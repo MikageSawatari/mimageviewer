@@ -419,6 +419,17 @@ ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開く�
 | ZipDir | Some(representative) または None (`ZipDirRepresentative`) | None | `zipdir:{dir_prefix}` | 通常は部分木代表 entry を直接読む。ZipDir source pin は `zip_dir_prefix` を worker に渡し、同じ sort で部分木代表を選び直す |
 | PdfPage | None | Some(page) | `pdf_page_cache_key(page)` | PDF ワーカーでそのページをレンダリング |
 
+PDF ワーカーの render 結果は raster に加えて、PDFium が読んだページ box の point 寸法を返す。
+`thumbnails.source_width/source_height` には rasterized thumbnail の `width/height` ではなく、
+ページ box を **1/1000 point の固定小数点**にした値を保存する。ページごとの box 差を保ったまま
+整数丸め誤差を避け、フルスクリーンの通過 rendition と完成 raster を同一矩形へ配置するためである。
+通常画像と ZIP / 変換 archive 内画像は従来どおり decode 後の元画素寸法を保存する。動画サムネイルは
+catalog のこの生成経路を通らず、fullscreen も poster thumbnail へフォールバックしないため対象外。
+
+この意味変更より前のリリース済み catalog は PDF 行に thumbnail 自身の寸法を持つ。元の page box は
+WebP から復元できないため、`pdf_layout_dims_version` の初回 migration で PDF 仮想 catalog のページ行と
+通常フォルダ catalog の `pdfthumb:` 行だけを削除し、次回表示時に再生成する。画像 / ZIP 等の行は残す。
+
 `ConvertibleArchive` の cache ZIP 対応表 (`App.converted_archive_cache_paths`) は
 `install_new_items` で現在 items から path/mtime/size だけを snapshot し、SQLite `peek` と
 cache ZIP の `exists()` は `ConvertedArchiveCachePathsPending` worker で解決する。worker 完了前は

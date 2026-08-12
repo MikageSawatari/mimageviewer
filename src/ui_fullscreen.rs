@@ -3144,13 +3144,19 @@ fn fit_display_size_in_rect(rect: egui::Rect, display_size: egui::Vec2) -> egui:
 /// their own aspect ratio for layout visibly stretches the pass-through frame.
 fn resolve_fs_image_transform(
     input: DisplayedImageTransformInput,
-    use_source_layout: bool,
+    layout_source_size: Option<egui::Vec2>,
 ) -> Option<DisplayedImageTransform> {
-    if !use_source_layout {
+    let Some(layout_source_size) = layout_source_size else {
         return DisplayedImageTransform::resolve(input);
-    }
+    };
+    // `layout_source_size` may use PDF fixed-point page units rather than pixels.
+    // Preserve only its aspect ratio while keeping Original/no-upscale semantics
+    // on the coordinate source's pixel-scale magnitude.
+    let reference_long = input.source_size.x.max(input.source_size.y).max(1.0);
+    let layout_long = layout_source_size.x.max(layout_source_size.y).max(1.0);
+    let layout_size = layout_source_size * (reference_long / layout_long);
     let layout = DisplayedImageTransform::resolve(DisplayedImageTransformInput {
-        texture_size: input.source_size,
+        texture_size: layout_size,
         ..input
     })?;
     DisplayedImageTransform::from_resolved_rect(input, layout.full_image_rect)
@@ -11443,7 +11449,7 @@ impl App {
                             content_rect
                         };
                         let source_size = self
-                            .fs_page_layout_source_size(fs_idx)
+                            .fs_page_coordinate_source_size(fs_idx)
                             .or_else(|| {
                                 state
                                     .image_dims
@@ -13539,10 +13545,10 @@ impl App {
         }
     }
 
-    /// Canonical, pre-thumbnail-rounding dimensions used to lay out a page.
-    /// Full decode/header data wins, followed by the catalog's persisted source
-    /// dimensions. The texture size remains a final fallback at the draw site.
-    fn fs_page_layout_source_size(&self, idx: usize) -> Option<egui::Vec2> {
+    /// Pixel coordinate dimensions used by annotations, hit testing, and Original
+    /// scale. PDF catalog dimensions are page-layout units, so they are not a
+    /// coordinate fallback until a full/display raster has supplied real pixels.
+    fn fs_page_coordinate_source_size(&self, idx: usize) -> Option<egui::Vec2> {
         self.source_dims_for_idx(idx)
             .map(|(w, h)| egui::vec2(w, h))
             .or_else(|| {
@@ -13551,13 +13557,32 @@ impl App {
                     .copied()
                     .map(|[w, h]| egui::vec2(w as f32, h as f32))
             })
-            .or_else(|| match self.thumbnails.get(idx) {
-                Some(ThumbnailState::Loaded {
-                    source_dims: Some((w, h)),
-                    ..
-                }) => Some(egui::vec2(*w as f32, *h as f32)),
+            .or_else(|| match (self.items.get(idx), self.thumbnails.get(idx)) {
+                (Some(GridItem::PdfPage { .. }), _) => None,
+                (
+                    _,
+                    Some(ThumbnailState::Loaded {
+                        source_dims: Some((w, h)),
+                        ..
+                    }),
+                ) => Some(egui::vec2(*w as f32, *h as f32)),
                 _ => None,
             })
+    }
+
+    /// Canonical, pre-raster-rounding dimensions used only to lay out a page.
+    /// PDF page box dimensions persisted with the thumbnail win even after the
+    /// display raster arrives, so both textures resolve to one stable rectangle.
+    fn fs_page_layout_source_size(&self, idx: usize) -> Option<egui::Vec2> {
+        if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }))
+            && let Some(ThumbnailState::Loaded {
+                source_dims: Some((w, h)),
+                ..
+            }) = self.thumbnails.get(idx)
+        {
+            return Some(egui::vec2(*w as f32, *h as f32));
+        }
+        self.fs_page_coordinate_source_size(idx)
     }
 
     /// 見開き上部 HUD の相方ページ情報を、表示済みキャッシュだけから組み立てる。
@@ -20677,7 +20702,11 @@ impl App {
         if let Some(resource) = display_tex {
             let handle = resource.source_texture();
             let tex_size = handle.size_vec2();
-            let use_source_layout = self.is_passthrough_rendition_texture(handle);
+            let use_source_layout = self.is_passthrough_rendition_texture(handle)
+                || matches!(self.items.get(page_idx), Some(GridItem::PdfPage { .. }));
+            let layout_source_size = use_source_layout
+                .then(|| self.fs_page_layout_source_size(page_idx))
+                .flatten();
             let fit_bbox = fs_image_fit_bbox(rotation, free_rotation_rad, content_bbox);
             let Some(transform) = resolved_transform.or_else(|| {
                 resolve_fs_image_transform(
@@ -20694,7 +20723,7 @@ impl App {
                         pixels_per_point: ui.ctx().pixels_per_point(),
                         placement: ResolvedDisplayPlacement::Normal { zoom_pan },
                     },
-                    use_source_layout,
+                    layout_source_size,
                 )
             }) else {
                 return None;
@@ -24501,9 +24530,18 @@ impl App {
                 self.fs_page_layout_source_size(right_idx),
             ),
         };
+        let (left_coordinate_size, right_coordinate_size) = match display_override {
+            Some((left, right)) => (left.source_size, right.source_size),
+            None => (
+                self.fs_page_coordinate_source_size(left_idx),
+                self.fs_page_coordinate_source_size(right_idx),
+            ),
+        };
         let both_in_fs_cache =
             self.fs_cache.contains_key(&left_idx) && self.fs_cache.contains_key(&right_idx);
-        let (left_size, right_size) = if color_faithful_rendition_unit {
+        let pdf_layout_unit = matches!(self.items.get(left_idx), Some(GridItem::PdfPage { .. }))
+            || matches!(self.items.get(right_idx), Some(GridItem::PdfPage { .. }));
+        let (left_size, right_size) = if color_faithful_rendition_unit || pdf_layout_unit {
             (
                 passthrough_layout_display_size(
                     left_source_size,
@@ -24680,7 +24718,7 @@ impl App {
                 (
                     spread_rects.left_rect,
                     left_idx,
-                    left_source_size,
+                    left_coordinate_size,
                     left_rot,
                     &left_location,
                     left_display_tex.as_ref(),
@@ -24690,7 +24728,7 @@ impl App {
                 (
                     spread_rects.right_rect,
                     right_idx,
-                    right_source_size,
+                    right_coordinate_size,
                     right_rot,
                     &right_location,
                     right_display_tex.as_ref(),
@@ -24758,7 +24796,7 @@ impl App {
                 (
                     left_rect,
                     left_idx,
-                    left_source_size,
+                    left_coordinate_size,
                     left_rot,
                     &left_location,
                     left_display_tex.as_ref(),
@@ -24768,7 +24806,7 @@ impl App {
                 (
                     right_rect,
                     right_idx,
-                    right_source_size,
+                    right_coordinate_size,
                     right_rot,
                     &right_location,
                     right_display_tex.as_ref(),
@@ -24867,11 +24905,17 @@ impl App {
 
         if let Some(handle) = display_tex {
             let tex_size = handle.size_vec2();
+            let use_layout = self.is_passthrough_rendition_texture(handle.source_texture())
+                || matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }));
+            let layout_size = use_layout
+                .then(|| self.fs_page_layout_source_size(idx))
+                .flatten()
+                .unwrap_or(tex_size);
             let display_size = match rotation {
                 crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
-                    egui::vec2(tex_size.y, tex_size.x)
+                    egui::vec2(layout_size.y, layout_size.x)
                 }
-                _ => tex_size,
+                _ => layout_size,
             };
             let img_rect = fit_display_size_in_rect(rect, display_size);
             let transform = DisplayedImageTransform::from_resolved_rect(
@@ -30758,10 +30802,51 @@ mod tests {
             placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
         };
 
-        let pass = resolve_fs_image_transform(make_input(egui::vec2(300.0, 450.0)), true)
-            .expect("pass-through transform");
+        let pass =
+            resolve_fs_image_transform(make_input(egui::vec2(300.0, 450.0)), Some(source_size))
+                .expect("pass-through transform");
         let final_image =
-            resolve_fs_image_transform(make_input(source_size), false).expect("final transform");
+            resolve_fs_image_transform(make_input(source_size), None).expect("final transform");
+
+        assert!((pass.full_image_rect.left() - final_image.full_image_rect.left()).abs() < 1.0e-4);
+        assert!((pass.full_image_rect.top() - final_image.full_image_rect.top()).abs() < 1.0e-4);
+        assert!(
+            (pass.full_image_rect.width() - final_image.full_image_rect.width()).abs() < 1.0e-4
+        );
+        assert!(
+            (pass.full_image_rect.height() - final_image.full_image_rect.height()).abs() < 1.0e-4
+        );
+    }
+
+    #[test]
+    fn pdf_thumbnail_and_rounded_display_raster_use_the_same_page_box_rectangle() {
+        let viewport_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        // Page-box aspect is retained in 1/1000 point units. Both the 327x473
+        // thumbnail and 1643x2375 display raster round that ratio differently.
+        let page_box_layout = egui::vec2(691_792.0, 1_000_000.0);
+        let make_input = |source_size, texture_size| DisplayedImageTransformInput {
+            page_idx: 0,
+            viewport_rect,
+            source_size,
+            texture_size,
+            rotation: crate::rotation_db::Rotation::None,
+            free_rotation_rad: 0.0,
+            content_bbox: None,
+            fit_mode: FullscreenFitMode::Page,
+            fit_scale_limits: FullscreenFitScaleLimits::default(),
+            pixels_per_point: 1.0,
+            placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+        };
+        let pass = resolve_fs_image_transform(
+            make_input(egui::vec2(327.0, 473.0), egui::vec2(327.0, 473.0)),
+            Some(page_box_layout),
+        )
+        .expect("PDF pass-through transform");
+        let final_image = resolve_fs_image_transform(
+            make_input(egui::vec2(1643.0, 2375.0), egui::vec2(1643.0, 2375.0)),
+            Some(page_box_layout),
+        )
+        .expect("PDF final transform");
 
         assert!((pass.full_image_rect.left() - final_image.full_image_rect.left()).abs() < 1.0e-4);
         assert!((pass.full_image_rect.top() - final_image.full_image_rect.top()).abs() < 1.0e-4);

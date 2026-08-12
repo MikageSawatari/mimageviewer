@@ -5026,7 +5026,7 @@ fn fs_upload_backlog_idx(value: &(usize, FsLoadResult, u64)) -> usize {
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::thumb_loader::{
     CacheDecision, DctDecodeError, LoadRequest, ScaleStats, ThumbMsg, apply_orientation,
-    build_and_save_one, compute_display_px, decode_jpeg_turbo_scaled_from_bytes, encode_and_save,
+    build_and_save_one, compute_display_px, decode_jpeg_turbo_scaled_from_bytes,
     encode_and_save_with_source_dims, is_jpeg_entry, process_load_request,
     read_exif_orientation_from_bytes,
 };
@@ -48194,6 +48194,7 @@ impl App {
                         image: img,
                         content_type,
                         page_count: _,
+                        page_size_points: _,
                     }) => {
                         let elapsed = t.elapsed().as_secs_f64() * 1000.0;
                         crate::logger::log(format!(
@@ -48760,6 +48761,7 @@ impl App {
                     image: img,
                     content_type: _content_type,
                     page_count: _,
+                    page_size_points: _,
                 })) => {
                     if cancel.load(Ordering::Relaxed) {
                         return;

@@ -1721,8 +1721,11 @@ resident final や rendition の有無でページごとに mode を反転させ
 未解決 unit として直前表示を保ち、後続 frame の rendition へ差し替える。
 
 通過 rendition の texture は低解像度でも、表示矩形は source/header 寸法
-(`ThumbnailState::Loaded::source_dims` を含む) から求める。完成画像も同じ source 寸法を使うため、
-単一 / 見開きとも settle で位置・幅・高さ・縦横比を変えない。
+(`ThumbnailState::Loaded::source_dims` を含む) から求める。PDF は thumbnail / fullscreen の
+各 raster 寸法が別々に整数丸めされるため、PDFium が読むページ box を 1/1000 point の固定小数点
+レイアウト寸法として catalog に保存し、通過 rendition と完成 texture の両方をその同じ縦横比へ
+配置する。これは注釈等が使う完成 raster の画素座標とは別の軸である。単一 / 見開きとも settle で
+位置・幅・高さ・縦横比を変えない。
 
 縦・横の連結読みは通過表示の対象外 (スクロールは実体化済みのページを見せるだけなので、
 キーごとの実体化コストが元から出ない)。

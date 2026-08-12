@@ -1968,8 +1968,9 @@ fn process_neighbor_prefetch(
         }
     }
     if !thumb_present {
-        if let Some(bytes) = encode_and_save(
+        if let Some(bytes) = encode_and_save_with_source_dims(
             &res.image,
+            res.page_size_points.catalog_layout_dims(),
             &folder_key,
             parent_catalog,
             mtime,
@@ -2502,6 +2503,9 @@ pub fn load_one_cached(
     // source_dims を **元寸法** で保存する (DCT scaled buffer ではない)。
     let mut decode_source = crate::stats::DecodeSource::Native;
     let mut dct_stats: Option<ScaleStats> = None;
+    // PDF thumbnail の整数丸め後 raster ではなく、PDFium が読んだ page box の
+    // 縦横比を catalog に残す。値は 1/1000 point の固定小数点レイアウト寸法。
+    let mut pdf_layout_dims: Option<(u32, u32)> = None;
     let mut byte_orientation: u16 = 1;
     let has_verified_source = verified_source_bytes.is_some();
     let img_result = if let Some(page_num) = pdf_page {
@@ -2525,6 +2529,7 @@ pub fn load_one_cached(
             cancel_policy,
         )
         .map(|res| {
+            pdf_layout_dims = res.page_size_points.catalog_layout_dims();
             // C-thumb (v1.0.0): 親フォルダ内の PDF サムネ render の場合、ついでに
             // pdf_meta テーブルへページ数を書き込む。`cache_key_override` が
             // "pdfthumb:" 始まりのときが「親フォルダ catalog 経路」の signature。
@@ -2796,12 +2801,16 @@ pub fn load_one_cached(
 
     let decode_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-    // 元画像のピクセル寸法。
+    // 元画像の寸法。PDF だけは表示 raster のピクセル寸法ではなく page box の
+    // 固定小数点レイアウト寸法を使う。PDFium の target 丸めで 327x473 等になった
+    // thumbnail 自身の比率を保存すると、final への差し替え時に枠が動くため。
     // DCT scale 経由なら `img.width()/height()` は scaled buffer の寸法なので
     // 使わず、`dct_stats.src_w/src_h` から EXIF 適用後寸法を算出する。
-    // 非 DCT 経路 (image::open / WIC / Susie / PDF / ZIP image::load_from_memory)
+    // 非 DCT 経路 (image::open / WIC / Susie / ZIP image::load_from_memory)
     // は img の現寸法 = 元寸法 (EXIF 適用済み) なので従来通り。
-    let source_dims: Option<(u32, u32)> = if let Some(stats) = dct_stats {
+    let source_dims: Option<(u32, u32)> = if pdf_page.is_some() {
+        pdf_layout_dims
+    } else if let Some(stats) = dct_stats {
         Some(stats.source_dims_after_exif(orientation))
     } else {
         Some((img.width(), img.height()))
@@ -3921,8 +3930,9 @@ pub fn build_and_save_one_pdf(
     )
     .ok()?;
     let key = crate::grid_item::pdf_page_cache_key(page_num);
-    encode_and_save(
+    encode_and_save_with_source_dims(
         &res.image,
+        res.page_size_points.catalog_layout_dims(),
         &key,
         catalog,
         mtime,
