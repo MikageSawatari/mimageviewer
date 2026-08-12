@@ -2,10 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
 const CATALOG_VERSION: &str = "2";
+const PDF_LAYOUT_DIMS_META_KEY: &str = "pdf_layout_dims_version";
+const PDF_LAYOUT_DIMS_VERSION: &str = "1";
 pub const THUMB_LONG_SIDE: u32 = 512;
 
 // -----------------------------------------------------------------------
@@ -39,7 +41,8 @@ pub struct CacheEntry {
     pub mtime: i64,
     pub file_size: i64,
     pub jpeg_data: Vec<u8>,
-    /// 元画像のピクセル寸法 (幅, 高さ)。
+    /// 元画像の寸法 (幅, 高さ)。通常画像 / archive entry はピクセル、PDF は page box を
+    /// 1/1000 point で表すレイアウト寸法。いずれも thumbnail raster の寸法ではない。
     /// 旧バージョンで保存されたエントリには NULL が入るため Option で表現する。
     pub source_dims: Option<(u32, u32)>,
 }
@@ -87,9 +90,10 @@ impl CatalogDb {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let conn = Connection::open(&db_path)?;
+        let mut conn = Connection::open(&db_path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         init_schema(&conn)?;
+        migrate_pdf_layout_dims(&mut conn, folder_path)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -231,7 +235,7 @@ impl CatalogDb {
     /// サムネイルを INSERT OR REPLACE で保存する。
     ///
     /// `width` / `height` はキャッシュされる WebP サムネイルの寸法、
-    /// `source_dims` は元画像の寸法 (未取得なら None)。
+    /// `source_dims` は元画像の寸法 (PDF は page box の 1/1000 point、未取得なら None)。
     #[allow(clippy::too_many_arguments)]
     pub fn save(
         &self,
@@ -575,6 +579,57 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Released catalogs stored PDF thumbnail raster dimensions in `source_*`.
+/// They cannot be repaired from the WebP because the page-box precision has
+/// already been discarded, so invalidate only PDF-derived thumbnail rows once.
+///
+/// A catalog whose owner is a PDF contains its virtual `page_NNNN` rows only;
+/// ordinary folder catalogs may contain `pdfthumb:` representative rows beside
+/// unrelated image/ZIP entries, which must remain intact.
+fn migrate_pdf_layout_dims(conn: &mut Connection, folder_path: &Path) -> rusqlite::Result<()> {
+    let current: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [PDF_LAYOUT_DIMS_META_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if current.as_deref() == Some(PDF_LAYOUT_DIMS_VERSION) {
+        return Ok(());
+    }
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Another opener may have completed the migration while this connection
+    // waited for the write lock. Recheck under the transaction before deleting.
+    let version: Option<String> = tx
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [PDF_LAYOUT_DIMS_META_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if version.as_deref() == Some(PDF_LAYOUT_DIMS_VERSION) {
+        return tx.commit();
+    }
+    let is_pdf_catalog = folder_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"));
+    if is_pdf_catalog {
+        tx.execute("DELETE FROM thumbnails", [])?;
+    } else {
+        tx.execute(
+            "DELETE FROM thumbnails WHERE filename LIKE 'pdfthumb:%'",
+            [],
+        )?;
+    }
+    tx.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        params![PDF_LAYOUT_DIMS_META_KEY, PDF_LAYOUT_DIMS_VERSION],
+    )?;
+    tx.commit()
+}
+
 fn add_thumbnail_column_if_missing(
     conn: &Connection,
     column: &str,
@@ -617,10 +672,25 @@ pub fn encode_thumb_webp(
     long_side: u32,
     quality: f32,
 ) -> Option<(Vec<u8>, u32, u32)> {
-    let thumb = crate::fast_resize::resize_dynamic_fit(
+    encode_thumb_webp_with_source_dims(img, long_side, quality, (img.width(), img.height()))
+}
+
+/// `encode_thumb_webp` variant that uses canonical source dimensions for aspect.
+///
+/// PDF page boxes and DCT-scaled JPEG buffers can differ slightly from the decoded
+/// raster's already-rounded aspect. The output still never exceeds `long_side` or
+/// upscales the supplied raster.
+pub fn encode_thumb_webp_with_source_dims(
+    img: &image::DynamicImage,
+    long_side: u32,
+    quality: f32,
+    source_dims: (u32, u32),
+) -> Option<(Vec<u8>, u32, u32)> {
+    let thumb = crate::fast_resize::resize_dynamic_fit_with_source_aspect(
         img,
         long_side,
         long_side,
+        source_dims,
         crate::fast_resize::Quality::Lanczos3,
     );
     let rgb = thumb.to_rgb8();
@@ -828,6 +898,81 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version, CATALOG_VERSION);
+    }
+
+    #[test]
+    fn pdf_layout_migration_rebuilds_legacy_page_rows_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("cache");
+        let pdf_path = tmp.path().join("book.pdf");
+        let db = CatalogDb::open(&cache_dir, &pdf_path).unwrap();
+        db.save("page_0000", 1, 10, 327, 473, Some((327, 473)), b"legacy")
+            .unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM meta WHERE key = ?1",
+                [PDF_LAYOUT_DIMS_META_KEY],
+            )
+            .unwrap();
+        drop(db);
+
+        let migrated = CatalogDb::open(&cache_dir, &pdf_path).unwrap();
+        assert!(migrated.load_all().unwrap().is_empty());
+        migrated
+            .save(
+                "page_0000",
+                1,
+                10,
+                327,
+                473,
+                Some((595_276, 841_890)),
+                b"fixed",
+            )
+            .unwrap();
+        drop(migrated);
+
+        let reopened = CatalogDb::open(&cache_dir, &pdf_path).unwrap();
+        assert_eq!(
+            reopened.load_all().unwrap()["page_0000"].source_dims,
+            Some((595_276, 841_890)),
+            "the migration marker must preserve regenerated rows on later opens"
+        );
+    }
+
+    #[test]
+    fn pdf_layout_migration_keeps_non_pdf_rows_in_folder_catalogs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("cache");
+        let folder = tmp.path().join("photos");
+        let db = CatalogDb::open(&cache_dir, &folder).unwrap();
+        db.save("image.jpg", 1, 10, 8, 8, Some((4000, 3000)), b"image")
+            .unwrap();
+        db.save(
+            "pdfthumb:book.pdf",
+            1,
+            10,
+            8,
+            8,
+            Some((327, 473)),
+            b"legacy-pdf",
+        )
+        .unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM meta WHERE key = ?1",
+                [PDF_LAYOUT_DIMS_META_KEY],
+            )
+            .unwrap();
+        drop(db);
+
+        let migrated = CatalogDb::open(&cache_dir, &folder).unwrap();
+        let rows = migrated.load_all().unwrap();
+        assert!(rows.contains_key("image.jpg"));
+        assert!(!rows.contains_key("pdfthumb:book.pdf"));
     }
 
     // -- CatalogDb CRUD --

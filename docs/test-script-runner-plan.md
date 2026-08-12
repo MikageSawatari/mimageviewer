@@ -301,7 +301,8 @@ run が次を観測できなかったら、**成功ではなく不成立**とし
 | 条件 | 何を証明するか | いつ必須か |
 | --- | --- | --- |
 | 同じ hold 中に `held=true/edge=あり` と `held=true/edge=なし` の**両方** | §2.5.2.1 の 30Hz 振動を実際に通した = 合成入力が edge と level の両方に届いている | **常に** |
-| 複数 repeat が 1 フレームに materialize された | §3.2 の蓄積条件を通した | **page-turn 計測のときだけ** (下記) |
+| `frame_input held=true` と同じ `(hold_id, frame_nr)` で production の `Keymap::key_held_chord` が `held=true` を返した | timeline 内の level ではなく、実際の consumer まで到達した | **常に** |
+| 複数 repeat が 1 フレームに materialize された | §3.2 の蓄積条件を通した | 観測結果を報告するが合否には使わない (下記) |
 | burst が 1 つ以上ある | 検査対象があった | page-turn の不変条件検査時 |
 
 **蓄積条件を常時必須にしてはいけない (2026-08-11 に実測で判明)。** 1 フレームが複数 repeat を
@@ -309,9 +310,9 @@ run が次を観測できなかったら、**成功ではなく不成立**とし
 2.5 秒 hold が **約 166fps** で回り、repeat 68 個が全部別フレームに散った (`vibration=yes` /
 `accumulation=no`)。健全な速い run を「不成立」と報告してしまう。
 
-したがって蓄積条件は **`fs/page_turn_ready` があるログ (= §1.58 の計測) のときだけ必須**にする。
-それ以外では観測結果を出すが合否には使わない。**遅いフレームこそが §1.58 の主題**なので、
-page-turn 計測で蓄積が 0 なら、その計測は興味のある条件を通っていない。
+したがって蓄積条件は、`fs/page_turn_ready` がある §1.58 の計測でも**報告だけで gate にしない**。
+1.6MP の実データは約 6ms/frame で回り、正しい 1:1 通過表示ほど複数 repeat が同一 frame に
+溜まらない。R1〜R4 の合否は page-turn I1〜I5 と実際の命令数 / 表示数で判定する。
 
 ### 9.3 アプリが出す事実 (判定しない)
 
@@ -322,6 +323,7 @@ page-turn 計測で蓄積が 0 なら、その計測は興味のある条件を�
 | `hold_begin` | `hold_id`, `key`, `target_viewport`, `repeat_delay_ms`, `repeat_hz` |
 | `hold_end` | `hold_id`, materialize した down/repeat/up の数 |
 | `frame_input` | `hold_id`, `held`, `edge_count`, `materialized_in_frame`, `frame_nr` |
+| `level_read` | `hold_id`, `frame_nr`, `held`, `reader=Keymap::key_held_chord`。production の level 読み取り結果 |
 | `step` / `precondition` / `fail` | script の進行と前提 |
 
 `fs/page_turn_ready` 等の §1.58 側 event には `input_route` (`fullscreen_raw_arrow` 等) と
@@ -362,12 +364,12 @@ default keymap で作る。**
 
 ## 12. 実装ステージ
 
-| S | 内容 | 完了条件 |
-| --- | --- | --- |
-| S1 | timeline + chokepoint + plugin fan-out | 単体テスト。テスト専用 API で Down/repeat/Up を流し、Win32 edge と egui event の**両方**が同じ順序で出ること、level が hold 中 true のままであること |
-| S2 | Rhai runner + CLI + feature gate + snapshot publish | `--test-script` で起動して script が完走し、終了する |
-| S3 | perf event + `analyze_perf.py` の hold_id 分割と §9.2 の不成立条件 | `scripts/test_analyze_perf.py` に回帰テスト |
-| S4 | `page-turn-smoke.ps1` の中身差し替え + self-test script + 本書/backlog 更新 | **§13** |
+| S | 内容 | 完了条件 | 状態 |
+| --- | --- | --- | --- |
+| S1 | timeline + chokepoint + plugin fan-out | 単体テスト。テスト専用 API で Down/repeat/Up を流し、Win32 edge と egui event の**両方**が同じ順序で出ること、level が hold 中 true のままであること | 完了 (`5f090b9c`) |
+| S2 | Rhai runner + CLI + feature gate + snapshot publish | `--test-script` で起動して script が完走し、終了する | 完了 (`069794cd`, `33406a6d`) |
+| S3 | perf event + `analyze_perf.py` の hold_id 分割と §9.2 の不成立条件 | `scripts/test_analyze_perf.py` に回帰テスト | 完了 (`b63f1c16`, `df947c75`) |
+| S4 | `page-turn-smoke.ps1` の中身差し替え + self-test script + 本書/backlog 更新 | **§13** | 完了 (本コミット)。対話デスクトップの隔離実ログで app / analyzer とも exit 0 を確認 |
 
 ## 12.1 終了コードの配送と shutdown watchdog (S2 で判明)
 
@@ -407,16 +409,82 @@ compositor 側の健全性を疑う。`run-native-return` に戻らないなら 
 
 ## 13. §2.3 自体の完了条件
 
-`fs/page_turn_ready` / `page_turn_decision` は現行コードに無いので、**この基盤だけでは
-`--check` は `checked bursts=0` の no-op**。§1.58 を待たずに基盤の正しさを証明する必要がある。
+§2.3 統合時点では `fs/page_turn_ready` / `fs/page_turn_decision` が無く、`--check` は
+`checked bursts=0` の no-op だった。2026-08-12 の §1.58 本体修正で両 event を復活し、現在は
+実ページ送り burst の I1〜I5 を検査できる。
 
 self-test (`scripts/page-turn/selftest.rhai`) が次を示すこと:
 
 1. FS に入って Right を 5 秒 hold → **ページが N 以上進んだ** (= egui 経路に届いている)
 2. hold 中ずっと `key_held_chord` が true だった (= level 経路に届いている)
-3. §9.2 の 2 条件を観測した (= 振動と蓄積を実際に通した)
+3. §9.2 の振動条件を観測した
 
-**これが通るまで §1.58 に着手しない。**
+2 は timeline 自身の `held` を再掲せず、各 `frame_input held=true` と同じ
+`(hold_id, frame_nr)` で production の `Keymap::key_held_chord` を実際に呼び、
+`test_script/level_read held=true` が出たことを Python 側で照合する。
+
+蓄積は S3 と §1.58 の実測訂正どおり、page-turn 計測を含めて報告だけにする。
+self-test と本番計測は速い run でも成立しなければならず、蓄積 0 を不成立にしない。
+
+### 13.1 無人 self-test
+
+```powershell
+.\scripts\build-dev.ps1 -TestScript
+.\scripts\page-turn-smoke.ps1 -SelfTest
+```
+
+- `generate_fixture.py` が 12 枚の小さい PNG を生成する。
+- `--data-dir <isolated> --test-script selftest.rhai <fixture-folder>` で起動する。完全に新しい
+  profile でも無人で進めるよう、scripted run は初回設定 / 更新案内等の起動時専用 modal を
+  **メモリ上だけ**抑止する。`settings.db` へ完了済み状態は保存しない。
+- host は起動した **test PID の最大の可視 top-level window だけ**を前面化する。main から
+  fullscreen viewport へ切り替わった後も追従するが、キー入力は注入しない。前面化できたこと
+  自体は `wait_until` の `focused` / target 前提で確認し、成立しなければ非 0 で終わる。
+- script は §10 の前提を `wait_until` で確認し、2 ページ目から Right を 5 秒 hold する。
+- 6 ページ目以降まで進まなければ app exit 非 0 (最低 4 ページ進んだことを要求)。
+- `analyze_perf.py ... test-script-input --check` が振動と production level read を確認し、
+  不成立なら analyzer exit 非 0。
+- PowerShell は **app exit と analyzer exit の両方**を見て、どちらかが非 0 なら失敗する。
+- scripted run は single-instance mutex を skip するため、通常版が起動中でも実行できる。
+  `Assert-NoOtherInstanceForSetup` は人が設定する非 scripted の `-Setup` にだけ残す。
+
+2026-08-11 の実ログ往復結果:
+
+```text
+app exit: 0
+test-script input: status=pass holds=1 frames=827 vibration=yes level=yes
+                   level_reads=826 accumulation=no (not required)
+PowerShell harness exit: 0
+```
+
+同じ harness を前面 window の無い環境で走らせた失敗確認では、`wait_until` の focus / target
+前提が成立せず app exit 1、`test-script-input --check` も `not-established` / exit 1、harness
+exit 1 となった。app と analyzer の片方だけを見て成功扱いする経路は無い。
+
+### 13.2 §1.58 の本番計測
+
+```powershell
+.\scripts\page-turn-smoke.ps1 -Setup
+.\scripts\page-turn-smoke.ps1
+```
+
+`-Setup` では隔離 data-dir で実際の本を開き、カラー化等を設定して中ほどのページを
+選択して終了する。通常実行は同じ隔離 profile を `--test-script` で開き、Right / Left を
+hold した実ログへ次の 2 判定を順に掛ける。
+
+```powershell
+python scripts/analyze_perf.py <perf-log> test-script-input --check
+python scripts/analyze_perf.py <perf-log> page-turn --check
+```
+
+後者は `fs/page_turn_ready` / `fs/page_turn_decision` を読む。`checked bursts=0` は no-op として
+未完了扱いにし、本番計測では `checked bursts>0 / violations=0` を要求する。
+
+上記 self-test が実ログで通ったため、**§1.58 の着手条件は満たされた**。§1.58 は両 event と
+単一 / 見開き display-unit の通過表示を実装済み。単一ページは `scripts/page-turn/measure.rhai`、
+RTL 見開きの往復は `scripts/page-turn/measure-spread-rtl-roundtrip.rhai` を使う。残る完了条件は
+§13.2 の隔離 foreground 本番計測である。通過表示は単一ページにも適用し、4.1MP 実 ZIP の
+materialized 経路で観測した 174 命令 / 29 表示の解消も同じ gate で確認する。
 
 ## 14. 後続 (この基盤ができてから)
 

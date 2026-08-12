@@ -6,9 +6,10 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import shutil
 import sys
-import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -24,6 +25,19 @@ from analyze_perf import (
     load_events,
     main,
 )
+
+
+@contextlib.contextmanager
+def writable_test_directory():
+    """Avoid Python 3.13's owner-only Windows temp ACL in restricted runners."""
+    base = Path(__file__).resolve().parent.parent / "target" / "test-analyze-perf"
+    base.mkdir(parents=True, exist_ok=True)
+    path = base / f"run-{uuid.uuid4().hex}"
+    path.mkdir()
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def frame(t: float, n: int) -> dict:
@@ -122,10 +136,45 @@ def frame_input(
     }
 
 
+def level_read(
+    t: float,
+    hold_id: int,
+    *,
+    held: bool,
+    frame_nr: int,
+) -> dict:
+    return {
+        "t": t,
+        "cat": "test_script",
+        "kind": "level_read",
+        "hold_id": hold_id,
+        "held": held,
+        "frame_nr": frame_nr,
+        "reader": "Keymap::key_held_chord",
+    }
+
+
+def add_level_reads(events: list[dict]) -> list[dict]:
+    result = list(events)
+    result.extend(
+        level_read(
+            float(event.get("t", 0.0)),
+            int(event["hold_id"]),
+            held=True,
+            frame_nr=int(event["frame_nr"]),
+        )
+        for event in events
+        if event.get("cat") == "test_script"
+        and event.get("kind") == "frame_input"
+        and event.get("held") is True
+    )
+    return result
+
+
 def valid_test_script_input(hold_id: int = 900) -> list[dict]:
     # No hold_begin/end here: invariant-only tests keep exercising the legacy
     # time-gap splitter while satisfying the independent harness evidence gate.
-    return [
+    return add_level_reads([
         frame_input(
             0.10,
             hold_id,
@@ -150,7 +199,7 @@ def valid_test_script_input(hold_id: int = 900) -> list[dict]:
             materialized_in_frame=3,
             frame_nr=3,
         ),
-    ]
+    ])
 
 
 def page_turn_gate_decision(
@@ -534,7 +583,7 @@ class PageTurnInvariantCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertNotIn("I3 violation:", result.stdout)
 
-    def test_i4_endpoint_exception_requires_a_repeated_endpoint(self) -> None:
+    def test_i4_endpoint_requires_materialized_settle(self) -> None:
         endpoint_cases = {
             "last": [
                 page_turn(1.0, 1, "materialized"),
@@ -550,29 +599,16 @@ class PageTurnInvariantCliTests(unittest.TestCase):
         for endpoint, events in endpoint_cases.items():
             with self.subTest(endpoint=endpoint):
                 result = self.run_page_turn(events)
-                self.assertEqual(result.returncode, 0, result.stdout)
-                self.assertNotIn("I4 violation:", result.stdout)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("I4 violation:", result.stdout)
 
-        interior_repeat = self.run_page_turn([
-            page_turn(1.0, 0, "materialized"),
-            page_turn(1.1, 1, "pass_through"),
-            page_turn(1.2, 1, "pass_through"),
-            # A later burst establishes that idx=1 was not the final page.
-            page_turn(2.0, 2, "materialized"),
-        ])
-        self.assertEqual(interior_repeat.returncode, 1, interior_repeat.stdout)
-        self.assertIn("I4 violation:", interior_repeat.stdout)
-
-        endpoint_without_repeat = self.run_page_turn([
+        settled_endpoint = self.run_page_turn([
             page_turn(1.0, 1, "materialized"),
             page_turn(1.1, 2, "pass_through"),
+            page_turn(1.2, 2, "materialized"),
         ])
-        self.assertEqual(
-            endpoint_without_repeat.returncode,
-            1,
-            endpoint_without_repeat.stdout,
-        )
-        self.assertIn("I4 violation:", endpoint_without_repeat.stdout)
+        self.assertEqual(settled_endpoint.returncode, 0, settled_endpoint.stdout)
+        self.assertNotIn("I4 violation:", settled_endpoint.stdout)
 
     def test_i5_only_applies_to_rendition_ready_pending_frames(self) -> None:
         events = [
@@ -660,7 +696,7 @@ class TestScriptInputGateTests(unittest.TestCase):
                 exit_code = int(error.code or 0)
         return SimpleNamespace(returncode=exit_code, stdout=stdout.getvalue())
 
-    def test_missing_vibration_or_accumulation_is_not_established(self) -> None:
+    def test_missing_vibration_is_not_established(self) -> None:
         missing_vibration = [
             frame_input(
                 1.0,
@@ -671,47 +707,18 @@ class TestScriptInputGateTests(unittest.TestCase):
                 frame_nr=1,
             ),
         ]
-        missing_accumulation = [
-            frame_input(
-                1.0,
-                1,
-                held=True,
-                edge_count=1,
-                materialized_in_frame=0,
-                frame_nr=1,
-            ),
-            frame_input(
-                1.1,
-                1,
-                held=True,
-                edge_count=0,
-                materialized_in_frame=0,
-                frame_nr=2,
-            ),
-        ]
 
-        # Accumulation is only demanded of a page-turn measurement, so the
-        # missing-accumulation case has to carry page-turn events to be a
-        # failure at all.
-        measured_without_accumulation = missing_accumulation + [
-            page_turn(1.05, 1, "materialized"),
-        ]
+        report = analyze_test_script_input(missing_vibration)
+        self.assertEqual(report["status"], "not-established")
+        result = self.run_input_check(missing_vibration)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("vibration=no", result.stdout)
 
-        for missing, events in (
-            ("vibration", missing_vibration),
-            ("accumulation", measured_without_accumulation),
-        ):
-            with self.subTest(missing=missing):
-                report = analyze_test_script_input(events)
-                self.assertEqual(report["status"], "not-established")
-                result = self.run_input_check(events)
-                self.assertEqual(result.returncode, 1, result.stdout)
-                self.assertIn(f"{missing}=no", result.stdout)
-
-    def test_fast_run_without_page_turns_does_not_need_accumulation(self) -> None:
-        # A frame only absorbs several repeats when it outlasts the repeat
-        # interval. A real 2.5s hold on the grid ran at ~166fps and accumulated
-        # nothing, so requiring it here would call a working harness broken.
+    def test_missing_accumulation_alone_still_establishes_the_harness(self) -> None:
+        # Accumulation only happens when a frame outlasts the repeat interval,
+        # which depends on how heavy the book is rather than on the harness. A
+        # 1.6MP folder renders at ~6ms and can never produce one, so requiring
+        # it here failed correct runs.
         events = [
             frame_input(
                 1.0,
@@ -729,7 +736,35 @@ class TestScriptInputGateTests(unittest.TestCase):
                 materialized_in_frame=0,
                 frame_nr=2,
             ),
+            page_turn(1.05, 1, "materialized"),
         ]
+
+        report = analyze_test_script_input(add_level_reads(events))
+        self.assertEqual(report["status"], "pass")
+        self.assertFalse(report["accumulated_frames"])
+
+    def test_fast_run_without_page_turns_does_not_need_accumulation(self) -> None:
+        # A frame only absorbs several repeats when it outlasts the repeat
+        # interval. A real 2.5s hold on the grid ran at ~166fps and accumulated
+        # nothing, so requiring it here would call a working harness broken.
+        events = add_level_reads([
+            frame_input(
+                1.0,
+                1,
+                held=True,
+                edge_count=1,
+                materialized_in_frame=0,
+                frame_nr=1,
+            ),
+            frame_input(
+                1.1,
+                1,
+                held=True,
+                edge_count=0,
+                materialized_in_frame=0,
+                frame_nr=2,
+            ),
+        ])
 
         report = analyze_test_script_input(events)
         self.assertEqual(report["status"], "pass")
@@ -737,6 +772,7 @@ class TestScriptInputGateTests(unittest.TestCase):
 
         result = self.run_input_check(events)
         self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("level=yes", result.stdout)
         self.assertIn("accumulation=no (not required", result.stdout)
 
     def test_vibration_and_accumulation_establish_the_harness(self) -> None:
@@ -745,7 +781,41 @@ class TestScriptInputGateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("status=pass", result.stdout)
         self.assertIn("vibration=yes", result.stdout)
+        self.assertIn("level=yes", result.stdout)
         self.assertIn("accumulation=yes", result.stdout)
+
+    def test_missing_or_false_production_level_read_is_not_established(self) -> None:
+        base = [
+            frame_input(
+                1.0,
+                1,
+                held=True,
+                edge_count=1,
+                materialized_in_frame=0,
+                frame_nr=1,
+            ),
+            frame_input(
+                1.1,
+                1,
+                held=True,
+                edge_count=0,
+                materialized_in_frame=0,
+                frame_nr=2,
+            ),
+        ]
+        missing = base + [level_read(1.0, 1, held=True, frame_nr=1)]
+        false = base + [
+            level_read(1.0, 1, held=True, frame_nr=1),
+            level_read(1.1, 1, held=False, frame_nr=2),
+        ]
+
+        for case, events in (("missing", missing), ("false", false)):
+            with self.subTest(case=case):
+                report = analyze_test_script_input(events)
+                self.assertEqual(report["status"], "not-established")
+                result = self.run_input_check(events)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("level=no", result.stdout)
 
 
 class IdleHealthTests(unittest.TestCase):
@@ -756,6 +826,12 @@ class IdleHealthTests(unittest.TestCase):
         source = harness.read_bytes().decode("ascii")
         self.assertIn("$CpuCoreRatio =", source)
         self.assertIn("GetForegroundWindow", source)
+
+    def test_page_turn_harness_is_ascii_for_windows_powershell_51(self) -> None:
+        harness = Path(__file__).with_name("page-turn-smoke.ps1")
+        source = harness.read_bytes().decode("ascii")
+        self.assertIn("--test-script", source)
+        self.assertNotIn("MivSmokeInput", source)
 
     def test_empty_window_fails_without_explicit_same_session_evidence(self) -> None:
         events = [session(42), frame(1.0, 1), tail(1.0, 1)]
@@ -967,8 +1043,8 @@ class IdleHealthTests(unittest.TestCase):
 
     def test_command_writes_json_and_returns_gate_exit_code(self) -> None:
         events = [frame(0.0, 0), tail(0.0, 0)]
-        with tempfile.TemporaryDirectory() as temp_dir:
-            report_path = Path(temp_dir) / "idle-health.json"
+        with writable_test_directory() as temp_dir:
+            report_path = temp_dir / "idle-health.json"
             with contextlib.redirect_stdout(io.StringIO()):
                 exit_code = cmd_idle_health(
                     events,

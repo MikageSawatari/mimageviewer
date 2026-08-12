@@ -1108,9 +1108,16 @@ struct SyntheticViewportBatch {
 
 #[derive(Debug)]
 struct PreparedSyntheticFrame {
+    #[cfg_attr(not(feature = "test-script"), allow(dead_code))]
+    frame_nr: u64,
     time_key: RawInputTimeKey,
     raw_input_time: Option<f64>,
     batches: Vec<SyntheticViewportBatch>,
+    /// Synthetic holds whose events were materialized for each target viewport
+    /// in this RawInput frame. This keeps the release frame attributable after
+    /// the timeline has removed the held level.
+    #[cfg_attr(not(feature = "test-script"), allow(dead_code))]
+    hold_attributions: Vec<(egui::ViewportId, u64)>,
     delivered_viewports: Vec<egui::ViewportId>,
     final_modifiers: egui::Modifiers,
     armed: bool,
@@ -1188,6 +1195,17 @@ impl SyntheticInputPlugin {
         );
         emit_synthetic_input_facts(&materialized.facts, frame_nr);
 
+        let mut hold_attributions = Vec::new();
+        for event in &materialized.events {
+            let Some(hold_id) = event.hold_id else {
+                continue;
+            };
+            let attribution = (event.target.viewport, hold_id);
+            if !hold_attributions.contains(&attribution) {
+                hold_attributions.push(attribution);
+            }
+        }
+
         let mut batches: Vec<SyntheticViewportBatch> = Vec::new();
         for event in materialized.events {
             let egui_event = event.egui_event();
@@ -1207,9 +1225,11 @@ impl SyntheticInputPlugin {
             self.record_issue(issue);
         }
         self.prepared = Some(PreparedSyntheticFrame {
+            frame_nr,
             time_key,
             raw_input_time: input.time,
             batches,
+            hold_attributions,
             delivered_viewports: Vec::new(),
             final_modifiers: materialized.final_modifiers.to_egui(),
             armed: materialized.armed,
@@ -1340,6 +1360,105 @@ pub(crate) fn install_synthetic_input_plugin(ctx: &egui::Context) {
 pub fn take_synthetic_input_issues(ctx: &egui::Context) -> Vec<SyntheticInputIssue> {
     ctx.with_plugin(|plugin: &mut SyntheticInputPlugin| plugin.issues.drain(..).collect())
         .unwrap_or_default()
+}
+
+#[cfg(feature = "test-script")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SyntheticHoldObservation {
+    pub(crate) frame_nr: u64,
+    pub(crate) key: SyntheticNavigationKey,
+    pub(crate) hold_ids: Vec<u64>,
+}
+
+/// Return the synthetic holds that are active in the RawInput frame currently
+/// being processed. The result only identifies which production level reads
+/// need attribution; the held value itself must still be read through
+/// `Keymap::key_held_chord`.
+#[cfg(feature = "test-script")]
+pub(crate) fn synthetic_hold_observations(ctx: &egui::Context) -> Vec<SyntheticHoldObservation> {
+    let Some((frame_nr, armed)) = ctx
+        .with_plugin(|plugin: &mut SyntheticInputPlugin| {
+            plugin
+                .prepared
+                .as_ref()
+                .map(|prepared| (prepared.frame_nr, prepared.armed))
+        })
+        .flatten()
+    else {
+        return Vec::new();
+    };
+    if !armed {
+        return Vec::new();
+    }
+
+    let Ok(guard) = state().lock() else {
+        return Vec::new();
+    };
+    let mut observations: Vec<SyntheticHoldObservation> = Vec::new();
+    for held in &guard.synthetic.held {
+        let Some(hold_id) = held.hold_id else {
+            continue;
+        };
+        if let Some(existing) = observations
+            .iter_mut()
+            .find(|observation| observation.key == held.key)
+        {
+            existing.hold_ids.push(hold_id);
+        } else {
+            observations.push(SyntheticHoldObservation {
+                frame_nr,
+                key: held.key,
+                hold_ids: vec![hold_id],
+            });
+        }
+    }
+    observations
+}
+
+/// Identify the single scripted hold attributable to the current RawInput
+/// frame for a viewport. Active level ownership and a materialized release edge
+/// are both facts from the synthetic input owner; no cross-frame history is used.
+#[cfg(feature = "test-script")]
+pub(crate) fn synthetic_frame_hold_id(
+    ctx: &egui::Context,
+    viewport: egui::ViewportId,
+) -> Option<u64> {
+    let mut hold_ids = ctx
+        .with_plugin(|plugin: &mut SyntheticInputPlugin| {
+            plugin
+                .prepared
+                .as_ref()
+                .into_iter()
+                .flat_map(|prepared| prepared.hold_attributions.iter())
+                .filter_map(|(target, hold_id)| (*target == viewport).then_some(*hold_id))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if let Ok(guard) = state().lock() {
+        hold_ids.extend(
+            guard
+                .synthetic
+                .held
+                .iter()
+                .filter_map(|held| (held.target.viewport == viewport).then_some(held.hold_id))
+                .flatten(),
+        );
+    }
+    hold_ids.sort_unstable();
+    hold_ids.dedup();
+    if hold_ids.len() == 1 {
+        hold_ids.first().copied()
+    } else {
+        None
+    }
+}
+
+#[cfg(not(feature = "test-script"))]
+pub(crate) fn synthetic_frame_hold_id(
+    _ctx: &egui::Context,
+    _viewport: egui::ViewportId,
+) -> Option<u64> {
+    None
 }
 
 /// Arm the production synthetic timeline without disturbing the HWND registry

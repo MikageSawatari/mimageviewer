@@ -419,9 +419,22 @@ ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開く�
 | ZipDir | Some(representative) または None (`ZipDirRepresentative`) | None | `zipdir:{dir_prefix}` | 通常は部分木代表 entry を直接読む。ZipDir source pin は `zip_dir_prefix` を worker に渡し、同じ sort で部分木代表を選び直す |
 | PdfPage | None | Some(page) | `pdf_page_cache_key(page)` | PDF ワーカーでそのページをレンダリング |
 
+PDF ワーカーの render 結果は raster に加えて、PDFium が読んだページ box の point 寸法を返す。
+`thumbnails.source_width/source_height` には rasterized thumbnail の `width/height` ではなく、
+ページ box を **1/1000 point の固定小数点**にした値を保存する。ページごとの box 差を保ったまま
+整数丸め誤差を避け、フルスクリーンの通過 rendition と完成 raster を同一矩形へ配置するためである。
+通常画像と ZIP / 変換 archive 内画像は従来どおり decode 後の元画素寸法を保存する。動画サムネイルは
+catalog のこの生成経路を通らず、fullscreen も poster thumbnail へフォールバックしないため対象外。
+
+この意味変更より前のリリース済み catalog は PDF 行に thumbnail 自身の寸法を持つ。元の page box は
+WebP から復元できないため、`pdf_layout_dims_version` の初回 migration で PDF 仮想 catalog のページ行と
+通常フォルダ catalog の `pdfthumb:` 行だけを削除し、次回表示時に再生成する。画像 / ZIP 等の行は残す。
+
 `ConvertibleArchive` の cache ZIP 対応表 (`App.converted_archive_cache_paths`) は
-`install_new_items` で現在 items から path/mtime/size だけを snapshot し、SQLite `peek` と
-cache ZIP の `exists()` は `ConvertedArchiveCachePathsPending` worker で解決する。worker 完了前は
+`install_new_items` で現在 items の path/mtime/size と、folder thumb pin を引く container root
+だけを snapshot する。SQLite `peek`、cache ZIP の `exists()`、pin の DB lookup・cascade・stat は
+`ConvertedArchiveCachePathsPending` worker で解決し、最終 leaf が RAR / 7z / LZH のときだけ
+対応表へ加える。worker 完了前は
 `make_load_request` が `None` を返し、サムネは Pending のまま次の repaint で再試行される。
 この経路で `make_load_request` から `archive_cache.db` やファイルシステムを直接触らないこと。
 
@@ -430,14 +443,18 @@ cache ZIP の `exists()` は `ConvertedArchiveCachePathsPending` worker で解�
 
 #### 3.1.1 親コンテナの代表サムネピン (folder thumb pin、v0.9.x)
 
-ユーザーが「このフォルダ / ZIP / PDF の代表サムネは中の特定アイテム」を手動で指定
-できる機能。優先順位は **手動ピン > 自動代表選定 > フォルダ/ZIP/PDF アイコン**。
+ユーザーが「このフォルダ / ZIP / PDF / 変換済み RAR・7z・LZH の代表サムネは中の特定アイテム」を手動で指定
+できる機能。優先順位は **手動ピン > 自動代表選定 > フォルダ/ZIP/PDF/アーカイブアイコン**。
 
 - **DB**: `%APPDATA%/mimageviewer/folder_thumb_pins.db` (`folder_thumb_pins.rs`)。
   schema は `(container_key, source_kind, source_rel, source_entry, source_page)`。
   container_key は `path_key::normalize_keep_drive` で正規化。`source_kind` は
-  `image` / `video` / `folder` / `zipfile` / `pdffile` / `zipentry` / `zipdir` /
+  `image` / `video` / `folder` / `zipfile` / `pdffile` / `archive` / `zipentry` / `zipdir` /
   `pdfpage` で、`zipdir` は `source_entry` に ZIP 内 prefix を保存する。
+  `archive` は既存 TEXT 列への追加値で schema migration は不要。metadata bundle も同じ値を
+  export/import する。旧版は `archive` を含む bundle を拒否するが、現行版は将来の未知 kind
+  だけをその pin 1 件の partial failure として skip し、同じ bundle の他 metadata は取り込む
+  (`FORMAT_VERSION` は変更しない)。既知 kind の不正 rel/entry/page は従来どおり bundle を拒否する。
 - **解決パス**: `make_load_request` 経由で `apply_folder_thumb_pin` が pin map
   (= `App::folder_pin_map`、load 開始時に `lookup_many` で一括取得) を引き、
   pin があれば `LoadRequest` を target アイテム用の形 (path/zip_entry/pdf_page/
@@ -457,20 +474,29 @@ cache ZIP の `exists()` は `ConvertedArchiveCachePathsPending` worker で解�
   worker を folder auto-pick fallback (`resolve_folder_thumb_image`) に落とす。
   video pin は `skip_cache = false` 固定で idle quality-upgrade の対象外 (WebP IS the source)。
   - **「動画内 PIN 必須」仕様** (Codex post-merge P2 → ユーザー合意): video source の
-    folder pin は `try_set_folder_thumb_pin_with_video_guard` が **set 時に `video_pins.db`
+    folder pin は `try_set_folder_thumb_pin_with_guard` が **set 時に `video_pins.db`
     の WebP 有無をチェック**し、無ければトーストで案内して set を拒否する。sidecar
     `image::open` / Shell API 抽出を seed で同期実行すると、動画 pin 付きフォルダ複数 +
     Shell 遅延でフォルダ移動が固まるため。これにより seed は軽い DB→DB コピーのみに
     なり UI スレッドのヒッチが消える。動画を folder pin したいユーザーは先にフルスクリーン
     で `P` キー / HUD ピンボタンでフレームを保存する。
-- **Folder / ZipFile / PdfFile / ZipDir source の cascade 解決** (v0.9.x+ / ZipDir は
-  v1.3.x+): pin source がサブフォルダ、ZIP、PDF、ZIP 内コンテナの場合、
+- **Archive ピンの特殊経路**: 変換済み `ConvertibleArchive` は元アーカイブ path を pin identity
+  として保存し、load 時だけ `converted_archive_cache_paths` で cache ZIP path に置き換える。
+  dispatch は ZIP と同じ先頭画像 / `ZipEntry` / `ZipDir` 経路を使い、編集 preview の key も
+  cache ZIP path から作る。対応表がまだ無い、または変換 cache が失効した場合は同期 I/O や
+  pin の自動解除をせず `base_req` に戻し、worker 更新後の次回 load で再解決する。
+  set 時は `try_set_folder_thumb_pin_with_guard` が `archive_cache.db` の有効行を確認し、未変換なら
+  拒否して「一度開くか、選択してバッチ変換」を案内する。直接読める RAR は既存 cache path が
+  元 RAR を指す場合も有効とする。
+- **Folder / ZipFile / PdfFile / Archive / ZipDir source の cascade 解決** (v0.9.x+ / ZipDir は
+  v1.3.x+): pin source がサブフォルダ、ZIP、PDF、変換済み archive、ZIP 内コンテナの場合、
   `resolve_pin_target_cascaded` が `folder_thumb_pins.db` を順に lookup して、子コンテナが
   持つ代表 pin の最終 leaf まで辿る。例: A が B (Folder) を pin、B が C (Image) を pin
   → A の親グリッドでの A のタイルは C を表示する。同様に、親フォルダが book.zip /
-  book.pdf を pin し、その ZIP/PDF が page 2 を pin していれば、親も page 2 とその編集
-  preview を表示する。子側に pin がなければ従来どおり ZIP の先頭画像 / PDF のページ 0
-  へフォールバックする。ZIP 内でも、外側 root + ZipDir prefix を合成した仮想 container
+  book.pdf や変換済み archive を pin し、その ZIP/PDF/archive が page 2 を pin していれば、
+  親も page 2 とその編集
+  preview を表示する。子側に pin がなければ従来どおり ZIP / 変換済み archive の先頭画像、
+  PDF のページ 0 へフォールバックする。ZIP 内でも、外側 root + ZipDir prefix を合成した仮想 container
   key で lookup し、子の `ZipEntry` / `ZipDir` pin を同じ規則で辿る。
   cascade の段数上限は `Settings.folder_thumb_depth` (規定 3、範囲 0〜10) に揃える
   (= `resolve_folder_thumb_image` のサブフォルダ探索深度と同じ仕様)。
@@ -500,8 +526,9 @@ cache ZIP の `exists()` は `ConvertedArchiveCachePathsPending` worker で解�
   出さない。RAR/7z/LZH 変換キャッシュの drill-down は `zip_nav` が生きていれば
   `archive_source_override` を root にしてピン可能。`zip_nav` が無い中途半端な override
   状態だけは dead pin 回避のため UI を出さない。親フォルダで ConvertibleArchive
-  アイテム自体を選択した場合は、まだ中のエントリを選べないため disabled + tooltip
-  「変換後に設定可能」。
+  アイテム自体を選択した場合、変換 cache があれば通常どおり固定 / 解除でき、その archive
+  自身の先頭画像または内部 pin を代表にする。未変換の場合だけ disabled +
+  「変換後に設定可能」とし、ネイティブ右クリックメニューも項目を隠さず disabled 表示する。
 - **書き換え反映経路**: `set_folder_thumb_pin` / `remove_folder_thumb_pin` が DB
   書き込み + `folder_pin_map` 更新 + `folder_thumb_pin_dirty = true`。
   `consume_folder_thumb_pin_dirty` が **`update` 内 (fullscreen 中以外)** および

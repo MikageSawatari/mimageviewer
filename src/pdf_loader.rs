@@ -930,9 +930,10 @@ fn ipc_get_info(pdfium: &Pdfium, path: &Path, password: Option<&str>) -> std::io
 
 /// core_render の結果を IPC バイナリ (RGBA ピクセル) にシリアライズする。
 ///
-/// レスポンス: [status 1B][w 4B][h 4B][type_tag 1B][raster_w 4B][raster_h 4B][page_count 4B][rgba_pixels]
-/// ピクセル開始オフセット = 22B。`page_count` は呼び出し側 (thumb_loader) で PDF メタ
-/// キャッシュへ書き込むために返している (v1.0.0、`pdf_meta` テーブル)。
+/// レスポンス: [status 1B][w 4B][h 4B][type_tag 1B][raster_w 4B][raster_h 4B]
+/// [page_count 4B][page_width_points f32 4B][page_height_points f32 4B][rgba_pixels]
+/// ピクセル開始オフセット = 30B。ページ box のポイント寸法は、thumbnail raster の
+/// 整数丸めに依存しない表示レイアウト比を catalog へ残すために返す。
 fn ipc_render(
     pdfium: &Pdfium,
     path: &Path,
@@ -940,13 +941,13 @@ fn ipc_render(
     target: PdfRenderTarget,
     password: Option<&str>,
 ) -> std::io::Result<Vec<u8>> {
-    let (img, content_type, page_count) =
+    let (img, content_type, page_count, page_size_points) =
         core_render_with_count(pdfium, path, page_num, target, password)?;
     let rgba = img.to_rgba8();
     let w = rgba.width();
     let h = rgba.height();
     let pixels = rgba.as_raw();
-    let mut buf = Vec::with_capacity(1 + 4 + 4 + 9 + 4 + pixels.len());
+    let mut buf = Vec::with_capacity(30 + pixels.len());
     buf.push(STATUS_OK);
     buf.extend_from_slice(&w.to_le_bytes());
     buf.extend_from_slice(&h.to_le_bytes());
@@ -963,6 +964,8 @@ fn ipc_render(
         }
     }
     buf.extend_from_slice(&page_count.to_le_bytes());
+    buf.extend_from_slice(&page_size_points.width.to_le_bytes());
+    buf.extend_from_slice(&page_size_points.height.to_le_bytes());
     buf.extend_from_slice(pixels);
     Ok(buf)
 }
@@ -1021,7 +1024,12 @@ fn core_render_with_count(
     page_num: u32,
     target: PdfRenderTarget,
     password: Option<&str>,
-) -> std::io::Result<(image::DynamicImage, PdfPageContentType, u32)> {
+) -> std::io::Result<(
+    image::DynamicImage,
+    PdfPageContentType,
+    u32,
+    PdfPageSizePoints,
+)> {
     let doc = pdfium
         .load_pdf_from_file(path, password)
         .map_err(pdfium_open_error)?;
@@ -1041,7 +1049,15 @@ fn core_render_with_count(
     let bitmap = page
         .render_with_config(&render_config)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
-    Ok((bitmap.as_image(), content_type, page_count))
+    Ok((
+        bitmap.as_image(),
+        content_type,
+        page_count,
+        PdfPageSizePoints {
+            width: page_w,
+            height: page_h,
+        },
+    ))
 }
 
 // -----------------------------------------------------------------------
@@ -1758,9 +1774,10 @@ impl PdfWorkerPool {
             let msg = std::str::from_utf8(&data[1..]).unwrap_or("unknown error");
             return Err(std::io::Error::new(std::io::ErrorKind::Other, msg));
         }
-        // [status 1B][w 4B][h 4B][type_tag 1B][raster_w 4B][raster_h 4B][page_count 4B][pixels...]
-        // 全 22B のヘッダ。`page_count` は v1.0.0 で追加 (PDF メタキャッシュ用)。
-        if data[0] != STATUS_OK || data.len() < 22 {
+        // [status 1B][w 4B][h 4B][type_tag 1B][raster_w 4B][raster_h 4B]
+        // [page_count 4B][page_width_points f32 4B][page_height_points f32 4B][pixels...]
+        // 全 30B のヘッダ。page box は thumbnail の丸め前レイアウト比を保持する。
+        if data[0] != STATUS_OK || data.len() < 30 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "invalid render response",
@@ -1772,6 +1789,16 @@ impl PdfWorkerPool {
         let raster_w = u32::from_le_bytes(data[10..14].try_into().unwrap());
         let raster_h = u32::from_le_bytes(data[14..18].try_into().unwrap());
         let page_count = u32::from_le_bytes(data[18..22].try_into().unwrap());
+        let page_size_points = PdfPageSizePoints {
+            width: f32::from_le_bytes(data[22..26].try_into().unwrap()),
+            height: f32::from_le_bytes(data[26..30].try_into().unwrap()),
+        };
+        if !page_size_points.is_valid() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid PDF page box dimensions",
+            ));
+        }
         let content_type = if type_tag == 1 {
             PdfPageContentType::Raster {
                 w: raster_w,
@@ -1780,7 +1807,7 @@ impl PdfWorkerPool {
         } else {
             PdfPageContentType::Vector
         };
-        let pixels = &data[22..];
+        let pixels = &data[30..];
         let expected = (w as usize) * (h as usize) * 4;
         if pixels.len() != expected {
             return Err(std::io::Error::new(
@@ -1801,6 +1828,7 @@ impl PdfWorkerPool {
             image: image::DynamicImage::ImageRgba8(img_buf),
             content_type,
             page_count,
+            page_size_points,
         })
     }
 
@@ -2259,11 +2287,14 @@ impl PdfWorker {
                 }
                 let result =
                     core_render_with_count(pdfium, &path, page_num, target, password.as_deref())
-                        .map(|(image, content_type, page_count)| RenderResult {
-                            image,
-                            content_type,
-                            page_count,
-                        });
+                        .map(
+                            |(image, content_type, page_count, page_size_points)| RenderResult {
+                                image,
+                                content_type,
+                                page_count,
+                                page_size_points,
+                            },
+                        );
                 if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
                     return;
                 }
@@ -2501,6 +2532,38 @@ pub fn canonical_pdf_raster_long_edge(content_type: PdfPageContentType) -> Optio
     Some(zoom_render_long_edge(native_long, 1.0, Some(native_long)))
 }
 
+/// PDF page box のポイント寸法。thumbnail / display raster の target 丸めとは独立し、
+/// ページ固有の正確な縦横比を表す。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PdfPageSizePoints {
+    pub width: f32,
+    pub height: f32,
+}
+
+impl PdfPageSizePoints {
+    const CATALOG_UNITS_PER_POINT: f64 = 1000.0;
+
+    fn is_valid(self) -> bool {
+        self.width.is_finite() && self.height.is_finite() && self.width > 0.0 && self.height > 0.0
+    }
+
+    /// Catalog の INTEGER 列へ page box を 1/1000 point 単位で保存する。
+    /// 単なる point 整数丸めでは thumbnail と同種の比率誤差を残すため固定小数点にする。
+    pub fn catalog_layout_dims(self) -> Option<(u32, u32)> {
+        if !self.is_valid() {
+            return None;
+        }
+        let width = (f64::from(self.width) * Self::CATALOG_UNITS_PER_POINT).round();
+        let height = (f64::from(self.height) * Self::CATALOG_UNITS_PER_POINT).round();
+        if !(1.0..=f64::from(u32::MAX)).contains(&width)
+            || !(1.0..=f64::from(u32::MAX)).contains(&height)
+        {
+            return None;
+        }
+        Some((width as u32, height as u32))
+    }
+}
+
 /// PDF ページ render の結果一式 (v1.0.0)。
 ///
 /// 従来は `(image, content_type)` のタプルだったが、PDF メタキャッシュ
@@ -2513,6 +2576,7 @@ pub struct RenderResult {
     pub image: image::DynamicImage,
     pub content_type: PdfPageContentType,
     pub page_count: u32,
+    pub page_size_points: PdfPageSizePoints,
 }
 
 /// Render せずに取得した PDF page の canonical 判定情報。
@@ -3188,8 +3252,21 @@ fn fit_to_target(w: f32, h: f32, target: f32) -> (f32, f32) {
     if long <= 0.0 {
         return (w, h);
     }
-    let scale = target / long;
-    (w * scale, h * scale)
+    let target = target.round().clamp(1.0, u32::MAX as f32) as u32;
+    let Some(source_dims) = (PdfPageSizePoints {
+        width: w,
+        height: h,
+    })
+    .catalog_layout_dims() else {
+        let scale = target as f32 / long;
+        return (w * scale, h * scale);
+    };
+    let (width, height) = crate::fast_resize::aspect_accurate_fit_dimensions(
+        (target, target),
+        (target, target),
+        source_dims,
+    );
+    (width as f32, height as f32)
 }
 
 // -----------------------------------------------------------------------
@@ -3261,6 +3338,26 @@ C:\isolated\miv-data"#
             display_render_long_edge(window, 600.0, 900.0, false, vector_target()),
             1320
         );
+    }
+
+    #[test]
+    fn pdf_render_target_chooses_near_cap_dimensions_with_low_aspect_error() {
+        for (width, height, target) in [
+            (1643.0, 2375.0, 473.0),
+            (1024.0, 1536.0, 512.0),
+            (896.0, 1120.0, 512.0),
+        ] {
+            let (render_w, render_h) = fit_to_target(width, height, target);
+            let source_ratio = f64::from(width / height);
+            let render_ratio = f64::from(render_w / render_h);
+            let relative_error = ((render_ratio / source_ratio) - 1.0).abs();
+
+            assert!(render_w <= target && render_h <= target);
+            assert!(
+                relative_error <= 0.0005,
+                "{width}x{height} -> {render_w}x{render_h}: {relative_error:.6}"
+            );
+        }
     }
 
     #[test]
@@ -3381,6 +3478,10 @@ C:\isolated\miv-data"#
                     image: image::DynamicImage::new_rgba8(824, 1200),
                     content_type: PdfPageContentType::Raster { w: 824, h: 1200 },
                     page_count: 17,
+                    page_size_points: PdfPageSizePoints {
+                        width: 612.0,
+                        height: 792.0,
+                    },
                 })
             },
         )
@@ -3411,6 +3512,10 @@ C:\isolated\miv-data"#
                     image: image::DynamicImage::new_rgba8(1000, 2000),
                     content_type: PdfPageContentType::Raster { w: 1000, h: 2000 },
                     page_count: 3,
+                    page_size_points: PdfPageSizePoints {
+                        width: 612.0,
+                        height: 792.0,
+                    },
                 })
             },
         )
@@ -3504,6 +3609,49 @@ C:\isolated\miv-data"#
                 content_type: PdfPageContentType::Vector,
                 page_count: 42,
             }
+        );
+    }
+
+    #[test]
+    fn render_response_preserves_page_box_independently_from_raster_size() {
+        let mut response = vec![STATUS_OK];
+        response.extend_from_slice(&327u32.to_le_bytes());
+        response.extend_from_slice(&473u32.to_le_bytes());
+        response.push(0); // vector
+        response.extend_from_slice(&0u32.to_le_bytes());
+        response.extend_from_slice(&0u32.to_le_bytes());
+        response.extend_from_slice(&28u32.to_le_bytes());
+        response.extend_from_slice(&595.276_f32.to_le_bytes());
+        response.extend_from_slice(&841.89_f32.to_le_bytes());
+        response.resize(30 + 327 * 473 * 4, 0xff);
+
+        let result = PdfWorkerPool::parse_render_response(&response).unwrap();
+        assert_eq!(result.image.width(), 327);
+        assert_eq!(result.image.height(), 473);
+        assert_eq!(result.page_count, 28);
+        assert_eq!(
+            result.page_size_points.catalog_layout_dims(),
+            Some((595_276, 841_890))
+        );
+    }
+
+    #[test]
+    fn catalog_pdf_layout_dims_reject_invalid_page_boxes() {
+        assert_eq!(
+            PdfPageSizePoints {
+                width: f32::NAN,
+                height: 842.0,
+            }
+            .catalog_layout_dims(),
+            None
+        );
+        assert_eq!(
+            PdfPageSizePoints {
+                width: 0.0,
+                height: 842.0,
+            }
+            .catalog_layout_dims(),
+            None
         );
     }
 

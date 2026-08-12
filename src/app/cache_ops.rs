@@ -703,9 +703,9 @@ impl App {
                                     0,
                                     crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
                                 ) {
-                                    let img = res.image;
-                                    if let Some(bytes) = encode_and_save(
-                                        &img,
+                                    if let Some(bytes) = encode_and_save_with_source_dims(
+                                        &res.image,
+                                        res.page_size_points.catalog_layout_dims(),
                                         &folder_key,
                                         &catalog,
                                         *pdf_mtime,
@@ -786,9 +786,9 @@ impl App {
                                         ));
                                     }
                                 }
-                                let img = res.image;
-                                if let Some(bytes) = encode_and_save(
-                                    &img,
+                                if let Some(bytes) = encode_and_save_with_source_dims(
+                                    &res.image,
+                                    res.page_size_points.catalog_layout_dims(),
                                     &folder_key,
                                     &catalog,
                                     *pdf_mtime,

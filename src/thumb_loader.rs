@@ -385,11 +385,13 @@ impl CacheDecision {
 pub fn resize_to_display_color_image(
     img: &image::DynamicImage,
     display_px: u32,
+    source_dims: Option<(u32, u32)>,
 ) -> egui::ColorImage {
-    let resized = crate::fast_resize::resize_dynamic_fit(
+    let resized = crate::fast_resize::resize_dynamic_fit_with_source_aspect(
         img,
         display_px,
         display_px,
+        source_dims.unwrap_or((img.width(), img.height())),
         crate::fast_resize::Quality::Lanczos3,
     );
     let rgba = resized.to_rgba8();
@@ -402,26 +404,27 @@ pub fn resize_to_display_color_image(
 pub fn decode_image_for_thumb(path: &std::path::Path, display_px: u32) -> Option<egui::ColorImage> {
     // JPEG なら TurboJPEG で DCT scale 付き高速デコードを試す。
     // この関数は cache 用 thumb_px を持たないので target = display_px を使う。
-    let turbo_img: Option<image::DynamicImage> = if is_jpeg_ext(path) {
-        match decode_jpeg_turbo_scaled_from_path(path, display_px) {
-            Ok((img, _stats)) => Some(img),
-            Err(DctDecodeError::TerminalRejection(msg)) => {
-                // adversarial JPEG — fallback すると danger なので None で諦める。
-                // この関数は cosmetic helper (動画 sidecar) なので致命的ではない。
-                crate::logger::log(format!(
-                    "decode_image_for_thumb: DCT terminal rejection {path:?}: {msg}"
-                ));
-                return None;
+    let (turbo_img, source_dims): (Option<image::DynamicImage>, Option<(u32, u32)>) =
+        if is_jpeg_ext(path) {
+            match decode_jpeg_turbo_scaled_from_path(path, display_px) {
+                Ok((img, stats)) => (Some(img), Some((stats.src_w, stats.src_h))),
+                Err(DctDecodeError::TerminalRejection(msg)) => {
+                    // adversarial JPEG — fallback すると danger なので None で諦める。
+                    // この関数は cosmetic helper (動画 sidecar) なので致命的ではない。
+                    crate::logger::log(format!(
+                        "decode_image_for_thumb: DCT terminal rejection {path:?}: {msg}"
+                    ));
+                    return None;
+                }
+                Err(DctDecodeError::Fallback(_)) => (None, None),
             }
-            Err(DctDecodeError::Fallback(_)) => None,
-        }
-    } else {
-        None
-    };
+        } else {
+            (None, None)
+        };
     let img = turbo_img
         .or_else(|| image::open(path).ok())
         .or_else(|| crate::wic_decoder::decode_to_dynamic_image(path))?;
-    Some(resize_to_display_color_image(&img, display_px))
+    Some(resize_to_display_color_image(&img, display_px, source_dims))
 }
 
 /// EXIF Orientation に基づいて画像を回転・反転する。
@@ -1968,8 +1971,9 @@ fn process_neighbor_prefetch(
         }
     }
     if !thumb_present {
-        if let Some(bytes) = encode_and_save(
+        if let Some(bytes) = encode_and_save_with_source_dims(
             &res.image,
+            res.page_size_points.catalog_layout_dims(),
             &folder_key,
             parent_catalog,
             mtime,
@@ -2502,6 +2506,9 @@ pub fn load_one_cached(
     // source_dims を **元寸法** で保存する (DCT scaled buffer ではない)。
     let mut decode_source = crate::stats::DecodeSource::Native;
     let mut dct_stats: Option<ScaleStats> = None;
+    // PDF thumbnail の整数丸め後 raster ではなく、PDFium が読んだ page box の
+    // 縦横比を catalog に残す。値は 1/1000 point の固定小数点レイアウト寸法。
+    let mut pdf_layout_dims: Option<(u32, u32)> = None;
     let mut byte_orientation: u16 = 1;
     let has_verified_source = verified_source_bytes.is_some();
     let img_result = if let Some(page_num) = pdf_page {
@@ -2525,6 +2532,7 @@ pub fn load_one_cached(
             cancel_policy,
         )
         .map(|res| {
+            pdf_layout_dims = res.page_size_points.catalog_layout_dims();
             // C-thumb (v1.0.0): 親フォルダ内の PDF サムネ render の場合、ついでに
             // pdf_meta テーブルへページ数を書き込む。`cache_key_override` が
             // "pdfthumb:" 始まりのときが「親フォルダ catalog 経路」の signature。
@@ -2796,12 +2804,16 @@ pub fn load_one_cached(
 
     let decode_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-    // 元画像のピクセル寸法。
+    // 元画像の寸法。PDF だけは表示 raster のピクセル寸法ではなく page box の
+    // 固定小数点レイアウト寸法を使う。PDFium の target 丸めで 327x473 等になった
+    // thumbnail 自身の比率を保存すると、final への差し替え時に枠が動くため。
     // DCT scale 経由なら `img.width()/height()` は scaled buffer の寸法なので
     // 使わず、`dct_stats.src_w/src_h` から EXIF 適用後寸法を算出する。
-    // 非 DCT 経路 (image::open / WIC / Susie / PDF / ZIP image::load_from_memory)
+    // 非 DCT 経路 (image::open / WIC / Susie / ZIP image::load_from_memory)
     // は img の現寸法 = 元寸法 (EXIF 適用済み) なので従来通り。
-    let source_dims: Option<(u32, u32)> = if let Some(stats) = dct_stats {
+    let source_dims: Option<(u32, u32)> = if pdf_page.is_some() {
+        pdf_layout_dims
+    } else if let Some(stats) = dct_stats {
         Some(stats.source_dims_after_exif(orientation))
     } else {
         Some((img.width(), img.height()))
@@ -2832,7 +2844,7 @@ pub fn load_one_cached(
     //     WebP 量子化を経由しないため画質劣化なし、かつ WebP encode を待たない
     //     from_cache = false: 元画像由来の高画質 (段階 E アップグレード不要)
     let t_display = std::time::Instant::now();
-    let display_ci = resize_to_display_color_image(&img, display_px);
+    let display_ci = resize_to_display_color_image(&img, display_px, source_dims);
     let display_ci = match pinned_page_adjustment {
         Some(params) => crate::adjustment::apply_adjustments_fast(&display_ci, params),
         None => display_ci,
@@ -2885,7 +2897,12 @@ pub fn load_one_cached(
     if should_save {
         let cat = catalog.expect("should_save => catalog is Some");
         let t_enc = std::time::Instant::now();
-        match crate::catalog::encode_thumb_webp(&img, thumb_px, thumb_quality as f32) {
+        match crate::catalog::encode_thumb_webp_with_source_dims(
+            &img,
+            thumb_px,
+            thumb_quality as f32,
+            source_dims.unwrap_or((img.width(), img.height())),
+        ) {
             Some((webp_data, w, h)) => {
                 let encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
                 if let Err(e) = cat.save(name, mtime, file_size, w, h, source_dims, &webp_data) {
@@ -3849,7 +3866,12 @@ pub fn encode_and_save_with_source_dims(
     thumb_quality: u8,
 ) -> Option<usize> {
     let source_dims = source_dims_override.or(Some((img.width(), img.height())));
-    let (webp_data, w, h) = crate::catalog::encode_thumb_webp(img, thumb_px, thumb_quality as f32)?;
+    let (webp_data, w, h) = crate::catalog::encode_thumb_webp_with_source_dims(
+        img,
+        thumb_px,
+        thumb_quality as f32,
+        source_dims.unwrap_or((img.width(), img.height())),
+    )?;
     catalog
         .save(key, mtime, file_size, w, h, source_dims, &webp_data)
         .ok()?;
@@ -3921,8 +3943,9 @@ pub fn build_and_save_one_pdf(
     )
     .ok()?;
     let key = crate::grid_item::pdf_page_cache_key(page_num);
-    encode_and_save(
+    encode_and_save_with_source_dims(
         &res.image,
+        res.page_size_points.catalog_layout_dims(),
         &key,
         catalog,
         mtime,

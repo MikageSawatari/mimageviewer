@@ -10,7 +10,8 @@ use std::sync::{
 use crate::final_composite::FinalCompositeTiming;
 use crate::final_composite::{
     FinalCompositePlan, FinalCompositeResult, active_favorite_default_id_for_path,
-    build_final_composite_plan_without_ai, execute_final_composite, resolve_effective_params,
+    build_final_composite_plan_without_ai, execute_final_composite,
+    final_composite_colorize_applies, resolve_effective_params,
 };
 use crate::keymap::{CommandScope, KeyAction, LOCATION_NAVIGATION_ACTIONS, PINNED_TAG_ACTIONS};
 
@@ -2270,6 +2271,7 @@ struct ViewerContextBundle {
     >,
     thumb_edit_preview_keys: std::collections::HashMap<usize, String>,
     thumb_adjust_tex: std::collections::HashMap<usize, egui::TextureHandle>,
+    passthrough_rendition_cache: PassthroughRenditionCache,
     adjustment_page_params: std::collections::HashMap<usize, crate::adjustment::AdjustParams>,
     local_adjust_page_layers:
         std::collections::HashMap<usize, Vec<local_adjust_core::LocalAdjustmentLayer>>,
@@ -2555,6 +2557,7 @@ impl ViewerContextBundle {
             thumb_edit_preview_layers: std::collections::HashMap::new(),
             thumb_edit_preview_keys: std::collections::HashMap::new(),
             thumb_adjust_tex: std::collections::HashMap::new(),
+            passthrough_rendition_cache: PassthroughRenditionCache::default(),
             adjustment_page_params: std::collections::HashMap::new(),
             local_adjust_page_layers: std::collections::HashMap::new(),
             local_adjust_pages: std::collections::HashSet::new(),
@@ -4995,7 +4998,7 @@ fn fs_upload_backlog_idx(value: &(usize, FsLoadResult, u64)) -> usize {
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::thumb_loader::{
     CacheDecision, DctDecodeError, LoadRequest, ScaleStats, ThumbMsg, apply_orientation,
-    build_and_save_one, compute_display_px, decode_jpeg_turbo_scaled_from_bytes, encode_and_save,
+    build_and_save_one, compute_display_px, decode_jpeg_turbo_scaled_from_bytes,
     encode_and_save_with_source_dims, is_jpeg_entry, process_load_request,
     read_exif_orientation_from_bytes,
 };
@@ -5673,6 +5676,21 @@ pub(crate) enum FsPageDisplaySource {
     RetainedPdfFinalAi,
 }
 
+/// Whether an explicit fullscreen open should start full-resolution work now.
+/// Page-turn pass-through uses the deferred variant; release returns to Eager
+/// without storing a second navigation-mode flag in App state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FsOpenMaterialization {
+    Eager,
+    DeferredPageTurn,
+}
+
+impl FsOpenMaterialization {
+    const fn is_eager(self) -> bool {
+        matches!(self, Self::Eager)
+    }
+}
+
 impl FsPageLoadState {
     fn needs_load_request(self) -> bool {
         matches!(self, Self::NeedsLoad)
@@ -6010,6 +6028,108 @@ pub(crate) struct FinalCompositeKey {
     pub(crate) bg: u8,
 }
 
+fn final_effect_identity_matches(left: FinalCompositeKey, right: FinalCompositeKey) -> bool {
+    left.edit_key.idx == right.edit_key.idx
+        && left.edit_key.erase_mask_gen == right.edit_key.erase_mask_gen
+        && left.edit_key.local_gen == right.edit_key.local_gen
+        && left.edit_key.conceal_mask_gen == right.edit_key.conceal_mask_gen
+        && left.edit_key.conceal_gen == right.edit_key.conceal_gen
+        && left.params_hash == right.params_hash
+}
+
+const PASSTHROUGH_RENDITION_CACHE_CAPACITY: usize = 16;
+
+#[derive(Clone)]
+pub(crate) struct PassthroughRenditionEntry {
+    /// Catalog-thumbnail pixels used to build this rendition. Pointer identity
+    /// closes the independent thumbnail quality-upgrade lifetime without a
+    /// second effect-key system.
+    source_pixels: Arc<egui::ColorImage>,
+    /// Keep the CPU result beside the GPU texture so the cache owns one complete rendition.
+    _pixels: Arc<egui::ColorImage>,
+    /// MonochromeOnly applicability resolved from the rendition's adjusted
+    /// pixels. The landing-page final worker reuses this exact decision so a
+    /// thumbnail/full-resolution classifier disagreement cannot change color.
+    colorize_applied: bool,
+    pub(crate) texture: egui::TextureHandle,
+}
+
+/// Small viewer-context-local LRU for color-faithful page-turn thumbnails.
+/// `FinalCompositeKey` already owns idx, edit generation, effect parameters and background.
+#[derive(Clone, Default)]
+pub(crate) struct PassthroughRenditionCache {
+    entries: std::collections::HashMap<FinalCompositeKey, PassthroughRenditionEntry>,
+    lru: std::collections::VecDeque<FinalCompositeKey>,
+}
+
+impl PassthroughRenditionCache {
+    fn get(
+        &mut self,
+        key: FinalCompositeKey,
+        source_pixels: &Arc<egui::ColorImage>,
+    ) -> Option<PassthroughRenditionEntry> {
+        let source_matches = self
+            .entries
+            .get(&key)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.source_pixels, source_pixels));
+        if !source_matches {
+            self.remove(&key);
+            return None;
+        }
+        self.touch(key);
+        self.entries.get(&key).cloned()
+    }
+
+    fn insert(&mut self, key: FinalCompositeKey, entry: PassthroughRenditionEntry) {
+        self.entries.insert(key, entry);
+        self.touch(key);
+        while self.lru.len() > PASSTHROUGH_RENDITION_CACHE_CAPACITY {
+            if let Some(oldest) = self.lru.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+
+    fn remove(&mut self, key: &FinalCompositeKey) {
+        self.entries.remove(key);
+        if let Some(pos) = self.lru.iter().position(|candidate| candidate == key) {
+            self.lru.remove(pos);
+        }
+    }
+
+    fn touch(&mut self, key: FinalCompositeKey) {
+        if let Some(pos) = self.lru.iter().position(|candidate| *candidate == key) {
+            self.lru.remove(pos);
+        }
+        self.lru.push_back(key);
+    }
+
+    fn contains_texture(&self, texture_id: egui::TextureId) -> bool {
+        self.entries
+            .values()
+            .any(|entry| entry.texture.id() == texture_id)
+    }
+
+    fn colorize_applied_for_final(&self, key: FinalCompositeKey) -> Option<bool> {
+        self.lru
+            .iter()
+            .rev()
+            .find(|candidate| final_effect_identity_matches(**candidate, key))
+            .and_then(|candidate| self.entries.get(candidate))
+            .map(|entry| entry.colorize_applied)
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.lru.clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 const FINAL_EFFECT_PREFETCH_BLOCK_LOG_CAPACITY: usize = 256;
 const FINAL_EFFECT_PREFETCH_BLOCK_LOG_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(1);
@@ -6166,6 +6286,10 @@ impl FinalCompositeDropTracker {
 #[derive(Default)]
 pub(crate) struct FinalCompositeCache {
     entries: std::collections::HashMap<FinalCompositeKey, FinalCompositeEntry>,
+    /// Actual worker classification for resident MonochromeOnly composites.
+    /// This lets a later pass-through rendition use the already-visible final
+    /// decision instead of independently classifying a rounded thumbnail.
+    colorize_applied: std::collections::HashMap<FinalCompositeKey, bool>,
     dropped: FinalCompositeDropTracker,
 }
 
@@ -6186,6 +6310,8 @@ impl FinalCompositeCache {
             }
             retain
         });
+        self.colorize_applied
+            .retain(|key, _| self.entries.contains_key(key));
         if dropped.is_empty() {
             return;
         }
@@ -6201,6 +6327,7 @@ impl FinalCompositeCache {
         reason: &'static str,
     ) -> Option<FinalCompositeEntry> {
         let removed = self.entries.remove(key);
+        self.colorize_applied.remove(key);
         if removed.as_ref().is_some_and(|entry| entry.complete) {
             self.dropped
                 .record_drop(*key, true, std::time::Instant::now(), reason);
@@ -6221,10 +6348,34 @@ impl FinalCompositeCache {
             }
         }
         self.entries.clear();
+        self.colorize_applied.clear();
     }
 
     fn observe_spawn(&mut self, key: FinalCompositeKey) -> Option<FinalEffectRecomputeObservation> {
         self.dropped.observe_spawn(key, std::time::Instant::now())
+    }
+
+    fn record_colorize_applied(&mut self, key: FinalCompositeKey, applied: bool) {
+        self.colorize_applied.insert(key, applied);
+    }
+
+    fn colorize_applied_for_rendition(&self, key: FinalCompositeKey) -> Option<bool> {
+        self.entries
+            .get(&key)
+            .and_then(|_| self.colorize_applied.get(&key).copied())
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .filter(|(candidate, _)| final_effect_identity_matches(**candidate, key))
+                    .filter_map(|(candidate, _)| {
+                        self.colorize_applied
+                            .get(candidate)
+                            .copied()
+                            .map(|applied| (candidate.edit_key.source_gen, applied))
+                    })
+                    .max_by_key(|(source_gen, _)| *source_gen)
+                    .map(|(_, applied)| applied)
+            })
     }
 }
 
@@ -6283,27 +6434,29 @@ pub(crate) struct ContinuousPageTransition {
 
 /// フルスクリーンの一時表示を 1 フィールドで所有する typed state。
 ///
-/// フォルダ横断と同一 viewer 内のカラー化待ちは、どちらも旧ページを個別 slot に
+/// フォルダ横断と同一 viewer 内の final-effect source reload は、どちらも旧ページを個別 slot に
 /// 分けず、画面上の 1 表示ユニット（単ページまたは見開き）を一体で保持する。
 /// variant は保持する理由と解放条件を分離するために維持する。
 #[derive(Clone)]
 pub(crate) enum FsHoldover {
     FolderNavigation(FsDisplayUnitHoldover),
-    ColorizeDisplayUnit(ColorizeDisplayUnitHoldover),
+    FinalEffectSourceReload(FinalEffectSourceReloadHoldover),
 }
 
 impl FsHoldover {
     pub(crate) fn folder_navigation_display_unit(&self) -> Option<&FsDisplayUnitHoldover> {
         match self {
             Self::FolderNavigation(unit) => Some(unit),
-            Self::ColorizeDisplayUnit(_) => None,
+            Self::FinalEffectSourceReload(_) => None,
         }
     }
 
-    pub(crate) fn colorize_wait_started_at(&self) -> Option<std::time::Instant> {
+    pub(crate) fn final_effect_wait(&self) -> Option<(usize, std::time::Instant)> {
         match self {
             Self::FolderNavigation(_) => None,
-            Self::ColorizeDisplayUnit(holdover) => Some(holdover.started_at),
+            Self::FinalEffectSourceReload(holdover) => {
+                Some((holdover.target_idx, holdover.started_at))
+            }
         }
     }
 
@@ -6316,11 +6469,11 @@ impl FsHoldover {
                 .expect("folder navigation display unit must contain at least one page")
                 .texture
                 .id(),
-            Self::ColorizeDisplayUnit(holdover) => holdover
+            Self::FinalEffectSourceReload(holdover) => holdover
                 .previous
                 .pages
                 .first()
-                .expect("colorize display unit must contain at least one page")
+                .expect("final-effect source reload must contain at least one page")
                 .texture
                 .id(),
         }
@@ -6328,11 +6481,11 @@ impl FsHoldover {
 }
 
 #[derive(Clone)]
-pub(crate) struct ColorizeDisplayUnitHoldover {
-    /// `open_fullscreen` 後にこの idx が current である間だけ previous を公開する。
+pub(crate) struct FinalEffectSourceReloadHoldover {
+    /// source reload 後にこの idx が current である間だけ previous を公開する。
     pub(crate) target_idx: usize,
     pub(crate) previous: FsDisplayUnitHoldover,
-    /// The UX delay belongs to the typed colorize wait state, not to a separate flag.
+    /// The UX delay belongs to the typed source-reload wait state, not to a separate flag.
     pub(crate) started_at: std::time::Instant,
 }
 
@@ -6368,6 +6521,55 @@ pub(crate) struct FinalEffectPending {
     nearest_sampler: bool,
     /// 非表示ページの先読みとして起動した worker。表示要求時は同じ job を昇格して再利用する。
     prefetch: bool,
+}
+
+/// Build the low-resolution page-turn rendition synchronously on the UI thread.
+/// The order is the page-turn contract in display-pipeline §2.5.6:
+/// color adjustment -> colorize -> Creative LUT. Content edits, AI, sharpen and
+/// post filters stay outside this bounded thumbnail-sized path.
+struct PassthroughRenditionPixels {
+    /// None means every low-resolution effect was an identity and the catalog
+    /// texture can be reused without an extra upload.
+    pixels: Option<egui::ColorImage>,
+    colorize_applied: bool,
+}
+
+fn build_passthrough_rendition_pixels(
+    source: &egui::ColorImage,
+    params: &crate::adjustment::AdjustParams,
+    creative_lut: Option<(crate::creative_lut::SharedCreativeLut, f32)>,
+    colorize_applicable_override: Option<bool>,
+) -> PassthroughRenditionPixels {
+    let mut pixels = if params.is_color_identity() {
+        None
+    } else {
+        Some(crate::adjustment::apply_adjustments_fast(source, params))
+    };
+    let colorize_source = pixels.as_ref().unwrap_or(source);
+    // 適用可否の規則は最終合成と同じ 1 か所に置く (final_composite)。
+    let colorize_applied = final_composite_colorize_applies(
+        &params.colorize,
+        colorize_applicable_override,
+        colorize_source,
+    );
+    if colorize_applied {
+        let cancel = AtomicBool::new(false);
+        pixels = crate::colorize::apply_applicable_with_cancel(
+            colorize_source,
+            &params.colorize,
+            &cancel,
+        );
+    }
+    if let Some((lut, strength)) = creative_lut {
+        let lut_source = pixels.as_ref().unwrap_or(source);
+        pixels = Some(crate::creative_lut::apply_to_color_image(
+            lut_source, &lut, strength,
+        ));
+    }
+    PassthroughRenditionPixels {
+        pixels,
+        colorize_applied,
+    }
 }
 
 /// 見開きから消しゴムに入ったときのコンテキスト。Apply / Cancel で
@@ -10643,6 +10845,9 @@ pub struct App {
     /// `effective_params(idx)` が色調 identity でないときのみ格納。
     /// サムネ描画時は `thumbnails[idx].tex` より優先される。
     pub(crate) thumb_adjust_tex: std::collections::HashMap<usize, egui::TextureHandle>,
+    /// ページ送り中に使う、完成画像と同じ色処理を適用済みの低解像度 rendition。
+    /// viewer context ごとに所有し、通常の final composite cache とは寿命を分ける。
+    pub(crate) passthrough_rendition_cache: PassthroughRenditionCache,
     /// 前フレームのスライダードラッグ状態。true→false 遷移を検知して
     /// release 時に `thumb_adjust_tex` を全無効化する。
     pub(crate) thumb_adjust_was_dragging: bool,
@@ -11297,7 +11502,7 @@ pub struct App {
     /// ロックを即解除してしまい、items 入れ替えの瞬間に holdover が失われて
     /// 「ファイル名のみ表示」が出る不具合になる。
     pub(crate) fs_nav_locked_gen: Option<u64>,
-    /// 旧表示を保持する単一 typed state。`FolderNavigation` / `ColorizeDisplayUnit` とも
+    /// 旧表示を保持する単一 typed state。folder navigation / final-effect source reload とも
     /// 単ページ / 見開き全体を 1 unit として持ち、variant ごとに解放条件を分離する。
     /// legacy 名は context bundle の機械的な差分を抑えるため維持している。
     pub(crate) fs_holdover_tex: Option<FsHoldover>,
@@ -12866,6 +13071,7 @@ impl App {
             thumb_edit_preview_layers: std::collections::HashMap::new(),
             thumb_edit_preview_keys: std::collections::HashMap::new(),
             thumb_adjust_tex: std::collections::HashMap::new(),
+            passthrough_rendition_cache: PassthroughRenditionCache::default(),
             thumb_adjust_was_dragging: false,
             thumb_adjust_drag_color_dirty: false,
             adjustment_dragging: false,
@@ -14208,6 +14414,18 @@ impl App {
         self.common_modal_dialog_open()
     }
 
+    #[cfg(all(windows, feature = "test-script"))]
+    pub(crate) fn prepare_test_script_run(&mut self) {
+        // A fresh isolated data directory normally opens first-run and migration
+        // dialogs. Scripted runs cannot dismiss pointer-driven setup UI, and
+        // allowing those dialogs to block input would make an unattended smoke
+        // test impossible. Suppress startup-only prompts in memory; never save
+        // these choices to the isolated profile.
+        self.settings.first_setup_completed = true;
+        self.show_mouse_nav_migration_prompt = false;
+        self.show_whats_new = false;
+    }
+
     pub(crate) fn clear_fullscreen_tag_picker_state(&mut self) {
         self.fullscreen_tag_picker_open = false;
         self.fullscreen_tag_picker_input.clear();
@@ -14470,6 +14688,7 @@ impl App {
             thumb_edit_preview_layers,
             thumb_edit_preview_keys,
             thumb_adjust_tex,
+            passthrough_rendition_cache,
             adjustment_page_params,
             local_adjust_page_layers,
             local_adjust_pages,
@@ -14702,6 +14921,7 @@ impl App {
         swap_field!(thumb_edit_preview_layers);
         swap_field!(thumb_edit_preview_keys);
         swap_field!(thumb_adjust_tex);
+        swap_field!(passthrough_rendition_cache);
         swap_field!(adjustment_page_params);
         swap_field!(local_adjust_page_layers);
         swap_field!(local_adjust_pages);
@@ -16840,6 +17060,7 @@ impl App {
         self.reset_folder_rating_counts();
         self.adjustment_cache.clear();
         self.thumb_pixels.clear();
+        self.passthrough_rendition_cache.clear();
         self.thumb_edit_preview_layers.clear();
         self.thumb_adjust_tex.clear();
         self.fs_cache.clear();
@@ -22160,6 +22381,7 @@ impl App {
         // 画像補正: ページ個別パラメータを DB から復元
         self.adjustment_cache.clear();
         self.thumb_pixels.clear();
+        self.passthrough_rendition_cache.clear();
         self.thumb_edit_preview_layers.clear();
         self.thumb_adjust_tex.clear();
         self.thumb_adjust_was_dragging = false;
@@ -22842,7 +23064,7 @@ impl App {
         let Some(db) = self.archive_cache_db.clone() else {
             return;
         };
-        let inputs: Vec<(PathBuf, i64, i64)> = self
+        let direct_inputs: Vec<(PathBuf, i64, i64)> = self
             .items
             .iter()
             .enumerate()
@@ -22864,9 +23086,21 @@ impl App {
                 Some((path.clone(), mtime, file_size))
             })
             .collect();
-        if inputs.is_empty() {
+        // Folder タイル自身の pin が指す変換対象アーカイブは current items に現れない。
+        // container root だけを snapshot し、DB lookup + cascade + metadata は worker 側で行う。
+        let pin_roots: Vec<PathBuf> = self
+            .items
+            .iter()
+            .filter_map(|item| {
+                self.folder_pin_lookup_target_for_item(item)
+                    .map(|target| target.path)
+            })
+            .collect();
+        let pin_db = self.folder_thumb_pin_db.clone();
+        if direct_inputs.is_empty() && (pin_roots.is_empty() || pin_db.is_none()) {
             return;
         }
+        let max_cascade_depth = self.settings.folder_thumb_depth as usize;
 
         let generation = self.items_generation;
         let input_seq = self.input_seq;
@@ -22880,7 +23114,40 @@ impl App {
                 let mut paths = std::collections::HashMap::new();
                 let mut peeked = 0usize;
                 let mut hits = 0usize;
-                for (path, mtime, file_size) in inputs {
+                let mut candidates: std::collections::HashMap<String, (PathBuf, i64, i64)> =
+                    std::collections::HashMap::new();
+                for (path, mtime, file_size) in direct_inputs {
+                    candidates.insert(
+                        crate::path_key::normalize_keep_drive(&path),
+                        (path, mtime, file_size),
+                    );
+                }
+                if let Some(pin_db) = pin_db.as_deref() {
+                    for root in pin_roots {
+                        if worker_cancel.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let Some(source) = pin_db.lookup(&root) else {
+                            continue;
+                        };
+                        let Some(resolved) =
+                            crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
+                                &root,
+                                &source,
+                                |path| pin_db.lookup(path),
+                                max_cascade_depth,
+                            )
+                        else {
+                            continue;
+                        };
+                        if crate::folder_tree::is_convertible_archive_path(&resolved.abs_path) {
+                            candidates
+                                .entry(crate::path_key::normalize_keep_drive(&resolved.abs_path))
+                                .or_insert((resolved.abs_path, resolved.mtime, resolved.file_size));
+                        }
+                    }
+                }
+                for (_, (path, mtime, file_size)) in candidates {
                     if worker_cancel.load(Ordering::Relaxed) {
                         return;
                     }
@@ -23011,7 +23278,7 @@ impl App {
     /// fallback も seed に入れたが、UI スレッドで重く動画 pin 付きフォルダ複数 + Shell
     /// 遅延でフォルダ移動が固まったため撤去した。動画を folder pin したいユーザーは
     /// 先にフルスクリーンで `P` キー / HUD でフレームを保存する
-    /// (set 側で `try_set_folder_thumb_pin_with_video_guard` がガード)。
+    /// (set 側で `try_set_folder_thumb_pin_with_guard` がガード)。
     fn seed_folder_video_pin_thumbs(
         &self,
         cache_map: &Arc<
@@ -23085,7 +23352,7 @@ impl App {
             // UI スレッドで重く、動画 pin 付きフォルダが複数あると `start_loading_items`
             // (= フォルダ移動) がブロックする。sidecar / Shell fallback は撤去し、
             // 「動画を folder pin するには先にフルスクリーンでフレームを保存する」
-            // 仕様にした (set 側で `try_set_folder_thumb_pin_with_video_guard` がガード)。
+            // 仕様にした (set 側で `try_set_folder_thumb_pin_with_guard` がガード)。
             // ここに来る時点で video_pins WebP は必ず存在する想定だが、レース
             // (フルスクリーンで unpin した直後など) で空になっていることもあるので
             // `.filter(non-empty)` は残し、空なら下の purge_stale 経路に落とす。
@@ -23237,6 +23504,20 @@ impl App {
                         let item = GridItem::PdfFile(container.join(rel));
                         let key = container_cache_base_key(&item, use_full_path_key, None, 0)
                             .unwrap_or_else(|| format!("{}{}", CACHE_KEY_PDF, fname));
+                        cat.load_one(&key).ok().flatten()
+                    }
+                    FileKind::ConvertibleArchive => {
+                        let cat = self.get_or_open_catalog(container)?;
+                        let archive_path = container.join(rel);
+                        let format = archive_path
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .and_then(crate::archive_converter::ArchiveFormat::from_extension)?;
+                        let key = convertible_archive_cache_base_key(
+                            &archive_path,
+                            format,
+                            use_full_path_key,
+                        )?;
                         cat.load_one(&key).ok().flatten()
                     }
                     FileKind::Folder => {
@@ -23663,7 +23944,12 @@ impl App {
             .and_then(|i| self.folder_pin_selected_source(i));
 
         let selected_item = self.selected.and_then(|i| self.items.get(i));
-        let is_convertible = matches!(selected_item, Some(GridItem::ConvertibleArchive { .. }));
+        let convertible_unavailable = matches!(
+            selected_item,
+            Some(GridItem::ConvertibleArchive { path, .. })
+                if !self.converted_archive_cache_paths
+                    .contains_key(&crate::path_key::normalize_keep_drive(path))
+        );
 
         let matches_current_pin = match (&existing_pin, &selected_source) {
             (Some(a), Some(b)) => a == b,
@@ -23671,10 +23957,10 @@ impl App {
         };
 
         // 描画 + tooltip の決定
-        // 1) ConvertibleArchive 選択中: 「変換後に設定可能」で disabled
+        // 1) 未変換 ConvertibleArchive 選択中: 「変換後に設定可能」で disabled
         // 2) 選択無し / pin 不可: 「項目を選択してください」で disabled
         // 3) 通常: enabled。matches_current_pin で tooltip を分岐
-        let (enabled, tooltip) = if is_convertible {
+        let (enabled, tooltip) = if convertible_unavailable {
             (
                 false,
                 "代表サムネ固定: 変換後に設定可能 (アーカイブを ZIP に変換すると指定できます)"
@@ -23727,7 +24013,7 @@ impl App {
     /// - Ctrl+G アグリゲートビュー (`items_are_global_search_view`)
     /// - Ctrl+T タグビュー (`items_are_tag_view`)
     /// - RAR/7z/LZH 変換キャッシュ ZIP の drill-down だが `zip_nav` が無い中途半端な状態
-    /// - 選択無し / 選択アイテムが pin 不能 (ConvertibleArchive / SearchContainer、
+    /// - 選択無し / 選択アイテムが pin 不能 (SearchContainer、
     ///   または container を指す `rel=""` ケース)
     ///
     /// **Video pin の set ガード**: pin 対象が動画でかつ `video_pins` DB に有効な WebP
@@ -23787,7 +24073,7 @@ impl App {
             self.remove_folder_thumb_pin(&container);
             return;
         }
-        self.try_set_folder_thumb_pin_with_video_guard(&container, source);
+        self.try_set_folder_thumb_pin_with_guard(&container, source);
     }
 
     /// アドレスバー 📌 ボタンの左クリック (toggle) / グリッド P キーショートカットのハンドラ。
@@ -23798,9 +24084,9 @@ impl App {
         self.toggle_folder_pin_for_idx(idx);
     }
 
-    /// `set_folder_thumb_pin` の薄いラッパで、**動画 source の場合は video_pins DB に
-    /// 有効な WebP が無ければ拒否**する。worker が auto-pick fallback で「親フォルダ自身の
-    /// 代表画」を pinned_key に保存してしまう dead pin を防ぐ。
+    /// `set_folder_thumb_pin` の薄いラッパで、代表サムネ source 固有の前提を set 時に
+    /// 一括検証する。動画は `video_pins.db` の WebP、変換対象アーカイブは有効な変換済み
+    /// 読込元が無ければ拒否し、効果のない dead pin を作らない。
     ///
     /// 戻り値: 実際に pin が設定できれば `true`。拒否時はトーストを出して `false`。
     /// 拒否は **set** にのみ適用される (= remove は別経路から直接呼ぶ)。
@@ -23812,7 +24098,7 @@ impl App {
     /// フレームを保存済み) 場合のみ** folder pin を許可する。seed は軽い DB→DB
     /// コピーだけになり UI ヒッチが完全に消える。フレーム未保存の動画に 📌 すると
     /// トーストで「フルスクリーンでフレームを保存してください」と案内する。
-    fn try_set_folder_thumb_pin_with_video_guard(
+    fn try_set_folder_thumb_pin_with_guard(
         &mut self,
         container: &std::path::Path,
         source: crate::folder_thumb_pins::FolderPinSource,
@@ -23840,6 +24126,46 @@ impl App {
                 );
                 crate::logger::log(format!(
                     "folder_thumb_pin: video pin rejected (no WebP) for {}",
+                    abs.display()
+                ));
+                return false;
+            }
+        }
+        if let crate::folder_thumb_pins::FolderPinSource::File {
+            kind: crate::folder_thumb_pins::FileKind::ConvertibleArchive,
+            ..
+        } = &source
+        {
+            let abs = container.join(source.rel());
+            let metadata = std::fs::metadata(&abs).ok();
+            let has_cached_zip = metadata.as_ref().is_some_and(|metadata| {
+                self.archive_cache_db.as_ref().is_some_and(|db| {
+                    db.lookup(
+                        &abs,
+                        crate::ui_helpers::mtime_secs(metadata),
+                        metadata.len() as i64,
+                    )
+                    .is_some()
+                })
+            });
+            // 非ソリッド RAR の直接閲覧は archive_cache.db 行を持たない。非同期 map が
+            // 解決した読込元も RAR の場合だけ、存在確認を guard の代替にする。
+            let has_direct_rar = self
+                .converted_archive_cache_paths
+                .get(&crate::path_key::normalize_keep_drive(&abs))
+                .is_some_and(|load_path| {
+                    crate::rar_loader::is_rar_path(load_path)
+                        && load_path.try_exists().unwrap_or(false)
+                });
+            if !has_cached_zip && !has_direct_rar {
+                self.show_feedback_toast_with_duration(
+                    "まだ変換されていないため代表サムネに固定できません\n\
+                     一度開くか、選択してバッチ変換してください"
+                        .to_string(),
+                    5.0,
+                );
+                crate::logger::log(format!(
+                    "folder_thumb_pin: archive pin rejected (no valid converted source) for {}",
                     abs.display()
                 ));
                 return false;
@@ -24089,8 +24415,13 @@ impl App {
         if matches!(item, GridItem::SearchContainer { .. }) {
             return false;
         }
-        // ConvertibleArchive: disabled + tooltip (描画 OK だが返値は常に false)
-        if matches!(item, GridItem::ConvertibleArchive { .. }) {
+        // 未変換 ConvertibleArchive: disabled + tooltip (描画 OK だが返値は常に false)
+        if matches!(
+            item,
+            GridItem::ConvertibleArchive { path, .. }
+                if !self.converted_archive_cache_paths
+                    .contains_key(&crate::path_key::normalize_keep_drive(path))
+        ) {
             ui.separator();
             ui.add_enabled(false, egui::Button::new("📌 代表サムネに固定"))
                 .on_hover_text("変換後に設定可能 (アーカイブを ZIP に変換すると指定できます)");
@@ -24152,7 +24483,7 @@ impl App {
             if is_current {
                 self.remove_folder_thumb_pin(&pin_container);
             } else {
-                self.try_set_folder_thumb_pin_with_video_guard(&pin_container, source);
+                self.try_set_folder_thumb_pin_with_guard(&pin_container, source);
             }
             // 本の中では対象セルが親階層にあり現ビューに無いので、再 materialize (scroll
             // リセット) は不要。dirty を消して読書位置を保つ (親へ戻れば refresh が拾う)。
@@ -24212,6 +24543,7 @@ impl App {
         self.rating_cache.clear();
         self.adjustment_cache.clear();
         self.thumb_pixels.clear();
+        self.passthrough_rendition_cache.clear();
         self.thumb_edit_preview_layers.clear();
         self.thumb_adjust_tex.clear();
         self.ai_upscale_cache.clear();
@@ -30374,6 +30706,7 @@ impl App {
             self.keep_start_shared.store(0, Ordering::Relaxed);
             self.keep_end_shared.store(0, Ordering::Relaxed);
             self.thumb_pixels.clear();
+            self.passthrough_rendition_cache.clear();
             self.thumb_edit_preview_layers.clear();
             self.thumb_adjust_tex.clear();
             let force_full_reconcile =
@@ -38936,6 +39269,7 @@ impl App {
             thumb_edit_preview_layers,
             thumb_edit_preview_keys,
             thumb_adjust_tex,
+            passthrough_rendition_cache,
             adjustment_page_params,
             local_adjust_page_layers,
             local_adjust_pages,
@@ -39182,6 +39516,7 @@ impl App {
             thumb_edit_preview_layers,
             thumb_edit_preview_keys,
             thumb_adjust_tex,
+            passthrough_rendition_cache,
             adjustment_page_params,
             local_adjust_page_layers,
             local_adjust_pages,
@@ -41197,16 +41532,29 @@ impl App {
     /// 見開き正規化のような内部起動は bump しないので、fs load は現在の
     /// `self.input_seq` (= 直近のユーザー入力) に紐づく。
     pub fn open_fullscreen(&mut self, idx: usize, history_trigger: HistoryTrigger) {
+        self.open_fullscreen_with_materialization(
+            idx,
+            history_trigger,
+            FsOpenMaterialization::Eager,
+        );
+    }
+
+    pub(crate) fn open_fullscreen_with_materialization(
+        &mut self,
+        idx: usize,
+        history_trigger: HistoryTrigger,
+        materialization: FsOpenMaterialization,
+    ) {
         #[cfg(windows)]
         if self.route_materialized_physical_still_open_to_active_context(idx) {
             return;
         }
 
-        // viewer 内ページ送りでは idx を差し替える前に、カラー化待ち用の完成表示と
-        // 前ページの完成済み編集結果を退避する。grid からの新規入場では
-        // fullscreen_idx=None なので holdover は空になる。
+        // A final-effect source-reload holdover belongs to one unchanged display unit.
+        // Moving to another idx ends that lifetime. Page navigation itself uses the
+        // target's color-faithful rendition until the final composite is ready.
         if self.fullscreen_idx != Some(idx) {
-            self.capture_colorize_page_transition_holdover(idx);
+            self.clear_final_effect_source_reload_holdover();
         }
         if self.fullscreen_idx.is_some() && self.fullscreen_idx != Some(idx) {
             self.cache_current_edit_preview_if_ready();
@@ -41412,12 +41760,14 @@ impl App {
             Some(GridItem::Image(_))
             | Some(GridItem::ZipImage { .. })
             | Some(GridItem::PdfPage { .. }) => {
-                let load_state = self.ensure_fs_page_load(idx);
-                if load_state.is_display_ready() {
-                    crate::logger::log(format!("  cache hit idx={idx} → instant display"));
-                }
-                if self.reading_flow.is_paged() {
-                    self.update_prefetch_window(idx);
+                if materialization.is_eager() {
+                    let load_state = self.ensure_fs_page_load(idx);
+                    if load_state.is_display_ready() {
+                        crate::logger::log(format!("  cache hit idx={idx} → instant display"));
+                    }
+                    if self.reading_flow.is_paged() {
+                        self.update_prefetch_window(idx);
+                    }
                 }
             }
             Some(GridItem::Video(_)) => {
@@ -48032,6 +48382,7 @@ impl App {
                         image: img,
                         content_type,
                         page_count: _,
+                        page_size_points: _,
                     }) => {
                         let elapsed = t.elapsed().as_secs_f64() * 1000.0;
                         crate::logger::log(format!(
@@ -48504,6 +48855,7 @@ impl App {
                     image: img,
                     content_type: _content_type,
                     page_count: _,
+                    page_size_points: _,
                 })) => {
                     if cancel.load(Ordering::Relaxed) {
                         return;
@@ -50446,6 +50798,7 @@ impl App {
                     adjust_before_effect,
                     smart_sharpen: params.effective_smart_sharpen(used_upscale),
                     colorize: params.colorize.clone(),
+                    colorize_applicable_override: None,
                     creative_lut,
                     post_filter: params.post_filter,
                 }
@@ -52663,7 +53016,7 @@ impl App {
     /// holdover へ退避する。ページ単位表示は現在の表示ユニット全体、連結読みは
     /// 従来どおりページ別 transition が所有する。初回ロードでは
     /// `resolve_fs_display_tex` が `None` を返すので、既存 holdover は上書きしない。
-    pub(crate) fn capture_colorize_source_reload_holdover(&mut self, idx: usize) {
+    pub(crate) fn capture_final_effect_source_reload_holdover(&mut self, idx: usize) {
         if self.fs_nav_locked_gen.is_some() || !self.colorize_display_requires_final_effect(idx) {
             return;
         }
@@ -52678,8 +53031,8 @@ impl App {
                 && self.fs_display_unit_page_indices(fs_idx).contains(&idx)
                 && let Some(previous) = self.capture_fs_display_unit(fs_idx)
             {
-                self.fs_holdover_tex = Some(FsHoldover::ColorizeDisplayUnit(
-                    ColorizeDisplayUnitHoldover {
+                self.fs_holdover_tex = Some(FsHoldover::FinalEffectSourceReload(
+                    FinalEffectSourceReloadHoldover {
                         target_idx: fs_idx,
                         previous,
                         started_at: std::time::Instant::now(),
@@ -53904,6 +54257,19 @@ impl App {
         }
     }
 
+    /// Cancel producers whose outputs cannot be admitted while a physical page-turn
+    /// level is held. Resident caches and completed upload backlog entries are kept;
+    /// only in-flight full-resolution decode/effect/AI work is stopped.
+    pub(crate) fn defer_page_turn_full_resolution_work(&mut self) {
+        self.fs_pending.clear();
+        self.fs_early_dims.clear();
+        for pending in self.final_ai_pending.values() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        self.final_ai_pending.clear();
+        self.cancel_all_final_effects();
+    }
+
     #[cfg(test)]
     fn insert_retained_final_ai(
         &mut self,
@@ -54559,6 +54925,15 @@ impl App {
         if self.final_effect_pending.is_empty() {
             return;
         }
+        if let Some(fs_idx) = self.fullscreen_idx
+            && self
+                .fs_page_turn_decision_for_frame(ctx, fs_idx)
+                .defer_ui_uploads()
+        {
+            // Completed workers retain their channel result until physical release.
+            // Collecting here would perform a full-size UI-thread texture upload.
+            return;
+        }
         let mut completed = Vec::new();
         let mut disconnected = Vec::new();
         for (&key, pending) in &self.final_effect_pending {
@@ -54618,6 +54993,8 @@ impl App {
                             complete: pending.output_complete,
                         },
                     );
+                    self.final_composite_cache
+                        .record_colorize_applied(key, timing.colorize_applied);
                     if pending.output_complete {
                         self.continuous_page_transitions.remove(&key.edit_key.idx);
                     } else {
@@ -54735,6 +55112,15 @@ impl App {
             adjust_before_effect: None,
             smart_sharpen: 0,
             colorize: params.colorize.clone(),
+            colorize_applicable_override: matches!(
+                params.colorize.mode,
+                crate::colorize::ColorizeMode::MonochromeOnly
+            )
+            .then(|| {
+                self.passthrough_rendition_cache
+                    .colorize_applied_for_final(key)
+            })
+            .flatten(),
             creative_lut: (!self.post_filter_bypassed && !params.creative_lut.is_identity())
                 .then(|| {
                     self.creative_lut_library
@@ -60077,6 +60463,148 @@ impl App {
         computed
     }
 
+    pub(crate) fn known_monochrome_only_applicability(
+        &self,
+        idx: usize,
+        params: &crate::adjustment::AdjustParams,
+    ) -> Option<bool> {
+        if !matches!(
+            params.colorize.mode,
+            crate::colorize::ColorizeMode::MonochromeOnly
+        ) || !params.is_color_identity()
+        {
+            return None;
+        }
+        let edit_key = self.current_edit_result_key(idx);
+        if !self.edit_result_cache.contains_key(&edit_key) {
+            return None;
+        }
+        let summary = self
+            .colorize_mono_summary_cache
+            .get(&idx)
+            .filter(|summary| summary.edit_key == edit_key)?;
+        Some(crate::colorize::is_near_monochrome_residual(
+            summary.p95_residual,
+            params.colorize.mono_tolerance,
+        ))
+    }
+
+    /// Return a color-faithful catalog-thumbnail rendition for page-turn pass-through.
+    /// This is intentionally synchronous: publishing an uncolored texture first would
+    /// violate R2, while the measured thumbnail-sized work is bounded to a few milliseconds.
+    pub(crate) fn ensure_passthrough_rendition(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        let (catalog_texture, from_edit_preview) = match self.thumbnails.get(idx) {
+            Some(crate::grid_item::ThumbnailState::Loaded {
+                tex,
+                from_edit_preview,
+                ..
+            }) => (tex.clone(), *from_edit_preview),
+            _ => return None,
+        };
+        let source_pixels = self.thumb_pixels.get(&idx)?.clone();
+        let params = self.effective_params(idx).clone();
+        let key = self.final_composite_key_for_pixels(
+            self.current_edit_result_key(idx),
+            source_pixels.size,
+            &params,
+        );
+        if let Some(entry) = self.passthrough_rendition_cache.get(key, &source_pixels) {
+            return Some(entry.texture);
+        }
+
+        let creative_lut = if !params.creative_lut.is_identity() {
+            self.creative_lut_library
+                .get(params.creative_lut.id)
+                .map(|lut| (lut, params.creative_lut.strength))
+        } else {
+            None
+        };
+        let colorize_applicable_override = matches!(
+            params.colorize.mode,
+            crate::colorize::ColorizeMode::MonochromeOnly
+        )
+        .then(|| {
+            self.final_composite_cache
+                .colorize_applied_for_rendition(key)
+                .or_else(|| self.known_monochrome_only_applicability(idx, &params))
+        })
+        .flatten();
+        let rendition = build_passthrough_rendition_pixels(
+            &source_pixels,
+            &params,
+            creative_lut,
+            colorize_applicable_override,
+        );
+        let colorize_applied = rendition.colorize_applied;
+        let (pixels, texture) = if rendition.pixels.is_none() && !from_edit_preview {
+            (Arc::clone(&source_pixels), catalog_texture)
+        } else {
+            let pixels = Arc::new(
+                rendition
+                    .pixels
+                    .unwrap_or_else(|| source_pixels.as_ref().clone()),
+            );
+            let texture = ctx.load_texture(
+                format!(
+                    "passthrough_rendition_{}_{}_{}_{}",
+                    key.edit_key.idx, key.edit_key.source_gen, key.params_hash, key.bg
+                ),
+                (*pixels).clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            (pixels, texture)
+        };
+        self.passthrough_rendition_cache.insert(
+            key,
+            PassthroughRenditionEntry {
+                source_pixels,
+                _pixels: pixels,
+                colorize_applied,
+                texture: texture.clone(),
+            },
+        );
+        Some(texture)
+    }
+
+    pub(crate) fn is_passthrough_rendition_texture(&self, texture: &egui::TextureHandle) -> bool {
+        self.passthrough_rendition_cache
+            .contains_texture(texture.id())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn passthrough_rendition_cache_len_for_test(&self) -> usize {
+        self.passthrough_rendition_cache.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn current_passthrough_rendition_pixels_for_test(
+        &self,
+        idx: usize,
+    ) -> Option<Arc<egui::ColorImage>> {
+        self.passthrough_rendition_cache
+            .lru
+            .iter()
+            .rev()
+            .find(|key| key.edit_key.idx == idx)
+            .and_then(|key| self.passthrough_rendition_cache.entries.get(key))
+            .map(|entry| Arc::clone(&entry._pixels))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn current_passthrough_colorize_applied_for_test(&self, idx: usize) -> Option<bool> {
+        self.passthrough_rendition_cache
+            .lru
+            .iter()
+            .rev()
+            .find(|key| key.edit_key.idx == idx)
+            .and_then(|key| self.passthrough_rendition_cache.entries.get(key))
+            .map(|entry| entry.colorize_applied)
+    }
+
     /// 一旦 `fs_upload_backlog` に積み、1 フレームあたり最大 1 枚だけ `ctx.load_texture`
     /// する。現在フルスクリーン表示中の idx は即時アップロードして表示遅延ゼロ。
     /// これにより 20MP JPEG 連続 prefetch 時の 500ms 級 UI フリーズを回避する。
@@ -60156,7 +60684,16 @@ impl App {
         // ── ペーシング: このフレームで何枚アップロードするか決める ──
         // 1. 現在フルスクリーン表示中の idx (= ユーザーが待っている画像) は即時に処理
         // 2. 他の先読み分は FIFO 先頭から 1 枚だけ取り出す
+        // 3. ページ送り level が held の間は 0 枚。worker 結果は backlog に残し、
+        //    release 後の通常フレームで同じ優先順位のまま消化する。
         // backlog は通常 <10 要素なので `Vec::remove` の O(n) は実質コストなし。
+        if let Some(fs_idx) = self.fullscreen_idx
+            && self
+                .fs_page_turn_decision_for_frame(ctx, fs_idx)
+                .defer_ui_uploads()
+        {
+            return;
+        }
         let cur = self.fullscreen_idx;
         let (mut cur_pos, mut other_pos) = (None, None);
         for (i, (k, _, _)) in self.fs_upload_backlog.iter().enumerate() {
@@ -60201,7 +60738,7 @@ impl App {
                     | FsLoadResult::StaticCached { .. }
                     | FsLoadResult::StaticPanorama { .. }
             ) {
-                self.capture_colorize_source_reload_holdover(key);
+                self.capture_final_effect_source_reload_holdover(key);
             }
             let entry = match result {
                 FsLoadResult::Static { ci, source_dims } => {
@@ -62891,60 +63428,65 @@ impl eframe::App for App {
         if let Some(fs_idx) = self.fullscreen_idx {
             // プリセットに基づいてアップスケール設定を同期
             self.sync_upscale_from_preset(fs_idx);
-            let continuous_keep_set = if !self.reading_flow.is_paged()
-                && self.fs_vertical_cache_keep_set.contains(&fs_idx)
-            {
-                Some(self.fs_vertical_cache_keep_set.clone())
-            } else {
-                None
-            };
-            // 見開き相方ページ (Double のとき)。reconcile と local_adjust の両方で使う。
-            let spread_other: Option<usize> = match self.resolve_spread_pair(fs_idx) {
-                crate::ui_fullscreen::SpreadPair::Double { left, right } => {
-                    Some(if left == fs_idx { right } else { left })
-                }
-                _ => None,
-            };
-            // PDF raster の display-fit 結果が AI 用 native 入力と異なるなら、native
-            // 解像度へ再レンダして AI を起動する。
-            // sync_upscale_from_preset の **直後** = fs_idx の AI 設定が最新の地点で評価。
-            // 判定自体はページ個別 effective_params なので、見開き相方・連続表示の可視
-            // ページ (= ui_fullscreen が final AI をかける全ページ) にも個別に適用する。
-            {
-                let mut targets: Vec<usize> = Vec::with_capacity(2);
-                targets.push(fs_idx);
-                if let Some(other) = spread_other {
-                    targets.push(other);
+            let defer_page_turn_materialization = self
+                .fs_page_turn_decision_for_frame(ctx, fs_idx)
+                .defer_ui_uploads();
+            if !defer_page_turn_materialization {
+                let continuous_keep_set = if !self.reading_flow.is_paged()
+                    && self.fs_vertical_cache_keep_set.contains(&fs_idx)
+                {
+                    Some(self.fs_vertical_cache_keep_set.clone())
+                } else {
+                    None
+                };
+                // 見開き相方ページ (Double のとき)。reconcile と local_adjust の両方で使う。
+                let spread_other: Option<usize> = match self.resolve_spread_pair(fs_idx) {
+                    crate::ui_fullscreen::SpreadPair::Double { left, right } => {
+                        Some(if left == fs_idx { right } else { left })
+                    }
+                    _ => None,
+                };
+                // PDF raster の display-fit 結果が AI 用 native 入力と異なるなら、native
+                // 解像度へ再レンダして AI を起動する。
+                // sync_upscale_from_preset の **直後** = fs_idx の AI 設定が最新の地点で評価。
+                // 判定自体はページ個別 effective_params なので、見開き相方・連続表示の可視
+                // ページ (= ui_fullscreen が final AI をかける全ページ) にも個別に適用する。
+                {
+                    let mut targets: Vec<usize> = Vec::with_capacity(2);
+                    targets.push(fs_idx);
+                    if let Some(other) = spread_other {
+                        targets.push(other);
+                    }
+                    if let Some(keep_set) = continuous_keep_set.as_ref() {
+                        targets.extend(keep_set.iter().copied());
+                    }
+                    targets.sort_unstable();
+                    targets.dedup();
+                    for idx in targets {
+                        self.maybe_native_rerender_pdf_for_ai(idx);
+                    }
                 }
                 if let Some(keep_set) = continuous_keep_set.as_ref() {
-                    targets.extend(keep_set.iter().copied());
+                    self.evict_final_pipeline_cache_for_keep_set(keep_set);
+                } else {
+                    self.evict_final_pipeline_cache(fs_idx);
                 }
-                targets.sort_unstable();
-                targets.dedup();
-                for idx in targets {
-                    self.maybe_native_rerender_pdf_for_ai(idx);
+                if let Some(other) = spread_other {
+                    self.maybe_start_local_adjust_render(other);
                 }
+                self.maybe_start_local_adjust_render(fs_idx);
+                if let Some(keep_set) = continuous_keep_set.as_ref() {
+                    self.evict_adjustment_cache_for_keep_set(keep_set);
+                } else {
+                    self.evict_adjustment_cache(fs_idx);
+                }
+                // AI 先読み (新パイプライン v1.1.0)。現在ページの final_ai が完了 / 不要
+                // のときだけ隣接ページを起動するため、毎フレーム呼んでも spawn の競合を
+                // 起こさない (= 内部で has_uncancelled_final_ai_pending を gate に使う)。
+                // Pipeline P1 リファクタで dead code 化していた旧 `prefetch_ai_upscale` の
+                // 後継 (= ページ送り時 AI を待たされる退行を直す)。
+                self.prefetch_final_ai(ctx, fs_idx);
             }
-            if let Some(keep_set) = continuous_keep_set.as_ref() {
-                self.evict_final_pipeline_cache_for_keep_set(keep_set);
-            } else {
-                self.evict_final_pipeline_cache(fs_idx);
-            }
-            if let Some(other) = spread_other {
-                self.maybe_start_local_adjust_render(other);
-            }
-            self.maybe_start_local_adjust_render(fs_idx);
-            if let Some(keep_set) = continuous_keep_set.as_ref() {
-                self.evict_adjustment_cache_for_keep_set(keep_set);
-            } else {
-                self.evict_adjustment_cache(fs_idx);
-            }
-            // AI 先読み (新パイプライン v1.1.0)。現在ページの final_ai が完了 / 不要
-            // のときだけ隣接ページを起動するため、毎フレーム呼んでも spawn の競合を
-            // 起こさない (= 内部で has_uncancelled_final_ai_pending を gate に使う)。
-            // Pipeline P1 リファクタで dead code 化していた旧 `prefetch_ai_upscale` の
-            // 後継 (= ページ送り時 AI を待たされる退行を直す)。
-            self.prefetch_final_ai(ctx, fs_idx);
         }
         let t_fullscreen_work = frame_t0.elapsed();
 
@@ -64636,31 +65178,19 @@ fn convertible_archive_cache_base_key(
     ))
 }
 
-fn pin_source_id_with_container_identity(
-    source: &crate::folder_thumb_pins::FolderPinSource,
-    mtime: i64,
-    file_size: i64,
-) -> String {
-    format!(
-        "{}{}|{}",
-        pin_source_id_cache_prefix(source),
-        mtime,
-        file_size
-    )
-}
-
-fn convertible_archive_pinned_cache_key(
-    base_key: &str,
-    source: &crate::folder_thumb_pins::FolderPinSource,
-    mtime: i64,
-    file_size: i64,
-) -> String {
-    format!(
-        "{}{}{}",
-        base_key,
-        crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
-        pin_source_id_with_container_identity(source, mtime, file_size)
-    )
+/// folder-thumb pin の最終 target が変換対象アーカイブ由来なら、worker が実際に
+/// 読める変換キャッシュ ZIP (直接閲覧 RAR の場合は解決済み RAR) へ置き換える。
+/// 非アーカイブ target は元の path をそのまま返す。
+fn folder_pin_load_path(
+    resolved_path: &std::path::Path,
+    converted_archive_cache_paths: &std::collections::HashMap<String, PathBuf>,
+) -> Option<PathBuf> {
+    if !crate::folder_tree::is_convertible_archive_path(resolved_path) {
+        return Some(resolved_path.to_path_buf());
+    }
+    converted_archive_cache_paths
+        .get(&crate::path_key::normalize_keep_drive(resolved_path))
+        .cloned()
 }
 
 impl App {
@@ -65128,6 +65658,7 @@ fn pinned_edit_preview_target(
         ResolvedKind::Video
         | ResolvedKind::Folder
         | ResolvedKind::ZipFirstImage
+        | ResolvedKind::ArchiveFirstImage
         | ResolvedKind::ZipDirRepresentative => (None, false),
     }
 }
@@ -65320,83 +65851,25 @@ fn make_load_request(
             let archive_key = crate::path_key::normalize_keep_drive(path);
             let cached_zip = converted_archive_cache_paths.get(&archive_key)?;
             let base_key = convertible_archive_cache_base_key(path, *format, use_full_path_keys)?;
-            if let Some(
-                source @ crate::folder_thumb_pins::FolderPinSource::ZipEntry { zip_rel, entry },
-            ) = pin_map.get(&archive_key)
-                && zip_rel.is_empty()
-                && !entry.is_empty()
-            {
-                return Some(LoadRequest {
-                    path: cached_zip.clone(),
-                    zip_entry: Some(entry.clone()),
-                    edit_preview_key: Some(crate::adjustment_db::zip_entry_key(cached_zip, entry)),
-                    edit_preview_validate_container: true,
-                    pinned_page_adjustment_key: Some(crate::adjustment_db::zip_entry_key(
-                        cached_zip, entry,
-                    )),
-                    cache_key_override: Some(convertible_archive_pinned_cache_key(
-                        &base_key, source, mtime, file_size,
-                    )),
-                    ..base
-                });
-            }
-            if let Some(source @ crate::folder_thumb_pins::FolderPinSource::ZipDir { zip_rel, .. }) =
-                pin_map.get(&archive_key)
-                && zip_rel.is_empty()
-                && let Some(resolved) =
-                    resolve_pin_target_cascaded(path, source, pin_db, folder_thumb_depth as usize)
-            {
-                let cache_key = format!(
-                    "{}{}{}",
-                    base_key,
-                    crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
-                    resolved.source_id,
-                );
-                match resolved.kind {
-                    crate::folder_thumb_pins::ResolvedKind::ZipEntry => {
-                        let (edit_preview_key, edit_preview_validate_container) =
-                            pinned_edit_preview_target(
-                                resolved.kind,
-                                cached_zip,
-                                resolved.zip_entry.as_deref(),
-                                resolved.pdf_page,
-                            );
-                        return Some(LoadRequest {
-                            path: cached_zip.clone(),
-                            zip_entry: resolved.zip_entry,
-                            pinned_page_adjustment_key: edit_preview_key.clone(),
-                            edit_preview_key,
-                            edit_preview_validate_container,
-                            cache_key_override: Some(cache_key),
-                            mtime: resolved.mtime,
-                            file_size: resolved.file_size,
-                            ..base
-                        });
-                    }
-                    crate::folder_thumb_pins::ResolvedKind::ZipDirRepresentative => {
-                        return Some(LoadRequest {
-                            path: cached_zip.clone(),
-                            zip_dir_prefix: resolved.zip_dir_prefix,
-                            cache_key_override: Some(cache_key),
-                            resolve_override: Some(
-                                crate::thumb_loader::ResolveStrategy::ZipDirRepresentative,
-                            ),
-                            folder_thumb_sort,
-                            folder_thumb_depth,
-                            mtime: resolved.mtime,
-                            file_size: resolved.file_size,
-                            ..base
-                        });
-                    }
-                    _ => {}
-                }
-            }
-            Some(LoadRequest {
+            let req = LoadRequest {
                 path: cached_zip.clone(),
-                cache_key_override: Some(base_key),
+                cache_key_override: Some(base_key.clone()),
                 resolve_override: Some(crate::thumb_loader::ResolveStrategy::ZipFirstImage),
+                folder_thumb_sort,
+                folder_thumb_depth,
                 ..base
-            })
+            };
+            Some(apply_folder_thumb_pin(
+                req,
+                path,
+                &base_key,
+                ContainerKindForPin::ConvertibleArchive,
+                pin_map,
+                converted_archive_cache_paths,
+                pin_db,
+                video_pin_db,
+                pdf_password,
+            ))
         }
         GridItem::ZipFile(p) => {
             // zip_entry は None のままにしておき、ワーカー側でキャッシュミス時に
@@ -65421,6 +65894,7 @@ fn make_load_request(
                 &base_key,
                 ContainerKindForPin::ZipFile,
                 pin_map,
+                converted_archive_cache_paths,
                 pin_db,
                 video_pin_db,
                 pdf_password,
@@ -65448,6 +65922,7 @@ fn make_load_request(
                 &base_key,
                 ContainerKindForPin::PdfFile,
                 pin_map,
+                converted_archive_cache_paths,
                 pin_db,
                 video_pin_db,
                 pdf_password,
@@ -65473,6 +65948,7 @@ fn make_load_request(
                 &base_key,
                 ContainerKindForPin::Folder,
                 pin_map,
+                converted_archive_cache_paths,
                 pin_db,
                 video_pin_db,
                 pdf_password,
@@ -65552,25 +66028,14 @@ fn folder_thumb_existing_keys_for(
         };
         let mut keys = vec![base_key.clone()];
         let container_key = crate::path_key::normalize_keep_drive(container_path);
-        if let (Some((mtime, file_size)), Some(source)) = (item_meta, pin_map.get(&container_key))
-            && matches!(
-                source,
-                crate::folder_thumb_pins::FolderPinSource::ZipEntry { zip_rel, entry }
-                    if zip_rel.is_empty() && !entry.is_empty()
-            )
-        {
-            keys.push(convertible_archive_pinned_cache_key(
-                &base_key, source, mtime, file_size,
-            ));
-        }
-        if let Some(source @ crate::folder_thumb_pins::FolderPinSource::ZipDir { zip_rel, .. }) =
-            pin_map.get(&container_key)
-            && zip_rel.is_empty()
-            && let Some(resolved) = resolve_pin_target_cascaded(
+        if let (Some(root_metadata), Some(source)) = (item_meta, pin_map.get(&container_key))
+            && pin_source_compatible_with_container(ContainerKindForPin::ConvertibleArchive, source)
+            && let Some(resolved) = resolve_pin_target_cascaded_with_root_metadata(
                 container_path,
                 source,
                 pin_db,
                 folder_thumb_depth as usize,
+                root_metadata,
             )
         {
             keys.push(format!(
@@ -65621,6 +66086,7 @@ enum ContainerKindForPin {
     Folder,
     ZipFile,
     PdfFile,
+    ConvertibleArchive,
 }
 
 /// container と source の組合せが妥当か検査する。
@@ -65628,7 +66094,8 @@ enum ContainerKindForPin {
 /// 妥当な組合せ:
 /// - **Folder**: 全 source 形を受け入れる (File/ZipEntry/ZipDir/PdfPage)。
 ///   - ただし ZipEntry / PdfPage は `*_rel` が **空でない** (= サブの ZIP/PDF を指す) ことを要求。
-/// - **ZipFile**: `ZipEntry { zip_rel: "" }` / `ZipDir { zip_rel: "" }` (= container 自身の中身)
+/// - **ZipFile / ConvertibleArchive**: `ZipEntry { zip_rel: "" }` /
+///   `ZipDir { zip_rel: "" }` (= container 自身の中身)
 /// - **PdfFile**: `PdfPage { pdf_rel: "" }` のみ
 fn pin_source_compatible_with_container(
     container: ContainerKindForPin,
@@ -65645,6 +66112,12 @@ fn pin_source_compatible_with_container(
         (ContainerKindForPin::ZipFile, S::ZipEntry { zip_rel, .. }) => zip_rel.is_empty(),
         (ContainerKindForPin::ZipFile, S::ZipDir { zip_rel, .. }) => zip_rel.is_empty(),
         (ContainerKindForPin::ZipFile, _) => false,
+        // 変換対象アーカイブも読込時は ZIP と同じ内側 source だけを受け入れる。
+        (ContainerKindForPin::ConvertibleArchive, S::ZipEntry { zip_rel, .. }) => {
+            zip_rel.is_empty()
+        }
+        (ContainerKindForPin::ConvertibleArchive, S::ZipDir { zip_rel, .. }) => zip_rel.is_empty(),
+        (ContainerKindForPin::ConvertibleArchive, _) => false,
         // PdfFile は内側 PdfPage のみ
         (ContainerKindForPin::PdfFile, S::PdfPage { pdf_rel, .. }) => pdf_rel.is_empty(),
         (ContainerKindForPin::PdfFile, _) => false,
@@ -65692,6 +66165,36 @@ fn resolve_pin_target_cascaded(
     )
 }
 
+/// 通常は stat した target metadata を使うが、現在一覧の container 自身については
+/// `GridItem` と一緒に取得済みの metadata を fallback にできる cascade resolver。
+/// 変換済みアーカイブ自身の内部 pin は、仮想/遅延パスでも従来どおり一覧 metadata から
+/// cache identity を構築する。
+fn resolve_pin_target_cascaded_with_root_metadata(
+    container: &std::path::Path,
+    immediate_source: &crate::folder_thumb_pins::FolderPinSource,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    max_depth: usize,
+    root_metadata: (i64, i64),
+) -> Option<crate::folder_thumb_pins::ResolvedPinTarget> {
+    crate::folder_thumb_pins::resolve_pin_target_cascaded_via_with_metadata(
+        container,
+        immediate_source,
+        |path| pin_db.and_then(|db| db.lookup(path)),
+        |path| {
+            std::fs::metadata(path)
+                .ok()
+                .map(|metadata| {
+                    (
+                        crate::ui_helpers::mtime_secs(&metadata),
+                        metadata.len() as i64,
+                    )
+                })
+                .or_else(|| crate::folder_tree::path_eq(path, container).then_some(root_metadata))
+        },
+        max_depth,
+    )
+}
+
 /// 親コンテナ用 `LoadRequest` (Folder/ZipFile/PdfFile) に対し、手動ピンがあれば
 /// target 種別のリクエストに書き換える。
 ///
@@ -65718,6 +66221,7 @@ fn apply_folder_thumb_pin(
     base_key: &str,
     container_kind: ContainerKindForPin,
     pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    converted_archive_cache_paths: &std::collections::HashMap<String, PathBuf>,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
     // cascade resolve が Video kind に到達したとき、`video_pins.db` に有効な WebP が
     // あるか確認するために渡す。WebP が無い (= フルスクリーン pin 削除済み / 旧版の
@@ -65745,12 +66249,23 @@ fn apply_folder_thumb_pin(
     // cascade 解決: Folder / ZipFile / PdfFile / ZipDir の pin 連鎖を leaf まで辿る。
     // max_depth は base_req の folder_thumb_depth (= Settings.folder_thumb_depth) に揃える。
     // pin 無し時の `resolve_folder_thumb_image` のサブフォルダ探索上限と同じ仕様にする。
-    let Some(resolved) = resolve_pin_target_cascaded(
-        container,
-        source,
-        pin_db,
-        base_req.folder_thumb_depth as usize,
-    ) else {
+    let resolved = if matches!(container_kind, ContainerKindForPin::ConvertibleArchive) {
+        resolve_pin_target_cascaded_with_root_metadata(
+            container,
+            source,
+            pin_db,
+            base_req.folder_thumb_depth as usize,
+            (base_req.mtime, base_req.file_size),
+        )
+    } else {
+        resolve_pin_target_cascaded(
+            container,
+            source,
+            pin_db,
+            base_req.folder_thumb_depth as usize,
+        )
+    };
+    let Some(resolved) = resolved else {
         crate::logger::log(format!(
             "folder_thumb_pin: target unresolved for {} (source={:?}) — falling back to auto-select",
             container.display(),
@@ -65794,7 +66309,7 @@ fn apply_folder_thumb_pin(
         // 経路で folder auto-pick を pinned_key 下に保存 → 次回 seed が purge という
         // churn が毎ロード走る。base_req に戻せば worker は base_key を使い、
         // auto-pick は base_key 下に普通に保存され churn しない。
-        // WebP は通常 set 時に `try_set_folder_thumb_pin_with_video_guard` が存在を
+        // WebP は通常 set 時に `try_set_folder_thumb_pin_with_guard` が存在を
         // 保証するが、フルスクリーンで pin 削除 / 旧版の dead pin で欠落し得る。
         let has_webp = video_pin_db
             .and_then(|db| db.lookup(&resolved.abs_path))
@@ -65847,9 +66362,31 @@ fn apply_folder_thumb_pin(
         };
     }
 
+    // ArchiveFirstImage はもちろん、cascade 後に ZipEntry / ZipDirRepresentative へ
+    // 到達した場合も `resolved.abs_path` は元アーカイブを保持している。worker へ渡す
+    // 直前にだけ変換キャッシュ ZIP へ置き換え、source identity は元ファイル基準のままにする。
+    let request_path = if matches!(
+        resolved.kind,
+        ResolvedKind::ArchiveFirstImage
+            | ResolvedKind::ZipEntry
+            | ResolvedKind::ZipDirRepresentative
+    ) {
+        let Some(path) = folder_pin_load_path(&resolved.abs_path, converted_archive_cache_paths)
+        else {
+            crate::logger::log(format!(
+                "folder_thumb_pin: archive cache unavailable for {} — falling back to base_req",
+                resolved.abs_path.display()
+            ));
+            return base_req;
+        };
+        path
+    } else {
+        resolved.abs_path.clone()
+    };
+
     let (edit_preview_key, edit_preview_validate_container) = pinned_edit_preview_target(
         resolved.kind,
-        &resolved.abs_path,
+        &request_path,
         resolved.zip_entry.as_deref(),
         resolved.pdf_page,
     );
@@ -65865,6 +66402,7 @@ fn apply_folder_thumb_pin(
             None,
         ),
         ResolvedKind::ZipFirstImage => (Some(ResolveStrategy::ZipFirstImage), None, None, None),
+        ResolvedKind::ArchiveFirstImage => (Some(ResolveStrategy::ZipFirstImage), None, None, None),
         ResolvedKind::ZipDirRepresentative => (
             Some(ResolveStrategy::ZipDirRepresentative),
             None,
@@ -65879,7 +66417,7 @@ fn apply_folder_thumb_pin(
     };
 
     LoadRequest {
-        path: resolved.abs_path,
+        path: request_path,
         relative_page_provenance: None,
         zip_entry,
         zip_dir_prefix,

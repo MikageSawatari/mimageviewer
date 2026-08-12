@@ -315,7 +315,7 @@ pending state は使わず、連結読みは対象外とする。
 戻さずに、初期 white client / サイズ遷移フラッシュを抑える。
 詳細は [docs/ui-responsiveness.md §9](ui-responsiveness.md) を参照。
 
-Ctrl+↑↓ のフォルダ横断とページ単位表示のカラー化待ちは、単一 field
+Ctrl+↑↓ のフォルダ横断と、同じ表示ユニットの final-effect source reload は、単一 field
 `fs_holdover_tex: Option<FsHoldover>` を共有する。値は typed state で相互排他になっている:
 
 - `FolderNavigation(previous)`: `previous.pages` に画面順の 1 ページ、または `[left, right]` の
@@ -323,10 +323,11 @@ Ctrl+↑↓ のフォルダ横断とページ単位表示のカラー化待ち�
   **表示ユニット単位**の hold であり、カラー化の有無とは無関係に
   `capture_fs_nav_holdover` が作る。各 page は texture に加えて capture 時点の rotation、
   canonical source size、実表示に使った単ページ / 見開き側別 content bbox を所有する。
-- `ColorizeDisplayUnit { target_idx, previous, started_at }`: `previous.pages` に画面順の 1 ページ、または
-  `[left, right]` の見開き 2 ページをまとめて保持する。`capture_colorize_page_transition_holdover` /
-  `capture_colorize_source_reload_holdover` だけがカラー化条件で作る。左右別 slot は持たず、
-  `started_at` は作業中表示の 400ms UX 閾値を variant 自身に持たせる。
+- `FinalEffectSourceReload { target_idx, previous, started_at }`: PDF の Z ズーム再レンダなど、同じ
+  表示ユニットの source が差し替わる直前に、`previous.pages` へ単ページまたは見開き全体を保持する。
+  `capture_final_effect_source_reload_holdover` だけが作り、左右別 slot は持たない。`started_at` は
+  作業中表示の 400ms UX 閾値を variant 自身に持たせる。通常のページ移動はこの state を作らず、
+  移動先の色忠実な低解像度 rendition を final composite 到着まで表示する。
 
 `fs_nav_holdover_for_draw` が有効な間、`fullscreen_idx == None` の PDF/ZIP enumerate
 gap と、`fullscreen_idx == Some` の nav ロック継続中のどちらも、カラー化側と共通の
@@ -360,8 +361,8 @@ DFS 実行中の同種入力は `start_folder_nav` の単一受付口で
 お気に入り、ツリークリックなど無関係なフォルダ切替をまたいで burst が残ることはない。
 
 フルスクリーン画像領域の合成順は、ページ画像 → ページ単位の編集オーバーレイ
-(消しゴム / クロップ / キャプチャ領域 / ルーペ) → ビュー単位の nav holdover →
-インジケータ / HUD / パネルとする。nav holdover は直前に見ていたビュー全体なので、
+(消しゴム / クロップ / キャプチャ領域 / ルーペ) → ビュー単位の holdover →
+インジケータ / HUD / パネルとする。holdover は退避時に見えていたビュー全体なので、
 移動先ページの編集矩形を旧ビューの上に重ねないよう、編集オーバーレイより後に描く。
 
 `--perf-log` 診断では `fs.paint` に `source` / `idx` / `items_generation` /
@@ -731,6 +732,15 @@ per-frame 経路 (`d3d11_shared` / `cpu_upload`) はプレゼン側の判定で�
 - `thumb_loader::resize_to_display_color_image` — 表示用サムネ (Lanczos3、品質重視)
 - `catalog::encode_thumb_webp` — キャッシュ用サムネ (Lanczos3、品質重視)
 
+表示用 / catalog 用サムネイルの整数寸法は `fast_resize::aspect_accurate_fit_dimensions` を
+共用する。長辺を上限へ固定して短辺を 1 回だけ丸めると、PDF のように raster ごとの丸めが
+異なるページで 0.1% 程度の縦横比誤差が残る。そこで width / height の両軸から整数候補を
+列挙し、元の縦横比に対する相対誤差 0.05% 以下を満たす最大解像度の候補を選ぶ。PDF page box
+や JPEG DCT 縮小のように decoded raster より正確な `source_dims` がある場合は、その比率を
+選択器へ渡す。PDFium の `fit_to_target` も page box を同じ選択器へ渡し、低解像度 raster を
+最初から選択済み整数寸法で描画する。上限を超える拡大はせず、既存 catalog 行も強制再生成
+しないため、この改善は新規生成分から適用する。
+
 新規リサイズ経路を増やすときは `image::DynamicImage::resize(_exact)` を直接呼ばず、
 `fast_resize::resize_dynamic_fit` / `resize_dynamic_exact` を使うこと。`image` crate の
 `resize` は UI スレッドに乗ったとき秒単位の応答なしを招きやすい。
@@ -851,14 +861,15 @@ AI 待ちの `complete=false` final composite も表示専用の候補である�
 
 #### ページ単位表示のキーリピート
 
-v2.13.0 では、キーリピート中のページをカタログサムネイルで代替する通過表示を削除した。
-ページ単位表示も通常の優先順位だけを使い、毎フレーム `resolve_fs_processed_texture` で完成画像を
-解決する。final-effect worker の完了結果と `fs_upload_backlog` もページ送り入力では保留せず、
-通常の回収・GPU upload ペースで処理する。次版で再実装するときの設計要件と失敗から得た知見は
-§2.5 を正本とする。
+v2.13.0 で一度削除した通過表示は、2026-08-12 に単一 / 見開き共通で再実装した。physical
+page-turn key level が held で、かつ実際の display-unit 遷移が成立したバースト中は、色忠実な
+低解像度 rendition を全ページ一様に選び、final-effect worker の完了回収、`fs_upload_backlog`、
+full decode / AI producer を保留する。境界で遷移しなかった入力では通過表示に入らず、release 後
+(または held 中に境界へ達した後) は current display unit を `resolve_fs_processed_texture` の
+通常経路へ戻す。詳細な要件と失敗から得た知見は §2.5 を正本とする。
 
-`colorize_display_requires_final_effect(idx)` は、設定が有効かだけでなく、そのページで
-待たずに出せる画素と final-effect worker の出力が視覚的に変わるかを表す gate である。
+`colorize_display_requires_final_effect(idx)` は materialized 経路で、設定が有効かだけでなく、
+そのページで待たずに出せる画素と final-effect worker の出力が視覚的に変わるかを表す gate である。
 `AllImages` は常に gate する。`MonochromeOnly` の高速パスは色調補正が identity の場合だけ使い、
 `edit_result_cache`（raw → erase → local_adjust → conceal）の画素から作った近モノクロ要約
 （主成分軸からの p95 直交残差）が現在の `mono_tolerance` を超えるページでは gate を外す。
@@ -867,6 +878,9 @@ v2.13.0 では、キーリピート中のページをカタログサムネイル
 する。final AI は復元・拡大処理で入力の近モノクロ性を反転させないものとして扱う。
 この条件を満たすカラー画像でカラー化が no-op になるページだけ、raw / edit / thumbnail fallback
 を許可する。
+通過 rendition ではこの保留 gate を「カラー化を適用する」という判定に流用しない。常駐する
+完成 composite の実判定、既存 full-size summary、調整後の低解像度画素の順に 1 つの適用可否を
+解決して rendition に保持し、着地点の final-effect worker も同じ判定を使う (§2.5.3)。
 Creative LUT も**単独で** gate 条件に入れる。LUT もカラー化と同じ「色が変わる最終段」であり、
 待たないと LUT 未適用の絵が 1 フレーム見えてから色が変わる (ユーザー報告 2026-07-29)。
 gate している間の Ctrl+↑↓ は捨てず、folder-nav の accumulator が受け取る
@@ -882,13 +896,16 @@ generation と erase / local-adjust / conceal の各編集世代を含むため�
 `EditResultKey` 不一致は安全側の `true` とし、要約が完成するまで従来どおり生画像へ
 フォールバックしない。`edit_result_cache` から消えた entry は次の reconcile で memo からも落とす。
 
-ページ枠での最終的な fallback 順は、`final/processed` → 連結読みのページ単位
-`continuous_page_transition_texture` → サムネイル → `読込中...` である。
-`fs_holdover_tex` はこの優先順位には入らない。`FolderNavigation` / `ColorizeDisplayUnit` とも
-ページ画像と編集 overlay の後に、共通描画で黒背景 + 旧単ページ / 旧見開き全体を重ねる。
-ただし解放条件は統合しない。フォルダ移動は `fs_nav_locked_gen` と新 anchor の表示 readiness、
-カラー化は新しい表示ユニットの全ページで final-effect 適用済み表示（または終端の読込失敗）が
-揃った描画フレームを使う。後者は「新しい左 + 古い右」や片側だけ黒になるのを防ぐ。
+ページ枠での最終的な fallback 順は、`final/processed` → ページ単位表示で final-effect 待ち中の
+色忠実 rendition → 連結読みの `continuous_page_transition_texture` → 未処理サムネイル →
+`読込中...` である。見開きの final-effect 待ちはページ別に fallback せず、片側でも final が
+未完了なら左右とも rendition、全ページが揃った frame で左右とも final へ切り替える。
+
+`fs_holdover_tex` はこの優先順位には入らない。`FolderNavigation` /
+`FinalEffectSourceReload` ともページ画像と編集 overlay の後に、共通描画で黒背景 +
+退避した単ページ / 見開き全体を重ねる。ただし解放条件は統合しない。フォルダ移動は
+`fs_nav_locked_gen` と新 anchor の表示 readiness、source reload は**同じ表示ユニット**の
+全ページで final-effect 適用済み表示（または終端の読込失敗）が揃った描画 frame を使う。
 
 Ctrl+↑↓ の nav lock 解放判定も、描画側と同じ
 `fs_display_bypasses_final_pipeline` を使う。通常表示でカラー化が有効なページは
@@ -904,9 +921,9 @@ raw `fs_cache` を直接描くため、Static / Animated またはサムネイ�
 単ページ、見開き、連結読み、ルーペが `edit_result_cache → fs_cache` のような独自チェーンを
 再実装すると、新しい派生レイヤ (消しゴム / 隠蔽加工 / AI など) の横展開漏れが起きる。
 見開きと連結読みも、画面全体で 1 枚を解決するのではなく、描画対象の **各ページ idx**
-についてこの入口を呼び、完成テクスチャが無ければそのページの transition texture /
-サムネイルへ落とす。ただしページ単位の見開きで `ColorizeDisplayUnit` が active な間は、
-各 idx の解決結果を個別公開せず、両方が揃うまで旧 unit overlay が全体を覆う。
+についてこの入口を呼ぶ。ページ単位の見開きで final-effect が未完了なら、各 idx の結果を
+個別公開せず左右とも色忠実 rendition に揃える。同一 unit の source reload 中だけは
+`FinalEffectSourceReload` が両方の final 完成まで旧 unit overlay を全体へ重ねる。
 ルーペも hit-test 後に選ばれたページ idx で同じ入口を呼ぶ。
 
 local-adjust / conceal の materialization は worker で進む。必要な local 結果が未完成なら
@@ -1006,7 +1023,7 @@ page idx の processed texture をページ単位で解決し、範囲キャプ�
 `FullscreenPaintResource::source_texture()` を使う。これは加工済みの full-image texture であり、
 ズーム中に可視 source 領域だけを持つ Lanczos 拡大出力 (`paint_texture_id()`) は使わない。
 加工済み composite が未準備のページだけは既存のサムネイルカタログへフォールバックし、黒や
-点滅を挟まない。nav / colorize holdover を重ねたフレームは、ナビゲータへ渡す idx → resource も
+点滅を挟まない。nav / final-effect source-reload holdover を重ねたフレームは、ナビゲータへ渡す idx → resource も
 その display unit 全体へ置き換え、本文とナビゲータが新旧ページで食い違わないようにする。
 ナビゲータ自身は texture producer を呼ばず、UI スレッドで画像読み込みやデコードも行わない。
 比較表示では本文と同じ単一比較キャンバスをレイアウト正本とし、Wipe / Diff はナビゲータの
@@ -1018,7 +1035,7 @@ page idx の processed texture をページ単位で解決し、範囲キャプ�
 本文の primary 描画は `CompareFramePrimaryDraw` が排他的に所有する。現在ページに一致する
 `ComparePreparationState::Ready` があるフレームは準備済み比較だけを描き、`Unprepared` /
 `WaitingForSource` / `Preparing` / `Draining` と別ページの `Ready` は通常ページだけを描く。準備中に raw pinned
-texture や Wipe の切れ端を通常ページへ重ねず、準備済み比較を描いた後も nav / colorize holdover を
+texture や Wipe の切れ端を通常ページへ重ねず、準備済み比較を描いた後も nav / source-reload holdover を
 重ねない。
 比較を準備・描画できるのは `SpreadMode::Single` の単ページ表示だけとする。X / C / Shift+C / Alt+C
 の全入口は見開き表示モードで案内toastを表示して状態を変更しない。表紙が1枚だけ見える瞬間も
@@ -1114,7 +1131,7 @@ resampler texture を生成せず従来の LINEAR 表示へ戻す。フォール
 と branch につき一度 `gpu/lanczos_upscale_limit_fallback` へ記録し、3 種の拡大は
 `scale_branch` フィールドで区別する。
 
-単ページ、見開きの各ページ、縦 / 横連結読み、page transition、nav / colorize holdover、
+単ページ、見開きの各ページ、縦 / 横連結読み、page transition、nav / source-reload holdover、
 detached single / spread / continuous frozen snapshot と keep-alive backstop は同じ typed
 resource を通る。見開きは高さ合わせ係数を含むページ別実効倍率を使う。ルーペは鮮明な元画素が
 必要なので `resolve_fs_processed_texture -> TextureHandle` の元経路、pixel grid は元論理寸法の
@@ -1417,10 +1434,11 @@ processed テクスチャは配置サイズへ反映せず、raw/source のア�
 配置サイズや UV を変えない。
 通常見開き・ページ送り・連結読みは同じ画像表示ユニット列を使うため、横長ページの前後で
 単ページ扱いと一時的なずらしアンカーの扱いがずれない。
-ただし遷移 texture の所有粒度は意図的に異なる。`capture_colorize_page_transition_holdover` は
-`ReadingFlow::Paged` だけを受け付け、連結読みは従来どおり keep-set 内の
-`continuous_page_transitions[idx]` をページ別に使う。スクロールで複数 unit が同時可視になる
-連結読みへ単一の paged holdover を重ねないため、縦 / 横連結の描画挙動は変わらない。
+ただし source reload の遷移 texture は所有粒度を意図的に分ける。
+`capture_final_effect_source_reload_holdover` は `ReadingFlow::Paged` の現在 unit 全体を保持し、
+連結読みは従来どおり keep-set 内の `continuous_page_transitions[idx]` をページ別に使う。
+通常の paged ページ移動は holdover ではなく移動先 rendition が所有する。スクロールで複数 unit が
+同時可視になる連結読みへ単一の paged holdover を重ねないため、縦 / 横連結の描画挙動は変わらない。
 横連結では `ReadingDirection` により
 左→右 / 右→左の座標符号を反転する。UI で横方向を変更した場合は `SpreadMode` の
 表紙あり/なしを保ったまま LTR/RTL も同期し、ページ単位の見開き方向と横連結方向が
@@ -1457,12 +1475,15 @@ delta に適用するため、ドラッグ途中の Ctrl 押下 / 解放でも�
 
 ---
 
-### 2.5 ページ送り中の表示規則 (次版でやり直すときの正本)
+### 2.5 ページ送り中の表示規則 (実装の正本)
 
-> **v2.13.0 では通過表示の実装を削除した。** `page_turn_decision_for_inputs` /
-> `FsPageTurnDecision` と専用の perf event は現行コードに存在しない。この節は次版でテスト基盤を
-> 先に作って再実装するときの正本として残す。`colorize_display_requires_final_effect` /
-> `waiting_for_colorize`、または新しいページ送り判定を変更・追加する前に、ここを読むこと。
+> **v2.13.0 では通過表示をいったん削除し、2026-08-12 にページ単位表示へ再実装した。**
+> `page_turn_decision_for_inputs` / `FsPageTurnDecision` と `fs/page_turn_ready` /
+> `fs/page_turn_decision` は現行コードに存在する。単一ページ / 見開きとも physical key level が
+> held で実際の表示単位遷移が成立したバースト中は、全ページ一様に低解像度の色忠実 rendition を
+> 使い、release 後または境界 no-op 後に完成画像へ戻す。
+> `colorize_display_requires_final_effect` / `waiting_for_colorize`、またはページ送り判定を変更する前に、
+> この節を読むこと。
 > **この領域は繰り返し壊れており、壊れ方が毎回違う。**
 > 2026-08-11 の 1 日だけで 3 回退行した (すべて「支配している規則を読まずに判定へ条件を
 > 足した / 反転させた」もの)。
@@ -1473,10 +1494,31 @@ delta に適用するため、ドラッグ途中の Ctrl 押下 / 解放でも�
 | --- | --- | --- |
 | **R1** | **ページ表示自体を飛ばさない。** キーを押しっぱなしで通り過ぎるページも、一瞬でも必ず 1 回は画面に出す | 利用者要件 (§1.58、2026-08-07) |
 | **R2** | **白黒 → カラーの切り替わりを見せない。** カラー化や LUT が乗る絵で、色が付く前の状態を一瞬でも出さない | 利用者報告 2026-07-29 (「LUT 未適用の絵が 1 フレーム見えてから色が変わる」)。確定要件 |
-| **R3** | **押しっぱなしで引っかからない。** 入力が続いている間、UI スレッドでフルサイズのアップロードや最終合成を行わない | 実測 (§1.58): 1 枚あたり upload 21ms + final_composite_build 21ms で、キーリピート間隔 34ms に構造的に追いつかない |
+| **R3** | **押しっぱなしで引っかからない。** 実際のページ遷移が続いている間、UI スレッドでフルサイズのアップロードや最終合成を行わない | 実測 (§1.58): 1 枚あたり upload 21ms + final_composite_build 21ms で、キーリピート間隔 34ms に構造的に追いつかない |
 | **R4** | **キーを離したら完成画像で終わる。** 押し終わったページは通常の画質・加工で表示する | 同上 |
 
 R1〜R4 は同時に満たす。**どれか 1 つのために他を崩す修正を入れない。**
+
+##### 2.5.1.1 何のための機能か — 解像度は変わってよい、色は変わってはいけない
+
+**利用者の意図 (2026-08-11 に明示)**: ページ送りは**音声のスクラブと同じ**もの。今どのあたりに
+いるかを何となく見ながら高速に切り替えて、目的のページを探すためにある。
+
+そこから 2 つの軸の扱いが決まる。**この区別が §2.5 全体の前提になる。**
+
+| 軸 | 通過中の扱い | 理由 |
+| --- | --- | --- |
+| **解像度** | **変わってよい。サムネイル画質で構わない。** 止まったページでフルサイズに差し替われば良い。サムネイルキャッシュが無いページを、一旦サムネイル画質で出してから差し替えるのも可 | 通り過ぎる絵に精細さは要らない。探すのに必要なのは「何が写っているか」だけ |
+| **色** | **変わってはいけない。** 通過表示にも完成画像と同じ色処理 (色調補正 / カラー化 / LUT) を乗せる | 見た目の差が大きく、ページごとに色が入れ替わると破綻して見える (R2) |
+
+したがって **通過表示に必要なのは「フルサイズを速くする」ことではなく「色を合わせた低解像度を出す」こと**。
+2026-08-11 の 5 回の失敗は、通過表示という発想が誤りだったのではなく、
+**描画元をページごとに変わる条件で選び、しかも色を合わせていなかった**ことによる (§2.5.2.1)。
+
+> 実測 (2026-08-11、`scripts/page-turn/measure.rhai` + 24MP JPEG fixture): 1 ページの
+> UI スレッドコスト 28.2ms は**ほぼ全量がフルサイズのテクスチャアップロード**で、元画像の
+> 画素数にほぼ比例する (11.8MP で 13.9ms)。表示は精々 1000×1500 程度なので、通過中に
+> フルサイズを上げていること自体が費用の源。
 
 #### 2.5.2 2 つの軸を混ぜない
 
@@ -1488,11 +1530,12 @@ R1〜R4 は同時に満たす。**どれか 1 つのために他を崩す修正�
 | **A. 描画元** (`paint_source`) | このフレームで**何を描くか** — カタログサムネイルか、完成画像か | `prepare_fullscreen_state` |
 | **B. 重い処理の保留** (`defer_ui_uploads`) | このフレームで**UI スレッドを使うか** — final-effect 結果の回収 / `fs_upload_batch` の消化 | `poll_final_effects` / `fs_upload_backlog` の消化 |
 
-- **B は R3 の本体**。「ページ送り入力がこのフレームに残っている」かどうかだけで決める。
-  描画元の都合を混ぜない。
-- **A は B の結果ではない**。すでに常駐している完成画像を描く費用は、サムネイルを描く費用と
-  同じ (どちらもアップロード済み texture を貼るだけ)。**B で保留したまま A で完成画像を
-  選んでよい**。
+- **B は R3 の本体**。「ページ送りキーが held で、実際の表示単位遷移からなるバーストが active
+  か」で決める。描画元の cache readiness を混ぜない。
+- **A は B の結果ではない**。ただし現行のページ送り規則では、実遷移が成立した held バースト全体で
+  A を `pass_through` に固定する。常駐している完成画像を貼る費用自体は安いが、
+  **「完成画像が cache にあるか」はページごとに違うため、通過中の A をその条件で選んではいけない。**
+  B は同時に `true` だが、A と B は別々の field / consumer のまま維持する。
 
 #### 2.5.2.1 「ページ送り中か」は**フレーム間で安定した信号**でなければならない
 
@@ -1519,6 +1562,14 @@ I1 violation: burst t=45.222..45.987 idx=123
 `key_held_via_os` の OS 直読み) を使う。押下状態は物理状態そのものなので、
 リピート周期に関係なくバーストの間 true のまま安定する。
 
+ただし physical held は**必要条件であって十分条件ではない**。描画より後に解決される navigation
+結果が実際に display unit を変えた時点で `FsPageTurnBurstState::Active` にし、その target idx と
+items generation を所有させる。先頭で戻る、末尾で進むなど target が無い / current idx と同じ
+入力はバーストを作らず、すでに active な hold が境界 no-op に達した場合はその場で
+`Idle` に戻して着地点を materialize する。これは page / cache readiness ごとの描画条件ではなく、
+**navigation が遷移を作ったかというコマンド結果**である。edge、時間閾値、ヒステリシスによる
+平滑化は使わない。
+
 §1.58 が edge 方式を選んだのは「時間閾値・押下開始時刻・前フレームからの pending 状態を
 判定に使わない」ためだが、**押下状態の直読みはそのいずれでもない** (履歴を持たない現在値)。
 制約の意図を保ったまま、信号だけを安定させられる。
@@ -1528,42 +1579,248 @@ I1 violation: burst t=45.222..45.987 idx=123
 
 #### 2.5.3 サムネイルを代役に使ってよい条件
 
-通過表示は「カタログサムネイルをそのページの代役にする」最適化である。**代役が成立しない
-ときは使わない。** 成立条件は加工の種類ごとに違い、判断基準は**見た目の差**と**処理時間**の
-2 つ。
+通過表示は「カタログサムネイルから作る低解像度 rendition をそのページの代役にする」最適化で
+ある。rendition がまだ得られなくても通過モード自体をページ別に解除せず、直前の表示単位を保った
+まま得られる画質で差し替える。加工の扱いは**見た目の差**と**処理時間**の 2 つで決める。
 
 | 加工 | サムネイルとの見た目の差 | フルサイズの実測 | 通過表示の扱い |
 | --- | --- | --- | --- |
-| 色調補正 (明るさ / コントラスト / 彩度など) | 色が変わる | `adjust_ms` **0.00ms** | **サムネイルを使う**。理想はサムネイルに補正を適用して出すこと (§2.5.6) |
-| Creative LUT | 色が変わる | `creative_lut_ms` **0.00ms** | 削除前の実装では「色の最終段」として待つ側に入れていた (R2 の出どころが LUT の報告だったため) |
-| カラー化 | **白黒 → カラー**。差が最も大きい | `colorize_apply_ms` 中央値 **7.9ms** / 最大 **135ms** (1123×1648 で 10ms) | **サムネイルを使わない**。完成画像が来るまで前ページを保持し「カラー化中」を表示する |
+| 色調補正 (明るさ / コントラスト / 彩度など) | 色が変わる | `adjust_ms` **0.00ms** | **サムネイルに適用して使う** |
+| Creative LUT | 色が変わる | `creative_lut_ms` **0.00ms** | **サムネイルに適用して使う** |
+| カラー化 | **白黒 → カラー**。差が最も大きい | 下表のとおり寸法依存。347×506 で **1.67ms** | **サムネイルに適用して使う** (実測済み、下記) |
 | 消しゴム / 隠蔽 / テキスト注釈 | 内容が変わる | 最悪 **1 秒以上** かかりうる | **サムネイルを使う (加工なしで通過してよい)**。待つと R1 / R3 を壊すため、意図的にスキップする |
 
 **消しゴム・隠蔽・注釈をスキップする理由は「色ではないから」ではなく「時間がかかりすぎるから」。**
 将来この 3 つが十分速くなったら、扱いを再判断する余地がある。
 
-判定の正本は `colorize_display_requires_final_effect(idx)`
-([ui_fullscreen.rs](../src/ui_fullscreen.rs))。**この述語を新しく作り直さない。**
-現在の対象は Creative LUT と カラー化 (`AllImages` / `MonochromeOnly` かつ色補正が
-identity でない等)。
+**サムネイルキャッシュが無いページの扱い**: 通過表示に入れないのではなく、**出せる最低画質で
+一旦出してから差し替えてよい** (§2.5.1.1)。「そのページのサムネイルがあるか」で描画元を選ぶのは
+§2.5.2.1 が禁じている「ページごとに変わる条件」そのものであり、5 回の失敗の 1 つ目の形。
 
-#### 2.5.4 表示単位 (見開き / 連結)
+##### 2.5.3.1 寸法別の色処理コスト (2026-08-11 実測)
 
-見開きでは、**表示単位に含まれるページのどれか 1 つでも代役が成立しないなら、単位全体で
-通過表示を使わない**。片側だけ完成画像にすると、左右で加工の有無が食い違う。
-サムネイルの有無も同じく単位全体で判定する。削除前は
-`fs_page_turn_display_unit_readiness` がこの役割を持っていたが、次版では壊れた実装を復元せず、
-表示単位の resolver とテストを先に定めてから新しく接続する。
+`cargo test --release -p mimageviewer --lib colorize::tests::thumbnail_effect_cost_measurement
+-- --ignored --nocapture` (24 スレッド、`legacy4color` / `luminance100` / `gaussian` /
+`radius1.0` / `strength100` + `contrast:+20`)。
+
+| 寸法 | 画素数 | 色調補正 中央値 | カラー化 中央値 | 最大 | うちトーンぼかし |
+| --- | --- | --- | --- | --- | --- |
+| **347×506** | 0.18MP | **0.25ms** | **1.67ms** | 4.75ms | 1.25ms |
+| 800×1200 | 0.96MP | 1.22ms | 5.76ms | 7.12ms | 4.67ms |
+| 1123×1648 | 1.85MP | 2.40ms | 9.97ms | 10.34ms | 8.29ms |
+| 2480×3508 | 8.70MP | 11.74ms | 41.24ms | 47.62ms | 32.49ms |
+
+**§2.5.6 が警告していた固定費は実在した。** 面積比だけなら 347×506 は 1123×1648 の 0.095 倍
+なので 0.95ms のはずだが、実測は 1.67ms (0.167 倍)。差はトーン階調化のぼかしで、
+サムネイル寸法でもコストの 4 分の 3 を占める。
+
+それでも **サムネイル 1 枚あたり 色調補正 + カラー化 ≒ 2ms** で、キーリピート間隔 34ms に対して
+十分小さい。**したがって通過表示の色処理は UI スレッドで同期的に行ってよい。** 非同期にすると
+「色が後から付く」状態が生まれ、それは R2 の失敗そのものである。同期実行なら**同じフレームで
+色が揃うことが構造的に保証される**。
+
+`colorize_display_requires_final_effect(idx)` ([ui_fullscreen.rs](../src/ui_fullscreen.rs)) は、
+materialized 経路で raw / edit fallback を見せず final-effect を待つための保守的な gate である。
+**この gate の true を、通過 rendition にカラー化を適用する意味へ読み替えてはいけない。**
+`MonochromeOnly` で full-size summary が未到着、または色調補正が classifier 入力を変える場合、
+gate は「未確定なので待つ」という意味で true を返すためである。
+
+通過 rendition の `MonochromeOnly` 適用可否は、(1) 同じページ / 編集世代 / params の常駐する
+完成 composite が保持する実 worker 判定、(2) 色調補正が identity で同じ `EditResultKey` の
+full-size summary、(3) 色調補正後の低解像度画素に対する既存の `colorize::should_apply`、の順に
+1 回だけ解決し、`colorize_applied` を rendition cache entry に保持する。着地点の final-effect
+worker は同じ entry の判定を再利用する。既存 final があるページでは rendition が final に合わせ、
+final が無いページでは final が rendition に合わせるため、thumbnail と full-size の classifier が
+食い違っても settle で色が変わらない。raw decode 到着だけで進む source generation はまたいでよいが、
+編集世代 / params が違う entry は再利用しない。この判定は pass-through / materialized の mode
+選択には使わない。
+
+#### 2.5.3.2 実測: 軽い本では見開きだけに露出した (2026-08-11〜12)
+
+**利用者が引っかかりを確認したフォルダ** (`aimodel1`、306 枚、**1.0〜1.6MP**) を、同じフォルダ・
+同じ設定で単一ページと見開き (RTL) の両方で計測した。この軽い本では解像度は支配項でなかった。
+
+| モード | ナビ命令 | 実際に描かれた枚数 | 画面滞留時間 | 逆行 | 再訪 |
+| --- | --- | --- | --- | --- | --- |
+| **単一ページ** | 144 | **144** (1:1) | 中央値 34.7ms | 0 | 0 |
+| **見開き (RTL)** | 142 | **23** (6:1) | 中央値 35ms / **最大 2267ms** | 0 | 0 |
+
+見開きでは 142 回のページ送り命令に対して **23 枚しか描かれない**。描かれた idx は
+`14 → 57 → 70,71,72,73 → 80,…,94 → 229 → 234,235,238` と飛び、**1 枚が 746ms / 2267ms
+画面に留まる**。これが利用者報告の「たまに一瞬同じ画像が止まる」の実体。
+
+**ナビゲーション自体は正しい。** `input/fs_key` は `Target(2), Target(4), … Target(14),
+Target(15), Target(17), …` と単調増加で、逆行は 0 件。つまり**入力も遷移も壊れておらず、
+描画が単位ごと落ちている**。画面には前の表示単位が残り続けるので、止まって見えたあと飛ぶ。
+
+> 「ページ数が巻き戻るようにちらつく」については、**逆行そのものは観測できていない**。
+> 止まって飛ぶ挙動が巻き戻りとして知覚されている可能性が高いが、未確認。
+
+単一ページはこの条件では 1 命令 1 描画を維持し、すべて `final_composite` で追いついていた。
+一方、見開きの主症状はスループットではなく、表示単位が final 完成まで旧 unit に覆われることによる
+描画欠落だった (§2.5.4)。どちらも R1 は同じであり、単一が常に安全という意味ではない。
+
+その後、4.1MP の実 ZIP (`原神.zip`) を単一ページで測ると、materialized 経路は **174 命令に
+対して 29 表示 (約 1:6)** しか出なかった。`aimodel1` の 1:1 は完成処理が 34ms の repeat に
+たまたま追いついていただけで、高解像度では単一ページにも同じ R1 違反が露出する。この実測を受け、
+利用者判断で単一ページも見開きと同じ pass-through 規則へ統一した。
+
+計測メモ: **RTL 見開きでは Right が「戻る」方向**。前進は Left。RTL で Right を押し続けると
+`page_nav=Boundary { at_end: false }` が 144 回並ぶだけになる (実際にそうなった)。
+
+##### 方向による差 (2026-08-11、利用者の「戻りの方が引っかかる気がする」を検証)
+
+同一 run で 3 回のホールドを取った。**集計値は方向でほぼ差が無い。**
+
+| ホールド | ナビ命令 | 描画枚数 | 滞留 中央値 | 最大 |
+| --- | --- | --- | --- | --- |
+| 前進 | 142 | 23 | 35ms | 2266ms |
+| 戻り (直前に通ったページ) | 143 | 23 | 36ms | 2284ms |
+| 戻り (末尾から) | 143 | 22 | 36ms | 2280ms |
+
+ただし**最初の無反応時間は戻りの方が長い**。末尾からの戻りは idx 303 から始まり、
+**最初の 1.29 秒は 1 枚も描かれず**、238 に達して初めて描き始めた (前進の初回停止は 746ms)。
+
+**そして 2 周目以降に大量の再デコードが起きる。**
+
+| ホールド | decode 開始 | 対象ページ | **既に composite 済みなのに再デコード** | 同一ホールド内で 2 回以上 |
+| --- | --- | --- | --- | --- |
+| 前進 (初回) | 261 | 261 | 0 | 0 |
+| 戻り (末尾から) | 353 | 264 | **228** | 44 |
+
+初回前進は 261 ページをデコードして 23 枚しか出さない。末尾からの戻りは 264 ページ中 **228 ページが
+「以前 final composite を作ったのに再デコードされている」**。これが backlog の対策 2
+(再デコードの抑止) の実データ。
+
+**方向そのものの影響か、単に 2 周目だからかは切り分けていない** (前進の 2 周目を測っていない)。
+利用者が戻りで引っかかりを強く感じるのは、実使用では前進で読み進めた後に戻るため、
+この再デコード経路に常に入ることで説明が付く可能性がある。
+
+**フレーム自体は詰まっていない。** 5 秒のホールド中に 588〜610 フレーム描かれており
+(間隔中央値 6〜7ms)、その中で表示画像が変わったのは 22〜23 回だけ。
+つまり**描画が遅いのではなく、表示単位が更新されない**。
+
+##### 根本原因と 2026-08-12 の修正
+
+当時の source inspection で、見開きの表示欠落は `open_fullscreen` が前の
+`ColorizeDisplayUnitHoldover` を capture し、`colorize_display_unit_holdover_for_draw` が対象見開きの
+全ページで final texture が解決するまでその旧 unit を通常描画の上へ重ね続ける経路と確定した。
+ナビゲーション先の frame は描かれていたが、旧 unit の overlay に隠されていたため、final が同時に
+揃った表示単位しか画面上で観測されなかった。
+
+再デコードは key mismatch ではない。ページ送りのたびに `open_fullscreen` が
+`ensure_fs_page_load` と `update_prefetch_window` を起動し、通過ページまで full decode / final pipeline
+へ投入していた一方、`fs_cache` / `final_composite_cache` の小さい keep window が先に通ったページを
+退避した。2 周目は正しい同じ key であっても resident entry が既に無く、もう一度 source decode へ
+入っていた。
+
+修正後は、単一ページ / 見開きで physical key level が held かつ実遷移バーストが active の間、
+次を一体で行う。
+
+- 表示単位の全ページを、色調補正 → カラー化 → Creative LUT 済みの低解像度 rendition として
+  同じ frame で原子的に解決する。ready 状態は通過モードへ入る条件に使わない。
+- `open_fullscreen` は通過先の full decode / prefetch を開始せず、進行中の context-owned
+  decode / final effect / AI producer を cancel する。resident cache と完成済み upload backlog は保持する。
+- release frame は current display unit だけを通常の eager materialization へ戻し、その後の通常
+  prefetch を再開する。
+- 通過終了後は着地点の色忠実 rendition を final 到着まで維持する。通常ページ移動は旧
+  `ColorizeDisplayUnitHoldover` を作らず、同一 unit の source reload だけが typed holdover を使う。
+
+最初の見開き修正 (96faeee6) は利用者実測で、**267 / 267 ページを順番どおり表示** (間隔中央値
+30ms)、hold 中の `decode_begin` **0 / 0 / 0**、release 後 **29〜56ms** で左右同時に完成画像へ
+settle、`page-turn --check` は **checked bursts=3 / violations=0** を確認した。
+
+単一ページ側の source inspection では、`fs_page_turn_ordinary_context_blocker` の
+`single_page_materialized` が pass-through を明示的に除外し、`open_fullscreen` の eager
+materialization へ流していた。4.1MP ZIP では次の final texture が間に合わず旧ページが残るため、
+174 命令のうち完成した 29 ページしか `fs/paint` に現れなかった。この blocker を除き、active
+burst 中は resident final の有無を見ず rendition だけを選ぶようにした。4800f2cd の利用者実測では、
+単一 `aimodel1` が 144 命令 / 145 表示、単一 4.1MP ZIP が 174 命令で全 30 ページ表示、見開きが
+144 命令 / 267 ページ表示で、hold 中 decode は全ケース 0〜1、I1〜I5 は violations=0 だった。
+
+2026-08-12 の追加 source inspection で、残る 3 件の経路を次のように確定した。
+
+- **境界での画質低下**: `render_fullscreen_viewport` は navigation 解決より前に physical held だけで
+  pass-through を選び、その frame の後段で `adjacent_navigable_idx` が `None` /
+  `FsPageNav::Boundary` を返していた。idx が変わらなくても rendition を描く順序だった。navigation
+  結果を burst owner へ publish し、実遷移だけを active、boundary no-op を idle とするよう直した。
+- **縦横比の差**: 単一の `draw_fs_image` は rendition texture の `size_vec2()`、見開きの layout も
+  左右 texture の整数丸め後寸法を fit に使っていた。`ThumbnailState::Loaded::source_dims` は既に
+  保持していたが、この経路が参照していなかった。通過中の layout は source/header 寸法で解決し、
+  texture 寸法は sampling と upload 判定だけに使う。
+- **MonochromeOnly の誤カラー化**: `ensure_passthrough_rendition` が
+  `colorize_display_requires_final_effect` の保守的な「待つ」結果を
+  `final_color_effect_required` として builder へ渡し、builder が true を「カラー化を適用する」と
+  解釈していた。full summary 未到着のカラーページほど強制カラー化される意味の反転だった。
+  常駐 final の実判定、既存 full-size summary、rendition 自身の adjusted pixels の順に 1 つの判定を
+  解決し、landing final と共有するよう直した。
+
+#### 2.5.3.3 実測: 通過表示の上限は約 100 ページ / 秒 (2026-08-12)
+
+外部からの「mIV は 125Hz リピートで 50〜52fps しか出ない」という指摘を受け、4K 165Hz の
+foreground で 500 ページの FHD ZIP (1200×1700 = 2.04MP、STORED、335MB) を各リピートレート
+1 ホールドずつ、毎回新しいプロファイルで測った。合成入力は `scripts/page-turn/measure.rhai`。
+
+| リピート | 入力 / 秒 | **表示ページ / 秒** | **fps** | フレーム間隔 中央値 | p99 | 最大 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 30Hz | 29 | **29** (1:1) | **165.2** | 6.0ms | 8.0ms | 9ms |
+| 125Hz | 119 | **100** | **164.1** | 6.0ms | 8.0ms | 18ms |
+| 165Hz | 156 | **100** | **164.4** | 6.0ms | 8.0ms | 15ms |
+
+**フレームレートは 3 条件とも表示リフレッシュに張り付いている。** 「50fps 止まり」は
+この構成では再現せず、修正前の描画欠落 (§2.5.3.2 の 142 命令 / 23 表示) を fps として
+観測したものと考えるのが自然。
+
+**表示ページレートは約 100 / 秒で頭打ちになる。** 律速は通過表示の素材づくりで、165Hz
+ホールド中の内訳は次のとおり:
+
+| イベント | 件数 | 中央値 | 合計 |
+| --- | --- | --- | --- |
+| `thumb/decode_end` | 460 | **32.8ms** | 14356ms |
+| `details_meta/load_done` | 487 | 1.69ms | 796ms |
+| `fs/decode_end` | 5 | 26.97ms | 129ms |
+
+5 秒のホールド中に 460 枚のサムネイルをワーカー並列で生成しており、460 / 5 秒 ≒ 92/秒が
+表示ページレートとほぼ一致する。**カタログキャッシュが無い本でも通過表示は成立する**
+(その場で生成される) が、生成スループットが上限を決める。
+
+`fs/paint` の実測 geometry は `w=1016.83, h=1440.0, texture_w=334, texture_h=473,
+scale_x=3.0443971, scale_y=3.0443973` で、論理 1440 × ppp1.5 = 実 2160px の 4K 描画、かつ
+`scale_x` と `scale_y` が一致する (e7191ad2 の縦横比保持が効いている)。
+
+**出荷時の言い方**: 「連続ページ送り中はサムネイル画質へ落として高速に切り替える。
+その状態でおよそ 100 ページ / 秒」。フル画質のまま同じレートを出せるかは未測定
+(ホールド中は full decode / upload を意図的に抑止しているため、別構成での測定が要る)。
+
+#### 2.5.4 表示単位 (単一 / 見開き / 連結)
+
+単一ページは 1 ページ、見開きは左右 2 ページを表示単位として、**表示単位全体を 1 回で解決する**。
+physical key level が held で実遷移バーストが active なら、その burst 内の全 unit が通過モードであり、
+resident final や rendition の有無でページごとに mode を反転させない。見開きは左右 rendition が
+揃った frame だけを原子的に描き、
+片側だけ完成画像、もう片側だけ rendition という組み合わせを描かない。rendition がまだ無ければ
+未解決 unit として直前表示を保ち、後続 frame の rendition へ差し替える。
+
+通過 rendition の外側の**ページ矩形**は、低解像度 texture の整数寸法ではなく source/header 寸法
+(`ThumbnailState::Loaded::source_dims` を含む) から求める。PDF は thumbnail / fullscreen の
+各 raster 寸法が別々に整数丸めされるため、PDFium が読むページ box を 1/1000 point の固定小数点
+レイアウト寸法として catalog に保存し、通過 rendition と完成 texture のページ矩形を同じ位置・
+大きさに固定する。これは注釈等が使う完成 raster の画素座標とは別の軸である。
+
+ただし低解像度 raster 自体をそのページ矩形へ非等方に引き伸ばしてはならない。rendition の実描画
+矩形は texture 自身の縦横比を保つ contain fit とし、ページ矩形の中央へ置く。完成 texture だけは
+従来どおりページ矩形全体へ描く。整数丸め差に相当する最大数 pixel の余白は許容し、低解像度の
+中身を伸縮して settle 時に位置が動くことを避ける。単一 / 見開きとも同じ規則を使い、見開きの
+source 選択と差し替えは引き続き表示単位で原子的に行う。
 
 縦・横の連結読みは通過表示の対象外 (スクロールは実体化済みのページを見せるだけなので、
 キーごとの実体化コストが元から出ない)。
 
 #### 2.5.5 トレース不変条件 (機械判定)
 
-次版の実装では、上の規則が `fs.page_turn_ready` / `fs.page_turn_decision` の並びに現れるよう
-計装し、`python scripts/analyze_perf.py <jsonl> page-turn --check` で検査する。v2.13.0 は
-これらの event を出さないため、該当 event の無いログに対する `--check` は
-`checked bursts=0 violations=0`、exit 0 の no-op になる。判定器と回帰テストは次版用に残す。
+現行実装は上の規則を `fs/page_turn_ready` / `fs/page_turn_decision` の並びとして計装し、
+`python scripts/analyze_perf.py <jsonl> page-turn --check` で検査する。event が無いログを成功扱い
+しないため、本番計測では `checked bursts>0` も完了条件に含める。
 **規則を変えたらこの不変条件も同時に更新する。**
 
 | ID | 不変条件 | 対応する要件 |
@@ -1571,23 +1828,85 @@ identity でない等)。
 | I1 | 1 バースト内で、同じ idx の `source` が `final_composite` → `thumbnail` へ戻らない | R2 |
 | I2 | 1 バースト内で `source` がページをまたいで混ざらない | R2 |
 | I3 | バーストの最初と最後の間のすべての idx が 1 回以上出る | R1 |
-| I4 | バーストの最後の idx は `materialized` で終わる | R4 |
-| I5 | 入力が残っている間 `defer_ui_uploads=true` が維持される | R3 |
+| I4 | key-up または境界 no-op 後 1.5 秒以内に、着地点 idx の `materialized` が現れる | R4 |
+| I5 | active な通過バーストで rendition が ready の間、`defer_ui_uploads=true` が維持される | R3 |
 
-**削除前に確認した例外**: フォルダ末尾でキーを押し続けると最後のページがサムネイル画質のまま
-留まった (利用者判断 2026-08-10「支障なし」)。次版の判定器でも I4 はこの場合だけ免除する。
+`fs/paint` は単一ページでは既存の `(idx, texture)` producer が rendition も記録し、見開きでは
+holdover を含む最終表示単位の解決後に同じ page list から記録する。`source=thumbnail` が通過
+rendition、`source=final_composite` が完成画像である。前表示単位と同じ `(idx, texture)` は重複して
+出さない。event の `x` / `y` / `w` / `h` は実際に texture を描いた矩形、`texture_w` /
+`texture_h` は回転後 texture 寸法、`scale_x` / `scale_y` はその描画倍率である。これにより
+`fs/paint` の表示ページ数と `fs/page_turn_ready` を直接照合でき、同じ idx の rendition → final で
+非等方伸縮が混入していないかもログから確認できる。
 
-#### 2.5.6 未対応 / 次に検討すること
+開始時から境界で、1 回も display unit が変わらない hold は ready signature も変えないため、
+その押下に対応する `fs/page_turn_ready` を 1 件も出さない。
 
-- **サムネイルに色調補正を適用して出す**。`adjust_ms` が実測 0.00ms なので費用はほぼ無い。
-  削除前の初期実装はサムネイルをそのまま出しており、補正前の色が一瞬見えた。
-- **サムネイルをカラー化して出す**。フルサイズで中央値 7.9ms なので、面積比でサムネイルなら
-  1ms を下回る見込み。実現すれば「カラー化中」で前ページを保持する必要がなくなり、R1 と R2 を
-  同時に満たせる。**ただしトーン階調化のぼかしに固定費がある可能性があるため、サムネイル
-  寸法での実測を先に取ること。**
-- **カラー化 Disabled + 色調補正のみ**のページは、`colorize_display_requires_final_effect`
-  が `false` を返す (`is_color_identity` を見ているのが `MonochromeOnly` の枝の中だけのため)。
-  上の「サムネイルに補正を適用」を入れれば自然に解消する。
+endpoint 例外は設けない。active burst が端へ達して次の repeat が no-op になった時点で、physical
+key がまだ held でも burst を閉じて着地点を materialize する。したがって I4 は端でも必ず要求する。
+通常の移動中 burst の settle 窓は従来どおり key-up にアンカーし、burst 内の最後には要求しない。
+
+2026-08-12 の実機報告にあった「戻り hold の端で黒背景 + 中央の白文字」は、
+`ColorizeDisplayUnit` の「カラー化中…」ではなかった。active burst の最後は rendition を描いた後、
+navigation 解決で `Idle` になる。次 frame の `prepare_fullscreen_state` は materialized を選ぶが、
+着地点の final composite はまだ無いため `resolve_fs_processed_texture=None` となり、R2 のため未処理
+thumbnail も抑止する。残る `draw_fs_image` の終端が黒背景 + 中央「読込中...」だった。
+pass-through open は旧 page-transition holdover を消しているので、この frame に
+`ColorizeDisplayUnit` と「カラー化中…」は存在しない。
+
+修正後は materialized settle も同じ着地点 rendition を final 到着まで使う。見開きは片側だけ final に
+せず、片側でも final-effect 待ちなら両ページとも rendition、両 final が揃った frame で原子的に
+差し替える。開始時から端の no-op は既存 final が解決済みなので表示 source を一切変えない。
+通常ページ移動は旧ページ holdover を作らず、「カラー化中…」は同一ページの PDF 再レンダ等で
+`FinalEffectSourceReload` が 400ms を超えた場合だけ表示する。その表示開始は
+`fs/colorize_wait_indicator` (`reason=source_reload`) に一度だけ記録する。
+
+#### 2.5.6 やり直しの作業順 (2026-08-11 に更新)
+
+§2.5.1.1 で意図が確定したので、次版は「色を合わせた低解像度を出す」ことに集約する。
+
+1. ~~サムネイル寸法での色処理コストを実測する~~ → **実測済み (§2.5.3.1)。約 2ms / 枚で、
+   UI スレッド同期実行が可能。**
+2. ~~通過表示に色処理を適用する~~ → 色調補正 → カラー化 → LUT を UI スレッドで同期実行する
+   context-local rendition cache を実装済み。
+3. ~~通過中はフルサイズのアップロードとデコードを始めない~~ → 実遷移バーストが active の間は
+   producer 起動と UI upload 回収を保留し、既存 producer を cancel する。
+4. ~~止まったページだけ実体化する~~ → release または境界 no-op frame で current display unit を
+   eager path へ戻し、final 到着までは着地点 rendition を維持する。
+
+単一ページの `aimodel1` / 4.1MP 実 ZIP と見開きの実ログ gate は利用者実測で合格済み。境界 no-op、
+rendition の表示矩形、PDF + `MonochromeOnly` は上記の回帰テストと再実測で維持する。
+
+##### ボトルネックは 1 つではない (2026-08-11 実測)
+
+計測対象によって支配項が違う。**どちらか一方だけ直しても足りない。**
+
+| 対象 | ページの画素数 | 合成コスト | ページ間隔 | 追いつくか |
+| --- | --- | --- | --- | --- |
+| 実物 ZIP (1792×2304 PNG、664 枚) | 4.1MP | 4.7ms | **33.5ms** | materialized 単一は ❌ **29 / 174** |
+| 合成 fixture JPEG | 11.8MP | 13.9ms | **35ms** | ✅ 追いつく |
+| 合成 fixture JPEG | 24.0MP | 28.2ms | **67ms** | ❌ 追いつかない |
+| 実物の本 (`-Setup`、カラー化 + AI 有効) | 小さい | — | — | デコード 72.9ms + AI タイル 57.5ms×44 が支配。upload は **1.38ms** |
+
+合成 fixture 単体のコストは画素数にほぼ線形だったが、実アプリでは decode / upload / final-effect
+回収を含むため、4.1MP ZIP でも materialized 経路は追いつかなかった。したがって合成 fixture の
+11.8〜24MP だけから実用上の閾値を決めてはいけない。
+
+実物の本では upload は問題ですらなかった (ページが小さいため)。合成 fixture では upload が
+支配的だった。**共通して効くのは「通過するページでフル解像度の作業を始めない」こと**であって、
+upload だけを速くすることではない。
+
+**AI アップスケールは通過中に走らせない** (利用者判断 2026-08-11)。止まったページで推論して
+遅れて差し替えてよい。57.5ms/タイルは通過表示の予算に対して桁違いで、通り過ぎる絵に拡大結果は
+要らない。
+
+**カラー化 Disabled + 色調補正のみ**のページは、`colorize_display_requires_final_effect`
+が `false` を返す (`is_color_identity` を見ているのが `MonochromeOnly` の枝の中だけのため)。
+上の 2 を入れれば自然に解消する。
+
+なお **デコードも律速**である。24MP JPEG の実測でデコードは 172ms/ページで、ページ間隔 67ms は
+ワーカー並列でようやく成立している。UI スレッドの 28ms を消しても 34ms まで落ちるとは限らない。
+通過するページのデコードを始めないこと (上の 3) が効くはず。
 
 ---
 
@@ -1633,16 +1952,15 @@ identity でない等)。
      スクリーントーン濃淡変換、カスタム階調 LUT
    → `final_effect_pending` worker。カラー化前の provisional texture は公開しない。
      前後ページは final composite まで先読みし、完成済みならページ移動直後からカラー表示する。
-     先読みが未完了なら、ページ単位表示では直前の表示ユニット（単ページ / 見開き全体）を
-     holdover し、対象 unit の全ページが揃った後にカラー化済み画像へ一括で切り替える。
+     先読みが未完了なら、ページ単位表示では移動先の色忠実な低解像度 rendition を表示し、
+     対象 unit の全ページが揃った frame で完成画像へ一括で切り替える。
      PDF の Z ズーム再描画など、同じ表示ページの source 解像度が更新される場合は、旧世代の
      完成済み texture を display-only holdover に退避してから live cache を無効化し、
      新世代の final composite 完成時に置き換える。AI 待ちの incomplete composite は
      final AI 到着後も同一 key の cache entry として維持し、AI 後の完成結果で直接上書きする。
-     `complete=true` の final だけが holdover / nav lock を解放する。
-     `ColorizeDisplayUnit` が 400ms 続いた場合だけ、中央の暗いラウンド矩形に
-     「カラー化中…」を表示する。通常ページ送りで即時表示を繰り返さないための実機調整値で、
-     フォルダ移動の `FolderNavigation` では表示しない。
+     `complete=true` の final だけが source-reload holdover / nav lock を解放する。
+     `FinalEffectSourceReload` が 400ms 続いた場合だけ、中央の暗いラウンド矩形に
+     「カラー化中…」を表示する。通常ページ送りとフォルダ移動の `FolderNavigation` では表示しない。
    ↓
 10. Creative 3D LUT
    → 環境設定で登録した `.cube` を適用量付きで最終表示へ適用する。
@@ -1684,10 +2002,11 @@ colorize / Creative LUT / post-filter は意図的に飛ばすため、grid / fu
   stale 結果を `FinalCompositeKey` と items 世代で拒否する。AI 先読みと同じ前後枚数の
   `final_composite_cache` を背景で 1 枚ずつ作る。先読み中は provisional texture を upload
   せず、同ページが表示対象になったときは進行中 job を昇格して再利用する。通常ページ送りでは
-  完成まで直前ページを保持し、生画像・サムネイルへフォールバックしない。待ちが 400ms を
-  超えた場合だけ「カラー化中…」を表示する。`open_fullscreen` はページ入場だけでは final
-  composite / worker を無効化しない。サムネイル自体には反映しない。連結読みは
-  `ColorizeDisplayUnit` を通らないため、このインジケータの対象外とする。
+  完成まで移動先の色忠実 rendition を保持し、生画像・未処理サムネイルへフォールバックしない。
+  同一ページの source reload holdover が 400ms を超えた場合だけ「カラー化中…」を表示する。
+  `open_fullscreen` はページ入場だけでは final composite / worker を無効化しない。カタログの
+  サムネイル自体は書き換えない。連結読みは `FinalEffectSourceReload` を通らないため、
+  このインジケータの対象外とする。
 - **Creative LUT**: カラー化後・ポストフィルタ前に適用する。登録済み `.cube` の parse 済み
   table を worker へ `Arc` で渡し、ファイル I/O は UI thread と final-effect worker の外で行う。
   LUT の選択・適用量は final composite key に含め、変更時も edit / final AI cache は保持する。

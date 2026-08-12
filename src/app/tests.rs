@@ -16256,6 +16256,79 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn converted_archive_cache_refresh_includes_archive_reached_through_folder_pin() {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+        use std::io::Write;
+
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("shelf");
+        std::fs::create_dir_all(&folder).unwrap();
+        let src = folder.join("book.7z");
+        let cached = app.tmp.path().join("book.zip");
+        std::fs::File::create(&src)
+            .unwrap()
+            .write_all(b"archive")
+            .unwrap();
+        std::fs::File::create(&cached)
+            .unwrap()
+            .write_all(b"PK\x03\x04")
+            .unwrap();
+        let src_meta = std::fs::metadata(&src).unwrap();
+        let src_mtime = crate::ui_helpers::mtime_secs(&src_meta);
+        let src_size = src_meta.len() as i64;
+        let cached_size = std::fs::metadata(&cached).unwrap().len() as i64;
+        app.archive_cache_db
+            .as_ref()
+            .unwrap()
+            .record(
+                &src,
+                src_mtime,
+                src_size,
+                crate::archive_converter::ArchiveFormat::SevenZ,
+                &cached,
+                cached_size,
+                1,
+                false,
+            )
+            .unwrap();
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &folder,
+                &FolderPinSource::File {
+                    rel: "book.7z".to_string(),
+                    kind: FileKind::ConvertibleArchive,
+                },
+            )
+            .unwrap();
+        let folder_meta = std::fs::metadata(&folder).unwrap();
+        app.install_new_items(
+            vec![GridItem::Folder(folder)],
+            vec![Some((
+                crate::ui_helpers::mtime_secs(&folder_meta),
+                folder_meta.len() as i64,
+            ))],
+        );
+
+        let ctx = egui::Context::default();
+        for _ in 0..50 {
+            app.poll_converted_archive_cache_paths(&ctx);
+            if app.converted_archive_cache_paths_pending.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(app.converted_archive_cache_paths_pending.is_none());
+        assert_eq!(
+            app.converted_archive_cache_paths
+                .get(&crate::path_key::normalize_keep_drive(&src)),
+            Some(&cached)
+        );
+    }
+
+    #[test]
     fn convertible_archive_pin_uses_cached_zip_entry_thumb_request() {
         use crate::folder_thumb_pins::FolderPinSource;
         use crate::grid_item::GridItem;
@@ -16295,7 +16368,11 @@ mod favorite_adjustment_defaults_tests {
         .expect("pinned converted archive should read the pinned entry from cache zip");
 
         let base = "archivethumb:rar:book.rar";
-        let expected_key = convertible_archive_pinned_cache_key(base, &source, 333, 444);
+        let expected_key = format!(
+            "{}{}zipentry||inner/p01.png|-|333|444",
+            base,
+            crate::thumb_loader::CACHE_KEY_PIN_SUFFIX
+        );
         assert_eq!(req.path, cache);
         assert_eq!(req.zip_entry.as_deref(), Some("inner/p01.png"));
         assert_eq!(req.resolve_override, None);
@@ -16351,6 +16428,166 @@ mod favorite_adjustment_defaults_tests {
             Some(crate::adjustment_db::zip_entry_key(&req.path, "chapter/page01.jpg").as_str())
         );
         assert!(req.edit_preview_validate_container);
+    }
+
+    #[test]
+    fn folder_pin_to_convertible_archive_uses_cached_zip_first_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("shelf");
+        std::fs::create_dir_all(&folder).unwrap();
+        let archive = folder.join("book.7z");
+        let cached = temp.path().join("book.zip");
+        std::fs::write(&archive, b"archive").unwrap();
+        std::fs::write(&cached, b"PK\x03\x04 test").unwrap();
+        let archive_meta = std::fs::metadata(&archive).unwrap();
+        let item = GridItem::Folder(folder.clone());
+        let mut pins = std::collections::HashMap::new();
+        pins.insert(
+            crate::path_key::normalize_keep_drive(&folder),
+            crate::folder_thumb_pins::FolderPinSource::File {
+                rel: "book.7z".to_string(),
+                kind: crate::folder_thumb_pins::FileKind::ConvertibleArchive,
+            },
+        );
+        let mut converted = std::collections::HashMap::new();
+        converted.insert(
+            crate::path_key::normalize_keep_drive(&archive),
+            cached.clone(),
+        );
+
+        let req = make_load_request(
+            &item,
+            0,
+            1,
+            2,
+            false,
+            None,
+            Some(crate::settings::SortOrder::FileName),
+            3,
+            &pins,
+            &converted,
+            None,
+            Some(&folder),
+            None,
+            None,
+            false,
+        )
+        .expect("folder pin should read the archive's first image from its cache ZIP");
+
+        assert_eq!(req.path, cached);
+        assert_eq!(
+            req.resolve_override,
+            Some(crate::thumb_loader::ResolveStrategy::ZipFirstImage)
+        );
+        assert_eq!(
+            req.mtime,
+            crate::ui_helpers::mtime_secs(&archive_meta),
+            "catalog identity must remain tied to the source archive"
+        );
+        assert_eq!(req.file_size, archive_meta.len() as i64);
+        assert!(
+            req.cache_key_override
+                .as_deref()
+                .is_some_and(|key| key.contains("#pin:archive|book.7z|"))
+        );
+
+        let fallback = make_load_request(
+            &item,
+            0,
+            1,
+            2,
+            false,
+            None,
+            Some(crate::settings::SortOrder::FileName),
+            3,
+            &pins,
+            &std::collections::HashMap::new(),
+            None,
+            Some(&folder),
+            None,
+            None,
+            false,
+        )
+        .expect("missing archive cache should keep the folder auto-pick request");
+        assert_eq!(fallback.path, folder);
+        assert_eq!(fallback.resolve_override, None);
+        assert!(!fallback.cache_key_override.unwrap().contains("#pin:"));
+    }
+
+    #[test]
+    fn folder_pin_to_convertible_archive_cascades_to_cached_zip_entry() {
+        let app = setup_app();
+        let folder = app.tmp.path().join("shelf");
+        std::fs::create_dir_all(&folder).unwrap();
+        let archive = folder.join("book.7z");
+        let cached = app.tmp.path().join("book.zip");
+        std::fs::write(&archive, b"archive").unwrap();
+        std::fs::write(&cached, b"PK\x03\x04 test").unwrap();
+        let item = GridItem::Folder(folder.clone());
+        let mut pins = std::collections::HashMap::new();
+        pins.insert(
+            crate::path_key::normalize_keep_drive(&folder),
+            crate::folder_thumb_pins::FolderPinSource::File {
+                rel: "book.7z".to_string(),
+                kind: crate::folder_thumb_pins::FileKind::ConvertibleArchive,
+            },
+        );
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &archive,
+                &crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+                    zip_rel: String::new(),
+                    entry: "chapter/page03.jpg".to_string(),
+                },
+            )
+            .unwrap();
+        let mut converted = std::collections::HashMap::new();
+        converted.insert(
+            crate::path_key::normalize_keep_drive(&archive),
+            cached.clone(),
+        );
+
+        let req = make_load_request(
+            &item,
+            0,
+            1,
+            2,
+            false,
+            None,
+            Some(crate::settings::SortOrder::FileName),
+            3,
+            &pins,
+            &converted,
+            None,
+            Some(&folder),
+            app.folder_thumb_pin_db.as_deref(),
+            app.video_pin_db.as_ref(),
+            false,
+        )
+        .expect("folder pin should follow the archive's own representative pin");
+
+        assert_eq!(req.path, cached);
+        assert_eq!(req.zip_entry.as_deref(), Some("chapter/page03.jpg"));
+        assert_eq!(req.resolve_override, None);
+        assert_eq!(
+            req.edit_preview_key.as_deref(),
+            Some(crate::adjustment_db::zip_entry_key(&cached, "chapter/page03.jpg").as_str())
+        );
+        let pinned_key = req.cache_key_override.clone().unwrap();
+        assert!(pinned_key.contains("#pin:cascade:"), "{pinned_key}");
+
+        let existing_keys = folder_thumb_existing_keys_for(
+            &item,
+            Some((1, 2)),
+            &pins,
+            app.folder_thumb_pin_db.as_deref(),
+            Some(crate::settings::SortOrder::FileName),
+            3,
+            false,
+        );
+        assert!(existing_keys.contains(&pinned_key));
     }
 
     #[test]
@@ -16703,6 +16940,65 @@ mod favorite_adjustment_defaults_tests {
             .expect("converted archive zip_nav should show the pin button");
         assert!(state.enabled);
         assert!(state.matches_current_pin);
+    }
+
+    #[test]
+    fn convertible_archive_folder_pin_ui_and_set_guard_require_valid_cache() {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("shelf");
+        std::fs::create_dir_all(&folder).unwrap();
+        let archive = folder.join("book.7z");
+        let cached = app.tmp.path().join("book.zip");
+        std::fs::write(&archive, b"archive").unwrap();
+        std::fs::write(&cached, b"PK\x03\x04 test").unwrap();
+        let item = GridItem::ConvertibleArchive {
+            path: archive.clone(),
+            format: crate::archive_converter::ArchiveFormat::SevenZ,
+        };
+        app.current_folder = Some(folder.clone());
+        app.items = vec![item];
+        app.image_metas = vec![Some((1, 2))];
+        app.selected = Some(0);
+        app.settings.show_address_bar_folder_pin = true;
+
+        let unavailable = app.compute_folder_pin_button_state().unwrap();
+        assert!(!unavailable.enabled);
+        assert!(unavailable.tooltip.contains("変換後に設定可能"));
+
+        app.converted_archive_cache_paths.insert(
+            crate::path_key::normalize_keep_drive(&archive),
+            cached.clone(),
+        );
+        let ready_in_memory = app.compute_folder_pin_button_state().unwrap();
+        assert!(ready_in_memory.enabled);
+
+        // 非同期 map だけが stale に残っていても set 時 guard が DB を再検証する。
+        app.toggle_folder_pin_for_idx(0);
+        assert!(app.folder_thumb_pin_for(&folder).is_none());
+
+        let archive_meta = std::fs::metadata(&archive).unwrap();
+        app.archive_cache_db
+            .as_ref()
+            .unwrap()
+            .record(
+                &archive,
+                crate::ui_helpers::mtime_secs(&archive_meta),
+                archive_meta.len() as i64,
+                crate::archive_converter::ArchiveFormat::SevenZ,
+                &cached,
+                std::fs::metadata(&cached).unwrap().len() as i64,
+                1,
+                false,
+            )
+            .unwrap();
+        app.toggle_folder_pin_for_idx(0);
+        assert_eq!(
+            app.folder_thumb_pin_for(&folder),
+            Some(&crate::folder_thumb_pins::FolderPinSource::File {
+                rel: "book.7z".to_string(),
+                kind: crate::folder_thumb_pins::FileKind::ConvertibleArchive,
+            })
+        );
     }
 
     #[test]
@@ -21455,7 +21751,7 @@ mod pipeline_cache_refactor_tests {
         page_idx: usize,
         texture: egui::TextureHandle,
     ) -> FsHoldover {
-        FsHoldover::ColorizeDisplayUnit(ColorizeDisplayUnitHoldover {
+        FsHoldover::FinalEffectSourceReload(FinalEffectSourceReloadHoldover {
             target_idx,
             previous: FsDisplayUnitHoldover {
                 pages: vec![FsDisplayUnitHoldoverPage {
@@ -21624,154 +21920,6 @@ mod pipeline_cache_refactor_tests {
             },
         );
         (edit_key, final_key)
-    }
-
-    fn insert_display_final(
-        app: &mut App,
-        ctx: &egui::Context,
-        idx: usize,
-        label: &str,
-    ) -> egui::TextureId {
-        let (_, final_key) = insert_edit_and_final_cache(app, ctx, idx, label);
-        app.final_composite_cache
-            .get(&final_key)
-            .expect("display final fixture must exist")
-            .texture
-            .id()
-    }
-
-    #[test]
-    fn paged_spread_colorize_transition_holds_previous_unit_until_both_target_pages_are_ready() {
-        let ctx = egui::Context::default();
-        let mut app = setup_app();
-        for page in 0..4 {
-            push_image(&mut app, &format!("C:/pics/spread-colorize-{page}.jpg"));
-        }
-        app.rebuild_visible_indices();
-        app.reading_flow = crate::settings::ReadingFlow::Paged;
-        app.spread_mode = crate::settings::SpreadMode::Ltr;
-        app.settings.global_preset.colorize.mode = ColorizeMode::AllImages;
-        app.fullscreen_idx = Some(0);
-
-        let old_left = insert_display_final(&mut app, &ctx, 0, "spread_old_left");
-        let old_right = insert_display_final(&mut app, &ctx, 1, "spread_old_right");
-        let target_left = insert_display_final(&mut app, &ctx, 2, "spread_target_left");
-
-        app.capture_colorize_page_transition_holdover(2);
-        app.fullscreen_idx = Some(2);
-        let target_pair = app.resolve_spread_pair(2);
-        assert_eq!(target_pair, SpreadPair::Double { left: 2, right: 3 });
-
-        let held = app
-            .colorize_display_unit_holdover_for_draw(2, target_pair, false)
-            .expect("one missing target page must keep the whole previous spread");
-        assert_eq!(
-            held.pages.iter().map(|page| page.idx).collect::<Vec<_>>(),
-            vec![0, 1]
-        );
-        assert_eq!(
-            held.pages
-                .iter()
-                .map(|page| page.texture.id())
-                .collect::<Vec<_>>(),
-            vec![old_left, old_right],
-            "both old pages must remain visible as one display unit"
-        );
-        assert_eq!(
-            app.resolve_fs_display_tex(2, true)
-                .map(|texture| texture.id()),
-            Some(target_left),
-            "the ready target page may exist in cache but must not be published alone"
-        );
-        assert!(
-            app.resolve_fs_display_tex(3, true).is_none(),
-            "the missing colorized partner remains gated instead of falling back to raw"
-        );
-
-        let target_right = insert_display_final(&mut app, &ctx, 3, "spread_target_right");
-        assert!(
-            app.colorize_display_unit_holdover_for_draw(2, target_pair, false)
-                .is_none(),
-            "the old spread must be released only when both target pages are ready"
-        );
-        assert!(app.fs_holdover_tex.is_none());
-        assert_eq!(
-            [2, 3].map(|idx| app.resolve_fs_display_tex(idx, true).unwrap().id()),
-            [target_left, target_right]
-        );
-    }
-
-    #[test]
-    fn paged_single_colorize_transition_keeps_single_page_holdover_behavior() {
-        let ctx = egui::Context::default();
-        let mut app = setup_app();
-        let old_idx = push_image(&mut app, "C:/pics/single-colorize-old.jpg");
-        let target_idx = push_image(&mut app, "C:/pics/single-colorize-target.jpg");
-        app.rebuild_visible_indices();
-        app.reading_flow = crate::settings::ReadingFlow::Paged;
-        app.spread_mode = crate::settings::SpreadMode::Single;
-        app.settings.global_preset.colorize.mode = ColorizeMode::AllImages;
-        app.fullscreen_idx = Some(old_idx);
-        let old_texture = insert_display_final(&mut app, &ctx, old_idx, "single_old");
-
-        app.capture_colorize_page_transition_holdover(target_idx);
-        app.fullscreen_idx = Some(target_idx);
-        let held = app
-            .colorize_display_unit_holdover_for_draw(target_idx, SpreadPair::Single, false)
-            .expect("single-page colorize wait should retain the previous page");
-        assert_eq!(held.pages.len(), 1);
-        assert_eq!(held.pages[0].idx, old_idx);
-        assert_eq!(held.pages[0].texture.id(), old_texture);
-
-        insert_display_final(&mut app, &ctx, target_idx, "single_target");
-        assert!(
-            app.colorize_display_unit_holdover_for_draw(target_idx, SpreadPair::Single, false,)
-                .is_none()
-        );
-        assert!(app.fs_holdover_tex.is_none());
-    }
-
-    #[test]
-    fn paged_colorize_disabled_switches_without_waiting_for_display_unit() {
-        let ctx = egui::Context::default();
-        let mut app = setup_app();
-        for page in 0..4 {
-            push_image(&mut app, &format!("C:/pics/spread-plain-{page}.jpg"));
-        }
-        app.rebuild_visible_indices();
-        app.reading_flow = crate::settings::ReadingFlow::Paged;
-        app.spread_mode = crate::settings::SpreadMode::Ltr;
-        app.settings.global_preset.colorize.mode = ColorizeMode::Disabled;
-        app.fullscreen_idx = Some(0);
-        insert_display_final(&mut app, &ctx, 0, "plain_old_left");
-        insert_display_final(&mut app, &ctx, 1, "plain_old_right");
-
-        app.capture_colorize_page_transition_holdover(2);
-
-        assert!(
-            app.fs_holdover_tex.is_none(),
-            "without a final-effect gate, paged navigation must switch immediately"
-        );
-    }
-
-    #[test]
-    fn continuous_colorize_navigation_does_not_create_paged_display_unit_holdover() {
-        let ctx = egui::Context::default();
-        let mut app = setup_app();
-        let old_idx = push_image(&mut app, "C:/pics/continuous-old.jpg");
-        let target_idx = push_image(&mut app, "C:/pics/continuous-target.jpg");
-        app.rebuild_visible_indices();
-        app.reading_flow = crate::settings::ReadingFlow::Vertical;
-        app.settings.global_preset.colorize.mode = ColorizeMode::AllImages;
-        app.fullscreen_idx = Some(old_idx);
-        insert_display_final(&mut app, &ctx, old_idx, "continuous_old");
-
-        app.capture_colorize_page_transition_holdover(target_idx);
-
-        assert!(
-            app.fs_holdover_tex.is_none(),
-            "continuous reading keeps using its page-scoped transition map"
-        );
     }
 
     #[test]
@@ -22439,7 +22587,7 @@ mod pipeline_cache_refactor_tests {
         let existing_id = existing.id();
         app.fs_holdover_tex = Some(single_colorize_holdover(idx, idx, existing));
 
-        app.capture_colorize_source_reload_holdover(idx);
+        app.capture_final_effect_source_reload_holdover(idx);
         app.bump_input_generation_for_fs_cache_reload(idx);
 
         assert_eq!(
@@ -22470,7 +22618,7 @@ mod pipeline_cache_refactor_tests {
         app.fs_holdover_tex = Some(single_colorize_holdover(current_idx, current_idx, existing));
         populate_all_idx_caches(&mut app, &ctx, prefetched_idx, "prefetched_reload");
 
-        app.capture_colorize_source_reload_holdover(prefetched_idx);
+        app.capture_final_effect_source_reload_holdover(prefetched_idx);
         app.bump_input_generation_for_fs_cache_reload(prefetched_idx);
 
         assert_eq!(
@@ -22762,19 +22910,19 @@ mod pipeline_cache_refactor_tests {
             .expect("incomplete colorized composite should be displayable");
         assert_eq!(displayed.id(), provisional_id);
         assert!(
-            app.colorize_display_unit_holdover_for_draw(idx, SpreadPair::Single, false)
+            app.final_effect_source_reload_holdover_for_draw(idx, SpreadPair::Single, false)
                 .is_none(),
             "a displayable colorized replacement atomically releases the older unit"
         );
 
-        app.capture_colorize_source_reload_holdover(idx);
+        app.capture_final_effect_source_reload_holdover(idx);
         app.final_composite_cache.remove(&final_key);
         assert!(
             app.resolve_fs_processed_texture(&ctx, idx, false).is_none(),
             "the page resolver must not expose a per-page holdover fallback"
         );
         let during_rebuild = app
-            .colorize_display_unit_holdover_for_draw(idx, SpreadPair::Single, false)
+            .final_effect_source_reload_holdover_for_draw(idx, SpreadPair::Single, false)
             .expect("the captured display unit should bridge an explicit cache invalidation");
         assert_eq!(during_rebuild.pages.len(), 1);
         assert_eq!(during_rebuild.pages[0].texture.id(), provisional_id);
@@ -22804,7 +22952,7 @@ mod pipeline_cache_refactor_tests {
             .expect("complete final should replace the holdover");
         assert_eq!(displayed.id(), complete_id);
         assert!(
-            app.colorize_display_unit_holdover_for_draw(idx, SpreadPair::Single, false)
+            app.final_effect_source_reload_holdover_for_draw(idx, SpreadPair::Single, false)
                 .is_none(),
             "the ready target unit must release the old unit at the draw boundary"
         );
@@ -22837,7 +22985,7 @@ mod pipeline_cache_refactor_tests {
             .texture
             .id();
 
-        app.capture_colorize_source_reload_holdover(idx);
+        app.capture_final_effect_source_reload_holdover(idx);
         app.bump_input_generation_for_fs_cache_reload(idx);
         assert_eq!(
             app.continuous_page_transition_texture(idx)
@@ -22950,7 +23098,7 @@ mod pipeline_cache_refactor_tests {
         let (_, _, _, final_key) =
             populate_all_idx_caches(&mut app, &ctx, idx, "continuous_keep_drop");
 
-        app.capture_colorize_source_reload_holdover(idx);
+        app.capture_final_effect_source_reload_holdover(idx);
         assert!(app.continuous_page_transitions.contains_key(&idx));
 
         let keep_set = std::collections::HashSet::from([anchor]);
@@ -25335,6 +25483,303 @@ mod pipeline_cache_refactor_tests {
             FsPageLoadState::DisplayReady(FsPageDisplaySource::LiveCache)
         );
         assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn deferred_page_turn_open_does_not_start_decode_until_materialization() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\missing\page-turn-deferred.png");
+        app.visible_indices = vec![idx];
+        app.details_order = vec![idx];
+
+        app.open_fullscreen_with_materialization(
+            idx,
+            HistoryTrigger::UserChosen,
+            FsOpenMaterialization::DeferredPageTurn,
+        );
+
+        assert_eq!(app.fullscreen_idx, Some(idx));
+        assert_eq!(app.fs_page_load_state(idx), FsPageLoadState::NeedsLoad);
+        assert!(app.fs_pending.is_empty());
+
+        app.open_fullscreen_with_materialization(
+            idx,
+            HistoryTrigger::UserChosen,
+            FsOpenMaterialization::Eager,
+        );
+
+        assert_eq!(app.fs_page_load_state(idx), FsPageLoadState::LoadPending);
+        assert!(app.fs_pending.contains_key(&idx));
+    }
+
+    #[test]
+    fn deferring_page_turn_work_cancels_producers_but_preserves_resident_results() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let resident_idx = push_image(&mut app, r"C:\pics\resident.png");
+        let pending_idx = push_image(&mut app, r"C:\pics\pending.png");
+        let resident_pixels = Arc::new(egui::ColorImage::filled([2, 2], egui::Color32::LIGHT_BLUE));
+        let resident_tex = ctx.load_texture(
+            "page_turn_resident",
+            (*resident_pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            resident_idx,
+            FsCacheEntry::Static {
+                tex: resident_tex,
+                pixels: Arc::clone(&resident_pixels),
+                source_dims: Some([2, 2]),
+                load_seq: 1,
+            },
+        );
+
+        let (_fs_tx, fs_rx) = std::sync::mpsc::channel();
+        let fs_cancel = Arc::new(AtomicBool::new(false));
+        let input_seq = app.input_seq;
+        app.fs_pending
+            .insert(pending_idx, (Arc::clone(&fs_cancel), fs_rx, input_seq));
+        app.fs_upload_backlog
+            .push((pending_idx, FsLoadResult::Failed, input_seq));
+
+        let ai_key = FinalAiKey {
+            edit_key: dummy_edit_key(&app, pending_idx),
+            color_ai_hash: 1,
+            bg: 0,
+        };
+        let (ai_pending, ai_cancel) = make_fake_final_ai_pending();
+        app.final_ai_pending.insert(ai_key, ai_pending);
+
+        let effect_key = FinalCompositeKey {
+            edit_key: dummy_edit_key(&app, pending_idx),
+            params_hash: 1,
+            bg: 0,
+        };
+        let effect_cancel = Arc::new(AtomicBool::new(false));
+        let (_effect_tx, effect_rx) = std::sync::mpsc::channel();
+        let items_generation = app.items_generation;
+        app.final_effect_pending.insert(
+            effect_key,
+            FinalEffectPending {
+                cancel: Arc::clone(&effect_cancel),
+                rx: effect_rx,
+                items_generation,
+                output_complete: true,
+                nearest_sampler: false,
+                prefetch: false,
+            },
+        );
+
+        app.defer_page_turn_full_resolution_work();
+
+        assert!(fs_cancel.load(Ordering::Relaxed));
+        assert!(ai_cancel.load(Ordering::Relaxed));
+        assert!(effect_cancel.load(Ordering::Relaxed));
+        assert!(app.fs_pending.is_empty());
+        assert!(app.final_ai_pending.is_empty());
+        assert!(app.final_effect_pending.is_empty());
+        assert!(app.fs_cache.contains_key(&resident_idx));
+        assert_eq!(app.fs_upload_backlog.len(), 1);
+    }
+
+    #[test]
+    fn page_turn_rendition_reuses_identity_thumbnail_and_rekeys_color_adjustment() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\pics\page-turn-rendition.png");
+        let source = Arc::new(egui::ColorImage::filled(
+            [2, 2],
+            egui::Color32::from_rgb(64, 96, 128),
+        ));
+        let catalog = ctx.load_texture(
+            "page_turn_catalog",
+            (*source).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        let catalog_id = catalog.id();
+        app.thumbnails[idx] = ThumbnailState::Loaded {
+            tex: catalog,
+            from_cache: false,
+            from_edit_preview: false,
+            rendered_at_px: 2,
+            source_dims: Some((2, 2)),
+        };
+        app.thumb_pixels.insert(idx, Arc::clone(&source));
+
+        let identity = app
+            .ensure_passthrough_rendition(&ctx, idx)
+            .expect("identity rendition");
+        assert_eq!(identity.id(), catalog_id);
+        assert_eq!(app.passthrough_rendition_cache_len_for_test(), 1);
+        assert!(Arc::ptr_eq(
+            &app.current_passthrough_rendition_pixels_for_test(idx)
+                .expect("identity pixels"),
+            &source,
+        ));
+
+        let mut adjusted_params = crate::adjustment::AdjustParams::default();
+        adjusted_params.brightness = 25.0;
+        app.adjustment_page_params.insert(idx, adjusted_params);
+        let adjusted = app
+            .ensure_passthrough_rendition(&ctx, idx)
+            .expect("adjusted rendition");
+        let adjusted_pixels = app
+            .current_passthrough_rendition_pixels_for_test(idx)
+            .expect("adjusted pixels");
+
+        assert_ne!(adjusted.id(), catalog_id);
+        assert_ne!(*adjusted_pixels, *source);
+        assert_eq!(app.passthrough_rendition_cache_len_for_test(), 2);
+    }
+
+    #[test]
+    fn monochrome_only_page_turn_reuses_the_rendition_classification_for_final() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\pics\page-turn-color.png");
+        let color = Arc::new(egui::ColorImage::new(
+            [8, 8],
+            (0..64)
+                .map(|value| match value % 4 {
+                    0 => egui::Color32::RED,
+                    1 => egui::Color32::GREEN,
+                    2 => egui::Color32::BLUE,
+                    _ => egui::Color32::YELLOW,
+                })
+                .collect(),
+        ));
+        let catalog = ctx.load_texture(
+            "page_turn_color_catalog",
+            color.as_ref().clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.thumbnails[idx] = ThumbnailState::Loaded {
+            tex: catalog,
+            from_cache: false,
+            from_edit_preview: false,
+            rendered_at_px: 8,
+            source_dims: Some((800, 1201)),
+        };
+        app.thumb_pixels.insert(idx, Arc::clone(&color));
+        set_colorize_mode(&mut app, idx, ColorizeMode::MonochromeOnly);
+
+        let _ = app
+            .ensure_passthrough_rendition(&ctx, idx)
+            .expect("color rendition");
+        assert_eq!(
+            app.current_passthrough_colorize_applied_for_test(idx),
+            Some(false)
+        );
+
+        // Full materialization advances source_gen. The rendition-owned
+        // applicability intentionally crosses that decode-only generation.
+        app.input_generation.insert(idx, 1);
+        let params = app.effective_params(idx).clone();
+        let final_key =
+            app.final_composite_key_for_pixels(app.current_edit_result_key(idx), [8, 8], &params);
+        let applicability = app
+            .passthrough_rendition_cache
+            .colorize_applied_for_final(final_key);
+        assert_eq!(applicability, Some(false));
+        let mut edited_key = final_key;
+        edited_key.edit_key.local_gen = edited_key.edit_key.local_gen.wrapping_add(1);
+        assert_eq!(
+            app.passthrough_rendition_cache
+                .colorize_applied_for_final(edited_key),
+            None,
+            "an edit-generation change must not reuse a stale rendition classification"
+        );
+
+        // Deliberately use a full-resolution input whose independent classifier
+        // would disagree. The landing final must retain the visible rendition's
+        // decision instead of changing color at settle.
+        let monochrome = Arc::new(egui::ColorImage::new(
+            [8, 8],
+            (0..64)
+                .map(|value| egui::Color32::from_gray((value * 4) as u8))
+                .collect(),
+        ));
+        assert!(crate::colorize::should_apply(&monochrome, &params.colorize));
+        let cancel = AtomicBool::new(false);
+        let result = crate::final_composite::execute_final_composite(
+            Arc::clone(&monochrome),
+            crate::final_composite::FinalCompositePlan {
+                adjust_before_effect: None,
+                smart_sharpen: 0,
+                colorize: params.colorize,
+                colorize_applicable_override: applicability,
+                creative_lut: None,
+                post_filter: crate::adjustment::PostFilter::None,
+            },
+            &cancel,
+        );
+        let crate::final_composite::FinalCompositeResult::Ready { pixels, timing, .. } = result
+        else {
+            panic!("final composite should complete");
+        };
+        assert!(!timing.colorize_applied);
+        assert_eq!(pixels.as_ref(), monochrome.as_ref());
+    }
+
+    #[test]
+    fn monochrome_only_page_turn_prefers_a_resident_final_classification() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\pics\page-turn-known-color.png");
+        let monochrome = Arc::new(egui::ColorImage::new(
+            [8, 8],
+            (0..64)
+                .map(|value| egui::Color32::from_gray((value * 4) as u8))
+                .collect(),
+        ));
+        let catalog = ctx.load_texture(
+            "page_turn_known_color_catalog",
+            monochrome.as_ref().clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        let catalog_id = catalog.id();
+        app.thumbnails[idx] = ThumbnailState::Loaded {
+            tex: catalog,
+            from_cache: false,
+            from_edit_preview: false,
+            rendered_at_px: 8,
+            source_dims: Some((800, 1201)),
+        };
+        app.thumb_pixels.insert(idx, Arc::clone(&monochrome));
+        set_colorize_mode(&mut app, idx, ColorizeMode::MonochromeOnly);
+        let params = app.effective_params(idx).clone();
+        assert!(crate::colorize::should_apply(&monochrome, &params.colorize));
+
+        let final_key =
+            app.final_composite_key_for_pixels(app.current_edit_result_key(idx), [8, 8], &params);
+        let final_texture = ctx.load_texture(
+            "page_turn_known_color_final",
+            monochrome.as_ref().clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.final_composite_cache.insert(
+            final_key,
+            FinalCompositeEntry {
+                pixels: Arc::clone(&monochrome),
+                texture: final_texture,
+                complete: true,
+            },
+        );
+        app.final_composite_cache
+            .record_colorize_applied(final_key, false);
+
+        let rendition = app
+            .ensure_passthrough_rendition(&ctx, idx)
+            .expect("resident-final-aligned rendition");
+        assert_eq!(
+            app.current_passthrough_colorize_applied_for_test(idx),
+            Some(false)
+        );
+        assert_eq!(
+            rendition.id(),
+            catalog_id,
+            "the pass-through frame must retain the resident final's no-colorize decision"
+        );
     }
 
     #[test]

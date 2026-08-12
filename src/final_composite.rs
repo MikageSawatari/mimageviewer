@@ -63,6 +63,9 @@ pub(crate) struct FinalCompositePlan {
     /// AI の実行結果 (`used_upscale`) まで解決した有効強度。
     pub(crate) smart_sharpen: u8,
     pub(crate) colorize: crate::colorize::ColorizeParams,
+    /// 直前の rendition が出した適用可否。`MonochromeOnly` の判定は走査が重いので、
+    /// 同じ画像で答えが出ているときは再計算しない (master の final effect と同じ規則)。
+    pub(crate) colorize_applicable_override: Option<bool>,
     /// 選択 id ではなく、adapter が解決済みの immutable LUT と強度。
     pub(crate) creative_lut: Option<(crate::creative_lut::SharedCreativeLut, f32)>,
     pub(crate) post_filter: crate::adjustment::PostFilter,
@@ -78,6 +81,21 @@ impl FinalCompositePlan {
 ///
 /// App uses this for its non-AI route and remote always uses it in stage 1.
 /// Smart sharpen therefore follows `effective_smart_sharpen(false)`.
+/// `MonochromeOnly` の適用可否だけは呼び出し側の答えを優先する。走査が重く、同じ画像に対して
+/// 直前の rendition が既に出しているため。他のモードは常にこの場で判定する。
+pub(crate) fn final_composite_colorize_applies(
+    colorize: &crate::colorize::ColorizeParams,
+    applicable_override: Option<bool>,
+    source: &egui::ColorImage,
+) -> bool {
+    match colorize.mode {
+        crate::colorize::ColorizeMode::MonochromeOnly => {
+            applicable_override.unwrap_or_else(|| crate::colorize::should_apply(source, colorize))
+        }
+        _ => crate::colorize::should_apply(source, colorize),
+    }
+}
+
 pub(crate) fn build_final_composite_plan_without_ai(
     params: &crate::adjustment::AdjustParams,
     creative_lut: Option<(crate::creative_lut::SharedCreativeLut, f32)>,
@@ -86,6 +104,7 @@ pub(crate) fn build_final_composite_plan_without_ai(
         adjust_before_effect: (!params.is_color_identity()).then(|| params.clone()),
         smart_sharpen: params.effective_smart_sharpen(false),
         colorize: params.colorize.clone(),
+        colorize_applicable_override: None,
         creative_lut,
         post_filter: params.post_filter,
     }
@@ -103,6 +122,7 @@ pub(crate) fn build_final_composite_plan_after_ai(
         adjust_before_effect: None,
         smart_sharpen: params.effective_smart_sharpen(used_upscale),
         colorize: params.colorize.clone(),
+        colorize_applicable_override: None,
         creative_lut,
         post_filter: params.post_filter,
     }
@@ -173,7 +193,11 @@ pub(crate) fn execute_final_composite(
         return FinalCompositeResult::Cancelled;
     }
     let stage_started = std::time::Instant::now();
-    timing.colorize_applied = crate::colorize::should_apply(&sharpened, &plan.colorize);
+    timing.colorize_applied = final_composite_colorize_applies(
+        &plan.colorize,
+        plan.colorize_applicable_override,
+        &sharpened,
+    );
     timing.colorize_check_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
     let stage_started = std::time::Instant::now();
     let colorized = if timing.colorize_applied {
@@ -340,6 +364,7 @@ mod tests {
             adjust_before_effect: Some(adjust.clone()),
             smart_sharpen: 37,
             colorize: colorize.clone(),
+            colorize_applicable_override: None,
             creative_lut: Some((Arc::clone(&lut), 0.65)),
             post_filter: crate::adjustment::PostFilter::WarmTone,
         };

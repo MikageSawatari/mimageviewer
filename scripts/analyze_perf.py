@@ -419,6 +419,10 @@ def cmd_page_turn(events: list[dict]) -> None:
 
 
 PAGE_TURN_BURST_GAP_SECS = 0.300
+# How long after a hold's key-up the landing page may take to materialize (R4).
+# Measured settles are 29-56ms; this is generous but bounded so a page that
+# never settles still fails.
+PAGE_TURN_SETTLE_WINDOW_SECS = 1.500
 PAGE_TURN_BURST_GAP_EPSILON = 1e-9
 PAGE_TURN_INVARIANT_SOURCES = ("final_composite", "thumbnail")
 
@@ -501,6 +505,39 @@ def analyze_test_script_input(events: list[dict]) -> dict:
         for event in frames
         if int(event.get("materialized_in_frame", 0)) > 1
     ]
+    level_reads = [
+        event
+        for event in events
+        if event.get("cat") == "test_script"
+        and event.get("kind") == "level_read"
+        and event.get("reader") == "Keymap::key_held_chord"
+        and _positive_hold_id(event) is not None
+        and isinstance(event.get("frame_nr"), int)
+    ]
+    level_reads_by_frame: dict[tuple[int, int], list[dict]] = defaultdict(list)
+    for event in level_reads:
+        level_reads_by_frame[
+            (_positive_hold_id(event), int(event["frame_nr"]))
+        ].append(event)
+    required_level_reads = {
+        (_positive_hold_id(event), int(event["frame_nr"]))
+        for event in frames
+        if event.get("held") is True and isinstance(event.get("frame_nr"), int)
+    }
+    missing_level_reads = sorted(
+        pair for pair in required_level_reads if pair not in level_reads_by_frame
+    )
+    false_level_reads = sorted(
+        pair
+        for pair in required_level_reads
+        if pair in level_reads_by_frame
+        and not all(event.get("held") is True for event in level_reads_by_frame[pair])
+    )
+    level_established = (
+        bool(required_level_reads)
+        and not missing_level_reads
+        and not false_level_reads
+    )
     # A frame only absorbs several repeats when it outlasts the repeat
     # interval. A healthy fast run never produces one -- a real 2.5s hold on the
     # grid ran at ~166fps and accumulated nothing -- so demanding it everywhere
@@ -516,16 +553,30 @@ def analyze_test_script_input(events: list[dict]) -> dict:
         failures.append(
             "no hold observed both held=true/edge>0 and held=true/edge=0 frames"
         )
-    if page_turn_measured and not accumulated_frames:
+    if missing_level_reads:
         failures.append(
-            "no frame materialized multiple repeats during a page-turn measurement"
+            "production keymap level read missing for held synthetic input frames"
         )
+    if false_level_reads:
+        failures.append(
+            "production keymap level read returned held=false for held synthetic input frames"
+        )
+    # Accumulation is reported, never required. It only happens when a frame
+    # outlasts the repeat interval, which is a property of how heavy the book
+    # is, not of whether the harness works: a 1.6MP folder renders at ~6ms and
+    # can never pile repeats up, so gating on it fails correct runs. That the
+    # timeline can deliver piled-up repeats is covered by the key_input unit
+    # test that advances a synthetic clock by 460ms.
     return {
         "status": "pass" if not failures else "not-established",
         "hold_ids": sorted(by_hold),
         "frame_count": len(frames),
         "vibration_hold_ids": vibration_hold_ids,
         "accumulated_frames": accumulated_frames,
+        "level_read_count": len(level_reads),
+        "level_established": level_established,
+        "missing_level_reads": missing_level_reads,
+        "false_level_reads": false_level_reads,
         "page_turn_measured": page_turn_measured,
         "failures": failures,
     }
@@ -533,6 +584,7 @@ def analyze_test_script_input(events: list[dict]) -> dict:
 
 def _print_test_script_input_report(report: dict) -> None:
     vibration = "yes" if report["vibration_hold_ids"] else "no"
+    level = "yes" if report["level_established"] else "no"
     if report["accumulated_frames"]:
         accumulation = "yes"
     elif report["page_turn_measured"]:
@@ -543,6 +595,7 @@ def _print_test_script_input_report(report: dict) -> None:
         "test-script input: "
         f"status={report['status']} holds={len(report['hold_ids'])} "
         f"frames={report['frame_count']} vibration={vibration} "
+        f"level={level} level_reads={report['level_read_count']} "
         f"accumulation={accumulation}"
     )
     for failure in report["failures"]:
@@ -553,6 +606,20 @@ def cmd_test_script_input(events: list[dict], check: bool) -> int:
     report = analyze_test_script_input(events)
     _print_test_script_input_report(report)
     return 1 if check and report["status"] != "pass" else 0
+
+
+def _hold_release_time(events: list[dict], hold_id: object) -> float | None:
+    """Return when the script released the key for this hold, if it is known."""
+    if hold_id is None:
+        return None
+    for event in events:
+        if (
+            event.get("cat") == "test_script"
+            and event.get("kind") == "hold_end"
+            and event.get("hold_id") == hold_id
+        ):
+            return float(event.get("t", 0.0))
+    return None
 
 
 def _page_turn_check_bursts(events: list[dict]) -> list[dict]:
@@ -700,14 +767,6 @@ def _page_turn_decision_reason_for_ready(
 def analyze_page_turn_invariants(events: list[dict]) -> dict:
     """Check the page-turn trace invariants I1--I5 from the v2.13 brief."""
     bursts = _page_turn_check_bursts(events)
-    max_idx_by_generation: dict[object, int] = {}
-    for burst in bursts:
-        generation = burst["items_generation"]
-        observed_max = max(burst["indices"])
-        max_idx_by_generation[generation] = max(
-            observed_max,
-            max_idx_by_generation.get(generation, observed_max),
-        )
 
     violations: list[dict] = []
     for burst in bursts:
@@ -807,21 +866,34 @@ def analyze_page_turn_invariants(events: list[dict]) -> dict:
                     "missing_indices": missing,
                 })
 
-        # I4: a burst normally settles on a materialized frame. The sole
-        # exception is a repeated endpoint (0 or the highest observed index in
-        # this items_generation), which represents holding at a folder edge.
+        # I4: the page a burst lands on must end up materialized. R4 is about
+        # what happens *after* the key comes up, so the settle is looked for in
+        # a window following the burst rather than inside it. Measured settles
+        # land 29-56ms after release; a hold-scoped burst ends at the Up itself,
+        # so requiring the last in-burst event to be materialized reports every
+        # correct run as a violation.
         last_event = burst_events[-1]
         last_idx = burst["indices"][-1]
-        repeated_tail = (
-            len(burst["indices"]) >= 2
-            and burst["indices"][-2] == last_idx
+        # Ordinary moving bursts settle after key-up, so anchor their upper
+        # bound there rather than at the last pass-through ready event. An
+        # endpoint no-op may materialize earlier while the key is still held;
+        # the lower bound at burst end accepts that structurally earlier settle.
+        settle_anchor = max(
+            burst["end_t"],
+            _hold_release_time(events, burst.get("hold_id")) or burst["end_t"],
         )
-        at_endpoint = (
-            last_idx == 0
-            or last_idx == max_idx_by_generation[burst["items_generation"]]
+        settled = last_event.get("mode") == "materialized" or any(
+            event.get("cat") == "fs"
+            and event.get("kind") == "page_turn_ready"
+            and event.get("mode") == "materialized"
+            and event.get("idx") == last_idx
+            and event.get("items_generation") == burst["items_generation"]
+            and burst["end_t"]
+            <= float(event.get("t", 0.0))
+            <= settle_anchor + PAGE_TURN_SETTLE_WINDOW_SECS
+            for event in events
         )
-        endpoint_exception = repeated_tail and at_endpoint
-        if last_event.get("mode") != "materialized" and not endpoint_exception:
+        if not settled:
             violations.append({
                 "id": "I4",
                 "burst": burst,

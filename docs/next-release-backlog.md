@@ -450,11 +450,52 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   規模。detached リワーク ([detached-rework-plan.md](detached-rework-plan.md)) と presenter を
   共有するので、着手時期はリワークの進捗と調整する
 
-### 1.58 ページ送り (キー押しっぱなし) が引っかかる — v2.13.0 で入れて削除した。やり直し
+### 1.58 ページ送り (キー押しっぱなし) が引っかかる — 完了
 
+- **完了 (2026-08-12、`96faeee6`〜`a8036249`)**。§2.3 のテスト基盤で自分で再現できるように
+  してから着手し、6 回目で通した。**仕様の正本は [display-pipeline.md](display-pipeline.md)
+  §2.5**、実測は §2.5.3.2 / §2.5.3.3。
+  - **通過表示の意図を利用者が確定**: ページ送りは音声のスクラブと同じで、目標を探すための
+    操作。**解像度は変わってよいが色味は変えてはならない** (§2.5.1.1)。AI アップスケールは
+    通過中は走らせず、止まったページで推論して遅延差し替えする。
+  - 見開き 267/267、単一 144/144 と 4.1MP ZIP 全ページ表示、hold 中 decode 0〜1、
+    `page-turn --check` violations=0。
+  - 実測 (4K 165Hz、500 ページの FHD ZIP、§2.5.3.3): **fps は 30/125/165Hz いずれも約 165**。
+    表示ページレートは 30Hz で 1:1、125/165Hz では **約 100 ページ/秒**で頭打ち。律速は
+    通過表示の素材づくり (`thumb/decode_end` 中央値 32.8ms × 460 件 / 5 秒 ≒ 92 枚/秒) で、
+    カタログキャッシュが無い本でもその場で生成して成立する。
+  - **出荷時の言い方**: 「連続ページ送り中はサムネイル画質へ落として高速に切り替える。
+    その状態でおよそ 100 ページ/秒」。フル画質のまま同じレートを出せるかは未測定
+    (通過中は full decode / upload を意図的に抑止しているため、別構成の測定が要る)。
+  - 途中で見つけて直した派生: 端で押し続けたときの余計な描画 (`22ca2c45`)、読込中
+    プレースホルダの点滅 (`ff9d2eb1`)、PDF ページの元寸法喪失 (`1b5fff92`)、代役の
+    縦横比引き伸ばし (`e7191ad2`)、`MonochromeOnly` の誤カラー化。
+  - マニュアルの既知の問題から該当項目を削除し、フルスクリーンの説明に新しい挙動を追記済み。
 - 出典: 利用者メール (pattier、2026-08-07) + `--perf-log` 実測。キーリピート間隔 34ms に対し、
   1 ページの実体化に UI スレッドで upload 21ms + final_composite_build 21ms かかり、
   構造的に追いつかない。連結読みが速いのは実体化済みを見せるだけだから。
+- **2026-08-12 見開き本体修正**: source inspection で、見開きだけ旧
+  `ColorizeDisplayUnitHoldover` が対象 unit の final 完成まで前 unit を上描きし、正しく遷移した
+  frame を隠していたと確定。見開きの physical held level 中は display-unit 原子の色忠実
+  low-resolution rendition を描き、full decode / final effect / AI と UI upload を保留する。
+  release frame で止まった unit だけを実体化する。
+- **見開きの利用者実測は合格**: 修正前 23 / 267 表示から **267 / 267** (順番どおり、中央値
+  30ms)、hold 中の `decode_begin` は **0 / 0 / 0**、release 後 **29〜56ms** で左右同時に
+  materialized、`page-turn --check` は **checked bursts=3 / violations=0** になった。
+- **単一ページにも同じ規則を適用**: `aimodel1` (1.6MP) は materialized のままでも 144 / 144
+  だったが、4.1MP の実 ZIP (`原神.zip`) は **174 命令 / 29 表示 (約 1:6)** だった。
+  source inspection で `fs_page_turn_ordinary_context_blocker` の `single_page_materialized` が
+  pass-through を明示的に除外していたと確定したため、この blocker を除いた。held 中は resident
+  final の有無をページ別に見ず全ページ一様に rendition、release 後だけ materialized とする。
+- **再デコードの根因**: cache key mismatch ではなく、通過する全ページで eager decode / prefetch を
+  始めた後に `fs_cache` / `final_composite_cache` の keep window が先行ページを eviction していた。
+  見開き held 中は通過先 producer 自体を起動せず、進行中 producer だけ cancel して resident result と
+  完成済み upload backlog は保持する形へ変更した。
+- `fs/page_turn_ready` / `fs/page_turn_decision` を復活し、`idx` / `mode` / `source` /
+  `items_generation` / `reason` / `defer_ui_uploads` / `passthrough_rendition_ready` を出す。
+  `fs/paint` も通過 rendition を `source=thumbnail` として記録し、見開きは atomic source 解決後に
+  両ページを出す。`scripts/page-turn/measure-spread-rtl-roundtrip.rhai` も追加した。残作業は隔離
+  foreground で単一 `aimodel1` / 4.1MP ZIP を数値確認し、見開き回帰も再確認すること。
 - **v2.13.0 で対策 1 (通過表示 = 通り過ぎるページをカタログサムネイルで描く) を入れ、
   出荷前の実機確認で 5 回直して 5 回とも失敗したため削除した (2026-08-11)。**
   最後の状態は v2.12.0 より悪かった (カラー化した本でページごとにカラー / 白黒が入れ替わり、
@@ -478,9 +519,9 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   まま 5 回直し、毎回実機確認に依存して 1 往復 1 仮説しか試せなかった。§2.3 の
   「アプリ内蔵テストスクリプト」ができてから着手する。判定は
   `python scripts/analyze_perf.py <jsonl> page-turn --check` (実装済み) を使う。
-- 対策 2〜4 は未着手のまま残る: 再デコードの抑止 / UI スレッドの 42ms 削減 (表示解像度へ
-  縮めてからアップロード、`edit_result` upload の分散) / 最終合成の先読み。
-  **対策 1 より先に 3 を試す価値がある** (42ms が減れば通過表示自体が要らなくなる可能性)。
+- UI スレッドの 42ms 削減 (通常 materialized path の表示解像度 upload、`edit_result` upload の分散) /
+  最終合成の先読みは別の改善余地として残る。今回の held path は full-size work を開始しないため、
+  §1.58 の主症状と再デコードをこの追加最適化に依存させていない。
 - 規模 / 優先度: Medium / P2。
 
 ### 1.63 Alt+N で出したままにしたナビゲータを、タッチで消せない — 利用者報告
@@ -606,14 +647,113 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
     「モードに入らず一時的にやる」補助として後から検討するのが順当。
 - 規模 / 優先度: Medium / P3 (まず `Z` で足りるかの確認が先)。
 
+### 1.65 環境設定画面を検索できるようにする — 利用者要望
+
+- 出典: 5ch 専用スレ #207 (2026-08-11)。v2.13.0 で対応予定だったがタスクリストへ
+  入れ忘れていた項目。次バージョンで対応する。
+- 要望: 設定項目が増えてきたため、環境設定内で目的の設定を探せるようにする。
+- 方針:
+  - Siki のように「該当する設定項目だけを 1 画面に抽出し、その場で操作する」形式は、
+    現在の手続き的な egui 設定 UI では修正範囲が大きいので初期対応では目指さない。
+  - まずは検索欄から **設定ページ / 設定項目へのジャンプ**ができる形にする。
+    可能なら該当箇所までスクロールし、数秒だけ枠や背景で強調表示する。
+  - 検索対象は項目名に加えて、「ホイール」「回転」「文字」「フォント」など画面上の
+    ラベルと完全一致しない語でも見つけやすいよう、別名キーワードを持たせる。
+  - 検索欄は IME helper 経由で実装し、Enter / Tab / Esc の挙動を既存入力欄と揃える。
+- 実装メモ:
+  - `src/ui_dialogs/preferences.rs` のページ選択 / 右ペイン ScrollArea と、
+    `src/ui_dialogs/preferences/pages.rs` の各ページ描画に anchor を付ける方向で検討する。
+  - 索引が腐ると検索機能の信用が落ちるため、可能であれば egui_kittest / accesskit 等で
+    設定ラベルと索引の網羅性を確認するテストを追加する。
+  - フォント一覧や VST 一覧のような worker / 同期 I/O を伴うページを検索結果描画で
+    何度も起動しないこと。UI スレッドで重い処理を追加しない。
+- 着手前に [preferences-layout-guidelines.md](preferences-layout-guidelines.md) と
+  [ui-responsiveness.md](ui-responsiveness.md) §4 を読む。
+- 規模 / 優先度: Medium / P2。
+
+### 1.66 RAR / 7z / LZH を親フォルダの代表サムネに固定できない — 利用者報告
+
+- 出典: 5ch 専用スレ #211 (2026-08-12)。「RAR だと代表サムネに固定が出来ないの?」
+- 症状: 通常フォルダ上の変換対象アーカイブ (`GridItem::ConvertibleArchive`) タイルは、
+  そのフォルダの代表サムネに指定できない。右クリックの「📌 代表サムネに固定」が項目ごと
+  出ず、アドレスバーの 📌 も disabled + 「変換後に設定可能」。`.rar` は変換済みでも常に
+  `ConvertibleArchive` として列挙されるため、この文言は現状どうやっても成立しない。
+  ZIP / PDF は固定でき cascade も効くので、**ZIP と RAR で機能の有無が非対称**。
+- 切り分け済み (実機 + ログ、2026-08-12): アーカイブの**中**で付けるピンは正常
+  (元アーカイブのパスをキーに保存され、親フォルダのアーカイブタイルにも反映される)。
+  欠落は上記 1 経路だけ。フォルダの自動代表選定がアーカイブを開かないのは ZIP でも
+  同じで、種別差ではない (意図的仕様、維持する)。
+- 設計・実装手順の正本: [archive-thumb-pin-plan.md](archive-thumb-pin-plan.md)。
+  仕様判断 (新 `source_kind` を足す / 旧版でのバンドル取り込み失敗は仕様 / 未変換
+  アーカイブへのピンは動画と同じ guard で拒否) は利用者合意済み。
+- 同プランに、代表サムネの未知 `source_kind` を 1 件だけスキップして取り込みを続行する
+  metadata_transfer の寛容化も含む (今回一緒に入れる)。
+- 再現データ: `C:\tmp\miv-pin-test\` (フォルダ / ZIP / RAR / 7z を同一内容で用意。
+  手順と生成スクリプトは同フォルダの README.md)。
+- 規模 / 優先度: Medium (実装 300〜400 行 + テスト) / P2。
+
+### 1.67 操作カスタマイズのドライブ移動コマンド名と並び順を整理 — 利用者要望
+
+- 出典: 5ch 専用スレ #212 (2026-08-12)。C:〜Y: のドライブコマンドに続いて
+  ZIP / PDF 関連コマンドが入り、その後に Z: のコマンドが表示されるため分かりにくい。
+- 原因: 操作カスタマイズのコマンド一覧は表示名の自然順で並べている。現在の表示名は
+  `C:\を開く` / `C:の最後の場所へ切り替える` のような形式なので、Z: の項目が
+  `ZIP/PDF...` より後ろへ並ぶ。
+- 方針:
+  - 2 種類の意味も判別しやすいよう、表示名を次の形式へ変更する。
+    - `ドライブ C: の最後の場所へ切り替える`
+    - `ドライブ C:\ のルートを開く`
+  - D:〜Z: も同じ形式に統一し、操作カスタマイズ上で C:〜Z: のドライブ操作が
+    連続して表示され、各ドライブの 2 操作も隣接することを確認する。
+  - `KeyAction` の識別子と実行内容は変更しない。既存のキー / マウス / ジェスチャ割り当てを
+    維持し、ユーザー向け表示名だけを整理する。
+  - 操作一覧やショートカットヘルプなど、同じラベルを参照する画面も新しい表記へ揃える。
+  - Z: と ZIP / PDF 関連コマンドを含む並び順の回帰テストを追加する。
+- 規模 / 優先度: Small / P2。
+
+### 1.68 PDF が「表示するファイルがありません」になったとき、理由がどこにも出ない — 利用者報告
+
+- 出典: 利用者報告 2026-08-12 (§1.58 の実機確認中)。PDF を開いたら「表示するファイルが
+  ありません」になり表示できなくなった。**再起動したら再現しなくなり、原因不明のまま**。
+- 切り分け済み (source inspection、2026-08-12): PDF の item は
+  `load_pdf_as_folder` → `poll_pdf_enumerate` → `start_loading_items` が作る。
+  **items を空にし得る経路は 3 つ**あり、いずれも**利用者に理由を見せない**。
+  1. enumerate worker の切断 (プロセスが落ちた / IPC が切れた)
+  2. 通常の enumerate error
+  3. パスワードエラー時の placeholder 除去
+  同時期に入れた `MonochromeOnly` の変更は既存 item を読む consumer 側で、items を
+  空にする経路は持たない (確認済み)。
+- **これは「無言の早期 return」そのもので、直す前に観測を足す類の問題**
+  (CLAUDE.md「バグ修正の一般原則」)。原因を推測して guard を足さないこと。
+- 方針:
+  - まず **3 経路それぞれに型付きの理由を持たせ**、ログと UI の空表示メッセージに出す。
+    「表示するファイルがありません」で終わらせず、「PDF の読み込みに失敗しました
+    (パスワードが必要です / 処理が中断されました)」のように、次の行動が分かる文言にする。
+  - worker 切断は再試行の余地があるかを判断する (PDF pool は 5 プロセス構成で、
+    1 つ落ちても他が生きている可能性がある)。
+  - 同型の確認: ZIP / 変換アーカイブ / スマートフォルダなど、**enumerate 系が空を返す
+    他の経路**にも同じ無言終了が無いかを洗う。
+- 再現手段が無いので、**観測を入れた版を配ってログを待つ**形になる。観測が入る前に
+  「直った」と判断しないこと。
+- 規模 / 優先度: Small〜Medium / P2。
+
 ## 2. 一覧 / サムネイル / フォルダ走査
 
-### 2.3 アプリ内蔵のテストスクリプト実行 (実機確認の往復をなくす) — 利用者提案
+### 2.3 アプリ内蔵のテストスクリプト実行 (実機確認の往復をなくす) — 完了
 
 - 出典: 利用者提案 2026-08-11。§1.58 の実機確認で 5 往復して直せなかったことを受けて。
 - **設計の正本は [test-script-runner-plan.md](test-script-runner-plan.md)。着手時はそちらを読む。**
   差し込む層の決定 (§1)、同期点 (§2)、timeline の規約 (§3)、level の chokepoint (§4)、
   判定器を false green にしない条件 (§9) が入っている。
+- **完了 (2026-08-11、S1〜S4)**:
+  - `--test-script` + 隔離 `--data-dir`、Rhai runner、deterministic hold timeline、Win32 / egui
+    fan-out、production `Keymap::key_held_chord` の level 観測、外部 Python 判定まで実装した。
+  - `scripts/page-turn-smoke.ps1 -SelfTest` は PNG fixture 生成から fullscreen の Right hold、
+    app 終了コードと analyzer 終了コードの確認まで無人で完走する。
+  - 対話デスクトップの実ログで `app exit=0`、`status=pass`、`vibration=yes`、`level=yes`
+    (`level_reads=826`) を確認した。前提不足 run は app / analyzer / harness が非 0 になる。
+  - 以上により **§1.58 の再着手条件は満たされた**。ページ送り固有 event と不変条件の再実装は
+    §1.58 の作業として行い、正本 §13.2 の実データ計測を最終 gate にする。
 - **やりたいこと**: 起動引数でテスト用スクリプトを渡すと、mIV 内のスレッドがそれを実行し、
   操作をアプリ内から再現する。別プロセスからのキー注入をやめる。Rhai は
   スタック機能 ([filename-stack-plan.md](filename-stack-plan.md)) で既に使っており、
@@ -879,6 +1019,35 @@ docs/conceal-feature-plan.md
   Z 以外のキー ([Space] など) も効かなかったか (c) 直前に別ウィンドウ / タスクバーを
   クリックしていないか。
 - 優先度: P3 / 再現待ち。**報告が来るまで着手しない** (ユーザー判断 2026-08-02)。
+
+### 4.3 履歴クリア系を操作カスタマイズから割り当て可能にする — 利用者要望
+
+- 出典: 5ch 専用スレ #208 (2026-08-11)。「最近開いたフォルダ履歴をクリア」と
+  「A/B の記憶した場所をクリア」を 1 キーで呼び出したい。
+- 要望:
+  - フォルダバー設定メニューにある履歴クリア系操作を、キー / マウスジェスチャ /
+    リングショートカット等から呼べるようにする。
+  - 対象は少なくとも次の 2 件:
+    1. **最近開いたフォルダ履歴をクリア**
+    2. **A/B の記憶した場所をクリア**
+- 方針:
+  - 既定キーは割り当てない。操作カスタマイズの候補に追加し、利用者が必要なキーや
+    ジェスチャへ割り当てる形にする。
+  - 実行後はトースト等で「クリアしました」が分かるようにする。
+  - ファイル削除のような破壊的操作ではないため、既存メニュー動作と同程度の確認に留める。
+    既存メニュー側に確認が無い場合、キー実行だけ確認を増やして操作感を変えない。
+- 実装メモ:
+  - 既存のフォルダバー設定メニューで使っている処理を共有し、メニュー経路と
+    KeyAction / RingAction / Gesture 経路で挙動がずれないようにする。
+  - `KeyAction` / コマンド catalog / `docs/keymap.ini.default` / 操作カスタマイズ UI /
+    ヘルプ表示の更新漏れを避ける。`ring-keyaction-parity` の観点で、リング・ジェスチャ側へ
+    出す場合もキーボード側の Action と対応を取る。
+  - `quick_folder_drive_current_dirs` と `recent_folders` / `quick_folder_recent_folders` の
+    どこまでを各操作の対象にするかは既存メニュー名の意味に揃える。
+- 着手前に [keymap-spec.md](keymap-spec.md)、
+  [key-customization-impl-plan.md](key-customization-impl-plan.md)、
+  [ring-keyaction-parity.md](ring-keyaction-parity.md) を読む。
+- 規模 / 優先度: Small〜Medium / P2。
 
 ### 4.1 Shift / Alt + ホイールのカスタマイズ再設計
 

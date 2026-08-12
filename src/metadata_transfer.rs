@@ -836,9 +836,19 @@ where
                         manifest.exported_at_ms,
                         sidecar_sync,
                     ) {
-                        Ok(()) => {
+                        Ok(outcome) => {
                             conn.execute_batch("RELEASE metadata_import_item")
                                 .map_err(db_error)?;
+                            for failure in outcome.skipped_folder_pins {
+                                crate::logger::log(format!(
+                                    "metadata import: partially applied {}: {}",
+                                    failure.path, failure.reason
+                                ));
+                                summary.failed_entries = summary.failed_entries.saturating_add(1);
+                                if summary.failed_items.len() < MAX_REPORTED_PATHS {
+                                    summary.failed_items.push(failure);
+                                }
+                            }
                             if let Some((folder_key, write_adjustment, write_tags)) =
                                 sidecar_sync_flags
                             {
@@ -3303,15 +3313,24 @@ fn validate_container_state(
         }
     }
     if let Some(pin) = &state.folder_thumb_pin {
-        for value in [Some(pin.source_rel.as_str()), pin.source_entry.as_deref()]
-            .into_iter()
-            .flatten()
+        for value in [
+            Some(pin.source_kind.as_str()),
+            Some(pin.source_rel.as_str()),
+            pin.source_entry.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
         {
             if value.contains('\0') || value.chars().count() > MAX_MEMBER_KEY_CHARS {
                 return Err(TransferError::Invalid(format!(
                     "代表サムネ設定が不正です: {entry_path}"
                 )));
             }
+        }
+        if !pin.source_rel.is_empty() {
+            crate::folder_thumb_pins::validate_rel(&pin.source_rel).map_err(|error| {
+                TransferError::Invalid(format!("代表サムネ設定が不正です: {entry_path}: {error}"))
+            })?;
         }
         if let Some(entry) = pin.source_entry.as_deref() {
             let entry = entry.trim_end_matches('/');
@@ -3320,6 +3339,13 @@ fn validate_container_state(
                     "代表サムネ設定が不正です: {entry_path}"
                 )));
             }
+        }
+        if !folder_pin_source_kind_is_known(&pin.source_kind) {
+            crate::logger::log(format!(
+                "metadata import preflight: unsupported folder thumbnail source_kind={} at {} will be skipped",
+                pin.source_kind, entry_path
+            ));
+            return Ok(());
         }
         let source = portable_folder_pin_source(pin).ok_or_else(|| {
             TransferError::Invalid(format!("代表サムネ設定が不正です: {entry_path}"))
@@ -3390,7 +3416,7 @@ fn portable_folder_pin_source(
 ) -> Option<crate::folder_thumb_pins::FolderPinSource> {
     use crate::folder_thumb_pins::{FileKind, FolderPinSource};
     match pin.source_kind.as_str() {
-        "image" | "video" | "folder" | "zipfile" | "pdffile"
+        "image" | "video" | "folder" | "zipfile" | "pdffile" | "archive"
             if pin.source_entry.is_none() && pin.source_page.is_none() =>
         {
             Some(FolderPinSource::File {
@@ -3412,6 +3438,21 @@ fn portable_folder_pin_source(
         }),
         _ => None,
     }
+}
+
+fn folder_pin_source_kind_is_known(source_kind: &str) -> bool {
+    matches!(
+        source_kind,
+        "image"
+            | "video"
+            | "folder"
+            | "zipfile"
+            | "pdffile"
+            | "archive"
+            | "zipentry"
+            | "zipdir"
+            | "pdfpage"
+    )
 }
 
 fn validate_rating(rating: Option<&PortableRating>) -> Result<(), TransferError> {
@@ -3949,6 +3990,11 @@ fn open_import_connection(data_dir: &Path) -> Result<Connection, TransferError> 
     Ok(conn)
 }
 
+#[derive(Default)]
+struct ApplyEntryOutcome {
+    skipped_folder_pins: Vec<ImportFailure>,
+}
+
 fn apply_entry(
     tx: &Connection,
     data_dir: &Path,
@@ -3957,7 +4003,8 @@ fn apply_entry(
     sections: ManifestSections,
     fallback_time_ms: i64,
     automatic_sidecar_sync: Option<(String, i64, bool, bool)>,
-) -> Result<(), TransferError> {
+) -> Result<ApplyEntryOutcome, TransferError> {
+    let mut outcome = ApplyEntryOutcome::default();
     let base_key = crate::path_key::normalize_keep_drive(path);
     let deterministic_cache_key = matches!(
         entry.media_kind,
@@ -4263,24 +4310,57 @@ fn apply_entry(
     if sections.thumbnail_pins {
         if supports_container {
             let include_nested = entry.kind == PortableEntryKind::File;
-            delete_container_family(
+            // 未知 kind は「その pin 1 件を適用しない」扱いなので、取り込み先に同じ
+            // container の既存 pin があれば保持する。family 一括 DELETE の巻き添えに
+            // すると skip ではなく remove になってしまう。
+            let mut skipped_pin_keys = Vec::new();
+            if entry
+                .container_state
+                .folder_thumb_pin
+                .as_ref()
+                .is_some_and(|pin| !folder_pin_source_kind_is_known(&pin.source_kind))
+            {
+                skipped_pin_keys.push(base_key.clone());
+            }
+            for container in &entry.nested_containers {
+                if container
+                    .state
+                    .folder_thumb_pin
+                    .as_ref()
+                    .is_some_and(|pin| !folder_pin_source_kind_is_known(&pin.source_kind))
+                {
+                    skipped_pin_keys.push(join_container_key(&base_key, &container.member_key));
+                }
+            }
+            delete_container_family_except(
                 tx,
                 "folder_pin.folder_thumb_pins",
                 "container_key",
                 &base_key,
                 include_nested,
+                &skipped_pin_keys,
             )?;
-            insert_folder_pin(
+            if let Some(reason) = insert_folder_pin(
                 tx,
                 &base_key,
                 entry.container_state.folder_thumb_pin.as_ref(),
-            )?;
+            )? {
+                outcome.skipped_folder_pins.push(ImportFailure {
+                    path: entry.path.clone(),
+                    reason,
+                });
+            }
             for container in &entry.nested_containers {
-                insert_folder_pin(
+                if let Some(reason) = insert_folder_pin(
                     tx,
                     &join_container_key(&base_key, &container.member_key),
                     container.state.folder_thumb_pin.as_ref(),
-                )?;
+                )? {
+                    outcome.skipped_folder_pins.push(ImportFailure {
+                        path: format!("{}::{}", entry.path, container.member_key),
+                        reason,
+                    });
+                }
             }
         }
         if entry.media_kind == PortableMediaKind::Video {
@@ -4311,7 +4391,7 @@ fn apply_entry(
             .map_err(db_error)?;
         }
     }
-    Ok(())
+    Ok(outcome)
 }
 
 fn automatic_sidecar_sync_cached(
@@ -4491,10 +4571,20 @@ fn insert_folder_pin(
     tx: &Connection,
     key: &str,
     pin: Option<&PortableFolderThumbPin>,
-) -> Result<(), TransferError> {
+) -> Result<Option<String>, TransferError> {
     let Some(pin) = pin else {
-        return Ok(());
+        return Ok(None);
     };
+    if !folder_pin_source_kind_is_known(&pin.source_kind) {
+        let reason = format!(
+            "未対応の代表サムネ種別「{}」をスキップしました",
+            pin.source_kind
+        );
+        crate::logger::log(format!(
+            "metadata import: skipping folder thumbnail pin at {key}: {reason}"
+        ));
+        return Ok(Some(reason));
+    }
     portable_folder_pin_source(pin)
         .ok_or_else(|| TransferError::Invalid("代表サムネ設定が不正です".into()))?;
     tx.prepare_cached(
@@ -4511,7 +4601,7 @@ fn insert_folder_pin(
         pin.source_page,
     ])
     .map_err(db_error)?;
-    Ok(())
+    Ok(None)
 }
 
 fn delete_container_family(
@@ -4532,6 +4622,36 @@ fn delete_container_family(
     tx.prepare_cached(&sql)
         .map_err(db_error)?
         .execute([base_key])
+        .map_err(db_error)?;
+    Ok(())
+}
+
+fn delete_container_family_except(
+    tx: &Connection,
+    table: &str,
+    column: &str,
+    base_key: &str,
+    include_nested: bool,
+    excluded_keys: &[String],
+) -> Result<(), TransferError> {
+    if excluded_keys.is_empty() {
+        return delete_container_family(tx, table, column, base_key, include_nested);
+    }
+    let family = if include_nested {
+        format!("({column} = ?1 OR ({column} >= ?1 || '/' AND {column} < ?1 || '0'))")
+    } else {
+        format!("{column} = ?1")
+    };
+    let placeholders = (2..=excluded_keys.len() + 1)
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("DELETE FROM {table} WHERE {family} AND {column} NOT IN ({placeholders})");
+    tx.prepare_cached(&sql)
+        .map_err(db_error)?
+        .execute(rusqlite::params_from_iter(
+            std::iter::once(base_key).chain(excluded_keys.iter().map(String::as_str)),
+        ))
         .map_err(db_error)?;
     Ok(())
 }
@@ -7383,6 +7503,113 @@ mod tests {
     }
 
     #[test]
+    fn archive_folder_thumbnail_pin_round_trips() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("book.7z"), b"same-archive").unwrap();
+        fs::write(destination.join("book.7z"), b"same-archive").unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        Connection::open(source_data.join("folder_thumb_pins.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO folder_thumb_pins
+                    (container_key, source_kind, source_rel, source_entry, source_page)
+                 VALUES (?1, 'archive', 'book.7z', NULL, NULL)",
+                [crate::path_key::normalize_keep_drive(&source)],
+            )
+            .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        copy_sidecar_bundle(&source, &destination);
+        let summary = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(summary.failed_entries, 0);
+        assert_eq!(
+            Connection::open(destination_data.join("folder_thumb_pins.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT source_kind, source_rel FROM folder_thumb_pins WHERE container_key = ?1",
+                    [crate::path_key::normalize_keep_drive(&destination)],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+            ("archive".to_string(), "book.7z".to_string())
+        );
+    }
+
+    #[test]
+    fn unknown_folder_thumbnail_pin_kind_is_skipped_without_blocking_other_metadata() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("cover.jpg"), b"same-image").unwrap();
+        fs::write(destination.join("cover.jpg"), b"same-image").unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        set_rating(&source_data, &source.join("cover.jpg"), 5);
+        Connection::open(source_data.join("folder_thumb_pins.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO folder_thumb_pins
+                    (container_key, source_kind, source_rel, source_entry, source_page)
+                 VALUES (?1, 'image', 'cover.jpg', NULL, NULL)",
+                [crate::path_key::normalize_keep_drive(&source)],
+            )
+            .unwrap();
+        Connection::open(destination_data.join("folder_thumb_pins.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO folder_thumb_pins
+                    (container_key, source_kind, source_rel, source_entry, source_page)
+                 VALUES (?1, 'image', 'cover.jpg', NULL, NULL)",
+                [crate::path_key::normalize_keep_drive(&destination)],
+            )
+            .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        copy_sidecar_bundle(&source, &destination);
+        rewrite_root_shard_entries(&destination, &cancel, |entry| {
+            if entry.path == "."
+                && let Some(pin) = entry.container_state.folder_thumb_pin.as_mut()
+            {
+                pin.source_kind = "future-container".to_string();
+            }
+        });
+
+        let summary = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(summary.failed_entries, 1);
+        assert_eq!(summary.failed_items.len(), 1);
+        assert_eq!(summary.failed_items[0].path, ".");
+        assert!(summary.failed_items[0].reason.contains("future-container"));
+        assert_eq!(
+            rating(&destination_data, &destination.join("cover.jpg")),
+            Some(5)
+        );
+        let existing_pin: (String, String) = Connection::open(
+            destination_data.join("folder_thumb_pins.db"),
+        )
+        .unwrap()
+        .query_row(
+            "SELECT source_kind, source_rel FROM folder_thumb_pins WHERE container_key = ?1",
+            [crate::path_key::normalize_keep_drive(&destination)],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+        assert_eq!(existing_pin, ("image".to_string(), "cover.jpg".to_string()));
+    }
+
+    #[test]
     fn v7_round_trip_is_self_contained_without_automatic_sidecar() {
         let temp = tempfile::TempDir::new().unwrap();
         let source = temp.path().join("source");
@@ -9199,6 +9426,51 @@ mod tests {
         });
         assert!(matches!(
             validate_manifest(&invalid_pin),
+            Err(TransferError::Invalid(_))
+        ));
+
+        let mut unknown_pin = base.clone();
+        unknown_pin.entries[0].container_state.folder_thumb_pin = Some(PortableFolderThumbPin {
+            source_kind: "future-container".to_string(),
+            source_rel: "book.future".to_string(),
+            source_entry: None,
+            source_page: None,
+        });
+        assert!(validate_manifest(&unknown_pin).is_ok());
+
+        let mut unsafe_unknown_pin = unknown_pin.clone();
+        unsafe_unknown_pin.entries[0]
+            .container_state
+            .folder_thumb_pin
+            .as_mut()
+            .unwrap()
+            .source_rel = "../outside.future".to_string();
+        assert!(matches!(
+            validate_manifest(&unsafe_unknown_pin),
+            Err(TransferError::Invalid(_))
+        ));
+
+        let mut nul_unknown_pin = unknown_pin.clone();
+        nul_unknown_pin.entries[0]
+            .container_state
+            .folder_thumb_pin
+            .as_mut()
+            .unwrap()
+            .source_kind = "future\0container".to_string();
+        assert!(matches!(
+            validate_manifest(&nul_unknown_pin),
+            Err(TransferError::Invalid(_))
+        ));
+
+        let mut oversized_unknown_pin = unknown_pin;
+        oversized_unknown_pin.entries[0]
+            .container_state
+            .folder_thumb_pin
+            .as_mut()
+            .unwrap()
+            .source_kind = "x".repeat(MAX_MEMBER_KEY_CHARS + 1);
+        assert!(matches!(
+            validate_manifest(&oversized_unknown_pin),
             Err(TransferError::Invalid(_))
         ));
 

@@ -89,15 +89,123 @@ pub fn resize_dynamic_fit(
     max_h: u32,
     quality: Quality,
 ) -> DynamicImage {
+    resize_dynamic_fit_with_source_aspect(src, max_w, max_h, (src.width(), src.height()), quality)
+}
+
+const THUMBNAIL_ASPECT_ERROR_TARGET: f64 = 0.0005;
+
+/// Choose the largest near-cap integer raster whose aspect error is at most 0.05%.
+///
+/// Thumbnail dimensions are integers, so fixing the long edge and rounding the short
+/// edge can leave a visible aspect error. Consider candidates derived from both axes;
+/// among candidates meeting the error target, retain the largest long edge. If an
+/// unusually small source cannot meet the target, use the globally closest candidate.
+/// The returned dimensions never exceed either the source raster or the requested box.
+pub(crate) fn aspect_accurate_fit_dimensions(
+    raster_size: (u32, u32),
+    max_size: (u32, u32),
+    source_aspect_size: (u32, u32),
+) -> (u32, u32) {
+    let (raster_w, raster_h) = (raster_size.0.max(1), raster_size.1.max(1));
+    let bound_w = raster_w.min(max_size.0.max(1));
+    let bound_h = raster_h.min(max_size.1.max(1));
+    let (aspect_w, aspect_h) = (
+        source_aspect_size.0.max(1) as f64,
+        source_aspect_size.1.max(1) as f64,
+    );
+    let source_ratio = aspect_w / aspect_h;
+
+    #[derive(Clone, Copy)]
+    struct Candidate {
+        width: u32,
+        height: u32,
+        error: f64,
+    }
+
+    impl Candidate {
+        fn long_edge(self) -> u32 {
+            self.width.max(self.height)
+        }
+
+        fn area(self) -> u64 {
+            self.width as u64 * self.height as u64
+        }
+    }
+
+    fn better_acceptable(candidate: Candidate, current: Candidate) -> bool {
+        candidate.long_edge() > current.long_edge()
+            || (candidate.long_edge() == current.long_edge()
+                && (candidate.error < current.error
+                    || (candidate.error == current.error && candidate.area() > current.area())))
+    }
+
+    fn better_fallback(candidate: Candidate, current: Candidate) -> bool {
+        candidate.error < current.error
+            || (candidate.error == current.error
+                && (candidate.long_edge() > current.long_edge()
+                    || (candidate.long_edge() == current.long_edge()
+                        && candidate.area() > current.area())))
+    }
+
+    let mut acceptable: Option<Candidate> = None;
+    let mut fallback: Option<Candidate> = None;
+    let mut consider = |width: u32, height: u32| {
+        if width == 0 || height == 0 || width > bound_w || height > bound_h {
+            return;
+        }
+        let ratio = width as f64 / height as f64;
+        let candidate = Candidate {
+            width,
+            height,
+            error: ((ratio / source_ratio) - 1.0).abs(),
+        };
+        if candidate.error <= THUMBNAIL_ASPECT_ERROR_TARGET
+            && acceptable.is_none_or(|current| better_acceptable(candidate, current))
+        {
+            acceptable = Some(candidate);
+        }
+        if fallback.is_none_or(|current| better_fallback(candidate, current)) {
+            fallback = Some(candidate);
+        }
+    };
+
+    // Fix each possible height and test the two adjacent integer widths.
+    for height in 1..=bound_h {
+        let ideal_width = source_ratio * height as f64;
+        consider(ideal_width.floor().max(1.0) as u32, height);
+        consider(ideal_width.ceil().max(1.0) as u32, height);
+    }
+    // Do the symmetric search so a width-limited candidate is not lost.
+    for width in 1..=bound_w {
+        let ideal_height = width as f64 / source_ratio;
+        consider(width, ideal_height.floor().max(1.0) as u32);
+        consider(width, ideal_height.ceil().max(1.0) as u32);
+    }
+
+    let selected = acceptable.or(fallback).unwrap_or(Candidate {
+        width: bound_w,
+        height: bound_h,
+        error: f64::INFINITY,
+    });
+    (selected.width, selected.height)
+}
+
+/// Fit a decoded raster using a separately supplied canonical source aspect.
+///
+/// PDF page boxes and DCT-scaled JPEG buffers can have a more accurate aspect than
+/// the already rounded raster passed in here. No upscaling is performed.
+pub fn resize_dynamic_fit_with_source_aspect(
+    src: &DynamicImage,
+    max_w: u32,
+    max_h: u32,
+    source_aspect_size: (u32, u32),
+    quality: Quality,
+) -> DynamicImage {
     let (w, h) = (src.width(), src.height());
-    if w <= max_w && h <= max_h {
+    let (new_w, new_h) = aspect_accurate_fit_dimensions((w, h), (max_w, max_h), source_aspect_size);
+    if w == new_w && h == new_h {
         return src.clone();
     }
-    let ratio_w = max_w as f64 / w as f64;
-    let ratio_h = max_h as f64 / h as f64;
-    let scale = ratio_w.min(ratio_h);
-    let new_w = ((w as f64 * scale).round() as u32).max(1);
-    let new_h = ((h as f64 * scale).round() as u32).max(1);
     resize_dynamic_exact(src, new_w, new_h, quality)
 }
 
@@ -163,6 +271,44 @@ mod tests {
             DynamicImage::ImageRgba8(RgbaImage::from_pixel(100, 100, image::Rgba([5, 5, 5, 255])));
         let out = resize_dynamic_fit(&src, 200, 200, Quality::Bilinear);
         assert_eq!((out.width(), out.height()), (100, 100));
+    }
+
+    #[test]
+    fn thumbnail_dimensions_meet_aspect_target_without_exceeding_the_long_edge() {
+        for (source_w, source_h) in [(1643, 2375), (1024, 1536), (896, 1120)] {
+            let (width, height) = aspect_accurate_fit_dimensions(
+                (source_w, source_h),
+                (512, 512),
+                (source_w, source_h),
+            );
+            let source_ratio = source_w as f64 / source_h as f64;
+            let output_ratio = width as f64 / height as f64;
+            let relative_error = ((output_ratio / source_ratio) - 1.0).abs();
+
+            assert!(width <= 512 && height <= 512);
+            assert!(
+                width.max(height) >= 507,
+                "the aspect improvement must retain at least 99% of the long edge"
+            );
+            assert!(
+                relative_error <= THUMBNAIL_ASPECT_ERROR_TARGET,
+                "{source_w}x{source_h} -> {width}x{height}: {relative_error:.6}"
+            );
+        }
+    }
+
+    #[test]
+    fn thumbnail_dimensions_use_canonical_aspect_for_an_already_rounded_pdf_raster() {
+        let (width, height) = aspect_accurate_fit_dimensions((327, 473), (512, 512), (1643, 2375));
+        let source_ratio = 1643.0 / 2375.0;
+        let output_ratio = width as f64 / height as f64;
+
+        assert!(width <= 327 && height <= 473, "must not upscale");
+        assert!(
+            width.max(height) >= 468,
+            "must retain at least 99% of the raster"
+        );
+        assert!(((output_ratio / source_ratio) - 1.0).abs() <= 0.0005);
     }
 
     #[test]

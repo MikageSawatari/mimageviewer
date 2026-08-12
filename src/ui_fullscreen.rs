@@ -25,8 +25,8 @@ use std::sync::Arc;
 use crate::adjustment::PostFilter;
 use crate::ai::ModelKind;
 use crate::app::{
-    App, ColorizeDisplayUnitHoldover, FsDisplayUnitHoldover, FsDisplayUnitHoldoverPage, FsHoldover,
-    ViewerPresentation,
+    App, FsDisplayUnitHoldover, FsDisplayUnitHoldoverPage, FsHoldover, FsOpenMaterialization,
+    FsPageLoadState, ViewerPresentation,
 };
 use crate::displayed_image_transform::{
     DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
@@ -877,8 +877,8 @@ enum FsNavHoldoverDecision {
 
 fn colorize_wait_indicator_visible(holdover: Option<&FsHoldover>, now: std::time::Instant) -> bool {
     holdover
-        .and_then(FsHoldover::colorize_wait_started_at)
-        .is_some_and(|started_at| {
+        .and_then(FsHoldover::final_effect_wait)
+        .is_some_and(|(_, started_at)| {
             now.saturating_duration_since(started_at) >= COLORIZE_WAIT_INDICATOR_DELAY
         })
 }
@@ -3122,10 +3122,67 @@ fn rotated_display_size(size: egui::Vec2, rotation: crate::rotation_db::Rotation
     }
 }
 
+fn passthrough_layout_display_size(
+    source_size: Option<egui::Vec2>,
+    texture_size: Option<egui::Vec2>,
+    rotation: crate::rotation_db::Rotation,
+) -> Option<egui::Vec2> {
+    source_size
+        .or(texture_size)
+        .map(|size| rotated_display_size(size, rotation))
+}
+
 fn fit_display_size_in_rect(rect: egui::Rect, display_size: egui::Vec2) -> egui::Rect {
     let fit_scale =
         (rect.width() / display_size.x.max(1.0)).min(rect.height() / display_size.y.max(1.0));
     egui::Rect::from_center_size(rect.center(), display_size * fit_scale)
+}
+
+fn fs_texture_content_rect(
+    page_rect: egui::Rect,
+    texture_size: egui::Vec2,
+    rotation: crate::rotation_db::Rotation,
+    preserve_texture_aspect: bool,
+) -> egui::Rect {
+    if preserve_texture_aspect {
+        fit_display_size_in_rect(page_rect, rotated_display_size(texture_size, rotation))
+    } else {
+        page_rect
+    }
+}
+
+/// Resolve the page rectangle from canonical dimensions, optionally fitting the
+/// actual texture inside it without changing the texture's pixel aspect.
+///
+/// The canonical rectangle keeps the page frame stable. Pass-through thumbnails
+/// are integer-rounded independently, so painting them across that whole rectangle
+/// would introduce a small non-uniform stretch. They instead use a centered contain
+/// rectangle; final textures continue to fill the canonical page rectangle.
+fn resolve_fs_image_transform(
+    input: DisplayedImageTransformInput,
+    layout_source_size: Option<egui::Vec2>,
+    preserve_texture_aspect: bool,
+) -> Option<DisplayedImageTransform> {
+    let Some(layout_source_size) = layout_source_size else {
+        return DisplayedImageTransform::resolve(input);
+    };
+    // `layout_source_size` may use PDF fixed-point page units rather than pixels.
+    // Preserve only its aspect ratio while keeping Original/no-upscale semantics
+    // on the coordinate source's pixel-scale magnitude.
+    let reference_long = input.source_size.x.max(input.source_size.y).max(1.0);
+    let layout_long = layout_source_size.x.max(layout_source_size.y).max(1.0);
+    let layout_size = layout_source_size * (reference_long / layout_long);
+    let layout = DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+        texture_size: layout_size,
+        ..input
+    })?;
+    let paint_rect = fs_texture_content_rect(
+        layout.full_image_rect,
+        input.texture_size,
+        input.rotation,
+        preserve_texture_aspect,
+    );
+    DisplayedImageTransform::from_resolved_rect(input, paint_rect)
 }
 
 fn normalized_sub_rect(rect: egui::Rect, uv: egui::Rect) -> egui::Rect {
@@ -3880,28 +3937,12 @@ impl App {
         match params.colorize.mode {
             crate::colorize::ColorizeMode::Disabled => false,
             crate::colorize::ColorizeMode::AllImages => true,
-            crate::colorize::ColorizeMode::MonochromeOnly => {
-                // final AI は復元・拡大処理であり、入力の近モノクロ性を反転させない前提。
-                // 色調補正が classifier 入力を変える場合や full-size summary 未到着時は
-                // 未確定として完成画像を待つ。
-                if !params.is_color_identity() {
-                    return true;
-                }
-                let edit_key = self.current_edit_result_key(idx);
-                if !self.edit_result_cache.contains_key(&edit_key) {
-                    return true;
-                }
-                let Some(summary) = self.colorize_mono_summary_cache.get(&idx) else {
-                    return true;
-                };
-                if summary.edit_key != edit_key {
-                    return true;
-                }
-                crate::colorize::is_near_monochrome_residual(
-                    summary.p95_residual,
-                    params.colorize.mono_tolerance,
-                )
-            }
+            // final AI is assumed not to flip near-monochrome applicability.
+            // A color adjustment that changes the classifier input, or a
+            // missing/stale full-size summary, remains conservatively gated.
+            crate::colorize::ColorizeMode::MonochromeOnly => self
+                .known_monochrome_only_applicability(idx, params)
+                .unwrap_or(true),
         }
     }
 
@@ -3913,6 +3954,9 @@ impl App {
         texture: &egui::TextureHandle,
     ) -> &'static str {
         let texture_id = texture.id();
+        if self.is_passthrough_rendition_texture(texture) {
+            return "thumbnail";
+        }
         if self
             .current_comic_composite_texture(idx)
             .is_some_and(|tex| tex.id() == texture_id)
@@ -4089,73 +4133,19 @@ impl App {
         })
     }
 
-    fn clear_colorize_display_unit_holdover(&mut self) {
+    pub(crate) fn clear_final_effect_source_reload_holdover(&mut self) {
         if matches!(
             self.fs_holdover_tex,
-            Some(FsHoldover::ColorizeDisplayUnit(_))
+            Some(FsHoldover::FinalEffectSourceReload(_))
         ) {
             self.fs_holdover_tex = None;
         }
     }
 
-    /// 同一 viewer 内のページ送りで、新しい表示ユニットの final-effect 表示が未完了の
-    /// 場合にだけ、直前の単ページまたは見開き全体を 1 unit として取得する。
-    /// フォルダ移動用 nav lock が所有中の holdover は上書きしない。
-    pub(crate) fn capture_colorize_page_transition_holdover(&mut self, target_idx: usize) {
-        if self.fs_nav_locked_gen.is_some() {
-            return;
-        }
-
-        if !self.reading_flow.is_paged() {
-            self.clear_colorize_display_unit_holdover();
-            return;
-        }
-
-        let target_pages = self.fs_display_unit_page_indices(target_idx);
-        let target_requires_final = target_pages
-            .iter()
-            .any(|&idx| self.colorize_display_requires_final_effect(idx));
-        let target_ready = target_pages
-            .iter()
-            .all(|&idx| self.resolve_fs_display_tex(idx, true).is_some());
-        if !target_requires_final || target_ready {
-            self.clear_colorize_display_unit_holdover();
-            return;
-        }
-
-        let existing_holdover = match self.fs_holdover_tex.as_ref() {
-            Some(FsHoldover::ColorizeDisplayUnit(holdover)) => {
-                Some((holdover.previous.clone(), holdover.started_at))
-            }
-            _ => None,
-        };
-        let current_previous = match self.fullscreen_idx {
-            Some(current_idx) if current_idx != target_idx => {
-                self.capture_fs_display_unit(current_idx)
-            }
-            _ => None,
-        };
-        if let Some(previous) = current_previous.or_else(|| {
-            existing_holdover
-                .as_ref()
-                .map(|(previous, _)| previous.clone())
-        }) {
-            self.fs_holdover_tex = Some(FsHoldover::ColorizeDisplayUnit(
-                ColorizeDisplayUnitHoldover {
-                    target_idx,
-                    previous,
-                    started_at: existing_holdover
-                        .map(|(_, started_at)| started_at)
-                        .unwrap_or_else(std::time::Instant::now),
-                },
-            ));
-        }
-    }
-
-    /// ページ単位表示の描画確定点で、旧表示ユニットを出すかを原子的に決める。
-    /// 新しい見開きは両ページが表示可能になるまで 1 枚も公開せず、両方が揃った
-    /// フレームで typed state を解放して一括で切り替える。
-    pub(crate) fn colorize_display_unit_holdover_for_draw(
+    /// 同じ表示ユニットの source reload 中に、旧 final-effect 表示を出すかを原子的に決める。
+    /// 見開きは両ページが表示可能になるまで旧 unit を維持し、両方が揃った
+    /// frame で typed state を解放して一括で切り替える。
+    pub(crate) fn final_effect_source_reload_holdover_for_draw(
         &mut self,
         fs_idx: usize,
         spread_pair: SpreadPair,
@@ -4168,13 +4158,13 @@ impl App {
         }
 
         let (target_idx, previous) = match self.fs_holdover_tex.as_ref() {
-            Some(FsHoldover::ColorizeDisplayUnit(holdover)) => {
+            Some(FsHoldover::FinalEffectSourceReload(holdover)) => {
                 (holdover.target_idx, holdover.previous.clone())
             }
             _ => return None,
         };
         if target_idx != fs_idx {
-            self.clear_colorize_display_unit_holdover();
+            self.clear_final_effect_source_reload_holdover();
             return None;
         }
 
@@ -4186,7 +4176,7 @@ impl App {
             .iter()
             .any(|&idx| self.colorize_display_requires_final_effect(idx))
         {
-            self.clear_colorize_display_unit_holdover();
+            self.clear_final_effect_source_reload_holdover();
             return None;
         }
 
@@ -4195,7 +4185,7 @@ impl App {
                 || matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Failed))
         });
         if target_unit_ready {
-            self.clear_colorize_display_unit_holdover();
+            self.clear_final_effect_source_reload_holdover();
             None
         } else {
             Some(previous)
@@ -4423,9 +4413,9 @@ impl App {
             return Some(texture);
         }
         if self.colorize_display_requires_final_effect(idx) {
-            // raw / edit / thumbnail gate は維持する。ページ単位表示の旧画像はここで
-            // ページ別 fallback にせず、描画確定点で `ColorizeDisplayUnit` 全体を
-            // overlay する。連結読みは従来どおりページ別 transition が所有する。
+            // raw / edit / unprocessed-thumbnail gate は維持する。ページ単位表示は
+            // color-faithful rendition、source reload は display-unit holdover、
+            // 連結読みは従来どおりページ別 transition が完成までを橋渡しする。
             return None;
         }
         self.resolve_fs_pre_overlay_texture(idx)
@@ -6482,6 +6472,7 @@ fn spread_shift_anchor_pos_for_target(target_pos: usize, landscape_flags: &[bool
 struct FsFrameState {
     is_video: bool,
     original_preview_active: bool,
+    page_turn_decision: FsPageTurnDecision,
     tex: Option<egui::TextureHandle>,
     thumb_tex: Option<egui::TextureHandle>,
     /// 上部ホバーバー左側に表示するパス文字列。
@@ -6501,6 +6492,157 @@ struct FsFrameState {
     fs_load_failed: bool,
     /// PDF ページのコンテンツ種別 (非 PDF なら None)
     pdf_content_type: Option<PdfPageContentType>,
+}
+
+/// Per-frame page-turn choices. The paint source and UI-work admission are
+/// deliberately separate axes; rendition readiness is diagnostic/unit-resolver input only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FsPageTurnPaintSource {
+    Materialized,
+    PassThrough,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FsPageTurnDecision {
+    paint_source: FsPageTurnPaintSource,
+    defer_ui_uploads: bool,
+    passthrough_rendition_ready: bool,
+}
+
+const FS_PAGE_TURN_COALESCE_ACTIONS: [KeyAction; 6] = [
+    KeyAction::FsPagePrev,
+    KeyAction::FsPageNext,
+    KeyAction::FsSpreadShiftLeft,
+    KeyAction::FsSpreadShiftRight,
+    KeyAction::FsSpreadShiftPrev,
+    KeyAction::FsSpreadShiftNext,
+];
+
+const FS_FIXED_PAGE_TURN_CHORDS: [Chord; 4] = [
+    Chord::key(KeyName::Left),
+    Chord::key(KeyName::Right),
+    Chord::key(KeyName::Up),
+    Chord::key(KeyName::Down),
+];
+
+impl FsPageTurnDecision {
+    const fn normal() -> Self {
+        Self {
+            paint_source: FsPageTurnPaintSource::Materialized,
+            defer_ui_uploads: false,
+            passthrough_rendition_ready: false,
+        }
+    }
+
+    const fn paint_source(self) -> FsPageTurnPaintSource {
+        self.paint_source
+    }
+
+    pub(crate) const fn defer_ui_uploads(self) -> bool {
+        self.defer_ui_uploads
+    }
+
+    const fn perf_label(self) -> &'static str {
+        match self.paint_source {
+            FsPageTurnPaintSource::Materialized => "materialized",
+            FsPageTurnPaintSource::PassThrough => "pass_through",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FsPageTurnFrameDecision {
+    frame_nr: u64,
+    items_generation: u64,
+    idx: usize,
+    decision: FsPageTurnDecision,
+}
+
+/// A page-turn burst exists only after a held page-turn input has actually
+/// changed the displayed unit. Physical level alone is insufficient: at a
+/// folder boundary the same held key produces navigation commands but no
+/// transition, so entering pass-through there would only degrade the current
+/// page.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum FsPageTurnBurstState {
+    #[default]
+    Idle,
+    Active {
+        items_generation: u64,
+        current_idx: usize,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FsPageTurnReadySignature {
+    items_generation: u64,
+    mode: &'static str,
+    pages: Vec<(usize, egui::TextureId, &'static str)>,
+}
+
+fn fs_page_turn_ready_signature_changed(
+    previous: Option<&FsPageTurnReadySignature>,
+    current: &FsPageTurnReadySignature,
+) -> bool {
+    previous != Some(current)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FsDisplayUnitTracePage {
+    idx: usize,
+    texture_id: egui::TextureId,
+    source: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FsPaintDisplayUnitSignature {
+    items_generation: u64,
+    pages: Vec<(usize, egui::TextureId)>,
+}
+
+fn fs_paint_page_changed_from_previous(
+    previous: Option<&FsPaintDisplayUnitSignature>,
+    items_generation: u64,
+    idx: usize,
+    texture_id: egui::TextureId,
+) -> bool {
+    previous.map_or(true, |previous| {
+        previous.items_generation != items_generation
+            || !previous
+                .pages
+                .iter()
+                .any(|(previous_idx, previous_texture_id)| {
+                    *previous_idx == idx && *previous_texture_id == texture_id
+                })
+    })
+}
+
+fn page_turn_decision_for_inputs(
+    page_turn_input_held: bool,
+    page_turn_burst_active: bool,
+    passthrough_rendition_ready: bool,
+) -> FsPageTurnDecision {
+    let pass_through = page_turn_input_held && page_turn_burst_active;
+    FsPageTurnDecision {
+        paint_source: if pass_through {
+            FsPageTurnPaintSource::PassThrough
+        } else {
+            FsPageTurnPaintSource::Materialized
+        },
+        defer_ui_uploads: pass_through,
+        passthrough_rendition_ready,
+    }
+}
+
+fn settling_spread_uses_color_faithful_renditions(
+    original_preview_active: bool,
+    left_ready: bool,
+    left_requires_final: bool,
+    right_ready: bool,
+    right_requires_final: bool,
+) -> bool {
+    !original_preview_active
+        && ((!left_ready && left_requires_final) || (!right_ready && right_requires_final))
 }
 
 #[derive(Clone)]
@@ -10585,6 +10727,21 @@ impl App {
 
         self.harvest_page_dims_from_fs_cache();
 
+        let page_turn_decision = self.fs_page_turn_decision_for_frame(ctx, fs_idx);
+        if !page_turn_decision.defer_ui_uploads()
+            && self.items.get(fs_idx).is_some_and(GridItem::has_page_data)
+        {
+            // A pass-through open intentionally did not start the full-resolution
+            // producer. The first physical-level release frame materializes only
+            // the page on which navigation stopped.
+            let stop_page_needs_load =
+                matches!(self.fs_page_load_state(fs_idx), FsPageLoadState::NeedsLoad);
+            self.ensure_fs_page_load(fs_idx);
+            if stop_page_needs_load && self.reading_flow.is_paged() {
+                self.update_prefetch_window(fs_idx);
+            }
+        }
+
         // ── pending の PDF 再レンダリング結果を取り込む ──
         // show_viewport_immediate 内では &mut self が使えるので、
         // メインの update() を待たずにここで直接 poll する。
@@ -10631,7 +10788,9 @@ impl App {
         if let SpreadPair::Double { left, right } = spread_pair {
             let partner = if left == fs_idx { right } else { left };
             self.advance_animation(ctx, partner);
-            self.ensure_fs_page_load(partner);
+            if !page_turn_decision.defer_ui_uploads() {
+                self.ensure_fs_page_load(partner);
+            }
         }
         // in-window モード中は静止画を専用 viewport ではなくメインウィンドウの
         // egui ctx に直接描画する (embedded)。本関数冒頭で動画は early-return
@@ -10652,7 +10811,7 @@ impl App {
             self.fullscreen_viewport_id()
         };
         self.sync_conceal_preview_before_pipeline(ctx, preview_viewport_id);
-        let state = self.prepare_fullscreen_state(ctx, fs_idx);
+        let state = self.prepare_fullscreen_state(ctx, fs_idx, page_turn_decision);
 
         let mut close_fs = false;
         let mut close_to_page_list = false;
@@ -11124,12 +11283,13 @@ impl App {
                         } else {
                             self.fullscreen_media_rect(full_rect, fs_idx, state.is_video)
                         };
-                        let pdf_display_target = crate::pdf_loader::PdfDisplayTarget::from_logical_size(
-                            pdf_media_rect.width(),
-                            pdf_media_rect.height(),
-                            ctx.pixels_per_point(),
-                            pdf_fit_mode,
-                        );
+                        let pdf_display_target =
+                            crate::pdf_loader::PdfDisplayTarget::from_logical_size(
+                                pdf_media_rect.width(),
+                                pdf_media_rect.height(),
+                                ctx.pixels_per_point(),
+                                pdf_fit_mode,
+                            );
                         let pdf_target_changed =
                             self.fs_pdf_display_target != Some(pdf_display_target);
                         self.fs_pdf_display_target = Some(pdf_display_target);
@@ -11140,10 +11300,8 @@ impl App {
                             }
                             SpreadPair::Single => None,
                         };
-                        let current_is_pdf = matches!(
-                            self.items.get(fs_idx),
-                            Some(GridItem::PdfPage { .. })
-                        );
+                        let current_is_pdf =
+                            matches!(self.items.get(fs_idx), Some(GridItem::PdfPage { .. }));
                         let partner_is_pdf = pdf_partner.is_some_and(|idx| {
                             matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }))
                         });
@@ -11156,17 +11314,20 @@ impl App {
                             })
                             .and_then(|idx| self.pdf_content_bbox_for_display_idx(idx));
 
-                        if current_is_pdf {
+                        if current_is_pdf && !state.page_turn_decision.defer_ui_uploads() {
                             self.ensure_fs_page_load(fs_idx);
                             self.ensure_pdf_display_resolution(fs_idx, pdf_current_bbox);
                         }
-                        if let Some(partner) = pdf_partner {
+                        if !state.page_turn_decision.defer_ui_uploads()
+                            && let Some(partner) = pdf_partner
+                        {
                             if matches!(self.items.get(partner), Some(GridItem::PdfPage { .. })) {
                                 self.ensure_fs_page_load(partner);
                                 self.ensure_pdf_display_resolution(partner, pdf_partner_bbox);
                             }
                         }
-                        if pdf_target_changed
+                        if !state.page_turn_decision.defer_ui_uploads()
+                            && pdf_target_changed
                             && (current_is_pdf || partner_is_pdf)
                             && self.reading_flow.is_paged()
                         {
@@ -11199,13 +11360,7 @@ impl App {
                                     .events
                                     .iter()
                                     .filter(|event| {
-                                        matches!(
-                                            event,
-                                            egui::Event::Key {
-                                                pressed: true,
-                                                ..
-                                            }
-                                        )
+                                        matches!(event, egui::Event::Key { pressed: true, .. })
                                     })
                                     .count();
                                 let wheel_event_count = i
@@ -11267,8 +11422,12 @@ impl App {
                             ));
                         }
                         let key_action = self.handle_fs_key_input(ctx, fs_idx, is_spread_double);
-                        if key_action.close { close_fs = true; }
-                        if key_action.close_to_page_list { close_to_page_list = true; }
+                        if key_action.close {
+                            close_fs = true;
+                        }
+                        if key_action.close_to_page_list {
+                            close_to_page_list = true;
+                        }
                         page_nav = key_action.page_nav;
                         ctrl_nav = key_action.ctrl_nav;
                         sibling_nav = key_action.sibling_nav;
@@ -11298,11 +11457,18 @@ impl App {
                             is_spread_double,
                             prev_foreground_hwnd,
                         );
-                        if !wheel_nav.is_none() { page_nav = wheel_nav; }
-                        if click_close { close_fs = true; }
+                        if !wheel_nav.is_none() {
+                            page_nav = wheel_nav;
+                        }
+                        if click_close {
+                            close_fs = true;
+                        }
                         // perf: ホイール/クリック起因のナビ
                         if !wheel_nav.is_none() {
-                            self.bump_input_seq("fs_wheel", Some(&format!("page_nav={wheel_nav:?}")));
+                            self.bump_input_seq(
+                                "fs_wheel",
+                                Some(&format!("page_nav={wheel_nav:?}")),
+                            );
                         } else if click_close {
                             self.bump_input_seq("fs_close_click", None);
                         }
@@ -11326,9 +11492,8 @@ impl App {
                         // 360 度パノラマビューモード中は分析 / 補正 / 比較を抑止する
                         // (= 上バーの 360 / × / window のみ、機能制限モード)。
                         let panorama_mode_active_now = self.is_panorama_mode_active(fs_idx);
-                        let analysis_active = self.analysis_mode
-                            && !is_spread_double
-                            && !panorama_mode_active_now;
+                        let analysis_active =
+                            self.analysis_mode && !is_spread_double && !panorama_mode_active_now;
                         // 補正パネルは見開き Double でも使えるようにする (左右独立補正 + コピー)。
                         // 編集対象 (画面上の左/右) は `adjust_spread_target` で切替。
                         let adjustment_active = self.adjustment_mode.is_open()
@@ -11338,10 +11503,11 @@ impl App {
                         // VST3 動画コンパクト表示モード: 動画のときだけ右上 1/4 に縮小し、
                         // 残った左下 3/4 をプラグイン GUI 用に空ける。動画でない (画像/PDF)
                         // ときは無視する (= プラグインで分析するのは動画なので)。
-                        let vst3_compact_active =
-                            cfg!(windows) && state.is_video && self.settings.vst3_enabled
-                                && self.settings.vst3_gui_visible
-                                && self.settings.vst3_video_compact;
+                        let vst3_compact_active = cfg!(windows)
+                            && state.is_video
+                            && self.settings.vst3_enabled
+                            && self.settings.vst3_gui_visible
+                            && self.settings.vst3_video_compact;
                         let content_rect =
                             self.fullscreen_media_rect(full_rect, fs_idx, state.is_video);
                         let image_rect = if analysis_active {
@@ -11351,10 +11517,8 @@ impl App {
                         } else {
                             content_rect
                         };
-                        let source_size = self
-                            .source_dims_for_idx(fs_idx)
-                            .map(|(w, h)| egui::vec2(w, h))
-                            .or_else(|| {
+                        let source_size =
+                            self.fs_page_coordinate_source_size(fs_idx).or_else(|| {
                                 state
                                     .image_dims
                                     .map(|(w, h)| egui::vec2(w as f32, h as f32))
@@ -11368,7 +11532,13 @@ impl App {
                         let mut navigator_texture_sources = if spread_pair == SpreadPair::Single {
                             FsNavigatorTextureSources::single(
                                 fs_idx,
-                                state.tex.clone().map(|texture| {
+                                Self::fs_display_texture_choice(
+                                    state.is_video,
+                                    state.tex.as_ref(),
+                                    state.thumb_tex.as_ref(),
+                                )
+                                .cloned()
+                                .map(|texture| {
                                     self.fullscreen_paint_resource_for_texture(fs_idx, texture)
                                 }),
                             )
@@ -11413,161 +11583,111 @@ impl App {
                                     {
                                         // ZipPla 風全画面ズーム (Z): 専用描画へ分岐。
                                         // 通常のズーム/パン/比較/フィット経路はスキップする。
-                                        single_transform = self.draw_fs_zoom_mode(
-                                            ui, ctx, image_rect, fs_idx, &state,
-                                        );
+                                        single_transform = self
+                                            .draw_fs_zoom_mode(ui, ctx, image_rect, fs_idx, &state);
                                     } else {
-
-                                    let fs_rotation = self.get_rotation(fs_idx);
-                                    let zp = if analysis_active {
-                                        Some((self.analysis_zoom, self.analysis_pan))
-                                    } else {
-                                        self.fs_zoom_pan()
-                                    };
-                                    let free_rot = if analysis_active { 0.0 } else { self.fs_free_rotation };
-                                    // 前フレームと異なる (idx, テクスチャ) の最初の描画で paint を emit。
-                                    // seq はエントリ自身の `load_seq` を使う (self.input_seq だと
-                                    // paint 時点で別操作に更新されていて load→ready→paint の相関が崩れる)。
-                                    if crate::perf::is_enabled()
-                                        && let Some(tex) = Self::fs_display_texture_choice(
-                                            state.is_video,
-                                            state.tex.as_ref(),
-                                            state.thumb_tex.as_ref(),
-                                        )
-                                    {
-                                        let cur_id = tex.id();
-                                        let prev = self.fs_painted_last;
-                                        let is_new = !matches!(
-                                            prev,
-                                            Some((prev_idx, prev_id, _)) if prev_idx == fs_idx && prev_id == cur_id
+                                        let fs_rotation = self.get_rotation(fs_idx);
+                                        let zp = if analysis_active {
+                                            Some((self.analysis_zoom, self.analysis_pan))
+                                        } else {
+                                            self.fs_zoom_pan()
+                                        };
+                                        let free_rot = if analysis_active {
+                                            0.0
+                                        } else {
+                                            self.fs_free_rotation
+                                        };
+                                        let compare_mode = self.compare_view_mode;
+                                        let compare_requested = !matches!(
+                                            compare_mode,
+                                            crate::app::CompareViewMode::Off
                                         );
-                                        if is_new {
-                                            let key = self.perf_item_key(fs_idx);
-                                            let entry_seq = self
-                                                .fs_cache
-                                                .get(&fs_idx)
-                                                .map(|e| e.load_seq())
-                                                .unwrap_or(0);
-                                            let source = self
-                                                .fs_texture_source_for_trace(fs_idx, tex);
-                                            crate::perf::event(
-                                                "fs",
-                                                "paint",
-                                                key.as_deref(),
-                                                entry_seq,
-                                                &[
-                                                    ("idx", serde_json::Value::from(fs_idx)),
-                                                    (
-                                                        "items_generation",
-                                                        serde_json::Value::from(
-                                                            self.items_generation,
-                                                        ),
-                                                    ),
-                                                    (
-                                                        "source",
-                                                        serde_json::Value::from(source),
-                                                    ),
-                                                    (
-                                                        "texture_id",
-                                                        serde_json::Value::from(format!(
-                                                            "{:?}", cur_id
-                                                        )),
-                                                    ),
-                                                ],
-                                            );
-                                            self.fs_painted_last = Some((fs_idx, cur_id, entry_seq));
-                                        }
-                                    }
-                                    let compare_mode = self.compare_view_mode;
-                                    let compare_requested = !matches!(
-                                        compare_mode,
-                                        crate::app::CompareViewMode::Off
-                                    );
-                                    // 入力ハンドラ (キー / ホイール / クリック / gamepad) と
-                                    // 同一述語で判定し、描画と入力の食い違いを構造的に防ぐ。
-                                    let continuous_reading_active =
-                                        self.continuous_reading_active_for_idx(fs_idx);
-                                    let pixels_per_point = ctx.pixels_per_point();
-                                    let fit_scale_limits =
-                                        self.fullscreen_fit_scale_limits(pixels_per_point);
-                                    if continuous_reading_active {
-                                        self.draw_fs_continuous_reading(
-                                            ui,
-                                            ctx,
-                                            image_rect,
-                                            fs_idx,
-                                            state.original_preview_active,
-                                        );
-                                    } else {
-                                        if compare_requested {
-                                            self.ensure_compare_prepared_pair(ctx, fs_idx);
-                                        }
-                                        let requested_draw = CompareFramePrimaryDraw::resolve(
-                                            compare_requested,
-                                            self.compare_prepared_pair_matches(fs_idx),
-                                        );
-                                        let prepared_compare_drawn = requested_draw
-                                            .draws_prepared_compare()
-                                            && self.draw_compare_prepared_mode(
+                                        // 入力ハンドラ (キー / ホイール / クリック / gamepad) と
+                                        // 同一述語で判定し、描画と入力の食い違いを構造的に防ぐ。
+                                        let continuous_reading_active =
+                                            self.continuous_reading_active_for_idx(fs_idx);
+                                        let pixels_per_point = ctx.pixels_per_point();
+                                        let fit_scale_limits =
+                                            self.fullscreen_fit_scale_limits(pixels_per_point);
+                                        if continuous_reading_active {
+                                            self.draw_fs_continuous_reading(
                                                 ui,
                                                 ctx,
                                                 image_rect,
                                                 fs_idx,
-                                                compare_mode,
-                                                zp,
+                                                state.original_preview_active,
                                             );
-                                        if prepared_compare_drawn {
-                                            primary_draw =
-                                                CompareFramePrimaryDraw::PreparedCompareOnly;
-                                        }
+                                        } else {
+                                            if compare_requested {
+                                                self.ensure_compare_prepared_pair(ctx, fs_idx);
+                                            }
+                                            let requested_draw = CompareFramePrimaryDraw::resolve(
+                                                compare_requested,
+                                                self.compare_prepared_pair_matches(fs_idx),
+                                            );
+                                            let prepared_compare_drawn = requested_draw
+                                                .draws_prepared_compare()
+                                                && self.draw_compare_prepared_mode(
+                                                    ui,
+                                                    ctx,
+                                                    image_rect,
+                                                    fs_idx,
+                                                    compare_mode,
+                                                    zp,
+                                                );
+                                            if prepared_compare_drawn {
+                                                primary_draw =
+                                                    CompareFramePrimaryDraw::PreparedCompareOnly;
+                                            }
 
-                                        if !prepared_compare_drawn {
-                                            // `Ready` でない間は通常ページだけを描く。旧 fallback
-                                            // の raw pinned overlay を重ねると、現在ページと狭い比較
-                                            // 矩形が同じ frame に共存していた。
-                                            let pixel_grid_enabled =
-                                                self.fs_pixel_grid_enabled && !analysis_active;
-                                            // 余白カットフィット用 bbox (設定 OFF なら None)。
-                                            // bg_style が self を借用する前に算出しておく。
-                                            let fit_mode = if analysis_active {
-                                                FullscreenFitMode::Page
-                                            } else {
-                                                self.effective_fullscreen_fit_mode()
-                                            };
-                                            let content_bbox = if state.is_video {
-                                                None
-                                            } else {
-                                                self.view_trim_single_content_bbox(fs_idx)
-                                            };
-                                            let paint_resource = state.tex.clone().map(|texture| {
-                                                self.fullscreen_paint_resource_for_texture(
-                                                    fs_idx, texture,
-                                                )
-                                            });
-                                            let bg_style = self.fs_bg_style(ctx);
-                                            single_transform = self.draw_fs_image(
-                                                ui,
-                                                image_rect,
-                                                fs_idx,
-                                                source_size,
-                                                None,
-                                                paint_resource.as_ref(),
-                                                state.thumb_tex.as_ref(),
-                                                state.is_video,
-                                                state.vst3_waiting_for_video,
-                                                state.fs_load_failed,
-                                                fs_rotation,
-                                                zp,
-                                                free_rot,
-                                                &bg_style,
-                                                &state.location_display,
-                                                pixel_grid_enabled,
-                                                fit_mode,
-                                                fit_scale_limits,
-                                                content_bbox,
-                                            );
+                                            if !prepared_compare_drawn {
+                                                // `Ready` でない間は通常ページだけを描く。旧 fallback
+                                                // の raw pinned overlay を重ねると、現在ページと狭い比較
+                                                // 矩形が同じ frame に共存していた。
+                                                let pixel_grid_enabled =
+                                                    self.fs_pixel_grid_enabled && !analysis_active;
+                                                // 余白カットフィット用 bbox (設定 OFF なら None)。
+                                                // bg_style が self を借用する前に算出しておく。
+                                                let fit_mode = if analysis_active {
+                                                    FullscreenFitMode::Page
+                                                } else {
+                                                    self.effective_fullscreen_fit_mode()
+                                                };
+                                                let content_bbox = if state.is_video {
+                                                    None
+                                                } else {
+                                                    self.view_trim_single_content_bbox(fs_idx)
+                                                };
+                                                let paint_resource =
+                                                    state.tex.clone().map(|texture| {
+                                                        self.fullscreen_paint_resource_for_texture(
+                                                            fs_idx, texture,
+                                                        )
+                                                    });
+                                                let bg_style = self.fs_bg_style(ctx);
+                                                single_transform = self.draw_fs_image(
+                                                    ui,
+                                                    image_rect,
+                                                    fs_idx,
+                                                    source_size,
+                                                    None,
+                                                    paint_resource.as_ref(),
+                                                    state.thumb_tex.as_ref(),
+                                                    state.is_video,
+                                                    state.vst3_waiting_for_video,
+                                                    state.fs_load_failed,
+                                                    fs_rotation,
+                                                    zp,
+                                                    free_rot,
+                                                    &bg_style,
+                                                    &state.location_display,
+                                                    pixel_grid_enabled,
+                                                    fit_mode,
+                                                    fit_scale_limits,
+                                                    content_bbox,
+                                                );
+                                            }
                                         }
-                                    }
                                     } // else (= !panorama_painted) ブロック終端
                                 }
                                 SpreadPair::Double { left, right } => {
@@ -11578,16 +11698,14 @@ impl App {
                                         left,
                                         right,
                                         state.original_preview_active,
+                                        state.page_turn_decision,
                                         None,
                                     );
                                 }
                             }
                         }
                         if single_transform.is_none()
-                            && !matches!(
-                                self.compare_view_mode,
-                                crate::app::CompareViewMode::Off
-                            )
+                            && !matches!(self.compare_view_mode, crate::app::CompareViewMode::Off)
                         {
                             let compare_size = self
                                 .compare_preparation
@@ -11617,9 +11735,8 @@ impl App {
                                         free_rotation_rad: 0.0,
                                         content_bbox: None,
                                         fit_mode: FullscreenFitMode::Page,
-                                        fit_scale_limits: self.fullscreen_fit_scale_limits(
-                                            ctx.pixels_per_point(),
-                                        ),
+                                        fit_scale_limits: self
+                                            .fullscreen_fit_scale_limits(ctx.pixels_per_point()),
                                         pixels_per_point: ctx.pixels_per_point(),
                                         placement: ResolvedDisplayPlacement::Normal {
                                             zoom_pan: self.fs_zoom_pan(),
@@ -11657,9 +11774,7 @@ impl App {
                         // 消しゴム同様、見開き中は 1 フレーム遷移期間で is_spread_double が
                         // true のまま conceal_mode = true になりうるので、その 1 フレームは
                         // overlay 描画をスキップして単一ページ表示で出す次フレームに描画する。
-                        if self.conceal_mode
-                            && !is_spread_double
-                            && !state.original_preview_active
+                        if self.conceal_mode && !is_spread_double && !state.original_preview_active
                         {
                             if let Some(transform) = single_transform.as_ref() {
                                 self.handle_conceal_paint(ctx, transform);
@@ -11672,10 +11787,7 @@ impl App {
 
                         // ── テキスト注釈モード: キャンバス選択/移動 + パネル描画 ──
                         // (Inc 3b 座標逆写像 + 選択 / 3c ドラッグ移動 / 3d IME 編集)。
-                        if self.text_mode
-                            && !is_spread_double
-                            && !state.original_preview_active
-                        {
+                        if self.text_mode && !is_spread_double && !state.original_preview_active {
                             if let Some(transform) = single_transform.as_ref() {
                                 // 子ダイアログ表示中はキャンバスのポインタ操作を止める (Codex P2:
                                 // ダイアログ上のクリック/ドラッグが背面オブジェクトの選択/移動/削除に
@@ -11743,24 +11855,21 @@ impl App {
                         }
 
                         let overlay_t0 = std::time::Instant::now();
-                        self.draw_capture_region_selection_overlay(
-                            ui,
-                            ctx,
-                            full_rect,
-                            fs_idx,
-                        );
+                        self.draw_capture_region_selection_overlay(ui, ctx, full_rect, fs_idx);
                         // ── ルーペ (Shift ホールド / M トグル) ──
                         // パノラマ・分析・補正・テキスト注釈モードでは内部で早期 return する。
                         // 消しゴムモードのマスクオーバーレイより上に載せる (最新状態を拡大)。
-                        self.draw_fs_loupe_if_active(
-                            ui, ctx, image_rect, fs_idx,
-                        );
+                        self.draw_fs_loupe_if_active(ui, ctx, image_rect, fs_idx);
 
                         // カラー化待ちはページ枠ごとの fallback にせず、旧表示ユニットを
                         // 黒背景ごと重ねる。見開きは新しい左右が両方揃ったフレームだけ
                         // typed state を解放するため、新旧ページの混在も片側の黒も出ない。
                         if primary_draw.draws_ordinary()
-                            && let Some(unit) = self.colorize_display_unit_holdover_for_draw(
+                            && matches!(
+                                state.page_turn_decision.paint_source(),
+                                FsPageTurnPaintSource::Materialized
+                            )
+                            && let Some(unit) = self.final_effect_source_reload_holdover_for_draw(
                                 fs_idx,
                                 spread_pair,
                                 state.original_preview_active,
@@ -11769,17 +11878,12 @@ impl App {
                             for page in &unit.pages {
                                 self.trace_fs_texture_choice(
                                     "fullscreen_overlay",
-                                    "colorize_display_unit_holdover",
+                                    "final_effect_source_reload_holdover",
                                     Some(page.idx),
                                     page.texture.source_texture(),
                                 );
                             }
-                            self.draw_fs_display_unit_holdover(
-                                ui,
-                                ctx,
-                                image_rect,
-                                &unit,
-                            );
+                            self.draw_fs_display_unit_holdover(ui, ctx, image_rect, &unit);
                             navigator_texture_sources.replace_with_display_unit(&unit);
                         }
 
@@ -11796,14 +11900,17 @@ impl App {
                                     page.texture.source_texture(),
                                 );
                             }
-                            self.draw_fs_display_unit_holdover(
-                                ui,
-                                ctx,
-                                image_rect,
-                                &unit,
-                            );
+                            self.draw_fs_display_unit_holdover(ui, ctx, image_rect, &unit);
                             navigator_texture_sources.replace_with_display_unit(&unit);
                         }
+
+                        self.emit_fs_page_turn_ready_for_display_unit(
+                            ctx,
+                            fs_idx,
+                            spread_pair,
+                            state.page_turn_decision,
+                            &navigator_texture_sources,
+                        );
 
                         // Keep the fixed overview above transient display-unit holdovers. The
                         // navigator uses the same display unit and stays absent until that unit has
@@ -11861,24 +11968,30 @@ impl App {
 
                         // ── PDF 再レンダリング進捗 ──
                         if self.fs_pending.contains_key(&fs_idx) {
-                            let label = if matches!(self.items.get(fs_idx), Some(GridItem::PdfPage { .. })) {
-                                "PDF 再レンダリング中..."
-                            } else {
-                                "読込中..."
-                            };
+                            let label =
+                                if matches!(self.items.get(fs_idx), Some(GridItem::PdfPage { .. }))
+                                {
+                                    "PDF 再レンダリング中..."
+                                } else {
+                                    "読込中..."
+                                };
                             let font = egui::FontId::proportional(13.0);
                             let pos = egui::pos2(image_rect.min.x + 12.0, image_rect.max.y - 12.0);
                             let galley = ui.painter().layout_no_wrap(
-                                label.to_string(), font.clone(), egui::Color32::WHITE,
+                                label.to_string(),
+                                font.clone(),
+                                egui::Color32::WHITE,
                             );
-                            let text_rect = egui::Align2::LEFT_BOTTOM
-                                .anchor_size(pos, galley.size());
+                            let text_rect =
+                                egui::Align2::LEFT_BOTTOM.anchor_size(pos, galley.size());
                             let bg = text_rect.expand(4.0);
                             ui.painter().rect_filled(
-                                bg, 4.0,
+                                bg,
+                                4.0,
                                 egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
                             );
-                            ui.painter().galley(text_rect.min, galley, egui::Color32::WHITE);
+                            ui.painter()
+                                .galley(text_rect.min, galley, egui::Color32::WHITE);
                         }
 
                         // 連結読みではシークバーと同じ current page を左パネルの編集対象にする。
@@ -11907,7 +12020,11 @@ impl App {
                                 _ => None,
                             };
                             let close_analysis = self.draw_analysis_panel(
-                                ui, ctx, full_rect, image_rect, pixels.as_deref(),
+                                ui,
+                                ctx,
+                                full_rect,
+                                image_rect,
+                                pixels.as_deref(),
                             );
                             if close_analysis {
                                 // × も Z / ホバーボタンと同じ経路 (ズーム/パン引き継ぎ込み) に
@@ -12015,12 +12132,7 @@ impl App {
                             touch_chrome_latched,
                         );
                         if !touch_chrome_latched {
-                            self.draw_fs_panel_callouts(
-                                ui,
-                                ctx,
-                                full_rect,
-                                callouts_enabled,
-                            );
+                            self.draw_fs_panel_callouts(ui, ctx, full_rect, callouts_enabled);
                         }
                         // 静止画は左右どちらかの実パネルが表示中なら、上部バーと下部
                         // ページシークバーを同時表示する。callout だけの hover は含めない。
@@ -12059,7 +12171,8 @@ impl App {
                         // 上情報バー + 下シークバーを描くため、Inc 3 パネル漏れ修正)。
                         if self.fullscreen_top_bar_chrome_allowed(fs_idx) {
                             let saved_nav = page_nav;
-                            let has_page_override = self.adjustment_page_params.contains_key(&fs_idx);
+                            let has_page_override =
+                                self.adjustment_page_params.contains_key(&fs_idx);
                             // Phase 6: 動画モードかどうかを上ホバーバーに通知する。
                             // 動画なら video_meta (duration, bitrate) と画像 dims (= 動画解像度) を
                             // 動画用 info text 構築のために流す。
@@ -12068,12 +12181,12 @@ impl App {
                             #[cfg(windows)]
                             if is_video_mode {
                                 if let Some(crate::fs_animation::FsCacheEntry::Video {
-                                    player, ..
+                                    player,
+                                    ..
                                 }) = self.fs_cache.get(&fs_idx)
                                 {
                                     if let Some(info) = player.info() {
-                                        video_meta =
-                                            Some((info.duration_secs, info.bit_rate_bps));
+                                        video_meta = Some((info.duration_secs, info.bit_rate_bps));
                                     }
                                 }
                             }
@@ -12093,8 +12206,7 @@ impl App {
                             // ウィンドウ / 全画面 切り替えボタン: 静止画フルスクリーン
                             // (= 非動画、Windows) のときだけ出す。動画は native HUD 側に
                             // 専用トグルがある。
-                            let show_window_toggle =
-                                cfg!(windows) && !is_video_mode && !detached;
+                            let show_window_toggle = cfg!(windows) && !is_video_mode && !detached;
                             let slideshow_was_playing = self.slideshow_playing;
                             // 360 度パノラマビュー: 検出 + アクティブ状態を計算
                             // (docs/panorama-360-view-plan.md §5.3)。is_panorama_mode_active
@@ -12102,8 +12214,8 @@ impl App {
                             // detect Some だけで十分 (= 360 ボタン押下で初期化可能)。
                             // 非対応画像でもボタンは disabled で常に表示する。
                             let panorama_trigger = self.detect_panorama(fs_idx);
-                            let panorama_active = self.panorama_state.is_some()
-                                && panorama_trigger.is_some();
+                            let panorama_active =
+                                self.panorama_state.is_some() && panorama_trigger.is_some();
                             // panorama_mode_active=true なら他のボタン (info / analysis /
                             // spread / 補正 / rotate / capture / VST / play / tile) は全て隠す。
                             let panorama_mode_active = panorama_active;
@@ -12134,18 +12246,13 @@ impl App {
                             );
                             let hover_in_top = ctx.input(|i| {
                                 !self.cursor_hidden
-                                    && i.pointer
-                                        .hover_pos()
-                                        .is_some_and(|p| {
-                                            p.y < TOP_BAR_HOVER_Y
-                                                && fullscreen_edge_hover_allowed(
-                                                    p,
-                                                    navigator_exclusion,
-                                                )
-                                        })
+                                    && i.pointer.hover_pos().is_some_and(|p| {
+                                        p.y < TOP_BAR_HOVER_Y
+                                            && fullscreen_edge_hover_allowed(p, navigator_exclusion)
+                                    })
                             });
-                            let top_bar_visible = still_top_bar_visible_from_inputs(
-                                StillTopBarVisibilityInputs {
+                            let top_bar_visible =
+                                still_top_bar_visible_from_inputs(StillTopBarVisibilityInputs {
                                     locked: self.settings.fullscreen_top_bar_locked,
                                     hover_in_top,
                                     side_panel_visible,
@@ -12155,8 +12262,7 @@ impl App {
                                     rotation_popup_open: fs_rotation_popup_open(ctx),
                                     view_trim_mode: self.view_trim_mode,
                                     touch_chrome_latched,
-                                },
-                            );
+                                });
                             let top_bar_page_infos = if top_bar_visible {
                                 match spread_pair {
                                     SpreadPair::Single => {
@@ -12183,16 +12289,21 @@ impl App {
                                 Vec::new()
                             };
                             Self::draw_fs_hover_bar(
-                                ui, ctx, &self.keymap, full_rect,
+                                ui,
+                                ctx,
+                                &self.keymap,
+                                full_rect,
                                 &top_bar_page_infos,
-                                &mut close_fs, &mut page_nav,
+                                &mut close_fs,
+                                &mut page_nav,
                                 self.settings.fullscreen_side_panel_mode,
                                 &mut side_panel_mode_pressed,
                                 side_panel_visible,
                                 &mut self.slideshow_playing,
                                 &mut self.settings.slideshow_interval_secs,
                                 &mut self.settings.slideshow_end_action,
-                                current_rotation, &mut rotation_choice,
+                                current_rotation,
+                                &mut rotation_choice,
                                 self.analysis_mode,
                                 &mut bar_analysis_pressed,
                                 panorama_trigger,
@@ -12322,7 +12433,9 @@ impl App {
                                 self.show_vst3_manager = !self.show_vst3_manager;
                             }
                             // ホイール/キーで確定したページ移動を保護
-                            if nav_locked { page_nav = saved_nav; }
+                            if nav_locked {
+                                page_nav = saved_nav;
+                            }
                         }
                         fs_hover_bar_ms = hover_bar_t0.elapsed().as_secs_f64() * 1000.0;
                         if let Some(rotation) = rotation_choice {
@@ -12344,9 +12457,8 @@ impl App {
                         }
 
                         // ── 右上フィードバックトースト ──
-                        let ring_surface_context = self.ring_shortcut_context_for_surface(
-                            crate::app::ActionSurface::Viewer,
-                        );
+                        let ring_surface_context = self
+                            .ring_shortcut_context_for_surface(crate::app::ActionSurface::Viewer);
                         if self.mouse_ring_flick.is_some()
                             && ring_surface_context
                                 == crate::ring_shortcut::RingShortcutContext::VideoFullscreen
@@ -12406,9 +12518,7 @@ impl App {
 
                         // The touch help is the final canvas overlay: once it is visible,
                         // no panel, page, or gesture target should appear above its guide.
-                        self.draw_still_touch_first_run_help_overlay(
-                            ui, ctx, full_rect, fs_idx,
-                        );
+                        self.draw_still_touch_first_run_help_overlay(ui, ctx, full_rect, fs_idx);
 
                         // ── スロット保存ダイアログ ──
                         self.draw_slot_save_dialog(ctx);
@@ -12416,9 +12526,9 @@ impl App {
                         self.draw_export_dialog(ctx);
                         self.draw_export_progress_dialog(ctx);
 
-                        let spread_changed_from_direction =
-                            self.reading_direction != reading_direction_before
-                                && self.sync_spread_mode_from_reading_direction();
+                        let spread_changed_from_direction = self.reading_direction
+                            != reading_direction_before
+                            && self.sync_spread_mode_from_reading_direction();
                         // ホバーバーのポップアップからモードが変更された場合
                         if self.spread_mode != spread_before {
                             if !spread_changed_from_direction {
@@ -12439,7 +12549,8 @@ impl App {
                             }
                         }
                         let reading_flow_changed = self.reading_flow != reading_flow_before;
-                        if reading_flow_changed || self.reading_direction != reading_direction_before
+                        if reading_flow_changed
+                            || self.reading_direction != reading_direction_before
                         {
                             self.reset_continuous_reading_transform();
                             if reading_flow_changed {
@@ -12778,13 +12889,583 @@ impl App {
         }
     }
 
+    #[cfg(windows)]
+    fn fs_page_turn_ordinary_context_blocker(
+        &self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) -> Option<&'static str> {
+        if !self.reading_flow.is_paged() {
+            Some("reading_flow_not_paged")
+        } else if !self.items.get(fs_idx).is_some_and(GridItem::has_page_data) {
+            Some("item_not_page_data")
+        } else if self.any_modal_dialog_open_for_fullscreen_keys() {
+            Some("modal_dialog")
+        } else if self.fs_context_menu_idx.is_some() {
+            Some("context_menu")
+        } else if self.capture_region_selection.is_some() {
+            Some("capture_region")
+        } else if self.is_overlay_edit_mode_active() {
+            Some("overlay_edit_mode")
+        } else if self.analysis_mode {
+            Some("analysis_mode")
+        } else if self.view_trim_mode {
+            Some("view_trim_mode")
+        } else if self.fs_zoom_mode_engaged() {
+            Some("zoom_mode")
+        } else if !matches!(self.compare_view_mode, crate::app::CompareViewMode::Off) {
+            Some("compare_mode")
+        } else if self.is_panorama_mode_active(fs_idx) {
+            Some("panorama_mode")
+        } else if self.original_preview_active(ctx, fs_idx) {
+            Some("original_preview")
+        } else {
+            None
+        }
+    }
+
+    #[cfg(windows)]
+    fn fs_page_turn_chord_is_unambiguous(&self, chord: Chord) -> bool {
+        !KeyAction::all().iter().copied().any(|action| {
+            FS_IMAGE_ACTIVE_SCOPES.contains(&action.context())
+                && action.trigger() == KeyTrigger::Press
+                && !FS_PAGE_TURN_COALESCE_ACTIONS.contains(&action)
+                && !(matches!(
+                    action,
+                    KeyAction::FsStackJumpPrev | KeyAction::FsStackJumpNext
+                ) && !self.stack_showing_flat)
+                && self.keymap.effective_chords(action).contains(&chord)
+        })
+    }
+
+    /// Resolve the physical page-turn level for the owning viewport. This reads
+    /// current OS/synthetic level only: repeat edges, elapsed time and prior frames
+    /// do not participate.
+    #[cfg(windows)]
+    fn fs_page_turn_input_held(
+        &self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) -> (bool, Option<&'static str>, egui::ViewportId) {
+        let viewport = if self.fullscreen_embedded_still_active() {
+            ctx.viewport_id()
+        } else {
+            self.fullscreen_viewport_id()
+        };
+        let blocker = self.fs_page_turn_ordinary_context_blocker(ctx, fs_idx);
+        if blocker.is_some() {
+            return (false, blocker, viewport);
+        }
+        let configurable = FS_PAGE_TURN_COALESCE_ACTIONS.into_iter().any(|action| {
+            self.keymap
+                .effective_chords(action)
+                .into_iter()
+                .any(|chord| {
+                    self.keymap.key_held_chord_via_os(viewport, chord)
+                        && self.fs_page_turn_chord_is_unambiguous(chord)
+                })
+        });
+        let fixed = FS_FIXED_PAGE_TURN_CHORDS
+            .into_iter()
+            .chain((!self.stack_showing_flat).then_some(Chord::shift(KeyName::Up)))
+            .chain((!self.stack_showing_flat).then_some(Chord::shift(KeyName::Down)))
+            .any(|chord| {
+                self.keymap.key_held_chord_via_os(viewport, chord)
+                    && self.fs_page_turn_chord_is_unambiguous(chord)
+            });
+        (configurable || fixed, None, viewport)
+    }
+
+    fn fs_page_turn_passthrough_renditions_ready(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) -> bool {
+        let pages = self.fs_display_unit_page_indices(fs_idx);
+        !pages.is_empty()
+            && pages
+                .into_iter()
+                .all(|idx| self.ensure_passthrough_rendition(ctx, idx).is_some())
+    }
+
+    fn emit_fs_page_turn_decision_probe(
+        &mut self,
+        frame_nr: u64,
+        fs_idx: usize,
+        ordinary_blocker: Option<&'static str>,
+        page_turn_input_held: bool,
+        page_turn_burst_active: bool,
+        decision: FsPageTurnDecision,
+    ) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let reason = if let Some(blocker) = ordinary_blocker {
+            blocker
+        } else if !page_turn_input_held {
+            "pending_zero"
+        } else if !page_turn_burst_active {
+            "no_page_transition"
+        } else if !decision.passthrough_rendition_ready {
+            "passthrough_rendition_unavailable"
+        } else {
+            "pass_through"
+        };
+        for idx in self.fs_display_unit_page_indices(fs_idx) {
+            crate::perf::event(
+                "fs",
+                "page_turn_decision",
+                self.perf_item_key(idx).as_deref(),
+                self.input_seq,
+                &[
+                    ("n", serde_json::Value::from(self.frame_counter)),
+                    ("frame_nr", serde_json::Value::from(frame_nr)),
+                    ("idx", serde_json::Value::from(idx)),
+                    (
+                        "items_generation",
+                        serde_json::Value::from(self.items_generation),
+                    ),
+                    ("mode", serde_json::Value::from(decision.perf_label())),
+                    ("reason", serde_json::Value::from(reason)),
+                    (
+                        "defer_ui_uploads",
+                        serde_json::Value::from(decision.defer_ui_uploads()),
+                    ),
+                    (
+                        "passthrough_rendition_ready",
+                        serde_json::Value::from(decision.passthrough_rendition_ready),
+                    ),
+                ],
+            );
+        }
+    }
+
+    /// Decide paint source and heavy-work admission from the current physical
+    /// level plus the last resolved navigation outcome. The typed burst state is
+    /// not input smoothing: it is activated only by an actual display-unit move
+    /// and cleared by release, context change, or a boundary no-op. A frame-local
+    /// cache keeps egui replay passes deterministic.
+    pub(crate) fn fs_page_turn_decision_for_frame(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) -> FsPageTurnDecision {
+        #[cfg(not(windows))]
+        {
+            let _ = (ctx, fs_idx);
+            FsPageTurnDecision::normal()
+        }
+
+        #[cfg(windows)]
+        {
+            let (page_turn_input_held, ordinary_blocker, viewport) =
+                self.fs_page_turn_input_held(ctx, fs_idx);
+            let frame_nr = ctx.cumulative_frame_nr();
+            let cache_id = egui::Id::new(("fs_page_turn_decision", viewport));
+            if let Some(cached) = ctx
+                .data(|data| data.get_temp::<FsPageTurnFrameDecision>(cache_id))
+                .filter(|cached| {
+                    cached.frame_nr == frame_nr
+                        && cached.items_generation == self.items_generation
+                        && cached.idx == fs_idx
+                })
+            {
+                return cached.decision;
+            }
+            let burst_id = egui::Id::new(("fs_page_turn_burst", viewport));
+            let mut burst_state = ctx
+                .data(|data| data.get_temp::<FsPageTurnBurstState>(burst_id))
+                .unwrap_or_default();
+            if !page_turn_input_held
+                || !matches!(
+                    burst_state,
+                    FsPageTurnBurstState::Active {
+                        items_generation,
+                        current_idx,
+                    } if items_generation == self.items_generation && current_idx == fs_idx
+                )
+            {
+                burst_state = FsPageTurnBurstState::Idle;
+                ctx.data_mut(|data| data.insert_temp(burst_id, burst_state));
+            }
+            let page_turn_burst_active = matches!(
+                burst_state,
+                FsPageTurnBurstState::Active {
+                    items_generation,
+                    current_idx,
+                } if items_generation == self.items_generation && current_idx == fs_idx
+            );
+            let passthrough_rendition_ready = page_turn_burst_active
+                && self.fs_page_turn_passthrough_renditions_ready(ctx, fs_idx);
+            let decision = page_turn_decision_for_inputs(
+                page_turn_input_held,
+                page_turn_burst_active,
+                passthrough_rendition_ready,
+            );
+            self.emit_fs_page_turn_decision_probe(
+                frame_nr,
+                fs_idx,
+                ordinary_blocker,
+                page_turn_input_held,
+                page_turn_burst_active,
+                decision,
+            );
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    cache_id,
+                    FsPageTurnFrameDecision {
+                        frame_nr,
+                        items_generation: self.items_generation,
+                        idx: fs_idx,
+                        decision,
+                    },
+                );
+            });
+            decision
+        }
+    }
+
+    /// Publish the result of a discrete still-page navigation command to the
+    /// page-turn burst owner. A successful move starts/continues the burst;
+    /// reaching an endpoint ends it even while the physical key remains held,
+    /// allowing the landing page to materialize immediately.
+    fn update_fs_page_turn_burst_after_navigation(
+        &mut self,
+        ctx: &egui::Context,
+        current_idx: usize,
+        target_idx: Option<usize>,
+    ) {
+        #[cfg(not(windows))]
+        let _ = (ctx, current_idx, target_idx);
+
+        #[cfg(windows)]
+        {
+            let (held, blocker, viewport) = self.fs_page_turn_input_held(ctx, current_idx);
+            let moved = target_idx.is_some_and(|target_idx| target_idx != current_idx);
+            let state = if held && blocker.is_none() && moved {
+                FsPageTurnBurstState::Active {
+                    items_generation: self.items_generation,
+                    current_idx: target_idx.expect("moved page turn has a target"),
+                }
+            } else {
+                FsPageTurnBurstState::Idle
+            };
+            let burst_id = egui::Id::new(("fs_page_turn_burst", viewport));
+            let decision_id = egui::Id::new(("fs_page_turn_decision", viewport));
+            ctx.data_mut(|data| {
+                data.insert_temp(burst_id, state);
+                // The frame began before navigation was resolved. Make the target
+                // open observe the just-published transition instead of the old
+                // page's cached decision.
+                data.insert_temp(
+                    decision_id,
+                    FsPageTurnFrameDecision {
+                        frame_nr: u64::MAX,
+                        items_generation: self.items_generation,
+                        idx: current_idx,
+                        decision: FsPageTurnDecision::normal(),
+                    },
+                );
+            });
+            if !moved {
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    fn fs_display_unit_trace_pages(
+        &self,
+        fs_idx: usize,
+        spread_pair: SpreadPair,
+        sources: &FsNavigatorTextureSources,
+    ) -> Option<Vec<FsDisplayUnitTracePage>> {
+        let mut expected = match spread_pair {
+            SpreadPair::Single => vec![fs_idx],
+            SpreadPair::Double { left, right } => vec![left, right],
+        };
+        expected.sort_unstable();
+        let pages = expected
+            .iter()
+            .filter_map(|idx| {
+                sources
+                    .pages
+                    .iter()
+                    .find(|(page_idx, _)| page_idx == idx)
+                    .map(|(_, resource)| {
+                        let texture = resource.source_texture();
+                        let source = if self.is_passthrough_rendition_texture(texture) {
+                            "thumbnail"
+                        } else {
+                            self.fs_texture_source_for_trace(*idx, texture)
+                        };
+                        FsDisplayUnitTracePage {
+                            idx: *idx,
+                            texture_id: texture.id(),
+                            source,
+                        }
+                    })
+            })
+            .collect::<Vec<_>>();
+        (pages.len() == expected.len()).then_some(pages)
+    }
+
+    /// Record the resources selected by the completed display-unit draw, after spread
+    /// resolution and holdover replacement. Dedup compares each page only with the
+    /// immediately preceding display unit's `(idx, texture)` pairs.
+    fn emit_fs_paint_for_display_unit(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        spread_pair: SpreadPair,
+        decision: FsPageTurnDecision,
+        sources: &FsNavigatorTextureSources,
+    ) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let trace_pages = self
+            .fs_display_unit_trace_pages(fs_idx, spread_pair, sources)
+            .unwrap_or_default();
+        let viewport = if self.fullscreen_embedded_still_active() {
+            ctx.viewport_id()
+        } else {
+            self.fullscreen_viewport_id()
+        };
+        let cache_id = egui::Id::new(("fs_paint_display_unit", viewport));
+        let previous = ctx.data(|data| data.get_temp::<FsPaintDisplayUnitSignature>(cache_id));
+        let changed_pages = trace_pages
+            .iter()
+            .copied()
+            .filter(|page| {
+                fs_paint_page_changed_from_previous(
+                    previous.as_ref(),
+                    self.items_generation,
+                    page.idx,
+                    page.texture_id,
+                )
+            })
+            .collect::<Vec<_>>();
+        let current = FsPaintDisplayUnitSignature {
+            items_generation: self.items_generation,
+            pages: trace_pages
+                .iter()
+                .map(|page| (page.idx, page.texture_id))
+                .collect(),
+        };
+        ctx.data_mut(|data| data.insert_temp(cache_id, current));
+
+        for page in changed_pages {
+            let entry_seq = if matches!(decision.paint_source(), FsPageTurnPaintSource::PassThrough)
+            {
+                self.input_seq
+            } else {
+                self.fs_cache
+                    .get(&page.idx)
+                    .map(|entry| entry.load_seq())
+                    .unwrap_or(0)
+            };
+            let transform = self
+                .fullscreen_page_layout
+                .page_by_idx(page.idx)
+                .map(|displayed| displayed.transform);
+            let draw_rect = transform.map(|transform| transform.paint_rect);
+            let display_size = transform
+                .map(|transform| rotated_display_size(transform.texture_size, transform.rotation));
+            let scale_x = transform.map(|transform| {
+                transform.full_image_rect.width()
+                    / rotated_display_size(transform.texture_size, transform.rotation)
+                        .x
+                        .max(1.0)
+            });
+            let scale_y = transform.map(|transform| {
+                transform.full_image_rect.height()
+                    / rotated_display_size(transform.texture_size, transform.rotation)
+                        .y
+                        .max(1.0)
+            });
+            crate::perf::event(
+                "fs",
+                "paint",
+                self.perf_item_key(page.idx).as_deref(),
+                entry_seq,
+                &[
+                    ("idx", serde_json::Value::from(page.idx)),
+                    (
+                        "items_generation",
+                        serde_json::Value::from(self.items_generation),
+                    ),
+                    ("mode", serde_json::Value::from(decision.perf_label())),
+                    ("source", serde_json::Value::from(page.source)),
+                    (
+                        "texture_id",
+                        serde_json::Value::from(format!("{:?}", page.texture_id)),
+                    ),
+                    (
+                        "x",
+                        draw_rect
+                            .map(|rect| serde_json::Value::from(rect.min.x))
+                            .unwrap_or(serde_json::Value::Null),
+                    ),
+                    (
+                        "y",
+                        draw_rect
+                            .map(|rect| serde_json::Value::from(rect.min.y))
+                            .unwrap_or(serde_json::Value::Null),
+                    ),
+                    (
+                        "w",
+                        draw_rect
+                            .map(|rect| serde_json::Value::from(rect.width()))
+                            .unwrap_or(serde_json::Value::Null),
+                    ),
+                    (
+                        "h",
+                        draw_rect
+                            .map(|rect| serde_json::Value::from(rect.height()))
+                            .unwrap_or(serde_json::Value::Null),
+                    ),
+                    (
+                        "texture_w",
+                        display_size
+                            .map(|size| serde_json::Value::from(size.x))
+                            .unwrap_or(serde_json::Value::Null),
+                    ),
+                    (
+                        "texture_h",
+                        display_size
+                            .map(|size| serde_json::Value::from(size.y))
+                            .unwrap_or(serde_json::Value::Null),
+                    ),
+                    (
+                        "scale_x",
+                        scale_x
+                            .map(serde_json::Value::from)
+                            .unwrap_or(serde_json::Value::Null),
+                    ),
+                    (
+                        "scale_y",
+                        scale_y
+                            .map(serde_json::Value::from)
+                            .unwrap_or(serde_json::Value::Null),
+                    ),
+                ],
+            );
+        }
+        if let [page] = trace_pages.as_slice() {
+            let entry_seq = if matches!(decision.paint_source(), FsPageTurnPaintSource::PassThrough)
+            {
+                self.input_seq
+            } else {
+                self.fs_cache
+                    .get(&page.idx)
+                    .map(|entry| entry.load_seq())
+                    .unwrap_or(0)
+            };
+            self.fs_painted_last = Some((page.idx, page.texture_id, entry_seq));
+        }
+    }
+
+    /// Emit readiness only after the final visible display-unit source has been
+    /// selected (including holdovers). Spread pages are accepted only as a complete
+    /// unit, so the trace cannot report a half-painted pair as ready.
+    fn emit_fs_page_turn_ready_for_display_unit(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        spread_pair: SpreadPair,
+        decision: FsPageTurnDecision,
+        sources: &FsNavigatorTextureSources,
+    ) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let Some(trace_pages) = self.fs_display_unit_trace_pages(fs_idx, spread_pair, sources)
+        else {
+            return;
+        };
+        self.emit_fs_paint_for_display_unit(ctx, fs_idx, spread_pair, decision, sources);
+        if matches!(decision.paint_source(), FsPageTurnPaintSource::Materialized)
+            && trace_pages.iter().any(|page| page.source == "thumbnail")
+        {
+            // A normal decode-wait thumbnail is not the materialized stop page.
+            return;
+        }
+        let signature = FsPageTurnReadySignature {
+            items_generation: self.items_generation,
+            mode: decision.perf_label(),
+            pages: trace_pages
+                .iter()
+                .map(|page| (page.idx, page.texture_id, page.source))
+                .collect(),
+        };
+        let cache_id = egui::Id::new(("fs_page_turn_ready", self.fullscreen_viewport_id()));
+        if !fs_page_turn_ready_signature_changed(
+            ctx.data(|data| data.get_temp::<FsPageTurnReadySignature>(cache_id))
+                .as_ref(),
+            &signature,
+        ) {
+            return;
+        }
+        ctx.data_mut(|data| data.insert_temp(cache_id, signature));
+
+        let viewport = if self.fullscreen_embedded_still_active() {
+            ctx.viewport_id()
+        } else {
+            self.fullscreen_viewport_id()
+        };
+        let script_hold_id = crate::key_input::synthetic_frame_hold_id(ctx, viewport);
+
+        for page in trace_pages {
+            let mut attrs = vec![
+                ("idx", serde_json::Value::from(page.idx)),
+                (
+                    "items_generation",
+                    serde_json::Value::from(self.items_generation),
+                ),
+                ("mode", serde_json::Value::from(decision.perf_label())),
+                ("source", serde_json::Value::from(page.source)),
+                (
+                    "texture_id",
+                    serde_json::Value::from(format!("{:?}", page.texture_id)),
+                ),
+            ];
+            if let Some(hold_id) = script_hold_id {
+                attrs.push(("script_hold_id", serde_json::Value::from(hold_id)));
+            }
+            crate::perf::event(
+                "fs",
+                "page_turn_ready",
+                self.perf_item_key(page.idx).as_deref(),
+                self.input_seq,
+                &attrs,
+            );
+        }
+    }
+
     /// フルスクリーン描画に必要な状態を事前計算する。
-    fn prepare_fullscreen_state(&mut self, ctx: &egui::Context, fs_idx: usize) -> FsFrameState {
+    fn prepare_fullscreen_state(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        page_turn_decision: FsPageTurnDecision,
+    ) -> FsFrameState {
         let is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
         let original_preview_active = self.original_preview_active(ctx, fs_idx);
 
-        let tex = self.resolve_fs_processed_texture(ctx, fs_idx, original_preview_active);
-        if crate::perf::is_enabled()
+        let pass_through = matches!(
+            page_turn_decision.paint_source(),
+            FsPageTurnPaintSource::PassThrough
+        );
+        let tex = if pass_through {
+            // The physical held level owns the paint mode for the whole burst. Do not
+            // choose a resident final page-by-page merely because one happens to be
+            // cached; every passing page uses the same low-resolution rendition path.
+            None
+        } else {
+            self.resolve_fs_processed_texture(ctx, fs_idx, original_preview_active)
+        };
+        if !pass_through
+            && crate::perf::is_enabled()
             && tex.is_none()
             && matches!(self.fs_painted_last, Some((painted_idx, _, _)) if painted_idx == fs_idx)
         {
@@ -12819,13 +13500,17 @@ impl App {
 
         let fs_load_failed = matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Failed));
 
-        let waiting_for_colorize = !original_preview_active
+        let waiting_for_colorize = !pass_through
+            && !original_preview_active
             && tex.is_none()
             && self.colorize_display_requires_final_effect(fs_idx);
-        let thumb_tex = if waiting_for_colorize {
-            // 生サムネイルは白黒なので使わない。paged の ColorizeDisplayUnit と
-            // folder-nav holdover はページ別 fallback にせず後段の overlay で描く。
-            None
+        let thumb_tex = if pass_through {
+            self.ensure_passthrough_rendition(ctx, fs_idx)
+        } else if waiting_for_colorize {
+            // The pass-through rendition already has the landing final's color
+            // decision. Keep that same visible page while full materialization
+            // catches up; exposing the raw catalog thumbnail would violate R2.
+            self.ensure_passthrough_rendition(ctx, fs_idx)
         } else {
             match self.thumbnails.get(fs_idx) {
                 Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
@@ -12893,6 +13578,8 @@ impl App {
                         let will_clamp =
                             sw > crate::app::MAX_TEXTURE_DIM || sh > crate::app::MAX_TEXTURE_DIM;
                         (Some((sw as u32, sh as u32)), will_clamp)
+                    } else if let Some(size) = self.fs_page_layout_source_size(fs_idx) {
+                        (Some((size.x.round() as u32, size.y.round() as u32)), false)
                     } else {
                         // 最後の頼り: フォールバックサムネイル/テクスチャから寸法を取得。
                         let dims = tex.as_ref().map(|t| {
@@ -12929,6 +13616,7 @@ impl App {
         FsFrameState {
             is_video,
             original_preview_active,
+            page_turn_decision,
             tex,
             thumb_tex,
             location_display,
@@ -12940,6 +13628,46 @@ impl App {
             fs_load_failed,
             pdf_content_type,
         }
+    }
+
+    /// Pixel coordinate dimensions used by annotations, hit testing, and Original
+    /// scale. PDF catalog dimensions are page-layout units, so they are not a
+    /// coordinate fallback until a full/display raster has supplied real pixels.
+    fn fs_page_coordinate_source_size(&self, idx: usize) -> Option<egui::Vec2> {
+        self.source_dims_for_idx(idx)
+            .map(|(w, h)| egui::vec2(w, h))
+            .or_else(|| {
+                self.fs_early_dims
+                    .get(&idx)
+                    .copied()
+                    .map(|[w, h]| egui::vec2(w as f32, h as f32))
+            })
+            .or_else(|| match (self.items.get(idx), self.thumbnails.get(idx)) {
+                (Some(GridItem::PdfPage { .. }), _) => None,
+                (
+                    _,
+                    Some(ThumbnailState::Loaded {
+                        source_dims: Some((w, h)),
+                        ..
+                    }),
+                ) => Some(egui::vec2(*w as f32, *h as f32)),
+                _ => None,
+            })
+    }
+
+    /// Canonical, pre-raster-rounding dimensions used only to lay out a page.
+    /// PDF page box dimensions persisted with the thumbnail win even after the
+    /// display raster arrives, so both textures resolve to one stable rectangle.
+    fn fs_page_layout_source_size(&self, idx: usize) -> Option<egui::Vec2> {
+        if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }))
+            && let Some(ThumbnailState::Loaded {
+                source_dims: Some((w, h)),
+                ..
+            }) = self.thumbnails.get(idx)
+        {
+            return Some(egui::vec2(*w as f32, *h as f32));
+        }
+        self.fs_page_coordinate_source_size(idx)
     }
 
     /// 見開き上部 HUD の相方ページ情報を、表示済みキャッシュだけから組み立てる。
@@ -14069,6 +14797,31 @@ impl App {
         &self,
         ctx: &egui::Context,
     ) -> crate::test_script::TestScriptSnapshot {
+        let keymap_level_observations = crate::key_input::synthetic_hold_observations(ctx)
+            .into_iter()
+            .map(|observation| {
+                let key_name = match observation.key {
+                    crate::key_input::SyntheticNavigationKey::Right => KeyName::Right,
+                    crate::key_input::SyntheticNavigationKey::Left => KeyName::Left,
+                    crate::key_input::SyntheticNavigationKey::Up => KeyName::Up,
+                    crate::key_input::SyntheticNavigationKey::Down => KeyName::Down,
+                    crate::key_input::SyntheticNavigationKey::PageUp => KeyName::PageUp,
+                    crate::key_input::SyntheticNavigationKey::PageDown => KeyName::PageDown,
+                    crate::key_input::SyntheticNavigationKey::Home => KeyName::Home,
+                    crate::key_input::SyntheticNavigationKey::End => KeyName::End,
+                    crate::key_input::SyntheticNavigationKey::Enter => KeyName::Enter,
+                    crate::key_input::SyntheticNavigationKey::Escape => KeyName::Esc,
+                };
+                crate::test_script::KeymapLevelObservation {
+                    frame_nr: observation.frame_nr,
+                    key: key_name.settings_name().to_string(),
+                    hold_ids: observation.hold_ids,
+                    held: self
+                        .keymap
+                        .test_script_key_held_chord(ctx, Chord::key(key_name)),
+                }
+            })
+            .collect();
         let target = crate::key_input::resolve_synthetic_routing_target().ok();
         let target_viewport = target
             .map(|target| {
@@ -14134,6 +14887,7 @@ impl App {
             fullscreen_raw_key_permit: false,
             has_previous_page: nav_position.is_some_and(|position| position > 0),
             has_next_page: nav_position.is_some_and(|position| position + 1 < nav.len()),
+            keymap_level_observations,
         }
     }
 
@@ -19112,6 +19866,21 @@ impl App {
             return;
         }
 
+        let target_is_still_page = self.items.get(idx).is_some_and(GridItem::has_page_data);
+        let materialization = if target_is_still_page
+            && self.fullscreen_idx.is_some()
+            && self
+                .fs_page_turn_decision_for_frame(ctx, idx)
+                .defer_ui_uploads()
+        {
+            FsOpenMaterialization::DeferredPageTurn
+        } else {
+            FsOpenMaterialization::Eager
+        };
+        if matches!(materialization, FsOpenMaterialization::DeferredPageTurn) {
+            self.defer_page_turn_full_resolution_work();
+        }
+
         self.sync_main_selection_from_viewer_idx(idx);
 
         // 7e: VST ホスト表示中に file-nav したら、まず VST ホストを畳んでクリーンな音声モード
@@ -19183,7 +19952,7 @@ impl App {
                 "ui_fullscreen::open_fullscreen_from_fs_navigation:open_fullscreen",
             );
         }
-        self.open_fullscreen(idx, history_trigger);
+        self.open_fullscreen_with_materialization(idx, history_trigger, materialization);
         // `open_fullscreen` resets cursor idleness for a new fullscreen entry.
         // Fullscreen-internal navigation should keep the mouse cursor state continuous;
         // keyboard page turns must not revive a hidden cursor, while pointer navigation
@@ -19743,9 +20512,15 @@ impl App {
                         );
                     }
                 } else {
+                    self.update_fs_page_turn_burst_after_navigation(
+                        ctx,
+                        fs_idx,
+                        (new_idx != fs_idx).then_some(new_idx),
+                    );
                     self.land_still_page_navigation_target(ctx, fs_idx, new_idx);
                 }
             } else if let FsPageNav::Boundary { at_end } = page_nav {
+                self.update_fs_page_turn_burst_after_navigation(ctx, fs_idx, None);
                 self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
                     at_end,
                     at: std::time::Instant::now(),
@@ -19778,8 +20553,14 @@ impl App {
                     fs_idx,
                     nav_delta,
                 ) {
+                    self.update_fs_page_turn_burst_after_navigation(
+                        ctx,
+                        fs_idx,
+                        (new_idx != fs_idx).then_some(new_idx),
+                    );
                     self.land_still_page_navigation_target(ctx, fs_idx, new_idx);
                 } else {
+                    self.update_fs_page_turn_burst_after_navigation(ctx, fs_idx, None);
                     // 境界到達: 中央にヒントを出す (nav_delta > 0 なら末尾)
                     self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
                         at_end: nav_delta > 0,
@@ -20030,21 +20811,31 @@ impl App {
         if let Some(resource) = display_tex {
             let handle = resource.source_texture();
             let tex_size = handle.size_vec2();
+            let preserve_texture_aspect = self.is_passthrough_rendition_texture(handle);
+            let use_source_layout = preserve_texture_aspect
+                || matches!(self.items.get(page_idx), Some(GridItem::PdfPage { .. }));
+            let layout_source_size = use_source_layout
+                .then(|| self.fs_page_layout_source_size(page_idx))
+                .flatten();
             let fit_bbox = fs_image_fit_bbox(rotation, free_rotation_rad, content_bbox);
             let Some(transform) = resolved_transform.or_else(|| {
-                DisplayedImageTransform::resolve(DisplayedImageTransformInput {
-                    page_idx,
-                    viewport_rect: full_rect,
-                    source_size: source_size.unwrap_or(tex_size),
-                    texture_size: tex_size,
-                    rotation,
-                    free_rotation_rad,
-                    content_bbox,
-                    fit_mode,
-                    fit_scale_limits,
-                    pixels_per_point: ui.ctx().pixels_per_point(),
-                    placement: ResolvedDisplayPlacement::Normal { zoom_pan },
-                })
+                resolve_fs_image_transform(
+                    DisplayedImageTransformInput {
+                        page_idx,
+                        viewport_rect: full_rect,
+                        source_size: source_size.unwrap_or(tex_size),
+                        texture_size: tex_size,
+                        rotation,
+                        free_rotation_rad,
+                        content_bbox,
+                        fit_mode,
+                        fit_scale_limits,
+                        pixels_per_point: ui.ctx().pixels_per_point(),
+                        placement: ResolvedDisplayPlacement::Normal { zoom_pan },
+                    },
+                    layout_source_size,
+                    preserve_texture_aspect,
+                )
             }) else {
                 return None;
             };
@@ -23714,6 +24505,7 @@ impl App {
                     left.idx,
                     right.idx,
                     false,
+                    FsPageTurnDecision::normal(),
                     Some((left, right)),
                 );
             }
@@ -23731,6 +24523,7 @@ impl App {
         left_idx: usize,
         right_idx: usize,
         original_preview_active: bool,
+        page_turn_decision: FsPageTurnDecision,
         display_override: Option<(&FsDisplayUnitHoldoverPage, &FsDisplayUnitHoldoverPage)>,
     ) -> FsNavigatorTextureSources {
         self.fullscreen_page_layout.clear();
@@ -23781,8 +24574,19 @@ impl App {
                 self.location_display_for_loading(right_idx),
             )
         };
-        let (left_display_tex, right_display_tex) = match display_override {
+        let pass_through = display_override.is_none()
+            && matches!(
+                page_turn_decision.paint_source(),
+                FsPageTurnPaintSource::PassThrough
+            );
+        let (mut left_display_tex, mut right_display_tex) = match display_override {
             Some((left, right)) => (Some(left.texture.clone()), Some(right.texture.clone())),
+            None if pass_through => (
+                self.ensure_passthrough_rendition(ctx, left_idx)
+                    .map(crate::gpu_lanczos::FullscreenPaintResource::direct),
+                self.ensure_passthrough_rendition(ctx, right_idx)
+                    .map(crate::gpu_lanczos::FullscreenPaintResource::direct),
+            ),
             None => (
                 self.resolve_fs_processed_texture(ctx, left_idx, original_preview_active)
                     .map(|texture| self.fullscreen_paint_resource_for_texture(left_idx, texture)),
@@ -23790,6 +24594,32 @@ impl App {
                     .map(|texture| self.fullscreen_paint_resource_for_texture(right_idx, texture)),
             ),
         };
+        let settling_with_renditions = display_override.is_none()
+            && !pass_through
+            && settling_spread_uses_color_faithful_renditions(
+                original_preview_active,
+                left_display_tex.is_some(),
+                self.colorize_display_requires_final_effect(left_idx),
+                right_display_tex.is_some(),
+                self.colorize_display_requires_final_effect(right_idx),
+            );
+        if settling_with_renditions {
+            left_display_tex = self
+                .ensure_passthrough_rendition(ctx, left_idx)
+                .map(crate::gpu_lanczos::FullscreenPaintResource::direct);
+            right_display_tex = self
+                .ensure_passthrough_rendition(ctx, right_idx)
+                .map(crate::gpu_lanczos::FullscreenPaintResource::direct);
+        }
+        let color_faithful_rendition_unit = pass_through || settling_with_renditions;
+        if color_faithful_rendition_unit
+            && (left_display_tex.is_none() || right_display_tex.is_none())
+        {
+            // The visible unit is atomic. Never expose one faithful side beside one
+            // missing/raw side merely because their cache readiness differs.
+            left_display_tex = None;
+            right_display_tex = None;
+        }
         // 透過背景スタイル (bg_style はテクスチャ借用を含むため左右描画の前後で寿命に注意)
         // fs_bg_style は &mut self を要求するため先に解決してから以降は shared borrow に切り替える。
         // 透過画像が見開きの片方だけの場合もあるので両ページに同じ bg を適用する。
@@ -23804,27 +24634,55 @@ impl App {
         // 各ページの表示サイズを計算して、全体をフィットさせる
         // 片方だけフルサイズだとアスペクト比の微小差でレイアウトがジャンプするため、
         // 両方フルサイズが揃うまではサムネイルサイズに統一する
+        let (left_source_size, right_source_size) = match display_override {
+            Some((left, right)) => (left.source_size, right.source_size),
+            None => (
+                self.fs_page_layout_source_size(left_idx),
+                self.fs_page_layout_source_size(right_idx),
+            ),
+        };
+        let (left_coordinate_size, right_coordinate_size) = match display_override {
+            Some((left, right)) => (left.source_size, right.source_size),
+            None => (
+                self.fs_page_coordinate_source_size(left_idx),
+                self.fs_page_coordinate_source_size(right_idx),
+            ),
+        };
         let both_in_fs_cache =
             self.fs_cache.contains_key(&left_idx) && self.fs_cache.contains_key(&right_idx);
-        let (left_size, right_size) =
-            if let (Some(left_tex), Some(right_tex)) = (&left_display_tex, &right_display_tex) {
-                (
-                    Some(rotated_display_size(left_tex.size_vec2(), left_rot)),
-                    Some(rotated_display_size(right_tex.size_vec2(), right_rot)),
-                )
-            } else if both_in_fs_cache {
-                (
-                    Self::get_display_size(left_idx, left_rot, &self.fs_cache, &self.thumbnails),
-                    Self::get_display_size(right_idx, right_rot, &self.fs_cache, &self.thumbnails),
-                )
-            } else {
-                // サムネイルのみ使用（fs_cache を空マップとして渡す）
-                let empty = ItemsGenerationMap::new("fs_cache");
-                (
-                    Self::get_display_size(left_idx, left_rot, &empty, &self.thumbnails),
-                    Self::get_display_size(right_idx, right_rot, &empty, &self.thumbnails),
-                )
-            };
+        let pdf_layout_unit = matches!(self.items.get(left_idx), Some(GridItem::PdfPage { .. }))
+            || matches!(self.items.get(right_idx), Some(GridItem::PdfPage { .. }));
+        let (left_size, right_size) = if color_faithful_rendition_unit || pdf_layout_unit {
+            (
+                passthrough_layout_display_size(
+                    left_source_size,
+                    left_display_tex.as_ref().map(|tex| tex.size_vec2()),
+                    left_rot,
+                ),
+                passthrough_layout_display_size(
+                    right_source_size,
+                    right_display_tex.as_ref().map(|tex| tex.size_vec2()),
+                    right_rot,
+                ),
+            )
+        } else if let (Some(left_tex), Some(right_tex)) = (&left_display_tex, &right_display_tex) {
+            (
+                Some(rotated_display_size(left_tex.size_vec2(), left_rot)),
+                Some(rotated_display_size(right_tex.size_vec2(), right_rot)),
+            )
+        } else if both_in_fs_cache {
+            (
+                Self::get_display_size(left_idx, left_rot, &self.fs_cache, &self.thumbnails),
+                Self::get_display_size(right_idx, right_rot, &self.fs_cache, &self.thumbnails),
+            )
+        } else {
+            // サムネイルのみ使用（fs_cache を空マップとして渡す）
+            let empty = ItemsGenerationMap::new("fs_cache");
+            (
+                Self::get_display_size(left_idx, left_rot, &empty, &self.thumbnails),
+                Self::get_display_size(right_idx, right_rot, &empty, &self.thumbnails),
+            )
+        };
 
         // ズーム/パンが有効な場合は image_rect でクリップする
         // (ズーム時にページが image_rect 外へはみ出して他の UI を覆わないようにするため)
@@ -23841,19 +24699,17 @@ impl App {
             ui.painter().clone()
         };
         let left_allow_thumbnail = display_override.is_none()
-            && (original_preview_active || !self.colorize_display_requires_final_effect(left_idx));
+            && !settling_with_renditions
+            && (pass_through
+                || (!pass_through
+                    && (original_preview_active
+                        || !self.colorize_display_requires_final_effect(left_idx))));
         let right_allow_thumbnail = display_override.is_none()
-            && (original_preview_active || !self.colorize_display_requires_final_effect(right_idx));
-        let (left_source_size, right_source_size) = match display_override {
-            Some((left, right)) => (left.source_size, right.source_size),
-            None => (
-                self.source_dims_for_idx(left_idx)
-                    .map(|(w, h)| egui::vec2(w, h)),
-                self.source_dims_for_idx(right_idx)
-                    .map(|(w, h)| egui::vec2(w, h)),
-            ),
-        };
-
+            && !settling_with_renditions
+            && (pass_through
+                || (!pass_through
+                    && (original_preview_active
+                        || !self.colorize_display_requires_final_effect(right_idx))));
         if let (Some(ls), Some(rs)) = (left_size, right_size) {
             let spread_gap = quantize_points_to_physical_pixels(
                 self.settings.spread_page_gap_px.min(200) as f32,
@@ -23973,7 +24829,7 @@ impl App {
                 (
                     spread_rects.left_rect,
                     left_idx,
-                    left_source_size,
+                    left_coordinate_size,
                     left_rot,
                     &left_location,
                     left_display_tex.as_ref(),
@@ -23983,7 +24839,7 @@ impl App {
                 (
                     spread_rects.right_rect,
                     right_idx,
-                    right_source_size,
+                    right_coordinate_size,
                     right_rot,
                     &right_location,
                     right_display_tex.as_ref(),
@@ -24051,7 +24907,7 @@ impl App {
                 (
                     left_rect,
                     left_idx,
-                    left_source_size,
+                    left_coordinate_size,
                     left_rot,
                     &left_location,
                     left_display_tex.as_ref(),
@@ -24061,7 +24917,7 @@ impl App {
                 (
                     right_rect,
                     right_idx,
-                    right_source_size,
+                    right_coordinate_size,
                     right_rot,
                     &right_location,
                     right_display_tex.as_ref(),
@@ -24160,13 +25016,23 @@ impl App {
 
         if let Some(handle) = display_tex {
             let tex_size = handle.size_vec2();
+            let preserve_texture_aspect =
+                self.is_passthrough_rendition_texture(handle.source_texture());
+            let use_layout = preserve_texture_aspect
+                || matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }));
+            let layout_size = use_layout
+                .then(|| self.fs_page_layout_source_size(idx))
+                .flatten()
+                .unwrap_or(tex_size);
             let display_size = match rotation {
                 crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
-                    egui::vec2(tex_size.y, tex_size.x)
+                    egui::vec2(layout_size.y, layout_size.x)
                 }
-                _ => tex_size,
+                _ => layout_size,
             };
-            let img_rect = fit_display_size_in_rect(rect, display_size);
+            let page_rect = fit_display_size_in_rect(rect, display_size);
+            let img_rect =
+                fs_texture_content_rect(page_rect, tex_size, rotation, preserve_texture_aspect);
             let transform = DisplayedImageTransform::from_resolved_rect(
                 DisplayedImageTransformInput {
                     page_idx: idx,
@@ -25739,20 +26605,44 @@ impl App {
         full_rect: egui::Rect,
         ctx: &egui::Context,
     ) {
-        let Some(started_at) = self
+        let indicator_id = egui::Id::new(("fs_colorize_wait_indicator_visible", ctx.viewport_id()));
+        let Some((target_idx, started_at)) = self
             .fs_holdover_tex
             .as_ref()
-            .and_then(FsHoldover::colorize_wait_started_at)
+            .and_then(FsHoldover::final_effect_wait)
         else {
+            ctx.data_mut(|data| data.insert_temp(indicator_id, false));
             return;
         };
         let now = std::time::Instant::now();
         if !colorize_wait_indicator_visible(self.fs_holdover_tex.as_ref(), now) {
+            ctx.data_mut(|data| data.insert_temp(indicator_id, false));
             ctx.request_repaint_after(
                 COLORIZE_WAIT_INDICATOR_DELAY
                     .saturating_sub(now.saturating_duration_since(started_at)),
             );
             return;
+        }
+        let became_visible = ctx.data_mut(|data| {
+            let was_visible = data.get_temp::<bool>(indicator_id).unwrap_or(false);
+            data.insert_temp(indicator_id, true);
+            !was_visible
+        });
+        if became_visible && crate::perf::is_enabled() {
+            crate::perf::event(
+                "fs",
+                "colorize_wait_indicator",
+                self.perf_item_key(target_idx).as_deref(),
+                self.input_seq,
+                &[
+                    ("idx", serde_json::Value::from(target_idx)),
+                    (
+                        "items_generation",
+                        serde_json::Value::from(self.items_generation),
+                    ),
+                    ("reason", serde_json::Value::from("source_reload")),
+                ],
+            );
         }
         paint_centered_dark_status_overlay(ui, full_rect, "カラー化中…");
     }
@@ -29875,6 +30765,351 @@ mod tests {
     }
 
     #[test]
+    fn page_turn_held_level_selects_pass_through_even_without_a_thumbnail_rendition() {
+        let decision = page_turn_decision_for_inputs(true, true, false);
+
+        assert_eq!(decision.paint_source(), FsPageTurnPaintSource::PassThrough);
+        assert!(decision.defer_ui_uploads());
+        assert!(!decision.passthrough_rendition_ready);
+    }
+
+    #[test]
+    fn page_turn_decision_keeps_paint_and_ui_work_as_independent_axes() {
+        let cases = [
+            (true, true, FsPageTurnPaintSource::PassThrough, true),
+            (true, false, FsPageTurnPaintSource::PassThrough, true),
+            (false, true, FsPageTurnPaintSource::Materialized, false),
+            (false, false, FsPageTurnPaintSource::Materialized, false),
+        ];
+
+        for (held, ready, expected_source, expected_defer) in cases {
+            let decision = page_turn_decision_for_inputs(held, true, ready);
+            assert_eq!(decision.paint_source(), expected_source);
+            assert_eq!(decision.defer_ui_uploads(), expected_defer);
+            assert_eq!(decision.passthrough_rendition_ready, ready);
+        }
+    }
+
+    #[test]
+    fn page_turn_release_materializes_on_the_next_frame_without_hysteresis() {
+        let held = page_turn_decision_for_inputs(true, true, true);
+        let released = page_turn_decision_for_inputs(false, true, true);
+
+        assert_eq!(held.paint_source(), FsPageTurnPaintSource::PassThrough);
+        assert!(held.defer_ui_uploads());
+        assert_eq!(
+            released,
+            FsPageTurnDecision {
+                paint_source: FsPageTurnPaintSource::Materialized,
+                defer_ui_uploads: false,
+                passthrough_rendition_ready: true,
+            }
+        );
+    }
+
+    #[test]
+    fn held_boundary_without_a_page_transition_stays_materialized() {
+        let decision = page_turn_decision_for_inputs(true, false, false);
+
+        assert_eq!(decision.paint_source(), FsPageTurnPaintSource::Materialized);
+        assert!(!decision.defer_ui_uploads());
+        assert!(!decision.passthrough_rendition_ready);
+
+        let previous = FsPageTurnReadySignature {
+            items_generation: 7,
+            mode: "materialized",
+            pages: vec![(0, egui::TextureId::Managed(1), "final_composite")],
+        };
+        let boundary = FsPageTurnReadySignature {
+            items_generation: 7,
+            mode: decision.perf_label(),
+            pages: previous.pages.clone(),
+        };
+        assert!(
+            !fs_page_turn_ready_signature_changed(Some(&previous), &boundary),
+            "an unchanged boundary press must not emit page_turn_ready"
+        );
+    }
+
+    #[test]
+    fn materialized_settle_keeps_the_color_faithful_landing_rendition() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items.push(GridItem::Image(PathBuf::from(
+            "c:/test/page-turn-landing.jpg",
+        )));
+        let pixels = std::sync::Arc::new(egui::ColorImage::filled(
+            [4, 4],
+            egui::Color32::from_rgb(80, 90, 100),
+        ));
+        let catalog = ctx.load_texture(
+            "page_turn_landing_catalog",
+            (*pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.thumbnails.push(ThumbnailState::Loaded {
+            tex: catalog,
+            from_cache: false,
+            from_edit_preview: false,
+            rendered_at_px: 4,
+            source_dims: Some((400, 401)),
+        });
+        app.thumb_pixels.insert(0, pixels);
+        app.fullscreen_idx = Some(0);
+        app.reading_flow = ReadingFlow::Paged;
+        app.spread_mode = SpreadMode::Single;
+        app.settings.global_preset.colorize.mode = crate::colorize::ColorizeMode::AllImages;
+
+        let state = app.prepare_fullscreen_state(&ctx, 0, FsPageTurnDecision::normal());
+        let landing = state
+            .thumb_tex
+            .expect("the visible rendition must bridge final materialization");
+
+        assert!(state.tex.is_none());
+        assert!(app.is_passthrough_rendition_texture(&landing));
+        assert!(app.fs_holdover_tex.is_none());
+    }
+
+    #[test]
+    fn spread_settle_selects_renditions_for_the_whole_incomplete_final_effect_unit() {
+        assert!(settling_spread_uses_color_faithful_renditions(
+            false, true, false, false, true,
+        ));
+        assert!(settling_spread_uses_color_faithful_renditions(
+            false, false, true, true, false,
+        ));
+        assert!(!settling_spread_uses_color_faithful_renditions(
+            false, true, true, true, true,
+        ));
+        assert!(!settling_spread_uses_color_faithful_renditions(
+            false, false, false, false, false,
+        ));
+        assert!(!settling_spread_uses_color_faithful_renditions(
+            true, false, true, false, true,
+        ));
+    }
+
+    #[test]
+    fn passthrough_thumbnail_preserves_its_aspect_inside_the_final_page_rectangle() {
+        let viewport_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let source_size = egui::vec2(1000.0, 1501.0);
+        let make_input = |texture_size| DisplayedImageTransformInput {
+            page_idx: 0,
+            viewport_rect,
+            source_size,
+            texture_size,
+            rotation: crate::rotation_db::Rotation::None,
+            free_rotation_rad: 0.0,
+            content_bbox: None,
+            fit_mode: FullscreenFitMode::Page,
+            fit_scale_limits: FullscreenFitScaleLimits::default(),
+            pixels_per_point: 1.0,
+            placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+        };
+
+        let pass = resolve_fs_image_transform(
+            make_input(egui::vec2(300.0, 450.0)),
+            Some(source_size),
+            true,
+        )
+        .expect("pass-through transform");
+        let final_image = resolve_fs_image_transform(make_input(source_size), None, false)
+            .expect("final transform");
+
+        assert!(
+            final_image
+                .full_image_rect
+                .contains_rect(pass.full_image_rect)
+        );
+        assert!(
+            (pass.full_image_rect.center().x - final_image.full_image_rect.center().x).abs()
+                < 1.0e-4
+        );
+        assert!(
+            (pass.full_image_rect.center().y - final_image.full_image_rect.center().y).abs()
+                < 1.0e-4
+        );
+        let texture_ratio = 300.0 / 450.0;
+        let paint_ratio = pass.full_image_rect.width() / pass.full_image_rect.height();
+        assert!((paint_ratio - texture_ratio).abs() < 1.0e-4);
+        let scale_x = pass.full_image_rect.width() / 300.0;
+        let scale_y = pass.full_image_rect.height() / 450.0;
+        assert!((scale_x - scale_y).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn pdf_thumbnail_and_rounded_display_raster_use_the_same_page_box_rectangle() {
+        let viewport_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        // Page-box aspect is retained in 1/1000 point units. Both the 327x473
+        // thumbnail and 1643x2375 display raster round that ratio differently.
+        let page_box_layout = egui::vec2(691_792.0, 1_000_000.0);
+        let make_input = |source_size, texture_size| DisplayedImageTransformInput {
+            page_idx: 0,
+            viewport_rect,
+            source_size,
+            texture_size,
+            rotation: crate::rotation_db::Rotation::None,
+            free_rotation_rad: 0.0,
+            content_bbox: None,
+            fit_mode: FullscreenFitMode::Page,
+            fit_scale_limits: FullscreenFitScaleLimits::default(),
+            pixels_per_point: 1.0,
+            placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+        };
+        let pass = resolve_fs_image_transform(
+            make_input(egui::vec2(327.0, 473.0), egui::vec2(327.0, 473.0)),
+            Some(page_box_layout),
+            true,
+        )
+        .expect("PDF pass-through transform");
+        let final_image = resolve_fs_image_transform(
+            make_input(egui::vec2(1643.0, 2375.0), egui::vec2(1643.0, 2375.0)),
+            Some(page_box_layout),
+            false,
+        )
+        .expect("PDF final transform");
+
+        assert!(
+            final_image
+                .full_image_rect
+                .contains_rect(pass.full_image_rect)
+        );
+        assert!(
+            (pass.full_image_rect.center().x - final_image.full_image_rect.center().x).abs()
+                < 1.0e-4
+        );
+        assert!(
+            (pass.full_image_rect.center().y - final_image.full_image_rect.center().y).abs()
+                < 1.0e-4
+        );
+        let texture_ratio = 327.0 / 473.0;
+        let paint_ratio = pass.full_image_rect.width() / pass.full_image_rect.height();
+        assert!((paint_ratio - texture_ratio).abs() < 1.0e-4);
+        let scale_x = pass.full_image_rect.width() / 327.0;
+        let scale_y = pass.full_image_rect.height() / 473.0;
+        assert!((scale_x - scale_y).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn passthrough_spread_geometry_uses_source_dimensions_for_both_pages() {
+        let left_source = egui::vec2(1000.0, 1501.0);
+        let right_source = egui::vec2(997.0, 1499.0);
+        let left = passthrough_layout_display_size(
+            Some(left_source),
+            Some(egui::vec2(300.0, 450.0)),
+            crate::rotation_db::Rotation::None,
+        )
+        .expect("left layout size");
+        let right = passthrough_layout_display_size(
+            Some(right_source),
+            Some(egui::vec2(299.0, 450.0)),
+            crate::rotation_db::Rotation::None,
+        )
+        .expect("right layout size");
+
+        assert_eq!(left, left_source);
+        assert_eq!(right, right_source);
+    }
+
+    #[test]
+    fn page_turn_pass_through_covers_single_and_spread_without_page_cache_gates() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items
+            .push(GridItem::Image(PathBuf::from("c:/test/page-turn.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.fullscreen_idx = Some(0);
+        app.reading_flow = ReadingFlow::Paged;
+        app.spread_mode = SpreadMode::Single;
+
+        assert_eq!(app.fs_page_turn_ordinary_context_blocker(&ctx, 0), None);
+
+        app.spread_mode = SpreadMode::Rtl;
+        assert_eq!(app.fs_page_turn_ordinary_context_blocker(&ctx, 0), None);
+    }
+
+    #[test]
+    fn page_turn_pass_through_does_not_select_a_resident_final_when_rendition_is_missing() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items.push(GridItem::Image(PathBuf::from(
+            "c:/test/page-turn-final.jpg",
+        )));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.fullscreen_idx = Some(0);
+        let pixels =
+            std::sync::Arc::new(egui::ColorImage::filled([2, 2], egui::Color32::LIGHT_BLUE));
+        let texture = ctx.load_texture(
+            "page_turn_resident_final",
+            (*pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Static {
+                tex: texture,
+                pixels,
+                source_dims: Some([2, 2]),
+                load_seq: 1,
+            },
+        );
+
+        let state =
+            app.prepare_fullscreen_state(&ctx, 0, page_turn_decision_for_inputs(true, true, false));
+
+        assert!(state.tex.is_none());
+        assert!(state.thumb_tex.is_none());
+    }
+
+    #[test]
+    fn fs_paint_dedup_compares_each_page_with_the_immediately_previous_display_unit() {
+        let ctx = egui::Context::default();
+        let texture_a = ctx
+            .load_texture(
+                "fs_paint_a",
+                egui::ColorImage::filled([1, 1], egui::Color32::RED),
+                egui::TextureOptions::LINEAR,
+            )
+            .id();
+        let texture_b = ctx
+            .load_texture(
+                "fs_paint_b",
+                egui::ColorImage::filled([1, 1], egui::Color32::BLUE),
+                egui::TextureOptions::LINEAR,
+            )
+            .id();
+        let previous = FsPaintDisplayUnitSignature {
+            items_generation: 7,
+            pages: vec![(2, texture_a), (3, texture_b)],
+        };
+
+        assert!(!fs_paint_page_changed_from_previous(
+            Some(&previous),
+            7,
+            3,
+            texture_b,
+        ));
+        assert!(fs_paint_page_changed_from_previous(
+            Some(&previous),
+            7,
+            4,
+            texture_a,
+        ));
+        assert!(fs_paint_page_changed_from_previous(
+            Some(&previous),
+            7,
+            2,
+            texture_b,
+        ));
+        assert!(fs_paint_page_changed_from_previous(
+            Some(&previous),
+            8,
+            2,
+            texture_a,
+        ));
+    }
+
+    #[test]
     fn navigator_hold_requests_visibility_when_fixed_setting_is_off() {
         assert!(fs_navigator_visibility_requested(false, true, true, false));
     }
@@ -30526,6 +31761,7 @@ mod tests {
         let state = FsFrameState {
             is_video: false,
             original_preview_active: false,
+            page_turn_decision: FsPageTurnDecision::normal(),
             tex: None,
             thumb_tex: None,
             location_display: String::new(),
@@ -30874,7 +32110,7 @@ mod tests {
     }
 
     #[test]
-    fn colorize_wait_indicator_requires_colorize_state_and_full_delay() {
+    fn colorize_wait_indicator_requires_source_reload_state_and_full_delay() {
         let ctx = egui::Context::default();
         let texture = ctx.load_texture(
             "colorize_wait_indicator",
@@ -30882,26 +32118,29 @@ mod tests {
             egui::TextureOptions::LINEAR,
         );
         let started_at = std::time::Instant::now();
-        let colorize = FsHoldover::ColorizeDisplayUnit(ColorizeDisplayUnitHoldover {
-            target_idx: 0,
-            previous: FsDisplayUnitHoldover {
-                pages: vec![FsDisplayUnitHoldoverPage {
-                    idx: 0,
-                    texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture.clone()),
-                    rotation: crate::rotation_db::Rotation::None,
-                    source_size: None,
-                    content_bbox: None,
-                }],
-            },
-            started_at,
-        });
+        let source_reload =
+            FsHoldover::FinalEffectSourceReload(crate::app::FinalEffectSourceReloadHoldover {
+                target_idx: 0,
+                previous: FsDisplayUnitHoldover {
+                    pages: vec![FsDisplayUnitHoldoverPage {
+                        idx: 0,
+                        texture: crate::gpu_lanczos::FullscreenPaintResource::direct(
+                            texture.clone(),
+                        ),
+                        rotation: crate::rotation_db::Rotation::None,
+                        source_size: None,
+                        content_bbox: None,
+                    }],
+                },
+                started_at,
+            });
 
         assert!(!colorize_wait_indicator_visible(
-            Some(&colorize),
+            Some(&source_reload),
             started_at + COLORIZE_WAIT_INDICATOR_DELAY - std::time::Duration::from_millis(1),
         ));
         assert!(colorize_wait_indicator_visible(
-            Some(&colorize),
+            Some(&source_reload),
             started_at + COLORIZE_WAIT_INDICATOR_DELAY,
         ));
 
@@ -31622,6 +32861,7 @@ mod tests {
         let state = FsFrameState {
             is_video: false,
             original_preview_active: false,
+            page_turn_decision: FsPageTurnDecision::normal(),
             tex: None,
             thumb_tex: None,
             location_display: String::new(),
@@ -33029,6 +34269,7 @@ mod tests {
         let state = FsFrameState {
             is_video: false,
             original_preview_active: false,
+            page_turn_decision: FsPageTurnDecision::normal(),
             tex: None,
             thumb_tex: None,
             location_display: String::new(),
