@@ -759,9 +759,30 @@ export const VIDEO_QUALITY_PRESETS = Object.freeze([
   Object.freeze({ id: "high", label: "高", traffic: "約 1.4 GB / 時" }),
 ]);
 
+/// Each step is how far the reader can magnify before the page turns soft,
+/// bought with the seconds the PC spends drawing it and the bytes the link has
+/// to carry. A tablet shows a page about 1600 pixels tall, so 4096 stays sharp
+/// at roughly 2.5x and 8192 at 5x.
+///
+/// Measured on 46-megapixel pages, a step costs about 1.5 to 1.9 times the one
+/// below it -- 0.20, 0.64, 1.2, 1.9, 3.5, 5.4 MiB on the wire. The ladder is
+/// nearly geometric on purpose: moving one step should change what the reader
+/// feels by a similar amount wherever they are standing. Four steps used to sit
+/// three times apart, which left no way to trade a little sharpness for a
+/// thinner link.
+///
+/// 8192 is named for the extreme it is rather than topping a plain scale,
+/// because it costs the PC two seconds a page against 4096's 0.6.
 export const IMAGE_QUALITY_PRESETS = Object.freeze([
-  Object.freeze({ id: "high", label: "高品質", maxLongSide: 8192 }),
+  Object.freeze({
+    id: "maximum",
+    label: "最高画質",
+    maxLongSide: 8192,
+    note: "拡大を多用する場合向け。ページ送りが遅くなります",
+  }),
+  Object.freeze({ id: "high", label: "高画質", maxLongSide: 6144 }),
   Object.freeze({ id: "standard", label: "標準", maxLongSide: 4096 }),
+  Object.freeze({ id: "lighter", label: "やや軽量", maxLongSide: 3072 }),
   Object.freeze({ id: "light", label: "軽量", maxLongSide: 2048 }),
   Object.freeze({ id: "minimum", label: "最軽量", maxLongSide: 1024 }),
 ]);

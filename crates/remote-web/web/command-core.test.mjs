@@ -1161,18 +1161,44 @@ test("quality presets keep their traffic estimates attached to the command value
   assert.equal(videoQualityPreset("unknown").id, "standard");
 });
 
-test("image quality presets keep four deterministic long-side limits", () => {
+test("image quality presets keep six deterministic long-side limits", () => {
   assert.deepEqual(
     IMAGE_QUALITY_PRESETS.map(({ id, label, maxLongSide }) => [id, label, maxLongSide]),
     [
-      ["high", "高品質", 8192],
+      ["maximum", "最高画質", 8192],
+      ["high", "高画質", 6144],
       ["standard", "標準", 4096],
+      ["lighter", "やや軽量", 3072],
       ["light", "軽量", 2048],
       ["minimum", "最軽量", 1024],
     ]
   );
-  assert.equal(imageQualityPreset("high").maxLongSide, 8192);
+  assert.equal(imageQualityPreset("maximum").maxLongSide, 8192);
   assert.equal(imageQualityPreset("unknown").id, "standard");
+});
+
+test("only the most expensive image quality warns about page turns", () => {
+  const noted = IMAGE_QUALITY_PRESETS.filter(({ note }) => note);
+  assert.deepEqual(noted.map(({ id }) => id), ["maximum"]);
+  assert.match(noted[0].note, /ページ送りが遅くなります/);
+});
+
+test("one image quality step never more than doubles the cost", () => {
+  const sides = IMAGE_QUALITY_PRESETS.map(({ maxLongSide }) => maxLongSide);
+  // Compared by area, because render time and transfer size both follow pixel
+  // count. A reader moving one step should feel a similar change wherever on
+  // the ladder they stand; a 3x gap leaves nothing to reach for between.
+  // The last step down to the emergency floor is exempt and checked separately.
+  for (let index = 1; index < sides.length - 1; index += 1) {
+    const ratio = (sides[index - 1] / sides[index]) ** 2;
+    assert.ok(
+      ratio > 1 && ratio <= 2.5,
+      `${sides[index - 1]} to ${sides[index]} changes cost ${ratio.toFixed(1)}x`
+    );
+  }
+  const floor = sides.at(-1);
+  assert.equal(floor, 1024, "the emergency floor is the one wide step");
+  assert.ok((sides.at(-2) / floor) ** 2 <= 4);
 });
 
 test("RTL reverses only physical horizontal viewer keys and tap zones", () => {

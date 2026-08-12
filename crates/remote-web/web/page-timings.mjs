@@ -1,7 +1,9 @@
 import { IMAGE_QUALITY_PRESETS } from "./command-core.mjs";
 
 export const PAGE_TIMINGS_STORAGE_KEY = "miv-remote-page-timings";
-export const PAGE_TIMINGS_VERSION = 1;
+/// Bumped to 2 when "high" moved from 8192 to 6144. Samples recorded under the
+/// old meaning would be shown next to the new one and read as its cost.
+export const PAGE_TIMINGS_VERSION = 2;
 export const PAGE_TIMINGS_LIMIT = 10;
 
 const IMAGE_QUALITY_IDS = new Set(IMAGE_QUALITY_PRESETS.map(({ id }) => id));

@@ -12,6 +12,7 @@ import {
   saveLocalSettings,
   serializeLocalSettings,
 } from "./local-settings.mjs";
+import { IMAGE_QUALITY_PRESETS } from "./command-core.mjs";
 
 test("local settings use the current defaults when no value exists", () => {
   assert.deepEqual(parseLocalSettings(null), {
@@ -218,7 +219,10 @@ test("prefetch depth validates each field without changing version-one settings"
 });
 
 test("all image quality choices round-trip as device-local settings", () => {
-  for (const imageQuality of ["high", "standard", "light", "minimum"]) {
+  // Driven off the presets themselves, so a new step cannot be added without
+  // being covered here.
+  assert.ok(IMAGE_QUALITY_PRESETS.length >= 5);
+  for (const { id: imageQuality } of IMAGE_QUALITY_PRESETS) {
     const settings = { ...defaultLocalSettings(), imageQuality };
     assert.equal(
       parseLocalSettings(serializeLocalSettings(settings)).imageQuality,

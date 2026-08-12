@@ -10428,6 +10428,7 @@ class LocalSettingsDialog {
         textElement("strong", preset.label),
         textElement("small", `最大 ${preset.maxLongSide} px`)
       );
+      if (preset.note) qualityCopy.append(textElement("small", preset.note));
       if (timingAverage) qualityCopy.append(textElement("small", timingAverage));
       qualityOption.append(radio, qualityCopy);
       radio.addEventListener("change", () => {
