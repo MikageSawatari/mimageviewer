@@ -2585,3 +2585,24 @@ raw 取得は現在ページの source 比較を崩さないため trim に分�
 段別 p50 / p90 と ms/MP、同時本数別所要時間、lock wait を集計する。これにより、lock 待ちが
 増える直列化と、待ちはほぼ 0 だが実処理が伸びる CPU / メモリ帯域飽和を区別してから速度変更を決める。
 この増分は計測だけで、pool、並列上限、画質、先読み、表示 ownership は変更しない。
+
+2026-08-13 に PDF worker 内訳計測を追加した。`pdf.pool_recv` は従来の `rtt_ms` に加え、
+PDFium bitmap までの `worker_render_ms`、RGBA / response 組立の `worker_serialize_ms`、
+stdout 完了までの `worker_write_ms`、親側の `parent_read_ms`、両側の byte / call 数を持つ。
+write/read は同一 pipe 区間なので、内訳の critical path は
+`render + serialize + max(write, read)` とし、`timing_consistent` で `rtt_ms` 以下を検査する。
+自動テストでは既存 render response の header / RGBA が変わらず、計測 frame の encode/decode、
+framing byte 数、call 数、error 応答で追加 frame を待たないことを確認した。実 PDF の dominance
+（render 対 transfer）は、隔離した debug worker で 4096 px の同一ページを 3 回計測した。
+45.25 MiB 応答の warm 2 回は render 30.7–30.9 ms、serialize 24.9–27.0 ms、
+write 24.2–28.3 ms、worker RTT 87.0–87.4 ms だった。cold 1 回目は render 86.4 ms、
+serialize 23.9 ms、write 15.6 ms、RTT 137.9 ms である。warm 時は転送だけが単独で支配しておらず、
+render、RGBA 組立、pipe 転送が同程度だった。ただし debug profile / 4096 px の確認値なので、
+8192 px の通常利用に対する高速化判断はアプリの性能ログで再計測してから行い、この増分では高速化しない。
+
+Rust 1.94.1 の標準ライブラリ実装も確認した。`stdout().lock()` の実体は容量 1024 byte の
+`LineWriter<StdoutRaw>` で、`write_all` は入力内の最後の改行までをまとめて inner writer へ渡し、
+残りだけを buffer へ置く。RGBA 中の改行ごとに OS write する実装ではない。今回の
+`worker_write_calls` は既存 `write_msg` がその LineWriter 公開境界へ行った呼出回数、
+`parent_pipe_read_calls` は `BufReader` 内側の実 `ChildStdout.read` 回数を記録する。上記の実測でも、
+画像 frame は `write` 2 回（4-byte length と payload）+ `flush` 1 回で、改行単位の細切れはなかった。

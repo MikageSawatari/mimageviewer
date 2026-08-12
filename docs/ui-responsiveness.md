@@ -484,6 +484,26 @@ python scripts/analyze_perf.py <perf_events.jsonl> remote-page
 を表示する。同時本数とともに `ms` が伸び、`wait_ms` も伸びる場合は lock 直列化を疑う。
 `wait_ms` がほぼ 0 のまま `ms` だけ伸びる場合は CPU またはメモリ帯域の競合を疑う。
 
+PDF worker process の Render では、性能ログが有効な要求だけ、既存画像レスポンスの直後に固定長の
+計測フレームを返す。`pdf.pool_recv` は従来の `rtt_ms` を変えず、次を追加で記録する。
+
+- `worker_render_ms`: document open、page 解析、PDFium bitmap 作成、`as_image` 完了まで
+- `worker_serialize_ms`: RGBA 化と既存画像レスポンス `Vec<u8>` の組立
+- `worker_write_ms`: 画像フレームの `[4B len] + payload + flush` 完了まで
+- `parent_read_ms`: 親の最初の応答 read が完了してから画像フレーム全体を読み終えるまで。
+  最初の read が待った render 時間を読み取り時間へ混ぜない
+- `response_bytes`、`worker_wire_bytes`、`worker_write_calls`、`worker_flush_calls`:
+  worker の画像 payload / framing と、`StdoutLock` の外側で観測した Write 呼出回数
+- `parent_wire_bytes`、`parent_read_calls`: 画像フレームだけを `BufReader` 経由で返した
+  byte / Read 呼出回数。`parent_pipe_bytes`、`parent_pipe_read_calls` はその内側の
+  `ChildStdout.read` を数え、次の小さい計測フレームを先読みした場合は byte 数が大きくなり得る
+
+write と read は同じ pipe 転送区間を両端から測るため加算しない。
+`critical_path_ms = worker_render_ms + worker_serialize_ms + max(worker_write_ms, parent_read_ms)`
+とし、`timing_consistent` は計測フレームを取得でき、かつこの値が `rtt_ms` 以下のときだけ true。
+残りは `unaccounted_ms`（queue/dispatch、request write、response parse/copy 等）に残す。
+`metrics_available=false` では計測値を 0 として扱い、計測フレームの異常で受信済み画像を破棄しない。
+
 ---
 
 ## 7a. 既知の同期 I/O 残課題 (v0.8.2 以降で worker 化)

@@ -26,6 +26,7 @@
 //! `%APPDATA%/mimageviewer/pdfium.dll` に展開される。
 
 use std::collections::HashSet;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -439,12 +440,15 @@ pub(crate) fn is_password_required_error(error: &std::io::Error) -> bool {
 //     DisplayRender (5):
 //       [2B path_len][path_utf8][4B page_num][4B viewport_w][4B viewport_h]
 //       [1B fit_mode][1B swap_page_axes][2B pw_len][pw_utf8]
+//     Render / DisplayRender の末尾: [1B collect_metrics]
 //
 // レスポンス (worker → main):
 //   [4B msg_len LE][1B status][payload]
 //     Success (0):
 //       Enumerate: [4B page_count][per page: 8B mtime LE + 8B file_size LE]
 //       Render:    [4B width][4B height][rgba_bytes...]
+//       Render metrics (perf 有効時だけ Render success の次フレーム):
+//         [4B magic PDM1][1B version][7 * 8B counters]
 //     Error (1): [error_message_utf8]
 
 const MSG_ENUMERATE: u8 = 1;
@@ -457,6 +461,204 @@ const MSG_DISPLAY_RENDER: u8 = 5;
 const MSG_ANALYZE_PAGE: u8 = 6;
 const STATUS_OK: u8 = 0;
 const STATUS_ERR: u8 = 1;
+const RENDER_METRICS_MAGIC: &[u8; 4] = &[0x50, 0x44, 0x4d, 0x31];
+const RENDER_METRICS_VERSION: u8 = 1;
+const RENDER_METRICS_LEN: usize = 4 + 1 + 7 * std::mem::size_of::<u64>();
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct WorkerRenderMetrics {
+    render_us: u64,
+    serialize_us: u64,
+    write_us: u64,
+    response_bytes: u64,
+    wire_bytes: u64,
+    write_calls: u64,
+    flush_calls: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ParentReadMetrics {
+    /// 最初の pipe read が完了してから画像フレームを読み終えるまで。
+    /// 最初の read の block 時間には worker render 待ちが混ざるため除外する。
+    read_us: u64,
+    wire_bytes: u64,
+    read_calls: u64,
+    /// BufReader の内側で ChildStdout.read が呼ばれた回数と返却 byte 数。
+    /// 最終 read が次の metrics frame まで先読みした場合は wire_bytes より大きくなり得る。
+    pipe_bytes: u64,
+    pipe_read_calls: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct WriteCounterSnapshot {
+    bytes: u64,
+    write_calls: u64,
+    flush_calls: u64,
+}
+
+struct CountingWriter<W> {
+    inner: W,
+    counters: WriteCounterSnapshot,
+}
+
+impl<W> CountingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            counters: WriteCounterSnapshot::default(),
+        }
+    }
+
+    fn snapshot(&self) -> WriteCounterSnapshot {
+        self.counters
+    }
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.counters.write_calls = self.counters.write_calls.saturating_add(1);
+        let written = self.inner.write(buf)?;
+        self.counters.bytes = self.counters.bytes.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.counters.flush_calls = self.counters.flush_calls.saturating_add(1);
+        self.inner.flush()
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        // StdoutLock / LineWriter の specialized write_all を維持する。
+        self.counters.write_calls = self.counters.write_calls.saturating_add(1);
+        self.inner.write_all(buf)?;
+        self.counters.bytes = self.counters.bytes.saturating_add(buf.len() as u64);
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct ReadMeasurementState {
+    first_read_completed_at: Option<std::time::Instant>,
+    bytes: u64,
+    calls: u64,
+}
+
+struct CountingReader<R> {
+    inner: R,
+    measurement: Option<ReadMeasurementState>,
+}
+
+impl<R> CountingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            measurement: None,
+        }
+    }
+
+    fn begin_measurement(&mut self) {
+        self.measurement = Some(ReadMeasurementState::default());
+    }
+
+    fn finish_measurement(&mut self) -> ParentReadMetrics {
+        let Some(state) = self.measurement.take() else {
+            return ParentReadMetrics::default();
+        };
+        let read_us = state
+            .first_read_completed_at
+            .map(|first| duration_us(first.elapsed()))
+            .unwrap_or(0);
+        ParentReadMetrics {
+            read_us,
+            wire_bytes: state.bytes,
+            read_calls: state.calls,
+            pipe_bytes: 0,
+            pipe_read_calls: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        if let Some(state) = self.measurement.as_mut() {
+            state.calls = state.calls.saturating_add(1);
+            state.bytes = state.bytes.saturating_add(read as u64);
+            if read > 0 && state.first_read_completed_at.is_none() {
+                state.first_read_completed_at = Some(std::time::Instant::now());
+            }
+        }
+        Ok(read)
+    }
+}
+
+fn duration_us(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn counter_delta(
+    before: WriteCounterSnapshot,
+    after: WriteCounterSnapshot,
+) -> WriteCounterSnapshot {
+    WriteCounterSnapshot {
+        bytes: after.bytes.saturating_sub(before.bytes),
+        write_calls: after.write_calls.saturating_sub(before.write_calls),
+        flush_calls: after.flush_calls.saturating_sub(before.flush_calls),
+    }
+}
+
+fn encode_worker_render_metrics(metrics: WorkerRenderMetrics) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(RENDER_METRICS_LEN);
+    bytes.extend_from_slice(RENDER_METRICS_MAGIC);
+    bytes.push(RENDER_METRICS_VERSION);
+    for value in [
+        metrics.render_us,
+        metrics.serialize_us,
+        metrics.write_us,
+        metrics.response_bytes,
+        metrics.wire_bytes,
+        metrics.write_calls,
+        metrics.flush_calls,
+    ] {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+fn decode_worker_render_metrics(bytes: &[u8]) -> std::io::Result<WorkerRenderMetrics> {
+    if bytes.len() != RENDER_METRICS_LEN
+        || &bytes[..4] != RENDER_METRICS_MAGIC
+        || bytes[4] != RENDER_METRICS_VERSION
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid PDF render metrics frame",
+        ));
+    }
+    let mut offset = 5;
+    let mut next = || {
+        let value = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+        value
+    };
+    Ok(WorkerRenderMetrics {
+        render_us: next(),
+        serialize_us: next(),
+        write_us: next(),
+        response_bytes: next(),
+        wire_bytes: next(),
+        write_calls: next(),
+        flush_calls: next(),
+    })
+}
+
+fn render_critical_path_ms(worker: WorkerRenderMetrics, parent: ParentReadMetrics) -> f64 {
+    let render_ms = worker.render_us as f64 / 1000.0;
+    let serialize_ms = worker.serialize_us as f64 / 1000.0;
+    let write_ms = worker.write_us as f64 / 1000.0;
+    let read_ms = parent.read_us as f64 / 1000.0;
+    render_ms + serialize_ms + write_ms.max(read_ms)
+}
 
 fn write_msg(w: &mut impl std::io::Write, data: &[u8]) -> std::io::Result<()> {
     let len = data.len() as u32;
@@ -524,6 +726,7 @@ fn encode_render_request(
     page_num: u32,
     target: PdfRenderTarget,
     password: Option<&str>,
+    collect_metrics: bool,
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
     buf.push(match target {
@@ -552,6 +755,7 @@ fn encode_render_request(
     }
     buf.extend_from_slice(&(pw_bytes.len() as u16).to_le_bytes());
     buf.extend_from_slice(pw_bytes);
+    buf.push(u8::from(collect_metrics));
     buf
 }
 
@@ -667,11 +871,22 @@ fn decode_request(data: &[u8]) -> std::io::Result<DecodedRequest> {
             } else {
                 None
             };
+            let collect_metrics = match pw_payload.get(2 + pw_len).copied().unwrap_or(0) {
+                0 => false,
+                1 => true,
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid render metrics flag",
+                    ));
+                }
+            };
             Ok(DecodedRequest::Render {
                 path: PathBuf::from(path_str),
                 page_num,
                 target,
                 password,
+                collect_metrics,
             })
         }
         MSG_SHUTDOWN => Ok(DecodedRequest::Shutdown),
@@ -736,6 +951,7 @@ enum DecodedRequest {
         page_num: u32,
         target: PdfRenderTarget,
         password: Option<String>,
+        collect_metrics: bool,
     },
     GetInfo {
         path: PathBuf,
@@ -784,7 +1000,10 @@ pub fn run_worker_process() {
     let pdfium = Pdfium::new(bindings);
 
     let mut stdin = std::io::stdin().lock();
-    let mut stdout = std::io::stdout().lock();
+    // std::io::stdout() は常に 1 KiB LineWriter を挟む。バイナリ内の最後の改行までを
+    // 直接 inner へ出し、残りを buffer に置いて flush する実装なので、RGBA 中の改行数と
+    // OS write 回数は同じではない。CountingWriter はこの公開 Write 境界の実測値を取る。
+    let mut stdout = CountingWriter::new(std::io::stdout().lock());
     let data_dir = crate::data_dir::get();
     let ready = format!("{PDF_WORKER_READY_PREFIX}\n{}", data_dir.display());
     if let Err(error) = write_msg(&mut stdout, ready.as_bytes()) {
@@ -827,9 +1046,31 @@ pub fn run_worker_process() {
                 page_num,
                 target,
                 password,
+                collect_metrics,
             } => match ipc_render(&pdfium, &path, page_num, target, password.as_deref()) {
-                Ok(resp) => {
-                    let _ = write_msg(&mut stdout, &resp);
+                Ok((resp, render_us, serialize_us)) => {
+                    let before = stdout.snapshot();
+                    let write_started = std::time::Instant::now();
+                    let write_result = write_msg(&mut stdout, &resp);
+                    let write_us = duration_us(write_started.elapsed());
+                    let written = counter_delta(before, stdout.snapshot());
+                    if write_result.is_err() {
+                        break;
+                    }
+                    if collect_metrics {
+                        let metrics = encode_worker_render_metrics(WorkerRenderMetrics {
+                            render_us,
+                            serialize_us,
+                            write_us,
+                            response_bytes: resp.len() as u64,
+                            wire_bytes: written.bytes,
+                            write_calls: written.write_calls,
+                            flush_calls: written.flush_calls,
+                        });
+                        if write_msg(&mut stdout, &metrics).is_err() {
+                            break;
+                        }
+                    }
                 }
                 Err(e) => {
                     let _ = send_error(&mut stdout, &e.to_string());
@@ -940,9 +1181,12 @@ fn ipc_render(
     page_num: u32,
     target: PdfRenderTarget,
     password: Option<&str>,
-) -> std::io::Result<Vec<u8>> {
+) -> std::io::Result<(Vec<u8>, u64, u64)> {
+    let render_started = std::time::Instant::now();
     let (img, content_type, page_count, page_size_points) =
         core_render_with_count(pdfium, path, page_num, target, password)?;
+    let render_us = duration_us(render_started.elapsed());
+    let serialize_started = std::time::Instant::now();
     let rgba = img.to_rgba8();
     let w = rgba.width();
     let h = rgba.height();
@@ -967,7 +1211,8 @@ fn ipc_render(
     buf.extend_from_slice(&page_size_points.width.to_le_bytes());
     buf.extend_from_slice(&page_size_points.height.to_le_bytes());
     buf.extend_from_slice(pixels);
-    Ok(buf)
+    let serialize_us = duration_us(serialize_started.elapsed());
+    Ok((buf, render_us, serialize_us))
 }
 
 /// Render を行わず、AI canonical 判定に必要な page content と native raster 寸法だけ返す。
@@ -1082,7 +1327,14 @@ fn core_render_with_count(
 
 struct ProcessWorkerIo {
     stdin: std::process::ChildStdin,
-    stdout: std::io::BufReader<std::process::ChildStdout>,
+    stdout: std::io::BufReader<CountingReader<std::process::ChildStdout>>,
+}
+
+#[derive(Debug)]
+struct ProcessResponse {
+    bytes: Vec<u8>,
+    parent_read: ParentReadMetrics,
+    worker_render: Option<WorkerRenderMetrics>,
 }
 
 fn spawn_worker_process(
@@ -1125,7 +1377,7 @@ fn spawn_worker_process(
 
     let io = ProcessWorkerIo {
         stdin,
-        stdout: std::io::BufReader::new(stdout),
+        stdout: std::io::BufReader::new(CountingReader::new(stdout)),
     };
     await_worker_ready(child, io, data_dir, worker_id)
 }
@@ -1242,16 +1494,73 @@ fn terminate_failed_worker(child: &mut Child) -> String {
     }
 }
 
-fn send_recv_io(io: &mut ProcessWorkerIo, request: &[u8]) -> std::io::Result<Vec<u8>> {
+fn send_recv_io(io: &mut ProcessWorkerIo, request: &[u8]) -> std::io::Result<ProcessResponse> {
     write_msg(&mut io.stdin, request)?;
-    read_msg(&mut io.stdout)
+    let collect_metrics = render_request_collects_metrics(request);
+    if collect_metrics {
+        io.stdout.get_mut().begin_measurement();
+    }
+    let (bytes, mut parent_read) = if collect_metrics {
+        let mut response_reader = CountingReader::new(&mut io.stdout);
+        response_reader.begin_measurement();
+        let bytes = read_msg(&mut response_reader);
+        let metrics = response_reader.finish_measurement();
+        match bytes {
+            Ok(bytes) => (bytes, metrics),
+            Err(error) => {
+                let _ = io.stdout.get_mut().finish_measurement();
+                return Err(error);
+            }
+        }
+    } else {
+        (read_msg(&mut io.stdout)?, ParentReadMetrics::default())
+    };
+    if collect_metrics {
+        let pipe_read = io.stdout.get_mut().finish_measurement();
+        parent_read.pipe_bytes = pipe_read.wire_bytes;
+        parent_read.pipe_read_calls = pipe_read.read_calls;
+    }
+    let worker_render = if worker_metrics_frame_expected(collect_metrics, &bytes) {
+        match read_msg(&mut io.stdout).and_then(|frame| decode_worker_render_metrics(&frame)) {
+            Ok(metrics) => Some(metrics),
+            Err(error) => {
+                // 計装フレームの失敗で、既に受信済みの正常な画像を破棄しない。
+                // pipe 自体が閉じた場合は次要求が通常の IPC error になり worker を隔離する。
+                crate::logger::log(format!(
+                    "pdf-pool: render metrics frame unavailable: {error}"
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    Ok(ProcessResponse {
+        bytes,
+        parent_read,
+        worker_render,
+    })
+}
+
+fn worker_metrics_frame_expected(collect_metrics: bool, response: &[u8]) -> bool {
+    collect_metrics && response.first() == Some(&STATUS_OK)
+}
+
+fn render_request_collects_metrics(request: &[u8]) -> bool {
+    matches!(
+        decode_request(request),
+        Ok(DecodedRequest::Render {
+            collect_metrics: true,
+            ..
+        })
+    )
 }
 
 /// ディスパッチャースレッドに渡される 1 件のジョブ。
 struct Job {
     request: Vec<u8>,
     cancel: Option<Arc<AtomicBool>>,
-    reply: mpsc::Sender<std::io::Result<Vec<u8>>>,
+    reply: mpsc::Sender<std::io::Result<ProcessResponse>>,
     priority: JobPriority,
     enqueued_at: std::time::Instant,
     /// perf 相関キー (存在すれば dispatch/cancel イベントに載せる)
@@ -1571,7 +1880,7 @@ impl PdfWorkerPool {
         perf_key: Option<String>,
         context_epoch: u64,
         cancel_policy: CancelWaitPolicy,
-    ) -> std::io::Result<Vec<u8>> {
+    ) -> std::io::Result<ProcessResponse> {
         if self.worker_count == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -2686,7 +2995,7 @@ pub fn get_document_info(
             0,
             CancelWaitPolicy::AbortOnCancel,
         )?;
-        return PdfWorkerPool::parse_get_info_response(&resp);
+        return PdfWorkerPool::parse_get_info_response(&resp.bytes);
     }
     // in-process フォールバック
     let (tx, rx) = mpsc::channel();
@@ -2719,7 +3028,7 @@ pub fn analyze_page_content_type(
             0,
             CancelWaitPolicy::AbortOnCancel,
         )?;
-        return PdfWorkerPool::parse_analyze_page_response(&resp);
+        return PdfWorkerPool::parse_analyze_page_response(&resp.bytes);
     }
 
     let (tx, rx) = mpsc::channel();
@@ -2770,7 +3079,7 @@ pub fn enumerate_pages_with_cancel(
             0,
             CancelWaitPolicy::AbortOnCancel,
         )?;
-        return PdfWorkerPool::parse_enumerate_response(&resp);
+        return PdfWorkerPool::parse_enumerate_response(&resp.bytes);
     }
     // フォールバック: in-process ワーカー。
     // 同期経路 (キャッシュ作成等) なので epoch は None を渡す (Codex P2: UI nav の
@@ -2956,7 +3265,7 @@ fn render_page_target(
                 ],
             );
         }
-        let req = encode_render_request(pdf_path, page_num, target, password);
+        let req = encode_render_request(pdf_path, page_num, target, password, perf_enabled);
         let resp = pool.execute(
             &req,
             cancel.as_ref(),
@@ -2965,9 +3274,18 @@ fn render_page_target(
             context_epoch,
             cancel_policy,
         )?;
-        let result = PdfWorkerPool::parse_render_response(&resp);
+        let result = PdfWorkerPool::parse_render_response(&resp.bytes);
         if perf_enabled {
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let metrics_available = resp.worker_render.is_some();
+            let worker = resp.worker_render.unwrap_or_default();
+            let worker_render_ms = worker.render_us as f64 / 1000.0;
+            let worker_serialize_ms = worker.serialize_us as f64 / 1000.0;
+            let worker_write_ms = worker.write_us as f64 / 1000.0;
+            let parent_read_ms = resp.parent_read.read_us as f64 / 1000.0;
+            // write/read は同じ pipe 転送を両端から測った重複区間なので加算しない。
+            let critical_path_ms = render_critical_path_ms(worker, resp.parent_read);
+            let timing_consistent = metrics_available && critical_path_ms <= ms;
             let (render_w, render_h, render_long_px) = result
                 .as_ref()
                 .map(|result| {
@@ -2984,6 +3302,64 @@ fn render_page_target(
                 &[
                     ("page", serde_json::Value::from(page_num)),
                     ("rtt_ms", serde_json::Value::from(ms)),
+                    (
+                        "worker_render_ms",
+                        serde_json::Value::from(worker_render_ms),
+                    ),
+                    (
+                        "worker_serialize_ms",
+                        serde_json::Value::from(worker_serialize_ms),
+                    ),
+                    ("worker_write_ms", serde_json::Value::from(worker_write_ms)),
+                    ("parent_read_ms", serde_json::Value::from(parent_read_ms)),
+                    (
+                        "critical_path_ms",
+                        serde_json::Value::from(critical_path_ms),
+                    ),
+                    (
+                        "unaccounted_ms",
+                        serde_json::Value::from((ms - critical_path_ms).max(0.0)),
+                    ),
+                    (
+                        "timing_consistent",
+                        serde_json::Value::from(timing_consistent),
+                    ),
+                    (
+                        "metrics_available",
+                        serde_json::Value::from(metrics_available),
+                    ),
+                    (
+                        "response_bytes",
+                        serde_json::Value::from(worker.response_bytes),
+                    ),
+                    (
+                        "worker_wire_bytes",
+                        serde_json::Value::from(worker.wire_bytes),
+                    ),
+                    (
+                        "worker_write_calls",
+                        serde_json::Value::from(worker.write_calls),
+                    ),
+                    (
+                        "worker_flush_calls",
+                        serde_json::Value::from(worker.flush_calls),
+                    ),
+                    (
+                        "parent_wire_bytes",
+                        serde_json::Value::from(resp.parent_read.wire_bytes),
+                    ),
+                    (
+                        "parent_read_calls",
+                        serde_json::Value::from(resp.parent_read.read_calls),
+                    ),
+                    (
+                        "parent_pipe_bytes",
+                        serde_json::Value::from(resp.parent_read.pipe_bytes),
+                    ),
+                    (
+                        "parent_pipe_read_calls",
+                        serde_json::Value::from(resp.parent_read.pipe_read_calls),
+                    ),
                     ("render_w", serde_json::Value::from(render_w)),
                     ("render_h", serde_json::Value::from(render_h)),
                     ("render_long_px", serde_json::Value::from(render_long_px)),
@@ -3152,7 +3528,8 @@ pub fn enumerate_pages_async(pdf_path: &Path, password: Option<&str>) -> PdfEnum
                     0,
                     CancelWaitPolicy::AbortOnCancel,
                 );
-                let result = resp.and_then(|bytes| PdfWorkerPool::parse_enumerate_response(&bytes));
+                let result = resp
+                    .and_then(|response| PdfWorkerPool::parse_enumerate_response(&response.bytes));
                 let _ = tx.send(result);
             }) {
             Ok(_) => return PdfEnumerateHandle { cancel, rx },
@@ -3560,6 +3937,7 @@ C:\isolated\miv-data"#
                 swap_page_axes: true,
             },
             Some("secret"),
+            true,
         );
         match decode_request(&encoded).unwrap() {
             DecodedRequest::Render {
@@ -3570,15 +3948,99 @@ C:\isolated\miv-data"#
                         swap_page_axes,
                     },
                 password,
+                collect_metrics,
                 ..
             } => {
                 assert_eq!(page_num, 7);
                 assert_eq!(actual, viewport);
                 assert!(swap_page_axes);
                 assert_eq!(password.as_deref(), Some("secret"));
+                assert!(collect_metrics);
             }
             _ => panic!("unexpected decoded request"),
         }
+    }
+
+    #[test]
+    fn render_metrics_frame_roundtrip_preserves_worker_breakdown() {
+        let metrics = WorkerRenderMetrics {
+            render_us: 410_000,
+            serialize_us: 12_000,
+            write_us: 220_000,
+            response_bytes: 186_000_030,
+            wire_bytes: 186_000_034,
+            write_calls: 2,
+            flush_calls: 1,
+        };
+        let encoded = encode_worker_render_metrics(metrics);
+        assert_eq!(encoded.len(), RENDER_METRICS_LEN);
+        assert_eq!(decode_worker_render_metrics(&encoded).unwrap(), metrics);
+
+        let mut truncated = encoded;
+        truncated.pop();
+        assert!(decode_worker_render_metrics(&truncated).is_err());
+    }
+
+    #[test]
+    fn framed_write_and_pipe_read_counters_preserve_payload() {
+        let payload = vec![0x0a, 0x55, 0xaa, 0xff];
+        let mut writer = CountingWriter::new(Vec::new());
+        write_msg(&mut writer, &payload).unwrap();
+        let write = writer.snapshot();
+        assert_eq!(write.bytes, (payload.len() + 4) as u64);
+        assert_eq!(write.write_calls, 2);
+        assert_eq!(write.flush_calls, 1);
+
+        let mut reader = CountingReader::new(writer.inner.as_slice());
+        reader.begin_measurement();
+        assert_eq!(read_msg(&mut reader).unwrap(), payload);
+        let read = reader.finish_measurement();
+        assert_eq!(read.wire_bytes, write.bytes);
+        assert_eq!(read.read_calls, 2);
+    }
+
+    #[test]
+    fn render_timing_critical_path_counts_overlapping_transfer_once() {
+        let worker = WorkerRenderMetrics {
+            render_us: 400_000,
+            serialize_us: 20_000,
+            write_us: 250_000,
+            ..WorkerRenderMetrics::default()
+        };
+        let parent = ParentReadMetrics {
+            read_us: 240_000,
+            ..ParentReadMetrics::default()
+        };
+        let rtt_ms = 900.0;
+        let critical_path_ms = render_critical_path_ms(worker, parent);
+        assert_eq!(critical_path_ms, 670.0);
+        assert!(critical_path_ms <= rtt_ms);
+    }
+
+    #[test]
+    fn only_successful_instrumented_render_expects_a_metrics_frame() {
+        let plain = encode_render_request(
+            Path::new("sample.pdf"),
+            1,
+            PdfRenderTarget::LongEdge(1024),
+            Some(concat!("password-with-trailing-control-", "\u{1}")),
+            false,
+        );
+        let measured = encode_render_request(
+            Path::new("sample.pdf"),
+            1,
+            PdfRenderTarget::LongEdge(1024),
+            None,
+            true,
+        );
+        assert!(!render_request_collects_metrics(&plain));
+        assert!(render_request_collects_metrics(&measured));
+        assert!(!worker_metrics_frame_expected(
+            true,
+            &[STATUS_ERR, b'e', b'r', b'r']
+        ));
+        assert!(!worker_metrics_frame_expected(false, &[STATUS_OK]));
+        assert!(worker_metrics_frame_expected(true, &[STATUS_OK]));
     }
 
     #[test]
@@ -3733,7 +4195,7 @@ C:\isolated\miv-data"#
     fn make_test_job(
         priority: JobPriority,
         context_epoch: u64,
-    ) -> (Job, mpsc::Receiver<std::io::Result<Vec<u8>>>) {
+    ) -> (Job, mpsc::Receiver<std::io::Result<ProcessResponse>>) {
         let (tx, rx) = mpsc::channel();
         let job = Job {
             request: vec![],
@@ -3998,7 +4460,7 @@ C:\isolated\miv-data"#
     fn make_test_job_with_perf_key(
         priority: JobPriority,
         perf_key: Option<&str>,
-    ) -> (Job, mpsc::Receiver<std::io::Result<Vec<u8>>>) {
+    ) -> (Job, mpsc::Receiver<std::io::Result<ProcessResponse>>) {
         let (tx, rx) = mpsc::channel();
         let job = Job {
             request: vec![],
