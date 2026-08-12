@@ -1120,25 +1120,30 @@ impl App {
             );
             painter.rect_filled(filled, 2.0, egui::Color32::from_rgb(228, 228, 228));
         }
-        let tick_stroke = egui::Stroke::new(
-            crate::seek_ruler::SEEK_RULER_STROKE_WIDTH,
-            egui::Color32::from_gray(crate::seek_ruler::SEEK_RULER_GRAY),
-        );
         for tick in crate::seek_ruler::duration_ruler_ticks(
             dur,
             bar_rect.width(),
-            crate::seek_ruler::SEEK_RULER_MIN_SPACING,
+            crate::seek_ruler::SEEK_RULER_TIME_MIN_SPACING,
         ) {
             let x = bar_rect.min.x + bar_rect.width() * tick.fraction;
             let top = bar_rect.bottom() + crate::seek_ruler::SEEK_RULER_GAP;
-            let height = if tick.major {
-                crate::seek_ruler::SEEK_RULER_MAJOR_HEIGHT
+            let (height, gray) = if tick.major {
+                (
+                    crate::seek_ruler::SEEK_RULER_MAJOR_HEIGHT,
+                    crate::seek_ruler::SEEK_RULER_MAJOR_GRAY,
+                )
             } else {
-                crate::seek_ruler::SEEK_RULER_MINOR_HEIGHT
+                (
+                    crate::seek_ruler::SEEK_RULER_MINOR_HEIGHT,
+                    crate::seek_ruler::SEEK_RULER_MINOR_GRAY,
+                )
             };
             painter.line_segment(
                 [egui::pos2(x, top), egui::pos2(x, top + height)],
-                tick_stroke,
+                egui::Stroke::new(
+                    crate::seek_ruler::SEEK_RULER_STROKE_WIDTH,
+                    egui::Color32::from_gray(gray),
+                ),
             );
         }
         if dur > 0.0 {

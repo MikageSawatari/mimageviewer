@@ -10295,10 +10295,6 @@ impl App {
             4.0,
             egui::Color32::from_rgba_unmultiplied(112, 174, 255, 230),
         );
-        let tick_stroke = egui::Stroke::new(
-            crate::seek_ruler::SEEK_RULER_STROKE_WIDTH,
-            egui::Color32::from_gray(crate::seek_ruler::SEEK_RULER_GRAY),
-        );
         for tick in crate::seek_ruler::page_ruler_ticks(
             seek_unit_count,
             track_rect.width(),
@@ -10306,14 +10302,23 @@ impl App {
         ) {
             let x = fullscreen_seek_knob_x(track_rect, tick.fraction, is_rtl);
             let top = track_rect.bottom() + crate::seek_ruler::SEEK_RULER_GAP;
-            let height = if tick.major {
-                crate::seek_ruler::SEEK_RULER_MAJOR_HEIGHT
+            let (height, gray) = if tick.major {
+                (
+                    crate::seek_ruler::SEEK_RULER_MAJOR_HEIGHT,
+                    crate::seek_ruler::SEEK_RULER_MAJOR_GRAY,
+                )
             } else {
-                crate::seek_ruler::SEEK_RULER_MINOR_HEIGHT
+                (
+                    crate::seek_ruler::SEEK_RULER_MINOR_HEIGHT,
+                    crate::seek_ruler::SEEK_RULER_MINOR_GRAY,
+                )
             };
             painter.line_segment(
                 [egui::pos2(x, top), egui::pos2(x, top + height)],
-                tick_stroke,
+                egui::Stroke::new(
+                    crate::seek_ruler::SEEK_RULER_STROKE_WIDTH,
+                    egui::Color32::from_gray(gray),
+                ),
             );
         }
         painter.circle_filled(

@@ -3,15 +3,22 @@
 //! 呼び出し側は返された論理 fraction を各シークバー固有の方向規約で x 座標へ変換し、
 //! 描画だけを担当する。ここではページ番号と時間の「切りの良い」刻み選択を一元化する。
 
-/// 目盛り同士に確保する最小の論理間隔。
-pub(crate) const SEEK_RULER_MIN_SPACING: f32 = 8.0;
+/// ページ目盛りに確保する最小の論理間隔。
+pub(crate) const SEEK_RULER_MIN_SPACING: f32 = 16.0;
+/// 時間目盛りに確保する最小の論理間隔。
+///
+/// ページより広く取る。1 ページは利用者にとって数えられる単位だが、1 秒はそうではなく、
+/// 同じ間隔だと 2 分程度の動画で秒刻みが選ばれて櫛のようになる (実機 FB 2026-08-12)。
+pub(crate) const SEEK_RULER_TIME_MIN_SPACING: f32 = 48.0;
 /// トラック下端から目盛りまでの空き。
 pub(crate) const SEEK_RULER_GAP: f32 = 2.0;
-pub(crate) const SEEK_RULER_MINOR_HEIGHT: f32 = 3.0;
+pub(crate) const SEEK_RULER_MINOR_HEIGHT: f32 = 2.0;
 pub(crate) const SEEK_RULER_MAJOR_HEIGHT: f32 = 5.0;
 pub(crate) const SEEK_RULER_STROKE_WIDTH: f32 = 1.0;
-/// 3 面で共通に使う無彩色。トラックやつまみより弱く見せる。
-pub(crate) const SEEK_RULER_GRAY: u8 = 112;
+/// 小 / 大の無彩色。長さだけでは差が読み取れないので明度差も付ける (実機 FB 2026-08-12)。
+/// どちらもトラック (gray 74) やつまみより主張を弱くする。
+pub(crate) const SEEK_RULER_MINOR_GRAY: u8 = 92;
+pub(crate) const SEEK_RULER_MAJOR_GRAY: u8 = 168;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RulerTick {
@@ -127,14 +134,18 @@ fn time_tick_count(duration_secs: f64, step_secs: u64) -> Option<usize> {
     Some(intervals as usize + 1)
 }
 
+/// 小目盛りに対する大目盛りの刻み。
+///
+/// 「次の単位 (分 / 時 / 日)」固定にすると、1 秒刻みで大目盛りが 60 本に 1 本しか出ず、
+/// 目盛りが一様な櫛に見える (実機 FB 2026-08-12)。同じ許可系列の中から、小目盛りの
+/// 倍数かつ 4 倍以上の最小値を選び、4〜6 本ごとに大目盛りが来るようにする。
 fn time_major_step(step_secs: u64) -> u64 {
-    if step_secs < 60 {
-        60
-    } else if step_secs < 60 * 60 {
-        60 * 60
-    } else {
-        24 * 60 * 60
-    }
+    let step_secs = step_secs.max(1);
+    TIME_STEPS_SECS
+        .iter()
+        .copied()
+        .find(|&candidate| candidate >= step_secs.saturating_mul(4) && candidate % step_secs == 0)
+        .unwrap_or_else(|| step_secs.saturating_mul(5))
 }
 
 /// 再生時間から目盛りを作る。
@@ -255,6 +266,47 @@ mod tests {
         assert!(duration_ruler_ticks(0.0, 1000.0, 8.0).is_empty());
         assert!(page_ruler_ticks(10, 15.0, 8.0).is_empty());
         assert!(duration_ruler_ticks(60.0, 15.0, 8.0).is_empty());
+    }
+
+    #[test]
+    fn short_video_ruler_is_sparse_instead_of_one_tick_per_second() {
+        // 実機 FB 2026-08-12: 1:44 の動画が 1 秒刻み 105 本になり、大目盛りは 0 秒と 60 秒の
+        // 2 本だけで、一様な櫛に見えていた。
+        let ticks = duration_ruler_ticks(104.0, 1350.0, SEEK_RULER_TIME_MIN_SPACING);
+
+        assert!(ticks.len() <= 24, "got {} ticks", ticks.len());
+        assert!(ticks.iter().filter(|tick| tick.major).count() >= 3);
+    }
+
+    #[test]
+    fn time_major_ticks_stay_within_a_readable_number_of_minor_steps() {
+        for duration_secs in [30.0, 104.0, 600.0, 3600.0, 7200.0, 10.0 * 3600.0] {
+            let ticks = duration_ruler_ticks(duration_secs, 1350.0, SEEK_RULER_TIME_MIN_SPACING);
+            let majors = ticks
+                .iter()
+                .enumerate()
+                .filter(|(_, tick)| tick.major)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+
+            assert!(!majors.is_empty(), "duration={duration_secs}");
+            for pair in majors.windows(2) {
+                assert!(
+                    pair[1] - pair[0] <= 8,
+                    "duration={duration_secs} gap={}",
+                    pair[1] - pair[0]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn time_major_step_is_a_multiple_of_the_minor_step() {
+        for &step in TIME_STEPS_SECS.iter() {
+            let major = time_major_step(step);
+            assert_eq!(major % step, 0, "step={step} major={major}");
+            assert!(major >= step * 4, "step={step} major={major}");
+        }
     }
 
     #[test]
