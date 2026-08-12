@@ -31,6 +31,10 @@ const PAGE_JPEG_QUALITY: i32 = 85;
 /// Bump only when the native remote AI pipeline changes pixel semantics.
 const REMOTE_AI_PIPELINE_SCHEMA: u32 = 1;
 
+fn catalog_dims_are_landscape((width, height): (u32, u32)) -> bool {
+    width > height
+}
+
 /// Remote の表示ページ専用 encoder。サムネイル cache の WebP 形式とは共有しない。
 fn encode_remote_page_jpeg(
     image: &image::DynamicImage,
@@ -180,6 +184,56 @@ struct RemoteMaterializedEdits {
     export_crop: Option<crate::export_crop::CropSettings>,
     timing: crate::edit_source::EditSourceTiming,
     used_diffusion_fallback: bool,
+}
+
+/// Pixel coordinate space in which persisted crop and comic edits were authored.
+///
+/// `ThumbMsg::source_dims` is catalog-compatible metadata: it is original-raster pixels for
+/// regular images but PDF page-box fixed-point dimensions for layout/aspect calculations. A PDF
+/// must therefore ignore that metadata here and use the raster that was actually rendered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StoredEditSpace {
+    raster_dims: [usize; 2],
+}
+
+impl StoredEditSpace {
+    fn for_remote_source(
+        subresource: &RemoteSubresource,
+        rendered_raster_dims: [usize; 2],
+        decoded_layout_or_source_dims: Option<[usize; 2]>,
+    ) -> Self {
+        let raster_dims = match subresource {
+            RemoteSubresource::PdfPage { .. } => rendered_raster_dims,
+            _ => decoded_layout_or_source_dims.unwrap_or(rendered_raster_dims),
+        };
+        Self { raster_dims }
+    }
+
+    fn comic_composite(
+        self,
+        base: &Arc<egui::ColorImage>,
+        objects: &[comic_core::AnnotationObject],
+        fonts: &comic_core::FontSet,
+        stamp_cache: &mut HashMap<String, Option<Arc<comic_core::RgbaOverlay>>>,
+        cancel: &AtomicBool,
+    ) -> Arc<egui::ColorImage> {
+        crate::edit_source::comic_composite(
+            base,
+            objects,
+            self.raster_dims,
+            fonts,
+            stamp_cache,
+            cancel,
+        )
+    }
+
+    fn crop_rect(
+        self,
+        settings: crate::export_crop::CropSettings,
+        pixel_dims: [usize; 2],
+    ) -> crate::export_crop::CropRect {
+        crate::edit_source::export_crop_rect_for_pixels(settings, self.raster_dims, pixel_dims)
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -2208,7 +2262,7 @@ impl ContainerEngine {
             .ok_or_else(|| {
                 RemoteAiRunError::Failed("address does not identify an image page".to_owned())
             })?;
-            let (source, source_dims) = decode_source(
+            let (source, decoded_source_dims) = decode_source(
                 self,
                 &page.address,
                 &resolved,
@@ -2216,6 +2270,11 @@ impl ContainerEngine {
                 page_index,
                 cancel,
             )?;
+            let stored_edit_space = StoredEditSpace::for_remote_source(
+                &page.address.subresource,
+                source.size,
+                Some(decoded_source_dims),
+            );
             check_remote_ai_cancel(cancel)?;
             let pre_ai_edit_fingerprint = prepared.edits.pre_ai_fingerprint;
             let materialized = self
@@ -2348,10 +2407,9 @@ impl ContainerEngine {
             if !materialized.comic.is_empty()
                 && let Some(fonts) = crate::comic_overlay::load_comic_fonts_for(&materialized.comic)
             {
-                pixels = crate::edit_source::comic_composite(
+                pixels = stored_edit_space.comic_composite(
                     &pixels,
                     &materialized.comic,
-                    source_dims,
                     &fonts,
                     &mut self
                         .comic_stamp_cache
@@ -2361,8 +2419,7 @@ impl ContainerEngine {
                 );
             }
             if let Some(crop) = materialized.export_crop {
-                let rect =
-                    crate::edit_source::export_crop_rect_for_pixels(crop, source_dims, pixels.size);
+                let rect = stored_edit_space.crop_rect(crop, pixels.size);
                 pixels = Arc::new(
                     crate::export_crop::crop_color_image(&pixels, rect)
                         .map_err(|error| RemoteAiRunError::Failed(error.to_string()))?,
@@ -3266,7 +3323,9 @@ impl ContainerEngine {
                             .source_dims
                             .or_else(|| crate::catalog::decode_thumb_dims(&entry.jpeg_data))
                     })
-                    .is_some_and(|(width, height)| width > height)
+                    // Catalog dimensions are a layout/aspect space. PDF page-box values are valid
+                    // here because only their ratio is observed; they are not an edit coordinate.
+                    .is_some_and(catalog_dims_are_landscape)
             })
             .collect()
     }
@@ -3505,9 +3564,11 @@ impl ContainerEngine {
                     )
                 }
             })?;
-        let source_dims = decoded_source_dims
-            .map(|(width, height)| [width as usize, height as usize])
-            .unwrap_or(color_image.size);
+        let stored_edit_space = StoredEditSpace::for_remote_source(
+            &address.subresource,
+            color_image.size,
+            decoded_source_dims.map(|(width, height)| [width as usize, height as usize]),
+        );
         let auto_trim_bbox = match cached_auto_trim_bbox {
             Some(bbox) => bbox,
             None if detect_auto_trim => {
@@ -3546,10 +3607,9 @@ impl ContainerEngine {
             if !materialized.comic.is_empty()
                 && let Some(fonts) = crate::comic_overlay::load_comic_fonts_for(&materialized.comic)
             {
-                pixels = crate::edit_source::comic_composite(
+                pixels = stored_edit_space.comic_composite(
                     &pixels,
                     &materialized.comic,
-                    source_dims,
                     &fonts,
                     &mut self
                         .comic_stamp_cache
@@ -3559,8 +3619,7 @@ impl ContainerEngine {
                 );
             }
             if let Some(crop) = materialized.export_crop {
-                let rect =
-                    crate::edit_source::export_crop_rect_for_pixels(crop, source_dims, pixels.size);
+                let rect = stored_edit_space.crop_rect(crop, pixels.size);
                 pixels = Arc::new(crate::export_crop::crop_color_image(&pixels, rect).map_err(
                     |error| {
                         crate::logger::log(format!("remote_ipc: export crop failed: {error}"));
@@ -4505,6 +4564,60 @@ mod tests {
     use super::*;
     use crate::settings::FavoriteEntry;
     use std::io::{Cursor, Write};
+
+    fn stored_edit_test_crop() -> crate::export_crop::CropSettings {
+        crate::export_crop::CropSettings {
+            rect: crate::export_crop::CropRect {
+                min_x: 14.0,
+                min_y: 22.0,
+                max_x: 126.0,
+                max_y: 198.0,
+            },
+            aspect_mode: crate::export_crop::CropAspectMode::Free,
+        }
+    }
+
+    fn stored_edit_test_raster(size: [usize; 2]) -> egui::ColorImage {
+        egui::ColorImage::new(size, vec![egui::Color32::BLUE; size[0] * size[1]])
+    }
+
+    #[test]
+    fn pdf_saved_crop_uses_rendered_raster_not_catalog_layout_dimensions() {
+        let raster = stored_edit_test_raster([140, 220]);
+        let stored_edit_space = StoredEditSpace::for_remote_source(
+            &RemoteSubresource::PdfPage { page_number: 0 },
+            raster.size,
+            // Representative PDF catalog page-box values are orders of magnitude larger than
+            // the rendered raster. Treating these as edit coordinates caused the 1/140 crop.
+            Some([468_600, 714_360]),
+        );
+
+        assert_eq!(stored_edit_space.raster_dims, raster.size);
+        let crop = stored_edit_space.crop_rect(stored_edit_test_crop(), raster.size);
+        let output = crate::export_crop::crop_color_image(&raster, crop).unwrap();
+        assert_eq!(output.size, [112, 176]);
+    }
+
+    #[test]
+    fn regular_image_saved_crop_keeps_original_pixel_coordinate_space() {
+        let raster = stored_edit_test_raster([70, 110]);
+        let stored_edit_space = StoredEditSpace::for_remote_source(
+            &RemoteSubresource::File,
+            raster.size,
+            Some([140, 220]),
+        );
+
+        assert_eq!(stored_edit_space.raster_dims, [140, 220]);
+        let crop = stored_edit_space.crop_rect(stored_edit_test_crop(), raster.size);
+        let output = crate::export_crop::crop_color_image(&raster, crop).unwrap();
+        assert_eq!(output.size, [56, 88]);
+    }
+
+    #[test]
+    fn catalog_dimensions_remain_valid_for_landscape_ratio_classification() {
+        assert!(!catalog_dims_are_landscape((468_600, 714_360)));
+        assert!(catalog_dims_are_landscape((714_360, 468_600)));
+    }
 
     #[test]
     fn page_render_observes_the_registry_job_token() {

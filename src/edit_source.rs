@@ -388,7 +388,7 @@ fn page_key_for_pdf(path: &Path, page_number: u32) -> String {
 pub(crate) fn comic_composite(
     base: &Arc<egui::ColorImage>,
     objects: &[comic_core::AnnotationObject],
-    source_dims: [usize; 2],
+    stored_edit_space: [usize; 2],
     fonts: &comic_core::FontSet,
     stamp_cache: &mut std::collections::HashMap<String, Option<Arc<comic_core::RgbaOverlay>>>,
     cancel: &AtomicBool,
@@ -396,8 +396,10 @@ pub(crate) fn comic_composite(
     if objects.is_empty() || cancel.load(Ordering::Relaxed) {
         return Arc::clone(base);
     }
-    let scale =
-        base.size[0].max(base.size[1]) as f32 / source_dims[0].max(source_dims[1]).max(1) as f32;
+    // Saved annotation coordinates use the original raster's pixel space. Catalog layout/aspect
+    // dimensions (notably PDF page-box fixed-point values) must never be passed here.
+    let scale = base.size[0].max(base.size[1]) as f32
+        / stored_edit_space[0].max(stored_edit_space[1]).max(1) as f32;
     let scaled = if (scale - 1.0).abs() > 1e-4 {
         comic_core::scale_scene(objects, scale)
     } else {
@@ -414,14 +416,16 @@ pub(crate) fn comic_composite(
 
 pub(crate) fn export_crop_rect_for_pixels(
     settings: crate::export_crop::CropSettings,
-    source_dims: [usize; 2],
+    stored_edit_space: [usize; 2],
     pixel_dims: [usize; 2],
 ) -> crate::export_crop::CropRect {
-    if source_dims == pixel_dims {
+    // Crop rectangles are persisted in original-raster pixel coordinates, not catalog
+    // layout/aspect coordinates. Keep the name explicit at this shared boundary.
+    if stored_edit_space == pixel_dims {
         return settings.rect;
     }
-    let sx = pixel_dims[0] as f32 / source_dims[0].max(1) as f32;
-    let sy = pixel_dims[1] as f32 / source_dims[1].max(1) as f32;
+    let sx = pixel_dims[0] as f32 / stored_edit_space[0].max(1) as f32;
+    let sy = pixel_dims[1] as f32 / stored_edit_space[1].max(1) as f32;
     crate::export_crop::CropRect {
         min_x: settings.rect.min_x * sx,
         min_y: settings.rect.min_y * sy,

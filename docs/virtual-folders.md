@@ -425,6 +425,9 @@ PDF ワーカーの render 結果は raster に加えて、PDFium が読んだ�
 整数丸め誤差を避け、フルスクリーンの通過 rendition と完成 raster を同一矩形へ配置するためである。
 通常画像と ZIP / 変換 archive 内画像は従来どおり decode 後の元画素寸法を保存する。動画サムネイルは
 catalog のこの生成経路を通らず、fullscreen も poster thumbnail へフォールバックしないため対象外。
+この PDF の `source_width/source_height` はレイアウトと縦横比のための座標軸であり、crop や
+コミック注釈など保存済み編集の絶対座標には使わない。保存済み編集は、そのページを実際に描画した
+元ラスタのピクセル座標を基準にする。
 
 この意味変更より前のリリース済み catalog は PDF 行に thumbnail 自身の寸法を持つ。元の page box は
 WebP から復元できないため、`pdf_layout_dims_version` の初回 migration で PDF 仮想 catalog のページ行と
