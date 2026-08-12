@@ -152,8 +152,9 @@ const PAGE_BOUNDARY_MESSAGE_DURATION_MS = 2400;
 const VIEWER_EXIT_HISTORY_TIMEOUT_MS = 250;
 // Matches the server's MAX_CONCURRENT_PAGE_PREFETCH. Three ceilings sit in
 // series -- this one, that one, and the core's remote heavy workers -- so the
-// lowest wins and raising one alone does nothing. Measured: a third concurrent
-// render earns a quarter more pages a second, a fourth earns five percent.
+// lowest wins and raising one alone does nothing. Measured with three actually
+// running, page supply went 0.99 to 1.02 a second: the PC is saturated at two,
+// so this is not the way to make pages arrive faster.
 const PAGE_PREFETCH_CONCURRENCY = 3;
 const CONTAINER_SPREAD_REFRESH_FAILURE_MESSAGE =
   "見開き表示を更新できませんでした。";

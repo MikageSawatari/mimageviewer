@@ -49,10 +49,18 @@ const TELEMETRY_WINDOW: Duration = Duration::from_secs(60);
 pub const HTTP_WORKER_COUNT: usize = 12;
 pub const MAX_CONCURRENT_IPC: usize = 6;
 pub const MAX_CONCURRENT_HEAVY_IPC: usize = 4;
-/// Three, measured: on 46-megapixel pages the core needs 44ms per megapixel with
-/// two renders in flight, 52ms with three and 66ms with four, so page supply goes
-/// 0.99, 1.26 and 1.32 a second. The third render earns a quarter more pages; the
-/// fourth earns five percent and takes more of a machine its owner may be using.
+/// Three, but do not expect page supply to follow. Measured with three actually
+/// running: a 46-megapixel page takes 2952ms against 2016ms at two, which is
+/// 1.02 pages a second against 0.99. The machine is already saturated at two,
+/// so the extra render buys back only what it costs.
+///
+/// An earlier reading of 1.26 pages a second at "concurrency three" was taken
+/// from samples that were two prefetches overlapping one foreground page, not
+/// three renders competing. Sustained prefetch is the case that matters here.
+///
+/// The number stays at three because it is no longer the binding ceiling and
+/// costs nothing; supply is bound by rasterising and encoding. Shifting that
+/// work earlier is the only lever left.
 ///
 /// This ceiling only binds when the other two move with it. The browser starts at
 /// most `PAGE_PREFETCH_CONCURRENCY` fetches, and the core hands prefetch at most
