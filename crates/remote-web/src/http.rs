@@ -49,7 +49,13 @@ const TELEMETRY_WINDOW: Duration = Duration::from_secs(60);
 pub const HTTP_WORKER_COUNT: usize = 12;
 pub const MAX_CONCURRENT_IPC: usize = 6;
 pub const MAX_CONCURRENT_HEAVY_IPC: usize = 4;
-pub const MAX_CONCURRENT_PAGE_PREFETCH: usize = 2;
+/// Three, because a fourth buys almost nothing. Rendering one 46-megapixel page
+/// costs the core 44ms per megapixel alone, 52ms with three in flight, and 66ms
+/// with four: page supply measures 0.99/s, 1.26/s and 1.32/s at those widths, so
+/// the machine is already CPU-bound at three and the last slot returns 5%.
+/// Prefetch still stops one below `MAX_CONCURRENT_HEAVY_IPC`, so a page the
+/// reader is waiting for never queues behind speculation.
+pub const MAX_CONCURRENT_PAGE_PREFETCH: usize = 3;
 pub const MAX_CONCURRENT_STREAM_IPC: usize = 4;
 const IPC_RETRY_AFTER_SECONDS: u64 = 1;
 
