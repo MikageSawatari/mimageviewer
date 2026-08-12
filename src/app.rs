@@ -4329,6 +4329,10 @@ impl Drop for ConvertedArchiveCachePathsPending {
 
 struct ConvertedArchiveCachePathsResult {
     paths: std::collections::HashMap<String, PathBuf>,
+    /// (item index, normalized source archive key) pairs for tiles whose
+    /// folder-thumb pin resolution needs paths to build its LoadRequest.
+    /// The indices are safe to apply only while generation still matches.
+    pin_archive_dependencies: Vec<(usize, String)>,
     peeked: usize,
     hits: usize,
     elapsed_ms: f64,
@@ -23091,7 +23095,10 @@ impl App {
         if let Some(pending) = self.converted_archive_cache_paths_pending.take() {
             pending.cancel();
         }
-        self.converted_archive_cache_paths.clear();
+        // Keep the previous snapshot usable until the worker publishes its replacement.
+        // Keys are normalized source archive paths, so entries from the previous folder
+        // cannot resolve an unrelated tile. Clearing here used to create an empty window
+        // in which a folder pin fell back to (and permanently loaded) its base thumbnail.
         // サブ展開は Image / Video / Folder / ZipFile / PdfFile だけで、ConvertibleArchive は
         // 取り込まない。数百万件を判定しても必ず空なので synthetic path で即終了する。
         if self.current_folder.as_ref().is_some_and(|folder| {
@@ -23126,12 +23133,13 @@ impl App {
             .collect();
         // Folder タイル自身の pin が指す変換対象アーカイブは current items に現れない。
         // container root だけを snapshot し、DB lookup + cascade + metadata は worker 側で行う。
-        let pin_roots: Vec<PathBuf> = self
+        let pin_roots: Vec<(usize, PathBuf)> = self
             .items
             .iter()
-            .filter_map(|item| {
+            .enumerate()
+            .filter_map(|(idx, item)| {
                 self.folder_pin_lookup_target_for_item(item)
-                    .map(|target| target.path)
+                    .map(|target| (idx, target.path))
             })
             .collect();
         let pin_db = self.folder_thumb_pin_db.clone();
@@ -23150,6 +23158,7 @@ impl App {
             .spawn(move || {
                 let t0 = std::time::Instant::now();
                 let mut paths = std::collections::HashMap::new();
+                let mut pin_archive_dependencies = Vec::new();
                 let mut peeked = 0usize;
                 let mut hits = 0usize;
                 let mut candidates: std::collections::HashMap<String, (PathBuf, i64, i64)> =
@@ -23161,7 +23170,7 @@ impl App {
                     );
                 }
                 if let Some(pin_db) = pin_db.as_deref() {
-                    for root in pin_roots {
+                    for (idx, root) in pin_roots {
                         if worker_cancel.load(Ordering::Relaxed) {
                             return;
                         }
@@ -23178,10 +23187,21 @@ impl App {
                         else {
                             continue;
                         };
-                        if crate::folder_tree::is_convertible_archive_path(&resolved.abs_path) {
-                            candidates
-                                .entry(crate::path_key::normalize_keep_drive(&resolved.abs_path))
-                                .or_insert((resolved.abs_path, resolved.mtime, resolved.file_size));
+                        if matches!(
+                            resolved.kind,
+                            crate::folder_thumb_pins::ResolvedKind::ArchiveFirstImage
+                                | crate::folder_thumb_pins::ResolvedKind::ZipEntry
+                                | crate::folder_thumb_pins::ResolvedKind::ZipDirRepresentative
+                        ) && crate::folder_tree::is_convertible_archive_path(&resolved.abs_path)
+                        {
+                            let archive_key =
+                                crate::path_key::normalize_keep_drive(&resolved.abs_path);
+                            pin_archive_dependencies.push((idx, archive_key.clone()));
+                            candidates.entry(archive_key).or_insert((
+                                resolved.abs_path,
+                                resolved.mtime,
+                                resolved.file_size,
+                            ));
                         }
                     }
                 }
@@ -23233,6 +23253,7 @@ impl App {
                 if !worker_cancel.load(Ordering::Relaxed) {
                     let _ = tx.send(ConvertedArchiveCachePathsResult {
                         paths,
+                        pin_archive_dependencies,
                         peeked,
                         hits,
                         elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
@@ -23286,12 +23307,36 @@ impl App {
                 ],
             );
         }
-        let should_rebuild_visible = self.settings.facet_filter.has_rollup_edit_filter();
-        self.converted_archive_cache_paths = result.paths;
-        if should_rebuild_visible {
-            self.rebuild_visible_indices();
+        if self.converted_archive_cache_paths != result.paths {
+            let changed_keys: std::collections::HashSet<String> = self
+                .converted_archive_cache_paths
+                .keys()
+                .chain(result.paths.keys())
+                .filter(|key| {
+                    self.converted_archive_cache_paths.get(*key) != result.paths.get(*key)
+                })
+                .cloned()
+                .collect();
+            let mut dependent_indices: Vec<usize> = result
+                .pin_archive_dependencies
+                .iter()
+                .filter_map(|(idx, archive_key)| changed_keys.contains(archive_key).then_some(*idx))
+                .collect();
+            dependent_indices.sort_unstable();
+            dependent_indices.dedup();
+
+            self.converted_archive_cache_paths = result.paths;
+            for idx in dependent_indices {
+                self.evict_thumbnail_for_reload(idx);
+            }
+            if self.settings.facet_filter.has_rollup_edit_filter() {
+                self.rebuild_visible_indices();
+            }
+            // This is deliberately driven only by a value change. A subsequent refresh
+            // that returns the same snapshot performs no eviction, so this cannot become
+            // a reload -> refresh -> eviction loop (and never uses folder_thumb_pin_dirty).
+            ctx.request_repaint();
         }
-        ctx.request_repaint();
     }
 
     /// Phase C: フォルダピンの source が Video のときに、`video_pins` DB の WebP を
@@ -26132,7 +26177,7 @@ impl App {
         }
         if let Some(page) = result.page_state.take() {
             for index in &page.thumbnail_reset_indices {
-                self.evict_thumbnail_for_edit_preview_refresh(*index);
+                self.evict_thumbnail_for_reload(*index);
             }
             self.adjustment_page_params = page.adjustment_page_params;
             self.local_adjust_pages = page.local_adjust_pages;
@@ -26710,7 +26755,7 @@ impl App {
             .filter_map(|(&idx, key)| matches_key(key).then_some(idx))
             .collect::<Vec<_>>();
         for idx in affected {
-            self.evict_thumbnail_for_edit_preview_refresh(idx);
+            self.evict_thumbnail_for_reload(idx);
         }
     }
 
@@ -50932,7 +50977,9 @@ impl App {
         self.enqueue_edit_preview_close_update(update);
     }
 
-    fn evict_thumbnail_for_edit_preview_refresh(&mut self, idx: usize) {
+    /// Remove every queued/materialized form of one grid thumbnail and make it
+    /// eligible for a fresh LoadRequest on the next keep-range update.
+    fn evict_thumbnail_for_reload(&mut self, idx: usize) {
         for queue in [&self.reload_queue, &self.heavy_io_queue]
             .into_iter()
             .flatten()
@@ -50984,7 +51031,7 @@ impl App {
                 }),
         );
         for idx in invalidated {
-            self.evict_thumbnail_for_edit_preview_refresh(idx);
+            self.evict_thumbnail_for_reload(idx);
         }
         self.thumb_edit_preview_keys.clear();
         self.edit_preview_refresh_pending.clear();
@@ -51037,7 +51084,7 @@ impl App {
                 })
                 .collect();
             for idx in matching {
-                self.evict_thumbnail_for_edit_preview_refresh(idx);
+                self.evict_thumbnail_for_reload(idx);
             }
         }
     }
@@ -51054,7 +51101,7 @@ impl App {
                 crate::edit_preview_cache::EditPreviewEvent::Saved { item_key } => {
                     let matching = self.thumbnail_indices_for_edit_preview_key(&item_key);
                     for idx in matching {
-                        self.evict_thumbnail_for_edit_preview_refresh(idx);
+                        self.evict_thumbnail_for_reload(idx);
                     }
                     self.edit_preview_refresh_pending.insert(
                         item_key,
@@ -51064,7 +51111,7 @@ impl App {
                 crate::edit_preview_cache::EditPreviewEvent::Invalidated { item_key } => {
                     let matching = self.thumbnail_indices_for_edit_preview_key(&item_key);
                     for idx in matching {
-                        self.evict_thumbnail_for_edit_preview_refresh(idx);
+                        self.evict_thumbnail_for_reload(idx);
                     }
                     self.edit_preview_refresh_pending.remove(&item_key);
                 }
@@ -51113,7 +51160,7 @@ impl App {
                     self.thumbnails.get(idx),
                     Some(ThumbnailState::Loaded { .. }) | Some(ThumbnailState::Failed)
                 ) {
-                    self.evict_thumbnail_for_edit_preview_refresh(idx);
+                    self.evict_thumbnail_for_reload(idx);
                 }
             }
         }

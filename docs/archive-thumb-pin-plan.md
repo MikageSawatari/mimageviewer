@@ -129,6 +129,10 @@ resolve_folder_thumb_image: folder=...\03_rar ... pin_aware=true -> <none>   ←
 
 - 推奨: **worker 側で cascade を解決**し、経路上に現れた変換対象アーカイブのパスを全部集める。
   worker は UI スレッド外で、pin DB も archive_cache DB も開ける
+- refresh 開始時は現在の map を clear せず、worker 結果で置き換える。worker は archive path
+  だけでなく、その path に pin 解決が依存する item index も返す。poll は旧/new map の差分 key
+  に依存するタイルだけを共通 thumbnail reload helper で Evicted に戻す。同じ map の再適用では
+  何もしないため、`folder_thumb_pin_dirty` / `load_folder` の再帰ループを作らない
 - 最小実装 (1 段だけ) にする場合は、`folder_pin_map` の値から
   `container.join(rel)` が変換対象拡張子のものを集める。多段 cascade は将来対応として
   この doc に残すこと

@@ -434,8 +434,18 @@ WebP から復元できないため、`pdf_layout_dims_version` の初回 migrat
 `install_new_items` で現在 items の path/mtime/size と、folder thumb pin を引く container root
 だけを snapshot する。SQLite `peek`、cache ZIP の `exists()`、pin の DB lookup・cascade・stat は
 `ConvertedArchiveCachePathsPending` worker で解決し、最終 leaf が RAR / 7z / LZH のときだけ
-対応表へ加える。worker 完了前は
-`make_load_request` が `None` を返し、サムネは Pending のまま次の repaint で再試行される。
+対応表へ加える。refresh 開始時には現行 map を clear せず、worker の新しい snapshot が届くまで
+前の値を保つ。key は正規化済み元アーカイブ path なので、別フォルダ由来の値が無関係なタイルへ
+誤適用されることはない。
+
+worker 完了前、直接の `ConvertibleArchive` タイルは `make_load_request` が `None` を返して
+Pending のまま再試行される。一方、Folder タイルの pin が変換対象アーカイブへ解決される場合は
+base request へ fallback できるため、その request が先に Loaded へ進むことがある。worker は
+pin 解決と同時に `(item index, archive key)` の依存集合も返し、poll で map の値が実際に変わった
+key に依存するタイルだけを Evicted に戻す。reload/heavy queue と `requested` も通常の thumbnail
+再要求 helper で同時に外し、次の keep-range update が新 map から request を組み直す。
+同じ map が再度届いた場合は失効を行わないため、この handoff は `load_folder` や
+`folder_thumb_pin_dirty` を介さず有限回で収束する。
 この経路で `make_load_request` から `archive_cache.db` やファイルシステムを直接触らないこと。
 
 **キャッシュキーの命名規則**を勝手に変えないこと。Folder 自動代表は選定

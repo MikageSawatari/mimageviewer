@@ -15774,6 +15774,241 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn archive_cache_arrival_reloads_the_dependent_folder_pin_only_once() {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("shelf");
+        std::fs::create_dir_all(&folder).unwrap();
+        let src = folder.join("book.7z");
+        let cached = app.tmp.path().join("book.zip");
+        let unrelated = app.tmp.path().join("unrelated.png");
+        std::fs::write(&src, b"archive").unwrap();
+        std::fs::write(&cached, b"cached zip").unwrap();
+        std::fs::write(&unrelated, b"image").unwrap();
+        let src_meta = std::fs::metadata(&src).unwrap();
+        let src_mtime = crate::ui_helpers::mtime_secs(&src_meta);
+        let src_size = src_meta.len() as i64;
+        app.archive_cache_db
+            .as_ref()
+            .unwrap()
+            .record(
+                &src,
+                src_mtime,
+                src_size,
+                crate::archive_converter::ArchiveFormat::SevenZ,
+                &cached,
+                std::fs::metadata(&cached).unwrap().len() as i64,
+                1,
+                false,
+            )
+            .unwrap();
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &folder,
+                &FolderPinSource::File {
+                    rel: "book.7z".to_string(),
+                    kind: FileKind::ConvertibleArchive,
+                },
+            )
+            .unwrap();
+
+        let folder_meta = std::fs::metadata(&folder).unwrap();
+        let folder_mtime = crate::ui_helpers::mtime_secs(&folder_meta);
+        let folder_size = folder_meta.len() as i64;
+        let unrelated_meta = std::fs::metadata(&unrelated).unwrap();
+        app.install_new_items(
+            vec![GridItem::Folder(folder.clone()), GridItem::Image(unrelated)],
+            vec![
+                Some((folder_mtime, folder_size)),
+                Some((
+                    crate::ui_helpers::mtime_secs(&unrelated_meta),
+                    unrelated_meta.len() as i64,
+                )),
+            ],
+        );
+        assert!(app.converted_archive_cache_paths.is_empty());
+        let fallback = make_load_request(
+            &app.items[0],
+            0,
+            folder_mtime,
+            folder_size,
+            false,
+            None,
+            Some(crate::settings::SortOrder::FileName),
+            app.settings.folder_thumb_depth,
+            &app.folder_pin_map,
+            &app.converted_archive_cache_paths,
+            None,
+            None,
+            app.folder_thumb_pin_db.as_deref(),
+            app.video_pin_db.as_ref(),
+            false,
+        )
+        .expect("the initial empty map must build the folder fallback request");
+        assert_eq!(fallback.path, folder);
+        assert_eq!(fallback.resolve_override, None);
+        assert!(!fallback.cache_key_override.unwrap().contains("#pin:"));
+
+        let ctx = egui::Context::default();
+        let tex = ctx.load_texture(
+            "archive_pin_async_fallback",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let loaded = || ThumbnailState::Loaded {
+            tex: tex.clone(),
+            from_cache: false,
+            from_edit_preview: false,
+            rendered_at_px: 1,
+            source_dims: Some((1, 1)),
+        };
+        app.thumbnails = vec![loaded(), loaded()];
+        app.requested.insert(0, false);
+        app.requested.insert(1, false);
+        let reload_queue: Arc<NotifyQueue> = Arc::new((
+            Mutex::new(vec![
+                LoadRequest {
+                    idx: 0,
+                    ..Default::default()
+                },
+                LoadRequest {
+                    idx: 1,
+                    ..Default::default()
+                },
+            ]),
+            Condvar::new(),
+        ));
+        let heavy_io_queue: Arc<NotifyQueue> = Arc::new((
+            Mutex::new(vec![
+                LoadRequest {
+                    idx: 0,
+                    ..Default::default()
+                },
+                LoadRequest {
+                    idx: 1,
+                    ..Default::default()
+                },
+            ]),
+            Condvar::new(),
+        ));
+        app.reload_queue = Some(Arc::clone(&reload_queue));
+        app.heavy_io_queue = Some(Arc::clone(&heavy_io_queue));
+        for _ in 0..100 {
+            app.poll_converted_archive_cache_paths(&ctx);
+            if app.converted_archive_cache_paths_pending.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(app.converted_archive_cache_paths_pending.is_none());
+        assert_eq!(
+            app.converted_archive_cache_paths
+                .get(&crate::path_key::normalize_keep_drive(&src)),
+            Some(&cached)
+        );
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
+        assert!(!app.requested.contains_key(&0));
+        assert!(matches!(app.thumbnails[1], ThumbnailState::Loaded { .. }));
+        assert!(app.requested.contains_key(&1));
+        assert_eq!(
+            reload_queue
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|req| req.idx)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(
+            heavy_io_queue
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|req| req.idx)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+
+        let rebuilt = make_load_request(
+            &app.items[0],
+            0,
+            folder_mtime,
+            folder_size,
+            false,
+            None,
+            Some(crate::settings::SortOrder::FileName),
+            app.settings.folder_thumb_depth,
+            &app.folder_pin_map,
+            &app.converted_archive_cache_paths,
+            None,
+            None,
+            app.folder_thumb_pin_db.as_deref(),
+            app.video_pin_db.as_ref(),
+            false,
+        )
+        .expect("the rebuilt request must use the worker-supplied archive cache");
+        assert_eq!(rebuilt.path, cached);
+        assert_eq!(
+            rebuilt.resolve_override,
+            Some(crate::thumb_loader::ResolveStrategy::ZipFirstImage)
+        );
+
+        app.thumbnails[0] = loaded();
+        app.requested.insert(0, false);
+        reload_queue.0.lock().unwrap().push(LoadRequest {
+            idx: 0,
+            ..Default::default()
+        });
+        heavy_io_queue.0.lock().unwrap().push(LoadRequest {
+            idx: 0,
+            ..Default::default()
+        });
+        let first_snapshot = app.converted_archive_cache_paths.clone();
+        app.start_converted_archive_cache_paths_refresh();
+        assert_eq!(
+            app.converted_archive_cache_paths, first_snapshot,
+            "refresh must keep the previous map while the worker is running"
+        );
+        for _ in 0..100 {
+            app.poll_converted_archive_cache_paths(&ctx);
+            if app.converted_archive_cache_paths_pending.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(app.converted_archive_cache_paths_pending.is_none());
+        assert_eq!(app.converted_archive_cache_paths, first_snapshot);
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
+        assert!(
+            app.requested.contains_key(&0),
+            "an identical map must not schedule another reload"
+        );
+        assert!(
+            reload_queue
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|req| req.idx == 0)
+        );
+        assert!(
+            heavy_io_queue
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|req| req.idx == 0)
+        );
+    }
+
+    #[test]
     fn convertible_archive_pin_uses_cached_zip_entry_thumb_request() {
         use crate::folder_thumb_pins::FolderPinSource;
         use crate::grid_item::GridItem;
