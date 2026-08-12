@@ -28401,19 +28401,28 @@ impl App {
         });
 
         let export_crop = if let Some(idx) = idx {
-            self.export_crop_page_settings
-                .get(&idx)
-                .map(|settings| settings.rect)
+            let settings = self.export_crop_page_settings.get(&idx).copied();
+            if settings.is_some_and(|settings| settings.valid_source_size().is_none()) {
+                let fallback_size = self
+                    .current_raw_source_pixels(idx)
+                    .map(|pixels| pixels.size);
+                fallback_size
+                    .and_then(|size| self.ensure_export_crop_source_size(idx, size))
+                    .or(settings)
+            } else {
+                settings
+            }
         } else {
-            self.export_crop_db
-                .as_ref()
-                .and_then(|db| db.get(key))
-                .map(|settings| settings.rect)
+            self.export_crop_db.as_ref().and_then(|db| db.get(key))
         };
-        let crop_source_dims = idx.and_then(|idx| {
-            self.current_raw_source_pixels(idx)
-                .map(|pixels| pixels.size)
-        });
+        let crop_legacy_writeback = export_crop
+            .filter(|settings| settings.valid_source_size().is_none())
+            .map(|_| {
+                (
+                    crate::data_dir::get().join("export_crop.db"),
+                    key.to_string(),
+                )
+            });
 
         let erase = erase_mask.map(|mask| {
             self.ensure_ai_runtime();
@@ -28447,7 +28456,7 @@ impl App {
             comic,
             comic_source_dims,
             export_crop,
-            crop_source_dims,
+            crop_legacy_writeback,
             format: self.settings.capture_format,
             jpeg_matte: crate::capture::JpegMatte::from_fs_transparent_bg_mode(
                 self.fs_transparent_bg_mode,
@@ -28583,7 +28592,7 @@ impl App {
 
     #[allow(dead_code)] // Legacy export variant path; final composite is used in v1.1.0 P1.
     fn capture_job_with_conceal(
-        &self,
+        &mut self,
         idx: usize,
         job: crate::capture::CapturePixelJob,
     ) -> crate::capture::CapturePixelJob {

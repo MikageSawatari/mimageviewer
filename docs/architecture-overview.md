@@ -188,7 +188,7 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `local_adjust_db.rs` | 補正レイヤー配列をページ単位 JSON として `local_adjust.db` へ保存し、`mimageviewer.dat` に復元用バックアップをミラーする |
 | `local_adjust_catalog.rs` | 補正レイヤー効果ピッカー用の効果一覧・検索・デフォルト効果生成 |
 | `local_adjust_effect_ui.rs` | `local_adjust_lab` から移植した各 `LocalEffect` のパラメータ UI |
-| `export_crop.rs` | 切り取り (crop) の矩形・アスペクト・ページ単位の切り出しと `export_crop.db` 永続化。通常表示は crop 外暗転 overlay のみで、実際の切り出しは Ctrl+S コピー / Ctrl+E 書き出しの最終段に行う |
+| `export_crop.rs` | 切り取り (crop) の矩形・アスペクト・矩形作成時の基準ラスタ寸法、ページ単位の切り出しと `export_crop.db` 永続化を所有する。通常表示は crop 外暗転 overlay のみで、実際の切り出しは Ctrl+S コピー / Ctrl+E 書き出しの最終段に行う。旧行の nullable 基準寸法は最初の利用可能ラスタで遅延移行する |
 | `spread_db.rs` | フォルダ別のページ構成・連結方式永続化 (単ページ / 見開き + ページ単位 / 縦連結 / 横連結。DB 名は互換のため `spread.db`) |
 | `ai/` | ONNX Runtime (DirectML or TensorRT) によるアップスケール / デノイズ / Inpainting / 補正レイヤー被写体選択と、ヒューリスティックによる画像種別分類。`AiBackend` で multi-EP 対応、TRT 用に `tensorrt_pack` (DLL pack 検出) と `tensorrt_builder` (子プロセスエンジンビルダー) を持つ。TRT 推論はメインから別プロセスへ shm + JSON IPC でルーティング (`trt_worker_pool` / `trt_worker_proto` / `trt_worker_runtime` / `trt_worker_shm`)。TensorRT 設定でも起動時には worker を自動起動せず、AI 処理が実際に必要になった最初のタイミングで遅延起動する。worker 起動ハンドシェイクは provider DLL 初期化遅延を見込んで 45 秒待ち、transient な起動失敗は 1 回だけ silent retry する。worker 死亡を検知したら自動 detach + DirectML フォールバック + UI バナー通知。U²-Netp 被写体選択は小型モデルとして in-process CPU 強制ロードで使う |
 | `png_metadata.rs` | PNG の tEXt/iTXt/zTXt に埋め込まれた AI メタデータ読み取り |
@@ -312,7 +312,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `mask.db` | 消しゴムマスク (deflate 圧縮 1bit/pixel + ベクタオブジェクト JSON) | `mask_db.rs` |
 | `conceal.db` | 隠蔽加工マスク (deflate 圧縮 1bit/pixel + ベクタオブジェクト JSON) とマスクスロット | `conceal_db.rs` |
 | `local_adjust.db` | 補正レイヤーのページ単位 JSON。中央 DB が authoritative で、`mimageviewer.dat` の `local_adjust_layers` はフォルダ移動時の復元用バックアップ | `local_adjust_db.rs` + `sidecar.rs` |
-| `export_crop.db` | 最後段 crop のページ単位矩形。中央 DB が authoritative で、`mimageviewer.dat` の `export_crop` はフォルダ移動時の復元用バックアップ | `export_crop.rs` + `sidecar.rs` |
+| `export_crop.db` | 最後段 crop のページ単位矩形と、その座標を作成した基準ラスタ寸法 (`source_width` / `source_height`)。中央 DB が authoritative で、`mimageviewer.dat` の `export_crop` は同じ自己記述設定を持つフォルダ移動時の復元用バックアップ | `export_crop.rs` + `sidecar.rs` |
 | `view_trim.db` | 表示専用トリム。`view_trim_books` に本ごとの基本適用モード / 本全体設定、`view_trim_pages` にページ個別設定を JSON で保存する。手動設定では enabled なページ行そのものが永続する「このページ」選択を表し、ページ表示時に本全体より優先される。出力用 crop とは独立し、コピー / 保存 / Ctrl+E には焼き込まない | `view_trim_db.rs` + `ui_view_trim.rs` |
 | `comic.db` | Ctrl+T テキスト注釈のページ単位 JSON。吹き出し・テキスト・ウィンドウ・スタンプ配置の正本で、ユーザー画像スタンプは配置先の注釈に `Embedded` として埋め込む | `comic_db.rs` + `ui_text.rs` + `sidecar.rs` |
 | `comic_user_stamps.db` | Ctrl+T スタンプピッカーのユーザー画像履歴。配置時の長辺 1024px 上限 PNG を再利用用 MRU として保持する。履歴から選んでも配置先には `Embedded` をコピーするため、履歴削除は既存注釈に影響しない | `comic_user_stamps.rs` + `ui_text.rs` |
@@ -337,7 +337,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 
 ### フォルダ側サイドカー (`mimageviewer.dat`)
 
-`adjustment.db` (ページ個別補正)、`mask.db` (消しゴムマスク)、`conceal.db` (隠蔽加工マスク)、`local_adjust.db` (補正レイヤー)、`export_crop.db` (最後段 crop)、`comic.db` (Ctrl+T 注釈) のバックアップとして、各ユーザーフォルダの直下に `mimageviewer.dat` を置く (Hidden + System 属性付きの JSON)。中央 DB が authoritative で、フォルダを丸ごと別ドライブへ移動した際に中央のパスキーが無効化されるケースの復旧経路。設定トグル (`sidecar_backup_enabled`、デフォルト ON) で ON/OFF できる。補正レイヤーは各エントリの `local_adjust_layers` 配列、最後段 crop は `export_crop`、Ctrl+T 注釈は `comic` として保存し、中央 DB に既存エントリがある場合はインポート時に上書きしない。書き込むモジュール: `sidecar.rs`。詳細は [preset-and-adjustment.md](preset-and-adjustment.md) §9 と [virtual-folders.md](virtual-folders.md) §6 を参照。
+`adjustment.db` (ページ個別補正)、`mask.db` (消しゴムマスク)、`conceal.db` (隠蔽加工マスク)、`local_adjust.db` (補正レイヤー)、`export_crop.db` (最後段 crop)、`comic.db` (Ctrl+T 注釈) のバックアップとして、各ユーザーフォルダの直下に `mimageviewer.dat` を置く (Hidden + System 属性付きの JSON)。中央 DB が authoritative で、フォルダを丸ごと別ドライブへ移動した際に中央のパスキーが無効化されるケースの復旧経路。設定トグル (`sidecar_backup_enabled`、デフォルト ON) で ON/OFF できる。補正レイヤーは各エントリの `local_adjust_layers` 配列、最後段 crop は矩形と基準ラスタ寸法を含む `export_crop`、Ctrl+T 注釈は `comic` として保存し、中央 DB に既存エントリがある場合はインポート時に上書きしない。書き込むモジュール: `sidecar.rs`。詳細は [preset-and-adjustment.md](preset-and-adjustment.md) §9 と [virtual-folders.md](virtual-folders.md) §6 を参照。
 
 この自動 sidecar は日常的な編集バックアップであり、明示的な持ち運び用 manifest ではない。
 設定が OFF でも `mimageviewer.meta.miv` の export / import は独立して動作する。
@@ -351,8 +351,8 @@ v2.7.0では安定化のためメニュー入口を一時非表示にしたが�
 `mimageviewer.dat` と独立した versioned bundle directory を実フォルダ直下へ作る。v7 は評価、
 タグ（名前・適用時刻と旧XMP seedを制御する決定状態）、サムネイル付き動画・音声ブックマーク /
 本ブックマーク、見開き・表示トリム・回転、ページ補正 / マスク /
-部分補正 / crop / 注釈、フォルダ代表サムネ・動画ピンを対象にする。crop矩形は通常DB /
-sidecarと同じ元画像ピクセル座標を保持する。ZIP / PDF のページ stateと ZIP 内の本 state は
+部分補正 / crop / 注釈、フォルダ代表サムネ・動画ピンを対象にする。crop は通常DB /
+sidecarと同じ矩形と基準ラスタ寸法の組を保持する。ZIP / PDF のページ stateと ZIP 内の本 state は
 物理コンテナ配下の相対キーで持つ。RAR / 7z / LZHと、入れ子非ZIPを含んで変換されたZIPは、
 ページ側とコンテナ側で独立したoriginをmanifestの`virtual_key_base` / `container_key_base`へ保存する。
 ページ情報はexport元のarchive cache DBで有効なsource/cache対応も確認し、cache ZIP側のページkeyを

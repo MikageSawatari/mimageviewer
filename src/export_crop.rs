@@ -2,6 +2,10 @@
 //!
 //! Crop は補正レイヤーや隠蔽加工の内部画像サイズを変えず、表示・コピー・書き出しの
 //! 最後にだけ source image coordinate の矩形で切り出す。
+//!
+//! 矩形は、それを作成したラスタの `source_size` と組にして保存する。同じ PDF ページの
+//! 再レンダや AI アップスケールで手元のラスタ寸法が変わっても、適用時はこの基準寸法から
+//! 対象ラスタへ変換し、選択領域の意味を維持する。
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -38,6 +42,12 @@ pub struct CropSettings {
     pub rect: CropRect,
     #[serde(default)]
     pub aspect_mode: CropAspectMode,
+    /// `rect` を作成したラスタのピクセル寸法。
+    ///
+    /// v2.13.0 以前の DB / sidecar / metadata transfer には存在しないため、`None` は
+    /// legacy 行を表す。最初に利用可能なラスタ寸法を採用した時点で書き戻す。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_size: Option<[usize; 2]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -306,16 +316,77 @@ impl CropRect {
 }
 
 impl CropSettings {
+    pub fn authored(rect: CropRect, aspect_mode: CropAspectMode, source_size: [usize; 2]) -> Self {
+        let source_size = valid_size_or_one(source_size);
+        Self {
+            rect,
+            aspect_mode,
+            source_size: Some(source_size),
+        }
+        .sanitized(source_size[0], source_size[1])
+    }
+
+    /// legacy 設定へ最初の利用可能ラスタ寸法を採用する。既に有効な基準寸法があれば保つ。
+    pub fn with_legacy_source_size(self, fallback_size: [usize; 2]) -> Self {
+        if self.valid_source_size().is_some() {
+            return self;
+        }
+        let fallback_size = valid_size_or_one(fallback_size);
+        Self {
+            rect: self.rect.sanitized(fallback_size[0], fallback_size[1]),
+            aspect_mode: self.aspect_mode,
+            source_size: Some(fallback_size),
+        }
+    }
+
+    pub fn valid_source_size(self) -> Option<[usize; 2]> {
+        self.source_size.filter(|[width, height]| {
+            *width > 0
+                && *height > 0
+                && i64::try_from(*width).is_ok()
+                && i64::try_from(*height).is_ok()
+        })
+    }
+
+    /// 保存済みの基準寸法から `target_size` のピクセル座標へ変換する。
+    ///
+    /// 戻り値も target 座標の自己記述設定なので、そのまま別ページへの貼り付け結果として
+    /// 永続化できる。legacy 設定は target を最初の基準とみなす。
+    pub fn scaled_to(self, target_size: [usize; 2]) -> Self {
+        let target_size = valid_size_or_one(target_size);
+        let source = self.with_legacy_source_size(target_size);
+        let [source_w, source_h] = source.valid_source_size().unwrap_or(target_size);
+        let source_rect = source.rect.sanitized(source_w, source_h);
+        let sx = target_size[0] as f32 / source_w as f32;
+        let sy = target_size[1] as f32 / source_h as f32;
+        Self {
+            rect: CropRect {
+                min_x: source_rect.min_x * sx,
+                min_y: source_rect.min_y * sy,
+                max_x: source_rect.max_x * sx,
+                max_y: source_rect.max_y * sy,
+            }
+            .sanitized(target_size[0], target_size[1]),
+            aspect_mode: source.aspect_mode,
+            source_size: Some(target_size),
+        }
+    }
+
     pub fn sanitized(self, width: usize, height: usize) -> Self {
         Self {
             rect: self.rect.sanitized(width, height),
             aspect_mode: self.aspect_mode,
+            source_size: self.source_size,
         }
     }
 
     pub fn is_full(self, width: usize, height: usize) -> bool {
         self.rect.is_full(width, height)
     }
+}
+
+fn valid_size_or_one([width, height]: [usize; 2]) -> [usize; 2] {
+    [width.max(1), height.max(1)]
 }
 
 pub fn crop_from_xywh_inputs(
@@ -429,8 +500,9 @@ impl CropDb {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let conn = rusqlite::Connection::open(path)?;
-        conn.execute_batch(
+        let mut conn = rusqlite::Connection::open(path)?;
+        let tx = conn.transaction()?;
+        tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS export_crop_pages (
                 page_path   TEXT PRIMARY KEY,
                 min_x       REAL NOT NULL,
@@ -438,9 +510,38 @@ impl CropDb {
                 max_x       REAL NOT NULL,
                 max_y       REAL NOT NULL,
                 aspect_mode TEXT NOT NULL DEFAULT 'free',
+                source_width  INTEGER,
+                source_height INTEGER,
                 updated_at  INTEGER NOT NULL DEFAULT (unixepoch())
              );",
         )?;
+        let columns = {
+            let mut stmt = tx.prepare("PRAGMA table_info(export_crop_pages)")?;
+            let rows = stmt.query_map([], |row| {
+                let name: String = row.get(1)?;
+                Ok(name)
+            })?;
+            let mut columns = HashSet::new();
+            for name in rows {
+                columns.insert(name?);
+            }
+            columns
+        };
+        // v2.13.0 以前のリリース済み schema は基準寸法を持たない。既存行は NULL のまま
+        // 保持し、最初に利用可能なラスタを採用する遅延 migration へ渡す。
+        if !columns.contains("source_width") {
+            tx.execute(
+                "ALTER TABLE export_crop_pages ADD COLUMN source_width INTEGER",
+                [],
+            )?;
+        }
+        if !columns.contains("source_height") {
+            tx.execute(
+                "ALTER TABLE export_crop_pages ADD COLUMN source_height INTEGER",
+                [],
+            )?;
+        }
+        tx.commit()?;
         Ok(Self { conn })
     }
 
@@ -452,7 +553,8 @@ impl CropDb {
         let mut stmt = self
             .conn
             .prepare_cached(
-                "SELECT min_x, min_y, max_x, max_y, aspect_mode
+                "SELECT min_x, min_y, max_x, max_y, aspect_mode,
+                        source_width, source_height
                  FROM export_crop_pages WHERE page_path = ?1",
             )
             .ok()?;
@@ -466,6 +568,7 @@ impl CropDb {
                     max_y: row.get::<_, f32>(3)?,
                 },
                 aspect_mode: CropAspectMode::from_stable_key(&aspect),
+                source_size: read_source_size(row, 5, 6)?,
             })
         })
         .ok()
@@ -474,14 +577,17 @@ impl CropDb {
     pub fn set(&self, page_key: &str, settings: CropSettings) -> Result<(), rusqlite::Error> {
         self.conn.execute(
             "INSERT INTO export_crop_pages
-                (page_path, min_x, min_y, max_x, max_y, aspect_mode, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, unixepoch())
+                (page_path, min_x, min_y, max_x, max_y, aspect_mode,
+                 source_width, source_height, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, unixepoch())
              ON CONFLICT(page_path) DO UPDATE SET
                 min_x = ?2,
                 min_y = ?3,
                 max_x = ?4,
                 max_y = ?5,
                 aspect_mode = ?6,
+                source_width = ?7,
+                source_height = ?8,
                 updated_at = unixepoch()",
             rusqlite::params![
                 page_key,
@@ -490,6 +596,12 @@ impl CropDb {
                 settings.rect.max_x,
                 settings.rect.max_y,
                 settings.aspect_mode.stable_key(),
+                settings
+                    .valid_source_size()
+                    .and_then(|size| i64::try_from(size[0]).ok()),
+                settings
+                    .valid_source_size()
+                    .and_then(|size| i64::try_from(size[1]).ok()),
             ],
         )?;
         Ok(())
@@ -509,8 +621,10 @@ impl CropDb {
         }
         self.conn.execute(
             "INSERT INTO export_crop_pages
-                (page_path, min_x, min_y, max_x, max_y, aspect_mode, updated_at)
-             SELECT ?2, min_x, min_y, max_x, max_y, aspect_mode, unixepoch()
+                (page_path, min_x, min_y, max_x, max_y, aspect_mode,
+                 source_width, source_height, updated_at)
+             SELECT ?2, min_x, min_y, max_x, max_y, aspect_mode,
+                    source_width, source_height, unixepoch()
              FROM export_crop_pages WHERE page_path = ?1
              ON CONFLICT(page_path) DO UPDATE SET
                 min_x = excluded.min_x,
@@ -518,6 +632,8 @@ impl CropDb {
                 max_x = excluded.max_x,
                 max_y = excluded.max_y,
                 aspect_mode = excluded.aspect_mode,
+                source_width = excluded.source_width,
+                source_height = excluded.source_height,
                 updated_at = unixepoch()",
             rusqlite::params![from_key, to_key],
         )?;
@@ -539,7 +655,8 @@ impl CropDb {
     pub fn load_by_prefix(&self, prefix: &str) -> HashMap<String, CropSettings> {
         let mut map = HashMap::new();
         let Ok(mut stmt) = self.conn.prepare_cached(
-            "SELECT page_path, min_x, min_y, max_x, max_y, aspect_mode
+            "SELECT page_path, min_x, min_y, max_x, max_y, aspect_mode,
+                    source_width, source_height
              FROM export_crop_pages
              WHERE page_path LIKE ?1 ESCAPE '\\'",
         ) else {
@@ -563,6 +680,7 @@ impl CropDb {
                         max_y: row.get::<_, f32>(4)?,
                     },
                     aspect_mode: CropAspectMode::from_stable_key(&aspect),
+                    source_size: read_source_size(row, 6, 7)?,
                 },
             ))
         }) else {
@@ -585,7 +703,8 @@ impl CropDb {
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
-                "SELECT page_path, min_x, min_y, max_x, max_y, aspect_mode
+                "SELECT page_path, min_x, min_y, max_x, max_y, aspect_mode,
+                        source_width, source_height
                  FROM export_crop_pages WHERE page_path IN ({placeholders})"
             );
             let Ok(mut stmt) = self.conn.prepare(&sql) else {
@@ -604,6 +723,7 @@ impl CropDb {
                                 max_y: row.get::<_, f32>(4)?,
                             },
                             aspect_mode: CropAspectMode::from_stable_key(&aspect),
+                            source_size: read_source_size(row, 6, 7)?,
                         },
                     ))
                 })
@@ -614,6 +734,24 @@ impl CropDb {
         }
         map
     }
+}
+
+pub(crate) fn read_source_size(
+    row: &rusqlite::Row<'_>,
+    width_index: usize,
+    height_index: usize,
+) -> rusqlite::Result<Option<[usize; 2]>> {
+    let width = row.get::<_, Option<i64>>(width_index)?;
+    let height = row.get::<_, Option<i64>>(height_index)?;
+    Ok(match (width, height) {
+        (Some(width), Some(height)) if width > 0 && height > 0 => {
+            match (usize::try_from(width), usize::try_from(height)) {
+                (Ok(width), Ok(height)) => Some([width, height]),
+                _ => None,
+            }
+        }
+        _ => None,
+    })
 }
 
 #[cfg(test)]
@@ -691,6 +829,7 @@ mod tests {
                 max_y: 60.0,
             },
             aspect_mode: CropAspectMode::Ratio4x3,
+            source_size: Some([100, 80]),
         };
 
         db.set(key, settings).unwrap();
@@ -710,6 +849,7 @@ mod tests {
                 max_y: 40.0,
             },
             aspect_mode: CropAspectMode::Keep,
+            source_size: Some([100, 100]),
         };
         db.set("c:/a.jpg", settings).unwrap();
         db.set("c:/b.jpg", settings).unwrap();
@@ -729,6 +869,7 @@ mod tests {
                 max_y: 10.0,
             },
             aspect_mode: CropAspectMode::Free,
+            source_size: Some([10, 10]),
         };
         db.set("c:/imgs/a_[one].png", settings).unwrap();
         db.set("c:/imgs/a_xone].png", settings).unwrap();
@@ -737,5 +878,66 @@ mod tests {
 
         assert_eq!(got.len(), 1);
         assert!(got.contains_key("c:/imgs/a_[one].png"));
+    }
+
+    #[test]
+    fn crop_keeps_the_same_region_across_pdf_rerender_sizes() {
+        let authored = CropSettings::authored(
+            CropRect {
+                min_x: 113.5,
+                min_y: 173.0,
+                max_x: 908.0,
+                max_y: 1_384.0,
+            },
+            CropAspectMode::Free,
+            [1_135, 1_730],
+        );
+
+        let rerendered = authored.scaled_to([4_540, 6_920]);
+
+        assert_eq!(rerendered.source_size, Some([4_540, 6_920]));
+        assert_eq!(rerendered.rect.min_x, 454.0);
+        assert_eq!(rerendered.rect.min_y, 692.0);
+        assert_eq!(rerendered.rect.max_x, 3_632.0);
+        assert_eq!(rerendered.rect.max_y, 5_536.0);
+        assert_eq!(
+            rerendered.scaled_to([1_135, 1_730]).rect,
+            authored.rect,
+            "switching between the observed 4x PDF rasters must preserve the selected region"
+        );
+    }
+
+    #[test]
+    fn legacy_db_row_is_preserved_then_adopts_first_raster_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crop.db");
+        let legacy = rusqlite::Connection::open(&path).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE export_crop_pages (
+                    page_path TEXT PRIMARY KEY,
+                    min_x REAL NOT NULL, min_y REAL NOT NULL,
+                    max_x REAL NOT NULL, max_y REAL NOT NULL,
+                    aspect_mode TEXT NOT NULL DEFAULT 'free',
+                    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+                 );
+                 INSERT INTO export_crop_pages
+                    (page_path, min_x, min_y, max_x, max_y, aspect_mode)
+                 VALUES ('pdf::page_0', 100.0, 200.0, 900.0, 1400.0, 'keep');",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let db = CropDb::open_at(&path).expect("released schema must migrate additively");
+        let loaded = db.get("pdf::page_0").expect("legacy row must survive");
+        assert_eq!(loaded.source_size, None);
+
+        let adopted = loaded.with_legacy_source_size([1_135, 1_730]);
+        db.set("pdf::page_0", adopted).unwrap();
+        assert_eq!(
+            db.get("pdf::page_0").unwrap().source_size,
+            Some([1_135, 1_730]),
+            "the first usable raster becomes the durable coordinate basis"
+        );
     }
 }

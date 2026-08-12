@@ -141,7 +141,11 @@ impl PageEditBundle {
             return Err("画像サイズを取得できませんでした".to_string());
         }
         if self.source_size == target_size {
-            return Ok(self.clone());
+            let mut cloned = self.clone();
+            cloned.export_crop = cloned
+                .export_crop
+                .map(|crop| crop.with_legacy_source_size(self.source_size));
+            return Ok(cloned);
         }
 
         let sx = target_w as f32 / source_w as f32;
@@ -172,16 +176,10 @@ impl PageEditBundle {
             .map(|layers| transform_local_adjust_layers(layers, target_size, length_scale))
             .transpose()?;
 
-        let export_crop = self
-            .export_crop
-            .map(|mut crop| {
-                crop.rect.min_x *= sx;
-                crop.rect.max_x *= sx;
-                crop.rect.min_y *= sy;
-                crop.rect.max_y *= sy;
-                crop.sanitized(target_w, target_h)
-            })
-            .filter(|crop| !crop.is_full(target_w, target_h));
+        let export_crop = self.export_crop.map(|crop| {
+            crop.with_legacy_source_size(self.source_size)
+                .scaled_to(target_size)
+        });
 
         Ok(Self {
             source_size: target_size,
@@ -548,12 +546,16 @@ impl PreparedPageEditBundle {
         if let Some(crop) = self.export_crop {
             conn.execute(
                 "INSERT INTO crop_edit.export_crop_pages
-                    (page_path, min_x, min_y, max_x, max_y, aspect_mode, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, unixepoch())
+                    (page_path, min_x, min_y, max_x, max_y, aspect_mode,
+                     source_width, source_height, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, unixepoch())
                  ON CONFLICT(page_path) DO UPDATE SET
                     min_x = excluded.min_x, min_y = excluded.min_y,
                     max_x = excluded.max_x, max_y = excluded.max_y,
-                    aspect_mode = excluded.aspect_mode, updated_at = unixepoch()",
+                    aspect_mode = excluded.aspect_mode,
+                    source_width = excluded.source_width,
+                    source_height = excluded.source_height,
+                    updated_at = unixepoch()",
                 params![
                     key,
                     crop.rect.min_x,
@@ -561,6 +563,10 @@ impl PreparedPageEditBundle {
                     crop.rect.max_x,
                     crop.rect.max_y,
                     crop.aspect_mode.stable_key(),
+                    crop.valid_source_size()
+                        .and_then(|size| i64::try_from(size[0]).ok()),
+                    crop.valid_source_size()
+                        .and_then(|size| i64::try_from(size[1]).ok()),
                 ],
             )
             .map_err(db_write_error)?;
@@ -705,6 +711,7 @@ mod tests {
                     max_y: 1.75,
                 },
                 aspect_mode: CropAspectMode::Free,
+                source_size: Some([2, 2]),
             }),
             ..Default::default()
         };
@@ -727,6 +734,7 @@ mod tests {
         assert_eq!(crop.rect.min_y, 0.75);
         assert_eq!(crop.rect.max_x, 3.0);
         assert_eq!(crop.rect.max_y, 5.25);
+        assert_eq!(crop.source_size, Some([4, 6]));
     }
 
     #[test]
@@ -869,7 +877,7 @@ mod tests {
     }
 
     #[test]
-    fn transformed_full_crop_is_removed() {
+    fn transformed_full_crop_is_preserved_instead_of_silently_removed() {
         let bundle = PageEditBundle {
             source_size: [100, 100],
             export_crop: Some(CropSettings {
@@ -880,16 +888,17 @@ mod tests {
                     max_y: 100.0,
                 },
                 aspect_mode: CropAspectMode::Free,
+                source_size: Some([100, 100]),
             }),
             ..Default::default()
         };
-        assert!(
-            bundle
-                .transformed_to([200, 300])
-                .unwrap()
-                .export_crop
-                .is_none()
-        );
+        let crop = bundle
+            .transformed_to([200, 300])
+            .unwrap()
+            .export_crop
+            .expect("an explicit crop row must not disappear during conversion");
+        assert_eq!(crop.rect, CropRect::full(200, 300));
+        assert_eq!(crop.source_size, Some([200, 300]));
     }
 
     fn init_bundle_databases(paths: &EditBundleDbPaths) {

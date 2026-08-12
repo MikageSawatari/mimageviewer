@@ -49049,6 +49049,7 @@ fn prepared_aggregate_installs_exact_per_item_edit_state() {
             max_y: 40.0,
         },
         aspect_mode: crate::export_crop::CropAspectMode::Keep,
+        source_size: Some([100, 100]),
     };
     let page_trim =
         crate::view_trim::ViewTrimPageOverride::from_margins(crate::view_trim::ViewTrimMargins {

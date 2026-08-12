@@ -51661,7 +51661,7 @@ impl App {
     }
 
     /// 指定 idx の最後段 crop 設定を DB / サイドカー / in-memory state に反映する。
-    /// `None` または full rect は「crop なし」として削除する。
+    /// `None` または、現在の authoring raster に対する full rect は「crop なし」として削除する。
     pub(crate) fn set_export_crop_for_idx(
         &mut self,
         idx: usize,
@@ -51673,7 +51673,13 @@ impl App {
             None => return,
         };
         let normalized = settings
-            .map(|settings| settings.sanitized(image_size[0], image_size[1]))
+            .map(|settings| {
+                crate::export_crop::CropSettings::authored(
+                    settings.rect,
+                    settings.aspect_mode,
+                    image_size,
+                )
+            })
             .filter(|settings| !settings.is_full(image_size[0], image_size[1]));
 
         if let Some(settings) = normalized {
@@ -51716,7 +51722,13 @@ impl App {
         image_size: [usize; 2],
     ) {
         let normalized = settings
-            .map(|settings| settings.sanitized(image_size[0], image_size[1]))
+            .map(|settings| {
+                crate::export_crop::CropSettings::authored(
+                    settings.rect,
+                    settings.aspect_mode,
+                    image_size,
+                )
+            })
             .filter(|settings| !settings.is_full(image_size[0], image_size[1]));
         if let Some(settings) = normalized {
             self.export_crop_page_settings.insert(idx, settings);
@@ -51728,16 +51740,45 @@ impl App {
         // (上記 set_export_crop_for_idx と同じ理由でキャッシュ無効化しない。Codex P2)
     }
 
+    /// legacy crop が基準寸法を持たない場合、最初に使えるラスタ寸法を採用し、中央 DB と
+    /// sidecar mirror へ書き戻す。clamp 後に full rect になっても行は削除しない。
+    pub(crate) fn ensure_export_crop_source_size(
+        &mut self,
+        idx: usize,
+        fallback_size: [usize; 2],
+    ) -> Option<crate::export_crop::CropSettings> {
+        let settings = self.export_crop_page_settings.get(&idx).copied()?;
+        if settings.valid_source_size().is_some() {
+            return Some(settings);
+        }
+        let adopted = settings.with_legacy_source_size(fallback_size);
+        if let Some(key) = self.page_path_key(idx) {
+            if let Some(db) = &self.export_crop_db
+                && let Err(err) = db.set(&key, adopted)
+            {
+                crate::logger::log(format!(
+                    "export_crop: failed to adopt legacy source size idx={idx} error={err}"
+                ));
+            }
+            self.with_sidecar_mut(idx, move |sc, rel| sc.set_export_crop(rel, adopted));
+            let [width, height] = adopted.valid_source_size().unwrap_or([1, 1]);
+            crate::logger::log(format!(
+                "export_crop: adopted legacy source size idx={idx} size={}x{}",
+                width, height
+            ));
+        }
+        self.export_crop_page_settings.insert(idx, adopted);
+        self.export_crop_pages.insert(idx);
+        Some(adopted)
+    }
+
     pub(crate) fn export_crop_for_idx(
-        &self,
+        &mut self,
         idx: usize,
         image_size: [usize; 2],
     ) -> Option<crate::export_crop::CropSettings> {
-        self.export_crop_page_settings
-            .get(&idx)
-            .copied()
-            .map(|settings| settings.sanitized(image_size[0], image_size[1]))
-            .filter(|settings| !settings.is_full(image_size[0], image_size[1]))
+        self.ensure_export_crop_source_size(idx, image_size)
+            .map(|settings| settings.scaled_to(image_size))
     }
 
     /// 保存対象画像 (final composite。AI アップスケールで source とサイズが違うことが
@@ -51745,26 +51786,18 @@ impl App {
     /// されているので、`target_size / source_size` の比で等比拡縮する。表示は切り取らず
     /// capture / export の最終段でだけ使う。
     pub(crate) fn export_crop_rect_for_pixels(
-        &self,
+        &mut self,
         idx: usize,
         target_size: [usize; 2],
     ) -> Option<crate::export_crop::CropRect> {
-        let source_size = self.current_raw_source_pixels(idx)?.size;
-        let crop = self.export_crop_for_idx(idx, source_size)?;
-        if source_size == target_size {
-            return Some(crop.rect);
-        }
-        let sx = target_size[0] as f32 / source_size[0].max(1) as f32;
-        let sy = target_size[1] as f32 / source_size[1].max(1) as f32;
-        Some(
-            crate::export_crop::CropRect {
-                min_x: crop.rect.min_x * sx,
-                min_y: crop.rect.min_y * sy,
-                max_x: crop.rect.max_x * sx,
-                max_y: crop.rect.max_y * sy,
-            }
-            .sanitized(target_size[0], target_size[1]),
-        )
+        let settings = self.export_crop_page_settings.get(&idx).copied()?;
+        let settings = if settings.valid_source_size().is_some() {
+            settings
+        } else {
+            let first_raster_size = self.current_raw_source_pixels(idx)?.size;
+            self.ensure_export_crop_source_size(idx, first_raster_size)?
+        };
+        Some(settings.scaled_to(target_size).rect)
     }
 
     /// 現在の input / erase mask / local adjust 世代から、補正レイヤー cache key を作る。

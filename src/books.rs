@@ -294,8 +294,10 @@ pub struct BakedEditSnapshot {
     pub local_adjust: Option<Vec<local_adjust_core::LocalAdjustmentLayer>>,
     pub comic: Option<BookComicSnapshot>,
     pub comic_source_dims: Option<[usize; 2]>,
-    pub export_crop: Option<crate::export_crop::CropRect>,
-    pub crop_source_dims: Option<[usize; 2]>,
+    pub export_crop: Option<crate::export_crop::CropSettings>,
+    /// idx を持たない stack member の legacy crop を、decode 後の最初のラスタ寸法で
+    /// 中央 DB へ遅延移行するための `(db_path, page_key)`。
+    pub crop_legacy_writeback: Option<(PathBuf, String)>,
     pub format: crate::capture::CaptureFormat,
     pub jpeg_matte: crate::capture::JpegMatte,
 }
@@ -1129,20 +1131,25 @@ fn compose_book_page(
     }
 
     let crop = edits.export_crop.map(|crop| {
-        let crop = if let Some(source_size) = edits.crop_source_dims
-            && source_size != image.size
+        let was_legacy = crop.valid_source_size().is_none();
+        let resolved = crop.with_legacy_source_size(image.size);
+        if was_legacy
+            && let Some((db_path, page_key)) = &edits.crop_legacy_writeback
         {
-            let sx = image.size[0] as f32 / source_size[0].max(1) as f32;
-            let sy = image.size[1] as f32 / source_size[1].max(1) as f32;
-            crate::export_crop::CropRect {
-                min_x: crop.min_x * sx,
-                min_y: crop.min_y * sy,
-                max_x: crop.max_x * sx,
-                max_y: crop.max_y * sy,
+            match crate::export_crop::CropDb::open_at(db_path) {
+                Ok(db) => {
+                    if let Err(error) = db.set(page_key, resolved) {
+                        crate::logger::log(format!(
+                            "books: failed to adopt legacy crop source size key={page_key} error={error}"
+                        ));
+                    }
+                }
+                Err(error) => crate::logger::log(format!(
+                    "books: failed to open crop DB for legacy migration key={page_key} error={error}"
+                )),
             }
-        } else {
-            crop
-        };
+        }
+        let crop = resolved.scaled_to(image.size).rect;
         crop_after_rotation(crop, image.size, edits.rotation)
     });
     if !edits.rotation.is_none() {
@@ -1762,7 +1769,7 @@ mod tests {
             comic: None,
             comic_source_dims: None,
             export_crop: None,
-            crop_source_dims: None,
+            crop_legacy_writeback: None,
             format: crate::capture::CaptureFormat::Png,
             jpeg_matte: crate::capture::JpegMatte::Black,
         }
@@ -1986,12 +1993,16 @@ mod tests {
         )]);
         edits.params.brightness = 10.0;
         edits.rotation = crate::rotation_db::Rotation::Cw90;
-        edits.export_crop = Some(crate::export_crop::CropRect {
-            min_x: 0.0,
-            min_y: 0.0,
-            max_x: 1.0,
-            max_y: 1.0,
-        });
+        edits.export_crop = Some(crate::export_crop::CropSettings::authored(
+            crate::export_crop::CropRect {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 1.0,
+                max_y: 1.0,
+            },
+            crate::export_crop::CropAspectMode::Free,
+            [2, 1],
+        ));
 
         let result = compose_book_page(base, &edits).unwrap();
 
@@ -2121,19 +2132,59 @@ mod tests {
             .collect();
         let base = egui::ColorImage::new([8, 4], pixels);
         let mut edits = empty_baked_edits();
-        edits.export_crop = Some(crate::export_crop::CropRect {
-            min_x: 8.0,
-            min_y: 0.0,
-            max_x: 16.0,
-            max_y: 8.0,
-        });
-        edits.crop_source_dims = Some([16, 8]);
+        edits.export_crop = Some(crate::export_crop::CropSettings::authored(
+            crate::export_crop::CropRect {
+                min_x: 8.0,
+                min_y: 0.0,
+                max_x: 16.0,
+                max_y: 8.0,
+            },
+            crate::export_crop::CropAspectMode::Free,
+            [16, 8],
+        ));
 
         let result = compose_book_page(base, &edits).unwrap();
 
         assert_eq!(result.image.size, [4, 4]);
         assert_eq!(result.image.pixels[0], egui::Color32::from_rgb(80, 0, 0));
         assert_eq!(result.image.pixels[3], egui::Color32::from_rgb(140, 0, 0));
+    }
+
+    #[test]
+    fn full_composite_adopts_legacy_crop_basis_after_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("export_crop.db");
+        let key = "c:/legacy.png";
+        let legacy = crate::export_crop::CropSettings {
+            rect: crate::export_crop::CropRect {
+                min_x: 2.0,
+                min_y: 1.0,
+                max_x: 6.0,
+                max_y: 3.0,
+            },
+            aspect_mode: crate::export_crop::CropAspectMode::Free,
+            source_size: None,
+        };
+        crate::export_crop::CropDb::open_at(&db_path)
+            .unwrap()
+            .set(key, legacy)
+            .unwrap();
+        let mut edits = empty_baked_edits();
+        edits.export_crop = Some(legacy);
+        edits.crop_legacy_writeback = Some((db_path.clone(), key.to_string()));
+        let base = egui::ColorImage::new([8, 4], vec![egui::Color32::WHITE; 32]);
+
+        let result = compose_book_page(base, &edits).unwrap();
+
+        assert_eq!(result.image.size, [4, 2]);
+        assert_eq!(
+            crate::export_crop::CropDb::open_at(&db_path)
+                .unwrap()
+                .get(key)
+                .unwrap()
+                .source_size,
+            Some([8, 4])
+        );
     }
 
     #[test]
