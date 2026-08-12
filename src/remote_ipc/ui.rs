@@ -98,6 +98,7 @@ struct RemoteTailscaleServeElements {
     show_setup_button: bool,
     setup_button_enabled: bool,
     show_conflict_warning: bool,
+    show_unsupported_path_warning: bool,
     show_unknown_message: bool,
     show_removal_note: bool,
 }
@@ -106,12 +107,14 @@ fn remote_tailscale_serve_elements(
     serve_status: RemoteWebFeatureStatus,
     https_certificate: RemoteWebFeatureStatus,
     has_conflict: bool,
+    has_unsupported_path: bool,
 ) -> RemoteTailscaleServeElements {
     match serve_status {
         RemoteWebFeatureStatus::Configured => RemoteTailscaleServeElements {
             show_setup_button: false,
             setup_button_enabled: false,
             show_conflict_warning: false,
+            show_unsupported_path_warning: false,
             show_unknown_message: false,
             show_removal_note: true,
         },
@@ -119,6 +122,7 @@ fn remote_tailscale_serve_elements(
             show_setup_button: true,
             setup_button_enabled: https_certificate != RemoteWebFeatureStatus::NotConfigured,
             show_conflict_warning: has_conflict,
+            show_unsupported_path_warning: has_unsupported_path,
             show_unknown_message: false,
             show_removal_note: false,
         },
@@ -126,6 +130,7 @@ fn remote_tailscale_serve_elements(
             show_setup_button: false,
             setup_button_enabled: false,
             show_conflict_warning: false,
+            show_unsupported_path_warning: false,
             show_unknown_message: true,
             show_removal_note: false,
         },
@@ -2676,6 +2681,7 @@ impl crate::app::App {
                         info.tailscale_serve,
                         info.tailscale_https_certificate,
                         info.tailscale_serve_conflict.is_some(),
+                        info.tailscale_serve_unsupported_path.is_some(),
                     );
                     if elements.show_unknown_message {
                         ui.label("Tailscale が見つからないか、状態を読み取れません。");
@@ -2687,6 +2693,17 @@ impl crate::app::App {
                         ui.label("TLS は Tailscale が処理します。インターネットには公開されません。");
                         ui.label("実行するコマンド:");
                         ui.monospace(format!("tailscale serve --bg {serve_port}"));
+                        if elements.show_unsupported_path_warning
+                            && let Some(path) =
+                                info.tailscale_serve_unsupported_path.as_deref()
+                        {
+                            ui.colored_label(
+                                ui.visuals().warn_fg_color,
+                                format!(
+                                    "tailscale serve は {path} に設定されています。mImageViewer はパスを付けた公開に対応していないため、この URL では接続できません。"
+                                ),
+                            );
+                        }
                         if elements.show_conflict_warning
                             && let Some(conflict) = info.tailscale_serve_conflict.as_deref()
                         {
@@ -3543,11 +3560,13 @@ mod tests {
                 RemoteWebFeatureStatus::Configured,
                 RemoteWebFeatureStatus::Configured,
                 false,
+                false,
             ),
             RemoteTailscaleServeElements {
                 show_setup_button: false,
                 setup_button_enabled: false,
                 show_conflict_warning: false,
+                show_unsupported_path_warning: false,
                 show_unknown_message: false,
                 show_removal_note: true,
             }
@@ -3557,11 +3576,13 @@ mod tests {
                 RemoteWebFeatureStatus::NotConfigured,
                 RemoteWebFeatureStatus::Configured,
                 false,
+                false,
             ),
             RemoteTailscaleServeElements {
                 show_setup_button: true,
                 setup_button_enabled: true,
                 show_conflict_warning: false,
+                show_unsupported_path_warning: false,
                 show_unknown_message: false,
                 show_removal_note: false,
             }
@@ -3571,6 +3592,7 @@ mod tests {
                 RemoteWebFeatureStatus::NotConfigured,
                 RemoteWebFeatureStatus::Configured,
                 true,
+                false,
             )
             .show_conflict_warning
         );
@@ -3579,15 +3601,31 @@ mod tests {
                 RemoteWebFeatureStatus::Unknown,
                 RemoteWebFeatureStatus::Unknown,
                 true,
+                true,
             ),
             RemoteTailscaleServeElements {
                 show_setup_button: false,
                 setup_button_enabled: false,
                 show_conflict_warning: false,
+                show_unsupported_path_warning: false,
                 show_unknown_message: true,
                 show_removal_note: false,
             }
         );
+    }
+
+    #[test]
+    fn unsupported_tailscale_serve_path_warns_without_disabling_root_setup() {
+        let elements = remote_tailscale_serve_elements(
+            RemoteWebFeatureStatus::NotConfigured,
+            RemoteWebFeatureStatus::Configured,
+            false,
+            true,
+        );
+        assert!(elements.show_setup_button);
+        assert!(elements.setup_button_enabled);
+        assert!(elements.show_unsupported_path_warning);
+        assert!(!elements.show_conflict_warning);
     }
 
     #[test]
@@ -3596,6 +3634,7 @@ mod tests {
             RemoteWebFeatureStatus::NotConfigured,
             RemoteWebFeatureStatus::NotConfigured,
             false,
+            false,
         );
         assert!(invalid.show_setup_button);
         assert!(!invalid.setup_button_enabled);
@@ -3603,6 +3642,7 @@ mod tests {
         let unknown = remote_tailscale_serve_elements(
             RemoteWebFeatureStatus::NotConfigured,
             RemoteWebFeatureStatus::Unknown,
+            false,
             false,
         );
         assert!(unknown.show_setup_button);

@@ -121,7 +121,7 @@
           <tr><td>PIN</td><td><strong>設定済み</strong> / <strong>未設定</strong>。未設定のうちは有効にできません</td></tr>
           <tr><td>状態</td><td>待ち受けの状況。有効にした直後は準備中になり、接続先が決まると受付中になります</td></tr>
           <tr><td>利用状況</td><td>いま接続している端末があるかどうか（台数は表示しません）</td></tr>
-          <tr><td>tailscale serve</td><td><strong>設定済み</strong> / <strong>未設定</strong> / <strong>確認できません</strong>。未設定のときは、実行する内容とコマンドを示したうえで設定ボタンが出ます</td></tr>
+          <tr><td>tailscale serve</td><td><strong>設定済み</strong> / <strong>未設定</strong> / <strong>確認できません</strong>。未設定のときや、パスを付けて公開している場合は、実行する内容とコマンドを示したうえで設定ボタンが出ます</td></tr>
           <tr><td>接続キーの有効期限</td><td>期限がある場合だけ表示します。期限が近い、または切れている場合は強調表示します</td></tr>
           <tr><td>QR コード / URL</td><td>接続先です。QR コードに含まれるのは接続先だけで、PIN は含まれません</td></tr>
         </tbody>
@@ -143,6 +143,11 @@
       外出先のブラウザから HTTPS で開けるようにする設定です。mImageViewer が代わりに実行します。
       <strong>ボタンを押すまでは何も変更しません。</strong>すでに別のものを公開している場合は、
       置き換わることを表示します。解除したいときは Tailscale 側で行います。
+    </p>
+    <p>
+      <code>/miv</code> のようにパスを付けて公開している場合、その URL では表示できません。
+      接続ダイアログに警告が出るので、<strong>「tailscale serve を設定する」</strong>を押して、
+      パスなし (<code>/</code>) で公開し直してください。
     </p>
 
     <h2 id="connect">接続する</h2>
@@ -276,6 +281,7 @@
           <tr><td>URL を開いても表示されない</td><td>手元の端末が Tailscale にサインインしているか。自宅 PC がスリープしていないか</td></tr>
           <tr><td>外出先から急につながらなくなった</td><td>接続キーの有効期限が切れていないか（自宅に戻ってから確認します）</td></tr>
           <tr><td>tailscale serve を設定できない</td><td>Tailscale の管理画面で HTTPS の証明書が有効か</td></tr>
+          <tr><td>パス付きの公開は未対応と表示される</td><td>接続ダイアログの「tailscale serve を設定する」を押して、パスなしで公開し直す</td></tr>
           <tr><td>ページの表示が遅い</td><td>端末の設定で画質を下げる、先読み枚数を増やす</td></tr>
           <tr><td>読んでいる途中でアプリが再読み込みされる</td><td>先読み枚数を下げる。それでも起きるなら画質を下げる</td></tr>
         </tbody>

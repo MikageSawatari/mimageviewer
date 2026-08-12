@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 46;
+pub const PROTOCOL_VERSION: u32 = 47;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -1290,6 +1290,7 @@ pub struct RemoteWebConnectionInfo {
     pub public_url: String,
     pub tailscale_serve: RemoteWebFeatureStatus,
     pub tailscale_serve_conflict: Option<String>,
+    pub tailscale_serve_unsupported_path: Option<String>,
     pub tailscale_https_certificate: RemoteWebFeatureStatus,
     pub tailscale_key_expiry_unix_seconds: Option<i64>,
 }
@@ -2605,14 +2606,15 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v46_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
-        assert_eq!(PROTOCOL_VERSION, 46);
+    fn protocol_v47_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
+        assert_eq!(PROTOCOL_VERSION, 47);
         let expected = ClientMessage::RemoteWebConnectionInfo {
             id: 10,
             info: RemoteWebConnectionInfo {
                 public_url: "https://viewer.example.ts.net/".to_owned(),
                 tailscale_serve: RemoteWebFeatureStatus::NotConfigured,
                 tailscale_serve_conflict: Some("http://127.0.0.1:3000".to_owned()),
+                tailscale_serve_unsupported_path: Some("/miv".to_owned()),
                 tailscale_https_certificate: RemoteWebFeatureStatus::Configured,
                 tailscale_key_expiry_unix_seconds: Some(1_770_508_800),
             },
@@ -2779,8 +2781,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v46_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 46);
+    fn protocol_v47_remote_video_thumbnail_shape_round_trips() {
+        assert_eq!(PROTOCOL_VERSION, 47);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,

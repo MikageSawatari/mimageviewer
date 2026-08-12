@@ -31,6 +31,7 @@ pub struct ConnectionUrl {
     pub source: UrlSource,
     pub tailscale_serve: RemoteWebFeatureStatus,
     pub tailscale_serve_conflict: Option<String>,
+    pub tailscale_serve_unsupported_path: Option<String>,
     pub tailscale_https_certificate: RemoteWebFeatureStatus,
     pub tailscale_key_expiry_unix_seconds: Option<i64>,
 }
@@ -40,6 +41,7 @@ struct TailscaleServeState {
     status: RemoteWebFeatureStatus,
     url: Option<String>,
     conflict: Option<String>,
+    unsupported_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +69,7 @@ pub fn choose_connection_url(
         source,
         tailscale_serve: serve.status,
         tailscale_serve_conflict: serve.conflict.clone(),
+        tailscale_serve_unsupported_path: serve.unsupported_path.clone(),
         tailscale_https_certificate: status.https_certificate,
         tailscale_key_expiry_unix_seconds: status.key_expiry_unix_seconds,
     };
@@ -167,11 +170,13 @@ fn tailscale_serve_status_json(bytes: &[u8], address: SocketAddr) -> TailscaleSe
 
 fn inspect_tailscale_serve(value: &Value, address: SocketAddr) -> TailscaleServeState {
     let mut conflict = None;
+    let mut unsupported_path = None;
     let Some(web) = value.get("Web").and_then(Value::as_object) else {
         return TailscaleServeState {
             status: RemoteWebFeatureStatus::NotConfigured,
             url: None,
             conflict: None,
+            unsupported_path: None,
         };
     };
     for (entry, config) in web {
@@ -185,14 +190,21 @@ fn inspect_tailscale_serve(value: &Value, address: SocketAddr) -> TailscaleServe
             let Some(proxy) = handler.get("Proxy").and_then(Value::as_str) else {
                 continue;
             };
-            if proxy_targets(proxy, address)
-                && let Some(url) = serve_url(&host, path)
-            {
-                return TailscaleServeState {
-                    status: RemoteWebFeatureStatus::Configured,
-                    url: Some(url),
-                    conflict: None,
-                };
+            if proxy_targets(proxy, address) {
+                if path == "/"
+                    && let Some(url) = serve_url(&host, path)
+                {
+                    return TailscaleServeState {
+                        status: RemoteWebFeatureStatus::Configured,
+                        url: Some(url),
+                        conflict: None,
+                        unsupported_path: None,
+                    };
+                }
+                if unsupported_path.is_none() {
+                    unsupported_path = Some(path.to_owned());
+                }
+                continue;
             }
             if path == "/" && conflict.is_none() {
                 conflict = Some(proxy.to_owned());
@@ -203,6 +215,7 @@ fn inspect_tailscale_serve(value: &Value, address: SocketAddr) -> TailscaleServe
         status: RemoteWebFeatureStatus::NotConfigured,
         url: None,
         conflict,
+        unsupported_path,
     }
 }
 
@@ -211,6 +224,7 @@ fn unknown_serve_state() -> TailscaleServeState {
         status: RemoteWebFeatureStatus::Unknown,
         url: None,
         conflict: None,
+        unsupported_path: None,
     }
 }
 
@@ -514,6 +528,7 @@ mod tests {
             Some("https://desktop4090.taild260d0.ts.net/")
         );
         assert_eq!(state.conflict, None);
+        assert_eq!(state.unsupported_path, None);
     }
 
     #[test]
@@ -523,6 +538,7 @@ mod tests {
         assert_eq!(state.status, RemoteWebFeatureStatus::NotConfigured);
         assert_eq!(state.url, None);
         assert_eq!(state.conflict.as_deref(), Some("http://127.0.0.1:3000"));
+        assert_eq!(state.unsupported_path, None);
     }
 
     #[test]
@@ -533,17 +549,28 @@ mod tests {
         assert_eq!(state.status, RemoteWebFeatureStatus::NotConfigured);
         assert_eq!(state.url, None);
         assert_eq!(state.conflict, None);
+        assert_eq!(state.unsupported_path, None);
     }
 
     #[test]
-    fn configured_handler_path_is_part_of_the_connection_url() {
+    fn owned_non_root_handler_is_reported_as_unsupported_instead_of_configured() {
         let json = br#"{"Web":{"desktop4090.taild260d0.ts.net:443":{"Handlers":{"/miv":{"Proxy":"http://127.0.0.1:8787"}}}}}"#;
+        let state = tailscale_serve_status_json(json, "127.0.0.1:8787".parse().unwrap());
+        assert_eq!(state.status, RemoteWebFeatureStatus::NotConfigured);
+        assert_eq!(state.url, None);
+        assert_eq!(state.unsupported_path.as_deref(), Some("/miv"));
+    }
+
+    #[test]
+    fn owned_root_handler_wins_when_an_owned_non_root_handler_also_exists() {
+        let json = br#"{"Web":{"desktop4090.taild260d0.ts.net:443":{"Handlers":{"/miv":{"Proxy":"http://127.0.0.1:8787"},"/":{"Proxy":"http://127.0.0.1:8787"}}}}}"#;
         let state = tailscale_serve_status_json(json, "127.0.0.1:8787".parse().unwrap());
         assert_eq!(state.status, RemoteWebFeatureStatus::Configured);
         assert_eq!(
             state.url.as_deref(),
-            Some("https://desktop4090.taild260d0.ts.net/miv/")
+            Some("https://desktop4090.taild260d0.ts.net/")
         );
+        assert_eq!(state.unsupported_path, None);
     }
 
     #[test]

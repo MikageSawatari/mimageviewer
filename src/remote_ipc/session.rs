@@ -3522,6 +3522,7 @@ mod tests {
             public_url: url.to_owned(),
             tailscale_serve: mimageviewer_ipc::RemoteWebFeatureStatus::Configured,
             tailscale_serve_conflict: None,
+            tailscale_serve_unsupported_path: None,
             tailscale_https_certificate: mimageviewer_ipc::RemoteWebFeatureStatus::Configured,
             tailscale_key_expiry_unix_seconds: None,
         };

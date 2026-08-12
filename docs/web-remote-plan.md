@@ -146,10 +146,11 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
   定数時間比較し、PIN・hash・セッション署名値・Bearer をログへ出さない。認証失敗本文に内部情報を出さない
 - 接続用 QR コードには URL だけを含め、PIN や Bearer は含めない。URL は `--url`、Tailscale の
   `--json` 状態、bind 先の順で決める。remote-web は確定 URL、`tailscale serve` 状態、`/` を占める
-  既存 proxy 先、tailnet の HTTPS 証明書状態、接続キーの有効期限を protocol v46 の接続情報として
+  既存 proxy 先、自分の proxy がある未対応サブパス、tailnet の HTTPS 証明書状態、接続キーの有効期限を
+  protocol v47 の接続情報として
   本体へ通知する。判定は `Web` の `.ts.net` キーだけでなく、handler の `Proxy` が本体から渡された
-  bind / port と一致するかまで見る。HTTPS 証明書と期限も remote-web が `tailscale status --json` を
-  解釈し、本体は JSON を独自解釈しない。
+  bind / port と一致し、かつ handler path が `/` であるかまで見る。HTTPS 証明書と期限も remote-web が
+  `tailscale status --json` を解釈し、本体は JSON を独自解釈しない。
   PIN 設定状態は認証ファイルの所有者である本体が判定し、
   設定メニューの「リモート接続…」に QR、URL、即時反映する opt-in、受付状態、active session の
   有無に基づく二値の利用状況を表示する。排他的 owner なので端末台数は表示しない。
@@ -2467,8 +2468,12 @@ data directory の外にする理由は「remote-web は本体 data directory �
 
 従来は `serve status --json` の `Web` に `.ts.net` のキーがあるだけで設定済みと判定していたため、
 別サービスを配信中でも mIV 用と誤認していた。現在は各 handler の `Proxy` の host / port が、本体所有の
-`127.0.0.1:<port>` と一致するときだけ設定済みとし、接続 URL は該当 entry の host と handler path から
-組み立てる。`/` が別 proxy 先なら v46 でも保持する衝突情報として本体へ運び、上書きになることをボタン前に表示する。
+`127.0.0.1:<port>` と一致し、かつ handler path が `/` のときだけ設定済みとする。SPA の asset / API /
+stream / Service Worker は origin root を正本とするため、`/miv` のようなサブパスに自分の proxy があっても
+動作 URL として案内しない。非 root path は v47 の未対応サブパス情報として本体へ運び、接続できない理由を
+警告したうえで、root へ設定し直すボタンは有効なまま保つ。`/` が別 proxy 先なら衝突情報も本体へ運び、
+上書きになることをボタン前に表示する。同時に自分の root handler が見つかれば、非 root handler より
+root を優先して設定済みとする。
 
 設定変更は接続ダイアログに `tailscale serve --bg <port>` そのものと意味を示し、利用者が押したときだけ
 owner worker が最大 8 秒の CLI 実行を行う。成功時は所有する remote-web child を再起動する。本体から
@@ -2486,7 +2491,7 @@ remote-web へ状態再読込を要求する IPC は無く、再起動で `choos
 top-level `CertDomains` と `Self.KeyExpiry` から前提条件も検出する。`CertDomains` が 1 件以上なら
 HTTPS 証明書を有効、空または欠落なら無効とし、CLI の不在・実行失敗・JSON 不正は不明にする。
 `Self.KeyExpiry` は解釈できる RFC3339 文字列だけを unix 秒へ変換し、null・欠落・解釈不能は
-情報なしとして運ぶ。JSON の解釈は引き続き remote-web が所有し、本体は v46 の型付き結果だけを表示する。
+情報なしとして運ぶ。JSON の解釈は引き続き remote-web が所有し、本体は v47 の型付き結果だけを表示する。
 
 HTTPS 証明書が無効なら `tailscale serve` は証明書を取得できず必ず失敗するため、接続ダイアログは
 serve 設定ボタンだけを無効にし、Tailscale 管理コンソールの DNS ページへ案内する。不明時は従来どおり
