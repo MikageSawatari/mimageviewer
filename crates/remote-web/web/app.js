@@ -150,7 +150,11 @@ const PAGE_LOADING_INDICATOR_DELAY_MS = 225;
 const PAGE_BOUNDARY_MESSAGE_DURATION_MS = 2400;
 // history.go(-N) は範囲外だと何も起こさない。popstate が来ないことでそれを知る。
 const VIEWER_EXIT_HISTORY_TIMEOUT_MS = 250;
-const PAGE_PREFETCH_CONCURRENCY = 2;
+// Matches the server's MAX_CONCURRENT_PAGE_PREFETCH. Three ceilings sit in
+// series -- this one, that one, and the core's remote heavy workers -- so the
+// lowest wins and raising one alone does nothing. Measured: a third concurrent
+// render earns a quarter more pages a second, a fourth earns five percent.
+const PAGE_PREFETCH_CONCURRENCY = 3;
 const CONTAINER_SPREAD_REFRESH_FAILURE_MESSAGE =
   "見開き表示を更新できませんでした。";
 export const ContainerSpreadRefreshExitReason = Object.freeze({

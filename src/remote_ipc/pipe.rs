@@ -845,10 +845,16 @@ impl Drop for ServerGuard {
 }
 
 fn remote_heavy_worker_count(configured_worker_count: usize) -> usize {
-    // IPC decode がローカル表示用 worker と CPU / disk を奪い合わないよう、
-    // 利用者設定の半分かつ最大 3 本だけを remote 専用にする。3 本ある場合も
-    // queue の pop 条件が prefetch を最大 2 本までに制限し、最後の 1 本を残す。
-    (configured_worker_count / 2).clamp(1, 3)
+    // 利用者の並列数設定をそのまま使う。かつては「ローカル表示用 worker と CPU / disk を
+    // 奪い合わないよう」半分かつ最大 3 本に絞っていたが、奪い合う相手が居ない。
+    // session は排他で、リモートが操作権を持つ間は本体の通常入力がロックされるため
+    // (plan §2.2)、その間ローカルの表示 worker は動いていない。remote 専用の割引を
+    // 持たないほうが、設定と実際の並列数が一致して保守しやすい。
+    //
+    // 上限が要る場面は remote-web 側が持つ (`MAX_CONCURRENT_PAGE_PREFETCH`)。
+    // PDF は下流の worker プールが 4 本で頭打ちになるので、ここを増やしても
+    // 実際に同時 raster される数はそれ以上には増えない。
+    configured_worker_count.max(1)
 }
 
 fn worker_loop(
@@ -4560,11 +4566,14 @@ mod tests {
     }
 
     #[test]
-    fn remote_workers_leave_capacity_for_local_operations() {
-        assert_eq!(remote_heavy_worker_count(1), 1);
-        assert_eq!(remote_heavy_worker_count(2), 1);
-        assert_eq!(remote_heavy_worker_count(4), 2);
-        assert_eq!(remote_heavy_worker_count(8), 3);
-        assert_eq!(remote_heavy_worker_count(64), 3);
+    fn remote_workers_follow_the_configured_parallelism_without_a_discount() {
+        // No remote-specific halving or ceiling: the number the user chose is the
+        // number they get. The session is exclusive, so local display workers are
+        // not running while a remote reader holds it.
+        for configured in [1, 2, 4, 8, 64] {
+            assert_eq!(remote_heavy_worker_count(configured), configured);
+        }
+        // A pool of zero would accept work nothing ever pops.
+        assert_eq!(remote_heavy_worker_count(0), 1);
     }
 }
