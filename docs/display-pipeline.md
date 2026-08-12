@@ -315,7 +315,7 @@ pending state は使わず、連結読みは対象外とする。
 戻さずに、初期 white client / サイズ遷移フラッシュを抑える。
 詳細は [docs/ui-responsiveness.md §9](ui-responsiveness.md) を参照。
 
-Ctrl+↑↓ のフォルダ横断とページ単位表示のカラー化待ちは、単一 field
+Ctrl+↑↓ のフォルダ横断と、同じ表示ユニットの final-effect source reload は、単一 field
 `fs_holdover_tex: Option<FsHoldover>` を共有する。値は typed state で相互排他になっている:
 
 - `FolderNavigation(previous)`: `previous.pages` に画面順の 1 ページ、または `[left, right]` の
@@ -323,10 +323,11 @@ Ctrl+↑↓ のフォルダ横断とページ単位表示のカラー化待ち�
   **表示ユニット単位**の hold であり、カラー化の有無とは無関係に
   `capture_fs_nav_holdover` が作る。各 page は texture に加えて capture 時点の rotation、
   canonical source size、実表示に使った単ページ / 見開き側別 content bbox を所有する。
-- `ColorizeDisplayUnit { target_idx, previous, started_at }`: `previous.pages` に画面順の 1 ページ、または
-  `[left, right]` の見開き 2 ページをまとめて保持する。`capture_colorize_page_transition_holdover` /
-  `capture_colorize_source_reload_holdover` だけがカラー化条件で作る。左右別 slot は持たず、
-  `started_at` は作業中表示の 400ms UX 閾値を variant 自身に持たせる。
+- `FinalEffectSourceReload { target_idx, previous, started_at }`: PDF の Z ズーム再レンダなど、同じ
+  表示ユニットの source が差し替わる直前に、`previous.pages` へ単ページまたは見開き全体を保持する。
+  `capture_final_effect_source_reload_holdover` だけが作り、左右別 slot は持たない。`started_at` は
+  作業中表示の 400ms UX 閾値を variant 自身に持たせる。通常のページ移動はこの state を作らず、
+  移動先の色忠実な低解像度 rendition を final composite 到着まで表示する。
 
 `fs_nav_holdover_for_draw` が有効な間、`fullscreen_idx == None` の PDF/ZIP enumerate
 gap と、`fullscreen_idx == Some` の nav ロック継続中のどちらも、カラー化側と共通の
@@ -360,8 +361,8 @@ DFS 実行中の同種入力は `start_folder_nav` の単一受付口で
 お気に入り、ツリークリックなど無関係なフォルダ切替をまたいで burst が残ることはない。
 
 フルスクリーン画像領域の合成順は、ページ画像 → ページ単位の編集オーバーレイ
-(消しゴム / クロップ / キャプチャ領域 / ルーペ) → ビュー単位の nav holdover →
-インジケータ / HUD / パネルとする。nav holdover は直前に見ていたビュー全体なので、
+(消しゴム / クロップ / キャプチャ領域 / ルーペ) → ビュー単位の holdover →
+インジケータ / HUD / パネルとする。holdover は退避時に見えていたビュー全体なので、
 移動先ページの編集矩形を旧ビューの上に重ねないよう、編集オーバーレイより後に描く。
 
 `--perf-log` 診断では `fs.paint` に `source` / `idx` / `items_generation` /
@@ -873,13 +874,16 @@ generation と erase / local-adjust / conceal の各編集世代を含むため�
 `EditResultKey` 不一致は安全側の `true` とし、要約が完成するまで従来どおり生画像へ
 フォールバックしない。`edit_result_cache` から消えた entry は次の reconcile で memo からも落とす。
 
-ページ枠での最終的な fallback 順は、`final/processed` → 連結読みのページ単位
-`continuous_page_transition_texture` → サムネイル → `読込中...` である。
-`fs_holdover_tex` はこの優先順位には入らない。`FolderNavigation` / `ColorizeDisplayUnit` とも
-ページ画像と編集 overlay の後に、共通描画で黒背景 + 旧単ページ / 旧見開き全体を重ねる。
-ただし解放条件は統合しない。フォルダ移動は `fs_nav_locked_gen` と新 anchor の表示 readiness、
-カラー化は新しい表示ユニットの全ページで final-effect 適用済み表示（または終端の読込失敗）が
-揃った描画フレームを使う。後者は「新しい左 + 古い右」や片側だけ黒になるのを防ぐ。
+ページ枠での最終的な fallback 順は、`final/processed` → ページ単位表示で final-effect 待ち中の
+色忠実 rendition → 連結読みの `continuous_page_transition_texture` → 未処理サムネイル →
+`読込中...` である。見開きの final-effect 待ちはページ別に fallback せず、片側でも final が
+未完了なら左右とも rendition、全ページが揃った frame で左右とも final へ切り替える。
+
+`fs_holdover_tex` はこの優先順位には入らない。`FolderNavigation` /
+`FinalEffectSourceReload` ともページ画像と編集 overlay の後に、共通描画で黒背景 +
+退避した単ページ / 見開き全体を重ねる。ただし解放条件は統合しない。フォルダ移動は
+`fs_nav_locked_gen` と新 anchor の表示 readiness、source reload は**同じ表示ユニット**の
+全ページで final-effect 適用済み表示（または終端の読込失敗）が揃った描画 frame を使う。
 
 Ctrl+↑↓ の nav lock 解放判定も、描画側と同じ
 `fs_display_bypasses_final_pipeline` を使う。通常表示でカラー化が有効なページは
@@ -895,9 +899,9 @@ raw `fs_cache` を直接描くため、Static / Animated またはサムネイ�
 単ページ、見開き、連結読み、ルーペが `edit_result_cache → fs_cache` のような独自チェーンを
 再実装すると、新しい派生レイヤ (消しゴム / 隠蔽加工 / AI など) の横展開漏れが起きる。
 見開きと連結読みも、画面全体で 1 枚を解決するのではなく、描画対象の **各ページ idx**
-についてこの入口を呼び、完成テクスチャが無ければそのページの transition texture /
-サムネイルへ落とす。ただしページ単位の見開きで `ColorizeDisplayUnit` が active な間は、
-各 idx の解決結果を個別公開せず、両方が揃うまで旧 unit overlay が全体を覆う。
+についてこの入口を呼ぶ。ページ単位の見開きで final-effect が未完了なら、各 idx の結果を
+個別公開せず左右とも色忠実 rendition に揃える。同一 unit の source reload 中だけは
+`FinalEffectSourceReload` が両方の final 完成まで旧 unit overlay を全体へ重ねる。
 ルーペも hit-test 後に選ばれたページ idx で同じ入口を呼ぶ。
 
 local-adjust / conceal の materialization は worker で進む。必要な local 結果が未完成なら
@@ -997,7 +1001,7 @@ page idx の processed texture をページ単位で解決し、範囲キャプ�
 `FullscreenPaintResource::source_texture()` を使う。これは加工済みの full-image texture であり、
 ズーム中に可視 source 領域だけを持つ Lanczos 拡大出力 (`paint_texture_id()`) は使わない。
 加工済み composite が未準備のページだけは既存のサムネイルカタログへフォールバックし、黒や
-点滅を挟まない。nav / colorize holdover を重ねたフレームは、ナビゲータへ渡す idx → resource も
+点滅を挟まない。nav / final-effect source-reload holdover を重ねたフレームは、ナビゲータへ渡す idx → resource も
 その display unit 全体へ置き換え、本文とナビゲータが新旧ページで食い違わないようにする。
 ナビゲータ自身は texture producer を呼ばず、UI スレッドで画像読み込みやデコードも行わない。
 比較表示では本文と同じ単一比較キャンバスをレイアウト正本とし、Wipe / Diff はナビゲータの
@@ -1009,7 +1013,7 @@ page idx の processed texture をページ単位で解決し、範囲キャプ�
 本文の primary 描画は `CompareFramePrimaryDraw` が排他的に所有する。現在ページに一致する
 `ComparePreparationState::Ready` があるフレームは準備済み比較だけを描き、`Unprepared` /
 `WaitingForSource` / `Preparing` / `Draining` と別ページの `Ready` は通常ページだけを描く。準備中に raw pinned
-texture や Wipe の切れ端を通常ページへ重ねず、準備済み比較を描いた後も nav / colorize holdover を
+texture や Wipe の切れ端を通常ページへ重ねず、準備済み比較を描いた後も nav / source-reload holdover を
 重ねない。
 比較を準備・描画できるのは `SpreadMode::Single` の単ページ表示だけとする。X / C / Shift+C / Alt+C
 の全入口は見開き表示モードで案内toastを表示して状態を変更しない。表紙が1枚だけ見える瞬間も
@@ -1105,7 +1109,7 @@ resampler texture を生成せず従来の LINEAR 表示へ戻す。フォール
 と branch につき一度 `gpu/lanczos_upscale_limit_fallback` へ記録し、3 種の拡大は
 `scale_branch` フィールドで区別する。
 
-単ページ、見開きの各ページ、縦 / 横連結読み、page transition、nav / colorize holdover、
+単ページ、見開きの各ページ、縦 / 横連結読み、page transition、nav / source-reload holdover、
 detached single / spread / continuous frozen snapshot と keep-alive backstop は同じ typed
 resource を通る。見開きは高さ合わせ係数を含むページ別実効倍率を使う。ルーペは鮮明な元画素が
 必要なので `resolve_fs_processed_texture -> TextureHandle` の元経路、pixel grid は元論理寸法の
@@ -1386,10 +1390,11 @@ processed テクスチャは配置サイズへ反映せず、raw/source のア�
 配置サイズや UV を変えない。
 通常見開き・ページ送り・連結読みは同じ画像表示ユニット列を使うため、横長ページの前後で
 単ページ扱いと一時的なずらしアンカーの扱いがずれない。
-ただし遷移 texture の所有粒度は意図的に異なる。`capture_colorize_page_transition_holdover` は
-`ReadingFlow::Paged` だけを受け付け、連結読みは従来どおり keep-set 内の
-`continuous_page_transitions[idx]` をページ別に使う。スクロールで複数 unit が同時可視になる
-連結読みへ単一の paged holdover を重ねないため、縦 / 横連結の描画挙動は変わらない。
+ただし source reload の遷移 texture は所有粒度を意図的に分ける。
+`capture_final_effect_source_reload_holdover` は `ReadingFlow::Paged` の現在 unit 全体を保持し、
+連結読みは従来どおり keep-set 内の `continuous_page_transitions[idx]` をページ別に使う。
+通常の paged ページ移動は holdover ではなく移動先 rendition が所有する。スクロールで複数 unit が
+同時可視になる連結読みへ単一の paged holdover を重ねないため、縦 / 横連結の描画挙動は変わらない。
 横連結では `ReadingDirection` により
 左→右 / 右→左の座標符号を反転する。UI で横方向を変更した場合は `SpreadMode` の
 表紙あり/なしを保ったまま LTR/RTL も同期し、ページ単位の見開き方向と横連結方向が
@@ -1653,7 +1658,7 @@ Target(15), Target(17), …` と単調増加で、逆行は 0 件。つまり**�
 
 ##### 根本原因と 2026-08-12 の修正
 
-source inspection で、見開きの表示欠落は `open_fullscreen` が前の
+当時の source inspection で、見開きの表示欠落は `open_fullscreen` が前の
 `ColorizeDisplayUnitHoldover` を capture し、`colorize_display_unit_holdover_for_draw` が対象見開きの
 全ページで final texture が解決するまでその旧 unit を通常描画の上へ重ね続ける経路と確定した。
 ナビゲーション先の frame は描かれていたが、旧 unit の overlay に隠されていたため、final が同時に
@@ -1674,7 +1679,8 @@ source inspection で、見開きの表示欠落は `open_fullscreen` が前の
   decode / final effect / AI producer を cancel する。resident cache と完成済み upload backlog は保持する。
 - release frame は current display unit だけを通常の eager materialization へ戻し、その後の通常
   prefetch を再開する。
-- 旧 `ColorizeDisplayUnitHoldover` は materialized path だけで描き、通過中の新 display unit を覆わない。
+- 通過終了後は着地点の色忠実 rendition を final 到着まで維持する。通常ページ移動は旧
+  `ColorizeDisplayUnitHoldover` を作らず、同一 unit の source reload だけが typed holdover を使う。
 
 最初の見開き修正 (96faeee6) は利用者実測で、**267 / 267 ページを順番どおり表示** (間隔中央値
 30ms)、hold 中の `decode_begin` **0 / 0 / 0**、release 後 **29〜56ms** で左右同時に完成画像へ
@@ -1748,6 +1754,21 @@ endpoint 例外は設けない。active burst が端へ達して次の repeat �
 key がまだ held でも burst を閉じて着地点を materialize する。したがって I4 は端でも必ず要求する。
 通常の移動中 burst の settle 窓は従来どおり key-up にアンカーし、burst 内の最後には要求しない。
 
+2026-08-12 の実機報告にあった「戻り hold の端で黒背景 + 中央の白文字」は、
+`ColorizeDisplayUnit` の「カラー化中…」ではなかった。active burst の最後は rendition を描いた後、
+navigation 解決で `Idle` になる。次 frame の `prepare_fullscreen_state` は materialized を選ぶが、
+着地点の final composite はまだ無いため `resolve_fs_processed_texture=None` となり、R2 のため未処理
+thumbnail も抑止する。残る `draw_fs_image` の終端が黒背景 + 中央「読込中...」だった。
+pass-through open は旧 page-transition holdover を消しているので、この frame に
+`ColorizeDisplayUnit` と「カラー化中…」は存在しない。
+
+修正後は materialized settle も同じ着地点 rendition を final 到着まで使う。見開きは片側だけ final に
+せず、片側でも final-effect 待ちなら両ページとも rendition、両 final が揃った frame で原子的に
+差し替える。開始時から端の no-op は既存 final が解決済みなので表示 source を一切変えない。
+通常ページ移動は旧ページ holdover を作らず、「カラー化中…」は同一ページの PDF 再レンダ等で
+`FinalEffectSourceReload` が 400ms を超えた場合だけ表示する。その表示開始は
+`fs/colorize_wait_indicator` (`reason=source_reload`) に一度だけ記録する。
+
 #### 2.5.6 やり直しの作業順 (2026-08-11 に更新)
 
 §2.5.1.1 で意図が確定したので、次版は「色を合わせた低解像度を出す」ことに集約する。
@@ -1759,7 +1780,7 @@ key がまだ held でも burst を閉じて着地点を materialize する。�
 3. ~~通過中はフルサイズのアップロードとデコードを始めない~~ → 実遷移バーストが active の間は
    producer 起動と UI upload 回収を保留し、既存 producer を cancel する。
 4. ~~止まったページだけ実体化する~~ → release または境界 no-op frame で current display unit を
-   eager path へ戻す。
+   eager path へ戻し、final 到着までは着地点 rendition を維持する。
 
 単一ページの `aimodel1` / 4.1MP 実 ZIP と見開きの実ログ gate は利用者実測で合格済み。境界 no-op、
 rendition の表示矩形、PDF + `MonochromeOnly` は上記の回帰テストと再実測で維持する。
@@ -1839,16 +1860,15 @@ upload だけを速くすることではない。
      スクリーントーン濃淡変換、カスタム階調 LUT
    → `final_effect_pending` worker。カラー化前の provisional texture は公開しない。
      前後ページは final composite まで先読みし、完成済みならページ移動直後からカラー表示する。
-     先読みが未完了なら、ページ単位表示では直前の表示ユニット（単ページ / 見開き全体）を
-     holdover し、対象 unit の全ページが揃った後にカラー化済み画像へ一括で切り替える。
+     先読みが未完了なら、ページ単位表示では移動先の色忠実な低解像度 rendition を表示し、
+     対象 unit の全ページが揃った frame で完成画像へ一括で切り替える。
      PDF の Z ズーム再描画など、同じ表示ページの source 解像度が更新される場合は、旧世代の
      完成済み texture を display-only holdover に退避してから live cache を無効化し、
      新世代の final composite 完成時に置き換える。AI 待ちの incomplete composite は
      final AI 到着後も同一 key の cache entry として維持し、AI 後の完成結果で直接上書きする。
-     `complete=true` の final だけが holdover / nav lock を解放する。
-     `ColorizeDisplayUnit` が 400ms 続いた場合だけ、中央の暗いラウンド矩形に
-     「カラー化中…」を表示する。通常ページ送りで即時表示を繰り返さないための実機調整値で、
-     フォルダ移動の `FolderNavigation` では表示しない。
+     `complete=true` の final だけが source-reload holdover / nav lock を解放する。
+     `FinalEffectSourceReload` が 400ms 続いた場合だけ、中央の暗いラウンド矩形に
+     「カラー化中…」を表示する。通常ページ送りとフォルダ移動の `FolderNavigation` では表示しない。
    ↓
 10. Creative 3D LUT
    → 環境設定で登録した `.cube` を適用量付きで最終表示へ適用する。
@@ -1890,10 +1910,11 @@ colorize / Creative LUT / post-filter は意図的に飛ばすため、grid / fu
   stale 結果を `FinalCompositeKey` と items 世代で拒否する。AI 先読みと同じ前後枚数の
   `final_composite_cache` を背景で 1 枚ずつ作る。先読み中は provisional texture を upload
   せず、同ページが表示対象になったときは進行中 job を昇格して再利用する。通常ページ送りでは
-  完成まで直前ページを保持し、生画像・サムネイルへフォールバックしない。待ちが 400ms を
-  超えた場合だけ「カラー化中…」を表示する。`open_fullscreen` はページ入場だけでは final
-  composite / worker を無効化しない。サムネイル自体には反映しない。連結読みは
-  `ColorizeDisplayUnit` を通らないため、このインジケータの対象外とする。
+  完成まで移動先の色忠実 rendition を保持し、生画像・未処理サムネイルへフォールバックしない。
+  同一ページの source reload holdover が 400ms を超えた場合だけ「カラー化中…」を表示する。
+  `open_fullscreen` はページ入場だけでは final composite / worker を無効化しない。カタログの
+  サムネイル自体は書き換えない。連結読みは `FinalEffectSourceReload` を通らないため、
+  このインジケータの対象外とする。
 - **Creative LUT**: カラー化後・ポストフィルタ前に適用する。登録済み `.cube` の parse 済み
   table を worker へ `Arc` で渡し、ファイル I/O は UI thread と final-effect worker の外で行う。
   LUT の選択・適用量は final composite key に含め、変更時も edit / final AI cache は保持する。

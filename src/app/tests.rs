@@ -20900,7 +20900,7 @@ mod pipeline_cache_refactor_tests {
         page_idx: usize,
         texture: egui::TextureHandle,
     ) -> FsHoldover {
-        FsHoldover::ColorizeDisplayUnit(ColorizeDisplayUnitHoldover {
+        FsHoldover::FinalEffectSourceReload(FinalEffectSourceReloadHoldover {
             target_idx,
             previous: FsDisplayUnitHoldover {
                 pages: vec![FsDisplayUnitHoldoverPage {
@@ -21069,154 +21069,6 @@ mod pipeline_cache_refactor_tests {
             },
         );
         (edit_key, final_key)
-    }
-
-    fn insert_display_final(
-        app: &mut App,
-        ctx: &egui::Context,
-        idx: usize,
-        label: &str,
-    ) -> egui::TextureId {
-        let (_, final_key) = insert_edit_and_final_cache(app, ctx, idx, label);
-        app.final_composite_cache
-            .get(&final_key)
-            .expect("display final fixture must exist")
-            .texture
-            .id()
-    }
-
-    #[test]
-    fn paged_spread_colorize_transition_holds_previous_unit_until_both_target_pages_are_ready() {
-        let ctx = egui::Context::default();
-        let mut app = setup_app();
-        for page in 0..4 {
-            push_image(&mut app, &format!("C:/pics/spread-colorize-{page}.jpg"));
-        }
-        app.rebuild_visible_indices();
-        app.reading_flow = crate::settings::ReadingFlow::Paged;
-        app.spread_mode = crate::settings::SpreadMode::Ltr;
-        app.settings.global_preset.colorize.mode = ColorizeMode::AllImages;
-        app.fullscreen_idx = Some(0);
-
-        let old_left = insert_display_final(&mut app, &ctx, 0, "spread_old_left");
-        let old_right = insert_display_final(&mut app, &ctx, 1, "spread_old_right");
-        let target_left = insert_display_final(&mut app, &ctx, 2, "spread_target_left");
-
-        app.capture_colorize_page_transition_holdover(2);
-        app.fullscreen_idx = Some(2);
-        let target_pair = app.resolve_spread_pair(2);
-        assert_eq!(target_pair, SpreadPair::Double { left: 2, right: 3 });
-
-        let held = app
-            .colorize_display_unit_holdover_for_draw(2, target_pair, false)
-            .expect("one missing target page must keep the whole previous spread");
-        assert_eq!(
-            held.pages.iter().map(|page| page.idx).collect::<Vec<_>>(),
-            vec![0, 1]
-        );
-        assert_eq!(
-            held.pages
-                .iter()
-                .map(|page| page.texture.id())
-                .collect::<Vec<_>>(),
-            vec![old_left, old_right],
-            "both old pages must remain visible as one display unit"
-        );
-        assert_eq!(
-            app.resolve_fs_display_tex(2, true)
-                .map(|texture| texture.id()),
-            Some(target_left),
-            "the ready target page may exist in cache but must not be published alone"
-        );
-        assert!(
-            app.resolve_fs_display_tex(3, true).is_none(),
-            "the missing colorized partner remains gated instead of falling back to raw"
-        );
-
-        let target_right = insert_display_final(&mut app, &ctx, 3, "spread_target_right");
-        assert!(
-            app.colorize_display_unit_holdover_for_draw(2, target_pair, false)
-                .is_none(),
-            "the old spread must be released only when both target pages are ready"
-        );
-        assert!(app.fs_holdover_tex.is_none());
-        assert_eq!(
-            [2, 3].map(|idx| app.resolve_fs_display_tex(idx, true).unwrap().id()),
-            [target_left, target_right]
-        );
-    }
-
-    #[test]
-    fn paged_single_colorize_transition_keeps_single_page_holdover_behavior() {
-        let ctx = egui::Context::default();
-        let mut app = setup_app();
-        let old_idx = push_image(&mut app, "C:/pics/single-colorize-old.jpg");
-        let target_idx = push_image(&mut app, "C:/pics/single-colorize-target.jpg");
-        app.rebuild_visible_indices();
-        app.reading_flow = crate::settings::ReadingFlow::Paged;
-        app.spread_mode = crate::settings::SpreadMode::Single;
-        app.settings.global_preset.colorize.mode = ColorizeMode::AllImages;
-        app.fullscreen_idx = Some(old_idx);
-        let old_texture = insert_display_final(&mut app, &ctx, old_idx, "single_old");
-
-        app.capture_colorize_page_transition_holdover(target_idx);
-        app.fullscreen_idx = Some(target_idx);
-        let held = app
-            .colorize_display_unit_holdover_for_draw(target_idx, SpreadPair::Single, false)
-            .expect("single-page colorize wait should retain the previous page");
-        assert_eq!(held.pages.len(), 1);
-        assert_eq!(held.pages[0].idx, old_idx);
-        assert_eq!(held.pages[0].texture.id(), old_texture);
-
-        insert_display_final(&mut app, &ctx, target_idx, "single_target");
-        assert!(
-            app.colorize_display_unit_holdover_for_draw(target_idx, SpreadPair::Single, false,)
-                .is_none()
-        );
-        assert!(app.fs_holdover_tex.is_none());
-    }
-
-    #[test]
-    fn paged_colorize_disabled_switches_without_waiting_for_display_unit() {
-        let ctx = egui::Context::default();
-        let mut app = setup_app();
-        for page in 0..4 {
-            push_image(&mut app, &format!("C:/pics/spread-plain-{page}.jpg"));
-        }
-        app.rebuild_visible_indices();
-        app.reading_flow = crate::settings::ReadingFlow::Paged;
-        app.spread_mode = crate::settings::SpreadMode::Ltr;
-        app.settings.global_preset.colorize.mode = ColorizeMode::Disabled;
-        app.fullscreen_idx = Some(0);
-        insert_display_final(&mut app, &ctx, 0, "plain_old_left");
-        insert_display_final(&mut app, &ctx, 1, "plain_old_right");
-
-        app.capture_colorize_page_transition_holdover(2);
-
-        assert!(
-            app.fs_holdover_tex.is_none(),
-            "without a final-effect gate, paged navigation must switch immediately"
-        );
-    }
-
-    #[test]
-    fn continuous_colorize_navigation_does_not_create_paged_display_unit_holdover() {
-        let ctx = egui::Context::default();
-        let mut app = setup_app();
-        let old_idx = push_image(&mut app, "C:/pics/continuous-old.jpg");
-        let target_idx = push_image(&mut app, "C:/pics/continuous-target.jpg");
-        app.rebuild_visible_indices();
-        app.reading_flow = crate::settings::ReadingFlow::Vertical;
-        app.settings.global_preset.colorize.mode = ColorizeMode::AllImages;
-        app.fullscreen_idx = Some(old_idx);
-        insert_display_final(&mut app, &ctx, old_idx, "continuous_old");
-
-        app.capture_colorize_page_transition_holdover(target_idx);
-
-        assert!(
-            app.fs_holdover_tex.is_none(),
-            "continuous reading keeps using its page-scoped transition map"
-        );
     }
 
     #[test]
@@ -21884,7 +21736,7 @@ mod pipeline_cache_refactor_tests {
         let existing_id = existing.id();
         app.fs_holdover_tex = Some(single_colorize_holdover(idx, idx, existing));
 
-        app.capture_colorize_source_reload_holdover(idx);
+        app.capture_final_effect_source_reload_holdover(idx);
         app.bump_input_generation_for_fs_cache_reload(idx);
 
         assert_eq!(
@@ -21915,7 +21767,7 @@ mod pipeline_cache_refactor_tests {
         app.fs_holdover_tex = Some(single_colorize_holdover(current_idx, current_idx, existing));
         populate_all_idx_caches(&mut app, &ctx, prefetched_idx, "prefetched_reload");
 
-        app.capture_colorize_source_reload_holdover(prefetched_idx);
+        app.capture_final_effect_source_reload_holdover(prefetched_idx);
         app.bump_input_generation_for_fs_cache_reload(prefetched_idx);
 
         assert_eq!(
@@ -22207,19 +22059,19 @@ mod pipeline_cache_refactor_tests {
             .expect("incomplete colorized composite should be displayable");
         assert_eq!(displayed.id(), provisional_id);
         assert!(
-            app.colorize_display_unit_holdover_for_draw(idx, SpreadPair::Single, false)
+            app.final_effect_source_reload_holdover_for_draw(idx, SpreadPair::Single, false)
                 .is_none(),
             "a displayable colorized replacement atomically releases the older unit"
         );
 
-        app.capture_colorize_source_reload_holdover(idx);
+        app.capture_final_effect_source_reload_holdover(idx);
         app.final_composite_cache.remove(&final_key);
         assert!(
             app.resolve_fs_processed_texture(&ctx, idx, false).is_none(),
             "the page resolver must not expose a per-page holdover fallback"
         );
         let during_rebuild = app
-            .colorize_display_unit_holdover_for_draw(idx, SpreadPair::Single, false)
+            .final_effect_source_reload_holdover_for_draw(idx, SpreadPair::Single, false)
             .expect("the captured display unit should bridge an explicit cache invalidation");
         assert_eq!(during_rebuild.pages.len(), 1);
         assert_eq!(during_rebuild.pages[0].texture.id(), provisional_id);
@@ -22249,7 +22101,7 @@ mod pipeline_cache_refactor_tests {
             .expect("complete final should replace the holdover");
         assert_eq!(displayed.id(), complete_id);
         assert!(
-            app.colorize_display_unit_holdover_for_draw(idx, SpreadPair::Single, false)
+            app.final_effect_source_reload_holdover_for_draw(idx, SpreadPair::Single, false)
                 .is_none(),
             "the ready target unit must release the old unit at the draw boundary"
         );
@@ -22282,7 +22134,7 @@ mod pipeline_cache_refactor_tests {
             .texture
             .id();
 
-        app.capture_colorize_source_reload_holdover(idx);
+        app.capture_final_effect_source_reload_holdover(idx);
         app.bump_input_generation_for_fs_cache_reload(idx);
         assert_eq!(
             app.continuous_page_transition_texture(idx)
@@ -22395,7 +22247,7 @@ mod pipeline_cache_refactor_tests {
         let (_, _, _, final_key) =
             populate_all_idx_caches(&mut app, &ctx, idx, "continuous_keep_drop");
 
-        app.capture_colorize_source_reload_holdover(idx);
+        app.capture_final_effect_source_reload_holdover(idx);
         assert!(app.continuous_page_transitions.contains_key(&idx));
 
         let keep_set = std::collections::HashSet::from([anchor]);

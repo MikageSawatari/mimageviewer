@@ -25,8 +25,8 @@ use std::sync::Arc;
 use crate::adjustment::PostFilter;
 use crate::ai::ModelKind;
 use crate::app::{
-    App, ColorizeDisplayUnitHoldover, FsDisplayUnitHoldover, FsDisplayUnitHoldoverPage, FsHoldover,
-    FsOpenMaterialization, FsPageLoadState, ViewerPresentation,
+    App, FsDisplayUnitHoldover, FsDisplayUnitHoldoverPage, FsHoldover, FsOpenMaterialization,
+    FsPageLoadState, ViewerPresentation,
 };
 use crate::displayed_image_transform::{
     DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
@@ -877,8 +877,8 @@ enum FsNavHoldoverDecision {
 
 fn colorize_wait_indicator_visible(holdover: Option<&FsHoldover>, now: std::time::Instant) -> bool {
     holdover
-        .and_then(FsHoldover::colorize_wait_started_at)
-        .is_some_and(|started_at| {
+        .and_then(FsHoldover::final_effect_wait)
+        .is_some_and(|(_, started_at)| {
             now.saturating_duration_since(started_at) >= COLORIZE_WAIT_INDICATOR_DELAY
         })
 }
@@ -4104,73 +4104,19 @@ impl App {
         })
     }
 
-    pub(crate) fn clear_colorize_display_unit_holdover(&mut self) {
+    pub(crate) fn clear_final_effect_source_reload_holdover(&mut self) {
         if matches!(
             self.fs_holdover_tex,
-            Some(FsHoldover::ColorizeDisplayUnit(_))
+            Some(FsHoldover::FinalEffectSourceReload(_))
         ) {
             self.fs_holdover_tex = None;
         }
     }
 
-    /// 同一 viewer 内のページ送りで、新しい表示ユニットの final-effect 表示が未完了の
-    /// 場合にだけ、直前の単ページまたは見開き全体を 1 unit として取得する。
-    /// フォルダ移動用 nav lock が所有中の holdover は上書きしない。
-    pub(crate) fn capture_colorize_page_transition_holdover(&mut self, target_idx: usize) {
-        if self.fs_nav_locked_gen.is_some() {
-            return;
-        }
-
-        if !self.reading_flow.is_paged() {
-            self.clear_colorize_display_unit_holdover();
-            return;
-        }
-
-        let target_pages = self.fs_display_unit_page_indices(target_idx);
-        let target_requires_final = target_pages
-            .iter()
-            .any(|&idx| self.colorize_display_requires_final_effect(idx));
-        let target_ready = target_pages
-            .iter()
-            .all(|&idx| self.resolve_fs_display_tex(idx, true).is_some());
-        if !target_requires_final || target_ready {
-            self.clear_colorize_display_unit_holdover();
-            return;
-        }
-
-        let existing_holdover = match self.fs_holdover_tex.as_ref() {
-            Some(FsHoldover::ColorizeDisplayUnit(holdover)) => {
-                Some((holdover.previous.clone(), holdover.started_at))
-            }
-            _ => None,
-        };
-        let current_previous = match self.fullscreen_idx {
-            Some(current_idx) if current_idx != target_idx => {
-                self.capture_fs_display_unit(current_idx)
-            }
-            _ => None,
-        };
-        if let Some(previous) = current_previous.or_else(|| {
-            existing_holdover
-                .as_ref()
-                .map(|(previous, _)| previous.clone())
-        }) {
-            self.fs_holdover_tex = Some(FsHoldover::ColorizeDisplayUnit(
-                ColorizeDisplayUnitHoldover {
-                    target_idx,
-                    previous,
-                    started_at: existing_holdover
-                        .map(|(_, started_at)| started_at)
-                        .unwrap_or_else(std::time::Instant::now),
-                },
-            ));
-        }
-    }
-
-    /// ページ単位表示の描画確定点で、旧表示ユニットを出すかを原子的に決める。
-    /// 新しい見開きは両ページが表示可能になるまで 1 枚も公開せず、両方が揃った
-    /// フレームで typed state を解放して一括で切り替える。
-    pub(crate) fn colorize_display_unit_holdover_for_draw(
+    /// 同じ表示ユニットの source reload 中に、旧 final-effect 表示を出すかを原子的に決める。
+    /// 見開きは両ページが表示可能になるまで旧 unit を維持し、両方が揃った
+    /// frame で typed state を解放して一括で切り替える。
+    pub(crate) fn final_effect_source_reload_holdover_for_draw(
         &mut self,
         fs_idx: usize,
         spread_pair: SpreadPair,
@@ -4183,13 +4129,13 @@ impl App {
         }
 
         let (target_idx, previous) = match self.fs_holdover_tex.as_ref() {
-            Some(FsHoldover::ColorizeDisplayUnit(holdover)) => {
+            Some(FsHoldover::FinalEffectSourceReload(holdover)) => {
                 (holdover.target_idx, holdover.previous.clone())
             }
             _ => return None,
         };
         if target_idx != fs_idx {
-            self.clear_colorize_display_unit_holdover();
+            self.clear_final_effect_source_reload_holdover();
             return None;
         }
 
@@ -4201,7 +4147,7 @@ impl App {
             .iter()
             .any(|&idx| self.colorize_display_requires_final_effect(idx))
         {
-            self.clear_colorize_display_unit_holdover();
+            self.clear_final_effect_source_reload_holdover();
             return None;
         }
 
@@ -4210,7 +4156,7 @@ impl App {
                 || matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Failed))
         });
         if target_unit_ready {
-            self.clear_colorize_display_unit_holdover();
+            self.clear_final_effect_source_reload_holdover();
             None
         } else {
             Some(previous)
@@ -4438,9 +4384,9 @@ impl App {
             return Some(texture);
         }
         if self.colorize_display_requires_final_effect(idx) {
-            // raw / edit / thumbnail gate は維持する。ページ単位表示の旧画像はここで
-            // ページ別 fallback にせず、描画確定点で `ColorizeDisplayUnit` 全体を
-            // overlay する。連結読みは従来どおりページ別 transition が所有する。
+            // raw / edit / unprocessed-thumbnail gate は維持する。ページ単位表示は
+            // color-faithful rendition、source reload は display-unit holdover、
+            // 連結読みは従来どおりページ別 transition が完成までを橋渡しする。
             return None;
         }
         self.resolve_fs_pre_overlay_texture(idx)
@@ -6618,6 +6564,17 @@ fn page_turn_decision_for_inputs(
         defer_ui_uploads: pass_through,
         passthrough_rendition_ready,
     }
+}
+
+fn settling_spread_uses_color_faithful_renditions(
+    original_preview_active: bool,
+    left_ready: bool,
+    left_requires_final: bool,
+    right_ready: bool,
+    right_requires_final: bool,
+) -> bool {
+    !original_preview_active
+        && ((!left_ready && left_requires_final) || (!right_ready && right_requires_final))
 }
 
 #[derive(Clone)]
@@ -11898,7 +11855,7 @@ impl App {
                                 state.page_turn_decision.paint_source(),
                                 FsPageTurnPaintSource::Materialized
                             )
-                            && let Some(unit) = self.colorize_display_unit_holdover_for_draw(
+                            && let Some(unit) = self.final_effect_source_reload_holdover_for_draw(
                                 fs_idx,
                                 spread_pair,
                                 state.original_preview_active,
@@ -11907,7 +11864,7 @@ impl App {
                             for page in &unit.pages {
                                 self.trace_fs_texture_choice(
                                     "fullscreen_overlay",
-                                    "colorize_display_unit_holdover",
+                                    "final_effect_source_reload_holdover",
                                     Some(page.idx),
                                     page.texture.source_texture(),
                                 );
@@ -13459,9 +13416,10 @@ impl App {
         let thumb_tex = if pass_through {
             self.ensure_passthrough_rendition(ctx, fs_idx)
         } else if waiting_for_colorize {
-            // 生サムネイルは白黒なので使わない。paged の ColorizeDisplayUnit と
-            // folder-nav holdover はページ別 fallback にせず後段の overlay で描く。
-            None
+            // The pass-through rendition already has the landing final's color
+            // decision. Keep that same visible page while full materialization
+            // catches up; exposing the raw catalog thumbnail would violate R2.
+            self.ensure_passthrough_rendition(ctx, fs_idx)
         } else {
             match self.thumbnails.get(fs_idx) {
                 Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
@@ -24496,7 +24454,27 @@ impl App {
                     .map(|texture| self.fullscreen_paint_resource_for_texture(right_idx, texture)),
             ),
         };
-        if pass_through && (left_display_tex.is_none() || right_display_tex.is_none()) {
+        let settling_with_renditions = display_override.is_none()
+            && !pass_through
+            && settling_spread_uses_color_faithful_renditions(
+                original_preview_active,
+                left_display_tex.is_some(),
+                self.colorize_display_requires_final_effect(left_idx),
+                right_display_tex.is_some(),
+                self.colorize_display_requires_final_effect(right_idx),
+            );
+        if settling_with_renditions {
+            left_display_tex = self
+                .ensure_passthrough_rendition(ctx, left_idx)
+                .map(crate::gpu_lanczos::FullscreenPaintResource::direct);
+            right_display_tex = self
+                .ensure_passthrough_rendition(ctx, right_idx)
+                .map(crate::gpu_lanczos::FullscreenPaintResource::direct);
+        }
+        let color_faithful_rendition_unit = pass_through || settling_with_renditions;
+        if color_faithful_rendition_unit
+            && (left_display_tex.is_none() || right_display_tex.is_none())
+        {
             // The visible unit is atomic. Never expose one faithful side beside one
             // missing/raw side merely because their cache readiness differs.
             left_display_tex = None;
@@ -24525,7 +24503,7 @@ impl App {
         };
         let both_in_fs_cache =
             self.fs_cache.contains_key(&left_idx) && self.fs_cache.contains_key(&right_idx);
-        let (left_size, right_size) = if pass_through {
+        let (left_size, right_size) = if color_faithful_rendition_unit {
             (
                 passthrough_layout_display_size(
                     left_source_size,
@@ -24572,11 +24550,13 @@ impl App {
             ui.painter().clone()
         };
         let left_allow_thumbnail = display_override.is_none()
+            && !settling_with_renditions
             && (pass_through
                 || (!pass_through
                     && (original_preview_active
                         || !self.colorize_display_requires_final_effect(left_idx))));
         let right_allow_thumbnail = display_override.is_none()
+            && !settling_with_renditions
             && (pass_through
                 || (!pass_through
                     && (original_preview_active
@@ -26466,20 +26446,44 @@ impl App {
         full_rect: egui::Rect,
         ctx: &egui::Context,
     ) {
-        let Some(started_at) = self
+        let indicator_id = egui::Id::new(("fs_colorize_wait_indicator_visible", ctx.viewport_id()));
+        let Some((target_idx, started_at)) = self
             .fs_holdover_tex
             .as_ref()
-            .and_then(FsHoldover::colorize_wait_started_at)
+            .and_then(FsHoldover::final_effect_wait)
         else {
+            ctx.data_mut(|data| data.insert_temp(indicator_id, false));
             return;
         };
         let now = std::time::Instant::now();
         if !colorize_wait_indicator_visible(self.fs_holdover_tex.as_ref(), now) {
+            ctx.data_mut(|data| data.insert_temp(indicator_id, false));
             ctx.request_repaint_after(
                 COLORIZE_WAIT_INDICATOR_DELAY
                     .saturating_sub(now.saturating_duration_since(started_at)),
             );
             return;
+        }
+        let became_visible = ctx.data_mut(|data| {
+            let was_visible = data.get_temp::<bool>(indicator_id).unwrap_or(false);
+            data.insert_temp(indicator_id, true);
+            !was_visible
+        });
+        if became_visible && crate::perf::is_enabled() {
+            crate::perf::event(
+                "fs",
+                "colorize_wait_indicator",
+                self.perf_item_key(target_idx).as_deref(),
+                self.input_seq,
+                &[
+                    ("idx", serde_json::Value::from(target_idx)),
+                    (
+                        "items_generation",
+                        serde_json::Value::from(self.items_generation),
+                    ),
+                    ("reason", serde_json::Value::from("source_reload")),
+                ],
+            );
         }
         paint_centered_dark_status_overlay(ui, full_rect, "カラー化中…");
     }
@@ -30679,6 +30683,64 @@ mod tests {
     }
 
     #[test]
+    fn materialized_settle_keeps_the_color_faithful_landing_rendition() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items.push(GridItem::Image(PathBuf::from(
+            "c:/test/page-turn-landing.jpg",
+        )));
+        let pixels = std::sync::Arc::new(egui::ColorImage::filled(
+            [4, 4],
+            egui::Color32::from_rgb(80, 90, 100),
+        ));
+        let catalog = ctx.load_texture(
+            "page_turn_landing_catalog",
+            (*pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.thumbnails.push(ThumbnailState::Loaded {
+            tex: catalog,
+            from_cache: false,
+            from_edit_preview: false,
+            rendered_at_px: 4,
+            source_dims: Some((400, 401)),
+        });
+        app.thumb_pixels.insert(0, pixels);
+        app.fullscreen_idx = Some(0);
+        app.reading_flow = ReadingFlow::Paged;
+        app.spread_mode = SpreadMode::Single;
+        app.settings.global_preset.colorize.mode = crate::colorize::ColorizeMode::AllImages;
+
+        let state = app.prepare_fullscreen_state(&ctx, 0, FsPageTurnDecision::normal());
+        let landing = state
+            .thumb_tex
+            .expect("the visible rendition must bridge final materialization");
+
+        assert!(state.tex.is_none());
+        assert!(app.is_passthrough_rendition_texture(&landing));
+        assert!(app.fs_holdover_tex.is_none());
+    }
+
+    #[test]
+    fn spread_settle_selects_renditions_for_the_whole_incomplete_final_effect_unit() {
+        assert!(settling_spread_uses_color_faithful_renditions(
+            false, true, false, false, true,
+        ));
+        assert!(settling_spread_uses_color_faithful_renditions(
+            false, false, true, true, false,
+        ));
+        assert!(!settling_spread_uses_color_faithful_renditions(
+            false, true, true, true, true,
+        ));
+        assert!(!settling_spread_uses_color_faithful_renditions(
+            false, false, false, false, false,
+        ));
+        assert!(!settling_spread_uses_color_faithful_renditions(
+            true, false, true, false, true,
+        ));
+    }
+
+    #[test]
     fn passthrough_thumbnail_uses_the_final_page_rectangle() {
         let viewport_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
         let source_size = egui::vec2(1000.0, 1501.0);
@@ -31831,7 +31893,7 @@ mod tests {
     }
 
     #[test]
-    fn colorize_wait_indicator_requires_colorize_state_and_full_delay() {
+    fn colorize_wait_indicator_requires_source_reload_state_and_full_delay() {
         let ctx = egui::Context::default();
         let texture = ctx.load_texture(
             "colorize_wait_indicator",
@@ -31839,26 +31901,29 @@ mod tests {
             egui::TextureOptions::LINEAR,
         );
         let started_at = std::time::Instant::now();
-        let colorize = FsHoldover::ColorizeDisplayUnit(ColorizeDisplayUnitHoldover {
-            target_idx: 0,
-            previous: FsDisplayUnitHoldover {
-                pages: vec![FsDisplayUnitHoldoverPage {
-                    idx: 0,
-                    texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture.clone()),
-                    rotation: crate::rotation_db::Rotation::None,
-                    source_size: None,
-                    content_bbox: None,
-                }],
-            },
-            started_at,
-        });
+        let source_reload =
+            FsHoldover::FinalEffectSourceReload(crate::app::FinalEffectSourceReloadHoldover {
+                target_idx: 0,
+                previous: FsDisplayUnitHoldover {
+                    pages: vec![FsDisplayUnitHoldoverPage {
+                        idx: 0,
+                        texture: crate::gpu_lanczos::FullscreenPaintResource::direct(
+                            texture.clone(),
+                        ),
+                        rotation: crate::rotation_db::Rotation::None,
+                        source_size: None,
+                        content_bbox: None,
+                    }],
+                },
+                started_at,
+            });
 
         assert!(!colorize_wait_indicator_visible(
-            Some(&colorize),
+            Some(&source_reload),
             started_at + COLORIZE_WAIT_INDICATOR_DELAY - std::time::Duration::from_millis(1),
         ));
         assert!(colorize_wait_indicator_visible(
-            Some(&colorize),
+            Some(&source_reload),
             started_at + COLORIZE_WAIT_INDICATOR_DELAY,
         ));
 

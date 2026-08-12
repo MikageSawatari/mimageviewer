@@ -6331,27 +6331,29 @@ pub(crate) struct ContinuousPageTransition {
 
 /// フルスクリーンの一時表示を 1 フィールドで所有する typed state。
 ///
-/// フォルダ横断と同一 viewer 内のカラー化待ちは、どちらも旧ページを個別 slot に
+/// フォルダ横断と同一 viewer 内の final-effect source reload は、どちらも旧ページを個別 slot に
 /// 分けず、画面上の 1 表示ユニット（単ページまたは見開き）を一体で保持する。
 /// variant は保持する理由と解放条件を分離するために維持する。
 #[derive(Clone)]
 pub(crate) enum FsHoldover {
     FolderNavigation(FsDisplayUnitHoldover),
-    ColorizeDisplayUnit(ColorizeDisplayUnitHoldover),
+    FinalEffectSourceReload(FinalEffectSourceReloadHoldover),
 }
 
 impl FsHoldover {
     pub(crate) fn folder_navigation_display_unit(&self) -> Option<&FsDisplayUnitHoldover> {
         match self {
             Self::FolderNavigation(unit) => Some(unit),
-            Self::ColorizeDisplayUnit(_) => None,
+            Self::FinalEffectSourceReload(_) => None,
         }
     }
 
-    pub(crate) fn colorize_wait_started_at(&self) -> Option<std::time::Instant> {
+    pub(crate) fn final_effect_wait(&self) -> Option<(usize, std::time::Instant)> {
         match self {
             Self::FolderNavigation(_) => None,
-            Self::ColorizeDisplayUnit(holdover) => Some(holdover.started_at),
+            Self::FinalEffectSourceReload(holdover) => {
+                Some((holdover.target_idx, holdover.started_at))
+            }
         }
     }
 
@@ -6364,11 +6366,11 @@ impl FsHoldover {
                 .expect("folder navigation display unit must contain at least one page")
                 .texture
                 .id(),
-            Self::ColorizeDisplayUnit(holdover) => holdover
+            Self::FinalEffectSourceReload(holdover) => holdover
                 .previous
                 .pages
                 .first()
-                .expect("colorize display unit must contain at least one page")
+                .expect("final-effect source reload must contain at least one page")
                 .texture
                 .id(),
         }
@@ -6376,11 +6378,11 @@ impl FsHoldover {
 }
 
 #[derive(Clone)]
-pub(crate) struct ColorizeDisplayUnitHoldover {
-    /// `open_fullscreen` 後にこの idx が current である間だけ previous を公開する。
+pub(crate) struct FinalEffectSourceReloadHoldover {
+    /// source reload 後にこの idx が current である間だけ previous を公開する。
     pub(crate) target_idx: usize,
     pub(crate) previous: FsDisplayUnitHoldover,
-    /// The UX delay belongs to the typed colorize wait state, not to a separate flag.
+    /// The UX delay belongs to the typed source-reload wait state, not to a separate flag.
     pub(crate) started_at: std::time::Instant,
 }
 
@@ -11468,7 +11470,7 @@ pub struct App {
     /// ロックを即解除してしまい、items 入れ替えの瞬間に holdover が失われて
     /// 「ファイル名のみ表示」が出る不具合になる。
     pub(crate) fs_nav_locked_gen: Option<u64>,
-    /// 旧表示を保持する単一 typed state。`FolderNavigation` / `ColorizeDisplayUnit` とも
+    /// 旧表示を保持する単一 typed state。folder navigation / final-effect source reload とも
     /// 単ページ / 見開き全体を 1 unit として持ち、variant ごとに解放条件を分離する。
     /// legacy 名は context bundle の機械的な差分を抑えるため維持している。
     pub(crate) fs_holdover_tex: Option<FsHoldover>,
@@ -41357,15 +41359,11 @@ impl App {
             return;
         }
 
-        // viewer 内ページ送りでは idx を差し替える前に、カラー化待ち用の完成表示と
-        // 前ページの完成済み編集結果を退避する。grid からの新規入場では
-        // fullscreen_idx=None なので holdover は空になる。
+        // A final-effect source-reload holdover belongs to one unchanged display unit.
+        // Moving to another idx ends that lifetime. Page navigation itself uses the
+        // target's color-faithful rendition until the final composite is ready.
         if self.fullscreen_idx != Some(idx) {
-            if materialization.is_eager() {
-                self.capture_colorize_page_transition_holdover(idx);
-            } else {
-                self.clear_colorize_display_unit_holdover();
-            }
+            self.clear_final_effect_source_reload_holdover();
         }
         if self.fullscreen_idx.is_some() && self.fullscreen_idx != Some(idx) {
             self.cache_current_edit_preview_if_ready();
@@ -52809,7 +52807,7 @@ impl App {
     /// holdover へ退避する。ページ単位表示は現在の表示ユニット全体、連結読みは
     /// 従来どおりページ別 transition が所有する。初回ロードでは
     /// `resolve_fs_display_tex` が `None` を返すので、既存 holdover は上書きしない。
-    pub(crate) fn capture_colorize_source_reload_holdover(&mut self, idx: usize) {
+    pub(crate) fn capture_final_effect_source_reload_holdover(&mut self, idx: usize) {
         if self.fs_nav_locked_gen.is_some() || !self.colorize_display_requires_final_effect(idx) {
             return;
         }
@@ -52824,8 +52822,8 @@ impl App {
                 && self.fs_display_unit_page_indices(fs_idx).contains(&idx)
                 && let Some(previous) = self.capture_fs_display_unit(fs_idx)
             {
-                self.fs_holdover_tex = Some(FsHoldover::ColorizeDisplayUnit(
-                    ColorizeDisplayUnitHoldover {
+                self.fs_holdover_tex = Some(FsHoldover::FinalEffectSourceReload(
+                    FinalEffectSourceReloadHoldover {
                         target_idx: fs_idx,
                         previous,
                         started_at: std::time::Instant::now(),
@@ -60341,7 +60339,7 @@ impl App {
                     | FsLoadResult::StaticCached { .. }
                     | FsLoadResult::StaticPanorama { .. }
             ) {
-                self.capture_colorize_source_reload_holdover(key);
+                self.capture_final_effect_source_reload_holdover(key);
             }
             let entry = match result {
                 FsLoadResult::Static { ci, source_dims } => {
