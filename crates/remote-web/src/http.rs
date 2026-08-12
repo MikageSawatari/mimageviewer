@@ -1,12 +1,14 @@
 use std::collections::{HashMap, VecDeque};
 #[cfg(not(feature = "embedded-web-assets"))]
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use mimageviewer_ipc::{
     CollectionErrorCode, CollectionKind, FavoriteSearchIndexState, FavoriteSearchKind,
     FavoriteSearchRequest, MediaErrorCode, PageDemandRequest, PagePriority, RemoteAddress,
@@ -46,6 +48,7 @@ const MAX_HTTP_ADDRESS_PATHS: usize = 16;
 const MAX_TELEMETRY_EVENTS: usize = 128;
 const TELEMETRY_REQUESTS_PER_WINDOW: usize = 30;
 const TELEMETRY_WINDOW: Duration = Duration::from_secs(60);
+const MIN_GZIP_BODY_BYTES: usize = 1024;
 pub const HTTP_WORKER_COUNT: usize = 12;
 pub const MAX_CONCURRENT_IPC: usize = 6;
 pub const MAX_CONCURRENT_HEAVY_IPC: usize = 4;
@@ -501,9 +504,10 @@ pub fn handle(mut request: Request, state: &Arc<AppState>) {
     let method = request.method().to_string();
     let raw_url = request.url().to_owned();
     let path = split_url(&raw_url).0;
-    let video_route = path.starts_with("/api/video/") || path.starts_with("/stream/");
+    let accepts_gzip = request_accepts_gzip(&request);
     let proxy_details = request_proxy_details(&request);
-    let mut response = finalize_response(route(&mut request, state), video_route, request_id);
+    let mut response =
+        finalize_response(route(&mut request, state), path, accepts_gzip, request_id);
     let status = response.status;
     let response_bytes = response.body.len();
     let mut details = response.log_details.take().unwrap_or_else(|| json!({}));
@@ -527,12 +531,47 @@ pub fn handle(mut request: Request, state: &Arc<AppState>) {
     }
 }
 
-fn finalize_response(response: HttpResponse, video_route: bool, request_id: u64) -> HttpResponse {
-    let response = if video_route {
+fn finalize_response(
+    response: HttpResponse,
+    path: &str,
+    accepts_gzip: bool,
+    request_id: u64,
+) -> HttpResponse {
+    let mut response = if path.starts_with("/api/video/") || path.starts_with("/stream/") {
         response.with_body_error_code_log()
     } else {
         response
     };
+
+    // Vary goes on every response that *could* be compressed, not only the ones that
+    // were. Whether a cache holds the compressed or the plain form depends on the
+    // request header either way, so it has to key on it either way.
+    let compressible = response
+        .content_type
+        .split(';')
+        .next()
+        .is_some_and(|content_type| content_type.trim().eq_ignore_ascii_case("application/json"))
+        && !path.starts_with("/api/auth/")
+        && !path.starts_with("/stream/");
+    if compressible {
+        response = response.with_header("Vary", "Accept-Encoding");
+    }
+    if compressible && accepts_gzip && response.body.len() >= MIN_GZIP_BODY_BYTES {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        match encoder
+            .write_all(&response.body)
+            .and_then(|()| encoder.finish())
+        {
+            Ok(body) => {
+                response.body = body;
+                response = response.with_header("Content-Encoding", "gzip");
+            }
+            Err(error) => {
+                eprintln!("remote-web: JSON response compression failed: {error}");
+            }
+        }
+    }
+
     response
         .with_header("X-Content-Type-Options", "nosniff")
         .with_header("Referrer-Policy", "no-referrer")
@@ -4236,6 +4275,43 @@ fn header_value<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
     })
 }
 
+fn request_accepts_gzip(request: &Request) -> bool {
+    request
+        .headers()
+        .iter()
+        .filter(|header| {
+            header
+                .field
+                .as_str()
+                .as_str()
+                .eq_ignore_ascii_case("Accept-Encoding")
+        })
+        .flat_map(|header| header.value.as_str().split(','))
+        .any(|encoding| {
+            let mut parts = encoding.split(';');
+            if !parts
+                .next()
+                .is_some_and(|name| name.trim().eq_ignore_ascii_case("gzip"))
+            {
+                return false;
+            }
+
+            let mut quality = 1.0_f32;
+            for parameter in parts {
+                let Some((name, value)) = parameter.split_once('=') else {
+                    continue;
+                };
+                if name.trim().eq_ignore_ascii_case("q") {
+                    let Ok(parsed) = value.trim().parse::<f32>() else {
+                        return false;
+                    };
+                    quality = parsed;
+                }
+            }
+            quality > 0.0 && quality <= 1.0
+        })
+}
+
 fn remote_client_header(request: &Request) -> Option<&str> {
     header_value(request, "X-mIV-Remote-Client").filter(|value| {
         (8..=128).contains(&value.len())
@@ -4414,9 +4490,44 @@ mod tests {
     }
 
     fn finalized_route(request: &mut Request, state: &AppState, request_id: u64) -> HttpResponse {
-        let path = split_url(request.url()).0;
-        let video_route = path.starts_with("/api/video/") || path.starts_with("/stream/");
-        finalize_response(route(request, state), video_route, request_id)
+        let path = split_url(request.url()).0.to_owned();
+        let accepts_gzip = request_accepts_gzip(request);
+        finalize_response(route(request, state), &path, accepts_gzip, request_id)
+    }
+
+    fn finalize_for_test(
+        response: HttpResponse,
+        path: &str,
+        accept_encoding: Option<&str>,
+        request_id: u64,
+    ) -> HttpResponse {
+        let mut request = TestRequest::new().with_method(Method::Get).with_path(path);
+        if let Some(value) = accept_encoding {
+            request = request.with_header(Header::from_bytes("Accept-Encoding", value).unwrap());
+        }
+        let request: Request = request.into();
+        finalize_response(response, path, request_accepts_gzip(&request), request_id)
+    }
+
+    fn response_header_values<'a>(response: &'a HttpResponse, name: &str) -> Vec<&'a str> {
+        response
+            .headers
+            .iter()
+            .filter_map(|(candidate, value)| {
+                candidate
+                    .eq_ignore_ascii_case(name)
+                    .then_some(value.as_str())
+            })
+            .collect()
+    }
+
+    fn large_json_body() -> Vec<u8> {
+        let body = serde_json::to_vec(&json!({
+            "items": vec!["C:/shared/library/folder/image-0001.jpg"; 128]
+        }))
+        .unwrap();
+        assert!(body.len() >= MIN_GZIP_BODY_BYTES);
+        body
     }
 
     fn assert_common_response_headers(response: &HttpResponse, request_id: u64) {
@@ -4483,6 +4594,97 @@ mod tests {
     }
 
     #[test]
+    fn large_json_response_is_gzipped_and_keeps_common_headers() {
+        let original = large_json_body();
+        let response = finalize_for_test(
+            HttpResponse::bytes(200, "application/json; charset=utf-8", original.clone()),
+            "/api/items",
+            Some("br, GZip; q=0.5"),
+            501,
+        );
+
+        assert_eq!(
+            response_header_values(&response, "Content-Encoding"),
+            ["gzip"]
+        );
+        assert_eq!(
+            response_header_values(&response, "Vary"),
+            ["Accept-Encoding"]
+        );
+        assert!(response.body.len() < original.len());
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(response.body.as_slice())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, original);
+        assert_common_response_headers(&response, 501);
+    }
+
+    #[test]
+    fn json_response_is_not_gzipped_without_acceptable_gzip() {
+        let original = large_json_body();
+        for accept_encoding in [None, Some("br"), Some("gzip;q=0")] {
+            let response = finalize_for_test(
+                HttpResponse::bytes(200, "application/json; charset=utf-8", original.clone()),
+                "/api/items",
+                accept_encoding,
+                502,
+            );
+            assert_eq!(response.body, original, "{accept_encoding:?}");
+            assert!(response_header_values(&response, "Content-Encoding").is_empty());
+            // Still Vary: which form this URL returns depends on the request header,
+            // so a cache has to key on it even when this particular reply is plain.
+            assert_eq!(
+                response_header_values(&response, "Vary"),
+                ["Accept-Encoding"],
+                "{accept_encoding:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn already_compressed_media_response_is_not_gzipped() {
+        let original = vec![0x5a; MIN_GZIP_BODY_BYTES * 2];
+        let response = finalize_for_test(
+            HttpResponse::bytes(200, "image/jpeg", original.clone()),
+            "/api/thumbnail",
+            Some("gzip"),
+            503,
+        );
+        assert_eq!(response.body, original);
+        assert!(response_header_values(&response, "Content-Encoding").is_empty());
+    }
+
+    #[test]
+    fn small_json_response_is_not_gzipped() {
+        let original = br#"{"status":"ok"}"#.to_vec();
+        assert!(original.len() < MIN_GZIP_BODY_BYTES);
+        let response = finalize_for_test(
+            HttpResponse::bytes(200, "application/json", original.clone()),
+            "/api/status",
+            Some("gzip"),
+            504,
+        );
+        assert_eq!(response.body, original);
+        assert!(response_header_values(&response, "Content-Encoding").is_empty());
+    }
+
+    #[test]
+    fn auth_and_stream_responses_are_not_gzipped() {
+        let original = large_json_body();
+        for path in ["/api/auth/status", "/stream/example"] {
+            let response = finalize_for_test(
+                HttpResponse::bytes(200, "application/json", original.clone()),
+                path,
+                Some("gzip"),
+                505,
+            );
+            assert_eq!(response.body, original, "{path}");
+            assert!(response_header_values(&response, "Content-Encoding").is_empty());
+        }
+    }
+
+    #[test]
     fn video_error_finalization_preserves_the_body_error_code_for_request_logging() {
         let response = finalize_response(
             HttpResponse::bytes(
@@ -4490,7 +4692,8 @@ mod tests {
                 "application/json; charset=utf-8",
                 br#"{"error":"stream_not_ready"}"#.to_vec(),
             ),
-            true,
+            "/api/video/example",
+            false,
             77,
         );
         assert_eq!(
@@ -5335,7 +5538,8 @@ mod tests {
                     retry_count: 0,
                     retry_statuses: Vec::new(),
                 }),
-                true,
+                "/api/video/example",
+                false,
                 1,
             );
             assert_eq!(mismatch.status, 409);
@@ -5364,7 +5568,8 @@ mod tests {
                     retry_count: 0,
                     retry_statuses: Vec::new(),
                 }),
-                true,
+                "/api/video/example",
+                false,
                 1,
             );
             assert_eq!(timeout.status, 504);

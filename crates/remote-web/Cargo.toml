@@ -18,6 +18,7 @@ path = "src/main.rs"
 argon2 = "0.5"
 getrandom = "0.3"
 fast_image_resize = { version = "5", features = ["image"] }
+flate2 = "1"
 hmac = "0.12"
 image = { version = "0.25", features = ["jpeg", "png", "webp", "bmp", "gif"] }
 mimageviewer-ipc = { path = "../remote-ipc" }
