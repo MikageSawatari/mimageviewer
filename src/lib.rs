@@ -160,6 +160,7 @@ pub mod search_norm;
 pub mod search_query;
 pub mod search_walker;
 pub mod search_watcher;
+mod seek_ruler;
 pub mod settings;
 pub mod settings_db;
 pub mod settings_restore;

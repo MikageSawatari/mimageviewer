@@ -14,7 +14,9 @@ use crate::ring_shortcut::{
 use crate::settings::{Parallelism, Settings};
 
 mod pages;
+mod search_index;
 use self::pages::*;
+use self::search_index::{PrefSearchEntry, search_preferences};
 
 fn pref_panel_scroll_style() -> egui::style::ScrollStyle {
     let mut scroll = egui::style::ScrollStyle::solid();
@@ -127,7 +129,40 @@ pub(crate) enum PreferencesPage {
 }
 
 impl PreferencesPage {
-    fn label(self) -> &'static str {
+    #[cfg(test)]
+    const ALL: &'static [Self] = &[
+        Self::General,
+        Self::Font,
+        Self::StartupFolder,
+        Self::ExplorerIntegration,
+        Self::Thumbnail,
+        Self::Slideshow,
+        Self::Capture,
+        Self::CreativeLut,
+        Self::MenuLayout,
+        Self::Parallelism,
+        Self::Prefetch,
+        Self::GpuMemory,
+        Self::AiBackend,
+        Self::Cache,
+        Self::Folder,
+        Self::Book,
+        Self::DuplicateFiles,
+        Self::ExifDisplay,
+        Self::SpreadMode,
+        Self::PlaybackResume,
+        Self::SusiePlugins,
+        Self::IndexerSpeed,
+        Self::TrayResidency,
+        Self::Rating,
+        Self::UpdateCheck,
+        Self::Video,
+        Self::Vst3,
+        Self::EditingAddon,
+        Self::Developer,
+    ];
+
+    pub(super) fn label(self) -> &'static str {
         match self {
             Self::General => "全体設定",
             Self::Font => "フォント",
@@ -482,6 +517,14 @@ pub(crate) struct PreferencesState {
     /// 右ペインのスクロール状態をページ切替ごとに新しくする世代。
     /// 同じページの再描画では維持し、別ページへ移ったときだけ増やす。
     pub right_panel_scroll_generation: u64,
+    /// 左ツリー上部の環境設定検索文字列。
+    pub search_query: String,
+    /// 右ペインを設定ページではなく検索結果一覧へ切り替える。
+    pub showing_results: bool,
+    /// 検索結果から遷移した直後にスクロールするページ内 anchor。
+    pub pending_anchor: Option<&'static str>,
+    /// 現在強調表示している anchor と表示開始時刻 (egui input time)。
+    pub highlight: Option<(&'static str, f64)>,
     /// 展開中のカテゴリラベル
     pub expanded: HashSet<&'static str>,
 
@@ -727,6 +770,10 @@ impl PreferencesState {
             settings: s.clone(),
             selected: PreferencesPage::General,
             right_panel_scroll_generation: 0,
+            search_query: String::new(),
+            showing_results: false,
+            pending_anchor: None,
+            highlight: None,
             expanded,
             ui_font_catalog: Vec::new(),
             ui_font_filter: String::new(),
@@ -1149,6 +1196,135 @@ fn advance_preferences_scroll_generation_on_open(
     })
 }
 
+const PREFERENCE_HIGHLIGHT_SECS: f64 = 2.5;
+
+/// ページ内の検索対象コントロールへ anchor を付ける。
+/// ui.scope の既存レイアウトをそのまま使い、余白や折り返し幅は追加しない。
+pub(super) fn anchored<R>(
+    ui: &mut egui::Ui,
+    state: &mut PreferencesState,
+    anchor: &'static str,
+    add: impl FnOnce(&mut egui::Ui, &mut PreferencesState) -> R,
+) -> R {
+    let response = ui.scope(|ui| add(ui, state));
+    let rect = response.response.rect;
+
+    if state.pending_anchor == Some(anchor) {
+        ui.scroll_to_rect(rect, Some(egui::Align::Center));
+        state.pending_anchor = None;
+        state.highlight = Some((anchor, ui.ctx().input(|input| input.time)));
+    }
+
+    if let Some((highlighted, started_at)) = state.highlight
+        && highlighted == anchor
+    {
+        let now = ui.ctx().input(|input| input.time);
+        if now - started_at <= PREFERENCE_HIGHLIGHT_SECS {
+            ui.painter().rect_stroke(
+                rect.expand(2.0),
+                4.0,
+                ui.visuals().selection.stroke,
+                egui::StrokeKind::Outside,
+            );
+            ui.ctx().request_repaint();
+        } else {
+            state.highlight = None;
+        }
+    }
+
+    response.inner
+}
+
+fn preference_category(page: PreferencesPage) -> (&'static str, usize, usize) {
+    for (category_index, category) in TREE.iter().enumerate() {
+        if category.page == Some(page) {
+            return (category.label, category_index, 0);
+        }
+        for (page_index, candidate) in category.children.iter().enumerate() {
+            if *candidate == page {
+                return (category.label, category_index, page_index);
+            }
+        }
+    }
+    unreachable!("every PreferencesPage must be present in TREE")
+}
+
+fn select_preference_search_result(state: &mut PreferencesState, entry: &PrefSearchEntry) {
+    state.selected = entry.page;
+    state.right_panel_scroll_generation = state.right_panel_scroll_generation.wrapping_add(1);
+    state.pending_anchor = Some(entry.anchor);
+    state.highlight = None;
+    state.showing_results = false;
+    let (category, _, _) = preference_category(entry.page);
+    if TREE
+        .iter()
+        .find(|candidate| candidate.label == category)
+        .is_some_and(|candidate| !candidate.children.is_empty())
+    {
+        state.expanded.insert(category);
+    }
+}
+
+fn draw_preference_search(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    let width = ui.available_width();
+    let response = crate::ime_focus::add_singleline(ui, &mut state.search_query, None, |edit| {
+        edit.desired_width(width).hint_text("設定を検索")
+    });
+    if response.changed() {
+        state.showing_results = !state.search_query.trim().is_empty();
+    }
+    ui.add_space(6.0);
+}
+
+fn draw_preference_search_results(
+    ui: &mut egui::Ui,
+    query: &str,
+) -> Option<&'static PrefSearchEntry> {
+    ui.heading("検索結果");
+    ui.add_space(8.0);
+    let results = search_preferences(query, preference_category);
+    if results.is_empty() {
+        ui.label("一致する設定がありません");
+        return None;
+    }
+    let mut selected = None;
+    for entry in results {
+        let category = preference_category(entry.page).0;
+        let mut category_path = category.to_owned();
+        category_path.push(' ');
+        category_path.push('\u{203a}');
+        category_path.push(' ');
+        category_path.push_str(entry.page.label());
+        let row_height = ui.spacing().interact_size.y + 8.0;
+        let size = egui::vec2(ui.available_width(), row_height);
+        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+        if response.hovered() {
+            ui.painter()
+                .rect_filled(rect, 3.0, ui.visuals().widgets.hovered.bg_fill);
+        }
+        let left_max_x = (rect.max.x - 155.0).max(rect.min.x);
+        let left_rect = egui::Rect::from_min_max(rect.min, egui::pos2(left_max_x, rect.max.y));
+        ui.painter().with_clip_rect(left_rect).text(
+            egui::pos2(rect.min.x + 6.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            entry.title,
+            egui::TextStyle::Body.resolve(ui.style()),
+            ui.visuals().text_color(),
+        );
+        ui.painter().text(
+            egui::pos2(rect.max.x - 6.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            category_path,
+            egui::TextStyle::Small.resolve(ui.style()),
+            ui.visuals().weak_text_color(),
+        );
+        if response.clicked() {
+            selected = Some(entry);
+        }
+    }
+    selected
+}
+
 /// 指定ディレクトリ配下のファイル合計サイズを返す。エラーや不在は 0。
 /// AI バックエンドページの "X MiB を解放" 表示等で使う。
 fn dir_size_bytes(dir: &std::path::Path) -> u64 {
@@ -1409,9 +1585,11 @@ impl App {
                         .layout(egui::Layout::top_down(egui::Align::Min)),
                 );
                 let selected_before_tree = state.selected;
+                draw_preference_search(&mut left_ui, state);
+                let tree_height = left_ui.available_height().max(0.0);
                 egui::ScrollArea::vertical()
                     .id_salt("pref_tree")
-                    .max_height(main_height)
+                    .max_height(tree_height)
                     .auto_shrink([false, false])
                     .show(&mut left_ui, |ui| {
                         ui.set_min_width(tree_width - 12.0);
@@ -1440,6 +1618,14 @@ impl App {
                 // スクロールバーは本文上に重なるため、右端ボタンや区切り線が読みにくくなる。
                 right_ui.spacing_mut().scroll = pref_panel_scroll_style();
                 let mut command_capture_waiting = false;
+                if enter_pressed && state.showing_results {
+                    let first = search_preferences(&state.search_query, preference_category)
+                        .into_iter()
+                        .next();
+                    if let Some(entry) = first {
+                        select_preference_search_result(state, entry);
+                    }
+                }
                 egui::ScrollArea::vertical()
                     .id_salt(("pref_panel", state.right_panel_scroll_generation))
                     .scroll_bar_visibility(
@@ -1450,7 +1636,14 @@ impl App {
                     .show(&mut right_ui, |ui| {
                         ui.set_width(ui.available_width());
                         command_capture_waiting = state.command_capture_slot.is_some();
-                        draw_page(ui, state, enter_pressed);
+                        if state.showing_results {
+                            let query = state.search_query.clone();
+                            if let Some(entry) = draw_preference_search_results(ui, &query) {
+                                select_preference_search_result(state, entry);
+                            }
+                        } else {
+                            draw_page(ui, state, enter_pressed);
+                        }
                     });
 
                 // 全体の高さを確保
@@ -1462,7 +1655,12 @@ impl App {
 
                 // Esc でキャンセル (IME 変換中はスキップ)
                 if escape_pressed && !command_capture_waiting {
-                    cancel = true;
+                    if state.showing_results || !state.search_query.is_empty() {
+                        state.search_query.clear();
+                        state.showing_results = false;
+                    } else {
+                        cancel = true;
+                    }
                 }
 
                 ui.horizontal(|ui| {
@@ -2398,6 +2596,7 @@ fn draw_tree(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 let selected = state.selected == page;
                 if ui.selectable_label(selected, cat.label).clicked() {
                     state.selected = page;
+                    state.showing_results = false;
                 }
             }
         } else {
@@ -2419,11 +2618,13 @@ fn draw_tree(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 }
                 if let Some(page) = cat.page {
                     state.selected = page;
+                    state.showing_results = false;
                 } else if !is_expanded
                     && !cat.children.contains(&state.selected)
                     && let Some(&first_child) = cat.children.first()
                 {
                     state.selected = first_child;
+                    state.showing_results = false;
                 }
             }
 
@@ -2434,6 +2635,7 @@ fn draw_tree(ui: &mut egui::Ui, state: &mut PreferencesState) {
                     let text = format!("    {}", child.label());
                     if ui.selectable_label(selected, text).clicked() {
                         state.selected = child;
+                        state.showing_results = false;
                     }
                 }
             }
@@ -2485,6 +2687,30 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preferences_search_results_snapshot() {
+        use egui_kittest::Harness;
+
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(560.0, 320.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_width(ui.available_width());
+                    let _ = draw_preference_search_results(ui, "GPU");
+                });
+            });
+        harness.run();
+        harness.snapshot("preferences_search_results");
+    }
 
     fn assert_selection_bar_matches_details(settings: &crate::settings::Settings) {
         assert_eq!(

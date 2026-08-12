@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 
 const CATALOG_VERSION: &str = "2";
 const PDF_LAYOUT_DIMS_META_KEY: &str = "pdf_layout_dims_version";
-const PDF_LAYOUT_DIMS_VERSION: &str = "1";
+const PDF_LAYOUT_DIMS_VERSION: &str = "2";
 pub const THUMB_LONG_SIDE: u32 = 512;
 
 // -----------------------------------------------------------------------
@@ -41,10 +41,19 @@ pub struct CacheEntry {
     pub mtime: i64,
     pub file_size: i64,
     pub jpeg_data: Vec<u8>,
-    /// 元画像の寸法 (幅, 高さ)。通常画像 / archive entry はピクセル、PDF は page box を
-    /// 1/1000 point で表すレイアウト寸法。いずれも thumbnail raster の寸法ではない。
+    /// 元画像 / PDF thumbnail raster のピクセル寸法 (幅, 高さ)。
     /// 旧バージョンで保存されたエントリには NULL が入るため Option で表現する。
     pub source_dims: Option<(u32, u32)>,
+    /// raster の整数丸めに依存しないレイアウト寸法。PDF page box を 1/1000 point で
+    /// 保持する。通常画像と旧エントリは NULL。
+    pub layout_dims: Option<(u32, u32)>,
+}
+
+fn valid_dims(width: Option<u32>, height: Option<u32>) -> Option<(u32, u32)> {
+    match (width, height) {
+        (Some(width), Some(height)) if width > 0 && height > 0 => Some((width, height)),
+        _ => None,
+    }
 }
 
 /// ZIP / 画像のみフォルダ / 変換対象アーカイブのページ数キャッシュ種別。
@@ -80,6 +89,7 @@ pub fn decode_thumb_dims(data: &[u8]) -> Option<(u32, u32)> {
 
 pub struct CatalogDb {
     conn: Mutex<Connection>,
+    has_layout_dims_columns: bool,
 }
 
 impl CatalogDb {
@@ -96,6 +106,7 @@ impl CatalogDb {
         migrate_pdf_layout_dims(&mut conn, folder_path)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            has_layout_dims_columns: true,
         })
     }
 
@@ -113,18 +124,27 @@ impl CatalogDb {
             return Ok(None);
         }
         let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let has_layout_dims_columns = thumbnail_column_exists(&conn, "layout_width")?
+            && thumbnail_column_exists(&conn, "layout_height")?;
         Ok(Some(Self {
             conn: Mutex::new(conn),
+            has_layout_dims_columns,
         }))
     }
 
     /// DB 内の全エントリを HashMap<filename, CacheEntry> として返す（一括 SELECT）。
     pub fn load_all(&self) -> rusqlite::Result<HashMap<String, CacheEntry>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT filename, mtime, file_size, thumb_data, source_width, source_height \
-             FROM thumbnails",
-        )?;
+        let layout_columns = if self.has_layout_dims_columns {
+            "layout_width, layout_height"
+        } else {
+            "NULL, NULL"
+        };
+        let sql = format!(
+            "SELECT filename, mtime, file_size, thumb_data, source_width, source_height, \
+                    {layout_columns} FROM thumbnails"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let mut map = HashMap::new();
         let iter = stmt.query_map([], |row| {
             Ok((
@@ -134,10 +154,12 @@ impl CatalogDb {
                 row.get::<_, Vec<u8>>(3)?,
                 row.get::<_, Option<u32>>(4)?,
                 row.get::<_, Option<u32>>(5)?,
+                row.get::<_, Option<u32>>(6)?,
+                row.get::<_, Option<u32>>(7)?,
             ))
         })?;
         for item in iter.flatten() {
-            let (filename, mtime, file_size, jpeg_data, src_w, src_h) = item;
+            let (filename, mtime, file_size, jpeg_data, src_w, src_h, layout_w, layout_h) = item;
             let source_dims = match (src_w, src_h) {
                 (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
                 _ => None,
@@ -149,6 +171,7 @@ impl CatalogDb {
                     file_size,
                     jpeg_data,
                     source_dims,
+                    layout_dims: valid_dims(layout_w, layout_h),
                 },
             );
         }
@@ -159,10 +182,16 @@ impl CatalogDb {
     /// 場合用 (例: 仮想フォルダ進入時の親 catalog からの seed lookup)。
     pub fn load_one(&self, filename: &str) -> rusqlite::Result<Option<CacheEntry>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT mtime, file_size, thumb_data, source_width, source_height \
-             FROM thumbnails WHERE filename = ?1",
-        )?;
+        let layout_columns = if self.has_layout_dims_columns {
+            "layout_width, layout_height"
+        } else {
+            "NULL, NULL"
+        };
+        let sql = format!(
+            "SELECT mtime, file_size, thumb_data, source_width, source_height, \
+                    {layout_columns} FROM thumbnails WHERE filename = ?1"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let mut iter = stmt.query_map(params![filename], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -170,10 +199,12 @@ impl CatalogDb {
                 row.get::<_, Vec<u8>>(2)?,
                 row.get::<_, Option<u32>>(3)?,
                 row.get::<_, Option<u32>>(4)?,
+                row.get::<_, Option<u32>>(5)?,
+                row.get::<_, Option<u32>>(6)?,
             ))
         })?;
         if let Some(item) = iter.next() {
-            let (mtime, file_size, jpeg_data, src_w, src_h) = item?;
+            let (mtime, file_size, jpeg_data, src_w, src_h, layout_w, layout_h) = item?;
             let source_dims = match (src_w, src_h) {
                 (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
                 _ => None,
@@ -183,6 +214,7 @@ impl CatalogDb {
                 file_size,
                 jpeg_data,
                 source_dims,
+                layout_dims: valid_dims(layout_w, layout_h),
             }));
         }
         Ok(None)
@@ -196,13 +228,19 @@ impl CatalogDb {
         prefix: &str,
     ) -> rusqlite::Result<Option<(String, CacheEntry)>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT filename, mtime, file_size, thumb_data, source_width, source_height \
-             FROM thumbnails \
+        let layout_columns = if self.has_layout_dims_columns {
+            "layout_width, layout_height"
+        } else {
+            "NULL, NULL"
+        };
+        let sql = format!(
+            "SELECT filename, mtime, file_size, thumb_data, source_width, source_height, \
+                    {layout_columns} FROM thumbnails \
              WHERE substr(filename, 1, ?1) = ?2 \
              ORDER BY mtime DESC, file_size DESC, filename DESC \
-             LIMIT 1",
-        )?;
+             LIMIT 1"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let mut iter = stmt.query_map(params![prefix.chars().count() as i64, prefix], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -211,10 +249,12 @@ impl CatalogDb {
                 row.get::<_, Vec<u8>>(3)?,
                 row.get::<_, Option<u32>>(4)?,
                 row.get::<_, Option<u32>>(5)?,
+                row.get::<_, Option<u32>>(6)?,
+                row.get::<_, Option<u32>>(7)?,
             ))
         })?;
         if let Some(item) = iter.next() {
-            let (filename, mtime, file_size, jpeg_data, src_w, src_h) = item?;
+            let (filename, mtime, file_size, jpeg_data, src_w, src_h, layout_w, layout_h) = item?;
             let source_dims = match (src_w, src_h) {
                 (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
                 _ => None,
@@ -226,6 +266,7 @@ impl CatalogDb {
                     file_size,
                     jpeg_data,
                     source_dims,
+                    layout_dims: valid_dims(layout_w, layout_h),
                 },
             )));
         }
@@ -235,7 +276,7 @@ impl CatalogDb {
     /// サムネイルを INSERT OR REPLACE で保存する。
     ///
     /// `width` / `height` はキャッシュされる WebP サムネイルの寸法、
-    /// `source_dims` は元画像の寸法 (PDF は page box の 1/1000 point、未取得なら None)。
+    /// `source_dims` は元画像 / PDF raster のピクセル寸法 (未取得なら None)。
     #[allow(clippy::too_many_arguments)]
     pub fn save(
         &self,
@@ -247,15 +288,44 @@ impl CatalogDb {
         source_dims: Option<(u32, u32)>,
         jpeg_data: &[u8],
     ) -> rusqlite::Result<()> {
+        self.save_with_layout_dims(
+            filename,
+            mtime,
+            file_size,
+            width,
+            height,
+            source_dims,
+            None,
+            jpeg_data,
+        )
+    }
+
+    /// `save` に raster と独立したレイアウト寸法を付加する PDF 用保存経路。
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_with_layout_dims(
+        &self,
+        filename: &str,
+        mtime: i64,
+        file_size: i64,
+        width: u32,
+        height: u32,
+        source_dims: Option<(u32, u32)>,
+        layout_dims: Option<(u32, u32)>,
+        jpeg_data: &[u8],
+    ) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
         let src_w: Option<u32> = source_dims.map(|(w, _)| w);
         let src_h: Option<u32> = source_dims.map(|(_, h)| h);
+        let layout_w: Option<u32> = layout_dims.map(|(w, _)| w);
+        let layout_h: Option<u32> = layout_dims.map(|(_, h)| h);
         conn.execute(
             "INSERT OR REPLACE INTO thumbnails \
-             (filename, mtime, file_size, width, height, thumb_data, source_width, source_height) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (filename, mtime, file_size, width, height, thumb_data, source_width, source_height, \
+              layout_width, layout_height) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
-                filename, mtime, file_size, width, height, jpeg_data, src_w, src_h
+                filename, mtime, file_size, width, height, jpeg_data, src_w, src_h, layout_w,
+                layout_h
             ],
         )?;
         Ok(())
@@ -278,12 +348,41 @@ impl CatalogDb {
         source_dims: Option<(u32, u32)>,
         jpeg_data: &[u8],
     ) -> rusqlite::Result<bool> {
+        self.save_thumb_bytes_with_layout_dims(
+            filename,
+            mtime,
+            file_size,
+            source_dims,
+            None,
+            jpeg_data,
+        )
+    }
+
+    /// `save_thumb_bytes` の PDF レイアウト寸法付き版。
+    pub fn save_thumb_bytes_with_layout_dims(
+        &self,
+        filename: &str,
+        mtime: i64,
+        file_size: i64,
+        source_dims: Option<(u32, u32)>,
+        layout_dims: Option<(u32, u32)>,
+        jpeg_data: &[u8],
+    ) -> rusqlite::Result<bool> {
         let Some((w, h)) = decode_thumb_dims(jpeg_data) else {
             // 寸法が取れない (= 壊れたバイト列) なら保存を断念。SQLite スキーマ上
             // width/height は NOT NULL なので 0 を入れると整合性が壊れる。
             return Ok(false);
         };
-        self.save(filename, mtime, file_size, w, h, source_dims, jpeg_data)?;
+        self.save_with_layout_dims(
+            filename,
+            mtime,
+            file_size,
+            w,
+            h,
+            source_dims,
+            layout_dims,
+            jpeg_data,
+        )?;
         Ok(true)
     }
 
@@ -531,7 +630,9 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              height         INTEGER NOT NULL,
              thumb_data     BLOB    NOT NULL,
              source_width   INTEGER,
-             source_height  INTEGER
+             source_height  INTEGER,
+             layout_width   INTEGER,
+             layout_height  INTEGER
          );
          CREATE TABLE IF NOT EXISTS pdf_meta (
              filename          TEXT    NOT NULL PRIMARY KEY,
@@ -562,6 +663,16 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         "source_height",
         "ALTER TABLE thumbnails ADD COLUMN source_height INTEGER",
     )?;
+    add_thumbnail_column_if_missing(
+        conn,
+        "layout_width",
+        "ALTER TABLE thumbnails ADD COLUMN layout_width INTEGER",
+    )?;
+    add_thumbnail_column_if_missing(
+        conn,
+        "layout_height",
+        "ALTER TABLE thumbnails ADD COLUMN layout_height INTEGER",
+    )?;
 
     // バージョン不一致（スキーマ変更）の場合は全削除して再生成
     let version: Option<String> = conn
@@ -579,9 +690,11 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Released catalogs stored PDF thumbnail raster dimensions in `source_*`.
-/// They cannot be repaired from the WebP because the page-box precision has
-/// already been discarded, so invalidate only PDF-derived thumbnail rows once.
+/// Released catalogs store PDF thumbnail raster pixels in `source_*`, but do not
+/// contain the page box needed for exact layout. The short-lived development
+/// schema version 1 instead wrote page-box units into `source_*`. Neither row can
+/// be upgraded from the cached WebP alone, so invalidate only PDF-derived rows
+/// once and regenerate both independent dimension pairs.
 ///
 /// A catalog whose owner is a PDF contains its virtual `page_NNNN` rows only;
 /// ordinary folder catalogs may contain `pdfthumb:` representative rows beside
@@ -635,15 +748,7 @@ fn add_thumbnail_column_if_missing(
     column: &str,
     alter_sql: &str,
 ) -> rusqlite::Result<()> {
-    let exists = conn
-        .query_row(
-            "SELECT 1 FROM pragma_table_info('thumbnails') WHERE name = ?1 LIMIT 1",
-            [column],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
-    if exists {
+    if thumbnail_column_exists(conn, column)? {
         return Ok(());
     }
     match conn.execute(alter_sql, []) {
@@ -655,6 +760,17 @@ fn add_thumbnail_column_if_missing(
         }
         Err(error) => Err(error),
     }
+}
+
+fn thumbnail_column_exists(conn: &Connection, column: &str) -> rusqlite::Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('thumbnails') WHERE name = ?1 LIMIT 1",
+            [column],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 // -----------------------------------------------------------------------
@@ -686,11 +802,22 @@ pub fn encode_thumb_webp_with_source_dims(
     quality: f32,
     source_dims: (u32, u32),
 ) -> Option<(Vec<u8>, u32, u32)> {
+    encode_thumb_webp_with_aspect_dims(img, long_side, quality, source_dims)
+}
+
+/// `encode_thumb_webp` variant that uses dimensions supplied only for aspect.
+/// The values may be pixel source dimensions or PDF page-layout dimensions.
+pub fn encode_thumb_webp_with_aspect_dims(
+    img: &image::DynamicImage,
+    long_side: u32,
+    quality: f32,
+    aspect_dims: (u32, u32),
+) -> Option<(Vec<u8>, u32, u32)> {
     let thumb = crate::fast_resize::resize_dynamic_fit_with_source_aspect(
         img,
         long_side,
         long_side,
-        source_dims,
+        aspect_dims,
         crate::fast_resize::Quality::Lanczos3,
     );
     let rgb = thumb.to_rgb8();
@@ -824,6 +951,7 @@ mod tests {
         init_schema(&conn).unwrap();
         CatalogDb {
             conn: Mutex::new(conn),
+            has_layout_dims_columns: true,
         }
     }
 
@@ -898,21 +1026,40 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version, CATALOG_VERSION);
+        let columns = conn
+            .prepare("SELECT name FROM pragma_table_info('thumbnails')")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .flatten()
+            .collect::<HashSet<_>>();
+        assert!(columns.contains("source_width"));
+        assert!(columns.contains("source_height"));
+        assert!(columns.contains("layout_width"));
+        assert!(columns.contains("layout_height"));
     }
 
     #[test]
-    fn pdf_layout_migration_rebuilds_legacy_page_rows_once() {
+    fn pdf_layout_migration_rebuilds_development_v1_page_rows_once() {
         let tmp = tempfile::tempdir().unwrap();
         let cache_dir = tmp.path().join("cache");
         let pdf_path = tmp.path().join("book.pdf");
         let db = CatalogDb::open(&cache_dir, &pdf_path).unwrap();
-        db.save("page_0000", 1, 10, 327, 473, Some((327, 473)), b"legacy")
-            .unwrap();
+        db.save(
+            "page_0000",
+            1,
+            10,
+            327,
+            473,
+            Some((595_276, 841_890)),
+            b"development-v1",
+        )
+        .unwrap();
         db.conn
             .lock()
             .unwrap()
             .execute(
-                "DELETE FROM meta WHERE key = ?1",
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, '1')",
                 [PDF_LAYOUT_DIMS_META_KEY],
             )
             .unwrap();
@@ -921,12 +1068,13 @@ mod tests {
         let migrated = CatalogDb::open(&cache_dir, &pdf_path).unwrap();
         assert!(migrated.load_all().unwrap().is_empty());
         migrated
-            .save(
+            .save_with_layout_dims(
                 "page_0000",
                 1,
                 10,
                 327,
                 473,
+                Some((327, 473)),
                 Some((595_276, 841_890)),
                 b"fixed",
             )
@@ -936,8 +1084,12 @@ mod tests {
         let reopened = CatalogDb::open(&cache_dir, &pdf_path).unwrap();
         assert_eq!(
             reopened.load_all().unwrap()["page_0000"].source_dims,
-            Some((595_276, 841_890)),
+            Some((327, 473)),
             "the migration marker must preserve regenerated rows on later opens"
+        );
+        assert_eq!(
+            reopened.load_all().unwrap()["page_0000"].layout_dims,
+            Some((595_276, 841_890))
         );
     }
 
@@ -998,6 +1150,69 @@ mod tests {
         assert_eq!(entry.file_size, 2048);
         assert_eq!(entry.jpeg_data, b"fake_webp");
         assert_eq!(entry.source_dims, Some((4000, 3000)));
+        assert_eq!(entry.layout_dims, None);
+    }
+
+    #[test]
+    fn catalog_keeps_pdf_raster_pixels_separate_from_page_layout() {
+        let db = open_in_memory();
+        db.save_with_layout_dims(
+            "page_0000",
+            1000,
+            2048,
+            273,
+            416,
+            Some((273, 416)),
+            Some((468_600, 714_360)),
+            b"fake_webp",
+        )
+        .unwrap();
+
+        let entry = db.load_one("page_0000").unwrap().unwrap();
+        assert_eq!(entry.source_dims, Some((273, 416)));
+        assert_eq!(entry.layout_dims, Some((468_600, 714_360)));
+    }
+
+    #[test]
+    fn read_only_legacy_catalog_treats_missing_layout_columns_as_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("cache");
+        let folder = tmp.path().join("photos");
+        let db_path = db_path_for(&cache_dir, &folder);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE thumbnails (
+                 filename TEXT NOT NULL PRIMARY KEY,
+                 mtime INTEGER NOT NULL,
+                 file_size INTEGER NOT NULL,
+                 width INTEGER NOT NULL,
+                 height INTEGER NOT NULL,
+                 thumb_data BLOB NOT NULL,
+                 source_width INTEGER,
+                 source_height INTEGER
+             );
+             INSERT INTO thumbnails VALUES
+                 ('image.jpg', 1, 10, 8, 8, X'0102', 4000, 3000);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = CatalogDb::open_existing_read_only(&cache_dir, &folder)
+            .unwrap()
+            .unwrap();
+        let all = db.load_all().unwrap();
+        assert_eq!(all["image.jpg"].source_dims, Some((4000, 3000)));
+        assert_eq!(all["image.jpg"].layout_dims, None);
+        assert_eq!(db.load_one("image.jpg").unwrap().unwrap().layout_dims, None);
+        assert_eq!(
+            db.load_latest_with_prefix("image")
+                .unwrap()
+                .unwrap()
+                .1
+                .layout_dims,
+            None
+        );
     }
 
     #[test]

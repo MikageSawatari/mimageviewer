@@ -421,6 +421,12 @@ pub(crate) fn export_crop_rect_for_pixels(
 ) -> crate::export_crop::CropRect {
     // Crop rectangles are persisted in original-raster pixel coordinates, not catalog
     // layout/aspect coordinates. Keep the name explicit at this shared boundary.
+    //
+    // The basis is the raster the rect was drawn on whenever the row records one, so the
+    // remote agrees with what the core shows. Rows saved before that column existed fall
+    // back to the caller's space — for PDF that is the canonical raster, never the
+    // rendered one, whose size changes with the requested resolution.
+    let stored_edit_space = settings.valid_source_size().unwrap_or(stored_edit_space);
     if stored_edit_space == pixel_dims {
         return settings.rect;
     }
@@ -578,5 +584,45 @@ mod tests {
             }),
             page_key_for_remote(&pdf, &RemoteSubresource::PdfPage { page_number: 7 },)
         );
+    }
+
+    fn crop_over(
+        rect: [f32; 4],
+        source_size: Option<[usize; 2]>,
+    ) -> crate::export_crop::CropSettings {
+        crate::export_crop::CropSettings {
+            rect: crate::export_crop::CropRect {
+                min_x: rect[0],
+                min_y: rect[1],
+                max_x: rect[2],
+                max_y: rect[3],
+            },
+            aspect_mode: crate::export_crop::CropAspectMode::Free,
+            source_size,
+        }
+    }
+
+    #[test]
+    fn a_recorded_crop_basis_wins_over_the_space_the_caller_offers() {
+        // The core scales a saved rect from the raster it was drawn on. The remote has to
+        // land on the same pixels, so a recorded basis beats the canonical space passed in.
+        let recorded = crop_over([100.0, 200.0, 300.0, 400.0], Some([1000, 2000]));
+        let rect = export_crop_rect_for_pixels(recorded, [500, 1000], [2000, 4000]);
+        assert_eq!(rect.min_x, 200.0);
+        assert_eq!(rect.min_y, 400.0);
+        assert_eq!(rect.max_x, 600.0);
+        assert_eq!(rect.max_y, 800.0);
+    }
+
+    #[test]
+    fn a_crop_saved_before_the_basis_column_uses_the_space_the_caller_offers() {
+        // For PDF that space is the canonical raster, which does not move with the
+        // requested resolution; falling back to the rendered raster would drift.
+        let legacy = crop_over([100.0, 200.0, 300.0, 400.0], None);
+        let rect = export_crop_rect_for_pixels(legacy, [1000, 2000], [2000, 4000]);
+        assert_eq!(rect.min_x, 200.0);
+        assert_eq!(rect.min_y, 400.0);
+        assert_eq!(rect.max_x, 600.0);
+        assert_eq!(rect.max_y, 800.0);
     }
 }

@@ -2282,11 +2282,13 @@ where
     )?;
     attach_page_rows(
         "export_crop.db",
-        "SELECT p.page_path, p.min_x, p.min_y, p.max_x, p.max_y, p.aspect_mode
+        "SELECT p.page_path, p.min_x, p.min_y, p.max_x, p.max_y, p.aspect_mode,
+                p.source_width, p.source_height
            FROM metadata_transfer_scope AS s CROSS JOIN export_crop_pages AS p
           WHERE p.page_path = s.item_key
          UNION ALL
-         SELECT p.page_path, p.min_x, p.min_y, p.max_x, p.max_y, p.aspect_mode
+         SELECT p.page_path, p.min_x, p.min_y, p.max_x, p.max_y, p.aspect_mode,
+                p.source_width, p.source_height
            FROM metadata_transfer_scope AS s CROSS JOIN export_crop_pages AS p
           WHERE p.page_path >= s.virtual_lower AND p.page_path < s.virtual_upper",
         Box::new(|row, _key, state| {
@@ -2299,6 +2301,7 @@ where
                     max_y: row.get(4)?,
                 },
                 aspect_mode: crate::export_crop::CropAspectMode::from_stable_key(&aspect),
+                source_size: crate::export_crop::read_source_size(row, 6, 7)?,
             });
             Ok(())
         }),
@@ -3223,6 +3226,11 @@ fn validate_page_state(state: &PortablePageState, entry_path: &str) -> Result<()
         {
             return Err(TransferError::Invalid(format!(
                 "書き出しクロップが不正です: {entry_path}"
+            )));
+        }
+        if crop.source_size.is_some() && crop.valid_source_size().is_none() {
+            return Err(TransferError::Invalid(format!(
+                "書き出しクロップの基準寸法が不正です: {entry_path}"
             )));
         }
     }
@@ -4463,8 +4471,9 @@ fn insert_page_state(
     if let Some(crop) = state.export_crop {
         tx.prepare_cached(
             "INSERT INTO crop.export_crop_pages
-                (page_path, min_x, min_y, max_x, max_y, aspect_mode, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, unixepoch())",
+                (page_path, min_x, min_y, max_x, max_y, aspect_mode,
+                 source_width, source_height, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, unixepoch())",
         )
         .map_err(db_error)?
         .execute(params![
@@ -4474,6 +4483,10 @@ fn insert_page_state(
             crop.rect.max_x,
             crop.rect.max_y,
             crop.aspect_mode.stable_key(),
+            crop.valid_source_size()
+                .and_then(|size| i64::try_from(size[0]).ok()),
+            crop.valid_source_size()
+                .and_then(|size| i64::try_from(size[1]).ok()),
         ])
         .map_err(db_error)?;
     }
@@ -5545,6 +5558,7 @@ mod tests {
                     max_y: 900.0,
                 },
                 aspect_mode: crate::export_crop::CropAspectMode::Ratio16x9,
+                source_size: Some([2_000, 1_000]),
             }),
             ..PortablePageState::default()
         };
@@ -5579,6 +5593,7 @@ mod tests {
                 export_crop: Some(crate::export_crop::CropSettings {
                     rect,
                     aspect_mode: crate::export_crop::CropAspectMode::Free,
+                    source_size: None,
                 }),
                 ..PortablePageState::default()
             };
@@ -7792,8 +7807,10 @@ mod tests {
             .unwrap()
             .execute(
                 "INSERT INTO export_crop_pages
-                    (page_path, min_x, min_y, max_x, max_y, aspect_mode)
-                 VALUES (?1, 63.3854256, 33.5276108, 1024.0, 1024.0, 'free')",
+                    (page_path, min_x, min_y, max_x, max_y, aspect_mode,
+                     source_width, source_height)
+                 VALUES (?1, 63.3854256, 33.5276108, 1024.0, 1024.0, 'free',
+                         2048, 1536)",
                 [&image_key],
             )
             .unwrap();
@@ -8100,7 +8117,8 @@ mod tests {
             Connection::open(destination_data.join("export_crop.db"))
                 .unwrap()
                 .query_row(
-                    "SELECT min_x, min_y, max_x, max_y, aspect_mode
+                    "SELECT min_x, min_y, max_x, max_y, aspect_mode,
+                            source_width, source_height
                        FROM export_crop_pages WHERE page_path = ?1",
                     [&destination_image],
                     |row| Ok((
@@ -8109,11 +8127,21 @@ mod tests {
                         row.get::<_, f32>(2)?,
                         row.get::<_, f32>(3)?,
                         row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
                     ))
                 )
                 .unwrap(),
-            (63.3854256, 33.5276108, 1024.0, 1024.0, "free".to_string()),
-            "source-image pixel crop coordinates must round-trip without normalization"
+            (
+                63.3854256,
+                33.5276108,
+                1024.0,
+                1024.0,
+                "free".to_string(),
+                2048,
+                1536,
+            ),
+            "crop coordinates and their source raster size must round-trip together"
         );
         assert_eq!(
             Connection::open(destination_data.join("folder_thumb_pins.db"))

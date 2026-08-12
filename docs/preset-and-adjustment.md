@@ -739,8 +739,26 @@ erase / raw 上へ conceal を載せない。通常表示で edit / final が未
 **crop は表示パイプラインに含めない** (通常表示は crop 外を暗くする overlay のみで、
 画像そのものは切り取らない)。実際の切り出しは Ctrl+S コピー / Ctrl+E 書き出しの最終段で
 `App::export_crop_rect_for_pixels` を使い、final composite (AI アップスケール後で source と
-サイズが違いうる) のピクセル座標へ crop 矩形をスケールして適用する。したがって crop の
-変更は `edit_result_cache` / final cache を無効化しない (無効化すると crop ドラッグのたびに
+サイズが違いうる) のピクセル座標へ crop 矩形をスケールして適用する。`CropSettings` は矩形と
+その矩形を作成したラスタの `source_size` を一体で持ち、`export_crop.db` の
+`source_width` / `source_height`、sidecar JSON、編集内容コピー / 貼り付け、メタデータ転送の
+すべてで同じ基準寸法を運ぶ。PDF のズーム再レンダや AI 処理で現在のラスタ寸法が変わっても、
+保存済み基準寸法から対象ラスタへ X/Y 比率で変換するため、選択領域の意味は変わらない。
+
+v2.13.0 以前の `export_crop.db` 行と旧 sidecar / メタデータ bundle には基準寸法が無い。
+DB open 時に nullable の 2 列を加える加法 migration を行い、旧行は最初に利用できたラスタ寸法を
+基準として採用して中央 DB と sidecar へ書き戻す。過去にどの解像度で作成したかは復元不能なので、
+最初の採用前だけは旧来どおりそのラスタを基準とみなす。この採用時に矩形が全面へ clamp されても、
+読み出し側の `is_full` では削除せず、利用者が明示的に設定した行を保持する。新規操作で現在ラスタの
+全面を指定した場合だけ「crop なし」として正規化する。
+
+露出頻度の履歴として、高倍率 PDF 再レンダは 2026-06-21 の `1eca5cee` で入り、2026-07-30 の
+`fba512e2` で初回 PDF ラスタも 4096px 固定から viewport / DPI / fit 基準へ変わったため、同一ページで
+異なるラスタ寸法を扱う機会が増えた。2026-08-12 の `1b5fff92`〜`7dbb2f39` は page layout geometry と
+raster pixel geometry の分離・表示補正であり、再レンダ要求頻度そのものは増やしていない。
+
+したがって crop の変更は `edit_result_cache` / final cache を無効化しない
+(無効化すると crop ドラッグのたびに
 AI を無駄に再実行してしまう)。
 
 ### 3.2 final pipeline の適用タイミング
@@ -1386,6 +1404,8 @@ release 時に 1 Undo として確定する。モード終了・フォルダ切�
 - **中央 DB が authoritative**。サイドカーはあくまでバックアップ。
 - **すべての書き込みはミラー**: DB 更新と同じタイミングでメモリ上のサイドカー表現
   (`App::sidecars`) を更新し dirty フラグを立てる。
+- crop の `export_crop` は矩形だけでなく作成時ラスタの `source_size` も含めてミラーし、
+  フォルダ移動後や PDF の別解像度レンダでも同じ領域を復元する。
 - **実ディスク書き込みのタイミング**:
   1. フォルダ切替時 (`start_loading_items` 冒頭で `flush_all_sidecars`)
   2. アプリ正常終了時 (`on_exit` 内)

@@ -84,6 +84,7 @@ fn spread_page_dims_survive_fs_cache_and_thumbnail_eviction() {
                     from_edit_preview: false,
                     rendered_at_px: 2,
                     source_dims: Some((900, 1400)),
+                    layout_dims: None,
                 }
             }
         })
@@ -497,6 +498,7 @@ fn edit_preview_clear_reaches_main_active_and_paused_contexts() {
         from_edit_preview: true,
         rendered_at_px: 64,
         source_dims: Some((1, 1)),
+        layout_dims: None,
     };
     let prepare_bundle = |path: &str| {
         let mut bundle = ViewerContextBundle::empty();
@@ -7700,6 +7702,7 @@ mod phase_c_drill_nav_tests {
                     from_edit_preview: false,
                     rendered_at_px: 64,
                     source_dims: Some((1, 1)),
+                    layout_dims: None,
                 },
                 pixels,
             )
@@ -10262,6 +10265,7 @@ fn begin_detached_bookmark_media_test(
                 file_size: 2,
                 jpeg_data: Vec::new(),
                 source_dims: None,
+                layout_dims: None,
             },
         )]),
     )));
@@ -12671,6 +12675,7 @@ mod favorite_adjustment_defaults_tests {
                     from_edit_preview: false,
                     edit_preview_adjustment: None,
                     source_dims: Some((2, 2)),
+                    layout_dims: None,
                     canceled: false,
                     finalized: false,
                     input_seq: 0,
@@ -12762,6 +12767,7 @@ mod favorite_adjustment_defaults_tests {
                 from_edit_preview: false,
                 edit_preview_adjustment: None,
                 source_dims: Some((64, 64)),
+                layout_dims: None,
                 canceled: false,
                 finalized: false,
                 input_seq: 0,
@@ -12851,6 +12857,7 @@ mod favorite_adjustment_defaults_tests {
             from_edit_preview: true,
             rendered_at_px: 64,
             source_dims: Some((4000, 3000)),
+            layout_dims: None,
         });
         app.keep_set.insert(0);
         app.keep_range = (0, 1);
@@ -12945,6 +12952,7 @@ mod favorite_adjustment_defaults_tests {
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: Some((1920, 1080)),
+            layout_dims: None,
         });
         app.keep_set.insert(0);
         app.keep_range = (0, 1);
@@ -13021,6 +13029,7 @@ mod favorite_adjustment_defaults_tests {
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: Some((4000, 3000)),
+            layout_dims: None,
         });
         app.keep_set.insert(0);
         app.keep_range = (0, 1);
@@ -13608,6 +13617,7 @@ mod favorite_adjustment_defaults_tests {
                 from_edit_preview: false,
                 rendered_at_px: 1,
                 source_dims: Some(source_dims),
+                layout_dims: None,
             }
         }
 
@@ -13664,6 +13674,7 @@ mod favorite_adjustment_defaults_tests {
                 from_edit_preview: false,
                 rendered_at_px: 1,
                 source_dims: Some(source_dims),
+                layout_dims: None,
             }
         }
 
@@ -16329,6 +16340,242 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
+    fn archive_cache_arrival_reloads_the_dependent_folder_pin_only_once() {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("shelf");
+        std::fs::create_dir_all(&folder).unwrap();
+        let src = folder.join("book.7z");
+        let cached = app.tmp.path().join("book.zip");
+        let unrelated = app.tmp.path().join("unrelated.png");
+        std::fs::write(&src, b"archive").unwrap();
+        std::fs::write(&cached, b"cached zip").unwrap();
+        std::fs::write(&unrelated, b"image").unwrap();
+        let src_meta = std::fs::metadata(&src).unwrap();
+        let src_mtime = crate::ui_helpers::mtime_secs(&src_meta);
+        let src_size = src_meta.len() as i64;
+        app.archive_cache_db
+            .as_ref()
+            .unwrap()
+            .record(
+                &src,
+                src_mtime,
+                src_size,
+                crate::archive_converter::ArchiveFormat::SevenZ,
+                &cached,
+                std::fs::metadata(&cached).unwrap().len() as i64,
+                1,
+                false,
+            )
+            .unwrap();
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &folder,
+                &FolderPinSource::File {
+                    rel: "book.7z".to_string(),
+                    kind: FileKind::ConvertibleArchive,
+                },
+            )
+            .unwrap();
+
+        let folder_meta = std::fs::metadata(&folder).unwrap();
+        let folder_mtime = crate::ui_helpers::mtime_secs(&folder_meta);
+        let folder_size = folder_meta.len() as i64;
+        let unrelated_meta = std::fs::metadata(&unrelated).unwrap();
+        app.install_new_items(
+            vec![GridItem::Folder(folder.clone()), GridItem::Image(unrelated)],
+            vec![
+                Some((folder_mtime, folder_size)),
+                Some((
+                    crate::ui_helpers::mtime_secs(&unrelated_meta),
+                    unrelated_meta.len() as i64,
+                )),
+            ],
+        );
+        assert!(app.converted_archive_cache_paths.is_empty());
+        let fallback = make_load_request(
+            &app.items[0],
+            0,
+            folder_mtime,
+            folder_size,
+            false,
+            None,
+            Some(crate::settings::SortOrder::FileName),
+            app.settings.folder_thumb_depth,
+            &app.folder_pin_map,
+            &app.converted_archive_cache_paths,
+            None,
+            None,
+            app.folder_thumb_pin_db.as_deref(),
+            app.video_pin_db.as_ref(),
+            false,
+        )
+        .expect("the initial empty map must build the folder fallback request");
+        assert_eq!(fallback.path, folder);
+        assert_eq!(fallback.resolve_override, None);
+        assert!(!fallback.cache_key_override.unwrap().contains("#pin:"));
+
+        let ctx = egui::Context::default();
+        let tex = ctx.load_texture(
+            "archive_pin_async_fallback",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let loaded = || ThumbnailState::Loaded {
+            tex: tex.clone(),
+            from_cache: false,
+            from_edit_preview: false,
+            rendered_at_px: 1,
+            source_dims: Some((1, 1)),
+            layout_dims: None,
+        };
+        app.thumbnails = vec![loaded(), loaded()];
+        app.requested.insert(0, false);
+        app.requested.insert(1, false);
+        let reload_queue: Arc<NotifyQueue> = Arc::new((
+            Mutex::new(vec![
+                LoadRequest {
+                    idx: 0,
+                    ..Default::default()
+                },
+                LoadRequest {
+                    idx: 1,
+                    ..Default::default()
+                },
+            ]),
+            Condvar::new(),
+        ));
+        let heavy_io_queue: Arc<NotifyQueue> = Arc::new((
+            Mutex::new(vec![
+                LoadRequest {
+                    idx: 0,
+                    ..Default::default()
+                },
+                LoadRequest {
+                    idx: 1,
+                    ..Default::default()
+                },
+            ]),
+            Condvar::new(),
+        ));
+        app.reload_queue = Some(Arc::clone(&reload_queue));
+        app.heavy_io_queue = Some(Arc::clone(&heavy_io_queue));
+        for _ in 0..100 {
+            app.poll_converted_archive_cache_paths(&ctx);
+            if app.converted_archive_cache_paths_pending.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(app.converted_archive_cache_paths_pending.is_none());
+        assert_eq!(
+            app.converted_archive_cache_paths
+                .get(&crate::path_key::normalize_keep_drive(&src)),
+            Some(&cached)
+        );
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
+        assert!(!app.requested.contains_key(&0));
+        assert!(matches!(app.thumbnails[1], ThumbnailState::Loaded { .. }));
+        assert!(app.requested.contains_key(&1));
+        assert_eq!(
+            reload_queue
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|req| req.idx)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(
+            heavy_io_queue
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|req| req.idx)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+
+        let rebuilt = make_load_request(
+            &app.items[0],
+            0,
+            folder_mtime,
+            folder_size,
+            false,
+            None,
+            Some(crate::settings::SortOrder::FileName),
+            app.settings.folder_thumb_depth,
+            &app.folder_pin_map,
+            &app.converted_archive_cache_paths,
+            None,
+            None,
+            app.folder_thumb_pin_db.as_deref(),
+            app.video_pin_db.as_ref(),
+            false,
+        )
+        .expect("the rebuilt request must use the worker-supplied archive cache");
+        assert_eq!(rebuilt.path, cached);
+        assert_eq!(
+            rebuilt.resolve_override,
+            Some(crate::thumb_loader::ResolveStrategy::ZipFirstImage)
+        );
+
+        app.thumbnails[0] = loaded();
+        app.requested.insert(0, false);
+        reload_queue.0.lock().unwrap().push(LoadRequest {
+            idx: 0,
+            ..Default::default()
+        });
+        heavy_io_queue.0.lock().unwrap().push(LoadRequest {
+            idx: 0,
+            ..Default::default()
+        });
+        let first_snapshot = app.converted_archive_cache_paths.clone();
+        app.start_converted_archive_cache_paths_refresh();
+        assert_eq!(
+            app.converted_archive_cache_paths, first_snapshot,
+            "refresh must keep the previous map while the worker is running"
+        );
+        for _ in 0..100 {
+            app.poll_converted_archive_cache_paths(&ctx);
+            if app.converted_archive_cache_paths_pending.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(app.converted_archive_cache_paths_pending.is_none());
+        assert_eq!(app.converted_archive_cache_paths, first_snapshot);
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
+        assert!(
+            app.requested.contains_key(&0),
+            "an identical map must not schedule another reload"
+        );
+        assert!(
+            reload_queue
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|req| req.idx == 0)
+        );
+        assert!(
+            heavy_io_queue
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|req| req.idx == 0)
+        );
+    }
+
+    #[test]
     fn convertible_archive_pin_uses_cached_zip_entry_thumb_request() {
         use crate::folder_thumb_pins::FolderPinSource;
         use crate::grid_item::GridItem;
@@ -17800,6 +18047,7 @@ mod favorite_adjustment_defaults_tests {
             from_edit_preview: true,
             rendered_at_px: 128,
             source_dims: Some((1, 1)),
+            layout_dims: None,
         };
         let preview_key = "c:/test/outer.zip::book/page1.jpg".to_owned();
         app.thumb_edit_preview_keys.insert(idx, preview_key.clone());
@@ -18153,6 +18401,7 @@ mod favorite_adjustment_defaults_tests {
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: Some((2, 3)),
+            layout_dims: None,
         };
         app.visible_indices = vec![idx];
         app.spread_mode = crate::settings::SpreadMode::Single;
@@ -18246,6 +18495,7 @@ mod favorite_adjustment_defaults_tests {
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: Some((2, 3)),
+            layout_dims: None,
         };
         app.thumbnails[second] = ThumbnailState::Loaded {
             tex: second_texture,
@@ -18253,6 +18503,7 @@ mod favorite_adjustment_defaults_tests {
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: Some((2, 3)),
+            layout_dims: None,
         };
         app.visible_indices = vec![first, second];
         app.cached_nav_indices = None;
@@ -19381,6 +19632,7 @@ mod favorite_adjustment_defaults_tests {
                 file_size: 4096,
                 jpeg_data: webp_bytes.clone(),
                 source_dims: Some((400, 400)),
+                layout_dims: None,
             },
         );
 
@@ -19590,6 +19842,7 @@ mod favorite_adjustment_defaults_tests {
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: None,
+            layout_dims: None,
         });
         app.fullscreen_idx = Some(0);
         let locked_gen = app.items_generation;
@@ -19637,6 +19890,7 @@ mod favorite_adjustment_defaults_tests {
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: None,
+            layout_dims: None,
         }];
         assert!(
             app.fs_nav_holdover_for_draw().is_none(),
@@ -20026,6 +20280,7 @@ mod favorite_adjustment_defaults_tests {
             from_edit_preview: false,
             rendered_at_px: 1,
             source_dims: None,
+            layout_dims: None,
         });
         app.items
             .push(GridItem::Video(std::path::PathBuf::from("c:/p/b.mp4")));
@@ -20035,6 +20290,7 @@ mod favorite_adjustment_defaults_tests {
             from_edit_preview: false,
             rendered_at_px: 1,
             source_dims: None,
+            layout_dims: None,
         });
         app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
 
@@ -20070,6 +20326,7 @@ mod favorite_adjustment_defaults_tests {
                 from_edit_preview: false,
                 rendered_at_px: 1,
                 source_dims: None,
+                layout_dims: None,
             })
             .collect();
 
@@ -20105,6 +20362,7 @@ mod favorite_adjustment_defaults_tests {
                 from_edit_preview: false,
                 rendered_at_px: 1,
                 source_dims: None,
+                layout_dims: None,
             })
             .collect();
         app.keep_set = std::collections::HashSet::from([1]);
@@ -20519,6 +20777,7 @@ mod favorite_adjustment_defaults_tests {
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: None,
+            layout_dims: None,
         });
         app.fullscreen_idx = Some(0);
         // items_generation は変えない (= 0)、ロック発火時の gen は 0 を記録する想定
@@ -21112,6 +21371,7 @@ mod favorite_adjustment_defaults_tests {
                     from_edit_preview: false,
                     rendered_at_px: 64,
                     source_dims: Some((1, 1)),
+                    layout_dims: None,
                 },
                 pixels,
             )
@@ -21941,6 +22201,7 @@ mod pipeline_cache_refactor_tests {
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: Some((2, 1)),
+            layout_dims: None,
         };
 
         app.spread_mode = crate::settings::SpreadMode::LtrCover;
@@ -25603,6 +25864,7 @@ mod pipeline_cache_refactor_tests {
             from_edit_preview: false,
             rendered_at_px: 2,
             source_dims: Some((2, 2)),
+            layout_dims: None,
         };
         app.thumb_pixels.insert(idx, Arc::clone(&source));
 
@@ -25659,6 +25921,7 @@ mod pipeline_cache_refactor_tests {
             from_edit_preview: false,
             rendered_at_px: 8,
             source_dims: Some((800, 1201)),
+            layout_dims: None,
         };
         app.thumb_pixels.insert(idx, Arc::clone(&color));
         set_colorize_mode(&mut app, idx, ColorizeMode::MonochromeOnly);
@@ -25744,6 +26007,7 @@ mod pipeline_cache_refactor_tests {
             from_edit_preview: false,
             rendered_at_px: 8,
             source_dims: Some((800, 1201)),
+            layout_dims: None,
         };
         app.thumb_pixels.insert(idx, Arc::clone(&monochrome));
         set_colorize_mode(&mut app, idx, ColorizeMode::MonochromeOnly);
@@ -33550,6 +33814,35 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn hidden_main_window_heartbeat_follows_detached_and_media_session_transitions() {
+        let mut app = setup_app();
+        app.window_visible = false;
+
+        assert!(
+            !app.ui_heartbeat_should_stay_active_while_hidden(),
+            "an idle hidden app with neither detached nor media ownership should suspend"
+        );
+
+        app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+            bundle: ViewerContextBundle::empty(),
+        });
+        assert!(
+            app.ui_heartbeat_should_stay_active_while_hidden(),
+            "a live detached viewer must keep watchdog observation active"
+        );
+
+        app.active_detached_viewer_context = None;
+        let video = push_video(&mut app, r"C:\clips\watchdog-fullscreen.mp4");
+        app.fullscreen_idx = Some(video);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        assert!(
+            app.ui_heartbeat_should_stay_active_while_hidden(),
+            "native video fullscreen must remain observable while its main HWND is hidden"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn tray_residency_preserves_mounted_video_transport_and_session() {
         for (case, presentation) in [
             ("fullscreen", ViewerPresentation::Fullscreen),
@@ -34449,6 +34742,7 @@ mod still_window_mode_key_tests {
             from_edit_preview: false,
             edit_preview_adjustment: None,
             source_dims: None,
+            layout_dims: None,
             canceled: false,
             finalized: false,
             input_seq: 0,
@@ -34892,6 +35186,7 @@ mod still_window_mode_key_tests {
             from_edit_preview: false,
             rendered_at_px: 128,
             source_dims: Some((1, 1)),
+            layout_dims: None,
         };
         app.fullscreen_idx = Some(image);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
@@ -35389,6 +35684,7 @@ mod still_window_mode_key_tests {
             from_edit_preview: false,
             rendered_at_px: 1,
             source_dims: Some((1, 1)),
+            layout_dims: None,
         };
         app.thumbnails[target] = loaded("rename_preview_target");
         app.thumbnails[unrelated] = loaded("rename_preview_unrelated");
@@ -38169,6 +38465,7 @@ mod still_window_mode_key_tests {
                     from_edit_preview: false,
                     rendered_at_px: 20,
                     source_dims: Some((20, 20)),
+                    layout_dims: None,
                 },
             );
             app.fs_cache.insert(
@@ -49721,6 +50018,7 @@ fn prepared_aggregate_installs_exact_per_item_edit_state() {
             max_y: 40.0,
         },
         aspect_mode: crate::export_crop::CropAspectMode::Keep,
+        source_size: Some([100, 100]),
     };
     let page_trim =
         crate::view_trim::ViewTrimPageOverride::from_margins(crate::view_trim::ViewTrimMargins {

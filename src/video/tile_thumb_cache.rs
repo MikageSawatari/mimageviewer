@@ -5,7 +5,7 @@
 //! ms) → WebP バイト列」を保存する。タイルモードを 2 度目以降開いたとき、ffmpeg
 //! seek + decode + swscale を省略して即座に表示できる。
 //!
-//! ## スキーマ (v2)
+//! ## スキーマ (v3)
 //!
 //! ```sql
 //! CREATE TABLE IF NOT EXISTS video_tile_thumbs (
@@ -15,6 +15,7 @@
 //!     tile_h       INTEGER NOT NULL,
 //!     webp         BLOB NOT NULL,
 //!     video_mtime  INTEGER NOT NULL,
+//!     render_version INTEGER NOT NULL,
 //!     PRIMARY KEY (path, tile_w, timestamp_ms)
 //! );
 //! CREATE INDEX IF NOT EXISTS idx_video_tile_thumbs_path
@@ -26,7 +27,8 @@
 //!     timestamp_ms INTEGER NOT NULL,
 //!     tile_h       INTEGER NOT NULL,
 //!     webp         BLOB NOT NULL,
-//!     video_mtime  INTEGER NOT NULL
+//!     video_mtime  INTEGER NOT NULL,
+//!     render_version INTEGER NOT NULL
 //! );
 //! ```
 //! `video_resume_thumbs` はホイール動画ナビゲーション中の静止画プレビュー用で、
@@ -55,6 +57,10 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+/// v2 rows contain encoded-orientation pixels. v3 materializes display matrix
+/// orientation, so old rows must miss and be regenerated.
+const THUMB_RENDER_VERSION: i64 = 2;
 
 pub struct TileThumbCache {
     conn: Mutex<rusqlite::Connection>,
@@ -102,6 +108,7 @@ impl TileThumbCache {
                     tile_h       INTEGER NOT NULL,
                     webp         BLOB NOT NULL,
                     video_mtime  INTEGER NOT NULL,
+                    render_version INTEGER NOT NULL DEFAULT 1,
                     PRIMARY KEY (path, tile_w, timestamp_ms)
                  );
                  INSERT OR IGNORE INTO video_tile_thumbs_v2
@@ -122,12 +129,13 @@ impl TileThumbCache {
                     tile_h       INTEGER NOT NULL,
                     webp         BLOB NOT NULL,
                     video_mtime  INTEGER NOT NULL,
+                    render_version INTEGER NOT NULL DEFAULT 1,
                     PRIMARY KEY (path)
                  );
                  CREATE INDEX IF NOT EXISTS idx_video_resume_thumbs_path
                     ON video_resume_thumbs(path);",
             )?;
-            return Ok(());
+            return Self::ensure_render_version_columns(conn);
         }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS video_tile_thumbs (
@@ -137,6 +145,7 @@ impl TileThumbCache {
                 tile_h       INTEGER NOT NULL,
                 webp         BLOB NOT NULL,
                 video_mtime  INTEGER NOT NULL,
+                render_version INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY (path, tile_w, timestamp_ms)
              );
              CREATE INDEX IF NOT EXISTS idx_video_tile_thumbs_path
@@ -151,12 +160,29 @@ impl TileThumbCache {
                     tile_h       INTEGER NOT NULL,
                     webp         BLOB NOT NULL,
                     video_mtime  INTEGER NOT NULL,
+                    render_version INTEGER NOT NULL DEFAULT 1,
                     PRIMARY KEY (path)
                  );
                  CREATE INDEX IF NOT EXISTS idx_video_resume_thumbs_path
                     ON video_resume_thumbs(path);",
             )
         })
+        .and_then(|_| Self::ensure_render_version_columns(conn))
+    }
+
+    fn ensure_render_version_columns(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+        for table in ["video_tile_thumbs", "video_resume_thumbs"] {
+            let sql = format!(
+                "SELECT 1 FROM pragma_table_info('{table}') WHERE name = 'render_version' LIMIT 1"
+            );
+            let exists = conn.query_row(&sql, [], |_| Ok(true)).unwrap_or(false);
+            if !exists {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN render_version INTEGER NOT NULL DEFAULT 1;"
+                ))?;
+            }
+        }
+        Ok(())
     }
 
     fn db_path() -> PathBuf {
@@ -218,12 +244,12 @@ impl TileThumbCache {
         let mut stmt = conn
             .prepare_cached(
                 "SELECT timestamp_ms, webp, video_mtime, tile_w FROM video_resume_thumbs
-                  WHERE path = ?1
+                  WHERE path = ?1 AND render_version = ?2
                   LIMIT 1",
             )
             .ok()?;
         let row: Option<(i64, Vec<u8>, i64, i64)> = stmt
-            .query_row(rusqlite::params![&key], |r| {
+            .query_row(rusqlite::params![&key, THUMB_RENDER_VERSION], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, Vec<u8>>(1)?,
@@ -273,13 +299,15 @@ impl TileThumbCache {
             .prepare_cached(
                 "SELECT webp, video_mtime FROM video_tile_thumbs
                   WHERE path = ?1 AND timestamp_ms = ?2 AND tile_w >= ?3
+                    AND render_version = ?4
                   ORDER BY tile_w DESC LIMIT 1",
             )
             .ok()?;
         let row: Option<(Vec<u8>, i64)> = stmt
-            .query_row(rusqlite::params![key, timestamp_ms, min_tile_w], |r| {
-                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?))
-            })
+            .query_row(
+                rusqlite::params![key, timestamp_ms, min_tile_w, THUMB_RENDER_VERSION],
+                |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?)),
+            )
             .ok();
         match row {
             Some((webp, mtime)) if mtime == video_mtime => Some(webp),
@@ -315,11 +343,19 @@ impl TileThumbCache {
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
         conn.execute(
             "INSERT INTO video_tile_thumbs
-                (path, tile_w, timestamp_ms, tile_h, webp, video_mtime)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                (path, tile_w, timestamp_ms, tile_h, webp, video_mtime, render_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(path, tile_w, timestamp_ms) DO UPDATE SET
-                tile_h = ?4, webp = ?5, video_mtime = ?6",
-            rusqlite::params![key, tile_w, timestamp_ms, tile_h, webp, video_mtime],
+                tile_h = ?4, webp = ?5, video_mtime = ?6, render_version = ?7",
+            rusqlite::params![
+                key,
+                tile_w,
+                timestamp_ms,
+                tile_h,
+                webp,
+                video_mtime,
+                THUMB_RENDER_VERSION
+            ],
         )?;
         Ok(())
     }
@@ -342,11 +378,20 @@ impl TileThumbCache {
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
         conn.execute(
             "INSERT INTO video_resume_thumbs
-                (path, tile_w, timestamp_ms, tile_h, webp, video_mtime)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                (path, tile_w, timestamp_ms, tile_h, webp, video_mtime, render_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(path) DO UPDATE SET
-                tile_w = ?2, timestamp_ms = ?3, tile_h = ?4, webp = ?5, video_mtime = ?6",
-            rusqlite::params![key, tile_w, timestamp_ms, tile_h, webp, video_mtime],
+                tile_w = ?2, timestamp_ms = ?3, tile_h = ?4, webp = ?5,
+                video_mtime = ?6, render_version = ?7",
+            rusqlite::params![
+                key,
+                tile_w,
+                timestamp_ms,
+                tile_h,
+                webp,
+                video_mtime,
+                THUMB_RENDER_VERSION
+            ],
         )?;
         Ok(())
     }
@@ -801,8 +846,8 @@ mod tests {
     }
 
     #[test]
-    fn migrate_v1_schema_to_v2() {
-        // 旧 v1 スキーマに行を入れた後 init_schema が v2 にマイグレートする。
+    fn migrate_v1_schema_marks_existing_rows_as_stale() {
+        // 旧スキーマの画像は回転未反映なので、移行後の lookup から除外する。
         let conn = Connection::open_in_memory().expect("memory db");
         conn.execute_batch(
             "CREATE TABLE video_tile_thumbs (
@@ -829,6 +874,11 @@ mod tests {
             conn: Mutex::new(conn),
         };
         let got = db.lookup_webp(Path::new("c:/v.mp4"), 10000, 100, 320);
-        assert_eq!(got.as_deref(), Some(&[42u8][..]));
+        assert!(got.is_none());
+
+        db.store_webp(Path::new("c:/v.mp4"), 320, 10000, 100, 180, &[43])
+            .unwrap();
+        let got = db.lookup_webp(Path::new("c:/v.mp4"), 10000, 100, 320);
+        assert_eq!(got.as_deref(), Some(&[43u8][..]));
     }
 }

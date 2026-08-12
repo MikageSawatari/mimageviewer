@@ -4301,6 +4301,10 @@ impl Drop for ConvertedArchiveCachePathsPending {
 
 struct ConvertedArchiveCachePathsResult {
     paths: std::collections::HashMap<String, PathBuf>,
+    /// (item index, normalized source archive key) pairs for tiles whose
+    /// folder-thumb pin resolution needs paths to build its LoadRequest.
+    /// The indices are safe to apply only while generation still matches.
+    pin_archive_dependencies: Vec<(usize, String)>,
     peeked: usize,
     hits: usize,
     elapsed_ms: f64,
@@ -13538,7 +13542,7 @@ impl App {
     /// ユーザーが UI で「自動」を初めて押したとき、それまで Manual で動いていて
     /// `poll_thumbnails` の sample 記録経路 (Auto ON 限定) が動いていなかったため、
     /// `samples` は空のまま。Auto ON 直後にこの関数で既存の Loaded サムネから
-    /// `source_dims` を集めて、即座に判定材料を揃える。
+    /// `layout_dims` / `source_dims` を集めて、即座に判定材料を揃える。
     ///
     /// Codex P2 #1 / 2026-05 ユーザー報告: 「自動を選んでもしばらく反応しない」の対応。
     pub(crate) fn rebuild_auto_aspect_samples_from_loaded(&mut self) {
@@ -13548,11 +13552,14 @@ impl App {
         self.auto_aspect.samples.clear();
         for (idx, state) in self.thumbnails.iter().enumerate() {
             if let ThumbnailState::Loaded {
-                source_dims, tex, ..
+                source_dims,
+                layout_dims,
+                tex,
+                ..
             } = state
             {
-                let ratio = match source_dims {
-                    Some((sw, sh)) if *sw > 0 => *sh as f32 / *sw as f32,
+                let ratio = match (*layout_dims).or(*source_dims) {
+                    Some((sw, sh)) if sw > 0 => sh as f32 / sw as f32,
                     _ => {
                         // source_dims が無くても、テクスチャ寸法から比率を拾える
                         // (アスペクト保持リサイズ済みなので比率は保たれる)
@@ -21671,11 +21678,12 @@ impl App {
             // `Failed` 状態に陥る (Codex P2)。
             // SQLite I/O エラーは Ok(false) と区別してログに残す (= 静かに丸めると
             // disk full / lock 競合の調査が困難になるため)。
-            let saved = match target_db.save_thumb_bytes(
+            let saved = match target_db.save_thumb_bytes_with_layout_dims(
                 &target_key,
                 entry.mtime,
                 entry.file_size,
                 entry.source_dims,
+                entry.layout_dims,
                 &entry.jpeg_data,
             ) {
                 Ok(b) => b,
@@ -21751,11 +21759,12 @@ impl App {
             .and_then(|m| m.get(&wb.target_key).cloned());
         if let Some(entry) = entry_opt {
             let parent_key = wb.parent_key.clone();
-            let _ = wb.parent_catalog.save_thumb_bytes(
+            let _ = wb.parent_catalog.save_thumb_bytes_with_layout_dims(
                 &parent_key,
                 wb.parent_entry_mtime,
                 wb.parent_entry_size,
                 entry.source_dims,
+                entry.layout_dims,
                 &entry.jpeg_data,
             );
             crate::perf::event("nav", "virtual_writeback", Some(&parent_key), 0, &[]);
@@ -23053,7 +23062,10 @@ impl App {
         if let Some(pending) = self.converted_archive_cache_paths_pending.take() {
             pending.cancel();
         }
-        self.converted_archive_cache_paths.clear();
+        // Keep the previous snapshot usable until the worker publishes its replacement.
+        // Keys are normalized source archive paths, so entries from the previous folder
+        // cannot resolve an unrelated tile. Clearing here used to create an empty window
+        // in which a folder pin fell back to (and permanently loaded) its base thumbnail.
         // サブ展開は Image / Video / Folder / ZipFile / PdfFile だけで、ConvertibleArchive は
         // 取り込まない。数百万件を判定しても必ず空なので synthetic path で即終了する。
         if self.current_folder.as_ref().is_some_and(|folder| {
@@ -23088,12 +23100,13 @@ impl App {
             .collect();
         // Folder タイル自身の pin が指す変換対象アーカイブは current items に現れない。
         // container root だけを snapshot し、DB lookup + cascade + metadata は worker 側で行う。
-        let pin_roots: Vec<PathBuf> = self
+        let pin_roots: Vec<(usize, PathBuf)> = self
             .items
             .iter()
-            .filter_map(|item| {
+            .enumerate()
+            .filter_map(|(idx, item)| {
                 self.folder_pin_lookup_target_for_item(item)
-                    .map(|target| target.path)
+                    .map(|target| (idx, target.path))
             })
             .collect();
         let pin_db = self.folder_thumb_pin_db.clone();
@@ -23112,6 +23125,7 @@ impl App {
             .spawn(move || {
                 let t0 = std::time::Instant::now();
                 let mut paths = std::collections::HashMap::new();
+                let mut pin_archive_dependencies = Vec::new();
                 let mut peeked = 0usize;
                 let mut hits = 0usize;
                 let mut candidates: std::collections::HashMap<String, (PathBuf, i64, i64)> =
@@ -23123,7 +23137,7 @@ impl App {
                     );
                 }
                 if let Some(pin_db) = pin_db.as_deref() {
-                    for root in pin_roots {
+                    for (idx, root) in pin_roots {
                         if worker_cancel.load(Ordering::Relaxed) {
                             return;
                         }
@@ -23140,10 +23154,21 @@ impl App {
                         else {
                             continue;
                         };
-                        if crate::folder_tree::is_convertible_archive_path(&resolved.abs_path) {
-                            candidates
-                                .entry(crate::path_key::normalize_keep_drive(&resolved.abs_path))
-                                .or_insert((resolved.abs_path, resolved.mtime, resolved.file_size));
+                        if matches!(
+                            resolved.kind,
+                            crate::folder_thumb_pins::ResolvedKind::ArchiveFirstImage
+                                | crate::folder_thumb_pins::ResolvedKind::ZipEntry
+                                | crate::folder_thumb_pins::ResolvedKind::ZipDirRepresentative
+                        ) && crate::folder_tree::is_convertible_archive_path(&resolved.abs_path)
+                        {
+                            let archive_key =
+                                crate::path_key::normalize_keep_drive(&resolved.abs_path);
+                            pin_archive_dependencies.push((idx, archive_key.clone()));
+                            candidates.entry(archive_key).or_insert((
+                                resolved.abs_path,
+                                resolved.mtime,
+                                resolved.file_size,
+                            ));
                         }
                     }
                 }
@@ -23195,6 +23220,7 @@ impl App {
                 if !worker_cancel.load(Ordering::Relaxed) {
                     let _ = tx.send(ConvertedArchiveCachePathsResult {
                         paths,
+                        pin_archive_dependencies,
                         peeked,
                         hits,
                         elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
@@ -23248,12 +23274,36 @@ impl App {
                 ],
             );
         }
-        let should_rebuild_visible = self.settings.facet_filter.has_rollup_edit_filter();
-        self.converted_archive_cache_paths = result.paths;
-        if should_rebuild_visible {
-            self.rebuild_visible_indices();
+        if self.converted_archive_cache_paths != result.paths {
+            let changed_keys: std::collections::HashSet<String> = self
+                .converted_archive_cache_paths
+                .keys()
+                .chain(result.paths.keys())
+                .filter(|key| {
+                    self.converted_archive_cache_paths.get(*key) != result.paths.get(*key)
+                })
+                .cloned()
+                .collect();
+            let mut dependent_indices: Vec<usize> = result
+                .pin_archive_dependencies
+                .iter()
+                .filter_map(|(idx, archive_key)| changed_keys.contains(archive_key).then_some(*idx))
+                .collect();
+            dependent_indices.sort_unstable();
+            dependent_indices.dedup();
+
+            self.converted_archive_cache_paths = result.paths;
+            for idx in dependent_indices {
+                self.evict_thumbnail_for_reload(idx);
+            }
+            if self.settings.facet_filter.has_rollup_edit_filter() {
+                self.rebuild_visible_indices();
+            }
+            // This is deliberately driven only by a value change. A subsequent refresh
+            // that returns the same snapshot performs no eviction, so this cannot become
+            // a reload -> refresh -> eviction loop (and never uses folder_thumb_pin_dirty).
+            ctx.request_repaint();
         }
-        ctx.request_repaint();
     }
 
     /// Phase C: フォルダピンの source が Video のときに、`video_pins` DB の WebP を
@@ -23445,6 +23495,7 @@ impl App {
                         file_size: resolved.file_size,
                         jpeg_data: webp,
                         source_dims: None,
+                        layout_dims: None,
                     },
                 );
             }
@@ -23490,6 +23541,7 @@ impl App {
                             file_size: 0,
                             jpeg_data: webp,
                             source_dims: None,
+                            layout_dims: None,
                         })
                     }
                     FileKind::ZipFile => {
@@ -26094,7 +26146,7 @@ impl App {
         }
         if let Some(page) = result.page_state.take() {
             for index in &page.thumbnail_reset_indices {
-                self.evict_thumbnail_for_edit_preview_refresh(*index);
+                self.evict_thumbnail_for_reload(*index);
             }
             self.adjustment_page_params = page.adjustment_page_params;
             self.local_adjust_pages = page.local_adjust_pages;
@@ -26672,7 +26724,7 @@ impl App {
             .filter_map(|(&idx, key)| matches_key(key).then_some(idx))
             .collect::<Vec<_>>();
         for idx in affected {
-            self.evict_thumbnail_for_edit_preview_refresh(idx);
+            self.evict_thumbnail_for_reload(idx);
         }
     }
 
@@ -28270,6 +28322,7 @@ impl App {
                 from_edit_preview: false,
                 edit_preview_adjustment: None,
                 source_dims: Some((width as u32, height as u32)),
+                layout_dims: None,
                 canceled: false,
                 finalized: false,
                 input_seq: self.input_seq,
@@ -29771,6 +29824,7 @@ impl App {
                             from_edit_preview: false,
                             edit_preview_adjustment: None,
                             source_dims: None,
+                            layout_dims: None,
                             canceled: true,
                             finalized: false,
                             input_seq: req.input_seq,
@@ -30106,6 +30160,7 @@ impl App {
                     from_edit_preview: false,
                     edit_preview_adjustment: None,
                     source_dims: None,
+                    layout_dims: None,
                     canceled: false,
                     finalized: false,
                     input_seq: 0,
@@ -30168,6 +30223,7 @@ impl App {
                 from_edit_preview,
                 edit_preview_adjustment,
                 source_dims,
+                layout_dims,
                 canceled,
                 finalized,
                 input_seq: req_input_seq,
@@ -30332,6 +30388,7 @@ impl App {
                             from_edit_preview,
                             rendered_at_px,
                             source_dims,
+                            layout_dims,
                         };
                         textures_created += 1;
                         // 見開きの縦横判定はテクスチャ寿命に依存させない。元寸法が無い
@@ -30341,11 +30398,15 @@ impl App {
                         {
                             self.page_dims_cache.record(self.items_generation, i, dims);
                         }
+                        if let Some(dims) = layout_dims {
+                            self.page_dims_cache
+                                .record_layout(self.items_generation, i, dims);
+                        }
                         // auto_aspect: 新規 Loaded のタイミングで比率サンプルを記録。
                         // source_dims が None なら ColorImage の (w, h) を fallback として使う
                         // (動画 Shell サムネ / 旧 cache 由来などで source_dims が無いケース)。
                         if self.settings.thumb_aspect_auto {
-                            let ratio = match source_dims {
+                            let ratio = match layout_dims.or(source_dims) {
                                 Some((sw, sh)) if sw > 0 => sh as f32 / sw as f32,
                                 _ if w > 0 => h as f32 / w as f32,
                                 _ => -1.0,
@@ -30421,6 +30482,7 @@ impl App {
                             from_edit_preview,
                             edit_preview_adjustment,
                             source_dims,
+                            layout_dims,
                             canceled: false,
                             finalized: false,
                             input_seq: req_input_seq,
@@ -34825,6 +34887,26 @@ impl App {
             return true;
         }
         self.current_viewer_session_is_detached_or_switching()
+    }
+
+    /// Whether hiding the main HWND must leave the UI heartbeat watchdog armed.
+    ///
+    /// Detached lifecycle, an active mounted media session, and the narrower tray-resident
+    /// playback wake projection all require `App::update` progress while the root window is
+    /// hidden. Keep this as the single policy boundary for both an explicit tray hide and an
+    /// externally observed `ShowWindow(SW_HIDE)` transition.
+    pub(crate) fn ui_heartbeat_should_stay_active_while_hidden(&self) -> bool {
+        let mounted_media_session = self.fullscreen_idx.is_some_and(|idx| {
+            matches!(
+                self.items.get(idx),
+                Some(GridItem::Video(_)) | Some(GridItem::Audio(_))
+            ) || self.video_audio_mode == Some(idx)
+                || matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Video { .. }))
+        });
+
+        self.viewer_session_is_detached_or_switching()
+            || mounted_media_session
+            || self.tray_resident_media_updates_needed()
     }
 
     pub(crate) fn viewer_session_blocks_main_window(&self) -> bool {
@@ -51039,7 +51121,9 @@ impl App {
         self.enqueue_edit_preview_close_update(update);
     }
 
-    fn evict_thumbnail_for_edit_preview_refresh(&mut self, idx: usize) {
+    /// Remove every queued/materialized form of one grid thumbnail and make it
+    /// eligible for a fresh LoadRequest on the next keep-range update.
+    fn evict_thumbnail_for_reload(&mut self, idx: usize) {
         for queue in [&self.reload_queue, &self.heavy_io_queue]
             .into_iter()
             .flatten()
@@ -51091,7 +51175,7 @@ impl App {
                 }),
         );
         for idx in invalidated {
-            self.evict_thumbnail_for_edit_preview_refresh(idx);
+            self.evict_thumbnail_for_reload(idx);
         }
         self.thumb_edit_preview_keys.clear();
         self.edit_preview_refresh_pending.clear();
@@ -51144,7 +51228,7 @@ impl App {
                 })
                 .collect();
             for idx in matching {
-                self.evict_thumbnail_for_edit_preview_refresh(idx);
+                self.evict_thumbnail_for_reload(idx);
             }
         }
     }
@@ -51161,7 +51245,7 @@ impl App {
                 crate::edit_preview_cache::EditPreviewEvent::Saved { item_key } => {
                     let matching = self.thumbnail_indices_for_edit_preview_key(&item_key);
                     for idx in matching {
-                        self.evict_thumbnail_for_edit_preview_refresh(idx);
+                        self.evict_thumbnail_for_reload(idx);
                     }
                     self.edit_preview_refresh_pending.insert(
                         item_key,
@@ -51171,7 +51255,7 @@ impl App {
                 crate::edit_preview_cache::EditPreviewEvent::Invalidated { item_key } => {
                     let matching = self.thumbnail_indices_for_edit_preview_key(&item_key);
                     for idx in matching {
-                        self.evict_thumbnail_for_edit_preview_refresh(idx);
+                        self.evict_thumbnail_for_reload(idx);
                     }
                     self.edit_preview_refresh_pending.remove(&item_key);
                 }
@@ -51220,7 +51304,7 @@ impl App {
                     self.thumbnails.get(idx),
                     Some(ThumbnailState::Loaded { .. }) | Some(ThumbnailState::Failed)
                 ) {
-                    self.evict_thumbnail_for_edit_preview_refresh(idx);
+                    self.evict_thumbnail_for_reload(idx);
                 }
             }
         }
@@ -51704,7 +51788,7 @@ impl App {
     }
 
     /// 指定 idx の最後段 crop 設定を DB / サイドカー / in-memory state に反映する。
-    /// `None` または full rect は「crop なし」として削除する。
+    /// `None` または、現在の authoring raster に対する full rect は「crop なし」として削除する。
     pub(crate) fn set_export_crop_for_idx(
         &mut self,
         idx: usize,
@@ -51716,7 +51800,13 @@ impl App {
             None => return,
         };
         let normalized = settings
-            .map(|settings| settings.sanitized(image_size[0], image_size[1]))
+            .map(|settings| {
+                crate::export_crop::CropSettings::authored(
+                    settings.rect,
+                    settings.aspect_mode,
+                    image_size,
+                )
+            })
             .filter(|settings| !settings.is_full(image_size[0], image_size[1]));
 
         if let Some(settings) = normalized {
@@ -51759,7 +51849,13 @@ impl App {
         image_size: [usize; 2],
     ) {
         let normalized = settings
-            .map(|settings| settings.sanitized(image_size[0], image_size[1]))
+            .map(|settings| {
+                crate::export_crop::CropSettings::authored(
+                    settings.rect,
+                    settings.aspect_mode,
+                    image_size,
+                )
+            })
             .filter(|settings| !settings.is_full(image_size[0], image_size[1]));
         if let Some(settings) = normalized {
             self.export_crop_page_settings.insert(idx, settings);
@@ -51771,16 +51867,51 @@ impl App {
         // (上記 set_export_crop_for_idx と同じ理由でキャッシュ無効化しない。Codex P2)
     }
 
+    /// legacy crop が基準寸法を持たない場合、最初に使える**矩形が収まる**ラスタ寸法を採用し、
+    /// 中央 DB と sidecar mirror へ書き戻す。clamp 後に full rect になっても行は削除しない。
+    ///
+    /// 矩形がはみ出す寸法は採用を見送る (採用すると矩形が切り落とされ、書き戻した時点で
+    /// 元の選択領域が失われる)。見送った場合は legacy のまま返す。
+    pub(crate) fn ensure_export_crop_source_size(
+        &mut self,
+        idx: usize,
+        fallback_size: [usize; 2],
+    ) -> Option<crate::export_crop::CropSettings> {
+        let settings = self.export_crop_page_settings.get(&idx).copied()?;
+        if settings.valid_source_size().is_some() {
+            return Some(settings);
+        }
+        let adopted = settings.with_legacy_source_size(fallback_size);
+        let Some([adopted_w, adopted_h]) = adopted.valid_source_size() else {
+            // 矩形が収まらないラスタは基準として採用しない (`with_legacy_source_size` 参照)。
+            // 書き戻さずに legacy のまま返し、表示側の clamp だけを従来どおり効かせる。
+            return Some(settings);
+        };
+        if let Some(key) = self.page_path_key(idx) {
+            if let Some(db) = &self.export_crop_db
+                && let Err(err) = db.set(&key, adopted)
+            {
+                crate::logger::log(format!(
+                    "export_crop: failed to adopt legacy source size idx={idx} error={err}"
+                ));
+            }
+            self.with_sidecar_mut(idx, move |sc, rel| sc.set_export_crop(rel, adopted));
+            crate::logger::log(format!(
+                "export_crop: adopted legacy source size idx={idx} size={adopted_w}x{adopted_h}"
+            ));
+        }
+        self.export_crop_page_settings.insert(idx, adopted);
+        self.export_crop_pages.insert(idx);
+        Some(adopted)
+    }
+
     pub(crate) fn export_crop_for_idx(
-        &self,
+        &mut self,
         idx: usize,
         image_size: [usize; 2],
     ) -> Option<crate::export_crop::CropSettings> {
-        self.export_crop_page_settings
-            .get(&idx)
-            .copied()
-            .map(|settings| settings.sanitized(image_size[0], image_size[1]))
-            .filter(|settings| !settings.is_full(image_size[0], image_size[1]))
+        self.ensure_export_crop_source_size(idx, image_size)
+            .map(|settings| settings.scaled_to(image_size))
     }
 
     /// 保存対象画像 (final composite。AI アップスケールで source とサイズが違うことが
@@ -51788,17 +51919,18 @@ impl App {
     /// されているので、`target_size / source_size` の比で等比拡縮する。表示は切り取らず
     /// capture / export の最終段でだけ使う。
     pub(crate) fn export_crop_rect_for_pixels(
-        &self,
+        &mut self,
         idx: usize,
         target_size: [usize; 2],
     ) -> Option<crate::export_crop::CropRect> {
-        let source_size = self.current_raw_source_pixels(idx)?.size;
-        let crop = self.export_crop_for_idx(idx, source_size)?;
-        Some(crate::edit_source::export_crop_rect_for_pixels(
-            crop,
-            source_size,
-            target_size,
-        ))
+        let settings = self.export_crop_page_settings.get(&idx).copied()?;
+        let settings = if settings.valid_source_size().is_some() {
+            settings
+        } else {
+            let first_raster_size = self.current_raw_source_pixels(idx)?.size;
+            self.ensure_export_crop_source_size(idx, first_raster_size)?
+        };
+        Some(settings.scaled_to(target_size).rect)
     }
 
     /// 現在の input / erase mask / local adjust 世代から、補正レイヤー cache key を作る。
@@ -62839,12 +62971,12 @@ impl eframe::App for App {
                     );
                     self.sync_after_restore(ctx);
                 } else if !is_visible_now && self.window_visible {
-                    let keep_detached_viewer_alive = self.viewer_session_is_detached_or_switching();
                     self.window_visible = false;
+                    let keep_heartbeat_alive = self.ui_heartbeat_should_stay_active_while_hidden();
                     crate::set_ui_heartbeat_suspended(
-                        !keep_detached_viewer_alive,
-                        if keep_detached_viewer_alive {
-                            "App::update heartbeat kept alive for detached viewer after external window hide"
+                        !keep_heartbeat_alive,
+                        if keep_heartbeat_alive {
+                            "App::update heartbeat kept alive for active viewer session after external window hide"
                         } else {
                             "App::update heartbeat suspended after external window hide"
                         }

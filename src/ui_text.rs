@@ -53,6 +53,13 @@ const HANDLE_R: f32 = 7.0;
 /// 超過時は最古エントリから捨てる。
 const COMIC_UNDO_CAP: usize = 100;
 
+/// Annotation colors are stored and rendered as ordinary RGBA. Additive alpha has no matching
+/// compositing path here, so exposing egui's additive sentinel would only collapse `Color32`
+/// alpha to zero and make the color appear impossible to restore.
+fn annotation_color_edit_button(ui: &mut egui::Ui, color: &mut egui::Color32) -> egui::Response {
+    egui::color_picker::color_edit_button_srgba(ui, color, egui::color_picker::Alpha::OnlyBlend)
+}
+
 fn text_floating_ui_blocks_canvas_input(
     ctx: &egui::Context,
     pointer_pos: Option<egui::Pos2>,
@@ -1927,7 +1934,7 @@ fn annotation_dialog_contents_ui(
     ui.horizontal(|ui| {
         ui.label("カスタム:");
         let mut custom = to_c32(*color);
-        if ui.color_edit_button_srgba(&mut custom).changed() {
+        if annotation_color_edit_button(ui, &mut custom).changed() {
             *color = from_c32(custom);
         }
     });
@@ -7318,7 +7325,7 @@ fn window_name_header_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed
             });
         if w.name_plate.mode != NamePlateMode::None {
             let mut col = to_c32(w.name_plate.name.color);
-            if ui.color_edit_button_srgba(&mut col).changed() {
+            if annotation_color_edit_button(ui, &mut col).changed() {
                 w.name_plate.name.color = from_c32(col);
                 *changed = true;
             }
@@ -7637,7 +7644,7 @@ fn text_block_ui(
     ui.horizontal(|ui| {
         ui.label("色");
         let mut col = to_c32(t.color);
-        if ui.color_edit_button_srgba(&mut col).changed() {
+        if annotation_color_edit_button(ui, &mut col).changed() {
             t.color = from_c32(col);
             *changed = true;
         }
@@ -7714,7 +7721,7 @@ fn text_block_ui(
             ui.spacing_mut().slider_width = DETAIL_ROW_SLIDER_W;
             ui.label("縁色");
             let mut col = to_c32(o.color);
-            if ui.color_edit_button_srgba(&mut col).changed() {
+            if annotation_color_edit_button(ui, &mut col).changed() {
                 o.color = from_c32(col);
                 *changed = true;
             }
@@ -7794,7 +7801,7 @@ fn text_effects_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool) {
                 ui.spacing_mut().slider_width = DETAIL_ROW_SLIDER_W;
                 ui.label(format!("外フチ{}", i + 1));
                 let mut col = to_c32(outline.color);
-                if ui.color_edit_button_srgba(&mut col).changed() {
+                if annotation_color_edit_button(ui, &mut col).changed() {
                     outline.color = from_c32(col);
                     *changed = true;
                 }
@@ -7838,7 +7845,7 @@ fn text_effects_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool) {
         ui.horizontal(|ui| {
             ui.label("影色");
             let mut col = to_c32(sh.color);
-            if ui.color_edit_button_srgba(&mut col).changed() {
+            if annotation_color_edit_button(ui, &mut col).changed() {
                 sh.color = from_c32(col);
                 *changed = true;
             }
@@ -7872,7 +7879,7 @@ fn text_effects_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool) {
         ui.horizontal(|ui| {
             ui.label("発光色");
             let mut col = to_c32(glow.color);
-            if ui.color_edit_button_srgba(&mut col).changed() {
+            if annotation_color_edit_button(ui, &mut col).changed() {
                 glow.color = from_c32(col);
                 *changed = true;
             }
@@ -7898,7 +7905,7 @@ fn text_effects_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool) {
         ui.horizontal(|ui| {
             ui.label("背景色");
             let mut col = to_c32(bg.fill);
-            if ui.color_edit_button_srgba(&mut col).changed() {
+            if annotation_color_edit_button(ui, &mut col).changed() {
                 bg.fill = from_c32(col);
                 *changed = true;
             }
@@ -7924,7 +7931,7 @@ fn text_effects_ui(ui: &mut egui::Ui, t: &mut TextBlock, changed: &mut bool) {
         ui.horizontal(|ui| {
             ui.label("Echo色");
             let mut col = to_c32(echo.color);
-            if ui.color_edit_button_srgba(&mut col).changed() {
+            if annotation_color_edit_button(ui, &mut col).changed() {
                 echo.color = from_c32(col);
                 *changed = true;
             }
@@ -7998,7 +8005,7 @@ fn marker_bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut 
         ui.horizontal(|ui| {
             ui.label("塗り色");
             let mut color = to_c32(*fill);
-            if ui.color_edit_button_srgba(&mut color).changed() {
+            if annotation_color_edit_button(ui, &mut color).changed() {
                 *fill = from_c32(color);
                 *changed = true;
             }
@@ -8080,7 +8087,7 @@ fn annotation_arrow_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &m
         ui.spacing_mut().slider_width = DETAIL_ROW_SLIDER_W;
         ui.label("塗り色");
         let mut color = to_c32(b.fill.unwrap_or(b.outline.color));
-        if ui.color_edit_button_srgba(&mut color).changed() {
+        if annotation_color_edit_button(ui, &mut color).changed() {
             b.fill = Some(from_c32(color));
             *changed = true;
         }
@@ -8537,7 +8544,7 @@ fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
             ui.spacing_mut().slider_width = DETAIL_ROW_SLIDER_W;
             ui.label("塗り色");
             let mut col = to_c32(*f);
-            if ui.color_edit_button_srgba(&mut col).changed() {
+            if annotation_color_edit_button(ui, &mut col).changed() {
                 *f = from_c32(col);
                 *changed = true;
             }
@@ -8554,7 +8561,7 @@ fn bubble_body_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
         ui.spacing_mut().slider_width = DETAIL_ROW_SLIDER_W;
         ui.label("線色");
         let mut col = to_c32(b.outline.color);
-        if ui.color_edit_button_srgba(&mut col).changed() {
+        if annotation_color_edit_button(ui, &mut col).changed() {
             b.outline.color = from_c32(col);
             *changed = true;
         }
@@ -8788,7 +8795,7 @@ fn window_body_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut 
             ui.horizontal(|ui| {
                 ui.label("色");
                 let mut col = to_c32(*c);
-                if ui.color_edit_button_srgba(&mut col).changed() {
+                if annotation_color_edit_button(ui, &mut col).changed() {
                     *c = from_c32(col);
                     *changed = true;
                 }
@@ -8820,7 +8827,7 @@ fn window_body_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut 
                 ui.horizontal(|ui| {
                     ui.label("下端色");
                     let mut col = to_c32(*c);
-                    if ui.color_edit_button_srgba(&mut col).changed() {
+                    if annotation_color_edit_button(ui, &mut col).changed() {
                         *c = from_c32(col);
                         *changed = true;
                     }
@@ -8849,7 +8856,7 @@ fn window_body_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut 
         ui.horizontal(|ui| {
             ui.label("枠色");
             let mut col = to_c32(w.outline.color);
-            if ui.color_edit_button_srgba(&mut col).changed() {
+            if annotation_color_edit_button(ui, &mut col).changed() {
                 w.outline.color = from_c32(col);
                 *changed = true;
             }
@@ -8879,7 +8886,7 @@ fn window_body_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut 
         ui.horizontal(|ui| {
             ui.label("影色");
             let mut col = to_c32(sh.color);
-            if ui.color_edit_button_srgba(&mut col).changed() {
+            if annotation_color_edit_button(ui, &mut col).changed() {
                 sh.color = from_c32(col);
                 *changed = true;
             }
@@ -8966,7 +8973,7 @@ fn window_parts_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut
                 ui.horizontal(|ui| {
                     ui.label("塗り色");
                     let mut col = to_c32(*c);
-                    if ui.color_edit_button_srgba(&mut col).changed() {
+                    if annotation_color_edit_button(ui, &mut col).changed() {
                         *c = from_c32(col);
                         *changed = true;
                     }
@@ -8975,7 +8982,7 @@ fn window_parts_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut
             ui.horizontal(|ui| {
                 ui.label("枠色");
                 let mut col = to_c32(w.name_plate.outline.color);
-                if ui.color_edit_button_srgba(&mut col).changed() {
+                if annotation_color_edit_button(ui, &mut col).changed() {
                     w.name_plate.outline.color = from_c32(col);
                     *changed = true;
                 }
@@ -9031,7 +9038,7 @@ fn window_parts_ui(ui: &mut egui::Ui, w: &mut MessageWindowObject, changed: &mut
             ui.horizontal(|ui| {
                 ui.label("色");
                 let mut col = to_c32(*c);
-                if ui.color_edit_button_srgba(&mut col).changed() {
+                if annotation_color_edit_button(ui, &mut col).changed() {
                     *c = from_c32(col);
                     *changed = true;
                 }
@@ -9147,7 +9154,7 @@ fn bubble_deco_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
         ui.horizontal(|ui| {
             ui.label("色");
             let mut c = to_c32(layer.color);
-            if ui.color_edit_button_srgba(&mut c).changed() {
+            if annotation_color_edit_button(ui, &mut c).changed() {
                 layer.color = from_c32(c);
                 *changed = true;
             }
@@ -9161,7 +9168,7 @@ fn bubble_deco_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
             ui.horizontal(|ui| {
                 ui.label("縁取り色");
                 let mut c = to_c32(layer.outline_color);
-                if ui.color_edit_button_srgba(&mut c).changed() {
+                if annotation_color_edit_button(ui, &mut c).changed() {
                     layer.outline_color = from_c32(c);
                     *changed = true;
                 }
@@ -9182,7 +9189,7 @@ fn bubble_deco_ui(ui: &mut egui::Ui, b: &mut BubbleObject, changed: &mut bool) {
                 ui.horizontal(|ui| {
                     ui.label("中央色");
                     let mut c = to_c32(layer.center_color);
-                    if ui.color_edit_button_srgba(&mut c).changed() {
+                    if annotation_color_edit_button(ui, &mut c).changed() {
                         layer.center_color = from_c32(c);
                         *changed = true;
                     }
@@ -9295,7 +9302,7 @@ fn stamp_ui(
             ui.spacing_mut().slider_width = DETAIL_ROW_SLIDER_W;
             ui.label("縁色");
             let mut col = to_c32(o.color);
-            if ui.color_edit_button_srgba(&mut col).changed() {
+            if annotation_color_edit_button(ui, &mut col).changed() {
                 o.color = from_c32(col);
                 *changed = true;
             }
@@ -9511,6 +9518,24 @@ fn shape_half(shape: &BubbleShape) -> (f32, f32) {
 mod tests {
     use super::*;
     use crate::rotation_db::Rotation;
+
+    #[test]
+    fn annotation_color_pickers_do_not_use_egui_additive_default() {
+        let source = include_str!("ui_text.rs");
+        let raw_ui_call = ["ui.", "color_edit_button_srgba("].concat();
+        let explicit_picker_call = ["egui::color_picker::", "color_edit_button_srgba("].concat();
+
+        assert!(
+            !source.contains(&raw_ui_call),
+            "annotation color pickers must use annotation_color_edit_button so egui cannot expose additive alpha"
+        );
+        assert_eq!(
+            source.matches(&explicit_picker_call).count(),
+            1,
+            "the annotation color picker policy must remain centralized in one helper"
+        );
+        assert!(source.contains("egui::color_picker::Alpha::OnlyBlend"));
+    }
 
     fn primary_press_input(pos: egui::Pos2) -> egui::RawInput {
         let mut input = egui::RawInput {

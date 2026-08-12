@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use crossbeam_channel::{Receiver, SendTimeoutError, Sender, TryRecvError, bounded};
 
 use super::clock::AvClock;
+use super::display_metadata::{VideoOrientation, orientation_from_stream};
 use super::stream::video_tap::{VideoTapController, VideoTapProducer, video_tap_channel};
 
 /// 同時に走っている **video decode thread** (= `run_video_decode`) の数。
@@ -1365,11 +1366,15 @@ pub struct VideoFrame {
     pub data: VideoFrameData,
     /// Sample aspect ratio (= pixel aspect ratio)。1/1 = 正方ピクセル。
     /// アナモフィック動画 (NTSC DVD 等で SAR=97/80 など) で native presenter が
-    /// 表示比を補正するために使う。`VideoInfo` 経由の `SetVideoSar` コマンドと違い、
+    /// 表示比を補正するために使う。`VideoInfo` 経由の display geometry command と違い、
     /// フレームに同梱して presenter thread へ直接届けることで、ソース切替直後の
     /// 最初のフレームが旧動画の SAR で描かれるのを防ぐ。
     pub sar_num: u32,
     pub sar_den: u32,
+    /// Container display matrix normalized to a quarter-turn/reflection value.
+    /// Kept on each frame so fast-swap presents the first new-source frame with
+    /// matching geometry before the slower `VideoInfo` command path completes.
+    pub orientation: VideoOrientation,
     /// 提示時刻 (秒)。AvClock との比較に使う。
     pub pts_secs: f64,
     /// シーク世代。これが現行の AvClock seek_serial と異なれば UI は捨てる。
@@ -1563,6 +1568,8 @@ pub struct VideoInfo {
     /// 未指定 / 不正値は (1, 1) に正規化する。
     pub sar_num: u32,
     pub sar_den: u32,
+    /// Container display matrix normalized to 0/90/180/270 plus reflection.
+    pub orientation: VideoOrientation,
 }
 
 /// 埋め込みチャプター 1 件分。`AVChapter` の `start`/`end` を `time_base` で秒に
@@ -1865,6 +1872,7 @@ struct VideoSetup {
     fps_den: u32,
     sar_num: u32,
     sar_den: u32,
+    orientation: VideoOrientation,
     src_w: u32,
     src_h: u32,
     dst_w: u32,
@@ -1998,6 +2006,7 @@ fn run_decoder(
         Some(video_stream) => {
             let video_stream_idx = video_stream.index();
             let video_time_base = video_stream.time_base();
+            let video_orientation = orientation_from_stream(&video_stream);
             let video_params = video_stream.parameters();
             let (video_fps_num, video_fps_den) =
                 selected_video_rate(video_stream.avg_frame_rate(), video_stream.rate())
@@ -2121,6 +2130,7 @@ fn run_decoder(
                 fps_den: video_fps_den,
                 sar_num: video_sar_num,
                 sar_den: video_sar_den,
+                orientation: video_orientation,
                 src_w,
                 src_h,
                 dst_w,
@@ -2282,6 +2292,7 @@ fn run_decoder(
         vi_fps_den,
         vi_sar_num,
         vi_sar_den,
+        vi_orientation,
         vi_stream_interlaced,
     ) = match video_setup.as_ref() {
         Some(v) => (
@@ -2297,6 +2308,7 @@ fn run_decoder(
             v.fps_den,
             v.sar_num,
             v.sar_den,
+            v.orientation,
             v.stream_interlaced,
         ),
         None => (
@@ -2312,6 +2324,7 @@ fn run_decoder(
             0,
             1,
             1,
+            VideoOrientation::IDENTITY,
             false,
         ),
     };
@@ -2412,6 +2425,7 @@ fn run_decoder(
         chapters,
         sar_num: vi_sar_num,
         sar_den: vi_sar_den,
+        orientation: vi_orientation,
     };
     let _ = info_tx.send(Ok(info));
 
@@ -2663,6 +2677,7 @@ fn run_decoder(
             fps_den: video_fps_den,
             sar_num: video_sar_num,
             sar_den: video_sar_den,
+            orientation: video_orientation,
             dst_w,
             dst_h,
             stream_interlaced: video_stream_interlaced,
@@ -2717,6 +2732,7 @@ fn run_decoder(
                         video_fps_den,
                         video_sar_num,
                         video_sar_den,
+                        video_orientation,
                         hw_active_initially,
                         deinterlace,
                         video_stream_interlaced,
@@ -3376,6 +3392,7 @@ fn run_video_decode(
     video_fps_den: u32,
     video_sar_num: u32,
     video_sar_den: u32,
+    video_orientation: VideoOrientation,
     hw_active_initially: bool,
     deinterlace: crate::settings::VideoDeinterlaceMode,
     stream_interlaced: bool,
@@ -4218,6 +4235,7 @@ fn run_video_decode(
                         dst_h,
                         video_sar_num,
                         video_sar_den,
+                        video_orientation,
                         pts_secs,
                         current_seek_serial,
                         &mut first_frame_event_logged,
@@ -4952,6 +4970,7 @@ fn run_video_decode(
                 data: VideoFrameData::Cpu(bgra),
                 sar_num: video_sar_num,
                 sar_den: video_sar_den,
+                orientation: video_orientation,
                 pts_secs,
                 seek_serial: current_seek_serial,
             };
@@ -7769,6 +7788,7 @@ fn try_gpu_blit_path(
     dst_h: u32,
     sar_num: u32,
     sar_den: u32,
+    orientation: VideoOrientation,
     pts_secs: f64,
     current_seek_serial: u64,
     first_frame_event_logged: &mut bool,
@@ -7914,6 +7934,7 @@ fn try_gpu_blit_path(
         data: VideoFrameData::Gpu(d3d11_frame),
         sar_num,
         sar_den,
+        orientation,
         pts_secs,
         seek_serial: current_seek_serial,
     })

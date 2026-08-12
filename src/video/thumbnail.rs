@@ -185,8 +185,11 @@ struct SeekThumbnailDecoder {
     tb_den: f64,
     src_w: u32,
     src_h: u32,
+    scaled_w: u32,
+    scaled_h: u32,
     dst_w: u32,
     dst_h: u32,
+    orientation: crate::video::display_metadata::VideoOrientation,
     scaler: Option<ffmpeg_the_third::software::scaling::Context>,
     scaler_src_fmt: Option<ffmpeg_the_third::format::Pixel>,
     decoder: crate::video::decoder::AuxVideoDecoder,
@@ -207,7 +210,11 @@ impl SeekThumbnailDecoder {
         let time_base = video_stream.time_base();
         let tb_num = time_base.numerator() as f64;
         let tb_den = time_base.denominator() as f64;
+        let orientation = crate::video::display_metadata::orientation_from_stream(&video_stream);
         let params_ref = video_stream.parameters();
+        let sar = params_ref.sample_aspect_ratio();
+        let (sar_num, sar_den) =
+            crate::video::decoder::normalize_sar(sar.numerator(), sar.denominator());
         let params = crate::video::decoder::clone_codec_parameters(&params_ref)?;
         let codec_id = params.id();
 
@@ -219,9 +226,22 @@ impl SeekThumbnailDecoder {
         )?;
         let src_w = decoder.width();
         let src_h = decoder.height();
-        let (dst_w, dst_h) = fit_within(src_w, src_h, THUMB_W, THUMB_H);
+        let (dst_w, dst_h) = crate::video::display_metadata::fit_display_within(
+            src_w,
+            src_h,
+            sar_num,
+            sar_den,
+            orientation,
+            THUMB_W,
+            THUMB_H,
+        );
+        let (scaled_w, scaled_h) = if orientation.swaps_axes() {
+            (dst_h, dst_w)
+        } else {
+            (dst_w, dst_h)
+        };
         crate::logger::log(format!(
-            "video-thumb: decoder ready codec={} decoder={} decode_path={} d3d11va_supported={} d3d11va_config={} src_size={}x{} dst_size={}x{}",
+            "video-thumb: decoder ready codec={} decoder={} decode_path={} d3d11va_supported={} d3d11va_config={} src_size={}x{} scale_size={}x{} display_size={}x{} orientation={:?}",
             codec_id.name(),
             decoder.decoder_name(),
             if decoder.hw_decode_active() {
@@ -233,8 +253,11 @@ impl SeekThumbnailDecoder {
             decoder.d3d11va_config(),
             src_w,
             src_h,
+            scaled_w,
+            scaled_h,
             dst_w,
             dst_h,
+            orientation,
         ));
 
         Ok(Self {
@@ -244,8 +267,11 @@ impl SeekThumbnailDecoder {
             tb_den,
             src_w,
             src_h,
+            scaled_w,
+            scaled_h,
             dst_w,
             dst_h,
+            orientation,
             scaler: None,
             scaler_src_fmt: None,
             decoder,
@@ -364,15 +390,15 @@ impl SeekThumbnailDecoder {
         if self.scaler.is_none() || self.scaler_src_fmt != Some(cur_src_fmt) {
             crate::logger::log(format!(
                 "video-thumb: -> ScaleContext::get src_fmt={cur_src_fmt:?} src_size={}x{} dst_size={}x{}",
-                self.src_w, self.src_h, self.dst_w, self.dst_h
+                self.src_w, self.src_h, self.scaled_w, self.scaled_h
             ));
             let scaler = ScaleContext::get(
                 cur_src_fmt,
                 self.src_w,
                 self.src_h,
                 Pixel::RGBA,
-                self.dst_w,
-                self.dst_h,
+                self.scaled_w,
+                self.scaled_h,
                 ScaleFlags::BILINEAR,
             )
             .map_err(|e| format!("sws_scale init failed: {e}"))?;
@@ -388,23 +414,31 @@ impl SeekThumbnailDecoder {
             .map_err(|e| format!("sws_scale failed: {e}"))?;
 
         let stride = rgba.stride(0);
-        let needed = (self.dst_w * 4) as usize;
+        let needed = (self.scaled_w * 4) as usize;
         let plane = rgba.data(0);
         let buf: Vec<u8> = if stride == needed {
-            plane[..needed * self.dst_h as usize].to_vec()
+            plane[..needed * self.scaled_h as usize].to_vec()
         } else {
-            let mut out = Vec::with_capacity(needed * self.dst_h as usize);
-            for row in 0..self.dst_h as usize {
+            let mut out = Vec::with_capacity(needed * self.scaled_h as usize);
+            for row in 0..self.scaled_h as usize {
                 let start = row * stride;
                 out.extend_from_slice(&plane[start..start + needed]);
             }
             out
         };
 
+        let (oriented_w, oriented_h, buf) = crate::video::display_metadata::orient_rgba(
+            self.scaled_w,
+            self.scaled_h,
+            &buf,
+            self.orientation,
+        )?;
+        debug_assert_eq!((oriented_w, oriented_h), (self.dst_w, self.dst_h));
+
         Ok(DecodeOutcome::Ready(Thumbnail {
             target_secs: frame_pts_secs,
-            width: self.dst_w,
-            height: self.dst_h,
+            width: oriented_w,
+            height: oriented_h,
             rgba: Arc::new(buf),
         }))
     }
@@ -530,16 +564,6 @@ fn run_worker(
         state.lock().unwrap().insert(key, thumb);
     }
     crate::logger::log("video-thumb: terminated");
-}
-
-fn fit_within(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
-    if src_w == 0 || src_h == 0 {
-        return (max_w, max_h);
-    }
-    let scale = (max_w as f64 / src_w as f64).min(max_h as f64 / src_h as f64);
-    let w = ((src_w as f64 * scale).round() as u32).max(1);
-    let h = ((src_h as f64 * scale).round() as u32).max(1);
-    (w, h)
 }
 
 #[cfg(test)]

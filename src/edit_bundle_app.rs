@@ -75,7 +75,7 @@ impl App {
             .unwrap_or_else(|| key.clone());
         let adjust_override = self.adjustment_page_params.get(&idx).cloned();
         let local_adjust_override = self.local_adjust_page_layers.get(&idx).cloned();
-        let crop_override = self.export_crop_page_settings.get(&idx).copied();
+        let crop_override = self.ensure_export_crop_source_size(idx, source_size);
         let comic_override = self.comic_docs.get(&key).cloned();
         let paths = EditBundleDbPaths::default_data_dir();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -457,6 +457,17 @@ fn load_page_edit_bundle(
         shapes,
         size: source_size,
     };
+    let export_crop = crop_override.or_else(|| crop_db.get(key)).map(|crop| {
+        let adopted = crop.with_legacy_source_size(source_size);
+        if crop.valid_source_size().is_none()
+            && let Err(error) = crop_db.set(key, adopted)
+        {
+            crate::logger::log(format!(
+                "edit_bundle: failed to adopt legacy crop source size key={key} error={error}"
+            ));
+        }
+        adopted
+    });
     Ok(PageEditBundle {
         source_size,
         adjust: adjust_override.or_else(|| adjustment.get_page_params(key)),
@@ -469,7 +480,7 @@ fn load_page_edit_bundle(
         local_adjust_layers: local_adjust_override
             .or_else(|| local_adjust_db.get_layers(key))
             .filter(|layers| !layers.is_empty()),
-        export_crop: crop_override.or_else(|| crop_db.get(key)),
+        export_crop,
         comic: comic_override
             .or_else(|| comic_db.get(key))
             .filter(|objects| !objects.is_empty()),

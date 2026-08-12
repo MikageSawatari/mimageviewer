@@ -3142,13 +3142,23 @@ fn fs_texture_content_rect(
     page_rect: egui::Rect,
     texture_size: egui::Vec2,
     rotation: crate::rotation_db::Rotation,
-    preserve_texture_aspect: bool,
 ) -> egui::Rect {
-    if preserve_texture_aspect {
-        fit_display_size_in_rect(page_rect, rotated_display_size(texture_size, rotation))
-    } else {
-        page_rect
-    }
+    fit_display_size_in_rect(page_rect, rotated_display_size(texture_size, rotation))
+}
+
+/// Bind a layout-owned page rectangle to the texture that will actually be painted.
+///
+/// Page/source geometry and the selected raster can be resolved at different times
+/// (progressive thumbnails, PDF rerenders, processed continuous-reading textures).
+/// The layout rectangle is therefore only a containing frame. Re-resolve the final
+/// image rectangle from the actual texture at this ownership boundary so no caller
+/// can publish a non-uniform pixel scale when those aspects differ transiently.
+fn resolve_fs_transform_in_layout_rect(
+    input: DisplayedImageTransformInput,
+    page_rect: egui::Rect,
+) -> Option<DisplayedImageTransform> {
+    let texture_rect = fs_texture_content_rect(page_rect, input.texture_size, input.rotation);
+    DisplayedImageTransform::from_resolved_rect(input, texture_rect)
 }
 
 /// Resolve the page rectangle from canonical dimensions, optionally fitting the
@@ -3157,11 +3167,11 @@ fn fs_texture_content_rect(
 /// The canonical rectangle keeps the page frame stable. Pass-through thumbnails
 /// are integer-rounded independently, so painting them across that whole rectangle
 /// would introduce a small non-uniform stretch. They instead use a centered contain
-/// rectangle; final textures continue to fill the canonical page rectangle.
+/// rectangle. Final textures normally have the canonical aspect and therefore fill
+/// it too; a transiently different raster is contained instead of being stretched.
 fn resolve_fs_image_transform(
     input: DisplayedImageTransformInput,
     layout_source_size: Option<egui::Vec2>,
-    preserve_texture_aspect: bool,
 ) -> Option<DisplayedImageTransform> {
     let Some(layout_source_size) = layout_source_size else {
         return DisplayedImageTransform::resolve(input);
@@ -3176,13 +3186,7 @@ fn resolve_fs_image_transform(
         texture_size: layout_size,
         ..input
     })?;
-    let paint_rect = fs_texture_content_rect(
-        layout.full_image_rect,
-        input.texture_size,
-        input.rotation,
-        preserve_texture_aspect,
-    );
-    DisplayedImageTransform::from_resolved_rect(input, paint_rect)
+    resolve_fs_transform_in_layout_rect(input, layout.full_image_rect)
 }
 
 fn normalized_sub_rect(rect: egui::Rect, uv: egui::Rect) -> egui::Rect {
@@ -3355,6 +3359,23 @@ fn choose_layout_base_size(
     }
     .unwrap_or(fallback);
     valid_layout_size_or_fallback(rotated_display_size(selected, rotation), fallback)
+}
+
+fn choose_continuous_page_layout_size(
+    canonical_layout: Option<egui::Vec2>,
+    processed: Option<egui::Vec2>,
+    raster_fallback: Option<egui::Vec2>,
+    fallback: egui::Vec2,
+    rotation: crate::rotation_db::Rotation,
+    prefer_processed: bool,
+) -> egui::Vec2 {
+    choose_layout_base_size(
+        processed,
+        canonical_layout.or(raster_fallback),
+        fallback,
+        rotation,
+        prefer_processed,
+    )
 }
 
 /// 透過背景の描画スタイル。Shift+B で 3 モードを循環する。
@@ -4222,6 +4243,18 @@ impl App {
     /// 持っている間、メイン ctx の modifier event は届かない
     /// (= `i.modifiers.shift` が常に false)。元画像表示の修飾キー検出と同じ理由。
     fn original_preview_active(&self, ctx: &egui::Context, idx: usize) -> bool {
+        // 比較表示中は元画像表示を無効にする (利用者判断 2026-08-13、§1.79)。
+        //
+        // 比較は加工済みピクセルから合成した対を描くので、元画像表示はもともと画面に効かない。
+        // それでいて有効なままにすると、比較用 source が確定していない扱いになって
+        // 「比較表示を準備中」トーストが出たり、組み上がった対が捨てられたりする。
+        // 見た目が変わらないのに副作用だけ起きる状態なので、ここで断つ。
+        //
+        // 「ワイプを保ったまま両側を元画像にする」形にするなら §1.79 を実装する。
+        // その場合はこの早期 return を外し、元画像版の対を用意する経路へ差し替える。
+        if !matches!(self.compare_view_mode, crate::app::CompareViewMode::Off) {
+            return false;
+        }
         if !self.fs_prev_focused {
             return false;
         }
@@ -5543,8 +5576,12 @@ fn compare_wipe_line_visible(
     pointer_hover_pos: Option<egui::Pos2>,
     fraction: f32,
     dragging: bool,
+    ctrl_held: bool,
 ) -> bool {
-    dragging || pointer_hover_pos.is_some_and(|pos| compare_wipe_grab_hit(draw_rect, pos, fraction))
+    if dragging {
+        return !ctrl_held;
+    }
+    pointer_hover_pos.is_some_and(|pos| compare_wipe_grab_hit(draw_rect, pos, fraction))
 }
 
 fn compare_wipe_fraction_from_screen_x(
@@ -6184,10 +6221,13 @@ fn is_landscape(
     }
     // サムネイルから判定
     if let Some(ThumbnailState::Loaded {
-        tex, source_dims, ..
+        tex,
+        source_dims,
+        layout_dims,
+        ..
     }) = thumbnails.get(idx)
     {
-        if let Some((w, h)) = source_dims {
+        if let Some((w, h)) = (*layout_dims).or(*source_dims) {
             return w > h;
         }
         let s = tex.size_vec2();
@@ -6212,7 +6252,15 @@ fn fs_cache_entry_page_dims(entry: &FsCacheEntry) -> Option<(u32, u32)> {
         FsCacheEntry::Animated { frames, .. } => {
             frames.first().and_then(|(tex, _)| from_usize(tex.size()))
         }
-        FsCacheEntry::Video { player, .. } => player.info().map(|info| (info.width, info.height)),
+        FsCacheEntry::Video { player, .. } => player.info().map(|info| {
+            crate::video::display_metadata::display_pixel_dimensions(
+                info.width,
+                info.height,
+                info.sar_num,
+                info.sar_den,
+                info.orientation,
+            )
+        }),
         FsCacheEntry::Failed => None,
     }
 }
@@ -6567,10 +6615,58 @@ struct FsPageTurnFrameDecision {
 enum FsPageTurnBurstState {
     #[default]
     Idle,
+    /// キーを押したまま 1 回だけ送った状態。**まだ通し描画にしない。**
+    ///
+    /// 1 回の押下でもナビ確定の瞬間はキーが物理的に押されているので、ここを `Active` に
+    /// すると、1 ページずつゆっくり読む操作でも毎回サムネ画質が一瞬見える (実機 FB
+    /// 2026-08-13)。連打かキーリピートで**同じ押下のまま 2 回目**が来て初めて `Active` にする。
+    /// キーを離せば `Idle` へ戻るので、ゆっくり押し直す限り常に元の画質で表示される。
+    Armed {
+        items_generation: u64,
+        current_idx: usize,
+    },
     Active {
         items_generation: u64,
         current_idx: usize,
     },
+}
+
+impl FsPageTurnBurstState {
+    /// この状態が指定の世代・ページを追跡しているか (= 押下が途切れていない同じ流れか)。
+    fn tracks(self, items_generation: u64, idx: usize) -> bool {
+        match self {
+            Self::Idle => false,
+            Self::Armed {
+                items_generation: generation,
+                current_idx,
+            }
+            | Self::Active {
+                items_generation: generation,
+                current_idx,
+            } => generation == items_generation && current_idx == idx,
+        }
+    }
+
+    fn is_active(self) -> bool {
+        matches!(self, Self::Active { .. })
+    }
+
+    /// 押下を保ったままの 1 回のページ送りを反映する。
+    ///
+    /// 同じ押下の続きなら `Active`、そうでなければ `Armed` から始める。
+    fn advance(self, items_generation: u64, from_idx: usize, to_idx: usize) -> Self {
+        if self.tracks(items_generation, from_idx) {
+            Self::Active {
+                items_generation,
+                current_idx: to_idx,
+            }
+        } else {
+            Self::Armed {
+                items_generation,
+                current_idx: to_idx,
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6594,26 +6690,106 @@ struct FsDisplayUnitTracePage {
     source: &'static str,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+const FS_PAINT_GEOMETRY_POINT_EPSILON: f32 = 0.25;
+const FS_PAINT_GEOMETRY_SCALE_EPSILON: f32 = 0.001;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FsPaintGeometrySignature {
+    draw_rect: Option<[f32; 4]>,
+    scale_x: Option<f32>,
+    scale_y: Option<f32>,
+}
+
+impl FsPaintGeometrySignature {
+    fn from_transform(transform: Option<DisplayedImageTransform>) -> Self {
+        let display_size = transform
+            .map(|transform| rotated_display_size(transform.texture_size, transform.rotation));
+        Self {
+            draw_rect: transform.map(|transform| {
+                [
+                    transform.paint_rect.min.x,
+                    transform.paint_rect.min.y,
+                    transform.paint_rect.width(),
+                    transform.paint_rect.height(),
+                ]
+            }),
+            scale_x: transform
+                .zip(display_size)
+                .map(|(transform, display_size)| {
+                    transform.full_image_rect.width() / display_size.x.max(1.0)
+                }),
+            scale_y: transform
+                .zip(display_size)
+                .map(|(transform, display_size)| {
+                    transform.full_image_rect.height() / display_size.y.max(1.0)
+                }),
+        }
+    }
+
+    fn differs_from(self, previous: Self) -> bool {
+        fn optional_scalar_differs(
+            current: Option<f32>,
+            previous: Option<f32>,
+            epsilon: f32,
+        ) -> bool {
+            match (current, previous) {
+                (Some(current), Some(previous)) => (current - previous).abs() > epsilon,
+                (None, None) => false,
+                _ => true,
+            }
+        }
+
+        let rect_differs = match (self.draw_rect, previous.draw_rect) {
+            (Some(current), Some(previous)) => {
+                current
+                    .into_iter()
+                    .zip(previous)
+                    .any(|(current, previous)| {
+                        (current - previous).abs() > FS_PAINT_GEOMETRY_POINT_EPSILON
+                    })
+            }
+            (None, None) => false,
+            _ => true,
+        };
+        rect_differs
+            || optional_scalar_differs(
+                self.scale_x,
+                previous.scale_x,
+                FS_PAINT_GEOMETRY_SCALE_EPSILON,
+            )
+            || optional_scalar_differs(
+                self.scale_y,
+                previous.scale_y,
+                FS_PAINT_GEOMETRY_SCALE_EPSILON,
+            )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FsPaintPageSignature {
+    idx: usize,
+    texture_id: egui::TextureId,
+    geometry: FsPaintGeometrySignature,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct FsPaintDisplayUnitSignature {
     items_generation: u64,
-    pages: Vec<(usize, egui::TextureId)>,
+    pages: Vec<FsPaintPageSignature>,
 }
 
 fn fs_paint_page_changed_from_previous(
     previous: Option<&FsPaintDisplayUnitSignature>,
     items_generation: u64,
-    idx: usize,
-    texture_id: egui::TextureId,
+    current: FsPaintPageSignature,
 ) -> bool {
     previous.map_or(true, |previous| {
         previous.items_generation != items_generation
-            || !previous
+            || previous
                 .pages
                 .iter()
-                .any(|(previous_idx, previous_texture_id)| {
-                    *previous_idx == idx && *previous_texture_id == texture_id
-                })
+                .find(|page| page.idx == current.idx && page.texture_id == current.texture_id)
+                .is_none_or(|previous| current.geometry.differs_from(previous.geometry))
     })
 }
 
@@ -10211,8 +10387,9 @@ impl App {
             4.0,
             egui::Color32::from_rgba_unmultiplied(92, 98, 110, 170),
         );
-        let fraction = if let Some((units, _)) = spread_seek.as_ref() {
-            spread_seek_unit_fraction(display_pos, units.len())
+        let seek_unit_count = spread_seek.as_ref().map_or(total, |(units, _)| units.len());
+        let fraction = if spread_seek.is_some() {
+            spread_seek_unit_fraction(display_pos, seek_unit_count)
         } else if total <= 1 {
             0.0
         } else {
@@ -10232,6 +10409,32 @@ impl App {
             4.0,
             egui::Color32::from_rgba_unmultiplied(112, 174, 255, 230),
         );
+        for tick in crate::seek_ruler::page_ruler_ticks(
+            seek_unit_count,
+            track_rect.width(),
+            crate::seek_ruler::SEEK_RULER_MIN_SPACING,
+        ) {
+            let x = fullscreen_seek_knob_x(track_rect, tick.fraction, is_rtl);
+            let top = track_rect.bottom() + crate::seek_ruler::SEEK_RULER_GAP;
+            let (height, gray) = if tick.major {
+                (
+                    crate::seek_ruler::SEEK_RULER_MAJOR_HEIGHT,
+                    crate::seek_ruler::SEEK_RULER_MAJOR_GRAY,
+                )
+            } else {
+                (
+                    crate::seek_ruler::SEEK_RULER_MINOR_HEIGHT,
+                    crate::seek_ruler::SEEK_RULER_MINOR_GRAY,
+                )
+            };
+            painter.line_segment(
+                [egui::pos2(x, top), egui::pos2(x, top + height)],
+                egui::Stroke::new(
+                    crate::seek_ruler::SEEK_RULER_STROKE_WIDTH,
+                    egui::Color32::from_gray(gray),
+                ),
+            );
+        }
         painter.circle_filled(
             egui::pos2(knob_x, track_rect.center().y),
             6.0,
@@ -13076,25 +13279,13 @@ impl App {
             let mut burst_state = ctx
                 .data(|data| data.get_temp::<FsPageTurnBurstState>(burst_id))
                 .unwrap_or_default();
-            if !page_turn_input_held
-                || !matches!(
-                    burst_state,
-                    FsPageTurnBurstState::Active {
-                        items_generation,
-                        current_idx,
-                    } if items_generation == self.items_generation && current_idx == fs_idx
-                )
-            {
+            // 押下が途切れた時点で `Armed` も含めて捨てる。これが「ゆっくり押し直す限り
+            // 常に元の画質」を成り立たせている唯一の条件で、時間しきい値は使わない。
+            if !page_turn_input_held || !burst_state.tracks(self.items_generation, fs_idx) {
                 burst_state = FsPageTurnBurstState::Idle;
                 ctx.data_mut(|data| data.insert_temp(burst_id, burst_state));
             }
-            let page_turn_burst_active = matches!(
-                burst_state,
-                FsPageTurnBurstState::Active {
-                    items_generation,
-                    current_idx,
-                } if items_generation == self.items_generation && current_idx == fs_idx
-            );
+            let page_turn_burst_active = burst_state.is_active();
             let passthrough_rendition_ready = page_turn_burst_active
                 && self.fs_page_turn_passthrough_renditions_ready(ctx, fs_idx);
             let decision = page_turn_decision_for_inputs(
@@ -13142,15 +13333,20 @@ impl App {
         {
             let (held, blocker, viewport) = self.fs_page_turn_input_held(ctx, current_idx);
             let moved = target_idx.is_some_and(|target_idx| target_idx != current_idx);
+            let burst_id = egui::Id::new(("fs_page_turn_burst", viewport));
             let state = if held && blocker.is_none() && moved {
-                FsPageTurnBurstState::Active {
-                    items_generation: self.items_generation,
-                    current_idx: target_idx.expect("moved page turn has a target"),
-                }
+                // 同じ押下の続き (キーリピート / 連打) で初めて通し描画へ上げる。
+                // 1 回目は `Armed` に留めるので、単発のページ送りは元の画質のまま。
+                ctx.data(|data| data.get_temp::<FsPageTurnBurstState>(burst_id))
+                    .unwrap_or_default()
+                    .advance(
+                        self.items_generation,
+                        current_idx,
+                        target_idx.expect("moved page turn has a target"),
+                    )
             } else {
                 FsPageTurnBurstState::Idle
             };
-            let burst_id = egui::Id::new(("fs_page_turn_burst", viewport));
             let decision_id = egui::Id::new(("fs_page_turn_decision", viewport));
             ctx.data_mut(|data| {
                 data.insert_temp(burst_id, state);
@@ -13236,12 +13432,23 @@ impl App {
         let changed_pages = trace_pages
             .iter()
             .copied()
-            .filter(|page| {
+            .map(|page| {
+                let transform = self
+                    .fullscreen_page_layout
+                    .page_by_idx(page.idx)
+                    .map(|displayed| displayed.transform);
+                let signature = FsPaintPageSignature {
+                    idx: page.idx,
+                    texture_id: page.texture_id,
+                    geometry: FsPaintGeometrySignature::from_transform(transform),
+                };
+                (page, signature)
+            })
+            .filter(|(_, signature)| {
                 fs_paint_page_changed_from_previous(
                     previous.as_ref(),
                     self.items_generation,
-                    page.idx,
-                    page.texture_id,
+                    *signature,
                 )
             })
             .collect::<Vec<_>>();
@@ -13249,12 +13456,22 @@ impl App {
             items_generation: self.items_generation,
             pages: trace_pages
                 .iter()
-                .map(|page| (page.idx, page.texture_id))
+                .map(|page| {
+                    let transform = self
+                        .fullscreen_page_layout
+                        .page_by_idx(page.idx)
+                        .map(|displayed| displayed.transform);
+                    FsPaintPageSignature {
+                        idx: page.idx,
+                        texture_id: page.texture_id,
+                        geometry: FsPaintGeometrySignature::from_transform(transform),
+                    }
+                })
                 .collect(),
         };
         ctx.data_mut(|data| data.insert_temp(cache_id, current));
 
-        for page in changed_pages {
+        for (page, signature) in changed_pages {
             let entry_seq = if matches!(decision.paint_source(), FsPageTurnPaintSource::PassThrough)
             {
                 self.input_seq
@@ -13271,18 +13488,6 @@ impl App {
             let draw_rect = transform.map(|transform| transform.paint_rect);
             let display_size = transform
                 .map(|transform| rotated_display_size(transform.texture_size, transform.rotation));
-            let scale_x = transform.map(|transform| {
-                transform.full_image_rect.width()
-                    / rotated_display_size(transform.texture_size, transform.rotation)
-                        .x
-                        .max(1.0)
-            });
-            let scale_y = transform.map(|transform| {
-                transform.full_image_rect.height()
-                    / rotated_display_size(transform.texture_size, transform.rotation)
-                        .y
-                        .max(1.0)
-            });
             crate::perf::event(
                 "fs",
                 "paint",
@@ -13338,13 +13543,17 @@ impl App {
                     ),
                     (
                         "scale_x",
-                        scale_x
+                        signature
+                            .geometry
+                            .scale_x
                             .map(serde_json::Value::from)
                             .unwrap_or(serde_json::Value::Null),
                     ),
                     (
                         "scale_y",
-                        scale_y
+                        signature
+                            .geometry
+                            .scale_y
                             .map(serde_json::Value::from)
                             .unwrap_or(serde_json::Value::Null),
                     ),
@@ -13631,8 +13840,8 @@ impl App {
     }
 
     /// Pixel coordinate dimensions used by annotations, hit testing, and Original
-    /// scale. PDF catalog dimensions are page-layout units, so they are not a
-    /// coordinate fallback until a full/display raster has supplied real pixels.
+    /// scale. PDF `source_*` values have the same pixel contract as other sources;
+    /// the independent page-box aspect lives in `layout_*`.
     fn fs_page_coordinate_source_size(&self, idx: usize) -> Option<egui::Vec2> {
         self.source_dims_for_idx(idx)
             .map(|(w, h)| egui::vec2(w, h))
@@ -13655,19 +13864,29 @@ impl App {
             })
     }
 
+    fn pdf_page_layout_size(&self, idx: usize) -> Option<egui::Vec2> {
+        if !matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
+            return None;
+        }
+        match self.thumbnails.get(idx) {
+            Some(ThumbnailState::Loaded {
+                layout_dims: Some((w, h)),
+                ..
+            }) => Some(egui::vec2(*w as f32, *h as f32)),
+            _ => self
+                .page_dims_cache
+                .get_layout(self.items_generation, idx)
+                .map(|(w, h)| egui::vec2(w as f32, h as f32)),
+        }
+    }
+
     /// Canonical, pre-raster-rounding dimensions used only to lay out a page.
     /// PDF page box dimensions persisted with the thumbnail win even after the
-    /// display raster arrives, so both textures resolve to one stable rectangle.
+    /// display raster or thumbnail texture is evicted, so every raster resolves
+    /// to one stable rectangle.
     fn fs_page_layout_source_size(&self, idx: usize) -> Option<egui::Vec2> {
-        if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }))
-            && let Some(ThumbnailState::Loaded {
-                source_dims: Some((w, h)),
-                ..
-            }) = self.thumbnails.get(idx)
-        {
-            return Some(egui::vec2(*w as f32, *h as f32));
-        }
-        self.fs_page_coordinate_source_size(idx)
+        self.pdf_page_layout_size(idx)
+            .or_else(|| self.fs_page_coordinate_source_size(idx))
     }
 
     /// 見開き上部 HUD の相方ページ情報を、表示済みキャッシュだけから組み立てる。
@@ -17848,6 +18067,9 @@ impl App {
         {
             return false;
         }
+        // Fullscreen canvas modifier events can be stale; keep navigator and main compare paint
+        // on the same OS-level Ctrl fact used by other transient canvas modifiers.
+        let ctrl_held = ctrl_held_via_os();
 
         let shader_shape =
             self.compare_preparation
@@ -17882,6 +18104,7 @@ impl App {
                     ctx.input(|input| input.pointer.hover_pos()),
                     fraction,
                     self.compare_wipe_dragging,
+                    ctrl_held,
                 )
             {
                 Self::paint_compare_wipe_line(painter, shader_shape.draw_rect, fraction);
@@ -17926,6 +18149,7 @@ impl App {
                     ctx.input(|input| input.pointer.hover_pos()),
                     fraction,
                     self.compare_wipe_dragging,
+                    ctrl_held,
                 ) {
                     Self::paint_compare_wipe_line(painter, layout.content_rect, fraction);
                 }
@@ -20818,25 +21042,28 @@ impl App {
                 .then(|| self.fs_page_layout_source_size(page_idx))
                 .flatten();
             let fit_bbox = fs_image_fit_bbox(rotation, free_rotation_rad, content_bbox);
-            let Some(transform) = resolved_transform.or_else(|| {
-                resolve_fs_image_transform(
-                    DisplayedImageTransformInput {
-                        page_idx,
-                        viewport_rect: full_rect,
-                        source_size: source_size.unwrap_or(tex_size),
-                        texture_size: tex_size,
-                        rotation,
-                        free_rotation_rad,
-                        content_bbox,
-                        fit_mode,
-                        fit_scale_limits,
-                        pixels_per_point: ui.ctx().pixels_per_point(),
-                        placement: ResolvedDisplayPlacement::Normal { zoom_pan },
-                    },
-                    layout_source_size,
-                    preserve_texture_aspect,
-                )
-            }) else {
+            let transform_input = DisplayedImageTransformInput {
+                page_idx,
+                viewport_rect: full_rect,
+                source_size: source_size.unwrap_or(tex_size),
+                texture_size: tex_size,
+                rotation,
+                free_rotation_rad,
+                content_bbox,
+                fit_mode,
+                fit_scale_limits,
+                pixels_per_point: ui.ctx().pixels_per_point(),
+                placement: resolved_transform
+                    .map(|transform| transform.placement)
+                    .unwrap_or(ResolvedDisplayPlacement::Normal { zoom_pan }),
+            };
+            let transform = match resolved_transform {
+                Some(layout) => {
+                    resolve_fs_transform_in_layout_rect(transform_input, layout.full_image_rect)
+                }
+                None => resolve_fs_image_transform(transform_input, layout_source_size),
+            };
+            let Some(transform) = transform else {
                 return None;
             };
             let img_rect = transform.full_image_rect;
@@ -21665,7 +21892,7 @@ impl App {
         prefer_processed: bool,
     ) -> egui::Vec2 {
         let rotation = self.get_rotation(idx);
-        let raw = match self.fs_cache.get(&idx) {
+        let raster_fallback = match self.fs_cache.get(&idx) {
             Some(FsCacheEntry::Static {
                 tex, source_dims, ..
             }) => match source_dims {
@@ -21693,7 +21920,14 @@ impl App {
             _ => None,
         });
         let processed = self.current_processed_layout_size(idx);
-        choose_layout_base_size(processed, raw, fallback, rotation, prefer_processed)
+        choose_continuous_page_layout_size(
+            self.pdf_page_layout_size(idx),
+            processed,
+            raster_fallback,
+            fallback,
+            rotation,
+            prefer_processed,
+        )
     }
 
     fn continuous_unit_base_size(
@@ -23941,6 +24175,9 @@ impl App {
         if !self.compare_prepared_pair_matches(fs_idx) {
             return false;
         }
+        // Do not read `ctx.input().modifiers` here: the fullscreen viewport can retain a stale
+        // modifier snapshot while the physical Ctrl state changes during the same drag.
+        let ctrl_held = ctrl_held_via_os();
 
         let shader_shape = self
             .compare_preparation
@@ -23976,6 +24213,7 @@ impl App {
                     ctx.input(|input| input.pointer.hover_pos()),
                     fraction,
                     self.compare_wipe_dragging,
+                    ctrl_held,
                 )
             {
                 // 白線はシェーダーの合成境界 (draw_rect = フィット後の実表示画像矩形) に揃える。
@@ -24047,6 +24285,7 @@ impl App {
                     ctx.input(|input| input.pointer.hover_pos()),
                     fraction,
                     self.compare_wipe_dragging,
+                    ctrl_held,
                 ) {
                     Self::draw_compare_wipe_line(ui, ref_rect, fraction);
                 }
@@ -25031,9 +25270,7 @@ impl App {
                 _ => layout_size,
             };
             let page_rect = fit_display_size_in_rect(rect, display_size);
-            let img_rect =
-                fs_texture_content_rect(page_rect, tex_size, rotation, preserve_texture_aspect);
-            let transform = DisplayedImageTransform::from_resolved_rect(
+            let transform = resolve_fs_transform_in_layout_rect(
                 DisplayedImageTransformInput {
                     page_idx: idx,
                     viewport_rect,
@@ -25050,7 +25287,7 @@ impl App {
                     pixels_per_point,
                     placement,
                 },
-                img_rect,
+                page_rect,
             )?;
             // 回転中は bbox のズレを避けて背景を適用しない
             if rotation.is_none() {
@@ -28338,19 +28575,28 @@ impl App {
         });
 
         let export_crop = if let Some(idx) = idx {
-            self.export_crop_page_settings
-                .get(&idx)
-                .map(|settings| settings.rect)
+            let settings = self.export_crop_page_settings.get(&idx).copied();
+            if settings.is_some_and(|settings| settings.valid_source_size().is_none()) {
+                let fallback_size = self
+                    .current_raw_source_pixels(idx)
+                    .map(|pixels| pixels.size);
+                fallback_size
+                    .and_then(|size| self.ensure_export_crop_source_size(idx, size))
+                    .or(settings)
+            } else {
+                settings
+            }
         } else {
-            self.export_crop_db
-                .as_ref()
-                .and_then(|db| db.get(key))
-                .map(|settings| settings.rect)
+            self.export_crop_db.as_ref().and_then(|db| db.get(key))
         };
-        let crop_source_dims = idx.and_then(|idx| {
-            self.current_raw_source_pixels(idx)
-                .map(|pixels| pixels.size)
-        });
+        let crop_legacy_writeback = export_crop
+            .filter(|settings| settings.valid_source_size().is_none())
+            .map(|_| {
+                (
+                    crate::data_dir::get().join("export_crop.db"),
+                    key.to_string(),
+                )
+            });
 
         let erase = erase_mask.map(|mask| {
             self.ensure_ai_runtime();
@@ -28384,7 +28630,7 @@ impl App {
             comic,
             comic_source_dims,
             export_crop,
-            crop_source_dims,
+            crop_legacy_writeback,
             format: self.settings.capture_format,
             jpeg_matte: crate::capture::JpegMatte::from_fs_transparent_bg_mode(
                 self.fs_transparent_bg_mode,
@@ -28520,7 +28766,7 @@ impl App {
 
     #[allow(dead_code)] // Legacy export variant path; final composite is used in v1.1.0 P1.
     fn capture_job_with_conceal(
-        &self,
+        &mut self,
         idx: usize,
         job: crate::capture::CapturePixelJob,
     ) -> crate::capture::CapturePixelJob {
@@ -30808,6 +31054,59 @@ mod tests {
     }
 
     #[test]
+    fn a_single_page_turn_does_not_reach_the_pass_through_burst() {
+        // 実機 FB 2026-08-13: 1 ページずつゆっくり読むときも一瞬サムネ画質が見えていた。
+        // 1 回の押下でもナビ確定の瞬間はキーが押されているため、1 回目で Active にすると
+        // 押している間だけ通し描画になってしまう。
+        let first = FsPageTurnBurstState::default().advance(3, 10, 11);
+
+        assert_eq!(
+            first,
+            FsPageTurnBurstState::Armed {
+                items_generation: 3,
+                current_idx: 11,
+            }
+        );
+        assert!(!first.is_active(), "the first turn must stay full quality");
+
+        // 同じ押下のまま 2 回目 (キーリピート / 連打) で初めて通し描画へ上げる。
+        let second = first.advance(3, 11, 12);
+        assert!(second.is_active());
+        assert_eq!(
+            second,
+            FsPageTurnBurstState::Active {
+                items_generation: 3,
+                current_idx: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn releasing_the_key_disarms_the_burst_so_slow_paging_never_degrades() {
+        // 「押下が途切れたら捨てる」だけで、ゆっくり押し直す限り常に元の画質になる。
+        // 時間しきい値は使わない。
+        let armed = FsPageTurnBurstState::default().advance(3, 10, 11);
+        assert!(armed.tracks(3, 11));
+
+        // 離した後に押し直すと、追跡している流れが切れているので Armed からやり直す。
+        let after_release = FsPageTurnBurstState::Idle;
+        assert!(!after_release.tracks(3, 11));
+        assert_eq!(
+            after_release.advance(3, 11, 12),
+            FsPageTurnBurstState::Armed {
+                items_generation: 3,
+                current_idx: 12,
+            }
+        );
+
+        // 一覧が入れ替わった (世代が変わった) 場合も続きとは見なさない。
+        assert!(!armed.tracks(4, 11));
+        assert!(!armed.advance(4, 11, 12).is_active());
+        // 押下は続いていても別のページから送られたなら続きではない。
+        assert!(!armed.advance(3, 99, 100).is_active());
+    }
+
+    #[test]
     fn held_boundary_without_a_page_transition_stays_materialized() {
         let decision = page_turn_decision_for_inputs(true, false, false);
 
@@ -30853,6 +31152,7 @@ mod tests {
             from_edit_preview: false,
             rendered_at_px: 4,
             source_dims: Some((400, 401)),
+            layout_dims: None,
         });
         app.thumb_pixels.insert(0, pixels);
         app.fullscreen_idx = Some(0);
@@ -30907,14 +31207,11 @@ mod tests {
             placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
         };
 
-        let pass = resolve_fs_image_transform(
-            make_input(egui::vec2(300.0, 450.0)),
-            Some(source_size),
-            true,
-        )
-        .expect("pass-through transform");
-        let final_image = resolve_fs_image_transform(make_input(source_size), None, false)
-            .expect("final transform");
+        let pass =
+            resolve_fs_image_transform(make_input(egui::vec2(300.0, 450.0)), Some(source_size))
+                .expect("pass-through transform");
+        let final_image =
+            resolve_fs_image_transform(make_input(source_size), None).expect("final transform");
 
         assert!(
             final_image
@@ -30935,6 +31232,42 @@ mod tests {
         let scale_x = pass.full_image_rect.width() / 300.0;
         let scale_y = pass.full_image_rect.height() / 450.0;
         assert!((scale_x - scale_y).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn layout_source_and_texture_aspect_mismatch_keeps_texture_scale_uniform() {
+        let viewport_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        // The reported transient ratio was about 409/512 while the page texture
+        // itself was about 336/512. A layout frame may use either ratio, but the
+        // raster's square pixels must never receive different X/Y scales.
+        let texture_size = egui::vec2(336.0, 512.0);
+        let layout_source_size = egui::vec2(409.0, 512.0);
+        let transform = resolve_fs_image_transform(
+            DisplayedImageTransformInput {
+                page_idx: 0,
+                viewport_rect,
+                source_size: texture_size,
+                texture_size,
+                rotation: crate::rotation_db::Rotation::None,
+                free_rotation_rad: 0.0,
+                content_bbox: None,
+                fit_mode: FullscreenFitMode::Page,
+                fit_scale_limits: FullscreenFitScaleLimits::default(),
+                pixels_per_point: 1.0,
+                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+            },
+            Some(layout_source_size),
+        )
+        .expect("mismatched layout/texture transform");
+
+        let paint_ratio = transform.full_image_rect.width() / transform.full_image_rect.height();
+        let texture_ratio = texture_size.x / texture_size.y;
+        let scale_x = transform.full_image_rect.width() / texture_size.x;
+        let scale_y = transform.full_image_rect.height() / texture_size.y;
+        assert!((paint_ratio - texture_ratio).abs() < 1.0e-4);
+        assert!((scale_x - scale_y).abs() < 1.0e-4);
+        assert!((transform.full_image_rect.center().x - viewport_rect.center().x).abs() < 1.0e-4);
+        assert!((transform.full_image_rect.center().y - viewport_rect.center().y).abs() < 1.0e-4);
     }
 
     #[test]
@@ -30959,13 +31292,11 @@ mod tests {
         let pass = resolve_fs_image_transform(
             make_input(egui::vec2(327.0, 473.0), egui::vec2(327.0, 473.0)),
             Some(page_box_layout),
-            true,
         )
         .expect("PDF pass-through transform");
         let final_image = resolve_fs_image_transform(
             make_input(egui::vec2(1643.0, 2375.0), egui::vec2(1643.0, 2375.0)),
             Some(page_box_layout),
-            false,
         )
         .expect("PDF final transform");
 
@@ -31078,34 +31409,88 @@ mod tests {
                 egui::TextureOptions::LINEAR,
             )
             .id();
+        let geometry = FsPaintGeometrySignature {
+            draw_rect: Some([52.0, 70.0, 158.0, 243.0]),
+            scale_x: Some(0.5),
+            scale_y: Some(0.5),
+        };
         let previous = FsPaintDisplayUnitSignature {
             items_generation: 7,
-            pages: vec![(2, texture_a), (3, texture_b)],
+            pages: vec![
+                FsPaintPageSignature {
+                    idx: 2,
+                    texture_id: texture_a,
+                    geometry,
+                },
+                FsPaintPageSignature {
+                    idx: 3,
+                    texture_id: texture_b,
+                    geometry,
+                },
+            ],
         };
 
         assert!(!fs_paint_page_changed_from_previous(
             Some(&previous),
             7,
-            3,
-            texture_b,
+            FsPaintPageSignature {
+                idx: 3,
+                texture_id: texture_b,
+                geometry,
+            },
         ));
         assert!(fs_paint_page_changed_from_previous(
             Some(&previous),
             7,
-            4,
-            texture_a,
+            FsPaintPageSignature {
+                idx: 4,
+                texture_id: texture_a,
+                geometry,
+            },
         ));
         assert!(fs_paint_page_changed_from_previous(
             Some(&previous),
             7,
-            2,
-            texture_b,
+            FsPaintPageSignature {
+                idx: 2,
+                texture_id: texture_b,
+                geometry,
+            },
         ));
         assert!(fs_paint_page_changed_from_previous(
             Some(&previous),
             8,
-            2,
-            texture_a,
+            FsPaintPageSignature {
+                idx: 2,
+                texture_id: texture_a,
+                geometry,
+            },
+        ));
+        assert!(fs_paint_page_changed_from_previous(
+            Some(&previous),
+            7,
+            FsPaintPageSignature {
+                idx: 2,
+                texture_id: texture_a,
+                geometry: FsPaintGeometrySignature {
+                    draw_rect: Some([34.0, 70.0, 194.0, 243.0]),
+                    scale_x: Some(0.6127),
+                    scale_y: Some(0.5),
+                },
+            },
+        ));
+        assert!(!fs_paint_page_changed_from_previous(
+            Some(&previous),
+            7,
+            FsPaintPageSignature {
+                idx: 2,
+                texture_id: texture_a,
+                geometry: FsPaintGeometrySignature {
+                    draw_rect: Some([52.1, 69.9, 158.1, 242.9]),
+                    scale_x: Some(0.5005),
+                    scale_y: Some(0.4995),
+                },
+            },
         ));
     }
 
@@ -36184,6 +36569,26 @@ mod tests {
     }
 
     #[test]
+    fn spread_seek_ruler_uses_the_same_display_unit_denominator_as_the_knob() {
+        let nav = (0..10).collect::<Vec<_>>();
+        let units =
+            build_spread_display_units_with_landscape(&nav, SpreadMode::Ltr, None, |_| false);
+        let ticks = crate::seek_ruler::page_ruler_ticks(
+            units.len(),
+            1000.0,
+            crate::seek_ruler::SEEK_RULER_MIN_SPACING,
+        );
+
+        assert_eq!(units.len(), 5);
+        assert_eq!(ticks.len(), units.len());
+        for (unit_index, tick) in ticks.iter().enumerate() {
+            assert!(
+                (tick.fraction - spread_seek_unit_fraction(unit_index, units.len())).abs() < 0.001
+            );
+        }
+    }
+
+    #[test]
     fn spread_units_keep_leading_landscape_single_and_pair_following_pages() {
         let nav = (0..11).collect::<Vec<_>>();
         let units =
@@ -37143,6 +37548,23 @@ mod tests {
     }
 
     #[test]
+    fn seek_ruler_rtl_positions_are_ltr_mirror_images() {
+        let track = egui::Rect::from_min_max(egui::pos2(100.0, 0.0), egui::pos2(500.0, 8.0));
+        let ticks = crate::seek_ruler::page_ruler_ticks(
+            100,
+            track.width(),
+            crate::seek_ruler::SEEK_RULER_MIN_SPACING,
+        );
+
+        assert!(!ticks.is_empty());
+        for tick in ticks {
+            let ltr_x = fullscreen_seek_knob_x(track, tick.fraction, false);
+            let rtl_x = fullscreen_seek_knob_x(track, tick.fraction, true);
+            assert!((ltr_x + rtl_x - track.left() - track.right()).abs() < 0.001);
+        }
+    }
+
+    #[test]
     fn compare_wipe_reference_rect_is_letterbox_fitted_not_full_rect() {
         // 横長ウィンドウ + 縦長画像 → 左右に黒帯。比較 Wipe の白線 / clip / ドラッグ /
         // シェーダー合成境界は、この「フィット後の実表示画像矩形」を基準にしなければ
@@ -37208,25 +37630,34 @@ mod tests {
     }
 
     #[test]
-    fn compare_wipe_line_uses_drag_or_the_same_grab_band_as_input() {
+    fn compare_wipe_line_uses_drag_or_grab_band_and_ctrl_only_suppresses_drag() {
         let image = egui::Rect::from_min_max(egui::pos2(100.0, 50.0), egui::pos2(900.0, 750.0));
         let fraction = 0.25;
         let line_x = compare_wipe_screen_x(image, fraction);
+        let line_pos = Some(egui::pos2(line_x, image.center().y));
 
-        assert!(!compare_wipe_line_visible(image, None, fraction, false));
+        assert!(!compare_wipe_line_visible(
+            image, None, fraction, false, false
+        ));
         assert!(compare_wipe_line_visible(
-            image,
-            Some(egui::pos2(line_x, image.center().y)),
-            fraction,
-            false
+            image, line_pos, fraction, false, false
+        ));
+        assert!(compare_wipe_line_visible(
+            image, line_pos, fraction, false, true
         ));
         assert!(!compare_wipe_line_visible(
             image,
             Some(egui::pos2(image.right() - 1.0, image.center().y)),
             fraction,
+            false,
             false
         ));
-        assert!(compare_wipe_line_visible(image, None, fraction, true));
+        assert!(compare_wipe_line_visible(
+            image, None, fraction, true, false
+        ));
+        assert!(!compare_wipe_line_visible(
+            image, line_pos, fraction, true, true
+        ));
     }
 
     #[test]
@@ -37498,6 +37929,30 @@ mod tests {
             ),
             egui::vec2(200.0, 400.0)
         );
+    }
+
+    #[test]
+    fn continuous_pdf_layout_keeps_page_box_aspect_when_final_raster_arrives() {
+        // Real regression: the holdover thumbnail was 226x422 (0.5355), while
+        // PDF page 0 is 468.600x714.360 points and its final raster is 4540x6920.
+        // The final texture can become paintable later in the same frame than the
+        // layout lookup, so it is intentionally absent from `processed` here.
+        let layout = choose_continuous_page_layout_size(
+            Some(egui::vec2(468_600.0, 714_360.0)),
+            None,
+            Some(egui::vec2(226.0, 422.0)),
+            egui::vec2(100.0, 100.0),
+            crate::rotation_db::Rotation::None,
+            true,
+        );
+        let layout_aspect = layout.x / layout.y;
+        let raster_aspect = 4540.0 / 6920.0;
+
+        assert!(
+            ((layout_aspect - raster_aspect) / raster_aspect).abs() < 0.001,
+            "layout={layout_aspect} raster={raster_aspect}"
+        );
+        assert!((layout_aspect - 226.0 / 422.0).abs() > 0.1);
     }
 
     #[test]

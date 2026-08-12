@@ -16174,6 +16174,7 @@ mod selection_info_tests {
             from_edit_preview: false,
             rendered_at_px: 128,
             source_dims: Some(dims),
+            layout_dims: None,
         }
     }
 

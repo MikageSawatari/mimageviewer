@@ -880,6 +880,7 @@ mod tests {
                 max_y: 70.0,
             },
             aspect_mode: crate::export_crop::CropAspectMode::Ratio4x3,
+            source_size: Some([100, 80]),
         }
     }
 
@@ -1220,6 +1221,7 @@ mod tests {
                 max_y: 40.0,
             },
             aspect_mode: crate::export_crop::CropAspectMode::Square,
+            source_size: Some([50, 50]),
         };
         s.set_export_crop("fresh.png", imported_crop);
         s.set_export_crop("existing.png", sample_export_crop());

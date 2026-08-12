@@ -128,10 +128,12 @@ impl App {
         {
             let enabled = self.tray_resident_media_updates_needed();
             if controller.set_resident_media_wake_enabled(enabled) {
+                let keep_heartbeat_alive = self.ui_heartbeat_should_stay_active_while_hidden();
                 crate::set_ui_heartbeat_suspended(
-                    !self.window_visible && !enabled,
-                    if enabled {
-                        "App::update heartbeat resumed for active tray media".to_string()
+                    !self.window_visible && !keep_heartbeat_alive,
+                    if !self.window_visible && keep_heartbeat_alive {
+                        "App::update heartbeat kept alive for active hidden viewer session"
+                            .to_string()
                     } else if self.window_visible {
                         "App::update heartbeat follows visible window".to_string()
                     } else {
@@ -199,14 +201,13 @@ impl App {
         // consume-and-hold state; egui hosts remain registered but become explicitly hidden.
         let routed_presenters = self.prepare_media_session_for_tray_residency();
         let retained_viewports = self.sync_retained_viewport_visibility_for_tray(ctx, false);
-        let keep_detached_viewer_alive = self.viewer_session_is_detached_or_switching();
         self.window_visible = false;
         self.sync_tray_resident_media_wake();
-        let keep_resident_media_awake = self.tray_resident_media_updates_needed();
+        let keep_heartbeat_alive = self.ui_heartbeat_should_stay_active_while_hidden();
         crate::set_ui_heartbeat_suspended(
-            !keep_resident_media_awake,
-            if keep_resident_media_awake {
-                "App::update heartbeat kept alive for active media while hidden to tray"
+            !keep_heartbeat_alive,
+            if keep_heartbeat_alive {
+                "App::update heartbeat kept alive for active viewer session while hidden to tray"
             } else {
                 "App::update heartbeat suspended for idle tray residency"
             }
@@ -241,7 +242,7 @@ impl App {
 
         // GPU リソース解放 (best-effort)
         self.release_gpu_resources();
-        if keep_detached_viewer_alive {
+        if self.viewer_session_is_detached_or_switching() {
             ctx.request_repaint();
         }
         // settings / sidecar は従来どおり hide 時にも保存する。トレイ「終了」は DWM cloak 後に

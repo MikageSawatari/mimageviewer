@@ -420,30 +420,43 @@ ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開く�
 | PdfPage | None | Some(page) | `pdf_page_cache_key(page)` | PDF ワーカーでそのページをレンダリング |
 
 PDF ワーカーの render 結果は raster に加えて、PDFium が読んだページ box の point 寸法を返す。
-`thumbnails.source_width/source_height` には rasterized thumbnail の `width/height` ではなく、
-ページ box を **1/1000 point の固定小数点**にした値を保存する。ページごとの box 差を保ったまま
-整数丸め誤差を避け、フルスクリーンの通過 rendition と完成 raster を同一矩形へ配置するためである。
-通常画像と ZIP / 変換 archive 内画像は従来どおり decode 後の元画素寸法を保存する。動画サムネイルは
-catalog のこの生成経路を通らず、fullscreen も poster thumbnail へフォールバックしないため対象外。
-この PDF の `source_width/source_height` はレイアウトと縦横比のための座標軸であり、crop や
-コミック注釈など保存済み編集の絶対座標には使わない。保存済み編集は raster PDF ページ固有の
-正準ラスタ寸法 (`canonical_pdf_raster_dims` / canonical renderer の `native_dims`) を基準にする。
-この基準は表示要求の 1024 / 4096 / 8192 などで変化してはならない。`CropSettings` は矩形だけを持ち
-基準寸法を保存しないため、安定した native pixel space を持たない vector PDF では現在の表示 raster へ
-黙ってフォールバックしない。本体は vector かどうかでページ表示自体を失敗させないため、remote も
-保存済み crop / コミック注釈だけを適用せずページ全体を描画し、対象と理由を型付きログへ記録する。
-vector ページにも解像度非依存の正準寸法を与える案は、本体側のページ枠まわりが落ち着いてから扱う。
+`thumbnails.source_width/source_height` は PDF を含め raster の**ピクセル寸法**を保存する。
+ページ box は別の `layout_width/layout_height` に **1/1000 point の固定小数点**で保存する。
+前者は編集・注釈・クリック判定等の画素座標、後者はページごとの box 差を保った fullscreen layout
+専用であり、単位を読み替えない。通常画像と ZIP / 変換 archive 内画像は従来どおり decode 後の
+元画素寸法を `source_*` に保存し、`layout_*` は NULL。動画サムネイルは catalog のこの生成経路を
+通らず、fullscreen も poster thumbnail へフォールバックしないため対象外。
 
-この意味変更より前のリリース済み catalog は PDF 行に thumbnail 自身の寸法を持つ。元の page box は
-WebP から復元できないため、`pdf_layout_dims_version` の初回 migration で PDF 仮想 catalog のページ行と
-通常フォルダ catalog の `pdfthumb:` 行だけを削除し、次回表示時に再生成する。画像 / ZIP 等の行は残す。
+remote が保存済み crop / コミック注釈を適用するときの基準は、raster PDF ページ固有の正準ラスタ
+寸法 (`canonical_pdf_raster_dims`) であり、表示要求の 1024 / 4096 / 8192 などで変化してはならない
+(`StoredEditSpace::for_remote_source`)。安定した native pixel space を持たない vector PDF では、
+本体がページ表示自体を失敗させないのと同様に、remote も保存済み crop / コミック注釈だけを適用せず
+ページ全体を描画し、対象と理由を型付きログへ記録する。vector ページにも解像度非依存の正準寸法を
+与える案は、本体側のページ枠まわりが落ち着いてから扱う。
+
+README の更新履歴で確認できる最新リリース v2.13.0 までの catalog は `source_*` が pixel 契約で、
+正確な page box 列を持たない。未リリースの開発版 `pdf_layout_dims_version=1` だけが同じ `source_*`
+へ page-box 単位を書いていた。WebP だけから page box は復元できず、開発版 v1 行は pixel 値も
+壊れているため、version 2 migration は PDF 仮想 catalog のページ行と通常フォルダ catalog の
+`pdfthumb:` 行だけを一度削除して両寸法を再生成する。画像 / ZIP 等の行は残す。旧 catalog を
+読み取り専用で参照する経路では、未追加の `layout_*` を NULL として扱う。
 
 `ConvertibleArchive` の cache ZIP 対応表 (`App.converted_archive_cache_paths`) は
 `install_new_items` で現在 items の path/mtime/size と、folder thumb pin を引く container root
 だけを snapshot する。SQLite `peek`、cache ZIP の `exists()`、pin の DB lookup・cascade・stat は
 `ConvertedArchiveCachePathsPending` worker で解決し、最終 leaf が RAR / 7z / LZH のときだけ
-対応表へ加える。worker 完了前は
-`make_load_request` が `None` を返し、サムネは Pending のまま次の repaint で再試行される。
+対応表へ加える。refresh 開始時には現行 map を clear せず、worker の新しい snapshot が届くまで
+前の値を保つ。key は正規化済み元アーカイブ path なので、別フォルダ由来の値が無関係なタイルへ
+誤適用されることはない。
+
+worker 完了前、直接の `ConvertibleArchive` タイルは `make_load_request` が `None` を返して
+Pending のまま再試行される。一方、Folder タイルの pin が変換対象アーカイブへ解決される場合は
+base request へ fallback できるため、その request が先に Loaded へ進むことがある。worker は
+pin 解決と同時に `(item index, archive key)` の依存集合も返し、poll で map の値が実際に変わった
+key に依存するタイルだけを Evicted に戻す。reload/heavy queue と `requested` も通常の thumbnail
+再要求 helper で同時に外し、次の keep-range update が新 map から request を組み直す。
+同じ map が再度届いた場合は失効を行わないため、この handoff は `load_folder` や
+`folder_thumb_pin_dirty` を介さず有限回で収束する。
 この経路で `make_load_request` から `archive_cache.db` やファイルシステムを直接触らないこと。
 
 **キャッシュキーの命名規則**を勝手に変えないこと。Folder 自動代表は選定

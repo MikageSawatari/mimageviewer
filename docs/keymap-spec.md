@@ -51,7 +51,8 @@ Shell 連携 (コピー / パスコピー / フォルダを開く) は入力経�
 `# Action = none` として列挙される。コマンド設定または旧 `keymap.ini` 移行でキー名を指定すると割り当てられ、
 `Action = none` を明示した場合は無効化として扱う。
 お気に入りの前後移動 / 1〜20 番を開く、現在位置のルートディレクトリを開く、
-`C:\`〜`Z:\` を開く、`C:`〜`Z:` の最後の場所へ切り替える、場所▼の固定項目
+「ドライブ `C:\` のルートを開く」〜「ドライブ `Z:\` のルートを開く」、
+「ドライブ `C:` の最後の場所へ切り替える」〜「ドライブ `Z:` の最後の場所へ切り替える」、場所▼の固定項目
 (ドライブ一覧 / 閲覧履歴 / ★1〜★5 / 本棚フォルダ / デスクトップ / ピクチャ / ダウンロード)
 、ピン留めタグ 1〜20 の付与/解除も標準キーなしのサムネイル一覧 Action として割り当てられる。設定名は
 `GridFavorite...` / `GridOpenFavorite...` / `GridOpenCurrentDriveRoot` / `GridOpenDrive...` /
@@ -398,6 +399,7 @@ snapshot として一方向 publish し、App から presenter Context を直接
 | <kbd>X</kbd> | 現在表示中を比較スロットへピン留め / 同じ画像なら解除 |
 | <kbd>C</kbd> | 比較スロットのピン画像と現在画像をトグル表示 |
 | <kbd>Shift</kbd>+<kbd>C</kbd> | Wipe 比較を ON/OFF (左=ピン、右=現在) |
+| <kbd>Ctrl</kbd> (Wipe 境界を左ドラッグ中) | 押している間だけ境界線を隠す。ドラッグを継続したまま見え方を一時的に変える修飾であり、単独のキー操作ではないため keymap 対象外の固定入力とする。フルスクリーン viewport の stale な modifier event を避け、ドラッグ中の各フレームで OS の押下状態を読む |
 | <kbd>Alt</kbd>+<kbd>C</kbd> | 差分比較を ON/OFF (RGB チャンネルごとの差分を色付きで強調表示) |
 | <kbd>U</kbd> / <kbd>Shift</kbd>+<kbd>U</kbd> / <kbd>Alt</kbd>+<kbd>U</kbd> | AI モデル 次 / 前 / リセット。標準キーなしの `FsAiModelAuto` / `FsAiModelRealEsrganX4Plus` / `FsAiModelRealEsrganAnime6B` / `FsAiModelRealCugan4x` / `FsAiModelNmkdSiax4x` / `FsAiModelRealEsrGeneralV3` にキーを割り当てると、任意の AI モデルへ直接切り替えられる |
 | <kbd>T</kbd> / <kbd>Shift</kbd>+<kbd>T</kbd> / <kbd>Alt</kbd>+<kbd>T</kbd> | ポストフィルタ 次 / 前 / 標準 (リセット)。標準キーなしの `FsPostFilterUpscaleSharp` / `FsPostFilterUpscaleAnime` など `FsPostFilter...` 系 Action にキーを割り当てると、任意のポストフィルタへ直接切り替えられる |

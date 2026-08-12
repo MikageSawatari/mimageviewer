@@ -99,6 +99,7 @@ CREATE TABLE meta (
 );
 -- key='version' value='2'
 -- key='folder_path' value='/photos/2024/夏休み'（正規化済みパス）
+-- key='pdf_layout_dims_version' value='2'
 
 -- サムネイルエントリ
 CREATE TABLE thumbnails (
@@ -108,10 +109,19 @@ CREATE TABLE thumbnails (
     width       INTEGER NOT NULL,              -- サムネイル幅（ピクセル）
     height      INTEGER NOT NULL,              -- サムネイル高さ（ピクセル）
     thumb_data  BLOB    NOT NULL,              -- WebP圧縮サムネイルデータ
-    source_width  INTEGER,                     -- 元画像の幅（ピクセル）
-    source_height INTEGER                      -- 元画像の高さ（ピクセル）
+    source_width  INTEGER,                     -- 元画像 / PDF raster の幅（ピクセル）
+    source_height INTEGER,                     -- 元画像 / PDF raster の高さ（ピクセル）
+    layout_width  INTEGER,                     -- PDF page box 幅（1/1000 point、他はNULL）
+    layout_height INTEGER                      -- PDF page box 高さ（1/1000 point、他はNULL）
 );
 ```
+
+`source_*` は画像種別にかかわらずピクセル座標系で、編集・注釈・クリック判定等が参照する。
+PDF の raster 丸めに依存しないページ矩形比だけを `layout_*` に分離し、レイアウト consumer は
+こちらを優先する。v2.13.0 までのリリース済み行には `layout_*` が無く、未リリースの開発版 marker
+v1 は PDF の `source_*` へ page-box 単位を書いていた。どちらも WebP から正確には補えないため、
+`pdf_layout_dims_version=2` への移行時に PDF catalog の全 page 行と通常 catalog の `pdfthumb:` 行を
+一度だけ削除・再生成し、無関係な画像 / ZIP 行は保持する。
 
 ### 無効化ロジック（キャッシュ整合性）
 

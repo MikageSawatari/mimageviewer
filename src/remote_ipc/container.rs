@@ -5444,6 +5444,7 @@ mod tests {
                 max_y: 198.0,
             },
             aspect_mode: crate::export_crop::CropAspectMode::Free,
+            source_size: None,
         }
     }
 
@@ -5466,6 +5467,7 @@ mod tests {
                 max_y: canonical_dims[1] as f32 * 0.75,
             },
             aspect_mode: crate::export_crop::CropAspectMode::Free,
+            source_size: None,
         };
         let expected_page_fractions = [0.2_f32, 0.25, 0.8, 0.75];
 

@@ -336,7 +336,7 @@ impl App {
                     .fit_to_aspect_around_center(ratio, image_size[0], image_size[1]);
                 self.set_export_crop_for_idx(
                     fs_idx,
-                    Some(CropSettings { rect, aspect_mode }),
+                    Some(CropSettings::authored(rect, aspect_mode, image_size)),
                     image_size,
                 );
             } else if let Some(mut settings) = current {
@@ -346,9 +346,12 @@ impl App {
             }
         }
 
-        let mut settings = current.unwrap_or(CropSettings {
-            rect: CropRect::full(image_size[0], image_size[1]),
-            aspect_mode,
+        let mut settings = current.unwrap_or_else(|| {
+            CropSettings::authored(
+                CropRect::full(image_size[0], image_size[1]),
+                aspect_mode,
+                image_size,
+            )
         });
         settings.aspect_mode = aspect_mode;
 
@@ -367,7 +370,7 @@ impl App {
                 };
                 self.set_export_crop_for_idx(
                     fs_idx,
-                    Some(CropSettings { rect, aspect_mode }),
+                    Some(CropSettings::authored(rect, aspect_mode, image_size)),
                     image_size,
                 );
             }
@@ -419,7 +422,7 @@ impl App {
             );
             self.set_export_crop_for_idx(
                 fs_idx,
-                Some(CropSettings { rect, aspect_mode }),
+                Some(CropSettings::authored(rect, aspect_mode, image_size)),
                 image_size,
             );
         }
@@ -436,10 +439,11 @@ impl App {
         self.export_crop_aspect_mode = CropAspectMode::Free;
         self.set_export_crop_for_idx(
             fs_idx,
-            Some(CropSettings {
+            Some(CropSettings::authored(
                 rect,
-                aspect_mode: CropAspectMode::Free,
-            }),
+                CropAspectMode::Free,
+                image_size,
+            )),
             image_size,
         );
         true
@@ -470,9 +474,12 @@ impl App {
         if !self.export_crop_mode && current.is_none() {
             return false;
         }
-        let settings = current.unwrap_or(CropSettings {
-            rect: CropRect::full(image_size[0], image_size[1]),
-            aspect_mode: self.export_crop_aspect_mode,
+        let settings = current.unwrap_or_else(|| {
+            CropSettings::authored(
+                CropRect::full(image_size[0], image_size[1]),
+                self.export_crop_aspect_mode,
+                image_size,
+            )
         });
         let crop_corners = crop_corners(transform, image_size, settings.rect);
         let painter = ui.painter().with_clip_rect(transform.viewport_rect);
@@ -603,10 +610,11 @@ impl App {
                 );
                 self.set_export_crop_for_idx_memory_only(
                     fs_idx,
-                    Some(CropSettings {
+                    Some(CropSettings::authored(
                         rect,
-                        aspect_mode: settings.aspect_mode,
-                    }),
+                        settings.aspect_mode,
+                        image_size,
+                    )),
                     image_size,
                 );
                 ui.ctx()
@@ -629,10 +637,11 @@ impl App {
                     );
                     self.set_export_crop_for_idx_memory_only(
                         fs_idx,
-                        Some(CropSettings {
+                        Some(CropSettings::authored(
                             rect,
-                            aspect_mode: settings.aspect_mode,
-                        }),
+                            settings.aspect_mode,
+                            image_size,
+                        )),
                         image_size,
                     );
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
