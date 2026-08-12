@@ -641,6 +641,10 @@ UI 同期なら、worker 化・キャンセル・結果適用時の世代/idx �
 既定は相対パス `remote-web-log.jsonl` (`crates/remote-web/src/config.rs`)。
 core が service を spawn するとき `--log` を渡していないので、**リポジトリ
 ルート直下**に出ることが多い (`--log <path>` で変更可)。JSON Lines 形式。
+16 MiB を超えるとローテーションし、現在ファイルと
+`remote-web-log.1.jsonl`〜`.4.jsonl` の計 5 世代を保持する (合計およそ 80 MiB)。
+本体の perf log と違い**起動時にはローテーションしない** — PIN 変更・serve 設定・
+全端末ログアウトで core が child を再起動するため、起動契機にすると数回の操作で履歴が消える。
 
 ### 何が入っているか
 
