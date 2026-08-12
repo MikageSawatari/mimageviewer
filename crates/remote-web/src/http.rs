@@ -49,13 +49,18 @@ const TELEMETRY_WINDOW: Duration = Duration::from_secs(60);
 pub const HTTP_WORKER_COUNT: usize = 12;
 pub const MAX_CONCURRENT_IPC: usize = 6;
 pub const MAX_CONCURRENT_HEAVY_IPC: usize = 4;
-/// Three, because a fourth buys almost nothing. Rendering one 46-megapixel page
-/// costs the core 44ms per megapixel alone, 52ms with three in flight, and 66ms
-/// with four: page supply measures 0.99/s, 1.26/s and 1.32/s at those widths, so
-/// the machine is already CPU-bound at three and the last slot returns 5%.
-/// Prefetch still stops one below `MAX_CONCURRENT_HEAVY_IPC`, so a page the
-/// reader is waiting for never queues behind speculation.
-pub const MAX_CONCURRENT_PAGE_PREFETCH: usize = 3;
+/// Two, and raising it alone changes nothing: three separate ceilings sit in
+/// series and this is the loosest of them. The browser starts at most
+/// `PAGE_PREFETCH_CONCURRENCY` fetches, and the core hands prefetch at most
+/// `worker_count - 1` of its remote heavy workers, which `remote_heavy_worker_count`
+/// clamps to three. Both of those are two. Lifting the real limit means moving
+/// all three together and deciding how much of the machine remote may take.
+///
+/// Worth knowing before anyone tries: measured on 46-megapixel pages the core
+/// needs 44ms per megapixel with two renders in flight, 52ms with three and
+/// 66ms with four, so supply goes 0.99, 1.26, 1.32 pages a second. The third
+/// render earns a quarter more pages and the fourth earns five percent.
+pub const MAX_CONCURRENT_PAGE_PREFETCH: usize = 2;
 pub const MAX_CONCURRENT_STREAM_IPC: usize = 4;
 const IPC_RETRY_AFTER_SECONDS: u64 = 1;
 
