@@ -7405,6 +7405,27 @@ impl NativeEguiOverlay {
                                 egui::Color32::from_rgb(228, 228, 228),
                             );
                         }
+                        let tick_stroke = egui::Stroke::new(
+                            crate::seek_ruler::SEEK_RULER_STROKE_WIDTH,
+                            egui::Color32::from_gray(crate::seek_ruler::SEEK_RULER_GRAY),
+                        );
+                        for tick in crate::seek_ruler::duration_ruler_ticks(
+                            duration_secs,
+                            bar_rect.width(),
+                            crate::seek_ruler::SEEK_RULER_MIN_SPACING,
+                        ) {
+                            let x = bar_rect.min.x + bar_rect.width() * tick.fraction;
+                            let top = bar_rect.bottom() + crate::seek_ruler::SEEK_RULER_GAP;
+                            let height = if tick.major {
+                                crate::seek_ruler::SEEK_RULER_MAJOR_HEIGHT
+                            } else {
+                                crate::seek_ruler::SEEK_RULER_MINOR_HEIGHT
+                            };
+                            painter.line_segment(
+                                [egui::pos2(x, top), egui::pos2(x, top + height)],
+                                tick_stroke,
+                            );
+                        }
                         if duration_secs > 0.0 {
                             for marker in &timeline_markers {
                                 draw_timeline_marker(painter, bar_rect, duration_secs, *marker);

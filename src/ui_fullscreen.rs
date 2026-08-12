@@ -10273,8 +10273,9 @@ impl App {
             4.0,
             egui::Color32::from_rgba_unmultiplied(92, 98, 110, 170),
         );
-        let fraction = if let Some((units, _)) = spread_seek.as_ref() {
-            spread_seek_unit_fraction(display_pos, units.len())
+        let seek_unit_count = spread_seek.as_ref().map_or(total, |(units, _)| units.len());
+        let fraction = if spread_seek.is_some() {
+            spread_seek_unit_fraction(display_pos, seek_unit_count)
         } else if total <= 1 {
             0.0
         } else {
@@ -10294,6 +10295,27 @@ impl App {
             4.0,
             egui::Color32::from_rgba_unmultiplied(112, 174, 255, 230),
         );
+        let tick_stroke = egui::Stroke::new(
+            crate::seek_ruler::SEEK_RULER_STROKE_WIDTH,
+            egui::Color32::from_gray(crate::seek_ruler::SEEK_RULER_GRAY),
+        );
+        for tick in crate::seek_ruler::page_ruler_ticks(
+            seek_unit_count,
+            track_rect.width(),
+            crate::seek_ruler::SEEK_RULER_MIN_SPACING,
+        ) {
+            let x = fullscreen_seek_knob_x(track_rect, tick.fraction, is_rtl);
+            let top = track_rect.bottom() + crate::seek_ruler::SEEK_RULER_GAP;
+            let height = if tick.major {
+                crate::seek_ruler::SEEK_RULER_MAJOR_HEIGHT
+            } else {
+                crate::seek_ruler::SEEK_RULER_MINOR_HEIGHT
+            };
+            painter.line_segment(
+                [egui::pos2(x, top), egui::pos2(x, top + height)],
+                tick_stroke,
+            );
+        }
         painter.circle_filled(
             egui::pos2(knob_x, track_rect.center().y),
             6.0,
@@ -36352,6 +36374,26 @@ mod tests {
     }
 
     #[test]
+    fn spread_seek_ruler_uses_the_same_display_unit_denominator_as_the_knob() {
+        let nav = (0..10).collect::<Vec<_>>();
+        let units =
+            build_spread_display_units_with_landscape(&nav, SpreadMode::Ltr, None, |_| false);
+        let ticks = crate::seek_ruler::page_ruler_ticks(
+            units.len(),
+            1000.0,
+            crate::seek_ruler::SEEK_RULER_MIN_SPACING,
+        );
+
+        assert_eq!(units.len(), 5);
+        assert_eq!(ticks.len(), units.len());
+        for (unit_index, tick) in ticks.iter().enumerate() {
+            assert!(
+                (tick.fraction - spread_seek_unit_fraction(unit_index, units.len())).abs() < 0.001
+            );
+        }
+    }
+
+    #[test]
     fn spread_units_keep_leading_landscape_single_and_pair_following_pages() {
         let nav = (0..11).collect::<Vec<_>>();
         let units =
@@ -37275,6 +37317,23 @@ mod tests {
         }
         assert_eq!(fullscreen_seek_fraction_from_x(track, 100.0, false), 0.0);
         assert_eq!(fullscreen_seek_fraction_from_x(track, 100.0, true), 1.0);
+    }
+
+    #[test]
+    fn seek_ruler_rtl_positions_are_ltr_mirror_images() {
+        let track = egui::Rect::from_min_max(egui::pos2(100.0, 0.0), egui::pos2(500.0, 8.0));
+        let ticks = crate::seek_ruler::page_ruler_ticks(
+            100,
+            track.width(),
+            crate::seek_ruler::SEEK_RULER_MIN_SPACING,
+        );
+
+        assert!(!ticks.is_empty());
+        for tick in ticks {
+            let ltr_x = fullscreen_seek_knob_x(track, tick.fraction, false);
+            let rtl_x = fullscreen_seek_knob_x(track, tick.fraction, true);
+            assert!((ltr_x + rtl_x - track.left() - track.right()).abs() < 0.001);
+        }
     }
 
     #[test]

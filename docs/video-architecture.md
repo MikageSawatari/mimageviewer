@@ -281,6 +281,11 @@ Context の `zoom_factor` を `ui_scale` として保持し、単一の ppp 源�
 `miv-hud-text` (= 無補正の既定日本語フォント) を使う。これらは既定フォント向けの固定 Y 基準と
 幅を持つため、任意 UI フォントの字面を伝播させない。VST 等の固定 glyph はベクター描画のまま。
 
+**下部 HUD のシーク目盛り**: NativeEguiOverlay はシーク行のトラック下側に、duration と
+トラック論理幅から間引いた秒 / 分 / 時間の目盛りを描く。トラック → 進捗塗り → 目盛り →
+timeline marker の順で描き、chapter / bookmark / pin は現行の色・高さのまま目盛りより前面へ
+残す。音声 HUD も同じ目盛り生成と寸法を使い、動画と音声モードの切替で密度や見た目を変えない。
+
 **フォールバック経路**: HUD HWND 生成失敗 / 環境変数 `MIV_HUD_OVERLAY=0` でフォールバック有効化。
 従来通り egui overlay を presenter HWND の DComp tree に attach (`NativeEguiOverlay::new` の
 `after_visual=Some(&video_visual)`、`dcomp_hwnd=focus_hwnd=presenter_hwnd`)。VST GUI 裏に bars が
