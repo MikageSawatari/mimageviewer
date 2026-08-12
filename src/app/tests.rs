@@ -24930,6 +24930,155 @@ mod pipeline_cache_refactor_tests {
     }
 
     #[test]
+    fn monochrome_only_page_turn_reuses_the_rendition_classification_for_final() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\pics\page-turn-color.png");
+        let color = Arc::new(egui::ColorImage::new(
+            [8, 8],
+            (0..64)
+                .map(|value| match value % 4 {
+                    0 => egui::Color32::RED,
+                    1 => egui::Color32::GREEN,
+                    2 => egui::Color32::BLUE,
+                    _ => egui::Color32::YELLOW,
+                })
+                .collect(),
+        ));
+        let catalog = ctx.load_texture(
+            "page_turn_color_catalog",
+            color.as_ref().clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.thumbnails[idx] = ThumbnailState::Loaded {
+            tex: catalog,
+            from_cache: false,
+            from_edit_preview: false,
+            rendered_at_px: 8,
+            source_dims: Some((800, 1201)),
+        };
+        app.thumb_pixels.insert(idx, Arc::clone(&color));
+        set_colorize_mode(&mut app, idx, ColorizeMode::MonochromeOnly);
+
+        let _ = app
+            .ensure_passthrough_rendition(&ctx, idx)
+            .expect("color rendition");
+        assert_eq!(
+            app.current_passthrough_colorize_applied_for_test(idx),
+            Some(false)
+        );
+
+        // Full materialization advances source_gen. The rendition-owned
+        // applicability intentionally crosses that decode-only generation.
+        app.input_generation.insert(idx, 1);
+        let params = app.effective_params(idx).clone();
+        let final_key =
+            app.final_composite_key_for_pixels(app.current_edit_result_key(idx), [8, 8], &params);
+        let applicability = app
+            .passthrough_rendition_cache
+            .colorize_applied_for_final(final_key);
+        assert_eq!(applicability, Some(false));
+        let mut edited_key = final_key;
+        edited_key.edit_key.local_gen = edited_key.edit_key.local_gen.wrapping_add(1);
+        assert_eq!(
+            app.passthrough_rendition_cache
+                .colorize_applied_for_final(edited_key),
+            None,
+            "an edit-generation change must not reuse a stale rendition classification"
+        );
+
+        // Deliberately use a full-resolution input whose independent classifier
+        // would disagree. The landing final must retain the visible rendition's
+        // decision instead of changing color at settle.
+        let monochrome = Arc::new(egui::ColorImage::new(
+            [8, 8],
+            (0..64)
+                .map(|value| egui::Color32::from_gray((value * 4) as u8))
+                .collect(),
+        ));
+        assert!(crate::colorize::should_apply(&monochrome, &params.colorize));
+        let cancel = AtomicBool::new(false);
+        let result = run_final_effect_job(
+            FinalEffectJob {
+                source: Arc::clone(&monochrome),
+                adjust_before_effect: None,
+                smart_sharpen: 0,
+                colorize: params.colorize,
+                colorize_applicable_override: applicability,
+                creative_lut: None,
+                post_filter: crate::adjustment::PostFilter::None,
+            },
+            &cancel,
+        );
+        let FinalEffectResult::Ready { pixels, timing, .. } = result else {
+            panic!("final effect should complete");
+        };
+        assert!(!timing.colorize_applied);
+        assert_eq!(pixels.as_ref(), monochrome.as_ref());
+    }
+
+    #[test]
+    fn monochrome_only_page_turn_prefers_a_resident_final_classification() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\pics\page-turn-known-color.png");
+        let monochrome = Arc::new(egui::ColorImage::new(
+            [8, 8],
+            (0..64)
+                .map(|value| egui::Color32::from_gray((value * 4) as u8))
+                .collect(),
+        ));
+        let catalog = ctx.load_texture(
+            "page_turn_known_color_catalog",
+            monochrome.as_ref().clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        let catalog_id = catalog.id();
+        app.thumbnails[idx] = ThumbnailState::Loaded {
+            tex: catalog,
+            from_cache: false,
+            from_edit_preview: false,
+            rendered_at_px: 8,
+            source_dims: Some((800, 1201)),
+        };
+        app.thumb_pixels.insert(idx, Arc::clone(&monochrome));
+        set_colorize_mode(&mut app, idx, ColorizeMode::MonochromeOnly);
+        let params = app.effective_params(idx).clone();
+        assert!(crate::colorize::should_apply(&monochrome, &params.colorize));
+
+        let final_key =
+            app.final_composite_key_for_pixels(app.current_edit_result_key(idx), [8, 8], &params);
+        let final_texture = ctx.load_texture(
+            "page_turn_known_color_final",
+            monochrome.as_ref().clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.final_composite_cache.insert(
+            final_key,
+            FinalCompositeEntry {
+                pixels: Arc::clone(&monochrome),
+                texture: final_texture,
+                complete: true,
+            },
+        );
+        app.final_composite_cache
+            .record_colorize_applied(final_key, false);
+
+        let rendition = app
+            .ensure_passthrough_rendition(&ctx, idx)
+            .expect("resident-final-aligned rendition");
+        assert_eq!(
+            app.current_passthrough_colorize_applied_for_test(idx),
+            Some(false)
+        );
+        assert_eq!(
+            rendition.id(),
+            catalog_id,
+            "the pass-through frame must retain the resident final's no-colorize decision"
+        );
+    }
+
+    #[test]
     fn paged_prefetch_starts_current_needs_load_after_cancelling_siblings() {
         let mut app = setup_app();
         let current = push_image(&mut app, r"C:\missing\current.png");

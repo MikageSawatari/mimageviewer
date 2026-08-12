@@ -583,7 +583,7 @@ class PageTurnInvariantCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertNotIn("I3 violation:", result.stdout)
 
-    def test_i4_endpoint_exception_requires_a_repeated_endpoint(self) -> None:
+    def test_i4_endpoint_requires_materialized_settle(self) -> None:
         endpoint_cases = {
             "last": [
                 page_turn(1.0, 1, "materialized"),
@@ -599,29 +599,16 @@ class PageTurnInvariantCliTests(unittest.TestCase):
         for endpoint, events in endpoint_cases.items():
             with self.subTest(endpoint=endpoint):
                 result = self.run_page_turn(events)
-                self.assertEqual(result.returncode, 0, result.stdout)
-                self.assertNotIn("I4 violation:", result.stdout)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("I4 violation:", result.stdout)
 
-        interior_repeat = self.run_page_turn([
-            page_turn(1.0, 0, "materialized"),
-            page_turn(1.1, 1, "pass_through"),
-            page_turn(1.2, 1, "pass_through"),
-            # A later burst establishes that idx=1 was not the final page.
-            page_turn(2.0, 2, "materialized"),
-        ])
-        self.assertEqual(interior_repeat.returncode, 1, interior_repeat.stdout)
-        self.assertIn("I4 violation:", interior_repeat.stdout)
-
-        endpoint_without_repeat = self.run_page_turn([
+        settled_endpoint = self.run_page_turn([
             page_turn(1.0, 1, "materialized"),
             page_turn(1.1, 2, "pass_through"),
+            page_turn(1.2, 2, "materialized"),
         ])
-        self.assertEqual(
-            endpoint_without_repeat.returncode,
-            1,
-            endpoint_without_repeat.stdout,
-        )
-        self.assertIn("I4 violation:", endpoint_without_repeat.stdout)
+        self.assertEqual(settled_endpoint.returncode, 0, settled_endpoint.stdout)
+        self.assertNotIn("I4 violation:", settled_endpoint.stdout)
 
     def test_i5_only_applies_to_rendition_ready_pending_frames(self) -> None:
         events = [

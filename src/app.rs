@@ -5925,6 +5925,15 @@ pub(crate) struct FinalCompositeKey {
     pub(crate) bg: u8,
 }
 
+fn final_effect_identity_matches(left: FinalCompositeKey, right: FinalCompositeKey) -> bool {
+    left.edit_key.idx == right.edit_key.idx
+        && left.edit_key.erase_mask_gen == right.edit_key.erase_mask_gen
+        && left.edit_key.local_gen == right.edit_key.local_gen
+        && left.edit_key.conceal_mask_gen == right.edit_key.conceal_mask_gen
+        && left.edit_key.conceal_gen == right.edit_key.conceal_gen
+        && left.params_hash == right.params_hash
+}
+
 const PASSTHROUGH_RENDITION_CACHE_CAPACITY: usize = 16;
 
 #[derive(Clone)]
@@ -5935,6 +5944,10 @@ pub(crate) struct PassthroughRenditionEntry {
     source_pixels: Arc<egui::ColorImage>,
     /// Keep the CPU result beside the GPU texture so the cache owns one complete rendition.
     _pixels: Arc<egui::ColorImage>,
+    /// MonochromeOnly applicability resolved from the rendition's adjusted
+    /// pixels. The landing-page final worker reuses this exact decision so a
+    /// thumbnail/full-resolution classifier disagreement cannot change color.
+    colorize_applied: bool,
     pub(crate) texture: egui::TextureHandle,
 }
 
@@ -5992,6 +6005,15 @@ impl PassthroughRenditionCache {
         self.entries
             .values()
             .any(|entry| entry.texture.id() == texture_id)
+    }
+
+    fn colorize_applied_for_final(&self, key: FinalCompositeKey) -> Option<bool> {
+        self.lru
+            .iter()
+            .rev()
+            .find(|candidate| final_effect_identity_matches(**candidate, key))
+            .and_then(|candidate| self.entries.get(candidate))
+            .map(|entry| entry.colorize_applied)
     }
 
     fn clear(&mut self) {
@@ -6161,6 +6183,10 @@ impl FinalCompositeDropTracker {
 #[derive(Default)]
 pub(crate) struct FinalCompositeCache {
     entries: std::collections::HashMap<FinalCompositeKey, FinalCompositeEntry>,
+    /// Actual worker classification for resident MonochromeOnly composites.
+    /// This lets a later pass-through rendition use the already-visible final
+    /// decision instead of independently classifying a rounded thumbnail.
+    colorize_applied: std::collections::HashMap<FinalCompositeKey, bool>,
     dropped: FinalCompositeDropTracker,
 }
 
@@ -6181,6 +6207,8 @@ impl FinalCompositeCache {
             }
             retain
         });
+        self.colorize_applied
+            .retain(|key, _| self.entries.contains_key(key));
         if dropped.is_empty() {
             return;
         }
@@ -6196,6 +6224,7 @@ impl FinalCompositeCache {
         reason: &'static str,
     ) -> Option<FinalCompositeEntry> {
         let removed = self.entries.remove(key);
+        self.colorize_applied.remove(key);
         if removed.as_ref().is_some_and(|entry| entry.complete) {
             self.dropped
                 .record_drop(*key, true, std::time::Instant::now(), reason);
@@ -6216,10 +6245,34 @@ impl FinalCompositeCache {
             }
         }
         self.entries.clear();
+        self.colorize_applied.clear();
     }
 
     fn observe_spawn(&mut self, key: FinalCompositeKey) -> Option<FinalEffectRecomputeObservation> {
         self.dropped.observe_spawn(key, std::time::Instant::now())
+    }
+
+    fn record_colorize_applied(&mut self, key: FinalCompositeKey, applied: bool) {
+        self.colorize_applied.insert(key, applied);
+    }
+
+    fn colorize_applied_for_rendition(&self, key: FinalCompositeKey) -> Option<bool> {
+        self.entries
+            .get(&key)
+            .and_then(|_| self.colorize_applied.get(&key).copied())
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .filter(|(candidate, _)| final_effect_identity_matches(**candidate, key))
+                    .filter_map(|(candidate, _)| {
+                        self.colorize_applied
+                            .get(candidate)
+                            .copied()
+                            .map(|applied| (candidate.edit_key.source_gen, applied))
+                    })
+                    .max_by_key(|(source_gen, _)| *source_gen)
+                    .map(|(_, applied)| applied)
+            })
     }
 }
 
@@ -6394,45 +6447,69 @@ struct FinalEffectJob {
     adjust_before_effect: Option<crate::adjustment::AdjustParams>,
     smart_sharpen: u8,
     colorize: crate::colorize::ColorizeParams,
+    colorize_applicable_override: Option<bool>,
     creative_lut: Option<(crate::creative_lut::SharedCreativeLut, f32)>,
     post_filter: crate::adjustment::PostFilter,
 }
 
 /// Build the low-resolution page-turn rendition synchronously on the UI thread.
 /// The order is the page-turn contract in display-pipeline §2.5.6:
-/// color adjustment -> Creative LUT -> colorize. Content edits, AI, sharpen and
+/// color adjustment -> colorize -> Creative LUT. Content edits, AI, sharpen and
 /// post filters stay outside this bounded thumbnail-sized path.
+struct PassthroughRenditionPixels {
+    /// None means every low-resolution effect was an identity and the catalog
+    /// texture can be reused without an extra upload.
+    pixels: Option<egui::ColorImage>,
+    colorize_applied: bool,
+}
+
 fn build_passthrough_rendition_pixels(
     source: &egui::ColorImage,
     params: &crate::adjustment::AdjustParams,
-    final_color_effect_required: bool,
     creative_lut: Option<(crate::creative_lut::SharedCreativeLut, f32)>,
-) -> egui::ColorImage {
-    let adjusted = if params.is_color_identity() {
-        source.clone()
+    colorize_applicable_override: Option<bool>,
+) -> PassthroughRenditionPixels {
+    let mut pixels = if params.is_color_identity() {
+        None
     } else {
-        crate::adjustment::apply_adjustments_fast(source, params)
+        Some(crate::adjustment::apply_adjustments_fast(source, params))
     };
-    let lut_applied = if final_color_effect_required {
-        if let Some((lut, strength)) = creative_lut {
-            crate::creative_lut::apply_to_color_image(&adjusted, &lut, strength)
-        } else {
-            adjusted
-        }
-    } else {
-        adjusted
-    };
-    if final_color_effect_required
-        && !matches!(
-            params.colorize.mode,
-            crate::colorize::ColorizeMode::Disabled
-        )
-    {
+    let colorize_source = pixels.as_ref().unwrap_or(source);
+    let colorize_applied = final_effect_colorize_applies(
+        &params.colorize,
+        colorize_applicable_override,
+        colorize_source,
+    );
+    if colorize_applied {
         let cancel = AtomicBool::new(false);
-        crate::colorize::apply_applicable_with_cancel(&lut_applied, &params.colorize, &cancel)
-            .unwrap_or(lut_applied)
-    } else {
-        lut_applied
+        pixels = crate::colorize::apply_applicable_with_cancel(
+            colorize_source,
+            &params.colorize,
+            &cancel,
+        );
+    }
+    if let Some((lut, strength)) = creative_lut {
+        let lut_source = pixels.as_ref().unwrap_or(source);
+        pixels = Some(crate::creative_lut::apply_to_color_image(
+            lut_source, &lut, strength,
+        ));
+    }
+    PassthroughRenditionPixels {
+        pixels,
+        colorize_applied,
+    }
+}
+
+fn final_effect_colorize_applies(
+    colorize: &crate::colorize::ColorizeParams,
+    applicable_override: Option<bool>,
+    source: &egui::ColorImage,
+) -> bool {
+    match colorize.mode {
+        crate::colorize::ColorizeMode::MonochromeOnly => {
+            applicable_override.unwrap_or_else(|| crate::colorize::should_apply(source, colorize))
+        }
+        _ => crate::colorize::should_apply(source, colorize),
     }
 }
 
@@ -6474,7 +6551,8 @@ fn run_final_effect_job(job: FinalEffectJob, cancel: &AtomicBool) -> FinalEffect
         return FinalEffectResult::Cancelled;
     }
     let stage_started = std::time::Instant::now();
-    timing.colorize_applied = crate::colorize::should_apply(&sharpened, &job.colorize);
+    timing.colorize_applied =
+        final_effect_colorize_applies(&job.colorize, job.colorize_applicable_override, &sharpened);
     timing.colorize_check_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
     let stage_started = std::time::Instant::now();
     let colorized = if timing.colorize_applied {
@@ -50509,6 +50587,7 @@ impl App {
                 adjust_before_effect,
                 smart_sharpen: params.effective_smart_sharpen(used_upscale),
                 colorize: params.colorize.clone(),
+                colorize_applicable_override: None,
                 creative_lut,
                 post_filter: params.post_filter,
             };
@@ -54686,6 +54765,8 @@ impl App {
                             complete: pending.output_complete,
                         },
                     );
+                    self.final_composite_cache
+                        .record_colorize_applied(key, timing.colorize_applied);
                     if pending.output_complete {
                         self.continuous_page_transitions.remove(&key.edit_key.idx);
                     } else {
@@ -54804,6 +54885,15 @@ impl App {
             adjust_before_effect: None,
             smart_sharpen: 0,
             colorize: params.colorize.clone(),
+            colorize_applicable_override: matches!(
+                params.colorize.mode,
+                crate::colorize::ColorizeMode::MonochromeOnly
+            )
+            .then(|| {
+                self.passthrough_rendition_cache
+                    .colorize_applied_for_final(key)
+            })
+            .flatten(),
             creative_lut: (!self.post_filter_bypassed && !params.creative_lut.is_identity())
                 .then(|| {
                     self.creative_lut_library
@@ -59976,6 +60066,32 @@ impl App {
         computed
     }
 
+    pub(crate) fn known_monochrome_only_applicability(
+        &self,
+        idx: usize,
+        params: &crate::adjustment::AdjustParams,
+    ) -> Option<bool> {
+        if !matches!(
+            params.colorize.mode,
+            crate::colorize::ColorizeMode::MonochromeOnly
+        ) || !params.is_color_identity()
+        {
+            return None;
+        }
+        let edit_key = self.current_edit_result_key(idx);
+        if !self.edit_result_cache.contains_key(&edit_key) {
+            return None;
+        }
+        let summary = self
+            .colorize_mono_summary_cache
+            .get(&idx)
+            .filter(|summary| summary.edit_key == edit_key)?;
+        Some(crate::colorize::is_near_monochrome_residual(
+            summary.p95_residual,
+            params.colorize.mono_tolerance,
+        ))
+    }
+
     /// Return a color-faithful catalog-thumbnail rendition for page-turn pass-through.
     /// This is intentionally synchronous: publishing an uncolored texture first would
     /// violate R2, while the measured thumbnail-sized work is bounded to a few milliseconds.
@@ -59994,7 +60110,6 @@ impl App {
         };
         let source_pixels = self.thumb_pixels.get(&idx)?.clone();
         let params = self.effective_params(idx).clone();
-        let final_color_effect_required = self.colorize_display_requires_final_effect(idx);
         let key = self.final_composite_key_for_pixels(
             self.current_edit_result_key(idx),
             source_pixels.size,
@@ -60004,23 +60119,38 @@ impl App {
             return Some(entry.texture);
         }
 
-        let creative_lut = if final_color_effect_required && !params.creative_lut.is_identity() {
+        let creative_lut = if !params.creative_lut.is_identity() {
             self.creative_lut_library
                 .get(params.creative_lut.id)
                 .map(|lut| (lut, params.creative_lut.strength))
         } else {
             None
         };
-        let no_color_effect = params.is_color_identity() && !final_color_effect_required;
-        let (pixels, texture) = if no_color_effect && !from_edit_preview {
+        let colorize_applicable_override = matches!(
+            params.colorize.mode,
+            crate::colorize::ColorizeMode::MonochromeOnly
+        )
+        .then(|| {
+            self.final_composite_cache
+                .colorize_applied_for_rendition(key)
+                .or_else(|| self.known_monochrome_only_applicability(idx, &params))
+        })
+        .flatten();
+        let rendition = build_passthrough_rendition_pixels(
+            &source_pixels,
+            &params,
+            creative_lut,
+            colorize_applicable_override,
+        );
+        let colorize_applied = rendition.colorize_applied;
+        let (pixels, texture) = if rendition.pixels.is_none() && !from_edit_preview {
             (Arc::clone(&source_pixels), catalog_texture)
         } else {
-            let pixels = Arc::new(build_passthrough_rendition_pixels(
-                &source_pixels,
-                &params,
-                final_color_effect_required,
-                creative_lut,
-            ));
+            let pixels = Arc::new(
+                rendition
+                    .pixels
+                    .unwrap_or_else(|| source_pixels.as_ref().clone()),
+            );
             let texture = ctx.load_texture(
                 format!(
                     "passthrough_rendition_{}_{}_{}_{}",
@@ -60036,6 +60166,7 @@ impl App {
             PassthroughRenditionEntry {
                 source_pixels,
                 _pixels: pixels,
+                colorize_applied,
                 texture: texture.clone(),
             },
         );
@@ -60064,6 +60195,17 @@ impl App {
             .find(|key| key.edit_key.idx == idx)
             .and_then(|key| self.passthrough_rendition_cache.entries.get(key))
             .map(|entry| Arc::clone(&entry._pixels))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn current_passthrough_colorize_applied_for_test(&self, idx: usize) -> Option<bool> {
+        self.passthrough_rendition_cache
+            .lru
+            .iter()
+            .rev()
+            .find(|key| key.edit_key.idx == idx)
+            .and_then(|key| self.passthrough_rendition_cache.entries.get(key))
+            .map(|entry| entry.colorize_applied)
     }
 
     /// 一旦 `fs_upload_backlog` に積み、1 フレームあたり最大 1 枚だけ `ctx.load_texture`

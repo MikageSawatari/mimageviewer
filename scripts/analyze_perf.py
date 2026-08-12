@@ -767,14 +767,6 @@ def _page_turn_decision_reason_for_ready(
 def analyze_page_turn_invariants(events: list[dict]) -> dict:
     """Check the page-turn trace invariants I1--I5 from the v2.13 brief."""
     bursts = _page_turn_check_bursts(events)
-    max_idx_by_generation: dict[object, int] = {}
-    for burst in bursts:
-        generation = burst["items_generation"]
-        observed_max = max(burst["indices"])
-        max_idx_by_generation[generation] = max(
-            observed_max,
-            max_idx_by_generation.get(generation, observed_max),
-        )
 
     violations: list[dict] = []
     for burst in bursts:
@@ -882,19 +874,10 @@ def analyze_page_turn_invariants(events: list[dict]) -> dict:
         # correct run as a violation.
         last_event = burst_events[-1]
         last_idx = burst["indices"][-1]
-        repeated_tail = (
-            len(burst["indices"]) >= 2
-            and burst["indices"][-2] == last_idx
-        )
-        at_endpoint = (
-            last_idx == 0
-            or last_idx == max_idx_by_generation[burst["items_generation"]]
-        )
-        endpoint_exception = repeated_tail and at_endpoint
-        # Anchor the settle window to the key coming up, not to the last ready
-        # event. Holding at the end of a folder stops producing ready events
-        # while the key is still down, so a burst can end seconds before the
-        # release that R4 is actually about.
+        # Ordinary moving bursts settle after key-up, so anchor their upper
+        # bound there rather than at the last pass-through ready event. An
+        # endpoint no-op may materialize earlier while the key is still held;
+        # the lower bound at burst end accepts that structurally earlier settle.
         settle_anchor = max(
             burst["end_t"],
             _hold_release_time(events, burst.get("hold_id")) or burst["end_t"],
@@ -910,7 +893,7 @@ def analyze_page_turn_invariants(events: list[dict]) -> dict:
             <= settle_anchor + PAGE_TURN_SETTLE_WINDOW_SECS
             for event in events
         )
-        if not settled and not endpoint_exception:
+        if not settled:
             violations.append({
                 "id": "I4",
                 "burst": burst,
