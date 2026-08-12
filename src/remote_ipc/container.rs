@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, mpsc};
 use std::time::Instant;
 
 use mimageviewer_ipc::{
@@ -31,6 +31,350 @@ const PAGE_JPEG_QUALITY: i32 = 85;
 /// Bump only when the native remote AI pipeline changes pixel semantics.
 const REMOTE_AI_PIPELINE_SCHEMA: u32 = 1;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemotePageStage {
+    Resolve,
+    Source,
+    Compose,
+    Trim,
+    Resize,
+    Jpeg,
+    Total,
+}
+
+impl RemotePageStage {
+    #[cfg(test)]
+    const ORDERED: [Self; 7] = [
+        Self::Resolve,
+        Self::Source,
+        Self::Compose,
+        Self::Trim,
+        Self::Resize,
+        Self::Jpeg,
+        Self::Total,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Resolve => "resolve",
+            Self::Source => "source",
+            Self::Compose => "compose",
+            Self::Trim => "trim",
+            Self::Resize => "resize",
+            Self::Jpeg => "jpeg",
+            Self::Total => "total",
+        }
+    }
+
+    fn counter(self) -> &'static RemotePageStageCounter {
+        match self {
+            Self::Resolve => &REMOTE_PAGE_RESOLVE_COUNTER,
+            Self::Source => &REMOTE_PAGE_SOURCE_COUNTER,
+            Self::Compose => &REMOTE_PAGE_COMPOSE_COUNTER,
+            Self::Trim => &REMOTE_PAGE_TRIM_COUNTER,
+            Self::Resize => &REMOTE_PAGE_RESIZE_COUNTER,
+            Self::Jpeg => &REMOTE_PAGE_JPEG_COUNTER,
+            Self::Total => &REMOTE_PAGE_TOTAL_COUNTER,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RemotePageConcurrency {
+    active_others: usize,
+    active_total: usize,
+}
+
+fn remote_page_concurrency_on_enter(active_before: usize) -> RemotePageConcurrency {
+    RemotePageConcurrency {
+        active_others: active_before,
+        active_total: active_before.saturating_add(1),
+    }
+}
+
+fn remote_page_concurrency_on_exit(active_before: usize) -> Option<usize> {
+    active_before.checked_sub(1)
+}
+
+struct RemotePageStageCounter {
+    active: AtomicUsize,
+}
+
+impl RemotePageStageCounter {
+    const fn new() -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+        }
+    }
+
+    fn enter(&self) -> RemotePageConcurrency {
+        remote_page_concurrency_on_enter(self.active.fetch_add(1, Ordering::AcqRel))
+    }
+
+    fn leave(&self) {
+        let mut active_before = self.active.load(Ordering::Acquire);
+        while let Some(active_after) = remote_page_concurrency_on_exit(active_before) {
+            match self.active.compare_exchange_weak(
+                active_before,
+                active_after,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => active_before = actual,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+struct RemotePageStageLease<'a> {
+    counter: &'a RemotePageStageCounter,
+    concurrency: RemotePageConcurrency,
+}
+
+impl<'a> RemotePageStageLease<'a> {
+    fn new(counter: &'a RemotePageStageCounter) -> Self {
+        Self {
+            counter,
+            concurrency: counter.enter(),
+        }
+    }
+}
+
+impl Drop for RemotePageStageLease<'_> {
+    fn drop(&mut self) {
+        self.counter.leave();
+    }
+}
+
+static REMOTE_PAGE_RESOLVE_COUNTER: RemotePageStageCounter = RemotePageStageCounter::new();
+static REMOTE_PAGE_SOURCE_COUNTER: RemotePageStageCounter = RemotePageStageCounter::new();
+static REMOTE_PAGE_COMPOSE_COUNTER: RemotePageStageCounter = RemotePageStageCounter::new();
+static REMOTE_PAGE_TRIM_COUNTER: RemotePageStageCounter = RemotePageStageCounter::new();
+static REMOTE_PAGE_RESIZE_COUNTER: RemotePageStageCounter = RemotePageStageCounter::new();
+static REMOTE_PAGE_JPEG_COUNTER: RemotePageStageCounter = RemotePageStageCounter::new();
+static REMOTE_PAGE_TOTAL_COUNTER: RemotePageStageCounter = RemotePageStageCounter::new();
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RemotePageStageMetrics {
+    pixels: u64,
+    bytes: u64,
+    output_pixels: u64,
+    output_bytes: u64,
+}
+
+impl RemotePageStageMetrics {
+    fn buffer(width: usize, height: usize, bytes_per_pixel: u64) -> Self {
+        let pixels = (width as u64).saturating_mul(height as u64);
+        Self {
+            pixels,
+            bytes: pixels.saturating_mul(bytes_per_pixel),
+            output_pixels: pixels,
+            output_bytes: pixels.saturating_mul(bytes_per_pixel),
+        }
+    }
+
+    fn with_output(mut self, width: usize, height: usize, bytes_per_pixel: u64) -> Self {
+        self.output_pixels = (width as u64).saturating_mul(height as u64);
+        self.output_bytes = self.output_pixels.saturating_mul(bytes_per_pixel);
+        self
+    }
+}
+
+fn remote_page_file_metrics(file_size: i64) -> RemotePageStageMetrics {
+    let bytes = u64::try_from(file_size).unwrap_or(0);
+    RemotePageStageMetrics {
+        bytes,
+        output_bytes: bytes,
+        ..RemotePageStageMetrics::default()
+    }
+}
+
+struct RemotePagePerfContext {
+    key: String,
+    job_id: String,
+    display_request_id: Option<String>,
+    source_kind: &'static str,
+    priority: &'static str,
+}
+
+#[derive(Clone, Default)]
+struct RemotePagePerf(Option<Arc<RemotePagePerfContext>>);
+
+impl RemotePagePerf {
+    fn new(request: &PageRequest, source_kind: &'static str) -> Self {
+        if !crate::perf::is_enabled() {
+            return Self::default();
+        }
+        let key = remote_page_perf_key(&request.address);
+        Self(Some(Arc::new(RemotePagePerfContext {
+            key,
+            job_id: request.job_id.clone(),
+            display_request_id: request.display_request_id.clone(),
+            source_kind,
+            priority: if request.priority == PagePriority::Prefetch {
+                "prefetch"
+            } else {
+                "foreground"
+            },
+        })))
+    }
+
+    fn enter(&self, stage: RemotePageStage) -> Option<RemotePageStageGuard> {
+        let context = Arc::clone(self.0.as_ref()?);
+        let lease = RemotePageStageLease::new(stage.counter());
+        Some(RemotePageStageGuard {
+            context,
+            stage,
+            started: Instant::now(),
+            lease: Some(lease),
+            wait_ms: 0.0,
+            metrics: RemotePageStageMetrics::default(),
+            outcome: "aborted",
+        })
+    }
+
+    fn record_skipped(
+        &self,
+        stage: RemotePageStage,
+        metrics: RemotePageStageMetrics,
+        reason: &'static str,
+    ) {
+        if let Some(mut guard) = self.enter(stage) {
+            guard.metrics = metrics;
+            guard.outcome = reason;
+        }
+    }
+}
+
+struct RemotePageStageGuard {
+    context: Arc<RemotePagePerfContext>,
+    stage: RemotePageStage,
+    started: Instant,
+    lease: Option<RemotePageStageLease<'static>>,
+    wait_ms: f64,
+    metrics: RemotePageStageMetrics,
+    outcome: &'static str,
+}
+
+impl RemotePageStageGuard {
+    fn add_lock_wait(&mut self, started: Instant) {
+        self.add_lock_wait_ms(started.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    fn add_lock_wait_ms(&mut self, wait_ms: f64) {
+        self.wait_ms += wait_ms;
+    }
+
+    fn finish(&mut self, metrics: RemotePageStageMetrics) {
+        self.finish_with_outcome(metrics, "ok");
+    }
+
+    fn finish_with_outcome(&mut self, metrics: RemotePageStageMetrics, outcome: &'static str) {
+        self.metrics = metrics;
+        self.outcome = outcome;
+    }
+}
+
+impl Drop for RemotePageStageGuard {
+    fn drop(&mut self) {
+        let ms = self.started.elapsed().as_secs_f64() * 1000.0;
+        let concurrency = self
+            .lease
+            .as_ref()
+            .map(|lease| lease.concurrency)
+            .unwrap_or(remote_page_concurrency_on_enter(0));
+        drop(self.lease.take());
+        let mut extras = vec![
+            ("stage", serde_json::Value::from(self.stage.name())),
+            ("ms", serde_json::Value::from(ms)),
+            ("wait_ms", serde_json::Value::from(self.wait_ms)),
+            (
+                "active_others",
+                serde_json::Value::from(concurrency.active_others),
+            ),
+            (
+                "active_total",
+                serde_json::Value::from(concurrency.active_total),
+            ),
+            ("pixels", serde_json::Value::from(self.metrics.pixels)),
+            ("bytes", serde_json::Value::from(self.metrics.bytes)),
+            (
+                "output_pixels",
+                serde_json::Value::from(self.metrics.output_pixels),
+            ),
+            (
+                "output_bytes",
+                serde_json::Value::from(self.metrics.output_bytes),
+            ),
+            ("outcome", serde_json::Value::from(self.outcome)),
+            (
+                "source_kind",
+                serde_json::Value::from(self.context.source_kind),
+            ),
+            ("priority", serde_json::Value::from(self.context.priority)),
+            (
+                "job_id",
+                serde_json::Value::from(self.context.job_id.clone()),
+            ),
+        ];
+        if let Some(display_request_id) = self.context.display_request_id.as_ref() {
+            extras.push((
+                "display_request_id",
+                serde_json::Value::from(display_request_id.clone()),
+            ));
+        }
+        crate::perf::event("remote_page", "stage", Some(&self.context.key), 0, &extras);
+    }
+}
+
+struct RemotePageLoadTiming {
+    perf: RemotePagePerf,
+    resolve: RemotePageStageGuard,
+}
+
+struct RemotePageEncodeTiming {
+    perf: RemotePagePerf,
+    trim: RemotePageStageGuard,
+}
+
+fn lock_with_remote_page_wait<'a, T>(
+    mutex: &'a Mutex<T>,
+    primary: Option<&mut RemotePageStageGuard>,
+    fallback: Option<&mut RemotePageStageGuard>,
+) -> MutexGuard<'a, T> {
+    let started = (primary.is_some() || fallback.is_some()).then(Instant::now);
+    let guard = mutex.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(started) = started {
+        if let Some(stage) = primary {
+            stage.add_lock_wait(started);
+        } else if let Some(stage) = fallback {
+            stage.add_lock_wait(started);
+        }
+    }
+    guard
+}
+
+fn remote_page_perf_key(address: &RemoteAddress) -> String {
+    match &address.subresource {
+        RemoteSubresource::File => address.path.clone(),
+        RemoteSubresource::ZipEntry { entry_name } => {
+            format!("{}::{entry_name}", address.path)
+        }
+        RemoteSubresource::ZipDirectory { prefix } => {
+            format!("{}::{prefix}", address.path)
+        }
+        RemoteSubresource::PdfPage { page_number } => {
+            crate::grid_item::pdf_page_perf_key(Path::new(&address.path), *page_number)
+        }
+    }
+}
+
 fn catalog_dims_are_landscape((width, height): (u32, u32)) -> bool {
     width > height
 }
@@ -41,6 +385,19 @@ fn encode_remote_page_jpeg(
     long_side: u32,
     view_trim_bbox: Option<egui::Rect>,
 ) -> Option<(Vec<u8>, u32, u32)> {
+    encode_remote_page_jpeg_timed(image, long_side, view_trim_bbox, None)
+}
+
+fn encode_remote_page_jpeg_timed(
+    image: &image::DynamicImage,
+    long_side: u32,
+    view_trim_bbox: Option<egui::Rect>,
+    timing: Option<RemotePageEncodeTiming>,
+) -> Option<(Vec<u8>, u32, u32)> {
+    let page_perf = timing.as_ref().map(|timing| timing.perf.clone());
+    let mut trim_stage = timing.map(|timing| timing.trim);
+    let trim_input =
+        RemotePageStageMetrics::buffer(image.width() as usize, image.height() as usize, 4);
     let cropped;
     let image = if let Some(bbox) = view_trim_bbox {
         let rect = crate::export_crop::CropRect {
@@ -56,17 +413,43 @@ fn encode_remote_page_jpeg(
     } else {
         image
     };
+    if let Some(stage) = trim_stage.as_mut() {
+        stage.finish(trim_input.with_output(image.width() as usize, image.height() as usize, 4));
+    }
+    drop(trim_stage);
+    let mut resize_stage = page_perf
+        .as_ref()
+        .and_then(|perf| perf.enter(RemotePageStage::Resize));
+    let resize_input =
+        RemotePageStageMetrics::buffer(image.width() as usize, image.height() as usize, 4);
     let resized = crate::fast_resize::resize_dynamic_fit(
         image,
         long_side,
         long_side,
         crate::fast_resize::Quality::Lanczos3,
     );
+    if let Some(stage) = resize_stage.as_mut() {
+        stage.finish(resize_input.with_output(
+            resized.width() as usize,
+            resized.height() as usize,
+            4,
+        ));
+    }
+    drop(resize_stage);
+    let mut jpeg_stage = page_perf
+        .as_ref()
+        .and_then(|perf| perf.enter(RemotePageStage::Jpeg));
     let rgb = resized.to_rgb8();
     let (width, height) = (rgb.width(), rgb.height());
     let bytes =
         turbojpeg::compress_image(&rgb, PAGE_JPEG_QUALITY, turbojpeg::Subsamp::Sub2x2).ok()?;
-    Some((bytes.to_vec(), width, height))
+    let bytes = bytes.to_vec();
+    if let Some(stage) = jpeg_stage.as_mut() {
+        let mut metrics = RemotePageStageMetrics::buffer(width as usize, height as usize, 3);
+        metrics.output_bytes = bytes.len() as u64;
+        stage.finish(metrics);
+    }
+    Some((bytes, width, height))
 }
 
 fn harmonized_remote_auto_bbox(
@@ -778,18 +1161,23 @@ impl ContainerEngine {
         match &self.adjustment_settings {
             AdjustmentSettingsSource::Live => {
                 crate::settings_db::with_db_result(|db| db.load_adjustment_render_settings())
-                    .map_err(|error| {
-                        crate::logger::log(format!(
-                            "remote_ipc: live adjustment settings read failed: {error}"
-                        ));
-                        media_error(
-                            MediaErrorCode::Internal,
-                            "最新の補正設定を読み込めませんでした",
-                        )
-                    })
+                    .map_err(remote_adjustment_settings_error)
             }
             #[cfg(test)]
             AdjustmentSettingsSource::Snapshot(settings) => Ok(settings.clone()),
+        }
+    }
+
+    fn adjustment_render_settings_timed(
+        &self,
+    ) -> Result<(crate::settings_db::AdjustmentRenderSettings, f64), MediaError> {
+        match &self.adjustment_settings {
+            AdjustmentSettingsSource::Live => crate::settings_db::with_db_result(|db| {
+                db.load_adjustment_render_settings_with_lock_wait(true)
+            })
+            .map_err(remote_adjustment_settings_error),
+            #[cfg(test)]
+            AdjustmentSettingsSource::Snapshot(settings) => Ok((settings.clone(), 0.0)),
         }
     }
 
@@ -985,6 +1373,32 @@ impl ContainerEngine {
         preview: Option<&mimageviewer_ipc::RemoteAdjustmentPreview>,
         context: &WorkerContext,
     ) -> Result<Option<RemotePreparedComposite>, MediaError> {
+        self.prepare_remote_composite_timed(
+            address,
+            logical_path,
+            mtime,
+            file_size,
+            target_px,
+            preview,
+            context,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_remote_composite_timed(
+        &self,
+        address: &RemoteAddress,
+        logical_path: &Path,
+        mtime: i64,
+        file_size: i64,
+        target_px: u32,
+        preview: Option<&mimageviewer_ipc::RemoteAdjustmentPreview>,
+        context: &WorkerContext,
+        primary: Option<&mut RemotePageStageGuard>,
+        fallback: Option<&mut RemotePageStageGuard>,
+    ) -> Result<Option<RemotePreparedComposite>, MediaError> {
         let Some(mut identity) = remote_adjustment_identity(address, logical_path) else {
             return Ok(None);
         };
@@ -992,7 +1406,17 @@ impl ContainerEngine {
             && logical_path.parent().is_some_and(|parent| {
                 crate::books::is_direct_book_folder(&self.settings.books_root_path(), parent)
             });
-        let settings = self.adjustment_render_settings()?;
+        let measure_lock_wait = primary.is_some() || fallback.is_some();
+        let (settings, settings_lock_wait_ms) = if measure_lock_wait {
+            self.adjustment_render_settings_timed()?
+        } else {
+            (self.adjustment_render_settings()?, 0.0)
+        };
+        if let Some(stage) = primary {
+            stage.add_lock_wait_ms(settings_lock_wait_ms);
+        } else if let Some(stage) = fallback {
+            stage.add_lock_wait_ms(settings_lock_wait_ms);
+        }
         let edits = self.prepare_remote_edits(&identity.page_key, &settings, context)?;
         // `WorkerContext` は worker 起動時に 1 度だけ DB を開く。その 1 回が失敗した状態を
         // そのまま合成失敗にすると、一過性の失敗でも **その worker を通る全ページ**が
@@ -1073,12 +1497,19 @@ impl ContainerEngine {
         &self,
         entry: Option<&crate::creative_lut::CreativeLutEntry>,
     ) -> Result<Option<crate::creative_lut::SharedCreativeLut>, MediaError> {
+        self.resolve_remote_lut_timed(entry, None, None)
+    }
+
+    fn resolve_remote_lut_timed(
+        &self,
+        entry: Option<&crate::creative_lut::CreativeLutEntry>,
+        primary: Option<&mut RemotePageStageGuard>,
+        fallback: Option<&mut RemotePageStageGuard>,
+    ) -> Result<Option<crate::creative_lut::SharedCreativeLut>, MediaError> {
         let Some(entry) = entry else {
             return Ok(None);
         };
-        self.creative_lut_cache
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+        lock_with_remote_page_wait(&self.creative_lut_cache, primary, fallback)
             .resolve(entry)
             .map(Some)
             .map_err(|error| {
@@ -2097,6 +2528,9 @@ impl ContainerEngine {
         let started = Instant::now();
         let source_kind = media_source_kind(&request.address);
         let priority = request.priority;
+        let page_perf = RemotePagePerf::new(&request, source_kind);
+        let mut total_stage = page_perf.enter(RemotePageStage::Total);
+        let mut resolve_stage = page_perf.enter(RemotePageStage::Resolve);
         if cancel.load(Ordering::Acquire) {
             return cancelled_page_error();
         }
@@ -2118,10 +2552,11 @@ impl ContainerEngine {
             Ok(resolved) => resolved,
             Err(error) => return PageResponse::Error(error),
         };
-        let view_trim_plan = match self.remote_view_trim_plan(
+        let view_trim_plan = match self.remote_view_trim_plan_timed(
             &request.address,
             &resolved,
             request.render_context.as_ref(),
+            resolve_stage.as_mut(),
         ) {
             Ok(plan) => plan,
             Err(error) => return PageResponse::Error(error),
@@ -2131,7 +2566,11 @@ impl ContainerEngine {
         } else {
             RemoteImageLoadKind::CompositedPage
         };
-        let response = match self.load_image(
+        let load_timing = resolve_stage.take().map(|resolve| RemotePageLoadTiming {
+            perf: page_perf.clone(),
+            resolve,
+        });
+        let response = match self.load_image_timed(
             &request.address,
             &resolved,
             request.target_px,
@@ -2140,33 +2579,47 @@ impl ContainerEngine {
             context,
             Some(&cancel),
             request.adjustment_preview.as_ref(),
+            load_timing,
+            None,
         ) {
-            Ok(loaded) => match self.complete_remote_view_trim_bbox(
-                &view_trim_plan,
-                loaded.auto_trim_bbox,
-                request.target_px,
-                priority == PagePriority::Foreground,
-                context,
-                &cancel,
-            ) {
-                Ok(view_trim_bbox) => {
-                    match encode_remote_page_jpeg(&loaded.image, request.target_px, view_trim_bbox)
-                    {
-                        Some((bytes, width, height)) => PageResponse::Success(PagePayload {
-                            bytes,
-                            content_type: "image/jpeg".to_owned(),
-                            width,
-                            height,
-                            identity: loaded.identity.clone(),
-                        }),
-                        None => PageResponse::Error(media_error(
-                            MediaErrorCode::RenderFailed,
-                            "JPEG エンコードに失敗しました",
-                        )),
+            Ok(loaded) => {
+                let mut trim_stage = page_perf.enter(RemotePageStage::Trim);
+                match self.complete_remote_view_trim_bbox_timed(
+                    &view_trim_plan,
+                    loaded.auto_trim_bbox,
+                    request.target_px,
+                    priority == PagePriority::Foreground,
+                    context,
+                    &cancel,
+                    trim_stage.as_mut(),
+                ) {
+                    Ok(view_trim_bbox) => {
+                        let encode_timing = trim_stage.take().map(|trim| RemotePageEncodeTiming {
+                            perf: page_perf.clone(),
+                            trim,
+                        });
+                        match encode_remote_page_jpeg_timed(
+                            &loaded.image,
+                            request.target_px,
+                            view_trim_bbox,
+                            encode_timing,
+                        ) {
+                            Some((bytes, width, height)) => PageResponse::Success(PagePayload {
+                                bytes,
+                                content_type: "image/jpeg".to_owned(),
+                                width,
+                                height,
+                                identity: loaded.identity.clone(),
+                            }),
+                            None => PageResponse::Error(media_error(
+                                MediaErrorCode::RenderFailed,
+                                "JPEG エンコードに失敗しました",
+                            )),
+                        }
                     }
+                    Err(error) => PageResponse::Error(error),
                 }
-                Err(error) => PageResponse::Error(error),
-            },
+            }
             Err(error) => PageResponse::Error(error),
         };
         let response = if cancel.load(Ordering::Acquire) {
@@ -2178,6 +2631,21 @@ impl ContainerEngine {
             PageResponse::Success(payload) => ("ok", payload.bytes.len()),
             PageResponse::Error(_) => ("error", 0),
         };
+        if let Some(stage) = total_stage.as_mut() {
+            let metrics = match &response {
+                PageResponse::Success(payload) => {
+                    let pixels = u64::from(payload.width).saturating_mul(u64::from(payload.height));
+                    RemotePageStageMetrics {
+                        pixels,
+                        bytes: payload.bytes.len() as u64,
+                        output_pixels: pixels,
+                        output_bytes: payload.bytes.len() as u64,
+                    }
+                }
+                PageResponse::Error(_) => RemotePageStageMetrics::default(),
+            };
+            stage.finish_with_outcome(metrics, outcome);
+        }
         crate::logger::log(format!(
             "remote_ipc: media_operation operation=page source_kind={source_kind} priority={} outcome={outcome} duration_ms={:.1} output_bytes={output_bytes}",
             if priority == PagePriority::Prefetch {
@@ -3171,16 +3639,23 @@ impl ContainerEngine {
         resolved: &ResolvedPath,
         render_context: Option<&RemotePageRenderContext>,
     ) -> Result<RemoteViewTrimPlan, MediaError> {
+        self.remote_view_trim_plan_timed(page_address, resolved, render_context, None)
+    }
+
+    fn remote_view_trim_plan_timed(
+        &self,
+        page_address: &RemoteAddress,
+        resolved: &ResolvedPath,
+        render_context: Option<&RemotePageRenderContext>,
+        wait_stage: Option<&mut RemotePageStageGuard>,
+    ) -> Result<RemoteViewTrimPlan, MediaError> {
         let keys = self.remote_view_trim_keys(page_address, resolved, render_context)?;
         let page_key = crate::edit_source::page_key_for_remote(
             &resolved.logical,
             &page_address.subresource,
         )
         .ok_or_else(|| media_error(MediaErrorCode::BadRequest, "表示トリム対象が不正です"))?;
-        let db = self
-            .view_trim_db
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let db = lock_with_remote_page_wait(&self.view_trim_db, wait_stage, None);
         let state = db
             .as_ref()
             .and_then(|db| db.get_book_state(&keys.exact))
@@ -3244,6 +3719,28 @@ impl ContainerEngine {
         context: &WorkerContext,
         cancel: &Arc<AtomicBool>,
     ) -> Result<Option<egui::Rect>, MediaError> {
+        self.complete_remote_view_trim_bbox_timed(
+            plan,
+            current_auto_trim_bbox,
+            target_px,
+            foreground,
+            context,
+            cancel,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn complete_remote_view_trim_bbox_timed(
+        &self,
+        plan: &RemoteViewTrimPlan,
+        current_auto_trim_bbox: Option<egui::Rect>,
+        target_px: u32,
+        foreground: bool,
+        context: &WorkerContext,
+        cancel: &Arc<AtomicBool>,
+        mut wait_stage: Option<&mut RemotePageStageGuard>,
+    ) -> Result<Option<egui::Rect>, MediaError> {
         match plan {
             RemoteViewTrimPlan::Stored(bbox) => Ok(*bbox),
             RemoteViewTrimPlan::AutoSingle => Ok(current_auto_trim_bbox),
@@ -3251,13 +3748,14 @@ impl ContainerEngine {
                 // 相手 request を待たない。heavy worker が 1 本でも進められるよう、cache miss
                 // なら現在の worker が同じ cancel token で相手 raw raster を解決する。
                 let partner_resolved = self.resolve(partner)?;
-                let partner_auto_trim_bbox = self.remote_auto_trim_bbox(
+                let partner_auto_trim_bbox = self.remote_auto_trim_bbox_timed(
                     partner,
                     &partner_resolved,
                     target_px,
                     foreground,
                     context,
                     cancel,
+                    wait_stage.as_deref_mut(),
                 )?;
                 Ok(harmonized_remote_auto_bbox(
                     *side,
@@ -3276,6 +3774,22 @@ impl ContainerEngine {
         foreground: bool,
         context: &WorkerContext,
         cancel: &Arc<AtomicBool>,
+    ) -> Result<Option<egui::Rect>, MediaError> {
+        self.remote_auto_trim_bbox_timed(
+            address, resolved, target_px, foreground, context, cancel, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn remote_auto_trim_bbox_timed(
+        &self,
+        address: &RemoteAddress,
+        resolved: &ResolvedPath,
+        target_px: u32,
+        foreground: bool,
+        context: &WorkerContext,
+        cancel: &Arc<AtomicBool>,
+        mut wait_stage: Option<&mut RemotePageStageGuard>,
     ) -> Result<Option<egui::Rect>, MediaError> {
         if cancel.load(Ordering::Relaxed) {
             return Err(media_error(
@@ -3298,15 +3812,13 @@ impl ContainerEngine {
             i64::try_from(metadata.len()).unwrap_or(i64::MAX),
             target_px,
         )?;
-        if let Some(bbox) = self
-            .auto_trim_bbox_cache
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(&key)
+        if let Some(bbox) =
+            lock_with_remote_page_wait(&self.auto_trim_bbox_cache, wait_stage.as_deref_mut(), None)
+                .get(&key)
         {
             return Ok(bbox);
         }
-        self.load_image(
+        self.load_image_timed(
             address,
             resolved,
             target_px,
@@ -3315,6 +3827,8 @@ impl ContainerEngine {
             context,
             Some(cancel),
             None,
+            None,
+            wait_stage,
         )
         .map(|loaded| loaded.auto_trim_bbox)
     }
@@ -3443,9 +3957,38 @@ impl ContainerEngine {
         external_cancel: Option<&Arc<AtomicBool>>,
         adjustment_preview: Option<&mimageviewer_ipc::RemoteAdjustmentPreview>,
     ) -> Result<LoadedImage, MediaError> {
+        self.load_image_timed(
+            address,
+            resolved,
+            target_px,
+            load_kind,
+            foreground,
+            context,
+            external_cancel,
+            adjustment_preview,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_image_timed(
+        &self,
+        address: &RemoteAddress,
+        resolved: &ResolvedPath,
+        target_px: u32,
+        load_kind: RemoteImageLoadKind,
+        foreground: bool,
+        context: &WorkerContext,
+        external_cancel: Option<&Arc<AtomicBool>>,
+        adjustment_preview: Option<&mimageviewer_ipc::RemoteAdjustmentPreview>,
+        mut page_timing: Option<RemotePageLoadTiming>,
+        mut ambient_wait_stage: Option<&mut RemotePageStageGuard>,
+    ) -> Result<LoadedImage, MediaError> {
         let full_page = load_kind.full_page();
         let compose_full_page = load_kind.composes_page();
         let detect_auto_trim = load_kind.detects_auto_trim();
+        let page_perf = page_timing.as_ref().map(|timing| timing.perf.clone());
         if target_px == 0 || target_px > MAX_PAGE_RENDER_PX {
             return Err(media_error(
                 MediaErrorCode::BadRequest,
@@ -3484,7 +4027,13 @@ impl ContainerEngine {
                 })?
             }
             RemoteSubresource::File if is_pdf_path(&resolved.logical) => {
-                self.ensure_pdf_page_in_range(resolved, &metadata, 0)?;
+                self.ensure_pdf_page_in_range_timed(
+                    resolved,
+                    &metadata,
+                    0,
+                    page_timing.as_mut().map(|timing| &mut timing.resolve),
+                    ambient_wait_stage.as_deref_mut(),
+                )?;
                 request.pdf_page = Some(0);
                 request.pdf_password = self.pdf_passwords.get(&resolved.logical);
                 request.cache_key_override = Some(container_thumb_key(
@@ -3506,7 +4055,13 @@ impl ContainerEngine {
                 &resolved.logical
             }
             RemoteSubresource::PdfPage { page_number } if is_pdf_path(&resolved.logical) => {
-                self.ensure_pdf_page_in_range(resolved, &metadata, *page_number)?;
+                self.ensure_pdf_page_in_range_timed(
+                    resolved,
+                    &metadata,
+                    *page_number,
+                    page_timing.as_mut().map(|timing| &mut timing.resolve),
+                    ambient_wait_stage.as_deref_mut(),
+                )?;
                 request.pdf_page = Some(*page_number);
                 request.pdf_password = self.pdf_passwords.get(&resolved.logical);
                 &resolved.logical
@@ -3535,7 +4090,7 @@ impl ContainerEngine {
             super::path_guard::page_identity_from_resolved(resolved, &address.subresource);
 
         let prepared_composite = if compose_full_page {
-            self.prepare_remote_composite(
+            self.prepare_remote_composite_timed(
                 address,
                 &resolved.logical,
                 mtime,
@@ -3543,6 +4098,8 @@ impl ContainerEngine {
                 target_px,
                 adjustment_preview,
                 context,
+                page_timing.as_mut().map(|timing| &mut timing.resolve),
+                ambient_wait_stage.as_deref_mut(),
             )?
         } else {
             None
@@ -3555,18 +4112,21 @@ impl ContainerEngine {
             None
         };
         let cached_auto_trim_bbox = auto_trim_key.as_ref().and_then(|key| {
-            self.auto_trim_bbox_cache
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .get(key)
+            lock_with_remote_page_wait(
+                &self.auto_trim_bbox_cache,
+                page_timing.as_mut().map(|timing| &mut timing.resolve),
+                ambient_wait_stage.as_deref_mut(),
+            )
+            .get(key)
         });
         let mut cached_composite_pixels = None;
         if let Some(prepared) = prepared_composite.as_ref()
-            && let Some(pixels) = self
-                .page_composite_cache
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .get(&prepared.key)
+            && let Some(pixels) = lock_with_remote_page_wait(
+                &self.page_composite_cache,
+                page_timing.as_mut().map(|timing| &mut timing.resolve),
+                ambient_wait_stage.as_deref_mut(),
+            )
+            .get(&prepared.key)
         {
             if external_cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
                 return Err(media_error(
@@ -3579,6 +4139,14 @@ impl ContainerEngine {
                 prepared.key.page_key
             ));
             if !detect_auto_trim || cached_auto_trim_bbox.is_some() {
+                if let Some(mut timing) = page_timing.take() {
+                    timing.resolve.finish(remote_page_file_metrics(file_size));
+                }
+                if let Some(perf) = page_perf.as_ref() {
+                    let metrics = RemotePageStageMetrics::buffer(pixels.size[0], pixels.size[1], 4);
+                    perf.record_skipped(RemotePageStage::Source, metrics, "composite_cache_hit");
+                    perf.record_skipped(RemotePageStage::Compose, metrics, "composite_cache_hit");
+                }
                 return loaded_image_from_color_image(
                     &pixels,
                     cached_auto_trim_bbox.flatten(),
@@ -3610,6 +4178,13 @@ impl ContainerEngine {
         {
             map.insert(key.into_owned(), entry);
         }
+
+        if let Some(mut timing) = page_timing.take() {
+            timing.resolve.finish(remote_page_file_metrics(file_size));
+        }
+        let mut source_stage = page_perf
+            .as_ref()
+            .and_then(|perf| perf.enter(RemotePageStage::Source));
 
         let (tx, rx) = mpsc::channel();
         let done = Arc::new(AtomicUsize::new(0));
@@ -3666,6 +4241,17 @@ impl ContainerEngine {
                     )
                 }
             })?;
+        if let Some(stage) = source_stage.as_mut() {
+            stage.finish(RemotePageStageMetrics::buffer(
+                color_image.size[0],
+                color_image.size[1],
+                4,
+            ));
+        }
+        drop(source_stage);
+        let mut compose_stage = page_perf
+            .as_ref()
+            .and_then(|perf| perf.enter(RemotePageStage::Compose));
         let requires_stored_edit_space = prepared_composite.as_ref().is_some_and(|prepared| {
             !prepared.edits.comic.is_empty() || prepared.edits.export_crop.is_some()
         });
@@ -3732,17 +4318,27 @@ impl ContainerEngine {
                     crate::margin_fit::DEFAULT_TOLERANCE,
                 );
                 if let Some(key) = auto_trim_key {
-                    self.auto_trim_bbox_cache
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .insert(key, bbox);
+                    lock_with_remote_page_wait(
+                        &self.auto_trim_bbox_cache,
+                        compose_stage.as_mut(),
+                        ambient_wait_stage.as_deref_mut(),
+                    )
+                    .insert(key, bbox);
                 }
                 bbox
             }
             None => None,
         };
         if let Some(pixels) = cached_composite_pixels {
-            return loaded_image_from_color_image(&pixels, auto_trim_bbox, identity);
+            let result = loaded_image_from_color_image(&pixels, auto_trim_bbox, identity);
+            if let Some(stage) = compose_stage.as_mut() {
+                stage.finish(RemotePageStageMetrics::buffer(
+                    pixels.size[0],
+                    pixels.size[1],
+                    4,
+                ));
+            }
+            return result;
         }
         let mut pixels = Arc::new(color_image);
         if let Some(prepared) = prepared_composite {
@@ -3757,7 +4353,11 @@ impl ContainerEngine {
                 materialized.timing.conceal_ms,
                 materialized.used_diffusion_fallback,
             ));
-            let lut = self.resolve_remote_lut(prepared.lut_entry.as_ref())?;
+            let lut = self.resolve_remote_lut_timed(
+                prepared.lut_entry.as_ref(),
+                compose_stage.as_mut(),
+                ambient_wait_stage.as_deref_mut(),
+            )?;
             pixels = execute_remote_composite(pixels, &prepared.params, lut, &cancel)?;
             if let Some(stored_edit_space) = stored_edit_space {
                 if !materialized.comic.is_empty()
@@ -3768,10 +4368,11 @@ impl ContainerEngine {
                         &pixels,
                         &materialized.comic,
                         &fonts,
-                        &mut self
-                            .comic_stamp_cache
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner()),
+                        &mut lock_with_remote_page_wait(
+                            &self.comic_stamp_cache,
+                            compose_stage.as_mut(),
+                            ambient_wait_stage.as_deref_mut(),
+                        ),
                         &cancel,
                     );
                 }
@@ -3785,16 +4386,28 @@ impl ContainerEngine {
                             "ページの切り取り結果を作成できませんでした",
                         )
                     })?;
-            self.page_composite_cache
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .insert(prepared.key.clone(), Arc::clone(&pixels));
+            lock_with_remote_page_wait(
+                &self.page_composite_cache,
+                compose_stage.as_mut(),
+                ambient_wait_stage.as_deref_mut(),
+            )
+            .insert(prepared.key.clone(), Arc::clone(&pixels));
             crate::logger::log(format!(
                 "remote_ipc: final_composite cache=miss key={}",
                 prepared.key.page_key
             ));
         }
-        loaded_image_from_color_image(&pixels, auto_trim_bbox, identity)
+        let result = loaded_image_from_color_image(&pixels, auto_trim_bbox, identity);
+        if result.is_ok()
+            && let Some(stage) = compose_stage.as_mut()
+        {
+            stage.finish(RemotePageStageMetrics::buffer(
+                pixels.size[0],
+                pixels.size[1],
+                4,
+            ));
+        }
+        result
     }
 
     fn ensure_pdf_page_in_range(
@@ -3803,7 +4416,21 @@ impl ContainerEngine {
         metadata: &std::fs::Metadata,
         page_number: u32,
     ) -> Result<(), MediaError> {
-        validate_page_number(page_number, self.pdf_page_count(resolved, metadata)?)
+        self.ensure_pdf_page_in_range_timed(resolved, metadata, page_number, None, None)
+    }
+
+    fn ensure_pdf_page_in_range_timed(
+        &self,
+        resolved: &ResolvedPath,
+        metadata: &std::fs::Metadata,
+        page_number: u32,
+        primary: Option<&mut RemotePageStageGuard>,
+        fallback: Option<&mut RemotePageStageGuard>,
+    ) -> Result<(), MediaError> {
+        validate_page_number(
+            page_number,
+            self.pdf_page_count_timed(resolved, metadata, primary, fallback)?,
+        )
     }
 
     /// 本体の PDF 一覧と同じ `pdf_meta` を先に引き、miss 時だけ PDFium で列挙する。
@@ -3814,17 +4441,28 @@ impl ContainerEngine {
         resolved: &ResolvedPath,
         metadata: &std::fs::Metadata,
     ) -> Result<u32, MediaError> {
+        self.pdf_page_count_timed(resolved, metadata, None, None)
+    }
+
+    fn pdf_page_count_timed(
+        &self,
+        resolved: &ResolvedPath,
+        metadata: &std::fs::Metadata,
+        mut primary: Option<&mut RemotePageStageGuard>,
+        mut fallback: Option<&mut RemotePageStageGuard>,
+    ) -> Result<u32, MediaError> {
         let identity = PdfIdentity {
             path: resolved.canonical.clone(),
             mtime: crate::ui_helpers::mtime_secs(metadata),
             file_size: metadata.len(),
         };
-        let cached = self
-            .pdf_page_counts
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(&identity)
-            .copied();
+        let cached = lock_with_remote_page_wait(
+            &self.pdf_page_counts,
+            primary.as_deref_mut(),
+            fallback.as_deref_mut(),
+        )
+        .get(&identity)
+        .copied();
         let count = match cached {
             Some(count) => count,
             None => {
@@ -3889,10 +4527,12 @@ impl ContainerEngine {
                         count
                     }
                 };
-                self.pdf_page_counts
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .insert(identity, count);
+                lock_with_remote_page_wait(
+                    &self.pdf_page_counts,
+                    primary.as_deref_mut(),
+                    fallback.as_deref_mut(),
+                )
+                .insert(identity, count);
                 count
             }
         };
@@ -4350,6 +4990,16 @@ fn remote_adjustment_read_error(scope: &str, error: String) -> MediaError {
     )
 }
 
+fn remote_adjustment_settings_error(error: crate::settings_db::SettingsDbError) -> MediaError {
+    crate::logger::log(format!(
+        "remote_ipc: live adjustment settings read failed: {error}"
+    ));
+    media_error(
+        MediaErrorCode::Internal,
+        "最新の補正設定を読み込めませんでした",
+    )
+}
+
 fn validated_context(
     page_index: usize,
     page_count: usize,
@@ -4719,6 +5369,60 @@ mod tests {
     use super::*;
     use crate::settings::FavoriteEntry;
     use std::io::{Cursor, Write};
+
+    #[test]
+    fn remote_page_stage_split_is_stable() {
+        assert_eq!(
+            RemotePageStage::ORDERED.map(RemotePageStage::name),
+            [
+                "resolve", "source", "compose", "trim", "resize", "jpeg", "total",
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_page_concurrency_transition_counts_other_requests() {
+        assert_eq!(
+            remote_page_concurrency_on_enter(0),
+            RemotePageConcurrency {
+                active_others: 0,
+                active_total: 1,
+            }
+        );
+        assert_eq!(
+            remote_page_concurrency_on_enter(2),
+            RemotePageConcurrency {
+                active_others: 2,
+                active_total: 3,
+            }
+        );
+        assert_eq!(remote_page_concurrency_on_exit(3), Some(2));
+        assert_eq!(remote_page_concurrency_on_exit(0), None);
+    }
+
+    fn cancel_after_remote_page_stage_enter(counter: &RemotePageStageCounter) -> Result<(), ()> {
+        let _lease = RemotePageStageLease::new(counter);
+        Err(())
+    }
+
+    #[test]
+    fn remote_page_stage_lease_releases_on_nested_drop_and_cancel_return() {
+        let counter = RemotePageStageCounter::new();
+        {
+            let first = RemotePageStageLease::new(&counter);
+            assert_eq!(first.concurrency.active_others, 0);
+            assert_eq!(counter.active(), 1);
+            {
+                let second = RemotePageStageLease::new(&counter);
+                assert_eq!(second.concurrency.active_others, 1);
+                assert_eq!(counter.active(), 2);
+            }
+            assert_eq!(counter.active(), 1);
+        }
+        assert_eq!(counter.active(), 0);
+        assert_eq!(cancel_after_remote_page_stage_enter(&counter), Err(()));
+        assert_eq!(counter.active(), 0);
+    }
 
     fn stored_edit_test_crop() -> crate::export_crop::CropSettings {
         crate::export_crop::CropSettings {

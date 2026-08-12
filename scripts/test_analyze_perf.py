@@ -16,14 +16,17 @@ from unittest import mock
 
 from analyze_perf import (
     analyze_page_turn,
+    analyze_remote_page,
     analyze_test_script_input,
     analyze_idle_health,
     cmd_colorize,
     cmd_idle_health,
     cmd_page_turn,
     cmd_pre_grid,
+    cmd_remote_page,
     load_events,
     main,
+    percentile,
 )
 
 
@@ -271,6 +274,73 @@ def page_turn_winit_probe(t: float, frame_number: int, count: int) -> dict:
         "winit_page_turn_repeat_count": count,
         "winit_page_turn_chords": f"Left={count}/{count}r",
     }
+
+
+def remote_page_stage(
+    stage: str,
+    ms: float,
+    others: int,
+    *,
+    pixels: int = 1_000_000,
+    wait_ms: float = 0.0,
+    outcome: str = "ok",
+) -> dict:
+    return {
+        "t": 1.0,
+        "cat": "remote_page",
+        "kind": "stage",
+        "stage": stage,
+        "ms": ms,
+        "wait_ms": wait_ms,
+        "active_others": others,
+        "active_total": others + 1,
+        "pixels": pixels,
+        "bytes": pixels * 4,
+        "outcome": outcome,
+    }
+
+
+class RemotePageReportTests(unittest.TestCase):
+    def test_percentile_uses_interpolated_median_and_p90(self) -> None:
+        self.assertEqual(percentile([100.0, 180.0], 0.5), 140.0)
+        self.assertEqual(percentile([100.0, 180.0], 0.9), 172.0)
+
+    def test_groups_successful_stages_by_concurrency_and_keeps_outcomes(self) -> None:
+        events = [
+            remote_page_stage("source", 100.0, 0, wait_ms=0.1),
+            remote_page_stage("source", 180.0, 1, wait_ms=12.0),
+            remote_page_stage(
+                "source", 0.01, 0, outcome="composite_cache_hit"
+            ),
+            remote_page_stage("jpeg", 40.0, 0, pixels=2_000_000),
+        ]
+
+        report = analyze_remote_page(events)
+
+        self.assertEqual(len(report["by_stage"]["source"]), 3)
+        self.assertEqual(len(report["by_stage_and_others"][("source", 1)]), 1)
+        self.assertEqual(report["outcomes"][("source", "ok")], 2)
+        self.assertEqual(
+            report["outcomes"][("source", "composite_cache_hit")], 1
+        )
+
+    def test_prints_pixel_cost_concurrency_and_lock_wait(self) -> None:
+        events = [
+            remote_page_stage("source", 100.0, 0, wait_ms=0.1),
+            remote_page_stage("source", 180.0, 1, wait_ms=12.0),
+            remote_page_stage("jpeg", 40.0, 0, pixels=2_000_000),
+        ]
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            cmd_remote_page(events)
+
+        output = stdout.getvalue()
+        self.assertIn("Remote page stages", output)
+        self.assertIn("ms/MP", output)
+        self.assertIn("Stage duration by active_others", output)
+        self.assertIn("source          1", output)
+        self.assertIn("Instrumented lock wait", output)
 
 
 class PageTurnTests(unittest.TestCase):

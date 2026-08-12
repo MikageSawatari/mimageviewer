@@ -2571,3 +2571,17 @@ object URL を revoke する。ready 要素も窓外では同様に解放する�
 `x_forwarded_for` は値を維持する。tailnet 内の `100.x.x.x` アドレスは氏名、メールアドレス、
 プロフィール画像とは性質が異なり、どの利用者端末から要求されたかを切り分けるために必要である。
 `remote_addr`、HTTPS 判定とその根拠も従来どおりとし、認証でのヘッダ利用可否には影響させない。
+### 14.21 リモート通常ページ生成の段別計測 (2026-08-12)
+
+高画質 8192、46.6 MP の 1 ページでは、remote-web から見た本体処理 `ipc_ms` の中央値が
+2398 ms、うち PDF worker の `pool_send` → `pool_recv` (`rtt_ms`) が 881 ms、
+`pool_dispatch.wait_ms` は中央値 0.1 ms だった。差分の本体内後処理は約 1517 ms (63%) である。
+先読み同時数を 2 → 3 に増やすと 1 本あたり 2016 → 2952 ms へ伸びた一方、供給は
+0.99 → 1.02 ページ/秒 (+2%) に留まった。
+
+`remote_page.stage` を resolve / source / compose / trim / resize / jpeg / total に分け、各段へ
+画素・byte、開始時の `active_others`、明示 mutex の `wait_ms` を記録する。Auto 見開き相手の
+raw 取得は現在ページの source 比較を崩さないため trim に分離する。`analyze_perf.py remote-page` で
+段別 p50 / p90 と ms/MP、同時本数別所要時間、lock wait を集計する。これにより、lock 待ちが
+増える直列化と、待ちはほぼ 0 だが実処理が伸びる CPU / メモリ帯域飽和を区別してから速度変更を決める。
+この増分は計測だけで、pool、並列上限、画質、先読み、表示 ownership は変更しない。

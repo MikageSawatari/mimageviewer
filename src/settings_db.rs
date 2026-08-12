@@ -579,7 +579,19 @@ impl SettingsDb {
     pub(crate) fn load_adjustment_render_settings(
         &self,
     ) -> Result<AdjustmentRenderSettings, SettingsDbError> {
+        self.load_adjustment_render_settings_with_lock_wait(false)
+            .map(|(settings, _)| settings)
+    }
+
+    pub(crate) fn load_adjustment_render_settings_with_lock_wait(
+        &self,
+        measure_lock_wait: bool,
+    ) -> Result<(AdjustmentRenderSettings, f64), SettingsDbError> {
+        let lock_started = measure_lock_wait.then(std::time::Instant::now);
         let inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
+        let lock_wait_ms = lock_started
+            .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
         let defaults = Settings::default();
         let upscale_skip_px = read_settings_kv_typed(&inner.conn, "ai_upscale_skip_px", || {
             defaults.ai_upscale_skip_px
@@ -626,42 +638,49 @@ impl SettingsDb {
             )?,
             blur_feather: read_settings_kv_typed(&inner.conn, "conceal_blur_feather", || false)?,
         };
-        Ok(AdjustmentRenderSettings {
-            favorites: read_favorites(&inner.conn)?,
-            global_preset: read_settings_kv_typed(
-                &inner.conn,
-                "global_preset",
-                crate::adjustment::AdjustParams::default,
-            )?,
-            creative_luts: read_settings_kv_typed(&inner.conn, "creative_luts", || {
-                crate::creative_lut::builtin_creative_lut_entries()
-            })?,
-            conceal_preset,
-            ai_feature_mode: read_settings_kv_typed(
-                &inner.conn,
-                "ai_feature_mode",
-                crate::settings::AiFeatureMode::default,
-            )?,
-            ai_upscale_limit: read_settings_kv_typed(&inner.conn, "ai_upscale_size_limit", || {
-                None
-            })?
-            .unwrap_or_else(|| crate::ai::upscale::AiProcessSizeLimit::square(upscale_skip_px)),
-            ai_denoise_limit: read_settings_kv_typed(&inner.conn, "ai_denoise_size_limit", || {
-                None
-            })?
-            .unwrap_or_else(|| crate::ai::upscale::AiProcessSizeLimit::square(denoise_skip_px)),
-            ai_backend: read_settings_kv_typed(&inner.conn, "ai_backend", || None)?,
-            retained_final_ai_cache_max_entries: read_settings_kv_typed(
-                &inner.conn,
-                "retained_final_ai_cache_max_entries",
-                || defaults.retained_final_ai_cache_max_entries,
-            )?,
-            retained_final_ai_cache_max_mib: read_settings_kv_typed(
-                &inner.conn,
-                "retained_final_ai_cache_max_mib",
-                || defaults.retained_final_ai_cache_max_mib,
-            )?,
-        })
+        Ok((
+            AdjustmentRenderSettings {
+                favorites: read_favorites(&inner.conn)?,
+                global_preset: read_settings_kv_typed(
+                    &inner.conn,
+                    "global_preset",
+                    crate::adjustment::AdjustParams::default,
+                )?,
+                creative_luts: read_settings_kv_typed(&inner.conn, "creative_luts", || {
+                    crate::creative_lut::builtin_creative_lut_entries()
+                })?,
+                conceal_preset,
+                ai_feature_mode: read_settings_kv_typed(
+                    &inner.conn,
+                    "ai_feature_mode",
+                    crate::settings::AiFeatureMode::default,
+                )?,
+                ai_upscale_limit: read_settings_kv_typed(
+                    &inner.conn,
+                    "ai_upscale_size_limit",
+                    || None,
+                )?
+                .unwrap_or_else(|| crate::ai::upscale::AiProcessSizeLimit::square(upscale_skip_px)),
+                ai_denoise_limit: read_settings_kv_typed(
+                    &inner.conn,
+                    "ai_denoise_size_limit",
+                    || None,
+                )?
+                .unwrap_or_else(|| crate::ai::upscale::AiProcessSizeLimit::square(denoise_skip_px)),
+                ai_backend: read_settings_kv_typed(&inner.conn, "ai_backend", || None)?,
+                retained_final_ai_cache_max_entries: read_settings_kv_typed(
+                    &inner.conn,
+                    "retained_final_ai_cache_max_entries",
+                    || defaults.retained_final_ai_cache_max_entries,
+                )?,
+                retained_final_ai_cache_max_mib: read_settings_kv_typed(
+                    &inner.conn,
+                    "retained_final_ai_cache_max_mib",
+                    || defaults.retained_final_ai_cache_max_mib,
+                )?,
+            },
+            lock_wait_ms,
+        ))
     }
 
     /// Read only the settings used to scan and materialize one physical-folder listing.

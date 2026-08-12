@@ -455,6 +455,35 @@ TTC/OTC face ごとの glyph coverage 判定、`ab_glyph` プレビュー生成�
 プレビューの `load_texture`、準備済み定義の `Context::set_fonts` だけ。縦位置 slider は
 150ms debounce し、連続ドラッグ中に大型 CJK font data の読み込み worker を増殖させない。
 
+### 7.5 mIV Remote ページ生成の段別計測
+
+`--perf-log` では通常ページ要求の生成経路を `cat=remote_page` / `kind=stage` として記録する。
+`stage` は `resolve / source / compose / trim / resize / jpeg / total` の順である。Auto 見開きの
+相手ページ取得は、現在ページの `source` と混ぜず `trim` に含める。相手の bbox 解決と raw raster
+取得を表示トリム固有コストとして分離し、PDF の現在ページ取得時間を `pdf.pool_recv.rtt_ms` と
+突き合わせられるようにするためである。
+
+各イベントは `ms`、`wait_ms`、`active_others`（開始時に同じ段を実行中だった他要求数）、
+`active_total`、`pixels / bytes`、`output_pixels / output_bytes`、`outcome`、source / priority、
+`job_id` と任意の `display_request_id` を持つ。`outcome=composite_cache_hit` の source / compose は
+実処理を省略した印で、所要時間集計から除外する。早期 return / cancel / error は RAII guard により
+`outcome=aborted` を残し、段の active counter も必ず減る。
+
+画素・byte の基準は、resolve が source file bytes（解像度確定前なので pixels=0）、source / compose /
+trim が RGBA、resize が入力 RGBA と出力 RGBA、jpeg が入力 RGB と出力 JPEG bytes、total が最終
+JPEG の画素数と bytes である。`wait_ms` は各段で明示的に取得する `ContainerEngine` の cache / DB
+handle mutex と、resolve 中の共有 `SettingsDb` inner mutex の待ち時間合計で、段の実行時間 `ms` とは
+別に読む。PDF worker queue の待ちは従来どおり
+`pdf.pool_dispatch.wait_ms` が正本であり、remote の `source.wait_ms` へ二重計上しない。
+
+```powershell
+python scripts/analyze_perf.py <perf_events.jsonl> remote-page
+```
+
+この集計は段ごとの p50 / p90、ms/MP、`active_others` 別の p50 / p90、lock wait の p50 / p90 / max
+を表示する。同時本数とともに `ms` が伸び、`wait_ms` も伸びる場合は lock 直列化を疑う。
+`wait_ms` がほぼ 0 のまま `ms` だけ伸びる場合は CPU またはメモリ帯域の競合を疑う。
+
 ---
 
 ## 7a. 既知の同期 I/O 残課題 (v0.8.2 以降で worker 化)

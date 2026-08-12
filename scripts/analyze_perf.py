@@ -20,6 +20,7 @@ mimageviewer パフォーマンスイベントログ (perf_events.jsonl) の解�
     dump <seq>          指定 seq に紐づく全イベントを時系列で列挙
     timeline [seq]      ガントチャート (matplotlib が必要)。seq 指定可
     thumbs              サムネイル decode 時間の分布 (priority=H/L 別)
+    remote-page         mIV Remote のページ生成を段・同時本数・lock 待ち別に集計
     colorize            カラー化 / final effect の段階別時間を解像度・方式別に集計
     nav                 Ctrl+↑↓ ナビの区間別 wall time (DFS / apply / load_folder /
                         start_loading_items / close_fullscreen) を集計
@@ -42,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -1186,6 +1188,155 @@ def cmd_thumbs(events: list[dict]) -> None:
         for cached in (True, False):
             label = f"priority={pri}  from_cache={cached}"
             stats(label, buckets.get((pri, cached), []))
+
+
+# -----------------------------------------------------------------------
+# remote-page
+# -----------------------------------------------------------------------
+
+REMOTE_PAGE_STAGE_ORDER = (
+    "resolve",
+    "source",
+    "compose",
+    "trim",
+    "resize",
+    "jpeg",
+    "total",
+)
+
+
+def percentile(values: list[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = max(0.0, min(float(len(ordered) - 1), (len(ordered) - 1) * quantile))
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def analyze_remote_page(events: list[dict]) -> dict:
+    rows = [
+        event
+        for event in events
+        if event.get("cat") == "remote_page" and event.get("kind") == "stage"
+    ]
+    by_stage: dict[str, list[dict]] = defaultdict(list)
+    by_stage_and_others: dict[tuple[str, int], list[dict]] = defaultdict(list)
+    outcomes: Counter = Counter()
+    for row in rows:
+        stage = str(row.get("stage", "unknown"))
+        others = int(row.get("active_others", 0))
+        by_stage[stage].append(row)
+        by_stage_and_others[(stage, others)].append(row)
+        outcomes[(stage, str(row.get("outcome", "unknown")))] += 1
+    return {
+        "rows": rows,
+        "by_stage": by_stage,
+        "by_stage_and_others": by_stage_and_others,
+        "outcomes": outcomes,
+    }
+
+
+def remote_page_stages(report: dict) -> list[str]:
+    known = [stage for stage in REMOTE_PAGE_STAGE_ORDER if stage in report["by_stage"]]
+    unknown = sorted(set(report["by_stage"]) - set(REMOTE_PAGE_STAGE_ORDER))
+    return known + unknown
+
+
+def remote_page_ok(rows: list[dict]) -> list[dict]:
+    return [row for row in rows if row.get("outcome") == "ok"]
+
+
+def fmt_stat(value: float | None) -> str:
+    return "-" if value is None else f"{value:.3f}"
+
+
+def cmd_remote_page(events: list[dict]) -> None:
+    report = analyze_remote_page(events)
+    if not report["rows"]:
+        print("(remote_page.stage イベント 0 件)")
+        return
+
+    print("Remote page stages (outcome=ok; ms/MP は各イベントの値を集計):")
+    print(
+        f"{'stage':<10} {'n':>5} {'p50 ms':>10} {'p90 ms':>10} "
+        f"{'p50 ms/MP':>12} {'p90 ms/MP':>12} {'wait p50':>10} {'wait p90':>10}"
+    )
+    print("-" * 88)
+    for stage in remote_page_stages(report):
+        rows = remote_page_ok(report["by_stage"][stage])
+        durations = [float(row.get("ms", 0.0)) for row in rows]
+        waits = [float(row.get("wait_ms", 0.0)) for row in rows]
+        per_mpixel = [
+            float(row.get("ms", 0.0)) * 1_000_000.0 / float(row["pixels"])
+            for row in rows
+            if float(row.get("pixels", 0.0)) > 0.0
+        ]
+        print(
+            f"{stage:<10} {len(rows):>5} "
+            f"{fmt_stat(percentile(durations, 0.5)):>10} "
+            f"{fmt_stat(percentile(durations, 0.9)):>10} "
+            f"{fmt_stat(percentile(per_mpixel, 0.5)):>12} "
+            f"{fmt_stat(percentile(per_mpixel, 0.9)):>12} "
+            f"{fmt_stat(percentile(waits, 0.5)):>10} "
+            f"{fmt_stat(percentile(waits, 0.9)):>10}"
+        )
+
+    print()
+    print("Stage outcomes:")
+    for stage in remote_page_stages(report):
+        counts = {
+            outcome: count
+            for (row_stage, outcome), count in report["outcomes"].items()
+            if row_stage == stage
+        }
+        values = " ".join(f"{outcome}={count}" for outcome, count in sorted(counts.items()))
+        print(f"  {stage:<10} {values}")
+
+    print()
+    print("Stage duration by active_others (outcome=ok):")
+    print(
+        f"{'stage':<10} {'others':>6} {'n':>5} {'p50 ms':>10} "
+        f"{'p90 ms':>10} {'wait p50':>10} {'wait p90':>10}"
+    )
+    print("-" * 70)
+    stage_rank = {stage: index for index, stage in enumerate(REMOTE_PAGE_STAGE_ORDER)}
+    buckets = sorted(
+        report["by_stage_and_others"].items(),
+        key=lambda item: (stage_rank.get(item[0][0], len(stage_rank)), item[0][0], item[0][1]),
+    )
+    for (stage, others), bucket_rows in buckets:
+        rows = remote_page_ok(bucket_rows)
+        if not rows:
+            continue
+        durations = [float(row.get("ms", 0.0)) for row in rows]
+        waits = [float(row.get("wait_ms", 0.0)) for row in rows]
+        print(
+            f"{stage:<10} {others:>6} {len(rows):>5} "
+            f"{fmt_stat(percentile(durations, 0.5)):>10} "
+            f"{fmt_stat(percentile(durations, 0.9)):>10} "
+            f"{fmt_stat(percentile(waits, 0.5)):>10} "
+            f"{fmt_stat(percentile(waits, 0.9)):>10}"
+        )
+
+    print()
+    print("Instrumented lock wait by stage (outcome=ok):")
+    print(f"{'stage':<10} {'n':>5} {'positive':>9} {'p50 ms':>10} {'p90 ms':>10} {'max ms':>10}")
+    print("-" * 61)
+    for stage in remote_page_stages(report):
+        rows = remote_page_ok(report["by_stage"][stage])
+        waits = [float(row.get("wait_ms", 0.0)) for row in rows]
+        positive = sum(wait > 0.001 for wait in waits)
+        print(
+            f"{stage:<10} {len(waits):>5} {positive:>9} "
+            f"{fmt_stat(percentile(waits, 0.5)):>10} "
+            f"{fmt_stat(percentile(waits, 0.9)):>10} "
+            f"{fmt_stat(max(waits) if waits else None):>10}"
+        )
 
 
 # -----------------------------------------------------------------------
@@ -2654,6 +2805,7 @@ def main() -> None:
     )
     subs.add_parser("priority")
     subs.add_parser("thumbs")
+    subs.add_parser("remote-page")
     subs.add_parser("colorize")
     subs.add_parser("nav")
     subs.add_parser("startup")
@@ -2731,6 +2883,8 @@ def main() -> None:
         cmd_priority(events)
     elif args.cmd == "thumbs":
         cmd_thumbs(events)
+    elif args.cmd == "remote-page":
+        cmd_remote_page(events)
     elif args.cmd == "colorize":
         cmd_colorize(events)
     elif args.cmd == "nav":
