@@ -51740,8 +51740,11 @@ impl App {
         // (上記 set_export_crop_for_idx と同じ理由でキャッシュ無効化しない。Codex P2)
     }
 
-    /// legacy crop が基準寸法を持たない場合、最初に使えるラスタ寸法を採用し、中央 DB と
-    /// sidecar mirror へ書き戻す。clamp 後に full rect になっても行は削除しない。
+    /// legacy crop が基準寸法を持たない場合、最初に使える**矩形が収まる**ラスタ寸法を採用し、
+    /// 中央 DB と sidecar mirror へ書き戻す。clamp 後に full rect になっても行は削除しない。
+    ///
+    /// 矩形がはみ出す寸法は採用を見送る (採用すると矩形が切り落とされ、書き戻した時点で
+    /// 元の選択領域が失われる)。見送った場合は legacy のまま返す。
     pub(crate) fn ensure_export_crop_source_size(
         &mut self,
         idx: usize,
@@ -51752,6 +51755,11 @@ impl App {
             return Some(settings);
         }
         let adopted = settings.with_legacy_source_size(fallback_size);
+        let Some([adopted_w, adopted_h]) = adopted.valid_source_size() else {
+            // 矩形が収まらないラスタは基準として採用しない (`with_legacy_source_size` 参照)。
+            // 書き戻さずに legacy のまま返し、表示側の clamp だけを従来どおり効かせる。
+            return Some(settings);
+        };
         if let Some(key) = self.page_path_key(idx) {
             if let Some(db) = &self.export_crop_db
                 && let Err(err) = db.set(&key, adopted)
@@ -51761,10 +51769,8 @@ impl App {
                 ));
             }
             self.with_sidecar_mut(idx, move |sc, rel| sc.set_export_crop(rel, adopted));
-            let [width, height] = adopted.valid_source_size().unwrap_or([1, 1]);
             crate::logger::log(format!(
-                "export_crop: adopted legacy source size idx={idx} size={}x{}",
-                width, height
+                "export_crop: adopted legacy source size idx={idx} size={adopted_w}x{adopted_h}"
             ));
         }
         self.export_crop_page_settings.insert(idx, adopted);

@@ -327,16 +327,33 @@ impl CropSettings {
     }
 
     /// legacy 設定へ最初の利用可能ラスタ寸法を採用する。既に有効な基準寸法があれば保つ。
+    ///
+    /// **矩形が収まらない寸法は採用しない。** 保存済みの矩形が `fallback_size` からはみ出す
+    /// なら、その寸法は矩形を作ったラスタではないと確定できる (作成時に必ず clamp される
+    /// ため)。ここで採用すると `sanitized` が矩形を切り落とし、それを永続化した時点で
+    /// 元の選択領域が復元不能になる。PDF は低解像度ラスタが先に届いてから 4 倍の再レンダが
+    /// 来るので、この順序は普通に起きる。採用を見送った設定は legacy のまま残り、次に
+    /// 十分な大きさのラスタが来たときに採用される。
     pub fn with_legacy_source_size(self, fallback_size: [usize; 2]) -> Self {
         if self.valid_source_size().is_some() {
             return self;
         }
         let fallback_size = valid_size_or_one(fallback_size);
+        if !self.rect_fits_within(fallback_size) {
+            return self;
+        }
         Self {
             rect: self.rect.sanitized(fallback_size[0], fallback_size[1]),
             aspect_mode: self.aspect_mode,
             source_size: Some(fallback_size),
         }
+    }
+
+    /// `rect` が `size` のラスタに収まるか (= その寸法が作成時の基準であり得るか)。
+    fn rect_fits_within(self, size: [usize; 2]) -> bool {
+        let [width, height] = valid_size_or_one(size);
+        // 作成時は `sanitized` を通っているので、基準ラスタなら 0.5px の丸め以内に収まる。
+        self.rect.max_x <= width as f32 + 0.5 && self.rect.max_y <= height as f32 + 0.5
     }
 
     pub fn valid_source_size(self) -> Option<[usize; 2]> {
@@ -905,6 +922,37 @@ mod tests {
             authored.rect,
             "switching between the observed 4x PDF rasters must preserve the selected region"
         );
+    }
+
+    #[test]
+    fn legacy_crop_does_not_adopt_a_raster_too_small_to_hold_it() {
+        // 実ログの PDF page 0 は 1135x1730 の低解像度ラスタが先に届き、その後 4540x6920 の
+        // 再レンダが来る。4540 基準で作られた legacy 矩形を先着の 1135 で採用してしまうと、
+        // clamp で選択領域が切り落とされ、書き戻した時点で復元できなくなる。
+        let legacy = CropSettings {
+            rect: CropRect {
+                min_x: 454.0,
+                min_y: 692.0,
+                max_x: 3_632.0,
+                max_y: 5_536.0,
+            },
+            aspect_mode: CropAspectMode::Free,
+            source_size: None,
+        };
+
+        let refused = legacy.with_legacy_source_size([1_135, 1_730]);
+        assert_eq!(
+            refused.source_size, None,
+            "a raster smaller than the stored rect cannot be the authoring basis"
+        );
+        assert_eq!(
+            refused.rect, legacy.rect,
+            "refusing adoption must leave the stored rect untouched"
+        );
+
+        let adopted = refused.with_legacy_source_size([4_540, 6_920]);
+        assert_eq!(adopted.source_size, Some([4_540, 6_920]));
+        assert_eq!(adopted.rect, legacy.rect);
     }
 
     #[test]
