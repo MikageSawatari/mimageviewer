@@ -436,7 +436,9 @@ telemetry には `input_source` (`touch` / `mouse` / `keyboard`) と入力の詳
   `C:\foobar` の取り違えが起きない)。`..` / 絶対パス / ドライブ相対 / UNC を拒否し、
   junction による脱出のテストもある
 - **認証**: `subtle` による定数時間比較 (長さ比較も定数時間)。**ルーティングより前**に
-  認証しており fail-closed。全応答に `X-Content-Type-Options` / `Referrer-Policy` が付く
+  認証しており fail-closed。早期終了を含む全応答の送信直前に `X-Content-Type-Options` /
+  `Referrer-Policy` / `Content-Security-Policy: frame-ancestors 'none'` /
+  `X-Frame-Options: DENY` を 1 回だけ付け、別ページからの frame 埋め込みを拒否する
 - **静的配信**: URL → ファイル名は完全一致テーブルで、クライアントが与えた文字列を
   ファイル名に使っていない。静的配信側からの traversal は成立しない
 - **read-only**: `SQLITE_OPEN_READ_ONLY` + `PRAGMA query_only=ON`。書き込みが拒否される

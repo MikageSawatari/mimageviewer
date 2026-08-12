@@ -491,11 +491,10 @@ pub fn handle(mut request: Request, state: &Arc<AppState>) {
         .as_millis();
     let method = request.method().to_string();
     let raw_url = request.url().to_owned();
+    let path = split_url(&raw_url).0;
+    let video_route = path.starts_with("/api/video/") || path.starts_with("/stream/");
     let proxy_details = request_proxy_details(&request);
-    let mut response = route(&mut request, state);
-    response
-        .headers
-        .push(("X-mIV-Request-Id", request_id.to_string()));
+    let mut response = finalize_response(route(&mut request, state), video_route, request_id);
     let status = response.status;
     let response_bytes = response.body.len();
     let mut details = response.log_details.take().unwrap_or_else(|| json!({}));
@@ -519,10 +518,23 @@ pub fn handle(mut request: Request, state: &Arc<AppState>) {
     }
 }
 
+fn finalize_response(response: HttpResponse, video_route: bool, request_id: u64) -> HttpResponse {
+    let response = if video_route {
+        response.with_body_error_code_log()
+    } else {
+        response
+    };
+    response
+        .with_header("X-Content-Type-Options", "nosniff")
+        .with_header("Referrer-Policy", "no-referrer")
+        .with_header("Content-Security-Policy", "frame-ancestors 'none'")
+        .with_header("X-Frame-Options", "DENY")
+        .with_header("X-mIV-Request-Id", request_id.to_string())
+}
+
 fn route(request: &mut Request, state: &AppState) -> HttpResponse {
     let request_url = request.url().to_owned();
     let (path, raw_query) = split_url(&request_url);
-    let video_route = path.starts_with("/api/video/") || path.starts_with("/stream/");
     let query_result = parse_query(raw_query);
     let query = match query_result {
         Ok(query) => query,
@@ -823,14 +835,7 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
             .with_header("Cache-Control", "no-store"),
     };
 
-    let response = if video_route {
-        response.with_body_error_code_log()
-    } else {
-        response
-    };
     response
-        .with_header("X-Content-Type-Options", "nosniff")
-        .with_header("Referrer-Policy", "no-referrer")
 }
 
 fn ai_state_job_id(path: &str) -> Option<&str> {
@@ -2126,7 +2131,7 @@ fn video_ipc_error_response(failure: crate::ipc_client::ClientFailure) -> HttpRe
             }
         }));
     }
-    response.with_body_error_code_log()
+    response
 }
 
 fn api_session_acquire(
@@ -4358,6 +4363,93 @@ mod tests {
         .unwrap()
     }
 
+    fn finalized_route(request: &mut Request, state: &AppState, request_id: u64) -> HttpResponse {
+        let path = split_url(request.url()).0;
+        let video_route = path.starts_with("/api/video/") || path.starts_with("/stream/");
+        finalize_response(route(request, state), video_route, request_id)
+    }
+
+    fn assert_common_response_headers(response: &HttpResponse, request_id: u64) {
+        let request_id = request_id.to_string();
+        for (expected_name, expected_value) in [
+            ("X-Content-Type-Options", "nosniff"),
+            ("Referrer-Policy", "no-referrer"),
+            ("Content-Security-Policy", "frame-ancestors 'none'"),
+            ("X-Frame-Options", "DENY"),
+            ("X-mIV-Request-Id", request_id.as_str()),
+        ] {
+            let values = response
+                .headers
+                .iter()
+                .filter_map(|(name, value)| (*name == expected_name).then_some(value.as_str()))
+                .collect::<Vec<_>>();
+            assert_eq!(values, [expected_value], "{expected_name}");
+        }
+    }
+
+    #[test]
+    fn every_route_outcome_receives_one_copy_of_the_common_response_headers() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        std::fs::write(
+            temp.path().join("index.html"),
+            format!(
+                r#"<!doctype html><meta name="miv-remote-asset-token" content="{WEB_ASSET_TOKEN_PLACEHOLDER}">"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("app.js"), b"export {};").unwrap();
+
+        let requests = [
+            (Method::Get, "/", false, 200),
+            (Method::Get, "/app.js", false, 200),
+            (Method::Get, "/api/app-version", false, 401),
+            (Method::Get, "/?path=%ff", false, 400),
+            (Method::Get, "/api/favorites", true, 428),
+            (Method::Get, "/stream/not-a-resource", true, 404),
+            (Method::Post, "/api/auth/status", false, 405),
+            (Method::Get, "/missing", true, 404),
+        ];
+
+        for (index, (method, path, authenticated, expected_status)) in
+            requests.into_iter().enumerate()
+        {
+            let mut request = TestRequest::new().with_method(method).with_path(path);
+            if authenticated {
+                request = request.with_header(cookie_header(&state));
+            }
+            if path.starts_with("/stream/") {
+                request = request.with_header(
+                    Header::from_bytes("X-mIV-Remote-Session", "0123456789abcdef0123456789abcdef")
+                        .unwrap(),
+                );
+            }
+            let mut request: Request = request.into();
+            let request_id = 100 + index as u64;
+            let response = finalized_route(&mut request, &state, request_id);
+            assert_eq!(response.status, expected_status, "{path}");
+            assert_common_response_headers(&response, request_id);
+        }
+    }
+
+    #[test]
+    fn video_error_finalization_preserves_the_body_error_code_for_request_logging() {
+        let response = finalize_response(
+            HttpResponse::bytes(
+                503,
+                "application/json; charset=utf-8",
+                br#"{"error":"stream_not_ready"}"#.to_vec(),
+            ),
+            true,
+            77,
+        );
+        assert_eq!(
+            response.log_details.as_ref().unwrap()["video_stream"]["error_code"],
+            "stream_not_ready"
+        );
+        assert_common_response_headers(&response, 77);
+    }
+
     #[test]
     fn query_parser_decodes_form_encoding_and_rejects_invalid_utf8() {
         let query = parse_query("path=A%2FB+set&name=%E5%A4%8F").unwrap();
@@ -5165,13 +5257,17 @@ mod tests {
                 "stream_generation_mismatch",
             ),
         ] {
-            let mismatch = video_ipc_error_response(crate::ipc_client::ClientFailure {
-                error: IpcClientError::VideoStreamRemote(mimageviewer_ipc::VideoStreamError::new(
-                    code, "mismatch",
-                )),
-                retry_count: 0,
-                retry_statuses: Vec::new(),
-            });
+            let mismatch = finalize_response(
+                video_ipc_error_response(crate::ipc_client::ClientFailure {
+                    error: IpcClientError::VideoStreamRemote(
+                        mimageviewer_ipc::VideoStreamError::new(code, "mismatch"),
+                    ),
+                    retry_count: 0,
+                    retry_statuses: Vec::new(),
+                }),
+                true,
+                1,
+            );
             assert_eq!(mismatch.status, 409);
             let body: Value = serde_json::from_slice(&mismatch.body).unwrap();
             assert_eq!(body["error"], expected_error);
@@ -5190,14 +5286,17 @@ mod tests {
                 "stream_start_encoder_timeout",
             ),
         ] {
-            let timeout = video_ipc_error_response(crate::ipc_client::ClientFailure {
-                error: IpcClientError::VideoStreamRemote(mimageviewer_ipc::VideoStreamError::new(
-                    code,
-                    "start stage deadline",
-                )),
-                retry_count: 0,
-                retry_statuses: Vec::new(),
-            });
+            let timeout = finalize_response(
+                video_ipc_error_response(crate::ipc_client::ClientFailure {
+                    error: IpcClientError::VideoStreamRemote(
+                        mimageviewer_ipc::VideoStreamError::new(code, "start stage deadline"),
+                    ),
+                    retry_count: 0,
+                    retry_statuses: Vec::new(),
+                }),
+                true,
+                1,
+            );
             assert_eq!(timeout.status, 504);
             let body: Value = serde_json::from_slice(&timeout.body).unwrap();
             assert_eq!(body["error"], expected_error);
