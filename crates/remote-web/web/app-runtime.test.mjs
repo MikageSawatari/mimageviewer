@@ -612,6 +612,7 @@ test("every iPhone viewer menu page stays within the fixed action limit", () => 
     assert.equal(mainNames.includes("next_page"), false);
     assert.equal(mainNames.includes("zoom_in"), false);
     assert.equal(mainNames.includes("zoom_out"), false);
+    assert.equal(mainNames.includes("logout"), true);
     assert.equal(
       main.filter(([, , , payload]) => payload?.menuPage === "rating").length,
       1

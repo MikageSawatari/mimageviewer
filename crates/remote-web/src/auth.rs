@@ -238,6 +238,17 @@ impl AuthService {
         self.issue_session_cookie_at(unix_seconds(), remember, secure)
     }
 
+    pub fn clear_session_cookie(&self, secure: bool) -> SessionCookie {
+        let mut header = format!("{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+        if secure {
+            header.push_str("; Secure");
+        }
+        SessionCookie {
+            header,
+            sensitive_value: String::new(),
+        }
+    }
+
     fn issue_session_cookie_at(
         &self,
         now_unix: u64,
@@ -452,6 +463,54 @@ mod tests {
         let session_only = auth.issue_session_cookie_at(10, false, true);
         assert!(!session_only.header.contains("Max-Age"));
         assert!(session_only.header.contains("; Secure"));
+    }
+
+    #[test]
+    fn deletion_cookie_matches_the_issued_scope_and_transport_attributes() {
+        let auth = service("123456");
+        for secure in [false, true] {
+            let issued = auth.issue_session_cookie_at(10, true, secure);
+            let deleted = auth.clear_session_cookie(secure);
+            for attribute in ["Path=/", "HttpOnly", "SameSite=Lax"] {
+                assert!(issued.header.contains(attribute));
+                assert!(deleted.header.contains(attribute));
+            }
+            assert!(deleted.header.contains("Max-Age=0"));
+            assert_eq!(issued.header.contains("; Secure"), secure);
+            assert_eq!(deleted.header.contains("; Secure"), secure);
+        }
+    }
+
+    #[test]
+    fn rotated_secret_rejects_old_cookies_but_keeps_the_same_pin() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("auth.json");
+        mimageviewer_ipc::set_pin_file(&path, "123456").unwrap();
+        let before = AuthService::new(
+            mimageviewer_ipc::load_pin_file(&path).unwrap(),
+            AuthToken::from_printable_for_test(TEST_TOKEN),
+        )
+        .unwrap();
+        let old = before.issue_session_cookie_at(10, true, false);
+
+        mimageviewer_ipc::rotate_session_secret_file(&path).unwrap();
+        let after = AuthService::new(
+            mimageviewer_ipc::load_pin_file(&path).unwrap(),
+            AuthToken::from_printable_for_test(TEST_TOKEN),
+        )
+        .unwrap();
+        let cookie = format!("{COOKIE_NAME}={}", old.sensitive_value);
+        assert_eq!(
+            after.authorize_at(
+                AuthInput {
+                    cookie: Some(&cookie),
+                    ..AuthInput::default()
+                },
+                11,
+            ),
+            AuthDecision::Unauthorized
+        );
+        assert_eq!(after.verify_pin("123456"), PinVerification::Success);
     }
 
     #[test]

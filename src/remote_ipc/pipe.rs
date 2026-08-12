@@ -993,6 +993,7 @@ fn worker_loop(
                     }
                     ClientMessage::SessionAcquire { id, .. }
                     | ClientMessage::SessionPing { id, .. }
+                    | ClientMessage::SessionRelease { id, .. }
                     | ClientMessage::SessionActivity { id, .. } => ServerMessage::Session {
                         id,
                         response: session_response(
@@ -1647,6 +1648,7 @@ fn request_kind(message: &ClientMessage) -> &'static str {
         ClientMessage::RemoteWebConnectionInfo { .. } => "connection_info",
         ClientMessage::SessionAcquire { .. } => "session_acquire",
         ClientMessage::SessionPing { .. } => "session_ping",
+        ClientMessage::SessionRelease { .. } => "session_release",
         ClientMessage::SessionActivity { .. } => "session_activity",
         ClientMessage::Thumbnail { .. } => "thumbnail",
         ClientMessage::Home { .. } => "home",
@@ -1716,6 +1718,7 @@ fn message_owner(message: &ClientMessage) -> Option<&RemoteSessionIdentity> {
             None
         }
         ClientMessage::SessionPing { request, .. } => Some(&request.owner),
+        ClientMessage::SessionRelease { request, .. } => Some(&request.owner),
         ClientMessage::Thumbnail { owner, .. }
         | ClientMessage::Home { owner, .. }
         | ClientMessage::Collection { owner, .. }
@@ -1826,6 +1829,7 @@ fn operation_description(message: &ClientMessage) -> String {
         ClientMessage::VideoStreamStop { .. } => "動画ストリーミングを停止中".to_owned(),
         ClientMessage::SessionAcquire { .. }
         | ClientMessage::SessionPing { .. }
+        | ClientMessage::SessionRelease { .. }
         | ClientMessage::SessionActivity { .. } => "接続を確認中".to_owned(),
     }
 }
@@ -2402,6 +2406,11 @@ fn handle_connection(
             }
             ClientMessage::SessionPing { id, request } => {
                 let response = session.ping(request);
+                let _ = reply_tx.send(ServerMessage::Session { id: *id, response });
+                continue;
+            }
+            ClientMessage::SessionRelease { id, request } => {
+                let response = session.logout(&request.owner);
                 let _ = reply_tx.send(ServerMessage::Session { id: *id, response });
                 continue;
             }
@@ -3127,6 +3136,7 @@ fn service_stopped_response(message: &ClientMessage) -> ServerMessage {
         }
         ClientMessage::SessionAcquire { id, .. }
         | ClientMessage::SessionPing { id, .. }
+        | ClientMessage::SessionRelease { id, .. }
         | ClientMessage::SessionActivity { id, .. }
         | ClientMessage::PageDemand { id, .. } => ServerMessage::Session {
             id: *id,
@@ -3385,6 +3395,7 @@ fn queue_busy_response(message: &ClientMessage) -> ServerMessage {
         }
         ClientMessage::SessionAcquire { id, .. }
         | ClientMessage::SessionPing { id, .. }
+        | ClientMessage::SessionRelease { id, .. }
         | ClientMessage::SessionActivity { id, .. }
         | ClientMessage::PageDemand { id, .. } => ServerMessage::Session {
             id: *id,

@@ -49,6 +49,7 @@ pub(crate) struct RemoteSessionUiState {
 
 struct RemoteConnectionDialogState {
     pin_editor: RemotePinEditorState,
+    session_logout: RemoteSessionLogoutState,
     tailscale_serve_setup: RemoteTailscaleServeSetupState,
 }
 
@@ -72,6 +73,15 @@ enum RemoteTailscaleServeSetupState {
     Finished(Result<(), String>),
 }
 
+enum RemoteSessionLogoutState {
+    Idle,
+    Confirming,
+    Running {
+        receiver: super::service::RemoteSessionSecretRotationReceiver,
+    },
+    Finished(Result<(), String>),
+}
+
 impl RemoteConnectionDialogState {
     fn new(pin_configured: bool) -> Self {
         Self {
@@ -84,6 +94,7 @@ impl RemoteConnectionDialogState {
                     request_focus: true,
                 }
             },
+            session_logout: RemoteSessionLogoutState::Idle,
             tailscale_serve_setup: RemoteTailscaleServeSetupState::Idle,
         }
     }
@@ -2400,6 +2411,26 @@ impl crate::app::App {
                 },
             };
         }
+        let session_logout_result = match &dialog.session_logout {
+            RemoteSessionLogoutState::Running { receiver } => match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(
+                    "すべての端末のログアウト結果を受け取れませんでした".to_owned(),
+                )),
+            },
+            RemoteSessionLogoutState::Idle
+            | RemoteSessionLogoutState::Confirming
+            | RemoteSessionLogoutState::Finished(_) => None,
+        };
+        if let Some(result) = session_logout_result {
+            if result.is_ok()
+                && let Some(handle) = self.remote_session_ui.handle.as_ref()
+            {
+                handle.local_disconnect();
+            }
+            dialog.session_logout = RemoteSessionLogoutState::Finished(result);
+        }
         let tailscale_serve_result = match &dialog.tailscale_serve_setup {
             RemoteTailscaleServeSetupState::Running { receiver } => match receiver.try_recv() {
                 Ok(result) => Some(result.map_err(|error| error.user_message())),
@@ -2471,6 +2502,7 @@ impl crate::app::App {
         let mut requested_enabled = None;
         let mut close_requested = false;
         let mut begin_tailscale_serve_setup = false;
+        let mut begin_session_logout = false;
         egui::Window::new("リモート接続")
             .id(egui::Id::new("remote_connection_dialog"))
             .collapsible(false)
@@ -2577,6 +2609,45 @@ impl crate::app::App {
                 }
                 ui.small("PIN の設定・変更後、有効なリモート接続は自動的に再起動します。");
                 ui.small("署名鍵も更新されるため、接続中の端末では PIN の再入力が必要になります。");
+                if pin_configured {
+                    ui.add_space(4.0);
+                    match &dialog.session_logout {
+                        RemoteSessionLogoutState::Idle => {
+                            if ui.button("すべての端末をログアウト").clicked() {
+                                dialog.session_logout = RemoteSessionLogoutState::Confirming;
+                            }
+                        }
+                        RemoteSessionLogoutState::Confirming => {
+                            ui.colored_label(
+                                ui.visuals().warn_fg_color,
+                                "この PC に接続中の端末を含め、すべての端末で PIN の再入力が必要になります。PIN は変わりません。",
+                            );
+                            ui.horizontal(|ui| {
+                                if ui.button("すべての端末をログアウト").clicked() {
+                                    begin_session_logout = true;
+                                }
+                                if ui.button("キャンセル").clicked() {
+                                    dialog.session_logout = RemoteSessionLogoutState::Idle;
+                                }
+                            });
+                        }
+                        RemoteSessionLogoutState::Running { .. } => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("すべての端末をログアウトしています...");
+                            });
+                        }
+                        RemoteSessionLogoutState::Finished(Ok(())) => {
+                            ui.label("すべての端末をログアウトしました。PIN は変わっていません。");
+                        }
+                        RemoteSessionLogoutState::Finished(Err(error)) => {
+                            ui.colored_label(ui.visuals().error_fg_color, error);
+                            if ui.button("もう一度試す").clicked() {
+                                dialog.session_logout = RemoteSessionLogoutState::Confirming;
+                            }
+                        }
+                    }
+                }
                 ui.add_space(6.0);
                 if remote_enable_warning_visible(service_enabled) {
                     let error_color = ui.visuals().error_fg_color;
@@ -2805,6 +2876,18 @@ impl crate::app::App {
             ctx.request_repaint();
         }
 
+        if begin_session_logout {
+            dialog.session_logout = match service_control
+                .as_ref()
+                .ok_or_else(|| "すべての端末のログアウトを開始できませんでした".to_owned())
+                .and_then(super::RemoteServiceControl::rotate_session_secret)
+            {
+                Ok(receiver) => RemoteSessionLogoutState::Running { receiver },
+                Err(error) => RemoteSessionLogoutState::Finished(Err(error)),
+            };
+            ctx.request_repaint();
+        }
+
         if let Some(enabled) = requested_enabled {
             self.settings.remote_service_enabled = enabled;
             self.settings.save();
@@ -2826,12 +2909,18 @@ impl crate::app::App {
                 &dialog.tailscale_serve_setup,
                 RemoteTailscaleServeSetupState::Running { .. }
             );
+            let session_logout_running = matches!(
+                &dialog.session_logout,
+                RemoteSessionLogoutState::Running { .. }
+            );
             self.remote_session_ui.connection_dialog = Some(dialog);
-            ctx.request_repaint_after(if pin_saving || tailscale_running {
-                std::time::Duration::from_millis(50)
-            } else {
-                std::time::Duration::from_secs(1)
-            });
+            ctx.request_repaint_after(
+                if pin_saving || tailscale_running || session_logout_running {
+                    std::time::Duration::from_millis(50)
+                } else {
+                    std::time::Duration::from_secs(1)
+                },
+            );
         }
     }
 
@@ -3222,10 +3311,14 @@ fn remote_bookmark_draft(
 fn remote_logical_path(
     address: &mimageviewer_ipc::RemoteAddress,
 ) -> Result<std::path::PathBuf, RemoteWriteError> {
-    address.validate_syntax().map_err(|_| {
+    address.validate_syntax().map_err(|error| {
         RemoteWriteError::new(
             RemoteWriteErrorCode::BadRequest,
-            "コンテンツアドレスが不正です",
+            if error == mimageviewer_ipc::AddressError::NetworkPath {
+                mimageviewer_ipc::REMOTE_NETWORK_PATH_MESSAGE
+            } else {
+                "コンテンツアドレスが不正です"
+            },
         )
     })?;
     super::path_guard::resolve_existing(&address.path)
@@ -3234,6 +3327,10 @@ fn remote_logical_path(
             super::path_guard::ResolveError::InvalidPath => RemoteWriteError::new(
                 RemoteWriteErrorCode::BadRequest,
                 "コンテンツアドレスが不正です",
+            ),
+            super::path_guard::ResolveError::NetworkPath => RemoteWriteError::new(
+                RemoteWriteErrorCode::BadRequest,
+                mimageviewer_ipc::REMOTE_NETWORK_PATH_MESSAGE,
             ),
             super::path_guard::ResolveError::Unavailable => {
                 RemoteWriteError::new(RemoteWriteErrorCode::NotFound, "対象が見つかりません")
@@ -3534,6 +3631,7 @@ mod tests {
     fn remote_connection_dialog_has_no_pending_enabled_state() {
         let RemoteConnectionDialogState {
             pin_editor,
+            session_logout,
             tailscale_serve_setup,
         } = RemoteConnectionDialogState::new(false);
         assert!(matches!(pin_editor, RemotePinEditorState::Editing { .. }));
@@ -3541,9 +3639,11 @@ mod tests {
             tailscale_serve_setup,
             RemoteTailscaleServeSetupState::Idle
         ));
+        assert!(matches!(session_logout, RemoteSessionLogoutState::Idle));
 
         let RemoteConnectionDialogState {
             pin_editor,
+            session_logout,
             tailscale_serve_setup,
         } = RemoteConnectionDialogState::new(true);
         assert!(matches!(pin_editor, RemotePinEditorState::Hidden));
@@ -3551,6 +3651,7 @@ mod tests {
             tailscale_serve_setup,
             RemoteTailscaleServeSetupState::Idle
         ));
+        assert!(matches!(session_logout, RemoteSessionLogoutState::Idle));
     }
 
     #[test]

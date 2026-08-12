@@ -1,6 +1,7 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RemoteLongJobDrainCause {
     DiscardedByHost,
+    LoggedOut,
     BackgroundExpired,
     Superseded,
 }

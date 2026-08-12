@@ -7,7 +7,7 @@ mod tailscale;
 
 pub use auth::{
     AUTH_FILE_VERSION, AuthRecord, MAX_PIN_CHARS, MIN_PIN_CHARS, load_pin_file, production_argon2,
-    set_pin_file, validate_pin, validate_record,
+    rotate_session_secret_file, set_pin_file, validate_pin, validate_record,
 };
 pub use tailscale::{
     DEFAULT_REMOTE_PORT, TAILSCALE_COMMAND_TIMEOUT, TailscaleCommandError, TailscaleCommandOutput,
@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 47;
+pub const PROTOCOL_VERSION: u32 = 48;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -38,6 +38,7 @@ pub const REMOTE_AI_START_ACCEPT_BUDGET: Duration = Duration::from_secs(2);
 /// A remote archive POST only admits a long-running job. Inspection and conversion continue on
 /// the core-owned job thread after this short IPC admission window.
 pub const REMOTE_ARCHIVE_START_ACCEPT_BUDGET: Duration = Duration::from_secs(2);
+pub const REMOTE_NETWORK_PATH_MESSAGE: &str = r"ネットワーク共有 (\\server\share 形式) はリモートからは開けません。ドライブ文字を割り当ててください。";
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ClientHello {
@@ -114,6 +115,7 @@ pub enum RemoteSubresource {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AddressError {
     InvalidPath,
+    NetworkPath,
     InvalidZipPath,
 }
 
@@ -121,14 +123,16 @@ pub enum AddressError {
 ///
 /// 絶対パス判定と NUL 拒否を別の crate に複製せず、必ずこの関数を使うこと。
 pub fn validate_absolute_path(value: &str) -> Result<(), AddressError> {
-    let path = std::path::Path::new(value);
     let bytes = value.as_bytes();
+    if bytes.len() >= 2 && matches!(bytes[0], b'/' | b'\\') && matches!(bytes[1], b'/' | b'\\') {
+        return Err(AddressError::NetworkPath);
+    }
+    let path = std::path::Path::new(value);
     let absolute = path.is_absolute()
         || (bytes.len() >= 3
             && bytes[0].is_ascii_alphabetic()
             && bytes[1] == b':'
-            && matches!(bytes[2], b'/' | b'\\'))
-        || value.starts_with(r"\\");
+            && matches!(bytes[2], b'/' | b'\\'));
     if value.contains('\0') || !absolute {
         return Err(AddressError::InvalidPath);
     }
@@ -1327,6 +1331,11 @@ pub struct SessionPingRequest {
     pub media_playing: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct SessionReleaseRequest {
+    pub owner: RemoteSessionIdentity,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
@@ -1999,6 +2008,10 @@ pub enum ClientMessage {
         id: RequestId,
         request: SessionPingRequest,
     },
+    SessionRelease {
+        id: RequestId,
+        request: SessionReleaseRequest,
+    },
     SessionActivity {
         id: RequestId,
         owner: RemoteSessionIdentity,
@@ -2186,6 +2199,7 @@ impl ClientMessage {
             Self::RemoteWebConnectionInfo { id, .. }
             | Self::SessionAcquire { id, .. }
             | Self::SessionPing { id, .. }
+            | Self::SessionRelease { id, .. }
             | Self::SessionActivity { id, .. }
             | Self::Thumbnail { id, .. }
             | Self::Home { id, .. }
@@ -2606,8 +2620,23 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v47_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
-        assert_eq!(PROTOCOL_VERSION, 47);
+    fn session_release_round_trips_the_exact_owner() {
+        let expected = ClientMessage::SessionRelease {
+            id: 10,
+            request: SessionReleaseRequest {
+                owner: test_owner("browser-instance"),
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &expected).unwrap();
+        let actual: ClientMessage =
+            read_frame(&mut bytes.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn protocol_v48_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
+        assert_eq!(PROTOCOL_VERSION, 48);
         let expected = ClientMessage::RemoteWebConnectionInfo {
             id: 10,
             info: RemoteWebConnectionInfo {
@@ -2781,8 +2810,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v47_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 47);
+    fn protocol_v48_remote_video_thumbnail_shape_round_trips() {
+        assert_eq!(PROTOCOL_VERSION, 48);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -3397,12 +3426,26 @@ mod tests {
     }
 
     #[test]
-    fn absolute_path_boundary_is_shared_and_rejects_nul() {
-        for path in ["C:/Pictures/page.jpg", r"\\server\share\page.jpg"] {
+    fn absolute_path_boundary_is_shared_and_rejects_network_namespaces_and_nul() {
+        for path in [r"C:\Pictures\page.jpg", "Z:/Pictures/page.jpg"] {
             validate_absolute_path(path).unwrap();
         }
         for path in ["relative/page.jpg", "C:page.jpg", "C:/bad\0page.jpg"] {
             assert_eq!(validate_absolute_path(path), Err(AddressError::InvalidPath));
+        }
+        for path in [
+            r"\\nas\share\a.jpg",
+            "//nas/share/a.jpg",
+            r"\\?\C:\a.jpg",
+            r"\\.\PhysicalDrive0",
+            r"\/nas/share/a.jpg",
+            r"/\nas\share\a.jpg",
+        ] {
+            assert_eq!(
+                validate_absolute_path(path),
+                Err(AddressError::NetworkPath),
+                "accepted {path:?}"
+            );
         }
     }
 

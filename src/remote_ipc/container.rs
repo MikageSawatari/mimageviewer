@@ -2659,9 +2659,16 @@ impl ContainerEngine {
     }
 
     fn resolve(&self, address: &RemoteAddress) -> Result<ResolvedPath, MediaError> {
-        address
-            .validate_syntax()
-            .map_err(|_| media_error(MediaErrorCode::BadRequest, "コンテンツアドレスが不正です"))?;
+        address.validate_syntax().map_err(|error| {
+            media_error(
+                MediaErrorCode::BadRequest,
+                if error == mimageviewer_ipc::AddressError::NetworkPath {
+                    mimageviewer_ipc::REMOTE_NETWORK_PATH_MESSAGE
+                } else {
+                    "コンテンツアドレスが不正です"
+                },
+            )
+        })?;
         if let Some(registry) = self
             .session
             .as_ref()
@@ -5277,6 +5284,10 @@ fn pdf_error(error: std::io::Error) -> MediaError {
 fn resolve_media_error(error: ResolveError) -> MediaError {
     match error {
         ResolveError::InvalidPath => media_error(MediaErrorCode::BadRequest, "絶対パスが不正です"),
+        ResolveError::NetworkPath => media_error(
+            MediaErrorCode::BadRequest,
+            mimageviewer_ipc::REMOTE_NETWORK_PATH_MESSAGE,
+        ),
         ResolveError::Unavailable => media_error(MediaErrorCode::NotFound, "対象が見つかりません"),
     }
 }

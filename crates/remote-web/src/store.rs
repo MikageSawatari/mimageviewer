@@ -18,6 +18,7 @@ const IMAGE_WEBP_QUALITY: f32 = 82.0;
 #[derive(Debug)]
 pub enum StoreError {
     BadRequest,
+    NetworkPath,
     Busy,
     NotFound,
     StaleGeneration(String),
@@ -42,6 +43,7 @@ impl From<ResolveError> for StoreError {
     fn from(value: ResolveError) -> Self {
         match value {
             ResolveError::InvalidPath => Self::BadRequest,
+            ResolveError::NetworkPath => Self::NetworkPath,
             ResolveError::Unavailable => Self::NotFound,
         }
     }
@@ -221,9 +223,11 @@ impl Library {
     }
 
     pub fn validate_remote_address(&self, address: &RemoteAddress) -> Result<(), StoreError> {
-        address
-            .validate_syntax()
-            .map_err(|_| StoreError::BadRequest)?;
+        address.validate_syntax().map_err(|error| match error {
+            mimageviewer_ipc::AddressError::NetworkPath => StoreError::NetworkPath,
+            mimageviewer_ipc::AddressError::InvalidPath
+            | mimageviewer_ipc::AddressError::InvalidZipPath => StoreError::BadRequest,
+        })?;
         resolve_existing(&address.path)?;
         Ok(())
     }
@@ -238,7 +242,7 @@ impl Library {
         ) {
             return Err(StoreError::BadRequest);
         }
-        let path = resolve_existing(&address.path)?;
+        let path = resolve_existing(&address.path)?.canonical;
         let metadata = std::fs::metadata(&path)?;
         if metadata.is_file() && classify_path(&path) == EntryKind::Image {
             Ok(())
@@ -258,7 +262,7 @@ impl Library {
         ) {
             return Err(StoreError::BadRequest);
         }
-        let path = resolve_existing(&address.path)?;
+        let path = resolve_existing(&address.path)?.canonical;
         let metadata = std::fs::metadata(&path)?;
         if metadata.is_file() && matches!(classify_path(&path), EntryKind::Video | EntryKind::Audio)
         {
@@ -272,7 +276,7 @@ impl Library {
         if requested_width == 0 || requested_width > MAX_IMAGE_WIDTH {
             return Err(StoreError::BadRequest);
         }
-        let image_path = resolve_existing(path)?;
+        let image_path = resolve_existing(path)?.canonical;
         let metadata = require_image_file(&image_path)?;
 
         let probe = image_support::probe_image(&image_path).ok_or(StoreError::Decode)?;
@@ -337,7 +341,7 @@ impl Library {
     }
 
     pub fn image_info(&self, path: &str) -> Result<ImageInfoResponse, StoreError> {
-        let image_path = resolve_existing(path)?;
+        let image_path = resolve_existing(path)?.canonical;
         require_image_file(&image_path)?;
         let probe = image_support::probe_image(&image_path).ok_or(StoreError::Decode)?;
         let (width, height) = probe.oriented_dimensions();

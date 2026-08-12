@@ -174,6 +174,11 @@ impl RemoteAiJobRegistry {
                 RemoteAiTerminalCode::DiscardedByHost,
                 "PC 側で接続が終了されたため AI 処理を中止しました",
             ),
+            RemoteLongJobDrainCause::LoggedOut => (
+                RemoteAiJobState::DiscardedByHost,
+                RemoteAiTerminalCode::DiscardedByHost,
+                "この端末からログアウトしたため AI 処理を中止しました",
+            ),
             RemoteLongJobDrainCause::BackgroundExpired => (
                 RemoteAiJobState::BackgroundExpired,
                 RemoteAiTerminalCode::BackgroundExpired,
@@ -628,8 +633,15 @@ fn validate_start_request(request: &RemoteAiStartRequest) -> Result<(), RemoteAi
         ));
     }
     for page in &request.pages {
-        page.address.validate_syntax().map_err(|_| {
-            RemoteAiJobError::new(RemoteAiJobErrorCode::BadRequest, "invalid page address")
+        page.address.validate_syntax().map_err(|error| {
+            RemoteAiJobError::new(
+                RemoteAiJobErrorCode::BadRequest,
+                if error == mimageviewer_ipc::AddressError::NetworkPath {
+                    mimageviewer_ipc::REMOTE_NETWORK_PATH_MESSAGE
+                } else {
+                    "invalid page address"
+                },
+            )
         })?;
         if page.target_px == 0 || page.target_px > crate::pdf_loader::PDF_RENDER_MAX_LONG_PX {
             return Err(RemoteAiJobError::new(

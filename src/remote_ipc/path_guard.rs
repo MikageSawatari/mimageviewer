@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
 
-use mimageviewer_ipc::{RemoteAddress, RemoteSubresource, validate_absolute_path};
+use mimageviewer_ipc::{AddressError, RemoteAddress, RemoteSubresource, validate_absolute_path};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ResolveError {
     InvalidPath,
+    NetworkPath,
     Unavailable,
 }
 
@@ -32,7 +33,7 @@ impl ResolvedPath {
         public_path: &str,
         backing_path: &Path,
     ) -> Result<Self, ResolveError> {
-        validate_absolute_path(public_path).map_err(|_| ResolveError::InvalidPath)?;
+        validate_absolute_path(public_path).map_err(resolve_syntax_error)?;
         let canonical =
             std::fs::canonicalize(source_path).map_err(|_| ResolveError::Unavailable)?;
         let backing_canonical =
@@ -68,15 +69,49 @@ impl ResolvedPath {
 
 /// 絶対パスを検証し、実在する対象を canonical path へ正規化する。
 pub(super) fn resolve_existing(path: &str) -> Result<ResolvedPath, ResolveError> {
+    resolve_existing_with(path, |candidate| std::fs::canonicalize(candidate))
+}
+
+fn resolve_existing_with(
+    path: &str,
+    canonicalize: impl FnOnce(&Path) -> std::io::Result<PathBuf>,
+) -> Result<ResolvedPath, ResolveError> {
     // 絶対パス + NUL 拒否の正本は mimageviewer-ipc。ここに述語を複製しない。
-    validate_absolute_path(path).map_err(|_| ResolveError::InvalidPath)?;
-    let canonical = std::fs::canonicalize(path).map_err(|_| ResolveError::Unavailable)?;
-    let logical = logical_path_from_canonical(&canonical);
+    validate_absolute_path(path).map_err(resolve_syntax_error)?;
+    let caller = Path::new(path);
+    let canonical = canonicalize(caller).map_err(|_| ResolveError::Unavailable)?;
+    let logical = logical_path_for_caller(caller, &canonical);
     Ok(ResolvedPath {
         logical,
         canonical,
         archive_backing: None,
     })
+}
+
+fn resolve_syntax_error(error: AddressError) -> ResolveError {
+    match error {
+        AddressError::NetworkPath => ResolveError::NetworkPath,
+        AddressError::InvalidPath | AddressError::InvalidZipPath => ResolveError::InvalidPath,
+    }
+}
+
+fn logical_path_for_caller(caller: &Path, canonical: &Path) -> PathBuf {
+    if canonical.to_string_lossy().starts_with(r"\\?\UNC\")
+        && caller_is_drive_absolute(caller)
+        && let Ok(absolute) = std::path::absolute(caller)
+    {
+        return logical_path_from_canonical(&absolute);
+    }
+    logical_path_from_canonical(canonical)
+}
+
+fn caller_is_drive_absolute(path: &Path) -> bool {
+    let value = path.to_string_lossy();
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
 }
 
 fn logical_path_from_canonical(canonical: &Path) -> PathBuf {
@@ -135,6 +170,34 @@ mod tests {
         assert_eq!(
             resolve_existing("invalid\0path.jpg"),
             Err(ResolveError::InvalidPath)
+        );
+    }
+
+    #[test]
+    fn rejects_network_namespace_before_canonicalize() {
+        let canonicalize_called = std::cell::Cell::new(false);
+        let result =
+            resolve_existing_with(r"\\host-that-must-not-be-contacted\share\a.jpg", |_| {
+                canonicalize_called.set(true);
+                Ok(PathBuf::from(r"C:\unexpected"))
+            });
+        assert_eq!(result, Err(ResolveError::NetworkPath));
+        assert!(!canonicalize_called.get());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_caller_stays_drive_shaped_when_canonical_is_unc() {
+        assert_eq!(
+            logical_path_for_caller(
+                Path::new(r"Z:\photo\..\photo"),
+                Path::new(r"\\?\UNC\nas\share\photo"),
+            ),
+            PathBuf::from(r"Z:\photo")
+        );
+        assert_eq!(
+            logical_path_for_caller(Path::new(r"Z:\photo"), Path::new(r"\\?\Z:\photo"),),
+            PathBuf::from(r"Z:\photo")
         );
     }
 

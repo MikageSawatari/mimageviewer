@@ -757,10 +757,14 @@ fn validate_archive_start(
             "request_id must contain 1 to 128 bytes",
         ));
     }
-    request.source.validate_syntax().map_err(|_| {
+    request.source.validate_syntax().map_err(|error| {
         RemoteArchiveJobError::new(
             RemoteArchiveJobErrorCode::BadRequest,
-            "invalid archive address",
+            if error == mimageviewer_ipc::AddressError::NetworkPath {
+                mimageviewer_ipc::REMOTE_NETWORK_PATH_MESSAGE
+            } else {
+                "invalid archive address"
+            },
         )
     })?;
     if request.source.subresource != RemoteSubresource::File {
@@ -899,6 +903,11 @@ fn archive_drain_terminal(
             RemoteArchiveJobState::DiscardedByHost,
             RemoteArchiveTerminalCode::DiscardedByHost,
             "PC 側で接続が終了されたためアーカイブ操作を中止しました",
+        ),
+        RemoteLongJobDrainCause::LoggedOut => (
+            RemoteArchiveJobState::DiscardedByHost,
+            RemoteArchiveTerminalCode::DiscardedByHost,
+            "この端末からログアウトしたためアーカイブ操作を中止しました",
         ),
         RemoteLongJobDrainCause::BackgroundExpired => (
             RemoteArchiveJobState::BackgroundExpired,
@@ -1636,6 +1645,12 @@ impl ContainerRemoteArchiveExecutor {
                 return failed(
                     RemoteArchiveTerminalCode::UnsupportedFormat,
                     "アーカイブのパスが不正です",
+                );
+            }
+            Err(super::path_guard::ResolveError::NetworkPath) => {
+                return failed(
+                    RemoteArchiveTerminalCode::UnsupportedFormat,
+                    mimageviewer_ipc::REMOTE_NETWORK_PATH_MESSAGE,
                 );
             }
             Err(super::path_guard::ResolveError::Unavailable) => {

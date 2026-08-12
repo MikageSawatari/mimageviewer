@@ -22,14 +22,15 @@ use mimageviewer_ipc::{
     RemoteArchiveStartResponse, RemoteArchiveStateResponse, RemotePageRenderContext,
     RemoteSessionIdentity, RemoteWebConnectionInfo, RemoteWriteError, RemoteWriteErrorCode,
     RemoteWriteRequest, RemoteWriteResponse, RemoteWriteResult, RequestId, ServerMessage,
-    SessionAcquireRequest, SessionPeerInfo, SessionPingRequest, SessionResponse, SessionStatus,
-    TagBrowsePayload, TagBrowseRequest, TagBrowseResponse, TagItemsPayload, TagItemsRequest,
-    TagItemsResponse, ThumbnailError, ThumbnailErrorCode, ThumbnailRequest, ThumbnailResponse,
-    VIDEO_STREAM_START_BUDGET, VideoStreamControlAction, VideoStreamError, VideoStreamErrorCode,
-    VideoStreamJumpListPayload, VideoStreamJumpThumbnailPayload, VideoStreamPlaylistKind,
-    VideoStreamPlaylistPayload, VideoStreamQuality, VideoStreamResult, VideoStreamSeekPayload,
-    VideoStreamSegmentIndex, VideoStreamSegmentPayload, VideoStreamStartPayload,
-    VideoStreamStatePayload, VideoStreamThumbnailPayload, read_frame, write_frame,
+    SessionAcquireRequest, SessionPeerInfo, SessionPingRequest, SessionReleaseRequest,
+    SessionResponse, SessionStatus, TagBrowsePayload, TagBrowseRequest, TagBrowseResponse,
+    TagItemsPayload, TagItemsRequest, TagItemsResponse, ThumbnailError, ThumbnailErrorCode,
+    ThumbnailRequest, ThumbnailResponse, VIDEO_STREAM_START_BUDGET, VideoStreamControlAction,
+    VideoStreamError, VideoStreamErrorCode, VideoStreamJumpListPayload,
+    VideoStreamJumpThumbnailPayload, VideoStreamPlaylistKind, VideoStreamPlaylistPayload,
+    VideoStreamQuality, VideoStreamResult, VideoStreamSeekPayload, VideoStreamSegmentIndex,
+    VideoStreamSegmentPayload, VideoStreamStartPayload, VideoStreamStatePayload,
+    VideoStreamThumbnailPayload, read_frame, write_frame,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -373,6 +374,18 @@ impl ThumbnailClient {
                 owner: owner.clone(),
                 user_active,
                 media_playing,
+            },
+        })
+    }
+
+    pub fn session_release(
+        &self,
+        owner: &RemoteSessionIdentity,
+    ) -> Result<SessionResponse, ClientFailure> {
+        self.session_request(|id| ClientMessage::SessionRelease {
+            id,
+            request: SessionReleaseRequest {
+                owner: owner.clone(),
             },
         })
     }

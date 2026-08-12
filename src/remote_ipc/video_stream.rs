@@ -106,10 +106,14 @@ impl VideoStreamEngine {
         &self,
         address: &RemoteAddress,
     ) -> Result<PathBuf, VideoStreamError> {
-        address.validate_syntax().map_err(|_| {
+        address.validate_syntax().map_err(|error| {
             video_error(
                 VideoStreamErrorCode::BadRequest,
-                "メディアアドレスの形式が正しくありません",
+                if error == mimageviewer_ipc::AddressError::NetworkPath {
+                    mimageviewer_ipc::REMOTE_NETWORK_PATH_MESSAGE
+                } else {
+                    "メディアアドレスの形式が正しくありません"
+                },
             )
         })?;
         if !matches!(address.subresource, RemoteSubresource::File) {
@@ -472,6 +476,10 @@ fn resolve_error(error: ResolveError) -> VideoStreamError {
         ResolveError::InvalidPath => (
             VideoStreamErrorCode::BadRequest,
             "メディアアドレスの形式が正しくありません",
+        ),
+        ResolveError::NetworkPath => (
+            VideoStreamErrorCode::BadRequest,
+            mimageviewer_ipc::REMOTE_NETWORK_PATH_MESSAGE,
         ),
         ResolveError::Unavailable => (
             VideoStreamErrorCode::NotFound,

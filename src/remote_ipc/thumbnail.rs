@@ -469,10 +469,14 @@ impl ThumbnailEngine {
         {
             return Ok(None);
         }
-        source_address.validate_syntax().map_err(|_| {
+        source_address.validate_syntax().map_err(|error| {
             error_response(
                 ThumbnailErrorCode::BadRequest,
-                "サムネイル出所のアドレスが不正です",
+                if error == mimageviewer_ipc::AddressError::NetworkPath {
+                    mimageviewer_ipc::REMOTE_NETWORK_PATH_MESSAGE
+                } else {
+                    "サムネイル出所のアドレスが不正です"
+                },
             )
         })?;
         if !matches!(source_address.subresource, RemoteSubresource::File) {
@@ -594,6 +598,10 @@ fn resolve_error_response(error: ResolveError) -> ThumbnailResponse {
         ResolveError::InvalidPath => {
             error_response(ThumbnailErrorCode::BadRequest, "絶対パスが不正です")
         }
+        ResolveError::NetworkPath => error_response(
+            ThumbnailErrorCode::BadRequest,
+            mimageviewer_ipc::REMOTE_NETWORK_PATH_MESSAGE,
+        ),
         ResolveError::Unavailable => {
             error_response(ThumbnailErrorCode::NotFound, "対象が見つかりません")
         }

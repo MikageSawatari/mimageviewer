@@ -175,6 +175,15 @@ impl RemoteClientIdentities {
                 session_id,
             })
     }
+
+    fn clear_session(&self, auth: AuthDecision) {
+        let AuthDecision::Authorized(AuthSource::SessionCookie(identity)) = auth else {
+            return;
+        };
+        if let Ok(mut owners) = self.cookie_owners.lock() {
+            owners.remove(&identity);
+        }
+    }
 }
 
 pub struct SessionActivityNotifier {
@@ -550,7 +559,7 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
     });
     let remote_client_id = if auth != AuthDecision::Unauthorized
         && (path.starts_with("/api/") || path.starts_with("/stream/"))
-        && !path.starts_with("/api/auth/")
+        && (!path.starts_with("/api/auth/") || path == "/api/auth/logout")
     {
         state.remote_client_identities.resolve(request, auth)
     } else {
@@ -587,7 +596,8 @@ fn route(request: &mut Request, state: &AppState) -> HttpResponse {
         ),
         (Method::Get, "/api/auth/status") => api_auth_status(state, auth),
         (Method::Post, "/api/auth/pin") => api_auth_pin(request, state),
-        (_, "/api/auth/status" | "/api/auth/pin") => {
+        (Method::Post, "/api/auth/logout") => api_auth_logout(request, state, auth, remote_owner),
+        (_, "/api/auth/status" | "/api/auth/pin" | "/api/auth/logout") => {
             HttpResponse::text(405, "Method Not Allowed").with_header("Cache-Control", "no-store")
         }
         _ if auth == AuthDecision::Unauthorized => unauthorized(),
@@ -2456,6 +2466,23 @@ fn api_auth_pin(request: &mut Request, state: &AppState) -> HttpResponse {
     }
 }
 
+fn api_auth_logout(
+    request: &Request,
+    state: &AppState,
+    auth: AuthDecision,
+    owner: Option<&RemoteSessionIdentity>,
+) -> HttpResponse {
+    if let Some(owner) = owner {
+        let _ = state.thumbnail_client.session_release(owner);
+    }
+    state.remote_client_identities.clear_session(auth);
+    let cookie = state.auth.clear_session_cookie(request_is_https(request));
+    HttpResponse::json(&json!({"authenticated": false}))
+        .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+        .with_header("Set-Cookie", cookie.header)
+        .with_header("Cache-Control", "no-store")
+}
+
 fn api_favorites(state: &AppState) -> HttpResponse {
     let favorites = match state.library.favorites() {
         Ok(favorites) => favorites,
@@ -2978,7 +3005,8 @@ fn api_container(
         {
             address
         }
-        _ => return HttpResponse::text(400, "Bad Request"),
+        Ok(_) => return HttpResponse::text(400, "Bad Request"),
+        Err(error) => return store_error_response(error),
     };
     if let Err(error) = state.library.validate_remote_address(&address) {
         return store_error_response(error);
@@ -3105,14 +3133,14 @@ fn api_thumb(
 ) -> HttpResponse {
     let address = match remote_address_from_query(query) {
         Ok(address) => address,
-        Err(()) => return HttpResponse::text(400, "Bad Request"),
+        Err(error) => return store_error_response(error),
     };
     if let Err(error) = state.library.validate_remote_address(&address) {
         return store_error_response(error);
     }
     let source_address = match thumbnail_source_from_query(query) {
         Ok(source) => source,
-        Err(()) => return HttpResponse::text(400, "Bad Request"),
+        Err(error) => return store_error_response(error),
     };
     if let Some(source) = source_address.as_ref()
         && let Err(error) = state.library.validate_remote_address(source)
@@ -3206,7 +3234,7 @@ fn api_page(
     }
     let address = match remote_address_from_query(query) {
         Ok(address) => address,
-        _ => return HttpResponse::text(400, "Bad Request"),
+        Err(error) => return store_error_response(error),
     };
     if let Err(error) = validate_page_address(&state.library, &address) {
         return store_error_response(error);
@@ -3954,15 +3982,15 @@ fn restore_address_query_paths(
     Ok(())
 }
 
-fn remote_address_from_query(query: &[(String, String)]) -> Result<RemoteAddress, ()> {
-    let path = required_query_value(query, "path")?;
-    let entry = query_value(query, "entry")?;
-    let prefix = query_value(query, "prefix")?;
-    let page = query_value(query, "page")?;
+fn remote_address_from_query(query: &[(String, String)]) -> Result<RemoteAddress, StoreError> {
+    let path = required_query_value(query, "path").map_err(|_| StoreError::BadRequest)?;
+    let entry = query_value(query, "entry").map_err(|_| StoreError::BadRequest)?;
+    let prefix = query_value(query, "prefix").map_err(|_| StoreError::BadRequest)?;
+    let page = query_value(query, "page").map_err(|_| StoreError::BadRequest)?;
     if usize::from(entry.is_some()) + usize::from(prefix.is_some()) + usize::from(page.is_some())
         > 1
     {
-        return Err(());
+        return Err(StoreError::BadRequest);
     }
     let subresource = if let Some(entry_name) = entry {
         RemoteSubresource::ZipEntry {
@@ -3974,7 +4002,7 @@ fn remote_address_from_query(query: &[(String, String)]) -> Result<RemoteAddress
         }
     } else if let Some(page) = page {
         RemoteSubresource::PdfPage {
-            page_number: page.parse::<u32>().map_err(|_| ())?,
+            page_number: page.parse::<u32>().map_err(|_| StoreError::BadRequest)?,
         }
     } else {
         RemoteSubresource::File
@@ -3983,17 +4011,29 @@ fn remote_address_from_query(query: &[(String, String)]) -> Result<RemoteAddress
         path: path.to_owned(),
         subresource,
     };
-    address.validate_syntax().map_err(|_| ())?;
+    address.validate_syntax().map_err(address_store_error)?;
     Ok(address)
 }
 
-fn thumbnail_source_from_query(query: &[(String, String)]) -> Result<Option<RemoteAddress>, ()> {
-    let Some(path) = query_value(query, "thumbnail_source_path")? else {
+fn thumbnail_source_from_query(
+    query: &[(String, String)],
+) -> Result<Option<RemoteAddress>, StoreError> {
+    let Some(path) =
+        query_value(query, "thumbnail_source_path").map_err(|_| StoreError::BadRequest)?
+    else {
         return Ok(None);
     };
     let address = RemoteAddress::file(path.to_owned());
-    address.validate_syntax().map_err(|_| ())?;
+    address.validate_syntax().map_err(address_store_error)?;
     Ok(Some(address))
+}
+
+fn address_store_error(error: mimageviewer_ipc::AddressError) -> StoreError {
+    match error {
+        mimageviewer_ipc::AddressError::NetworkPath => StoreError::NetworkPath,
+        mimageviewer_ipc::AddressError::InvalidPath
+        | mimageviewer_ipc::AddressError::InvalidZipPath => StoreError::BadRequest,
+    }
 }
 
 fn requested_width(query: &[(String, String)]) -> Result<u32, ()> {
@@ -4134,6 +4174,16 @@ fn static_index(state: &AppState) -> HttpResponse {
 fn store_error_response(error: StoreError) -> HttpResponse {
     match error {
         StoreError::BadRequest => HttpResponse::text(400, "Bad Request"),
+        StoreError::NetworkPath => HttpResponse::bytes(
+            400,
+            "application/json; charset=utf-8",
+            serde_json::to_vec(&json!({
+                "error": "network_path_not_supported",
+                "message": mimageviewer_ipc::REMOTE_NETWORK_PATH_MESSAGE,
+            }))
+            .unwrap_or_default(),
+        )
+        .with_header("Cache-Control", "no-store"),
         StoreError::Busy => HttpResponse::text(503, "Service Unavailable")
             .with_header("Retry-After", IPC_RETRY_AFTER_SECONDS.to_string())
             .with_header("Cache-Control", "no-store"),
@@ -4595,6 +4645,26 @@ mod tests {
 
         let mixed = parse_query("path=C%3A%2FBooks%2Fbook.pdf&page=1&entry=page.jpg").unwrap();
         assert!(remote_address_from_query(&mixed).is_err());
+
+        for query in [
+            "path=%5C%5Cnas%5Cshare%5Ca.jpg",
+            "path=%2F%2Fnas%2Fshare%2Fa.jpg",
+            "path=%5C%5C%3F%5CC%3A%5Ca.jpg",
+            "path=%5C%5C.%5CPhysicalDrive0",
+        ] {
+            assert!(matches!(
+                remote_address_from_query(&parse_query(query).unwrap()),
+                Err(StoreError::NetworkPath)
+            ));
+        }
+
+        let response = store_error_response(StoreError::NetworkPath);
+        assert_eq!(response.status, 400);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(
+            body["message"],
+            mimageviewer_ipc::REMOTE_NETWORK_PATH_MESSAGE
+        );
 
         let valid =
             parse_query("path=C%3A%2FBooks%2Fbook.zip&entry=chapter.zip%2F001.jpg").unwrap();
@@ -5868,6 +5938,61 @@ mod tests {
             .unwrap();
         assert!(!set_cookie.contains("Max-Age"));
         assert!(!set_cookie.contains("; Secure"));
+    }
+
+    #[test]
+    fn logout_deletes_the_browser_cookie_for_plain_and_https_proxy_requests() {
+        for secure in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let state = test_state(&temp);
+            let issued = state.auth.issue_session_cookie(true, secure);
+            let mut request = TestRequest::new()
+                .with_method(Method::Post)
+                .with_path("/api/auth/logout")
+                .with_header(
+                    Header::from_bytes(
+                        "Cookie",
+                        format!("{COOKIE_NAME}={}", issued.sensitive_value).as_bytes(),
+                    )
+                    .unwrap(),
+                );
+            if secure {
+                request =
+                    request.with_header(Header::from_bytes("X-Forwarded-Proto", "https").unwrap());
+            }
+            let mut request: Request = request.into();
+            let response = route(&mut request, &state);
+            assert_eq!(response.status, 200);
+            let deleted = response
+                .headers
+                .iter()
+                .find(|(name, _)| *name == "Set-Cookie")
+                .map(|(_, value)| value)
+                .unwrap();
+            for attribute in ["Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=0"] {
+                assert!(deleted.contains(attribute));
+            }
+            assert_eq!(deleted.contains("; Secure"), secure);
+
+            let mut after: Request = TestRequest::new()
+                .with_method(Method::Get)
+                .with_path("/api/app-version")
+                .into();
+            assert_eq!(route(&mut after, &state).status, 401);
+        }
+    }
+
+    #[test]
+    fn logout_accepts_only_post_even_without_authentication() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        for method in [Method::Get, Method::Put, Method::Delete] {
+            let mut request: Request = TestRequest::new()
+                .with_method(method)
+                .with_path("/api/auth/logout")
+                .into();
+            assert_eq!(route(&mut request, &state).status, 405);
+        }
     }
 
     #[test]

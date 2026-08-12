@@ -78,6 +78,9 @@ enum RemoteServiceCommand {
         pin: String,
         reply: mpsc::Sender<Result<(), String>>,
     },
+    RotateSessionSecret {
+        reply: mpsc::Sender<Result<(), String>>,
+    },
     ConfigureTailscaleServe {
         reply: mpsc::Sender<Result<(), mimageviewer_ipc::TailscaleCommandError>>,
     },
@@ -85,6 +88,7 @@ enum RemoteServiceCommand {
 }
 
 pub(crate) type RemotePinUpdateReceiver = mpsc::Receiver<Result<(), String>>;
+pub(crate) type RemoteSessionSecretRotationReceiver = mpsc::Receiver<Result<(), String>>;
 pub(crate) type RemoteTailscaleServeReceiver =
     mpsc::Receiver<Result<(), mimageviewer_ipc::TailscaleCommandError>>;
 
@@ -124,6 +128,16 @@ impl RemoteServiceControl {
         self.tx
             .send(RemoteServiceCommand::SetPin { pin, reply })
             .map_err(|_| "PIN の設定を開始できませんでした".to_owned())?;
+        Ok(receiver)
+    }
+
+    pub(crate) fn rotate_session_secret(
+        &self,
+    ) -> Result<RemoteSessionSecretRotationReceiver, String> {
+        let (reply, receiver) = mpsc::channel();
+        self.tx
+            .send(RemoteServiceCommand::RotateSessionSecret { reply })
+            .map_err(|_| "すべての端末のログアウトを開始できませんでした".to_owned())?;
         Ok(receiver)
     }
 
@@ -238,6 +252,14 @@ fn run_service_manager(
                         drop(process.take());
                         start_owned_process(&paths, &status, &mut process);
                     }
+                }
+                let _ = reply.send(result);
+            }
+            Ok(RemoteServiceCommand::RotateSessionSecret { reply }) => {
+                let result = mimageviewer_ipc::rotate_session_secret_file(&paths.auth_file);
+                if result.is_ok() && pin_update_plan(enabled) == PinUpdatePlan::Restart {
+                    drop(process.take());
+                    start_owned_process(&paths, &status, &mut process);
                 }
                 let _ = reply.send(result);
             }
@@ -519,6 +541,11 @@ mod tests {
         assert!(matches!(
             rx.recv().unwrap(),
             RemoteServiceCommand::ConfigureTailscaleServe { .. }
+        ));
+        let _receiver = control.rotate_session_secret().unwrap();
+        assert!(matches!(
+            rx.recv().unwrap(),
+            RemoteServiceCommand::RotateSessionSecret { .. }
         ));
     }
 

@@ -1866,6 +1866,11 @@ function startSessionPing() {
   }, SESSION_PING_INTERVAL_MS);
 }
 
+function stopSessionPing() {
+  clearInterval(state.remoteSessionTimer);
+  state.remoteSessionTimer = 0;
+}
+
 async function pingRemoteSession() {
   if (
     !state.authenticated ||
@@ -2178,6 +2183,7 @@ export function createPinLoginInput() {
 }
 
 function renderPinLogin(initialRemainingSeconds = 0) {
+  stopSessionPing();
   cleanupScreen();
   applyRemoteSessionId("");
   state.screenContext = "pin";
@@ -2611,13 +2617,16 @@ function dispatchCommand(requested, meta = {}) {
   if (
     requested.name === CommandName.OPEN_LOCAL_SETTINGS ||
     requested.name === CommandName.OPEN_GESTURE_HELP ||
-    requested.name === CommandName.RELOAD_APP
+    requested.name === CommandName.RELOAD_APP ||
+    requested.name === CommandName.LOGOUT
   ) {
     state.commandMenu?.close(false);
     if (requested.name === CommandName.OPEN_LOCAL_SETTINGS) {
       openLocalSettingsDialog();
     } else if (requested.name === CommandName.OPEN_GESTURE_HELP) {
       openGestureHelpDialog();
+    } else if (requested.name === CommandName.LOGOUT) {
+      logoutApplication().catch(renderError);
     } else {
       reloadApplication();
     }
@@ -7521,7 +7530,7 @@ export const VIEWER_PANEL_TABS = Object.freeze([
   Object.freeze({ id: "bookmarks", label: "ブックマーク" }),
 ]);
 
-export const VIEWER_MENU_MAX_ACTIONS = 11;
+export const VIEWER_MENU_MAX_ACTIONS = 12;
 
 function remoteAddressLooksValid(address) {
   return Boolean(
@@ -7599,6 +7608,7 @@ export function viewerMenuDefinitions({ hasContainer, barsVisible }) {
     [CommandName.BACK, "一覧へ戻る", "Backspace / Enter / Esc"],
     [CommandName.OPEN_LOCAL_SETTINGS, "端末の設定", "メニュー"],
     [CommandName.OPEN_GESTURE_HELP, "操作方法を見る", "メニュー"],
+    [CommandName.LOGOUT, "ログアウト", "この端末"],
     [CommandName.RELOAD_APP, "再読み込み", "メニュー"],
   ];
   return {
@@ -7681,6 +7691,7 @@ function menuDefinition(context, page = "main") {
         [CommandName.GRID_LAST, "末尾へ", "End"],
         [CommandName.TOGGLE_FULLSCREEN, "全画面表示", "F11"],
         [CommandName.OPEN_LOCAL_SETTINGS, "端末の設定", "メニュー"],
+        [CommandName.LOGOUT, "ログアウト", "この端末"],
         [CommandName.RELOAD_APP, "再読み込み", "メニュー"],
       ],
       shortcuts: [
@@ -7700,6 +7711,7 @@ function menuDefinition(context, page = "main") {
     actions: [
       [CommandName.TOGGLE_FULLSCREEN, "全画面表示", "F11"],
       [CommandName.OPEN_LOCAL_SETTINGS, "端末の設定", "メニュー"],
+      [CommandName.LOGOUT, "ログアウト", "この端末"],
       [CommandName.RELOAD_APP, "再読み込み", "メニュー"],
     ],
     shortcuts: [
@@ -13178,6 +13190,18 @@ function toggleBrowserFullscreen() {
 // it must work even after the server-side session or authentication cookie expires.
 export function reloadApplication() {
   window.location.reload();
+}
+
+export async function logoutApplication() {
+  const response = await fetch("/api/auth/logout", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: remoteHeaders({ Accept: "application/json" }),
+  });
+  if (!response.ok) {
+    throw new Error(`ログアウトできません (HTTP ${response.status})。`);
+  }
+  renderPinLogin(0);
 }
 
 function installTelemetry() {

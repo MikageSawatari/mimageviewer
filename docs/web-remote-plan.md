@@ -106,7 +106,9 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
 `?path=...` で渡し、URL path や診断ログの details へ入れない。request log は記録前にクエリ全体を
 落とす。ブラウザの hash route には利用者自身の端末内での履歴・復帰に必要な path を含める。
 
-- リモートから読める範囲は **mIV 本体が開ける範囲と同じ**であり、お気に入り、スマートフォルダ、
+- リモートから読める範囲は、ネットワーク共有の共有名表記と device namespace を除き、
+  **mIV 本体が開ける範囲と同じ**である。ネットワークドライブはドライブ文字の住所を保ったまま
+  公開し、canonicalize が共有名を返す環境でも次の要求を拒否しない。お気に入り、スマートフォルダ、
   タグ、レーティング、ブックマーク、閲覧履歴、本棚をアクセス境界にはしない
 - 保証できない範囲制限を保護として提示すると、利用者に検証されていない保証を信じさせるため、
   favorite / registered-root allowlist は置かない。過去の制限は攻撃を防がず正当な一覧を欠落させた
@@ -114,8 +116,10 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
   外部からは `tailscale serve` 経由だけにする
 - この判断は、有効化のたび接続ダイアログで「mIV が開ける画像・動画・PDF すべて」が対象になると
   明示し、利用者が有効化前に認識できることを前提とする。無効化時には警告を出さない
-- path は NUL を含まない絶対パスで、実在することを remote-web と本体の境界で検証し、canonicalize
-  した値を永続キーと応答 identity に使う。ZIP entry / prefix の slash、drive、backslash、NUL、
+- path は NUL を含まないドライブ文字の絶対パスで、実在することを remote-web と本体の境界で検証する。
+  I/O は canonicalize した値を使い、公開住所は通常表記へ戻す。ネットワークドライブの canonical が
+  共有名になった場合だけ、字句正規化した呼び出し元のドライブ文字表記を公開住所に使う。
+  ZIP entry / prefix の slash、drive、backslash、NUL、
   `..` component 検証と PDF page 範囲検証は維持する
 
 ### 3.2 認証
@@ -141,7 +145,9 @@ remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去�
   指数バックオフする。失敗時刻・接続元・累積失敗回数を診断ログへ記録する
 - 成功時は HMAC-SHA256 署名付き HttpOnly / SameSite=Lax Cookie を発行する。通常は Max-Age 90 日、
   「この端末を記憶しない」選択時は Max-Age のないセッション Cookie とする。`Secure` は direct TLS
-  または `X-Forwarded-Proto: https` を検出したリクエストでだけ付ける
+  または `X-Forwarded-Proto: https` を検出したリクエストでだけ付ける。`POST /api/auth/logout` は
+  現在の remote session を typed drain へ移してから、発行時と同じ Path / HttpOnly / SameSite /
+  Secure 属性と Max-Age=0 でその端末の Cookie を削除する
 - curl 等の診断用には起動時生成の 256bit `Authorization: Bearer <token>` も残す。Bearer は
   定数時間比較し、PIN・hash・セッション署名値・Bearer をログへ出さない。認証失敗本文に内部情報を出さない
 - 接続用 QR コードには URL だけを含め、PIN や Bearer は含めない。URL は `--url`、Tailscale の
@@ -175,6 +181,8 @@ core は認証ファイルを `<data_dir>/remote-web-auth.json` に固定する�
 子プロセスには解決済みの認証ファイルとログファイルを `--auth-file` / `--log` で渡し、
 remote-web 側で保存場所を推測しない。PIN の hash 化とファイル書き込みも owner worker 上で行い、
 有効中の変更では所有 child を再起動する。新しい session 署名鍵になるため既存端末は再認証する。
+接続ダイアログの「すべての端末をログアウト」も同じ owner worker 上で、PIN hash を保ったまま
+session 署名鍵だけを atomic に更新し、所有 child を再起動する。UI thread は認証ファイルを読まない。
 stdout は起動時 Bearer token を含むため収集せず、stderr の安全な診断だけを本体 UI へ渡す。
 管理用 marker を受けた remote は IPC を累積 15 秒復旧できなければ自ら終了し、core の強制終了でも
 画像を配信する孤児を残さない。手動起動には marker が無く、従来どおり無期限に再接続を待つ。
@@ -1834,8 +1842,9 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 `crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
 再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
-tailnet の HTTPS 証明書状態と接続キー有効期限を本体へ通知する 2026-08-12 時点の現行版は **v46**。
-v46 は `RemoteWebConnectionInfo.tailscale_https_certificate` と
+ブラウザの明示 logout で current owner を release する `SessionRelease` を追加した現行版は **v48**。
+v47 は root 以外の Serve path を型付きで通知する。v46 は
+`RemoteWebConnectionInfo.tailscale_https_certificate` と
 `tailscale_key_expiry_unix_seconds` を追加する。v45 で追加した
 `RemoteWebConnectionInfo.tailscale_serve_conflict` も保持する。v44 で削除した
 `RemoteWebConnectionInfo.pin_configured` は戻さない。v43 で `ContainerPayload` に追加した

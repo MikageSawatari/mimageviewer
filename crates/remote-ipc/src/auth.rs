@@ -71,6 +71,15 @@ pub fn set_pin_file(path: &Path, pin: &str) -> Result<(), String> {
     write_record_atomically(path, &record)
 }
 
+pub fn rotate_session_secret_file(path: &Path) -> Result<(), String> {
+    let mut record = load_pin_file(path)?;
+    let mut session_secret = [0_u8; SESSION_SECRET_BYTES];
+    getrandom::fill(&mut session_secret)
+        .map_err(|error| format!("セッション秘密値を生成できません: {error}"))?;
+    record.session_secret_hex = encode_hex(&session_secret);
+    write_record_atomically(path, &record)
+}
+
 pub fn load_pin_file(path: &Path) -> Result<AuthRecord, String> {
     if !path.is_file() {
         return Err(format!(
@@ -292,5 +301,27 @@ mod tests {
         assert_ne!(std::fs::read(&path).unwrap(), first);
         assert!(!temporary_path.exists());
         load_pin_file(&path).unwrap();
+    }
+
+    #[test]
+    fn rotating_sessions_preserves_the_pin_hash_and_replaces_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("remote-web-auth.json");
+        set_pin_file(&path, "123456").unwrap();
+        let before = load_pin_file(&path).unwrap();
+        let before_secret = before.session_secret().unwrap();
+
+        rotate_session_secret_file(&path).unwrap();
+
+        let after = load_pin_file(&path).unwrap();
+        assert_eq!(after.pin_hash(), before.pin_hash());
+        assert_ne!(after.session_secret().unwrap(), before_secret);
+        assert!(!temporary_auth_path(&path).exists());
+
+        let temporary_path = temporary_auth_path(&path);
+        std::fs::create_dir(&temporary_path).unwrap();
+        let unchanged = std::fs::read(&path).unwrap();
+        assert!(rotate_session_secret_file(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), unchanged);
     }
 }

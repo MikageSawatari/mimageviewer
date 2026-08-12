@@ -29,6 +29,7 @@ const UI_REQUEST_CANCELLED: u8 = 2;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReleaseReason {
     Local,
+    Logout,
     AcquireBarrierTimeout,
     LivenessTimeout,
     IdleTimeout,
@@ -42,6 +43,7 @@ impl ReleaseReason {
             Self::Local | Self::AcquireBarrierTimeout => {
                 Some(RemoteLongJobDrainCause::DiscardedByHost)
             }
+            Self::Logout => Some(RemoteLongJobDrainCause::LoggedOut),
             Self::BackgroundExpired => Some(RemoteLongJobDrainCause::BackgroundExpired),
             Self::Superseded => Some(RemoteLongJobDrainCause::Superseded),
             Self::LivenessTimeout | Self::IdleTimeout => None,
@@ -129,7 +131,7 @@ impl ReleaseReason {
     fn status(self) -> SessionStatus {
         match self {
             Self::Local | Self::AcquireBarrierTimeout => SessionStatus::LocalInUse,
-            Self::LivenessTimeout | Self::IdleTimeout | Self::BackgroundExpired => {
+            Self::Logout | Self::LivenessTimeout | Self::IdleTimeout | Self::BackgroundExpired => {
                 SessionStatus::Expired
             }
             Self::Superseded => SessionStatus::Superseded,
@@ -338,6 +340,23 @@ impl SessionStateMachine {
             active.last_activity = now;
         }
         SessionResponse::active(active.session_id.clone())
+    }
+
+    fn logout(&mut self, now: Duration, owner: &RemoteSessionIdentity) -> SessionResponse {
+        self.expire(now);
+        let Some(active) = self.active.as_ref() else {
+            return self.inactive_response(&owner.client_id);
+        };
+        if active.client_id != owner.client_id || active.session_id != owner.session_id {
+            return status_response(
+                SessionStatus::Superseded,
+                "この接続の操作権は無効です。再接続してください。",
+            );
+        }
+        if self.lifecycle.phase != RemoteControlPhase::DrainingRemote {
+            self.begin_drain(ReleaseReason::Logout, now);
+        }
+        self.draining_owner_response()
     }
 
     fn note_long_job_client_seen(&mut self, now: Duration, owner: &RemoteSessionIdentity) -> bool {
@@ -802,6 +821,7 @@ fn session_closing_response() -> SessionResponse {
 fn release_message(reason: ReleaseReason) -> &'static str {
     match reason {
         ReleaseReason::Local => "本体で切断されました。再接続してください。",
+        ReleaseReason::Logout => "この端末からログアウトしました。",
         ReleaseReason::AcquireBarrierTimeout => {
             "本体の処理を安全に停止できなかったため接続を中止しました。処理の終了後に再接続してください。"
         }
@@ -1434,6 +1454,23 @@ impl SessionHandle {
             self.notify_page_job_drain();
             self.clear_video_stream(None);
             self.notify_phase_changed();
+            self.notify_ui();
+        }
+        response
+    }
+
+    pub(crate) fn logout(&self, owner: &RemoteSessionIdentity) -> SessionResponse {
+        let (response, phase_changed) = {
+            let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            let phase = state.lifecycle.phase;
+            let response = state.logout(self.now(), owner);
+            (response, state.lifecycle.phase != phase)
+        };
+        if phase_changed {
+            self.notify_long_job_drain(ReleaseReason::Logout);
+            self.clear_video_stream(None);
+            self.notify_phase_changed();
+            crate::logger::log("remote_ipc: session_drain_started reason=logout".to_owned());
             self.notify_ui();
         }
         response
@@ -2393,6 +2430,7 @@ fn session_watchdog(handle: SessionHandle, stop: Arc<AtomicBool>) {
                     ReleaseReason::IdleTimeout => "idle_timeout",
                     ReleaseReason::BackgroundExpired => "background_expired",
                     ReleaseReason::Local => "local",
+                    ReleaseReason::Logout => "logout",
                     ReleaseReason::AcquireBarrierTimeout => "acquire_barrier_timeout",
                     ReleaseReason::Superseded => "superseded",
                 }
@@ -3165,6 +3203,37 @@ mod tests {
                 .begin_operation(Duration::from_secs(3), &owner, "test".to_owned())
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn browser_logout_revokes_the_current_owner_and_releases_control() {
+        let mut state = SessionStateMachine::default();
+        acquire(&mut state, Duration::ZERO);
+        let owner = state_owner(&state, "client");
+
+        let response = state.logout(Duration::from_secs(1), &owner);
+
+        assert_eq!(response.status, SessionStatus::Expired);
+        assert_eq!(state.lifecycle.phase, RemoteControlPhase::DrainingRemote);
+        assert_eq!(state.drain_reason, Some(ReleaseReason::Logout));
+        assert!(state.complete_app_drain(state.generation));
+        assert_eq!(state.lifecycle.phase, RemoteControlPhase::Local);
+        assert!(state.active.is_none());
+        assert_eq!(state.last_release_reason, Some(ReleaseReason::Logout));
+    }
+
+    #[test]
+    fn browser_logout_cannot_release_another_owner() {
+        let mut state = SessionStateMachine::default();
+        acquire(&mut state, Duration::ZERO);
+        let mut owner = state_owner(&state, "client");
+        owner.session_id = "00000000000000000000000000000000".to_owned();
+
+        let response = state.logout(Duration::from_secs(1), &owner);
+
+        assert_eq!(response.status, SessionStatus::Superseded);
+        assert_eq!(state.lifecycle.phase, RemoteControlPhase::RemoteActive);
+        assert!(state.active.is_some());
     }
 
     #[test]
