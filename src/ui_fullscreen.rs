@@ -4243,6 +4243,15 @@ impl App {
     /// 持っている間、メイン ctx の modifier event は届かない
     /// (= `i.modifiers.shift` が常に false)。元画像表示の修飾キー検出と同じ理由。
     fn original_preview_active(&self, ctx: &egui::Context, idx: usize) -> bool {
+        // Wipe owns Ctrl as a transient drag modifier. Prepared compare paint does not have an
+        // original-preview variant, so allowing the hold action here would only show a misleading
+        // indicator (and briefly alter the ordinary fallback while preparation settles).
+        if matches!(
+            self.compare_view_mode,
+            crate::app::CompareViewMode::Wipe { .. }
+        ) {
+            return false;
+        }
         if !self.fs_prev_focused {
             return false;
         }
@@ -5564,8 +5573,12 @@ fn compare_wipe_line_visible(
     pointer_hover_pos: Option<egui::Pos2>,
     fraction: f32,
     dragging: bool,
+    ctrl_held: bool,
 ) -> bool {
-    dragging || pointer_hover_pos.is_some_and(|pos| compare_wipe_grab_hit(draw_rect, pos, fraction))
+    if dragging {
+        return !ctrl_held;
+    }
+    pointer_hover_pos.is_some_and(|pos| compare_wipe_grab_hit(draw_rect, pos, fraction))
 }
 
 fn compare_wipe_fraction_from_screen_x(
@@ -17946,6 +17959,9 @@ impl App {
         {
             return false;
         }
+        // Fullscreen canvas modifier events can be stale; keep navigator and main compare paint
+        // on the same OS-level Ctrl fact used by other transient canvas modifiers.
+        let ctrl_held = ctrl_held_via_os();
 
         let shader_shape =
             self.compare_preparation
@@ -17980,6 +17996,7 @@ impl App {
                     ctx.input(|input| input.pointer.hover_pos()),
                     fraction,
                     self.compare_wipe_dragging,
+                    ctrl_held,
                 )
             {
                 Self::paint_compare_wipe_line(painter, shader_shape.draw_rect, fraction);
@@ -18024,6 +18041,7 @@ impl App {
                     ctx.input(|input| input.pointer.hover_pos()),
                     fraction,
                     self.compare_wipe_dragging,
+                    ctrl_held,
                 ) {
                     Self::paint_compare_wipe_line(painter, layout.content_rect, fraction);
                 }
@@ -24033,6 +24051,9 @@ impl App {
         if !self.compare_prepared_pair_matches(fs_idx) {
             return false;
         }
+        // Do not read `ctx.input().modifiers` here: the fullscreen viewport can retain a stale
+        // modifier snapshot while the physical Ctrl state changes during the same drag.
+        let ctrl_held = ctrl_held_via_os();
 
         let shader_shape = self
             .compare_preparation
@@ -24068,6 +24089,7 @@ impl App {
                     ctx.input(|input| input.pointer.hover_pos()),
                     fraction,
                     self.compare_wipe_dragging,
+                    ctrl_held,
                 )
             {
                 // 白線はシェーダーの合成境界 (draw_rect = フィット後の実表示画像矩形) に揃える。
@@ -24139,6 +24161,7 @@ impl App {
                     ctx.input(|input| input.pointer.hover_pos()),
                     fraction,
                     self.compare_wipe_dragging,
+                    ctrl_held,
                 ) {
                     Self::draw_compare_wipe_line(ui, ref_rect, fraction);
                 }
@@ -37407,25 +37430,34 @@ mod tests {
     }
 
     #[test]
-    fn compare_wipe_line_uses_drag_or_the_same_grab_band_as_input() {
+    fn compare_wipe_line_uses_drag_or_grab_band_and_ctrl_only_suppresses_drag() {
         let image = egui::Rect::from_min_max(egui::pos2(100.0, 50.0), egui::pos2(900.0, 750.0));
         let fraction = 0.25;
         let line_x = compare_wipe_screen_x(image, fraction);
+        let line_pos = Some(egui::pos2(line_x, image.center().y));
 
-        assert!(!compare_wipe_line_visible(image, None, fraction, false));
+        assert!(!compare_wipe_line_visible(
+            image, None, fraction, false, false
+        ));
         assert!(compare_wipe_line_visible(
-            image,
-            Some(egui::pos2(line_x, image.center().y)),
-            fraction,
-            false
+            image, line_pos, fraction, false, false
+        ));
+        assert!(compare_wipe_line_visible(
+            image, line_pos, fraction, false, true
         ));
         assert!(!compare_wipe_line_visible(
             image,
             Some(egui::pos2(image.right() - 1.0, image.center().y)),
             fraction,
+            false,
             false
         ));
-        assert!(compare_wipe_line_visible(image, None, fraction, true));
+        assert!(compare_wipe_line_visible(
+            image, None, fraction, true, false
+        ));
+        assert!(!compare_wipe_line_visible(
+            image, line_pos, fraction, true, true
+        ));
     }
 
     #[test]
