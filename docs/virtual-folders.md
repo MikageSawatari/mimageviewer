@@ -420,15 +420,19 @@ ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開く�
 | PdfPage | None | Some(page) | `pdf_page_cache_key(page)` | PDF ワーカーでそのページをレンダリング |
 
 PDF ワーカーの render 結果は raster に加えて、PDFium が読んだページ box の point 寸法を返す。
-`thumbnails.source_width/source_height` には rasterized thumbnail の `width/height` ではなく、
-ページ box を **1/1000 point の固定小数点**にした値を保存する。ページごとの box 差を保ったまま
-整数丸め誤差を避け、フルスクリーンの通過 rendition と完成 raster を同一矩形へ配置するためである。
-通常画像と ZIP / 変換 archive 内画像は従来どおり decode 後の元画素寸法を保存する。動画サムネイルは
-catalog のこの生成経路を通らず、fullscreen も poster thumbnail へフォールバックしないため対象外。
+`thumbnails.source_width/source_height` は PDF を含め raster の**ピクセル寸法**を保存する。
+ページ box は別の `layout_width/layout_height` に **1/1000 point の固定小数点**で保存する。
+前者は編集・注釈・クリック判定等の画素座標、後者はページごとの box 差を保った fullscreen layout
+専用であり、単位を読み替えない。通常画像と ZIP / 変換 archive 内画像は従来どおり decode 後の
+元画素寸法を `source_*` に保存し、`layout_*` は NULL。動画サムネイルは catalog のこの生成経路を
+通らず、fullscreen も poster thumbnail へフォールバックしないため対象外。
 
-この意味変更より前のリリース済み catalog は PDF 行に thumbnail 自身の寸法を持つ。元の page box は
-WebP から復元できないため、`pdf_layout_dims_version` の初回 migration で PDF 仮想 catalog のページ行と
-通常フォルダ catalog の `pdfthumb:` 行だけを削除し、次回表示時に再生成する。画像 / ZIP 等の行は残す。
+README の更新履歴で確認できる最新リリース v2.13.0 までの catalog は `source_*` が pixel 契約で、
+正確な page box 列を持たない。未リリースの開発版 `pdf_layout_dims_version=1` だけが同じ `source_*`
+へ page-box 単位を書いていた。WebP だけから page box は復元できず、開発版 v1 行は pixel 値も
+壊れているため、version 2 migration は PDF 仮想 catalog のページ行と通常フォルダ catalog の
+`pdfthumb:` 行だけを一度削除して両寸法を再生成する。画像 / ZIP 等の行は残す。旧 catalog を
+読み取り専用で参照する経路では、未追加の `layout_*` を NULL として扱う。
 
 `ConvertibleArchive` の cache ZIP 対応表 (`App.converted_archive_cache_paths`) は
 `install_new_items` で現在 items の path/mtime/size と、folder thumb pin を引く container root

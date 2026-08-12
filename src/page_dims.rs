@@ -2,11 +2,13 @@
 
 use std::collections::HashMap;
 
-/// 一度判明したページのピクセル寸法を、テクスチャの生存期間と切り離して覚えておく。
+/// 一度判明したページのピクセル寸法とレイアウト寸法を、テクスチャの生存期間から
+/// 切り離して覚えておく。両者は単位と用途が異なるため別 map で所有する。
 #[derive(Clone, Debug, Default)]
 pub struct PageDimsCache {
     generation: u64,
     dims: HashMap<usize, (u32, u32)>,
+    layout_dims: HashMap<usize, (u32, u32)>,
 }
 
 impl PageDimsCache {
@@ -16,6 +18,7 @@ impl PageDimsCache {
     pub fn record(&mut self, generation: u64, idx: usize, dims: (u32, u32)) {
         if self.generation != generation {
             self.dims.clear();
+            self.layout_dims.clear();
             self.generation = generation;
         }
         self.dims.insert(idx, dims);
@@ -30,9 +33,27 @@ impl PageDimsCache {
             .flatten()
     }
 
+    /// PDF page box など、pixel raster と独立したレイアウト寸法を記録する。
+    pub fn record_layout(&mut self, generation: u64, idx: usize, dims: (u32, u32)) {
+        if self.generation != generation {
+            self.dims.clear();
+            self.layout_dims.clear();
+            self.generation = generation;
+        }
+        self.layout_dims.insert(idx, dims);
+    }
+
+    /// 現在の items 世代で判明済みのレイアウト寸法を返す。
+    pub fn get_layout(&self, generation: u64, idx: usize) -> Option<(u32, u32)> {
+        (self.generation == generation)
+            .then(|| self.layout_dims.get(&idx).copied())
+            .flatten()
+    }
+
     /// 現在保持している寸法をすべて破棄する。
     pub fn clear(&mut self) {
         self.dims.clear();
+        self.layout_dims.clear();
     }
 }
 
@@ -74,5 +95,15 @@ mod tests {
         cache.clear();
 
         assert_eq!(cache.get(7, 3), None);
+    }
+
+    #[test]
+    fn layout_dims_survive_independently_from_pixel_dims() {
+        let mut cache = PageDimsCache::default();
+        cache.record(7, 3, (273, 416));
+        cache.record_layout(7, 3, (468_600, 714_360));
+
+        assert_eq!(cache.get(7, 3), Some((273, 416)));
+        assert_eq!(cache.get_layout(7, 3), Some((468_600, 714_360)));
     }
 }

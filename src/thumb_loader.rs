@@ -210,6 +210,8 @@ pub struct ThumbMsg {
     pub edit_preview_adjustment: Option<ThumbEditPreviewAdjustment>,
     /// 元画像のピクセル寸法 (幅, 高さ)。取得できなかった場合は None。
     pub source_dims: Option<(u32, u32)>,
+    /// PDF page box の 1/1000 point 寸法。raster と独立したレイアウト専用値。
+    pub layout_dims: Option<(u32, u32)>,
     /// ワーカーがロードを中断した場合 true (STALE: keep_range 外になった等)。
     /// `image` は必ず `None`。UI 側は `thumbnails[idx]` を `Evicted` に戻し、
     /// `requested` からも削除して **再試行可能** な状態にする (`Failed` にはしない)。
@@ -385,13 +387,13 @@ impl CacheDecision {
 pub fn resize_to_display_color_image(
     img: &image::DynamicImage,
     display_px: u32,
-    source_dims: Option<(u32, u32)>,
+    aspect_dims: Option<(u32, u32)>,
 ) -> egui::ColorImage {
     let resized = crate::fast_resize::resize_dynamic_fit_with_source_aspect(
         img,
         display_px,
         display_px,
-        source_dims.unwrap_or((img.width(), img.height())),
+        aspect_dims.unwrap_or((img.width(), img.height())),
         crate::fast_resize::Quality::Lanczos3,
     );
     let rgba = resized.to_rgba8();
@@ -858,6 +860,7 @@ fn send_thumb_failed(req: &LoadRequest, tx: &mpsc::Sender<ThumbMsg>, gen_done: &
         from_edit_preview: false,
         edit_preview_adjustment: None,
         source_dims: None,
+        layout_dims: None,
         canceled: false,
         finalized: false,
         input_seq: req.input_seq,
@@ -882,13 +885,14 @@ fn send_pinned_only_cached(
                     key.clone(),
                     entry.jpeg_data.clone(),
                     entry.source_dims,
+                    entry.layout_dims,
                     entry.mtime,
                     entry.file_size,
                 )
             })
     });
 
-    let Some((filename, webp_data, source_dims, mtime, file_size)) = cached else {
+    let Some((filename, webp_data, source_dims, layout_dims, mtime, file_size)) = cached else {
         crate::logger::log(format!(
             "drive-list pin: cached thumbnail missing ({})",
             pin.cache_key_prefix
@@ -904,6 +908,7 @@ fn send_pinned_only_cached(
         from_edit_preview: false,
         edit_preview_adjustment: None,
         source_dims,
+        layout_dims,
         canceled: false,
         finalized: false,
         input_seq: req.input_seq,
@@ -1011,6 +1016,7 @@ pub fn process_load_request(
                 annotation_layers: preview.annotation_layers,
             }),
             source_dims: Some(preview.source_dims),
+            layout_dims: None,
             canceled: false,
             finalized: false,
             input_seq: req.input_seq,
@@ -1048,12 +1054,16 @@ pub fn process_load_request(
         let cached = cache_map.read().ok().and_then(|map| {
             let entry = map.get(filename)?;
             if entry.mtime == req.mtime && entry.file_size == req.file_size {
-                Some((entry.jpeg_data.clone(), entry.source_dims))
+                Some((
+                    entry.jpeg_data.clone(),
+                    entry.source_dims,
+                    entry.layout_dims,
+                ))
             } else {
                 None
             }
         });
-        if let Some((webp_data, source_dims)) = cached {
+        if let Some((webp_data, source_dims, layout_dims)) = cached {
             let ci = crate::catalog::decode_thumb_to_color_image(&webp_data).map(|image| {
                 match pinned_page_adjustment.as_ref() {
                     Some(params) => crate::adjustment::apply_adjustments_fast(&image, params),
@@ -1071,6 +1081,7 @@ pub fn process_load_request(
                 from_edit_preview: false,
                 edit_preview_adjustment: None,
                 source_dims,
+                layout_dims,
                 canceled: false,
                 finalized: false,
                 input_seq: req.input_seq,
@@ -1171,6 +1182,7 @@ pub fn process_load_request(
                     from_edit_preview: false,
                     edit_preview_adjustment: None,
                     source_dims: None,
+                    layout_dims: None,
                     canceled: false,
                     finalized: false,
                     input_seq: req.input_seq,
@@ -1249,6 +1261,7 @@ pub fn process_load_request(
                     from_edit_preview: false,
                     edit_preview_adjustment: None,
                     source_dims: None,
+                    layout_dims: None,
                     canceled: false,
                     finalized: false,
                     input_seq: req.input_seq,
@@ -1284,6 +1297,7 @@ pub fn process_load_request(
                     from_edit_preview: false,
                     edit_preview_adjustment: None,
                     source_dims: None,
+                    layout_dims: None,
                     canceled: false,
                     finalized: false,
                     input_seq: req.input_seq,
@@ -1331,6 +1345,7 @@ pub fn process_load_request(
                 from_edit_preview: false,
                 edit_preview_adjustment: None,
                 source_dims: None,
+                layout_dims: None,
                 canceled: true,
                 finalized: false,
                 input_seq: req.input_seq,
@@ -1351,11 +1366,12 @@ pub fn process_load_request(
         let mut mirrored = false;
         if should_save {
             let cat = catalog_ref.expect("should_save => catalog is Some");
-            match cat.save_thumb_bytes(
+            match cat.save_thumb_bytes_with_layout_dims(
                 filename,
                 req.mtime,
                 req.file_size,
                 cached.source_dims,
+                cached.layout_dims,
                 &cached.webp_data,
             ) {
                 Ok(true) => {
@@ -1367,6 +1383,7 @@ pub fn process_load_request(
                                 file_size: req.file_size,
                                 jpeg_data: cached.webp_data.clone(),
                                 source_dims: cached.source_dims,
+                                layout_dims: cached.layout_dims,
                             },
                         );
                     }
@@ -1393,6 +1410,7 @@ pub fn process_load_request(
             from_edit_preview: false,
             edit_preview_adjustment: None,
             source_dims: cached.source_dims,
+            layout_dims: cached.layout_dims,
             canceled: false,
             finalized: false,
             input_seq: req.input_seq,
@@ -1455,6 +1473,7 @@ pub fn process_load_request(
                 from_edit_preview: false,
                 edit_preview_adjustment: None,
                 source_dims: None,
+                layout_dims: None,
                 canceled: true,
                 finalized: false,
                 input_seq: req.input_seq,
@@ -1971,8 +1990,9 @@ fn process_neighbor_prefetch(
         }
     }
     if !thumb_present {
-        if let Some(bytes) = encode_and_save_with_source_dims(
+        if let Some(bytes) = encode_and_save_with_geometry(
             &res.image,
+            None,
             res.page_size_points.catalog_layout_dims(),
             &folder_key,
             parent_catalog,
@@ -2131,6 +2151,7 @@ struct CachedPinnedFolderThumb {
     image: egui::ColorImage,
     webp_data: Vec<u8>,
     source_dims: Option<(u32, u32)>,
+    layout_dims: Option<(u32, u32)>,
     source_path: std::path::PathBuf,
     source_mtime: i64,
     source_file_size: i64,
@@ -2194,6 +2215,7 @@ fn load_cached_pinned_folder_thumb(
         image,
         webp_data: entry.jpeg_data,
         source_dims: entry.source_dims,
+        layout_dims: entry.layout_dims,
         source_path: resolved.abs_path.clone(),
         source_mtime: resolved.mtime,
         source_file_size: resolved.file_size,
@@ -2762,6 +2784,7 @@ pub fn load_one_cached(
                     from_edit_preview: false,
                     edit_preview_adjustment: None,
                     source_dims: None,
+                    layout_dims: None,
                     canceled: true,
                     finalized: false,
                     input_seq,
@@ -2778,6 +2801,7 @@ pub fn load_one_cached(
                 from_edit_preview: false,
                 edit_preview_adjustment: None,
                 source_dims: None,
+                layout_dims: None,
                 canceled: false,
                 finalized: false,
                 input_seq,
@@ -2804,20 +2828,18 @@ pub fn load_one_cached(
 
     let decode_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-    // 元画像の寸法。PDF だけは表示 raster のピクセル寸法ではなく page box の
-    // 固定小数点レイアウト寸法を使う。PDFium の target 丸めで 327x473 等になった
-    // thumbnail 自身の比率を保存すると、final への差し替え時に枠が動くため。
+    // source_dims は常にピクセル座標系。PDF page box の正確な比率は layout_dims に
+    // 分離し、リリース済みの source_* 契約を別の単位で上書きしない。
     // DCT scale 経由なら `img.width()/height()` は scaled buffer の寸法なので
     // 使わず、`dct_stats.src_w/src_h` から EXIF 適用後寸法を算出する。
     // 非 DCT 経路 (image::open / WIC / Susie / ZIP image::load_from_memory)
     // は img の現寸法 = 元寸法 (EXIF 適用済み) なので従来通り。
-    let source_dims: Option<(u32, u32)> = if pdf_page.is_some() {
-        pdf_layout_dims
-    } else if let Some(stats) = dct_stats {
+    let source_dims: Option<(u32, u32)> = if let Some(stats) = dct_stats {
         Some(stats.source_dims_after_exif(orientation))
     } else {
         Some((img.width(), img.height()))
     };
+    let layout_dims = pdf_page.is_some().then_some(pdf_layout_dims).flatten();
 
     // DCT スケール経由なら perf event を発火 (`thumb/dct_scale`)。
     // `decode_ms` を含めることで analyze_perf.py で scale_num 別の所要時間を集計可能。
@@ -2844,7 +2866,7 @@ pub fn load_one_cached(
     //     WebP 量子化を経由しないため画質劣化なし、かつ WebP encode を待たない
     //     from_cache = false: 元画像由来の高画質 (段階 E アップグレード不要)
     let t_display = std::time::Instant::now();
-    let display_ci = resize_to_display_color_image(&img, display_px, source_dims);
+    let display_ci = resize_to_display_color_image(&img, display_px, layout_dims.or(source_dims));
     let display_ci = match pinned_page_adjustment {
         Some(params) => crate::adjustment::apply_adjustments_fast(&display_ci, params),
         None => display_ci,
@@ -2861,6 +2883,7 @@ pub fn load_one_cached(
         from_edit_preview: false,
         edit_preview_adjustment: None,
         source_dims,
+        layout_dims,
         canceled: false,
         finalized: false,
         input_seq,
@@ -2897,15 +2920,26 @@ pub fn load_one_cached(
     if should_save {
         let cat = catalog.expect("should_save => catalog is Some");
         let t_enc = std::time::Instant::now();
-        match crate::catalog::encode_thumb_webp_with_source_dims(
+        match crate::catalog::encode_thumb_webp_with_aspect_dims(
             &img,
             thumb_px,
             thumb_quality as f32,
-            source_dims.unwrap_or((img.width(), img.height())),
+            layout_dims
+                .or(source_dims)
+                .unwrap_or((img.width(), img.height())),
         ) {
             Some((webp_data, w, h)) => {
                 let encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
-                if let Err(e) = cat.save(name, mtime, file_size, w, h, source_dims, &webp_data) {
+                if let Err(e) = cat.save_with_layout_dims(
+                    name,
+                    mtime,
+                    file_size,
+                    w,
+                    h,
+                    source_dims,
+                    layout_dims,
+                    &webp_data,
+                ) {
                     crate::logger::log(format!("    idx={idx:>4} catalog save: {e}"));
                 } else if let Some(cm) = cache_map {
                     // DB 保存成功 → in-memory cache_map にも反映する。
@@ -2918,6 +2952,7 @@ pub fn load_one_cached(
                                 file_size,
                                 jpeg_data: webp_data,
                                 source_dims,
+                                layout_dims,
                             },
                         );
                     }
@@ -2970,6 +3005,7 @@ pub fn load_one_cached(
         from_edit_preview: false,
         edit_preview_adjustment: None,
         source_dims: None,
+        layout_dims: None,
         canceled: false,
         finalized: true,
         input_seq,
@@ -3755,6 +3791,43 @@ mod tests {
 
         assert_eq!(resolved_image_path(picked), Some(expected));
     }
+
+    #[test]
+    fn pdf_geometry_save_keeps_raster_pixels_and_page_layout_separate() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = crate::catalog::CatalogDb::open(
+            &tmp.path().join("cache"),
+            &tmp.path().join("book.pdf"),
+        )
+        .unwrap();
+        let raster = image::DynamicImage::new_rgb8(1135, 1730);
+        let page_layout = (468_600, 714_360);
+
+        encode_and_save_with_geometry(
+            &raster,
+            None,
+            Some(page_layout),
+            "page_0000",
+            &catalog,
+            1,
+            10,
+            512,
+            75,
+        )
+        .expect("encode PDF thumbnail geometry");
+
+        let entry = catalog.load_one("page_0000").unwrap().unwrap();
+        assert_eq!(entry.source_dims, Some((1135, 1730)));
+        assert_eq!(entry.layout_dims, Some(page_layout));
+        let (thumb_w, thumb_h) = crate::catalog::decode_thumb_dims(&entry.jpeg_data).unwrap();
+        let thumb_aspect = thumb_w as f64 / thumb_h as f64;
+        let layout_aspect = page_layout.0 as f64 / page_layout.1 as f64;
+        assert!(
+            ((thumb_aspect - layout_aspect) / layout_aspect).abs() < 0.001,
+            "thumb={thumb_w}x{thumb_h} layout={:?}",
+            page_layout
+        );
+    }
 }
 
 /// 画像1枚をデコード・エンコード・カタログ保存する。成功時は WebP バイト数を返す。
@@ -3865,15 +3938,54 @@ pub fn encode_and_save_with_source_dims(
     thumb_px: u32,
     thumb_quality: u8,
 ) -> Option<usize> {
+    encode_and_save_with_geometry(
+        img,
+        source_dims_override,
+        None,
+        key,
+        catalog,
+        mtime,
+        file_size,
+        thumb_px,
+        thumb_quality,
+    )
+}
+
+/// Pixel coordinate dimensions and layout-only dimensions are persisted in
+/// separate columns. `layout_dims` controls thumbnail fitting when present but
+/// never changes the pixel meaning of `source_dims`.
+#[allow(clippy::too_many_arguments)]
+fn encode_and_save_with_geometry(
+    img: &image::DynamicImage,
+    source_dims_override: Option<(u32, u32)>,
+    layout_dims: Option<(u32, u32)>,
+    key: &str,
+    catalog: &crate::catalog::CatalogDb,
+    mtime: i64,
+    file_size: i64,
+    thumb_px: u32,
+    thumb_quality: u8,
+) -> Option<usize> {
     let source_dims = source_dims_override.or(Some((img.width(), img.height())));
-    let (webp_data, w, h) = crate::catalog::encode_thumb_webp_with_source_dims(
+    let (webp_data, w, h) = crate::catalog::encode_thumb_webp_with_aspect_dims(
         img,
         thumb_px,
         thumb_quality as f32,
-        source_dims.unwrap_or((img.width(), img.height())),
+        layout_dims
+            .or(source_dims)
+            .unwrap_or((img.width(), img.height())),
     )?;
     catalog
-        .save(key, mtime, file_size, w, h, source_dims, &webp_data)
+        .save_with_layout_dims(
+            key,
+            mtime,
+            file_size,
+            w,
+            h,
+            source_dims,
+            layout_dims,
+            &webp_data,
+        )
         .ok()?;
     Some(webp_data.len())
 }
@@ -3943,8 +4055,9 @@ pub fn build_and_save_one_pdf(
     )
     .ok()?;
     let key = crate::grid_item::pdf_page_cache_key(page_num);
-    encode_and_save_with_source_dims(
+    encode_and_save_with_geometry(
         &res.image,
+        None,
         res.page_size_points.catalog_layout_dims(),
         &key,
         catalog,

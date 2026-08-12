@@ -13508,7 +13508,7 @@ impl App {
     /// ユーザーが UI で「自動」を初めて押したとき、それまで Manual で動いていて
     /// `poll_thumbnails` の sample 記録経路 (Auto ON 限定) が動いていなかったため、
     /// `samples` は空のまま。Auto ON 直後にこの関数で既存の Loaded サムネから
-    /// `source_dims` を集めて、即座に判定材料を揃える。
+    /// `layout_dims` / `source_dims` を集めて、即座に判定材料を揃える。
     ///
     /// Codex P2 #1 / 2026-05 ユーザー報告: 「自動を選んでもしばらく反応しない」の対応。
     pub(crate) fn rebuild_auto_aspect_samples_from_loaded(&mut self) {
@@ -13518,11 +13518,14 @@ impl App {
         self.auto_aspect.samples.clear();
         for (idx, state) in self.thumbnails.iter().enumerate() {
             if let ThumbnailState::Loaded {
-                source_dims, tex, ..
+                source_dims,
+                layout_dims,
+                tex,
+                ..
             } = state
             {
-                let ratio = match source_dims {
-                    Some((sw, sh)) if *sw > 0 => *sh as f32 / *sw as f32,
+                let ratio = match (*layout_dims).or(*source_dims) {
+                    Some((sw, sh)) if sw > 0 => sh as f32 / sw as f32,
                     _ => {
                         // source_dims が無くても、テクスチャ寸法から比率を拾える
                         // (アスペクト保持リサイズ済みなので比率は保たれる)
@@ -21713,11 +21716,12 @@ impl App {
             // `Failed` 状態に陥る (Codex P2)。
             // SQLite I/O エラーは Ok(false) と区別してログに残す (= 静かに丸めると
             // disk full / lock 競合の調査が困難になるため)。
-            let saved = match target_db.save_thumb_bytes(
+            let saved = match target_db.save_thumb_bytes_with_layout_dims(
                 &target_key,
                 entry.mtime,
                 entry.file_size,
                 entry.source_dims,
+                entry.layout_dims,
                 &entry.jpeg_data,
             ) {
                 Ok(b) => b,
@@ -21793,11 +21797,12 @@ impl App {
             .and_then(|m| m.get(&wb.target_key).cloned());
         if let Some(entry) = entry_opt {
             let parent_key = wb.parent_key.clone();
-            let _ = wb.parent_catalog.save_thumb_bytes(
+            let _ = wb.parent_catalog.save_thumb_bytes_with_layout_dims(
                 &parent_key,
                 wb.parent_entry_mtime,
                 wb.parent_entry_size,
                 entry.source_dims,
+                entry.layout_dims,
                 &entry.jpeg_data,
             );
             crate::perf::event("nav", "virtual_writeback", Some(&parent_key), 0, &[]);
@@ -23528,6 +23533,7 @@ impl App {
                         file_size: resolved.file_size,
                         jpeg_data: webp,
                         source_dims: None,
+                        layout_dims: None,
                     },
                 );
             }
@@ -23573,6 +23579,7 @@ impl App {
                             file_size: 0,
                             jpeg_data: webp,
                             source_dims: None,
+                            layout_dims: None,
                         })
                     }
                     FileKind::ZipFile => {
@@ -28324,6 +28331,7 @@ impl App {
                 from_edit_preview: false,
                 edit_preview_adjustment: None,
                 source_dims: Some((width as u32, height as u32)),
+                layout_dims: None,
                 canceled: false,
                 finalized: false,
                 input_seq: self.input_seq,
@@ -29825,6 +29833,7 @@ impl App {
                             from_edit_preview: false,
                             edit_preview_adjustment: None,
                             source_dims: None,
+                            layout_dims: None,
                             canceled: true,
                             finalized: false,
                             input_seq: req.input_seq,
@@ -30160,6 +30169,7 @@ impl App {
                     from_edit_preview: false,
                     edit_preview_adjustment: None,
                     source_dims: None,
+                    layout_dims: None,
                     canceled: false,
                     finalized: false,
                     input_seq: 0,
@@ -30222,6 +30232,7 @@ impl App {
                 from_edit_preview,
                 edit_preview_adjustment,
                 source_dims,
+                layout_dims,
                 canceled,
                 finalized,
                 input_seq: req_input_seq,
@@ -30386,6 +30397,7 @@ impl App {
                             from_edit_preview,
                             rendered_at_px,
                             source_dims,
+                            layout_dims,
                         };
                         textures_created += 1;
                         // 見開きの縦横判定はテクスチャ寿命に依存させない。元寸法が無い
@@ -30395,11 +30407,15 @@ impl App {
                         {
                             self.page_dims_cache.record(self.items_generation, i, dims);
                         }
+                        if let Some(dims) = layout_dims {
+                            self.page_dims_cache
+                                .record_layout(self.items_generation, i, dims);
+                        }
                         // auto_aspect: 新規 Loaded のタイミングで比率サンプルを記録。
                         // source_dims が None なら ColorImage の (w, h) を fallback として使う
                         // (動画 Shell サムネ / 旧 cache 由来などで source_dims が無いケース)。
                         if self.settings.thumb_aspect_auto {
-                            let ratio = match source_dims {
+                            let ratio = match layout_dims.or(source_dims) {
                                 Some((sw, sh)) if sw > 0 => sh as f32 / sw as f32,
                                 _ if w > 0 => h as f32 / w as f32,
                                 _ => -1.0,
@@ -30475,6 +30491,7 @@ impl App {
                             from_edit_preview,
                             edit_preview_adjustment,
                             source_dims,
+                            layout_dims,
                             canceled: false,
                             finalized: false,
                             input_seq: req_input_seq,

@@ -3477,6 +3477,7 @@ mod tests {
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: None,
+            layout_dims: None,
         }
     }
 

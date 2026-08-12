@@ -3361,6 +3361,23 @@ fn choose_layout_base_size(
     valid_layout_size_or_fallback(rotated_display_size(selected, rotation), fallback)
 }
 
+fn choose_continuous_page_layout_size(
+    canonical_layout: Option<egui::Vec2>,
+    processed: Option<egui::Vec2>,
+    raster_fallback: Option<egui::Vec2>,
+    fallback: egui::Vec2,
+    rotation: crate::rotation_db::Rotation,
+    prefer_processed: bool,
+) -> egui::Vec2 {
+    choose_layout_base_size(
+        processed,
+        canonical_layout.or(raster_fallback),
+        fallback,
+        rotation,
+        prefer_processed,
+    )
+}
+
 /// 透過背景の描画スタイル。Shift+B で 3 モードを循環する。
 ///
 /// フルスクリーンのビューポート背景は `ui_fullscreen.rs` で `Color32::BLACK` に
@@ -6179,10 +6196,13 @@ fn is_landscape(
     }
     // サムネイルから判定
     if let Some(ThumbnailState::Loaded {
-        tex, source_dims, ..
+        tex,
+        source_dims,
+        layout_dims,
+        ..
     }) = thumbnails.get(idx)
     {
-        if let Some((w, h)) = source_dims {
+        if let Some((w, h)) = (*layout_dims).or(*source_dims) {
             return w > h;
         }
         let s = tex.size_vec2();
@@ -13680,8 +13700,8 @@ impl App {
     }
 
     /// Pixel coordinate dimensions used by annotations, hit testing, and Original
-    /// scale. PDF catalog dimensions are page-layout units, so they are not a
-    /// coordinate fallback until a full/display raster has supplied real pixels.
+    /// scale. PDF `source_*` values have the same pixel contract as other sources;
+    /// the independent page-box aspect lives in `layout_*`.
     fn fs_page_coordinate_source_size(&self, idx: usize) -> Option<egui::Vec2> {
         self.source_dims_for_idx(idx)
             .map(|(w, h)| egui::vec2(w, h))
@@ -13704,19 +13724,29 @@ impl App {
             })
     }
 
+    fn pdf_page_layout_size(&self, idx: usize) -> Option<egui::Vec2> {
+        if !matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
+            return None;
+        }
+        match self.thumbnails.get(idx) {
+            Some(ThumbnailState::Loaded {
+                layout_dims: Some((w, h)),
+                ..
+            }) => Some(egui::vec2(*w as f32, *h as f32)),
+            _ => self
+                .page_dims_cache
+                .get_layout(self.items_generation, idx)
+                .map(|(w, h)| egui::vec2(w as f32, h as f32)),
+        }
+    }
+
     /// Canonical, pre-raster-rounding dimensions used only to lay out a page.
     /// PDF page box dimensions persisted with the thumbnail win even after the
-    /// display raster arrives, so both textures resolve to one stable rectangle.
+    /// display raster or thumbnail texture is evicted, so every raster resolves
+    /// to one stable rectangle.
     fn fs_page_layout_source_size(&self, idx: usize) -> Option<egui::Vec2> {
-        if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }))
-            && let Some(ThumbnailState::Loaded {
-                source_dims: Some((w, h)),
-                ..
-            }) = self.thumbnails.get(idx)
-        {
-            return Some(egui::vec2(*w as f32, *h as f32));
-        }
-        self.fs_page_coordinate_source_size(idx)
+        self.pdf_page_layout_size(idx)
+            .or_else(|| self.fs_page_coordinate_source_size(idx))
     }
 
     /// 見開き上部 HUD の相方ページ情報を、表示済みキャッシュだけから組み立てる。
@@ -21693,7 +21723,7 @@ impl App {
         prefer_processed: bool,
     ) -> egui::Vec2 {
         let rotation = self.get_rotation(idx);
-        let raw = match self.fs_cache.get(&idx) {
+        let raster_fallback = match self.fs_cache.get(&idx) {
             Some(FsCacheEntry::Static {
                 tex, source_dims, ..
             }) => match source_dims {
@@ -21721,7 +21751,14 @@ impl App {
             _ => None,
         });
         let processed = self.current_processed_layout_size(idx);
-        choose_layout_base_size(processed, raw, fallback, rotation, prefer_processed)
+        choose_continuous_page_layout_size(
+            self.pdf_page_layout_size(idx),
+            processed,
+            raster_fallback,
+            fallback,
+            rotation,
+            prefer_processed,
+        )
     }
 
     fn continuous_unit_base_size(
@@ -30889,6 +30926,7 @@ mod tests {
             from_edit_preview: false,
             rendered_at_px: 4,
             source_dims: Some((400, 401)),
+            layout_dims: None,
         });
         app.thumb_pixels.insert(0, pixels);
         app.fullscreen_idx = Some(0);
@@ -37586,6 +37624,30 @@ mod tests {
             ),
             egui::vec2(200.0, 400.0)
         );
+    }
+
+    #[test]
+    fn continuous_pdf_layout_keeps_page_box_aspect_when_final_raster_arrives() {
+        // Real regression: the holdover thumbnail was 226x422 (0.5355), while
+        // PDF page 0 is 468.600x714.360 points and its final raster is 4540x6920.
+        // The final texture can become paintable later in the same frame than the
+        // layout lookup, so it is intentionally absent from `processed` here.
+        let layout = choose_continuous_page_layout_size(
+            Some(egui::vec2(468_600.0, 714_360.0)),
+            None,
+            Some(egui::vec2(226.0, 422.0)),
+            egui::vec2(100.0, 100.0),
+            crate::rotation_db::Rotation::None,
+            true,
+        );
+        let layout_aspect = layout.x / layout.y;
+        let raster_aspect = 4540.0 / 6920.0;
+
+        assert!(
+            ((layout_aspect - raster_aspect) / raster_aspect).abs() < 0.001,
+            "layout={layout_aspect} raster={raster_aspect}"
+        );
+        assert!((layout_aspect - 226.0 / 422.0).abs() > 0.1);
     }
 
     #[test]

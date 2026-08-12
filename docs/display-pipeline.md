@@ -12,7 +12,8 @@
 `GridItem` 1 個につき 1 つの `ThumbnailState` (grid_item.rs) を持つ:
 
 ```
-Pending ──────────(ワーカーがデコード)──────────▶ Loaded { tex, from_cache, rendered_at_px, source_dims }
+Pending ──────────(ワーカーがデコード)──────────▶ Loaded { tex, from_cache, rendered_at_px,
+                                                           source_dims, layout_dims }
                                                        │
                                            (keep_range 外に出ると)
                                                        ▼
@@ -21,10 +22,12 @@ Pending ──────────(ワーカーがデコード)────�
 
 Failed は単発の終端ステート。デコードエラー時のみ。
 
-`Loaded` へ遷移した時点で、`source_dims`（無ければロード済み画像寸法）を per-context の
-`PageDimsCache` に記録する。`Evicted` は GPU texture だけを破棄し、同じ `items_generation` で
-判明済みのページ寸法は残す。idx 空間が変わるときだけ `invalidate_idx_state_and_queues` で clear し、
-cache 自身の generation 不一致も `None` へ fail-closed する。
+`Loaded` へ遷移した時点で、`source_dims`（無ければロード済み画像寸法）と PDF の `layout_dims` を
+per-context の `PageDimsCache` の別 map に記録する。`source_dims` は常にピクセル座標、
+`layout_dims` は PDF page box の 1/1000 point であり、単位を混ぜない。`Evicted` は GPU texture
+だけを破棄し、同じ `items_generation` で判明済みの両寸法は残す。idx 空間が変わるときだけ
+`invalidate_idx_state_and_queues` で clear し、cache 自身の generation 不一致も `None` へ
+fail-closed する。
 
 ### 1.2 2 フェーズ優先ロード
 
@@ -97,7 +100,7 @@ resync (`MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES`) と同じ「surface 復帰まで
         ├─ CacheDecision::should_cache でキャッシュ可否判定
         └─ 必要なら WebP エンコードして catalog.db に保存
 3. mpsc で (idx, ColorImage, from_cache, from_edit_preview,
-   edit_preview_adjustment, source_dims) を送信
+   edit_preview_adjustment, source_dims, layout_dims) を送信
 ```
 
 ### 1.3.1 非破壊編集プレビューキャッシュ
@@ -727,8 +730,8 @@ per-frame 経路 (`d3d11_shared` / `cpu_upload`) はプレゼン側の判定で�
 共用する。長辺を上限へ固定して短辺を 1 回だけ丸めると、PDF のように raster ごとの丸めが
 異なるページで 0.1% 程度の縦横比誤差が残る。そこで width / height の両軸から整数候補を
 列挙し、元の縦横比に対する相対誤差 0.05% 以下を満たす最大解像度の候補を選ぶ。PDF page box
-や JPEG DCT 縮小のように decoded raster より正確な `source_dims` がある場合は、その比率を
-選択器へ渡す。PDFium の `fit_to_target` も page box を同じ選択器へ渡し、低解像度 raster を
+(`layout_dims`) や JPEG DCT 縮小の元ピクセル寸法 (`source_dims`) のように decoded raster より
+正確な比がある場合は、その比率を選択器へ渡す。PDFium の `fit_to_target` も page box を同じ選択器へ渡し、低解像度 raster を
 最初から選択済み整数寸法で描画する。上限を超える拡大はせず、既存 catalog 行も強制再生成
 しないため、この改善は新規生成分から適用する。
 
@@ -1776,10 +1779,20 @@ resident final や rendition の有無でページごとに mode を反転させ
 未解決 unit として直前表示を保ち、後続 frame の rendition へ差し替える。
 
 通過 rendition の外側の**ページ矩形**は、低解像度 texture の整数寸法ではなく source/header 寸法
-(`ThumbnailState::Loaded::source_dims` を含む) から求める。PDF は thumbnail / fullscreen の
-各 raster 寸法が別々に整数丸めされるため、PDFium が読むページ box を 1/1000 point の固定小数点
-レイアウト寸法として catalog に保存し、通過 rendition と完成 texture のページ矩形を同じ位置・
-大きさに固定する。これは注釈等が使う完成 raster の画素座標とは別の軸である。
+から求める。PDF は thumbnail / fullscreen の各 raster 寸法が別々に整数丸めされるため、PDFium が
+読む page box を `layout_width/layout_height` に 1/1000 point の固定小数点レイアウト寸法として
+保存し、通過 rendition と完成 texture のページ矩形を同じ位置・大きさに固定する。一方、
+`source_width/source_height` は PDF を含め常に raster のピクセル寸法であり、注釈・クリック判定・
+編集座標等に使う。両者は別の軸で、相互の fallback として単位を混ぜない。
+
+縦連続表示も同じ PDF レイアウト寸法を `vertical_reading_base_size` の最優先 source とする。
+2026-08-12 の実ログでは page 0 の final raster が `4540×6920` へ切り替わった frame に、直前の
+cached thumbnail `226×422` の比 (`0.5355`) が連続表示だけに残り、ページ矩形が
+`561.1×1048` (`0.5354`) になっていた。page box は `468.600×714.360 pt` (`0.6560`) であり、
+同じ final raster の比 (`0.6561`) と一致する。原因は paged path の canonical layout owner を
+連続表示が迂回し、かつ `Evicted` で PDF layout metadata を失えたことだった。現在は同一の
+`layout_dims` を paged / continuous の両方へ供給し、generation-scoped cache が texture eviction
+後も保持する。
 
 ただし低解像度 raster 自体をそのページ矩形へ非等方に引き伸ばしてはならない。rendition の実描画
 矩形は texture 自身の縦横比を保つ contain fit とし、ページ矩形の中央へ置く。完成 texture だけは
@@ -1788,7 +1801,7 @@ resident final や rendition の有無でページごとに mode を反転させ
 source 選択と差し替えは引き続き表示単位で原子的に行う。
 
 縦・横の連結読みは通過表示の対象外 (スクロールは実体化済みのページを見せるだけなので、
-キーごとの実体化コストが元から出ない)。
+キーごとの実体化コストが元から出ない) だが、ページ矩形の canonical layout 契約は共通である。
 
 #### 2.5.5 トレース不変条件 (機械判定)
 

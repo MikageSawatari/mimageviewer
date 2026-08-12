@@ -879,6 +879,7 @@ mod bottom_left_content_tests {
             from_edit_preview: false,
             rendered_at_px: 128,
             source_dims: None,
+            layout_dims: None,
         }
     }
 

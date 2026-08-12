@@ -84,6 +84,7 @@ fn spread_page_dims_survive_fs_cache_and_thumbnail_eviction() {
                     from_edit_preview: false,
                     rendered_at_px: 2,
                     source_dims: Some((900, 1400)),
+                    layout_dims: None,
                 }
             }
         })
@@ -497,6 +498,7 @@ fn edit_preview_clear_reaches_main_active_and_paused_contexts() {
         from_edit_preview: true,
         rendered_at_px: 64,
         source_dims: Some((1, 1)),
+        layout_dims: None,
     };
     let prepare_bundle = |path: &str| {
         let mut bundle = ViewerContextBundle::empty();
@@ -7360,6 +7362,7 @@ mod phase_c_drill_nav_tests {
                     from_edit_preview: false,
                     rendered_at_px: 64,
                     source_dims: Some((1, 1)),
+                    layout_dims: None,
                 },
                 pixels,
             )
@@ -9922,6 +9925,7 @@ fn begin_detached_bookmark_media_test(
                 file_size: 2,
                 jpeg_data: Vec::new(),
                 source_dims: None,
+                layout_dims: None,
             },
         )]),
     )));
@@ -12116,6 +12120,7 @@ mod favorite_adjustment_defaults_tests {
                     from_edit_preview: false,
                     edit_preview_adjustment: None,
                     source_dims: Some((2, 2)),
+                    layout_dims: None,
                     canceled: false,
                     finalized: false,
                     input_seq: 0,
@@ -12207,6 +12212,7 @@ mod favorite_adjustment_defaults_tests {
                 from_edit_preview: false,
                 edit_preview_adjustment: None,
                 source_dims: Some((64, 64)),
+                layout_dims: None,
                 canceled: false,
                 finalized: false,
                 input_seq: 0,
@@ -12296,6 +12302,7 @@ mod favorite_adjustment_defaults_tests {
             from_edit_preview: true,
             rendered_at_px: 64,
             source_dims: Some((4000, 3000)),
+            layout_dims: None,
         });
         app.keep_set.insert(0);
         app.keep_range = (0, 1);
@@ -12390,6 +12397,7 @@ mod favorite_adjustment_defaults_tests {
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: Some((1920, 1080)),
+            layout_dims: None,
         });
         app.keep_set.insert(0);
         app.keep_range = (0, 1);
@@ -12466,6 +12474,7 @@ mod favorite_adjustment_defaults_tests {
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: Some((4000, 3000)),
+            layout_dims: None,
         });
         app.keep_set.insert(0);
         app.keep_range = (0, 1);
@@ -13053,6 +13062,7 @@ mod favorite_adjustment_defaults_tests {
                 from_edit_preview: false,
                 rendered_at_px: 1,
                 source_dims: Some(source_dims),
+                layout_dims: None,
             }
         }
 
@@ -13109,6 +13119,7 @@ mod favorite_adjustment_defaults_tests {
                 from_edit_preview: false,
                 rendered_at_px: 1,
                 source_dims: Some(source_dims),
+                layout_dims: None,
             }
         }
 
@@ -15864,6 +15875,7 @@ mod favorite_adjustment_defaults_tests {
             from_edit_preview: false,
             rendered_at_px: 1,
             source_dims: Some((1, 1)),
+            layout_dims: None,
         };
         app.thumbnails = vec![loaded(), loaded()];
         app.requested.insert(0, false);
@@ -17480,6 +17492,7 @@ mod favorite_adjustment_defaults_tests {
             from_edit_preview: true,
             rendered_at_px: 128,
             source_dims: Some((1, 1)),
+            layout_dims: None,
         };
         let preview_key = "c:/test/outer.zip::book/page1.jpg".to_owned();
         app.thumb_edit_preview_keys.insert(idx, preview_key.clone());
@@ -17833,6 +17846,7 @@ mod favorite_adjustment_defaults_tests {
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: Some((2, 3)),
+            layout_dims: None,
         };
         app.visible_indices = vec![idx];
         app.spread_mode = crate::settings::SpreadMode::Single;
@@ -17926,6 +17940,7 @@ mod favorite_adjustment_defaults_tests {
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: Some((2, 3)),
+            layout_dims: None,
         };
         app.thumbnails[second] = ThumbnailState::Loaded {
             tex: second_texture,
@@ -17933,6 +17948,7 @@ mod favorite_adjustment_defaults_tests {
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: Some((2, 3)),
+            layout_dims: None,
         };
         app.visible_indices = vec![first, second];
         app.cached_nav_indices = None;
@@ -19061,6 +19077,7 @@ mod favorite_adjustment_defaults_tests {
                 file_size: 4096,
                 jpeg_data: webp_bytes.clone(),
                 source_dims: Some((400, 400)),
+                layout_dims: None,
             },
         );
 
@@ -19270,6 +19287,7 @@ mod favorite_adjustment_defaults_tests {
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: None,
+            layout_dims: None,
         });
         app.fullscreen_idx = Some(0);
         let locked_gen = app.items_generation;
@@ -19317,6 +19335,7 @@ mod favorite_adjustment_defaults_tests {
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: None,
+            layout_dims: None,
         }];
         assert!(
             app.fs_nav_holdover_for_draw().is_none(),
@@ -19706,6 +19725,7 @@ mod favorite_adjustment_defaults_tests {
             from_edit_preview: false,
             rendered_at_px: 1,
             source_dims: None,
+            layout_dims: None,
         });
         app.items
             .push(GridItem::Video(std::path::PathBuf::from("c:/p/b.mp4")));
@@ -19715,6 +19735,7 @@ mod favorite_adjustment_defaults_tests {
             from_edit_preview: false,
             rendered_at_px: 1,
             source_dims: None,
+            layout_dims: None,
         });
         app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
 
@@ -19750,6 +19771,7 @@ mod favorite_adjustment_defaults_tests {
                 from_edit_preview: false,
                 rendered_at_px: 1,
                 source_dims: None,
+                layout_dims: None,
             })
             .collect();
 
@@ -19785,6 +19807,7 @@ mod favorite_adjustment_defaults_tests {
                 from_edit_preview: false,
                 rendered_at_px: 1,
                 source_dims: None,
+                layout_dims: None,
             })
             .collect();
         app.keep_set = std::collections::HashSet::from([1]);
@@ -20199,6 +20222,7 @@ mod favorite_adjustment_defaults_tests {
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: None,
+            layout_dims: None,
         });
         app.fullscreen_idx = Some(0);
         // items_generation は変えない (= 0)、ロック発火時の gen は 0 を記録する想定
@@ -20792,6 +20816,7 @@ mod favorite_adjustment_defaults_tests {
                     from_edit_preview: false,
                     rendered_at_px: 64,
                     source_dims: Some((1, 1)),
+                    layout_dims: None,
                 },
                 pixels,
             )
@@ -21621,6 +21646,7 @@ mod pipeline_cache_refactor_tests {
             from_edit_preview: false,
             rendered_at_px: 64,
             source_dims: Some((2, 1)),
+            layout_dims: None,
         };
 
         app.spread_mode = crate::settings::SpreadMode::LtrCover;
@@ -25283,6 +25309,7 @@ mod pipeline_cache_refactor_tests {
             from_edit_preview: false,
             rendered_at_px: 2,
             source_dims: Some((2, 2)),
+            layout_dims: None,
         };
         app.thumb_pixels.insert(idx, Arc::clone(&source));
 
@@ -25339,6 +25366,7 @@ mod pipeline_cache_refactor_tests {
             from_edit_preview: false,
             rendered_at_px: 8,
             source_dims: Some((800, 1201)),
+            layout_dims: None,
         };
         app.thumb_pixels.insert(idx, Arc::clone(&color));
         set_colorize_mode(&mut app, idx, ColorizeMode::MonochromeOnly);
@@ -25423,6 +25451,7 @@ mod pipeline_cache_refactor_tests {
             from_edit_preview: false,
             rendered_at_px: 8,
             source_dims: Some((800, 1201)),
+            layout_dims: None,
         };
         app.thumb_pixels.insert(idx, Arc::clone(&monochrome));
         set_colorize_mode(&mut app, idx, ColorizeMode::MonochromeOnly);
@@ -33752,6 +33781,7 @@ mod still_window_mode_key_tests {
             from_edit_preview: false,
             edit_preview_adjustment: None,
             source_dims: None,
+            layout_dims: None,
             canceled: false,
             finalized: false,
             input_seq: 0,
@@ -34195,6 +34225,7 @@ mod still_window_mode_key_tests {
             from_edit_preview: false,
             rendered_at_px: 128,
             source_dims: Some((1, 1)),
+            layout_dims: None,
         };
         app.fullscreen_idx = Some(image);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
@@ -34692,6 +34723,7 @@ mod still_window_mode_key_tests {
             from_edit_preview: false,
             rendered_at_px: 1,
             source_dims: Some((1, 1)),
+            layout_dims: None,
         };
         app.thumbnails[target] = loaded("rename_preview_target");
         app.thumbnails[unrelated] = loaded("rename_preview_unrelated");
@@ -37472,6 +37504,7 @@ mod still_window_mode_key_tests {
                     from_edit_preview: false,
                     rendered_at_px: 20,
                     source_dims: Some((20, 20)),
+                    layout_dims: None,
                 },
             );
             app.fs_cache.insert(

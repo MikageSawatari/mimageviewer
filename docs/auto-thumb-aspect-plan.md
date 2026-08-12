@@ -41,7 +41,8 @@
 
 **重要な気付き**:
 
-- `source_dims` は既に「新規デコード」「カタログ復元」両経路で付いている。
+- `source_dims` は既に「新規デコード」「カタログ復元」両経路で付いている。PDF は raster pixel
+  と独立した `layout_dims` も持ち、自動比率はそちらを優先する。
   集計に必要なデータ供給は **追加 worker 不要**。
 - 旧キャッシュで `source_dims = None` のものも、保存済み WebP の
   ヘッダだけ `decode_thumb_dims` で読めば比率は得られる (フルデコード不要)。
@@ -57,9 +58,9 @@
 | C | 縦長・横長混在フォルダ | `log(ratio)` の中央値を最近接バケットに割り当てる方式により自然に 1:1 へ収束。OK (§4.2 参照) |
 | D | ヒステリシス幅 | 実機で調整。初期値: log 距離マージン 0.10、同候補勝利継続 750ms、最大 2 切替/folder |
 | E | ZIP / PDF を開いている階層 | そのアイテム自身 (`ZipImage` / `PdfPage`) の比率で集計 |
-| F | PDF / ZIP ファイルが並ぶ階層 | **代表サムネ (1 ページ目 / 最初の画像) の `source_dims`** をそのまま使う |
+| F | PDF / ZIP ファイルが並ぶ階層 | **代表サムネ (1 ページ目 / 最初の画像) の `layout_dims.or(source_dims)`** を使う |
 
-E と F は実装的には同一の処理になる: 「`source_dims` が `Some` か、または
+E と F は実装的には同一の処理になる: 「`layout_dims.or(source_dims)` が `Some` か、または
 ColorImage サイズが取れる Loaded サムネは全部集計に入れる」だけ。種別分岐は不要。
 
 ## 4. アルゴリズム
@@ -69,9 +70,9 @@ ColorImage サイズが取れる Loaded サムネは全部集計に入れる」�
 | `GridItem` 種別 | 集計 | 比率の出所 |
 | --- | --- | --- |
 | Image | ✓ | 自身の元画像 |
-| ZipImage / PdfPage | ✓ | 開いている階層のアイテム自身 |
+| ZipImage / PdfPage | ✓ | 開いている階層のアイテム自身 (PDF は `layout_dims` 優先) |
 | Video | ✓ | Shell サムネの HBITMAP 寸法 (元動画フレーム比とは限らない、詳細: §4.1.1) |
-| ZipFile / PdfFile / Folder | ✓ | 代表サムネ (1 ページ目 / 最初の画像) の `source_dims` |
+| ZipFile / PdfFile / Folder | ✓ | 代表サムネ (1 ページ目 / 最初の画像) の `layout_dims.or(source_dims)` |
 
 `source_dims` の解決は次の優先順:
 
