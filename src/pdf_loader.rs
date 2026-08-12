@@ -2532,6 +2532,19 @@ pub fn canonical_pdf_raster_long_edge(content_type: PdfPageContentType) -> Optio
     Some(zoom_render_long_edge(native_long, 1.0, Some(native_long)))
 }
 
+/// Raster PDF の保存済み編集が基準にする、ページ固有の正準ラスタ寸法。
+///
+/// canonical render の要求長辺は 8192 上限を持つが、crop / annotation の保存座標は
+/// `CanonicalPdfPage::Raster::native_dims` と同じ native pixel space を使う。
+/// Vector は安定した native pixel space を持たないため `None` とする。
+pub fn canonical_pdf_raster_dims(content_type: PdfPageContentType) -> Option<[u32; 2]> {
+    canonical_pdf_raster_long_edge(content_type)?;
+    match content_type {
+        PdfPageContentType::Raster { w, h } if w > 0 && h > 0 => Some([w, h]),
+        PdfPageContentType::Raster { .. } | PdfPageContentType::Vector => None,
+    }
+}
+
 /// PDF page box のポイント寸法。thumbnail / display raster の target 丸めとは独立し、
 /// ページ固有の正確な縦横比を表す。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2870,7 +2883,7 @@ fn render_page_canonical_raster_with(
 
     for _attempt in 0..2 {
         let result = render(target_px)?;
-        let PdfPageContentType::Raster { w, h } = result.content_type else {
+        let Some(native_dims) = canonical_pdf_raster_dims(result.content_type) else {
             return Ok(CanonicalPdfPage::Vector);
         };
         let actual_target = canonical_pdf_raster_long_edge(result.content_type)
@@ -2878,7 +2891,7 @@ fn render_page_canonical_raster_with(
         if actual_target == target_px {
             return Ok(CanonicalPdfPage::Raster {
                 image: result.image,
-                native_dims: [w, h],
+                native_dims,
                 page_count: result.page_count,
             });
         }

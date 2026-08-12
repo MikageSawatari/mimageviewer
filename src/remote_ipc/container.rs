@@ -186,14 +186,15 @@ struct RemoteMaterializedEdits {
     used_diffusion_fallback: bool,
 }
 
-/// Pixel coordinate space in which persisted crop and comic edits were authored.
+/// Canonical pixel coordinate space in which persisted crop and comic edits were authored.
 ///
 /// `ThumbMsg::source_dims` is catalog-compatible metadata: it is original-raster pixels for
-/// regular images but PDF page-box fixed-point dimensions for layout/aspect calculations. A PDF
-/// must therefore ignore that metadata here and use the raster that was actually rendered.
+/// regular images but PDF page-box fixed-point dimensions for layout/aspect calculations. A PDF's
+/// edit space must instead be page-specific and independent of the requested render resolution;
+/// using the raster rendered for the current request makes the saved crop move as target_px changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct StoredEditSpace {
-    raster_dims: [usize; 2],
+    canonical_dims: [usize; 2],
 }
 
 impl StoredEditSpace {
@@ -201,12 +202,16 @@ impl StoredEditSpace {
         subresource: &RemoteSubresource,
         rendered_raster_dims: [usize; 2],
         decoded_layout_or_source_dims: Option<[usize; 2]>,
-    ) -> Self {
-        let raster_dims = match subresource {
-            RemoteSubresource::PdfPage { .. } => rendered_raster_dims,
+        pdf_canonical_raster_dims: Option<[usize; 2]>,
+    ) -> Option<Self> {
+        let canonical_dims = match subresource {
+            // Never fall back to rendered_raster_dims for PDF: that value changes with target_px.
+            // Vector pages have no native pixel space, so their saved absolute edits must fail
+            // explicitly instead of silently moving or being applied in the wrong coordinates.
+            RemoteSubresource::PdfPage { .. } => pdf_canonical_raster_dims?,
             _ => decoded_layout_or_source_dims.unwrap_or(rendered_raster_dims),
         };
-        Self { raster_dims }
+        Some(Self { canonical_dims })
     }
 
     fn comic_composite(
@@ -220,7 +225,7 @@ impl StoredEditSpace {
         crate::edit_source::comic_composite(
             base,
             objects,
-            self.raster_dims,
+            self.canonical_dims,
             fonts,
             stamp_cache,
             cancel,
@@ -232,7 +237,7 @@ impl StoredEditSpace {
         settings: crate::export_crop::CropSettings,
         pixel_dims: [usize; 2],
     ) -> crate::export_crop::CropRect {
-        crate::edit_source::export_crop_rect_for_pixels(settings, self.raster_dims, pixel_dims)
+        crate::edit_source::export_crop_rect_for_pixels(settings, self.canonical_dims, pixel_dims)
     }
 }
 
@@ -2270,11 +2275,24 @@ impl ContainerEngine {
                 page_index,
                 cancel,
             )?;
+            let requires_stored_edit_space = !prepared.edits.comic.is_empty()
+                || prepared.edits.export_crop.is_some();
+            let pdf_canonical_raster_dims = matches!(
+                &page.address.subresource,
+                RemoteSubresource::PdfPage { .. }
+            )
+            .then_some(decoded_source_dims);
             let stored_edit_space = StoredEditSpace::for_remote_source(
                 &page.address.subresource,
                 source.size,
                 Some(decoded_source_dims),
+                pdf_canonical_raster_dims,
             );
+            if requires_stored_edit_space && stored_edit_space.is_none() {
+                return Err(RemoteAiRunError::Failed(
+                    "PDF page has no request-independent pixel space for saved edits".to_owned(),
+                ));
+            }
             check_remote_ai_cancel(cancel)?;
             let pre_ai_edit_fingerprint = prepared.edits.pre_ai_fingerprint;
             let materialized = self
@@ -2407,6 +2425,11 @@ impl ContainerEngine {
             if !materialized.comic.is_empty()
                 && let Some(fonts) = crate::comic_overlay::load_comic_fonts_for(&materialized.comic)
             {
+                let stored_edit_space = stored_edit_space.ok_or_else(|| {
+                    RemoteAiRunError::Failed(
+                        "saved edit coordinate space is unavailable".to_owned(),
+                    )
+                })?;
                 pixels = stored_edit_space.comic_composite(
                     &pixels,
                     &materialized.comic,
@@ -2419,6 +2442,11 @@ impl ContainerEngine {
                 );
             }
             if let Some(crop) = materialized.export_crop {
+                let stored_edit_space = stored_edit_space.ok_or_else(|| {
+                    RemoteAiRunError::Failed(
+                        "saved edit coordinate space is unavailable".to_owned(),
+                    )
+                })?;
                 let rect = stored_edit_space.crop_rect(crop, pixels.size);
                 pixels = Arc::new(
                     crate::export_crop::crop_color_image(&pixels, rect)
@@ -3564,11 +3592,49 @@ impl ContainerEngine {
                     )
                 }
             })?;
+        let requires_stored_edit_space = prepared_composite.as_ref().is_some_and(|prepared| {
+            !prepared.edits.comic.is_empty() || prepared.edits.export_crop.is_some()
+        });
+        let pdf_canonical_raster_dims = if requires_stored_edit_space {
+            match &address.subresource {
+                RemoteSubresource::PdfPage { page_number } => {
+                    let analysis = crate::pdf_loader::analyze_page_content_type(
+                        &resolved.canonical,
+                        *page_number,
+                        request.pdf_password.as_deref(),
+                        Some(Arc::clone(&cancel)),
+                    )
+                    .map_err(|error| {
+                        crate::logger::log(format!(
+                            "remote_ipc: PDF canonical edit space analysis failed: {error}"
+                        ));
+                        media_error(
+                            MediaErrorCode::RenderFailed,
+                            "PDF ページの保存済み編集座標を解決できませんでした",
+                        )
+                    })?;
+                    crate::pdf_loader::canonical_pdf_raster_dims(analysis.content_type)
+                        .map(|[width, height]| [width as usize, height as usize])
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         let stored_edit_space = StoredEditSpace::for_remote_source(
             &address.subresource,
             color_image.size,
             decoded_source_dims.map(|(width, height)| [width as usize, height as usize]),
+            pdf_canonical_raster_dims,
         );
+        if requires_stored_edit_space && stored_edit_space.is_none() {
+            // Vector PDF pages have no stable native pixel basis in CropSettings. Returning the
+            // current target raster here would make the crop change between 1024/4096/8192.
+            return Err(media_error(
+                MediaErrorCode::RenderFailed,
+                "この PDF ページには保存済み編集の正準ピクセル座標がありません",
+            ));
+        }
         let auto_trim_bbox = match cached_auto_trim_bbox {
             Some(bbox) => bbox,
             None if detect_auto_trim => {
@@ -3607,6 +3673,12 @@ impl ContainerEngine {
             if !materialized.comic.is_empty()
                 && let Some(fonts) = crate::comic_overlay::load_comic_fonts_for(&materialized.comic)
             {
+                let stored_edit_space = stored_edit_space.ok_or_else(|| {
+                    media_error(
+                        MediaErrorCode::RenderFailed,
+                        "保存済み編集のピクセル座標を解決できませんでした",
+                    )
+                })?;
                 pixels = stored_edit_space.comic_composite(
                     &pixels,
                     &materialized.comic,
@@ -3619,6 +3691,12 @@ impl ContainerEngine {
                 );
             }
             if let Some(crop) = materialized.export_crop {
+                let stored_edit_space = stored_edit_space.ok_or_else(|| {
+                    media_error(
+                        MediaErrorCode::RenderFailed,
+                        "保存済み編集のピクセル座標を解決できませんでした",
+                    )
+                })?;
                 let rect = stored_edit_space.crop_rect(crop, pixels.size);
                 pixels = Arc::new(crate::export_crop::crop_color_image(&pixels, rect).map_err(
                     |error| {
@@ -4582,20 +4660,72 @@ mod tests {
     }
 
     #[test]
-    fn pdf_saved_crop_uses_rendered_raster_not_catalog_layout_dimensions() {
-        let raster = stored_edit_test_raster([140, 220]);
-        let stored_edit_space = StoredEditSpace::for_remote_source(
-            &RemoteSubresource::PdfPage { page_number: 0 },
-            raster.size,
-            // Representative PDF catalog page-box values are orders of magnitude larger than
-            // the rendered raster. Treating these as edit coordinates caused the 1/140 crop.
-            Some([468_600, 714_360]),
-        );
+    fn pdf_saved_crop_range_is_independent_of_requested_resolution() {
+        let canonical_dims = crate::pdf_loader::canonical_pdf_raster_dims(
+            crate::pdf_loader::PdfPageContentType::Raster { w: 3905, h: 5953 },
+        )
+        .map(|[width, height]| [width as usize, height as usize])
+        .unwrap();
+        let crop = crate::export_crop::CropSettings {
+            rect: crate::export_crop::CropRect {
+                min_x: canonical_dims[0] as f32 * 0.2,
+                min_y: canonical_dims[1] as f32 * 0.25,
+                max_x: canonical_dims[0] as f32 * 0.8,
+                max_y: canonical_dims[1] as f32 * 0.75,
+            },
+            aspect_mode: crate::export_crop::CropAspectMode::Free,
+        };
+        let expected_page_fractions = [0.2_f32, 0.25, 0.8, 0.75];
 
-        assert_eq!(stored_edit_space.raster_dims, raster.size);
-        let crop = stored_edit_space.crop_rect(stored_edit_test_crop(), raster.size);
-        let output = crate::export_crop::crop_color_image(&raster, crop).unwrap();
-        assert_eq!(output.size, [112, 176]);
+        for target_px in [1024_u32, 4096, 8192] {
+            let (width, height) = crate::fast_resize::aspect_accurate_fit_dimensions(
+                (target_px, target_px),
+                (target_px, target_px),
+                (canonical_dims[0] as u32, canonical_dims[1] as u32),
+            );
+            let rendered_dims = [width as usize, height as usize];
+            let stored_edit_space = StoredEditSpace::for_remote_source(
+                &RemoteSubresource::PdfPage { page_number: 0 },
+                rendered_dims,
+                // Real catalog page-box values remain ratio metadata and must not affect crop.
+                Some([468_600, 714_360]),
+                Some(canonical_dims),
+            )
+            .unwrap();
+
+            assert_eq!(stored_edit_space.canonical_dims, canonical_dims);
+            let rect = stored_edit_space.crop_rect(crop, rendered_dims);
+            let actual_page_fractions = [
+                rect.min_x / rendered_dims[0] as f32,
+                rect.min_y / rendered_dims[1] as f32,
+                rect.max_x / rendered_dims[0] as f32,
+                rect.max_y / rendered_dims[1] as f32,
+            ];
+            for (actual, expected) in actual_page_fractions
+                .into_iter()
+                .zip(expected_page_fractions)
+            {
+                assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "target_px={target_px}: actual={actual}, expected={expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pdf_saved_edits_do_not_fall_back_to_the_requested_raster() {
+        for rendered_dims in [[663, 1024], [2687, 4096], [5374, 8192]] {
+            assert_eq!(
+                StoredEditSpace::for_remote_source(
+                    &RemoteSubresource::PdfPage { page_number: 0 },
+                    rendered_dims,
+                    Some([468_600, 714_360]),
+                    None,
+                ),
+                None
+            );
+        }
     }
 
     #[test]
@@ -4605,9 +4735,11 @@ mod tests {
             &RemoteSubresource::File,
             raster.size,
             Some([140, 220]),
-        );
+            None,
+        )
+        .unwrap();
 
-        assert_eq!(stored_edit_space.raster_dims, [140, 220]);
+        assert_eq!(stored_edit_space.canonical_dims, [140, 220]);
         let crop = stored_edit_space.crop_rect(stored_edit_test_crop(), raster.size);
         let output = crate::export_crop::crop_color_image(&raster, crop).unwrap();
         assert_eq!(output.size, [56, 88]);
