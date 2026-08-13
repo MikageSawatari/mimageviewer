@@ -216,12 +216,12 @@ producer 側で予算を守るのが正しい。
 
 ## 次にやること
 
-1. **供給が追いつかない件 (中断中、実機が使えるので再開できる)** — ここが今の一番大きい待ち時間。
-   1 ページ 1784ms の全内訳は下の「ページ供給の律速」にある。**次に割るのは
-   ① pool が返した後に本体側で消えている 458ms (26%) と ② compose の 284ms (16%)**。
-   どちらも計装が入っていないので、まず perf event を足してから測る。
-   4 件の render が完走してから捨てられていた件 (`HarvestOnCancel` の適用先) も同じ節にある。
-   その後で `codex-remote-server-side-prepare-brief.md` (未送付) を、更新した 1 ページ単価で送る
+1. **供給が追いつかない件** — ここが今の一番大きい待ち時間。**未解明だった 742ms は
+   計装して割り終えた** (下の「1 ページの全内訳」)。次は打ち手を選ぶ段階で、候補は
+   ① サムネイル WebP 生成 269ms を読み手の待ち行列から外す ② ページ 1 枚あたり 2 回ある
+   全画素コピー 328ms を減らす。4 件の render が完走してから捨てられていた件
+   (`HarvestOnCancel` の適用先) も同じ節にある。その後で
+   `codex-remote-server-side-prepare-brief.md` (未送付) を、更新した 1 ページ単価で送る
 2. **remote-web 側の 503** (`admission_busy`)。1 とは同じ場所の別の面。入口で断る形が残っている。
    2026-08-12 の 3 分半で 10 件。**先読みレーンの上限 2 で断る形が 3 件**
    (`ipc_prefetch_in_flight: 2 / limit: 2`)、**heavy レーンの上限 4 で断る形が 1 件**
@@ -309,6 +309,47 @@ producer 側で予算を守るのが正しい。
 | ワーカーの RGBA 組立 | 100 | 6% | 妥当 |
 | パイプ転送 (書き + 読み) | 138 | 8% | **問題なし** (186 MB / 1.36 GB/s、syscall 往復 4 回) |
 | 縮小 | 64 | 4% | 妥当 |
+
+### 未解明だった 742ms の正体 (2026-08-13、計装して実測)
+
+`cce7e0e9` `ecf2a052` で段に区間を持たせ、実機で 49 ページ測った (46.1 MP、最高画質、
+隔離 data-dir)。**上表の「未解明」2 つは消えた。**`unaccounted_ms` は
+`source` 0.0ms / `thumb` 0.0ms / `compose` 8.9ms で、名前の付いていない時間はもう無い。
+
+| 区間 | p50 | 何をしているか |
+|---|---:|---|
+| `thumb.decode` (= PDF pool 往復) | 839ms | PDFium 描画 + RGBA 組立 + パイプ |
+| **`thumb.cache_encode`** | **269ms** | **46 MP からサムネイルへ縮小して WebP エンコード** |
+| `thumb.display` | 181ms | 表示用 ColorImage への変換 (全画素コピー) |
+| `compose.composite` | 175ms | **カラー化の適用** (`colorize_apply_ms` 132〜283、`colorize_applied=true`) |
+| `compose.to_rgba` | 147ms | ColorImage → RgbaImage (全画素コピー) |
+| `jpeg` | 163ms | JPEG エンコード |
+| `resize` | 39ms | 送信サイズへの縮小 |
+| `thumb.cache_save` | 0.5ms | SQLite 書き込み |
+| `source.drain_ms` | 0.0ms | チャネルの受け取り |
+| 合計 (`total` 段) | **1818ms** | |
+
+**① 458ms = `cache_encode` 269 + `display` 181。**
+`source` 段 1309ms は `load_request_ms` 1309ms と一致し、`drain_ms` は 0。
+つまり `source` の中身は `process_load_request` の中身そのもので、**表示用画像を送った後の
+サムネイル生成が読み手の待ち行列に入っている**。`skip_cache: true` はキャッシュの読みしか
+飛ばさず、保存側は `should_save` で決まる。**実測 42/42 のフルページ要求が保存を実行した**。
+比較: 一覧のサムネイル要求では同じ `cache_encode` が 3.6ms しかかからない (小さい raster から
+作るため)。269ms は「46 MP から作っているから」であって、読み手はこの成果物を待つ必要が無い。
+
+**② compose 284 (今回 319) = カラー化 175 + `to_rgba` 147。**
+カラー化は利用者が有効にしている実仕事なので削れない (`edits` / `lut` / `crop` /
+`cache_insert` はすべて 0.0ms)。`to_rgba` は形式変換の全画素コピー。
+
+**残る無駄はコピーとサムネイル**: 186 MB のバッファを `display` と `to_rgba` で 2 回作り直し
+(328ms)、さらに読み手が要らないサムネイルを 269ms かけて作っている。**合わせて 597ms、
+1 ページの 33%。**
+
+計測のやり方: `--perf-log` 付きで起動し、`remote_page/stage` (`phases` と `unaccounted_ms`)、
+`thumb/load_phases`、`pdf/pool_recv` を **key で join** する (PDF ページは 3 系統とも
+`pdf_page_perf_key` で同じ)。`source` 段の区間 `[t - ms, t]` に入る他イベントを同じページに
+帰属させる。**`unaccounted_ms` が育ったら、そこに名前の無い仕事が入り込んだということ。**
+`decode_parts` は `decode_ms` の内側の内訳なので、他の区間と並べて足さない。
 
 **測って否定できたもの** (どれも「遅そうに見えた」だけ):
 
