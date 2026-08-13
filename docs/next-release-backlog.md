@@ -1659,6 +1659,28 @@ docs/conceal-feature-plan.md
 - 規模 / 優先度: Small〜Medium / P2。いずれも製品 runtime の品質問題ではなく、
   同一 worktree で複数セッションを使うリリース運用とクリーン再現性の改善。
 
+### 1.84 表示キャッシュに item-context 世代の刻印が無い (latent、ABA 危険)
+
+- 出典: v3.0.0 出荷前の holdover 調査 (2026-08-14) で Codex が併せて指摘。
+  **今回の不具合 (`docs/briefs/pdf-page-turn-and-stale-composite-plan.md`) の原因ではない**
+  が、同じ調査で見つかった同型の穴。
+- フルスクリーン表示チェーンの以下が **`idx` だけ**、または item 文脈を含まない世代だけで
+  引いている:
+  - `current_edit_result_texture` — `idx` で走査し他の `EditResultKey` 世代を無視 (src/app.rs 53781)
+  - `current_comic_composite_texture` — `idx` 直引き。コメントに「世代チェックなし」と明記 (src/app.rs 56470)
+  - `current_final_composite_texture` — `key.edit_key.idx` のみ (src/app.rs 55823)
+  - `conceal_cache` — `idx` + global conceal 世代のみ、`items_generation` を見ない (src/ui_fullscreen.rs 4297)
+  - `EditResultKey` / `FinalCompositeKey` に item-context 世代のフィールドが無い
+    (src/app.rs 5550 / 6032)
+- **今は `close_fullscreen` が各キャッシュをクリアするので救われているだけ**
+  (src/app.rs 49757)。軽量な items 差し替え経路がそのクリアを通らないと ABA になる。
+- **意図された正しい形が同じファイルにある**: `ContinuousPageTransition` は
+  `items_generation` を自分で持ち、`keep_set_evict` でも照合している (src/app.rs 6434)。
+- 直すときの注意 (Codex): 「current 系 helper 3 つに条件を足す」では**不十分**。
+  exact-key ヒットが src/app.rs 55292 / 55640 にもあるため、
+  **key / read / insert のライフサイクル全体**に item 文脈を通す必要がある。
+- 規模 / 優先度: 中 / P2。リリース直前に触る範囲ではない。
+
 ### 5.8 検索ベンチのゲートに絶対時間の下限が無い
 
 - 出典: v3.0.0 リリース前確認 (2026-08-14)。`check_bench_regression.py` が 10 件中 7 件を
