@@ -780,7 +780,7 @@ mod local_adjust_segmentation_tests {
             tolerance: 0,
             connected: true,
             value: true,
-            leak_stop: 0,
+            leak_stop: 0.0,
         };
         let filled = crate::mask_db::BucketFillOutcome::Filled;
 
@@ -2794,7 +2794,7 @@ fn draw_local_tool_settings(
                 ui.add(
                     egui::Slider::new(bucket_leak_stop, 0.0..=16.0)
                         .text("漏れ止め")
-                        .step_by(1.0),
+                        .step_by(0.1),
                 )
                 .on_hover_text("細い線や小さな隙間から塗りが漏れるのを防ぎます。0 で無効。");
             }
@@ -9640,7 +9640,7 @@ impl App {
             tolerance,
             connected: self.local_adjust_bucket_connected,
             value: paint,
-            leak_stop: self.local_adjust_bucket_leak_stop.round().max(0.0) as usize,
+            leak_stop: self.local_adjust_bucket_leak_stop.max(0.0),
         };
         let mut outcome = crate::mask_db::BucketFillOutcome::Invalid;
         let changed =

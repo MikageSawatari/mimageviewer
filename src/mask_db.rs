@@ -658,8 +658,91 @@ fn color_within_rgb_tolerance(color: egui::Color32, seed: [u8; 3], tolerance: u8
         <= tolerance
 }
 
+/// 1 次元の二乗距離変換 (Felzenszwalb & Huttenlocher)。
+///
+/// `f` は各点の初期コスト (種は 0、それ以外は無限大)。放物線の下側包絡線を
+/// 走査で求めるので、長さに比例した時間で厳密なユークリッド二乗距離が出る。
+fn squared_distance_1d(f: &[f64], out: &mut [f64]) {
+    let n = f.len();
+    if n == 0 {
+        return;
+    }
+    // 有限のコストを持つ点だけを放物線の母点にする。無限大どうしの引き算は NaN に
+    // なり、そこから先の包絡線が全部壊れる (種の無い行が必ず現れるのでこれは通る道)。
+    let mut sites: Vec<usize> = Vec::with_capacity(n);
+    let mut bounds: Vec<f64> = Vec::with_capacity(n + 1);
+    for (q, cost) in f.iter().enumerate() {
+        if !cost.is_finite() {
+            continue;
+        }
+        loop {
+            let Some(&last) = sites.last() else {
+                bounds.push(f64::NEG_INFINITY);
+                break;
+            };
+            let (qf, vf) = (q as f64, last as f64);
+            let crossing = ((f[q] + qf * qf) - (f[last] + vf * vf)) / (2.0 * qf - 2.0 * vf);
+            if crossing <= *bounds.last().expect("a site always has a bound") {
+                sites.pop();
+                bounds.pop();
+            } else {
+                bounds.push(crossing);
+                break;
+            }
+        }
+        sites.push(q);
+    }
+
+    if sites.is_empty() {
+        out.fill(f64::INFINITY);
+        return;
+    }
+    bounds.push(f64::INFINITY);
+
+    let mut k = 0usize;
+    for (q, slot) in out.iter_mut().enumerate().take(n) {
+        while bounds[k + 1] < q as f64 {
+            k += 1;
+        }
+        let d = q as f64 - sites[k] as f64;
+        *slot = d * d + f[sites[k]];
+    }
+}
+
+/// 各画素から、`seeds` が立っている最も近い画素までの**二乗**ユークリッド距離。
+///
+/// 半径を整数に丸めずに済ませるためにこれを使う。正方形の近傍だと半径 1 の次が
+/// 2 で、その間が無い。距離で比較すれば 1.4 や 1.7 が意味を持ち、しかも近傍の
+/// 形が円になるので角を余計に削らない。
+fn squared_distance_map(seeds: &[bool], width: usize, height: usize) -> Vec<f64> {
+    let len = width * height;
+    let mut buf: Vec<f64> = (0..len)
+        .map(|i| if seeds[i] { 0.0 } else { f64::INFINITY })
+        .collect();
+
+    let mut column = vec![0.0f64; height];
+    let mut column_out = vec![0.0f64; height];
+    for x in 0..width {
+        for y in 0..height {
+            column[y] = buf[y * width + x];
+        }
+        squared_distance_1d(&column, &mut column_out);
+        for y in 0..height {
+            buf[y * width + x] = column_out[y];
+        }
+    }
+
+    let mut row_out = vec![0.0f64; width];
+    for y in 0..height {
+        let start = y * width;
+        squared_distance_1d(&buf[start..start + width], &mut row_out);
+        buf[start..start + width].copy_from_slice(&row_out);
+    }
+    buf
+}
+
 /// バケツの設定。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BucketFill {
     /// seed RGB との最大チャンネル差の許容値。
     pub tolerance: u8,
@@ -667,14 +750,17 @@ pub struct BucketFill {
     pub connected: bool,
     /// マスクへ書き込む値 (塗る / 消す)。
     pub value: bool,
-    /// 漏れ止めの半径 (px)。0 で無効。
+    /// 漏れ止めの半径 (px)。0 以下で無効。**小数を取る**。
     ///
     /// **細い通路と小さな隙間から塗りが漏れるのを防ぐ**。塗れる領域をこの半径だけ
     /// やせさせてから塗り、結果を同じだけ太らせて元の領域と重ねる。
     /// 幅が `2 * leak_stop` 未満の線や隙間はやせた時点で消えるので塗りが入り込めず、
     /// 長方形の隅は太らせる段階で回復するので**隅までは塗れる**。
     /// `connected` が false のときは伝播しないので無視する。
-    pub leak_stop: usize,
+    ///
+    /// 判定はユークリッド距離で行う。整数の正方近傍だと 1 の次が 2 で、その間が
+    /// 無い上に角を余計に削る。距離なら 1.4 や 1.7 が意味を持ち、近傍の形も円になる。
+    pub leak_stop: f32,
 }
 
 /// バケツの結果。
@@ -762,6 +848,56 @@ fn bucket_reach(
     reached
 }
 
+/// `reached` を `fillable` の内側だけで 8 近傍に `steps` 段ぶん広げる。
+///
+/// やせさせた分を戻す工程。**距離で太らせると長方形の隅が戻らない**
+/// (隅は斜めなので中心から √2 離れており、半径 1 では届かない)。斜めを 1 歩と
+/// 数える 8 近傍で広げれば隅がちょうど戻る。`fillable` の外へは出ないので、
+/// 障壁を越えることはない。
+///
+/// 前線だけを queue に持つので、段数によらず画素数に比例した時間で終わる。
+fn bucket_regrow(
+    fillable: &[bool],
+    reached: &[bool],
+    width: usize,
+    height: usize,
+    steps: usize,
+) -> Vec<bool> {
+    let mut grown = reached.to_vec();
+    if steps == 0 {
+        return grown;
+    }
+    let mut frontier: Vec<usize> = grown
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, on)| on.then_some(idx))
+        .collect();
+    for _ in 0..steps {
+        if frontier.is_empty() {
+            break;
+        }
+        let mut next = Vec::new();
+        for idx in frontier {
+            let (x, y) = (idx % width, idx / width);
+            let x0 = x.saturating_sub(1);
+            let x1 = (x + 1).min(width - 1);
+            let y0 = y.saturating_sub(1);
+            let y1 = (y + 1).min(height - 1);
+            for yy in y0..=y1 {
+                for xx in x0..=x1 {
+                    let n = yy * width + xx;
+                    if !grown[n] && fillable[n] {
+                        grown[n] = true;
+                        next.push(n);
+                    }
+                }
+            }
+        }
+        frontier = next;
+    }
+    grown
+}
+
 /// seed 色に近い画素へ 1bit マスクを書き込む。
 ///
 /// `connected` で seed からつながる範囲だけに絞り、`leak_stop` で細い通路と
@@ -791,23 +927,36 @@ pub fn flood_fill_bitmap_mask(
 
     let region = if !fill.connected {
         fillable
-    } else if fill.leak_stop == 0 {
+    } else if !(fill.leak_stop > 0.0) {
         bucket_reach(&fillable, width, height, seed_x, seed_y)
     } else {
         // やせさせて塗り、太らせて元の領域と重ねる。やせた地図で seed が消えるのは
         // 「漏れ止めより細い場所を指した」ということなので、黙って何もしない代わりに
         // 理由を返す。
-        let narrowed = morph_bitmap_mask(&fillable, width, height, fill.leak_stop, false);
+        let radius = f64::from(fill.leak_stop);
+        let radius_sq = radius * radius;
+        // 画像の外は障壁として数えない。端に接した領域が端から削れると、
+        // 「画面いっぱいの背景を塗る」がいきなり効かなくなる。
+        let barrier: Vec<bool> = fillable.iter().map(|inside| !*inside).collect();
+        let to_barrier = squared_distance_map(&barrier, width, height);
+        let narrowed: Vec<bool> = fillable
+            .iter()
+            .zip(&to_barrier)
+            .map(|(inside, distance)| *inside && *distance > radius_sq)
+            .collect();
         if !narrowed[seed_y * width + seed_x] {
             return BucketFillOutcome::SeedTooThin;
         }
         let reached = bucket_reach(&narrowed, width, height, seed_x, seed_y);
-        let grown = morph_bitmap_mask(&reached, width, height, fill.leak_stop, true);
-        grown
-            .into_iter()
-            .zip(fillable)
-            .map(|(grown, fillable)| grown && fillable)
-            .collect()
+        // 戻す量は段数 (整数)。小数の効き目はやせさせる側にある — 「どこが細すぎるか」を
+        // 決めるのはそちらで、戻す工程は `fillable` で頭打ちになるため。
+        bucket_regrow(
+            &fillable,
+            &reached,
+            width,
+            height,
+            radius.ceil().max(0.0) as usize,
+        )
     };
 
     let mut changed = false;
@@ -1463,7 +1612,7 @@ mod tests {
                     tolerance: 0,
                     connected: true,
                     value: true,
-                    leak_stop: 0,
+                    leak_stop: 0.0,
                 },
             ),
             BucketFillOutcome::Filled
@@ -1480,7 +1629,7 @@ mod tests {
                     tolerance: 0,
                     connected: true,
                     value: false,
-                    leak_stop: 0,
+                    leak_stop: 0.0,
                 },
             ),
             BucketFillOutcome::Filled
@@ -1531,7 +1680,7 @@ mod tests {
                     tolerance: 0,
                     connected: true,
                     value: true,
-                    leak_stop: 0,
+                    leak_stop: 0.0,
                 },
             );
             mask
@@ -1548,7 +1697,7 @@ mod tests {
                 tolerance: 0,
                 connected: true,
                 value: true,
-                leak_stop: 1,
+                leak_stop: 1.0,
             },
         );
         assert_eq!(outcome, BucketFillOutcome::Filled);
@@ -1557,9 +1706,75 @@ mod tests {
         for (x, y) in [(1, 1), (7, 1), (1, 6), (7, 6)] {
             assert!(mask[y * w + x], "the box corner ({x},{y}) must be filled");
         }
-        // 通路には入っていないこと。
-        assert!(!mask[3 * w + 8], "the thin neck must not be entered");
-        assert!(!mask[3 * w + 9], "the far side of the neck must stay clear");
+        // 通路を伝って進んでいないこと。
+        //
+        // 入口の 1 画素は戻す工程の届く範囲なので塗られる。防ぎたいのは
+        // 「線をたどって外まで流れる」ことで、接合部が 1 画素太るのは実用上見えない。
+        assert!(!mask[3 * w + 9], "the fill must not run along the neck");
+    }
+
+    /// 半径が小数で効くこと。1 と 2 の間が無いと、実際の絵で「1 では漏れるが
+    /// 2 では細すぎると言われる」に挟まれて使えない (利用者報告 2026-08-13)。
+    #[test]
+    fn a_fractional_leak_stop_lands_between_the_whole_ones() {
+        let ink = egui::Color32::from_rgb(10, 10, 10);
+        let paper = egui::Color32::WHITE;
+        // 幅 3 の帯。半径 1 なら芯が残り、半径 2 なら消える。1.5 は 1 と同じ側。
+        let rows = ["XXXXX", "XXXXX", "XXXXX"];
+        let colors: Vec<egui::Color32> = rows
+            .iter()
+            .flat_map(|row| row.chars())
+            .map(|c| if c == 'X' { paper } else { ink })
+            .collect();
+        let image = color_image(&colors, 5, 3);
+
+        let outcome = |leak_stop: f32| {
+            let mut mask = vec![false; 15];
+            flood_fill_bitmap_mask(
+                &mut mask,
+                &image,
+                2,
+                1,
+                BucketFill {
+                    tolerance: 0,
+                    connected: true,
+                    value: true,
+                    leak_stop,
+                },
+            )
+        };
+
+        // 画像の端は障壁として数えないので、この帯はどの半径でも塗れる。
+        // 小数が「同じ整数に丸められて無視される」ことだけを見る。
+        assert_eq!(outcome(1.0), BucketFillOutcome::Filled);
+        assert_eq!(outcome(1.5), BucketFillOutcome::Filled);
+
+        // 障壁で囲むと半径が効き始める。
+        let framed = [".....", ".XXX.", "....."];
+        let colors: Vec<egui::Color32> = framed
+            .iter()
+            .flat_map(|row| row.chars())
+            .map(|c| if c == 'X' { paper } else { ink })
+            .collect();
+        let image = color_image(&colors, 5, 3);
+        let framed_outcome = |leak_stop: f32| {
+            let mut mask = vec![false; 15];
+            flood_fill_bitmap_mask(
+                &mut mask,
+                &image,
+                2,
+                1,
+                BucketFill {
+                    tolerance: 0,
+                    connected: true,
+                    value: true,
+                    leak_stop,
+                },
+            )
+        };
+        // 高さ 1 の帯は、半径がどれだけ小さくても 1 を超えれば消える。
+        assert_eq!(framed_outcome(0.5), BucketFillOutcome::Filled);
+        assert_eq!(framed_outcome(1.5), BucketFillOutcome::SeedTooThin);
     }
 
     /// 漏れ止めより細い場所を指したら、黙って何もしないのではなく理由を返す。
@@ -1583,7 +1798,7 @@ mod tests {
                 tolerance: 0,
                 connected: true,
                 value: true,
-                leak_stop: 2,
+                leak_stop: 2.0,
             },
         );
         assert_eq!(outcome, BucketFillOutcome::SeedTooThin);
@@ -1620,7 +1835,7 @@ mod tests {
                     tolerance: 0,
                     connected: true,
                     value: true,
-                    leak_stop: 0,
+                    leak_stop: 0.0,
                 },
             ),
             BucketFillOutcome::Filled
@@ -1660,7 +1875,7 @@ mod tests {
                     tolerance: 0,
                     connected: true,
                     value: true,
-                    leak_stop: 0,
+                    leak_stop: 0.0,
                 },
             ),
             BucketFillOutcome::Filled
@@ -1691,7 +1906,7 @@ mod tests {
                     tolerance: 0,
                     connected: true,
                     value: true,
-                    leak_stop: 0,
+                    leak_stop: 0.0,
                 },
             ),
             BucketFillOutcome::Filled
@@ -1716,7 +1931,7 @@ mod tests {
                     tolerance: 0,
                     connected: false,
                     value: true,
-                    leak_stop: 0,
+                    leak_stop: 0.0,
                 },
             ),
             BucketFillOutcome::Filled
@@ -1747,7 +1962,7 @@ mod tests {
                     tolerance: 10,
                     connected: false,
                     value: true,
-                    leak_stop: 0,
+                    leak_stop: 0.0,
                 },
             ),
             BucketFillOutcome::Filled
@@ -1764,7 +1979,7 @@ mod tests {
             tolerance: 0,
             connected: true,
             value: true,
-            leak_stop: 0,
+            leak_stop: 0.0,
         };
         assert_eq!(
             flood_fill_bitmap_mask(&mut mask, &width_zero, 0, 0, fill),
@@ -1810,7 +2025,7 @@ mod tests {
                         tolerance: 0,
                         connected: true,
                         value: true,
-                        leak_stop: 0,
+                        leak_stop: 0.0,
                     },
                 ),
                 BucketFillOutcome::Filled
@@ -1829,7 +2044,7 @@ mod tests {
                         tolerance: 0,
                         connected: false,
                         value: true,
-                        leak_stop: 0,
+                        leak_stop: 0.0,
                     },
                 ),
                 BucketFillOutcome::Filled

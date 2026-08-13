@@ -1030,7 +1030,7 @@ impl App {
                 tolerance: self.erase_bucket_tolerance.round().clamp(0.0, 255.0) as u8,
                 connected: self.erase_bucket_connected,
                 value: self.erase_paint_mode,
-                leak_stop: self.erase_bucket_leak_stop.round().max(0.0) as usize,
+                leak_stop: self.erase_bucket_leak_stop.max(0.0),
             },
         );
         match outcome {
@@ -2465,10 +2465,10 @@ impl App {
                                 ui.add(
                                     egui::Slider::new(
                                         &mut self.erase_bucket_leak_stop,
-                                        0.0..=16.0,
+                                        0.0..=16.0
                                     )
                                     .text("漏れ止め")
-                                    .step_by(1.0),
+                                    .step_by(0.1),
                                 )
                                 .on_hover_text("細い線や小さな隙間から塗りが漏れるのを防ぎます。0 で無効。");
                             }
