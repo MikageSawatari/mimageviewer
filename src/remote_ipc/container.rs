@@ -5337,21 +5337,11 @@ impl ContainerEngine {
             }
             return result;
         }
-        let mut pixels = if prepared_composite.is_some() {
-            match Arc::try_unwrap(color_image) {
-                Ok(pixels) => Arc::new(pixels),
-                Err(shared) => {
-                    let copy_started = Instant::now();
-                    let pixels = Arc::new((*shared).clone());
-                    if let Some(stage) = compose_stage.as_mut() {
-                        stage.phase_from("source_raster_copy_ms", copy_started);
-                    }
-                    pixels
-                }
-            }
-        } else {
-            color_image
-        };
+        // 生 raster は共有されたまま渡す。この下の編集・合成・切り抜きはどれも `&` で読んで
+        // 新しい buffer を返すので、一意な `Arc` を要求しない (本体のローカル表示も
+        // `fs_cache` の共有 `Arc` をそのまま同じ関数へ渡している)。事前に deep clone すると、
+        // 46MP のページで実測 62ms を毎ページ払うだけで何も買えない。
+        let mut pixels = color_image;
         if let Some(prepared) = prepared_composite {
             let edit_started = Instant::now();
             let materialized_result = self.execute_remote_edits(pixels, prepared.edits, &cancel);
