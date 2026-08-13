@@ -30,16 +30,13 @@ pub const PITCH_LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.001;
 /// - 0 = fs_cache
 /// - 1 = adjustment_cache (raw + 色調補正 / auto_mode / post_filter)
 /// - 2 = ai_upscale_cache
+/// - 3 = AI 実効時に選ばれた adjustment_cache (legacy fallback marker)
 /// - 4 = final_composite_cache
-/// - 5 = 色調補正 cache の生成待ちで一時的に選ばれた fs_cache
-///
-/// `adjustment_cache` の唯一の writer は raw pixels を入力にするため、旧来の
-/// `SOURCE_KIND_AI_ADJUST` は実際には発生しない。
 pub const SOURCE_KIND_FS: u16 = 0;
 pub const SOURCE_KIND_ADJUST_RAW: u16 = 1;
 pub const SOURCE_KIND_AI: u16 = 2;
+pub const SOURCE_KIND_AI_ADJUST: u16 = 3;
 pub const SOURCE_KIND_FINAL_COMPOSITE: u16 = 4;
-pub const SOURCE_KIND_FS_WAITING_ADJUSTMENTS: u16 = 5;
 
 /// 360 ビューのインタラクティブステート (フルスクリーン内のみ Some)。
 /// ファイル切替 / フルスクリーン退出で `panorama_state = None`。
@@ -333,7 +330,7 @@ pub fn needs_user_confirmation(source_pixels: u64, approved_max: u64) -> bool {
 
 /// settle の適用ポリシー (§3.6.2.1)。
 ///
-/// 8K base のソース選択結果 (`source_kind`) から `compute_settle_policy` で決まる。
+/// 対象ページの実効機能と 8K base の `source_kind` から `compute_settle_policy` で決まる。
 #[derive(Clone, Debug)]
 pub enum PanoramaSettlePolicy {
     /// 選択された 8K base を settle render で再現できないため開始しない。
@@ -356,7 +353,7 @@ pub enum PanoramaSettleDisabledReason {
     AiApplied,
     PostFilterApplied,
     AutoAdjustmentApplied,
-    FinalCompositeApplied,
+    SmartSharpenApplied,
     UnsupportedSource,
 }
 
@@ -367,7 +364,7 @@ impl PanoramaSettleDisabledReason {
             Self::AiApplied => "AI 適用中",
             Self::PostFilterApplied => "ポストフィルタ適用中",
             Self::AutoAdjustmentApplied => "自動補正適用中",
-            Self::FinalCompositeApplied => "最終加工適用中",
+            Self::SmartSharpenApplied => "シャープ化適用中",
             Self::UnsupportedSource => "再現できない加工を適用中",
         }
     }
@@ -396,6 +393,17 @@ pub fn settle_enabled(state: &PanoramaQualityState, policy: &PanoramaSettlePolic
         state,
         PanoramaQualityState::SettleReady | PanoramaQualityState::SettleApproved
     ) && policy.is_enabled()
+}
+
+/// 高画質化で画素編集が外れる可能性をステータスに表示する条件。
+///
+/// 画素編集があり、かつ現在の state / policy で settle が実際に動き得る場合だけ true。
+pub fn should_show_pano_high_res_edit_warning(
+    has_excluded_pixel_edits: bool,
+    state: Option<&PanoramaQualityState>,
+    policy: &PanoramaSettlePolicy,
+) -> bool {
+    has_excluded_pixel_edits && state.is_some_and(|state| settle_enabled(state, policy))
 }
 
 /// settle render の進行ハンドル (§4.6.2)。
@@ -1065,6 +1073,31 @@ mod tests {
         ));
         // BaseOnly は NG
         assert!(!settle_enabled(&PanoramaQualityState::BaseOnly, &policy_ok));
+    }
+
+    #[test]
+    fn pano_high_res_edit_warning_requires_edits_and_active_settle() {
+        let state = PanoramaQualityState::SettleReady;
+        let enabled = PanoramaSettlePolicy::EnabledFromRaw;
+        let disabled = PanoramaSettlePolicy::Disabled {
+            reason: PanoramaSettleDisabledReason::AiApplied,
+        };
+
+        assert!(should_show_pano_high_res_edit_warning(
+            true,
+            Some(&state),
+            &enabled
+        ));
+        assert!(!should_show_pano_high_res_edit_warning(
+            true,
+            Some(&state),
+            &disabled
+        ));
+        assert!(!should_show_pano_high_res_edit_warning(
+            false,
+            Some(&state),
+            &enabled
+        ));
     }
 
     #[test]

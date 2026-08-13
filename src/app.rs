@@ -9498,10 +9498,6 @@ pub struct App {
     /// `open_fullscreen` で false にリセット、トースト発火で true、
     /// `close_fullscreen` で false に戻る。
     pub(crate) pano_toast_shown_for_current_fs: bool,
-    /// 画素編集を持つページで「360° ビューには編集を反映しない」と案内済みの
-    /// source_key 集合。同じページで 360° を出入りするたびに繰り返さない。
-    /// V キー案内トーストとは別の一回性を持たせ、重要な注意が案内に上書きされないようにする。
-    pub(crate) pano_edit_warning_shown_sources: std::collections::HashSet<String>,
     /// 360 度パノラマビュー Phase 2a: settle-refinement 用フル解像度 RGBA
     /// (docs/panorama-360-view-plan.md §4.6.1)。キーは `metadata_cache_key`。
     /// SettleReady / SettleApproved の画像でだけエントリが作られる。
@@ -12616,7 +12612,6 @@ impl App {
             panorama_state: None,
             pano_uploaded: None,
             pano_toast_shown_for_current_fs: false,
-            pano_edit_warning_shown_sources: std::collections::HashSet::new(),
             pano_high_res_source: std::collections::HashMap::new(),
             pano_refinement: None,
             pano_quality_state: std::collections::HashMap::new(),
@@ -59650,32 +59645,22 @@ impl App {
             .unwrap_or(false)
     }
 
-    /// 360° で表示しない画素編集が対象ページにあるか。
+    /// settle 高画質化では再現されない画素編集が対象ページにあるか。
     ///
-    /// ソース選択と入場時トーストは必ずこの述語を共用し、表示仕様と案内をずらさない。
+    /// ステータス注意書きはこの述語を使い、消しゴム・隠蔽加工・補正レイヤーの
+    /// 判定を描画側へ複製しない。
     pub(crate) fn has_pano_excluded_pixel_edits(&self, fs_idx: usize) -> bool {
         self.mask_pages.contains(&fs_idx)
             || self.has_active_local_adjust_layers(fs_idx)
             || self.conceal_pages.contains(&fs_idx)
     }
 
-    /// 360° の暫定ソースとして `adjustment_cache` の生成を待つ状態か。
-    ///
-    /// `adjustment_cache` の唯一の writer (`apply_sync_adjustment`) と同じ条件にする。
-    /// smart_sharpen / AI / カラー化はこの cache には焼き込まれない。
-    fn pano_expects_adjustment_cache(&self, fs_idx: usize) -> bool {
-        let params = self.effective_params(fs_idx);
-        !params.is_color_identity()
-            || (!self.post_filter_bypassed
-                && params.post_filter != crate::adjustment::PostFilter::None)
-    }
-
     /// 360 ベーステクスチャのソース選択 + cache_key 計算を 1 関数に集約する (§4.3)。
     ///
-    /// 優先順位は `final_composite_cache → ai_upscale_cache → adjustment_cache → fs_cache`。
-    /// ただし画素編集があるページでは、それを運ぶ final composite だけを除外する。
-    /// `adjustment_cache` は raw pixels だけから生成されるため AI 由来の種別は存在せず、
-    /// AI が実効的な場合は AI cache を adjustment cache より先に選ぶ。
+    /// 優先順位は通常表示と同じ
+    /// `final_composite_cache → adjustment_cache → ai_upscale_cache → fs_cache`。
+    /// final composite は画素編集も含めてそのまま 8K base に使う。settle 高画質化で
+    /// 再現できない機能は `compute_settle_policy` が無効化する。
     ///
     /// Phase 1 ではこの戻り値の `pixels` を `color_image_to_rgba` で RGBA8 化し、
     /// `cache_key` を `pano_uploaded` の stale 判定 + callback に渡す。
@@ -59689,27 +59674,7 @@ impl App {
         let source_key = self.metadata_cache_key(fs_idx)?;
         let bg = self.effective_upscale_bg_mode();
         let ai_effective = self.ai_will_apply_to(fs_idx);
-        let has_excluded_pixel_edits = self.has_pano_excluded_pixel_edits(fs_idx);
-
-        // 画素編集があるページは final composite を恒久的に候補から外すため、表示中の
-        // params 変更で adjustment_cache が無効化された後に通常の final pipeline から
-        // 再生成される機会がない。360 の fallback として必要な場合は、唯一の writer と
-        // 同じ raw fs_cache pixels からここで同期生成する。成功後は cache hit になるので
-        // 次フレーム以降はこの分岐へ入らない。
-        if has_excluded_pixel_edits
-            && self.pano_expects_adjustment_cache(fs_idx)
-            && !self.adjustment_cache.contains_key(&fs_idx)
-            && let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&fs_idx)
-        {
-            let raw_pixels = std::sync::Arc::clone(pixels);
-            self.apply_sync_adjustment(ctx, fs_idx, &raw_pixels);
-        }
-
-        let final_source = if has_excluded_pixel_edits {
-            None
-        } else {
-            self.ensure_final_composite_pixels_with_key(ctx, fs_idx)
-        };
+        let final_source = self.ensure_final_composite_pixels_with_key(ctx, fs_idx);
         let ai_cache_entry = if ai_effective {
             self.ai_upscale_cache.get(&(fs_idx, bg))
         } else {
@@ -59723,20 +59688,20 @@ impl App {
                 final_key.hash(h);
             });
             (pixels, SOURCE_KIND_FINAL_COMPOSITE, Some(hash))
-        } else if let Some(FsCacheEntry::Static { pixels, .. }) = ai_cache_entry {
-            (std::sync::Arc::clone(pixels), SOURCE_KIND_AI, None)
         } else if let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&fs_idx)
         {
-            // apply_sync_adjustment の呼び出し元はどちらも raw fs_cache pixels を渡す。
-            // したがって旧 SOURCE_KIND_AI_ADJUST に相当する entry は発生しない。
-            (std::sync::Arc::clone(pixels), SOURCE_KIND_ADJUST_RAW, None)
-        } else if let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&fs_idx) {
-            let kind = if self.pano_expects_adjustment_cache(fs_idx) {
-                SOURCE_KIND_FS_WAITING_ADJUSTMENTS
+            // SOURCE_KIND_AI_ADJUST は pixels の由来ではなく、final 未完成時に
+            // AI が実効中の adjustment fallback を settle 無効として識別する marker。
+            let kind = if ai_effective {
+                SOURCE_KIND_AI_ADJUST
             } else {
-                SOURCE_KIND_FS
+                SOURCE_KIND_ADJUST_RAW
             };
             (std::sync::Arc::clone(pixels), kind, None)
+        } else if let Some(FsCacheEntry::Static { pixels, .. }) = ai_cache_entry {
+            (std::sync::Arc::clone(pixels), SOURCE_KIND_AI, None)
+        } else if let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&fs_idx) {
+            (std::sync::Arc::clone(pixels), SOURCE_KIND_FS, None)
         } else {
             return None; // ColorImage がまだ無い (Animated / Failed / 未ロード)
         };
@@ -59758,7 +59723,7 @@ impl App {
         let cache_key =
             make_pano_cache_key(crc16_of_str(&source_key), source_kind, adjust_gen, ai_gen);
 
-        // Phase 2a settle policy: 実際に選んだ source_kind だけから判定 (§3.6.2.1)
+        // Phase 2a settle policy: 対象ページの実効機能と source_kind から判定 (§3.6.2.1)
         let settle_policy = self.compute_settle_policy(fs_idx, source_kind);
 
         Some(PanoSourceResolution {
@@ -59772,41 +59737,61 @@ impl App {
 
     /// 360 度パノラマビュー Phase 2a: settle policy 判定 (§3.6.2.1)。
     ///
-    /// 機能 flag の判定木を複製せず、実際に選ばれた source_kind が settle render で
-    /// 再現できるかだけを判定する。adjustment cache の内部だけは、同じ source_kind に
-    /// 色調 / auto_mode / post_filter が入り得るため params で理由を分ける。
+    /// AI / auto_mode / post_filter / smart_sharpen は 8K base に反映したまま settle を
+    /// 無効化する。通常の色調補正だけなら settle 側で再適用し、無補正なら raw sample。
+    /// Disabled 理由はここで型にし、表示側に同じ判定木を持たせない。
     pub(crate) fn compute_settle_policy(
         &self,
         fs_idx: usize,
         source_kind: u16,
     ) -> crate::panorama::PanoramaSettlePolicy {
         use crate::panorama::PanoramaSettleDisabledReason::{
-            AiApplied, AutoAdjustmentApplied, FinalCompositeApplied, PostFilterApplied,
+            AiApplied, AutoAdjustmentApplied, PostFilterApplied, SmartSharpenApplied,
             UnsupportedSource, WaitingForColorAdjustments,
         };
         use crate::panorama::PanoramaSettlePolicy::{
             Disabled, EnabledFromRaw, EnabledWithColorAdjustments,
         };
         use crate::panorama::{
-            SOURCE_KIND_ADJUST_RAW, SOURCE_KIND_AI, SOURCE_KIND_FINAL_COMPOSITE, SOURCE_KIND_FS,
-            SOURCE_KIND_FS_WAITING_ADJUSTMENTS,
+            SOURCE_KIND_ADJUST_RAW, SOURCE_KIND_AI, SOURCE_KIND_AI_ADJUST,
+            SOURCE_KIND_FINAL_COMPOSITE, SOURCE_KIND_FS,
         };
+        if self.ai_will_apply_to(fs_idx) {
+            return Disabled { reason: AiApplied };
+        }
+        if source_kind == SOURCE_KIND_AI || source_kind == SOURCE_KIND_AI_ADJUST {
+            return Disabled { reason: AiApplied };
+        }
         let params = self.effective_params(fs_idx);
+        if params.auto_mode.is_some() {
+            return Disabled {
+                reason: AutoAdjustmentApplied,
+            };
+        }
+        if params.post_filter != crate::adjustment::PostFilter::None {
+            return Disabled {
+                reason: PostFilterApplied,
+            };
+        }
+        if params.smart_sharpen != 0 {
+            return Disabled {
+                reason: SmartSharpenApplied,
+            };
+        }
         match source_kind {
-            SOURCE_KIND_FS => EnabledFromRaw,
-            SOURCE_KIND_FS_WAITING_ADJUSTMENTS => Disabled {
-                reason: WaitingForColorAdjustments,
-            },
-            SOURCE_KIND_ADJUST_RAW => {
-                if !self.post_filter_bypassed
-                    && params.post_filter != crate::adjustment::PostFilter::None
-                {
+            SOURCE_KIND_FS => {
+                if params.is_color_identity() {
+                    EnabledFromRaw
+                } else {
                     Disabled {
-                        reason: PostFilterApplied,
+                        reason: WaitingForColorAdjustments,
                     }
-                } else if params.auto_mode.is_some() {
+                }
+            }
+            SOURCE_KIND_ADJUST_RAW => {
+                if params.is_color_identity() {
                     Disabled {
-                        reason: AutoAdjustmentApplied,
+                        reason: WaitingForColorAdjustments,
                     }
                 } else {
                     EnabledWithColorAdjustments {
@@ -59814,10 +59799,15 @@ impl App {
                     }
                 }
             }
-            SOURCE_KIND_AI => Disabled { reason: AiApplied },
-            SOURCE_KIND_FINAL_COMPOSITE => Disabled {
-                reason: FinalCompositeApplied,
-            },
+            SOURCE_KIND_FINAL_COMPOSITE => {
+                if params.is_color_identity() {
+                    EnabledFromRaw
+                } else {
+                    EnabledWithColorAdjustments {
+                        params: params.clone(),
+                    }
+                }
+            }
             _ => Disabled {
                 reason: UnsupportedSource,
             },
@@ -59962,20 +59952,8 @@ impl App {
             return;
         }
         // ON: GPano hint があれば初期視点に反映
-        let edit_warning_source_key = self
-            .has_pano_excluded_pixel_edits(fs_idx)
-            .then(|| self.metadata_cache_key(fs_idx))
-            .flatten();
         let (init_yaw, init_pitch) = self.panorama_initial_pose(fs_idx);
         self.panorama_state = Some(crate::panorama::PanoramaState::new(init_yaw, init_pitch));
-        if let Some(source_key) = edit_warning_source_key
-            && self.pano_edit_warning_shown_sources.insert(source_key)
-        {
-            self.show_feedback_toast(
-                "360° ビューでは編集（消しゴム・隠蔽加工・補正レイヤー）は反映されません"
-                    .to_string(),
-            );
-        }
         // 衝突する機能を停止 (docs/panorama-360-view-plan.md フィードバック対応):
         // 360 中は上バーのみの機能制限モードになるので、他の panel / mode を OFF
         // しておく。これらは 360 OFF 後にユーザーが再度有効化できる。

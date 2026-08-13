@@ -925,13 +925,14 @@ conceal は erase / raw を入力にして先へ合成せず `None` を返し、
 未完成の上位結果を作らない。表示側はその間だけ現在有効な下位レイヤーへフォールバックし、
 古い local / conceal cache を再表示しない。保存・比較・クリップボードの pixel job はこの
 表示用フォールバックを完成結果として扱わず、必要な edit materialization の完了を待つ。
-360 度パノラマ表示は、画素編集がないページでは通常表示と同じ完成済み
-`final_composite_cache` を 8K base に使う。消しゴム・隠蔽加工・補正レイヤーがある
-ページだけは、それらを運ぶ final composite を除外し、実効 `ai_upscale_cache` →
-`adjustment_cache` → `fs_cache` の順にフォールバックする。したがって AI・ポストフィルタ・
-スマートシャープ・自動補正は 360 度表示へ反映し、非反映は画素編集 3 種だけである。
-高解像度差し替えは実際に選んだ source が原本 sample から再現できる場合だけ有効にし、
-AI / final / post_filter / auto_mode を含む source では 8K base のまま表示する。
+360 度パノラマ表示も同じ考え方で、完了済みの `final_composite_cache` を 8K base
+アップロード元として画素編集の有無にかかわらず優先する。final AI が未完了の間だけ
+`adjustment_cache` / `ai_upscale_cache` / `fs_cache` の順へフォールバックし、AI 完了後は
+`FinalCompositeKey` の hash を含む cache_key へ変えて再アップロードする。
+高解像度化は原本を再デコードするため、AI / 自動補正 / ポストフィルタ / スマートシャープが
+有効なら無効にする。消しゴム・隠蔽加工・補正レイヤーだけがある場合は高解像度化を許可するため、
+切替後には編集が見えなくなる。この差は仕様として受け入れ、画素編集があり高解像度化が実際に
+動く状態だけ、画質ステータスの下へ注意書きを表示する。
 保存・比較・クリップボードのようなピクセル出力経路も、`prepare_capture_pixel_job` で
 同じ最終 composite pixels を取得する。EXIF Orientation は decode 済みなのでここでは
 再適用しないが、`rotation_db` の非破壊 90 度回転は GPU 描画専用のため、crop 後の

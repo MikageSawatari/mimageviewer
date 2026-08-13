@@ -24560,6 +24560,11 @@ impl App {
             state,
             Some(PanoramaQualityState::SettleReady) | Some(PanoramaQualityState::SettleApproved)
         );
+        let show_edit_warning = crate::panorama::should_show_pano_high_res_edit_warning(
+            self.has_pano_excluded_pixel_edits(fs_idx),
+            state.as_ref(),
+            &resolution.settle_policy,
+        );
         let rendering = self
             .pano_refinement
             .as_ref()
@@ -24627,6 +24632,7 @@ impl App {
             None => String::new(),
         };
         let full_text = format!("{mark} {label}{dims_str}");
+        let warning_text = "高画質化には編集は反映されません";
 
         // 切替ボタン情報を決定 (action / 表示文言 / ホバー)
         #[derive(Clone, Copy)]
@@ -24697,6 +24703,17 @@ impl App {
             .painter()
             .layout_no_wrap(full_text.clone(), font_id.clone(), color);
         let text_size = galley.size();
+        let warning_galley = show_edit_warning.then(|| {
+            ui.painter().layout_no_wrap(
+                warning_text.to_string(),
+                egui::FontId::proportional(11.0),
+                gray,
+            )
+        });
+        let warning_size = warning_galley
+            .as_ref()
+            .map(|galley| galley.size())
+            .unwrap_or(egui::Vec2::ZERO);
         let padding = egui::vec2(12.0, 6.0);
         let button_width = 130.0_f32;
         let button_height = 24.0_f32;
@@ -24706,11 +24723,16 @@ impl App {
         } else {
             0.0
         };
+        let status_row_height = text_size.y.max(button_height);
+        let warning_gap = if show_edit_warning { 2.0 } else { 0.0 };
         let pill_size = egui::vec2(
-            text_size.x + extra_w + padding.x * 2.0,
-            text_size.y.max(button_height) + padding.y * 2.0,
+            (text_size.x + extra_w).max(warning_size.x) + padding.x * 2.0,
+            status_row_height + warning_gap + warning_size.y + padding.y * 2.0,
         );
-        let pill_center = egui::pos2(image_rect.center().x, image_rect.bottom() - 28.0);
+        let pill_center = egui::pos2(
+            image_rect.center().x,
+            image_rect.bottom() - 10.0 - pill_size.y * 0.5,
+        );
         let pill_rect = egui::Rect::from_center_size(pill_center, pill_size);
         ui.painter().rect_filled(
             pill_rect,
@@ -24724,18 +24746,26 @@ impl App {
             egui::epaint::StrokeKind::Outside,
         );
         // テキストは左寄せ (button があれば右余白にボタンを置くため)
+        let status_row_center_y = pill_rect.top() + padding.y + status_row_height * 0.5;
         let text_pos = egui::pos2(
             pill_rect.left() + padding.x,
-            pill_rect.center().y - text_size.y * 0.5,
+            status_row_center_y - text_size.y * 0.5,
         );
         ui.painter().galley(text_pos, galley, color);
+        if let Some(warning_galley) = warning_galley {
+            let warning_pos = egui::pos2(
+                pill_rect.left() + padding.x,
+                pill_rect.top() + padding.y + status_row_height + warning_gap,
+            );
+            ui.painter().galley(warning_pos, warning_galley, gray);
+        }
 
         // 切替ボタン (該当 state のみ)
         if let Some((action, btn_label, hover)) = toggle_info {
             let btn_rect = egui::Rect::from_min_size(
                 egui::pos2(
                     pill_rect.left() + padding.x + text_size.x + button_gap,
-                    pill_rect.center().y - button_height * 0.5,
+                    status_row_center_y - button_height * 0.5,
                 ),
                 egui::vec2(button_width, button_height),
             );
