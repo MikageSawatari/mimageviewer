@@ -4163,6 +4163,7 @@ pub(crate) enum FsNavNoOpReason {
     DetachedIndependent,
     DetachedVideoUnsupported,
     DetachedEditUnavailable,
+    PanoramaEditUnavailable,
     ContinuousReadingUnavailable(FsContinuousReadingUnavailableFeature),
 }
 
@@ -16730,8 +16731,10 @@ impl App {
         let key_b_bg =
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsBgCycle);
         // 360 モード中は他モード切替系のキーを抑止 (= フィードバック反映の「機能制限モード」)。
-        // - 抑止対象: Z (分析) / S (スライドショー) / E (消しゴム) / M (ルーペ) / B (bg cycle)
-        //   / I (メタデータ) / C 系 (比較)
+        // - 抑止対象: Z (分析) / S (スライドショー) / M (ルーペ) / B (bg cycle)
+        //   / G (ピクセルグリッド) / I (メタデータ) / C 系 (比較)
+        // - E / Ctrl+G / Ctrl+M / Ctrl+T は各編集モードの共通入口まで通し、
+        //   そこで理由付き no-op にする。
         // - 抑止しない: V (= 360 を抜ける手段)、Esc / 矢印 / Wheel / F1-F5 / BS (= ナビ・レーティング)
         let pano_active_now = self.is_panorama_mode_active(fs_idx);
         // 描画・PageUp/Down・通常ナビと同じ正本を使う。reading_flow だけでは、比較等で
@@ -16742,7 +16745,7 @@ impl App {
             .is_some();
         let key_z = key_z_raw && !pano_active_now;
         let key_s = key_s && !pano_active_now;
-        let key_e = key_e_raw && !pano_active_now;
+        let key_e = key_e_raw;
         let key_m = key_m && !pano_active_now;
         let key_b_bg = key_b_bg && !pano_active_now;
         let key_g = key_g && !pano_active_now;
@@ -21494,10 +21497,26 @@ impl App {
         #[cfg(not(windows))]
         let _ = (ctx, native_toast);
 
+        self.set_fullscreen_nav_noop(reason);
+    }
+
+    fn set_fullscreen_nav_noop(&mut self, reason: FsNavNoOpReason) {
         self.fs_boundary_hint = Some(FsBoundaryHint::NavNoOp {
             reason,
             at: std::time::Instant::now(),
         });
+    }
+
+    /// 画素編集系モードの全入口が通る 360° 排他述語。
+    ///
+    /// false の場合は既存の no-op 案内と同じ単一 state を更新するため、キーリピートや
+    /// 非同期 continuation が重なっても通知を積み上げない。
+    pub(crate) fn fullscreen_edit_mode_entry_allowed(&mut self, fs_idx: usize) -> bool {
+        if !self.is_panorama_mode_active(fs_idx) {
+            return true;
+        }
+        self.set_fullscreen_nav_noop(FsNavNoOpReason::PanoramaEditUnavailable);
+        false
     }
 
     fn show_continuous_reading_shortcut_noop(
@@ -21532,6 +21551,9 @@ impl App {
             FsNavNoOpReason::DetachedVideoUnsupported => "この別ウィンドウでは動画を再生できません",
             FsNavNoOpReason::DetachedEditUnavailable => {
                 "この別ウィンドウでは画像編集機能を利用できません"
+            }
+            FsNavNoOpReason::PanoramaEditUnavailable => {
+                "360° ビュー中は画像編集モードを利用できません"
             }
             FsNavNoOpReason::ContinuousReadingUnavailable(feature) => feature.noop_title(),
         }
@@ -24610,6 +24632,11 @@ impl App {
             state,
             Some(PanoramaQualityState::SettleReady) | Some(PanoramaQualityState::SettleApproved)
         );
+        let show_edit_warning = crate::panorama::should_show_pano_high_res_edit_warning(
+            self.has_pano_excluded_pixel_edits(fs_idx),
+            state.as_ref(),
+            &resolution.settle_policy,
+        );
         let rendering = self
             .pano_refinement
             .as_ref()
@@ -24661,9 +24688,11 @@ impl App {
                 yellow,
             )
         } else if !policy_enabled {
-            // settle_policy が Disabled になっている主な理由を推定
-            // (AI 機能 / post_filter / auto_mode / transient)
-            let reason = self.pano_settle_disabled_reason(fs_idx, resolution.source_kind);
+            let reason = resolution
+                .settle_policy
+                .disabled_reason()
+                .map(|reason| reason.label())
+                .unwrap_or("不明");
             ("○", format!("高画質 OFF ({reason})"), gray)
         } else {
             ("○", "8K 表示".to_string(), gray)
@@ -24675,6 +24704,7 @@ impl App {
             None => String::new(),
         };
         let full_text = format!("{mark} {label}{dims_str}");
+        let warning_text = "高画質化には編集は反映されません";
 
         // 切替ボタン情報を決定 (action / 表示文言 / ホバー)
         #[derive(Clone, Copy)]
@@ -24691,10 +24721,8 @@ impl App {
         //    BaseOnly 固定にされている。
         //  - `!high_res_failed` (= 前回 decode 失敗履歴がない)。`start_pano_high_res_load`
         //    が failed エントリで即 return するため、同じ stall を引き起こす。
-        //  - `policy_enabled` (= AI / post_filter / auto_mode で settle_policy が
-        //    Disabled でない)。Disabled 下で SettleApproved に倒しても settle は動かず、
-        //    巨大 RGBA だけ確保される無駄を避ける。設定を解除すれば次フレで
-        //    自動的にボタンが現れる。
+        //  - `policy_enabled` (= 色調補正 cache の準備待ちでない)。Disabled 下で
+        //    SettleApproved に倒しても settle は動かず、巨大 RGBA だけ確保されるため。
         let is_plain_image = matches!(self.items.get(fs_idx), Some(GridItem::Image(_)));
         let high_res_failed = self.pano_high_res_failed.contains(&resolution.source_key);
         let can_switch_to_hq = is_plain_image && !high_res_failed && policy_enabled;
@@ -24747,6 +24775,17 @@ impl App {
             .painter()
             .layout_no_wrap(full_text.clone(), font_id.clone(), color);
         let text_size = galley.size();
+        let warning_galley = show_edit_warning.then(|| {
+            ui.painter().layout_no_wrap(
+                warning_text.to_string(),
+                egui::FontId::proportional(11.0),
+                gray,
+            )
+        });
+        let warning_size = warning_galley
+            .as_ref()
+            .map(|galley| galley.size())
+            .unwrap_or(egui::Vec2::ZERO);
         let padding = egui::vec2(12.0, 6.0);
         let button_width = 130.0_f32;
         let button_height = 24.0_f32;
@@ -24756,11 +24795,16 @@ impl App {
         } else {
             0.0
         };
+        let status_row_height = text_size.y.max(button_height);
+        let warning_gap = if show_edit_warning { 2.0 } else { 0.0 };
         let pill_size = egui::vec2(
-            text_size.x + extra_w + padding.x * 2.0,
-            text_size.y.max(button_height) + padding.y * 2.0,
+            (text_size.x + extra_w).max(warning_size.x) + padding.x * 2.0,
+            status_row_height + warning_gap + warning_size.y + padding.y * 2.0,
         );
-        let pill_center = egui::pos2(image_rect.center().x, image_rect.bottom() - 28.0);
+        let pill_center = egui::pos2(
+            image_rect.center().x,
+            image_rect.bottom() - 10.0 - pill_size.y * 0.5,
+        );
         let pill_rect = egui::Rect::from_center_size(pill_center, pill_size);
         ui.painter().rect_filled(
             pill_rect,
@@ -24774,18 +24818,26 @@ impl App {
             egui::epaint::StrokeKind::Outside,
         );
         // テキストは左寄せ (button があれば右余白にボタンを置くため)
+        let status_row_center_y = pill_rect.top() + padding.y + status_row_height * 0.5;
         let text_pos = egui::pos2(
             pill_rect.left() + padding.x,
-            pill_rect.center().y - text_size.y * 0.5,
+            status_row_center_y - text_size.y * 0.5,
         );
         ui.painter().galley(text_pos, galley, color);
+        if let Some(warning_galley) = warning_galley {
+            let warning_pos = egui::pos2(
+                pill_rect.left() + padding.x,
+                pill_rect.top() + padding.y + status_row_height + warning_gap,
+            );
+            ui.painter().galley(warning_pos, warning_galley, gray);
+        }
 
         // 切替ボタン (該当 state のみ)
         if let Some((action, btn_label, hover)) = toggle_info {
             let btn_rect = egui::Rect::from_min_size(
                 egui::pos2(
                     pill_rect.left() + padding.x + text_size.x + button_gap,
-                    pill_rect.center().y - button_height * 0.5,
+                    status_row_center_y - button_height * 0.5,
                 ),
                 egui::vec2(button_width, button_height),
             );
@@ -24849,36 +24901,6 @@ impl App {
         _overlay_drawn: bool,
         _overlay_alpha: f32,
     ) {
-    }
-
-    /// `compute_settle_policy` が Disabled を返すときの主因を 1 単語で返す
-    /// (status インジケータ表示用)。
-    fn pano_settle_disabled_reason(&self, fs_idx: usize, source_kind: u16) -> &'static str {
-        // AI が **実効的に** この画像に適用される場合のみ "AI 機能 ON" 扱い。
-        // 設定 ON でもサイズ閾値超でスキップされる画像は AI 由来ではないので、
-        // 後段の post_filter / auto_mode / 補正 transient 等の理由を先に出す。
-        if self.ai_will_apply_to(fs_idx) {
-            return "AI 機能 ON";
-        }
-        if source_kind == crate::panorama::SOURCE_KIND_AI
-            || source_kind == crate::panorama::SOURCE_KIND_AI_ADJUST
-        {
-            return "AI 由来 cache";
-        }
-        let params = self.effective_params(fs_idx);
-        if params.auto_mode.is_some() {
-            return "自動補正 ON";
-        }
-        if params.post_filter != crate::adjustment::PostFilter::None {
-            return "ポストフィルタ ON";
-        }
-        if params.smart_sharpen != 0 {
-            return "シャープ化 ON";
-        }
-        if source_kind == crate::panorama::SOURCE_KIND_FS && !params.is_color_identity() {
-            return "補正適用待ち";
-        }
-        "不明"
     }
 
     #[cfg(not(windows))]
@@ -28173,6 +28195,13 @@ impl App {
             } => (
                 Self::nav_noop_title(FsNavNoOpReason::DetachedEditUnavailable),
                 vec!["通常の連動ウィンドウ、またはメイン側で編集してください"],
+            ),
+            FsBoundaryHint::NavNoOp {
+                reason: FsNavNoOpReason::PanoramaEditUnavailable,
+                ..
+            } => (
+                Self::nav_noop_title(FsNavNoOpReason::PanoramaEditUnavailable),
+                vec!["V キーで 360° ビューを終了してから編集してください"],
             ),
             FsBoundaryHint::NavNoOp {
                 reason: FsNavNoOpReason::ContinuousReadingUnavailable(feature),

@@ -58568,8 +58568,8 @@ impl App {
     }
 
     /// 指定ピクセルデータに色調補正を同期適用して adjustment_cache に格納する。
-    /// poll_prefetch / poll_ai_upscale の完了時に呼ばれ、
-    /// 補正済み画像を即座にテクスチャ化してチラつきを防止する。
+    /// raw `fs_cache` の通常 / panorama load 完了時に呼ばれ、補正済み画像を
+    /// 即座にテクスチャ化してチラつきを防止する。
     fn apply_sync_adjustment(
         &mut self,
         ctx: &egui::Context,
@@ -59368,8 +59368,8 @@ impl App {
                 self.dismiss_pano_confirmation_banner(&ready.source_key);
                 ctx.request_repaint();
             }
-            // settle_will_use_it == false (AI / post_filter ON 等):
-            //   state は触らない、HighResSource は格納 (= 将来 OFF→ON で再利用可能)
+            // settle_will_use_it == false (色調補正 cache の準備待ち):
+            //   state は触らない、HighResSource は格納して準備完了後に再利用する。
         }
         // **進行中 worker がある間は低頻度 repaint で wakeup を確保** (Codex P1 第 11、
         // 2026-05): egui はアイドル時にフレームを送らないので、worker が完了しても
@@ -59942,11 +59942,22 @@ impl App {
             .unwrap_or(false)
     }
 
+    /// settle 高画質化では再現されない画素編集が対象ページにあるか。
+    ///
+    /// ステータス注意書きはこの述語を使い、消しゴム・隠蔽加工・補正レイヤーの
+    /// 判定を描画側へ複製しない。
+    pub(crate) fn has_pano_excluded_pixel_edits(&self, fs_idx: usize) -> bool {
+        self.mask_pages.contains(&fs_idx)
+            || self.has_active_local_adjust_layers(fs_idx)
+            || self.conceal_pages.contains(&fs_idx)
+    }
+
     /// 360 ベーステクスチャのソース選択 + cache_key 計算を 1 関数に集約する (§4.3)。
     ///
-    /// 優先順位は `final_composite_cache → adjustment_cache → ai_upscale_cache → fs_cache`
-    /// (display-pipeline.md §2.3)。final pipeline が未完了の間だけ旧キャッシュ層へ
-    /// フォールバックし、AI 完了後は通常表示と同じ最終 composite を 360 ベースにする。
+    /// 優先順位は通常表示と同じ
+    /// `final_composite_cache → adjustment_cache → ai_upscale_cache → fs_cache`。
+    /// final composite は画素編集も含めてそのまま 8K base に使う。settle 高画質化で
+    /// 再現できない機能は `compute_settle_policy` が無効化する。
     ///
     /// Phase 1 ではこの戻り値の `pixels` を `color_image_to_rgba` で RGBA8 化し、
     /// `cache_key` を `pano_uploaded` の stale 判定 + callback に渡す。
@@ -59959,15 +59970,8 @@ impl App {
         use crate::panorama::*;
         let source_key = self.metadata_cache_key(fs_idx)?;
         let bg = self.effective_upscale_bg_mode();
-        // AI が「この画像に実効的に適用されるか」で source_kind を分ける。
-        // 設定 ON でもサイズ閾値超でスキップされる画像は AI 由来扱いにしない
-        // (= settle を有効化できる、2026-05 ユーザー要望)。
         let ai_effective = self.ai_will_apply_to(fs_idx);
-
         let final_source = self.ensure_final_composite_pixels_with_key(ctx, fs_idx);
-
-        // ai_upscale_cache 参照は AI が実効的に動くときだけ (Codex P1 第 14 反映、
-        // 2026-05 で機能 flag → 実効判定に強化)
         let ai_cache_entry = if ai_effective {
             self.ai_upscale_cache.get(&(fs_idx, bg))
         } else {
@@ -59983,9 +59987,8 @@ impl App {
             (pixels, SOURCE_KIND_FINAL_COMPOSITE, Some(hash))
         } else if let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&fs_idx)
         {
-            // adjustment_cache は AI 由来 / 通常由来の両方が入る (実コード line 15500)。
-            // ai_effective が true のときは AI 由来扱い (SOURCE_KIND_AI_ADJUST)、
-            // false のときは通常由来 (SOURCE_KIND_ADJUST_RAW)。
+            // SOURCE_KIND_AI_ADJUST は pixels の由来ではなく、final 未完成時に
+            // AI が実効中の adjustment fallback を settle 無効として識別する marker。
             let kind = if ai_effective {
                 SOURCE_KIND_AI_ADJUST
             } else {
@@ -60017,7 +60020,7 @@ impl App {
         let cache_key =
             make_pano_cache_key(crc16_of_str(&source_key), source_kind, adjust_gen, ai_gen);
 
-        // Phase 2a settle policy: source_kind と AI / 補正状態から判定 (§3.6.2.1)
+        // Phase 2a settle policy: 対象ページの実効機能と source_kind から判定 (§3.6.2.1)
         let settle_policy = self.compute_settle_policy(fs_idx, source_kind);
 
         Some(PanoSourceResolution {
@@ -60030,63 +60033,63 @@ impl App {
     }
 
     /// 360 度パノラマビュー Phase 2a: settle policy 判定 (§3.6.2.1)。
-    /// AI 機能 ON / `post_filter` / `auto_mode` / source_kind が AI 由来 (2/3) などで
-    /// `Disabled`、純粋色調補正なら `EnabledWithColorAdjustments`、補正なし &
-    /// AI なしなら `EnabledFromRaw`。
     ///
-    /// **AI 機能 ON の判定** (2026-05 ユーザー要望反映):
-    /// 設定 ON でも画像サイズ (`should_process_rect`) で実際に AI が動かないケースでは
-    /// settle を有効化する。判定は以下の OR:
-    ///   - `ai_upscale_enabled && upscale_in_range` (実効的にアップスケール対象)
-    ///   - `ai_denoise_model.is_some() && denoise_in_range` (実効的にデノイズ対象)
-    /// 画像サイズが取れない (= まだロード中) 場合は保守的に「適用される」とみなす。
+    /// AI / auto_mode / post_filter / smart_sharpen は 8K base に反映したまま settle を
+    /// 無効化する。通常の色調補正だけなら settle 側で再適用し、無補正なら raw sample。
+    /// Disabled 理由はここで型にし、表示側に同じ判定木を持たせない。
     pub(crate) fn compute_settle_policy(
         &self,
         fs_idx: usize,
         source_kind: u16,
     ) -> crate::panorama::PanoramaSettlePolicy {
-        use crate::panorama::PanoramaSettlePolicy::*;
+        use crate::panorama::PanoramaSettleDisabledReason::{
+            AiApplied, AutoAdjustmentApplied, PostFilterApplied, SmartSharpenApplied,
+            UnsupportedSource, WaitingForColorAdjustments,
+        };
+        use crate::panorama::PanoramaSettlePolicy::{
+            Disabled, EnabledFromRaw, EnabledWithColorAdjustments,
+        };
         use crate::panorama::{
             SOURCE_KIND_ADJUST_RAW, SOURCE_KIND_AI, SOURCE_KIND_AI_ADJUST,
             SOURCE_KIND_FINAL_COMPOSITE, SOURCE_KIND_FS,
         };
-        // AI が「実際にこの画像に適用される」か判定。
-        // 設定 ON でもサイズ閾値超でスキップされるケースは settle 許可する。
-        let ai_actually_active = self.ai_will_apply_to(fs_idx);
-        if ai_actually_active {
-            return Disabled;
+        if self.ai_will_apply_to(fs_idx) {
+            return Disabled { reason: AiApplied };
         }
-        // source_kind が AI 由来 (2 or 3) なら settle 無効。
-        // (上の `ai_actually_active` 判定で大半は弾かれるが、AI OFF 直後に cache 残骸が
-        // 居て resolve_pano_source が AI 由来 entry を選んだ過渡期は別途ガードが要る)
         if source_kind == SOURCE_KIND_AI || source_kind == SOURCE_KIND_AI_ADJUST {
-            return Disabled;
+            return Disabled { reason: AiApplied };
         }
         let params = self.effective_params(fs_idx);
         if params.auto_mode.is_some() {
-            return Disabled;
+            return Disabled {
+                reason: AutoAdjustmentApplied,
+            };
         }
         if params.post_filter != crate::adjustment::PostFilter::None {
-            return Disabled;
+            return Disabled {
+                reason: PostFilterApplied,
+            };
         }
-        // 最終表示段スマートシャープも settle 再レンダリングでは再現しない
-        // (EnabledWithColorAdjustments は色調のみ適用) ため post_filter と同じ扱い。
         if params.smart_sharpen != 0 {
-            return Disabled;
+            return Disabled {
+                reason: SmartSharpenApplied,
+            };
         }
         match source_kind {
             SOURCE_KIND_FS => {
                 if params.is_color_identity() {
                     EnabledFromRaw
                 } else {
-                    // params 有効だが adjustment_cache 未生成 = transient
-                    Disabled
+                    Disabled {
+                        reason: WaitingForColorAdjustments,
+                    }
                 }
             }
             SOURCE_KIND_ADJUST_RAW => {
                 if params.is_color_identity() {
-                    // post_filter のみで adjustment_cache が出来た形跡 (上で除外済みのはず)
-                    Disabled
+                    Disabled {
+                        reason: WaitingForColorAdjustments,
+                    }
                 } else {
                     EnabledWithColorAdjustments {
                         params: params.clone(),
@@ -60102,7 +60105,9 @@ impl App {
                     }
                 }
             }
-            _ => Disabled,
+            _ => Disabled {
+                reason: UnsupportedSource,
+            },
         }
     }
 
@@ -60110,16 +60115,20 @@ impl App {
     /// 設定 ON でもサイズ上限超 (`should_process_rect(w, h, limit) == false`) なら false。
     /// fs_cache に entry がまだ無い場合は判定不能なので保守的に true (= 適用予定)。
     pub(crate) fn ai_will_apply_to(&self, fs_idx: usize) -> bool {
-        let upscale_on = self.ai_upscale_enabled;
-        let denoise_on = self.ai_denoise_model.is_some();
+        // `ai_upscale_enabled` / `ai_denoise_model` は現在の fullscreen idx 用に同期した
+        // UI cache なので、見開き相方やページ個別設定には使わない。final AI と同じ
+        // effective request を対象ページから解決する。
+        let params = self.effective_params(fs_idx);
+        let upscale_on = self.effective_upscale_request(params).is_some();
+        let denoise_on = self.effective_denoise_request(params).is_some();
         if !upscale_on && !denoise_on {
             return false;
         }
         // 源解像度を fs_cache から取得 (clamp 前の source_dims 優先)。
         // **fs_cache が evict された / Animated / 未ロード**等で見つからない場合は
         // 他の cache 層 (adjustment_cache / ai_upscale_cache) からも探す (Codex P3 第 5、
-        // 2026-05): cache が複数層に分散したフレームで settle が誤って Disabled 化
-        // するのを防ぐ。後段の cache 層は pixels.size しか持たない (= GPU clamp 後の
+        // 2026-05): cache が複数層に分散したフレームでも、360 のソース選択が AI の
+        // 実効有無を誤らないようにする。後段の cache 層は pixels.size しか持たない (= GPU clamp 後の
         // 8K cap dims) ので、AI 適用サイズ上限 (最大でも数 K) との比較なら問題ない。
         let bg = self.effective_upscale_bg_mode();
         let dims: Option<(u32, u32)> = match self.fs_cache.get(&fs_idx) {
@@ -60148,7 +60157,7 @@ impl App {
             }
         };
         let Some((w, h)) = dims else {
-            // 寸法不明 → 保守的に「適用される」(= settle を一時 Disabled)。
+            // 寸法不明 → 保守的に「適用される」(= 360 は raw source を選ぶ)。
             // 寸法が確定したら次フレで再評価される。
             return true;
         };
@@ -60163,8 +60172,8 @@ impl App {
     /// 「これ以上進まない / 不要」かを判定する。true なら隣接画像の AI 先読みへ
     /// 進んでよい (= update ループの `current_done`)。
     ///
-    /// **`ai_will_apply_to` (panorama settle 用) とは意味が逆**なので別 predicate にする:
-    /// settle 側は「適用されるかもしれない → 保守的に true」で、寸法不明・終端状態でも
+    /// **`ai_will_apply_to` (360 source 選択用) とは意味が逆**なので別 predicate にする:
+    /// 360 側は「適用されるかもしれない → 保守的に true」で、寸法不明・終端状態でも
     /// true を返す。スケジューラがそれを `!ai_will_apply_to` で使うと、
     /// `FsCacheEntry::Animated` / `Failed` (= AI upscale 経路に乗らない終端状態) で
     /// `current_done=false` が固定され、`maybe_start_ai_upscale` も Static 以外は即 return

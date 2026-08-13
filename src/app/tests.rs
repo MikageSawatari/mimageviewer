@@ -22048,6 +22048,69 @@ mod pipeline_cache_refactor_tests {
         }
     }
 
+    fn insert_pano_static_source(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        label: &str,
+        color: egui::Color32,
+    ) -> Arc<egui::ColorImage> {
+        let pixels = Arc::new(egui::ColorImage::new([2, 1], vec![color; 2]));
+        let texture = ctx.load_texture(label, (*pixels).clone(), egui::TextureOptions::LINEAR);
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex: texture,
+                pixels: Arc::clone(&pixels),
+                source_dims: Some([2, 1]),
+                load_seq: 0,
+            },
+        );
+        pixels
+    }
+
+    fn insert_pano_final_source(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        label: &str,
+        color: egui::Color32,
+    ) -> Arc<egui::ColorImage> {
+        let source_size = app
+            .current_raw_source_pixels(idx)
+            .expect("pano final fixture requires raw pixels")
+            .size;
+        let edit_key = dummy_edit_key(app, idx);
+        let params = app.effective_params(idx).clone();
+        let final_key = app.final_composite_key_for_pixels(edit_key, source_size, &params);
+        let edit_pixels = app
+            .current_raw_source_pixels(idx)
+            .expect("pano final fixture requires raw pixels");
+        let edit_texture = ctx.load_texture(
+            format!("{label}_edit"),
+            (*edit_pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.edit_result_cache.insert(
+            edit_key,
+            EditResultEntry {
+                pixels: edit_pixels,
+                texture: Some(edit_texture),
+            },
+        );
+        let pixels = Arc::new(egui::ColorImage::new([4, 2], vec![color; 8]));
+        let texture = ctx.load_texture(label, (*pixels).clone(), egui::TextureOptions::LINEAR);
+        app.final_composite_cache.insert(
+            final_key,
+            FinalCompositeEntry {
+                pixels: Arc::clone(&pixels),
+                texture,
+                complete: true,
+            },
+        );
+        pixels
+    }
+
     #[test]
     fn final_effect_recompute_tracker_counts_only_recent_completed_same_key() {
         let base = std::time::Instant::now();
@@ -24318,94 +24381,165 @@ mod pipeline_cache_refactor_tests {
     }
 
     #[test]
-    fn pano_source_switches_to_completed_final_composite() {
+    fn pano_source_uses_completed_final_composite_for_effective_ai_with_pixel_edits() {
         let ctx = egui::Context::default();
         let mut app = setup_app();
-        let idx = push_image(&mut app, "C:/pics/pano-final.jpg");
+        let idx = push_image(&mut app, "C:/pics/pano-ai-brightness.jpg");
         app.fullscreen_idx = Some(idx);
-
-        let raw_color = egui::Color32::from_rgb(20, 30, 40);
-        let raw_pixels = Arc::new(egui::ColorImage::new([2, 1], vec![raw_color; 2]));
-        let raw_texture = ctx.load_texture(
-            "pano_final_raw",
-            (*raw_pixels).clone(),
-            egui::TextureOptions::LINEAR,
-        );
-        app.fs_cache.insert(
+        insert_pano_static_source(
+            &mut app,
+            &ctx,
             idx,
-            FsCacheEntry::Static {
-                tex: raw_texture,
-                pixels: Arc::clone(&raw_pixels),
-                source_dims: Some([2, 1]),
-                load_seq: 0,
-            },
+            "pano_ai_brightness_raw",
+            egui::Color32::from_rgb(10, 20, 30),
+        );
+        app.settings.global_preset.brightness = 10.0;
+        app.settings.global_preset.upscale_model = Some("auto".to_string());
+        app.mask_pages.insert(idx);
+        let final_pixels = insert_pano_final_source(
+            &mut app,
+            &ctx,
+            idx,
+            "pano_ai_brightness_final",
+            egui::Color32::from_rgb(170, 180, 190),
         );
 
-        let edit_key = dummy_edit_key(&app, idx);
-        let edit_texture = ctx.load_texture(
-            "pano_final_edit",
-            (*raw_pixels).clone(),
-            egui::TextureOptions::LINEAR,
-        );
-        app.edit_result_cache.insert(
-            edit_key,
-            EditResultEntry {
-                pixels: Arc::clone(&raw_pixels),
-                texture: Some(edit_texture),
-            },
-        );
-
-        let params = app.effective_params(idx).clone();
-        let final_key = app.final_composite_key_for_pixels(edit_key, raw_pixels.size, &params);
-        let preview_texture = ctx.load_texture(
-            "pano_final_preview",
-            (*raw_pixels).clone(),
-            egui::TextureOptions::LINEAR,
-        );
-        app.final_composite_cache.insert(
-            final_key,
-            FinalCompositeEntry {
-                pixels: Arc::clone(&raw_pixels),
-                texture: preview_texture,
-                complete: false,
-            },
-        );
-
-        let fallback = app
+        let resolution = app
             .resolve_pano_source(&ctx, idx)
-            .expect("raw fallback should be available while final composite is incomplete");
-        assert_eq!(fallback.source_kind, crate::panorama::SOURCE_KIND_FS);
-        assert_eq!(fallback.pixels.size, [2, 1]);
-
-        let final_color = egui::Color32::from_rgb(200, 210, 220);
-        let final_pixels = Arc::new(egui::ColorImage::new([8, 4], vec![final_color; 32]));
-        let final_texture = ctx.load_texture(
-            "pano_final_complete",
-            (*final_pixels).clone(),
-            egui::TextureOptions::LINEAR,
-        );
-        app.final_composite_cache.insert(
-            final_key,
-            FinalCompositeEntry {
-                pixels: Arc::clone(&final_pixels),
-                texture: final_texture,
-                complete: true,
-            },
-        );
-
-        let completed = app
-            .resolve_pano_source(&ctx, idx)
-            .expect("completed final composite should be panorama-ready");
+            .expect("completed AI final composite should be panorama-ready");
         assert_eq!(
-            completed.source_kind,
+            resolution.source_kind,
             crate::panorama::SOURCE_KIND_FINAL_COMPOSITE
         );
-        assert_eq!(completed.pixels.size, [8, 4]);
-        assert_eq!(completed.pixels.pixels[0], final_color);
-        assert_ne!(
-            fallback.cache_key, completed.cache_key,
-            "AI/final completion must force the pano upload cache to refresh"
+        assert!(
+            Arc::ptr_eq(&resolution.pixels, &final_pixels),
+            "画素編集があっても AI を含む final composite を 360° base に使う"
         );
+        assert!(matches!(
+            resolution.settle_policy,
+            crate::panorama::PanoramaSettlePolicy::Disabled {
+                reason: crate::panorama::PanoramaSettleDisabledReason::AiApplied
+            }
+        ));
+    }
+
+    #[test]
+    fn pano_settle_policy_restores_feature_rules_with_typed_reasons() {
+        let mut raw_app = setup_app();
+        let raw_idx = push_image(&mut raw_app, "C:/pics/pano-policy-raw.jpg");
+        assert!(matches!(
+            raw_app.compute_settle_policy(raw_idx, crate::panorama::SOURCE_KIND_FS),
+            crate::panorama::PanoramaSettlePolicy::EnabledFromRaw
+        ));
+        raw_app.settings.global_preset.brightness = 10.0;
+        assert!(matches!(
+            raw_app.compute_settle_policy(raw_idx, crate::panorama::SOURCE_KIND_ADJUST_RAW),
+            crate::panorama::PanoramaSettlePolicy::EnabledWithColorAdjustments { .. }
+        ));
+        assert_eq!(
+            raw_app
+                .compute_settle_policy(raw_idx, crate::panorama::SOURCE_KIND_FS)
+                .disabled_reason(),
+            Some(crate::panorama::PanoramaSettleDisabledReason::WaitingForColorAdjustments)
+        );
+        drop(raw_app);
+
+        for effect in 0..4 {
+            let ctx = egui::Context::default();
+            let mut app = setup_app();
+            let idx = push_image(&mut app, &format!("C:/pics/pano-policy-{effect}.jpg"));
+            insert_pano_static_source(
+                &mut app,
+                &ctx,
+                idx,
+                "pano_policy_source",
+                egui::Color32::from_rgb(10, 20, 30),
+            );
+            let expected = match effect {
+                0 => {
+                    app.settings.global_preset.upscale_model = Some("auto".to_string());
+                    crate::panorama::PanoramaSettleDisabledReason::AiApplied
+                }
+                1 => {
+                    app.settings.global_preset.auto_mode = Some(crate::adjustment::AutoMode::Auto);
+                    crate::panorama::PanoramaSettleDisabledReason::AutoAdjustmentApplied
+                }
+                2 => {
+                    app.settings.global_preset.post_filter = PostFilter::Sepia;
+                    crate::panorama::PanoramaSettleDisabledReason::PostFilterApplied
+                }
+                3 => {
+                    app.settings.global_preset.smart_sharpen = 40;
+                    crate::panorama::PanoramaSettleDisabledReason::SmartSharpenApplied
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                app.compute_settle_policy(idx, crate::panorama::SOURCE_KIND_FINAL_COMPOSITE)
+                    .disabled_reason(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn panorama_blocks_edit_mode_shortcuts_at_the_shared_entry_gate() {
+        let _key_input_guard = crate::key_input::TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        crate::key_input::clear_test_frame();
+
+        for (key, ctrl_pressed) in [
+            (egui::Key::E, false),
+            (egui::Key::G, true),
+            (egui::Key::M, true),
+            (egui::Key::T, true),
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app();
+            let idx = push_image(&mut app, &format!("C:/pics/pano-edit-{key:?}.jpg"));
+            app.fullscreen_idx = Some(idx);
+            insert_pano_static_source(
+                &mut app,
+                &ctx,
+                idx,
+                "pano_edit_mode_raw",
+                egui::Color32::BLACK,
+            );
+            app.panorama_state = Some(crate::panorama::PanoramaState::new(0.0, 0.0));
+
+            let ctrl = egui::Modifiers {
+                ctrl: ctrl_pressed,
+                ..Default::default()
+            };
+            ctx.begin_pass(egui::RawInput {
+                modifiers: ctrl,
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: ctrl,
+                }],
+                ..Default::default()
+            });
+            let _ = app.handle_fs_key_input(&ctx, idx, false);
+            let _ = ctx.end_pass();
+
+            assert!(!app.erase_mode, "E must remain blocked");
+            assert!(!app.local_adjust_mode, "Ctrl+G must remain blocked");
+            assert!(!app.conceal_mode, "Ctrl+M must remain blocked");
+            assert!(!app.text_mode, "Ctrl+T must remain blocked");
+            assert!(matches!(
+                app.fs_boundary_hint,
+                Some(crate::ui_fullscreen::FsBoundaryHint::NavNoOp {
+                    reason: crate::ui_fullscreen::FsNavNoOpReason::PanoramaEditUnavailable,
+                    ..
+                })
+            ));
+        }
+        crate::key_input::clear_test_frame();
     }
 
     #[test]

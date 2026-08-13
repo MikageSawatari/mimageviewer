@@ -27,11 +27,11 @@ pub const FOV_DEFAULT: f32 = 1.2;
 pub const PITCH_LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.001;
 
 /// `cache_key` の source_kind ビット (§4.1.2):
-/// - 0 = fs_cache のみ (補正なし、AI なし)
-/// - 1 = adjustment_cache (raw + 単純色調補正)
-/// - 2 = ai_upscale_cache (AI のみ)
-/// - 3 = adjustment_cache (AI + 補正)
-/// - 4 = final_composite_cache (通常表示と同じ最終パイプライン)
+/// - 0 = fs_cache
+/// - 1 = adjustment_cache (raw + 色調補正 / auto_mode / post_filter)
+/// - 2 = ai_upscale_cache
+/// - 3 = AI 実効時に選ばれた adjustment_cache (legacy fallback marker)
+/// - 4 = final_composite_cache
 pub const SOURCE_KIND_FS: u16 = 0;
 pub const SOURCE_KIND_ADJUST_RAW: u16 = 1;
 pub const SOURCE_KIND_AI: u16 = 2;
@@ -258,7 +258,7 @@ pub struct PanoSourceResolution {
     pub cache_key: u64,
     /// 360 ベーステクスチャのアップロード元。`color_image_to_rgba` で RGBA8 化する。
     pub pixels: std::sync::Arc<egui::ColorImage>,
-    /// どのキャッシュ層から取ったか (SOURCE_KIND_*)。Phase 2a の settle policy 判定にも使う。
+    /// 元画像 / 単純色調補正のどちらから取ったか。settle policy 判定にも使う。
     pub source_kind: u16,
     /// settle (Phase 2a) の発動可否ポリシー (§3.6.2.1)。
     /// `compute_settle_policy(fs_idx, source_kind)` の出力をそのまま焼き込む。
@@ -330,25 +330,58 @@ pub fn needs_user_confirmation(source_pixels: u64, approved_max: u64) -> bool {
 
 /// settle の適用ポリシー (§3.6.2.1)。
 ///
-/// 8K base のソース選択結果 (`source_kind`) と AI / 補正設定から
-/// `compute_settle_policy` で決まる。
+/// 対象ページの実効機能と 8K base の `source_kind` から `compute_settle_policy` で決まる。
 #[derive(Clone, Debug)]
 pub enum PanoramaSettlePolicy {
-    /// settle スキップ。8K base のみ表示 (AI 有効 / post_filter / auto_mode / transient)
-    Disabled,
-    /// raw fs_cache (補正なし、AI なし)。HighResSource = 元 RGBA をそのまま sample
+    /// 選択された 8K base を settle render で再現できないため開始しない。
+    Disabled {
+        reason: PanoramaSettleDisabledReason,
+    },
+    /// raw fs_cache。HighResSource の元 RGBA を sample
     EnabledFromRaw,
-    /// 通常画像 + 単純色調補正 (post_filter / auto / AI なし)。
+    /// 通常画像 + settle render で再現可能な色調補正。
     /// settle source は元 RGBA、render 内で `apply_adjustments_fast` を再適用。
     EnabledWithColorAdjustments {
         params: crate::adjustment::AdjustParams,
     },
 }
 
+/// settle を一時停止する理由。表示側はこの値だけを読み、判定木を複製しない。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanoramaSettleDisabledReason {
+    WaitingForColorAdjustments,
+    AiApplied,
+    PostFilterApplied,
+    AutoAdjustmentApplied,
+    SmartSharpenApplied,
+    UnsupportedSource,
+}
+
+impl PanoramaSettleDisabledReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::WaitingForColorAdjustments => "補正適用待ち",
+            Self::AiApplied => "AI 適用中",
+            Self::PostFilterApplied => "ポストフィルタ適用中",
+            Self::AutoAdjustmentApplied => "自動補正適用中",
+            Self::SmartSharpenApplied => "シャープ化適用中",
+            Self::UnsupportedSource => "再現できない加工を適用中",
+        }
+    }
+}
+
 impl PanoramaSettlePolicy {
     /// settle render を起動する必要があるかどうか。
     pub fn is_enabled(&self) -> bool {
-        !matches!(self, PanoramaSettlePolicy::Disabled)
+        !matches!(self, PanoramaSettlePolicy::Disabled { .. })
+    }
+
+    pub fn disabled_reason(&self) -> Option<PanoramaSettleDisabledReason> {
+        match self {
+            PanoramaSettlePolicy::Disabled { reason } => Some(*reason),
+            PanoramaSettlePolicy::EnabledFromRaw
+            | PanoramaSettlePolicy::EnabledWithColorAdjustments { .. } => None,
+        }
     }
 }
 
@@ -360,6 +393,17 @@ pub fn settle_enabled(state: &PanoramaQualityState, policy: &PanoramaSettlePolic
         state,
         PanoramaQualityState::SettleReady | PanoramaQualityState::SettleApproved
     ) && policy.is_enabled()
+}
+
+/// 高画質化で画素編集が外れる可能性をステータスに表示する条件。
+///
+/// 画素編集があり、かつ現在の state / policy で settle が実際に動き得る場合だけ true。
+pub fn should_show_pano_high_res_edit_warning(
+    has_excluded_pixel_edits: bool,
+    state: Option<&PanoramaQualityState>,
+    policy: &PanoramaSettlePolicy,
+) -> bool {
+    has_excluded_pixel_edits && state.is_some_and(|state| settle_enabled(state, policy))
 }
 
 /// settle render の進行ハンドル (§4.6.2)。
@@ -1015,7 +1059,9 @@ mod tests {
             est_ram_gb: 2.4,
         };
         let policy_ok = PanoramaSettlePolicy::EnabledFromRaw;
-        let policy_no = PanoramaSettlePolicy::Disabled;
+        let policy_no = PanoramaSettlePolicy::Disabled {
+            reason: PanoramaSettleDisabledReason::WaitingForColorAdjustments,
+        };
         assert!(settle_enabled(&state_ok, &policy_ok));
         assert!(!settle_enabled(&state_no, &policy_ok));
         assert!(!settle_enabled(&state_ok, &policy_no));
@@ -1027,6 +1073,31 @@ mod tests {
         ));
         // BaseOnly は NG
         assert!(!settle_enabled(&PanoramaQualityState::BaseOnly, &policy_ok));
+    }
+
+    #[test]
+    fn pano_high_res_edit_warning_requires_edits_and_active_settle() {
+        let state = PanoramaQualityState::SettleReady;
+        let enabled = PanoramaSettlePolicy::EnabledFromRaw;
+        let disabled = PanoramaSettlePolicy::Disabled {
+            reason: PanoramaSettleDisabledReason::AiApplied,
+        };
+
+        assert!(should_show_pano_high_res_edit_warning(
+            true,
+            Some(&state),
+            &enabled
+        ));
+        assert!(!should_show_pano_high_res_edit_warning(
+            true,
+            Some(&state),
+            &disabled
+        ));
+        assert!(!should_show_pano_high_res_edit_warning(
+            false,
+            Some(&state),
+            &enabled
+        ));
     }
 
     #[test]

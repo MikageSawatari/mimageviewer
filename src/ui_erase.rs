@@ -255,6 +255,9 @@ impl App {
     }
 
     pub(crate) fn enter_erase_mode(&mut self, fs_idx: usize) {
+        if !self.fullscreen_edit_mode_entry_allowed(fs_idx) {
+            return;
+        }
         // 見開きから入った場合は左ページへピボット。Single 起動 / 片側のみのページ
         // (表紙・末尾奇数・横長画像) では `resolve_spread_pair` が Single を返すので
         // ピボット処理はスキップされる。
