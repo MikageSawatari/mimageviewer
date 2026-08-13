@@ -21,7 +21,10 @@ use super::path_guard::{
 };
 use super::thumbnail::WorkerContext;
 
-const CONTAINER_ENTRY_LIMIT: usize = 1000;
+const CONTAINER_ENTRY_LIMIT: usize = 100_000;
+// A page group contributes at most one `pages` address and one `anchor` address
+// per listed entry. 32 bytes per entry also covers object/array syntax and commas.
+const PAGE_GROUP_JSON_OVERHEAD_PER_ENTRY: usize = 32;
 const REMOTE_COMPOSITE_CACHE_ENTRIES: usize = 8;
 const REMOTE_COMPOSITE_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const REMOTE_AUTO_TRIM_CACHE_ENTRIES: usize = 64;
@@ -30,6 +33,46 @@ const MAX_PAGE_RENDER_PX: u32 = crate::pdf_loader::PDF_RENDER_MAX_LONG_PX;
 const PAGE_JPEG_QUALITY: i32 = 85;
 /// Bump only when the native remote AI pipeline changes pixel semantics.
 const REMOTE_AI_PIPELINE_SCHEMA: u32 = 1;
+
+struct ContainerEntryBudget {
+    estimated_bytes: usize,
+    maximum_bytes: usize,
+}
+
+impl ContainerEntryBudget {
+    fn new(maximum_bytes: usize) -> Self {
+        // Brackets for both the `entries` and `page_groups` JSON arrays.
+        Self {
+            estimated_bytes: 4,
+            maximum_bytes,
+        }
+    }
+
+    fn try_include(&mut self, entry: &ContainerEntry) -> bool {
+        let address_bytes = super::serialized_json_len(&entry.address).saturating_add(1);
+        let entry_bytes = super::serialized_json_len(entry)
+            .saturating_add(1)
+            .saturating_add(address_bytes.saturating_mul(2))
+            .saturating_add(PAGE_GROUP_JSON_OVERHEAD_PER_ENTRY);
+        if self.estimated_bytes.saturating_add(entry_bytes) > self.maximum_bytes {
+            return false;
+        }
+        self.estimated_bytes = self.estimated_bytes.saturating_add(entry_bytes);
+        true
+    }
+}
+
+fn container_limit_metadata(
+    total_entries: usize,
+    returned_entries: usize,
+    byte_truncated: bool,
+) -> (usize, bool) {
+    let truncated = total_entries > CONTAINER_ENTRY_LIMIT || byte_truncated;
+    (
+        super::response_entry_limit(CONTAINER_ENTRY_LIMIT, returned_entries, truncated),
+        truncated,
+    )
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RemotePageStage {
@@ -3300,24 +3343,34 @@ impl ContainerEngine {
             .filter(|item| matches!(item, crate::grid_item::GridItem::Image(_)))
             .count();
         let auto_open = listing.image_only && listing.auto_fullscreen_image_folders_enabled;
-        let items = source_items
+        let mut budget = ContainerEntryBudget::new(super::REMOTE_LIST_RESPONSE_BUDGET_BYTES);
+        let mut items = Vec::new();
+        let mut entries = Vec::new();
+        let mut byte_truncated = false;
+        for item in source_items
             .iter()
             .filter(|item| matches!(item, crate::grid_item::GridItem::Image(_)))
             .take(CONTAINER_ENTRY_LIMIT)
-            .cloned()
-            .collect::<Vec<_>>();
-        let entries = items
-            .iter()
-            .filter_map(|item| {
-                Some(ContainerEntry {
-                    address: grid_item_address(&address, item)?,
-                    name: item.name().into_owned(),
-                    kind: ContainerEntryKind::Image,
-                    page_count: None,
-                })
-            })
-            .collect::<Vec<_>>();
+        {
+            let Some(entry_address) = grid_item_address(&address, item) else {
+                continue;
+            };
+            let entry = ContainerEntry {
+                address: entry_address,
+                name: item.name().into_owned(),
+                kind: ContainerEntryKind::Image,
+                page_count: None,
+            };
+            if !budget.try_include(&entry) {
+                byte_truncated = true;
+                break;
+            }
+            items.push(item.clone());
+            entries.push(entry);
+        }
         let spread = self.spread_payload(request, resolved, &items, Some(&source_items), None);
+        let (entry_limit, truncated) =
+            container_limit_metadata(total, entries.len(), byte_truncated);
         Ok(ContainerPayload {
             title: container_title(&resolved.logical),
             root_name: absolute_root_name(&resolved.logical),
@@ -3341,8 +3394,8 @@ impl ContainerEngine {
             other_count: spread.other_count,
             spread_page_gap_px: self.settings.spread_page_gap_px,
             page_groups: spread.groups,
-            entry_limit: CONTAINER_ENTRY_LIMIT,
-            truncated: total > CONTAINER_ENTRY_LIMIT,
+            entry_limit,
+            truncated,
         })
     }
 
@@ -3406,38 +3459,40 @@ impl ContainerEngine {
         let at_resume_root = effective_segments == root_segments;
         let resume_page =
             self.resume_page_for_items(&address, &resolved.logical, &items, at_resume_root);
-        let items = items
-            .into_iter()
-            .take(CONTAINER_ENTRY_LIMIT)
-            .collect::<Vec<_>>();
-        let entries = items
-            .iter()
-            .filter_map(|item| {
-                let name = item.name().into_owned();
-                match item {
-                    crate::grid_item::GridItem::ZipDir { dir_prefix, .. } => Some(ContainerEntry {
-                        name,
-                        page_count: tree.page_count_for_prefix_str(&dir_prefix),
-                        address: RemoteAddress {
-                            path: address.path.clone(),
-                            subresource: RemoteSubresource::ZipDirectory {
-                                prefix: dir_prefix.clone(),
-                            },
+        let mut budget = ContainerEntryBudget::new(super::REMOTE_LIST_RESPONSE_BUDGET_BYTES);
+        let mut bounded_items = Vec::new();
+        let mut entries = Vec::new();
+        let mut byte_truncated = false;
+        for item in items.into_iter().take(CONTAINER_ENTRY_LIMIT) {
+            let name = item.name().into_owned();
+            let entry = match &item {
+                crate::grid_item::GridItem::ZipDir { dir_prefix, .. } => ContainerEntry {
+                    name,
+                    page_count: tree.page_count_for_prefix_str(&dir_prefix),
+                    address: RemoteAddress {
+                        path: address.path.clone(),
+                        subresource: RemoteSubresource::ZipDirectory {
+                            prefix: dir_prefix.clone(),
                         },
-                        kind: ContainerEntryKind::Directory,
-                    }),
-                    crate::grid_item::GridItem::ZipImage { entry_name, .. } => {
-                        Some(ContainerEntry {
-                            name,
-                            page_count: None,
-                            address: zip_entry_address(&address, entry_name),
-                            kind: ContainerEntryKind::Image,
-                        })
-                    }
-                    _ => None,
-                }
-            })
-            .collect::<Vec<_>>();
+                    },
+                    kind: ContainerEntryKind::Directory,
+                },
+                crate::grid_item::GridItem::ZipImage { entry_name, .. } => ContainerEntry {
+                    name,
+                    page_count: None,
+                    address: zip_entry_address(&address, entry_name),
+                    kind: ContainerEntryKind::Image,
+                },
+                _ => continue,
+            };
+            if !budget.try_include(&entry) {
+                byte_truncated = true;
+                break;
+            }
+            bounded_items.push(item);
+            entries.push(entry);
+        }
+        let items = bounded_items;
         let spread = self.spread_payload(
             request,
             resolved,
@@ -3445,6 +3500,8 @@ impl ContainerEngine {
             None,
             Some((&effective_segments, &resolved.logical)),
         );
+        let (entry_limit, truncated) =
+            container_limit_metadata(total, entries.len(), byte_truncated);
         Ok(ContainerPayload {
             title: container_title(&resolved.logical),
             root_name: absolute_root_name(&resolved.logical),
@@ -3479,8 +3536,8 @@ impl ContainerEngine {
             other_count: spread.other_count,
             spread_page_gap_px: self.settings.spread_page_gap_px,
             page_groups: spread.groups,
-            entry_limit: CONTAINER_ENTRY_LIMIT,
-            truncated: total > CONTAINER_ENTRY_LIMIT,
+            entry_limit,
+            truncated,
         })
     }
 
@@ -3498,21 +3555,17 @@ impl ContainerEngine {
             ));
         }
         let page_count = self.pdf_page_count(resolved, metadata)?;
-        let page_numbers = (0..page_count)
-            .take(CONTAINER_ENTRY_LIMIT)
-            .collect::<Vec<_>>();
-        let items = page_numbers
-            .iter()
-            .map(|page_number| crate::grid_item::GridItem::PdfPage {
+        let mut budget = ContainerEntryBudget::new(super::REMOTE_LIST_RESPONSE_BUDGET_BYTES);
+        let mut items = Vec::new();
+        let mut entries = Vec::new();
+        let mut byte_truncated = false;
+        for page_number in (0..page_count).take(CONTAINER_ENTRY_LIMIT) {
+            let item = crate::grid_item::GridItem::PdfPage {
                 pdf_path: resolved.logical.clone(),
-                page_num: *page_number,
+                page_num: page_number,
                 content_type: None,
-            })
-            .collect::<Vec<_>>();
-        let resume_page = self.resume_page_for_items(&address, &resolved.logical, &items, true);
-        let entries = page_numbers
-            .into_iter()
-            .map(|page_number| ContainerEntry {
+            };
+            let entry = ContainerEntry {
                 address: RemoteAddress {
                     path: address.path.clone(),
                     subresource: RemoteSubresource::PdfPage { page_number },
@@ -3520,9 +3573,18 @@ impl ContainerEngine {
                 name: format!("Page {}", page_number + 1),
                 kind: ContainerEntryKind::Image,
                 page_count: None,
-            })
-            .collect::<Vec<_>>();
+            };
+            if !budget.try_include(&entry) {
+                byte_truncated = true;
+                break;
+            }
+            items.push(item);
+            entries.push(entry);
+        }
+        let resume_page = self.resume_page_for_items(&address, &resolved.logical, &items, true);
         let spread = self.spread_payload(request, resolved, &items, None, None);
+        let (entry_limit, truncated) =
+            container_limit_metadata(page_count as usize, entries.len(), byte_truncated);
         Ok(ContainerPayload {
             title: container_title(&resolved.logical),
             root_name: absolute_root_name(&resolved.logical),
@@ -3546,8 +3608,8 @@ impl ContainerEngine {
             other_count: spread.other_count,
             spread_page_gap_px: self.settings.spread_page_gap_px,
             page_groups: spread.groups,
-            entry_limit: CONTAINER_ENTRY_LIMIT,
-            truncated: page_count as usize > CONTAINER_ENTRY_LIMIT,
+            entry_limit,
+            truncated,
         })
     }
 
@@ -5380,6 +5442,105 @@ mod tests {
     use super::*;
     use crate::settings::FavoriteEntry;
     use std::io::{Cursor, Write};
+
+    fn test_container_entries(count: usize, path: &str) -> (Vec<ContainerEntry>, bool) {
+        let mut budget = ContainerEntryBudget::new(super::super::REMOTE_LIST_RESPONSE_BUDGET_BYTES);
+        let mut entries = Vec::with_capacity(count.min(CONTAINER_ENTRY_LIMIT));
+        for index in 0..count.min(CONTAINER_ENTRY_LIMIT) {
+            let page_number = u32::try_from(index).unwrap();
+            let entry = ContainerEntry {
+                address: RemoteAddress {
+                    path: path.to_owned(),
+                    subresource: RemoteSubresource::PdfPage { page_number },
+                },
+                name: format!("Page {}", index + 1),
+                kind: ContainerEntryKind::Image,
+                page_count: None,
+            };
+            if !budget.try_include(&entry) {
+                return (entries, true);
+            }
+            entries.push(entry);
+        }
+        (entries, false)
+    }
+
+    fn test_container_payload(
+        total: usize,
+        entries: Vec<ContainerEntry>,
+        byte_truncated: bool,
+    ) -> ContainerPayload {
+        let (entry_limit, truncated) =
+            container_limit_metadata(total, entries.len(), byte_truncated);
+        let page_groups = entries
+            .iter()
+            .map(|entry| PageGroup {
+                anchor: entry.address.clone(),
+                pages: vec![entry.address.clone()],
+            })
+            .collect();
+        ContainerPayload {
+            title: "test".to_owned(),
+            root_name: "C:".to_owned(),
+            kind: ContainerKind::Pdf,
+            effective_address: RemoteAddress::file("C:/p.pdf"),
+            entries,
+            thumb_aspect_height_ratio: 1.0,
+            sort_state: super::super::remote_grid_sort_state(
+                crate::settings::SortOrder::FileName,
+                None,
+            ),
+            resume_page: None,
+            open_mode: ContainerOpenMode::Grid,
+            configured_spread_mode: RemoteSpreadMode::Single,
+            effective_spread_mode: RemoteSpreadMode::Single,
+            reading_direction: RemoteReadingDirection::Ltr,
+            image_count: total,
+            video_count: 0,
+            other_count: 0,
+            spread_page_gap_px: 0,
+            page_groups,
+            entry_limit,
+            truncated,
+        }
+    }
+
+    #[test]
+    fn container_accepts_one_hundred_thousand_short_entries_and_truncates_the_next() {
+        let (entries, byte_truncated) = test_container_entries(CONTAINER_ENTRY_LIMIT, "C:/p.pdf");
+        let payload = test_container_payload(CONTAINER_ENTRY_LIMIT, entries, byte_truncated);
+
+        assert_eq!(payload.entries.len(), CONTAINER_ENTRY_LIMIT);
+        assert!(!payload.truncated);
+        assert_eq!(payload.entry_limit, CONTAINER_ENTRY_LIMIT);
+        assert!(
+            serde_json::to_vec(&ContainerResponse::Success(payload))
+                .unwrap()
+                .len()
+                < mimageviewer_ipc::MAX_RESPONSE_FRAME_BYTES
+        );
+
+        let (entry_limit, truncated) =
+            container_limit_metadata(CONTAINER_ENTRY_LIMIT + 1, CONTAINER_ENTRY_LIMIT, false);
+        assert_eq!(entry_limit, CONTAINER_ENTRY_LIMIT);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn container_long_entries_and_page_groups_stay_below_the_ipc_frame_limit() {
+        let long_path = format!("C:/{}.pdf", "x".repeat(400));
+        let (entries, byte_truncated) = test_container_entries(CONTAINER_ENTRY_LIMIT, &long_path);
+        let payload = test_container_payload(CONTAINER_ENTRY_LIMIT, entries, byte_truncated);
+
+        assert!(payload.truncated);
+        assert_eq!(payload.entry_limit, payload.entries.len());
+        assert!(
+            serde_json::to_vec(&ContainerResponse::Success(payload))
+                .unwrap()
+                .len()
+                < mimageviewer_ipc::MAX_RESPONSE_FRAME_BYTES
+        );
+    }
 
     #[test]
     fn remote_page_stage_split_is_stable() {

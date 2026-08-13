@@ -24,7 +24,45 @@ pub(crate) mod ui;
 pub(super) const BOOK_SORT_LOCK_REASON: &str =
     "本として表示中は名前順固定です（一覧の並べ替えは使えません）。";
 pub(super) const FIXED_LIST_SORT_LOCK_REASON: &str = "この一覧では並び順が固定されています。";
+/// Dynamic JSON budget for container and collection entry lists.
+///
+/// The IPC reader accepts 64 MiB response frames. Capping the repeated list data at
+/// 40 MiB leaves 24 MiB for the response envelope, fixed payload fields, and future
+/// protocol additions without making ordinary 100,000-entry lists hit the wire limit.
+pub(super) const REMOTE_LIST_RESPONSE_BUDGET_BYTES: usize = 40 * 1024 * 1024;
 const MAX_REMOTE_AGGREGATE_SIDECAR_PARENT_SCANS: usize = 64;
+
+pub(super) fn serialized_json_len<T: serde::Serialize>(value: &T) -> usize {
+    struct ByteCounter(usize);
+
+    impl std::io::Write for ByteCounter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = ByteCounter(0);
+    serde_json::to_writer(&mut counter, value)
+        .expect("remote IPC response values must serialize to JSON");
+    counter.0
+}
+
+pub(super) fn response_entry_limit(
+    configured_limit: usize,
+    returned: usize,
+    truncated: bool,
+) -> usize {
+    if truncated {
+        returned
+    } else {
+        configured_limit
+    }
+}
 
 /// Remote grid thumbnail provenance shared by physical folders and aggregate lists.
 ///

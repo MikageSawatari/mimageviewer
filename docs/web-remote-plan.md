@@ -767,10 +767,11 @@ payload を順に描画するだけで、既知フォルダやドライブを独
 
 `/api/home` は保存済みスマートフォルダの ID / 名前と、共通 read model が確定した「場所」の項目だけを
 返し、ファイルシステム走査や各集約ビューの内容取得は行わない。`scan_smart_folder` は利用者が
-該当スマートフォルダを開いて `/api/collection` を要求した時だけ実行する。読書履歴は本体設定
-由来の上限 (最大 1000) を既に持つ。他のレーティング・本棚・ブックマーク・スマートフォルダも
-IPC 応答を最大 1000 件へ制限し、`truncated` /
-`entry_limit` を返して Web 画面に打ち切りを表示する。現段階ではページングは実装しない。
+該当スマートフォルダを開いて `/api/collection` を要求した時だけ実行する。読書履歴は本体設定由来の
+上限 (最大 1000) を既に持つ。リモートのコレクション項目は最大 100,000 件とし、さらに直列化後の
+entry JSON を 40 MiB 以内へ制限する。レーティング・本棚・ブックマーク・スマートフォルダも同じ
+上限と byte 予算を使い、`truncated` / `entry_limit` を返して Web 画面に打ち切りを表示する。byte
+予算で打ち切った場合の `entry_limit` は実際に返した件数とする。現段階ではページングは実装しない。
 
 IPC の `RemoteEntry` は canonicalize 済みの絶対 `path`、表示名、種別、進捗・レーティング等の
 表示用メタデータを持つ。候補は favorite との包含関係では落とさず、欠落して canonicalize できない
@@ -858,8 +859,11 @@ Web からの password 入力・保存は行わない。
 
 認証必須の `GET /api/container` がコンテナの 1 階層を返し、`GET /api/page` がページを
 turbojpeg q85 の JPEG で返す。`GET /api/thumb` はサムネイル用 WebP のまま、同じ address query（`entry` / `prefix` / `page` のいずれか）
-へ拡張する。コンテナは最大 1000 項目を返し、超過時は `truncated=true` と `entry_limit` を
-画面に表示する。ページングはこの増分では行わない。
+へ拡張する。コンテナは最大 100,000 項目を返す。応答 IPC フレームの 64 MiB 上限に対して、
+`entries` と同じ address を再掲する `page_groups` も含めた直列化後の概算を 40 MiB 以内へ制限し、
+残り 24 MiB を応答 envelope・固定フィールド・将来拡張の余裕とする。件数または byte 予算の超過時は
+`truncated=true` とし、byte 予算で打ち切った場合の `entry_limit` は実際に返した件数を画面に表示する。
+ページングはこの増分では行わない。
 
 フロントは ZIP/PDF を通常フォルダと同じ仮想グリッドで表示し、ページを既存の swipe、
 pinch zoom、表示モード、keyboard / mouse command layer へ渡す。hash route は
@@ -874,7 +878,7 @@ PDF cold render 1.441 秒、通常の page render 0.7〜3 秒であり、remote 
 
 ### 12.4 明示的な非スコープ
 
-RAR / 7z / LZH の変換、リモートからの PDF password 入力、コンテナの 1000 件超のページング、
+RAR / 7z / LZH の変換、リモートからの PDF password 入力、コンテナの 100,000 件超のページング、
 読書履歴・rating・bookmark 等の書き込みは含めない。nested ZIP は本体の列挙文字列と
 `read_entry_bytes` をそのまま使うため対応するが、nested RAR / 7z / LZH は変換増分まで扱わない。
 

@@ -9,12 +9,13 @@ use mimageviewer_ipc::{
     TagBrowseRequest, TagBrowseResponse, TagIndexState, TagItemKind, TagItemsPayload,
     TagItemsRequest, TagItemsResponse,
 };
+use rayon::prelude::*;
 
 use crate::grid_item::GridItem;
 use crate::search_index_db::{IndexEntry, IndexKind, SEARCH_RESULT_LIMIT, SearchIndexDb};
 use crate::settings::Settings;
 
-const MAX_REMOTE_COLLECTION_ENTRIES: usize = 1000;
+const MAX_REMOTE_COLLECTION_ENTRIES: usize = 100_000;
 const MAX_REMOTE_TAG_CHOICES: usize = 2000;
 
 pub(super) struct CollectionEngine {
@@ -247,11 +248,12 @@ impl CollectionEngine {
         &self,
         settings: &Settings,
         sort_order: crate::settings::SortOrder,
-        mut entries: Vec<RemoteEntry>,
+        entries: Vec<RemoteEntry>,
         truncated: bool,
     ) -> CollectionPayload {
-        super::RemoteThumbnailSources::for_remote_entries(settings, &entries)
-            .populate_remote_entries(&mut entries);
+        let (entries, truncated) = finalize_remote_entries(settings, entries, truncated);
+        let entry_limit =
+            super::response_entry_limit(MAX_REMOTE_COLLECTION_ENTRIES, entries.len(), truncated);
         CollectionPayload {
             title: "検索結果".to_owned(),
             thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(settings),
@@ -260,7 +262,7 @@ impl CollectionEngine {
                 Some(super::FIXED_LIST_SORT_LOCK_REASON),
             ),
             entries,
-            entry_limit: MAX_REMOTE_COLLECTION_ENTRIES,
+            entry_limit,
             truncated,
         }
     }
@@ -382,11 +384,12 @@ impl CollectionEngine {
         &self,
         settings: &Settings,
         sort_order: crate::settings::SortOrder,
-        mut entries: Vec<RemoteEntry>,
+        entries: Vec<RemoteEntry>,
         truncated: bool,
     ) -> CollectionPayload {
-        super::RemoteThumbnailSources::for_remote_entries(settings, &entries)
-            .populate_remote_entries(&mut entries);
+        let (entries, truncated) = finalize_remote_entries(settings, entries, truncated);
+        let entry_limit =
+            super::response_entry_limit(MAX_REMOTE_COLLECTION_ENTRIES, entries.len(), truncated);
         CollectionPayload {
             title: "タグの項目".to_owned(),
             thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(settings),
@@ -395,7 +398,7 @@ impl CollectionEngine {
                 Some(super::FIXED_LIST_SORT_LOCK_REASON),
             ),
             entries,
-            entry_limit: MAX_REMOTE_COLLECTION_ENTRIES,
+            entry_limit,
             truncated,
         }
     }
@@ -655,21 +658,22 @@ impl CollectionEngine {
         sort_order: crate::settings::SortOrder,
         locked_reason: Option<&str>,
     ) -> Result<CollectionPayload, CollectionError> {
-        let entries = to_remote_entries(
+        let entries = to_remote_entries_bounded(
             candidates
                 .into_iter()
                 .filter(|candidate| include_collection_candidate(settings, candidate))
                 .collect(),
+            MAX_REMOTE_COLLECTION_ENTRIES.saturating_add(1),
         );
-        let (mut entries, truncated) = bound_remote_entries(entries);
-        super::RemoteThumbnailSources::for_remote_entries(settings, &entries)
-            .populate_remote_entries(&mut entries);
+        let (entries, truncated) = finalize_remote_entries(settings, entries, false);
+        let entry_limit =
+            super::response_entry_limit(MAX_REMOTE_COLLECTION_ENTRIES, entries.len(), truncated);
         Ok(CollectionPayload {
             title: title.to_owned(),
             thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(settings),
             sort_state: super::remote_grid_sort_state(sort_order, locked_reason),
             entries,
-            entry_limit: MAX_REMOTE_COLLECTION_ENTRIES,
+            entry_limit,
             truncated,
         })
     }
@@ -783,8 +787,25 @@ fn map_tag_item_keys(
     key_scan_limit: usize,
     include_archives: bool,
 ) -> (Vec<RemoteEntry>, bool) {
+    map_tag_item_keys_with_entry_limit(
+        item_keys,
+        filter,
+        key_scan_limit,
+        include_archives,
+        MAX_REMOTE_COLLECTION_ENTRIES,
+    )
+}
+
+fn map_tag_item_keys_with_entry_limit(
+    item_keys: Vec<String>,
+    filter: TagItemKind,
+    key_scan_limit: usize,
+    include_archives: bool,
+    entry_limit: usize,
+) -> (Vec<RemoteEntry>, bool) {
     let key_limit_reached = item_keys.len() > key_scan_limit;
-    let mut entries = Vec::with_capacity(MAX_REMOTE_COLLECTION_ENTRIES + 1);
+    let mapped_limit = entry_limit.saturating_add(1);
+    let mut candidates = Vec::with_capacity(mapped_limit);
     for key in item_keys.into_iter().take(key_scan_limit) {
         let Some(candidate) = candidate_from_tag_item_key(key, filter) else {
             continue;
@@ -792,12 +813,17 @@ fn map_tag_item_keys(
         if !include_archives && candidate.kind == RemoteEntryKind::Archive {
             continue;
         }
-        entries.push(remote_entry_from_candidate(candidate));
-        if entries.len() > MAX_REMOTE_COLLECTION_ENTRIES {
+        candidates.push(candidate);
+        if candidates.len() >= mapped_limit {
             break;
         }
     }
-    let (entries, matched_truncated) = bound_remote_entries(entries);
+    let entries = to_remote_entries_bounded(candidates, mapped_limit);
+    let (entries, matched_truncated) = bound_remote_entries_with_limits(
+        entries,
+        entry_limit,
+        super::REMOTE_LIST_RESPONSE_BUDGET_BYTES,
+    );
     (entries, matched_truncated || key_limit_reached)
 }
 
@@ -822,10 +848,51 @@ fn tag_item_kind_matches(filter: TagItemKind, kind: RemoteEntryKind) -> bool {
     }
 }
 
-fn bound_remote_entries(mut entries: Vec<RemoteEntry>) -> (Vec<RemoteEntry>, bool) {
-    let truncated = entries.len() > MAX_REMOTE_COLLECTION_ENTRIES;
-    entries.truncate(MAX_REMOTE_COLLECTION_ENTRIES);
-    (entries, truncated)
+fn bound_remote_entries(entries: Vec<RemoteEntry>) -> (Vec<RemoteEntry>, bool) {
+    bound_remote_entries_with_limits(
+        entries,
+        MAX_REMOTE_COLLECTION_ENTRIES,
+        super::REMOTE_LIST_RESPONSE_BUDGET_BYTES,
+    )
+}
+
+fn bound_remote_entries_with_limits(
+    entries: Vec<RemoteEntry>,
+    entry_limit: usize,
+    byte_budget: usize,
+) -> (Vec<RemoteEntry>, bool) {
+    // Two bytes cover the JSON array brackets. Adding one separator byte for every
+    // value deliberately overestimates the real array by one byte when non-empty.
+    let mut estimated_bytes = 2usize;
+    let mut bounded = Vec::with_capacity(entries.len().min(entry_limit));
+    let mut truncated = entries.len() > entry_limit;
+    for entry in entries.into_iter().take(entry_limit) {
+        let entry_bytes = super::serialized_json_len(&entry).saturating_add(1);
+        if estimated_bytes.saturating_add(entry_bytes) > byte_budget {
+            truncated = true;
+            break;
+        }
+        estimated_bytes = estimated_bytes.saturating_add(entry_bytes);
+        bounded.push(entry);
+    }
+    (bounded, truncated)
+}
+
+fn finalize_remote_entries(
+    settings: &Settings,
+    entries: Vec<RemoteEntry>,
+    source_truncated: bool,
+) -> (Vec<RemoteEntry>, bool) {
+    let (mut entries, initially_truncated) = bound_remote_entries(entries);
+    super::RemoteThumbnailSources::for_remote_entries(settings, &entries)
+        .populate_remote_entries(&mut entries);
+    // A video sidecar adds another address after the first estimate, so run the exact
+    // serialized-size accumulator again before publishing the payload.
+    let (entries, thumbnail_truncated) = bound_remote_entries(entries);
+    (
+        entries,
+        source_truncated || initially_truncated || thumbnail_truncated,
+    )
 }
 
 fn visible_places(settings: &Settings) -> Vec<PlaceSummary> {
@@ -875,7 +942,10 @@ fn remote_folder_place(name: String, path: PathBuf) -> PlaceSummary {
     }
 }
 
+#[cfg(test)]
 fn to_remote_entries(candidates: Vec<CandidateEntry>) -> Vec<RemoteEntry> {
+    // The two direct callers intentionally map only small identity fixtures. Production
+    // collection paths use `to_remote_entries_bounded` so canonicalization is capped.
     to_remote_entries_bounded(candidates, usize::MAX)
 }
 
@@ -883,10 +953,21 @@ fn to_remote_entries_bounded(
     candidates: Vec<CandidateEntry>,
     mapped_limit: usize,
 ) -> Vec<RemoteEntry> {
-    candidates
+    map_bounded_in_order(candidates, mapped_limit, remote_entry_from_candidate)
+}
+
+fn map_bounded_in_order<T, U, F>(values: Vec<T>, mapped_limit: usize, map: F) -> Vec<U>
+where
+    T: Send,
+    U: Send,
+    F: Fn(T) -> U + Sync + Send,
+{
+    values
         .into_iter()
-        .map(remote_entry_from_candidate)
         .take(mapped_limit)
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(map)
         .collect()
 }
 
@@ -911,6 +992,13 @@ fn remote_entry_from_candidate(candidate: CandidateEntry) -> RemoteEntry {
 }
 
 fn map_favorite_search_entries(index_entries: Vec<IndexEntry>) -> (Vec<RemoteEntry>, bool) {
+    map_favorite_search_entries_with_entry_limit(index_entries, MAX_REMOTE_COLLECTION_ENTRIES)
+}
+
+fn map_favorite_search_entries_with_entry_limit(
+    index_entries: Vec<IndexEntry>,
+    entry_limit: usize,
+) -> (Vec<RemoteEntry>, bool) {
     let index_limit_reached = index_entries.len() == SEARCH_RESULT_LIMIT;
     let candidates = index_entries
         .into_iter()
@@ -932,8 +1020,12 @@ fn map_favorite_search_entries(index_entries: Vec<IndexEntry>) -> (Vec<RemoteEnt
             })
         })
         .collect();
-    let entries = to_remote_entries_bounded(candidates, MAX_REMOTE_COLLECTION_ENTRIES + 1);
-    let (entries, mapped_truncated) = bound_remote_entries(entries);
+    let entries = to_remote_entries_bounded(candidates, entry_limit.saturating_add(1));
+    let (entries, mapped_truncated) = bound_remote_entries_with_limits(
+        entries,
+        entry_limit,
+        super::REMOTE_LIST_RESPONSE_BUDGET_BYTES,
+    );
     (entries, mapped_truncated || index_limit_reached)
 }
 
@@ -1077,6 +1169,35 @@ fn internal_error(context: &str, error: impl std::fmt::Display) -> CollectionErr
 mod tests {
     use super::*;
     use crate::settings::FavoriteEntry;
+
+    fn test_remote_entry(path: impl Into<String>, name: impl Into<String>) -> RemoteEntry {
+        RemoteEntry {
+            path: path.into(),
+            name: name.into(),
+            kind: RemoteEntryKind::Image,
+            thumbnail_address: None,
+            detail: None,
+            progress_current: None,
+            progress_total: None,
+            rating: None,
+        }
+    }
+
+    fn test_collection_payload(entries: Vec<RemoteEntry>, truncated: bool) -> CollectionPayload {
+        let entry_limit = super::super::response_entry_limit(
+            MAX_REMOTE_COLLECTION_ENTRIES,
+            entries.len(),
+            truncated,
+        );
+        CollectionPayload {
+            title: "test".to_owned(),
+            thumb_aspect_height_ratio: 1.0,
+            sort_state: super::super::remote_grid_sort_state(Settings::default().sort_order, None),
+            entries,
+            entry_limit,
+            truncated,
+        }
+    }
 
     #[test]
     fn reading_history_media_entries_keep_kind_and_time_progress() {
@@ -1282,22 +1403,98 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_payload_is_bounded_to_one_thousand_entries() {
-        let entries = (0..=MAX_REMOTE_COLLECTION_ENTRIES)
-            .map(|index| RemoteEntry {
-                path: format!("C:/entries/entry-{index}"),
-                name: format!("entry-{index}"),
-                kind: RemoteEntryKind::Image,
-                thumbnail_address: None,
-                detail: None,
-                progress_current: None,
-                progress_total: None,
-                rating: None,
+    fn parallel_mapping_matches_sequential_order_and_content_for_real_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let candidates = (0..32)
+            .map(|index| {
+                let path = temp.path().join(format!("entry-{index:02}.jpg"));
+                std::fs::write(&path, format!("fixture-{index}")).unwrap();
+                CandidateEntry {
+                    path,
+                    name: format!("entry-{index:02}"),
+                    kind: RemoteEntryKind::Image,
+                    detail: Some(format!("detail-{index}")),
+                    progress_current: Some(index),
+                    progress_total: Some(32),
+                    rating: Some((index % 5 + 1) as u8),
+                }
+            })
+            .collect::<Vec<_>>();
+        let expected = candidates
+            .clone()
+            .into_iter()
+            .map(remote_entry_from_candidate)
+            .collect::<Vec<_>>();
+
+        let actual = to_remote_entries_bounded(candidates, 32);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn bounded_parallel_mapping_invokes_the_mapper_only_for_the_taken_prefix() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let mapped = map_bounded_in_order((0..20).collect(), 7, |value| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            value * 2
+        });
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 7);
+        assert_eq!(mapped, vec![0, 2, 4, 6, 8, 10, 12]);
+    }
+
+    #[test]
+    fn aggregate_payload_count_limit_is_injectable_without_a_large_fixture() {
+        let test_limit = 7;
+        let entries = (0..=test_limit)
+            .map(|index| {
+                test_remote_entry(
+                    format!("C:/entries/entry-{index}"),
+                    format!("entry-{index}"),
+                )
             })
             .collect();
-        let (entries, truncated) = bound_remote_entries(entries);
+        let (entries, truncated) =
+            bound_remote_entries_with_limits(entries, test_limit, usize::MAX);
+        assert_eq!(entries.len(), test_limit);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn collection_accepts_one_hundred_thousand_short_entries_and_truncates_the_next() {
+        let short = test_remote_entry("C:/p", "p");
+        let (entries, truncated) =
+            bound_remote_entries(vec![short.clone(); MAX_REMOTE_COLLECTION_ENTRIES]);
+        assert_eq!(entries.len(), MAX_REMOTE_COLLECTION_ENTRIES);
+        assert!(!truncated);
+
+        let (entries, truncated) =
+            bound_remote_entries(vec![short; MAX_REMOTE_COLLECTION_ENTRIES + 1]);
         assert_eq!(entries.len(), MAX_REMOTE_COLLECTION_ENTRIES);
         assert!(truncated);
+    }
+
+    #[test]
+    fn collection_long_entries_stay_below_the_ipc_frame_limit() {
+        let long_name = "x".repeat(400);
+        let candidates = (0..MAX_REMOTE_COLLECTION_ENTRIES)
+            .map(|index| {
+                test_remote_entry(
+                    format!("C:/{long_name}/{index:06}.jpg"),
+                    format!("{long_name}-{index:06}.jpg"),
+                )
+            })
+            .collect();
+        let (entries, truncated) = bound_remote_entries(candidates);
+        let payload = test_collection_payload(entries, truncated);
+
+        assert!(payload.truncated);
+        assert_eq!(payload.entry_limit, payload.entries.len());
+        let response = CollectionResponse::Success(payload);
+        assert!(
+            serde_json::to_vec(&response).unwrap().len()
+                < mimageviewer_ipc::MAX_RESPONSE_FRAME_BYTES
+        );
     }
 
     #[test]
@@ -1736,16 +1933,18 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(&image, b"image").unwrap();
         let item_key = crate::tags_db::item_key_for_path(&image);
-        let item_keys = vec![item_key; MAX_REMOTE_COLLECTION_ENTRIES + 1];
+        let test_limit = 7;
+        let item_keys = vec![item_key; test_limit + 1];
 
-        let (entries, truncated) = map_tag_item_keys(
+        let (entries, truncated) = map_tag_item_keys_with_entry_limit(
             item_keys,
             TagItemKind::All,
             crate::tag_view::TAG_VIEW_RESULT_LIMIT,
             true,
+            test_limit,
         );
 
-        assert_eq!(entries.len(), MAX_REMOTE_COLLECTION_ENTRIES);
+        assert_eq!(entries.len(), test_limit);
         assert!(truncated);
     }
 
@@ -1779,8 +1978,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("favorite");
         std::fs::create_dir_all(&root).unwrap();
+        let test_limit = 3;
         let mut item_keys = Vec::new();
-        for index in 0..=MAX_REMOTE_COLLECTION_ENTRIES {
+        for index in 0..=test_limit {
             let path = root.join(format!("{index:04}.mp4"));
             std::fs::write(&path, b"video").unwrap();
             item_keys.push(crate::tags_db::item_key_for_path(&path));
@@ -1788,11 +1988,12 @@ mod tests {
         let image = root.join("zzzz.jpg");
         std::fs::write(&image, b"image").unwrap();
         item_keys.push(crate::tags_db::item_key_for_path(&image));
-        let (entries, truncated) = map_tag_item_keys(
+        let (entries, truncated) = map_tag_item_keys_with_entry_limit(
             item_keys,
             TagItemKind::Image,
             crate::tag_view::TAG_VIEW_FILTERED_KEY_SCAN_LIMIT,
             true,
+            test_limit,
         );
 
         assert_eq!(entries.len(), 1);
@@ -1940,7 +2141,8 @@ mod tests {
         let root = temp.path().join("favorite");
         let target = root.join("album");
         std::fs::create_dir_all(&target).unwrap();
-        let index_entries = (0..=MAX_REMOTE_COLLECTION_ENTRIES)
+        let test_limit = 7;
+        let index_entries = (0..=test_limit)
             .map(|index| IndexEntry {
                 path: target.clone(),
                 display_name: format!("album-{index}"),
@@ -1949,9 +2151,10 @@ mod tests {
             })
             .collect();
 
-        let (entries, truncated) = map_favorite_search_entries(index_entries);
+        let (entries, truncated) =
+            map_favorite_search_entries_with_entry_limit(index_entries, test_limit);
 
-        assert_eq!(entries.len(), MAX_REMOTE_COLLECTION_ENTRIES);
+        assert_eq!(entries.len(), test_limit);
         assert!(truncated);
     }
 }
