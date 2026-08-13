@@ -1,13 +1,15 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mimageviewer_ipc::{
     CollectionError, CollectionErrorCode, CollectionKind, CollectionPayload, CollectionRequest,
     CollectionResponse, FavoriteSearchIndexState, FavoriteSearchKind, FavoriteSearchPayload,
-    FavoriteSearchRequest, FavoriteSearchResponse, HomePayload, HomeResponse, PlaceSummary,
-    RemoteEntry, RemoteEntryKind, RemoteTagChoice, SmartFolderSummary, TagBrowsePayload,
-    TagBrowseRequest, TagBrowseResponse, TagIndexState, TagItemKind, TagItemsPayload,
-    TagItemsRequest, TagItemsResponse,
+    FavoriteSearchRequest, FavoriteSearchResponse, HomePayload, HomeResponse, PageGroup,
+    PlaceSummary, RemoteAddress, RemoteEntry, RemoteEntryKind, RemoteReadingDirection,
+    RemoteSpreadMode, RemoteTagChoice, SmartFolderSummary, TagBrowsePayload, TagBrowseRequest,
+    TagBrowseResponse, TagIndexState, TagItemKind, TagItemsPayload, TagItemsRequest,
+    TagItemsResponse,
 };
 use rayon::prelude::*;
 
@@ -17,6 +19,7 @@ use crate::settings::Settings;
 
 const MAX_REMOTE_COLLECTION_ENTRIES: usize = 100_000;
 const MAX_REMOTE_TAG_CHOICES: usize = 2000;
+const PAGE_GROUP_JSON_OVERHEAD_PER_IMAGE: usize = 32;
 
 pub(super) struct CollectionEngine {
     settings: CollectionSettingsSource,
@@ -50,6 +53,21 @@ struct CandidateEntry {
     progress_current: Option<u64>,
     progress_total: Option<u64>,
     rating: Option<u8>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct CollectionSpreadRequest {
+    spread_mode: Option<RemoteSpreadMode>,
+    reading_direction: Option<RemoteReadingDirection>,
+    force_single_page: bool,
+}
+
+struct CollectionSpreadPayload {
+    configured: RemoteSpreadMode,
+    effective: RemoteSpreadMode,
+    reading_direction: RemoteReadingDirection,
+    image_count: usize,
+    groups: Vec<PageGroup>,
 }
 
 impl CollectionEngine {
@@ -114,14 +132,23 @@ impl CollectionEngine {
                 ));
             }
         };
+        let spread_request = CollectionSpreadRequest {
+            spread_mode: request.spread_mode,
+            reading_direction: request.reading_direction,
+            force_single_page: request.force_single_page,
+        };
         let result = match request.kind {
-            CollectionKind::DriveList => self.drive_list(&settings, sort_order),
-            CollectionKind::ReadingHistory => self.reading_history(&settings, sort_order),
-            CollectionKind::Rating { stars } => self.rating(&settings, stars, sort_order),
-            CollectionKind::Bookshelf => self.bookshelf(&settings, sort_order),
-            CollectionKind::Bookmarks => self.bookmarks(&settings, sort_order),
+            CollectionKind::DriveList => self.drive_list(&settings, sort_order, spread_request),
+            CollectionKind::ReadingHistory => {
+                self.reading_history(&settings, sort_order, spread_request)
+            }
+            CollectionKind::Rating { stars } => {
+                self.rating(&settings, stars, sort_order, spread_request)
+            }
+            CollectionKind::Bookshelf => self.bookshelf(&settings, sort_order, spread_request),
+            CollectionKind::Bookmarks => self.bookmarks(&settings, sort_order, spread_request),
             CollectionKind::SmartFolder { definition_id } => {
-                self.smart_folder(&settings, &definition_id, sort_order)
+                self.smart_folder(&settings, &definition_id, sort_order, spread_request)
             }
         };
         match result {
@@ -254,17 +281,15 @@ impl CollectionEngine {
         let (entries, truncated) = finalize_remote_entries(settings, entries, truncated);
         let entry_limit =
             super::response_entry_limit(MAX_REMOTE_COLLECTION_ENTRIES, entries.len(), truncated);
-        CollectionPayload {
-            title: "検索結果".to_owned(),
-            thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(settings),
-            sort_state: super::remote_grid_sort_state(
-                sort_order,
-                Some(super::FIXED_LIST_SORT_LOCK_REASON),
-            ),
+        collection_payload(
+            settings,
+            "検索結果",
+            super::remote_grid_sort_state(sort_order, Some(super::FIXED_LIST_SORT_LOCK_REASON)),
             entries,
             entry_limit,
             truncated,
-        }
+            CollectionSpreadRequest::default(),
+        )
     }
 
     pub(super) fn tag_browse(&self, _request: TagBrowseRequest) -> TagBrowseResponse {
@@ -390,23 +415,22 @@ impl CollectionEngine {
         let (entries, truncated) = finalize_remote_entries(settings, entries, truncated);
         let entry_limit =
             super::response_entry_limit(MAX_REMOTE_COLLECTION_ENTRIES, entries.len(), truncated);
-        CollectionPayload {
-            title: "タグの項目".to_owned(),
-            thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(settings),
-            sort_state: super::remote_grid_sort_state(
-                sort_order,
-                Some(super::FIXED_LIST_SORT_LOCK_REASON),
-            ),
+        collection_payload(
+            settings,
+            "タグの項目",
+            super::remote_grid_sort_state(sort_order, Some(super::FIXED_LIST_SORT_LOCK_REASON)),
             entries,
             entry_limit,
             truncated,
-        }
+            CollectionSpreadRequest::default(),
+        )
     }
 
     fn reading_history(
         &self,
         settings: &Settings,
         sort_order: crate::settings::SortOrder,
+        spread_request: CollectionSpreadRequest,
     ) -> Result<CollectionPayload, CollectionError> {
         let rows = if crate::reading_history_db::ReadingHistoryDb::db_path()
             .try_exists()
@@ -428,6 +452,7 @@ impl CollectionEngine {
             candidates,
             sort_order,
             Some(super::FIXED_LIST_SORT_LOCK_REASON),
+            spread_request,
         )
     }
 
@@ -435,11 +460,13 @@ impl CollectionEngine {
         &self,
         settings: &Settings,
         sort_order: crate::settings::SortOrder,
+        spread_request: CollectionSpreadRequest,
     ) -> Result<CollectionPayload, CollectionError> {
         self.drive_list_from_paths(
             settings,
             sort_order,
             crate::known_folders::available_drives(),
+            spread_request,
         )
     }
 
@@ -448,6 +475,7 @@ impl CollectionEngine {
         settings: &Settings,
         sort_order: crate::settings::SortOrder,
         drives: Vec<PathBuf>,
+        spread_request: CollectionSpreadRequest,
     ) -> Result<CollectionPayload, CollectionError> {
         let candidates = drives
             .into_iter()
@@ -467,6 +495,7 @@ impl CollectionEngine {
             candidates,
             sort_order,
             Some(super::FIXED_LIST_SORT_LOCK_REASON),
+            spread_request,
         )
     }
 
@@ -475,6 +504,7 @@ impl CollectionEngine {
         settings: &Settings,
         stars: u8,
         sort_order: crate::settings::SortOrder,
+        spread_request: CollectionSpreadRequest,
     ) -> Result<CollectionPayload, CollectionError> {
         if !(1..=5).contains(&stars) {
             return Err(CollectionError::new(
@@ -505,6 +535,7 @@ impl CollectionEngine {
             candidates,
             sort_order,
             Some(super::FIXED_LIST_SORT_LOCK_REASON),
+            spread_request,
         )
     }
 
@@ -512,6 +543,7 @@ impl CollectionEngine {
         &self,
         settings: &Settings,
         sort_order: crate::settings::SortOrder,
+        spread_request: CollectionSpreadRequest,
     ) -> Result<CollectionPayload, CollectionError> {
         let rows = crate::bookmark_browser::build_rows_readonly()
             .map_err(|error| internal_error("ブックマークを読み込めませんでした", error))?;
@@ -564,6 +596,7 @@ impl CollectionEngine {
             candidates,
             sort_order,
             Some(super::FIXED_LIST_SORT_LOCK_REASON),
+            spread_request,
         )
     }
 
@@ -571,6 +604,7 @@ impl CollectionEngine {
         &self,
         settings: &Settings,
         sort_order: crate::settings::SortOrder,
+        spread_request: CollectionSpreadRequest,
     ) -> Result<CollectionPayload, CollectionError> {
         let root = settings.books_root_path();
         let candidates = crate::books::list_books(&root)
@@ -592,6 +626,7 @@ impl CollectionEngine {
             candidates,
             sort_order,
             Some(super::FIXED_LIST_SORT_LOCK_REASON),
+            spread_request,
         )
     }
 
@@ -600,6 +635,7 @@ impl CollectionEngine {
         settings: &Settings,
         definition_id: &str,
         sort_order: crate::settings::SortOrder,
+        spread_request: CollectionSpreadRequest,
     ) -> Result<CollectionPayload, CollectionError> {
         let id = uuid::Uuid::parse_str(definition_id).map_err(|_| {
             CollectionError::new(CollectionErrorCode::BadRequest, "ID が正しくありません")
@@ -647,7 +683,14 @@ impl CollectionEngine {
                 rating: entry.rating,
             })
             .collect();
-        self.payload(settings, &title, candidates, sort_order, None)
+        self.payload(
+            settings,
+            &title,
+            candidates,
+            sort_order,
+            None,
+            spread_request,
+        )
     }
 
     fn payload(
@@ -657,6 +700,7 @@ impl CollectionEngine {
         candidates: Vec<CandidateEntry>,
         sort_order: crate::settings::SortOrder,
         locked_reason: Option<&str>,
+        spread_request: CollectionSpreadRequest,
     ) -> Result<CollectionPayload, CollectionError> {
         let entries = to_remote_entries_bounded(
             candidates
@@ -668,15 +712,173 @@ impl CollectionEngine {
         let (entries, truncated) = finalize_remote_entries(settings, entries, false);
         let entry_limit =
             super::response_entry_limit(MAX_REMOTE_COLLECTION_ENTRIES, entries.len(), truncated);
-        Ok(CollectionPayload {
-            title: title.to_owned(),
-            thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(settings),
-            sort_state: super::remote_grid_sort_state(sort_order, locked_reason),
+        Ok(collection_payload(
+            settings,
+            title,
+            super::remote_grid_sort_state(sort_order, locked_reason),
             entries,
             entry_limit,
             truncated,
-        })
+            spread_request,
+        ))
     }
+}
+
+fn collection_payload(
+    settings: &Settings,
+    title: &str,
+    sort_state: mimageviewer_ipc::RemoteGridSortState,
+    entries: Vec<RemoteEntry>,
+    entry_limit: usize,
+    truncated: bool,
+    spread_request: CollectionSpreadRequest,
+) -> CollectionPayload {
+    let spread = collection_spread_payload(&entries, spread_request);
+    CollectionPayload {
+        title: title.to_owned(),
+        thumb_aspect_height_ratio: aggregate_thumb_aspect_height_ratio(settings),
+        sort_state,
+        entries,
+        configured_spread_mode: spread.configured,
+        effective_spread_mode: spread.effective,
+        reading_direction: spread.reading_direction,
+        image_count: spread.image_count,
+        spread_page_gap_px: settings.spread_page_gap_px,
+        page_groups: spread.groups,
+        entry_limit,
+        truncated,
+    }
+}
+
+fn collection_spread_payload(
+    entries: &[RemoteEntry],
+    request: CollectionSpreadRequest,
+) -> CollectionSpreadPayload {
+    // Collection には spread.db の container key に相当する安定した鍵がない。
+    // 永続化はせず、session request と本体の non-book 既定だけから毎回解決する。
+    let defaults = crate::app::SpreadRestoreDefaults::NON_BOOK;
+    let (configured, effective, reading_direction) = super::container::resolve_spread_state(
+        request.spread_mode,
+        request.reading_direction,
+        None,
+        None,
+        defaults.spread_mode(),
+        defaults.reading_direction(),
+        request.force_single_page,
+    );
+    let items = entries
+        .iter()
+        .map(|entry| remote_entry_grid_item(entry.kind, PathBuf::from(&entry.path)))
+        .collect::<Vec<_>>();
+    let landscape = if effective == RemoteSpreadMode::Single {
+        vec![false; entries.len()]
+    } else {
+        cached_collection_landscape_flags(entries)
+    };
+    let index_groups = crate::ui_fullscreen::build_remote_spread_page_groups(
+        &items,
+        super::container::core_spread_mode(effective),
+        &landscape,
+    );
+    let groups = index_groups
+        .into_iter()
+        .filter_map(|indices| {
+            let pages = indices
+                .into_iter()
+                .filter_map(|index| entries.get(index))
+                .map(|entry| RemoteAddress::file(entry.path.clone()))
+                .collect::<Vec<_>>();
+            let anchor = if effective.is_rtl() && pages.len() == 2 {
+                pages.get(1).cloned()
+            } else {
+                pages.first().cloned()
+            }?;
+            Some(PageGroup { anchor, pages })
+        })
+        .collect();
+    CollectionSpreadPayload {
+        configured,
+        effective,
+        reading_direction,
+        image_count: entries
+            .iter()
+            .filter(|entry| entry.kind == RemoteEntryKind::Image)
+            .count(),
+        groups,
+    }
+}
+
+fn remote_entry_grid_item(kind: RemoteEntryKind, path: PathBuf) -> GridItem {
+    match kind {
+        RemoteEntryKind::Folder | RemoteEntryKind::Other | RemoteEntryKind::Archive => {
+            GridItem::Folder(path)
+        }
+        RemoteEntryKind::Image => GridItem::Image(path),
+        RemoteEntryKind::Video => GridItem::Video(path),
+        RemoteEntryKind::Audio => GridItem::Audio(path),
+        RemoteEntryKind::Zip => GridItem::ZipFile(path),
+        RemoteEntryKind::Pdf => GridItem::PdfFile(path),
+    }
+}
+
+fn cached_collection_landscape_flags(entries: &[RemoteEntry]) -> Vec<bool> {
+    struct ParentImages {
+        path: PathBuf,
+        images: Vec<(usize, String)>,
+    }
+
+    let mut parents = Vec::<ParentImages>::new();
+    let mut parent_indexes = HashMap::<String, usize>::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.kind != RemoteEntryKind::Image {
+            continue;
+        }
+        let path = Path::new(&entry.path);
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let parent_key = crate::path_key::normalize_keep_drive(parent);
+        let parent_index = *parent_indexes.entry(parent_key).or_insert_with(|| {
+            let parent_index = parents.len();
+            parents.push(ParentImages {
+                path: parent.to_path_buf(),
+                images: Vec::new(),
+            });
+            parent_index
+        });
+        parents[parent_index]
+            .images
+            .push((index, filename.to_owned()));
+    }
+
+    let cache_dir = crate::catalog::default_cache_dir();
+    let mut landscape = vec![false; entries.len()];
+    // 親フォルダごとに一度だけ catalog を開き、寸法列だけを一括取得する。
+    // フォルダを処理し終えたら DB と寸法 map を drop するので、全親の blob/map を保持しない。
+    for parent in parents {
+        let catalog = crate::catalog::CatalogDb::open_existing_read_only(&cache_dir, &parent.path)
+            .ok()
+            .flatten();
+        let cached = catalog
+            .as_ref()
+            .and_then(|catalog| catalog.load_source_dims().ok())
+            .unwrap_or_default();
+        for (index, filename) in parent.images {
+            let dims = cached.get(&filename).and_then(|recorded| {
+                recorded.or_else(|| {
+                    catalog
+                        .as_ref()
+                        .and_then(|catalog| catalog.load_one(&filename).ok().flatten())
+                        .and_then(|entry| crate::catalog::decode_thumb_dims(&entry.jpeg_data))
+                })
+            });
+            landscape[index] = dims.is_some_and(|(width, height)| width > height);
+        }
+    }
+    landscape
 }
 
 fn empty_tag_browse_payload(state: TagIndexState) -> TagBrowsePayload {
@@ -861,13 +1063,25 @@ fn bound_remote_entries_with_limits(
     entry_limit: usize,
     byte_budget: usize,
 ) -> (Vec<RemoteEntry>, bool) {
-    // Two bytes cover the JSON array brackets. Adding one separator byte for every
-    // value deliberately overestimates the real array by one byte when non-empty.
-    let mut estimated_bytes = 2usize;
+    // Brackets for entries and page_groups. Each image can become a single-page group,
+    // so reserve both its pages address and anchor address. This is the worst case and
+    // keeps the completed CollectionPayload below the IPC frame budget even for long paths.
+    let mut estimated_bytes = 4usize;
     let mut bounded = Vec::with_capacity(entries.len().min(entry_limit));
     let mut truncated = entries.len() > entry_limit;
     for entry in entries.into_iter().take(entry_limit) {
-        let entry_bytes = super::serialized_json_len(&entry).saturating_add(1);
+        let group_bytes = if entry.kind == RemoteEntryKind::Image {
+            let address_bytes =
+                super::serialized_json_len(&RemoteAddress::file(&entry.path)).saturating_add(1);
+            address_bytes
+                .saturating_mul(2)
+                .saturating_add(PAGE_GROUP_JSON_OVERHEAD_PER_IMAGE)
+        } else {
+            0
+        };
+        let entry_bytes = super::serialized_json_len(&entry)
+            .saturating_add(1)
+            .saturating_add(group_bytes);
         if estimated_bytes.saturating_add(entry_bytes) > byte_budget {
             truncated = true;
             break;
@@ -1183,20 +1397,194 @@ mod tests {
         }
     }
 
+    fn test_remote_entry_kind(path: &Path, kind: RemoteEntryKind) -> RemoteEntry {
+        let mut entry = test_remote_entry(
+            path.to_string_lossy().into_owned(),
+            path.file_name().unwrap().to_string_lossy().into_owned(),
+        );
+        entry.kind = kind;
+        entry
+    }
+
     fn test_collection_payload(entries: Vec<RemoteEntry>, truncated: bool) -> CollectionPayload {
         let entry_limit = super::super::response_entry_limit(
             MAX_REMOTE_COLLECTION_ENTRIES,
             entries.len(),
             truncated,
         );
-        CollectionPayload {
-            title: "test".to_owned(),
-            thumb_aspect_height_ratio: 1.0,
-            sort_state: super::super::remote_grid_sort_state(Settings::default().sort_order, None),
+        let settings = Settings::default();
+        collection_payload(
+            &settings,
+            "test",
+            super::super::remote_grid_sort_state(settings.sort_order, None),
             entries,
             entry_limit,
             truncated,
-        }
+            CollectionSpreadRequest::default(),
+        )
+    }
+
+    #[test]
+    fn collection_spread_groups_only_images_and_uses_each_parent_catalog_dimensions() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let first_parent = data_dir.path().join("first");
+        let second_parent = data_dir.path().join("second");
+        std::fs::create_dir_all(&first_parent).unwrap();
+        std::fs::create_dir_all(&second_parent).unwrap();
+        let cache_dir = crate::catalog::default_cache_dir();
+        let first_catalog = crate::catalog::CatalogDb::open(&cache_dir, &first_parent).unwrap();
+        first_catalog
+            .save("portrait-a.jpg", 1, 10, 8, 8, Some((1200, 1800)), b"a")
+            .unwrap();
+        first_catalog
+            .save("portrait-b.jpg", 1, 10, 8, 8, Some((1200, 1800)), b"b")
+            .unwrap();
+        drop(first_catalog);
+        let second_catalog = crate::catalog::CatalogDb::open(&cache_dir, &second_parent).unwrap();
+        second_catalog
+            .save("wide.jpg", 1, 10, 8, 8, Some((1800, 1200)), b"wide")
+            .unwrap();
+        second_catalog
+            .save("portrait-c.jpg", 1, 10, 8, 8, Some((1200, 1800)), b"c")
+            .unwrap();
+        drop(second_catalog);
+
+        let portrait_a = first_parent.join("portrait-a.jpg");
+        let video = first_parent.join("clip.mp4");
+        let archive = first_parent.join("book.zip");
+        let wide = second_parent.join("wide.jpg");
+        let portrait_b = first_parent.join("portrait-b.jpg");
+        let portrait_c = second_parent.join("portrait-c.jpg");
+        let entries = vec![
+            test_remote_entry_kind(&portrait_a, RemoteEntryKind::Image),
+            test_remote_entry_kind(&video, RemoteEntryKind::Video),
+            test_remote_entry_kind(&archive, RemoteEntryKind::Zip),
+            test_remote_entry_kind(&wide, RemoteEntryKind::Image),
+            test_remote_entry_kind(&portrait_b, RemoteEntryKind::Image),
+            test_remote_entry_kind(&portrait_c, RemoteEntryKind::Image),
+        ];
+        let spread = collection_spread_payload(
+            &entries,
+            CollectionSpreadRequest {
+                spread_mode: Some(RemoteSpreadMode::Ltr),
+                reading_direction: Some(RemoteReadingDirection::Ltr),
+                force_single_page: false,
+            },
+        );
+
+        assert_eq!(spread.image_count, 4);
+        assert_eq!(spread.groups.len(), 3);
+        assert_eq!(
+            spread.groups[0].pages,
+            [RemoteAddress::file(
+                portrait_a.to_string_lossy().into_owned()
+            )]
+        );
+        assert_eq!(
+            spread.groups[1].pages,
+            [RemoteAddress::file(wide.to_string_lossy().into_owned())]
+        );
+        assert_eq!(
+            spread.groups[2].pages,
+            [
+                RemoteAddress::file(portrait_b.to_string_lossy().into_owned()),
+                RemoteAddress::file(portrait_c.to_string_lossy().into_owned())
+            ]
+        );
+        assert!(spread.groups.iter().all(|group| {
+            group.pages.iter().all(|address| {
+                !address.path.ends_with("clip.mp4") && !address.path.ends_with("book.zip")
+            })
+        }));
+    }
+
+    #[test]
+    fn collection_force_single_page_keeps_one_image_per_group() {
+        let entries = (0..5)
+            .map(|index| {
+                test_remote_entry(
+                    format!("C:/collection/page-{index}.jpg"),
+                    format!("page-{index}.jpg"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let spread = collection_spread_payload(
+            &entries,
+            CollectionSpreadRequest {
+                spread_mode: Some(RemoteSpreadMode::RtlCover),
+                reading_direction: Some(RemoteReadingDirection::Rtl),
+                force_single_page: true,
+            },
+        );
+
+        assert_eq!(spread.configured, RemoteSpreadMode::RtlCover);
+        assert_eq!(spread.effective, RemoteSpreadMode::Single);
+        assert_eq!(spread.groups.len(), entries.len());
+        assert!(spread.groups.iter().all(|group| group.pages.len() == 1));
+    }
+
+    #[test]
+    fn collection_landscape_uses_thumb_only_for_legacy_null_catalog_rows() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let parent = data_dir.path().join("legacy-catalog");
+        std::fs::create_dir_all(&parent).unwrap();
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 6));
+        let mut jpeg = Vec::new();
+        image
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        let catalog =
+            crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &parent).unwrap();
+        catalog
+            .save("legacy-wide.jpg", 1, 10, 8, 6, None, &jpeg)
+            .unwrap();
+        drop(catalog);
+
+        let entries = vec![
+            test_remote_entry_kind(&parent.join("legacy-wide.jpg"), RemoteEntryKind::Image),
+            test_remote_entry_kind(&parent.join("missing.jpg"), RemoteEntryKind::Image),
+        ];
+
+        assert_eq!(cached_collection_landscape_flags(&entries), [true, false]);
+    }
+
+    #[test]
+    fn collection_page_groups_scale_to_sixty_six_thousand_images() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let parent = data_dir.path().join("large-smart-folder");
+        let entries = (0..66_934)
+            .map(|index| {
+                test_remote_entry(
+                    parent
+                        .join(format!("page-{index:05}.jpg"))
+                        .to_string_lossy()
+                        .into_owned(),
+                    format!("page-{index:05}.jpg"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let started = std::time::Instant::now();
+        let spread = collection_spread_payload(
+            &entries,
+            CollectionSpreadRequest {
+                spread_mode: Some(RemoteSpreadMode::Ltr),
+                reading_direction: Some(RemoteReadingDirection::Ltr),
+                force_single_page: false,
+            },
+        );
+        let elapsed = started.elapsed();
+
+        eprintln!(
+            "collection_page_groups images={} groups={} elapsed_ms={:.3}",
+            entries.len(),
+            spread.groups.len(),
+            elapsed.as_secs_f64() * 1000.0
+        );
+        assert_eq!(spread.image_count, 66_934);
+        assert_eq!(spread.groups.len(), 33_467);
     }
 
     #[test]
@@ -1272,6 +1660,7 @@ mod tests {
                 &settings,
                 settings.sort_order,
                 vec![first.clone(), second.clone()],
+                CollectionSpreadRequest::default(),
             )
             .unwrap();
         assert_eq!(payload.title, "ドライブ一覧");
@@ -1536,6 +1925,7 @@ mod tests {
                 candidates(),
                 settings.sort_order,
                 None,
+                CollectionSpreadRequest::default(),
             )
             .unwrap();
         assert_eq!(ignored.entries.len(), 1);
@@ -1549,6 +1939,7 @@ mod tests {
                 candidates(),
                 settings.sort_order,
                 None,
+                CollectionSpreadRequest::default(),
             )
             .unwrap();
         assert_eq!(included.entries.len(), 2);
@@ -1597,6 +1988,7 @@ mod tests {
                 candidates,
                 settings.sort_order,
                 None,
+                CollectionSpreadRequest::default(),
             )
             .unwrap();
 
@@ -1843,6 +2235,9 @@ mod tests {
 
         let first = collection_success(engine.collection(CollectionRequest {
             kind: CollectionKind::Bookshelf,
+            spread_mode: None,
+            reading_direction: None,
+            force_single_page: false,
         }));
         assert_eq!(first.entries.len(), 1);
         assert_eq!(first.entries[0].name, "First");
@@ -1873,6 +2268,9 @@ mod tests {
 
         let second = collection_success(engine.collection(CollectionRequest {
             kind: CollectionKind::Bookshelf,
+            spread_mode: None,
+            reading_direction: None,
+            force_single_page: false,
         }));
         assert_eq!(second.entries.len(), 1);
         assert_eq!(second.entries[0].name, "Second");

@@ -2604,9 +2604,27 @@ fn api_collection(
         }
         _ => return HttpResponse::text(400, "Bad Request"),
     };
+    let spread_mode = match parse_spread_mode(query) {
+        Ok(value) => value,
+        Err(()) => return HttpResponse::text(400, "Bad Request"),
+    };
+    let reading_direction = match parse_reading_direction(query) {
+        Ok(value) => value,
+        Err(()) => return HttpResponse::text(400, "Bad Request"),
+    };
+    let force_single_page = match parse_force_single_page(query) {
+        Ok(value) => value,
+        Err(()) => return HttpResponse::text(400, "Bad Request"),
+    };
     let started = Instant::now();
     let result = match state.ipc_admission.run(IpcClass::Heavy, || {
-        state.thumbnail_client.collection(owner, kind)
+        state.thumbnail_client.collection(
+            owner,
+            kind.clone(),
+            spread_mode,
+            reading_direction,
+            force_single_page,
+        )
     }) {
         Ok(result) => result,
         Err(busy) => return collection_admission_busy_response(busy, kind_name),
@@ -2621,6 +2639,11 @@ fn api_collection(
                     "collection": {
                         "kind": kind_name,
                         "entry_count": entry_count,
+                        "group_count": result.value.page_groups.len(),
+                        "configured_spread": result.value.configured_spread_mode,
+                        "effective_spread": result.value.effective_spread_mode,
+                        "reading_direction": result.value.reading_direction,
+                        "force_single_page": force_single_page,
                         "ipc_status": "ok",
                         "ipc_ms": crate::diagnostics::duration_ms(started.elapsed()),
                         "ipc_retry_count": result.retry_count,

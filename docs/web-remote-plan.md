@@ -769,7 +769,7 @@ payload を順に描画するだけで、既知フォルダやドライブを独
 返し、ファイルシステム走査や各集約ビューの内容取得は行わない。`scan_smart_folder` は利用者が
 該当スマートフォルダを開いて `/api/collection` を要求した時だけ実行する。読書履歴は本体設定由来の
 上限 (最大 1000) を既に持つ。リモートのコレクション項目は最大 100,000 件とし、さらに直列化後の
-entry JSON を 40 MiB 以内へ制限する。レーティング・本棚・ブックマーク・スマートフォルダも同じ
+`entries` と `page_groups` の反復部分を 40 MiB 以内へ制限する。レーティング・本棚・ブックマーク・スマートフォルダも同じ
 上限と byte 予算を使い、`truncated` / `entry_limit` を返して Web 画面に打ち切りを表示する。byte
 予算で打ち切った場合の `entry_limit` は実際に返した件数とする。現段階ではページングは実装しない。
 
@@ -781,6 +781,26 @@ HTTP は認証必須の `GET /api/home` と `GET /api/collection` を追加す�
 フォルダは既存 `/api/thumb?path=<absolute>&w=<px>` を使う。ZIP / PDF は §12 の増分で
 コンテナ内ページまで閲覧可能になった。動画・音声・変換アーカイブの再生、および
 読書履歴・レーティング・ブックマーク等への書き込みは後続のセッションロック設計と一緒に行う。
+
+### 10.1 集約コレクションを保った画像閲覧 (protocol v49, 2026-08-13)
+
+ドライブ一覧・閲覧履歴・ブックマーク・本棚・レーティング・スマートフォルダの画像を開くときは、
+実親フォルダの container へ移動せず、取得済み collection の `entries` / `images` を viewer 文脈として
+保つ。フォルダ、ZIP / PDF、動画、音声の open route は従来どおりである。
+
+`CollectionRequest` は session 中の `spread_mode` / `reading_direction` と縦持ち用
+`force_single_page` を受け取る。collection には安定した container key がないため `spread.db` へは
+保存せず、指定がない初回は `SpreadRestoreDefaults::NON_BOOK` を使う。本体は collection 全体から
+画像だけを選び、`ui_fullscreen::build_remote_spread_page_groups` で address-based `page_groups` を
+生成する。横長判定は画像を実親フォルダごとにまとめ、各親の catalog を 1 回だけ read-only open
+して `load_source_dims` を一括取得する。旧行の寸法が `NULL` の画像だけ `load_one` の thumbnail 寸法へ
+fallback し、未取得は縦長扱いとする。親の処理ごとに catalog と寸法 map を破棄する。
+
+Web は応答をコンテナと共通の `setContainerPageGroups` へ渡し、見開き変更・読み方向変更・縦持ち
+Single の変更時には `/api/collection` を再取得する。collection の見開き指定はその閲覧 session にだけ
+残る。画像 URL は `#collection/<kind>[/<id>]/image/<encoded-path>` とし、再読込では collection を
+読み直して同じ address の画像を直接開く。画像が一覧から消えていた場合はエラー画面にせず、その
+collection 一覧へ戻す。
 
 ## 11. 通常運用と並行する検証用インスタンス (2026-07-31)
 
@@ -1846,7 +1866,8 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 `crates/remote-ipc` の protocol version を上げた増分では、**本体と remote-web の両方を
 再ビルドして再起動する**必要がある。片方だけだとハンドシェイクで弾かれる。
-ブラウザの明示 logout で current owner を release する `SessionRelease` を追加した現行版は **v48**。
+collection の session spread request と address-based `page_groups` を追加した現行版は **v49**。
+v48 はブラウザの明示 logout で current owner を release する `SessionRelease` を追加した。
 v47 は root 以外の Serve path を型付きで通知する。v46 は
 `RemoteWebConnectionInfo.tailscale_https_certificate` と
 `tailscale_key_expiry_unix_seconds` を追加する。v45 で追加した

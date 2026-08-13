@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 48;
+pub const PROTOCOL_VERSION: u32 = 49;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -1085,6 +1085,11 @@ pub enum HomeResponse {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct CollectionRequest {
     pub kind: CollectionKind,
+    /// Collection には永続化 key がないため、Web session 中の現在値だけを受け取る。
+    pub spread_mode: Option<RemoteSpreadMode>,
+    pub reading_direction: Option<RemoteReadingDirection>,
+    /// 縦長 viewport 用の表示限定 Single。configured mode は変更しない。
+    pub force_single_page: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1132,6 +1137,13 @@ pub struct CollectionPayload {
     pub thumb_aspect_height_ratio: f64,
     pub sort_state: RemoteGridSortState,
     pub entries: Vec<RemoteEntry>,
+    pub configured_spread_mode: RemoteSpreadMode,
+    pub effective_spread_mode: RemoteSpreadMode,
+    pub reading_direction: RemoteReadingDirection,
+    pub image_count: usize,
+    pub spread_page_gap_px: u32,
+    /// Collection entry の index ではなく、コンテナと同じ address identity で表す。
+    pub page_groups: Vec<PageGroup>,
     /// 応答サイズと初回 thumbnail burst を抑える読み取り専用上限。
     pub entry_limit: usize,
     pub truncated: bool,
@@ -2635,8 +2647,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v48_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
-        assert_eq!(PROTOCOL_VERSION, 48);
+    fn protocol_v49_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
+        assert_eq!(PROTOCOL_VERSION, 49);
         let expected = ClientMessage::RemoteWebConnectionInfo {
             id: 10,
             info: RemoteWebConnectionInfo {
@@ -2810,8 +2822,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v48_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 48);
+    fn protocol_v49_remote_video_thumbnail_shape_round_trips() {
+        assert_eq!(PROTOCOL_VERSION, 49);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -3251,20 +3263,42 @@ mod tests {
     }
 
     #[test]
-    fn collection_message_carries_the_absolute_path() {
+    fn collection_message_round_trip_keeps_spread_request_and_address_groups() {
+        let request = ClientMessage::Collection {
+            id: 77,
+            owner: test_owner("test-client"),
+            request: CollectionRequest {
+                kind: CollectionKind::SmartFolder {
+                    definition_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+                },
+                spread_mode: Some(RemoteSpreadMode::RtlCover),
+                reading_direction: Some(RemoteReadingDirection::Rtl),
+                force_single_page: false,
+            },
+        };
+        let page = RemoteAddress::file("C:/Books/volume-1/page-001.jpg");
         let expected = ServerMessage::Collection {
             id: 77,
             response: CollectionResponse::Success(CollectionPayload {
                 title: "最近読んだ本".to_owned(),
                 thumb_aspect_height_ratio: 1.0,
                 sort_state: test_sort_state(Some("この一覧では並び順が固定されています")),
+                configured_spread_mode: RemoteSpreadMode::RtlCover,
+                effective_spread_mode: RemoteSpreadMode::RtlCover,
+                reading_direction: RemoteReadingDirection::Rtl,
+                image_count: 1,
+                spread_page_gap_px: 4,
+                page_groups: vec![PageGroup {
+                    anchor: page.clone(),
+                    pages: vec![page],
+                }],
                 entry_limit: 1000,
                 truncated: false,
                 entries: vec![RemoteEntry {
-                    path: "C:/Books/volume-1".to_owned(),
+                    path: "C:/Books/volume-1/page-001.jpg".to_owned(),
                     thumbnail_address: None,
-                    name: "volume-1".to_owned(),
-                    kind: RemoteEntryKind::Folder,
+                    name: "page-001.jpg".to_owned(),
+                    kind: RemoteEntryKind::Image,
                     detail: Some("3 / 20 ページ".to_owned()),
                     progress_current: Some(3),
                     progress_total: Some(20),
@@ -3272,6 +3306,11 @@ mod tests {
                 }],
             }),
         };
+        let mut request_bytes = Vec::new();
+        write_frame(&mut request_bytes, &request).unwrap();
+        let decoded_request: ClientMessage =
+            read_frame(&mut request_bytes.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap();
+        assert_eq!(decoded_request, request);
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &expected).unwrap();
         let decoded: ServerMessage =
@@ -3299,6 +3338,12 @@ mod tests {
                     thumb_aspect_height_ratio: 1.0,
                     sort_state: test_sort_state(Some("この一覧では並び順が固定されています")),
                     entries: Vec::new(),
+                    configured_spread_mode: RemoteSpreadMode::Single,
+                    effective_spread_mode: RemoteSpreadMode::Single,
+                    reading_direction: RemoteReadingDirection::Ltr,
+                    image_count: 0,
+                    spread_page_gap_px: 4,
+                    page_groups: Vec::new(),
                     entry_limit: 1000,
                     truncated: false,
                 },
@@ -3357,6 +3402,12 @@ mod tests {
                     thumb_aspect_height_ratio: 1.0,
                     sort_state: test_sort_state(Some("この一覧では並び順が固定されています")),
                     entries: Vec::new(),
+                    configured_spread_mode: RemoteSpreadMode::Single,
+                    effective_spread_mode: RemoteSpreadMode::Single,
+                    reading_direction: RemoteReadingDirection::Ltr,
+                    image_count: 0,
+                    spread_page_gap_px: 4,
+                    page_groups: Vec::new(),
                     entry_limit: 1000,
                     truncated: false,
                 },

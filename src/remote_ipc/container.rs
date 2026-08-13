@@ -5191,7 +5191,7 @@ fn resolve_resume_page(
         .and_then(|item| grid_item_address(container, item))
 }
 
-fn core_spread_mode(mode: RemoteSpreadMode) -> crate::settings::SpreadMode {
+pub(super) fn core_spread_mode(mode: RemoteSpreadMode) -> crate::settings::SpreadMode {
     match mode {
         RemoteSpreadMode::Single => crate::settings::SpreadMode::Single,
         RemoteSpreadMode::Ltr => crate::settings::SpreadMode::Ltr,
@@ -5239,7 +5239,7 @@ fn remote_reading_direction_name(direction: RemoteReadingDirection) -> &'static 
     }
 }
 
-fn resolve_spread_state(
+pub(super) fn resolve_spread_state(
     requested: Option<RemoteSpreadMode>,
     requested_direction: Option<RemoteReadingDirection>,
     stored_mode: Option<crate::settings::SpreadMode>,

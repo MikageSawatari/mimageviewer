@@ -534,11 +534,19 @@ impl ThumbnailClient {
         &self,
         owner: &RemoteSessionIdentity,
         kind: CollectionKind,
+        spread_mode: Option<mimageviewer_ipc::RemoteSpreadMode>,
+        reading_direction: Option<mimageviewer_ipc::RemoteReadingDirection>,
+        force_single_page: bool,
     ) -> Result<IpcSuccess<CollectionPayload>, ClientFailure> {
         self.collection_request(|id| ClientMessage::Collection {
             id,
             owner: owner.clone(),
-            request: CollectionRequest { kind: kind.clone() },
+            request: CollectionRequest {
+                kind: kind.clone(),
+                spread_mode,
+                reading_direction,
+                force_single_page,
+            },
         })
         .and_then(|success| match success.value {
             ServerMessage::Collection {
