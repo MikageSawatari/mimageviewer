@@ -14,18 +14,24 @@ wait_until(|s|
         && s.target_rendered
         && s.focused
         && !s.is_fullscreen
+        && s.items_len > 0
+        && s.pending_thumbs == 0
         && !s.modal_open
         && !s.popup_open,
     60000
 );
-// `pending_thumbs == 0` is also true before the folder has requested anything
-// (backlog 1.70), so give the grid a moment rather than trusting it alone.
-sleep(1500);
 
 log("continuous-video: open the first page in fullscreen");
 tap_key("Enter");
+// `fullscreen_raw_key_permit` is the signal that the fullscreen viewport has
+// actually taken over key handling. Without it the foreground can still be
+// mid-handover and the next key has nowhere registered to go.
 wait_until(
-    |s| s.is_fullscreen && s.target_rendered && s.focused && s.current_is_still_image,
+    |s| s.is_fullscreen
+        && s.target_registered
+        && s.focused
+        && s.current_is_still_image
+        && s.fullscreen_raw_key_permit,
     30000,
 );
 

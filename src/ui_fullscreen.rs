@@ -15037,6 +15037,7 @@ impl App {
             target_registered: target.is_some(),
             // A child callback publishes true after it is actually reached.
             target_rendered: target.is_some_and(|target| target.viewport == egui::ViewportId::ROOT),
+            items_len: i64::try_from(self.items.len()).unwrap_or(i64::MAX),
             pending_thumbs: i64::try_from(pending_thumbs).unwrap_or(i64::MAX),
             spread_mode: format!("{:?}", self.spread_mode),
             continuous_reading,

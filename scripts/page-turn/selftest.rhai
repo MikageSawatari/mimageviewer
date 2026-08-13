@@ -4,6 +4,7 @@ wait_until(|s|
         && s.target_rendered
         && s.focused
         && !s.is_fullscreen
+        && s.items_len > 0
         && s.pending_thumbs == 0
         && !s.modal_open
         && !s.popup_open

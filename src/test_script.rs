@@ -49,6 +49,11 @@ pub(crate) struct TestScriptSnapshot {
     pub(crate) target_viewport: String,
     pub(crate) target_registered: bool,
     pub(crate) target_rendered: bool,
+    /// 現在のフォルダに並んでいる item 数。
+    ///
+    /// `pending_thumbs == 0` だけでは「全部終わった」と「まだ何も始まっていない」を
+    /// 区別できない。落ち着いたことを待つ条件には `items_len > 0` を併せて使う。
+    pub(crate) items_len: i64,
     pub(crate) pending_thumbs: i64,
     pub(crate) spread_mode: String,
     pub(crate) continuous_reading: bool,
@@ -77,6 +82,7 @@ impl Default for TestScriptSnapshot {
             target_viewport: "unregistered".to_string(),
             target_registered: false,
             target_rendered: false,
+            items_len: 0,
             pending_thumbs: 0,
             spread_mode: "Single".to_string(),
             continuous_reading: false,
@@ -115,6 +121,7 @@ impl TestScriptSnapshot {
         insert!(target_viewport);
         insert!(target_registered);
         insert!(target_rendered);
+        insert!(items_len);
         insert!(pending_thumbs);
         insert!(spread_mode);
         insert!(continuous_reading);
@@ -599,6 +606,14 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
             }
         },
     );
+
+    // 条件を待つのではなく、いまの状態をそのまま読む。`wait_until` は真になるまで
+    // 待つので、「どちらに転んだか」で分岐するシナリオが書けなかった。
+    let snapshot_bridge = bridge.clone();
+    engine.register_fn("snapshot", move || -> Result<Map, Box<EvalAltResult>> {
+        let snapshot = snapshot_bridge.latest_snapshot().map_err(rhai_error)?;
+        Ok(snapshot.to_rhai_map())
+    });
 
     let repeat_float_bridge = bridge.clone();
     engine.register_fn(
