@@ -1603,6 +1603,30 @@ docs/conceal-feature-plan.md
   - 検索 bench 回帰
   - perf smoke
   - `dumpbin /dependents` で不要な VC runtime DLL が復活していないこと
+- **quick-xml の非推奨 API 追随** (v3.0.0 で 0.39 → 0.41、advisory 対応)。
+  `src/xmp_reader.rs` の 4 箇所が非推奨警告を出す:
+  `decode_and_unescape_value` → `decoded_and_normalized_value`、
+  `unescape_value` → `normalized_value`。
+  **0.41 では非推奨側が新実装へ委譲済み**なので、いま呼んでいる限り挙動は
+  `normalized_*` と同じ (= XML 仕様どおり属性値の改行 / タブが空白になる)。
+  影響するのは**属性値だけ**で、`xtw:*` (ツイート情報の表示用テキスト) と
+  `rdf:resource` / `xmp:Rating` / GPano (いずれも URI か数値) にとどまる。
+  **タグ (`dc:subject`) は `Event::Text` 経由**で非推奨メソッドを通らないため無関係。
+  次の更新で削除される前に呼び出しを置き換える。
+
+### 5.9 リリース手順: 配布ビルド前に core / remote の存在が要る
+
+- 出典: v3.0.0 リリース前確認 (2026-08-14)。`scripts/test-full.ps1` が
+  **テストを 1 件も実行しないままビルドエラーで落ちた**。
+- 原因: `--workspace` に launcher package が入り、その build.rs が内包対象の
+  `target\release\mimageviewer-core.exe` と `mimageviewer-remote.exe` の存在を検査する。
+  remote は v3.0.0 で増えたので、それ以前の成果物しか無い環境で初めて表面化した。
+- `build-dist.ps1` は test-full を `cargo clean` の**前**に回すため、直前のビルドが
+  残っている通常のリリース機では起きない。新しい clone や `cargo clean` 直後に起きる。
+- 当座の回避と前提は CLAUDE.md「開発中のビルド・テスト選択」に記載済み。
+- 直す方向: test-full が不足分を先に build するか、launcher を `--workspace` の
+  テスト対象から外す (launcher 自身に unit test があるかを確認してから決める)。
+- 規模 / 優先度: 小 / P3。
 
 ### 5.3 リリース / テストスクリプトの並行実行耐性とクリーン環境再現性
 
