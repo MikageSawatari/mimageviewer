@@ -1537,6 +1537,7 @@ pub fn process_load_request(
         req.context_epoch,
         cancel_policy,
         req.force_cache,
+        req.skip_cache,
         pinned_page_adjustment.as_ref(),
     );
     if crate::perf::is_enabled() {
@@ -2434,6 +2435,41 @@ fn resolve_folder_thumb_image_inner(
     None
 }
 
+/// `load_one_cached` の区間。**入れ子を型で分ける**のが目的で、`render` と `orientation` は
+/// `decode` の内側にある (`decode_ms` は `apply_orientation` の後で計測される)。内訳を
+/// 合計へ足すと `unaccounted_ms` が過小になり、**名前の付いていない時間が消えて見える** —
+/// この計装が唯一守ろうとしている信号なので、足せない形にしておく。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ThumbLoadPhases {
+    /// デコード全体。PDF では render 往復と orientation を含む。
+    decode_ms: f64,
+    display_ms: f64,
+    send_display_ms: f64,
+    cache_encode_ms: f64,
+    cache_save_ms: f64,
+    cache_map_ms: f64,
+    /// 以下は `decode_ms` の内訳。合計には入れない。
+    render_ms: Option<f64>,
+    orientation_ms: f64,
+}
+
+impl ThumbLoadPhases {
+    /// 互いに重ならない区間だけの合計。
+    fn disjoint_total_ms(&self) -> f64 {
+        self.decode_ms
+            + self.display_ms
+            + self.send_display_ms
+            + self.cache_encode_ms
+            + self.cache_save_ms
+            + self.cache_map_ms
+    }
+
+    /// 名前の付いていない時間。負にはしない (計測誤差で負値を出さない)。
+    fn unaccounted_ms(&self, total_ms: f64) -> f64 {
+        (total_ms - self.disjoint_total_ms()).max(0.0)
+    }
+}
+
 /// 1枚の画像をデコードしてサムネイルを生成し、(条件を満たせば) カタログに保存して
 /// チャネルへ送信する。
 /// catalog が None の場合はカタログへの保存をスキップする。
@@ -2492,10 +2528,13 @@ pub fn load_one_cached(
     // CachePolicy に関係なく catalog に残す。ユーザー明示ピンなど cache-only 復元が
     // 後続で必要なリクエストに限って使う。
     force_cache: bool,
+    // 呼び出し元が cache read を飛ばしたかどうか。計装用で、保存判定には使わない。
+    skip_cache: bool,
     // 手動固定した親代表へ伝播する、固定元ページの個別色調補正。
     // 通常ページは UI 側の `effective_params` で処理するため None。
     pinned_page_adjustment: Option<&crate::adjustment::AdjustParams>,
 ) {
+    let total_started = std::time::Instant::now();
     // カタログキー (保存・参照で一致させる) と表示名 (ログ用) を分離。
     // process_load_request 側と同じキー形式を使うこと。
     // cache_key_override が Some のとき: フォルダ一覧の ZipFile/PdfFile 用キーを優先。
@@ -2532,6 +2571,7 @@ pub fn load_one_cached(
     // 縦横比を catalog に残す。値は 1/1000 point の固定小数点レイアウト寸法。
     let mut pdf_layout_dims: Option<(u32, u32)> = None;
     let mut byte_orientation: u16 = 1;
+    let mut render_ms: Option<f64> = None;
     let has_verified_source = verified_source_bytes.is_some();
     let img_result = if let Some(page_num) = pdf_page {
         // サムネイル用 PDF レンダ: 可視セル (priority=true) は HighNormal、
@@ -2543,7 +2583,8 @@ pub fn load_one_cached(
         } else {
             crate::pdf_loader::JobPriority::Normal
         };
-        crate::pdf_loader::render_page(
+        let render_started = std::time::Instant::now();
+        let render_result = crate::pdf_loader::render_page(
             path,
             page_num,
             display_px,
@@ -2552,43 +2593,45 @@ pub fn load_one_cached(
             pdf_priority,
             context_epoch,
             cancel_policy,
-        )
-        .map(|res| {
-            pdf_layout_dims = res.page_size_points.catalog_layout_dims();
-            // C-thumb (v1.0.0): 親フォルダ内の PDF サムネ render の場合、ついでに
-            // pdf_meta テーブルへページ数を書き込む。`cache_key_override` が
-            // "pdfthumb:" 始まりのときが「親フォルダ catalog 経路」の signature。
-            // PDF 自身を仮想フォルダとして開いている経路 (= cache_key_override None
-            // で pdf_page Some) は catalog が PDF 内サムネ用なので skip。
-            //
-            // **password_required の決定** (Codex P1/P2 follow-up 対応):
-            //   - pdf_password=None で render 成功 = 「パスワード不要」確信あり
-            //     → `set_pdf_meta_safe` (新規行 OK、既存 password_required は保持)
-            //   - pdf_password=Some = session-level pw が居座っているだけかもしれず、
-            //     PDF が本当に保護されているか確信できない (= unknown)
-            //     → `set_pdf_meta_thumb` (UPDATE only、新規行は作らない)
-            // unknown を false-default で挿入すると、保護 PDF が永続的に
-            // 「非保護」記録されて次回 placeholder で page 数が露出する bypass を
-            // 生むので、新規行は確信できる経路 (= enumerate 成功時) のみで作る。
-            if let (Some(cat), Some(key)) = (catalog, cache_key_override) {
-                if key.starts_with(CACHE_KEY_PDF) {
-                    if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                        let write_result = if pdf_password.is_none() {
-                            cat.set_pdf_meta_safe(filename, mtime, file_size, res.page_count)
-                        } else {
-                            cat.set_pdf_meta_thumb(filename, mtime, file_size, res.page_count)
-                        };
-                        if let Err(e) = write_result {
-                            crate::logger::log(format!(
-                                "thumb_loader: pdf_meta write failed for {filename}: {e}"
-                            ));
+        );
+        render_ms = Some(render_started.elapsed().as_secs_f64() * 1000.0);
+        render_result
+            .map(|res| {
+                pdf_layout_dims = res.page_size_points.catalog_layout_dims();
+                // C-thumb (v1.0.0): 親フォルダ内の PDF サムネ render の場合、ついでに
+                // pdf_meta テーブルへページ数を書き込む。`cache_key_override` が
+                // "pdfthumb:" 始まりのときが「親フォルダ catalog 経路」の signature。
+                // PDF 自身を仮想フォルダとして開いている経路 (= cache_key_override None
+                // で pdf_page Some) は catalog が PDF 内サムネ用なので skip。
+                //
+                // **password_required の決定** (Codex P1/P2 follow-up 対応):
+                //   - pdf_password=None で render 成功 = 「パスワード不要」確信あり
+                //     → `set_pdf_meta_safe` (新規行 OK、既存 password_required は保持)
+                //   - pdf_password=Some = session-level pw が居座っているだけかもしれず、
+                //     PDF が本当に保護されているか確信できない (= unknown)
+                //     → `set_pdf_meta_thumb` (UPDATE only、新規行は作らない)
+                // unknown を false-default で挿入すると、保護 PDF が永続的に
+                // 「非保護」記録されて次回 placeholder で page 数が露出する bypass を
+                // 生むので、新規行は確信できる経路 (= enumerate 成功時) のみで作る。
+                if let (Some(cat), Some(key)) = (catalog, cache_key_override) {
+                    if key.starts_with(CACHE_KEY_PDF) {
+                        if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                            let write_result = if pdf_password.is_none() {
+                                cat.set_pdf_meta_safe(filename, mtime, file_size, res.page_count)
+                            } else {
+                                cat.set_pdf_meta_thumb(filename, mtime, file_size, res.page_count)
+                            };
+                            if let Err(e) = write_result {
+                                crate::logger::log(format!(
+                                    "thumb_loader: pdf_meta write failed for {filename}: {e}"
+                                ));
+                            }
                         }
                     }
                 }
-            }
-            res.image
-        })
-        .map_err(|e| image::ImageError::IoError(e))
+                res.image
+            })
+            .map_err(|e| image::ImageError::IoError(e))
     } else if let Some(bytes) = verified_source_bytes {
         byte_orientation = read_exif_orientation_from_bytes(&bytes);
         let hint = path
@@ -2824,7 +2867,9 @@ pub fn load_one_cached(
     } else {
         read_exif_orientation(path)
     };
+    let orientation_started = std::time::Instant::now();
     let img = apply_orientation(img, orientation);
+    let orientation_ms = orientation_started.elapsed().as_secs_f64() * 1000.0;
 
     let decode_ms = t.elapsed().as_secs_f64() * 1000.0;
 
@@ -2876,6 +2921,7 @@ pub fn load_one_cached(
     // from_cache=false のこの経路では `requested` を抜かない (下の cache save が
     // 完了するまで保持する → cache save 中に同じ idx が再エンキューされて
     // 二重レンダする事故を防ぐ)。
+    let send_display_started = std::time::Instant::now();
     let _ = tx.send(ThumbMsg {
         idx,
         image: Some(display_ci),
@@ -2889,6 +2935,7 @@ pub fn load_one_cached(
         input_seq,
         items_gen,
     });
+    let send_display_ms = send_display_started.elapsed().as_secs_f64() * 1000.0;
 
     // 統計: 画像のフルデコード時間・サイズ・フォーマット・デコーダ経路を記録
     {
@@ -2916,21 +2963,27 @@ pub fn load_one_cached(
     //     それ以外は CacheDecision の判定に従う
     let policy_should_save = cache_decision.should_cache(path, file_size, decode_ms, display_ms);
     let should_save = catalog.is_some() && (force_cache || policy_should_save);
+    let mut cache_encode_ms = 0.0;
+    let mut cache_save_ms = 0.0;
+    let mut cache_map_ms = 0.0;
 
     if should_save {
         let cat = catalog.expect("should_save => catalog is Some");
         let t_enc = std::time::Instant::now();
-        match crate::catalog::encode_thumb_webp_with_aspect_dims(
+        let encoded = crate::catalog::encode_thumb_webp_with_aspect_dims(
             &img,
             thumb_px,
             thumb_quality as f32,
             layout_dims
                 .or(source_dims)
                 .unwrap_or((img.width(), img.height())),
-        ) {
+        );
+        cache_encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
+        match encoded {
             Some((webp_data, w, h)) => {
-                let encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
-                if let Err(e) = cat.save_with_layout_dims(
+                let encode_ms = cache_encode_ms;
+                let cache_save_started = std::time::Instant::now();
+                let save_result = cat.save_with_layout_dims(
                     name,
                     mtime,
                     file_size,
@@ -2939,11 +2992,14 @@ pub fn load_one_cached(
                     source_dims,
                     layout_dims,
                     &webp_data,
-                ) {
+                );
+                cache_save_ms = cache_save_started.elapsed().as_secs_f64() * 1000.0;
+                if let Err(e) = save_result {
                     crate::logger::log(format!("    idx={idx:>4} catalog save: {e}"));
                 } else if let Some(cm) = cache_map {
                     // DB 保存成功 → in-memory cache_map にも反映する。
                     // Evicted → 再ロード時にキャッシュヒットさせるために必要。
+                    let cache_map_started = std::time::Instant::now();
                     if let Ok(mut map) = cm.write() {
                         map.insert(
                             name.to_owned(),
@@ -2956,6 +3012,7 @@ pub fn load_one_cached(
                             },
                         );
                     }
+                    cache_map_ms = cache_map_started.elapsed().as_secs_f64() * 1000.0;
                     // **HarvestOnCancel ROI 計測**: cache_map.insert 完了後に
                     // cancel が立っているか確認する (encode/save 中に flip した
                     // ケースも拾う、Codex round 1 P3-1 対応)。立っていれば「投資回収
@@ -3011,6 +3068,64 @@ pub fn load_one_cached(
         input_seq,
         items_gen,
     });
+
+    if crate::perf::is_enabled() {
+        let total_ms = total_started.elapsed().as_secs_f64() * 1000.0;
+        let phases = ThumbLoadPhases {
+            decode_ms,
+            display_ms,
+            send_display_ms,
+            cache_encode_ms,
+            cache_save_ms,
+            cache_map_ms,
+            render_ms,
+            orientation_ms,
+        };
+        let unaccounted_ms = phases.unaccounted_ms(total_ms);
+        let key = if let Some(page_num) = pdf_page {
+            crate::grid_item::pdf_page_perf_key(path, page_num)
+        } else if let Some(entry_name) = zip_entry {
+            format!("{}::{entry_name}", path.display())
+        } else {
+            path.display().to_string()
+        };
+        // `decode_parts` は `decode_ms` の**内側**の内訳。入れ子であることが読み手に
+        // 分かる形で運び、解析側が他の区間と並べて足してしまわないようにする。
+        let mut decode_parts = serde_json::Map::new();
+        decode_parts.insert(
+            "orientation_ms".into(),
+            serde_json::Value::from(phases.orientation_ms),
+        );
+        if let Some(render_ms) = phases.render_ms {
+            decode_parts.insert("render_ms".into(), serde_json::Value::from(render_ms));
+        }
+        let extras = vec![
+            ("total_ms", serde_json::Value::from(total_ms)),
+            ("decode_ms", serde_json::Value::from(phases.decode_ms)),
+            ("display_ms", serde_json::Value::from(phases.display_ms)),
+            (
+                "send_display_ms",
+                serde_json::Value::from(phases.send_display_ms),
+            ),
+            (
+                "cache_encode_ms",
+                serde_json::Value::from(phases.cache_encode_ms),
+            ),
+            (
+                "cache_save_ms",
+                serde_json::Value::from(phases.cache_save_ms),
+            ),
+            ("cache_map_ms", serde_json::Value::from(phases.cache_map_ms)),
+            ("unaccounted_ms", serde_json::Value::from(unaccounted_ms)),
+            ("decode_parts", serde_json::Value::Object(decode_parts)),
+            ("should_save", serde_json::Value::from(should_save)),
+            ("skip_cache", serde_json::Value::from(skip_cache)),
+            ("pdf_page", serde_json::Value::from(pdf_page)),
+            ("idx", serde_json::Value::from(idx)),
+            ("input_seq", serde_json::Value::from(input_seq)),
+        ];
+        crate::perf::event("thumb", "load_phases", Some(&key), input_seq, &extras);
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -3027,6 +3142,56 @@ mod tests {
     use crate::settings::{CachePolicy, SortOrder};
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[test]
+    fn unmeasured_time_is_all_of_it_when_nothing_was_timed() {
+        assert_eq!(ThumbLoadPhases::default().unaccounted_ms(12.5), 12.5);
+    }
+
+    #[test]
+    fn unmeasured_time_is_what_the_named_phases_left_behind() {
+        let phases = ThumbLoadPhases {
+            decode_ms: 2.0,
+            display_ms: 3.0,
+            cache_encode_ms: 1.0,
+            ..ThumbLoadPhases::default()
+        };
+
+        assert_eq!(phases.unaccounted_ms(10.0), 4.0);
+    }
+
+    /// これが落ちたら、`decode_ms` の内側にある区間が合計へ入っている。
+    /// 二重に引かれると「名前の付いていない時間」が消え、計装そのものが嘘になる。
+    #[test]
+    fn phases_nested_inside_decode_do_not_shrink_the_unmeasured_time() {
+        let outer_only = ThumbLoadPhases {
+            decode_ms: 10.0,
+            display_ms: 4.0,
+            ..ThumbLoadPhases::default()
+        };
+        let with_breakdown = ThumbLoadPhases {
+            render_ms: Some(8.0),
+            orientation_ms: 1.0,
+            ..outer_only
+        };
+
+        assert_eq!(with_breakdown.unaccounted_ms(20.0), 6.0);
+        assert_eq!(
+            with_breakdown.unaccounted_ms(20.0),
+            outer_only.unaccounted_ms(20.0)
+        );
+    }
+
+    #[test]
+    fn unmeasured_time_never_goes_negative() {
+        let phases = ThumbLoadPhases {
+            decode_ms: 3.0,
+            display_ms: 4.0,
+            ..ThumbLoadPhases::default()
+        };
+
+        assert_eq!(phases.unaccounted_ms(5.0), 0.0);
+    }
 
     #[cfg(windows)]
     fn create_dir_link(target: &Path, link: &Path) -> bool {
@@ -3425,6 +3590,7 @@ mod tests {
             0,
             crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
             true,
+            false,
             None,
         );
 
