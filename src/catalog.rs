@@ -92,6 +92,40 @@ pub struct CatalogDb {
     has_layout_dims_columns: bool,
 }
 
+/// journal mode の変更は排他ロックを要求するため、**`busy_timeout` が効かない**。SQLite は
+/// デッドロックを避けるためこの競合を待たず、即 `SQLITE_BUSY` (`database is locked`) を返す。
+///
+/// mode はファイルに永続するので、**必要なのは作成時の 1 回だけ**。それなのに従来は開くたびに
+/// 実行していて、一覧を開いた瞬間にサムネイル worker 12 本が同じ新規カタログへ殺到すると、
+/// 数本が即失敗していた (2026-08-13 の実害: 一覧の 2 枚が記号のまま残った。再要求はされない)。
+///
+/// 既に WAL ならまず何もしない。これで 2 回目以降の open はロックを取りに行かない。変換が要る
+/// ときだけ直列化し、他所で先に変換されていればそれで目的は果たされている。
+fn ensure_wal_journal(conn: &Connection) -> rusqlite::Result<()> {
+    if journal_mode_is_wal(conn)? {
+        return Ok(());
+    }
+    // 同一プロセス内の競合はここで消える。別プロセスとの競合は下の再確認で拾う。
+    static CONVERT: Mutex<()> = Mutex::new(());
+    let _serialized = CONVERT.lock().unwrap_or_else(|error| error.into_inner());
+    if journal_mode_is_wal(conn)? {
+        return Ok(());
+    }
+    match conn.execute_batch("PRAGMA journal_mode=WAL;") {
+        Ok(()) => Ok(()),
+        Err(error) if journal_mode_is_wal(conn).unwrap_or(false) => {
+            let _ = error;
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn journal_mode_is_wal(conn: &Connection) -> rusqlite::Result<bool> {
+    let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    Ok(mode.eq_ignore_ascii_case("wal"))
+}
+
 impl CatalogDb {
     /// cache_dir 配下の適切な場所に DB を開く（なければ作成）。
     /// サブディレクトリも自動作成する。
@@ -101,7 +135,8 @@ impl CatalogDb {
             std::fs::create_dir_all(parent).ok();
         }
         let mut conn = Connection::open(&db_path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        ensure_wal_journal(&conn)?;
+        conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
         init_schema(&conn)?;
         migrate_pdf_layout_dims(&mut conn, folder_path)?;
         Ok(Self {
@@ -1198,6 +1233,36 @@ mod tests {
         let entry = db.load_one("page_0000").unwrap().unwrap();
         assert_eq!(entry.source_dims, Some((273, 416)));
         assert_eq!(entry.layout_dims, Some((468_600, 714_360)));
+    }
+
+    /// 一覧を開いた瞬間、リモートはサムネイル worker 12 本から同じカタログを同時に開く。
+    /// 2026-08-13 の実害はここで、2 要求が `database is locked` で 1.1ms 失敗し、再要求もされず
+    /// 一覧のその 2 枚だけが記号のまま残った。`busy_timeout` は既定 5 秒入っているのに効かない。
+    #[test]
+    fn opening_one_catalog_from_many_threads_at_once_never_reports_it_locked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().to_path_buf();
+        let folder = tmp.path().join("folder");
+        std::fs::create_dir_all(&folder).unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(12));
+        let mut handles = Vec::new();
+        for _ in 0..12 {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let cache_dir = cache_dir.clone();
+            let folder = folder.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                CatalogDb::open(&cache_dir, &folder)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }));
+        }
+        let failures: Vec<String> = handles
+            .into_iter()
+            .filter_map(|handle| handle.join().unwrap().err())
+            .collect();
+        assert!(failures.is_empty(), "{failures:?}");
     }
 
     #[test]

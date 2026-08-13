@@ -14308,9 +14308,8 @@ function updateHud() {
         : "表示中央値 —"
     );
   }
-  lines.push(
-    `error(60s) ${hudState.errors.length}  · ${debugDetails ? "tapで設定" : "tapで隠す"}`
-  );
+  // 押したときの動作は 1 つ (閉じる) なので、案内も 1 つ。詳細記録の有無で変えない。
+  lines.push(`error(60s) ${hudState.errors.length}  · tapで隠す`);
   const header = element("span", "telemetry-hud-header");
   header.append(textElement("span", heading, "telemetry-hud-heading"));
   const prefetch = video ? null : pagePrefetchHudIndicator();
