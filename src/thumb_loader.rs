@@ -329,6 +329,24 @@ impl CacheDecision {
         }
     }
 
+    /// サムネイルを作らない要求のための判定。**成果物がサムネイルではない**呼び出し元
+    /// (= リモートのフルページ描画) が使う。
+    ///
+    /// フルページ要求でこれを使わないと、読み手が待っている間に 46 MP のラスタから
+    /// サムネイルを作り直すことになる。実測 269ms で、読み手はその成果物を受け取らない
+    /// (一覧のサムネイル要求では同じ処理が 3.6ms — 小さいラスタから作るため)。
+    /// 一覧用のサムネイルは、一覧が要求したときに従来どおり生成される。
+    pub fn without_thumbnail() -> Self {
+        Self {
+            policy: crate::settings::CachePolicy::Off,
+            threshold_ms: 0,
+            size_threshold: 0,
+            webp_always: false,
+            pdf_always: false,
+            zip_always: false,
+        }
+    }
+
     /// 指定画像をキャッシュに保存すべきか判定する。
     ///
     /// - `Always`: 常に true

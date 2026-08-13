@@ -451,6 +451,26 @@ fn lock_with_remote_page_wait<'a, T>(
     guard
 }
 
+/// フルページ要求の成果物はページであってサムネイルではない。
+///
+/// ローダーは表示用画像をチャネルへ送った後もサムネイルの生成を続け、その間この呼び出しは
+/// 戻ってこない (チャネルを drain するのは呼び出しが返ってから) ため、**読み手は自分が
+/// 受け取らない成果物の完成を待たされる**。実測 269ms / ページ、42/42 の要求が該当した。
+///
+/// **本体のフルスクリーンは同じ待ちを持たない** — `render_page_for_display` を直接呼び、
+/// 永続キャッシュを通らないため (`app.rs` の「フルスクリーンは fs_cache (memory) のみ」)。
+/// リモートも成果物を一致させる。一覧のサムネイルは一覧が要求したときに従来どおり作られる。
+fn remote_page_cache_decision(
+    full_page: bool,
+    settings: &crate::settings::Settings,
+) -> crate::thumb_loader::CacheDecision {
+    if full_page {
+        crate::thumb_loader::CacheDecision::without_thumbnail()
+    } else {
+        crate::thumb_loader::CacheDecision::from_settings(settings)
+    }
+}
+
 fn remote_page_perf_key(address: &RemoteAddress) -> String {
     match &address.subresource {
         RemoteSubresource::File => address.path.clone(),
@@ -4330,6 +4350,7 @@ impl ContainerEngine {
             .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         let keep_start = Arc::new(AtomicUsize::new(0));
         let keep_end = Arc::new(AtomicUsize::new(usize::MAX));
+        let cache_decision = remote_page_cache_decision(full_page, &self.settings);
         let load_request_started = Instant::now();
         crate::thumb_loader::process_load_request(
             &request,
@@ -4339,7 +4360,7 @@ impl ContainerEngine {
             self.settings.thumb_px,
             self.settings.thumb_quality,
             target_px,
-            crate::thumb_loader::CacheDecision::from_settings(&self.settings),
+            cache_decision,
             &done,
             &self.stats,
             Some(&cancel),
@@ -5691,6 +5712,30 @@ mod tests {
                 "resolve", "source", "compose", "trim", "resize", "jpeg", "total",
             ]
         );
+    }
+
+    #[test]
+    fn a_full_page_request_does_not_stop_to_make_a_thumbnail() {
+        let mut settings = crate::settings::Settings::default();
+        settings.cache_policy = crate::settings::CachePolicy::Always;
+        settings.cache_pdf_always = true;
+        let page = Path::new("book.pdf");
+
+        let decision = remote_page_cache_decision(true, &settings);
+
+        // 設定が「常に保存」でも、PDF の無条件保存に当たっても、遅くても、大きくても保存しない。
+        assert!(!decision.should_cache(page, 40 * 1024 * 1024, 5_000.0, 5_000.0));
+    }
+
+    #[test]
+    fn a_thumbnail_request_still_follows_the_settings() {
+        let mut settings = crate::settings::Settings::default();
+        settings.cache_policy = crate::settings::CachePolicy::Always;
+        let page = Path::new("book.pdf");
+
+        let decision = remote_page_cache_decision(false, &settings);
+
+        assert!(decision.should_cache(page, 1, 0.0, 0.0));
     }
 
     #[test]
