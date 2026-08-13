@@ -13158,6 +13158,14 @@ impl App {
                             }
                             if let Some(request) = overflow_request {
                                 self.fs_overflow_panel_state = match request {
+                                    // 見開き / フィットのボタンと同じくトグルにする。
+                                    // 開いている状態で押しても何も起きないと、押し方が
+                                    // 分からない (利用者報告 2026-08-13)。
+                                    FsOverflowOpenRequest::Root
+                                        if self.fs_overflow_panel_state.is_open() =>
+                                    {
+                                        FsOverflowPanelState::Closed
+                                    }
                                     FsOverflowOpenRequest::Root => FsOverflowPanelState::Root,
                                 };
                                 ctx.request_repaint();
@@ -18018,6 +18026,16 @@ impl App {
     /// 360 度ビューのタップがページを送っていた (利用者報告 2026-08-13、ログで確定)。
     ///
     /// ローカル変数を使い回すと定義順に縛られるので、`self` から直接求める。
+    /// 「…」を押したときの状態遷移。トグルであることをテストから縛るために切り出す。
+    #[cfg(test)]
+    pub(crate) fn apply_fs_overflow_open_request_for_test(&mut self) {
+        self.fs_overflow_panel_state = if self.fs_overflow_panel_state.is_open() {
+            FsOverflowPanelState::Closed
+        } else {
+            FsOverflowPanelState::Root
+        };
+    }
+
     pub(crate) fn fs_touch_tap_zones_enabled(&self) -> bool {
         still_touch_tap_zones_enabled(
             self.fullscreen_idx
@@ -27768,7 +27786,10 @@ impl App {
                     p.preview_scale
                 ),
                 upload,
-                crate::app::DISPLAY_IMAGE_TEXTURE_OPTIONS,
+                // 注釈の焼き込みは同期経路 (`ensure_comic_composite_texture`) と
+                // この worker 完了経路の**2 つ**が上げる。片方だけ直したせいで、
+                // ニアレストが効かない症状が残った (利用者報告 2026-08-13)。
+                self.display_texture_options(i),
             );
             let upload_ms = t_up.elapsed().as_secs_f64() * 1000.0;
             if crate::perf::is_enabled() {

@@ -49785,3 +49785,21 @@ fn every_display_texture_asks_one_place_which_sampler_to_use() {
         "a bypassed post filter cannot ask for its sampler"
     );
 }
+
+/// 「…」は見開き / フィットのボタンと同じくトグル。開いている状態で押したら閉じる。
+/// 反応が無いと、利用者からは押し方が分からない (利用者報告 2026-08-13)。
+#[test]
+fn the_overflow_button_closes_the_panel_it_opened() {
+    let mut app = phase_c_support::setup_app();
+    assert!(!app.fs_overflow_panel_state.is_open());
+
+    app.apply_fs_overflow_open_request_for_test();
+    assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Root);
+
+    app.apply_fs_overflow_open_request_for_test();
+    assert_eq!(
+        app.fs_overflow_panel_state,
+        FsOverflowPanelState::Closed,
+        "a second press must close it"
+    );
+}
