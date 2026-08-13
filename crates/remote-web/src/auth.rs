@@ -10,6 +10,8 @@ use subtle::ConstantTimeEq;
 pub const COOKIE_NAME: &str = "miv_remote_session";
 const TOKEN_BYTES: usize = 32;
 const TOKEN_HEX_LEN: usize = TOKEN_BYTES * 2;
+const SESSION_NONCE_BYTES: usize = 16;
+const SESSION_NONCE_HEX_LEN: usize = SESSION_NONCE_BYTES * 2;
 const LOCKOUT_THRESHOLD: u32 = 5;
 const FIRST_LOCKOUT: Duration = Duration::from_secs(30);
 const MAX_LOCKOUT_EXPONENT: u32 = 10;
@@ -234,7 +236,11 @@ impl AuthService {
             .map_or(Duration::ZERO, |until| until.duration_since(now))
     }
 
-    pub fn issue_session_cookie(&self, remember: bool, secure: bool) -> SessionCookie {
+    pub fn issue_session_cookie(
+        &self,
+        remember: bool,
+        secure: bool,
+    ) -> Result<SessionCookie, getrandom::Error> {
         self.issue_session_cookie_at(unix_seconds(), remember, secure)
     }
 
@@ -254,9 +260,21 @@ impl AuthService {
         now_unix: u64,
         remember: bool,
         secure: bool,
-    ) -> SessionCookie {
+    ) -> Result<SessionCookie, getrandom::Error> {
+        self.issue_session_cookie_at_with_nonce_source(now_unix, remember, secure, getrandom::fill)
+    }
+
+    fn issue_session_cookie_at_with_nonce_source<E>(
+        &self,
+        now_unix: u64,
+        remember: bool,
+        secure: bool,
+        fill_nonce: impl FnOnce(&mut [u8]) -> Result<(), E>,
+    ) -> Result<SessionCookie, E> {
+        let mut nonce = [0_u8; SESSION_NONCE_BYTES];
+        fill_nonce(&mut nonce)?;
         let expires = now_unix.saturating_add(SESSION_MAX_AGE_SECONDS);
-        let message = format!("v1.{expires}");
+        let message = format!("v2.{expires}.{}", encode_hex(&nonce));
         let mut mac =
             HmacSha256::new_from_slice(&self.session_secret).expect("HMAC accepts a 256-bit key");
         mac.update(message.as_bytes());
@@ -268,10 +286,10 @@ impl AuthService {
         if secure {
             header.push_str("; Secure");
         }
-        SessionCookie {
+        Ok(SessionCookie {
             header,
             sensitive_value: value,
-        }
+        })
     }
 
     fn session_matches(&self, candidate: &str, now_unix: u64) -> bool {
@@ -282,25 +300,42 @@ impl AuthService {
         let Some(expires_text) = parts.next() else {
             return false;
         };
+        let Some(nonce_text) = parts.next() else {
+            return false;
+        };
         let Some(mac_text) = parts.next() else {
             return false;
         };
-        if parts.next().is_some() || version != "v1" {
+        // Remote browsing has not shipped yet, so v1 cookies are rejected outright instead of
+        // retaining a migration reader for a format no released client needs.
+        if parts.next().is_some() || version != "v2" {
             return false;
         }
         let Ok(expires) = expires_text.parse::<u64>() else {
             return false;
         };
+        if nonce_text.len() != SESSION_NONCE_HEX_LEN {
+            return false;
+        }
+        let Ok(nonce) = decode_hex(nonce_text) else {
+            return false;
+        };
+        if nonce.len() != SESSION_NONCE_BYTES {
+            return false;
+        }
         if expires < now_unix {
             return false;
         }
         let Ok(candidate_mac) = decode_hex(mac_text) else {
             return false;
         };
+        if candidate_mac.len() != TOKEN_BYTES {
+            return false;
+        }
         let Ok(mut mac) = HmacSha256::new_from_slice(&self.session_secret) else {
             return false;
         };
-        mac.update(format!("v1.{expires}").as_bytes());
+        mac.update(format!("v2.{expires}.{nonce_text}").as_bytes());
         mac.verify_slice(&candidate_mac).is_ok()
     }
 }
@@ -383,6 +418,30 @@ mod tests {
         AuthService::new(record, AuthToken::from_printable_for_test(TEST_TOKEN)).unwrap()
     }
 
+    fn cookie_identity(
+        auth: &AuthService,
+        cookie: &SessionCookie,
+        now_unix: u64,
+    ) -> AuthSessionIdentity {
+        let header = format!("{COOKIE_NAME}={}", cookie.sensitive_value);
+        match auth.authorize_at(
+            AuthInput {
+                cookie: Some(&header),
+                ..AuthInput::default()
+            },
+            now_unix,
+        ) {
+            AuthDecision::Authorized(AuthSource::SessionCookie(identity)) => identity,
+            decision => panic!("expected session cookie authorization, got {decision:?}"),
+        }
+    }
+
+    fn signed_cookie_value(auth: &AuthService, message: &str) -> String {
+        let mut mac = HmacSha256::new_from_slice(&auth.session_secret).unwrap();
+        mac.update(message.as_bytes());
+        format!("{message}.{}", encode_hex(&mac.finalize().into_bytes()))
+    }
+
     #[test]
     fn fifth_failure_locks_and_lockout_expires() {
         let auth = service("123456");
@@ -431,7 +490,7 @@ mod tests {
             ),
             AuthDecision::Authorized(AuthSource::Bearer)
         );
-        let issued = auth.issue_session_cookie_at(10, true, false);
+        let issued = auth.issue_session_cookie_at(10, true, false).unwrap();
         assert!(issued.header.contains("Max-Age=7776000"));
         assert!(!issued.header.contains("Secure"));
         let cookie = format!("{COOKIE_NAME}={}", issued.sensitive_value);
@@ -458,9 +517,98 @@ mod tests {
     }
 
     #[test]
+    fn same_second_session_cookies_have_distinct_values_and_identities() {
+        let auth = service("123456");
+        let first = auth.issue_session_cookie_at(10, true, false).unwrap();
+        let second = auth.issue_session_cookie_at(10, true, false).unwrap();
+
+        assert_ne!(first.sensitive_value, second.sensitive_value);
+        assert_ne!(
+            cookie_identity(&auth, &first, 10),
+            cookie_identity(&auth, &second, 10)
+        );
+        for issued in [&first, &second] {
+            let parts = issued.sensitive_value.split('.').collect::<Vec<_>>();
+            assert_eq!(parts.len(), 4);
+            assert_eq!(parts[0], "v2");
+            assert_eq!(parts[2].len(), SESSION_NONCE_HEX_LEN);
+            assert!(parts[2].bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
+    fn remember_modes_do_not_share_session_cookie_identity() {
+        let auth = service("123456");
+        let remembered = auth.issue_session_cookie_at(10, true, false).unwrap();
+        let session_only = auth.issue_session_cookie_at(10, false, false).unwrap();
+
+        assert_ne!(
+            cookie_identity(&auth, &remembered, 10),
+            cookie_identity(&auth, &session_only, 10)
+        );
+    }
+
+    #[test]
+    fn v1_session_cookie_is_rejected_without_a_migration_reader() {
+        let auth = service("123456");
+        let expires = 10 + SESSION_MAX_AGE_SECONDS;
+        let value = signed_cookie_value(&auth, &format!("v1.{expires}"));
+        let header = format!("{COOKIE_NAME}={value}");
+
+        assert_eq!(
+            auth.authorize_at(
+                AuthInput {
+                    cookie: Some(&header),
+                    ..AuthInput::default()
+                },
+                10,
+            ),
+            AuthDecision::Unauthorized
+        );
+    }
+
+    #[test]
+    fn malformed_v2_nonce_and_component_counts_are_rejected_even_with_valid_macs() {
+        let auth = service("123456");
+        let expires = 10 + SESSION_MAX_AGE_SECONDS;
+        let nonce = "ab".repeat(SESSION_NONCE_BYTES);
+        let messages = [
+            format!("v2.{expires}.{}", "a".repeat(SESSION_NONCE_HEX_LEN - 1)),
+            format!("v2.{expires}.{}", "g".repeat(SESSION_NONCE_HEX_LEN)),
+            format!("v2.{expires}.{nonce}.extra"),
+            format!("v2.{expires}"),
+        ];
+
+        for message in messages {
+            let value = signed_cookie_value(&auth, &message);
+            let header = format!("{COOKIE_NAME}={value}");
+            assert_eq!(
+                auth.authorize_at(
+                    AuthInput {
+                        cookie: Some(&header),
+                        ..AuthInput::default()
+                    },
+                    10,
+                ),
+                AuthDecision::Unauthorized,
+                "accepted malformed cookie message {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn nonce_generation_failure_does_not_issue_a_cookie() {
+        let auth = service("123456");
+        let result = auth.issue_session_cookie_at_with_nonce_source(10, true, false, |_| {
+            Err::<(), _>("rng unavailable")
+        });
+        assert!(matches!(result, Err("rng unavailable")));
+    }
+
+    #[test]
     fn session_cookie_respects_remember_and_secure_flags() {
         let auth = service("123456");
-        let session_only = auth.issue_session_cookie_at(10, false, true);
+        let session_only = auth.issue_session_cookie_at(10, false, true).unwrap();
         assert!(!session_only.header.contains("Max-Age"));
         assert!(session_only.header.contains("; Secure"));
     }
@@ -469,7 +617,7 @@ mod tests {
     fn deletion_cookie_matches_the_issued_scope_and_transport_attributes() {
         let auth = service("123456");
         for secure in [false, true] {
-            let issued = auth.issue_session_cookie_at(10, true, secure);
+            let issued = auth.issue_session_cookie_at(10, true, secure).unwrap();
             let deleted = auth.clear_session_cookie(secure);
             for attribute in ["Path=/", "HttpOnly", "SameSite=Lax"] {
                 assert!(issued.header.contains(attribute));
@@ -491,7 +639,7 @@ mod tests {
             AuthToken::from_printable_for_test(TEST_TOKEN),
         )
         .unwrap();
-        let old = before.issue_session_cookie_at(10, true, false);
+        let old = before.issue_session_cookie_at(10, true, false).unwrap();
 
         mimageviewer_ipc::rotate_session_secret_file(&path).unwrap();
         let after = AuthService::new(
@@ -516,7 +664,7 @@ mod tests {
     #[test]
     fn malformed_authorization_does_not_fall_back_to_cookie() {
         let auth = service("123456");
-        let issued = auth.issue_session_cookie_at(10, true, false);
+        let issued = auth.issue_session_cookie_at(10, true, false).unwrap();
         let cookie = format!("{COOKIE_NAME}={}", issued.sensitive_value);
         assert_eq!(
             auth.authorize_at(

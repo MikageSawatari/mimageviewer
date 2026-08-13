@@ -2432,7 +2432,25 @@ fn api_auth_pin(request: &mut Request, state: &AppState) -> HttpResponse {
     let secure = request_is_https(request);
     match state.auth.verify_pin(&input.pin) {
         PinVerification::Success => {
-            let cookie = state.auth.issue_session_cookie(input.remember, secure);
+            let cookie = match state.auth.issue_session_cookie(input.remember, secure) {
+                Ok(cookie) => cookie,
+                Err(error) => {
+                    return HttpResponse::bytes(
+                        500,
+                        "application/json; charset=utf-8",
+                        serde_json::to_vec(&json!({"authenticated": false})).unwrap_or_default(),
+                    )
+                    .with_header("Cache-Control", "no-store")
+                    .with_log_details(json!({
+                        "pin_auth": {
+                            "success": false,
+                            "reason": "session_nonce_generation_failed",
+                            "error": error.to_string(),
+                        }
+                    }))
+                    .with_sensitive_value(input.pin);
+                }
+            };
             HttpResponse::json(&json!({"authenticated": true}))
                 .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
                 .with_header("Set-Cookie", cookie.header)
@@ -4504,7 +4522,7 @@ mod tests {
     }
 
     fn cookie_header(state: &AppState) -> Header {
-        let cookie = state.auth.issue_session_cookie(true, false);
+        let cookie = state.auth.issue_session_cookie(true, false).unwrap();
         Header::from_bytes(
             "Cookie",
             format!("{COOKIE_NAME}={}", cookie.sensitive_value).as_bytes(),
@@ -5497,6 +5515,79 @@ mod tests {
     }
 
     #[test]
+    fn simultaneous_cookie_logins_keep_client_and_session_owners_separate() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let cookie_a = cookie_header(&state);
+        let cookie_b = cookie_header(&state);
+        assert_ne!(cookie_a.value.as_str(), cookie_b.value.as_str());
+
+        let request_a: Request = TestRequest::new()
+            .with_method(Method::Post)
+            .with_path("/api/session/acquire")
+            .with_header(cookie_a.clone())
+            .with_header(Header::from_bytes("X-mIV-Remote-Client", "browser-client-a").unwrap())
+            .into();
+        let auth_a = state.auth.authorize(AuthInput {
+            authorization: header_value(&request_a, "Authorization"),
+            cookie: header_value(&request_a, "Cookie"),
+        });
+        assert_eq!(
+            state.remote_client_identities.resolve(&request_a, auth_a),
+            "browser-client-a"
+        );
+        let owner_a = RemoteSessionIdentity {
+            client_id: "browser-client-a".to_owned(),
+            session_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        };
+        state
+            .remote_client_identities
+            .bind_session(auth_a, &owner_a);
+
+        let request_b: Request = TestRequest::new()
+            .with_method(Method::Post)
+            .with_path("/api/session/acquire")
+            .with_header(cookie_b.clone())
+            .with_header(Header::from_bytes("X-mIV-Remote-Client", "browser-client-b").unwrap())
+            .into();
+        let auth_b = state.auth.authorize(AuthInput {
+            authorization: header_value(&request_b, "Authorization"),
+            cookie: header_value(&request_b, "Cookie"),
+        });
+        assert_eq!(
+            state.remote_client_identities.resolve(&request_b, auth_b),
+            "browser-client-b"
+        );
+        let owner_b = RemoteSessionIdentity {
+            client_id: "browser-client-b".to_owned(),
+            session_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+        };
+        state
+            .remote_client_identities
+            .bind_session(auth_b, &owner_b);
+
+        for (cookie, expected_owner) in [(cookie_a, owner_a), (cookie_b, owner_b)] {
+            let request: Request = TestRequest::new()
+                .with_method(Method::Get)
+                .with_path("/api/state")
+                .with_header(cookie)
+                .into();
+            let auth = state.auth.authorize(AuthInput {
+                authorization: header_value(&request, "Authorization"),
+                cookie: header_value(&request, "Cookie"),
+            });
+            let client_id = state.remote_client_identities.resolve(&request, auth);
+            assert_eq!(client_id, expected_owner.client_id);
+            assert_eq!(
+                state
+                    .remote_client_identities
+                    .resolve_session(&request, auth, &client_id),
+                Some(expected_owner)
+            );
+        }
+    }
+
+    #[test]
     fn authenticated_dynamic_request_without_acquisition_is_rejected() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_state(&temp);
@@ -6173,7 +6264,7 @@ mod tests {
         for secure in [false, true] {
             let temp = tempfile::tempdir().unwrap();
             let state = test_state(&temp);
-            let issued = state.auth.issue_session_cookie(true, secure);
+            let issued = state.auth.issue_session_cookie(true, secure).unwrap();
             let mut request = TestRequest::new()
                 .with_method(Method::Post)
                 .with_path("/api/auth/logout")
