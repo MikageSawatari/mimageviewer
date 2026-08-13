@@ -9,7 +9,66 @@
 - 開始時から存在した `src/pdf_loader.rs` の変更と `docs/briefs/` の未追跡ファイル群は、利用者の作業として触れていない
 - レビュー中に別作業の `docs/ui-responsiveness.md` / `docs/web-remote-plan.md` への追記が現れたため、これらも触れていない
 
-## 0. 再レビュー（2026-08-13、HEAD `c3316390`）
+## 0. 再々レビュー（2026-08-13、HEAD `c4af0192`）
+
+### 判定
+
+前回追加した RR-R1 / RR-R2 の修正 (`d557b966`, `cd234136`) と、その後の master merge
+(`60f0236e`) を再確認した。**RR-R1 / RR-R2 は解消しており、今回確認した修正範囲に新しい
+actionable finding はない。** 元の RR-01〜RR-10 も前回の解消判定を維持する。
+
+既知の表示速度 / 先読みキュー管理、dependency advisory scan、実 Tailscale / SMB / Android の
+動的確認はこの判定に含めない。それらを別の release gate として完了させる前提では、今回の
+レビュー指摘を理由にリリースを保留する必要はない。
+
+### RR-R1 の再確認
+
+- logout 完了 receiver は `RemoteConnectionDialogState` ではなく、それより長寿命の
+  `RemoteSessionUiState` が所有する (`src/remote_ipc/ui.rs:34-48`)。
+- `show_remote_connection_dialog` はダイアログ有無の判定より前に毎フレーム receiver を poll し、
+  `Running` 中はダイアログを閉じていても 50 ms 後の repaint を予約する
+  (`src/remote_ipc/ui.rs:2552-2591`)。この関数自体も app update から常時呼ばれる
+  (`src/app.rs:65284-65285`)。
+- 成功遷移だけが `disconnect_local = true` を 1 回返し、成功後の dialog close は drain を
+  再発行しない。確認中 / 実行中 / 成功 / 失敗の close 規則も typed transition に揃っている
+  (`src/remote_ipc/ui.rs:113-160`, `:222-245`)。
+- close 後成功、ダイアログ表示中成功、失敗、4 状態の close table に回帰テストがある
+  (`src/remote_ipc/ui.rs:3896-4004`)。
+
+したがって、署名鍵 rotate を開始した後で設定画面を閉じても、成功時の本体 session drain は
+ダイアログの寿命に依存せず完了する。
+
+### RR-R2 の再確認
+
+- Cookie は `v2.{expires}.{nonce}.{mac}` となり、login ごとに OS CSPRNG から 16 byte の nonce を
+ 生成して、version / expires / nonce 全体を HMAC-SHA256 の対象にする
+  (`crates/remote-web/src/auth.rs:239-293`)。
+- reader は部品数、v2、expires、nonce の 32 hex 文字、MAC の 32 byte を検証してから MAC を
+  照合し、v1 は明示的に拒否する (`crates/remote-web/src/auth.rs:295-340`)。
+- RNG 失敗時は Cookie を発行せず HTTP 500 とし、nonce 無しへ fallback しない
+  (`crates/remote-web/src/http.rs:2433-2452`)。
+- 同じ秒の2発行、remember mode 違い、v1 / malformed v2、RNG failure、2 Cookie 間の
+  client id / session id 分離をテストしている
+  (`crates/remote-web/src/auth.rs:519-606`, `crates/remote-web/src/http.rs:5517-5588`)。
+
+これにより、同じ秒に PIN 認証した別端末が同じ `AuthSessionIdentity` へ衝突する経路は閉じている。
+リモート閲覧は未出荷のため v1 を移行対象にしない判断とも整合する。
+
+### 再々レビューで実行した確認
+
+- `node --test crates/remote-web/web/*.test.mjs`: **365 passed**
+- `cargo test -p mimageviewer-remote`: **131 passed / 1 ignored**
+  - ignored は管理 test sandbox が local named pipe を拒否する既知の test
+- `cargo test -p mimageviewer-ipc`: **35 passed**
+- `cargo test -p mimageviewer --lib remote_ipc`: **245 passed**
+- `cargo fmt --all -- --check`: pass
+- `cargo check -p mimageviewer --bin mimageviewer-core`: pass（既存 dead-code warning 8 件）
+
+今回、通常 profile / portable smoke のアプリは起動していない。HANDOFF には修正後の新 Cookie login と
+dialog close 後の操作権返却を実機確認済みと記録されているが、本節の判定ではその実機操作を再実施して
+いない。
+
+## 0.1 前回の再レビュー（2026-08-13、HEAD `c3316390`）
 
 ### 判定
 
@@ -512,7 +571,7 @@ cargo test -p mimageviewer --lib remote_ipc
 - [x] RR-06: 全 HTTP response が frame embedding を拒否する
 - [x] RR-07: Tailscale 到達性の説明が node sharing / ACL を含めて正確である
 - [x] RR-08〜10: 検索範囲、補正 subset、ブラウザ検証状況を両マニュアルへ反映する
-- [ ] RR-R1: 全端末 logout の完了を dialog close で失わず、本体 session を必ず drain する
-- [ ] RR-R2: 同時発行 Cookie に nonce を持たせ、端末/session identity を分離する
+- [x] RR-R1: 全端末 logout の完了を dialog close で失わず、本体 session を必ず drain する
+- [x] RR-R2: 同時発行 Cookie に nonce を持たせ、端末/session identity を分離する
 - [ ] dependency advisory scan を release gate で実行する
 - [ ] disposable portable smoke と、必要な実端末 smoke を別途完了する

@@ -99,6 +99,18 @@
 
 **次は出荷前レビューの再取得** — 基準 commit は `0af8f6d3` (= RR-R1/R2 + master 取り込み後)。
 
+### RR-R1 / RR-R2 再レビュー完了（2026-08-13、`c4af0192`）
+
+- ✅ RR-R1: dialog 外所有、close 後 poll / repaint、成功時ちょうど 1 回の local drain、
+  close 4 状態の回帰テストを再確認。追加 finding なし
+- ✅ RR-R2: v2 nonce の生成・署名・構文検証、RNG failure の fail-closed、v1 拒否、
+  Cookie ごとの client / session 分離テストを再確認。追加 finding なし
+- ✅ 再実行: JS 365、remote-web 131 (+ ignored 1)、IPC 35、Core remote IPC 245、
+  `cargo fmt --check`、Core `cargo check`
+
+元の RR-01〜RR-10 を含め、レビュー指摘はすべて closed。既知の先読み性能調査と、release gate の
+dependency advisory scan / 実 Tailscale・SMB・Android 確認は別管理のまま。
+
 ### 実機 (iPad) で出た 3 件も対応済み (2026-08-13)
 
 **6 万件のサブ展開が問題なく開き、スクロールも滑らか**であることを実機で確認済み。
