@@ -7730,6 +7730,7 @@ export const VIEWER_PANEL_TABS = Object.freeze([
   Object.freeze({ id: "bookmarks", label: "ブックマーク" }),
 ]);
 
+// This is a complexity budget for each menu page, not a layout capacity.
 export const VIEWER_MENU_MAX_ACTIONS = 12;
 
 function remoteAddressLooksValid(address) {

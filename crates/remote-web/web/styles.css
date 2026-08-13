@@ -2625,7 +2625,10 @@ select {
 }
 
 .viewer-command-menu-layer[data-orientation="landscape"] .command-menu-actions {
-  grid-template-columns: 1fr;
+  grid-template-columns: repeat(
+    auto-fit,
+    minmax(clamp(118px, 14vw, 192px), 1fr)
+  );
 }
 
 @media (prefers-reduced-motion: reduce) {
