@@ -1,8 +1,10 @@
+#[cfg(debug_assertions)]
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, mpsc};
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, mpsc};
+use std::time::{Duration, Instant};
 
 use mimageviewer_ipc::{
     ContainerEntry, ContainerEntryKind, ContainerKind, ContainerOpenMode, ContainerPayload,
@@ -471,6 +473,89 @@ fn remote_page_cache_decision(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn decode_remote_source(
+    request: crate::thumb_loader::LoadRequest,
+    cache_map: Arc<RwLock<HashMap<String, crate::catalog::CacheEntry>>>,
+    catalog: Arc<crate::catalog::CatalogDb>,
+    thumb_px: u32,
+    thumb_quality: u8,
+    target_px: u32,
+    cache_decision: crate::thumb_loader::CacheDecision,
+    stats: Arc<Mutex<crate::stats::ThumbStats>>,
+    shared_cancel: &Arc<AtomicBool>,
+    zip_directory: bool,
+) -> Result<RemoteDecodedSource, MediaError> {
+    let (tx, rx) = mpsc::channel();
+    let done = Arc::new(AtomicUsize::new(0));
+    let keep_start = Arc::new(AtomicUsize::new(0));
+    let keep_end = Arc::new(AtomicUsize::new(usize::MAX));
+    let load_request_started = Instant::now();
+    // Remote raw requests never set the folder-pin or page-adjustment fields asserted by
+    // RemoteSourceDecodeIdentity, so those DB handles cannot affect this Source raster.
+    crate::thumb_loader::process_load_request(
+        &request,
+        &cache_map,
+        &tx,
+        Some(&catalog),
+        thumb_px,
+        thumb_quality,
+        target_px,
+        cache_decision,
+        &done,
+        &stats,
+        Some(shared_cancel),
+        &keep_start,
+        &keep_end,
+        None,
+        None,
+        None,
+    );
+    let load_request_ms = load_request_started.elapsed().as_secs_f64() * 1000.0;
+    drop(tx);
+    let drain_started = Instant::now();
+    let mut saw_canceled = false;
+    let loaded = rx.into_iter().find_map(|message| {
+        saw_canceled |= message.canceled;
+        if !message.finalized && !message.canceled {
+            message.image.map(|image| (image, message.source_dims))
+        } else {
+            None
+        }
+    });
+    let drain_ms = drain_started.elapsed().as_secs_f64() * 1000.0;
+    let (color_image, decoded_source_dims) = loaded.ok_or_else(|| {
+        remote_source_decode_error(
+            saw_canceled || shared_cancel.load(Ordering::Acquire),
+            zip_directory,
+        )
+    })?;
+    Ok(RemoteDecodedSource {
+        raster: RemoteSourceRaster {
+            pixels: Arc::new(color_image),
+            decoded_source_dims,
+        },
+        load_request_ms,
+        drain_ms,
+    })
+}
+
+fn remote_source_decode_error(canceled: bool, zip_directory: bool) -> MediaError {
+    if canceled {
+        return RemoteSourceSingleFlight::participant_cancelled_error();
+    }
+    if zip_directory {
+        return media_error(
+            MediaErrorCode::NotFound,
+            "ZIP 内に代表サムネイルが見つかりません",
+        );
+    }
+    media_error(
+        MediaErrorCode::RenderFailed,
+        "mIV 本体でページをレンダリングできませんでした",
+    )
+}
+
 fn remote_page_perf_key(address: &RemoteAddress) -> String {
     match &address.subresource {
         RemoteSubresource::File => address.path.clone(),
@@ -662,6 +747,7 @@ pub(super) struct ContainerEngine {
     creative_lut_cache: Mutex<RemoteCreativeLutCache>,
     page_composite_cache: Mutex<RemoteCompositeCache>,
     auto_trim_bbox_cache: Mutex<RemoteAutoTrimCache>,
+    source_single_flight: Arc<RemoteSourceSingleFlight>,
     remote_ai_native_cache: Mutex<RemoteAiNativeCache>,
     comic_stamp_cache: Mutex<HashMap<String, Option<Arc<comic_core::RgbaOverlay>>>>,
     session: Option<super::session::SessionHandle>,
@@ -893,6 +979,526 @@ struct RemoteAutoTrimCacheKey {
 struct RemoteAutoTrimCacheEntry {
     key: RemoteAutoTrimCacheKey,
     bbox: Option<egui::Rect>,
+}
+
+/// Exact identity of the raw raster produced by the remote Source stage.
+///
+/// Keep this tied to `LoadRequest`, not to the later page-composite or auto-trim identities:
+/// `AutoTrimReference` and `CompositedPageWithAutoTrim` intentionally differ after Source while
+/// producing the same raw raster here.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct RemoteSourceDecodeIdentity {
+    path: PathBuf,
+    mtime: i64,
+    file_size: i64,
+    pdf_page: Option<u32>,
+    zip_entry: Option<String>,
+    zip_dir_prefix: Option<String>,
+    cache_key_override: Option<String>,
+    target_px: u32,
+    full_page: bool,
+}
+
+impl RemoteSourceDecodeIdentity {
+    fn from_load_request(
+        request: &crate::thumb_loader::LoadRequest,
+        target_px: u32,
+        full_page: bool,
+    ) -> Self {
+        debug_assert_eq!(request.skip_cache, full_page);
+        debug_assert!(request.relative_page_provenance.is_none());
+        debug_assert!(request.edit_preview_key.is_none());
+        debug_assert!(!request.edit_preview_validate_container);
+        debug_assert!(request.pinned_page_adjustment_key.is_none());
+        debug_assert_eq!(request.folder_thumb_depth, 0);
+        debug_assert!(request.resolve_override.is_none());
+        debug_assert!(request.pinned_only.is_none());
+        debug_assert!(!request.force_cache);
+        debug_assert_eq!(request.input_seq, 0);
+        debug_assert_eq!(request.items_gen, 0);
+        debug_assert_eq!(request.context_epoch, 0);
+        // `resolve_override` being None is not on its own what keeps the folder-representative
+        // branch out of reach: `process_load_request` also enters it when `cache_key_override`
+        // starts with `CACHE_KEY_FOLDER`. That branch is the only reader of `folder_thumb_sort`
+        // (omitted from this identity) and of the pin DB (passed as None by `decode_remote_source`),
+        // so a future remote folder thumbnail would silently break both. Fail loudly instead.
+        debug_assert!(
+            !request
+                .cache_key_override
+                .as_deref()
+                .is_some_and(|key| key.starts_with(crate::thumb_loader::CACHE_KEY_FOLDER))
+        );
+
+        // Included below: every varying LoadRequest field that can select or decode different
+        // bytes in this remote path. The omitted fields are deliberately non-identities:
+        // - idx routes ThumbMsg; input_seq only correlates perf events; items_gen only lets the
+        //   UI reject stale ThumbMsg values. None changes pixels.
+        // - priority changes scheduling, never pixels.
+        // - skip_cache is exactly `full_page`, which is included (and also separates Thumbnail's
+        //   cache_decision from full-page requests).
+        // - pdf_password comes from this ContainerEngine's immutable password-store snapshot, so
+        //   it cannot vary for the same path within this coordinator and is not retained as a
+        //   plaintext cache key.
+        // - relative_page_provenance is always None: remote paths were already resolved and
+        //   guarded before this request is assembled.
+        // - edit_preview_key and edit_preview_validate_container are inactive because remote
+        //   Source deliberately loads the raw raster; edits are composed after Source.
+        // - pinned_page_adjustment_key is None for the same reason, and therefore adjustment_db
+        //   cannot affect this raster.
+        // - folder_thumb_depth is zero, resolve_override and pinned_only are None, and force_cache
+        //   is false in this remote path, as asserted above.
+        // - context_epoch is the documented zero sentinel for this background path.
+        // - folder_thumb_sort is populated for ZipDirectory but is only read by the
+        //   folder-representative branch, which this path never enters: it needs either a
+        //   ResolveStrategy override or a CACHE_KEY_FOLDER cache key, and remote Source produces
+        //   neither (its keys are zipthumb:/pdfthumb:/zipdir:). Both are asserted above.
+        Self {
+            path: request.path.clone(),
+            mtime: request.mtime,
+            file_size: request.file_size,
+            pdf_page: request.pdf_page,
+            zip_entry: request.zip_entry.clone(),
+            zip_dir_prefix: request.zip_dir_prefix.clone(),
+            cache_key_override: request.cache_key_override.clone(),
+            target_px,
+            full_page,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RemoteSourceRaster {
+    pixels: Arc<egui::ColorImage>,
+    decoded_source_dims: Option<(u32, u32)>,
+}
+
+#[derive(Debug)]
+struct RemoteDecodedSource {
+    raster: RemoteSourceRaster,
+    load_request_ms: f64,
+    drain_ms: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteSourceLoadOutcome {
+    Decoded,
+    Joined,
+    Handoff,
+}
+
+impl RemoteSourceLoadOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Decoded => "decoded",
+            Self::Joined => "joined",
+            Self::Handoff => "handoff",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RemoteSourceLoad {
+    raster: RemoteSourceRaster,
+    outcome: RemoteSourceLoadOutcome,
+    singleflight_wait_ms: f64,
+    load_request_ms: f64,
+    drain_ms: f64,
+}
+
+enum RemoteSourceEntryStatus {
+    InFlight,
+    Ready(Arc<RemoteDecodedSource>),
+    Broken(MediaError),
+}
+
+struct RemoteSourceEntryState {
+    status: RemoteSourceEntryStatus,
+    participants: usize,
+}
+
+struct RemoteSourceEntry {
+    state: Mutex<RemoteSourceEntryState>,
+    ready: Condvar,
+    shared_cancel: Arc<AtomicBool>,
+}
+
+impl RemoteSourceEntry {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(RemoteSourceEntryState {
+                status: RemoteSourceEntryStatus::InFlight,
+                participants: 1,
+            }),
+            ready: Condvar::new(),
+            shared_cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+struct RemoteSourceParticipant {
+    entry: Arc<RemoteSourceEntry>,
+}
+
+impl Drop for RemoteSourceParticipant {
+    fn drop(&mut self) {
+        let mut state = self
+            .entry
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        debug_assert_ne!(state.participants, 0);
+        state.participants = state.participants.saturating_sub(1);
+        if state.participants == 0 && matches!(state.status, RemoteSourceEntryStatus::InFlight) {
+            self.entry.shared_cancel.store(true, Ordering::Release);
+        }
+    }
+}
+
+struct RemoteSourceHandoff {
+    identity: RemoteSourceDecodeIdentity,
+    raster: RemoteSourceRaster,
+}
+
+#[derive(Default)]
+struct RemoteSourceSingleFlightState {
+    in_flight: HashMap<RemoteSourceDecodeIdentity, Arc<RemoteSourceEntry>>,
+    handoff: Option<RemoteSourceHandoff>,
+}
+
+#[derive(Default)]
+struct RemoteSourceSingleFlight {
+    state: Mutex<RemoteSourceSingleFlightState>,
+    #[cfg(test)]
+    changed: Condvar,
+}
+
+enum RemoteSourceAcquire {
+    Handoff(RemoteSourceRaster),
+    Entry {
+        entry: Arc<RemoteSourceEntry>,
+        owner: bool,
+    },
+}
+
+enum RemoteSourceWait {
+    Ready(Arc<RemoteDecodedSource>),
+    Broken(MediaError),
+    Cancelled,
+}
+
+const REMOTE_SOURCE_CANCEL_POLL: Duration = Duration::from_millis(10);
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static REMOTE_SOURCE_DECODE_OWNER: RefCell<Option<RemoteSourceDecodeIdentity>> = const {
+        RefCell::new(None)
+    };
+}
+
+struct RemoteSourceDecodeOwnerScope;
+
+impl RemoteSourceDecodeOwnerScope {
+    fn enter(identity: RemoteSourceDecodeIdentity) -> Self {
+        #[cfg(debug_assertions)]
+        REMOTE_SOURCE_DECODE_OWNER.with(|owner| {
+            let previous = owner.replace(Some(identity));
+            debug_assert!(previous.is_none());
+        });
+        #[cfg(not(debug_assertions))]
+        let _ = identity;
+        Self
+    }
+}
+
+impl Drop for RemoteSourceDecodeOwnerScope {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        REMOTE_SOURCE_DECODE_OWNER.with(|owner| {
+            owner.replace(None);
+        });
+    }
+}
+
+impl RemoteSourceSingleFlight {
+    fn participant_cancelled_error() -> MediaError {
+        media_error(
+            MediaErrorCode::Busy,
+            "先読みは新しいページ要求に置き換えられました",
+        )
+    }
+
+    fn debug_assert_can_wait(identity: &RemoteSourceDecodeIdentity) {
+        // Source must finish before Trim requests a partner. Otherwise two spread jobs can own
+        // A/B respectively and wait B/A, so reject that structural deadlock in debug builds.
+        #[cfg(debug_assertions)]
+        REMOTE_SOURCE_DECODE_OWNER.with(|owner| {
+            if let Some(owned) = owner.borrow().as_ref() {
+                debug_assert_eq!(owned, identity);
+            }
+        });
+        #[cfg(not(debug_assertions))]
+        let _ = identity;
+    }
+
+    fn acquire(&self, identity: &RemoteSourceDecodeIdentity) -> RemoteSourceAcquire {
+        Self::debug_assert_can_wait(identity);
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state
+            .handoff
+            .as_ref()
+            .is_some_and(|handoff| handoff.identity == *identity)
+        {
+            return RemoteSourceAcquire::Handoff(state.handoff.as_ref().unwrap().raster.clone());
+        }
+        // This is a one-slot hand-off, not a cache. Any different identity releases it now.
+        state.handoff = None;
+        if let Some(entry) = state.in_flight.get(identity).cloned() {
+            let mut entry_state = entry
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            entry_state.participants = entry_state.participants.saturating_add(1);
+            drop(entry_state);
+            #[cfg(test)]
+            self.changed.notify_all();
+            return RemoteSourceAcquire::Entry {
+                entry,
+                owner: false,
+            };
+        }
+        let entry = Arc::new(RemoteSourceEntry::new());
+        state.in_flight.insert(identity.clone(), Arc::clone(&entry));
+        #[cfg(test)]
+        self.changed.notify_all();
+        RemoteSourceAcquire::Entry { entry, owner: true }
+    }
+
+    fn wait_for_entry(
+        entry: &RemoteSourceEntry,
+        participant_cancel: &AtomicBool,
+    ) -> RemoteSourceWait {
+        let mut state = entry
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        loop {
+            if participant_cancel.load(Ordering::Acquire) {
+                return RemoteSourceWait::Cancelled;
+            }
+            match &state.status {
+                RemoteSourceEntryStatus::Ready(decoded) => {
+                    return RemoteSourceWait::Ready(Arc::clone(decoded));
+                }
+                RemoteSourceEntryStatus::Broken(error) => {
+                    return RemoteSourceWait::Broken(error.clone());
+                }
+                RemoteSourceEntryStatus::InFlight => {}
+            }
+            // AtomicBool has no wake primitive. This bounded Condvar wait only observes a
+            // participant cancellation; completion/failure always notifies and never times out.
+            let (next, _) = entry
+                .ready
+                .wait_timeout(state, REMOTE_SOURCE_CANCEL_POLL)
+                .unwrap_or_else(|error| error.into_inner());
+            state = next;
+        }
+    }
+
+    fn finish_decode(
+        &self,
+        identity: RemoteSourceDecodeIdentity,
+        entry: Arc<RemoteSourceEntry>,
+        mut result: Result<RemoteDecodedSource, MediaError>,
+    ) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut entry_state = entry
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let is_current = state
+            .in_flight
+            .get(&identity)
+            .is_some_and(|current| Arc::ptr_eq(current, &entry));
+        if is_current {
+            state.in_flight.remove(&identity);
+        }
+        if entry.shared_cancel.load(Ordering::Acquire) {
+            result = Err(media_error(
+                MediaErrorCode::Busy,
+                "先読みは新しいページ要求に置き換えられました",
+            ));
+        }
+        match result {
+            Ok(decoded) => {
+                let decoded = Arc::new(decoded);
+                if is_current && entry_state.participants != 0 {
+                    state.handoff = Some(RemoteSourceHandoff {
+                        identity,
+                        raster: decoded.raster.clone(),
+                    });
+                }
+                entry_state.status = RemoteSourceEntryStatus::Ready(decoded);
+            }
+            Err(error) => entry_state.status = RemoteSourceEntryStatus::Broken(error),
+        }
+        drop(entry_state);
+        drop(state);
+        entry.ready.notify_all();
+        #[cfg(test)]
+        self.changed.notify_all();
+    }
+
+    fn start_decode<F>(
+        self: &Arc<Self>,
+        identity: RemoteSourceDecodeIdentity,
+        entry: Arc<RemoteSourceEntry>,
+        decode: F,
+    ) where
+        F: FnOnce(&Arc<AtomicBool>) -> Result<RemoteDecodedSource, MediaError> + Send + 'static,
+    {
+        let flight = Arc::clone(self);
+        let worker_identity = identity.clone();
+        let worker_entry = Arc::clone(&entry);
+        let shared_cancel = Arc::clone(&entry.shared_cancel);
+        let spawn = std::thread::Builder::new()
+            .name("remote-source-decode".to_string())
+            .spawn(move || {
+                let _owner = RemoteSourceDecodeOwnerScope::enter(worker_identity.clone());
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    decode(&shared_cancel)
+                }))
+                .unwrap_or_else(|_| {
+                    Err(media_error(
+                        MediaErrorCode::Internal,
+                        "共有デコードが失敗しました",
+                    ))
+                });
+                flight.finish_decode(worker_identity, worker_entry, result);
+            });
+        if spawn.is_err() {
+            self.finish_decode(
+                identity,
+                entry,
+                Err(media_error(
+                    MediaErrorCode::Internal,
+                    "共有デコードを開始できません",
+                )),
+            );
+        }
+    }
+
+    fn completed_load(
+        decoded: &RemoteDecodedSource,
+        outcome: RemoteSourceLoadOutcome,
+        wait_ms: f64,
+    ) -> RemoteSourceLoad {
+        let decoded_here = outcome == RemoteSourceLoadOutcome::Decoded;
+        RemoteSourceLoad {
+            raster: decoded.raster.clone(),
+            outcome,
+            singleflight_wait_ms: wait_ms,
+            load_request_ms: if decoded_here {
+                decoded.load_request_ms
+            } else {
+                0.0
+            },
+            drain_ms: if decoded_here { decoded.drain_ms } else { 0.0 },
+        }
+    }
+
+    fn handoff_load(raster: RemoteSourceRaster, wait_ms: f64) -> RemoteSourceLoad {
+        RemoteSourceLoad {
+            raster,
+            outcome: RemoteSourceLoadOutcome::Handoff,
+            singleflight_wait_ms: wait_ms,
+            load_request_ms: 0.0,
+            drain_ms: 0.0,
+        }
+    }
+
+    fn load<F>(
+        self: &Arc<Self>,
+        identity: RemoteSourceDecodeIdentity,
+        participant_cancel: Arc<AtomicBool>,
+        decode: F,
+    ) -> Result<RemoteSourceLoad, MediaError>
+    where
+        F: FnOnce(&Arc<AtomicBool>) -> Result<RemoteDecodedSource, MediaError> + Send + 'static,
+    {
+        let mut decode = Some(decode);
+        let mut wait_ms = 0.0;
+        loop {
+            if participant_cancel.load(Ordering::Acquire) {
+                return Err(Self::participant_cancelled_error());
+            }
+            match self.acquire(&identity) {
+                RemoteSourceAcquire::Handoff(raster) => {
+                    if participant_cancel.load(Ordering::Acquire) {
+                        return Err(Self::participant_cancelled_error());
+                    }
+                    return Ok(Self::handoff_load(raster, wait_ms));
+                }
+                RemoteSourceAcquire::Entry { entry, owner } => {
+                    if let Some(loaded) = self.wait_for_attempt(
+                        &identity,
+                        entry,
+                        owner,
+                        &participant_cancel,
+                        &mut decode,
+                        &mut wait_ms,
+                    )? {
+                        return Ok(loaded);
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn wait_for_attempt<F>(
+        self: &Arc<Self>,
+        identity: &RemoteSourceDecodeIdentity,
+        entry: Arc<RemoteSourceEntry>,
+        owner: bool,
+        participant_cancel: &Arc<AtomicBool>,
+        decode: &mut Option<F>,
+        wait_ms: &mut f64,
+    ) -> Result<Option<RemoteSourceLoad>, MediaError>
+    where
+        F: FnOnce(&Arc<AtomicBool>) -> Result<RemoteDecodedSource, MediaError> + Send + 'static,
+    {
+        let participant = RemoteSourceParticipant {
+            entry: Arc::clone(&entry),
+        };
+        if owner {
+            let factory = decode.take().unwrap();
+            self.start_decode(identity.clone(), Arc::clone(&entry), factory);
+        }
+        let wait_started = (!owner).then(Instant::now);
+        let waited = Self::wait_for_entry(&entry, participant_cancel);
+        if let Some(started) = wait_started {
+            *wait_ms += started.elapsed().as_secs_f64() * 1000.0;
+        }
+        drop(participant);
+        match waited {
+            RemoteSourceWait::Ready(decoded) => {
+                if participant_cancel.load(Ordering::Acquire) {
+                    return Err(Self::participant_cancelled_error());
+                }
+                let outcome = if owner {
+                    RemoteSourceLoadOutcome::Decoded
+                } else {
+                    RemoteSourceLoadOutcome::Joined
+                };
+                Ok(Some(Self::completed_load(&decoded, outcome, *wait_ms)))
+            }
+            RemoteSourceWait::Broken(error) if owner => Err(error),
+            // The broken entry is removed before wakeup. One waiter retries as owner; the rest
+            // join it, using their still-unconsumed factories and no timeout fallback.
+            RemoteSourceWait::Broken(_) => Ok(None),
+            RemoteSourceWait::Cancelled => Err(Self::participant_cancelled_error()),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -1312,6 +1918,7 @@ impl ContainerEngine {
             creative_lut_cache: Mutex::new(RemoteCreativeLutCache::default()),
             page_composite_cache: Mutex::new(RemoteCompositeCache::default()),
             auto_trim_bbox_cache: Mutex::new(RemoteAutoTrimCache::default()),
+            source_single_flight: Arc::new(RemoteSourceSingleFlight::default()),
             remote_ai_native_cache: Mutex::new(RemoteAiNativeCache::default()),
             comic_stamp_cache: Mutex::new(HashMap::new()),
             session,
@@ -4396,75 +5003,57 @@ impl ContainerEngine {
             .as_ref()
             .and_then(|perf| perf.enter(RemotePageStage::Source));
 
-        let (tx, rx) = mpsc::channel();
-        let done = Arc::new(AtomicUsize::new(0));
         let cancel = external_cancel
             .cloned()
             .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-        let keep_start = Arc::new(AtomicUsize::new(0));
-        let keep_end = Arc::new(AtomicUsize::new(usize::MAX));
+        let source_identity =
+            RemoteSourceDecodeIdentity::from_load_request(&request, target_px, full_page);
+        let pdf_password = request.pdf_password.clone();
         let cache_decision = remote_page_cache_decision(full_page, &self.settings);
-        let load_request_started = Instant::now();
-        crate::thumb_loader::process_load_request(
-            &request,
-            &cache_map,
-            &tx,
-            Some(&catalog),
-            self.settings.thumb_px,
-            self.settings.thumb_quality,
-            target_px,
-            cache_decision,
-            &done,
-            &self.stats,
-            Some(&cancel),
-            &keep_start,
-            &keep_end,
-            context.folder_pin_db.as_ref(),
-            None,
-            context.adjustment_db.as_ref(),
-        );
+        let zip_directory = matches!(address.subresource, RemoteSubresource::ZipDirectory { .. });
+        let stats = Arc::clone(&self.stats);
+        let thumb_px = self.settings.thumb_px;
+        let thumb_quality = self.settings.thumb_quality;
+        let source_load = self.source_single_flight.load(
+            source_identity,
+            Arc::clone(&cancel),
+            move |shared_cancel| {
+                decode_remote_source(
+                    request,
+                    cache_map,
+                    catalog,
+                    thumb_px,
+                    thumb_quality,
+                    target_px,
+                    cache_decision,
+                    stats,
+                    shared_cancel,
+                    zip_directory,
+                )
+            },
+        )?;
+
         if let Some(stage) = source_stage.as_mut() {
-            stage.phase_from("load_request_ms", load_request_started);
-        }
-        drop(tx);
-        let mut saw_canceled = false;
-        let drain_started = Instant::now();
-        let loaded = rx.into_iter().find_map(|message| {
-            saw_canceled |= message.canceled;
-            if !message.finalized && !message.canceled {
-                message.image.map(|image| (image, message.source_dims))
-            } else {
-                None
+            if source_load.load_request_ms > 0.0 {
+                stage.add_phase("load_request_ms", source_load.load_request_ms);
             }
-        });
-        if let Some(stage) = source_stage.as_mut() {
-            stage.phase_from("drain_ms", drain_started);
-        }
-        let image_result = loaded.ok_or_else(|| {
-            if saw_canceled || cancel.load(Ordering::Relaxed) {
-                media_error(
-                    MediaErrorCode::Busy,
-                    "先読みは新しいページ要求に置き換えられました",
-                )
-            } else if matches!(address.subresource, RemoteSubresource::ZipDirectory { .. }) {
-                media_error(
-                    MediaErrorCode::NotFound,
-                    "ZIP 内に代表サムネイルが見つかりません",
-                )
-            } else {
-                media_error(
-                    MediaErrorCode::RenderFailed,
-                    "mIV 本体でページをレンダリングできませんでした",
-                )
+            if source_load.drain_ms > 0.0 {
+                stage.add_phase("drain_ms", source_load.drain_ms);
             }
-        });
-        let (color_image, decoded_source_dims) = image_result?;
+            if source_load.singleflight_wait_ms > 0.0 {
+                stage.add_phase("singleflight_wait_ms", source_load.singleflight_wait_ms);
+            }
+        }
+        let source_outcome = source_load.outcome;
+        let RemoteSourceRaster {
+            pixels: color_image,
+            decoded_source_dims,
+        } = source_load.raster;
         if let Some(stage) = source_stage.as_mut() {
-            stage.finish(RemotePageStageMetrics::buffer(
-                color_image.size[0],
-                color_image.size[1],
-                4,
-            ));
+            stage.finish_with_outcome(
+                RemotePageStageMetrics::buffer(color_image.size[0], color_image.size[1], 4),
+                source_outcome.as_str(),
+            );
         }
         drop(source_stage);
         let mut compose_stage = page_perf
@@ -4481,7 +5070,7 @@ impl ContainerEngine {
                         let analysis_result = crate::pdf_loader::analyze_page_content_type(
                             &resolved.canonical,
                             *page_number,
-                            request.pdf_password.as_deref(),
+                            pdf_password.as_deref(),
                             Some(Arc::clone(&cancel)),
                         );
                         if let Some(stage) = compose_stage.as_mut() {
@@ -4567,7 +5156,21 @@ impl ContainerEngine {
             }
             return result;
         }
-        let mut pixels = Arc::new(color_image);
+        let mut pixels = if prepared_composite.is_some() {
+            match Arc::try_unwrap(color_image) {
+                Ok(pixels) => Arc::new(pixels),
+                Err(shared) => {
+                    let copy_started = Instant::now();
+                    let pixels = Arc::new((*shared).clone());
+                    if let Some(stage) = compose_stage.as_mut() {
+                        stage.phase_from("source_raster_copy_ms", copy_started);
+                    }
+                    pixels
+                }
+            }
+        } else {
+            color_image
+        };
         if let Some(prepared) = prepared_composite {
             let edit_started = Instant::now();
             let materialized_result = self.execute_remote_edits(pixels, prepared.edits, &cancel);
@@ -5630,6 +6233,107 @@ mod tests {
     use crate::settings::FavoriteEntry;
     use std::io::{Cursor, Write};
 
+    fn source_test_identity(
+        name: &str,
+        target_px: u32,
+        full_page: bool,
+    ) -> RemoteSourceDecodeIdentity {
+        RemoteSourceDecodeIdentity {
+            path: PathBuf::from(name),
+            mtime: 10,
+            file_size: 20,
+            pdf_page: None,
+            zip_entry: None,
+            zip_dir_prefix: None,
+            cache_key_override: None,
+            target_px,
+            full_page,
+        }
+    }
+
+    fn source_test_decoded(color: egui::Color32) -> RemoteDecodedSource {
+        RemoteDecodedSource {
+            raster: RemoteSourceRaster {
+                pixels: Arc::new(egui::ColorImage::new([2, 1], vec![color; 2])),
+                decoded_source_dims: Some((2, 1)),
+            },
+            load_request_ms: 1.0,
+            drain_ms: 0.5,
+        }
+    }
+
+    type SourceTestGate = Arc<(Mutex<bool>, Condvar)>;
+
+    fn source_test_gate_wait(gate: &SourceTestGate, cancel: &AtomicBool) -> bool {
+        let (open, ready) = &**gate;
+        let mut open = open.lock().unwrap_or_else(|error| error.into_inner());
+        while !*open && !cancel.load(Ordering::Acquire) {
+            let (next, _) = ready
+                .wait_timeout(open, Duration::from_millis(5))
+                .unwrap_or_else(|error| error.into_inner());
+            open = next;
+        }
+        *open
+    }
+
+    fn source_test_gate_open(gate: &SourceTestGate) {
+        let (open, ready) = &**gate;
+        *open.lock().unwrap_or_else(|error| error.into_inner()) = true;
+        ready.notify_all();
+    }
+
+    fn wait_for_source_participants(
+        flight: &RemoteSourceSingleFlight,
+        identity: &RemoteSourceDecodeIdentity,
+        expected: usize,
+    ) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut state = flight
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        loop {
+            let participants = state
+                .in_flight
+                .get(identity)
+                .map(|entry| {
+                    entry
+                        .state
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .participants
+                })
+                .unwrap_or(0);
+            if participants == expected {
+                return true;
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            let (next, timed) = flight
+                .changed
+                .wait_timeout(state, remaining.min(Duration::from_millis(10)))
+                .unwrap_or_else(|error| error.into_inner());
+            state = next;
+            if timed.timed_out() && Instant::now() >= deadline {
+                return false;
+            }
+        }
+    }
+
+    fn source_shared_cancelled(
+        flight: &RemoteSourceSingleFlight,
+        identity: &RemoteSourceDecodeIdentity,
+    ) -> Option<bool> {
+        flight
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .in_flight
+            .get(identity)
+            .map(|entry| entry.shared_cancel.load(Ordering::Acquire))
+    }
+
     fn test_container_entries(count: usize, path: &str) -> (Vec<ContainerEntry>, bool) {
         let mut budget = ContainerEntryBudget::new(super::super::REMOTE_LIST_RESPONSE_BUDGET_BYTES);
         let mut entries = Vec::with_capacity(count.min(CONTAINER_ENTRY_LIMIT));
@@ -5737,6 +6441,282 @@ mod tests {
                 "resolve", "source", "compose", "trim", "resize", "jpeg", "total",
             ]
         );
+    }
+
+    #[test]
+    fn remote_source_singleflight_decodes_same_identity_once() {
+        let mut request = crate::thumb_loader::LoadRequest {
+            path: PathBuf::from("page.png"),
+            mtime: 10,
+            file_size: 20,
+            skip_cache: true,
+            ..Default::default()
+        };
+        let identity = RemoteSourceDecodeIdentity::from_load_request(
+            &request,
+            4096,
+            RemoteImageLoadKind::AutoTrimReference.full_page(),
+        );
+        request.priority = true;
+        let page_identity = RemoteSourceDecodeIdentity::from_load_request(
+            &request,
+            4096,
+            RemoteImageLoadKind::CompositedPageWithAutoTrim.full_page(),
+        );
+        assert_eq!(identity, page_identity);
+
+        let flight = Arc::new(RemoteSourceSingleFlight::default());
+        let gate: SourceTestGate = Arc::new((Mutex::new(false), Condvar::new()));
+        let decodes = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = mpsc::channel();
+        let first = {
+            let flight = Arc::clone(&flight);
+            let identity = identity.clone();
+            let gate = Arc::clone(&gate);
+            let decodes = Arc::clone(&decodes);
+            std::thread::spawn(move || {
+                flight.load(identity, Arc::new(AtomicBool::new(false)), move |cancel| {
+                    decodes.fetch_add(1, Ordering::AcqRel);
+                    started_tx.send(()).unwrap();
+                    assert!(source_test_gate_wait(&gate, cancel));
+                    Ok(source_test_decoded(egui::Color32::RED))
+                })
+            })
+        };
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let second = {
+            let flight = Arc::clone(&flight);
+            let identity = identity.clone();
+            let gate = Arc::clone(&gate);
+            let decodes = Arc::clone(&decodes);
+            std::thread::spawn(move || {
+                flight.load(identity, Arc::new(AtomicBool::new(false)), move |cancel| {
+                    decodes.fetch_add(1, Ordering::AcqRel);
+                    assert!(source_test_gate_wait(&gate, cancel));
+                    Ok(source_test_decoded(egui::Color32::BLUE))
+                })
+            })
+        };
+        let joined = wait_for_source_participants(&flight, &identity, 2);
+        source_test_gate_open(&gate);
+        let first = first.join().unwrap().unwrap();
+        let second = second.join().unwrap().unwrap();
+        assert!(joined);
+        assert_eq!(decodes.load(Ordering::Acquire), 1);
+        assert!(Arc::ptr_eq(&first.raster.pixels, &second.raster.pixels));
+        assert_eq!(first.outcome, RemoteSourceLoadOutcome::Decoded);
+        assert_eq!(second.outcome, RemoteSourceLoadOutcome::Joined);
+    }
+
+    #[test]
+    fn remote_source_handoff_reuses_sequential_raster() {
+        let flight = Arc::new(RemoteSourceSingleFlight::default());
+        let identity = source_test_identity("page.png", 4096, true);
+        let decodes = Arc::new(AtomicUsize::new(0));
+        let first = {
+            let decodes = Arc::clone(&decodes);
+            flight
+                .load(
+                    identity.clone(),
+                    Arc::new(AtomicBool::new(false)),
+                    move |_| {
+                        decodes.fetch_add(1, Ordering::AcqRel);
+                        Ok(source_test_decoded(egui::Color32::RED))
+                    },
+                )
+                .unwrap()
+        };
+        let second = flight
+            .load(identity, Arc::new(AtomicBool::new(false)), |_| {
+                panic!("handoff must not decode")
+            })
+            .unwrap();
+        assert_eq!(decodes.load(Ordering::Acquire), 1);
+        assert_eq!(second.outcome, RemoteSourceLoadOutcome::Handoff);
+        assert!(Arc::ptr_eq(&first.raster.pixels, &second.raster.pixels));
+    }
+
+    #[test]
+    fn remote_source_target_px_is_part_of_identity() {
+        let flight = Arc::new(RemoteSourceSingleFlight::default());
+        let decodes = Arc::new(AtomicUsize::new(0));
+        for target_px in [1024, 4096] {
+            let decodes = Arc::clone(&decodes);
+            let loaded = flight
+                .load(
+                    source_test_identity("page.png", target_px, true),
+                    Arc::new(AtomicBool::new(false)),
+                    move |_| {
+                        decodes.fetch_add(1, Ordering::AcqRel);
+                        Ok(source_test_decoded(egui::Color32::RED))
+                    },
+                )
+                .unwrap();
+            assert_eq!(loaded.outcome, RemoteSourceLoadOutcome::Decoded);
+        }
+        assert_eq!(decodes.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn remote_source_thumbnail_and_full_page_do_not_share() {
+        let flight = Arc::new(RemoteSourceSingleFlight::default());
+        let decodes = Arc::new(AtomicUsize::new(0));
+        for full_page in [false, true] {
+            let decodes = Arc::clone(&decodes);
+            let loaded = flight
+                .load(
+                    source_test_identity("page.png", 1024, full_page),
+                    Arc::new(AtomicBool::new(false)),
+                    move |_| {
+                        decodes.fetch_add(1, Ordering::AcqRel);
+                        Ok(source_test_decoded(egui::Color32::RED))
+                    },
+                )
+                .unwrap();
+            assert_eq!(loaded.outcome, RemoteSourceLoadOutcome::Decoded);
+        }
+        assert_eq!(decodes.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn remote_source_waiter_retries_after_owner_failure() {
+        let flight = Arc::new(RemoteSourceSingleFlight::default());
+        let identity = source_test_identity("page.png", 4096, true);
+        let gate: SourceTestGate = Arc::new((Mutex::new(false), Condvar::new()));
+        let decodes = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = mpsc::channel();
+        let owner = {
+            let flight = Arc::clone(&flight);
+            let identity = identity.clone();
+            let gate = Arc::clone(&gate);
+            let decodes = Arc::clone(&decodes);
+            std::thread::spawn(move || {
+                flight.load(identity, Arc::new(AtomicBool::new(false)), move |cancel| {
+                    decodes.fetch_add(1, Ordering::AcqRel);
+                    started_tx.send(()).unwrap();
+                    assert!(source_test_gate_wait(&gate, cancel));
+                    Err(media_error(MediaErrorCode::RenderFailed, "owner failed"))
+                })
+            })
+        };
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let waiter = {
+            let flight = Arc::clone(&flight);
+            let identity = identity.clone();
+            let decodes = Arc::clone(&decodes);
+            std::thread::spawn(move || {
+                flight.load(identity, Arc::new(AtomicBool::new(false)), move |_| {
+                    decodes.fetch_add(1, Ordering::AcqRel);
+                    Ok(source_test_decoded(egui::Color32::GREEN))
+                })
+            })
+        };
+        let joined = wait_for_source_participants(&flight, &identity, 2);
+        source_test_gate_open(&gate);
+        let owner_error = owner.join().unwrap().unwrap_err();
+        let waiter = waiter.join().unwrap().unwrap();
+        assert!(joined);
+        assert_eq!(owner_error.code, MediaErrorCode::RenderFailed);
+        assert_eq!(waiter.outcome, RemoteSourceLoadOutcome::Decoded);
+        assert_eq!(decodes.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn remote_source_all_participants_cancel_shared_decode() {
+        let flight = Arc::new(RemoteSourceSingleFlight::default());
+        let identity = source_test_identity("page.png", 4096, true);
+        let owner_cancel = Arc::new(AtomicBool::new(false));
+        let waiter_cancel = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (shared_tx, shared_rx) = mpsc::channel();
+        let owner = {
+            let flight = Arc::clone(&flight);
+            let identity = identity.clone();
+            let cancel = Arc::clone(&owner_cancel);
+            std::thread::spawn(move || {
+                flight.load(identity, cancel, move |shared_cancel| {
+                    started_tx.send(()).unwrap();
+                    while !shared_cancel.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    shared_tx.send(()).unwrap();
+                    Err(RemoteSourceSingleFlight::participant_cancelled_error())
+                })
+            })
+        };
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let waiter = {
+            let flight = Arc::clone(&flight);
+            let identity = identity.clone();
+            let cancel = Arc::clone(&waiter_cancel);
+            std::thread::spawn(move || {
+                flight.load(identity, cancel, |_| {
+                    panic!("cancelled waiter must not decode")
+                })
+            })
+        };
+        let joined = wait_for_source_participants(&flight, &identity, 2);
+        owner_cancel.store(true, Ordering::Release);
+        waiter_cancel.store(true, Ordering::Release);
+        shared_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let owner = owner.join().unwrap();
+        let waiter = waiter.join().unwrap();
+        assert!(joined);
+        assert_eq!(owner.unwrap_err().code, MediaErrorCode::Busy);
+        assert_eq!(waiter.unwrap_err().code, MediaErrorCode::Busy);
+    }
+
+    #[test]
+    fn remote_source_one_participant_cancel_does_not_cancel_remaining_decode() {
+        let flight = Arc::new(RemoteSourceSingleFlight::default());
+        let identity = source_test_identity("page.png", 4096, true);
+        let gate: SourceTestGate = Arc::new((Mutex::new(false), Condvar::new()));
+        let owner_cancel = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = mpsc::channel();
+        let owner = {
+            let flight = Arc::clone(&flight);
+            let identity = identity.clone();
+            let gate = Arc::clone(&gate);
+            let cancel = Arc::clone(&owner_cancel);
+            std::thread::spawn(move || {
+                flight.load(identity, cancel, move |shared_cancel| {
+                    started_tx.send(()).unwrap();
+                    assert!(source_test_gate_wait(&gate, shared_cancel));
+                    Ok(source_test_decoded(egui::Color32::GREEN))
+                })
+            })
+        };
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let waiter = {
+            let flight = Arc::clone(&flight);
+            let identity = identity.clone();
+            std::thread::spawn(move || {
+                flight.load(identity, Arc::new(AtomicBool::new(false)), |_| {
+                    panic!("joined participant must not decode")
+                })
+            })
+        };
+        assert!(wait_for_source_participants(&flight, &identity, 2));
+        owner_cancel.store(true, Ordering::Release);
+        assert!(wait_for_source_participants(&flight, &identity, 1));
+        assert_eq!(source_shared_cancelled(&flight, &identity), Some(false));
+        source_test_gate_open(&gate);
+        let owner = owner.join().unwrap().unwrap_err();
+        let waiter = waiter.join().unwrap().unwrap();
+        assert_eq!(owner.code, MediaErrorCode::Busy);
+        assert_eq!(waiter.outcome, RemoteSourceLoadOutcome::Joined);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic]
+    fn remote_source_owner_cannot_wait_on_different_identity() {
+        let owned = source_test_identity("left.png", 4096, true);
+        let other = source_test_identity("right.png", 4096, true);
+        let flight = RemoteSourceSingleFlight::default();
+        let _owner = RemoteSourceDecodeOwnerScope::enter(owned);
+
+        let _ = flight.acquire(&other);
     }
 
     #[test]
