@@ -277,6 +277,7 @@ impl RemotePagePerf {
             started: Instant::now(),
             lease: Some(lease),
             wait_ms: 0.0,
+            phases: Vec::new(),
             metrics: RemotePageStageMetrics::default(),
             outcome: "aborted",
         })
@@ -301,6 +302,7 @@ struct RemotePageStageGuard {
     started: Instant,
     lease: Option<RemotePageStageLease<'static>>,
     wait_ms: f64,
+    phases: Vec<(&'static str, f64)>,
     metrics: RemotePageStageMetrics,
     outcome: &'static str,
 }
@@ -312,6 +314,28 @@ impl RemotePageStageGuard {
 
     fn add_lock_wait_ms(&mut self, wait_ms: f64) {
         self.wait_ms += wait_ms;
+    }
+
+    fn add_phase(&mut self, name: &'static str, ms: f64) {
+        self.phases.push((name, ms));
+    }
+
+    fn phase_from(&mut self, name: &'static str, started: Instant) {
+        self.add_phase(name, started.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    /// mutex 待ちを含み得る区間。待ちは `wait_ms` に別途積まれているので、
+    /// そのまま記録すると同じ時間を 2 箇所で数えることになる。呼び出しの直前に
+    /// 読んだ `wait_ms` を渡すと、その区間で増えた分だけを差し引く。
+    fn phase_from_excluding_wait(
+        &mut self,
+        name: &'static str,
+        started: Instant,
+        wait_ms_before: f64,
+    ) {
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let waited_ms = (self.wait_ms - wait_ms_before).max(0.0);
+        self.add_phase(name, (elapsed_ms - waited_ms).max(0.0));
     }
 
     fn finish(&mut self, metrics: RemotePageStageMetrics) {
@@ -327,6 +351,7 @@ impl RemotePageStageGuard {
 impl Drop for RemotePageStageGuard {
     fn drop(&mut self) {
         let ms = self.started.elapsed().as_secs_f64() * 1000.0;
+        let (phases, unaccounted_ms) = remote_page_phase_summary(ms, &self.phases);
         let concurrency = self
             .lease
             .as_ref()
@@ -356,6 +381,7 @@ impl Drop for RemotePageStageGuard {
                 serde_json::Value::from(self.metrics.output_bytes),
             ),
             ("outcome", serde_json::Value::from(self.outcome)),
+            ("unaccounted_ms", serde_json::Value::from(unaccounted_ms)),
             (
                 "source_kind",
                 serde_json::Value::from(self.context.source_kind),
@@ -372,8 +398,30 @@ impl Drop for RemotePageStageGuard {
                 serde_json::Value::from(display_request_id.clone()),
             ));
         }
+        if let Some(phases) = phases {
+            extras.push(("phases", phases));
+        }
         crate::perf::event("remote_page", "stage", Some(&self.context.key), 0, &extras);
     }
+}
+
+fn remote_page_phase_summary(
+    stage_ms: f64,
+    phases: &[(&'static str, f64)],
+) -> (Option<serde_json::Value>, f64) {
+    let mut phase_map = serde_json::Map::new();
+    let mut phase_ms = 0.0;
+    for (name, ms) in phases {
+        phase_ms += ms;
+        let accumulated = phase_map
+            .get(*name)
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0)
+            + ms;
+        phase_map.insert((*name).to_owned(), serde_json::Value::from(accumulated));
+    }
+    let phases = (!phase_map.is_empty()).then(|| serde_json::Value::Object(phase_map));
+    (phases, (stage_ms - phase_ms).max(0.0))
 }
 
 struct RemotePageLoadTiming {
@@ -4224,13 +4272,23 @@ impl ContainerEngine {
                 if let Some(perf) = page_perf.as_ref() {
                     let metrics = RemotePageStageMetrics::buffer(pixels.size[0], pixels.size[1], 4);
                     perf.record_skipped(RemotePageStage::Source, metrics, "composite_cache_hit");
-                    perf.record_skipped(RemotePageStage::Compose, metrics, "composite_cache_hit");
                 }
-                return loaded_image_from_color_image(
+                let mut compose_stage = page_perf
+                    .as_ref()
+                    .and_then(|perf| perf.enter(RemotePageStage::Compose));
+                let result = loaded_image_from_color_image_timed(
                     &pixels,
                     cached_auto_trim_bbox.flatten(),
                     identity,
+                    compose_stage.as_mut(),
                 );
+                if let Some(stage) = compose_stage.as_mut() {
+                    stage.finish_with_outcome(
+                        RemotePageStageMetrics::buffer(pixels.size[0], pixels.size[1], 4),
+                        "composite_cache_hit",
+                    );
+                }
+                return result;
             }
             // Auto bbox だけが未計算なら raw raster を復号するが、補正済み pixels は保持し、
             // 後段の edit / final composite は再実行しない。
@@ -4272,6 +4330,7 @@ impl ContainerEngine {
             .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         let keep_start = Arc::new(AtomicUsize::new(0));
         let keep_end = Arc::new(AtomicUsize::new(usize::MAX));
+        let load_request_started = Instant::now();
         crate::thumb_loader::process_load_request(
             &request,
             &cache_map,
@@ -4290,36 +4349,42 @@ impl ContainerEngine {
             None,
             context.adjustment_db.as_ref(),
         );
+        if let Some(stage) = source_stage.as_mut() {
+            stage.phase_from("load_request_ms", load_request_started);
+        }
         drop(tx);
         let mut saw_canceled = false;
-        let (color_image, decoded_source_dims) = rx
-            .into_iter()
-            .find_map(|message| {
-                saw_canceled |= message.canceled;
-                if !message.finalized && !message.canceled {
-                    message.image.map(|image| (image, message.source_dims))
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| {
-                if saw_canceled || cancel.load(Ordering::Relaxed) {
-                    media_error(
-                        MediaErrorCode::Busy,
-                        "先読みは新しいページ要求に置き換えられました",
-                    )
-                } else if matches!(address.subresource, RemoteSubresource::ZipDirectory { .. }) {
-                    media_error(
-                        MediaErrorCode::NotFound,
-                        "ZIP 内に代表サムネイルが見つかりません",
-                    )
-                } else {
-                    media_error(
-                        MediaErrorCode::RenderFailed,
-                        "mIV 本体でページをレンダリングできませんでした",
-                    )
-                }
-            })?;
+        let drain_started = Instant::now();
+        let loaded = rx.into_iter().find_map(|message| {
+            saw_canceled |= message.canceled;
+            if !message.finalized && !message.canceled {
+                message.image.map(|image| (image, message.source_dims))
+            } else {
+                None
+            }
+        });
+        if let Some(stage) = source_stage.as_mut() {
+            stage.phase_from("drain_ms", drain_started);
+        }
+        let image_result = loaded.ok_or_else(|| {
+            if saw_canceled || cancel.load(Ordering::Relaxed) {
+                media_error(
+                    MediaErrorCode::Busy,
+                    "先読みは新しいページ要求に置き換えられました",
+                )
+            } else if matches!(address.subresource, RemoteSubresource::ZipDirectory { .. }) {
+                media_error(
+                    MediaErrorCode::NotFound,
+                    "ZIP 内に代表サムネイルが見つかりません",
+                )
+            } else {
+                media_error(
+                    MediaErrorCode::RenderFailed,
+                    "mIV 本体でページをレンダリングできませんでした",
+                )
+            }
+        });
+        let (color_image, decoded_source_dims) = image_result?;
         if let Some(stage) = source_stage.as_mut() {
             stage.finish(RemotePageStageMetrics::buffer(
                 color_image.size[0],
@@ -4338,12 +4403,17 @@ impl ContainerEngine {
             if requires_stored_edit_space {
                 match &address.subresource {
                     RemoteSubresource::PdfPage { page_number } => {
-                        match crate::pdf_loader::analyze_page_content_type(
+                        let edit_space_started = Instant::now();
+                        let analysis_result = crate::pdf_loader::analyze_page_content_type(
                             &resolved.canonical,
                             *page_number,
                             request.pdf_password.as_deref(),
                             Some(Arc::clone(&cancel)),
-                        ) {
+                        );
+                        if let Some(stage) = compose_stage.as_mut() {
+                            stage.phase_from("edit_space", edit_space_started);
+                        }
+                        match analysis_result {
                             Ok(analysis) => match crate::pdf_loader::canonical_pdf_raster_dims(
                                 analysis.content_type,
                             ) {
@@ -4392,10 +4462,14 @@ impl ContainerEngine {
         let auto_trim_bbox = match cached_auto_trim_bbox {
             Some(bbox) => bbox,
             None if detect_auto_trim => {
+                let auto_trim_started = Instant::now();
                 let bbox = crate::margin_fit::detect_content_bbox(
                     &color_image,
                     crate::margin_fit::DEFAULT_TOLERANCE,
                 );
+                if let Some(stage) = compose_stage.as_mut() {
+                    stage.phase_from("auto_trim", auto_trim_started);
+                }
                 if let Some(key) = auto_trim_key {
                     lock_with_remote_page_wait(
                         &self.auto_trim_bbox_cache,
@@ -4409,7 +4483,12 @@ impl ContainerEngine {
             None => None,
         };
         if let Some(pixels) = cached_composite_pixels {
-            let result = loaded_image_from_color_image(&pixels, auto_trim_bbox, identity);
+            let result = loaded_image_from_color_image_timed(
+                &pixels,
+                auto_trim_bbox,
+                identity,
+                compose_stage.as_mut(),
+            );
             if let Some(stage) = compose_stage.as_mut() {
                 stage.finish(RemotePageStageMetrics::buffer(
                     pixels.size[0],
@@ -4422,7 +4501,11 @@ impl ContainerEngine {
         let mut pixels = Arc::new(color_image);
         if let Some(prepared) = prepared_composite {
             let edit_started = Instant::now();
-            let materialized = self.execute_remote_edits(pixels, prepared.edits, &cancel)?;
+            let materialized_result = self.execute_remote_edits(pixels, prepared.edits, &cancel);
+            if let Some(stage) = compose_stage.as_mut() {
+                stage.phase_from("edits", edit_started);
+            }
+            let materialized = materialized_result?;
             pixels = materialized.pixels;
             crate::logger::log(format!(
                 "remote_ipc: edit_materialize elapsed_ms={:.1} erase_ms={:.1} local_adjust_ms={:.1} conceal_ms={:.1} diffusion_fallback={}",
@@ -4432,17 +4515,30 @@ impl ContainerEngine {
                 materialized.timing.conceal_ms,
                 materialized.used_diffusion_fallback,
             ));
-            let lut = self.resolve_remote_lut_timed(
+            let lut_started = Instant::now();
+            let lut_wait_ms = compose_stage.as_ref().map_or(0.0, |stage| stage.wait_ms);
+            let lut_result = self.resolve_remote_lut_timed(
                 prepared.lut_entry.as_ref(),
                 compose_stage.as_mut(),
                 ambient_wait_stage.as_deref_mut(),
-            )?;
-            pixels = execute_remote_composite(pixels, &prepared.params, lut, &cancel)?;
+            );
+            if let Some(stage) = compose_stage.as_mut() {
+                stage.phase_from_excluding_wait("lut", lut_started, lut_wait_ms);
+            }
+            let lut = lut_result?;
+            let composite_started = Instant::now();
+            let composite_result = execute_remote_composite(pixels, &prepared.params, lut, &cancel);
+            if let Some(stage) = compose_stage.as_mut() {
+                stage.phase_from("composite", composite_started);
+            }
+            pixels = composite_result?;
             if let Some(stored_edit_space) = stored_edit_space {
                 if !materialized.comic.is_empty()
                     && let Some(fonts) =
                         crate::comic_overlay::load_comic_fonts_for(&materialized.comic)
                 {
+                    let comic_started = Instant::now();
+                    let comic_wait_ms = compose_stage.as_ref().map_or(0.0, |stage| stage.wait_ms);
                     pixels = stored_edit_space.comic_composite(
                         &pixels,
                         &materialized.comic,
@@ -4454,29 +4550,50 @@ impl ContainerEngine {
                         ),
                         &cancel,
                     );
+                    if let Some(stage) = compose_stage.as_mut() {
+                        stage.phase_from_excluding_wait("comic", comic_started, comic_wait_ms);
+                    }
                 }
             }
-            pixels =
-                crop_with_stored_edit_space(pixels, materialized.export_crop, stored_edit_space)
-                    .map_err(|error| {
-                        crate::logger::log(format!("remote_ipc: export crop failed: {error}"));
-                        media_error(
-                            MediaErrorCode::RenderFailed,
-                            "ページの切り取り結果を作成できませんでした",
-                        )
-                    })?;
+            let crop_started = Instant::now();
+            let crop_result =
+                crop_with_stored_edit_space(pixels, materialized.export_crop, stored_edit_space);
+            if let Some(stage) = compose_stage.as_mut() {
+                stage.phase_from("crop", crop_started);
+            }
+            pixels = crop_result.map_err(|error| {
+                crate::logger::log(format!("remote_ipc: export crop failed: {error}"));
+                media_error(
+                    MediaErrorCode::RenderFailed,
+                    "ページの切り取り結果を作成できませんでした",
+                )
+            })?;
+            let cache_insert_started = Instant::now();
+            let cache_insert_wait_ms = compose_stage.as_ref().map_or(0.0, |stage| stage.wait_ms);
             lock_with_remote_page_wait(
                 &self.page_composite_cache,
                 compose_stage.as_mut(),
                 ambient_wait_stage.as_deref_mut(),
             )
             .insert(prepared.key.clone(), Arc::clone(&pixels));
+            if let Some(stage) = compose_stage.as_mut() {
+                stage.phase_from_excluding_wait(
+                    "cache_insert",
+                    cache_insert_started,
+                    cache_insert_wait_ms,
+                );
+            }
             crate::logger::log(format!(
                 "remote_ipc: final_composite cache=miss key={}",
                 prepared.key.page_key
             ));
         }
-        let result = loaded_image_from_color_image(&pixels, auto_trim_bbox, identity);
+        let result = loaded_image_from_color_image_timed(
+            &pixels,
+            auto_trim_bbox,
+            identity,
+            compose_stage.as_mut(),
+        );
         if result.is_ok()
             && let Some(stage) = compose_stage.as_mut()
         {
@@ -5034,6 +5151,20 @@ fn decode_remote_ai_canonical(
     }
 }
 
+fn loaded_image_from_color_image_timed(
+    pixels: &egui::ColorImage,
+    auto_trim_bbox: Option<egui::Rect>,
+    identity: RemoteAddress,
+    stage: Option<&mut RemotePageStageGuard>,
+) -> Result<LoadedImage, MediaError> {
+    let started = Instant::now();
+    let result = loaded_image_from_color_image(pixels, auto_trim_bbox, identity);
+    if let Some(stage) = stage {
+        stage.phase_from("to_rgba", started);
+    }
+    result
+}
+
 fn loaded_image_from_color_image(
     pixels: &egui::ColorImage,
     auto_trim_bbox: Option<egui::Rect>,
@@ -5560,6 +5691,38 @@ mod tests {
                 "resolve", "source", "compose", "trim", "resize", "jpeg", "total",
             ]
         );
+    }
+
+    #[test]
+    fn remote_page_phase_summary_keeps_empty_stage_time_unaccounted() {
+        let (phases, unaccounted_ms) = remote_page_phase_summary(12.5, &[]);
+
+        assert_eq!(phases, None);
+        assert_eq!(unaccounted_ms, 12.5);
+    }
+
+    #[test]
+    fn remote_page_phase_summary_accumulates_duplicate_names() {
+        let (phases, unaccounted_ms) =
+            remote_page_phase_summary(10.0, &[("decode", 2.0), ("decode", 3.0), ("display", 1.0)]);
+
+        assert_eq!(
+            phases,
+            Some(serde_json::json!({
+                "decode": 5.0,
+                "display": 1.0,
+            }))
+        );
+        assert_eq!(unaccounted_ms, 4.0);
+    }
+
+    #[test]
+    fn remote_page_phase_summary_clamps_negative_unaccounted_time() {
+        let (phases, unaccounted_ms) =
+            remote_page_phase_summary(5.0, &[("first", 3.0), ("second", 4.0)]);
+
+        assert!(phases.is_some());
+        assert_eq!(unaccounted_ms, 0.0);
     }
 
     #[test]
