@@ -492,7 +492,7 @@ fn catalog_dims_are_landscape((width, height): (u32, u32)) -> bool {
 
 /// Remote の表示ページ専用 encoder。サムネイル cache の WebP 形式とは共有しない。
 fn encode_remote_page_jpeg(
-    image: &image::DynamicImage,
+    image: &egui::ColorImage,
     long_side: u32,
     view_trim_bbox: Option<egui::Rect>,
 ) -> Option<(Vec<u8>, u32, u32)> {
@@ -500,67 +500,118 @@ fn encode_remote_page_jpeg(
 }
 
 fn encode_remote_page_jpeg_timed(
-    image: &image::DynamicImage,
+    image: &egui::ColorImage,
     long_side: u32,
     view_trim_bbox: Option<egui::Rect>,
     timing: Option<RemotePageEncodeTiming>,
 ) -> Option<(Vec<u8>, u32, u32)> {
     let page_perf = timing.as_ref().map(|timing| timing.perf.clone());
     let mut trim_stage = timing.map(|timing| timing.trim);
-    let trim_input =
-        RemotePageStageMetrics::buffer(image.width() as usize, image.height() as usize, 4);
-    let cropped;
-    let image = if let Some(bbox) = view_trim_bbox {
+    let image_width = image.size[0];
+    let image_height = image.size[1];
+    let (x, y, width, height) = if let Some(bbox) = view_trim_bbox {
         let rect = crate::export_crop::CropRect {
-            min_x: bbox.min.x * image.width() as f32,
-            min_y: bbox.min.y * image.height() as f32,
-            max_x: bbox.max.x * image.width() as f32,
-            max_y: bbox.max.y * image.height() as f32,
+            min_x: bbox.min.x * image_width as f32,
+            min_y: bbox.min.y * image_height as f32,
+            max_x: bbox.max.x * image_width as f32,
+            max_y: bbox.max.y * image_height as f32,
         };
-        let (x, y, width, height) =
-            rect.pixel_bounds(image.width() as usize, image.height() as usize);
-        cropped = image.crop_imm(x as u32, y as u32, width as u32, height as u32);
-        &cropped
+        rect.pixel_bounds(image_width, image_height)
     } else {
-        image
+        (0, 0, image_width, image_height)
     };
+    let width_u32 = u32::try_from(width).ok()?;
+    let height_u32 = u32::try_from(height).ok()?;
+    let (output_width, output_height) = crate::fast_resize::aspect_accurate_fit_dimensions(
+        (width_u32, height_u32),
+        (long_side, long_side),
+        (width_u32, height_u32),
+    );
+    // 縮小が要るなら結局 `DynamicImage` を組むので、不透明かどうかを調べても答えは変わらない。
+    // 走査は 46 MP を 1 往復するので、要らないときは走らせない。
+    let needs_resize = (output_width, output_height) != (width_u32, height_u32);
+    let use_zero_copy = !needs_resize && {
+        let started = Instant::now();
+        let is_opaque = image.pixels.iter().all(|pixel| pixel.a() == 255);
+        // 走査はこの段の中で起きているので、この段の区間として記録する。
+        // 段をまたいで時間を付け替えると、段の ms が「その段にかかった時間」でなくなる。
+        if let Some(stage) = trim_stage.as_mut() {
+            stage.phase_from("opacity_scan", started);
+        }
+        is_opaque
+    };
+
+    let mut legacy_image = None;
+    if !use_zero_copy {
+        let source = color_image_to_dynamic_image(image)?;
+        legacy_image = Some(if view_trim_bbox.is_some() {
+            source.crop_imm(x as u32, y as u32, width_u32, height_u32)
+        } else {
+            source
+        });
+    }
+    let trim_input = RemotePageStageMetrics::buffer(image_width, image_height, 4);
     if let Some(stage) = trim_stage.as_mut() {
-        stage.finish(trim_input.with_output(image.width() as usize, image.height() as usize, 4));
+        stage.finish(trim_input.with_output(width, height, 4));
     }
     drop(trim_stage);
     let mut resize_stage = page_perf
         .as_ref()
         .and_then(|perf| perf.enter(RemotePageStage::Resize));
-    let resize_input =
-        RemotePageStageMetrics::buffer(image.width() as usize, image.height() as usize, 4);
-    let resized = crate::fast_resize::resize_dynamic_fit(
-        image,
-        long_side,
-        long_side,
-        crate::fast_resize::Quality::Lanczos3,
-    );
+    let resize_input = RemotePageStageMetrics::buffer(width, height, 4);
+    let resized = legacy_image.as_ref().map(|image| {
+        crate::fast_resize::resize_dynamic_fit(
+            image,
+            long_side,
+            long_side,
+            crate::fast_resize::Quality::Lanczos3,
+        )
+    });
     if let Some(stage) = resize_stage.as_mut() {
-        stage.finish(resize_input.with_output(
-            resized.width() as usize,
-            resized.height() as usize,
-            4,
-        ));
+        stage.finish(resize_input.with_output(output_width as usize, output_height as usize, 4));
     }
     drop(resize_stage);
     let mut jpeg_stage = page_perf
         .as_ref()
         .and_then(|perf| perf.enter(RemotePageStage::Jpeg));
-    let rgb = resized.to_rgb8();
-    let (width, height) = (rgb.width(), rgb.height());
-    let bytes =
-        turbojpeg::compress_image(&rgb, PAGE_JPEG_QUALITY, turbojpeg::Subsamp::Sub2x2).ok()?;
-    let bytes = bytes.to_vec();
+    let bytes = if use_zero_copy {
+        let pitch = image_width.checked_mul(4)?;
+        let start = y.checked_mul(pitch)?.checked_add(x.checked_mul(4)?)?;
+        let raw = image.as_raw();
+        let input = turbojpeg::Image {
+            pixels: raw.get(start..)?,
+            width,
+            pitch,
+            height,
+            format: turbojpeg::PixelFormat::RGBA,
+        };
+        turbojpeg::compress(input, PAGE_JPEG_QUALITY, turbojpeg::Subsamp::Sub2x2)
+            .ok()?
+            .to_vec()
+    } else {
+        let rgb = resized?.to_rgb8();
+        turbojpeg::compress_image(&rgb, PAGE_JPEG_QUALITY, turbojpeg::Subsamp::Sub2x2)
+            .ok()?
+            .to_vec()
+    };
     if let Some(stage) = jpeg_stage.as_mut() {
-        let mut metrics = RemotePageStageMetrics::buffer(width as usize, height as usize, 3);
+        let bytes_per_pixel = if use_zero_copy { 4 } else { 3 };
+        let mut metrics = RemotePageStageMetrics::buffer(
+            output_width as usize,
+            output_height as usize,
+            bytes_per_pixel,
+        );
         metrics.output_bytes = bytes.len() as u64;
-        stage.finish(metrics);
+        stage.finish_with_outcome(
+            metrics,
+            if use_zero_copy {
+                "zero_copy"
+            } else {
+                "unmultiplied"
+            },
+        );
     }
-    Some((bytes, width, height))
+    Some((bytes, output_width, output_height))
 }
 
 fn harmonized_remote_auto_bbox(
@@ -1078,7 +1129,7 @@ struct PdfIdentity {
 }
 
 struct LoadedImage {
-    image: image::DynamicImage,
+    pixels: Arc<egui::ColorImage>,
     auto_trim_bbox: Option<egui::Rect>,
     identity: RemoteAddress,
 }
@@ -2596,18 +2647,21 @@ impl ContainerEngine {
             None,
             None,
         ) {
-            Ok(loaded) => crate::catalog::encode_thumb_webp(
-                &loaded.image,
-                request.target_px,
-                self.settings.thumb_quality as f32,
-            )
-            .map(|(webp_bytes, _, _)| ThumbnailResponse::Success { webp_bytes })
-            .unwrap_or_else(|| {
-                thumbnail_error(
-                    ThumbnailErrorCode::GenerationFailed,
-                    "WebP エンコードに失敗しました",
-                )
-            }),
+            Ok(loaded) => color_image_to_dynamic_image(&loaded.pixels)
+                .and_then(|image| {
+                    crate::catalog::encode_thumb_webp(
+                        &image,
+                        request.target_px,
+                        self.settings.thumb_quality as f32,
+                    )
+                })
+                .map(|(webp_bytes, _, _)| ThumbnailResponse::Success { webp_bytes })
+                .unwrap_or_else(|| {
+                    thumbnail_error(
+                        ThumbnailErrorCode::GenerationFailed,
+                        "WebP エンコードに失敗しました",
+                    )
+                }),
             Err(error) => thumbnail_error_from_media(error),
         };
         let (outcome, output_bytes) = match &response {
@@ -2710,7 +2764,7 @@ impl ContainerEngine {
                             trim,
                         });
                         match encode_remote_page_jpeg_timed(
-                            &loaded.image,
+                            &loaded.pixels,
                             request.target_px,
                             view_trim_bbox,
                             encode_timing,
@@ -3152,7 +3206,7 @@ impl ContainerEngine {
                 )
                 .map_err(remote_ai_media_error)?;
             let (bytes, width, height) =
-                encode_remote_page_jpeg(&image.image, page.target_px, view_trim_bbox)
+                encode_remote_page_jpeg(&image.pixels, page.target_px, view_trim_bbox)
                     .ok_or_else(|| RemoteAiRunError::Failed("JPEG encoding failed".to_owned()))?;
             Ok((
                 PagePayload {
@@ -4296,11 +4350,10 @@ impl ContainerEngine {
                 let mut compose_stage = page_perf
                     .as_ref()
                     .and_then(|perf| perf.enter(RemotePageStage::Compose));
-                let result = loaded_image_from_color_image_timed(
+                let result = loaded_image_from_color_image(
                     &pixels,
                     cached_auto_trim_bbox.flatten(),
                     identity,
-                    compose_stage.as_mut(),
                 );
                 if let Some(stage) = compose_stage.as_mut() {
                     stage.finish_with_outcome(
@@ -4504,12 +4557,7 @@ impl ContainerEngine {
             None => None,
         };
         if let Some(pixels) = cached_composite_pixels {
-            let result = loaded_image_from_color_image_timed(
-                &pixels,
-                auto_trim_bbox,
-                identity,
-                compose_stage.as_mut(),
-            );
+            let result = loaded_image_from_color_image(&pixels, auto_trim_bbox, identity);
             if let Some(stage) = compose_stage.as_mut() {
                 stage.finish(RemotePageStageMetrics::buffer(
                     pixels.size[0],
@@ -4609,12 +4657,7 @@ impl ContainerEngine {
                 prepared.key.page_key
             ));
         }
-        let result = loaded_image_from_color_image_timed(
-            &pixels,
-            auto_trim_bbox,
-            identity,
-            compose_stage.as_mut(),
-        );
+        let result = loaded_image_from_color_image(&pixels, auto_trim_bbox, identity);
         if result.is_ok()
             && let Some(stage) = compose_stage.as_mut()
         {
@@ -5172,43 +5215,25 @@ fn decode_remote_ai_canonical(
     }
 }
 
-fn loaded_image_from_color_image_timed(
-    pixels: &egui::ColorImage,
-    auto_trim_bbox: Option<egui::Rect>,
-    identity: RemoteAddress,
-    stage: Option<&mut RemotePageStageGuard>,
-) -> Result<LoadedImage, MediaError> {
-    let started = Instant::now();
-    let result = loaded_image_from_color_image(pixels, auto_trim_bbox, identity);
-    if let Some(stage) = stage {
-        stage.phase_from("to_rgba", started);
-    }
-    result
-}
-
 fn loaded_image_from_color_image(
-    pixels: &egui::ColorImage,
+    pixels: &Arc<egui::ColorImage>,
     auto_trim_bbox: Option<egui::Rect>,
     identity: RemoteAddress,
 ) -> Result<LoadedImage, MediaError> {
-    let width = u32::try_from(pixels.size[0])
-        .map_err(|_| media_error(MediaErrorCode::RenderFailed, "画像の幅が範囲外です"))?;
-    let height = u32::try_from(pixels.size[1])
-        .map_err(|_| media_error(MediaErrorCode::RenderFailed, "画像の高さが範囲外です"))?;
-    let rgba = crate::capture::color_image_to_rgba(pixels);
-    let image = image::RgbaImage::from_raw(width, height, rgba)
-        .map(image::DynamicImage::ImageRgba8)
-        .ok_or_else(|| {
-            media_error(
-                MediaErrorCode::RenderFailed,
-                "ページ画像を WebP エンコード用の形式へ変換できませんでした",
-            )
-        })?;
     Ok(LoadedImage {
-        image,
+        pixels: Arc::clone(pixels),
         auto_trim_bbox,
         identity,
     })
+}
+
+fn color_image_to_dynamic_image(pixels: &egui::ColorImage) -> Option<image::DynamicImage> {
+    let width = u32::try_from(pixels.size[0]).ok()?;
+    let height = u32::try_from(pixels.size[1]).ok()?;
+    let rgba = crate::capture::color_image_to_rgba(pixels);
+    let image =
+        image::RgbaImage::from_raw(width, height, rgba).map(image::DynamicImage::ImageRgba8)?;
+    Some(image)
 }
 
 fn remote_adjustment_read_error(scope: &str, error: String) -> MediaError {
@@ -6031,44 +6056,120 @@ mod tests {
         bytes
     }
 
-    #[test]
-    fn remote_page_jpeg_encoder_respects_long_side_and_never_upscales() {
-        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(40, 20, |x, y| {
-            image::Rgba([x as u8, y as u8, (x + y) as u8, 127])
-        }));
+    fn remote_page_test_image(width: usize, height: usize) -> egui::ColorImage {
+        let pixels = (0..height)
+            .flat_map(|y| {
+                (0..width).map(move |x| {
+                    egui::Color32::from_rgb(
+                        (x * 37 + y * 11) as u8,
+                        (x * 13 + y * 47) as u8,
+                        (x * 29 + y * 19) as u8,
+                    )
+                })
+            })
+            .collect();
+        egui::ColorImage::new([width, height], pixels)
+    }
 
-        let (resized_bytes, resized_width, resized_height) =
-            encode_remote_page_jpeg(&image, 10, None).expect("JPEG encode");
-        assert_eq!((resized_width, resized_height), (10, 5));
-        assert_eq!(&resized_bytes[..2], &[0xff, 0xd8]);
-        let resized = image::load_from_memory(&resized_bytes).expect("JPEG decode");
-        assert_eq!((resized.width(), resized.height()), (10, 5));
-
-        let (native_bytes, native_width, native_height) =
-            encode_remote_page_jpeg(&image, 8192, None).expect("JPEG encode");
-        assert_eq!((native_width, native_height), (40, 20));
-        let native = image::load_from_memory(&native_bytes).expect("JPEG decode");
-        assert_eq!((native.width(), native.height()), (40, 20));
+    fn encode_remote_page_jpeg_legacy(
+        image: &egui::ColorImage,
+        long_side: u32,
+        view_trim_bbox: Option<egui::Rect>,
+    ) -> Option<(Vec<u8>, u32, u32)> {
+        let width = u32::try_from(image.size[0]).ok()?;
+        let height = u32::try_from(image.size[1]).ok()?;
+        let rgba = crate::capture::color_image_to_rgba(image);
+        let source =
+            image::RgbaImage::from_raw(width, height, rgba).map(image::DynamicImage::ImageRgba8)?;
+        let cropped;
+        let source = if let Some(bbox) = view_trim_bbox {
+            let rect = crate::export_crop::CropRect {
+                min_x: bbox.min.x * source.width() as f32,
+                min_y: bbox.min.y * source.height() as f32,
+                max_x: bbox.max.x * source.width() as f32,
+                max_y: bbox.max.y * source.height() as f32,
+            };
+            let (x, y, width, height) =
+                rect.pixel_bounds(source.width() as usize, source.height() as usize);
+            cropped = source.crop_imm(x as u32, y as u32, width as u32, height as u32);
+            &cropped
+        } else {
+            &source
+        };
+        let resized = crate::fast_resize::resize_dynamic_fit(
+            source,
+            long_side,
+            long_side,
+            crate::fast_resize::Quality::Lanczos3,
+        );
+        let rgb = resized.to_rgb8();
+        let (width, height) = (rgb.width(), rgb.height());
+        let bytes = turbojpeg::compress_image(&rgb, PAGE_JPEG_QUALITY, turbojpeg::Subsamp::Sub2x2)
+            .ok()?
+            .to_vec();
+        Some((bytes, width, height))
     }
 
     #[test]
-    fn remote_page_jpeg_encoder_crops_before_resizing() {
-        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
-            40,
-            20,
-            image::Rgba([10, 20, 30, 255]),
-        ));
-        let bbox = egui::Rect::from_min_max(egui::pos2(0.25, 0.0), egui::pos2(0.75, 1.0));
+    fn remote_page_jpeg_opaque_zero_copy_is_byte_identical_to_legacy() {
+        let image = remote_page_test_image(40, 20);
 
-        let (native_bytes, native_width, native_height) =
-            encode_remote_page_jpeg(&image, 8192, Some(bbox)).expect("JPEG encode");
-        assert_eq!((native_width, native_height), (20, 20));
-        let native = image::load_from_memory(&native_bytes).expect("JPEG decode");
-        assert_eq!((native.width(), native.height()), (20, 20));
+        let actual = encode_remote_page_jpeg(&image, 8192, None).expect("JPEG encode");
+        let legacy = encode_remote_page_jpeg_legacy(&image, 8192, None).expect("legacy encode");
 
-        let (_, resized_width, resized_height) =
-            encode_remote_page_jpeg(&image, 10, Some(bbox)).expect("JPEG encode");
-        assert_eq!((resized_width, resized_height), (10, 10));
+        assert_eq!(actual.0, legacy.0);
+        assert_eq!((actual.1, actual.2), (legacy.1, legacy.2));
+        assert_eq!((actual.1, actual.2), (40, 20));
+    }
+
+    #[test]
+    fn remote_page_jpeg_translucent_pixel_falls_back_byte_identical_to_legacy() {
+        let mut image = remote_page_test_image(40, 20);
+        image.pixels[17] = egui::Color32::from_rgba_unmultiplied(220, 140, 60, 64);
+        let raw = &image.as_raw()[17 * 4..17 * 4 + 4];
+        assert_ne!(raw, image.pixels[17].to_srgba_unmultiplied());
+
+        let actual = encode_remote_page_jpeg(&image, 8192, None).expect("JPEG encode");
+        let legacy = encode_remote_page_jpeg_legacy(&image, 8192, None).expect("legacy encode");
+
+        assert_eq!(actual.0, legacy.0);
+        assert_eq!((actual.1, actual.2), (legacy.1, legacy.2));
+    }
+
+    #[test]
+    fn remote_page_jpeg_zero_copy_crop_with_odd_width_is_byte_identical_to_legacy() {
+        let image = remote_page_test_image(13, 9);
+        let bbox = egui::Rect::from_min_max(egui::pos2(0.2, 0.2), egui::pos2(0.5, 0.8));
+        let rect = crate::export_crop::CropRect {
+            min_x: bbox.min.x * image.size[0] as f32,
+            min_y: bbox.min.y * image.size[1] as f32,
+            max_x: bbox.max.x * image.size[0] as f32,
+            max_y: bbox.max.y * image.size[1] as f32,
+        };
+        let (_, _, crop_width, crop_height) = rect.pixel_bounds(image.size[0], image.size[1]);
+        assert_eq!((crop_width, crop_height), (5, 7));
+
+        let actual = encode_remote_page_jpeg(&image, 8192, Some(bbox)).expect("JPEG encode");
+        let legacy =
+            encode_remote_page_jpeg_legacy(&image, 8192, Some(bbox)).expect("legacy encode");
+
+        assert_eq!(actual.0, legacy.0);
+        assert_eq!((actual.1, actual.2), (legacy.1, legacy.2));
+        assert_eq!((actual.1, actual.2), (5, 7));
+    }
+
+    #[test]
+    fn remote_page_jpeg_resize_matches_legacy_bytes_and_fit_dimensions() {
+        let image = remote_page_test_image(40, 21);
+        let expected =
+            crate::fast_resize::aspect_accurate_fit_dimensions((40, 21), (10, 10), (40, 21));
+
+        let actual = encode_remote_page_jpeg(&image, 10, None).expect("JPEG encode");
+        let legacy = encode_remote_page_jpeg_legacy(&image, 10, None).expect("legacy encode");
+
+        assert_eq!(actual.0, legacy.0);
+        assert_eq!((actual.1, actual.2), (legacy.1, legacy.2));
+        assert_eq!((actual.1, actual.2), expected);
     }
 
     fn auto_trim_test_page(top: usize, bottom: usize) -> egui::ColorImage {
@@ -6377,7 +6478,7 @@ mod tests {
                     &cancel,
                 )
                 .unwrap();
-            encode_remote_page_jpeg(&loaded.image, 1024, bbox).unwrap()
+            encode_remote_page_jpeg(&loaded.pixels, 1024, bbox).unwrap()
         };
 
         let left_payload = render(
