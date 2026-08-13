@@ -130,6 +130,7 @@ const {
   applyRemoteSessionId,
   browserDoubleTapTelemetryEvent,
   commandTelemetryEvent,
+  collectionImageHash,
   containerInitialImageIndex,
   createRemoteHomeDataRefreshCoordinator,
   createFavoriteSearchForm,
@@ -330,6 +331,51 @@ test("drive list uses the core-owned collection route", () => {
     collectionKind: "drive_list",
     value: "",
   });
+});
+
+test("collection image routes keep optional ids distinct from the image marker", () => {
+  const smartId = "01234567-89ab-cdef-0123-456789abcdef";
+  const imagePath = testPath("smart/sub folder/page #1.jpg");
+  assert.deepEqual(parseRoute(`#collection/smart/${smartId}`), {
+    kind: "collection",
+    collectionKind: "smart",
+    value: smartId,
+  });
+  assert.deepEqual(
+    parseRoute(collectionImageHash("smart", smartId, imagePath)),
+    {
+      kind: "collection",
+      collectionKind: "smart",
+      value: smartId,
+      imagePath,
+    }
+  );
+  assert.deepEqual(parseRoute("#collection/rating/5"), {
+    kind: "collection",
+    collectionKind: "rating",
+    value: "5",
+  });
+  assert.deepEqual(
+    parseRoute(collectionImageHash("rating", "5", imagePath)),
+    {
+      kind: "collection",
+      collectionKind: "rating",
+      value: "5",
+      imagePath,
+    }
+  );
+  assert.deepEqual(
+    parseRoute(collectionImageHash("reading_history", "", imagePath)),
+    {
+      kind: "collection",
+      collectionKind: "reading_history",
+      value: "",
+      imagePath,
+    }
+  );
+  const encoded = collectionImageHash("smart", smartId, imagePath);
+  assert.match(encoded, /%2F/);
+  assert.match(encoded, /%23/);
 });
 
 test("favorite search distinguishes empty, disabled, and unavailable states", () => {

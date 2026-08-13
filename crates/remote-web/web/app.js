@@ -1339,7 +1339,9 @@ const containerSpreadRefreshOwner = new LatestOnlyTaskQueue(
     left.viewer === right.viewer &&
     left.addressIdentity === right.addressIdentity &&
     left.currentIdentity === right.currentIdentity &&
-    left.forceSinglePage === right.forceSinglePage
+    left.forceSinglePage === right.forceSinglePage &&
+    left.spreadMode === right.spreadMode &&
+    left.readingDirection === right.readingDirection
 );
 
 const state = {
@@ -2401,16 +2403,8 @@ export function parseRoute(hash) {
   if (home) {
     return { kind: "home", tab: home[1] };
   }
-  const collection = hash.match(
-    /^#collection\/(drive_list|reading_history|bookmarks|bookshelf|rating|smart)(?:\/([^/]+))?$/
-  );
-  if (collection) {
-    return {
-      kind: "collection",
-      collectionKind: collection[1],
-      value: collection[2] ?? "",
-    };
-  }
+  const collection = parseCollectionRoute(hash);
+  if (collection) return collection;
   const search = hash.match(/^#search\/(all|folder|zip|pdf)\/(.*)$/);
   if (search) {
     try {
@@ -2465,6 +2459,43 @@ function homeHash(tab) {
 
 function collectionHash(kind, value = "") {
   return `#collection/${kind}${value ? `/${encodeURIComponent(value)}` : ""}`;
+}
+
+export function collectionImageHash(kind, value, path) {
+  return `${collectionHash(kind, value)}/image/${encodeURIComponent(path)}`;
+}
+
+function parseCollectionRoute(hash) {
+  const prefix = "#collection/";
+  if (!hash.startsWith(prefix)) return null;
+  let routePart = hash.slice(prefix.length);
+  let encodedImagePath = null;
+  const imageMarker = "/image/";
+  const imageMarkerIndex = routePart.indexOf(imageMarker);
+  if (imageMarkerIndex >= 0) {
+    encodedImagePath = routePart.slice(imageMarkerIndex + imageMarker.length);
+    routePart = routePart.slice(0, imageMarkerIndex);
+    if (!encodedImagePath) return null;
+  }
+
+  const direct = routePart.match(
+    /^(drive_list|reading_history|bookmarks|bookshelf)$/
+  );
+  const identified = routePart.match(/^(rating|smart)\/([^/]+)$/);
+  if (!direct && !identified) return null;
+  const route = {
+    kind: "collection",
+    collectionKind: direct?.[1] ?? identified[1],
+    value: identified?.[2] ?? "",
+  };
+  if (encodedImagePath !== null) {
+    try {
+      route.imagePath = decodeURIComponent(encodedImagePath);
+    } catch {
+      return null;
+    }
+  }
+  return route;
 }
 
 export function favoriteSearchHash(query, kind = "all") {
@@ -2962,6 +2993,29 @@ function executeOpenCommand(payload, meta) {
   );
   meta.openRoute = legacyOpenRoute;
   if (legacyOpenRoute === "legacy_image_rejected") return false;
+  const collectionRoute = refreshableCollectionRoute();
+  if (collectionRoute) {
+    tryEnterBrowserFullscreen();
+    history.pushState(
+      {
+        mivRoute: true,
+        navigatedInApp: true,
+        viewerFromGrid: true,
+        viewerDepth: 1,
+        returnHash: state.gridHash,
+      },
+      "",
+      collectionImageHash(
+        collectionRoute.collectionKind,
+        collectionRoute.value,
+        payload.path
+      )
+    );
+    renderImageViewer(payload.imageIndex, meta.at ?? performance.now());
+    return true;
+  }
+  // Search and tag result routes also use state.collection, but are not /api/collection
+  // contexts. Preserve their existing parent-container open behavior.
   if (state.collection) {
     tryEnterBrowserFullscreen();
     navigate(imageHash(payload.path), {
@@ -3728,21 +3782,76 @@ function ipcUnavailableMessage() {
 
 async function showCollection(route) {
   renderLoading("一覧を読み込んでいます");
-  const params = collectionRequestParams(route);
-  const data = await apiJson("/api/collection", params);
+  const loaded = await loadCollection(route);
+  if (!loaded) return;
+  if (typeof route.imagePath === "string") {
+    const pageAddress = {
+      path: route.imagePath,
+      subresource: { kind: "file" },
+    };
+    const imageIndex = state.images.findIndex(
+      (entry) => addressIdentity(entryAddress(entry)) === addressIdentity(pageAddress)
+    );
+    if (imageIndex >= 0) {
+      tryEnterBrowserFullscreen();
+      renderImageViewer(imageIndex, performance.now());
+      return;
+    }
+    // A stale/shared image URL still has a valid collection destination.
+    history.replaceState({ mivRoute: true }, "", state.gridHash);
+  }
+  renderFolder();
+}
+
+async function loadCollection(route, options = {}) {
+  const forceSinglePage = options.forceSinglePage === undefined
+    ? containerForceSinglePage()
+    : Boolean(options.forceSinglePage);
+  state.requestController?.abort();
+  state.folderContainerLoad = null;
+  const controller = new AbortController();
+  state.requestController = controller;
+  const data = await apiJson(
+    "/api/collection",
+    collectionRequestParams(route, {
+      spreadMode: options.spreadMode,
+      readingDirection: options.readingDirection,
+      forceSinglePage,
+    }),
+    controller.signal
+  );
+  if (controller.signal.aborted || state.requestController !== controller) {
+    return false;
+  }
+  state.requestController = null;
+  applyCollectionData(route, data, forceSinglePage, options);
+  return true;
+}
+
+function applyCollectionData(route, data, forceSinglePage, options = {}) {
+  const baseHash = collectionHash(route.collectionKind, route.value);
+  if (state.pagePrefetchContextIdentity !== baseHash) {
+    state.pagePrefetchContextIdentity = baseHash;
+    state.pagePrefetchMovedSinceOpen = false;
+  }
   state.collection = {
     kind: route.collectionKind,
     value: route.value,
     title: data.title ?? "一覧",
     truncated: Boolean(data.truncated),
     entryLimit: Number(data.entry_limit) || 0,
+    configuredSpreadMode: data.configured_spread_mode ?? SpreadMode.SINGLE,
+    effectiveSpreadMode: data.effective_spread_mode ?? SpreadMode.SINGLE,
+    readingDirection: data.reading_direction ?? ReadingDirection.LTR,
+    imageCount: Math.max(0, Math.floor(Number(data.image_count) || 0)),
+    forceSinglePage,
   };
   state.gridSortState = normalizeRemoteGridSortState(data.sort_state);
   state.gridSortScope = collectionSortScope(route.collectionKind, route.value);
   state.container = null;
   state.gridReturnHash =
     route.collectionKind === "smart" ? homeHash("smart") : homeHash("places");
-  state.gridHash = location.hash;
+  state.gridHash = baseHash;
   state.favoriteName = data.title ?? "一覧";
   state.folderPath = "";
   state.thumbAspectHeightRatio =
@@ -3752,9 +3861,10 @@ async function showCollection(route) {
       : 1;
   state.entries = data.entries ?? [];
   state.images = state.entries.filter((entry) => entry.kind === "image");
-  setSinglePageGroups();
-  state.gridIndex = 0;
-  renderFolder();
+  applyCollectionSpreadData(data, forceSinglePage);
+  state.gridIndex = options.preserveGridIndex
+    ? clamp(state.gridIndex, 0, Math.max(0, state.entries.length - 1))
+    : 0;
 }
 
 async function showFavoriteSearch(route) {
@@ -3793,7 +3903,7 @@ async function showFavoriteSearch(route) {
   // 今のコンテナ索引は画像を返さないが、その前提をここにもう 1 つ置かない。集約ビューと
   // 同じ導出にしておけば、返るものが変わってもセルの開き方が食い違わない。
   state.images = state.entries.filter((entry) => entry.kind === "image");
-  setSinglePageGroups();
+  applyCollectionSpreadData(listing, false);
   state.gridIndex = 0;
   renderFolder();
 }
@@ -3830,7 +3940,7 @@ async function showTagItems(route) {
       : 1;
   state.entries = entries;
   state.images = state.entries.filter((entry) => entry.kind === "image");
-  setSinglePageGroups();
+  applyCollectionSpreadData(listing, false);
   state.gridIndex = 0;
   renderFolder();
 }
@@ -3880,14 +3990,25 @@ export function tagItemsEmptyMessage(indexState, entryCount = 0) {
   return "このタグの項目は見つかりませんでした。";
 }
 
-function collectionRequestParams(route) {
+function collectionRequestParams(route, options = {}) {
+  const spread = Object.values(SpreadMode).includes(options.spreadMode)
+    ? options.spreadMode
+    : null;
+  const direction = Object.values(ReadingDirection).includes(options.readingDirection)
+    ? options.readingDirection
+    : null;
+  const common = {
+    ...(spread ? { spread } : {}),
+    ...(direction ? { direction } : {}),
+    single: options.forceSinglePage ? 1 : 0,
+  };
   if (route.collectionKind === "rating") {
-    return { kind: "rating", stars: route.value };
+    return { kind: "rating", stars: route.value, ...common };
   }
   if (route.collectionKind === "smart") {
-    return { kind: "smart_folder", id: route.value };
+    return { kind: "smart_folder", id: route.value, ...common };
   }
-  return { kind: route.collectionKind };
+  return { kind: route.collectionKind, ...common };
 }
 
 function collectionSortScope(kind, value) {
@@ -4119,6 +4240,15 @@ function setSinglePageGroups() {
   state.forceSinglePage = false;
 }
 
+function applyCollectionSpreadData(data, forceSinglePage) {
+  state.spreadMode = data.configured_spread_mode ?? SpreadMode.SINGLE;
+  state.effectiveSpreadMode = data.effective_spread_mode ?? SpreadMode.SINGLE;
+  state.readingDirection = data.reading_direction ?? ReadingDirection.LTR;
+  state.spreadPageGapPx = Math.max(0, Number(data.spread_page_gap_px) || 0);
+  state.forceSinglePage = Boolean(forceSinglePage);
+  setContainerPageGroups(data.page_groups ?? []);
+}
+
 function setContainerPageGroups(groups) {
   const previousPosition = viewerPositionOwner.current();
   const byAddress = new Map(
@@ -4181,9 +4311,11 @@ function currentPageGroup() {
 
 function viewerPageContextIdentity() {
   const contextAddress = state.container?.requestedAddress;
-  const locationIdentity = contextAddress
-    ? addressIdentity(contextAddress)
-    : String(state.folderPath ?? "");
+  const locationIdentity = state.collection
+    ? `collection:${state.gridHash}`
+    : contextAddress
+      ? addressIdentity(contextAddress)
+      : String(state.folderPath ?? "");
   return `${state.screenContext ?? ""}\n${locationIdentity}`;
 }
 
@@ -4274,6 +4406,14 @@ function applyRequestedPageGroupPosition(
 function viewerPageGroupHash(snapshot) {
   const entry = snapshot?.group?.anchor;
   if (!entry) return null;
+  const collectionRoute = refreshableCollectionRoute();
+  if (collectionRoute && !entry.address) {
+    return collectionImageHash(
+      collectionRoute.collectionKind,
+      collectionRoute.value,
+      entry.path
+    );
+  }
   return entry.address ? mediaHash(entry.address) : imageHash(entry.path);
 }
 
@@ -4726,8 +4866,12 @@ function shouldForceSinglePageForViewport() {
 }
 
 function requestSpreadMode(mode) {
-  if (!state.container || !Object.values(SpreadMode).includes(mode)) return false;
-  const address = state.container.requestedAddress;
+  const collectionRoute = refreshableCollectionRoute();
+  if (
+    (!state.container && !collectionRoute) ||
+    !Object.values(SpreadMode).includes(mode)
+  ) return false;
+  const address = state.container?.requestedAddress ?? null;
   const spreadIntent = planSpreadIntent({
     address,
     selectedMode: mode,
@@ -4739,23 +4883,30 @@ function requestSpreadMode(mode) {
   const writeRequest = spreadIntent.writeRequest;
   if (!writeRequest) return false;
   const readingDirection = writeRequest.reading_direction;
-  const identity = addressIdentity(address);
+  const identity = collectionRoute
+    ? collectionHash(collectionRoute.collectionKind, collectionRoute.value)
+    : addressIdentity(address);
   const sequence = ++spreadWriteSequence;
   state.spreadMode = mode;
   state.readingDirection = readingDirection;
   spreadWriteTail = spreadWriteTail.then(async () => {
     let writeError = null;
-    try {
-      await apiAddressPostJson("/api/write", writeRequest);
-    } catch (error) {
-      writeError = error;
+    if (!collectionRoute) {
+      try {
+        await apiAddressPostJson("/api/write", writeRequest);
+      } catch (error) {
+        writeError = error;
+      }
     }
     if (
       sequence === spreadWriteSequence &&
-      state.container &&
-      addressIdentity(state.container.requestedAddress) === identity
+      activeSpreadContextIdentity() === identity
     ) {
-      const refresh = await refreshContainerSpread();
+      const refresh = await refreshContainerSpread(
+        shouldForceSinglePageForViewport(),
+        "spread_refresh",
+        { spreadMode: mode, readingDirection }
+      );
       if (writeError) {
         state.viewer?.showBoundaryMessage(
           writeError instanceof Error
@@ -4772,13 +4923,21 @@ function requestSpreadMode(mode) {
 
 function refreshContainerSpread(
   forceSinglePage = shouldForceSinglePageForViewport(),
-  renderTrigger = "spread_refresh"
+  renderTrigger = "spread_refresh",
+  requested = {}
 ) {
-  if (!state.container) return Promise.resolve(VIEWER_GROUP_LOAD_SUPERSEDED);
+  const collectionRoute = refreshableCollectionRoute();
+  if (!state.container && !collectionRoute) {
+    return Promise.resolve(VIEWER_GROUP_LOAD_SUPERSEDED);
+  }
   const viewer = state.viewer;
   const current = currentPageGroup()?.anchor ?? state.images[state.imageIndex];
   const currentIdentity = current ? entryIdentity(current) : "";
-  const address = state.container.requestedAddress;
+  const address = state.container?.requestedAddress ?? null;
+  const contextKind = collectionRoute ? "collection" : "container";
+  const contextIdentity = collectionRoute
+    ? collectionHash(collectionRoute.collectionKind, collectionRoute.value)
+    : addressIdentity(address);
   if (!viewer || !currentIdentity) {
     return Promise.resolve({
       outcome: ViewerGroupLoadOutcome.FAILED,
@@ -4787,12 +4946,39 @@ function refreshContainerSpread(
   }
   return containerSpreadRefreshOwner.enqueue({
     address,
-    addressIdentity: addressIdentity(address),
+    collectionRoute,
+    contextKind,
+    addressIdentity: contextIdentity,
     currentIdentity,
     forceSinglePage,
+    spreadMode: requested.spreadMode ?? state.spreadMode,
+    readingDirection: requested.readingDirection ?? state.readingDirection,
     renderTrigger,
     viewer,
   });
+}
+
+function refreshableCollectionRoute() {
+  const kind = state.collection?.kind;
+  if (![
+    "drive_list",
+    "reading_history",
+    "bookmarks",
+    "bookshelf",
+    "rating",
+    "smart",
+  ].includes(kind)) return null;
+  return { collectionKind: kind, value: state.collection?.value ?? "" };
+}
+
+function activeSpreadContextIdentity() {
+  const collectionRoute = refreshableCollectionRoute();
+  if (collectionRoute) {
+    return collectionHash(collectionRoute.collectionKind, collectionRoute.value);
+  }
+  return state.container
+    ? addressIdentity(state.container.requestedAddress)
+    : "";
 }
 
 function containerSpreadRefreshContextExitReason(request, duringLoad = false) {
@@ -4801,14 +4987,15 @@ function containerSpreadRefreshContextExitReason(request, duringLoad = false) {
       ? ContainerSpreadRefreshExitReason.VIEWER_CHANGED_DURING_LOAD
       : ContainerSpreadRefreshExitReason.VIEWER_CHANGED_BEFORE_LOAD;
   }
-  if (!state.container) {
+  const contextPresent = request.contextKind === "collection"
+    ? Boolean(refreshableCollectionRoute())
+    : Boolean(state.container);
+  if (!contextPresent) {
     return duringLoad
       ? ContainerSpreadRefreshExitReason.CONTAINER_MISSING_DURING_LOAD
       : ContainerSpreadRefreshExitReason.CONTAINER_MISSING_BEFORE_LOAD;
   }
-  if (
-    addressIdentity(state.container.requestedAddress) !== request.addressIdentity
-  ) {
+  if (activeSpreadContextIdentity() !== request.addressIdentity) {
     return duringLoad
       ? ContainerSpreadRefreshExitReason.CONTAINER_CHANGED_DURING_LOAD
       : ContainerSpreadRefreshExitReason.CONTAINER_CHANGED_BEFORE_LOAD;
@@ -4859,12 +5046,19 @@ async function performContainerSpreadRefresh(request) {
       return supersedeContainerSpreadRefresh(request, initialExit, stage);
     }
 
-    stage = "container_load";
+    stage = request.contextKind === "collection" ? "collection_load" : "container_load";
     let loaded;
     try {
-      loaded = await loadContainer(request.address, {
-        forceSinglePage: request.forceSinglePage,
-      });
+      loaded = request.contextKind === "collection"
+        ? await loadCollection(request.collectionRoute, {
+            forceSinglePage: request.forceSinglePage,
+            spreadMode: request.spreadMode,
+            readingDirection: request.readingDirection,
+            preserveGridIndex: true,
+          })
+        : await loadContainer(request.address, {
+            forceSinglePage: request.forceSinglePage,
+          });
     } catch (error) {
       if (error?.name === "AbortError") {
         const contextExit = containerSpreadRefreshContextExitReason(request, true);
@@ -4901,7 +5095,7 @@ async function performContainerSpreadRefresh(request) {
       )
     )) {
       return reportContainerSpreadRefreshError(
-        new Error("更新後のコンテナに現在のページがありません。"),
+        new Error("更新後の一覧に現在のページがありません。"),
         request,
         {
           reason: ContainerSpreadRefreshExitReason.CURRENT_PAGE_MISSING,
@@ -4970,7 +5164,7 @@ async function performContainerSpreadRefresh(request) {
     throw new TypeError("viewer update returned an unknown outcome");
   } catch (error) {
     return reportContainerSpreadRefreshError(error, request, {
-      reason: stage === "container_load"
+      reason: stage === "container_load" || stage === "collection_load"
         ? ContainerSpreadRefreshExitReason.CONTAINER_LOAD_FAILED
         : ContainerSpreadRefreshExitReason.UNEXPECTED_ERROR,
       stage,
@@ -7886,7 +8080,7 @@ export function viewerMenuDefinitions({ hasContainer, barsVisible }) {
 function menuDefinition(context, page = "main") {
   if (context === "viewer") {
     const definitions = viewerMenuDefinitions({
-      hasContainer: Boolean(state.container),
+      hasContainer: Boolean(state.container || refreshableCollectionRoute()),
       barsVisible: state.viewerBarsVisible,
     });
     return definitions[page] ?? definitions.main;
@@ -10750,7 +10944,10 @@ class LocalSettingsDialog {
       state.localSettingsStorageAvailable = saved.saved;
       this.updateStorageStatus();
       const forceSinglePage = shouldForceSinglePageForViewport();
-      if (state.container && forceSinglePage !== state.forceSinglePage) {
+      if (
+        (state.container || refreshableCollectionRoute()) &&
+        forceSinglePage !== state.forceSinglePage
+      ) {
         refreshContainerSpread(forceSinglePage).then((result) => {
           if (result.outcome === ViewerGroupLoadOutcome.FAILED) {
             state.viewer?.showBoundaryMessage(result.message);
@@ -11850,7 +12047,7 @@ export class ImageViewer {
         }
         const forceSinglePage = shouldForceSinglePageForViewport();
         const plan = viewerResizePlan({
-          hasContainer: Boolean(state.container),
+          hasContainer: Boolean(state.container || refreshableCollectionRoute()),
           forceSinglePageChanged: forceSinglePage !== state.forceSinglePage,
           panelOpen: Boolean(state.commandMenu?.isOpen()),
         });
