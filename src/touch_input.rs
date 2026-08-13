@@ -483,6 +483,18 @@ impl TouchRecognizer {
             }
         }
 
+        // タップ判定を持たない面では、動かなかった接触を「クリック」に化けさせない。
+        // キャンバスは自前の操作を持つので、素通りさせるとマウスのクリック経路
+        // (= 画面の左右半分でページ送り) へ流れ、触れただけでページが飛ぶ
+        // (利用者報告 2026-08-13)。ドラッグは対象外なので見回しは従来どおり通る。
+        if !geom.behavior.uses_tap_zones()
+            && self.owner == TouchOwner::ViewerPointerPassthrough
+            && self.contacts.len() == 1
+            && self.contacts[index].is_tap(sample.now_ms)
+        {
+            self.suppress_primary = true;
+        }
+
         self.contacts.remove(index);
         match self.owner {
             TouchOwner::Pinch => {

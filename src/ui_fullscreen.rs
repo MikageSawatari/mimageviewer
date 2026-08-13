@@ -1686,6 +1686,19 @@ fn still_touch_input_enabled(input: StillTouchInputEnabledInputs) -> bool {
         && !input.zoom_active
 }
 
+/// 表示モードがキャンバスを所有しているか。
+///
+/// true のとき、キャンバスのクリック / タップは「ページ送り」ではなく、その
+/// モード自身の操作を意味する。**マウスでもタッチでも同じ**。
+///
+/// クリックのページ送りは `fs_zoom` などの変形が無いときだけ走る作りで、
+/// 360 度ビューと分析ツールは自前の状態を持ち `fs_zoom` を動かさないため、
+/// この 2 つでは変形なしと見なされてページ送りが生きていた
+/// (利用者報告 2026-08-13: 分析ツールのパネルを触ってもページが送られる)。
+fn fs_display_mode_owns_canvas(panorama_active: bool, analysis_active: bool) -> bool {
+    panorama_active || analysis_active
+}
+
 /// タップをページ送り / 中央タップとして解釈してよいか。
 ///
 /// 360 度ビューと分析ツールは**画面全体が自前のポインタ操作**なので、タップ判定を
@@ -1697,7 +1710,7 @@ fn still_touch_input_enabled(input: StillTouchInputEnabledInputs) -> bool {
 /// ホバー前提、編集系と比較ワイプはキー操作とセットでしか使えないので、
 /// `still_touch_input_enabled` 側で止めたままにする。
 fn still_touch_tap_zones_enabled(panorama_active: bool, analysis_active: bool) -> bool {
-    !panorama_active && !analysis_active
+    !fs_display_mode_owns_canvas(panorama_active, analysis_active)
 }
 
 #[derive(Clone, Copy)]
@@ -18314,11 +18327,16 @@ impl App {
                 .hover_pos()
                 .is_some_and(|pos| layout.canvas_rect.contains(pos))
         }) {
-            let secondary_down = ctx.input(|input| input.pointer.secondary_down());
-            ctx.set_cursor_icon(if secondary_down {
+            // カーソルは主ボタンの意味に合わせる。主 = 枠を掴んで動かす、
+            // 副 = 範囲を選ぶ。ドラッグの割り当てを入れ替えたらここも入れ替える。
+            let (primary_down, secondary_down) =
+                ctx.input(|input| (input.pointer.primary_down(), input.pointer.secondary_down()));
+            ctx.set_cursor_icon(if primary_down {
                 egui::CursorIcon::Grabbing
-            } else {
+            } else if secondary_down {
                 egui::CursorIcon::Crosshair
+            } else {
+                egui::CursorIcon::Grab
             });
         }
     }
@@ -18598,11 +18616,16 @@ impl App {
                 .hover_pos()
                 .is_some_and(|pos| layout.canvas_rect.contains(pos))
         }) {
-            let secondary_down = ctx.input(|input| input.pointer.secondary_down());
-            ctx.set_cursor_icon(if secondary_down {
+            // カーソルは主ボタンの意味に合わせる。主 = 枠を掴んで動かす、
+            // 副 = 範囲を選ぶ。ドラッグの割り当てを入れ替えたらここも入れ替える。
+            let (primary_down, secondary_down) =
+                ctx.input(|input| (input.pointer.primary_down(), input.pointer.secondary_down()));
+            ctx.set_cursor_icon(if primary_down {
                 egui::CursorIcon::Grabbing
-            } else {
+            } else if secondary_down {
                 egui::CursorIcon::Crosshair
+            } else {
+                egui::CursorIcon::Grab
             });
         }
     }
@@ -19779,7 +19802,18 @@ impl App {
                                 // intentional rather than incidental, so PageSide is deliberately
                                 // dispatched above even in continuous reading (touch/mouse parity is
                                 // not required here; see touch-support-plan §5.14-11).
-                                if !in_side_panel && !in_seek_panel && !continuous_active {
+                                // 表示モードがキャンバスを持っているときは、クリックは
+                                // そのモードの操作。ページ送りへ流さない。
+                                let display_mode_owns_canvas = fs_display_mode_owns_canvas(
+                                    self.fullscreen_idx
+                                        .is_some_and(|idx| self.is_panorama_mode_active(idx)),
+                                    self.analysis_mode,
+                                );
+                                if !in_side_panel
+                                    && !in_seek_panel
+                                    && !continuous_active
+                                    && !display_mode_owns_canvas
+                                {
                                     let base = fullscreen_click_nav_base_delta(
                                         pos.x,
                                         full_rect.center().x,
@@ -36251,6 +36285,83 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, crate::touch_input::TouchCommand::PageSide { .. })),
             "a surface without tap zones must never emit a page turn"
+        );
+    }
+
+    /// タップ判定を外したら、代わりに**マウスのクリック経路**へ流れてページが送られた
+    /// (利用者報告 2026-08-13)。動かなかった接触は synthetic click を出さない。
+    ///
+    /// ドラッグは対象外。見回しもガイド操作も従来どおり通す必要がある。
+    #[test]
+    fn a_still_tap_without_tap_zones_does_not_become_a_click() {
+        use crate::touch_input::{
+            TapZoneGeometry, TouchPhase, TouchRecognizer, TouchSample, TouchSurfaceBehavior,
+        };
+
+        let geom = TapZoneGeometry {
+            surface: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1000.0, 800.0)),
+            excluded: Vec::new(),
+            behavior: TouchSurfaceBehavior::Viewer {
+                accepts_pinch: true,
+                tap_zones: false,
+            },
+        };
+
+        let mut tapped = TouchRecognizer::new();
+        tapped.handle_sample(
+            &geom,
+            TouchSample {
+                id: 1,
+                pos: egui::pos2(800.0, 400.0),
+                phase: TouchPhase::Start,
+                now_ms: 0,
+            },
+        );
+        tapped.handle_sample(
+            &geom,
+            TouchSample {
+                id: 1,
+                pos: egui::pos2(800.0, 400.0),
+                phase: TouchPhase::End,
+                now_ms: 100,
+            },
+        );
+        assert!(
+            tapped.should_suppress_primary(),
+            "a stationary tap must not reach the click-to-turn-page path"
+        );
+
+        let mut dragged = TouchRecognizer::new();
+        dragged.handle_sample(
+            &geom,
+            TouchSample {
+                id: 1,
+                pos: egui::pos2(800.0, 400.0),
+                phase: TouchPhase::Start,
+                now_ms: 0,
+            },
+        );
+        dragged.handle_sample(
+            &geom,
+            TouchSample {
+                id: 1,
+                pos: egui::pos2(500.0, 400.0),
+                phase: TouchPhase::Move,
+                now_ms: 50,
+            },
+        );
+        dragged.handle_sample(
+            &geom,
+            TouchSample {
+                id: 1,
+                pos: egui::pos2(500.0, 400.0),
+                phase: TouchPhase::End,
+                now_ms: 100,
+            },
+        );
+        assert!(
+            !dragged.should_suppress_primary(),
+            "a drag must still reach the view's own pointer handling"
         );
     }
 
