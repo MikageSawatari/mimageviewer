@@ -57,10 +57,50 @@ self.final_composite_cache
 候補は今サイクルの通過表示 (`2426961f` で v2.13.0 から外し、`96faeee6` 以降で入れ直し) と
 PDF ページ形状の変更 (`22e47021` / `7dbb2f39` / `1b5fff92`)。Codex に判定を依頼中。
 
-### 却下した仮説
+### 追加調査 (2026-08-14、Codex 待ちの間)
 
-`capture_fs_nav_holdover` が holdover 自身を再退避してループする、という説。
-`resolve_fs_display_tex` は `fs_holdover_tex` を読まないので成立しない。
+**却下していた holdover 説を撤回する。** 却下の根拠は「`resolve_fs_display_tex` は
+`fs_holdover_tex` を読まない」だったが、**描画経路は resolve とは別に holdover を直接読む**
+(`fs_nav_holdover_for_draw`)。ログの `texture_choice` が
+`branch="fullscreen_overlay" source="nav_holdover"` と明記しており、
+**描かれているのは holdover** で確定。
+
+ナビ 1 回分の生ログ (t=27.84〜27.88、`_009` → `_010`):
+
+```
+27.849 ready          idx=0 key=pdf::..._010.pdf#0 from_cache=true w=290 h=421
+27.850 texture_choice branch=resolve_processed  source=none_after_paint texture_id=null
+27.852 texture_choice branch=fullscreen_overlay source=nav_holdover     texture_id=Managed(641)
+27.853 paint          source=processed_other    texture_id=Managed(641)
+27.853 page_turn_ready mode=materialized source=processed_other texture_id=Managed(641)
+```
+
+**新しい PDF の正しいサムネイルは用意できている** (`ready` が `from_cache=true` で出ている)
+のに、holdover が解除されず前の絵が描かれている。`resolve_processed` が `null` を返しており、
+holdover の解除条件が「processed/final が解決できること」に依存しているために解除されない、
+という筋が通る。`resolve_fs_display_tex` は
+`colorize_display_requires_final_effect(idx)` が真だと**サムネイルがあっても None を返す**
+(src/ui_fullscreen.rs 4291)。カラー化や Creative LUT が効くページでは常にこの経路に入る。
+
+`paint` の `source="processed_other"` は診断分類器 (src/ui_fullscreen.rs 4520-4555) が
+erase / fs_cache / thumbnail しか見ないための **fallback ラベル**で、holdover を知らない。
+分類器に holdover を足すべき (誤診を誘発した)。
+
+**egui の texture id は再利用されない** (`epaint::TextureManager::alloc` が `next_id += 1`)
+ので、`Managed(641)` が同一テクスチャであることは確定。
+
+**v2.13.0 で再現しない説明 (仮説、Codex に確認中)**: `ff9d2eb1` が holdover の variant を
+組み替え (`ColorizeDisplayUnit` → `FinalEffectSourceReload`)、
+`capture_colorize_page_transition_holdover` を削除している。解除条件の依存先が
+変わった可能性がある。
+
+### 却下した仮説 (現時点)
+
+- `final_composite_cache` の idx 一致だけの引き方が直接原因、という説。
+  引き方も `resolve_fs_display_tex` の順序も v2.13.0 と同一で、さらに
+  `start_loading_items_inner` (フォルダ読み込み経路) が
+  `clear_all_final_pipeline_caches` を**無条件で呼ぶ**ため、移動時にキャッシュは空になる。
+  ただし世代の刻印が無いこと自体は別の穴として残る (要修正かは Codex の回答で判断)
 
 ### 修正方針 (Codex の回答で確定させる)
 
