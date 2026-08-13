@@ -774,6 +774,18 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
 - 方針: `TestScriptSnapshot` に **items 件数**を足し、`s.items_len > 0 && s.pending_thumbs == 0`
   で判定する。`pending_thumbs == 0` は「まだ何も始まっていない」と「全部終わった」を
   区別できない、というのが根。
+- **完了 (2026-08-13、`8eda67b0`)**。`TestScriptSnapshot` に `items_len` を足し、
+  settle 判定を `items_len > 0 && pending_thumbs == 0` にした。`sleep(1500)` は撤去。
+  実測で 1.5 秒 → **128ms** で成立するようになり、`page-turn-smoke.ps1 -SelfTest` も pass。
+- **併せて `snapshot()` を Rhai へ公開した**。`wait_until` は条件が真になるまで待つので、
+  「どちらに転んだか」で分岐するシナリオが書けなかった (§1.77 の再現がまさにそれで、
+  タイムアウトの連鎖として書く羽目になった)。
+- **同じ作業で見つかった別の落とし穴**: フルスクリーン投入後の待ちに `target_rendered` を
+  使うと不十分。あれは **ROOT viewport のときだけ true** なので、前面がフルスクリーン窓へ
+  切り替わる途中でも成立してしまい、次のキーが未登録 HWND へ飛んで
+  `UnregisteredForegroundWindow` で落ちる。**`target_registered` と
+  `fullscreen_raw_key_permit` を待つ**のが正しい (`measure.rhai` は元からそうなっていた)。
+  settle が速くなった分この競合が露出したので、新しいスクリプトを書くときは真似ること。
 - 規模 / 優先度: Small / P2 (測定するたびに踏む)。
 
 ### 1.71 「キーから割り当て」の候補一覧に検索欄が無い — 利用者要望
