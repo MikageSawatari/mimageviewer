@@ -24,6 +24,7 @@ import {
   gridLayoutForWidth,
   gridScrollbarFirstVisibleItem,
   gridScrollbarScrollTop,
+  gridScrollbarShouldShow,
   gridScrollbarThumb,
   gridScrollExtent,
   gridIndexForCommand,
@@ -7191,8 +7192,17 @@ class VirtualGrid {
 
   updateScrollbar() {
     if (!this.scrollbar) return;
+    // Reveal, then measure. While the bar is hidden its track measures zero, and a
+    // zero track reads as "nothing to scroll", so asking the geometry first would keep
+    // it hidden for good. `gridScrollbarShouldShow` cannot see the track by design.
+    const scrollable = gridScrollbarShouldShow({
+      totalItems: this.items.length,
+      contentHeight: this.contentHeight,
+      viewportHeight: this.scroller.clientHeight,
+    });
+    this.scrollbar.root.hidden = !scrollable;
+    if (!scrollable) return;
     const geometry = this.scrollbarGeometry();
-    this.scrollbar.root.hidden = !geometry.visible;
     if (!geometry.visible) return;
 
     this.scrollbar.thumb.style.height = geometry.thumbHeight + "px";

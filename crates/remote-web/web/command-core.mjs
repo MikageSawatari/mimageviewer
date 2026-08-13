@@ -2122,6 +2122,22 @@ export function gridScrollExtent(rowCount, rowPitch, viewportHeight) {
   };
 }
 
+/// Whether the grid needs a scrollbar at all.
+///
+/// Deliberately blind to the track: the track only has a height once the bar is on
+/// screen, so letting the measurement decide visibility would keep a hidden bar
+/// hidden for good. Callers reveal first, then measure.
+export function gridScrollbarShouldShow({
+  totalItems,
+  contentHeight,
+  viewportHeight,
+}) {
+  const items = Math.max(0, Math.floor(Number(totalItems) || 0));
+  const content = Math.max(0, Number(contentHeight) || 0);
+  const viewport = Math.max(0, Number(viewportHeight) || 0);
+  return items > 0 && content > viewport;
+}
+
 export function gridScrollbarThumb({
   contentHeight,
   viewportHeight,

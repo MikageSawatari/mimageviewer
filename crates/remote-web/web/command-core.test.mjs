@@ -32,6 +32,7 @@ import {
   gridLayoutForWidth,
   gridScrollbarFirstVisibleItem,
   gridScrollbarScrollTop,
+  gridScrollbarShouldShow,
   gridScrollbarThumb,
   gridScrollExtent,
   gridIndexForCommand,
@@ -2366,6 +2367,40 @@ test("grid scroll extent and snapping stay on whole row boundaries", () => {
     maxOffset: 0,
     totalHeight: 700,
   });
+});
+
+test('grid scrollbar visibility never depends on the measured track', () => {
+  // The bar starts hidden, and a hidden element measures a zero-height track. If the
+  // track decided visibility, the bar could never appear. This function is not given
+  // the track at all, which is what keeps that regression out.
+  assert.equal(
+    gridScrollbarShouldShow({
+      totalItems: 60_000,
+      contentHeight: 60_000 * 164,
+      viewportHeight: 800,
+    }),
+    true
+  );
+  assert.equal(
+    gridScrollbarShouldShow({
+      totalItems: 4,
+      contentHeight: 328,
+      viewportHeight: 800,
+    }),
+    false
+  );
+  assert.equal(
+    gridScrollbarShouldShow({
+      totalItems: 0,
+      contentHeight: 0,
+      viewportHeight: 0,
+    }),
+    false
+  );
+  assert.ok(
+    !String(gridScrollbarShouldShow).includes('track'),
+    'visibility must not read a track measurement'
+  );
 });
 
 test('grid scrollbar hides when the list fits and maps both endpoints', () => {
