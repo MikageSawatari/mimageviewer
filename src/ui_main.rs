@@ -225,7 +225,7 @@ pub(crate) struct FolderPinButtonState {
     pub matches_current_pin: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RatingFilterOp {
     Toggle,
     Solo,
@@ -767,6 +767,41 @@ fn is_rating_solo_with_unrated(rf: &[bool; 6], idx: usize) -> bool {
         return false;
     }
     rf[0] && rf[idx] && (1..6).all(|i| i == idx || !rf[i])
+}
+
+/// 修飾キー付きクリックが意味する操作。
+///
+/// ★ツールバーと絞り込みバーの ★ プルダウンが**同じ答えを使う**ための 1 か所。
+/// 対応表が 2 つあると、同じ★を押しているのに入口で結果が変わって見える。
+///
+/// Windows 専用ビルドなので `mods.command` は ctrl と同値 (egui 内で alias)。
+/// 既存コード (Ctrl+クリック選択等) と合わせて ctrl のみを見る。
+/// 優先順位: Ctrl+Shift > Ctrl > Shift > 通常。
+/// 同じ状態をもう一度選んだら全 ON へ戻す (2 回押せば解除できる)。
+fn rating_filter_op_for_click(rf: &[bool; 6], idx: usize, mods: egui::Modifiers) -> RatingFilterOp {
+    if mods.ctrl && mods.shift && idx >= 1 {
+        // ★N + 未評価 (= `rating_filter[0]` も ON)。idx=0 では意味を成さないので
+        // 除外 (下の Ctrl 単独に落ちる)。
+        if is_rating_solo_with_unrated(rf, idx) {
+            RatingFilterOp::AllOn
+        } else {
+            RatingFilterOp::SoloWithUnrated
+        }
+    } else if mods.ctrl {
+        if is_rating_solo(rf, idx) {
+            RatingFilterOp::AllOn
+        } else {
+            RatingFilterOp::Solo
+        }
+    } else if mods.shift {
+        if is_rating_threshold(rf, idx) {
+            RatingFilterOp::AllOn
+        } else {
+            RatingFilterOp::Threshold
+        }
+    } else {
+        RatingFilterOp::Toggle
+    }
 }
 
 fn apply_rating_filter_op(rf: &mut [bool; 6], op: RatingFilterOp, idx: usize) {
@@ -1451,33 +1486,7 @@ fn draw_rating_filter_button(
     let mut assign: Option<RatingAssign> = None;
     if enabled && resp.clicked() {
         let mods = ui.input(|i| i.modifiers);
-        // Windows 専用ビルドなので mods.command は ctrl と同値 (egui 内で alias)。
-        // 既存コード (src/ui_main.rs:992 の Ctrl+クリック選択等) と合わせて ctrl のみを見る。
-        // 優先順位: Ctrl+Shift > Ctrl > Shift > 通常。
-        let op = if mods.ctrl && mods.shift && idx >= 1 {
-            // ★N + 未評価 (= `rating_filter[0]` も ON)。idx=0 では意味を成さないので
-            // 除外 (下の Ctrl 単独に落ちる)。
-            if is_rating_solo_with_unrated(rf, idx) {
-                RatingFilterOp::AllOn
-            } else {
-                RatingFilterOp::SoloWithUnrated
-            }
-        } else if mods.ctrl {
-            if is_rating_solo(rf, idx) {
-                RatingFilterOp::AllOn
-            } else {
-                RatingFilterOp::Solo
-            }
-        } else if mods.shift {
-            if is_rating_threshold(rf, idx) {
-                RatingFilterOp::AllOn
-            } else {
-                RatingFilterOp::Threshold
-            }
-        } else {
-            RatingFilterOp::Toggle
-        };
-        apply_rating_filter_op(rf, op, idx);
+        apply_rating_filter_op(rf, rating_filter_op_for_click(rf, idx, mods), idx);
         changed = true;
     }
     // 右クリックメニューは常に「set」(toggle せず) なので op を直接渡す。
@@ -10037,14 +10046,21 @@ impl App {
                     ui.separator();
                     let counts = self.facet_rating_counts();
                     for idx in 0..6 {
+                        // checkbox 自身の bool 反転は捨てて、クリックは★ツールバーと同じ
+                        // `rating_filter_op_for_click` へ通す。単純な toggle では
+                        // Ctrl / Shift の意味 (これのみ / ★N 以上) を表せない。
+                        // 反転した `selected` は書き戻さないので、次フレームは
+                        // `settings.rating_filter` の実値で描き直される。
                         let mut selected = self.settings.rating_filter[idx];
                         let text = format!("{} ({})", rating_button_label(idx), counts[idx]);
-                        if ui
+                        let resp = ui
                             .checkbox(&mut selected, text)
-                            .on_hover_text(rating_tooltip(&self.keymap, idx))
-                            .changed()
-                        {
-                            self.settings.rating_filter[idx] = selected;
+                            .on_hover_text(rating_tooltip(&self.keymap, idx));
+                        if resp.clicked() {
+                            let mods = ui.input(|i| i.modifiers);
+                            let op =
+                                rating_filter_op_for_click(&self.settings.rating_filter, idx, mods);
+                            apply_rating_filter_op(&mut self.settings.rating_filter, op, idx);
                             changed = true;
                         }
                     }
@@ -16910,25 +16926,58 @@ mod rating_filter_op_tests {
         assert!(!is_rating_solo_with_unrated(&rf_two_stars, 5));
     }
 
+    /// テストは対応表を書き写さず、実際に UI が使う `rating_filter_op_for_click` を通す。
+    /// 書き写すと、実装だけ変わってテストが古い表を守り続ける。
+    fn mods(ctrl: bool, shift: bool) -> egui::Modifiers {
+        egui::Modifiers {
+            ctrl,
+            shift,
+            ..Default::default()
+        }
+    }
+
+    fn click(rf: &mut [bool; 6], idx: usize, ctrl: bool, shift: bool) {
+        let op = rating_filter_op_for_click(rf, idx, mods(ctrl, shift));
+        apply_rating_filter_op(rf, op, idx);
+    }
+
+    /// 修飾の対応表。★ツールバーと絞り込みバーの ★ プルダウンはどちらもこの 1 か所を
+    /// 通るので、ここが両方の入口の仕様になる。
+    #[test]
+    fn rating_click_modifier_table() {
+        let all_on = crate::settings::default_rating_filter();
+        assert_eq!(
+            rating_filter_op_for_click(&all_on, 3, mods(false, false)),
+            RatingFilterOp::Toggle
+        );
+        assert_eq!(
+            rating_filter_op_for_click(&all_on, 3, mods(true, false)),
+            RatingFilterOp::Solo
+        );
+        assert_eq!(
+            rating_filter_op_for_click(&all_on, 3, mods(false, true)),
+            RatingFilterOp::Threshold
+        );
+        assert_eq!(
+            rating_filter_op_for_click(&all_on, 3, mods(true, true)),
+            RatingFilterOp::SoloWithUnrated
+        );
+        // idx=0 に「★N と未評価」は無いので Ctrl 単独へ落ちる。
+        assert_eq!(
+            rating_filter_op_for_click(&all_on, 0, mods(true, true)),
+            RatingFilterOp::Solo
+        );
+    }
+
     /// Ctrl+Shift+クリック は solo_with_unrated ↔ 全 ON を往復する。
     #[test]
     fn ctrl_shift_click_model_toggles_with_unrated() {
         let mut rf = [true; 6];
         // 初回 Ctrl+Shift+★5 → ★5 + なし だけ
-        let op = if is_rating_solo_with_unrated(&rf, 5) {
-            RatingFilterOp::AllOn
-        } else {
-            RatingFilterOp::SoloWithUnrated
-        };
-        apply_rating_filter_op(&mut rf, op, 5);
+        click(&mut rf, 5, true, true);
         assert!(is_rating_solo_with_unrated(&rf, 5));
         // 同じボタンを Ctrl+Shift+クリック再度 → 全 ON
-        let op = if is_rating_solo_with_unrated(&rf, 5) {
-            RatingFilterOp::AllOn
-        } else {
-            RatingFilterOp::SoloWithUnrated
-        };
-        apply_rating_filter_op(&mut rf, op, 5);
+        click(&mut rf, 5, true, true);
         assert_eq!(rf, crate::settings::default_rating_filter());
     }
 
@@ -16937,20 +16986,10 @@ mod rating_filter_op_tests {
     fn ctrl_click_model_solo_and_restore() {
         let mut rf = [true; 6];
         // 既に全 ON で Ctrl+★3 → solo 状態に
-        let op = if is_rating_solo(&rf, 3) {
-            RatingFilterOp::AllOn
-        } else {
-            RatingFilterOp::Solo
-        };
-        apply_rating_filter_op(&mut rf, op, 3);
+        click(&mut rf, 3, true, false);
         assert!(is_rating_solo(&rf, 3));
         // 同じボタンを Ctrl+クリック再度 → 全 ON
-        let op = if is_rating_solo(&rf, 3) {
-            RatingFilterOp::AllOn
-        } else {
-            RatingFilterOp::Solo
-        };
-        apply_rating_filter_op(&mut rf, op, 3);
+        click(&mut rf, 3, true, false);
         assert_eq!(rf, crate::settings::default_rating_filter());
     }
 
@@ -16959,21 +16998,22 @@ mod rating_filter_op_tests {
     fn shift_click_model_threshold_and_restore() {
         let mut rf = [true; 6];
         // 全 ON で Shift+★3 → threshold (idx>=3 のみ ON)
-        let op = if is_rating_threshold(&rf, 3) {
-            RatingFilterOp::AllOn
-        } else {
-            RatingFilterOp::Threshold
-        };
-        apply_rating_filter_op(&mut rf, op, 3);
+        click(&mut rf, 3, false, true);
         assert_eq!(rf, [false, false, false, true, true, true]);
         // 同ボタン再度 → 全 ON
-        let op = if is_rating_threshold(&rf, 3) {
-            RatingFilterOp::AllOn
-        } else {
-            RatingFilterOp::Threshold
-        };
-        apply_rating_filter_op(&mut rf, op, 3);
+        click(&mut rf, 3, false, true);
         assert_eq!(rf, crate::settings::default_rating_filter());
+    }
+
+    /// 修飾なしのクリックは、他の★の状態に関係なくその★だけを反転する。
+    /// プルダウンの checkbox が従来どおり動くことの確認でもある。
+    #[test]
+    fn plain_click_only_toggles_its_own_bucket() {
+        let mut rf = [false, false, false, true, true, true];
+        click(&mut rf, 1, false, false);
+        assert_eq!(rf, [false, true, false, true, true, true]);
+        click(&mut rf, 1, false, false);
+        assert_eq!(rf, [false, false, false, true, true, true]);
     }
 }
 
