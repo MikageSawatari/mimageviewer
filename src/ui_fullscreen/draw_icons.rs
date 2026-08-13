@@ -235,6 +235,13 @@ pub(super) fn bar_button_bg(hovered: bool, active: bool) -> egui::Color32 {
     }
 }
 
+/// 「その他の機能」ボタン。font glyph に頼らず、3 点を vector で描く。
+pub(super) fn draw_more_icon(painter: &egui::Painter, center: egui::Pos2, _r: f32) {
+    for offset in [-7.0, 0.0, 7.0] {
+        painter.circle_filled(center + egui::vec2(offset, 0.0), 2.0, egui::Color32::WHITE);
+    }
+}
+
 /// バーボタンの共通描画。位置とアイコン描画関数を受け取る。
 pub(super) fn draw_bar_button(
     ui: &mut egui::Ui,
@@ -400,6 +407,23 @@ mod bar_button_touch_tests {
             assert!(state.resolved_ids.is_empty());
         });
     }
+}
+
+#[cfg(test)]
+pub(super) fn test_current_bar_button_targets(ctx: &egui::Context) -> Vec<(egui::Id, egui::Rect)> {
+    let id = bar_button_touch_state_id(ctx);
+    let mut targets = ctx
+        .data(|data| data.get_temp::<BarButtonTouchState>(id))
+        .map(|state| {
+            state
+                .current
+                .into_iter()
+                .map(|target| (target.id, target.rect))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    targets.sort_by(|left, right| left.1.min.x.total_cmp(&right.1.min.x));
+    targets
 }
 
 /// "VST" ラベルを線分で自前描画する (= ホバーバーの VST3 管理ボタン用アイコン)。
@@ -923,40 +947,6 @@ pub(super) fn draw_camera_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     painter.rect_filled(hump, 1.2, white);
     painter.circle_stroke(body.center(), r * 0.38, stroke);
     painter.circle_filled(body.center(), r * 0.15, white);
-}
-
-pub(super) fn draw_analysis_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
-    let white = egui::Color32::WHITE;
-    let stroke = egui::Stroke::new(1.8, white);
-    // 虫眼鏡の円
-    let lens_r = r * 0.62;
-    let lens_cx = c.x - r * 0.12;
-    let lens_cy = c.y - r * 0.12;
-    painter.circle_stroke(egui::pos2(lens_cx, lens_cy), lens_r, stroke);
-    // 虫眼鏡のハンドル
-    let angle = std::f32::consts::FRAC_PI_4;
-    let handle_start = egui::pos2(
-        lens_cx + lens_r * angle.cos(),
-        lens_cy + lens_r * angle.sin(),
-    );
-    let handle_end = egui::pos2(c.x + r * 0.72, c.y + r * 0.72);
-    painter.line_segment([handle_start, handle_end], egui::Stroke::new(2.2, white));
-    // 十字線（レンズ内）
-    let ch = lens_r * 0.55;
-    painter.line_segment(
-        [
-            egui::pos2(lens_cx - ch, lens_cy),
-            egui::pos2(lens_cx + ch, lens_cy),
-        ],
-        egui::Stroke::new(1.2, white),
-    );
-    painter.line_segment(
-        [
-            egui::pos2(lens_cx, lens_cy - ch),
-            egui::pos2(lens_cx, lens_cy + ch),
-        ],
-        egui::Stroke::new(1.2, white),
-    );
 }
 
 /// 360 度パノラマアイコン (球体 + 経度線) を描画する。

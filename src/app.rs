@@ -8582,6 +8582,22 @@ pub(crate) struct NormalFolderOmittedEntries {
     pub(crate) counts: folder_scan::OmittedFolderEntryCounts,
 }
 
+/// 静止画フルスクリーンの「その他の機能」パネルが所有する排他的な表示状態。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum FsOverflowPanelState {
+    #[default]
+    Closed,
+    Root,
+    NavigatorPosition,
+    Customize,
+}
+
+impl FsOverflowPanelState {
+    pub(crate) fn is_open(self) -> bool {
+        self != Self::Closed
+    }
+}
+
 pub struct App {
     pub(crate) address: String,
     pub(crate) current_folder: Option<PathBuf>,
@@ -10071,6 +10087,8 @@ pub struct App {
     pub(crate) fit_popup_open: bool,
     /// スライドショー設定ポップアップ表示中
     pub(crate) slideshow_popup_open: bool,
+    /// 上バーの「…」から開く下部オーバーレイ。root / submenu / customization を単一状態で所有する。
+    pub(crate) fs_overflow_panel_state: FsOverflowPanelState,
 
     // ── スライドショー ────────────────────────────────────────────
     /// スライドショー再生中フラグ
@@ -12795,6 +12813,7 @@ impl App {
             spread_popup_open: false,
             fit_popup_open: false,
             slideshow_popup_open: false,
+            fs_overflow_panel_state: FsOverflowPanelState::Closed,
             slideshow_playing: false,
             slideshow_next_at: std::time::Instant::now(),
             slideshow_anchor_idx: None,
@@ -14345,6 +14364,7 @@ impl App {
             || self.show_tag_editor
             || self.show_tag_apply
             || self.fullscreen_tag_picker_open
+            || self.fs_overflow_panel_state.is_open()
             || self.show_fav_add_dialog
             || self.show_open_folder_dialog
             || self.show_subfolder_expansion_dialog
@@ -56959,6 +56979,7 @@ impl App {
         // ナビゲーションした場合も旧ページの dirty 値を確定してから idx を切り替える。
         self.persist_pending_view_trim_state();
         self.close_fs_side_panel_runtime();
+        self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
     }
 
     fn close_fs_side_panel_runtime(&mut self) {

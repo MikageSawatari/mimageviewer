@@ -690,6 +690,73 @@ impl FullscreenNavigatorCorner {
             corner => corner,
         }
     }
+
+    pub fn label(self) -> &'static str {
+        match self.normalized() {
+            Self::TopLeft => "左上",
+            Self::TopRight => "右上",
+            Self::BottomLeft => "左下",
+            Self::BottomRight => "右下",
+            Self::Unknown => unreachable!(),
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// Fullscreen overflow panel items
+// -----------------------------------------------------------------------
+
+/// 静止画フルスクリーンの「その他の機能」パネルに並べる項目。
+///
+/// 保存順に無い将来項目は [`Self::ordered_with_fallback`] が末尾へ補い、旧バイナリが
+/// 将来版の変種を読んだ場合は `Unknown` として安全に読み飛ばす。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FullscreenOverflowItemId {
+    NavigatorToggle,
+    NavigatorPosition,
+    ImageAnalysis,
+    PixelGrid,
+    LoupeLock,
+    #[serde(other)]
+    Unknown,
+}
+
+impl FullscreenOverflowItemId {
+    pub fn default_order() -> &'static [Self] {
+        &[
+            Self::NavigatorToggle,
+            Self::NavigatorPosition,
+            Self::ImageAnalysis,
+            Self::PixelGrid,
+            Self::LoupeLock,
+        ]
+    }
+
+    pub fn ordered_with_fallback(saved: &[Self]) -> Vec<Self> {
+        let mut out = Vec::with_capacity(Self::default_order().len());
+        for &id in saved {
+            if id != Self::Unknown && !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        for &id in Self::default_order() {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        out
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NavigatorToggle => "ナビゲータ",
+            Self::NavigatorPosition => "ナビゲータ位置",
+            Self::ImageAnalysis => "分析ツール",
+            Self::PixelGrid => "ピクセルグリッド",
+            Self::LoupeLock => "ルーペ固定",
+            Self::Unknown => "不明な項目",
+        }
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -3773,6 +3840,13 @@ pub struct Settings {
     /// Screen corner used by the fullscreen navigator.
     #[serde(default)]
     pub fullscreen_navigator_corner: FullscreenNavigatorCorner,
+    /// 「その他の機能」パネルの項目順。空 Vec は既定順。
+    /// 保存順に無い新項目は FullscreenOverflowItemId::ordered_with_fallback が末尾へ補う。
+    #[serde(default)]
+    pub fullscreen_overflow_item_order: Vec<FullscreenOverflowItemId>,
+    /// 「その他の機能」パネルで非表示にする項目。順序とは別に保持し、新項目は既定で表示する。
+    #[serde(default)]
+    pub fullscreen_overflow_hidden_items: Vec<FullscreenOverflowItemId>,
     /// Length of one side of the navigator canvas in logical points.
     #[serde(default = "default_fullscreen_navigator_size")]
     pub fullscreen_navigator_size: f32,
@@ -5205,6 +5279,8 @@ impl Default for Settings {
             fullscreen_side_panel_mode: FsSidePanelMode::default(),
             fullscreen_navigator_visible: false,
             fullscreen_navigator_corner: FullscreenNavigatorCorner::default(),
+            fullscreen_overflow_item_order: Vec::new(),
+            fullscreen_overflow_hidden_items: Vec::new(),
             fullscreen_navigator_size: FULLSCREEN_NAVIGATOR_SIZE_DEFAULT,
             fullscreen_seek_bar_locked: false,
             fullscreen_top_bar_locked: false,
@@ -7088,6 +7164,12 @@ impl Settings {
         // UI 表示倍率は設定メニューから即時変更するため、環境設定ダイアログを開いたまま
         // 変更しても OK 押下時の古い snapshot で巻き戻さない。
         self.ui_scale_factor = src.ui_scale_factor;
+        // ── フルスクリーン「その他の機能」パネル ──
+        // 上バーの「…」右クリックで live 変更するため、環境設定の古い snapshot で戻さない。
+        self.fullscreen_overflow_item_order =
+            std::mem::take(&mut src.fullscreen_overflow_item_order);
+        self.fullscreen_overflow_hidden_items =
+            std::mem::take(&mut src.fullscreen_overflow_hidden_items);
         // ── ツールバー カスタマイズ (v2.0.0: 環境設定ではなくツールバー右クリックで編集) ──
         // 表示/非表示・並び順・行頭・表示形式・出す項目は、環境設定ダイアログを開いている
         // 間にも右クリックメニューから変更できる。OK 押下時に旧 snapshot で巻き戻らないよう、
@@ -7626,6 +7708,55 @@ mod tests {
                 value.to_bits()
             );
         }
+    }
+
+    // -- Fullscreen overflow panel order --
+
+    #[test]
+    fn fullscreen_overflow_order_empty_is_default() {
+        assert_eq!(
+            FullscreenOverflowItemId::ordered_with_fallback(&[]),
+            FullscreenOverflowItemId::default_order()
+        );
+    }
+
+    #[test]
+    fn fullscreen_overflow_order_appends_new_items_and_drops_unknown_duplicates() {
+        let saved = vec![
+            FullscreenOverflowItemId::PixelGrid,
+            FullscreenOverflowItemId::Unknown,
+            FullscreenOverflowItemId::PixelGrid,
+            FullscreenOverflowItemId::NavigatorToggle,
+        ];
+        let got = FullscreenOverflowItemId::ordered_with_fallback(&saved);
+        assert_eq!(got[0], FullscreenOverflowItemId::PixelGrid);
+        assert_eq!(got[1], FullscreenOverflowItemId::NavigatorToggle);
+        assert_eq!(got.len(), FullscreenOverflowItemId::default_order().len());
+        assert!(!got.contains(&FullscreenOverflowItemId::Unknown));
+        for &item in FullscreenOverflowItemId::default_order() {
+            assert_eq!(got.iter().filter(|&&saved| saved == item).count(), 1);
+        }
+    }
+
+    #[test]
+    fn fullscreen_overflow_item_deserializes_unknown_tolerantly() {
+        let items: Vec<FullscreenOverflowItemId> =
+            serde_json::from_str(r#"["NavigatorToggle","FutureItem","LoupeLock"]"#).unwrap();
+        assert_eq!(
+            items,
+            vec![
+                FullscreenOverflowItemId::NavigatorToggle,
+                FullscreenOverflowItemId::Unknown,
+                FullscreenOverflowItemId::LoupeLock,
+            ]
+        );
+    }
+
+    #[test]
+    fn fullscreen_overflow_customization_defaults_when_fields_are_missing() {
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert!(settings.fullscreen_overflow_item_order.is_empty());
+        assert!(settings.fullscreen_overflow_hidden_items.is_empty());
     }
 
     // -- Toolbar section order (v2.0.0 Phase 1) --

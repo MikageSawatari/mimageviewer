@@ -5,6 +5,17 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 #[test]
+fn fullscreen_overflow_panel_registers_as_common_modal_and_closes_at_file_boundary() {
+    let mut app = setup_app_for_test();
+    app.fs_overflow_panel_state = FsOverflowPanelState::Root;
+    assert!(app.common_modal_dialog_open());
+    assert!(app.any_modal_dialog_open_for_fullscreen_keys());
+
+    app.reset_fs_side_panel_runtime_for_file_change();
+    assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+}
+
+#[test]
 fn display_image_texture_options_always_keep_the_complete_mip_chain() {
     assert_eq!(
         DISPLAY_IMAGE_TEXTURE_OPTIONS.mipmap_mode,
