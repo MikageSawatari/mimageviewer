@@ -20,6 +20,9 @@
 | [preset-and-adjustment.md](preset-and-adjustment.md) | 補正・プリセット・AI キャッシュを触るとき。**無効化ルールの早見表** |
 | [adjustment-scope-selector-plan.md](adjustment-scope-selector-plan.md) | **設計合意済み・未実装**。補正スコープを「このページの個別設定 > その場所の標準」の 2 段へ再設計する計画。お気に入りごとの `□ お気に入り用標準設定を使う` (既定 OFF、ON/OFF の実体は `favorite_params` 行の有無)、標準（共通）/ 標準（お気に入り「xxx」）の名称、`Ctrl+Alt+数字` の書き込み先統一と `Ctrl+Alt+-` 追加、表示トリムとの語彙・見た目統一。永続データ変更なし・移行不要 |
 | [ai-processing-size-threshold-plan.md](ai-processing-size-threshold-plan.md) | AI 処理の入力サイズ閾値、縮小規則、テスト要件を触るとき |
+| [web-remote-plan.md](web-remote-plan.md) | **v3.0.0 で出荷**。リモート閲覧の正本。本体 / remote service / Web UI の 3 プロセス構成、IPC protocol と版管理、Tailscale + PIN の認証境界、表示所有権の cutover、閲覧できる範囲と操作できない範囲。リモートを触るときは最初にここを読む |
+| [web-remote-video-streaming-plan.md](web-remote-video-streaming-plan.md) | リモートの動画 / 音声。PC 側トランスコード + HLS 配信、画質 mode、seek と再接続 |
+| [web-remote-left-panel-plan.md](web-remote-left-panel-plan.md) | リモートの左パネル (場所 / 検索 / タグ / お気に入り / 本棚) の範囲と、本体一覧との差 |
 | [web-remote-ai-plan.md](web-remote-ai-plan.md) | **段 3b-0〜3b-2 実装・実機確認済み。JPEG 転送 / 端末別画質 mode は実装済み・実機確認待ち**。remote AI アップスケール / デノイズの PC modal 排他、共有 canonical decoder、接続取得 / 切断 drain barrier、App 所有 singleton Runtime、stable remote key、HTTP job、Web UI、画面消灯復帰、VRAM、撤退条件 |
 | [local-adjust-testing.md](local-adjust-testing.md) | 部分補正レイヤーの回帰テスト、合成順、キャッシュ無効化を検証するとき |
 | [search-architecture.md](search-architecture.md) | 検索 / インデクサ / タグを触るとき。**Ctrl+S/F/G の経路 + インデクサパイプライン + DB 責任分離** |

@@ -29,6 +29,7 @@
 | ワーカー追加・キャッシュ・キャンセル処理 | [docs/async-architecture.md](docs/async-architecture.md) |
 | UI スレッドから新しい同期 I/O / GPU アップロード / read_dir 走査を呼ぶ | [docs/ui-responsiveness.md](docs/ui-responsiveness.md) (§4 チェックリスト) |
 | ZIP / PDF 対応が必要な機能 | [docs/virtual-folders.md](docs/virtual-folders.md) |
+| **リモート閲覧 (mIV Remote / `mimageviewer-remote.exe` / Web UI)** | [docs/web-remote-plan.md](docs/web-remote-plan.md) が正本。動画は [docs/web-remote-video-streaming-plan.md](docs/web-remote-video-streaming-plan.md)、AI は [docs/web-remote-ai-plan.md](docs/web-remote-ai-plan.md)。**本体の表示状態を触る修正はリモート側の所有権と IPC 版に波及する** |
 | ファイル名 prefix スタック（同接頭辞の画像を畳む集約表示・フラット読書・Shift+↓↑ ジャンプ） | [docs/filename-stack-plan.md](docs/filename-stack-plan.md) |
 | 補正 / プリセット / AI アップスケール / 消しゴム | [docs/preset-and-adjustment.md](docs/preset-and-adjustment.md) |
 | 補正レイヤー / ローカル調整 / レイヤー合成 | [docs/local-adjustment-layer-v1.1.0-plan.md](docs/local-adjustment-layer-v1.1.0-plan.md) と [docs/local-adjust-filter-candidates.md](docs/local-adjust-filter-candidates.md) |
@@ -1223,6 +1224,21 @@ cargo test -p mimageviewer --test <integration-test-name>
 これは共有基盤を横断する変更の最終確認、リリース前、または明示的に全体確認を求められた
 場合に実行する。機能追加中の試行錯誤ごとには実行しない。詳細と判断表は
 [docs/development-build-and-test.md](docs/development-build-and-test.md) を参照。
+
+⚠️ **`test-full.ps1` は `target\release\mimageviewer-core.exe` と
+`target\release\mimageviewer-remote.exe` が既に在ることを前提にする**。`--workspace` が
+launcher package を含み、その build.rs が内包対象 exe の存在を検査するため、どちらかが
+無いと**テストが 1 件も走らないままビルドエラーで落ちる**。新しい clone や
+`cargo clean` 直後は、先に 2 本を作ってから走らせる (どちらでもよい):
+
+```powershell
+.\scripts\build-release.ps1     # core -> remote -> launcher を正しい順で作る
+cargo build --release --bin mimageviewer-core
+cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets
+```
+
+`build-dist.ps1` は test-full を `cargo clean` の**前**に回すので、直前のビルド成果物が
+残っている通常のリリース機では問題にならない。
 
 ### 修正完了時の実機確認用バイナリ
 
