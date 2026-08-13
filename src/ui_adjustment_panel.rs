@@ -736,6 +736,39 @@ mod local_adjust_segmentation_tests {
         );
     }
 
+    /// 補正レイヤーは中間 alpha を持つので `f32` 版を残し、消しゴム / 隠蔽は
+    /// `bool` 版を使う (§3.3)。**利用者から見れば同じ「1px拡張・縮小」**なので、
+    /// 0/1 だけのマスクでは両者が一致しなければならない。
+    ///
+    /// 実装が 2 本ある以上、片方だけ端の扱いや近傍を変えても気付けない。ここで縛る。
+    #[test]
+    fn the_f32_and_bool_morphs_agree_on_a_binary_mask() {
+        // 端・角・孤立点・穴を 1 枚に詰める。端の clamp が割れると必ずどこかが食い違う。
+        let rows = [
+            "X..X.", //
+            ".XX..", //
+            "..X.X", //
+            "XX...", //
+        ];
+        let (w, h) = (5, 4);
+        let bits: Vec<bool> = rows
+            .iter()
+            .flat_map(|row| row.chars())
+            .map(|c| c == 'X')
+            .collect();
+        let alpha: Vec<f32> = bits.iter().map(|&b| if b { 1.0 } else { 0.0 }).collect();
+
+        for dilate in [true, false] {
+            let from_f32 = local_adjust_morph_alpha_1px(&alpha, w, h, dilate);
+            let from_bool = crate::mask_db::morph_bitmap_mask_1px(&bits, w, h, dilate);
+            let as_bits: Vec<bool> = from_f32.iter().map(|&v| v >= 0.5).collect();
+            assert_eq!(
+                as_bits, from_bool,
+                "the two 1px morph implementations disagree (dilate={dilate})"
+            );
+        }
+    }
+
     #[test]
     fn linear_gradient_handle_hit_detects_endpoints() {
         let layer = local_adjust_core::LocalAdjustmentLayer::new(

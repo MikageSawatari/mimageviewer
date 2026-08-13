@@ -1383,6 +1383,71 @@ mod tests {
         assert_eq!(mask, vec![false; 5]);
     }
 
+    /// スキャンライン span fill が壊れるときの典型は、行を跨いで**回り込む**形。
+    /// 1 行ずつ span を積む実装は、親 span より外へ伸びた先の枝を落としやすい。
+    ///
+    /// 下の U 字は、seed から下へ降り、底を渡り、反対側を**上へ戻る**必要がある。
+    /// 右の柱が塗り残っていたら、隣接行の走査範囲が親 span に閉じている。
+    #[test]
+    fn bitmap_mask_flood_fill_connected_walks_around_a_concave_region() {
+        let ink = egui::Color32::from_rgb(10, 10, 10);
+        let paper = egui::Color32::WHITE;
+        let (w, h) = (7, 5);
+        let rows = [
+            "X.....X", //
+            "X.....X", //
+            "X.....X", //
+            "XXXXXXX", //
+            ".......",
+        ];
+        let colors: Vec<egui::Color32> = rows
+            .iter()
+            .flat_map(|row| row.chars())
+            .map(|c| if c == 'X' { ink } else { paper })
+            .collect();
+        let image = color_image(&colors, w, h);
+        let mut mask = vec![false; w * h];
+
+        assert!(flood_fill_bitmap_mask(
+            &mut mask, &image, 0, 0, 0, true, true
+        ));
+
+        let expected: Vec<bool> = rows
+            .iter()
+            .flat_map(|row| row.chars())
+            .map(|c| c == 'X')
+            .collect();
+        assert_eq!(
+            mask, expected,
+            "the far column must be reached around the U"
+        );
+    }
+
+    /// 隣接行の一致範囲が親 span より**広い**場合、左右へ伸ばし切ること。
+    /// 親の範囲だけを塗ると、下の行の両端が残る。
+    #[test]
+    fn bitmap_mask_flood_fill_connected_widens_past_the_parent_span() {
+        let ink = egui::Color32::from_rgb(10, 10, 10);
+        let paper = egui::Color32::WHITE;
+        let colors: Vec<egui::Color32> = "..X..XXXXX"
+            .chars()
+            .map(|c| if c == 'X' { ink } else { paper })
+            .collect();
+        let image = color_image(&colors, 5, 2);
+        let mut mask = vec![false; 10];
+
+        assert!(flood_fill_bitmap_mask(
+            &mut mask, &image, 2, 0, 0, true, true
+        ));
+
+        assert_eq!(
+            mask,
+            vec![
+                false, false, true, false, false, true, true, true, true, true
+            ]
+        );
+    }
+
     #[test]
     fn bitmap_mask_flood_fill_connected_uses_four_neighbors() {
         let red = egui::Color32::from_rgb(100, 20, 30);
