@@ -132,6 +132,33 @@ impl CatalogDb {
         }))
     }
 
+    /// filename -> 元画像の寸法を、thumbnail の blob を読まずに返す。
+    ///
+    /// `load_all` は `thumb_data` も SELECT する。実測で 1 行あたり平均 35 KiB あり
+    /// (4,628 枚のカタログで 157 MiB)、5 万枚のフォルダでは寸法を知るためだけに
+    /// 1.7 GB を運ぶことになる。整数列だけで答えられる問いにはこちらを使う。
+    ///
+    /// 値の `None` は「行はあるが寸法列が NULL」(寸法列より前に保存された古いエントリ) を、
+    /// key の不在は「行が無い」を表す。blob からの復元が要る呼び出し側は、前者のときだけ
+    /// `load_one` で個別に取り直す。
+    pub fn load_source_dims(&self) -> rusqlite::Result<HashMap<String, Option<(u32, u32)>>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT filename, source_width, source_height FROM thumbnails")?;
+        let mut map = HashMap::new();
+        let iter = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<u32>>(1)?,
+                row.get::<_, Option<u32>>(2)?,
+            ))
+        })?;
+        for (filename, width, height) in iter.flatten() {
+            map.insert(filename, valid_dims(width, height));
+        }
+        Ok(map)
+    }
+
     /// DB 内の全エントリを HashMap<filename, CacheEntry> として返す（一括 SELECT）。
     pub fn load_all(&self) -> rusqlite::Result<HashMap<String, CacheEntry>> {
         let conn = self.conn.lock().unwrap();
@@ -1237,6 +1264,40 @@ mod tests {
 
         let map = db.load_all().unwrap();
         assert_eq!(map["no_dims.jpg"].source_dims, None);
+    }
+
+    #[test]
+    fn source_dims_query_separates_a_missing_row_from_a_row_without_dimensions() {
+        // Callers use the difference to decide whether reading a thumbnail is worth it:
+        // a missing row has nothing to recover, an empty one predates the columns.
+        let db = open_in_memory();
+        db.save("wide.jpg", 1, 10, 128, 96, Some((4000, 3000)), b"thumb")
+            .unwrap();
+        db.save("legacy.jpg", 2, 20, 128, 96, None, b"thumb")
+            .unwrap();
+
+        let dims = db.load_source_dims().unwrap();
+        assert_eq!(dims.get("wide.jpg"), Some(&Some((4000, 3000))));
+        assert_eq!(dims.get("legacy.jpg"), Some(&None));
+        assert_eq!(dims.get("absent.jpg"), None);
+        assert_eq!(dims.len(), 2);
+    }
+
+    #[test]
+    fn source_dims_query_agrees_with_the_full_load_it_replaces() {
+        let db = open_in_memory();
+        db.save("a.jpg", 1, 10, 128, 96, Some((1200, 1800)), b"a")
+            .unwrap();
+        db.save("b.jpg", 2, 20, 128, 96, Some((1800, 1200)), b"b")
+            .unwrap();
+        db.save("c.jpg", 3, 30, 128, 96, None, b"c").unwrap();
+
+        let full = db.load_all().unwrap();
+        let dims = db.load_source_dims().unwrap();
+        assert_eq!(full.len(), dims.len());
+        for (filename, entry) in &full {
+            assert_eq!(dims.get(filename), Some(&entry.source_dims), "{filename}");
+        }
     }
 
     #[test]

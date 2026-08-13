@@ -3978,14 +3978,18 @@ impl ContainerEngine {
         container_path: &Path,
         items: &[crate::grid_item::GridItem],
     ) -> Vec<bool> {
-        let cached = crate::catalog::CatalogDb::open_existing_read_only(
+        // 寸法列だけを引く。`load_all` は thumbnail の blob も運ぶので、横長かどうかを
+        // 知るためだけに 5 万枚で 1.7 GB を確保して即捨てることになる。
+        let catalog = crate::catalog::CatalogDb::open_existing_read_only(
             &crate::catalog::default_cache_dir(),
             container_path,
         )
         .ok()
-        .flatten()
-        .and_then(|catalog| catalog.load_all().ok())
-        .unwrap_or_default();
+        .flatten();
+        let cached = catalog
+            .as_ref()
+            .and_then(|catalog| catalog.load_source_dims().ok())
+            .unwrap_or_default();
         items
             .iter()
             .map(|item| {
@@ -4002,15 +4006,21 @@ impl ContainerEngine {
                     }
                     _ => None,
                 };
-                key.and_then(|key| cached.get(&key))
-                    .and_then(|entry| {
-                        entry
-                            .source_dims
-                            .or_else(|| crate::catalog::decode_thumb_dims(&entry.jpeg_data))
+                key.and_then(|key| {
+                    // A missing key means no catalog row at all. A present-but-empty value is a
+                    // row saved before the dimension columns existed, and only those are worth
+                    // paying for a thumbnail read to recover.
+                    let recorded = cached.get(&key)?;
+                    recorded.or_else(|| {
+                        catalog
+                            .as_ref()
+                            .and_then(|catalog| catalog.load_one(&key).ok().flatten())
+                            .and_then(|entry| crate::catalog::decode_thumb_dims(&entry.jpeg_data))
                     })
-                    // Catalog dimensions are a layout/aspect space. PDF page-box values are valid
-                    // here because only their ratio is observed; they are not an edit coordinate.
-                    .is_some_and(catalog_dims_are_landscape)
+                })
+                // Catalog dimensions are a layout/aspect space. PDF page-box values are valid
+                // here because only their ratio is observed; they are not an edit coordinate.
+                .is_some_and(catalog_dims_are_landscape)
             })
             .collect()
     }
