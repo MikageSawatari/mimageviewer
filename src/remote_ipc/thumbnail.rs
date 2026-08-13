@@ -53,6 +53,30 @@ impl WorkerContext {
             .ok(),
         }
     }
+
+    /// `RemoteImageLoadKind::AutoTrimReference` 専用。**`open()` を呼ばないこと**が要点で、
+    /// あれは SQLite を 9 個開くため、見開きページごとに走らせる値段ではない。
+    ///
+    /// 安全な理由: `load_image_timed` が `WorkerContext` を読むのは
+    /// `prepare_remote_composite_timed` へ渡す 1 箇所だけで、そこは `compose_full_page`
+    /// (= `RemoteImageLoadKind::composes_page()`) の内側にある。`AutoTrimReference` は
+    /// それが false で、生 raster と bbox しか作らない。`decode_remote_source` も
+    /// pin / adjustment DB を明示的に `None` で呼ぶ。
+    ///
+    /// 合成する load kind へこれを渡さないこと (補正・編集が黙って外れる)。
+    pub(super) fn without_databases() -> Self {
+        Self {
+            folder_pin_db: None,
+            video_pin_db: None,
+            rotation_db: None,
+            adjustment_db: None,
+            mask_db: None,
+            local_adjust_db: None,
+            conceal_db: None,
+            comic_db: None,
+            crop_db: None,
+        }
+    }
 }
 
 #[derive(Clone, Eq)]

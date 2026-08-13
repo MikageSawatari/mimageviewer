@@ -718,6 +718,24 @@ fn harmonized_remote_auto_bbox(
     }
 }
 
+fn complete_remote_view_trim_bbox_from_partner(
+    plan: &RemoteViewTrimPlan,
+    current_auto_trim_bbox: Option<egui::Rect>,
+    partner: RemotePartnerResult<Option<egui::Rect>>,
+) -> Option<egui::Rect> {
+    match (plan, partner) {
+        (RemoteViewTrimPlan::Stored(bbox), _) => *bbox,
+        (RemoteViewTrimPlan::AutoSingle, _) => current_auto_trim_bbox,
+        (
+            RemoteViewTrimPlan::AutoSpread { side, .. },
+            RemotePartnerResult::Resolved(partner_auto_trim_bbox),
+        ) => harmonized_remote_auto_bbox(*side, current_auto_trim_bbox, partner_auto_trim_bbox),
+        (RemoteViewTrimPlan::AutoSpread { .. }, RemotePartnerResult::NotRequired) => {
+            unreachable!()
+        }
+    }
+}
+
 fn remote_auto_trim_cache_key(
     address: &RemoteAddress,
     resolved: &ResolvedPath,
@@ -1781,6 +1799,99 @@ impl RemoteViewTrimPlan {
     fn requires_auto_detection(&self) -> bool {
         matches!(self, Self::AutoSingle | Self::AutoSpread { .. })
     }
+
+    fn spread_partner(&self) -> Option<&RemoteAddress> {
+        match self {
+            Self::AutoSpread { partner, .. } => Some(partner),
+            Self::Stored(_) | Self::AutoSingle => None,
+        }
+    }
+}
+
+enum RemotePartnerStart<T, I> {
+    NotRequired,
+    Cached(T),
+    Resolve(I),
+}
+
+enum RemotePartnerResult<T> {
+    NotRequired,
+    Resolved(T),
+}
+
+enum ScopedRemotePartner<'scope, T, E> {
+    NotRequired,
+    Ready(T),
+    Pending {
+        participant_cancel: Arc<AtomicBool>,
+        handle: std::thread::ScopedJoinHandle<'scope, Result<T, E>>,
+    },
+}
+
+impl<T, E> ScopedRemotePartner<'_, T, E> {
+    fn cancel(&self) {
+        if let Self::Pending {
+            participant_cancel, ..
+        } = self
+        {
+            participant_cancel.store(true, Ordering::Release);
+        }
+    }
+
+    fn collect(self) -> Result<RemotePartnerResult<T>, E> {
+        match self {
+            Self::NotRequired => Ok(RemotePartnerResult::NotRequired),
+            Self::Ready(value) => Ok(RemotePartnerResult::Resolved(value)),
+            Self::Pending { handle, .. } => match handle.join() {
+                Ok(result) => result.map(RemotePartnerResult::Resolved),
+                Err(payload) => std::panic::resume_unwind(payload),
+            },
+        }
+    }
+}
+
+fn with_scoped_remote_partner<T, I, S, R, E, Resolve, Source, Finish>(
+    start: RemotePartnerStart<T, I>,
+    resolve: Resolve,
+    source: Source,
+    finish: Finish,
+) -> Result<R, E>
+where
+    T: Send,
+    I: Send,
+    E: Send,
+    Resolve: FnOnce(I, Arc<AtomicBool>) -> Result<T, E> + Send,
+    Source: FnOnce() -> Result<S, E>,
+    Finish: for<'scope> FnOnce(S, ScopedRemotePartner<'scope, T, E>) -> Result<R, E>,
+{
+    std::thread::scope(|scope| {
+        let partner = match start {
+            RemotePartnerStart::NotRequired => ScopedRemotePartner::NotRequired,
+            RemotePartnerStart::Cached(value) => ScopedRemotePartner::Ready(value),
+            RemotePartnerStart::Resolve(input) => {
+                let participant_cancel = Arc::new(AtomicBool::new(false));
+                let worker_cancel = Arc::clone(&participant_cancel);
+                let handle = scope.spawn(move || resolve(input, worker_cancel));
+                ScopedRemotePartner::Pending {
+                    participant_cancel,
+                    handle,
+                }
+            }
+        };
+        let source = match source() {
+            Ok(source) => source,
+            Err(error) => {
+                partner.cancel();
+                return Err(error);
+            }
+        };
+        finish(source, partner)
+    })
+}
+
+struct RemotePartnerAutoTrimRequest {
+    address: RemoteAddress,
+    resolved: ResolvedPath,
 }
 
 struct SpreadPayload {
@@ -3338,62 +3449,93 @@ impl ContainerEngine {
         } else {
             RemoteImageLoadKind::CompositedPage
         };
+        let partner_start = match self.prepare_remote_auto_trim_partner_timed(
+            &view_trim_plan,
+            request.target_px,
+            &cancel,
+            resolve_stage.as_mut(),
+        ) {
+            Ok(start) => start,
+            Err(error) => return PageResponse::Error(error),
+        };
         let load_timing = resolve_stage.take().map(|resolve| RemotePageLoadTiming {
             perf: page_perf.clone(),
             resolve,
         });
-        let response = match self.load_image_timed(
-            &request.address,
-            &resolved,
-            request.target_px,
-            load_kind,
-            priority == PagePriority::Foreground,
-            context,
-            Some(&cancel),
-            request.adjustment_preview.as_ref(),
-            load_timing,
-            None,
-        ) {
-            Ok(loaded) => {
+        let foreground = priority == PagePriority::Foreground;
+        let response = with_scoped_remote_partner(
+            partner_start,
+            |partner: RemotePartnerAutoTrimRequest, partner_cancel| {
+                // 相手ページは AutoTrimReference なので合成せず、context の DB を 1 つも
+                // 読まない。ここで WorkerContext::open() を呼ぶと、見開きページごとに
+                // SQLite を 9 個開くことになる。
+                let partner_context = WorkerContext::without_databases();
+                self.remote_auto_trim_bbox_timed(
+                    &partner.address,
+                    &partner.resolved,
+                    request.target_px,
+                    foreground,
+                    &partner_context,
+                    &partner_cancel,
+                    None,
+                )
+            },
+            || {
+                let loaded = self.load_image_timed(
+                    &request.address,
+                    &resolved,
+                    request.target_px,
+                    load_kind,
+                    foreground,
+                    context,
+                    Some(&cancel),
+                    request.adjustment_preview.as_ref(),
+                    load_timing,
+                    None,
+                )?;
+                if cancel.load(Ordering::Acquire) {
+                    return Err(media_error(
+                        MediaErrorCode::Cancelled,
+                        "ページの表示需要がなくなったため処理を取り消しました",
+                    ));
+                }
+                Ok(loaded)
+            },
+            |loaded, partner| {
                 let mut trim_stage = page_perf.enter(RemotePageStage::Trim);
-                match self.complete_remote_view_trim_bbox_timed(
+                let partner_auto_trim_bbox = partner.collect()?;
+                let view_trim_bbox = complete_remote_view_trim_bbox_from_partner(
                     &view_trim_plan,
                     loaded.auto_trim_bbox,
-                    request.target_px,
-                    priority == PagePriority::Foreground,
-                    context,
-                    &cancel,
-                    trim_stage.as_mut(),
-                ) {
-                    Ok(view_trim_bbox) => {
-                        let encode_timing = trim_stage.take().map(|trim| RemotePageEncodeTiming {
-                            perf: page_perf.clone(),
-                            trim,
-                        });
-                        match encode_remote_page_jpeg_timed(
-                            &loaded.pixels,
-                            request.target_px,
-                            view_trim_bbox,
-                            encode_timing,
-                        ) {
-                            Some((bytes, width, height)) => PageResponse::Success(PagePayload {
-                                bytes,
-                                content_type: "image/jpeg".to_owned(),
-                                width,
-                                height,
-                                identity: loaded.identity.clone(),
-                            }),
-                            None => PageResponse::Error(media_error(
-                                MediaErrorCode::RenderFailed,
-                                "JPEG エンコードに失敗しました",
-                            )),
-                        }
-                    }
-                    Err(error) => PageResponse::Error(error),
-                }
-            }
-            Err(error) => PageResponse::Error(error),
-        };
+                    partner_auto_trim_bbox,
+                );
+                let encode_timing = trim_stage.take().map(|trim| RemotePageEncodeTiming {
+                    perf: page_perf.clone(),
+                    trim,
+                });
+                Ok(
+                    match encode_remote_page_jpeg_timed(
+                        &loaded.pixels,
+                        request.target_px,
+                        view_trim_bbox,
+                        encode_timing,
+                    ) {
+                        Some((bytes, width, height)) => PageResponse::Success(PagePayload {
+                            bytes,
+                            content_type: "image/jpeg".to_owned(),
+                            width,
+                            height,
+                            identity: loaded.identity.clone(),
+                        }),
+                        None => PageResponse::Error(media_error(
+                            MediaErrorCode::RenderFailed,
+                            "JPEG エンコードに失敗しました",
+                        )),
+                    },
+                )
+            },
+        )
+        .unwrap_or_else(PageResponse::Error);
         let response = if cancel.load(Ordering::Acquire) {
             cancelled_page_error()
         } else {
@@ -4507,6 +4649,29 @@ impl ContainerEngine {
         ))
     }
 
+    fn prepare_remote_auto_trim_partner_timed(
+        &self,
+        plan: &RemoteViewTrimPlan,
+        target_px: u32,
+        cancel: &AtomicBool,
+        wait_stage: Option<&mut RemotePageStageGuard>,
+    ) -> Result<RemotePartnerStart<Option<egui::Rect>, RemotePartnerAutoTrimRequest>, MediaError>
+    {
+        let Some(partner) = plan.spread_partner() else {
+            return Ok(RemotePartnerStart::NotRequired);
+        };
+        let resolved = self.resolve(partner)?;
+        if let Some(bbox) = self.remote_auto_trim_bbox_cache_lookup_timed(
+            partner, &resolved, target_px, cancel, wait_stage,
+        )? {
+            return Ok(RemotePartnerStart::Cached(bbox));
+        }
+        Ok(RemotePartnerStart::Resolve(RemotePartnerAutoTrimRequest {
+            address: partner.clone(),
+            resolved,
+        }))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn complete_remote_view_trim_bbox(
         &self,
@@ -4539,10 +4704,8 @@ impl ContainerEngine {
         cancel: &Arc<AtomicBool>,
         mut wait_stage: Option<&mut RemotePageStageGuard>,
     ) -> Result<Option<egui::Rect>, MediaError> {
-        match plan {
-            RemoteViewTrimPlan::Stored(bbox) => Ok(*bbox),
-            RemoteViewTrimPlan::AutoSingle => Ok(current_auto_trim_bbox),
-            RemoteViewTrimPlan::AutoSpread { side, partner } => {
+        let partner = match plan {
+            RemoteViewTrimPlan::AutoSpread { partner, .. } => {
                 // 相手 request を待たない。heavy worker が 1 本でも進められるよう、cache miss
                 // なら現在の worker が同じ cancel token で相手 raw raster を解決する。
                 let partner_resolved = self.resolve(partner)?;
@@ -4555,13 +4718,17 @@ impl ContainerEngine {
                     cancel,
                     wait_stage.as_deref_mut(),
                 )?;
-                Ok(harmonized_remote_auto_bbox(
-                    *side,
-                    current_auto_trim_bbox,
-                    partner_auto_trim_bbox,
-                ))
+                RemotePartnerResult::Resolved(partner_auto_trim_bbox)
             }
-        }
+            RemoteViewTrimPlan::Stored(_) | RemoteViewTrimPlan::AutoSingle => {
+                RemotePartnerResult::NotRequired
+            }
+        };
+        Ok(complete_remote_view_trim_bbox_from_partner(
+            plan,
+            current_auto_trim_bbox,
+            partner,
+        ))
     }
 
     fn remote_auto_trim_bbox(
@@ -4578,17 +4745,14 @@ impl ContainerEngine {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn remote_auto_trim_bbox_timed(
+    fn remote_auto_trim_bbox_cache_lookup_timed(
         &self,
         address: &RemoteAddress,
         resolved: &ResolvedPath,
         target_px: u32,
-        foreground: bool,
-        context: &WorkerContext,
-        cancel: &Arc<AtomicBool>,
-        mut wait_stage: Option<&mut RemotePageStageGuard>,
-    ) -> Result<Option<egui::Rect>, MediaError> {
+        cancel: &AtomicBool,
+        wait_stage: Option<&mut RemotePageStageGuard>,
+    ) -> Result<Option<Option<egui::Rect>>, MediaError> {
         if cancel.load(Ordering::Relaxed) {
             return Err(media_error(
                 MediaErrorCode::Busy,
@@ -4610,10 +4774,27 @@ impl ContainerEngine {
             i64::try_from(metadata.len()).unwrap_or(i64::MAX),
             target_px,
         )?;
-        if let Some(bbox) =
-            lock_with_remote_page_wait(&self.auto_trim_bbox_cache, wait_stage.as_deref_mut(), None)
-                .get(&key)
-        {
+        Ok(lock_with_remote_page_wait(&self.auto_trim_bbox_cache, wait_stage, None).get(&key))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn remote_auto_trim_bbox_timed(
+        &self,
+        address: &RemoteAddress,
+        resolved: &ResolvedPath,
+        target_px: u32,
+        foreground: bool,
+        context: &WorkerContext,
+        cancel: &Arc<AtomicBool>,
+        mut wait_stage: Option<&mut RemotePageStageGuard>,
+    ) -> Result<Option<egui::Rect>, MediaError> {
+        if let Some(bbox) = self.remote_auto_trim_bbox_cache_lookup_timed(
+            address,
+            resolved,
+            target_px,
+            cancel,
+            wait_stage.as_deref_mut(),
+        )? {
             return Ok(bbox);
         }
         self.load_image_timed(
@@ -6334,6 +6515,243 @@ mod tests {
             .map(|entry| entry.shared_cancel.load(Ordering::Acquire))
     }
 
+    #[test]
+    fn auto_spread_partner_starts_before_current_source_finishes() {
+        let current_bbox = Some(egui::Rect::from_min_max(
+            egui::pos2(0.10, 0.20),
+            egui::pos2(0.80, 0.90),
+        ));
+        let partner_bbox = Some(egui::Rect::from_min_max(
+            egui::pos2(0.25, 0.05),
+            egui::pos2(0.95, 0.70),
+        ));
+        let plan = RemoteViewTrimPlan::AutoSpread {
+            side: crate::view_trim::ViewTrimSpreadSide::Left,
+            partner: RemoteAddress::file("partner.png"),
+        };
+        let (partner_started_tx, partner_started_rx) = mpsc::channel();
+        let (source_finished_tx, source_finished_rx) = mpsc::channel();
+
+        let actual = with_scoped_remote_partner(
+            RemotePartnerStart::Resolve(()),
+            move |(), _| {
+                partner_started_tx.send(()).unwrap();
+                source_finished_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap();
+                Ok::<_, MediaError>(partner_bbox)
+            },
+            || {
+                partner_started_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap();
+                source_finished_tx.send(()).unwrap();
+                Ok::<_, MediaError>(current_bbox)
+            },
+            |current_bbox, partner| {
+                let partner = partner.collect()?;
+                Ok(complete_remote_view_trim_bbox_from_partner(
+                    &plan,
+                    current_bbox,
+                    partner,
+                ))
+            },
+        )
+        .unwrap();
+
+        let expected = crate::view_trim::harmonize_spread_auto_bboxes(current_bbox, partner_bbox).0;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn non_spread_trim_plans_do_not_start_partner_resolution() {
+        for plan in [
+            RemoteViewTrimPlan::AutoSingle,
+            RemoteViewTrimPlan::Stored(None),
+        ] {
+            let resolutions = Arc::new(AtomicUsize::new(0));
+            let resolver_count = Arc::clone(&resolutions);
+            let start: RemotePartnerStart<(), ()> = if plan.spread_partner().is_some() {
+                RemotePartnerStart::Resolve(())
+            } else {
+                RemotePartnerStart::NotRequired
+            };
+            let result = with_scoped_remote_partner(
+                start,
+                move |(), _| {
+                    resolver_count.fetch_add(1, Ordering::AcqRel);
+                    Ok::<_, MediaError>(())
+                },
+                || Ok::<_, MediaError>(()),
+                |(), partner| partner.collect().map(|_| ()),
+            );
+            assert!(result.is_ok());
+            assert_eq!(resolutions.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn cached_spread_partner_does_not_spawn_or_decode() {
+        let bbox = Some(egui::Rect::from_min_max(
+            egui::pos2(0.1, 0.2),
+            egui::pos2(0.9, 0.8),
+        ));
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let resolver_count = Arc::clone(&resolutions);
+        let result = with_scoped_remote_partner(
+            RemotePartnerStart::<_, ()>::Cached(bbox),
+            move |(), _| {
+                resolver_count.fetch_add(1, Ordering::AcqRel);
+                Ok::<_, MediaError>(None)
+            },
+            || Ok::<_, MediaError>(()),
+            |(), partner| partner.collect(),
+        )
+        .unwrap();
+
+        assert!(matches!(result, RemotePartnerResult::Resolved(value) if value == bbox));
+        assert_eq!(resolutions.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn source_failure_cancels_partner_and_leaves_scope() {
+        let cancel_seen = Arc::new(AtomicBool::new(false));
+        let worker_cancel_seen = Arc::clone(&cancel_seen);
+        let (started_tx, started_rx) = mpsc::channel();
+        let started = Instant::now();
+
+        let result = with_scoped_remote_partner(
+            RemotePartnerStart::Resolve(()),
+            move |(), participant_cancel| {
+                started_tx.send(()).unwrap();
+                let deadline = Instant::now() + Duration::from_millis(250);
+                while !participant_cancel.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                worker_cancel_seen.store(
+                    participant_cancel.load(Ordering::Acquire),
+                    Ordering::Release,
+                );
+                Ok::<_, MediaError>(())
+            },
+            || {
+                started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                Err::<(), _>(media_error(MediaErrorCode::RenderFailed, "source failed"))
+            },
+            |(), _| -> Result<(), MediaError> { unreachable!() },
+        );
+
+        assert_eq!(result.unwrap_err().code, MediaErrorCode::RenderFailed);
+        assert!(cancel_seen.load(Ordering::Acquire));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn speculative_partner_cancel_keeps_decode_for_partner_request() {
+        let flight = Arc::new(RemoteSourceSingleFlight::default());
+        let identity = source_test_identity("partner.png", 4096, true);
+        let gate: SourceTestGate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let owner = {
+            let flight = Arc::clone(&flight);
+            let identity = identity.clone();
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                flight.load(
+                    identity,
+                    Arc::new(AtomicBool::new(false)),
+                    move |shared_cancel| {
+                        started_tx.send(()).unwrap();
+                        assert!(source_test_gate_wait(&gate, shared_cancel));
+                        Ok(source_test_decoded(egui::Color32::GREEN))
+                    },
+                )
+            })
+        };
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let speculative_flight = Arc::clone(&flight);
+        let source_flight = Arc::clone(&flight);
+        let source_identity = identity.clone();
+        let result = with_scoped_remote_partner(
+            RemotePartnerStart::Resolve(identity.clone()),
+            move |identity, participant_cancel| {
+                speculative_flight
+                    .load(identity, participant_cancel, |_| {
+                        panic!("speculative participant must join the existing decode")
+                    })
+                    .map(|_| ())
+            },
+            || {
+                assert!(wait_for_source_participants(
+                    &source_flight,
+                    &source_identity,
+                    2,
+                ));
+                Err::<(), _>(media_error(MediaErrorCode::RenderFailed, "source failed"))
+            },
+            |(), _| -> Result<(), MediaError> { unreachable!() },
+        );
+
+        assert_eq!(result.unwrap_err().code, MediaErrorCode::RenderFailed);
+        assert!(wait_for_source_participants(&flight, &identity, 1));
+        assert_eq!(source_shared_cancelled(&flight, &identity), Some(false));
+        source_test_gate_open(&gate);
+        assert_eq!(
+            owner.join().unwrap().unwrap().outcome,
+            RemoteSourceLoadOutcome::Decoded
+        );
+    }
+
+    #[test]
+    fn scoped_partner_collection_preserves_harmonized_bbox() {
+        let current_bbox = Some(egui::Rect::from_min_max(
+            egui::pos2(0.10, 0.20),
+            egui::pos2(0.70, 0.95),
+        ));
+        let partner_bbox = Some(egui::Rect::from_min_max(
+            egui::pos2(0.30, 0.05),
+            egui::pos2(0.90, 0.75),
+        ));
+
+        for side in [
+            crate::view_trim::ViewTrimSpreadSide::Left,
+            crate::view_trim::ViewTrimSpreadSide::Right,
+        ] {
+            let plan = RemoteViewTrimPlan::AutoSpread {
+                side,
+                partner: RemoteAddress::file("partner.png"),
+            };
+            let (expected_left, expected_right) = match side {
+                crate::view_trim::ViewTrimSpreadSide::Left => {
+                    crate::view_trim::harmonize_spread_auto_bboxes(current_bbox, partner_bbox)
+                }
+                crate::view_trim::ViewTrimSpreadSide::Right => {
+                    crate::view_trim::harmonize_spread_auto_bboxes(partner_bbox, current_bbox)
+                }
+            };
+            let expected = match side {
+                crate::view_trim::ViewTrimSpreadSide::Left => expected_left,
+                crate::view_trim::ViewTrimSpreadSide::Right => expected_right,
+            };
+            let actual = with_scoped_remote_partner(
+                RemotePartnerStart::<_, ()>::Cached(partner_bbox),
+                |(), _| Ok::<_, MediaError>(None),
+                || Ok::<_, MediaError>(current_bbox),
+                |current_bbox, partner| {
+                    Ok(complete_remote_view_trim_bbox_from_partner(
+                        &plan,
+                        current_bbox,
+                        partner.collect()?,
+                    ))
+                },
+            )
+            .unwrap();
+
+            assert_eq!(actual, expected);
+        }
+    }
+
     fn test_container_entries(count: usize, path: &str) -> (Vec<ContainerEntry>, bool) {
         let mut budget = ContainerEntryBudget::new(super::super::REMOTE_LIST_RESPONSE_BUDGET_BYTES);
         let mut entries = Vec::with_capacity(count.min(CONTAINER_ENTRY_LIMIT));
@@ -7205,6 +7623,92 @@ mod tests {
         assert!((harmonized_right.max.y - left_bbox.max.y).abs() < 1e-6);
         assert!((harmonized_left.min.x - left_bbox.min.x).abs() < 1e-6);
         assert!((harmonized_right.min.x - right_bbox.min.x).abs() < 1e-6);
+    }
+
+    /// `cached_spread_partner_does_not_spawn_or_decode` only proves the scope helper honours a
+    /// `Cached` start. Nothing checked that a warm cache actually produces one, and a regression
+    /// there is silent: every page of an already-read spread would spawn a thread and decode the
+    /// partner again while still returning the right picture.
+    #[test]
+    fn a_warm_partner_bbox_skips_the_speculative_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        let book = temp.path().join("book");
+        std::fs::create_dir(&book).unwrap();
+        write_auto_trim_test_page(&book.join("left.png"), 40, 20);
+        write_auto_trim_test_page(&book.join("right.png"), 20, 40);
+        let db_path = temp.path().join("view_trim.db");
+        let db = crate::view_trim_db::ViewTrimDb::open_at(&db_path).unwrap();
+        db.set_book_state(
+            &book,
+            crate::view_trim::ViewTrimBookState {
+                apply_mode: crate::view_trim::ViewTrimApplyMode::Auto,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drop(db);
+
+        let favorite = FavoriteEntry::new("test".to_owned(), temp.path().to_path_buf());
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            favorites: vec![favorite.clone()],
+            ..Default::default()
+        });
+        *engine
+            .view_trim_db
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&db_path).unwrap();
+        let left = favorite_address(&favorite, "book/left.png");
+        let right = favorite_address(&favorite, "book/right.png");
+        let left_resolved = engine.resolve(&left).unwrap();
+        let plan = engine
+            .remote_view_trim_plan(
+                &left,
+                &left_resolved,
+                Some(&RemotePageRenderContext {
+                    context_address: favorite_address(&favorite, "book"),
+                    display_slot: RemotePageDisplaySlot::SpreadLeft,
+                    spread_partner: Some(right.clone()),
+                }),
+            )
+            .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        assert!(
+            matches!(
+                engine
+                    .prepare_remote_auto_trim_partner_timed(&plan, 1024, &cancel, None)
+                    .unwrap(),
+                RemotePartnerStart::Resolve(_)
+            ),
+            "a cold partner has to be resolved"
+        );
+
+        // Warm it the way the partner's own request would, so the key this lookup builds has to
+        // match the key that insert built.
+        let worker = WorkerContext::open();
+        let right_resolved = engine.resolve(&right).unwrap();
+        let expected = engine
+            .remote_auto_trim_bbox(&right, &right_resolved, 1024, true, &worker, &cancel)
+            .unwrap();
+
+        match engine
+            .prepare_remote_auto_trim_partner_timed(&plan, 1024, &cancel, None)
+            .unwrap()
+        {
+            RemotePartnerStart::Cached(bbox) => assert_eq!(bbox, expected),
+            _ => panic!("a warm partner bbox must not start a speculative resolution"),
+        }
+
+        assert!(
+            matches!(
+                engine
+                    .prepare_remote_auto_trim_partner_timed(&plan, 2048, &cancel, None)
+                    .unwrap(),
+                RemotePartnerStart::Resolve(_)
+            ),
+            "another target_px is another raster, so it has to be resolved again"
+        );
     }
 
     #[test]
