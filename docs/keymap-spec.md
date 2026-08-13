@@ -435,7 +435,7 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 |---|---|
 | <kbd>?</kbd> (既定) | 消しゴムモードで使えるショートカット一覧を表示する。Action: `HelpShowContextShortcuts`。keymap 化済み操作は現在読み込まれている割り当て済みのものを表示し、固定扱いの操作は別枠で表示する |
 | <kbd>E</kbd> / <kbd>Esc</kbd> | 補完を実行して終了。選択中オブジェクトがあるときの <kbd>Esc</kbd> はまず選択解除 |
-| <kbd>S</kbd> / <kbd>B</kbd> / <kbd>L</kbd> / <kbd>I</kbd> / <kbd>V</kbd> / <kbd>H</kbd> / <kbd>R</kbd> / <kbd>O</kbd> | 選択 / 筆 / 囲み / 直線 / 縦線 / 横線 / 矩形 / 楕円ツール |
+| <kbd>S</kbd> / <kbd>B</kbd> / <kbd>K</kbd> / <kbd>L</kbd> / <kbd>P</kbd> / <kbd>I</kbd> / <kbd>V</kbd> / <kbd>H</kbd> / <kbd>R</kbd> / <kbd>O</kbd> | 選択 / 筆 / バケツ / 囲み / 多角形 / 直線 / 縦線 / 横線 / 矩形 / 楕円ツール |
 | <kbd>D</kbd> / <kbd>F</kbd> | 描画 / 消去モード切替 |
 | <kbd>Space</kbd>+左ドラッグ | 一時パン |
 | <kbd>Ctrl</kbd>+マウスホイール | ズーム。ツールパネル上でも同じ |
@@ -461,7 +461,9 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 | <kbd>D</kbd> / <kbd>F</kbd> | 描画 / 消去モード切替 |
 | <kbd>S</kbd> | 選択ツール |
 | <kbd>B</kbd> | 筆ツール |
+| <kbd>K</kbd> | バケツツール |
 | <kbd>L</kbd> | 囲みツール |
+| <kbd>P</kbd> | 多角形ツール |
 | <kbd>I</kbd> | 直線ツール |
 | <kbd>V</kbd> | 縦線ツール |
 | <kbd>H</kbd> | 横線ツール |
@@ -485,7 +487,7 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 | <kbd>Q</kbd> | 補正レイヤー直前の元画像表示 ON/OFF |
 | <kbd>W</kbd> | 選択中レイヤーのマスク表示 ON/OFF |
 | <kbd>D</kbd> / <kbd>F</kbd> | 手動マスクの描画 / 消去モード切替 |
-| <kbd>B</kbd> / <kbd>A</kbd> / <kbd>G</kbd> | 筆 / 境界筆 / すき間塗りツール |
+| <kbd>B</kbd> / <kbd>K</kbd> / <kbd>A</kbd> / <kbd>G</kbd> | 筆 / バケツ / 境界筆 / すき間塗りツール |
 | <kbd>L</kbd> / <kbd>P</kbd> | 囲み / 多角形ツール |
 | <kbd>S</kbd> | 選択ツール |
 | <kbd>I</kbd> / <kbd>V</kbd> / <kbd>H</kbd> | 直線 / 縦線 / 横線ツール |

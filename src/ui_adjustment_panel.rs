@@ -770,6 +770,29 @@ mod local_adjust_segmentation_tests {
     }
 
     #[test]
+    fn local_adjust_bucket_round_trips_through_binary_mask_for_paint_and_erase() {
+        let red = egui::Color32::from_rgb(180, 20, 20);
+        let blue = egui::Color32::from_rgb(20, 20, 180);
+        let source = egui::ColorImage::new([5, 1], vec![red, red, blue, red, red]);
+        let mut alpha = vec![0.0; 5];
+
+        assert!(flood_fill_local_adjust_alpha_mask(
+            &mut alpha, &source, 0, 0, 0, true, true,
+        ));
+        assert_eq!(alpha, vec![1.0, 1.0, 0.0, 0.0, 0.0]);
+
+        assert!(flood_fill_local_adjust_alpha_mask(
+            &mut alpha, &source, 0, 0, 0, true, false,
+        ));
+        assert_eq!(alpha, vec![0.0; 5]);
+
+        assert!(flood_fill_local_adjust_alpha_mask(
+            &mut alpha, &source, 0, 0, 0, false, true,
+        ));
+        assert_eq!(alpha, vec![1.0, 1.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
     fn linear_gradient_handle_hit_detects_endpoints() {
         let layer = local_adjust_core::LocalAdjustmentLayer::new(
             "linear",
@@ -1778,6 +1801,7 @@ fn local_mask_tool_label(tool: LocalAdjustMaskTool) -> &'static str {
     match tool {
         LocalAdjustMaskTool::Select => "選択",
         LocalAdjustMaskTool::Brush => "筆",
+        LocalAdjustMaskTool::Bucket => "バケツ",
         LocalAdjustMaskTool::EdgeBrush => "境界筆",
         LocalAdjustMaskTool::GapFillBrush => "隙間補完",
         LocalAdjustMaskTool::Lasso => "囲み",
@@ -1836,6 +1860,40 @@ fn local_adjust_morph_alpha_1px(
         }
     }
     out
+}
+
+fn flood_fill_local_adjust_alpha_mask(
+    alpha: &mut [f32],
+    source: &egui::ColorImage,
+    seed_x: usize,
+    seed_y: usize,
+    tolerance: u8,
+    connected: bool,
+    value: bool,
+) -> bool {
+    let expected_len = source.size[0].saturating_mul(source.size[1]);
+    if expected_len == 0 || alpha.len() < expected_len {
+        return false;
+    }
+    let mut bitmap: Vec<bool> = alpha[..expected_len]
+        .iter()
+        .map(|value| *value >= 0.5)
+        .collect();
+    if !crate::mask_db::flood_fill_bitmap_mask(
+        &mut bitmap,
+        source,
+        seed_x,
+        seed_y,
+        tolerance,
+        connected,
+        value,
+    ) {
+        return false;
+    }
+    for (alpha, value) in alpha[..expected_len].iter_mut().zip(bitmap) {
+        *alpha = if value { 1.0 } else { 0.0 };
+    }
+    true
 }
 
 fn local_adjust_target_raster_vector_mask_mut(
@@ -2555,13 +2613,16 @@ fn draw_local_manual_mask_tool_panel(
     for row in [
         &[
             (LocalAdjustMaskTool::Brush, "筆 [B]"),
-            (LocalAdjustMaskTool::EdgeBrush, "境界筆 [A]"),
+            (LocalAdjustMaskTool::Bucket, "バケツ [K]"),
         ][..],
         &[
+            (LocalAdjustMaskTool::EdgeBrush, "境界筆 [A]"),
             (LocalAdjustMaskTool::GapFillBrush, "隙間補完 [G]"),
-            (LocalAdjustMaskTool::Lasso, "囲み [L]"),
         ][..],
-        &[(LocalAdjustMaskTool::Polygon, "多角形 [P]")][..],
+        &[
+            (LocalAdjustMaskTool::Lasso, "囲み [L]"),
+            (LocalAdjustMaskTool::Polygon, "多角形 [P]"),
+        ][..],
     ] {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
@@ -2654,6 +2715,7 @@ fn draw_local_tool_settings(
     boundary_gap_px: &mut f32,
     edge_snap_radius: &mut f32,
     edge_brush_tolerance: &mut f32,
+    bucket_connected: &mut bool,
     edge_brush_include_boundary: &mut bool,
 ) {
     ui.label(
@@ -2700,6 +2762,19 @@ fn draw_local_tool_settings(
     }
 
     match mask_tool {
+        LocalAdjustMaskTool::Bucket => {
+            ui.add(
+                egui::Slider::new(edge_brush_tolerance, 0.0..=255.0)
+                    .text("色差の許容値")
+                    .step_by(1.0),
+            );
+            ui.checkbox(bucket_connected, "隣接のみ");
+            ui.label(
+                egui::RichText::new("画像をクリックしたときに1回だけ塗りつぶします。")
+                    .size(10.0)
+                    .weak(),
+            );
+        }
         LocalAdjustMaskTool::EdgeBrush => {
             ui.add(egui::Slider::new(boundary_edge_threshold, 0.0..=120.0).text("境界しきい値"));
             ui.add(egui::Slider::new(boundary_ink_threshold, 0.0..=120.0).text("線内部しきい値"));
@@ -2785,6 +2860,7 @@ fn draw_selected_local_adjust_layer_editor(
     boundary_gap_px: &mut f32,
     edge_snap_radius: &mut f32,
     edge_brush_tolerance: &mut f32,
+    bucket_connected: &mut bool,
     edge_brush_include_boundary: &mut bool,
     region_color_tolerance: &mut f32,
     region_min_area: &mut usize,
@@ -2819,6 +2895,7 @@ fn draw_selected_local_adjust_layer_editor(
                 boundary_gap_px,
                 edge_snap_radius,
                 edge_brush_tolerance,
+                bucket_connected,
                 edge_brush_include_boundary,
             );
             if selected_line_thickness.is_some()
@@ -9498,6 +9575,62 @@ impl App {
         }
     }
 
+    fn apply_local_adjust_bucket(
+        &mut self,
+        fs_idx: usize,
+        layer_idx: usize,
+        target: LocalAdjustMaskEditTarget,
+        norm: [f32; 2],
+    ) {
+        let Some(source) = self.current_local_adjust_source_pixels(fs_idx) else {
+            self.show_feedback_toast(
+                "バケツに使う補正前の画像を準備中です。少し待ってからもう一度クリックしてください。"
+                    .to_string(),
+            );
+            return;
+        };
+        let image_dims = local_adjust_image_dims(self, fs_idx);
+        if source.size != [image_dims.0, image_dims.1] {
+            self.show_feedback_toast(
+                "バケツに使う画像の準備が完了していません。もう一度クリックしてください。"
+                    .to_string(),
+            );
+            return;
+        }
+        let point = local_adjust_norm_to_pixel(norm, image_dims.0, image_dims.1);
+        let seed_x = point.0.floor() as usize;
+        let seed_y = point.1.floor() as usize;
+        let tolerance = self
+            .local_adjust_edge_brush_tolerance
+            .round()
+            .clamp(0.0, 255.0) as u8;
+        let connected = self.local_adjust_bucket_connected;
+        let paint = self.local_adjust_mask_paint_add;
+        let changed =
+            self.mutate_local_adjust_layer_from_canvas(fs_idx, layer_idx, true, |layer| {
+                let Some(mask) =
+                    local_adjust_target_raster_vector_mask_mut(layer, target, image_dims, paint)
+                else {
+                    return false;
+                };
+                if source.size != [mask.width, mask.height] {
+                    return false;
+                }
+                flood_fill_local_adjust_alpha_mask(
+                    &mut mask.alpha,
+                    source.as_ref(),
+                    seed_x,
+                    seed_y,
+                    tolerance,
+                    connected,
+                    paint,
+                )
+            });
+        if changed {
+            self.local_adjust_show_mask = true;
+        }
+    }
+
     fn apply_local_adjust_gradient_drag(
         &mut self,
         drag: crate::app::LocalAdjustCanvasDrag,
@@ -10311,6 +10444,12 @@ impl App {
         if !self.local_adjust_mode {
             return;
         }
+        if !self.ime_input_active(ctx)
+            && !ctx.wants_keyboard_input()
+            && self.keymap.consume_action(ctx, KeyAction::LaToolBucket)
+        {
+            self.set_local_adjust_mask_tool_from_shortcut(LocalAdjustMaskTool::Bucket);
+        }
         if self.local_adjust_add_layer_dialog_open
             || self.local_adjust_change_mask_dialog_open
             || self.local_adjust_effect_picker_dialog_open
@@ -10325,6 +10464,21 @@ impl App {
             return;
         };
         if !self.ensure_local_adjust_masks_match_source_dims(fs_idx) {
+            let bucket_canvas_click = self.local_adjust_mask_tool == LocalAdjustMaskTool::Bucket
+                && ctx.input(|input| input.pointer.primary_pressed())
+                && ctx
+                    .input(|input| input.pointer.interact_pos())
+                    .is_some_and(|pos| {
+                        transform.contains_screen(pos)
+                            && !self.local_adjust_panel_rect(full_rect).contains(pos)
+                            && !self.local_adjust_tool_panel_rect(full_rect).contains(pos)
+                    });
+            if bucket_canvas_click {
+                self.show_feedback_toast(
+                    "バケツに使う補正前の画像を準備中です。少し待ってからもう一度クリックしてください。"
+                        .to_string(),
+                );
+            }
             return;
         }
         let (
@@ -10819,6 +10973,12 @@ impl App {
             }
 
             if let Some(target) = active_mask_edit_target {
+                if self.local_adjust_mask_tool == LocalAdjustMaskTool::Bucket {
+                    self.apply_local_adjust_bucket(fs_idx, layer_idx, target, norm);
+                    ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                    ctx.request_repaint();
+                    return;
+                }
                 let point = local_adjust_norm_to_pixel(norm, image_dims.0, image_dims.1);
                 let shape_hit =
                     local_adjust_image_layout(transform, image_dims).and_then(|(scale, _)| {
@@ -10875,6 +11035,7 @@ impl App {
                 }
                 match self.local_adjust_mask_tool {
                     LocalAdjustMaskTool::Select => {}
+                    LocalAdjustMaskTool::Bucket => {}
                     LocalAdjustMaskTool::Brush
                     | LocalAdjustMaskTool::EdgeBrush
                     | LocalAdjustMaskTool::GapFillBrush => {
@@ -12677,6 +12838,7 @@ impl App {
         let mut boundary_gap_px = self.local_adjust_boundary_gap_px;
         let mut edge_snap_radius = self.local_adjust_edge_snap_radius;
         let mut edge_brush_tolerance = self.local_adjust_edge_brush_tolerance;
+        let mut bucket_connected = self.local_adjust_bucket_connected;
         let mut edge_brush_include_boundary = self.local_adjust_edge_brush_include_boundary;
         let mut region_color_tolerance = self.local_adjust_region_color_tolerance;
         let mut region_min_area = self.local_adjust_region_min_area;
@@ -12922,6 +13084,7 @@ impl App {
                                         &mut boundary_gap_px,
                                         &mut edge_snap_radius,
                                         &mut edge_brush_tolerance,
+                                        &mut bucket_connected,
                                         &mut edge_brush_include_boundary,
                                         &mut region_color_tolerance,
                                         &mut region_min_area,
@@ -12988,6 +13151,7 @@ impl App {
         self.local_adjust_boundary_gap_px = boundary_gap_px.clamp(0.0, 8.0);
         self.local_adjust_edge_snap_radius = edge_snap_radius.clamp(2.0, 64.0);
         self.local_adjust_edge_brush_tolerance = edge_brush_tolerance.clamp(0.0, 255.0);
+        self.local_adjust_bucket_connected = bucket_connected;
         self.local_adjust_edge_brush_include_boundary = edge_brush_include_boundary;
         self.local_adjust_region_color_tolerance = region_color_tolerance.clamp(4.0, 120.0);
         self.local_adjust_region_min_area = region_min_area.clamp(1, 2048);

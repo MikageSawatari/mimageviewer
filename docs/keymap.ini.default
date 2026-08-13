@@ -497,6 +497,7 @@
 # EraseDeleteShape = Delete ; 選択中の消しゴム図形を削除する
 # EraseToolSelect = S ; 選択ツールに切り替える
 # EraseToolBrush = B ; 筆ツールに切り替える
+# EraseToolBucket = K ; バケツツールに切り替える
 # EraseToolLasso = L ; 囲みツールに切り替える
 # EraseToolPolygon = P ; 多角形ツールに切り替える
 # EraseToolVLine = V ; 縦線ツールに切り替える
@@ -527,6 +528,7 @@
 # ConcealEraseMode = F ; 消去モードに切り替える
 # ConcealToolSelect = S ; 選択ツールに切り替える
 # ConcealToolBrush = B ; 筆ツールに切り替える
+# ConcealToolBucket = K ; バケツツールに切り替える
 # ConcealToolLasso = L ; 囲みツールに切り替える
 # ConcealToolPolygon = P ; 多角形ツールに切り替える
 # ConcealToolLine = I ; 直線ツールに切り替える
@@ -553,6 +555,7 @@
 # LaPaintAdd = D ; 補正マスクの追加描画モードにする
 # LaPaintErase = F ; 補正マスクの消去描画モードにする
 # LaToolBrush = B ; 筆ツールに切り替える
+# LaToolBucket = K ; バケツツールに切り替える
 # LaToolEdgeBrush = A ; 境界ブラシツールに切り替える
 # LaToolGapFill = G ; すき間塗りツールに切り替える
 # LaToolLasso = L ; 囲みツールに切り替える

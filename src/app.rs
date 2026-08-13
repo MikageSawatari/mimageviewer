@@ -3470,6 +3470,7 @@ pub(crate) struct LocalAdjustEdgePreviewCache {
 pub(crate) enum LocalAdjustMaskTool {
     Select,
     Brush,
+    Bucket,
     EdgeBrush,
     GapFillBrush,
     Lasso,
@@ -5268,6 +5269,8 @@ pub(crate) enum EraseTool {
     Line,
     /// 筆ツール: 円形ブラシで自由に塗る
     Brush,
+    /// バケツツール: クリックした画素の色差に基づいてビットマップを塗りつぶす
+    Bucket,
     /// 矩形ツール (Phase 0b): ドラッグ始終点を bbox とする回転可能な矩形を作成
     Rect,
     /// 楕円ツール (Phase 0b): ドラッグ始終点を bbox とする回転可能な楕円を作成
@@ -10692,6 +10695,8 @@ pub struct App {
     pub(crate) local_adjust_edge_snap_radius: f32,
     /// 補正レイヤー境界筆の開始色からの許容差。
     pub(crate) local_adjust_edge_brush_tolerance: f32,
+    /// 補正レイヤーバケツで seed と連結する領域だけを対象にする。
+    pub(crate) local_adjust_bucket_connected: bool,
     /// 補正レイヤー境界筆で塗り領域に接する境界線も含める。
     pub(crate) local_adjust_edge_brush_include_boundary: bool,
     /// Ctrl 境界表示用の縮小 texture cache。
@@ -11089,6 +11094,10 @@ pub struct App {
     pub(crate) erase_tool: EraseTool,
     /// 筆ツールの半径 (画像ピクセル)
     pub(crate) erase_brush_radius: f32,
+    /// バケツツールの開始色からの許容差。
+    pub(crate) erase_bucket_tolerance: f32,
+    /// バケツツールで seed と連結する領域だけを対象にする。
+    pub(crate) erase_bucket_connected: bool,
     /// 囲みツールのポイント列 (画像ピクセル座標)
     pub(crate) erase_lasso_points: Vec<(f32, f32)>,
     /// 縦線/横線ツールのドラッグ開始点 (画像ピクセル座標)
@@ -11201,6 +11210,10 @@ pub struct App {
     pub(crate) conceal_tool: crate::conceal::ConcealTool,
     /// 描画モード (true) / 消去モード (false)、`D` / `F` キーで切替。
     pub(crate) conceal_paint_mode: bool,
+    /// バケツツールの開始色からの許容差。
+    pub(crate) conceal_bucket_tolerance: f32,
+    /// バケツツールで seed と連結する領域だけを対象にする。
+    pub(crate) conceal_bucket_connected: bool,
     /// 現在ページのマスクビットマップ (1bit/pixel、`erase_mask` と同じ表現)。
     pub(crate) conceal_mask: Option<Vec<bool>>,
     /// マスク対象の画像サイズ [width, height]。
@@ -13001,6 +13014,7 @@ impl App {
             local_adjust_boundary_gap_px: 2.0,
             local_adjust_edge_snap_radius: 16.0,
             local_adjust_edge_brush_tolerance: 48.0,
+            local_adjust_bucket_connected: true,
             local_adjust_edge_brush_include_boundary: false,
             local_adjust_edge_preview_cache: None,
             local_adjust_mask_lasso_points: Vec::new(),
@@ -13124,6 +13138,8 @@ impl App {
             erase_last_paint_pos: None,
             erase_tool: EraseTool::default(),
             erase_brush_radius: 0.0, // enter_erase_mode で設定
+            erase_bucket_tolerance: 48.0,
+            erase_bucket_connected: true,
             erase_lasso_points: Vec::new(),
             erase_line_start: None,
             erase_line_end: None,
@@ -13157,6 +13173,8 @@ impl App {
             conceal_mode: false,
             conceal_tool: crate::conceal::ConcealTool::default(),
             conceal_paint_mode: true,
+            conceal_bucket_tolerance: 48.0,
+            conceal_bucket_connected: true,
             conceal_mask: None,
             conceal_mask_size: [0, 0],
             conceal_mask_texture: None,

@@ -2,7 +2,7 @@
 
 > **現況 (2026-07)**
 >
-> - **コードで実装確認済み**: Mosaic / WhiteFill / BlackFill / Blur、9 ツール
+> - **コードで実装確認済み**: Mosaic / WhiteFill / BlackFill / Blur、10 ツール
 >   (Polygon を含む)、ページ別 `conceal.db`、`settings.db` のグローバル設定、
 >   サイドカー、Undo / Redo、マスクスロット、Ctrl+E、永続 edit preview。
 > - **現行の正本**: データとツールは §6 / §8、表示・cache 順序は
@@ -93,7 +93,7 @@ final pipeline を適用する。
 
 ### 3.3 現行の共有境界
 
-消しゴムとツールパレットを **完全一致 (9 種)** させ、`mask_db.rs` と
+消しゴムとツールパレットを **完全一致 (10 種)** させ、`mask_db.rs` と
 `Shape` enum 対応に拡張し、両ツールから共有する:
 
 ```rust
@@ -108,6 +108,7 @@ use crate::vector_edit::{HoverTarget, hit_test, cursor_icon_for, draw_handles, a
 | `LineKind` enum (Vert / Horiz / Diag) | `mask_db.rs` | Line variant 内で使用、ツールパレット統一に伴い共有 |
 | `rasterize_shape_into` 関数 (新規) | `mask_db.rs` | Shape variant ごとのラスタライズ (Line/Rect=多角形、Ellipse=楕円方程式) |
 | `scanline_fill_polygon` 関数 | `mask_db.rs` (既存) | 筆 / 囲み / Line / Rect 共通の多角形塗り |
+| `flood_fill_bitmap_mask` 関数 | `mask_db.rs` | バケツの連結 / 非連結塗りを消しゴム・隠蔽加工と共有 |
 | `scanline_fill_ellipse` 関数 (新規) | `mask_db.rs` | Ellipse variant 専用 (~50 行) |
 | `vector_edit.rs` (新規モジュール) | 新規 | ハンドル操作・カーソル選択・ドラッグ状態機械 (両ツール共通) |
 
@@ -149,6 +150,10 @@ conceal_vectors: Vec<LineObject>,           // LineKind::{Vert, Horiz, Diag} 全
 conceal_brush_radius: f32,
 conceal_line_width: f32,
 
+// バケツ設定 (App のセッション内保持。settings.db のスキーマは変更しない)
+conceal_bucket_tolerance: f32,
+conceal_bucket_connected: bool,
+
 // 隠蔽パラメータ (グローバル、settings.db の settings_kv に永続化)
 conceal_type: ConcealType,                  // Mosaic / WhiteFill / BlackFill / Blur
 // モザイク用
@@ -182,7 +187,8 @@ conceal_pages: HashSet<usize>,
 **設計判断: すべてのパラメータ (隠蔽タイプ、タイル倍率、不透明度、ぼかし半径、
 境界モード等) は「グローバル設定」**。ページ個別にはしない。これで「ツールの好み」と
 「ページごとのマスク内容」が分離される。複数の好みを保持したいときはプリセット 4 スロット
-を使う (§8.3)。
+を使う (§8.3)。バケツの色差許容値と「隣接のみ」は編集セッションの操作値として
+`App` にだけ保持し、`settings.db` やプリセットには追加しない。
 
 ```rust
 enum ConcealType { Mosaic, WhiteFill, BlackFill, Blur }
@@ -206,7 +212,7 @@ enum BlurMode { AsMask, ExtendByRadius, InsideOnly }     // ぼかし専用
 | キー | 動作 |
 | --- | --- |
 | `Esc` | モード終了 (マスク保持、DB 書込) |
-| `S` / `B` / `L` / `P` / `I` / `V` / `H` / `R` / `O` | ツール切替 (選択 / 筆 / 囲み / 多角形 / 直線 / 縦線 / 横線 / 矩形 / 楕円) — 消しゴムと完全同一 |
+| `S` / `B` / `K` / `L` / `P` / `I` / `V` / `H` / `R` / `O` | ツール切替 (選択 / 筆 / バケツ / 囲み / 多角形 / 直線 / 縦線 / 横線 / 矩形 / 楕円) — 消しゴムと完全同一 |
 | `D` / `F` | 描画 / 消去 |
 | `1` / `2` / `3` / `4` | パラメータプリセット 1〜4 を適用 |
 | `T` | 隠蔽タイプを順次切替 (Mosaic → WhiteFill → BlackFill → Blur → Mosaic …) |
@@ -230,7 +236,7 @@ enum BlurMode { AsMask, ExtendByRadius, InsideOnly }     // ぼかし専用
 ```
 ┌─ 隠蔽加工 ───────────────────────────────────┐
 │ ツール:                                          │
-│  [選] [筆] [囲] [多] [直] [縦] [横] [矩] [楕]    │  ← S/B/L/P/I/V/H/R/O キー (消しゴムと同一)
+│  [選] [筆] [塗] [囲] [多] [直] [縦] [横] [矩] [楕] │  ← S/B/K/L/P/I/V/H/R/O キー (消しゴムと同一)
 │  ● 描画   ○ 消去                                │  ← D/F キー
 │  太さ: ──●─── 12px                              │
 │                                                  │
@@ -306,9 +312,9 @@ enum BlurMode { AsMask, ExtendByRadius, InsideOnly }     // ぼかし専用
 **処理の機構**を書くこと。これがないと利用者は自分の用途 (投稿先の規定など) に
 合っているかを判断できない。
 
-## 6. ツール 9 種仕様 (消しゴムと完全同一)
+## 6. ツール 10 種仕様 (消しゴムと完全同一)
 
-両ツール (消しゴム / 隠蔽加工) で同じ 9 種パレットを採用。`Shape` enum / rasterizer / UI
+両ツール (消しゴム / 隠蔽加工) で同じ 10 種パレットを採用。`Shape` enum / rasterizer / UI
 パネル骨子を共有することで実装重複を排除。順序は **描画系 → 拘束系 → bbox 系** の流れに
 そろえる:
 
@@ -316,6 +322,7 @@ enum BlurMode { AsMask, ExtendByRadius, InsideOnly }     // ぼかし専用
 | --- | --- | --- | --- |
 | 選択 | S | ベクタ本体を hit test、ハンドルドラッグで編集 (`vector_edit.rs` 参照) | `Shape` 編集 |
 | 筆 | B | 半径 `brush_radius`、ストロークで `scanline_fill_polygon` ラスタライズ | ビットマップ |
+| バケツ | K | 画像クリック時に 1 回だけ、開始色との許容差で連結領域または画像全体の近似色を描画 / 消去 | ビットマップ |
 | 囲み | L | ポリゴン → `scanline_fill_polygon` | ビットマップ |
 | 多角形 | P | クリックで頂点追加、始点付近 / 右クリック / Enter で確定して `scanline_fill_polygon` | ビットマップ |
 | 直線 | I | `Shape::Line { p0, p1, thickness }`、両端ドラッグで端点編集 | `Shape` vec |
@@ -334,8 +341,8 @@ enum BlurMode { AsMask, ExtendByRadius, InsideOnly }     // ぼかし専用
 
 | シーン | 主に使うツール |
 | --- | --- |
-| AI イラスト R18 修正 | 筆、囲み、矩形 |
-| スキャン書籍のゴミ取り (消しゴム用途) | 縦線、横線、直線、筆 |
+| AI イラスト R18 修正 | 筆、バケツ、囲み、矩形 |
+| スキャン書籍のゴミ取り (消しゴム用途) | 縦線、横線、直線、筆、バケツ |
 | 写真のゴミ・映り込み消去 (消しゴム用途) | 矩形、楕円、筆 |
 | 個人情報マスキング (顔・名前・住所) | 矩形 (テキストブロック)、楕円 (顔) |
 | ナンバープレート / 看板の隠蔽 | 矩形、直線 |
@@ -1214,16 +1221,18 @@ CLAUDE.md の「コード修正時のドキュメント同時更新」ルール�
 - 処理タイプ 4 種: **Mosaic / WhiteFill / BlackFill / Blur**。タイプごとに異なるパラメータと境界モードを持つ
 - タイルサイズは **2 モード** (長辺比率モード = 0.25 刻み / 固定 px モード = 1px 刻み) から選択
 - 隠蔽加工は永続 edit preview に反映する。未生成・失効中は raw thumbnail + [隠] バッジへ fallback
-- ツールパレット **9 種** を消しゴムと完全統一: 選択 (S) / 筆 (B) / 囲み (L) / 多角形 (P) / 直線 (I) /
-  縦線 (V) / 横線 (H) / 矩形 (R) / 楕円 (O)。`Shape` enum / rasterizer / `vector_edit.rs`
+- ツールパレット **10 種** を消しゴムと完全統一: 選択 (S) / 筆 (B) / バケツ (K) / 囲み (L) /
+  多角形 (P) / 直線 (I) / 縦線 (V) / 横線 (H) / 矩形 (R) / 楕円 (O)。
+  `Shape` enum / rasterizer / `vector_edit.rs`
   を共有
 - データモデル `Shape` enum (Line / Rect / Ellipse) を `mask_db.rs` に新設。
   **既存の `LineObject` JSON との後方互換性を確保** (CLAUDE.md「永続データ・スキーマ変更時の判断」§リリース済み準拠)
 - 消しゴム側にも矩形 / 楕円ツールを追加 (写真のゴミ消し用途)。リリース済み機能拡張のため
   Phase 0 でデータマイグレーションが必須
-- すべてのパラメータ (タイプ、タイルモード、不透明度、ぼかし半径、境界モード等) は
+- 加工パラメータ (タイプ、タイルモード、不透明度、ぼかし半径、境界モード等) は
   **グローバル設定** (`settings.db` の `settings_kv` に永続化、ページ間共有)。複数の好みを保持したい
   ときは **パラメータプリセット 4 スロット** (`1`〜`4` キーで適用)
+- バケツの色差許容値と「隣接のみ」は `App` のセッション内保持とし、設定 DB のスキーマは変えない
 - マスクは **ページ個別** に保存 (`conceal.db` + サイドカー)
 - マスク用 2 スロット (`__slot_1` / `__slot_2`) で差分画像生成をサポート
 - **特定の投稿サイト名・基準名・基準への適合判定を UI / ドキュメント / ヘルプ文に書かない**。

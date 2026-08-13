@@ -1319,9 +1319,9 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
 
   | 面 | マスク表現 | ビットマップツール | 1px 拡張/縮小 | 色サンプル元 |
   | --- | --- | --- | --- | --- |
-  | 消しゴム [ui_erase.rs](../src/ui_erase.rs) | `Vec<bool>` (`erase_mask`) | 筆 / 囲み / 多角形 | なし | `erase_base_cache` (raw を黒フラット化) |
-  | 補正レイヤー [ui_adjustment_panel.rs](../src/ui_adjustment_panel.rs) | `Vec<f32>` (`RasterVectorMask.alpha`、実質 0/1) | 筆 / 境界筆 / 隙間補完 / 囲み / 多角形 | あり | `current_local_adjust_source_pixels` |
-  | 隠蔽加工 [ui_conceal.rs](../src/ui_conceal.rs) | `Vec<bool>` (`conceal_mask`) | 筆 / 囲み / 多角形 | なし | `current_conceal_source_pixels` |
+  | 消しゴム [ui_erase.rs](../src/ui_erase.rs) | `Vec<bool>` (`erase_mask`) | 筆 / バケツ / 囲み / 多角形 | あり | `erase_base_cache` (raw を黒フラット化) |
+  | 補正レイヤー [ui_adjustment_panel.rs](../src/ui_adjustment_panel.rs) | `Vec<f32>` (`RasterVectorMask.alpha`、実質 0/1) | 筆 / バケツ / 境界筆 / 隙間補完 / 囲み / 多角形 | あり | `current_local_adjust_source_pixels` |
+  | 隠蔽加工 [ui_conceal.rs](../src/ui_conceal.rs) | `Vec<bool>` (`conceal_mask`) | 筆 / バケツ / 囲み / 多角形 | あり | `current_conceal_source_pixels` |
 
 - 対象範囲 (2026-08-11 利用者判断): **3 面すべてに両機能を入れる**。共通ロジックを
   `mask_db.rs` に置けば追加コストは配線とパネル UI だけなので、ここで 3 面の機能差を解消する。
@@ -1360,8 +1360,8 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
 
 #### 第 1 段 完了 (2026-08-13、`01038cf7` + レビュー分)
 
-共有の純粋関数と (b) の配線まで入った。**バケツツール本体 (ツール enum / K キー /
-dispatch / 許容値スライダー / 隣接チェックボックス) は未着手**で、これが第 2 段。
+共有の純粋関数と (b) の配線まで入った。この時点では **バケツツール本体 (ツール enum / K キー /
+dispatch / 許容値スライダー / 隣接チェックボックス) は未着手**で、後続の第 2 段で実装した。
 
 - [mask_db.rs](../src/mask_db.rs) に `morph_bitmap_mask_1px` と `flood_fill_bitmap_mask`。
 - 消しゴム / 隠蔽のパネルに「1px拡張」/「1px縮小」。
@@ -1371,6 +1371,16 @@ dispatch / 許容値スライダー / 隣接チェックボックス) は未着�
   (`the_f32_and_bool_morphs_agree_on_a_binary_mask`) を置いた。
 - span fill の回り込み (U 字) と、親 span より広い行への伸長を縛るテストを追加。
   スキャンライン実装が落としやすいのはこの 2 つ。
+
+#### 第 2 段 完了 (2026-08-13)
+
+- 消しゴム / 補正レイヤー / 隠蔽加工にバケツを追加し、各コンテキストの `K` で切り替える。
+- `primary_pressed` の明示クリックでだけ 1 回実行し、ドラッグ継続経路には入れない。
+- 描画 / 消去モード、色差許容値 0..=255、「隣接のみ」既定 ON を 3 面で共通化した。
+- 補正レイヤーは一時 `Vec<bool>` へ変換して共有 flood fill を呼び、結果を 0.0 / 1.0 に戻す。
+  色差許容値は境界筆の `local_adjust_edge_brush_tolerance` を共用する。
+- 色サンプル元が未到達の場合は、再クリックが必要な理由をトーストで通知する。
+- マスクが変わらない場合は Undo を積まず、ベクタ Shape は障壁にも編集対象にもしない。
 
 #### (b) 1px 拡張・縮小を消しゴム / 隠蔽にも追加
 

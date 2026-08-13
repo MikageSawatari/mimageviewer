@@ -724,9 +724,10 @@ impl App {
             self.rotate_mask(rot_deg.to_radians());
         }
 
-        // S/B/L/P/V/H/I/R/O: ツール切替
+        // S/B/K/L/P/V/H/I/R/O: ツール切替
         let key_s_tool = self.keymap.consume_action(ctx, KeyAction::EraseToolSelect);
         let key_b = self.keymap.consume_action(ctx, KeyAction::EraseToolBrush);
+        let key_k = self.keymap.consume_action(ctx, KeyAction::EraseToolBucket);
         let key_l = self.keymap.consume_action(ctx, KeyAction::EraseToolLasso);
         let key_p = self.keymap.consume_action(ctx, KeyAction::EraseToolPolygon);
         let key_v = self.keymap.consume_action(ctx, KeyAction::EraseToolVLine);
@@ -741,6 +742,10 @@ impl App {
         if key_b {
             let toast = self.erase_tool_toast("筆", EraseTool::Brush);
             self.switch_erase_tool(EraseTool::Brush, &toast);
+        }
+        if key_k {
+            let toast = self.erase_tool_toast("バケツ", EraseTool::Bucket);
+            self.switch_erase_tool(EraseTool::Bucket, &toast);
         }
         if key_l {
             let toast = self.erase_tool_toast("囲み", EraseTool::Lasso);
@@ -991,6 +996,50 @@ impl App {
         );
     }
 
+    fn apply_erase_bucket(&mut self, fs_idx: usize, seed_x: usize, seed_y: usize) {
+        let Some(source) = self.erase_base_cache.get(&fs_idx).cloned() else {
+            self.show_feedback_toast(
+                "バケツに使う画像を準備中です。少し待ってからもう一度クリックしてください。"
+                    .to_string(),
+            );
+            return;
+        };
+        let [w, h] = self.erase_mask_size;
+        if source.size != [w, h] {
+            self.show_feedback_toast(
+                "バケツに使う画像の準備が完了していません。もう一度クリックしてください。"
+                    .to_string(),
+            );
+            return;
+        }
+        let Some(mask) = self.erase_mask.as_ref() else {
+            self.show_feedback_toast(
+                "バケツに使うマスクを準備中です。少し待ってからもう一度クリックしてください。"
+                    .to_string(),
+            );
+            return;
+        };
+
+        let mut next = mask.clone();
+        let changed = crate::mask_db::flood_fill_bitmap_mask(
+            &mut next,
+            &source,
+            seed_x,
+            seed_y,
+            self.erase_bucket_tolerance.round().clamp(0.0, 255.0) as u8,
+            self.erase_bucket_connected,
+            self.erase_paint_mode,
+        );
+        if !changed {
+            return;
+        }
+
+        self.push_undo_snapshot();
+        self.erase_mask = Some(next);
+        self.mark_erase_mask_texture_dirty(None);
+        self.clear_erase_preview(fs_idx);
+    }
+
     // ── マスクテクスチャ ──────────────────────────────────────────
 
     fn mark_erase_mask_texture_dirty(&mut self, dirty: Option<MaskDirtyRect>) {
@@ -1161,6 +1210,7 @@ impl App {
         match tool {
             EraseTool::Select => KeyAction::EraseToolSelect,
             EraseTool::Brush => KeyAction::EraseToolBrush,
+            EraseTool::Bucket => KeyAction::EraseToolBucket,
             EraseTool::Lasso => KeyAction::EraseToolLasso,
             EraseTool::Polygon => KeyAction::EraseToolPolygon,
             EraseTool::VertLine => KeyAction::EraseToolVLine,
@@ -1439,6 +1489,30 @@ impl App {
         // 新方針: 選択はツール enum 値が変わったときのみクリアする (= ツール切替
         // ボタン / ショートカット押下のときに明示クリア)。ツール継続中は選択を保持。
 
+        // バケツは明示クリック 1 回だけを処理する。共通ハンドル処理より先に分岐し、
+        // 選択中のベクタ図形を障壁にも編集対象にもしない。
+        if self.erase_tool == EraseTool::Bucket {
+            if primary_pressed
+                && let Some(pos) = pointer_pos
+                && transform.contains_screen(pos)
+                && let Some(img_pos) = self.screen_to_image_f32_unclamped(pos, transform)
+            {
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    self.apply_erase_bucket(
+                        fs_idx,
+                        img_pos.0.floor() as usize,
+                        img_pos.1.floor() as usize,
+                    );
+                } else {
+                    self.show_feedback_toast(
+                        "バケツの対象画像を確認できません。画像を開き直してからもう一度クリックしてください。"
+                            .to_string(),
+                    );
+                }
+            }
+            return;
+        }
+
         // ── 共通ハンドル処理 (ツール非依存): 直近 shape のハンドルが操作中なら
         //    そちらを優先処理して、新規 shape 作成側に流さない。
         let polygon_in_progress =
@@ -1478,6 +1552,7 @@ impl App {
                     self.erase_last_paint_pos = None;
                 }
             }
+            EraseTool::Bucket => {}
             EraseTool::Lasso => {
                 if primary_down {
                     if let Some(pos) = pointer_pos {
@@ -2257,8 +2332,8 @@ impl App {
                                 .color(egui::Color32::from_gray(200)),
                         );
                         let bitmap_rows: &[&[(&str, EraseTool)]] = &[
-                            &[("筆", EraseTool::Brush), ("囲み", EraseTool::Lasso)],
-                            &[("多角形", EraseTool::Polygon)],
+                            &[("筆", EraseTool::Brush), ("バケツ", EraseTool::Bucket)],
+                            &[("囲み", EraseTool::Lasso), ("多角形", EraseTool::Polygon)],
                         ];
                         for row in bitmap_rows {
                             ui.horizontal(|ui| {
@@ -2363,6 +2438,27 @@ impl App {
                                 egui::Slider::new(&mut self.erase_brush_radius, 1.0..=max_r)
                                     .text("サイズ")
                                     .step_by(1.0),
+                            );
+                        }
+                        if self.erase_tool == EraseTool::Bucket {
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.erase_bucket_tolerance,
+                                    0.0..=255.0,
+                                )
+                                .text("色差の許容値")
+                                .step_by(1.0),
+                            );
+                            ui.checkbox(&mut self.erase_bucket_connected, "隣接のみ");
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(
+                                        "画像をクリックしたときに1回だけ塗りつぶします。",
+                                    )
+                                    .size(10.0)
+                                    .color(egui::Color32::from_gray(150)),
+                                )
+                                .wrap(),
                             );
                         }
                         if self.erase_tool == EraseTool::Line {
@@ -4067,6 +4163,14 @@ pub(crate) fn draw_dashed_circle(painter: &egui::Painter, center: egui::Pos2, ra
 #[cfg(test)]
 mod book_erase_tests {
     use super::*;
+
+    #[test]
+    fn erase_bucket_tool_maps_to_bucket_key_action() {
+        assert_eq!(
+            App::erase_tool_key_action(EraseTool::Bucket),
+            KeyAction::EraseToolBucket
+        );
+    }
 
     #[test]
     fn inpaint_progress_label_reports_pass_tile_and_parallel_job_count() {

@@ -1081,7 +1081,7 @@ MI-GAN は RGB 専用で alpha を扱えない。透過 PNG / WebP 等は透明�
 
 マスクは 2 つのレイヤで構成される:
 
-- **ビットマップ** (`Vec<bool>`): 筆 (Brush) / 囲み (Lasso) でのストロークが直接ラスタライズされる。
+- **ビットマップ** (`Vec<bool>`): 筆 (Brush) / バケツ (Bucket) / 囲み (Lasso) での操作が直接ラスタライズされる。
   mask_db の `mask_data` 列 (1bit/pixel + deflate 圧縮) に保存。
 - **ベクタ** (`Vec<Shape>`): 直線 / 縦線 / 横線 / 矩形 / 楕円はオブジェクトとして保存される。
   各 Shape は `op = add | subtract` を持つ。描画モードで作った Shape は `add`、
@@ -1091,6 +1091,14 @@ MI-GAN は RGB 専用で alpha を扱えない。透過 PNG / WebP 等は透明�
 消しゴム / 隠蔽加工 / 補正レイヤーの手動マスクには「1px拡張」「1px縮小」があり、
 3x3 近傍の max / min でビットマップ本体だけを破壊的に編集する。ベクタ Shape は
 この操作では変更せず、合成時に編集後のビットマップ下地へ従来どおり重ねる。
+
+3 面のバケツは画像上の明示クリックで 1 回だけ実行し、クリック画素との最大チャンネル差が
+許容値以下の画素を描画 / 消去モードに従って更新する。「隣接のみ」がオンなら 4 近傍で連結する
+領域、オフなら画像全体を対象にする。色サンプル元は消しゴムが `erase_base_cache`、
+補正レイヤーが `current_local_adjust_source_pixels`、隠蔽加工が
+`current_conceal_source_pixels`。書き換えるのはビットマップ本体だけで、Shape は
+塗り範囲の障壁にも編集対象にもしない。補正レイヤーは境界筆と同じ
+`local_adjust_edge_brush_tolerance` を共用し、色差の基準を 1 つに保つ。
 
 MI-GAN / diffusion に渡す最終マスクと、オーバーレイ描画に使うマスクは、
 **毎回ビットマップとベクタを合成した結果 (`composite_mask`)**。
