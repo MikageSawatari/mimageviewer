@@ -17519,6 +17519,23 @@ impl App {
         true
     }
 
+    /// いまタップをページ送りとして解釈してよいか。
+    ///
+    /// **同じ面の認識器を回す呼び出しが 1 フレームに複数ある**。接触が始まった
+    /// フレームを処理した呼び出しが所有者を決めるので、どれか 1 つでも古い値を
+    /// 渡すと、そこで始まった接触がページ送りとして確定する。
+    /// フォーカス復帰の経路がまさにこれで、アプリを切り替えて戻った直後だけ
+    /// 360 度ビューのタップがページを送っていた (利用者報告 2026-08-13、ログで確定)。
+    ///
+    /// ローカル変数を使い回すと定義順に縛られるので、`self` から直接求める。
+    pub(crate) fn fs_touch_tap_zones_enabled(&self) -> bool {
+        still_touch_tap_zones_enabled(
+            self.fullscreen_idx
+                .is_some_and(|idx| self.is_panorama_mode_active(idx)),
+            self.analysis_mode,
+        )
+    }
+
     fn fs_navigator_layout(&self, image_rect: egui::Rect) -> Option<FlatNavigatorLayout> {
         build_flat_navigator_layout(
             &self.fullscreen_page_layout,
@@ -18639,6 +18656,9 @@ impl App {
         prev_foreground_hwnd: usize,
     ) -> (FsPageNav, bool) {
         let mut page_nav = FsPageNav::None;
+        // 同じ面の認識器を回す呼び出しが下に複数ある。接触の開始フレームを処理した
+        // 呼び出しが所有者を決めるので、**全部で同じ値を使う**。
+        let touch_tap_zones = self.fs_touch_tap_zones_enabled();
         let mut close = false;
         const FOCUS_RESTORE_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
         let (pointer_primary_down, primary_released) =
@@ -18686,7 +18706,7 @@ impl App {
                     excluded: Vec::new(),
                     behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                         accepts_pinch: true,
-                        tap_zones: true,
+                        tap_zones: touch_tap_zones,
                     },
                 },
                 self.frame_counter,
@@ -18802,7 +18822,7 @@ impl App {
                         excluded: Vec::new(),
                         behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                             accepts_pinch: true,
-                            tap_zones: true,
+                            tap_zones: touch_tap_zones,
                         },
                     },
                     self.frame_counter,
@@ -19095,7 +19115,7 @@ impl App {
                     excluded: Vec::new(),
                     behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                         accepts_pinch: true,
-                        tap_zones: true,
+                        tap_zones: touch_tap_zones,
                     },
                 },
                 self.frame_counter,
@@ -19153,9 +19173,8 @@ impl App {
             view_trim_active: self.view_trim_mode,
             zoom_active: self.fs_zoom_mode_engaged(),
         });
-        // タップ判定を使わない面でも、ピンチだけは受け取る。
-        let touch_tap_zones_enabled =
-            still_touch_tap_zones_enabled(panorama_active, self.analysis_mode);
+        // タップ判定を使わない面でも、ピンチだけは受け取る。上の driver 群と同じ値。
+        let touch_tap_zones_enabled = touch_tap_zones;
         let touch_help_scope = panel_fs_idx.map(|fs_idx| StillTouchChromeLatch {
             fs_idx,
             session_started_at: self.fullscreen_opened_at(),
@@ -19298,12 +19317,6 @@ impl App {
                         // A recognized tap is an intentional discrete page turn,
                         // including in continuous reading. Use the same unit
                         // resolver as FsPageNext/FsPagePrev.
-                        // 一時計装 (§1.63 タッチ): 表示モードがキャンバスを持つのに
-                        // ページが動く経路を特定する。原因が確定したら外す。
-                        crate::logger::log(format!(
-                            "page_nav source=touch_tap panorama={} analysis={} tap_zones={}",
-                            panorama_active, self.analysis_mode, touch_tap_zones_enabled
-                        ));
                         let base =
                             fullscreen_click_nav_delta_for_side(left, self.spread_mode.is_rtl());
                         page_nav = self.spread_page_nav(base);
@@ -19595,7 +19608,6 @@ impl App {
                         self.maybe_rerender_pdf(self.fs_zoom);
                     }
                 } else {
-                    crate::logger::log("page_nav source=wheel_normal".to_string());
                     let base = if wheel_y < 0.0 { 1 } else { -1 };
                     page_nav = self.spread_page_nav(base);
                 }
@@ -19820,10 +19832,6 @@ impl App {
                                     && !continuous_active
                                     && !display_mode_owns_canvas
                                 {
-                                    crate::logger::log(format!(
-                                        "page_nav source=mouse_click panorama={} analysis={}",
-                                        display_mode_owns_canvas, self.analysis_mode
-                                    ));
                                     let base = fullscreen_click_nav_base_delta(
                                         pos.x,
                                         full_rect.center().x,
@@ -36295,6 +36303,57 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, crate::touch_input::TouchCommand::PageSide { .. })),
             "a surface without tap zones must never emit a page turn"
+        );
+    }
+
+    /// 接触が始まったフレームを処理した呼び出しが所有者を決める。同じ面の認識器を
+    /// 回す呼び出しが複数あるので、**どれか 1 つでも古い値を渡すと**そこで始まった
+    /// 接触がページ送りとして確定してしまう (利用者報告 2026-08-13、ログで確定)。
+    ///
+    /// 実害はフォーカス復帰の経路で出た。アプリを切り替えて戻った直後だけ
+    /// 360 度ビューのタップがページを送り、間欠的にしか再現しなかった。
+    #[test]
+    fn a_contact_started_with_tap_zones_on_still_turns_pages_after_they_go_off() {
+        use crate::touch_input::{
+            TapZoneGeometry, TouchCommand, TouchPhase, TouchRecognizer, TouchSample,
+            TouchSurfaceBehavior,
+        };
+
+        let geometry = |tap_zones: bool| TapZoneGeometry {
+            surface: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1000.0, 800.0)),
+            excluded: Vec::new(),
+            behavior: TouchSurfaceBehavior::Viewer {
+                accepts_pinch: true,
+                tap_zones,
+            },
+        };
+        let mut recognizer = TouchRecognizer::new();
+
+        // 開始フレームだけ古い値 (= 別の呼び出しが先に回した) を渡す。
+        recognizer.handle_sample(
+            &geometry(true),
+            TouchSample {
+                id: 1,
+                pos: egui::pos2(900.0, 400.0),
+                phase: TouchPhase::Start,
+                now_ms: 0,
+            },
+        );
+        let commands = recognizer.handle_sample(
+            &geometry(false),
+            TouchSample {
+                id: 1,
+                pos: egui::pos2(900.0, 400.0),
+                phase: TouchPhase::End,
+                now_ms: 80,
+            },
+        );
+
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, TouchCommand::PageSide { .. })),
+            "this is the shape of the bug: the start frame decides, so every caller              driving this surface must pass the same value"
         );
     }
 
