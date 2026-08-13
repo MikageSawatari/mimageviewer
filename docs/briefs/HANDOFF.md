@@ -58,6 +58,21 @@
 
 **レビュー 10 件すべて完了。**
 
+### 再レビュー追記（2026-08-13、`c3316390`）
+
+元の RR-01〜RR-10 の修正は確認済み。ただし、再レビューで次の P2 を 2 件追加した。
+詳細・根拠・推奨テストは正本
+[codex-remote-release-review-2026-08-13.md](codex-remote-release-review-2026-08-13.md) の §0 を参照。
+
+- **RR-R1**: 「すべての端末をログアウト」の実行中に接続ダイアログを閉じると、完了 receiver と
+  `local_disconnect()` が失われる。Cookie 全失効は進むが、本体の古い remote session が通常 60 秒、
+  非終端 AI / archive job があれば最大 10 分残り得る。完了所有者を dialog state の外へ移す。
+- **RR-R2**: session Cookie が `v1.{expires}.{mac}` で nonce を持たず、同じ秒の PIN login が
+  同一 Cookie / `AuthSessionIdentity` になる。別端末の client id / session id が同じ map entry で
+  交差するため、login ごとの CSPRNG nonce を署名対象へ追加する。
+
+この 2 件を修正するまでは、再レビュー判定はリリース保留。
+
 ### 実機 (iPad) で出た 3 件も対応済み (2026-08-13)
 
 **6 万件のサブ展開が問題なく開き、スクロールも滑らか**であることを実機で確認済み。

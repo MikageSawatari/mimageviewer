@@ -9,9 +9,138 @@
 - 開始時から存在した `src/pdf_loader.rs` の変更と `docs/briefs/` の未追跡ファイル群は、利用者の作業として触れていない
 - レビュー中に別作業の `docs/ui-responsiveness.md` / `docs/web-remote-plan.md` への追記が現れたため、これらも触れていない
 
-## 1. 結論
+## 0. 再レビュー（2026-08-13、HEAD `c3316390`）
 
-現時点で、v3.0.0 のリモート閲覧をそのままリリース可とは判断しない。
+### 判定
+
+基準 commit `883d48ed` 以降の修正を再確認した。**元の RR-01〜RR-10 は、利用者が決定した
+RR-03 / RR-04 の仕様を含め、意図どおり対応されている。** 一方、RR-05 の全端末ログアウトに
+非同期完了の所有権漏れと Cookie identity の衝突を見つけたため、現 HEAD を無条件の
+リリース可とはしない。
+
+| ID | 優先度 | 分類 | 再レビュー結果 |
+|---|---:|---|---|
+| RR-R1 | P2 | 機能 / セキュリティ運用 | 全端末ログアウトの実行中に接続ダイアログを閉じると、本体側のリモート操作権解放が実行されない |
+| RR-R2 | P2 | セキュリティ / session 所有権 | 同じ秒に PIN 認証した端末へ同一 Cookie を発行し、別端末を同じ session identity として扱う |
+
+RR-R1 / RR-R2 の修正後、下記の未実施実機確認を通せば、今回レビューした範囲ではリリースを止める
+既知事項はない。既知の表示速度 / 先読みキュー管理は、引き続き本レビューの対象外とする。
+
+### RR-R1 [P2] 全端末ログアウトの完了処理がダイアログの寿命に従属している
+
+#### 観測した事実
+
+- 全端末ログアウトの確認後、`RemoteSessionLogoutState::Running` が完了 receiver を
+  `RemoteConnectionDialogState` 内に保持する (`src/remote_ipc/ui.rs:2994-3000`)。
+- receiver が成功を返したときだけ、ダイアログ描画処理が
+  `handle.local_disconnect()` を呼び、本体側の現在のリモート操作権を drain する
+  (`src/remote_ipc/ui.rs:2508-2526`)。
+- しかし「閉じる」、Esc、または window close は、logout が `Running` かにかかわらず
+  `connection_dialog = None` とし、receiver を破棄する (`src/remote_ipc/ui.rs:3016-3018`)。
+- service owner に送信済みの `RotateSessionSecret` は receiver が破棄されても続行するため、
+  Cookie 署名鍵の更新と remote-web の再起動は行われる (`src/remote_ipc/service.rs:258-264`)。
+- remote-web の IPC 切断処理は、その接続の page job と接続情報だけを破棄し、active session を
+  drain しない (`src/remote_ipc/session.rs:1656-1672`)。本体側の操作権は最終 ping から
+  通常 `LIVENESS_TIMEOUT = 60 秒` まで残り得る。非終端の AI / archive job がある場合は
+  liveness timeout では解放せず、`IDLE_TIMEOUT = 10 分` まで残し得る
+  (`src/remote_ipc/session.rs:21-22`, `:593-608`)。
+
+#### 影響
+
+「すべての端末をログアウト」を確定した直後に接続ダイアログを閉じると、ブラウザ Cookie の
+全失効は進む一方、本体 UI は通常最大約 60 秒、非終端 job があれば最大約 10 分、古いリモート
+session の drain 待ちになる可能性がある。
+認証情報の失効自体は破られないが、セキュリティ操作の完了と本体操作権の解放が原子的でなく、
+利用者には「ログアウトしたのに本体操作へ戻らない」と見える。
+
+#### 修正方針
+
+完了 receiver と `local_disconnect()` を接続ダイアログの一時状態から外し、ダイアログを閉じても
+生存する所有者へ移す。単に「実行中は閉じるボタンを無効化する」だけでは window close や将来の
+別経路に同じ不変条件を残すため、署名鍵 rotate の成功と本体 session drain を 1 つの永続的な
+operation owner が完了させる。
+
+回帰テストは少なくとも次を含める。
+
+- rotate 開始 → ダイアログ破棄 → 成功完了でも `local_disconnect()` 相当が必ず 1 回起きる。
+- rotate 失敗時は成功表示せず、既存仕様どおり PIN と session secret の状態を区別する。
+- ダイアログを開いたままの成功経路でも二重 drain しない。
+
+### RR-R2 [P2] 同じ秒の PIN 認証が別端末で同一 Cookie identity になる
+
+#### 観測した事実
+
+- session Cookie の署名対象は `v1.{expires}` だけで、端末 / login ごとの nonce を含まない。
+  `expires` は秒精度の現在時刻 + 90 日であるため、同じ秒に発行した Cookie は完全に同一になる
+  (`crates/remote-web/src/auth.rs:252-274`, `:331-335`)。`remember` の違いも Cookie 本文には入らない。
+- server-side の `AuthSessionIdentity` は Cookie 全文の SHA-256 で作る
+  (`crates/remote-web/src/auth.rs:170-176`)。したがって、同じ秒にログインした別端末を区別できない。
+- `RemoteClientIdentities::resolve` は identity が既存なら、新しい request の
+  `X-mIV-Remote-Client` を無視し、先に保存された client id を返す
+  (`crates/remote-web/src/http.rs:104-125`)。
+- 同じ map entry に remote session id も保存するため、後から acquire した端末が同じ entry を
+  上書きし、session header を付けられない stream request なども別端末の現在 owner へ結び付く
+  (`crates/remote-web/src/http.rs:141-179`)。
+
+#### 影響
+
+2 台の端末、または別 browser profile が同じ 1 秒内に PIN 認証すると、別々の
+`X-mIV-Remote-Client` を送っても server は同一 client として扱う。session acquire / supersede の
+所有者表示と routing が交差し、常時 1 台だけを active owner とする不変条件、および Cookie ごとの
+logout/session bookkeeping が崩れる。PIN を知らない第三者への権限昇格ではないが、認証済み別端末を
+分離するための security identity が発行時刻の偶然で衝突する。
+
+#### 修正方針
+
+Cookie の署名対象へ login ごとの CSPRNG nonce を追加し、同時発行でも token と
+`AuthSessionIdentity` が必ず異なる形式へ上げる。たとえば
+`v2.{expires}.{nonce}.{HMAC(version || expires || nonce)}` とし、nonce の長さ・hex 構文を
+検証してから MAC を定数時間検証する。v1 Cookie を移行期間だけ受けるか、v3.0.0 の初回起動で
+session secret を rotate して再ログインさせるかは、リリース前の互換性判断として明記する。
+
+回帰テストは少なくとも次を含める。
+
+- 同一 `now_unix` で連続発行した Cookie が異なり、異なる `AuthSessionIdentity` になる。
+- `remember=true/false` でも token identity は共有されない。
+- 同時 login の 2 Cookie を `RemoteClientIdentities` へ渡し、client id と session id が交差しない。
+- nonce / expires / MAC の改変、期限切れ、形式不正は従来どおり拒否する。
+
+### 元の指摘の再確認
+
+| ID | 状態 | 確認内容 |
+|---|---|---|
+| RR-01 | 解消 | PIN 欄は password manager 用属性を保ちつつ数字キーボードを要求しない。DOM test あり |
+| RR-02 | 解消 | 所有 proxy の `/` だけを Configured とし、非 root path は非対応として UI へ運ぶ |
+| RR-03 | 解消（仕様決定込み） | raw UNC / device namespace を filesystem I/O 前に拒否。割り当て済みドライブは維持し、両マニュアルに差分を記載 |
+| RR-04 | 解消（仕様決定込み） | 上限を 100,000 件へ緩和し、40 MiB の直列化予算と画面上の truncation 通知を追加。ページングは明示的に延期 |
+| RR-05 | 機構は解消、RR-R1 / RR-R2 あり | この端末の logout、全 Cookie の署名鍵 rotate、PIN 維持、マニュアル説明を確認。完了 lifecycle と token identity に追加指摘あり |
+| RR-06 | 解消 | route の early return を含む全応答が共通 finalizer を通り、CSP `frame-ancestors 'none'` と XFO `DENY` を付与 |
+| RR-07 | 解消 | Tailscale 側で許可した他者端末にも届き得ることと、mIV が端末所有者を識別しないことを明記 |
+| RR-08 | 解消 | 名前検索が「お気に入りの中」であることを両マニュアルに明記 |
+| RR-09 | 解消 | 変更可能な補正 subset と、保存済みの他補正は反映だけされることを両マニュアルに明記 |
+| RR-10 | 解消 | iOS / iPadOS Safari と PC browser の確認済み範囲、Android Chrome 未実機確認を両マニュアルに明記 |
+
+RR-03 は利用者判断どおり、`\\server\share` を拒否し、Windows の割り当て済みネットワークドライブは
+利用可能なままにしている。このため「認証済み client が任意の raw UNC を発行する」境界は閉じたが、
+ホスト利用者が明示的に割り当てたドライブの接続は許容する。RR-04 も利用者判断どおり、極端な一覧は
+100,000 件または 40 MiB で打ち切って画面で通知し、ページング自体は後続課題としている。
+
+### 再レビューで実行した確認
+
+- `node --test crates/remote-web/web/*.test.mjs`: **365 passed**
+- `cargo test -p mimageviewer-remote`: **125 passed / 1 ignored**
+  - ignored は管理 test sandbox が local named pipe を拒否する既知の test
+- `cargo test -p mimageviewer-ipc`: **35 passed**
+- `cargo test -p mimageviewer --lib remote_ipc`: **234 passed**
+- `cargo fmt --all -- --check`: pass
+- `cargo check -p mimageviewer --bin mimageviewer-core`: pass（既存 dead-code warning 8 件）
+
+実 Tailscale Serve、実 SMB、Android Chrome の動的確認は今回も実施していない。HANDOFF に記録された
+iPad 実機修正についても、今回の再レビューでは実機再試験していない。
+
+## 1. 初回レビュー時の結論（履歴）
+
+基準 commit `883d48ed` の時点では、v3.0.0 のリモート閲覧をそのままリリース可とは判断しない。
 少なくとも **P1 の 3 件は、修正するか、セキュリティ境界を明示的に再決定してからリリース判定する**。
 
 | ID | 優先度 | 分類 | 要約 |
@@ -332,7 +461,7 @@ node sharing、ACL / grants、tailnet 運用によっては「同じ自分のア
 したがって、favorite/root allowlist のような保証できない境界を追加する、二重に DB を開く、
 UI thread で I/O する、といった方向へ戻す必要はない。
 
-## 4. 開発セッションへの推奨分割
+## 4. 開発セッションへの推奨分割（初回レビュー時）
 
 互いに独立してレビューしやすい順序は次のとおり。
 
@@ -345,7 +474,7 @@ UI thread で I/O する、といった方向へ戻す必要はない。
 RR-03 は他より大きい。短期 workaround として UNC を黙って拒否すると既存機能を落とすため、
 利用者判断なしに実装しない。
 
-## 5. 実行した確認
+## 5. 初回レビューで実行した確認
 
 ```
 node --test
@@ -365,7 +494,7 @@ cargo test -p mimageviewer --lib remote_ipc
 `cargo audit` / `cargo deny` はこの環境に入っておらず、依存 crate の advisory scan は未実施。
 ツールを勝手に install して利用者環境を変更していない。
 
-## 6. 未実施 / 限界
+## 6. 初回レビューの未実施 / 限界
 
 - 実 Tailscale Serve、iPhone / iPad / Android、SMB server を使った動的侵入テストは行っていない。
 - 通常 profile / portable smoke の mImageViewer は起動していない。
@@ -375,13 +504,15 @@ cargo test -p mimageviewer --lib remote_ipc
 
 ## 7. リリース判定チェックリスト
 
-- [ ] RR-01: 英字・記号 PIN でスマホ login できる
-- [ ] RR-02: non-root Serve handler を対応済みと誤表示しない
-- [ ] RR-03: UNC / device namespace の信頼境界を決定し、コード・テスト・マニュアルを一致させる
-- [ ] RR-04: 1000 件超をページングする、または v3.0.0 の明示制限として承認する
-- [ ] RR-05: local logout と全 session 失効の運用がある
-- [ ] RR-06: 全 HTTP response が frame embedding を拒否する
-- [ ] RR-07: Tailscale 到達性の説明が node sharing / ACL を含めて正確である
-- [ ] RR-08〜10: 検索範囲、補正 subset、ブラウザ検証状況を両マニュアルへ反映する
+- [x] RR-01: 英字・記号 PIN でスマホ login できる
+- [x] RR-02: non-root Serve handler を対応済みと誤表示しない
+- [x] RR-03: UNC / device namespace の信頼境界を決定し、コード・テスト・マニュアルを一致させる
+- [x] RR-04: 1000 件超をページングする、または v3.0.0 の明示制限として承認する
+- [x] RR-05: local logout と全 session 失効の運用がある（基本機構）
+- [x] RR-06: 全 HTTP response が frame embedding を拒否する
+- [x] RR-07: Tailscale 到達性の説明が node sharing / ACL を含めて正確である
+- [x] RR-08〜10: 検索範囲、補正 subset、ブラウザ検証状況を両マニュアルへ反映する
+- [ ] RR-R1: 全端末 logout の完了を dialog close で失わず、本体 session を必ず drain する
+- [ ] RR-R2: 同時発行 Cookie に nonce を持たせ、端末/session identity を分離する
 - [ ] dependency advisory scan を release gate で実行する
 - [ ] disposable portable smoke と、必要な実端末 smoke を別途完了する
