@@ -745,6 +745,54 @@ fn panorama_navigator_wrap_yaw(yaw: f32) -> f32 {
     (yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
 }
 
+/// フルスクリーンでズーム / パンを実際に握っている状態。
+///
+/// 排他なので bool の重ね合わせではなく列挙で持つ。入力を足すたびに
+/// `if analysis_mode … else if panorama …` を書き直すと、必ずどれかを落とす。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FsZoomOwner {
+    /// ZipPla 風ズーム (照準中 / 確定中)。専用描画経路で `fs_zoom` を見ない。
+    ZoomMode,
+    /// 360 度ビュー。`fov_y` / `yaw` / `pitch`。
+    Panorama,
+    /// 分析モード。`analysis_zoom` / `analysis_pan`。画像矩形も右パネル分ずれる。
+    Analysis,
+    /// 通常表示。`fs_zoom` / `fs_pan`。
+    Image,
+}
+
+/// ピンチ倍率を 360 度ビューの視野角へ写す。
+///
+/// 拡大 (`factor > 1`) は**視野を狭める**方向なので割る。ホイールの FOV 操作
+/// (`handle_panorama_wheel_if_active`) と同じ向き。
+fn panorama_touch_zoom_fov(fov_y: f32, factor: f32) -> Option<f32> {
+    if !factor.is_finite() || factor <= 0.0 || !fov_y.is_finite() {
+        return None;
+    }
+    Some((fov_y / factor).clamp(crate::panorama::FOV_MIN, crate::panorama::FOV_MAX))
+}
+
+/// ピンチ中の 2 本指平行移動を yaw / pitch へ写す。
+///
+/// 感度も向きも 1 本指ドラッグ (`handle_panorama_drag_if_active`) と同じにする。
+/// 指と画像が別々に動くと、同じ操作が入力手段で違う意味になる。
+fn panorama_touch_pan_pose(
+    yaw: f32,
+    pitch: f32,
+    fov_y: f32,
+    delta: egui::Vec2,
+    viewport_h: f32,
+) -> Option<(f32, f32)> {
+    if !delta.x.is_finite() || !delta.y.is_finite() || delta.length_sq() <= 0.0 {
+        return None;
+    }
+    let sens = fov_y / viewport_h.max(1.0);
+    Some((
+        panorama_navigator_wrap_yaw(yaw + delta.x * sens),
+        (pitch + delta.y * sens).clamp(-crate::panorama::PITCH_LIMIT, crate::panorama::PITCH_LIMIT),
+    ))
+}
+
 fn panorama_navigator_fov_from_height(selection_height: f32, content_height: f32) -> f32 {
     let fov_y = selection_height.abs() / content_height.max(f32::EPSILON) * std::f32::consts::PI;
     if fov_y.is_finite() {
@@ -5065,6 +5113,89 @@ impl App {
     /// Apply a recognizer-provided touch scale at its screen-space pivot.
     /// Input recognition stays separate from the existing zoom/pan ownership:
     /// this thin adapter reuses the same clamps as wheel and drag input.
+    /// いま画面のズーム / パンを実際に握っている状態。
+    ///
+    /// フルスクリーンには**ズームの持ち主が 4 通り**あり、どれを動かすかの判定が
+    /// 入力手段ごとに書かれていた。その結果、入力を足すたびに取りこぼしが出ている:
+    /// ホイールは 360 を知っていたがピンチは知らず、中ボタンは分析を知っていたが
+    /// 360 を知らない。**書き先を間違えても画面は静止するだけ**なので、見えない値が
+    /// 動くだけで誰も気付かない (利用者報告 2026-08-13、360 と分析の両方)。
+    ///
+    /// 判定はここ 1 か所に集める。新しい入力を足すときは必ずこれを通すこと。
+    pub(crate) fn fs_zoom_owner(&self) -> FsZoomOwner {
+        if self.fs_zoom_mode_engaged() {
+            return FsZoomOwner::ZoomMode;
+        }
+        if self
+            .fullscreen_idx
+            .is_some_and(|idx| self.is_panorama_mode_active(idx))
+        {
+            return FsZoomOwner::Panorama;
+        }
+        if self.analysis_mode {
+            return FsZoomOwner::Analysis;
+        }
+        FsZoomOwner::Image
+    }
+
+    /// 分析モードは右パネルの分だけ画像が左へ寄るので、ピボットの基準矩形が違う。
+    fn fs_zoom_pivot_rect(
+        &self,
+        full_rect: egui::Rect,
+        default_image_rect: egui::Rect,
+    ) -> egui::Rect {
+        match self.fs_zoom_owner() {
+            FsZoomOwner::Analysis => analysis_image_rect(full_rect),
+            _ => default_image_rect,
+        }
+    }
+
+    /// 360 度ビューは `fs_zoom` / `fs_pan` を一切見ない (yaw / pitch / fov_y が視点の正)。
+    ///
+    /// ピンチをそのまま `fs_zoom` へ流すと、**画面には何も起きないのに見えない値だけが動く**。
+    /// ホイールが 360 中に FOV 操作へ転用されるのと同じ扱いにする。
+    /// 拡大 (factor > 1) は視野を狭める方向なので割る。
+    fn apply_panorama_touch_zoom(&mut self, factor: f32) -> bool {
+        if !self
+            .fullscreen_idx
+            .is_some_and(|idx| self.is_panorama_mode_active(idx))
+        {
+            return false;
+        }
+        let Some(pano) = self.panorama_state.as_mut() else {
+            return false;
+        };
+        let Some(fov_y) = panorama_touch_zoom_fov(pano.fov_y, factor) else {
+            return false;
+        };
+        pano.fov_y = fov_y;
+        pano.sanitize();
+        true
+    }
+
+    /// ピンチ中の 2 本指の平行移動。1 本指ドラッグと同じ「掴んで引っ張る」向きで
+    /// yaw / pitch を回す。`fs_pan` へ流すと 360 では不可視のまま値だけがずれる。
+    fn apply_panorama_touch_pan(&mut self, delta: egui::Vec2, viewport_h: f32) -> bool {
+        if !self
+            .fullscreen_idx
+            .is_some_and(|idx| self.is_panorama_mode_active(idx))
+        {
+            return false;
+        }
+        let Some(pano) = self.panorama_state.as_mut() else {
+            return false;
+        };
+        let Some((yaw, pitch)) =
+            panorama_touch_pan_pose(pano.yaw, pano.pitch, pano.fov_y, delta, viewport_h)
+        else {
+            return false;
+        };
+        pano.yaw = yaw;
+        pano.pitch = pitch;
+        pano.sanitize();
+        true
+    }
+
     fn apply_touch_zoom_factor_about_pivot(
         &mut self,
         factor: f32,
@@ -5074,15 +5205,47 @@ impl App {
         if !factor.is_finite() || factor <= 0.0 {
             return false;
         }
-        let old_zoom = self.fs_zoom;
+        // 分析モードは自前の zoom / pan を持つ。fs_zoom へ書くと画面は静止したまま
+        // 見えない値だけが動く (利用者報告 2026-08-13)。
+        let analysis = matches!(self.fs_zoom_owner(), FsZoomOwner::Analysis);
+        let old_zoom = if analysis {
+            self.analysis_zoom
+        } else {
+            self.fs_zoom
+        };
         let new_zoom = (old_zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
         if (new_zoom - old_zoom).abs() <= f32::EPSILON {
             return false;
         }
-        let proposed_pan = zoom_preserve_pivot(pivot, rect_center, self.fs_pan, old_zoom, new_zoom);
-        self.fs_zoom = new_zoom;
-        self.set_fs_pan_from_input(new_zoom, proposed_pan);
+        let start_pan = if analysis {
+            self.analysis_pan
+        } else {
+            self.fs_pan
+        };
+        let proposed_pan = zoom_preserve_pivot(pivot, rect_center, start_pan, old_zoom, new_zoom);
+        if analysis {
+            self.analysis_zoom = new_zoom;
+            self.analysis_pan = proposed_pan;
+        } else {
+            self.fs_zoom = new_zoom;
+            self.set_fs_pan_from_input(new_zoom, proposed_pan);
+        }
         true
+    }
+
+    /// ピンチ中の 2 本指平行移動を、いまの持ち主の pan へ流す。
+    fn apply_touch_pan_delta(&mut self, delta: egui::Vec2, full_rect: egui::Rect) {
+        match self.fs_zoom_owner() {
+            FsZoomOwner::Panorama => {
+                self.apply_panorama_touch_pan(delta, full_rect.height());
+            }
+            FsZoomOwner::Analysis => {
+                self.analysis_pan += delta;
+            }
+            FsZoomOwner::ZoomMode | FsZoomOwner::Image => {
+                self.set_fs_pan_from_input(self.fs_zoom, self.fs_pan + delta);
+            }
+        }
     }
 
     /// 中ボタンドラッグズームを処理する。
@@ -5097,6 +5260,13 @@ impl App {
         // 中ボタンドラッグで不可視の fs_zoom を書き換えず、専用の fs_zoom_factor を動かす。
         if self.fs_zoom_mode_engaged() {
             return self.handle_zoom_mode_middle_drag(ctx);
+        }
+        // 360 度ビューも自前の視点を持つ。ここを塞がないと、中ボタンドラッグが
+        // 画面に何も起こさないまま fs_zoom を動かす (ピンチと同じ取りこぼし)。
+        // FOV はホイールが担当しているので、ここでは何もせず入力だけ消費する。
+        if matches!(self.fs_zoom_owner(), FsZoomOwner::Panorama) {
+            self.fs_middle_zoom_drag = None;
+            return ctx.input(|i| i.pointer.button_down(egui::PointerButton::Middle));
         }
         let (is_down, is_pressed, is_released, current_pos) = ctx.input(|i| {
             (
@@ -17562,7 +17732,7 @@ impl App {
                 egui::Sense::click_and_drag(),
             )
             .on_hover_text(
-                "左ドラッグ: 範囲を拡大 / 右ドラッグ: 表示位置を移動 / ダブルクリック: 中央へ移動 / ホイール: サイズ変更",
+                "左ドラッグ: 表示位置を移動 / 右ドラッグ: 範囲を拡大 / ダブルクリック: 中央へ移動 / ホイール: サイズ変更",
             );
         let clamp_to_canvas = |pos: egui::Pos2| {
             egui::pos2(
@@ -17832,7 +18002,7 @@ impl App {
                 egui::Sense::click_and_drag(),
             )
             .on_hover_text(
-                "左ドラッグ: 範囲を拡大 / 右ドラッグ: 表示位置を移動 / ダブルクリック: 中央へ移動 / ホイール: サイズ変更",
+                "左ドラッグ: 表示位置を移動 / 右ドラッグ: 範囲を拡大 / ダブルクリック: 中央へ移動 / ホイール: サイズ変更",
             );
         let clamp_to_canvas = |pos: egui::Pos2| {
             egui::pos2(
@@ -17894,7 +18064,21 @@ impl App {
             return true;
         }
 
-        if primary_pressed
+        // ヘッダのボタンが今フレームを消費したら、キャンバス入力として解釈し直さない。
+        // 掴みかけの操作が残っていたら捨てる (押下は必ずボタン上なので確定していない)。
+        if corner_clicked {
+            ctx.data_mut(|data| {
+                data.remove_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id())
+            });
+            return true;
+        }
+
+        // 主ボタンのドラッグは**枠を動かす**。範囲を選んで拡大する方は副ボタンへ置く。
+        //
+        // 触って動かすものが「移動」でなく「範囲選択」なのは、指で触ったときに特に
+        // 分かりにくい (利用者報告 2026-08-13)。タッチには副ボタンが無いので、
+        // 主ボタンに置いた方が指から届く。
+        if secondary_pressed
             && pointer_pos.is_some_and(|pos| layout.canvas_rect.contains(pos))
             && let Some(pos) = canvas_pos
         {
@@ -17907,7 +18091,7 @@ impl App {
                     },
                 )
             });
-        } else if primary_down
+        } else if secondary_down
             && let Some(pos) = canvas_pos
             && let Some(FsNavigatorInteraction::Select { start, .. }) = interaction
         {
@@ -17923,16 +18107,10 @@ impl App {
             ctx.request_repaint();
         }
 
-        if primary_released
+        if secondary_released
             && let Some(FsNavigatorInteraction::Select { start, current }) = interaction
         {
-            // A click is reported on release. If this release belongs to a corner button,
-            // discard a stale selection and still run the normal release cleanup before returning.
-            if corner_clicked {
-                ctx.data_mut(|data| {
-                    data.remove_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id())
-                });
-            } else {
+            {
                 let selection =
                     egui::Rect::from_two_pos(start, current).intersect(layout.content_rect);
                 if selection.width() >= FS_NAVIGATOR_MIN_SELECTION
@@ -17975,11 +18153,7 @@ impl App {
             }
         }
 
-        if corner_clicked {
-            return true;
-        }
-
-        if secondary_pressed
+        if primary_pressed
             && pointer_pos.is_some_and(|pos| layout.canvas_rect.contains(pos))
             && let Some(pos) = canvas_pos
         {
@@ -18012,7 +18186,7 @@ impl App {
                     )
                 });
             }
-        } else if secondary_down
+        } else if primary_down
             && let Some(pos) = canvas_pos
             && let Some(FsNavigatorInteraction::Pan {
                 start,
@@ -18024,7 +18198,7 @@ impl App {
             self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
             ctx.request_repaint();
         }
-        if secondary_released
+        if primary_released
             && matches!(
                 interaction,
                 Some(
@@ -18302,7 +18476,7 @@ impl App {
                         .main
                         .pan_to_center_source_normalized(source_uv, self.fs_pan);
                     self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
-                    if ctx.input(|input| input.pointer.secondary_down()) {
+                    if ctx.input(|input| input.pointer.primary_down()) {
                         ctx.data_mut(|data| {
                             data.insert_temp(
                                 fs_navigator_interaction_id(),
@@ -19084,16 +19258,24 @@ impl App {
                         page_nav = self.spread_page_nav(base);
                     }
                     crate::touch_input::TouchCommand::Zoom { factor, pivot } => {
-                        if self.apply_touch_zoom_factor_about_pivot(
-                            factor,
-                            pivot,
-                            default_image_rect.center(),
-                        ) {
+                        // 書き先は `fs_zoom_owner` が決める。ここで新しい分岐を足さない。
+                        let applied = match self.fs_zoom_owner() {
+                            FsZoomOwner::Panorama => self.apply_panorama_touch_zoom(factor),
+                            _ => {
+                                let rect = self.fs_zoom_pivot_rect(full_rect, default_image_rect);
+                                self.apply_touch_zoom_factor_about_pivot(
+                                    factor,
+                                    pivot,
+                                    rect.center(),
+                                )
+                            }
+                        };
+                        if applied {
                             ctx.request_repaint();
                         }
                     }
                     crate::touch_input::TouchCommand::Pan { delta } => {
-                        self.set_fs_pan_from_input(self.fs_zoom, self.fs_pan + delta);
+                        self.apply_touch_pan_delta(delta, full_rect);
                         ctx.request_repaint();
                     }
                     crate::touch_input::TouchCommand::PinchEnd => {
@@ -31897,6 +32079,53 @@ mod tests {
         }
     }
 
+    /// 360 度ビューは `fs_zoom` を描画に使わない。ピンチをそのまま流していたので、
+    /// 画面は何も変わらないのに見えない値だけが動いていた (利用者報告 2026-08-13)。
+    #[test]
+    fn a_pinch_narrows_the_panorama_field_of_view() {
+        let start = (crate::panorama::FOV_MIN + crate::panorama::FOV_MAX) * 0.5;
+
+        let zoomed_in = panorama_touch_zoom_fov(start, 2.0).unwrap();
+        let zoomed_out = panorama_touch_zoom_fov(start, 0.5).unwrap();
+        assert!(zoomed_in < start, "pinching out must narrow the view");
+        assert!(zoomed_out > start, "pinching in must widen the view");
+
+        // 端で止まること。止まらないと sanitize 前に発散する。
+        assert_eq!(
+            panorama_touch_zoom_fov(start, 1e6).unwrap(),
+            crate::panorama::FOV_MIN
+        );
+        assert_eq!(
+            panorama_touch_zoom_fov(start, 1e-6).unwrap(),
+            crate::panorama::FOV_MAX
+        );
+
+        // 異常な倍率は姿勢へ触れない。
+        assert!(panorama_touch_zoom_fov(start, 0.0).is_none());
+        assert!(panorama_touch_zoom_fov(start, f32::NAN).is_none());
+    }
+
+    /// ピンチ中の平行移動は、1 本指ドラッグと同じ向き・同じ感度で回すこと。
+    /// 同じ操作が入力手段で違う意味になると、指と画像が別々に動いて見える。
+    #[test]
+    fn a_two_finger_drag_turns_the_panorama_like_one_finger_does() {
+        let fov_y = 1.0_f32;
+        let viewport_h = 800.0_f32;
+        let sens = fov_y / viewport_h;
+        let delta = egui::vec2(40.0, -30.0);
+
+        let (yaw, pitch) = panorama_touch_pan_pose(0.0, 0.0, fov_y, delta, viewport_h).unwrap();
+        assert!((yaw - delta.x * sens).abs() < 1e-6);
+        assert!((pitch - delta.y * sens).abs() < 1e-6);
+
+        // 極を直視させない。
+        let (_, clamped) =
+            panorama_touch_pan_pose(0.0, 0.0, fov_y, egui::vec2(0.0, 1e9), viewport_h).unwrap();
+        assert_eq!(clamped, crate::panorama::PITCH_LIMIT);
+
+        assert!(panorama_touch_pan_pose(0.0, 0.0, fov_y, egui::Vec2::ZERO, viewport_h).is_none());
+    }
+
     #[test]
     fn navigator_hold_does_not_request_visibility_without_focus() {
         assert!(!fs_navigator_visibility_requested(
@@ -32179,8 +32408,10 @@ mod tests {
         );
     }
 
+    /// 主ボタンのドラッグは枠を動かし、範囲を選んで拡大する方は副ボタン。
+    /// タッチには副ボタンが無いので、指から届く方に「移動」を置いている。
     #[test]
-    fn navigator_left_and_right_drags_keep_canvas_clamp_and_release_cleanup() {
+    fn navigator_primary_drag_moves_the_frame_and_secondary_selects_a_range() {
         let (mut app, image_rect, _) = setup_flat_navigator_input_test();
         let ctx = egui::Context::default();
         let layout = app.fs_navigator_layout(image_rect).unwrap();
@@ -32194,7 +32425,7 @@ mod tests {
             image_rect,
             navigator_pointer_input(
                 start,
-                Some((egui::PointerButton::Primary, true)),
+                Some((egui::PointerButton::Secondary, true)),
                 egui::Modifiers::default(),
                 0.0,
             ),
@@ -32224,7 +32455,7 @@ mod tests {
             image_rect,
             navigator_pointer_input(
                 finish,
-                Some((egui::PointerButton::Primary, false)),
+                Some((egui::PointerButton::Secondary, false)),
                 egui::Modifiers::default(),
                 0.2,
             ),
@@ -32241,7 +32472,7 @@ mod tests {
             image_rect,
             navigator_pointer_input(
                 start,
-                Some((egui::PointerButton::Secondary, true)),
+                Some((egui::PointerButton::Primary, true)),
                 egui::Modifiers::default(),
                 1.0,
             ),
@@ -32272,7 +32503,7 @@ mod tests {
             image_rect,
             navigator_pointer_input(
                 outside,
-                Some((egui::PointerButton::Secondary, false)),
+                Some((egui::PointerButton::Primary, false)),
                 egui::Modifiers::default(),
                 1.3,
             ),
