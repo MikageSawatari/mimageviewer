@@ -1526,13 +1526,22 @@ delta に適用するため、ドラッグ途中の Ctrl 押下 / 解放でも�
 > 2026-08-11 の 1 日だけで 3 回退行した (すべて「支配している規則を読まずに判定へ条件を
 > 足した / 反転させた」もの)。
 
+> **2026-08-14 Part B 追補 (現行の最優先規則)**: held browsing は入力レートへ
+> 追従して idx だけを先行させない。`FsHoldover::NavigationSequence` が受理済みの
+> 1 display unit を所有し、その unit 自身の rendition / materialized image が実際の
+> 最終描画 source として 1 frame 提示されるまで、次のページ送りまたは手動フォルダ移動を
+> 受理しない。待機中に届く key repeat / 同一 frame の追加 edge は **drop し、queue しない**。
+> 未キャッシュ PDF は対象ページを既存 thumbnail worker / PDFium pool へ interactive priority
+> で要求し、約 300ms かかっても rendition を提示してから次へ進む。これは以下の過去の
+> 「入力に追いつく」「約 100 ページ/秒」という性能記録より優先する現行仕様である。
+
 #### 2.5.1 満たすべき要件
 
 | ID | 要件 | 出どころ |
 | --- | --- | --- |
 | **R1** | **ページ表示自体を飛ばさない。** キーを押しっぱなしで通り過ぎるページも、一瞬でも必ず 1 回は画面に出す | 利用者要件 (§1.58、2026-08-07) |
 | **R2** | **白黒 → カラーの切り替わりを見せない。** カラー化や LUT が乗る絵で、色が付く前の状態を一瞬でも出さない | 利用者報告 2026-07-29 (「LUT 未適用の絵が 1 フレーム見えてから色が変わる」)。確定要件 |
-| **R3** | **押しっぱなしで引っかからない。** 実際のページ遷移が続いている間、UI スレッドでフルサイズのアップロードや最終合成を行わない | 実測 (§1.58): 1 枚あたり upload 21ms + final_composite_build 21ms で、キーリピート間隔 34ms に構造的に追いつかない |
+| **R3** | **押しっぱなしでも内容を見せる。** 受理済み unit が未提示の間は次の repeat を drop し、idx だけを先行させない。通過 target の full-size upload / final 合成は rendition 提示後へ回す | 利用者判断 2026-08-14: seek bar / Ctrl+G は高速移動、held key は内容を見ながら読む操作 |
 | **R4** | **キーを離したら完成画像で終わる。** 押し終わったページは通常の画質・加工で表示する | 同上 |
 
 R1〜R4 は同時に満たす。**どれか 1 つのために他を崩す修正を入れない。**
@@ -1568,12 +1577,14 @@ R1〜R4 は同時に満たす。**どれか 1 つのために他を崩す修正�
 | **A. 描画元** (`paint_source`) | このフレームで**何を描くか** — カタログサムネイルか、完成画像か | `prepare_fullscreen_state` |
 | **B. 重い処理の保留** (`defer_ui_uploads`) | このフレームで**UI スレッドを使うか** — final-effect 結果の回収 / `fs_upload_batch` の消化 | `poll_final_effects` / `fs_upload_backlog` の消化 |
 
-- **B は R3 の本体**。「ページ送りキーが held で、実際の表示単位遷移からなるバーストが active
-  か」で決める。描画元の cache readiness を混ぜない。
-- **A は B の結果ではない**。ただし現行のページ送り規則では、実遷移が成立した held バースト全体で
-  A を `pass_through` に固定する。常駐している完成画像を貼る費用自体は安いが、
-  **「完成画像が cache にあるか」はページごとに違うため、通過中の A をその条件で選んではいけない。**
-  B は同時に `true` だが、A と B は別々の field / consumer のまま維持する。
+- **B は未解決 sequence target が rendition を受け取るまで true**。physical key が先に
+  release されても、landing rendition の提示前に full work を再開して黒い placeholder を
+  露出してはいけない。
+- **A は B の結果ではない**。rendition 未着の間は `Materialized` を選ぶが、typed sequence が
+  直前の complete unit を overlay する。rendition が atomic unit 全体で ready になった frame
+  だけ `PassThrough` に切り替える。従来の「rendition が無くても PassThrough」は廃止した。
+  ready は「提示済み」ではなく、描画末尾で target page set と最終 source を照合して初めて
+  sequence を完了する。
 
 #### 2.5.2.1 「ページ送り中か」は**フレーム間で安定した信号**でなければならない
 
@@ -1608,6 +1619,15 @@ items generation を所有させる。先頭で戻る、末尾で進むなど ta
 **navigation が遷移を作ったかというコマンド結果**である。edge、時間閾値、ヒステリシスによる
 平滑化は使わない。
 
+2026-08-14 以降、`FsPageTurnBurstState` は「同じ physical hold の 2 回目以降なら低解像度
+target にできる」という画質選択だけを所有する。受理可否と表示待ちは
+`FsNavigationSequenceTarget::{FolderItems, Display}` と
+`FsNavigationTargetPhase::{Awaiting, Ready, Presenting, RenditionFailed}` が所有する。
+`Awaiting` / `Ready` / `Presenting` 中の repeat は edge multiplicity を含めて捨てる。
+`RenditionFailed` は damaged/password page 等の terminal outcome であり、次 target を受理できる。
+ただし release 後に landing target の full materialization が成功または失敗確定するまでは、
+captured previous unit を原子的に保持する。
+
 §1.58 が edge 方式を選んだのは「時間閾値・押下開始時刻・前フレームからの pending 状態を
 判定に使わない」ためだが、**押下状態の直読みはそのいずれでもない** (履歴を持たない現在値)。
 制約の意図を保ったまま、信号だけを安定させられる。
@@ -1617,9 +1637,10 @@ items generation を所有させる。先頭で戻る、末尾で進むなど ta
 
 #### 2.5.3 サムネイルを代役に使ってよい条件
 
-通過表示は「カタログサムネイルから作る低解像度 rendition をそのページの代役にする」最適化で
-ある。rendition がまだ得られなくても通過モード自体をページ別に解除せず、直前の表示単位を保った
-まま得られる画質で差し替える。加工の扱いは**見た目の差**と**処理時間**の 2 つで決める。
+通過表示は「カタログサムネイル、またはその場で PDFium 等から作る低解像度 rendition を
+そのページの代役にする」表示契約である。未着なら直前の表示単位を原子的に保持し、後続 repeat を
+drop する。rendition ready 後の target を実際に 1 frame 提示してから次を受理する。
+加工の扱いは**見た目の差**と**処理時間**の 2 つで決める。
 
 | 加工 | サムネイルとの見た目の差 | フルサイズの実測 | 通過表示の扱い |
 | --- | --- | --- | --- |
@@ -1631,9 +1652,12 @@ items generation を所有させる。先頭で戻る、末尾で進むなど ta
 **消しゴム・隠蔽・注釈をスキップする理由は「色ではないから」ではなく「時間がかかりすぎるから」。**
 将来この 3 つが十分速くなったら、扱いを再判断する余地がある。
 
-**サムネイルキャッシュが無いページの扱い**: 通過表示に入れないのではなく、**出せる最低画質で
-一旦出してから差し替えてよい** (§2.5.1.1)。「そのページのサムネイルがあるか」で描画元を選ぶのは
-§2.5.2.1 が禁じている「ページごとに変わる条件」そのものであり、5 回の失敗の 1 つ目の形。
+**サムネイルキャッシュが無いページの扱い**: target page set を既存 `keep_set` の一時 anchor
+として保持し、thumbnail worker へ priority request を発行する。PDF page は PDFium pool の
+HighNormal lane へ昇格する。catalog hit と `thumb_pixels` の両方が無い場合も request を省略せず、
+source render 完了後に色忠実 rendition を同期生成する。生成中は previous unit を保持する。
+worker が `ThumbnailState::Failed` を返した場合は `RenditionFailed` へ遷移し、sequence を永久停止
+させない。
 
 ##### 2.5.3.1 寸法別の色処理コスト (2026-08-11 実測)
 
@@ -1833,11 +1857,18 @@ scale_x=3.0443971, scale_y=3.0443973` で、論理 1440 × ppp1.5 = 実 2160px �
 #### 2.5.4 表示単位 (単一 / 見開き / 連結)
 
 単一ページは 1 ページ、見開きは左右 2 ページを表示単位として、**表示単位全体を 1 回で解決する**。
-physical key level が held で実遷移バーストが active なら、その burst 内の全 unit が通過モードであり、
-resident final や rendition の有無でページごとに mode を反転させない。見開きは左右 rendition が
-揃った frame だけを原子的に描き、
-片側だけ完成画像、もう片側だけ rendition という組み合わせを描かない。rendition がまだ無ければ
-未解決 unit として直前表示を保ち、後続 frame の rendition へ差し替える。
+受理時に current unit の texture / rotation / Part A の captured layout geometry を
+`FsNavigationSequence::previous` へ 1 unit として取り、target page set も 1 typed owner に保持する。
+見開きは左右 rendition が揃った frame だけ `Ready(Rendition)` になり、片側だけ完成画像、もう片側
+だけ rendition という組み合わせを描かない。rendition がまだ無ければ `Awaiting` のまま previous
+unit 全体を描く。target と同じ idx に旧 texture が残っていても、texture identity が captured
+previous に属するなら提示とは数えない。
+
+描画直前に `Ready` を `Presenting` へ一方向遷移させて previous overlay を外す。描画末尾で
+`fs_display_unit_trace_pages` が target generation と完全な page set を返し、captured texture が
+1 枚も選ばれていないことを確認して初めて「提示済み」と判定し sequence を解放する。
+したがって次の同 frame repeat が受理される場合でも、その前に target の draw command は確定済みで
+あり、見開き片側だけを提示済みと数えることはない。
 
 通過 rendition の外側の**ページ矩形**は、低解像度 texture の整数寸法ではなく source/header 寸法
 から求める。PDF は thumbnail / fullscreen の各 raster 寸法が別々に整数丸めされるため、PDFium が
@@ -1875,9 +1906,9 @@ source 選択と差し替えは引き続き表示単位で原子的に行う。
 | --- | --- | --- |
 | I1 | 1 バースト内で、同じ idx の `source` が `final_composite` → `thumbnail` へ戻らない | R2 |
 | I2 | 1 バースト内で `source` がページをまたいで混ざらない | R2 |
-| I3 | バーストの最初と最後の間のすべての idx が 1 回以上出る | R1 |
-| I4 | key-up または境界 no-op 後 1.5 秒以内に、着地点 idx の `materialized` が現れる | R4 |
-| I5 | active な通過バーストで rendition が ready の間、`defer_ui_uploads=true` が維持される | R3 |
+| I3 | 受理した target unit の全 idx が、次 target の受理前に同じ final display-unit source として 1 回以上出る | R1 |
+| I4 | key-up 後は追加 target を内部 queue から発火せず、受理済み landing rendition を提示した後に同 idx の `materialized` が現れる | R4 |
+| I5 | unresolved rendition sequence では ready 前も含め `defer_ui_uploads=true`、ready 前の `paint_source=materialized` は previous atomic holdover に覆われる | R3 |
 
 `fs/paint` は単一ページでは既存の `(idx, texture)` producer が rendition も記録し、見開きでは
 holdover を含む最終表示単位の解決後に同じ page list から記録する。`source=thumbnail` が通過
@@ -1919,8 +1950,12 @@ pass-through open は旧 page-transition holdover を消しているので、こ
    context-local rendition cache を実装済み。
 3. ~~通過中はフルサイズのアップロードとデコードを始めない~~ → 実遷移バーストが active の間は
    producer 起動と UI upload 回収を保留し、既存 producer を cancel する。
-4. ~~止まったページだけ実体化する~~ → release または境界 no-op frame で current display unit を
-   eager path へ戻し、final 到着までは着地点 rendition を維持する。
+4. ~~止まったページだけ実体化する~~ → key-up 後も受理済み landing rendition の提示までは
+   sequence を維持し、提示後の次 frame で current display unit を eager path へ戻す。入力 repeat は
+   queue しないため、release 後に別 target が自動で進むことはない。
+5. ~~未キャッシュ target を実際に生成する~~ → sequence page set を keep-set に固定し、priority
+   thumbnail request と PDF HighNormal promotion を発行する。terminal failure は typed outcome として
+   次 target または landing full materialization へ進める。
 
 単一ページの `aimodel1` / 4.1MP 実 ZIP と見開きの実ログ gate は利用者実測で合格済み。境界 no-op、
 rendition の表示矩形、PDF + `MonochromeOnly` は上記の回帰テストと再実測で維持する。

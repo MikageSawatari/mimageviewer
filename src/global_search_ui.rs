@@ -2028,7 +2028,11 @@ impl App {
     /// 移動先に直接の image-like が無い (サブフォルダ配下にしかない) ケースは
     /// スキップしてさらに次の候補に進む。対象が見つかるまで前後方向に進み、
     /// フラットリスト全体に対象が無ければ元の位置に戻して何もしない。
-    pub(crate) fn global_search_ctrl_nav_fullscreen(&mut self, ctx: &egui::Context, forward: bool) {
+    pub(crate) fn global_search_ctrl_nav_fullscreen(
+        &mut self,
+        ctx: &egui::Context,
+        forward: bool,
+    ) -> bool {
         // global_search_ctrl_nav が動かすのは drill state だけなので、進めたかは
         // drill の変化で判定する。
         let before_drill = self.global_search.drill.clone();
@@ -2046,7 +2050,7 @@ impl App {
                     forward,
                     at: std::time::Instant::now(),
                 });
-                return;
+                return false;
             }
             // rebuild_items_from_global_search 済みなので visible_indices を見て
             // image-like アイテムがあるか判定する。無ければ次の候補へ。
@@ -2064,7 +2068,7 @@ impl App {
                 self.selected = Some(idx);
                 self.scroll_to_selected = true;
                 self.update_last_selected_image();
-                return;
+                return true;
             }
             // 画像が無い (Folder 枝しかない) 候補はスキップしてさらに次へ
         }

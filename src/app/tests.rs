@@ -12675,6 +12675,34 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    #[test]
+    fn navigation_target_pdf_page_is_kept_and_requested_at_interactive_priority() {
+        use std::sync::{Arc, Condvar, Mutex};
+
+        let mut app = setup_app();
+        let pdf = app.tmp.path().join(stringify!(uncached.pdf));
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: pdf,
+            page_num: 4,
+            content_type: None,
+        }];
+        app.image_metas = vec![Some((7, 11))];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.reload_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+        app.heavy_io_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+
+        app.ensure_navigation_target_thumbnail_requests(&egui::Context::default(), &[0]);
+
+        assert!(app.keep_set.contains(&0));
+        assert_eq!(app.keep_range, (0, 1));
+        assert!(app.requested.contains_key(&0));
+        let queue = app.reload_queue.as_ref().unwrap().0.lock().unwrap();
+        assert_eq!(queue.len(), 1);
+        assert!(queue[0].priority);
+        assert_eq!(queue[0].idx, 0);
+        assert_eq!(queue[0].items_gen, app.items_generation);
+    }
+
     /// 黒サムネ回帰修正 (2026-06-19, v1.8.0) + detached-rework findings-9 B2:
     /// font-atlas resync が予約されているだけの safe-frame 待ちではサムネ upload を
     /// 止めない。実際に `set_fonts` が発火して repeat 中の間だけ、no-surface フレームで
@@ -20521,7 +20549,7 @@ mod favorite_adjustment_defaults_tests {
 
     #[cfg(windows)]
     #[test]
-    fn same_frame_two_ctrl_down_edges_move_two_fullscreen_folders() {
+    fn same_frame_second_ctrl_down_edge_is_dropped_until_target_is_presented() {
         let _serial = crate::key_input::TEST_INPUT_LOCK
             .get_or_init(|| std::sync::Mutex::new(()))
             .lock()
@@ -20582,14 +20610,15 @@ mod favorite_adjustment_defaults_tests {
             None,
             0,
         );
-        assert_eq!(app.pending_folder_nav_steps, 1);
+        assert_eq!(app.pending_folder_nav_steps, 0);
 
         drain_folder_nav_burst_for_test(&mut app, &ctx);
         assert!(
             app.current_folder
                 .as_ref()
-                .is_some_and(|current| crate::folder_tree::path_eq(current, &folders[2])),
-            "two same-frame physical presses must apply two fullscreen folder transitions"
+                .is_some_and(|current| crate::folder_tree::path_eq(current, &folders[1])),
+            "the second same-frame press is dropped until the first target has been presented, \
+             so only one folder transition applies"
         );
     }
 

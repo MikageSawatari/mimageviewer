@@ -25,8 +25,10 @@ use std::sync::Arc;
 use crate::adjustment::PostFilter;
 use crate::ai::ModelKind;
 use crate::app::{
-    App, FsDisplayUnitHoldover, FsDisplayUnitHoldoverPage, FsHoldover, FsOpenMaterialization,
-    FsOverflowPanelState, FsPageLoadState, ViewerPresentation,
+    App, FsDisplayUnitHoldover, FsDisplayUnitHoldoverPage, FsHoldover, FsNavigationDisplayTarget,
+    FsNavigationPresentation, FsNavigationSequence, FsNavigationSequenceTarget,
+    FsNavigationTargetPhase, FsOpenMaterialization, FsOverflowPanelState, FsPageLoadState,
+    ViewerPresentation,
 };
 use crate::displayed_image_transform::{
     DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
@@ -1045,7 +1047,7 @@ fn paint_fs_navigator_header(
 
 enum FsNavHoldoverDecision {
     Unavailable,
-    TargetReady,
+    TargetReady(FsNavigationPresentation),
     Draw(FsDisplayUnitHoldover),
 }
 
@@ -4658,6 +4660,22 @@ impl App {
     }
 
     pub(crate) fn capture_fs_display_unit(&mut self, idx: usize) -> Option<FsDisplayUnitHoldover> {
+        self.capture_fs_display_unit_with_rendition(None, idx)
+    }
+
+    fn capture_fs_navigation_display_unit(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<FsDisplayUnitHoldover> {
+        self.capture_fs_display_unit_with_rendition(Some(ctx), idx)
+    }
+
+    fn capture_fs_display_unit_with_rendition(
+        &mut self,
+        rendition_ctx: Option<&egui::Context>,
+        idx: usize,
+    ) -> Option<FsDisplayUnitHoldover> {
         match self.resolve_spread_pair(idx) {
             SpreadPair::Single => {
                 let rotation = self.get_rotation(idx);
@@ -4666,7 +4684,8 @@ impl App {
                 } else {
                     None
                 };
-                let page = self.capture_fs_display_unit_page(idx, rotation, content_bbox)?;
+                let page =
+                    self.capture_fs_display_unit_page(rendition_ctx, idx, rotation, content_bbox)?;
                 Some(FsDisplayUnitHoldover { pages: vec![page] })
             }
             SpreadPair::Double { left, right } => {
@@ -4695,10 +4714,18 @@ impl App {
                             },
                         )
                     };
-                let left_page =
-                    self.capture_fs_display_unit_page(left, left_rotation, left_content_bbox)?;
-                let right_page =
-                    self.capture_fs_display_unit_page(right, right_rotation, right_content_bbox)?;
+                let left_page = self.capture_fs_display_unit_page(
+                    rendition_ctx,
+                    left,
+                    left_rotation,
+                    left_content_bbox,
+                )?;
+                let right_page = self.capture_fs_display_unit_page(
+                    rendition_ctx,
+                    right,
+                    right_rotation,
+                    right_content_bbox,
+                )?;
                 Some(FsDisplayUnitHoldover {
                     pages: vec![left_page, right_page],
                 })
@@ -4707,13 +4734,16 @@ impl App {
     }
 
     fn capture_fs_display_unit_page(
-        &self,
+        &mut self,
+        rendition_ctx: Option<&egui::Context>,
         idx: usize,
         rotation: crate::rotation_db::Rotation,
         content_bbox: Option<egui::Rect>,
     ) -> Option<FsDisplayUnitHoldoverPage> {
-        let texture = self
-            .fullscreen_paint_resource_for_texture(idx, self.resolve_fs_display_tex(idx, true)?);
+        let texture = self.resolve_fs_display_tex(idx, true).or_else(|| {
+            rendition_ctx.and_then(|ctx| self.ensure_passthrough_rendition(ctx, idx))
+        })?;
+        let texture = self.fullscreen_paint_resource_for_texture(idx, texture);
         let source_size = self
             .source_dims_for_idx(idx)
             .map(|(width, height)| egui::vec2(width, height));
@@ -5041,6 +5071,235 @@ impl App {
         self.resolve_fs_pre_overlay_texture(idx)
     }
 
+    pub(crate) fn fs_navigation_sequence_blocks_new_target(&self) -> bool {
+        self.fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .is_some_and(FsNavigationSequence::blocks_new_target)
+    }
+
+    pub(crate) fn begin_fs_folder_navigation_sequence(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) {
+        let previous = self
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .filter(|sequence| !sequence.blocks_new_target())
+            .and_then(|sequence| sequence.previous.clone())
+            .or_else(|| self.capture_fs_navigation_display_unit(ctx, fs_idx));
+        self.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous,
+            target: FsNavigationSequenceTarget::FolderItems {
+                accepted_generation: self.items_generation,
+            },
+        }));
+        self.fs_nav_locked_gen = Some(self.items_generation);
+    }
+
+    fn begin_fs_page_navigation_sequence(
+        &mut self,
+        ctx: &egui::Context,
+        current_idx: usize,
+        target_idx: usize,
+        accept_rendition: bool,
+    ) -> bool {
+        if self.continuous_reading_active_for_idx(current_idx) {
+            return true;
+        }
+        if self.fs_navigation_sequence_blocks_new_target() {
+            return false;
+        }
+        let previous = self
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .and_then(|sequence| sequence.previous.clone())
+            .or_else(|| self.capture_fs_navigation_display_unit(ctx, current_idx));
+        let mut pages = self.fs_display_unit_page_indices(target_idx);
+        pages.sort_unstable();
+        self.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous,
+            target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                items_generation: self.items_generation,
+                pages,
+                phase: FsNavigationTargetPhase::Awaiting { accept_rendition },
+            }),
+        }));
+        true
+    }
+
+    pub(crate) fn bind_fs_navigation_sequence_to_current_target(&mut self) -> bool {
+        let Some(idx) = self.fullscreen_idx else {
+            return false;
+        };
+        let awaiting_folder = self
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .is_some_and(|sequence| {
+                matches!(
+                    sequence.target,
+                    FsNavigationSequenceTarget::FolderItems { .. }
+                )
+            });
+        if !awaiting_folder {
+            return false;
+        }
+        let mut pages = self.fs_display_unit_page_indices(idx);
+        pages.sort_unstable();
+        if pages
+            .iter()
+            .any(|page| !self.items.get(*page).is_some_and(GridItem::has_page_data))
+        {
+            let previous = self
+                .fs_holdover_tex
+                .as_ref()
+                .and_then(FsHoldover::navigation_sequence)
+                .and_then(|sequence| sequence.previous.clone());
+            self.fs_holdover_tex = previous.map(FsHoldover::FolderNavigation);
+            return false;
+        }
+        if let Some(sequence) = self
+            .fs_holdover_tex
+            .as_mut()
+            .and_then(FsHoldover::navigation_sequence_mut)
+        {
+            sequence.target = FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                items_generation: self.items_generation,
+                pages,
+                phase: FsNavigationTargetPhase::Awaiting {
+                    accept_rendition: true,
+                },
+            });
+            return true;
+        }
+        false
+    }
+
+    fn resolve_fs_navigation_sequence_target(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        let Some(target) = self
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .and_then(|sequence| match &sequence.target {
+                FsNavigationSequenceTarget::Display(target) => Some(target.clone()),
+                FsNavigationSequenceTarget::FolderItems { .. } => None,
+            })
+        else {
+            return;
+        };
+        let accept_rendition = match target.phase {
+            FsNavigationTargetPhase::Awaiting { accept_rendition } => accept_rendition,
+            FsNavigationTargetPhase::RenditionFailed => false,
+            FsNavigationTargetPhase::Ready(_) | FsNavigationTargetPhase::Presenting(_) => {
+                return;
+            }
+        };
+        if target.items_generation != self.items_generation || !target.pages.contains(&fs_idx) {
+            return;
+        }
+
+        if accept_rendition {
+            self.ensure_navigation_target_thumbnail_requests(ctx, &target.pages);
+        }
+        let materialized_ready = target.pages.iter().all(|idx| {
+            self.resolve_fs_display_tex(*idx, true).is_some()
+                || (!self.items.get(*idx).is_some_and(GridItem::has_page_data)
+                    && matches!(
+                        self.thumbnails.get(*idx),
+                        Some(ThumbnailState::Loaded { .. })
+                    ))
+        });
+        let materialized_failed = target
+            .pages
+            .iter()
+            .any(|idx| matches!(self.fs_cache.get(idx), Some(FsCacheEntry::Failed)));
+        let rendition_ready = accept_rendition
+            && target
+                .pages
+                .iter()
+                .all(|idx| self.ensure_passthrough_rendition(ctx, *idx).is_some());
+        let rendition_failed = accept_rendition
+            && target
+                .pages
+                .iter()
+                .any(|idx| matches!(self.thumbnails.get(*idx), Some(ThumbnailState::Failed)));
+
+        let next_phase = if materialized_ready {
+            Some(FsNavigationTargetPhase::Ready(
+                FsNavigationPresentation::Materialized,
+            ))
+        } else if rendition_ready {
+            Some(FsNavigationTargetPhase::Ready(
+                FsNavigationPresentation::Rendition,
+            ))
+        } else if materialized_failed {
+            Some(FsNavigationTargetPhase::Ready(
+                FsNavigationPresentation::Failure,
+            ))
+        } else if rendition_failed {
+            Some(FsNavigationTargetPhase::RenditionFailed)
+        } else {
+            None
+        };
+        let Some(next_phase) = next_phase else {
+            return;
+        };
+        let terminal_rendition_failure =
+            matches!(next_phase, FsNavigationTargetPhase::RenditionFailed);
+        if let Some(FsNavigationSequenceTarget::Display(current)) = self
+            .fs_holdover_tex
+            .as_mut()
+            .and_then(FsHoldover::navigation_sequence_mut)
+            .map(|sequence| &mut sequence.target)
+            && *current == target
+        {
+            current.phase = next_phase;
+            if terminal_rendition_failure {
+                self.fs_nav_locked_gen = None;
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    fn fs_navigation_sequence_rendition_state(&self, fs_idx: usize) -> (bool, bool) {
+        let Some(target) = self
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .and_then(|sequence| match &sequence.target {
+                FsNavigationSequenceTarget::Display(target)
+                    if target.items_generation == self.items_generation
+                        && target.pages.contains(&fs_idx) =>
+                {
+                    Some(target)
+                }
+                FsNavigationSequenceTarget::FolderItems { .. }
+                | FsNavigationSequenceTarget::Display(_) => None,
+            })
+        else {
+            return (false, false);
+        };
+        match target.phase {
+            FsNavigationTargetPhase::Awaiting {
+                accept_rendition: true,
+            } => (true, false),
+            FsNavigationTargetPhase::Ready(FsNavigationPresentation::Rendition)
+            | FsNavigationTargetPhase::Presenting(FsNavigationPresentation::Rendition) => {
+                (true, true)
+            }
+            FsNavigationTargetPhase::Awaiting {
+                accept_rendition: false,
+            }
+            | FsNavigationTargetPhase::Ready(_)
+            | FsNavigationTargetPhase::Presenting(_)
+            | FsNavigationTargetPhase::RenditionFailed => (false, false),
+        }
+    }
+
     /// `fs_nav_locked_gen.is_some()` の薄いラッパー。
     /// 入力ハンドラ・描画パスから「現在 nav ロック中か」を簡潔に問い合わせるため。
     pub(crate) fn fs_nav_is_locked(&self) -> bool {
@@ -5058,6 +5317,29 @@ impl App {
     /// ページ枠の fallback には渡さず、描画側が `image_rect` 全体へ旧単ページ、または
     /// 画面順の旧見開き 2 ページを 1 unit としてオーバーレイする。
     fn fs_nav_holdover_decision(&self) -> FsNavHoldoverDecision {
+        if let Some(sequence) = self
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+        {
+            if let FsNavigationSequenceTarget::Display(target) = &sequence.target {
+                match target.phase {
+                    FsNavigationTargetPhase::Ready(presentation) => {
+                        return FsNavHoldoverDecision::TargetReady(presentation);
+                    }
+                    FsNavigationTargetPhase::Presenting(_) => {
+                        return FsNavHoldoverDecision::Unavailable;
+                    }
+                    FsNavigationTargetPhase::Awaiting { .. }
+                    | FsNavigationTargetPhase::RenditionFailed => {}
+                }
+            }
+            return sequence
+                .previous
+                .clone()
+                .map(FsNavHoldoverDecision::Draw)
+                .unwrap_or(FsNavHoldoverDecision::Unavailable);
+        }
         let Some(locked_gen) = self.fs_nav_locked_gen else {
             return FsNavHoldoverDecision::Unavailable;
         };
@@ -5077,7 +5359,7 @@ impl App {
             let new_content_ready = self.resolve_fs_display_tex(idx, true).is_some();
             let new_content_failed = matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Failed));
             if new_content_ready || new_content_failed {
-                return FsNavHoldoverDecision::TargetReady;
+                return FsNavHoldoverDecision::TargetReady(FsNavigationPresentation::Materialized);
             }
         }
         self.fs_holdover_tex
@@ -5093,7 +5375,21 @@ impl App {
     /// unit が所有する handle を破棄しない。
     pub(crate) fn fs_nav_holdover_for_draw(&mut self) -> Option<FsDisplayUnitHoldover> {
         match self.fs_nav_holdover_decision() {
-            FsNavHoldoverDecision::TargetReady => {
+            FsNavHoldoverDecision::TargetReady(presentation) => {
+                if let Some(sequence) = self
+                    .fs_holdover_tex
+                    .as_mut()
+                    .and_then(FsHoldover::navigation_sequence_mut)
+                    && let FsNavigationSequenceTarget::Display(target) = &mut sequence.target
+                    && matches!(target.phase, FsNavigationTargetPhase::Ready(_))
+                {
+                    target.phase = FsNavigationTargetPhase::Presenting(presentation);
+                    if matches!(presentation, FsNavigationPresentation::Failure) {
+                        self.fs_nav_locked_gen = None;
+                        self.fs_holdover_tex = None;
+                    }
+                    return None;
+                }
                 // 一方向ラッチ: 新 generation の表示物を選べた描画フレームで旧フォルダの
                 // texture handle 自体を破棄する。AI final の差し替えで次フレームの
                 // resolve が一時的に None へ戻っても、旧画像を再選択できなくする。
@@ -5108,7 +5404,7 @@ impl App {
     fn fs_nav_holdover_without_latching(&self) -> Option<FsDisplayUnitHoldover> {
         match self.fs_nav_holdover_decision() {
             FsNavHoldoverDecision::Draw(unit) => Some(unit),
-            FsNavHoldoverDecision::Unavailable | FsNavHoldoverDecision::TargetReady => None,
+            FsNavHoldoverDecision::Unavailable | FsNavHoldoverDecision::TargetReady(_) => None,
         }
     }
 
@@ -5148,6 +5444,35 @@ impl App {
     /// 「items が進む前」(= 旧ページがロード済み判定で誤って解除される) のを
     /// items_generation チェックで防ぐ。
     pub(crate) fn poll_fs_nav_lock(&mut self, ctx: &egui::Context) {
+        if let Some(sequence) = self
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+        {
+            let accepted_generation = match sequence.target {
+                FsNavigationSequenceTarget::FolderItems {
+                    accepted_generation,
+                } => Some(accepted_generation),
+                FsNavigationSequenceTarget::Display(_) => None,
+            };
+            if let Some(accepted_generation) = accepted_generation {
+                if self.items_generation <= accepted_generation {
+                    return;
+                }
+                if self.fullscreen_idx.is_none() {
+                    if self.fs_nav_deferred_reopen_wait_active() {
+                        return;
+                    }
+                    self.release_fs_nav_lock();
+                    return;
+                }
+                self.bind_fs_navigation_sequence_to_current_target();
+            }
+            if let Some(idx) = self.fullscreen_idx {
+                self.resolve_fs_navigation_sequence_target(ctx, idx);
+            }
+            return;
+        }
         let Some(locked_gen) = self.fs_nav_locked_gen else {
             return;
         };
@@ -7494,18 +7819,17 @@ fn fs_paint_page_changed_from_previous(
 }
 
 fn page_turn_decision_for_inputs(
-    page_turn_input_held: bool,
-    page_turn_burst_active: bool,
+    rendition_sequence_active: bool,
     passthrough_rendition_ready: bool,
 ) -> FsPageTurnDecision {
-    let pass_through = page_turn_input_held && page_turn_burst_active;
+    let pass_through = rendition_sequence_active && passthrough_rendition_ready;
     FsPageTurnDecision {
         paint_source: if pass_through {
             FsPageTurnPaintSource::PassThrough
         } else {
             FsPageTurnPaintSource::Materialized
         },
-        defer_ui_uploads: pass_through,
+        defer_ui_uploads: rendition_sequence_active,
         passthrough_rendition_ready,
     }
 }
@@ -13902,18 +14226,6 @@ impl App {
         (configurable || fixed, None, viewport)
     }
 
-    fn fs_page_turn_passthrough_renditions_ready(
-        &mut self,
-        ctx: &egui::Context,
-        fs_idx: usize,
-    ) -> bool {
-        let pages = self.fs_display_unit_page_indices(fs_idx);
-        !pages.is_empty()
-            && pages
-                .into_iter()
-                .all(|idx| self.ensure_passthrough_rendition(ctx, idx).is_some())
-    }
-
     fn emit_fs_page_turn_decision_probe(
         &mut self,
         frame_nr: u64,
@@ -13976,10 +14288,13 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
     ) -> FsPageTurnDecision {
+        self.resolve_fs_navigation_sequence_target(ctx, fs_idx);
+        let (rendition_sequence_active, passthrough_rendition_ready) =
+            self.fs_navigation_sequence_rendition_state(fs_idx);
         #[cfg(not(windows))]
         {
-            let _ = (ctx, fs_idx);
-            FsPageTurnDecision::normal()
+            let _ = ctx;
+            page_turn_decision_for_inputs(rendition_sequence_active, passthrough_rendition_ready)
         }
 
         #[cfg(windows)]
@@ -14009,11 +14324,8 @@ impl App {
                 ctx.data_mut(|data| data.insert_temp(burst_id, burst_state));
             }
             let page_turn_burst_active = burst_state.is_active();
-            let passthrough_rendition_ready = page_turn_burst_active
-                && self.fs_page_turn_passthrough_renditions_ready(ctx, fs_idx);
             let decision = page_turn_decision_for_inputs(
-                page_turn_input_held,
-                page_turn_burst_active,
+                rendition_sequence_active,
                 passthrough_rendition_ready,
             );
             self.emit_fs_page_turn_decision_probe(
@@ -14048,9 +14360,12 @@ impl App {
         ctx: &egui::Context,
         current_idx: usize,
         target_idx: Option<usize>,
-    ) {
+    ) -> bool {
         #[cfg(not(windows))]
-        let _ = (ctx, current_idx, target_idx);
+        {
+            let _ = (ctx, current_idx, target_idx);
+            false
+        }
 
         #[cfg(windows)]
         {
@@ -14089,6 +14404,7 @@ impl App {
             if !moved {
                 ctx.request_repaint();
             }
+            state.is_active()
         }
     }
 
@@ -14305,6 +14621,41 @@ impl App {
         }
     }
 
+    fn observe_fs_navigation_sequence_presented(&mut self, trace_pages: &[FsDisplayUnitTracePage]) {
+        let Some(target) = self
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .and_then(|sequence| match &sequence.target {
+                FsNavigationSequenceTarget::Display(target)
+                    if matches!(target.phase, FsNavigationTargetPhase::Presenting(_)) =>
+                {
+                    Some(target.clone())
+                }
+                FsNavigationSequenceTarget::FolderItems { .. }
+                | FsNavigationSequenceTarget::Display(_) => None,
+            })
+        else {
+            return;
+        };
+        if target.items_generation != self.items_generation {
+            return;
+        }
+        let captured_page_visible = trace_pages.iter().any(|page| {
+            self.fs_holdover_tex
+                .as_ref()
+                .and_then(|holdover| holdover.page_for_texture_id(page.texture_id))
+                .is_some()
+        });
+        let mut presented_pages = trace_pages.iter().map(|page| page.idx).collect::<Vec<_>>();
+        presented_pages.sort_unstable();
+        presented_pages.dedup();
+        if !captured_page_visible && presented_pages == target.pages {
+            self.fs_nav_locked_gen = None;
+            self.fs_holdover_tex = None;
+        }
+    }
+
     /// Emit readiness only after the final visible display-unit source has been
     /// selected (including holdovers). Spread pages are accepted only as a complete
     /// unit, so the trace cannot report a half-painted pair as ready.
@@ -14316,13 +14667,14 @@ impl App {
         decision: FsPageTurnDecision,
         sources: &FsNavigatorTextureSources,
     ) {
-        if !crate::perf::is_enabled() {
-            return;
-        }
         let Some(trace_pages) = self.fs_display_unit_trace_pages(fs_idx, spread_pair, sources)
         else {
             return;
         };
+        self.observe_fs_navigation_sequence_presented(&trace_pages);
+        if !crate::perf::is_enabled() {
+            return;
+        }
         self.emit_fs_paint_for_display_unit(ctx, fs_idx, spread_pair, decision, sources);
         if matches!(decision.paint_source(), FsPageTurnPaintSource::Materialized)
             && trace_pages.iter().any(|page| page.source == "thumbnail")
@@ -15428,14 +15780,18 @@ impl App {
         dir: i32,
         action: &mut FsKeyAction,
     ) {
-        if dir == 0 {
+        if dir == 0
+            || self.fs_navigation_sequence_blocks_new_target()
+            || !action.page_nav.is_none()
+            || action.jump_to.is_some()
+        {
             return;
         }
         if self.spread_mode.is_spread() {
             if let Some((new_idx, anchor_idx)) = self.compute_spread_offset_nudge(fs_idx, dir) {
                 self.spread_shift_anchor_idx = Some(anchor_idx);
                 self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
-                action.jump_to = Some(new_idx);
+                action.page_nav = FsPageNav::Target(new_idx);
                 self.show_feedback_toast("見開きを1ページずらしました".to_string());
             }
         } else {
@@ -20961,7 +21317,7 @@ impl App {
         // 抜け、次の実フォルダへ進む。holdover / 端での lock 残留対策は
         // zip_nav_dfs_fullscreen 側に集約されている。
         if self.zip_nav.is_some() {
-            if self.zip_nav_dfs_fullscreen(fs_idx, true) {
+            if self.zip_nav_dfs_fullscreen(None, fs_idx, true) {
                 // 移動先の本がフィルタで全 hidden でフルスクリーンが閉じた場合
                 // (dfs_fullscreen 内で slideshow_playing=false 済み) はスケジュールしない。
                 if self.fullscreen_idx.is_some() {
@@ -21369,6 +21725,9 @@ impl App {
         forward: bool,
         native_toast: bool,
     ) {
+        if self.fs_navigation_sequence_blocks_new_target() {
+            return;
+        }
         if self.fs_nav_is_locked() {
             if let Some((current, mode)) = self.locked_fullscreen_folder_nav_request(false) {
                 // A follow-up accepted during the display-wait window targets the next items
@@ -21422,7 +21781,7 @@ impl App {
         // ★固定 中は snapshot 内 entry を巡回する (= §4.6)。
         // Folder/Image/Video 混合 entry 全部対象。
         if self.is_snapshot_active() {
-            self.capture_fs_nav_holdover(fs_idx);
+            self.begin_fs_folder_navigation_sequence(ctx, fs_idx);
             let _ = self.snapshot_navigate(
                 ctx,
                 forward,
@@ -21435,7 +21794,12 @@ impl App {
 
         if self.global_search.active {
             if self.global_search.drill.is_some() {
-                self.global_search_ctrl_nav_fullscreen(ctx, forward);
+                self.begin_fs_folder_navigation_sequence(ctx, fs_idx);
+                if self.global_search_ctrl_nav_fullscreen(ctx, forward) {
+                    self.bind_fs_navigation_sequence_to_current_target();
+                } else {
+                    self.release_fs_nav_lock();
+                }
             } else {
                 // 一覧ビューはグリッドに実画像が並ぶので通常のフルスクリーン前後移動が
                 // 使える。フォルダ横断 (Ctrl+↑↓) の概念は無いので no-op ヒントを出す。
@@ -21452,7 +21816,7 @@ impl App {
             let Some(current) = self.favsearch.nav_stack.last().cloned() else {
                 return;
             };
-            self.capture_fs_nav_holdover(fs_idx);
+            self.begin_fs_folder_navigation_sequence(ctx, fs_idx);
             self.start_folder_nav(
                 current,
                 forward,
@@ -21480,12 +21844,12 @@ impl App {
         // 返り nav は不変なので、下の current_folder 分岐に落ちて ZIP を抜けて実フォルダ
         // DFS へ続く (グリッド側 zip_nav_handle_ctrl_updown と対称)。
         // holdover は移動確定後に zip_nav_dfs_fullscreen 内で取る (端で lock が残るのを防ぐ)。
-        if self.zip_nav.is_some() && self.zip_nav_dfs_fullscreen(fs_idx, forward) {
+        if self.zip_nav.is_some() && self.zip_nav_dfs_fullscreen(Some(ctx), fs_idx, forward) {
             return;
         }
 
         if self.top_level_grid_view.smart_folder().is_some() {
-            self.capture_fs_nav_holdover(fs_idx);
+            self.begin_fs_folder_navigation_sequence(ctx, fs_idx);
             let _ = self.start_smart_folder_scope_nav(forward, true);
             return;
         }
@@ -21494,7 +21858,7 @@ impl App {
         // effective_folder() を起点にする (グリッド側と同じ。Codex P2: さもないと
         // ZIP ツリーの端から抜けたとき archive_cache ディレクトリを探索してしまう)。
         if let Some(cur) = self.effective_folder() {
-            self.capture_fs_nav_holdover(fs_idx);
+            self.begin_fs_folder_navigation_sequence(ctx, fs_idx);
             self.start_folder_nav(cur, forward, crate::app::FolderNavMode::Fullscreen);
         }
     }
@@ -21506,6 +21870,9 @@ impl App {
         forward: bool,
         native_toast: bool,
     ) {
+        if self.fs_navigation_sequence_blocks_new_target() {
+            return;
+        }
         if self.fs_nav_is_locked() {
             if let Some((current, mode)) = self.locked_fullscreen_folder_nav_request(true) {
                 self.fs_nav_locked_gen = Some(self.items_generation);
@@ -21541,7 +21908,7 @@ impl App {
         // ★固定 中は snapshot 内の playable image-like entry のみを巡回 (= §4.6)。
         // Ctrl+PageUp/Down は Folder entry を skip して直接 image/video へ。
         if self.is_snapshot_active() {
-            self.capture_fs_nav_holdover(fs_idx);
+            self.begin_fs_folder_navigation_sequence(ctx, fs_idx);
             let _ = self.snapshot_navigate(
                 ctx,
                 forward,
@@ -21582,7 +21949,7 @@ impl App {
 
         // 変換キャッシュ閲覧中の起点はユーザー視点の元アーカイブ (Codex P2、上と同様)。
         if let Some(cur) = self.effective_folder() {
-            self.capture_fs_nav_holdover(fs_idx);
+            self.begin_fs_folder_navigation_sequence(ctx, fs_idx);
             self.start_folder_nav(cur, forward, crate::app::FolderNavMode::SiblingFullscreen);
         }
     }
@@ -21740,7 +22107,9 @@ impl App {
             // close (Esc) / close_to_page_list (BS) は終端アクション。閉じた後に同フレームの
             // wheel 由来のページ移動等で別項目を開き直さないようガードする。
             if let Some(new_idx) = jump_to {
-                self.land_still_page_navigation_target(ctx, fs_idx, new_idx);
+                if !self.fs_navigation_sequence_blocks_new_target() {
+                    self.land_still_page_navigation_target(ctx, fs_idx, new_idx);
+                }
             } else if let FsPageNav::Target(new_idx) = page_nav {
                 let display_order = self.current_grid_order().to_vec();
                 let current_is_media = matches!(
@@ -21761,12 +22130,24 @@ impl App {
                         );
                     }
                 } else {
-                    self.update_fs_page_turn_burst_after_navigation(
-                        ctx,
-                        fs_idx,
-                        (new_idx != fs_idx).then_some(new_idx),
-                    );
-                    self.land_still_page_navigation_target(ctx, fs_idx, new_idx);
+                    let moved = new_idx != fs_idx;
+                    if !moved || !self.fs_navigation_sequence_blocks_new_target() {
+                        let accept_rendition = self.update_fs_page_turn_burst_after_navigation(
+                            ctx,
+                            fs_idx,
+                            moved.then_some(new_idx),
+                        );
+                        if !moved
+                            || self.begin_fs_page_navigation_sequence(
+                                ctx,
+                                fs_idx,
+                                new_idx,
+                                accept_rendition,
+                            )
+                        {
+                            self.land_still_page_navigation_target(ctx, fs_idx, new_idx);
+                        }
+                    }
                 }
             } else if let FsPageNav::Boundary { at_end } = page_nav {
                 self.update_fs_page_turn_burst_after_navigation(ctx, fs_idx, None);
@@ -21800,15 +22181,27 @@ impl App {
                     &self.items,
                     &display_order,
                     fs_idx,
-                    nav_delta,
+                    nav_delta.signum(),
                     self.continuous_reading_active_for_idx(fs_idx),
                 ) {
-                    self.update_fs_page_turn_burst_after_navigation(
-                        ctx,
-                        fs_idx,
-                        (new_idx != fs_idx).then_some(new_idx),
-                    );
-                    self.land_still_page_navigation_target(ctx, fs_idx, new_idx);
+                    let moved = new_idx != fs_idx;
+                    if !moved || !self.fs_navigation_sequence_blocks_new_target() {
+                        let accept_rendition = self.update_fs_page_turn_burst_after_navigation(
+                            ctx,
+                            fs_idx,
+                            moved.then_some(new_idx),
+                        );
+                        if !moved
+                            || self.begin_fs_page_navigation_sequence(
+                                ctx,
+                                fs_idx,
+                                new_idx,
+                                accept_rendition,
+                            )
+                        {
+                            self.land_still_page_navigation_target(ctx, fs_idx, new_idx);
+                        }
+                    }
                 } else {
                     self.update_fs_page_turn_burst_after_navigation(ctx, fs_idx, None);
                     // 境界到達: 中央にヒントを出す (nav_delta > 0 なら末尾)
@@ -32555,10 +32948,10 @@ mod tests {
     }
 
     #[test]
-    fn page_turn_held_level_selects_pass_through_even_without_a_thumbnail_rendition() {
-        let decision = page_turn_decision_for_inputs(true, true, false);
+    fn unresolved_page_turn_keeps_materialized_paint_behind_the_atomic_holdover() {
+        let decision = page_turn_decision_for_inputs(true, false);
 
-        assert_eq!(decision.paint_source(), FsPageTurnPaintSource::PassThrough);
+        assert_eq!(decision.paint_source(), FsPageTurnPaintSource::Materialized);
         assert!(decision.defer_ui_uploads());
         assert!(!decision.passthrough_rendition_ready);
     }
@@ -32567,13 +32960,13 @@ mod tests {
     fn page_turn_decision_keeps_paint_and_ui_work_as_independent_axes() {
         let cases = [
             (true, true, FsPageTurnPaintSource::PassThrough, true),
-            (true, false, FsPageTurnPaintSource::PassThrough, true),
+            (true, false, FsPageTurnPaintSource::Materialized, true),
             (false, true, FsPageTurnPaintSource::Materialized, false),
             (false, false, FsPageTurnPaintSource::Materialized, false),
         ];
 
-        for (held, ready, expected_source, expected_defer) in cases {
-            let decision = page_turn_decision_for_inputs(held, true, ready);
+        for (active, ready, expected_source, expected_defer) in cases {
+            let decision = page_turn_decision_for_inputs(active, ready);
             assert_eq!(decision.paint_source(), expected_source);
             assert_eq!(decision.defer_ui_uploads(), expected_defer);
             assert_eq!(decision.passthrough_rendition_ready, ready);
@@ -32581,20 +32974,128 @@ mod tests {
     }
 
     #[test]
-    fn page_turn_release_materializes_on_the_next_frame_without_hysteresis() {
-        let held = page_turn_decision_for_inputs(true, true, true);
-        let released = page_turn_decision_for_inputs(false, true, true);
+    fn page_turn_sequence_settles_only_after_its_rendition_was_presented() {
+        let ready = page_turn_decision_for_inputs(true, true);
+        let presented = page_turn_decision_for_inputs(false, true);
 
-        assert_eq!(held.paint_source(), FsPageTurnPaintSource::PassThrough);
-        assert!(held.defer_ui_uploads());
+        assert_eq!(ready.paint_source(), FsPageTurnPaintSource::PassThrough);
+        assert!(ready.defer_ui_uploads());
         assert_eq!(
-            released,
+            presented,
             FsPageTurnDecision {
                 paint_source: FsPageTurnPaintSource::Materialized,
                 defer_ui_uploads: false,
                 passthrough_rendition_ready: true,
             }
         );
+    }
+
+    #[test]
+    fn navigation_sequence_blocks_until_presented_but_not_after_terminal_failure() {
+        let target = |phase| FsNavigationSequence {
+            previous: None,
+            target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                items_generation: 7,
+                pages: vec![2],
+                phase,
+            }),
+        };
+
+        assert!(
+            target(FsNavigationTargetPhase::Awaiting {
+                accept_rendition: true,
+            })
+            .blocks_new_target()
+        );
+        assert!(
+            target(FsNavigationTargetPhase::Ready(
+                FsNavigationPresentation::Rendition,
+            ))
+            .blocks_new_target()
+        );
+        assert!(
+            target(FsNavigationTargetPhase::Presenting(
+                FsNavigationPresentation::Rendition,
+            ))
+            .blocks_new_target()
+        );
+        assert!(!target(FsNavigationTargetPhase::RenditionFailed).blocks_new_target());
+    }
+
+    #[test]
+    fn navigation_sequence_requires_the_complete_atomic_target_unit() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items_generation = 9;
+        app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous: None,
+            target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                items_generation: 9,
+                pages: vec![3, 4],
+                phase: FsNavigationTargetPhase::Presenting(FsNavigationPresentation::Rendition),
+            }),
+        }));
+        let first = FsDisplayUnitTracePage {
+            idx: 3,
+            texture_id: egui::TextureId::Managed(31),
+            source: stringify!(thumbnail),
+        };
+        app.observe_fs_navigation_sequence_presented(&[first]);
+        assert!(app.fs_navigation_sequence_blocks_new_target());
+
+        let second = FsDisplayUnitTracePage {
+            idx: 4,
+            texture_id: egui::TextureId::Managed(32),
+            source: stringify!(thumbnail),
+        };
+        app.observe_fs_navigation_sequence_presented(&[first, second]);
+        assert!(app.fs_holdover_tex.is_none());
+    }
+
+    #[test]
+    fn retained_texture_with_reused_index_does_not_count_as_target_presentation() {
+        let ctx = egui::Context::default();
+        let old = ctx.load_texture(
+            stringify!(navigation_old),
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let previous = FsDisplayUnitHoldover {
+            pages: vec![FsDisplayUnitHoldoverPage {
+                idx: 0,
+                texture: FullscreenPaintResource::direct(old.clone()),
+                rotation: crate::rotation_db::Rotation::None,
+                layout_size: old.size_vec2(),
+                post_filter: crate::adjustment::PostFilter::None,
+                trace_key: None,
+                trace_load_seq: 0,
+                source_size: None,
+                content_bbox: None,
+            }],
+        };
+        let mut app = crate::app::setup_app_for_test();
+        app.items_generation = 11;
+        app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous: Some(previous),
+            target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                items_generation: 11,
+                pages: vec![0],
+                phase: FsNavigationTargetPhase::Presenting(FsNavigationPresentation::Rendition),
+            }),
+        }));
+
+        app.observe_fs_navigation_sequence_presented(&[FsDisplayUnitTracePage {
+            idx: 0,
+            texture_id: old.id(),
+            source: stringify!(holdover),
+        }]);
+        assert!(app.fs_navigation_sequence_blocks_new_target());
+
+        app.observe_fs_navigation_sequence_presented(&[FsDisplayUnitTracePage {
+            idx: 0,
+            texture_id: egui::TextureId::Managed(99),
+            source: stringify!(thumbnail),
+        }]);
+        assert!(app.fs_holdover_tex.is_none());
     }
 
     #[test]
@@ -32652,7 +33153,7 @@ mod tests {
 
     #[test]
     fn held_boundary_without_a_page_transition_stays_materialized() {
-        let decision = page_turn_decision_for_inputs(true, false, false);
+        let decision = page_turn_decision_for_inputs(false, false);
 
         assert_eq!(decision.paint_source(), FsPageTurnPaintSource::Materialized);
         assert!(!decision.defer_ui_uploads());
@@ -32904,7 +33405,7 @@ mod tests {
     }
 
     #[test]
-    fn page_turn_pass_through_does_not_select_a_resident_final_when_rendition_is_missing() {
+    fn unresolved_page_turn_keeps_a_resident_final_behind_the_holdover() {
         let ctx = egui::Context::default();
         let mut app = crate::app::setup_app_for_test();
         app.items.push(GridItem::Image(PathBuf::from(
@@ -32930,9 +33431,9 @@ mod tests {
         );
 
         let state =
-            app.prepare_fullscreen_state(&ctx, 0, page_turn_decision_for_inputs(true, true, false));
+            app.prepare_fullscreen_state(&ctx, 0, page_turn_decision_for_inputs(true, false));
 
-        assert!(state.tex.is_none());
+        assert!(state.tex.is_some());
         assert!(state.thumb_tex.is_none());
     }
 

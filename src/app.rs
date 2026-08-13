@@ -6446,7 +6446,11 @@ pub(crate) struct ContinuousPageTransition {
 /// variant は保持する理由と解放条件を分離するために維持する。
 #[derive(Clone)]
 pub(crate) enum FsHoldover {
+    /// Legacy owner for detached/slideshow folder transitions. Main-view manual
+    /// browsing uses `NavigationSequence`, whose target must be presented before
+    /// another target can be accepted.
     FolderNavigation(FsDisplayUnitHoldover),
+    NavigationSequence(FsNavigationSequence),
     FinalEffectSourceReload(FinalEffectSourceReloadHoldover),
 }
 
@@ -6454,13 +6458,27 @@ impl FsHoldover {
     pub(crate) fn folder_navigation_display_unit(&self) -> Option<&FsDisplayUnitHoldover> {
         match self {
             Self::FolderNavigation(unit) => Some(unit),
-            Self::FinalEffectSourceReload(_) => None,
+            Self::NavigationSequence(_) | Self::FinalEffectSourceReload(_) => None,
+        }
+    }
+
+    pub(crate) fn navigation_sequence(&self) -> Option<&FsNavigationSequence> {
+        match self {
+            Self::NavigationSequence(sequence) => Some(sequence),
+            Self::FolderNavigation(_) | Self::FinalEffectSourceReload(_) => None,
+        }
+    }
+
+    pub(crate) fn navigation_sequence_mut(&mut self) -> Option<&mut FsNavigationSequence> {
+        match self {
+            Self::NavigationSequence(sequence) => Some(sequence),
+            Self::FolderNavigation(_) | Self::FinalEffectSourceReload(_) => None,
         }
     }
 
     pub(crate) fn final_effect_wait(&self) -> Option<(usize, std::time::Instant)> {
         match self {
-            Self::FolderNavigation(_) => None,
+            Self::FolderNavigation(_) | Self::NavigationSequence(_) => None,
             Self::FinalEffectSourceReload(holdover) => {
                 Some((holdover.target_idx, holdover.started_at))
             }
@@ -6477,6 +6495,7 @@ impl FsHoldover {
     ) -> Option<&FsDisplayUnitHoldoverPage> {
         let unit = match self {
             Self::FolderNavigation(unit) => unit,
+            Self::NavigationSequence(sequence) => sequence.previous.as_ref()?,
             Self::FinalEffectSourceReload(holdover) => &holdover.previous,
         };
         unit.pages
@@ -6493,6 +6512,12 @@ impl FsHoldover {
                 .expect("folder navigation display unit must contain at least one page")
                 .texture
                 .id(),
+            Self::NavigationSequence(sequence) => sequence
+                .previous
+                .as_ref()
+                .and_then(|unit| unit.pages.first())
+                .map(|page| page.texture.id())
+                .unwrap(),
             Self::FinalEffectSourceReload(holdover) => holdover
                 .previous
                 .pages
@@ -6540,6 +6565,75 @@ pub(crate) struct FsDisplayUnitHoldoverPage {
     pub(crate) trace_load_seq: u64,
     pub(crate) source_size: Option<egui::Vec2>,
     pub(crate) content_bbox: Option<egui::Rect>,
+}
+
+/// One accepted manual-browsing target and the complete display unit held while
+/// that target is unresolved. It lives in `App::fs_holdover_tex`, so its lifetime
+/// follows the owning viewer context without another cache or context generation.
+#[derive(Clone)]
+pub(crate) struct FsNavigationSequence {
+    /// None is permitted only when the viewer genuinely had no material to hold.
+    pub(crate) previous: Option<FsDisplayUnitHoldover>,
+    pub(crate) target: FsNavigationSequenceTarget,
+}
+
+impl FsNavigationSequence {
+    pub(crate) fn blocks_new_target(&self) -> bool {
+        match &self.target {
+            FsNavigationSequenceTarget::FolderItems { .. } => true,
+            FsNavigationSequenceTarget::Display(target) => {
+                !matches!(target.phase, FsNavigationTargetPhase::RenditionFailed)
+            }
+        }
+    }
+
+    pub(crate) fn target_pages_for_generation(&self, items_generation: u64) -> &[usize] {
+        match &self.target {
+            FsNavigationSequenceTarget::Display(target)
+                if target.items_generation == items_generation =>
+            {
+                &target.pages
+            }
+            FsNavigationSequenceTarget::FolderItems { .. }
+            | FsNavigationSequenceTarget::Display(_) => &[],
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FsNavigationSequenceTarget {
+    FolderItems { accepted_generation: u64 },
+    Display(FsNavigationDisplayTarget),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FsNavigationDisplayTarget {
+    pub(crate) items_generation: u64,
+    /// Sorted indices of the complete single-page/spread display unit.
+    pub(crate) pages: Vec<usize>,
+    pub(crate) phase: FsNavigationTargetPhase,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FsNavigationTargetPhase {
+    /// Passing page/folder targets accept a thumbnail-quality rendition. The first
+    /// discrete page turn may remain full-quality while still blocking repeats.
+    Awaiting {
+        accept_rendition: bool,
+    },
+    Ready(FsNavigationPresentation),
+    Presenting(FsNavigationPresentation),
+    /// PDFium/catalog production reached a terminal failure. This does not block
+    /// another repeat; on release, full materialization is admitted while the
+    /// previous complete unit remains visible.
+    RenditionFailed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FsNavigationPresentation {
+    Rendition,
+    Materialized,
+    Failure,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -20948,7 +21042,12 @@ impl App {
     /// 変わらず lock が永久に残り、以降のフルスクリーン Ctrl+↑↓ が無視される (Codex P1)。
     /// 探索は clone した nav 上で行い items は触らないので、着地確定後
     /// `zip_nav_show_current_level` の前に capture すれば旧ページの holdover を正しく取れる。
-    pub(crate) fn zip_nav_dfs_fullscreen(&mut self, fs_idx: usize, forward: bool) -> bool {
+    pub(crate) fn zip_nav_dfs_fullscreen(
+        &mut self,
+        sequence_ctx: Option<&egui::Context>,
+        fs_idx: usize,
+        forward: bool,
+    ) -> bool {
         let sort = BOOK_READING_PAGE_ORDER;
         let Some(nav) = self.zip_nav.as_ref() else {
             return false;
@@ -20974,7 +21073,11 @@ impl App {
         }
         self.zip_nav = Some(probe);
         // 移動確定 → holdover を取ってから items を差し替える。
-        self.capture_fs_nav_holdover(fs_idx);
+        if let Some(ctx) = sequence_ctx {
+            self.begin_fs_folder_navigation_sequence(ctx, fs_idx);
+        } else {
+            self.capture_fs_nav_holdover(fs_idx);
+        }
         // 新しい本のページに差し替え + その本の見開き設定を適用。
         self.zip_nav_show_current_level();
         // 新しい本の先頭画像をフルスクリーンで開く (Ctrl+↑↓ 慣習: 常に先頭着地)。
@@ -30778,7 +30881,52 @@ impl App {
         }
     }
 
+    pub(crate) fn ensure_navigation_target_thumbnail_requests(
+        &mut self,
+        ctx: &egui::Context,
+        pages: &[usize],
+    ) {
+        if pages.is_empty() {
+            return;
+        }
+        self.keep_set.extend(pages.iter().copied());
+        if let (Some(start), Some(end)) = (
+            self.keep_set.iter().min().copied(),
+            self.keep_set.iter().max().copied(),
+        ) {
+            self.keep_range = (start, end.saturating_add(1));
+            self.keep_start_shared.store(start, Ordering::Relaxed);
+            self.keep_end_shared
+                .store(end.saturating_add(1), Ordering::Relaxed);
+        }
+        for idx in pages.iter().copied() {
+            self.enqueue_priority_thumbnail(idx);
+        }
+        let pdf_keys = pages
+            .iter()
+            .filter_map(|idx| match self.items.get(*idx) {
+                Some(GridItem::PdfFile(path)) => Some(crate::grid_item::pdf_page_perf_key(path, 0)),
+                Some(GridItem::PdfPage {
+                    pdf_path, page_num, ..
+                }) => Some(crate::grid_item::pdf_page_perf_key(pdf_path, *page_num)),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        if !pdf_keys.is_empty() {
+            let stats = crate::pdf_loader::promote_to_high_normal(&pdf_keys);
+            self.promote_retry_pending = stats.not_found_keys > 0;
+            self.last_promoted_visible_keys = Some(pdf_keys);
+        }
+        if pages.iter().any(|idx| self.requested.contains_key(idx)) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+    }
+
     fn enqueue_details_hover_thumbnail(&mut self, idx: usize) {
+        self.enqueue_priority_thumbnail(idx);
+    }
+
+    fn enqueue_priority_thumbnail(&mut self, idx: usize) {
         if self.requested.contains_key(&idx) {
             return;
         }
@@ -30872,6 +31020,44 @@ impl App {
         // 走って「Failed」表示が出る (ゴミ箱移動済みなので File::open が失敗する)。
         // Modal で入力は止まっているので keep_range は基本動かず、再 enqueue は発生しない想定。
         if self.delete_pending.is_some() {
+            return;
+        }
+        let navigation_pages = self
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .map(|sequence| {
+                sequence
+                    .target_pages_for_generation(self.items_generation)
+                    .to_vec()
+            })
+            .unwrap_or_default();
+        if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+            && !navigation_pages.is_empty()
+        {
+            let previous_keep_set = std::mem::take(&mut self.keep_set);
+            self.keep_set.extend(navigation_pages.iter().copied());
+            let start = navigation_pages.iter().min().copied().unwrap_or(0);
+            let end = navigation_pages
+                .iter()
+                .max()
+                .copied()
+                .map_or(start, |idx| idx.saturating_add(1));
+            self.keep_range = (start, end);
+            self.keep_start_shared.store(start, Ordering::Relaxed);
+            self.keep_end_shared.store(end, Ordering::Relaxed);
+            self.thumb_pixels
+                .retain(|idx, _| self.keep_set.contains(idx));
+            self.thumb_edit_preview_layers
+                .retain(|idx, _| self.keep_set.contains(idx));
+            self.thumb_adjust_tex
+                .retain(|idx, _| self.keep_set.contains(idx));
+            let force_full_reconcile =
+                self.thumbnail_eviction_generation != Some(self.items_generation);
+            self.reconcile_grid_thumbnail_evictions(&previous_keep_set, force_full_reconcile);
+            self.thumbnail_eviction_generation = Some(self.items_generation);
+            self.details_thumb_suppression_applied = false;
+            self.ensure_navigation_target_thumbnail_requests(ctx, &navigation_pages);
             return;
         }
         if self.settings.grid_view_mode == crate::settings::GridViewMode::Details {
@@ -41742,12 +41928,30 @@ impl App {
         &mut self,
         idx: usize,
         history_trigger: HistoryTrigger,
-        materialization: FsOpenMaterialization,
+        requested_materialization: FsOpenMaterialization,
     ) {
         #[cfg(windows)]
         if self.route_materialized_physical_still_open_to_active_context(idx) {
             return;
         }
+
+        let sequence_is_awaiting_folder_target = self
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .is_some_and(|sequence| {
+                matches!(
+                    sequence.target,
+                    FsNavigationSequenceTarget::FolderItems { .. }
+                )
+            });
+        let materialization = if sequence_is_awaiting_folder_target
+            && self.items.get(idx).is_some_and(GridItem::has_page_data)
+        {
+            FsOpenMaterialization::DeferredPageTurn
+        } else {
+            requested_materialization
+        };
 
         // A final-effect source-reload holdover belongs to one unchanged display unit.
         // Moving to another idx ends that lifetime. Page navigation itself uses the
@@ -49564,6 +49768,14 @@ impl App {
                 self.release_fs_nav_lock();
             }
         }
+        if self.fs_nav_locked_gen.is_none()
+            && matches!(
+                self.fs_holdover_tex,
+                Some(FsHoldover::NavigationSequence(_))
+            )
+        {
+            self.fs_holdover_tex = None;
+        }
         #[cfg(windows)]
         let preserve_viewport_for_folder_nav_reopen = self.fs_nav_locked_gen.is_some()
             && self.fs_viewport_shown
@@ -53255,7 +53467,14 @@ impl App {
     /// 従来どおりページ別 transition が所有する。初回ロードでは
     /// `resolve_fs_display_tex` が `None` を返すので、既存 holdover は上書きしない。
     pub(crate) fn capture_final_effect_source_reload_holdover(&mut self, idx: usize) {
-        if self.fs_nav_locked_gen.is_some() || !self.colorize_display_requires_final_effect(idx) {
+        if self.fs_nav_locked_gen.is_some()
+            || self
+                .fs_holdover_tex
+                .as_ref()
+                .and_then(FsHoldover::navigation_sequence)
+                .is_some()
+            || !self.colorize_display_requires_final_effect(idx)
+        {
             return;
         }
         if let Some(texture) = self.resolve_fs_display_tex(idx, false) {

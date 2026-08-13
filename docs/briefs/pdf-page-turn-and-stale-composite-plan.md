@@ -282,6 +282,33 @@ Part A だけで「枠に合わせて変形してから中身が入れ替わる�
   - キーアップで landing の rendition / final image へ settle する
 - 黒背景 + パスのプレースホルダは、本当に何も無いとき (初回オープン) だけに限定する
 
+#### Part B 実装記録 (2026-08-14、未コミット)
+
+- `App::fs_holdover_tex` の typed variant として `FsHoldover::NavigationSequence` を追加した。
+  `FsNavigationSequence` は captured previous display unit と
+  `FsNavigationSequenceTarget::{FolderItems, Display}` を一体で所有し、target phase は
+  `Awaiting { accept_rendition }` → `Ready(Rendition|Materialized|Failure)` →
+  `Presenting(...)` と遷移する。thumbnail/PDFium が terminal failure の場合は
+  `RenditionFailed` として次 repeat を許可し、key-up 後は previous unit を保持したまま full
+  materialization の成功/失敗へ settle する。
+- main viewer の手動 Ctrl+↑↓ / Ctrl+PageUp/Down、snapshot、Ctrl+G drill、smart/favsearch、
+  nested ZIP、およびページ送りを sequence の受理 gate に通した。detached と slideshow の
+  legacy `FolderNavigation` owner は変更していない。未解決中の repeat と同一 frame の追加 edge は
+  accumulator へ入れず drop する。グリッド側の folder-nav burst は従来どおり queue する。
+- target page set を既存 thumbnail `keep_set` の一時 anchor に加え、priority request を発行する。
+  PDF page は `pdf_loader::promote_to_high_normal` へ明示的に渡すため、catalog thumbnail / pixels が
+  無い場合も PDFium source render が実際に開始される。item-context generation は追加していない。
+- `page_turn_decision_for_inputs` は rendition 未着時に `PassThrough` を選ばなくなった。
+  `defer_ui_uploads=true` のまま `Materialized` を選び、その下を previous atomic unit が覆う。
+  rendition ready frame だけ `PassThrough` にし、描画末尾で target generation / complete page set /
+  non-holdover texture identity を確認して初めて sequence を解放する。
+- key-up は burst 画質 owner を `Idle` に戻すが unresolved sequence は消さない。landing rendition を
+  1 frame 提示した後の次 frame で final work を再開する。repeat queue が無いため、key-up 後に
+  navigation が追加で進む producer は存在しない。
+- 回帰テストを 4 件追加し、既存の page-turn decision / same-frame Ctrl+Down の期待値を新仕様へ
+  更新した。`mimageviewer` lib は 5,671 tests。`scripts/test-full.ps1` PASS、
+  `cargo fmt --check` clean、`scripts/check_ui_glyphs.py` 0、`scripts/build-dev.ps1` 成功。
+
 **なぜ「直前の絵を保持するだけ」では駄目か** (Codex 指摘): 移動だけ先へ進みながら古い絵を
 出し続けると、飛ばしたページを見せないことになり **R1 に反する**
 (docs/display-pipeline.md 1524)。保持自体は spec が要求する正しい fallback だが

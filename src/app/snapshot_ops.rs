@@ -1109,7 +1109,9 @@ impl App {
         let gen_before = self.items_generation;
         let opened = self.snapshot_open_entry(entry_idx, resume_slideshow, history_trigger);
         if self.items_generation == gen_before && self.fs_nav_after_pdf_enumerate.is_none() {
-            self.release_fs_nav_lock();
+            if !opened || !self.bind_fs_navigation_sequence_to_current_target() {
+                self.release_fs_nav_lock();
+            }
         }
         opened
     }
