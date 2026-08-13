@@ -8589,7 +8589,6 @@ pub(crate) enum FsOverflowPanelState {
     Closed,
     Root,
     NavigatorPosition,
-    Customize,
 }
 
 impl FsOverflowPanelState {
@@ -10087,7 +10086,7 @@ pub struct App {
     pub(crate) fit_popup_open: bool,
     /// スライドショー設定ポップアップ表示中
     pub(crate) slideshow_popup_open: bool,
-    /// 上バーの「…」から開く下部オーバーレイ。root / submenu / customization を単一状態で所有する。
+    /// 上バーの「…」から開く右上パネル。root / navigator submenu を単一状態で所有する。
     pub(crate) fs_overflow_panel_state: FsOverflowPanelState,
 
     // ── スライドショー ────────────────────────────────────────────

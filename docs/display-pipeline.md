@@ -1173,19 +1173,21 @@ Anime4K は event 名を共用し、`scale_branch` (`upscale` / `upscale_nis` / 
 混在メディア要約など通常 HUD の文字は暗色 UI のセマンティック文字色へ追従する。
 
 静止画の上部バーは、通常閲覧中のページ解決 (`SpreadPair::Single` / `Double`) や
-`ReadingFlow` の違いだけでは `draw_bar_button` の個数と x 座標を変えない。分析入口は下部の
-「その他の機能」パネルへ移し、360 度入口は常に同じ slot を確保して、見開き 2 ページ表示、
+`ReadingFlow` の違いだけでは `draw_bar_button` の個数と x 座標を変えない。分析入口は右上の
+「その他の機能」パネルへ移し、`…` は `×` の直後となる右から 2 番目に置く。360 度入口は
+常に同じ slot を確保して、見開き 2 ページ表示、
 連結読み、非 360 画像では disabled 描画と理由 tooltip にする。実描画を 4 組
 （見開き単ページ / 見開き 2 ページ × ページ単位 / 連結読み）で走らせ、登録済み button rect の
 個数と全 x 座標が一致することを回帰テストで固定する。
 
-「その他の機能」パネルは `FsOverflowPanelState` が閉 / root / ナビゲータ位置 / カスタマイズを
-排他的に所有し、画面下端から 12pt 離して配置する。行高は 48pt、ヘッダーと閉じる hit target は
-44pt とし、短い viewport では本文だけをスクロールする。同じ純粋な panel rect resolver を描画と
-`touch_excluded` が共有する。表示中は `App::common_modal_dialog_open` に含めて wheel / key を止め、
-背面キャンバスの pointer / navigator 操作も止める。touch recognizer 自体は terminal frame まで
-駆動して ownership を残さない。状態表示や実効 shortcut label は既存 state / keymap の読み取りだけで
-組み立て、UI 描画のための同期 I/O は行わない。
+「その他の機能」パネルは `FsOverflowPanelState` が閉 / root / ナビゲータ位置を排他的に所有し、
+上部バーの下へ 12pt、画面右端から 12pt 離して配置する。項目はナビゲータ ON / OFF →
+ナビゲータ位置 → 分析ツール → ピクセルグリッド → ルーペ固定の固定順にする。行高は 48pt、
+ヘッダーと閉じる hit target は 44pt とし、短い viewport では本文だけをスクロールする。同じ純粋な
+panel rect resolver を描画と `touch_excluded` が共有する。表示中は
+`App::common_modal_dialog_open` に含めて wheel / key を止め、背面キャンバスの pointer / navigator
+操作も止める。touch recognizer 自体は terminal frame まで駆動して ownership を残さない。状態表示や
+実効 shortcut label は既存 state / keymap の読み取りだけで組み立て、UI 描画のための同期 I/O は行わない。
 
 ページシークバーの実効左右方向は `fullscreen_seek_direction` と `reading_direction` から一度だけ
 決定し、ラベル配置、pointer fraction、つまみ位置、進捗塗りへ共有する。見た目だけを反転して

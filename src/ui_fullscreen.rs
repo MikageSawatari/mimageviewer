@@ -1418,66 +1418,48 @@ struct FsOverflowPanelView {
     state: FsOverflowPanelState,
     root_rows: Vec<FsOverflowPanelRow>,
     navigator_corner: FullscreenNavigatorCorner,
-    ordered_items: Vec<FullscreenOverflowItemId>,
-    hidden_items: Vec<FullscreenOverflowItemId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FsOverflowPanelAction {
     Close,
     Back,
-    /// 表示項目の設定へ。
-    ///
-    /// 「…」の右クリックからも開けるが、**タッチには右クリックが無い**。
-    /// 届かない設定を置いても意味がないので、パネル自身からも入れるようにする。
-    OpenCustomize,
     Activate(FullscreenOverflowItemId),
     SetNavigatorCorner(FullscreenNavigatorCorner),
-    ToggleVisibility(FullscreenOverflowItemId),
-    MoveUp(FullscreenOverflowItemId),
-    MoveDown(FullscreenOverflowItemId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FsOverflowOpenRequest {
     Root,
-    Customize,
 }
 
-fn fs_overflow_panel_body_row_count(
-    state: FsOverflowPanelState,
-    visible_root_rows: usize,
-) -> usize {
+fn fs_overflow_panel_body_row_count(state: FsOverflowPanelState) -> usize {
     match state {
         FsOverflowPanelState::Closed => 0,
-        // 項目の行 + 末尾の「表示項目の設定...」。項目が 0 でも設定へは入れる。
-        FsOverflowPanelState::Root => visible_root_rows.max(1) + 1,
+        FsOverflowPanelState::Root => FullscreenOverflowItemId::fixed_order().len(),
         FsOverflowPanelState::NavigatorPosition => 1 + FullscreenNavigatorCorner::ALL.len(),
-        FsOverflowPanelState::Customize => FullscreenOverflowItemId::default_order().len(),
     }
 }
 
 fn fs_overflow_panel_rect(
     full_rect: egui::Rect,
     state: FsOverflowPanelState,
-    visible_root_rows: usize,
 ) -> Option<egui::Rect> {
     if state == FsOverflowPanelState::Closed {
         return None;
     }
     let available_width = (full_rect.width() - FS_OVERFLOW_PANEL_MARGIN * 2.0).max(0.0);
-    let available_height = (full_rect.height() - FS_OVERFLOW_PANEL_MARGIN * 2.0).max(0.0);
+    let top = full_rect.top() + TOP_BAR_HEIGHT + FS_OVERFLOW_PANEL_MARGIN;
+    let available_height = (full_rect.bottom() - FS_OVERFLOW_PANEL_MARGIN - top).max(0.0);
     if available_width <= 0.0 || available_height <= 0.0 {
         return None;
     }
     let width = FS_OVERFLOW_PANEL_WIDTH.min(available_width);
     let desired_height = FS_OVERFLOW_PANEL_PADDING * 2.0
         + FS_OVERFLOW_PANEL_HEADER_HEIGHT
-        + fs_overflow_panel_body_row_count(state, visible_root_rows) as f32
-            * FS_OVERFLOW_PANEL_ROW_HEIGHT;
+        + fs_overflow_panel_body_row_count(state) as f32 * FS_OVERFLOW_PANEL_ROW_HEIGHT;
     let height = desired_height.min(available_height);
-    let left = full_rect.center().x - width * 0.5;
-    let top = full_rect.bottom() - FS_OVERFLOW_PANEL_MARGIN - height;
+    let left = full_rect.right() - FS_OVERFLOW_PANEL_MARGIN - width;
     Some(egui::Rect::from_min_size(
         egui::pos2(left, top),
         egui::vec2(width, height),
@@ -1488,9 +1470,8 @@ fn append_fs_overflow_touch_exclusion(
     excluded: &mut Vec<egui::Rect>,
     full_rect: egui::Rect,
     state: FsOverflowPanelState,
-    visible_root_rows: usize,
 ) {
-    if let Some(rect) = fs_overflow_panel_rect(full_rect, state, visible_root_rows) {
+    if let Some(rect) = fs_overflow_panel_rect(full_rect, state) {
         excluded.push(rect);
     }
 }
@@ -1578,158 +1559,6 @@ fn draw_fs_overflow_panel_row(
     }
 }
 
-fn paint_fs_overflow_move_arrow(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    up: bool,
-    color: egui::Color32,
-) {
-    let center = rect.center();
-    let direction = if up { 1.0 } else { -1.0 };
-    let stroke = egui::Stroke::new(1.8, color);
-    painter.line_segment(
-        [
-            egui::pos2(center.x, center.y - 7.0 * direction),
-            egui::pos2(center.x, center.y + 7.0 * direction),
-        ],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            egui::pos2(center.x, center.y - 7.0 * direction),
-            egui::pos2(center.x - 5.0, center.y - 2.0 * direction),
-        ],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            egui::pos2(center.x, center.y - 7.0 * direction),
-            egui::pos2(center.x + 5.0, center.y - 2.0 * direction),
-        ],
-        stroke,
-    );
-}
-
-fn draw_fs_overflow_customize_row(
-    ui: &mut egui::Ui,
-    item: FullscreenOverflowItemId,
-    visible: bool,
-    can_move_up: bool,
-    can_move_down: bool,
-) -> Option<FsOverflowPanelAction> {
-    let (rect, row_response) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), FS_OVERFLOW_PANEL_ROW_HEIGHT),
-        egui::Sense::click(),
-    );
-    if row_response.hovered() {
-        ui.painter()
-            .rect_filled(rect, 4.0, egui::Color32::from_gray(58));
-    }
-    ui.painter().line_segment(
-        [
-            egui::pos2(rect.left() + 8.0, rect.bottom()),
-            egui::pos2(rect.right() - 8.0, rect.bottom()),
-        ],
-        egui::Stroke::new(1.0, egui::Color32::from_gray(58)),
-    );
-
-    let check_rect = egui::Rect::from_center_size(
-        egui::pos2(rect.left() + 23.0, rect.center().y),
-        egui::vec2(18.0, 18.0),
-    );
-    ui.painter().rect_stroke(
-        check_rect,
-        2.0,
-        egui::Stroke::new(1.5, ui.visuals().text_color()),
-        egui::StrokeKind::Inside,
-    );
-    if visible {
-        ui.painter().line_segment(
-            [
-                check_rect.left_center() + egui::vec2(3.0, 0.0),
-                check_rect.center() + egui::vec2(-1.0, 4.0),
-            ],
-            egui::Stroke::new(2.0, ui.visuals().text_color()),
-        );
-        ui.painter().line_segment(
-            [
-                check_rect.center() + egui::vec2(-1.0, 4.0),
-                check_rect.right_top() + egui::vec2(-2.0, 3.0),
-            ],
-            egui::Stroke::new(2.0, ui.visuals().text_color()),
-        );
-    }
-    ui.painter().text(
-        egui::pos2(check_rect.right() + 10.0, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        item.label(),
-        egui::FontId::proportional(14.0),
-        ui.visuals().text_color(),
-    );
-
-    let down_rect = egui::Rect::from_center_size(
-        egui::pos2(rect.right() - 24.0, rect.center().y),
-        egui::vec2(44.0, 44.0),
-    );
-    let up_rect = down_rect.translate(egui::vec2(-46.0, 0.0));
-    let up_response = ui.interact(
-        up_rect,
-        ui.id().with(("fs_overflow_move_up", item)),
-        if can_move_up {
-            egui::Sense::click()
-        } else {
-            egui::Sense::hover()
-        },
-    );
-    let down_response = ui.interact(
-        down_rect,
-        ui.id().with(("fs_overflow_move_down", item)),
-        if can_move_down {
-            egui::Sense::click()
-        } else {
-            egui::Sense::hover()
-        },
-    );
-    for (button_rect, response, enabled, up) in [
-        (up_rect, &up_response, can_move_up, true),
-        (down_rect, &down_response, can_move_down, false),
-    ] {
-        ui.painter().rect_filled(
-            button_rect,
-            4.0,
-            if enabled && response.hovered() {
-                egui::Color32::from_gray(78)
-            } else {
-                egui::Color32::from_gray(48)
-            },
-        );
-        paint_fs_overflow_move_arrow(
-            ui.painter(),
-            button_rect,
-            up,
-            if enabled {
-                ui.visuals().text_color()
-            } else {
-                egui::Color32::from_gray(92)
-            },
-        );
-    }
-
-    if can_move_up && up_response.clicked() {
-        return Some(FsOverflowPanelAction::MoveUp(item));
-    }
-    if can_move_down && down_response.clicked() {
-        return Some(FsOverflowPanelAction::MoveDown(item));
-    }
-    let pointer_in_move_button = row_response
-        .interact_pointer_pos()
-        .is_some_and(|pos| up_rect.contains(pos) || down_rect.contains(pos));
-    if row_response.clicked() && !pointer_in_move_button {
-        return Some(FsOverflowPanelAction::ToggleVisibility(item));
-    }
-    None
-}
-
 fn draw_fs_overflow_panel_surface(
     ui: &mut egui::Ui,
     panel_rect: egui::Rect,
@@ -1767,7 +1596,6 @@ fn draw_fs_overflow_panel_surface(
     let title = match view.state {
         FsOverflowPanelState::Root => "その他の機能",
         FsOverflowPanelState::NavigatorPosition => "ナビゲータ位置",
-        FsOverflowPanelState::Customize => "パネル項目の設定",
         FsOverflowPanelState::Closed => return None,
     };
     child.painter().text(
@@ -1830,45 +1658,19 @@ fn draw_fs_overflow_panel_surface(
                 ui.set_width(ui.available_width());
                 match view.state {
                     FsOverflowPanelState::Root => {
-                        if view.root_rows.is_empty() {
-                            let _ = draw_fs_overflow_panel_row(
+                        for row in &view.root_rows {
+                            let response = draw_fs_overflow_panel_row(
                                 ui,
-                                "fs_overflow_empty",
-                                "表示する項目がありません",
-                                "",
+                                ("fs_overflow_root", row.item),
+                                &row.label,
+                                &row.status,
                                 false,
-                                false,
-                                Some("下の「表示項目の設定...」から変更できます"),
+                                row.enabled,
+                                row.disabled_reason,
                             );
-                        } else {
-                            for row in &view.root_rows {
-                                let response = draw_fs_overflow_panel_row(
-                                    ui,
-                                    ("fs_overflow_root", row.item),
-                                    &row.label,
-                                    &row.status,
-                                    false,
-                                    row.enabled,
-                                    row.disabled_reason,
-                                );
-                                if response.clicked() {
-                                    action = Some(FsOverflowPanelAction::Activate(row.item));
-                                }
+                            if response.clicked() {
+                                action = Some(FsOverflowPanelAction::Activate(row.item));
                             }
-                        }
-                        // 右クリックはタッチに無い。ここからも設定へ入れるようにする。
-                        if draw_fs_overflow_panel_row(
-                            ui,
-                            "fs_overflow_open_customize",
-                            "表示項目の設定...",
-                            "",
-                            false,
-                            true,
-                            None,
-                        )
-                        .clicked()
-                        {
-                            action = Some(FsOverflowPanelAction::OpenCustomize);
                         }
                     }
                     FsOverflowPanelState::NavigatorPosition => {
@@ -1899,20 +1701,6 @@ fn draw_fs_overflow_panel_surface(
                             .clicked()
                             {
                                 action = Some(FsOverflowPanelAction::SetNavigatorCorner(corner));
-                            }
-                        }
-                    }
-                    FsOverflowPanelState::Customize => {
-                        for (index, &item) in view.ordered_items.iter().enumerate() {
-                            let visible = !view.hidden_items.contains(&item);
-                            if let Some(row_action) = draw_fs_overflow_customize_row(
-                                ui,
-                                item,
-                                visible,
-                                index > 0,
-                                index + 1 < view.ordered_items.len(),
-                            ) {
-                                action = Some(row_action);
                             }
                         }
                     }
@@ -13371,9 +13159,6 @@ impl App {
                             if let Some(request) = overflow_request {
                                 self.fs_overflow_panel_state = match request {
                                     FsOverflowOpenRequest::Root => FsOverflowPanelState::Root,
-                                    FsOverflowOpenRequest::Customize => {
-                                        FsOverflowPanelState::Customize
-                                    }
                                 };
                                 ctx.request_repaint();
                             }
@@ -18063,35 +17848,9 @@ impl App {
         });
     }
 
-    fn fullscreen_overflow_ordered_items(&self) -> Vec<FullscreenOverflowItemId> {
-        FullscreenOverflowItemId::ordered_with_fallback(
-            &self.settings.fullscreen_overflow_item_order,
-        )
-    }
-
-    fn fullscreen_overflow_visible_item_count(&self) -> usize {
-        self.fullscreen_overflow_ordered_items()
-            .into_iter()
-            .filter(|item| {
-                !self
-                    .settings
-                    .fullscreen_overflow_hidden_items
-                    .contains(item)
-            })
-            .count()
-    }
-
     fn fullscreen_overflow_panel_view(&self, is_spread_double: bool) -> FsOverflowPanelView {
-        let ordered_items = self.fullscreen_overflow_ordered_items();
         let mut root_rows = Vec::new();
-        for &item in &ordered_items {
-            if self
-                .settings
-                .fullscreen_overflow_hidden_items
-                .contains(&item)
-            {
-                continue;
-            }
+        for &item in FullscreenOverflowItemId::fixed_order() {
             let (label, status, enabled, disabled_reason) = match item {
                 FullscreenOverflowItemId::NavigatorToggle => (
                     self.keymap
@@ -18154,7 +17913,6 @@ impl App {
                     true,
                     None,
                 ),
-                FullscreenOverflowItemId::Unknown => continue,
             };
             root_rows.push(FsOverflowPanelRow {
                 item,
@@ -18168,8 +17926,6 @@ impl App {
             state: self.fs_overflow_panel_state,
             root_rows,
             navigator_corner: self.settings.fullscreen_navigator_corner.normalized(),
-            ordered_items,
-            hidden_items: self.settings.fullscreen_overflow_hidden_items.clone(),
         }
     }
 
@@ -18180,9 +17936,7 @@ impl App {
         full_rect: egui::Rect,
         is_spread_double: bool,
     ) {
-        let visible_count = self.fullscreen_overflow_visible_item_count();
-        let Some(panel_rect) =
-            fs_overflow_panel_rect(full_rect, self.fs_overflow_panel_state, visible_count)
+        let Some(panel_rect) = fs_overflow_panel_rect(full_rect, self.fs_overflow_panel_state)
         else {
             return;
         };
@@ -18196,9 +17950,6 @@ impl App {
             }
             FsOverflowPanelAction::Back => {
                 self.fs_overflow_panel_state = FsOverflowPanelState::Root;
-            }
-            FsOverflowPanelAction::OpenCustomize => {
-                self.fs_overflow_panel_state = FsOverflowPanelState::Customize;
             }
             FsOverflowPanelAction::Activate(item) => match item {
                 FullscreenOverflowItemId::NavigatorToggle => {
@@ -18219,41 +17970,10 @@ impl App {
                 }
                 FullscreenOverflowItemId::PixelGrid => self.toggle_fs_pixel_grid(),
                 FullscreenOverflowItemId::LoupeLock => self.toggle_fs_loupe_lock(),
-                FullscreenOverflowItemId::Unknown => {}
             },
             FsOverflowPanelAction::SetNavigatorCorner(corner) => {
                 self.set_fullscreen_navigator_corner(corner);
                 self.fs_overflow_panel_state = FsOverflowPanelState::Root;
-            }
-            FsOverflowPanelAction::ToggleVisibility(item) => {
-                if self
-                    .settings
-                    .fullscreen_overflow_hidden_items
-                    .contains(&item)
-                {
-                    self.settings
-                        .fullscreen_overflow_hidden_items
-                        .retain(|saved| *saved != item);
-                } else {
-                    self.settings.fullscreen_overflow_hidden_items.push(item);
-                }
-                self.settings.save();
-            }
-            FsOverflowPanelAction::MoveUp(item) | FsOverflowPanelAction::MoveDown(item) => {
-                let moving_up = matches!(action, FsOverflowPanelAction::MoveUp(_));
-                let mut order = self.fullscreen_overflow_ordered_items();
-                if let Some(index) = order.iter().position(|saved| *saved == item) {
-                    let target = if moving_up {
-                        index.checked_sub(1)
-                    } else {
-                        (index + 1 < order.len()).then_some(index + 1)
-                    };
-                    if let Some(target) = target {
-                        order.swap(index, target);
-                        self.settings.fullscreen_overflow_item_order = order;
-                        self.settings.save();
-                    }
-                }
             }
         }
         ctx.request_repaint();
@@ -19976,14 +19696,13 @@ impl App {
         if top_bar_visible {
             touch_excluded.push(fullscreen_top_bar_rect(full_rect));
         }
-        // 下部 overflow panel はページ送り面ではない。panel state と同じ純粋な矩形計算を
+        // 右上の overflow panel はページ送り面ではない。panel state と同じ純粋な矩形計算を
         // touch classifier に渡し、行・戻る・閉じる操作を PageSide へ再分類させない。
         if self.fs_overflow_panel_state.is_open() {
             append_fs_overflow_touch_exclusion(
                 &mut touch_excluded,
                 full_rect,
                 self.fs_overflow_panel_state,
-                self.fullscreen_overflow_visible_item_count(),
             );
         }
         // ナビゲータは画像の上に浮く widget であって、ページ送りの当たり判定ではない。
@@ -26651,7 +26370,29 @@ impl App {
         }
         next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
 
-        // 上部情報バー固定。× の直左に置き、下部シークバーと同じ鍵表現を使う。
+        // その他の機能。一般的な配置に合わせて × のすぐ左に置き、固定順の低頻度機能を
+        // 右上パネルへまとめる。
+        if !is_video && !panorama_mode_active {
+            let overflow_resp = draw_bar_button(
+                ui,
+                next_x,
+                bar_rect.min.y + BAR_BUTTON_MARGIN,
+                "fs_overflow_btn",
+                |hovered| bar_button_bg(hovered, overflow_panel_open),
+                overflow_panel_open,
+                draw_more_icon,
+            );
+            let overflow_resp = overflow_resp.hover_tip_dark("その他の機能");
+            if overflow_resp.clicked() {
+                *overflow_request = Some(FsOverflowOpenRequest::Root);
+            }
+            if overflow_resp.hovered() {
+                *page_nav = FsPageNav::None;
+            }
+            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+        }
+
+        // 上部情報バー固定。下部シークバーと同じ鍵表現を使う。
         if !is_video {
             let lock_resp = draw_bar_button(
                 ui,
@@ -27078,31 +26819,6 @@ impl App {
                 *side_panel_mode_pressed = true;
             }
             if info_resp.hovered() {
-                *page_nav = FsPageNav::None;
-            }
-            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
-        }
-
-        // その他の機能。静止画の低頻度機能を下部 overflow panel にまとめる。
-        // 通常クリック / タップは機能パネル、右クリックは表示項目のカスタマイズを開く。
-        if !is_video && !panorama_mode_active {
-            let overflow_resp = draw_bar_button(
-                ui,
-                next_x,
-                bar_rect.min.y + BAR_BUTTON_MARGIN,
-                "fs_overflow_btn",
-                |hovered| bar_button_bg(hovered, overflow_panel_open),
-                overflow_panel_open,
-                draw_more_icon,
-            );
-            let overflow_resp =
-                overflow_resp.hover_tip_dark("その他の機能\n右クリック: 表示項目をカスタマイズ");
-            if overflow_resp.secondary_clicked() {
-                *overflow_request = Some(FsOverflowOpenRequest::Customize);
-            } else if overflow_resp.clicked() {
-                *overflow_request = Some(FsOverflowOpenRequest::Root);
-            }
-            if overflow_resp.hovered() {
                 *page_nav = FsPageNav::None;
             }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
@@ -32233,6 +31949,24 @@ mod tests {
         ];
         let baseline = fullscreen_top_bar_button_x_positions(cases[0].0, cases[0].1);
         assert!(!baseline.is_empty());
+        let expected_left_to_right = [
+            "fs_margin_fit_btn",
+            "fs_spread_btn",
+            "fs_panorama_btn",
+            "fs_info_btn",
+            "fs_rotation_btn",
+            "fs_play_btn",
+            "fs_capture_copy_btn",
+            "fs_top_bar_lock_btn",
+            "fs_overflow_btn",
+            "fs_close_btn",
+        ]
+        .map(egui::Id::new);
+        assert_eq!(
+            baseline.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            expected_left_to_right,
+            "the overflow button must stay immediately left of close"
+        );
         for &(is_spread_double, reading_flow) in &cases[1..] {
             let actual = fullscreen_top_bar_button_x_positions(is_spread_double, reading_flow);
             assert_eq!(
@@ -32284,21 +32018,35 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_overflow_rows_keep_touch_target_height_and_panel_is_bottom_anchored() {
-        assert!(FS_OVERFLOW_PANEL_ROW_HEIGHT >= 44.0);
+    fn fullscreen_overflow_rows_keep_touch_target_height_and_panel_is_top_right_anchored() {
+        assert_eq!(FS_OVERFLOW_PANEL_ROW_HEIGHT, 48.0);
+        assert_eq!(FS_OVERFLOW_PANEL_HEADER_HEIGHT, 44.0);
         let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
-        let root = fs_overflow_panel_rect(full_rect, FsOverflowPanelState::Root, 5).unwrap();
+        let root = fs_overflow_panel_rect(full_rect, FsOverflowPanelState::Root).unwrap();
         let submenu =
-            fs_overflow_panel_rect(full_rect, FsOverflowPanelState::NavigatorPosition, 5).unwrap();
-        assert_eq!(root.bottom(), full_rect.bottom() - FS_OVERFLOW_PANEL_MARGIN);
-        assert_eq!(submenu.bottom(), root.bottom());
+            fs_overflow_panel_rect(full_rect, FsOverflowPanelState::NavigatorPosition).unwrap();
+        assert_eq!(
+            root.top(),
+            full_rect.top() + TOP_BAR_HEIGHT + FS_OVERFLOW_PANEL_MARGIN
+        );
+        assert_eq!(root.right(), full_rect.right() - FS_OVERFLOW_PANEL_MARGIN);
+        assert_eq!(submenu, root);
         assert_eq!(root.width(), FS_OVERFLOW_PANEL_WIDTH);
+
+        let narrow = egui::Rect::from_min_size(egui::pos2(20.0, 30.0), egui::vec2(300.0, 180.0));
+        let clamped = fs_overflow_panel_rect(narrow, FsOverflowPanelState::Root).unwrap();
+        assert_eq!(clamped.right(), narrow.right() - FS_OVERFLOW_PANEL_MARGIN);
+        assert_eq!(
+            clamped.top(),
+            narrow.top() + TOP_BAR_HEIGHT + FS_OVERFLOW_PANEL_MARGIN
+        );
+        assert!(clamped.bottom() <= narrow.bottom() - FS_OVERFLOW_PANEL_MARGIN);
     }
 
     #[test]
     fn fullscreen_overflow_panel_is_excluded_from_tap_zone_classification() {
         let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
-        let panel_rect = fs_overflow_panel_rect(full_rect, FsOverflowPanelState::Root, 5).unwrap();
+        let panel_rect = fs_overflow_panel_rect(full_rect, FsOverflowPanelState::Root).unwrap();
         let tap = panel_rect.center();
         let bare = crate::touch_input::TapZoneGeometry {
             surface: full_rect,
@@ -32314,7 +32062,7 @@ mod tests {
         );
 
         let mut excluded = Vec::new();
-        append_fs_overflow_touch_exclusion(&mut excluded, full_rect, FsOverflowPanelState::Root, 5);
+        append_fs_overflow_touch_exclusion(&mut excluded, full_rect, FsOverflowPanelState::Root);
         assert_eq!(excluded, vec![panel_rect]);
         let guarded = crate::touch_input::TapZoneGeometry { excluded, ..bare };
         assert_eq!(
@@ -32328,7 +32076,7 @@ mod tests {
 
         let mut fonts_ready = false;
         let mut harness = Harness::builder()
-            .with_size(egui::vec2(440.0, 340.0))
+            .with_size(egui::vec2(720.0, 440.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                 if !fonts_ready {
@@ -32383,10 +32131,8 @@ mod tests {
                             state,
                             root_rows,
                             navigator_corner: FullscreenNavigatorCorner::BottomRight,
-                            ordered_items: FullscreenOverflowItemId::default_order().to_vec(),
-                            hidden_items: Vec::new(),
                         };
-                        let panel_rect = fs_overflow_panel_rect(ui.max_rect(), state, 5).unwrap();
+                        let panel_rect = fs_overflow_panel_rect(ui.max_rect(), state).unwrap();
                         let _ = draw_fs_overflow_panel_surface(ui, panel_rect, &view);
                     });
             });
@@ -32407,28 +32153,6 @@ mod tests {
         snapshot_fullscreen_overflow_panel(
             "fullscreen_overflow_panel_navigator_submenu",
             FsOverflowPanelState::NavigatorPosition,
-        );
-    }
-
-    /// 表示項目の設定は「…」の右クリックからも開けるが、**タッチには右クリックが無い**。
-    /// パネル自身に入口が無いと、タッチだけの利用者は設定へ永久に到達できない。
-    #[test]
-    fn the_customize_view_is_reachable_without_a_right_click() {
-        // Root には項目の行に加えて設定への行が必ず 1 つある。
-        let with_items = fs_overflow_panel_body_row_count(FsOverflowPanelState::Root, 5);
-        let without_items = fs_overflow_panel_body_row_count(FsOverflowPanelState::Root, 0);
-        assert_eq!(with_items, 6, "five entries plus the settings row");
-        assert_eq!(
-            without_items, 2,
-            "even with everything hidden the settings row must remain"
-        );
-    }
-
-    #[test]
-    fn fullscreen_overflow_panel_snapshot_customize() {
-        snapshot_fullscreen_overflow_panel(
-            "fullscreen_overflow_panel_customize",
-            FsOverflowPanelState::Customize,
         );
     }
 
