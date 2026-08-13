@@ -48,6 +48,7 @@ mod displayed_image_transform;
 pub mod dwm_iconic_thumbnail;
 #[cfg(windows)]
 pub mod dwm_transitions;
+mod empty_items_reason;
 mod gpu_anime4k;
 mod gpu_lanczos;
 pub mod metadata_transfer;

@@ -745,6 +745,54 @@ fn panorama_navigator_wrap_yaw(yaw: f32) -> f32 {
     (yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
 }
 
+/// フルスクリーンでズーム / パンを実際に握っている状態。
+///
+/// 排他なので bool の重ね合わせではなく列挙で持つ。入力を足すたびに
+/// `if analysis_mode … else if panorama …` を書き直すと、必ずどれかを落とす。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FsZoomOwner {
+    /// ZipPla 風ズーム (照準中 / 確定中)。専用描画経路で `fs_zoom` を見ない。
+    ZoomMode,
+    /// 360 度ビュー。`fov_y` / `yaw` / `pitch`。
+    Panorama,
+    /// 分析モード。`analysis_zoom` / `analysis_pan`。画像矩形も右パネル分ずれる。
+    Analysis,
+    /// 通常表示。`fs_zoom` / `fs_pan`。
+    Image,
+}
+
+/// ピンチ倍率を 360 度ビューの視野角へ写す。
+///
+/// 拡大 (`factor > 1`) は**視野を狭める**方向なので割る。ホイールの FOV 操作
+/// (`handle_panorama_wheel_if_active`) と同じ向き。
+fn panorama_touch_zoom_fov(fov_y: f32, factor: f32) -> Option<f32> {
+    if !factor.is_finite() || factor <= 0.0 || !fov_y.is_finite() {
+        return None;
+    }
+    Some((fov_y / factor).clamp(crate::panorama::FOV_MIN, crate::panorama::FOV_MAX))
+}
+
+/// ピンチ中の 2 本指平行移動を yaw / pitch へ写す。
+///
+/// 感度も向きも 1 本指ドラッグ (`handle_panorama_drag_if_active`) と同じにする。
+/// 指と画像が別々に動くと、同じ操作が入力手段で違う意味になる。
+fn panorama_touch_pan_pose(
+    yaw: f32,
+    pitch: f32,
+    fov_y: f32,
+    delta: egui::Vec2,
+    viewport_h: f32,
+) -> Option<(f32, f32)> {
+    if !delta.x.is_finite() || !delta.y.is_finite() || delta.length_sq() <= 0.0 {
+        return None;
+    }
+    let sens = fov_y / viewport_h.max(1.0);
+    Some((
+        panorama_navigator_wrap_yaw(yaw + delta.x * sens),
+        (pitch + delta.y * sens).clamp(-crate::panorama::PITCH_LIMIT, crate::panorama::PITCH_LIMIT),
+    ))
+}
+
 fn panorama_navigator_fov_from_height(selection_height: f32, content_height: f32) -> f32 {
     let fov_y = selection_height.abs() / content_height.max(f32::EPSILON) * std::f32::consts::PI;
     if fov_y.is_finite() {
@@ -855,18 +903,134 @@ fn build_panorama_navigator_layout(
     })
 }
 
-fn fs_navigator_corner_button_rect(header_rect: egui::Rect, index: usize) -> egui::Rect {
-    const BUTTON_SIZE: f32 = 16.0;
-    const BUTTON_GAP: f32 = 3.0;
-    let total_width = BUTTON_SIZE * 4.0 + BUTTON_GAP * 3.0;
-    let left = header_rect.right() - 6.0 - total_width;
+const FS_NAVIGATOR_HEADER_PAD: f32 = 6.0;
+const FS_NAVIGATOR_CORNER_BUTTON_SIZE: f32 = 16.0;
+const FS_NAVIGATOR_CORNER_BUTTON_GAP: f32 = 3.0;
+const FS_NAVIGATOR_CLOSE_BUTTON_SIZE: f32 = 18.0;
+/// 閉じるボタンと隅ボタン群の間隔。隅ボタン同士の間隔より広くして、
+/// 「移動」と「閉じる」を別のまとまりとして読ませる。
+const FS_NAVIGATOR_CLOSE_BUTTON_GAP: f32 = 8.0;
+const FS_NAVIGATOR_TITLE_GAP: f32 = 6.0;
+
+/// ヘッダ右端の閉じるボタン。
+///
+/// ナビゲータの保持状態 (`fullscreen_navigator_visible`) は設定に永続化されるのに、
+/// 出口が <kbd>Alt</kbd>+<kbd>N</kbd> しかなかった。キーボードを持たない端末では
+/// 一度出すと二度と消せない状態になる。画面上の出口はこのボタンが持つ。
+fn fs_navigator_close_button_rect(header_rect: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_size(
         egui::pos2(
-            left + index as f32 * (BUTTON_SIZE + BUTTON_GAP),
-            header_rect.center().y - BUTTON_SIZE * 0.5,
+            header_rect.right() - FS_NAVIGATOR_HEADER_PAD - FS_NAVIGATOR_CLOSE_BUTTON_SIZE,
+            header_rect.center().y - FS_NAVIGATOR_CLOSE_BUTTON_SIZE * 0.5,
         ),
-        egui::vec2(BUTTON_SIZE, BUTTON_SIZE),
+        egui::vec2(
+            FS_NAVIGATOR_CLOSE_BUTTON_SIZE,
+            FS_NAVIGATOR_CLOSE_BUTTON_SIZE,
+        ),
     )
+}
+
+fn fs_navigator_corner_button_rect(header_rect: egui::Rect, index: usize) -> egui::Rect {
+    let total_width = FS_NAVIGATOR_CORNER_BUTTON_SIZE * 4.0 + FS_NAVIGATOR_CORNER_BUTTON_GAP * 3.0;
+    let left = fs_navigator_close_button_rect(header_rect).left()
+        - FS_NAVIGATOR_CLOSE_BUTTON_GAP
+        - total_width;
+    egui::Rect::from_min_size(
+        egui::pos2(
+            left + index as f32
+                * (FS_NAVIGATOR_CORNER_BUTTON_SIZE + FS_NAVIGATOR_CORNER_BUTTON_GAP),
+            header_rect.center().y - FS_NAVIGATOR_CORNER_BUTTON_SIZE * 0.5,
+        ),
+        egui::vec2(
+            FS_NAVIGATOR_CORNER_BUTTON_SIZE,
+            FS_NAVIGATOR_CORNER_BUTTON_SIZE,
+        ),
+    )
+}
+
+/// タイトルに残された幅。ボタン群を右に寄せた分だけ狭くなるので、
+/// 最小サイズのパネルでは文字がボタンに重なりうる。重ねずに切り詰める。
+fn fs_navigator_title_max_width(header_rect: egui::Rect) -> f32 {
+    let title_left = header_rect.left() + FS_NAVIGATOR_HEADER_PAD + 2.0;
+    let cluster_left = fs_navigator_corner_button_rect(header_rect, 0).left();
+    (cluster_left - FS_NAVIGATOR_TITLE_GAP - title_left).max(0.0)
+}
+
+/// ヘッダのタイトルとボタン群を描く。平面ナビゲータとパノラマナビゲータで
+/// 見た目が分かれないよう、両方がこの 1 か所を通る。
+fn paint_fs_navigator_header(
+    painter: &egui::Painter,
+    header_rect: egui::Rect,
+    selected_corner: FullscreenNavigatorCorner,
+    show_close: bool,
+) {
+    painter.rect_filled(
+        header_rect,
+        5.0,
+        egui::Color32::from_rgba_unmultiplied(34, 38, 46, 245),
+    );
+    let mut title = egui::text::LayoutJob::single_section(
+        "ナビゲータ".to_owned(),
+        egui::TextFormat::simple(egui::FontId::proportional(12.0), egui::Color32::WHITE),
+    );
+    title.wrap =
+        egui::text::TextWrapping::truncate_at_width(fs_navigator_title_max_width(header_rect));
+    let galley = painter.layout_job(title);
+    painter.galley(
+        egui::pos2(
+            header_rect.left() + FS_NAVIGATOR_HEADER_PAD + 2.0,
+            header_rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        egui::Color32::WHITE,
+    );
+    for (index, &corner) in FullscreenNavigatorCorner::ALL.iter().enumerate() {
+        let button = fs_navigator_corner_button_rect(header_rect, index);
+        let selected = corner == selected_corner.normalized();
+        painter.rect_filled(
+            button,
+            2.0,
+            if selected {
+                egui::Color32::from_rgb(64, 112, 172)
+            } else {
+                egui::Color32::from_gray(54)
+            },
+        );
+        painter.rect_stroke(
+            button,
+            2.0,
+            egui::Stroke::new(1.0, egui::Color32::from_gray(142)),
+            egui::StrokeKind::Inside,
+        );
+        let marker_center = match corner {
+            FullscreenNavigatorCorner::TopLeft => button.left_top() + egui::vec2(4.0, 4.0),
+            FullscreenNavigatorCorner::TopRight => button.right_top() + egui::vec2(-4.0, 4.0),
+            FullscreenNavigatorCorner::BottomLeft => button.left_bottom() + egui::vec2(4.0, -4.0),
+            FullscreenNavigatorCorner::BottomRight => {
+                button.right_bottom() + egui::vec2(-4.0, -4.0)
+            }
+            FullscreenNavigatorCorner::Unknown => unreachable!("known navigator corner"),
+        };
+        painter.circle_filled(marker_center, 2.0, egui::Color32::WHITE);
+    }
+    if show_close {
+        let button = fs_navigator_close_button_rect(header_rect);
+        painter.rect_filled(button, 2.0, egui::Color32::from_gray(54));
+        painter.rect_stroke(
+            button,
+            2.0,
+            egui::Stroke::new(1.0, egui::Color32::from_gray(142)),
+            egui::StrokeKind::Inside,
+        );
+        // U+00D7。CLAUDE.md「UI 文字列の Unicode グリフ選定ルール」で ✕ / ✖ は不可。
+        painter.text(
+            button.center(),
+            egui::Align2::CENTER_CENTER,
+            "×",
+            egui::FontId::proportional(14.0),
+            egui::Color32::WHITE,
+        );
+    }
 }
 
 enum FsNavHoldoverDecision {
@@ -1494,13 +1658,16 @@ struct StillTouchInputEnabledInputs {
     slideshow_popup_open: bool,
     rotation_popup_open: bool,
     compare_wipe_active: bool,
-    panorama_active: bool,
-    analysis_active: bool,
     overlay_edit_active: bool,
     view_trim_active: bool,
     zoom_active: bool,
 }
 
+/// タッチ入力を扱ってよい状況か。ここで false なら**ジェスチャー認識ごと止まる**。
+///
+/// 別ウィンドウ・ダイアログ・IME・ポップアップのように、そもそもキャンバスが
+/// 前面にない状況だけを落とす。「自前のポインタ操作を持つ表示モード」は
+/// `still_touch_tap_zones_enabled` の側で落とす。
 fn still_touch_input_enabled(input: StillTouchInputEnabledInputs) -> bool {
     !input.is_video
         && !input.is_music_view
@@ -1514,11 +1681,36 @@ fn still_touch_input_enabled(input: StillTouchInputEnabledInputs) -> bool {
         && !input.slideshow_popup_open
         && !input.rotation_popup_open
         && !input.compare_wipe_active
-        && !input.panorama_active
-        && !input.analysis_active
         && !input.overlay_edit_active
         && !input.view_trim_active
         && !input.zoom_active
+}
+
+/// 表示モードがキャンバスを所有しているか。
+///
+/// true のとき、キャンバスのクリック / タップは「ページ送り」ではなく、その
+/// モード自身の操作を意味する。**マウスでもタッチでも同じ**。
+///
+/// クリックのページ送りは `fs_zoom` などの変形が無いときだけ走る作りで、
+/// 360 度ビューと分析ツールは自前の状態を持ち `fs_zoom` を動かさないため、
+/// この 2 つでは変形なしと見なされてページ送りが生きていた
+/// (利用者報告 2026-08-13: 分析ツールのパネルを触ってもページが送られる)。
+fn fs_display_mode_owns_canvas(panorama_active: bool, analysis_active: bool) -> bool {
+    panorama_active || analysis_active
+}
+
+/// タップをページ送り / 中央タップとして解釈してよいか。
+///
+/// 360 度ビューと分析ツールは**画面全体が自前のポインタ操作**なので、タップ判定を
+/// 使わない。ただしピンチは要る。かつては両方まとめて `still_touch_input_enabled`
+/// で落としていて、**ピンチまで巻き添えで消えていた** (利用者報告 2026-08-13)。
+///
+/// この 2 つだけを分けるのは、**アイコンから入れる = キーボード無しで到達できる**
+/// 表示モードがこの 2 つだからという判断 (2026-08-13、利用者判断)。ズームモードは
+/// ホバー前提、編集系と比較ワイプはキー操作とセットでしか使えないので、
+/// `still_touch_input_enabled` 側で止めたままにする。
+fn still_touch_tap_zones_enabled(panorama_active: bool, analysis_active: bool) -> bool {
+    !fs_display_mode_owns_canvas(panorama_active, analysis_active)
 }
 
 #[derive(Clone, Copy)]
@@ -4949,6 +5141,89 @@ impl App {
     /// Apply a recognizer-provided touch scale at its screen-space pivot.
     /// Input recognition stays separate from the existing zoom/pan ownership:
     /// this thin adapter reuses the same clamps as wheel and drag input.
+    /// いま画面のズーム / パンを実際に握っている状態。
+    ///
+    /// フルスクリーンには**ズームの持ち主が 4 通り**あり、どれを動かすかの判定が
+    /// 入力手段ごとに書かれていた。その結果、入力を足すたびに取りこぼしが出ている:
+    /// ホイールは 360 を知っていたがピンチは知らず、中ボタンは分析を知っていたが
+    /// 360 を知らない。**書き先を間違えても画面は静止するだけ**なので、見えない値が
+    /// 動くだけで誰も気付かない (利用者報告 2026-08-13、360 と分析の両方)。
+    ///
+    /// 判定はここ 1 か所に集める。新しい入力を足すときは必ずこれを通すこと。
+    pub(crate) fn fs_zoom_owner(&self) -> FsZoomOwner {
+        if self.fs_zoom_mode_engaged() {
+            return FsZoomOwner::ZoomMode;
+        }
+        if self
+            .fullscreen_idx
+            .is_some_and(|idx| self.is_panorama_mode_active(idx))
+        {
+            return FsZoomOwner::Panorama;
+        }
+        if self.analysis_mode {
+            return FsZoomOwner::Analysis;
+        }
+        FsZoomOwner::Image
+    }
+
+    /// 分析モードは右パネルの分だけ画像が左へ寄るので、ピボットの基準矩形が違う。
+    fn fs_zoom_pivot_rect(
+        &self,
+        full_rect: egui::Rect,
+        default_image_rect: egui::Rect,
+    ) -> egui::Rect {
+        match self.fs_zoom_owner() {
+            FsZoomOwner::Analysis => analysis_image_rect(full_rect),
+            _ => default_image_rect,
+        }
+    }
+
+    /// 360 度ビューは `fs_zoom` / `fs_pan` を一切見ない (yaw / pitch / fov_y が視点の正)。
+    ///
+    /// ピンチをそのまま `fs_zoom` へ流すと、**画面には何も起きないのに見えない値だけが動く**。
+    /// ホイールが 360 中に FOV 操作へ転用されるのと同じ扱いにする。
+    /// 拡大 (factor > 1) は視野を狭める方向なので割る。
+    fn apply_panorama_touch_zoom(&mut self, factor: f32) -> bool {
+        if !self
+            .fullscreen_idx
+            .is_some_and(|idx| self.is_panorama_mode_active(idx))
+        {
+            return false;
+        }
+        let Some(pano) = self.panorama_state.as_mut() else {
+            return false;
+        };
+        let Some(fov_y) = panorama_touch_zoom_fov(pano.fov_y, factor) else {
+            return false;
+        };
+        pano.fov_y = fov_y;
+        pano.sanitize();
+        true
+    }
+
+    /// ピンチ中の 2 本指の平行移動。1 本指ドラッグと同じ「掴んで引っ張る」向きで
+    /// yaw / pitch を回す。`fs_pan` へ流すと 360 では不可視のまま値だけがずれる。
+    fn apply_panorama_touch_pan(&mut self, delta: egui::Vec2, viewport_h: f32) -> bool {
+        if !self
+            .fullscreen_idx
+            .is_some_and(|idx| self.is_panorama_mode_active(idx))
+        {
+            return false;
+        }
+        let Some(pano) = self.panorama_state.as_mut() else {
+            return false;
+        };
+        let Some((yaw, pitch)) =
+            panorama_touch_pan_pose(pano.yaw, pano.pitch, pano.fov_y, delta, viewport_h)
+        else {
+            return false;
+        };
+        pano.yaw = yaw;
+        pano.pitch = pitch;
+        pano.sanitize();
+        true
+    }
+
     fn apply_touch_zoom_factor_about_pivot(
         &mut self,
         factor: f32,
@@ -4958,15 +5233,47 @@ impl App {
         if !factor.is_finite() || factor <= 0.0 {
             return false;
         }
-        let old_zoom = self.fs_zoom;
+        // 分析モードは自前の zoom / pan を持つ。fs_zoom へ書くと画面は静止したまま
+        // 見えない値だけが動く (利用者報告 2026-08-13)。
+        let analysis = matches!(self.fs_zoom_owner(), FsZoomOwner::Analysis);
+        let old_zoom = if analysis {
+            self.analysis_zoom
+        } else {
+            self.fs_zoom
+        };
         let new_zoom = (old_zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
         if (new_zoom - old_zoom).abs() <= f32::EPSILON {
             return false;
         }
-        let proposed_pan = zoom_preserve_pivot(pivot, rect_center, self.fs_pan, old_zoom, new_zoom);
-        self.fs_zoom = new_zoom;
-        self.set_fs_pan_from_input(new_zoom, proposed_pan);
+        let start_pan = if analysis {
+            self.analysis_pan
+        } else {
+            self.fs_pan
+        };
+        let proposed_pan = zoom_preserve_pivot(pivot, rect_center, start_pan, old_zoom, new_zoom);
+        if analysis {
+            self.analysis_zoom = new_zoom;
+            self.analysis_pan = proposed_pan;
+        } else {
+            self.fs_zoom = new_zoom;
+            self.set_fs_pan_from_input(new_zoom, proposed_pan);
+        }
         true
+    }
+
+    /// ピンチ中の 2 本指平行移動を、いまの持ち主の pan へ流す。
+    fn apply_touch_pan_delta(&mut self, delta: egui::Vec2, full_rect: egui::Rect) {
+        match self.fs_zoom_owner() {
+            FsZoomOwner::Panorama => {
+                self.apply_panorama_touch_pan(delta, full_rect.height());
+            }
+            FsZoomOwner::Analysis => {
+                self.analysis_pan += delta;
+            }
+            FsZoomOwner::ZoomMode | FsZoomOwner::Image => {
+                self.set_fs_pan_from_input(self.fs_zoom, self.fs_pan + delta);
+            }
+        }
     }
 
     /// 中ボタンドラッグズームを処理する。
@@ -4981,6 +5288,13 @@ impl App {
         // 中ボタンドラッグで不可視の fs_zoom を書き換えず、専用の fs_zoom_factor を動かす。
         if self.fs_zoom_mode_engaged() {
             return self.handle_zoom_mode_middle_drag(ctx);
+        }
+        // 360 度ビューも自前の視点を持つ。ここを塞がないと、中ボタンドラッグが
+        // 画面に何も起こさないまま fs_zoom を動かす (ピンチと同じ取りこぼし)。
+        // FOV はホイールが担当しているので、ここでは何もせず入力だけ消費する。
+        if matches!(self.fs_zoom_owner(), FsZoomOwner::Panorama) {
+            self.fs_middle_zoom_drag = None;
+            return ctx.input(|i| i.pointer.button_down(egui::PointerButton::Middle));
         }
         let (is_down, is_pressed, is_released, current_pos) = ctx.input(|i| {
             (
@@ -5703,18 +6017,7 @@ pub(crate) fn navigable_delta_between(
 }
 
 fn build_image_reading_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize> {
-    visible_indices
-        .iter()
-        .copied()
-        .filter(|&i| {
-            matches!(
-                items.get(i),
-                Some(GridItem::Image(_))
-                    | Some(GridItem::ZipImage { .. })
-                    | Some(GridItem::PdfPage { .. })
-            )
-        })
-        .collect()
+    crate::ui_helpers::still_image_display_indices(items, visible_indices)
 }
 
 fn count_seek_overlay_non_image_items(items: &[GridItem], nav_indices: &[usize]) -> (usize, usize) {
@@ -14599,7 +14902,11 @@ impl App {
             Some(i) => i,
             None => return FsPageNav::Delta(base_delta),
         };
-        let nav = self.get_nav_indices();
+        let nav = if self.continuous_reading_active_for_idx(fs_idx) {
+            crate::ui_helpers::still_image_display_indices(&self.items, self.current_grid_order())
+        } else {
+            self.get_nav_indices()
+        };
         self.spread_page_nav_for_indices(&nav, fs_idx, base_delta)
     }
 
@@ -14647,7 +14954,11 @@ impl App {
         fs_idx: usize,
         dir: i32,
     ) -> Option<(usize, usize)> {
-        let nav = self.get_nav_indices();
+        let nav = if self.continuous_reading_active_for_idx(fs_idx) {
+            crate::ui_helpers::still_image_display_indices(&self.items, self.current_grid_order())
+        } else {
+            self.get_nav_indices()
+        };
         let units = build_spread_display_units(
             &nav,
             &self.items,
@@ -15088,6 +15399,7 @@ impl App {
             target_registered: target.is_some(),
             // A child callback publishes true after it is actually reached.
             target_rendered: target.is_some_and(|target| target.viewport == egui::ViewportId::ROOT),
+            items_len: i64::try_from(self.items.len()).unwrap_or(i64::MAX),
             pending_thumbs: i64::try_from(pending_thumbs).unwrap_or(i64::MAX),
             spread_mode: format!("{:?}", self.spread_mode),
             continuous_reading,
@@ -16709,17 +17021,7 @@ impl App {
             self.toggle_panorama_mode(fs_idx);
         }
         if key_n_navigator {
-            self.settings.fullscreen_navigator_visible =
-                !self.settings.fullscreen_navigator_visible;
-            self.settings.save();
-            // The navigator and loupe intentionally coexist: the former is a fixed overview,
-            // while the latter is a cursor-local inspection tool. The selected navigator corner
-            // gives users a stable way to keep the two overlays apart.
-            self.show_feedback_toast(if self.settings.fullscreen_navigator_visible {
-                "[ナビゲータ ON（拡大中に表示）]".to_string()
-            } else {
-                "[ナビゲータ OFF]".to_string()
-            });
+            self.set_fullscreen_navigator_visible(!self.settings.fullscreen_navigator_visible);
         }
         if key_z && !is_spread_double {
             if !self.analysis_mode && self.adjustment_mode.is_open() {
@@ -17226,6 +17528,70 @@ impl App {
             )
     }
 
+    /// ナビゲータの保持状態を変える唯一の出口。
+    ///
+    /// ナビゲータとルーペは意図的に併存する (前者は固定の全体図、後者はカーソル位置の
+    /// 拡大鏡)。隅の選択があるので 2 つは重ならずに置ける。
+    pub(crate) fn set_fullscreen_navigator_visible(&mut self, visible: bool) {
+        if self.settings.fullscreen_navigator_visible == visible {
+            return;
+        }
+        self.settings.fullscreen_navigator_visible = visible;
+        self.settings.save();
+        self.show_feedback_toast(if visible {
+            "[ナビゲータ ON（拡大中に表示）]".to_string()
+        } else {
+            "[ナビゲータ OFF]".to_string()
+        });
+    }
+
+    /// ヘッダの閉じるボタン。保持中のときだけ置く。
+    ///
+    /// 修飾キーで一時的に出ている間は消す対象が無いので、押せる見た目のまま
+    /// 何も起きないボタンにはしない。
+    fn fs_navigator_close_button_clicked(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        header_rect: egui::Rect,
+        id_prefix: &str,
+    ) -> bool {
+        if !self.settings.fullscreen_navigator_visible {
+            return false;
+        }
+        if !ui
+            .interact(
+                fs_navigator_close_button_rect(header_rect),
+                egui::Id::new("fs_navigator_close").with(id_prefix),
+                egui::Sense::click(),
+            )
+            .on_hover_text("ナビゲータを閉じる")
+            .clicked()
+        {
+            return false;
+        }
+        self.set_fullscreen_navigator_visible(false);
+        ctx.request_repaint();
+        true
+    }
+
+    /// いまタップをページ送りとして解釈してよいか。
+    ///
+    /// **同じ面の認識器を回す呼び出しが 1 フレームに複数ある**。接触が始まった
+    /// フレームを処理した呼び出しが所有者を決めるので、どれか 1 つでも古い値を
+    /// 渡すと、そこで始まった接触がページ送りとして確定する。
+    /// フォーカス復帰の経路がまさにこれで、アプリを切り替えて戻った直後だけ
+    /// 360 度ビューのタップがページを送っていた (利用者報告 2026-08-13、ログで確定)。
+    ///
+    /// ローカル変数を使い回すと定義順に縛られるので、`self` から直接求める。
+    pub(crate) fn fs_touch_tap_zones_enabled(&self) -> bool {
+        still_touch_tap_zones_enabled(
+            self.fullscreen_idx
+                .is_some_and(|idx| self.is_panorama_mode_active(idx)),
+            self.analysis_mode,
+        )
+    }
+
     fn fs_navigator_layout(&self, image_rect: egui::Rect) -> Option<FlatNavigatorLayout> {
         build_flat_navigator_layout(
             &self.fullscreen_page_layout,
@@ -17236,7 +17602,11 @@ impl App {
         )
     }
 
-    pub(crate) fn fullscreen_navigator_edge_exclusion(
+    /// 描画されるナビゲータ本体の矩形。
+    ///
+    /// タップ分類の除外とマウスのエッジ抑止が同じ幾何から導かれるように、
+    /// パネル矩形の求め方はここ 1 か所に置く。
+    pub(crate) fn fullscreen_navigator_panel_rect(
         &self,
         ctx: &egui::Context,
         full_rect: egui::Rect,
@@ -17246,12 +17616,24 @@ impl App {
             return None;
         }
         let image_rect = self.fullscreen_media_rect(full_rect, fs_idx, false);
-        let panel_rect = if self.is_panorama_mode_active(fs_idx) {
-            self.panorama_navigator_layout(image_rect, fs_idx)?
-                .panel_rect
+        if self.is_panorama_mode_active(fs_idx) {
+            Some(
+                self.panorama_navigator_layout(image_rect, fs_idx)?
+                    .panel_rect,
+            )
         } else {
-            self.fs_navigator_layout(image_rect)?.panel_rect
-        };
+            Some(self.fs_navigator_layout(image_rect)?.panel_rect)
+        }
+    }
+
+    pub(crate) fn fullscreen_navigator_edge_exclusion(
+        &self,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+    ) -> Option<egui::Rect> {
+        let panel_rect = self.fullscreen_navigator_panel_rect(ctx, full_rect)?;
+        let fs_idx = self.fullscreen_idx?;
+        let image_rect = self.fullscreen_media_rect(full_rect, fs_idx, false);
         Some(fs_navigator_edge_exclusion_rect(
             image_rect,
             panel_rect,
@@ -17440,6 +17822,9 @@ impl App {
                 break;
             }
         }
+        if self.fs_navigator_close_button_clicked(ui, ctx, layout.header_rect, "panorama") {
+            corner_clicked = true;
+        }
 
         let response = ui
             .interact(
@@ -17448,7 +17833,7 @@ impl App {
                 egui::Sense::click_and_drag(),
             )
             .on_hover_text(
-                "左ドラッグ: 範囲を拡大 / 右ドラッグ: 表示位置を移動 / ダブルクリック: 中央へ移動 / ホイール: サイズ変更",
+                "左ドラッグ: 表示位置を移動 / 右ドラッグ: 範囲を拡大 / ダブルクリック: 中央へ移動 / ホイール: サイズ変更",
             );
         let clamp_to_canvas = |pos: egui::Pos2| {
             egui::pos2(
@@ -17501,7 +17886,7 @@ impl App {
             return true;
         }
 
-        if primary_pressed
+        if secondary_pressed
             && pointer_pos.is_some_and(|pos| layout.canvas_rect.contains(pos))
             && let Some(pos) = canvas_pos
         {
@@ -17514,7 +17899,7 @@ impl App {
                     },
                 )
             });
-        } else if primary_down
+        } else if secondary_down
             && let Some(pos) = canvas_pos
             && let Some(PanoramaNavigatorInteraction::Select { start, .. }) = interaction
         {
@@ -17530,7 +17915,7 @@ impl App {
             ctx.request_repaint();
         }
 
-        if primary_released
+        if secondary_released
             && let Some(PanoramaNavigatorInteraction::Select { start, current }) = interaction
         {
             // A corner click releases over the header, so any primary selection present here is
@@ -17569,7 +17954,7 @@ impl App {
             return true;
         }
 
-        if secondary_pressed
+        if primary_pressed
             && pointer_pos.is_some_and(|pos| layout.canvas_rect.contains(pos))
             && let Some(pos) = canvas_pos
             && let Some(pano) = self.panorama_state.as_ref()
@@ -17584,7 +17969,7 @@ impl App {
                     },
                 )
             });
-        } else if secondary_down
+        } else if primary_down
             && let Some(pos) = canvas_pos
             && let Some(PanoramaNavigatorInteraction::Pan {
                 start_uv,
@@ -17603,8 +17988,7 @@ impl App {
             }
             ctx.request_repaint();
         }
-        if secondary_released
-            && matches!(interaction, Some(PanoramaNavigatorInteraction::Pan { .. }))
+        if primary_released && matches!(interaction, Some(PanoramaNavigatorInteraction::Pan { .. }))
         {
             ctx.data_mut(|data| {
                 data.remove_temp::<PanoramaNavigatorInteraction>(
@@ -17707,6 +18091,9 @@ impl App {
                 break;
             }
         }
+        if self.fs_navigator_close_button_clicked(ui, ctx, layout.header_rect, "flat") {
+            corner_clicked = true;
+        }
 
         let response = ui
             .interact(
@@ -17715,7 +18102,7 @@ impl App {
                 egui::Sense::click_and_drag(),
             )
             .on_hover_text(
-                "左ドラッグ: 範囲を拡大 / 右ドラッグ: 表示位置を移動 / ダブルクリック: 中央へ移動 / ホイール: サイズ変更",
+                "左ドラッグ: 表示位置を移動 / 右ドラッグ: 範囲を拡大 / ダブルクリック: 中央へ移動 / ホイール: サイズ変更",
             );
         let clamp_to_canvas = |pos: egui::Pos2| {
             egui::pos2(
@@ -17777,7 +18164,21 @@ impl App {
             return true;
         }
 
-        if primary_pressed
+        // ヘッダのボタンが今フレームを消費したら、キャンバス入力として解釈し直さない。
+        // 掴みかけの操作が残っていたら捨てる (押下は必ずボタン上なので確定していない)。
+        if corner_clicked {
+            ctx.data_mut(|data| {
+                data.remove_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id())
+            });
+            return true;
+        }
+
+        // 主ボタンのドラッグは**枠を動かす**。範囲を選んで拡大する方は副ボタンへ置く。
+        //
+        // 触って動かすものが「移動」でなく「範囲選択」なのは、指で触ったときに特に
+        // 分かりにくい (利用者報告 2026-08-13)。タッチには副ボタンが無いので、
+        // 主ボタンに置いた方が指から届く。
+        if secondary_pressed
             && pointer_pos.is_some_and(|pos| layout.canvas_rect.contains(pos))
             && let Some(pos) = canvas_pos
         {
@@ -17790,7 +18191,7 @@ impl App {
                     },
                 )
             });
-        } else if primary_down
+        } else if secondary_down
             && let Some(pos) = canvas_pos
             && let Some(FsNavigatorInteraction::Select { start, .. }) = interaction
         {
@@ -17806,16 +18207,10 @@ impl App {
             ctx.request_repaint();
         }
 
-        if primary_released
+        if secondary_released
             && let Some(FsNavigatorInteraction::Select { start, current }) = interaction
         {
-            // A click is reported on release. If this release belongs to a corner button,
-            // discard a stale selection and still run the normal release cleanup before returning.
-            if corner_clicked {
-                ctx.data_mut(|data| {
-                    data.remove_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id())
-                });
-            } else {
+            {
                 let selection =
                     egui::Rect::from_two_pos(start, current).intersect(layout.content_rect);
                 if selection.width() >= FS_NAVIGATOR_MIN_SELECTION
@@ -17858,11 +18253,7 @@ impl App {
             }
         }
 
-        if corner_clicked {
-            return true;
-        }
-
-        if secondary_pressed
+        if primary_pressed
             && pointer_pos.is_some_and(|pos| layout.canvas_rect.contains(pos))
             && let Some(pos) = canvas_pos
         {
@@ -17895,7 +18286,7 @@ impl App {
                     )
                 });
             }
-        } else if secondary_down
+        } else if primary_down
             && let Some(pos) = canvas_pos
             && let Some(FsNavigatorInteraction::Pan {
                 start,
@@ -17907,7 +18298,7 @@ impl App {
             self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
             ctx.request_repaint();
         }
-        if secondary_released
+        if primary_released
             && matches!(
                 interaction,
                 Some(
@@ -17944,49 +18335,12 @@ impl App {
             5.0,
             egui::Color32::from_rgba_unmultiplied(16, 18, 22, 232),
         );
-        painter.rect_filled(
+        paint_fs_navigator_header(
+            painter,
             layout.header_rect,
-            5.0,
-            egui::Color32::from_rgba_unmultiplied(34, 38, 46, 245),
+            self.settings.fullscreen_navigator_corner,
+            self.settings.fullscreen_navigator_visible,
         );
-        painter.text(
-            layout.header_rect.left_center() + egui::vec2(8.0, 0.0),
-            egui::Align2::LEFT_CENTER,
-            "ナビゲータ",
-            egui::FontId::proportional(12.0),
-            egui::Color32::WHITE,
-        );
-        for (index, &corner) in FullscreenNavigatorCorner::ALL.iter().enumerate() {
-            let button = fs_navigator_corner_button_rect(layout.header_rect, index);
-            let selected = corner == self.settings.fullscreen_navigator_corner.normalized();
-            painter.rect_filled(
-                button,
-                2.0,
-                if selected {
-                    egui::Color32::from_rgb(64, 112, 172)
-                } else {
-                    egui::Color32::from_gray(54)
-                },
-            );
-            painter.rect_stroke(
-                button,
-                2.0,
-                egui::Stroke::new(1.0, egui::Color32::from_gray(142)),
-                egui::StrokeKind::Inside,
-            );
-            let marker_center = match corner {
-                FullscreenNavigatorCorner::TopLeft => button.left_top() + egui::vec2(4.0, 4.0),
-                FullscreenNavigatorCorner::TopRight => button.right_top() + egui::vec2(-4.0, 4.0),
-                FullscreenNavigatorCorner::BottomLeft => {
-                    button.left_bottom() + egui::vec2(4.0, -4.0)
-                }
-                FullscreenNavigatorCorner::BottomRight => {
-                    button.right_bottom() + egui::vec2(-4.0, -4.0)
-                }
-                FullscreenNavigatorCorner::Unknown => unreachable!("known navigator corner"),
-            };
-            painter.circle_filled(marker_center, 2.0, egui::Color32::WHITE);
-        }
 
         let canvas_painter = painter.with_clip_rect(layout.canvas_rect);
         canvas_painter.rect_filled(layout.canvas_rect, 0.0, egui::Color32::BLACK);
@@ -18045,11 +18399,16 @@ impl App {
                 .hover_pos()
                 .is_some_and(|pos| layout.canvas_rect.contains(pos))
         }) {
-            let secondary_down = ctx.input(|input| input.pointer.secondary_down());
-            ctx.set_cursor_icon(if secondary_down {
+            // カーソルは主ボタンの意味に合わせる。主 = 枠を掴んで動かす、
+            // 副 = 範囲を選ぶ。ドラッグの割り当てを入れ替えたらここも入れ替える。
+            let (primary_down, secondary_down) =
+                ctx.input(|input| (input.pointer.primary_down(), input.pointer.secondary_down()));
+            ctx.set_cursor_icon(if primary_down {
                 egui::CursorIcon::Grabbing
-            } else {
+            } else if secondary_down {
                 egui::CursorIcon::Crosshair
+            } else {
+                egui::CursorIcon::Grab
             });
         }
     }
@@ -18222,7 +18581,7 @@ impl App {
                         .main
                         .pan_to_center_source_normalized(source_uv, self.fs_pan);
                     self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
-                    if ctx.input(|input| input.pointer.secondary_down()) {
+                    if ctx.input(|input| input.pointer.primary_down()) {
                         ctx.data_mut(|data| {
                             data.insert_temp(
                                 fs_navigator_interaction_id(),
@@ -18257,49 +18616,12 @@ impl App {
             5.0,
             egui::Color32::from_rgba_unmultiplied(16, 18, 22, 232),
         );
-        painter.rect_filled(
+        paint_fs_navigator_header(
+            painter,
             layout.header_rect,
-            5.0,
-            egui::Color32::from_rgba_unmultiplied(34, 38, 46, 245),
+            self.settings.fullscreen_navigator_corner,
+            self.settings.fullscreen_navigator_visible,
         );
-        painter.text(
-            layout.header_rect.left_center() + egui::vec2(8.0, 0.0),
-            egui::Align2::LEFT_CENTER,
-            "ナビゲータ",
-            egui::FontId::proportional(12.0),
-            egui::Color32::WHITE,
-        );
-        for (index, &corner) in FullscreenNavigatorCorner::ALL.iter().enumerate() {
-            let button = fs_navigator_corner_button_rect(layout.header_rect, index);
-            let selected = corner == self.settings.fullscreen_navigator_corner.normalized();
-            painter.rect_filled(
-                button,
-                2.0,
-                if selected {
-                    egui::Color32::from_rgb(64, 112, 172)
-                } else {
-                    egui::Color32::from_gray(54)
-                },
-            );
-            painter.rect_stroke(
-                button,
-                2.0,
-                egui::Stroke::new(1.0, egui::Color32::from_gray(142)),
-                egui::StrokeKind::Inside,
-            );
-            let marker_center = match corner {
-                FullscreenNavigatorCorner::TopLeft => button.left_top() + egui::vec2(4.0, 4.0),
-                FullscreenNavigatorCorner::TopRight => button.right_top() + egui::vec2(-4.0, 4.0),
-                FullscreenNavigatorCorner::BottomLeft => {
-                    button.left_bottom() + egui::vec2(4.0, -4.0)
-                }
-                FullscreenNavigatorCorner::BottomRight => {
-                    button.right_bottom() + egui::vec2(-4.0, -4.0)
-                }
-                FullscreenNavigatorCorner::Unknown => unreachable!("known navigator corner"),
-            };
-            painter.circle_filled(marker_center, 2.0, egui::Color32::WHITE);
-        }
 
         let canvas_painter = painter.with_clip_rect(layout.canvas_rect);
         canvas_painter.rect_filled(layout.canvas_rect, 0.0, egui::Color32::BLACK);
@@ -18366,11 +18688,16 @@ impl App {
                 .hover_pos()
                 .is_some_and(|pos| layout.canvas_rect.contains(pos))
         }) {
-            let secondary_down = ctx.input(|input| input.pointer.secondary_down());
-            ctx.set_cursor_icon(if secondary_down {
+            // カーソルは主ボタンの意味に合わせる。主 = 枠を掴んで動かす、
+            // 副 = 範囲を選ぶ。ドラッグの割り当てを入れ替えたらここも入れ替える。
+            let (primary_down, secondary_down) =
+                ctx.input(|input| (input.pointer.primary_down(), input.pointer.secondary_down()));
+            ctx.set_cursor_icon(if primary_down {
                 egui::CursorIcon::Grabbing
-            } else {
+            } else if secondary_down {
                 egui::CursorIcon::Crosshair
+            } else {
+                egui::CursorIcon::Grab
             });
         }
     }
@@ -18385,6 +18712,9 @@ impl App {
         prev_foreground_hwnd: usize,
     ) -> (FsPageNav, bool) {
         let mut page_nav = FsPageNav::None;
+        // 同じ面の認識器を回す呼び出しが下に複数ある。接触の開始フレームを処理した
+        // 呼び出しが所有者を決めるので、**全部で同じ値を使う**。
+        let touch_tap_zones = self.fs_touch_tap_zones_enabled();
         let mut close = false;
         const FOCUS_RESTORE_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
         let (pointer_primary_down, primary_released) =
@@ -18432,6 +18762,7 @@ impl App {
                     excluded: Vec::new(),
                     behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                         accepts_pinch: true,
+                        tap_zones: touch_tap_zones,
                     },
                 },
                 self.frame_counter,
@@ -18547,6 +18878,7 @@ impl App {
                         excluded: Vec::new(),
                         behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                             accepts_pinch: true,
+                            tap_zones: touch_tap_zones,
                         },
                     },
                     self.frame_counter,
@@ -18839,6 +19171,7 @@ impl App {
                     excluded: Vec::new(),
                     behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                         accepts_pinch: true,
+                        tap_zones: touch_tap_zones,
                     },
                 },
                 self.frame_counter,
@@ -18892,19 +19225,22 @@ impl App {
             slideshow_popup_open: self.slideshow_popup_open,
             rotation_popup_open: fs_rotation_popup_open(ctx),
             compare_wipe_active,
-            panorama_active,
-            analysis_active: self.analysis_mode,
             overlay_edit_active: self.is_overlay_edit_mode_active(),
             view_trim_active: self.view_trim_mode,
             zoom_active: self.fs_zoom_mode_engaged(),
         });
+        // タップ判定を使わない面でも、ピンチだけは受け取る。上の driver 群と同じ値。
+        let touch_tap_zones_enabled = touch_tap_zones;
         let touch_help_scope = panel_fs_idx.map(|fs_idx| StillTouchChromeLatch {
             fs_idx,
             session_started_at: self.fullscreen_opened_at(),
         });
         let mut touch_help_phase_before =
             touch_help_scope.and_then(|scope| still_touch_first_run_help_phase(ctx, scope));
-        if self.settings.touch_still_chrome_learned || !touch_input_enabled {
+        if self.settings.touch_still_chrome_learned
+            || !touch_input_enabled
+            || !touch_tap_zones_enabled
+        {
             if touch_help_phase_before.is_some() {
                 clear_still_touch_first_run_help(ctx);
                 touch_help_phase_before = None;
@@ -18924,6 +19260,11 @@ impl App {
         }
         if top_bar_visible {
             touch_excluded.push(fullscreen_top_bar_rect(full_rect));
+        }
+        // ナビゲータは画像の上に浮く widget であって、ページ送りの当たり判定ではない。
+        // 除外しないと、隅ボタンも閉じるボタンも押せないまま、触れた指がページを送る。
+        if let Some(navigator_rect) = self.fullscreen_navigator_panel_rect(ctx, full_rect) {
+            touch_excluded.push(navigator_rect);
         }
         extend_touch_excluded_with_panel_handles(
             &mut touch_excluded,
@@ -18945,6 +19286,7 @@ impl App {
                 excluded: touch_excluded,
                 behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                     accepts_pinch: true,
+                    tap_zones: touch_tap_zones_enabled,
                 },
             },
             self.frame_counter,
@@ -18957,7 +19299,7 @@ impl App {
                 learned: self.settings.touch_still_chrome_learned,
                 touch_activity,
                 gestures_disabled: crate::touch_correlation::touch_gestures_disabled(),
-                touch_input_enabled,
+                touch_input_enabled: touch_input_enabled && touch_tap_zones_enabled,
             });
         if touch_help_started_this_frame && let Some(scope) = touch_help_scope {
             // The discovering contact is never also the dismissing contact.
@@ -19036,16 +19378,24 @@ impl App {
                         page_nav = self.spread_page_nav(base);
                     }
                     crate::touch_input::TouchCommand::Zoom { factor, pivot } => {
-                        if self.apply_touch_zoom_factor_about_pivot(
-                            factor,
-                            pivot,
-                            default_image_rect.center(),
-                        ) {
+                        // 書き先は `fs_zoom_owner` が決める。ここで新しい分岐を足さない。
+                        let applied = match self.fs_zoom_owner() {
+                            FsZoomOwner::Panorama => self.apply_panorama_touch_zoom(factor),
+                            _ => {
+                                let rect = self.fs_zoom_pivot_rect(full_rect, default_image_rect);
+                                self.apply_touch_zoom_factor_about_pivot(
+                                    factor,
+                                    pivot,
+                                    rect.center(),
+                                )
+                            }
+                        };
+                        if applied {
                             ctx.request_repaint();
                         }
                     }
                     crate::touch_input::TouchCommand::Pan { delta } => {
-                        self.set_fs_pan_from_input(self.fs_zoom, self.fs_pan + delta);
+                        self.apply_touch_pan_delta(delta, full_rect);
                         ctx.request_repaint();
                     }
                     crate::touch_input::TouchCommand::PinchEnd => {
@@ -19526,7 +19876,18 @@ impl App {
                                 // intentional rather than incidental, so PageSide is deliberately
                                 // dispatched above even in continuous reading (touch/mouse parity is
                                 // not required here; see touch-support-plan §5.14-11).
-                                if !in_side_panel && !in_seek_panel && !continuous_active {
+                                // 表示モードがキャンバスを持っているときは、クリックは
+                                // そのモードの操作。ページ送りへ流さない。
+                                let display_mode_owns_canvas = fs_display_mode_owns_canvas(
+                                    self.fullscreen_idx
+                                        .is_some_and(|idx| self.is_panorama_mode_active(idx)),
+                                    self.analysis_mode,
+                                );
+                                if !in_side_panel
+                                    && !in_seek_panel
+                                    && !continuous_active
+                                    && !display_mode_owns_canvas
+                                {
                                     let base = fullscreen_click_nav_base_delta(
                                         pos.x,
                                         full_rect.center().x,
@@ -20211,8 +20572,13 @@ impl App {
         at_end: bool,
     ) -> Option<usize> {
         let display_order = self.current_grid_order().to_vec();
-        let target =
-            crate::ui_helpers::boundary_navigable_idx(&self.items, &display_order, at_end)?;
+        let continuous_reading = self.continuous_reading_active_for_idx(fs_idx);
+        let target = crate::ui_helpers::boundary_page_navigation_idx(
+            &self.items,
+            &display_order,
+            at_end,
+            continuous_reading,
+        )?;
         if target != fs_idx {
             Some(target)
         } else {
@@ -20711,11 +21077,7 @@ impl App {
             // close (Esc) / close_to_page_list (BS) は終端アクション。閉じた後に同フレームの
             // wheel 由来のページ移動等で別項目を開き直さないようガードする。
             if let Some(new_idx) = jump_to {
-                self.open_fullscreen_from_fs_navigation(
-                    ctx,
-                    new_idx,
-                    crate::app::HistoryTrigger::UserChosen,
-                );
+                self.land_still_page_navigation_target(ctx, fs_idx, new_idx);
             } else if let FsPageNav::Target(new_idx) = page_nav {
                 let display_order = self.current_grid_order().to_vec();
                 let current_is_media = matches!(
@@ -20771,11 +21133,12 @@ impl App {
                         "media_window_manual",
                         crate::app::ManualMediaNavigationLanding::Fullscreen,
                     );
-                } else if let Some(new_idx) = crate::ui_helpers::adjacent_navigable_idx(
+                } else if let Some(new_idx) = crate::ui_helpers::adjacent_page_navigation_idx(
                     &self.items,
                     &display_order,
                     fs_idx,
                     nav_delta,
+                    self.continuous_reading_active_for_idx(fs_idx),
                 ) {
                     self.update_fs_page_turn_burst_after_navigation(
                         ctx,
@@ -31853,6 +32216,53 @@ mod tests {
         }
     }
 
+    /// 360 度ビューは `fs_zoom` を描画に使わない。ピンチをそのまま流していたので、
+    /// 画面は何も変わらないのに見えない値だけが動いていた (利用者報告 2026-08-13)。
+    #[test]
+    fn a_pinch_narrows_the_panorama_field_of_view() {
+        let start = (crate::panorama::FOV_MIN + crate::panorama::FOV_MAX) * 0.5;
+
+        let zoomed_in = panorama_touch_zoom_fov(start, 2.0).unwrap();
+        let zoomed_out = panorama_touch_zoom_fov(start, 0.5).unwrap();
+        assert!(zoomed_in < start, "pinching out must narrow the view");
+        assert!(zoomed_out > start, "pinching in must widen the view");
+
+        // 端で止まること。止まらないと sanitize 前に発散する。
+        assert_eq!(
+            panorama_touch_zoom_fov(start, 1e6).unwrap(),
+            crate::panorama::FOV_MIN
+        );
+        assert_eq!(
+            panorama_touch_zoom_fov(start, 1e-6).unwrap(),
+            crate::panorama::FOV_MAX
+        );
+
+        // 異常な倍率は姿勢へ触れない。
+        assert!(panorama_touch_zoom_fov(start, 0.0).is_none());
+        assert!(panorama_touch_zoom_fov(start, f32::NAN).is_none());
+    }
+
+    /// ピンチ中の平行移動は、1 本指ドラッグと同じ向き・同じ感度で回すこと。
+    /// 同じ操作が入力手段で違う意味になると、指と画像が別々に動いて見える。
+    #[test]
+    fn a_two_finger_drag_turns_the_panorama_like_one_finger_does() {
+        let fov_y = 1.0_f32;
+        let viewport_h = 800.0_f32;
+        let sens = fov_y / viewport_h;
+        let delta = egui::vec2(40.0, -30.0);
+
+        let (yaw, pitch) = panorama_touch_pan_pose(0.0, 0.0, fov_y, delta, viewport_h).unwrap();
+        assert!((yaw - delta.x * sens).abs() < 1e-6);
+        assert!((pitch - delta.y * sens).abs() < 1e-6);
+
+        // 極を直視させない。
+        let (_, clamped) =
+            panorama_touch_pan_pose(0.0, 0.0, fov_y, egui::vec2(0.0, 1e9), viewport_h).unwrap();
+        assert_eq!(clamped, crate::panorama::PITCH_LIMIT);
+
+        assert!(panorama_touch_pan_pose(0.0, 0.0, fov_y, egui::Vec2::ZERO, viewport_h).is_none());
+    }
+
     #[test]
     fn navigator_hold_does_not_request_visibility_without_focus() {
         assert!(!fs_navigator_visibility_requested(
@@ -32011,8 +32421,135 @@ mod tests {
         assert!(!app.fs_navigator_allowed(&ctx, fs_idx));
     }
 
+    /// 保持状態の出口が Alt+N しかなかったので、キーボードのない端末では
+    /// 一度出したナビゲータを消せなかった (§1.63)。閉じるボタンが画面上の出口。
     #[test]
-    fn navigator_left_and_right_drags_keep_canvas_clamp_and_release_cleanup() {
+    fn navigator_close_button_clears_the_persisted_visibility() {
+        let (mut app, image_rect, fs_idx) = setup_flat_navigator_input_test();
+        let ctx = egui::Context::default();
+        let layout = app.fs_navigator_layout(image_rect).unwrap();
+        let close_pos = fs_navigator_close_button_rect(layout.header_rect).center();
+
+        assert!(run_flat_navigator_input_frame(
+            &mut app,
+            &ctx,
+            image_rect,
+            navigator_pointer_input(close_pos, None, egui::Modifiers::default(), -0.1),
+        ));
+        assert!(run_flat_navigator_input_frame(
+            &mut app,
+            &ctx,
+            image_rect,
+            navigator_pointer_input(
+                close_pos,
+                Some((egui::PointerButton::Primary, true)),
+                egui::Modifiers::default(),
+                0.0,
+            ),
+        ));
+        assert!(app.settings.fullscreen_navigator_visible);
+        // ヘッダを押しただけでキャンバスの範囲選択を始めてはいけない。
+        assert!(ctx.data(|data| {
+            data.get_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id())
+                .is_none()
+        }));
+
+        assert!(run_flat_navigator_input_frame(
+            &mut app,
+            &ctx,
+            image_rect,
+            navigator_pointer_input(
+                close_pos,
+                Some((egui::PointerButton::Primary, false)),
+                egui::Modifiers::default(),
+                0.1,
+            ),
+        ));
+
+        assert!(!app.settings.fullscreen_navigator_visible);
+        assert!(!app.fs_navigator_allowed(&ctx, fs_idx));
+        assert!(!fs_navigator_interaction_active(&ctx));
+    }
+
+    /// ナビゲータは画像の上に浮く widget であって、ページ送りの当たり判定ではない。
+    /// 除外に入れ忘れると、触れた指がナビゲータではなくページを送る (§1.63)。
+    #[test]
+    fn navigator_panel_is_excluded_from_tap_zone_classification() {
+        let (mut app, _, _) = setup_flat_navigator_input_test();
+        let ctx = egui::Context::default();
+        let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+
+        let panel_rect = app
+            .fullscreen_navigator_panel_rect(&ctx, full_rect)
+            .expect("a visible navigator must publish its panel rect");
+        let tap = panel_rect.center();
+
+        let bare = crate::touch_input::TapZoneGeometry {
+            surface: full_rect,
+            excluded: Vec::new(),
+            behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                accepts_pinch: true,
+                tap_zones: true,
+            },
+        };
+        assert!(
+            !matches!(
+                crate::touch_input::classify_tap(&bare, tap),
+                crate::touch_input::TapZone::Excluded
+            ),
+            "without the exclusion the same tap is a page-turn zone, which is the reported bug"
+        );
+
+        let guarded = crate::touch_input::TapZoneGeometry {
+            excluded: vec![panel_rect],
+            ..bare
+        };
+        assert_eq!(
+            crate::touch_input::classify_tap(&guarded, tap),
+            crate::touch_input::TapZone::Excluded
+        );
+
+        app.set_fullscreen_navigator_visible(false);
+        assert!(
+            app.fullscreen_navigator_panel_rect(&ctx, full_rect)
+                .is_none()
+        );
+    }
+
+    /// ボタン群を右へ寄せた分だけタイトルの幅が減る。最小サイズのパネルでも
+    /// 文字がボタンに重ならないこと、ボタン同士も重ならないことを固定する。
+    #[test]
+    fn navigator_header_buttons_and_title_never_overlap_at_the_smallest_panel() {
+        let host = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let (_, header_rect, _) = fs_navigator_panel_rect(
+            host,
+            FULLSCREEN_NAVIGATOR_SIZE_MIN,
+            FullscreenNavigatorCorner::TopLeft,
+        )
+        .expect("the smallest navigator still fits a 1200x800 host");
+
+        let close = fs_navigator_close_button_rect(header_rect);
+        let last_corner = fs_navigator_corner_button_rect(header_rect, 3);
+        let first_corner = fs_navigator_corner_button_rect(header_rect, 0);
+
+        assert!(header_rect.contains_rect(close));
+        assert!(header_rect.contains_rect(first_corner));
+        assert!(last_corner.right() <= close.left());
+        assert!(
+            fs_navigator_title_max_width(header_rect) > 0.0,
+            "the title must keep some room rather than collapse"
+        );
+        assert!(
+            first_corner.left() - fs_navigator_title_max_width(header_rect)
+                >= header_rect.left() + FS_NAVIGATOR_HEADER_PAD,
+            "the title width must stop short of the button cluster"
+        );
+    }
+
+    /// 主ボタンのドラッグは枠を動かし、範囲を選んで拡大する方は副ボタン。
+    /// タッチには副ボタンが無いので、指から届く方に「移動」を置いている。
+    #[test]
+    fn navigator_primary_drag_moves_the_frame_and_secondary_selects_a_range() {
         let (mut app, image_rect, _) = setup_flat_navigator_input_test();
         let ctx = egui::Context::default();
         let layout = app.fs_navigator_layout(image_rect).unwrap();
@@ -32026,7 +32563,7 @@ mod tests {
             image_rect,
             navigator_pointer_input(
                 start,
-                Some((egui::PointerButton::Primary, true)),
+                Some((egui::PointerButton::Secondary, true)),
                 egui::Modifiers::default(),
                 0.0,
             ),
@@ -32056,7 +32593,7 @@ mod tests {
             image_rect,
             navigator_pointer_input(
                 finish,
-                Some((egui::PointerButton::Primary, false)),
+                Some((egui::PointerButton::Secondary, false)),
                 egui::Modifiers::default(),
                 0.2,
             ),
@@ -32073,7 +32610,7 @@ mod tests {
             image_rect,
             navigator_pointer_input(
                 start,
-                Some((egui::PointerButton::Secondary, true)),
+                Some((egui::PointerButton::Primary, true)),
                 egui::Modifiers::default(),
                 1.0,
             ),
@@ -32104,7 +32641,7 @@ mod tests {
             image_rect,
             navigator_pointer_input(
                 outside,
-                Some((egui::PointerButton::Secondary, false)),
+                Some((egui::PointerButton::Primary, false)),
                 egui::Modifiers::default(),
                 1.3,
             ),
@@ -32708,6 +33245,63 @@ mod tests {
         assert_eq!(app.selected, Some(2));
         assert_eq!(app.fs_vertical_scroll, 0.0);
         assert_eq!(app.fs_zoom, 1.5);
+    }
+
+    #[test]
+    fn continuous_spread_target_skips_media_units_while_paged_keeps_video() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![
+            GridItem::Image(PathBuf::new()),
+            GridItem::Image(PathBuf::new()),
+            GridItem::Video(PathBuf::new()),
+            GridItem::Audio(PathBuf::new()),
+            GridItem::Image(PathBuf::new()),
+            GridItem::Image(PathBuf::new()),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.visible_indices = (0..app.items.len()).collect();
+        app.open_fullscreen(0, crate::app::HistoryTrigger::UserChosen);
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+
+        app.reading_flow = ReadingFlow::Vertical;
+        assert_eq!(app.spread_page_nav(1), FsPageNav::Target(4));
+
+        app.reading_flow = ReadingFlow::Paged;
+        assert_eq!(app.spread_page_nav(1), FsPageNav::Target(2));
+    }
+
+    #[test]
+    fn continuous_navigation_without_a_still_target_stays_put_and_shows_edge() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![
+            GridItem::Image(PathBuf::new()),
+            GridItem::Video(PathBuf::new()),
+            GridItem::Audio(PathBuf::new()),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.visible_indices = (0..app.items.len()).collect();
+        app.open_fullscreen(0, crate::app::HistoryTrigger::UserChosen);
+        app.reading_flow = ReadingFlow::Vertical;
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        let ctx = egui::Context::default();
+
+        app.handle_fs_navigation(
+            &ctx,
+            false,
+            false,
+            None,
+            None,
+            None,
+            FsPageNav::Delta(1),
+            None,
+            0,
+        );
+
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(matches!(
+            app.fs_boundary_hint,
+            Some(FsBoundaryHint::Edge { at_end: true, .. })
+        ));
     }
 
     #[test]
@@ -34484,6 +35078,7 @@ mod tests {
             excluded,
             behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                 accepts_pinch: true,
+                tap_zones: true,
             },
         };
         for rect in still_touch_panel_handle_rects(viewport) {
@@ -35062,6 +35657,7 @@ mod tests {
                                 excluded: Vec::new(),
                                 behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                                     accepts_pinch: true,
+                                    tap_zones: true,
                                 },
                             },
                             1,
@@ -35229,6 +35825,7 @@ mod tests {
                                     excluded: Vec::new(),
                                     behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                                         accepts_pinch: true,
+                                        tap_zones: true,
                                     },
                                 },
                                 frame,
@@ -35661,14 +36258,6 @@ mod tests {
                 ..enabled
             },
             StillTouchInputEnabledInputs {
-                panorama_active: true,
-                ..enabled
-            },
-            StillTouchInputEnabledInputs {
-                analysis_active: true,
-                ..enabled
-            },
-            StillTouchInputEnabledInputs {
                 overlay_edit_active: true,
                 ..enabled
             },
@@ -35683,6 +36272,228 @@ mod tests {
         ] {
             assert!(!still_touch_input_enabled(disabled));
         }
+    }
+
+    /// 360 度ビューと分析ツールは、タップ判定を持たないだけで**タッチ入力自体は生きる**。
+    ///
+    /// かつては両方まとめて止めていて、ピンチまで消えていた (利用者報告 2026-08-13)。
+    /// 「タップ判定を使うか」と「タッチを扱うか」が同じ述語だったのが原因なので、
+    /// 分かれたままであることをここで縛る。
+    #[test]
+    fn the_panorama_and_analysis_views_keep_touch_but_drop_tap_zones() {
+        let enabled = StillTouchInputEnabledInputs {
+            is_video: false,
+            is_music_view: false,
+            has_fullscreen_item: true,
+            dialog_open: false,
+            wants_keyboard_input: false,
+            ime_input_active: false,
+            context_menu_open: false,
+            spread_popup_open: false,
+            fit_popup_open: false,
+            slideshow_popup_open: false,
+            rotation_popup_open: false,
+            compare_wipe_active: false,
+            overlay_edit_active: false,
+            view_trim_active: false,
+            zoom_active: false,
+        };
+        // 表示モードはこの述語の入力ではない。ここで落とすとピンチごと消える。
+        assert!(still_touch_input_enabled(enabled));
+
+        assert!(still_touch_tap_zones_enabled(false, false));
+        assert!(!still_touch_tap_zones_enabled(true, false));
+        assert!(!still_touch_tap_zones_enabled(false, true));
+    }
+
+    /// タップ判定を持たない面では、1 本指は素通り、2 本指はピンチ。
+    ///
+    /// `WidgetPassthrough` にするとピンチが始まらず、`Undecided` にするとページ送りへ
+    /// 落ちうる。どちらでもない `ViewerPointerPassthrough` であることが要点。
+    #[test]
+    fn a_surface_without_tap_zones_passes_one_finger_through_and_still_pinches() {
+        use crate::touch_input::{
+            TapZoneGeometry, TouchOwner, TouchPhase, TouchRecognizer, TouchSample,
+            TouchSurfaceBehavior,
+        };
+
+        let geom = TapZoneGeometry {
+            surface: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1000.0, 800.0)),
+            excluded: Vec::new(),
+            behavior: TouchSurfaceBehavior::Viewer {
+                accepts_pinch: true,
+                tap_zones: false,
+            },
+        };
+        let mut recognizer = TouchRecognizer::new();
+
+        // 画面の端 = 通常ならページ送りゾーン。
+        recognizer.handle_sample(
+            &geom,
+            TouchSample {
+                id: 1,
+                pos: egui::pos2(30.0, 400.0),
+                phase: TouchPhase::Start,
+                now_ms: 0,
+            },
+        );
+        assert_eq!(recognizer.owner(), TouchOwner::ViewerPointerPassthrough);
+
+        recognizer.handle_sample(
+            &geom,
+            TouchSample {
+                id: 2,
+                pos: egui::pos2(600.0, 400.0),
+                phase: TouchPhase::Start,
+                now_ms: 10,
+            },
+        );
+        assert_eq!(recognizer.owner(), TouchOwner::Pinch);
+
+        // 離しても、そのタップがページ送りになってはいけない。
+        let commands = recognizer.handle_sample(
+            &geom,
+            TouchSample {
+                id: 1,
+                pos: egui::pos2(30.0, 400.0),
+                phase: TouchPhase::End,
+                now_ms: 20,
+            },
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|c| matches!(c, crate::touch_input::TouchCommand::PageSide { .. })),
+            "a surface without tap zones must never emit a page turn"
+        );
+    }
+
+    /// 接触が始まったフレームを処理した呼び出しが所有者を決める。同じ面の認識器を
+    /// 回す呼び出しが複数あるので、**どれか 1 つでも古い値を渡すと**そこで始まった
+    /// 接触がページ送りとして確定してしまう (利用者報告 2026-08-13、ログで確定)。
+    ///
+    /// 実害はフォーカス復帰の経路で出た。アプリを切り替えて戻った直後だけ
+    /// 360 度ビューのタップがページを送り、間欠的にしか再現しなかった。
+    #[test]
+    fn a_contact_started_with_tap_zones_on_still_turns_pages_after_they_go_off() {
+        use crate::touch_input::{
+            TapZoneGeometry, TouchCommand, TouchPhase, TouchRecognizer, TouchSample,
+            TouchSurfaceBehavior,
+        };
+
+        let geometry = |tap_zones: bool| TapZoneGeometry {
+            surface: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1000.0, 800.0)),
+            excluded: Vec::new(),
+            behavior: TouchSurfaceBehavior::Viewer {
+                accepts_pinch: true,
+                tap_zones,
+            },
+        };
+        let mut recognizer = TouchRecognizer::new();
+
+        // 開始フレームだけ古い値 (= 別の呼び出しが先に回した) を渡す。
+        recognizer.handle_sample(
+            &geometry(true),
+            TouchSample {
+                id: 1,
+                pos: egui::pos2(900.0, 400.0),
+                phase: TouchPhase::Start,
+                now_ms: 0,
+            },
+        );
+        let commands = recognizer.handle_sample(
+            &geometry(false),
+            TouchSample {
+                id: 1,
+                pos: egui::pos2(900.0, 400.0),
+                phase: TouchPhase::End,
+                now_ms: 80,
+            },
+        );
+
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, TouchCommand::PageSide { .. })),
+            "this is the shape of the bug: the start frame decides, so every caller              driving this surface must pass the same value"
+        );
+    }
+
+    /// タップ判定を外したら、代わりに**マウスのクリック経路**へ流れてページが送られた
+    /// (利用者報告 2026-08-13)。動かなかった接触は synthetic click を出さない。
+    ///
+    /// ドラッグは対象外。見回しもガイド操作も従来どおり通す必要がある。
+    #[test]
+    fn a_still_tap_without_tap_zones_does_not_become_a_click() {
+        use crate::touch_input::{
+            TapZoneGeometry, TouchPhase, TouchRecognizer, TouchSample, TouchSurfaceBehavior,
+        };
+
+        let geom = TapZoneGeometry {
+            surface: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1000.0, 800.0)),
+            excluded: Vec::new(),
+            behavior: TouchSurfaceBehavior::Viewer {
+                accepts_pinch: true,
+                tap_zones: false,
+            },
+        };
+
+        let mut tapped = TouchRecognizer::new();
+        tapped.handle_sample(
+            &geom,
+            TouchSample {
+                id: 1,
+                pos: egui::pos2(800.0, 400.0),
+                phase: TouchPhase::Start,
+                now_ms: 0,
+            },
+        );
+        tapped.handle_sample(
+            &geom,
+            TouchSample {
+                id: 1,
+                pos: egui::pos2(800.0, 400.0),
+                phase: TouchPhase::End,
+                now_ms: 100,
+            },
+        );
+        assert!(
+            tapped.should_suppress_primary(),
+            "a stationary tap must not reach the click-to-turn-page path"
+        );
+
+        let mut dragged = TouchRecognizer::new();
+        dragged.handle_sample(
+            &geom,
+            TouchSample {
+                id: 1,
+                pos: egui::pos2(800.0, 400.0),
+                phase: TouchPhase::Start,
+                now_ms: 0,
+            },
+        );
+        dragged.handle_sample(
+            &geom,
+            TouchSample {
+                id: 1,
+                pos: egui::pos2(500.0, 400.0),
+                phase: TouchPhase::Move,
+                now_ms: 50,
+            },
+        );
+        dragged.handle_sample(
+            &geom,
+            TouchSample {
+                id: 1,
+                pos: egui::pos2(500.0, 400.0),
+                phase: TouchPhase::End,
+                now_ms: 100,
+            },
+        );
+        assert!(
+            !dragged.should_suppress_primary(),
+            "a drag must still reach the view's own pointer handling"
+        );
     }
 
     #[test]
@@ -35785,6 +36596,7 @@ mod tests {
             excluded: Vec::new(),
             behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                 accepts_pinch: true,
+                tap_zones: true,
             },
         };
         for point in [

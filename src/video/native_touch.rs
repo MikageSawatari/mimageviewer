@@ -696,6 +696,7 @@ mod tests {
             excluded: Vec::new(),
             behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                 accepts_pinch: false,
+                tap_zones: true,
             },
         }
     }

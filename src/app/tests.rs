@@ -50654,3 +50654,29 @@ fn same_name_test_folder_reports_its_folded_and_unsupported_entries() {
     }
     assert!(!drawn_off.contains("非表示"), "OFF にしたら出さない");
 }
+
+/// 空になった理由は、次の読み込みへ持ち越さない (§1.68)。
+///
+/// 理由を消す責任を「空にした側の呼び出し順」に持たせると、経路が増えたときに
+/// 消し忘れが混ざる。世代で無効化しているので、順序に関係なく落ちる。
+#[test]
+fn an_empty_items_reason_expires_with_its_generation() {
+    use crate::empty_items_reason::EmptyItemsReason;
+
+    let mut app = phase_c_support::setup_app();
+    app.set_empty_items_reason(EmptyItemsReason::PdfWorkerLost);
+    assert_eq!(
+        app.empty_items_reason(),
+        Some(&EmptyItemsReason::PdfWorkerLost)
+    );
+
+    app.bump_items_generation();
+    assert_eq!(app.empty_items_reason(), None);
+}
+
+/// 理由の付かない空は「本当に 0 件」。既定でどれかの失敗文が出てはいけない。
+#[test]
+fn a_fresh_app_reports_no_empty_items_reason() {
+    let app = phase_c_support::setup_app();
+    assert_eq!(app.empty_items_reason(), None);
+}

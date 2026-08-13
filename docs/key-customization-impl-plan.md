@@ -584,7 +584,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 ### Erase (Ph3) ★
 - EraseConfirm `E`,`Esc` / EraseConfirmPolygon `Enter` / EraseUndo `Ctrl+Z` /
   EraseDeleteShape `Delete`
-- EraseToolSelect `S` / Brush `B` / Lasso `L` / Polygon `P` / VLine `V` / HLine `H` /
+- EraseToolSelect `S` / Brush `B` / Bucket `K` / Lasso `L` / Polygon `P` / VLine `V` / HLine `H` /
   Line `I` / Rect `R` / Ellipse `O`
 - ErasePaintMode `D` / EraseEraseMode `F`
 - EraseSpacePan `Space` (KH, Ph6) / EraseNudge 矢印 (固定候補) / EraseRotate `[`,`]`
@@ -595,7 +595,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   ConcealDelete `Delete`
 - ConcealTypeCycle `T` / ConcealPixelGrid `G` / ConcealPreset1..4 `1`..`4` /
   ConcealPaintMode `D` / ConcealEraseMode `F`
-- ConcealToolSelect/Brush/Lasso/Line/VLine/HLine/Rect/Ellipse `S/B/L/I/V/H/R/O`
+- ConcealToolSelect/Brush/Bucket/Lasso/Polygon/Line/VLine/HLine/Rect/Ellipse
+  `S/B/K/L/P/I/V/H/R/O`
 - ConcealSpacePan `Space` (KH, Ph6) / ConcealNudge 矢印 (固定候補)
 
 ### Crop (Ph3) ★
@@ -609,8 +610,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 
 ### LocalAdjust (Ph3) ★
 - LaShowSource `Q` / LaShowMask `W` / LaPaintAdd `D` / LaPaintErase `F` / LaExit `Esc`(予約)
-- LaToolBrush/EdgeBrush/GapFill/Lasso/Polygon/Select/Line/VLine/HLine/Rect/Ellipse
-  `B/A/G/L/P/S/I/V/H/R/O`
+- LaToolBrush/Bucket/EdgeBrush/GapFill/Lasso/Polygon/Select/Line/VLine/HLine/Rect/Ellipse
+  `B/K/A/G/L/P/S/I/V/H/R/O`
 - LaSpacePan `Space` (KH)
 - Ctrl / Ctrl+Shift の source/layer bypass は一時 modifier 状態を使うため固定。
 

@@ -567,6 +567,412 @@ pub fn rasterize_shapes_into(mask: &mut [bool], shapes: &[Shape], w: usize, h: u
     }
 }
 
+/// 1bit マスクを半径 `radius` の正方近傍で拡張または縮小する。
+///
+/// 縦横に分けた 1 次元の走査を 2 回行う。正方形の構造要素は分離できるので、
+/// **半径をいくら大きくしても計算量は画素数に比例したまま**になる。バケツの
+/// 漏れ止めは半径を数 px 取るので、素朴な近傍走査 (半径の 2 乗に比例) では
+/// 大きな画像で持たない。
+///
+/// 端の扱いは座標 clamp (= 端の画素を複製) で、`morph_bitmap_mask_1px` と同じ。
+/// clamp した範囲での min / max は、複製した値を含めた min / max と一致するので、
+/// 走査範囲を画像内に切り詰めるだけでよい。
+pub fn morph_bitmap_mask(
+    mask: &[bool],
+    width: usize,
+    height: usize,
+    radius: usize,
+    dilate: bool,
+) -> Vec<bool> {
+    let expected_len = width.saturating_mul(height);
+    if width == 0 || height == 0 || mask.len() < expected_len {
+        return mask.to_vec();
+    }
+    if radius == 0 {
+        return mask.to_vec();
+    }
+
+    // 走査線ごとの窓 min / max。`dilate` なら「窓内に true があるか」、
+    // そうでなければ「窓内が全て true か」。どちらも「窓内の false の数」で判定できる。
+    let sweep = |src: &[bool], out: &mut [bool], len: usize, stride: usize, base: usize| {
+        // 立っている / 倒れている画素の個数を窓の移動で更新する (O(len))。
+        let mut hits = 0usize;
+        let at = |i: usize| src[base + i * stride];
+        let counts_as_hit = |v: bool| if dilate { v } else { !v };
+        let initial = (radius + 1).min(len);
+        for i in 0..initial {
+            if counts_as_hit(at(i)) {
+                hits += 1;
+            }
+        }
+        for i in 0..len {
+            out[base + i * stride] = if dilate { hits > 0 } else { hits == 0 };
+            let leaving = i.wrapping_sub(radius);
+            if i >= radius && counts_as_hit(at(leaving)) {
+                hits -= 1;
+            }
+            let entering = i + radius + 1;
+            if entering < len && counts_as_hit(at(entering)) {
+                hits += 1;
+            }
+        }
+    };
+
+    let mut horizontal = vec![false; expected_len];
+    for y in 0..height {
+        sweep(mask, &mut horizontal, width, 1, y * width);
+    }
+    let mut out = vec![false; expected_len];
+    for x in 0..width {
+        sweep(&horizontal, &mut out, height, width, x);
+    }
+    out
+}
+
+/// 1bit ビットマップマスクを 3x3 近傍で 1px 拡張または縮小する。
+///
+/// `dilate=true` は近傍の OR、`false` は近傍の AND を取る。画像端の近傍座標は
+/// 端の画素へ clamp し、補正レイヤーの `local_adjust_morph_alpha_1px` と同じ規約にする。
+/// 寸法が 0 または `mask` が不足している異常入力では、入力を変更せず複製して返す。
+pub fn morph_bitmap_mask_1px(
+    mask: &[bool],
+    width: usize,
+    height: usize,
+    dilate: bool,
+) -> Vec<bool> {
+    let expected_len = width.saturating_mul(height);
+    if width == 0 || height == 0 || mask.len() < expected_len {
+        return mask.to_vec();
+    }
+
+    morph_bitmap_mask(mask, width, height, 1, dilate)
+}
+
+#[inline]
+fn color_within_rgb_tolerance(color: egui::Color32, seed: [u8; 3], tolerance: u8) -> bool {
+    color
+        .r()
+        .abs_diff(seed[0])
+        .max(color.g().abs_diff(seed[1]))
+        .max(color.b().abs_diff(seed[2]))
+        <= tolerance
+}
+
+/// 1 次元の二乗距離変換 (Felzenszwalb & Huttenlocher)。
+///
+/// `f` は各点の初期コスト (種は 0、それ以外は無限大)。放物線の下側包絡線を
+/// 走査で求めるので、長さに比例した時間で厳密なユークリッド二乗距離が出る。
+fn squared_distance_1d(f: &[f64], out: &mut [f64]) {
+    let n = f.len();
+    if n == 0 {
+        return;
+    }
+    // 有限のコストを持つ点だけを放物線の母点にする。無限大どうしの引き算は NaN に
+    // なり、そこから先の包絡線が全部壊れる (種の無い行が必ず現れるのでこれは通る道)。
+    let mut sites: Vec<usize> = Vec::with_capacity(n);
+    let mut bounds: Vec<f64> = Vec::with_capacity(n + 1);
+    for (q, cost) in f.iter().enumerate() {
+        if !cost.is_finite() {
+            continue;
+        }
+        loop {
+            let Some(&last) = sites.last() else {
+                bounds.push(f64::NEG_INFINITY);
+                break;
+            };
+            let (qf, vf) = (q as f64, last as f64);
+            let crossing = ((f[q] + qf * qf) - (f[last] + vf * vf)) / (2.0 * qf - 2.0 * vf);
+            if crossing <= *bounds.last().expect("a site always has a bound") {
+                sites.pop();
+                bounds.pop();
+            } else {
+                bounds.push(crossing);
+                break;
+            }
+        }
+        sites.push(q);
+    }
+
+    if sites.is_empty() {
+        out.fill(f64::INFINITY);
+        return;
+    }
+    bounds.push(f64::INFINITY);
+
+    let mut k = 0usize;
+    for (q, slot) in out.iter_mut().enumerate().take(n) {
+        while bounds[k + 1] < q as f64 {
+            k += 1;
+        }
+        let d = q as f64 - sites[k] as f64;
+        *slot = d * d + f[sites[k]];
+    }
+}
+
+/// 各画素から、`seeds` が立っている最も近い画素までの**二乗**ユークリッド距離。
+///
+/// 半径を整数に丸めずに済ませるためにこれを使う。正方形の近傍だと半径 1 の次が
+/// 2 で、その間が無い。距離で比較すれば 1.4 や 1.7 が意味を持ち、しかも近傍の
+/// 形が円になるので角を余計に削らない。
+fn squared_distance_map(seeds: &[bool], width: usize, height: usize) -> Vec<f64> {
+    let len = width * height;
+    let mut buf: Vec<f64> = (0..len)
+        .map(|i| if seeds[i] { 0.0 } else { f64::INFINITY })
+        .collect();
+
+    let mut column = vec![0.0f64; height];
+    let mut column_out = vec![0.0f64; height];
+    for x in 0..width {
+        for y in 0..height {
+            column[y] = buf[y * width + x];
+        }
+        squared_distance_1d(&column, &mut column_out);
+        for y in 0..height {
+            buf[y * width + x] = column_out[y];
+        }
+    }
+
+    let mut row_out = vec![0.0f64; width];
+    for y in 0..height {
+        let start = y * width;
+        squared_distance_1d(&buf[start..start + width], &mut row_out);
+        buf[start..start + width].copy_from_slice(&row_out);
+    }
+    buf
+}
+
+/// バケツの設定。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BucketFill {
+    /// seed RGB との最大チャンネル差の許容値。
+    pub tolerance: u8,
+    /// seed からつながっている領域だけを対象にするか。
+    pub connected: bool,
+    /// マスクへ書き込む値 (塗る / 消す)。
+    pub value: bool,
+    /// 漏れ止めの半径 (px)。0 以下で無効。**小数を取る**。
+    ///
+    /// **細い通路と小さな隙間から塗りが漏れるのを防ぐ**。塗れる領域をこの半径だけ
+    /// やせさせてから塗り、結果を同じだけ太らせて元の領域と重ねる。
+    /// 幅が `2 * leak_stop` 未満の線や隙間はやせた時点で消えるので塗りが入り込めず、
+    /// 長方形の隅は太らせる段階で回復するので**隅までは塗れる**。
+    /// `connected` が false のときは伝播しないので無視する。
+    ///
+    /// 判定はユークリッド距離で行う。整数の正方近傍だと 1 の次が 2 で、その間が
+    /// 無い上に角を余計に削る。距離なら 1.4 や 1.7 が意味を持ち、近傍の形も円になる。
+    pub leak_stop: f32,
+}
+
+/// バケツの結果。
+///
+/// 「何も起きなかった」を bool の false 1 つで表すと、**押したのに無反応**の理由が
+/// 利用者にも呼び出し側にも分からない。理由を型で返す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketFillOutcome {
+    /// 少なくとも 1 画素が変わった。
+    Filled,
+    /// 対象は決まったが、マスクは既にその値だった。
+    NoChange,
+    /// seed が漏れ止めで消える細さの場所にある。マスクは変えていない。
+    SeedTooThin,
+    /// 寸法 0 / seed が範囲外 / 配列長が足りない。
+    Invalid,
+}
+
+/// seed 色との差が許容内の画素を立てた地図。
+fn bucket_fillable_map(
+    pixels: &[egui::Color32],
+    len: usize,
+    seed: [u8; 3],
+    tolerance: u8,
+) -> Vec<bool> {
+    pixels[..len]
+        .iter()
+        .map(|color| color_within_rgb_tolerance(*color, seed, tolerance))
+        .collect()
+}
+
+/// `fillable` の上を seed から 4 近傍で塗り広げ、届いた範囲を返す。
+///
+/// 1 画素ずつ queue に積まず、走査線の連続区間 (span) 単位で進める。素朴な
+/// per-pixel BFS は 8192px 級で桁違いに遅い。
+fn bucket_reach(
+    fillable: &[bool],
+    width: usize,
+    height: usize,
+    seed_x: usize,
+    seed_y: usize,
+) -> Vec<bool> {
+    let mut reached = vec![false; fillable.len()];
+    if !fillable[seed_y * width + seed_x] {
+        return reached;
+    }
+
+    // 行 `y` の `x` を含む連続区間を塗り、その範囲を返す。
+    let fill_span = |reached: &mut Vec<bool>, y: usize, x: usize| -> (usize, usize) {
+        let row = y * width;
+        let mut start = x;
+        while start > 0 && fillable[row + start - 1] && !reached[row + start - 1] {
+            start -= 1;
+        }
+        let mut end = x + 1;
+        while end < width && fillable[row + end] && !reached[row + end] {
+            end += 1;
+        }
+        for xx in start..end {
+            reached[row + xx] = true;
+        }
+        (start, end)
+    };
+
+    let (start, end) = fill_span(&mut reached, seed_y, seed_x);
+    let mut spans = vec![(seed_y, start, end)];
+    while let Some((y, start, end)) = spans.pop() {
+        for adjacent_y in [y.checked_sub(1), y.checked_add(1).filter(|&yy| yy < height)]
+            .into_iter()
+            .flatten()
+        {
+            let row = adjacent_y * width;
+            let mut x = start;
+            while x < end {
+                if reached[row + x] || !fillable[row + x] {
+                    x += 1;
+                    continue;
+                }
+                let (next_start, next_end) = fill_span(&mut reached, adjacent_y, x);
+                spans.push((adjacent_y, next_start, next_end));
+                x = next_end;
+            }
+        }
+    }
+    reached
+}
+
+/// `reached` を `fillable` の内側だけで 8 近傍に `steps` 段ぶん広げる。
+///
+/// やせさせた分を戻す工程。**距離で太らせると長方形の隅が戻らない**
+/// (隅は斜めなので中心から √2 離れており、半径 1 では届かない)。斜めを 1 歩と
+/// 数える 8 近傍で広げれば隅がちょうど戻る。`fillable` の外へは出ないので、
+/// 障壁を越えることはない。
+///
+/// 前線だけを queue に持つので、段数によらず画素数に比例した時間で終わる。
+fn bucket_regrow(
+    fillable: &[bool],
+    reached: &[bool],
+    width: usize,
+    height: usize,
+    steps: usize,
+) -> Vec<bool> {
+    let mut grown = reached.to_vec();
+    if steps == 0 {
+        return grown;
+    }
+    let mut frontier: Vec<usize> = grown
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, on)| on.then_some(idx))
+        .collect();
+    for _ in 0..steps {
+        if frontier.is_empty() {
+            break;
+        }
+        let mut next = Vec::new();
+        for idx in frontier {
+            let (x, y) = (idx % width, idx / width);
+            let x0 = x.saturating_sub(1);
+            let x1 = (x + 1).min(width - 1);
+            let y0 = y.saturating_sub(1);
+            let y1 = (y + 1).min(height - 1);
+            for yy in y0..=y1 {
+                for xx in x0..=x1 {
+                    let n = yy * width + xx;
+                    if !grown[n] && fillable[n] {
+                        grown[n] = true;
+                        next.push(n);
+                    }
+                }
+            }
+        }
+        frontier = next;
+    }
+    grown
+}
+
+/// seed 色に近い画素へ 1bit マスクを書き込む。
+///
+/// `connected` で seed からつながる範囲だけに絞り、`leak_stop` で細い通路と
+/// 小さな隙間からの漏れを止める。alpha は色差判定に使わない。
+pub fn flood_fill_bitmap_mask(
+    mask: &mut [bool],
+    image: &egui::ColorImage,
+    seed_x: usize,
+    seed_y: usize,
+    fill: BucketFill,
+) -> BucketFillOutcome {
+    let [width, height] = image.size;
+    let expected_len = width.saturating_mul(height);
+    if width == 0
+        || height == 0
+        || seed_x >= width
+        || seed_y >= height
+        || mask.len() < expected_len
+        || image.pixels.len() < expected_len
+    {
+        return BucketFillOutcome::Invalid;
+    }
+
+    let seed_color = image.pixels[seed_y * width + seed_x];
+    let seed = [seed_color.r(), seed_color.g(), seed_color.b()];
+    let fillable = bucket_fillable_map(&image.pixels, expected_len, seed, fill.tolerance);
+
+    let region = if !fill.connected {
+        fillable
+    } else if !(fill.leak_stop > 0.0) {
+        bucket_reach(&fillable, width, height, seed_x, seed_y)
+    } else {
+        // やせさせて塗り、太らせて元の領域と重ねる。やせた地図で seed が消えるのは
+        // 「漏れ止めより細い場所を指した」ということなので、黙って何もしない代わりに
+        // 理由を返す。
+        let radius = f64::from(fill.leak_stop);
+        let radius_sq = radius * radius;
+        // 画像の外は障壁として数えない。端に接した領域が端から削れると、
+        // 「画面いっぱいの背景を塗る」がいきなり効かなくなる。
+        let barrier: Vec<bool> = fillable.iter().map(|inside| !*inside).collect();
+        let to_barrier = squared_distance_map(&barrier, width, height);
+        let narrowed: Vec<bool> = fillable
+            .iter()
+            .zip(&to_barrier)
+            .map(|(inside, distance)| *inside && *distance > radius_sq)
+            .collect();
+        if !narrowed[seed_y * width + seed_x] {
+            return BucketFillOutcome::SeedTooThin;
+        }
+        let reached = bucket_reach(&narrowed, width, height, seed_x, seed_y);
+        // 戻す量は段数 (整数)。小数の効き目はやせさせる側にある — 「どこが細すぎるか」を
+        // 決めるのはそちらで、戻す工程は `fillable` で頭打ちになるため。
+        bucket_regrow(
+            &fillable,
+            &reached,
+            width,
+            height,
+            radius.ceil().max(0.0) as usize,
+        )
+    };
+
+    let mut changed = false;
+    for (idx, inside) in region.into_iter().enumerate() {
+        if inside && mask[idx] != fill.value {
+            mask[idx] = fill.value;
+            changed = true;
+        }
+    }
+    if changed {
+        BucketFillOutcome::Filled
+    } else {
+        BucketFillOutcome::NoChange
+    }
+}
+
 /// ブラシ線分が触れうる画像内 bbox を半開区間で返す。
 pub fn brush_line_bbox(
     w: usize,
@@ -1197,6 +1603,508 @@ pub fn rescale_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn color_image(colors: &[egui::Color32], width: usize, height: usize) -> egui::ColorImage {
+        egui::ColorImage::new([width, height], colors.to_vec())
+    }
+
+    #[test]
+    fn bitmap_mask_morph_1px_uses_clamped_3x3_neighbors() {
+        let corner = vec![
+            true, false, false, //
+            false, false, false, //
+            false, false, false,
+        ];
+        assert_eq!(
+            morph_bitmap_mask_1px(&corner, 3, 3, true),
+            vec![
+                true, true, false, //
+                true, true, false, //
+                false, false, false,
+            ]
+        );
+
+        let center = vec![
+            false, false, false, //
+            false, true, false, //
+            false, false, false,
+        ];
+        assert_eq!(morph_bitmap_mask_1px(&center, 3, 3, true), vec![true; 9]);
+        assert_eq!(morph_bitmap_mask_1px(&center, 3, 3, false), vec![false; 9]);
+    }
+
+    #[test]
+    fn bitmap_mask_morph_1px_preserves_abnormal_zero_dimensions() {
+        let src = vec![true, false];
+        assert_eq!(morph_bitmap_mask_1px(&src, 0, 2, true), src);
+        assert_eq!(morph_bitmap_mask_1px(&src, 2, 0, false), src);
+    }
+
+    #[test]
+    fn bitmap_mask_flood_fill_connected_stays_in_seed_component() {
+        let red = egui::Color32::from_rgb(100, 20, 30);
+        let blue = egui::Color32::from_rgb(20, 30, 100);
+        let image = color_image(&[red, red, blue, red, red], 5, 1);
+        let mut mask = vec![false; 5];
+
+        assert_eq!(
+            flood_fill_bitmap_mask(
+                &mut mask,
+                &image,
+                0,
+                0,
+                BucketFill {
+                    tolerance: 0,
+                    connected: true,
+                    value: true,
+                    leak_stop: 0.0,
+                },
+            ),
+            BucketFillOutcome::Filled
+        );
+        assert_eq!(mask, vec![true, true, false, false, false]);
+
+        assert_eq!(
+            flood_fill_bitmap_mask(
+                &mut mask,
+                &image,
+                0,
+                0,
+                BucketFill {
+                    tolerance: 0,
+                    connected: true,
+                    value: false,
+                    leak_stop: 0.0,
+                },
+            ),
+            BucketFillOutcome::Filled
+        );
+        assert_eq!(mask, vec![false; 5]);
+    }
+
+    /// スキャンライン span fill が壊れるときの典型は、行を跨いで**回り込む**形。
+    /// 1 行ずつ span を積む実装は、親 span より外へ伸びた先の枝を落としやすい。
+    ///
+    /// 下の U 字は、seed から下へ降り、底を渡り、反対側を**上へ戻る**必要がある。
+    /// 右の柱が塗り残っていたら、隣接行の走査範囲が親 span に閉じている。
+    /// 漏れ止め: 長方形の隅までは塗り、つながった細い線へは漏れない。
+    ///
+    /// これがバケツの実用上の要。**やせさせて塗り、太らせて元の領域と重ねる**ので、
+    /// 幅が 2*leak_stop 未満の通路は消えて入り込めず、隅は復元される。
+    #[test]
+    fn leak_stop_fills_a_box_to_its_corners_without_entering_a_thin_neck() {
+        let ink = egui::Color32::from_rgb(10, 10, 10);
+        let paper = egui::Color32::WHITE;
+        // 7x7 の白い箱の右辺から、幅 1 の白い通路が外へ伸びている。
+        let rows = [
+            "..........",
+            ".XXXXXXX..",
+            ".XXXXXXX..",
+            ".XXXXXXXXX",
+            ".XXXXXXX..",
+            ".XXXXXXX..",
+            ".XXXXXXX..",
+            "..........",
+        ];
+        let (w, h) = (10, 8);
+        let colors: Vec<egui::Color32> = rows
+            .iter()
+            .flat_map(|row| row.chars())
+            .map(|c| if c == 'X' { paper } else { ink })
+            .collect();
+        let image = color_image(&colors, w, h);
+
+        let leaky = {
+            let mut mask = vec![false; w * h];
+            flood_fill_bitmap_mask(
+                &mut mask,
+                &image,
+                3,
+                3,
+                BucketFill {
+                    tolerance: 0,
+                    connected: true,
+                    value: true,
+                    leak_stop: 0.0,
+                },
+            );
+            mask
+        };
+        assert!(leaky[3 * w + 9], "without leak stop the neck is filled");
+
+        let mut mask = vec![false; w * h];
+        let outcome = flood_fill_bitmap_mask(
+            &mut mask,
+            &image,
+            3,
+            3,
+            BucketFill {
+                tolerance: 0,
+                connected: true,
+                value: true,
+                leak_stop: 1.0,
+            },
+        );
+        assert_eq!(outcome, BucketFillOutcome::Filled);
+
+        // 箱の四隅まで塗れていること。太らせて元の領域と重ねる段で戻るのが要点。
+        for (x, y) in [(1, 1), (7, 1), (1, 6), (7, 6)] {
+            assert!(mask[y * w + x], "the box corner ({x},{y}) must be filled");
+        }
+        // 通路を伝って進んでいないこと。
+        //
+        // 入口の 1 画素は戻す工程の届く範囲なので塗られる。防ぎたいのは
+        // 「線をたどって外まで流れる」ことで、接合部が 1 画素太るのは実用上見えない。
+        assert!(!mask[3 * w + 9], "the fill must not run along the neck");
+    }
+
+    /// 半径が小数で効くこと。1 と 2 の間が無いと、実際の絵で「1 では漏れるが
+    /// 2 では細すぎると言われる」に挟まれて使えない (利用者報告 2026-08-13)。
+    #[test]
+    fn a_fractional_leak_stop_lands_between_the_whole_ones() {
+        let ink = egui::Color32::from_rgb(10, 10, 10);
+        let paper = egui::Color32::WHITE;
+        // 幅 3 の帯。半径 1 なら芯が残り、半径 2 なら消える。1.5 は 1 と同じ側。
+        let rows = ["XXXXX", "XXXXX", "XXXXX"];
+        let colors: Vec<egui::Color32> = rows
+            .iter()
+            .flat_map(|row| row.chars())
+            .map(|c| if c == 'X' { paper } else { ink })
+            .collect();
+        let image = color_image(&colors, 5, 3);
+
+        let outcome = |leak_stop: f32| {
+            let mut mask = vec![false; 15];
+            flood_fill_bitmap_mask(
+                &mut mask,
+                &image,
+                2,
+                1,
+                BucketFill {
+                    tolerance: 0,
+                    connected: true,
+                    value: true,
+                    leak_stop,
+                },
+            )
+        };
+
+        // 画像の端は障壁として数えないので、この帯はどの半径でも塗れる。
+        // 小数が「同じ整数に丸められて無視される」ことだけを見る。
+        assert_eq!(outcome(1.0), BucketFillOutcome::Filled);
+        assert_eq!(outcome(1.5), BucketFillOutcome::Filled);
+
+        // 障壁で囲むと半径が効き始める。
+        let framed = [".....", ".XXX.", "....."];
+        let colors: Vec<egui::Color32> = framed
+            .iter()
+            .flat_map(|row| row.chars())
+            .map(|c| if c == 'X' { paper } else { ink })
+            .collect();
+        let image = color_image(&colors, 5, 3);
+        let framed_outcome = |leak_stop: f32| {
+            let mut mask = vec![false; 15];
+            flood_fill_bitmap_mask(
+                &mut mask,
+                &image,
+                2,
+                1,
+                BucketFill {
+                    tolerance: 0,
+                    connected: true,
+                    value: true,
+                    leak_stop,
+                },
+            )
+        };
+        // 高さ 1 の帯は、半径がどれだけ小さくても 1 を超えれば消える。
+        assert_eq!(framed_outcome(0.5), BucketFillOutcome::Filled);
+        assert_eq!(framed_outcome(1.5), BucketFillOutcome::SeedTooThin);
+    }
+
+    /// 漏れ止めより細い場所を指したら、黙って何もしないのではなく理由を返す。
+    #[test]
+    fn a_seed_thinner_than_the_leak_stop_reports_why_nothing_happened() {
+        let ink = egui::Color32::from_rgb(10, 10, 10);
+        let paper = egui::Color32::WHITE;
+        let colors: Vec<egui::Color32> = "..X....X....X.."
+            .chars()
+            .map(|c| if c == 'X' { paper } else { ink })
+            .collect();
+        let image = color_image(&colors, 5, 3);
+        let mut mask = vec![false; 15];
+
+        let outcome = flood_fill_bitmap_mask(
+            &mut mask,
+            &image,
+            2,
+            1,
+            BucketFill {
+                tolerance: 0,
+                connected: true,
+                value: true,
+                leak_stop: 2.0,
+            },
+        );
+        assert_eq!(outcome, BucketFillOutcome::SeedTooThin);
+        assert!(mask.iter().all(|v| !*v), "a refused fill must not write");
+    }
+
+    #[test]
+    fn bitmap_mask_flood_fill_connected_walks_around_a_concave_region() {
+        let ink = egui::Color32::from_rgb(10, 10, 10);
+        let paper = egui::Color32::WHITE;
+        let (w, h) = (7, 5);
+        let rows = [
+            "X.....X", //
+            "X.....X", //
+            "X.....X", //
+            "XXXXXXX", //
+            ".......",
+        ];
+        let colors: Vec<egui::Color32> = rows
+            .iter()
+            .flat_map(|row| row.chars())
+            .map(|c| if c == 'X' { ink } else { paper })
+            .collect();
+        let image = color_image(&colors, w, h);
+        let mut mask = vec![false; w * h];
+
+        assert_eq!(
+            flood_fill_bitmap_mask(
+                &mut mask,
+                &image,
+                0,
+                0,
+                BucketFill {
+                    tolerance: 0,
+                    connected: true,
+                    value: true,
+                    leak_stop: 0.0,
+                },
+            ),
+            BucketFillOutcome::Filled
+        );
+
+        let expected: Vec<bool> = rows
+            .iter()
+            .flat_map(|row| row.chars())
+            .map(|c| c == 'X')
+            .collect();
+        assert_eq!(
+            mask, expected,
+            "the far column must be reached around the U"
+        );
+    }
+
+    /// 隣接行の一致範囲が親 span より**広い**場合、左右へ伸ばし切ること。
+    /// 親の範囲だけを塗ると、下の行の両端が残る。
+    #[test]
+    fn bitmap_mask_flood_fill_connected_widens_past_the_parent_span() {
+        let ink = egui::Color32::from_rgb(10, 10, 10);
+        let paper = egui::Color32::WHITE;
+        let colors: Vec<egui::Color32> = "..X..XXXXX"
+            .chars()
+            .map(|c| if c == 'X' { ink } else { paper })
+            .collect();
+        let image = color_image(&colors, 5, 2);
+        let mut mask = vec![false; 10];
+
+        assert_eq!(
+            flood_fill_bitmap_mask(
+                &mut mask,
+                &image,
+                2,
+                0,
+                BucketFill {
+                    tolerance: 0,
+                    connected: true,
+                    value: true,
+                    leak_stop: 0.0,
+                },
+            ),
+            BucketFillOutcome::Filled
+        );
+
+        assert_eq!(
+            mask,
+            vec![
+                false, false, true, false, false, true, true, true, true, true
+            ]
+        );
+    }
+
+    #[test]
+    fn bitmap_mask_flood_fill_connected_uses_four_neighbors() {
+        let red = egui::Color32::from_rgb(100, 20, 30);
+        let blue = egui::Color32::from_rgb(20, 30, 100);
+        let image = color_image(&[red, blue, blue, red], 2, 2);
+        let mut mask = vec![false; 4];
+
+        assert_eq!(
+            flood_fill_bitmap_mask(
+                &mut mask,
+                &image,
+                0,
+                0,
+                BucketFill {
+                    tolerance: 0,
+                    connected: true,
+                    value: true,
+                    leak_stop: 0.0,
+                },
+            ),
+            BucketFillOutcome::Filled
+        );
+        assert_eq!(mask, vec![true, false, false, false]);
+    }
+
+    #[test]
+    fn bitmap_mask_flood_fill_non_connected_matches_all_components() {
+        let red = egui::Color32::from_rgb(100, 20, 30);
+        let blue = egui::Color32::from_rgb(20, 30, 100);
+        let image = color_image(&[red, red, blue, red, red], 5, 1);
+        let mut mask = vec![false; 5];
+
+        assert_eq!(
+            flood_fill_bitmap_mask(
+                &mut mask,
+                &image,
+                0,
+                0,
+                BucketFill {
+                    tolerance: 0,
+                    connected: false,
+                    value: true,
+                    leak_stop: 0.0,
+                },
+            ),
+            BucketFillOutcome::Filled
+        );
+        assert_eq!(mask, vec![true, true, false, true, true]);
+    }
+
+    #[test]
+    fn bitmap_mask_flood_fill_tolerance_boundary_is_inclusive() {
+        let image = color_image(
+            &[
+                egui::Color32::from_rgb(100, 100, 100),
+                egui::Color32::from_rgb(110, 90, 100),
+                egui::Color32::from_rgb(100, 100, 111),
+            ],
+            3,
+            1,
+        );
+        let mut mask = vec![false; 3];
+
+        assert_eq!(
+            flood_fill_bitmap_mask(
+                &mut mask,
+                &image,
+                0,
+                0,
+                BucketFill {
+                    tolerance: 10,
+                    connected: false,
+                    value: true,
+                    leak_stop: 0.0,
+                },
+            ),
+            BucketFillOutcome::Filled
+        );
+        assert_eq!(mask, vec![true, true, false]);
+    }
+
+    #[test]
+    fn bitmap_mask_flood_fill_rejects_zero_dimensions() {
+        let width_zero = egui::ColorImage::new([0, 2], Vec::new());
+        let height_zero = egui::ColorImage::new([2, 0], Vec::new());
+        let mut mask = Vec::new();
+        let fill = BucketFill {
+            tolerance: 0,
+            connected: true,
+            value: true,
+            leak_stop: 0.0,
+        };
+        assert_eq!(
+            flood_fill_bitmap_mask(&mut mask, &width_zero, 0, 0, fill),
+            BucketFillOutcome::Invalid
+        );
+        assert_eq!(
+            flood_fill_bitmap_mask(
+                &mut mask,
+                &height_zero,
+                0,
+                0,
+                BucketFill {
+                    connected: false,
+                    ..fill
+                },
+            ),
+            BucketFillOutcome::Invalid
+        );
+    }
+
+    #[test]
+    #[ignore = "8192x8192 performance measurement; run explicitly with --release"]
+    fn bitmap_mask_flood_fill_8192_worst_case_benchmark() {
+        const SIDE: usize = 8192;
+        let image = egui::ColorImage::new(
+            [SIDE, SIDE],
+            vec![egui::Color32::from_rgb(80, 120, 160); SIDE * SIDE],
+        );
+        let mut mask = vec![false; SIDE * SIDE];
+        let mut connected_times = Vec::new();
+        let mut non_connected_times = Vec::new();
+
+        for _ in 0..3 {
+            mask.fill(false);
+            let started = std::time::Instant::now();
+            assert_eq!(
+                flood_fill_bitmap_mask(
+                    &mut mask,
+                    &image,
+                    0,
+                    0,
+                    BucketFill {
+                        tolerance: 0,
+                        connected: true,
+                        value: true,
+                        leak_stop: 0.0,
+                    },
+                ),
+                BucketFillOutcome::Filled
+            );
+            connected_times.push(started.elapsed());
+
+            mask.fill(false);
+            let started = std::time::Instant::now();
+            assert_eq!(
+                flood_fill_bitmap_mask(
+                    &mut mask,
+                    &image,
+                    0,
+                    0,
+                    BucketFill {
+                        tolerance: 0,
+                        connected: false,
+                        value: true,
+                        leak_stop: 0.0,
+                    },
+                ),
+                BucketFillOutcome::Filled
+            );
+            non_connected_times.push(started.elapsed());
+        }
+
+        assert!(mask[0] && mask[SIDE * SIDE - 1]);
+        connected_times.sort_unstable();
+        non_connected_times.sort_unstable();
+        eprintln!(
+            "8192x8192 median: connected={:?}, non_connected={:?}; runs={connected_times:?}/{non_connected_times:?}",
+            connected_times[1], non_connected_times[1]
+        );
+    }
 
     #[test]
     fn roundtrip_compress() {

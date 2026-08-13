@@ -14,23 +14,30 @@ wait_until(|s|
         && s.target_rendered
         && s.focused
         && !s.is_fullscreen
+        && s.items_len > 0
+        && s.pending_thumbs == 0
         && !s.modal_open
         && !s.popup_open,
     60000
 );
-// `pending_thumbs == 0` is also true before the folder has requested anything
-// (backlog 1.70), so give the grid a moment rather than trusting it alone.
-sleep(1500);
 
 log("continuous-video: open the first page in fullscreen");
 tap_key("Enter");
+// `fullscreen_raw_key_permit` is the signal that the fullscreen viewport has
+// actually taken over key handling. Without it the foreground can still be
+// mid-handover and the next key has nowhere registered to go.
 wait_until(
-    |s| s.is_fullscreen && s.target_rendered && s.focused && s.current_is_still_image,
+    |s| s.is_fullscreen
+        && s.target_registered
+        && s.focused
+        && s.current_is_still_image
+        && s.fullscreen_raw_key_permit,
     30000,
 );
 
+// tap_key only speaks navigation keys, so cycle the reading flow by action.
 log("continuous-video: turn on continuous reading");
-tap_key("6");
+run_action("FsReadingFlowCycle");
 wait_until(|s| s.continuous_reading, 10000);
 
 // Walk forward with the cross-axis key. In vertical continuous reading that
@@ -43,22 +50,29 @@ while steps < 11 {
     steps += 1;
 }
 
-// CHECK 1: does the cross-axis key land on the video at all?
-// A timeout here means the keys already skip videos and there is nothing to fix
-// beyond writing that down.
-log("continuous-video: check 1 - did we land on a non-still item?");
-wait_until(|s| s.is_fullscreen && !s.current_is_still_image, 8000);
-log("continuous-video: landed on a non-still item");
+// The cross-axis key must walk past the video without entering it. Before the
+// fix this landed on the video, and the way back was not the key that got you
+// there: the video context has no plain Left or Right at all.
+log("continuous-video: check - we walked past the video without entering it");
+wait_until(|s| s.is_fullscreen && s.current_is_still_image, 8000);
 
-// CHECK 2: does the reverse key bring the still image back?
-// A timeout here reproduces the report.
-log("continuous-video: check 2 - can the reverse key return?");
-tap_key("Left");
-wait_until(|s| s.current_is_still_image, 10000);
-log("continuous-video: returned to a still image");
+// Walk the rest of the folder and back, to be sure the skip did not strand us.
+log("continuous-video: walk to the end and back");
+let more = 0;
+while more < 6 {
+    tap_key("Right");
+    sleep(200);
+    more += 1;
+}
+wait_until(|s| s.is_fullscreen && s.current_is_still_image, 8000);
 
-// CHECK 3: is the continuous session still intact after the round trip?
-log("continuous-video: check 3 - is continuous reading still on?");
+let back = 0;
+while back < 17 {
+    tap_key("Left");
+    sleep(200);
+    back += 1;
+}
+wait_until(|s| s.is_fullscreen && s.current_is_still_image, 8000);
 wait_until(|s| s.continuous_reading, 5000);
 
-log("continuous-video: round trip completed, the report did not reproduce here");
+log("continuous-video: the video never took the view, in either direction");

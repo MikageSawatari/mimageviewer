@@ -644,7 +644,7 @@ impl App {
             self.nudge_conceal(dx, dy);
         }
 
-        // ツール切替: S/B/L/P/I/V/H/R/O
+        // ツール切替: S/B/K/L/P/I/V/H/R/O
         let mut switched: Option<ConcealTool> = None;
         if self
             .keymap
@@ -654,6 +654,12 @@ impl App {
         }
         if self.keymap.consume_action(ctx, KeyAction::ConcealToolBrush) {
             switched = Some(ConcealTool::Brush);
+        }
+        if self
+            .keymap
+            .consume_action(ctx, KeyAction::ConcealToolBucket)
+        {
+            switched = Some(ConcealTool::Bucket);
         }
         if self.keymap.consume_action(ctx, KeyAction::ConcealToolLasso) {
             switched = Some(ConcealTool::Lasso);
@@ -866,6 +872,87 @@ impl App {
         }
     }
 
+    fn apply_conceal_bitmap_morph_1px(&mut self, dilate: bool) {
+        let [w, h] = self.conceal_mask_size;
+        let Some(mask) = self.conceal_mask.as_ref() else {
+            return;
+        };
+        let next = crate::mask_db::morph_bitmap_mask_1px(mask, w, h, dilate);
+        if mask.as_slice() == next.as_slice() {
+            return;
+        }
+
+        self.push_conceal_undo();
+        self.conceal_mask = Some(next);
+        self.mark_conceal_mask_texture_dirty(None);
+        if let Some(fs_idx) = self.fullscreen_idx {
+            self.clear_conceal_caches(fs_idx);
+        }
+        self.show_feedback_toast(
+            if dilate {
+                "手動マスクを1px拡張しました。"
+            } else {
+                "手動マスクを1px縮小しました。"
+            }
+            .to_string(),
+        );
+    }
+
+    fn apply_conceal_bucket(&mut self, fs_idx: usize, seed_x: usize, seed_y: usize) {
+        let Some((source, _)) = self.current_conceal_source_pixels(fs_idx) else {
+            self.show_feedback_toast(
+                "バケツに使う加工前の画像を準備中です。少し待ってからもう一度クリックしてください。"
+                    .to_string(),
+            );
+            return;
+        };
+        let [w, h] = self.conceal_mask_size;
+        if source.size != [w, h] {
+            self.show_feedback_toast(
+                "バケツに使う画像の準備が完了していません。もう一度クリックしてください。"
+                    .to_string(),
+            );
+            return;
+        }
+        let Some(mask) = self.conceal_mask.as_ref() else {
+            self.show_feedback_toast(
+                "バケツに使うマスクを準備中です。少し待ってからもう一度クリックしてください。"
+                    .to_string(),
+            );
+            return;
+        };
+
+        let mut next = mask.clone();
+        let outcome = crate::mask_db::flood_fill_bitmap_mask(
+            &mut next,
+            &source,
+            seed_x,
+            seed_y,
+            crate::mask_db::BucketFill {
+                tolerance: self.conceal_bucket_tolerance.round().clamp(0.0, 255.0) as u8,
+                connected: self.conceal_bucket_connected,
+                value: self.conceal_paint_mode,
+                leak_stop: self.conceal_bucket_leak_stop.max(0.0),
+            },
+        );
+        match outcome {
+            crate::mask_db::BucketFillOutcome::Filled => {}
+            crate::mask_db::BucketFillOutcome::SeedTooThin => {
+                self.show_feedback_toast(
+                    "漏れ止めより細い場所です。漏れ止めを小さくしてください。".to_string(),
+                );
+                return;
+            }
+            crate::mask_db::BucketFillOutcome::NoChange
+            | crate::mask_db::BucketFillOutcome::Invalid => return,
+        }
+
+        self.push_conceal_undo();
+        self.conceal_mask = Some(next);
+        self.mark_conceal_mask_texture_dirty(None);
+        self.clear_conceal_caches(fs_idx);
+    }
+
     // ── マスクテクスチャ ──────────────────────────────────────────
 
     fn mark_conceal_mask_texture_dirty(&mut self, dirty: Option<MaskDirtyRect>) {
@@ -968,6 +1055,7 @@ impl App {
         match tool {
             ConcealTool::Select => "選択",
             ConcealTool::Brush => "筆",
+            ConcealTool::Bucket => "バケツ",
             ConcealTool::Lasso => "囲み",
             ConcealTool::Polygon => "多角形",
             ConcealTool::Line => "直線",
@@ -982,6 +1070,7 @@ impl App {
         match tool {
             ConcealTool::Select => KeyAction::ConcealToolSelect,
             ConcealTool::Brush => KeyAction::ConcealToolBrush,
+            ConcealTool::Bucket => KeyAction::ConcealToolBucket,
             ConcealTool::Lasso => KeyAction::ConcealToolLasso,
             ConcealTool::Polygon => KeyAction::ConcealToolPolygon,
             ConcealTool::Line => KeyAction::ConcealToolLine,
@@ -1112,6 +1201,29 @@ impl App {
         // ツールを切り替えずに描き続けている間は、直近 shape の選択を保持して
         // ハンドル操作 (= 太さ・サイズ・回転の微調整) を許可する。
 
+        // バケツは明示クリック 1 回だけを処理する。共通ハンドル処理より先に分岐し、
+        // 選択中のベクタ図形を障壁にも編集対象にもしない。
+        if self.conceal_tool == ConcealTool::Bucket {
+            if primary_pressed
+                && let Some(pos) = pointer_pos
+                && let Some(img_pos) = self.conceal_screen_to_image(pos, transform, true)
+            {
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    self.apply_conceal_bucket(
+                        fs_idx,
+                        img_pos.0.floor() as usize,
+                        img_pos.1.floor() as usize,
+                    );
+                } else {
+                    self.show_feedback_toast(
+                        "バケツの対象画像を確認できません。画像を開き直してからもう一度クリックしてください。"
+                            .to_string(),
+                    );
+                }
+            }
+            return;
+        }
+
         // ── 共通ハンドル処理 (ツール非依存): 直近 shape のハンドルが操作中なら
         //    そちらを優先処理して、新規 shape 作成側に流さない。
         //
@@ -1151,6 +1263,7 @@ impl App {
                     transform,
                 );
             }
+            ConcealTool::Bucket => {}
             ConcealTool::Lasso => {
                 self.handle_lasso_tool(
                     primary_down,
@@ -2102,9 +2215,12 @@ impl App {
                                         let bitmap_rows: &[&[(ConcealTool, &str)]] = &[
                                             &[
                                                 (ConcealTool::Brush, "筆"),
-                                                (ConcealTool::Lasso, "囲み"),
+                                                (ConcealTool::Bucket, "バケツ"),
                                             ],
-                                            &[(ConcealTool::Polygon, "多角形")],
+                                            &[
+                                                (ConcealTool::Lasso, "囲み"),
+                                                (ConcealTool::Polygon, "多角形"),
+                                            ],
                                         ];
                                         for row in bitmap_rows {
                                             ui.horizontal(|ui| {
@@ -2126,6 +2242,31 @@ impl App {
                                                 }
                                             });
                                         }
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 4.0;
+                                            if ui
+                                                .add_sized(btn_size, egui::Button::new("1px拡張"))
+                                                .clicked()
+                                            {
+                                                self.apply_conceal_bitmap_morph_1px(true);
+                                            }
+                                            if ui
+                                                .add_sized(btn_size, egui::Button::new("1px縮小"))
+                                                .clicked()
+                                            {
+                                                self.apply_conceal_bitmap_morph_1px(false);
+                                            }
+                                        });
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(
+                                                    "ビットマップ本体のみ。オブジェクトには影響しません。",
+                                                )
+                                                .size(10.0)
+                                                .color(egui::Color32::from_gray(150)),
+                                            )
+                                            .wrap(),
+                                        );
                                         ui.label(
                                             egui::RichText::new("オブジェクト:")
                                                 .color(egui::Color32::from_gray(200)),
@@ -2207,6 +2348,42 @@ impl App {
                                                     .text("ブラシ半径"),
                                                 );
                                                 self.settings.conceal_brush_radius = r;
+                                            }
+                                            ConcealTool::Bucket => {
+                                                ui.separator();
+                                                ui.add(
+                                                    egui::Slider::new(
+                                                        &mut self.conceal_bucket_tolerance,
+                                                        0.0..=255.0,
+                                                    )
+                                                    .text("色差の許容値")
+                                                    .step_by(1.0),
+                                                );
+                                                ui.checkbox(
+                                                    &mut self.conceal_bucket_connected,
+                                                    "隣接のみ",
+                                                );
+                                                if self.conceal_bucket_connected {
+                                                    ui.add(
+                                                        egui::Slider::new(
+                                                            &mut self.conceal_bucket_leak_stop,
+                                                            0.0..=16.0
+                                                        )
+                                                        .text("漏れ止め")
+                                                        .step_by(0.1),
+                                                    )
+                                                    .on_hover_text("細い線や小さな隙間から塗りが漏れるのを防ぎます。0 で無効。");
+                                                }
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(
+                                                            "画像をクリックしたときに1回だけ塗りつぶします。",
+                                                        )
+                                                        .size(10.0)
+                                                        .color(egui::Color32::from_gray(150)),
+                                                    )
+                                                    .wrap(),
+                                                );
                                             }
                                             ConcealTool::Line
                                             | ConcealTool::VertLine
@@ -2700,7 +2877,17 @@ fn conceal_preview_pointer_state(
 
 #[cfg(test)]
 mod tests {
-    use super::{conceal_preview_pointer_active, conceal_preview_pointer_state};
+    use super::{
+        App, ConcealTool, KeyAction, conceal_preview_pointer_active, conceal_preview_pointer_state,
+    };
+
+    #[test]
+    fn conceal_bucket_tool_maps_to_bucket_key_action() {
+        assert_eq!(
+            App::conceal_tool_key_action(ConcealTool::Bucket),
+            KeyAction::ConcealToolBucket
+        );
+    }
 
     #[test]
     fn conceal_preview_pointer_state_is_available_before_panel_draw() {

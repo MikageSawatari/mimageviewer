@@ -205,6 +205,8 @@ pub enum ConcealTool {
     /// 筆 (B): 円形ブラシで自由塗り、ビットマップに反映
     #[default]
     Brush,
+    /// バケツ (K): クリックした画素の色差に基づいてビットマップを塗りつぶす
+    Bucket,
     /// 囲み (L): 多角形を描き内側を塗りつぶす、ビットマップに反映
     Lasso,
     /// 多角形 (P): クリックで頂点を置き内側を塗りつぶす、ビットマップに反映
@@ -226,6 +228,7 @@ impl ConcealTool {
         match self {
             ConcealTool::Select => "選 [S]",
             ConcealTool::Brush => "筆 [B]",
+            ConcealTool::Bucket => "塗 [K]",
             ConcealTool::Lasso => "囲 [L]",
             ConcealTool::Polygon => "多 [P]",
             ConcealTool::Line => "直 [I]",

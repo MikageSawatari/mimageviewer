@@ -1726,6 +1726,7 @@ pub enum KeyAction {
     EraseDeleteShape,
     EraseToolSelect,
     EraseToolBrush,
+    EraseToolBucket,
     EraseToolLasso,
     EraseToolPolygon,
     EraseToolVLine,
@@ -1750,6 +1751,7 @@ pub enum KeyAction {
     ConcealEraseMode,
     ConcealToolSelect,
     ConcealToolBrush,
+    ConcealToolBucket,
     ConcealToolLasso,
     ConcealToolPolygon,
     ConcealToolLine,
@@ -1769,6 +1771,7 @@ pub enum KeyAction {
     LaPaintAdd,
     LaPaintErase,
     LaToolBrush,
+    LaToolBucket,
     LaToolEdgeBrush,
     LaToolGapFill,
     LaToolLasso,
@@ -2151,6 +2154,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::EraseDeleteShape,
     KeyAction::EraseToolSelect,
     KeyAction::EraseToolBrush,
+    KeyAction::EraseToolBucket,
     KeyAction::EraseToolLasso,
     KeyAction::EraseToolPolygon,
     KeyAction::EraseToolVLine,
@@ -2175,6 +2179,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::ConcealEraseMode,
     KeyAction::ConcealToolSelect,
     KeyAction::ConcealToolBrush,
+    KeyAction::ConcealToolBucket,
     KeyAction::ConcealToolLasso,
     KeyAction::ConcealToolPolygon,
     KeyAction::ConcealToolLine,
@@ -2194,6 +2199,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::LaPaintAdd,
     KeyAction::LaPaintErase,
     KeyAction::LaToolBrush,
+    KeyAction::LaToolBucket,
     KeyAction::LaToolEdgeBrush,
     KeyAction::LaToolGapFill,
     KeyAction::LaToolLasso,
@@ -3666,6 +3672,7 @@ impl KeyAction {
             EraseDeleteShape => "EraseDeleteShape",
             EraseToolSelect => "EraseToolSelect",
             EraseToolBrush => "EraseToolBrush",
+            EraseToolBucket => "EraseToolBucket",
             EraseToolLasso => "EraseToolLasso",
             EraseToolPolygon => "EraseToolPolygon",
             EraseToolVLine => "EraseToolVLine",
@@ -3690,6 +3697,7 @@ impl KeyAction {
             ConcealEraseMode => "ConcealEraseMode",
             ConcealToolSelect => "ConcealToolSelect",
             ConcealToolBrush => "ConcealToolBrush",
+            ConcealToolBucket => "ConcealToolBucket",
             ConcealToolLasso => "ConcealToolLasso",
             ConcealToolPolygon => "ConcealToolPolygon",
             ConcealToolLine => "ConcealToolLine",
@@ -3709,6 +3717,7 @@ impl KeyAction {
             LaPaintAdd => "LaPaintAdd",
             LaPaintErase => "LaPaintErase",
             LaToolBrush => "LaToolBrush",
+            LaToolBucket => "LaToolBucket",
             LaToolEdgeBrush => "LaToolEdgeBrush",
             LaToolGapFill => "LaToolGapFill",
             LaToolLasso => "LaToolLasso",
@@ -4217,6 +4226,7 @@ impl KeyAction {
             EraseDeleteShape => "選択中の消しゴム図形を削除する",
             EraseToolSelect => "選択ツールに切り替える",
             EraseToolBrush => "筆ツールに切り替える",
+            EraseToolBucket => "バケツツールに切り替える",
             EraseToolLasso => "囲みツールに切り替える",
             EraseToolPolygon => "多角形ツールに切り替える",
             EraseToolVLine => "縦線ツールに切り替える",
@@ -4241,6 +4251,7 @@ impl KeyAction {
             ConcealEraseMode => "消去モードに切り替える",
             ConcealToolSelect => "選択ツールに切り替える",
             ConcealToolBrush => "筆ツールに切り替える",
+            ConcealToolBucket => "バケツツールに切り替える",
             ConcealToolLasso => "囲みツールに切り替える",
             ConcealToolPolygon => "多角形ツールに切り替える",
             ConcealToolLine => "直線ツールに切り替える",
@@ -4260,6 +4271,7 @@ impl KeyAction {
             LaPaintAdd => "補正マスクの追加描画モードにする",
             LaPaintErase => "補正マスクの消去描画モードにする",
             LaToolBrush => "筆ツールに切り替える",
+            LaToolBucket => "バケツツールに切り替える",
             LaToolEdgeBrush => "境界ブラシツールに切り替える",
             LaToolGapFill => "すき間塗りツールに切り替える",
             LaToolLasso => "囲みツールに切り替える",
@@ -4624,9 +4636,11 @@ impl KeyAction {
             | VideoAdjustSlot10
             | VideoToggleAudioMode => KeyContext::FsVideo,
             EraseConfirm | EraseConfirmPolygon | EraseUndo | EraseDeleteShape | EraseToolSelect
-            | EraseToolBrush | EraseToolLasso | EraseToolPolygon | EraseToolVLine
-            | EraseToolHLine | EraseToolLine | EraseToolRect | EraseToolEllipse
-            | ErasePaintMode | EraseEraseMode | EraseSpacePan => KeyContext::Erase,
+            | EraseToolBrush | EraseToolBucket | EraseToolLasso | EraseToolPolygon
+            | EraseToolVLine | EraseToolHLine | EraseToolLine | EraseToolRect
+            | EraseToolEllipse | ErasePaintMode | EraseEraseMode | EraseSpacePan => {
+                KeyContext::Erase
+            }
             ConcealExit
             | ConcealConfirmPolygon
             | ConcealUndo
@@ -4641,6 +4655,7 @@ impl KeyAction {
             | ConcealEraseMode
             | ConcealToolSelect
             | ConcealToolBrush
+            | ConcealToolBucket
             | ConcealToolLasso
             | ConcealToolPolygon
             | ConcealToolLine
@@ -4651,7 +4666,7 @@ impl KeyAction {
             | ConcealSpacePan => KeyContext::Conceal,
             CropExecute | CropSpacePan => KeyContext::Crop,
             TextConfirm | TextRedo | TextUndo | TextSpacePan => KeyContext::Text,
-            LaShowSource | LaShowMask | LaPaintAdd | LaPaintErase | LaToolBrush
+            LaShowSource | LaShowMask | LaPaintAdd | LaPaintErase | LaToolBrush | LaToolBucket
             | LaToolEdgeBrush | LaToolGapFill | LaToolLasso | LaToolPolygon | LaToolSelect
             | LaToolLine | LaToolVLine | LaToolHLine | LaToolRect | LaToolEllipse
             | LaConfirmPolygon | LaSpacePan => KeyContext::LocalAdjust,
@@ -5027,6 +5042,7 @@ impl KeyAction {
             | EraseDeleteShape
             | EraseToolSelect
             | EraseToolBrush
+            | EraseToolBucket
             | EraseToolLasso
             | EraseToolPolygon
             | EraseToolVLine
@@ -5050,6 +5066,7 @@ impl KeyAction {
             | ConcealEraseMode
             | ConcealToolSelect
             | ConcealToolBrush
+            | ConcealToolBucket
             | ConcealToolLasso
             | ConcealToolPolygon
             | ConcealToolLine
@@ -5066,6 +5083,7 @@ impl KeyAction {
             | LaPaintAdd
             | LaPaintErase
             | LaToolBrush
+            | LaToolBucket
             | LaToolEdgeBrush
             | LaToolGapFill
             | LaToolLasso
@@ -5465,6 +5483,7 @@ impl KeyAction {
             EraseDeleteShape => ChordList::one(Chord::key(Delete)),
             EraseToolSelect => ChordList::one(Chord::key(S)),
             EraseToolBrush => ChordList::one(Chord::key(B)),
+            EraseToolBucket => ChordList::one(Chord::key(K)),
             EraseToolLasso => ChordList::one(Chord::key(L)),
             EraseToolPolygon => ChordList::one(Chord::key(P)),
             EraseToolVLine => ChordList::one(Chord::key(V)),
@@ -5489,6 +5508,7 @@ impl KeyAction {
             ConcealEraseMode => ChordList::one(Chord::key(F)),
             ConcealToolSelect => ChordList::one(Chord::key(S)),
             ConcealToolBrush => ChordList::one(Chord::key(B)),
+            ConcealToolBucket => ChordList::one(Chord::key(K)),
             ConcealToolLasso => ChordList::one(Chord::key(L)),
             ConcealToolPolygon => ChordList::one(Chord::key(P)),
             ConcealToolLine => ChordList::one(Chord::key(I)),
@@ -5508,6 +5528,7 @@ impl KeyAction {
             LaPaintAdd => ChordList::one(Chord::key(D)),
             LaPaintErase => ChordList::one(Chord::key(F)),
             LaToolBrush => ChordList::one(Chord::key(B)),
+            LaToolBucket => ChordList::one(Chord::key(K)),
             LaToolEdgeBrush => ChordList::one(Chord::key(A)),
             LaToolGapFill => ChordList::one(Chord::key(G)),
             LaToolLasso => ChordList::one(Chord::key(L)),
@@ -8092,6 +8113,49 @@ mod tests {
             key_action_enum_names_from_source(),
             all_actions_names_from_source()
         );
+    }
+
+    #[test]
+    fn bucket_tool_actions_register_k_in_distinct_edit_contexts() {
+        let cases = [
+            (
+                KeyAction::EraseToolBucket,
+                KeyContext::Erase,
+                "EraseToolBucket",
+            ),
+            (
+                KeyAction::LaToolBucket,
+                KeyContext::LocalAdjust,
+                "LaToolBucket",
+            ),
+            (
+                KeyAction::ConcealToolBucket,
+                KeyContext::Conceal,
+                "ConcealToolBucket",
+            ),
+        ];
+
+        for (action, context, ini_name) in cases {
+            assert!(KeyAction::all().contains(&action));
+            assert_eq!(action.ini_name(), ini_name);
+            assert_eq!(action.context(), context);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert_eq!(
+                action.default_chords().iter().next(),
+                Some(Chord::key(KeyName::K))
+            );
+            assert!(
+                KeyAction::all()
+                    .iter()
+                    .copied()
+                    .filter(|other| *other != action && other.context() == context)
+                    .all(|other| !other
+                        .default_chords()
+                        .iter()
+                        .any(|chord| chord == Chord::key(KeyName::K))),
+                "{ini_name} must be the only K binding in {context:?}"
+            );
+        }
     }
 
     #[test]
