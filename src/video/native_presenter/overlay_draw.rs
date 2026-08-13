@@ -1146,9 +1146,23 @@ pub(super) fn draw_native_jump_row(
             );
             painter.rect_filled(thumb_rect, 3.0, egui::Color32::from_rgb(30, 30, 35));
             if let Some(texture_id) = jump_texture_ids.get(&idx) {
+                // 枠は固定 (行の高さとテキスト開始位置がこれに揃っている) だが、画像は
+                // 自分の比率で内接させる。回転メタデータを持つ縦長動画のサムネイルは
+                // 横長の枠へ引き伸ばすと明らかに歪む。ホバー時のシークサムネイルは
+                // 元から同じ helper で内接させていた。
+                let fitted = entry
+                    .thumbnail
+                    .as_ref()
+                    .map(|thumb| {
+                        fit_rect_in_rect(
+                            egui::vec2(thumb.width as f32, thumb.height as f32),
+                            thumb_rect,
+                        )
+                    })
+                    .unwrap_or(thumb_rect);
                 painter.image(
                     *texture_id,
-                    thumb_rect,
+                    fitted,
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                     egui::Color32::WHITE,
                 );
@@ -6960,5 +6974,25 @@ mod tests {
 
         assert!(native_perf_sample_has_audio_underrun_band(&audio_active));
         assert!(!native_perf_sample_has_audio_underrun_band(&audio_inactive));
+    }
+
+    #[test]
+    fn a_portrait_thumbnail_keeps_its_shape_inside_the_landscape_jump_slot() {
+        // ジャンプパネルの枠は 120x68 固定。回転メタデータを持つ縦長動画のサムネイルを
+        // そこへ引き伸ばすと歪む (実機 FB 2026-08-13)。
+        let slot = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(120.0, 68.0));
+
+        let portrait = fit_rect_in_rect(egui::vec2(720.0, 1280.0), slot);
+        assert!(
+            (portrait.aspect_ratio() - 720.0 / 1280.0).abs() < 1e-3,
+            "got {portrait:?}"
+        );
+        assert!(slot.contains_rect(portrait));
+        assert!((portrait.center() - slot.center()).length() < 1e-3);
+
+        // 横長は従来どおり枠いっぱいに近く収まる。
+        let landscape = fit_rect_in_rect(egui::vec2(1280.0, 720.0), slot);
+        assert!((landscape.width() - slot.width()).abs() < 1e-3);
+        assert!(slot.contains_rect(landscape));
     }
 }
