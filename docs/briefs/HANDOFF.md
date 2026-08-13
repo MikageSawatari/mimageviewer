@@ -221,6 +221,27 @@ RR-04 は「いったん制限でよいが、緩められないか検討した�
 「post filter が nearest を要求するなら NEAREST で描く」規則だが、リモートにこの概念は無い。
 下の「post filter はリモートに出ていない」を参照。
 
+### master を 3 度目に取り込んだ (2026-08-13、merge-base `10d3e930`、master 3 commit)
+
+パノラマ 360 ビューの仕上げ。**テキスト衝突なし、意味の衝突もなし。**
+
+- master の追加はパノラマ関連 (`PanoramaSettleDisabledReason` / `has_pano_excluded_pixel_edits` /
+  `should_show_pano_high_res_edit_warning`) と、**編集モードの入口ゲート**
+  `fullscreen_edit_mode_entry_allowed`
+- そのゲートの呼び出し元は**ローカル UI の 4 ファイルだけ** (補正パネル / 隠蔽 / 消しゴム / 注釈)。
+  **リモートは編集モードを持たないので到達しない**
+- 前回警戒した隣接 (こちらの `compute_pano_settle_output_size` と master の settle 可否) は
+  **別物だった** — 前者は viewport 寸法を返す純関数、後者は settle するかどうかの判断
+- master の `ui_adjustment_panel.rs` 変更 5 行は**ポストフィルタに触れていない**
+  (先日こちらが入れた箇所と重なりなし)
+- `.\scripts	est-full.ps1` = **43 バイナリ / 6468 passed / 0 failed**
+
+**これで `web-remote → master` は fast-forward。** master が動いていなければいつでも渡せる。
+
+**全体テストの ui_snapshot が 1 度だけ `STATUS_ACCESS_VIOLATION` で落ちた** (アサーション失敗ではない)。
+単独では 3 回とも 33/33、再実行の全体テストでも通ったので、**並走時の GPU 競合**と見ている。
+当時マシンでは 2 つの core と別セッションのテストが同時に動いていた。
+
 ### post filter はリモートに出ていない (2026-08-13、パネル追加を決定)
 
 `post_filter::apply` は 2 種類に割れる ([post_filter.rs](../../src/post_filter.rs)):
