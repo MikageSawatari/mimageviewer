@@ -9434,6 +9434,12 @@ impl App {
     /// この境界で揃える。終了時の状態が次回起動へ漏れないよう、元画像比較は OFF、
     /// マスク表示は ON から始める。
     pub(crate) fn enter_local_adjust_mode(&mut self) {
+        if self
+            .fullscreen_idx
+            .is_some_and(|fs_idx| !self.fullscreen_edit_mode_entry_allowed(fs_idx))
+        {
+            return;
+        }
         self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.local_adjust_mode = true;
         self.local_adjust_show_source = false;

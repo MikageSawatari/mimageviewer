@@ -1136,6 +1136,22 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   消しゴムの合成結果ではなく元のピクセルを載せている疑い。低解像度側だけ合成が
   効いているなら、差し替え経路が編集後のラスタを参照していない。
 - 規模 / 優先度: Small〜Medium / P3。
+- **対応した (2026-08-13)**。settle worker が原本を再デコードする一方、8K base が
+  `final_composite_cache` の編集済み pixels を選んでいたため、静止 500ms の切替時に
+  表示内容が変わっていた。360 度ビューを通常表示の final pipeline から切り離し、
+  **元画像 + 単純色調補正だけ**を表示する仕様へ統一した。
+  - `resolve_pano_source` は、単純色調補正だけなら `adjustment_cache`、それ以外は
+    `fs_cache` を選ぶ。final composite / AI cache は参照しない。消しゴム・隠蔽加工・
+    補正レイヤーの有無は `has_pano_excluded_pixel_edits` に集約し、入場時トーストも
+    同じ述語を使う。
+  - settle policy は raw / 色調補正と補正 cache 待ちだけに縮めた。Disabled 理由を型で
+    保持し、`ui_fullscreen.rs` にあった判定木の手書き複製を削除した。
+  - 360 中の編集モード入口を `fullscreen_edit_mode_entry_allowed` に集約した。従来の
+    個別抑止列挙から **Ctrl+G（補正レイヤー）/ Ctrl+M（隠蔽加工）/
+    Ctrl+T（テキスト注釈）が漏れていた**ため、キー、補正パネル、遅延 continuation を
+    含む全入口をモード境界で抑止するようにした。
+  - 編集データがあるページへの 360 入場時は注意トーストを出す。同一 source では
+    セッション中 1 回だけとし、既存の V キー案内用フラグとは分離した。
 
 ### 1.82 絞り込みバーの ★ プルダウンでも修飾クリックの選び方を使いたい — 利用者要望
 

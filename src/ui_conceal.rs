@@ -90,6 +90,9 @@ impl App {
     /// (消しゴムと同じ振る舞い、`conceal_spread_ctx` に元状態を保存)、
     /// `reset_conceal_mode` で復元する。
     pub(crate) fn enter_conceal_mode(&mut self, fs_idx: usize) {
+        if !self.fullscreen_edit_mode_entry_allowed(fs_idx) {
+            return;
+        }
         let target_idx = match self.resolve_spread_pair(fs_idx) {
             crate::ui_fullscreen::SpreadPair::Double { left, .. } => left,
             crate::ui_fullscreen::SpreadPair::Single => fs_idx,
@@ -127,6 +130,9 @@ impl App {
         loaded_mask: Vec<bool>,
         loaded_shapes: Vec<crate::mask_db::Shape>,
     ) -> bool {
+        if !self.fullscreen_edit_mode_entry_allowed(requested_fs_idx) {
+            return false;
+        }
         let spread_pair = match self.resolve_spread_pair(requested_fs_idx) {
             crate::ui_fullscreen::SpreadPair::Double { left, right } => Some((left, right)),
             crate::ui_fullscreen::SpreadPair::Single => None,

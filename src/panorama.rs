@@ -29,14 +29,9 @@ pub const PITCH_LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.001;
 /// `cache_key` の source_kind ビット (§4.1.2):
 /// - 0 = fs_cache のみ (補正なし、AI なし)
 /// - 1 = adjustment_cache (raw + 単純色調補正)
-/// - 2 = ai_upscale_cache (AI のみ)
-/// - 3 = adjustment_cache (AI + 補正)
-/// - 4 = final_composite_cache (通常表示と同じ最終パイプライン)
+/// 360 度ビューは元画像と単純色調補正だけを入力にするため、現行値は 0 / 1 のみ。
 pub const SOURCE_KIND_FS: u16 = 0;
 pub const SOURCE_KIND_ADJUST_RAW: u16 = 1;
-pub const SOURCE_KIND_AI: u16 = 2;
-pub const SOURCE_KIND_AI_ADJUST: u16 = 3;
-pub const SOURCE_KIND_FINAL_COMPOSITE: u16 = 4;
 
 /// 360 ビューのインタラクティブステート (フルスクリーン内のみ Some)。
 /// ファイル切替 / フルスクリーン退出で `panorama_state = None`。
@@ -258,7 +253,7 @@ pub struct PanoSourceResolution {
     pub cache_key: u64,
     /// 360 ベーステクスチャのアップロード元。`color_image_to_rgba` で RGBA8 化する。
     pub pixels: std::sync::Arc<egui::ColorImage>,
-    /// どのキャッシュ層から取ったか (SOURCE_KIND_*)。Phase 2a の settle policy 判定にも使う。
+    /// 元画像 / 単純色調補正のどちらから取ったか。settle policy 判定にも使う。
     pub source_kind: u16,
     /// settle (Phase 2a) の発動可否ポリシー (§3.6.2.1)。
     /// `compute_settle_policy(fs_idx, source_kind)` の出力をそのまま焼き込む。
@@ -330,13 +325,15 @@ pub fn needs_user_confirmation(source_pixels: u64, approved_max: u64) -> bool {
 
 /// settle の適用ポリシー (§3.6.2.1)。
 ///
-/// 8K base のソース選択結果 (`source_kind`) と AI / 補正設定から
+/// 8K base のソース選択結果 (`source_kind`) と色調補正の準備状態から
 /// `compute_settle_policy` で決まる。
 #[derive(Clone, Debug)]
 pub enum PanoramaSettlePolicy {
-    /// settle スキップ。8K base のみ表示 (AI 有効 / post_filter / auto_mode / transient)
-    Disabled,
-    /// raw fs_cache (補正なし、AI なし)。HighResSource = 元 RGBA をそのまま sample
+    /// 色調補正済み pixels がまだ無い過渡期なので settle を開始しない。
+    Disabled {
+        reason: PanoramaSettleDisabledReason,
+    },
+    /// raw fs_cache。360 対象外の加工は反映せず、HighResSource の元 RGBA を sample
     EnabledFromRaw,
     /// 通常画像 + 単純色調補正 (post_filter / auto / AI なし)。
     /// settle source は元 RGBA、render 内で `apply_adjustments_fast` を再適用。
@@ -345,10 +342,32 @@ pub enum PanoramaSettlePolicy {
     },
 }
 
+/// settle を一時停止する理由。表示側はこの値だけを読み、判定木を複製しない。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanoramaSettleDisabledReason {
+    WaitingForColorAdjustments,
+}
+
+impl PanoramaSettleDisabledReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::WaitingForColorAdjustments => "補正適用待ち",
+        }
+    }
+}
+
 impl PanoramaSettlePolicy {
     /// settle render を起動する必要があるかどうか。
     pub fn is_enabled(&self) -> bool {
-        !matches!(self, PanoramaSettlePolicy::Disabled)
+        !matches!(self, PanoramaSettlePolicy::Disabled { .. })
+    }
+
+    pub fn disabled_reason(&self) -> Option<PanoramaSettleDisabledReason> {
+        match self {
+            PanoramaSettlePolicy::Disabled { reason } => Some(*reason),
+            PanoramaSettlePolicy::EnabledFromRaw
+            | PanoramaSettlePolicy::EnabledWithColorAdjustments { .. } => None,
+        }
     }
 }
 
@@ -1015,7 +1034,9 @@ mod tests {
             est_ram_gb: 2.4,
         };
         let policy_ok = PanoramaSettlePolicy::EnabledFromRaw;
-        let policy_no = PanoramaSettlePolicy::Disabled;
+        let policy_no = PanoramaSettlePolicy::Disabled {
+            reason: PanoramaSettleDisabledReason::WaitingForColorAdjustments,
+        };
         assert!(settle_enabled(&state_ok, &policy_ok));
         assert!(!settle_enabled(&state_no, &policy_ok));
         assert!(!settle_enabled(&state_ok, &policy_no));

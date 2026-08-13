@@ -9498,6 +9498,10 @@ pub struct App {
     /// `open_fullscreen` で false にリセット、トースト発火で true、
     /// `close_fullscreen` で false に戻る。
     pub(crate) pano_toast_shown_for_current_fs: bool,
+    /// 画素編集を持つページで「360° ビューには編集を反映しない」と案内済みの
+    /// source_key 集合。同じページで 360° を出入りするたびに繰り返さない。
+    /// V キー案内トーストとは別の一回性を持たせ、重要な注意が案内に上書きされないようにする。
+    pub(crate) pano_edit_warning_shown_sources: std::collections::HashSet<String>,
     /// 360 度パノラマビュー Phase 2a: settle-refinement 用フル解像度 RGBA
     /// (docs/panorama-360-view-plan.md §4.6.1)。キーは `metadata_cache_key`。
     /// SettleReady / SettleApproved の画像でだけエントリが作られる。
@@ -12612,6 +12616,7 @@ impl App {
             panorama_state: None,
             pano_uploaded: None,
             pano_toast_shown_for_current_fs: false,
+            pano_edit_warning_shown_sources: std::collections::HashSet::new(),
             pano_high_res_source: std::collections::HashMap::new(),
             pano_refinement: None,
             pano_quality_state: std::collections::HashMap::new(),
@@ -58271,8 +58276,8 @@ impl App {
     }
 
     /// 指定ピクセルデータに色調補正を同期適用して adjustment_cache に格納する。
-    /// poll_prefetch / poll_ai_upscale の完了時に呼ばれ、
-    /// 補正済み画像を即座にテクスチャ化してチラつきを防止する。
+    /// raw `fs_cache` の通常 / panorama load 完了時に呼ばれ、補正済み画像を
+    /// 即座にテクスチャ化してチラつきを防止する。
     fn apply_sync_adjustment(
         &mut self,
         ctx: &egui::Context,
@@ -59028,7 +59033,7 @@ impl App {
             let Some(fs_idx) = self.fs_idx_of_source_key(&ready.source_key) else {
                 continue;
             };
-            let Some(resolution) = self.resolve_pano_source(ctx, fs_idx) else {
+            let Some(resolution) = self.resolve_pano_source(fs_idx) else {
                 continue;
             };
             let state = self.pano_quality_state.get(&resolution.source_key).cloned();
@@ -59071,8 +59076,8 @@ impl App {
                 self.dismiss_pano_confirmation_banner(&ready.source_key);
                 ctx.request_repaint();
             }
-            // settle_will_use_it == false (AI / post_filter ON 等):
-            //   state は触らない、HighResSource は格納 (= 将来 OFF→ON で再利用可能)
+            // settle_will_use_it == false (色調補正 cache の準備待ち):
+            //   state は触らない、HighResSource は格納して準備完了後に再利用する。
         }
         // **進行中 worker がある間は低頻度 repaint で wakeup を確保** (Codex P1 第 11、
         // 2026-05): egui はアイドル時にフレームを送らないので、worker が完了しても
@@ -59112,7 +59117,7 @@ impl App {
             self.clear_pano_refinement();
             return;
         }
-        let Some(resolution) = self.resolve_pano_source(ctx, fs_idx) else {
+        let Some(resolution) = self.resolve_pano_source(fs_idx) else {
             return;
         };
         let Some(pano_state) = self.panorama_state.as_ref() else {
@@ -59645,82 +59650,68 @@ impl App {
             .unwrap_or(false)
     }
 
+    /// 360° で表示しない画素編集が対象ページにあるか。
+    ///
+    /// ソース選択と入場時トーストは必ずこの述語を共用し、表示仕様と案内をずらさない。
+    pub(crate) fn has_pano_excluded_pixel_edits(&self, fs_idx: usize) -> bool {
+        self.mask_pages.contains(&fs_idx)
+            || self.has_active_local_adjust_layers(fs_idx)
+            || self.conceal_pages.contains(&fs_idx)
+    }
+
+    /// 360° の元画像に単純色調補正だけを重ねる状態か。
+    ///
+    /// `adjustment_cache` は `apply_sync_adjustment` で色調 (auto_mode の解決を含む)
+    /// と post_filter を焼き込むため、再現可能な色調だけの状態でしか参照しない。
+    fn pano_uses_color_adjustment_source(&self, fs_idx: usize) -> bool {
+        let params = self.effective_params(fs_idx);
+        !params.is_color_identity()
+            && params.auto_mode.is_none()
+            && params.post_filter == crate::adjustment::PostFilter::None
+            && params.smart_sharpen == 0
+            && !self.ai_will_apply_to(fs_idx)
+            && !self.has_pano_excluded_pixel_edits(fs_idx)
+    }
+
     /// 360 ベーステクスチャのソース選択 + cache_key 計算を 1 関数に集約する (§4.3)。
     ///
-    /// 優先順位は `final_composite_cache → adjustment_cache → ai_upscale_cache → fs_cache`
-    /// (display-pipeline.md §2.3)。final pipeline が未完了の間だけ旧キャッシュ層へ
-    /// フォールバックし、AI 完了後は通常表示と同じ最終 composite を 360 ベースにする。
+    /// 360° は通常表示の final pipeline から独立し、元画像と単純色調補正だけを扱う。
+    /// 色調のみの状態では `adjustment_cache`、それ以外は `fs_cache` を選ぶ。
     ///
     /// Phase 1 ではこの戻り値の `pixels` を `color_image_to_rgba` で RGBA8 化し、
     /// `cache_key` を `pano_uploaded` の stale 判定 + callback に渡す。
     /// Phase 2a で `source_kind` を settle policy 判定にも使う。
     pub(crate) fn resolve_pano_source(
-        &mut self,
-        ctx: &egui::Context,
+        &self,
         fs_idx: usize,
     ) -> Option<crate::panorama::PanoSourceResolution> {
         use crate::panorama::*;
         let source_key = self.metadata_cache_key(fs_idx)?;
-        let bg = self.effective_upscale_bg_mode();
-        // AI が「この画像に実効的に適用されるか」で source_kind を分ける。
-        // 設定 ON でもサイズ閾値超でスキップされる画像は AI 由来扱いにしない
-        // (= settle を有効化できる、2026-05 ユーザー要望)。
-        let ai_effective = self.ai_will_apply_to(fs_idx);
-
-        let final_source = self.ensure_final_composite_pixels_with_key(ctx, fs_idx);
-
-        // ai_upscale_cache 参照は AI が実効的に動くときだけ (Codex P1 第 14 反映、
-        // 2026-05 で機能 flag → 実効判定に強化)
-        let ai_cache_entry = if ai_effective {
-            self.ai_upscale_cache.get(&(fs_idx, bg))
-        } else {
-            None
-        };
-
-        let (pixels, source_kind, final_key_hash) = if let Some((final_key, pixels)) = final_source
+        let use_adjustment = self.pano_uses_color_adjustment_source(fs_idx);
+        let (pixels, source_kind) = if use_adjustment
+            && let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&fs_idx)
         {
-            let hash = runtime_hash_with(|h| {
-                use std::hash::Hash;
-                final_key.hash(h);
-            });
-            (pixels, SOURCE_KIND_FINAL_COMPOSITE, Some(hash))
-        } else if let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&fs_idx)
-        {
-            // adjustment_cache は AI 由来 / 通常由来の両方が入る (実コード line 15500)。
-            // ai_effective が true のときは AI 由来扱い (SOURCE_KIND_AI_ADJUST)、
-            // false のときは通常由来 (SOURCE_KIND_ADJUST_RAW)。
-            let kind = if ai_effective {
-                SOURCE_KIND_AI_ADJUST
-            } else {
-                SOURCE_KIND_ADJUST_RAW
-            };
-            (std::sync::Arc::clone(pixels), kind, None)
-        } else if let Some(FsCacheEntry::Static { pixels, .. }) = ai_cache_entry {
-            (std::sync::Arc::clone(pixels), SOURCE_KIND_AI, None)
+            (std::sync::Arc::clone(pixels), SOURCE_KIND_ADJUST_RAW)
         } else if let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&fs_idx) {
-            (std::sync::Arc::clone(pixels), SOURCE_KIND_FS, None)
+            (std::sync::Arc::clone(pixels), SOURCE_KIND_FS)
         } else {
             return None; // ColorImage がまだ無い (Animated / Failed / 未ロード)
         };
 
-        let mut adjust_gen = self
+        let adjust_gen = self
             .adjustment_generation
             .get(&source_key)
             .copied()
             .unwrap_or(0) as u16;
-        let mut ai_gen = self
+        let ai_gen = self
             .ai_upscale_generation
             .get(&source_key)
             .copied()
             .unwrap_or(0) as u16;
-        if let Some(hash) = final_key_hash {
-            adjust_gen ^= hash as u16;
-            ai_gen ^= (hash >> 16) as u16;
-        }
         let cache_key =
             make_pano_cache_key(crc16_of_str(&source_key), source_kind, adjust_gen, ai_gen);
 
-        // Phase 2a settle policy: source_kind と AI / 補正状態から判定 (§3.6.2.1)
+        // Phase 2a settle policy: source_kind と色調補正の過渡状態から判定 (§3.6.2.1)
         let settle_policy = self.compute_settle_policy(fs_idx, source_kind);
 
         Some(PanoSourceResolution {
@@ -59733,79 +59724,36 @@ impl App {
     }
 
     /// 360 度パノラマビュー Phase 2a: settle policy 判定 (§3.6.2.1)。
-    /// AI 機能 ON / `post_filter` / `auto_mode` / source_kind が AI 由来 (2/3) などで
-    /// `Disabled`、純粋色調補正なら `EnabledWithColorAdjustments`、補正なし &
-    /// AI なしなら `EnabledFromRaw`。
     ///
-    /// **AI 機能 ON の判定** (2026-05 ユーザー要望反映):
-    /// 設定 ON でも画像サイズ (`should_process_rect`) で実際に AI が動かないケースでは
-    /// settle を有効化する。判定は以下の OR:
-    ///   - `ai_upscale_enabled && upscale_in_range` (実効的にアップスケール対象)
-    ///   - `ai_denoise_model.is_some() && denoise_in_range` (実効的にデノイズ対象)
-    /// 画像サイズが取れない (= まだロード中) 場合は保守的に「適用される」とみなす。
+    /// ソース選択側が再現不能な加工をすべて元画像へ畳むため、ここで判定するのは
+    /// 元画像 / 色調補正済みの対応と、色調補正 cache 待ちの過渡期だけ。
     pub(crate) fn compute_settle_policy(
         &self,
         fs_idx: usize,
         source_kind: u16,
     ) -> crate::panorama::PanoramaSettlePolicy {
-        use crate::panorama::PanoramaSettlePolicy::*;
-        use crate::panorama::{
-            SOURCE_KIND_ADJUST_RAW, SOURCE_KIND_AI, SOURCE_KIND_AI_ADJUST,
-            SOURCE_KIND_FINAL_COMPOSITE, SOURCE_KIND_FS,
+        use crate::panorama::PanoramaSettleDisabledReason::WaitingForColorAdjustments;
+        use crate::panorama::PanoramaSettlePolicy::{
+            Disabled, EnabledFromRaw, EnabledWithColorAdjustments,
         };
-        // AI が「実際にこの画像に適用される」か判定。
-        // 設定 ON でもサイズ閾値超でスキップされるケースは settle 許可する。
-        let ai_actually_active = self.ai_will_apply_to(fs_idx);
-        if ai_actually_active {
-            return Disabled;
-        }
-        // source_kind が AI 由来 (2 or 3) なら settle 無効。
-        // (上の `ai_actually_active` 判定で大半は弾かれるが、AI OFF 直後に cache 残骸が
-        // 居て resolve_pano_source が AI 由来 entry を選んだ過渡期は別途ガードが要る)
-        if source_kind == SOURCE_KIND_AI || source_kind == SOURCE_KIND_AI_ADJUST {
-            return Disabled;
-        }
+        use crate::panorama::{SOURCE_KIND_ADJUST_RAW, SOURCE_KIND_FS};
         let params = self.effective_params(fs_idx);
-        if params.auto_mode.is_some() {
-            return Disabled;
-        }
-        if params.post_filter != crate::adjustment::PostFilter::None {
-            return Disabled;
-        }
-        // 最終表示段スマートシャープも settle 再レンダリングでは再現しない
-        // (EnabledWithColorAdjustments は色調のみ適用) ため post_filter と同じ扱い。
-        if params.smart_sharpen != 0 {
-            return Disabled;
-        }
         match source_kind {
             SOURCE_KIND_FS => {
-                if params.is_color_identity() {
-                    EnabledFromRaw
-                } else {
-                    // params 有効だが adjustment_cache 未生成 = transient
-                    Disabled
-                }
-            }
-            SOURCE_KIND_ADJUST_RAW => {
-                if params.is_color_identity() {
-                    // post_filter のみで adjustment_cache が出来た形跡 (上で除外済みのはず)
-                    Disabled
-                } else {
-                    EnabledWithColorAdjustments {
-                        params: params.clone(),
+                if self.pano_uses_color_adjustment_source(fs_idx) {
+                    Disabled {
+                        reason: WaitingForColorAdjustments,
                     }
-                }
-            }
-            SOURCE_KIND_FINAL_COMPOSITE => {
-                if params.is_color_identity() {
-                    EnabledFromRaw
                 } else {
-                    EnabledWithColorAdjustments {
-                        params: params.clone(),
-                    }
+                    EnabledFromRaw
                 }
             }
-            _ => Disabled,
+            SOURCE_KIND_ADJUST_RAW => EnabledWithColorAdjustments {
+                params: params.clone(),
+            },
+            _ => Disabled {
+                reason: WaitingForColorAdjustments,
+            },
         }
     }
 
@@ -59813,16 +59761,20 @@ impl App {
     /// 設定 ON でもサイズ上限超 (`should_process_rect(w, h, limit) == false`) なら false。
     /// fs_cache に entry がまだ無い場合は判定不能なので保守的に true (= 適用予定)。
     pub(crate) fn ai_will_apply_to(&self, fs_idx: usize) -> bool {
-        let upscale_on = self.ai_upscale_enabled;
-        let denoise_on = self.ai_denoise_model.is_some();
+        // `ai_upscale_enabled` / `ai_denoise_model` は現在の fullscreen idx 用に同期した
+        // UI cache なので、見開き相方やページ個別設定には使わない。final AI と同じ
+        // effective request を対象ページから解決する。
+        let params = self.effective_params(fs_idx);
+        let upscale_on = self.effective_upscale_request(params).is_some();
+        let denoise_on = self.effective_denoise_request(params).is_some();
         if !upscale_on && !denoise_on {
             return false;
         }
         // 源解像度を fs_cache から取得 (clamp 前の source_dims 優先)。
         // **fs_cache が evict された / Animated / 未ロード**等で見つからない場合は
         // 他の cache 層 (adjustment_cache / ai_upscale_cache) からも探す (Codex P3 第 5、
-        // 2026-05): cache が複数層に分散したフレームで settle が誤って Disabled 化
-        // するのを防ぐ。後段の cache 層は pixels.size しか持たない (= GPU clamp 後の
+        // 2026-05): cache が複数層に分散したフレームでも、360 のソース選択が AI の
+        // 実効有無を誤らないようにする。後段の cache 層は pixels.size しか持たない (= GPU clamp 後の
         // 8K cap dims) ので、AI 適用サイズ上限 (最大でも数 K) との比較なら問題ない。
         let bg = self.effective_upscale_bg_mode();
         let dims: Option<(u32, u32)> = match self.fs_cache.get(&fs_idx) {
@@ -59851,7 +59803,7 @@ impl App {
             }
         };
         let Some((w, h)) = dims else {
-            // 寸法不明 → 保守的に「適用される」(= settle を一時 Disabled)。
+            // 寸法不明 → 保守的に「適用される」(= 360 は raw source を選ぶ)。
             // 寸法が確定したら次フレで再評価される。
             return true;
         };
@@ -59866,8 +59818,8 @@ impl App {
     /// 「これ以上進まない / 不要」かを判定する。true なら隣接画像の AI 先読みへ
     /// 進んでよい (= update ループの `current_done`)。
     ///
-    /// **`ai_will_apply_to` (panorama settle 用) とは意味が逆**なので別 predicate にする:
-    /// settle 側は「適用されるかもしれない → 保守的に true」で、寸法不明・終端状態でも
+    /// **`ai_will_apply_to` (360 source 選択用) とは意味が逆**なので別 predicate にする:
+    /// 360 側は「適用されるかもしれない → 保守的に true」で、寸法不明・終端状態でも
     /// true を返す。スケジューラがそれを `!ai_will_apply_to` で使うと、
     /// `FsCacheEntry::Animated` / `Failed` (= AI upscale 経路に乗らない終端状態) で
     /// `current_done=false` が固定され、`maybe_start_ai_upscale` も Static 以外は即 return
@@ -59943,8 +59895,20 @@ impl App {
             return;
         }
         // ON: GPano hint があれば初期視点に反映
+        let edit_warning_source_key = self
+            .has_pano_excluded_pixel_edits(fs_idx)
+            .then(|| self.metadata_cache_key(fs_idx))
+            .flatten();
         let (init_yaw, init_pitch) = self.panorama_initial_pose(fs_idx);
         self.panorama_state = Some(crate::panorama::PanoramaState::new(init_yaw, init_pitch));
+        if let Some(source_key) = edit_warning_source_key
+            && self.pano_edit_warning_shown_sources.insert(source_key)
+        {
+            self.show_feedback_toast(
+                "360° ビューでは編集（消しゴム・隠蔽加工・補正レイヤー）は反映されません"
+                    .to_string(),
+            );
+        }
         // 衝突する機能を停止 (docs/panorama-360-view-plan.md フィードバック対応):
         // 360 中は上バーのみの機能制限モードになるので、他の panel / mode を OFF
         // しておく。これらは 360 OFF 後にユーザーが再度有効化できる。
@@ -60038,11 +60002,11 @@ impl App {
     /// 3. 一致 → 何もしない
     /// 4. `CallbackResources` への Arc clone 挿入は別経路 (`sync_pano_callback_resources`)
     #[cfg(windows)]
-    pub(crate) fn ensure_pano_upload(&mut self, ctx: &egui::Context, fs_idx: usize) {
+    pub(crate) fn ensure_pano_upload(&mut self, _ctx: &egui::Context, fs_idx: usize) {
         let Some(render_state) = self.wgpu_render_state.clone() else {
             return;
         };
-        let Some(resolution) = self.resolve_pano_source(ctx, fs_idx) else {
+        let Some(resolution) = self.resolve_pano_source(fs_idx) else {
             return;
         };
         // stale チェック (§4.2 + Codex P2 第 19 ラウンド):
