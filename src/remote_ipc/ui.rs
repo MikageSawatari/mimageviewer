@@ -42,6 +42,9 @@ pub(crate) struct RemoteSessionUiState {
     paused_animation_restore_key: Option<String>,
     pending_bookmark_writes: std::collections::HashMap<u64, PendingRemoteBookmarkWrite>,
     connection_dialog: Option<RemoteConnectionDialogState>,
+    // Unlike the dialog-owned PIN and tailscale receivers, logout completion must outlive the
+    // window because a successful secret rotation still has to disconnect local control.
+    session_logout: RemoteSessionLogoutState,
     video_stream: Option<AppRemoteVideoStreamState>,
     local_ai_lease: Option<RemoteLocalAiLease>,
     acquire_barrier_diagnostics: RemoteAcquireBarrierDiagnostics,
@@ -49,7 +52,6 @@ pub(crate) struct RemoteSessionUiState {
 
 struct RemoteConnectionDialogState {
     pin_editor: RemotePinEditorState,
-    session_logout: RemoteSessionLogoutState,
     tailscale_serve_setup: RemoteTailscaleServeSetupState,
 }
 
@@ -87,7 +89,8 @@ enum RemoteSessionLogoutPhase {
     Idle,
     Confirming,
     Running,
-    Finished,
+    FinishedSuccess,
+    FinishedError,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,29 +99,71 @@ enum RemoteSessionLogoutEvent {
     Confirm,
     Cancel,
     StartFailed,
-    Finish,
+    FinishSuccess,
+    FinishError,
+    DialogClosed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RemoteSessionLogoutTransition {
+    phase: RemoteSessionLogoutPhase,
+    disconnect_local: bool,
 }
 
 fn remote_session_logout_transition(
     phase: RemoteSessionLogoutPhase,
     event: RemoteSessionLogoutEvent,
-) -> Option<RemoteSessionLogoutPhase> {
+) -> Option<RemoteSessionLogoutTransition> {
+    let transition = |phase| RemoteSessionLogoutTransition {
+        phase,
+        disconnect_local: false,
+    };
     match (phase, event) {
         (
-            RemoteSessionLogoutPhase::Idle | RemoteSessionLogoutPhase::Finished,
+            RemoteSessionLogoutPhase::Idle
+            | RemoteSessionLogoutPhase::FinishedSuccess
+            | RemoteSessionLogoutPhase::FinishedError,
             RemoteSessionLogoutEvent::RequestConfirmation,
-        ) => Some(RemoteSessionLogoutPhase::Confirming),
+        ) => Some(transition(RemoteSessionLogoutPhase::Confirming)),
         (RemoteSessionLogoutPhase::Confirming, RemoteSessionLogoutEvent::Confirm) => {
-            Some(RemoteSessionLogoutPhase::Running)
+            Some(transition(RemoteSessionLogoutPhase::Running))
         }
         (RemoteSessionLogoutPhase::Confirming, RemoteSessionLogoutEvent::Cancel) => {
-            Some(RemoteSessionLogoutPhase::Idle)
+            Some(transition(RemoteSessionLogoutPhase::Idle))
         }
         (RemoteSessionLogoutPhase::Confirming, RemoteSessionLogoutEvent::StartFailed)
-        | (RemoteSessionLogoutPhase::Running, RemoteSessionLogoutEvent::Finish) => {
-            Some(RemoteSessionLogoutPhase::Finished)
+        | (RemoteSessionLogoutPhase::Running, RemoteSessionLogoutEvent::FinishError) => {
+            Some(transition(RemoteSessionLogoutPhase::FinishedError))
+        }
+        (RemoteSessionLogoutPhase::Running, RemoteSessionLogoutEvent::FinishSuccess) => {
+            Some(RemoteSessionLogoutTransition {
+                phase: RemoteSessionLogoutPhase::FinishedSuccess,
+                disconnect_local: true,
+            })
+        }
+        (RemoteSessionLogoutPhase::Idle, RemoteSessionLogoutEvent::DialogClosed) => {
+            Some(transition(RemoteSessionLogoutPhase::Idle))
+        }
+        (RemoteSessionLogoutPhase::Confirming, RemoteSessionLogoutEvent::DialogClosed) => {
+            Some(transition(RemoteSessionLogoutPhase::Idle))
+        }
+        (RemoteSessionLogoutPhase::Running, RemoteSessionLogoutEvent::DialogClosed) => {
+            Some(transition(RemoteSessionLogoutPhase::Running))
+        }
+        (RemoteSessionLogoutPhase::FinishedSuccess, RemoteSessionLogoutEvent::DialogClosed) => {
+            Some(transition(RemoteSessionLogoutPhase::Idle))
+        }
+        // 失敗はここで消さない。「もう一度試す」と一緒に残し、利用者が retry するまで見える。
+        (RemoteSessionLogoutPhase::FinishedError, RemoteSessionLogoutEvent::DialogClosed) => {
+            Some(transition(RemoteSessionLogoutPhase::FinishedError))
         }
         _ => None,
+    }
+}
+
+impl Default for RemoteSessionLogoutState {
+    fn default() -> Self {
+        Self::Idle
     }
 }
 
@@ -128,7 +173,8 @@ impl RemoteSessionLogoutState {
             Self::Idle => RemoteSessionLogoutPhase::Idle,
             Self::Confirming => RemoteSessionLogoutPhase::Confirming,
             Self::Running { .. } => RemoteSessionLogoutPhase::Running,
-            Self::Finished(_) => RemoteSessionLogoutPhase::Finished,
+            Self::Finished(Ok(())) => RemoteSessionLogoutPhase::FinishedSuccess,
+            Self::Finished(Err(_)) => RemoteSessionLogoutPhase::FinishedError,
         }
     }
 
@@ -138,7 +184,10 @@ impl RemoteSessionLogoutState {
                 self.phase(),
                 RemoteSessionLogoutEvent::RequestConfirmation,
             ),
-            Some(RemoteSessionLogoutPhase::Confirming)
+            Some(RemoteSessionLogoutTransition {
+                phase: RemoteSessionLogoutPhase::Confirming,
+                disconnect_local: false,
+            })
         );
         *self = Self::Confirming;
     }
@@ -146,7 +195,10 @@ impl RemoteSessionLogoutState {
     fn cancel_confirmation(&mut self) {
         debug_assert_eq!(
             remote_session_logout_transition(self.phase(), RemoteSessionLogoutEvent::Cancel,),
-            Some(RemoteSessionLogoutPhase::Idle)
+            Some(RemoteSessionLogoutTransition {
+                phase: RemoteSessionLogoutPhase::Idle,
+                disconnect_local: false,
+            })
         );
         *self = Self::Idle;
     }
@@ -167,12 +219,29 @@ impl RemoteSessionLogoutState {
         };
     }
 
-    fn finish(&mut self, result: Result<(), String>) {
-        debug_assert_eq!(
-            remote_session_logout_transition(self.phase(), RemoteSessionLogoutEvent::Finish),
-            Some(RemoteSessionLogoutPhase::Finished)
-        );
+    fn finish(&mut self, result: Result<(), String>) -> bool {
+        let event = if result.is_ok() {
+            RemoteSessionLogoutEvent::FinishSuccess
+        } else {
+            RemoteSessionLogoutEvent::FinishError
+        };
+        let transition = remote_session_logout_transition(self.phase(), event)
+            .expect("only a running logout can finish");
         *self = Self::Finished(result);
+        transition.disconnect_local
+    }
+
+    fn dialog_closed(&mut self) {
+        let transition =
+            remote_session_logout_transition(self.phase(), RemoteSessionLogoutEvent::DialogClosed)
+                .expect("every logout state defines dialog-close behavior");
+        match transition.phase {
+            RemoteSessionLogoutPhase::Idle => *self = Self::Idle,
+            RemoteSessionLogoutPhase::Running
+            | RemoteSessionLogoutPhase::FinishedError
+            | RemoteSessionLogoutPhase::Confirming
+            | RemoteSessionLogoutPhase::FinishedSuccess => {}
+        }
     }
 }
 
@@ -188,7 +257,6 @@ impl RemoteConnectionDialogState {
                     request_focus: true,
                 }
             },
-            session_logout: RemoteSessionLogoutState::Idle,
             tailscale_serve_setup: RemoteTailscaleServeSetupState::Idle,
         }
     }
@@ -2482,6 +2550,43 @@ impl crate::app::App {
     }
 
     pub(crate) fn show_remote_connection_dialog(&mut self, ctx: &egui::Context) {
+        let dialog_open = self.remote_session_ui.connection_dialog.is_some();
+        let session_logout_result = match &self.remote_session_ui.session_logout {
+            RemoteSessionLogoutState::Running { receiver } => match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(
+                    "すべての端末のログアウト結果を受け取れませんでした".to_owned(),
+                )),
+            },
+            RemoteSessionLogoutState::Idle
+            | RemoteSessionLogoutState::Confirming
+            | RemoteSessionLogoutState::Finished(_) => None,
+        };
+        if let Some(result) = session_logout_result {
+            // 失敗はダイアログが開いていたかに関わらず、完了した時点で 1 度だけ残す。
+            // 署名鍵が回っていないという事実は、利用者がその瞬間を見ていなくても記録が要る。
+            if let Err(error) = &result {
+                crate::logger::log(format!("remote_ipc: logout-all failed: {error}"));
+            }
+            let disconnect_local = self.remote_session_ui.session_logout.finish(result);
+            if disconnect_local && let Some(handle) = self.remote_session_ui.handle.as_ref() {
+                handle.local_disconnect();
+            }
+            if !dialog_open {
+                // 誰も見ていないうちに終わった場合は、閉じたときと同じ後始末をここで済ませる
+                // (成功表示を溜め込まない)。失敗は「もう一度試す」と一緒に残す。
+                self.remote_session_ui.session_logout.dialog_closed();
+            }
+        }
+        if matches!(
+            &self.remote_session_ui.session_logout,
+            RemoteSessionLogoutState::Running { .. }
+        ) {
+            // The receiver is core-owned, so keep polling even while the dialog is closed.
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+
         let Some(mut dialog) = self.remote_session_ui.connection_dialog.take() else {
             return;
         };
@@ -2504,26 +2609,6 @@ impl crate::app::App {
                     request_focus: true,
                 },
             };
-        }
-        let session_logout_result = match &dialog.session_logout {
-            RemoteSessionLogoutState::Running { receiver } => match receiver.try_recv() {
-                Ok(result) => Some(result),
-                Err(std::sync::mpsc::TryRecvError::Empty) => None,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(
-                    "すべての端末のログアウト結果を受け取れませんでした".to_owned(),
-                )),
-            },
-            RemoteSessionLogoutState::Idle
-            | RemoteSessionLogoutState::Confirming
-            | RemoteSessionLogoutState::Finished(_) => None,
-        };
-        if let Some(result) = session_logout_result {
-            if result.is_ok()
-                && let Some(handle) = self.remote_session_ui.handle.as_ref()
-            {
-                handle.local_disconnect();
-            }
-            dialog.session_logout.finish(result);
         }
         let tailscale_serve_result = match &dialog.tailscale_serve_setup {
             RemoteTailscaleServeSetupState::Running { receiver } => match receiver.try_recv() {
@@ -2705,10 +2790,12 @@ impl crate::app::App {
                 ui.small("署名鍵も更新されるため、接続中の端末では PIN の再入力が必要になります。");
                 if pin_configured {
                     ui.add_space(4.0);
-                    match &dialog.session_logout {
+                    match &self.remote_session_ui.session_logout {
                         RemoteSessionLogoutState::Idle => {
                             if ui.button("すべての端末をログアウト").clicked() {
-                                dialog.session_logout.request_confirmation();
+                                self.remote_session_ui
+                                    .session_logout
+                                    .request_confirmation();
                             }
                         }
                         RemoteSessionLogoutState::Confirming => {}
@@ -2724,7 +2811,9 @@ impl crate::app::App {
                         RemoteSessionLogoutState::Finished(Err(error)) => {
                             ui.colored_label(ui.visuals().error_fg_color, error);
                             if ui.button("もう一度試す").clicked() {
-                                dialog.session_logout.request_confirmation();
+                                self.remote_session_ui
+                                    .session_logout
+                                    .request_confirmation();
                             }
                         }
                     }
@@ -2945,8 +3034,10 @@ impl crate::app::App {
                 }
             });
 
-        let logout_confirmation_open =
-            matches!(&dialog.session_logout, RemoteSessionLogoutState::Confirming);
+        let logout_confirmation_open = matches!(
+            &self.remote_session_ui.session_logout,
+            RemoteSessionLogoutState::Confirming
+        );
         if logout_confirmation_open {
             let mut confirm = false;
             let mut cancel = escape_pressed;
@@ -2975,7 +3066,7 @@ impl crate::app::App {
             if confirm {
                 begin_session_logout = true;
             } else if cancel || response.should_close() {
-                dialog.session_logout.cancel_confirmation();
+                self.remote_session_ui.session_logout.cancel_confirmation();
             }
         }
 
@@ -2996,7 +3087,7 @@ impl crate::app::App {
                 .as_ref()
                 .ok_or_else(|| "すべての端末のログアウトを開始できませんでした".to_owned())
                 .and_then(super::RemoteServiceControl::rotate_session_secret);
-            dialog.session_logout.start(result);
+            self.remote_session_ui.session_logout.start(result);
             ctx.request_repaint();
         }
 
@@ -3014,6 +3105,7 @@ impl crate::app::App {
         }
 
         if close_requested || (escape_pressed && !logout_confirmation_open) || !open {
+            self.remote_session_ui.session_logout.dialog_closed();
             self.remote_session_ui.connection_dialog = None;
         } else {
             let pin_saving = matches!(&dialog.pin_editor, RemotePinEditorState::Saving { .. });
@@ -3021,18 +3113,12 @@ impl crate::app::App {
                 &dialog.tailscale_serve_setup,
                 RemoteTailscaleServeSetupState::Running { .. }
             );
-            let session_logout_running = matches!(
-                &dialog.session_logout,
-                RemoteSessionLogoutState::Running { .. }
-            );
             self.remote_session_ui.connection_dialog = Some(dialog);
-            ctx.request_repaint_after(
-                if pin_saving || tailscale_running || session_logout_running {
-                    std::time::Duration::from_millis(50)
-                } else {
-                    std::time::Duration::from_secs(1)
-                },
-            );
+            ctx.request_repaint_after(if pin_saving || tailscale_running {
+                std::time::Duration::from_millis(50)
+            } else {
+                std::time::Duration::from_secs(1)
+            });
         }
     }
 
@@ -3743,7 +3829,6 @@ mod tests {
     fn remote_connection_dialog_has_no_pending_enabled_state() {
         let RemoteConnectionDialogState {
             pin_editor,
-            session_logout,
             tailscale_serve_setup,
         } = RemoteConnectionDialogState::new(false);
         assert!(matches!(pin_editor, RemotePinEditorState::Editing { .. }));
@@ -3751,11 +3836,9 @@ mod tests {
             tailscale_serve_setup,
             RemoteTailscaleServeSetupState::Idle
         ));
-        assert!(matches!(session_logout, RemoteSessionLogoutState::Idle));
 
         let RemoteConnectionDialogState {
             pin_editor,
-            session_logout,
             tailscale_serve_setup,
         } = RemoteConnectionDialogState::new(true);
         assert!(matches!(pin_editor, RemotePinEditorState::Hidden));
@@ -3763,7 +3846,6 @@ mod tests {
             tailscale_serve_setup,
             RemoteTailscaleServeSetupState::Idle
         ));
-        assert!(matches!(session_logout, RemoteSessionLogoutState::Idle));
     }
 
     #[test]
@@ -3772,20 +3854,34 @@ mod tests {
             RemoteSessionLogoutPhase::Idle,
             RemoteSessionLogoutEvent::RequestConfirmation,
         );
-        assert_eq!(confirming, Some(RemoteSessionLogoutPhase::Confirming));
         assert_eq!(
-            remote_session_logout_transition(confirming.unwrap(), RemoteSessionLogoutEvent::Cancel,),
+            confirming.map(|transition| transition.phase),
+            Some(RemoteSessionLogoutPhase::Confirming)
+        );
+        assert_eq!(
+            remote_session_logout_transition(
+                confirming.unwrap().phase,
+                RemoteSessionLogoutEvent::Cancel,
+            )
+            .map(|transition| transition.phase),
             Some(RemoteSessionLogoutPhase::Idle)
         );
 
         let running = remote_session_logout_transition(
-            confirming.unwrap(),
+            confirming.unwrap().phase,
             RemoteSessionLogoutEvent::Confirm,
         );
-        assert_eq!(running, Some(RemoteSessionLogoutPhase::Running));
         assert_eq!(
-            remote_session_logout_transition(running.unwrap(), RemoteSessionLogoutEvent::Finish,),
-            Some(RemoteSessionLogoutPhase::Finished)
+            running.map(|transition| transition.phase),
+            Some(RemoteSessionLogoutPhase::Running)
+        );
+        assert_eq!(
+            remote_session_logout_transition(
+                running.unwrap().phase,
+                RemoteSessionLogoutEvent::FinishSuccess,
+            )
+            .map(|transition| transition.phase),
+            Some(RemoteSessionLogoutPhase::FinishedSuccess)
         );
         assert_eq!(
             remote_session_logout_transition(
@@ -3794,6 +3890,115 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn remote_session_logout_completion_survives_dialog_close_and_disconnects_once() {
+        let mut phase = RemoteSessionLogoutPhase::Running;
+        let mut disconnect_count = 0;
+
+        let closed =
+            remote_session_logout_transition(phase, RemoteSessionLogoutEvent::DialogClosed)
+                .unwrap();
+        phase = closed.phase;
+        disconnect_count += usize::from(closed.disconnect_local);
+        assert_eq!(phase, RemoteSessionLogoutPhase::Running);
+
+        let finished =
+            remote_session_logout_transition(phase, RemoteSessionLogoutEvent::FinishSuccess)
+                .unwrap();
+        phase = finished.phase;
+        disconnect_count += usize::from(finished.disconnect_local);
+
+        let hidden_finished =
+            remote_session_logout_transition(phase, RemoteSessionLogoutEvent::DialogClosed)
+                .unwrap();
+        phase = hidden_finished.phase;
+        disconnect_count += usize::from(hidden_finished.disconnect_local);
+
+        assert_eq!(phase, RemoteSessionLogoutPhase::Idle);
+        assert_eq!(disconnect_count, 1);
+        assert!(
+            remote_session_logout_transition(phase, RemoteSessionLogoutEvent::FinishSuccess,)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn remote_session_logout_open_success_does_not_drain_twice() {
+        let finished = remote_session_logout_transition(
+            RemoteSessionLogoutPhase::Running,
+            RemoteSessionLogoutEvent::FinishSuccess,
+        )
+        .unwrap();
+        assert!(finished.disconnect_local);
+        let closed = remote_session_logout_transition(
+            finished.phase,
+            RemoteSessionLogoutEvent::DialogClosed,
+        )
+        .unwrap();
+        assert_eq!(closed.phase, RemoteSessionLogoutPhase::Idle);
+        assert!(!closed.disconnect_local);
+        assert!(
+            remote_session_logout_transition(
+                finished.phase,
+                RemoteSessionLogoutEvent::FinishSuccess,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn remote_session_logout_dialog_close_table_and_failure_are_explicit() {
+        // 閉じたときの行き先。失敗だけが残り、成功は溜め込まない。
+        let cases = [
+            (
+                RemoteSessionLogoutPhase::Confirming,
+                RemoteSessionLogoutPhase::Idle,
+            ),
+            (
+                RemoteSessionLogoutPhase::Running,
+                RemoteSessionLogoutPhase::Running,
+            ),
+            (
+                RemoteSessionLogoutPhase::FinishedSuccess,
+                RemoteSessionLogoutPhase::Idle,
+            ),
+            (
+                RemoteSessionLogoutPhase::FinishedError,
+                RemoteSessionLogoutPhase::FinishedError,
+            ),
+        ];
+        for (phase, expected_phase) in cases {
+            let transition =
+                remote_session_logout_transition(phase, RemoteSessionLogoutEvent::DialogClosed)
+                    .unwrap();
+            assert_eq!(transition.phase, expected_phase);
+            assert!(!transition.disconnect_local);
+        }
+
+        let failed = remote_session_logout_transition(
+            RemoteSessionLogoutPhase::Confirming,
+            RemoteSessionLogoutEvent::StartFailed,
+        )
+        .unwrap();
+        assert_eq!(failed.phase, RemoteSessionLogoutPhase::FinishedError);
+        assert!(!failed.disconnect_local);
+    }
+
+    #[test]
+    fn remote_session_logout_start_failure_stays_distinct_from_pin_state() {
+        let dialog = RemoteConnectionDialogState::new(true);
+        let mut logout = RemoteSessionLogoutState::default();
+        logout.request_confirmation();
+        logout.start(Err("session secret rotation failed".to_owned()));
+
+        assert!(matches!(dialog.pin_editor, RemotePinEditorState::Hidden));
+        assert!(matches!(
+            logout,
+            RemoteSessionLogoutState::Finished(Err(ref error))
+                if error == "session secret rotation failed"
+        ));
     }
 
     #[test]
