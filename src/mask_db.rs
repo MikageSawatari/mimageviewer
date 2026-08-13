@@ -567,6 +567,182 @@ pub fn rasterize_shapes_into(mask: &mut [bool], shapes: &[Shape], w: usize, h: u
     }
 }
 
+/// 1bit ビットマップマスクを 3x3 近傍で 1px 拡張または縮小する。
+///
+/// `dilate=true` は近傍の OR、`false` は近傍の AND を取る。画像端の近傍座標は
+/// 端の画素へ clamp し、補正レイヤーの `local_adjust_morph_alpha_1px` と同じ規約にする。
+/// 寸法が 0 または `mask` が不足している異常入力では、入力を変更せず複製して返す。
+pub fn morph_bitmap_mask_1px(
+    mask: &[bool],
+    width: usize,
+    height: usize,
+    dilate: bool,
+) -> Vec<bool> {
+    let expected_len = width.saturating_mul(height);
+    if width == 0 || height == 0 || mask.len() < expected_len {
+        return mask.to_vec();
+    }
+
+    let mut out = mask.to_vec();
+    for y in 0..height {
+        let ys = [y.saturating_sub(1), y, y.saturating_add(1).min(height - 1)];
+        for x in 0..width {
+            let xs = [x.saturating_sub(1), x, x.saturating_add(1).min(width - 1)];
+            let mut value = !dilate;
+            for yy in ys {
+                for xx in xs {
+                    if dilate {
+                        value |= mask[yy * width + xx];
+                    } else {
+                        value &= mask[yy * width + xx];
+                    }
+                }
+            }
+            out[y * width + x] = value;
+        }
+    }
+    out
+}
+
+#[inline]
+fn color_within_rgb_tolerance(color: egui::Color32, seed: [u8; 3], tolerance: u8) -> bool {
+    color
+        .r()
+        .abs_diff(seed[0])
+        .max(color.g().abs_diff(seed[1]))
+        .max(color.b().abs_diff(seed[2]))
+        <= tolerance
+}
+
+fn fill_matching_color_span(
+    mask: &mut [bool],
+    visited: &mut [bool],
+    pixels: &[egui::Color32],
+    width: usize,
+    y: usize,
+    x: usize,
+    seed: [u8; 3],
+    tolerance: u8,
+    value: bool,
+) -> (usize, usize, bool) {
+    let row = y * width;
+    let mut start = x;
+    while start > 0 {
+        let candidate = row + start - 1;
+        if visited[candidate] || !color_within_rgb_tolerance(pixels[candidate], seed, tolerance) {
+            break;
+        }
+        start -= 1;
+    }
+
+    let mut end = x + 1;
+    while end < width {
+        let candidate = row + end;
+        if visited[candidate] || !color_within_rgb_tolerance(pixels[candidate], seed, tolerance) {
+            break;
+        }
+        end += 1;
+    }
+
+    let mut changed = false;
+    for xx in start..end {
+        let idx = row + xx;
+        visited[idx] = true;
+        if mask[idx] != value {
+            mask[idx] = value;
+            changed = true;
+        }
+    }
+    (start, end, changed)
+}
+
+/// seed RGB との最大チャンネル差が許容値以下の画素を 1bit マスクへ書き込む。
+///
+/// `connected=true` では seed から 4 近傍でつながる領域だけを、1 画素ごとの queue を
+/// 作らないスキャンライン span fill で処理する。`false` では画像全体を 1 パス走査する。
+/// alpha は色差判定に使わない。戻り値は少なくとも 1 画素のマスク値が変わった場合に true。
+pub fn flood_fill_bitmap_mask(
+    mask: &mut [bool],
+    image: &egui::ColorImage,
+    seed_x: usize,
+    seed_y: usize,
+    tolerance: u8,
+    connected: bool,
+    value: bool,
+) -> bool {
+    let [width, height] = image.size;
+    let expected_len = width.saturating_mul(height);
+    if width == 0
+        || height == 0
+        || seed_x >= width
+        || seed_y >= height
+        || mask.len() < expected_len
+        || image.pixels.len() < expected_len
+    {
+        return false;
+    }
+
+    let seed_color = image.pixels[seed_y * width + seed_x];
+    let seed = [seed_color.r(), seed_color.g(), seed_color.b()];
+    if !connected {
+        let mut changed = false;
+        for (idx, &color) in image.pixels[..expected_len].iter().enumerate() {
+            if color_within_rgb_tolerance(color, seed, tolerance) && mask[idx] != value {
+                mask[idx] = value;
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    let mut visited = vec![false; expected_len];
+    let (start, end, mut changed) = fill_matching_color_span(
+        mask,
+        &mut visited,
+        &image.pixels,
+        width,
+        seed_y,
+        seed_x,
+        seed,
+        tolerance,
+        value,
+    );
+    let mut spans = Vec::with_capacity(height.min(1024));
+    spans.push((seed_y, start, end));
+
+    while let Some((y, start, end)) = spans.pop() {
+        for adjacent_y in [y.checked_sub(1), y.checked_add(1).filter(|&yy| yy < height)]
+            .into_iter()
+            .flatten()
+        {
+            let row = adjacent_y * width;
+            let mut x = start;
+            while x < end {
+                let idx = row + x;
+                if visited[idx] || !color_within_rgb_tolerance(image.pixels[idx], seed, tolerance) {
+                    x += 1;
+                    continue;
+                }
+                let (next_start, next_end, span_changed) = fill_matching_color_span(
+                    mask,
+                    &mut visited,
+                    &image.pixels,
+                    width,
+                    adjacent_y,
+                    x,
+                    seed,
+                    tolerance,
+                    value,
+                );
+                changed |= span_changed;
+                spans.push((adjacent_y, next_start, next_end));
+                x = next_end;
+            }
+        }
+    }
+    changed
+}
+
 /// ブラシ線分が触れうる画像内 bbox を半開区間で返す。
 pub fn brush_line_bbox(
     w: usize,
@@ -1152,6 +1328,167 @@ pub fn rescale_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn color_image(colors: &[egui::Color32], width: usize, height: usize) -> egui::ColorImage {
+        egui::ColorImage::new([width, height], colors.to_vec())
+    }
+
+    #[test]
+    fn bitmap_mask_morph_1px_uses_clamped_3x3_neighbors() {
+        let corner = vec![
+            true, false, false, //
+            false, false, false, //
+            false, false, false,
+        ];
+        assert_eq!(
+            morph_bitmap_mask_1px(&corner, 3, 3, true),
+            vec![
+                true, true, false, //
+                true, true, false, //
+                false, false, false,
+            ]
+        );
+
+        let center = vec![
+            false, false, false, //
+            false, true, false, //
+            false, false, false,
+        ];
+        assert_eq!(morph_bitmap_mask_1px(&center, 3, 3, true), vec![true; 9]);
+        assert_eq!(morph_bitmap_mask_1px(&center, 3, 3, false), vec![false; 9]);
+    }
+
+    #[test]
+    fn bitmap_mask_morph_1px_preserves_abnormal_zero_dimensions() {
+        let src = vec![true, false];
+        assert_eq!(morph_bitmap_mask_1px(&src, 0, 2, true), src);
+        assert_eq!(morph_bitmap_mask_1px(&src, 2, 0, false), src);
+    }
+
+    #[test]
+    fn bitmap_mask_flood_fill_connected_stays_in_seed_component() {
+        let red = egui::Color32::from_rgb(100, 20, 30);
+        let blue = egui::Color32::from_rgb(20, 30, 100);
+        let image = color_image(&[red, red, blue, red, red], 5, 1);
+        let mut mask = vec![false; 5];
+
+        assert!(flood_fill_bitmap_mask(
+            &mut mask, &image, 0, 0, 0, true, true
+        ));
+        assert_eq!(mask, vec![true, true, false, false, false]);
+
+        assert!(flood_fill_bitmap_mask(
+            &mut mask, &image, 0, 0, 0, true, false
+        ));
+        assert_eq!(mask, vec![false; 5]);
+    }
+
+    #[test]
+    fn bitmap_mask_flood_fill_connected_uses_four_neighbors() {
+        let red = egui::Color32::from_rgb(100, 20, 30);
+        let blue = egui::Color32::from_rgb(20, 30, 100);
+        let image = color_image(&[red, blue, blue, red], 2, 2);
+        let mut mask = vec![false; 4];
+
+        assert!(flood_fill_bitmap_mask(
+            &mut mask, &image, 0, 0, 0, true, true
+        ));
+        assert_eq!(mask, vec![true, false, false, false]);
+    }
+
+    #[test]
+    fn bitmap_mask_flood_fill_non_connected_matches_all_components() {
+        let red = egui::Color32::from_rgb(100, 20, 30);
+        let blue = egui::Color32::from_rgb(20, 30, 100);
+        let image = color_image(&[red, red, blue, red, red], 5, 1);
+        let mut mask = vec![false; 5];
+
+        assert!(flood_fill_bitmap_mask(
+            &mut mask, &image, 0, 0, 0, false, true
+        ));
+        assert_eq!(mask, vec![true, true, false, true, true]);
+    }
+
+    #[test]
+    fn bitmap_mask_flood_fill_tolerance_boundary_is_inclusive() {
+        let image = color_image(
+            &[
+                egui::Color32::from_rgb(100, 100, 100),
+                egui::Color32::from_rgb(110, 90, 100),
+                egui::Color32::from_rgb(100, 100, 111),
+            ],
+            3,
+            1,
+        );
+        let mut mask = vec![false; 3];
+
+        assert!(flood_fill_bitmap_mask(
+            &mut mask, &image, 0, 0, 10, false, true
+        ));
+        assert_eq!(mask, vec![true, true, false]);
+    }
+
+    #[test]
+    fn bitmap_mask_flood_fill_rejects_zero_dimensions() {
+        let width_zero = egui::ColorImage::new([0, 2], Vec::new());
+        let height_zero = egui::ColorImage::new([2, 0], Vec::new());
+        let mut mask = Vec::new();
+        assert!(!flood_fill_bitmap_mask(
+            &mut mask,
+            &width_zero,
+            0,
+            0,
+            0,
+            true,
+            true
+        ));
+        assert!(!flood_fill_bitmap_mask(
+            &mut mask,
+            &height_zero,
+            0,
+            0,
+            0,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    #[ignore = "8192x8192 performance measurement; run explicitly with --release"]
+    fn bitmap_mask_flood_fill_8192_worst_case_benchmark() {
+        const SIDE: usize = 8192;
+        let image = egui::ColorImage::new(
+            [SIDE, SIDE],
+            vec![egui::Color32::from_rgb(80, 120, 160); SIDE * SIDE],
+        );
+        let mut mask = vec![false; SIDE * SIDE];
+        let mut connected_times = Vec::new();
+        let mut non_connected_times = Vec::new();
+
+        for _ in 0..3 {
+            mask.fill(false);
+            let started = std::time::Instant::now();
+            assert!(flood_fill_bitmap_mask(
+                &mut mask, &image, 0, 0, 0, true, true
+            ));
+            connected_times.push(started.elapsed());
+
+            mask.fill(false);
+            let started = std::time::Instant::now();
+            assert!(flood_fill_bitmap_mask(
+                &mut mask, &image, 0, 0, 0, false, true
+            ));
+            non_connected_times.push(started.elapsed());
+        }
+
+        assert!(mask[0] && mask[SIDE * SIDE - 1]);
+        connected_times.sort_unstable();
+        non_connected_times.sort_unstable();
+        eprintln!(
+            "8192x8192 median: connected={:?}, non_connected={:?}; runs={connected_times:?}/{non_connected_times:?}",
+            connected_times[1], non_connected_times[1]
+        );
+    }
 
     #[test]
     fn roundtrip_compress() {

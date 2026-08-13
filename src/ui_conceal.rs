@@ -866,6 +866,32 @@ impl App {
         }
     }
 
+    fn apply_conceal_bitmap_morph_1px(&mut self, dilate: bool) {
+        let [w, h] = self.conceal_mask_size;
+        let Some(mask) = self.conceal_mask.as_ref() else {
+            return;
+        };
+        let next = crate::mask_db::morph_bitmap_mask_1px(mask, w, h, dilate);
+        if mask.as_slice() == next.as_slice() {
+            return;
+        }
+
+        self.push_conceal_undo();
+        self.conceal_mask = Some(next);
+        self.mark_conceal_mask_texture_dirty(None);
+        if let Some(fs_idx) = self.fullscreen_idx {
+            self.clear_conceal_caches(fs_idx);
+        }
+        self.show_feedback_toast(
+            if dilate {
+                "手動マスクを1px拡張しました。"
+            } else {
+                "手動マスクを1px縮小しました。"
+            }
+            .to_string(),
+        );
+    }
+
     // ── マスクテクスチャ ──────────────────────────────────────────
 
     fn mark_conceal_mask_texture_dirty(&mut self, dirty: Option<MaskDirtyRect>) {
@@ -2126,6 +2152,31 @@ impl App {
                                                 }
                                             });
                                         }
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 4.0;
+                                            if ui
+                                                .add_sized(btn_size, egui::Button::new("1px拡張"))
+                                                .clicked()
+                                            {
+                                                self.apply_conceal_bitmap_morph_1px(true);
+                                            }
+                                            if ui
+                                                .add_sized(btn_size, egui::Button::new("1px縮小"))
+                                                .clicked()
+                                            {
+                                                self.apply_conceal_bitmap_morph_1px(false);
+                                            }
+                                        });
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(
+                                                    "ビットマップ本体のみ。オブジェクトには影響しません。",
+                                                )
+                                                .size(10.0)
+                                                .color(egui::Color32::from_gray(150)),
+                                            )
+                                            .wrap(),
+                                        );
                                         ui.label(
                                             egui::RichText::new("オブジェクト:")
                                                 .color(egui::Color32::from_gray(200)),
