@@ -377,6 +377,41 @@ export function visualViewportScaleTransition(
   };
 }
 
+/// iOS / iPadOS は `overflow: hidden` の文書でも visual viewport 自体を動かすことがある。
+/// レイアウトは動かないので `position: fixed` の UI がその分持ち上がり、下に body の背景が
+/// 出る。回転すると直るのは viewport が組み直されるため。
+///
+/// **拡大中は戻さない。** 利用者がブラウザのピンチで拡大しているとき、ずれは本人の
+/// パン操作そのもので、引き戻すと操作と喧嘩する。戻すのは等倍のときだけ。
+export function visualViewportOffsetRecovery({
+  offsetTop,
+  offsetLeft,
+  scrollX,
+  scrollY,
+  scale,
+  minimumPx = 1,
+} = {}) {
+  const finite = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
+  const top = finite(offsetTop);
+  const left = finite(offsetLeft);
+  const x = finite(scrollX);
+  const y = finite(scrollY);
+  const zoom = normalizeVisualViewportScale(scale);
+  if (zoom !== null && zoom > 1.01) return null;
+  const threshold = Math.max(1, Number(minimumPx) || 1);
+  const drift = Math.max(Math.abs(top), Math.abs(left), Math.abs(x), Math.abs(y));
+  if (drift < threshold) return null;
+  return {
+    type: "visual_viewport",
+    action: "offset_recovered",
+    offset_top: Math.round(top),
+    offset_left: Math.round(left),
+    scroll_x: Math.round(x),
+    scroll_y: Math.round(y),
+    visual_viewport_scale: zoom,
+  };
+}
+
 function normalizedRemoteSubresource(value) {
   if (!value || typeof value !== "object") return null;
   if (value.kind === "file") return { kind: "file" };

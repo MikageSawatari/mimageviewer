@@ -104,6 +104,7 @@ import {
   viewerSpreadLayout,
   viewerTransformTelemetry,
   viewerWheelCommand,
+  visualViewportOffsetRecovery,
   visualViewportScaleTransition,
 } from "./command-core.mjs";
 import {
@@ -13775,7 +13776,27 @@ function installTelemetry() {
     if (document.visibilityState === "hidden") flushTelemetry(true);
   });
   const visualViewport = window.visualViewport;
+  // 文書は overflow:hidden で動かないが、iOS / iPadOS は visual viewport の方をずらすことが
+  // ある。そうなると UI 全体が持ち上がり、下に body の背景だけが残る。等倍のときだけ引き戻し、
+  // 起きた事実と量を記録する (再現手順が無いので、次に起きたときに数字が残るようにしておく)。
+  const recoverVisualViewportOffset = () => {
+    const event = visualViewportOffsetRecovery({
+      offsetTop: visualViewport?.offsetTop,
+      offsetLeft: visualViewport?.offsetLeft,
+      scrollX: window.scrollX,
+      scrollY: window.scrollY,
+      scale: visualViewport?.scale,
+    });
+    if (!event) return;
+    enqueueTelemetry(event);
+    window.scrollTo(0, 0);
+  };
+  visualViewport?.addEventListener?.("scroll", recoverVisualViewportOffset, {
+    passive: true,
+  });
+  window.addEventListener("scroll", recoverVisualViewportOffset, { passive: true });
   visualViewport?.addEventListener?.("resize", () => {
+    recoverVisualViewportOffset();
     telemetryState.visualViewportObservedAtMs = performance.now();
     clearTimeout(telemetryState.visualViewportTimer);
     telemetryState.visualViewportTimer = setTimeout(() => {

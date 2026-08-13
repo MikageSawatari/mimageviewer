@@ -117,6 +117,7 @@ import {
   videoStartSeekTarget,
   videoStartupDecision,
   videoTapCommand,
+  visualViewportOffsetRecovery,
   visualViewportScaleTransition,
   appUpdateNotice,
   adjustmentResetVisible,
@@ -3006,4 +3007,37 @@ test("admission retry honours Retry-After and stays within a usable range", () =
   assert.equal(pageAdmissionRetryDelayMs(60_000, 0), 2000);
   assert.equal(pageAdmissionRetryDelayMs(1, 0), 100);
   assert.equal(pageAdmissionRetryDelayMs("bad", 0), 250);
+});
+
+test("a drifted visual viewport is pulled back and recorded", () => {
+  assert.equal(
+    visualViewportOffsetRecovery({ offsetTop: 0, offsetLeft: 0, scrollX: 0, scrollY: 0, scale: 1 }),
+    null
+  );
+  const recovered = visualViewportOffsetRecovery({
+    offsetTop: 96, offsetLeft: 0, scrollX: 0, scrollY: 0, scale: 1,
+  });
+  assert.equal(recovered.action, "offset_recovered");
+  assert.equal(recovered.offset_top, 96);
+});
+
+test("a browser-zoomed viewport is left alone, because the drift is the user panning", () => {
+  assert.equal(
+    visualViewportOffsetRecovery({ offsetTop: 96, offsetLeft: 40, scrollX: 0, scrollY: 0, scale: 2.4 }),
+    null
+  );
+  // 等倍へ戻ったら、また面倒を見る対象になる。
+  assert.ok(
+    visualViewportOffsetRecovery({ offsetTop: 96, offsetLeft: 40, scrollX: 0, scrollY: 0, scale: 1 })
+  );
+});
+
+test("document scroll counts as drift even when the visual viewport reports zero", () => {
+  assert.ok(
+    visualViewportOffsetRecovery({ offsetTop: 0, offsetLeft: 0, scrollX: 0, scrollY: 120, scale: 1 })
+  );
+  assert.equal(
+    visualViewportOffsetRecovery({ offsetTop: 0.4, offsetLeft: 0, scrollX: 0, scrollY: 0, scale: 1 }),
+    null
+  );
 });
