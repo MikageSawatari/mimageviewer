@@ -17813,7 +17813,7 @@ impl App {
             return true;
         }
 
-        if primary_pressed
+        if secondary_pressed
             && pointer_pos.is_some_and(|pos| layout.canvas_rect.contains(pos))
             && let Some(pos) = canvas_pos
         {
@@ -17826,7 +17826,7 @@ impl App {
                     },
                 )
             });
-        } else if primary_down
+        } else if secondary_down
             && let Some(pos) = canvas_pos
             && let Some(PanoramaNavigatorInteraction::Select { start, .. }) = interaction
         {
@@ -17842,7 +17842,7 @@ impl App {
             ctx.request_repaint();
         }
 
-        if primary_released
+        if secondary_released
             && let Some(PanoramaNavigatorInteraction::Select { start, current }) = interaction
         {
             // A corner click releases over the header, so any primary selection present here is
@@ -17881,7 +17881,7 @@ impl App {
             return true;
         }
 
-        if secondary_pressed
+        if primary_pressed
             && pointer_pos.is_some_and(|pos| layout.canvas_rect.contains(pos))
             && let Some(pos) = canvas_pos
             && let Some(pano) = self.panorama_state.as_ref()
@@ -17896,7 +17896,7 @@ impl App {
                     },
                 )
             });
-        } else if secondary_down
+        } else if primary_down
             && let Some(pos) = canvas_pos
             && let Some(PanoramaNavigatorInteraction::Pan {
                 start_uv,
@@ -17915,8 +17915,7 @@ impl App {
             }
             ctx.request_repaint();
         }
-        if secondary_released
-            && matches!(interaction, Some(PanoramaNavigatorInteraction::Pan { .. }))
+        if primary_released && matches!(interaction, Some(PanoramaNavigatorInteraction::Pan { .. }))
         {
             ctx.data_mut(|data| {
                 data.remove_temp::<PanoramaNavigatorInteraction>(
@@ -19299,6 +19298,12 @@ impl App {
                         // A recognized tap is an intentional discrete page turn,
                         // including in continuous reading. Use the same unit
                         // resolver as FsPageNext/FsPagePrev.
+                        // 一時計装 (§1.63 タッチ): 表示モードがキャンバスを持つのに
+                        // ページが動く経路を特定する。原因が確定したら外す。
+                        crate::logger::log(format!(
+                            "page_nav source=touch_tap panorama={} analysis={} tap_zones={}",
+                            panorama_active, self.analysis_mode, touch_tap_zones_enabled
+                        ));
                         let base =
                             fullscreen_click_nav_delta_for_side(left, self.spread_mode.is_rtl());
                         page_nav = self.spread_page_nav(base);
@@ -19590,6 +19595,7 @@ impl App {
                         self.maybe_rerender_pdf(self.fs_zoom);
                     }
                 } else {
+                    crate::logger::log("page_nav source=wheel_normal".to_string());
                     let base = if wheel_y < 0.0 { 1 } else { -1 };
                     page_nav = self.spread_page_nav(base);
                 }
@@ -19814,6 +19820,10 @@ impl App {
                                     && !continuous_active
                                     && !display_mode_owns_canvas
                                 {
+                                    crate::logger::log(format!(
+                                        "page_nav source=mouse_click panorama={} analysis={}",
+                                        display_mode_owns_canvas, self.analysis_mode
+                                    ));
                                     let base = fullscreen_click_nav_base_delta(
                                         pos.x,
                                         full_rect.center().x,
