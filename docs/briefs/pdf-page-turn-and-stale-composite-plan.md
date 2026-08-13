@@ -94,13 +94,78 @@ erase / fs_cache / thumbnail しか見ないための **fallback ラベル**で�
 `capture_colorize_page_transition_holdover` を削除している。解除条件の依存先が
 変わった可能性がある。
 
-### 却下した仮説 (現時点)
+### 確定 (Codex gpt-5.6-sol の検証と合意、2026-08-14)
 
-- `final_composite_cache` の idx 一致だけの引き方が直接原因、という説。
-  引き方も `resolve_fs_display_tex` の順序も v2.13.0 と同一で、さらに
-  `start_loading_items_inner` (フォルダ読み込み経路) が
-  `clear_all_final_pipeline_caches` を**無条件で呼ぶ**ため、移動時にキャッシュは空になる。
-  ただし世代の刻印が無いこと自体は別の穴として残る (要修正かは Codex の回答で判断)
+**供給元は holdover。`final_composite_cache` 説は否定された。**
+
+1. 最初の Ctrl+↓ の直前、`capture_fs_nav_holdover` が `resolve_fs_display_tex` 経由で
+   表示中の unit を退避する。この時点では final composite が `Managed(641)` を
+   正当に供給する (ui_fullscreen.rs 5063 / 4657)
+2. フォルダ移動は fullscreen を閉じ、`edit_result_cache` / `final_composite_cache` /
+   `comic_cache` / `fs_cache` を**クリアする** (app.rs 49757 / 52246)。
+   よって移動後にキャッシュ側へ古いエントリは残っていない
+3. しかし **clone された `TextureHandle` は `FsHoldover::FolderNavigation` が所有し続ける**。
+   連打時は同じ handle を保持したまま `fs_nav_locked_gen` だけ押し直す
+   (ui_fullscreen.rs 21266 「Keep the existing holdover handle…」)。**これは意図的**
+4. 新しい target が ready になるまで `fs_nav_holdover_decision` が同じ unit を返す (4993)
+5. 通常ページを描いた上に holdover を重ねる (12724)。これが
+   `source="nav_holdover" branch="fullscreen_overlay"`
+6. 診断分類器は現在のキャッシュ群としか照合しないので `processed_other` に落ちる (4490)。
+   paint は現在の `page.idx` / item key / `items_generation` を使うため (14127)、
+   **新しい PDF のキーに古い texture id が並ぶ**
+
+**「自己再退避」の却下は結果的に正しかった** (`resolve_fs_display_tex` は
+`fs_holdover_tex` を読まない)。ただし**自己再退避は不要**で、最初の clone が
+そのまま生き続けるだけだった。
+
+### v2.13.0 との差 (Codex 判定)
+
+**保持の仕組み自体は v2.13.0 以前から同じ** (`dd2e3c492` が導入、v2.13.0 の祖先)。
+変わったのは **holdover の geometry**:
+
+- `FsDisplayUnitHoldoverPage` は「items 入れ替え後に capture 時の `idx` から
+  geometry を再導出してはならない」と明記している (app.rs 6506)
+- ところが `draw_fs_display_unit_holdover` はその capture 時 `idx` を通常の描画経路へ
+  渡している (ui_fullscreen.rs 25614)
+- 現在の `draw_fs_image` は `self.items[0]` が**差し替わった新しい PDF ページ**であることを
+  見て、その PDF の `fs_page_layout_source_size(0)` を引く (21955 / 14540)
+
+原因コミット: `1b5fff92` (draw_fs_image に PDF の current-item layout 参照を導入) /
+`22e47021` (寸法不一致時に page-layout 枠内へ contain するよう変更) /
+`7dbb2f39` (PDF page-box レイアウトと raster 座標の分離)。
+
+**これが「古い絵が次の PDF のページ枠に合わせて 1 度変換されてから中身が差し替わる」の実体。**
+v2.13.0 では capture 時の `source_size` をそのまま使い、差し替え先の layout を参照しなかったので、
+handle は残っても geometry が安定しており目立たなかった。
+
+⚠ Codex の留保: v2.13.0 が「絶対に古い絵を出さない」ことは source からは証明できない
+(保持機構は同じ)。利用者の実機で再現しなかった差は、target thumbnail の readiness /
+キャッシュ状態 / final-effect の有効設定 / 入力タイミングなど runtime 条件の可能性がある。
+
+なお **Ctrl+↓ は通過表示 (pass-through) の再投入とは無関係**。物理 chord 照合が
+修飾キー完全一致を要求するため (keymap.rs 5993)、Ctrl+Down は無修飾 Down の
+ページ送り経路を起動しない。
+
+### 却下した仮説
+
+- **`final_composite_cache` の idx 一致だけの引き方が直接原因** — 否定。
+  holdover が握る clone は、キャッシュを空にしても解放されない。
+  `keep_set_evict` (app.rs 56719) も修理境界ではない。
+  ただし**世代の刻印が無いこと自体は latent な穴として残る** (下の「同型の穴」)
+- **自己再退避ループ** — 不要だった (最初の clone が生き続けるだけ)
+
+### 同型の穴 (Codex 指摘、今回は latent)
+
+いずれも `close_fullscreen` のクリアに救われているだけで、軽量な items 差し替え経路が
+そのクリアを外すと ABA になる:
+
+- `current_edit_result_texture` が `idx` だけで走査し他の `EditResultKey` 世代を無視 (app.rs 53781)
+- `current_comic_composite_texture` が `idx` 直引き (コメントに「世代チェックなし」と明記、app.rs 56470)
+- `conceal_cache` は `idx` + global conceal 世代のみで `items_generation` を見ない (ui_fullscreen.rs 4297)
+- `EditResultKey` / `FinalCompositeKey` に item-context 世代が無い (app.rs 5550 / 6032)
+
+**意図された正しい形は `ContinuousPageTransition`** で、これは `items_generation` を
+自分で持っている (app.rs 6434)。
 
 ### 修正方針 (Codex の回答で確定させる)
 
@@ -169,10 +234,70 @@ PDF ページは PDFium レンダで 1 枚 300ms 前後かかり、キーリピ�
 
 ---
 
+## 修正方針 (Codex と合意、2026-08-14)
+
+①と②は**同じ 1 つの仕組みへ収束する**。「解決していない移動先がある間、何を見せるか」を
+型で持ち、通過した対象を必ず提示する。
+
+### Part A — holdover を capture 時の geometry だけで描く (①の見た目の直接原因)
+
+- `FsDisplayUnitHoldoverPage` に **canonical layout geometry を capture 時に持たせる**
+  (rotation / source size / content bbox と並べる)
+- 単ページ・見開きとも、holdover の描画は**この capture 済み geometry だけ**から行う
+- holdover 描画中に **現在の `self.items` / thumbnails / page-layout メタを一切参照しない**
+- 画面矩形ではなく **canonical layout size** を持つこと (holdover 表示中に viewport が
+  正当にリサイズされ得るため)
+- 診断分類器 (ui_fullscreen.rs 4490) に **holdover を追加**する。
+  現状 erase / fs_cache / thumbnail しか見ず、holdover を `processed_other` と誤表示して
+  調査を誤らせた
+
+Part A だけで「枠に合わせて変形してから中身が入れ替わる」「ちらつく」は止まる。
+**ただし中間の PDF が表示されないことは直らない。**
+
+### Part B — 受理した移動先を必ず提示し、捌けないキーリピートは捨てる (①の残りと②)
+
+利用者判断 (2026-08-14): **通過するページ / 移動先は、サムネイル画質でよいので必ず実際に
+表示する。1 ページ 300ms かかるならそれは許容する。**
+
+- **型付きの未解決 page-turn / nav unit (sequence)** を持つ:
+  - 移動先の rendition が ready になるまで、直前の unit を**原子的に**保持する
+  - **受理した対象は必ず 1 度提示してから**次を受理する
+  - 提示待ちの間に届いたキーリピートは**溜めずに捨てる** (溜めるとキーを離した後も進み続ける)
+  - キーアップで landing の rendition / final image へ settle する
+- 黒背景 + パスのプレースホルダは、本当に何も無いとき (初回オープン) だけに限定する
+
+**なぜ「直前の絵を保持するだけ」では駄目か** (Codex 指摘): 移動だけ先へ進みながら古い絵を
+出し続けると、飛ばしたページを見せないことになり **R1 に反する**
+(docs/display-pipeline.md 1524)。保持自体は spec が要求する正しい fallback だが
+(同 1613 / 1828)、「提示せずに進む」ことが違反。
+
+### ②の経路の訂正 (Codex 指摘)
+
+- 単ページ表示のパス文字列は `prepare_fullscreen_state` 内の **`location_display_for`**
+  から来る (ui_fullscreen.rs 14383)。`location_display_for_loading` は見開きと
+  連結読みの経路 (25731 ほか)
+- `page_turn_decision_for_inputs` は burst 中、`passthrough_rendition_ready == false`
+  でも **PassThrough を選ぶ** (7427)。**この挙動を要求する unit test が 32279 にある**
+  ので、変更時はテストごと直す
+- `prepare_fullscreen_state` が full texture を `None` に落とし (14317)、
+  `ensure_passthrough_rendition` は catalog thumbnail と `thumb_pixels[idx]` の
+  **両方**が無いと `None` を返す (app.rs 60740)。両方欠けると 22063 の
+  「読込中...」+ パスへ到達する
+- 352 件の `passthrough_rendition_unavailable` は「rendition が長く不在だった」ことは
+  示すが、**352 回のレンダ失敗を意味しない** (frame / display-unit page ごとに出る)。
+  PDFium の遅さは有力だが、queueing / cancel / `thumb_pixels` 欠落も候補
+
+### やらないこと
+
+- `final_composite_cache` への `items_generation` 追加は**この不具合の修正にはならない**。
+  hardening としては有効だが、やるなら key / read / insert のライフサイクル全体に通す必要があり
+  (app.rs 55292 / 55640 にも exact-key ヒットがある)、**リリース直前にやる範囲ではない**。
+  「同型の穴」としてバックログへ送る
+- bisect は実施しない (影響は v3.0.0 のみと利用者の実機確認で確定済み)
+
 ## 進め方
 
-1. Codex (gpt-5.6-sol, read-only) に ① の原因判定を依頼中。**結果が出るまで実装しない**
-   (一度誤った分析で実装しかけているため、検証を挟む)
-2. ① の原因確定後、① と ② のブリーフを Codex へ出して実装
+1. ~~Codex に原因判定を依頼~~ **完了。上記で合意**
+2. Part A → Part B の順で実装 (A は範囲が小さく単独で価値がある)
 3. `cargo fmt` / `test-full.ps1` / `check_ui_glyphs.py` を通す
 4. 検証ビルドを作って実機確認 → OK なら v3.0.0 の配布ビルドを作り直す
