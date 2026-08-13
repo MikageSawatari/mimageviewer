@@ -77,7 +77,19 @@ pub(crate) struct TapZoneGeometry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TouchSurfaceBehavior {
     Grid,
-    Viewer { accepts_pinch: bool },
+    Viewer {
+        accepts_pinch: bool,
+        /// タップをページ送り / 中央タップとして解釈するか。
+        ///
+        /// 360 度ビューや分析ツールのように**画面全体が自前のポインタ操作を持つ**面では
+        /// false にする。1 本指はそのまま egui のポインタとして通り (見回し・ガイド操作が
+        /// 従来どおり動く)、2 本指だけがピンチとして扱われる。
+        ///
+        /// かつてこれらの面は認識器ごと止めていたが、それだと**ピンチまで巻き添えで
+        /// 消える** (利用者報告 2026-08-13: 360 と分析でピンチが効かない)。
+        /// 「タップ判定を使うか」と「ピンチを受け取るか」は別の問い。
+        tap_zones: bool,
+    },
 }
 
 impl TouchSurfaceBehavior {
@@ -86,9 +98,17 @@ impl TouchSurfaceBehavior {
             self,
             Self::Grid
                 | Self::Viewer {
-                    accepts_pinch: true
+                    accepts_pinch: true,
+                    ..
                 }
         )
+    }
+
+    fn uses_tap_zones(self) -> bool {
+        match self {
+            Self::Grid => true,
+            Self::Viewer { tap_zones, .. } => tap_zones,
+        }
     }
 }
 
@@ -317,6 +337,12 @@ impl TouchRecognizer {
     ) -> Vec<TouchCommand> {
         if self.contacts.is_empty() {
             self.owner = match start_policy {
+                // タップ判定を持たない面では、1 本指は最初から素通り扱いにする。
+                // `Undecided` にするとタップゾーンへ落ちうるし、`WidgetPassthrough`
+                // にするとピンチが始まらない (下の pinch 分岐が弾く)。
+                TouchStartPolicy::ClassifyGeometry if !geom.behavior.uses_tap_zones() => {
+                    TouchOwner::ViewerPointerPassthrough
+                }
                 TouchStartPolicy::ClassifyGeometry => {
                     if classify_tap(geom, sample.pos) == TapZone::Excluded {
                         TouchOwner::WidgetPassthrough
@@ -575,6 +601,7 @@ mod tests {
             excluded: Vec::new(),
             behavior: TouchSurfaceBehavior::Viewer {
                 accepts_pinch: true,
+                tap_zones: true,
             },
         }
     }
@@ -657,6 +684,7 @@ mod tests {
                 excluded: Vec::new(),
                 behavior: TouchSurfaceBehavior::Viewer {
                     accepts_pinch: true,
+                    tap_zones: true,
                 },
             };
             assert_eq!(classify_tap(&geometry, surface.center()), TapZone::Center);

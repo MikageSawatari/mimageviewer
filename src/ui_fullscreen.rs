@@ -1658,13 +1658,16 @@ struct StillTouchInputEnabledInputs {
     slideshow_popup_open: bool,
     rotation_popup_open: bool,
     compare_wipe_active: bool,
-    panorama_active: bool,
-    analysis_active: bool,
     overlay_edit_active: bool,
     view_trim_active: bool,
     zoom_active: bool,
 }
 
+/// タッチ入力を扱ってよい状況か。ここで false なら**ジェスチャー認識ごと止まる**。
+///
+/// 別ウィンドウ・ダイアログ・IME・ポップアップのように、そもそもキャンバスが
+/// 前面にない状況だけを落とす。「自前のポインタ操作を持つ表示モード」は
+/// `still_touch_tap_zones_enabled` の側で落とす。
 fn still_touch_input_enabled(input: StillTouchInputEnabledInputs) -> bool {
     !input.is_video
         && !input.is_music_view
@@ -1678,11 +1681,23 @@ fn still_touch_input_enabled(input: StillTouchInputEnabledInputs) -> bool {
         && !input.slideshow_popup_open
         && !input.rotation_popup_open
         && !input.compare_wipe_active
-        && !input.panorama_active
-        && !input.analysis_active
         && !input.overlay_edit_active
         && !input.view_trim_active
         && !input.zoom_active
+}
+
+/// タップをページ送り / 中央タップとして解釈してよいか。
+///
+/// 360 度ビューと分析ツールは**画面全体が自前のポインタ操作**なので、タップ判定を
+/// 使わない。ただしピンチは要る。かつては両方まとめて `still_touch_input_enabled`
+/// で落としていて、**ピンチまで巻き添えで消えていた** (利用者報告 2026-08-13)。
+///
+/// この 2 つだけを分けるのは、**アイコンから入れる = キーボード無しで到達できる**
+/// 表示モードがこの 2 つだからという判断 (2026-08-13、利用者判断)。ズームモードは
+/// ホバー前提、編集系と比較ワイプはキー操作とセットでしか使えないので、
+/// `still_touch_input_enabled` 側で止めたままにする。
+fn still_touch_tap_zones_enabled(panorama_active: bool, analysis_active: bool) -> bool {
+    !panorama_active && !analysis_active
 }
 
 #[derive(Clone, Copy)]
@@ -18649,6 +18664,7 @@ impl App {
                     excluded: Vec::new(),
                     behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                         accepts_pinch: true,
+                        tap_zones: true,
                     },
                 },
                 self.frame_counter,
@@ -18764,6 +18780,7 @@ impl App {
                         excluded: Vec::new(),
                         behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                             accepts_pinch: true,
+                            tap_zones: true,
                         },
                     },
                     self.frame_counter,
@@ -19056,6 +19073,7 @@ impl App {
                     excluded: Vec::new(),
                     behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                         accepts_pinch: true,
+                        tap_zones: true,
                     },
                 },
                 self.frame_counter,
@@ -19109,19 +19127,23 @@ impl App {
             slideshow_popup_open: self.slideshow_popup_open,
             rotation_popup_open: fs_rotation_popup_open(ctx),
             compare_wipe_active,
-            panorama_active,
-            analysis_active: self.analysis_mode,
             overlay_edit_active: self.is_overlay_edit_mode_active(),
             view_trim_active: self.view_trim_mode,
             zoom_active: self.fs_zoom_mode_engaged(),
         });
+        // タップ判定を使わない面でも、ピンチだけは受け取る。
+        let touch_tap_zones_enabled =
+            still_touch_tap_zones_enabled(panorama_active, self.analysis_mode);
         let touch_help_scope = panel_fs_idx.map(|fs_idx| StillTouchChromeLatch {
             fs_idx,
             session_started_at: self.fullscreen_opened_at(),
         });
         let mut touch_help_phase_before =
             touch_help_scope.and_then(|scope| still_touch_first_run_help_phase(ctx, scope));
-        if self.settings.touch_still_chrome_learned || !touch_input_enabled {
+        if self.settings.touch_still_chrome_learned
+            || !touch_input_enabled
+            || !touch_tap_zones_enabled
+        {
             if touch_help_phase_before.is_some() {
                 clear_still_touch_first_run_help(ctx);
                 touch_help_phase_before = None;
@@ -19167,6 +19189,7 @@ impl App {
                 excluded: touch_excluded,
                 behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                     accepts_pinch: true,
+                    tap_zones: touch_tap_zones_enabled,
                 },
             },
             self.frame_counter,
@@ -19179,7 +19202,7 @@ impl App {
                 learned: self.settings.touch_still_chrome_learned,
                 touch_activity,
                 gestures_disabled: crate::touch_correlation::touch_gestures_disabled(),
-                touch_input_enabled,
+                touch_input_enabled: touch_input_enabled && touch_tap_zones_enabled,
             });
         if touch_help_started_this_frame && let Some(scope) = touch_help_scope {
             // The discovering contact is never also the dismissing contact.
@@ -32352,6 +32375,7 @@ mod tests {
             excluded: Vec::new(),
             behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                 accepts_pinch: true,
+                tap_zones: true,
             },
         };
         assert!(
@@ -34940,6 +34964,7 @@ mod tests {
             excluded,
             behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                 accepts_pinch: true,
+                tap_zones: true,
             },
         };
         for rect in still_touch_panel_handle_rects(viewport) {
@@ -35518,6 +35543,7 @@ mod tests {
                                 excluded: Vec::new(),
                                 behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                                     accepts_pinch: true,
+                                    tap_zones: true,
                                 },
                             },
                             1,
@@ -35685,6 +35711,7 @@ mod tests {
                                     excluded: Vec::new(),
                                     behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                                         accepts_pinch: true,
+                                        tap_zones: true,
                                     },
                                 },
                                 frame,
@@ -36117,14 +36144,6 @@ mod tests {
                 ..enabled
             },
             StillTouchInputEnabledInputs {
-                panorama_active: true,
-                ..enabled
-            },
-            StillTouchInputEnabledInputs {
-                analysis_active: true,
-                ..enabled
-            },
-            StillTouchInputEnabledInputs {
                 overlay_edit_active: true,
                 ..enabled
             },
@@ -36139,6 +36158,100 @@ mod tests {
         ] {
             assert!(!still_touch_input_enabled(disabled));
         }
+    }
+
+    /// 360 度ビューと分析ツールは、タップ判定を持たないだけで**タッチ入力自体は生きる**。
+    ///
+    /// かつては両方まとめて止めていて、ピンチまで消えていた (利用者報告 2026-08-13)。
+    /// 「タップ判定を使うか」と「タッチを扱うか」が同じ述語だったのが原因なので、
+    /// 分かれたままであることをここで縛る。
+    #[test]
+    fn the_panorama_and_analysis_views_keep_touch_but_drop_tap_zones() {
+        let enabled = StillTouchInputEnabledInputs {
+            is_video: false,
+            is_music_view: false,
+            has_fullscreen_item: true,
+            dialog_open: false,
+            wants_keyboard_input: false,
+            ime_input_active: false,
+            context_menu_open: false,
+            spread_popup_open: false,
+            fit_popup_open: false,
+            slideshow_popup_open: false,
+            rotation_popup_open: false,
+            compare_wipe_active: false,
+            overlay_edit_active: false,
+            view_trim_active: false,
+            zoom_active: false,
+        };
+        // 表示モードはこの述語の入力ではない。ここで落とすとピンチごと消える。
+        assert!(still_touch_input_enabled(enabled));
+
+        assert!(still_touch_tap_zones_enabled(false, false));
+        assert!(!still_touch_tap_zones_enabled(true, false));
+        assert!(!still_touch_tap_zones_enabled(false, true));
+    }
+
+    /// タップ判定を持たない面では、1 本指は素通り、2 本指はピンチ。
+    ///
+    /// `WidgetPassthrough` にするとピンチが始まらず、`Undecided` にするとページ送りへ
+    /// 落ちうる。どちらでもない `ViewerPointerPassthrough` であることが要点。
+    #[test]
+    fn a_surface_without_tap_zones_passes_one_finger_through_and_still_pinches() {
+        use crate::touch_input::{
+            TapZoneGeometry, TouchOwner, TouchPhase, TouchRecognizer, TouchSample,
+            TouchSurfaceBehavior,
+        };
+
+        let geom = TapZoneGeometry {
+            surface: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1000.0, 800.0)),
+            excluded: Vec::new(),
+            behavior: TouchSurfaceBehavior::Viewer {
+                accepts_pinch: true,
+                tap_zones: false,
+            },
+        };
+        let mut recognizer = TouchRecognizer::new();
+
+        // 画面の端 = 通常ならページ送りゾーン。
+        recognizer.handle_sample(
+            &geom,
+            TouchSample {
+                id: 1,
+                pos: egui::pos2(30.0, 400.0),
+                phase: TouchPhase::Start,
+                now_ms: 0,
+            },
+        );
+        assert_eq!(recognizer.owner(), TouchOwner::ViewerPointerPassthrough);
+
+        recognizer.handle_sample(
+            &geom,
+            TouchSample {
+                id: 2,
+                pos: egui::pos2(600.0, 400.0),
+                phase: TouchPhase::Start,
+                now_ms: 10,
+            },
+        );
+        assert_eq!(recognizer.owner(), TouchOwner::Pinch);
+
+        // 離しても、そのタップがページ送りになってはいけない。
+        let commands = recognizer.handle_sample(
+            &geom,
+            TouchSample {
+                id: 1,
+                pos: egui::pos2(30.0, 400.0),
+                phase: TouchPhase::End,
+                now_ms: 20,
+            },
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|c| matches!(c, crate::touch_input::TouchCommand::PageSide { .. })),
+            "a surface without tap zones must never emit a page turn"
+        );
     }
 
     #[test]
@@ -36241,6 +36354,7 @@ mod tests {
             excluded: Vec::new(),
             behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
                 accepts_pinch: true,
+                tap_zones: true,
             },
         };
         for point in [
