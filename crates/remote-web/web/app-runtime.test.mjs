@@ -165,6 +165,7 @@ const {
   resolveMediaOpenRoute,
   selectRecoverableRemoteAiJob,
   selectRecoverableRemoteArchiveJob,
+  telemetryHudVisible,
   setViewTrimSpreadSeparate,
   setRuntimeTestErrorObserver,
   showUnsupportedRemoteEntryNotice,
@@ -3433,4 +3434,28 @@ test("latest-only preview supersession exposes a cancellation hook", async () =>
 
   assert.deepEqual(cancelled, ["preview-1"]);
   assert.equal(first.controller.signal.aborted, true);
+});
+
+const HUD_ON = {
+  enabled: true,
+  detailed: true,
+  authenticated: true,
+  viewerBarsHidden: false,
+  dismissed: false,
+};
+
+test("the measurement HUD stays off until someone turns detailed recording on", () => {
+  assert.equal(telemetryHudVisible({ ...HUD_ON, detailed: false }), false);
+  assert.equal(telemetryHudVisible(HUD_ON), true);
+});
+
+test("the measurement HUD leaves the page alone while the bars are hidden", () => {
+  assert.equal(telemetryHudVisible({ ...HUD_ON, viewerBarsHidden: true }), false);
+  assert.equal(telemetryHudVisible({ ...HUD_ON, viewerBarsHidden: false }), true);
+});
+
+test("the measurement HUD stays closed once dismissed, and never shows signed out", () => {
+  assert.equal(telemetryHudVisible({ ...HUD_ON, dismissed: true }), false);
+  assert.equal(telemetryHudVisible({ ...HUD_ON, authenticated: false }), false);
+  assert.equal(telemetryHudVisible({ ...HUD_ON, enabled: false }), false);
 });

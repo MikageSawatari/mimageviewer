@@ -1297,7 +1297,27 @@ const hudState = {
   displayDurations: [],
   errors: [],
   pagePrefetch: null,
+  dismissed: false,
 };
+
+/// 計測 HUD を出すかどうかの唯一の判断。`hudElement.hidden` を書くのは `updateHud` だけで、
+/// 表示したい / 隠したい側はここへ状態を渡す。以前は 8 箇所が直接 `hidden` を書いていて、
+/// どれか 1 つが残るだけで「隠したのに戻る」が起きていた。
+///
+/// 既定で出さない: これは調査用の計器なので、調べていない人の画面には要らない。
+/// バーを隠して読んでいる間も出さない — styles.css の `.viewer-ai-status` と同じ規則で、
+/// 本の上には何も置かない。
+export function telemetryHudVisible({
+  enabled,
+  detailed,
+  authenticated,
+  viewerBarsHidden,
+  dismissed,
+}) {
+  if (!enabled || !authenticated || !detailed) return false;
+  if (dismissed) return false;
+  return !viewerBarsHidden;
+}
 
 class RemoteSessionControlOwner {
   constructor() {
@@ -1454,7 +1474,7 @@ if (!RUNTIME_TEST_MODE) {
   if (TELEMETRY_ENABLED) {
     installTelemetry();
   } else {
-    hudElement.hidden = true;
+    updateHud();
   }
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible") {
@@ -2201,7 +2221,7 @@ function renderPinLogin(initialRemainingSeconds = 0) {
   state.remoteSessionOwner = null;
   telemetryState.authenticated = false;
   updateRemoteSessionOwnerBadge();
-  hudElement.hidden = true;
+  updateHud();
   document.title = "PIN 認証 — mIV Remote";
 
   const screen = element("section", "pin-screen");
@@ -2265,7 +2285,7 @@ function renderPinLogin(initialRemainingSeconds = 0) {
       if (response.ok && result.authenticated) {
         clearInterval(state.authCountdownTimer);
         state.authCountdownTimer = 0;
-        hudElement.hidden = !TELEMETRY_ENABLED;
+        updateHud();
         await enterAuthenticatedApp();
         return;
       }
@@ -10927,7 +10947,7 @@ class LocalSettingsDialog {
       textElement("strong", "詳細記録を有効にする"),
       textElement(
         "small",
-        "調査時だけ使用します。ファイルの相対パス・remote address・端末 ID・サーバーメッセージを記録します。PIN、認証 token、remote session ID の生値は記録しません。"
+        "調査時だけ使用します。画面右下に計測値を表示し、ファイルの相対パス・remote address・端末 ID・サーバーメッセージを記録します。PIN、認証 token、remote session ID の生値は記録しません。"
       )
     );
     telemetryOption.append(telemetryCheckbox, telemetryCopy);
@@ -10962,7 +10982,8 @@ class LocalSettingsDialog {
       });
       state.localSettings = saved.settings;
       state.localSettingsStorageAvailable = saved.saved;
-      hudElement.hidden = false;
+      // 詳細記録を入れ直したら、前に閉じたことは持ち越さない。
+      hudState.dismissed = false;
       state.viewer?.captureVideoHealth?.("hud");
       updateHud();
       this.updateStorageStatus();
@@ -12198,6 +12219,8 @@ export class ImageViewer {
   setBarsVisible(visible) {
     if (visible) this.root.classList.remove("viewer-bars-hidden");
     else this.root.classList.add("viewer-bars-hidden");
+    // 計測 HUD は viewer の外にいるので、バーと同じ CSS 規則では消えない。
+    updateHud();
   }
 
   setSeekState(seekState) {
@@ -13613,12 +13636,12 @@ export async function logoutApplication() {
 }
 
 function installTelemetry() {
-  hudElement.hidden = false;
   hudElement.addEventListener("click", () => {
     if (state.localSettings.telemetryDebugDetails) {
       openLocalSettingsDialog();
     } else {
-      hudElement.hidden = true;
+      hudState.dismissed = true;
+      updateHud();
     }
   });
   updateHud();
@@ -14103,13 +14126,20 @@ function trimHudErrors() {
   while (hudState.errors[0] < cutoff) hudState.errors.shift();
 }
 
+function viewerBarsAreHidden() {
+  return Boolean(state.viewer?.root?.classList?.contains("viewer-bars-hidden"));
+}
+
 function updateHud() {
-  if (!TELEMETRY_ENABLED) {
-    hudElement.hidden = true;
-    return;
-  }
   const debugDetails = state.localSettings.telemetryDebugDetails;
-  if (debugDetails && state.authenticated) hudElement.hidden = false;
+  hudElement.hidden = !telemetryHudVisible({
+    enabled: TELEMETRY_ENABLED,
+    detailed: debugDetails,
+    authenticated: state.authenticated,
+    viewerBarsHidden: viewerBarsAreHidden(),
+    dismissed: hudState.dismissed,
+  });
+  if (hudElement.hidden) return;
   hudElement.dataset.telemetryTier = debugDetails ? "debug" : "normal";
   trimHudErrors();
   const image = hudState.lastImage;
