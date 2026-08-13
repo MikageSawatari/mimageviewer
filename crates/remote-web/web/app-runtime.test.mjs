@@ -148,6 +148,7 @@ const {
   normalizeRemoteBookBookmarkList,
   normalizeRemoteColorizeParams,
   normalizeRemoteGridSortState,
+  normalizeRemotePostFilterState,
   normalizeRemoteViewTrimState,
   parentContainerAddress,
   parseRoute,
@@ -708,6 +709,7 @@ test("adjustment panel exposes only implemented sections in desktop order", () =
       ["color_tone", "色調"],
       ["ai", "AI"],
       ["colorize", "カラー化"],
+      ["post_filter", "フィルタ"],
     ]
   );
 });
@@ -721,6 +723,7 @@ test("adjustment tabs keep shared actions outside and preserve range pointer han
     panel.colorTonePanel,
     panel.aiSection,
     panel.colorizeSection,
+    panel.postFilterSection,
     panel.resetButton,
     panel.status,
   ]);
@@ -728,11 +731,13 @@ test("adjustment tabs keep shared actions outside and preserve range pointer han
   assert.equal(panel.colorTonePanel.hidden, false);
   assert.equal(panel.aiSection.hidden, true);
   assert.equal(panel.colorizeSection.hidden, true);
+  assert.equal(panel.postFilterSection.hidden, true);
 
   panel.selectTab("ai");
   assert.equal(panel.colorTonePanel.hidden, true);
   assert.equal(panel.aiSection.hidden, false);
   assert.equal(panel.colorizeSection.hidden, true);
+  assert.equal(panel.postFilterSection.hidden, true);
   for (const controls of [panel.controls, panel.colorizeControls]) {
     for (const { input } of controls.values()) {
       assert.ok(input.listeners.has("pointerdown"));
@@ -740,6 +745,68 @@ test("adjustment tabs keep shared actions outside and preserve range pointer han
       assert.ok(input.listeners.has("pointerup"));
     }
   }
+});
+
+test("post filter groups keep server order and show the paint-time note once in basic", async () => {
+  const panel = new ViewerAdjustmentPanel();
+  const catalog = normalizeRemotePostFilterState({
+    selected: "nearest",
+    groups: [
+      {
+        label: "基本",
+        options: [
+          { value: "none", label: "標準（補間あり）", rewrites_pixels: false },
+          { value: "nearest", label: "ニアレスト（補間なし）", rewrites_pixels: false },
+        ],
+      },
+      {
+        label: "CRT",
+        options: [
+          { value: "crt_simple", label: "CRT シンプル（控えめ）", rewrites_pixels: true },
+        ],
+      },
+    ],
+  });
+  panel.syncPostFilterControls(catalog);
+
+  assert.deepEqual(
+    panel.postFilterGroups.children.map((group) => group.children[0].textContent),
+    ["基本", "CRT"]
+  );
+  assert.deepEqual(panel.postFilterInputs.map((input) => input.value), [
+    "none",
+    "nearest",
+    "crt_simple",
+  ]);
+  assert.deepEqual(
+    panel.postFilterGroups.children.flatMap((group) =>
+      group.children[1].children.map((option) => option.children[1].textContent)
+    ),
+    ["標準（補間あり）", "ニアレスト（補間なし）", "CRT シンプル（控えめ）"]
+  );
+  const note = "本体の画面での拡大方法を決める項目です。リモートの表示は変わりません。";
+  const descendantText = (node) => [
+    node.textContent,
+    ...node.children.flatMap(descendantText),
+  ];
+  assert.equal(descendantText(panel.postFilterGroups).filter((text) => text === note).length, 1);
+  assert.equal(panel.postFilterGroups.children[0].children.some((child) => child.textContent === note), true);
+
+  let commits = 0;
+  panel.commitCurrent = async () => { commits += 1; };
+  const crtInput = panel.postFilterInputs[2];
+  panel.setDisabled(true);
+  crtInput.checked = true;
+  crtInput.dispatchEvent({ type: "change" });
+  await Promise.resolve();
+  assert.equal(commits, 0);
+  assert.equal(panel.values.post_filter, "nearest");
+
+  panel.setDisabled(false);
+  crtInput.dispatchEvent({ type: "change" });
+  await Promise.resolve();
+  assert.equal(commits, 1);
+  assert.equal(panel.values.post_filter, "crt_simple");
 });
 
 test("adjustment touch cancellation restores the starting value without committing", () => {
@@ -1735,6 +1802,7 @@ test("remote adjustment normalization keeps valid local slider defaults and boun
       tone_radius: 1,
       tone_strength: 100,
     },
+    post_filter: null,
     ai: null,
   });
   assert.equal(normalizeRemoteAdjustmentValues({ black_point: 255 }).black_point, 254);

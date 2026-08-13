@@ -2548,6 +2548,7 @@ mod tests {
                     midtone: 0.9,
                     auto_mode: None,
                     colorize: mimageviewer_ipc::RemoteColorizeParams::default(),
+                    post_filter: None,
                     ai: None,
                 },
             },

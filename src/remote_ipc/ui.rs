@@ -2123,6 +2123,7 @@ impl crate::app::App {
                     .map(super::remote_colorize_params)
             }),
             ai_model_catalog: remote_ai_model_catalog(ai_mode),
+            post_filter: super::remote_post_filter_state(effective.post_filter),
             effective_ai_enabled: crate::ai::final_pipeline::effective_upscale_request(
                 ai_mode, &effective,
             )

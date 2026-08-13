@@ -10,6 +10,7 @@ export const ADJUSTMENT_PANEL_TABS = Object.freeze([
   Object.freeze({ id: "color_tone", label: "色調" }),
   Object.freeze({ id: "ai", label: "AI" }),
   Object.freeze({ id: "colorize", label: "カラー化" }),
+  Object.freeze({ id: "post_filter", label: "フィルタ" }),
 ]);
 
 export function normalizeAdjustmentTab(value) {

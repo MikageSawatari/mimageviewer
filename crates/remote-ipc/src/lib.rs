@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 49;
+pub const PROTOCOL_VERSION: u32 = 50;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -278,9 +278,28 @@ pub struct RemoteAiModelCatalog {
     pub denoise: Vec<RemoteAiModelOption>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemotePostFilterOption {
+    pub value: String,
+    pub label: String,
+    pub rewrites_pixels: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemotePostFilterGroup {
+    pub label: String,
+    pub options: Vec<RemotePostFilterOption>,
+}
+
+/// 選択肢と現在値。値・ラベル・分類は本体の `PostFilter` から毎回組み立てる。
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RemotePostFilterState {
+    pub selected: String,
+    pub groups: Vec<RemotePostFilterGroup>,
+}
+
 /// リモートの画像補正パネルが編集できるパラメータ。
 ///
-/// post-filter 等はまだ読み取り専用にし、この型へは入れない。
 /// 書き込み側は保存済みの完全な `AdjustParams` にこの差分だけを重ねるため、Web が
 /// 非公開フィールドを消したり既定値へ戻したりしない。
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -295,6 +314,9 @@ pub struct RemoteAdjustmentValues {
     pub midtone: f32,
     pub auto_mode: Option<RemoteAutoMode>,
     pub colorize: RemoteColorizeParams,
+    /// 旧 SPA の payload では欠落する。`None` はポストフィルタを変更しない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_filter: Option<String>,
     /// 旧 SPA の payload では欠落する。`None` は AI 値を変更しない。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai: Option<RemoteAiAdjustmentValues>,
@@ -424,6 +446,7 @@ pub struct RemoteAdjustmentState {
     /// デスクトップのグローバル保存スロット。Web は読み込みだけを提供する。
     pub colorize_preset_slots: [Option<RemoteColorizeParams>; 4],
     pub ai_model_catalog: RemoteAiModelCatalog,
+    pub post_filter: RemotePostFilterState,
     /// `AiFeatureMode` を適用した後、effective params が final AI を一つ以上要求するか。
     pub effective_ai_enabled: bool,
     pub read_only: RemoteAdjustmentReadOnlyState,
@@ -2647,8 +2670,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v49_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
-        assert_eq!(PROTOCOL_VERSION, 49);
+    fn protocol_v50_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
+        assert_eq!(PROTOCOL_VERSION, 50);
         let expected = ClientMessage::RemoteWebConnectionInfo {
             id: 10,
             info: RemoteWebConnectionInfo {
@@ -2724,6 +2747,7 @@ mod tests {
                         midtone: 1.0,
                         auto_mode: None,
                         colorize: RemoteColorizeParams::default(),
+                        post_filter: None,
                         ai: None,
                     },
                 }),
@@ -2822,8 +2846,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v49_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 49);
+    fn protocol_v50_remote_video_thumbnail_shape_round_trips() {
+        assert_eq!(PROTOCOL_VERSION, 50);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -3101,6 +3125,7 @@ mod tests {
                         ],
                         ..RemoteColorizeParams::default()
                     },
+                    post_filter: Some("crt_simple".to_owned()),
                     ai: Some(RemoteAiAdjustmentValues {
                         upscale_model: Some("auto".to_owned()),
                         denoise_model: None,
@@ -3197,6 +3222,7 @@ mod tests {
                     midtone: 1.0,
                     auto_mode: None,
                     colorize: RemoteColorizeParams::default(),
+                    post_filter: Some("crt_simple".to_owned()),
                     ai: Some(RemoteAiAdjustmentValues {
                         upscale_model: Some("auto".to_owned()),
                         denoise_model: None,
@@ -3213,6 +3239,7 @@ mod tests {
                     midtone: 1.0,
                     auto_mode: None,
                     colorize: RemoteColorizeParams::default(),
+                    post_filter: Some("none".to_owned()),
                     ai: Some(RemoteAiAdjustmentValues {
                         upscale_model: None,
                         denoise_model: None,
@@ -3248,6 +3275,17 @@ mod tests {
                         key: None,
                         label: "なし".to_owned(),
                         selectable: true,
+                    }],
+                },
+                post_filter: RemotePostFilterState {
+                    selected: "crt_simple".to_owned(),
+                    groups: vec![RemotePostFilterGroup {
+                        label: "基本".to_owned(),
+                        options: vec![RemotePostFilterOption {
+                            value: "none".to_owned(),
+                            label: "標準（補間あり）".to_owned(),
+                            rewrites_pixels: false,
+                        }],
                     }],
                 },
                 effective_ai_enabled: true,

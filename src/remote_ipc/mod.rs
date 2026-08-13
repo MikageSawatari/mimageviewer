@@ -304,6 +304,44 @@ pub(super) fn remote_grid_sort_state(
     }
 }
 
+pub(super) fn post_filter_wire_value(filter: crate::adjustment::PostFilter) -> String {
+    serde_json::to_value(filter)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .expect("PostFilter serializes as a string")
+}
+
+pub(super) fn parse_post_filter_wire(
+    value: &str,
+) -> Result<crate::adjustment::PostFilter, &'static str> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned()))
+        .map_err(|_| "ポストフィルタの選択値が不正です")
+}
+
+pub(super) fn remote_post_filter_state(
+    selected: crate::adjustment::PostFilter,
+) -> mimageviewer_ipc::RemotePostFilterState {
+    mimageviewer_ipc::RemotePostFilterState {
+        selected: post_filter_wire_value(selected),
+        groups: crate::adjustment::POST_FILTER_GROUPS
+            .iter()
+            .map(|group| mimageviewer_ipc::RemotePostFilterGroup {
+                label: group.label.to_owned(),
+                options: group
+                    .filters
+                    .iter()
+                    .copied()
+                    .map(|filter| mimageviewer_ipc::RemotePostFilterOption {
+                        value: post_filter_wire_value(filter),
+                        label: filter.display_label().to_owned(),
+                        rewrites_pixels: filter.rewrites_pixels(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
 pub(super) fn normalize_remote_view_trim_state(
     value: &serde_json::Value,
 ) -> Result<crate::view_trim::ViewTrimBookState, &'static str> {
@@ -350,6 +388,7 @@ pub(crate) fn remote_adjustment_values(
             }
         }),
         colorize: remote_colorize_params(&params.colorize),
+        post_filter: Some(post_filter_wire_value(params.post_filter)),
         ai: Some(mimageviewer_ipc::RemoteAiAdjustmentValues {
             upscale_model: params.upscale_model.clone(),
             denoise_model: params.denoise_model.clone(),
@@ -518,6 +557,9 @@ pub(crate) fn apply_remote_adjustment_values(
         tone_radius: colorize.tone_radius,
         tone_strength: colorize.tone_strength,
     };
+    if let Some(value) = values.post_filter.as_deref() {
+        params.post_filter = parse_post_filter_wire(value)?;
+    }
     if let Some(ai) = values.ai.as_ref() {
         if let Some(key) = ai.upscale_model.as_deref()
             && key != "auto"
@@ -555,6 +597,7 @@ mod adjustment_value_tests {
         let base = crate::adjustment::AdjustParams {
             upscale_model: Some("auto".to_owned()),
             denoise_model: Some("denoise_realplksr".to_owned()),
+            post_filter: crate::adjustment::PostFilter::CrtFull,
             smart_sharpen: 42,
             ..Default::default()
         };
@@ -568,6 +611,7 @@ mod adjustment_value_tests {
         values.white_point = 247;
         values.midtone = 0.8;
         values.auto_mode = Some(mimageviewer_ipc::RemoteAutoMode::MangaCleanup);
+        values.post_filter = Some("sepia".to_owned());
         values.colorize.mode = mimageviewer_ipc::RemoteColorizeMode::AllImages;
         values.colorize.palette = mimageviewer_ipc::RemoteColorizePalette::Custom;
         values.colorize.control_points = vec![
@@ -592,6 +636,7 @@ mod adjustment_value_tests {
             values.ai.as_ref().unwrap().denoise_model
         );
         assert_eq!(remote_colorize_params(&applied.colorize), values.colorize);
+        assert_eq!(applied.post_filter, crate::adjustment::PostFilter::Sepia);
         assert_eq!(applied.smart_sharpen, base.smart_sharpen);
         assert_eq!(remote_adjustment_values(&applied), values);
     }
@@ -615,6 +660,66 @@ mod adjustment_value_tests {
         let applied = apply_remote_adjustment_values(base.clone(), &values).unwrap();
         assert_eq!(applied.upscale_model, base.upscale_model);
         assert_eq!(applied.denoise_model, base.denoise_model);
+    }
+
+    #[test]
+    fn missing_remote_post_filter_value_preserves_saved_filter() {
+        let base = crate::adjustment::AdjustParams {
+            post_filter: crate::adjustment::PostFilter::CrtFull,
+            ..Default::default()
+        };
+        let mut payload = serde_json::to_value(remote_adjustment_values(&base)).unwrap();
+        payload.as_object_mut().unwrap().remove("post_filter");
+        let values: mimageviewer_ipc::RemoteAdjustmentValues =
+            serde_json::from_value(payload).unwrap();
+        assert_eq!(values.post_filter, None);
+
+        let applied = apply_remote_adjustment_values(base.clone(), &values).unwrap();
+        assert_eq!(applied.post_filter, base.post_filter);
+    }
+
+    #[test]
+    fn remote_post_filter_value_rejects_unknown_filter() {
+        let mut values = remote_adjustment_values(&crate::adjustment::AdjustParams::default());
+        values.post_filter = Some("future_filter".to_owned());
+        assert!(apply_remote_adjustment_values(Default::default(), &values).is_err());
+    }
+
+    #[test]
+    fn remote_post_filter_state_uses_core_groups_labels_and_pixel_metadata() {
+        let selected = crate::adjustment::PostFilter::CrtFull;
+        let state = remote_post_filter_state(selected);
+        assert_eq!(state.selected, post_filter_wire_value(selected));
+        assert_eq!(
+            state
+                .groups
+                .iter()
+                .map(|group| group.label.as_str())
+                .collect::<Vec<_>>(),
+            crate::adjustment::POST_FILTER_GROUPS
+                .iter()
+                .map(|group| group.label)
+                .collect::<Vec<_>>()
+        );
+
+        let options = state
+            .groups
+            .iter()
+            .flat_map(|group| group.options.iter())
+            .collect::<Vec<_>>();
+        for option in &options {
+            let filter = parse_post_filter_wire(&option.value).unwrap();
+            assert_eq!(option.label, filter.display_label());
+            assert_eq!(option.rewrites_pixels, filter.rewrites_pixels());
+        }
+        assert_eq!(
+            options
+                .iter()
+                .filter(|option| !option.rewrites_pixels)
+                .map(|option| option.value.as_str())
+                .collect::<Vec<_>>(),
+            ["none", "nearest", "upscale_sharp", "upscale_anime"]
+        );
     }
 
     #[test]

@@ -254,12 +254,13 @@ test("adjustment tab order and normalization follow the available desktop sectio
       ["color_tone", "色調"],
       ["ai", "AI"],
       ["colorize", "カラー化"],
+      ["post_filter", "フィルタ"],
     ]
   );
   for (const { id } of ADJUSTMENT_PANEL_TABS) {
     assert.equal(normalizeAdjustmentTab(id), id);
   }
-  assert.equal(normalizeAdjustmentTab("post_filter"), "color_tone");
+  assert.equal(normalizeAdjustmentTab("post_filter"), "post_filter");
   assert.equal(normalizeAdjustmentTab(null), "color_tone");
   assert.equal(
     parseLocalSettings(JSON.stringify({ version: 1, adjustmentTab: "ai" })).adjustmentTab,

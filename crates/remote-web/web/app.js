@@ -8188,6 +8188,7 @@ const DEFAULT_REMOTE_ADJUSTMENT_VALUES = Object.freeze({
   midtone: 1,
   auto_mode: null,
   colorize: DEFAULT_REMOTE_COLORIZE_VALUES,
+  post_filter: null,
 });
 
 function finiteNumber(value, fallback) {
@@ -8262,7 +8263,31 @@ export function normalizeRemoteAdjustmentValues(values = {}) {
       ? source.auto_mode
       : null,
     colorize: normalizeRemoteColorizeParams(source.colorize),
+    post_filter: typeof source.post_filter === "string" ? source.post_filter : null,
     ai,
+  };
+}
+
+export function normalizeRemotePostFilterState(value) {
+  const groups = Array.isArray(value?.groups)
+    ? value.groups.map((group) => ({
+        label: typeof group?.label === "string" ? group.label : "",
+        options: Array.isArray(group?.options)
+          ? group.options
+              .filter((option) =>
+                typeof option?.value === "string" && typeof option?.label === "string"
+              )
+              .map((option) => ({
+                value: option.value,
+                label: option.label,
+                rewrites_pixels: option.rewrites_pixels === true,
+              }))
+          : [],
+      }))
+    : [];
+  return {
+    selected: typeof value?.selected === "string" ? value.selected : null,
+    groups,
   };
 }
 
@@ -8701,6 +8726,8 @@ export class ViewerAdjustmentPanel {
     this.controls = new Map();
     this.colorizeControls = new Map();
     this.colorizePresetSlots = [null, null, null, null];
+    this.postFilterInputs = [];
+    this.postFilterInputName = `remote-post-filter-${Math.random().toString(36).slice(2)}`;
     this.previewQueue = new LatestOnlyTaskQueue(
       (job) => this.runPreview(job),
       (error) => this.showError(error),
@@ -9228,6 +9255,11 @@ export class ViewerAdjustmentPanel {
     this.aiAvailability = textElement("p", "", "adjustment-colorize-note");
     this.aiSection.append(this.aiAvailability);
 
+    this.postFilterSection = element("section", "adjustment-post-filter");
+    this.postFilterSection.classList.add("adjustment-tab-panel");
+    this.postFilterGroups = element("div", "adjustment-post-filter-groups");
+    this.postFilterSection.append(this.postFilterGroups);
+
     this.selectedTab = state.localSettings.adjustmentTab;
     this.tabList = element("nav", "adjustment-tabs");
     this.tabList.setAttribute("role", "tablist");
@@ -9237,6 +9269,7 @@ export class ViewerAdjustmentPanel {
       ["color_tone", this.colorTonePanel],
       ["ai", this.aiSection],
       ["colorize", this.colorizeSection],
+      ["post_filter", this.postFilterSection],
     ]);
     const tabGroupId = `remote-adjustment-tab-${Math.random().toString(36).slice(2)}`;
     for (const tab of ADJUSTMENT_PANEL_TABS) {
@@ -9262,10 +9295,12 @@ export class ViewerAdjustmentPanel {
     this.resetButton.addEventListener("click", () => {
       const colorize = this.values.colorize;
       const ai = this.values.ai;
+      const postFilter = this.values.post_filter;
       this.values = normalizeRemoteAdjustmentValues({
         ...DEFAULT_REMOTE_ADJUSTMENT_VALUES,
         colorize,
         ai,
+        post_filter: postFilter,
       });
       this.syncControls();
       this.setDisabled(false);
@@ -9279,6 +9314,7 @@ export class ViewerAdjustmentPanel {
       this.colorTonePanel,
       this.aiSection,
       this.colorizeSection,
+      this.postFilterSection,
       this.resetButton,
       this.status
     );
@@ -9840,6 +9876,7 @@ export class ViewerAdjustmentPanel {
     for (const [scope, value] of this.scopeInputs) value.input.checked = scope === this.scope;
     this.syncColorizeControls();
     this.syncAiControls(this.serverState?.ai_model_catalog);
+    this.syncPostFilterControls(this.serverState?.post_filter);
   }
 
   syncAiControls(catalog = {}) {
@@ -9865,6 +9902,47 @@ export class ViewerAdjustmentPanel {
       select.replaceChildren(...options);
       select.value = selectedKey;
     }
+  }
+
+  syncPostFilterControls(catalog) {
+    const state = normalizeRemotePostFilterState(catalog);
+    const selected = this.values.post_filter ?? state.selected;
+    if (this.values.post_filter === null && selected !== null) {
+      this.values.post_filter = selected;
+    }
+    this.postFilterInputs = [];
+    const groups = state.groups.map((group) => {
+      const fieldset = element("fieldset", "adjustment-post-filter-group");
+      fieldset.append(textElement("legend", group.label));
+      const options = element("div", "adjustment-post-filter-options");
+      for (const option of group.options) {
+        const wrapper = element("label", "adjustment-post-filter-option");
+        const input = document.createElement("input");
+        input.type = "radio";
+        input.name = this.postFilterInputName;
+        input.value = option.value;
+        input.checked = option.value === selected;
+        input.addEventListener("change", () => {
+          if (!input.checked || input.disabled) return;
+          this.values.post_filter = input.value;
+          this.commitCurrent().catch((error) => this.showError(error));
+        });
+        wrapper.append(input, textElement("span", option.label));
+        options.append(wrapper);
+        this.postFilterInputs.push(input);
+      }
+      fieldset.append(options);
+      if (group.options.some((option) => !option.rewrites_pixels)) {
+        fieldset.append(textElement(
+          "p",
+          "本体の画面での拡大方法を決める項目です。リモートの表示は変わりません。",
+          "adjustment-post-filter-note"
+        ));
+      }
+      return fieldset;
+    });
+    this.postFilterGroups.replaceChildren(...groups);
+    for (const input of this.postFilterInputs) input.disabled = this.disabled;
   }
 
   syncTargetButtons() {
@@ -9895,6 +9973,7 @@ export class ViewerAdjustmentPanel {
     });
     this.autoSelect.disabled = disabled;
     for (const select of this.aiSelects.values()) select.disabled = disabled;
+    for (const input of this.postFilterInputs) input.disabled = disabled;
     this.resetButton.disabled = disabled;
     for (const [scope, value] of this.scopeInputs) {
       value.input.disabled = disabled || (scope === "standard" && this.serverState?.standard_available === false);

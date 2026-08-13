@@ -8,7 +8,7 @@ use super::{
     App, FolderNavMode, GridContainerOpenMode, GridCursorDirection, GridScrollIntent,
     grid_cursor_nav_target_pos,
 };
-use crate::adjustment::PostFilter;
+use crate::adjustment::{POST_FILTER_GROUPS, PostFilter};
 use crate::folder_pane::{FolderPaneCommand, FolderPaneTreeKey};
 use crate::gamepad::{GamepadInputState, PadAxis, PadButton, PadEvent, WestReleaseOutcome};
 use crate::grid_item::GridItem;
@@ -147,113 +147,6 @@ const VIDEO_PICKER_ROWS: &[RingPickerRowId] = &[
     RingPickerRowId::VideoContinuousMode,
     RingPickerRowId::ItemRating,
     RingPickerRowId::ContainerRating,
-];
-
-struct PostFilterGroup {
-    label: &'static str,
-    filters: &'static [PostFilter],
-}
-
-const POST_FILTER_GROUP_BASIC: &[PostFilter] = &[
-    PostFilter::None,
-    PostFilter::Nearest,
-    PostFilter::UpscaleSharp,
-    PostFilter::UpscaleAnime,
-];
-const POST_FILTER_GROUP_CRT: &[PostFilter] = &[
-    PostFilter::CrtSimple,
-    PostFilter::CrtFull,
-    PostFilter::CrtArcade,
-];
-const POST_FILTER_GROUP_RETRO: &[PostFilter] = &[
-    PostFilter::Dither1bit,
-    PostFilter::GameBoy,
-    PostFilter::Pc98,
-    PostFilter::GameGear,
-    PostFilter::Famicom,
-    PostFilter::MegaDrive,
-    PostFilter::Msx2Plus,
-    PostFilter::Sfc,
-];
-const POST_FILTER_GROUP_COMBO: &[PostFilter] = &[
-    PostFilter::ComboFamicomCrt,
-    PostFilter::ComboPc98Crt,
-    PostFilter::ComboMsx2PlusCrt,
-    PostFilter::ComboMegaDriveCrt,
-    PostFilter::ComboSfcCrt,
-];
-const POST_FILTER_GROUP_MONO_TONE: &[PostFilter] = &[
-    PostFilter::Sepia,
-    PostFilter::MonoNeutral,
-    PostFilter::MonoCool,
-    PostFilter::MonoWarm,
-    PostFilter::WarmTone,
-    PostFilter::CoolTone,
-];
-const POST_FILTER_GROUP_FILM: &[PostFilter] = &[
-    PostFilter::TealOrange,
-    PostFilter::KodakPortra,
-    PostFilter::FujiVelvia,
-    PostFilter::BleachBypass,
-    PostFilter::CrossProcess,
-    PostFilter::Vintage,
-];
-const POST_FILTER_GROUP_ANALOG: &[PostFilter] = &[
-    PostFilter::FilmGrain,
-    PostFilter::Vignette,
-    PostFilter::LightLeak,
-    PostFilter::SoftFocus,
-];
-const POST_FILTER_GROUP_DRAWING: &[PostFilter] = &[
-    PostFilter::Halftone,
-    PostFilter::OilPaint,
-    PostFilter::Sketch,
-];
-const POST_FILTER_GROUP_PSEUDO_COLOR: &[PostFilter] =
-    &[PostFilter::PseudoColor4, PostFilter::PseudoColorSkin];
-const POST_FILTER_GROUP_UTILITY: &[PostFilter] = &[PostFilter::Sharpen];
-
-const POST_FILTER_GROUPS: &[PostFilterGroup] = &[
-    PostFilterGroup {
-        label: "基本",
-        filters: POST_FILTER_GROUP_BASIC,
-    },
-    PostFilterGroup {
-        label: "CRT",
-        filters: POST_FILTER_GROUP_CRT,
-    },
-    PostFilterGroup {
-        label: "レトロ機",
-        filters: POST_FILTER_GROUP_RETRO,
-    },
-    PostFilterGroup {
-        label: "CRT × レトロ機",
-        filters: POST_FILTER_GROUP_COMBO,
-    },
-    PostFilterGroup {
-        label: "モノ・トーン",
-        filters: POST_FILTER_GROUP_MONO_TONE,
-    },
-    PostFilterGroup {
-        label: "シネマ・フィルム",
-        filters: POST_FILTER_GROUP_FILM,
-    },
-    PostFilterGroup {
-        label: "アナログフィルム",
-        filters: POST_FILTER_GROUP_ANALOG,
-    },
-    PostFilterGroup {
-        label: "描画風",
-        filters: POST_FILTER_GROUP_DRAWING,
-    },
-    PostFilterGroup {
-        label: "カラー化（互換）",
-        filters: POST_FILTER_GROUP_PSEUDO_COLOR,
-    },
-    PostFilterGroup {
-        label: "実用",
-        filters: POST_FILTER_GROUP_UTILITY,
-    },
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

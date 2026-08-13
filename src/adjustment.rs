@@ -131,6 +131,113 @@ pub enum PostFilter {
     Sharpen,
 }
 
+pub(crate) struct PostFilterGroup {
+    pub(crate) label: &'static str,
+    pub(crate) filters: &'static [PostFilter],
+}
+
+const POST_FILTER_GROUP_BASIC: &[PostFilter] = &[
+    PostFilter::None,
+    PostFilter::Nearest,
+    PostFilter::UpscaleSharp,
+    PostFilter::UpscaleAnime,
+];
+const POST_FILTER_GROUP_CRT: &[PostFilter] = &[
+    PostFilter::CrtSimple,
+    PostFilter::CrtFull,
+    PostFilter::CrtArcade,
+];
+const POST_FILTER_GROUP_RETRO: &[PostFilter] = &[
+    PostFilter::Dither1bit,
+    PostFilter::GameBoy,
+    PostFilter::Pc98,
+    PostFilter::GameGear,
+    PostFilter::Famicom,
+    PostFilter::MegaDrive,
+    PostFilter::Msx2Plus,
+    PostFilter::Sfc,
+];
+const POST_FILTER_GROUP_COMBO: &[PostFilter] = &[
+    PostFilter::ComboFamicomCrt,
+    PostFilter::ComboPc98Crt,
+    PostFilter::ComboMsx2PlusCrt,
+    PostFilter::ComboMegaDriveCrt,
+    PostFilter::ComboSfcCrt,
+];
+const POST_FILTER_GROUP_MONO_TONE: &[PostFilter] = &[
+    PostFilter::Sepia,
+    PostFilter::MonoNeutral,
+    PostFilter::MonoCool,
+    PostFilter::MonoWarm,
+    PostFilter::WarmTone,
+    PostFilter::CoolTone,
+];
+const POST_FILTER_GROUP_FILM: &[PostFilter] = &[
+    PostFilter::TealOrange,
+    PostFilter::KodakPortra,
+    PostFilter::FujiVelvia,
+    PostFilter::BleachBypass,
+    PostFilter::CrossProcess,
+    PostFilter::Vintage,
+];
+const POST_FILTER_GROUP_ANALOG: &[PostFilter] = &[
+    PostFilter::FilmGrain,
+    PostFilter::Vignette,
+    PostFilter::LightLeak,
+    PostFilter::SoftFocus,
+];
+const POST_FILTER_GROUP_DRAWING: &[PostFilter] = &[
+    PostFilter::Halftone,
+    PostFilter::OilPaint,
+    PostFilter::Sketch,
+];
+const POST_FILTER_GROUP_PSEUDO_COLOR: &[PostFilter] =
+    &[PostFilter::PseudoColor4, PostFilter::PseudoColorSkin];
+const POST_FILTER_GROUP_UTILITY: &[PostFilter] = &[PostFilter::Sharpen];
+
+pub(crate) const POST_FILTER_GROUPS: &[PostFilterGroup] = &[
+    PostFilterGroup {
+        label: "基本",
+        filters: POST_FILTER_GROUP_BASIC,
+    },
+    PostFilterGroup {
+        label: "CRT",
+        filters: POST_FILTER_GROUP_CRT,
+    },
+    PostFilterGroup {
+        label: "レトロ機",
+        filters: POST_FILTER_GROUP_RETRO,
+    },
+    PostFilterGroup {
+        label: "CRT × レトロ機",
+        filters: POST_FILTER_GROUP_COMBO,
+    },
+    PostFilterGroup {
+        label: "モノ・トーン",
+        filters: POST_FILTER_GROUP_MONO_TONE,
+    },
+    PostFilterGroup {
+        label: "シネマ・フィルム",
+        filters: POST_FILTER_GROUP_FILM,
+    },
+    PostFilterGroup {
+        label: "アナログフィルム",
+        filters: POST_FILTER_GROUP_ANALOG,
+    },
+    PostFilterGroup {
+        label: "描画風",
+        filters: POST_FILTER_GROUP_DRAWING,
+    },
+    PostFilterGroup {
+        label: "カラー化（互換）",
+        filters: POST_FILTER_GROUP_PSEUDO_COLOR,
+    },
+    PostFilterGroup {
+        label: "実用",
+        filters: POST_FILTER_GROUP_UTILITY,
+    },
+];
+
 impl PostFilter {
     /// 全プリセットを UI 順で列挙する。
     /// - レトロ系: 減色は色数昇順、複合は機種順
@@ -229,6 +336,14 @@ impl PostFilter {
             Self::PseudoColorSkin => "疑似カラー（肌色）",
             Self::Sharpen => "シャープ化",
         }
+    }
+
+    /// 画素を書き換えるか。`false` は本体の描画時にだけ効く (拡大方法の選択)。
+    pub fn rewrites_pixels(self) -> bool {
+        !matches!(
+            self,
+            Self::None | Self::Nearest | Self::UpscaleSharp | Self::UpscaleAnime
+        )
     }
 
     /// NEAREST サンプラーでテクスチャを作るべきか。
@@ -992,6 +1107,28 @@ fn apply_temperature(buf: &mut [[f32; 3]], temperature: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn post_filter_groups_contain_every_variant_exactly_once() {
+        let expected = PostFilter::ALL
+            .iter()
+            .copied()
+            .chain([PostFilter::PseudoColor4, PostFilter::PseudoColorSkin]);
+        let grouped_count: usize = POST_FILTER_GROUPS
+            .iter()
+            .map(|group| group.filters.len())
+            .sum();
+        assert_eq!(grouped_count, PostFilter::ALL.len() + 2);
+
+        for filter in expected {
+            let occurrences = POST_FILTER_GROUPS
+                .iter()
+                .flat_map(|group| group.filters.iter().copied())
+                .filter(|&candidate| candidate == filter)
+                .count();
+            assert_eq!(occurrences, 1, "{filter:?}");
+        }
+    }
 
     #[test]
     fn identity_params_no_change() {

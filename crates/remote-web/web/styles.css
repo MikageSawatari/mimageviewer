@@ -2166,7 +2166,7 @@ select {
 
 .adjustment-tabs {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   border-bottom: 1px solid var(--line);
 }
 
@@ -2350,6 +2350,52 @@ select {
   display: grid;
   gap: 9px;
   padding: 10px;
+}
+
+.adjustment-post-filter,
+.adjustment-post-filter-groups {
+  display: grid;
+  gap: 10px;
+}
+
+.adjustment-post-filter-group {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 8px 10px 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface-raised);
+}
+
+.adjustment-post-filter-group legend {
+  padding: 0 5px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.adjustment-post-filter-options {
+  display: grid;
+  gap: 4px;
+}
+
+.adjustment-post-filter-option {
+  display: flex;
+  min-height: 36px;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.82rem;
+}
+
+.adjustment-post-filter-note {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 9px;
+  color: var(--muted);
+  background: rgb(255 255 255 / 4%);
+  font-size: 0.74rem;
+  line-height: 1.5;
 }
 
 .adjustment-colorize-settings {

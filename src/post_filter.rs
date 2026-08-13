@@ -17,6 +17,10 @@ use rayon::prelude::*;
 
 /// Applies the post-filter. Upscaling choices clone the pixels because their appearance changes
 /// only when the paint-time resampler is selected.
+/// **`PostFilter::rewrites_pixels` をここで参照しないこと。**そうすると
+/// `rewrites_pixels_matches_apply_for_every_variant` が同語反復になり、フィルタを
+/// 描画時扱いへ誤って入れたときに、そのフィルタが黙って何もしなくなる。この関数が事実で、
+/// フラグはそれを写したもの。一致はテストが縛る。
 pub fn apply(src: &ColorImage, filter: PostFilter) -> ColorImage {
     match filter {
         PostFilter::None
@@ -1654,6 +1658,32 @@ mod tests {
             }
         }
         ColorImage::new([w, h], pixels)
+    }
+
+    #[test]
+    fn rewrites_pixels_matches_apply_for_every_variant() {
+        let w = 24;
+        let h = 24;
+        let pixels = (0..h)
+            .flat_map(|y| {
+                (0..w).map(move |x| {
+                    Color32::from_rgb(
+                        ((x * 37 + y * 17 + x * y * 3) % 256) as u8,
+                        ((x * 11 + y * 53 + x * y * 5) % 256) as u8,
+                        ((x * 71 + y * 7 + x * y * 13) % 256) as u8,
+                    )
+                })
+            })
+            .collect();
+        let src = ColorImage::new([w, h], pixels);
+
+        for group in crate::adjustment::POST_FILTER_GROUPS {
+            for &filter in group.filters {
+                let output = apply(&src, filter);
+                let changed = output.size != src.size || output.pixels != src.pixels;
+                assert_eq!(changed, filter.rewrites_pixels(), "{filter:?}");
+            }
+        }
     }
 
     #[test]
