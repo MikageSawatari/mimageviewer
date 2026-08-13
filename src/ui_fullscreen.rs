@@ -855,18 +855,134 @@ fn build_panorama_navigator_layout(
     })
 }
 
-fn fs_navigator_corner_button_rect(header_rect: egui::Rect, index: usize) -> egui::Rect {
-    const BUTTON_SIZE: f32 = 16.0;
-    const BUTTON_GAP: f32 = 3.0;
-    let total_width = BUTTON_SIZE * 4.0 + BUTTON_GAP * 3.0;
-    let left = header_rect.right() - 6.0 - total_width;
+const FS_NAVIGATOR_HEADER_PAD: f32 = 6.0;
+const FS_NAVIGATOR_CORNER_BUTTON_SIZE: f32 = 16.0;
+const FS_NAVIGATOR_CORNER_BUTTON_GAP: f32 = 3.0;
+const FS_NAVIGATOR_CLOSE_BUTTON_SIZE: f32 = 18.0;
+/// 閉じるボタンと隅ボタン群の間隔。隅ボタン同士の間隔より広くして、
+/// 「移動」と「閉じる」を別のまとまりとして読ませる。
+const FS_NAVIGATOR_CLOSE_BUTTON_GAP: f32 = 8.0;
+const FS_NAVIGATOR_TITLE_GAP: f32 = 6.0;
+
+/// ヘッダ右端の閉じるボタン。
+///
+/// ナビゲータの保持状態 (`fullscreen_navigator_visible`) は設定に永続化されるのに、
+/// 出口が <kbd>Alt</kbd>+<kbd>N</kbd> しかなかった。キーボードを持たない端末では
+/// 一度出すと二度と消せない状態になる。画面上の出口はこのボタンが持つ。
+fn fs_navigator_close_button_rect(header_rect: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_size(
         egui::pos2(
-            left + index as f32 * (BUTTON_SIZE + BUTTON_GAP),
-            header_rect.center().y - BUTTON_SIZE * 0.5,
+            header_rect.right() - FS_NAVIGATOR_HEADER_PAD - FS_NAVIGATOR_CLOSE_BUTTON_SIZE,
+            header_rect.center().y - FS_NAVIGATOR_CLOSE_BUTTON_SIZE * 0.5,
         ),
-        egui::vec2(BUTTON_SIZE, BUTTON_SIZE),
+        egui::vec2(
+            FS_NAVIGATOR_CLOSE_BUTTON_SIZE,
+            FS_NAVIGATOR_CLOSE_BUTTON_SIZE,
+        ),
     )
+}
+
+fn fs_navigator_corner_button_rect(header_rect: egui::Rect, index: usize) -> egui::Rect {
+    let total_width = FS_NAVIGATOR_CORNER_BUTTON_SIZE * 4.0 + FS_NAVIGATOR_CORNER_BUTTON_GAP * 3.0;
+    let left = fs_navigator_close_button_rect(header_rect).left()
+        - FS_NAVIGATOR_CLOSE_BUTTON_GAP
+        - total_width;
+    egui::Rect::from_min_size(
+        egui::pos2(
+            left + index as f32
+                * (FS_NAVIGATOR_CORNER_BUTTON_SIZE + FS_NAVIGATOR_CORNER_BUTTON_GAP),
+            header_rect.center().y - FS_NAVIGATOR_CORNER_BUTTON_SIZE * 0.5,
+        ),
+        egui::vec2(
+            FS_NAVIGATOR_CORNER_BUTTON_SIZE,
+            FS_NAVIGATOR_CORNER_BUTTON_SIZE,
+        ),
+    )
+}
+
+/// タイトルに残された幅。ボタン群を右に寄せた分だけ狭くなるので、
+/// 最小サイズのパネルでは文字がボタンに重なりうる。重ねずに切り詰める。
+fn fs_navigator_title_max_width(header_rect: egui::Rect) -> f32 {
+    let title_left = header_rect.left() + FS_NAVIGATOR_HEADER_PAD + 2.0;
+    let cluster_left = fs_navigator_corner_button_rect(header_rect, 0).left();
+    (cluster_left - FS_NAVIGATOR_TITLE_GAP - title_left).max(0.0)
+}
+
+/// ヘッダのタイトルとボタン群を描く。平面ナビゲータとパノラマナビゲータで
+/// 見た目が分かれないよう、両方がこの 1 か所を通る。
+fn paint_fs_navigator_header(
+    painter: &egui::Painter,
+    header_rect: egui::Rect,
+    selected_corner: FullscreenNavigatorCorner,
+    show_close: bool,
+) {
+    painter.rect_filled(
+        header_rect,
+        5.0,
+        egui::Color32::from_rgba_unmultiplied(34, 38, 46, 245),
+    );
+    let mut title = egui::text::LayoutJob::single_section(
+        "ナビゲータ".to_owned(),
+        egui::TextFormat::simple(egui::FontId::proportional(12.0), egui::Color32::WHITE),
+    );
+    title.wrap =
+        egui::text::TextWrapping::truncate_at_width(fs_navigator_title_max_width(header_rect));
+    let galley = painter.layout_job(title);
+    painter.galley(
+        egui::pos2(
+            header_rect.left() + FS_NAVIGATOR_HEADER_PAD + 2.0,
+            header_rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        egui::Color32::WHITE,
+    );
+    for (index, &corner) in FullscreenNavigatorCorner::ALL.iter().enumerate() {
+        let button = fs_navigator_corner_button_rect(header_rect, index);
+        let selected = corner == selected_corner.normalized();
+        painter.rect_filled(
+            button,
+            2.0,
+            if selected {
+                egui::Color32::from_rgb(64, 112, 172)
+            } else {
+                egui::Color32::from_gray(54)
+            },
+        );
+        painter.rect_stroke(
+            button,
+            2.0,
+            egui::Stroke::new(1.0, egui::Color32::from_gray(142)),
+            egui::StrokeKind::Inside,
+        );
+        let marker_center = match corner {
+            FullscreenNavigatorCorner::TopLeft => button.left_top() + egui::vec2(4.0, 4.0),
+            FullscreenNavigatorCorner::TopRight => button.right_top() + egui::vec2(-4.0, 4.0),
+            FullscreenNavigatorCorner::BottomLeft => button.left_bottom() + egui::vec2(4.0, -4.0),
+            FullscreenNavigatorCorner::BottomRight => {
+                button.right_bottom() + egui::vec2(-4.0, -4.0)
+            }
+            FullscreenNavigatorCorner::Unknown => unreachable!("known navigator corner"),
+        };
+        painter.circle_filled(marker_center, 2.0, egui::Color32::WHITE);
+    }
+    if show_close {
+        let button = fs_navigator_close_button_rect(header_rect);
+        painter.rect_filled(button, 2.0, egui::Color32::from_gray(54));
+        painter.rect_stroke(
+            button,
+            2.0,
+            egui::Stroke::new(1.0, egui::Color32::from_gray(142)),
+            egui::StrokeKind::Inside,
+        );
+        // U+00D7。CLAUDE.md「UI 文字列の Unicode グリフ選定ルール」で ✕ / ✖ は不可。
+        painter.text(
+            button.center(),
+            egui::Align2::CENTER_CENTER,
+            "×",
+            egui::FontId::proportional(14.0),
+            egui::Color32::WHITE,
+        );
+    }
 }
 
 enum FsNavHoldoverDecision {
@@ -16644,17 +16760,7 @@ impl App {
             self.toggle_panorama_mode(fs_idx);
         }
         if key_n_navigator {
-            self.settings.fullscreen_navigator_visible =
-                !self.settings.fullscreen_navigator_visible;
-            self.settings.save();
-            // The navigator and loupe intentionally coexist: the former is a fixed overview,
-            // while the latter is a cursor-local inspection tool. The selected navigator corner
-            // gives users a stable way to keep the two overlays apart.
-            self.show_feedback_toast(if self.settings.fullscreen_navigator_visible {
-                "[ナビゲータ ON（拡大中に表示）]".to_string()
-            } else {
-                "[ナビゲータ OFF]".to_string()
-            });
+            self.set_fullscreen_navigator_visible(!self.settings.fullscreen_navigator_visible);
         }
         if key_z && !is_spread_double {
             if !self.analysis_mode && self.adjustment_mode.is_open() {
@@ -17168,6 +17274,53 @@ impl App {
             )
     }
 
+    /// ナビゲータの保持状態を変える唯一の出口。
+    ///
+    /// ナビゲータとルーペは意図的に併存する (前者は固定の全体図、後者はカーソル位置の
+    /// 拡大鏡)。隅の選択があるので 2 つは重ならずに置ける。
+    pub(crate) fn set_fullscreen_navigator_visible(&mut self, visible: bool) {
+        if self.settings.fullscreen_navigator_visible == visible {
+            return;
+        }
+        self.settings.fullscreen_navigator_visible = visible;
+        self.settings.save();
+        self.show_feedback_toast(if visible {
+            "[ナビゲータ ON（拡大中に表示）]".to_string()
+        } else {
+            "[ナビゲータ OFF]".to_string()
+        });
+    }
+
+    /// ヘッダの閉じるボタン。保持中のときだけ置く。
+    ///
+    /// 修飾キーで一時的に出ている間は消す対象が無いので、押せる見た目のまま
+    /// 何も起きないボタンにはしない。
+    fn fs_navigator_close_button_clicked(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        header_rect: egui::Rect,
+        id_prefix: &str,
+    ) -> bool {
+        if !self.settings.fullscreen_navigator_visible {
+            return false;
+        }
+        if !ui
+            .interact(
+                fs_navigator_close_button_rect(header_rect),
+                egui::Id::new("fs_navigator_close").with(id_prefix),
+                egui::Sense::click(),
+            )
+            .on_hover_text("ナビゲータを閉じる")
+            .clicked()
+        {
+            return false;
+        }
+        self.set_fullscreen_navigator_visible(false);
+        ctx.request_repaint();
+        true
+    }
+
     fn fs_navigator_layout(&self, image_rect: egui::Rect) -> Option<FlatNavigatorLayout> {
         build_flat_navigator_layout(
             &self.fullscreen_page_layout,
@@ -17178,7 +17331,11 @@ impl App {
         )
     }
 
-    pub(crate) fn fullscreen_navigator_edge_exclusion(
+    /// 描画されるナビゲータ本体の矩形。
+    ///
+    /// タップ分類の除外とマウスのエッジ抑止が同じ幾何から導かれるように、
+    /// パネル矩形の求め方はここ 1 か所に置く。
+    pub(crate) fn fullscreen_navigator_panel_rect(
         &self,
         ctx: &egui::Context,
         full_rect: egui::Rect,
@@ -17188,12 +17345,24 @@ impl App {
             return None;
         }
         let image_rect = self.fullscreen_media_rect(full_rect, fs_idx, false);
-        let panel_rect = if self.is_panorama_mode_active(fs_idx) {
-            self.panorama_navigator_layout(image_rect, fs_idx)?
-                .panel_rect
+        if self.is_panorama_mode_active(fs_idx) {
+            Some(
+                self.panorama_navigator_layout(image_rect, fs_idx)?
+                    .panel_rect,
+            )
         } else {
-            self.fs_navigator_layout(image_rect)?.panel_rect
-        };
+            Some(self.fs_navigator_layout(image_rect)?.panel_rect)
+        }
+    }
+
+    pub(crate) fn fullscreen_navigator_edge_exclusion(
+        &self,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+    ) -> Option<egui::Rect> {
+        let panel_rect = self.fullscreen_navigator_panel_rect(ctx, full_rect)?;
+        let fs_idx = self.fullscreen_idx?;
+        let image_rect = self.fullscreen_media_rect(full_rect, fs_idx, false);
         Some(fs_navigator_edge_exclusion_rect(
             image_rect,
             panel_rect,
@@ -17381,6 +17550,9 @@ impl App {
                 corner_clicked = true;
                 break;
             }
+        }
+        if self.fs_navigator_close_button_clicked(ui, ctx, layout.header_rect, "panorama") {
+            corner_clicked = true;
         }
 
         let response = ui
@@ -17649,6 +17821,9 @@ impl App {
                 break;
             }
         }
+        if self.fs_navigator_close_button_clicked(ui, ctx, layout.header_rect, "flat") {
+            corner_clicked = true;
+        }
 
         let response = ui
             .interact(
@@ -17886,49 +18061,12 @@ impl App {
             5.0,
             egui::Color32::from_rgba_unmultiplied(16, 18, 22, 232),
         );
-        painter.rect_filled(
+        paint_fs_navigator_header(
+            painter,
             layout.header_rect,
-            5.0,
-            egui::Color32::from_rgba_unmultiplied(34, 38, 46, 245),
+            self.settings.fullscreen_navigator_corner,
+            self.settings.fullscreen_navigator_visible,
         );
-        painter.text(
-            layout.header_rect.left_center() + egui::vec2(8.0, 0.0),
-            egui::Align2::LEFT_CENTER,
-            "ナビゲータ",
-            egui::FontId::proportional(12.0),
-            egui::Color32::WHITE,
-        );
-        for (index, &corner) in FullscreenNavigatorCorner::ALL.iter().enumerate() {
-            let button = fs_navigator_corner_button_rect(layout.header_rect, index);
-            let selected = corner == self.settings.fullscreen_navigator_corner.normalized();
-            painter.rect_filled(
-                button,
-                2.0,
-                if selected {
-                    egui::Color32::from_rgb(64, 112, 172)
-                } else {
-                    egui::Color32::from_gray(54)
-                },
-            );
-            painter.rect_stroke(
-                button,
-                2.0,
-                egui::Stroke::new(1.0, egui::Color32::from_gray(142)),
-                egui::StrokeKind::Inside,
-            );
-            let marker_center = match corner {
-                FullscreenNavigatorCorner::TopLeft => button.left_top() + egui::vec2(4.0, 4.0),
-                FullscreenNavigatorCorner::TopRight => button.right_top() + egui::vec2(-4.0, 4.0),
-                FullscreenNavigatorCorner::BottomLeft => {
-                    button.left_bottom() + egui::vec2(4.0, -4.0)
-                }
-                FullscreenNavigatorCorner::BottomRight => {
-                    button.right_bottom() + egui::vec2(-4.0, -4.0)
-                }
-                FullscreenNavigatorCorner::Unknown => unreachable!("known navigator corner"),
-            };
-            painter.circle_filled(marker_center, 2.0, egui::Color32::WHITE);
-        }
 
         let canvas_painter = painter.with_clip_rect(layout.canvas_rect);
         canvas_painter.rect_filled(layout.canvas_rect, 0.0, egui::Color32::BLACK);
@@ -18199,49 +18337,12 @@ impl App {
             5.0,
             egui::Color32::from_rgba_unmultiplied(16, 18, 22, 232),
         );
-        painter.rect_filled(
+        paint_fs_navigator_header(
+            painter,
             layout.header_rect,
-            5.0,
-            egui::Color32::from_rgba_unmultiplied(34, 38, 46, 245),
+            self.settings.fullscreen_navigator_corner,
+            self.settings.fullscreen_navigator_visible,
         );
-        painter.text(
-            layout.header_rect.left_center() + egui::vec2(8.0, 0.0),
-            egui::Align2::LEFT_CENTER,
-            "ナビゲータ",
-            egui::FontId::proportional(12.0),
-            egui::Color32::WHITE,
-        );
-        for (index, &corner) in FullscreenNavigatorCorner::ALL.iter().enumerate() {
-            let button = fs_navigator_corner_button_rect(layout.header_rect, index);
-            let selected = corner == self.settings.fullscreen_navigator_corner.normalized();
-            painter.rect_filled(
-                button,
-                2.0,
-                if selected {
-                    egui::Color32::from_rgb(64, 112, 172)
-                } else {
-                    egui::Color32::from_gray(54)
-                },
-            );
-            painter.rect_stroke(
-                button,
-                2.0,
-                egui::Stroke::new(1.0, egui::Color32::from_gray(142)),
-                egui::StrokeKind::Inside,
-            );
-            let marker_center = match corner {
-                FullscreenNavigatorCorner::TopLeft => button.left_top() + egui::vec2(4.0, 4.0),
-                FullscreenNavigatorCorner::TopRight => button.right_top() + egui::vec2(-4.0, 4.0),
-                FullscreenNavigatorCorner::BottomLeft => {
-                    button.left_bottom() + egui::vec2(4.0, -4.0)
-                }
-                FullscreenNavigatorCorner::BottomRight => {
-                    button.right_bottom() + egui::vec2(-4.0, -4.0)
-                }
-                FullscreenNavigatorCorner::Unknown => unreachable!("known navigator corner"),
-            };
-            painter.circle_filled(marker_center, 2.0, egui::Color32::WHITE);
-        }
 
         let canvas_painter = painter.with_clip_rect(layout.canvas_rect);
         canvas_painter.rect_filled(layout.canvas_rect, 0.0, egui::Color32::BLACK);
@@ -18866,6 +18967,11 @@ impl App {
         }
         if top_bar_visible {
             touch_excluded.push(fullscreen_top_bar_rect(full_rect));
+        }
+        // ナビゲータは画像の上に浮く widget であって、ページ送りの当たり判定ではない。
+        // 除外しないと、隅ボタンも閉じるボタンも押せないまま、触れた指がページを送る。
+        if let Some(navigator_rect) = self.fullscreen_navigator_panel_rect(ctx, full_rect) {
+            touch_excluded.push(navigator_rect);
         }
         extend_touch_excluded_with_panel_handles(
             &mut touch_excluded,
@@ -31947,6 +32053,130 @@ mod tests {
         );
         assert!(!fs_navigator_interaction_active(&ctx));
         assert!(!app.fs_navigator_allowed(&ctx, fs_idx));
+    }
+
+    /// 保持状態の出口が Alt+N しかなかったので、キーボードのない端末では
+    /// 一度出したナビゲータを消せなかった (§1.63)。閉じるボタンが画面上の出口。
+    #[test]
+    fn navigator_close_button_clears_the_persisted_visibility() {
+        let (mut app, image_rect, fs_idx) = setup_flat_navigator_input_test();
+        let ctx = egui::Context::default();
+        let layout = app.fs_navigator_layout(image_rect).unwrap();
+        let close_pos = fs_navigator_close_button_rect(layout.header_rect).center();
+
+        assert!(run_flat_navigator_input_frame(
+            &mut app,
+            &ctx,
+            image_rect,
+            navigator_pointer_input(close_pos, None, egui::Modifiers::default(), -0.1),
+        ));
+        assert!(run_flat_navigator_input_frame(
+            &mut app,
+            &ctx,
+            image_rect,
+            navigator_pointer_input(
+                close_pos,
+                Some((egui::PointerButton::Primary, true)),
+                egui::Modifiers::default(),
+                0.0,
+            ),
+        ));
+        assert!(app.settings.fullscreen_navigator_visible);
+        // ヘッダを押しただけでキャンバスの範囲選択を始めてはいけない。
+        assert!(ctx.data(|data| {
+            data.get_temp::<FsNavigatorInteraction>(fs_navigator_interaction_id())
+                .is_none()
+        }));
+
+        assert!(run_flat_navigator_input_frame(
+            &mut app,
+            &ctx,
+            image_rect,
+            navigator_pointer_input(
+                close_pos,
+                Some((egui::PointerButton::Primary, false)),
+                egui::Modifiers::default(),
+                0.1,
+            ),
+        ));
+
+        assert!(!app.settings.fullscreen_navigator_visible);
+        assert!(!app.fs_navigator_allowed(&ctx, fs_idx));
+        assert!(!fs_navigator_interaction_active(&ctx));
+    }
+
+    /// ナビゲータは画像の上に浮く widget であって、ページ送りの当たり判定ではない。
+    /// 除外に入れ忘れると、触れた指がナビゲータではなくページを送る (§1.63)。
+    #[test]
+    fn navigator_panel_is_excluded_from_tap_zone_classification() {
+        let (mut app, _, _) = setup_flat_navigator_input_test();
+        let ctx = egui::Context::default();
+        let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+
+        let panel_rect = app
+            .fullscreen_navigator_panel_rect(&ctx, full_rect)
+            .expect("a visible navigator must publish its panel rect");
+        let tap = panel_rect.center();
+
+        let bare = crate::touch_input::TapZoneGeometry {
+            surface: full_rect,
+            excluded: Vec::new(),
+            behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                accepts_pinch: true,
+            },
+        };
+        assert!(
+            !matches!(
+                crate::touch_input::classify_tap(&bare, tap),
+                crate::touch_input::TapZone::Excluded
+            ),
+            "without the exclusion the same tap is a page-turn zone, which is the reported bug"
+        );
+
+        let guarded = crate::touch_input::TapZoneGeometry {
+            excluded: vec![panel_rect],
+            ..bare
+        };
+        assert_eq!(
+            crate::touch_input::classify_tap(&guarded, tap),
+            crate::touch_input::TapZone::Excluded
+        );
+
+        app.set_fullscreen_navigator_visible(false);
+        assert!(
+            app.fullscreen_navigator_panel_rect(&ctx, full_rect)
+                .is_none()
+        );
+    }
+
+    /// ボタン群を右へ寄せた分だけタイトルの幅が減る。最小サイズのパネルでも
+    /// 文字がボタンに重ならないこと、ボタン同士も重ならないことを固定する。
+    #[test]
+    fn navigator_header_buttons_and_title_never_overlap_at_the_smallest_panel() {
+        let host = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let (_, header_rect, _) = fs_navigator_panel_rect(
+            host,
+            FULLSCREEN_NAVIGATOR_SIZE_MIN,
+            FullscreenNavigatorCorner::TopLeft,
+        )
+        .expect("the smallest navigator still fits a 1200x800 host");
+
+        let close = fs_navigator_close_button_rect(header_rect);
+        let last_corner = fs_navigator_corner_button_rect(header_rect, 3);
+        let first_corner = fs_navigator_corner_button_rect(header_rect, 0);
+
+        assert!(header_rect.contains_rect(close));
+        assert!(header_rect.contains_rect(first_corner));
+        assert!(last_corner.right() <= close.left());
+        assert!(
+            fs_navigator_title_max_width(header_rect) > 0.0,
+            "the title must keep some room rather than collapse"
+        );
+        assert!(
+            first_corner.left() - fs_navigator_title_max_width(header_rect)
+                >= header_rect.left() + FS_NAVIGATOR_HEADER_PAD,
+            "the title width must stop short of the button cluster"
+        );
     }
 
     #[test]
