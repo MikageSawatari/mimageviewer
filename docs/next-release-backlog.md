@@ -1182,6 +1182,16 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
 - **着手時の注意**: `DISPLAY_IMAGE_TEXTURE_OPTIONS` の全箇所が「最終表示テクスチャ」とは
   限らない。**合成の途中で 1:1 以外で再サンプルされる中間テクスチャを NEAREST にすると
   逆に画質が落ちる**。一律置換はせず、箇所ごとに「これは最終表示か」を確認すること。
+- **原因を特定し修正した (2026-08-13)**。利用者が注釈を全部消すと直ることで確定。
+  `ensure_comic_composite_texture` が注釈を焼いたテクスチャを無条件に LINEAR で
+  上げていた。`App::display_texture_options(idx)` を新設し、**表示テクスチャの
+  アップロード 7 箇所をそこへ通した** (`ai_fs_*` / `local_adjust_*` / `conceal_*` /
+  `local_adjust_layer_bypass_*` / `local_adjust_prefix_preview_*` /
+  `erase_base_display_*` / `comic_*`)。
+  - 懸念していた「合成途中で再サンプルされる中間テクスチャ」は、この一覧には無かった
+    (全部が画面に出るテクスチャ)。
+  - 消しゴム / 隠蔽 / 分析中は `post_filter_bypassed` が立つので、helper が自動的に
+    LINEAR を返す。現行の挙動を変えない。
 - 規模 / 優先度: Medium / P2。
 
 ## 2. 一覧 / サムネイル / フォルダ走査

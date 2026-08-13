@@ -50279,7 +50279,7 @@ impl App {
             let handle = ctx.load_texture(
                 format!("ai_fs_{idx}_{bg}"),
                 upload.into_owned(),
-                DISPLAY_IMAGE_TEXTURE_OPTIONS,
+                self.display_texture_options(idx),
             );
             let upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
             if crate::perf::is_enabled() {
@@ -52639,7 +52639,7 @@ impl App {
                             key.idx, key.input_gen, key.erase_mask_gen, key.local_gen
                         ),
                         upload.into_owned(),
-                        DISPLAY_IMAGE_TEXTURE_OPTIONS,
+                        self.display_texture_options(idx),
                     );
                     emit_edit_materialize_ms(
                         "upload",
@@ -52696,7 +52696,7 @@ impl App {
                     let texture = ctx.load_texture(
                         format!("conceal_{idx}_g{}", key.conceal_gen),
                         upload.into_owned(),
-                        DISPLAY_IMAGE_TEXTURE_OPTIONS,
+                        self.display_texture_options(idx),
                     );
                     emit_edit_materialize_ms(
                         "upload",
@@ -52817,7 +52817,7 @@ impl App {
                         pending.key.layer_idx
                     ),
                     upload.into_owned(),
-                    DISPLAY_IMAGE_TEXTURE_OPTIONS,
+                    self.display_texture_options(key.idx),
                 );
                 emit_edit_materialize_ms(
                     "upload",
@@ -52886,7 +52886,7 @@ impl App {
                         pending.key.layer_count
                     ),
                     upload.into_owned(),
-                    DISPLAY_IMAGE_TEXTURE_OPTIONS,
+                    self.display_texture_options(key.idx),
                 );
                 emit_edit_materialize_ms(
                     "upload",
@@ -53267,7 +53267,7 @@ impl App {
         let tex = ctx.load_texture(
             format!("erase_base_display_{idx}"),
             (*source_pixels).clone(),
-            DISPLAY_IMAGE_TEXTURE_OPTIONS,
+            self.display_texture_options(idx),
         );
         self.erase_base_tex_cache.insert(idx, tex.clone());
         Some(tex)
@@ -56034,6 +56034,31 @@ impl App {
         crate::comic_stamp::build_stamp_images_from_cache_snapshot(objects, cache, cancel)
     }
 
+    /// 表示用テクスチャのサンプラ。
+    ///
+    /// ニアレストは画素を加工しない。`PostFilter::Nearest` は `src.clone()` を返すだけで、
+    /// **アップロード時のサンプラ指定でだけ効く**。ところがその判定が上げる場所ごとに
+    /// 書かれていて、注釈を焼いた経路など多くが無条件に LINEAR だった。結果、
+    /// 「ニアレストにしてもドットがくっきりしない画像がある」という形で出た
+    /// (利用者報告 2026-08-13、注釈を消すと直ることで確定)。
+    ///
+    /// どの経路の**表示**テクスチャも、この 1 か所の答えを使う。消しゴム / 隠蔽 / 分析中は
+    /// `post_filter_bypassed` が立つので、ここが自動的に LINEAR を返す。
+    pub(crate) fn display_texture_options(&self, idx: usize) -> egui::TextureOptions {
+        if self.post_filter_bypassed {
+            return DISPLAY_IMAGE_TEXTURE_OPTIONS;
+        }
+        if self
+            .effective_params(idx)
+            .post_filter
+            .needs_nearest_sampler()
+        {
+            egui::TextureOptions::NEAREST
+        } else {
+            DISPLAY_IMAGE_TEXTURE_OPTIONS
+        }
+    }
+
     pub(crate) fn ensure_comic_composite_texture(
         &mut self,
         ctx: &egui::Context,
@@ -56201,7 +56226,7 @@ impl App {
                     Arc::as_ptr(&base) as usize
                 ),
                 upload,
-                DISPLAY_IMAGE_TEXTURE_OPTIONS,
+                self.display_texture_options(idx),
             );
             self.comic_cache.insert(
                 idx,

@@ -49750,3 +49750,38 @@ fn a_fresh_app_reports_no_empty_items_reason() {
     let app = phase_c_support::setup_app();
     assert_eq!(app.empty_items_reason(), None);
 }
+
+/// ニアレストは画素を加工せず、アップロード時のサンプラ指定でだけ効く。
+/// その判定が上げる場所ごとに書かれていたので、注釈を焼いた経路では捨てられ、
+/// 「ニアレストにしてもドットがくっきりしない」が起きた (利用者報告 2026-08-13)。
+///
+/// 表示テクスチャの経路がいくつあっても、答えはここ 1 つであることを縛る。
+#[test]
+fn every_display_texture_asks_one_place_which_sampler_to_use() {
+    let mut app = phase_c_support::setup_app();
+    app.items = vec![GridItem::Image(PathBuf::from("C:/book/page.png"))];
+    app.image_metas = vec![None];
+
+    assert_eq!(
+        app.display_texture_options(0),
+        DISPLAY_IMAGE_TEXTURE_OPTIONS,
+        "no post filter means the usual smooth sampler"
+    );
+
+    let mut params = app.effective_params(0).clone();
+    params.post_filter = crate::adjustment::PostFilter::Nearest;
+    app.adjustment_page_params.insert(0, params);
+    assert_eq!(
+        app.display_texture_options(0),
+        egui::TextureOptions::NEAREST,
+        "nearest only exists as a sampler choice, so it must reach the upload"
+    );
+
+    // 消しゴム / 隠蔽 / 分析中はポストフィルタ自体を通さない。ここも同じ答えに従う。
+    app.post_filter_bypassed = true;
+    assert_eq!(
+        app.display_texture_options(0),
+        DISPLAY_IMAGE_TEXTURE_OPTIONS,
+        "a bypassed post filter cannot ask for its sampler"
+    );
+}
