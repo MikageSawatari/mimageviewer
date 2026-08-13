@@ -249,6 +249,15 @@ struct FsNavigatorTextureSources {
     pages: Vec<(usize, FullscreenPaintResource)>,
 }
 
+#[derive(Clone, Copy)]
+enum FsPageLayoutSource {
+    CurrentItem,
+    Captured {
+        layout_size: egui::Vec2,
+        post_filter: crate::adjustment::PostFilter,
+    },
+}
+
 impl FsNavigatorTextureSources {
     fn single(page_idx: usize, texture: Option<FullscreenPaintResource>) -> Self {
         Self {
@@ -4353,15 +4362,42 @@ impl App {
         pixels_per_point: f32,
         visible_source_uv_rect: Option<egui::Rect>,
     ) -> crate::gpu_lanczos::FullscreenPaintResource {
-        let render_state = self.wgpu_render_state.clone();
-        let post_filter = if self.post_filter_bypassed {
+        let post_filter = self.fullscreen_paint_post_filter(resource);
+        self.prepare_fullscreen_paint_resource_with_filter(
+            resource,
+            logical_scale,
+            pixels_per_point,
+            visible_source_uv_rect,
+            post_filter,
+            true,
+        )
+    }
+
+    fn fullscreen_paint_post_filter(
+        &self,
+        resource: &crate::gpu_lanczos::FullscreenPaintResource,
+    ) -> crate::adjustment::PostFilter {
+        if self.post_filter_bypassed {
             crate::adjustment::PostFilter::None
         } else {
             resource
                 .page_idx()
                 .map(|idx| self.effective_params(idx).post_filter)
                 .unwrap_or(crate::adjustment::PostFilter::None)
-        };
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_fullscreen_paint_resource_with_filter(
+        &mut self,
+        resource: &crate::gpu_lanczos::FullscreenPaintResource,
+        logical_scale: f32,
+        pixels_per_point: f32,
+        visible_source_uv_rect: Option<egui::Rect>,
+        post_filter: crate::adjustment::PostFilter,
+        trace_current_item_key: bool,
+    ) -> crate::gpu_lanczos::FullscreenPaintResource {
+        let render_state = self.wgpu_render_state.clone();
         let (prepared, perf_event) = self.fs_lanczos_cache.resolve(
             render_state.as_ref(),
             resource,
@@ -4375,7 +4411,9 @@ impl App {
         if let Some(perf_event) = perf_event
             && crate::perf::is_enabled()
         {
-            let key = resource.page_idx().and_then(|idx| self.perf_item_key(idx));
+            let key = trace_current_item_key
+                .then(|| resource.page_idx().and_then(|idx| self.perf_item_key(idx)))
+                .flatten();
             match perf_event {
                 crate::gpu_lanczos::LanczosPerfEvent::Generated(stats) => {
                     // Every resampler branch shares one event name and is told apart by the
@@ -4495,6 +4533,13 @@ impl App {
         texture: &egui::TextureHandle,
     ) -> &'static str {
         let texture_id = texture.id();
+        if self
+            .fs_holdover_tex
+            .as_ref()
+            .is_some_and(|holdover| holdover.contains_texture_id(texture_id))
+        {
+            return "holdover";
+        }
         if self.is_passthrough_rendition_texture(texture) {
             return "thumbnail";
         }
@@ -4566,7 +4611,14 @@ impl App {
         if !crate::perf::is_enabled() {
             return;
         }
-        let key = idx.and_then(|idx| self.perf_item_key(idx));
+        let held_page = self
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(|holdover| holdover.page_for_texture_id(texture.id()));
+        let key = match held_page {
+            Some(page) => page.trace_key.clone(),
+            None => idx.and_then(|idx| self.perf_item_key(idx)),
+        };
         crate::perf::event(
             "fs",
             "texture_choice",
@@ -4665,10 +4717,25 @@ impl App {
         let source_size = self
             .source_dims_for_idx(idx)
             .map(|(width, height)| egui::vec2(width, height));
+        let layout_size = self
+            .fs_page_layout_source_size(idx)
+            .or(source_size)
+            .unwrap_or_else(|| texture.size_vec2());
+        let post_filter = self.fullscreen_paint_post_filter(&texture);
+        let trace_key = self.perf_item_key(idx);
+        let trace_load_seq = self
+            .fs_cache
+            .get(&idx)
+            .map(|entry| entry.load_seq())
+            .unwrap_or(0);
         Some(FsDisplayUnitHoldoverPage {
             idx,
             texture,
             rotation,
+            layout_size,
+            post_filter,
+            trace_key,
+            trace_load_seq,
             source_size,
             content_bbox,
         })
@@ -5328,6 +5395,7 @@ impl App {
                 image_rect,
                 fs_idx,
                 None,
+                FsPageLayoutSource::CurrentItem,
                 None,
                 paint_resource.as_ref(),
                 state.thumb_tex.as_ref(),
@@ -5406,6 +5474,7 @@ impl App {
             image_rect,
             fs_idx,
             Some(source_size),
+            FsPageLayoutSource::CurrentItem,
             Some(transform),
             paint_resource.as_ref(),
             state.thumb_tex.as_ref(),
@@ -12504,6 +12573,7 @@ impl App {
                                                     image_rect,
                                                     fs_idx,
                                                     source_size,
+                                                    FsPageLayoutSource::CurrentItem,
                                                     None,
                                                     paint_resource.as_ref(),
                                                     state.thumb_tex.as_ref(),
@@ -14042,11 +14112,7 @@ impl App {
                     .find(|(page_idx, _)| page_idx == idx)
                     .map(|(_, resource)| {
                         let texture = resource.source_texture();
-                        let source = if self.is_passthrough_rendition_texture(texture) {
-                            "thumbnail"
-                        } else {
-                            self.fs_texture_source_for_trace(*idx, texture)
-                        };
+                        let source = self.fs_texture_source_for_trace(*idx, texture);
                         FsDisplayUnitTracePage {
                             idx: *idx,
                             texture_id: texture.id(),
@@ -14075,7 +14141,8 @@ impl App {
         let trace_pages = self
             .fs_display_unit_trace_pages(fs_idx, spread_pair, sources)
             .unwrap_or_default();
-        let viewport = if self.fullscreen_embedded_still_active() {
+        let captured_display_unit = trace_pages.iter().any(|page| page.source == "holdover");
+        let viewport = if captured_display_unit || self.fullscreen_embedded_still_active() {
             ctx.viewport_id()
         } else {
             self.fullscreen_viewport_id()
@@ -14125,14 +14192,25 @@ impl App {
         ctx.data_mut(|data| data.insert_temp(cache_id, current));
 
         for (page, signature) in changed_pages {
-            let entry_seq = if matches!(decision.paint_source(), FsPageTurnPaintSource::PassThrough)
-            {
-                self.input_seq
-            } else {
-                self.fs_cache
+            let held_trace = self
+                .fs_holdover_tex
+                .as_ref()
+                .and_then(|holdover| holdover.page_for_texture_id(page.texture_id))
+                .map(|held| (held.trace_key.clone(), held.trace_load_seq));
+            let entry_seq = match held_trace.as_ref() {
+                Some((_, load_seq)) => *load_seq,
+                None if matches!(decision.paint_source(), FsPageTurnPaintSource::PassThrough) => {
+                    self.input_seq
+                }
+                None => self
+                    .fs_cache
                     .get(&page.idx)
                     .map(|entry| entry.load_seq())
-                    .unwrap_or(0)
+                    .unwrap_or(0),
+            };
+            let event_key = match held_trace.as_ref() {
+                Some((key, _)) => key.clone(),
+                None => self.perf_item_key(page.idx),
             };
             let transform = self
                 .fullscreen_page_layout
@@ -14144,7 +14222,7 @@ impl App {
             crate::perf::event(
                 "fs",
                 "paint",
-                self.perf_item_key(page.idx).as_deref(),
+                event_key.as_deref(),
                 entry_seq,
                 &[
                     ("idx", serde_json::Value::from(page.idx)),
@@ -14270,7 +14348,8 @@ impl App {
         }
         ctx.data_mut(|data| data.insert_temp(cache_id, signature));
 
-        let viewport = if self.fullscreen_embedded_still_active() {
+        let captured_display_unit = trace_pages.iter().any(|page| page.source == "holdover");
+        let viewport = if captured_display_unit || self.fullscreen_embedded_still_active() {
             ctx.viewport_id()
         } else {
             self.fullscreen_viewport_id()
@@ -14278,6 +14357,14 @@ impl App {
         let script_hold_id = crate::key_input::synthetic_frame_hold_id(ctx, viewport);
 
         for page in trace_pages {
+            let held_page = self
+                .fs_holdover_tex
+                .as_ref()
+                .and_then(|holdover| holdover.page_for_texture_id(page.texture_id));
+            let event_key = match held_page {
+                Some(held) => held.trace_key.clone(),
+                None => self.perf_item_key(page.idx),
+            };
             let mut attrs = vec![
                 ("idx", serde_json::Value::from(page.idx)),
                 (
@@ -14297,7 +14384,7 @@ impl App {
             crate::perf::event(
                 "fs",
                 "page_turn_ready",
-                self.perf_item_key(page.idx).as_deref(),
+                event_key.as_deref(),
                 self.input_seq,
                 &attrs,
             );
@@ -17845,6 +17932,15 @@ impl App {
 
     /// ホイールとクリックを処理し、(page_nav, close) を返す。
     fn fs_navigator_allowed(&self, ctx: &egui::Context, fs_idx: usize) -> bool {
+        self.fs_navigator_allowed_for_display_unit(ctx, fs_idx, false)
+    }
+
+    fn fs_navigator_allowed_for_display_unit(
+        &self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        captured_display_unit: bool,
+    ) -> bool {
         let focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
         let hold_active = self
             .keymap
@@ -17862,12 +17958,13 @@ impl App {
             && !self.is_overlay_edit_mode_active()
             && !self.view_trim_mode
             && self.capture_region_selection.is_none()
-            && matches!(
-                self.items.get(fs_idx),
-                Some(GridItem::Image(_))
-                    | Some(GridItem::ZipImage { .. })
-                    | Some(GridItem::PdfPage { .. })
-            )
+            && (captured_display_unit
+                || matches!(
+                    self.items.get(fs_idx),
+                    Some(GridItem::Image(_))
+                        | Some(GridItem::ZipImage { .. })
+                        | Some(GridItem::PdfPage { .. })
+                ))
     }
 
     /// ナビゲータの保持状態を変える唯一の出口。
@@ -19043,10 +19140,15 @@ impl App {
         fs_idx: usize,
         texture_sources: &FsNavigatorTextureSources,
     ) {
-        if !self.fs_navigator_allowed(ctx, fs_idx) {
+        let captured_display_unit = texture_sources.pages.iter().any(|(_, resource)| {
+            self.fs_holdover_tex
+                .as_ref()
+                .is_some_and(|holdover| holdover.contains_texture_id(resource.source_texture_id()))
+        });
+        if !self.fs_navigator_allowed_for_display_unit(ctx, fs_idx, captured_display_unit) {
             return;
         }
-        if self.is_panorama_mode_active(fs_idx) {
+        if !captured_display_unit && self.is_panorama_mode_active(fs_idx) {
             self.draw_panorama_navigator(ui, ctx, image_rect, fs_idx);
             return;
         }
@@ -19134,13 +19236,17 @@ impl App {
 
         let canvas_painter = painter.with_clip_rect(layout.canvas_rect);
         canvas_painter.rect_filled(layout.canvas_rect, 0.0, egui::Color32::BLACK);
-        if !self.draw_compare_navigator_content(ctx, fs_idx, &layout, &canvas_painter) {
+        if captured_display_unit
+            || !self.draw_compare_navigator_content(ctx, fs_idx, &layout, &canvas_painter)
+        {
             for page in &layout.pages {
-                let thumbnail = match self.thumbnails.get(page.main.page_idx) {
-                    Some(ThumbnailState::Loaded { tex, .. }) => Some(tex),
-                    _ => None,
-                };
-                if let Some(tex) = texture_sources.texture_for_page(page.main.page_idx, thumbnail) {
+                let texture = texture_sources
+                    .texture_for_page(page.main.page_idx, None)
+                    .or_else(|| match self.thumbnails.get(page.main.page_idx) {
+                        Some(ThumbnailState::Loaded { tex, .. }) => Some(tex),
+                        _ => None,
+                    });
+                if let Some(tex) = texture {
                     page.navigator
                         .paint_texture(&canvas_painter, tex.id(), egui::Color32::WHITE);
                 } else {
@@ -21924,6 +22030,7 @@ impl App {
         full_rect: egui::Rect,
         page_idx: usize,
         source_size: Option<egui::Vec2>,
+        layout_source: FsPageLayoutSource,
         resolved_transform: Option<DisplayedImageTransform>,
         tex: Option<&crate::gpu_lanczos::FullscreenPaintResource>,
         thumb_tex: Option<&egui::TextureHandle>,
@@ -21955,12 +22062,17 @@ impl App {
         if let Some(resource) = display_tex {
             let handle = resource.source_texture();
             let tex_size = handle.size_vec2();
-            let preserve_texture_aspect = self.is_passthrough_rendition_texture(handle);
-            let use_source_layout = preserve_texture_aspect
-                || matches!(self.items.get(page_idx), Some(GridItem::PdfPage { .. }));
-            let layout_source_size = use_source_layout
-                .then(|| self.fs_page_layout_source_size(page_idx))
-                .flatten();
+            let layout_source_size = match layout_source {
+                FsPageLayoutSource::Captured { layout_size, .. } => Some(layout_size),
+                FsPageLayoutSource::CurrentItem => {
+                    let preserve_texture_aspect = self.is_passthrough_rendition_texture(handle);
+                    let use_source_layout = preserve_texture_aspect
+                        || matches!(self.items.get(page_idx), Some(GridItem::PdfPage { .. }));
+                    use_source_layout
+                        .then(|| self.fs_page_layout_source_size(page_idx))
+                        .flatten()
+                }
+            };
             let fit_bbox = fs_image_fit_bbox(rotation, free_rotation_rad, content_bbox);
             let transform_input = DisplayedImageTransformInput {
                 page_idx,
@@ -22004,12 +22116,23 @@ impl App {
             if rotation.is_none() && free_rotation_rad.abs() <= TRANSFORM_EPSILON {
                 paint_transparent_bg(&painter, paint_rect, bg_style);
             }
-            let paint_resource = self.prepare_fullscreen_paint_resource(
-                resource,
-                transform.total_scale,
-                ui.ctx().pixels_per_point(),
-                transform.visible_source_uv_rect(painter.clip_rect()),
-            );
+            let paint_resource = match layout_source {
+                FsPageLayoutSource::Captured { post_filter, .. } => self
+                    .prepare_fullscreen_paint_resource_with_filter(
+                        resource,
+                        transform.total_scale,
+                        ui.ctx().pixels_per_point(),
+                        transform.visible_source_uv_rect(painter.clip_rect()),
+                        post_filter,
+                        false,
+                    ),
+                FsPageLayoutSource::CurrentItem => self.prepare_fullscreen_paint_resource(
+                    resource,
+                    transform.total_scale,
+                    ui.ctx().pixels_per_point(),
+                    transform.visible_source_uv_rect(painter.clip_rect()),
+                ),
+            };
             if let Some(source_uv_rect) = paint_resource.visible_source_uv_rect() {
                 transform.paint_texture_source_region(
                     &painter,
@@ -23688,6 +23811,7 @@ impl App {
                 page.rect,
                 page.idx,
                 source_size,
+                FsPageLayoutSource::CurrentItem,
                 rotation,
                 &bg_style,
                 &location,
@@ -25635,6 +25759,10 @@ impl App {
                         image_rect,
                         page.idx,
                         page.source_size,
+                        FsPageLayoutSource::Captured {
+                            layout_size: page.layout_size,
+                            post_filter: page.post_filter,
+                        },
                         None,
                         Some(&page.texture),
                         None,
@@ -25793,8 +25921,8 @@ impl App {
         // 各ページの表示サイズを計算して、全体をフィットさせる
         // 片方だけフルサイズだとアスペクト比の微小差でレイアウトがジャンプするため、
         // 両方フルサイズが揃うまではサムネイルサイズに統一する
-        let (left_source_size, right_source_size) = match display_override {
-            Some((left, right)) => (left.source_size, right.source_size),
+        let (left_layout_size, right_layout_size) = match display_override {
+            Some((left, right)) => (Some(left.layout_size), Some(right.layout_size)),
             None => (
                 self.fs_page_layout_source_size(left_idx),
                 self.fs_page_layout_source_size(right_idx),
@@ -25807,40 +25935,66 @@ impl App {
                 self.fs_page_coordinate_source_size(right_idx),
             ),
         };
-        let both_in_fs_cache =
-            self.fs_cache.contains_key(&left_idx) && self.fs_cache.contains_key(&right_idx);
-        let pdf_layout_unit = matches!(self.items.get(left_idx), Some(GridItem::PdfPage { .. }))
-            || matches!(self.items.get(right_idx), Some(GridItem::PdfPage { .. }));
-        let (left_size, right_size) = if color_faithful_rendition_unit || pdf_layout_unit {
+        let (left_size, right_size) = if let Some((left, right)) = display_override {
             (
-                passthrough_layout_display_size(
-                    left_source_size,
-                    left_display_tex.as_ref().map(|tex| tex.size_vec2()),
-                    left_rot,
-                ),
-                passthrough_layout_display_size(
-                    right_source_size,
-                    right_display_tex.as_ref().map(|tex| tex.size_vec2()),
-                    right_rot,
-                ),
-            )
-        } else if let (Some(left_tex), Some(right_tex)) = (&left_display_tex, &right_display_tex) {
-            (
-                Some(rotated_display_size(left_tex.size_vec2(), left_rot)),
-                Some(rotated_display_size(right_tex.size_vec2(), right_rot)),
-            )
-        } else if both_in_fs_cache {
-            (
-                Self::get_display_size(left_idx, left_rot, &self.fs_cache, &self.thumbnails),
-                Self::get_display_size(right_idx, right_rot, &self.fs_cache, &self.thumbnails),
+                Some(rotated_display_size(left.layout_size, left_rot)),
+                Some(rotated_display_size(right.layout_size, right_rot)),
             )
         } else {
-            // サムネイルのみ使用（fs_cache を空マップとして渡す）
-            let empty = ItemsGenerationMap::new("fs_cache");
-            (
-                Self::get_display_size(left_idx, left_rot, &empty, &self.thumbnails),
-                Self::get_display_size(right_idx, right_rot, &empty, &self.thumbnails),
-            )
+            let both_in_fs_cache =
+                self.fs_cache.contains_key(&left_idx) && self.fs_cache.contains_key(&right_idx);
+            let pdf_layout_unit =
+                matches!(self.items.get(left_idx), Some(GridItem::PdfPage { .. }))
+                    || matches!(self.items.get(right_idx), Some(GridItem::PdfPage { .. }));
+            if color_faithful_rendition_unit || pdf_layout_unit {
+                (
+                    passthrough_layout_display_size(
+                        left_layout_size,
+                        left_display_tex.as_ref().map(|tex| tex.size_vec2()),
+                        left_rot,
+                    ),
+                    passthrough_layout_display_size(
+                        right_layout_size,
+                        right_display_tex.as_ref().map(|tex| tex.size_vec2()),
+                        right_rot,
+                    ),
+                )
+            } else if let (Some(left_tex), Some(right_tex)) =
+                (&left_display_tex, &right_display_tex)
+            {
+                (
+                    Some(rotated_display_size(left_tex.size_vec2(), left_rot)),
+                    Some(rotated_display_size(right_tex.size_vec2(), right_rot)),
+                )
+            } else if both_in_fs_cache {
+                (
+                    Self::get_display_size(left_idx, left_rot, &self.fs_cache, &self.thumbnails),
+                    Self::get_display_size(right_idx, right_rot, &self.fs_cache, &self.thumbnails),
+                )
+            } else {
+                // サムネイルのみ使用（fs_cache を空マップとして渡す）
+                let empty = ItemsGenerationMap::new("fs_cache");
+                (
+                    Self::get_display_size(left_idx, left_rot, &empty, &self.thumbnails),
+                    Self::get_display_size(right_idx, right_rot, &empty, &self.thumbnails),
+                )
+            }
+        };
+        let (left_page_layout_source, right_page_layout_source) = match display_override {
+            Some((left, right)) => (
+                FsPageLayoutSource::Captured {
+                    layout_size: left.layout_size,
+                    post_filter: left.post_filter,
+                },
+                FsPageLayoutSource::Captured {
+                    layout_size: right.layout_size,
+                    post_filter: right.post_filter,
+                },
+            ),
+            None => (
+                FsPageLayoutSource::CurrentItem,
+                FsPageLayoutSource::CurrentItem,
+            ),
         };
 
         // ズーム/パンが有効な場合は image_rect でクリップする
@@ -25979,6 +26133,7 @@ impl App {
                 rect,
                 idx,
                 source_size,
+                layout_source,
                 rot,
                 location,
                 display_tex,
@@ -25989,6 +26144,7 @@ impl App {
                     spread_rects.left_rect,
                     left_idx,
                     left_coordinate_size,
+                    left_page_layout_source,
                     left_rot,
                     &left_location,
                     left_display_tex.as_ref(),
@@ -25999,6 +26155,7 @@ impl App {
                     spread_rects.right_rect,
                     right_idx,
                     right_coordinate_size,
+                    right_page_layout_source,
                     right_rot,
                     &right_location,
                     right_display_tex.as_ref(),
@@ -26012,6 +26169,7 @@ impl App {
                     rect,
                     idx,
                     source_size,
+                    layout_source,
                     rot,
                     &bg_style,
                     location,
@@ -26057,6 +26215,7 @@ impl App {
                 rect,
                 idx,
                 source_size,
+                layout_source,
                 rot,
                 location,
                 display_tex,
@@ -26067,6 +26226,7 @@ impl App {
                     left_rect,
                     left_idx,
                     left_coordinate_size,
+                    left_page_layout_source,
                     left_rot,
                     &left_location,
                     left_display_tex.as_ref(),
@@ -26077,6 +26237,7 @@ impl App {
                     right_rect,
                     right_idx,
                     right_coordinate_size,
+                    right_page_layout_source,
                     right_rot,
                     &right_location,
                     right_display_tex.as_ref(),
@@ -26090,6 +26251,7 @@ impl App {
                     rect,
                     idx,
                     source_size,
+                    layout_source,
                     rot,
                     &bg_style,
                     location,
@@ -26152,6 +26314,7 @@ impl App {
         rect: egui::Rect,
         idx: usize,
         source_size: Option<egui::Vec2>,
+        layout_source: FsPageLayoutSource,
         rotation: crate::rotation_db::Rotation,
         bg_style: &FsBgStyle,
         location_display: &str,
@@ -26175,14 +26338,19 @@ impl App {
 
         if let Some(handle) = display_tex {
             let tex_size = handle.size_vec2();
-            let preserve_texture_aspect =
-                self.is_passthrough_rendition_texture(handle.source_texture());
-            let use_layout = preserve_texture_aspect
-                || matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }));
-            let layout_size = use_layout
-                .then(|| self.fs_page_layout_source_size(idx))
-                .flatten()
-                .unwrap_or(tex_size);
+            let layout_size = match layout_source {
+                FsPageLayoutSource::Captured { layout_size, .. } => layout_size,
+                FsPageLayoutSource::CurrentItem => {
+                    let preserve_texture_aspect =
+                        self.is_passthrough_rendition_texture(handle.source_texture());
+                    let use_layout = preserve_texture_aspect
+                        || matches!(self.items.get(idx), Some(GridItem::PdfPage { .. }));
+                    use_layout
+                        .then(|| self.fs_page_layout_source_size(idx))
+                        .flatten()
+                        .unwrap_or(tex_size)
+                }
+            };
             let display_size = match rotation {
                 crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
                     egui::vec2(layout_size.y, layout_size.x)
@@ -26213,12 +26381,23 @@ impl App {
             if rotation.is_none() {
                 paint_transparent_bg(painter, transform.paint_rect, bg_style);
             }
-            let paint_resource = self.prepare_fullscreen_paint_resource(
-                handle,
-                transform.total_scale,
-                pixels_per_point,
-                transform.visible_source_uv_rect(painter.clip_rect()),
-            );
+            let paint_resource = match layout_source {
+                FsPageLayoutSource::Captured { post_filter, .. } => self
+                    .prepare_fullscreen_paint_resource_with_filter(
+                        handle,
+                        transform.total_scale,
+                        pixels_per_point,
+                        transform.visible_source_uv_rect(painter.clip_rect()),
+                        post_filter,
+                        false,
+                    ),
+                FsPageLayoutSource::CurrentItem => self.prepare_fullscreen_paint_resource(
+                    handle,
+                    transform.total_scale,
+                    pixels_per_point,
+                    transform.visible_source_uv_rect(painter.clip_rect()),
+                ),
+            };
             if let Some(source_uv_rect) = paint_resource.visible_source_uv_rect() {
                 transform.paint_texture_source_region(
                     painter,
@@ -31936,6 +32115,106 @@ mod tests {
         assert!((actual.bottom() - expected.bottom()).abs() < EPSILON);
     }
 
+    fn push_loaded_pdf_page(
+        app: &mut App,
+        ctx: &egui::Context,
+        texture_name: &str,
+        path: &str,
+        page_num: u32,
+        texture_size: [usize; 2],
+        source_dims: (u32, u32),
+        layout_dims: (u32, u32),
+        color: egui::Color32,
+    ) -> usize {
+        let idx = app.items.len();
+        app.items.push(GridItem::PdfPage {
+            pdf_path: PathBuf::from(path),
+            page_num,
+            content_type: None,
+        });
+        app.thumbnails.push(ThumbnailState::Loaded {
+            tex: ctx.load_texture(
+                texture_name,
+                egui::ColorImage::filled(texture_size, color),
+                egui::TextureOptions::LINEAR,
+            ),
+            from_cache: false,
+            from_edit_preview: false,
+            rendered_at_px: texture_size[0].max(texture_size[1]) as u32,
+            source_dims: Some(source_dims),
+            layout_dims: Some(layout_dims),
+        });
+        idx
+    }
+
+    fn replace_loaded_pdf_page(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        texture_name: &str,
+        path: &str,
+        page_num: u32,
+        layout_dims: (u32, u32),
+    ) {
+        app.items[idx] = GridItem::PdfPage {
+            pdf_path: PathBuf::from(path),
+            page_num,
+            content_type: None,
+        };
+        app.thumbnails[idx] = ThumbnailState::Loaded {
+            tex: ctx.load_texture(
+                texture_name,
+                egui::ColorImage::filled([24, 12], egui::Color32::LIGHT_BLUE),
+                egui::TextureOptions::LINEAR,
+            ),
+            from_cache: false,
+            from_edit_preview: false,
+            rendered_at_px: 24,
+            source_dims: Some((1200, 600)),
+            layout_dims: Some(layout_dims),
+        };
+    }
+
+    fn captured_folder_navigation_unit(app: &App) -> FsDisplayUnitHoldover {
+        let FsHoldover::FolderNavigation(unit) = app
+            .fs_holdover_tex
+            .as_ref()
+            .expect("folder navigation holdover captured")
+        else {
+            panic!("expected folder navigation holdover");
+        };
+        unit.clone()
+    }
+
+    fn draw_holdover_unit_for_test(
+        app: &mut App,
+        ctx: &egui::Context,
+        image_rect: egui::Rect,
+        unit: &FsDisplayUnitHoldover,
+    ) {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(image_rect),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        app.draw_fs_display_unit_holdover(ui, ctx, image_rect, unit);
+                    });
+            },
+        );
+    }
+
+    fn assert_aspect_ratio(rect: egui::Rect, expected: f32) {
+        let actual = rect.width() / rect.height();
+        assert!(
+            (actual - expected).abs() < 1.0e-4,
+            "expected aspect {expected}, got {actual} from {rect:?}"
+        );
+    }
+
     fn fullscreen_top_bar_button_x_positions(
         is_spread_double: bool,
         initial_reading_flow: ReadingFlow,
@@ -32825,6 +33104,10 @@ mod tests {
         let holdover = FsDisplayUnitHoldover {
             pages: vec![FsDisplayUnitHoldoverPage {
                 idx: 4,
+                layout_size: held.size_vec2(),
+                post_filter: crate::adjustment::PostFilter::None,
+                trace_key: None,
+                trace_load_seq: 0,
                 texture: FullscreenPaintResource::direct(held.clone()),
                 rotation: crate::rotation_db::Rotation::None,
                 source_size: None,
@@ -32837,6 +33120,189 @@ mod tests {
         assert_eq!(
             sources.texture_for_page(4, Some(&live)).unwrap().id(),
             held.id()
+        );
+    }
+
+    #[test]
+    fn single_page_holdover_draw_uses_captured_pdf_layout_after_index_reuse() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        let idx = push_loaded_pdf_page(
+            &mut app,
+            &ctx,
+            "holdover_single_old_pdf",
+            "C:/pdf/old.pdf",
+            0,
+            [40, 80],
+            (400, 800),
+            (500, 1000),
+            egui::Color32::WHITE,
+        );
+        app.visible_indices = vec![idx];
+        app.fullscreen_idx = Some(idx);
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
+        app.settings.global_preset.post_filter = crate::adjustment::PostFilter::Nearest;
+        let full_texture = ctx.load_texture(
+            "holdover_single_old_full",
+            egui::ColorImage::filled([40, 80], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex: full_texture,
+                pixels: std::sync::Arc::new(egui::ColorImage::filled(
+                    [40, 80],
+                    egui::Color32::WHITE,
+                )),
+                source_dims: Some([400, 800]),
+                load_seq: 17,
+            },
+        );
+
+        app.capture_fs_nav_holdover(idx);
+        let unit = captured_folder_navigation_unit(&app);
+        assert_eq!(unit.pages[0].layout_size, egui::vec2(500.0, 1000.0));
+        assert_eq!(
+            unit.pages[0].post_filter,
+            crate::adjustment::PostFilter::Nearest
+        );
+        assert_eq!(unit.pages[0].trace_load_seq, 17);
+
+        app.fs_cache.clear();
+        app.settings.global_preset.post_filter = crate::adjustment::PostFilter::None;
+        replace_loaded_pdf_page(
+            &mut app,
+            &ctx,
+            idx,
+            "holdover_single_replacement_pdf",
+            "C:/pdf/replacement.pdf",
+            0,
+            (1200, 600),
+        );
+        app.items_generation = app.items_generation.wrapping_add(1);
+        assert_eq!(
+            app.fs_page_layout_source_size(idx),
+            Some(egui::vec2(1200.0, 600.0)),
+            "the reused index must expose the replacement PDF page box"
+        );
+
+        let image_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 900.0));
+        draw_holdover_unit_for_test(&mut app, &ctx, image_rect, &unit);
+
+        let transform = app
+            .fullscreen_page_layout
+            .single_page()
+            .expect("single holdover draw records one transform")
+            .transform;
+        assert_aspect_ratio(transform.full_image_rect, 0.5);
+    }
+
+    #[test]
+    fn spread_holdover_draw_uses_each_captured_pdf_layout_after_index_reuse() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        let left = push_loaded_pdf_page(
+            &mut app,
+            &ctx,
+            "holdover_spread_old_left",
+            "C:/pdf/old.pdf",
+            0,
+            [40, 80],
+            (400, 800),
+            (400, 800),
+            egui::Color32::LIGHT_RED,
+        );
+        let right = push_loaded_pdf_page(
+            &mut app,
+            &ctx,
+            "holdover_spread_old_right",
+            "C:/pdf/old.pdf",
+            1,
+            [60, 80],
+            (600, 800),
+            (600, 800),
+            egui::Color32::LIGHT_GREEN,
+        );
+        app.visible_indices = vec![left, right];
+        app.cached_nav_indices = None;
+        app.fullscreen_idx = Some(left);
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
+
+        app.capture_fs_nav_holdover(left);
+        let unit = captured_folder_navigation_unit(&app);
+        assert_eq!(unit.pages.len(), 2);
+        assert_eq!(unit.pages[0].layout_size, egui::vec2(400.0, 800.0));
+        assert_eq!(unit.pages[1].layout_size, egui::vec2(600.0, 800.0));
+
+        replace_loaded_pdf_page(
+            &mut app,
+            &ctx,
+            left,
+            "holdover_spread_replacement_left",
+            "C:/pdf/replacement.pdf",
+            0,
+            (1000, 500),
+        );
+        replace_loaded_pdf_page(
+            &mut app,
+            &ctx,
+            right,
+            "holdover_spread_replacement_right",
+            "C:/pdf/replacement.pdf",
+            1,
+            (1200, 400),
+        );
+        app.items_generation = app.items_generation.wrapping_add(1);
+
+        let image_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 900.0));
+        draw_holdover_unit_for_test(&mut app, &ctx, image_rect, &unit);
+
+        assert_eq!(
+            app.fullscreen_page_layout.kind(),
+            FullscreenPageLayoutKind::Spread
+        );
+        let left_transform = app
+            .fullscreen_page_layout
+            .page_by_idx(left)
+            .expect("captured left page is drawn")
+            .transform;
+        let right_transform = app
+            .fullscreen_page_layout
+            .page_by_idx(right)
+            .expect("captured right page is drawn")
+            .transform;
+        assert_aspect_ratio(left_transform.full_image_rect, 0.5);
+        assert_aspect_ratio(right_transform.full_image_rect, 0.75);
+    }
+
+    #[test]
+    fn fullscreen_texture_classifier_reports_holdover_texture_as_holdover() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        let idx = push_loaded_pdf_page(
+            &mut app,
+            &ctx,
+            "holdover_classifier",
+            "C:/pdf/classifier.pdf",
+            0,
+            [40, 80],
+            (400, 800),
+            (500, 1000),
+            egui::Color32::WHITE,
+        );
+        app.visible_indices = vec![idx];
+        app.fullscreen_idx = Some(idx);
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        app.capture_fs_nav_holdover(idx);
+        let unit = captured_folder_navigation_unit(&app);
+        let held_texture = unit.pages[0].texture.source_texture();
+
+        assert_eq!(
+            app.fs_texture_source_for_trace(idx, held_texture),
+            "holdover"
         );
     }
 
@@ -33948,6 +34414,10 @@ mod tests {
                 previous: FsDisplayUnitHoldover {
                     pages: vec![FsDisplayUnitHoldoverPage {
                         idx: 0,
+                        layout_size: texture.size_vec2(),
+                        post_filter: crate::adjustment::PostFilter::None,
+                        trace_key: None,
+                        trace_load_seq: 0,
                         texture: crate::gpu_lanczos::FullscreenPaintResource::direct(
                             texture.clone(),
                         ),
@@ -33971,6 +34441,10 @@ mod tests {
         let folder_navigation = FsHoldover::FolderNavigation(FsDisplayUnitHoldover {
             pages: vec![FsDisplayUnitHoldoverPage {
                 idx: 0,
+                layout_size: texture.size_vec2(),
+                post_filter: crate::adjustment::PostFilter::None,
+                trace_key: None,
+                trace_load_seq: 0,
                 texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
                 rotation: crate::rotation_db::Rotation::None,
                 source_size: None,

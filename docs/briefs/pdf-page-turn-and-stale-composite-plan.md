@@ -254,6 +254,22 @@ PDF ページは PDFium レンダで 1 枚 300ms 前後かかり、キーリピ�
 Part A だけで「枠に合わせて変形してから中身が入れ替わる」「ちらつく」は止まる。
 **ただし中間の PDF が表示されないことは直らない。**
 
+#### Part A 実装記録 (2026-08-14)
+
+- `FsDisplayUnitHoldoverPage` に capture 時の `layout_size` を追加。PDF はそのページの page box、
+  通常画像は source size（いずれも無い旧 fallback だけ texture size）を保存する。
+- 単ページは `draw_fs_image`、見開きは spread geometry と `draw_fs_spread_page` へ
+  `FsPageLayoutSource::Captured { .. }` を渡す。holdover 分岐では replacement items の
+  `items` / `thumbnails` / page-layout metadata を idx から参照しない。共有 resampler 経路も
+  capture 済み post-filter と診断 identity / load sequence を受け取り、replacement item の
+  `effective_params` / perf key / `fs_cache` を再解決しない。
+- `fs_texture_source_for_trace` は holdover が所有する texture id を cache 分類より先に判定し、
+  `processed_other` ではなく `holdover` と記録する。
+- 単ページ / 見開きそれぞれで、同 idx の replacement PDF が異なる page box を持っても
+  capture 時の縦横比で描く回帰テストと、classifier の回帰テストを追加した。
+- retention policy、受理 target の逐次提示、key repeat の drop は変更していない。これらは
+  引き続き Part B の範囲とする。`final_composite_cache` / key の世代 hardening も未変更。
+
 ### Part B — 受理した移動先を必ず提示し、捌けないキーリピートは捨てる (①の残りと②)
 
 利用者判断 (2026-08-14): **通過するページ / 移動先は、サムネイル画質でよいので必ず実際に

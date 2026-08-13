@@ -184,6 +184,10 @@ fn single_folder_navigation_holdover(page_idx: usize, texture: egui::TextureHand
     FsHoldover::FolderNavigation(FsDisplayUnitHoldover {
         pages: vec![FsDisplayUnitHoldoverPage {
             idx: page_idx,
+            layout_size: texture.size_vec2(),
+            post_filter: crate::adjustment::PostFilter::None,
+            trace_key: None,
+            trace_load_seq: 0,
             texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
             rotation: crate::rotation_db::Rotation::None,
             source_size: None,
@@ -18479,6 +18483,7 @@ mod favorite_adjustment_defaults_tests {
             crate::rotation_db::Rotation::Cw90,
             "holdover geometry must be the capture-time old-item geometry"
         );
+        assert_eq!(held.pages[0].layout_size, egui::vec2(400.0, 700.0));
         assert_eq!(held.pages[0].source_size, Some(egui::vec2(400.0, 700.0)));
     }
 
@@ -22027,6 +22032,10 @@ mod pipeline_cache_refactor_tests {
             previous: FsDisplayUnitHoldover {
                 pages: vec![FsDisplayUnitHoldoverPage {
                     idx: page_idx,
+                    layout_size: texture.size_vec2(),
+                    post_filter: crate::adjustment::PostFilter::None,
+                    trace_key: None,
+                    trace_load_seq: 0,
                     texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
                     rotation: crate::rotation_db::Rotation::None,
                     source_size: None,

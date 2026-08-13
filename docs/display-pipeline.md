@@ -325,7 +325,9 @@ Ctrl+↑↓ のフォルダ横断と、同じ表示ユニットの final-effect 
   見開き 2 ページをまとめて保持する。ページごとの fallback ではなく、直前に見ていた
   **表示ユニット単位**の hold であり、カラー化の有無とは無関係に
   `capture_fs_nav_holdover` が作る。各 page は texture に加えて capture 時点の rotation、
-  canonical source size、実表示に使った単ページ / 見開き側別 content bbox を所有する。
+  canonical coordinate source size、PDF page box（通常画像は source size）由来の独立した
+  canonical layout size、実表示に使った単ページ / 見開き側別 content bbox、paint-time
+  post-filter と診断 identity を所有する。
 - `FinalEffectSourceReload { target_idx, previous, started_at }`: PDF の Z ズーム再レンダなど、同じ
   表示ユニットの source が差し替わる直前に、`previous.pages` へ単ページまたは見開き全体を保持する。
   `capture_final_effect_source_reload_holdover` だけが作り、左右別 slot は持たない。`started_at` は
@@ -337,8 +339,11 @@ gap と、`fullscreen_idx == Some` の nav ロック継続中のどちらも、�
 `draw_fs_display_unit_holdover` で旧単ページまたは旧見開き全体を `image_rect` に重ねる。
 画面順を payload に保存するため、LTR は `[小 idx, 大 idx]`、RTL は `[大 idx, 小 idx]` の
 物理的な左右順を items 差し替え後も維持する。texture handle と geometry snapshot を unit
-自身が所有するため、旧 `fs_cache` が drop されても描画寿命は変わらず、同じ数値 idx が
-新フォルダの別 item を指し始めても rotation / source size / trim を再解決しない。
+自身が所有するため、旧 `fs_cache` が drop されても描画寿命は変わらない。holdover の単ページ・
+見開き描画は capture 済み canonical layout size を明示的に渡し、同じ数値 idx が新フォルダの
+別 item を指し始めても `items` / `thumbnails` / page-layout metadata から rotation / layout size /
+source size / trim / post-filter を再解決しない。idx は `fullscreen_page_layout` の identity と
+診断イベントの数値欄にだけ使い、診断 key / load sequence も capture 済みの値を使う。
 
 フォルダ横断後、新しい `items_generation` のページで full / final / edit / thumbnail の
 いずれかを一度でも表示候補に選べたら、`fs_nav_holdover_for_draw` は

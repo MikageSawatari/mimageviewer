@@ -6467,6 +6467,23 @@ impl FsHoldover {
         }
     }
 
+    pub(crate) fn contains_texture_id(&self, texture_id: egui::TextureId) -> bool {
+        self.page_for_texture_id(texture_id).is_some()
+    }
+
+    pub(crate) fn page_for_texture_id(
+        &self,
+        texture_id: egui::TextureId,
+    ) -> Option<&FsDisplayUnitHoldoverPage> {
+        let unit = match self {
+            Self::FolderNavigation(unit) => unit,
+            Self::FinalEffectSourceReload(holdover) => &holdover.previous,
+        };
+        unit.pages
+            .iter()
+            .find(|page| page.texture.source_texture_id() == texture_id)
+    }
+
     #[cfg(test)]
     pub(crate) fn primary_texture_id(&self) -> egui::TextureId {
         match self {
@@ -6510,6 +6527,17 @@ pub(crate) struct FsDisplayUnitHoldoverPage {
     pub(crate) idx: usize,
     pub(crate) texture: crate::gpu_lanczos::FullscreenPaintResource,
     pub(crate) rotation: crate::rotation_db::Rotation,
+    /// Capture-time canonical dimensions used only for page layout. PDF pages retain their
+    /// page-box geometry; ordinary images retain their source dimensions. This is deliberately
+    /// independent of the viewport so a held page can be laid out again after a resize.
+    pub(crate) layout_size: egui::Vec2,
+    /// Paint-time filter paired with the captured texture. Resampler preparation must not
+    /// resolve the replacement item's parameters through the retained capture-time index.
+    pub(crate) post_filter: crate::adjustment::PostFilter,
+    /// Capture-time diagnostic identity. Holdover paint logs must not label the old texture with
+    /// the replacement item that later reuses `idx`.
+    pub(crate) trace_key: Option<String>,
+    pub(crate) trace_load_seq: u64,
     pub(crate) source_size: Option<egui::Vec2>,
     pub(crate) content_bbox: Option<egui::Rect>,
 }
