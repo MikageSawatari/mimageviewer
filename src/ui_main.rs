@@ -14800,6 +14800,9 @@ impl App {
                     // Drop されて worker が cancel する。
                     let loading = self.zip_enumerate_pending.is_some()
                         || self.pdf_enumerate_pending.is_some();
+                    // 空になった理由が付いていればそれを出す (§1.68)。理由の無い空だけが
+                    // 「本当に 0 件」で、読み込みの失敗と同じ文言にはしない。
+                    let failure = self.empty_items_reason().map(|reason| reason.message());
                     let msg = if self.items_are_bookmark_view
                         && self.bookmark_browser_pending.is_some()
                     {
@@ -14810,6 +14813,8 @@ impl App {
                         "検索中"
                     } else if loading {
                         "読み込み中…"
+                    } else if let Some(failure) = failure {
+                        failure
                     } else if self.current_folder.is_some() {
                         "表示するファイルがありません"
                     } else {

@@ -8958,6 +8958,12 @@ pub struct App {
     /// このフラグが true のときだけ (Codex P2): Ctrl+G から実フォルダ/ZIP/PDF を
     /// 開いた後に rating 変更して合成ビューが書き戻される事故を防ぐ。
     pub(crate) items_are_global_search_view: bool,
+    /// `items` が空になった理由と、そのときの `items_generation` (§1.68)。
+    ///
+    /// 世代を一緒に持つのは、次の読み込みへ理由が持ち越されないようにするため。
+    /// 空にした側が `set_empty_items_reason` を呼ぶ順序に頼らず、世代が変われば
+    /// 自動的に無効になる。理由が付かない空は「本当に 0 件」を意味する。
+    pub(crate) empty_items_reason: Option<(u64, crate::empty_items_reason::EmptyItemsReason)>,
     /// 現在の `items` がタグビュー (Ctrl+T) の一時結果一覧かを示す。
     pub(crate) items_are_tag_view: bool,
     /// 現在の `items` が閲覧履歴の仮想ビューかを示す。
@@ -12357,6 +12363,7 @@ impl App {
             items_generation: 0,
             top_level_grid_view: top_level_grid_view::TopLevelGridView::default(),
             items_are_global_search_view: false,
+            empty_items_reason: None,
             items_are_tag_view: false,
             items_are_reading_history_view: false,
             items_are_bookmark_view: false,
@@ -20292,7 +20299,6 @@ impl App {
             Ok(r) => r,
             Err(mpsc::TryRecvError::Empty) => return,
             Err(mpsc::TryRecvError::Disconnected) => {
-                crate::logger::log("zip enumerate: worker disconnected");
                 let zip_path = pending.zip_path.clone();
                 self.zip_enumerate_pending = None;
                 // ワーカー切断ではフルスクリーン復帰が起きない: defer フラグを破棄。
@@ -20305,6 +20311,9 @@ impl App {
                     std::collections::HashSet::new(),
                     Vec::new(),
                     None,
+                );
+                self.set_empty_items_reason(
+                    crate::empty_items_reason::EmptyItemsReason::ZipWorkerLost,
                 );
                 return;
             }
@@ -20325,7 +20334,6 @@ impl App {
         let enumeration = match result {
             Ok(e) => e,
             Err(e) => {
-                crate::logger::log(format!("  zip enumerate failed: {e}"));
                 // 失敗時はフルスクリーンを開き直さないので defer フラグを破棄する
                 // (line 6142 の `.take()` には到達しない早期 return パス)。
                 self.fs_nav_after_pdf_enumerate = None;
@@ -20337,6 +20345,9 @@ impl App {
                     std::collections::HashSet::new(),
                     Vec::new(),
                     None,
+                );
+                self.set_empty_items_reason(
+                    crate::empty_items_reason::EmptyItemsReason::ZipEnumerateFailed { detail: e },
                 );
                 return;
             }
@@ -21282,7 +21293,6 @@ impl App {
             Err(mpsc::TryRecvError::Empty) => return, // まだ結果が来ていない
             Err(mpsc::TryRecvError::Disconnected) => {
                 // ワーカーが切断 (通常起きない)
-                crate::logger::log("  pdf enumerate: worker disconnected");
                 let path = pdf_path.clone();
                 self.pdf_enumerate_pending = None;
                 self.fs_nav_after_pdf_enumerate = None;
@@ -21294,6 +21304,9 @@ impl App {
                     std::collections::HashSet::new(),
                     Vec::new(),
                     None,
+                );
+                self.set_empty_items_reason(
+                    crate::empty_items_reason::EmptyItemsReason::PdfWorkerLost,
                 );
                 return;
             }
@@ -21470,6 +21483,9 @@ impl App {
                             Vec::new(),
                             None,
                         );
+                        self.set_empty_items_reason(
+                            crate::empty_items_reason::EmptyItemsReason::PdfPasswordRequired,
+                        );
                     }
                     self.pdf_password_request = Some(PdfPasswordRequest { path: pdf_path });
                     self.show_pdf_password_dialog = true;
@@ -21487,7 +21503,6 @@ impl App {
                 // グリッド表示にフォールバック
                 self.fs_nav_after_pdf_enumerate = None;
                 self.pdf_placeholder_count = None;
-                crate::logger::log(format!("  pdf enumerate failed: {e}"));
                 self.start_loading_items(
                     pdf_path,
                     Vec::new(),
@@ -21495,6 +21510,11 @@ impl App {
                     std::collections::HashSet::new(),
                     Vec::new(),
                     None,
+                );
+                self.set_empty_items_reason(
+                    crate::empty_items_reason::EmptyItemsReason::PdfEnumerateFailed {
+                        detail: err_msg,
+                    },
                 );
             }
         }
@@ -22989,6 +23009,29 @@ impl App {
 
     pub(crate) fn bump_items_generation(&mut self) {
         self.set_items_generation(self.items_generation.wrapping_add(1));
+    }
+
+    /// 一覧を空にした理由を記録する (§1.68)。**`start_loading_items` で空を積んだ後**に
+    /// 呼ぶこと。世代を一緒に焼くので、次の読み込みへは持ち越されない。
+    ///
+    /// ログもここで 1 行出す。理由の型と、利用者から届くログの文言が別々に育って
+    /// ずれないようにするため。
+    pub(crate) fn set_empty_items_reason(
+        &mut self,
+        reason: crate::empty_items_reason::EmptyItemsReason,
+    ) {
+        crate::logger::log(reason.log_line());
+        self.empty_items_reason = Some((self.items_generation, reason));
+    }
+
+    /// いま表示している空一覧に付いた理由。世代が違えば無いものとして扱う。
+    pub(crate) fn empty_items_reason(
+        &self,
+    ) -> Option<&crate::empty_items_reason::EmptyItemsReason> {
+        self.empty_items_reason
+            .as_ref()
+            .filter(|(generation, _)| *generation == self.items_generation)
+            .map(|(_, reason)| reason)
     }
 
     #[cfg(test)]
