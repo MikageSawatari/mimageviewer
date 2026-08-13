@@ -441,43 +441,54 @@ mIV 再起動で 0 にリセット。将来 Phase 3 で「常に高品質」を�
 200 MP 以下では tee 経路 (1 回デコード) で最適化、200 MP 超ではユーザー判断後に
 追加デコード、という設計トレードオフ。
 
-#### 3.6.2.1 settle overlay の適用範囲 (2026-08 編集非反映仕様)
+#### 3.6.2.1 settle overlay の適用範囲 (2026-08 画素編集非反映仕様)
 
-settle worker は原本ファイルを再デコードし、元 RGBA を sample する。したがって再現できるのは
-「原本」と「原本へ単純色調補正を再適用した結果」だけである。通常表示の最終合成を 8K base
-だけに使うと、ドラッグ中と静止後で消しゴム・隠蔽加工・補正レイヤー等が出入りする。
+settle worker は原本ファイルを再デコードし、元 RGBA を sample する。再現できるのは
+「原本」と「原本へ通常の色調補正を再適用した結果」だけであり、AI、ポストフィルタ、
+スマートシャープ、自動補正を焼き込んだ 8K base では settle を動かさない。これは変更前から
+成立していた整合方法であり、これらの加工自体は 360 度表示へ反映する。
 
-この食い違いを構造的に無くすため、360 度ビューは通常表示の final pipeline から独立させ、
-次の 2 ソースだけを使う。
+不整合があったのは、通常表示の最終合成に含まれる消しゴム・隠蔽加工・補正レイヤーだけである。
+これらは base に出る一方で settle では消えていたため、画素編集があるページだけ
+`final_composite_cache` を候補から外す。ソース優先順位は次のとおり。
 
-- 補正なし: `fs_cache`（元画像）
-- 単純色調補正だけ: `adjustment_cache`
-- post_filter / smart_sharpen / auto_mode / AI / 消しゴム / 隠蔽加工 / 補正レイヤーが
-  1 つでも有効: `fs_cache`（元画像）
+1. 画素編集がなければ、完成済み `final_composite_cache`
+2. AI が対象ページへ実効的に適用されるなら `ai_upscale_cache`
+3. `adjustment_cache`
+4. `fs_cache`
 
-`adjustment_cache` の内容は `App::apply_sync_adjustment` が根拠になる。同関数は
-`adjustment::apply_adjustments_fast`（内部で `resolve_auto_mode`）の後に
-`post_filter::apply` を行う。一方、コメントどおり smart sharpen とカラー化はこの cache に
-含めない。現在の呼び出し元は `fs_cache` の raw pixels を渡す。このため 360 側は
-`auto_mode == None`、`post_filter == None`、`smart_sharpen == 0`、AI 非適用、画素編集なしの
-ときだけ `adjustment_cache` を採用する。
+`adjustment_cache` の唯一の writer は `App::apply_sync_adjustment` である。同関数は
+raw pixels に `adjustment::apply_adjustments_fast`（内部で `resolve_auto_mode`）を掛け、
+続けて `post_filter::apply` を行う。smart sharpen、カラー化、AI は含まれず、2 つの
+呼び出し元はいずれも `fs_cache` の raw pixels を渡す。したがって AI 由来の
+`adjustment_cache` は存在せず、AI が実効的な場合は AI cache を adjustment cache より先に選ぶ。
 
-| 状態 | 8K base | settle policy | 静止後の表示 |
-| --- | --- | --- | --- |
-| 補正なし | `fs_cache` | `EnabledFromRaw` | 原本を sample |
-| 単純色調補正のみ | `adjustment_cache` | `EnabledWithColorAdjustments { params }` | 原本 sample 後に同じ色調補正を再適用 |
-| 色調補正 cache の生成待ち | 一時的に `fs_cache` | `Disabled { WaitingForColorAdjustments }` | cache 完成まで 8K base のみ |
-| post_filter / smart_sharpen / auto_mode / AI / 画素編集あり | `fs_cache` | `EnabledFromRaw` | 原本を sample |
+settle policy は機能 flag を別の判定表へ写さず、実際に選ばれた `source_kind` から決める。
 
-`PanoramaSettlePolicy::Disabled` は色調補正 pixels がまだ無い過渡期だけに使い、理由を
-`PanoramaSettleDisabledReason` で保持する。表示側は `disabled_reason()` を読むだけとし、
-policy の判定木や理由表を複製しない。
+| 選ばれた 8K base | settle policy | 理由 |
+| --- | --- | --- |
+| `fs_cache` | `EnabledFromRaw` | 原本をそのまま sample できる |
+| 色調補正 cache の生成待ちで一時的に `fs_cache` | `Disabled { WaitingForColorAdjustments }` | 補正前の base と補正後 overlay の混在を防ぐ |
+| `adjustment_cache`（通常の色調補正） | `EnabledWithColorAdjustments { params }` | 原本 sample 後に同じ色調補正を再適用できる |
+| `adjustment_cache`（post_filter / auto_mode を含む） | `Disabled` | settle render では同じ結果を再現できない |
+| `ai_upscale_cache` | `Disabled` | AI 結果を原本 sample から再現できない |
+| `final_composite_cache` | `Disabled` | AI・スマートシャープ等を含み得る最終結果を再現できない |
+
+`PanoramaSettlePolicy::Disabled` の理由は `PanoramaSettleDisabledReason` で保持する。
+表示側は `disabled_reason()` を読むだけとし、policy の判定木や理由表を複製しない。
+画素編集があるページでは final composite が恒久的に候補外になるため、params 変更で
+`adjustment_cache` が無効化されたままだと生成契機を失う。`resolve_pano_source` は、画素編集あり・
+adjustment が必要・cache miss の組み合わせだけ raw pixels から `apply_sync_adjustment` を呼び、
+同じ解決処理内で adjustment source へ到達する。生成成功後は cache hit になるため毎フレーム
+再実行せず、`WaitingForColorAdjustments` は恒久状態にしない。
 
 #### 3.6.2.2 ソース選択と invalidation の不変条件
 
 `resolve_pano_source` は pixels、`source_kind`、`cache_key`、settle policy を一度に決める。
-`source_kind` は `0 = fs_cache` / `1 = adjustment_cache` の 2 値だけで、
-`final_composite_cache` と `ai_upscale_cache` は参照しない。
+`source_kind` は、`fs_cache` / `adjustment_cache` / `ai_upscale_cache` /
+`final_composite_cache` と、色調補正 cache 待ちの一時的な `fs_cache` を区別する。
+画素編集の有無は final composite の採用可否だけを決め、AI・通常補正・原本の
+フォールバック順は変えない。
 
 `cache_key` には従来どおり補正世代と AI 世代を含める。AI や補正設定を切り替えたとき、
 最終的に元画像を選ぶ場合でも古い upload / overlay を同一状態と誤認しないためである。
@@ -512,7 +523,7 @@ fn render_settle_overlay(
     match policy {
         PanoramaSettlePolicy::EnabledFromRaw
             | PanoramaSettlePolicy::EnabledWithColorAdjustments { .. } => {},
-        PanoramaSettlePolicy::Disabled => {
+        PanoramaSettlePolicy::Disabled { .. } => {
             debug_assert!(false, "settle render called with Disabled policy");
             return None;
         }
@@ -546,7 +557,7 @@ fn render_settle_overlay(
         );
         // 既存補正パイプラインをそのまま呼ぶ
         // (apply_adjustments_fast は internal で LUT or f32 経路を自動選択、
-        //  resolve_auto_mode も走るが Disabled で auto は除外済みなので no-op)
+        //  EnabledWithColorAdjustments では auto_mode は除外済みなので no-op)
         let adjusted = crate::adjustment::apply_adjustments_fast(&ci, params);
         out = crate::capture::color_image_to_rgba(&adjusted);
     }
@@ -562,7 +573,8 @@ fn render_settle_overlay(
   入る場合、厳密には完全一致しない**
 - **完全一致を狙うなら逆順**: full RGBA に先に補正を掛けてから sample する。ただし
   full RGBA は最大 2.15 GB、補正切替の度に再計算で 100 ms+ ブロック → 不採用
-- **現実的な目標**: 「視覚的に同等で、AI / post_filter / auto_mode は除外」(§3.6.2.1)。
+- **現実的な目標**: 単純色調補正の source だけを settle 対象にし、AI / post_filter /
+  auto_mode を含む source では base を保ったまま settle を無効にする (§3.6.2.1)。
   単純色調補正なら順序差は実用上気づきにくい範囲
 
 **性能見積もり** (4K viewport × `apply_adjustments_fast`):
@@ -772,7 +784,7 @@ status indicator の `[8K 軽量に切替]` で BaseOnly に戻したケース)�
    一瞬発生する。**これは mIV 既存のフルスクリーン表示の挙動と同じで、360 機能で
    新規発生するものではない** (本機能のスコープ外)
 3. UI の 360 ボタンは押せる (= 360 モード自体は ON、8K base で描画)
-4. **360 ベーステクスチャは `resolve_pano_source` が選んだ元画像 / 単純色調補正
+4. **360 ベーステクスチャは `resolve_pano_source` が選んだ final / AI / adjustment / raw
    pixels から `color_image_to_rgba` で RGBA8 に変換し、raw `wgpu::Texture` を
    新規作成してアップロード**する
    (`compare_wgpu.rs` 同じ経路、§4.3 参照)。
@@ -1038,7 +1050,7 @@ worker 化の経路はオプションで Phase 1 に含める (テスト時に�
 バンド分割 / idle アップロード) は省略する。実装時に再検討するなら §12.1 + git 履歴
 を参照。
 
-### 4.1.2 cache_key の設計 (2026-08 source_kind 2 値化)
+### 4.1.2 cache_key の設計
 
 **`compare_wgpu.rs::ensure_pair` は size 変化でしか再構築判定しない**問題がある
 (補正後 / AI 後で `pixels.size()` が同じだと古いテクスチャが残る)。本機能はそれを
@@ -1047,7 +1059,8 @@ worker 化の経路はオプションで Phase 1 に含める (テスト時に�
 ```rust
 // 64-bit packed:
 //   [63..48]: idx_hash16   (path-derived metadata key の crc16)
-//   [47..32]: source_kind  (0=fs_cache, 1=raw+adjustment)
+//   [47..32]: source_kind  (0=fs_cache, 1=raw+adjustment, 2=AI,
+//                           4=final composite, 5=adjustment 待ちの fs_cache)
 //                            high-res RGBA は
 //                            base texture には入れず settle 専用ストア
 //                            (`pano_high_res_source`) で別管理
@@ -1088,8 +1101,8 @@ wrap が起きると、**過去に同じ cache_key が観測された組み合�
 
 **Phase 3 拡張案**:
 
-- `source_kind` を 1 bit に縮める (現状 0-1 の 2 値だけを使う)
-- 余った 12 bit を `adjust_gen` / `ai_gen` に再配分 (例: 各 22 bit = 約 419 万、
+- `source_kind` を必要な値数に合わせて 3 bit に縮める
+- 余った bit を `adjust_gen` / `ai_gen` に再配分し、
   数日連続使用に耐える)
 - または `cache_key` を `u64` packed から `struct CacheKey { idx_hash, source_kind,
   adjust_gen, ai_gen }` に変更 (各 u32 で完全に wrap free、`Eq` で比較)
@@ -1114,7 +1127,7 @@ if let Some(pano) = self.panorama_state.as_ref()
 
     // §4.3 の resolve_pano_source 1 箇所で source / cache_key / pixels を解決
     // (Codex P2 第 9 ラウンド反映: stale guard の一貫性を保証)
-    let resolution = self.resolve_pano_source(fs_idx)?;
+    let resolution = self.resolve_pano_source(ctx, fs_idx)?;
 
     // アップロード済みかチェック (App::pano_uploaded、LRU 1)
     // source_key と cache_key の両方一致が必要 (Codex P1 第 6 ラウンド反映)
@@ -1148,42 +1161,56 @@ if let Some(pano) = self.panorama_state.as_ref()
 
 このブロックは `§2.3 表示テクスチャの優先順位` (`docs/display-pipeline.md`) の
 **通常パスとは独立した第 0 層**として動かす。回転 / pan / zoom / spread はバイパス
-する (360 ビュー自身が yaw/pitch/fov を持つため)。入力は §4.3 のとおり元画像か
-単純色調補正済み画像だけで、通常表示の final composite や AI 結果は使わない。
+する (360 ビュー自身が yaw/pitch/fov を持つため)。入力は §4.3 の解決結果を使い、
+画素編集のない最終合成、AI 結果、通常補正、元画像の順にフォールバックする。
 
 ### 4.3 ピクセル取得経路 (通常解像度: ≤ 8192)
 
-360 ベースは通常表示の final pipeline から切り離す。`resolve_pano_source(fs_idx)` が
-ソース・cache key・settle policy を同時に決め、呼び出し側はその結果だけを使う。
+`resolve_pano_source(ctx, fs_idx)` がソース・cache key・settle policy を同時に決め、
+呼び出し側はその結果だけを使う。通常表示の final pipeline を優先するが、
+`has_pano_excluded_pixel_edits(fs_idx)` が true のときだけ final composite を採用しない。
 
 ```rust
 pub struct PanoSourceResolution {
     pub source_key: String,
     pub cache_key: u64,
     pub pixels: Arc<egui::ColorImage>,
-    pub source_kind: u16, // 0=fs_cache, 1=adjustment_cache
+    pub source_kind: u16, // fs / adjustment / AI / final / adjustment 待ち
     pub settle_policy: PanoramaSettlePolicy,
 }
 
-fn resolve_pano_source(&self, fs_idx: usize) -> Option<PanoSourceResolution> {
-    let use_adjustment = self.pano_uses_color_adjustment_source(fs_idx);
-    let (pixels, source_kind) = if use_adjustment {
-        // cache がまだ無ければ一時的に raw を使い、settle は補正待ちにする
-        self.adjustment_cache.get(&fs_idx).map(|entry| (entry.pixels(), 1))
-            .or_else(|| self.fs_cache.get(&fs_idx).map(|entry| (entry.pixels(), 0)))?
-    } else {
-        self.fs_cache.get(&fs_idx).map(|entry| (entry.pixels(), 0))?
-    };
+fn resolve_pano_source(&mut self, ctx: &egui::Context, fs_idx: usize)
+    -> Option<PanoSourceResolution>
+{
+    let final_source = (!self.has_pano_excluded_pixel_edits(fs_idx))
+        .then(|| self.ensure_final_composite_pixels_with_key(ctx, fs_idx))
+        .flatten();
+    let ai_source = self.ai_will_apply_to(fs_idx)
+        .then(|| self.ai_upscale_cache.get(&(fs_idx, self.effective_upscale_bg_mode())))
+        .flatten();
+    let (pixels, source_kind) = final_source
+        .map(|(_, pixels)| (pixels, SOURCE_KIND_FINAL_COMPOSITE))
+        .or_else(|| ai_source.map(|entry| (entry.pixels(), SOURCE_KIND_AI)))
+        .or_else(|| self.adjustment_cache.get(&fs_idx)
+            .map(|entry| (entry.pixels(), SOURCE_KIND_ADJUST_RAW)))
+        .or_else(|| self.fs_cache.get(&fs_idx).map(|entry| {
+            let kind = if self.pano_expects_adjustment_cache(fs_idx) {
+                SOURCE_KIND_FS_WAITING_ADJUSTMENTS
+            } else {
+                SOURCE_KIND_FS
+            };
+            (entry.pixels(), kind)
+        }))?;
     // cache_key と settle_policy もここで構築
     // ...
 }
 ```
 
-`pano_uses_color_adjustment_source` が true になるのは、色調が identity ではなく、
-`auto_mode` / post filter / smart sharpen / AI / 消しゴム / 隠蔽加工 / 補正レイヤーが
-すべて無効な場合だけである。`final_composite_cache` と `ai_upscale_cache` は 360 の候補に
-含めない。色調補正だけのときも `adjustment_cache` が未完成なら raw base を先に表示し、
-settle policy を `Disabled { WaitingForColorAdjustments }` にして完成後の世代変更を待つ。
+`adjustment_cache` は raw 由来だけなので `SOURCE_KIND_AI_ADJUST` は設けない。AI が実効的な
+ページで final composite を画素編集のため除外した場合も、AI cache を adjustment cache より
+先に選ぶ。画素編集ページで色調補正 cache が必要なのに未完成なら、raw pixels から同期生成して
+同じ解決処理内で adjustment source を選ぶ。画素編集がないページの通常 pipeline 過渡期では、
+専用 source kind から `Disabled { WaitingForColorAdjustments }` を選んで完成を待つ。
 
 `ColorImage` の byte 化は `capture::color_image_to_rgba` を使う。ソース選択を upload、
 callback、settle の各経路で再実装してはならない。回転 (`rotation_db`) は 360 表示中の
@@ -1192,9 +1219,9 @@ pixels には焼き込まず、360 自身の yaw / pitch / fov を使う。
 ### 4.4 高解像度キャッシュ (Phase 1 では不使用、案 A 確定で削除)
 
 **案 A (8K base) 確定により、Phase 1 では専用の高解像度キャッシュ層を作らない**。
-360 ベーステクスチャは 8K clamp 後の `fs_cache` を基本にし、単純色調補正だけの
-場合に限って `adjustment_cache` を流用する。通常表示の final composite と AI cache は
-参照しない。
+360 ベーステクスチャは、画素編集がない完成済み final composite、実効 AI cache、
+adjustment cache、8K clamp 後の raw cache の順に流用する。画素編集がある場合だけ
+final composite を除外する。
 `pano_source_pixels` / `clamp_panorama_for_gpu` / `max_pano_dim` は実装不要。
 
 ベーステクスチャアップロードの経路:
@@ -1354,7 +1381,7 @@ fn poll_pano_high_res(&mut self, ctx: &egui::Context) {
         // 必要がある。さらに成功パスでも state / policy の再確認が必要 (ユーザーが
         // ロード中に「8K でよい」を押したケースの巻き戻り防止)。
         let current = self.fs_idx_of_source_key(&ready.source_key)
-            .and_then(|fs_idx| self.resolve_pano_source(fs_idx).map(|r| (fs_idx, r)));
+            .and_then(|fs_idx| self.resolve_pano_source(ctx, fs_idx).map(|r| (fs_idx, r)));
         let Some((fs_idx, resolution)) = current else {
             continue;  // 別画像へナビ済み等で resolution が取れない
         };
@@ -1767,9 +1794,12 @@ wheel は修飾キーに関係なくすべて FOV 操作として consume し、
 
 ### 6.4 補正 / AI との関係
 
-- 360 度ビューが表示するのは**元画像 + 単純色調補正**だけ。通常表示の final pipeline
-  とは独立し、AI upscale / denoise、自動補正、ポストフィルタ、スマートシャープ、
-  消しゴム、隠蔽加工、補正レイヤーは反映しない。
+- 360 度ビューは通常表示と同じ全体補正、AI upscale / denoise、自動補正、
+  ポストフィルタ、スマートシャープを 8K base に反映する。これらを含む source では
+  settle を無効にし、解像度切替による表示差を生じさせない。
+- 表示に反映しないのは、消しゴム、隠蔽加工、補正レイヤーの画素編集 3 種だけである。
+  画素編集を含む final composite を候補から外し、実効 AI → 通常補正 → 原本の順に
+  フォールバックする。
 - 画素編集データがあるページへ入ると、その編集を反映しない旨を同一 source につき
   1 回だけトーストで案内する。
 - 360 中は消しゴム・隠蔽加工・補正レイヤー・テキスト注釈の各編集モードへ入れない。
@@ -1797,10 +1827,10 @@ wheel は修飾キーに関係なくすべて FOV 操作として consume し、
 | 消しゴム | 表示に反映しない。編集モードへ入れない | 高解像度表示と base の一致を保つ |
 | 隠蔽加工（モザイク等） | 表示に反映しない。編集モードへ入れない | 同上 |
 | 補正レイヤー | 表示に反映しない。編集モードへ入れない | 同上 |
-| テキスト注釈 | 表示に反映しない。編集モードへ入れない | 360 中の編集入口を共通化する |
-| AI upscale / denoise | 反映しない | settle が元画像から再現できないため |
+| テキスト注釈 | 編集モードへ入れない | 360 中の編集入口を共通化する |
+| AI upscale / denoise | 反映する。settle は無効 | AI 結果を原本 sample から再現できないため |
 | プリセットの単純色調補正 | 適用する | settle 側で同じ色調補正を再適用できるため |
-| 自動補正 / スマートシャープ / ポストフィルタ | 反映しない | settle 側で同じ結果を再現できないため |
+| 自動補正 / スマートシャープ / ポストフィルタ | 反映する。settle は無効 | 8K base を保ち、高解像度差し替えだけを止める |
 | スライドショー | 360 入場時に停止 | 連続 equirect の pose 連動は未実装の将来候補 |
 | アニメーション (GIF/APNG) | **将来検討**。当面は静的フレームのみ (`FsCacheEntry::Animated` は 360 対象外) | GIF 360 はレアケース |
 | 動画 | **対象外** (FFmpeg 経路で 360 動画再生は別議論) | スコープ外 |
@@ -1858,7 +1888,7 @@ wheel は修飾キーに関係なくすべて FOV 操作として consume し、
 - [x] `src/panorama_wgpu.rs` (compare_wgpu.rs をテンプレートに WGSL を §3.3 のものに差替え、
       §4.1 のキャッシュキー設計 + `Arc::ptr_eq` 保険、Codex P1 反映)
 - [x] **callback は `UploadedPanoTexture` 参照、テクスチャ実体を持たない** (§4.1)
-- [x] アップロード経路: `resolve_pano_source` が選んだ元画像 / 単純色調補正 pixels を `color_image_to_rgba` 変換 →
+- [x] アップロード経路: `resolve_pano_source` が選んだ final / AI / adjustment / raw pixels を `color_image_to_rgba` 変換 →
       raw wgpu テクスチャ生成 → `pano_uploaded` に格納 (§4.3 / §4.1.1)
 - [x] `ui_fullscreen.rs` で 360 モード分岐 (描画 + 入力)
 - [x] **左ドラッグで yaw/pitch、修飾キー不問の Wheel で FOV、矢印 / Esc は奪わない**
@@ -2007,14 +2037,14 @@ checklist は実施状況未確認として残す。
 - [x] **`PanoramaSettlePolicy` enum + `compute_settle_policy` 実装** (§3.6.2.1):
   - [x] `EnabledFromRaw` / `EnabledWithColorAdjustments { params }` /
         `Disabled { reason }` の 3 形
-  - [x] 再現不能な加工はソース選択側で raw へ畳み、policy は raw / 色調補正と
-        色調補正 cache 待ちだけを判定
+  - [x] 実際に選択した source kind から settle の再現可否を判定し、AI / final /
+        post_filter / auto_mode と色調補正 cache 待ちの理由を型で保持
   - [x] Disabled 理由を `PanoramaSettleDisabledReason` で保持し、表示側の手書き判定表を削除
 - [x] **`resolve_pano_source` を `settle_policy` 込みに拡張** (§4.3):
   - [x] `PanoSourceResolution` に `settle_policy: PanoramaSettlePolicy` フィールドを追加
   - [x] `compute_settle_policy(fs_idx, source_kind)` を呼び込み済み
-  - [x] final composite / AI cache を候補から外し、単純色調補正だけなら
-        `adjustment_cache`、それ以外は `fs_cache` を選択
+  - [x] 画素編集がなければ final composite、続いて実効 AI / adjustment / raw の順に選択
+  - [x] 画素編集がある場合だけ final composite を除外し、同じ述語を入場時トーストにも使用
 - [x] `settle_enabled(state, policy)` で 2 軸 AND 判定 (§3.6.2.1)
 - [x] CPU 並列レンダ `render_settle_overlay` + **独自の bilinear sampler**
       (`sample_bilinear_equirect`、§3.6.3)。`policy = EnabledWithColorAdjustments` で
@@ -2042,7 +2072,7 @@ checklist は実施状況未確認として残す。
 - **status indicator (`draw_pano_status_indicator`)**: 画面下部中央に「● 高画質 ON
   (源解像度)」「○ 高画質 待機中」「○ 高画質 描画中…」「○ 8K 表示」等を毎フレ表示。
   ユーザーが高画質が効いているか目視で確認できるように。2026-08 以降、OFF 理由は
-  `PanoramaSettlePolicy::disabled_reason()` から「補正適用待ち」を表示し、別の判定表は持たない
+  `PanoramaSettlePolicy::disabled_reason()` から表示し、別の判定表は持たない
 - **AI 効力ベース判定 (`ai_will_apply_to(fs_idx)`)**: 設定 ON でもサイズ閾値超で
   AI がスキップされる画像 (例: 11968×5984 の 360 写真) は AI 由来扱いにせず、settle を
   有効化。`compute_settle_policy` と `resolve_pano_source` の両方で `ai_feature_active`
@@ -2062,7 +2092,7 @@ checklist は実施状況未確認として残す。
   1-2 GB を即解放) を 1 つだけ pill バッジ右側に表示。ホバーで RAM 想定量
   (`W × H × 4 × 2 / 1e9` GB) を表示。`[高画質に切替]` は `is_plain_image &&
   !pano_high_res_failed && policy_enabled` のときだけ表示 (= ZIP/PDF/Video、decode
-  失敗履歴、または色調補正 cache 待ちで `settle_policy` Disabled の画像では非表示。
+  失敗履歴、または選択 source を settle で再現できず `settle_policy` Disabled の画像では非表示。
   押下しても `start_pano_high_res_load` が即 return して "高画質 ロード中…" で
   永久 stall するのを防ぐ、Codex P1/P2 第 4 ラウンド指摘)。これにより旧案の
   「上部 360 ボタン横に ⚙ 高品質化アイコン → `NeedsUserConfirmation` に戻す」
@@ -2197,8 +2227,8 @@ Phase 2a 完成後の包括的レビューで 15 件の指摘 (P0-P3) を網羅�
           は **bump されない** (= 次の > 200 MP 新画像はバナー再表示)
     - [ ] BaseOnly 状態 + ZIP/PDF/Video → `[高画質に切替]` 非表示 (押下で stall 防止)
     - [ ] BaseOnly 状態 + `pano_high_res_failed` 該当 → `[高画質に切替]` 非表示
-    - [ ] BaseOnly 状態 + 色調補正 cache 待ちで settle_policy=Disabled →
-          `[高画質に切替]` 非表示。cache 完成後に次フレームで表示復活
+    - [ ] BaseOnly 状態 + 選択 source が settle_policy=Disabled →
+          `[高画質に切替]` 非表示。再現可能な source へ変わった次フレームで表示復活
     - [ ] SettleReady/SettleApproved 状態 → `[8K 軽量に切替]` 表示、押下で
           BaseOnly + `pano_high_res_pending` cancel + `pano_high_res_source.remove` +
           `clear_pano_refinement` (RAM 解放)
@@ -2206,12 +2236,12 @@ Phase 2a 完成後の包括的レビューで 15 件の指摘 (P0-P3) を網羅�
   - [ ] **approved_max_pixels の動作**: 220 MP 承認後、240 MP (× 1.09) はバナー
         出ず、340 MP (× 1.55) はバナー再表示
   - [ ] **settle_policy 切替の動作** (Codex P1 第 10 ラウンド):
-    - [ ] 補正なし + AI OFF → settle 動作 (EnabledFromRaw)
-    - [ ] 補正 ON (単純色調のみ) → settle 動作 + `apply_adjustments_fast` 適用、
+    - [ ] raw source 選択 → settle 動作 (EnabledFromRaw)
+    - [ ] adjustment source + 単純色調のみ → settle 動作 + `apply_adjustments_fast` 適用、
           本体と視覚的に同等 (EnabledWithColorAdjustments、順序差で gamma 等は微小差あり)
-    - [x] post_filter / auto_mode / smart_sharpen / AI が有効 → raw base +
-          `EnabledFromRaw`（加工は 360 に反映しない）
-    - [x] 消しゴム mask がある → final composite を無視して raw base を選ぶ
+    - [x] post_filter / auto_mode / smart_sharpen を含む final source → 加工を反映し、settle は Disabled
+    - [x] AI source → AI を反映し、settle は Disabled
+    - [x] 消しゴム mask がある → final composite を無視し、AI / adjustment / raw へフォールバック
   - [ ] **stale 再要求の動作** (Codex P2 第 11 ラウンド):
     - [ ] 「高品質」押下後にデコード中 (数秒間) に補正を切り替え → 到着結果は捨てら
           れて新 cache_key で再要求が走り、最終的に高品質が出る
@@ -2220,15 +2250,16 @@ Phase 2a 完成後の包括的レビューで 15 件の指摘 (P0-P3) を網羅�
     - [ ] 静止して settle overlay 表示中 → 補正スライダー操作 → overlay 即非表示 →
           8K base (補正済み) のみ表示 → settle 再起動で新 overlay 生成
     - [ ] 静止して settle overlay 表示中 → AI トグル ON → overlay 即非表示 →
-          元画像 base を再 upload し、新 cache_key で raw settle を生成
+          AI または final base を再 upload し、settle は Disabled
   - [ ] **transient 時の settle 整合** (Codex P1 第 13 反映):
     - [ ] 補正パラメータが非 identity で adjustment_cache 未生成の瞬間 (transient) →
           settle policy が `Disabled` になり、ズレた色の overlay が出ないこと
     - [ ] adjustment_cache 完成後 → cache_key 変化で再評価され、
           `EnabledWithColorAdjustments` に遷移 → 正しい色の overlay 生成
-  - [x] **final / AI cache の非参照**:
-    - [x] final composite 完了済みでも、360 は raw / 単純色調補正だけを選ぶ
-    - [x] AI cache の有無に関係なく、AI 適用ページは raw を選ぶ
+  - [x] **final / AI cache の選択**:
+    - [x] 画素編集なし + final composite 完了済み → final を選ぶ
+    - [x] 画素編集あり + AI 実効 + AI cache あり → final を飛ばして AI を選ぶ
+    - [x] AI 非実効で AI cache の残骸だけがある → AI を無視して adjustment / raw を選ぶ
   - [ ] **high-res 完了時の state guard** (Codex P1 第 14 反映):
     - [ ] ロード中に「8K でよい」(BaseOnly) → 結果到着で state は上書きされず、
           HighResSource にも格納されない (= 完全破棄)
@@ -2237,13 +2268,11 @@ Phase 2a 完成後の包括的レビューで 15 件の指摘 (P0-P3) を網羅�
     - [ ] ロード中に補正切替 (cache_key 変化) → ready は捨てられ、必要なら新 cache_key
           で再要求 (ただし state=SettleApproved のみ、Codex P2 第 15 反映)
   - [ ] **HighResSource の自動復帰**:
-    - [ ] 色調補正 cache 待ちでは HighResSource を保持
-    - [ ] cache 完成後、追加デコードなしで settle が自動復活 (既存 Arc 再利用)
-  - [ ] **AI OFF 時 cache clear 不変条件の遵守** (Codex P2 第 16 反映):
-    - [ ] AI OFF 直後の adjustment_cache 残骸が**ない**こと (= 自動 clear が走っている)
-    - [ ] AI モデル切替 / bg_mode 切替時も同じ
-    - [ ] 違反した場合の症状 (8K base = AI+補正、settle = raw+補正 で色ズレ) を
-          回帰テストで確認
+    - [ ] settle 無効の source 選択中も HighResSource を保持
+    - [ ] 再現可能な source へ変わった後、追加デコードなしで settle が自動復活 (既存 Arc 再利用)
+  - [x] **adjustment cache の由来**:
+    - [x] writer は `apply_sync_adjustment` だけで、2 呼び出し元はいずれも raw pixels を渡す
+    - [x] AI 実効時は AI cache を adjustment cache より優先し、旧 AI-adjust 種別を使わない
   - [ ] **cache_key wrap の動作確認** (Codex P2 第 16 反映、unit test):
     - [ ] mock generation で 65,537 回 increment して cache_key の wrap 動作を
           確認 (実害は低いが long session の保険)
@@ -2337,18 +2366,18 @@ Codex P1 で指摘された turbojpeg-sys 経路を実装するフェーズ。
 | **巨大画像のユーザー透明性** (ユーザー第 7 ラウンド設計改善) | 黙って画質を落とすと「自分が選んでいない感」がある | §3.6.2 のバナー UI で「想定 RAM 消費」を明示、「高品質 / 8K でよい」をユーザーが選択 |
 | **callback の stale guard** (Codex P1 第 8 ラウンド) | callback 側が `source_key` のみチェックで、補正 / AI 切替時に古いテクスチャを描画する可能性 | §4.1 のとおり callback struct に `cache_key: u64` を追加し、paint() 内で `source_key + cache_key` の両方一致を二重チェック |
 | **追加 high-res load の経路** (Codex P2 第 8 ラウンド) | NeedsUserConfirmation 後に `StaticPanorama` で 8K base を再生成すると無駄 | §4.6.0 のとおり追加 worker は **専用 channel `pano_high_res_pending`** 経由で `PanoHighResReady` を運ぶ。fs_cache / fs_upload_backlog は触らない (Codex P1 第 9 ラウンドで channel 分離に再修正) |
-| **settle と補正 / AI の整合** (Codex P1 第 9-10 ラウンド) | 8K base は補正済み、settle source は元 RGBA で色が一致しない。さらに adjustment_cache は AI 由来も含む / post_filter / auto_mode の再現困難 | §3.6.2.1 のとおり **settle 適用範囲を絞る方針に修正**: `PanoramaSettlePolicy` enum で `EnabledFromRaw` / `EnabledWithColorAdjustments` / `Disabled` の 3 値、AI 有効中 / post_filter ON / auto_mode ON / AI 由来 adjustment_cache は全て Disabled |
-| **adjustment_cache の AI 由来判定** (Codex P1 第 10 ラウンド) | `apply_sync_adjustment` (line 15458) が AI 結果に補正を掛けて adjustment_cache に入れるため、cache 内容から AI 由来か判別不可 | §3.6.2.1 / §4.3 のとおり `ai_upscale_cache.contains_key(&(idx, bg))` で「AI が現在有効か」を判定し、AI 有効中の adjustment_cache は source_kind=3 + settle Disabled |
-| **resolve_pano_source の実型不一致** (Codex P1 第 10 ラウンド) | 旧擬似コードが `ai_upscale_cache.get(&fs_idx)` / `Arc<ColorImage>` 直返しで実型 (`HashMap<(usize, u8), FsCacheEntry>`) と不一致 | §4.3 のとおり実型に合わせて書き直し: `(fs_idx, bg)` キー、`FsCacheEntry::Static { pixels, .. }` パターンマッチ、優先順位は本文と整合 (adjustment → ai → fs_cache) |
+| **settle と補正 / AI の整合** (Codex P1 第 9-10 ラウンド) | 8K base は補正済み、settle source は元 RGBA で色が一致しない | §3.6.2.1 のとおり、実際に選んだ source kind が再現可能な場合だけ settle を有効にする。AI / final / post_filter / auto_mode は base に反映したまま Disabled |
+| **adjustment_cache の AI 由来という誤認** (2026-08 再確認) | 旧設計は adjustment cache に AI 結果も入ると仮定していた | 唯一の writer `apply_sync_adjustment` と 2 呼び出し元を確認し、raw pixels だけが入力と確定。AI-adjust 種別を廃止し、AI cache を adjustment cache より優先 |
+| **resolve_pano_source の実型不一致** (Codex P1 第 10 ラウンド) | 旧擬似コードが `ai_upscale_cache.get(&fs_idx)` / `Arc<ColorImage>` 直返しで実型 (`HashMap<(usize, u8), FsCacheEntry>`) と不一致 | §4.3 のとおり実型に合わせて書き直し: `(fs_idx, bg)` キー、`FsCacheEntry::Static { pixels, .. }` パターンマッチ、優先順位は final（画素編集なし）→ AI → adjustment → raw |
 | **post_filter / auto_mode の再現困難** (Codex P1 第 10 ラウンド) | `apply_adjustments_fast` + `post_filter::apply` の 2 段階 + NEAREST サンプラ要件 + `auto_mode` の再計算ずれ | §3.6.2.1 のとおり post_filter / auto_mode が active なときは Disabled に倒し、settle なしで本体のみ表示 |
 | **`PanoramaHighResReady` の channel 分離** (Codex P1 第 9 ラウンド) | `FsLoadResult` variant 追加では既存 `poll_prefetch` の fs_cache 変換構造と衝突 | §4.6.0 のとおり専用 channel `pano_high_res_rx` を新設、`poll_pano_high_res` で別経路処理 |
-| **resolve_pano_source 関数の集約** (Codex P2 第 9 ラウンド) | cache_key 計算とピクセル解決が分かれているとズレで stale guard が崩壊 | §4.3 のとおり `resolve_pano_source(fs_idx) -> PanoSourceResolution` で source_key / cache_key / pixels / source_kind / settle_policy を一体決定 |
+| **resolve_pano_source 関数の集約** (Codex P2 第 9 ラウンド) | cache_key 計算とピクセル解決が分かれているとズレで stale guard が崩壊 | §4.3 のとおり `resolve_pano_source(ctx, fs_idx) -> PanoSourceResolution` で source_key / cache_key / pixels / source_kind / settle_policy を一体決定 |
 | **PanoHighResRequest の cache_key 欠落** (Codex P2 第 10 ラウンド) | `PanoHighResReady` には cache_key があるが request 側が source_key のみで stale 検出が弱い | §4.6.0 の `PanoHighResRequest` に `cache_key: u64` を追加し、`poll_pano_high_res` で `ready.cache_key == req.cache_key` の 3 段階 stale check |
 | **`PanoramaHighResReady` 別 variant 表現の混乱** (Codex P3 第 10 ラウンド) | 「別 variant」と書いたが実体は専用 channel の別メッセージ型 | 該当箇所を「専用 channel 経由で `PanoHighResReady` 別メッセージ型を送る」に修正 |
 | **`build_lut` / `apply_lut` API の不在** (Codex P1 第 11 ラウンド) | 設計の独自関数名は実コードに存在しない (`apply_adjustments_fast` が public、`build_u8_lut` は private) | §3.6.3 のとおり settle render の補正適用は **`crate::adjustment::apply_adjustments_fast(&ci, params)` を直接呼ぶ**経路に統一。overlay を一旦 `ColorImage` 化してから掛ける |
 | **`params.auto_mode` の型誤り** (Codex P1 第 11 ラウンド) | `bool` で擬似コードを書いていたが実型は `Option<AutoMode>` | §3.6.2.1 で `params.auto_mode.is_some()` に修正 |
 | **`EnabledWithColorAdjustments` (旧名 `EnabledWithLut`) の「完全一致」表現** (Codex P2 第 11 ラウンド) | gamma 等の非線形補正で「補間 → 補正」と「補正 → 補間」は厳密一致しない | §3.6.2.1 一致性列を「視覚的に同等 (順序差で gamma 等は微小差)」に修正。§3.6.3 で実装トレードオフを明記 |
-| **AI 由来 adjustment_cache 判定の脆さ** (Codex P2 第 11 ラウンド) | `ai_upscale_cache.contains_key` だけだと AI トグル OFF 直後の誤判定の余地 | §3.6.2.1 で許容 (実害は数フレ古い settle で、次フレで cache_key 差で無効化)。Phase 3 で `AdjustmentCacheEntry { kind: Raw \| FromAi }` 構造化に拡張する余地を明記 |
+| **AI 由来 adjustment_cache 判定の脆さ** (Codex P2 第 11 ラウンド) | AI 由来も入るという前提自体が誤りだった | 2026-08 の writer / call site 再確認で raw 由来だけと確定し、由来推定を削除 |
 | **cache_key 不一致時の再要求動作** (Codex P2 第 11 ラウンド) | 古い結果を捨てるだけだとユーザーが「高品質」を押しても永久に反映されない | §4.6.0 `poll_pano_high_res` で stale 検出時に **現在の resolution で再キック** する経路を追加 |
 | **settle overlay の cache_key 欠落** (Codex P1 第 12 ラウンド) | `PanoramaRefinement.overlay_pose` だけだと、静止中に補正/AI を切り替えても古い overlay が居座る | §4.6.1 で `last_cache_key` / `overlay_cache_key` を追加、`RenderingHandle.for_cache_key` / `SettleRenderResult.cache_key` で start-to-end 一貫した stale 判定。描画時にも cache_key 一致を確認 |
 | **adjustment_generation / ai_upscale_generation** (解決済み、Codex P1 第 12 ラウンド) | 同じ source_kind・同じサイズで補正だけ変わったケースを cache_key で検出できない | 両 generation と bump 経路を実装し、`resolve_pano_source` の cache key に含めた |
@@ -2361,10 +2390,10 @@ Codex P1 で指摘された turbojpeg-sys 経路を実装するフェーズ。
 | **ai_upscale_cache 分岐の AI 機能 flag gate** (Codex P1 第 14 ラウンド) | `ai_upscale_cache.get` 分岐が `ai_feature_active` で gate されておらず、AI OFF 後の cache 残骸を 360 入力に拾う可能性 | §4.3 で `ai_cache_entry` を `if ai_feature_active { ... } else { None }` で挟む。adjustment_cache 分岐の `source_kind` 判定とも整合 |
 | **high-res 完了時の state 上書き** (Codex P1 第 14 ラウンド) | ロード中にユーザーが「8K でよい」を押しても、完了時に SettleApproved に上書きされる | §4.6.0 `poll_pano_high_res` で **成功パスにも guard 追加**。state=BaseOnly なら結果破棄、settle_will_use_it=false なら state を上書きせず HighResSource のみ保持 (将来 OFF→ON で再利用可能) |
 | **cache_key の stale 比較対象** (Codex P2 第 14 ラウンド) | `ready.cache_key != req.cache_key` は worker 内同一値で stale 検出にならない | §4.6.0 で **`ready.cache_key != current resolution.cache_key`** に修正。`PanoHighResRequest.cache_key` は重複リクエスト検出専用と用途明確化 |
-| **source_kind=3 の意味食い違い** (Codex P2 第 14 ラウンド) | §4.1.2 (cache_key 設計) で `3=pano_high_res`、§4.6.1 で `3=ai+adj` と不整合 | §4.1.2 を `3=ai+adjustment` に統一、high-res は `pano_high_res_source` 別ストアで管理することを明記 |
+| **source_kind=3 の意味食い違い** (Codex P2 第 14 ラウンド) | `3=pano_high_res` と `3=ai+adj` が混在していた | high-res は `pano_high_res_source` 別ストアで管理し、AI 由来 adjustment が存在しないため source kind 3 は現在使わない |
 | **NeedsUserConfirmation 状態での再要求** (Codex P2 第 15 ラウンド) | `user_still_wants_high_res` が `SettleApproved \| NeedsUserConfirmation` の両方を受けると、未承認状態でも 26K 再デコードが走る | §4.6.0 で `SettleApproved` のみに絞る。`NeedsUserConfirmation` はバナーが残っているので、ユーザーが押せば改めて `start_pano_high_res_load` が走る |
 | **HighResSource 既存時の自動復帰条件** (Codex P2 第 15 ラウンド) | AI / post_filter 解除時に既存 HighResSource を再利用する条件がライフサイクル未明記 | §4.6.3 step 5 に自動復帰チェーンを明示: AI/post_filter OFF → `settle_policy` 遷移 → 次フレ `settle_enabled` 変化 → 既存 Arc を参照して追加デコードなしで settle 起動 |
-| **AI OFF 時 adjustment_cache clear 不変条件** (Codex P2 第 16 ラウンド) | AI OFF 後に adjustment_cache が残ると settle が AI+補正の 8K base に対して raw+補正の overlay を出してズレる | §3.6.2.2 で**不変条件として明文化**: AI 機能 ON/OFF / モデル切替 / bg_mode 切替時には `clear_all_adjustment_and_ai_caches` (`src/app.rs:16976`) 等で両 cache を clear すること。違反時の症状も明記、回帰テスト項目化 |
+| **AI OFF 時 adjustment_cache clear 不変条件** (Codex P2 第 16 ラウンド) | AI 由来 adjustment があるという前提で clear 依存を置いていた | adjustment cache は raw 由来だけなので settle correctness はこの clear に依存しない。AI cache は実効 AI 判定で gate する |
 | **cache_key の 16bit gen wrap リスク** (Codex P2 第 16 ラウンド) | 長時間セッション (補正アニメ等で約 18 分、通常スライダー操作で約 18 時間) で wrap し、stale guard が誤って一致判定する可能性 | §4.1.2 末尾で wrap 試算を明記。Phase 3 拡張案として `source_kind` を 4 bit に縮めて gen を 22 bit に再配分、または `cache_key` を struct 化を提示 |
 | **旧名 `EnabledWithLut` 表記の混在** (Codex P3 第 16 ラウンド) | リスク表に旧名が残り、実装者が現名と取り違える可能性 | リスク表の該当行に「(旧名 `EnabledWithLut`)」または「現名 `EnabledWithColorAdjustments`」を明記 |
 | **clear 粒度の表記が実コードと不整合** (Codex P3 第 17 ラウンド) | 設計で「該当 idx で clear」と書いていたが、実コード `clear_all_adjustment_and_ai_caches` は adjustment は idx、AI は全体の混合粒度 | §3.6.2.2 に粒度表 (adjustment=idx、AI=全体) を追記、Phase 1 チェックリストの generation bump も同じ粒度に整合 |
@@ -2481,7 +2510,7 @@ PCIe 転送がそのままブロッキングする。
 - 削除: `pano_source_pixels` / `max_pano_dim` / `clamp_panorama_for_gpu` /
   `WgpuConfiguration` の limit 引き上げ
 - 維持: 360 検出 / equirect WGSL シェーダ / 入力ハンドリング / UI トグル / GPano XMP
-- 360 ベーステクスチャは `resolve_pano_source` が選んだ元画像 / 単純色調補正
+- 360 ベーステクスチャは `resolve_pano_source` が選んだ final / AI / adjustment / raw
   pixels を `color_image_to_rgba` 変換した上で毎回新規アップロード (LRU 1)
 - Phase 2a 以降: 「settle が無いと >8K source は荒い」現象を許容するか、settle 不可な
   Off tier でも別経路 (例: 平面ズーム的なフォールバック) を出すか、別途検討

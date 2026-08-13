@@ -59033,7 +59033,7 @@ impl App {
             let Some(fs_idx) = self.fs_idx_of_source_key(&ready.source_key) else {
                 continue;
             };
-            let Some(resolution) = self.resolve_pano_source(fs_idx) else {
+            let Some(resolution) = self.resolve_pano_source(ctx, fs_idx) else {
                 continue;
             };
             let state = self.pano_quality_state.get(&resolution.source_key).cloned();
@@ -59117,7 +59117,7 @@ impl App {
             self.clear_pano_refinement();
             return;
         }
-        let Some(resolution) = self.resolve_pano_source(fs_idx) else {
+        let Some(resolution) = self.resolve_pano_source(ctx, fs_idx) else {
             return;
         };
         let Some(pano_state) = self.panorama_state.as_ref() else {
@@ -59659,59 +59659,106 @@ impl App {
             || self.conceal_pages.contains(&fs_idx)
     }
 
-    /// 360° の元画像に単純色調補正だけを重ねる状態か。
+    /// 360° の暫定ソースとして `adjustment_cache` の生成を待つ状態か。
     ///
-    /// `adjustment_cache` は `apply_sync_adjustment` で色調 (auto_mode の解決を含む)
-    /// と post_filter を焼き込むため、再現可能な色調だけの状態でしか参照しない。
-    fn pano_uses_color_adjustment_source(&self, fs_idx: usize) -> bool {
+    /// `adjustment_cache` の唯一の writer (`apply_sync_adjustment`) と同じ条件にする。
+    /// smart_sharpen / AI / カラー化はこの cache には焼き込まれない。
+    fn pano_expects_adjustment_cache(&self, fs_idx: usize) -> bool {
         let params = self.effective_params(fs_idx);
         !params.is_color_identity()
-            && params.auto_mode.is_none()
-            && params.post_filter == crate::adjustment::PostFilter::None
-            && params.smart_sharpen == 0
-            && !self.ai_will_apply_to(fs_idx)
-            && !self.has_pano_excluded_pixel_edits(fs_idx)
+            || (!self.post_filter_bypassed
+                && params.post_filter != crate::adjustment::PostFilter::None)
     }
 
     /// 360 ベーステクスチャのソース選択 + cache_key 計算を 1 関数に集約する (§4.3)。
     ///
-    /// 360° は通常表示の final pipeline から独立し、元画像と単純色調補正だけを扱う。
-    /// 色調のみの状態では `adjustment_cache`、それ以外は `fs_cache` を選ぶ。
+    /// 優先順位は `final_composite_cache → ai_upscale_cache → adjustment_cache → fs_cache`。
+    /// ただし画素編集があるページでは、それを運ぶ final composite だけを除外する。
+    /// `adjustment_cache` は raw pixels だけから生成されるため AI 由来の種別は存在せず、
+    /// AI が実効的な場合は AI cache を adjustment cache より先に選ぶ。
     ///
     /// Phase 1 ではこの戻り値の `pixels` を `color_image_to_rgba` で RGBA8 化し、
     /// `cache_key` を `pano_uploaded` の stale 判定 + callback に渡す。
     /// Phase 2a で `source_kind` を settle policy 判定にも使う。
     pub(crate) fn resolve_pano_source(
-        &self,
+        &mut self,
+        ctx: &egui::Context,
         fs_idx: usize,
     ) -> Option<crate::panorama::PanoSourceResolution> {
         use crate::panorama::*;
         let source_key = self.metadata_cache_key(fs_idx)?;
-        let use_adjustment = self.pano_uses_color_adjustment_source(fs_idx);
-        let (pixels, source_kind) = if use_adjustment
-            && let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&fs_idx)
+        let bg = self.effective_upscale_bg_mode();
+        let ai_effective = self.ai_will_apply_to(fs_idx);
+        let has_excluded_pixel_edits = self.has_pano_excluded_pixel_edits(fs_idx);
+
+        // 画素編集があるページは final composite を恒久的に候補から外すため、表示中の
+        // params 変更で adjustment_cache が無効化された後に通常の final pipeline から
+        // 再生成される機会がない。360 の fallback として必要な場合は、唯一の writer と
+        // 同じ raw fs_cache pixels からここで同期生成する。成功後は cache hit になるので
+        // 次フレーム以降はこの分岐へ入らない。
+        if has_excluded_pixel_edits
+            && self.pano_expects_adjustment_cache(fs_idx)
+            && !self.adjustment_cache.contains_key(&fs_idx)
+            && let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&fs_idx)
         {
-            (std::sync::Arc::clone(pixels), SOURCE_KIND_ADJUST_RAW)
+            let raw_pixels = std::sync::Arc::clone(pixels);
+            self.apply_sync_adjustment(ctx, fs_idx, &raw_pixels);
+        }
+
+        let final_source = if has_excluded_pixel_edits {
+            None
+        } else {
+            self.ensure_final_composite_pixels_with_key(ctx, fs_idx)
+        };
+        let ai_cache_entry = if ai_effective {
+            self.ai_upscale_cache.get(&(fs_idx, bg))
+        } else {
+            None
+        };
+
+        let (pixels, source_kind, final_key_hash) = if let Some((final_key, pixels)) = final_source
+        {
+            let hash = runtime_hash_with(|h| {
+                use std::hash::Hash;
+                final_key.hash(h);
+            });
+            (pixels, SOURCE_KIND_FINAL_COMPOSITE, Some(hash))
+        } else if let Some(FsCacheEntry::Static { pixels, .. }) = ai_cache_entry {
+            (std::sync::Arc::clone(pixels), SOURCE_KIND_AI, None)
+        } else if let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&fs_idx)
+        {
+            // apply_sync_adjustment の呼び出し元はどちらも raw fs_cache pixels を渡す。
+            // したがって旧 SOURCE_KIND_AI_ADJUST に相当する entry は発生しない。
+            (std::sync::Arc::clone(pixels), SOURCE_KIND_ADJUST_RAW, None)
         } else if let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&fs_idx) {
-            (std::sync::Arc::clone(pixels), SOURCE_KIND_FS)
+            let kind = if self.pano_expects_adjustment_cache(fs_idx) {
+                SOURCE_KIND_FS_WAITING_ADJUSTMENTS
+            } else {
+                SOURCE_KIND_FS
+            };
+            (std::sync::Arc::clone(pixels), kind, None)
         } else {
             return None; // ColorImage がまだ無い (Animated / Failed / 未ロード)
         };
 
-        let adjust_gen = self
+        let mut adjust_gen = self
             .adjustment_generation
             .get(&source_key)
             .copied()
             .unwrap_or(0) as u16;
-        let ai_gen = self
+        let mut ai_gen = self
             .ai_upscale_generation
             .get(&source_key)
             .copied()
             .unwrap_or(0) as u16;
+        if let Some(hash) = final_key_hash {
+            adjust_gen ^= hash as u16;
+            ai_gen ^= (hash >> 16) as u16;
+        }
         let cache_key =
             make_pano_cache_key(crc16_of_str(&source_key), source_kind, adjust_gen, ai_gen);
 
-        // Phase 2a settle policy: source_kind と色調補正の過渡状態から判定 (§3.6.2.1)
+        // Phase 2a settle policy: 実際に選んだ source_kind だけから判定 (§3.6.2.1)
         let settle_policy = self.compute_settle_policy(fs_idx, source_kind);
 
         Some(PanoSourceResolution {
@@ -59725,34 +59772,54 @@ impl App {
 
     /// 360 度パノラマビュー Phase 2a: settle policy 判定 (§3.6.2.1)。
     ///
-    /// ソース選択側が再現不能な加工をすべて元画像へ畳むため、ここで判定するのは
-    /// 元画像 / 色調補正済みの対応と、色調補正 cache 待ちの過渡期だけ。
+    /// 機能 flag の判定木を複製せず、実際に選ばれた source_kind が settle render で
+    /// 再現できるかだけを判定する。adjustment cache の内部だけは、同じ source_kind に
+    /// 色調 / auto_mode / post_filter が入り得るため params で理由を分ける。
     pub(crate) fn compute_settle_policy(
         &self,
         fs_idx: usize,
         source_kind: u16,
     ) -> crate::panorama::PanoramaSettlePolicy {
-        use crate::panorama::PanoramaSettleDisabledReason::WaitingForColorAdjustments;
+        use crate::panorama::PanoramaSettleDisabledReason::{
+            AiApplied, AutoAdjustmentApplied, FinalCompositeApplied, PostFilterApplied,
+            UnsupportedSource, WaitingForColorAdjustments,
+        };
         use crate::panorama::PanoramaSettlePolicy::{
             Disabled, EnabledFromRaw, EnabledWithColorAdjustments,
         };
-        use crate::panorama::{SOURCE_KIND_ADJUST_RAW, SOURCE_KIND_FS};
+        use crate::panorama::{
+            SOURCE_KIND_ADJUST_RAW, SOURCE_KIND_AI, SOURCE_KIND_FINAL_COMPOSITE, SOURCE_KIND_FS,
+            SOURCE_KIND_FS_WAITING_ADJUSTMENTS,
+        };
         let params = self.effective_params(fs_idx);
         match source_kind {
-            SOURCE_KIND_FS => {
-                if self.pano_uses_color_adjustment_source(fs_idx) {
+            SOURCE_KIND_FS => EnabledFromRaw,
+            SOURCE_KIND_FS_WAITING_ADJUSTMENTS => Disabled {
+                reason: WaitingForColorAdjustments,
+            },
+            SOURCE_KIND_ADJUST_RAW => {
+                if !self.post_filter_bypassed
+                    && params.post_filter != crate::adjustment::PostFilter::None
+                {
                     Disabled {
-                        reason: WaitingForColorAdjustments,
+                        reason: PostFilterApplied,
+                    }
+                } else if params.auto_mode.is_some() {
+                    Disabled {
+                        reason: AutoAdjustmentApplied,
                     }
                 } else {
-                    EnabledFromRaw
+                    EnabledWithColorAdjustments {
+                        params: params.clone(),
+                    }
                 }
             }
-            SOURCE_KIND_ADJUST_RAW => EnabledWithColorAdjustments {
-                params: params.clone(),
+            SOURCE_KIND_AI => Disabled { reason: AiApplied },
+            SOURCE_KIND_FINAL_COMPOSITE => Disabled {
+                reason: FinalCompositeApplied,
             },
             _ => Disabled {
-                reason: WaitingForColorAdjustments,
+                reason: UnsupportedSource,
             },
         }
     }
@@ -60002,11 +60069,11 @@ impl App {
     /// 3. 一致 → 何もしない
     /// 4. `CallbackResources` への Arc clone 挿入は別経路 (`sync_pano_callback_resources`)
     #[cfg(windows)]
-    pub(crate) fn ensure_pano_upload(&mut self, _ctx: &egui::Context, fs_idx: usize) {
+    pub(crate) fn ensure_pano_upload(&mut self, ctx: &egui::Context, fs_idx: usize) {
         let Some(render_state) = self.wgpu_render_state.clone() else {
             return;
         };
-        let Some(resolution) = self.resolve_pano_source(fs_idx) else {
+        let Some(resolution) = self.resolve_pano_source(ctx, fs_idx) else {
             return;
         };
         // stale チェック (§4.2 + Codex P2 第 19 ラウンド):

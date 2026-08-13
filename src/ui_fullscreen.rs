@@ -24410,7 +24410,7 @@ impl App {
             return false;
         };
         let target_format = render_state.target_format;
-        let Some(resolution) = self.resolve_pano_source(fs_idx) else {
+        let Some(resolution) = self.resolve_pano_source(ctx, fs_idx) else {
             return false;
         };
         let uploaded_ready = self
@@ -24969,7 +24969,7 @@ impl App {
                 self.pano_session_approved_max_pixels =
                     self.pano_session_approved_max_pixels.max(source_pixels);
             }
-            if let Some(resolution) = self.resolve_pano_source(fs_idx) {
+            if let Some(resolution) = self.resolve_pano_source(ctx, fs_idx) {
                 self.start_pano_high_res_load(fs_idx, resolution.cache_key);
             }
             ctx.request_repaint();

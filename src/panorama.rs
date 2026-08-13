@@ -27,11 +27,19 @@ pub const FOV_DEFAULT: f32 = 1.2;
 pub const PITCH_LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.001;
 
 /// `cache_key` の source_kind ビット (§4.1.2):
-/// - 0 = fs_cache のみ (補正なし、AI なし)
-/// - 1 = adjustment_cache (raw + 単純色調補正)
-/// 360 度ビューは元画像と単純色調補正だけを入力にするため、現行値は 0 / 1 のみ。
+/// - 0 = fs_cache
+/// - 1 = adjustment_cache (raw + 色調補正 / auto_mode / post_filter)
+/// - 2 = ai_upscale_cache
+/// - 4 = final_composite_cache
+/// - 5 = 色調補正 cache の生成待ちで一時的に選ばれた fs_cache
+///
+/// `adjustment_cache` の唯一の writer は raw pixels を入力にするため、旧来の
+/// `SOURCE_KIND_AI_ADJUST` は実際には発生しない。
 pub const SOURCE_KIND_FS: u16 = 0;
 pub const SOURCE_KIND_ADJUST_RAW: u16 = 1;
+pub const SOURCE_KIND_AI: u16 = 2;
+pub const SOURCE_KIND_FINAL_COMPOSITE: u16 = 4;
+pub const SOURCE_KIND_FS_WAITING_ADJUSTMENTS: u16 = 5;
 
 /// 360 ビューのインタラクティブステート (フルスクリーン内のみ Some)。
 /// ファイル切替 / フルスクリーン退出で `panorama_state = None`。
@@ -325,17 +333,16 @@ pub fn needs_user_confirmation(source_pixels: u64, approved_max: u64) -> bool {
 
 /// settle の適用ポリシー (§3.6.2.1)。
 ///
-/// 8K base のソース選択結果 (`source_kind`) と色調補正の準備状態から
-/// `compute_settle_policy` で決まる。
+/// 8K base のソース選択結果 (`source_kind`) から `compute_settle_policy` で決まる。
 #[derive(Clone, Debug)]
 pub enum PanoramaSettlePolicy {
-    /// 色調補正済み pixels がまだ無い過渡期なので settle を開始しない。
+    /// 選択された 8K base を settle render で再現できないため開始しない。
     Disabled {
         reason: PanoramaSettleDisabledReason,
     },
-    /// raw fs_cache。360 対象外の加工は反映せず、HighResSource の元 RGBA を sample
+    /// raw fs_cache。HighResSource の元 RGBA を sample
     EnabledFromRaw,
-    /// 通常画像 + 単純色調補正 (post_filter / auto / AI なし)。
+    /// 通常画像 + settle render で再現可能な色調補正。
     /// settle source は元 RGBA、render 内で `apply_adjustments_fast` を再適用。
     EnabledWithColorAdjustments {
         params: crate::adjustment::AdjustParams,
@@ -346,12 +353,22 @@ pub enum PanoramaSettlePolicy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PanoramaSettleDisabledReason {
     WaitingForColorAdjustments,
+    AiApplied,
+    PostFilterApplied,
+    AutoAdjustmentApplied,
+    FinalCompositeApplied,
+    UnsupportedSource,
 }
 
 impl PanoramaSettleDisabledReason {
     pub fn label(self) -> &'static str {
         match self {
             Self::WaitingForColorAdjustments => "補正適用待ち",
+            Self::AiApplied => "AI 適用中",
+            Self::PostFilterApplied => "ポストフィルタ適用中",
+            Self::AutoAdjustmentApplied => "自動補正適用中",
+            Self::FinalCompositeApplied => "最終加工適用中",
+            Self::UnsupportedSource => "再現できない加工を適用中",
         }
     }
 }

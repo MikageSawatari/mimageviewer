@@ -1136,16 +1136,24 @@ Lanczos3 と同じ可視領域・出力上限・cache ownership を使い、bran
   消しゴムの合成結果ではなく元のピクセルを載せている疑い。低解像度側だけ合成が
   効いているなら、差し替え経路が編集後のラスタを参照していない。
 - 規模 / 優先度: Small〜Medium / P3。
-- **対応した (2026-08-13)**。settle worker が原本を再デコードする一方、8K base が
+- **対応した (2026-08-13、同日訂正)**。settle worker が原本を再デコードする一方、8K base が
   `final_composite_cache` の編集済み pixels を選んでいたため、静止 500ms の切替時に
-  表示内容が変わっていた。360 度ビューを通常表示の final pipeline から切り離し、
-  **元画像 + 単純色調補正だけ**を表示する仕様へ統一した。
-  - `resolve_pano_source` は、単純色調補正だけなら `adjustment_cache`、それ以外は
-    `fs_cache` を選ぶ。final composite / AI cache は参照しない。消しゴム・隠蔽加工・
-    補正レイヤーの有無は `has_pano_excluded_pixel_edits` に集約し、入場時トーストも
-    同じ述語を使う。
-  - settle policy は raw / 色調補正と補正 cache 待ちだけに縮めた。Disabled 理由を型で
-    保持し、`ui_fullscreen.rs` にあった判定木の手書き複製を削除した。
+  表示内容が変わっていた。実際に食い違っていたのは、最終合成に含まれる
+  **消しゴム・隠蔽加工・補正レイヤーの画素編集 3 種だけ**だった。
+  - 最初の対応では「settle が再現できない加工はすべて 360 から外す」と線を引き、AI・
+    ポストフィルタ・スマートシャープ・自動補正まで非反映にした。これは分岐を減らす
+    実装都合で除外範囲を広げすぎた判断であり、従来から「8K base へ反映し、settle は
+    Disabled」として整合していた機能を削っていたため訂正した。
+  - `resolve_pano_source` は、画素編集がないときだけ final composite を採用する。画素編集が
+    あるときは実効 AI → adjustment → raw の順に選び、AI を adjustment より優先する。
+    `adjustment_cache` の writer と 2 呼び出し元を再確認し、AI 由来 pixels は入らないと確定した。
+    画素編集の有無は `has_pano_excluded_pixel_edits` に集約し、入場時トーストも同じ述語を使う。
+  - settle policy は機能フラグ表を再実装せず、実際に選んだ source kind が再現可能かで決める。
+    Disabled 理由を型で保持し、`ui_fullscreen.rs` にあった判定木の手書き複製は復活させない。
+  - 追加確認で、画素編集ページの表示中に色調を変えると `adjustment_cache` が無効化された後の
+    writer がなく、「補正適用待ち」に留まる経路が見つかった。final を使えない画素編集ページに
+    限り、`resolve_pano_source` が raw pixels から不足する adjustment cache を同期生成する。
+    生成後は同じ呼び出し内と次フレームで cache hit するため、毎フレームの再生成にはならない。
   - 360 中の編集モード入口を `fullscreen_edit_mode_entry_allowed` に集約した。従来の
     個別抑止列挙から **Ctrl+G（補正レイヤー）/ Ctrl+M（隠蔽加工）/
     Ctrl+T（テキスト注釈）が漏れていた**ため、キー、補正パネル、遅延 continuation を

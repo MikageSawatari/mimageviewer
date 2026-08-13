@@ -925,12 +925,13 @@ conceal は erase / raw を入力にして先へ合成せず `None` を返し、
 未完成の上位結果を作らない。表示側はその間だけ現在有効な下位レイヤーへフォールバックし、
 古い local / conceal cache を再表示しない。保存・比較・クリップボードの pixel job はこの
 表示用フォールバックを完成結果として扱わず、必要な edit materialization の完了を待つ。
-360 度パノラマ表示はこの通常表示 final pipeline の例外である。settle 高解像度表示が
-原本 sample と単純色調補正だけを再現できるため、8K base も同じ範囲へ揃える。
-`resolve_pano_source` は、単純色調補正だけのときに `adjustment_cache`、それ以外は
-`fs_cache` を選び、`final_composite_cache` と `ai_upscale_cache` は参照しない。
-消しゴム・隠蔽加工・補正レイヤー・ポストフィルタ・スマートシャープ・自動補正・AI は
-360 度表示へ反映しない。これによりドラッグ中の base と静止後の高解像度表示を一致させる。
+360 度パノラマ表示は、画素編集がないページでは通常表示と同じ完成済み
+`final_composite_cache` を 8K base に使う。消しゴム・隠蔽加工・補正レイヤーがある
+ページだけは、それらを運ぶ final composite を除外し、実効 `ai_upscale_cache` →
+`adjustment_cache` → `fs_cache` の順にフォールバックする。したがって AI・ポストフィルタ・
+スマートシャープ・自動補正は 360 度表示へ反映し、非反映は画素編集 3 種だけである。
+高解像度差し替えは実際に選んだ source が原本 sample から再現できる場合だけ有効にし、
+AI / final / post_filter / auto_mode を含む source では 8K base のまま表示する。
 保存・比較・クリップボードのようなピクセル出力経路も、`prepare_capture_pixel_job` で
 同じ最終 composite pixels を取得する。EXIF Orientation は decode 済みなのでここでは
 再適用しないが、`rotation_db` の非破壊 90 度回転は GPU 描画専用のため、crop 後の

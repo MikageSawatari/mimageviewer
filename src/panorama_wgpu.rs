@@ -178,7 +178,7 @@ pub struct PanoramaShaderCallback {
     /// `App::metadata_cache_key(idx)` の戻り値。どの画像に対応する 360 描画かを表す。
     pub source_key: String,
     /// `(idx_hash, source_kind, adjust_gen, ai_gen)` を u64 にパックしたキー。
-    /// `resolve_pano_source(fs_idx)` の出力をそのまま焼き付ける (§4.1.2)。
+    /// `resolve_pano_source` の出力をそのまま焼き付ける (§4.1.2)。
     pub cache_key: u64,
     pub yaw: f32,
     pub pitch: f32,
