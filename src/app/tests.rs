@@ -5,6 +5,17 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 #[test]
+fn fullscreen_overflow_panel_registers_as_common_modal_and_closes_at_file_boundary() {
+    let mut app = setup_app_for_test();
+    app.fs_overflow_panel_state = FsOverflowPanelState::Root;
+    assert!(app.common_modal_dialog_open());
+    assert!(app.any_modal_dialog_open_for_fullscreen_keys());
+
+    app.reset_fs_side_panel_runtime_for_file_change();
+    assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+}
+
+#[test]
 fn display_image_texture_options_always_keep_the_complete_mip_chain() {
     assert_eq!(
         DISPLAY_IMAGE_TEXTURE_OPTIONS.mipmap_mode,
@@ -50679,4 +50690,57 @@ fn an_empty_items_reason_expires_with_its_generation() {
 fn a_fresh_app_reports_no_empty_items_reason() {
     let app = phase_c_support::setup_app();
     assert_eq!(app.empty_items_reason(), None);
+}
+
+/// ニアレストは画素を加工せず、アップロード時のサンプラ指定でだけ効く。
+/// その判定が上げる場所ごとに書かれていたので、注釈を焼いた経路では捨てられ、
+/// 「ニアレストにしてもドットがくっきりしない」が起きた (利用者報告 2026-08-13)。
+///
+/// 表示テクスチャの経路がいくつあっても、答えはここ 1 つであることを縛る。
+#[test]
+fn every_display_texture_asks_one_place_which_sampler_to_use() {
+    let mut app = phase_c_support::setup_app();
+    app.items = vec![GridItem::Image(PathBuf::from("C:/book/page.png"))];
+    app.image_metas = vec![None];
+
+    assert_eq!(
+        app.display_texture_options(0),
+        DISPLAY_IMAGE_TEXTURE_OPTIONS,
+        "no post filter means the usual smooth sampler"
+    );
+
+    let mut params = app.effective_params(0).clone();
+    params.post_filter = crate::adjustment::PostFilter::Nearest;
+    app.adjustment_page_params.insert(0, params);
+    assert_eq!(
+        app.display_texture_options(0),
+        egui::TextureOptions::NEAREST,
+        "nearest only exists as a sampler choice, so it must reach the upload"
+    );
+
+    // 消しゴム / 隠蔽 / 分析中はポストフィルタ自体を通さない。ここも同じ答えに従う。
+    app.post_filter_bypassed = true;
+    assert_eq!(
+        app.display_texture_options(0),
+        DISPLAY_IMAGE_TEXTURE_OPTIONS,
+        "a bypassed post filter cannot ask for its sampler"
+    );
+}
+
+/// 「…」は見開き / フィットのボタンと同じくトグル。開いている状態で押したら閉じる。
+/// 反応が無いと、利用者からは押し方が分からない (利用者報告 2026-08-13)。
+#[test]
+fn the_overflow_button_closes_the_panel_it_opened() {
+    let mut app = phase_c_support::setup_app();
+    assert!(!app.fs_overflow_panel_state.is_open());
+
+    app.apply_fs_overflow_open_request_for_test();
+    assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Root);
+
+    app.apply_fs_overflow_open_request_for_test();
+    assert_eq!(
+        app.fs_overflow_panel_state,
+        FsOverflowPanelState::Closed,
+        "a second press must close it"
+    );
 }

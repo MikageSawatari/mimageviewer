@@ -690,6 +690,55 @@ impl FullscreenNavigatorCorner {
             corner => corner,
         }
     }
+
+    pub fn label(self) -> &'static str {
+        match self.normalized() {
+            Self::TopLeft => "左上",
+            Self::TopRight => "右上",
+            Self::BottomLeft => "左下",
+            Self::BottomRight => "右下",
+            Self::Unknown => unreachable!(),
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// Fullscreen overflow panel items
+// -----------------------------------------------------------------------
+
+/// 静止画フルスクリーンの「その他の機能」パネルに並べる項目。
+///
+/// 利用者判断 (2026-08-13、実機確認後): 上バーのほかのメニューにカスタマイズがなく、
+/// このパネルだけ表示項目を変更できるのは不自然で過剰なため、並びは固定する。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FullscreenOverflowItemId {
+    NavigatorToggle,
+    NavigatorPosition,
+    ImageAnalysis,
+    PixelGrid,
+    LoupeLock,
+}
+
+impl FullscreenOverflowItemId {
+    pub fn fixed_order() -> &'static [Self] {
+        &[
+            Self::NavigatorToggle,
+            Self::NavigatorPosition,
+            Self::ImageAnalysis,
+            Self::PixelGrid,
+            Self::LoupeLock,
+        ]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NavigatorToggle => "ナビゲータ",
+            Self::NavigatorPosition => "ナビゲータ位置",
+            Self::ImageAnalysis => "分析ツール",
+            Self::PixelGrid => "ピクセルグリッド",
+            Self::LoupeLock => "ルーペ固定",
+        }
+    }
 }
 
 // -----------------------------------------------------------------------

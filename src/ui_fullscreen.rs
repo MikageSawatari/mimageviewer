@@ -26,7 +26,7 @@ use crate::adjustment::PostFilter;
 use crate::ai::ModelKind;
 use crate::app::{
     App, FsDisplayUnitHoldover, FsDisplayUnitHoldoverPage, FsHoldover, FsOpenMaterialization,
-    FsPageLoadState, ViewerPresentation,
+    FsOverflowPanelState, FsPageLoadState, ViewerPresentation,
 };
 use crate::displayed_image_transform::{
     DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
@@ -45,7 +45,8 @@ use crate::keymap::{
 use crate::pdf_loader::PdfPageContentType;
 use crate::settings::{
     FULLSCREEN_NAVIGATOR_SIZE_MAX, FULLSCREEN_NAVIGATOR_SIZE_MIN, FullscreenFitMode,
-    FullscreenNavigatorCorner, ReadingDirection, ReadingFlow, SlideshowEndAction, SpreadMode,
+    FullscreenNavigatorCorner, FullscreenOverflowItemId, ReadingDirection, ReadingFlow,
+    SlideshowEndAction, SpreadMode,
 };
 use crate::ui_helpers::{HoverTipExt, open_external_player};
 
@@ -1386,6 +1387,330 @@ fn fullscreen_top_bar_rect(full_rect: egui::Rect) -> egui::Rect {
         .intersect(full_rect)
 }
 
+fn fullscreen_secondary_in_overlay_chrome(
+    pos: egui::Pos2,
+    full_rect: egui::Rect,
+    top_bar_visible: bool,
+    seek_panel_rect: egui::Rect,
+    seek_panel_interactive: bool,
+) -> bool {
+    (top_bar_visible && fullscreen_top_bar_rect(full_rect).contains(pos))
+        || (seek_panel_interactive && seek_panel_rect.contains(pos))
+}
+
+const FS_OVERFLOW_PANEL_WIDTH: f32 = 400.0;
+const FS_OVERFLOW_PANEL_MARGIN: f32 = 12.0;
+const FS_OVERFLOW_PANEL_PADDING: f32 = 8.0;
+const FS_OVERFLOW_PANEL_HEADER_HEIGHT: f32 = 44.0;
+pub(crate) const FS_OVERFLOW_PANEL_ROW_HEIGHT: f32 = 48.0;
+
+#[derive(Clone, Debug)]
+struct FsOverflowPanelRow {
+    item: FullscreenOverflowItemId,
+    label: String,
+    status: String,
+    enabled: bool,
+    disabled_reason: Option<&'static str>,
+}
+
+#[derive(Clone, Debug)]
+struct FsOverflowPanelView {
+    state: FsOverflowPanelState,
+    root_rows: Vec<FsOverflowPanelRow>,
+    navigator_corner: FullscreenNavigatorCorner,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FsOverflowPanelAction {
+    Close,
+    Back,
+    Activate(FullscreenOverflowItemId),
+    SetNavigatorCorner(FullscreenNavigatorCorner),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FsOverflowOpenRequest {
+    Root,
+}
+
+fn fs_overflow_panel_body_row_count(state: FsOverflowPanelState) -> usize {
+    match state {
+        FsOverflowPanelState::Closed => 0,
+        FsOverflowPanelState::Root => FullscreenOverflowItemId::fixed_order().len(),
+        FsOverflowPanelState::NavigatorPosition => 1 + FullscreenNavigatorCorner::ALL.len(),
+    }
+}
+
+fn fs_overflow_panel_rect(
+    full_rect: egui::Rect,
+    state: FsOverflowPanelState,
+) -> Option<egui::Rect> {
+    if state == FsOverflowPanelState::Closed {
+        return None;
+    }
+    let available_width = (full_rect.width() - FS_OVERFLOW_PANEL_MARGIN * 2.0).max(0.0);
+    let top = full_rect.top() + TOP_BAR_HEIGHT + FS_OVERFLOW_PANEL_MARGIN;
+    let available_height = (full_rect.bottom() - FS_OVERFLOW_PANEL_MARGIN - top).max(0.0);
+    if available_width <= 0.0 || available_height <= 0.0 {
+        return None;
+    }
+    let width = FS_OVERFLOW_PANEL_WIDTH.min(available_width);
+    let desired_height = FS_OVERFLOW_PANEL_PADDING * 2.0
+        + FS_OVERFLOW_PANEL_HEADER_HEIGHT
+        + fs_overflow_panel_body_row_count(state) as f32 * FS_OVERFLOW_PANEL_ROW_HEIGHT;
+    let height = desired_height.min(available_height);
+    let left = full_rect.right() - FS_OVERFLOW_PANEL_MARGIN - width;
+    Some(egui::Rect::from_min_size(
+        egui::pos2(left, top),
+        egui::vec2(width, height),
+    ))
+}
+
+fn append_fs_overflow_touch_exclusion(
+    excluded: &mut Vec<egui::Rect>,
+    full_rect: egui::Rect,
+    state: FsOverflowPanelState,
+) {
+    if let Some(rect) = fs_overflow_panel_rect(full_rect, state) {
+        excluded.push(rect);
+    }
+}
+
+fn draw_fs_overflow_panel_row(
+    ui: &mut egui::Ui,
+    _id: impl std::hash::Hash,
+    label: &str,
+    status: &str,
+    selected: bool,
+    enabled: bool,
+    disabled_reason: Option<&'static str>,
+) -> egui::Response {
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), FS_OVERFLOW_PANEL_ROW_HEIGHT),
+        sense,
+    );
+    let background = if selected {
+        egui::Color32::from_rgb(54, 93, 142)
+    } else if enabled && response.hovered() {
+        egui::Color32::from_gray(58)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, 4.0, background);
+    ui.painter().line_segment(
+        [
+            egui::pos2(rect.left() + 8.0, rect.bottom()),
+            egui::pos2(rect.right() - 8.0, rect.bottom()),
+        ],
+        egui::Stroke::new(1.0, egui::Color32::from_gray(58)),
+    );
+
+    let text_color = if enabled {
+        ui.visuals().text_color()
+    } else {
+        egui::Color32::from_gray(118)
+    };
+    let status_color = if selected {
+        egui::Color32::WHITE
+    } else if enabled {
+        ui.visuals().weak_text_color()
+    } else {
+        egui::Color32::from_gray(105)
+    };
+    let status_galley = ui.painter().layout_no_wrap(
+        status.to_owned(),
+        egui::FontId::proportional(13.0),
+        status_color,
+    );
+    let status_size = status_galley.size();
+    let status_right = rect.right() - 12.0;
+    ui.painter().galley(
+        egui::pos2(
+            status_right - status_size.x,
+            rect.center().y - status_size.y * 0.5,
+        ),
+        status_galley,
+        status_color,
+    );
+
+    let label_left = rect.left() + 12.0;
+    let label_width = (status_right - status_size.x - 12.0 - label_left).max(40.0);
+    let mut label_job = egui::text::LayoutJob::single_section(
+        label.to_owned(),
+        egui::TextFormat::simple(egui::FontId::proportional(14.0), text_color),
+    );
+    label_job.wrap = egui::text::TextWrapping::truncate_at_width(label_width);
+    let label_galley = ui.painter().layout_job(label_job);
+    ui.painter().galley(
+        egui::pos2(label_left, rect.center().y - label_galley.size().y * 0.5),
+        label_galley,
+        text_color,
+    );
+
+    if let Some(reason) = disabled_reason {
+        response.hover_tip_dark(reason)
+    } else {
+        response
+    }
+}
+
+fn draw_fs_overflow_panel_surface(
+    ui: &mut egui::Ui,
+    panel_rect: egui::Rect,
+    view: &FsOverflowPanelView,
+) -> Option<FsOverflowPanelAction> {
+    ui.painter().rect_filled(
+        panel_rect,
+        8.0,
+        egui::Color32::from_rgba_unmultiplied(24, 24, 24, 248),
+    );
+    ui.painter().rect_stroke(
+        panel_rect,
+        8.0,
+        egui::Stroke::new(1.0, egui::Color32::from_gray(82)),
+        egui::StrokeKind::Inside,
+    );
+    let _sink = ui.interact(
+        panel_rect,
+        egui::Id::new("fs_overflow_panel_sink"),
+        egui::Sense::click(),
+    );
+
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(panel_rect));
+    child.set_clip_rect(panel_rect);
+    crate::os_theme::apply_dark_ui(&mut child);
+    let header_rect = egui::Rect::from_min_size(
+        panel_rect.min,
+        egui::vec2(panel_rect.width(), FS_OVERFLOW_PANEL_HEADER_HEIGHT),
+    );
+    child.painter().rect_filled(
+        header_rect,
+        8.0,
+        egui::Color32::from_rgba_unmultiplied(36, 36, 36, 250),
+    );
+    let title = match view.state {
+        FsOverflowPanelState::Root => "その他の機能",
+        FsOverflowPanelState::NavigatorPosition => "ナビゲータ位置",
+        FsOverflowPanelState::Closed => return None,
+    };
+    child.painter().text(
+        egui::pos2(header_rect.left() + 14.0, header_rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        title,
+        egui::FontId::proportional(15.0),
+        child.visuals().text_color(),
+    );
+    let close_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            header_rect.right() - FS_OVERFLOW_PANEL_HEADER_HEIGHT,
+            header_rect.top(),
+        ),
+        egui::vec2(
+            FS_OVERFLOW_PANEL_HEADER_HEIGHT,
+            FS_OVERFLOW_PANEL_HEADER_HEIGHT,
+        ),
+    );
+    let close_response = child.interact(
+        close_rect,
+        egui::Id::new("fs_overflow_panel_close"),
+        egui::Sense::click(),
+    );
+    if close_response.hovered() {
+        child
+            .painter()
+            .rect_filled(close_rect, 4.0, egui::Color32::from_rgb(120, 46, 46));
+    }
+    child.painter().text(
+        close_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "×",
+        egui::FontId::proportional(18.0),
+        egui::Color32::WHITE,
+    );
+    let mut action = close_response
+        .clicked()
+        .then_some(FsOverflowPanelAction::Close);
+
+    let body_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            panel_rect.left() + FS_OVERFLOW_PANEL_PADDING,
+            header_rect.bottom() + FS_OVERFLOW_PANEL_PADDING,
+        ),
+        egui::pos2(
+            panel_rect.right() - FS_OVERFLOW_PANEL_PADDING,
+            panel_rect.bottom() - FS_OVERFLOW_PANEL_PADDING,
+        ),
+    );
+    if body_rect.is_positive() {
+        let mut body = child.new_child(egui::UiBuilder::new().max_rect(body_rect));
+        body.set_clip_rect(body_rect);
+        body.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+        egui::ScrollArea::vertical()
+            .id_salt("fs_overflow_panel_body")
+            .max_height(body_rect.height())
+            .auto_shrink([false, false])
+            .show(&mut body, |ui| {
+                ui.set_width(ui.available_width());
+                match view.state {
+                    FsOverflowPanelState::Root => {
+                        for row in &view.root_rows {
+                            let response = draw_fs_overflow_panel_row(
+                                ui,
+                                ("fs_overflow_root", row.item),
+                                &row.label,
+                                &row.status,
+                                false,
+                                row.enabled,
+                                row.disabled_reason,
+                            );
+                            if response.clicked() {
+                                action = Some(FsOverflowPanelAction::Activate(row.item));
+                            }
+                        }
+                    }
+                    FsOverflowPanelState::NavigatorPosition => {
+                        if draw_fs_overflow_panel_row(
+                            ui,
+                            "fs_overflow_back",
+                            "<  戻る",
+                            view.navigator_corner.label(),
+                            false,
+                            true,
+                            None,
+                        )
+                        .clicked()
+                        {
+                            action = Some(FsOverflowPanelAction::Back);
+                        }
+                        for &corner in FullscreenNavigatorCorner::ALL {
+                            let selected = corner == view.navigator_corner.normalized();
+                            if draw_fs_overflow_panel_row(
+                                ui,
+                                ("fs_overflow_corner", corner as u8),
+                                corner.label(),
+                                if selected { "選択中" } else { "" },
+                                selected,
+                                true,
+                                None,
+                            )
+                            .clicked()
+                            {
+                                action = Some(FsOverflowPanelAction::SetNavigatorCorner(corner));
+                            }
+                        }
+                    }
+                    FsOverflowPanelState::Closed => {}
+                }
+            });
+    }
+    action
+}
+
 pub(crate) fn panel_callout_edge_rect(
     full_rect: egui::Rect,
     edge: crate::ui_helpers::PanelEdge,
@@ -1605,6 +1930,7 @@ struct StillTopBarVisibilityInputs {
     fit_popup_open: bool,
     slideshow_popup_open: bool,
     rotation_popup_open: bool,
+    overflow_panel_open: bool,
     view_trim_mode: bool,
     touch_chrome_latched: bool,
 }
@@ -1617,6 +1943,7 @@ fn still_top_bar_visible_from_inputs(input: StillTopBarVisibilityInputs) -> bool
         || input.fit_popup_open
         || input.slideshow_popup_open
         || input.rotation_popup_open
+        || input.overflow_panel_open
         || input.view_trim_mode
         || input.touch_chrome_latched
 }
@@ -12740,7 +13067,7 @@ impl App {
                             let mut fit_mode_choice: Option<FullscreenFitMode> = None;
                             let mut fit_no_upscale_choice: Option<bool> = None;
                             let mut fit_no_downscale_choice: Option<bool> = None;
-                            let mut bar_analysis_pressed = false;
+                            let mut overflow_request = None;
                             let mut side_panel_mode_pressed = false;
                             let mut top_bar_lock_pressed = false;
                             let navigator_exclusion =
@@ -12766,6 +13093,7 @@ impl App {
                                     fit_popup_open: self.fit_popup_open,
                                     slideshow_popup_open: self.slideshow_popup_open,
                                     rotation_popup_open: fs_rotation_popup_open(ctx),
+                                    overflow_panel_open: self.fs_overflow_panel_state.is_open(),
                                     view_trim_mode: self.view_trim_mode,
                                     touch_chrome_latched,
                                 });
@@ -12805,13 +13133,13 @@ impl App {
                                 self.settings.fullscreen_side_panel_mode,
                                 &mut side_panel_mode_pressed,
                                 side_panel_visible,
+                                self.fs_overflow_panel_state.is_open(),
+                                &mut overflow_request,
                                 &mut self.slideshow_playing,
                                 &mut self.settings.slideshow_interval_secs,
                                 &mut self.settings.slideshow_end_action,
                                 current_rotation,
                                 &mut rotation_choice,
-                                self.analysis_mode,
-                                &mut bar_analysis_pressed,
                                 panorama_trigger,
                                 panorama_active,
                                 panorama_mode_active,
@@ -12870,15 +13198,25 @@ impl App {
                                 }
                                 self.cycle_fs_side_panel_mode();
                             }
+                            if let Some(request) = overflow_request {
+                                self.fs_overflow_panel_state = match request {
+                                    // 見開き / フィットのボタンと同じくトグルにする。
+                                    // 開いている状態で押しても何も起きないと、押し方が
+                                    // 分からない (利用者報告 2026-08-13)。
+                                    FsOverflowOpenRequest::Root
+                                        if self.fs_overflow_panel_state.is_open() =>
+                                    {
+                                        FsOverflowPanelState::Closed
+                                    }
+                                    FsOverflowOpenRequest::Root => FsOverflowPanelState::Root,
+                                };
+                                ctx.request_repaint();
+                            }
                             if copy_capture_pressed {
                                 self.copy_image_capture_to_clipboard(ctx, fs_idx);
                             }
                             if copy_capture_region_pressed {
                                 self.begin_capture_region_selection(ctx, fs_idx);
-                            }
-                            // 分析ボタン押下は Z キーと同じ経路へ合流 (副作用込み、Codex P1)。
-                            if bar_analysis_pressed && !is_spread_double {
-                                self.toggle_analysis_mode();
                             }
                             // ズーム/フィットモード: ツールバーボタンはメニューから選択
                             // (0 キーは従来どおり循環)。
@@ -12941,6 +13279,17 @@ impl App {
                             // ホイール/キーで確定したページ移動を保護
                             if nav_locked {
                                 page_nav = saved_nav;
+                            }
+                        }
+                        if self.fs_overflow_panel_state.is_open() {
+                            let overflow_available = !state.is_video
+                                && !is_music_view
+                                && !panorama_mode_active_now
+                                && self.fullscreen_top_bar_chrome_allowed(fs_idx);
+                            if overflow_available {
+                                self.draw_fs_overflow_panel(ui, ctx, full_rect, is_spread_double);
+                            } else {
+                                self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
                             }
                         }
                         fs_hover_bar_ms = hover_bar_t0.elapsed().as_secs_f64() * 1000.0;
@@ -17043,20 +17392,10 @@ impl App {
                 }
             }
         } else if key_g && !is_video_fs {
-            self.fs_pixel_grid_enabled = !self.fs_pixel_grid_enabled;
-            self.show_feedback_toast(if self.fs_pixel_grid_enabled {
-                "[ピクセルグリッド ON]".to_string()
-            } else {
-                "[ピクセルグリッド OFF]".to_string()
-            });
+            self.toggle_fs_pixel_grid();
         } else if key_m && !self.adjustment_mode.is_open() {
             // M: ルーペ表示のトグル (分析モード外でのみ。分析モードでは既存のモザイクグリッド操作)
-            self.fs_loupe_locked = !self.fs_loupe_locked;
-            self.show_feedback_toast(if self.fs_loupe_locked {
-                "[ルーペ ON]".to_string()
-            } else {
-                "[ルーペ OFF]".to_string()
-            });
+            self.toggle_fs_loupe_lock();
         }
 
         if key_b_bookmark {
@@ -17545,6 +17884,165 @@ impl App {
         });
     }
 
+    /// ナビゲータ位置を変える共通出口。ヘッダの隅ボタンと overflow submenu を合流させる。
+    fn set_fullscreen_navigator_corner(&mut self, corner: FullscreenNavigatorCorner) {
+        let corner = corner.normalized();
+        if self.settings.fullscreen_navigator_corner == corner {
+            return;
+        }
+        self.settings.fullscreen_navigator_corner = corner;
+        self.settings.save();
+    }
+
+    fn toggle_fs_pixel_grid(&mut self) {
+        self.fs_pixel_grid_enabled = !self.fs_pixel_grid_enabled;
+        self.show_feedback_toast(if self.fs_pixel_grid_enabled {
+            "[ピクセルグリッド ON]".to_string()
+        } else {
+            "[ピクセルグリッド OFF]".to_string()
+        });
+    }
+
+    fn toggle_fs_loupe_lock(&mut self) {
+        self.fs_loupe_locked = !self.fs_loupe_locked;
+        self.show_feedback_toast(if self.fs_loupe_locked {
+            "[ルーペ ON]".to_string()
+        } else {
+            "[ルーペ OFF]".to_string()
+        });
+    }
+
+    fn fullscreen_overflow_panel_view(&self, is_spread_double: bool) -> FsOverflowPanelView {
+        let mut root_rows = Vec::new();
+        for &item in FullscreenOverflowItemId::fixed_order() {
+            let (label, status, enabled, disabled_reason) = match item {
+                FullscreenOverflowItemId::NavigatorToggle => (
+                    self.keymap
+                        .first_chord_bracket_label(item.label(), KeyAction::FsNavigatorToggle),
+                    if self.settings.fullscreen_navigator_visible {
+                        "ON".to_string()
+                    } else {
+                        "OFF".to_string()
+                    },
+                    true,
+                    None,
+                ),
+                FullscreenOverflowItemId::NavigatorPosition => (
+                    item.label().to_string(),
+                    format!("{}  >", self.settings.fullscreen_navigator_corner.label()),
+                    true,
+                    None,
+                ),
+                FullscreenOverflowItemId::ImageAnalysis => {
+                    let enabled =
+                        self.analysis_mode || (!is_spread_double && self.reading_flow.is_paged());
+                    let reason = if enabled {
+                        None
+                    } else if is_spread_double {
+                        Some("分析ツールは見開きの2ページ表示中は使えません")
+                    } else {
+                        Some("分析ツールはページ単位表示で使えます")
+                    };
+                    (
+                        self.keymap
+                            .first_chord_bracket_label(item.label(), KeyAction::FsImageAnalysis),
+                        if self.analysis_mode {
+                            "ON".to_string()
+                        } else {
+                            "OFF".to_string()
+                        },
+                        enabled,
+                        reason,
+                    )
+                }
+                FullscreenOverflowItemId::PixelGrid => (
+                    self.keymap
+                        .first_chord_bracket_label(item.label(), KeyAction::FsPixelGrid),
+                    if self.fs_pixel_grid_enabled {
+                        "ON".to_string()
+                    } else {
+                        "OFF".to_string()
+                    },
+                    true,
+                    None,
+                ),
+                FullscreenOverflowItemId::LoupeLock => (
+                    self.keymap
+                        .first_chord_bracket_label(item.label(), KeyAction::FsLoupeLockToggle),
+                    if self.fs_loupe_locked {
+                        "ON".to_string()
+                    } else {
+                        "OFF".to_string()
+                    },
+                    true,
+                    None,
+                ),
+            };
+            root_rows.push(FsOverflowPanelRow {
+                item,
+                label,
+                status,
+                enabled,
+                disabled_reason,
+            });
+        }
+        FsOverflowPanelView {
+            state: self.fs_overflow_panel_state,
+            root_rows,
+            navigator_corner: self.settings.fullscreen_navigator_corner.normalized(),
+        }
+    }
+
+    fn draw_fs_overflow_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        is_spread_double: bool,
+    ) {
+        let Some(panel_rect) = fs_overflow_panel_rect(full_rect, self.fs_overflow_panel_state)
+        else {
+            return;
+        };
+        let view = self.fullscreen_overflow_panel_view(is_spread_double);
+        let Some(action) = draw_fs_overflow_panel_surface(ui, panel_rect, &view) else {
+            return;
+        };
+        match action {
+            FsOverflowPanelAction::Close => {
+                self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+            }
+            FsOverflowPanelAction::Back => {
+                self.fs_overflow_panel_state = FsOverflowPanelState::Root;
+            }
+            FsOverflowPanelAction::Activate(item) => match item {
+                FullscreenOverflowItemId::NavigatorToggle => {
+                    self.set_fullscreen_navigator_visible(
+                        !self.settings.fullscreen_navigator_visible,
+                    );
+                }
+                FullscreenOverflowItemId::NavigatorPosition => {
+                    self.fs_overflow_panel_state = FsOverflowPanelState::NavigatorPosition;
+                }
+                FullscreenOverflowItemId::ImageAnalysis => {
+                    let available =
+                        self.analysis_mode || (!is_spread_double && self.reading_flow.is_paged());
+                    if available {
+                        self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+                        self.toggle_analysis_mode();
+                    }
+                }
+                FullscreenOverflowItemId::PixelGrid => self.toggle_fs_pixel_grid(),
+                FullscreenOverflowItemId::LoupeLock => self.toggle_fs_loupe_lock(),
+            },
+            FsOverflowPanelAction::SetNavigatorCorner(corner) => {
+                self.set_fullscreen_navigator_corner(corner);
+                self.fs_overflow_panel_state = FsOverflowPanelState::Root;
+            }
+        }
+        ctx.request_repaint();
+    }
+
     /// ヘッダの閉じるボタン。保持中のときだけ置く。
     ///
     /// 修飾キーで一時的に出ている間は消す対象が無いので、押せる見た目のまま
@@ -17584,6 +18082,16 @@ impl App {
     /// 360 度ビューのタップがページを送っていた (利用者報告 2026-08-13、ログで確定)。
     ///
     /// ローカル変数を使い回すと定義順に縛られるので、`self` から直接求める。
+    /// 「…」を押したときの状態遷移。トグルであることをテストから縛るために切り出す。
+    #[cfg(test)]
+    pub(crate) fn apply_fs_overflow_open_request_for_test(&mut self) {
+        self.fs_overflow_panel_state = if self.fs_overflow_panel_state.is_open() {
+            FsOverflowPanelState::Closed
+        } else {
+            FsOverflowPanelState::Root
+        };
+    }
+
     pub(crate) fn fs_touch_tap_zones_enabled(&self) -> bool {
         still_touch_tap_zones_enabled(
             self.fullscreen_idx
@@ -17815,8 +18323,7 @@ impl App {
                 .on_hover_text(tooltip)
                 .clicked()
             {
-                self.settings.fullscreen_navigator_corner = corner;
-                self.settings.save();
+                self.set_fullscreen_navigator_corner(corner);
                 ctx.request_repaint();
                 corner_clicked = true;
                 break;
@@ -18084,8 +18591,7 @@ impl App {
                 .on_hover_text(tooltip)
                 .clicked()
             {
-                self.settings.fullscreen_navigator_corner = corner;
-                self.settings.save();
+                self.set_fullscreen_navigator_corner(corner);
                 ctx.request_repaint();
                 corner_clicked = true;
                 break;
@@ -18746,11 +19252,13 @@ impl App {
             .fullscreen_idx
             .map(|idx| self.fullscreen_media_rect(full_rect, idx, state.is_video))
             .unwrap_or(full_rect);
-        let navigator_consumed = if let Some(navigator_idx) = self.fullscreen_idx {
-            self.handle_fs_navigator_input(ui, ctx, default_image_rect, navigator_idx)
-        } else {
-            false
-        };
+        let modal_input_blocked = self.any_modal_dialog_open_for_fullscreen_keys();
+        let navigator_consumed =
+            if !modal_input_blocked && let Some(navigator_idx) = self.fullscreen_idx {
+                self.handle_fs_navigator_input(ui, ctx, default_image_rect, navigator_idx)
+            } else {
+                false
+            };
         let navigator_exclusion = self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
         if self.capture_region_selection.is_some() {
             clear_still_touch_first_run_help(ctx);
@@ -19208,6 +19716,7 @@ impl App {
                     fit_popup_open: self.fit_popup_open,
                     slideshow_popup_open: self.slideshow_popup_open,
                     rotation_popup_open: fs_rotation_popup_open(ctx),
+                    overflow_panel_open: self.fs_overflow_panel_state.is_open(),
                     view_trim_mode: self.view_trim_mode,
                     touch_chrome_latched,
                 })
@@ -19260,6 +19769,15 @@ impl App {
         }
         if top_bar_visible {
             touch_excluded.push(fullscreen_top_bar_rect(full_rect));
+        }
+        // 右上の overflow panel はページ送り面ではない。panel state と同じ純粋な矩形計算を
+        // touch classifier に渡し、行・戻る・閉じる操作を PageSide へ再分類させない。
+        if self.fs_overflow_panel_state.is_open() {
+            append_fs_overflow_touch_exclusion(
+                &mut touch_excluded,
+                full_rect,
+                self.fs_overflow_panel_state,
+            );
         }
         // ナビゲータは画像の上に浮く widget であって、ページ送りの当たり判定ではない。
         // 除外しないと、隅ボタンも閉じるボタンも押せないまま、触れた指がページを送る。
@@ -19431,6 +19949,18 @@ impl App {
                 cancelled: touch_frame.touch_cancelled(),
             },
         ));
+
+        // modal UI が表示中は wheel / key だけでなく、背面キャンバスの drag / click /
+        // navigator も所有させない。touch recognizer は上で終端まで駆動済みなので、ここで
+        // 返しても接触 owner は残らない。
+        if modal_input_blocked {
+            self.cancel_mouse_ring_flick();
+            self.cancel_mouse_gesture();
+            self.fs_secondary_press_start = None;
+            self.fs_pan_drag_start = None;
+            self.fs_rotation_drag_start = None;
+            return (FsPageNav::None, false);
+        }
 
         // Wipe のドラッグ基準は、白線 / clip / シェーダー合成境界と同じ「フィット後の実表示
         // 画像矩形」にする。full_rect (黒帯込み) で取ると線・切り替え位置とドラッグがズレる。
@@ -19941,8 +20471,13 @@ impl App {
         let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed());
         let secondary_released = ctx.input(|i| i.pointer.secondary_released());
         let secondary_pos = fullscreen_pointer_pos_or(ctx, full_rect, full_rect.center());
-        let secondary_in_seek_panel =
-            seek_panel_interactive && seek_panel_rect.contains(secondary_pos);
+        let secondary_in_overlay_chrome = fullscreen_secondary_in_overlay_chrome(
+            secondary_pos,
+            full_rect,
+            top_bar_visible,
+            seek_panel_rect,
+            seek_panel_interactive,
+        );
         // 旧 egui HUD は撤去済 (native presenter overlay が右クリックも独自処理)。
         // egui main window 側に右クリックを吸収すべき HUD 矩形は無い。
         let popup_open = self.spread_popup_open || self.fit_popup_open || self.slideshow_popup_open;
@@ -20013,7 +20548,7 @@ impl App {
                  foreground=0x{foreground:x} active_hwnd=0x{active_hwnd:x} \
                  foreground_matches={} prev_foreground=0x{:x} \
                  secondary_down={} secondary_pressed={} secondary_released={} \
-                 secondary_pos=({:.1},{:.1}) secondary_in_seek_panel={} \
+                 secondary_pos=({:.1},{:.1}) secondary_in_overlay_chrome={} \
                  right_drag_context={right_drag_context:?} right_drag_mode={right_drag_mode:?} \
                  gate={} events={} key_pressed={} wheel_events={} secondary_button_events={} \
                  frame={}",
@@ -20035,7 +20570,7 @@ impl App {
                     secondary_released,
                     secondary_pos.x,
                     secondary_pos.y,
-                    secondary_in_seek_panel,
+                    secondary_in_overlay_chrome,
                     right_drag_gate_reject.unwrap_or("ok"),
                     event_count,
                     key_pressed_count,
@@ -20059,7 +20594,7 @@ impl App {
                     let Some(ring_context) = right_drag_context.ring_context() else {
                         return (page_nav, close);
                     };
-                    if secondary_in_seek_panel {
+                    if secondary_in_overlay_chrome {
                         self.cancel_mouse_ring_flick();
                     } else if secondary_pressed {
                         self.start_mouse_ring_flick(ctx, ring_context, secondary_pos, None);
@@ -20084,7 +20619,7 @@ impl App {
                     }
                 }
                 crate::ring_shortcut::RightDragMode::MouseGesture => {
-                    if secondary_in_seek_panel {
+                    if secondary_in_overlay_chrome {
                         self.cancel_mouse_gesture();
                     } else if secondary_pressed {
                         self.start_mouse_gesture(ctx, right_drag_context, secondary_pos, None);
@@ -20113,7 +20648,7 @@ impl App {
                     if right_drag_context == crate::ring_shortcut::RightDragContext::EditMode {
                         return (page_nav, close);
                     }
-                    if secondary_in_seek_panel {
+                    if secondary_in_overlay_chrome {
                         self.fs_secondary_press_start = None;
                     } else if secondary_down && self.fs_secondary_press_start.is_none() {
                         // 押下開始を記録
@@ -25770,16 +26305,13 @@ impl App {
         side_panel_mode: crate::settings::FsSidePanelMode,
         side_panel_mode_pressed: &mut bool,
         side_panel_visible: bool,
+        overflow_panel_open: bool,
+        overflow_request: &mut Option<FsOverflowOpenRequest>,
         slideshow_playing: &mut bool,
         slideshow_interval: &mut f32,
         slideshow_end_action: &mut SlideshowEndAction,
         current_rotation: crate::rotation_db::Rotation,
         rotation_choice: &mut Option<crate::rotation_db::Rotation>,
-        // 分析ボタン: 表示状態 (active) は値で受け、押下は out フラグで返す。`analysis_mode` を
-        // 直接反転すると Z キー経路の副作用 (ズーム/パン引き継ぎ・bypass enter/exit・補正排他) を
-        // 飛ばすため、呼び出し側で `toggle_analysis_mode()` に合流させる (Codex P1)。
-        analysis_active: bool,
-        analysis_pressed: &mut bool,
         // 360 度パノラマビュー (docs/panorama-360-view-plan.md §5.3):
         // - trigger Some(Auto/Hint) のとき球体アイコンを表示。None なら disabled 表示。
         // - panorama_active=true なら強調背景。
@@ -25860,6 +26392,7 @@ impl App {
             fit_popup_open: *fit_popup_open,
             slideshow_popup_open: *slideshow_popup_open,
             rotation_popup_open: fs_rotation_popup_open(ctx),
+            overflow_panel_open,
             view_trim_mode: *view_trim_mode,
             touch_chrome_latched,
         }) {
@@ -25927,7 +26460,29 @@ impl App {
         }
         next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
 
-        // 上部情報バー固定。× の直左に置き、下部シークバーと同じ鍵表現を使う。
+        // その他の機能。一般的な配置に合わせて × のすぐ左に置き、固定順の低頻度機能を
+        // 右上パネルへまとめる。
+        if !is_video && !panorama_mode_active {
+            let overflow_resp = draw_bar_button(
+                ui,
+                next_x,
+                bar_rect.min.y + BAR_BUTTON_MARGIN,
+                "fs_overflow_btn",
+                |hovered| bar_button_bg(hovered, overflow_panel_open),
+                overflow_panel_open,
+                draw_more_icon,
+            );
+            let overflow_resp = overflow_resp.hover_tip_dark("その他の機能");
+            if overflow_resp.clicked() {
+                *overflow_request = Some(FsOverflowOpenRequest::Root);
+            }
+            if overflow_resp.hovered() {
+                *page_nav = FsPageNav::None;
+            }
+            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+        }
+
+        // 上部情報バー固定。下部シークバーと同じ鍵表現を使う。
         if !is_video {
             let lock_resp = draw_bar_button(
                 ui,
@@ -26359,48 +26914,31 @@ impl App {
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
 
-        // 🔬 分析ボタン（見開きダブル中は非表示。動画では意味を持たないため非表示）
-        // 360 モード中も非表示。
-        if !is_spread_double && !is_video && !panorama_mode_active && reading_flow.is_paged() {
-            let analysis_resp = draw_bar_button(
-                ui,
-                next_x,
-                bar_rect.min.y + BAR_BUTTON_MARGIN,
-                "fs_analysis_btn",
-                |hovered| bar_button_bg(hovered, analysis_active),
-                analysis_active,
-                |p, c, r| draw_analysis_icon(p, c, r),
-            );
-            let analysis_resp = analysis_resp.hover_tip_dark(
-                keymap.first_chord_bracket_label("分析ツール", KeyAction::FsImageAnalysis),
-            );
-            if analysis_resp.clicked() {
-                *analysis_pressed = true;
-            }
-            if analysis_resp.hovered() {
-                *page_nav = FsPageNav::None;
-            }
-            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
-        }
-
         // 360 度パノラマビューボタン (docs/panorama-360-view-plan.md §5.3 / §6.1):
         // - 360 モード OFF + 360 対応画像: ボタン表示 + クリックで ON
         // - 360 モード OFF + 非対応画像: disabled 表示
         // - **360 モード ON 時はボタンを隠す** (× が 360 解除を兼ねるため、
         //   2026-05 ユーザー要望)
         // 元設計 (常時表示 + 強調背景) はユーザーフィードバックで取り下げ。
-        if !is_video && !is_spread_double && !panorama_active && reading_flow.is_paged() {
-            let tooltip = match panorama_trigger {
-                Some(crate::panorama::PanoramaTrigger::Auto) => {
-                    keymap.first_chord_bracket_label("360° 画像 (XMP 検出)", KeyAction::FsPanorama)
+        if !is_video && !panorama_active {
+            let mode_available = !is_spread_double && reading_flow.is_paged();
+            let tooltip = if !reading_flow.is_paged() {
+                "360° ビューワーはページ単位表示で使えます".to_owned()
+            } else if is_spread_double {
+                "360° ビューワーは見開きの2ページ表示中は使えません".to_owned()
+            } else {
+                match panorama_trigger {
+                    Some(crate::panorama::PanoramaTrigger::Auto) => keymap
+                        .first_chord_bracket_label("360° 画像 (XMP 検出)", KeyAction::FsPanorama),
+                    Some(crate::panorama::PanoramaTrigger::Hint) => keymap
+                        .first_chord_bracket_label(
+                            "360° ビューワーで開く (アスペクト比から推定)",
+                            KeyAction::FsPanorama,
+                        ),
+                    None => "360° 画像ではありません".to_owned(),
                 }
-                Some(crate::panorama::PanoramaTrigger::Hint) => keymap.first_chord_bracket_label(
-                    "360° ビューワーで開く (アスペクト比から推定)",
-                    KeyAction::FsPanorama,
-                ),
-                None => "360° 画像ではありません".to_owned(),
             };
-            let is_enabled = panorama_trigger.is_some();
+            let is_enabled = mode_available && panorama_trigger.is_some();
             let pano_resp = draw_bar_button(
                 ui,
                 next_x,
@@ -27320,7 +27858,10 @@ impl App {
                     p.preview_scale
                 ),
                 upload,
-                crate::app::DISPLAY_IMAGE_TEXTURE_OPTIONS,
+                // 注釈の焼き込みは同期経路 (`ensure_comic_composite_texture`) と
+                // この worker 完了経路の**2 つ**が上げる。片方だけ直したせいで、
+                // ニアレストが効かない症状が残った (利用者報告 2026-08-13)。
+                self.display_texture_options(i),
             );
             let upload_ms = t_up.elapsed().as_secs_f64() * 1000.0;
             if crate::perf::is_enabled() {
@@ -31364,6 +31905,338 @@ mod tests {
         assert!((actual.top() - expected.top()).abs() < EPSILON);
         assert!((actual.right() - expected.right()).abs() < EPSILON);
         assert!((actual.bottom() - expected.bottom()).abs() < EPSILON);
+    }
+
+    fn fullscreen_top_bar_button_x_positions(
+        is_spread_double: bool,
+        initial_reading_flow: ReadingFlow,
+    ) -> Vec<(egui::Id, f32)> {
+        let ctx = egui::Context::default();
+        let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
+        let mut positions = Vec::new();
+        let raw_input = egui::RawInput {
+            screen_rect: Some(full_rect),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    let keymap = Keymap::default();
+                    let mut close = false;
+                    let mut page_nav = FsPageNav::None;
+                    let mut side_panel_mode_pressed = false;
+                    let mut overflow_request = None;
+                    let mut slideshow_playing = false;
+                    let mut slideshow_interval = 5.0;
+                    let mut slideshow_end_action = SlideshowEndAction::default();
+                    let mut rotation_choice = None;
+                    let mut panorama_pressed = false;
+                    let mut spread_mode = SpreadMode::Ltr;
+                    let mut reading_flow = initial_reading_flow;
+                    let mut reading_direction = ReadingDirection::Ltr;
+                    let mut spread_popup_open = false;
+                    let mut local_adjust_mode = false;
+                    let mut fit_popup_open = false;
+                    let mut slideshow_popup_open = false;
+                    let mut slideshow_wait = 1.0;
+                    let mut slideshow_scroll = 1.0;
+                    let mut slideshow_percent = 100;
+                    let mut fit_mode_choice = None;
+                    let mut fit_no_upscale_choice = None;
+                    let mut fit_no_downscale_choice = None;
+                    let mut view_trim_mode = false;
+                    let mut tile_pressed = false;
+                    let mut vst_pressed = false;
+                    let mut copy_pressed = false;
+                    let mut copy_region_pressed = false;
+                    let mut window_mode_pressed = false;
+                    let mut top_bar_lock_pressed = false;
+                    App::draw_fs_hover_bar(
+                        ui,
+                        ctx,
+                        &keymap,
+                        full_rect,
+                        &[],
+                        &mut close,
+                        &mut page_nav,
+                        crate::settings::FsSidePanelMode::Hover,
+                        &mut side_panel_mode_pressed,
+                        false,
+                        false,
+                        &mut overflow_request,
+                        &mut slideshow_playing,
+                        &mut slideshow_interval,
+                        &mut slideshow_end_action,
+                        crate::rotation_db::Rotation::None,
+                        &mut rotation_choice,
+                        None,
+                        false,
+                        false,
+                        &mut panorama_pressed,
+                        &mut spread_mode,
+                        &mut reading_flow,
+                        &mut reading_direction,
+                        &mut spread_popup_open,
+                        is_spread_double,
+                        &mut local_adjust_mode,
+                        false,
+                        FullscreenFitMode::Page,
+                        false,
+                        false,
+                        &mut fit_popup_open,
+                        &mut slideshow_popup_open,
+                        &mut slideshow_wait,
+                        &mut slideshow_scroll,
+                        &mut slideshow_percent,
+                        &mut fit_mode_choice,
+                        &mut fit_no_upscale_choice,
+                        &mut fit_no_downscale_choice,
+                        &mut view_trim_mode,
+                        false,
+                        false,
+                        None,
+                        false,
+                        &mut tile_pressed,
+                        false,
+                        false,
+                        &mut vst_pressed,
+                        &mut copy_pressed,
+                        &mut copy_region_pressed,
+                        false,
+                        false,
+                        &mut window_mode_pressed,
+                        true,
+                        &mut top_bar_lock_pressed,
+                        false,
+                        None,
+                        false,
+                        1,
+                    );
+                    positions = test_current_bar_button_targets(ctx)
+                        .into_iter()
+                        .map(|(id, rect)| (id, rect.min.x))
+                        .collect();
+                });
+        });
+        positions
+    }
+
+    #[test]
+    fn fullscreen_top_bar_button_count_and_x_positions_ignore_page_pair_and_reading_flow() {
+        let cases = [
+            (false, ReadingFlow::Paged),
+            (true, ReadingFlow::Paged),
+            (false, ReadingFlow::Vertical),
+            (true, ReadingFlow::Vertical),
+        ];
+        let baseline = fullscreen_top_bar_button_x_positions(cases[0].0, cases[0].1);
+        assert!(!baseline.is_empty());
+        let expected_left_to_right = [
+            "fs_margin_fit_btn",
+            "fs_spread_btn",
+            "fs_panorama_btn",
+            "fs_info_btn",
+            "fs_rotation_btn",
+            "fs_play_btn",
+            "fs_capture_copy_btn",
+            "fs_top_bar_lock_btn",
+            "fs_overflow_btn",
+            "fs_close_btn",
+        ]
+        .map(egui::Id::new);
+        assert_eq!(
+            baseline.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            expected_left_to_right,
+            "the overflow button must stay immediately left of close"
+        );
+        for &(is_spread_double, reading_flow) in &cases[1..] {
+            let actual = fullscreen_top_bar_button_x_positions(is_spread_double, reading_flow);
+            assert_eq!(
+                actual.len(),
+                baseline.len(),
+                "button count changed for is_spread_double={is_spread_double} reading_flow={reading_flow:?}"
+            );
+            for (index, ((actual_id, actual_x), (baseline_id, baseline_x))) in
+                actual.iter().zip(baseline.iter()).enumerate()
+            {
+                assert_eq!(
+                    actual_id, baseline_id,
+                    "button identity changed at slot {index} for is_spread_double={is_spread_double} reading_flow={reading_flow:?}"
+                );
+                assert!(
+                    (actual_x - baseline_x).abs() < 1.0e-4,
+                    "button {index} moved: actual={actual_x} baseline={baseline_x} is_spread_double={is_spread_double} reading_flow={reading_flow:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fullscreen_top_bar_secondary_click_is_owned_by_overlay_chrome() {
+        let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let seek_rect = fullscreen_seek_panel_rect(full_rect);
+        let top_bar_pos = egui::pos2(600.0, TOP_BAR_HEIGHT * 0.5);
+        assert!(fullscreen_secondary_in_overlay_chrome(
+            top_bar_pos,
+            full_rect,
+            true,
+            seek_rect,
+            false,
+        ));
+        assert!(!fullscreen_secondary_in_overlay_chrome(
+            top_bar_pos,
+            full_rect,
+            false,
+            seek_rect,
+            false,
+        ));
+        assert!(fullscreen_secondary_in_overlay_chrome(
+            seek_rect.center(),
+            full_rect,
+            false,
+            seek_rect,
+            true,
+        ));
+    }
+
+    #[test]
+    fn fullscreen_overflow_rows_keep_touch_target_height_and_panel_is_top_right_anchored() {
+        assert_eq!(FS_OVERFLOW_PANEL_ROW_HEIGHT, 48.0);
+        assert_eq!(FS_OVERFLOW_PANEL_HEADER_HEIGHT, 44.0);
+        let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let root = fs_overflow_panel_rect(full_rect, FsOverflowPanelState::Root).unwrap();
+        let submenu =
+            fs_overflow_panel_rect(full_rect, FsOverflowPanelState::NavigatorPosition).unwrap();
+        assert_eq!(
+            root.top(),
+            full_rect.top() + TOP_BAR_HEIGHT + FS_OVERFLOW_PANEL_MARGIN
+        );
+        assert_eq!(root.right(), full_rect.right() - FS_OVERFLOW_PANEL_MARGIN);
+        assert_eq!(submenu, root);
+        assert_eq!(root.width(), FS_OVERFLOW_PANEL_WIDTH);
+
+        let narrow = egui::Rect::from_min_size(egui::pos2(20.0, 30.0), egui::vec2(300.0, 180.0));
+        let clamped = fs_overflow_panel_rect(narrow, FsOverflowPanelState::Root).unwrap();
+        assert_eq!(clamped.right(), narrow.right() - FS_OVERFLOW_PANEL_MARGIN);
+        assert_eq!(
+            clamped.top(),
+            narrow.top() + TOP_BAR_HEIGHT + FS_OVERFLOW_PANEL_MARGIN
+        );
+        assert!(clamped.bottom() <= narrow.bottom() - FS_OVERFLOW_PANEL_MARGIN);
+    }
+
+    #[test]
+    fn fullscreen_overflow_panel_is_excluded_from_tap_zone_classification() {
+        let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let panel_rect = fs_overflow_panel_rect(full_rect, FsOverflowPanelState::Root).unwrap();
+        let tap = panel_rect.center();
+        let bare = crate::touch_input::TapZoneGeometry {
+            surface: full_rect,
+            excluded: Vec::new(),
+            behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                accepts_pinch: true,
+                tap_zones: true,
+            },
+        };
+        assert_ne!(
+            crate::touch_input::classify_tap(&bare, tap),
+            crate::touch_input::TapZone::Excluded
+        );
+
+        let mut excluded = Vec::new();
+        append_fs_overflow_touch_exclusion(&mut excluded, full_rect, FsOverflowPanelState::Root);
+        assert_eq!(excluded, vec![panel_rect]);
+        let guarded = crate::touch_input::TapZoneGeometry { excluded, ..bare };
+        assert_eq!(
+            crate::touch_input::classify_tap(&guarded, tap),
+            crate::touch_input::TapZone::Excluded
+        );
+    }
+
+    fn snapshot_fullscreen_overflow_panel(name: &str, state: FsOverflowPanelState) {
+        use egui_kittest::Harness;
+
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(720.0, 440.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
+                    .show(ctx, |ui| {
+                        let root_rows = vec![
+                            FsOverflowPanelRow {
+                                item: FullscreenOverflowItemId::NavigatorToggle,
+                                label: "ナビゲータ [Alt+N]".to_string(),
+                                status: "ON".to_string(),
+                                enabled: true,
+                                disabled_reason: None,
+                            },
+                            FsOverflowPanelRow {
+                                item: FullscreenOverflowItemId::NavigatorPosition,
+                                label: "ナビゲータ位置".to_string(),
+                                status: "右下  >".to_string(),
+                                enabled: true,
+                                disabled_reason: None,
+                            },
+                            FsOverflowPanelRow {
+                                item: FullscreenOverflowItemId::ImageAnalysis,
+                                label: "分析ツール [Shift+Z]".to_string(),
+                                status: "OFF".to_string(),
+                                enabled: false,
+                                disabled_reason: Some(
+                                    "分析ツールは見開きの2ページ表示中は使えません",
+                                ),
+                            },
+                            FsOverflowPanelRow {
+                                item: FullscreenOverflowItemId::PixelGrid,
+                                label: "ピクセルグリッド [G]".to_string(),
+                                status: "ON".to_string(),
+                                enabled: true,
+                                disabled_reason: None,
+                            },
+                            FsOverflowPanelRow {
+                                item: FullscreenOverflowItemId::LoupeLock,
+                                label: "ルーペ固定 [M]".to_string(),
+                                status: "OFF".to_string(),
+                                enabled: true,
+                                disabled_reason: None,
+                            },
+                        ];
+                        let view = FsOverflowPanelView {
+                            state,
+                            root_rows,
+                            navigator_corner: FullscreenNavigatorCorner::BottomRight,
+                        };
+                        let panel_rect = fs_overflow_panel_rect(ui.max_rect(), state).unwrap();
+                        let _ = draw_fs_overflow_panel_surface(ui, panel_rect, &view);
+                    });
+            });
+        harness.run();
+        harness.snapshot(name);
+    }
+
+    #[test]
+    fn fullscreen_overflow_panel_snapshot_root() {
+        snapshot_fullscreen_overflow_panel(
+            "fullscreen_overflow_panel_root",
+            FsOverflowPanelState::Root,
+        );
+    }
+
+    #[test]
+    fn fullscreen_overflow_panel_snapshot_navigator_submenu() {
+        snapshot_fullscreen_overflow_panel(
+            "fullscreen_overflow_panel_navigator_submenu",
+            FsOverflowPanelState::NavigatorPosition,
+        );
     }
 
     fn assert_loupe_scale(mapping: LoupeSampleMapping, texture_size: egui::Vec2, expected: f32) {
@@ -36061,6 +36934,7 @@ mod tests {
             fit_popup_open: false,
             slideshow_popup_open: false,
             rotation_popup_open: false,
+            overflow_panel_open: false,
             view_trim_mode: false,
             touch_chrome_latched: false,
         };
@@ -36086,6 +36960,12 @@ mod tests {
         assert!(still_top_bar_visible_from_inputs(
             StillTopBarVisibilityInputs {
                 touch_chrome_latched: true,
+                ..hidden
+            }
+        ));
+        assert!(still_top_bar_visible_from_inputs(
+            StillTopBarVisibilityInputs {
+                overflow_panel_open: true,
                 ..hidden
             }
         ));
