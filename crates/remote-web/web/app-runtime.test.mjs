@@ -3438,14 +3438,14 @@ test("latest-only preview supersession exposes a cancellation hook", async () =>
 
 const HUD_ON = {
   enabled: true,
-  detailed: true,
+  requested: true,
   authenticated: true,
   viewerBarsHidden: false,
   dismissed: false,
 };
 
-test("the measurement HUD stays off until someone turns detailed recording on", () => {
-  assert.equal(telemetryHudVisible({ ...HUD_ON, detailed: false }), false);
+test("the measurement HUD stays off until someone asks for it", () => {
+  assert.equal(telemetryHudVisible({ ...HUD_ON, requested: false }), false);
   assert.equal(telemetryHudVisible(HUD_ON), true);
 });
 

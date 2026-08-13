@@ -179,7 +179,9 @@ select {
   position: fixed;
   z-index: 100;
   right: max(7px, env(safe-area-inset-right));
-  bottom: max(7px, env(safe-area-inset-bottom));
+  /* 下バーの上に出す。バー = padding-top 28 + 行 47 (seek 24 + gap 5 + counter) +
+     padding-bottom max(14, safe-area)。その上に 9px 空ける。 */
+  bottom: calc(84px + max(14px, env(safe-area-inset-bottom)));
   max-width: min(68vw, 250px);
   padding: 7px 9px;
   border: 1px solid rgb(255 255 255 / 18%);
@@ -199,13 +201,14 @@ select {
   display: none;
 }
 
+/* 動画・音声の下バーは同じ作りに診断行が 1 行 (0.7rem / 1.3) 増える。 */
+#telemetry-hud[data-viewer-kind="video"] {
+  bottom: calc(104px + max(14px, env(safe-area-inset-bottom)));
+}
+
 #telemetry-hud[data-telemetry-tier="debug"] {
   border-color: rgb(255 186 74 / 72%);
   color: #fff0cd;
-}
-
-#telemetry-hud[data-viewer-kind="video"] {
-  bottom: max(78px, calc(env(safe-area-inset-bottom) + 64px));
 }
 
 .telemetry-hud-header {

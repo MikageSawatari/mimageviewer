@@ -386,7 +386,8 @@ test("video health HUD and persistent debug-tier warning stay wired", async () =
   assert.match(app, /buffer_ahead_secs/);
   assert.match(app, /dropped_video_frames/);
   assert.match(app, /詳細記録 ON/);
-  assert.match(app, /telemetryDebugDetails[\s\S]*openLocalSettingsDialog\(\)/);
+  // 押したら閉じる。設定はメニューから開く。
+  assert.match(app, /hudElement\.addEventListener\("click"[\s\S]{0,120}hudState\.dismissed = true/);
   assert.match(css, /#telemetry-hud\[data-telemetry-tier="debug"\]/);
   assert.match(app, /dataset\.viewerKind = video \? "video" : "default"/);
   assert.match(css, /#telemetry-hud\[data-viewer-kind="video"\][\s\S]*bottom:/);

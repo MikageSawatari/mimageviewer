@@ -25,6 +25,7 @@ test("local settings use the current defaults when no value exists", () => {
     prefetchAhead: 8,
     prefetchBehind: 4,
     telemetryDebugDetails: false,
+    diagnosticHudVisible: false,
     adjustmentTab: "color_tone",
   });
 });
@@ -52,6 +53,7 @@ test("local settings serialize and restore as one versioned value", () => {
     prefetchAhead: 14,
     prefetchBehind: 6,
     telemetryDebugDetails: true,
+    diagnosticHudVisible: true,
     adjustmentTab: "colorize",
   };
   assert.deepEqual(parseLocalSettings(serializeLocalSettings(settings)), settings);
@@ -76,6 +78,7 @@ test("storage failures use in-memory defaults and never escape", () => {
     prefetchAhead: 12,
     prefetchBehind: 5,
     telemetryDebugDetails: true,
+    diagnosticHudVisible: false,
     adjustmentTab: "ai",
   }, unavailable), {
     settings: {
@@ -88,6 +91,7 @@ test("storage failures use in-memory defaults and never escape", () => {
       prefetchAhead: 12,
       prefetchBehind: 5,
       telemetryDebugDetails: true,
+      diagnosticHudVisible: false,
       adjustmentTab: "ai",
     },
     saved: false,
@@ -108,6 +112,7 @@ test("storage helpers use one aggregate key", () => {
     gridColumnsPortrait: 2,
     gridColumnsLandscape: 8,
     telemetryDebugDetails: false,
+    diagnosticHudVisible: false,
     adjustmentTab: "color_tone",
   }, storage);
   assert.equal(saved.saved, true);
@@ -129,6 +134,7 @@ test("older version-one values add the gesture help default", () => {
       prefetchAhead: 8,
       prefetchBehind: 4,
       telemetryDebugDetails: false,
+      diagnosticHudVisible: false,
       adjustmentTab: "color_tone",
     }
   );
@@ -153,6 +159,7 @@ test("grid column settings clamp per field without replacing existing values", (
       prefetchAhead: 8,
       prefetchBehind: 4,
       telemetryDebugDetails: false,
+      diagnosticHudVisible: false,
       adjustmentTab: "color_tone",
     }
   );
@@ -174,6 +181,7 @@ test("grid column settings clamp per field without replacing existing values", (
       prefetchAhead: 8,
       prefetchBehind: 4,
       telemetryDebugDetails: false,
+      diagnosticHudVisible: false,
       adjustmentTab: "color_tone",
     }
   );

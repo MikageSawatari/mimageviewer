@@ -1309,12 +1309,12 @@ const hudState = {
 /// 本の上には何も置かない。
 export function telemetryHudVisible({
   enabled,
-  detailed,
+  requested,
   authenticated,
   viewerBarsHidden,
   dismissed,
 }) {
-  if (!enabled || !authenticated || !detailed) return false;
+  if (!enabled || !authenticated || !requested) return false;
   if (dismissed) return false;
   return !viewerBarsHidden;
 }
@@ -10947,11 +10947,26 @@ class LocalSettingsDialog {
       textElement("strong", "詳細記録を有効にする"),
       textElement(
         "small",
-        "調査時だけ使用します。画面右下に計測値を表示し、ファイルの相対パス・remote address・端末 ID・サーバーメッセージを記録します。PIN、認証 token、remote session ID の生値は記録しません。"
+        "調査時だけ使用します。ファイルの相対パス・remote address・端末 ID・サーバーメッセージを記録します。PIN、認証 token、remote session ID の生値は記録しません。"
       )
     );
     telemetryOption.append(telemetryCheckbox, telemetryCopy);
     telemetryGroup.append(telemetryOption);
+
+    const hudOption = element("label", "local-settings-option");
+    const hudCheckbox = element("input");
+    hudCheckbox.type = "checkbox";
+    hudCheckbox.checked = state.localSettings.diagnosticHudVisible;
+    const hudCopy = element("span", "local-settings-copy");
+    hudCopy.append(
+      textElement("strong", "詳細動作表示"),
+      textElement(
+        "small",
+        "画面右下に、読み込みにかかった時間や通信の状態を表示します。押すと閉じます。上下のバーを隠している間は表示しません。"
+      )
+    );
+    hudOption.append(hudCheckbox, hudCopy);
+    telemetryGroup.append(hudOption);
 
     this.status = textElement("p", "", "local-settings-status");
     this.updateStorageStatus();
@@ -10982,7 +10997,17 @@ class LocalSettingsDialog {
       });
       state.localSettings = saved.settings;
       state.localSettingsStorageAvailable = saved.saved;
-      // 詳細記録を入れ直したら、前に閉じたことは持ち越さない。
+      updateHud();
+      this.updateStorageStatus();
+    });
+    hudCheckbox.addEventListener("change", () => {
+      const saved = saveLocalSettings({
+        ...state.localSettings,
+        diagnosticHudVisible: hudCheckbox.checked,
+      });
+      state.localSettings = saved.settings;
+      state.localSettingsStorageAvailable = saved.saved;
+      // 出し直したいから入れているので、前に閉じたことは持ち越さない。
       hudState.dismissed = false;
       state.viewer?.captureVideoHealth?.("hud");
       updateHud();
@@ -13637,12 +13662,8 @@ export async function logoutApplication() {
 
 function installTelemetry() {
   hudElement.addEventListener("click", () => {
-    if (state.localSettings.telemetryDebugDetails) {
-      openLocalSettingsDialog();
-    } else {
-      hudState.dismissed = true;
-      updateHud();
-    }
+    hudState.dismissed = true;
+    updateHud();
   });
   updateHud();
 
@@ -14134,7 +14155,7 @@ function updateHud() {
   const debugDetails = state.localSettings.telemetryDebugDetails;
   hudElement.hidden = !telemetryHudVisible({
     enabled: TELEMETRY_ENABLED,
-    detailed: debugDetails,
+    requested: state.localSettings.diagnosticHudVisible,
     authenticated: state.authenticated,
     viewerBarsHidden: viewerBarsAreHidden(),
     dismissed: hudState.dismissed,

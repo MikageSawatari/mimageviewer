@@ -29,6 +29,7 @@ export function defaultLocalSettings() {
     prefetchAhead: DEFAULT_PREFETCH_AHEAD,
     prefetchBehind: DEFAULT_PREFETCH_BEHIND,
     telemetryDebugDetails: false,
+    diagnosticHudVisible: false,
     adjustmentTab: ADJUSTMENT_PANEL_TABS[0].id,
   };
 }
@@ -87,6 +88,10 @@ export function normalizeLocalSettings(value) {
       typeof value.telemetryDebugDetails === "boolean"
         ? value.telemetryDebugDetails
         : defaults.telemetryDebugDetails,
+    diagnosticHudVisible:
+      typeof value.diagnosticHudVisible === "boolean"
+        ? value.diagnosticHudVisible
+        : defaults.diagnosticHudVisible,
     adjustmentTab: normalizeAdjustmentTab(value.adjustmentTab),
   };
 }
