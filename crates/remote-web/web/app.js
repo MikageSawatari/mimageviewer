@@ -22,6 +22,9 @@ import {
   gridColumnsAfterPinch,
   gridLabelHeightForEntries,
   gridLayoutForWidth,
+  gridScrollbarFirstVisibleItem,
+  gridScrollbarScrollTop,
+  gridScrollbarThumb,
   gridScrollExtent,
   gridIndexForCommand,
   imageQualityPreset,
@@ -5116,7 +5119,23 @@ function renderFolder(listMetrics = null, preserveRequestController = null) {
   topbar.append(parent, home, buildBreadcrumbs(), createMenuButton("操作メニュー"));
   const sortBar = createGridSortBar();
 
+  const scrollShell = element("div", "grid-scroll-shell");
   const scroll = element("div", "grid-scroll");
+  const scrollbarRoot = element("div", "grid-scrollbar");
+  scrollbarRoot.hidden = true;
+  // Deliberately not a tab stop. The grid already answers arrows, Home/End and
+  // PageUp/Down through the window-level command layer; a focusable scrollbar would
+  // add a second Tab stop where those same keys mean something else.
+  scrollbarRoot.setAttribute("role", "scrollbar");
+  scrollbarRoot.setAttribute("aria-label", "一覧のスクロール位置");
+  scrollbarRoot.setAttribute("aria-orientation", "vertical");
+  scrollbarRoot.setAttribute("aria-valuemin", "1");
+  const scrollbarTrack = element("div", "grid-scrollbar-track");
+  const scrollbarThumb = element("div", "grid-scrollbar-thumb");
+  const scrollbarBubble = textElement("div", "", "grid-scrollbar-bubble");
+  scrollbarBubble.hidden = true;
+  scrollbarTrack.append(scrollbarThumb, scrollbarBubble);
+  scrollbarRoot.append(scrollbarTrack);
   const thumbnailNotice = textElement("p", "", "thumbnail-service-notice");
   thumbnailNotice.hidden = true;
   state.thumbnailNotice = thumbnailNotice;
@@ -5143,13 +5162,14 @@ function renderFolder(listMetrics = null, preserveRequestController = null) {
   const windowElement = element("div", "virtual-window");
   space.append(windowElement);
   scroll.append(space);
+  scrollShell.append(scroll, scrollbarRoot);
   screen.append(
     topbar,
     sortBar,
     collectionLimitNotice,
     gridActionNotice,
     thumbnailNotice,
-    scroll
+    scrollShell
   );
   screen.addEventListener("contextmenu", (event) => {
     event.preventDefault();
@@ -5196,6 +5216,12 @@ function renderFolder(listMetrics = null, preserveRequestController = null) {
     {
       context: state.gridHash,
       itemIdentities: gridItemIdentities,
+      scrollbar: {
+        root: scrollbarRoot,
+        track: scrollbarTrack,
+        thumb: scrollbarThumb,
+        bubble: scrollbarBubble,
+      },
     }
   );
   const gridViewport = state.gridViewportMemory.recall(state.gridHash);
@@ -7045,6 +7071,7 @@ class VirtualGrid {
     this.itemIdentities = Array.isArray(viewportState.itemIdentities)
       ? viewportState.itemIdentities.slice()
       : [];
+    this.scrollbar = viewportState.scrollbar ?? null;
     this.viewportAnchor = new GridViewportAnchor(this.itemIdentities);
     this.initialItemsReported = false;
     this.cells = new Map();
@@ -7055,6 +7082,7 @@ class VirtualGrid {
     this.cellWidth = 1;
     this.labelHeight = 1;
     this.gap = 0;
+    this.contentHeight = 0;
     this.maxScrollOffset = 0;
     this.lastRange = "";
     this.frame = 0;
@@ -7064,7 +7092,10 @@ class VirtualGrid {
     this.blockClickUntil = 0;
     this.wheelPinchScale = 1;
     this.wheelPinchTimer = 0;
+    this.scrollbarPointerId = null;
+    this.scrollbarGrabOffset = 0;
     this.onScroll = () => {
+      this.updateScrollbar();
       this.schedule();
       this.scheduleRowSnap();
     };
@@ -7083,6 +7114,12 @@ class VirtualGrid {
       event.stopImmediatePropagation();
     };
     this.onNativeGesture = (event) => event.preventDefault();
+    this.onScrollbarPointerDown = (event) =>
+      this.handleScrollbarPointerDown(event);
+    this.onScrollbarPointerMove = (event) =>
+      this.handleScrollbarPointerMove(event);
+    this.onScrollbarPointerEnd = (event) =>
+      this.handleScrollbarPointerEnd(event);
     this.resizeObserver = new ResizeObserver(() => this.layout());
     this.scroller.addEventListener("scroll", this.onScroll, { passive: true });
     this.scroller.addEventListener("scrollend", this.onScrollEnd, {
@@ -7113,8 +7150,142 @@ class VirtualGrid {
     this.scroller.addEventListener("gesturechange", this.onNativeGesture, {
       passive: false,
     });
+    if (this.scrollbar) {
+      this.scrollbar.thumb.addEventListener(
+        "pointerdown",
+        this.onScrollbarPointerDown
+      );
+      this.scrollbar.thumb.addEventListener(
+        "pointermove",
+        this.onScrollbarPointerMove
+      );
+      this.scrollbar.thumb.addEventListener(
+        "pointerup",
+        this.onScrollbarPointerEnd
+      );
+      this.scrollbar.thumb.addEventListener(
+        "pointercancel",
+        this.onScrollbarPointerEnd
+      );
+      this.scrollbar.thumb.addEventListener(
+        "lostpointercapture",
+        this.onScrollbarPointerEnd
+      );
+    }
     this.resizeObserver.observe(this.scroller);
     this.layout();
+  }
+
+  scrollbarGeometry() {
+    if (!this.scrollbar) {
+      return { visible: false, thumbHeight: 0, thumbTop: 0 };
+    }
+    return gridScrollbarThumb({
+      contentHeight: this.contentHeight,
+      viewportHeight: this.scroller.clientHeight,
+      scrollTop: this.scroller.scrollTop,
+      trackHeight: this.scrollbar.track.clientHeight,
+      minThumbHeight: 44,
+    });
+  }
+
+  updateScrollbar() {
+    if (!this.scrollbar) return;
+    const geometry = this.scrollbarGeometry();
+    this.scrollbar.root.hidden = !geometry.visible;
+    if (!geometry.visible) return;
+
+    this.scrollbar.thumb.style.height = geometry.thumbHeight + "px";
+    this.scrollbar.thumb.style.transform =
+      "translateY(" + geometry.thumbTop + "px)";
+    const itemNumber = gridScrollbarFirstVisibleItem({
+      scrollTop: this.scroller.scrollTop,
+      rowHeight: this.rowHeight,
+      columns: this.columns,
+      totalItems: this.items.length,
+    });
+    const valueText =
+      itemNumber.toLocaleString("ja-JP") +
+      " / " +
+      this.items.length.toLocaleString("ja-JP");
+    this.scrollbar.root.setAttribute("aria-valuemax", String(this.items.length));
+    this.scrollbar.root.setAttribute("aria-valuenow", String(itemNumber));
+    this.scrollbar.root.setAttribute("aria-valuetext", valueText);
+    this.scrollbar.bubble.textContent = valueText;
+    const bubbleHalfHeight = this.scrollbar.bubble.hidden
+      ? 0
+      : this.scrollbar.bubble.clientHeight / 2;
+    const bubbleTop = clamp(
+      geometry.thumbTop + geometry.thumbHeight / 2,
+      bubbleHalfHeight,
+      Math.max(
+        bubbleHalfHeight,
+        this.scrollbar.track.clientHeight - bubbleHalfHeight
+      )
+    );
+    this.scrollbar.bubble.style.top = bubbleTop + "px";
+  }
+
+  setScrollbarScrollTop(pointerTop) {
+    if (!this.scrollbar) return;
+    this.scroller.scrollTop = gridScrollbarScrollTop({
+      pointerTop,
+      grabOffset: this.scrollbarGrabOffset,
+      contentHeight: this.contentHeight,
+      viewportHeight: this.scroller.clientHeight,
+      trackHeight: this.scrollbar.track.clientHeight,
+      minThumbHeight: 44,
+    });
+    this.updateScrollbar();
+    this.schedule();
+  }
+
+  handleScrollbarPointerDown(event) {
+    if (!this.scrollbar || this.scrollbarPointerId !== null) return;
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    const geometry = this.scrollbarGeometry();
+    if (!geometry.visible) return;
+
+    const rect = this.scrollbar.track.getBoundingClientRect();
+    const pointerTop = clamp(event.clientY - rect.top, 0, rect.height);
+    this.scrollbarGrabOffset = clamp(
+      pointerTop - geometry.thumbTop,
+      0,
+      geometry.thumbHeight
+    );
+    this.scrollbarPointerId = event.pointerId;
+    this.scrollbar.root.dataset.dragging = "true";
+    this.scrollbar.bubble.hidden = false;
+    this.scrollbar.thumb.setPointerCapture(event.pointerId);
+    this.setScrollbarScrollTop(pointerTop);
+    event.preventDefault();
+    event.stopPropagation();
+  }
+
+  handleScrollbarPointerMove(event) {
+    if (!this.scrollbar || event.pointerId !== this.scrollbarPointerId) return;
+    const rect = this.scrollbar.track.getBoundingClientRect();
+    this.setScrollbarScrollTop(clamp(event.clientY - rect.top, 0, rect.height));
+    event.preventDefault();
+    event.stopPropagation();
+  }
+
+  handleScrollbarPointerEnd(event) {
+    if (!this.scrollbar || event.pointerId !== this.scrollbarPointerId) return;
+    const pointerId = this.scrollbarPointerId;
+    this.scrollbarPointerId = null;
+    this.scrollbarGrabOffset = 0;
+    delete this.scrollbar.root.dataset.dragging;
+    this.scrollbar.bubble.hidden = true;
+    if (
+      event.type !== "lostpointercapture" &&
+      this.scrollbar.thumb.hasPointerCapture(pointerId)
+    ) {
+      this.scrollbar.thumb.releasePointerCapture(pointerId);
+    }
+    this.updateScrollbar();
+    this.scheduleRowSnap();
+    event.stopPropagation();
   }
 
   handlePointerDown(event) {
@@ -7225,6 +7396,7 @@ class VirtualGrid {
       this.rowHeight,
       this.scroller.clientHeight
     );
+    this.contentHeight = extent.totalHeight;
     this.maxScrollOffset = extent.maxOffset;
     this.space.style.height = `${extent.totalHeight}px`;
     this.windowElement.style.setProperty(
@@ -7252,6 +7424,7 @@ class VirtualGrid {
         anchorRow * this.rowHeight
       );
     }
+    this.updateScrollbar();
     this.schedule();
   }
 
@@ -7293,13 +7466,13 @@ class VirtualGrid {
   }
 
   scheduleRowSnap() {
-    if (this.activePointers.size > 0) return;
+    if (this.activePointers.size > 0 || this.scrollbarPointerId !== null) return;
     clearTimeout(this.snapTimer);
     this.snapTimer = window.setTimeout(() => this.snapToRow(), 140);
   }
 
   snapToRow() {
-    if (this.activePointers.size > 0) return;
+    if (this.activePointers.size > 0 || this.scrollbarPointerId !== null) return;
     clearTimeout(this.snapTimer);
     this.snapTimer = 0;
     const snapped = snappedGridOffset(
@@ -7396,6 +7569,7 @@ class VirtualGrid {
       Math.min(this.maxScrollOffset, Number(scrollTop) || 0)
     );
     this.lastRange = '';
+    this.updateScrollbar();
     this.schedule();
   }
 
@@ -7432,6 +7606,7 @@ class VirtualGrid {
     }
     tile?.classList.add("grid-active");
     if (shouldFocus) tile?.focus({ preventScroll: true });
+    if (scrolled) this.updateScrollbar();
   }
 
   destroy() {
@@ -7449,7 +7624,32 @@ class VirtualGrid {
     this.scroller.removeEventListener("click", this.onClickCapture, true);
     this.scroller.removeEventListener("gesturestart", this.onNativeGesture);
     this.scroller.removeEventListener("gesturechange", this.onNativeGesture);
+    if (this.scrollbar) {
+      this.scrollbar.thumb.removeEventListener(
+        "pointerdown",
+        this.onScrollbarPointerDown
+      );
+      this.scrollbar.thumb.removeEventListener(
+        "pointermove",
+        this.onScrollbarPointerMove
+      );
+      this.scrollbar.thumb.removeEventListener(
+        "pointerup",
+        this.onScrollbarPointerEnd
+      );
+      this.scrollbar.thumb.removeEventListener(
+        "pointercancel",
+        this.onScrollbarPointerEnd
+      );
+      this.scrollbar.thumb.removeEventListener(
+        "lostpointercapture",
+        this.onScrollbarPointerEnd
+      );
+      delete this.scrollbar.root.dataset.dragging;
+      this.scrollbar.bubble.hidden = true;
+    }
     this.resizeObserver.disconnect();
+    this.scrollbarPointerId = null;
     this.activePointers.clear();
     this.pinch = null;
     for (const cell of this.cells.values()) disposeGridTile(cell);

@@ -30,6 +30,9 @@ import {
   gridColumnsAfterPinch,
   gridLabelHeightForEntries,
   gridLayoutForWidth,
+  gridScrollbarFirstVisibleItem,
+  gridScrollbarScrollTop,
+  gridScrollbarThumb,
   gridScrollExtent,
   gridIndexForCommand,
   isPortraitViewport,
@@ -2363,6 +2366,75 @@ test("grid scroll extent and snapping stay on whole row boundaries", () => {
     maxOffset: 0,
     totalHeight: 700,
   });
+});
+
+test('grid scrollbar hides when the list fits and maps both endpoints', () => {
+  assert.equal(
+    gridScrollbarThumb({
+      contentHeight: 600,
+      viewportHeight: 700,
+      scrollTop: 0,
+      trackHeight: 500,
+      minThumbHeight: 44,
+    }).visible,
+    false
+  );
+
+  const input = {
+    contentHeight: 60_000 * 164,
+    viewportHeight: 700,
+    trackHeight: 600,
+    minThumbHeight: 44,
+  };
+  const top = gridScrollbarThumb({ ...input, scrollTop: 0 });
+  assert.equal(top.thumbTop, 0);
+  assert.ok(top.thumbHeight >= input.minThumbHeight);
+
+  const bottom = gridScrollbarThumb({
+    ...input,
+    scrollTop: input.contentHeight - input.viewportHeight,
+  });
+  assert.ok(
+    Math.abs(bottom.thumbTop - (input.trackHeight - bottom.thumbHeight)) < 1e-9
+  );
+});
+
+test('grid scrollbar thumb and scroll position round trip', () => {
+  const input = {
+    contentHeight: 9_840_000,
+    viewportHeight: 720,
+    trackHeight: 640,
+    minThumbHeight: 44,
+  };
+  const original = gridScrollbarThumb({ ...input, scrollTop: 4_321_000 });
+  const scrollTop = gridScrollbarScrollTop({
+    ...input,
+    pointerTop: original.thumbTop,
+    grabOffset: 0,
+  });
+  const roundTrip = gridScrollbarThumb({ ...input, scrollTop });
+  assert.ok(Math.abs(roundTrip.thumbTop - original.thumbTop) < 1e-9);
+});
+
+test('grid scrollbar item number stays within the item range', () => {
+  const input = { rowHeight: 164, columns: 7, totalItems: 60_002 };
+  assert.equal(gridScrollbarFirstVisibleItem({ ...input, scrollTop: 0 }), 1);
+  assert.equal(
+    gridScrollbarFirstVisibleItem({ ...input, scrollTop: 164 * 3 + 80 }),
+    22
+  );
+  assert.equal(
+    gridScrollbarFirstVisibleItem({ ...input, scrollTop: Number.MAX_VALUE }),
+    input.totalItems
+  );
+  const partialLastRow = gridScrollbarFirstVisibleItem({
+    scrollTop: 164 * 8_571,
+    rowHeight: 164,
+    columns: 7,
+    totalItems: 60_000,
+  });
+  assert.equal(partialLastRow, 59_998);
+  assert.ok(partialLastRow >= 1 && partialLastRow <= 60_000);
 });
 
 test('grid return scrolls only enough to reveal the previously viewed item', () => {

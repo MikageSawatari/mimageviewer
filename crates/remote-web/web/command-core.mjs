@@ -2122,6 +2122,80 @@ export function gridScrollExtent(rowCount, rowPitch, viewportHeight) {
   };
 }
 
+export function gridScrollbarThumb({
+  contentHeight,
+  viewportHeight,
+  scrollTop,
+  trackHeight,
+  minThumbHeight = 44,
+}) {
+  const content = Math.max(0, Number(contentHeight) || 0);
+  const viewport = Math.max(0, Number(viewportHeight) || 0);
+  const track = Math.max(0, Number(trackHeight) || 0);
+  const minimum = Math.max(0, Number(minThumbHeight) || 0);
+  const maxScroll = Math.max(0, content - viewport);
+  if (maxScroll <= 0 || track <= 0) {
+    return { visible: false, thumbHeight: track, thumbTop: 0 };
+  }
+
+  const thumbHeight = Math.min(
+    track,
+    Math.max(minimum, track * (viewport / content))
+  );
+  const travel = Math.max(0, track - thumbHeight);
+  const offset = clampNumber(Number(scrollTop) || 0, 0, maxScroll);
+  return {
+    visible: true,
+    thumbHeight,
+    thumbTop: travel * (offset / maxScroll),
+  };
+}
+
+export function gridScrollbarScrollTop({
+  pointerTop,
+  grabOffset,
+  contentHeight,
+  viewportHeight,
+  trackHeight,
+  minThumbHeight = 44,
+}) {
+  const content = Math.max(0, Number(contentHeight) || 0);
+  const viewport = Math.max(0, Number(viewportHeight) || 0);
+  const track = Math.max(0, Number(trackHeight) || 0);
+  const geometry = gridScrollbarThumb({
+    contentHeight: content,
+    viewportHeight: viewport,
+    scrollTop: 0,
+    trackHeight: track,
+    minThumbHeight,
+  });
+  if (!geometry.visible) return 0;
+
+  const travel = Math.max(0, track - geometry.thumbHeight);
+  if (travel <= 0) return 0;
+  const thumbTop = clampNumber(
+    (Number(pointerTop) || 0) - (Number(grabOffset) || 0),
+    0,
+    travel
+  );
+  return (thumbTop / travel) * Math.max(0, content - viewport);
+}
+
+export function gridScrollbarFirstVisibleItem({
+  scrollTop,
+  rowHeight,
+  columns,
+  totalItems,
+}) {
+  const total = Math.max(0, Math.floor(Number(totalItems) || 0));
+  if (total === 0) return 0;
+  const pitch = Math.max(1, Number(rowHeight) || 1);
+  const columnCount = Math.max(1, Math.floor(Number(columns) || 1));
+  const offset = Math.max(0, Number(scrollTop) || 0);
+  const first = Math.floor(offset / pitch) * columnCount + 1;
+  return clampNumber(first, 1, total);
+}
+
 export function snappedGridOffset(scrollTop, rowPitch, maxOffset) {
   const offset = Math.max(0, Number(scrollTop) || 0);
   const pitch = Math.max(1, Number(rowPitch) || 1);
