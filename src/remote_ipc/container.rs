@@ -7384,6 +7384,10 @@ mod tests {
 
     #[test]
     fn page_render_observes_the_registry_job_token() {
+        // WorkerContext::open() と CatalogDb::open() は data_dir::get() へ落ちる。
+        // ガードが無いと本物の %APPDATA% のカタログを開き、同時に走る他テストの
+        // TEST_OVERRIDE (プロセス共有) を踏んで開けなくなる。
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
         let engine = ContainerEngine::new(crate::settings::Settings::default());
         let context = WorkerContext::open();
         let cancel = Arc::new(AtomicBool::new(true));
@@ -7621,6 +7625,8 @@ mod tests {
     /// partner again while still returning the right picture.
     #[test]
     fn a_warm_partner_bbox_skips_the_speculative_resolution() {
+        // 下の `remote_auto_trim_page_responses_...` と同じ理由 (data_dir::get() 到達)。
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
         let temp = tempfile::tempdir().unwrap();
         let book = temp.path().join("book");
         std::fs::create_dir(&book).unwrap();
@@ -7886,6 +7892,10 @@ mod tests {
 
     #[test]
     fn remote_auto_trim_page_responses_share_the_harmonized_spread_height() {
+        // このテストは自前の tempdir に本と view_trim.db を作るが、load_image() の
+        // 途中で開くサムネイルカタログだけは data_dir::get() 側にある。ガードを
+        // 取らないと利用者の実カタログを開き、並列実行で稀に失敗していた。
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
         let temp = tempfile::tempdir().unwrap();
         let book = temp.path().join("book");
         std::fs::create_dir(&book).unwrap();
