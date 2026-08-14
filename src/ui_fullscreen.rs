@@ -4280,7 +4280,24 @@ impl App {
     /// が同じチェーンを 2 回書いていた重複を集約する。ここでは既存 cache の lookup
     /// だけを行い、MI-GAN や隠蔽合成の新規生成は走らせない。生成を伴う通常描画は
     /// `resolve_fs_processed_texture` を使う。
+    ///
+    /// Whatever the chain settles on is checked against what the texture was made to show before
+    /// it is handed back. Each cache below judges its own entry, and each has to be taught identity
+    /// separately - which is how a composite belonging to another document came to be presented
+    /// while every store involved considered itself correct. Asking the texture covers all of them
+    /// at once, including ones added later. A mismatch is refused rather than displayed: the page
+    /// falls back to a holdover or a loading state, and the viewer tells the user to restart.
     pub(crate) fn resolve_fs_display_tex(
+        &self,
+        idx: usize,
+        include_thumb: bool,
+    ) -> Option<egui::TextureHandle> {
+        let texture = self.resolve_fs_display_tex_from_caches(idx, include_thumb)?;
+        self.display_texture_matches_page(&texture, idx)
+            .then_some(texture)
+    }
+
+    fn resolve_fs_display_tex_from_caches(
         &self,
         idx: usize,
         include_thumb: bool,
@@ -14216,7 +14233,7 @@ impl App {
         // otherwise appear is a page stuck loading with no explanation. Say what happened instead:
         // recovery is not known to be safe, so the honest instruction is to restart rather than to
         // wait for something that may never arrive.
-        if self.display_identity_error.is_some() {
+        if self.display_identity_error.borrow().is_some() {
             return "読み込みエラーです。アプリを再起動してください".to_owned();
         }
         let has_display_tex = matches!(

@@ -29,6 +29,7 @@
 //! collide, and a collision here would silently reinstate exactly the bug this exists to prevent.
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 
 /// Identifies *what* an item is, for as long as the process lives.
 ///
@@ -77,15 +78,133 @@ impl ItemIdInterner {
         id
     }
 
-    /// How many distinct items have been seen. Only for diagnostics.
+    /// How many distinct items have been seen.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.ids.len()
+    }
+}
+
+/// Which item a display texture was made to show.
+///
+/// Every cache that can answer for a page is keyed by index, and each one has to be given identity
+/// separately. Chasing them one at a time is how this bug kept coming back: a store nobody had got
+/// to yet would answer for an index whose meaning had changed, and the picture on screen belonged
+/// to the previous document.
+///
+/// A texture is the one thing all of those stores have in common, and it cannot be re-labelled -
+/// the pixels were uploaded once, for one page. Recording what a texture is *for* therefore covers
+/// every store at once, including stores that do not exist yet.
+///
+/// Identity is learned on first sight rather than at upload: the resolver below is the single point
+/// every display texture passes through, so binding it there needs no cooperation from producers
+/// and cannot be forgotten by a new one. A producer that already knows which item it worked on can
+/// bind earlier via [`Self::bind`], which is strictly better - it catches the case where the very
+/// first sighting is already the wrong one - but nothing depends on it happening.
+///
+/// Texture ids are never reused by `epaint`, so an entry can never come to describe a different
+/// texture; entries are dropped oldest-first purely to bound memory. The bound is far above the
+/// number of pages that can be resident, so a texture that outlives a document switch - the case
+/// worth catching - is always still on the books.
+#[derive(Debug, Default)]
+pub(crate) struct TextureIdentityLedger {
+    ids: HashMap<egui::TextureId, ItemId>,
+    order: VecDeque<egui::TextureId>,
+}
+
+impl TextureIdentityLedger {
+    /// Far above the number of page textures that can be resident at once.
+    const CAPACITY: usize = 4096;
+
+    /// Record what this texture shows, if it is not already recorded.
+    ///
+    /// The first binding wins. A later one being ignored is the point: that is precisely the
+    /// disagreement this exists to detect, and overwriting would erase it.
+    pub(crate) fn bind(&mut self, texture: egui::TextureId, item: ItemId) {
+        if item.is_none() || self.ids.contains_key(&texture) {
+            return;
+        }
+        self.ids.insert(texture, item);
+        self.order.push_back(texture);
+        while self.order.len() > Self::CAPACITY {
+            if let Some(evicted) = self.order.pop_front() {
+                self.ids.remove(&evicted);
+            }
+        }
+    }
+
+    /// What this texture was made to show, or `None` if it has not been seen before.
+    pub(crate) fn get(&self, texture: egui::TextureId) -> Option<ItemId> {
+        self.ids.get(&texture).copied()
+    }
+
+    /// Does this texture show `item`?
+    ///
+    /// Unknown answers `true`. Only a texture that is on the books *and* disagrees is a mismatch,
+    /// so a store this has not learned about yet keeps working exactly as before rather than
+    /// blanking the screen on a guess.
+    pub(crate) fn agrees(&self, texture: egui::TextureId, item: ItemId) -> bool {
+        if item.is_none() {
+            return true;
+        }
+        match self.get(texture) {
+            Some(bound) => bound == item,
+            None => true,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.ids.len()
     }
 }
 
 #[cfg(test)]
+thread_local! {
+    static MISMATCH_EXPECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Is the test running on this thread one that deliberately builds a mismatch?
+///
+/// A mismatch is a development-time assertion failure everywhere else, and that is worth keeping:
+/// it is how the rest of the suite would catch a store handing back a foreign texture. Only the
+/// tests that construct the condition on purpose opt out, and only for their own duration.
+pub(crate) fn mismatch_is_expected() -> bool {
+    #[cfg(test)]
+    {
+        MISMATCH_EXPECTED.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// Suppress the mismatch assertion until the returned guard is dropped.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn expect_mismatch() -> MismatchExpected {
+    MISMATCH_EXPECTED.with(|flag| flag.set(true));
+    MismatchExpected
+}
+
+#[cfg(test)]
+pub(crate) struct MismatchExpected;
+
+#[cfg(test)]
+impl Drop for MismatchExpected {
+    fn drop(&mut self) {
+        MISMATCH_EXPECTED.with(|flag| flag.set(false));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tex(id: u64) -> egui::TextureId {
+        egui::TextureId::Managed(id)
+    }
 
     #[test]
     fn the_same_key_keeps_its_identity_and_different_keys_never_share_one() {
@@ -112,6 +231,52 @@ mod tests {
             ItemId::NONE,
             real,
             "an entry with no identity must fail the check rather than pass it by default"
+        );
+    }
+
+    #[test]
+    fn a_texture_that_outlives_its_page_stops_agreeing_with_the_index_it_sits_at() {
+        let mut interner = ItemIdInterner::default();
+        let mut ledger = TextureIdentityLedger::default();
+        let first_doc_page = interner.intern("pdf::001.pdf#0");
+        let second_doc_page = interner.intern("pdf::002.pdf#0");
+
+        ledger.bind(tex(181), first_doc_page);
+        assert!(ledger.agrees(tex(181), first_doc_page));
+        assert!(
+            !ledger.agrees(tex(181), second_doc_page),
+            "the reported failure: index 0 now means another document, but the texture there is \
+             still the first document's page"
+        );
+
+        // A store that binds late cannot talk the ledger out of what it already knows.
+        ledger.bind(tex(181), second_doc_page);
+        assert!(!ledger.agrees(tex(181), second_doc_page));
+    }
+
+    #[test]
+    fn an_unseen_texture_is_allowed_through() {
+        let mut interner = ItemIdInterner::default();
+        let ledger = TextureIdentityLedger::default();
+        assert!(
+            ledger.agrees(tex(7), interner.intern("pdf::a.pdf#0")),
+            "a store this has not learned about must keep working, not blank the page on a guess"
+        );
+    }
+
+    #[test]
+    fn the_ledger_stays_bounded_and_keeps_the_recent_textures() {
+        let mut interner = ItemIdInterner::default();
+        let mut ledger = TextureIdentityLedger::default();
+        let overflow = TextureIdentityLedger::CAPACITY + 100;
+        for i in 0..overflow {
+            ledger.bind(tex(i as u64), interner.intern(&format!("pdf::a.pdf#{i}")));
+        }
+        assert_eq!(ledger.len(), TextureIdentityLedger::CAPACITY);
+        let newest = tex((overflow - 1) as u64);
+        assert!(
+            ledger.get(newest).is_some(),
+            "a texture that just crossed a document switch must still be on the books"
         );
     }
 }

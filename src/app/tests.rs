@@ -23979,6 +23979,54 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
+    /// The reported failure, at the one gate it cannot get past.
+    ///
+    /// Every store that can answer for a page has to be taught identity separately, and while that
+    /// was being done one at a time, a store nobody had reached yet kept handing back the previous
+    /// document's picture. This asks the texture instead: it was uploaded once, for one page, and
+    /// no store can relabel it. A store is simulated here rather than named, because the point is
+    /// that it works for stores this test does not know about - including ones added later.
+    #[test]
+    fn a_texture_from_the_previous_document_is_refused_rather_than_displayed() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/001.pdf-page-0.jpg");
+        app.reintern_item_ids();
+        let (_, _) = insert_edit_and_final_cache(&mut app, &ctx, idx, "doc_001");
+
+        let first_document_texture = app
+            .resolve_fs_display_tex(idx, true)
+            .expect("the page on screen must resolve");
+        assert!(
+            app.display_identity_error.borrow().is_none(),
+            "showing a page as itself is not a mismatch"
+        );
+
+        // The next document takes over the same index. The entry is deliberately left behind and
+        // stamped as current, which is what an async producer landing after the switch does: by
+        // the time its result arrives the generation genuinely is the new one, so generation alone
+        // cannot tell the two apart.
+        app.items[idx] = GridItem::Image(PathBuf::from("C:/pics/002.pdf-page-0.jpg"));
+        app.items_generation += 1;
+        app.reintern_item_ids();
+        let (_, _) = insert_edit_and_final_cache(&mut app, &ctx, idx, "doc_002");
+        app.final_composite_cache
+            .values_mut()
+            .for_each(|entry| entry.texture = first_document_texture.clone());
+
+        let _expected = crate::item_identity::expect_mismatch();
+        assert!(
+            app.resolve_fs_display_tex(idx, true).is_none(),
+            "a texture uploaded for the previous document must not be shown as this one"
+        );
+        let reported = app.display_identity_error.borrow().clone();
+        let reported = reported.expect("the mismatch must be reported, not silently swallowed");
+        assert!(
+            reported.contains("was made for item_id="),
+            "the report must name what the texture actually is: {reported}"
+        );
+    }
+
     /// フォルダ横断 nav lock は raw / thumbnail の到着だけでは解除しない。
     /// カラー化対象で final pipeline を使う表示では、complete composite が表示可能に
     /// なって初めて旧ページ holdover を解放する。

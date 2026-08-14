@@ -8825,11 +8825,23 @@ pub struct App {
     /// holds no per-viewer state, so sharing it lets the same page keep one id across every
     /// viewer context.
     pub(crate) item_id_interner: crate::item_identity::ItemIdInterner,
+    /// Which item each display texture was made to show. See
+    /// [`crate::item_identity::TextureIdentityLedger`].
+    ///
+    /// Shared across viewers for the same reason the interner is: a texture is one upload of one
+    /// page, and what it shows does not change with which window is looking at it.
+    ///
+    /// `RefCell` because the resolver that learns and checks identity is the read-only path every
+    /// display texture already passes through. Making it take `&mut self` would push the check out
+    /// to its callers, which is exactly the arrangement that let stores diverge in the first place.
+    pub(crate) texture_identity: std::cell::RefCell<crate::item_identity::TextureIdentityLedger>,
     /// Set once when a display cache is found holding another page's entry. App-wide on
     /// purpose: it reports that an invalidation was missed, which is not a property of one
     /// viewer, and it is never cleared automatically - recovery is not known to be safe, so the
     /// viewer tells the user to restart rather than guessing.
-    pub(crate) display_identity_error: Option<String>,
+    ///
+    /// `RefCell` for the same reason as the ledger above.
+    pub(crate) display_identity_error: std::cell::RefCell<Option<String>>,
     pub(crate) thumbnails: Vec<ThumbnailState>,
     pub(crate) selected: Option<usize>,
     /// Shift+クリックの起点。index と items 世代を一体で保持し、別一覧の同じ index を
@@ -12511,7 +12523,8 @@ impl App {
             items: Vec::new(),
             item_ids: Vec::new(),
             item_id_interner: crate::item_identity::ItemIdInterner::default(),
-            display_identity_error: None,
+            texture_identity: std::cell::RefCell::default(),
+            display_identity_error: std::cell::RefCell::new(None),
             thumbnails: Vec::new(),
             selected: None,
             grid_click_selection_anchor: None,
@@ -13755,15 +13768,87 @@ impl App {
     /// invalidation surfaces during development as a failing assertion, and in a release build as
     /// something the user can act on, instead of as a picture that is quietly the wrong one.
     pub(crate) fn verify_display_identity(&mut self, idx: usize) {
-        if self.display_identity_error.is_some() {
-            return;
-        }
         let Some(detail) = self.stale_display_entry_at(idx) else {
             return;
         };
+        self.report_display_identity_mismatch(detail);
+    }
+
+    /// Is this texture allowed to stand for the page at `idx`?
+    ///
+    /// The one gate every display texture passes through. Each cache below decides on its own
+    /// whether its entry is still valid, and each one has to be taught identity separately; this
+    /// asks the texture instead, which no cache can talk out of what it is.
+    ///
+    /// A texture nobody has seen before is bound to the page it is being shown as and allowed
+    /// through, so a store that has not been taught identity yet behaves exactly as it did. Only a
+    /// texture already on the books as another page is refused.
+    pub(crate) fn display_texture_matches_page(
+        &self,
+        texture: &egui::TextureHandle,
+        idx: usize,
+    ) -> bool {
+        let item = self.item_id(idx);
+        if item.is_none() {
+            return true;
+        }
+        let mut ledger = self.texture_identity.borrow_mut();
+        if ledger.agrees(texture.id(), item) {
+            ledger.bind(texture.id(), item);
+            return true;
+        }
+        let bound = ledger.get(texture.id());
+        drop(ledger);
+        self.report_display_identity_mismatch(format!(
+            "texture {:?} was made for item_id={} but is being shown as idx={idx} item_id={item} \
+             (items_generation={}, key={:?})",
+            texture.id(),
+            bound.unwrap_or(crate::item_identity::ItemId::NONE),
+            self.items_generation,
+            self.perf_item_key(idx),
+        ));
+        false
+    }
+
+    /// Say what a texture was made to show, before anything has had a chance to guess.
+    ///
+    /// Worth doing wherever the producer knows: the resolver learns identity on first sight, which
+    /// is enough for a texture that outlives its page, but not for one uploaded *after* the switch
+    /// from pixels belonging to the page before it. There the first sighting is already wrong, and
+    /// only the producer still knows what it worked on.
+    pub(crate) fn bind_display_texture_identity(
+        &self,
+        texture: &egui::TextureHandle,
+        item: crate::item_identity::ItemId,
+    ) {
+        self.texture_identity.borrow_mut().bind(texture.id(), item);
+    }
+
+    /// Record a mismatch once, loudly.
+    ///
+    /// Deliberately not a silent skip: the caches already skip. This exists so a missed
+    /// invalidation surfaces during development as a failing assertion, and in a release build as
+    /// something the user can act on, instead of as a picture that is quietly the wrong one.
+    fn report_display_identity_mismatch(&self, detail: String) {
+        {
+            let mut slot = self.display_identity_error.borrow_mut();
+            if slot.is_some() {
+                return;
+            }
+            *slot = Some(detail.clone());
+        }
         crate::logger::log(format!("[display-identity] {detail}"));
-        debug_assert!(false, "stale display cache entry: {detail}");
-        self.display_identity_error = Some(detail);
+        crate::perf::event(
+            "fs",
+            "display_identity_mismatch",
+            None,
+            self.input_seq,
+            &[("detail", serde_json::Value::from(detail.as_str()))],
+        );
+        debug_assert!(
+            crate::item_identity::mismatch_is_expected(),
+            "stale display cache entry: {detail}"
+        );
     }
 
     /// What the item at `idx` *is*, as opposed to where it sits.
@@ -13771,6 +13856,19 @@ impl App {
     /// Returns [`ItemId::NONE`] past the end of the list, which never compares equal to a real id -
     /// so a key built for a page that has gone away fails the identity check instead of matching
     /// whatever moved into its place. See [`crate::item_identity`].
+    /// Give every item in the current list its content identity.
+    ///
+    /// Kept next to the list assignment it belongs to: `item_ids` is replaced with `items` and
+    /// swapped with it, so it can never describe a list that is no longer here. Interning here
+    /// keeps every later comparison a single integer.
+    pub(crate) fn reintern_item_ids(&mut self) {
+        self.item_ids = self
+            .items
+            .iter()
+            .map(|item| self.item_id_interner.intern(&item.perf_key()))
+            .collect();
+    }
+
     pub(crate) fn item_id(&self, idx: usize) -> crate::item_identity::ItemId {
         self.item_ids
             .get(idx)
@@ -23372,13 +23470,7 @@ impl App {
         debug_assert_eq!(items.len(), image_metas.len());
         self.persist_pending_view_trim_state();
         self.items = items;
-        // Interning here keeps every later comparison a single integer, and ties identity to the
-        // list it was built for: `item_ids` is replaced with `items` and swapped with it.
-        self.item_ids = self
-            .items
-            .iter()
-            .map(|item| self.item_id_interner.intern(&item.perf_key()))
-            .collect();
+        self.reintern_item_ids();
         self.image_metas = image_metas;
         self.thumb_edit_preview_keys.clear();
         self.idle_upgrade_cache_bypass_ineligible.clear();
@@ -54069,6 +54161,7 @@ impl App {
                 self.last_edit_materialize_upload_frame = self.frame_counter;
                 let upload_t0 = std::time::Instant::now();
                 let texture = upload_edit_result_texture(ctx, &key, &pixels);
+                self.bind_display_texture_identity(&texture, key.item_id);
                 emit_edit_materialize_ms(
                     "upload",
                     "edit_result",
@@ -54088,6 +54181,7 @@ impl App {
             self.last_edit_materialize_upload_frame = self.frame_counter;
             let upload_t0 = std::time::Instant::now();
             let texture = upload_edit_result_texture(ctx, &key, &pixels);
+            self.bind_display_texture_identity(&texture, key.item_id);
             emit_edit_materialize_ms(
                 "upload",
                 "edit_result",
@@ -55676,6 +55770,12 @@ impl App {
                     let load_texture_ms = load_texture_started.elapsed().as_secs_f64() * 1000.0;
                     let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
                     let [width, height] = pixels.size;
+                    // Identity comes from the key the work was *requested* with, not from whatever
+                    // sits at this index now. A composite that started under one document and
+                    // landed after the switch to the next is a fresh upload, so first sight at the
+                    // resolver would learn the wrong answer from it; binding here means it carries
+                    // the page it was actually made from wherever it is later copied to.
+                    self.bind_display_texture_identity(&texture, key.edit_key.item_id);
                     self.final_composite_cache.insert(
                         key,
                         FinalCompositeEntry {
