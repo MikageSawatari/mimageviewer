@@ -22079,6 +22079,7 @@ mod pipeline_cache_refactor_tests {
         EditResultKey {
             // The list the fixture belongs to, so entries it installs are visible to the display
             // getters. A test that wants a stale entry sets an older generation explicitly.
+            item_id: app.item_id(idx),
             items_generation: app.items_generation,
             idx,
             source_gen: app.input_generation.get(&idx).copied().unwrap_or(0),
@@ -22157,6 +22158,7 @@ mod pipeline_cache_refactor_tests {
         let base = std::time::Instant::now();
         let key = FinalCompositeKey {
             edit_key: EditResultKey {
+                item_id: crate::item_identity::ItemId::NONE,
                 items_generation: 0,
                 idx: 3,
                 source_gen: 4,
@@ -22170,6 +22172,7 @@ mod pipeline_cache_refactor_tests {
         };
         let other_key = FinalCompositeKey {
             edit_key: EditResultKey {
+                item_id: crate::item_identity::ItemId::NONE,
                 items_generation: 0,
                 idx: 11,
                 ..key.edit_key
@@ -25561,6 +25564,7 @@ mod pipeline_cache_refactor_tests {
         // 1 件 live で挿入 → true
         let key = FinalAiKey {
             edit_key: EditResultKey {
+                item_id: crate::item_identity::ItemId::NONE,
                 items_generation: 0,
                 idx: 0,
                 source_gen: 0,
@@ -25597,6 +25601,7 @@ mod pipeline_cache_refactor_tests {
         // live な pending を仕込む → prefetch_final_ai は即 return
         let key = FinalAiKey {
             edit_key: EditResultKey {
+                item_id: crate::item_identity::ItemId::NONE,
                 items_generation: 0,
                 idx,
                 source_gen: 0,
@@ -25632,6 +25637,7 @@ mod pipeline_cache_refactor_tests {
 
         let mk_key = |idx: usize| FinalAiKey {
             edit_key: EditResultKey {
+                item_id: crate::item_identity::ItemId::NONE,
                 items_generation: 0,
                 idx,
                 source_gen: 0,
@@ -25713,6 +25719,7 @@ mod pipeline_cache_refactor_tests {
         let idx = push_pdf_page(&mut app, r"C:\books\scan.pdf", 0);
         let key = FinalAiKey {
             edit_key: EditResultKey {
+                item_id: crate::item_identity::ItemId::NONE,
                 items_generation: 0,
                 idx,
                 source_gen: 0,
@@ -25765,6 +25772,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_rx = Some(rx);
         let key = FinalAiKey {
             edit_key: EditResultKey {
+                item_id: crate::item_identity::ItemId::NONE,
                 items_generation: 0,
                 idx: 0,
                 source_gen: 0,
@@ -25818,6 +25826,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_rx = Some(rx);
         let key = FinalAiKey {
             edit_key: EditResultKey {
+                item_id: crate::item_identity::ItemId::NONE,
                 items_generation: 0,
                 idx: 0,
                 source_gen: 0,
@@ -25879,6 +25888,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_rx = Some(rx);
         let key = FinalAiKey {
             edit_key: EditResultKey {
+                item_id: crate::item_identity::ItemId::NONE,
                 items_generation: 0,
                 idx: 0,
                 source_gen: 0,
@@ -26642,6 +26652,7 @@ mod pipeline_cache_refactor_tests {
 
         let mk_key = |idx: usize| FinalAiKey {
             edit_key: EditResultKey {
+                item_id: crate::item_identity::ItemId::NONE,
                 items_generation: 0,
                 idx,
                 source_gen: 0,
@@ -26767,6 +26778,7 @@ mod pipeline_cache_refactor_tests {
 
         let key = FinalAiKey {
             edit_key: EditResultKey {
+                item_id: crate::item_identity::ItemId::NONE,
                 items_generation: 0,
                 idx: 0,
                 source_gen: 0,
@@ -26815,6 +26827,7 @@ mod pipeline_cache_refactor_tests {
         app.items = vec![GridItem::Image(PathBuf::from(r"C:\imgs\00.png"))];
 
         let edit_key = EditResultKey {
+            item_id: crate::item_identity::ItemId::NONE,
             items_generation: 0,
             idx: 0,
             source_gen: 0,
@@ -27739,6 +27752,7 @@ mod pipeline_cache_refactor_tests {
         // 隣接ページの prefetch pending を仕込む (= AI worker 進行中の状態)
         let prefetch_key = FinalAiKey {
             edit_key: EditResultKey {
+                item_id: crate::item_identity::ItemId::NONE,
                 items_generation: 0,
                 idx: prefetch_idx,
                 source_gen: 0,
@@ -27756,6 +27770,7 @@ mod pipeline_cache_refactor_tests {
         // display 経路: 同じ idx (= display_idx) の古い key を 1 件追加
         let display_old_key = FinalAiKey {
             edit_key: EditResultKey {
+                item_id: crate::item_identity::ItemId::NONE,
                 items_generation: 0,
                 idx: display_idx,
                 source_gen: 0,
@@ -27832,6 +27847,7 @@ mod pipeline_cache_refactor_tests {
         // 現在ページの final_ai_pending を仕込む
         let key = FinalAiKey {
             edit_key: EditResultKey {
+                item_id: crate::item_identity::ItemId::NONE,
                 items_generation: 0,
                 idx: idx_cur,
                 source_gen: 0,
@@ -27862,6 +27878,7 @@ mod pipeline_cache_refactor_tests {
         let idx = push_image(&mut app, "C:/pics/prefetch-proceed.jpg");
         let key = FinalAiKey {
             edit_key: EditResultKey {
+                item_id: crate::item_identity::ItemId::NONE,
                 items_generation: 0,
                 idx,
                 source_gen: 0,
@@ -28073,6 +28090,7 @@ mod pipeline_display_edit_split_tests {
         color: egui::Color32,
     ) {
         let edit_key = EditResultKey {
+            item_id: crate::item_identity::ItemId::NONE,
             items_generation: 0,
             idx,
             source_gen: 0,
@@ -38865,6 +38883,7 @@ mod still_window_mode_key_tests {
         insert_static_fs_entry(&mut app, &ctx, idx, "pause_cancel_ai_page");
         let key = FinalAiKey {
             edit_key: EditResultKey {
+                item_id: crate::item_identity::ItemId::NONE,
                 items_generation: 0,
                 idx,
                 source_gen: 0,
@@ -39054,6 +39073,7 @@ mod still_window_mode_key_tests {
         app.final_ai_rx = Some(rx);
         let key = FinalAiKey {
             edit_key: EditResultKey {
+                item_id: crate::item_identity::ItemId::NONE,
                 items_generation: 0,
                 idx: 0,
                 source_gen: 0,

@@ -2056,6 +2056,7 @@ struct ViewerContextBundle {
     stack_script_error: Option<String>,
     stack_toggle_select_path: Option<PathBuf>,
     items: Vec<GridItem>,
+    item_ids: Vec<crate::item_identity::ItemId>,
     items_generation: u64,
     visible_indices: Vec<usize>,
     /// `items` と同じ添字の正規化済み basename と、その worker lifecycle。
@@ -2388,6 +2389,7 @@ impl ViewerContextBundle {
             stack_script_error: None,
             stack_toggle_select_path: None,
             items: Vec::new(),
+            item_ids: Vec::new(),
             items_generation: 0,
             visible_indices: Vec::new(),
             facet_name_cache: Vec::new(),
@@ -5558,6 +5560,15 @@ pub(crate) struct EraseResultCacheEntry {
 /// erase / local-adjust / conceal を再計算しないための境界になる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct EditResultKey {
+    /// What the item is, independent of where it sits.
+    ///
+    /// The generation below catches a list being replaced. This catches the cases it cannot: a
+    /// generation that did not change when it should have, and an asynchronous result that
+    /// adopted the current key on completion rather than carrying the one it started with. The
+    /// second is not hypothetical - an AI upscale begun under one document landed under the next
+    /// one and was presented as its first page. Comparing it costs one `u64`, which is why it is
+    /// applied everywhere rather than only where a failure has already been proven.
+    pub(crate) item_id: crate::item_identity::ItemId,
     /// Which list `idx` refers to.
     ///
     /// An index means nothing on its own: move to another PDF and index 0 is a different page.
@@ -8805,6 +8816,20 @@ pub struct App {
     pub(crate) normal_folder_omitted_entries: Option<NormalFolderOmittedEntries>,
     pub(crate) navigation_scope: ViewerNavigationScope,
     pub(crate) items: Vec<GridItem>,
+    /// Content identity per item, parallel to `items`.
+    ///
+    /// Read through `App::item_id`; it is kept beside the list so it is replaced and swapped
+    /// with it and cannot describe a list that is no longer here.
+    pub(crate) item_ids: Vec<crate::item_identity::ItemId>,
+    /// Hands out the ids above. Process-wide on purpose: it maps content to identity and
+    /// holds no per-viewer state, so sharing it lets the same page keep one id across every
+    /// viewer context.
+    pub(crate) item_id_interner: crate::item_identity::ItemIdInterner,
+    /// Set once when a display cache is found holding another page's entry. App-wide on
+    /// purpose: it reports that an invalidation was missed, which is not a property of one
+    /// viewer, and it is never cleared automatically - recovery is not known to be safe, so the
+    /// viewer tells the user to restart rather than guessing.
+    pub(crate) display_identity_error: Option<String>,
     pub(crate) thumbnails: Vec<ThumbnailState>,
     pub(crate) selected: Option<usize>,
     /// Shift+クリックの起点。index と items 世代を一体で保持し、別一覧の同じ index を
@@ -12484,6 +12509,9 @@ impl App {
             normal_folder_omitted_entries: None,
             navigation_scope: ViewerNavigationScope::Main,
             items: Vec::new(),
+            item_ids: Vec::new(),
+            item_id_interner: crate::item_identity::ItemIdInterner::default(),
+            display_identity_error: None,
             thumbnails: Vec::new(),
             selected: None,
             grid_click_selection_anchor: None,
@@ -13682,6 +13710,74 @@ impl App {
         self.items.get(idx).map(|g| g.perf_key())
     }
 
+    /// Does this cache key describe the page currently at `idx`?
+    ///
+    /// One predicate rather than the comparison written out at each lookup: every getter that
+    /// reached the screen had its own copy of "an entry at this index", and that is how a
+    /// composite belonging to another document came to be presented. Position, list and content
+    /// must all agree.
+    pub(crate) fn edit_key_describes_current_page(&self, key: &EditResultKey, idx: usize) -> bool {
+        key.idx == idx
+            && key.items_generation == self.items_generation
+            && key.item_id == self.item_id(idx)
+    }
+
+    /// Is there an entry sitting at `idx` that belongs to something else?
+    ///
+    /// The lookups skip such entries, so on their own they are safe - the page falls back to a
+    /// thumbnail or a loading state. But an entry that survived a list change means an
+    /// invalidation was missed somewhere, and the next cache to be given identity may not have a
+    /// skip to fall back on. Showing the wrong picture is the failure users notice least and
+    /// trust least, so this is reported rather than quietly tolerated.
+    fn stale_display_entry_at(&self, idx: usize) -> Option<String> {
+        let current = self.item_id(idx);
+        let stale = self
+            .final_composite_cache
+            .iter()
+            .map(|(key, _)| ("final_composite", key.edit_key))
+            .chain(
+                self.edit_result_cache
+                    .iter()
+                    .map(|(key, _)| ("edit_result", *key)),
+            )
+            .find(|(_, key)| key.idx == idx && !self.edit_key_describes_current_page(key, idx))?;
+        let (store, key) = stale;
+        Some(format!(
+            "{store} holds idx={idx} for item_id={} items_generation={} while the page there is \
+             item_id={current} items_generation={}",
+            key.item_id, key.items_generation, self.items_generation
+        ))
+    }
+
+    /// Check the page about to be displayed, and remember a mismatch so the viewer can say so.
+    ///
+    /// Deliberately not a silent skip: the caches below already skip. This exists so a missed
+    /// invalidation surfaces during development as a failing assertion, and in a release build as
+    /// something the user can act on, instead of as a picture that is quietly the wrong one.
+    pub(crate) fn verify_display_identity(&mut self, idx: usize) {
+        if self.display_identity_error.is_some() {
+            return;
+        }
+        let Some(detail) = self.stale_display_entry_at(idx) else {
+            return;
+        };
+        crate::logger::log(format!("[display-identity] {detail}"));
+        debug_assert!(false, "stale display cache entry: {detail}");
+        self.display_identity_error = Some(detail);
+    }
+
+    /// What the item at `idx` *is*, as opposed to where it sits.
+    ///
+    /// Returns [`ItemId::NONE`] past the end of the list, which never compares equal to a real id -
+    /// so a key built for a page that has gone away fails the identity check instead of matching
+    /// whatever moved into its place. See [`crate::item_identity`].
+    pub(crate) fn item_id(&self, idx: usize) -> crate::item_identity::ItemId {
+        self.item_ids
+            .get(idx)
+            .copied()
+            .unwrap_or(crate::item_identity::ItemId::NONE)
+    }
+
     /// 実描画で使うサムネイル比率。
     ///
     /// - Manual モード (`settings.thumb_aspect_auto = false`):
@@ -14761,6 +14857,7 @@ impl App {
             stack_script_error,
             stack_toggle_select_path,
             items,
+            item_ids,
             items_generation,
             visible_indices,
             facet_name_cache,
@@ -14986,6 +15083,7 @@ impl App {
         swap_field!(stack_script_error);
         swap_field!(stack_toggle_select_path);
         swap_field!(items);
+        swap_field!(item_ids);
         swap_field!(items_generation);
         swap_field!(visible_indices);
         swap_field!(facet_name_cache);
@@ -23274,6 +23372,13 @@ impl App {
         debug_assert_eq!(items.len(), image_metas.len());
         self.persist_pending_view_trim_state();
         self.items = items;
+        // Interning here keeps every later comparison a single integer, and ties identity to the
+        // list it was built for: `item_ids` is replaced with `items` and swapped with it.
+        self.item_ids = self
+            .items
+            .iter()
+            .map(|item| self.item_id_interner.intern(&item.perf_key()))
+            .collect();
         self.image_metas = image_metas;
         self.thumb_edit_preview_keys.clear();
         self.idle_upgrade_cache_bypass_ineligible.clear();
@@ -39551,6 +39656,7 @@ impl App {
             stack_script_error,
             stack_toggle_select_path,
             items,
+            item_ids,
             items_generation,
             visible_indices,
             facet_name_cache,
@@ -39777,6 +39883,7 @@ impl App {
             stack_script_error,
             stack_toggle_select_path,
             items,
+            item_ids,
             items_generation,
             visible_indices,
             facet_name_cache,
@@ -53929,6 +54036,7 @@ impl App {
 
     pub(crate) fn current_edit_result_key(&self, idx: usize) -> EditResultKey {
         EditResultKey {
+            item_id: self.item_id(idx),
             items_generation: self.items_generation,
             idx,
             source_gen: self.input_generation.get(&idx).copied().unwrap_or(0),
@@ -54108,9 +54216,14 @@ impl App {
         // Any resident edit generation for this page is acceptable - that is what lets a slider
         // drag keep showing the last complete result - but it has to belong to the list on
         // screen. Scanning by index alone crosses documents.
+        let item_id = self.item_id(idx);
         self.edit_result_cache
             .iter()
-            .find(|(key, _)| key.idx == idx && key.items_generation == self.items_generation)
+            .find(|(key, _)| {
+                key.idx == idx
+                    && key.items_generation == self.items_generation
+                    && key.item_id == item_id
+            })
             .and_then(|(_, entry)| entry.texture.clone())
     }
 
@@ -54784,6 +54897,9 @@ impl App {
 
     /// 同じ typed state を入口ガードにも使い、必要なときだけ producer を起動する。
     pub(crate) fn ensure_fs_page_load(&mut self, idx: usize) -> FsPageLoadState {
+        // Every page that is about to be shown passes through here, which makes it the one place
+        // that sees each page before the user does.
+        self.verify_display_identity(idx);
         let state = self.fs_page_load_state(idx);
         if state.needs_load_request() {
             self.start_fs_load(idx);
@@ -56197,9 +56313,7 @@ impl App {
         // by another document at this index wins over a correct miss below it.
         self.final_composite_cache
             .iter()
-            .find(|(key, _)| {
-                key.edit_key.idx == idx && key.edit_key.items_generation == self.items_generation
-            })
+            .find(|(key, _)| self.edit_key_describes_current_page(&key.edit_key, idx))
             .map(|(_, entry)| entry.texture.clone())
     }
 
@@ -56209,8 +56323,7 @@ impl App {
         texture: &egui::TextureHandle,
     ) -> bool {
         self.final_composite_cache.iter().any(|(key, entry)| {
-            key.edit_key.idx == idx
-                && key.edit_key.items_generation == self.items_generation
+            self.edit_key_describes_current_page(&key.edit_key, idx)
                 && entry.texture.id() == texture.id()
                 && entry.complete
         })
@@ -56218,9 +56331,7 @@ impl App {
 
     pub(crate) fn current_final_composite_is_complete(&self, idx: usize) -> bool {
         self.final_composite_cache.iter().any(|(key, entry)| {
-            key.edit_key.idx == idx
-                && key.edit_key.items_generation == self.items_generation
-                && entry.complete
+            self.edit_key_describes_current_page(&key.edit_key, idx) && entry.complete
         })
     }
 

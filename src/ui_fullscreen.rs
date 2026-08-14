@@ -14212,6 +14212,13 @@ impl App {
     /// steady state (fs_cache or thumbnail hit) では空文字列を返し、呼び出し先の
     /// `draw_centered_elided_label` は空なら描画をスキップする。
     fn location_display_for_loading(&self, idx: usize) -> String {
+        // A cache was found holding another page's entry. The lookups skip it, so what would
+        // otherwise appear is a page stuck loading with no explanation. Say what happened instead:
+        // recovery is not known to be safe, so the honest instruction is to restart rather than to
+        // wait for something that may never arrive.
+        if self.display_identity_error.is_some() {
+            return "読み込みエラーです。アプリを再起動してください".to_owned();
+        }
         let has_display_tex = matches!(
             self.fs_cache.get(&idx),
             Some(FsCacheEntry::Static { .. })

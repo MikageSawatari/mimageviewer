@@ -104,6 +104,7 @@ pub mod indexer_supervisor;
 pub mod ingest_text;
 pub mod ingest_worker;
 pub mod io_semaphore;
+pub(crate) mod item_identity;
 mod items_generation_cache;
 #[cfg(windows)]
 pub mod key_debug;
