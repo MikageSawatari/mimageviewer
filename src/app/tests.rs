@@ -26003,6 +26003,64 @@ mod pipeline_cache_refactor_tests {
         key
     }
 
+    /// The reported failure, reproduced from the log that recorded it.
+    ///
+    /// An AI upscale of `_001.pdf` page 0 is deliberately harvested after the reader has moved on
+    /// to `_003.pdf`. Both documents put their first page at index 0, so filing the result by
+    /// index put one document's page under the other's key - and the first page of `_003.pdf`
+    /// then showed `_001.pdf` until the reader turned a page and came back.
+    ///
+    /// Storing it is the right thing to do; the work is real and expensive. What must not happen
+    /// is storing it as a page it was never computed from.
+    #[test]
+    fn an_upscale_that_lands_after_a_document_switch_is_filed_under_the_page_it_came_from() {
+        let mut app = setup_app();
+        enable_pdf_final_ai_params(&mut app);
+
+        let first_document = push_pdf_page(&mut app, r"D:\scan30103_001.pdf", 0);
+        let edit_size = [828, 1190];
+        let key = pdf_final_ai_key(&app, first_document, edit_size);
+        let retained_key = app
+            .retained_final_ai_key_for(first_document, key, edit_size)
+            .expect("PDF retained final key");
+        let upscaled = Arc::new(egui::ColorImage::new(
+            [16, 16],
+            vec![egui::Color32::from_rgb(11, 22, 33); 256],
+        ));
+
+        // The reader moves on. Another document takes over index 0, exactly as it did in the log.
+        app.items[first_document] = GridItem::PdfPage {
+            pdf_path: PathBuf::from(r"D:\scan30103_003.pdf"),
+            page_num: 0,
+            content_type: None,
+        };
+        app.items_generation += 1;
+
+        assert!(
+            app.insert_retained_pdf_final_ai(first_document, retained_key.clone(), upscaled),
+            "the work is real and must still be kept"
+        );
+
+        let landed_on = app
+            .retained_pdf_page_key_for(first_document)
+            .expect("index 0 is a PDF page in both documents");
+        assert_ne!(
+            landed_on.item_key, retained_key.item_key,
+            "fixture check: the two documents must really share an index"
+        );
+        assert!(
+            !app.retained_pdf_page_cache.contains_key(&landed_on),
+            "the page now at index 0 must not be given another document's upscale"
+        );
+        assert!(
+            app.retained_pdf_page_cache
+                .contains_key(&crate::app::RetainedPdfPageKey {
+                    item_key: retained_key.item_key.clone(),
+                }),
+            "it belongs to the page it was computed for"
+        );
+    }
+
     #[test]
     fn fs_page_load_state_prevents_same_idx_same_params_reentry() {
         let ctx = egui::Context::default();
@@ -26696,9 +26754,12 @@ mod pipeline_cache_refactor_tests {
         app.settings.retained_final_ai_cache_max_entries = 2;
         app.settings.retained_final_ai_cache_max_mib = 1;
 
+        // Identities come from the list, as they do in production: a hand-written `NONE`
+        // is now refused as a result that no longer describes the page at that index.
+        let item_ids: Vec<_> = (0..app.items.len()).map(|idx| app.item_id(idx)).collect();
         let mk_key = |idx: usize| FinalAiKey {
             edit_key: EditResultKey {
-                item_id: crate::item_identity::ItemId::NONE,
+                item_id: item_ids[idx],
                 items_generation: 0,
                 idx,
                 source_gen: 0,
@@ -26824,7 +26885,7 @@ mod pipeline_cache_refactor_tests {
 
         let key = FinalAiKey {
             edit_key: EditResultKey {
-                item_id: crate::item_identity::ItemId::NONE,
+                item_id: app.item_id(0),
                 items_generation: 0,
                 idx: 0,
                 source_gen: 0,

@@ -54792,9 +54792,22 @@ impl App {
         pixels: Arc<egui::ColorImage>,
         used_upscale: bool,
     ) -> bool {
-        let Some(key) = self.retained_pdf_page_key_for(idx) else {
-            return false;
+        // Filed under the page it was computed for, which travels with the job, rather than under
+        // whatever `idx` means by the time it lands. An upscale outlives the document it started
+        // in - it is deliberately harvested after cancellation - and deriving the location from
+        // the index put one document's page under another's key. `idx` is kept for the log only.
+        let key = RetainedPdfPageKey {
+            item_key: retained_key.item_key.clone(),
         };
+        if let Some(current) = self.retained_pdf_page_key_for(idx)
+            && current != key
+        {
+            crate::logger::log(format!(
+                "[PDF] Retained page store landed after a move idx={idx} computed_for={} \
+                 index_now_means={} - stored under computed_for",
+                key.item_key, current.item_key,
+            ));
+        }
         let Some((max_entries, max_bytes)) = self.retained_final_ai_budget() else {
             self.clear_retained_pdf_page_cache("retained_pdf_page_budget_disabled");
             return false;
@@ -55072,6 +55085,25 @@ impl App {
         pixels: Arc<egui::ColorImage>,
         used_upscale: bool,
     ) -> bool {
+        // This overload has to reconstruct the item key from the index, which is only sound while
+        // the index still means what it did when the work was requested. It does not once a
+        // document switch has happened underneath an in-flight upscale - and the result is then
+        // filed as a page it was never computed from. Refuse rather than guess; the sibling
+        // overload, which carries its key from the request, is the one that keeps such results.
+        if key.edit_key.item_id != self.item_id(idx) {
+            crate::logger::log(format!(
+                "[AI] Retained final AI skip idx={idx} source={}x{} output={}x{} \
+                 bytes={} reason=index_no_longer_means_the_requested_page requested={} now={}",
+                edit_size[0],
+                edit_size[1],
+                pixels.size[0],
+                pixels.size[1],
+                Self::retained_final_ai_image_bytes(&pixels),
+                key.edit_key.item_id,
+                self.item_id(idx),
+            ));
+            return false;
+        }
         let Some(retained_key) = self.retained_final_ai_key_for(idx, key, edit_size) else {
             crate::logger::log(format!(
                 "[AI] Retained final AI skip idx={idx} source={}x{} output={}x{} \
