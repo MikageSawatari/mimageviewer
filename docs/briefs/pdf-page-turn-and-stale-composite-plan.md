@@ -598,3 +598,51 @@ Codex 第 2 ラウンドの残り 2 問はクリーン: interner の再入 borro
 - 実機再現で `[display-identity]` が出るか確認 → 出れば**どのストアか**が判る
 - `item_id()` の String 確保は毎フレーム 100 回程度。Codex 見積りでも memo 不要だが、
   リリース前 perf smoke で確認する
+
+## ⑥ 真因確定 (2026-08-14 夜) — ログが即答した
+
+### ログの決定的な行
+
+`mimageviewer.log`:
+
+```
+1192 [5.514s] store  _003.pdf::page_0 kind=raster   raster=825x1189 source=825x1189   ← 正しい
+1225 [5.725s] store  _003.pdf::page_0 kind=final_ai source=828x1190 output=3312x4760  ← ★ 別文書
+1228 [5.725s] hit    _003.pdf::page_0 kind=final_ai source=828x1190 output=3312x4760
+1323 [6.495s] store  _003.pdf::page_0 kind=final_ai source=825x1189 output=3300x4756  ← 正解が 0.8 秒遅れて到着
+```
+
+`perf_events.jsonl`: 画面に 25 秒居座った `Managed(268)` は **3312×4760**。
+これは **828×1190 の 4 倍**。`_003.pdf#0` は **825×1189** (4 倍 = 3300×4756)。
+828 幅のページを持つのは `20230103_001.pdf` **だけ**。
+
+### 真因
+
+[src/app.rs](../../src/app.rs) の AI 完了ハンドラが、保存先を **`key.edit_key.idx`** から求めていた。
+
+- AI アップスケールは移動後も **意図的に回収する** (`retained_final_ai_orphans`)。高価な計算を捨てないため
+- しかし保存キーは「その idx が **今** 何を指すか」で決まる
+- PDF を渡り歩くと idx 0 の意味が変わる → `_001.pdf` ページ 0 の結果が `_003.pdf::page_0` として保存
+- 直後の合成がそれを読み、`Managed(268)` になった
+- 0.8 秒後に正しい結果が来て entry は置き換わったが、**合成は作り直されない** →
+  ページを送って戻ると直る (= 利用者の観察と一致)
+
+### 修正
+
+- ジョブは `retained_key` (要求時の素性) を運んでいるので、**保存先をそれから決める**
+- 兄弟経路は `retained_key` を持たず idx から再構成するしかない →
+  `key.edit_key.item_id != self.item_id(idx)` なら**保存を拒否**する
+- 回帰テスト `an_upscale_that_lands_after_a_document_switch_is_filed_under_the_page_it_came_from`
+  (修正を戻すと落ちることを確認済み)
+
+### テクスチャ台帳が捕まえられなかった理由
+
+**テクスチャが作られる前に、既にピクセルが違っていた。** その後のアップロードは
+正しいラベルで行われている。台帳は「素性の食い違い」を見るので、
+「正しいラベルの中身違い」は原理的に守備範囲外。台帳は別クラスの再発防止として残す。
+
+### 反省
+
+3 回連続で「どのキャッシュが古いか」を推測して外した。ログ 2 本
+(`[PDF] Retained page store` の `source=` と perf の `texture_w/h`) を突き合わせれば
+**1 回で確定できた**。[[feedback_instrument_silent_paths_first]] の再確認。
