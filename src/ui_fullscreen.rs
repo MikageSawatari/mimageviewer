@@ -14657,6 +14657,29 @@ impl App {
         (pages.len() == expected.len()).then_some(pages)
     }
 
+    /// Which viewport a display-unit trace belongs to.
+    ///
+    /// One owner for the choice rather than the same three lines at each probe: a captured
+    /// display unit was drawn in the calling viewport, and so was a still image embedded in the
+    /// window alongside a native video window. That second arrangement only exists on Windows -
+    /// the native presenter is a Windows HWND - so elsewhere the question does not arise and the
+    /// viewer's own viewport is the answer.
+    fn fs_trace_viewport(
+        &self,
+        ctx: &egui::Context,
+        captured_display_unit: bool,
+    ) -> egui::ViewportId {
+        #[cfg(windows)]
+        let embedded = self.fullscreen_embedded_still_active();
+        #[cfg(not(windows))]
+        let embedded = false;
+        if captured_display_unit || embedded {
+            ctx.viewport_id()
+        } else {
+            self.fullscreen_viewport_id()
+        }
+    }
+
     /// Record the resources selected by the completed display-unit draw, after spread
     /// resolution and holdover replacement. Dedup compares each page only with the
     /// immediately preceding display unit's `(idx, texture)` pairs.
@@ -14675,11 +14698,7 @@ impl App {
             .fs_display_unit_trace_pages(fs_idx, spread_pair, sources)
             .unwrap_or_default();
         let captured_display_unit = trace_pages.iter().any(|page| page.source == "holdover");
-        let viewport = if captured_display_unit || self.fullscreen_embedded_still_active() {
-            ctx.viewport_id()
-        } else {
-            self.fullscreen_viewport_id()
-        };
+        let viewport = self.fs_trace_viewport(ctx, captured_display_unit);
         let cache_id = egui::Id::new(("fs_paint_display_unit", viewport));
         let previous = ctx.data(|data| data.get_temp::<FsPaintDisplayUnitSignature>(cache_id));
         let changed_pages = trace_pages
@@ -14917,13 +14936,17 @@ impl App {
         }
         ctx.data_mut(|data| data.insert_temp(cache_id, signature));
 
-        let captured_display_unit = trace_pages.iter().any(|page| page.source == "holdover");
-        let viewport = if captured_display_unit || self.fullscreen_embedded_still_active() {
-            ctx.viewport_id()
-        } else {
-            self.fullscreen_viewport_id()
+        // Scripted input is a Windows-only facility - the synthetic timeline drives real key
+        // state through the Windows input path - so off Windows there is no hold to attribute,
+        // and nothing the viewport would be needed for.
+        #[cfg(windows)]
+        let script_hold_id = {
+            let captured_display_unit = trace_pages.iter().any(|page| page.source == "holdover");
+            let viewport = self.fs_trace_viewport(ctx, captured_display_unit);
+            crate::key_input::synthetic_frame_hold_id(ctx, viewport)
         };
-        let script_hold_id = crate::key_input::synthetic_frame_hold_id(ctx, viewport);
+        #[cfg(not(windows))]
+        let script_hold_id: Option<u64> = None;
 
         for page in trace_pages {
             let held_page = self
