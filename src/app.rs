@@ -2262,6 +2262,7 @@ struct ViewerContextBundle {
     fs_nav_locked_gen: Option<u64>,
     fs_nav_dropped_block_signature: Option<String>,
     fs_nav_dropped_block_count: u32,
+    fs_load_skip_signature: Option<String>,
     fs_holdover_tex: Option<FsHoldover>,
     fs_boundary_hint: Option<crate::ui_fullscreen::FsBoundaryHint>,
     virtual_folder_writeback: Option<VirtualFolderWriteback>,
@@ -2553,6 +2554,7 @@ impl ViewerContextBundle {
             fs_nav_locked_gen: None,
             fs_nav_dropped_block_signature: None,
             fs_nav_dropped_block_count: 0,
+            fs_load_skip_signature: None,
             fs_holdover_tex: None,
             fs_boundary_hint: None,
             virtual_folder_writeback: None,
@@ -11715,6 +11717,9 @@ pub struct App {
     /// one that is briefly busy. See `note_fullscreen_nav_request_dropped`.
     pub(crate) fs_nav_dropped_block_signature: Option<String>,
     pub(crate) fs_nav_dropped_block_count: u32,
+    /// Dedup for `note_fs_page_load_skipped`; belongs to the same viewer context as the
+    /// cache it describes.
+    pub(crate) fs_load_skip_signature: Option<String>,
     /// 旧表示を保持する単一 typed state。folder navigation / final-effect source reload とも
     /// 単ページ / 見開き全体を 1 unit として持ち、variant ごとに解放条件を分離する。
     /// legacy 名は context bundle の機械的な差分を抑えるため維持している。
@@ -13499,6 +13504,7 @@ impl App {
             fs_nav_locked_gen: None,
             fs_nav_dropped_block_signature: None,
             fs_nav_dropped_block_count: 0,
+            fs_load_skip_signature: None,
             fs_holdover_tex: None,
             virtual_folder_writeback: None,
             pdf_prefetch_grace_until: None,
@@ -14911,6 +14917,7 @@ impl App {
             fs_nav_locked_gen,
             fs_nav_dropped_block_signature,
             fs_nav_dropped_block_count,
+            fs_load_skip_signature,
             fs_holdover_tex,
             fs_boundary_hint,
             virtual_folder_writeback,
@@ -15146,6 +15153,7 @@ impl App {
         swap_field!(fs_nav_locked_gen);
         swap_field!(fs_nav_dropped_block_signature);
         swap_field!(fs_nav_dropped_block_count);
+        swap_field!(fs_load_skip_signature);
         swap_field!(fs_holdover_tex);
         swap_field!(fs_boundary_hint);
         swap_field!(virtual_folder_writeback);
@@ -39699,6 +39707,7 @@ impl App {
             fs_nav_locked_gen,
             fs_nav_dropped_block_signature,
             fs_nav_dropped_block_count,
+            fs_load_skip_signature,
             fs_holdover_tex,
             fs_boundary_hint,
             virtual_folder_writeback,
@@ -39859,6 +39868,7 @@ impl App {
             fs_nav_locked_gen,
             fs_nav_dropped_block_signature,
             fs_nav_dropped_block_count,
+            fs_load_skip_signature,
             fs_holdover_tex,
             fs_boundary_hint,
             pdf_password_request,
@@ -54765,8 +54775,43 @@ impl App {
             self.start_fs_load(idx);
             self.fs_page_load_state(idx)
         } else {
+            self.note_fs_page_load_skipped(idx, state);
             state
         }
+    }
+
+    /// Record that the page the user is looking at was considered already loaded.
+    ///
+    /// `fs_page_load_state` answers from `fs_cache` and the retained PDF final-AI store, both of
+    /// which are keyed by `idx` alone; `FsCacheEntry` carries a `load_seq` but no item identity
+    /// and no `items_generation`. So an entry left by a different document under the same index
+    /// reads as "already displayable" and suppresses the load entirely - which is silent, and is
+    /// why a PDF could sit showing the previous document's first page until the user navigated
+    /// away and back. The `load_seq` recorded here is what makes that visible: an entry answering
+    /// for the current page while carrying a sequence from an earlier navigation is stale.
+    ///
+    /// Deduplicated by the whole signature, so a steady state logs once rather than every frame.
+    fn note_fs_page_load_skipped(&mut self, idx: usize, state: FsPageLoadState) {
+        if self.fullscreen_idx != Some(idx) {
+            // Prefetch neighbours skip constantly and legitimately; only the page being waited on
+            // is worth reporting.
+            return;
+        }
+        let entry_load_seq = self.fs_cache.get(&idx).map(FsCacheEntry::load_seq);
+        let signature = format!(
+            "idx={idx} state={state:?} entry_load_seq={entry_load_seq:?} \
+             input_seq={} items_generation={} key={:?}",
+            self.input_seq,
+            self.items_generation,
+            self.perf_item_key(idx)
+        );
+        if self.fs_load_skip_signature.as_deref() == Some(signature.as_str()) {
+            return;
+        }
+        self.fs_load_skip_signature = Some(signature.clone());
+        crate::logger::log(format!(
+            "[fs-load] page on screen considered already loaded, no load issued: {signature}"
+        ));
     }
 
     /// Cancel producers whose outputs cannot be admitted while a physical page-turn

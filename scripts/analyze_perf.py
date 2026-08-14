@@ -2783,6 +2783,53 @@ def cmd_scroll(events: list[dict]) -> None:
         )
 
 
+def cmd_display_integrity(events: list[dict], check: bool) -> int:
+    """Report pages presented from a materialized source that were never decoded.
+
+    A page reaches the screen from a materialized source (`final_composite`, `fs_cache`,
+    `edit_result`) only after it has been produced, which the trace records as `fs/ready` for that
+    key. `holdover` and `thumbnail` are the intended transitional sources and are exempt.
+
+    The state that answers "is this page already loaded?" is keyed by index alone and carries no
+    item identity, so an entry left behind by a different document under the same index suppresses
+    the load and the previous document's page stays on screen. That is invisible to a human until
+    they notice the picture is wrong, and invisible in the log unless this is checked - which is
+    why it survived a release cycle. Validated against the 2026-08-14 report: this flags exactly
+    the reported failure out of 86 paints in that session.
+    """
+    ready: set[str] = set()
+    violations: list[dict] = []
+    painted = 0
+    for e in events:
+        if e.get("cat") != "fs":
+            continue
+        kind = e.get("kind")
+        if kind == "ready":
+            ready.add(e.get("key"))
+        elif kind == "paint":
+            painted += 1
+            if e.get("source") in ("final_composite", "fs_cache", "edit_result"):
+                if e.get("key") not in ready:
+                    violations.append(e)
+
+    print(f"display integrity: {painted} paints, {len(violations)} presented without a decode")
+    for e in violations:
+        print(
+            f"  t={e.get('t'):.3f} items_generation={e.get('items_generation')} "
+            f"seq={e.get('seq')} texture={e.get('texture_id')} key={e.get('key')}"
+        )
+    if violations:
+        print(
+            "\nEach line is a page shown from a cache that was never filled for it in this "
+            "session: the viewer decided the page was already loaded and issued no load. Expect "
+            "the previous document's page to have been on screen until the user navigated away "
+            "and back."
+        )
+    if check:
+        return 1 if violations else 0
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="mimageviewer perf_events.jsonl analyzer"
@@ -2860,6 +2907,12 @@ def main() -> None:
     p_tl = subs.add_parser("timeline")
     p_tl.add_argument("seq", type=int, nargs="?", default=None)
     subs.add_parser("scroll")
+    p_display = subs.add_parser("display-integrity")
+    p_display.add_argument(
+        "--check",
+        action="store_true",
+        help="表示されたページが必ずデコードされていることを検査する",
+    )
 
     args = parser.parse_args()
 
@@ -2877,6 +2930,8 @@ def main() -> None:
         cmd_page_turn(events)
         if args.check:
             sys.exit(cmd_page_turn_check(events))
+    elif args.cmd == "display-integrity":
+        sys.exit(cmd_display_integrity(events, args.check))
     elif args.cmd == "test-script-input":
         sys.exit(cmd_test_script_input(events, args.check))
     elif args.cmd == "priority":
