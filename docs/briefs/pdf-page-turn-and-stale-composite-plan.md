@@ -392,3 +392,64 @@ delta の生涯が観測できていないのが問題。**3 回とも推測で�
 
 **この計装を入れてから直す。** 症状が同じでも層が違えば直らないことは 2 回実証済み
 ([[feedback_same_signature_different_layer]])。
+
+### 4 回目の調査 — ソース読みで確定した事実 (2026-08-14)
+
+3 回目のクラッシュの backtrace で **落ちている層が確定した**:
+
+```
+14: egui_wgpu::renderer::update_texture::closure$0   vendor/egui-wgpu/src/renderer.rs:629
+15: egui_wgpu::renderer::Renderer::update_texture    vendor/egui-wgpu/src/renderer.rs:745
+16: egui_wgpu::winit::Painter::paint_and_update_textures  vendor/egui-wgpu/src/winit.rs:480
+17: eframe::...::WgpuWinitRunning::run_ui_and_paint  vendor/eframe/src/native/wgpu_integration.rs:697
+```
+
+- `renderer.rs:629` は **partial 分岐**、`winit.rs:480` は今回追加した
+  「surface 参照より前に delta を適用する」ブロック。つまり **早期 return ではなく
+  通常の描画経路**で、`Managed(0)` への部分更新が 32px のテクスチャに当たっている
+- native video presenter は**別 `egui::Context` + 別 `Renderer`**
+  (`src/video/native_presenter/render_core.rs:282` / `:3890`) を持つが、
+  backtrace から**今回落ちたのは eframe 側の共有 renderer**と確定
+
+同じ 09:33 のログで、直前の入力は `source=native-video-key action=ctrl_nav_forward`、
+直後に `[native-video] startup probe #2`。**3 回とも動画 presenter の起動が絡む。**
+
+読んで**否定できた**もの (推測ではなくソース根拠):
+
+| 疑い | 根拠 |
+| --- | --- |
+| epaint が拡張時に partial しか出さない | `texture_atlas.rs:236-254` — 拡張時は `resize_to_min_height` が true を返し `dirty = Rectu::EVERYTHING` → `take_delta` は `ImageDelta::full`。**拡張は必ず full** |
+| 新しい atlas の初回 delta が partial | `TextureAtlas::new` は `dirty: Rectu::EVERYTHING` で開始 (`:82-90`) |
+| discard した pass の delta が消える | `Context::run` は `output.append(self.end_pass())` をループ内で行い (`context.rs:820`)、`FullOutput::append` は `textures_delta.append` (`data/output.rs:52`)。**discard しても delta は失われない** |
+| full delta を適用しても 32 のまま残る | `update_texture` の full 分岐は `device.create_texture` で作り直して `textures.insert` (`renderer.rs:680-755`)。**あり得ない** |
+| `Renderer` が作り直されて texture map が飛ぶ | `set_window` は surface だけを足し引きし (`winit.rs:143-161`)、`gc_viewports` は surface / depth / msaa のみ、`destroy` は空 (`winit.rs:683-695`)。**renderer はプロセス寿命で不変** |
+| egui 自身が immediate viewport で begin/end pass を持つ | `show_viewport_immediate` は backend の callback に丸投げし、callback が ui を呼ばなければ `expect` で別 panic (`context.rs:3943-3994`) |
+| mIV が `Managed(0)` を触る | `set_partial` は conceal / erase の 2 箇所だけで寸法一致を確認済み。renderer への直接操作は `callback_resources` と `register_native_texture` (= `User(n)`) のみ |
+| `FullOutput` の生成漏れ | wgpu 経路の生成点は `wgpu_integration.rs:638` (`integration.update`) と `:1046` (immediate viewport) の 2 つだけ。**両方とも適用経路に繋がっている** |
+
+**したがって残る可能性は 1 つに絞られた**: 拡張時の **full delta が生成されたのに
+renderer へ届いていない** (どこかで捨てられている)。partial が Y45..126 に出るためには、
+その pass の時点で atlas は既に 128px であり、そこへ至る full delta が必ず生成されている
+はずだから。読める範囲の経路は全部塞いだので、**残りは観測でしか出せない。**
+
+### 入れた計装 (`egui_wgpu::atlas_diag`)
+
+一度の再現で決着が付くこと、常時コストが無いこと、**計装ビルドが落ちないこと**を要件にした。
+
+- **リングバッファ台帳** (`vendor/egui-wgpu/src/atlas_diag.rs`、512 件、font atlas のみ)。
+  ディスクには**異常時しか書かない**
+- **生成側**: `wgpu_integration.rs` の 2 生成点で `record_produced`
+  (`ProducedMain` / `ProducedImmediate`)
+- **適用側**: `Painter` の 2 適用点を `apply_delta_set` に集約し、
+  delta ごとに **適用直前に renderer が持っているサイズ** を併記して `record_applied`
+- **検出と自己防衛**: `update_texture` の partial 分岐で
+  `pos + size` がテクスチャ外に出たら `report_overflow` で**台帳全体を吐いてから
+  書き込みをスキップ**する。panic せず、テクスチャは元のまま戻す。
+  1 フレーム文字が崩れる代わりにセッションが死なないので、利用者は再現を続けられる
+- 出力先は `egui_wgpu::atlas_diag::set_sink` で mIV のロガーへ (`src/lib.rs`)
+
+**読み方**: `produced` の各行に対応する `applied` があるか。
+
+- FULL が produced されているのに applied が無い → **backend が捨てている** (捨てた site が出る)
+- 直前の applied FULL より後ろに FULL が produced されていない → **egui が拡張 delta を
+  出していない** = 上流の問題で、egui 本体を vendor する必要がある

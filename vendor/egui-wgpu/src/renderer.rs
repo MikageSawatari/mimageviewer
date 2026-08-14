@@ -659,6 +659,31 @@ impl Renderer {
                 .expect("Tried to update a texture that has not been allocated yet.");
             let texture = texture.expect("Tried to update user texture.");
             let options = options.expect("Tried to update user texture.");
+
+            // mIV diagnostic guard: a partial delta that reaches past the texture we hold means
+            // an earlier reallocating delta never got here, and wgpu turns the write into a
+            // validation panic that takes the whole process down. Report what led up to it and
+            // skip the write instead - a frame of wrong glyphs beats losing the session, and it
+            // lets the user keep reproducing. See atlas_diag.
+            let existing = texture.size();
+            if pos[0] as u32 + width > existing.width || pos[1] as u32 + height > existing.height {
+                crate::atlas_diag::report_overflow(
+                    id,
+                    pos,
+                    [width as usize, height as usize],
+                    [existing.width, existing.height],
+                );
+                self.textures.insert(
+                    id,
+                    Texture {
+                        texture: Some(texture),
+                        bind_group,
+                        options: Some(options),
+                    },
+                );
+                return;
+            }
+
             let origin = wgpu::Origin3d {
                 x: pos[0] as u32,
                 y: pos[1] as u32,
@@ -758,6 +783,14 @@ impl Renderer {
                 options: Some(image_delta.options),
             },
         );
+    }
+
+    /// mIV: the size the renderer currently holds for `id`, for diagnosing deltas that arrive
+    /// against a texture that is no longer the size egui thinks it is. See `atlas_diag`.
+    pub fn texture_size(&self, id: &epaint::TextureId) -> Option<[u32; 2]> {
+        let texture = self.textures.get(id)?.texture.as_ref()?;
+        let size = texture.size();
+        Some([size.width, size.height])
     }
 
     pub fn free_texture(&mut self, id: &epaint::TextureId) {

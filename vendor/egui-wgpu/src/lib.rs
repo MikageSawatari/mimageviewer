@@ -21,6 +21,7 @@
 pub use wgpu;
 
 /// Low-level painting of [`egui`](https://github.com/emilk/egui) on [`wgpu`].
+pub mod atlas_diag;
 mod mipmap;
 mod renderer;
 

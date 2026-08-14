@@ -9,6 +9,22 @@ use crate::{
 use egui::{Context, Event, UserData, ViewportId, ViewportIdMap, ViewportIdSet};
 use std::{num::NonZeroU32, sync::Arc};
 
+/// mIV: hand a frame's `set` deltas to the renderer, recording each one against the size the
+/// renderer held beforehand. Both the painting and the non-painting path go through here so the
+/// ledger sees every application, in order. See [`crate::atlas_diag`].
+fn apply_delta_set(
+    renderer: &mut renderer::Renderer,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    textures_delta: &epaint::textures::TexturesDelta,
+    site: crate::atlas_diag::Site,
+) {
+    for (id, image_delta) in &textures_delta.set {
+        crate::atlas_diag::record_applied(site, *id, image_delta, renderer.texture_size(id));
+        renderer.update_texture(device, queue, *id, image_delta);
+    }
+}
+
 struct SurfaceState {
     surface: wgpu::Surface<'static>,
     alpha_mode: wgpu::CompositeAlphaMode,
@@ -425,14 +441,13 @@ impl Painter {
             return;
         };
         let mut renderer = render_state.renderer.write();
-        for (id, image_delta) in &textures_delta.set {
-            renderer.update_texture(
-                &render_state.device,
-                &render_state.queue,
-                *id,
-                image_delta,
-            );
-        }
+        apply_delta_set(
+            &mut renderer,
+            &render_state.device,
+            &render_state.queue,
+            textures_delta,
+            crate::atlas_diag::Site::AppliedNoPaint,
+        );
         for id in &textures_delta.free {
             renderer.free_texture(id);
         }
@@ -476,14 +491,13 @@ impl Painter {
         // thumbnails. See docs/display-pipeline.md.
         {
             let mut renderer = render_state.renderer.write();
-            for (id, image_delta) in &textures_delta.set {
-                renderer.update_texture(
-                    &render_state.device,
-                    &render_state.queue,
-                    *id,
-                    image_delta,
-                );
-            }
+            apply_delta_set(
+                &mut renderer,
+                &render_state.device,
+                &render_state.queue,
+                textures_delta,
+                crate::atlas_diag::Site::AppliedPaint,
+            );
         }
 
         let Some(surface_state) = self.surfaces.get(&viewport_id) else {

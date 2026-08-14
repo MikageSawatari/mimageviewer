@@ -657,6 +657,15 @@ impl WgpuWinitRunning<'_> {
             viewport_output,
         } = full_output;
 
+        // mIV: record what egui produced, before anything can drop it. Paired with the
+        // application record inside the painter, this shows whether a delta that never reached
+        // the GPU was lost here or was never emitted. See egui_wgpu::atlas_diag.
+        egui_wgpu::atlas_diag::record_produced(
+            egui_wgpu::atlas_diag::Site::ProducedMain,
+            &textures_delta,
+            Some(viewport_id.0.value()),
+        );
+
         remove_viewports_not_in(viewports, painter, viewport_from_window, &viewport_output);
 
         // mIV: a frame that will not be painted still has to deliver its texture deltas.
@@ -1037,6 +1046,14 @@ fn render_immediate_viewport(
     } = egui_ctx.run(input, |ctx| {
         viewport_ui_cb(ctx);
     });
+
+    // mIV: same ledger as the main path - an immediate viewport's `run` takes deltas out of the
+    // shared texture manager too, including any the parent pass had accumulated so far.
+    egui_wgpu::atlas_diag::record_produced(
+        egui_wgpu::atlas_diag::Site::ProducedImmediate,
+        &textures_delta,
+        Some(ids.this.0.value()),
+    );
 
     // ------------------------------------------
 

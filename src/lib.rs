@@ -344,6 +344,16 @@ fn configure_wgpu_presentation(wgpu_options: &mut egui_wgpu::WgpuConfiguration) 
     ));
 }
 
+/// egui のテクスチャ delta 台帳の出力先を mIV のファイルロガーに向ける。
+///
+/// font atlas への部分更新が「renderer が持っているテクスチャの外」に出る事象を追うための
+/// 計装。台帳自体はリングバッファなので常時のコストは無く、範囲外を検出したときだけ履歴を
+/// まとめて吐く。詳細は `egui_wgpu::atlas_diag` と
+/// docs/briefs/pdf-page-turn-and-stale-composite-plan.md の ③。
+fn install_texture_delta_ledger() {
+    egui_wgpu::atlas_diag::set_sink(|message| logger::log(message));
+}
+
 fn install_panic_log_hook() {
     // windows_subsystem = "windows" では stderr が見えないため、Rust panic は
     // data_dir 初期化直後から panic.log に残す。ネイティブ DLL / driver の
@@ -922,6 +932,7 @@ pub fn run() -> eframe::Result {
     };
 
     install_panic_log_hook();
+    install_texture_delta_ledger();
     #[cfg(windows)]
     install_native_exception_log_hook();
 
