@@ -646,3 +646,61 @@ Codex 第 2 ラウンドの残り 2 問はクリーン: interner の再入 borro
 3 回連続で「どのキャッシュが古いか」を推測して外した。ログ 2 本
 (`[PDF] Retained page store` の `source=` と perf の `texture_w/h`) を突き合わせれば
 **1 回で確定できた**。[[feedback_instrument_silent_paths_first]] の再確認。
+
+## ⑦ Ctrl+↓ 連打で読込中のまま固まる (2026-08-14 夜、未修正)
+
+**出荷阻止級。** 復帰手段は再起動のみ。証拠は
+`scratchpad/stall-evidence.{jsonl,log}` に退避済み (t=44-52s の窓)。
+
+### 観測事実
+
+`20240608_015.pdf` へ移動した直後 (t≈47) から **218 秒以上**、以下が続く:
+
+| 事実 | 値 |
+| --- | --- |
+| UI スレッド | 生存 (heartbeat 継続)、**165 fps で空転** |
+| `fs/decode_end _015.pdf#0` | t=47.058 `reason=pdf_ok` — **デコードは成功** |
+| `fs/ready _015.pdf#0` | **出ない** (= アップロードされない) |
+| `fs/page_turn_decision` | `defer_ui_uploads=True` が **全フレーム**、`seq=328` で凍結 |
+| `[fs-load]` (今セッションで追加した計装) | `state=UploadPending entry_load_seq=None` を毎フレーム |
+| `thumb/ready _015.pdf#0` | t=46.885 に **一度出ている** |
+| `thumb/idle_upgrade_enqueue idx=0` | t=47.945 → `decode_end` t=48.034 → **`ready` は出ない** |
+| `[display-identity]` | 0 件 (今回入れた台帳は無関係) |
+
+### ループ
+
+```
+navigation sequence が Presenting(Rendition) で滞留
+        ↓  defer_ui_uploads = rendition_sequence_active
+UI アップロードが止まる (fs も thumb も)
+        ↓
+ページが materialize しない → 画面は「読込中...」
+        ↓
+paint が起きない → page_turn_ready が出ない
+        ↓
+sequence が retire しない ────────┘
+```
+
+`page_turn_decision_for_inputs` は **`rendition_sequence_active` だけ**で
+`defer_ui_uploads` を決める。`page_turn_burst_active` は算出しても probe に渡すだけで
+判断に使っていない (`ui_fullscreen.rs`)。つまり **キーを離しても解除されない**。
+唯一の出口が sequence の retire で、その retire がアップロードに依存している。
+
+### まだ確定していない点
+
+t=46.885 に thumbnail は Loaded になっている。それでも pass-through が描かれない理由を
+**まだ特定していない**。候補は 2 つで、どちらかを確認してから直す:
+
+- (a) t=47.945 の idle 画質アップグレードが既存テクスチャを外し、置き換えが
+  アップロード停止で永久に来ない
+- (b) pass-through rendition の構築自体がアップロードを要し、停止に巻き込まれている
+
+(b) なら「アップロード停止中は rendition を作れない」という自己矛盾が本体なので、
+`defer_ui_uploads` の出口条件そのものを直す必要がある。
+
+### 今回の識別子まわりの変更との関係
+
+`[display-identity]` 0 件、`index_no_longer_means_the_requested_page` 0 件。
+今回追加した gate はどれも拒否していない。navigation sequence /
+アップロード backlog / idle upgrade はいずれも今回触っていない。
+ただし **「触っていないから無関係」とは断定しない** — 旧ビルドでの同一ストレス比較が要る。
