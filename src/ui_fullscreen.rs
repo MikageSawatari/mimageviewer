@@ -5017,7 +5017,25 @@ impl App {
     /// 注意: 本関数は `prepare_fullscreen_state` 経由でメインビューポート ctx が
     /// 渡される経路がある。Modifier 状態は `ctx.input(|i| i.modifiers)` ではなく
     /// 必ず `*_held_via_os()` 系で取ること。
+    ///
+    /// Like [`Self::resolve_fs_display_tex`], whatever this settles on is checked against what the
+    /// texture was made to show before it is handed back. Both resolvers are gated because both
+    /// reach the screen: this one is the ordinary single-page, spread and continuous-reading path,
+    /// and the other one covers holdover capture and the fallbacks. See
+    /// [`crate::item_identity::TextureIdentityLedger`].
     pub(crate) fn resolve_fs_processed_texture(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        original_preview_active: bool,
+    ) -> Option<egui::TextureHandle> {
+        let texture =
+            self.resolve_fs_processed_texture_from_caches(ctx, idx, original_preview_active)?;
+        self.display_texture_matches_page(&texture, idx)
+            .then_some(texture)
+    }
+
+    fn resolve_fs_processed_texture_from_caches(
         &mut self,
         ctx: &egui::Context,
         idx: usize,
@@ -14926,10 +14944,7 @@ impl App {
             // catches up; exposing the raw catalog thumbnail would violate R2.
             self.ensure_passthrough_rendition(ctx, fs_idx)
         } else {
-            match self.thumbnails.get(fs_idx) {
-                Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
-                _ => None,
-            }
+            self.fs_thumbnail_texture_for_display(fs_idx)
         };
 
         let mut location_display = self.location_display_for(fs_idx);
@@ -26871,12 +26886,8 @@ impl App {
         placement: ResolvedDisplayPlacement,
     ) -> Option<DisplayedImageTransform> {
         let thumb_tex = if allow_thumbnail {
-            match self.thumbnails.get(idx) {
-                Some(ThumbnailState::Loaded { tex, .. }) => Some(
-                    crate::gpu_lanczos::FullscreenPaintResource::direct(tex.clone()),
-                ),
-                _ => None,
-            }
+            self.fs_thumbnail_texture_for_display(idx)
+                .map(crate::gpu_lanczos::FullscreenPaintResource::direct)
         } else {
             None
         };

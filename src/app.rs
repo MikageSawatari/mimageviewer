@@ -2056,7 +2056,6 @@ struct ViewerContextBundle {
     stack_script_error: Option<String>,
     stack_toggle_select_path: Option<PathBuf>,
     items: Vec<GridItem>,
-    item_ids: Vec<crate::item_identity::ItemId>,
     items_generation: u64,
     visible_indices: Vec<usize>,
     /// `items` と同じ添字の正規化済み basename と、その worker lifecycle。
@@ -2389,7 +2388,6 @@ impl ViewerContextBundle {
             stack_script_error: None,
             stack_toggle_select_path: None,
             items: Vec::new(),
-            item_ids: Vec::new(),
             items_generation: 0,
             visible_indices: Vec::new(),
             facet_name_cache: Vec::new(),
@@ -8816,15 +8814,15 @@ pub struct App {
     pub(crate) normal_folder_omitted_entries: Option<NormalFolderOmittedEntries>,
     pub(crate) navigation_scope: ViewerNavigationScope,
     pub(crate) items: Vec<GridItem>,
-    /// Content identity per item, parallel to `items`.
-    ///
-    /// Read through `App::item_id`; it is kept beside the list so it is replaced and swapped
-    /// with it and cannot describe a list that is no longer here.
-    pub(crate) item_ids: Vec<crate::item_identity::ItemId>,
-    /// Hands out the ids above. Process-wide on purpose: it maps content to identity and
+    /// Hands out content identities. Process-wide on purpose: it maps content to identity and
     /// holds no per-viewer state, so sharing it lets the same page keep one id across every
     /// viewer context.
-    pub(crate) item_id_interner: crate::item_identity::ItemIdInterner,
+    ///
+    /// `RefCell` because identity is *derived* from `items` on demand rather than stored beside
+    /// it. A parallel vector would have to be updated by every path that mutates the list, and
+    /// six of them did not - deletion, snapshot restore and smart-folder restore among them -
+    /// which turned a guard against showing the wrong page into a way to refuse the right one.
+    pub(crate) item_id_interner: std::cell::RefCell<crate::item_identity::ItemIdInterner>,
     /// Which item each display texture was made to show. See
     /// [`crate::item_identity::TextureIdentityLedger`].
     ///
@@ -12521,8 +12519,7 @@ impl App {
             normal_folder_omitted_entries: None,
             navigation_scope: ViewerNavigationScope::Main,
             items: Vec::new(),
-            item_ids: Vec::new(),
-            item_id_interner: crate::item_identity::ItemIdInterner::default(),
+            item_id_interner: std::cell::RefCell::default(),
             texture_identity: std::cell::RefCell::default(),
             display_identity_error: std::cell::RefCell::new(None),
             thumbnails: Vec::new(),
@@ -13810,6 +13807,22 @@ impl App {
         false
     }
 
+    /// The catalog thumbnail for `idx`, checked like every other display texture.
+    ///
+    /// Thumbnails are drawn straight from `self.thumbnails` in several places rather than through
+    /// a resolver, so they need their own way past the same gate; otherwise a thumbnail is the one
+    /// picture that can still be the previous document's.
+    pub(crate) fn fs_thumbnail_texture_for_display(
+        &self,
+        idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        let crate::grid_item::ThumbnailState::Loaded { tex, .. } = self.thumbnails.get(idx)? else {
+            return None;
+        };
+        self.display_texture_matches_page(tex, idx)
+            .then(|| tex.clone())
+    }
+
     /// Say what a texture was made to show, before anything has had a chance to guess.
     ///
     /// Worth doing wherever the producer knows: the resolver learns identity on first sight, which
@@ -13856,24 +13869,11 @@ impl App {
     /// Returns [`ItemId::NONE`] past the end of the list, which never compares equal to a real id -
     /// so a key built for a page that has gone away fails the identity check instead of matching
     /// whatever moved into its place. See [`crate::item_identity`].
-    /// Give every item in the current list its content identity.
-    ///
-    /// Kept next to the list assignment it belongs to: `item_ids` is replaced with `items` and
-    /// swapped with it, so it can never describe a list that is no longer here. Interning here
-    /// keeps every later comparison a single integer.
-    pub(crate) fn reintern_item_ids(&mut self) {
-        self.item_ids = self
-            .items
-            .iter()
-            .map(|item| self.item_id_interner.intern(&item.perf_key()))
-            .collect();
-    }
-
     pub(crate) fn item_id(&self, idx: usize) -> crate::item_identity::ItemId {
-        self.item_ids
-            .get(idx)
-            .copied()
-            .unwrap_or(crate::item_identity::ItemId::NONE)
+        let Some(item) = self.items.get(idx) else {
+            return crate::item_identity::ItemId::NONE;
+        };
+        self.item_id_interner.borrow_mut().intern(&item.perf_key())
     }
 
     /// 実描画で使うサムネイル比率。
@@ -14955,7 +14955,6 @@ impl App {
             stack_script_error,
             stack_toggle_select_path,
             items,
-            item_ids,
             items_generation,
             visible_indices,
             facet_name_cache,
@@ -15181,7 +15180,6 @@ impl App {
         swap_field!(stack_script_error);
         swap_field!(stack_toggle_select_path);
         swap_field!(items);
-        swap_field!(item_ids);
         swap_field!(items_generation);
         swap_field!(visible_indices);
         swap_field!(facet_name_cache);
@@ -23470,7 +23468,6 @@ impl App {
         debug_assert_eq!(items.len(), image_metas.len());
         self.persist_pending_view_trim_state();
         self.items = items;
-        self.reintern_item_ids();
         self.image_metas = image_metas;
         self.thumb_edit_preview_keys.clear();
         self.idle_upgrade_cache_bypass_ineligible.clear();
@@ -39748,7 +39745,6 @@ impl App {
             stack_script_error,
             stack_toggle_select_path,
             items,
-            item_ids,
             items_generation,
             visible_indices,
             facet_name_cache,
@@ -39975,7 +39971,6 @@ impl App {
             stack_script_error,
             stack_toggle_select_path,
             items,
-            item_ids,
             items_generation,
             visible_indices,
             facet_name_cache,
@@ -61323,7 +61318,21 @@ impl App {
     /// Return a color-faithful catalog-thumbnail rendition for page-turn pass-through.
     /// This is intentionally synchronous: publishing an uncolored texture first would
     /// violate R2, while the measured thumbnail-sized work is bounded to a few milliseconds.
+    /// A catalog-thumbnail rendition standing in for `idx` until the real page materializes.
+    ///
+    /// Gated like every other display texture: this is a fallback the resolvers hand off to, so
+    /// without a check of its own it becomes the way a stale picture reaches the screen.
     pub(crate) fn ensure_passthrough_rendition(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        let texture = self.ensure_passthrough_rendition_inner(ctx, idx)?;
+        self.display_texture_matches_page(&texture, idx)
+            .then_some(texture)
+    }
+
+    fn ensure_passthrough_rendition_inner(
         &mut self,
         ctx: &egui::Context,
         idx: usize,

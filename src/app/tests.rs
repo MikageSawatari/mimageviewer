@@ -23991,7 +23991,6 @@ mod pipeline_cache_refactor_tests {
         let ctx = egui::Context::default();
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/001.pdf-page-0.jpg");
-        app.reintern_item_ids();
         let (_, _) = insert_edit_and_final_cache(&mut app, &ctx, idx, "doc_001");
 
         let first_document_texture = app
@@ -24008,7 +24007,6 @@ mod pipeline_cache_refactor_tests {
         // cannot tell the two apart.
         app.items[idx] = GridItem::Image(PathBuf::from("C:/pics/002.pdf-page-0.jpg"));
         app.items_generation += 1;
-        app.reintern_item_ids();
         let (_, _) = insert_edit_and_final_cache(&mut app, &ctx, idx, "doc_002");
         app.final_composite_cache
             .values_mut()
