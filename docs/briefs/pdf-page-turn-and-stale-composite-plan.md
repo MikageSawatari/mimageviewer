@@ -455,13 +455,29 @@ renderer へ届いていない** (どこかで捨てられている)。partial �
   partial の時点で吐くと修復側が見えない (Codex 指摘)
 - 出力先は `set_sink` で mIV のロガーへ (`src/lib.rs`)
 
-**読み方**: `produced` の各 FULL に対応する `applied` があるか。
+#### Codex レビューで潰した罠 (4 ラウンド)
+
+初版と 2 版には、**この台帳が探している証拠を自分で捏造する**穴があった。記録しておく。
+
+1. **`last_installed` が 2 つの Context で共有**されていた。presenter は別の atlas を持つので、
+   交互に走るだけで毎回「サイズが変わった」と出る。それは③の判定そのもので、
+   **egui 上流の不具合という誤った結論**に直行していた → Context ごとに分離
+2. **presenter thread と main thread が同じ台帳に書く**のに、overflow の pending が
+   単一の global bool だった。presenter の flush が eframe の pending を食い、
+   **修復 FULL を含む方の dump が消える** → batch id + thread-local 化
+3. **追跡していないテクスチャの overflow** が font atlas の dump を起動し、dump 枠も消費していた
+4. `record_applied` が `update_texture` の**前**に記録していた。**スキップした書き込みが
+   「適用済み」として残る** → 前後で挟む
+
+**読み方** (Codex と合意した最終形)。dump 冒頭の
+`overflow was in batch=B on renderer=#R` を見て、同じ `renderer=#R` の記録を追う。
 
 | dump の形 | 意味 |
 | --- | --- |
-| FULL が produced されているのに applied が無い | **backend が捨てている**。batch ヘッダが捨てた site を名指しする |
-| 直前の applied FULL より後ろに FULL の produced が無いのに `egui_installed` は大きい | **egui が拡張 delta を出していない** = 上流の問題。egui 本体の vendor が必要 |
-| applied の `after` が `before` から変わっていない | 適用が空振りしている |
+| ① `Produced FULL` はあるが対応する `Applied FULL` が無い | `Context::run` は拡張後の atlas を生成したが、renderer に届く前に**捨てられている**。`DROPPED` 行があれば経路まで分かる |
+| ② `Applied FULL` の `after` が 128 以上になった後、同じ renderer が再び 32 になっている | FULL は正常に届いた。その**後で** renderer 側が縮小・解放・交換されている。`FREED` / 後続の `FULL [*, 32]` / renderer 番号の変化を見る |
+| ③ `egui_installed` が 128 以上へ変化したのに、その間に `Produced FULL` が無い | **renderer より前** (egui / epaint / TextureManager) で拡張 delta が生成されていない。上流の問題 |
+| ④ 同じ batch 内で `OVERFLOW` の後に修復 FULL があり `after` が 128 以上になる | その出力が `[古い partial, 修復 full]` の順だった。従来は先頭の partial で panic していた。**stale の発生原因は別途 ①〜③ で判定する** |
 
 ⚠ **overflow のスキップは fix ではない** (Codex 指摘)。原因が特定できるまでの延命策であり、
 台帳が答えを出したら構造的な修正に置き換える。
