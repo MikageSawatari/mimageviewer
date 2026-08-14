@@ -5354,23 +5354,72 @@ impl App {
                 .iter()
                 .any(|idx| matches!(self.thumbnails.get(*idx), Some(ThumbnailState::Failed)));
 
-        let next_phase = if materialized_ready {
-            Some(FsNavigationTargetPhase::Ready(
-                FsNavigationPresentation::Materialized,
-            ))
-        } else if rendition_ready {
-            Some(FsNavigationTargetPhase::Ready(
-                FsNavigationPresentation::Rendition,
-            ))
-        } else if materialized_failed {
-            Some(FsNavigationTargetPhase::Ready(
-                FsNavigationPresentation::Failure,
-            ))
-        } else if rendition_failed {
-            Some(FsNavigationTargetPhase::RenditionFailed)
-        } else {
-            None
-        };
+        let next_phase = navigation_target_next_phase(
+            materialized_ready,
+            rendition_ready,
+            materialized_failed,
+            rendition_failed,
+        );
+        // Which branch above won, recorded where all four inputs are still in scope.
+        //
+        // The decision probe downstream cannot tell these apart: it sees only
+        // `passthrough_rendition_ready == false`, which is equally true of a target that resolved
+        // to the real page and one that is still waiting for anything at all. Those are opposite
+        // situations - the first is the fast path declining a stand-in it does not need, the
+        // second is the stand-in failing to appear - and a report that renders them identically
+        // is how a direction-dependent difference stayed invisible.
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "fs",
+                "navigation_target_phase",
+                self.perf_item_key(fs_idx).as_deref(),
+                self.input_seq,
+                &[
+                    ("idx", serde_json::Value::from(fs_idx)),
+                    (
+                        "accept_rendition",
+                        serde_json::Value::from(accept_rendition),
+                    ),
+                    (
+                        "materialized_ready",
+                        serde_json::Value::from(materialized_ready),
+                    ),
+                    ("rendition_ready", serde_json::Value::from(rendition_ready)),
+                    (
+                        "materialized_failed",
+                        serde_json::Value::from(materialized_failed),
+                    ),
+                    (
+                        "rendition_failed",
+                        serde_json::Value::from(rendition_failed),
+                    ),
+                    (
+                        "pages",
+                        serde_json::Value::from(
+                            target.pages.iter().copied().collect::<Vec<usize>>(),
+                        ),
+                    ),
+                    (
+                        "next_phase",
+                        serde_json::Value::from(match next_phase {
+                            Some(FsNavigationTargetPhase::Ready(
+                                FsNavigationPresentation::Materialized,
+                            )) => "ready_materialized",
+                            Some(FsNavigationTargetPhase::Ready(
+                                FsNavigationPresentation::Rendition,
+                            )) => "ready_rendition",
+                            Some(FsNavigationTargetPhase::Ready(
+                                FsNavigationPresentation::Failure,
+                            )) => "ready_failure",
+                            Some(FsNavigationTargetPhase::RenditionFailed) => "rendition_failed",
+                            Some(FsNavigationTargetPhase::Awaiting { .. })
+                            | Some(FsNavigationTargetPhase::Presenting(_)) => "unchanged",
+                            None => "still_awaiting",
+                        }),
+                    ),
+                ],
+            );
+        }
         let Some(next_phase) = next_phase else {
             return;
         };
@@ -7969,6 +8018,44 @@ fn fs_paint_page_changed_from_previous(
                 .find(|page| page.idx == current.idx && page.texture_id == current.texture_id)
                 .is_none_or(|previous| current.geometry.differs_from(previous.geometry))
     })
+}
+
+/// What a waiting navigation target should settle on, given what has become available.
+///
+/// The order of the first two is the rule, not an implementation detail. A stand-in is only ever
+/// offered while a held key is turning pages - `rendition_ready` already carries that condition -
+/// and there it wins even when the real page is also ready. Preferring the real page reads as the
+/// better choice page by page, but it is what made the two directions behave differently: reading
+/// forward the prefetch keeps the real page ready, so the stand-in was never used and every turn
+/// paid for a full-resolution page, while reading back it was not ready and the same burst ran at
+/// thumbnail quality. A burst that changes quality depending on which way it is going is worse
+/// than one that is uniformly quick, and the reader has already said they want the speed.
+///
+/// Outside a burst `rendition_ready` is false, so a single press still shows the real page and
+/// nothing about ordinary reading changes.
+fn navigation_target_next_phase(
+    materialized_ready: bool,
+    rendition_ready: bool,
+    materialized_failed: bool,
+    rendition_failed: bool,
+) -> Option<FsNavigationTargetPhase> {
+    if rendition_ready {
+        Some(FsNavigationTargetPhase::Ready(
+            FsNavigationPresentation::Rendition,
+        ))
+    } else if materialized_ready {
+        Some(FsNavigationTargetPhase::Ready(
+            FsNavigationPresentation::Materialized,
+        ))
+    } else if materialized_failed {
+        Some(FsNavigationTargetPhase::Ready(
+            FsNavigationPresentation::Failure,
+        ))
+    } else if rendition_failed {
+        Some(FsNavigationTargetPhase::RenditionFailed)
+    } else {
+        None
+    }
 }
 
 fn page_turn_decision_for_inputs(
@@ -32766,6 +32853,86 @@ mod tests {
     use crate::grid_item::GridItem;
     use crate::ring_shortcut::{RightDragContext, ViewerShortRightClickAction};
     use std::path::PathBuf;
+
+    /// Reported 2026-08-14: holding the key one way stayed at full quality while the other way
+    /// dropped to thumbnail quality. Both stand-in and real page were ready going forward, and the
+    /// real page won; going back only the stand-in was ready. Reproduced with the reporter's
+    /// settings, where the difference comes from the prefetch reaching further ahead (4) than
+    /// behind (2), so the direction alone decided which was ready.
+    #[test]
+    fn a_burst_takes_the_stand_in_even_when_the_real_page_is_also_ready() {
+        assert_eq!(
+            navigation_target_next_phase(true, true, false, false),
+            Some(FsNavigationTargetPhase::Ready(
+                FsNavigationPresentation::Rendition
+            )),
+            "a held key asked for speed; quality that depends on which way you are going is worse \
+             than uniform speed"
+        );
+    }
+
+    /// `rendition_ready` is only ever true while a burst is accepting stand-ins, so this is what
+    /// a single press does: nothing about ordinary reading changes.
+    #[test]
+    fn a_single_press_still_shows_the_real_page() {
+        assert_eq!(
+            navigation_target_next_phase(true, false, false, false),
+            Some(FsNavigationTargetPhase::Ready(
+                FsNavigationPresentation::Materialized
+            ))
+        );
+    }
+
+    #[test]
+    fn the_stand_in_carries_the_turn_when_the_real_page_is_not_ready() {
+        assert_eq!(
+            navigation_target_next_phase(false, true, false, false),
+            Some(FsNavigationTargetPhase::Ready(
+                FsNavigationPresentation::Rendition
+            ))
+        );
+    }
+
+    /// A failure must not outrank something that can actually be shown: the page that failed to
+    /// decode may be one half of a spread whose other half is fine.
+    #[test]
+    fn anything_showable_outranks_a_failure() {
+        assert_eq!(
+            navigation_target_next_phase(false, true, true, true),
+            Some(FsNavigationTargetPhase::Ready(
+                FsNavigationPresentation::Rendition
+            ))
+        );
+        assert_eq!(
+            navigation_target_next_phase(true, false, true, true),
+            Some(FsNavigationTargetPhase::Ready(
+                FsNavigationPresentation::Materialized
+            ))
+        );
+    }
+
+    #[test]
+    fn nothing_ready_and_nothing_failed_keeps_waiting() {
+        assert_eq!(
+            navigation_target_next_phase(false, false, false, false),
+            None,
+            "settling early is what leaves a turn showing the page before it"
+        );
+    }
+
+    #[test]
+    fn a_failed_decode_settles_rather_than_waiting_forever() {
+        assert_eq!(
+            navigation_target_next_phase(false, false, true, false),
+            Some(FsNavigationTargetPhase::Ready(
+                FsNavigationPresentation::Failure
+            ))
+        );
+        assert_eq!(
+            navigation_target_next_phase(false, false, false, true),
+            Some(FsNavigationTargetPhase::RenditionFailed)
+        );
+    }
 
     fn navigator_test_transform(
         page_idx: usize,
