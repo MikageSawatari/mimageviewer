@@ -972,3 +972,48 @@ resolver が作成済みなので描画側は原則 cache hit。
 
 既存 `navigation_sequence_requires_the_complete_atomic_target_unit` は「2 枚必要」は証明済みだが、
 **連結 renderer と sequence の接続を通らない**ので今回の回帰テストにはならない。
+
+## ⑫ 離したあとに 1 ページ進む (2026-08-14、未修正)
+
+利用者報告: 上下キーを押しっぱなしにして離すと、少ししてからもう 1 枚進んだ
+**フル画質**が出ることがある。
+
+### 再現
+
+`scripts/page-turn/release-overshoot.rhai` (利用者設定を overlay で再現)。
+
+```
+round 1 released at idx=29, settled at idx=30 (drift 1)
+```
+
+離した瞬間の `fs_idx` と落ち着いた後の `fs_idx` を比べる**挙動ベース**の判定にした。
+`page_turn_ready` の完了時刻で見る方法は不可 — 「離した後に描画が完了した」と
+「離した後に位置が動いた」を区別できず、最初の解析はこれで誤検出した。
+
+⚠ **最初のシナリオは 3 回 PASS したが無効だった**。押しっぱなしが毎回フォルダ末尾
+(idx=58) に到達しており、行き過ぎる先が無かった。押しっぱなしを 1 秒に縮め、末尾に
+到達したらシナリオ自体を fail させるガードを入れた。
+
+### 分かっていること
+
+- **私の修正 (`7a861573`) より前からある**。修正前の利用者セッションログでも、
+  離した後に page_turn_ready が完了する burst が 20 件、すべて `mode=materialized`
+- 設計意図は既に「離したら止まる」: commit `0cd28fec` に
+  "Repeats arriving during the wait are dropped at the input edge rather than queued,
+  so releasing the key stops the movement instead of paying out the backlog"
+- 更新履歴にも「指を離して止まったページはフル画質に戻ります」と書いてある。
+  つまり**新しい要望ではなく、書いてある約束どおりに直す話**
+
+### 未確認の仮説 (要検証、推測で直さないこと)
+
+最後に受理された移動が**キーが up になった後のフレームで処理されている**のではないか。
+そうであれば `update_fs_page_turn_burst_after_navigation` が burst 非活性と判断し、
+`accept_rendition=false` の target になる → materialized 待ち → サムネイル段階を
+踏まずにフル画質が出る、という観測と整合する。ただし**未確認**。
+`fs_page_turn_input_held` の level サンプリングと egui event queue の消費順序を
+1 フレーム内で確認すること。
+
+### 利用者の希望
+
+サムネイル画質で止まった位置をそのままフル画質にする (= 動かない)。
+代替案として「進むなら一旦サムネイル画質を出してからフル画質」も可、とのこと。
