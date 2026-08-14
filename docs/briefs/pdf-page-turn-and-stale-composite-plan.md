@@ -1,4 +1,4 @@
-# v3.0.0 出荷前: PDF ページ送りの 2 件 (2026-08-14)
+﻿# v3.0.0 出荷前: PDF ページ送りの 2 件 (2026-08-14)
 
 利用者の実機報告 2 件。**どちらも v3.0.0 で直してから出す**方針 (メジャー版なので目立つ
 不具合を残さない、という判断)。
@@ -344,3 +344,51 @@ Part A だけで「枠に合わせて変形してから中身が入れ替わる�
 2. Part A → Part B の順で実装 (A は範囲が小さく単独で価値がある)
 3. `cargo fmt` / `test-full.ps1` / `check_ui_glyphs.py` を通す
 4. 検証ビルドを作って実機確認 → OK なら v3.0.0 の配布ビルドを作り直す
+
+---
+
+## ③ font atlas の wgpu validation panic (未解決、2026-08-14)
+
+### 症状 (実機で 3 回)
+
+```
+In Queue::write_texture
+  Copy of Y 45..126 would end up overrunning the bounds of the Destination texture of Y size 32
+```
+
+egui の font atlas (`Managed(0)`、初期高さ 32px) が拡張されたのに、GPU 側の renderer が
+32px のまま取り残され、次の部分 glyph upload が拒否される。
+
+- 1 回目 08:41:19 — Ctrl+↓ で PDF を渡り歩き、未キャッシュ PDF に着地した直後
+- 2 回目 09:16:58 — 同上 + **動画に着地**して native presenter が起動
+- 3 回目 09:33:17 — 同様の操作
+
+直前は必ず `[ui-fonts] schedule main font atlas resync: fullscreen_viewport_recreate` →
+`discard pass ... generation=1..5` の 5 世代。**リトライ 5 回では防げない。**
+
+### 却下済み (根拠つき)
+
+- **conceal / erase の `set_partial`** — 両者とも handle の寸法一致を確認してから呼び、
+  reset は handle を捨てて `load_texture` で新 ID を取る。`Managed(0)` を縮められない
+- **Part A `fad728e4` / Part B `0cd28fec`** — `ctx.load_texture` は新 ID に full delta を
+  出すだけで、部分更新も `Managed(0)` の置換もできない
+- **`Painter::paint_and_update_textures` の surface 無し早期 return** (`ce6616ef` で修正) —
+  **この経路では painter が呼ばれない**ため効かなかった
+- **`wgpu_integration.rs` の早期 return 4 箇所** (`e4a52d39` で修正) — **まだ落ちる**。
+  ビルドログで `Compiling eframe` / `Compiling egui-wgpu` を確認済みなので、
+  修正がバイナリに入っていないわけではない
+
+### 次にやること — 推測をやめて計装する
+
+delta の生涯が観測できていないのが問題。**3 回とも推測で直そうとして 3 回とも外した。**
+
+必要な計装:
+
+1. `Painter::apply_textures_delta` と `paint_and_update_textures` の両方で、
+   **適用した delta ごとに** `id` / `pos.is_some()` / region / そのとき renderer が
+   持っている texture の実サイズを記録する
+2. `Managed(0)` の renderer 側サイズが**いつ 32 から動かなくなるか**を特定する
+3. delta が「生成されたのに適用されなかった」フレームがまだ在るなら、その経路を出す
+
+**この計装を入れてから直す。** 症状が同じでも層が違えば直らないことは 2 回実証済み
+([[feedback_same_signature_different_layer]])。
