@@ -5455,6 +5455,10 @@ impl App {
     pub(crate) fn release_fs_nav_lock(&mut self) {
         self.fs_nav_locked_gen = None;
         self.fs_holdover_tex = None;
+        // The dedup describes the sequence being released, so the next block is reported afresh
+        // instead of being folded into this one's running count.
+        self.fs_nav_dropped_block_signature = None;
+        self.fs_nav_dropped_block_count = 0;
         #[cfg(windows)]
         {
             self.detached_viewer_folder_nav_reuse_window_once = false;

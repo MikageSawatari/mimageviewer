@@ -2260,6 +2260,8 @@ struct ViewerContextBundle {
     cached_nav_indices: Option<Vec<usize>>,
     cached_fs_seek_info: Option<(usize, crate::ui_fullscreen::FsSeekInfo)>,
     fs_nav_locked_gen: Option<u64>,
+    fs_nav_dropped_block_signature: Option<String>,
+    fs_nav_dropped_block_count: u32,
     fs_holdover_tex: Option<FsHoldover>,
     fs_boundary_hint: Option<crate::ui_fullscreen::FsBoundaryHint>,
     virtual_folder_writeback: Option<VirtualFolderWriteback>,
@@ -2549,6 +2551,8 @@ impl ViewerContextBundle {
             cached_nav_indices: None,
             cached_fs_seek_info: None,
             fs_nav_locked_gen: None,
+            fs_nav_dropped_block_signature: None,
+            fs_nav_dropped_block_count: 0,
             fs_holdover_tex: None,
             fs_boundary_hint: None,
             virtual_folder_writeback: None,
@@ -2607,6 +2611,10 @@ impl ViewerContextBundle {
         self.fs_nav_after_pdf_enumerate = None;
         self.fs_nav_locked_gen = None;
         self.fs_holdover_tex = None;
+        // The dedup describes the sequence that was just discarded, so the next block has to be
+        // reported afresh rather than mistaken for a continuation of this one.
+        self.fs_nav_dropped_block_signature = None;
+        self.fs_nav_dropped_block_count = 0;
         self.continuous_page_transitions.clear();
         self.pdf_enumerate_pending = None;
         self.zip_enumerate_pending = None;
@@ -14901,6 +14909,8 @@ impl App {
             cached_nav_indices,
             cached_fs_seek_info,
             fs_nav_locked_gen,
+            fs_nav_dropped_block_signature,
+            fs_nav_dropped_block_count,
             fs_holdover_tex,
             fs_boundary_hint,
             virtual_folder_writeback,
@@ -15134,6 +15144,8 @@ impl App {
         swap_field!(cached_nav_indices);
         swap_field!(cached_fs_seek_info);
         swap_field!(fs_nav_locked_gen);
+        swap_field!(fs_nav_dropped_block_signature);
+        swap_field!(fs_nav_dropped_block_count);
         swap_field!(fs_holdover_tex);
         swap_field!(fs_boundary_hint);
         swap_field!(virtual_folder_writeback);
@@ -39685,6 +39697,8 @@ impl App {
             cached_nav_indices,
             cached_fs_seek_info,
             fs_nav_locked_gen,
+            fs_nav_dropped_block_signature,
+            fs_nav_dropped_block_count,
             fs_holdover_tex,
             fs_boundary_hint,
             virtual_folder_writeback,
@@ -39843,6 +39857,8 @@ impl App {
             slideshow_scroll_range_cache,
             cached_fs_seek_info,
             fs_nav_locked_gen,
+            fs_nav_dropped_block_signature,
+            fs_nav_dropped_block_count,
             fs_holdover_tex,
             fs_boundary_hint,
             pdf_password_request,
