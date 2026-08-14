@@ -45,9 +45,6 @@ wait_until(|s|
     30000
 );
 
-// Continuous reading, which is where the failure was reported. It matters structurally, not just
-// as a preference: in paged mode the page-turn burst takes the ordinary path, while continuous
-// reading is a blocker for it, and only the blocked path reached the state that livelocked.
 // A post filter puts the final-effect pipeline in the path, which is what the pass-through
 // rendition exists to cover for. Without it the page materializes directly and the sequence never
 // enters the phase that defers uploads - a default profile cannot reach the reported state.
@@ -55,9 +52,19 @@ log("folder-nav-burst: enable a post filter so the final-effect pipeline runs");
 run_action("FsPostFilterUpscaleAnime");
 sleep(500);
 
-log("folder-nav-burst: switch to continuous reading");
+// The continuation the failure was reported in, named rather than cycled to blindly. It matters
+// structurally, not as a preference: paged navigation takes the ordinary page-turn path, while
+// continuous reading is a blocker for it, and only the blocked path reached the state that
+// livelocked. Horizontal specifically, because the report showed two pages side by side and the
+// stuck sequence covered pages [0, 1]; the vertical continuation lays out one column and fits to
+// width, which is a different layout with different renditions.
+log("folder-nav-burst: switch to horizontal continuous reading");
 run_action("FsReadingFlowCycle");
 wait_until(|s| s.continuous_reading, 10000);
+if snapshot().reading_flow != "horizontal" {
+    run_action("FsReadingFlowCycle");
+    wait_until(|s| s.reading_flow == "horizontal", 10000);
+}
 
 // Let the first document settle, so the burst measures navigation rather than arrival.
 sleep(2000);

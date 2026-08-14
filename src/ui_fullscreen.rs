@@ -16380,6 +16380,12 @@ impl App {
             fullscreen_raw_key_permit: false,
             has_previous_page: nav_position.is_some_and(|position| position > 0),
             has_next_page: nav_position.is_some_and(|position| position + 1 < nav.len()),
+            reading_flow: match self.reading_flow {
+                crate::settings::ReadingFlow::Paged => "paged",
+                crate::settings::ReadingFlow::Vertical => "vertical",
+                crate::settings::ReadingFlow::Horizontal => "horizontal",
+            }
+            .to_string(),
             upload_deferral_streak: self.upload_deferral_streak as i64,
             passthrough_unavailable: self
                 .passthrough_unavailable
