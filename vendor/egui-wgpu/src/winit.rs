@@ -402,6 +402,42 @@ impl Painter {
         }
     }
 
+    /// mIV: apply a frame's texture deltas without painting it.
+    ///
+    /// egui hands each delta over exactly once - `Context::end_pass` moves it out of the
+    /// `TextureManager` and nothing re-sends it. Any frame that is produced but never painted
+    /// therefore has to deliver its textures anyway, or the renderer's shared namespace falls
+    /// behind what egui believes is on the GPU. The frames around fullscreen viewport
+    /// recreation and native-video handover are exactly that case: `egui_ctx.run` has already
+    /// returned a delta when the viewport or its window turns out to be gone.
+    ///
+    /// Losing a full font-atlas replacement this way leaves egui laying out against a grown
+    /// atlas while the GPU copy keeps its original 32px height, and the next partial glyph
+    /// upload is rejected:
+    ///   "Copy of Y 45..126 would end up overrunning the bounds of ... Y size 32".
+    /// The same dropped-upload boundary has also shown up as permanently black thumbnails.
+    /// See docs/display-pipeline.md.
+    ///
+    /// Frees are applied here too: this frame will never paint, so nothing can still be
+    /// referencing them, and leaving them behind leaks for the life of the process.
+    pub fn apply_textures_delta(&mut self, textures_delta: &epaint::textures::TexturesDelta) {
+        let Some(render_state) = self.render_state.as_ref() else {
+            return;
+        };
+        let mut renderer = render_state.renderer.write();
+        for (id, image_delta) in &textures_delta.set {
+            renderer.update_texture(
+                &render_state.device,
+                &render_state.queue,
+                *id,
+                image_delta,
+            );
+        }
+        for id in &textures_delta.free {
+            renderer.free_texture(id);
+        }
+    }
+
     /// Returns two things:
     ///
     /// The approximate number of seconds spent on vsync-waiting (if any),

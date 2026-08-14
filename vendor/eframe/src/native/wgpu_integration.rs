@@ -659,7 +659,13 @@ impl WgpuWinitRunning<'_> {
 
         remove_viewports_not_in(viewports, painter, viewport_from_window, &viewport_output);
 
+        // mIV: a frame that will not be painted still has to deliver its texture deltas.
+        // egui already moved them out of its `TextureManager` and never re-sends them, so
+        // returning here without handing them over leaves the renderer behind what egui
+        // thinks is on the GPU - which later fails as a partial glyph upload against a
+        // stale font atlas. See Painter::apply_textures_delta.
         let Some(viewport) = viewports.get_mut(&viewport_id) else {
+            painter.apply_textures_delta(&textures_delta);
             return Ok(EventResult::Wait);
         };
 
@@ -671,6 +677,7 @@ impl WgpuWinitRunning<'_> {
             ..
         } = viewport
         else {
+            painter.apply_textures_delta(&textures_delta);
             return Ok(EventResult::Wait);
         };
 
@@ -1041,11 +1048,16 @@ fn render_immediate_viewport(
         ..
     } = &mut *shared_mut;
 
+    // mIV: same rule as the main render path - an immediate viewport whose window went away
+    // during the user callback still owns this frame's texture deltas, and egui will not
+    // hand them over again. See Painter::apply_textures_delta.
     let Some(viewport) = viewports.get_mut(&ids.this) else {
+        painter.apply_textures_delta(&textures_delta);
         return;
     };
     viewport.info.events.clear(); // they should have been processed
     let (Some(egui_winit), Some(window)) = (&mut viewport.egui_winit, &viewport.window) else {
+        painter.apply_textures_delta(&textures_delta);
         return;
     };
 

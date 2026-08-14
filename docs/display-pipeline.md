@@ -507,15 +507,27 @@ renderer 側 font atlas texture のサイズが一時的にずれることがあ
 の部分 glyph update を送り、フォント崩れ後に wgpu validation panic するログを確認した。
 
 > **2026-08-14 根本修正**: このずれが起きる境界を特定して塞いだ。
-> `Painter::paint_and_update_textures` は **surface が無い viewport で早期 return しており、
-> その return が `textures_delta.set` の適用より手前にあった**
-> (`vendor/egui-wgpu/src/winit.rs`)。egui は delta を `Context::end_pass` で
-> `TextureManager` から**取り出して一度だけ渡す**ので、捨てられた full atlas 置換は
-> 二度と来ない。CPU 側 egui は拡張後の atlas で描き続け、GPU 側は 32px のまま残り、
-> 次の部分 glyph upload が拒否される。texture は renderer の共有 namespace にあり
-> presentation surface を必要としないため、**surface 参照より前に `textures_delta.set` を
-> 適用する**形へ変更した。surface が無い経路では `textures_delta.free` も処理する
-> (描画されないフレームの解放が落ちて leak するため)。
+> **不変条件は「生成されたフレームは、描画されなくても texture delta を必ず渡す」**。
+> egui は delta を `Context::end_pass` で `TextureManager` から**取り出して一度だけ渡す**ので、
+> 捨てられた full atlas 置換は二度と来ない。CPU 側 egui は拡張後の atlas で描き続け、
+> GPU 側は 32px のまま残り、次の部分 glyph upload が拒否される。
+> texture は renderer の共有 namespace にあり presentation surface を必要としない。
+>
+> 落ちていた箇所は **2 層あった**:
+>
+> 1. `Painter::paint_and_update_textures` (`vendor/egui-wgpu/src/winit.rs`) が
+>    **surface 無し viewport の早期 return を `textures_delta.set` の適用より手前に持っていた**。
+>    → surface 参照より前に適用する形へ変更
+> 2. **より手前**: `vendor/eframe/src/native/wgpu_integration.rs` が `egui_ctx.run()` の
+>    戻り値を受け取った後、`viewports.get_mut()` と `window` / `egui_winit` の
+>    パターン束縛で **4 箇所の早期 return** を持ち、そこで `textures_delta` ごと捨てていた。
+>    直前で `remove_viewports_not_in` が該当 viewport を消すため、
+>    **fullscreen viewport の作り直しと native video presenter への引き渡しが正にこの経路**。
+>    → `Painter::apply_textures_delta` を追加し、4 箇所すべてで渡してから return する
+>
+> ⚠ **1 だけを直したビルドで再発した**。1 は painter の中の話で、この経路では
+> **painter が呼ばれないまま delta が消える**ため効かない。
+> 症状が同じでも、落ちている層が違えば直らない。
 > **同じ境界が「サムネイルが純黒で固着する」形でも出ていた** (v1.8.0 回帰、
 > `poll_thumbnails` 側で resync 窓中の upload を先送りする形で回避していた)。
 > 下記の resync は本修正後も残すが、役割は「保険」であって正しさの担保ではない。
