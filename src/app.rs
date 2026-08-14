@@ -5558,6 +5558,16 @@ pub(crate) struct EraseResultCacheEntry {
 /// erase / local-adjust / conceal を再計算しないための境界になる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct EditResultKey {
+    /// Which list `idx` refers to.
+    ///
+    /// An index means nothing on its own: move to another PDF and index 0 is a different page.
+    /// Every cache keyed by this - edit results, final AI, final composites - is looked up by
+    /// scanning for a resident entry at `idx`, which without this field can return the previous
+    /// document's page. On 2026-08-14 it did: a PDF opened and showed the page from the PDF
+    /// before it, from `final_composite`, and kept showing it until the user navigated away and
+    /// back. `fs_cache` had already been given this identity (`ItemsGenerationMap`); the caches
+    /// above it had not, and the display resolver prefers them.
+    pub(crate) items_generation: u64,
     pub(crate) idx: usize,
     pub(crate) source_gen: u64,
     pub(crate) erase_mask_gen: u64,
@@ -53919,6 +53929,7 @@ impl App {
 
     pub(crate) fn current_edit_result_key(&self, idx: usize) -> EditResultKey {
         EditResultKey {
+            items_generation: self.items_generation,
             idx,
             source_gen: self.input_generation.get(&idx).copied().unwrap_or(0),
             erase_mask_gen: self.erase_mask_generation.get(&idx).copied().unwrap_or(0),
@@ -54094,9 +54105,12 @@ impl App {
         if self.fs_entry_is_animated(idx) {
             return None;
         }
+        // Any resident edit generation for this page is acceptable - that is what lets a slider
+        // drag keep showing the last complete result - but it has to belong to the list on
+        // screen. Scanning by index alone crosses documents.
         self.edit_result_cache
             .iter()
-            .find(|(key, _)| key.idx == idx)
+            .find(|(key, _)| key.idx == idx && key.items_generation == self.items_generation)
             .and_then(|(_, entry)| entry.texture.clone())
     }
 
@@ -56178,9 +56192,14 @@ impl App {
         if self.fs_entry_is_animated(idx) {
             return None;
         }
+        // Same rule as `current_edit_result_texture`, and this is the one the 2026-08-14 trace
+        // names: the display resolver prefers final composites over `fs_cache`, so an entry left
+        // by another document at this index wins over a correct miss below it.
         self.final_composite_cache
             .iter()
-            .find(|(key, _)| key.edit_key.idx == idx)
+            .find(|(key, _)| {
+                key.edit_key.idx == idx && key.edit_key.items_generation == self.items_generation
+            })
             .map(|(_, entry)| entry.texture.clone())
     }
 
@@ -56190,14 +56209,19 @@ impl App {
         texture: &egui::TextureHandle,
     ) -> bool {
         self.final_composite_cache.iter().any(|(key, entry)| {
-            key.edit_key.idx == idx && entry.texture.id() == texture.id() && entry.complete
+            key.edit_key.idx == idx
+                && key.edit_key.items_generation == self.items_generation
+                && entry.texture.id() == texture.id()
+                && entry.complete
         })
     }
 
     pub(crate) fn current_final_composite_is_complete(&self, idx: usize) -> bool {
-        self.final_composite_cache
-            .iter()
-            .any(|(key, entry)| key.edit_key.idx == idx && entry.complete)
+        self.final_composite_cache.iter().any(|(key, entry)| {
+            key.edit_key.idx == idx
+                && key.edit_key.items_generation == self.items_generation
+                && entry.complete
+        })
     }
 
     // ── テキスト注釈 (comic) オーバーレイ (Inc 1、最前面 D1) ─────────────

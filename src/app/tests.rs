@@ -22077,6 +22077,9 @@ mod pipeline_cache_refactor_tests {
 
     fn dummy_edit_key(app: &App, idx: usize) -> EditResultKey {
         EditResultKey {
+            // The list the fixture belongs to, so entries it installs are visible to the display
+            // getters. A test that wants a stale entry sets an older generation explicitly.
+            items_generation: app.items_generation,
             idx,
             source_gen: app.input_generation.get(&idx).copied().unwrap_or(0),
             erase_mask_gen: app.erase_mask_generation.get(&idx).copied().unwrap_or(0),
@@ -22154,6 +22157,7 @@ mod pipeline_cache_refactor_tests {
         let base = std::time::Instant::now();
         let key = FinalCompositeKey {
             edit_key: EditResultKey {
+                items_generation: 0,
                 idx: 3,
                 source_gen: 4,
                 erase_mask_gen: 5,
@@ -22166,6 +22170,7 @@ mod pipeline_cache_refactor_tests {
         };
         let other_key = FinalCompositeKey {
             edit_key: EditResultKey {
+                items_generation: 0,
                 idx: 11,
                 ..key.edit_key
             },
@@ -23928,6 +23933,49 @@ mod pipeline_cache_refactor_tests {
         assert!(!app.colorize_display_requires_final_effect(idx));
     }
 
+    /// Materialized display caches must not answer for a page belonging to a different list.
+    ///
+    /// Reported 2026-08-14: holding Ctrl+Down through PDFs, a document opened showing the page
+    /// from the document before it, and kept showing it until the user stepped to page 2 and
+    /// back. The trace named `final_composite` as the source. `fs_cache` had already been given
+    /// list identity, but `EditResultKey` had not, and every getter above it searched the
+    /// resident map for "an entry at this index" - which after a document switch is the previous
+    /// document's page, and which the display resolver prefers over `fs_cache`.
+    ///
+    /// This deliberately does not go through `close_fullscreen`. Clearing on teardown is a
+    /// resource concern; correctness must not depend on remembering to call it.
+    #[test]
+    fn display_caches_do_not_answer_for_a_page_from_another_list() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/doc-a-page-0.jpg");
+        let (_, _) = insert_edit_and_final_cache(&mut app, &ctx, idx, "doc_a");
+
+        assert!(
+            app.current_final_composite_texture(idx).is_some(),
+            "the entry belongs to the list on screen, so it must be usable"
+        );
+        assert!(app.current_edit_result_texture(idx).is_some());
+
+        // Another document takes over the same index. Only the list identity changes; the entries
+        // themselves are deliberately left in place, because that is the state the defect needs.
+        app.items[idx] = GridItem::Image(PathBuf::from("C:/pics/doc-b-page-0.jpg"));
+        app.items_generation += 1;
+
+        assert!(
+            app.current_final_composite_texture(idx).is_none(),
+            "a composite built for the previous document must not be presented for this one"
+        );
+        assert!(
+            app.current_edit_result_texture(idx).is_none(),
+            "same for the edit result the composite is derived from"
+        );
+        assert!(
+            !app.current_final_composite_is_complete(idx),
+            "completeness answered from another list would release the navigation holdover early"
+        );
+    }
+
     /// フォルダ横断 nav lock は raw / thumbnail の到着だけでは解除しない。
     /// カラー化対象で final pipeline を使う表示では、complete composite が表示可能に
     /// なって初めて旧ページ holdover を解放する。
@@ -25513,6 +25561,7 @@ mod pipeline_cache_refactor_tests {
         // 1 件 live で挿入 → true
         let key = FinalAiKey {
             edit_key: EditResultKey {
+                items_generation: 0,
                 idx: 0,
                 source_gen: 0,
                 erase_mask_gen: 0,
@@ -25548,6 +25597,7 @@ mod pipeline_cache_refactor_tests {
         // live な pending を仕込む → prefetch_final_ai は即 return
         let key = FinalAiKey {
             edit_key: EditResultKey {
+                items_generation: 0,
                 idx,
                 source_gen: 0,
                 erase_mask_gen: 0,
@@ -25582,6 +25632,7 @@ mod pipeline_cache_refactor_tests {
 
         let mk_key = |idx: usize| FinalAiKey {
             edit_key: EditResultKey {
+                items_generation: 0,
                 idx,
                 source_gen: 0,
                 erase_mask_gen: 0,
@@ -25662,6 +25713,7 @@ mod pipeline_cache_refactor_tests {
         let idx = push_pdf_page(&mut app, r"C:\books\scan.pdf", 0);
         let key = FinalAiKey {
             edit_key: EditResultKey {
+                items_generation: 0,
                 idx,
                 source_gen: 0,
                 erase_mask_gen: 0,
@@ -25713,6 +25765,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_rx = Some(rx);
         let key = FinalAiKey {
             edit_key: EditResultKey {
+                items_generation: 0,
                 idx: 0,
                 source_gen: 0,
                 erase_mask_gen: 0,
@@ -25765,6 +25818,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_rx = Some(rx);
         let key = FinalAiKey {
             edit_key: EditResultKey {
+                items_generation: 0,
                 idx: 0,
                 source_gen: 0,
                 erase_mask_gen: 0,
@@ -25825,6 +25879,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_rx = Some(rx);
         let key = FinalAiKey {
             edit_key: EditResultKey {
+                items_generation: 0,
                 idx: 0,
                 source_gen: 0,
                 erase_mask_gen: 0,
@@ -26587,6 +26642,7 @@ mod pipeline_cache_refactor_tests {
 
         let mk_key = |idx: usize| FinalAiKey {
             edit_key: EditResultKey {
+                items_generation: 0,
                 idx,
                 source_gen: 0,
                 erase_mask_gen: 0,
@@ -26711,6 +26767,7 @@ mod pipeline_cache_refactor_tests {
 
         let key = FinalAiKey {
             edit_key: EditResultKey {
+                items_generation: 0,
                 idx: 0,
                 source_gen: 0,
                 erase_mask_gen: 0,
@@ -26758,6 +26815,7 @@ mod pipeline_cache_refactor_tests {
         app.items = vec![GridItem::Image(PathBuf::from(r"C:\imgs\00.png"))];
 
         let edit_key = EditResultKey {
+            items_generation: 0,
             idx: 0,
             source_gen: 0,
             erase_mask_gen: 0,
@@ -27681,6 +27739,7 @@ mod pipeline_cache_refactor_tests {
         // 隣接ページの prefetch pending を仕込む (= AI worker 進行中の状態)
         let prefetch_key = FinalAiKey {
             edit_key: EditResultKey {
+                items_generation: 0,
                 idx: prefetch_idx,
                 source_gen: 0,
                 erase_mask_gen: 0,
@@ -27697,6 +27756,7 @@ mod pipeline_cache_refactor_tests {
         // display 経路: 同じ idx (= display_idx) の古い key を 1 件追加
         let display_old_key = FinalAiKey {
             edit_key: EditResultKey {
+                items_generation: 0,
                 idx: display_idx,
                 source_gen: 0,
                 erase_mask_gen: 0,
@@ -27772,6 +27832,7 @@ mod pipeline_cache_refactor_tests {
         // 現在ページの final_ai_pending を仕込む
         let key = FinalAiKey {
             edit_key: EditResultKey {
+                items_generation: 0,
                 idx: idx_cur,
                 source_gen: 0,
                 erase_mask_gen: 0,
@@ -27801,6 +27862,7 @@ mod pipeline_cache_refactor_tests {
         let idx = push_image(&mut app, "C:/pics/prefetch-proceed.jpg");
         let key = FinalAiKey {
             edit_key: EditResultKey {
+                items_generation: 0,
                 idx,
                 source_gen: 0,
                 erase_mask_gen: 0,
@@ -28011,6 +28073,7 @@ mod pipeline_display_edit_split_tests {
         color: egui::Color32,
     ) {
         let edit_key = EditResultKey {
+            items_generation: 0,
             idx,
             source_gen: 0,
             erase_mask_gen: 0,
@@ -38802,6 +38865,7 @@ mod still_window_mode_key_tests {
         insert_static_fs_entry(&mut app, &ctx, idx, "pause_cancel_ai_page");
         let key = FinalAiKey {
             edit_key: EditResultKey {
+                items_generation: 0,
                 idx,
                 source_gen: 0,
                 erase_mask_gen: 0,
@@ -38990,6 +39054,7 @@ mod still_window_mode_key_tests {
         app.final_ai_rx = Some(rx);
         let key = FinalAiKey {
             edit_key: EditResultKey {
+                items_generation: 0,
                 idx: 0,
                 source_gen: 0,
                 erase_mask_gen: 0,
