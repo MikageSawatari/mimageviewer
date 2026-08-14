@@ -6587,6 +6587,37 @@ impl FsNavigationSequence {
         }
     }
 
+    /// A short, stable description of why this sequence is holding navigation, for the log.
+    ///
+    /// Dropping a key repeat is correct while a target is unresolved, but the drop is silent, so
+    /// a sequence that never retires is indistinguishable from one that is merely slow. This is
+    /// what tells the two apart without guessing which branch parked.
+    pub(crate) fn describe_block(&self) -> String {
+        match &self.target {
+            FsNavigationSequenceTarget::FolderItems {
+                accepted_generation,
+            } => format!("FolderItems accepted_generation={accepted_generation}"),
+            FsNavigationSequenceTarget::Display(target) => {
+                let phase = match target.phase {
+                    FsNavigationTargetPhase::Awaiting { accept_rendition } => {
+                        format!("Awaiting accept_rendition={accept_rendition}")
+                    }
+                    FsNavigationTargetPhase::Ready(presentation) => {
+                        format!("Ready({presentation:?})")
+                    }
+                    FsNavigationTargetPhase::Presenting(presentation) => {
+                        format!("Presenting({presentation:?})")
+                    }
+                    FsNavigationTargetPhase::RenditionFailed => "RenditionFailed".to_owned(),
+                };
+                format!(
+                    "Display items_generation={} pages={:?} phase={phase}",
+                    target.items_generation, target.pages
+                )
+            }
+        }
+    }
+
     pub(crate) fn target_pages_for_generation(&self, items_generation: u64) -> &[usize] {
         match &self.target {
             FsNavigationSequenceTarget::Display(target)
@@ -11670,6 +11701,12 @@ pub struct App {
     /// ロックを即解除してしまい、items 入れ替えの瞬間に holdover が失われて
     /// 「ファイル名のみ表示」が出る不具合になる。
     pub(crate) fs_nav_locked_gen: Option<u64>,
+    /// Diagnostics for dropped navigation requests: the blocking state last reported, and how
+    /// many requests have been refused against it. Dropping repeats is intended behaviour, so
+    /// these exist purely to keep a sequence that can no longer retire from looking the same as
+    /// one that is briefly busy. See `note_fullscreen_nav_request_dropped`.
+    pub(crate) fs_nav_dropped_block_signature: Option<String>,
+    pub(crate) fs_nav_dropped_block_count: u32,
     /// 旧表示を保持する単一 typed state。folder navigation / final-effect source reload とも
     /// 単ページ / 見開き全体を 1 unit として持ち、variant ごとに解放条件を分離する。
     /// legacy 名は context bundle の機械的な差分を抑えるため維持している。
@@ -13452,6 +13489,8 @@ impl App {
             conceal_preview_button_rect: None,
             erase_base_tex_cache: std::collections::HashMap::new(),
             fs_nav_locked_gen: None,
+            fs_nav_dropped_block_signature: None,
+            fs_nav_dropped_block_count: 0,
             fs_holdover_tex: None,
             virtual_folder_writeback: None,
             pdf_prefetch_grace_until: None,

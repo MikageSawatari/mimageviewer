@@ -446,6 +446,81 @@ fn parse_navigation_key(name: &str) -> Result<SyntheticNavigationKey, Box<EvalAl
     Ok(key)
 }
 
+/// Parse a modifier spec such as `"ctrl"`, `"ctrl+shift"` or `""`.
+///
+/// Ctrl is what makes folder navigation (Ctrl+Up/Down) expressible, and the timeline already
+/// answers `GetAsyncKeyState` for the modifier VKs from the held set, so a scripted Ctrl chord
+/// reaches both the keymap's OS-level reads and egui's event modifiers - the same two
+/// representations a physical press produces.
+fn parse_modifiers(spec: &str) -> Result<SyntheticModifiers, Box<EvalAltResult>> {
+    let mut modifiers = SyntheticModifiers::default();
+    let spec = spec.trim();
+    if spec.is_empty() || spec.eq_ignore_ascii_case("none") {
+        return Ok(modifiers);
+    }
+    for part in spec.split(['+', ',']) {
+        match part.trim().to_ascii_lowercase().as_str() {
+            "" => {}
+            "ctrl" | "control" => modifiers.ctrl = true,
+            "shift" => modifiers.shift = true,
+            "alt" => modifiers.alt = true,
+            other => {
+                return Err(rhai_error(format!(
+                    "unsupported synthetic modifier: {other} (in {spec:?})"
+                )));
+            }
+        }
+    }
+    Ok(modifiers)
+}
+
+fn hold_key_impl(
+    bridge: &RunnerBridge,
+    name: &str,
+    modifiers: SyntheticModifiers,
+    ms: rhai::INT,
+) -> Result<(), Box<EvalAltResult>> {
+    let key = parse_navigation_key(name)?;
+    let duration = checked_duration(ms, "hold_key ms")?;
+    bridge.require_key_target().map_err(rhai_error)?;
+    let hold_id = bridge.allocate_hold_id();
+    bridge
+        .send(UiCommand::Key(
+            SyntheticKeyCommand::down(Instant::now(), key, modifiers).with_hold_id(hold_id),
+        ))
+        .map_err(rhai_error)?;
+    if let Err(error) = wait_interruptibly(&bridge.interrupt, duration) {
+        let _ = bridge.send_unchecked(UiCommand::Key(
+            SyntheticKeyCommand::up(Instant::now(), key).with_hold_id(hold_id),
+        ));
+        return Err(error);
+    }
+    bridge
+        .send(UiCommand::Key(
+            SyntheticKeyCommand::up(Instant::now(), key).with_hold_id(hold_id),
+        ))
+        .map_err(rhai_error)
+}
+
+fn tap_key_impl(
+    bridge: &RunnerBridge,
+    name: &str,
+    modifiers: SyntheticModifiers,
+) -> Result<(), Box<EvalAltResult>> {
+    let key = parse_navigation_key(name)?;
+    bridge.require_key_target().map_err(rhai_error)?;
+    bridge
+        .send(UiCommand::Key(SyntheticKeyCommand::down(
+            Instant::now(),
+            key,
+            modifiers,
+        )))
+        .map_err(rhai_error)?;
+    bridge
+        .send(UiCommand::Key(SyntheticKeyCommand::up(Instant::now(), key)))
+        .map_err(rhai_error)
+}
+
 fn parse_action(name: &str) -> Result<KeyAction, Box<EvalAltResult>> {
     let action = KeyAction::from_ini_name(name)
         .ok_or_else(|| rhai_error(format!("unknown KeyAction ini name: {name}")))?;
@@ -469,27 +544,22 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
     engine.register_fn(
         "hold_key",
         move |name: ImmutableString, ms: rhai::INT| -> Result<(), Box<EvalAltResult>> {
-            let key = parse_navigation_key(&name)?;
-            let duration = checked_duration(ms, "hold_key ms")?;
-            hold_bridge.require_key_target().map_err(rhai_error)?;
-            let hold_id = hold_bridge.allocate_hold_id();
-            hold_bridge
-                .send(UiCommand::Key(
-                    SyntheticKeyCommand::down(Instant::now(), key, SyntheticModifiers::default())
-                        .with_hold_id(hold_id),
-                ))
-                .map_err(rhai_error)?;
-            if let Err(error) = wait_interruptibly(&hold_bridge.interrupt, duration) {
-                let _ = hold_bridge.send_unchecked(UiCommand::Key(
-                    SyntheticKeyCommand::up(Instant::now(), key).with_hold_id(hold_id),
-                ));
-                return Err(error);
-            }
-            hold_bridge
-                .send(UiCommand::Key(
-                    SyntheticKeyCommand::up(Instant::now(), key).with_hold_id(hold_id),
-                ))
-                .map_err(rhai_error)
+            hold_key_impl(&hold_bridge, &name, SyntheticModifiers::default(), ms)
+        },
+    );
+
+    // `hold_key("Down", "ctrl", 3000)` - folder navigation is a Ctrl chord, so without this
+    // overload the harness cannot express the input that both of the v3.0.0 fullscreen defects
+    // start from.
+    let hold_mod_bridge = bridge.clone();
+    engine.register_fn(
+        "hold_key",
+        move |name: ImmutableString,
+              modifiers: ImmutableString,
+              ms: rhai::INT|
+              -> Result<(), Box<EvalAltResult>> {
+            let modifiers = parse_modifiers(&modifiers)?;
+            hold_key_impl(&hold_mod_bridge, &name, modifiers, ms)
         },
     );
 
@@ -497,18 +567,18 @@ fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
     engine.register_fn(
         "tap_key",
         move |name: ImmutableString| -> Result<(), Box<EvalAltResult>> {
-            let key = parse_navigation_key(&name)?;
-            tap_bridge.require_key_target().map_err(rhai_error)?;
-            tap_bridge
-                .send(UiCommand::Key(SyntheticKeyCommand::down(
-                    Instant::now(),
-                    key,
-                    SyntheticModifiers::default(),
-                )))
-                .map_err(rhai_error)?;
-            tap_bridge
-                .send(UiCommand::Key(SyntheticKeyCommand::up(Instant::now(), key)))
-                .map_err(rhai_error)
+            tap_key_impl(&tap_bridge, &name, SyntheticModifiers::default())
+        },
+    );
+
+    let tap_mod_bridge = bridge.clone();
+    engine.register_fn(
+        "tap_key",
+        move |name: ImmutableString,
+              modifiers: ImmutableString|
+              -> Result<(), Box<EvalAltResult>> {
+            let modifiers = parse_modifiers(&modifiers)?;
+            tap_key_impl(&tap_mod_bridge, &name, modifiers)
         },
     );
 

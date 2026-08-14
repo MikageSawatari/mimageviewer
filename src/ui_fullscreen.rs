@@ -5078,6 +5078,44 @@ impl App {
             .is_some_and(FsNavigationSequence::blocks_new_target)
     }
 
+    /// Record that a navigation request was dropped, and why.
+    ///
+    /// Dropping repeats while a target is unresolved is the intended behaviour, so this must not
+    /// be noisy: it logs once per distinct blocking state, then only the running count. What it
+    /// buys is the difference between "a target is taking a moment" and "a target can no longer
+    /// retire", which is otherwise invisible from outside - the 2026-08-14 report was 14 inputs
+    /// over 21.8 seconds with nothing in the log to say they had been refused.
+    fn note_fullscreen_nav_request_dropped(&mut self) {
+        let Some(sequence) = self
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+        else {
+            return;
+        };
+        let signature = format!(
+            "{} fs_idx={:?} items_generation={}",
+            sequence.describe_block(),
+            self.fullscreen_idx,
+            self.items_generation
+        );
+        if self.fs_nav_dropped_block_signature.as_deref() == Some(signature.as_str()) {
+            self.fs_nav_dropped_block_count += 1;
+            // Powers of two keep a genuinely wedged sequence visible without flooding a log
+            // during the ordinary case of a few repeats arriving inside one page turn.
+            if self.fs_nav_dropped_block_count.is_power_of_two() {
+                crate::logger::log(format!(
+                    "[fs-nav] dropped {} requests against the same unresolved target: {signature}",
+                    self.fs_nav_dropped_block_count
+                ));
+            }
+            return;
+        }
+        self.fs_nav_dropped_block_signature = Some(signature.clone());
+        self.fs_nav_dropped_block_count = 1;
+        crate::logger::log(format!("[fs-nav] dropped request: {signature}"));
+    }
+
     pub(crate) fn begin_fs_folder_navigation_sequence(
         &mut self,
         ctx: &egui::Context,
@@ -21726,6 +21764,7 @@ impl App {
         native_toast: bool,
     ) {
         if self.fs_navigation_sequence_blocks_new_target() {
+            self.note_fullscreen_nav_request_dropped();
             return;
         }
         if self.fs_nav_is_locked() {
@@ -33049,6 +33088,105 @@ mod tests {
         };
         app.observe_fs_navigation_sequence_presented(&[first, second]);
         assert!(app.fs_holdover_tex.is_none());
+    }
+
+    /// Build an app sitting in fullscreen on a video whose thumbnail has loaded.
+    ///
+    /// A video is drawn by the native presenter, so it never reaches
+    /// `emit_fs_page_turn_ready_for_display_unit` - the only production caller of
+    /// `observe_fs_navigation_sequence_presented`, and therefore the only thing that can retire a
+    /// navigation sequence. Anything that opens a sequence for this item has to be able to close
+    /// it some other way, or fullscreen navigation stops responding until the user leaves
+    /// fullscreen entirely.
+    fn app_in_fullscreen_on_a_video(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
+        let mut app = crate::app::setup_app_for_test();
+        let texture = ctx.load_texture(
+            stringify!(video_thumbnail),
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        app.items = vec![crate::grid_item::GridItem::Video(std::path::PathBuf::from(
+            "c:/clips/clip.mp4",
+        ))];
+        app.thumbnails = vec![crate::grid_item::ThumbnailState::Loaded {
+            tex: texture,
+            from_cache: false,
+            from_edit_preview: false,
+            rendered_at_px: 64,
+            source_dims: None,
+            layout_dims: None,
+        }];
+        app.fullscreen_idx = Some(0);
+        app.items_generation = 5;
+        app
+    }
+
+    /// Ctrl+Down onto a folder whose first item is a video must not wedge navigation.
+    ///
+    /// Observed 2026-08-14: 14 navigation inputs over 21.8 seconds produced no folder change,
+    /// and only leaving fullscreen recovered.
+    #[test]
+    fn folder_navigation_onto_a_video_does_not_wedge_the_next_navigation() {
+        let ctx = egui::Context::default();
+        let mut app = app_in_fullscreen_on_a_video(&ctx);
+        app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous: None,
+            target: FsNavigationSequenceTarget::FolderItems {
+                accepted_generation: 4,
+            },
+        }));
+        app.fs_nav_locked_gen = Some(4);
+
+        app.poll_fs_nav_lock(&ctx);
+
+        assert!(
+            !app.fs_navigation_sequence_blocks_new_target(),
+            "a sequence that landed on a video has to retire: the page-turn draw path that would \
+             normally retire it never runs for a natively presented item, so leaving it open \
+             drops every later Ctrl+Up/Down"
+        );
+    }
+
+    /// A `Display` target names a unit the page renderer will draw, and the page renderer's trace
+    /// is the only thing that retires a sequence. So every page in such a target has to be
+    /// page-bearing; a video described this way can be resolved to `Ready` but never presented,
+    /// and fullscreen navigation stops responding.
+    ///
+    /// `Ready` is deliberately not the assertion here: it means "drawable", not "presented", so
+    /// checking `blocks_new_target()` right after resolution would encode the wrong contract.
+    /// The defect is that the target was built at all.
+    #[test]
+    #[ignore = "red until a natively presented item stops being described as a page display unit"]
+    fn page_navigation_never_describes_a_natively_presented_item_as_a_page_unit() {
+        let ctx = egui::Context::default();
+        let mut app = app_in_fullscreen_on_a_video(&ctx);
+        // idx 0 is a still image the viewer is on; idx 1 is the video it navigates to.
+        app.items.insert(
+            0,
+            crate::grid_item::GridItem::Image(std::path::PathBuf::from("c:/clips/page.png")),
+        );
+        let still = app.thumbnails[0].clone();
+        app.thumbnails.insert(0, still);
+        app.fullscreen_idx = Some(0);
+
+        app.begin_fs_page_navigation_sequence(&ctx, 0, 1, true);
+
+        let target = app
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .map(|sequence| sequence.target.clone());
+        if let Some(FsNavigationSequenceTarget::Display(target)) = target {
+            for page in &target.pages {
+                assert!(
+                    app.items
+                        .get(*page)
+                        .is_some_and(crate::grid_item::GridItem::has_page_data),
+                    "page {page} of a Display target is not drawn by the page renderer, so no \
+                     presentation trace can ever retire this sequence"
+                );
+            }
+        }
     }
 
     #[test]
