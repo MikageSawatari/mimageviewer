@@ -1682,6 +1682,21 @@ docs/conceal-feature-plan.md
   (今回は同時に触らないと決めた)。
 - 規模 / 優先度: 中 / P2。
 
+### 1.86 surface 取得に失敗したフレームで `textures_delta.free` が捨てられる
+
+- 出典: v3.0.0 出荷前の font atlas 調査 (2026-08-14) で Codex が併せて指摘。
+  **今回のクラッシュの原因ではない** (`set` は既に適用済みの位置にある) が、同じ関数の同型の穴。
+- `paint_and_update_textures` は `set` を surface 参照より前に適用するようになったが、
+  **`free` のループは描画の後ろ**にある。`get_current_texture` が失敗して
+  `SurfaceErrorAction::RecreateSurface` / `SkipFrame` で戻る経路
+  (`vendor/egui-wgpu/src/winit.rs`) では free が実行されない。
+- 影響は**テクスチャリーク**であってクラッシュではない。egui は id を再利用しないので
+  誤描画にはならず、解放されない GPU テクスチャがプロセス寿命で残るだけ。
+  サムネイルを大量に流す使い方だと効いてくる可能性がある。
+- 直し方: no-surface 早期 return と同じく、これらの経路でも `free` を流す。
+  `set` / `free` の適用を 1 つのヘルパに寄せて、描画の成否と独立にするのが素直。
+- 規模 / 優先度: 小 / P3。
+
 ### 1.84 表示キャッシュに item-context 世代の刻印が無い (latent、ABA 危険)
 
 - 出典: v3.0.0 出荷前の holdover 調査 (2026-08-14) で Codex が併せて指摘。

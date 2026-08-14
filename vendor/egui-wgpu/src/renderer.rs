@@ -256,6 +256,10 @@ pub struct Renderer {
 
     options: RendererOptions,
 
+    /// mIV: a small stable number identifying this renderer in `atlas_diag` dumps. The app runs a
+    /// second renderer for the native video presenter, and a dump has to say which one it means.
+    diag_id: u64,
+
     /// Storage for resources shared with all invocations of [`CallbackTrait`]'s methods.
     ///
     /// See also [`CallbackTrait`].
@@ -460,6 +464,7 @@ impl Renderer {
             samplers: HashMap::default(),
             mipmap_generator: None,
             options,
+            diag_id: crate::atlas_diag::next_renderer_id(),
             callback_resources: CallbackResources::default(),
         }
     }
@@ -669,6 +674,7 @@ impl Renderer {
             if pos[0] as u32 + width > existing.width || pos[1] as u32 + height > existing.height {
                 crate::atlas_diag::report_overflow(
                     id,
+                    self.diag_id,
                     pos,
                     [width as usize, height as usize],
                     [existing.width, existing.height],
@@ -793,8 +799,17 @@ impl Renderer {
         Some([size.width, size.height])
     }
 
+    /// mIV: this renderer's number in `atlas_diag` dumps.
+    pub fn diag_id(&self) -> u64 {
+        self.diag_id
+    }
+
     pub fn free_texture(&mut self, id: &epaint::TextureId) {
         if let Some(texture) = self.textures.remove(id).and_then(|t| t.texture) {
+            // Record only a free that actually removed something: a no-op call would otherwise
+            // read back as proof that the GPU texture was reset. See atlas_diag.
+            let size = texture.size();
+            crate::atlas_diag::record_freed(*id, self.diag_id, [size.width, size.height]);
             texture.destroy();
         }
     }

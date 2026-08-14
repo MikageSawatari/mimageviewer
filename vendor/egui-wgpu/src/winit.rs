@@ -19,9 +19,20 @@ fn apply_delta_set(
     textures_delta: &epaint::textures::TexturesDelta,
     site: crate::atlas_diag::Site,
 ) {
+    let diag_id = renderer.diag_id();
+    let tracking = crate::atlas_diag::begin_applied_batch(site, diag_id, textures_delta);
     for (id, image_delta) in &textures_delta.set {
-        crate::atlas_diag::record_applied(site, *id, image_delta, renderer.texture_size(id));
+        // Bracket the call: a delta that was skipped as out of bounds must not read back as a
+        // successful application, so `after` is taken once `update_texture` has returned.
+        let before = renderer.texture_size(id);
         renderer.update_texture(device, queue, *id, image_delta);
+        let after = renderer.texture_size(id);
+        crate::atlas_diag::record_applied(*id, diag_id, image_delta, before, after);
+    }
+    if tracking {
+        // Flush at the end of the batch rather than at the offending delta: a batch can be
+        // `[stale partial, repairing full]`, and dumping early would hide the repair.
+        crate::atlas_diag::flush("applying a texture delta batch");
     }
 }
 
@@ -438,6 +449,11 @@ impl Painter {
     /// referencing them, and leaving them behind leaks for the life of the process.
     pub fn apply_textures_delta(&mut self, textures_delta: &epaint::textures::TexturesDelta) {
         let Some(render_state) = self.render_state.as_ref() else {
+            crate::atlas_diag::record_dropped_batch(
+                crate::atlas_diag::Site::AppliedNoPaint,
+                crate::atlas_diag::DropReason::RenderStateAbsent,
+                textures_delta,
+            );
             return;
         };
         let mut renderer = render_state.renderer.write();
@@ -474,6 +490,11 @@ impl Painter {
         let mut vsync_sec = 0.0;
 
         let Some(render_state) = self.render_state.as_mut() else {
+            crate::atlas_diag::record_dropped_batch(
+                crate::atlas_diag::Site::AppliedPaint,
+                crate::atlas_diag::DropReason::RenderStateAbsent,
+                textures_delta,
+            );
             return vsync_sec;
         };
 

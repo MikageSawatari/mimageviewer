@@ -435,21 +435,33 @@ renderer へ届いていない** (どこかで捨てられている)。partial �
 ### 入れた計装 (`egui_wgpu::atlas_diag`)
 
 一度の再現で決着が付くこと、常時コストが無いこと、**計装ビルドが落ちないこと**を要件にした。
+初版は Codex のレビューで 5 点の不備が出たので、以下は修正後の形。
 
-- **リングバッファ台帳** (`vendor/egui-wgpu/src/atlas_diag.rs`、512 件、font atlas のみ)。
-  ディスクには**異常時しか書かない**
-- **生成側**: `wgpu_integration.rs` の 2 生成点で `record_produced`
-  (`ProducedMain` / `ProducedImmediate`)
-- **適用側**: `Painter` の 2 適用点を `apply_delta_set` に集約し、
-  delta ごとに **適用直前に renderer が持っているサイズ** を併記して `record_applied`
-- **検出と自己防衛**: `update_texture` の partial 分岐で
-  `pos + size` がテクスチャ外に出たら `report_overflow` で**台帳全体を吐いてから
-  書き込みをスキップ**する。panic せず、テクスチャは元のまま戻す。
-  1 フレーム文字が崩れる代わりにセッションが死なないので、利用者は再現を続けられる
-- 出力先は `egui_wgpu::atlas_diag::set_sink` で mIV のロガーへ (`src/lib.rs`)
+- **リングバッファ台帳** (`vendor/egui-wgpu/src/atlas_diag.rs`、768 件、font atlas のみ)。
+  ディスクには**異常時しか書かない**。dump は 3 回まで
+- **生成側**: `wgpu_integration.rs` の 2 生成点 (`integration.update` と immediate viewport の
+  nested `run`) で `record_produced`。batch ヘッダに site / viewport と、
+  **egui 自身が「GPU に載っているはず」と思っているサイズ**
+  (`ctx.tex_manager().read().meta(Managed(0)).size`) を併記する
+- **適用側**: `Painter` の 2 適用点を `apply_delta_set` に集約。delta ごとに
+  `update_texture` の **前後** で renderer の実サイズを読む
+  (前だけだと「試みた」であって「適用された」証拠にならない — Codex 指摘)
+- **presenter も同じ経路に載せた**。native video presenter は別 Context / 別 Renderer を持つので
+  renderer 番号 (`diag_id`) で区別する。3 回のクラッシュ全部に presenter が絡んでいる
+- **検出と自己防衛**: `update_texture` の partial 分岐で `pos + size` がテクスチャ外に出たら
+  `report_overflow` が記録してフラグを立て、**書き込みをスキップ**してテクスチャは元のまま戻す。
+  panic しないので利用者は再現を続けられる
+- **dump は batch の末尾**で行う。batch が `[stale partial, 修復する full]` の順になり得るため、
+  partial の時点で吐くと修復側が見えない (Codex 指摘)
+- 出力先は `set_sink` で mIV のロガーへ (`src/lib.rs`)
 
-**読み方**: `produced` の各行に対応する `applied` があるか。
+**読み方**: `produced` の各 FULL に対応する `applied` があるか。
 
-- FULL が produced されているのに applied が無い → **backend が捨てている** (捨てた site が出る)
-- 直前の applied FULL より後ろに FULL が produced されていない → **egui が拡張 delta を
-  出していない** = 上流の問題で、egui 本体を vendor する必要がある
+| dump の形 | 意味 |
+| --- | --- |
+| FULL が produced されているのに applied が無い | **backend が捨てている**。batch ヘッダが捨てた site を名指しする |
+| 直前の applied FULL より後ろに FULL の produced が無いのに `egui_installed` は大きい | **egui が拡張 delta を出していない** = 上流の問題。egui 本体の vendor が必要 |
+| applied の `after` が `before` から変わっていない | 適用が空振りしている |
+
+⚠ **overflow のスキップは fix ではない** (Codex 指摘)。原因が特定できるまでの延命策であり、
+台帳が答えを出したら構造的な修正に置き換える。

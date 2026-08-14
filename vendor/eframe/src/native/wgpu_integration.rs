@@ -664,6 +664,7 @@ impl WgpuWinitRunning<'_> {
             egui_wgpu::atlas_diag::Site::ProducedMain,
             &textures_delta,
             Some(viewport_id.0.value()),
+            egui_installed_atlas_size(&egui_ctx),
         );
 
         remove_viewports_not_in(viewports, painter, viewport_from_window, &viewport_output);
@@ -1053,6 +1054,7 @@ fn render_immediate_viewport(
         egui_wgpu::atlas_diag::Site::ProducedImmediate,
         &textures_delta,
         Some(ids.this.0.value()),
+        egui_installed_atlas_size(&egui_ctx),
     );
 
     // ------------------------------------------
@@ -1107,6 +1109,17 @@ fn render_immediate_viewport(
         painter,
         viewport_from_window,
     );
+}
+
+/// mIV: what egui's own texture manager believes is installed for the font atlas.
+///
+/// This is the value the backend is obliged to have on the GPU once it has applied the batch that
+/// was just produced, so a dump can say whether the renderer fell behind egui or egui never
+/// emitted the growth in the first place. See `egui_wgpu::atlas_diag`.
+fn egui_installed_atlas_size(egui_ctx: &egui::Context) -> Option<[usize; 2]> {
+    let tex_manager = egui_ctx.tex_manager();
+    let guard = tex_manager.read();
+    guard.meta(egui::TextureId::default()).map(|meta| meta.size)
 }
 
 pub(crate) fn remove_viewports_not_in(

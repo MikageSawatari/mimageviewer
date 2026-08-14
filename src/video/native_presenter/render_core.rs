@@ -7988,6 +7988,19 @@ impl NativeEguiOverlay {
                 );
             }
         });
+        // presenter は本体とは別の egui Context を持つので、生成側もここで記録しないと
+        // 「produced と applied が対になる」という台帳の読み方が presenter 分だけ崩れる
+        // (Codex 2 周目指摘)。詳細: `egui_wgpu::atlas_diag`。
+        egui_wgpu::atlas_diag::record_produced(
+            egui_wgpu::atlas_diag::Site::ProducedPresenter,
+            &full_output.textures_delta,
+            None,
+            {
+                let tex_manager = self.egui_ctx.tex_manager();
+                let guard = tex_manager.read();
+                guard.meta(egui::TextureId::default()).map(|meta| meta.size)
+            },
+        );
         let repaint_delay = full_output
             .viewport_output
             .get(&egui::ViewportId::ROOT)
@@ -8066,9 +8079,24 @@ impl NativeEguiOverlay {
         });
 
         let shape_count = full_output.shapes.len();
+        // presenter は本体とは別の egui Context / Renderer を持つ。font atlas の追跡台帳は
+        // renderer 番号で区別するので、こちらの適用も同じ経路に載せる
+        // (詳細: `egui_wgpu::atlas_diag`)。
+        let diag_id = self.renderer.diag_id();
+        let atlas_tracked = egui_wgpu::atlas_diag::begin_applied_batch(
+            egui_wgpu::atlas_diag::Site::AppliedPresenter,
+            diag_id,
+            &full_output.textures_delta,
+        );
         for (id, image_delta) in &full_output.textures_delta.set {
+            let before = self.renderer.texture_size(id);
             self.renderer
                 .update_texture(&self.device, &self.queue, *id, image_delta);
+            let after = self.renderer.texture_size(id);
+            egui_wgpu::atlas_diag::record_applied(*id, diag_id, image_delta, before, after);
+        }
+        if atlas_tracked {
+            egui_wgpu::atlas_diag::flush("applying the presenter's texture delta batch");
         }
         let paint_jobs = self
             .egui_ctx
