@@ -265,19 +265,33 @@ impl InterruptState {
         self.failure.lock().ok().and_then(|guard| guard.clone())
     }
 
+    /// Sleep for `duration`, returning early only if the run has actually failed.
+    ///
+    /// The loop is the point. `wait_timeout` returns on spurious wakeups as well as on notify, so
+    /// taking the first wakeup as "the wait is over" makes a hold last however long the condvar
+    /// felt like: a twenty-second burst returned in 45ms, the script sailed past its assertions
+    /// because nothing had happened yet, and the run reported success. A scenario that silently
+    /// does not run is worse than one that fails.
     fn wait(&self, duration: Duration) -> Result<(), String> {
-        let guard = self
+        let deadline = std::time::Instant::now() + duration;
+        let mut guard = self
             .failure
             .lock()
             .map_err(|_| "script interrupt state is poisoned".to_string())?;
-        if let Some(message) = guard.as_ref() {
-            return Err(message.clone());
+        loop {
+            if let Some(message) = guard.as_ref() {
+                return Err(message.clone());
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(());
+            }
+            let (next, _) = self
+                .changed
+                .wait_timeout(guard, deadline - now)
+                .map_err(|_| "script interrupt state is poisoned".to_string())?;
+            guard = next;
         }
-        let (guard, _) = self
-            .changed
-            .wait_timeout(guard, duration)
-            .map_err(|_| "script interrupt state is poisoned".to_string())?;
-        guard.as_ref().cloned().map_or(Ok(()), Err)
     }
 }
 
@@ -1373,6 +1387,54 @@ pub(crate) fn cli_script_path_from(args: &[std::ffi::OsString]) -> Result<Option
 
 #[cfg(test)]
 mod tests {
+    use super::InterruptState;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// A hold must last as long as it was asked to, even when something wakes the condvar.
+    ///
+    /// Without the loop this returned on the first notify and a twenty-second burst finished in
+    /// 45ms, so the scenario never ran and the script reported success anyway.
+    #[test]
+    fn a_wait_is_not_ended_by_a_wakeup_that_is_not_a_failure() {
+        let state = Arc::new(InterruptState::default());
+        let waker = Arc::clone(&state);
+        std::thread::spawn(move || {
+            for _ in 0..10 {
+                std::thread::sleep(Duration::from_millis(5));
+                waker.changed.notify_all();
+            }
+        });
+        let started = Instant::now();
+        state
+            .wait(Duration::from_millis(300))
+            .expect("no failure was set");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(290),
+            "the wait ended after {elapsed:?} instead of running its full 300ms"
+        );
+    }
+
+    #[test]
+    fn a_wait_ends_as_soon_as_the_run_fails() {
+        let state = Arc::new(InterruptState::default());
+        let failer = Arc::clone(&state);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            failer.fail("the window lost focus");
+        });
+        let started = Instant::now();
+        let error = state
+            .wait(Duration::from_secs(30))
+            .expect_err("a failure must interrupt the wait");
+        assert_eq!(error, "the window lost focus");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a failure must not wait out the full duration"
+        );
+    }
+
     use super::*;
     use std::ffi::OsString;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
