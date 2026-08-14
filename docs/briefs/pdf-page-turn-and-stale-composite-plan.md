@@ -855,3 +855,56 @@ sequence が retire しない ────┘
 
 `draw_fs_spread` に到達しない理由、および表紙の単独表示と
 `FsNavigationDisplayTarget.pages` の整合を確認する。
+
+## ⑩ 根本原因 (2026-08-14 深夜、確定)
+
+### 該当箇所
+
+[src/ui_fullscreen.rs](../../src/ui_fullscreen.rs) `prepare_fullscreen_state` 冒頭:
+
+```rust
+if let SpreadPair::Double { left, right } = spread_pair {
+    let partner = if left == fs_idx { right } else { left };
+    self.advance_animation(ctx, partner);
+    if !page_turn_decision.defer_ui_uploads() {
+        self.ensure_fs_page_load(partner);        // ← 遅延中はスキップ
+    }
+}
+```
+
+### 循環
+
+```
+sequence が rendition phase に入る → defer_ui_uploads = true
+        ↓
+見開きの相方 (idx 1) が ensure_fs_page_load されない
+        ↓
+表示ユニット [0,1] が揃わない → 提示されない
+        ↓
+page_turn_ready が出ない → sequence が retire しない
+        ↓
+defer_ui_uploads が true のまま ────┘
+```
+
+**遅延が、その遅延を終わらせる当のページのロードを止めている。**
+
+### ログとの一致 (すべて説明が付く)
+
+| 観測 | 説明 |
+| --- | --- |
+| `idx0:ok@1f  idx1:ok@2046f` | idx 0 は fs_idx なので通常ロード。idx 1 は相方なのでロードされない |
+| 見開きでのみ発生 | `SpreadPair::Double` が前提 |
+| 連結 / pass-through 時のみ | `defer_ui_uploads` が true になる条件 |
+| 文書の 1 ページ目で発生 | 移動直後に sequence が rendition phase に入る |
+| 再起動でしか復帰しない | 循環に外部からの解除がない |
+| `fs/paint` が出ない | ユニットが揃わないので描画されない |
+
+### 修正の方向 (症状パッチにしないこと)
+
+`defer_ui_uploads` は**ページ送り連打中に全解像度アップロードで UI を止めない**ための遅延。
+しかし **sequence が提示を待っているページ**は、その遅延の対象にしてはならない。
+「待っている対象」と「後回しにしてよい対象」が同じ述語で判定されているのが構造上の誤り。
+
+タイムアウトや watchdog で解除するのは症状パッチ。
+`ensure_fs_page_load(partner)` を遅延の対象から外す (= 現表示ユニットは常にロードする)
+のが筋の修正と考えられるが、**実装は Codex / 利用者と合意してから**。
