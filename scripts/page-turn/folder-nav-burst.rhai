@@ -45,6 +45,14 @@ wait_until(|s|
     30000
 );
 
+// Windowed viewing, not true fullscreen. The report was made from a window - the screenshot has a
+// title bar - and the two are different paths: a window keeps the viewer embedded in the main
+// viewport, while fullscreen gives it a viewport of its own. The trace shows the embedded branch
+// throughout the wedge.
+log("folder-nav-burst: switch the viewer to window mode");
+run_action("FsToggleWindowMode");
+sleep(1000);
+
 // A post filter puts the final-effect pipeline in the path, which is what the pass-through
 // rendition exists to cover for. Without it the page materializes directly and the sequence never
 // enters the phase that defers uploads - a default profile cannot reach the reported state.
@@ -82,7 +90,14 @@ let before = snapshot().items_generation;
 let rounds = 4;
 for round in 0..rounds {
     log("folder-nav-burst: burst " + (round + 1) + " of " + rounds);
-    hold_key("Down", "ctrl", 8000);
+
+    // Folder navigation and page turns interleaved, which is how the report describes it: a few
+    // documents forward, then pages within one, then on again. Ctrl+Down alone lands on page 0 of
+    // each document and never builds the in-document state that a plain Down leaves behind.
+    hold_key("Down", "ctrl", 4000);
+    hold_key("Down", 2000);
+    hold_key("Down", "ctrl", 4000);
+    hold_key("Down", 2000);
 
     // Long enough for the landing page to materialize and its upscale to run. A raster PDF holds
     // its AI back until a full-resolution re-render lands, so a short pause leaves the upscale

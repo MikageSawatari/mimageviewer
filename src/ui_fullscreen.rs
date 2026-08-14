@@ -14378,16 +14378,25 @@ impl App {
         if self.upload_deferral_streak < 64 || !self.upload_deferral_streak.is_power_of_two() {
             return;
         }
+        // Says whether anything is *asking* for a rendition, not only whether one was refused.
+        // Those look identical in a "no failures recorded" report and are opposite problems: a
+        // rendition that will not build, versus a draw path that has stopped running.
+        let asked = match self.passthrough_last_call {
+            Some((frame, idx, outcome)) => format!(
+                "last_asked={} frames ago (idx={idx}, {})",
+                self.frame_counter.saturating_sub(frame),
+                match outcome {
+                    Some(reason) => reason.as_str(),
+                    None => "ok",
+                }
+            ),
+            None => "never asked".to_owned(),
+        };
         crate::logger::log(format!(
-            "[page-turn] UI uploads deferred for {} consecutive frames: fs_idx={fs_idx}              passthrough_ready={} items_generation={} passthrough_unavailable={:?} key={:?}",
+            "[page-turn] UI uploads deferred for {} consecutive frames: fs_idx={fs_idx}              passthrough_ready={} items_generation={} passthrough {asked} key={:?}",
             self.upload_deferral_streak,
             decision.passthrough_rendition_ready,
             self.items_generation,
-            self.passthrough_unavailable.map(|(idx, reason, frames)| (
-                idx,
-                reason.as_str(),
-                frames
-            )),
             self.perf_item_key(fs_idx),
         ));
     }

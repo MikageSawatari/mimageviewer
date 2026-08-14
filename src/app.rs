@@ -8866,6 +8866,14 @@ pub struct App {
     /// 218-second livelock left no record of which one fired. Reported on a doubling schedule so a
     /// 165fps spin does not flood the log.
     pub(crate) passthrough_unavailable: Option<(usize, PassthroughUnavailable, u64)>,
+    /// The last time the pass-through resolver was asked at all: frame, page, and how it answered.
+    ///
+    /// `passthrough_unavailable` alone cannot say whether a rendition is genuinely available or
+    /// whether nobody has asked for one since it was last cleared, and those are different
+    /// failures: one is a rendition that will not build, the other is a draw path that has stopped
+    /// running. The first wedge investigated with this instrumentation reported "available" when
+    /// what had actually happened was that nothing was asking.
+    pub(crate) passthrough_last_call: Option<(u64, usize, Option<PassthroughUnavailable>)>,
     /// Consecutive frames whose page-turn decision deferred texture uploads. See
     /// `App::note_upload_deferral`.
     pub(crate) upload_deferral_streak: u64,
@@ -12558,6 +12566,7 @@ impl App {
             item_id_interner: std::cell::RefCell::default(),
             texture_identity: std::cell::RefCell::default(),
             passthrough_unavailable: None,
+            passthrough_last_call: None,
             upload_deferral_streak: 0,
             display_identity_error: std::cell::RefCell::new(None),
             thumbnails: Vec::new(),
@@ -61400,15 +61409,18 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
-        match self.ensure_passthrough_rendition_inner(ctx, idx) {
+        let outcome = match self.ensure_passthrough_rendition_inner(ctx, idx) {
             Ok(texture) if self.display_texture_matches_page(&texture, idx) => {
                 self.passthrough_unavailable = None;
-                Some(texture)
+                Ok(texture)
             }
-            Ok(_) => {
-                self.note_passthrough_unavailable(idx, PassthroughUnavailable::IdentityMismatch);
-                None
-            }
+            Ok(_) => Err(PassthroughUnavailable::IdentityMismatch),
+            Err(reason) => Err(reason),
+        };
+        self.passthrough_last_call =
+            Some((self.frame_counter, idx, outcome.as_ref().err().copied()));
+        match outcome {
+            Ok(texture) => Some(texture),
             Err(reason) => {
                 self.note_passthrough_unavailable(idx, reason);
                 None
