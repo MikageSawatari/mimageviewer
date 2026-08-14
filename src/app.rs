@@ -54782,13 +54782,17 @@ impl App {
 
     /// Record that the page the user is looking at was considered already loaded.
     ///
-    /// `fs_page_load_state` answers from `fs_cache` and the retained PDF final-AI store, both of
-    /// which are keyed by `idx` alone; `FsCacheEntry` carries a `load_seq` but no item identity
-    /// and no `items_generation`. So an entry left by a different document under the same index
-    /// reads as "already displayable" and suppresses the load entirely - which is silent, and is
-    /// why a PDF could sit showing the previous document's first page until the user navigated
-    /// away and back. The `load_seq` recorded here is what makes that visible: an entry answering
-    /// for the current page while carrying a sequence from an earlier navigation is stale.
+    /// `fs_page_load_state` can answer "already displayable" from the retained PDF final-AI store
+    /// (keyed by a stable item key) or from `fs_cache` (an `ItemsGenerationMap`, so index reuse
+    /// across lists is already rejected). Neither should be able to answer for a page that was
+    /// never produced, yet on 2026-08-14 a PDF opened and its first page was presented with no
+    /// load ever issued for it - no `load_begin`, no decode, no `ready` - and the previous
+    /// document's page stayed on screen until the user stepped away and back.
+    ///
+    /// Which of the two answered, or whether the load was suppressed before reaching here, is not
+    /// determinable from the source; that is what this records. The `load_seq` is the tell: an
+    /// entry answering for the current page while carrying a sequence from an earlier navigation
+    /// did not come from this one.
     ///
     /// Deduplicated by the whole signature, so a steady state logs once rather than every frame.
     fn note_fs_page_load_skipped(&mut self, idx: usize, state: FsPageLoadState) {

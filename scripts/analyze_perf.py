@@ -2787,8 +2787,10 @@ def cmd_display_integrity(events: list[dict], check: bool) -> int:
     """Report pages presented from a materialized source that were never decoded.
 
     A page reaches the screen from a materialized source (`final_composite`, `fs_cache`,
-    `edit_result`) only after it has been produced, which the trace records as `fs/ready` for that
-    key. `holdover` and `thumbnail` are the intended transitional sources and are exempt.
+    `edit_result`) only after it has been produced. Production is normally `fs/ready` for that
+    key, but a retained PDF page can also be materialized from a store keyed by a stable item key
+    without decoding again in this session, so that counts as evidence too. `holdover` and
+    `thumbnail` are the intended transitional sources and are exempt.
 
     The state that answers "is this page already loaded?" is keyed by index alone and carries no
     item identity, so an entry left behind by a different document under the same index suppresses
@@ -2804,7 +2806,7 @@ def cmd_display_integrity(events: list[dict], check: bool) -> int:
         if e.get("cat") != "fs":
             continue
         kind = e.get("kind")
-        if kind == "ready":
+        if kind == "ready" or "retain" in str(e.get("source", "")) or "retain" in kind:
             ready.add(e.get("key"))
         elif kind == "paint":
             painted += 1
