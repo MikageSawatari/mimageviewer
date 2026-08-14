@@ -75,8 +75,8 @@ set_repeat(250, 30);
 
 let before = snapshot().items_generation;
 
-log("folder-nav-burst: hold Ctrl+Down for 20 seconds");
-hold_key("Down", "ctrl", 20000);
+log("folder-nav-burst: hold Ctrl+Down for 60 seconds");
+hold_key("Down", "ctrl", 60000);
 
 // A scenario that quietly does not run is worse than one that fails: an early return from the
 // hold once let this script sail through every assertion below and report success after 45ms of
@@ -86,7 +86,7 @@ let travelled = snapshot().items_generation - before;
 log("folder-nav-burst: documents visited during the burst: " + travelled);
 if travelled < 10 {
     fail("the burst did not navigate: only " + travelled
-        + " documents in 20 seconds. The hold is not reaching the viewer.");
+        + " documents. The hold is not reaching the viewer.");
 }
 
 // Everything below happens with no key held. Any deferral that persists here is waiting on

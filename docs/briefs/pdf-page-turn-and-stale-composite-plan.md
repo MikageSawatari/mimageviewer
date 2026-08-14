@@ -704,3 +704,44 @@ t=46.885 に thumbnail は Loaded になっている。それでも pass-through
 今回追加した gate はどれも拒否していない。navigation sequence /
 アップロード backlog / idle upgrade はいずれも今回触っていない。
 ただし **「触っていないから無関係」とは断定しない** — 旧ビルドでの同一ストレス比較が要る。
+
+### 再現ハーネスの現状 (2026-08-14 深夜)
+
+```bash
+.\scripts\page-turn-smoke.ps1 -Script "scripts\page-turn\folder-nav-burst.rhai" `
+  -Folder "d:\home\scan\comic" `
+  -SettingsOverride '{"ai_feature_mode":"high_quality","global_preset":{"colorize":{"mode":"monochrome_only"},"upscale_model":"realesr_general_v3"}}' `
+  -ScriptDataDir "target\page-turn-smoke\real-data" -RunTimeoutSeconds 300
+```
+
+隔離 data-dir + 設定 overlay。利用者の画像は読むだけ。
+
+| | 実セッション (固着) | ハーネス最新 |
+| --- | --- | --- |
+| 移動文書数 | ~300 / 46 秒 | **444 / 60 秒** |
+| `defer_ui_uploads` | 全フレーム | **74.7%** |
+| 連続遅延 | **無限 (218 秒)** | 最長 48 決定 |
+| 代替表示なし | **恒久** | 最長 **256 フレーム (~4 秒)** |
+| 理由 | (計装前で不明) | **`thumbnail_not_loaded` のみ** |
+
+**状態には入っている。抜けられなくなる最後の一押しが足りない。**
+
+### 判明した必須条件 (どれか欠けると 0%)
+
+1. **AI 有効** — 既定プロファイルでは `defer_ui_uploads` が **1 度も立たない** (0/3129)
+2. **横連結** — 縦連結では 1.2%。実報告のスクリーンショットが 2 ページ並びで、
+   固着した sequence も `pages=[0, 1]` だった
+3. **実スキャン** — 合成 PDF は 44ms で復号でき、パイプラインが遅れない
+
+### まだ足りていない疑い
+
+- `ai/upscale_tile` が **0 件**。連打中は AI が起動しない (ページが落ち着かない)。
+  実セッションは AI が走った後の重いテクスチャが常駐していた
+- → 次案: **バースト → 停止 (AI を走らせる) → バースト** の反復。実際の読み方に近い
+
+### ハーネス側で直した実バグ
+
+- `Condvar::wait_timeout` の spurious wakeup を「時間経過」と誤解しており、
+  **20 秒ホールドが 45ms で返っていた**。しかも script は成功で終わっていた
+  (何も起きていないので全 assertion が自明に真)。ループに修正 + 移動数を assert
+- `--settings-override` の失敗が stderr にしか出ず、GUI プロセスでは消えていた
