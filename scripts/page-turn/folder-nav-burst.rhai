@@ -75,22 +75,41 @@ set_repeat(250, 30);
 
 let before = snapshot().items_generation;
 
-log("folder-nav-burst: hold Ctrl+Down for 60 seconds");
-hold_key("Down", "ctrl", 60000);
+// Bursts separated by pauses, rather than one long hold. Nothing upscales during a burst - the
+// page never settles long enough to start one - so a single hold leaves the caches light, while
+// the reported session had been read normally and had heavy upscaled pages resident by the time
+// it wedged. The pause is what lets that weight accumulate.
+let rounds = 4;
+for round in 0..rounds {
+    log("folder-nav-burst: burst " + (round + 1) + " of " + rounds);
+    hold_key("Down", "ctrl", 8000);
+
+    // Long enough for the landing page to materialize and its upscale to run. A raster PDF holds
+    // its AI back until a full-resolution re-render lands, so a short pause leaves the upscale
+    // never started and the caches as light as a single unbroken hold would.
+    sleep(15000);
+
+    let s = snapshot();
+    // Caught here rather than at the end, because once it wedges it never recovers and every
+    // later round would report the same thing from further away.
+    if s.upload_deferral_streak > 200 {
+        fail("wedged after burst " + (round + 1) + ": uploads deferred for "
+            + s.upload_deferral_streak + " consecutive frames with nothing to show ("
+            + s.passthrough_unavailable + ")");
+    }
+}
 
 // A scenario that quietly does not run is worse than one that fails: an early return from the
 // hold once let this script sail through every assertion below and report success after 45ms of
-// doing nothing. The list generation changes once per document, so this says the burst really did
-// travel, and roughly how far.
+// doing nothing. The list generation changes once per document, so this says the bursts really
+// did travel, and roughly how far.
 let travelled = snapshot().items_generation - before;
-log("folder-nav-burst: documents visited during the burst: " + travelled);
+log("folder-nav-burst: documents visited across all bursts: " + travelled);
 if travelled < 10 {
-    fail("the burst did not navigate: only " + travelled
+    fail("the bursts did not navigate: only " + travelled
         + " documents. The hold is not reaching the viewer.");
 }
 
-// Everything below happens with no key held. Any deferral that persists here is waiting on
-// something that is not coming.
 log("folder-nav-burst: released - watching for recovery");
 
 // Generous: several hundred documents may be queued behind this, and a real PDF page can take a
