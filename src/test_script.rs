@@ -69,6 +69,11 @@ pub(crate) struct TestScriptSnapshot {
     pub(crate) fullscreen_raw_key_permit: bool,
     pub(crate) has_previous_page: bool,
     pub(crate) has_next_page: bool,
+    /// Consecutive frames whose page-turn decision deferred texture uploads. A number that keeps
+    /// climbing while nothing is being pressed is the livelock, not slow loading.
+    pub(crate) upload_deferral_streak: i64,
+    /// Why the page has no stand-in to show, or empty. See `PassthroughUnavailable`.
+    pub(crate) passthrough_unavailable: String,
     pub(crate) keymap_level_observations: Vec<KeymapLevelObservation>,
 }
 
@@ -98,6 +103,8 @@ impl Default for TestScriptSnapshot {
             fullscreen_raw_key_permit: false,
             has_previous_page: false,
             has_next_page: false,
+            upload_deferral_streak: 0,
+            passthrough_unavailable: String::new(),
             keymap_level_observations: Vec::new(),
         }
     }
@@ -137,6 +144,8 @@ impl TestScriptSnapshot {
         insert!(fullscreen_raw_key_permit);
         insert!(has_previous_page);
         insert!(has_next_page);
+        insert!(upload_deferral_streak);
+        insert!(passthrough_unavailable);
         map
     }
 }

@@ -6075,6 +6075,31 @@ fn final_effect_identity_matches(left: FinalCompositeKey, right: FinalCompositeK
 
 const PASSTHROUGH_RENDITION_CACHE_CAPACITY: usize = 16;
 
+/// Why [`App::ensure_passthrough_rendition`] could not produce a stand-in for a page.
+///
+/// The page-turn sequence waits on this rendition and defers texture uploads while it waits, so a
+/// reason that goes unrecorded here is a livelock nobody can diagnose afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PassthroughUnavailable {
+    /// No catalog thumbnail is on screen for this page.
+    ThumbnailNotLoaded,
+    /// The thumbnail is on screen, but the CPU pixels a rendition would be built from are not
+    /// resident. Nothing here can bring them back, so waiting cannot resolve it.
+    ThumbnailPixelsNotResident,
+    /// A rendition exists but was made for another page.
+    IdentityMismatch,
+}
+
+impl PassthroughUnavailable {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ThumbnailNotLoaded => "thumbnail_not_loaded",
+            Self::ThumbnailPixelsNotResident => "thumbnail_pixels_not_resident",
+            Self::IdentityMismatch => "identity_mismatch",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct PassthroughRenditionEntry {
     /// Catalog-thumbnail pixels used to build this rendition. Pointer identity
@@ -8833,6 +8858,17 @@ pub struct App {
     /// display texture already passes through. Making it take `&mut self` would push the check out
     /// to its callers, which is exactly the arrangement that let stores diverge in the first place.
     pub(crate) texture_identity: std::cell::RefCell<crate::item_identity::TextureIdentityLedger>,
+    /// Why the pass-through rendition is unavailable, and for how many consecutive frames.
+    ///
+    /// The page-turn sequence hands off to that rendition and will not retire until something is
+    /// presented, so when it silently yields nothing the viewer sits on "loading" indefinitely
+    /// while uploads stay deferred. Both of its early returns used to be bare `?`, which is why a
+    /// 218-second livelock left no record of which one fired. Reported on a doubling schedule so a
+    /// 165fps spin does not flood the log.
+    pub(crate) passthrough_unavailable: Option<(usize, PassthroughUnavailable, u64)>,
+    /// Consecutive frames whose page-turn decision deferred texture uploads. See
+    /// `App::note_upload_deferral`.
+    pub(crate) upload_deferral_streak: u64,
     /// Set once when a display cache is found holding another page's entry. App-wide on
     /// purpose: it reports that an invalidation was missed, which is not a property of one
     /// viewer, and it is never cleared automatically - recovery is not known to be safe, so the
@@ -12521,6 +12557,8 @@ impl App {
             items: Vec::new(),
             item_id_interner: std::cell::RefCell::default(),
             texture_identity: std::cell::RefCell::default(),
+            passthrough_unavailable: None,
+            upload_deferral_streak: 0,
             display_identity_error: std::cell::RefCell::new(None),
             thumbnails: Vec::new(),
             selected: None,
@@ -61362,25 +61400,77 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
-        let texture = self.ensure_passthrough_rendition_inner(ctx, idx)?;
-        self.display_texture_matches_page(&texture, idx)
-            .then_some(texture)
+        match self.ensure_passthrough_rendition_inner(ctx, idx) {
+            Ok(texture) if self.display_texture_matches_page(&texture, idx) => {
+                self.passthrough_unavailable = None;
+                Some(texture)
+            }
+            Ok(_) => {
+                self.note_passthrough_unavailable(idx, PassthroughUnavailable::IdentityMismatch);
+                None
+            }
+            Err(reason) => {
+                self.note_passthrough_unavailable(idx, reason);
+                None
+            }
+        }
+    }
+
+    /// Say, once and then on a doubling schedule, why the page has nothing to show.
+    ///
+    /// The caller sits in a page-turn sequence that defers uploads until something is presented,
+    /// so this is not a transient miss that resolves itself - it is the shape of a livelock. It is
+    /// reported rather than counted silently, and rate-limited because the frame loop that asks
+    /// runs at full speed while nothing is happening.
+    fn note_passthrough_unavailable(&mut self, idx: usize, reason: PassthroughUnavailable) {
+        let count = match self.passthrough_unavailable {
+            Some((prev_idx, prev_reason, count)) if prev_idx == idx && prev_reason == reason => {
+                count + 1
+            }
+            _ => 1,
+        };
+        self.passthrough_unavailable = Some((idx, reason, count));
+        if !count.is_power_of_two() {
+            return;
+        }
+        let detail = format!(
+            "[passthrough] no stand-in for the page: idx={idx} reason={} frames={count}              items_generation={} key={:?}",
+            reason.as_str(),
+            self.items_generation,
+            self.perf_item_key(idx),
+        );
+        crate::logger::log(detail);
+        crate::perf::event(
+            "fs",
+            "passthrough_unavailable",
+            self.perf_item_key(idx).as_deref(),
+            self.input_seq,
+            &[
+                ("idx", serde_json::Value::from(idx)),
+                ("reason", serde_json::Value::from(reason.as_str())),
+                ("frames", serde_json::Value::from(count)),
+            ],
+        );
     }
 
     fn ensure_passthrough_rendition_inner(
         &mut self,
         ctx: &egui::Context,
         idx: usize,
-    ) -> Option<egui::TextureHandle> {
+    ) -> Result<egui::TextureHandle, PassthroughUnavailable> {
         let (catalog_texture, from_edit_preview) = match self.thumbnails.get(idx) {
             Some(crate::grid_item::ThumbnailState::Loaded {
                 tex,
                 from_edit_preview,
                 ..
             }) => (tex.clone(), *from_edit_preview),
-            _ => return None,
+            _ => return Err(PassthroughUnavailable::ThumbnailNotLoaded),
         };
-        let source_pixels = self.thumb_pixels.get(&idx)?.clone();
+        let source_pixels = self
+            .thumb_pixels
+            .get(&idx)
+            .ok_or(PassthroughUnavailable::ThumbnailPixelsNotResident)?
+            .clone();
         let params = self.effective_params(idx).clone();
         let key = self.final_composite_key_for_pixels(
             self.current_edit_result_key(idx),
@@ -61388,7 +61478,7 @@ impl App {
             &params,
         );
         if let Some(entry) = self.passthrough_rendition_cache.get(key, &source_pixels) {
-            return Some(entry.texture);
+            return Ok(entry.texture);
         }
 
         let creative_lut = if !params.creative_lut.is_identity() {
@@ -61442,7 +61532,7 @@ impl App {
                 texture: texture.clone(),
             },
         );
-        Some(texture)
+        Ok(texture)
     }
 
     pub(crate) fn is_passthrough_rendition_texture(&self, texture: &egui::TextureHandle) -> bool {

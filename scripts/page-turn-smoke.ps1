@@ -20,6 +20,13 @@
 param(
     [switch]$Setup,
     [switch]$SelfTest,
+    # Run an arbitrary script against an arbitrary folder in a throwaway profile. The scripted
+    # focus rules and the every-100ms refocus are the reason to come through here rather than
+    # launching the exe directly: a burst that changes documents loses its synthetic key target
+    # otherwise, and the run fails for a reason that has nothing to do with what is being tested.
+    [string]$Script,
+    [string]$Folder,
+    [string]$ScriptDataDir = "target\page-turn-smoke\script-data",
     [string]$SelfTestRoot = "target\page-turn-smoke\selftest",
     [string]$DataDir = "target\page-turn-smoke\data",
     [string]$Exe = "target\dev-runtime\mimageviewer-core.exe",
@@ -314,6 +321,28 @@ if ($SelfTest) {
     $exitCode = Invoke-ScriptedRun -RunDataDir $dataDirFull `
         -ScriptPath $scriptFull -StartupFolder $fixtureDir `
         -AnalyzerModes @("test-script-input")
+    exit $exitCode
+}
+
+if ($Script) {
+    $scriptFull = Resolve-RepoPath $Script
+    if (-not (Test-Path -LiteralPath $scriptFull)) {
+        throw "no such script: $scriptFull"
+    }
+    $runDataDir = Resolve-RepoPath $ScriptDataDir
+    if (Test-Path -LiteralPath $runDataDir) {
+        Remove-Item -LiteralPath $runDataDir -Recurse -Force
+    }
+    $startupFolder = ""
+    if ($Folder) {
+        $startupFolder = [System.IO.Path]::GetFullPath($Folder)
+        if (-not (Test-Path -LiteralPath $startupFolder)) {
+            throw "no such folder: $startupFolder"
+        }
+    }
+    $exitCode = Invoke-ScriptedRun -RunDataDir $runDataDir `
+        -ScriptPath $scriptFull -StartupFolder $startupFolder `
+        -AnalyzerModes @()
     exit $exitCode
 }
 

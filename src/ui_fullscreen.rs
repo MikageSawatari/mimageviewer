@@ -14360,6 +14360,38 @@ impl App {
         (configurable || fixed, None, viewport)
     }
 
+    /// Say when texture uploads have been deferred for long enough that they cannot be waiting on
+    /// anything real.
+    ///
+    /// The deferral exists so a burst of page turns is not stalled by full-size uploads, and it
+    /// ends when the sequence presents something. But presenting requires an upload, so if the
+    /// stand-in never appears the two wait on each other and the viewer sits on "loading" forever
+    /// at full frame rate. That state used to be indistinguishable from ordinary paging in the
+    /// log; now it announces itself, and `[passthrough]` beside it says what is missing.
+    fn note_upload_deferral(&mut self, fs_idx: usize, decision: FsPageTurnDecision) {
+        if !decision.defer_ui_uploads {
+            self.upload_deferral_streak = 0;
+            return;
+        }
+        self.upload_deferral_streak += 1;
+        // Roughly a second at 60fps before the first word, then on a doubling schedule.
+        if self.upload_deferral_streak < 64 || !self.upload_deferral_streak.is_power_of_two() {
+            return;
+        }
+        crate::logger::log(format!(
+            "[page-turn] UI uploads deferred for {} consecutive frames: fs_idx={fs_idx}              passthrough_ready={} items_generation={} passthrough_unavailable={:?} key={:?}",
+            self.upload_deferral_streak,
+            decision.passthrough_rendition_ready,
+            self.items_generation,
+            self.passthrough_unavailable.map(|(idx, reason, frames)| (
+                idx,
+                reason.as_str(),
+                frames
+            )),
+            self.perf_item_key(fs_idx),
+        ));
+    }
+
     fn emit_fs_page_turn_decision_probe(
         &mut self,
         frame_nr: u64,
@@ -14428,7 +14460,12 @@ impl App {
         #[cfg(not(windows))]
         {
             let _ = ctx;
-            page_turn_decision_for_inputs(rendition_sequence_active, passthrough_rendition_ready)
+            let decision = page_turn_decision_for_inputs(
+                rendition_sequence_active,
+                passthrough_rendition_ready,
+            );
+            self.note_upload_deferral(fs_idx, decision);
+            decision
         }
 
         #[cfg(windows)]
@@ -14462,6 +14499,7 @@ impl App {
                 rendition_sequence_active,
                 passthrough_rendition_ready,
             );
+            self.note_upload_deferral(fs_idx, decision);
             self.emit_fs_page_turn_decision_probe(
                 frame_nr,
                 fs_idx,
@@ -16342,6 +16380,11 @@ impl App {
             fullscreen_raw_key_permit: false,
             has_previous_page: nav_position.is_some_and(|position| position > 0),
             has_next_page: nav_position.is_some_and(|position| position + 1 < nav.len()),
+            upload_deferral_streak: self.upload_deferral_streak as i64,
+            passthrough_unavailable: self
+                .passthrough_unavailable
+                .map(|(_, reason, _)| reason.as_str().to_owned())
+                .unwrap_or_default(),
             keymap_level_observations,
         }
     }
