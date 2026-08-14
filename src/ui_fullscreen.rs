@@ -244,8 +244,11 @@ const COMPARE_MAIN_SHADER_SLOT: crate::compare_wgpu::CompareShaderSlot =
 const COMPARE_NAVIGATOR_SHADER_SLOT: crate::compare_wgpu::CompareShaderSlot =
     crate::compare_wgpu::CompareShaderSlot::Navigator;
 
-/// Processed full-image resources already resolved by the page draw path for this frame.
-/// Missing entries deliberately fall back to the catalog thumbnail in `draw_fs_navigator`.
+/// Full-image resources actually drawn by the page path for this frame.
+///
+/// This map serves both the navigator and the presentation trace seam. Missing navigator entries
+/// deliberately fall back to the catalog thumbnail, while missing trace entries mean that page
+/// was not reported as presented.
 #[derive(Default)]
 struct FsNavigatorTextureSources {
     pages: Vec<(usize, FullscreenPaintResource)>,
@@ -5421,6 +5424,29 @@ impl App {
             | FsNavigationTargetPhase::Presenting(_)
             | FsNavigationTargetPhase::RenditionFailed => (false, false),
         }
+    }
+
+    fn fs_navigation_rendition_target_pages(&self, fs_idx: usize) -> Option<Vec<usize>> {
+        self.fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .and_then(|sequence| match &sequence.target {
+                FsNavigationSequenceTarget::Display(target)
+                    if target.items_generation == self.items_generation
+                        && target.pages.contains(&fs_idx)
+                        && matches!(
+                            target.phase,
+                            FsNavigationTargetPhase::Ready(FsNavigationPresentation::Rendition)
+                                | FsNavigationTargetPhase::Presenting(
+                                    FsNavigationPresentation::Rendition
+                                )
+                        ) =>
+                {
+                    Some(target.pages.clone())
+                }
+                FsNavigationSequenceTarget::FolderItems { .. }
+                | FsNavigationSequenceTarget::Display(_) => None,
+            })
     }
 
     /// `fs_nav_locked_gen.is_some()` の薄いラッパー。
@@ -12900,12 +12926,13 @@ impl App {
                             FsNavigatorTextureSources::default()
                         };
                         if self.continuous_reading_active_for_idx(fs_idx) {
-                            self.draw_fs_continuous_reading(
+                            navigator_texture_sources = self.draw_fs_continuous_reading(
                                 ui,
                                 ctx,
                                 image_rect,
                                 fs_idx,
                                 state.original_preview_active,
+                                state.page_turn_decision,
                             );
                         } else {
                             match spread_pair {
@@ -12964,13 +12991,15 @@ impl App {
                                         let fit_scale_limits =
                                             self.fullscreen_fit_scale_limits(pixels_per_point);
                                         if continuous_reading_active {
-                                            self.draw_fs_continuous_reading(
-                                                ui,
-                                                ctx,
-                                                image_rect,
-                                                fs_idx,
-                                                state.original_preview_active,
-                                            );
+                                            navigator_texture_sources = self
+                                                .draw_fs_continuous_reading(
+                                                    ui,
+                                                    ctx,
+                                                    image_rect,
+                                                    fs_idx,
+                                                    state.original_preview_active,
+                                                    state.page_turn_decision,
+                                                );
                                         } else {
                                             if compare_requested {
                                                 self.ensure_compare_prepared_pair(ctx, fs_idx);
@@ -24277,11 +24306,12 @@ impl App {
         image_rect: egui::Rect,
         fs_idx: usize,
         original_preview_active: bool,
-    ) {
+        page_turn_decision: FsPageTurnDecision,
+    ) -> FsNavigatorTextureSources {
         let Some((units, current_pos)) = self.continuous_reading_units_and_pos(fs_idx) else {
             self.fullscreen_page_layout.clear();
             self.slideshow_scroll_range_cache = None;
-            return;
+            return FsNavigatorTextureSources::default();
         };
         let prefer_processed_layout = !original_preview_active && !self.analysis_mode;
         let Some((pages, visible_positions, offsets, scroll_range)) = self
@@ -24295,8 +24325,25 @@ impl App {
         else {
             self.fullscreen_page_layout.clear();
             self.slideshow_scroll_range_cache = None;
-            return;
+            return FsNavigatorTextureSources::default();
         };
+        let pass_through_target_pages = matches!(
+            page_turn_decision.paint_source(),
+            FsPageTurnPaintSource::PassThrough
+        )
+        .then(|| self.fs_navigation_rendition_target_pages(fs_idx))
+        .flatten();
+        let pass_through_target_renditions =
+            pass_through_target_pages.as_ref().and_then(|target_pages| {
+                target_pages
+                    .iter()
+                    .map(|idx| {
+                        self.ensure_passthrough_rendition(ctx, *idx)
+                            .map(FullscreenPaintResource::direct)
+                            .map(|resource| (*idx, resource))
+                    })
+                    .collect::<Option<Vec<_>>>()
+            });
         self.slideshow_scroll_range_cache = Some((fs_idx, scroll_range.0, scroll_range.1));
         let prepare_positions = vertical_reading_prepare_positions(
             units.len(),
@@ -24364,11 +24411,24 @@ impl App {
 
         let mut any_raw_work_pending = false;
         let mut selected_processed_attempt = ContinuousProcessedAttempt::NotAttempted;
+        let mut painted_sources = FsNavigatorTextureSources::default();
         for page in pages {
             self.advance_animation(ctx, page.idx);
             let rotation = self.get_rotation(page.idx);
             let location = self.location_display_for_loading(page.idx);
-            let display_tex = if original_preview_active {
+            let pass_through_target_page = pass_through_target_pages
+                .as_ref()
+                .is_some_and(|target_pages| target_pages.contains(&page.idx));
+            let display_tex = if pass_through_target_page {
+                pass_through_target_renditions
+                    .as_ref()
+                    .and_then(|renditions| {
+                        renditions
+                            .iter()
+                            .find(|(idx, _)| *idx == page.idx)
+                            .map(|(_, resource)| resource.clone())
+                    })
+            } else if original_preview_active {
                 self.resolve_original_preview_tex(page.idx)
                     .or_else(|| self.resolve_fs_display_tex(page.idx, true))
                     .map(|texture| self.fullscreen_paint_resource_for_texture(page.idx, texture))
@@ -24435,8 +24495,17 @@ impl App {
             {
                 any_raw_work_pending = true;
             }
-            let allow_thumbnail =
-                original_preview_active || !self.colorize_display_requires_final_effect(page.idx);
+            let allow_thumbnail = !pass_through_target_page
+                && (original_preview_active
+                    || !self.colorize_display_requires_final_effect(page.idx));
+            let draw_tex = display_tex.or_else(|| {
+                allow_thumbnail
+                    .then(|| {
+                        self.fs_thumbnail_texture_for_display(page.idx)
+                            .map(FullscreenPaintResource::direct)
+                    })
+                    .flatten()
+            });
             let source_size = self
                 .source_dims_for_idx(page.idx)
                 .map(|(w, h)| egui::vec2(w, h));
@@ -24450,20 +24519,20 @@ impl App {
                 rotation,
                 &bg_style,
                 &location,
-                display_tex.as_ref(),
-                allow_thumbnail,
+                draw_tex.as_ref(),
+                false,
                 page.content_bbox,
                 ctx.pixels_per_point(),
                 ResolvedDisplayPlacement::Normal { zoom_pan: None },
             ) {
                 self.trace_fs_continuous_page_draw(
                     page.idx,
-                    display_tex
+                    draw_tex
                         .as_ref()
                         .map(crate::gpu_lanczos::FullscreenPaintResource::source_texture),
                 );
                 if crate::perf::is_enabled()
-                    && let Some(handle) = display_tex.as_ref()
+                    && let Some(handle) = draw_tex.as_ref()
                     && self
                         .continuous_page_transition_texture(page.idx)
                         .is_some_and(|transition| {
@@ -24478,6 +24547,9 @@ impl App {
                     );
                 }
                 self.fullscreen_page_layout.push(transform);
+                if let Some(resource) = draw_tex {
+                    painted_sources.pages.push((page.idx, resource));
+                }
             }
         }
         // 自動 / 手動の起点は scroll transition が所有し、再アンカーの記録地点まで
@@ -24516,6 +24588,7 @@ impl App {
         ) {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
+        painted_sources
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -33293,6 +33366,104 @@ mod tests {
         };
         app.observe_fs_navigation_sequence_presented(&[first, second]);
         assert!(app.fs_holdover_tex.is_none());
+    }
+
+    #[test]
+    fn continuous_navigation_sequence_retires_after_complete_target_rendition_is_drawn() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = (0..2)
+            .map(|idx| {
+                GridItem::Image(PathBuf::from(format!(
+                    "c:/test/continuous-navigation-{idx}.jpg"
+                )))
+            })
+            .collect();
+        app.thumbnails.clear();
+        for idx in 0..2 {
+            let pixels = std::sync::Arc::new(egui::ColorImage::filled(
+                [4, 6],
+                egui::Color32::from_gray(80 + idx as u8 * 40),
+            ));
+            let texture = ctx.load_texture(
+                format!("continuous_navigation_thumbnail_{idx}"),
+                pixels.as_ref().clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            app.thumbnails.push(ThumbnailState::Loaded {
+                tex: texture,
+                from_cache: false,
+                from_edit_preview: false,
+                rendered_at_px: 6,
+                source_dims: Some((400, 600)),
+                layout_dims: None,
+            });
+            app.thumb_pixels.insert(idx, pixels);
+        }
+        app.visible_indices = vec![0, 1];
+        app.fullscreen_idx = Some(0);
+        app.selected = Some(0);
+        app.items_generation = 9;
+        app.reading_flow = ReadingFlow::Horizontal;
+        app.spread_mode = SpreadMode::Ltr;
+
+        let left_rendition = app.ensure_passthrough_rendition(&ctx, 0).unwrap();
+        assert!(app.ensure_passthrough_rendition(&ctx, 1).is_some());
+        assert!(app.fs_cache.is_empty());
+        assert!(app.fs_upload_backlog.is_empty());
+        assert!(app.final_composite_cache.is_empty());
+        app.fs_nav_locked_gen = Some(app.items_generation);
+        app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous: None,
+            target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                items_generation: app.items_generation,
+                pages: vec![0, 1],
+                phase: FsNavigationTargetPhase::Ready(FsNavigationPresentation::Rendition),
+            }),
+        }));
+        let decision = page_turn_decision_for_inputs(true, true);
+        assert!(decision.defer_ui_uploads());
+        assert!(app.fs_nav_holdover_for_draw().is_none());
+
+        let one_drawn = FsNavigatorTextureSources::single(
+            0,
+            Some(FullscreenPaintResource::direct(left_rendition)),
+        );
+        app.emit_fs_page_turn_ready_for_display_unit(
+            &ctx,
+            0,
+            SpreadPair::Double { left: 0, right: 1 },
+            decision,
+            &one_drawn,
+        );
+        assert!(app.fs_navigation_sequence_blocks_new_target());
+        let image_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let mut continuous_sources = FsNavigatorTextureSources::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(image_rect),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        continuous_sources =
+                            app.draw_fs_continuous_reading(ui, ctx, image_rect, 0, false, decision);
+                    });
+            },
+        );
+        app.emit_fs_page_turn_ready_for_display_unit(
+            &ctx,
+            0,
+            SpreadPair::Double { left: 0, right: 1 },
+            decision,
+            &continuous_sources,
+        );
+        assert!(app.fs_holdover_tex.is_none());
+        let (sequence_active, rendition_ready) = app.fs_navigation_sequence_rendition_state(0);
+        let next_decision = page_turn_decision_for_inputs(sequence_active, rendition_ready);
+        assert!(!next_decision.defer_ui_uploads());
     }
 
     /// Build an app sitting in fullscreen on a video whose thumbnail has loaded.

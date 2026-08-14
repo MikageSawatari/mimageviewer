@@ -1920,8 +1920,12 @@ cached thumbnail `226×422` の比 (`0.5355`) が連続表示だけに残り、�
 中身を伸縮して settle 時に位置が動くことを避ける。単一 / 見開きとも同じ規則を使い、見開きの
 source 選択と差し替えは引き続き表示単位で原子的に行う。
 
-縦・横の連結読みは通過表示の対象外 (スクロールは実体化済みのページを見せるだけなので、
-キーごとの実体化コストが元から出ない) だが、ページ矩形の canonical layout 契約は共通である。
+縦・横の連結読みは通常のスクロール操作では通過表示の対象外 (スクロールは実体化済みのページを
+見せるだけなので、キーごとの実体化コストが元から出ない)。ただしフォルダ横断 navigation sequence
+が `Ready(Rendition)` の target unit を連結 renderer へ渡す場合は例外である。renderer は target
+全ページの rendition を all-or-none で描画 source にし、実際に draw command を作れたページだけを
+提示 source set として返す。複数 unit が同時に可視でも、target page set が完全一致した場合だけ
+sequence を retire する。ページ矩形の canonical layout 契約は paged / continuous で共通である。
 
 #### 2.5.5 トレース不変条件 (機械判定)
 
