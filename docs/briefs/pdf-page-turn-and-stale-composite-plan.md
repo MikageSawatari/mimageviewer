@@ -801,3 +801,57 @@ overlay が全設定に届く作りにしておいたのが効いた。
 `draw_fs_spread_page` の解決経路が、`prepare_fullscreen_state` の pass-through
 rendition を使わない理由を特定する。ここが直れば ①「描かれる」②「sequence が retire する」
 ③「アップロードが再開する」が同時に解ける見込み。
+
+## ⑨ 根本原因の所在が確定 (2026-08-14、ページ別計装)
+
+### 決定的なログ
+
+```
+[22.424s] UI uploads deferred for 2048 consecutive frames: fs_idx=0
+          passthrough_ready=true items_generation=60
+          passthrough idx1:ok@2046f  idx0:ok@1f
+          key=pdf::…\20240608_015.pdf#0
+```
+
+- **idx 0** — 毎フレーム要求され、毎フレーム成功
+- **idx 1** — **2046 フレーム前を最後に、一度も要求されていない**
+
+perf 側も一致:
+
+| | |
+| --- | --- |
+| `page_turn_decision` の対象 | **idx 0 と 1 の両方** (各 2500 回) = シーケンスは見開きとして待つ |
+| `fs/paint` 最終 | idx 1 = 8.04s、idx 0 = 9.49s (**両方停止**) |
+
+### 構造
+
+**シーケンスは見開き [0, 1] の提示を待つが、描画側はページ 0 しか解決していない。**
+
+`prepare_fullscreen_state` は `ensure_passthrough_rendition(fs_idx)` を **fs_idx だけ**呼ぶ。
+見開き両ページを解決するのは `draw_fs_spread` だが、**そこに到達していない**
+(idx 1 が 2046 フレーム要求されていない = `draw_fs_spread` が呼ばれていない)。
+
+```
+sequence: 表示ユニット [0,1] の提示待ち  → defer_ui_uploads
+描画:     ページ 0 しか解決されない
+          ↓
+ユニットが提示されない → page_turn_ready が出ない
+          ↓
+sequence が retire しない ────┘
+```
+
+固着は毎回 **文書の 1 ページ目**。`RtlCover` では**表紙は単独表示**になる。
+前文書の見開きから作られた `pages=[0,1]` のシーケンスが、
+単独表示になる表紙に着地したときに整合が壊れている疑いが濃い。
+
+### 再現の簡単さ (2026-08-14 最終報告)
+
+利用者は **起動して Ctrl+↓ を押しっぱなしにしただけ**で再現した。
+複雑な条件は不要で、**ウィンドウ表示 + `RtlCover` 見開き + 横連結 + AI** の
+プロファイルであれば素直に踏む。ハーネスが踏み切れないのは、
+その 4 条件のどれかが実効になっていない可能性が高い (要確認)。
+
+### 次
+
+`draw_fs_spread` に到達しない理由、および表紙の単独表示と
+`FsNavigationDisplayTarget.pages` の整合を確認する。

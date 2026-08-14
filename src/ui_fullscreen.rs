@@ -14381,17 +14381,24 @@ impl App {
         // Says whether anything is *asking* for a rendition, not only whether one was refused.
         // Those look identical in a "no failures recorded" report and are opposite problems: a
         // rendition that will not build, versus a draw path that has stopped running.
-        let asked = match self.passthrough_last_call {
-            Some((frame, idx, outcome)) => format!(
-                "last_asked={} frames ago (idx={idx}, {})",
-                self.frame_counter.saturating_sub(frame),
-                match outcome {
-                    Some(reason) => reason.as_str(),
-                    None => "ok",
-                }
-            ),
-            None => "never asked".to_owned(),
-        };
+        // Every page of the display unit, because all of them have to draw for the sequence to
+        // retire: reporting only the last one asked hides a half that has nothing to show.
+        let asked = self
+            .fs_display_unit_page_indices(fs_idx)
+            .into_iter()
+            .map(|idx| match self.passthrough_last_call.get(&idx) {
+                Some((frame, outcome)) => format!(
+                    "idx{idx}:{}@{}f",
+                    match outcome {
+                        Some(reason) => reason.as_str(),
+                        None => "ok",
+                    },
+                    self.frame_counter.saturating_sub(*frame)
+                ),
+                None => format!("idx{idx}:never-asked"),
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
         crate::logger::log(format!(
             "[page-turn] UI uploads deferred for {} consecutive frames: fs_idx={fs_idx}              passthrough_ready={} items_generation={} passthrough {asked} key={:?}",
             self.upload_deferral_streak,

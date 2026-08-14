@@ -8866,14 +8866,17 @@ pub struct App {
     /// 218-second livelock left no record of which one fired. Reported on a doubling schedule so a
     /// 165fps spin does not flood the log.
     pub(crate) passthrough_unavailable: Option<(usize, PassthroughUnavailable, u64)>,
-    /// The last time the pass-through resolver was asked at all: frame, page, and how it answered.
+    /// The last time the pass-through resolver was asked for each page: frame, and how it answered.
     ///
-    /// `passthrough_unavailable` alone cannot say whether a rendition is genuinely available or
-    /// whether nobody has asked for one since it was last cleared, and those are different
-    /// failures: one is a rendition that will not build, the other is a draw path that has stopped
-    /// running. The first wedge investigated with this instrumentation reported "available" when
-    /// what had actually happened was that nothing was asking.
-    pub(crate) passthrough_last_call: Option<(u64, usize, Option<PassthroughUnavailable>)>,
+    /// Per page rather than one slot, because a spread asks for both and the second answer used to
+    /// overwrite the first - a success on one side erased a failure on the other, and the report
+    /// said a rendition was available while half the display unit had none. Both halves have to
+    /// draw for the page-turn sequence to retire, so one missing is the whole failure.
+    ///
+    /// It also distinguishes "refused" from "nobody asked", which are opposite problems: a
+    /// rendition that will not build, versus a draw path that has stopped running.
+    pub(crate) passthrough_last_call:
+        std::collections::HashMap<usize, (u64, Option<PassthroughUnavailable>)>,
     /// Consecutive frames whose page-turn decision deferred texture uploads. See
     /// `App::note_upload_deferral`.
     pub(crate) upload_deferral_streak: u64,
@@ -12566,7 +12569,7 @@ impl App {
             item_id_interner: std::cell::RefCell::default(),
             texture_identity: std::cell::RefCell::default(),
             passthrough_unavailable: None,
-            passthrough_last_call: None,
+            passthrough_last_call: std::collections::HashMap::new(),
             upload_deferral_streak: 0,
             display_identity_error: std::cell::RefCell::new(None),
             thumbnails: Vec::new(),
@@ -61417,8 +61420,8 @@ impl App {
             Ok(_) => Err(PassthroughUnavailable::IdentityMismatch),
             Err(reason) => Err(reason),
         };
-        self.passthrough_last_call =
-            Some((self.frame_counter, idx, outcome.as_ref().err().copied()));
+        self.passthrough_last_call
+            .insert(idx, (self.frame_counter, outcome.as_ref().err().copied()));
         match outcome {
             Ok(texture) => Some(texture),
             Err(reason) => {

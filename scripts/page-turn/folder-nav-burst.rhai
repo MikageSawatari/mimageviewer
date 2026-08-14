@@ -91,20 +91,15 @@ let rounds = 4;
 for round in 0..rounds {
     log("folder-nav-burst: burst " + (round + 1) + " of " + rounds);
 
-    // Read to the end of a document, wait, then leave while the viewer is still busy behind the
-    // last page. That order is what the report describes and what a burst alone cannot produce:
-    // Ctrl+Down held down never lets a page settle, so no upscale or prefetch is ever in flight
-    // when the next document arrives - and in-flight background work is the one condition every
-    // earlier attempt was missing.
+    // Every reproduction so far landed on the document that follows the largest file in the
+    // folder - 312MB against 11-66MB for its neighbours - and left it while its enumeration,
+    // thumbnails and prefetch were all still running. Nothing about the document that wedges is
+    // special; it is the one standing behind a heavy neighbour.
+    //
+    // Ordinary page turns first, so there is in-document work to abandon, then straight on with no
+    // pause: waiting lets the prefetch finish, which is the opposite of what this needs.
     hold_key("Down", "ctrl", 3000);
-
-    // To the end of this document with ordinary page turns.
     hold_key("Down", 4000);
-
-    // No pause. Watching a run showed the prefetch bar reaching the end before the next document
-    // was asked for, which means the work had finished and nothing was in flight after all -
-    // the opposite of what this is trying to arrange. Leaving immediately is what puts the next
-    // navigation on top of an upscale and a neighbour prefetch that are still going.
     hold_key("Down", "ctrl", 3000);
 
     // Long enough for the landing page to materialize and its upscale to run. A raster PDF holds
