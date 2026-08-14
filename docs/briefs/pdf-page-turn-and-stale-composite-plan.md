@@ -745,3 +745,59 @@ t=46.885 に thumbnail は Loaded になっている。それでも pass-through
   **20 秒ホールドが 45ms で返っていた**。しかも script は成功で終わっていた
   (何も起きていないので全 assertion が自明に真)。ループに修正 + 移動数を assert
 - `--settings-override` の失敗が stderr にしか出ず、GUI プロセスでは消えていた
+
+## ⑧ 固着の所在が確定 (2026-08-14 深夜、改良計装)
+
+### 実機ログの決定的な 1 行
+
+```
+[27.747s] [page-turn] UI uploads deferred for 2048 consecutive frames: fs_idx=0
+          passthrough_ready=true
+          passthrough last_asked=1 frames ago (idx=0, ok)
+          key=pdf::d:\home\scan\comic\20240608_015.pdf#0
+```
+
+- 代替表示は **ある** (`passthrough_ready=true`)
+- **毎フレーム要求されていて、毎フレーム成功している** (`last_asked=1 frames ago … ok`)
+- それでも画面は **「読込中」× 2** (見開き) のまま
+- `fs/paint` / `page_turn_ready` / `texture_choice` は **すべて停止**
+
+### つまり
+
+**取得できている代替表示が、描画に使われていない。**
+
+`prepare_fullscreen_state` は `ensure_passthrough_rendition(fs_idx)` を呼んで成功している。
+一方 `draw_fs_spread` → `draw_fs_spread_page` は **ページごとに独立に解決**しており、
+そちらは何も見つけられずに「読込中」を描いている。
+
+```
+spread の各ページ解決が失敗 → 何も描かれない
+        ↓
+fs/paint が出ない → page_turn_ready が出ない
+        ↓
+sequence が retire しない → defer_ui_uploads が下りない
+        ↓
+ページが materialize できない ───┘
+```
+
+`prepare_fullscreen_state` が持っている rendition と、spread の各ページが描くものが
+**別経路**であることが本体。sequence は「提示された」を待つが、提示する側は
+その rendition を使っていない。
+
+### 再現条件 (実機で 3 回、ハーネスで 1 回)
+
+1. **ウィンドウ表示** (フルスクリーンではない = viewer が main viewport に埋め込み)
+2. **見開き** `RtlCover` (だから `pages=[0, 1]`、「読込中」が 2 つ)
+3. **横連結** (`reading_flow_not_paged`)
+4. **AI 有効** + `realesr_general_v3` + `monochrome_only` + TensorRT
+5. Ctrl+↓ と素の ↓ を混ぜた大量ページ送り
+
+**設定で私が当てていたのは 3 項目だけ**だった。残り 4 つ (ウィンドウ表示 / 見開き /
+TensorRT / 8GiB キャッシュ) は利用者の `settings.db` と突き合わせて初めて分かった。
+overlay が全設定に届く作りにしておいたのが効いた。
+
+### 次
+
+`draw_fs_spread_page` の解決経路が、`prepare_fullscreen_state` の pass-through
+rendition を使わない理由を特定する。ここが直れば ①「描かれる」②「sequence が retire する」
+③「アップロードが再開する」が同時に解ける見込み。

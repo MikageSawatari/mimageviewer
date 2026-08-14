@@ -101,10 +101,10 @@ for round in 0..rounds {
     // To the end of this document with ordinary page turns.
     hold_key("Down", 4000);
 
-    // Long enough for the upscale and the neighbour prefetch to start, short enough that they are
-    // still running when the next Ctrl+Down lands on top of them.
-    sleep(2500);
-
+    // No pause. Watching a run showed the prefetch bar reaching the end before the next document
+    // was asked for, which means the work had finished and nothing was in flight after all -
+    // the opposite of what this is trying to arrange. Leaving immediately is what puts the next
+    // navigation on top of an upscale and a neighbour prefetch that are still going.
     hold_key("Down", "ctrl", 3000);
 
     // Long enough for the landing page to materialize and its upscale to run. A raster PDF holds
