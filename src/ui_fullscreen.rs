@@ -4652,6 +4652,53 @@ impl App {
         );
     }
 
+    /// Record every page slot drawn in continuous reading, with the texture it actually used.
+    ///
+    /// The existing `continuous_page` trace only fires when the drawn texture matches a page
+    /// transition, so an ordinary slot leaves no record at all. That is why a report of "the
+    /// first page shows the previous document while the rest are correct" could not be located:
+    /// index 0 simply stopped appearing in the trace while 1 and 2 continued, and there was
+    /// nothing to say what index 0 was drawing instead.
+    ///
+    /// `key` is resolved the same way `trace_fs_texture_choice` resolves it - through the holdover
+    /// if this texture is one the holdover owns - so a slot drawing a held page from another
+    /// document names that document rather than the one on screen.
+    fn trace_fs_continuous_page_draw(&self, idx: usize, texture: Option<&egui::TextureHandle>) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let held_page = texture.and_then(|texture| {
+            self.fs_holdover_tex
+                .as_ref()
+                .and_then(|holdover| holdover.page_for_texture_id(texture.id()))
+        });
+        let from_holdover = held_page.is_some();
+        let key = match held_page {
+            Some(page) => page.trace_key.clone(),
+            None => self.perf_item_key(idx),
+        };
+        crate::perf::event(
+            "fs",
+            "continuous_draw",
+            key.as_deref(),
+            self.input_seq,
+            &[
+                ("idx", serde_json::Value::from(idx as u64)),
+                (
+                    "items_generation",
+                    serde_json::Value::from(self.items_generation),
+                ),
+                ("from_holdover", serde_json::Value::from(from_holdover)),
+                (
+                    "texture_id",
+                    texture
+                        .map(|texture| serde_json::Value::from(format!("{:?}", texture.id())))
+                        .unwrap_or(serde_json::Value::Null),
+                ),
+            ],
+        );
+    }
+
     pub(crate) fn fs_display_unit_page_indices(&mut self, idx: usize) -> Vec<usize> {
         match self.resolve_spread_pair(idx) {
             SpreadPair::Single => vec![idx],
@@ -24290,6 +24337,12 @@ impl App {
                 ctx.pixels_per_point(),
                 ResolvedDisplayPlacement::Normal { zoom_pan: None },
             ) {
+                self.trace_fs_continuous_page_draw(
+                    page.idx,
+                    display_tex
+                        .as_ref()
+                        .map(crate::gpu_lanczos::FullscreenPaintResource::source_texture),
+                );
                 if crate::perf::is_enabled()
                     && let Some(handle) = display_tex.as_ref()
                     && self

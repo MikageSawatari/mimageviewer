@@ -2814,7 +2814,36 @@ def cmd_display_integrity(events: list[dict], check: bool) -> int:
                 if e.get("key") not in ready:
                     violations.append(e)
 
+    # Continuous reading draws several page slots at once. Each slot names the document its
+    # texture belongs to, so a slot drawing another document's page is visible directly - which
+    # single-page paints cannot show, because there the wrong page is simply the whole screen.
+    continuous: list[dict] = []
+    current_doc: str | None = None
+    for e in events:
+        if e.get("cat") != "fs":
+            continue
+        key = str(e.get("key") or "")
+        if e.get("kind") == "paint" and key.startswith("pdf::"):
+            current_doc = key[len("pdf::") :].split("#")[0].lower()
+        elif e.get("kind") == "continuous_draw" and key.startswith("pdf::"):
+            doc = key[len("pdf::") :].split("#")[0].lower()
+            # A holdover slot is an intended transitional source and may legitimately hold the
+            # previous document for a moment.
+            if current_doc and doc != current_doc and not e.get("from_holdover"):
+                continuous.append(e)
+
     print(f"display integrity: {painted} paints, {len(violations)} presented without a decode")
+    if continuous:
+        print(
+            f"continuous reading: {len(continuous)} page slots drew a document that is not the "
+            "one on screen"
+        )
+        for e in continuous[:20]:
+            print(
+                f"  t={e.get('t'):.3f} slot idx={e.get('idx')} "
+                f"items_generation={e.get('items_generation')} texture={e.get('texture_id')} "
+                f"key={e.get('key')}"
+            )
     for e in violations:
         print(
             f"  t={e.get('t'):.3f} items_generation={e.get('items_generation')} "
@@ -2828,7 +2857,7 @@ def cmd_display_integrity(events: list[dict], check: bool) -> int:
             "and back."
         )
     if check:
-        return 1 if violations else 0
+        return 1 if (violations or continuous) else 0
     return 0
 
 
