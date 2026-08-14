@@ -505,6 +505,22 @@ native presenter 経路であり、この egui viewport 同期の対象外。
 renderer 側 font atlas texture のサイズが一時的にずれることがある。実機では、日本語フォルダ名の
 描画タイミングで `Queue::write_texture` が高さ 32 の古い font atlas texture に `Y 29..44`
 の部分 glyph update を送り、フォント崩れ後に wgpu validation panic するログを確認した。
+
+> **2026-08-14 根本修正**: このずれが起きる境界を特定して塞いだ。
+> `Painter::paint_and_update_textures` は **surface が無い viewport で早期 return しており、
+> その return が `textures_delta.set` の適用より手前にあった**
+> (`vendor/egui-wgpu/src/winit.rs`)。egui は delta を `Context::end_pass` で
+> `TextureManager` から**取り出して一度だけ渡す**ので、捨てられた full atlas 置換は
+> 二度と来ない。CPU 側 egui は拡張後の atlas で描き続け、GPU 側は 32px のまま残り、
+> 次の部分 glyph upload が拒否される。texture は renderer の共有 namespace にあり
+> presentation surface を必要としないため、**surface 参照より前に `textures_delta.set` を
+> 適用する**形へ変更した。surface が無い経路では `textures_delta.free` も処理する
+> (描画されないフレームの解放が落ちて leak するため)。
+> **同じ境界が「サムネイルが純黒で固着する」形でも出ていた** (v1.8.0 回帰、
+> `poll_thumbnails` 側で resync 窓中の upload を先送りする形で回避していた)。
+> 下記の resync は本修正後も残すが、役割は「保険」であって正しさの担保ではない。
+> 実機では resync が 5 世代連続で回った末に上記 panic に至っており、
+> **リトライ回数では防げない**ことが確認できている。
 `Visible(false)` で fullscreen/detached viewport を隠した経路では
 `request_main_font_atlas_resync` を立て、`configure_fonts_for_texture_resync` で font atlas を
 full upload から再開させる。通常の `configure_fonts` は定義が同一だと egui が再読み込みを

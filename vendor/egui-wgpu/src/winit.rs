@@ -425,7 +425,38 @@ impl Painter {
         let Some(render_state) = self.render_state.as_mut() else {
             return vsync_sec;
         };
+
+        // mIV: apply texture deltas before the surface lookup.
+        //
+        // egui hands each delta over exactly once - `Context::end_pass` takes it out of the
+        // `TextureManager` and never re-sends it. Textures live in the renderer's shared
+        // namespace and need no presentation surface, so returning early below used to throw
+        // the whole `set` list away whenever a viewport was momentarily surface-less (the
+        // frames around fullscreen viewport recreation). Losing a full font-atlas replacement
+        // that way leaves egui drawing against a grown atlas while the GPU copy stays at its
+        // original 32px height, and the next partial glyph upload is then rejected:
+        //   "Copy of Y 45..126 would end up overrunning the bounds of ... Y size 32".
+        // The same dropped-upload boundary previously showed up as permanently black
+        // thumbnails. See docs/display-pipeline.md.
+        {
+            let mut renderer = render_state.renderer.write();
+            for (id, image_delta) in &textures_delta.set {
+                renderer.update_texture(
+                    &render_state.device,
+                    &render_state.queue,
+                    *id,
+                    image_delta,
+                );
+            }
+        }
+
         let Some(surface_state) = self.surfaces.get(&viewport_id) else {
+            // This frame will never be painted, but egui has already given up ownership of
+            // the freed ids, so release them here or they stay resident for the process.
+            let mut renderer = render_state.renderer.write();
+            for id in &textures_delta.free {
+                renderer.free_texture(id);
+            }
             return vsync_sec;
         };
 
@@ -444,14 +475,7 @@ impl Painter {
 
         let user_cmd_bufs = {
             let mut renderer = render_state.renderer.write();
-            for (id, image_delta) in &textures_delta.set {
-                renderer.update_texture(
-                    &render_state.device,
-                    &render_state.queue,
-                    *id,
-                    image_delta,
-                );
-            }
+            // `textures_delta.set` was already applied above, before the surface lookup.
 
             renderer.update_buffers(
                 &render_state.device,
