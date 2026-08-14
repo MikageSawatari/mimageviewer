@@ -20,7 +20,7 @@ fn apply_delta_set(
     site: crate::atlas_diag::Site,
 ) {
     let diag_id = renderer.diag_id();
-    let tracking = crate::atlas_diag::begin_applied_batch(site, diag_id, textures_delta);
+    let batch = crate::atlas_diag::begin_applied_batch(site, diag_id, textures_delta);
     for (id, image_delta) in &textures_delta.set {
         // Bracket the call: a delta that was skipped as out of bounds must not read back as a
         // successful application, so `after` is taken once `update_texture` has returned.
@@ -29,7 +29,7 @@ fn apply_delta_set(
         let after = renderer.texture_size(id);
         crate::atlas_diag::record_applied(*id, diag_id, image_delta, before, after);
     }
-    if tracking {
+    if batch.tracked() {
         // Flush at the end of the batch rather than at the offending delta: a batch can be
         // `[stale partial, repairing full]`, and dumping early would hide the repair.
         crate::atlas_diag::flush("applying a texture delta batch");

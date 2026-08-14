@@ -8083,7 +8083,7 @@ impl NativeEguiOverlay {
         // renderer 番号で区別するので、こちらの適用も同じ経路に載せる
         // (詳細: `egui_wgpu::atlas_diag`)。
         let diag_id = self.renderer.diag_id();
-        let atlas_tracked = egui_wgpu::atlas_diag::begin_applied_batch(
+        let atlas_batch = egui_wgpu::atlas_diag::begin_applied_batch(
             egui_wgpu::atlas_diag::Site::AppliedPresenter,
             diag_id,
             &full_output.textures_delta,
@@ -8095,7 +8095,7 @@ impl NativeEguiOverlay {
             let after = self.renderer.texture_size(id);
             egui_wgpu::atlas_diag::record_applied(*id, diag_id, image_delta, before, after);
         }
-        if atlas_tracked {
+        if atlas_batch.tracked() {
             egui_wgpu::atlas_diag::flush("applying the presenter's texture delta batch");
         }
         let paint_jobs = self

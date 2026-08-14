@@ -77,6 +77,18 @@ impl Site {
             Self::AppliedPresenter => "applied/presenter",
         }
     }
+
+    /// Which egui context this site belongs to. The root, deferred and immediate viewports all
+    /// share eframe's context and therefore its atlas; the presenter owns a separate one.
+    fn context_group(self) -> usize {
+        match self {
+            Self::ProducedMain
+            | Self::ProducedImmediate
+            | Self::AppliedPaint
+            | Self::AppliedNoPaint => 0,
+            Self::ProducedPresenter | Self::AppliedPresenter => 1,
+        }
+    }
 }
 
 /// Why a batch was thrown away without being applied.
@@ -123,7 +135,7 @@ enum Event {
     },
     /// One atlas delta the backend put through `update_texture`, bracketing the call.
     Applied {
-        batch: u64,
+        batch: Option<u64>,
         renderer: u64,
         pos: Option<[usize; 2]>,
         size: [usize; 2],
@@ -214,7 +226,8 @@ impl Event {
                 before,
                 after,
             } => format!(
-                "  applied  batch={batch} renderer=#{renderer} {} before={} after={}",
+                "  applied  batch={} renderer=#{renderer} {} before={} after={}",
+                batch.map_or_else(|| "none".to_owned(), |b| b.to_string()),
                 region(*pos, *size),
                 dim(*before),
                 dim(*after)
@@ -246,20 +259,32 @@ impl Event {
     }
 }
 
+/// How many independent egui contexts write here: eframe's (shared by the root, deferred and
+/// immediate viewports) and the native video presenter's.
+const CONTEXT_GROUPS: usize = 2;
+
 struct Ledger {
     events: VecDeque<(u64, Event)>,
     next_seq: u64,
-    dumps: u32,
-    /// Last size egui's texture manager reported, so a change can be recorded even on a run that
-    /// carries no atlas delta.
-    last_installed: Option<Option<[usize; 2]>>,
+    /// Dumps spent, per renderer. A global quota would let a presenter failure use up every slot
+    /// before the eframe reproduction we are actually chasing ever gets to report.
+    dumps: Vec<(u64, u32)>,
+    /// Last size egui's texture manager reported, **per context**, so a change can be recorded
+    /// even on a run that carries no atlas delta.
+    ///
+    /// Keeping one shared value would be actively misleading: the two contexts own separate
+    /// atlases, so alternating between them would print a size change on every run and fabricate
+    /// exactly the "egui grew without emitting a delta" evidence this ledger exists to find.
+    /// The outer `Option` distinguishes "never observed" from "observed as absent", and the first
+    /// observation of a context is a baseline rather than a change.
+    last_installed: [Option<Option<[usize; 2]>>; CONTEXT_GROUPS],
 }
 
 static LEDGER: Mutex<Ledger> = Mutex::new(Ledger {
     events: VecDeque::new(),
     next_seq: 0,
-    dumps: 0,
-    last_installed: None,
+    dumps: Vec::new(),
+    last_installed: [None; CONTEXT_GROUPS],
 });
 
 /// Where dumps go. The host application installs this; without it the ledger still records but
@@ -273,13 +298,35 @@ static NEXT_RENDERER_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_BATCH_ID: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
-    /// The batch this thread is currently applying. Batches never span threads, so this is the
-    /// natural owner of both the id and the pending-report flag.
-    static CURRENT_BATCH: Cell<Option<u64>> = const { Cell::new(None) };
-    /// An overflow happened in this thread's current batch and has not been reported yet. Keeping
-    /// it thread-local is what stops the presenter thread from consuming eframe's pending report
-    /// (and vice versa), which would drop the very dump we are after.
-    static OVERFLOW_PENDING: Cell<bool> = const { Cell::new(false) };
+    /// The batch this thread is currently applying, as `(batch id, renderer id)`. A batch is
+    /// begun, filled and flushed on one stack, so thread-local storage is its natural owner.
+    /// Cleared when the [`BatchScope`] drops, so an application outside any batch reads as absent
+    /// rather than silently claiming batch zero.
+    static CURRENT_BATCH: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
+    /// An overflow happened in this thread's batch and has not been reported yet, as
+    /// `(batch id, renderer id)`. Keeping it thread-local is what stops the presenter thread from
+    /// consuming eframe's pending report (and vice versa), which would drop the very dump we are
+    /// after.
+    static OVERFLOW_PENDING: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
+}
+
+/// Holds a batch open for the duration of its application. Dropping it clears the thread's
+/// current-batch slot.
+pub struct BatchScope {
+    tracked: bool,
+}
+
+impl BatchScope {
+    /// Does this batch carry font-atlas deltas? Callers use it to decide whether to [`flush`].
+    pub fn tracked(&self) -> bool {
+        self.tracked
+    }
+}
+
+impl Drop for BatchScope {
+    fn drop(&mut self) {
+        CURRENT_BATCH.with(|current| current.set(None));
+    }
 }
 
 /// Install the log sink. mIV points this at its file logger.
@@ -343,9 +390,14 @@ pub fn record_produced(
     let Ok(mut ledger) = LEDGER.lock() else {
         return;
     };
-    let changed = ledger.last_installed != Some(egui_installed);
-    let previous = ledger.last_installed.flatten();
-    ledger.last_installed = Some(egui_installed);
+    // Per context: the presenter owns a different atlas, and comparing the two against one
+    // another would report a change on every alternation.
+    let group = site.context_group();
+    let seen_before = ledger.last_installed[group];
+    ledger.last_installed[group] = Some(egui_installed);
+    // The first observation of a context is a baseline, not a change.
+    let changed = seen_before.is_some_and(|previous| previous != egui_installed);
+    let previous = seen_before.flatten();
 
     if entries == 0 && !frees_atlas {
         if changed {
@@ -383,18 +435,19 @@ pub fn record_produced(
     }
 }
 
-/// Open an application batch. Returns whether the batch carries atlas deltas, which the caller
-/// uses to decide whether to [`flush`] afterwards.
+/// Open an application batch. Hold the returned scope for as long as the batch is being applied;
+/// dropping it clears the thread's current-batch slot.
+#[must_use]
 pub fn begin_applied_batch(
     site: Site,
     renderer: u64,
     textures_delta: &epaint::textures::TexturesDelta,
-) -> bool {
+) -> BatchScope {
     let batch = NEXT_BATCH_ID.fetch_add(1, Ordering::Relaxed);
-    CURRENT_BATCH.with(|current| current.set(Some(batch)));
+    CURRENT_BATCH.with(|current| current.set(Some((batch, renderer))));
     let entries = atlas_entries(textures_delta);
     if entries == 0 {
-        return false;
+        return BatchScope { tracked: false };
     }
     push(Event::AppliedBatch {
         batch,
@@ -402,7 +455,7 @@ pub fn begin_applied_batch(
         renderer,
         atlas_entries: entries,
     });
-    true
+    BatchScope { tracked: true }
 }
 
 /// Record a batch that reached an apply site and was discarded there instead.
@@ -435,7 +488,7 @@ pub fn record_applied(
     if !tracked(id) {
         return;
     }
-    let batch = CURRENT_BATCH.with(Cell::get).unwrap_or_default();
+    let batch = CURRENT_BATCH.with(Cell::get).map(|(batch, _)| batch);
     push(Event::Applied {
         batch,
         renderer,
@@ -466,44 +519,70 @@ pub fn report_overflow(
     size: [usize; 2],
     texture: [u32; 2],
 ) {
+    if !tracked(id) {
+        // The ledger only holds font-atlas history, so a dump would tell us nothing about this
+        // texture - and arming the flag here would let an unrelated texture spend a dump slot and
+        // mislabel the result as a font-atlas report. Say it happened and stop.
+        emit(format!(
+            "[atlas-diag] overflow on an untracked texture {id:?} on renderer #{renderer}: \
+             partial at [{}, {}] sized [{}, {}] does not fit [{}, {}] - write skipped. This \
+             ledger does not track that texture, so no history follows.",
+            pos[0], pos[1], size[0], size[1], texture[0], texture[1],
+        ));
+        return;
+    }
+    let current = CURRENT_BATCH.with(Cell::get);
     push(Event::Overflow {
-        batch: CURRENT_BATCH.with(Cell::get),
+        batch: current.map(|(batch, _)| batch),
         renderer,
         pos,
         size,
         texture,
     });
-    if !tracked(id) {
-        emit(format!(
-            "[atlas-diag] overflow on an untracked texture {id:?} - the ledger below will not \
-             contain its history"
-        ));
-    }
-    OVERFLOW_PENDING.with(|pending| pending.set(true));
+    OVERFLOW_PENDING.with(|pending| {
+        pending.set(Some((
+            current.map_or(u64::MAX, |(batch, _)| batch),
+            renderer,
+        )))
+    });
 }
 
 /// Dump the ring buffer if an overflow happened in this thread's batch. Call this once the batch's
 /// `set` list has been applied, so the dump includes anything that came after the offending delta.
 pub fn flush(context: &str) {
-    if !OVERFLOW_PENDING.with(Cell::get) {
+    let Some((batch, renderer)) = OVERFLOW_PENDING.with(Cell::get) else {
         return;
-    }
-    OVERFLOW_PENDING.with(|pending| pending.set(false));
+    };
+    OVERFLOW_PENDING.with(|pending| pending.set(None));
 
     let dump = {
         let Ok(mut ledger) = LEDGER.lock() else {
             return;
         };
-        if ledger.dumps >= MAX_DUMPS {
+        // Quota per renderer: a global one would let repeated presenter failures use up every
+        // slot before the eframe reproduction we are chasing ever gets to report.
+        let spent = match ledger.dumps.iter_mut().find(|(id, _)| *id == renderer) {
+            Some((_, spent)) => spent,
+            None => {
+                ledger.dumps.push((renderer, 0));
+                &mut ledger
+                    .dumps
+                    .last_mut()
+                    .expect("just pushed an entry for this renderer")
+                    .1
+            }
+        };
+        if *spent >= MAX_DUMPS {
             return;
         }
-        ledger.dumps += 1;
-        let remaining = MAX_DUMPS - ledger.dumps;
+        *spent += 1;
+        let remaining = MAX_DUMPS - *spent;
 
         let mut out = format!(
             "[atlas-diag] font atlas delta ledger ({} events, oldest first) after {context}; \
-             {remaining} further dumps will be reported. Events from the main and presenter \
-             threads interleave - regroup by batch= and renderer=.\n",
+             overflow was in batch={batch} on renderer=#{renderer}; {remaining} further dumps \
+             will be reported for this renderer. Events from the main and presenter threads \
+             interleave - regroup by batch= and renderer=.\n",
             ledger.events.len()
         );
         for (seq, event) in &ledger.events {
