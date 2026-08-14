@@ -568,3 +568,33 @@ watchdog / timeout は明確に否定された (欠けているのは時間で�
 - `4ee15943` `ItemId` + 表示境界の述語 1 本化 + `[display-identity]` ログ +
   debug_assert + 「読み込みエラーです。アプリを再起動してください」
 - `display-integrity --check` は**実機の失敗を毎回捕まえている** (判定器は信頼できる)
+
+### 実装 (2026-08-14 夜)
+
+- `b3ed4d24` テクスチャ素性台帳 (`TextureIdentityLedger`)。初見で結び付け、
+  食い違ったテクスチャは**描かずに拒否**して「読み込みエラーです」を出す。
+  非同期プロデューサ (合成 / 編集結果) は**要求時のキー**から先に結び付ける
+- `4fed2d39` Codex Sol 第 1 ラウンドの 2 件を修正
+  - **誤検知**: `item_ids` を `items` と並ぶ Vec で持っていたが、削除 /
+    スナップショット復帰 / スマートフォルダ復帰など **6 経路が同期していなかった**。
+    → Vec を廃止し `items` から**都度導出**。同期義務そのものを無くした
+  - **検出漏れ**: `resolve_fs_display_tex` は単一経路では**なかった**。通常の
+    単頁 / 見開き / 連結は `resolve_fs_processed_texture` を通る。両方を gate 化
+- `67b136af` Codex Sol 第 2 ラウンド。**連結表示の cache-hit は両 resolver を通らない**
+  (= 報告そのものの経路)。`vertical_reading_cached_processed_texture` /
+  `resolve_original_preview_tex` / `continuous_page_transition_texture` を
+  各**関数側**で gate (detached の連結スナップショットも同時に覆える)
+
+Codex 第 2 ラウンドの残り 2 問はクリーン: interner の再入 borrow なし、
+フレーム間で `perf_key` が変わる `GridItem` バリアントなし。
+
+### 意図的に対象外
+
+ナビゲータ / ルーペ / 一覧セルの縮小表示。200px のサムネイルが古いことより、
+それで「再起動してください」と言う方が損害が大きい。
+
+### 残 (次)
+
+- 実機再現で `[display-identity]` が出るか確認 → 出れば**どのストアか**が判る
+- `item_id()` の String 確保は毎フレーム 100 回程度。Codex 見積りでも memo 不要だが、
+  リリース前 perf smoke で確認する
