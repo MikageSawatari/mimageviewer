@@ -133,6 +133,8 @@ pub mod panorama;
 pub mod panorama_wgpu;
 pub mod path_key;
 pub mod reading_history_db;
+#[cfg(any(test, feature = "test-script"))]
+mod settings_override;
 #[cfg(all(windows, any(test, feature = "test-script")))]
 mod test_script;
 mod vram_budget;
@@ -1043,9 +1045,38 @@ pub fn run() -> eframe::Result {
     // ウィンドウ位置、`App::default` などすべてに引き回す。
     let t = Instant::now();
     let settings_load = settings::Settings::load_with_meta();
-    let saved = settings_load.settings;
+    #[allow(unused_mut)]
+    let mut saved = settings_load.settings;
     let settings_load_meta = settings_load.meta;
     emit_startup("settings_load", Some(t));
+
+    // Scripted runs configure themselves here rather than by driving the preferences dialog. Not
+    // present in a shipping binary, and refuses a profile that is not isolated.
+    #[cfg(any(test, feature = "test-script"))]
+    {
+        let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        if let Some(request) = settings_override::requested(&args) {
+            let has_explicit_data_dir = args.windows(2).any(|w| w[0] == "--data-dir");
+            match settings_override::apply(&mut saved, &request, has_explicit_data_dir) {
+                Ok(changed) if changed.is_empty() => {
+                    crate::logger::log("[settings-override] nothing to change".to_owned());
+                }
+                Ok(changed) => {
+                    for entry in &changed {
+                        crate::logger::log(format!("[settings-override] {entry}"));
+                    }
+                }
+                Err(error) => {
+                    // Through the logger, not just stderr: this is a windows_subsystem binary, so
+                    // a message printed to stderr goes nowhere and the run looks like an
+                    // unexplained exit 2.
+                    crate::logger::log(format!("[settings-override] FAILED: {error}"));
+                    eprintln!("error: {error}");
+                    std::process::exit(2);
+                }
+            }
+        }
+    }
 
     // 設定 (開発者タブ) で性能ログが ON なら、ここで perf を有効化する。
     // `perf::init_with_path` の START / FILE は OnceLock なので、CLI の `--perf-log`
@@ -1480,6 +1511,7 @@ fn cli_flag_takes_value(flag: &str) -> bool {
         flag,
         "--data-dir"
             | "--test-script"
+            | "--settings-override"
             | "--window-size"
             | "--perf-log-path"
             | "--play-test"

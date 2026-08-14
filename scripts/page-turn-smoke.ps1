@@ -27,6 +27,9 @@ param(
     [string]$Script,
     [string]$Folder,
     [string]$ScriptDataDir = "target\page-turn-smoke\script-data",
+    # JSON overlay applied to the loaded settings, so a scenario can state the configuration it
+    # needs instead of depending on whatever the profile happens to have. Inline JSON or a path.
+    [string]$SettingsOverride,
     [string]$SelfTestRoot = "target\page-turn-smoke\selftest",
     [string]$DataDir = "target\page-turn-smoke\data",
     [string]$Exe = "target\dev-runtime\mimageviewer-core.exe",
@@ -197,7 +200,8 @@ function Invoke-ScriptedRun {
         [string]$RunDataDir,
         [string]$ScriptPath,
         [string]$StartupFolder,
-        [string[]]$AnalyzerModes
+        [string[]]$AnalyzerModes,
+        [string]$SettingsJson
     )
 
     $null = New-Item -ItemType Directory -Force -Path $RunDataDir
@@ -211,6 +215,21 @@ function Invoke-ScriptedRun {
         "--perf-log",
         "--test-script", $ScriptPath
     )
+    if ($SettingsJson) {
+        # Inline JSON cannot go on the command line: Join-NativeArguments refuses quotes, and
+        # rightly so. Write it beside the run instead, which also leaves the exact configuration
+        # next to the log it produced.
+        $overlayPath = Join-Path $RunDataDir "settings-override.json"
+        if (Test-Path -LiteralPath $SettingsJson) {
+            Copy-Item -LiteralPath $SettingsJson -Destination $overlayPath -Force
+        } else {
+            # No BOM: PowerShell 5.1's [Text.Encoding]::UTF8 writes one, and a BOM is not JSON.
+            $noBom = New-Object System.Text.UTF8Encoding($false)
+            [System.IO.File]::WriteAllText($overlayPath, $SettingsJson, $noBom)
+        }
+        Write-Host "  settings : $overlayPath"
+        $arguments += @("--settings-override", $overlayPath)
+    }
     if ($StartupFolder) {
         $arguments += $StartupFolder
     }
@@ -342,7 +361,7 @@ if ($Script) {
     }
     $exitCode = Invoke-ScriptedRun -RunDataDir $runDataDir `
         -ScriptPath $scriptFull -StartupFolder $startupFolder `
-        -AnalyzerModes @()
+        -AnalyzerModes @() -SettingsJson $SettingsOverride
     exit $exitCode
 }
 
