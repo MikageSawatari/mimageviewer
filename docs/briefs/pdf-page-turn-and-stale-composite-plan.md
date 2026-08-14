@@ -856,7 +856,7 @@ sequence が retire しない ────┘
 `draw_fs_spread` に到達しない理由、および表紙の単独表示と
 `FsNavigationDisplayTarget.pages` の整合を確認する。
 
-## ⑩ 根本原因 (2026-08-14 深夜、確定)
+## ⑩ 根本原因の第一案 — **誤り** (2026-08-14 深夜、Codex が反証)
 
 ### 該当箇所
 
@@ -908,3 +908,67 @@ defer_ui_uploads が true のまま ────┘
 タイムアウトや watchdog で解除するのは症状パッチ。
 `ensure_fs_page_load(partner)` を遅延の対象から外す (= 現表示ユニットは常にロードする)
 のが筋の修正と考えられるが、**実装は Codex / 利用者と合意してから**。
+
+### ⑩ は誤り。正しい原因は ⑪ (Codex Sol レビューで反証、裏取り済み)
+
+⑩ の「見開き相方が defer でロードされないから提示できない」は**間違い**。
+
+- `rendition_ready` は `target.pages.iter().all(|idx| ensure_passthrough_rendition(idx).is_some())`
+  ([ui_fullscreen.rs:5343](../../src/ui_fullscreen.rs:5343))。
+  **`passthrough_ready=true` は idx 1 の rendition も取れていた証拠**。
+  提示に必要なのは低解像度 rendition であって、フル解像度ロードではない
+- `idx1:ok@2046f` の説明も逆だった。2046 フレーム前の `rendition_ready` 判定で 1 度呼ばれ、
+  その後 phase が `Ready`/`Presenting` になり resolver が早期 return する
+  ([ui_fullscreen.rs:5320](../../src/ui_fullscreen.rs:5320)) ので、以後聞かれないだけ
+
+## ⑪ 根本原因 (確定)
+
+**連結表示レンダラーが presentation seam に繋がっていない。**
+
+| | |
+| --- | --- |
+| `draw_fs_continuous_reading` の戻り値 | **`()`** — 何を描いたか報告できない ([ui_fullscreen.rs:24273](../../src/ui_fullscreen.rs:24273)) |
+| 見開き時の `navigator_texture_sources` | **空で初期化** ([ui_fullscreen.rs:12886](../../src/ui_fullscreen.rs:12886)) |
+| `fs_display_unit_trace_pages` | source が欠けると `None` → emit が即 return ([ui_fullscreen.rs:14599](../../src/ui_fullscreen.rs:14599)) |
+| `observe_fs_navigation_sequence_presented` | 描画 idx の集合が `target.pages` と**完全一致**したときだけ retire ([ui_fullscreen.rs:14838](../../src/ui_fullscreen.rs:14838)) |
+
+連結表示では `draw_fs_spread` を迂回する ([ui_fullscreen.rs:12902](../../src/ui_fullscreen.rs:12902))。
+`draw_fs_spread` は PassThrough 時に左右両方の rendition を明示取得するが
+([ui_fullscreen.rs:26505](../../src/ui_fullscreen.rs:26505))、連結側は `FsPageTurnDecision` も
+`state.thumb_tex` も受け取らず、独自に final/raw/thumbnail を解決する。
+
+**不変条件 (Codex の定式化):**
+
+> `Ready(presentation)` にした target unit は、現在選ばれている renderer が必ずその
+> presentation source を消費し、実際に描いた完全な page set を sequence owner へ返せること。
+
+### 修正方針 (full-resolution の admission は変えない)
+
+1. `draw_fs_continuous_reading` に確定済み `FsPageTurnDecision` を渡す
+2. PassThrough かつ navigation target のページは、**target 全ページの rendition を all-or-none**
+   で解決して描画 source にする (ページごとの raw/final fallback と混ぜない)
+3. `draw_fs_continuous_reading` が実際に描けた `(idx, FullscreenPaintResource)` を返す
+4. それを空の `navigator_texture_sources` の代わりに `emit_fs_page_turn_ready_for_display_unit` へ渡す
+
+これなら decode / upload / AI / final effect は従来どおり defer できる。rendition は
+resolver が作成済みなので描画側は原則 cache hit。
+
+### リスク (Codex 指摘)
+
+- [docs/display-pipeline.md:1923](../display-pipeline.md) は「縦・横連結は通過表示の対象外」と
+  している。cross-folder navigation sequence だけ例外にするなら仕様文言も更新する
+- 連結表示は複数 unit が可視になり得る。**実際に描かれた target pages だけ**を提示と数える。
+  cache にある / layout に含まれる / 近傍が描かれた、では retire させない
+- `FsNavigatorTextureSources` が navigator 用と presentation trace 用を兼ねている。
+  最小変更では再利用可、将来は責務を分ける
+
+### 回帰テスト
+
+`continuous_navigation_sequence_retires_after_complete_target_rendition_is_drawn`
+
+横連結 + 見開き、target `[0,1]`、`Ready(Rendition)`、fs_cache / upload / final は未完成の状態で:
+1 枚だけ描けた時点では sequence 継続、2 枚揃った時点で消え、次の decision で
+`defer_ui_uploads=false` になること。現行コードでは source set が空のまま残るので落ちる。
+
+既存 `navigation_sequence_requires_the_complete_atomic_target_unit` は「2 枚必要」は証明済みだが、
+**連結 renderer と sequence の接続を通らない**ので今回の回帰テストにはならない。
