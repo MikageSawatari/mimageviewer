@@ -53,6 +53,14 @@ log("folder-nav-burst: switch the viewer to window mode");
 run_action("FsToggleWindowMode");
 sleep(1000);
 
+// Spread, set explicitly. `default_spread_mode` in the profile is the default for a newly opened
+// folder, not the live mode, and every wedge so far has been a two-page display unit: the sequence
+// waits on pages [0, 1] while only one of them is ever resolved. A run that ends up single-page
+// cannot reach that state at all, which is why the scenario kept recovering.
+log("folder-nav-burst: switch to RTL spread with a cover");
+run_action("FsSpreadRtlCover");
+wait_until(|s| s.spread_mode == "RtlCover", 10000);
+
 // A post filter puts the final-effect pipeline in the path, which is what the pass-through
 // rendition exists to cover for. Without it the page materializes directly and the sequence never
 // enters the phase that defers uploads - a default profile cannot reach the reported state.
