@@ -1659,6 +1659,29 @@ docs/conceal-feature-plan.md
 - 規模 / 優先度: Small〜Medium / P2。いずれも製品 runtime の品質問題ではなく、
   同一 worktree で複数セッションを使うリリース運用とクリーン再現性の改善。
 
+### 1.85 vendored egui-wgpu のテクスチャ配送に回帰テストが無い
+
+- 出典: v3.0.0 出荷前のクラッシュ修正 (2026-08-14、`ce6616ef`)。
+  `paint_and_update_textures` が surface 無し viewport で早期 return し、
+  **`textures_delta.set` を丸ごと捨てていた**問題を直したが、**テストは入れていない**。
+- **この境界は過去 3 回、別の症状で表面化している**:
+  1. サムネイルが純黒で固着 (v1.8.0 回帰) → `poll_thumbnails` 側で resync 窓中の
+     upload を先送りする回避
+  2. font atlas の `Y 29..44` パニック → `set_fonts` 最大 5 世代リトライの resync
+  3. font atlas の `Y 45..126` パニック (今回) → **リトライ 5 世代を回りきって落ちた**。
+     リトライ回数では防げないことの実証
+- 欲しいテスト (Codex 案):
+  1. `Managed(0)` が初期 32px 高
+  2. **surface が無い状態で** 128px 以上の full 置換を submit
+  3. surface 復帰後に `y=45..126` の partial を submit
+  4. full 置換が共有 renderer に届いており validation error が出ないこと
+- 障害: vendored egui-wgpu に既存のテスト基盤が無く、GPU device が要る。
+  `egui_kittest` の wgpu 経路 (tests/ui_snapshot.rs) が最も近い足場。
+- **回避策を撤去するかの判断もここに含める**: 上記 1 の upload 先送りと 2 の resync は、
+  境界が直った今は保険であって正しさの担保ではない。撤去は別レビューで
+  (今回は同時に触らないと決めた)。
+- 規模 / 優先度: 中 / P2。
+
 ### 1.84 表示キャッシュに item-context 世代の刻印が無い (latent、ABA 危険)
 
 - 出典: v3.0.0 出荷前の holdover 調査 (2026-08-14) で Codex が併せて指摘。
