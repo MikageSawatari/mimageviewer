@@ -53705,11 +53705,14 @@ impl App {
         &self,
         idx: usize,
     ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        // Gated as well as generation-filtered: a transition is recorded from whatever the page
+        // was drawing, so a texture that got past nothing else must not get past this either.
         self.continuous_page_transition_is_owned_here(idx)
             .then(|| self.continuous_page_transitions.get(&idx))
             .flatten()
             .filter(|entry| entry.items_generation == self.items_generation)
             .map(|entry| entry.texture.clone())
+            .filter(|resource| self.display_texture_matches_page(resource.source_texture(), idx))
     }
 
     /// 連結読みで表示候補になった final/comic texture をページ別遷移状態へ反映する。

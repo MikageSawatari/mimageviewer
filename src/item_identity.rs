@@ -18,15 +18,18 @@
 //! | `items_generation` | the list was replaced |
 //! | `ItemId` | the generation did not change but the item did, or a result adopted a key that is not its own |
 //!
-//! The cost is deliberately near zero so it can be applied redundantly rather than only where a
-//! failure has already been proven: ids are interned once per item when a list is installed, and
-//! every later comparison is a single `u64`. Keys stay `Copy`, nothing is allocated on a lookup,
-//! and no string is hashed on a display path.
-//!
 //! Ids are interned by content, not by position, so the same page reopened later gets the same id.
 //! That is what makes the check meaningful across a list change rather than a restatement of
 //! `(generation, idx)`. A monotonic counter is used rather than a hash of the key: a hash can
 //! collide, and a collision here would silently reinstate exactly the bug this exists to prevent.
+//!
+//! Identity is *derived* from the item on demand rather than stored beside it. Holding it in a
+//! vector parallel to `items` was tried first and was wrong: six paths mutate the list without
+//! going through the install that filled the vector - deletion, snapshot restore and smart-folder
+//! restore among them - and after any of those, an item's texture stopped matching its own index.
+//! A guard against showing the wrong page became a way to refuse the right one. Deriving it costs
+//! a short-lived key allocation per call, which measured against roughly a hundred calls a frame
+//! is not worth a memo that would bring the synchronisation obligation back.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -58,9 +61,6 @@ impl std::fmt::Display for ItemId {
 }
 
 /// Hands out one [`ItemId`] per distinct item key, stable for the process.
-///
-/// Interning happens when a list is installed - O(n) work inside an operation that is already
-/// O(n) - so display paths only ever compare integers.
 #[derive(Debug, Default)]
 pub(crate) struct ItemIdInterner {
     ids: HashMap<String, ItemId>,
@@ -96,11 +96,18 @@ impl ItemIdInterner {
 /// the pixels were uploaded once, for one page. Recording what a texture is *for* therefore covers
 /// every store at once, including stores that do not exist yet.
 ///
-/// Identity is learned on first sight rather than at upload: the resolver below is the single point
-/// every display texture passes through, so binding it there needs no cooperation from producers
-/// and cannot be forgotten by a new one. A producer that already knows which item it worked on can
-/// bind earlier via [`Self::bind`], which is strictly better - it catches the case where the very
-/// first sighting is already the wrong one - but nothing depends on it happening.
+/// Identity is learned on first sight rather than at upload, so a store needs no cooperation to be
+/// covered and a new one cannot forget. A producer that already knows which item it worked on binds
+/// earlier via [`Self::bind`], which is strictly better - it catches the case where the very first
+/// sighting is already the wrong one, as when an AI composite starts under one document and lands
+/// after the switch to the next - but nothing depends on that having happened.
+///
+/// The checks live on the resolvers and accessors that hand a texture to the page being drawn:
+/// `resolve_fs_processed_texture`, `resolve_fs_display_tex`, the continuous-reading cache and
+/// original-preview lookups, the continuous transition, the pass-through rendition, and
+/// `fs_thumbnail_texture_for_display`. Small overlays that show a page at reduced size - the
+/// navigator, the loupe, the grid - are deliberately *not* gated: a stale thumbnail there is worth
+/// far less than the risk of telling someone to restart over one.
 ///
 /// Texture ids are never reused by `epaint`, so an entry can never come to describe a different
 /// texture; entries are dropped oldest-first purely to bound memory. The bound is far above the

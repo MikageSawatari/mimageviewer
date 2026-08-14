@@ -4977,11 +4977,14 @@ impl App {
         original_preview_active || self.analysis_mode
     }
 
+    /// Gated: continuous reading and the detached snapshot both take this straight to the screen.
     fn resolve_original_preview_tex(&self, idx: usize) -> Option<egui::TextureHandle> {
-        match self.fs_cache.get(&idx) {
+        let texture = match self.fs_cache.get(&idx) {
             Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
             _ => self.current_animated_frame_texture(idx),
-        }
+        }?;
+        self.display_texture_matches_page(&texture, idx)
+            .then_some(texture)
     }
 
     /// 編集プレビューの下地になる source 解像度レイヤを解決する。
@@ -24130,7 +24133,19 @@ impl App {
         }
     }
 
+    /// Gated: continuous reading adopts this result directly rather than through
+    /// [`Self::resolve_fs_processed_texture`], and it is where the reported failure - the first
+    /// page of the previous document staying on screen - reaches the screen.
     fn vertical_reading_cached_processed_texture(&self, idx: usize) -> Option<egui::TextureHandle> {
+        let texture = self.vertical_reading_cached_processed_texture_unchecked(idx)?;
+        self.display_texture_matches_page(&texture, idx)
+            .then_some(texture)
+    }
+
+    fn vertical_reading_cached_processed_texture_unchecked(
+        &self,
+        idx: usize,
+    ) -> Option<egui::TextureHandle> {
         if self.fs_entry_is_animated(idx) {
             self.current_animated_frame_texture(idx)
         } else if self.comic_pages.contains(&idx) {
