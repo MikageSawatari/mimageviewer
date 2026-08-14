@@ -22003,6 +22003,12 @@ impl App {
         reason: FsNavNoOpReason,
         native_toast: bool,
     ) {
+        // A refusal that only shows a toast is invisible afterwards, and the toast can land on a
+        // monitor the user is not looking at. That is how 21.8 seconds of deliberately refused
+        // navigation were reported - and investigated - as a lockup: the log recorded the inputs
+        // arriving and nothing about them being declined. Refusals with a reason now say so, the
+        // same way a refusal by an unresolved target does.
+        self.note_fullscreen_nav_noop(reason, native_toast);
         #[cfg(windows)]
         if native_toast {
             self.show_native_video_overlay_toast(Self::nav_noop_title(reason).to_string(), true);
@@ -22014,6 +22020,33 @@ impl App {
         let _ = (ctx, native_toast);
 
         self.set_fullscreen_nav_noop(reason);
+    }
+
+    /// Log a refusal that has a stated reason, deduplicated the same way dropped requests are:
+    /// once per distinct reason, then on powers of two. Key repeat means this fires 30 times a
+    /// second while the key is held, so the dedup is what keeps it readable.
+    fn note_fullscreen_nav_noop(&mut self, reason: FsNavNoOpReason, native_toast: bool) {
+        let signature = format!(
+            "{reason:?} native_toast={native_toast} fs_idx={:?}",
+            self.fullscreen_idx
+        );
+        if self.fs_nav_dropped_block_signature.as_deref() == Some(signature.as_str()) {
+            self.fs_nav_dropped_block_count += 1;
+            if self.fs_nav_dropped_block_count.is_power_of_two() {
+                crate::logger::log(format!(
+                    "[fs-nav] refused {} requests for the same reason: {signature} ({})",
+                    self.fs_nav_dropped_block_count,
+                    Self::nav_noop_title(reason)
+                ));
+            }
+            return;
+        }
+        self.fs_nav_dropped_block_signature = Some(signature.clone());
+        self.fs_nav_dropped_block_count = 1;
+        crate::logger::log(format!(
+            "[fs-nav] refused request: {signature} ({})",
+            Self::nav_noop_title(reason)
+        ));
     }
 
     fn set_fullscreen_nav_noop(&mut self, reason: FsNavNoOpReason) {

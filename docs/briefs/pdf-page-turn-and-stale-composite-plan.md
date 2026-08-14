@@ -481,3 +481,38 @@ renderer へ届いていない** (どこかで捨てられている)。partial �
 
 ⚠ **overflow のスキップは fix ではない** (Codex 指摘)。原因が特定できるまでの延命策であり、
 台帳が答えを出したら構造的な修正に置き換える。
+
+
+## ④ 21.8 秒の「ナビ固着」— 診断の訂正 (2026-08-14)
+
+**私の当初の診断は誤りだった可能性が高い。** 利用者の指摘で判明した。
+
+実機で再現したところ **「切り離した別ウィンドウではフォルダ移動しません」** のトーストが出て
+止まった。これは `FsNavNoOpReason::DetachedIndependent` による**意図した仕様**
+(`ui_fullscreen.rs` の `detached_independent_session_blocks_folder_nav` 分岐) であり、不具合ではない。
+前回はトーストが別モニタ側に出ていて見落とされたと考えられる。
+
+当該ログでも detached viewer は生きていた (`[detached-viewer] show viewport` /
+`registered host hwnd=0x241c44`)。**当時のログでは両者を区別できなかった** — 拒否も
+トーストもログに残っていなかったため、`blocks_new_target()` による固着と、この仕様上の
+拒否が同じ「入力だけ記録されて何も起きない」に見えていた。
+
+### この件から確定したこと
+
+1. **「入力が記録されているのに何も起きない」だけでは原因を特定できない。**
+   `[fs-nav] refused request: DetachedIndependent ...` を出すようにした。以後は仕様上の拒否と
+   未解決 target による drop がログ上で必ず分かれる
+2. **UI の feedback がマルチモニタで届かないことがある。** 別ウィンドウ側の操作に対する
+   トーストが、利用者の見ていない画面に出る。別途検討する価値がある (今回の調査コストの
+   直接の原因)
+
+### それでも残る本物の欠陥
+
+**動画を「ページ表示単位」として記述してしまう穴は実在する** (`#[ignore]` 付きの
+`page_navigation_never_describes_a_natively_presented_item_as_a_page_unit` が deterministic に
+red)。ページナビの入口 `begin_fs_page_navigation_sequence` は target 種別を検証せず、
+`resolve_...` は非ページ項目を `Ready` へ進められるのに、`Ready` を retire できるのは
+静止画の描画経路だけ。**この非対称は実機の 21.8 秒とは別件として直す。**
+
+Codex と合意した形は (c)+(b): 単一の `FsNavigationState` 所有者 + 各描画面からの typed receipt。
+watchdog / timeout は明確に否定された (欠けているのは時間ではなく presentation の受領確認)。
