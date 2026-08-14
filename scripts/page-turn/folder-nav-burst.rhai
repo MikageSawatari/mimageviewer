@@ -91,13 +91,21 @@ let rounds = 4;
 for round in 0..rounds {
     log("folder-nav-burst: burst " + (round + 1) + " of " + rounds);
 
-    // Folder navigation and page turns interleaved, which is how the report describes it: a few
-    // documents forward, then pages within one, then on again. Ctrl+Down alone lands on page 0 of
-    // each document and never builds the in-document state that a plain Down leaves behind.
-    hold_key("Down", "ctrl", 4000);
-    hold_key("Down", 2000);
-    hold_key("Down", "ctrl", 4000);
-    hold_key("Down", 2000);
+    // Read to the end of a document, wait, then leave while the viewer is still busy behind the
+    // last page. That order is what the report describes and what a burst alone cannot produce:
+    // Ctrl+Down held down never lets a page settle, so no upscale or prefetch is ever in flight
+    // when the next document arrives - and in-flight background work is the one condition every
+    // earlier attempt was missing.
+    hold_key("Down", "ctrl", 3000);
+
+    // To the end of this document with ordinary page turns.
+    hold_key("Down", 4000);
+
+    // Long enough for the upscale and the neighbour prefetch to start, short enough that they are
+    // still running when the next Ctrl+Down lands on top of them.
+    sleep(2500);
+
+    hold_key("Down", "ctrl", 3000);
 
     // Long enough for the landing page to materialize and its upscale to run. A raster PDF holds
     // its AI back until a full-resolution re-render lands, so a short pause leaves the upscale
