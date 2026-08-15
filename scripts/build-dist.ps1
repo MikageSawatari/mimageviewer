@@ -52,6 +52,29 @@ if ($sign) {
     Assert-MivSignReady
 }
 
+# A running mImageViewer holds its own exe open, and `cargo clean` cannot delete a file
+# that is open: the clean below fails with "os error 5" and the build stops after the
+# multi-minute test gate has already run. build-release.ps1 does stop these, but it runs
+# after the clean, so its stopper is no help here. Say so before anything expensive
+# starts, and name the processes rather than leaving a bare access-denied to interpret.
+# Not stopped automatically from here: this script also runs the test gate, and a viewer
+# holding unsaved state is the user's to close.
+$runningNames = @(
+    'mimageviewer',
+    'mimageviewer-core',
+    'mimageviewer-remote',
+    'mimageviewer-vst3-host',
+    'mimageviewer-susie32'
+)
+$running = @(Get-Process -ErrorAction SilentlyContinue |
+    Where-Object { $runningNames -contains $_.Name })
+if ($running.Count -gt 0) {
+    $list = ($running | ForEach-Object { "{0}({1})" -f $_.Name, $_.Id }) -join ', '
+    $message = "[build-dist] mImageViewer is running: $list. Close it (including the tray icon)"
+    $message += " before a distribution build - cargo clean cannot delete an exe that is open."
+    throw $message
+}
+
 # Run the complete Rust gate before cleaning release outputs. The explicit skip
 # exists for retrying packaging/signing on an unchanged, already-tested tree.
 if ($SkipRustTests) {
