@@ -29008,10 +29008,12 @@ impl App {
         const FONT_SIZE: f32 = 13.0;
 
         let ctx = ui.ctx().clone();
+        // `Area::anchor` が基準にするのと同じ矩形から下端を取る。読み込みラベルの位置も
+        // 同じ空間で記録しているので、退避量がずれない。
         let bottom_offset = fs_ai_status_bottom_offset(
             self.fs_seek_overlay_visible,
             self.fs_loading_label_top,
-            ctx.screen_rect().bottom(),
+            ctx.content_rect().bottom(),
         );
         egui::Area::new("fs_ai_status_overlay".into())
             .order(egui::Order::Foreground)
