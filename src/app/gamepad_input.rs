@@ -122,6 +122,14 @@ fn ring_location_action_for_key_action(action: KeyAction) -> Option<RingActionId
     })
 }
 
+fn ring_history_clear_action_for_key_action(action: KeyAction) -> Option<RingActionId> {
+    Some(match action {
+        KeyAction::GridClearRecentFolders => RingActionId::ClearRecentFolders,
+        KeyAction::GridClearQuickFolderSlots => RingActionId::ClearQuickFolderSlots,
+        _ => return None,
+    })
+}
+
 const GRID_PICKER_ROWS: &[RingPickerRowId] = &[
     RingPickerRowId::GridColumns,
     RingPickerRowId::GridSortOrder,
@@ -4531,6 +4539,18 @@ impl App {
         self.request_tag_toggle_for_selection(&name, crate::app::ActionSurface::MainWindow);
     }
 
+    pub(crate) fn apply_history_clear_key_action(
+        &mut self,
+        ctx: &egui::Context,
+        action: KeyAction,
+        source: &'static str,
+    ) {
+        let Some(ring_action) = ring_history_clear_action_for_key_action(action) else {
+            return;
+        };
+        let _ = self.apply_ring_action(ctx, RingShortcutContext::Grid, ring_action, source);
+    }
+
     fn apply_favorite_cycle_nav(
         &mut self,
         ctx: &egui::Context,
@@ -4771,6 +4791,14 @@ impl App {
             }
             RingActionId::OpenOperationCustomize if context == RingShortcutContext::Grid => {
                 self.show_operation_customize = true;
+                None
+            }
+            RingActionId::ClearRecentFolders if context == RingShortcutContext::Grid => {
+                self.execute_clear_recent_folders();
+                None
+            }
+            RingActionId::ClearQuickFolderSlots if context == RingShortcutContext::Grid => {
+                self.execute_clear_quick_folder_slots();
                 None
             }
             RingActionId::GridToggleDetails if context == RingShortcutContext::Grid => {

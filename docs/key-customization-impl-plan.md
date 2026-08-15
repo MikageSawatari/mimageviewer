@@ -487,6 +487,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
     GridOpenLocation*、GridTogglePinnedTag1..20 は既定未割り当て。設定名も `Grid...` に揃え、
     サムネイル一覧 (`Grid`) の一発操作として扱う。操作カスタマイズでキーを
     割り当てると、グリッド表示中に場所移動またはピン留めタグの付与/解除を実行する。
+  - GridClearRecentFolders / GridClearQuickFolderSlots も既定未割り当ての Grid 操作。
+    フォルダバー設定メニューと同じ共有入口で、状態クリア・設定保存・完了トーストまでを実行する。
 - GridSelectAll `Ctrl+A` (P) / GridDeselect `Ctrl+D`,`Ctrl+Shift+A` (P)
 - GridColumnCount1..10 `Alt+1`..`Alt+0`、GridToggleDetailsView `Alt+-` (P)
 

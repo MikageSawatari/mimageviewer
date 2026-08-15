@@ -16288,6 +16288,13 @@ impl App {
         self.sync_quick_folder_settings();
     }
 
+    /// フォルダバーのメニュー・キー・リングから共有する A/B 記憶場所クリア入口。
+    pub(crate) fn execute_clear_quick_folder_slots(&mut self) {
+        self.clear_quick_folder_slots();
+        self.settings.save();
+        self.show_feedback_toast("A/B の記憶した場所をクリアしました".to_string());
+    }
+
     pub(crate) fn activate_quick_folder_slot(
         &mut self,
         slot: QuickFolderSlotId,
@@ -16369,6 +16376,13 @@ impl App {
         }
         self.recent_folders.clear();
         self.sync_quick_folder_settings();
+    }
+
+    /// フォルダバーのメニュー・キー・リングから共有する最近開いたフォルダ履歴クリア入口。
+    pub(crate) fn execute_clear_recent_folders(&mut self) {
+        self.clear_recent_folders();
+        self.settings.save();
+        self.show_feedback_toast("最近開いたフォルダ履歴をクリアしました".to_string());
     }
 
     /// `load_folder*` 入口で呼ぶ。現在地から `target` への遷移を履歴に記録する。
@@ -32688,6 +32702,28 @@ impl App {
             .consume_action(ctx, KeyAction::GridOpenOperationCustomize)
         {
             self.show_operation_customize = true;
+            return None;
+        }
+        if self
+            .keymap
+            .consume_action(ctx, KeyAction::GridClearRecentFolders)
+        {
+            self.apply_history_clear_key_action(
+                ctx,
+                KeyAction::GridClearRecentFolders,
+                "grid-history-clear-key",
+            );
+            return None;
+        }
+        if self
+            .keymap
+            .consume_action(ctx, KeyAction::GridClearQuickFolderSlots)
+        {
+            self.apply_history_clear_key_action(
+                ctx,
+                KeyAction::GridClearQuickFolderSlots,
+                "grid-history-clear-key",
+            );
             return None;
         }
 

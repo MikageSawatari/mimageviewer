@@ -9169,14 +9169,11 @@ impl App {
             self.settings.save();
             ui.ctx().request_repaint();
         }
-        // クリア系は settings 以外 (session 状態) も触るので、専用メソッド + save を呼ぶ。
         if clear_recent {
-            self.clear_recent_folders();
-            self.settings.save();
+            self.execute_clear_recent_folders();
         }
         if clear_quick {
-            self.clear_quick_folder_slots();
-            self.settings.save();
+            self.execute_clear_quick_folder_slots();
         }
     }
 

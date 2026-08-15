@@ -7,7 +7,7 @@
 
 ## 背景
 
-`RingActionId` (123 variant, `src/ring_shortcut.rs`) と `KeyAction` (`src/keymap.rs`)
+`RingActionId` (125 variant, `src/ring_shortcut.rs`) と `KeyAction` (`src/keymap.rs`)
 を意味対応で突き合わせたところ、一部の操作が **ring/パッドには割り当てられるのにキーボードには
 割り当てられない**状態だった。キー側はハードコードの生キー処理で取り残されており、
 
@@ -25,11 +25,11 @@
 - ⚪ 設計上 ring/パッド専用 (場所ジャンプ等。キー化不要)
 - 固定: キーボード入力としては予約・OS/Shell 連携・マウス専用などの理由で keymap 対象外
 
-## 集計 (actionable 121 / `None`・`Unknown` 除く)
+## 集計 (actionable 123 / `None`・`Unknown` 除く)
 
 | 判定 | 件数 |
 |---|---|
-| ✅ 対応済み | 109 |
+| ✅ 対応済み | 111 |
 | 固定 (理由付き) | 7 |
 | ⚪ ring 専用 (意図的) | 5 |
 | ❌ / ⚠️ 未処理 | 0 |
@@ -56,6 +56,8 @@ global chord snapshot 方式 (`install_global_native_video_shortcuts` /
 | `GridMoveFirst` / `GridMoveLast` | Home / End | 既存 KeyAction 経路を共有 | ✅ `GridMoveFirst` / `GridMoveLast` として、リング / ジェスチャ / マウスボタンからもサムネイル・詳細表示の先頭 / 末尾へ選択移動できる |
 | `OpenPreferences` | 設定メニュー「環境設定…」 | KeyAction 化 | ✅ `GridOpenPreferences` として KeyAction 化。既定キーなし、Grid 文脈だけでリング / ジェスチャ / マウスボタン / X+方向にも割り当て可能 |
 | `OpenOperationCustomize` | 設定メニュー「操作カスタマイズ…」 | KeyAction 化 | ✅ `GridOpenOperationCustomize` として KeyAction 化。既定キーなし、Grid 文脈だけでリング / ジェスチャ / マウスボタン / X+方向にも割り当て可能 |
+| `ClearRecentFolders` | フォルダバー設定「最近開いたフォルダ履歴をクリア」 | KeyAction 化 | ✅ `GridClearRecentFolders` として KeyAction 化。既定キーなし、Grid 文脈だけで共有のクリア・保存・通知入口を実行する |
+| `ClearQuickFolderSlots` | フォルダバー設定「A/B の記憶した場所をクリア」 | KeyAction 化 | ✅ `GridClearQuickFolderSlots` として KeyAction 化。既定キーなし、Grid 文脈だけで共有のクリア・保存・通知入口を実行する |
 | `ImageHome` / `ImageEnd` | Home/End 生処理 | KeyAction 化 | ✅ `FsJumpFirst` / `FsJumpLast` として KeyAction 化。既定 Home / End。画像 / 動画フルスクリーン共通 |
 | `ImageCopyToClipboard` | ring/マウス/パッドから clipboard copy を実行 | 固定明記が妥当 | 固定。OS クリップボード経路で、通常の Ctrl+C / Shell menu / context menu と同じ固定入力レイヤーに置く |
 | `ImageCopyPath` / `ImageCopyFileName` | ring/マウス/パッドからパス / ファイル名を clipboard へコピー | 固定明記 or KeyAction | 固定。OS クリップボード / Shell 連携として keymap 対象外 |
@@ -66,7 +68,7 @@ global chord snapshot 方式 (`install_global_native_video_shortcuts` /
 
 ウィンドウ/本: `CloseFullscreen`→`FsClose`/`VideoCloseFullscreen`、`ToggleDetachedViewer`→`ToggleDetachedViewerMode`、`AddToBook`→`Grid/Fs/VideoAddToActiveBook`、
 `PinRepresentativeThumb`→`GridPin`。
-グリッド: `GridToggleDetails`→`GridToggleDetailsView`、`GridToggleCheck`、`GridSelectAll`、`GridOpenSelectedAsPage/List`、`GridMoveFirst/Last`、`GridColumnCount1..10`。
+グリッド: `GridToggleDetails`→`GridToggleDetailsView`、`GridToggleCheck`、`GridSelectAll`、`GridOpenSelectedAsPage/List`、`GridMoveFirst/Last`、`GridColumnCount1..10`、`ClearRecentFolders`→`GridClearRecentFolders`、`ClearQuickFolderSlots`→`GridClearQuickFolderSlots`。
 画像 FS: `ImageRotateLeft/Right`→`FsRotateCcw/FsRotateCw`、`ImageCapture`→`FsCapture`、
 `ImageToggleMetadata`→`FsToggleMetadata`、`ImageSlideshow`→`FsSlideshow`、`ImagePixelGrid`→`FsPixelGrid`、
 `ImageBackgroundCycle`→`FsBgCycle`、`ImageComparePin`→`FsCompareToggle`(比較系・近似)、

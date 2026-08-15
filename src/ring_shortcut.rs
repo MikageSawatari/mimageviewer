@@ -536,6 +536,8 @@ pub enum RingActionId {
     CloseFullscreen,
     OpenPreferences,
     OpenOperationCustomize,
+    ClearRecentFolders,
+    ClearQuickFolderSlots,
     CycleFavorite,
     OpenFavorite1,
     OpenFavorite2,
@@ -928,6 +930,8 @@ impl RingActionId {
             Self::CloseFullscreen => "close_fullscreen",
             Self::OpenPreferences => "open_preferences",
             Self::OpenOperationCustomize => "open_operation_customize",
+            Self::ClearRecentFolders => "clear_recent_folders",
+            Self::ClearQuickFolderSlots => "clear_quick_folder_slots",
             Self::CycleFavorite => "cycle_favorite",
             Self::OpenFavorite1
             | Self::OpenFavorite2
@@ -1069,6 +1073,8 @@ impl RingActionId {
             "close_fullscreen" => Self::CloseFullscreen,
             "open_preferences" => Self::OpenPreferences,
             "open_operation_customize" => Self::OpenOperationCustomize,
+            "clear_recent_folders" => Self::ClearRecentFolders,
+            "clear_quick_folder_slots" => Self::ClearQuickFolderSlots,
             "cycle_favorite" => Self::CycleFavorite,
             "open_location_drive_list" => Self::OpenLocationDriveList,
             "open_location_reading_history" => Self::OpenLocationReadingHistory,
@@ -1179,6 +1185,8 @@ impl RingActionId {
             },
             Self::OpenPreferences => "環境設定を開く",
             Self::OpenOperationCustomize => "操作カスタマイズを開く",
+            Self::ClearRecentFolders => "最近開いたフォルダ履歴をクリア",
+            Self::ClearQuickFolderSlots => "A/B の記憶した場所をクリア",
             Self::CycleFavorite => "お気に入り巡回",
             Self::OpenFavorite1
             | Self::OpenFavorite2
@@ -1307,6 +1315,8 @@ impl RingActionId {
                     | Self::QuitApplication
                     | Self::OpenPreferences
                     | Self::OpenOperationCustomize
+                    | Self::ClearRecentFolders
+                    | Self::ClearQuickFolderSlots
                     | Self::AddToBook
                     | Self::PinRepresentativeThumb
                     | Self::CycleFavorite
@@ -1425,6 +1435,8 @@ impl RingActionId {
                 Self::QuitApplication,
                 Self::OpenPreferences,
                 Self::OpenOperationCustomize,
+                Self::ClearRecentFolders,
+                Self::ClearQuickFolderSlots,
                 Self::AddToBook,
                 Self::PinRepresentativeThumb,
                 Self::CycleFavorite,
@@ -2927,6 +2939,43 @@ mod tests {
             assert!(action.is_valid_for_context(RingShortcutContext::Grid));
             assert!(
                 RingActionId::available_for_context(RingShortcutContext::Grid).contains(&action)
+            );
+            for context in [
+                RingShortcutContext::ImageFullscreen,
+                RingShortcutContext::VideoFullscreen,
+            ] {
+                assert!(!action.is_valid_for_context(context));
+                assert!(!RingActionId::available_for_context(context).contains(&action));
+            }
+        }
+    }
+
+    #[test]
+    fn history_clear_actions_round_trip_and_are_grid_only() {
+        let samples = [
+            (
+                RingActionId::ClearRecentFolders,
+                "clear_recent_folders",
+                "最近開いたフォルダ履歴をクリア",
+            ),
+            (
+                RingActionId::ClearQuickFolderSlots,
+                "clear_quick_folder_slots",
+                "A/B の記憶した場所をクリア",
+            ),
+        ];
+
+        for (action, id, label) in samples {
+            assert_eq!(action.as_str(), id);
+            assert_eq!(RingActionId::from_str(id), Some(action.clone()));
+            assert_eq!(action.label_for_context(RingShortcutContext::Grid), label);
+            assert!(action.is_valid_for_context(RingShortcutContext::Grid));
+            assert!(
+                RingActionId::available_for_context(RingShortcutContext::Grid).contains(&action)
+            );
+            assert!(
+                RingActionId::available_for_mouse_button_context(RingShortcutContext::Grid)
+                    .contains(&action)
             );
             for context in [
                 RingShortcutContext::ImageFullscreen,

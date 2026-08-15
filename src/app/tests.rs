@@ -4777,11 +4777,12 @@ mod folder_pane_open_nav_tests {
 #[cfg(test)]
 mod phase_c_folder_nav_history_tests {
     use crate::app::{
-        QuickFolderSlotId, QuickFolderSwitchTarget, drive_current_key_for_letter,
-        drive_root_path_for_letter, location_root_for_path,
+        FolderNavHistoryState, QuickFolderSlotId, QuickFolderSwitchTarget,
+        drive_current_key_for_letter, drive_root_path_for_letter, location_root_for_path,
     };
     use crate::archive_converter::ArchiveFormat;
     use crate::grid_item::GridItem;
+    use crate::keymap::KeyAction;
 
     use super::phase_c_support::setup_app;
     use std::collections::HashSet;
@@ -4899,16 +4900,21 @@ mod phase_c_folder_nav_history_tests {
     }
 
     #[test]
-    fn clear_recent_folders_updates_session_and_settings() {
+    fn clear_recent_folders_command_updates_session_storage_and_toast() {
         let mut app = setup_app();
         app.active_quick_folder_slot = Some(QuickFolderSlotId::A);
         app.remember_recent_folder(&PathBuf::from(r"C:\miv-test\a"));
         app.active_quick_folder_slot = Some(QuickFolderSlotId::B);
         app.remember_recent_folder(&PathBuf::from(r"C:\miv-test\b"));
+        app.settings.save();
 
-        app.clear_recent_folders();
+        app.apply_history_clear_key_action(
+            &egui::Context::default(),
+            KeyAction::GridClearRecentFolders,
+            "test-key",
+        );
 
-        // 全スロットの一覧がクリアされ、設定にも反映される。
+        // 全スロットの一覧がクリアされ、設定と永続ストアにも反映される。
         assert!(app.recent_folder_entries().is_empty());
         assert!(
             app.quick_folder_workspaces
@@ -4922,6 +4928,67 @@ mod phase_c_folder_nav_history_tests {
                 .all(|list| list.is_empty())
         );
         assert!(app.settings.recent_folders.is_empty());
+        let persisted = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+        assert!(
+            persisted
+                .quick_folder_recent_folders
+                .iter()
+                .all(Vec::is_empty)
+        );
+        assert!(persisted.recent_folders.is_empty());
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+            Some("最近開いたフォルダ履歴をクリアしました")
+        );
+    }
+
+    #[test]
+    fn clear_quick_folder_slots_command_updates_session_storage_and_toast() {
+        let mut app = setup_app();
+        app.set_quick_folder_slot_target(
+            QuickFolderSlotId::A,
+            PathBuf::from(r"C:\miv-test\source"),
+        );
+        app.set_quick_folder_slot_target(
+            QuickFolderSlotId::B,
+            PathBuf::from(r"D:\miv-test\destination"),
+        );
+        app.settings.save();
+
+        let _ = app.apply_ring_action(
+            &egui::Context::default(),
+            crate::ring_shortcut::RingShortcutContext::Grid,
+            crate::ring_shortcut::RingActionId::ClearQuickFolderSlots,
+            "test-ring",
+        );
+
+        assert_eq!(app.active_quick_folder_slot, Some(QuickFolderSlotId::A));
+        assert!(
+            app.quick_folder_workspaces
+                .iter()
+                .all(|workspace| workspace.target.is_none()
+                    && workspace.history == FolderNavHistoryState::default()
+                    && workspace.drive_current_dirs.is_empty())
+        );
+        assert_eq!(app.settings.quick_folder_slots, [None, None]);
+        assert!(
+            app.settings
+                .quick_folder_drive_current_dirs
+                .iter()
+                .all(|dirs| dirs.is_empty())
+        );
+        let persisted = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+        assert_eq!(persisted.quick_folder_slots, [None, None]);
+        assert!(
+            persisted
+                .quick_folder_drive_current_dirs
+                .iter()
+                .all(|dirs| dirs.is_empty())
+        );
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+            Some("A/B の記憶した場所をクリアしました")
+        );
     }
 
     #[test]

@@ -143,6 +143,8 @@
 # GridOpenLocationDesktop = none ; デスクトップを開く
 # GridOpenLocationPictures = none ; ピクチャを開く
 # GridOpenLocationDownloads = none ; ダウンロードを開く
+# GridClearRecentFolders = none ; 最近開いたフォルダ履歴をクリアする
+# GridClearQuickFolderSlots = none ; A/B の記憶した場所をクリアする
 # GridTogglePinnedTag1 = none ; ピン留めタグ1を付与/解除する
 # GridTogglePinnedTag2 = none ; ピン留めタグ2を付与/解除する
 # GridTogglePinnedTag3 = none ; ピン留めタグ3を付与/解除する

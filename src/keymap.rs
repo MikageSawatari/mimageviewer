@@ -1445,6 +1445,8 @@ pub enum KeyAction {
     GridOpenLocationDesktop,
     GridOpenLocationPictures,
     GridOpenLocationDownloads,
+    GridClearRecentFolders,
+    GridClearQuickFolderSlots,
     GridTogglePinnedTag1,
     GridTogglePinnedTag2,
     GridTogglePinnedTag3,
@@ -1876,6 +1878,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridOpenLocationDesktop,
     KeyAction::GridOpenLocationPictures,
     KeyAction::GridOpenLocationDownloads,
+    KeyAction::GridClearRecentFolders,
+    KeyAction::GridClearQuickFolderSlots,
     KeyAction::GridTogglePinnedTag1,
     KeyAction::GridTogglePinnedTag2,
     KeyAction::GridTogglePinnedTag3,
@@ -3415,6 +3419,8 @@ impl KeyAction {
             GridOpenLocationDesktop => "GridOpenLocationDesktop",
             GridOpenLocationPictures => "GridOpenLocationPictures",
             GridOpenLocationDownloads => "GridOpenLocationDownloads",
+            GridClearRecentFolders => "GridClearRecentFolders",
+            GridClearQuickFolderSlots => "GridClearQuickFolderSlots",
             GridSelectAll => "GridSelectAll",
             GridDeselect => "GridDeselect",
             GridToggleCheck => "GridToggleCheck",
@@ -3964,6 +3970,8 @@ impl KeyAction {
             GridOpenLocationDesktop => "デスクトップを開く",
             GridOpenLocationPictures => "ピクチャを開く",
             GridOpenLocationDownloads => "ダウンロードを開く",
+            GridClearRecentFolders => "最近開いたフォルダ履歴をクリアする",
+            GridClearQuickFolderSlots => "A/B の記憶した場所をクリアする",
             GridSelectAll => "表示中のチェック可能な項目をすべてチェックする",
             GridDeselect => "チェックをすべて解除する",
             GridToggleCheck => "選択中の項目のチェックを切り替える",
@@ -4382,6 +4390,8 @@ impl KeyAction {
             | GridOpenLocationDesktop
             | GridOpenLocationPictures
             | GridOpenLocationDownloads
+            | GridClearRecentFolders
+            | GridClearQuickFolderSlots
             | GridTogglePinnedTag1
             | GridTogglePinnedTag2
             | GridTogglePinnedTag3
@@ -4772,6 +4782,8 @@ impl KeyAction {
             | GridOpenLocationDesktop
             | GridOpenLocationPictures
             | GridOpenLocationDownloads
+            | GridClearRecentFolders
+            | GridClearQuickFolderSlots
             | GridTogglePinnedTag1
             | GridTogglePinnedTag2
             | GridTogglePinnedTag3
@@ -5209,6 +5221,8 @@ impl KeyAction {
             | GridOpenLocationDesktop
             | GridOpenLocationPictures
             | GridOpenLocationDownloads
+            | GridClearRecentFolders
+            | GridClearQuickFolderSlots
             | GridTogglePinnedTag1
             | GridTogglePinnedTag2
             | GridTogglePinnedTag3
@@ -8641,6 +8655,8 @@ mod tests {
             "CloseFullscreen".to_string(),
             "OpenPreferences".to_string(),
             "OpenOperationCustomize".to_string(),
+            "ClearRecentFolders".to_string(),
+            "ClearQuickFolderSlots".to_string(),
             "GridToggleDetails".to_string(),
             "GridToggleCheck".to_string(),
             "GridSelectAll".to_string(),
@@ -9506,6 +9522,21 @@ mod tests {
                 .and_then(|spec| spec.action),
             Some(KeyAction::GridOpenOperationCustomize)
         );
+    }
+
+    #[test]
+    fn grid_history_clear_actions_are_default_unassigned() {
+        for action in [
+            KeyAction::GridClearRecentFolders,
+            KeyAction::GridClearQuickFolderSlots,
+        ] {
+            assert!(KeyAction::all().contains(&action));
+            assert_eq!(KeyAction::from_ini_name(action.ini_name()), Some(action));
+            assert_eq!(action.context(), KeyContext::Grid);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert!(action.default_chords().is_empty());
+            assert!(action.is_user_facing());
+        }
     }
 
     #[test]

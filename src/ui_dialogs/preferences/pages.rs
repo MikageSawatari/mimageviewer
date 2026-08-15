@@ -1364,6 +1364,8 @@ fn ring_bindings_for_key_action(action: KeyAction) -> Vec<(RingShortcutContext, 
         KeyAction::GridToggleDetailsView => RingActionId::GridToggleDetails,
         KeyAction::GridOpenPreferences => RingActionId::OpenPreferences,
         KeyAction::GridOpenOperationCustomize => RingActionId::OpenOperationCustomize,
+        KeyAction::GridClearRecentFolders => RingActionId::ClearRecentFolders,
+        KeyAction::GridClearQuickFolderSlots => RingActionId::ClearQuickFolderSlots,
         KeyAction::GridToggleMaximize => RingActionId::ToggleMaximize,
         KeyAction::GridColumnCount1 => RingActionId::GridColumnCount1,
         KeyAction::GridColumnCount2 => RingActionId::GridColumnCount2,
@@ -7942,6 +7944,21 @@ mod tests {
             vec![(
                 RingShortcutContext::Grid,
                 RingActionId::OpenOperationCustomize,
+            )]
+        );
+    }
+
+    #[test]
+    fn history_clear_key_actions_map_to_grid_ring_actions() {
+        assert_eq!(
+            ring_bindings_for_key_action(KeyAction::GridClearRecentFolders),
+            vec![(RingShortcutContext::Grid, RingActionId::ClearRecentFolders,)]
+        );
+        assert_eq!(
+            ring_bindings_for_key_action(KeyAction::GridClearQuickFolderSlots),
+            vec![(
+                RingShortcutContext::Grid,
+                RingActionId::ClearQuickFolderSlots,
             )]
         );
     }

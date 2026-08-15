@@ -58,6 +58,8 @@ Shell 連携 (コピー / パスコピー / フォルダを開く) は入力経�
 `GridFavorite...` / `GridOpenFavorite...` / `GridOpenCurrentDriveRoot` / `GridOpenDrive...` /
 `GridSwitchDrive...` /
 `GridOpenLocation...` / `GridTogglePinnedTag...` とし、競合判定とヘルプ表示でも `Grid` 文脈として扱う。
+フォルダバーの「最近開いたフォルダ履歴をクリア」と「A/B の記憶した場所をクリア」も、
+`GridClearRecentFolders` / `GridClearQuickFolderSlots` として標準キーなしで割り当てられる。
 同時に有効になり得る Action へ同じキーを割り当てた場合や、予約扱いの
 Escape / 修飾なし矢印キーへ割り当てた場合は起動時に警告ログを出すが、
 設定自体は読み込み、現行 dispatch の優先順を変えない。
@@ -216,6 +218,7 @@ Enter-held の各 API は対象 `ViewportId` を必須引数にし、別 viewpor
 | 既定キーなし (`GridReload`) | 現在の一覧を、その一覧種別の再読み込み / 再スキャン / 再クエリ経路で更新する。スマートフォルダ / サブ展開の走査中は二重起動せず、★固定中は何もしない。表示中のフォルダツリーペインも同時に再読み込みする |
 | 既定キーなし (`GridOpenSelectedAsPage` / `GridOpenSelectedAsList`) | 選択中の ZIP/PDF/対応アーカイブを、全体設定に関係なく「ページを開く」または「一覧を開く」で明示的に開く。右クリックメニュー、リングショートカット、マウスジェスチャ候補にも同じ操作を出す。メイン一覧をページ一覧へ切り替えるフル機能ウィンドウ用コマンドのため、複数ウィンドウモードでは共通実行入口でトーストを表示し、履歴・変換・一覧・viewer の状態を一切変更しない。現在コンテキストのショートカット一覧にも使用可能なときだけ表示する |
 | 既定キーなし (`GridOpenPreferences` / `GridOpenOperationCustomize`) | 「環境設定」または「操作カスタマイズ」を開く。Grid 文脈だけで、キーボード、リング、マウスジェスチャ、マウスボタン、ゲームパッド X+方向へ割り当てられる。メインウィンドウ側のダイアログが見えない画像 / 動画フルスクリーンでは候補に出さず、発火もしない |
+| 既定キーなし (`GridClearRecentFolders` / `GridClearQuickFolderSlots`) | フォルダバー設定メニューと同じく、最近開いたフォルダ履歴または A/B の記憶した場所を確認なしでクリアし、設定へ保存して完了をトースト表示する。Grid 文脈だけで、キーボード、リング、マウスジェスチャ、マウスボタン、ゲームパッド X+方向へ割り当てられる |
 | 右ドラッグ（設定時） | 操作カスタマイズで選んだリングショートカットまたはマウスジェスチャを実行する。「ファイル上で右ドラッグを始めたとき、そのファイルを選択」が ON の場合は、押下時点で開始セルを選択してから操作を開始する。チェック済みの複数選択は解除せず、空き位置から開始した場合は選択を変えない。短い右クリックは従来どおり release 時に対象セルを選び、メニューを開く |
 | <kbd>Shift</kbd>+<kbd>Enter</kbd> | 選択中の動画を外部プレイヤーで開く。Action: `GridOpenExternalPlayer` |
 | <kbd>Alt</kbd>+<kbd>↑</kbd> | 親フォルダへ。Action: `GridParentFolder` の別既定割り当て (<kbd>Backspace</kbd> と同じ。Explorer 慣習に合わせた代替ショートカット。ドライブルートではドライブ一覧へ戻る。Ctrl+F フィルタ元フォルダでは no-op) |
