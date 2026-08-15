@@ -2631,6 +2631,17 @@ fn should_zoom_fullscreen_wheel(ctrl_held: bool, overlay_edit_mode: bool) -> boo
     ctrl_held || overlay_edit_mode
 }
 
+/// Whether a click on the canvas belongs to the view rather than to turning the page.
+///
+/// **Pan is deliberately not part of this.** A page that fits the window can be dragged too, so
+/// counting pan here would mean that nudging the image even slightly stops clicks from turning
+/// pages - with the way back (double-click to reset) unmarked, which is a worse dead end than the
+/// one that made panning always available in the first place. A drag is kept from being read as a
+/// click at the call site.
+fn fullscreen_click_belongs_to_view(zoom: f32, free_rotation: f32) -> bool {
+    zoom > ZOOM_NEAR_ONE || free_rotation.abs() > TRANSFORM_EPSILON
+}
+
 fn should_suppress_egui_wheel_for_native_detached_video(
     is_video: bool,
     detached: bool,
@@ -21122,12 +21133,15 @@ impl App {
                     self.fs_pan += delta.pan;
                     ctx.request_repaint();
                 }
-            } else if !continuous_active
-                && (self.fullscreen_fit_allows_drag_pan()
-                    || self.fs_zoom > ZOOM_NEAR_ONE
-                    || self.fs_free_rotation.abs() > TRANSFORM_EPSILON)
-            {
-                // ページ単位表示でズームまたは回転中: ドラッグでパン。
+            } else if !continuous_active {
+                // ページ単位表示: ドラッグでパン。
+                //
+                // 以前は「はみ出す表示のとき (フィット設定 / ズーム中 / 回転中) だけ」に
+                // 限っていた。画面に収まっているなら動かす先が無い、という理屈だが、
+                // 使う側からはドラッグしても何も起きない画面に見え、固まったと受け取られる
+                // (利用者報告 2026-08-15)。動かせる先が無いことは、動かしてみて分かるより
+                // 動かせた方がよい。行き先はクランプが持っているので、収まっている画像でも
+                // 画面内に残る範囲で動く。
                 // 連結読みのドラッグは直前の分岐で、主軸スクロールと直交パンに分けて扱う。
                 if primary_pressed
                     && let (Some(pos), Some(total_delta)) =
@@ -21151,12 +21165,16 @@ impl App {
             let has_transform = self.fs_zoom > ZOOM_NEAR_ONE
                 || self.fs_free_rotation.abs() > TRANSFORM_EPSILON
                 || self.fs_pan.length_sq() > PAN_EPSILON_SQ;
+            // ダブルクリックでの復帰は `has_transform` のままなので、動かした位置からは
+            // これまでどおり戻せる。クリックの判定だけがパンを見ない。
+            let click_belongs_to_view =
+                fullscreen_click_belongs_to_view(self.fs_zoom, self.fs_free_rotation);
             if fs_response.double_clicked() && has_transform {
                 self.fs_zoom = 1.0;
                 self.fs_pan = egui::Vec2::ZERO;
                 self.fs_free_rotation = 0.0;
                 self.maybe_rerender_pdf(1.0);
-            } else if !has_transform && self.fs_context_menu_idx.is_none() {
+            } else if !click_belongs_to_view && self.fs_context_menu_idx.is_none() {
                 // 変形なし: 従来の動画/画像クリック動作（コンテキストメニュー表示中は無効）
                 let was_dragging = fs_response.dragged() && fs_response.drag_delta().length() > 3.0;
                 if !was_dragging {
@@ -23417,14 +23435,6 @@ impl App {
             no_downscale: self.settings.fullscreen_fit_no_downscale,
             pixels_per_point,
         }
-    }
-
-    fn fullscreen_fit_allows_drag_pan(&self) -> bool {
-        self.settings.fullscreen_fit_no_downscale
-            || matches!(
-                self.effective_fullscreen_fit_mode(),
-                FullscreenFitMode::Width | FullscreenFitMode::Height | FullscreenFitMode::Original
-            )
     }
 
     pub(crate) fn set_fullscreen_fit_mode_for_current(
@@ -33604,6 +33614,27 @@ mod tests {
             !advance(&mut app, 3, 4, false),
             "a released press must end the burst"
         );
+    }
+
+    /// Dragging a page that fits the window must not cost the reader their click-to-turn.
+    ///
+    /// Panning used to be limited to views that overflow. Reported 2026-08-15: on a page that
+    /// fits, dragging did nothing and read as a hang. Now every page can be dragged - which means
+    /// the pan is no longer evidence that the reader wants clicks to stop turning pages.
+    #[test]
+    fn a_dragged_page_still_turns_on_click_but_a_zoomed_one_does_not() {
+        // Fit or shrunk, wherever it has been dragged to: clicks still turn pages.
+        assert!(!fullscreen_click_belongs_to_view(1.0, 0.0));
+        assert!(!fullscreen_click_belongs_to_view(0.4, 0.0));
+
+        // Zoomed in or rotated: the click is for the view, as before.
+        assert!(fullscreen_click_belongs_to_view(2.5, 0.0));
+        assert!(fullscreen_click_belongs_to_view(1.0, 0.35));
+
+        // The reset offered on double-click is the wider condition, so a page dragged off centre
+        // can still be recentred even though its clicks kept turning pages.
+        let panned = egui::vec2(120.0, -40.0);
+        assert!(panned.length_sq() > PAN_EPSILON_SQ);
     }
 
     #[test]
