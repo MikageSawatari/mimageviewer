@@ -97,6 +97,12 @@ pub(crate) struct FullscreenRawKeyPermit {
     viewport: egui::ViewportId,
 }
 
+impl FullscreenRawKeyPermit {
+    pub(crate) fn allows(self, ctx: &egui::Context) -> bool {
+        self.viewport == ctx.viewport_id()
+    }
+}
+
 impl KeyboardOwner {
     pub const fn shortcut_permit(self) -> Option<ShortcutPermit> {
         match self {
@@ -175,7 +181,7 @@ pub(crate) fn consume_fullscreen_raw_key(
     modifiers: egui::Modifiers,
     key: egui::Key,
 ) -> bool {
-    if permit.viewport != ctx.viewport_id() {
+    if !permit.allows(ctx) {
         return false;
     }
     ctx.input_mut(|input| input.consume_key(modifiers, key))

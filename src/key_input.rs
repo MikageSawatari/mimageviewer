@@ -1613,6 +1613,74 @@ pub struct ConsumeKeyDownResult {
     pub triggered_count: usize,
 }
 
+/// Ordered physical-edge facts for one consumed key press stream.
+///
+/// Unlike [`ConsumeKeyDownResult`], this preserves whether the frame contained
+/// an initial press or only auto-repeat, and whether a later key-up ended the
+/// same physical stream before its owner processed the frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConsumeKeyPressEdgesResult {
+    pub matched_count: usize,
+    pub had_initial_press: bool,
+    pub had_repeat: bool,
+    pub released_after_match: bool,
+}
+
+/// Consume the ordered key-down stream for one chord plus any later release of
+/// its physical slot.
+///
+/// `matches_key_down` owns modifier matching for presses. Releases deliberately
+/// use `matches_physical_key`, because modifiers may be released before the main
+/// key. A key-up that precedes the first matching key-down belongs to an older
+/// press and is left untouched.
+pub fn consume_key_press_edges_with_result<FDown, FPhysical>(
+    viewport: egui::ViewportId,
+    mut matches_key_down: FDown,
+    mut matches_physical_key: FPhysical,
+) -> ConsumeKeyPressEdgesResult
+where
+    FDown: FnMut(KeyEdge) -> bool,
+    FPhysical: FnMut(KeyEdge) -> bool,
+{
+    state()
+        .lock()
+        .map(|mut guard| {
+            let Some(mut index) = guard.frame.iter().position(|edge| {
+                edge.source_viewport == viewport && edge.pressed && matches_key_down(*edge)
+            }) else {
+                return ConsumeKeyPressEdgesResult::default();
+            };
+
+            let mut result = ConsumeKeyPressEdgesResult::default();
+            while index < guard.frame.len() {
+                let edge = guard.frame[index];
+                if edge.source_viewport != viewport {
+                    index += 1;
+                    continue;
+                }
+
+                let matching_down = edge.pressed && matches_key_down(edge);
+                let matching_release = !edge.pressed && matches_physical_key(edge);
+                if !matching_down && !matching_release {
+                    index += 1;
+                    continue;
+                }
+
+                guard.frame.remove(index);
+                if matching_down {
+                    result.matched_count += 1;
+                    result.had_initial_press |= !edge.repeat;
+                    result.had_repeat |= edge.repeat;
+                    result.released_after_match = false;
+                } else {
+                    result.released_after_match = true;
+                }
+            }
+            result
+        })
+        .unwrap_or_default()
+}
+
 pub fn consume_key_down_with_result<F>(
     viewport: egui::ViewportId,
     allow_repeat: bool,
@@ -1810,6 +1878,13 @@ pub fn set_test_synthetic_repeat(delay: Duration, hz: f64) -> bool {
 pub fn enqueue_test_synthetic_command(command: SyntheticKeyCommand) {
     if let Ok(mut guard) = state().lock() {
         guard.synthetic.enqueue(command);
+    }
+}
+
+#[cfg(test)]
+pub fn advance_test_synthetic_input(now: Instant) {
+    if let Ok(mut guard) = state().lock() {
+        let _ = guard.materialize_synthetic(now, |_| Some(true));
     }
 }
 

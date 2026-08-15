@@ -17249,22 +17249,26 @@ impl App {
             && !fs_music_view_active
             && self
                 .keymap
-                .consume_action(ctx, KeyAction::FsSpreadShiftLeft);
+                .consume_page_turn_action(ctx, KeyAction::FsSpreadShiftLeft)
+                .should_navigate();
         let ctrl_right = !is_video_fs
             && !fs_music_view_active
             && self
                 .keymap
-                .consume_action(ctx, KeyAction::FsSpreadShiftRight);
+                .consume_page_turn_action(ctx, KeyAction::FsSpreadShiftRight)
+                .should_navigate();
         let spread_shift_prev = !is_video_fs
             && !fs_music_view_active
             && self
                 .keymap
-                .consume_action(ctx, KeyAction::FsSpreadShiftPrev);
+                .consume_page_turn_action(ctx, KeyAction::FsSpreadShiftPrev)
+                .should_navigate();
         let spread_shift_next = !is_video_fs
             && !fs_music_view_active
             && self
                 .keymap
-                .consume_action(ctx, KeyAction::FsSpreadShiftNext);
+                .consume_page_turn_action(ctx, KeyAction::FsSpreadShiftNext)
+                .should_navigate();
         let ctrl_page_down_count = self
             .keymap
             .consume_action_press_count(ctx, KeyAction::FsSiblingNext);
@@ -17283,8 +17287,16 @@ impl App {
             && self
                 .keymap
                 .consume_action(ctx, KeyAction::FsContinuousScrollBack);
-        let page_next = !is_video_fs && self.keymap.consume_action(ctx, KeyAction::FsPageNext);
-        let page_prev = !is_video_fs && self.keymap.consume_action(ctx, KeyAction::FsPagePrev);
+        let page_next = !is_video_fs
+            && self
+                .keymap
+                .consume_page_turn_action(ctx, KeyAction::FsPageNext)
+                .should_navigate();
+        let page_prev = !is_video_fs
+            && self
+                .keymap
+                .consume_page_turn_action(ctx, KeyAction::FsPagePrev)
+                .should_navigate();
         let fixed_jump_next =
             !is_video_fs && self.keymap.consume_action(ctx, KeyAction::FsFixedJumpNext);
         let fixed_jump_prev =
@@ -17324,32 +17336,24 @@ impl App {
         let arrow_right = !fs_music_view_active
             && !video_horizontal_arrow_key
             && fullscreen_raw_key_permit.is_some_and(|permit| {
-                crate::keyboard_input::consume_fullscreen_raw_key(
-                    ctx,
-                    permit,
-                    egui::Modifiers::NONE,
-                    egui::Key::ArrowRight,
-                ) || crate::keyboard_input::consume_fullscreen_raw_key(
-                    ctx,
-                    permit,
-                    egui::Modifiers::SHIFT,
-                    egui::Key::ArrowRight,
-                )
+                self.keymap
+                    .consume_fixed_page_turn_chord(ctx, permit, Chord::key(KeyName::Right))
+                    .should_navigate()
+                    || self
+                        .keymap
+                        .consume_fixed_page_turn_chord(ctx, permit, Chord::shift(KeyName::Right))
+                        .should_navigate()
             });
         let arrow_left = !fs_music_view_active
             && !video_horizontal_arrow_key
             && fullscreen_raw_key_permit.is_some_and(|permit| {
-                crate::keyboard_input::consume_fullscreen_raw_key(
-                    ctx,
-                    permit,
-                    egui::Modifiers::NONE,
-                    egui::Key::ArrowLeft,
-                ) || crate::keyboard_input::consume_fullscreen_raw_key(
-                    ctx,
-                    permit,
-                    egui::Modifiers::SHIFT,
-                    egui::Key::ArrowLeft,
-                )
+                self.keymap
+                    .consume_fixed_page_turn_chord(ctx, permit, Chord::key(KeyName::Left))
+                    .should_navigate()
+                    || self
+                        .keymap
+                        .consume_fixed_page_turn_chord(ctx, permit, Chord::shift(KeyName::Left))
+                        .should_navigate()
             });
         // ファイル名スタックのフラット読書中 (v2.0.0) は Shift+↓↑ を「次/前のスタックへ
         // ジャンプ」に割り当てる。動画再生中は Video* action (音量 / 前後ファイル) が優先。
@@ -17386,36 +17390,38 @@ impl App {
                 && fullscreen_raw_key_permit.is_some_and(|permit| {
                     // egui イベントは常に drain する (残すと後段ハンドラが拾う恐れ)。ただし
                     // flat 読書中の Shift+↓ (= スタックジャンプ) はページ送りとしては扱わない。
-                    let consumed = crate::keyboard_input::consume_fullscreen_raw_key(
-                        ctx,
-                        permit,
-                        egui::Modifiers::NONE,
-                        egui::Key::ArrowDown,
-                    ) || (!stack_flat_nav
-                        && crate::keyboard_input::consume_fullscreen_raw_key(
-                            ctx,
-                            permit,
-                            egui::Modifiers::SHIFT,
-                            egui::Key::ArrowDown,
-                        ));
+                    let consumed = self
+                        .keymap
+                        .consume_fixed_page_turn_chord(ctx, permit, Chord::key(KeyName::Down))
+                        .should_navigate()
+                        || (!stack_flat_nav
+                            && self
+                                .keymap
+                                .consume_fixed_page_turn_chord(
+                                    ctx,
+                                    permit,
+                                    Chord::shift(KeyName::Down),
+                                )
+                                .should_navigate());
                     consumed && !stack_shift_arrow
                 }));
         let arrow_up = video_file_nav == Some(KeyAction::VideoPrevFile)
             || (!is_video_fs
                 && !fs_music_view_active
                 && fullscreen_raw_key_permit.is_some_and(|permit| {
-                    let consumed = crate::keyboard_input::consume_fullscreen_raw_key(
-                        ctx,
-                        permit,
-                        egui::Modifiers::NONE,
-                        egui::Key::ArrowUp,
-                    ) || (!stack_flat_nav
-                        && crate::keyboard_input::consume_fullscreen_raw_key(
-                            ctx,
-                            permit,
-                            egui::Modifiers::SHIFT,
-                            egui::Key::ArrowUp,
-                        ));
+                    let consumed = self
+                        .keymap
+                        .consume_fixed_page_turn_chord(ctx, permit, Chord::key(KeyName::Up))
+                        .should_navigate()
+                        || (!stack_flat_nav
+                            && self
+                                .keymap
+                                .consume_fixed_page_turn_chord(
+                                    ctx,
+                                    permit,
+                                    Chord::shift(KeyName::Up),
+                                )
+                                .should_navigate());
                     consumed && !stack_shift_arrow
                 }));
         let key_home = self.keymap.consume_action(ctx, KeyAction::FsJumpFirst);

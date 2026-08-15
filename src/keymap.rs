@@ -5551,6 +5551,43 @@ pub struct Keymap {
     warnings: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PageTurnPressKind {
+    InitialPress,
+    AutoRepeat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PageTurnKeyInput {
+    pub kind: PageTurnPressKind,
+    pub chord: Chord,
+    pub still_held: bool,
+    pub viewport: egui::ViewportId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PageTurnConsumeResult {
+    NoMatch,
+    Trigger(PageTurnKeyInput),
+    DroppedReleasedRepeat(PageTurnKeyInput),
+    #[cfg(all(windows, feature = "test-script"))]
+    ScriptAction {
+        action: KeyAction,
+        viewport: egui::ViewportId,
+    },
+}
+
+impl PageTurnConsumeResult {
+    pub(crate) const fn should_navigate(self) -> bool {
+        match self {
+            Self::Trigger(_) => true,
+            #[cfg(all(windows, feature = "test-script"))]
+            Self::ScriptAction { .. } => true,
+            Self::NoMatch | Self::DroppedReleasedRepeat(_) => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KeymapSettings {
     #[serde(default)]
@@ -6360,6 +6397,122 @@ impl Keymap {
         count
     }
 
+    /// Consume a page-turn press without discarding its physical edge provenance.
+    ///
+    /// Initial presses always trigger, including a down/up tap in one frame.
+    /// Auto-repeat triggers only while the matched chord is still physically
+    /// held; a repeat followed by key-up is owned and consumed here but is not
+    /// promoted to navigation.
+    pub(crate) fn consume_page_turn_action(
+        &self,
+        ctx: &egui::Context,
+        action: KeyAction,
+    ) -> PageTurnConsumeResult {
+        debug_assert_eq!(action.trigger(), KeyTrigger::Press);
+        #[cfg(all(windows, feature = "test-script"))]
+        if crate::test_script::consume_pending_action(action) {
+            return PageTurnConsumeResult::ScriptAction {
+                action,
+                viewport: ctx.viewport_id(),
+            };
+        }
+        if crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx) {
+            return PageTurnConsumeResult::NoMatch;
+        }
+
+        let mut dropped = None;
+        for chord in self.effective_chords(action) {
+            let result = self.consume_page_turn_chord_inner(ctx, chord);
+            match result {
+                PageTurnConsumeResult::Trigger(_) => {
+                    #[cfg(windows)]
+                    crate::key_debug::record_consumed_action(
+                        action,
+                        action.context(),
+                        chord,
+                        "consume_page_turn",
+                    );
+                    Self::trace_page_turn_consume(action, result);
+                    return result;
+                }
+                PageTurnConsumeResult::DroppedReleasedRepeat(_) => {
+                    #[cfg(windows)]
+                    crate::key_debug::record_consumed_action(
+                        action,
+                        action.context(),
+                        chord,
+                        "drop_released_page_turn_repeat",
+                    );
+                    dropped.get_or_insert(result);
+                }
+                PageTurnConsumeResult::NoMatch => {}
+                #[cfg(all(windows, feature = "test-script"))]
+                PageTurnConsumeResult::ScriptAction { .. } => unreachable!(),
+            }
+        }
+        let result = dropped.unwrap_or(PageTurnConsumeResult::NoMatch);
+        Self::trace_page_turn_consume(action, result);
+        result
+    }
+
+    /// Say what the page-turn edge was taken to be, on a channel that is on by default.
+    ///
+    /// The key-debug recorder beside the decision only writes when key debugging is switched on,
+    /// so an absence of lines from it says nothing about whether the branch ran. That ambiguity
+    /// cost a round: the scenario still failed after this path was added, and the log could not
+    /// distinguish "the drop did not happen" from "the drop happened and something else moved
+    /// the page".
+    fn trace_page_turn_consume(action: KeyAction, result: PageTurnConsumeResult) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let (outcome, kind, still_held) = match result {
+            PageTurnConsumeResult::NoMatch => ("no_match", None, None),
+            PageTurnConsumeResult::Trigger(input) => {
+                ("trigger", Some(input.kind), Some(input.still_held))
+            }
+            PageTurnConsumeResult::DroppedReleasedRepeat(input) => (
+                "dropped_released_repeat",
+                Some(input.kind),
+                Some(input.still_held),
+            ),
+            #[cfg(all(windows, feature = "test-script"))]
+            PageTurnConsumeResult::ScriptAction { .. } => ("script_action", None, None),
+        };
+        if outcome == "no_match" {
+            return;
+        }
+        crate::perf::event(
+            "input",
+            "page_turn_consume",
+            None,
+            0,
+            &[
+                ("action", serde_json::Value::from(action.ini_name())),
+                ("outcome", serde_json::Value::from(outcome)),
+                (
+                    "kind",
+                    match kind {
+                        Some(PageTurnPressKind::InitialPress) => {
+                            serde_json::Value::from("initial_press")
+                        }
+                        Some(PageTurnPressKind::AutoRepeat) => {
+                            serde_json::Value::from("auto_repeat")
+                        }
+                        None => serde_json::Value::Null,
+                    },
+                ),
+                (
+                    "still_held",
+                    match still_held {
+                        Some(held) => serde_json::Value::from(held),
+                        None => serde_json::Value::Null,
+                    },
+                ),
+            ],
+        );
+    }
+
     pub fn consume_action(&self, ctx: &egui::Context, action: KeyAction) -> bool {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
         #[cfg(all(windows, feature = "test-script"))]
@@ -6897,6 +7050,236 @@ impl Keymap {
     /// the same physical key in one frame.
     pub fn consume_fixed_chord(&self, ctx: &egui::Context, chord: Chord) -> bool {
         self.consume_chord(ctx, chord)
+    }
+
+    /// Consume a fixed fullscreen page-turn chord after the pass owner has
+    /// granted raw-key ownership. This shares the same physical-edge result as
+    /// configurable page-turn actions while preserving the focused-widget
+    /// exception for fixed arrows.
+    pub(crate) fn consume_fixed_page_turn_chord(
+        &self,
+        ctx: &egui::Context,
+        permit: crate::keyboard_input::FullscreenRawKeyPermit,
+        chord: Chord,
+    ) -> PageTurnConsumeResult {
+        if !permit.allows(ctx) {
+            return PageTurnConsumeResult::NoMatch;
+        }
+        self.consume_page_turn_chord_inner(ctx, chord)
+    }
+
+    fn consume_page_turn_chord_inner(
+        &self,
+        ctx: &egui::Context,
+        chord: Chord,
+    ) -> PageTurnConsumeResult {
+        let Some(key_name) = chord.key_name() else {
+            return PageTurnConsumeResult::NoMatch;
+        };
+        let viewport = ctx.viewport_id();
+
+        #[cfg(windows)]
+        if crate::key_input::is_frame_active(viewport) {
+            if crate::key_input::frame_had_key_down(viewport) {
+                let edges = crate::key_input::consume_key_press_edges_with_result(
+                    viewport,
+                    |edge| chord.matches_key_edge(edge),
+                    |edge| key_name.matches_win32(edge.virtual_key, edge.scan_code, edge.extended),
+                );
+                if edges.matched_count == 0 {
+                    return PageTurnConsumeResult::NoMatch;
+                }
+                // Win32 and egui describe the same physical stream. Claim the
+                // twin down/up events at the same ownership boundary.
+                Self::claim_egui_twin_key_events(ctx, &[chord]);
+                Self::cancel_claimed_tab_focus_traversal(ctx, chord);
+                let kind = if edges.had_initial_press {
+                    PageTurnPressKind::InitialPress
+                } else {
+                    PageTurnPressKind::AutoRepeat
+                };
+                let os_held = self.page_turn_chord_held(ctx, chord);
+                let still_held = !edges.released_after_match && os_held;
+                let result = Self::classify_page_turn_input(PageTurnKeyInput {
+                    kind,
+                    chord,
+                    still_held,
+                    viewport,
+                });
+                Self::trace_page_turn_edge(
+                    chord,
+                    "win32",
+                    kind,
+                    edges.released_after_match,
+                    os_held,
+                    result,
+                );
+                return result;
+            }
+            if Self::frame_active_blocks_egui_fallback(chord) {
+                return PageTurnConsumeResult::NoMatch;
+            }
+        }
+
+        let Some(egui_key) = key_name.egui_twin_key_for_claim() else {
+            return PageTurnConsumeResult::NoMatch;
+        };
+        let facts = ctx.input_mut(|input| {
+            let Some(mut index) = input.events.iter().position(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if chord.matches_egui(*key, *modifiers)
+                )
+            }) else {
+                return None;
+            };
+
+            let mut had_initial_press = false;
+            let mut had_repeat = false;
+            let mut released_after_match = false;
+            while index < input.events.len() {
+                let event = &input.events[index];
+                let matching_down = matches!(
+                    event,
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if chord.matches_egui(*key, *modifiers)
+                );
+                let matching_release = matches!(
+                    event,
+                    egui::Event::Key {
+                        key,
+                        pressed: false,
+                        ..
+                    } if *key == egui_key
+                );
+                if !matching_down && !matching_release {
+                    index += 1;
+                    continue;
+                }
+
+                let event = input.events.remove(index);
+                if matching_down {
+                    let repeat = matches!(event, egui::Event::Key { repeat: true, .. });
+                    had_initial_press |= !repeat;
+                    had_repeat |= repeat;
+                    released_after_match = false;
+                } else {
+                    released_after_match = true;
+                }
+            }
+            Some((had_initial_press, had_repeat, released_after_match))
+        });
+        let Some((had_initial_press, had_repeat, released_after_match)) = facts else {
+            return PageTurnConsumeResult::NoMatch;
+        };
+        debug_assert!(had_initial_press || had_repeat);
+        Self::cancel_claimed_tab_focus_traversal(ctx, chord);
+        let kind = if had_initial_press {
+            PageTurnPressKind::InitialPress
+        } else {
+            PageTurnPressKind::AutoRepeat
+        };
+        let os_held = self.page_turn_chord_held(ctx, chord);
+        let still_held = !released_after_match && os_held;
+        let result = Self::classify_page_turn_input(PageTurnKeyInput {
+            kind,
+            chord,
+            still_held,
+            viewport,
+        });
+        Self::trace_page_turn_edge(chord, "egui", kind, released_after_match, os_held, result);
+        result
+    }
+
+    /// Say what a physical page-turn edge was taken to be, on a channel that is on by default.
+    ///
+    /// Placed on the funnel both entry points share. The earlier probe sat on
+    /// `consume_page_turn_action`, which the fixed fullscreen arrows never call - they come in
+    /// through `consume_fixed_page_turn_chord`. It recorded nothing, and the nothing was read as
+    /// "the branch never runs" when it meant "the branch was measured in the wrong place".
+    fn trace_page_turn_edge(
+        chord: Chord,
+        source: &'static str,
+        kind: PageTurnPressKind,
+        released_after_match: bool,
+        os_held: bool,
+        result: PageTurnConsumeResult,
+    ) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let outcome = match result {
+            PageTurnConsumeResult::NoMatch => "no_match",
+            PageTurnConsumeResult::Trigger(_) => "trigger",
+            PageTurnConsumeResult::DroppedReleasedRepeat(_) => "dropped_released_repeat",
+            #[cfg(all(windows, feature = "test-script"))]
+            PageTurnConsumeResult::ScriptAction { .. } => "script_action",
+        };
+        crate::perf::event(
+            "input",
+            "page_turn_edge",
+            None,
+            0,
+            &[
+                ("chord", serde_json::Value::from(chord.display_name())),
+                ("source", serde_json::Value::from(source)),
+                (
+                    "kind",
+                    serde_json::Value::from(match kind {
+                        PageTurnPressKind::InitialPress => "initial",
+                        PageTurnPressKind::AutoRepeat => "repeat",
+                    }),
+                ),
+                (
+                    "released_after_match",
+                    serde_json::Value::from(released_after_match),
+                ),
+                ("os_held", serde_json::Value::from(os_held)),
+                ("outcome", serde_json::Value::from(outcome)),
+            ],
+        );
+    }
+
+    const fn classify_page_turn_input(input: PageTurnKeyInput) -> PageTurnConsumeResult {
+        if matches!(input.kind, PageTurnPressKind::InitialPress) || input.still_held {
+            PageTurnConsumeResult::Trigger(input)
+        } else {
+            PageTurnConsumeResult::DroppedReleasedRepeat(input)
+        }
+    }
+
+    fn page_turn_chord_held(&self, ctx: &egui::Context, chord: Chord) -> bool {
+        #[cfg(windows)]
+        {
+            self.key_held_chord_via_os(ctx.viewport_id(), chord)
+        }
+        #[cfg(not(windows))]
+        {
+            let Some(name) = chord.key_name() else {
+                return false;
+            };
+            let Some(key) = name.to_egui() else {
+                return false;
+            };
+            let Some((ctrl, shift, alt)) = chord.key_modifiers() else {
+                return false;
+            };
+            ctx.input(|input| {
+                input.modifiers.ctrl == ctrl
+                    && input.modifiers.shift == shift
+                    && input.modifiers.alt == alt
+                    && input.key_down(key)
+            })
+        }
     }
 
     fn consume_chord_inner(&self, ctx: &egui::Context, chord: Chord, allow_repeat: bool) -> bool {
@@ -7787,12 +8170,29 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn right_edge(repeat: bool, pressed: bool) -> crate::key_input::KeyEdge {
+        let mut edge = key_edge(0x27, 0x4d, true, false, repeat);
+        edge.pressed = pressed;
+        edge
+    }
+
+    #[cfg(windows)]
     struct ClearTestKeyFrame;
 
     #[cfg(windows)]
     impl Drop for ClearTestKeyFrame {
         fn drop(&mut self) {
             crate::key_input::clear_test_frame();
+        }
+    }
+
+    #[cfg(windows)]
+    struct ClearTestSyntheticInput;
+
+    #[cfg(windows)]
+    impl Drop for ClearTestSyntheticInput {
+        fn drop(&mut self) {
+            crate::key_input::clear_test_synthetic_input();
         }
     }
 
@@ -9793,6 +10193,134 @@ mod tests {
         assert_eq!(
             keymap.consume_action_press_count(&ctx, KeyAction::FsCtrlNavNext),
             1
+        );
+        let _ = ctx.end_pass();
+    }
+
+    #[cfg(windows)]
+    fn page_turn_keymap_for_test() -> Keymap {
+        let mut keymap = Keymap::empty();
+        keymap
+            .overrides
+            .insert(KeyAction::FsPageNext, vec![Chord::key(KeyName::Right)]);
+        keymap
+    }
+
+    #[cfg(windows)]
+    fn arm_held_right_for_test(viewport: egui::ViewportId) {
+        let now = std::time::Instant::now();
+        crate::key_input::arm_test_synthetic_input(1, viewport);
+        crate::key_input::enqueue_test_synthetic_command(
+            crate::key_input::SyntheticKeyCommand::down(
+                now,
+                crate::key_input::SyntheticNavigationKey::Right,
+                crate::key_input::SyntheticModifiers::default(),
+            ),
+        );
+        crate::key_input::advance_test_synthetic_input(now);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn page_turn_consume_reports_first_press_with_owning_viewport() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+        let _clear_synthetic = ClearTestSyntheticInput;
+        let keymap = page_turn_keymap_for_test();
+        let ctx = egui::Context::default();
+        ctx.begin_pass(Default::default());
+        cache_test_keyboard_owner(&ctx);
+        let viewport = ctx.viewport_id();
+        arm_held_right_for_test(viewport);
+        crate::key_input::set_test_frame(vec![right_edge(false, true)]);
+
+        assert_eq!(
+            keymap.consume_page_turn_action(&ctx, KeyAction::FsPageNext),
+            PageTurnConsumeResult::Trigger(PageTurnKeyInput {
+                kind: PageTurnPressKind::InitialPress,
+                chord: Chord::key(KeyName::Right),
+                still_held: true,
+                viewport,
+            })
+        );
+        let _ = ctx.end_pass();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn page_turn_consume_promotes_repeat_while_chord_is_held() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+        let _clear_synthetic = ClearTestSyntheticInput;
+        let keymap = page_turn_keymap_for_test();
+        let ctx = egui::Context::default();
+        ctx.begin_pass(Default::default());
+        cache_test_keyboard_owner(&ctx);
+        let viewport = ctx.viewport_id();
+        arm_held_right_for_test(viewport);
+        crate::key_input::set_test_frame(vec![right_edge(true, true)]);
+
+        assert_eq!(
+            keymap.consume_page_turn_action(&ctx, KeyAction::FsPageNext),
+            PageTurnConsumeResult::Trigger(PageTurnKeyInput {
+                kind: PageTurnPressKind::AutoRepeat,
+                chord: Chord::key(KeyName::Right),
+                still_held: true,
+                viewport,
+            })
+        );
+        let _ = ctx.end_pass();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn page_turn_consume_drops_repeat_released_in_the_same_frame() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+        let _clear_synthetic = ClearTestSyntheticInput;
+        let keymap = page_turn_keymap_for_test();
+        let ctx = egui::Context::default();
+        ctx.begin_pass(Default::default());
+        cache_test_keyboard_owner(&ctx);
+        let viewport = ctx.viewport_id();
+        crate::key_input::arm_test_synthetic_input(1, viewport);
+        crate::key_input::set_test_frame(vec![right_edge(true, true), right_edge(false, false)]);
+
+        assert_eq!(
+            keymap.consume_page_turn_action(&ctx, KeyAction::FsPageNext),
+            PageTurnConsumeResult::DroppedReleasedRepeat(PageTurnKeyInput {
+                kind: PageTurnPressKind::AutoRepeat,
+                chord: Chord::key(KeyName::Right),
+                still_held: false,
+                viewport,
+            })
+        );
+        assert!(!crate::key_input::pressed_key_down(viewport, |_| true));
+        let _ = ctx.end_pass();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn page_turn_consume_keeps_same_frame_tap_as_one_navigation() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+        let _clear_synthetic = ClearTestSyntheticInput;
+        let keymap = page_turn_keymap_for_test();
+        let ctx = egui::Context::default();
+        ctx.begin_pass(Default::default());
+        cache_test_keyboard_owner(&ctx);
+        let viewport = ctx.viewport_id();
+        crate::key_input::arm_test_synthetic_input(1, viewport);
+        crate::key_input::set_test_frame(vec![right_edge(false, true), right_edge(false, false)]);
+
+        assert_eq!(
+            keymap.consume_page_turn_action(&ctx, KeyAction::FsPageNext),
+            PageTurnConsumeResult::Trigger(PageTurnKeyInput {
+                kind: PageTurnPressKind::InitialPress,
+                chord: Chord::key(KeyName::Right),
+                still_held: false,
+                viewport,
+            })
         );
         let _ = ctx.end_pass();
     }

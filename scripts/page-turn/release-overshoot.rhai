@@ -48,13 +48,26 @@ for round in 0..3 {
     // version of this scenario passed three times that way, which is worse than failing.
     hold_key("Down", 1000);
 
-    // Read the index as soon as the key is up, before anything settles.
+    // Three readings, because two different things look alike from the outside.
+    //
+    // `at_release` is taken the instant the key is up. It routinely trails the app by a frame:
+    // hold_key returns when it stops sending, not when the last repeat it already sent has been
+    // processed, so a repeat emitted while the key was genuinely down can land a few ms later.
+    // Reading only this and comparing it to the settled index reports that 4ms race as a bug -
+    // which is what the first version of this scenario did, for a whole round of work.
+    //
+    // `drained` is taken after the in-flight repeats have had time to land. Movement after *that*
+    // is the reported fault: presses that were queued while the app was behind, paid out once the
+    // reader had already let go.
     let at_release = snapshot().fs_idx;
+    sleep(250);
+    let drained = snapshot().fs_idx;
     sleep(2500);
     let settled = snapshot().fs_idx;
 
     log("release-overshoot: round " + (round + 1) + " released at idx=" + at_release
-        + ", settled at idx=" + settled + " (drift " + (settled - at_release) + ")");
+        + ", drained at idx=" + drained + ", settled at idx=" + settled
+        + " (in-flight " + (drained - at_release) + ", after-release " + (settled - drained) + ")");
 
     if at_release == start {
         fail("round " + (round + 1) + " did not turn any pages: still at idx=" + start);
@@ -64,9 +77,17 @@ for round in 0..3 {
             + " of " + snapshot().items_len + "): a hold that hits the boundary cannot overshoot, "
             + "so this round proves nothing. Shorten the hold or use a longer folder.");
     }
-    if settled != at_release {
-        fail("the viewer moved after the key was released: idx=" + at_release
-            + " at release, idx=" + settled + " once settled");
+    if settled != drained {
+        fail("the viewer kept moving well after the key was released: idx=" + drained
+            + " once the in-flight repeats had landed, idx=" + settled + " a moment later");
+    }
+    // One frame of lag is the sampling race described above. More than that is a backlog of
+    // presses being honoured after the reader stopped asking for them, which is the same fault
+    // seen from the other end.
+    if drained - at_release > 1 {
+        fail("presses kept paying out after release: idx=" + at_release + " at release, idx="
+            + drained + " once drained (" + (drained - at_release) + " pages the reader did not "
+            + "ask to see)");
     }
 
     // Walk back to the start so the next round has the whole folder ahead of it. Single taps,

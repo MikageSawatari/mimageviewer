@@ -220,7 +220,17 @@ function Invoke-ScriptedRun {
         # rightly so. Write it beside the run instead, which also leaves the exact configuration
         # next to the log it produced.
         $overlayPath = Join-Path $RunDataDir "settings-override.json"
-        if (Test-Path -LiteralPath $SettingsJson) {
+        $sourceIsOverlay = $false
+        $sourceExists = Test-Path -LiteralPath $SettingsJson
+        if ($sourceExists) {
+            $sourceIsOverlay = ((Resolve-RepoPath $SettingsJson) -eq [System.IO.Path]::GetFullPath($overlayPath))
+        }
+        if ($sourceIsOverlay) {
+            # Already where it needs to be. Copying a file onto itself is not a no-op here: the
+            # else branch below would then write the *path* as the file body, and the run would
+            # fail on invalid JSON with the configuration silently destroyed.
+            Write-Host "  settings : (reusing overlay in place)"
+        } elseif ($sourceExists) {
             Copy-Item -LiteralPath $SettingsJson -Destination $overlayPath -Force
         } else {
             # No BOM: PowerShell 5.1's [Text.Encoding]::UTF8 writes one, and a BOM is not JSON.

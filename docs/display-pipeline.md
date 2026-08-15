@@ -1559,6 +1559,12 @@ delta に適用するため、ドラッグ途中の Ctrl 押下 / 解放でも�
 > 1 display unit を所有し、その unit 自身の rendition / materialized image が実際の
 > 最終描画 source として 1 frame 提示されるまで、次のページ送りまたは手動フォルダ移動を
 > 受理しない。待機中に届く key repeat / 同一 frame の追加 edge は **drop し、queue しない**。
+> ページ送りの入力端は、viewport-stamped `KeyEdge` の順序を保った typed consume result から
+> first keydown / auto-repeat、matched chord、送信元 viewport、処理時点の physical held / 同一 frame
+> の後続 key-up を判定する。first keydown は同一 frame に key-up があっても必ず 1 回受理する。
+> navigation へ昇格させず consume-only にするのは、処理時点ですでに release 済みの auto-repeat
+> だけである。これは受理済み `FsNavigationSequence` target の取消しではない。受理済み target は
+> release 後も少なくとも 1 frame 提示し、提示前の `fullscreen_idx` rollback は行わない。
 > 未キャッシュ PDF は対象ページを既存 thumbnail worker / PDFium pool へ interactive priority
 > で要求し、約 300ms かかっても rendition を提示してから次へ進む。これは以下の過去の
 > 「入力に追いつく」「約 100 ページ/秒」という性能記録より優先する現行仕様である。
@@ -1939,7 +1945,7 @@ sequence を retire する。ページ矩形の canonical layout 契約は paged
 | I1 | 1 バースト内で、同じ idx の `source` が `final_composite` → `thumbnail` へ戻らない | R2 |
 | I2 | 1 バースト内で `source` がページをまたいで混ざらない | R2 |
 | I3 | 受理した target unit の全 idx が、次 target の受理前に同じ final display-unit source として 1 回以上出る | R1 |
-| I4 | key-up 後は追加 target を内部 queue から発火せず、受理済み landing rendition を提示した後に同 idx の `materialized` が現れる | R4 |
+| I4 | key-up より後に処理された auto-repeat は入力端で consume-only にし追加 target を発火させない。一方、受理済み landing target は取消さず、その rendition を提示した後に同 idx の `materialized` が現れる | R4 |
 | I5 | unresolved rendition sequence では ready 前も含め `defer_ui_uploads=true`、ready 前の `paint_source=materialized` は previous atomic holdover に覆われる | R3 |
 
 `fs/paint` は単一ページでは既存の `(idx, texture)` producer が rendition も記録し、見開きでは
@@ -1984,7 +1990,8 @@ pass-through open は旧 page-transition holdover を消しているので、こ
    producer 起動と UI upload 回収を保留し、既存 producer を cancel する。
 4. ~~止まったページだけ実体化する~~ → key-up 後も受理済み landing rendition の提示までは
    sequence を維持し、提示後の次 frame で current display unit を eager path へ戻す。入力 repeat は
-   queue しないため、release 後に別 target が自動で進むことはない。
+   queue せず、処理時点ですでに release 済みなら入力端で consume-only にするため、release 後に
+   別 target が自動で進むことはない。first keydown は同一 frame の key-up でも 1 回発火する。
 5. ~~未キャッシュ target を実際に生成する~~ → sequence page set を keep-set に固定し、priority
    thumbnail request と PDF HighNormal promotion を発行する。terminal failure は typed outcome として
    次 target または landing full materialization へ進める。

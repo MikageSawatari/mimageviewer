@@ -157,6 +157,13 @@ folder navigation accumulator (`MAX_PENDING_NAV = 5`) を使う。トグル、�
 優先する。no-repeat Action は repeat edge を消費するが発火させない。これにより、キーを離した後に
 溜まった repeat 分だけナビゲーションが続く余韻を増やさない。
 
+fullscreen のページ送り Action と固定矢印は page-turn 専用の typed consume result を使う。
+result は first keydown / auto-repeat、matched chord、送信元 viewport、処理時点で chord がまだ
+physical held か、または同一 frame の後続 key-up ですでに release 済みかを保持する。first keydown は
+keydown + key-up が同一 frame に届く短い tap でも必ず 1 回発火する。発火させず consume-only にするのは
+release 済み auto-repeat だけである。`fs_page_turn_input_held` は複数 level の OR で、blocker や
+viewport routing でも false になるため、physical key-up の証拠としてこの判定には使わない。
+
 edge の寿命は 1 フレームのままにする。Action が消費しなかった edge は次の `begin_frame()` で
 破棄し、後のフレームへ持ち越さない。無制限の backlog を作って「押していないのに後から動く」
 挙動を避けるため、`begin_frame()` の `frame.clear()` は維持する。
