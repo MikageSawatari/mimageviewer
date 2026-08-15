@@ -2016,6 +2016,166 @@ fn interleaved_prefetch_targets_boundary_cases() {
 }
 
 #[test]
+fn fs_prefetch_page_state_distinguishes_ready_active_and_missing() {
+    assert_eq!(
+        fs_prefetch_page_state(true, false),
+        FsPrefetchPageState::Ready
+    );
+    assert_eq!(
+        fs_prefetch_page_state(false, true),
+        FsPrefetchPageState::Active
+    );
+    assert_eq!(
+        fs_prefetch_page_state(false, false),
+        FsPrefetchPageState::Missing
+    );
+    assert_eq!(
+        fs_prefetch_page_state(true, true),
+        FsPrefetchPageState::Ready,
+        "取得済みなら古い処理中キーが残っていても ready を優先する"
+    );
+}
+
+#[test]
+fn fs_prefetch_indicator_separates_directions_orders_distance_and_counts_states() {
+    use FsPrefetchPageState::{Active, Missing, Ready};
+
+    let indicator = build_fs_prefetch_indicator(
+        10,
+        false,
+        [
+            (12, Missing),
+            (8, Ready),
+            (11, Ready),
+            (7, Missing),
+            (9, Active),
+        ],
+    )
+    .expect("unfinished targets should be visible");
+
+    assert_eq!(
+        indicator.behind,
+        vec![Missing, Ready, Active],
+        "behind は遠い idx 7 から現在直前の idx 9 へ並ぶ"
+    );
+    assert_eq!(
+        indicator.ahead,
+        vec![Ready, Missing],
+        "ahead は現在直後の idx 11 から遠い idx 12 へ並ぶ"
+    );
+    assert_eq!(indicator.ready_count, 2);
+    assert_eq!(indicator.active_count, 1);
+    assert_eq!(indicator.missing_count, 2);
+    assert_eq!(
+        indicator.tooltip_text(),
+        "先読み: 取得済み 2 / 取得中 1 / 未取得 2"
+    );
+}
+
+#[test]
+fn fs_prefetch_indicator_keeps_nearest_eight_dots_and_summarizes_only_nonzero_far_states() {
+    use FsPrefetchPageState::{Active, Missing, Ready};
+
+    let pages = [
+        (1, Ready),
+        (2, Ready),
+        (3, Missing),
+        (4, Missing),
+        (5, Active),
+        (6, Ready),
+        (7, Missing),
+        (8, Active),
+        (9, Ready),
+        (10, Missing),
+        (11, Active),
+        (12, Ready),
+        (14, Ready),
+        (15, Active),
+        (16, Missing),
+        (17, Ready),
+        (18, Missing),
+        (19, Active),
+        (20, Ready),
+        (21, Missing),
+        (22, Active),
+        (23, Missing),
+        (24, Missing),
+        (25, Active),
+    ];
+    let indicator = build_fs_prefetch_indicator(13, false, pages)
+        .expect("unfinished targets should be visible");
+
+    let behind = indicator.behind_display();
+    assert_eq!(
+        behind.dots,
+        vec![
+            Active, Ready, Missing, Active, Ready, Missing, Active, Ready
+        ],
+        "behind は現在に近い末尾 8 ページを点のまま残す"
+    );
+    assert_eq!(
+        behind.far_counts,
+        vec![
+            FsPrefetchStateCount {
+                state: Ready,
+                count: 2,
+            },
+            FsPrefetchStateCount {
+                state: Missing,
+                count: 2,
+            },
+        ],
+        "遠方に 0 件の active は個数表示へ出さない"
+    );
+
+    let ahead = indicator.ahead_display();
+    assert_eq!(
+        ahead.dots,
+        vec![
+            Ready, Active, Missing, Ready, Missing, Active, Ready, Missing
+        ],
+        "ahead は現在に近い先頭 8 ページを点のまま残す"
+    );
+    assert_eq!(
+        ahead.far_counts,
+        vec![
+            FsPrefetchStateCount {
+                state: Active,
+                count: 2,
+            },
+            FsPrefetchStateCount {
+                state: Missing,
+                count: 2,
+            },
+        ],
+        "遠方に 0 件の ready は個数表示へ出さない"
+    );
+}
+
+#[test]
+fn fs_prefetch_indicator_preserves_existing_hidden_conditions() {
+    use FsPrefetchPageState::{Missing, Ready};
+
+    assert!(
+        build_fs_prefetch_indicator(
+            10,
+            false,
+            std::iter::empty::<(usize, FsPrefetchPageState)>()
+        )
+        .is_none(),
+        "target が 0 件なら表示しない"
+    );
+    assert!(
+        build_fs_prefetch_indicator(10, true, [(11, Missing)]).is_none(),
+        "現在ページの AI 処理中は先読み表示を隠す"
+    );
+    assert!(
+        build_fs_prefetch_indicator(10, false, [(9, Ready), (11, Ready)]).is_none(),
+        "全 target が取得済みなら従来どおり表示を終える"
+    );
+}
+
+#[test]
 fn final_effect_prefetch_admission_reports_each_condition() {
     let empty = std::collections::HashSet::new();
     assert_eq!(
@@ -22788,11 +22948,11 @@ mod pipeline_cache_refactor_tests {
 
     /// P9-2: AI モデルが両方未設定なら `final_ai_key_for_pixels` は None を返す。
     /// このとき key が無いので AI 推論は不要、`is_idx_final_ai_done_or_skipped` は
-    /// **true (= done 扱い)** を返して進捗バーから外れる。
+    /// **true (= ready 扱い)** を返す。
     ///
     /// セマンティクス: 「AI 機能を使わないユーザー」(= upscale_model / denoise_model
-    /// 共に None) で先読み進捗バーが終わらない退行を防ぐ。AI 不要なら最初から
-    /// 「done」として総数にカウントしない設計。
+    /// 共に None) で先読み表示が未取得のまま残る退行を防ぐ。AI 不要なら最初から
+    /// 「ready」として扱い、全対象 ready なら表示を終える設計。
     #[test]
     fn final_ai_key_is_none_when_no_ai_models_configured() {
         let mut app = setup_app();
@@ -22818,12 +22978,12 @@ mod pipeline_cache_refactor_tests {
     }
 
     /// P9-2b: AI モデル未設定で `is_idx_final_ai_done_or_skipped` が **true** を返す。
-    /// 先読み進捗バーの total 計算で「AI 不要 = done 扱い」とすることで、AI を
-    /// 使わないユーザー (= 多数派) で進捗バーが終わらない退行を防ぐ。
+    /// 先読み表示で「AI 不要 = ready 扱い」とすることで、AI を使わないユーザー
+    /// (= 多数派) で未取得表示が残る退行を防ぐ。
     ///
     /// 退行防止: もし `final_ai_key_for_pixels` の None 戻りで `is_done_or_skipped`
     /// が false を返すように変わると、AI 不要なページが永久に pending 扱いになり、
-    /// 進捗バーが消えなくなる (= 「AI 設定無いのにバーが出続ける」ユーザー報告)。
+    /// 先読み表示が消えなくなる (= 「AI 設定無いのに表示が出続ける」ユーザー報告)。
     #[test]
     fn is_idx_final_ai_done_or_skipped_true_when_no_ai_models() {
         let ctx = egui::Context::default();
@@ -27153,16 +27313,16 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
-    /// P5-3: `final_ai_prefetch_progress` は target が無いとき None を返す。
+    /// P5-3: `final_ai_prefetch_indicator` は target が無いとき None を返す。
     /// (= フォルダ内に画像が 1 枚しか無い場合や、先読み設定が 0/0 の場合)
     #[test]
-    fn final_ai_prefetch_progress_is_none_when_no_targets() {
+    fn final_ai_prefetch_indicator_is_none_when_no_targets() {
         let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/only-one.jpg");
         // 1 枚だけなので前後 target は空
         assert!(
-            app.final_ai_prefetch_progress(idx).is_none(),
-            "single-image folder => no prefetch progress bar"
+            app.final_ai_prefetch_indicator(idx).is_none(),
+            "single-image folder => no prefetch indicator"
         );
     }
 
@@ -27960,7 +28120,7 @@ mod pipeline_cache_refactor_tests {
     ///
     /// 結果: prefetch_final_ai が毎フレ呼び直されて同じ key で再 spawn → display 経路で
     /// 再 cancel → ... のループに入り、隣接ページの AI 結果が永久に final_ai_cache に
-    /// 格納されない。ユーザー体感は「先読み進捗バーは進んでいるのに、次ページに送ると
+    /// 格納されない。ユーザー体感は「先読み済みのように見えるのに、次ページに送ると
     /// 一瞬アップスケール前画像が見えて、計算し直してから AI 結果に切り替わる」。
     ///
     /// 修正後: cancel 対象は「同じ idx の古い key」だけに限定。別 idx の prefetch は
@@ -28058,10 +28218,10 @@ mod pipeline_cache_refactor_tests {
         );
     }
 
-    /// P5-3: `final_ai_prefetch_progress` は現在ページの AI 処理中は None を返す
-    /// (= 「AI 処理中」ラベルが既に出ているので進捗バー二重表示を避ける)。
+    /// P5-3: `final_ai_prefetch_indicator` は現在ページの AI 処理中は None を返す
+    /// (= 「AI 処理中」ラベルが既に出ているので先読み表示の二重表示を避ける)。
     #[test]
-    fn final_ai_prefetch_progress_hidden_while_current_busy() {
+    fn final_ai_prefetch_indicator_hidden_while_current_busy() {
         let mut app = setup_app();
         let idx_cur = push_image(&mut app, "C:/pics/busy-cur.jpg");
         push_image(&mut app, "C:/pics/busy-next-1.jpg");
@@ -28086,8 +28246,8 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_pending.insert(key, pending);
 
         assert!(
-            app.final_ai_prefetch_progress(idx_cur).is_none(),
-            "current page busy => hide prefetch progress (avoid double-label)"
+            app.final_ai_prefetch_indicator(idx_cur).is_none(),
+            "current page busy => hide prefetch indicator (avoid double-label)"
         );
     }
 

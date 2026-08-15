@@ -28,7 +28,8 @@ use crate::app::{
     App, FsDisplayUnitHoldover, FsDisplayUnitHoldoverPage, FsHoldover, FsNavigationDisplayTarget,
     FsNavigationPresentation, FsNavigationSequence, FsNavigationSequenceTarget,
     FsNavigationTargetPhase, FsOpenMaterialization, FsOverflowPanelState, FsPageLoadState,
-    ViewerPresentation,
+    FsPrefetchIndicator, FsPrefetchPageState, FsPrefetchSideDisplay, ViewerPresentation,
+    build_fs_prefetch_indicator,
 };
 use crate::displayed_image_transform::{
     DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
@@ -28670,13 +28671,13 @@ struct FsAiStatusSignals {
     is_prefetching_ai: bool,
     is_upscaled: bool,
     erase_complete: bool,
-    has_prefetch_progress: bool,
+    has_prefetch_indicator: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct FsAiStatusContent {
     lines: Vec<FsAiStatusLine>,
-    show_prefetch_progress: bool,
+    show_prefetch_indicator: bool,
 }
 
 fn fullscreen_processing_status_visible(setting_visible: bool, active: bool) -> bool {
@@ -28737,8 +28738,143 @@ fn fs_ai_status_content(
 
     FsAiStatusContent {
         lines,
-        show_prefetch_progress: prefetch_status_visible && signals.has_prefetch_progress,
+        show_prefetch_indicator: prefetch_status_visible && signals.has_prefetch_indicator,
     }
+}
+
+const FS_PREFETCH_READY_COLOR: egui::Color32 = egui::Color32::from_rgb(0x43, 0xd1, 0x7b);
+const FS_PREFETCH_ACTIVE_COLOR: egui::Color32 = egui::Color32::from_rgb(0xff, 0xd4, 0x5a);
+const FS_PREFETCH_MISSING_COLOR: egui::Color32 = egui::Color32::from_gray(176);
+const FS_PREFETCH_DOT_SLOT: egui::Vec2 = egui::vec2(10.0, 14.0);
+
+fn draw_fs_prefetch_dot(ui: &mut egui::Ui, state: FsPrefetchPageState) {
+    let (rect, _) = ui.allocate_exact_size(FS_PREFETCH_DOT_SLOT, egui::Sense::hover());
+    let center = rect.center();
+    match state {
+        FsPrefetchPageState::Ready => {
+            ui.painter()
+                .circle_filled(center, 4.0, FS_PREFETCH_READY_COLOR);
+        }
+        FsPrefetchPageState::Active => {
+            ui.painter()
+                .circle_filled(center, 4.0, FS_PREFETCH_ACTIVE_COLOR);
+        }
+        FsPrefetchPageState::Missing => {
+            ui.painter().circle_stroke(
+                center,
+                3.5,
+                egui::Stroke::new(1.5, FS_PREFETCH_MISSING_COLOR),
+            );
+        }
+    }
+}
+
+fn draw_fs_prefetch_state_count(ui: &mut egui::Ui, state: FsPrefetchPageState, count: usize) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 1.0;
+        draw_fs_prefetch_dot(ui, state);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(count.to_string())
+                    .monospace()
+                    .size(11.0)
+                    .color(crate::ui_helpers::PROGRESS_LABEL_COLOR),
+            )
+            .wrap_mode(egui::TextWrapMode::Extend),
+        );
+    });
+}
+
+fn draw_fs_prefetch_side(ui: &mut egui::Ui, side: FsPrefetchSideDisplay, summary_first: bool) {
+    if summary_first {
+        for summary in &side.far_counts {
+            draw_fs_prefetch_state_count(ui, summary.state, summary.count);
+        }
+    }
+    for state in side.dots {
+        draw_fs_prefetch_dot(ui, state);
+    }
+    if !summary_first {
+        for summary in &side.far_counts {
+            draw_fs_prefetch_state_count(ui, summary.state, summary.count);
+        }
+    }
+}
+
+fn draw_fs_prefetch_indicator(
+    ui: &mut egui::Ui,
+    indicator: &FsPrefetchIndicator,
+) -> egui::Response {
+    let behind = indicator.behind_display();
+    let ahead = indicator.ahead_display();
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        draw_fs_prefetch_side(ui, behind, true);
+
+        let (divider_rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 14.0), egui::Sense::hover());
+        ui.painter().line_segment(
+            [
+                egui::pos2(divider_rect.center().x, divider_rect.top() + 1.0),
+                egui::pos2(divider_rect.center().x, divider_rect.bottom() - 1.0),
+            ],
+            egui::Stroke::new(1.0, egui::Color32::from_gray(150)),
+        );
+
+        draw_fs_prefetch_side(ui, ahead, false);
+    })
+    .response
+    .hover_tip_dark(indicator.tooltip_text())
+}
+
+fn draw_fs_prefetch_status_row(ui: &mut egui::Ui, indicator: &FsPrefetchIndicator) {
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new("先読み AI")
+                    .monospace()
+                    .color(crate::ui_helpers::PROGRESS_LABEL_COLOR),
+            )
+            .wrap_mode(egui::TextWrapMode::Extend),
+        );
+        draw_fs_prefetch_indicator(ui, indicator);
+    });
+}
+
+#[doc(hidden)]
+pub fn draw_fs_prefetch_indicator_snapshot_fixture(ui: &mut egui::Ui) {
+    use FsPrefetchPageState::{Active, Missing, Ready};
+
+    let pages = [
+        (0, Ready),
+        (1, Missing),
+        (2, Ready),
+        (3, Active),
+        (4, Missing),
+        (5, Ready),
+        (6, Missing),
+        (7, Active),
+        (8, Ready),
+        (9, Missing),
+        (11, Ready),
+        (12, Active),
+        (13, Missing),
+        (14, Ready),
+        (15, Missing),
+        (16, Missing),
+        (17, Ready),
+        (18, Active),
+        (19, Ready),
+        (20, Active),
+        (21, Missing),
+        (22, Missing),
+    ];
+    let indicator =
+        build_fs_prefetch_indicator(10, false, pages).expect("snapshot fixture has pending pages");
+
+    ui.set_width(430.0);
+    egui::Frame::popup(ui.style())
+        .fill(crate::ui_helpers::PROGRESS_BG_COLOR)
+        .show(ui, |ui| draw_fs_prefetch_status_row(ui, &indicator));
 }
 
 impl App {
@@ -28788,7 +28924,7 @@ impl App {
         let is_loading = self.fs_pending.contains_key(&fs_idx);
         let any_busy = is_loading || has_ai_pending;
 
-        let prefetch_progress = self.final_ai_prefetch_progress(fs_idx);
+        let prefetch_indicator = self.final_ai_prefetch_indicator(fs_idx);
         let content = fs_ai_status_content(
             self.settings.fullscreen_processing_status_visible,
             self.settings.fullscreen_prefetch_status_visible,
@@ -28797,7 +28933,7 @@ impl App {
                 is_prefetching_ai,
                 is_upscaled,
                 erase_complete: self.erase_base_cache.contains_key(&fs_idx) && !self.erase_mode,
-                has_prefetch_progress: prefetch_progress.is_some(),
+                has_prefetch_indicator: prefetch_indicator.is_some(),
             },
         );
         let mut lines: Vec<(String, egui::Color32)> = Vec::new();
@@ -28828,16 +28964,15 @@ impl App {
             ));
         }
 
-        // Pipeline P1 refactor で旧 ai_upscale_pending を参照する経路が無効化されて
-        // 進捗バーが常時非表示になっていた。新パイプライン版 `final_ai_prefetch_progress`
-        // が done/total を計算して、先読み中だけバーを出す。
-        let prefetch_progress = if content.show_prefetch_progress {
-            prefetch_progress
+        // Pipeline P1 refactor 後の final AI 状態を、前後ページ別の表示モデルへ写す。
+        // 先読みの起動順や対象は変えず、方向と各ページの状態だけを可視化する。
+        let prefetch_indicator = if content.show_prefetch_indicator {
+            prefetch_indicator
         } else {
             None
         };
 
-        if lines.is_empty() && prefetch_progress.is_none() {
+        if lines.is_empty() && prefetch_indicator.is_none() {
             self.ai_status_done_at = None;
             return;
         }
@@ -28870,7 +29005,6 @@ impl App {
         // Area の available width が 0 のまま描画されるとラベルが 1 文字幅で
         // 縦に折り返される。min_width で横方向を確保する。
         const MIN_WIDTH: f32 = 260.0;
-        const BAR_WIDTH: f32 = 180.0;
         const FONT_SIZE: f32 = 13.0;
 
         let ctx = ui.ctx().clone();
@@ -28896,26 +29030,8 @@ impl App {
                                 .wrap_mode(egui::TextWrapMode::Extend),
                             );
                         }
-                        if let Some((done, total)) = prefetch_progress {
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new("先読み AI")
-                                            .monospace()
-                                            .color(crate::ui_helpers::PROGRESS_LABEL_COLOR),
-                                    )
-                                    .wrap_mode(egui::TextWrapMode::Extend),
-                                );
-                                ui.add(
-                                    egui::ProgressBar::new(done as f32 / total as f32)
-                                        .desired_width(BAR_WIDTH)
-                                        .fill(crate::ui_helpers::PROGRESS_UPGRADE_COLOR)
-                                        .text(
-                                            egui::RichText::new(format!("{} / {}", done, total))
-                                                .color(egui::Color32::BLACK),
-                                        ),
-                                );
-                            });
+                        if let Some(indicator) = &prefetch_indicator {
+                            draw_fs_prefetch_status_row(ui, indicator);
                         }
                     });
             });
@@ -33048,10 +33164,16 @@ mod tests {
         );
         assert_eq!(fs_ai_status_bottom_offset(true, None, screen_bottom), -58.0);
         // ラベルの上辺が 970 なら、6pt 空けて 36pt 上げる。
-        assert_eq!(
-            fs_ai_status_bottom_offset(false, Some(970.0), screen_bottom),
-            -36.0
-        );
+        let label_offset = fs_ai_status_bottom_offset(false, Some(970.0), screen_bottom);
+        assert_eq!(label_offset, -36.0);
+        let status_bottom = screen_bottom + label_offset;
+        assert_eq!(status_bottom, 964.0);
+        for status_height in [20.0, 42.0, 80.0] {
+            assert!(
+                status_bottom - status_height < 970.0,
+                "点の列で枠が高くなっても、下端を固定して上方向へだけ伸びる"
+            );
+        }
         // シークバー退避のほうが高ければそちらを採る。
         assert_eq!(
             fs_ai_status_bottom_offset(true, Some(970.0), screen_bottom),
@@ -33076,20 +33198,20 @@ mod tests {
             is_prefetching_ai: false,
             is_upscaled: false,
             erase_complete: true,
-            has_prefetch_progress: true,
+            has_prefetch_indicator: true,
         };
         assert_eq!(
             fs_ai_status_content(true, false, processing),
             FsAiStatusContent {
                 lines: vec![FsAiStatusLine::Processing, FsAiStatusLine::EraseComplete],
-                show_prefetch_progress: false,
+                show_prefetch_indicator: false,
             }
         );
         assert_eq!(
             fs_ai_status_content(false, false, processing),
             FsAiStatusContent {
                 lines: Vec::new(),
-                show_prefetch_progress: false,
+                show_prefetch_indicator: false,
             }
         );
 
@@ -33098,20 +33220,20 @@ mod tests {
             is_prefetching_ai: true,
             is_upscaled: false,
             erase_complete: true,
-            has_prefetch_progress: true,
+            has_prefetch_indicator: true,
         };
         assert_eq!(
             fs_ai_status_content(false, true, prefetching),
             FsAiStatusContent {
                 lines: vec![FsAiStatusLine::Prefetching],
-                show_prefetch_progress: true,
+                show_prefetch_indicator: true,
             }
         );
         assert_eq!(
             fs_ai_status_content(true, true, prefetching),
             FsAiStatusContent {
                 lines: vec![FsAiStatusLine::Prefetching, FsAiStatusLine::EraseComplete],
-                show_prefetch_progress: true,
+                show_prefetch_indicator: true,
             }
         );
 
@@ -33120,20 +33242,20 @@ mod tests {
             is_prefetching_ai: false,
             is_upscaled: true,
             erase_complete: false,
-            has_prefetch_progress: false,
+            has_prefetch_indicator: false,
         };
         assert_eq!(
             fs_ai_status_content(true, false, complete),
             FsAiStatusContent {
                 lines: vec![FsAiStatusLine::Complete],
-                show_prefetch_progress: false,
+                show_prefetch_indicator: false,
             }
         );
         assert_eq!(
             fs_ai_status_content(false, true, complete),
             FsAiStatusContent {
                 lines: Vec::new(),
-                show_prefetch_progress: false,
+                show_prefetch_indicator: false,
             }
         );
     }

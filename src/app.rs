@@ -159,13 +159,14 @@ use metadata_ops::{
     item_supports_tags, passes_rating_filter, path_extension_lower, path_in_subtree_ci,
     run_details_meta_load, run_metadata_load, run_metadata_search, stem_lower, tag_item_path,
 };
-#[cfg(test)]
-pub(crate) use prefetch_policy::BlockReason;
 pub(crate) use prefetch_policy::{
-    AllowReason, FinalEffectPrefetchAdmission, PREFETCH_BACKSTOP, PREFETCH_IDLE_THRESHOLD,
-    PrefetchDecision, decide_prefetch_allowed, interleaved_prefetch_targets,
-    should_prefetch_final_effect,
+    AllowReason, FinalEffectPrefetchAdmission, FsPrefetchIndicator, FsPrefetchPageState,
+    FsPrefetchSideDisplay, PREFETCH_BACKSTOP, PREFETCH_IDLE_THRESHOLD, PrefetchDecision,
+    build_fs_prefetch_indicator, decide_prefetch_allowed, fs_prefetch_page_state,
+    interleaved_prefetch_targets, should_prefetch_final_effect,
 };
+#[cfg(test)]
+pub(crate) use prefetch_policy::{BlockReason, FsPrefetchStateCount};
 #[cfg(windows)]
 use viewer_session::ViewerSession;
 
@@ -51434,7 +51435,7 @@ impl App {
     }
 
     /// 指定 idx の AI 処理が「完了」または「skip 確定」(= AI 不要 / failed) の
-    /// いずれかかを判定する。先読み進捗バー (`draw_fs_ai_status`) の done/total
+    /// いずれかかを判定する。先読み方向表示 (`draw_fs_ai_status`) のページ状態
     /// 計算に使う pub(crate) helper。
     ///
     /// 戻り値:
@@ -51459,28 +51460,27 @@ impl App {
             || self.final_ai_failed.contains(&key)
     }
 
-    /// 先読み進捗バー用の (done, total) を返す。総 target が 0 ならバー非表示
-    /// (= None)。現在ページの AI 処理が走っている間 (= `current_busy`) は先読み
-    /// バーを隠して「AI 処理中」ラベルだけ見せる。
-    pub(crate) fn final_ai_prefetch_progress(&self, fs_idx: usize) -> Option<(usize, usize)> {
+    /// AI 先読み対象を前後に分けた表示モデルを返す。総 target が 0 なら非表示
+    /// (= None)。現在ページの AI 処理が走っている間 (= `current_busy`) は表示を
+    /// 隠して「AI 処理中」ラベルだけ見せる。
+    pub(crate) fn final_ai_prefetch_indicator(&self, fs_idx: usize) -> Option<FsPrefetchIndicator> {
         let targets = self.ai_prefetch_targets(fs_idx);
-        let total = targets.len();
-        if total == 0 {
-            return None;
-        }
-        let done = targets
-            .iter()
-            .filter(|&&i| self.is_idx_final_ai_done_or_skipped(i))
-            .count();
-        let current_busy = self
+        let active_indices: std::collections::HashSet<usize> = self
             .final_ai_pending
             .keys()
-            .any(|key| key.edit_key.idx == fs_idx);
-        if done < total && !current_busy {
-            Some((done, total))
-        } else {
-            None
-        }
+            .map(|key| key.edit_key.idx)
+            .collect();
+        let current_busy = active_indices.contains(&fs_idx);
+        let pages = targets.into_iter().map(|idx| {
+            (
+                idx,
+                fs_prefetch_page_state(
+                    self.is_idx_final_ai_done_or_skipped(idx),
+                    active_indices.contains(&idx),
+                ),
+            )
+        });
+        build_fs_prefetch_indicator(fs_idx, current_busy, pages)
     }
 
     fn record_final_effect_prefetch_admission(
@@ -59729,7 +59729,7 @@ impl App {
         // なっていた。これだと `open_fullscreen` が defensive に
         // `bump_adjustment_generation(idx)` を呼ぶたび、隣接ページの prefetch_final_ai
         // で完了した `final_ai_cache` エントリまで巻き込んで削除され、次ページ表示時に
-        // 毎回 AI を待たされる退行があった (= 「先読み進捗バーは出ているのに次画像で
+        // 毎回 AI を待たされる退行があった (= 「先読み表示は出ているのに次画像で
         // 一瞬アップスケール前が見えて、AI 処理から再表示」のユーザー報告)。
         let Some(key) = self.metadata_cache_key(idx) else {
             self.cancel_final_effects_for_idx(idx);

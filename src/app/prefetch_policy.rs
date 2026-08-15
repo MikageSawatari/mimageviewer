@@ -157,3 +157,138 @@ pub(crate) fn interleaved_prefetch_targets(
     }
     out
 }
+
+/// フルスクリーンの AI 先読み表示で使うページ単位の状態。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FsPrefetchPageState {
+    Ready,
+    Active,
+    Missing,
+}
+
+/// 完了済みを処理中より優先して、先読みページの表示状態を一意に決める。
+pub(crate) fn fs_prefetch_page_state(ready: bool, active: bool) -> FsPrefetchPageState {
+    if ready {
+        FsPrefetchPageState::Ready
+    } else if active {
+        FsPrefetchPageState::Active
+    } else {
+        FsPrefetchPageState::Missing
+    }
+}
+
+/// 遠方分を状態別の個数へ畳んだ 1 要素。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FsPrefetchStateCount {
+    pub(crate) state: FsPrefetchPageState,
+    pub(crate) count: usize,
+}
+
+/// 片側の描画モデル。dots は現在ページに近い最大 8 ページ、far_counts は
+/// それより遠いページを状態別の個数へまとめたもの。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FsPrefetchSideDisplay {
+    pub(crate) dots: Vec<FsPrefetchPageState>,
+    pub(crate) far_counts: Vec<FsPrefetchStateCount>,
+}
+
+/// 現在ページを挟んだ AI 先読み表示。behind は遠い→近い、ahead は近い→遠い。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FsPrefetchIndicator {
+    pub(crate) behind: Vec<FsPrefetchPageState>,
+    pub(crate) ahead: Vec<FsPrefetchPageState>,
+    pub(crate) ready_count: usize,
+    pub(crate) active_count: usize,
+    pub(crate) missing_count: usize,
+}
+
+impl FsPrefetchIndicator {
+    pub(crate) const MAX_DOTS_PER_SIDE: usize = 8;
+
+    pub(crate) fn tooltip_text(&self) -> String {
+        format!(
+            "先読み: 取得済み {} / 取得中 {} / 未取得 {}",
+            self.ready_count, self.active_count, self.missing_count
+        )
+    }
+
+    /// behind は末尾が現在ページに最も近い。
+    pub(crate) fn behind_display(&self) -> FsPrefetchSideDisplay {
+        let first_dot = self.behind.len().saturating_sub(Self::MAX_DOTS_PER_SIDE);
+        FsPrefetchSideDisplay {
+            dots: self.behind[first_dot..].to_vec(),
+            far_counts: summarize_fs_prefetch_states(&self.behind[..first_dot]),
+        }
+    }
+
+    /// ahead は先頭が現在ページに最も近い。
+    pub(crate) fn ahead_display(&self) -> FsPrefetchSideDisplay {
+        let dot_count = self.ahead.len().min(Self::MAX_DOTS_PER_SIDE);
+        FsPrefetchSideDisplay {
+            dots: self.ahead[..dot_count].to_vec(),
+            far_counts: summarize_fs_prefetch_states(&self.ahead[dot_count..]),
+        }
+    }
+}
+
+fn summarize_fs_prefetch_states(states: &[FsPrefetchPageState]) -> Vec<FsPrefetchStateCount> {
+    [
+        FsPrefetchPageState::Ready,
+        FsPrefetchPageState::Active,
+        FsPrefetchPageState::Missing,
+    ]
+    .into_iter()
+    .filter_map(|state| {
+        let count = states.iter().filter(|&&value| value == state).count();
+        (count > 0).then_some(FsPrefetchStateCount { state, count })
+    })
+    .collect()
+}
+
+/// AI 先読み対象を現在ページの前後へ分け、リモート表示と同じ遠近順に整える。
+///
+/// 対象なし、現在ページ自身の AI 処理中、全対象の取得完了時は、従来どおり表示しない。
+pub(crate) fn build_fs_prefetch_indicator(
+    current_idx: usize,
+    current_busy: bool,
+    pages: impl IntoIterator<Item = (usize, FsPrefetchPageState)>,
+) -> Option<FsPrefetchIndicator> {
+    let mut behind = Vec::new();
+    let mut ahead = Vec::new();
+    let mut ready_count = 0;
+    let mut active_count = 0;
+    let mut missing_count = 0;
+
+    for (idx, state) in pages {
+        match idx.cmp(&current_idx) {
+            std::cmp::Ordering::Less => behind.push((idx, state)),
+            std::cmp::Ordering::Greater => ahead.push((idx, state)),
+            std::cmp::Ordering::Equal => continue,
+        }
+        match state {
+            FsPrefetchPageState::Ready => ready_count += 1,
+            FsPrefetchPageState::Active => active_count += 1,
+            FsPrefetchPageState::Missing => missing_count += 1,
+        }
+    }
+
+    if behind.is_empty() && ahead.is_empty() {
+        return None;
+    }
+
+    // item idx は表示順に増える。behind は昇順で遠い→近い、ahead は昇順で近い→遠い。
+    behind.sort_unstable_by_key(|(idx, _)| *idx);
+    ahead.sort_unstable_by_key(|(idx, _)| *idx);
+
+    if current_busy || active_count + missing_count == 0 {
+        return None;
+    }
+
+    Some(FsPrefetchIndicator {
+        behind: behind.into_iter().map(|(_, state)| state).collect(),
+        ahead: ahead.into_iter().map(|(_, state)| state).collect(),
+        ready_count,
+        active_count,
+        missing_count,
+    })
+}

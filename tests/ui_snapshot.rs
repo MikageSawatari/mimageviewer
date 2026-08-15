@@ -225,6 +225,15 @@ fn contrast_fixture(ui: &mut egui::Ui) {
 }
 
 #[test]
+fn fullscreen_prefetch_direction_dark() {
+    snapshot_with_theme(
+        "fullscreen_prefetch_direction_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::draw_fs_prefetch_indicator_snapshot_fixture,
+    );
+}
+
+#[test]
 fn still_touch_panel_handles_latched_dark() {
     snapshot_with_theme(
         "still_touch_panel_handles_latched_dark",
