@@ -35,6 +35,7 @@ import {
   gridScrollbarShouldShow,
   gridScrollbarThumb,
   gridScrollExtent,
+  gridScrollHeldByGesture,
   gridIndexForCommand,
   isPortraitViewport,
   isRtlReadingDirection,
@@ -2368,6 +2369,29 @@ test("grid scroll extent and snapping stay on whole row boundaries", () => {
     maxOffset: 0,
     totalHeight: 700,
   });
+});
+
+test("row snapping waits for the finger to leave, not for the pointer stream to stop", () => {
+  // The list is `touch-action: pan-y`, so the browser takes a one-finger drag over as a
+  // scroll and fires `pointercancel` right away. The finger is still on the glass, and
+  // snapping there writes `scrollTop` out from under it, which the browser then undoes:
+  // the list shakes for as long as the drag lasts.
+  assert.equal(
+    gridScrollHeldByGesture({ touchContacts: 1, activePointers: 0 }),
+    true
+  );
+  assert.equal(
+    gridScrollHeldByGesture({ touchContacts: 0, activePointers: 1 }),
+    true
+  );
+  assert.equal(
+    gridScrollHeldByGesture({ touchContacts: 0, activePointers: 0 }),
+    false
+  );
+  // Dragging the scrollbar thumb owns the offset the same way a finger does.
+  assert.equal(gridScrollHeldByGesture({ scrollbarPointerId: 0 }), true);
+  assert.equal(gridScrollHeldByGesture({ scrollbarPointerId: null }), false);
+  assert.equal(gridScrollHeldByGesture(), false);
 });
 
 test('grid scrollbar visibility never depends on the measured track', () => {

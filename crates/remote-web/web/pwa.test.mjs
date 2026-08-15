@@ -721,6 +721,38 @@ test("the grid owns pinch scaling while one-finger vertical scroll stays native"
   assert.doesNotMatch(app, /縦持ちの列数|横持ちの列数/);
 });
 
+test("the grid tracks finger contact with touch events because pointers are cancelled", async () => {
+  const app = await readFile(new URL("app.js", here), "utf8");
+  // `pan-y` の一本指スクロールはブラウザが引き取り、その瞬間 `pointercancel` が飛ぶ。
+  // 指はまだ乗っているので、接地は touch イベントで数える。行スナップの guard は
+  // pointer だけを見てはいけない (見ると、ドラッグ中に scrollTop を書いて一覧が震える)。
+  assert.match(
+    app,
+    /addEventListener\("touchstart", this\.onTouchStart, \{\s*passive: true,?\s*\}\)/
+  );
+  assert.match(
+    app,
+    /addEventListener\("touchend", this\.onTouchEnd, \{\s*passive: true,?\s*\}\)/
+  );
+  assert.match(
+    app,
+    /addEventListener\("touchcancel", this\.onTouchEnd, \{\s*passive: true,?\s*\}\)/
+  );
+  assert.match(app, /removeEventListener\("touchstart", this\.onTouchStart\)/);
+  assert.match(app, /removeEventListener\("touchend", this\.onTouchEnd\)/);
+  assert.match(app, /removeEventListener\("touchcancel", this\.onTouchEnd\)/);
+  assert.match(
+    app,
+    /gestureHoldsScroll\(\) \{\s*return gridScrollHeldByGesture\(\{\s*touchContacts: this\.touchContacts\.size,/
+  );
+  for (const method of ["scheduleRowSnap", "snapToRow"]) {
+    assert.match(
+      app,
+      new RegExp(`${method}\\(\\) \\{\\s*if \\(this\\.gestureHoldsScroll\\(\\)\\) return;`)
+    );
+  }
+});
+
 test("video owns repeated taps and pinch without allowing native page zoom", async () => {
   const css = await readFile(new URL("styles.css", here), "utf8");
   const video = await readFile(new URL("video-stream.mjs", here), "utf8");

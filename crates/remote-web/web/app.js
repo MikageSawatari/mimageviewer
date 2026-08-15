@@ -27,6 +27,7 @@ import {
   gridScrollbarShouldShow,
   gridScrollbarThumb,
   gridScrollExtent,
+  gridScrollHeldByGesture,
   gridIndexForCommand,
   imageQualityPreset,
   isRtlReadingDirection,
@@ -7304,6 +7305,11 @@ class VirtualGrid {
     this.frame = 0;
     this.snapTimer = 0;
     this.activePointers = new Map();
+    // Pointer events cannot answer "is a finger still on the glass". `.grid-scroll` is
+    // `touch-action: pan-y`, so the browser takes a one-finger drag over as a scroll and
+    // fires `pointercancel` while the finger is still down. Touch events keep reporting
+    // that finger until it lifts, so the row snap waits on this set instead.
+    this.touchContacts = new Set();
     this.pinch = null;
     this.blockClickUntil = 0;
     this.wheelPinchScale = 1;
@@ -7324,6 +7330,8 @@ class VirtualGrid {
       if (event.touches.length < 2) return;
       event.preventDefault();
     };
+    this.onTouchStart = (event) => this.handleTouchStart(event);
+    this.onTouchEnd = (event) => this.handleTouchEnd(event);
     this.onClickCapture = (event) => {
       if (performance.now() >= this.blockClickUntil) return;
       event.preventDefault();
@@ -7354,8 +7362,17 @@ class VirtualGrid {
     this.scroller.addEventListener("pointercancel", this.onPointerEnd, {
       passive: true,
     });
+    this.scroller.addEventListener("touchstart", this.onTouchStart, {
+      passive: true,
+    });
     this.scroller.addEventListener("touchmove", this.onTouchMove, {
       passive: false,
+    });
+    this.scroller.addEventListener("touchend", this.onTouchEnd, {
+      passive: true,
+    });
+    this.scroller.addEventListener("touchcancel", this.onTouchEnd, {
+      passive: true,
     });
     this.scroller.addEventListener("click", this.onClickCapture, {
       capture: true,
@@ -7566,7 +7583,35 @@ class VirtualGrid {
       this.blockClickUntil = performance.now() + 300;
       this.pinch = null;
     }
+    // A `pointercancel` lands here too, so this may run with the finger still down.
+    // `scheduleRowSnap` checks the touch contacts and declines in that case.
     if (this.activePointers.size === 0) this.scheduleRowSnap();
+  }
+
+  handleTouchStart(event) {
+    for (const touch of event.changedTouches ?? []) {
+      this.touchContacts.add(touch.identifier);
+    }
+    clearTimeout(this.snapTimer);
+    this.snapTimer = 0;
+  }
+
+  handleTouchEnd(event) {
+    // `touchcancel` arrives here as well. Unlike `pointercancel` it means the touch was
+    // really abandoned, so releasing on it is right — and required, or a cancelled touch
+    // would hold the guard shut and the list would never snap again.
+    for (const touch of event.changedTouches ?? []) {
+      this.touchContacts.delete(touch.identifier);
+    }
+    if (this.touchContacts.size === 0) this.scheduleRowSnap();
+  }
+
+  gestureHoldsScroll() {
+    return gridScrollHeldByGesture({
+      touchContacts: this.touchContacts.size,
+      activePointers: this.activePointers.size,
+      scrollbarPointerId: this.scrollbarPointerId,
+    });
   }
 
   applyColumnOverride(nextColumns) {
@@ -7691,13 +7736,13 @@ class VirtualGrid {
   }
 
   scheduleRowSnap() {
-    if (this.activePointers.size > 0 || this.scrollbarPointerId !== null) return;
+    if (this.gestureHoldsScroll()) return;
     clearTimeout(this.snapTimer);
     this.snapTimer = window.setTimeout(() => this.snapToRow(), 140);
   }
 
   snapToRow() {
-    if (this.activePointers.size > 0 || this.scrollbarPointerId !== null) return;
+    if (this.gestureHoldsScroll()) return;
     clearTimeout(this.snapTimer);
     this.snapTimer = 0;
     const snapped = snappedGridOffset(
@@ -7845,7 +7890,10 @@ class VirtualGrid {
     this.scroller.removeEventListener("pointermove", this.onPointerMove);
     this.scroller.removeEventListener("pointerup", this.onPointerEnd);
     this.scroller.removeEventListener("pointercancel", this.onPointerEnd);
+    this.scroller.removeEventListener("touchstart", this.onTouchStart);
     this.scroller.removeEventListener("touchmove", this.onTouchMove);
+    this.scroller.removeEventListener("touchend", this.onTouchEnd);
+    this.scroller.removeEventListener("touchcancel", this.onTouchEnd);
     this.scroller.removeEventListener("click", this.onClickCapture, true);
     this.scroller.removeEventListener("gesturestart", this.onNativeGesture);
     this.scroller.removeEventListener("gesturechange", this.onNativeGesture);
@@ -7876,6 +7924,7 @@ class VirtualGrid {
     this.resizeObserver.disconnect();
     this.scrollbarPointerId = null;
     this.activePointers.clear();
+    this.touchContacts.clear();
     this.pinch = null;
     for (const cell of this.cells.values()) disposeGridTile(cell);
     this.cells.clear();

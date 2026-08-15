@@ -2254,6 +2254,20 @@ export function snappedGridOffset(scrollTop, rowPitch, maxOffset) {
   return Math.max(0, Math.min(maximum, Math.round(offset / pitch) * pitch));
 }
 
+// Snapping to a row writes `scroller.scrollTop`. Doing that while the user is still
+// touching the list fights the browser's own scrolling: the write pulls the content out
+// from under the finger, the browser puts it back where the gesture says it belongs, and
+// the two take turns until the finger lifts. Touch contact is what decides this. An
+// empty pointer map does not mean the finger left, because the browser fires
+// `pointercancel` the moment it takes a one-finger drag over as a scroll.
+export function gridScrollHeldByGesture({
+  touchContacts = 0,
+  activePointers = 0,
+  scrollbarPointerId = null,
+} = {}) {
+  return touchContacts > 0 || activePointers > 0 || scrollbarPointerId !== null;
+}
+
 export const GRID_VIEWPORT_MEMORY_LIMIT = 64;
 
 const GridViewportAnchorKind = Object.freeze({
