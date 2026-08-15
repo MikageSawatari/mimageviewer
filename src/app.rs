@@ -10742,6 +10742,8 @@ pub struct App {
     pub(crate) subfolder_expansion_removed_paths: std::collections::HashSet<String>,
     /// OFF 状態のサブ展開ボタンから開く走査階層設定ダイアログ。
     pub(crate) show_subfolder_expansion_dialog: bool,
+    /// 直近でログに書いた「入力を止めているダイアログ」。遷移のときだけ記録するための控え。
+    pub(crate) modal_block_reason_logged: Option<&'static str>,
     /// サブ展開 worker の進行中状態。
     pub(crate) subfolder_expansion_pending: Option<subfolder_expansion::SubfolderExpansionPending>,
     /// サブ展開 worker 完了後、ソート・一覧構築・メタ DB 読み込みを行う非同期準備。
@@ -13250,6 +13252,7 @@ impl App {
             subfolder_expansion_snapshot: None,
             subfolder_expansion_removed_paths: std::collections::HashSet::new(),
             show_subfolder_expansion_dialog: false,
+            modal_block_reason_logged: None,
             subfolder_expansion_pending: None,
             subfolder_expansion_install_pending: None,
             subfolder_expansion_confirm_pending: None,
@@ -14818,74 +14821,122 @@ impl App {
     /// main / fullscreen で別々の一覧を持つと、新規ダイアログ追加時に片方だけ漏れて
     /// wheel・キーが背面へ伝播するため、モーダル相当の状態は必ずここへ集約する。
     fn common_modal_dialog_open(&self) -> bool {
-        self.remote_session_blocks_local_control()
-            || self.remote_connection_dialog_open()
-            || self.show_stats_dialog
-            || self.show_favorites_editor
-            || self.show_smart_folder_editor
-            || self.smart_folder_create_name.is_some()
-            || self.smart_folder_rule_draft.is_some()
-            || self.show_tag_editor
-            || self.show_tag_apply
-            || self.fullscreen_tag_picker_open
-            || self.fs_overflow_panel_state.is_open()
-            || self.show_fav_add_dialog
-            || self.show_open_folder_dialog
-            || self.show_subfolder_expansion_dialog
+        self.modal_dialog_block_reason().is_some()
+    }
+
+    /// Which of those states is holding input, by name.
+    ///
+    /// This was a bare `||` chain of sixty flags. When one of them stayed set with nothing drawn
+    /// on screen, every key in the application stopped working and the only thing any log could
+    /// say was "modal_dialog" - the name of the predicate, not of the state. A user spent ten
+    /// minutes with a dead keyboard and neither of us could tell which flag it was; the session
+    /// had to be kept alive while we guessed (2026-08-15).
+    ///
+    /// The boolean above is derived from this so the two cannot drift apart. Order is the order
+    /// the chain had, and the first match wins: with several set, the name is one true answer
+    /// rather than all of them, which is what a reader needs to start looking.
+    pub(crate) fn modal_dialog_block_reason(&self) -> Option<&'static str> {
+        macro_rules! first {
+            ($( $cond:expr => $name:literal ),+ $(,)?) => {
+                $( if $cond { return Some($name); } )+
+            };
+        }
+        first![
+            self.remote_session_blocks_local_control() => "remote_session",
+            self.remote_connection_dialog_open() => "remote_connection",
+            self.show_stats_dialog => "stats",
+            self.show_favorites_editor => "favorites_editor",
+            self.show_smart_folder_editor => "smart_folder_editor",
+            self.smart_folder_create_name.is_some() => "smart_folder_create_name",
+            self.smart_folder_rule_draft.is_some() => "smart_folder_rule_draft",
+            self.show_tag_editor => "tag_editor",
+            self.show_tag_apply => "tag_apply",
+            self.fullscreen_tag_picker_open => "fullscreen_tag_picker",
+            self.fs_overflow_panel_state.is_open() => "fs_overflow_panel",
+            self.show_fav_add_dialog => "fav_add",
+            self.show_open_folder_dialog => "open_folder",
+            self.show_subfolder_expansion_dialog => "subfolder_expansion_dialog",
             // Native name dialogs stop App::update while their OS modal loop is
             // active. Keep only the queued-launch flags here so the triggering
             // frame cannot leak input to the grid. Their async workers are not
             // visible dialogs and therefore do not belong in this predicate.
-            || self.show_new_folder_dialog
-            || self.show_rename_dialog
-            || self.show_book_manager
-            || self.book_reorder.is_some()
-            || self.show_preferences
-            || self.show_preferences_discard_confirm
-            || self.show_settings_restore
-            || self.show_settings_boot_problem_notice
-            || self.show_operation_customize
-            || self.show_operation_customize_discard_confirm
-            || self.show_mouse_nav_migration_prompt
-            || self.show_whats_new
-            || self.show_context_shortcuts_help
-            || self.show_toolbar_reset_confirm
-            || self.show_cache_manager
-            || self.show_archive_cache_manager
-            || self.show_metadata_cleanup
-            || self.metadata_cleanup_pending.is_some()
-            || self.metadata_transfer.is_some()
-            || self.cc.show
-            || self.archive_convert_dialog_visible()
-            || self.video_upscale.is_some()
-            || self.tq.show
-            || (self.settings_boot_problem_source.is_none() && !self.settings.first_setup_completed)
-            || self.show_delete_confirm
-            || self.edit_bundle_paste_pending.is_some()
-            || self.edit_bundle_apply_pending.is_some()
-            || self.show_rotation_reset_confirm
-            || self.show_pdf_password_dialog
-            || self.show_about_dialog
-            || self.show_update_dialog
-            || self.show_tray_enabled_notice
-            || self.slot_save_dialog.is_some()
-            || self.favorite_default_clear_confirm.is_some()
-            || self.export_dialog.is_some()
-            || self.export_pending.is_some()
-            || self.local_adjust_add_layer_dialog_open
-            || self.local_adjust_change_mask_dialog_open
-            || self.local_adjust_effect_picker_dialog_open
-            || self.context_menu_idx.is_some()
-            || self.delete_pending.is_some()
-            || self.batch_convert.is_some()
-            || self.subfolder_expansion_pending.is_some()
-            || self.subfolder_expansion_confirm_pending.is_some()
-            || self.smart_folder_pending.is_some()
-            || self.smart_folder_prepare_pending.is_some()
-            || self.smart_folder_confirm_pending.is_some()
-            || self.subfolder_expansion_install_pending.is_some()
-            || self.editing_addon_install_state.is_some()
-            || self.text_subdialog_open()
+            self.show_new_folder_dialog => "new_folder",
+            self.show_rename_dialog => "rename",
+            self.show_book_manager => "book_manager",
+            self.book_reorder.is_some() => "book_reorder",
+            self.show_preferences => "preferences",
+            self.show_preferences_discard_confirm => "preferences_discard_confirm",
+            self.show_settings_restore => "settings_restore",
+            self.show_settings_boot_problem_notice => "settings_boot_problem_notice",
+            self.show_operation_customize => "operation_customize",
+            self.show_operation_customize_discard_confirm => "operation_customize_discard_confirm",
+            self.show_mouse_nav_migration_prompt => "mouse_nav_migration_prompt",
+            self.show_whats_new => "whats_new",
+            self.show_context_shortcuts_help => "context_shortcuts_help",
+            self.show_toolbar_reset_confirm => "toolbar_reset_confirm",
+            self.show_cache_manager => "cache_manager",
+            self.show_archive_cache_manager => "archive_cache_manager",
+            self.show_metadata_cleanup => "metadata_cleanup",
+            self.metadata_cleanup_pending.is_some() => "metadata_cleanup_pending",
+            self.metadata_transfer.is_some() => "metadata_transfer",
+            self.cc.show => "cache_creator",
+            self.archive_convert_dialog_visible() => "archive_convert",
+            self.video_upscale.is_some() => "video_upscale",
+            self.tq.show => "thumb_quality",
+            self.settings_boot_problem_source.is_none() && !self.settings.first_setup_completed
+                => "first_setup",
+            self.show_delete_confirm => "delete_confirm",
+            self.edit_bundle_paste_pending.is_some() => "edit_bundle_paste_pending",
+            self.edit_bundle_apply_pending.is_some() => "edit_bundle_apply_pending",
+            self.show_rotation_reset_confirm => "rotation_reset_confirm",
+            self.show_pdf_password_dialog => "pdf_password",
+            self.show_about_dialog => "about",
+            self.show_update_dialog => "update",
+            self.show_tray_enabled_notice => "tray_enabled_notice",
+            self.slot_save_dialog.is_some() => "slot_save",
+            self.favorite_default_clear_confirm.is_some() => "favorite_default_clear_confirm",
+            self.export_dialog.is_some() => "export_dialog",
+            self.export_pending.is_some() => "export_pending",
+            self.local_adjust_add_layer_dialog_open => "local_adjust_add_layer",
+            self.local_adjust_change_mask_dialog_open => "local_adjust_change_mask",
+            self.local_adjust_effect_picker_dialog_open => "local_adjust_effect_picker",
+            self.context_menu_idx.is_some() => "grid_context_menu",
+            self.delete_pending.is_some() => "delete_pending",
+            self.batch_convert.is_some() => "batch_convert",
+            self.subfolder_expansion_pending.is_some() => "subfolder_expansion_pending",
+            self.subfolder_expansion_confirm_pending.is_some()
+                => "subfolder_expansion_confirm_pending",
+            self.smart_folder_pending.is_some() => "smart_folder_pending",
+            self.smart_folder_prepare_pending.is_some() => "smart_folder_prepare_pending",
+            self.smart_folder_confirm_pending.is_some() => "smart_folder_confirm_pending",
+            self.subfolder_expansion_install_pending.is_some()
+                => "subfolder_expansion_install_pending",
+            self.editing_addon_install_state.is_some() => "editing_addon_install",
+            self.text_subdialog_open() => "text_subdialog",
+        ];
+        None
+    }
+
+    /// Say in the ordinary log when input starts and stops being held by a dialog.
+    ///
+    /// The perf log carries this too, but only while `--perf-log` is on, and this state is not
+    /// something a reader can be asked to reproduce on demand: it costs them every key in the
+    /// application until they restart. One line each way is cheap enough to always keep.
+    pub(crate) fn note_modal_block_transition(&mut self) {
+        let reason = self.modal_dialog_block_reason();
+        if reason == self.modal_block_reason_logged {
+            return;
+        }
+        match reason {
+            Some(name) => crate::logger::log(format!(
+                "[input] all keyboard input is now held by a dialog: {name}"
+            )),
+            None => crate::logger::log(format!(
+                "[input] keyboard input released by {}",
+                self.modal_block_reason_logged.unwrap_or("?")
+            )),
+        }
+        self.modal_block_reason_logged = reason;
     }
 
     pub(crate) fn any_dialog_open(&self) -> bool {
@@ -63672,6 +63723,9 @@ impl eframe::App for App {
         self.acknowledge_tray_resident_media_wake();
         crate::record_ui_heartbeat_tick();
         self.poll_remote_session(ctx);
+        // Before any shortcut path, so a state that swallows every key says so once, in the
+        // ordinary log, whether or not the reader happened to be running with --perf-log.
+        self.note_modal_block_transition();
         // Select and cache the root viewport owner before any shortcut path.
         // This also ages a root PendingFocus claim on every pass, including
         // passes that return before the normal keyboard handler.

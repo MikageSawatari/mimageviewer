@@ -14414,8 +14414,10 @@ impl App {
             Some("reading_flow_not_paged")
         } else if !self.items.get(fs_idx).is_some_and(GridItem::has_page_data) {
             Some("item_not_page_data")
-        } else if self.any_modal_dialog_open_for_fullscreen_keys() {
-            Some("modal_dialog")
+        } else if let Some(dialog) = self.modal_dialog_block_reason() {
+            // The name of the dialog, not the name of the predicate. A blocked session can only
+            // be diagnosed from a log if the log says which one.
+            Some(dialog)
         } else if self.fs_context_menu_idx.is_some() {
             Some("context_menu")
         } else if self.capture_region_selection.is_some() {
