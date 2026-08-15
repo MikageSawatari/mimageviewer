@@ -2541,7 +2541,11 @@ serve 設定ボタンだけを無効にし、Tailscale 管理コンソールの 
 証明書、期限、Tailscale の有無では止めない。ローカルの `http://127.0.0.1` 確認経路を残すためである。
 公開 URL と QR コードだけは共有 probe の候補 URL ではなく、接続中の remote-web が通知した
 `RemoteWebConnectionInfo.public_url` を使う。これは tailnet の現在候補ではなく、service が実際に
-配信している場所だからである。
+配信している場所だからである。**表示条件も同じ snapshot の `tailscale_serve` が設定済みのときだけ**とする。
+serve が無い間の `public_url` は bind fallback (`http://127.0.0.1:<port>/`) になり得るが、QR は
+読まずに scan されるため、端末から届かない宛先を描いてはならない。案内側の probe が設定済みを示していても
+snapshot がまだ古い場合は QR を出さない。これは service を再起動するまで公開 URL が更新されないためで、
+その場合に古い URL を配るより出さない方が正しい。
 
 期限が得られた場合は日付と残り日数を表示し、30 日以内と期限切れを警告色にする。期限切れでは
 PC が tailnet から外れて外出先から接続できないことを明示し、デバイス一覧へ案内する。情報なしでは

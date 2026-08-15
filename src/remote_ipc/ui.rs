@@ -3133,7 +3133,9 @@ impl crate::app::App {
                         RemoteTailscaleServeSetupState::Idle => {}
                     }
                 }
-                if accepting && let Some(info) = info.as_ref() {
+                if let Some(info) = info.as_ref()
+                    && remote_connection_url_visible(accepting, info.tailscale_serve)
+                {
                     ui.separator();
                     paint_qr(ui, &info.public_url);
                     ui.add_space(6.0);
@@ -3678,6 +3680,14 @@ fn remote_logical_path(
 
 fn remote_enable_warning_visible(enabled: bool) -> bool {
     !enabled
+}
+
+/// serve が無い間の `public_url` は bind fallback (`http://127.0.0.1:<port>/`) になり得る。
+/// QR は読まずに scan されるので、端末から届かない宛先は描かない。判定も URL も、案内側の
+/// probe ではなく service の snapshot から取る (probe が設定済みでも snapshot が古ければ、
+/// 公開 URL はまだ更新されていない)。
+fn remote_connection_url_visible(accepting: bool, serve: RemoteWebFeatureStatus) -> bool {
+    accepting && serve == RemoteWebFeatureStatus::Configured
 }
 
 fn core_spread_mode(mode: RemoteSpreadMode) -> crate::settings::SpreadMode {
@@ -4390,6 +4400,28 @@ mod tests {
             REMOTE_MANUAL_URL,
             "https://mikage.to/mimageviewer/manual/tut-remote.html"
         );
+    }
+
+    #[test]
+    fn the_connection_qr_waits_for_serve_so_it_never_points_at_the_loopback() {
+        // serve が無い間の public_url は bind fallback になり得る。案内側の probe が
+        // 設定済みを示していても、service の snapshot が古ければ公開 URL はまだ古い。
+        assert!(remote_connection_url_visible(
+            true,
+            RemoteWebFeatureStatus::Configured
+        ));
+        assert!(!remote_connection_url_visible(
+            true,
+            RemoteWebFeatureStatus::NotConfigured
+        ));
+        assert!(!remote_connection_url_visible(
+            true,
+            RemoteWebFeatureStatus::Unknown
+        ));
+        assert!(!remote_connection_url_visible(
+            false,
+            RemoteWebFeatureStatus::Configured
+        ));
     }
 
     #[test]
