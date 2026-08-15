@@ -302,11 +302,18 @@
     </p>
     <ul>
       <li><strong>HTTPS の証明書。</strong>有効になっていないと
-      <strong>「tailscale serve を設定する」</strong>を押せません。</li>
+      <strong>「tailscale serve を設定する」</strong>を押せません。リモート接続を有効にする前に
+      済ませておくのが確実です。</li>
       <li><strong>接続キーの有効期限。</strong>切れるとその PC が Tailscale ネットワークから外れ、
       <strong>外出先から接続できなくなります</strong>。気付くのはたいてい外出先なので、
       期限が表示されているうちに管理画面で期限をなくしておくと安心です。</li>
     </ul>
+    <p>
+      接続ダイアログに出る Tailscale の状態は、<strong>リモート接続を有効にした時点のもの</strong>です。
+      あとから管理画面で設定を変えたときは、いったん<strong>無効にしてから、もう一度有効に</strong>
+      してください。<strong>「tailscale serve を設定する」</strong>を押した場合だけは、
+      mImageViewer が自分でつなぎ直すのでその操作は要りません。
+    </p>
 
     <h2 id="trouble">うまくいかないとき</h2>
     <div class="table-wrap">

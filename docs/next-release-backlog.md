@@ -1751,6 +1751,26 @@ docs/conceal-feature-plan.md
   (crates/remote-ipc/src/tailscale.rs) が既にあるので、状態を引く口はある。
 - 規模 / 優先度: 小 / P2。次版で入れる。
 
+**同じ報告で出た 2 つめ: tailnet の状態を有効化の瞬間にしか読まない。**
+
+- 利用者は HTTPS 証明書の要件に**あとから**気付き、管理画面で有効にした。しかし
+  ダイアログの表示が変わらず、**無効 → 有効**をやり直して初めて反映された。
+- 構造: `choose_connection_url` は remote service の `run()` で **1 回だけ**呼ばれ、
+  結果 (`tailscale_serve` / `tailscale_https_certificate` / key expiry) を
+  `set_remote_web_connection_info` で焼き付ける (crates/remote-web/src/main.rs 55-64)。
+  以後ポーリングしない。ダイアログ側の `info` は動いている service の snapshot なので
+  (src/remote_ipc/ui.rs 2660)、**service を再起動しない限り古いまま**。
+- そのため **手順の 3 (有効にする) と 4 (serve 設定) は入れ替えられない**。無効の間は
+  service が動いておらず、serve の状態も設定ボタンも存在しない。
+- 自力で直る経路は 1 つだけある: アプリ内の「tailscale serve を設定する」を押した場合、
+  `tailscale_serve_completion_plan` が service を再起動する (src/remote_ipc/service.rs 266-274)。
+  外 (管理画面 / コマンドライン) で変えた場合だけ取り残される。
+- 案: ダイアログを開いたとき / 明示の「再確認」で tailnet 状態を引き直す。service の
+  再起動なしに読める形 (core 側から `tailscale` を叩く) にするか、service へ再取得 IPC を足す。
+- マニュアル側は現状の挙動に合わせて書いた (`tut-remote.html` / `remote.html` に
+  「Tailscale 側を変えたら無効→有効」を明記)。直したらこの記述も消す。
+- 規模 / 優先度: 小〜中 / P2。上の 1 件と同時に直すのが自然。
+
 ### 5.8 検索ベンチのゲートに絶対時間の下限が無い
 
 - 出典: v3.0.0 リリース前確認 (2026-08-14)。`check_bench_regression.py` が 10 件中 7 件を

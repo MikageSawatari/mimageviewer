@@ -111,15 +111,20 @@
 
     <h2>準備する</h2>
     <p>
-      <strong>1 から順に進めてください。</strong>Tailscale を入れないまま 2 以降を進めると、
-      4 の<strong>「tailscale serve を設定する」</strong>まで来たところで止まります。
+      <strong>1 から順に進めてください。</strong>1 と 2 は Tailscale 側での作業で、
+      <strong>mImageViewer からは変更できません</strong>。ここを飛ばして 3 から始めると、
+      5 の<strong>「tailscale serve を設定する」</strong>まで来たところで止まり、
+      戻ってやり直すことになります。
     </p>
     <ol>
       <li><strong>Tailscale を入れる。</strong>いちばん最初にこれをします。
       <a href="https://tailscale.com/">Tailscale</a> は mImageViewer とは別のソフトです。
       <strong>自宅 PC と外出先で使う端末の両方</strong>に入れて、<strong>同じアカウント</strong>で
-      サインインしてください。これで 2 台が同じネットワークに入ります。
-      mImageViewer 側の設定は、これが終わってからです。</li>
+      サインインしてください。これで 2 台が同じネットワークに入ります。</li>
+      <li><strong>Tailscale の管理画面で HTTPS の証明書を有効にする。</strong>
+      これも先にやっておきます。5 で必要になりますが、<strong>mImageViewer 側からは
+      変更できません</strong>。有効になっていないと、5 の設定ボタンを押せません。
+      mImageViewer 側の設定は、ここまでが終わってからです。</li>
       <li><strong>PIN を決める。</strong>ここからは自宅 PC の mImageViewer で、メニューの
       <strong>設定 → リモート接続…</strong>を開いて進めます（このウィンドウでの操作はその場で
       反映されます）。<strong>PIN: 未設定</strong>と表示されているときは
@@ -134,6 +139,18 @@
       コマンドが表示されるので、<strong>「tailscale serve を設定する」</strong>を押してください。
       mImageViewer が代わりに設定します。押すまでは何も変更しません。</li>
     </ol>
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">
+        <strong>あとから Tailscale 側の設定を変えたときは、いったん
+        「リモート接続を無効にする」を押してから、もう一度有効にしてください。</strong>
+        mImageViewer が Tailscale の状態を見るのは<strong>有効にした瞬間だけ</strong>です。
+        たとえば 2 を飛ばして進み、あとで管理画面で HTTPS の証明書を有効にしても、
+        そのままでは<strong>tailscale serve</strong> の表示や設定ボタンが古いままになります。
+        （<strong>「tailscale serve を設定する」</strong>を押した場合は、mImageViewer が
+        自分でつなぎ直すので、この操作は要りません。）
+      </div>
+    </div>
     <div class="box info">
       <span class="box-icon">ℹ️</span>
       <div class="box-body">
@@ -157,7 +174,8 @@
     </p>
     <ul>
       <li><strong>HTTPS の証明書が有効になっていない。</strong>この状態では
-      <strong>「tailscale serve を設定する」</strong>を押せません。管理画面で先に有効にしてください。</li>
+      <strong>「tailscale serve を設定する」</strong>を押せません。管理画面で有効にしたあと、
+      いったんリモート接続を無効にしてから、もう一度有効にしてください（上の注意）。</li>
       <li><strong>接続キーの有効期限が近い、または切れている。</strong>期限が切れると
       その PC が Tailscale ネットワークから外れ、<strong>外出先から接続できなくなります</strong>。
       気付くのはたいてい外出先なので、期限が表示されているうちに、管理画面で期限をなくしておくと
