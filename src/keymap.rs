@@ -5565,6 +5565,68 @@ pub(crate) struct PageTurnKeyInput {
     pub viewport: egui::ViewportId,
 }
 
+/// What the page-turn edge consumed in a pass said about the key still being down.
+///
+/// The burst that lowers page-turn quality while the reader holds a key also asks the OS whether
+/// the key is down - but it asks *after* the edge has been consumed, from the code that decides
+/// how the resulting move is drawn. A key released in that gap makes the two answers contradict
+/// each other about one event: the move was accepted because the key was held, then presented as
+/// though it were a lone press, so the page it lands on skips the stand-in and arrives at full
+/// quality a quarter of a second later. Observed on a real keyboard 2026-08-15; the synthetic
+/// harness never produced the gap.
+///
+/// The edge caused the move, so the edge's answer is the one that describes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PageTurnEdgeHold {
+    frame_nr: u64,
+    still_held: bool,
+}
+
+fn page_turn_edge_hold_id(viewport: egui::ViewportId) -> egui::Id {
+    egui::Id::new(("page_turn_edge_hold", viewport))
+}
+
+/// Leave the edge's own answer to "is the key still down" where the rest of the pass can find it.
+///
+/// A held edge wins over a released one within a pass: if any page-turn chord was still down when
+/// it was consumed, the reader is still holding a page-turn key, whatever a second chord's edge
+/// said.
+pub(crate) fn record_page_turn_edge_hold(
+    ctx: &egui::Context,
+    viewport: egui::ViewportId,
+    still_held: bool,
+) {
+    let frame_nr = ctx.cumulative_frame_nr();
+    let id = page_turn_edge_hold_id(viewport);
+    ctx.data_mut(|data| {
+        let still_held = still_held
+            || data
+                .get_temp::<PageTurnEdgeHold>(id)
+                .is_some_and(|previous| previous.frame_nr == frame_nr && previous.still_held);
+        data.insert_temp(
+            id,
+            PageTurnEdgeHold {
+                frame_nr,
+                still_held,
+            },
+        );
+    });
+}
+
+/// The answer the page-turn edge gave in this pass, if a page-turn edge was consumed at all.
+///
+/// `None` on passes with no page-turn edge - ordinary frames, mouse and touch navigation - where
+/// asking the OS directly is still the only thing to do.
+pub(crate) fn page_turn_edge_hold_this_frame(
+    ctx: &egui::Context,
+    viewport: egui::ViewportId,
+) -> Option<bool> {
+    let frame_nr = ctx.cumulative_frame_nr();
+    ctx.data(|data| data.get_temp::<PageTurnEdgeHold>(page_turn_edge_hold_id(viewport)))
+        .filter(|mark| mark.frame_nr == frame_nr)
+        .map(|mark| mark.still_held)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PageTurnConsumeResult {
     NoMatch,
@@ -7106,6 +7168,7 @@ impl Keymap {
                     still_held,
                     viewport,
                 });
+                record_page_turn_edge_hold(ctx, viewport, still_held);
                 Self::trace_page_turn_edge(
                     chord,
                     "win32",
@@ -7196,6 +7259,7 @@ impl Keymap {
             still_held,
             viewport,
         });
+        record_page_turn_edge_hold(ctx, viewport, still_held);
         Self::trace_page_turn_edge(chord, "egui", kind, released_after_match, os_held, result);
         result
     }

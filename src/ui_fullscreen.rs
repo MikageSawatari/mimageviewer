@@ -14456,6 +14456,14 @@ impl App {
         if blocker.is_some() {
             return (false, blocker, viewport);
         }
+        // A page turn taken in this pass already answered this, at the instant the move was
+        // accepted. Asking the OS again here reads a later moment, and a key released in between
+        // makes the last repeat of a burst look like a lone press - the page it lands on then
+        // skips the stand-in and appears at full quality a quarter of a second later, which reads
+        // as the viewer moving on by itself after the key was let go.
+        if let Some(still_held) = crate::keymap::page_turn_edge_hold_this_frame(ctx, viewport) {
+            return (still_held, None, viewport);
+        }
         let configurable = FS_PAGE_TURN_COALESCE_ACTIONS.into_iter().any(|action| {
             self.keymap
                 .effective_chords(action)
@@ -33533,6 +33541,65 @@ mod tests {
             .blocks_new_target()
         );
         assert!(!target(FsNavigationTargetPhase::RenditionFailed).blocks_new_target());
+    }
+
+    /// The last page of a hold must be drawn like the rest of the hold.
+    ///
+    /// Reported 2026-08-15: holding an arrow and letting go left the reader on the page before,
+    /// and a quarter of a second later the next one appeared at full quality - as if the viewer
+    /// had moved on by itself. It had not. The final repeat was accepted while the key was down,
+    /// but the code that decides how to draw the resulting move asked the OS a second time, by
+    /// which point the key was up, so the move was presented as a lone press: no stand-in, and a
+    /// wait for the full-size render.
+    ///
+    /// Here the OS reports nothing held, as it does in any test. Before the edge's own answer was
+    /// kept, the second advance produced an inactive burst and the assertion below failed.
+    #[cfg(windows)]
+    #[test]
+    fn a_page_turn_is_drawn_from_the_edge_that_caused_it_not_a_later_key_sample() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = (0..6).map(|_| GridItem::Image(PathBuf::new())).collect();
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.visible_indices = (0..app.items.len()).collect();
+        app.reading_flow = ReadingFlow::Paged;
+        app.items_generation = 4;
+        let ctx = egui::Context::default();
+        // The viewport the burst owner reads. In the fullscreen pass this is the context's own
+        // viewport, which is where the keymap writes; a test context is the main one, so name it
+        // the same way the owner does rather than assuming they coincide.
+        let viewport = app.fullscreen_viewport_id();
+
+        // Each page turn is its own pass. The mark is scoped to the pass that wrote it, so
+        // running them together would let the first hold answer for the release at the end.
+        let advance = |app: &mut crate::app::App, from: usize, to: usize, still_held: bool| {
+            let _ = ctx.run(egui::RawInput::default(), |_| {});
+            crate::keymap::record_page_turn_edge_hold(&ctx, viewport, still_held);
+            app.update_fs_page_turn_burst_after_navigation(&ctx, from, Some(to))
+        };
+
+        // One press with the key still down arms the burst without lowering quality: reading a
+        // page at a time must stay full quality throughout.
+        assert!(
+            !advance(&mut app, 0, 1, true),
+            "a single press must not lower quality"
+        );
+        // The repeat that follows is what a hold looks like, and it turns the stand-in on.
+        assert!(
+            advance(&mut app, 1, 2, true),
+            "a repeat while the key is down is a hold, whatever a later sample says"
+        );
+        // The last repeat of the hold: accepted while down, applied on the frame the key came up.
+        assert!(
+            advance(&mut app, 2, 3, true),
+            "the final page of a hold must be drawn like the pages before it"
+        );
+
+        // A press already released is a lone press again, so the page it lands on materializes
+        // straight away rather than showing a stand-in nobody is waiting on.
+        assert!(
+            !advance(&mut app, 3, 4, false),
+            "a released press must end the burst"
+        );
     }
 
     #[test]
