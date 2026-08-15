@@ -2825,6 +2825,111 @@ impl crate::app::App {
                         ui.hyperlink_to("設定手順を開く", REMOTE_MANUAL_URL);
                     });
                 }
+                if let Some(probe) = tailnet_probe.as_ref()
+                    && let Some(elements) = tailnet_elements
+                    && elements.show_details
+                {
+                    ui.label(format!(
+                        "HTTPS 証明書: {}",
+                        remote_https_certificate_status_label(probe.https_certificate)
+                    ));
+                    if probe.https_certificate == RemoteWebFeatureStatus::NotConfigured {
+                        ui.colored_label(
+                            ui.visuals().warn_fg_color,
+                            "tailnet で HTTPS 証明書が有効になっていないため、tailscale serve を設定できません。",
+                        );
+                        ui.label(
+                            "Tailscale 管理コンソールの DNS ページで HTTPS 証明書を有効にしてください。",
+                        );
+                        ui.hyperlink_to(
+                            "Tailscale の DNS 設定を開く",
+                            REMOTE_TAILSCALE_DNS_URL,
+                        );
+                    }
+                    show_remote_key_expiry(
+                        ui,
+                        probe.key_expiry_unix_seconds,
+                        key_expiry_display,
+                    );
+                    ui.label(format!(
+                        "tailscale serve: {}",
+                        remote_feature_status_label(probe.serve)
+                    ));
+                    if elements.serve.show_unknown_message || elements.show_state_unreadable {
+                        ui.label("Tailscale は見つかりましたが、現在の状態を読み取れません。");
+                    }
+                    if elements.serve.show_setup_button {
+                        ui.label(format!(
+                            "この PC の {serve_port} 番を、tailnet 内から HTTPS で開けるようにします。"
+                        ));
+                        ui.label("TLS は Tailscale が処理します。インターネットには公開されません。");
+                        ui.label("実行するコマンド:");
+                        ui.monospace(format!("tailscale serve --bg {serve_port}"));
+                        if elements.serve.show_unsupported_path_warning
+                            && let Some(path) =
+                                probe.serve_unsupported_path.as_deref()
+                        {
+                            ui.colored_label(
+                                ui.visuals().warn_fg_color,
+                                format!(
+                                    "tailscale serve は {path} に設定されています。mImageViewer はパスを付けた公開に対応していないため、この URL では接続できません。"
+                                ),
+                            );
+                        }
+                        if elements.serve.show_conflict_warning
+                            && let Some(conflict) = probe.serve_conflict.as_deref()
+                        {
+                            let error_color = ui.visuals().error_fg_color;
+                            ui.colored_label(
+                                error_color,
+                                format!(
+                                    "現在 tailscale serve の / は {conflict} に割り当てられています。設定すると置き換わります。"
+                                ),
+                            );
+                        }
+                        let running = matches!(
+                            &dialog.tailscale_serve_setup,
+                            RemoteTailscaleServeSetupState::Running { .. }
+                        );
+                        let awaiting_refresh = matches!(
+                            &dialog.tailscale_serve_setup,
+                            RemoteTailscaleServeSetupState::Finished(Ok(()))
+                        );
+                        if ui
+                            .add_enabled(
+                                elements.serve.setup_button_enabled && !running && !awaiting_refresh,
+                                egui::Button::new("tailscale serve を設定する")
+                                    .min_size(egui::vec2(220.0, 34.0)),
+                            )
+                            .clicked()
+                        {
+                            begin_tailscale_serve_setup = true;
+                        }
+                    }
+                    if elements.serve.show_removal_note {
+                        ui.small("解除は Tailscale 側で行ってください。");
+                    }
+                }
+                if !matches!(
+                    &dialog.tailscale_serve_setup,
+                    RemoteTailscaleServeSetupState::Idle
+                ) {
+                    match &dialog.tailscale_serve_setup {
+                        RemoteTailscaleServeSetupState::Running { .. } => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("tailscale serve を設定しています...");
+                            });
+                        }
+                        RemoteTailscaleServeSetupState::Finished(Ok(())) => {
+                            ui.label("設定しました。接続状態を再確認しています...");
+                        }
+                        RemoteTailscaleServeSetupState::Finished(Err(error)) => {
+                            ui.colored_label(ui.visuals().error_fg_color, error);
+                        }
+                        RemoteTailscaleServeSetupState::Idle => {}
+                    }
+                }
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("PIN:");
@@ -3024,115 +3129,6 @@ impl crate::app::App {
                     }
                 }
 
-                if let Some(probe) = tailnet_probe.as_ref()
-                    && let Some(elements) = tailnet_elements
-                    && elements.show_details
-                {
-                    ui.separator();
-                    ui.label(format!(
-                        "HTTPS 証明書: {}",
-                        remote_https_certificate_status_label(probe.https_certificate)
-                    ));
-                    if probe.https_certificate == RemoteWebFeatureStatus::NotConfigured {
-                        ui.colored_label(
-                            ui.visuals().warn_fg_color,
-                            "tailnet で HTTPS 証明書が有効になっていないため、tailscale serve を設定できません。",
-                        );
-                        ui.label(
-                            "Tailscale 管理コンソールの DNS ページで HTTPS 証明書を有効にしてください。",
-                        );
-                        ui.hyperlink_to(
-                            "Tailscale の DNS 設定を開く",
-                            REMOTE_TAILSCALE_DNS_URL,
-                        );
-                    }
-                    show_remote_key_expiry(
-                        ui,
-                        probe.key_expiry_unix_seconds,
-                        key_expiry_display,
-                    );
-                    ui.label(format!(
-                        "tailscale serve: {}",
-                        remote_feature_status_label(probe.serve)
-                    ));
-                    if elements.serve.show_unknown_message || elements.show_state_unreadable {
-                        ui.label("Tailscale は見つかりましたが、現在の状態を読み取れません。");
-                    }
-                    if elements.serve.show_setup_button {
-                        ui.label(format!(
-                            "この PC の {serve_port} 番を、tailnet 内から HTTPS で開けるようにします。"
-                        ));
-                        ui.label("TLS は Tailscale が処理します。インターネットには公開されません。");
-                        ui.label("実行するコマンド:");
-                        ui.monospace(format!("tailscale serve --bg {serve_port}"));
-                        if elements.serve.show_unsupported_path_warning
-                            && let Some(path) =
-                                probe.serve_unsupported_path.as_deref()
-                        {
-                            ui.colored_label(
-                                ui.visuals().warn_fg_color,
-                                format!(
-                                    "tailscale serve は {path} に設定されています。mImageViewer はパスを付けた公開に対応していないため、この URL では接続できません。"
-                                ),
-                            );
-                        }
-                        if elements.serve.show_conflict_warning
-                            && let Some(conflict) = probe.serve_conflict.as_deref()
-                        {
-                            let error_color = ui.visuals().error_fg_color;
-                            ui.colored_label(
-                                error_color,
-                                format!(
-                                    "現在 tailscale serve の / は {conflict} に割り当てられています。設定すると置き換わります。"
-                                ),
-                            );
-                        }
-                        let running = matches!(
-                            &dialog.tailscale_serve_setup,
-                            RemoteTailscaleServeSetupState::Running { .. }
-                        );
-                        let awaiting_refresh = matches!(
-                            &dialog.tailscale_serve_setup,
-                            RemoteTailscaleServeSetupState::Finished(Ok(()))
-                        );
-                        if ui
-                            .add_enabled(
-                                elements.serve.setup_button_enabled && !running && !awaiting_refresh,
-                                egui::Button::new("tailscale serve を設定する")
-                                    .min_size(egui::vec2(220.0, 34.0)),
-                            )
-                            .clicked()
-                        {
-                            begin_tailscale_serve_setup = true;
-                        }
-                    }
-                    if elements.serve.show_removal_note {
-                        ui.small("解除は Tailscale 側で行ってください。");
-                    }
-                }
-                if !matches!(
-                    &dialog.tailscale_serve_setup,
-                    RemoteTailscaleServeSetupState::Idle
-                ) {
-                    if !tailnet_elements.is_some_and(|elements| elements.show_details) {
-                        ui.separator();
-                    }
-                    match &dialog.tailscale_serve_setup {
-                        RemoteTailscaleServeSetupState::Running { .. } => {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label("tailscale serve を設定しています...");
-                            });
-                        }
-                        RemoteTailscaleServeSetupState::Finished(Ok(())) => {
-                            ui.label("設定しました。接続状態を再確認しています...");
-                        }
-                        RemoteTailscaleServeSetupState::Finished(Err(error)) => {
-                            ui.colored_label(ui.visuals().error_fg_color, error);
-                        }
-                        RemoteTailscaleServeSetupState::Idle => {}
-                    }
-                }
                 if let Some(info) = info.as_ref()
                     && remote_connection_url_visible(accepting, info.tailscale_serve)
                 {
