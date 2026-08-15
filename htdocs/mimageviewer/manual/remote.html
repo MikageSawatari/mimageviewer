@@ -118,9 +118,11 @@
           <tr><th>表示</th><th>意味</th></tr>
         </thead>
         <tbody>
+          <tr><td>Tailscale</td><td><strong>見つかりました</strong> / <strong>見つかりません</strong> / <strong>確認できません</strong>。ウィンドウを開いたときに確認し、<strong>「再確認」</strong>で読み直せます。見つからないときは PIN より前に入手先を案内します</td></tr>
           <tr><td>PIN</td><td><strong>設定済み</strong> / <strong>未設定</strong>。未設定のうちは有効にできません</td></tr>
           <tr><td>状態</td><td>待ち受けの状況。有効にした直後は準備中になり、接続先が決まると受付中になります</td></tr>
           <tr><td>利用状況</td><td>いま接続している端末があるかどうか（台数は表示しません）</td></tr>
+          <tr><td>HTTPS 証明書</td><td>Tailscale 側で有効かどうか。無効のときは管理画面への案内が出ます</td></tr>
           <tr><td>tailscale serve</td><td><strong>設定済み</strong> / <strong>未設定</strong> / <strong>確認できません</strong>。未設定のときや、パスを付けて公開している場合は、実行する内容とコマンドを示したうえで設定ボタンが出ます</td></tr>
           <tr><td>接続キーの有効期限</td><td>期限がある場合だけ表示します。期限が近い、または切れている場合は強調表示します</td></tr>
           <tr><td>QR コード / URL</td><td>接続先です。QR コードに含まれるのは接続先だけで、PIN は含まれません</td></tr>
@@ -142,7 +144,8 @@
     <p>
       外出先のブラウザから HTTPS で開けるようにする設定です。mImageViewer が代わりに実行します。
       <strong>ボタンを押すまでは何も変更しません。</strong>すでに別のものを公開している場合は、
-      置き換わることを表示します。解除したいときは Tailscale 側で行います。
+      置き換わることを表示します。リモート接続が無効のままでも確認・設定できます。
+      解除したいときは Tailscale 側で行います。
     </p>
     <p>
       <code>/miv</code> のようにパスを付けて公開している場合、その URL では表示できません。
@@ -309,10 +312,9 @@
       期限が表示されているうちに管理画面で期限をなくしておくと安心です。</li>
     </ul>
     <p>
-      接続ダイアログに出る Tailscale の状態は、<strong>リモート接続を有効にした時点のもの</strong>です。
-      あとから管理画面で設定を変えたときは、いったん<strong>無効にしてから、もう一度有効に</strong>
-      してください。<strong>「tailscale serve を設定する」</strong>を押した場合だけは、
-      mImageViewer が自分でつなぎ直すのでその操作は要りません。
+      接続ダイアログを開くと、Tailscale の現在の状態を確認します。ダイアログを開いたまま
+      管理画面やコマンドで設定を変えたときは、<strong>「再確認」</strong>を押してください。
+      <strong>「tailscale serve を設定する」</strong>を押したあとは、自動で再確認します。
     </p>
 
     <h2 id="trouble">うまくいかないとき</h2>
@@ -322,6 +324,7 @@
           <tr><th>症状</th><th>確認すること</th></tr>
         </thead>
         <tbody>
+          <tr><td>Tailscale が見つからない</td><td>接続ダイアログの案内から Tailscale を入れ、この PC でサインインしてから「再確認」を押す</td></tr>
           <tr><td>有効にできない</td><td>PIN が未設定です。先に PIN を決めてください</td></tr>
           <tr><td>URL を開いても表示されない</td><td>手元の端末が Tailscale にサインインしているか。自宅 PC がスリープしていないか</td></tr>
           <tr><td>外出先から急につながらなくなった</td><td>接続キーの有効期限が切れていないか（自宅に戻ってから確認します）</td></tr>

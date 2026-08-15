@@ -2510,9 +2510,15 @@ stream / Service Worker は origin root を正本とするため、`/miv` のよ
 root を優先して設定済みとする。
 
 設定変更は接続ダイアログに `tailscale serve --bg <port>` そのものと意味を示し、利用者が押したときだけ
-owner worker が最大 8 秒の CLI 実行を行う。成功時は所有する remote-web child を再起動する。本体から
-remote-web へ状態再読込を要求する IPC は無く、再起動で `choose_connection_url` を走らせ直すことが
-再検出の手段だからである。JSON の解釈は引き続き remote-web だけが所有し、本体は独自検出しない。
+owner worker が最大 8 秒の CLI 実行を行う。成功時は所有する remote-web child を再起動し、その service が
+実際に配信する公開 URL を起動時に選び直す。serve の確認と設定ボタンは service の稼働には依存せず、
+リモート接続が無効の間も表示・操作できる。
+
+tailnet JSON の解釈は `mimageviewer-ipc` の共有 probe が 1 つだけ持ち、本体と remote-web はそれを呼ぶ。
+remote-web は起動時に 1 回読んで自分の公開 URL を決める。本体は接続ダイアログの案内のため、ダイアログを
+開いたとき、利用者が再確認を押したとき、serve 設定の成否が返ったときに随時読み直す。両者は同じ関数を
+通るので解釈が分かれない。本体から remote-web へ状態再読込を要求する逆向き IPC は追加しない。service が
+停止中でも本体自身が確認できることが、PIN や有効化より先に不足を案内するための不変条件である。
 
 解除の代行は行わない。Tailscale 1.98 の documented な解除は対象限定を保証できず、`reset` は利用者の
 別用途の serve 設定まで消すためである。今回は Tailscale 側で解除する案内だけを出す。将来代行するなら
@@ -2521,16 +2527,21 @@ remote-web へ状態再読込を要求する IPC は無く、再起動で `choos
 
 ### 14.16 tailnet 前提条件の検出と案内 (2026-08-12)
 
-`tailscale status --json` は接続 URL の組み立て時に remote-web が既に読むため、同じ JSON の
-top-level `CertDomains` と `Self.KeyExpiry` から前提条件も検出する。`CertDomains` が 1 件以上なら
+`tailscale status --json` の top-level `CertDomains` と `Self.KeyExpiry` から前提条件を検出する。
+解釈は §14.15 の共有 probe に集約し、remote-web の起動時 URL 選択と本体の随時確認で重複実装しない。
+`CertDomains` が 1 件以上なら
 HTTPS 証明書を有効、空または欠落なら無効とし、CLI の不在・実行失敗・JSON 不正は不明にする。
 `Self.KeyExpiry` は解釈できる RFC3339 文字列だけを unix 秒へ変換し、null・欠落・解釈不能は
-情報なしとして運ぶ。JSON の解釈は引き続き remote-web が所有し、本体は v47 の型付き結果だけを表示する。
+情報なしとする。CLI 自体が見つからない場合は実行失敗・JSON 不正と区別し、PIN 行より前に Tailscale を
+インストールする案内と入手先を表示する。CLI はあるが状態を読めない場合は別の案内にする。
 
 HTTPS 証明書が無効なら `tailscale serve` は証明書を取得できず必ず失敗するため、接続ダイアログは
 serve 設定ボタンだけを無効にし、Tailscale 管理コンソールの DNS ページへ案内する。不明時は従来どおり
 状態を読み取れない旨を示し、serve ボタンの可否は変えない。リモート接続自体の有効化は PIN だけで決め、
-証明書や期限では止めない。ローカルの `http://127.0.0.1` 確認経路を残すためである。
+証明書、期限、Tailscale の有無では止めない。ローカルの `http://127.0.0.1` 確認経路を残すためである。
+公開 URL と QR コードだけは共有 probe の候補 URL ではなく、接続中の remote-web が通知した
+`RemoteWebConnectionInfo.public_url` を使う。これは tailnet の現在候補ではなく、service が実際に
+配信している場所だからである。
 
 期限が得られた場合は日付と残り日数を表示し、30 日以内と期限切れを警告色にする。期限切れでは
 PC が tailnet から外れて外出先から接続できないことを明示し、デバイス一覧へ案内する。情報なしでは

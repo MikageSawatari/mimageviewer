@@ -112,9 +112,9 @@
     <h2>準備する</h2>
     <p>
       <strong>1 から順に進めてください。</strong>1 と 2 は Tailscale 側での作業で、
-      <strong>mImageViewer からは変更できません</strong>。ここを飛ばして 3 から始めると、
-      5 の<strong>「tailscale serve を設定する」</strong>まで来たところで止まり、
-      戻ってやり直すことになります。
+      <strong>mImageViewer からは変更できません</strong>。接続ダイアログを開くと現在の状態を
+      自動で確認します。ダイアログを開いたまま Tailscale 側を変更したときは、
+      <strong>「再確認」</strong>を押してください。
     </p>
     <ol>
       <li><strong>Tailscale を入れる。</strong>いちばん最初にこれをします。
@@ -122,35 +122,24 @@
       <strong>自宅 PC と外出先で使う端末の両方</strong>に入れて、<strong>同じアカウント</strong>で
       サインインしてください。これで 2 台が同じネットワークに入ります。</li>
       <li><strong>Tailscale の管理画面で HTTPS の証明書を有効にする。</strong>
-      これも先にやっておきます。5 で必要になりますが、<strong>mImageViewer 側からは
-      変更できません</strong>。有効になっていないと、5 の設定ボタンを押せません。
+      これも先にやっておきます。3 で必要になりますが、<strong>mImageViewer 側からは
+      変更できません</strong>。有効になっていないと、3 の設定ボタンを押せません。
       mImageViewer 側の設定は、ここまでが終わってからです。</li>
-      <li><strong>PIN を決める。</strong>ここからは自宅 PC の mImageViewer で、メニューの
-      <strong>設定 → リモート接続…</strong>を開いて進めます（このウィンドウでの操作はその場で
-      反映されます）。<strong>PIN: 未設定</strong>と表示されているときは
+      <li><strong>外から HTTPS で開けるようにする。</strong>ここからは自宅 PC の
+      mImageViewer で、メニューの<strong>設定 → リモート接続…</strong>を開いて進めます。
+      <strong>tailscale serve: 未設定</strong>と出ている場合は、実行する内容とコマンドが
+      表示されるので、<strong>「tailscale serve を設定する」</strong>を押してください。
+      mImageViewer が代わりに設定します。リモート接続が無効のままでも設定できます。
+      押すまでは何も変更しません。</li>
+      <li><strong>PIN を決める。</strong>同じウィンドウで続けます（このウィンドウでの操作は
+      その場で反映されます）。<strong>PIN: 未設定</strong>と表示されているときは
       入力欄が開いています。6 文字以上で決めて<strong>「設定」</strong>を押してください。
       外出先から接続するたびに入力するもので、そのとき自宅 PC の画面は見られないので、
       覚えられるものにします。あとから<strong>「PIN を変更」</strong>で変えられます。</li>
       <li><strong>有効にする。</strong><strong>「リモート接続を有効にする」</strong>を押します。
       押した時点で待ち受けが始まります。しばらくすると接続先の URL と QR コードが
       同じウィンドウに出ます。</li>
-      <li><strong>外から HTTPS で開けるようにする。</strong>
-      <strong>tailscale serve: 未設定</strong>と出ている場合は、実行する内容と
-      コマンドが表示されるので、<strong>「tailscale serve を設定する」</strong>を押してください。
-      mImageViewer が代わりに設定します。押すまでは何も変更しません。</li>
     </ol>
-    <div class="box warn">
-      <span class="box-icon">⚠️</span>
-      <div class="box-body">
-        <strong>あとから Tailscale 側の設定を変えたときは、いったん
-        「リモート接続を無効にする」を押してから、もう一度有効にしてください。</strong>
-        mImageViewer が Tailscale の状態を見るのは<strong>有効にした瞬間だけ</strong>です。
-        たとえば 2 を飛ばして進み、あとで管理画面で HTTPS の証明書を有効にしても、
-        そのままでは<strong>tailscale serve</strong> の表示や設定ボタンが古いままになります。
-        （<strong>「tailscale serve を設定する」</strong>を押した場合は、mImageViewer が
-        自分でつなぎ直すので、この操作は要りません。）
-      </div>
-    </div>
     <div class="box info">
       <span class="box-icon">ℹ️</span>
       <div class="box-body">
@@ -175,7 +164,7 @@
     <ul>
       <li><strong>HTTPS の証明書が有効になっていない。</strong>この状態では
       <strong>「tailscale serve を設定する」</strong>を押せません。管理画面で有効にしたあと、
-      いったんリモート接続を無効にしてから、もう一度有効にしてください（上の注意）。</li>
+      接続ダイアログの<strong>「再確認」</strong>を押してください。</li>
       <li><strong>接続キーの有効期限が近い、または切れている。</strong>期限が切れると
       その PC が Tailscale ネットワークから外れ、<strong>外出先から接続できなくなります</strong>。
       気付くのはたいてい外出先なので、期限が表示されているうちに、管理画面で期限をなくしておくと

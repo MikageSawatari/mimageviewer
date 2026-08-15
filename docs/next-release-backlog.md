@@ -1736,41 +1736,6 @@ docs/conceal-feature-plan.md
   (起動直後に足すと今度は起動が遅くなる)。
 - 規模 / 優先度: 小〜中 / P3。
 
-### 1.88 リモート接続ダイアログが「Tailscale がまだ無い」ことを先に言わない — 利用者報告
-
-- 出典: 2026-08-15、利用者自身の v3.0.0 リモート実機テスト。
-- 何が起きたか: マニュアルの「準備する」の**1 行目 (先に Tailscale を入れる) を読み飛ばし**、
-  PIN 設定・有効化まで進んでから `tailscale serve` の設定で進めなくなった。
-- マニュアル側は対応済み: `tut-remote.html` の番号付き手順の **1 番を「Tailscale を入れる」**
-  に独立させ、飛ばすとどこで止まるかを冒頭に書いた。
-- **アプリ側は未対応** (この報告時点で v3.0.0 のバイナリは署名済みだったため見送り)。
-  ダイアログは PIN 入力欄が先頭にあり、Tailscale の有無に触れないまま始められる。
-  利用者から見ると、止まるのは 2 手あとの serve 設定。
-- 案: ダイアログ上部で Tailscale の検出状態を出し、未検出なら PIN より前に「先に Tailscale を
-  入れる」を示す。`TailscaleCommandError::NotFound`
-  (crates/remote-ipc/src/tailscale.rs) が既にあるので、状態を引く口はある。
-- 規模 / 優先度: 小 / P2。次版で入れる。
-
-**同じ報告で出た 2 つめ: tailnet の状態を有効化の瞬間にしか読まない。**
-
-- 利用者は HTTPS 証明書の要件に**あとから**気付き、管理画面で有効にした。しかし
-  ダイアログの表示が変わらず、**無効 → 有効**をやり直して初めて反映された。
-- 構造: `choose_connection_url` は remote service の `run()` で **1 回だけ**呼ばれ、
-  結果 (`tailscale_serve` / `tailscale_https_certificate` / key expiry) を
-  `set_remote_web_connection_info` で焼き付ける (crates/remote-web/src/main.rs 55-64)。
-  以後ポーリングしない。ダイアログ側の `info` は動いている service の snapshot なので
-  (src/remote_ipc/ui.rs 2660)、**service を再起動しない限り古いまま**。
-- そのため **手順の 3 (有効にする) と 4 (serve 設定) は入れ替えられない**。無効の間は
-  service が動いておらず、serve の状態も設定ボタンも存在しない。
-- 自力で直る経路は 1 つだけある: アプリ内の「tailscale serve を設定する」を押した場合、
-  `tailscale_serve_completion_plan` が service を再起動する (src/remote_ipc/service.rs 266-274)。
-  外 (管理画面 / コマンドライン) で変えた場合だけ取り残される。
-- 案: ダイアログを開いたとき / 明示の「再確認」で tailnet 状態を引き直す。service の
-  再起動なしに読める形 (core 側から `tailscale` を叩く) にするか、service へ再取得 IPC を足す。
-- マニュアル側は現状の挙動に合わせて書いた (`tut-remote.html` / `remote.html` に
-  「Tailscale 側を変えたら無効→有効」を明記)。直したらこの記述も消す。
-- 規模 / 優先度: 小〜中 / P2。上の 1 件と同時に直すのが自然。
-
 ### 1.89 フルスクリーンの先頭・末尾通知と先読み状況を非表示にできるようにする — 利用者要望
 
 - 出典: 5ch 専用スレ >>222 / >>225 (2026-08-15)。ページ送りの先頭・末尾で出る

@@ -3,12 +3,14 @@
 //! GUI や Windows API には依存せず、型・版数・長さ付きフレームだけを共有する。
 
 mod auth;
+mod tailnet;
 mod tailscale;
 
 pub use auth::{
     AUTH_FILE_VERSION, AuthRecord, MAX_PIN_CHARS, MIN_PIN_CHARS, load_pin_file, production_argon2,
     rotate_session_secret_file, set_pin_file, validate_pin, validate_record,
 };
+pub use tailnet::{TailnetProbe, probe_tailnet};
 pub use tailscale::{
     DEFAULT_REMOTE_PORT, TAILSCALE_COMMAND_TIMEOUT, TailscaleCommandError, TailscaleCommandOutput,
     run_tailscale, run_tailscale_at, tailscale_executable,
@@ -1321,9 +1323,10 @@ pub struct SessionPeerInfo {
     pub device_name: Option<String>,
 }
 
-/// remote-web が確定した公開 URL と、その接続準備状態。
+/// remote-web が起動時に確定した公開 URL と、その時点の接続準備状態。
 ///
-/// URL の意味づけは remote-web が所有し、本体はこの値を再検出せず表示だけに使う。
+/// 公開 URL は実際に配信している remote-web の snapshot として本体が表示する。
+/// tailnet の現在状態を案内するときは `probe_tailnet` を使い、この snapshot を再利用しない。
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct RemoteWebConnectionInfo {
     pub public_url: String,

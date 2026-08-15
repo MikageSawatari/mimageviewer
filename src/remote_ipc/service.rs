@@ -1,4 +1,5 @@
 use std::io::{BufRead, BufReader};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -89,6 +90,7 @@ enum RemoteServiceCommand {
 
 pub(crate) type RemotePinUpdateReceiver = mpsc::Receiver<Result<(), String>>;
 pub(crate) type RemoteSessionSecretRotationReceiver = mpsc::Receiver<Result<(), String>>;
+pub(crate) type RemoteTailnetProbeReceiver = mpsc::Receiver<mimageviewer_ipc::TailnetProbe>;
 pub(crate) type RemoteTailscaleServeReceiver =
     mpsc::Receiver<Result<(), mimageviewer_ipc::TailscaleCommandError>>;
 
@@ -139,6 +141,13 @@ impl RemoteServiceControl {
             .send(RemoteServiceCommand::RotateSessionSecret { reply })
             .map_err(|_| "すべての端末のログアウトを開始できませんでした".to_owned())?;
         Ok(receiver)
+    }
+
+    pub(crate) fn probe_tailnet(&self) -> Result<RemoteTailnetProbeReceiver, String> {
+        // remote_command は --bind を渡さないため、remote-web もこの loopback address を使う。
+        // 実際の service port と同じ出所にしないと、serve の proxy target を誤判定する。
+        let address = SocketAddr::new(IpAddr::from([127, 0, 0, 1]), self.port);
+        spawn_tailnet_probe_with(address, mimageviewer_ipc::probe_tailnet)
     }
 
     pub(crate) fn configure_tailscale_serve(&self) -> Result<RemoteTailscaleServeReceiver, String> {
@@ -324,6 +333,20 @@ fn tailscale_serve_completion_plan(
     } else {
         TailscaleServeCompletionPlan::KeepProcess
     }
+}
+
+fn spawn_tailnet_probe_with(
+    address: SocketAddr,
+    probe: impl FnOnce(SocketAddr) -> mimageviewer_ipc::TailnetProbe + Send + 'static,
+) -> Result<RemoteTailnetProbeReceiver, String> {
+    let (reply, receiver) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("remote-tailnet-probe".to_owned())
+        .spawn(move || {
+            let _ = reply.send(probe(address));
+        })
+        .map_err(|error| format!("Tailscale の状態確認を開始できません: {error}"))?;
+    Ok(receiver)
 }
 
 fn configure_tailscale_serve(port: u16) -> Result<(), mimageviewer_ipc::TailscaleCommandError> {
@@ -547,6 +570,32 @@ mod tests {
             rx.recv().unwrap(),
             RemoteServiceCommand::RotateSessionSecret { .. }
         ));
+    }
+
+    #[test]
+    fn tailnet_probe_runs_on_a_dedicated_thread_with_the_service_address() {
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let receiver =
+            spawn_tailnet_probe_with("127.0.0.1:4242".parse().unwrap(), move |address| {
+                observed_tx
+                    .send((std::thread::current().name().map(str::to_owned), address))
+                    .unwrap();
+                mimageviewer_ipc::TailnetProbe {
+                    cli_found: true,
+                    serve: mimageviewer_ipc::RemoteWebFeatureStatus::Unknown,
+                    serve_url: None,
+                    serve_conflict: None,
+                    serve_unsupported_path: None,
+                    status_url: None,
+                    https_certificate: mimageviewer_ipc::RemoteWebFeatureStatus::Unknown,
+                    key_expiry_unix_seconds: None,
+                }
+            })
+            .unwrap();
+        let (thread_name, address) = observed_rx.recv().unwrap();
+        assert_eq!(thread_name.as_deref(), Some("remote-tailnet-probe"));
+        assert_eq!(address, "127.0.0.1:4242".parse().unwrap());
+        assert!(receiver.recv().unwrap().cli_found);
     }
 
     #[test]

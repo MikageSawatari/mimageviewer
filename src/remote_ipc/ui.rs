@@ -3,7 +3,7 @@ use mimageviewer_ipc::{
     RemoteAiModelCatalog, RemoteAiModelOption, RemoteItemState, RemoteReadingDirection,
     RemoteSessionIdentity, RemoteSpreadMode, RemoteSubresource, RemoteWebFeatureStatus,
     RemoteWriteError, RemoteWriteErrorCode, RemoteWriteRequest, RemoteWriteResponse,
-    RemoteWriteResult, SessionConnectionKind, SessionResponse, SessionStatus,
+    RemoteWriteResult, SessionConnectionKind, SessionResponse, SessionStatus, TailnetProbe,
     VideoStreamControlAction, VideoStreamEndBehavior, VideoStreamError, VideoStreamErrorCode,
 };
 use qrcode::{Color, QrCode};
@@ -27,6 +27,7 @@ const REMOTE_ENABLE_WARNING_EMPHASIS: &str = "すべてのドライブについ�
 const REMOTE_ENABLE_WARNING_SUFFIX: &str =
     "が、この PC の Tailscale アドレスへ接続でき、PIN を知っている人から見えるようになります。";
 const REMOTE_MANUAL_URL: &str = "https://mikage.to/mimageviewer/manual/tut-remote.html";
+const REMOTE_TAILSCALE_DOWNLOAD_URL: &str = "https://tailscale.com/download/windows";
 const REMOTE_TAILSCALE_DNS_URL: &str = "https://console.tailscale.com/admin/dns";
 const REMOTE_TAILSCALE_MACHINES_URL: &str = "https://console.tailscale.com/admin/machines";
 const REMOTE_KEY_EXPIRY_WARNING_DAYS: i64 = 30;
@@ -52,6 +53,7 @@ pub(crate) struct RemoteSessionUiState {
 
 struct RemoteConnectionDialogState {
     pin_editor: RemotePinEditorState,
+    tailnet_probe: RemoteTailnetProbeState,
     tailscale_serve_setup: RemoteTailscaleServeSetupState,
 }
 
@@ -73,6 +75,41 @@ enum RemoteTailscaleServeSetupState {
         receiver: super::service::RemoteTailscaleServeReceiver,
     },
     Finished(Result<(), String>),
+}
+
+enum RemoteTailnetProbeState {
+    Idle,
+    Running {
+        receiver: super::service::RemoteTailnetProbeReceiver,
+        previous: Option<TailnetProbe>,
+    },
+    Finished(TailnetProbe),
+    Failed {
+        error: String,
+        previous: Option<TailnetProbe>,
+    },
+}
+
+impl RemoteTailnetProbeState {
+    fn probe(&self) -> Option<&TailnetProbe> {
+        match self {
+            Self::Running { previous, .. } | Self::Failed { previous, .. } => previous.as_ref(),
+            Self::Finished(probe) => Some(probe),
+            Self::Idle => None,
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        matches!(self, Self::Running { .. })
+    }
+
+    fn start(&mut self, request: Result<super::service::RemoteTailnetProbeReceiver, String>) {
+        let previous = self.probe().cloned();
+        *self = match request {
+            Ok(receiver) => Self::Running { receiver, previous },
+            Err(error) => Self::Failed { error, previous },
+        };
+    }
 }
 
 enum RemoteSessionLogoutState {
@@ -257,6 +294,7 @@ impl RemoteConnectionDialogState {
                     request_focus: true,
                 }
             },
+            tailnet_probe: RemoteTailnetProbeState::Idle,
             tailscale_serve_setup: RemoteTailscaleServeSetupState::Idle,
         }
     }
@@ -274,6 +312,31 @@ struct RemoteTailscaleServeElements {
     show_unsupported_path_warning: bool,
     show_unknown_message: bool,
     show_removal_note: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RemoteTailnetElements {
+    show_install_guidance: bool,
+    show_state_unreadable: bool,
+    show_details: bool,
+    serve: RemoteTailscaleServeElements,
+}
+
+fn remote_tailnet_elements(probe: &TailnetProbe) -> RemoteTailnetElements {
+    let cli_found = probe.cli_found;
+    RemoteTailnetElements {
+        show_install_guidance: !cli_found,
+        show_state_unreadable: cli_found
+            && (probe.serve == RemoteWebFeatureStatus::Unknown
+                || probe.https_certificate == RemoteWebFeatureStatus::Unknown),
+        show_details: cli_found,
+        serve: remote_tailscale_serve_elements(
+            probe.serve,
+            probe.https_certificate,
+            probe.serve_conflict.is_some(),
+            probe.serve_unsupported_path.is_some(),
+        ),
+    }
 }
 
 fn remote_tailscale_serve_elements(
@@ -600,13 +663,16 @@ impl crate::app::App {
     }
 
     pub(crate) fn open_remote_connection_dialog(&mut self) {
-        let pin_configured = self
-            .remote_session_ui
-            .remote_service_control
-            .as_ref()
-            .is_some_and(super::RemoteServiceControl::pin_configured);
-        self.remote_session_ui.connection_dialog =
-            Some(RemoteConnectionDialogState::new(pin_configured));
+        let service_control = self.remote_session_ui.remote_service_control.as_ref();
+        let pin_configured =
+            service_control.is_some_and(super::RemoteServiceControl::pin_configured);
+        let mut dialog = RemoteConnectionDialogState::new(pin_configured);
+        dialog.tailnet_probe.start(
+            service_control
+                .ok_or_else(|| "Tailscale の状態確認を開始できませんでした".to_owned())
+                .and_then(super::RemoteServiceControl::probe_tailnet),
+        );
+        self.remote_session_ui.connection_dialog = Some(dialog);
     }
 
     pub(crate) fn remote_connection_dialog_open(&self) -> bool {
@@ -2591,6 +2657,32 @@ impl crate::app::App {
         let Some(mut dialog) = self.remote_session_ui.connection_dialog.take() else {
             return;
         };
+        let service_control = self.remote_session_ui.remote_service_control.clone();
+        let tailnet_probe_result = match &dialog.tailnet_probe {
+            RemoteTailnetProbeState::Running { receiver, previous } => match receiver.try_recv() {
+                Ok(probe) => Some(Ok(probe)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err((
+                    "Tailscale の状態確認結果を受け取れませんでした".to_owned(),
+                    previous.clone(),
+                ))),
+            },
+            RemoteTailnetProbeState::Idle
+            | RemoteTailnetProbeState::Finished(_)
+            | RemoteTailnetProbeState::Failed { .. } => None,
+        };
+        if let Some(result) = tailnet_probe_result {
+            dialog.tailnet_probe = match result {
+                Ok(probe) => RemoteTailnetProbeState::Finished(probe),
+                Err((error, previous)) => RemoteTailnetProbeState::Failed { error, previous },
+            };
+            if matches!(
+                &dialog.tailscale_serve_setup,
+                RemoteTailscaleServeSetupState::Finished(Ok(()))
+            ) {
+                dialog.tailscale_serve_setup = RemoteTailscaleServeSetupState::Idle;
+            }
+        }
         let pin_update_result = match &dialog.pin_editor {
             RemotePinEditorState::Saving { receiver } => match receiver.try_recv() {
                 Ok(result) => Some(result),
@@ -2625,8 +2717,13 @@ impl crate::app::App {
         };
         if let Some(result) = tailscale_serve_result {
             dialog.tailscale_serve_setup = RemoteTailscaleServeSetupState::Finished(result);
+            dialog.tailnet_probe.start(
+                service_control
+                    .as_ref()
+                    .ok_or_else(|| "Tailscale の状態確認を開始できませんでした".to_owned())
+                    .and_then(super::RemoteServiceControl::probe_tailnet),
+            );
         }
-        let service_control = self.remote_session_ui.remote_service_control.clone();
         let pin_configured = service_control
             .as_ref()
             .is_some_and(super::RemoteServiceControl::pin_configured);
@@ -2659,12 +2756,15 @@ impl crate::app::App {
         let info = snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.remote_web.clone());
-        if info
-            .as_ref()
-            .is_some_and(|info| info.tailscale_serve == RemoteWebFeatureStatus::Configured)
-        {
-            dialog.tailscale_serve_setup = RemoteTailscaleServeSetupState::Idle;
-        }
+        let tailnet_probe = dialog.tailnet_probe.probe().cloned();
+        let tailnet_elements = tailnet_probe.as_ref().map(remote_tailnet_elements);
+        let tailnet_probe_running = dialog.tailnet_probe.is_running();
+        let tailnet_probe_error = match &dialog.tailnet_probe {
+            RemoteTailnetProbeState::Failed { error, .. } => Some(error.clone()),
+            RemoteTailnetProbeState::Idle
+            | RemoteTailnetProbeState::Running { .. }
+            | RemoteTailnetProbeState::Finished(_) => None,
+        };
         let service_diagnostic = self
             .remote_session_ui
             .remote_service_status
@@ -2673,14 +2773,16 @@ impl crate::app::App {
             .unwrap_or(super::service::RemoteServiceDiagnostic::Stopped);
         let accepting = remote_web_connected && info.is_some();
         let key_expiry_display = remote_key_expiry_display(
-            info.as_ref()
-                .and_then(|info| info.tailscale_key_expiry_unix_seconds),
+            tailnet_probe
+                .as_ref()
+                .and_then(|probe| probe.key_expiry_unix_seconds),
             current_unix_seconds(),
         );
         let escape_pressed = self.dialog_escape_pressed(ctx);
         let mut open = true;
         let mut requested_enabled = None;
         let mut close_requested = false;
+        let mut begin_tailnet_probe = false;
         let mut begin_tailscale_serve_setup = false;
         let mut begin_session_logout = false;
         egui::Window::new("リモート接続")
@@ -2691,6 +2793,39 @@ impl crate::app::App {
             .open(&mut open)
             .show(ctx, |ui| {
                 let mut begin_pin_save = false;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Tailscale:");
+                    ui.strong(match tailnet_probe.as_ref() {
+                        Some(probe) if probe.cli_found => "見つかりました",
+                        Some(_) => "見つかりません",
+                        None if tailnet_probe_running => "確認中",
+                        None => "確認できません",
+                    });
+                    if tailnet_probe_running {
+                        ui.spinner();
+                    }
+                    if ui
+                        .add_enabled(!tailnet_probe_running, egui::Button::new("再確認"))
+                        .clicked()
+                    {
+                        begin_tailnet_probe = true;
+                    }
+                });
+                if let Some(error) = tailnet_probe_error.as_deref() {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+                if tailnet_elements.is_some_and(|elements| elements.show_install_guidance) {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        "リモート接続の準備には Tailscale が必要です。先にこの PC へインストールして、サインインしてください。",
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        ui.hyperlink_to("Tailscale を入手する", REMOTE_TAILSCALE_DOWNLOAD_URL);
+                        ui.separator();
+                        ui.hyperlink_to("設定手順を開く", REMOTE_MANUAL_URL);
+                    });
+                }
+                ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("PIN:");
                     ui.strong(if pin_configured {
@@ -2889,15 +3024,16 @@ impl crate::app::App {
                     }
                 }
 
-                if accepting && let Some(info) = info.as_ref() {
+                if let Some(probe) = tailnet_probe.as_ref()
+                    && let Some(elements) = tailnet_elements
+                    && elements.show_details
+                {
                     ui.separator();
                     ui.label(format!(
                         "HTTPS 証明書: {}",
-                        remote_https_certificate_status_label(info.tailscale_https_certificate)
+                        remote_https_certificate_status_label(probe.https_certificate)
                     ));
-                    if info.tailscale_https_certificate
-                        == RemoteWebFeatureStatus::NotConfigured
-                    {
+                    if probe.https_certificate == RemoteWebFeatureStatus::NotConfigured {
                         ui.colored_label(
                             ui.visuals().warn_fg_color,
                             "tailnet で HTTPS 証明書が有効になっていないため、tailscale serve を設定できません。",
@@ -2912,32 +3048,26 @@ impl crate::app::App {
                     }
                     show_remote_key_expiry(
                         ui,
-                        info.tailscale_key_expiry_unix_seconds,
+                        probe.key_expiry_unix_seconds,
                         key_expiry_display,
                     );
                     ui.label(format!(
                         "tailscale serve: {}",
-                        remote_feature_status_label(info.tailscale_serve)
+                        remote_feature_status_label(probe.serve)
                     ));
-                    let elements = remote_tailscale_serve_elements(
-                        info.tailscale_serve,
-                        info.tailscale_https_certificate,
-                        info.tailscale_serve_conflict.is_some(),
-                        info.tailscale_serve_unsupported_path.is_some(),
-                    );
-                    if elements.show_unknown_message {
-                        ui.label("Tailscale が見つからないか、状態を読み取れません。");
+                    if elements.serve.show_unknown_message || elements.show_state_unreadable {
+                        ui.label("Tailscale は見つかりましたが、現在の状態を読み取れません。");
                     }
-                    if elements.show_setup_button {
+                    if elements.serve.show_setup_button {
                         ui.label(format!(
                             "この PC の {serve_port} 番を、tailnet 内から HTTPS で開けるようにします。"
                         ));
                         ui.label("TLS は Tailscale が処理します。インターネットには公開されません。");
                         ui.label("実行するコマンド:");
                         ui.monospace(format!("tailscale serve --bg {serve_port}"));
-                        if elements.show_unsupported_path_warning
+                        if elements.serve.show_unsupported_path_warning
                             && let Some(path) =
-                                info.tailscale_serve_unsupported_path.as_deref()
+                                probe.serve_unsupported_path.as_deref()
                         {
                             ui.colored_label(
                                 ui.visuals().warn_fg_color,
@@ -2946,15 +3076,14 @@ impl crate::app::App {
                                 ),
                             );
                         }
-                        if elements.show_conflict_warning
-                            && let Some(conflict) = info.tailscale_serve_conflict.as_deref()
+                        if elements.serve.show_conflict_warning
+                            && let Some(conflict) = probe.serve_conflict.as_deref()
                         {
                             let error_color = ui.visuals().error_fg_color;
                             ui.colored_label(
                                 error_color,
                                 format!(
-                                    "現在 {} は {} に割り当てられています。設定すると置き換わります。",
-                                    info.public_url, conflict
+                                    "現在 tailscale serve の / は {conflict} に割り当てられています。設定すると置き換わります。"
                                 ),
                             );
                         }
@@ -2968,7 +3097,7 @@ impl crate::app::App {
                         );
                         if ui
                             .add_enabled(
-                                elements.setup_button_enabled && !running && !awaiting_refresh,
+                                elements.serve.setup_button_enabled && !running && !awaiting_refresh,
                                 egui::Button::new("tailscale serve を設定する")
                                     .min_size(egui::vec2(220.0, 34.0)),
                             )
@@ -2976,57 +3105,45 @@ impl crate::app::App {
                         {
                             begin_tailscale_serve_setup = true;
                         }
-                        match &dialog.tailscale_serve_setup {
-                            RemoteTailscaleServeSetupState::Running { .. } => {
-                                ui.horizontal(|ui| {
-                                    ui.spinner();
-                                    ui.label("tailscale serve を設定しています...");
-                                });
-                            }
-                            RemoteTailscaleServeSetupState::Finished(Ok(())) => {
-                                ui.label("設定しました。接続状態を再確認しています...");
-                            }
-                            RemoteTailscaleServeSetupState::Finished(Err(error)) => {
-                                ui.colored_label(ui.visuals().error_fg_color, error);
-                            }
-                            RemoteTailscaleServeSetupState::Idle => {}
-                        }
                     }
-                    if elements.show_removal_note {
+                    if elements.serve.show_removal_note {
                         ui.small("解除は Tailscale 側で行ってください。");
                     }
-                    if info.tailscale_serve == RemoteWebFeatureStatus::Configured {
-                        ui.add_space(6.0);
-                        paint_qr(ui, &info.public_url);
-                        ui.add_space(6.0);
-                        ui.horizontal_wrapped(|ui| {
-                            ui.monospace(&info.public_url);
-                            if ui.button("コピー").clicked() {
-                                ui.ctx().copy_text(info.public_url.clone());
-                            }
-                        });
-                        ui.small("QR コードには接続先だけが含まれ、PIN などの認証情報は含まれません。");
-                    }
                 }
-                if info.is_none() {
+                if !matches!(
+                    &dialog.tailscale_serve_setup,
+                    RemoteTailscaleServeSetupState::Idle
+                ) {
+                    if !tailnet_elements.is_some_and(|elements| elements.show_details) {
+                        ui.separator();
+                    }
                     match &dialog.tailscale_serve_setup {
                         RemoteTailscaleServeSetupState::Running { .. } => {
-                            ui.separator();
                             ui.horizontal(|ui| {
                                 ui.spinner();
                                 ui.label("tailscale serve を設定しています...");
                             });
                         }
                         RemoteTailscaleServeSetupState::Finished(Ok(())) => {
-                            ui.separator();
-                            ui.label("tailscale serve を設定しました。接続状態を再確認しています...");
+                            ui.label("設定しました。接続状態を再確認しています...");
                         }
                         RemoteTailscaleServeSetupState::Finished(Err(error)) => {
-                            ui.separator();
                             ui.colored_label(ui.visuals().error_fg_color, error);
                         }
                         RemoteTailscaleServeSetupState::Idle => {}
                     }
+                }
+                if accepting && let Some(info) = info.as_ref() {
+                    ui.separator();
+                    paint_qr(ui, &info.public_url);
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.monospace(&info.public_url);
+                        if ui.button("コピー").clicked() {
+                            ui.ctx().copy_text(info.public_url.clone());
+                        }
+                    });
+                    ui.small("QR コードには接続先だけが含まれ、PIN などの認証情報は含まれません。");
                 }
 
                 ui.separator();
@@ -3071,15 +3188,34 @@ impl crate::app::App {
             }
         }
 
+        if begin_tailnet_probe {
+            dialog.tailnet_probe.start(
+                service_control
+                    .as_ref()
+                    .ok_or_else(|| "Tailscale の状態確認を開始できませんでした".to_owned())
+                    .and_then(super::RemoteServiceControl::probe_tailnet),
+            );
+            ctx.request_repaint();
+        }
+
         if begin_tailscale_serve_setup {
-            dialog.tailscale_serve_setup = match service_control
+            let request = service_control
                 .as_ref()
                 .ok_or_else(|| "tailscale serve の設定を開始できませんでした".to_owned())
-                .and_then(super::RemoteServiceControl::configure_tailscale_serve)
-            {
+                .and_then(super::RemoteServiceControl::configure_tailscale_serve);
+            let start_failed = request.is_err();
+            dialog.tailscale_serve_setup = match request {
                 Ok(receiver) => RemoteTailscaleServeSetupState::Running { receiver },
                 Err(error) => RemoteTailscaleServeSetupState::Finished(Err(error)),
             };
+            if start_failed {
+                dialog.tailnet_probe.start(
+                    service_control
+                        .as_ref()
+                        .ok_or_else(|| "Tailscale の状態確認を開始できませんでした".to_owned())
+                        .and_then(super::RemoteServiceControl::probe_tailnet),
+                );
+            }
             ctx.request_repaint();
         }
 
@@ -3114,12 +3250,15 @@ impl crate::app::App {
                 &dialog.tailscale_serve_setup,
                 RemoteTailscaleServeSetupState::Running { .. }
             );
+            let tailnet_probe_running = dialog.tailnet_probe.is_running();
             self.remote_session_ui.connection_dialog = Some(dialog);
-            ctx.request_repaint_after(if pin_saving || tailscale_running {
-                std::time::Duration::from_millis(50)
-            } else {
-                std::time::Duration::from_secs(1)
-            });
+            ctx.request_repaint_after(
+                if pin_saving || tailscale_running || tailnet_probe_running {
+                    std::time::Duration::from_millis(50)
+                } else {
+                    std::time::Duration::from_secs(1)
+                },
+            );
         }
     }
 
@@ -3830,9 +3969,11 @@ mod tests {
     fn remote_connection_dialog_has_no_pending_enabled_state() {
         let RemoteConnectionDialogState {
             pin_editor,
+            tailnet_probe,
             tailscale_serve_setup,
         } = RemoteConnectionDialogState::new(false);
         assert!(matches!(pin_editor, RemotePinEditorState::Editing { .. }));
+        assert!(matches!(tailnet_probe, RemoteTailnetProbeState::Idle));
         assert!(matches!(
             tailscale_serve_setup,
             RemoteTailscaleServeSetupState::Idle
@@ -3840,9 +3981,11 @@ mod tests {
 
         let RemoteConnectionDialogState {
             pin_editor,
+            tailnet_probe,
             tailscale_serve_setup,
         } = RemoteConnectionDialogState::new(true);
         assert!(matches!(pin_editor, RemotePinEditorState::Hidden));
+        assert!(matches!(tailnet_probe, RemoteTailnetProbeState::Idle));
         assert!(matches!(
             tailscale_serve_setup,
             RemoteTailscaleServeSetupState::Idle
@@ -4100,6 +4243,53 @@ mod tests {
     }
 
     #[test]
+    fn tailnet_probe_elements_split_install_unreadable_certificate_and_serve_states() {
+        let probe = |cli_found, serve, https_certificate| TailnetProbe {
+            cli_found,
+            serve,
+            serve_url: None,
+            serve_conflict: None,
+            serve_unsupported_path: None,
+            status_url: None,
+            https_certificate,
+            key_expiry_unix_seconds: None,
+        };
+        let missing = remote_tailnet_elements(&probe(
+            false,
+            RemoteWebFeatureStatus::Unknown,
+            RemoteWebFeatureStatus::Unknown,
+        ));
+        assert!(missing.show_install_guidance);
+        assert!(!missing.show_state_unreadable);
+        assert!(!missing.show_details);
+
+        let unreadable = remote_tailnet_elements(&probe(
+            true,
+            RemoteWebFeatureStatus::Unknown,
+            RemoteWebFeatureStatus::Unknown,
+        ));
+        assert!(!unreadable.show_install_guidance);
+        assert!(unreadable.show_state_unreadable);
+        assert!(unreadable.show_details);
+
+        let certificate_disabled = remote_tailnet_elements(&probe(
+            true,
+            RemoteWebFeatureStatus::NotConfigured,
+            RemoteWebFeatureStatus::NotConfigured,
+        ));
+        assert!(certificate_disabled.serve.show_setup_button);
+        assert!(!certificate_disabled.serve.setup_button_enabled);
+
+        let serve_configured = remote_tailnet_elements(&probe(
+            true,
+            RemoteWebFeatureStatus::Configured,
+            RemoteWebFeatureStatus::Configured,
+        ));
+        assert!(!serve_configured.serve.show_setup_button);
+        assert!(serve_configured.serve.show_removal_note);
+    }
+
+    #[test]
     fn key_expiry_display_covers_warning_boundaries_without_inventing_unlimited_state() {
         const DAY: i64 = 86_400;
         let now = 1_700_000_000;
@@ -4138,6 +4328,10 @@ mod tests {
 
     #[test]
     fn tailnet_prerequisite_links_and_expiry_date_are_stable() {
+        assert_eq!(
+            REMOTE_TAILSCALE_DOWNLOAD_URL,
+            "https://tailscale.com/download/windows"
+        );
         assert_eq!(
             REMOTE_TAILSCALE_DNS_URL,
             "https://console.tailscale.com/admin/dns"
