@@ -13471,6 +13471,7 @@ impl App {
                         }
 
                         // ── PDF 再レンダリング進捗 ──
+                        self.fs_loading_label_top = None;
                         if fullscreen_processing_status_visible(
                             self.settings.fullscreen_processing_status_visible,
                             pdf_rerendering,
@@ -13499,6 +13500,7 @@ impl App {
                             );
                             ui.painter()
                                 .galley(text_rect.min, galley, egui::Color32::WHITE);
+                            self.fs_loading_label_top = Some(bg.top());
                         }
 
                         // 連結読みではシークバーと同じ current page を左パネルの編集対象にする。
@@ -28656,7 +28658,6 @@ impl App {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FsAiStatusLine {
-    Loading,
     Processing,
     Prefetching,
     Complete,
@@ -28665,7 +28666,6 @@ enum FsAiStatusLine {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FsAiStatusSignals {
-    is_loading: bool,
     is_upscaling: bool,
     is_prefetching_ai: bool,
     is_upscaled: bool,
@@ -28683,16 +28683,42 @@ fn fullscreen_processing_status_visible(setting_visible: bool, active: bool) -> 
     setting_visible && active
 }
 
+/// 左下ステータス枠を画面下端からどれだけ上げるか (`Align2::LEFT_BOTTOM` のオフセット)。
+///
+/// 画像左下の読み込みラベルは同じ条件で出るので、そのままでは後から描くこの枠が覆う。
+/// ラベルの上辺が分かっているときは、その上へ退く。ページシークバーが出ているときの
+/// 退避量とは競合させず、より高く上げるほうを採る。
+fn fs_ai_status_bottom_offset(
+    seek_overlay_visible: bool,
+    loading_label_top: Option<f32>,
+    screen_bottom: f32,
+) -> f32 {
+    const SEEK_BAR_AVOID: f32 = -58.0;
+    const SCREEN_MARGIN: f32 = -12.0;
+    const LABEL_GAP: f32 = 6.0;
+
+    let seek = if seek_overlay_visible {
+        SEEK_BAR_AVOID
+    } else {
+        SCREEN_MARGIN
+    };
+    let Some(top) = loading_label_top else {
+        return seek;
+    };
+    // 画面下端より下に出ることはないので、退避量が正になったら効かせない。
+    let label = (top - LABEL_GAP - screen_bottom).min(SCREEN_MARGIN);
+    seek.min(label)
+}
+
+/// 読み込み中であることは画像左下のラベルが単独で持つ。ここへ同じ行を積むと、この枠が
+/// 同じ条件で同じ位置に出て先発を覆い、二重に描いたうえで読めなくなる。左下ラベルは
+/// PDF 再レンダリングを区別できるうえ、AI が無効でも出るので、担当はあちらにある。
 fn fs_ai_status_content(
     processing_status_visible: bool,
     prefetch_status_visible: bool,
     signals: FsAiStatusSignals,
 ) -> FsAiStatusContent {
     let mut lines = Vec::new();
-    if processing_status_visible && signals.is_loading {
-        lines.push(FsAiStatusLine::Loading);
-    }
-
     if signals.is_upscaling {
         if processing_status_visible {
             lines.push(FsAiStatusLine::Processing);
@@ -28767,7 +28793,6 @@ impl App {
             self.settings.fullscreen_processing_status_visible,
             self.settings.fullscreen_prefetch_status_visible,
             FsAiStatusSignals {
-                is_loading,
                 is_upscaling,
                 is_prefetching_ai,
                 is_upscaled,
@@ -28776,10 +28801,6 @@ impl App {
             },
         );
         let mut lines: Vec<(String, egui::Color32)> = Vec::new();
-
-        if content.lines.contains(&FsAiStatusLine::Loading) {
-            lines.push(("読込中...".to_string(), egui::Color32::from_gray(210)));
-        }
 
         if content.lines.contains(&FsAiStatusLine::Processing) {
             let label = self.ai_model_label(fs_idx, true);
@@ -28853,11 +28874,11 @@ impl App {
         const FONT_SIZE: f32 = 13.0;
 
         let ctx = ui.ctx().clone();
-        let bottom_offset = if self.fs_seek_overlay_visible {
-            -58.0
-        } else {
-            -12.0
-        };
+        let bottom_offset = fs_ai_status_bottom_offset(
+            self.fs_seek_overlay_visible,
+            self.fs_loading_label_top,
+            ctx.screen_rect().bottom(),
+        );
         egui::Area::new("fs_ai_status_overlay".into())
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(12.0, bottom_offset))
@@ -33018,9 +33039,39 @@ mod tests {
     }
 
     #[test]
+    fn ai_status_box_retreats_above_the_loading_label_it_would_cover() {
+        // 画像左下のラベルと同じ条件で出るので、退かないと覆ってしまう。
+        let screen_bottom = 1000.0;
+        assert_eq!(
+            fs_ai_status_bottom_offset(false, None, screen_bottom),
+            -12.0
+        );
+        assert_eq!(fs_ai_status_bottom_offset(true, None, screen_bottom), -58.0);
+        // ラベルの上辺が 970 なら、6pt 空けて 36pt 上げる。
+        assert_eq!(
+            fs_ai_status_bottom_offset(false, Some(970.0), screen_bottom),
+            -36.0
+        );
+        // シークバー退避のほうが高ければそちらを採る。
+        assert_eq!(
+            fs_ai_status_bottom_offset(true, Some(970.0), screen_bottom),
+            -58.0
+        );
+        // レターボックスでラベルが上にあるほど、枠も高く退く。
+        assert_eq!(
+            fs_ai_status_bottom_offset(false, Some(600.0), screen_bottom),
+            -406.0
+        );
+        // 画面下端より下に来る位置は、既定の余白より下げない。
+        assert_eq!(
+            fs_ai_status_bottom_offset(false, Some(1200.0), screen_bottom),
+            -12.0
+        );
+    }
+
+    #[test]
     fn ai_status_content_separates_processing_and_prefetch_visibility() {
         let processing = FsAiStatusSignals {
-            is_loading: true,
             is_upscaling: true,
             is_prefetching_ai: false,
             is_upscaled: false,
@@ -33030,11 +33081,7 @@ mod tests {
         assert_eq!(
             fs_ai_status_content(true, false, processing),
             FsAiStatusContent {
-                lines: vec![
-                    FsAiStatusLine::Loading,
-                    FsAiStatusLine::Processing,
-                    FsAiStatusLine::EraseComplete,
-                ],
+                lines: vec![FsAiStatusLine::Processing, FsAiStatusLine::EraseComplete],
                 show_prefetch_progress: false,
             }
         );
@@ -33047,7 +33094,6 @@ mod tests {
         );
 
         let prefetching = FsAiStatusSignals {
-            is_loading: true,
             is_upscaling: false,
             is_prefetching_ai: true,
             is_upscaled: false,
@@ -33064,17 +33110,12 @@ mod tests {
         assert_eq!(
             fs_ai_status_content(true, true, prefetching),
             FsAiStatusContent {
-                lines: vec![
-                    FsAiStatusLine::Loading,
-                    FsAiStatusLine::Prefetching,
-                    FsAiStatusLine::EraseComplete,
-                ],
+                lines: vec![FsAiStatusLine::Prefetching, FsAiStatusLine::EraseComplete],
                 show_prefetch_progress: true,
             }
         );
 
         let complete = FsAiStatusSignals {
-            is_loading: false,
             is_upscaling: false,
             is_prefetching_ai: false,
             is_upscaled: true,

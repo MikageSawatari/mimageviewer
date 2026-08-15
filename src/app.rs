@@ -10881,6 +10881,11 @@ pub struct App {
     pub(crate) ai_upscale_failed: std::collections::HashSet<(usize, u8)>,
     /// AI ステータス表示の完了時刻（全処理完了後に記録、一定時間後に非表示）
     pub(crate) ai_status_done_at: Option<std::time::Instant>,
+    /// 画像左下の「読込中... / PDF 再レンダリング中...」を描いた枠の上辺 (screen 座標)。
+    /// 同じフレームで後から描く左下ステータス枠が、この上へ退くために読む。両者は同じ
+    /// 条件で出るので、退かないと後発の枠が先発を覆って読めなくなる。描かなかった
+    /// フレームは `None`。
+    pub(crate) fs_loading_label_top: Option<f32>,
 
     // ── 画像補正 ──────────────────────────────────────────────────
     /// 補正パネルの open owner (左パネルホバー / pointer / touch handle)
@@ -13292,6 +13297,7 @@ impl App {
             show_about_dialog: false,
             ai_upscale_failed: std::collections::HashSet::new(),
             ai_status_done_at: None,
+            fs_loading_label_top: None,
 
             // 画像補正
             adjustment_mode: crate::ui_helpers::MetadataPanelOpenState::Closed,
