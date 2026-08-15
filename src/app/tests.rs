@@ -10,9 +10,49 @@ fn fullscreen_overflow_panel_registers_as_common_modal_and_closes_at_file_bounda
     app.fs_overflow_panel_state = FsOverflowPanelState::Root;
     assert!(app.common_modal_dialog_open());
     assert!(app.any_modal_dialog_open_for_fullscreen_keys());
+    assert_eq!(app.modal_dialog_block_reason(), Some("fs_overflow_panel"));
 
     app.reset_fs_side_panel_runtime_for_file_change();
     assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+}
+
+/// A panel that is only drawn in fullscreen must not outlive fullscreen.
+///
+/// It holds the keyboard while it is open - including the Esc that would close it - so leaving
+/// fullscreen by any route that is not the keyboard would strand it: every key dead, nothing on
+/// screen to say why, and no way back but restarting. Changing file cleared it, which is why it
+/// went unnoticed; that is luck, not a rule (2026-08-15).
+#[test]
+fn leaving_fullscreen_closes_the_panel_that_only_draws_there() {
+    let mut app = setup_app_for_test();
+    app.fs_overflow_panel_state = FsOverflowPanelState::Root;
+
+    app.close_fullscreen();
+
+    assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+    assert_eq!(app.modal_dialog_block_reason(), None);
+}
+
+/// An open dialog stops the grid from opening anything.
+///
+/// Opening is what carries the reader away from the dialog: fullscreen is drawn instead of the
+/// main window, so a dialog left open there cannot be seen or dismissed while it goes on holding
+/// every key. A reader left the cache manager open, double-clicked a PDF, and lost the keyboard
+/// for ten minutes; the log named it `cache_manager` (2026-08-15).
+#[test]
+fn an_open_dialog_stops_the_grid_from_opening_an_item() {
+    let mut app = setup_app_for_test();
+    assert!(app.grid_open_from_click_allowed());
+
+    app.show_cache_manager = true;
+    assert_eq!(app.modal_dialog_block_reason(), Some("cache_manager"));
+    assert!(
+        !app.grid_open_from_click_allowed(),
+        "opening would leave the dialog drawn nowhere while it still holds the keyboard"
+    );
+
+    app.show_cache_manager = false;
+    assert!(app.grid_open_from_click_allowed());
 }
 
 #[test]

@@ -12521,6 +12521,15 @@ impl App {
             );
             self.update_last_selected_image();
         }
+        // An open dialog already stops the keyboard and the wheel. It did not stop this, so a
+        // reader could leave the cache manager open, double-click a PDF, and land in fullscreen -
+        // where that dialog is no longer drawn but still holds every key in the application, with
+        // no way back but restarting. Reported 2026-08-15; the log named it `cache_manager`.
+        // Selection above stays available: what a dialog owns is what happens next, not the
+        // cursor. The right-click branch has guarded on this predicate all along.
+        if !self.grid_open_from_click_allowed() {
+            return nav;
+        }
         if response.double_clicked() && self.items_are_bookmark_view {
             if let Some(row) = self.bookmark_browser_rows.get(idx).cloned() {
                 self.open_bookmark_browser_row(ctx, &row);

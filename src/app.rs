@@ -14939,6 +14939,15 @@ impl App {
         self.modal_block_reason_logged = reason;
     }
 
+    /// Whether activating an item in the grid may open anything.
+    ///
+    /// Opening is what carries the reader away from the dialog: fullscreen is drawn instead of
+    /// the main window, so a dialog left open there cannot be seen or dismissed while it goes on
+    /// holding every key. Named rather than inlined so that removing it has to be deliberate.
+    pub(crate) fn grid_open_from_click_allowed(&self) -> bool {
+        !self.any_dialog_open()
+    }
+
     pub(crate) fn any_dialog_open(&self) -> bool {
         self.common_modal_dialog_open()
             // VST3 manager は main window では背面グリッド入力を止めるが、fullscreen
@@ -36632,6 +36641,9 @@ impl App {
         self.spread_popup_open = false;
         self.fit_popup_open = false;
         self.slideshow_popup_open = false;
+        // The same reason as in `close_fullscreen`: this is the other place that gives up the
+        // fullscreen foreground, and a panel that only draws there must not outlive it.
+        self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
         self.cancel_mouse_ring_flick();
         self.capture_region_selection = None;
         self.clear_fullscreen_tag_picker_state();
@@ -49993,6 +50005,13 @@ impl App {
         self.spread_popup_open = false;
         self.fit_popup_open = false;
         self.slideshow_popup_open = false;
+        // The top bar's overflow panel belongs to this list for the same reason and was missing
+        // from it: it is drawn only in fullscreen, and it holds the keyboard while it is open -
+        // including the Esc that would close it. Leaving fullscreen by any other route (the
+        // right-click close, the window's own close) strands it, with nothing on screen to show
+        // why the application stopped responding. It survived until now only because changing
+        // file clears it, which is luck rather than a rule.
+        self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
         self.cancel_mouse_ring_flick();
         self.capture_region_selection = None;
         self.clear_fullscreen_tag_picker_state();
