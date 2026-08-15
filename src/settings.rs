@@ -3828,6 +3828,15 @@ pub struct Settings {
     /// フルスクリーン左右パネルを呼び出す方法。
     #[serde(default)]
     pub fullscreen_side_panel_mode: FsSidePanelMode,
+    /// フルスクリーンで先頭 / 末尾に達したときの案内を表示する。
+    #[serde(default = "default_true")]
+    pub fullscreen_boundary_notice_visible: bool,
+    /// 現在ページの読み込み・加工状況をフルスクリーンへ表示する。
+    #[serde(default = "default_true")]
+    pub fullscreen_processing_status_visible: bool,
+    /// 前後ページの先読み状況をフルスクリーンへ表示する。
+    #[serde(default = "default_true")]
+    pub fullscreen_prefetch_status_visible: bool,
     /// Show the overview navigator while only part of a flat image is visible.
     #[serde(default)]
     pub fullscreen_navigator_visible: bool,
@@ -5356,6 +5365,9 @@ impl Default for Settings {
             adjustment_settings_tab: AdjustmentSettingsTab::default(),
             creative_luts: crate::creative_lut::builtin_creative_lut_entries(),
             fullscreen_side_panel_mode: FsSidePanelMode::default(),
+            fullscreen_boundary_notice_visible: true,
+            fullscreen_processing_status_visible: true,
+            fullscreen_prefetch_status_visible: true,
             fullscreen_navigator_visible: false,
             fullscreen_navigator_corner: FullscreenNavigatorCorner::default(),
             fullscreen_navigator_size: FULLSCREEN_NAVIGATOR_SIZE_DEFAULT,
@@ -11892,6 +11904,30 @@ mod tests {
                 loaded.last_seen_version.as_deref(),
                 Some(env!("CARGO_PKG_VERSION"))
             );
+        }
+
+        #[test]
+        fn fullscreen_notice_visibility_settings_db_roundtrip() {
+            let missing: Settings = serde_json::from_str("{}").unwrap();
+            assert!(missing.fullscreen_boundary_notice_visible);
+            assert!(missing.fullscreen_processing_status_visible);
+            assert!(missing.fullscreen_prefetch_status_visible);
+
+            let env = setup_backup_env();
+            let _initial = Settings::load();
+            assert!(data_db_path(&env).exists());
+
+            let mut settings = Settings::default();
+            settings.fullscreen_boundary_notice_visible = false;
+            settings.fullscreen_processing_status_visible = false;
+            settings.fullscreen_prefetch_status_visible = false;
+            settings.save();
+
+            reset_backup_state_for_test();
+            let loaded = Settings::load();
+            assert!(!loaded.fullscreen_boundary_notice_visible);
+            assert!(!loaded.fullscreen_processing_status_visible);
+            assert!(!loaded.fullscreen_prefetch_status_visible);
         }
 
         #[test]

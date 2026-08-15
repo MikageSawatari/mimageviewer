@@ -8172,14 +8172,19 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(super) fn native_boundary_hint_text(hint: crate::ui_fullscreen::FsBoundaryHint) -> String {
+    pub(crate) fn native_boundary_hint_text(hint: crate::ui_fullscreen::FsBoundaryHint) -> String {
         match hint {
             crate::ui_fullscreen::FsBoundaryHint::Edge { at_end, .. } => {
-                if at_end {
-                    "最後の項目です  [Ctrl]+[↓] ツリー順で次へ".to_string()
+                let body = if at_end {
+                    "[Ctrl]+[↓] ツリー順で次へ"
                 } else {
-                    "最初の項目です  [Ctrl]+[↑] ツリー順で前へ".to_string()
-                }
+                    "[Ctrl]+[↑] ツリー順で前へ"
+                };
+                format!(
+                    "{}  {}",
+                    crate::ui_fullscreen::fullscreen_boundary_edge_title(at_end),
+                    body
+                )
             }
             crate::ui_fullscreen::FsBoundaryHint::NoImageFolder { forward, .. } => {
                 if forward {
@@ -8205,6 +8210,19 @@ impl App {
             crate::ui_fullscreen::FsBoundaryHint::NavNoOp { reason, .. } => {
                 Self::nav_noop_title(reason).to_string()
             }
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn show_native_video_boundary_hint_overlay(
+        &self,
+        hint: crate::ui_fullscreen::FsBoundaryHint,
+    ) {
+        if crate::ui_fullscreen::fullscreen_boundary_hint_visible(
+            self.settings.fullscreen_boundary_notice_visible,
+            hint,
+        ) {
+            self.show_native_video_overlay_toast(Self::native_boundary_hint_text(hint), true);
         }
     }
 
@@ -8293,7 +8311,7 @@ impl App {
             at_end,
             at: std::time::Instant::now(),
         };
-        self.show_native_video_overlay_toast(Self::native_boundary_hint_text(hint), true);
+        self.show_native_video_boundary_hint_overlay(hint);
         self.fs_boundary_hint = Some(hint);
         self.request_native_video_hud_repaint(ctx);
     }

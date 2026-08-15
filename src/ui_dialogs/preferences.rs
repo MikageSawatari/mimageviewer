@@ -2712,6 +2712,40 @@ mod tests {
         harness.snapshot("preferences_search_results");
     }
 
+    #[test]
+    fn preferences_viewer_notice_visibility_snapshot() {
+        use egui_kittest::Harness;
+
+        let mut state = PreferencesState::from_settings(
+            &crate::settings::Settings::default(),
+            None,
+            false,
+            0,
+            0,
+            0,
+        );
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(560.0, 360.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        page_spread_mode(ui, &mut state);
+                    });
+                });
+            });
+        harness.run();
+        harness.snapshot("preferences_viewer_notice_visibility");
+    }
+
     fn assert_selection_bar_matches_details(settings: &crate::settings::Settings) {
         assert_eq!(
             settings.details_selection_bar_column_order,

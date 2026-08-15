@@ -7169,6 +7169,28 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
         ui.small("通常ホバーは左端 / 右端で各パネルを表示します。クリック表示は最端の細いバーをクリックして開きます。");
     });
     ui.add_space(8.0);
+    ui.label(egui::RichText::new("案内と状況表示").strong());
+    anchored(ui, state, "spread/boundary-notice", |ui, state| {
+        ui.checkbox(
+            &mut state.settings.fullscreen_boundary_notice_visible,
+            "先頭 / 末尾の案内を表示",
+        );
+    });
+    anchored(ui, state, "spread/processing-status", |ui, state| {
+        ui.checkbox(
+            &mut state.settings.fullscreen_processing_status_visible,
+            "処理状況を表示",
+        );
+    });
+    anchored(ui, state, "spread/prefetch-status", |ui, state| {
+        ui.checkbox(
+            &mut state.settings.fullscreen_prefetch_status_visible,
+            "先読み状況を表示",
+        );
+    });
+    ui.small("「処理状況」は現在のページ、「先読み状況」は前後ページの準備を示します。OFF にしても処理自体は変わりません。");
+    ui.small("まだ表示できる画像がない間の「読込中...」は、どちらの設定でも表示されます。");
+    ui.add_space(8.0);
     ui.label(
         "フルスクリーンで画像を開いたときの初期表示。\n数字キー 1-5 でページ構成、6 で連結方式、7 で横方向、0 でズーム/フィットを切り替えできます。",
     );

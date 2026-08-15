@@ -6371,7 +6371,7 @@ impl NativeEguiOverlay {
                     hud_dimmed,
                     &mut commands,
                 );
-                // タイル表示中も境界トースト (= 「最後の項目です」「次のフォルダが見つかりません」
+                // タイル表示中も境界トースト (= 「末尾です」「次のフォルダが見つかりません」
                 // 等) は出す。元実装は早期 return で line 4342 の draw_native_toast に
                 // 到達しなかったため、タイル末尾に達してもユーザーへの feedback がゼロだった。
                 if let Some(toast) = toast.as_ref() {

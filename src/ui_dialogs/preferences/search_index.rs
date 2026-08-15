@@ -449,6 +449,24 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["サイドパネル", "ホバー", "クリック"]
     ),
     entry!(
+        "spread/boundary-notice",
+        SpreadMode,
+        "先頭 / 末尾の案内を表示",
+        ["境界", "最初", "最後", "通知"]
+    ),
+    entry!(
+        "spread/processing-status",
+        SpreadMode,
+        "処理状況を表示",
+        ["読込中", "AI 処理", "消去補完", "ステータス"]
+    ),
+    entry!(
+        "spread/prefetch-status",
+        SpreadMode,
+        "先読み状況を表示",
+        ["AI 先読み", "進捗", "前後ページ", "ステータス"]
+    ),
+    entry!(
         "spread/page-layout",
         SpreadMode,
         "デフォルトのページ構成",

@@ -34485,10 +34485,7 @@ impl App {
                     self.fs_boundary_hint = Some(hint);
                     #[cfg(windows)]
                     if self.native_video_fullscreen_active_for_main_backdrop() {
-                        self.show_native_video_overlay_toast(
-                            Self::native_boundary_hint_text(hint),
-                            true,
-                        );
+                        self.show_native_video_boundary_hint_overlay(hint);
                     }
                     self.clear_pending_folder_nav_steps();
                     self.release_fs_nav_lock();
@@ -34525,10 +34522,7 @@ impl App {
                             self.fs_boundary_hint = Some(hint);
                             #[cfg(windows)]
                             if self.native_video_fullscreen_active_for_main_backdrop() {
-                                self.show_native_video_overlay_toast(
-                                    Self::native_boundary_hint_text(hint),
-                                    true,
-                                );
+                                self.show_native_video_boundary_hint_overlay(hint);
                             }
                             self.clear_pending_folder_nav_steps();
                             self.release_fs_nav_lock();
@@ -34546,10 +34540,7 @@ impl App {
                         self.fs_boundary_hint = Some(hint);
                         #[cfg(windows)]
                         if self.native_video_fullscreen_active_for_main_backdrop() {
-                            self.show_native_video_overlay_toast(
-                                Self::native_boundary_hint_text(hint),
-                                true,
-                            );
+                            self.show_native_video_boundary_hint_overlay(hint);
                         }
                         self.release_fs_nav_lock();
                     } else {
@@ -34575,10 +34566,7 @@ impl App {
                     // Ctrl+↑↓ が無反応に見える。
                     #[cfg(windows)]
                     if self.native_video_fullscreen_active_for_main_backdrop() {
-                        self.show_native_video_overlay_toast(
-                            Self::native_boundary_hint_text(hint),
-                            true,
-                        );
+                        self.show_native_video_boundary_hint_overlay(hint);
                     }
                     self.clear_pending_folder_nav_steps();
                     // items_generation が進まないので poll_fs_nav_lock では解除されない
@@ -34644,7 +34632,7 @@ impl App {
             // native 動画 fullscreen 中は中央ヒントが見えないので toast でも feedback。
             #[cfg(windows)]
             if self.native_video_fullscreen_active_for_main_backdrop() {
-                self.show_native_video_overlay_toast(Self::native_boundary_hint_text(hint), true);
+                self.show_native_video_boundary_hint_overlay(hint);
             }
             self.clear_pending_folder_nav_steps();
             // 同上: items_generation 不変のまま return するので明示 release (Codex P1)。
@@ -34777,10 +34765,7 @@ impl App {
                         // native 動画 fullscreen 中は中央ヒントが見えないので toast でも feedback。
                         #[cfg(windows)]
                         if self.native_video_fullscreen_active_for_main_backdrop() {
-                            self.show_native_video_overlay_toast(
-                                Self::native_boundary_hint_text(hint),
-                                true,
-                            );
+                            self.show_native_video_boundary_hint_overlay(hint);
                         }
                         self.clear_pending_folder_nav_steps();
                         self.release_fs_nav_lock();
@@ -34857,10 +34842,7 @@ impl App {
                             self.fs_boundary_hint = Some(hint);
                             #[cfg(windows)]
                             if self.native_video_fullscreen_active_for_main_backdrop() {
-                                self.show_native_video_overlay_toast(
-                                    Self::native_boundary_hint_text(hint),
-                                    true,
-                                );
+                                self.show_native_video_boundary_hint_overlay(hint);
                             }
                             self.clear_pending_folder_nav_steps();
                             self.release_fs_nav_lock();

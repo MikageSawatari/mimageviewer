@@ -4104,7 +4104,7 @@ pub(crate) struct NavMarker {
 /// フルスクリーン中央のヒントオーバーレイ。
 #[derive(Copy, Clone)]
 pub(crate) enum FsBoundaryHint {
-    /// 最初/最後の項目に到達 (at_end: true=末尾, false=先頭)。
+    /// 先頭 / 末尾に到達 (at_end: true=末尾, false=先頭)。
     Edge {
         at_end: bool,
         at: std::time::Instant,
@@ -4206,6 +4206,21 @@ impl FsBoundaryHint {
             | FsBoundaryHint::NavNoOp { at, .. } => *at,
         }
     }
+}
+
+pub(crate) fn fullscreen_boundary_edge_title(at_end: bool) -> &'static str {
+    if at_end {
+        "末尾です"
+    } else {
+        "先頭です"
+    }
+}
+
+pub(crate) fn fullscreen_boundary_hint_visible(
+    boundary_notice_visible: bool,
+    hint: FsBoundaryHint,
+) -> bool {
+    boundary_notice_visible || !matches!(hint, FsBoundaryHint::Edge { .. })
 }
 
 // ── 見開きペアリング ──────────────────────────────────────────────────────
@@ -13442,7 +13457,10 @@ impl App {
                         // ── 高解像度読込中インジケーター ──
                         let has_any_tex = state.tex.is_some() || state.thumb_tex.is_some();
                         let pdf_rerendering = self.fs_pending.contains_key(&fs_idx);
-                        if state.is_loading && has_any_tex && !pdf_rerendering {
+                        if fullscreen_processing_status_visible(
+                            self.settings.fullscreen_processing_status_visible,
+                            state.is_loading && has_any_tex && !pdf_rerendering,
+                        ) {
                             ui.painter().text(
                                 image_rect.min + egui::vec2(16.0, 16.0),
                                 egui::Align2::LEFT_TOP,
@@ -13453,7 +13471,10 @@ impl App {
                         }
 
                         // ── PDF 再レンダリング進捗 ──
-                        if self.fs_pending.contains_key(&fs_idx) {
+                        if fullscreen_processing_status_visible(
+                            self.settings.fullscreen_processing_status_visible,
+                            pdf_rerendering,
+                        ) {
                             let label =
                                 if matches!(self.items.get(fs_idx), Some(GridItem::PdfPage { .. }))
                                 {
@@ -14021,7 +14042,7 @@ impl App {
                         // 中で描画される (= `native_presenter/overlay_draw.rs::draw_native_*`)。
                         // eframe ビューポートからは描画しない。
 
-                        // ── 中央の境界ヒント (最初/最後の項目です…) ──
+                        // ── 中央の先頭 / 末尾ヒント ──
                         self.draw_boundary_hint(ui, full_rect, ctx);
 
                         // The touch help is the final canvas overlay: once it is visible,
@@ -28633,6 +28654,67 @@ impl App {
 
 // ── フルスクリーン AI ステータスオーバーレイ ────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FsAiStatusLine {
+    Loading,
+    Processing,
+    Prefetching,
+    Complete,
+    EraseComplete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FsAiStatusSignals {
+    is_loading: bool,
+    is_upscaling: bool,
+    is_prefetching_ai: bool,
+    is_upscaled: bool,
+    erase_complete: bool,
+    has_prefetch_progress: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FsAiStatusContent {
+    lines: Vec<FsAiStatusLine>,
+    show_prefetch_progress: bool,
+}
+
+fn fullscreen_processing_status_visible(setting_visible: bool, active: bool) -> bool {
+    setting_visible && active
+}
+
+fn fs_ai_status_content(
+    processing_status_visible: bool,
+    prefetch_status_visible: bool,
+    signals: FsAiStatusSignals,
+) -> FsAiStatusContent {
+    let mut lines = Vec::new();
+    if processing_status_visible && signals.is_loading {
+        lines.push(FsAiStatusLine::Loading);
+    }
+
+    if signals.is_upscaling {
+        if processing_status_visible {
+            lines.push(FsAiStatusLine::Processing);
+        }
+    } else if signals.is_prefetching_ai && !signals.is_upscaled {
+        if prefetch_status_visible {
+            lines.push(FsAiStatusLine::Prefetching);
+        }
+    } else if processing_status_visible && signals.is_upscaled {
+        lines.push(FsAiStatusLine::Complete);
+    }
+
+    if processing_status_visible && signals.erase_complete {
+        lines.push(FsAiStatusLine::EraseComplete);
+    }
+
+    FsAiStatusContent {
+        lines,
+        show_prefetch_progress: prefetch_status_visible && signals.has_prefetch_progress,
+    }
+}
+
 impl App {
     /// 現在有効な AI 処理のモデル名を結合して返す。
     /// `show_auto_prefix` が true の場合、自動選択時に「自動: 」プレフィックスを付ける。
@@ -28680,24 +28762,37 @@ impl App {
         let is_loading = self.fs_pending.contains_key(&fs_idx);
         let any_busy = is_loading || has_ai_pending;
 
+        let prefetch_progress = self.final_ai_prefetch_progress(fs_idx);
+        let content = fs_ai_status_content(
+            self.settings.fullscreen_processing_status_visible,
+            self.settings.fullscreen_prefetch_status_visible,
+            FsAiStatusSignals {
+                is_loading,
+                is_upscaling,
+                is_prefetching_ai,
+                is_upscaled,
+                erase_complete: self.erase_base_cache.contains_key(&fs_idx) && !self.erase_mode,
+                has_prefetch_progress: prefetch_progress.is_some(),
+            },
+        );
         let mut lines: Vec<(String, egui::Color32)> = Vec::new();
 
-        if is_loading {
+        if content.lines.contains(&FsAiStatusLine::Loading) {
             lines.push(("読込中...".to_string(), egui::Color32::from_gray(210)));
         }
 
-        if is_upscaling {
+        if content.lines.contains(&FsAiStatusLine::Processing) {
             let label = self.ai_model_label(fs_idx, true);
             lines.push((
                 format!("AI 処理中 ({})", label),
                 egui::Color32::from_rgb(255, 200, 80),
             ));
-        } else if is_prefetching_ai && !is_upscaled {
+        } else if content.lines.contains(&FsAiStatusLine::Prefetching) {
             lines.push((
                 "AI 先読み中".to_string(),
                 egui::Color32::from_rgb(180, 210, 255),
             ));
-        } else if is_upscaled {
+        } else if content.lines.contains(&FsAiStatusLine::Complete) {
             let label = self.ai_model_label(fs_idx, false);
             lines.push((
                 format!("AI 処理完了 ({})", label),
@@ -28705,7 +28800,7 @@ impl App {
             ));
         }
 
-        if self.erase_base_cache.contains_key(&fs_idx) && !self.erase_mode {
+        if content.lines.contains(&FsAiStatusLine::EraseComplete) {
             lines.push((
                 "消去補完済み".to_string(),
                 egui::Color32::from_rgb(180, 140, 255),
@@ -28715,7 +28810,11 @@ impl App {
         // Pipeline P1 refactor で旧 ai_upscale_pending を参照する経路が無効化されて
         // 進捗バーが常時非表示になっていた。新パイプライン版 `final_ai_prefetch_progress`
         // が done/total を計算して、先読み中だけバーを出す。
-        let prefetch_progress: Option<(usize, usize)> = self.final_ai_prefetch_progress(fs_idx);
+        let prefetch_progress = if content.show_prefetch_progress {
+            prefetch_progress
+        } else {
+            None
+        };
 
         if lines.is_empty() && prefetch_progress.is_none() {
             self.ai_status_done_at = None;
@@ -29121,7 +29220,7 @@ impl App {
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
     }
 
-    /// 画面中央に境界ヒント (最初/最後の項目です… / 次のフォルダが見つかりません…) を描画する。
+    /// 画面中央に境界ヒント (先頭 / 末尾 / 次のフォルダが見つからない等) を描画する。
     fn draw_boundary_hint(
         &mut self,
         ui: &mut egui::Ui,
@@ -29144,6 +29243,11 @@ impl App {
             self.fs_boundary_hint = None;
             return;
         }
+        if !fullscreen_boundary_hint_visible(self.settings.fullscreen_boundary_notice_visible, hint)
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            return;
+        }
 
         let alpha = if elapsed > duration - 0.4 {
             ((duration - elapsed) / 0.4).clamp(0.0, 1.0)
@@ -29153,11 +29257,11 @@ impl App {
 
         let (title, body_lines): (&str, Vec<&str>) = match hint {
             FsBoundaryHint::Edge { at_end: true, .. } => (
-                "最後の項目です",
+                fullscreen_boundary_edge_title(true),
                 vec!["[Home] 最初に戻る", "[Ctrl]+[↓] ツリー順で次へ"],
             ),
             FsBoundaryHint::Edge { at_end: false, .. } => (
-                "最初の項目です",
+                fullscreen_boundary_edge_title(false),
                 vec!["[End] 最後に移動", "[Ctrl]+[↑] ツリー順で前へ"],
             ),
             FsBoundaryHint::NoImageFolder { forward: true, .. } => (
@@ -32904,6 +33008,134 @@ mod tests {
     use crate::grid_item::GridItem;
     use crate::ring_shortcut::{RightDragContext, ViewerShortRightClickAction};
     use std::path::PathBuf;
+
+    #[test]
+    fn processing_status_visibility_requires_setting_and_active_state() {
+        assert!(fullscreen_processing_status_visible(true, true));
+        assert!(!fullscreen_processing_status_visible(true, false));
+        assert!(!fullscreen_processing_status_visible(false, true));
+        assert!(!fullscreen_processing_status_visible(false, false));
+    }
+
+    #[test]
+    fn ai_status_content_separates_processing_and_prefetch_visibility() {
+        let processing = FsAiStatusSignals {
+            is_loading: true,
+            is_upscaling: true,
+            is_prefetching_ai: false,
+            is_upscaled: false,
+            erase_complete: true,
+            has_prefetch_progress: true,
+        };
+        assert_eq!(
+            fs_ai_status_content(true, false, processing),
+            FsAiStatusContent {
+                lines: vec![
+                    FsAiStatusLine::Loading,
+                    FsAiStatusLine::Processing,
+                    FsAiStatusLine::EraseComplete,
+                ],
+                show_prefetch_progress: false,
+            }
+        );
+        assert_eq!(
+            fs_ai_status_content(false, false, processing),
+            FsAiStatusContent {
+                lines: Vec::new(),
+                show_prefetch_progress: false,
+            }
+        );
+
+        let prefetching = FsAiStatusSignals {
+            is_loading: true,
+            is_upscaling: false,
+            is_prefetching_ai: true,
+            is_upscaled: false,
+            erase_complete: true,
+            has_prefetch_progress: true,
+        };
+        assert_eq!(
+            fs_ai_status_content(false, true, prefetching),
+            FsAiStatusContent {
+                lines: vec![FsAiStatusLine::Prefetching],
+                show_prefetch_progress: true,
+            }
+        );
+        assert_eq!(
+            fs_ai_status_content(true, true, prefetching),
+            FsAiStatusContent {
+                lines: vec![
+                    FsAiStatusLine::Loading,
+                    FsAiStatusLine::Prefetching,
+                    FsAiStatusLine::EraseComplete,
+                ],
+                show_prefetch_progress: true,
+            }
+        );
+
+        let complete = FsAiStatusSignals {
+            is_loading: false,
+            is_upscaling: false,
+            is_prefetching_ai: false,
+            is_upscaled: true,
+            erase_complete: false,
+            has_prefetch_progress: false,
+        };
+        assert_eq!(
+            fs_ai_status_content(true, false, complete),
+            FsAiStatusContent {
+                lines: vec![FsAiStatusLine::Complete],
+                show_prefetch_progress: false,
+            }
+        );
+        assert_eq!(
+            fs_ai_status_content(false, true, complete),
+            FsAiStatusContent {
+                lines: Vec::new(),
+                show_prefetch_progress: false,
+            }
+        );
+    }
+
+    #[test]
+    fn boundary_notice_setting_only_hides_edge_hints() {
+        let now = std::time::Instant::now();
+        assert!(!fullscreen_boundary_hint_visible(
+            false,
+            FsBoundaryHint::Edge {
+                at_end: true,
+                at: now,
+            },
+        ));
+        assert!(fullscreen_boundary_hint_visible(
+            false,
+            FsBoundaryHint::NoImageFolder {
+                forward: true,
+                at: now,
+            },
+        ));
+        assert!(fullscreen_boundary_hint_visible(
+            true,
+            FsBoundaryHint::Edge {
+                at_end: false,
+                at: now,
+            },
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn static_and_native_boundary_titles_use_the_same_wording() {
+        let now = std::time::Instant::now();
+        for (at_end, expected) in [(false, "先頭です"), (true, "末尾です")] {
+            assert_eq!(fullscreen_boundary_edge_title(at_end), expected);
+            let text = crate::app::App::native_boundary_hint_text(FsBoundaryHint::Edge {
+                at_end,
+                at: now,
+            });
+            assert!(text.starts_with(expected));
+        }
+    }
 
     /// Reported 2026-08-14: holding the key one way stayed at full quality while the other way
     /// dropped to thumbnail quality. Both stand-in and real page were ready going forward, and the
