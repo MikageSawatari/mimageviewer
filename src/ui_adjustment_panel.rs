@@ -8878,6 +8878,11 @@ fn draw_sliders(
                     .italics(),
                 );
             }
+            ui.radio_value(
+                &mut params.post_filter,
+                PostFilter::UpscalePixelArt,
+                PostFilter::UpscalePixelArt.display_label(),
+            );
             ui.separator();
             group_heading(ui, "── CRT ──");
             ui.radio_value(

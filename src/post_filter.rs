@@ -26,7 +26,8 @@ pub fn apply(src: &ColorImage, filter: PostFilter) -> ColorImage {
         PostFilter::None
         | PostFilter::Nearest
         | PostFilter::UpscaleSharp
-        | PostFilter::UpscaleAnime => src.clone(),
+        | PostFilter::UpscaleAnime
+        | PostFilter::UpscalePixelArt => src.clone(),
         PostFilter::CrtSimple => crt::apply_simple(src),
         PostFilter::CrtFull => crt::apply_full(src),
         PostFilter::CrtArcade => crt::apply_arcade(src),
@@ -1719,6 +1720,14 @@ mod tests {
     }
 
     #[test]
+    fn upscale_pixel_art_is_identity_clone_on_the_cpu_stage() {
+        let src = make_test_image(16, 16);
+        let out = apply(&src, PostFilter::UpscalePixelArt);
+        assert_eq!(out.size, src.size);
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
     fn pseudocolor_endpoints_black_and_white() {
         // 純グレー 0 → 黒、255 → 白 (両プリセットとも端点は無彩色)。
         for pf in [PostFilter::PseudoColor4, PostFilter::PseudoColorSkin] {
@@ -1965,6 +1974,7 @@ mod tests {
                     | PostFilter::Nearest
                     | PostFilter::UpscaleSharp
                     | PostFilter::UpscaleAnime
+                    | PostFilter::UpscalePixelArt
             ) {
                 continue; // これらは clone なので自明
             }

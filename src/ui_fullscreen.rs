@@ -1243,6 +1243,10 @@ const FS_POST_FILTER_DIRECT_ACTIONS: &[(KeyAction, PostFilter)] = &[
         KeyAction::FsPostFilterUpscaleAnime,
         PostFilter::UpscaleAnime,
     ),
+    (
+        KeyAction::FsPostFilterUpscalePixelArt,
+        PostFilter::UpscalePixelArt,
+    ),
     (KeyAction::FsPostFilterCrtSimple, PostFilter::CrtSimple),
     (KeyAction::FsPostFilterCrtFull, PostFilter::CrtFull),
     (KeyAction::FsPostFilterCrtArcade, PostFilter::CrtArcade),

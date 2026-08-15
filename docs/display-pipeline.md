@@ -1142,9 +1142,10 @@ yaw の継ぎ目では隣接点の U 差が 0.5 を超える線分を分割す�
 
 `FullscreenPaintResource` は `Direct / Resampleable / Lanczos` の typed state で、全 variant が
 元の `TextureHandle` を保持する。レイアウト、trim UV、回転、hit-test、pixel grid は元ハンドルの
-`size_vec2()` から従来どおり `DisplayedImageTransform` が解決する。縮小時、標準拡大時、シャープ拡大時、アニメ塗り拡大時だけ
-GPU resampler の native texture を別所有する (C-1)。`Lanczos` という resource variant 名はこの
-共有出力の既存所有境界を示し、実際の shader は `scale_branch` で Lanczos3 / NIS / Anime4K を区別する。縮小出力は従来どおり `TextureId` だけを
+`size_vec2()` から従来どおり `DisplayedImageTransform` が解決する。縮小時、標準拡大時、
+シャープ拡大時、アニメ塗り拡大時、ドット絵拡大時だけ GPU resampler の native texture を
+別所有する (C-1)。`Lanczos` という resource variant 名はこの共有出力の既存所有境界を示し、
+実際の shader は `scale_branch` で Lanczos3 / NIS / Anime4K / pixel-AA を区別する。縮小出力は従来どおり `TextureId` だけを
 差し替え、拡大出力はその texture が表す元画像 UV も typed resource に保持して同じ
 `DisplayedImageTransform` 上の対応位置へ描く。level 0 の `Rgba8Unorm` source を vertical
 `Rgba16Float`、horizontal `Rgba8Unorm` の 2 pass で直接リサンプルする。box mip 前縮小、
@@ -1172,12 +1173,17 @@ GPU resampler の native texture を別所有する (C-1)。`Lanczos` という 
   premultiplied RGB を alpha 以下に保つ。可視 source 領域の長辺が設定上限（2048px /
   4096px / 制限なし、既定 4096px）を超える場合は、中間 texture を確保する前に同じ領域の
   `UpscaleLanczos` へ切り替える。上限ちょうどは処理対象とする。
+- 1.0 超かつ `PostFilter::UpscalePixelArt`: 同じ可視 source 領域と目標寸法を、軸ごとの
+  面積被覆重みを使う分離可能 2 タップ補間で生成する。テクセル内は平坦なまま、境界だけを
+  常に出力 1px 幅で混合する。この経路だけは premultiplied alpha を外して sRGB からリニアへ
+  変換して混合し、sRGB へ戻してから再度 premultiply する。高コントラストなドット絵の白線と
+  黒線の太さを保つためであり、新規経路だけに限定することで既存経路の見え方は変えない。
 - 1.0 超かつ CRT / レトロ / セピア等の効果 post-filter: 元 `TextureId` を直接 paint し、
   従来の LINEAR を維持。拡大方式と効果は独立選択にしない。
 
 拡大出力は一辺 8192px、総画素 4096×4096 相当までとし、いずれかを超える場合は
 resampler texture を生成せず従来の LINEAR 表示へ戻す。フォールバックは同じ source generation
-と branch につき一度 `gpu/lanczos_upscale_limit_fallback` へ記録し、3 種の拡大は
+と branch につき一度 `gpu/lanczos_upscale_limit_fallback` へ記録し、4 種の拡大は
 `scale_branch` フィールドで区別する。
 
 単ページ、見開きの各ページ、縦 / 横連結読み、page transition、nav / source-reload holdover、
@@ -1200,7 +1206,8 @@ fullscreen close / invalidation / context park・swap / 連結読み keep-set �
 perf log の
 `gpu/lanczos_regenerate` に source / target、smoothing percent / blur、推定 fetch 数、
 encode + submit CPU 時間、累積再生成回数、拡大 / 縮小の別を記録する。Lanczos3 / NIS /
-Anime4K は event 名を共用し、`scale_branch` (`upscale` / `upscale_nis` / `upscale_anime`)
+Anime4K / pixel-AA は event 名を共用し、`scale_branch`
+(`upscale` / `upscale_nis` / `upscale_anime` / `upscale_pixel_art`)
 で区別する。拡大時はさらに、
 生成元となった source pixel 領域の x / y / width / height を記録する。
 

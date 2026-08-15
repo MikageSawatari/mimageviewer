@@ -351,6 +351,7 @@
 # FsPostFilterNearest = none ; ポストフィルタをニアレスト（補間なし）にする
 # FsPostFilterUpscaleSharp = none ; ポストフィルタをシャープ拡大にする
 # FsPostFilterUpscaleAnime = none ; ポストフィルタをアニメ塗り拡大にする
+# FsPostFilterUpscalePixelArt = none ; ポストフィルタをドット絵拡大にする
 # FsPostFilterCrtSimple = none ; ポストフィルタをCRT シンプル（控えめ）にする
 # FsPostFilterCrtFull = none ; ポストフィルタをCRT フル（歪み+強グロー）にする
 # FsPostFilterCrtArcade = none ; ポストフィルタをCRT アーケード（高コントラスト）にする

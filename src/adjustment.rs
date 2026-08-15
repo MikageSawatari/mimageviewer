@@ -26,7 +26,8 @@ pub enum AutoMode {
 ///
 /// 色調補正の後段で CPU 処理として適用される。`None` = 標準表示 (拡大は Lanczos3)、
 /// `Nearest` = CPU 変換はしないが NEAREST サンプラーで拡大する。
-/// `UpscaleSharp` and `UpscaleAnime` pass through the CPU stage and change only display upscaling.
+/// `UpscaleSharp`, `UpscaleAnime`, and `UpscalePixelArt` pass through the CPU stage and change
+/// only display upscaling.
 /// その他は CRT ブラウン管風 / 減色 / 複合プリセット。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -41,6 +42,8 @@ pub enum PostFilter {
     UpscaleSharp,
     /// Line-art and illustration upscaling at paint time, with no CPU color transform.
     UpscaleAnime,
+    /// Pixel-art upscaling at paint time, with no CPU color transform.
+    UpscalePixelArt,
     /// CRT シンプル: スキャンライン + シャドウマスク
     CrtSimple,
     /// CRT フル: CRT Simple + 樽型歪み + bloom
@@ -141,6 +144,7 @@ const POST_FILTER_GROUP_BASIC: &[PostFilter] = &[
     PostFilter::Nearest,
     PostFilter::UpscaleSharp,
     PostFilter::UpscaleAnime,
+    PostFilter::UpscalePixelArt,
 ];
 const POST_FILTER_GROUP_CRT: &[PostFilter] = &[
     PostFilter::CrtSimple,
@@ -248,6 +252,7 @@ impl PostFilter {
         Self::Nearest,
         Self::UpscaleSharp,
         Self::UpscaleAnime,
+        Self::UpscalePixelArt,
         Self::CrtSimple,
         Self::CrtFull,
         Self::CrtArcade,
@@ -297,6 +302,7 @@ impl PostFilter {
             Self::Nearest => "ニアレスト（補間なし）",
             Self::UpscaleSharp => "シャープ拡大",
             Self::UpscaleAnime => "アニメ塗り拡大",
+            Self::UpscalePixelArt => "ドット絵拡大",
             Self::CrtSimple => "CRT シンプル（控えめ）",
             Self::CrtFull => "CRT フル（歪み+強グロー）",
             Self::CrtArcade => "CRT アーケード（高コントラスト）",
@@ -342,7 +348,11 @@ impl PostFilter {
     pub fn rewrites_pixels(self) -> bool {
         !matches!(
             self,
-            Self::None | Self::Nearest | Self::UpscaleSharp | Self::UpscaleAnime
+            Self::None
+                | Self::Nearest
+                | Self::UpscaleSharp
+                | Self::UpscaleAnime
+                | Self::UpscalePixelArt
         )
     }
 
@@ -1128,6 +1138,12 @@ mod tests {
                 .count();
             assert_eq!(occurrences, 1, "{filter:?}");
         }
+    }
+
+    #[test]
+    fn pixel_art_upscale_does_not_rewrite_pixels() {
+        assert!(!PostFilter::UpscalePixelArt.rewrites_pixels());
+        assert!(!PostFilter::UpscalePixelArt.needs_nearest_sampler());
     }
 
     #[test]

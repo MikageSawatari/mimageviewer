@@ -3584,9 +3584,9 @@ mod tests {
         let mut original = Settings::default();
         original.global_preset.post_filter = PostFilter::UpscaleSharp;
         original.preset_slots.slots[9] = Some(PresetSlot {
-            name: "sharp".to_owned(),
+            name: "pixel art".to_owned(),
             params: AdjustParams {
-                post_filter: PostFilter::UpscaleSharp,
+                post_filter: PostFilter::UpscalePixelArt,
                 ..Default::default()
             },
         });
@@ -3604,8 +3604,8 @@ mod tests {
                     )
                     .unwrap();
                 assert!(
-                    !value.contains("upscale_sharp"),
-                    "v2.11.0-visible {key} JSON must not contain the new enum variant"
+                    !value.contains("upscale_sharp") && !value.contains("upscale_pixel_art"),
+                    "v2.11.0-visible {key} JSON must not contain a new enum variant"
                 );
             }
         }
@@ -3619,7 +3619,7 @@ mod tests {
                 .unwrap()
                 .params
                 .post_filter,
-            PostFilter::UpscaleSharp
+            PostFilter::UpscalePixelArt
         );
     }
 

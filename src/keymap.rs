@@ -1613,6 +1613,7 @@ pub enum KeyAction {
     FsPostFilterNearest,
     FsPostFilterUpscaleSharp,
     FsPostFilterUpscaleAnime,
+    FsPostFilterUpscalePixelArt,
     FsPostFilterCrtSimple,
     FsPostFilterCrtFull,
     FsPostFilterCrtArcade,
@@ -2043,6 +2044,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsPostFilterNearest,
     KeyAction::FsPostFilterUpscaleSharp,
     KeyAction::FsPostFilterUpscaleAnime,
+    KeyAction::FsPostFilterUpscalePixelArt,
     KeyAction::FsPostFilterCrtSimple,
     KeyAction::FsPostFilterCrtFull,
     KeyAction::FsPostFilterCrtArcade,
@@ -3561,6 +3563,7 @@ impl KeyAction {
             FsPostFilterNearest => "FsPostFilterNearest",
             FsPostFilterUpscaleSharp => "FsPostFilterUpscaleSharp",
             FsPostFilterUpscaleAnime => "FsPostFilterUpscaleAnime",
+            FsPostFilterUpscalePixelArt => "FsPostFilterUpscalePixelArt",
             FsPostFilterCrtSimple => "FsPostFilterCrtSimple",
             FsPostFilterCrtFull => "FsPostFilterCrtFull",
             FsPostFilterCrtArcade => "FsPostFilterCrtArcade",
@@ -4113,6 +4116,7 @@ impl KeyAction {
             FsPostFilterNearest => "ポストフィルタをニアレスト（補間なし）にする",
             FsPostFilterUpscaleSharp => "ポストフィルタをシャープ拡大にする",
             FsPostFilterUpscaleAnime => "ポストフィルタをアニメ塗り拡大にする",
+            FsPostFilterUpscalePixelArt => "ポストフィルタをドット絵拡大にする",
             FsPostFilterCrtSimple => "ポストフィルタをCRT シンプル（控えめ）にする",
             FsPostFilterCrtFull => "ポストフィルタをCRT フル（歪み+強グロー）にする",
             FsPostFilterCrtArcade => "ポストフィルタをCRT アーケード（高コントラスト）にする",
@@ -4530,6 +4534,7 @@ impl KeyAction {
             | FsPostFilterNearest
             | FsPostFilterUpscaleSharp
             | FsPostFilterUpscaleAnime
+            | FsPostFilterUpscalePixelArt
             | FsPostFilterCrtSimple
             | FsPostFilterCrtFull
             | FsPostFilterCrtArcade
@@ -4931,6 +4936,7 @@ impl KeyAction {
             | FsPostFilterNearest
             | FsPostFilterUpscaleSharp
             | FsPostFilterUpscaleAnime
+            | FsPostFilterUpscalePixelArt
             | FsPostFilterCrtSimple
             | FsPostFilterCrtFull
             | FsPostFilterCrtArcade
@@ -5369,6 +5375,7 @@ impl KeyAction {
             FsPostFilterNearest
             | FsPostFilterUpscaleSharp
             | FsPostFilterUpscaleAnime
+            | FsPostFilterUpscalePixelArt
             | FsPostFilterCrtSimple
             | FsPostFilterCrtFull
             | FsPostFilterCrtArcade
@@ -9873,6 +9880,7 @@ mod tests {
             KeyAction::FsPostFilterNearest,
             KeyAction::FsPostFilterUpscaleSharp,
             KeyAction::FsPostFilterUpscaleAnime,
+            KeyAction::FsPostFilterUpscalePixelArt,
             KeyAction::FsPostFilterCrtSimple,
             KeyAction::FsPostFilterCrtFull,
             KeyAction::FsPostFilterCrtArcade,
@@ -9914,6 +9922,8 @@ mod tests {
         ];
 
         for action in actions {
+            assert!(ALL_ACTIONS.contains(&action), "{action:?}");
+            assert_eq!(KeyAction::from_ini_name(action.ini_name()), Some(action));
             assert_eq!(action.context(), KeyContext::FsImage);
             assert_eq!(action.trigger(), KeyTrigger::Press);
             assert!(action.default_chords().is_empty(), "{action:?}");

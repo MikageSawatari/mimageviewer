@@ -3151,6 +3151,8 @@ pub(crate) struct PostFilterDowngradeStash {
     sharp_upscale: bool,
     #[serde(default)]
     anime_upscale: bool,
+    #[serde(default)]
+    pixel_art_upscale: bool,
 }
 
 impl PostFilterDowngradeStash {
@@ -3163,17 +3165,25 @@ impl PostFilterDowngradeStash {
             params.post_filter,
             crate::adjustment::PostFilter::UpscaleAnime
         );
-        if self.sharp_upscale || self.anime_upscale {
+        self.pixel_art_upscale = matches!(
+            params.post_filter,
+            crate::adjustment::PostFilter::UpscalePixelArt
+        );
+        if self.sharp_upscale || self.anime_upscale || self.pixel_art_upscale {
             params.post_filter = crate::adjustment::PostFilter::None;
         }
     }
 
     fn restore_after_load(&mut self, params: &mut crate::adjustment::AdjustParams) {
-        if std::mem::take(&mut self.anime_upscale) {
-            self.sharp_upscale = false;
+        let anime_upscale = std::mem::take(&mut self.anime_upscale);
+        let sharp_upscale = std::mem::take(&mut self.sharp_upscale);
+        let pixel_art_upscale = std::mem::take(&mut self.pixel_art_upscale);
+        if anime_upscale {
             params.post_filter = crate::adjustment::PostFilter::UpscaleAnime;
-        } else if std::mem::take(&mut self.sharp_upscale) {
+        } else if sharp_upscale {
             params.post_filter = crate::adjustment::PostFilter::UpscaleSharp;
+        } else if pixel_art_upscale {
+            params.post_filter = crate::adjustment::PostFilter::UpscalePixelArt;
         }
     }
 }
@@ -8373,7 +8383,7 @@ mod tests {
         use crate::adjustment::{PostFilter, PresetSlot};
 
         let mut settings = Settings::default();
-        settings.global_preset.post_filter = PostFilter::UpscaleAnime;
+        settings.global_preset.post_filter = PostFilter::UpscalePixelArt;
         settings.preset_slots.slots[0] = Some(PresetSlot {
             name: "sharp".to_owned(),
             params: crate::adjustment::AdjustParams {
@@ -8382,6 +8392,13 @@ mod tests {
             },
         });
         settings.preset_slots.slots[1] = Some(PresetSlot {
+            name: "anime".to_owned(),
+            params: crate::adjustment::AdjustParams {
+                post_filter: PostFilter::UpscaleAnime,
+                ..Default::default()
+            },
+        });
+        settings.preset_slots.slots[2] = Some(PresetSlot {
             name: "legacy".to_owned(),
             params: crate::adjustment::AdjustParams {
                 post_filter: PostFilter::Sepia,
@@ -8400,6 +8417,10 @@ mod tests {
         );
         assert_eq!(
             json["preset_slots"]["slots"][1]["params"]["post_filter"],
+            "none"
+        );
+        assert_eq!(
+            json["preset_slots"]["slots"][2]["params"]["post_filter"],
             "sepia"
         );
         assert_eq!(
@@ -8408,16 +8429,25 @@ mod tests {
         );
         assert_eq!(
             json["post_filter_global_preset_stash"]["anime_upscale"],
+            false
+        );
+        assert_eq!(
+            json["post_filter_global_preset_stash"]["pixel_art_upscale"],
             true
         );
         assert_eq!(
             json["post_filter_preset_slot_stashes"][0]["sharp_upscale"],
             true
         );
+        assert_eq!(
+            json["post_filter_preset_slot_stashes"][1]["anime_upscale"],
+            true
+        );
         assert!(
             !json.to_string().contains("upscale_sharp")
-                && !json.to_string().contains("upscale_anime"),
-            "v2.11.0-visible enum fields must contain neither new variant"
+                && !json.to_string().contains("upscale_anime")
+                && !json.to_string().contains("upscale_pixel_art"),
+            "v2.11.0-visible enum fields must contain no new variant"
         );
 
         #[derive(Debug, PartialEq, serde::Deserialize)]
@@ -8461,12 +8491,23 @@ mod tests {
                 .unwrap()
                 .params
                 .post_filter,
+            V211PostFilter::None
+        );
+        assert_eq!(
+            old.preset_slots.slots[2]
+                .as_ref()
+                .unwrap()
+                .params
+                .post_filter,
             V211PostFilter::Sepia
         );
 
         let mut loaded: Settings = serde_json::from_value(json).unwrap();
         loaded.sanitize();
-        assert_eq!(loaded.global_preset.post_filter, PostFilter::UpscaleAnime);
+        assert_eq!(
+            loaded.global_preset.post_filter,
+            PostFilter::UpscalePixelArt
+        );
         assert_eq!(
             loaded.preset_slots.slots[0]
                 .as_ref()
@@ -8481,15 +8522,26 @@ mod tests {
                 .unwrap()
                 .params
                 .post_filter,
+            PostFilter::UpscaleAnime
+        );
+        assert_eq!(
+            loaded.preset_slots.slots[2]
+                .as_ref()
+                .unwrap()
+                .params
+                .post_filter,
             PostFilter::Sepia
         );
         assert!(!loaded.post_filter_global_preset_stash.sharp_upscale);
         assert!(!loaded.post_filter_global_preset_stash.anime_upscale);
+        assert!(!loaded.post_filter_global_preset_stash.pixel_art_upscale);
         assert!(
             loaded
                 .post_filter_preset_slot_stashes
                 .iter()
-                .all(|stash| !stash.sharp_upscale && !stash.anime_upscale)
+                .all(|stash| !stash.sharp_upscale
+                    && !stash.anime_upscale
+                    && !stash.pixel_art_upscale)
         );
     }
 
@@ -8497,7 +8549,11 @@ mod tests {
     fn post_filter_stash_restores_each_new_variant_independently() {
         use crate::adjustment::{AdjustParams, PostFilter};
 
-        for variant in [PostFilter::UpscaleSharp, PostFilter::UpscaleAnime] {
+        for variant in [
+            PostFilter::UpscaleSharp,
+            PostFilter::UpscaleAnime,
+            PostFilter::UpscalePixelArt,
+        ] {
             let mut params = AdjustParams {
                 post_filter: variant,
                 ..Default::default()
@@ -8507,8 +8563,18 @@ mod tests {
             assert_eq!(params.post_filter, PostFilter::None);
             stash.restore_after_load(&mut params);
             assert_eq!(params.post_filter, variant);
-            assert!(!stash.sharp_upscale && !stash.anime_upscale);
+            assert!(!stash.sharp_upscale && !stash.anime_upscale && !stash.pixel_art_upscale);
         }
+
+        let mut params = AdjustParams::default();
+        let mut stash = PostFilterDowngradeStash {
+            sharp_upscale: true,
+            anime_upscale: true,
+            pixel_art_upscale: true,
+        };
+        stash.restore_after_load(&mut params);
+        assert_eq!(params.post_filter, PostFilter::UpscaleAnime);
+        assert!(!stash.sharp_upscale && !stash.anime_upscale && !stash.pixel_art_upscale);
     }
 
     #[test]

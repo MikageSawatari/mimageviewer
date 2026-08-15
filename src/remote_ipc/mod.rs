@@ -718,7 +718,13 @@ mod adjustment_value_tests {
                 .filter(|option| !option.rewrites_pixels)
                 .map(|option| option.value.as_str())
                 .collect::<Vec<_>>(),
-            ["none", "nearest", "upscale_sharp", "upscale_anime"]
+            [
+                "none",
+                "nearest",
+                "upscale_sharp",
+                "upscale_anime",
+                "upscale_pixel_art",
+            ]
         );
     }
 
