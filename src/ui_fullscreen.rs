@@ -16629,6 +16629,19 @@ impl App {
             return action;
         }
 
+        // The overflow panel is a menu, so the next keystroke closes it - and then goes on to do
+        // whatever it was going to do. It does not swallow the key: a menu that eats the input
+        // that dismisses it is the reason Esc appeared dead while it was open.
+        if self.fs_overflow_panel_state.is_open()
+            && ctx.input(|i| {
+                i.events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::Key { pressed: true, .. }))
+            })
+        {
+            self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+        }
+
         // ZipPla 風全画面ズーム (Z ホールド) のエッジ検出。編集/分析/見開き/連結/パノラマ/動画では
         // 無効化され、コンテキスト外なら状態をリセットする。編集モードの early-return より前に
         // 毎フレーム呼び、Z 押しっぱで対象外へ移ったときに状態が残らないようにする。
@@ -21217,9 +21230,17 @@ impl App {
                         }
                     } else if fs_response.clicked() {
                         // ポップアップ表示中はクリックでのページ送りを抑制
+                        // The overflow panel goes away on the click that lands outside it, and
+                        // that click is spent doing so rather than also turning the page - the
+                        // same bargain the other top-bar popups make.
+                        let overflow_panel_dismissed = self.fs_overflow_panel_state.is_open();
+                        if overflow_panel_dismissed {
+                            self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+                        }
                         let any_popup = self.spread_popup_open
                             || self.fit_popup_open
                             || self.slideshow_popup_open
+                            || overflow_panel_dismissed
                             || fs_rotation_popup_open(ctx);
                         if !any_popup {
                             if let Some(pos) = fs_response.interact_pointer_pos() {

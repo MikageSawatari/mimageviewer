@@ -14852,7 +14852,12 @@ impl App {
             self.show_tag_editor => "tag_editor",
             self.show_tag_apply => "tag_apply",
             self.fullscreen_tag_picker_open => "fullscreen_tag_picker",
-            self.fs_overflow_panel_state.is_open() => "fs_overflow_panel",
+            // The top bar's overflow panel is deliberately absent. It is a menu, not a dialog:
+            // it asks nothing and has nothing to confirm, and its siblings in the same bar - the
+            // spread, fit and slideshow popups - have never blocked anything. Classifying it with
+            // dialogs made it hold every key while open, including the Esc that closes it, and
+            // made a right-click stop closing the image for no visible reason. It dismisses
+            // itself on the next input instead (v3.0.0, before release).
             self.show_fav_add_dialog => "fav_add",
             self.show_open_folder_dialog => "open_folder",
             self.show_subfolder_expansion_dialog => "subfolder_expansion_dialog",

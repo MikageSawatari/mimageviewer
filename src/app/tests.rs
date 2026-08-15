@@ -5,12 +5,22 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 #[test]
-fn fullscreen_overflow_panel_registers_as_common_modal_and_closes_at_file_boundary() {
+/// The overflow panel is a menu, and a menu holds nothing.
+///
+/// It shipped classified with dialogs, which meant it held every key while open - including the
+/// Esc that closes it - and made a right-click stop closing the image with nothing on screen to
+/// explain why. Its siblings in the same bar have never blocked anything (2026-08-15, before
+/// v3.0.0 went out).
+fn fullscreen_overflow_panel_holds_no_input_and_closes_at_file_boundary() {
     let mut app = setup_app_for_test();
     app.fs_overflow_panel_state = FsOverflowPanelState::Root;
-    assert!(app.common_modal_dialog_open());
-    assert!(app.any_modal_dialog_open_for_fullscreen_keys());
-    assert_eq!(app.modal_dialog_block_reason(), Some("fs_overflow_panel"));
+    assert!(!app.common_modal_dialog_open());
+    assert!(!app.any_modal_dialog_open_for_fullscreen_keys());
+    assert_eq!(app.modal_dialog_block_reason(), None);
+    assert!(
+        app.grid_open_from_click_allowed(),
+        "a menu in the fullscreen bar must not stop the grid from opening anything"
+    );
 
     app.reset_fs_side_panel_runtime_for_file_change();
     assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
@@ -30,7 +40,6 @@ fn leaving_fullscreen_closes_the_panel_that_only_draws_there() {
     app.close_fullscreen();
 
     assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
-    assert_eq!(app.modal_dialog_block_reason(), None);
 }
 
 /// An open dialog stops the grid from opening anything.
