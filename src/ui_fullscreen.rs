@@ -15615,6 +15615,14 @@ impl App {
             })
     }
 
+    /// embedded 静止画は in-window native 動画から往復してきた状態を指すので、native
+    /// presenter を持たない環境では起こらない。フルスクリーンは常に専用 viewport にある。
+    /// 呼び出し側を cfg で割らずに済むよう、ここで false を返す。
+    #[cfg(not(windows))]
+    pub(crate) fn fullscreen_embedded_still_active(&self) -> bool {
+        false
+    }
+
     #[cfg(windows)]
     fn native_video_presenter_pending_for_fs(&self, fs_idx: usize) -> bool {
         if self.pending_native_video_output_active_for_fs(fs_idx) {
