@@ -60,6 +60,17 @@ impl Rotation {
     }
 }
 
+/// 保存済み回転を反映した表示方向が横長（幅 > 高さ）かを返す。
+///
+/// 回転はテクスチャへ焼き込まず描画時に適用するため、レイアウト判定側が 90° / 270° の
+/// 幅と高さを入れ替える。寸法が未確定の場合の扱いは呼び出し側が所有する。
+pub(crate) fn landscape_after_rotation(width: u32, height: u32, rotation: Rotation) -> bool {
+    match rotation {
+        Rotation::Cw90 | Rotation::Cw270 => height > width,
+        Rotation::None | Rotation::Cw180 => width > height,
+    }
+}
+
 /// 回転 DB ハンドル
 pub struct RotationDb {
     conn: rusqlite::Connection,
@@ -260,6 +271,31 @@ mod tests {
         assert_eq!(r, Rotation::Cw90);
         r = r.rotate_ccw();
         assert_eq!(r, Rotation::None);
+    }
+
+    #[test]
+    fn landscape_after_rotation_covers_all_quarter_turns() {
+        let cases = [
+            (Rotation::None, false, true),
+            (Rotation::Cw90, true, false),
+            (Rotation::Cw180, false, true),
+            (Rotation::Cw270, true, false),
+        ];
+
+        for (rotation, portrait_is_landscape, landscape_is_landscape) in cases {
+            assert_eq!(
+                landscape_after_rotation(600, 900, rotation),
+                portrait_is_landscape,
+                "portrait source at {} degrees",
+                rotation.degrees()
+            );
+            assert_eq!(
+                landscape_after_rotation(900, 600, rotation),
+                landscape_is_landscape,
+                "landscape source at {} degrees",
+                rotation.degrees()
+            );
+        }
     }
 
     #[test]

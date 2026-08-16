@@ -299,6 +299,13 @@ frame 冒頭では、先読み窓ぶんの `fs_cache` を 1 回だけ走査し�
 現在の縦横判定に使う寸法を `PageDimsCache` へ回収する。見開きの判定順は `fs_cache` →
 ロード済みサムネイル → `PageDimsCache` → 未知なら縦長扱いであり、一度判明した寸法は live cache
 退去後も同じ viewer context / items 世代に残る。全 thumbnails の毎 frame 走査は行わない。
+各 cache が保持する寸法は回転前なので、見開きの横長判定は nav 分の保存済み回転を
+`rotation_db.get_many` で一括取得し、共通の `landscape_after_rotation` へ寸法とともに渡す。
+90° / 270° は幅と高さを入れ替え、0° / 180° は元の寸法比を使う。`rotation_cache` は item
+差し替え時に失効し、個別回転時は更新値を直接 memoize する。`SpreadDisplayUnit` は固定 cache を
+持たず表示・ナビゲーションの各解決時に組み直すため、回転変更後の次の解決から単独境界と後続ペアが変わる。
+Remote の通常コンテナとコレクションも catalog の回転前寸法と同じ回転キーを一括で読み、同じ純関数を
+通す。寸法未確定を縦長扱いにする契約と、address-based `PageGroup` の通信形式は変更しない。
 
 paged 表示でキーリピート由来の未消費ページ送り edge が同じ input frame に残る場合は、現在の
 表示 unit をカタログサムネイルで 1 frame 描き、processed texture と完成済み worker result の

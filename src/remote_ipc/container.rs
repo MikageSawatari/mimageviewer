@@ -571,10 +571,6 @@ fn remote_page_perf_key(address: &RemoteAddress) -> String {
     }
 }
 
-fn catalog_dims_are_landscape((width, height): (u32, u32)) -> bool {
-    width > height
-}
-
 /// Remote の表示ページ専用 encoder。サムネイル cache の WebP 形式とは共有しない。
 fn encode_remote_page_jpeg(
     image: &egui::ColorImage,
@@ -4900,9 +4896,20 @@ impl ContainerEngine {
             .as_ref()
             .and_then(|catalog| catalog.load_source_dims().ok())
             .unwrap_or_default();
+        let rotation_keys = items
+            .iter()
+            .map(crate::edit_source::page_key_for_grid_item)
+            .collect::<Vec<_>>();
+        // ページ画像と同じ既存キーを使い、全 item 分を 1 回の chunked query で読む。
+        // DB が無い / 開けない場合は従来の回転なしとして扱う。
+        let rotations = crate::rotation_db::RotationDb::open_readonly()
+            .ok()
+            .map(|db| db.get_many(rotation_keys.iter().filter_map(|key| key.as_deref())))
+            .unwrap_or_default();
         items
             .iter()
-            .map(|item| {
+            .zip(rotation_keys)
+            .map(|(item, rotation_key)| {
                 let key = match item {
                     crate::grid_item::GridItem::Image(path) => path
                         .file_name()
@@ -4930,7 +4937,14 @@ impl ContainerEngine {
                 })
                 // Catalog dimensions are a layout/aspect space. PDF page-box values are valid
                 // here because only their ratio is observed; they are not an edit coordinate.
-                .is_some_and(catalog_dims_are_landscape)
+                .is_some_and(|(width, height)| {
+                    let rotation = rotation_key
+                        .as_ref()
+                        .and_then(|key| rotations.get(key))
+                        .copied()
+                        .unwrap_or(crate::rotation_db::Rotation::None);
+                    crate::rotation_db::landscape_after_rotation(width, height, rotation)
+                })
             })
             .collect()
     }
@@ -7377,9 +7391,46 @@ mod tests {
     }
 
     #[test]
-    fn catalog_dimensions_remain_valid_for_landscape_ratio_classification() {
-        assert!(!catalog_dims_are_landscape((468_600, 714_360)));
-        assert!(catalog_dims_are_landscape((714_360, 468_600)));
+    fn cached_landscape_flags_apply_saved_pdf_page_rotation() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let pdf_path = data_dir.path().join("rotated.pdf");
+        let items = (0..2)
+            .map(|page_num| crate::grid_item::GridItem::PdfPage {
+                pdf_path: pdf_path.clone(),
+                page_num,
+                content_type: None,
+            })
+            .collect::<Vec<_>>();
+        let catalog =
+            crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &pdf_path)
+                .unwrap();
+        for page_num in 0..2 {
+            catalog
+                .save(
+                    &crate::grid_item::pdf_page_cache_key(page_num),
+                    1,
+                    10,
+                    100,
+                    144,
+                    Some((503, 727)),
+                    b"thumb",
+                )
+                .unwrap();
+        }
+        drop(catalog);
+
+        let rotation_db = crate::rotation_db::RotationDb::open().unwrap();
+        let page_key = crate::edit_source::page_key_for_grid_item(&items[0]).unwrap();
+        rotation_db
+            .set_key(&page_key, crate::rotation_db::Rotation::Cw270)
+            .unwrap();
+        drop(rotation_db);
+
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        assert_eq!(
+            engine.cached_landscape_flags(&pdf_path, &items),
+            [true, false]
+        );
     }
 
     #[test]

@@ -856,6 +856,19 @@ fn cached_collection_landscape_flags(entries: &[RemoteEntry]) -> Vec<bool> {
 
     let cache_dir = crate::catalog::default_cache_dir();
     let mut landscape = vec![false; entries.len()];
+    let rotation_keys = entries
+        .iter()
+        .map(|entry| {
+            (entry.kind == RemoteEntryKind::Image)
+                .then(|| GridItem::Image(PathBuf::from(&entry.path)))
+                .as_ref()
+                .and_then(crate::edit_source::page_key_for_grid_item)
+        })
+        .collect::<Vec<_>>();
+    let rotations = crate::rotation_db::RotationDb::open_readonly()
+        .ok()
+        .map(|db| db.get_many(rotation_keys.iter().filter_map(|key| key.as_deref())))
+        .unwrap_or_default();
     // 親フォルダごとに一度だけ catalog を開き、寸法列だけを一括取得する。
     // フォルダを処理し終えたら DB と寸法 map を drop するので、全親の blob/map を保持しない。
     for parent in parents {
@@ -875,7 +888,14 @@ fn cached_collection_landscape_flags(entries: &[RemoteEntry]) -> Vec<bool> {
                         .and_then(|entry| crate::catalog::decode_thumb_dims(&entry.jpeg_data))
                 })
             });
-            landscape[index] = dims.is_some_and(|(width, height)| width > height);
+            landscape[index] = dims.is_some_and(|(width, height)| {
+                let rotation = rotation_keys[index]
+                    .as_ref()
+                    .and_then(|key| rotations.get(key))
+                    .copied()
+                    .unwrap_or(crate::rotation_db::Rotation::None);
+                crate::rotation_db::landscape_after_rotation(width, height, rotation)
+            });
         }
     }
     landscape
@@ -1541,14 +1561,36 @@ mod tests {
         catalog
             .save("legacy-wide.jpg", 1, 10, 8, 6, None, &jpeg)
             .unwrap();
+        catalog
+            .save(
+                "rotated-portrait.jpg",
+                1,
+                10,
+                6,
+                8,
+                Some((600, 800)),
+                b"thumb",
+            )
+            .unwrap();
         drop(catalog);
+
+        let rotated_path = parent.join("rotated-portrait.jpg");
+        let rotation_db = crate::rotation_db::RotationDb::open().unwrap();
+        rotation_db
+            .set(&rotated_path, crate::rotation_db::Rotation::Cw90)
+            .unwrap();
+        drop(rotation_db);
 
         let entries = vec![
             test_remote_entry_kind(&parent.join("legacy-wide.jpg"), RemoteEntryKind::Image),
             test_remote_entry_kind(&parent.join("missing.jpg"), RemoteEntryKind::Image),
+            test_remote_entry_kind(&rotated_path, RemoteEntryKind::Image),
         ];
 
-        assert_eq!(cached_collection_landscape_flags(&entries), [true, false]);
+        assert_eq!(
+            cached_collection_landscape_flags(&entries),
+            [true, false, true]
+        );
     }
 
     #[test]

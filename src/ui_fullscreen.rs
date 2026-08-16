@@ -7506,6 +7506,7 @@ fn continuous_reading_drag_delta(
 /// 寸法はテクスチャ退去で失わないため、同じ items 世代で既知から未知へは後退しない。
 fn is_landscape(
     idx: usize,
+    rotation: crate::rotation_db::Rotation,
     fs_cache: &ItemsGenerationMap<FsCacheEntry>,
     thumbnails: &[ThumbnailState],
     page_dims_cache: &crate::page_dims::PageDimsCache,
@@ -7513,7 +7514,7 @@ fn is_landscape(
 ) -> bool {
     // フルサイズキャッシュから判定
     if let Some((w, h)) = fs_cache.get(&idx).and_then(fs_cache_entry_page_dims) {
-        return w > h;
+        return crate::rotation_db::landscape_after_rotation(w, h, rotation);
     }
     // サムネイルから判定
     if let Some(ThumbnailState::Loaded {
@@ -7524,14 +7525,15 @@ fn is_landscape(
     }) = thumbnails.get(idx)
     {
         if let Some((w, h)) = (*layout_dims).or(*source_dims) {
-            return w > h;
+            return crate::rotation_db::landscape_after_rotation(w, h, rotation);
         }
-        let s = tex.size_vec2();
-        return s.x > s.y;
+        let width = u32::try_from(tex.size()[0]).unwrap_or(u32::MAX);
+        let height = u32::try_from(tex.size()[1]).unwrap_or(u32::MAX);
+        return crate::rotation_db::landscape_after_rotation(width, height, rotation);
     }
     // live texture が退去済みでも、一度判明した同世代の寸法は忘れない。
     if let Some((w, h)) = page_dims_cache.get(items_generation, idx) {
-        return w > h;
+        return crate::rotation_db::landscape_after_rotation(w, h, rotation);
     }
     false
 }
@@ -7604,6 +7606,7 @@ impl SpreadDisplayUnit {
 
 fn build_spread_display_units(
     nav: &[usize],
+    rotations: &[crate::rotation_db::Rotation],
     items: &[GridItem],
     spread_mode: SpreadMode,
     shift_anchor_idx: Option<usize>,
@@ -7616,7 +7619,19 @@ fn build_spread_display_units(
         nav,
         spread_mode,
         shift_anchor_idx,
-        |idx| is_landscape(idx, fs_cache, thumbnails, page_dims_cache, items_generation),
+        |nav_pos, idx| {
+            is_landscape(
+                idx,
+                rotations
+                    .get(nav_pos)
+                    .copied()
+                    .unwrap_or(crate::rotation_db::Rotation::None),
+                fs_cache,
+                thumbnails,
+                page_dims_cache,
+                items_generation,
+            )
+        },
         |idx| is_spread_pairable_item(items.get(idx)),
     )
 }
@@ -7626,13 +7641,13 @@ fn build_spread_display_units_with_landscape(
     nav: &[usize],
     spread_mode: SpreadMode,
     shift_anchor_idx: Option<usize>,
-    is_landscape_idx: impl FnMut(usize) -> bool,
+    mut is_landscape_idx: impl FnMut(usize) -> bool,
 ) -> Vec<SpreadDisplayUnit> {
     build_spread_display_units_with_predicates(
         nav,
         spread_mode,
         shift_anchor_idx,
-        is_landscape_idx,
+        |_, idx| is_landscape_idx(idx),
         |_| true,
     )
 }
@@ -7641,7 +7656,7 @@ fn build_spread_display_units_with_predicates(
     nav: &[usize],
     spread_mode: SpreadMode,
     shift_anchor_idx: Option<usize>,
-    mut is_landscape_idx: impl FnMut(usize) -> bool,
+    mut is_landscape_idx: impl FnMut(usize, usize) -> bool,
     mut is_pairable_idx: impl FnMut(usize) -> bool,
 ) -> Vec<SpreadDisplayUnit> {
     let mut units = Vec::new();
@@ -7700,7 +7715,7 @@ pub(crate) fn build_remote_spread_page_groups(
         &nav,
         spread_mode,
         None,
-        |idx| is_landscape.get(idx).copied().unwrap_or(false),
+        |_, idx| is_landscape.get(idx).copied().unwrap_or(false),
         |idx| is_spread_pairable_item(items.get(idx)),
     )
     .into_iter()
@@ -7716,12 +7731,12 @@ fn append_spread_display_units_until(
     units: &mut Vec<SpreadDisplayUnit>,
     pos: &mut usize,
     end_pos: usize,
-    is_landscape_idx: &mut impl FnMut(usize) -> bool,
+    is_landscape_idx: &mut impl FnMut(usize, usize) -> bool,
     is_pairable_idx: &mut impl FnMut(usize) -> bool,
 ) {
     while *pos < end_pos {
         let current = nav[*pos];
-        if !is_pairable_idx(current) || is_landscape_idx(current) {
+        if !is_pairable_idx(current) || is_landscape_idx(*pos, current) {
             units.push(SpreadDisplayUnit {
                 nav_start: *pos,
                 pages: vec![current],
@@ -7732,7 +7747,7 @@ fn append_spread_display_units_until(
 
         if *pos + 1 < end_pos {
             let partner = nav[*pos + 1];
-            if is_pairable_idx(partner) && !is_landscape_idx(partner) {
+            if is_pairable_idx(partner) && !is_landscape_idx(*pos + 1, partner) {
                 units.push(SpreadDisplayUnit {
                     nav_start: *pos,
                     pages: vec![current, partner],
@@ -8627,10 +8642,13 @@ impl App {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn spread_display_unit_pages_for_test(&self, nav: &[usize]) -> Vec<Vec<usize>> {
+    fn build_spread_display_units_for_nav(&mut self, nav: &[usize]) -> Vec<SpreadDisplayUnit> {
+        // `get_rotations_for_indices` が mutable なのは DB 未読分を idx cache へ memoize するため。
+        // fs_cache / thumbnails の借用より先に nav 全体を一括取得して借用を分離する。
+        let rotations = self.get_rotations_for_indices(nav);
         build_spread_display_units(
             nav,
+            &rotations,
             &self.items,
             self.spread_mode,
             self.spread_shift_anchor_idx,
@@ -8639,9 +8657,14 @@ impl App {
             &self.page_dims_cache,
             self.items_generation,
         )
-        .into_iter()
-        .map(|unit| unit.screen_pages(self.spread_mode))
-        .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spread_display_unit_pages_for_test(&mut self, nav: &[usize]) -> Vec<Vec<usize>> {
+        self.build_spread_display_units_for_nav(nav)
+            .into_iter()
+            .map(|unit| unit.screen_pages(self.spread_mode))
+            .collect()
     }
 
     pub(crate) fn still_touch_chrome_is_latched(&self, ctx: &egui::Context) -> bool {
@@ -11599,16 +11622,7 @@ impl App {
         // 連結読みでない見開き中は、毎フレーム組み直した表示ユニット単位でシークする。
         let spread_seek = if self.spread_mode.is_spread() && !continuous_label_mode {
             let nav = self.get_nav_indices();
-            let units = build_spread_display_units(
-                &nav,
-                &self.items,
-                self.spread_mode,
-                self.spread_shift_anchor_idx,
-                &self.fs_cache,
-                &self.thumbnails,
-                &self.page_dims_cache,
-                self.items_generation,
-            );
+            let units = self.build_spread_display_units_for_nav(&nav);
             match find_spread_display_unit(&units, fs_idx) {
                 Some((unit_index, _)) => Some((units, unit_index)),
                 None => None,
@@ -16066,16 +16080,7 @@ impl App {
         let Some(pos) = nav.iter().position(|&i| i == idx) else {
             return SpreadPair::Single;
         };
-        let units = build_spread_display_units(
-            &nav,
-            &self.items,
-            self.spread_mode,
-            self.spread_shift_anchor_idx,
-            &self.fs_cache,
-            &self.thumbnails,
-            &self.page_dims_cache,
-            self.items_generation,
-        );
+        let units = self.build_spread_display_units_for_nav(&nav);
         find_spread_display_unit(&units, nav[pos])
             .map(|(_, unit)| unit.spread_pair(self.spread_mode))
             .unwrap_or(SpreadPair::Single)
@@ -16122,7 +16127,7 @@ impl App {
     }
 
     fn spread_page_nav_for_indices(
-        &self,
+        &mut self,
         nav: &[usize],
         fs_idx: usize,
         base_delta: i32,
@@ -16134,16 +16139,7 @@ impl App {
         if !self.spread_mode.is_spread() {
             return FsPageNav::Delta(base_delta);
         }
-        let units = build_spread_display_units(
-            nav,
-            &self.items,
-            self.spread_mode,
-            self.spread_shift_anchor_idx,
-            &self.fs_cache,
-            &self.thumbnails,
-            &self.page_dims_cache,
-            self.items_generation,
-        );
+        let units = self.build_spread_display_units_for_nav(nav);
         let Some((unit_pos, _)) = find_spread_display_unit(&units, fs_idx) else {
             return FsPageNav::Delta(base_delta);
         };
@@ -16170,8 +16166,10 @@ impl App {
         } else {
             self.get_nav_indices()
         };
+        let rotations = self.get_rotations_for_indices(&nav);
         let units = build_spread_display_units(
             &nav,
+            &rotations,
             &self.items,
             self.spread_mode,
             self.spread_shift_anchor_idx,
@@ -16182,10 +16180,15 @@ impl App {
         );
         let landscape_flags = nav
             .iter()
-            .map(|&idx| {
+            .enumerate()
+            .map(|(nav_pos, &idx)| {
                 !is_spread_pairable_item(self.items.get(idx))
                     || is_landscape(
                         idx,
+                        rotations
+                            .get(nav_pos)
+                            .copied()
+                            .unwrap_or(crate::rotation_db::Rotation::None),
                         &self.fs_cache,
                         &self.thumbnails,
                         &self.page_dims_cache,
@@ -16254,16 +16257,7 @@ impl App {
             return;
         };
         let nav = self.get_nav_indices();
-        let units = build_spread_display_units(
-            &nav,
-            &self.items,
-            self.spread_mode,
-            self.spread_shift_anchor_idx,
-            &self.fs_cache,
-            &self.thumbnails,
-            &self.page_dims_cache,
-            self.items_generation,
-        );
+        let units = self.build_spread_display_units_for_nav(&nav);
         if let Some((_, unit)) = find_spread_display_unit(&units, idx) {
             let new_idx = unit.anchor_idx();
             if new_idx == idx {
@@ -23826,7 +23820,7 @@ impl App {
     }
 
     fn continuous_reading_units_and_pos(
-        &self,
+        &mut self,
         idx: usize,
     ) -> Option<(Vec<ContinuousReadingUnitSpec>, usize)> {
         let display_order = self.current_grid_order().to_vec();
@@ -23834,24 +23828,16 @@ impl App {
         let mut image_units = Vec::new();
 
         if self.spread_mode.is_spread() {
+            let spread_mode = self.spread_mode;
             image_units.extend(
-                build_spread_display_units(
-                    &image_indices,
-                    &self.items,
-                    self.spread_mode,
-                    self.spread_shift_anchor_idx,
-                    &self.fs_cache,
-                    &self.thumbnails,
-                    &self.page_dims_cache,
-                    self.items_generation,
-                )
-                .into_iter()
-                .map(|unit| {
-                    ContinuousReadingUnitSpec::pages(
-                        unit.anchor_idx(),
-                        unit.screen_pages(self.spread_mode),
-                    )
-                }),
+                self.build_spread_display_units_for_nav(&image_indices)
+                    .into_iter()
+                    .map(|unit| {
+                        ContinuousReadingUnitSpec::pages(
+                            unit.anchor_idx(),
+                            unit.screen_pages(spread_mode),
+                        )
+                    }),
             );
         } else {
             image_units.extend(
@@ -40652,6 +40638,26 @@ mod tests {
                 vec![9, 8],
                 vec![11, 10]
             ]
+        );
+    }
+
+    #[test]
+    fn spread_units_keep_page_rotated_to_landscape_single() {
+        let nav = [0, 1, 2, 3, 4];
+        let rotations = [
+            crate::rotation_db::Rotation::Cw90,
+            crate::rotation_db::Rotation::None,
+            crate::rotation_db::Rotation::None,
+            crate::rotation_db::Rotation::None,
+            crate::rotation_db::Rotation::None,
+        ];
+        let units = build_spread_display_units_with_landscape(&nav, SpreadMode::Ltr, None, |idx| {
+            crate::rotation_db::landscape_after_rotation(600, 900, rotations[idx])
+        });
+
+        assert_eq!(
+            spread_unit_summary(&units),
+            vec![(0, vec![0]), (1, vec![1, 2]), (3, vec![3, 4])]
         );
     }
 

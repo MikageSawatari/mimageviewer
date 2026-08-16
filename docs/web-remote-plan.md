@@ -793,8 +793,10 @@ HTTP は認証必須の `GET /api/home` と `GET /api/collection` を追加す�
 保存せず、指定がない初回は `SpreadRestoreDefaults::NON_BOOK` を使う。本体は collection 全体から
 画像だけを選び、`ui_fullscreen::build_remote_spread_page_groups` で address-based `page_groups` を
 生成する。横長判定は画像を実親フォルダごとにまとめ、各親の catalog を 1 回だけ read-only open
-して `load_source_dims` を一括取得する。旧行の寸法が `NULL` の画像だけ `load_one` の thumbnail 寸法へ
-fallback し、未取得は縦長扱いとする。親の処理ごとに catalog と寸法 map を破棄する。
+して `load_source_dims` を一括取得する。さらに全画像の保存済み回転を既存ページキーで一括取得し、
+通常コンテナ / fullscreen と共通の回転後横長判定へ渡す。旧行の寸法が `NULL` の画像だけ
+`load_one` の thumbnail 寸法へ fallback し、未取得は縦長扱いとする。親の処理ごとに catalog と
+寸法 map を破棄する。
 
 Web は応答をコンテナと共通の `setContainerPageGroups` へ渡し、見開き変更・読み方向変更・縦持ち
 Single の変更時には `/api/collection` を再取得する。collection の見開き指定はその閲覧 session にだけ
@@ -988,8 +990,9 @@ layout → atomic replace を実行する。bundler、TypeScript、追加 packag
 `build_spread_display_units_with_predicates`、`is_spread_pairable_item`、
 `SpreadDisplayUnit::spread_pair` を通す。したがって表紙の `has_cover` / `prefix_end` 位相、
 画像として組めない item、横長ページの単独境界、RTL の左右配置を fullscreen と共有する。
-横長判定は本体 catalog の既存 `source_dims`（無い場合は既存 thumbnail の寸法）を read-only で
-参照し、寸法未確定時は fullscreen と同じく非横長として扱う。応答の `page_groups` はグループ列を
+横長判定は本体 catalog の既存 `source_dims`（無い場合は既存 thumbnail の寸法）と保存済み回転を
+read-only で一括参照し、fullscreen / collection と共通の回転後横長判定を使う。寸法未確定時は
+fullscreen と同じく非横長として扱う。応答の `page_groups` はグループ列を
 読み進める順に並べ、各 `pages` は画面上の左→右順、`anchor` はそのグループの読み順先頭とする。
 remote-web は受信した各 address を組み直さず、独自 sort もしない。
 
@@ -1215,7 +1218,7 @@ container 応答は fetch 実装が abort を無視して完了しても現在�
 グループ列は引き続き本体
 `build_image_reading_indices` → `build_spread_display_units_with_predicates` →
 `SpreadDisplayUnit::spread_pair` を通す。通常 `GridItem::Image` でも表紙位相、catalog
-`source_dims` による横長単独、RTL の画面左右順が ZIP / PDF と同じになる。純粋関数テストは
+`source_dims` と保存済み回転による横長単独、RTL の画面左右順が ZIP / PDF と同じになる。純粋関数テストは
 LtrCover、横長境界、RTL、縦持ち Single を通常画像 item で固定する。
 
 読書位置と一覧の drift は、`materialize_local_folder_listing` を唯一の production

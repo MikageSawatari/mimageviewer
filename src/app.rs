@@ -46097,6 +46097,41 @@ impl App {
         rot
     }
 
+    /// 指定した item index 群の回転を、DB 未読分だけ一括取得して入力順で返す。
+    ///
+    /// 見開き構築は nav 全体を読むため、ページごとの `get_rotation` で同期 SELECT を
+    /// 繰り返さず、既存の idx cache と `RotationDb::get_many` を同じ所有境界で更新する。
+    pub(crate) fn get_rotations_for_indices(
+        &mut self,
+        indices: &[usize],
+    ) -> Vec<crate::rotation_db::Rotation> {
+        use crate::rotation_db::Rotation;
+
+        let mut rotations = vec![Rotation::None; indices.len()];
+        let mut missing = Vec::new();
+        for (position, &idx) in indices.iter().enumerate() {
+            if let Some(&rotation) = self.rotation_cache.get(&idx) {
+                rotations[position] = rotation;
+                continue;
+            }
+            if let Some(key) = self.rotation_key_for_idx(idx) {
+                missing.push((position, idx, key));
+            }
+        }
+
+        let loaded = self
+            .rotation_db
+            .as_ref()
+            .map(|db| db.get_many(missing.iter().map(|(_, _, key)| key.as_str())))
+            .unwrap_or_default();
+        for (position, idx, key) in missing {
+            let rotation = loaded.get(&key).copied().unwrap_or(Rotation::None);
+            self.rotation_cache.insert(idx, rotation);
+            rotations[position] = rotation;
+        }
+        rotations
+    }
+
     fn rotation_key_for_idx(&self, idx: usize) -> Option<String> {
         match self.items.get(idx)? {
             GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => {

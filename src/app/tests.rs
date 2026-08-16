@@ -195,6 +195,51 @@ fn spread_page_dims_survive_fs_cache_and_thumbnail_eviction() {
 }
 
 #[test]
+fn spread_units_rebuild_after_saved_rotation_changes() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    app.items = (0..5)
+        .map(|page| GridItem::Image(PathBuf::from(format!("C:/spread/{page:02}.png"))))
+        .collect();
+    app.spread_mode = crate::settings::SpreadMode::Ltr;
+    let portrait_tex = ctx.load_texture(
+        "rotation_spread_portrait",
+        egui::ColorImage::filled([1, 2], egui::Color32::WHITE),
+        egui::TextureOptions::LINEAR,
+    );
+    app.thumbnails = (0..app.items.len())
+        .map(|_| ThumbnailState::Loaded {
+            tex: portrait_tex.clone(),
+            from_cache: false,
+            from_edit_preview: false,
+            rendered_at_px: 2,
+            source_dims: Some((600, 900)),
+            layout_dims: None,
+        })
+        .collect();
+    let nav = (0..app.items.len()).collect::<Vec<_>>();
+
+    assert_eq!(
+        app.spread_display_unit_pages_for_test(&nav),
+        vec![vec![0, 1], vec![2, 3], vec![4]]
+    );
+
+    app.rotate_image_cw(0);
+    assert_eq!(
+        app.spread_display_unit_pages_for_test(&nav),
+        vec![vec![0], vec![1, 2], vec![3, 4]],
+        "R 回転後は更新済み rotation_cache から同じフレームの再構築へ反映する"
+    );
+
+    app.rotate_image_ccw(0);
+    assert_eq!(
+        app.spread_display_unit_pages_for_test(&nav),
+        vec![vec![0, 1], vec![2, 3], vec![4]],
+        "L 回転で縦長へ戻した後も固定した表示ユニットを再利用しない"
+    );
+}
+
+#[test]
 #[cfg(windows)]
 fn page_dims_cache_does_not_cross_equal_generation_viewer_bundles() {
     let mut app = phase_c_support::setup_app();
