@@ -9,6 +9,16 @@ use crate::{
 use egui::{Context, Event, UserData, ViewportId, ViewportIdMap, ViewportIdSet};
 use std::{num::NonZeroU32, sync::Arc};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaintOutcome {
+    RenderStateAbsent,
+    AppliedWithoutPaint,
+    SurfaceAbsent,
+    SurfaceRecreated,
+    Skipped,
+    Submitted,
+}
+
 /// mIV: hand a frame's `set` deltas to the renderer, recording each one against the size the
 /// renderer held beforehand. Both the painting and the non-painting path go through here so the
 /// ledger sees every application, in order. See [`crate::atlas_diag`].
@@ -448,25 +458,15 @@ impl Painter {
     /// Frees are applied here too: this frame will never paint, so nothing can still be
     /// referencing them, and leaving them behind leaks for the life of the process.
     pub fn apply_textures_delta(&mut self, textures_delta: &epaint::textures::TexturesDelta) {
-        let Some(render_state) = self.render_state.as_ref() else {
-            crate::atlas_diag::record_dropped_batch(
-                crate::atlas_diag::Site::AppliedNoPaint,
-                crate::atlas_diag::DropReason::RenderStateAbsent,
-                textures_delta,
-            );
-            return;
-        };
-        let mut renderer = render_state.renderer.write();
-        apply_delta_set(
-            &mut renderer,
-            &render_state.device,
-            &render_state.queue,
+        let outcome = match begin_delivery(
+            self.render_state.as_ref(),
             textures_delta,
             crate::atlas_diag::Site::AppliedNoPaint,
-        );
-        for id in &textures_delta.free {
-            renderer.free_texture(id);
-        }
+        ) {
+            Ok(()) => PaintOutcome::AppliedWithoutPaint,
+            Err(outcome) => outcome,
+        };
+        finish_delivery(self.render_state.as_ref(), textures_delta, outcome);
     }
 
     /// Returns two things:
@@ -489,15 +489,6 @@ impl Painter {
         let capture = !capture_data.is_empty();
         let mut vsync_sec = 0.0;
 
-        let Some(render_state) = self.render_state.as_mut() else {
-            crate::atlas_diag::record_dropped_batch(
-                crate::atlas_diag::Site::AppliedPaint,
-                crate::atlas_diag::DropReason::RenderStateAbsent,
-                textures_delta,
-            );
-            return vsync_sec;
-        };
-
         // mIV: apply texture deltas before the surface lookup.
         //
         // egui hands each delta over exactly once - `Context::end_pass` takes it out of the
@@ -510,194 +501,192 @@ impl Painter {
         //   "Copy of Y 45..126 would end up overrunning the bounds of ... Y size 32".
         // The same dropped-upload boundary previously showed up as permanently black
         // thumbnails. See docs/display-pipeline.md.
-        {
-            let mut renderer = render_state.renderer.write();
-            apply_delta_set(
-                &mut renderer,
-                &render_state.device,
-                &render_state.queue,
-                textures_delta,
-                crate::atlas_diag::Site::AppliedPaint,
-            );
-        }
+        let begin = begin_delivery(
+            self.render_state.as_ref(),
+            textures_delta,
+            crate::atlas_diag::Site::AppliedPaint,
+        );
 
-        let Some(surface_state) = self.surfaces.get(&viewport_id) else {
-            // This frame will never be painted, but egui has already given up ownership of
-            // the freed ids, so release them here or they stay resident for the process.
-            let mut renderer = render_state.renderer.write();
-            for id in &textures_delta.free {
-                renderer.free_texture(id);
-            }
-            return vsync_sec;
-        };
+        let outcome = match begin {
+            Err(outcome) => outcome,
+            Ok(()) => 'paint: {
+                let render_state = self
+                    .render_state
+                    .as_mut()
+                    .expect("begin_delivery verified the render state");
+                let Some(surface_state) = self.surfaces.get(&viewport_id) else {
+                    break 'paint PaintOutcome::SurfaceAbsent;
+                };
 
-        let mut encoder =
-            render_state
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("encoder"),
-                });
+                let mut encoder =
+                    render_state
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("encoder"),
+                        });
 
-        // Upload all resources for the GPU.
-        let screen_descriptor = renderer::ScreenDescriptor {
-            size_in_pixels: [surface_state.width, surface_state.height],
-            pixels_per_point,
-        };
+                // Upload all resources for the GPU.
+                let screen_descriptor = renderer::ScreenDescriptor {
+                    size_in_pixels: [surface_state.width, surface_state.height],
+                    pixels_per_point,
+                };
 
-        let user_cmd_bufs = {
-            let mut renderer = render_state.renderer.write();
-            // `textures_delta.set` was already applied above, before the surface lookup.
+                let user_cmd_bufs = {
+                    let mut renderer = render_state.renderer.write();
+                    // `textures_delta.set` was already applied above, before the surface lookup.
 
-            renderer.update_buffers(
-                &render_state.device,
-                &render_state.queue,
-                &mut encoder,
-                clipped_primitives,
-                &screen_descriptor,
-            )
-        };
+                    renderer.update_buffers(
+                        &render_state.device,
+                        &render_state.queue,
+                        &mut encoder,
+                        clipped_primitives,
+                        &screen_descriptor,
+                    )
+                };
 
-        let output_frame = {
-            profiling::scope!("get_current_texture");
-            // This is what vsync-waiting happens on my Mac.
-            let start = web_time::Instant::now();
-            let output_frame = surface_state.surface.get_current_texture();
-            vsync_sec += start.elapsed().as_secs_f32();
-            output_frame
-        };
+                let output_frame = {
+                    profiling::scope!("get_current_texture");
+                    // This is what vsync-waiting happens on my Mac.
+                    let start = web_time::Instant::now();
+                    let output_frame = surface_state.surface.get_current_texture();
+                    vsync_sec += start.elapsed().as_secs_f32();
+                    output_frame
+                };
 
-        let output_frame = match output_frame {
-            Ok(frame) => frame,
-            Err(err) => match (*self.configuration.on_surface_error)(err) {
-                SurfaceErrorAction::RecreateSurface => {
-                    Self::configure_surface(surface_state, render_state, &self.configuration);
-                    return vsync_sec;
-                }
-                SurfaceErrorAction::SkipFrame => {
-                    return vsync_sec;
-                }
-            },
-        };
-
-        let mut capture_buffer = None;
-        {
-            let renderer = render_state.renderer.read();
-
-            let target_texture = if capture {
-                let capture_state = self.screen_capture_state.get_or_insert_with(|| {
-                    CaptureState::new(&render_state.device, &output_frame.texture)
-                });
-                capture_state.update(&render_state.device, &output_frame.texture);
-
-                &capture_state.texture
-            } else {
-                &output_frame.texture
-            };
-            let target_view = target_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-            let (view, resolve_target) = (self.options.msaa_samples > 1)
-                .then_some(self.msaa_texture_view.get(&viewport_id))
-                .flatten()
-                .map_or((&target_view, None), |texture_view| {
-                    (texture_view, Some(&target_view))
-                });
-
-            let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("egui_render"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    resolve_target,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: clear_color[0] as f64,
-                            g: clear_color[1] as f64,
-                            b: clear_color[2] as f64,
-                            a: clear_color[3] as f64,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: self.depth_texture_view.get(&viewport_id).map(|view| {
-                    wgpu::RenderPassDepthStencilAttachment {
-                        view,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(1.0),
-                            // It is very unlikely that the depth buffer is needed after egui finished rendering
-                            // so no need to store it. (this can improve performance on tiling GPUs like mobile chips or Apple Silicon)
-                            store: wgpu::StoreOp::Discard,
-                        }),
-                        stencil_ops: None,
+                let output_frame = match classify_surface_acquire(
+                    output_frame,
+                    &*self.configuration.on_surface_error,
+                ) {
+                    Ok(frame) => frame,
+                    Err(outcome) => {
+                        if outcome == PaintOutcome::SurfaceRecreated {
+                            Self::configure_surface(
+                                surface_state,
+                                render_state,
+                                &self.configuration,
+                            );
+                        }
+                        break 'paint outcome;
                     }
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
+                };
 
-            // Forgetting the pass' lifetime means that we are no longer compile-time protected from
-            // runtime errors caused by accessing the parent encoder before the render pass is dropped.
-            // Since we don't pass it on to the renderer, we should be perfectly safe against this mistake here!
-            renderer.render(
-                &mut render_pass.forget_lifetime(),
-                clipped_primitives,
-                &screen_descriptor,
-            );
+                let mut capture_buffer = None;
+                {
+                    let renderer = render_state.renderer.read();
 
-            if capture && let Some(capture_state) = &mut self.screen_capture_state {
-                capture_buffer = Some(capture_state.copy_textures(
-                    &render_state.device,
-                    &output_frame,
-                    &mut encoder,
-                ));
+                    let target_texture = if capture {
+                        let capture_state = self.screen_capture_state.get_or_insert_with(|| {
+                            CaptureState::new(&render_state.device, &output_frame.texture)
+                        });
+                        capture_state.update(&render_state.device, &output_frame.texture);
+
+                        &capture_state.texture
+                    } else {
+                        &output_frame.texture
+                    };
+                    let target_view =
+                        target_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+                    let (view, resolve_target) = (self.options.msaa_samples > 1)
+                        .then_some(self.msaa_texture_view.get(&viewport_id))
+                        .flatten()
+                        .map_or((&target_view, None), |texture_view| {
+                            (texture_view, Some(&target_view))
+                        });
+
+                    let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("egui_render"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view,
+                            resolve_target,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color {
+                                    r: clear_color[0] as f64,
+                                    g: clear_color[1] as f64,
+                                    b: clear_color[2] as f64,
+                                    a: clear_color[3] as f64,
+                                }),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: self.depth_texture_view.get(&viewport_id).map(
+                            |view| {
+                                wgpu::RenderPassDepthStencilAttachment {
+                                    view,
+                                    depth_ops: Some(wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(1.0),
+                                        // It is very unlikely that the depth buffer is needed after egui finished rendering
+                                        // so no need to store it. (this can improve performance on tiling GPUs like mobile chips or Apple Silicon)
+                                        store: wgpu::StoreOp::Discard,
+                                    }),
+                                    stencil_ops: None,
+                                }
+                            },
+                        ),
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+
+                    // Forgetting the pass' lifetime means that we are no longer compile-time protected from
+                    // runtime errors caused by accessing the parent encoder before the render pass is dropped.
+                    // Since we don't pass it on to the renderer, we should be perfectly safe against this mistake here!
+                    renderer.render(
+                        &mut render_pass.forget_lifetime(),
+                        clipped_primitives,
+                        &screen_descriptor,
+                    );
+
+                    if capture && let Some(capture_state) = &mut self.screen_capture_state {
+                        capture_buffer = Some(capture_state.copy_textures(
+                            &render_state.device,
+                            &output_frame,
+                            &mut encoder,
+                        ));
+                    }
+                }
+
+                let encoded = {
+                    profiling::scope!("CommandEncoder::finish");
+                    encoder.finish()
+                };
+
+                // Submit the commands: both the main buffer and user-defined ones.
+                {
+                    profiling::scope!("Queue::submit");
+                    // wgpu doesn't document where vsync can happen. Maybe here?
+                    let start = web_time::Instant::now();
+                    render_state
+                        .queue
+                        .submit(user_cmd_bufs.into_iter().chain([encoded]));
+                    vsync_sec += start.elapsed().as_secs_f32();
+                };
+
+                if let Some(capture_buffer) = capture_buffer
+                    && let Some(screen_capture_state) = &mut self.screen_capture_state
+                {
+                    screen_capture_state.read_screen_rgba(
+                        self.context.clone(),
+                        capture_buffer,
+                        capture_data,
+                        self.capture_tx.clone(),
+                        viewport_id,
+                    );
+                }
+
+                {
+                    profiling::scope!("present");
+                    // wgpu doesn't document where vsync can happen. Maybe here?
+                    let start = web_time::Instant::now();
+                    output_frame.present();
+                    vsync_sec += start.elapsed().as_secs_f32();
+                }
+
+                PaintOutcome::Submitted
             }
-        }
-
-        let encoded = {
-            profiling::scope!("CommandEncoder::finish");
-            encoder.finish()
         };
 
-        // Submit the commands: both the main buffer and user-defined ones.
-        {
-            profiling::scope!("Queue::submit");
-            // wgpu doesn't document where vsync can happen. Maybe here?
-            let start = web_time::Instant::now();
-            render_state
-                .queue
-                .submit(user_cmd_bufs.into_iter().chain([encoded]));
-            vsync_sec += start.elapsed().as_secs_f32();
-        };
-
-        // Free textures marked for destruction **after** queue submit since they might still be used in the current frame.
-        // Calling `wgpu::Texture::destroy` on a texture that is still in use would invalidate the command buffer(s) it is used in.
-        // However, once we called `wgpu::Queue::submit`, it is up for wgpu to determine how long the underlying gpu resource has to live.
-        {
-            let mut renderer = render_state.renderer.write();
-            for id in &textures_delta.free {
-                renderer.free_texture(id);
-            }
-        }
-
-        if let Some(capture_buffer) = capture_buffer
-            && let Some(screen_capture_state) = &mut self.screen_capture_state
-        {
-            screen_capture_state.read_screen_rgba(
-                self.context.clone(),
-                capture_buffer,
-                capture_data,
-                self.capture_tx.clone(),
-                viewport_id,
-            );
-        }
-
-        {
-            profiling::scope!("present");
-            // wgpu doesn't document where vsync can happen. Maybe here?
-            let start = web_time::Instant::now();
-            output_frame.present();
-            vsync_sec += start.elapsed().as_secs_f32();
-        }
-
+        finish_delivery(self.render_state.as_ref(), textures_delta, outcome);
         vsync_sec
     }
 
@@ -726,5 +715,276 @@ impl Painter {
     #[expect(clippy::needless_pass_by_ref_mut, clippy::unused_self)]
     pub fn destroy(&mut self) {
         // TODO(emilk): something here?
+    }
+}
+
+fn begin_delivery(
+    render_state: Option<&RenderState>,
+    textures_delta: &epaint::textures::TexturesDelta,
+    site: crate::atlas_diag::Site,
+) -> Result<(), PaintOutcome> {
+    let Some(render_state) = render_state else {
+        crate::atlas_diag::record_dropped_batch(
+            site,
+            crate::atlas_diag::DropReason::RenderStateAbsent,
+            textures_delta,
+        );
+        return Err(PaintOutcome::RenderStateAbsent);
+    };
+
+    let mut renderer = render_state.renderer.write();
+    apply_delta_set(
+        &mut renderer,
+        &render_state.device,
+        &render_state.queue,
+        textures_delta,
+        site,
+    );
+    Ok(())
+}
+
+fn classify_surface_acquire<T>(
+    result: Result<T, wgpu::SurfaceError>,
+    on_surface_error: &dyn Fn(wgpu::SurfaceError) -> SurfaceErrorAction,
+) -> Result<T, PaintOutcome> {
+    result.map_err(|error| match on_surface_error(error) {
+        SurfaceErrorAction::RecreateSurface => PaintOutcome::SurfaceRecreated,
+        SurfaceErrorAction::SkipFrame => PaintOutcome::Skipped,
+    })
+}
+
+fn finish_delivery(
+    render_state: Option<&RenderState>,
+    textures_delta: &epaint::textures::TexturesDelta,
+    outcome: PaintOutcome,
+) {
+    // The inner paint block has dropped every unsubmitted encoder/command buffer before this
+    // finalizer runs. `Submitted` is only produced after `queue.submit`, so freeing here cannot
+    // invalidate commands that still need submission.
+    //
+    // The contract is deliberately "a renderer means the frees are delivered", with no outcome
+    // able to opt out - that is the whole point of routing every exit through here. The
+    // agreement between the outcome and the render state is an invariant worth catching while
+    // developing, but not worth killing a session over: this function sits on the paint path,
+    // and `Renderer::update_texture` next door already chose to skip a bad write rather than
+    // panic ("a frame of wrong glyphs beats losing the session"). A future outcome added by
+    // 1.31 must not be able to turn a bookkeeping mismatch into a process kill.
+    debug_assert_eq!(
+        render_state.is_none(),
+        outcome == PaintOutcome::RenderStateAbsent,
+        "paint outcome and render-state availability must agree, got {outcome:?}"
+    );
+    let Some(render_state) = render_state else {
+        return;
+    };
+    let mut renderer = render_state.renderer.write();
+    for id in &textures_delta.free {
+        renderer.free_texture(id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{WgpuError, WgpuSetup};
+    use egui::{Color32, ColorImage, TextureId, TextureOptions};
+    use epaint::{ImageDelta, textures::TexturesDelta};
+
+    fn full_delta(id: TextureId, height: usize) -> TexturesDelta {
+        TexturesDelta {
+            set: vec![(
+                id,
+                ImageDelta::full(
+                    ColorImage::filled([1, height], Color32::WHITE),
+                    TextureOptions::LINEAR,
+                ),
+            )],
+            free: Vec::new(),
+        }
+    }
+
+    fn paint_without_surface(painter: &mut Painter, textures_delta: &TexturesDelta) {
+        assert!(painter.surfaces.is_empty(), "test requires no surfaces");
+        painter.paint_and_update_textures(
+            ViewportId::ROOT,
+            1.0,
+            [0.0; 4],
+            &[],
+            textures_delta,
+            Vec::new(),
+        );
+    }
+
+    #[test]
+    fn paint_and_update_textures_delivers_set_and_free_without_surface() {
+        let mut configuration = WgpuConfiguration::default();
+        let WgpuSetup::CreateNew(setup) = &mut configuration.wgpu_setup else {
+            unreachable!("default configuration must create a new wgpu setup");
+        };
+        setup.instance_descriptor.backends = wgpu::Backends::DX12;
+
+        let options = RendererOptions::default();
+        let mut painter = pollster::block_on(Painter::new(
+            Context::default(),
+            configuration.clone(),
+            false,
+            options,
+        ));
+        let render_state = match pollster::block_on(RenderState::create(
+            &configuration,
+            &painter.instance,
+            None,
+            options,
+        )) {
+            Ok(render_state) => render_state,
+            Err(WgpuError::RequestAdapterError(error)) => {
+                eprintln!("skipping headless DX12 texture delivery test: {error}");
+                return;
+            }
+            Err(error) => panic!("create headless DX12 render state: {error}"),
+        };
+        painter.render_state = Some(render_state.clone());
+
+        let texture_id = TextureId::Managed(0);
+        paint_without_surface(&mut painter, &full_delta(texture_id, 32));
+        assert_eq!(
+            render_state.renderer.read().texture_size(&texture_id),
+            Some([1, 32]),
+            "seed texture must be observable before exercising replacement delivery"
+        );
+
+        paint_without_surface(&mut painter, &full_delta(texture_id, 128));
+        assert_eq!(
+            render_state.renderer.read().texture_size(&texture_id),
+            Some([1, 128]),
+            "a full replacement must reach the shared renderer without a surface"
+        );
+
+        render_state
+            .device
+            .push_error_scope(wgpu::ErrorFilter::Validation);
+        let partial_delta = TexturesDelta {
+            set: vec![(
+                texture_id,
+                ImageDelta::partial(
+                    [0, 45],
+                    ColorImage::filled([1, 81], Color32::WHITE),
+                    TextureOptions::LINEAR,
+                ),
+            )],
+            free: Vec::new(),
+        };
+        paint_without_surface(&mut painter, &partial_delta);
+        let validation_error = pollster::block_on(render_state.device.pop_error_scope());
+        assert!(
+            validation_error.is_none(),
+            "partial update after the full replacement must validate: {validation_error:?}"
+        );
+        assert_eq!(
+            render_state.renderer.read().texture_size(&texture_id),
+            Some([1, 128]),
+            "a partial update must preserve the replacement texture size"
+        );
+
+        let freed_id = TextureId::Managed(1);
+        paint_without_surface(&mut painter, &full_delta(freed_id, 32));
+        assert!(
+            render_state.renderer.read().texture(&freed_id).is_some(),
+            "free-path texture must be seeded"
+        );
+        paint_without_surface(
+            &mut painter,
+            &TexturesDelta {
+                set: Vec::new(),
+                free: vec![freed_id],
+            },
+        );
+        assert!(
+            render_state.renderer.read().texture(&freed_id).is_none(),
+            "free must reach the shared renderer without a surface"
+        );
+    }
+
+    fn headless_render_state() -> Option<RenderState> {
+        let mut configuration = WgpuConfiguration::default();
+        let WgpuSetup::CreateNew(setup) = &mut configuration.wgpu_setup else {
+            unreachable!("default configuration must create a new wgpu setup");
+        };
+        setup.instance_descriptor.backends = wgpu::Backends::DX12;
+
+        let instance = pollster::block_on(configuration.wgpu_setup.new_instance());
+        match pollster::block_on(RenderState::create(
+            &configuration,
+            &instance,
+            None,
+            RendererOptions::default(),
+        )) {
+            Ok(render_state) => Some(render_state),
+            Err(WgpuError::RequestAdapterError(error)) => {
+                eprintln!("skipping headless DX12 texture delivery test: {error}");
+                None
+            }
+            Err(error) => panic!("create headless DX12 render state: {error}"),
+        }
+    }
+
+    fn recreate_surface(_: wgpu::SurfaceError) -> SurfaceErrorAction {
+        SurfaceErrorAction::RecreateSurface
+    }
+
+    fn skip_frame(_: wgpu::SurfaceError) -> SurfaceErrorAction {
+        SurfaceErrorAction::SkipFrame
+    }
+
+    fn assert_surface_error_outcome_frees_texture(
+        on_surface_error: fn(wgpu::SurfaceError) -> SurfaceErrorAction,
+        expected_outcome: PaintOutcome,
+    ) {
+        let Some(render_state) = headless_render_state() else {
+            return;
+        };
+        let texture_id = TextureId::Managed(0);
+        begin_delivery(
+            Some(&render_state),
+            &full_delta(texture_id, 32),
+            crate::atlas_diag::Site::AppliedPaint,
+        )
+        .expect("seed texture delivery requires a render state");
+        assert_eq!(
+            render_state.renderer.read().texture_size(&texture_id),
+            Some([1, 32]),
+            "outcome test texture must be seeded before finalization"
+        );
+
+        let outcome =
+            classify_surface_acquire::<()>(Err(wgpu::SurfaceError::Lost), &on_surface_error)
+                .expect_err("injected surface error must classify as a non-submit outcome");
+        assert_eq!(outcome, expected_outcome);
+
+        finish_delivery(
+            Some(&render_state),
+            &TexturesDelta {
+                set: Vec::new(),
+                free: vec![texture_id],
+            },
+            outcome,
+        );
+        assert!(
+            render_state.renderer.read().texture(&texture_id).is_none(),
+            "the transaction finalizer must free the seeded texture for {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn surface_recreated_outcome_finalizes_texture_free() {
+        assert_surface_error_outcome_frees_texture(
+            recreate_surface,
+            PaintOutcome::SurfaceRecreated,
+        );
+    }
+
+    #[test]
+    fn skipped_outcome_finalizes_texture_free() {
+        assert_surface_error_outcome_frees_texture(skip_frame, PaintOutcome::Skipped);
     }
 }

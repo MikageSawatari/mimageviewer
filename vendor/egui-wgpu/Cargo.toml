@@ -71,6 +71,10 @@ x11 = ["winit?/x11"]
 [lib]
 name = "egui_wgpu"
 path = "src/lib.rs"
+test = true
+
+[dev-dependencies.pollster]
+version = "0.4"
 
 [dependencies.ahash]
 version = "0.8.12"

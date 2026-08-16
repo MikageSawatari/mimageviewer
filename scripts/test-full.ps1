@@ -18,6 +18,15 @@ try {
         exit $LASTEXITCODE
     }
 
+    # vendor/egui-wgpu is workspace-excluded, so the line above never reaches it. Run its
+    # unit tests here, unfiltered: naming one test would silently drop every test added
+    # later - which is the failure mode this step exists to prevent.
+    Write-Host '[test-full] cargo test --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib'
+    & cargo test --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+
     Write-Host '[test-full] PASS'
 } finally {
     Pop-Location
