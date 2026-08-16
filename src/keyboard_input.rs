@@ -103,6 +103,122 @@ impl FullscreenRawKeyPermit {
     }
 }
 
+/// Why a viewport pass may dispatch discrete keyboard input.
+///
+/// Focus is only one possible proof. On Windows a key edge already stamped
+/// with this viewport is event-time evidence that must survive a later focus
+/// loss in the same egui frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DiscreteKeyInputSource {
+    FocusedViewport,
+    RoutedKeyEdge,
+}
+
+/// Proof that discrete keyboard input belongs to this viewport pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DiscreteKeyInputPermit {
+    viewport: egui::ViewportId,
+    source: DiscreteKeyInputSource,
+}
+
+impl DiscreteKeyInputPermit {
+    #[cfg(test)]
+    pub(crate) const fn source(self) -> DiscreteKeyInputSource {
+        self.source
+    }
+}
+
+/// Proof that current keyboard level may be sampled for this viewport.
+///
+/// Unlike a discrete edge, `GetAsyncKeyState` and egui key/modifier levels are
+/// process-global or frame-final observations. They are valid only while the
+/// owning viewport still has focus. The private fields keep low-level OS
+/// helpers from manufacturing this proof themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FocusedKeyStatePermit {
+    viewport: egui::ViewportId,
+}
+
+impl FocusedKeyStatePermit {
+    pub(crate) const fn viewport(self) -> egui::ViewportId {
+        self.viewport
+    }
+
+    pub(crate) fn allows(self, ctx: &egui::Context) -> bool {
+        self.viewport == ctx.viewport_id()
+    }
+}
+
+/// Pass-local keyboard evidence. This is derived state, never stored on App.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct KeyboardInputPermits {
+    pub(crate) discrete: Option<DiscreteKeyInputPermit>,
+    pub(crate) current_level: Option<FocusedKeyStatePermit>,
+}
+
+pub(crate) const fn decide_keyboard_input_permits(
+    viewport: egui::ViewportId,
+    viewport_focused: bool,
+    routed_key_down: bool,
+) -> KeyboardInputPermits {
+    let current_level = if viewport_focused {
+        Some(FocusedKeyStatePermit { viewport })
+    } else {
+        None
+    };
+    let discrete = if viewport_focused {
+        Some(DiscreteKeyInputPermit {
+            viewport,
+            source: DiscreteKeyInputSource::FocusedViewport,
+        })
+    } else if routed_key_down {
+        Some(DiscreteKeyInputPermit {
+            viewport,
+            source: DiscreteKeyInputSource::RoutedKeyEdge,
+        })
+    } else {
+        None
+    };
+    KeyboardInputPermits {
+        discrete,
+        current_level,
+    }
+}
+
+/// Collect pass-local input evidence for the current viewport.
+pub(crate) fn keyboard_input_permits(ctx: &egui::Context) -> KeyboardInputPermits {
+    let viewport = ctx.viewport_id();
+    let viewport_focused = ctx.input(|input| input.viewport().focused).unwrap_or(true);
+    #[cfg(windows)]
+    let routed_key_down = crate::key_input::frame_had_key_down(viewport);
+    #[cfg(not(windows))]
+    let routed_key_down = false;
+    decide_keyboard_input_permits(viewport, viewport_focused, routed_key_down)
+}
+
+pub(crate) fn focused_key_state_permit(ctx: &egui::Context) -> Option<FocusedKeyStatePermit> {
+    focused_key_state_permit_for_viewport(
+        ctx.viewport_id(),
+        ctx.input(|input| input.viewport().focused).unwrap_or(true),
+    )
+}
+
+/// Issue a current-level permit for an explicitly observed viewport.
+///
+/// This is used when rendering from another egui context (for example the
+/// fullscreen state prepared from ROOT). The caller remains responsible for
+/// supplying the owning viewport's focus observation.
+pub(crate) const fn focused_key_state_permit_for_viewport(
+    viewport: egui::ViewportId,
+    viewport_focused: bool,
+) -> Option<FocusedKeyStatePermit> {
+    if viewport_focused {
+        Some(FocusedKeyStatePermit { viewport })
+    } else {
+        None
+    }
+}
+
 impl KeyboardOwner {
     pub const fn shortcut_permit(self) -> Option<ShortcutPermit> {
         match self {
@@ -670,6 +786,40 @@ mod tests {
             }
             .fullscreen_raw_key_permit(),
             None
+        );
+    }
+
+    #[test]
+    fn focused_pass_issues_discrete_and_current_level_permits() {
+        let viewport = egui::ViewportId::from_hash_of(7_u64);
+        let permits = decide_keyboard_input_permits(viewport, true, false);
+        assert_eq!(
+            permits.discrete.map(DiscreteKeyInputPermit::source),
+            Some(DiscreteKeyInputSource::FocusedViewport)
+        );
+        assert_eq!(
+            permits.current_level.map(FocusedKeyStatePermit::viewport),
+            Some(viewport)
+        );
+    }
+
+    #[test]
+    fn routed_edge_keeps_only_discrete_input_after_focus_loss() {
+        let viewport = egui::ViewportId::from_hash_of(8_u64);
+        let permits = decide_keyboard_input_permits(viewport, false, true);
+        assert_eq!(
+            permits.discrete.map(DiscreteKeyInputPermit::source),
+            Some(DiscreteKeyInputSource::RoutedKeyEdge)
+        );
+        assert_eq!(permits.current_level, None);
+    }
+
+    #[test]
+    fn unfocused_pass_without_routed_edge_has_no_keyboard_permit() {
+        let viewport = egui::ViewportId::from_hash_of(9_u64);
+        assert_eq!(
+            decide_keyboard_input_permits(viewport, false, false),
+            KeyboardInputPermits::default()
         );
     }
 

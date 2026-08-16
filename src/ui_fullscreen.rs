@@ -3021,7 +3021,7 @@ fn current_foreground_hwnd() -> usize {
 /// `ctx.input(|i| i.modifiers.ctrl)` がキーフォーカス不在で stale (常に false) になり得る
 /// ため、Ctrl 依存の挙動 (ソースプレビュー / 補正レイヤー境界筆の通常筆切替) はこれを使う。
 #[cfg(windows)]
-pub(crate) fn ctrl_held_via_os() -> bool {
+pub(crate) fn ctrl_held_via_os(_permit: crate::keyboard_input::FocusedKeyStatePermit) -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL;
 
     crate::key_input::physical_key_down(crate::key_input::PhysicalKeySlot::new(
@@ -3031,12 +3031,12 @@ pub(crate) fn ctrl_held_via_os() -> bool {
 }
 
 #[cfg(not(windows))]
-pub(crate) fn ctrl_held_via_os() -> bool {
+pub(crate) fn ctrl_held_via_os(_permit: crate::keyboard_input::FocusedKeyStatePermit) -> bool {
     false
 }
 
 #[cfg(windows)]
-fn shift_held_via_os() -> bool {
+fn shift_held_via_os(_permit: crate::keyboard_input::FocusedKeyStatePermit) -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::VK_SHIFT;
 
     crate::key_input::physical_key_down(crate::key_input::PhysicalKeySlot::new(
@@ -3046,7 +3046,7 @@ fn shift_held_via_os() -> bool {
 }
 
 #[cfg(not(windows))]
-fn shift_held_via_os() -> bool {
+fn shift_held_via_os(_permit: crate::keyboard_input::FocusedKeyStatePermit) -> bool {
     false
 }
 
@@ -4976,18 +4976,33 @@ impl App {
         if self.any_modal_dialog_open_for_fullscreen_keys() {
             return false;
         }
+        let focus_viewport = if self.fullscreen_embedded_still_active() {
+            ctx.viewport_id()
+        } else {
+            self.fullscreen_viewport_id()
+        };
+        let Some(level_permit) = crate::keyboard_input::focused_key_state_permit_for_viewport(
+            focus_viewport,
+            self.fs_prev_focused,
+        ) else {
+            return false;
+        };
         // この位置の ctx は main viewport のため、そこに残った FocusedUi/TextInput owner を
         // 元画像表示の抑止条件にはできない。実際の fullscreen focus と modal は上で明示的に
         // gate 済みなので、この呼び出しだけ keymap owner 判定を迂回して OS 状態を解決する。
-        if !self
-            .keymap
-            .modifier_held_action_for_external_viewport(ctx, KeyAction::FsOriginalPreviewHold)
-        {
+        if !self.keymap.modifier_held_action_for_external_viewport(
+            ctx,
+            level_permit,
+            KeyAction::FsOriginalPreviewHold,
+        ) {
             return false;
         }
         // 補正レイヤー固有の Ctrl+Shift バイパスだけを優先する。元画像表示を
         // RightShift / Alt などへ変更した場合、Shift 単独で抑止してはならない。
-        if self.local_adjust_mode && ctrl_held_via_os() && shift_held_via_os() {
+        if self.local_adjust_mode
+            && ctrl_held_via_os(level_permit)
+            && shift_held_via_os(level_permit)
+        {
             return false;
         }
         matches!(
@@ -5121,10 +5136,19 @@ impl App {
                 .get(&idx)
                 .map(Vec::len)
                 .unwrap_or(0);
+            let focus_viewport = if self.fullscreen_embedded_still_active() {
+                ctx.viewport_id()
+            } else {
+                self.fullscreen_viewport_id()
+            };
+            let level_permit = crate::keyboard_input::focused_key_state_permit_for_viewport(
+                focus_viewport,
+                self.fs_prev_focused,
+            );
             let action = decide_local_adjust_preview_action(
                 self.fs_prev_focused,
-                ctrl_held_via_os(),
-                shift_held_via_os(),
+                level_permit.is_some_and(ctrl_held_via_os),
+                level_permit.is_some_and(shift_held_via_os),
                 self.local_adjust_show_source,
                 self.local_adjust_preview_to_selected_layer,
                 total_layers > 0,
@@ -5847,13 +5871,27 @@ impl App {
     /// ZipPla 風全画面ズームのキー状態機械を 1 フレーム進める。Z (修飾なし) のホールド/離しを
     /// OS 直読みのエッジで検出する。fit 状態で押下=照準開始、離す=ズーム確定、ズーム中の押下=解除。
     /// 通常閲覧 (単ページ / 見開き) で動く (連結/パノラマ/動画/分析/編集モードは対象外)。
-    fn update_fs_zoom_mode_keys(&mut self, ctx: &egui::Context, fs_idx: usize) {
+    fn update_fs_zoom_mode_keys(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        level_permit: Option<crate::keyboard_input::FocusedKeyStatePermit>,
+    ) {
         // FsZoomMode (KeyHold、既定 Z) の押下/離しを (a) egui イベント (b) OS 直読みの両方から取る。
         // コンテキスト外でも先に edge を消費し、連結表示では無言抑止せず rising edge に一度だけ
         // 理由を表示する。`fs_zoom_z_was_down` のラッチでホールド中の連打を防ぐ。
         let (z_press_event, z_release_event) =
             self.keymap.take_key_hold_edges(ctx, KeyAction::FsZoomMode);
-        let z_down = self.keymap.key_held_action(ctx, KeyAction::FsZoomMode);
+        // A routed Z edge is still drained after focus loss, but KeyHold is a
+        // focus-scoped state machine: do not recreate aiming from that edge or
+        // sample another application's current key level.
+        let Some(level_permit) = level_permit else {
+            self.fs_zoom_reset_transient();
+            return;
+        };
+        let z_down = self
+            .keymap
+            .key_held_action(ctx, level_permit, KeyAction::FsZoomMode);
         let rising = z_press_event || (z_down && !self.fs_zoom_z_was_down);
         let falling = z_release_event || (!z_down && self.fs_zoom_z_was_down);
         if !self.fs_zoom_mode_context_ok(fs_idx) {
@@ -14505,12 +14543,23 @@ impl App {
         if let Some(still_held) = crate::keymap::page_turn_edge_hold_this_frame(ctx, viewport) {
             return (still_held, None, viewport);
         }
+        let viewport_focused = if viewport == ctx.viewport_id() {
+            ctx.input(|input| input.viewport().focused).unwrap_or(true)
+        } else {
+            self.fs_prev_focused
+        };
+        let Some(level_permit) = crate::keyboard_input::focused_key_state_permit_for_viewport(
+            viewport,
+            viewport_focused,
+        ) else {
+            return (false, Some("viewport_unfocused"), viewport);
+        };
         let configurable = FS_PAGE_TURN_COALESCE_ACTIONS.into_iter().any(|action| {
             self.keymap
                 .effective_chords(action)
                 .into_iter()
                 .any(|chord| {
-                    self.keymap.key_held_chord_via_os(viewport, chord)
+                    self.keymap.key_held_chord_via_os(level_permit, chord)
                         && self.fs_page_turn_chord_is_unambiguous(chord)
                 })
         });
@@ -14519,7 +14568,7 @@ impl App {
             .chain((!self.stack_showing_flat).then_some(Chord::shift(KeyName::Up)))
             .chain((!self.stack_showing_flat).then_some(Chord::shift(KeyName::Down)))
             .any(|chord| {
-                self.keymap.key_held_chord_via_os(viewport, chord)
+                self.keymap.key_held_chord_via_os(level_permit, chord)
                     && self.fs_page_turn_chord_is_unambiguous(chord)
             });
         (configurable || fixed, None, viewport)
@@ -16612,8 +16661,8 @@ impl App {
         let (browser_back_count, browser_forward_count) = crate::take_pending_mouse_nav();
         let owner = self.keyboard_owner_for_pass(ctx);
         let fullscreen_raw_key_permit = owner.fullscreen_raw_key_permit();
-
-        let has_focus = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        let input_permits = crate::keyboard_input::keyboard_input_permits(ctx);
+        let has_focus = input_permits.current_level.is_some();
         #[cfg(all(windows, feature = "test-script"))]
         crate::test_script::publish_fullscreen_input_state(
             ctx,
@@ -16641,8 +16690,10 @@ impl App {
             jump_to: None,
         };
 
-        if !has_focus {
-            // フォーカス喪失中は照準/エッジ状態をクリア (復帰時の誤確定防止)。確定ズームは残す。
+        // Current focus is not allowed to invalidate an already-routed edge.
+        // Without either focus or a same-viewport KeyEdge there is no discrete
+        // keyboard input owned by this pass, so retain the old fail-closed exit.
+        if input_permits.discrete.is_none() {
             self.fs_zoom_reset_transient();
             return action;
         }
@@ -16669,7 +16720,7 @@ impl App {
         // ZipPla 風全画面ズーム (Z ホールド) のエッジ検出。編集/分析/見開き/連結/パノラマ/動画では
         // 無効化され、コンテキスト外なら状態をリセットする。編集モードの early-return より前に
         // 毎フレーム呼び、Z 押しっぱで対象外へ移ったときに状態が残らないようにする。
-        self.update_fs_zoom_mode_keys(ctx, fs_idx);
+        self.update_fs_zoom_mode_keys(ctx, fs_idx, input_permits.current_level);
 
         if Self::consume_pipeline_debug_shortcut(ctx) {
             self.start_pipeline_debug_export(ctx, fs_idx);
@@ -16852,7 +16903,7 @@ impl App {
                 // 高速化/15度スナップの修飾キーは OS 直読み (FS viewport の stale 回避)。
                 // 矢印/ブラケットの consume_key は NONE/CTRL 両方を拾うので step/snap だけ
                 // OS 状態で決めれば、Ctrl/Shift を離した後の残留も起きない。
-                let ctrl_held = ctrl_held_via_os();
+                let ctrl_held = input_permits.current_level.is_some_and(ctrl_held_via_os);
                 let step = if ctrl_held {
                     crate::ui_adjustment_panel::LOCAL_ADJUST_NUDGE_PIXELS_FAST
                 } else {
@@ -16906,7 +16957,7 @@ impl App {
                 if self.rotate_selected_local_adjust_shape_from_shortcut(
                     fs_idx,
                     rotate_deg.to_radians(),
-                    shift_held_via_os(),
+                    input_permits.current_level.is_some_and(shift_held_via_os),
                 ) {
                     ctx.request_repaint();
                     return action;
@@ -17278,8 +17329,10 @@ impl App {
         // suppress ガード解除: Enter が現在押下されていなければ
         // `fs_suppress_enter_close_until_release` を false にリセット (= 次の新規押下から
         // close が有効化される)。「Enter で open → 同フレームで close」を防ぐ仕組み。
-        let enter_currently_down = ctx.input(|i| i.key_down(egui::Key::Enter));
-        if !enter_currently_down {
+        let enter_currently_down = input_permits
+            .current_level
+            .is_some_and(|_| ctx.input(|i| i.key_down(egui::Key::Enter)));
+        if input_permits.current_level.is_some() && !enter_currently_down {
             self.fs_suppress_enter_close_until_release = false;
         }
         // 動画・音声は Enter を再生/一時停止 (VideoPlayPause) に使うので image 用 FsClose
@@ -17311,25 +17364,41 @@ impl App {
             && !fs_music_view_active
             && self
                 .keymap
-                .consume_page_turn_action(ctx, KeyAction::FsSpreadShiftLeft)
+                .consume_page_turn_action(
+                    ctx,
+                    input_permits.current_level,
+                    KeyAction::FsSpreadShiftLeft,
+                )
                 .should_navigate();
         let ctrl_right = !is_video_fs
             && !fs_music_view_active
             && self
                 .keymap
-                .consume_page_turn_action(ctx, KeyAction::FsSpreadShiftRight)
+                .consume_page_turn_action(
+                    ctx,
+                    input_permits.current_level,
+                    KeyAction::FsSpreadShiftRight,
+                )
                 .should_navigate();
         let spread_shift_prev = !is_video_fs
             && !fs_music_view_active
             && self
                 .keymap
-                .consume_page_turn_action(ctx, KeyAction::FsSpreadShiftPrev)
+                .consume_page_turn_action(
+                    ctx,
+                    input_permits.current_level,
+                    KeyAction::FsSpreadShiftPrev,
+                )
                 .should_navigate();
         let spread_shift_next = !is_video_fs
             && !fs_music_view_active
             && self
                 .keymap
-                .consume_page_turn_action(ctx, KeyAction::FsSpreadShiftNext)
+                .consume_page_turn_action(
+                    ctx,
+                    input_permits.current_level,
+                    KeyAction::FsSpreadShiftNext,
+                )
                 .should_navigate();
         let ctrl_page_down_count = self
             .keymap
@@ -17352,12 +17421,12 @@ impl App {
         let page_next = !is_video_fs
             && self
                 .keymap
-                .consume_page_turn_action(ctx, KeyAction::FsPageNext)
+                .consume_page_turn_action(ctx, input_permits.current_level, KeyAction::FsPageNext)
                 .should_navigate();
         let page_prev = !is_video_fs
             && self
                 .keymap
-                .consume_page_turn_action(ctx, KeyAction::FsPagePrev)
+                .consume_page_turn_action(ctx, input_permits.current_level, KeyAction::FsPagePrev)
                 .should_navigate();
         let fixed_jump_next =
             !is_video_fs && self.keymap.consume_action(ctx, KeyAction::FsFixedJumpNext);
@@ -17374,12 +17443,14 @@ impl App {
                 .keymap
                 .consume_action(ctx, KeyAction::FsFixedJumpPrevNoRtl);
         // マウス戻る/進む (Extra1/Extra2 = native XButton) を Ctrl+↑/↓ と等価に扱う。
-        let mouse_back = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1));
-        let mouse_forward = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra2));
+        let mouse_back =
+            has_focus && ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1));
+        let mouse_forward =
+            has_focus && ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra2));
         // WM_APPCOMMAND / VK_BROWSER_BACK/FORWARD 経路 (上で関数頭で drain 済み) を消費。
         // 詳細は main.rs の `install_mouse_nav_hook` 参照。
-        let browser_back = browser_back_count > 0;
-        let browser_forward = browser_forward_count > 0;
+        let browser_back = has_focus && browser_back_count > 0;
+        let browser_forward = has_focus && browser_forward_count > 0;
         // 音声も「映像なし動画」として動画と同じ前/次ファイルキー (VideoPrevFile/NextFile =
         // 既定 plain ↑↓) を共有する (ユーザー確定 2026-07-03: 操作カスタマイズ上は動画フルスクリーン
         // と音声を共通スコープ扱い)。音声は 7837 の早期 return で modal/IME/TextEdit フォーカス中は
@@ -17399,22 +17470,42 @@ impl App {
             && !video_horizontal_arrow_key
             && fullscreen_raw_key_permit.is_some_and(|permit| {
                 self.keymap
-                    .consume_fixed_page_turn_chord(ctx, permit, Chord::key(KeyName::Right))
+                    .consume_fixed_page_turn_chord(
+                        ctx,
+                        permit,
+                        input_permits.current_level,
+                        Chord::key(KeyName::Right),
+                    )
                     .should_navigate()
                     || self
                         .keymap
-                        .consume_fixed_page_turn_chord(ctx, permit, Chord::shift(KeyName::Right))
+                        .consume_fixed_page_turn_chord(
+                            ctx,
+                            permit,
+                            input_permits.current_level,
+                            Chord::shift(KeyName::Right),
+                        )
                         .should_navigate()
             });
         let arrow_left = !fs_music_view_active
             && !video_horizontal_arrow_key
             && fullscreen_raw_key_permit.is_some_and(|permit| {
                 self.keymap
-                    .consume_fixed_page_turn_chord(ctx, permit, Chord::key(KeyName::Left))
+                    .consume_fixed_page_turn_chord(
+                        ctx,
+                        permit,
+                        input_permits.current_level,
+                        Chord::key(KeyName::Left),
+                    )
                     .should_navigate()
                     || self
                         .keymap
-                        .consume_fixed_page_turn_chord(ctx, permit, Chord::shift(KeyName::Left))
+                        .consume_fixed_page_turn_chord(
+                            ctx,
+                            permit,
+                            input_permits.current_level,
+                            Chord::shift(KeyName::Left),
+                        )
                         .should_navigate()
             });
         // ファイル名スタックのフラット読書中 (v2.0.0) は Shift+↓↑ を「次/前のスタックへ
@@ -17440,7 +17531,8 @@ impl App {
         // (v2.2.0 回帰: 646e7709 でスタックジャンプを egui consume_key → keymap Win32 キュー経路へ
         // 移したことで露呈)。FS ビューポートでは egui の modifiers が stale になり得るため、Shift
         // は OS から直読み (`shift_held_via_os`) して plain ページ送りから除外する。
-        let stack_shift_arrow = stack_flat_nav && shift_held_via_os();
+        let stack_shift_arrow =
+            stack_flat_nav && input_permits.current_level.is_some_and(shift_held_via_os);
         // 音声の前/次ファイル移動は上の `video_file_nav` (VideoNextFile/PrevFile = plain ↓↑) で
         // 処理する (adjacent_navigable_idx に Audio を含め、動画と統一)。下の `!fs_music_view_active`
         // ガードは残す: 音声は plain/Shift 矢印をこの image 経路では消費せず、plain ↓↑ は
@@ -17454,7 +17546,12 @@ impl App {
                     // flat 読書中の Shift+↓ (= スタックジャンプ) はページ送りとしては扱わない。
                     let consumed = self
                         .keymap
-                        .consume_fixed_page_turn_chord(ctx, permit, Chord::key(KeyName::Down))
+                        .consume_fixed_page_turn_chord(
+                            ctx,
+                            permit,
+                            input_permits.current_level,
+                            Chord::key(KeyName::Down),
+                        )
                         .should_navigate()
                         || (!stack_flat_nav
                             && self
@@ -17462,6 +17559,7 @@ impl App {
                                 .consume_fixed_page_turn_chord(
                                     ctx,
                                     permit,
+                                    input_permits.current_level,
                                     Chord::shift(KeyName::Down),
                                 )
                                 .should_navigate());
@@ -17473,7 +17571,12 @@ impl App {
                 && fullscreen_raw_key_permit.is_some_and(|permit| {
                     let consumed = self
                         .keymap
-                        .consume_fixed_page_turn_chord(ctx, permit, Chord::key(KeyName::Up))
+                        .consume_fixed_page_turn_chord(
+                            ctx,
+                            permit,
+                            input_permits.current_level,
+                            Chord::key(KeyName::Up),
+                        )
                         .should_navigate()
                         || (!stack_flat_nav
                             && self
@@ -17481,6 +17584,7 @@ impl App {
                                 .consume_fixed_page_turn_chord(
                                     ctx,
                                     permit,
+                                    input_permits.current_level,
                                     Chord::shift(KeyName::Up),
                                 )
                                 .should_navigate());
@@ -18701,9 +18805,11 @@ impl App {
         captured_display_unit: bool,
     ) -> bool {
         let focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
-        let hold_active = self
-            .keymap
-            .modifier_held_action(ctx, KeyAction::FsNavigatorHold);
+        let hold_active =
+            crate::keyboard_input::focused_key_state_permit(ctx).is_some_and(|permit| {
+                self.keymap
+                    .modifier_held_action(ctx, permit, KeyAction::FsNavigatorHold)
+            });
         let interaction_active = fs_navigator_interaction_active(ctx);
         // 「修飾キーを押している間」と「ナビゲータを掴んでいる間」は別の状態。
         // ドラッグ中は後者を優先し、Alt を離しても操作を最後まで継続させる。
@@ -19793,7 +19899,8 @@ impl App {
         }
         // Fullscreen canvas modifier events can be stale; keep navigator and main compare paint
         // on the same OS-level Ctrl fact used by other transient canvas modifiers.
-        let ctrl_held = ctrl_held_via_os();
+        let ctrl_held =
+            crate::keyboard_input::focused_key_state_permit(ctx).is_some_and(ctrl_held_via_os);
 
         let shader_shape =
             self.compare_preparation
@@ -26120,7 +26227,8 @@ impl App {
         }
         // Do not read `ctx.input().modifiers` here: the fullscreen viewport can retain a stale
         // modifier snapshot while the physical Ctrl state changes during the same drag.
-        let ctrl_held = ctrl_held_via_os();
+        let ctrl_held =
+            crate::keyboard_input::focused_key_state_permit(ctx).is_some_and(ctrl_held_via_os);
 
         let shader_shape = self
             .compare_preparation
@@ -26535,9 +26643,11 @@ impl App {
         }
         let (hover, focused) =
             ctx.input(|i| (i.pointer.hover_pos(), i.viewport().focused.unwrap_or(true)));
-        let loupe_hold = self
-            .keymap
-            .modifier_held_action(ctx, KeyAction::FsLoupeHold);
+        let loupe_hold =
+            crate::keyboard_input::focused_key_state_permit(ctx).is_some_and(|permit| {
+                self.keymap
+                    .modifier_held_action(ctx, permit, KeyAction::FsLoupeHold)
+            });
         if !focused {
             return;
         }
@@ -27656,7 +27766,9 @@ impl App {
             }
             let camera_resp = camera_resp.hover_tip_dark(camera_tip);
             if camera_resp.clicked() {
-                if ctx.input(|i| i.modifiers.ctrl) || ctrl_held_via_os() {
+                let ctrl_held = crate::keyboard_input::focused_key_state_permit(ctx)
+                    .is_some_and(ctrl_held_via_os);
+                if ctx.input(|i| i.modifiers.ctrl) || ctrl_held {
                     *copy_capture_region_pressed = true;
                 } else {
                     *copy_capture_pressed = true;

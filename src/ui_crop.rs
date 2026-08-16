@@ -545,11 +545,15 @@ impl App {
         let pointer_pos = hover_pos.or(press_origin);
         let crop_drag_in_progress =
             self.export_crop_drag.is_some() || self.export_crop_create_drag.is_some();
+        let space_pan_held =
+            crate::keyboard_input::focused_key_state_permit(ui.ctx()).is_some_and(|permit| {
+                self.keymap
+                    .key_held_action(ui.ctx(), permit, KeyAction::CropSpacePan)
+            });
         if !crop_drag_in_progress
             && self.handle_overlay_space_pan_drag(
                 ui.ctx(),
-                self.keymap
-                    .key_held_action(ui.ctx(), KeyAction::CropSpacePan),
+                space_pan_held,
                 pointer_pos.is_some_and(|pos| transform.contains_screen(pos)),
                 primary_pressed,
                 primary_down,

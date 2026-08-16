@@ -32585,7 +32585,8 @@ impl App {
         // 見られず、画像系フルスクリーンの進む/戻る (= egui Key 経路に出ない
         // WM_APPCOMMAND / Browser_Forward) が失われる (Codex 2 周目 P2)。判断の詳細は
         // `main_keyboard_should_drain_mouse_nav` に集約する。
-        let main_has_focus = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        let input_permits = crate::keyboard_input::keyboard_input_permits(ctx);
+        let main_has_focus = input_permits.current_level.is_some();
         let (browser_back_count, browser_forward_count) =
             if self.main_keyboard_should_drain_mouse_nav(main_has_focus) {
                 crate::take_pending_mouse_nav()
@@ -32602,8 +32603,10 @@ impl App {
             return Some(nav);
         }
 
-        // ウィンドウにフォーカスがない場合はキー入力を無視
-        if !main_has_focus {
+        // A same-viewport Win32 edge is event-time ownership evidence even if
+        // focus moved before this frame ran. With neither focus nor a ROOT edge,
+        // keep the main surface fail-closed.
+        if input_permits.discrete.is_none() {
             return None;
         }
         if self.active_detached_viewer_has_foreground() {
@@ -32758,7 +32761,7 @@ impl App {
         // 考慮するため、egui の全イベントから Ctrl 修飾子を探す。
         let ctrl_held = ctx.input(|i| {
             // 現在のフレームで Ctrl が押されている
-            if i.modifiers.ctrl {
+            if input_permits.current_level.is_some() && i.modifiers.ctrl {
                 return true;
             }
             // イベントの中に Ctrl 修飾子付きのキーイベントがあるか
@@ -32768,7 +32771,7 @@ impl App {
             })
         });
         let alt_held = ctx.input(|i| {
-            if i.modifiers.alt {
+            if input_permits.current_level.is_some() && i.modifiers.alt {
                 return true;
             }
             i.events.iter().any(|e| match e {
@@ -32786,15 +32789,15 @@ impl App {
                     i.key_pressed(egui::Key::ArrowUp),
                     i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowUp),
                     i.modifiers.ctrl && i.key_pressed(egui::Key::ArrowDown),
-                    i.pointer.button_pressed(egui::PointerButton::Extra1),
-                    i.pointer.button_pressed(egui::PointerButton::Extra2),
+                    main_has_focus && i.pointer.button_pressed(egui::PointerButton::Extra1),
+                    main_has_focus && i.pointer.button_pressed(egui::PointerButton::Extra2),
                 )
             });
 
         // マウスドライバが WM_APPCOMMAND / VK_BROWSER_BACK/FORWARD で送る経路 (上で
         // 関数頭で drain 済み) を消費。詳細は main.rs の `install_mouse_nav_hook` 参照。
-        let browser_back = browser_back_count > 0;
-        let browser_forward = browser_forward_count > 0;
+        let browser_back = main_has_focus && browser_back_count > 0;
+        let browser_forward = main_has_focus && browser_forward_count > 0;
         let mouse_nav_back = mouse_back || browser_back;
         let mouse_nav_forward = mouse_forward || browser_forward;
         if mouse_nav_back || mouse_nav_forward {
@@ -32805,7 +32808,9 @@ impl App {
                 "grid-mouse",
             );
         }
-        if self.update_mouse_middle_short_click(ctx, true, ActionSurface::MainWindow) {
+        if main_has_focus
+            && self.update_mouse_middle_short_click(ctx, true, ActionSurface::MainWindow)
+        {
             return self.apply_mouse_button(
                 ctx,
                 crate::ring_shortcut::MouseButtonSlot::Middle,
@@ -32921,7 +32926,19 @@ impl App {
                 cols.max(1)
             };
             let page_items = visible_rows.max(1) * nav_cols;
-            let shift = ctx.input(|i| i.modifiers.shift);
+            let shift = ctx.input(|i| {
+                (input_permits.current_level.is_some() && i.modifiers.shift)
+                    || i.events.iter().any(|event| {
+                        matches!(
+                            event,
+                            egui::Event::Key {
+                                pressed: true,
+                                modifiers,
+                                ..
+                            } if modifiers.shift
+                        )
+                    })
+            });
             // Shift+矢印の範囲チェックは下で線形区間として扱う。端をループさせると
             // 隣接する 1 回の移動で一覧全体が範囲に入るため、Shift 中だけ従来どおりクランプする。
             let cursor_wrap = self.settings.grid_cursor_wrap && !shift;

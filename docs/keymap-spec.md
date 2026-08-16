@@ -154,6 +154,15 @@ folder navigation accumulator (`MAX_PENDING_NAV = 5`) を使う。トグル、�
 複数 edge を回数分発火させない。ページ送り系は、固定矢印入力、見開き単位、連結読みスクロール、
 割合ジャンプで 1 step の意味が異なるため、共通の回数適用規則を定めるまでは対象外とする。
 
+**ページ送りが `SinglePerFrame` であることの帰結** (2026-08-16 に外部の計測ツールでの挙動を
+問われて確定): 高速な連打では **N 回押しても N ページ進むとは限らない**。同一フレームに届いた
+複数 edge は全部消費されるが移動は 1 回で、未処理ぶんを次フレームへ持ち越さない (上記の
+edge 寿命 1 フレーム) ため、超過分の押下は失われる。**失われるのは押下であってページではない**
+—— 到達点が手前になるだけで、通り過ぎたページ番号が飛ぶことはない。実測は
+[docs/display-pipeline.md](display-pipeline.md) §2.5.1.2 (60Hz で 554 押下 → 538 移動、
+idx 遷移はすべて +1)。これは「ページ送りをキューに溜めない」という設計方針そのもので、
+仕様として維持する (利用者確認 2026-08-16)。
+
 キーリピート (`edge.repeat`) の意味は従来どおり。repeat 許可 Action でも、長い 1 フレームに
 溜まった repeat edge は最大 1 回へまとめ、同じフレームに non-repeat edge があれば物理押下数を
 優先する。no-repeat Action は repeat edge を消費するが発火させない。これにより、キーを離した後に
@@ -178,6 +187,23 @@ Enter-held の各 API は対象 `ViewportId` を必須引数にし、別 viewpor
 再生成後の viewport へ stale edge を配送しない。未登録 HWND は全 viewport へ公開せず `ROOT` として
 配送して診断ログへ記録する。メイン HWND は subclass が edge を publish できる前に `ROOT` 対応を
 登録済みにすることを不変条件とする。
+
+### 配送済み edge と現在レベルの ownership 境界
+
+同一 viewport に stamped された key-down edge は、OS が配送した時点の input ownership を表す
+離散 fact である。egui pass が処理されるまでに foreground が別 window へ移り、その pass の最終
+`viewport().focused` が false になっていても、この edge は対象 viewport で消費・dispatch してよい。
+一方、unfocused pass に generic egui key event だけが存在しても送信元 viewport の証拠にはならず、
+stamped edge の代用にはしない。modal、TextInput、IME、および別 viewport owner の block はこの契約
+より優先し、edge を背面の application shortcut へ漏らさない。
+
+`GetAsyncKeyState`、egui の frame-final key/modifier level、held 判定などの現在レベル観測は、対象
+viewport がその pass でも focused であることを示す `FocusedKeyStatePermit` がある場合だけ許可する。
+page-turn の initial press は配送済み edge だけで成立するが、auto-repeat の navigation 昇格や
+`still_held` はこの permit がなければ成立しない。focus 喪失時の KeyHold transient 取消は離散 edge の
+dispatch 可否とは別の状態遷移であり、取消後の unfocused pass に届いた hold edge から state を再生成
+しない。WM_APPCOMMAND、Browser Back/Forward pending、pointer Extra1/Extra2 など keyboard edge 以外の
+入力はこの ownership 証拠を共有しないため、従来どおり処理時点の focus を要求する。
 
 ## 固定入力 / KeyAction 対象外の整理
 

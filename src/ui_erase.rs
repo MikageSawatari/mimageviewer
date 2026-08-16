@@ -667,7 +667,8 @@ impl App {
         // フルスクリーンビューポートでは egui の modifier 状態が stale になり得るため、
         // 補正レイヤーと同じく Windows では OS の実キー状態を正にする。
         #[cfg(windows)]
-        let ctrl_held = crate::ui_fullscreen::ctrl_held_via_os();
+        let ctrl_held = crate::keyboard_input::focused_key_state_permit(ctx)
+            .is_some_and(crate::ui_fullscreen::ctrl_held_via_os);
         #[cfg(not(windows))]
         let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
 
@@ -1421,7 +1422,11 @@ impl App {
         let paint = self.erase_paint_mode;
         // KeyHold は keymap 経由。Windows では内部で OS 状態も読むので、
         // FS ビューポートの stale key_down 問題を避けられる。
-        let space_held = self.keymap.key_held_action(ctx, KeyAction::EraseSpacePan);
+        let space_held =
+            crate::keyboard_input::focused_key_state_permit(ctx).is_some_and(|permit| {
+                self.keymap
+                    .key_held_action(ctx, permit, KeyAction::EraseSpacePan)
+            });
 
         // パネル上のクリックはツール操作に使わない。
         //

@@ -10560,10 +10560,15 @@ impl App {
             || self.local_adjust_canvas_drag.is_some()
             || self.local_adjust_mask_shape_drag_start.is_some()
             || !self.local_adjust_mask_lasso_points.is_empty();
+        let level_permit = crate::keyboard_input::focused_key_state_permit(ctx);
+        let space_pan_held = level_permit.is_some_and(|permit| {
+            self.keymap
+                .key_held_action(ctx, permit, KeyAction::LaSpacePan)
+        });
         if !drawing_in_progress
             && self.handle_overlay_space_pan_drag(
                 ctx,
-                self.keymap.key_held_action(ctx, KeyAction::LaSpacePan),
+                space_pan_held,
                 !pointer_over_panel,
                 primary_pressed,
                 primary_down,
@@ -10584,7 +10589,7 @@ impl App {
         // まま) になり得る。それを OR で混ぜると境界筆が常時「通常筆」化して境界の向こう側まで
         // 塗る回帰になるため、Ctrl 依存の境界筆→通常筆切替は OS 直読みのみを使う
         // (ソースプレビューの Ctrl 検出と同じ方式)。
-        let ctrl_held = crate::ui_fullscreen::ctrl_held_via_os();
+        let ctrl_held = level_permit.is_some_and(crate::ui_fullscreen::ctrl_held_via_os);
 
         if primary_released {
             if self.local_adjust_shape_drag.is_some() {
@@ -11416,7 +11421,8 @@ impl App {
             effective_local_mask_edit_target(&layer, self.local_adjust_mask_edit_target);
         // 塗り経路 (`ctrl_held`) と同じく OS 直読みのみ。stale な `modifiers.ctrl` を混ぜると
         // Ctrl 非押下でも境界オーバーレイ表示/吸着が出てしまう。
-        let ctrl_down = crate::ui_fullscreen::ctrl_held_via_os();
+        let ctrl_down = crate::keyboard_input::focused_key_state_permit(ui.ctx())
+            .is_some_and(crate::ui_fullscreen::ctrl_held_via_os);
         if ctrl_down
             && active_mask_edit_target.is_some()
             && matches!(

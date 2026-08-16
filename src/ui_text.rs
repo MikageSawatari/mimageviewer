@@ -2386,6 +2386,7 @@ impl App {
             return;
         };
         let fonts = self.ensure_comic_fonts();
+        let level_permit = crate::keyboard_input::focused_key_state_permit(ctx);
 
         let (pressed, down, released, pos) = ctx.input(|i| {
             (
@@ -2396,10 +2397,14 @@ impl App {
             )
         });
         let pointer_over_floating_ui = text_floating_ui_blocks_canvas_input(ctx, pos);
+        let space_pan_held = level_permit.is_some_and(|permit| {
+            self.keymap
+                .key_held_action(ctx, permit, KeyAction::TextSpacePan)
+        });
         if self.text_drag.is_none()
             && self.handle_overlay_space_pan_drag(
                 ctx,
-                self.keymap.key_held_action(ctx, KeyAction::TextSpacePan),
+                space_pan_held,
                 !pointer_over_floating_ui,
                 pressed,
                 down,
@@ -2435,8 +2440,10 @@ impl App {
                     return;
                 }
                 let img = view.screen_to_image(pos);
-                let ctrl = modifier_held_via_os(ModKind::Ctrl);
-                let shift = modifier_held_via_os(ModKind::Shift);
+                let ctrl =
+                    level_permit.is_some_and(|permit| modifier_held_via_os(permit, ModKind::Ctrl));
+                let shift =
+                    level_permit.is_some_and(|permit| modifier_held_via_os(permit, ModKind::Shift));
                 // 変形ハンドルは単一選択時だけ有効。複数選択時はグループ移動を優先する。
                 let handle = (self.text_selected_ids.len() == 1)
                     .then_some(self.text_selected)
@@ -2538,11 +2545,14 @@ impl App {
                 if drag.armed || (pos - drag.start).length() >= DRAG_ARM_PX {
                     drag.armed = true;
                     let img = view.screen_to_image(pos);
-                    let symmetric_corner_resize = modifier_held_via_os(ModKind::Ctrl);
-                    let preserve_aspect_corner_resize = modifier_held_via_os(ModKind::Shift);
+                    let symmetric_corner_resize = level_permit
+                        .is_some_and(|permit| modifier_held_via_os(permit, ModKind::Ctrl));
+                    let preserve_aspect_corner_resize = level_permit
+                        .is_some_and(|permit| modifier_held_via_os(permit, ModKind::Shift));
                     let snapping_enabled = text_drag_snapping_enabled(
                         self.settings.text_smart_snap_enabled,
-                        modifier_held_via_os(ModKind::Alt),
+                        level_permit
+                            .is_some_and(|permit| modifier_held_via_os(permit, ModKind::Alt)),
                     );
                     let changed = if matches!(drag.kind, TextDragKind::Move) {
                         let (changed, guides) = self
@@ -2609,8 +2619,10 @@ impl App {
                     self.save_comic_objects(fs_idx, &key, &objs);
                     self.text_dirty_at = None;
                 } else if matches!(drag.kind, TextDragKind::Move)
-                    && !modifier_held_via_os(ModKind::Ctrl)
-                    && !modifier_held_via_os(ModKind::Shift)
+                    && !level_permit
+                        .is_some_and(|permit| modifier_held_via_os(permit, ModKind::Ctrl))
+                    && !level_permit
+                        .is_some_and(|permit| modifier_held_via_os(permit, ModKind::Shift))
                 {
                     let hit = self.comic_docs.get(&key).and_then(|objs| {
                         hit_test_visible(objs, drag.last_img, fonts.as_deref(), &stamps)

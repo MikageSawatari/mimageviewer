@@ -4199,6 +4199,65 @@ mod phase_c_key_tests {
         nav
     }
 
+    #[cfg(windows)]
+    struct MainKeyFrameCleanup;
+
+    #[cfg(windows)]
+    impl Drop for MainKeyFrameCleanup {
+        fn drop(&mut self) {
+            crate::key_input::clear_test_frame();
+        }
+    }
+
+    #[cfg(windows)]
+    fn root_right_edge(pressed: bool) -> crate::key_input::KeyEdge {
+        crate::key_input::KeyEdge {
+            source_hwnd: 1,
+            source_viewport: egui::ViewportId::ROOT,
+            virtual_key: 0x27,
+            scan_code: 0x4d,
+            extended: true,
+            pressed,
+            repeat: false,
+            ctrl: false,
+            shift: false,
+            alt: false,
+        }
+    }
+
+    #[cfg(windows)]
+    fn unfocused_root_right_input() -> egui::RawInput {
+        let viewport = egui::ViewportId::ROOT;
+        let mut input = egui::RawInput {
+            viewport_id: viewport,
+            events: vec![
+                egui::Event::Key {
+                    key: egui::Key::ArrowRight,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Key {
+                    key: egui::Key::ArrowRight,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+        input.viewports.insert(
+            viewport,
+            egui::ViewportInfo {
+                focused: Some(false),
+                ..Default::default()
+            },
+        );
+        input
+    }
+
     fn setup_grid_cursor_wrap_app() -> AppTestEnv {
         let mut app = setup_app();
         app.settings.grid_cols = 2;
@@ -4236,6 +4295,33 @@ mod phase_c_key_tests {
         assert!(nav.is_none());
         assert_eq!(app.selected, Some(0));
         assert!(app.checked.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn root_routed_tap_moves_grid_once_after_focus_loss() {
+        let _serial = crate::key_input::TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let _cleanup = MainKeyFrameCleanup;
+        crate::key_input::clear_test_frame();
+        let mut app = setup_grid_cursor_wrap_app();
+        app.settings.grid_cols = 3;
+        app.settings.grid_cursor_wrap = false;
+        app.selected = Some(0);
+        let ctx = egui::Context::default();
+        ctx.begin_pass(unfocused_root_right_input());
+        crate::key_input::set_test_frame_for_viewport(
+            egui::ViewportId::ROOT,
+            vec![root_right_edge(true), root_right_edge(false)],
+        );
+
+        let nav = app.handle_keyboard(&ctx);
+        let _ = ctx.end_pass();
+
+        assert!(nav.is_none());
+        assert_eq!(app.selected, Some(1));
     }
 
     /// ベースライン: 新規 App はどの検索バーも開いていないこと。
@@ -49391,23 +49477,73 @@ fn plain_a_has_no_bookmark_panel_fullscreen_action() {
     );
 }
 
-fn fullscreen_fixed_key_event(key: egui::Key) -> egui::Event {
+fn fullscreen_fixed_key_event_with_state(
+    key: egui::Key,
+    pressed: bool,
+    repeat: bool,
+) -> egui::Event {
     egui::Event::Key {
         key,
         physical_key: None,
-        pressed: true,
-        repeat: false,
+        pressed,
+        repeat,
         modifiers: egui::Modifiers::NONE,
     }
 }
 
-fn fullscreen_fixed_key_test_guard() -> std::sync::MutexGuard<'static, ()> {
-    let guard = crate::key_input::TEST_INPUT_LOCK
+fn fullscreen_fixed_key_event(key: egui::Key) -> egui::Event {
+    fullscreen_fixed_key_event_with_state(key, true, false)
+}
+
+#[cfg(windows)]
+fn fullscreen_test_key_edge(
+    virtual_key: u32,
+    scan_code: u16,
+    extended: bool,
+    pressed: bool,
+    repeat: bool,
+) -> crate::key_input::KeyEdge {
+    crate::key_input::KeyEdge {
+        source_hwnd: 1,
+        source_viewport: egui::ViewportId::ROOT,
+        virtual_key,
+        scan_code,
+        extended,
+        pressed,
+        repeat,
+        ctrl: false,
+        shift: false,
+        alt: false,
+    }
+}
+
+#[cfg(windows)]
+fn fullscreen_right_edge(pressed: bool, repeat: bool) -> crate::key_input::KeyEdge {
+    fullscreen_test_key_edge(0x27, 0x4d, true, pressed, repeat)
+}
+
+#[cfg(windows)]
+fn fullscreen_z_edge(pressed: bool, repeat: bool) -> crate::key_input::KeyEdge {
+    fullscreen_test_key_edge(0x5a, 0x2c, false, pressed, repeat)
+}
+
+struct FullscreenFixedKeyTestGuard {
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for FullscreenFixedKeyTestGuard {
+    fn drop(&mut self) {
+        crate::key_input::clear_test_frame();
+    }
+}
+
+fn fullscreen_fixed_key_test_guard() -> FullscreenFixedKeyTestGuard {
+    let serial = crate::key_input::TEST_INPUT_LOCK
         .get_or_init(|| std::sync::Mutex::new(()))
         .lock()
         .expect("fullscreen fixed-key test lock poisoned");
     crate::key_input::clear_test_frame();
-    guard
+    FullscreenFixedKeyTestGuard { _serial: serial }
 }
 
 fn setup_fullscreen_fixed_key_test() -> (phase_c_support::AppTestEnv, usize, egui::Context) {
@@ -49623,7 +49759,11 @@ fn bookmark_title_draft_without_focus_or_ime_allows_fullscreen_arrows() {
     assert!(!action.page_nav.is_none());
 }
 
-fn viewport_raw_input(viewport: egui::ViewportId, events: Vec<egui::Event>) -> egui::RawInput {
+fn viewport_raw_input_with_focus(
+    viewport: egui::ViewportId,
+    focused: bool,
+    events: Vec<egui::Event>,
+) -> egui::RawInput {
     let mut input = egui::RawInput {
         viewport_id: viewport,
         events,
@@ -49632,12 +49772,192 @@ fn viewport_raw_input(viewport: egui::ViewportId, events: Vec<egui::Event>) -> e
     input.viewports.insert(
         viewport,
         egui::ViewportInfo {
-            parent: Some(egui::ViewportId::ROOT),
-            focused: Some(true),
+            parent: (viewport != egui::ViewportId::ROOT).then_some(egui::ViewportId::ROOT),
+            focused: Some(focused),
             ..Default::default()
         },
     );
     input
+}
+
+fn viewport_raw_input(viewport: egui::ViewportId, events: Vec<egui::Event>) -> egui::RawInput {
+    viewport_raw_input_with_focus(viewport, true, events)
+}
+
+#[cfg(windows)]
+#[test]
+fn fullscreen_routed_tap_is_consumed_once_after_focus_loss() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
+    let viewport = egui::ViewportId::from_hash_of(101_u64);
+    ctx.begin_pass(viewport_raw_input_with_focus(
+        viewport,
+        false,
+        vec![
+            fullscreen_fixed_key_event_with_state(egui::Key::ArrowRight, true, false),
+            fullscreen_fixed_key_event_with_state(egui::Key::ArrowRight, false, false),
+        ],
+    ));
+    crate::key_input::set_test_frame_for_viewport(
+        viewport,
+        vec![
+            fullscreen_right_edge(true, false),
+            fullscreen_right_edge(false, false),
+        ],
+    );
+
+    let first = app.handle_fs_key_input(&ctx, fs_idx, false);
+    let second = app.handle_fs_key_input(&ctx, fs_idx, false);
+    let _ = ctx.end_pass();
+
+    assert_eq!(first.page_nav, crate::ui_fullscreen::FsPageNav::Delta(1));
+    assert_no_fullscreen_fixed_key_action(second);
+}
+
+#[cfg(windows)]
+#[test]
+fn fullscreen_sibling_edge_does_not_authorize_unfocused_egui_event() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
+    let viewport = egui::ViewportId::from_hash_of(102_u64);
+    let sibling = egui::ViewportId::from_hash_of(103_u64);
+    ctx.begin_pass(viewport_raw_input_with_focus(
+        viewport,
+        false,
+        vec![fullscreen_fixed_key_event(egui::Key::ArrowRight)],
+    ));
+    crate::key_input::set_test_frame_for_viewport(
+        sibling,
+        vec![fullscreen_right_edge(true, false)],
+    );
+    crate::key_input::add_test_frame_active_viewport(viewport);
+
+    let action = app.handle_fs_key_input(&ctx, fs_idx, false);
+    let _ = ctx.end_pass();
+
+    assert_no_fullscreen_fixed_key_action(action);
+}
+
+#[cfg(windows)]
+#[test]
+fn fullscreen_unfocused_pass_without_edge_or_event_does_nothing() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
+    let viewport = egui::ViewportId::from_hash_of(104_u64);
+    ctx.begin_pass(viewport_raw_input_with_focus(viewport, false, Vec::new()));
+    crate::key_input::set_test_frame_for_viewport(viewport, Vec::new());
+
+    let action = app.handle_fs_key_input(&ctx, fs_idx, false);
+    let _ = ctx.end_pass();
+
+    assert_no_fullscreen_fixed_key_action(action);
+}
+
+#[cfg(windows)]
+#[test]
+fn fullscreen_modal_owner_blocks_routed_edge_after_focus_loss() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
+    app.show_preferences = true;
+    let viewport = egui::ViewportId::from_hash_of(105_u64);
+    ctx.begin_pass(viewport_raw_input_with_focus(
+        viewport,
+        false,
+        vec![fullscreen_fixed_key_event(egui::Key::ArrowRight)],
+    ));
+    crate::key_input::set_test_frame_for_viewport(
+        viewport,
+        vec![fullscreen_right_edge(true, false)],
+    );
+
+    let action = app.handle_fs_key_input(&ctx, fs_idx, false);
+    let _ = ctx.end_pass();
+
+    assert_no_fullscreen_fixed_key_action(action);
+}
+
+#[cfg(windows)]
+#[test]
+fn fullscreen_text_input_owner_blocks_routed_edge_after_focus_loss() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
+    start_bookmark_title_edit_after_handler(&mut app, &ctx, fs_idx);
+    focus_bookmark_title_editor(&mut app, &ctx, fs_idx);
+
+    let viewport = egui::ViewportId::ROOT;
+    ctx.begin_pass(viewport_raw_input_with_focus(
+        viewport,
+        false,
+        vec![fullscreen_fixed_key_event(egui::Key::ArrowRight)],
+    ));
+    crate::key_input::set_test_frame_for_viewport(
+        viewport,
+        vec![fullscreen_right_edge(true, false)],
+    );
+    let owner = app.keyboard_owner_for_pass(&ctx);
+    assert!(matches!(
+        owner,
+        crate::keyboard_input::KeyboardOwner::TextInput { .. }
+    ));
+
+    let action = app.handle_fs_key_input(&ctx, fs_idx, false);
+    draw_bookmark_title_editor(&mut app, &ctx);
+    let _ = ctx.end_pass();
+
+    assert_no_fullscreen_fixed_key_action(action);
+}
+
+#[cfg(windows)]
+#[test]
+fn fullscreen_released_auto_repeat_is_dropped_after_focus_loss() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
+    let viewport = egui::ViewportId::from_hash_of(106_u64);
+    ctx.begin_pass(viewport_raw_input_with_focus(
+        viewport,
+        false,
+        vec![
+            fullscreen_fixed_key_event_with_state(egui::Key::ArrowRight, true, true),
+            fullscreen_fixed_key_event_with_state(egui::Key::ArrowRight, false, false),
+        ],
+    ));
+    crate::key_input::set_test_frame_for_viewport(
+        viewport,
+        vec![
+            fullscreen_right_edge(true, true),
+            fullscreen_right_edge(false, false),
+        ],
+    );
+
+    let action = app.handle_fs_key_input(&ctx, fs_idx, false);
+    let _ = ctx.end_pass();
+
+    assert_no_fullscreen_fixed_key_action(action);
+}
+
+#[cfg(windows)]
+#[test]
+fn fullscreen_focus_loss_clears_zoom_transient_without_rearming_from_z_edge() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let (mut app, fs_idx, ctx) = setup_fullscreen_fixed_key_test();
+    app.fs_zoom_aiming = true;
+    app.fs_zoom_exit_pending = true;
+    app.fs_zoom_z_was_down = true;
+    let viewport = egui::ViewportId::from_hash_of(107_u64);
+    ctx.begin_pass(viewport_raw_input_with_focus(
+        viewport,
+        false,
+        vec![fullscreen_fixed_key_event(egui::Key::Z)],
+    ));
+    crate::key_input::set_test_frame_for_viewport(viewport, vec![fullscreen_z_edge(true, false)]);
+
+    let action = app.handle_fs_key_input(&ctx, fs_idx, false);
+    let _ = ctx.end_pass();
+
+    assert_no_fullscreen_fixed_key_action(action);
+    assert!(!app.fs_zoom_aiming);
+    assert!(!app.fs_zoom_exit_pending);
+    assert!(!app.fs_zoom_z_was_down);
 }
 
 #[test]

@@ -6110,20 +6110,24 @@ impl Keymap {
     /// The caller supplies the owning viewport so physical Enter/NumpadEnter
     /// latches stay routed to the same viewer context as normal dispatch.
     #[cfg(windows)]
-    pub(crate) fn key_held_chord_via_os(&self, viewport: egui::ViewportId, chord: Chord) -> bool {
+    pub(crate) fn key_held_chord_via_os(
+        &self,
+        permit: crate::keyboard_input::FocusedKeyStatePermit,
+        chord: Chord,
+    ) -> bool {
         let Some(name) = chord.key_name() else {
             return false;
         };
         let Some((ctrl, shift, alt)) = chord.key_modifiers() else {
             return false;
         };
-        if modifier_held_via_os(ModKind::Ctrl) != ctrl
-            || modifier_held_via_os(ModKind::Shift) != shift
-            || modifier_held_via_os(ModKind::Alt) != alt
+        if modifier_held_via_os(permit, ModKind::Ctrl) != ctrl
+            || modifier_held_via_os(permit, ModKind::Shift) != shift
+            || modifier_held_via_os(permit, ModKind::Alt) != alt
         {
             return false;
         }
-        key_held_via_os(viewport, name)
+        key_held_via_os(permit.viewport(), name)
     }
 
     pub fn first_chord_label(&self, action: KeyAction) -> Option<String> {
@@ -6489,6 +6493,7 @@ impl Keymap {
     pub(crate) fn consume_page_turn_action(
         &self,
         ctx: &egui::Context,
+        level_permit: Option<crate::keyboard_input::FocusedKeyStatePermit>,
         action: KeyAction,
     ) -> PageTurnConsumeResult {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
@@ -6505,7 +6510,7 @@ impl Keymap {
 
         let mut dropped = None;
         for chord in self.effective_chords(action) {
-            let result = self.consume_page_turn_chord_inner(ctx, chord);
+            let result = self.consume_page_turn_chord_inner(ctx, level_permit, chord);
             match result {
                 PageTurnConsumeResult::Trigger(_) => {
                     #[cfg(windows)]
@@ -6704,21 +6709,26 @@ impl Keymap {
         false
     }
 
-    pub fn key_held_action(&self, ctx: &egui::Context, action: KeyAction) -> bool {
+    pub(crate) fn key_held_action(
+        &self,
+        ctx: &egui::Context,
+        permit: crate::keyboard_input::FocusedKeyStatePermit,
+        action: KeyAction,
+    ) -> bool {
         debug_assert_eq!(action.trigger(), KeyTrigger::KeyHold);
-        if crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx) {
+        if !permit.allows(ctx) || crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx) {
             return false;
         }
         if let Some(chords) = self.overrides.get(&action) {
             return chords
                 .iter()
                 .copied()
-                .any(|chord| self.key_held_chord(ctx, chord));
+                .any(|chord| self.key_held_chord(ctx, permit, chord));
         }
         action
             .default_chords()
             .iter()
-            .any(|chord| self.key_held_chord(ctx, chord))
+            .any(|chord| self.key_held_chord(ctx, permit, chord))
     }
 
     /// KeyHold アクションに割り当てられたキーについて、このフレームの egui Key イベント
@@ -6757,6 +6767,9 @@ impl Keymap {
                 Self::claim_egui_twin_key_events(ctx, &chords);
             }
             return edges;
+        }
+        if !Self::egui_key_event_fallback_allowed(ctx) {
+            return (false, false);
         }
         // Numpad0-9 は to_egui が上段 Num0-9 へ畳むため、ここで使うと「テンキー割当なのに
         // 上段数字キーのイベントを消費 / fast-tap 誤発火」になる。fast-tap 救済から除外し、
@@ -6807,12 +6820,17 @@ impl Keymap {
         })
     }
 
-    pub fn modifier_held_action(&self, ctx: &egui::Context, action: KeyAction) -> bool {
+    pub(crate) fn modifier_held_action(
+        &self,
+        ctx: &egui::Context,
+        permit: crate::keyboard_input::FocusedKeyStatePermit,
+        action: KeyAction,
+    ) -> bool {
         debug_assert_eq!(action.trigger(), KeyTrigger::ModifierHold);
-        if crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx) {
+        if !permit.allows(ctx) || crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx) {
             return false;
         }
-        self.modifier_held_action_without_owner_gate(ctx, action)
+        self.modifier_held_action_without_owner_gate(ctx, permit, action)
     }
 
     /// Resolve a ModifierHold whose physical state belongs to another focused viewport.
@@ -6824,27 +6842,29 @@ impl Keymap {
     pub(crate) fn modifier_held_action_for_external_viewport(
         &self,
         ctx: &egui::Context,
+        permit: crate::keyboard_input::FocusedKeyStatePermit,
         action: KeyAction,
     ) -> bool {
         debug_assert_eq!(action.trigger(), KeyTrigger::ModifierHold);
-        self.modifier_held_action_without_owner_gate(ctx, action)
+        self.modifier_held_action_without_owner_gate(ctx, permit, action)
     }
 
     fn modifier_held_action_without_owner_gate(
         &self,
         ctx: &egui::Context,
+        permit: crate::keyboard_input::FocusedKeyStatePermit,
         action: KeyAction,
     ) -> bool {
         if let Some(chords) = self.overrides.get(&action) {
             return chords
                 .iter()
                 .copied()
-                .any(|chord| self.modifier_held_chord(ctx, chord));
+                .any(|chord| self.modifier_held_chord(ctx, permit, chord));
         }
         action
             .default_chords()
             .iter()
-            .any(|chord| self.modifier_held_chord(ctx, chord))
+            .any(|chord| self.modifier_held_chord(ctx, permit, chord))
     }
 
     pub fn matches_vk_action_parts(
@@ -7143,17 +7163,19 @@ impl Keymap {
         &self,
         ctx: &egui::Context,
         permit: crate::keyboard_input::FullscreenRawKeyPermit,
+        level_permit: Option<crate::keyboard_input::FocusedKeyStatePermit>,
         chord: Chord,
     ) -> PageTurnConsumeResult {
         if !permit.allows(ctx) {
             return PageTurnConsumeResult::NoMatch;
         }
-        self.consume_page_turn_chord_inner(ctx, chord)
+        self.consume_page_turn_chord_inner(ctx, level_permit, chord)
     }
 
     fn consume_page_turn_chord_inner(
         &self,
         ctx: &egui::Context,
+        level_permit: Option<crate::keyboard_input::FocusedKeyStatePermit>,
         chord: Chord,
     ) -> PageTurnConsumeResult {
         let Some(key_name) = chord.key_name() else {
@@ -7181,7 +7203,7 @@ impl Keymap {
                 } else {
                     PageTurnPressKind::AutoRepeat
                 };
-                let os_held = self.page_turn_chord_held(ctx, chord);
+                let os_held = self.page_turn_chord_held(ctx, level_permit, chord);
                 let still_held = !edges.released_after_match && os_held;
                 let result = Self::classify_page_turn_input(PageTurnKeyInput {
                     kind,
@@ -7203,6 +7225,12 @@ impl Keymap {
             if Self::frame_active_blocks_egui_fallback(chord) {
                 return PageTurnConsumeResult::NoMatch;
             }
+        }
+
+        // An unfocused pass may only trust the HWND-routed edge queue above.
+        // A generic egui event has no equivalent source proof on its own.
+        if !Self::egui_key_event_fallback_allowed(ctx) {
+            return PageTurnConsumeResult::NoMatch;
         }
 
         let Some(egui_key) = key_name.egui_twin_key_for_claim() else {
@@ -7272,7 +7300,7 @@ impl Keymap {
         } else {
             PageTurnPressKind::AutoRepeat
         };
-        let os_held = self.page_turn_chord_held(ctx, chord);
+        let os_held = self.page_turn_chord_held(ctx, level_permit, chord);
         let still_held = !released_after_match && os_held;
         let result = Self::classify_page_turn_input(PageTurnKeyInput {
             kind,
@@ -7342,10 +7370,18 @@ impl Keymap {
         }
     }
 
-    fn page_turn_chord_held(&self, ctx: &egui::Context, chord: Chord) -> bool {
+    fn page_turn_chord_held(
+        &self,
+        ctx: &egui::Context,
+        permit: Option<crate::keyboard_input::FocusedKeyStatePermit>,
+        chord: Chord,
+    ) -> bool {
+        let Some(permit) = permit.filter(|permit| permit.allows(ctx)) else {
+            return false;
+        };
         #[cfg(windows)]
         {
-            self.key_held_chord_via_os(ctx.viewport_id(), chord)
+            self.key_held_chord_via_os(permit, chord)
         }
         #[cfg(not(windows))]
         {
@@ -7396,6 +7432,9 @@ impl Keymap {
             if Self::frame_active_blocks_egui_fallback(chord) {
                 return false;
             }
+        }
+        if !Self::egui_key_event_fallback_allowed(ctx) {
+            return false;
         }
         let (triggered, matched) = ctx.input_mut(|i| {
             let mut found = false;
@@ -7467,6 +7506,9 @@ impl Keymap {
         {
             return 0;
         }
+        if !Self::egui_key_event_fallback_allowed(ctx) {
+            return 0;
+        }
 
         let (physical_press_count, matched_repeat, matched) = ctx.input_mut(|i| {
             let mut physical_press_count = 0usize;
@@ -7523,6 +7565,10 @@ impl Keymap {
         chord
             .key_name()
             .is_some_and(KeyName::egui_event_cannot_identify_slot)
+    }
+
+    fn egui_key_event_fallback_allowed(ctx: &egui::Context) -> bool {
+        ctx.input(|input| input.viewport().focused).unwrap_or(true)
     }
 
     fn claim_egui_twin_key_events(ctx: &egui::Context, chords: &[Chord]) {
@@ -7602,6 +7648,9 @@ impl Keymap {
                 return false;
             }
         }
+        if !Self::egui_key_event_fallback_allowed(ctx) {
+            return false;
+        }
         ctx.input(|i| {
             i.events.iter().any(|event| {
                 matches!(
@@ -7617,7 +7666,13 @@ impl Keymap {
         })
     }
 
-    fn key_held_chord(&self, ctx: &egui::Context, chord: Chord) -> bool {
+    fn key_held_chord(
+        &self,
+        ctx: &egui::Context,
+        permit: crate::keyboard_input::FocusedKeyStatePermit,
+        chord: Chord,
+    ) -> bool {
+        let _ = ctx;
         // KeyHold は「修飾キーなしの通常キー」契約 (validate_for_trigger 参照)。修飾キーが
         // 同時に押されている間は不成立にして、Ctrl+Z (undo) / Shift+Z (分析) 等が KeyHold
         // アクション (例: 全画面ズーム) を誤起動しないようにする (Codex P1)。FS ビューポートで
@@ -7632,7 +7687,7 @@ impl Keymap {
             //   経由の「上段数字キーで誤発火」も起きない。
             // - Enter / NumpadEnter は共有 VK_RETURN を直接読まず、Win32 edge の extended bit
             //   から作る物理ラッチを使うため、KeyHold でも双方向に分離される。
-            self.key_held_chord_via_os(ctx.viewport_id(), chord)
+            self.key_held_chord_via_os(permit, chord)
         }
         #[cfg(not(windows))]
         {
@@ -7657,13 +7712,19 @@ impl Keymap {
     /// alter routing.
     #[cfg(all(windows, feature = "test-script"))]
     pub(crate) fn test_script_key_held_chord(&self, ctx: &egui::Context, chord: Chord) -> bool {
-        self.key_held_chord(ctx, chord)
+        crate::keyboard_input::focused_key_state_permit(ctx)
+            .is_some_and(|permit| self.key_held_chord(ctx, permit, chord))
     }
 
-    fn modifier_held_chord(&self, ctx: &egui::Context, chord: Chord) -> bool {
+    fn modifier_held_chord(
+        &self,
+        ctx: &egui::Context,
+        permit: crate::keyboard_input::FocusedKeyStatePermit,
+        chord: Chord,
+    ) -> bool {
         #[cfg(windows)]
         if let Some(kind) = chord.modifier_kind() {
-            return modifier_held_via_os(kind);
+            return modifier_held_via_os(permit, kind);
         }
         ctx.input(|i| chord.matches_modifiers(i.modifiers))
     }
@@ -7838,13 +7899,19 @@ const fn modifier_virtual_key(kind: ModKind) -> u16 {
 }
 
 #[cfg(windows)]
-pub(crate) fn modifier_held_via_os(kind: ModKind) -> bool {
+pub(crate) fn modifier_held_via_os(
+    _permit: crate::keyboard_input::FocusedKeyStatePermit,
+    kind: ModKind,
+) -> bool {
     let vk = modifier_virtual_key(kind);
     crate::key_input::physical_key_down(crate::key_input::PhysicalKeySlot::new(vk.into(), false))
 }
 
 #[cfg(not(windows))]
-pub(crate) fn modifier_held_via_os(_kind: ModKind) -> bool {
+pub(crate) fn modifier_held_via_os(
+    _permit: crate::keyboard_input::FocusedKeyStatePermit,
+    _kind: ModKind,
+) -> bool {
     false
 }
 
@@ -10326,6 +10393,104 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn focused_level_permit(
+        viewport: egui::ViewportId,
+    ) -> crate::keyboard_input::FocusedKeyStatePermit {
+        crate::keyboard_input::focused_key_state_permit_for_viewport(viewport, true).unwrap()
+    }
+
+    #[cfg(windows)]
+    fn begin_unfocused_pass(ctx: &egui::Context, viewport: egui::ViewportId) {
+        let mut input = egui::RawInput {
+            viewport_id: viewport,
+            ..Default::default()
+        };
+        input.viewports.insert(
+            viewport,
+            egui::ViewportInfo {
+                focused: Some(false),
+                ..Default::default()
+            },
+        );
+        ctx.begin_pass(input);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn page_turn_initial_press_survives_focus_loss_after_routing() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+        let _clear_synthetic = ClearTestSyntheticInput;
+        let keymap = page_turn_keymap_for_test();
+        let ctx = egui::Context::default();
+        let viewport = egui::ViewportId::ROOT;
+        begin_unfocused_pass(&ctx, viewport);
+        cache_test_keyboard_owner(&ctx);
+        crate::key_input::set_test_frame_for_viewport(
+            viewport,
+            vec![right_edge(false, true), right_edge(false, false)],
+        );
+
+        assert_eq!(
+            keymap.consume_page_turn_action(&ctx, None, KeyAction::FsPageNext),
+            PageTurnConsumeResult::Trigger(PageTurnKeyInput {
+                kind: PageTurnPressKind::InitialPress,
+                chord: Chord::key(KeyName::Right),
+                still_held: false,
+                viewport,
+            })
+        );
+        let _ = ctx.end_pass();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn page_turn_auto_repeat_without_focused_level_permit_is_dropped() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+        let _clear_synthetic = ClearTestSyntheticInput;
+        let keymap = page_turn_keymap_for_test();
+        let ctx = egui::Context::default();
+        let viewport = egui::ViewportId::ROOT;
+        begin_unfocused_pass(&ctx, viewport);
+        cache_test_keyboard_owner(&ctx);
+        crate::key_input::set_test_frame_for_viewport(viewport, vec![right_edge(true, true)]);
+
+        assert_eq!(
+            keymap.consume_page_turn_action(&ctx, None, KeyAction::FsPageNext),
+            PageTurnConsumeResult::DroppedReleasedRepeat(PageTurnKeyInput {
+                kind: PageTurnPressKind::AutoRepeat,
+                chord: Chord::key(KeyName::Right),
+                still_held: false,
+                viewport,
+            })
+        );
+        let _ = ctx.end_pass();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn page_turn_edge_from_sibling_viewport_is_no_match() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+        let _clear_synthetic = ClearTestSyntheticInput;
+        let keymap = page_turn_keymap_for_test();
+        let ctx = egui::Context::default();
+        let viewport = egui::ViewportId::ROOT;
+        let sibling = egui::ViewportId::from_hash_of(10_u64);
+        begin_unfocused_pass(&ctx, viewport);
+        cache_test_keyboard_owner(&ctx);
+        crate::key_input::set_test_frame_for_viewport(sibling, vec![right_edge(false, true)]);
+        crate::key_input::add_test_frame_active_viewport(viewport);
+
+        assert_eq!(
+            keymap.consume_page_turn_action(&ctx, None, KeyAction::FsPageNext),
+            PageTurnConsumeResult::NoMatch
+        );
+        let _ = ctx.end_pass();
+    }
+
+    #[cfg(windows)]
     #[test]
     fn page_turn_consume_reports_first_press_with_owning_viewport() {
         let _serial = native_video_shortcut_test_guard();
@@ -10340,7 +10505,11 @@ mod tests {
         crate::key_input::set_test_frame(vec![right_edge(false, true)]);
 
         assert_eq!(
-            keymap.consume_page_turn_action(&ctx, KeyAction::FsPageNext),
+            keymap.consume_page_turn_action(
+                &ctx,
+                Some(focused_level_permit(viewport)),
+                KeyAction::FsPageNext,
+            ),
             PageTurnConsumeResult::Trigger(PageTurnKeyInput {
                 kind: PageTurnPressKind::InitialPress,
                 chord: Chord::key(KeyName::Right),
@@ -10366,7 +10535,11 @@ mod tests {
         crate::key_input::set_test_frame(vec![right_edge(true, true)]);
 
         assert_eq!(
-            keymap.consume_page_turn_action(&ctx, KeyAction::FsPageNext),
+            keymap.consume_page_turn_action(
+                &ctx,
+                Some(focused_level_permit(viewport)),
+                KeyAction::FsPageNext,
+            ),
             PageTurnConsumeResult::Trigger(PageTurnKeyInput {
                 kind: PageTurnPressKind::AutoRepeat,
                 chord: Chord::key(KeyName::Right),
@@ -10392,7 +10565,11 @@ mod tests {
         crate::key_input::set_test_frame(vec![right_edge(true, true), right_edge(false, false)]);
 
         assert_eq!(
-            keymap.consume_page_turn_action(&ctx, KeyAction::FsPageNext),
+            keymap.consume_page_turn_action(
+                &ctx,
+                Some(focused_level_permit(viewport)),
+                KeyAction::FsPageNext,
+            ),
             PageTurnConsumeResult::DroppedReleasedRepeat(PageTurnKeyInput {
                 kind: PageTurnPressKind::AutoRepeat,
                 chord: Chord::key(KeyName::Right),
@@ -10419,7 +10596,11 @@ mod tests {
         crate::key_input::set_test_frame(vec![right_edge(false, true), right_edge(false, false)]);
 
         assert_eq!(
-            keymap.consume_page_turn_action(&ctx, KeyAction::FsPageNext),
+            keymap.consume_page_turn_action(
+                &ctx,
+                Some(focused_level_permit(viewport)),
+                KeyAction::FsPageNext,
+            ),
             PageTurnConsumeResult::Trigger(PageTurnKeyInput {
                 kind: PageTurnPressKind::InitialPress,
                 chord: Chord::key(KeyName::Right),
