@@ -3859,37 +3859,69 @@ fn ipc_error_response(
 }
 
 fn api_image_info(state: &AppState, query: &[(String, String)]) -> HttpResponse {
-    let Ok(path) = required_query_value(query, "path") else {
-        return HttpResponse::text(400, "Bad Request");
-    };
-    match state.library.image_info(path) {
-        Ok(value) => HttpResponse::json(&value)
+    match with_legacy_image_generation(state, query, || {
+        let path = required_query_value(query, "path")
+            .map_err(|()| HttpResponse::text(400, "Bad Request"))?;
+        state.library.image_info(path).map_err(store_error_response)
+    }) {
+        Ok((value, remote_state_generation)) => HttpResponse::json(&value)
             .unwrap_or_else(|_| HttpResponse::text(500, "Internal Server Error"))
+            .with_header("X-mIV-Remote-State-Generation", remote_state_generation)
             .with_header("Cache-Control", "private, max-age=60"),
-        Err(error) => store_error_response(error),
+        Err(response) => response,
     }
 }
 
 fn api_image(state: &AppState, query: &[(String, String)]) -> HttpResponse {
-    let Ok(path) = required_query_value(query, "path") else {
-        return HttpResponse::text(400, "Bad Request");
-    };
-    let width = match required_query_value(query, "w").and_then(|value| {
-        value
-            .parse::<u32>()
-            .map_err(|_| ())
-            .and_then(|width| (width > 0).then_some(width).ok_or(()))
+    match with_legacy_image_generation(state, query, || {
+        let path = required_query_value(query, "path")
+            .map_err(|()| HttpResponse::text(400, "Bad Request"))?;
+        let width = required_query_value(query, "w")
+            .and_then(|value| {
+                value
+                    .parse::<u32>()
+                    .map_err(|_| ())
+                    .and_then(|width| (width > 0).then_some(width).ok_or(()))
+            })
+            .map_err(|()| HttpResponse::text(400, "Bad Request"))?;
+        state
+            .library
+            .image(path, width)
+            .map_err(store_error_response)
     }) {
-        Ok(width) => width,
-        Err(()) => return HttpResponse::text(400, "Bad Request"),
-    };
-
-    match state.library.image(path, width) {
-        Ok(value) => HttpResponse::bytes(200, value.content_type, value.bytes)
-            .with_header("Cache-Control", "private, max-age=60")
-            .with_log_details(json!({"image": value.metrics})),
-        Err(error) => store_error_response(error),
+        Ok((value, remote_state_generation)) => {
+            HttpResponse::bytes(200, value.content_type, value.bytes)
+                .with_header("X-mIV-Remote-State-Generation", remote_state_generation)
+                .with_header("Cache-Control", "private, max-age=60")
+                .with_log_details(json!({"image": value.metrics}))
+        }
+        Err(response) => response,
     }
+}
+
+fn with_legacy_image_generation<T>(
+    state: &AppState,
+    query: &[(String, String)],
+    operation: impl FnOnce() -> Result<T, HttpResponse>,
+) -> Result<(T, String), HttpResponse> {
+    let remote_state_generation = match query_value(query, "generation") {
+        Ok(Some(value)) if valid_page_wire_identity(value) => value.to_owned(),
+        _ => return Err(HttpResponse::text(400, "Bad Request")),
+    };
+    if let Err(error) = state
+        .library
+        .require_remote_state_generation(&remote_state_generation)
+    {
+        return Err(store_error_response(error));
+    }
+    let result = operation();
+    if let Err(error) = state
+        .library
+        .require_remote_state_generation(&remote_state_generation)
+    {
+        return Err(store_error_response(error));
+    }
+    result.map(|value| (value, remote_state_generation))
 }
 
 #[derive(Deserialize)]
@@ -4771,6 +4803,93 @@ mod tests {
         assert!(!valid_page_wire_identity(&"a".repeat(129)));
         assert!(!valid_page_wire_identity("page_123"));
         assert!(!valid_page_wire_identity("page/123"));
+    }
+
+    #[test]
+    fn legacy_image_routes_require_page_generation_wire_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let path = temp.path().join("page.png").to_string_lossy().into_owned();
+
+        for generation in [None, Some(""), Some("bad_generation")] {
+            let mut info_query = vec![("path".to_owned(), path.clone())];
+            let mut image_query = vec![
+                ("path".to_owned(), path.clone()),
+                ("w".to_owned(), "32".to_owned()),
+            ];
+            if let Some(generation) = generation {
+                info_query.push(("generation".to_owned(), generation.to_owned()));
+                image_query.push(("generation".to_owned(), generation.to_owned()));
+            }
+            assert_eq!(api_image_info(&state, &info_query).status, 400);
+            assert_eq!(api_image(&state, &image_query).status, 400);
+        }
+    }
+
+    #[test]
+    fn legacy_image_routes_reject_stale_generation_and_attest_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let image_path = temp.path().join("page.png");
+        image::RgbImage::from_pixel(3, 2, image::Rgb([10, 20, 30]))
+            .save(&image_path)
+            .unwrap();
+        let path = image_path.to_string_lossy().into_owned();
+        let query = |generation: &str, include_width: bool| {
+            let mut query = vec![
+                ("path".to_owned(), path.clone()),
+                ("generation".to_owned(), generation.to_owned()),
+            ];
+            if include_width {
+                query.push(("w".to_owned(), "32".to_owned()));
+            }
+            query
+        };
+
+        let current_generation = state
+            .library
+            .remote_state()
+            .unwrap()
+            .remote_state_generation;
+        for response in [
+            api_image_info(&state, &query("stale-1", false)),
+            api_image(&state, &query("stale-1", true)),
+        ] {
+            assert_eq!(response.status, 409);
+            assert_eq!(
+                response_header_values(&response, "Cache-Control"),
+                ["no-store"]
+            );
+            let body: Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(body["error"], "remote_state_generation_mismatch");
+            assert_eq!(body["remote_state_generation"], current_generation);
+        }
+
+        let info_response = api_image_info(&state, &query(&current_generation, false));
+        assert_eq!(info_response.status, 200);
+        assert_eq!(
+            response_header_values(&info_response, "X-mIV-Remote-State-Generation"),
+            [current_generation.as_str()]
+        );
+        assert_eq!(
+            response_header_values(&info_response, "Cache-Control"),
+            ["private, max-age=60"]
+        );
+        let info: Value = serde_json::from_slice(&info_response.body).unwrap();
+        assert_eq!(info["width"], 3);
+        assert_eq!(info["height"], 2);
+
+        let image_response = api_image(&state, &query(&current_generation, true));
+        assert_eq!(image_response.status, 200);
+        assert_eq!(
+            response_header_values(&image_response, "X-mIV-Remote-State-Generation"),
+            [current_generation.as_str()]
+        );
+        assert_eq!(
+            response_header_values(&image_response, "Cache-Control"),
+            ["private, max-age=60"]
+        );
+        assert!(!image_response.body.is_empty());
     }
 
     #[test]

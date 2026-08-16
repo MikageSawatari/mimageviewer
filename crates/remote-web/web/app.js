@@ -6854,7 +6854,7 @@ async function schedulePagePrefetch(viewer) {
   updateHud();
 }
 
-function imageRequest(
+export function imageRequest(
   entry,
   info,
   stage,
@@ -6944,8 +6944,9 @@ function imageRequest(
       path: entry.path,
       w: resolvedLayout.requestWidth,
       epoch: state.remoteSessionCacheEpoch,
-      generation: state.remoteStateGeneration,
+      generation: remoteStateGeneration,
     }),
+    remoteStateGeneration,
     width: resolvedLayout.requestWidth,
     cssWidth: resolvedLayout.cssWidth,
     dpr,

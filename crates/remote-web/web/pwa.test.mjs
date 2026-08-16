@@ -108,8 +108,9 @@ test("legacy image URLs include the remote state generation", async () => {
 
   assert.match(
     imageRequest,
-    /apiUrl\("\/api\/image",\s*\{[\s\S]*generation:\s*state\.remoteStateGeneration/
+    /apiUrl\("\/api\/image",\s*\{[\s\S]*generation:\s*remoteStateGeneration/
   );
+  assert.match(imageRequest, /\n\s*remoteStateGeneration,\s*\n\s*width:/);
   assert.match(
     imageInfo,
     /apiJson\("\/api\/image-info",\s*\{[\s\S]*generation:\s*state\.remoteStateGeneration/

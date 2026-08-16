@@ -141,6 +141,7 @@ const {
   favoriteSearchHash,
   favoriteSearchResultTitle,
   gridReturnItemIdentity,
+  imageRequest,
   invalidateViewerPendingLoad,
   isStreamMediaKind,
   loadFolder,
@@ -3013,6 +3014,55 @@ test("viewer refuses a page response without a generation attestation", async ()
         infoCacheKey: "page-unattested",
         containerInfoKey: "book-1",
       },
+      info: { width: 1200, height: 1800 },
+      fitMode: "page",
+      index: 0,
+      count: 1,
+      interactionStartedAt: performance.now(),
+    });
+    assert.equal(displayed.outcome, ViewerGroupLoadOutcome.FAILED);
+    assert.match(displayed.message, /状態版/);
+    assert.equal(viewer.pageLayer.children[0], initialImage);
+  } finally {
+    globalThis.fetch = imageFetch;
+    viewer.destroy();
+  }
+});
+
+test("legacy image requests snapshot and attest their remote state generation", async () => {
+  const initialImage = new FakeElement("img");
+  const stage = new FakeElement("div");
+  const viewer = new ImageViewer({
+    root: new FakeElement("section"),
+    stage,
+    image: initialImage,
+    title: new FakeElement("div"),
+    counter: new FakeElement("span"),
+    previous: new FakeElement("button"),
+    next: new FakeElement("button"),
+    loadingIndicator: new FakeElement("div"),
+  });
+  const request = imageRequest(
+    { name: "Legacy image", path: testPath("legacy.png") },
+    { width: 1200, height: 1800 },
+    stage,
+    { remoteStateGeneration: "legacy-test-1" }
+  );
+  const requestUrl = new URL(request.url, location.origin);
+  assert.equal(request.remoteStateGeneration, "legacy-test-1");
+  assert.equal(
+    requestUrl.searchParams.get("generation"),
+    request.remoteStateGeneration
+  );
+
+  globalThis.fetch = async () => new Response(new Blob([new Uint8Array([1, 2, 3])]), {
+    status: 200,
+    headers: { "Content-Type": "image/png" },
+  });
+  try {
+    const displayed = await viewer.load({
+      name: "Legacy image",
+      request,
       info: { width: 1200, height: 1800 },
       fitMode: "page",
       index: 0,
