@@ -88,8 +88,22 @@ ClaudeCode も同意している。
 `self.depth_texture_view` も同じ関数内で読む。inner を単純にクロージャへ切り出すと
 借用検査で詰まる。
 
-先に借用の割り付けを決めてから書くこと。分割が借用検査の都合で歪むなら、
-**歪んだ形を無理に通さず報告する**こと (歪んだ分割は次の §1.31 で作り直しになる)。
+同一関数の本体内なら field-level の借用分割が効くが、`&mut self` を取るメソッドへ
+切り出した瞬間に効かなくなる。逃げ道は 2 つあり、**どちらも既に前例がある**:
+
+1. **関連関数に明示パラメータを渡す**。`Self::configure_surface(surface_state,
+   render_state, config)` が既にこの形。`begin_delivery` / `finish_delivery` も
+   `&mut self` メソッドではなくこの形にすれば借用は起きない。
+2. **必要なハンドルだけ clone する**。`RenderState.renderer` は
+   `Arc<RwLock<Renderer>>`、`device` / `queue` も Arc backed なので clone は
+   refcount 増加のみ。
+
+⚠️ **`RenderState` 全体を clone しないこと**。`#[derive(Clone)]` は付いているが
+`available_adapters: Vec<wgpu::Adapter>` があるため、**毎フレーム Vec を確保する**。
+1 の形を第一候補にし、必要なら 2 で narrow なハンドルだけ取ること。
+
+それでも分割が借用検査の都合で歪むなら、**歪んだ形を無理に通さず報告する**こと
+(歪んだ分割は次の §1.31 で作り直しになる)。
 
 ## 5. テスト要件
 

@@ -934,6 +934,16 @@
     full 置換が落ちていてもテストが通ってしまう。
   - `vendor/egui-wgpu` は workspace `exclude` かつ `autotests = false` なので、
     `scripts/test-full.ps1` に専用実行を足さないと**テストが存在するだけで走らない**。
+- **2026-08-16: §1.85-A (前半) 完了**。
+  `vendor/egui-wgpu` の DX12 headless in-crate unit test
+  `paint_and_update_textures_delivers_set_and_free_without_surface` で、surface 無しのまま
+  32px seed → 128px full 置換 → `y=45..126` partial を渡し、主判定の
+  `Renderer::texture_size` が 128px を保持することと validation error scope が空であることを固定した。
+  別 texture の no-surface `free` も `Renderer::texture()` の消失で検査する。
+  vendor manifest に明示的な lib test target を設定し、`scripts/test-full.ps1` の専用
+  `--manifest-path` 段から実行される。production 挙動と `src/` 配下の既存回避策は変更していない。
+- **残り**: exit 3/4 (`RecreateSurface` / `SkipFrame`) の `free` 配送は §1.86 で
+  typed `PaintOutcome` seam を作ってから検査・修正する。本項前半からは手を伸ばさない。
 - 規模 / 優先度: 中 / P2。
 
 ### 1.86 surface 取得に失敗したフレームで `textures_delta.free` が捨てられる

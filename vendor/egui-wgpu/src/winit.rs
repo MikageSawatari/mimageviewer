@@ -728,3 +728,126 @@ impl Painter {
         // TODO(emilk): something here?
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{WgpuError, WgpuSetup};
+    use egui::{Color32, ColorImage, TextureId, TextureOptions};
+    use epaint::{ImageDelta, textures::TexturesDelta};
+
+    fn full_delta(id: TextureId, height: usize) -> TexturesDelta {
+        TexturesDelta {
+            set: vec![(
+                id,
+                ImageDelta::full(
+                    ColorImage::filled([1, height], Color32::WHITE),
+                    TextureOptions::LINEAR,
+                ),
+            )],
+            free: Vec::new(),
+        }
+    }
+
+    fn paint_without_surface(painter: &mut Painter, textures_delta: &TexturesDelta) {
+        assert!(painter.surfaces.is_empty(), "test requires no surfaces");
+        painter.paint_and_update_textures(
+            ViewportId::ROOT,
+            1.0,
+            [0.0; 4],
+            &[],
+            textures_delta,
+            Vec::new(),
+        );
+    }
+
+    #[test]
+    fn paint_and_update_textures_delivers_set_and_free_without_surface() {
+        let mut configuration = WgpuConfiguration::default();
+        let WgpuSetup::CreateNew(setup) = &mut configuration.wgpu_setup else {
+            unreachable!("default configuration must create a new wgpu setup");
+        };
+        setup.instance_descriptor.backends = wgpu::Backends::DX12;
+
+        let options = RendererOptions::default();
+        let mut painter = pollster::block_on(Painter::new(
+            Context::default(),
+            configuration.clone(),
+            false,
+            options,
+        ));
+        let render_state = match pollster::block_on(RenderState::create(
+            &configuration,
+            &painter.instance,
+            None,
+            options,
+        )) {
+            Ok(render_state) => render_state,
+            Err(WgpuError::RequestAdapterError(error)) => {
+                eprintln!("skipping headless DX12 texture delivery test: {error}");
+                return;
+            }
+            Err(error) => panic!("create headless DX12 render state: {error}"),
+        };
+        painter.render_state = Some(render_state.clone());
+
+        let texture_id = TextureId::Managed(0);
+        paint_without_surface(&mut painter, &full_delta(texture_id, 32));
+        assert_eq!(
+            render_state.renderer.read().texture_size(&texture_id),
+            Some([1, 32]),
+            "seed texture must be observable before exercising replacement delivery"
+        );
+
+        paint_without_surface(&mut painter, &full_delta(texture_id, 128));
+        assert_eq!(
+            render_state.renderer.read().texture_size(&texture_id),
+            Some([1, 128]),
+            "a full replacement must reach the shared renderer without a surface"
+        );
+
+        render_state
+            .device
+            .push_error_scope(wgpu::ErrorFilter::Validation);
+        let partial_delta = TexturesDelta {
+            set: vec![(
+                texture_id,
+                ImageDelta::partial(
+                    [0, 45],
+                    ColorImage::filled([1, 81], Color32::WHITE),
+                    TextureOptions::LINEAR,
+                ),
+            )],
+            free: Vec::new(),
+        };
+        paint_without_surface(&mut painter, &partial_delta);
+        let validation_error = pollster::block_on(render_state.device.pop_error_scope());
+        assert!(
+            validation_error.is_none(),
+            "partial update after the full replacement must validate: {validation_error:?}"
+        );
+        assert_eq!(
+            render_state.renderer.read().texture_size(&texture_id),
+            Some([1, 128]),
+            "a partial update must preserve the replacement texture size"
+        );
+
+        let freed_id = TextureId::Managed(1);
+        paint_without_surface(&mut painter, &full_delta(freed_id, 32));
+        assert!(
+            render_state.renderer.read().texture(&freed_id).is_some(),
+            "free-path texture must be seeded"
+        );
+        paint_without_surface(
+            &mut painter,
+            &TexturesDelta {
+                set: Vec::new(),
+                free: vec![freed_id],
+            },
+        );
+        assert!(
+            render_state.renderer.read().texture(&freed_id).is_none(),
+            "free must reach the shared renderer without a surface"
+        );
+    }
+}
