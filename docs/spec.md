@@ -1462,6 +1462,14 @@ GPU texture作成直前の寸法検査は、将来別入口が増えた場合の
   **`<data_dir>/logs/settings.log` に常に append** される。logger の初期化状態に
   依存しない独立 sink なので、起動ごく初期の設定復旧フェーズでも確実に残り、
   ユーザー報告時の調査に使える。
+- **ネットワーク上の data_dir 案内**: 設定読込後、解決済み `data_dir` が UNC
+  (`\\server\share` / `\\?\UNC\server\share`) または Windows の
+  `GetDriveTypeW == DRIVE_REMOTE` となる割り当てドライブなら、保存先のパス、起こり得る遅延・
+  再起動時の無応答、`--data-dir` でデータだけをローカルへ置く方法、マニュアルへのリンクを
+  起動ダイアログで案内する。設定を読めない保護起動中は復元案内を優先し、この案内を作らない。
+  初回設定・入力移行・重要な変更点が同時に対象なら、それらを閉じた後に表示する。「閉じる」や
+  タイトルバーの × / Escape は当該起動中だけ閉じる。「この保存先では今後表示しない」は現在の
+  パスを設定へ保存し、正規化後に同じ場所である間は次回以降表示しない。保存先が変われば再表示する。
 
 ### 起動引数
 
@@ -1471,6 +1479,10 @@ CB7 / LZH / LHA は `archive_file_handling` が `Ignore` 以外なら本とし�
 通常の画像・動画ファイルが指定された場合は親フォルダを開き、
 そのファイルをフルスクリーンで開く。ショートカットへのドラッグ＆ドロップや
 SendTo は Windows が対象パスを位置引数として渡すため、この経路で処理する。
+
+`--data-dir <パス>` は設定、サムネイル、検索用索引、各キャッシュなどの保存先を既定値から
+変更する。build flavor に関係なく優先し、ネットワーク上の本体・画像をそのまま使いながら
+データだけをローカルへ置く場合にも使える。
 
 `auto_fullscreen_zip_pdf` が ON の場合、または `detached_viewer_open_images_in_window` による
 複数ウィンドウモードが ON の場合、起動引数 / SendTo / 外部ファイラ経由で
@@ -1713,6 +1725,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `audio_normalize_target_lufs_milli` | i32 | -14000 | ノーマライズのターゲット音量 (LUFS の千分の一単位、整数。-14000 = -14.000 LUFS = YouTube/Spotify 相当)。使用時は `[-60_000, 0]` にクランプ |
 | `vst3_panel_pos` | Option<[f32; 2]> | None | 動画再生中 VST3 パネルの保存位置。表示時に現在の viewport/native overlay 内へクランプ |
 | `minimize_to_tray_on_close` | bool | false | ON のとき [×] で終了せずタスクトレイに常駐する。通常 fullscreen / in-window / F12 別窓 / ParkedLive の viewport と native presenter は同じ identity のまま hidden にし、動画、動画→音声モード、単体音楽の running / paused / EOF transport state を変更しない。hidden presenter は decode queue を drain して最新 frame を保持し、復帰で viewport と presenter を visible に戻すため再生中ならそのまま映像が再開する。detached / switching session と typed placement request は維持し、復帰時の外部フォルダ変更でも context を退避してから一覧へ反映する。復帰の `ShowWindow` で main focus が一時的に戻っても session は閉じない。mounted context の非 media texture とアイドル GPU 動画プールは解放するが、detached active viewer cache、稼働中 decoder / presenter / GPU frame、VST3 プラグインチェーンは保持するため、常駐中も動画 decode の CPU/GPU/電力コストを負う |
+| `network_data_dir_notice_dismissed_for` | Option\<String\> | None | ネットワーク上の data_dir に関する起動案内を「この保存先では今後表示しない」で抑止したパス。Windows の区切り・大文字小文字・通常 UNC / verbatim UNC の同値表記を正規化して比較し、別の保存先なら再案内する |
 | `pause_indexer_while_minimized` | bool | false | タスクトレイ常駐中にファイル監視 / インデックス更新を一時停止する。OFF でも常駐中は I/O 並列度を絞る |
 | `folder_thumb_depth` | u32 | 3 | フォルダ代表画像の探索最大階層数（0 で直接の子のみ） |
 | `sidecar_backup_enabled` | bool | true | フォルダ直下に `mimageviewer.dat` (Hidden+System 属性の JSON) を作り、補正・消しゴムマスクの設定をバックアップする。フォルダ丸ごと別ドライブへ移動しても設定が保持される。OFF 時は読み書き両方スキップ |

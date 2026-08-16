@@ -21,6 +21,7 @@ pub(crate) mod favorites_editor;
 mod first_setup;
 mod metadata_cleanup;
 pub(crate) mod metadata_transfer;
+pub mod network_data_dir_notice;
 pub(crate) mod new_folder;
 mod open_folder;
 mod pdf_password;

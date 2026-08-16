@@ -9548,6 +9548,8 @@ pub struct App {
     pub(crate) show_whats_new: bool,
     /// 表示する変更点エントリ (起動時の version またぎ / ヘルプ再表示で算出)。非永続。
     pub(crate) whats_new_entries: Vec<&'static crate::version_highlights::VersionHighlights>,
+    /// 起動時に案内するネットワーク上の data_dir。`Some` が未処理の案内要求そのもの。
+    pub(crate) network_data_dir_notice: Option<PathBuf>,
     /// `?` キーで開く現在コンテキストのショートカット一覧。
     pub(crate) show_context_shortcuts_help: bool,
 
@@ -12314,6 +12316,13 @@ impl App {
         );
         let show_whats_new =
             settings_boot_problem_source.is_none() && !whats_new_entries.is_empty();
+        let network_data_dir_notice = if settings_boot_problem_source.is_none() {
+            crate::data_dir::pending_network_notice(
+                settings.network_data_dir_notice_dismissed_for.as_deref(),
+            )
+        } else {
+            None
+        };
         // 操作中はバックグラウンドインデクサを一時停止するためのゲート。
         // IndexerManager / name_index_supervisor の両方に `Arc` で共有される。
         let activity_gate = Arc::new(crate::activity_gate::ActivityGate::new(
@@ -12820,6 +12829,7 @@ impl App {
             show_toolbar_reset_confirm: false,
             show_whats_new,
             whats_new_entries,
+            network_data_dir_notice,
             show_context_shortcuts_help: false,
             fs_secondary_press_start: None,
             fs_middle_zoom_drag: None,
@@ -14884,6 +14894,7 @@ impl App {
             self.show_operation_customize_discard_confirm => "operation_customize_discard_confirm",
             self.show_mouse_nav_migration_prompt => "mouse_nav_migration_prompt",
             self.show_whats_new => "whats_new",
+            self.network_data_dir_notice_visible() => "network_data_dir_notice",
             self.show_context_shortcuts_help => "context_shortcuts_help",
             self.show_toolbar_reset_confirm => "toolbar_reset_confirm",
             self.show_cache_manager => "cache_manager",
@@ -14985,6 +14996,7 @@ impl App {
         self.settings.first_setup_completed = true;
         self.show_mouse_nav_migration_prompt = false;
         self.show_whats_new = false;
+        self.network_data_dir_notice = None;
     }
 
     pub(crate) fn clear_fullscreen_tag_picker_state(&mut self) {
@@ -65092,6 +65104,7 @@ impl eframe::App for App {
         self.show_about_dialog_window(ctx);
         self.show_update_dialog_window(ctx);
         self.show_whats_new_dialog(ctx);
+        self.show_network_data_dir_notice_dialog(ctx);
         if !main_viewer_blocked {
             self.show_context_shortcuts_dialog(ctx);
         }

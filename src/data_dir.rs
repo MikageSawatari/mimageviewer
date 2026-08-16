@@ -130,6 +130,107 @@ pub fn logs_dir() -> PathBuf {
     get().join("logs")
 }
 
+/// Returns the data directory when it is on a network location and has not been dismissed.
+///
+/// UNC detection is textual so it does not require contacting the share again. A mapped drive
+/// needs the Windows volume classification, which is queried only after settings have already
+/// been loaded from this directory.
+pub(crate) fn pending_network_notice(dismissed_for: Option<&str>) -> Option<PathBuf> {
+    let data_dir = get();
+    pending_network_notice_for(&data_dir, dismissed_for)
+}
+
+fn pending_network_notice_for(path: &Path, dismissed_for: Option<&str>) -> Option<PathBuf> {
+    if !is_network_path(path) || notice_dismissed_for(path, dismissed_for) {
+        return None;
+    }
+    Some(path.to_path_buf())
+}
+
+/// Stores the spelling shown to the user; comparisons normalize Windows-equivalent spellings.
+pub(crate) fn network_notice_path_value(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn notice_dismissed_for(path: &Path, dismissed_for: Option<&str>) -> bool {
+    dismissed_for.is_some_and(|dismissed| {
+        normalize_network_path(&path.to_string_lossy()) == normalize_network_path(dismissed)
+    })
+}
+
+fn normalize_network_path(path: &str) -> String {
+    let mut normalized = path.replace('/', "\\");
+    if normalized
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\UNC\"))
+    {
+        normalized.replace_range(..8, r"\\");
+    }
+    while normalized.len() > 3 && normalized.ends_with('\\') {
+        normalized.pop();
+    }
+    normalized.to_lowercase()
+}
+
+fn is_network_path(path: &Path) -> bool {
+    if has_unc_prefix(path) {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        return mapped_drive_root(path).is_some_and(|root| windows_drive_is_remote(&root));
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Pure textual UNC check, kept platform-independent for regression coverage on CI.
+fn has_unc_prefix(path: &Path) -> bool {
+    let normalized = path.to_string_lossy().replace('/', "\\");
+    let tail = if normalized
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\UNC\"))
+    {
+        &normalized[8..]
+    } else if normalized.starts_with(r"\\")
+        && !normalized.starts_with(r"\\?\")
+        && !normalized.starts_with(r"\\.\")
+    {
+        &normalized[2..]
+    } else {
+        return false;
+    };
+
+    let mut components = tail.split('\\').filter(|component| !component.is_empty());
+    components.next().is_some() && components.next().is_some()
+}
+
+#[cfg(windows)]
+fn mapped_drive_root(path: &Path) -> Option<String> {
+    let normalized = path.to_string_lossy().replace('/', "\\");
+    let drive = normalized
+        .strip_prefix(r"\\?\")
+        .unwrap_or(normalized.as_str());
+    let bytes = drive.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
+        return None;
+    }
+    Some(format!("{}:\\", (bytes[0] as char).to_ascii_uppercase()))
+}
+
+#[cfg(windows)]
+fn windows_drive_is_remote(root: &str) -> bool {
+    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+    use windows::core::PCWSTR;
+
+    const DRIVE_REMOTE: u32 = 4;
+    let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe { GetDriveTypeW(PCWSTR(wide.as_ptr())) == DRIVE_REMOTE }
+}
+
 fn default() -> PathBuf {
     // 2026-05-17 事故ガード (cfg(test)): テストで `set_test_override(Some(temp))` を
     // 呼び忘れたまま `data_dir::get()` に落ちると、本物の %APPDATA%\mimageviewer に
@@ -383,6 +484,76 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unc_detection_accepts_standard_and_verbatim_paths() {
+        assert!(has_unc_prefix(Path::new(r"\\server\share")));
+        assert!(has_unc_prefix(Path::new(r"\\server\share\data")));
+        assert!(has_unc_prefix(Path::new(r"\\?\UNC\server\share\data")));
+        assert!(has_unc_prefix(Path::new(r"\\?\unc\server\share\data")));
+        assert!(has_unc_prefix(Path::new("//server/share/data")));
+    }
+
+    #[test]
+    fn unc_detection_rejects_drive_relative_and_empty_paths() {
+        assert!(!has_unc_prefix(Path::new(r"Z:\data")));
+        assert!(!has_unc_prefix(Path::new(r"data\cache")));
+        assert!(!has_unc_prefix(Path::new("")));
+        assert!(!has_unc_prefix(Path::new(r"\\server")));
+        assert!(!has_unc_prefix(Path::new(r"\\?\C:\data")));
+        assert!(!has_unc_prefix(Path::new(r"\\.\C:\data")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mapped_drive_root_accepts_absolute_drive_paths_only() {
+        assert_eq!(
+            mapped_drive_root(Path::new(r"z:\data")),
+            Some(r"Z:\".into())
+        );
+        assert_eq!(
+            mapped_drive_root(Path::new(r"\\?\Z:\data")),
+            Some(r"Z:\".into())
+        );
+        assert_eq!(mapped_drive_root(Path::new(r"Z:data")), None);
+        assert_eq!(mapped_drive_root(Path::new(r"data\cache")), None);
+        assert_eq!(mapped_drive_root(Path::new(r"\\server\share\data")), None);
+    }
+
+    #[test]
+    fn network_notice_suppression_is_scoped_to_the_same_path() {
+        let path = Path::new(r"\\server\share\miv-data");
+        assert!(!notice_dismissed_for(path, None));
+        assert!(notice_dismissed_for(
+            path,
+            Some(r"\\SERVER\SHARE\miv-data\")
+        ));
+        assert!(notice_dismissed_for(
+            path,
+            Some(r"\\?\UNC\server\share\miv-data")
+        ));
+        assert!(!notice_dismissed_for(
+            path,
+            Some(r"\\server\share\other-data")
+        ));
+    }
+
+    #[test]
+    fn pending_network_notice_tracks_none_same_and_different_paths() {
+        let path = Path::new(r"\\server\share\miv-data");
+        assert_eq!(
+            pending_network_notice_for(path, None),
+            Some(path.to_path_buf())
+        );
+        assert_eq!(
+            pending_network_notice_for(path, Some(r"\\server\share\miv-data")),
+            None
+        );
+        assert_eq!(
+            pending_network_notice_for(path, Some(r"\\server\share\other-data")),
+            Some(path.to_path_buf())
+        );
+    }
 
     fn assert_remote_log_sibling(data_dir: &str, expected: &str) {
         let data_dir = PathBuf::from(data_dir);

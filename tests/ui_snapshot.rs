@@ -853,6 +853,21 @@ fn whats_new_dialog_multi_version_dark() {
     );
 }
 
+#[test]
+fn network_data_dir_notice_dark() {
+    snapshot_with_theme(
+        "network_data_dir_notice_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| {
+            ui.set_width(440.0);
+            mimageviewer::ui_dialogs::network_data_dir_notice::render_network_data_dir_notice_content(
+                ui,
+                std::path::Path::new(r"\\NAS\photos\mImageViewer\data"),
+            );
+        },
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Susie 診断 UI (PoolStatus 各バリアントのレンダリング) のスナップショット
 // ---------------------------------------------------------------------------

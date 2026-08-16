@@ -4204,6 +4204,11 @@ pub struct Settings {
     #[serde(default)]
     pub update_check_dismissed_version: Option<String>,
 
+    /// 起動時の保存先案内を今後表示しないと選んだ data_dir。
+    /// 保存先が変われば別の場所として再び案内する。
+    #[serde(default)]
+    pub network_data_dir_notice_dismissed_for: Option<String>,
+
     // ── 開発者 / 診断 ─────────────────────────────────────────────
     /// 性能ログ (perf_events.jsonl、構造化イベントログ) を記録するか。
     /// 既定 OFF。フレーム単位のイベントを大量に吐くため常時 ON にはしない。
@@ -5496,6 +5501,7 @@ impl Default for Settings {
             write_rating_to_xmp: false,
             update_check_enabled: true,
             update_check_dismissed_version: None,
+            network_data_dir_notice_dismissed_for: None,
             perf_log_enabled: false,
             remote_service_enabled: false,
             remote_video_streaming_enabled: true,
@@ -11928,6 +11934,28 @@ mod tests {
             assert!(!loaded.fullscreen_boundary_notice_visible);
             assert!(!loaded.fullscreen_processing_status_visible);
             assert!(!loaded.fullscreen_prefetch_status_visible);
+        }
+
+        #[test]
+        fn network_data_dir_notice_dismissal_settings_db_roundtrip() {
+            let missing: Settings = serde_json::from_str("{}").unwrap();
+            assert!(missing.network_data_dir_notice_dismissed_for.is_none());
+
+            let env = setup_backup_env();
+            let _initial = Settings::load();
+            assert!(data_db_path(&env).exists());
+
+            let mut settings = Settings::default();
+            settings.network_data_dir_notice_dismissed_for =
+                Some(r"\\server\share\miv-data".to_owned());
+            settings.save();
+
+            reset_backup_state_for_test();
+            let loaded = Settings::load();
+            assert_eq!(
+                loaded.network_data_dir_notice_dismissed_for.as_deref(),
+                Some(r"\\server\share\miv-data")
+            );
         }
 
         #[test]

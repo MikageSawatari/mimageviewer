@@ -96,6 +96,99 @@
       <li>ウイルス対策ソフトが展開直後のファイルをスキャンしていると、初回起動が遅くなることがあります</li>
     </ul>
 
+    <h3 id="network-data-dir">NAS・ネットワークドライブに置いて使う</h3>
+    <p>画像を NAS やネットワークドライブに置いて開くことは、通常の使い方です。
+    ここで説明するのは、<strong>mImageViewer が使うデータ</strong>（サムネイルや検索用の索引など）
+    まで同じ場所に置いた場合の話です。</p>
+
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">
+        <strong>mImageViewer が使うデータをネットワーク上に置く使い方は、サポートしていません。</strong>
+        起動や表示が遅くなったり、終了後の再起動で応答しなくなったりすることがあります。
+        <br>
+        <strong>とくに、同じ保存先を複数の PC から使わないでください。</strong>
+        同時に開くとデータが壊れることがあります。mImageViewer が二重起動を防ぐ仕組みは
+        1 台の PC の中でしか働かないため、<strong>別の PC から開かれても検出できません。</strong>
+      </div>
+    </div>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        <strong>いちばん簡単な方法は、mImageViewer 本体をこの PC のディスクに置くことです。</strong>
+        画像はネットワーク上のままで構いません。インストール版を使うか、ポータブル版を
+        PC 内のフォルダへ展開してください。設定を変えたり、起動時に何かを指定したりする必要はありません。
+      </div>
+    </div>
+
+    <p>複数の端末から同じ画像を見たいためにネットワーク上へ置いている場合は、
+    <a href="remote.html">リモート閲覧</a>のほうが向いています。画像のある PC で
+    mImageViewer を動かし、ほかの PC やスマートフォンのブラウザから開く方法です。
+    データを共有しないので、上の問題は起きません。ただしブラウザから使えるのは
+    閲覧を中心とした機能に限られ、接続には Tailscale の設定が必要です。</p>
+
+    <p>本体をネットワーク上に置いたままにしたい場合は、mImageViewer が使うデータだけを
+    PC 内へ移せます。この場合、データは<strong>その PC ごとに別々</strong>になります。
+    設定や既読の状態は PC 間で共有されませんが、複数の PC から使うなら、これが安全な唯一の方法です。</p>
+
+    <p>また、遅さの原因が画像の読み込み自体にあることもあります。
+    どちらが効いているかは、次の方法で切り分けられます。</p>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>比較</th><th>本体</th><th>mImageViewer が使うデータ</th><th>画像</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>A（現在の使い方）</td><td>NAS</td><td>NAS</td><td>NAS</td></tr>
+          <tr><td>B（比較用）</td><td>NAS</td><td>PC 内</td><td>NAS</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>B では画像を NAS に置いたまま、mImageViewer が使うデータだけを PC 内へ変えます。</p>
+
+    <h4>B のショートカットを作る</h4>
+    <ol class="step-list">
+      <li><kbd>Windows</kbd>+<kbd>R</kbd> を押し、<code>%LOCALAPPDATA%</code> と入力して <kbd>Enter</kbd> を押します。開いたフォルダのパスを確認します</li>
+      <li>デスクトップを右クリックし、<strong>新規作成 → ショートカット</strong>を選びます</li>
+      <li>「項目の場所」に、mImageViewer 本体の場所と <code>--data-dir</code>、手順 1 で確認したパスを入力します。たとえば本体が <code>\\NAS\photo\mImageViewer\mimageviewer.exe</code>、PC 内のパスが <code>C:\Users\hanako\AppData\Local</code> の場合は、次のように入力します：<br>
+        <code>"\\NAS\photo\mImageViewer\mimageviewer.exe" --data-dir "C:\Users\hanako\AppData\Local\mimageviewer-data"</code>
+      </li>
+      <li>ショートカットに「mImageViewer ローカルデータ比較」など、区別できる名前を付けて完了します</li>
+      <li>作ったショートカットから B を起動し、A と同じ画像フォルダを開きます</li>
+    </ol>
+
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">
+        B は初回だけサムネイルを作り直すため、必ず遅くなります。
+        同じフォルダを 2 回開き、2 回目の速さを比べてください。
+      </div>
+    </div>
+
+    <p>次の 3 点を A と B で比べます：</p>
+    <ol>
+      <li>起動にかかる時間</li>
+      <li>同じ書庫を開いたときの速さ（B は 2 回目を使う）</li>
+      <li>終了してもう一度起動する操作を 3 回繰り返したときの安定性</li>
+    </ol>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>結果</th><th>意味</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>B が明らかに速い、または固まらなくなる</td><td>mImageViewer が使うデータの保存先が原因です。データを PC 内に置けば解決できます</td></tr>
+          <tr><td>B も同じ</td><td>画像の読み込み自体が重くなっています。ネットワーク接続や NAS 側を確認してください</td></tr>
+          <tr><td>起動だけ速くなる</td><td>データの保存先と画像の読み込みの両方が影響しています</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>特に、A で「固まって強制終了もできない」状態になり、B では起きなくなるかどうかが重要です。
+    B で起きなくなるなら、以後も同じショートカットを使うことで、画像は NAS のままデータだけを PC 内に置けます。</p>
+
     <h3>画面が真っ黒 / 何も表示されない</h3>
     <ul>
       <li>GPU ドライバーを最新バージョンに更新してください</li>
