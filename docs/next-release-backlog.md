@@ -1063,6 +1063,52 @@
   (起動直後に足すと今度は起動が遅くなる)。
 - 規模 / 優先度: 小〜中 / P3。
 
+### 1.88 見開き 1 ページずらし後にページ送りが停止する — 利用者報告
+
+- 出典: 専用スレ >>239 (2026-08-16)。v3.0.0 / v3.1.0 で再現し、v2.9.1 では
+  発生しない。手元でも再現済み。
+- 再現:
+  1. フルスクリーンで右綴じの見開き (テンキー 4 / 5) にし、
+     `見開き表示を右方向へ1ページずらす` (既定 Ctrl+Right) を実行する。
+  2. または左綴じの見開き (テンキー 2 / 3) で、左方向へ1ページずらす。
+  3. その後、カーソルキーによるページ移動を受け付けなくなることがある。
+     連打 / hold で起きやすいが、1 回だけでも起きる。左右どちらの Ctrl でも発生する。
+  4. Backspace でフルスクリーンを閉じると復旧する。
+- 根本原因:
+  - 見開き 1 ページずらしは、旧 unit `[2, 3]` から新 unit `[3, 4]` のように、
+    移動前後の表示単位で 1 ページを意図的に共有する。
+  - v3.0.0 の `96faeee6` で追加した navigation sequence は、target の完全な page set を
+    描いた後、`observe_fs_navigation_sequence_presented` で previous holdover の texture が
+    1 枚も見えていないことを確認して sequence を解放する。
+  - 現在は描画元を明示的に追跡せず、target の texture id が previous holdover の
+    `page_for_texture_id` に存在するかだけで旧表示の残存を推測する。共有ページは正しい
+    target として live 描画されても同じ texture id が previous に含まれるため、
+    `captured_page_visible=true` と誤判定される。
+  - sequence が `Presenting` のまま残り、`blocks_new_target()` が後続ナビを拒否し続ける。
+    フルスクリーン終了で sequence が破棄されるため Backspace 後は直る。
+  - 当初疑った右 Ctrl 既定の `押している間だけ元画像を表示する` との競合は根本原因ではない。
+    右 Ctrl は texture 選択のタイミングへ影響し得るが、左 Ctrl でも同じ ownership 誤判定が
+    成立する。
+- 修正方針:
+  - previous holdover が**実際に描かれた**ことと、target の live 描画が previous と同じ
+    texture handle を共有したことを区別する。texture id の包含だけから描画所有元を推測しない。
+    `FsDisplayUnitTracePage` まで live / holdover の provenance を明示的に通し、完全な target
+    page set が live source として描かれた frame で sequence を解放する方向を第一候補とする。
+  - previous overlay を本当に描いている間、片側だけ target が揃った間、target page set が
+    不完全な間は従来どおり sequence を解放しない。ちらつき防止の atomic unit 契約を弱める
+    条件緩和では直さない。
+  - `spread_shift_anchor_idx` の更新と previous unit capture の順序も確認し、遷移前 unit と
+    遷移後 unit の所有者を同じ mutable pairing から取り違えていないことを固定する。
+- 回帰テスト:
+  1. previous `[2, 3]` / target `[3, 4]` で 3 の texture id が同一でも、3 と 4 が target の
+     live source として完全に描かれたら sequence が解放される。
+  2. 同じ page set でも共有ページを previous holdover から実際に描いた場合は解放しない。
+  3. 左綴じ / 右綴じ、左右へのずらし、左 Ctrl / 右 Ctrl、単発 / repeat を確認する。
+  4. 既存の disjoint な通常ページ送り、片側だけ ready、不完全 target、旧 texture の
+     index 再利用を検出するテストを維持する。
+- 関連: [display-pipeline.md](display-pipeline.md) §2.5.4 の atomic display-unit 契約。
+- 規模 / 優先度: 小〜中 / **P1 (次バージョンで修正)**。
+
 ### 5.8 検索ベンチのゲートに絶対時間の下限が無い
 
 - 出典: v3.0.0 リリース前確認 (2026-08-14)。`check_bench_regression.py` が 10 件中 7 件を
