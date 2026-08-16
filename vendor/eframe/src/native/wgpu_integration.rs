@@ -27,10 +27,106 @@ use winit_integration::UserEvent;
 
 use crate::{
     App, AppCreator, CreationContext, NativeOptions, Result, Storage,
-    native::{epi_integration::EpiIntegration, winit_integration::EventResult},
+    native::{
+        epi_integration::EpiIntegration,
+        winit_integration::{EventResult, RenderTarget, RepaintNowReason},
+    },
 };
 
 use super::{epi_integration, event_loop_context, winit_integration, winit_integration::WinitApp};
+
+#[cfg(all(test, target_os = "windows"))]
+pub(super) mod render_phase_test_gate {
+    use std::{
+        io::{Read as _, Write as _},
+        net::TcpStream,
+        sync::{Mutex, OnceLock},
+    };
+
+    enum GateState {
+        Disabled,
+        Bootstrap,
+        Ready(TcpStream),
+        Armed(TcpStream),
+        Released,
+    }
+
+    static STATE: OnceLock<Mutex<GateState>> = OnceLock::new();
+
+    fn state() -> &'static Mutex<GateState> {
+        STATE.get_or_init(|| {
+            let enabled = std::env::var("EFRAME_RENDER_PHASE_TEST_CHILD").as_deref() == Ok("1");
+            Mutex::new(if enabled {
+                GateState::Bootstrap
+            } else {
+                GateState::Disabled
+            })
+        })
+    }
+
+    #[allow(unsafe_code)]
+    fn performance_counter() -> i64 {
+        let mut counter = 0;
+        let success = unsafe {
+            windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut counter)
+        };
+        assert_ne!(success, 0, "QueryPerformanceCounter failed");
+        counter
+    }
+
+    pub(super) fn before_surface_acquire() {
+        let mut state = state().lock().expect("render phase test gate poisoned");
+        let GateState::Armed(stream) = &mut *state else {
+            return;
+        };
+
+        // The caller records SendMessageTimeoutW's return before releasing this barrier.
+        // With the old inline WM_PAINT path both sides wait here until the 500 ms send
+        // timeout, so a successful send is itself part of the proof.
+        let ack_port = std::env::var("EFRAME_RENDER_PHASE_TEST_ACK_PORT")
+            .expect("test sender acknowledgement port must be provided");
+        let mut ack_stream = TcpStream::connect(("127.0.0.1", ack_port.parse::<u16>().unwrap()))
+            .expect("connect sender-return acknowledgement");
+        let mut sender_returned = [0_u8; 1];
+        ack_stream
+            .read_exact(&mut sender_returned)
+            .expect("sender must return before outer gate entry");
+
+        let entered_at = performance_counter();
+        writeln!(stream, "GATE_ENTER {entered_at}")
+            .expect("report outer paint gate entry to parent");
+        stream.flush().expect("flush outer paint gate entry");
+        let mut release = [0_u8; 1];
+        stream
+            .read_exact(&mut release)
+            .expect("parent must release the painter gate");
+        *state = GateState::Released;
+    }
+
+    pub(crate) fn arm() {
+        let mut state = state().lock().expect("render phase test gate poisoned");
+        let current = std::mem::replace(&mut *state, GateState::Disabled);
+        *state = match current {
+            GateState::Ready(stream) => GateState::Armed(stream),
+            other => other,
+        };
+    }
+
+    pub(super) fn after_paint() {
+        let mut state = state().lock().expect("render phase test gate poisoned");
+        if !matches!(*state, GateState::Bootstrap) {
+            return;
+        }
+
+        let port = std::env::var("EFRAME_RENDER_PHASE_TEST_GATE_PORT")
+            .expect("test gate port must be provided");
+        let mut stream = TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap()))
+            .expect("connect render phase test parent");
+        writeln!(stream, "READY").expect("report completed bootstrap paint");
+        stream.flush().expect("flush bootstrap-ready marker");
+        *state = GateState::Ready(stream);
+    }
+}
 
 // ----------------------------------------------------------------------------
 // Types:
@@ -90,6 +186,9 @@ pub struct Viewport {
     /// Window surface state that's initialized when the app starts running via a Resumed event
     /// and on Android will also be destroyed if the application is paused.
     window: Option<Arc<Window>>,
+
+    /// Monotonic identity of the current window surface/configuration.
+    surface_generation: u64,
 
     /// `window` and `egui_winit` are initialized together.
     egui_winit: Option<egui_winit::State>,
@@ -306,6 +405,7 @@ impl<'app> WgpuWinitApp<'app> {
                 actions_requested: Default::default(),
                 viewport_ui_cb: None,
                 window: Some(window),
+                surface_generation: 1,
                 egui_winit: Some(egui_winit),
             },
         );
@@ -371,6 +471,20 @@ impl WinitApp for WgpuWinitApp<'_> {
         )
     }
 
+    fn render_target(&self, window_id: WindowId) -> Option<RenderTarget> {
+        let running = self.running.as_ref()?;
+        let shared = running.shared.borrow();
+        let viewport_id = *shared.viewport_from_window.get(&window_id)?;
+        let viewport = shared.viewports.get(&viewport_id)?;
+        let window = viewport.window.as_ref()?;
+        Some(RenderTarget {
+            window_id,
+            viewport_id,
+            surface_generation: viewport.surface_generation,
+            size: window.inner_size(),
+        })
+    }
+
     fn save(&mut self) {
         log::debug!("WinitApp::save called");
         if let Some(running) = self.running.as_mut() {
@@ -429,7 +543,10 @@ impl WinitApp for WgpuWinitApp<'_> {
 
         let viewport = &running.shared.borrow().viewports[&ViewportId::ROOT];
         if let Some(window) = &viewport.window {
-            Ok(EventResult::RepaintNow(window.id()))
+            Ok(EventResult::repaint_now(
+                window.id(),
+                RepaintNowReason::Bootstrap,
+            ))
         } else {
             Ok(EventResult::Wait)
         }
@@ -704,6 +821,8 @@ impl WgpuWinitRunning<'_> {
                 true
             }
         });
+        #[cfg(all(test, target_os = "windows"))]
+        render_phase_test_gate::before_surface_acquire();
         let vsync_secs = painter.paint_and_update_textures(
             viewport_id,
             pixels_per_point,
@@ -712,6 +831,8 @@ impl WgpuWinitRunning<'_> {
             &textures_delta,
             screenshot_commands,
         );
+        #[cfg(all(test, target_os = "windows"))]
+        render_phase_test_gate::after_paint();
 
         for action in viewport.actions_requested.drain(..) {
             match action {
@@ -794,6 +915,13 @@ impl WgpuWinitRunning<'_> {
 
         let viewport_id = shared.viewport_from_window.get(&window_id).copied();
 
+        // A renderer may be entered from message dispatch only for an InteractiveResize frame
+        // responding to this window's non-zero client resize. This decision uses event provenance
+        // only: never timing, inferred geometry, focus, VST, or detached predicates. Every other
+        // redraw, bootstrap, AccessKit request, and hidden-window frame is owned by the outer render
+        // phase. An inline resize frame's immediate-viewport render subtree remains part of that
+        // frame, rather than a separate scheduler re-entry.
+        //
         // On Windows, if a window is resized by the user, it should repaint synchronously, inside the
         // event handler. If this is not done, the compositor will assume that the window does not want
         // to redraw and continue ahead.
@@ -856,6 +984,10 @@ impl WgpuWinitRunning<'_> {
                         shared.painter.on_window_resize_state_change(id, true);
                     }
                     shared.painter.on_window_resized(id, width, height);
+                    if let Some(viewport) = shared.viewports.get_mut(&id) {
+                        viewport.surface_generation =
+                            viewport.surface_generation.wrapping_add(1).max(1);
+                    }
                     repaint_asap = true;
                 }
             }
@@ -902,7 +1034,7 @@ impl WgpuWinitRunning<'_> {
             EventResult::CloseRequested
         } else if event_response.repaint {
             if repaint_asap {
-                EventResult::RepaintNow(window_id)
+                EventResult::repaint_now(window_id, RepaintNowReason::InteractiveResize)
             } else {
                 EventResult::RepaintNext(window_id)
             }
@@ -951,6 +1083,7 @@ impl Viewport {
                 ));
 
                 egui_winit::update_viewport_info(&mut self.info, egui_ctx, &window, true);
+                self.surface_generation = self.surface_generation.wrapping_add(1).max(1);
                 self.window = Some(window);
             }
             Err(err) => {
@@ -1224,6 +1357,7 @@ fn initialize_or_update_viewport<'a>(
                 actions_requested: Vec::new(),
                 viewport_ui_cb,
                 window: None,
+                surface_generation: 0,
                 egui_winit: None,
             })
         }

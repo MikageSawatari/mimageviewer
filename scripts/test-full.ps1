@@ -27,6 +27,14 @@ try {
         exit $LASTEXITCODE
     }
 
+    # vendor/eframe is workspace-excluded for the same reason. Keep this unfiltered so every
+    # scheduler and Windows process regression added to the vendored event-loop fork runs.
+    Write-Host '[test-full] cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib'
+    & cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+
     Write-Host '[test-full] PASS'
 } finally {
     Pop-Location

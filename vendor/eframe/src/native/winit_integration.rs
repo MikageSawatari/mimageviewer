@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::Instant};
 
 use winit::{
+    dpi::PhysicalSize,
     event_loop::ActiveEventLoop,
     window::{Window, WindowId},
 };
@@ -78,6 +79,21 @@ pub trait WinitApp {
 
     fn window_id_from_viewport_id(&self, id: ViewportId) -> Option<WindowId>;
 
+    /// The render target currently owned by window_id.
+    ///
+    /// Backends with explicit surface lifecycle tracking should override this.
+    /// The fallback still gives the scheduler a per-window viewport identity and
+    /// current client size, which keeps legacy backends source-compatible.
+    fn render_target(&self, window_id: WindowId) -> Option<RenderTarget> {
+        let window = self.window(window_id)?;
+        Some(RenderTarget {
+            window_id,
+            viewport_id: ViewportId::from_hash_of(window_id),
+            surface_generation: 0,
+            size: window.inner_size(),
+        })
+    }
+
     fn save(&mut self);
 
     fn save_and_destroy(&mut self);
@@ -110,17 +126,50 @@ pub trait WinitApp {
     fn on_accesskit_event(&mut self, event: accesskit_winit::Event) -> crate::Result<EventResult>;
 }
 
+/// Identity of the surface that a scheduled frame is allowed to render into.
+///
+/// Keeping this metadata beside each dirty window prevents a resize or viewport
+/// recreation in one context from publishing stale work into another context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenderTarget {
+    pub window_id: WindowId,
+    pub viewport_id: ViewportId,
+    pub surface_generation: u64,
+    pub size: PhysicalSize<u32>,
+}
+
+/// Why a producer asked for a frame without normal event-loop coalescing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepaintNowReason {
+    Bootstrap,
+    AccessKit,
+    InteractiveResize,
+}
+
+/// A typed immediate repaint request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RepaintNowRequest {
+    pub window_id: WindowId,
+    pub reason: RepaintNowReason,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventResult {
     Wait,
 
-    /// Causes a synchronous repaint inside the event handler. This should only
-    /// be used in special situations if the window must be repainted while
-    /// handling a specific event. This occurs on Windows when handling resizes.
+    /// Compatibility result for backends that have not attached provenance yet.
     ///
-    /// `RepaintNow` creates a new frame synchronously, and should therefore
-    /// only be used for extremely urgent repaints.
+    /// The event-owning wrapper must convert known producers to
+    /// `RepaintNowWithReason` before scheduling or painting.
+    #[allow(dead_code)]
+    // Constructed by the legacy glow backend, which may be feature-disabled.
     RepaintNow(WindowId),
+
+    /// A repaint request whose event provenance has been preserved.
+    ///
+    /// Only `InteractiveResize` may paint during message dispatch. Bootstrap
+    /// and AccessKit requests are drained by the outer render phase.
+    RepaintNowWithReason(RepaintNowRequest),
 
     /// Queues a repaint for once the event loop handles its next redraw. Exists
     /// so that multiple input events can be handled in one frame. Does not
@@ -154,6 +203,23 @@ pub enum EventResult {
     Exit,
 }
 
+impl EventResult {
+    pub fn repaint_now(window_id: WindowId, reason: RepaintNowReason) -> Self {
+        Self::RepaintNowWithReason(RepaintNowRequest { window_id, reason })
+    }
+
+    /// Attach provenance to a legacy backend's RepaintNow result.
+    ///
+    /// The wrapper calls this only while it still owns the originating event;
+    /// no timing, geometry comparison, focus, or detached predicate is used.
+    pub fn with_repaint_now_reason(self, reason: RepaintNowReason) -> Self {
+        match self {
+            Self::RepaintNow(window_id) => Self::repaint_now(window_id, reason),
+            _ => self,
+        }
+    }
+}
+
 #[cfg(feature = "accesskit")]
 pub(crate) fn on_accesskit_window_event(
     egui_winit: &mut egui_winit::State,
@@ -170,7 +236,7 @@ pub(crate) fn on_accesskit_window_event(
             // until we send the first tree update. To minimize the possible
             // bad effects of that workaround, repaint and send the tree
             // immediately.
-            EventResult::RepaintNow(window_id)
+            EventResult::repaint_now(window_id, RepaintNowReason::AccessKit)
         }
         accesskit_winit::WindowEvent::ActionRequested(request) => {
             egui_winit.on_accesskit_action_request(request.clone());

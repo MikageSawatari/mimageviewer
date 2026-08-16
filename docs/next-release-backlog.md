@@ -188,6 +188,15 @@
 ### 1.31 wndproc の内側で GPU 待ちのある描画をする構造
 
 - 出典: §1.30 の解析 (2026-08-01、Codex Sol の独立レビュー)。**v2.9.1 の範囲外**。
+- **進捗 (2026-08-16)**: **§1.31-A は完了、§1.31-B は未着手**。A で vendored eframe に
+  per-window / viewport / surface-generation 単位の typed scheduler と about_to_wait 外側
+  paint drain を新設し、通常 RedrawRequested、bootstrap、AccessKit、不可視窓の要求済み work が
+  message dispatch 中に renderer へ入る経路を除去した。inline 例外は event provenance が
+  非ゼロ Resized の InteractiveResize frame と、その親 frame が作る immediate viewport render
+  subtree だけ。reducer 11契約、既存 hidden throttle 3件、別 thread の SendMessageTimeoutW が
+  RedrawWindow で同期 damage を発生させる Windows process test を gate 化した。
+  **A が除去したのは「同期メッセージ自身が GPU 待ちを開始する経路」だけ**であり、外側 paint 中の
+  GPU 待ちに後着の同期メッセージが巻き込まれる問題は B のまま残る。
 - 何が問題か: winit は `WM_PAINT` 内で `RedrawRequested` を**同期 dispatch** し、eframe はそこで
   `run_ui_and_paint` を直接呼ぶ。さらに Windows の resize では flicker 防止のため意図的に同期 paint
   する。結果として **wndproc の内側で swapchain acquire と Present を行う**。Microsoft も
@@ -231,15 +240,16 @@
   ネイティブ動画フルスクリーン中は main HWND が隠れるため、**最も危ない操作の最中に
   watchdog が黙る**。keep-alive の述語にアクティブなメディアセッションを含める。
   これだけ入れておけば、次に野生で固まったときにログが残る。
-- 構造修正 (wndproc 即 return / 単一 render state / nonblocking acquire) 自体は、
-  v3.0.0 の後に単独で着手する。
+- message-dispatch / render 位相分離は §1.31-A として完了。nonblocking acquire / Present と
+  message service latency の上限制約は §1.31-B として後続する。
 - **着手順の確定 (2026-08-16、ClaudeCode / Codex Sol 合意)**:
   `§1.85-A → §1.86 → §1.31 本体` の 3 段。根拠と逆順の失敗モードは
   [codex-texture-delivery-test-brief.md](briefs/codex-texture-delivery-test-brief.md) §0。
   §1.31 は frame drop を通常経路にするので、その経路の delta 配送を先に契約化する。
   **§1.86 は障害影響としては P3 のままだが、本項の依存関係上は必須前提**として扱う。
 - **前提充足 (2026-08-16)**: §1.86 の単一 delta transaction owner と non-submit outcome の
-  finalization 契約が完成。§1.31 本体は未着手で、通常 frame drop はこの契約へ新 outcome を足す。
+  finalization 契約が完成し、その上で §1.31-A の位相分離まで完了。通常 frame drop と readiness
+  wake を足す §1.31-B は未着手。
 - **本体を A / B に分割 (2026-08-16、ClaudeCode / Codex Sol 合意)**:
   - **§1.31-A**: message-dispatch 位相と render 位相の分離。**同期メッセージ自身が GPU 待ちを
     開始する経路**を除去する。vendored eframe だけで完結する (winit / wgpu は vendor しない)。
@@ -254,7 +264,8 @@
     一方 `SurfaceTexture::present()` は戻り値が `()` で HAL の FIFO Present は
     `DXGI_PRESENT_DO_NOT_WAIT` を使わないため、Present まで厳密に bounded にするなら
     wgpu / core / hal の patch か render thread 分離が要る。
-- **2026-08-16 に訂正した認識** (前セッションの読み違い。同じ誤りを繰り返さないため残す):
+- **§1.31-A 着手前の 2026-08-16 に訂正した認識**
+  (前セッションの読み違い。同じ誤りを繰り返さないため履歴として残す):
   - **外側の paint 位相は現在存在しない**。`check_redraw_requests` は
     [run.rs:198](../vendor/eframe/src/native/run.rs:198) `handle_event_result` の末尾と
     [run.rs:396](../vendor/eframe/src/native/run.rs:396) `new_events` から呼ばれ、
@@ -299,7 +310,7 @@
     返ること (b) presentation 不能中も外側 render step と message-pump の service latency が有限で
     あること。ハング防止に raw `SendMessage` ではなく `SendMessageTimeout` を使い、実 DWM stall では
     なく決定的な readiness gate を止めて再現する。
-- 規模 / 優先度: **残るのは構造修正だけ = Large / P1 candidate (基盤)**。
+- 規模 / 優先度: **残るのは §1.31-B の上限制約 = Large / P1 candidate (基盤)**。
   watchdog の穴 (Small / P2) は上記のとおり解消済み。
 
 ### 1.35 リネーム移行ジャーナルの永続化 2 件
