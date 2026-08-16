@@ -233,6 +233,41 @@
   これだけ入れておけば、次に野生で固まったときにログが残る。
 - 構造修正 (wndproc 即 return / 単一 render state / nonblocking acquire) 自体は、
   v3.0.0 の後に単独で着手する。
+- **着手順の確定 (2026-08-16、ClaudeCode / Codex Sol 合意)**:
+  `§1.85-A → §1.86 → §1.31 本体` の 3 段。根拠と逆順の失敗モードは
+  [codex-texture-delivery-test-brief.md](briefs/codex-texture-delivery-test-brief.md) §0。
+  §1.31 は frame drop を通常経路にするので、その経路の delta 配送を先に契約化する。
+  **§1.86 は障害影響としては P3 のままだが、本項の依存関係上は必須前提**として扱う。
+- **設計時に確定すべき点 (2026-08-16 に追加で判明したもの)**:
+  - **`WM_PAINT` 内の同期 `RedrawRequested` だけでは足りない**。Windows の resize では
+    [eframe run.rs:121](../vendor/eframe/src/native/run.rs:121) が `RepaintNow` を受けて
+    その場で `run_ui_and_paint` を直接呼んでいる (flicker 対策)。同期 paint の入口は 2 つある。
+  - **acquire を短くしても Present 側の上限が未規定**。wgpu-core の acquire timeout は
+    `FRAME_TIMEOUT_MS = 1000` 固定 (present.rs)。DX12 backend は frame-latency waitable object の
+    `wait(timeout)` が返す `false` を捨てて先へ進む (`unsafe { sc.wait(timeout) }?;` で bool を破棄)。
+    Present は FIFO なら interval 1 で `DXGI_PRESENT_DO_NOT_WAIT` 無し。
+    **公開 wgpu API の設定だけでは短時間 try-acquire にできない**。lower-layer patch /
+    waitable-object の明示 readiness gate / 非ブロッキング Present 戦略のいずれかまで設計に含める。
+    なお §1.30 の「wait は本当に無限か」は、コード上は 1000ms 上限側と整合する
+    (= デッドロックより飢餓)。ただし実際に観測された `WaitForSingleObjectEx` がこの wait かは
+    `latency_waitable_object` の設定次第なので、live evidence の項目は開いたままにする。
+  - 通常の frame drop は `Skipped` と**別の outcome** (`DeferredNotReady` 等) にする。
+    通常動作なので warning 対象ではなく、damage の保持と readiness wake が要る。
+  - `Idle / Painting / Pending` を global scalar にすると複数 viewport の dirty 状態を失う。
+    viewport ID / dirty set / 最新 resize / surface 世代を持たせる。
+  - drop 後に即 repost すると spin する。waitable signal / event / 明示的 scheduler wake で再 arm する。
+  - `WM_PAINT` を即 return する際の `BeginPaint` / `EndPaint` または validation 規則を決めないと
+    無限 `WM_PAINT` になる。
+  - immediate viewport は UI callback 中に同期再帰する
+    ([wgpu_integration.rs](../vendor/eframe/src/native/wgpu_integration.rs) の nested 経路)。
+    フレーム全体を単純に `Painting` にすると detached / immediate viewport を塞ぐので、
+    state の適用範囲を定義する。
+  - dropped frame でも `textures_delta` は配送する (= §1.86 の契約)。screenshot request は
+    成功まで保持 / 再投入する。
+  - Windows 回帰テストは 2 つの性質を分ける: (a) `WM_PAINT` / 同期 message handler が有限時間で
+    返ること (b) presentation 不能中も外側 render step と message-pump の service latency が有限で
+    あること。ハング防止に raw `SendMessage` ではなく `SendMessageTimeout` を使い、実 DWM stall では
+    なく決定的な readiness gate を止めて再現する。
 - 規模 / 優先度: **残るのは構造修正だけ = Large / P1 candidate (基盤)**。
   watchdog の穴 (Small / P2) は上記のとおり解消済み。
 
@@ -885,6 +920,20 @@
 - **回避策を撤去するかの判断もここに含める**: 上記 1 の upload 先送りと 2 の resync は、
   境界が直った今は保険であって正しさの担保ではない。撤去は別レビューで
   (今回は同時に触らないと決めた)。
+- **2026-08-16 の確定**: §1.31 の第 1 段として着手する (順序は §1.31 参照)。
+  ブリーフ = [codex-texture-delivery-test-brief.md](briefs/codex-texture-delivery-test-brief.md)。
+  - 足場は `egui_kittest` **ではなく** `vendor/egui-wgpu` の in-crate headless unit test。
+    `RenderState::create` の `compatible_surface` が `Option` で全フィールドが `pub` なので
+    surface 無しの device / renderer を作れる。`ui_snapshot` 実行体の既知の間欠 AV を避ける。
+  - **上記の欲しいテスト 4 は exit 2 (no-surface) しか到達しない**。`surfaces` が空なら
+    `get_current_texture` に届かず、`on_surface_error` はエラーを分類するだけで注入できない。
+    `RecreateSurface` / `SkipFrame` の coverage は §1.86 で typed outcome の seam を作ってから。
+    → 前半を **§1.85-A** として切り出した。
+  - **判定は `Renderer::texture_size` の observable な値にする**。mIV の overflow guard が
+    範囲外 partial を wgpu へ渡す前に skip するため、「validation error が出ない」だけでは
+    full 置換が落ちていてもテストが通ってしまう。
+  - `vendor/egui-wgpu` は workspace `exclude` かつ `autotests = false` なので、
+    `scripts/test-full.ps1` に専用実行を足さないと**テストが存在するだけで走らない**。
 - 規模 / 優先度: 中 / P2。
 
 ### 1.86 surface 取得に失敗したフレームで `textures_delta.free` が捨てられる
@@ -900,7 +949,19 @@
   サムネイルを大量に流す使い方だと効いてくる可能性がある。
 - 直し方: no-surface 早期 return と同じく、これらの経路でも `free` を流す。
   `set` / `free` の適用を 1 つのヘルパに寄せて、描画の成否と独立にするのが素直。
-- 規模 / 優先度: 小 / P3。
+- **2026-08-16 の確定**: §1.31 の第 2 段として着手する (順序は §1.31 参照)。
+  ブリーフ = [codex-delta-delivery-transaction-brief.md](briefs/codex-delta-delivery-transaction-brief.md)。
+  - **障害影響は P3 のままだが、§1.31 の依存関係上は必須前提**。§1.31 は frame drop を通常経路に
+    するので、捨てる経路で `free` が落ちる構造のままだと本物のリークになる。
+  - **「1 つのヘルパ」を単一関数と読まない**。`set` は surface lookup の前、`free` は成功経路では
+    `queue.submit` の後でなければならず、同じ時点に置けない。
+    `begin_delivery` (set をちょうど一度) / inner が typed `PaintOutcome` を返す /
+    `finish_delivery` (outcome ごとに free) の**二段階 transaction owner**にする。
+    `RenderStateAbsent` は「配送不能」の明示的な例外 outcome として型に残す。
+  - **exit 3/4 へ同じ `free` ループをコピーするだけの修正は、「構造的修正」の合意対象外**
+    (2026-08-16、ClaudeCode / Codex Sol)。所有構造 (配送責任が各 return に分散している) を
+    直さず症状だけ消すため。
+- 規模 / 優先度: 小 / P3 (障害影響)。**ただし §1.31 の必須前提**。
 
 ### 1.84 表示キャッシュに item-context 世代の刻印が無い (latent、ABA 危険)
 
