@@ -38,9 +38,16 @@ OUT = os.path.join(MANUAL, "changelog.html")
 def conv_inline(text):
     """Convert one line of inline markdown to HTML.
 
-    Handles **bold**, `code`, and passes <kbd>…</kbd> through untouched while
-    HTML-escaping the surrounding plain text. <kbd> spans (which may appear
-    inside **bold**) are protected first so escaping does not mangle them.
+    Handles **bold**, `code`, [text](https://…) links, and passes <kbd>…</kbd>
+    through untouched while HTML-escaping the surrounding plain text. <kbd>
+    spans (which may appear inside **bold**) are protected first so escaping
+    does not mangle them.
+
+    Links are converted last so their text can carry the earlier inline markup.
+    Only absolute http(s) targets are recognised: README paths are relative to
+    the repository root, but this page is generated into manual/, so a relative
+    target would silently point somewhere else. Anything else stays literal,
+    which is visible on the page rather than quietly wrong.
     """
     kbds = []
 
@@ -52,6 +59,11 @@ def conv_inline(text):
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     text = re.sub(r"`([^`]+)`", lambda m: "<code>" + m.group(1) + "</code>", text)
     text = re.sub(r"\*\*(.+?)\*\*", lambda m: "<strong>" + m.group(1) + "</strong>", text)
+    text = re.sub(
+        r"\[([^\]]+)\]\((https?://[^)\s]+)\)",
+        lambda m: '<a href="{}">{}</a>'.format(m.group(2), m.group(1)),
+        text,
+    )
     for i, k in enumerate(kbds):
         text = text.replace("\x00K{}\x00".format(i), k)
     return text
