@@ -240,6 +240,35 @@
   **§1.86 は障害影響としては P3 のままだが、本項の依存関係上は必須前提**として扱う。
 - **前提充足 (2026-08-16)**: §1.86 の単一 delta transaction owner と non-submit outcome の
   finalization 契約が完成。§1.31 本体は未着手で、通常 frame drop はこの契約へ新 outcome を足す。
+- **本体を A / B に分割 (2026-08-16、ClaudeCode / Codex Sol 合意)**:
+  - **§1.31-A**: message-dispatch 位相と render 位相の分離。**同期メッセージ自身が GPU 待ちを
+    開始する経路**を除去する。vendored eframe だけで完結する (winit / wgpu は vendor しない)。
+    ブリーフ = [codex-render-phase-separation-brief.md](briefs/codex-render-phase-separation-brief.md)。
+  - **§1.31-B**: presentation と message service latency の上限制約。
+    **A を merge しても §1.31 は完了しない**。UI スレッドが外側の paint で GPU を待つ間も
+    message pump は止まるため、他スレッドの `SendMessage` は依然ブロックする。A が消すのは
+    「同期メッセージが GPU 待ちを**開始させた**」経路だけ。
+  - B の実現可能性メモ: `wgpu-hal` の DX12 Surface は `waitable_handle()` を公開しており、
+    `Dx12UseFrameLatencyWaitableObject::DontWait` は「application 自身が待つ」用途で存在する。
+    **acquire 前の readiness gate だけなら wgpu の vendor 不要で組める可能性がある**。
+    一方 `SurfaceTexture::present()` は戻り値が `()` で HAL の FIFO Present は
+    `DXGI_PRESENT_DO_NOT_WAIT` を使わないため、Present まで厳密に bounded にするなら
+    wgpu / core / hal の patch か render thread 分離が要る。
+- **2026-08-16 に訂正した認識** (前セッションの読み違い。同じ誤りを繰り返さないため残す):
+  - **外側の paint 位相は現在存在しない**。`check_redraw_requests` は
+    [run.rs:198](../vendor/eframe/src/native/run.rs:198) `handle_event_result` の末尾と
+    [run.rs:396](../vendor/eframe/src/native/run.rs:396) `new_events` から呼ばれ、
+    `WinitAppWrapper` には `about_to_wait` の実装が無い (trait 既定の no-op)。
+    不可視窓の direct paint を「既に外側」と読まないこと。
+  - **`RepaintNow` は resize 専用ではない**。producer は初回 `resumed` (bootstrap) /
+    非ゼロ `Resized` / AccessKit initial tree の 3 つで、`EventResult::RepaintNow(WindowId)` は
+    理由を失っている。位相を分けるには reason の型付けが要る。
+  - **無限 `WM_PAINT` の懸念は撤回してよい**。winit は `RedrawRequested` を送った後に
+    `DefWindowProcW(WM_PAINT)` を呼び、これが update region を validate する。
+    eframe が描画せず戻っても再送ループにはならない。
+  - **厳密な `MARKER_IN_SIZE_MOVE` 限定は採らない**。winit の非公開状態であり、
+    取りに行くと winit の vendor patch か全 HWND subclass が要る。A の inline 例外は
+    「非ゼロ `Resized`」とする (現行は全 redraw が inline なので、これでも厳密に狭い)。
 - **設計時に確定すべき点 (2026-08-16 に追加で判明したもの)**:
   - **`WM_PAINT` 内の同期 `RedrawRequested` だけでは足りない**。Windows の resize では
     [eframe run.rs:121](../vendor/eframe/src/native/run.rs:121) が `RepaintNow` を受けて
