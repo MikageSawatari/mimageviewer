@@ -2073,18 +2073,13 @@ fn fs_prefetch_indicator_separates_directions_orders_distance_and_counts_states(
 }
 
 #[test]
-fn fs_prefetch_indicator_keeps_nearest_eight_dots_and_summarizes_only_nonzero_far_states() {
+fn fs_prefetch_indicator_keeps_nearest_dots_and_summarizes_only_nonzero_far_states() {
     use FsPrefetchPageState::{Active, Missing, Ready};
 
+    // 先読み枚数の上限は前後とも 10 枚。近い側だけを点で残し、遠方は状態別の個数へ畳む。
     let pages = [
-        (1, Ready),
-        (2, Ready),
-        (3, Missing),
-        (4, Missing),
-        (5, Active),
-        (6, Ready),
-        (7, Missing),
-        (8, Active),
+        (7, Ready),
+        (8, Missing),
         (9, Ready),
         (10, Missing),
         (11, Active),
@@ -2093,14 +2088,9 @@ fn fs_prefetch_indicator_keeps_nearest_eight_dots_and_summarizes_only_nonzero_fa
         (15, Active),
         (16, Missing),
         (17, Ready),
-        (18, Missing),
+        (18, Active),
         (19, Active),
-        (20, Ready),
-        (21, Missing),
-        (22, Active),
-        (23, Missing),
-        (24, Missing),
-        (25, Active),
+        (20, Missing),
     ];
     let indicator = build_fs_prefetch_indicator(13, false, pages)
         .expect("unfinished targets should be visible");
@@ -2108,21 +2098,19 @@ fn fs_prefetch_indicator_keeps_nearest_eight_dots_and_summarizes_only_nonzero_fa
     let behind = indicator.behind_display();
     assert_eq!(
         behind.dots,
-        vec![
-            Active, Ready, Missing, Active, Ready, Missing, Active, Ready
-        ],
-        "behind は現在に近い末尾 8 ページを点のまま残す"
+        vec![Ready, Missing, Active, Ready],
+        "behind は現在に近い末尾 4 ページを点のまま残す"
     );
     assert_eq!(
         behind.far_counts,
         vec![
             FsPrefetchStateCount {
                 state: Ready,
-                count: 2,
+                count: 1,
             },
             FsPrefetchStateCount {
                 state: Missing,
-                count: 2,
+                count: 1,
             },
         ],
         "遠方に 0 件の active は個数表示へ出さない"
@@ -2131,10 +2119,8 @@ fn fs_prefetch_indicator_keeps_nearest_eight_dots_and_summarizes_only_nonzero_fa
     let ahead = indicator.ahead_display();
     assert_eq!(
         ahead.dots,
-        vec![
-            Ready, Active, Missing, Ready, Missing, Active, Ready, Missing
-        ],
-        "ahead は現在に近い先頭 8 ページを点のまま残す"
+        vec![Ready, Active, Missing, Ready],
+        "ahead は現在に近い先頭 4 ページを点のまま残す"
     );
     assert_eq!(
         ahead.far_counts,
@@ -2145,10 +2131,16 @@ fn fs_prefetch_indicator_keeps_nearest_eight_dots_and_summarizes_only_nonzero_fa
             },
             FsPrefetchStateCount {
                 state: Missing,
-                count: 2,
+                count: 1,
             },
         ],
         "遠方に 0 件の ready は個数表示へ出さない"
+    );
+
+    assert_eq!(
+        indicator.tooltip_text(),
+        "先読み: 取得済み 5 / 取得中 4 / 未取得 4",
+        "ホバー表示は点にした分と畳んだ分の合計を数える"
     );
 }
 

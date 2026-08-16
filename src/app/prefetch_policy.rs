@@ -184,8 +184,8 @@ pub(crate) struct FsPrefetchStateCount {
     pub(crate) count: usize,
 }
 
-/// 片側の描画モデル。dots は現在ページに近い最大 8 ページ、far_counts は
-/// それより遠いページを状態別の個数へまとめたもの。
+/// 片側の描画モデル。dots は現在ページに近い最大 `MAX_DOTS_PER_SIDE` ページ、
+/// far_counts はそれより遠いページを状態別の個数へまとめたもの。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FsPrefetchSideDisplay {
     pub(crate) dots: Vec<FsPrefetchPageState>,
@@ -203,7 +203,10 @@ pub(crate) struct FsPrefetchIndicator {
 }
 
 impl FsPrefetchIndicator {
-    pub(crate) const MAX_DOTS_PER_SIDE: usize = 8;
+    /// 先読み枚数の設定上限は前後とも 10 枚。ここを 8 にすると上限まで増やしても
+    /// 数値へ畳まれるのは 2 枚だけで、行が長いままになる。4 なら既定 (後方 1 / 前方 2)
+    /// では全部が点のまま出て、増やしたときだけ遠方が数値へ退く。
+    pub(crate) const MAX_DOTS_PER_SIDE: usize = 4;
 
     pub(crate) fn tooltip_text(&self) -> String {
         format!(
