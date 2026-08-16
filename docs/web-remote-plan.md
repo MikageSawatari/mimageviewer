@@ -2667,3 +2667,25 @@ Rust 1.94.1 の標準ライブラリ実装も確認した。`stdout().lock()` �
 `worker_write_calls` は既存 `write_msg` がその LineWriter 公開境界へ行った呼出回数、
 `parent_pipe_read_calls` は `BufReader` 内側の実 `ChildStdout.read` 回数を記録する。上記の実測でも、
 画像 frame は `write` 2 回（4-byte length と payload）+ `flush` 1 回で、改行単位の細切れはなかった。
+
+### 14.22 保存済み回転を端末用ページへ反映 (2026-08-16)
+
+通常ページ、AI 完了ページ、コンテナ内ページのサムネイルは、本体と同じ
+`page_key_for_remote(logical_path, subresource)` で `rotation.db` を読み、保存済み加工 crop を含む
+最終合成の後、端末用 resize / encode の前に 0° / 90° / 180° / 270° を適用する。
+通常画像を集約コレクションから開く旧 `/api/image` / `/api/image-info` 経路も、通常ファイル用の
+同じ正規化キーを read-only で読み、画像本体と寸法を同じ向きにする。ZIP / PDF は引き続き本体 IPC
+だけが扱う。`PagePayload` と `PageGroup` の形、IPC protocol version は変更しない。
+
+本体は保存済み回転が 0° 以外なら `effective_bbox` / `fs_image_fit_bbox` で表示トリム bbox を
+採用しない。remote もこの不変条件を表示トリム plan の生成境界で適用し、回転中は
+`Stored(None)` として手動 / Auto の両方を無効にする。したがって回転中に Auto の raw raster 検出や
+見開き相手の先行復号は開始せず、クライアント座標から画像座標への逆変換も持たない。保存用 crop と
+表示トリムは別段なので、保存用 crop は従来どおり回転前に materialize する。
+
+最終合成 cache key には `Rotation` を含め、同じ source stamp / target_px / 補正でも異なる回転結果を
+共有しない。raw decode、Auto bbox、AI native result は回転前の正準 raster のまま共有する。
+回転 DB は remote state generation の監視対象へ追加しない。本体操作がロックされる remote session 中に
+回転は変化せず、session 再取得時は既存の session cache epoch がブラウザの page resource key と URL を
+更新するためである。これにより HTTP の private cache と `PageResourceCache` も前 session の画像を
+再利用しない。

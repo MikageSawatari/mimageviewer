@@ -77,6 +77,20 @@ impl WorkerContext {
             crop_db: None,
         }
     }
+
+    pub(super) fn rotation_for_remote_page(
+        &self,
+        logical_path: &Path,
+        subresource: &RemoteSubresource,
+    ) -> crate::rotation_db::Rotation {
+        crate::edit_source::page_key_for_remote(logical_path, subresource)
+            .and_then(|key| {
+                self.rotation_db
+                    .as_ref()
+                    .and_then(|database| database.get_key(&key))
+            })
+            .unwrap_or(crate::rotation_db::Rotation::None)
+    }
 }
 
 #[derive(Clone, Eq)]
@@ -374,12 +388,9 @@ impl ThumbnailEngine {
         })?;
         // 本体 UI と同様、通常画像だけに手動回転 DB を適用する。フォルダ代表は
         // GridItem::Folder なので回転対象外。
-        if !is_folder
-            && let Some(rotation) = context
-                .rotation_db
-                .as_ref()
-                .and_then(|database| database.get(&resolved.logical))
-        {
+        if !is_folder {
+            let rotation =
+                context.rotation_for_remote_page(&resolved.logical, &RemoteSubresource::File);
             image = match rotation {
                 crate::rotation_db::Rotation::None => image,
                 crate::rotation_db::Rotation::Cw90 => image.rotate90(),

@@ -123,10 +123,43 @@ struct ObservedDatabase {
     data_version: i64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoredRotation {
+    None,
+    Cw90,
+    Cw180,
+    Cw270,
+}
+
+impl StoredRotation {
+    fn from_degrees(degrees: i32) -> Self {
+        match degrees.rem_euclid(360) {
+            90 => Self::Cw90,
+            180 => Self::Cw180,
+            270 => Self::Cw270,
+            _ => Self::None,
+        }
+    }
+
+    fn swaps_dimensions(self) -> bool {
+        matches!(self, Self::Cw90 | Self::Cw270)
+    }
+
+    fn apply(self, image: image::DynamicImage) -> image::DynamicImage {
+        match self {
+            Self::None => image,
+            Self::Cw90 => image.rotate90(),
+            Self::Cw180 => image.rotate180(),
+            Self::Cw270 => image.rotate270(),
+        }
+    }
+}
+
 struct LibraryState {
     snapshot: Arc<LibrarySnapshot>,
     settings: Option<ObservedDatabase>,
     view_trim: Option<ObservedDatabase>,
+    rotation: Option<ObservedDatabase>,
     generation_counter: u64,
     generation: String,
 }
@@ -136,6 +169,7 @@ pub struct Library {
     generation_prefix: String,
     settings_path: Option<PathBuf>,
     view_trim_path: Option<PathBuf>,
+    rotation_path: Option<PathBuf>,
 }
 
 impl Library {
@@ -152,13 +186,22 @@ impl Library {
                 snapshot: Arc::new(library_snapshot(favorites, None)),
                 settings: None,
                 view_trim: None,
+                rotation: None,
                 generation_counter: 1,
                 generation: format!("{prefix}-1"),
             }),
             generation_prefix: prefix,
             settings_path: None,
             view_trim_path: None,
+            rotation_path: None,
         }
+    }
+
+    #[cfg(test)]
+    fn from_test_rotation_path(rotation_path: PathBuf) -> Self {
+        let mut library = Self::from_test_favorites(Vec::new());
+        library.rotation_path = Some(rotation_path);
+        library
     }
 
     pub fn load(data_dir: &Path) -> Result<Self, StoreError> {
@@ -169,6 +212,8 @@ impl Library {
         settings.data_version = data_version;
         let view_trim_path = data_dir.join("view_trim.db");
         let view_trim = open_observed_database(&view_trim_path)?;
+        let rotation_path = data_dir.join("rotation.db");
+        let rotation = open_observed_database(&rotation_path)?;
         let mut generation_seed = [0_u8; 16];
         getrandom::fill(&mut generation_seed).map_err(|error| {
             StoreError::Io(std::io::Error::other(format!(
@@ -181,12 +226,14 @@ impl Library {
                 snapshot: Arc::new(library_snapshot(favorites, sort_order)),
                 settings: Some(settings),
                 view_trim,
+                rotation,
                 generation_counter: 1,
                 generation: format!("{generation_prefix}-1"),
             }),
             generation_prefix,
             settings_path: Some(settings_path),
             view_trim_path: Some(view_trim_path),
+            rotation_path: Some(rotation_path),
         })
     }
 
@@ -276,12 +323,15 @@ impl Library {
         if requested_width == 0 || requested_width > MAX_IMAGE_WIDTH {
             return Err(StoreError::BadRequest);
         }
-        let image_path = resolve_existing(path)?.canonical;
+        let resolved = resolve_existing(path)?;
+        let rotation = self.image_rotation(&resolved.logical)?;
+        let image_path = resolved.canonical;
         let metadata = require_image_file(&image_path)?;
 
         let probe = image_support::probe_image(&image_path).ok_or(StoreError::Decode)?;
-        if let Some(content_type) =
-            image_support::passthrough_content_type(&image_path, probe, requested_width)
+        if rotation == StoredRotation::None
+            && let Some(content_type) =
+                image_support::passthrough_content_type(&image_path, probe, requested_width)
         {
             let read_started = Instant::now();
             let bytes = std::fs::read(&image_path)?;
@@ -307,7 +357,8 @@ impl Library {
         }
 
         let decode_started = Instant::now();
-        let image = image_support::decode_oriented(&image_path).ok_or(StoreError::Decode)?;
+        let image =
+            rotation.apply(image_support::decode_oriented(&image_path).ok_or(StoreError::Decode)?);
         let decode_ms = duration_ms(decode_started.elapsed());
         let (source_width, source_height) = image.dimensions();
 
@@ -341,11 +392,38 @@ impl Library {
     }
 
     pub fn image_info(&self, path: &str) -> Result<ImageInfoResponse, StoreError> {
-        let image_path = resolve_existing(path)?.canonical;
+        let resolved = resolve_existing(path)?;
+        let rotation = self.image_rotation(&resolved.logical)?;
+        let image_path = resolved.canonical;
         require_image_file(&image_path)?;
         let probe = image_support::probe_image(&image_path).ok_or(StoreError::Decode)?;
-        let (width, height) = probe.oriented_dimensions();
+        let (mut width, mut height) = probe.oriented_dimensions();
+        if rotation.swaps_dimensions() {
+            std::mem::swap(&mut width, &mut height);
+        }
         Ok(ImageInfoResponse { width, height })
+    }
+
+    fn image_rotation(&self, logical_path: &Path) -> Result<StoredRotation, StoreError> {
+        let mut state = self.state.lock().map_err(|_| StoreError::BadRequest)?;
+        if state.rotation.is_none()
+            && let Some(path) = self.rotation_path.as_deref()
+        {
+            state.rotation = open_observed_database(path)?;
+        }
+        let Some(database) = state.rotation.as_ref() else {
+            return Ok(StoredRotation::None);
+        };
+        let key = rotation_page_key(logical_path);
+        match database.connection.query_row(
+            "SELECT angle FROM rotations WHERE path = ?1",
+            [&key],
+            |row| row.get::<_, i32>(0),
+        ) {
+            Ok(degrees) => Ok(StoredRotation::from_degrees(degrees)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(StoredRotation::None),
+            Err(error) => Err(StoreError::Db(error)),
+        }
     }
 
     fn snapshot(
@@ -364,6 +442,12 @@ impl Library {
         }
         Ok((Arc::clone(&state.snapshot), state.generation.clone()))
     }
+}
+
+/// `rotation.db` uses the same normal-file page key as the core process.
+/// ZIP/PDF keys stay in core because the legacy `/api/image` route only accepts files.
+fn rotation_page_key(path: &Path) -> String {
+    path.to_string_lossy().to_lowercase().replace('\\', "/")
 }
 
 fn library_snapshot(favorites: Vec<FavoriteRoot>, sort_order: Option<String>) -> LibrarySnapshot {
@@ -735,6 +819,68 @@ mod tests {
         assert_eq!(passthrough.metrics.webp_encode_ms, 0.0);
 
         assert_eq!(std::fs::read(&settings_path).unwrap(), settings_before);
+    }
+
+    #[test]
+    fn legacy_file_image_routes_follow_all_saved_quarter_turns() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("page.png");
+        RgbaImage::from_fn(3, 2, |x, y| {
+            Rgba([
+                (x * 70) as u8,
+                (y * 110) as u8,
+                (x * 30 + y * 20) as u8,
+                255,
+            ])
+        })
+        .save(&image_path)
+        .unwrap();
+
+        let rotation_path = temp.path().join("rotation.db");
+        let writer = Connection::open(&rotation_path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE rotations (
+                    path TEXT PRIMARY KEY,
+                    angle INTEGER NOT NULL DEFAULT 0
+                 );",
+            )
+            .unwrap();
+        let logical = resolve_existing(image_path.to_string_lossy().as_ref())
+            .unwrap()
+            .logical;
+        let key = rotation_page_key(&logical);
+        let library = Library::from_test_rotation_path(rotation_path);
+        let image_path_text = image_path.to_string_lossy().into_owned();
+
+        for (degrees, expected_dimensions, expected_passthrough) in [
+            (0, (3, 2), true),
+            (90, (2, 3), false),
+            (180, (3, 2), false),
+            (270, (2, 3), false),
+        ] {
+            writer
+                .execute(
+                    "INSERT INTO rotations (path, angle) VALUES (?1, ?2)
+                     ON CONFLICT(path) DO UPDATE SET angle = ?2",
+                    rusqlite::params![key, degrees],
+                )
+                .unwrap();
+
+            let info = library.image_info(&image_path_text).unwrap();
+            assert_eq!((info.width, info.height), expected_dimensions);
+            let result = library.image(&image_path_text, 3).unwrap();
+            assert_eq!(
+                (result.metrics.source_width, result.metrics.source_height),
+                expected_dimensions
+            );
+            assert_eq!(result.metrics.passthrough, expected_passthrough);
+            assert_eq!(
+                image::load_from_memory(&result.bytes).unwrap().dimensions(),
+                expected_dimensions
+            );
+        }
     }
 
     #[test]

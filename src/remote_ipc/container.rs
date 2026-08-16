@@ -968,6 +968,7 @@ struct RemoteCompositeCacheKey {
     mtime: i64,
     file_size: i64,
     target_px: u32,
+    rotation: crate::rotation_db::Rotation,
     params: crate::adjustment::AdjustParams,
     lut_entry: Option<crate::creative_lut::CreativeLutEntry>,
     edit_fingerprint: [u8; 32],
@@ -2246,6 +2247,7 @@ impl ContainerEngine {
         mtime: i64,
         file_size: i64,
         target_px: u32,
+        rotation: crate::rotation_db::Rotation,
         preview: Option<&mimageviewer_ipc::RemoteAdjustmentPreview>,
         context: &WorkerContext,
     ) -> Result<Option<RemotePreparedComposite>, MediaError> {
@@ -2255,6 +2257,7 @@ impl ContainerEngine {
             mtime,
             file_size,
             target_px,
+            rotation,
             preview,
             context,
             None,
@@ -2270,6 +2273,7 @@ impl ContainerEngine {
         mtime: i64,
         file_size: i64,
         target_px: u32,
+        rotation: crate::rotation_db::Rotation,
         preview: Option<&mimageviewer_ipc::RemoteAdjustmentPreview>,
         context: &WorkerContext,
         primary: Option<&mut RemotePageStageGuard>,
@@ -2356,6 +2360,7 @@ impl ContainerEngine {
             mtime,
             file_size,
             target_px,
+            rotation,
             params: params.clone(),
             lut_entry: lut_entry.clone(),
             edit_fingerprint: edits.fingerprint,
@@ -3351,11 +3356,14 @@ impl ContainerEngine {
             Ok(resolved) => resolved,
             Err(error) => return thumbnail_error_from_media(error),
         };
+        let rotation =
+            context.rotation_for_remote_page(&resolved.logical, &request.address.subresource);
         let response = match self.load_image(
             &request.address,
             &resolved,
             request.target_px,
             RemoteImageLoadKind::Thumbnail,
+            rotation,
             false,
             context,
             None,
@@ -3431,10 +3439,13 @@ impl ContainerEngine {
             Ok(resolved) => resolved,
             Err(error) => return PageResponse::Error(error),
         };
+        let rotation =
+            context.rotation_for_remote_page(&resolved.logical, &request.address.subresource);
         let view_trim_plan = match self.remote_view_trim_plan_timed(
             &request.address,
             &resolved,
             request.render_context.as_ref(),
+            rotation,
             resolve_stage.as_mut(),
         ) {
             Ok(plan) => plan,
@@ -3482,6 +3493,7 @@ impl ContainerEngine {
                     &resolved,
                     request.target_px,
                     load_kind,
+                    rotation,
                     foreground,
                     context,
                     Some(&cancel),
@@ -3636,13 +3648,14 @@ impl ContainerEngine {
             request,
             progress,
             cancel,
-            &|engine, address, logical_path, mtime, file_size, target_px, context| {
+            &|engine, address, logical_path, mtime, file_size, target_px, rotation, context| {
                 engine.prepare_remote_composite(
                     address,
                     logical_path,
                     mtime,
                     file_size,
                     target_px,
+                    rotation,
                     None,
                     context,
                 )
@@ -3671,6 +3684,7 @@ impl ContainerEngine {
             i64,
             i64,
             u32,
+            crate::rotation_db::Rotation,
             &WorkerContext,
         ) -> Result<Option<RemotePreparedComposite>, MediaError>,
         decode_source: &dyn Fn(
@@ -3715,6 +3729,8 @@ impl ContainerEngine {
             }
             let mtime = crate::ui_helpers::mtime_secs(&metadata);
             let file_size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+            let rotation = context
+                .rotation_for_remote_page(&resolved.logical, &page.address.subresource);
             let prepared = prepare_composite(
                 self,
                 &page.address,
@@ -3722,6 +3738,7 @@ impl ContainerEngine {
                 mtime,
                 file_size,
                 page.target_px,
+                rotation,
                 &context,
             )
             .map_err(remote_ai_media_error)?
@@ -3912,6 +3929,8 @@ impl ContainerEngine {
                 stored_edit_space,
             )
             .map_err(RemoteAiRunError::Failed)?;
+            check_remote_ai_cancel(cancel)?;
+            pixels = apply_remote_page_rotation(pixels, rotation);
             let identity = super::path_guard::page_identity_from_resolved(
                 &resolved,
                 &page.address.subresource,
@@ -3923,6 +3942,7 @@ impl ContainerEngine {
                     &page.address,
                     &resolved,
                     page.render_context.as_ref(),
+                    rotation,
                 )
                 .map_err(remote_ai_media_error)?;
             // Auto は AI 出力ではなく本体と同じ元ページ raster から検出する。bbox cache を
@@ -4002,6 +4022,8 @@ impl ContainerEngine {
             })?;
             let metadata = std::fs::metadata(&resolved.canonical)
                 .map_err(|_| RemoteAiRunError::Superseded("source metadata changed".to_owned()))?;
+            let rotation = validation_context
+                .rotation_for_remote_page(&resolved.logical, &address.subresource);
             let current = self
                 .prepare_remote_composite(
                     &address,
@@ -4009,6 +4031,7 @@ impl ContainerEngine {
                     crate::ui_helpers::mtime_secs(&metadata),
                     i64::try_from(metadata.len()).unwrap_or(i64::MAX),
                     target_px,
+                    rotation,
                     None,
                     &validation_context,
                 )
@@ -4574,8 +4597,9 @@ impl ContainerEngine {
         page_address: &RemoteAddress,
         resolved: &ResolvedPath,
         render_context: Option<&RemotePageRenderContext>,
+        rotation: crate::rotation_db::Rotation,
     ) -> Result<RemoteViewTrimPlan, MediaError> {
-        self.remote_view_trim_plan_timed(page_address, resolved, render_context, None)
+        self.remote_view_trim_plan_timed(page_address, resolved, render_context, rotation, None)
     }
 
     fn remote_view_trim_plan_timed(
@@ -4583,9 +4607,18 @@ impl ContainerEngine {
         page_address: &RemoteAddress,
         resolved: &ResolvedPath,
         render_context: Option<&RemotePageRenderContext>,
+        rotation: crate::rotation_db::Rotation,
         wait_stage: Option<&mut RemotePageStageGuard>,
     ) -> Result<RemoteViewTrimPlan, MediaError> {
+        // Keep the existing page/context ownership validation even when rotation makes the trim
+        // result empty. Only the DB lookup and Auto source/partner work are skipped.
         let keys = self.remote_view_trim_keys(page_address, resolved, render_context)?;
+        // Desktop display geometry drops the effective content bbox for every saved rotation.
+        // Resolve that invariant at plan creation so Auto trim cannot start source/partner work
+        // whose result is forbidden from reaching the rotated page.
+        if !rotation.is_none() {
+            return Ok(RemoteViewTrimPlan::Stored(None));
+        }
         let page_key = crate::edit_source::page_key_for_remote(
             &resolved.logical,
             &page_address.subresource,
@@ -4798,6 +4831,7 @@ impl ContainerEngine {
             resolved,
             target_px,
             RemoteImageLoadKind::AutoTrimReference,
+            crate::rotation_db::Rotation::None,
             foreground,
             context,
             Some(cancel),
@@ -4955,6 +4989,7 @@ impl ContainerEngine {
         resolved: &ResolvedPath,
         target_px: u32,
         load_kind: RemoteImageLoadKind,
+        rotation: crate::rotation_db::Rotation,
         foreground: bool,
         context: &WorkerContext,
         external_cancel: Option<&Arc<AtomicBool>>,
@@ -4965,6 +5000,7 @@ impl ContainerEngine {
             resolved,
             target_px,
             load_kind,
+            rotation,
             foreground,
             context,
             external_cancel,
@@ -4981,6 +5017,7 @@ impl ContainerEngine {
         resolved: &ResolvedPath,
         target_px: u32,
         load_kind: RemoteImageLoadKind,
+        rotation: crate::rotation_db::Rotation,
         foreground: bool,
         context: &WorkerContext,
         external_cancel: Option<&Arc<AtomicBool>>,
@@ -5099,6 +5136,7 @@ impl ContainerEngine {
                 mtime,
                 file_size,
                 target_px,
+                rotation,
                 adjustment_preview,
                 context,
                 page_timing.as_mut().map(|timing| &mut timing.resolve),
@@ -5355,6 +5393,7 @@ impl ContainerEngine {
         // 新しい buffer を返すので、一意な `Arc` を要求しない (本体のローカル表示も
         // `fs_cache` の共有 `Arc` をそのまま同じ関数へ渡している)。事前に deep clone すると、
         // 46MP のページで実測 62ms を毎ページ払うだけで何も買えない。
+        let cache_composite = prepared_composite.is_some();
         let mut pixels = color_image;
         if let Some(prepared) = prepared_composite {
             let edit_started = Instant::now();
@@ -5425,6 +5464,13 @@ impl ContainerEngine {
                     "ページの切り取り結果を作成できませんでした",
                 )
             })?;
+            if cancel.load(Ordering::Acquire) {
+                return Err(media_error(
+                    MediaErrorCode::Cancelled,
+                    "ページの表示需要がなくなったため処理を取り消しました",
+                ));
+            }
+            pixels = apply_remote_page_rotation(pixels, rotation);
             let cache_insert_started = Instant::now();
             let cache_insert_wait_ms = compose_stage.as_ref().map_or(0.0, |stage| stage.wait_ms);
             lock_with_remote_page_wait(
@@ -5444,6 +5490,9 @@ impl ContainerEngine {
                 "remote_ipc: final_composite cache=miss key={}",
                 prepared.key.page_key
             ));
+        }
+        if !cache_composite {
+            pixels = apply_remote_page_rotation(pixels, rotation);
         }
         let result = loaded_image_from_color_image(&pixels, auto_trim_bbox, identity);
         if result.is_ok()
@@ -6000,6 +6049,17 @@ fn decode_remote_ai_canonical(
                 page_index,
             })
         }
+    }
+}
+
+fn apply_remote_page_rotation(
+    pixels: Arc<egui::ColorImage>,
+    rotation: crate::rotation_db::Rotation,
+) -> Arc<egui::ColorImage> {
+    if rotation.is_none() {
+        pixels
+    } else {
+        Arc::new(crate::capture::rotate_color_image(&pixels, rotation))
     }
 }
 
@@ -7615,6 +7675,161 @@ mod tests {
         assert_eq!((actual.1, actual.2), expected);
     }
 
+    #[test]
+    fn remote_page_rotation_matches_all_saved_quarter_turns() {
+        let source = Arc::new(remote_page_test_image(3, 2));
+        let original = source.pixels.clone();
+
+        let cases = [
+            (
+                crate::rotation_db::Rotation::None,
+                [3, 2],
+                vec![0, 1, 2, 3, 4, 5],
+            ),
+            (
+                crate::rotation_db::Rotation::Cw90,
+                [2, 3],
+                vec![3, 0, 4, 1, 5, 2],
+            ),
+            (
+                crate::rotation_db::Rotation::Cw180,
+                [3, 2],
+                vec![5, 4, 3, 2, 1, 0],
+            ),
+            (
+                crate::rotation_db::Rotation::Cw270,
+                [2, 3],
+                vec![2, 5, 1, 4, 0, 3],
+            ),
+        ];
+
+        for (rotation, expected_size, expected_indices) in cases {
+            let actual = apply_remote_page_rotation(Arc::clone(&source), rotation);
+            assert_eq!(actual.size, expected_size);
+            assert_eq!(
+                actual.pixels,
+                expected_indices
+                    .into_iter()
+                    .map(|index| original[index])
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn remote_page_rotation_disables_trim_and_separates_composite_cache_entries() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let book = data_dir.path().join("book");
+        std::fs::create_dir_all(&book).unwrap();
+        let page_path = book.join("page.png");
+        std::fs::write(&page_path, remote_ai_test_png(100, 60)).unwrap();
+
+        let view_trim_db =
+            crate::view_trim_db::ViewTrimDb::open_at(&data_dir.path().join("view_trim.db"))
+                .unwrap();
+        view_trim_db
+            .set_book_state(
+                &book,
+                crate::view_trim::ViewTrimBookState {
+                    apply_mode: crate::view_trim::ViewTrimApplyMode::Book,
+                    book_settings: crate::view_trim::ViewTrimBookSettings {
+                        enabled: true,
+                        single: crate::view_trim::ViewTrimMargins {
+                            left: 0.10,
+                            top: 0.20,
+                            right: 0.15,
+                            bottom: 0.05,
+                        },
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap();
+        drop(view_trim_db);
+
+        // A composited page treats every edit database as part of one coherent snapshot.
+        // Create the empty schemas before the worker opens its read-only handles.
+        drop(crate::adjustment_db::AdjustmentDb::open().unwrap());
+        drop(crate::mask_db::MaskDb::open().unwrap());
+        drop(crate::local_adjust_db::LocalAdjustDb::open().unwrap());
+        drop(crate::conceal_db::ConcealDb::open().unwrap());
+        drop(crate::comic_db::ComicDb::open().unwrap());
+        drop(crate::export_crop::CropDb::open().unwrap());
+
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        let address = RemoteAddress::file(page_path.to_string_lossy().into_owned());
+        let resolved = engine.resolve(&address).unwrap();
+        let page_key =
+            crate::edit_source::page_key_for_remote(&resolved.logical, &address.subresource)
+                .unwrap();
+        let rotation_db = crate::rotation_db::RotationDb::open().unwrap();
+        let context = WorkerContext::open();
+        let render = |rotation: crate::rotation_db::Rotation| {
+            rotation_db.set_key(&page_key, rotation).unwrap();
+            match engine.page_with_job_cancel(
+                PageRequest {
+                    job_id: format!("rotation-{}", rotation.degrees()),
+                    display_request_id: Some(format!("display-{}", rotation.degrees())),
+                    address: address.clone(),
+                    target_px: 1024,
+                    priority: PagePriority::Foreground,
+                    render_context: None,
+                    adjustment_preview: None,
+                },
+                &context,
+                Arc::new(AtomicBool::new(false)),
+            ) {
+                PageResponse::Success(payload) => payload,
+                PageResponse::Error(error) => panic!("remote page failed: {error:?}"),
+            }
+        };
+
+        let unrotated = render(crate::rotation_db::Rotation::None);
+        assert_eq!((unrotated.width, unrotated.height), (75, 45));
+        let clockwise = render(crate::rotation_db::Rotation::Cw90);
+        assert_eq!((clockwise.width, clockwise.height), (60, 100));
+        let upside_down = render(crate::rotation_db::Rotation::Cw180);
+        assert_eq!((upside_down.width, upside_down.height), (100, 60));
+        let counterclockwise = render(crate::rotation_db::Rotation::Cw270);
+        assert_eq!((counterclockwise.width, counterclockwise.height), (60, 100));
+
+        let invalid_context = RemotePageRenderContext {
+            context_address: address.clone(),
+            display_slot: RemotePageDisplaySlot::Single,
+            spread_partner: None,
+        };
+        assert!(matches!(
+            engine.remote_view_trim_plan(
+                &address,
+                &resolved,
+                Some(&invalid_context),
+                crate::rotation_db::Rotation::Cw90,
+            ),
+            Err(MediaError {
+                code: MediaErrorCode::BadRequest,
+                ..
+            })
+        ));
+
+        let cache = engine
+            .page_composite_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for rotation in [
+            crate::rotation_db::Rotation::None,
+            crate::rotation_db::Rotation::Cw90,
+            crate::rotation_db::Rotation::Cw180,
+            crate::rotation_db::Rotation::Cw270,
+        ] {
+            assert!(
+                cache
+                    .entries
+                    .iter()
+                    .any(|entry| entry.key.rotation == rotation)
+            );
+        }
+    }
+
     fn auto_trim_test_page(top: usize, bottom: usize) -> egui::ColorImage {
         let mut image = egui::ColorImage::new([200, 200], vec![egui::Color32::WHITE; 200 * 200]);
         for y in top..(200 - bottom) {
@@ -7717,6 +7932,7 @@ mod tests {
                     display_slot: RemotePageDisplaySlot::SpreadLeft,
                     spread_partner: Some(right.clone()),
                 }),
+                crate::rotation_db::Rotation::None,
             )
             .unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -7843,7 +8059,12 @@ mod tests {
         let override_address = favorite_address(&favorite, "book/override.png");
         let override_resolved = engine.resolve(&override_address).unwrap();
         let override_bbox = match engine
-            .remote_view_trim_plan(&override_address, &override_resolved, Some(&context))
+            .remote_view_trim_plan(
+                &override_address,
+                &override_resolved,
+                Some(&context),
+                crate::rotation_db::Rotation::None,
+            )
             .unwrap()
         {
             RemoteViewTrimPlan::Stored(Some(bbox)) => bbox,
@@ -7856,7 +8077,12 @@ mod tests {
         let book_address = favorite_address(&favorite, "book/book.png");
         let book_resolved = engine.resolve(&book_address).unwrap();
         let book_bbox = match engine
-            .remote_view_trim_plan(&book_address, &book_resolved, Some(&context))
+            .remote_view_trim_plan(
+                &book_address,
+                &book_resolved,
+                Some(&context),
+                crate::rotation_db::Rotation::None,
+            )
             .unwrap()
         {
             RemoteViewTrimPlan::Stored(Some(bbox)) => bbox,
@@ -7908,7 +8134,12 @@ mod tests {
         };
         assert!(matches!(
             engine
-                .remote_view_trim_plan(&left, &resolved, Some(&missing_partner))
+                .remote_view_trim_plan(
+                    &left,
+                    &resolved,
+                    Some(&missing_partner),
+                    crate::rotation_db::Rotation::None,
+                )
                 .unwrap(),
             RemoteViewTrimPlan::AutoSingle
         ));
@@ -7920,7 +8151,12 @@ mod tests {
         };
         assert!(matches!(
             engine
-                .remote_view_trim_plan(&left, &resolved, Some(&spread))
+                .remote_view_trim_plan(
+                    &left,
+                    &resolved,
+                    Some(&spread),
+                    crate::rotation_db::Rotation::None,
+                )
                 .unwrap(),
             RemoteViewTrimPlan::AutoSpread {
                 side: crate::view_trim::ViewTrimSpreadSide::Left,
@@ -7935,7 +8171,12 @@ mod tests {
         };
         assert!(matches!(
             engine
-                .remote_view_trim_plan(&left, &resolved, Some(&single))
+                .remote_view_trim_plan(
+                    &left,
+                    &resolved,
+                    Some(&single),
+                    crate::rotation_db::Rotation::None,
+                )
                 .unwrap(),
             RemoteViewTrimPlan::AutoSingle
         ));
@@ -7988,7 +8229,12 @@ mod tests {
                 spread_partner: Some(partner),
             };
             let plan = engine
-                .remote_view_trim_plan(&address, &resolved, Some(&render_context))
+                .remote_view_trim_plan(
+                    &address,
+                    &resolved,
+                    Some(&render_context),
+                    crate::rotation_db::Rotation::None,
+                )
                 .unwrap();
             let cancel = Arc::new(AtomicBool::new(false));
             let loaded = engine
@@ -7997,6 +8243,7 @@ mod tests {
                     &resolved,
                     1024,
                     RemoteImageLoadKind::AutoTrimReference,
+                    crate::rotation_db::Rotation::None,
                     true,
                     &worker,
                     Some(&cancel),
@@ -8228,6 +8475,7 @@ mod tests {
                        mtime: i64,
                        file_size: i64,
                        target_px: u32,
+                       rotation: crate::rotation_db::Rotation,
                        _context: &WorkerContext| {
             let params = render_settings.global_preset.clone();
             let page_key =
@@ -8239,6 +8487,7 @@ mod tests {
                     mtime,
                     file_size,
                     target_px,
+                    rotation,
                     params: params.clone(),
                     lut_entry: None,
                     edit_fingerprint: [0; 32],
@@ -8400,6 +8649,7 @@ mod tests {
             mtime: 1,
             file_size: 2,
             target_px: 1024,
+            rotation: crate::rotation_db::Rotation::None,
             params: crate::adjustment::AdjustParams::default(),
             lut_entry: None,
             edit_fingerprint: [0; 32],

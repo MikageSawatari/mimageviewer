@@ -1384,6 +1384,9 @@ UI の `適用範囲` は enabled な個別行の有無から毎フレーム導�
 100% 原寸で fit 基準として使う。
 bbox 外は描画せず背景色を見せるだけで、
 `export_crop.rs` の切り取り、保存、Ctrl+E エクスポート、補正 / AI キャッシュには影響しない。
+保存済み回転が 0° 以外のページでは `effective_bbox` / `fs_image_fit_bbox` が表示トリムの
+bbox を採用せず、ページ全体を回転して表示する。表示トリムと保存済み回転は同時に成立しないため、
+回転ページ用に bbox の座標系を変換しない。
 見開きの「左右別」切替は値を移行し、連動→左右別では中央側/外側を左右ページへ展開、
 左右別→連動では中央側/外側/上下を平均値へ畳む。`Page` での「左右別」切替は
 本全体設定を書き換えず、各ページ個別行の値と表示側 semantics に反映する。ページ個別値のうち、見開き連動 UI から
@@ -1423,6 +1426,12 @@ mIV Remote のページ描画は protocol v29 で現在の container address、�
 decode / composite cache と同じ source stamp または decode 上限が変わった時に再検出する。同一 size / mtime
 を保った source 差し替えは既存 remote cache と同じ制約を持つ。端末からのモード変更は別段とし、remote は
 設定を書き込まない。
+
+保存済み回転も通常画像 / ZIP entry / PDF page の共通ページキーで解決し、保存済み加工 crop を
+含む最終合成の後、端末用 resize / JPEG encode の前に 0° / 90° / 180° / 270° を適用する。
+ただし回転が 0° 以外なら、上記の本体規則と同じく表示トリム plan を最初から bbox なしにし、
+`Auto` の検出や見開き相手の復号も開始しない。応答寸法とブラウザのレイアウト寸法は回転後を返す。
+回転は合成 cache key に含める一方、raw / Auto 検出 cache は回転前の正準 raster のまま共有する。
 
 本体側だけで表示トリム設定を変更した直後は、端末の `PageResourceCache` と HTTP の
 `private, max-age=60` が既存 JPEG を返し得る。この既存制約は Auto でも同じで、response cache hit
