@@ -51,8 +51,9 @@ static ORT_INIT: OnceLock<Result<ActiveBackend, String>> = OnceLock::new();
 ///      ディレクトリを置く (AddDllDirectory より強力で、フラグなし LoadLibrary も
 ///      対象になる)
 ///   2. PATH 環境変数の先頭追加 — 子プロセスや一部 API 用の保険
-///   3. providers DLL の事前 LoadLibrary — フルパスで明示ロードしておけば
-///      ORT 内部の LoadLibrary は「既にロード済み」として名前解決成功する
+///   3. `onnxruntime_providers_shared.dll` の事前 LoadLibrary — フルパスで明示
+///      ロードしておけば ORT 内部の LoadLibrary は「既にロード済み」として名前解決成功する
+///      (CUDA / TensorRT の provider DLL は対象外。理由は下のコメント参照)
 ///
 /// OnceLock 内から呼ばれるので副作用 (env::set_var) は 1 プロセス 1 回のみ。
 fn prepend_dll_search_path(dir: &std::path::Path) {
@@ -73,14 +74,20 @@ fn prepend_dll_search_path(dir: &std::path::Path) {
             ));
         }
 
-        // (3) 主要な providers DLL を事前にフルパスでロードしておく。
-        //     ORT 内部の LoadLibrary は "もう同名 DLL がロード済み" を見て
-        //     これらを参照できる。
-        let preload_targets = [
-            "onnxruntime_providers_shared.dll",
-            "onnxruntime_providers_cuda.dll",
-            "onnxruntime_providers_tensorrt.dll",
-        ];
+        // (3) provider bridge の実体である providers_shared.dll だけ事前にフルパスで
+        //     ロードしておく。ORT 内部の LoadLibrary は "もう同名 DLL がロード済み" を
+        //     見てこれを参照できる。
+        //
+        //     `onnxruntime_providers_cuda.dll` / `onnxruntime_providers_tensorrt.dll` は
+        //     **ここに足さないこと**。これらは onnxruntime.dll が provider bridge を
+        //     初期化した後にその手順で読ませる前提の DLL で、単独 LoadLibrary すると
+        //     DllMain 内でアクセス違反を起こす。ローダが握って 0x8007045A
+        //     (ERROR_DLL_INIT_FAILED) に変換するのでプロセスは生き延びるが、その裏で
+        //     WER が走るため 1 本あたり数秒を捨てたうえ、Windows のイベントログには
+        //     mimageviewer-core.exe のクラッシュとして記録が残る。2026-04 の PoC で
+        //     3 手段を束にして入れたときの名残で、実際は (1) SetDllDirectoryW と
+        //     (2) PATH 追加だけで TensorRT EP は動く (2026-08 に実測して除去)。
+        let preload_targets = ["onnxruntime_providers_shared.dll"];
         for name in &preload_targets {
             let full = dir.join(name);
             if !full.exists() {
