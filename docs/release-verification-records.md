@@ -12,6 +12,27 @@
 
 ---
 
+## v3.1.0 (2026-08-16)
+
+- **依存**: PDFium `chromium/7988` / FFmpeg `n7.1.5-12-g1fdbca85aa` とも更新なし。DLL の
+  ProductVersion が `vendor/ffmpeg/VERSION` と一致、LGPL 対応ソースの差し替え不要。
+- **idle health**: `static-foreground` / `static-background` とも **PASS**。どちらも測定 15 秒の
+  区間で perf event 0 件 = 完全 sleep。CPU one-core ratio は 0.0052 / 0.0156、perf ログ増加 0 バイト、
+  通常ログ増加 312 / 186 バイト。
+  - `video-pin-background` は**未実施**。`-TargetKey` に渡せる「動画を代表画像に固定した
+    フォルダ」を用意しなかったため。この版はアイドル高画質化の経路に触れていないので waiver。
+    §5.4 (evidence 窓が狭い) が片付けば準備の負担も下がる。
+- **perf smoke**: 6060 フレーム中、間隔 16ms 以上が 137 件 = **16ms 未満が 97.74%**
+  (v2.9.1 の 97.7% と同等)。100ms 超は 28 件で、内訳は `action: none` (入力待ちで就寝) 5、
+  `request_repaint_after_idle_upgrade` (予定どおりの遅延起床) 5、`request_repaint_after_ai_upscale` 4、
+  `request_repaint` 13、起動直後 1。
+  - `request_repaint` の 13 件は全て t=15〜21 秒のフルスクリーン中。`fullscreen_viewport_ms`
+    98〜133ms / `background_polls_ms` 26〜68ms に対し、**描画クロージャ本体
+    (`fs_viewport_breakdown` の `central_ms` / `closure_ms`) は 1ms 前後**。時間は viewport の
+    present とバックグラウンド結果の取り込み (テクスチャアップロード) にあり、AI アップスケール中の
+    設計どおりのコスト。UI スレッド同期 I/O の追加ではない。
+- **検索 bench**: 全文索引に触れていないため未実施。
+
 ## v2.13.0 (2026-08-11)
 
 - **依存**: PDFium `chromium/7988` / FFmpeg `n7.1.5-12-g1fdbca85aa` とも最新で更新なし。

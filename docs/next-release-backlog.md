@@ -220,7 +220,11 @@
     トランスコードを**UI スレッド外**で回すもので、**窓の所有関係にも同期メッセージにも
     手を出さない**。§1.31 の露出面を新たに増やさない。
   - その §1.30 も revert 後は再現していない (上記のとおり保留)。
-- **ただし観測の穴だけは v3.0.0 の前に埋める (Small)**。§1.30 のとき
+- **観測の穴は解消済み (v3.0.0 前)**。`ui_heartbeat_should_stay_active_while_hidden`
+  ([app.rs](../src/app.rs)) が keep-alive の述語に **mounted media session** (フルスクリーンの
+  動画 / 音声、動画→音声モード、`FsCacheEntry::Video`) を含めるようになり、ネイティブ動画
+  フルスクリーン中に main HWND が隠れても watchdog が armed のままになる。以下は当時の記録。
+- ~~ただし観測の穴だけは v3.0.0 の前に埋める (Small)~~。§1.30 のとき
   `ui-heartbeat-watchdog` は生きていたのに `panic.log` へ何も残らなかった。
   [app.rs:62646 付近](../src/app.rs:62646) を見ると、main HWND が不可視になった時点で
   watchdog を suspend し、**例外は `viewer_session_is_detached_or_switching()` だけ**。
@@ -229,8 +233,8 @@
   これだけ入れておけば、次に野生で固まったときにログが残る。
 - 構造修正 (wndproc 即 return / 単一 render state / nonblocking acquire) 自体は、
   v3.0.0 の後に単独で着手する。
-- 規模 / 優先度: 構造修正 = Large / **P1 candidate (基盤、v3.0.0 後)**、
-  watchdog の穴 = Small / **P2 (v3.0.0 前)**。
+- 規模 / 優先度: **残るのは構造修正だけ = Large / P1 candidate (基盤)**。
+  watchdog の穴 (Small / P2) は上記のとおり解消済み。
 
 ### 1.35 リネーム移行ジャーナルの永続化 2 件
 
