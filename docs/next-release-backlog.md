@@ -238,6 +238,8 @@
   [codex-texture-delivery-test-brief.md](briefs/codex-texture-delivery-test-brief.md) §0。
   §1.31 は frame drop を通常経路にするので、その経路の delta 配送を先に契約化する。
   **§1.86 は障害影響としては P3 のままだが、本項の依存関係上は必須前提**として扱う。
+- **前提充足 (2026-08-16)**: §1.86 の単一 delta transaction owner と non-submit outcome の
+  finalization 契約が完成。§1.31 本体は未着手で、通常 frame drop はこの契約へ新 outcome を足す。
 - **設計時に確定すべき点 (2026-08-16 に追加で判明したもの)**:
   - **`WM_PAINT` 内の同期 `RedrawRequested` だけでは足りない**。Windows の resize では
     [eframe run.rs:121](../vendor/eframe/src/native/run.rs:121) が `RepaintNow` を受けて
@@ -971,6 +973,15 @@
   - **exit 3/4 へ同じ `free` ループをコピーするだけの修正は、「構造的修正」の合意対象外**
     (2026-08-16、ClaudeCode / Codex Sol)。所有構造 (配送責任が各 return に分散している) を
     直さず症状だけ消すため。
+- **2026-08-16: 完了**。
+  - `begin_delivery` が render state 有りなら surface lookup 前に `set` をちょうど一度適用し、
+    inner paint は `RenderStateAbsent` / `SurfaceAbsent` / `SurfaceRecreated` / `Skipped` /
+    `Submitted` の typed `PaintOutcome` へ合流する。no-paint 経路も同じ owner を使う。
+  - `finish_delivery` が唯一の `free` 適用箇所。非 submit outcome は labeled inner block の
+    encoder / command buffer drop 後、`Submitted` は `queue.submit` 後に finalizer へ到達する。
+  - 実 driver error は注入せず、小さい acquire classifier seam で `RecreateSurface` / `SkipFrame`
+    を分類し、両 outcome で seed texture が消えることを `Renderer::texture()` で検査した。
+    §1.85-A の no-surface test は無修正で維持する。
 - 規模 / 優先度: 小 / P3 (障害影響)。**ただし §1.31 の必須前提**。
 
 ### 1.84 表示キャッシュに item-context 世代の刻印が無い (latent、ABA 危険)
