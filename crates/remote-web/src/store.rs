@@ -428,13 +428,15 @@ impl Library {
 
     fn snapshot(
         &self,
-        include_view_trim: bool,
+        include_page_display_state: bool,
     ) -> Result<(Arc<LibrarySnapshot>, String), StoreError> {
         let mut state = self.state.lock().map_err(|_| StoreError::BadRequest)?;
         let mut changed = refresh_settings_snapshot(&mut state, self.settings_path.as_deref())?;
-        if include_view_trim {
+        if include_page_display_state {
             changed |=
                 refresh_observed_database(&mut state.view_trim, self.view_trim_path.as_deref())?;
+            changed |=
+                refresh_observed_database(&mut state.rotation, self.rotation_path.as_deref())?;
         }
         if changed {
             state.generation_counter = state.generation_counter.saturating_add(1);
@@ -975,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn one_generation_observes_favorites_and_view_trim_but_ignores_unrelated_settings() {
+    fn one_generation_observes_favorites_view_trim_and_rotation_but_ignores_unrelated_settings() {
         let temp = tempfile::tempdir().unwrap();
         let data_dir = temp.path();
         let settings_path = data_dir.join("settings.db");
@@ -1014,6 +1016,18 @@ mod tests {
             .execute_batch(
                 "PRAGMA journal_mode=WAL;
                  CREATE TABLE view_trim_state (value INTEGER NOT NULL);",
+            )
+            .unwrap();
+
+        let rotation_path = data_dir.join("rotation.db");
+        let rotation_writer = Connection::open(&rotation_path).unwrap();
+        rotation_writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE rotations (
+                    path TEXT PRIMARY KEY,
+                    angle INTEGER NOT NULL
+                 );",
             )
             .unwrap();
 
@@ -1056,5 +1070,14 @@ mod tests {
             .unwrap();
         let after_favorite = library.remote_state().unwrap().remote_state_generation;
         assert_ne!(after_favorite, after_trim);
+
+        rotation_writer
+            .execute(
+                "INSERT INTO rotations (path, angle) VALUES (?1, 90)",
+                [rotation_page_key(&data_dir.join("page.jpg"))],
+            )
+            .unwrap();
+        let after_rotation = library.remote_state().unwrap().remote_state_generation;
+        assert_ne!(after_rotation, after_favorite);
     }
 }

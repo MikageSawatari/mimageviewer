@@ -95,6 +95,27 @@ test("the shell registers a root-scoped service worker without script caching", 
   );
 });
 
+test("legacy image URLs include the remote state generation", async () => {
+  const app = await readFile(new URL("app.js", here), "utf8");
+  const imageRequest = app.slice(
+    app.indexOf("function imageRequest("),
+    app.indexOf("\nfunction imageInfo(")
+  );
+  const imageInfo = app.slice(
+    app.indexOf("function imageInfo("),
+    app.indexOf("\nfunction mediaImageInfoKey(")
+  );
+
+  assert.match(
+    imageRequest,
+    /apiUrl\("\/api\/image",\s*\{[\s\S]*generation:\s*state\.remoteStateGeneration/
+  );
+  assert.match(
+    imageInfo,
+    /apiJson\("\/api\/image-info",\s*\{[\s\S]*generation:\s*state\.remoteStateGeneration/
+  );
+});
+
 test("the startup path never touches a singleton declared after boot runs", async () => {
   const app = await readFile(new URL("app.js", here), "utf8");
   const bootBlock = app.indexOf("if (!RUNTIME_TEST_MODE) {");

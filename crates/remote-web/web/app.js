@@ -1720,9 +1720,10 @@ export function applyRemoteSessionId(
   state.imageInfoCache.clear();
   state.containerImageInfoHints.clear();
   if (next) {
-    // Remote ownership is exclusive: core settings can change only while the remote does not
-    // own control. Every core-side change therefore crosses a disconnect and a new acquisition,
-    // making acquisition the complete refresh signal. Do not move this back to generation.
+    // Remote ownership is exclusive: core home/collection settings can change only while the
+    // remote does not own control. Those changes therefore cross a disconnect and a new
+    // acquisition, making acquisition the complete home refresh signal. Per-page display DBs
+    // that alter returned pixels remain covered separately by remoteStateGeneration.
     refreshHomeData();
   }
 }
@@ -6943,6 +6944,7 @@ function imageRequest(
       path: entry.path,
       w: resolvedLayout.requestWidth,
       epoch: state.remoteSessionCacheEpoch,
+      generation: state.remoteStateGeneration,
     }),
     width: resolvedLayout.requestWidth,
     cssWidth: resolvedLayout.cssWidth,
@@ -6970,6 +6972,7 @@ function imageInfo(entry) {
     const pending = apiJson("/api/image-info", {
       path,
       epoch: state.remoteSessionCacheEpoch,
+      generation: state.remoteStateGeneration,
     }).catch(
       (error) => {
         state.imageInfoCache.delete(key);

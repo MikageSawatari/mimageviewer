@@ -1404,12 +1404,13 @@ video_viewer_entry_rejected が 0 件でも、その手前のどの route が実
 > | 変化の出どころ | 検知 | 根拠 |
 > | --- | --- | --- |
 > | **本体側の変更** (設定・お気に入り・スマートフォルダ定義・「場所▼に出す項目」) | **セッション取得**。取得時に端末 cache を破棄し、home 画面のデータを取り直す | 排他により、本体はリモートが操作権を持つ間は変更できない (§2.2)。つまり本体側の変更は必ず切断を挟み、再取得を通る。**セッション取得は完全な信号であり、近似ではない** |
+> | **返す画像を変える per-page 表示 DB** (表示トリム・回転) | **`remote_state_generation`** | 同じ generation から異なる画素を返さない契約を守るため、writer にかかわらず DB の版変更を観測する |
 > | **セッション中に起きる変化** (リモート自身の書き込み = トリム・レーティング・見開き等) | **`remote_state_generation`** | 同一セッション内で起きるため、セッション取得では拾えない |
 >
-> **本体側の変更を generation で拾おうとしないこと。** generation は
-> favorites / view-trim の内容差分で進むので、`show_location_*` やスマートフォルダ定義の
-> 変更では進まない。ここへ項目を足していく方向で直すと、次に増えた設定でまた漏れる。
-> セッション取得を入口にすれば、本体側で何が変わっても一律に読み直せる。
+> **home / collection に関する本体側設定を generation で拾おうとしないこと。** generation は
+> favorites と、返す画像を変える view-trim / rotation の版で進むが、`show_location_*` や
+> スマートフォルダ定義の変更では進まない。ここへ home 設定を足していく方向で直すと、次に増えた
+> 設定でまた漏れる。セッション取得を入口にすれば、home 側は本体で何が変わっても一律に読み直せる。
 >
 > この分担は [briefs/codex-remote-session-epoch-addendum.md](briefs/codex-remote-session-epoch-addendum.md)
 > 「セッションを版の正本にする / 切断されたら明示的に再接続するまで止まる」で確定した。
@@ -1417,12 +1418,12 @@ video_viewer_entry_rejected が 0 件でも、その手前のどの route が実
 
 以下は generation 側 (セッション中の変化) の仕様である。
 
-本体が正本である favorites と view-trim の更新は、remote-web が持つ 1 個の
+本体が正本である favorites、view-trim、rotation の更新は、remote-web が持つ 1 個の
 `remote_state_generation` で端末へ公開する。値は remote-web 起動ごとの乱数 prefix と単調 counter
-から成り、`settings.db` と `view_trim.db` の専用 read-only connection で
+から成り、`settings.db`、`view_trim.db`、`rotation.db` の専用 read-only connection で
 `PRAGMA data_version` を観測する。settings の版が変わった場合だけ favorites を全件再読込し、内容が
-同一なら generation を進めない。view-trim の版変更と favorites の追加・削除・改名・並べ替えは同じ
-generation を進める。
+同一なら generation を進めない。view-trim / rotation の版変更と favorites の追加・削除・改名・
+並べ替えは同じ generation を進める。
 
 端末は session acquire / ping の応答で同じ generation を受け取る。ブラウザの全 command は既存の
 「後から操作した owner が勝つ」規則により active 中も acquire を先に送るため、ページ送りはこの既存
@@ -1444,9 +1445,10 @@ hit 時点の最新性そのものは証明しない。現在版は先行する 
 session と既存表示を保ったまま、次の acquire / ping / page request が一度も発生しない間は表示中画像を
 自発更新しない、という採用済みの鮮度境界は残る。
 
-**ここで「本体 DB だけが変わる」場合を数えないこと。** 本体はリモートが操作権を持つ間は変更できない
-(§2.2)。本体側の変更は必ず切断を挟むので、この鮮度境界の対象は**セッション中にリモート自身が
-起こした変化**に限られる。本体側の変更は冒頭の表のとおりセッション取得で拾う。
+**ここで一般の本体設定 DB 変更を数えないこと。** 本体はリモートが操作権を持つ間は変更できない
+(§2.2)。home / collection に関する本体側の変更は必ず切断を挟むので、冒頭の表のとおりセッション
+取得で拾う。例外は同じ generation から返す画素を変える view-trim / rotation であり、これらは
+writer にかかわらず generation の監視対象にする。
 
 favorites の `data_version` 観測はホームの「お気に入り」一覧と remote state generation の更新にだけ
 使う。お気に入りの追加・削除・名称変更は入口表示へ即時反映するが、path のアクセス可否は変えない。
@@ -2685,7 +2687,7 @@ Rust 1.94.1 の標準ライブラリ実装も確認した。`stdout().lock()` �
 
 最終合成 cache key には `Rotation` を含め、同じ source stamp / target_px / 補正でも異なる回転結果を
 共有しない。raw decode、Auto bbox、AI native result は回転前の正準 raster のまま共有する。
-回転 DB は remote state generation の監視対象へ追加しない。本体操作がロックされる remote session 中に
-回転は変化せず、session 再取得時は既存の session cache epoch がブラウザの page resource key と URL を
-更新するためである。これにより HTTP の private cache と `PageResourceCache` も前 session の画像を
-再利用しない。
+回転 DB は view-trim と同じ per-page 表示状態として remote state generation の監視対象に含める。
+回転変更後も同じ generation から異なる画素を返さないよう、`/api/page` の resource key に加え、
+集約コレクションが使う旧 `/api/image` / `/api/image-info` の URL にも generation を含める。
+session 再取得時の session cache epoch による HTTP cache 分離も従来どおり併用する。
