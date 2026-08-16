@@ -132,8 +132,7 @@ pub(crate) fn should_prefetch_final_effect(
 /// 先読み対象を距離順・forward 先で交互配置: +1, -1, +2, -2, +3, -3, …
 /// 同距離の組では forward (次ページ方向) が先。片側が尽きたら反対側だけ続く。
 /// fs_cache / AI アップスケール / サムネイルグリッド の全先読みで方針統一。
-pub(crate) fn interleaved_prefetch_targets(
-    image_indices: &[usize],
+pub(crate) fn interleaved_prefetch_positions(
     pos: usize,
     n: usize,
     pf_forward: usize,
@@ -145,17 +144,31 @@ pub(crate) fn interleaved_prefetch_targets(
         if d <= pf_forward {
             if let Some(p) = pos.checked_add(d) {
                 if p < n {
-                    out.push(image_indices[p]);
+                    out.push(p);
                 }
             }
         }
         if d <= pf_back {
             if let Some(p) = pos.checked_sub(d) {
-                out.push(image_indices[p]);
+                out.push(p);
             }
         }
     }
     out
+}
+
+/// 表示順の位置で選んだ先読み対象を raw item index へ引き直す。
+pub(crate) fn interleaved_prefetch_targets(
+    image_indices: &[usize],
+    pos: usize,
+    n: usize,
+    pf_forward: usize,
+    pf_back: usize,
+) -> Vec<usize> {
+    interleaved_prefetch_positions(pos, n, pf_forward, pf_back)
+        .into_iter()
+        .map(|position| image_indices[position])
+        .collect()
 }
 
 /// フルスクリーンの AI 先読み表示で使うページ単位の状態。
@@ -248,11 +261,11 @@ fn summarize_fs_prefetch_states(states: &[FsPrefetchPageState]) -> Vec<FsPrefetc
     .collect()
 }
 
-/// AI 先読み対象を現在ページの前後へ分け、リモート表示と同じ遠近順に整える。
+/// AI 先読み対象を表示順で現在ページの前後へ分け、リモート表示と同じ遠近順に整える。
 ///
 /// 対象なし、現在ページ自身の AI 処理中、全対象の取得完了時は、従来どおり表示しない。
 pub(crate) fn build_fs_prefetch_indicator(
-    current_idx: usize,
+    current_pos: usize,
     current_busy: bool,
     pages: impl IntoIterator<Item = (usize, FsPrefetchPageState)>,
 ) -> Option<FsPrefetchIndicator> {
@@ -262,10 +275,10 @@ pub(crate) fn build_fs_prefetch_indicator(
     let mut active_count = 0;
     let mut missing_count = 0;
 
-    for (idx, state) in pages {
-        match idx.cmp(&current_idx) {
-            std::cmp::Ordering::Less => behind.push((idx, state)),
-            std::cmp::Ordering::Greater => ahead.push((idx, state)),
+    for (pos, state) in pages {
+        match pos.cmp(&current_pos) {
+            std::cmp::Ordering::Less => behind.push((pos, state)),
+            std::cmp::Ordering::Greater => ahead.push((pos, state)),
             std::cmp::Ordering::Equal => continue,
         }
         match state {
@@ -279,9 +292,9 @@ pub(crate) fn build_fs_prefetch_indicator(
         return None;
     }
 
-    // item idx は表示順に増える。behind は昇順で遠い→近い、ahead は昇順で近い→遠い。
-    behind.sort_unstable_by_key(|(idx, _)| *idx);
-    ahead.sort_unstable_by_key(|(idx, _)| *idx);
+    // 表示順の位置は単調に増える。behind は昇順で遠い→近い、ahead は昇順で近い→遠い。
+    behind.sort_unstable_by_key(|(pos, _)| *pos);
+    ahead.sort_unstable_by_key(|(pos, _)| *pos);
 
     if current_busy || active_count + missing_count == 0 {
         return None;

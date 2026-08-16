@@ -2061,6 +2061,20 @@ fn interleaved_prefetch_targets_boundary_cases() {
 }
 
 #[test]
+fn interleaved_prefetch_positions_handle_display_boundaries() {
+    assert_eq!(
+        interleaved_prefetch_positions(0, 4, 2, 2),
+        vec![1, 2],
+        "表示先頭では forward 側の位置だけを近い順に返す"
+    );
+    assert_eq!(
+        interleaved_prefetch_positions(3, 4, 2, 2),
+        vec![2, 1],
+        "表示末尾では back 側の位置だけを近い順に返す"
+    );
+}
+
+#[test]
 fn fs_prefetch_page_state_distinguishes_ready_active_and_missing() {
     assert_eq!(
         fs_prefetch_page_state(true, false),
@@ -2114,6 +2128,54 @@ fn fs_prefetch_indicator_separates_directions_orders_distance_and_counts_states(
     assert_eq!(
         indicator.tooltip_text(),
         "先読み: 取得済み 2 / 取得中 1 / 未取得 2"
+    );
+}
+
+#[test]
+fn fs_prefetch_indicator_uses_display_positions_for_non_monotonic_item_order() {
+    use FsPrefetchPageState::{Active, Missing, Ready};
+
+    let indicator = build_fs_prefetch_indicator(1, false, [(2, Missing), (0, Ready), (3, Active)])
+        .expect("non-monotonic raw indices still have unfinished display-order targets");
+
+    assert_eq!(indicator.behind, vec![Ready]);
+    assert_eq!(indicator.ahead, vec![Missing, Active]);
+}
+
+#[test]
+fn details_order_drives_ai_prefetch_targets_and_indicator_directions() {
+    let mut app = phase_c_support::setup_app();
+    app.items = (0..6)
+        .map(|idx| GridItem::Image(PathBuf::from(format!("C:/details/{idx}.jpg"))))
+        .collect();
+    app.visible_indices = (0..6).collect();
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.details_order = vec![5, 4, 3, 2, 1, 0];
+    app.settings.ai_upscale_prefetch_forward = 2;
+    app.settings.ai_upscale_prefetch_back = 1;
+
+    let targets = app.ai_prefetch_targets(4);
+    let targets_with_positions = targets
+        .iter()
+        .map(|&idx| {
+            (
+                app.current_grid_order()
+                    .iter()
+                    .position(|&candidate| candidate == idx)
+                    .unwrap(),
+                idx,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(targets_with_positions, vec![(2, 3), (0, 5), (3, 2)]);
+
+    let indicator = app
+        .final_ai_prefetch_indicator(4)
+        .expect("missing prefetch pages should keep the indicator visible");
+    assert_eq!(indicator.behind, vec![FsPrefetchPageState::Missing]);
+    assert_eq!(
+        indicator.ahead,
+        vec![FsPrefetchPageState::Missing, FsPrefetchPageState::Missing]
     );
 }
 

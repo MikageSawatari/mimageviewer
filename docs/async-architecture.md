@@ -144,7 +144,9 @@ foreground は前景待機者がいる間その共有通信を cancel しない�
 距離計算は可視範囲の端からの歩数: backward は `scroll_hint - idx`, forward は `idx - visible_end + 1`
 で、同距離では forward (次ページ方向) が先。これは `fs_cache` 先読み / AI アップスケール先読み /
 サムネイルグリッドワーカーの全てで統一されており、`+1, -1, +2, -2, ...` の順 (forward 先) となる
-(共通ヘルパ: `interleaved_prefetch_targets`)。
+(共通ヘルパ: 表示順の位置を返す `interleaved_prefetch_positions` と、それを raw item index へ
+引き直す `interleaved_prefetch_targets`)。詳細表示の並べ替え中も前後方向は raw item index の
+大小ではなく表示順の位置で決める。
 
 ### 2.4 GlobalIoSemaphore (I/O 横断調停)
 

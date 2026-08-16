@@ -163,7 +163,7 @@ pub(crate) use prefetch_policy::{
     AllowReason, FinalEffectPrefetchAdmission, FsPrefetchIndicator, FsPrefetchPageState,
     FsPrefetchSideDisplay, PREFETCH_BACKSTOP, PREFETCH_IDLE_THRESHOLD, PrefetchDecision,
     build_fs_prefetch_indicator, decide_prefetch_allowed, fs_prefetch_page_state,
-    interleaved_prefetch_targets, should_prefetch_final_effect,
+    interleaved_prefetch_positions, interleaved_prefetch_targets, should_prefetch_final_effect,
 };
 #[cfg(test)]
 pub(crate) use prefetch_policy::{BlockReason, FsPrefetchStateCount};
@@ -51528,23 +51528,31 @@ impl App {
     /// (= None)。現在ページの AI 処理が走っている間 (= `current_busy`) は表示を
     /// 隠して「AI 処理中」ラベルだけ見せる。
     pub(crate) fn final_ai_prefetch_indicator(&self, fs_idx: usize) -> Option<FsPrefetchIndicator> {
-        let targets = self.ai_prefetch_targets(fs_idx);
+        let image_indices = self.collect_image_indices();
+        let current_pos = image_indices.iter().position(|&idx| idx == fs_idx)?;
+        let target_positions = interleaved_prefetch_positions(
+            current_pos,
+            image_indices.len(),
+            self.settings.ai_upscale_prefetch_forward,
+            self.settings.ai_upscale_prefetch_back,
+        );
         let active_indices: std::collections::HashSet<usize> = self
             .final_ai_pending
             .keys()
             .map(|key| key.edit_key.idx)
             .collect();
         let current_busy = active_indices.contains(&fs_idx);
-        let pages = targets.into_iter().map(|idx| {
+        let pages = target_positions.into_iter().map(|pos| {
+            let idx = image_indices[pos];
             (
-                idx,
+                pos,
                 fs_prefetch_page_state(
                     self.is_idx_final_ai_done_or_skipped(idx),
                     active_indices.contains(&idx),
                 ),
             )
         });
-        build_fs_prefetch_indicator(fs_idx, current_busy, pages)
+        build_fs_prefetch_indicator(current_pos, current_busy, pages)
     }
 
     fn record_final_effect_prefetch_admission(
