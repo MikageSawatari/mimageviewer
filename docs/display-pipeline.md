@@ -887,7 +887,8 @@ fs_load ワーカーが `clamp_dynamic_for_gpu` を掛ける直前に記録し�
 常に source 解像度・補正前の空間を保つ:
 
 ```
-0. 元画像表示の割り当てをホールド中 (既定は右 Ctrl。fs_cache の raw decode)
+0. 静止中に元画像表示の割り当てをホールド中
+   (既定は右 Ctrl。fs_cache の raw decode。ナビゲーションシーケンス進行中は適用しない)
 1. erase / local_adjust / conceal の編集中プレビュー (各 UI の in-memory state)
 2. final_composite_cache[edit_key, params_hash, bg]
    (= edit_result_cache + 色調補正 + final AI + スマートシャープ + カラー化
@@ -995,6 +996,9 @@ conceal は erase / raw を入力にして先へ合成せず `None` を返し、
 `FsOriginalPreviewHold` の元画像プレビューは例外的な一時表示で、派生キャッシュは作り直さない。
 通常の画像 / ZIP 内画像 / PDF ページだけを対象にし、動画には適用しない。表示元は常に
 `fs_cache` の生デコード結果で、補正 / AI / 消しゴム / 隠蔽の派生キャッシュは参照しない。
+ナビゲーションシーケンスが `blocks_new_target()` の間は画面を所有するのが前の表示単位の
+holdover で、現ページ自体が出ていないため、元画像ホールドを適用しない。これは割り当てた
+修飾キーや chord との一致ではなく typed sequence の進行状態だけで決め、時間窓は使わない。
 補正レイヤーの派生キャッシュも同様に参照しない。ただし補正レイヤーモード中の
 `Ctrl+Shift` は「選択レイヤーをバイパスし他レイヤーを全て適用したプレビュー」に割り当てるため、
 元画像プレビューはこの組み合わせを捕まえず、`resolve_fs_processed_texture` の
@@ -1971,12 +1975,13 @@ previous に属するなら提示とは数えない。
 あり、見開き片側だけを提示済みと数えることはない。
 
 target の `materialized_ready` は、その frame の描画 resolver が実際に選ぶ source に対して評価する。
-`fs_display_bypasses_final_pipeline` が true の元画像表示 / 分析モードでは target 全ページの raw
-`fs_cache` (`resolve_original_preview_tex`) が解決したときだけ ready とし、AI・カラー化済み final の
-完成は要求しない。false の通常表示は従来どおり加工済み source を要求し、raw があるだけでは ready
-にしない。元画像も無ければ `Awaiting` を維持する。見開きはどちらの source でも全ページの `all`
-判定を保ち、片側だけで ready にしない。元画像表示の OS キー状態は frame ごとに一度だけ sample し、
-producer gate / readiness / draw が同じ値を共有する。
+`fs_display_bypasses_final_pipeline` が true の分析モード、またはナビゲーションシーケンスが
+`blocks_new_target()` でなく元画像表示が成立する frame では、target 全ページの raw `fs_cache`
+(`resolve_original_preview_tex`) が解決したときだけ ready とし、AI・カラー化済み final の完成は
+要求しない。false の通常表示は従来どおり加工済み source を要求し、raw があるだけでは ready にしない。
+raw source を選ぶ frame で元画像も無ければ `Awaiting` を維持する。見開きはどちらの source でも
+全ページの `all` 判定を保ち、片側だけで ready にしない。元画像表示の OS キー状態は frame ごとに
+一度だけ sample し、producer gate / readiness / draw が同じ値を共有する。
 
 通過 rendition の外側の**ページ矩形**は、低解像度 texture の整数寸法ではなく source/header 寸法
 から求める。PDF は thumbnail / fullscreen の各 raster 寸法が別々に整数丸めされるため、PDFium が

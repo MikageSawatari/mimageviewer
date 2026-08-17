@@ -96,6 +96,14 @@ keymap 対象にする。`Esc` / 修飾なし矢印ナビゲーション、Ctrl+
 (キャプチャパレット / コマ送り UI を出さない)。`[Rating]` グループは静止画・動画と同じく
 音楽ビューでも使える。左右パネル表示モードの <kbd>I</kbd> / <kbd>Tab</kbd> は 3 面で同じ
 `FsToggleMetadata` を使い、native 動画も effective chord を App 側へ転送する。
+
+音声モードから戻る `VideoToggleAudioMode` の診断計装は、調査対象の
+`action_peek` / Win32 viewport Z / 全 viewport Z / egui Z の成否だけをログ候補の
+抑制条件にしてはならない。`[fs-key]` と同じ `fullscreen_shortcut_event_summary` が
+`Z:down` を報告した frame も候補にし、さらに音声モード中は理由や Z 観測の有無に関係なく
+最低 1 秒に 1 行を出す。停止中に通常 repaint が無くても heartbeat 時刻の repaint を予約する。
+調査中の信号が全て false でも診断自体が黙らないことを不変条件とする。
+
 Windows の egui 経路では、KeySlot でショートカットを所有した押下を egui event queue からも
 同時に除去する。ただし egui 0.33 は UI 実行前の `begin_pass` で <kbd>Tab</kbd> から focus
 方向を確定するため、event 除去だけでは traversal を止められない。各 egui Context に登録した
@@ -356,7 +364,7 @@ modifiers はイベント発生時点の情報として残し、離散ショー�
 | マウスホイール | 画像上ではズーム。スクロール可能なツールパネル上ではパネルスクロールを優先 |
 | <kbd>Ctrl</kbd>+マウスホイール | ズーム。ツールパネル上でも同じ |
 | ホイール押し込み+上下ドラッグ | 中ボタンドラッグズーム。パネル上で開始した場合は無視 |
-| 元画像表示の割り当て (既定: 右 <kbd>Ctrl</kbd>) を押しっぱなし | 元画像表示。補正 / AI / 消しゴム / 補正レイヤー / 隠蔽 / 注釈を一時的に外す。Action: `FsOriginalPreviewHold`。補正レイヤーの <kbd>Ctrl</kbd>+<kbd>Shift</kbd> は選択レイヤーバイパス表示を優先 |
+| 元画像表示の割り当て (既定: 右 <kbd>Ctrl</kbd>) を押しっぱなし | 静止中は元画像表示。補正 / AI / 消しゴム / 補正レイヤー / 隠蔽 / 注釈を一時的に外す。ナビゲーションシーケンス進行中は前の表示単位の holdover が画面を所有して現ページが出ていないため、元画像ホールドを適用しない。Action: `FsOriginalPreviewHold`。補正レイヤーの <kbd>Ctrl</kbd>+<kbd>Shift</kbd> は選択レイヤーバイパス表示を優先 |
 
 ## ゲームパッド操作
 
@@ -460,7 +468,7 @@ snapshot として一方向 publish し、App から presenter Context を直接
 |---|---|---|
 | <kbd>Shift</kbd> | `FsLoupeHold` | 押している間だけルーペを表示する。360 度パノラマモード中とテキスト注釈モード中は表示しない |
 | <kbd>Alt</kbd> | `FsNavigatorHold` | 固定表示が OFF でも、押している間だけナビゲータを表示する。ナビゲータ上でドラッグを始めた後は、修飾キーを離してもドラッグ終了まで表示を保つ |
-| 右 <kbd>Ctrl</kbd> | `FsOriginalPreviewHold` | 押している間だけ、補正 / AI / 消しゴム / 補正レイヤー / 隠蔽 / 注釈を外した元画像を表示する |
+| 右 <kbd>Ctrl</kbd> | `FsOriginalPreviewHold` | 静止中に押している間だけ、補正 / AI / 消しゴム / 補正レイヤー / 隠蔽 / 注釈を外した元画像を表示する。ナビゲーションシーケンス進行中は適用しない |
 
 3 操作とも同じ `ModifierHold` の仕組みを使い、操作カスタマイズで修飾キーを変更または割り当て解除できる。
 `Ctrl` / `Shift` / `Alt` は左右どちら側でも成立し、`RightCtrl` / `RightShift` /

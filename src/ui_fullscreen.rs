@@ -131,11 +131,18 @@ struct VideoAudioExitKeyDiagnosticInputs {
 
 #[cfg(windows)]
 impl VideoAudioExitKeyDiagnosticInputs {
+    fn fullscreen_summary_saw_z_down(&self) -> bool {
+        self.fullscreen_summary
+            .as_deref()
+            .is_some_and(|summary| summary.split(',').any(|event| event.starts_with("Z:down:")))
+    }
+
     fn saw_z_or_action_press(&self) -> bool {
         self.action_peek
             || self.z_press.win32_viewport_key_down
             || self.z_press.win32_any_key_down_source.is_some()
             || self.z_press.egui_key_down
+            || self.fullscreen_summary_saw_z_down()
     }
 }
 
@@ -152,7 +159,6 @@ struct VideoAudioExitKeyDiagnosticRateState {
     last_observed_outcome: Option<VideoAudioExitKeyOutcome>,
     last_observed_target: Option<(usize, Option<usize>)>,
     last_emitted_at: Option<std::time::Instant>,
-    last_seen_at: Option<std::time::Instant>,
     pending: Option<VideoAudioExitKeyDiagnosticRecord>,
 }
 
@@ -161,7 +167,6 @@ impl VideoAudioExitKeyDiagnosticRateState {
     fn reset_session(&mut self) {
         self.last_observed_outcome = None;
         self.last_observed_target = None;
-        self.last_seen_at = None;
         self.pending = None;
     }
 
@@ -170,26 +175,23 @@ impl VideoAudioExitKeyDiagnosticRateState {
         now: std::time::Instant,
         record: VideoAudioExitKeyDiagnosticRecord,
     ) -> Option<VideoAudioExitKeyDiagnosticRecord> {
-        if self.last_seen_at.is_some_and(|last_seen| {
-            now.saturating_duration_since(last_seen) >= VIDEO_AUDIO_EXIT_DIAGNOSTIC_MIN_INTERVAL
-        }) {
-            self.last_observed_outcome = None;
-            self.last_observed_target = None;
-            self.pending = None;
-        }
-        self.last_seen_at = Some(now);
-
         let outcome_changed = self.last_observed_outcome != Some(record.outcome);
         let target = (record.inputs.fs_idx, record.inputs.video_audio_mode);
         let target_changed = self.last_observed_target != Some(target);
         self.last_observed_outcome = Some(record.outcome);
         self.last_observed_target = Some(target);
+
+        // A diagnostic must not make eligibility depend only on the probes whose failure it is
+        // investigating. That already made this path silent twice: first when every record was
+        // gated by action_peek, then when these four Z probes alone selected candidates. The
+        // independently produced fullscreen summary is also a candidate source, and the timed
+        // emission below is an unconditional heartbeat while audio mode keeps calling observe.
         if outcome_changed || target_changed || record.inputs.saw_z_or_action_press() {
             let replace_pending = self.pending.as_ref().is_none_or(|pending| {
                 !pending.inputs.saw_z_or_action_press() && record.inputs.saw_z_or_action_press()
             });
             if replace_pending {
-                self.pending = Some(record);
+                self.pending = Some(record.clone());
             }
         }
 
@@ -197,11 +199,9 @@ impl VideoAudioExitKeyDiagnosticRateState {
             now.saturating_duration_since(last_emitted) >= VIDEO_AUDIO_EXIT_DIAGNOSTIC_MIN_INTERVAL
         });
         if interval_elapsed {
-            let ready = self.pending.take();
-            if ready.is_some() {
-                self.last_emitted_at = Some(now);
-            }
-            ready
+            let ready = self.pending.take().unwrap_or(record);
+            self.last_emitted_at = Some(now);
+            Some(ready)
         } else {
             None
         }
@@ -5198,6 +5198,14 @@ impl App {
         // 「ワイプを保ったまま両側を元画像にする」形にするなら §1.79 を実装する。
         // その場合はこの早期 return を外し、元画像版の対を用意する経路へ差し替える。
         if !matches!(self.compare_view_mode, crate::app::CompareViewMode::Off) {
+            return false;
+        }
+        if self.fs_navigation_sequence_blocks_new_target() {
+            // シーケンス進行中に画面へ出ているのは holdover (前の表示単位) であり、現ページでは
+            // ない。「現ページの元画像を見せる」約束は対象が画面に無いので成立しない。
+            //
+            // 利用者判断 (2026-08-17): 元画像ホールドは静止して画像を見ているときに元を確認する
+            // 用途である。移動中に補正が乗っていることは仕様として問題ない。
             return false;
         }
         if !self.fs_prev_focused {
@@ -17349,6 +17357,12 @@ impl App {
                         FS_VIDEO_ACTIVE_SCOPES,
                     ),
                 });
+        #[cfg(windows)]
+        if video_audio_exit_key_diagnostic.is_some() {
+            // Paused audio mode may otherwise have no frame at the heartbeat deadline. Keep the
+            // diagnostic independently alive without changing key consumption or mode routing.
+            ctx.request_repaint_after(VIDEO_AUDIO_EXIT_DIAGNOSTIC_MIN_INTERVAL);
+        }
         #[cfg(windows)]
         let video_audio_exit_key_blocker = if self.video_audio_mode.is_none() {
             None
@@ -33831,6 +33845,76 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn video_audio_exit_diagnostic_uses_fullscreen_summary_when_all_four_probes_miss() {
+        let start = std::time::Instant::now();
+        let mut state = VideoAudioExitKeyDiagnosticRateState::default();
+        let baseline =
+            video_audio_exit_diagnostic_record(VideoAudioExitKeyOutcome::ActionNotConsumed, false);
+        assert!(state.observe(start, baseline.clone()).is_some());
+        let mut summary_z = baseline.clone();
+        summary_z.inputs.fullscreen_summary = Some("Z:down:Modifiers".to_string());
+        assert!(!summary_z.inputs.action_peek);
+        assert!(!summary_z.inputs.z_press.win32_viewport_key_down);
+        assert!(summary_z.inputs.z_press.win32_any_key_down_source.is_none());
+        assert!(!summary_z.inputs.z_press.egui_key_down);
+        assert!(summary_z.inputs.fullscreen_summary_saw_z_down());
+        assert!(summary_z.inputs.saw_z_or_action_press());
+        assert!(
+            state
+                .observe(start + std::time::Duration::from_millis(200), summary_z)
+                .is_none()
+        );
+        let emitted = state
+            .observe(start + std::time::Duration::from_millis(1200), baseline)
+            .expect("the independently observed fullscreen Z must remain a candidate");
+        assert!(emitted.inputs.fullscreen_summary_saw_z_down());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn video_audio_exit_diagnostic_emits_a_heartbeat_without_candidates() {
+        let start = std::time::Instant::now();
+        let mut state = VideoAudioExitKeyDiagnosticRateState::default();
+        let baseline =
+            video_audio_exit_diagnostic_record(VideoAudioExitKeyOutcome::ActionNotConsumed, false);
+        assert!(state.observe(start, baseline.clone()).is_some());
+        assert!(
+            state
+                .observe(
+                    start + std::time::Duration::from_millis(100),
+                    baseline.clone()
+                )
+                .is_none()
+        );
+        let first_heartbeat = state
+            .observe(
+                start + VIDEO_AUDIO_EXIT_DIAGNOSTIC_MIN_INTERVAL,
+                baseline.clone(),
+            )
+            .expect("an unchanged audio-mode frame must still emit after one second");
+        assert!(!first_heartbeat.inputs.saw_z_or_action_press());
+        assert_eq!(
+            first_heartbeat.outcome,
+            VideoAudioExitKeyOutcome::ActionNotConsumed
+        );
+        assert!(
+            state
+                .observe(
+                    start + std::time::Duration::from_millis(1500),
+                    baseline.clone()
+                )
+                .is_none()
+        );
+        assert!(
+            state
+                .observe(start + std::time::Duration::from_secs(2), baseline)
+                .is_some(),
+            "the heartbeat must remain periodic while audio mode is observed"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn video_audio_exit_diagnostic_rearms_for_new_audio_mode_session() {
         let start = std::time::Instant::now();
         let mut state = VideoAudioExitKeyDiagnosticRateState::default();
@@ -34027,6 +34111,74 @@ mod tests {
         app.fullscreen_idx = Some(0);
         app.settings.global_preset.colorize.mode = crate::colorize::ColorizeMode::AllImages;
         app
+    }
+
+    #[cfg(windows)]
+    struct ClearOriginalPreviewSyntheticInput;
+
+    #[cfg(windows)]
+    impl Drop for ClearOriginalPreviewSyntheticInput {
+        fn drop(&mut self) {
+            crate::key_input::clear_test_synthetic_input();
+        }
+    }
+
+    #[cfg(windows)]
+    fn arm_reassigned_original_preview_hold(app: &mut crate::app::AppTestEnvForTest) {
+        app.keymap = Keymap::from_ini_str("[FsImage]\nFsOriginalPreviewHold = Ctrl\n");
+        app.fs_prev_focused = true;
+        let viewport = app.fullscreen_viewport_id();
+        let now = std::time::Instant::now();
+        crate::key_input::arm_test_synthetic_input(1, viewport);
+        crate::key_input::enqueue_test_synthetic_command(
+            crate::key_input::SyntheticKeyCommand::down(
+                now,
+                crate::key_input::SyntheticNavigationKey::Right,
+                crate::key_input::SyntheticModifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+            ),
+        );
+        crate::key_input::advance_test_synthetic_input(now);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn original_preview_hold_is_inactive_while_navigation_sequence_is_in_flight() {
+        let _serial = crate::key_input::TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("test input lock poisoned");
+        let _clear = ClearOriginalPreviewSyntheticInput;
+        let ctx = egui::Context::default();
+        let mut app = setup_navigation_readiness_app(1);
+        arm_reassigned_original_preview_hold(&mut app);
+        assert!(
+            app.original_preview_active(&ctx, 0),
+            "the reassigned hold must be active before navigation starts"
+        );
+
+        set_awaiting_navigation_target(&mut app, vec![0]);
+
+        assert!(app.fs_navigation_sequence_blocks_new_target());
+        assert!(!app.original_preview_active(&ctx, 0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn original_preview_hold_remains_active_without_navigation_in_flight() {
+        let _serial = crate::key_input::TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("test input lock poisoned");
+        let _clear = ClearOriginalPreviewSyntheticInput;
+        let ctx = egui::Context::default();
+        let mut app = setup_navigation_readiness_app(1);
+        arm_reassigned_original_preview_hold(&mut app);
+
+        assert!(!app.fs_navigation_sequence_blocks_new_target());
+        assert!(app.original_preview_active(&ctx, 0));
     }
 
     fn insert_navigation_original_page(

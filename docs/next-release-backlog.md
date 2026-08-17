@@ -943,6 +943,25 @@
 - 全 viewport 走査は current frame の read-only 診断 projection で、consume / Action 成立 / dispatch
   には使用しない。現時点では原因修正も production 分岐変更も行わない。
 
+#### 診断計装の 2 回目の再修正 (2026-08-17)
+
+- 再修正後の実ログも session 全体で 1 行しか出なかった。その 1 行は音声モード突入直後の
+  Z 未押下 idle frame で、以後 `[fs-key]` が t=9.321 から `Z:down` を繰り返し報告しても
+  `[video-audio] exit key diagnostic` は追加されなかった。
+- 原因は候補判定 `saw_z_or_action_press` が `action_peek`、viewport Win32 Z、
+  全 viewport Win32 Z、egui Z という**調査対象の 4 probe だけ**で決まっていたこと。
+  4 probe が全て false、`outcome` も不変なので、候補が永久に作られなかった。一方、
+  同じ record の `fullscreen_summary` は `Z:down` を持っていたが候補判定に未接続だった。
+- `fullscreen_summary` が `Z:down` を報告した frame も候補にし、rate limit 中はその snapshot を
+  保持する。加えて音声モード中は、候補・理由・Z 観測の有無に関係なく 1 秒ごとに現在 record を
+  heartbeat として出す。停止中に通常 repaint が無い場合も 1 秒後の repaint を予約する。
+  ログ量増加は許容し、診断が黙ることを禁止する。
+- 恒久原則: **診断ログの抑制条件を、調査している信号そのものだけに依存させない。**
+  独立した観測経路または無条件 heartbeat を持たせる。本計装では peek gate と 4-probe
+  candidate gate の 2 回、この原則違反で失敗した。
+- 変更は read-only 診断 snapshot の候補化と出力頻度だけ。production の key consume、Action 成立、
+  dispatch、音声モード enter / exit 挙動、原因修正には触れない。
+
 ### 4.1 Shift / Alt + ホイールのカスタマイズ再設計
 
 - 背景: v1.7.0 のリングショートカット / マウスボタン実装中に、Shift / Alt + ホイールのペアバインドを
@@ -1255,6 +1274,25 @@
   将来必要になった場合は GIF / WebP のフレーム依存とループ再decodeを含めて別設計にする。
 - 正本: [codex-animation-prefetch-policy-brief.md](briefs/codex-animation-prefetch-policy-brief.md)。
   関連: [display-pipeline.md](display-pipeline.md) §4.1.1。
+
+### 1.91 元画像ホールド併用の連続ページずらしで戻り方向だけ 2〜3 倍遅い
+
+- **完了 (2026-08-17):** `original_preview_active` は、既存の
+  `fs_navigation_sequence_blocks_new_target()` が true の間だけ false を返す。シーケンス終了後は
+  `FsOriginalPreviewHold` の effective modifier が成立すれば従来どおり元画像を表示する。
+- 実測は元画像プレビューなしの左右と preview ありの Left が 14.2〜17.2 手/秒だったのに対し、
+  Right + preview だけ 5.2〜5.8 手/秒。遅い区間の texture 選択 878 件は全て
+  `source=nav_holdover` で、4.5 秒間、補正済みの前表示単位を描き続けていた。
+- 機構は、元画像要求に矛盾する加工済み pass-through を正しく無効にした結果、設計どおりの
+  非対称先読み窓 12:4 の戻り側が露出し、target ready まで holdover が残るもの。画面にあるのは
+  現ページでなく前の表示単位なので、「現ページの元画像を見せる」約束自体が進行中は成立しない。
+- 利用者判断: 元画像ホールドは静止して画像を見ているときの確認用途であり、移動中に補正が
+  乗っていることは仕様として問題ない。判定は割り当て chord でなく typed navigation sequence
+  だけを使う。時間窓、pass-through 復活、先読み窓変更、`blocks_new_target()` caller 例外は追加しない。
+- 回帰テストは `FsOriginalPreviewHold` を Ctrl へ再割り当てして、sequence in flight 中の false と
+  sequence 不在時の true を固定する。既存の元画像 preview / readiness テストは変更しない。
+- 関連: [display-pipeline.md](display-pipeline.md) §§2.3, 2.5.4、
+  [keymap-spec.md](keymap-spec.md)「画像フルスクリーン」。
 
 ### 5.8 検索ベンチのゲートに絶対時間の下限が無い
 
