@@ -2382,7 +2382,7 @@ enum KeyboardPickerCell {
 }
 
 fn keyboard_picker_main_rows() -> [&'static [KeyboardPickerCell]; 6] {
-    use KeyboardPickerCell::Key;
+    use KeyboardPickerCell::{Key, Spacer};
     const EXTENDED_FUNCTION: &[KeyboardPickerCell] = &[
         Key(KeyName::F13, None),
         Key(KeyName::F14, None),
@@ -2443,7 +2443,12 @@ fn keyboard_picker_main_rows() -> [&'static [KeyboardPickerCell]; 6] {
         Key(KeyName::JisAt, Some("@")),
         Key(KeyName::OpenBracket, None),
     ];
+    // The rows below stand in for CapsLock and Shift, which are not assignable and so are not
+    // drawn. Without the indent A sat flush left while Q sat one Tab in, which read as the whole
+    // row being shifted a key to the left. `Spacer(48.0)` is the one-cell indent the navigation
+    // cluster already uses (44.0 key plus item spacing).
     const HOME: &[KeyboardPickerCell] = &[
+        Spacer(48.0),
         Key(KeyName::A, None),
         Key(KeyName::S, None),
         Key(KeyName::D, None),
@@ -2459,6 +2464,7 @@ fn keyboard_picker_main_rows() -> [&'static [KeyboardPickerCell]; 6] {
         Key(KeyName::Enter, None),
     ];
     const BOTTOM: &[KeyboardPickerCell] = &[
+        Spacer(48.0),
         Key(KeyName::Z, None),
         Key(KeyName::X, None),
         Key(KeyName::C, None),
@@ -6916,10 +6922,24 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        if i + 1 < len && ui.small_button("▼").clicked() {
+                                        // Both arrows keep their column on every row. Skipping
+                                        // the one that does not apply - ▼ on the last row, ▲ on
+                                        // the first - let the remaining arrow slide into the
+                                        // vacated slot, so the bottom entry's ▲ sat where every
+                                        // other row shows ▼. Disabled rather than omitted.
+                                        if ui
+                                            .add_enabled(
+                                                i + 1 < len,
+                                                egui::Button::new("▼").small(),
+                                            )
+                                            .clicked()
+                                        {
                                             swap = Some((i, i + 1));
                                         }
-                                        if i > 0 && ui.small_button("▲").clicked() {
+                                        if ui
+                                            .add_enabled(i > 0, egui::Button::new("▲").small())
+                                            .clicked()
+                                        {
                                             swap = Some((i, i - 1));
                                         }
                                     },
@@ -7820,14 +7840,15 @@ fn open_in_explorer(path: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AI_SIZE_LIMIT_OPTIONS, OperationAssignmentTab, OperationAssignmentTarget, PreferencesState,
-        apply_command_editor, close_assignment_editors, command_action_matches_filter,
-        command_key_labels_match_filter, compact_key_action_label, compact_operation_label,
+        AI_SIZE_LIMIT_OPTIONS, KeyboardPickerCell, OperationAssignmentTab,
+        OperationAssignmentTarget, PreferencesState, apply_command_editor,
+        close_assignment_editors, command_action_matches_filter, command_key_labels_match_filter,
+        compact_key_action_label, compact_operation_label, keyboard_picker_main_rows,
         modifier_hold_editor_choice, natural_operation_label_cmp, open_operation_assignment_editor,
         ring_bindings_for_key_action,
     };
     use crate::app::MAX_TEXTURE_DIM;
-    use crate::keymap::{KeyAction, ModKind};
+    use crate::keymap::{KeyAction, KeyName, ModKind};
     use crate::ring_shortcut::{RingActionId, RingShortcutContext};
 
     /// AI サイズ上限プリセットの長辺は GPU テクスチャ上限 (8192) を超えてはならない。
@@ -8016,5 +8037,46 @@ mod tests {
         close_assignment_editors(&mut state);
         assert_eq!(state.operation_keyboard_context, None);
         assert_eq!(state.operation_assignment_keyboard_context, None);
+    }
+
+    /// The home and bottom rows have to be indented, because the keys that indent them on a real
+    /// keyboard - CapsLock and Shift - are not assignable and so are not drawn. Without this the
+    /// rows sit flush left while QWERTY starts one Tab in, which reads as the row being shifted a
+    /// key to the left (reported 2026-08-17). Asserted on the row data rather than a snapshot
+    /// because this page has no snapshot coverage.
+    #[test]
+    fn letter_rows_are_indented_where_capslock_and_shift_would_sit() {
+        let rows = keyboard_picker_main_rows();
+        let leading_indent = |row: &[KeyboardPickerCell]| match row.first() {
+            Some(KeyboardPickerCell::Spacer(width)) => Some(*width),
+            _ => None,
+        };
+
+        // QWERTY is indented by a real key (Tab), so it needs no spacer.
+        let qwerty = rows[3];
+        assert!(
+            matches!(
+                qwerty.first(),
+                Some(KeyboardPickerCell::Key(KeyName::Tab, _))
+            ),
+            "QWERTY row should still start at Tab"
+        );
+        assert_eq!(leading_indent(qwerty), None);
+
+        for (label, row, first_key) in [
+            ("home", rows[4], KeyName::A),
+            ("bottom", rows[5], KeyName::Z),
+        ] {
+            let indent = leading_indent(row)
+                .unwrap_or_else(|| panic!("{label} row must start with a spacer indent"));
+            assert!(
+                indent > 0.0,
+                "{label} row indent must be positive, got {indent}"
+            );
+            assert!(
+                matches!(row.get(1), Some(KeyboardPickerCell::Key(key, _)) if *key == first_key),
+                "{label} row should place {first_key:?} directly after the indent"
+            );
+        }
     }
 }
