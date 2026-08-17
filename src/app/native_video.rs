@@ -1,6 +1,12 @@
 use super::*;
 use crate::keymap::{CommandDisplayRow, CommandScope, FS_VIDEO_ACTIVE_SCOPES, KeyAction};
 
+fn log_video_audio_enter_request(source: &str, fs_idx: usize) {
+    crate::logger::log(format!(
+        "[video-audio] enter request source={source} fs_idx={fs_idx}"
+    ));
+}
+
 /// native presenter が転送してきた KeyDown の virtual key が **いま物理的に押下中か**を
 /// OS に問い合わせる。placement 切替 (Plan B) で presenter を作り直すと、既に離された
 /// F12 の KeyDown が数百 ms 遅れて再配送され (`repeat=false` でも stale)、detached→main→
@@ -1600,6 +1606,7 @@ impl App {
         // した後この 1 箇所で戻す。ParkedLive completion は `open_fullscreen` を呼ばず、
         // defer 開始時に video_audio_mode=Some(target) へ進めた bundle 内状態をそのまま保つ。
         if audio_mode_after_swap && completed_via_open_fullscreen {
+            log_video_audio_enter_request("deferred_completion", target_idx);
             self.enter_video_audio_mode(ctx, target_idx);
         }
 
@@ -3324,6 +3331,7 @@ impl App {
                 // native presenter を detach するので、このイベントを処理した後は同バッチの残り
                 // イベントが stale になる → poll_video 側で batch を打ち切る (video_audio_mode の
                 // None→Some 遷移を検出)。fs_idx / fullscreen 前提の guard は enter 側で行う。
+                log_video_audio_enter_request("native_output_event", fs_idx);
                 self.enter_video_audio_mode(ctx, fs_idx);
             }
             crate::video::NativeVideoOutputEvent::CloseFullscreen { generation } => {
@@ -7066,6 +7074,7 @@ impl App {
                     .keymap
                     .matches_vk_action(KeyAction::VideoToggleAudioMode, &key) =>
             {
+                log_video_audio_enter_request("native_key", fs_idx);
                 self.enter_video_audio_mode(ctx, fs_idx);
             }
             _ => {
@@ -7455,8 +7464,8 @@ impl App {
     /// owner/HUD/VST GUI の後始末は presenter HWND が生きているうちに `exit_music_vst_shell` と同じ
     /// 順序で行い、孤児 VST window を防ぐ (Codex 7c 設計)。
     ///
-    /// 呼び出し元 = 動画 HUD の「音声モード」ボタン (`NativeVideoOutputEvent::ToggleAudioMode` →
-    /// `handle_native_video_output_event`、7d で配線)。
+    /// 呼び出し元 = native Z キー、動画 HUD の「音声モード」ボタン
+    /// (`NativeVideoOutputEvent::ToggleAudioMode`)、音声モード維持 source-swap の deferred completion。
     #[cfg(windows)]
     pub(crate) fn reset_video_audio_side_panel_sessions(&mut self, fs_idx: usize) {
         self.music_left_panel_active = false;
@@ -7611,10 +7620,24 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn exit_video_audio_mode(&mut self, ctx: &egui::Context, fs_idx: usize) {
         if self.video_audio_mode != Some(fs_idx) {
+            crate::logger::log(format!(
+                "[video-audio] exit fs_idx={fs_idx} ignored reason=audio_mode_mismatch current_video_audio_mode={:?}",
+                self.video_audio_mode
+            ));
             return;
         }
         // 既に exit 進行中なら二重起動しない (ボタンが複数フレーム描かれる間の連打対策)。
         if self.video_audio_exit_pending.is_some() {
+            if let Some(pending) = self.video_audio_exit_pending {
+                let now = std::time::Instant::now();
+                let deadline_remaining = pending.deadline.saturating_duration_since(now);
+                crate::logger::log(format!(
+                    "[video-audio] exit fs_idx={fs_idx} ignored reason=exit_pending pending_fs_idx={} deadline_remaining_ms={} deadline_expired={}",
+                    pending.fs_idx,
+                    deadline_remaining.as_millis(),
+                    pending.deadline <= now
+                ));
+            }
             return;
         }
         // 音声モードの連続再生 EOF による source-swap 進行中は exit を受け付けない (Codex P2)。

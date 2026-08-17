@@ -6709,6 +6709,30 @@ impl Keymap {
         false
     }
 
+    /// Non-consuming probe for diagnostics that must observe a physical press even when the
+    /// current keyboard owner blocks shortcuts.
+    ///
+    /// This deliberately bypasses `keymap_owner_blocks_shortcuts`: callers must never use the
+    /// result to drive behavior. Win32 and egui input queues are read without claiming events.
+    #[cfg(windows)]
+    pub(crate) fn diagnostic_peek_action_press(
+        &self,
+        ctx: &egui::Context,
+        action: KeyAction,
+    ) -> bool {
+        debug_assert_eq!(action.trigger(), KeyTrigger::Press);
+        if let Some(chords) = self.overrides.get(&action) {
+            return chords
+                .iter()
+                .copied()
+                .any(|chord| self.diagnostic_peek_chord_press(ctx, chord));
+        }
+        action
+            .default_chords()
+            .iter()
+            .any(|chord| self.diagnostic_peek_chord_press(ctx, chord))
+    }
+
     pub(crate) fn key_held_action(
         &self,
         ctx: &egui::Context,
@@ -7653,6 +7677,39 @@ impl Keymap {
         }
         ctx.input(|i| {
             i.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if chord.matches_egui(*key, *modifiers)
+                )
+            })
+        })
+    }
+
+    #[cfg(windows)]
+    fn diagnostic_peek_chord_press(&self, ctx: &egui::Context, chord: Chord) -> bool {
+        if chord.key_name().is_none() {
+            return false;
+        }
+        if crate::key_input::is_frame_active(ctx.viewport_id()) {
+            if crate::key_input::frame_had_key_down(ctx.viewport_id()) {
+                return crate::key_input::pressed_key_down(ctx.viewport_id(), |edge| {
+                    chord.matches_key_edge(edge)
+                });
+            }
+            if Self::frame_active_blocks_egui_fallback(chord) {
+                return false;
+            }
+        }
+        if !Self::egui_key_event_fallback_allowed(ctx) {
+            return false;
+        }
+        ctx.input(|input| {
+            input.events.iter().any(|event| {
                 matches!(
                     event,
                     egui::Event::Key {
@@ -10722,6 +10779,7 @@ mod tests {
         begin_key_pass(&ctx, egui::Key::T, egui::Modifiers::NONE);
         crate::key_input::set_test_frame(vec![plain_key_edge(0x54, 0x14)]);
         assert!(ctx.wants_keyboard_input());
+        assert!(keymap.diagnostic_peek_action_press(&ctx, KeyAction::FsPostFilterNext));
         assert!(!keymap.consume_action(&ctx, KeyAction::FsPostFilterNext));
         assert_eq!(ctx.input(|input| input.events.len()), 1);
         assert!(crate::key_input::pressed_key_down(

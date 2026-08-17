@@ -258,12 +258,32 @@
     **A を merge しても §1.31 は完了しない**。UI スレッドが外側の paint で GPU を待つ間も
     message pump は止まるため、他スレッドの `SendMessage` は依然ブロックする。A が消すのは
     「同期メッセージが GPU 待ちを**開始させた**」経路だけ。
-  - B の実現可能性メモ: `wgpu-hal` の DX12 Surface は `waitable_handle()` を公開しており、
-    `Dx12UseFrameLatencyWaitableObject::DontWait` は「application 自身が待つ」用途で存在する。
-    **acquire 前の readiness gate だけなら wgpu の vendor 不要で組める可能性がある**。
-    一方 `SurfaceTexture::present()` は戻り値が `()` で HAL の FIFO Present は
-    `DXGI_PRESENT_DO_NOT_WAIT` を使わないため、Present まで厳密に bounded にするなら
-    wgpu / core / hal の patch か render thread 分離が要る。
+  - **B の実現可能性は確認済み (2026-08-17、コードで実地確認)**。acquire 側は
+    **wgpu の vendor 不要**で組める:
+    - `Dx12UseFrameLatencyWaitableObject` の既定は **`Wait`**
+      ([wgpu-types instance.rs](https://docs.rs/wgpu-types/27.0.1/))。つまり現状の
+      `acquire_texture` は frame-latency waitable object を待ち、wgpu-core の
+      `FRAME_TIMEOUT_MS = 1000` で打ち切られても**その結果を捨てて先へ進む**。
+    - `DontWait` は doc に「**This is useful if the application wants to wait for the
+      waitable object itself**」と明記されており、まさに B の用途。swapchain は
+      waitable flag 付きで作られ、handle は取れるが wgpu は待たない。
+    - handle への到達経路も public: `wgpu::Surface::as_hal::<Dx12>()` (surface.rs) →
+      `wgpu_hal::dx12::Surface::waitable_handle()`。
+    - → 設計: 起動時に `DontWait` を設定し、paint 前に `WaitForSingleObject(handle, 0)` で
+      非ブロッキング判定。未 signal なら damage を保持したまま `DeferredNotReady` として
+      その frame を捨て、signal されたら wake する。**時間窓ではなく OS の事実で判定する**
+      ので憲法 5 に適合する。
+    - 注意: DX12 専用。backend が DX12 でない場合 `as_hal` は None を返すので、その場合は
+      現行挙動へフォールバックする (新しい失敗経路を作らない)。
+    - 参考: mIV は既に `MIV_WGPU_FRAME_LATENCY` で `desired_maximum_frame_latency` を
+      設定しており ([lib.rs](../src/lib.rs))、native presenter は自前 swapchain で
+      `DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT` を既に使っている
+      ([render_core.rs](../src/video/native_presenter/render_core.rs))。機構は既知。
+  - **Present 側は別問題で、これは vendor 不要では閉じない**。`SurfaceTexture::present()` は
+    戻り値が `()` で、HAL の FIFO Present は interval 1 かつ `DXGI_PRESENT_DO_NOT_WAIT` 無し
+    (`DO_NOT_WAIT` は blocked 時に `DXGI_ERROR_WAS_STILL_DRAWING` を返す契約)。
+    厳密に bounded にするなら wgpu / core / hal の patch か render thread 分離が要る。
+    **B は acquire だけ先に閉じて、Present は A 後の実測を見てから判断する**のが妥当。
 - **§1.31-A 着手前の 2026-08-16 に訂正した認識**
   (前セッションの読み違い。同じ誤りを繰り返さないため履歴として残す):
   - **外側の paint 位相は現在存在しない**。`check_redraw_requests` は
@@ -839,7 +859,36 @@
 - 依頼済み: 再現したら (a) mIV ウィンドウの余白を 1 回クリックして復帰するか (b) そのとき
   Z 以外のキー ([Space] など) も効かなかったか (c) 直前に別ウィンドウ / タスクバーを
   クリックしていないか。
-- 優先度: P3 / 再現待ち。**報告が来るまで着手しない** (ユーザー判断 2026-08-02)。
+- ~~優先度: P3 / 再現待ち。**報告が来るまで着手しない** (ユーザー判断 2026-08-02)。~~
+
+### 4.2 の更新 (2026-08-17) — 「1 回だけ」ではなく常時再現。着手可能になった ⚠️
+
+§1.31-A の実機確認中に開発機で再現し、**追加情報を待たずに着手できる状態**になった。
+
+- **再現率**: 「1 回だけ」ではない。**押した Z のほとんどが無視される**。実測:
+  - §1.31-A 込みビルド: 音声モード突入後の `Z:down` 12 回すべて無視
+  - §1.31-A 無しビルド (`pre-1.31a-master`): 突入後 **21 回**すべて無視 → 6 秒後にようやく exit
+  - 別の回では 3 回無視 → 12.9 秒後に exit、8 回無視 → exit したが timeout → fallback
+- **§1.31-A の退行ではない**。上記のとおり `pre-1.31a-master` (v3.1.0 + §1.85-A + §1.86、
+  描画スケジューリング無変更) でも同じ再現率で出る。**A/B 済み**。
+- **候補 (A) は否定された**。`[fs-key] source=fullscreen focused=true foreground=...` が
+  無視された Z すべてに出ている。フルスクリーン viewport はフォーカスを持っており、
+  `has_focus` 早期 return ではない。ただし `[fs-key]` は Win32 KeySlot 経路のログで、
+  実際の exit は egui 側の `consume_action_no_repeat` を通るため、**egui 側に届いて
+  いるかは別問題**として残る。
+- **未記録の併発症状**: exit が成功した 0.4〜1.0 秒後に**勝手に音声モードへ再突入する**
+  事象を 2 回観測 (`entered audio mode` が再度出る)。再突入後は Z がさらに効かなくなる。
+- **無言の分岐が 7 つある** (どれで消えているか現行ログでは判別不能):
+  - [ui_fullscreen.rs](../src/ui_fullscreen.rs) の音楽ビュー Z 経路 6 項 —
+    `fs_music_view_active` / `fs_context_menu_idx.is_none()` / `!ime_input_active` /
+    `!ctx.wants_keyboard_input()` / `!music_bookmark_modal_open()` /
+    `consume_action_no_repeat`
+  - [native_video.rs](../src/app/native_video.rs) `exit_video_audio_mode` 冒頭 2 つ —
+    `video_audio_mode != Some(fs_idx)` / `video_audio_exit_pending.is_some()`
+- **進め方**: 推測で直さない。7 箇所へ型付きの理由ログを入れてから 1 回再現し、
+  どこで消えているかを確定してから直す (`enter_video_audio_mode` の呼び出し元ログも
+  同時に入れて再突入の出所を割る)。過去に推測で 2 回外し、計装した 1 回で当てた前例に従う。
+- 優先度: **P2**。利用者報告のある実害バグで、再現手段が手元にある。
 
 ### 4.1 Shift / Alt + ホイールのカスタマイズ再設計
 

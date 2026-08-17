@@ -77,6 +77,56 @@ const LOUPE_SAMPLE_WINDOW: f32 = LOUPE_SIZE / LOUPE_ZOOM;
 const FS_PAN_MIN_VISIBLE_PX: f32 = 48.0;
 const PANORAMA_NAVIGATOR_EDGE_SAMPLES: usize = 24;
 
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VideoAudioExitKeyOutcome {
+    MusicViewInactive,
+    ContextMenuOpen,
+    ImeInputActive,
+    KeyboardInputWanted,
+    BookmarkModalOpen,
+    NormalizeModalActive,
+    ContextShortcutsHelpPreempted,
+    CloseFullscreenPreempted,
+    ActionNotConsumed,
+    ExitRequested,
+    ConsumedWithoutActiveVideoAudioMode,
+}
+
+#[cfg(windows)]
+impl VideoAudioExitKeyOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::MusicViewInactive => "music_view_inactive",
+            Self::ContextMenuOpen => "context_menu_open",
+            Self::ImeInputActive => "ime_input_active",
+            Self::KeyboardInputWanted => "keyboard_input_wanted",
+            Self::BookmarkModalOpen => "bookmark_modal_open",
+            Self::NormalizeModalActive => "normalize_modal_active",
+            Self::ContextShortcutsHelpPreempted => "context_shortcuts_help_preempted",
+            Self::CloseFullscreenPreempted => "close_fullscreen_preempted",
+            Self::ActionNotConsumed => "action_not_consumed",
+            Self::ExitRequested => "exit_requested",
+            Self::ConsumedWithoutActiveVideoAudioMode => "consumed_without_active_video_audio_mode",
+        }
+    }
+}
+
+#[cfg(windows)]
+fn log_video_audio_exit_key_outcome(
+    ctx: &egui::Context,
+    fs_idx: usize,
+    video_audio_mode: Option<usize>,
+    outcome: VideoAudioExitKeyOutcome,
+) {
+    crate::logger::log(format!(
+        "[video-audio] exit key edge fs_idx={fs_idx} viewport={:?} pass={} video_audio_mode={video_audio_mode:?} outcome={}",
+        ctx.viewport_id(),
+        ctx.cumulative_pass_nr(),
+        outcome.as_str()
+    ));
+}
+
 /// Cross-frame owner for primary-pointer suppression in fullscreen.
 ///
 /// Touch replacement on a terminal TouchFrame is deliberately not stored:
@@ -17008,6 +17058,32 @@ impl App {
         //    Video アームで別途カバーされるので、音声ファイル特有ぶんだけを表す)。
         let current_item_is_audio = matches!(self.items.get(fs_idx), Some(GridItem::Audio(_)));
         let fs_music_view_active = self.fs_music_view_active(fs_idx);
+        #[cfg(windows)]
+        let video_audio_exit_key_edge = self
+            .keymap
+            .diagnostic_peek_action_press(ctx, KeyAction::VideoToggleAudioMode);
+        #[cfg(windows)]
+        let video_audio_exit_key_blocker = if !video_audio_exit_key_edge {
+            None
+        } else if !fs_music_view_active {
+            Some(VideoAudioExitKeyOutcome::MusicViewInactive)
+        } else if self.fs_context_menu_idx.is_some() {
+            Some(VideoAudioExitKeyOutcome::ContextMenuOpen)
+        } else if self.ime_input_active(ctx) {
+            Some(VideoAudioExitKeyOutcome::ImeInputActive)
+        } else if ctx.wants_keyboard_input() {
+            Some(VideoAudioExitKeyOutcome::KeyboardInputWanted)
+        } else if self.music_bookmark_modal_open() {
+            Some(VideoAudioExitKeyOutcome::BookmarkModalOpen)
+        } else if self.music_normalize_modal_active(fs_idx) {
+            Some(VideoAudioExitKeyOutcome::NormalizeModalActive)
+        } else {
+            None
+        };
+        #[cfg(windows)]
+        if let Some(outcome) = video_audio_exit_key_blocker {
+            log_video_audio_exit_key_outcome(ctx, fs_idx, self.video_audio_mode, outcome);
+        }
         // 音楽ビューのパネル内 TextEdit (ブックマーク改名 / 一括登録 / タグピッカー) に
         // フォーカスがある / IME 変換中 / 中央モーダル (改名・一括登録) 表示中は、フルスクリーンの
         // ナビ・ショートカットキーを一切消費しない (Inc 5 FB / 5c-A)。矢印 (IME 候補選択) や
@@ -17026,6 +17102,15 @@ impl App {
             && self.fs_context_menu_idx.is_none()
             && self.consume_context_shortcuts_help_key(ctx)
         {
+            #[cfg(windows)]
+            if video_audio_exit_key_edge && video_audio_exit_key_blocker.is_none() {
+                log_video_audio_exit_key_outcome(
+                    ctx,
+                    fs_idx,
+                    self.video_audio_mode,
+                    VideoAudioExitKeyOutcome::ContextShortcutsHelpPreempted,
+                );
+            }
             self.show_context_shortcuts_help = true;
             return action;
         }
@@ -17068,6 +17153,15 @@ impl App {
                 .keymap
                 .consume_action(ctx, KeyAction::VideoCloseFullscreen)
         {
+            #[cfg(windows)]
+            if video_audio_exit_key_edge && video_audio_exit_key_blocker.is_none() {
+                log_video_audio_exit_key_outcome(
+                    ctx,
+                    fs_idx,
+                    self.video_audio_mode,
+                    VideoAudioExitKeyOutcome::CloseFullscreenPreempted,
+                );
+            }
             // この egui 経路では close は `action.close` で呼び出し側に伝える (esc と同じ方式、
             // 8838 参照)。close_fullscreen を直接呼ばない。
             action.close = true;
@@ -17091,9 +17185,31 @@ impl App {
         {
             #[cfg(windows)]
             if self.video_audio_mode == Some(fs_idx) {
+                log_video_audio_exit_key_outcome(
+                    ctx,
+                    fs_idx,
+                    self.video_audio_mode,
+                    VideoAudioExitKeyOutcome::ExitRequested,
+                );
                 self.exit_video_audio_mode(ctx, fs_idx);
+            } else {
+                log_video_audio_exit_key_outcome(
+                    ctx,
+                    fs_idx,
+                    self.video_audio_mode,
+                    VideoAudioExitKeyOutcome::ConsumedWithoutActiveVideoAudioMode,
+                );
             }
             return action;
+        }
+        #[cfg(windows)]
+        if video_audio_exit_key_edge && video_audio_exit_key_blocker.is_none() {
+            log_video_audio_exit_key_outcome(
+                ctx,
+                fs_idx,
+                self.video_audio_mode,
+                VideoAudioExitKeyOutcome::ActionNotConsumed,
+            );
         }
 
         // 音楽ビュー: Space / Enter で再生・一時停止 (動画の VideoPlayPause = Space+Enter を共有)。
