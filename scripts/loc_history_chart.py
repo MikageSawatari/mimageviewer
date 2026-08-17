@@ -157,8 +157,9 @@ __DARK_VARS__
 
   <div class="card">
     <h2>週ごとの増加量</h2>
-    <p class="note">前週スナップショットとの差分（削除を差し引いた純増）。</p>
+    <p class="note" id="delta-note">前週との差分（削除を差し引いた純増）。</p>
     <div class="plot" id="plot-delta"></div>
+    <div class="legend" id="legend-delta"></div>
     <p class="foot" id="delta-foot"></p>
   </div>
 
@@ -177,8 +178,9 @@ __DARK_VARS__
   <ul class="method">
     <li>数え方は物理行数（空行・コメントを含む）。cloc のような分類はしていません。</li>
     <li>除外: <code>vendor/</code> 配下（<code>vendor/eframe</code>、<code>hls.min.js</code> などの第三者コード）、<code>target/</code>、<code>Cargo.lock</code>、生成物の <code>changelog.html</code>、および画像・フォント・DLL などのバイナリ。</li>
-    <li>各週のスナップショットは、その日の 23:59 以前で最も新しいコミットのツリー。</li>
-    <li>再生成: <code>python scripts/loc_history.py</code> → <code>python scripts/loc_history_chart.py</code></li>
+    <li>累計のグラフは各週のスナップショット（その日 23:59 以前で最も新しいコミットのツリー）で、現在値はリポジトリの実際の行数と一致します。</li>
+    <li>「執筆時点で計上」はマージコミットを除いた各コミットの差分を author date で振り分けたもの。マージ時の衝突解決ぶんが落ち、追加→削除→再追加は二重に数えるため近似で、合計は実際の行数と __DRIFT__ ずれます。</li>
+    <li>再生成: <code>python scripts/loc_history.py</code>（累計）と <code>python scripts/loc_history.py --attribution authored --json target/loc-history/loc_authored.json --csv target/loc-history/loc_authored.csv</code>（執筆時点）を実行してから <code>python scripts/loc_history_chart.py</code></li>
   </ul>
 </main>
 
@@ -302,36 +304,42 @@ function stacked(hostId, legendId, keys, rows, colors) {
   new ResizeObserver(draw).observe(host);
 }
 
-/* bars ----------------------------------------------------------------- */
-function bars(hostId, values, color) {
+/* grouped bars --------------------------------------------------------- */
+function bars(hostId, legendId, series, colors) {
   const host = document.getElementById(hostId);
   const draw = () => {
-    const maxY = ticks(Math.max(...values)).at(-1);
+    const maxY = ticks(Math.max(...series.flatMap(s => s.values))).at(-1);
+    const n = series[0].values.length;
     const { svg, w, h, x, y, padL, padR, padB } = frame(host, 240, maxY);
-    const slot = (w - padL - padR) / Math.max(values.length - 1, 1);
-    const bw = Math.max(Math.min(slot * 0.62, 26), 3);
-    const r = Math.min(4, bw / 2);
+    const slot = (w - padL - padR) / Math.max(n - 1, 1);
+    const group = Math.max(Math.min(slot * 0.68, 30), 4);
+    const bw = Math.max((group - (series.length - 1) * 2) / series.length, 2);
     const tip = tooltip(host);
-    values.forEach((v, i) => {
-      const bx = x(i) - bw / 2, by = y(v), bh = h - padB - by;
-      const rr = Math.min(r, bh);
-      const bar = el('path', {
-        d: `M${bx},${h - padB} L${bx},${by + rr} Q${bx},${by} ${bx + rr},${by} L${bx + bw - rr},${by} Q${bx + bw},${by} ${bx + bw},${by + rr} L${bx + bw},${h - padB} Z`,
-        fill: color,
-      }, svg);
+    for (let i = 0; i < n; i++) {
+      const marks = series.map((s, k) => {
+        const v = s.values[i];
+        const bx = x(i) - group / 2 + k * (bw + 2), by = y(v), bh = h - padB - by;
+        const r = Math.min(4, bw / 2, bh);
+        return el('path', {
+          d: `M${bx},${h - padB} L${bx},${by + r} Q${bx},${by} ${bx + r},${by} L${bx + bw - r},${by} Q${bx + bw},${by} ${bx + bw},${by + r} L${bx + bw},${h - padB} Z`,
+          fill: colors[k],
+        }, svg);
+      });
       const hit = el('rect', { x: x(i) - slot / 2, y: 0, width: slot, height: h, fill: 'transparent' }, svg);
       hit.addEventListener('mouseenter', () => {
-        bar.setAttribute('opacity', .78);
-        tip.innerHTML = `<div class="head">${DATA.points[i].date} まで</div>` +
-          `<div class="row"><i style="background:${color}"></i><b>純増</b><em>+${fmt(v)}</em></div>` +
+        marks.forEach(m => m.setAttribute('opacity', .78));
+        tip.innerHTML = `<div class="head">${DATA.points[i].date} までの週</div>` +
+          series.map((s, k) => `<div class="row"><i style="background:${colors[k]}"></i><b>${s.name}</b><em>+${fmt(s.values[i])}</em></div>`).join('') +
           `<div class="row total"><b>累計</b><em>${fmt(DATA.points[i].total)}</em></div>`;
         tip.style.opacity = 1;
         const tw = tip.offsetWidth;
         tip.style.left = Math.min(Math.max(x(i) - tw / 2, 0), w - tw) + 'px';
         tip.style.top = '4px';
       });
-      hit.addEventListener('mouseleave', () => { bar.removeAttribute('opacity'); tip.style.opacity = 0; });
-    });
+      hit.addEventListener('mouseleave', () => { marks.forEach(m => m.removeAttribute('opacity')); tip.style.opacity = 0; });
+    }
+    document.getElementById(legendId).innerHTML = series.length < 2 ? '' : series.map((s, k) =>
+      `<span><i style="background:${colors[k]}"></i>${s.name}</span>`).join('');
   };
   draw();
   new ResizeObserver(draw).observe(host);
@@ -344,12 +352,21 @@ const palette = () => matchMedia('(prefers-color-scheme: dark)').matches && docu
 stacked('plot-lang', 'legend-lang', DATA.lang_keys, DATA.lang_rows, palette());
 stacked('plot-area', 'legend-area', DATA.area_keys, DATA.area_rows, palette());
 const deltas = DATA.points.map((p, i) => p.total - (i ? DATA.points[i - 1].total : 0));
-bars('plot-delta', deltas, palette()[0]);
+const series = [];
+if (DATA.authored) series.push({ name: '執筆時点で計上', values: DATA.authored });
+series.push({ name: DATA.authored ? 'master に載った時点で計上' : '週ごとの純増', values: deltas });
+bars('plot-delta', 'legend-delta', series, [palette()[0], palette()[1]]);
 
-const peak = deltas.indexOf(Math.max(...deltas));
+const lead = series[0];
+const peak = lead.values.indexOf(Math.max(...lead.values));
 document.getElementById('delta-foot').textContent =
-  `最大は ${DATA.points[peak].date} までの週で +${fmt(deltas[peak])} 行。` +
+  `最大は ${DATA.points[peak].date} までの週で +${fmt(lead.values[peak])} 行。` +
   `最初の棒は開始週なので 0 からの増分、最後の棒は ${DATA.spanLastDays} 日ぶん。`;
+if (DATA.authored) {
+  document.getElementById('delta-note').innerHTML =
+    '同じ作業を 2 通りに割り当てたもの。<b>執筆時点</b>は各コミットの author date、' +
+    '<b>master に載った時点</b>は週ごとのスナップショット差分。長く生きたブランチは後者だとマージ週に一括計上される。';
+}
 
 /* table view ----------------------------------------------------------- */
 document.getElementById('table').innerHTML =
@@ -367,11 +384,26 @@ document.getElementById('table').innerHTML =
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--json", default="target/loc-history/loc_history.json")
+    ap.add_argument(
+        "--authored",
+        default="target/loc-history/loc_authored.json",
+        help="optional --attribution authored run; its weekly increments are "
+        "drawn beside the snapshot ones. Skipped if absent or misaligned.",
+    )
     ap.add_argument("--out", default="target/loc-history/loc_history.html")
     args = ap.parse_args()
 
     raw = json.loads(Path(args.json).read_text(encoding="utf-8"))
     points = raw["points"]
+
+    authored: list[int] | None = None
+    authored_path = Path(args.authored)
+    if authored_path.exists():
+        alt = json.loads(authored_path.read_text(encoding="utf-8"))["points"]
+        if [p["date"] for p in alt] == [p["date"] for p in points]:
+            authored = [p["total"] - (alt[i - 1]["total"] if i else 0) for i, p in enumerate(alt)]
+        else:
+            print(f"note: {authored_path} covers different dates -- skipping it")
     lang_keys, lang_rows = fold(points, "by_language")
     area_keys, area_rows = fold(points, "by_area")
 
@@ -397,6 +429,7 @@ def main() -> int:
         "light": LIGHT[: len(lang_keys)],
         "dark": DARK[: len(lang_keys)],
         "spanLastDays": span_last,
+        "authored": authored,
     }
 
     html = (
@@ -406,6 +439,12 @@ def main() -> int:
         .replace("__RANGE__", f"{points[0]['date']} 〜 {points[-1]['date']}")
         .replace("__NPOINTS__", str(len(points)))
         .replace("__NCOMMITS__", f"{int(ncommits):,}")
+        .replace(
+            "__DRIFT__",
+            f"{sum(authored) - points[-1]['total']:+,} 行（{(sum(authored) / points[-1]['total'] - 1) * 100:+.1f}%）"
+            if authored
+            else "わずかに",
+        )
     )
 
     out = Path(args.out)

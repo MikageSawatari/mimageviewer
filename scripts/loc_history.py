@@ -198,8 +198,94 @@ def measure(sha: str, reader: BlobReader) -> tuple[dict[str, int], dict[str, int
     return by_lang, by_area, files
 
 
+def normalize_rename(path: str) -> str:
+    """`a/{old => new}/f.rs` and `old.rs => new.rs` both collapse to the new path."""
+    if " => " not in path:
+        return path
+    if "{" in path and "}" in path:
+        pre, rest = path.split("{", 1)
+        mid, post = rest.split("}", 1)
+        return pre + mid.split(" => ")[1] + post
+    return path.split(" => ")[1]
+
+
+def authored_points(points: list[tuple[dt.date, str]], head: str) -> list[dict]:
+    """Attribute every line to the week its commit was *authored*, not merged.
+
+    Tree snapshots follow one line of development, so a branch that lived for
+    six weeks and then merged lands entirely in the merge week.  Here each
+    non-merge commit's numstat is bucketed by its own author date instead, and
+    the cumulative sum over those buckets is the curve.
+
+    This trades exactness for attribution: merge-conflict resolutions carry
+    changes present in no single parent and are skipped with the merges, and a
+    line added, deleted and re-added counts twice.  main() reports the drift
+    against the exact tree count so the size of that trade is visible.
+    """
+    proc = subprocess.run(
+        ["git", "log", "--no-merges", "-M", "--numstat", "--format=format:%x00%aI", head],
+        check=True,
+        capture_output=True,
+    )
+    boundaries = [day for day, _ in points]
+    buckets: list[tuple[dict[str, int], dict[str, int]]] = [({}, {}) for _ in boundaries]
+
+    def bucket_for(day: dt.date) -> int:
+        for i, edge in enumerate(boundaries):
+            if day <= edge:
+                return i
+        return len(boundaries) - 1
+
+    idx = 0
+    for raw in proc.stdout.decode("utf-8", "surrogateescape").splitlines():
+        if raw.startswith("\0"):
+            idx = bucket_for(dt.datetime.fromisoformat(raw[1:]).date())
+            continue
+        fields = raw.split("\t")
+        if len(fields) != 3 or fields[0] == "-":  # blank line, or a binary file
+            continue
+        added, deleted, path = fields
+        path = normalize_rename(path).replace("\\", "/")
+        info = classify(path)
+        if info is None:
+            continue
+        lang, area = info
+        net = int(added) - int(deleted)
+        by_lang, by_area = buckets[idx]
+        by_lang[lang] = by_lang.get(lang, 0) + net
+        by_area[area] = by_area.get(area, 0) + net
+
+    rows = []
+    cum_lang: dict[str, int] = {}
+    cum_area: dict[str, int] = {}
+    for (day, sha), (by_lang, by_area) in zip(points, buckets):
+        for k, v in by_lang.items():
+            cum_lang[k] = cum_lang.get(k, 0) + v
+        for k, v in by_area.items():
+            cum_area[k] = cum_area.get(k, 0) + v
+        rows.append(
+            {
+                "date": day.isoformat(),
+                "commit": sha[:8],
+                "files": 0,
+                "total": sum(cum_lang.values()),
+                "by_language": dict(cum_lang),
+                "by_area": dict(cum_area),
+            }
+        )
+    return rows
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(
+        "--attribution",
+        choices=("tree", "authored"),
+        default="tree",
+        help="tree: lines present in that week's snapshot (exact, but a merged "
+        "branch lands in its merge week). authored: lines bucketed by each "
+        "commit's own author date (approximate, but attributed when written).",
+    )
     ap.add_argument("--interval-days", type=int, default=7)
     ap.add_argument("--json", default="target/loc-history/loc_history.json")
     ap.add_argument("--csv", default="target/loc-history/loc_history.csv")
@@ -209,22 +295,37 @@ def main() -> int:
     print(f"{len(points)} checkpoints, every {args.interval_days} day(s)", file=sys.stderr)
 
     reader = BlobReader()
-    rows = []
+    rows: list[dict] = []
     try:
-        for i, (day, sha) in enumerate(points, 1):
-            by_lang, by_area, files = measure(sha, reader)
-            total = sum(by_lang.values())
-            rows.append(
-                {
-                    "date": day.isoformat(),
-                    "commit": sha[:8],
-                    "files": files,
-                    "total": total,
-                    "by_language": by_lang,
-                    "by_area": by_area,
-                }
+        if args.attribution == "tree":
+            for i, (day, sha) in enumerate(points, 1):
+                by_lang, by_area, files = measure(sha, reader)
+                total = sum(by_lang.values())
+                rows.append(
+                    {
+                        "date": day.isoformat(),
+                        "commit": sha[:8],
+                        "files": files,
+                        "total": total,
+                        "by_language": by_lang,
+                        "by_area": by_area,
+                    }
+                )
+                print(f"  [{i}/{len(points)}] {day} {sha[:8]}  {total:>8,} LOC", file=sys.stderr)
+        else:
+            rows = authored_points(points, points[-1][1])
+            for i, r in enumerate(rows, 1):
+                print(
+                    f"  [{i}/{len(rows)}] {r['date']} {r['commit']}  {r['total']:>8,} LOC",
+                    file=sys.stderr,
+                )
+            exact = sum(measure(points[-1][1], reader)[0].values())
+            drift = rows[-1]["total"] - exact
+            print(
+                f"  final {rows[-1]['total']:,} authored vs {exact:,} actually in the tree"
+                f"  ({drift:+,}, {drift / exact * 100:+.1f}%)",
+                file=sys.stderr,
             )
-            print(f"  [{i}/{len(points)}] {day} {sha[:8]}  {total:>8,} LOC", file=sys.stderr)
     finally:
         reader.close()
 
@@ -235,7 +336,12 @@ def main() -> int:
     json_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_text(
         json.dumps(
-            {"languages": languages, "areas": areas, "points": rows},
+            {
+                "attribution": args.attribution,
+                "languages": languages,
+                "areas": areas,
+                "points": rows,
+            },
             ensure_ascii=False,
             indent=1,
         ),
