@@ -134,7 +134,7 @@ impl VideoAudioExitKeyDiagnosticInputs {
     fn fullscreen_summary_saw_z_down(&self) -> bool {
         self.fullscreen_summary
             .as_deref()
-            .is_some_and(|summary| summary.split(',').any(|event| event.starts_with("Z:down:")))
+            .is_some_and(|summary| fullscreen_summary_saw_key_down(summary, "Z"))
     }
 
     fn saw_z_or_action_press(&self) -> bool {
@@ -151,6 +151,46 @@ impl VideoAudioExitKeyDiagnosticInputs {
 struct VideoAudioExitKeyDiagnosticRecord {
     inputs: VideoAudioExitKeyDiagnosticInputs,
     outcome: VideoAudioExitKeyOutcome,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct VideoAudioPreHandleFsKeyDiagnostic<'a> {
+    fs_idx: usize,
+    keys: &'a str,
+    video_audio_mode: Option<usize>,
+    fs_music_view_active: bool,
+    wants_keyboard_input: bool,
+    ime_input_active: bool,
+    music_bookmark_modal_open: bool,
+    music_normalize_modal_active: bool,
+    fs_context_menu_idx: Option<usize>,
+    viewport: egui::ViewportId,
+    pass: u64,
+}
+
+#[cfg(windows)]
+fn format_video_audio_pre_handle_fs_key_diagnostic(
+    record: &VideoAudioPreHandleFsKeyDiagnostic<'_>,
+) -> String {
+    format!(
+        "[video-audio] stage=before_handle_fs_key_input fs_idx={} keys={} \
+         video_audio_mode={:?} fs_music_view_active={} wants_keyboard_input={} \
+         ime_input_active={} music_bookmark_modal_open={} \
+         music_normalize_modal_active={} fs_context_menu_idx={:?} \
+         viewport={:?} pass={}",
+        record.fs_idx,
+        record.keys,
+        record.video_audio_mode,
+        record.fs_music_view_active,
+        record.wants_keyboard_input,
+        record.ime_input_active,
+        record.music_bookmark_modal_open,
+        record.music_normalize_modal_active,
+        record.fs_context_menu_idx,
+        record.viewport,
+        record.pass,
+    )
 }
 
 #[cfg(windows)]
@@ -3472,6 +3512,14 @@ fn keymap_fullscreen_probe_matches(
         })
 }
 
+fn fullscreen_summary_saw_key_down(summary: &str, key_name: &str) -> bool {
+    summary.split(',').any(|event| {
+        event
+            .split_once(':')
+            .is_some_and(|(name, state)| name == key_name && state.starts_with("down:"))
+    })
+}
+
 fn fullscreen_shortcut_event_summary(
     ctx: &egui::Context,
     keymap: &Keymap,
@@ -5253,13 +5301,31 @@ impl App {
 
     /// OS キー状態は同じ frame の producer gate / readiness / draw で一度だけ読む。
     /// egui の一時データなので viewer context をまたいだ状態は App に追加しない。
-    fn original_preview_active_for_frame(&self, ctx: &egui::Context, idx: usize) -> bool {
+    fn original_preview_frame_observation(
+        &self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> FsOriginalPreviewFrameObservation {
         let frame_nr = ctx.cumulative_frame_nr();
+        let observed_pass_nr = ctx.cumulative_pass_nr();
         let viewport = if self.fullscreen_embedded_still_active() {
             ctx.viewport_id()
         } else {
             self.fullscreen_viewport_id()
         };
+        let order_id = egui::Id::new(("fs_original_preview_call_order", viewport));
+        let observed_call_order = ctx.data_mut(|data| {
+            let mut order = data
+                .get_temp::<FsOriginalPreviewFrameCallOrder>(order_id)
+                .filter(|order| order.frame_nr == frame_nr)
+                .unwrap_or(FsOriginalPreviewFrameCallOrder {
+                    frame_nr,
+                    next_call_order: 0,
+                });
+            order.next_call_order = order.next_call_order.saturating_add(1);
+            data.insert_temp(order_id, order);
+            order.next_call_order
+        });
         let cache_id = egui::Id::new(("fs_original_preview_active", viewport));
         if let Some(sample) = ctx
             .data(|data| data.get_temp::<FsOriginalPreviewFrameSample>(cache_id))
@@ -5269,22 +5335,42 @@ impl App {
                     && sample.idx == idx
             })
         {
-            return sample.active;
+            return FsOriginalPreviewFrameObservation {
+                sample,
+                cache_hit: true,
+                observed_frame_nr: frame_nr,
+                observed_pass_nr,
+                observed_call_order,
+            };
         }
 
+        let sequence_blocks_new_target_at_write = self.fs_navigation_sequence_blocks_new_target();
         let active = self.original_preview_active(ctx, idx);
+        let sample = FsOriginalPreviewFrameSample {
+            frame_nr,
+            items_generation: self.items_generation,
+            idx,
+            active,
+            written_pass_nr: observed_pass_nr,
+            written_call_order: observed_call_order,
+            sequence_blocks_new_target_at_write,
+        };
         ctx.data_mut(|data| {
-            data.insert_temp(
-                cache_id,
-                FsOriginalPreviewFrameSample {
-                    frame_nr,
-                    items_generation: self.items_generation,
-                    idx,
-                    active,
-                },
-            );
+            data.insert_temp(cache_id, sample);
         });
-        active
+        FsOriginalPreviewFrameObservation {
+            sample,
+            cache_hit: false,
+            observed_frame_nr: frame_nr,
+            observed_pass_nr,
+            observed_call_order,
+        }
+    }
+
+    fn original_preview_active_for_frame(&self, ctx: &egui::Context, idx: usize) -> bool {
+        self.original_preview_frame_observation(ctx, idx)
+            .sample
+            .active
     }
 
     /// 現在の表示が final pipeline (補正 / AI / カラー化合成) を迂回するか。
@@ -8230,7 +8316,108 @@ struct FsOriginalPreviewFrameSample {
     items_generation: u64,
     idx: usize,
     active: bool,
+    written_pass_nr: u64,
+    written_call_order: u64,
+    sequence_blocks_new_target_at_write: bool,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FsOriginalPreviewFrameObservation {
+    sample: FsOriginalPreviewFrameSample,
+    cache_hit: bool,
+    observed_frame_nr: u64,
+    observed_pass_nr: u64,
+    observed_call_order: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FsOriginalPreviewFrameCallOrder {
+    frame_nr: u64,
+    next_call_order: u64,
+}
+
+#[cfg(windows)]
+const FS_ORIGINAL_PREVIEW_BLOCKER_LOG_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(1);
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+struct FsOriginalPreviewBlockerDiagnosticRecord {
+    idx: usize,
+    items_generation: u64,
+    viewport: egui::ViewportId,
+    sequence_blocks_new_target: bool,
+    observation: FsOriginalPreviewFrameObservation,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Default)]
+struct FsOriginalPreviewBlockerDiagnosticSummary {
+    checks: u64,
+    sequence_in_flight_checks: u64,
+    original_preview_returns: u64,
+    sequence_in_flight_returns: u64,
+    sequence_idle_returns: u64,
+    memo_hit_returns: u64,
+    fresh_evaluation_returns: u64,
+    last_return: Option<FsOriginalPreviewBlockerDiagnosticRecord>,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Default)]
+struct FsOriginalPreviewBlockerDiagnosticRateState {
+    last_emitted_at: Option<std::time::Instant>,
+    pending: FsOriginalPreviewBlockerDiagnosticSummary,
+}
+
+#[cfg(windows)]
+impl FsOriginalPreviewBlockerDiagnosticRateState {
+    fn observe(
+        &mut self,
+        now: std::time::Instant,
+        record: FsOriginalPreviewBlockerDiagnosticRecord,
+    ) -> Option<FsOriginalPreviewBlockerDiagnosticSummary> {
+        self.pending.checks = self.pending.checks.saturating_add(1);
+        if record.sequence_blocks_new_target {
+            self.pending.sequence_in_flight_checks =
+                self.pending.sequence_in_flight_checks.saturating_add(1);
+        }
+        if record.observation.sample.active {
+            self.pending.original_preview_returns =
+                self.pending.original_preview_returns.saturating_add(1);
+            if record.sequence_blocks_new_target {
+                self.pending.sequence_in_flight_returns =
+                    self.pending.sequence_in_flight_returns.saturating_add(1);
+            } else {
+                self.pending.sequence_idle_returns =
+                    self.pending.sequence_idle_returns.saturating_add(1);
+            }
+            if record.observation.cache_hit {
+                self.pending.memo_hit_returns = self.pending.memo_hit_returns.saturating_add(1);
+            } else {
+                self.pending.fresh_evaluation_returns =
+                    self.pending.fresh_evaluation_returns.saturating_add(1);
+            }
+            self.pending.last_return = Some(record);
+        }
+
+        let interval_elapsed = self.last_emitted_at.is_none_or(|last_emitted| {
+            now.saturating_duration_since(last_emitted) >= FS_ORIGINAL_PREVIEW_BLOCKER_LOG_INTERVAL
+        });
+        if !interval_elapsed {
+            return None;
+        }
+        self.last_emitted_at = Some(now);
+        Some(std::mem::take(&mut self.pending))
+    }
+}
+
+#[cfg(windows)]
+static FS_ORIGINAL_PREVIEW_BLOCKER_DIAGNOSTIC_RATE_STATES: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<egui::ViewportId, FsOriginalPreviewBlockerDiagnosticRateState>,
+    >,
+> = std::sync::OnceLock::new();
 
 /// A page-turn burst exists only after a held page-turn input has actually
 /// changed the displayed unit. Physical level alone is insufficient: at a
@@ -13290,6 +13477,28 @@ impl App {
                                 current_foreground_hwnd(),
                                 keys
                             ));
+                            #[cfg(windows)]
+                            if self.video_audio_mode.is_some()
+                                && fullscreen_summary_saw_key_down(&keys, "Z")
+                            {
+                                let record = VideoAudioPreHandleFsKeyDiagnostic {
+                                    fs_idx,
+                                    keys: &keys,
+                                    video_audio_mode: self.video_audio_mode,
+                                    fs_music_view_active: self.fs_music_view_active(fs_idx),
+                                    wants_keyboard_input: ctx.wants_keyboard_input(),
+                                    ime_input_active: self.ime_input_active(ctx),
+                                    music_bookmark_modal_open: self.music_bookmark_modal_open(),
+                                    music_normalize_modal_active: self
+                                        .music_normalize_modal_active(fs_idx),
+                                    fs_context_menu_idx: self.fs_context_menu_idx,
+                                    viewport: ctx.viewport_id(),
+                                    pass: ctx.cumulative_pass_nr(),
+                                };
+                                crate::logger::log(
+                                    format_video_audio_pre_handle_fs_key_diagnostic(&record),
+                                );
+                            }
                         }
                         let key_action = self.handle_fs_key_input(ctx, fs_idx, is_spread_double);
                         if key_action.close {
@@ -14801,6 +15010,144 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn emit_fs_original_preview_blocker_probe(
+        &self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        observation: FsOriginalPreviewFrameObservation,
+    ) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let viewport = if self.fullscreen_embedded_still_active() {
+            ctx.viewport_id()
+        } else {
+            self.fullscreen_viewport_id()
+        };
+        let record = FsOriginalPreviewBlockerDiagnosticRecord {
+            idx: fs_idx,
+            items_generation: self.items_generation,
+            viewport,
+            sequence_blocks_new_target: self.fs_navigation_sequence_blocks_new_target(),
+            observation,
+        };
+        let summary = FS_ORIGINAL_PREVIEW_BLOCKER_DIAGNOSTIC_RATE_STATES
+            .get_or_init(Default::default)
+            .lock()
+            .ok()
+            .and_then(|mut states| {
+                states
+                    .entry(viewport)
+                    .or_default()
+                    .observe(std::time::Instant::now(), record)
+            });
+        let Some(summary) = summary else {
+            return;
+        };
+        let last = summary.last_return;
+        let key_idx = last.map_or(fs_idx, |record| record.idx);
+        let perf_key = self.perf_item_key(key_idx);
+        let optional_u64 = |value: Option<u64>| {
+            value
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null)
+        };
+        let optional_bool = |value: Option<bool>| {
+            value
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null)
+        };
+        crate::perf::event(
+            "fs",
+            "original_preview_blocker_summary",
+            perf_key.as_deref(),
+            self.input_seq,
+            &[
+                ("viewport", serde_json::Value::from(format!("{viewport:?}"))),
+                ("checks", serde_json::Value::from(summary.checks)),
+                (
+                    "sequence_in_flight_checks",
+                    serde_json::Value::from(summary.sequence_in_flight_checks),
+                ),
+                (
+                    "original_preview_returns",
+                    serde_json::Value::from(summary.original_preview_returns),
+                ),
+                (
+                    "sequence_in_flight_returns",
+                    serde_json::Value::from(summary.sequence_in_flight_returns),
+                ),
+                (
+                    "sequence_idle_returns",
+                    serde_json::Value::from(summary.sequence_idle_returns),
+                ),
+                (
+                    "memo_hit_returns",
+                    serde_json::Value::from(summary.memo_hit_returns),
+                ),
+                (
+                    "fresh_evaluation_returns",
+                    serde_json::Value::from(summary.fresh_evaluation_returns),
+                ),
+                (
+                    "last_idx",
+                    optional_u64(last.map(|record| record.idx as u64)),
+                ),
+                (
+                    "last_items_generation",
+                    optional_u64(last.map(|record| record.items_generation)),
+                ),
+                (
+                    "last_sequence_blocks_new_target",
+                    optional_bool(last.map(|record| record.sequence_blocks_new_target)),
+                ),
+                (
+                    "last_memo_hit",
+                    optional_bool(last.map(|record| record.observation.cache_hit)),
+                ),
+                (
+                    "last_memo_sequence_blocks_new_target_at_write",
+                    optional_bool(last.map(|record| {
+                        record
+                            .observation
+                            .sample
+                            .sequence_blocks_new_target_at_write
+                    })),
+                ),
+                (
+                    "last_memo_frame_nr",
+                    optional_u64(last.map(|record| record.observation.sample.frame_nr)),
+                ),
+                (
+                    "last_memo_pass_nr",
+                    optional_u64(last.map(|record| record.observation.sample.written_pass_nr)),
+                ),
+                (
+                    "last_memo_call_order",
+                    optional_u64(last.map(|record| record.observation.sample.written_call_order)),
+                ),
+                (
+                    "last_blocker_frame_nr",
+                    optional_u64(last.map(|record| record.observation.observed_frame_nr)),
+                ),
+                (
+                    "last_blocker_pass_nr",
+                    optional_u64(last.map(|record| record.observation.observed_pass_nr)),
+                ),
+                (
+                    "last_blocker_call_order",
+                    optional_u64(last.map(|record| record.observation.observed_call_order)),
+                ),
+                (
+                    "last_viewport",
+                    last.map(|record| serde_json::Value::from(format!("{:?}", record.viewport)))
+                        .unwrap_or(serde_json::Value::Null),
+                ),
+            ],
+        );
+    }
+
+    #[cfg(windows)]
     fn fs_page_turn_ordinary_context_blocker(
         &self,
         ctx: &egui::Context,
@@ -14830,10 +15177,10 @@ impl App {
             Some("compare_mode")
         } else if self.is_panorama_mode_active(fs_idx) {
             Some("panorama_mode")
-        } else if self.original_preview_active_for_frame(ctx, fs_idx) {
-            Some("original_preview")
         } else {
-            None
+            let observation = self.original_preview_frame_observation(ctx, fs_idx);
+            self.emit_fs_original_preview_blocker_probe(ctx, fs_idx, observation);
+            observation.sample.active.then_some("original_preview")
         }
     }
 
@@ -29822,7 +30169,7 @@ impl App {
         // 消しゴム補完は一時トーストより長く続くことがあるため、同じ描画チョークポイントで
         // ジョブ寿命に連動した専用ステータスも描く。トーストが無いフレームでも必要。
         self.draw_erase_inpaint_progress(ui, full_rect, ctx, drawing_surface);
-        self.draw_animation_promotion_progress(ui, full_rect, ctx, drawing_surface);
+        self.draw_animation_expansion_progress(ui, full_rect, ctx, drawing_surface);
 
         let Some((ref text, start_time, duration)) = self.fs_feedback_toast else {
             return;
@@ -29906,8 +30253,8 @@ impl App {
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
     }
 
-    /// 先読み済みの第1フレームを全フレームへ昇格している間だけ出す持続型ステータス。
-    fn draw_animation_promotion_progress(
+    /// 現ページの全フレーム展開中に、初回 decode / 先読み後の昇格を問わず出すステータス。
+    fn draw_animation_expansion_progress(
         &self,
         ui: &mut egui::Ui,
         full_rect: egui::Rect,
@@ -29917,13 +30264,13 @@ impl App {
         if drawing_surface != crate::app::ActionSurface::Viewer {
             return;
         }
-        let Some(started_at) = self.current_animation_promotion_started_at() else {
+        let Some(started_at) = self.current_animation_expansion_started_at() else {
             return;
         };
         let now = std::time::Instant::now();
         // 150ms は競合を時間窓で吸収するものではなく、短い処理を提示するかだけを決める
-        // UI のちらつき防止ゲート。昇格の生存・完了・stale 判定は typed in-flight 状態に従う。
-        if !crate::app::animation_promotion_progress_visible(Some(started_at), now) {
+        // UI のちらつき防止ゲート。展開の生存・完了・stale 判定は typed in-flight 状態に従う。
+        if !crate::app::animation_expansion_progress_visible(Some(started_at), now) {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
             return;
         }
@@ -33872,6 +34219,43 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn video_audio_pre_handle_diagnostic_is_sourced_from_z_down_and_lists_every_guard() {
+        assert!(fullscreen_summary_saw_key_down("Z:down:Modifiers", "Z"));
+        assert!(!fullscreen_summary_saw_key_down("Z:up:Modifiers", "Z"));
+        let record = VideoAudioPreHandleFsKeyDiagnostic {
+            fs_idx: 7,
+            keys: "Z:down:Modifiers",
+            video_audio_mode: Some(7),
+            fs_music_view_active: true,
+            wants_keyboard_input: false,
+            ime_input_active: false,
+            music_bookmark_modal_open: false,
+            music_normalize_modal_active: true,
+            fs_context_menu_idx: Some(3),
+            viewport: egui::ViewportId::ROOT,
+            pass: 42,
+        };
+
+        let line = format_video_audio_pre_handle_fs_key_diagnostic(&record);
+
+        for field in [
+            "stage=before_handle_fs_key_input",
+            "video_audio_mode=Some(7)",
+            "fs_music_view_active=true",
+            "wants_keyboard_input=false",
+            "ime_input_active=false",
+            "music_bookmark_modal_open=false",
+            "music_normalize_modal_active=true",
+            "fs_context_menu_idx=Some(3)",
+            "viewport=",
+            "pass=42",
+        ] {
+            assert!(line.contains(field), "missing {field}: {line}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn video_audio_exit_diagnostic_emits_a_heartbeat_without_candidates() {
         let start = std::time::Instant::now();
         let mut state = VideoAudioExitKeyDiagnosticRateState::default();
@@ -33945,6 +34329,100 @@ mod tests {
                 .observe(start + std::time::Duration::from_secs(1), next)
                 .is_some()
         );
+    }
+
+    #[cfg(windows)]
+    fn original_preview_blocker_record(
+        active: bool,
+        cache_hit: bool,
+        sequence_at_write: bool,
+        sequence_at_blocker: bool,
+        call_order: u64,
+    ) -> FsOriginalPreviewBlockerDiagnosticRecord {
+        FsOriginalPreviewBlockerDiagnosticRecord {
+            idx: 4,
+            items_generation: 9,
+            viewport: egui::ViewportId::ROOT,
+            sequence_blocks_new_target: sequence_at_blocker,
+            observation: FsOriginalPreviewFrameObservation {
+                sample: FsOriginalPreviewFrameSample {
+                    frame_nr: 11,
+                    items_generation: 9,
+                    idx: 4,
+                    active,
+                    written_pass_nr: 20,
+                    written_call_order: 1,
+                    sequence_blocks_new_target_at_write: sequence_at_write,
+                },
+                cache_hit,
+                observed_frame_nr: 11,
+                observed_pass_nr: 20,
+                observed_call_order: call_order,
+            },
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn original_preview_blocker_diagnostic_aggregates_without_signal_gating() {
+        let start = std::time::Instant::now();
+        let mut state = FsOriginalPreviewBlockerDiagnosticRateState::default();
+        let first = state
+            .observe(
+                start,
+                original_preview_blocker_record(false, false, false, false, 1),
+            )
+            .expect("the first observation establishes the one-second heartbeat");
+        assert_eq!(first.checks, 1);
+        assert_eq!(first.original_preview_returns, 0);
+
+        assert!(
+            state
+                .observe(
+                    start + std::time::Duration::from_millis(100),
+                    original_preview_blocker_record(true, true, false, true, 2),
+                )
+                .is_none()
+        );
+        assert!(
+            state
+                .observe(
+                    start + std::time::Duration::from_millis(200),
+                    original_preview_blocker_record(true, false, false, false, 1),
+                )
+                .is_none()
+        );
+        let summary = state
+            .observe(
+                start + FS_ORIGINAL_PREVIEW_BLOCKER_LOG_INTERVAL,
+                original_preview_blocker_record(false, true, true, true, 3),
+            )
+            .expect("the interval, not an investigated signal, must release the summary");
+        assert_eq!(summary.checks, 3);
+        assert_eq!(summary.sequence_in_flight_checks, 2);
+        assert_eq!(summary.original_preview_returns, 2);
+        assert_eq!(summary.sequence_in_flight_returns, 1);
+        assert_eq!(summary.sequence_idle_returns, 1);
+        assert_eq!(summary.memo_hit_returns, 1);
+        assert_eq!(summary.fresh_evaluation_returns, 1);
+        let last = summary
+            .last_return
+            .expect("the latest return keeps its order");
+        assert!(!last.sequence_blocks_new_target);
+        assert!(!last.observation.cache_hit);
+        assert_eq!(last.observation.sample.written_call_order, 1);
+        assert_eq!(last.observation.observed_frame_nr, 11);
+        assert_eq!(last.observation.observed_call_order, 1);
+
+        let heartbeat = state
+            .observe(
+                start + FS_ORIGINAL_PREVIEW_BLOCKER_LOG_INTERVAL * 2,
+                original_preview_blocker_record(false, false, false, true, 1),
+            )
+            .expect("a zero-return interval must still emit");
+        assert_eq!(heartbeat.sequence_in_flight_checks, 1);
+        assert_eq!(heartbeat.original_preview_returns, 0);
+        assert!(heartbeat.last_return.is_none());
     }
 
     #[test]
@@ -38210,7 +38688,7 @@ mod tests {
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 load_rx,
                 0,
-                crate::app::FsLoadPurpose::Display,
+                crate::app::FsLoadPurpose::for_page(true),
             ),
         );
         app.compare_preparation =

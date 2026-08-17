@@ -962,6 +962,19 @@
 - 変更は read-only 診断 snapshot の候補化と出力頻度だけ。production の key consume、Action 成立、
   dispatch、音声モード enter / exit 挙動、原因修正には触れない。
 
+#### 診断計装の 3 回目の再修正 (2026-08-17)
+
+- heartbeat 追加後も、実ログでは `[fs-key] source=fullscreen ... Z:down` と同じ時刻帯に
+  `exit key diagnostic fs_summary=None` しか出ず、Z frame を下流から候補化できなかった。
+- Z が見えていることを実ログで確認済みの `fullscreen_shortcut_event_summary` 直後へ
+  source-side 行を追加する。音声モード中の `Z:down` ごとに、これから
+  `handle_fs_key_input` を呼ぶ stage、`video_audio_mode`、`fs_music_view_active` /
+  `wants_keyboard_input` / `ime_input_active` / bookmark modal / normalize modal / context menu の
+  全 guard 値、`ctx.viewport_id()` と
+  `cumulative_pass_nr()` を rate limit なしで記録する。
+- 既存の `exit key diagnostic` は残し、source-side 行と viewport / pass を突き合わせる。
+  production の key consume / dispatch / audio-mode state は変更せず、原因修正も行わない。
+
 ### 4.1 Shift / Alt + ホイールのカスタマイズ再設計
 
 - 背景: v1.7.0 のリングショートカット / マウスボタン実装中に、Shift / Alt + ホイールのペアバインドを
@@ -974,6 +987,14 @@
 - 実装メモ: `ring_shortcuts.shift_wheel_pair` / `alt_wheel_pair` は互換読み込み用フィールドとして残すが、
   現行 UI / 入力経路からは参照しない。
 - 規模 / リスク: Medium / 中。動画系の手動確認を含めて別タスクで扱う。
+
+### 4.3 操作カスタマイズのキーボード図 HOME / BOTTOM が 4px 右へずれる
+
+- **完了 (2026-08-17):** HOME / BOTTOM 先頭の `Spacer(48.0)` を typed `KeyIndent("Tab")`
+  へ置換した。`egui::Ui::add_space` は `item_spacing` を足さず、後続キー配置が spacing を足すため、
+  QWERTY の実 Tab と同じ label-width 44px だけを代替する。
+- 描画は実キーと同じ `keyboard_picker_label_width` から幅を導く。将来の標準キー幅変更でも
+  インデントだけがずれない。HOME / BOTTOM の先頭 variant と Tab 幅一致を unit test で固定する。
 
 ## 5. リリース前確認 / 依存更新
 
@@ -1272,6 +1293,10 @@
   既存 `fs_animation` の10テストは無修正で通過。
 - 現ページ1本の全フレーム常駐は確定仕様。ストリーミング / リングバッファ化は今回の範囲外で、
   将来必要になった場合は GIF / WebP のフレーム依存とループ再decodeを含めて別設計にする。
+- **表示述語追補 (2026-08-17):** 進行表示を `AnimationPromotion` 専用から「現ページの
+  アニメーション全フレーム展開が in-flight」へ統一した。初回 `Display` と先読み後の昇格の
+  typed load purpose が同じ開始時刻 projection を公開し、150ms gate と右上3段目の位置は変更しない。
+  アニメーション非対応拡張子と PDF は表示対象にしない。
 - 正本: [codex-animation-prefetch-policy-brief.md](briefs/codex-animation-prefetch-policy-brief.md)。
   関連: [display-pipeline.md](display-pipeline.md) §4.1.1。
 
@@ -1291,6 +1316,12 @@
   だけを使う。時間窓、pass-through 復活、先読み窓変更、`blocks_new_target()` caller 例外は追加しない。
 - 回帰テストは `FsOriginalPreviewHold` を Ctrl へ再割り当てして、sequence in flight 中の false と
   sequence 不在時の true を固定する。既存の元画像 preview / readiness テストは変更しない。
+- **実測後の判別計装 (2026-08-17、原因修正なし):** 修正後の perf log でも
+  `page_turn_decision reason=original_preview` と holdover が支配的だったため、blocker 到達ごとに
+  memo の cache hit / fresh evaluation、memo 書込時と blocker 時の frame / pass / frame内 call order、
+  両時点の `fs_navigation_sequence_blocks_new_target()` を read-only で記録する。1秒ごとの
+  `fs/original_preview_blocker_summary` は sequence in-flight 中の original-preview return 数を集計し、
+  return が0件でも heartbeat を出す。抑制条件を original-preview / sequence の成立自体には依存させない。
 - 関連: [display-pipeline.md](display-pipeline.md) §§2.3, 2.5.4、
   [keymap-spec.md](keymap-spec.md)「画像フルスクリーン」。
 

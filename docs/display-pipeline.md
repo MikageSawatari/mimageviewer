@@ -2329,9 +2329,11 @@ fullscreen の canonical decode は `AnimationPolicy` を正本にする。現�
 
 昇格 worker / upload backlog は load purpose、items generation、target idx を保持する。別ページへ
 移動した昇格は cancel し、完了が遅れても target idx が現在ページでなければ適用しない。昇格失敗は
-`Failed` entry にせず第1フレームを `PromotionFailed` の static として残す。進行表示は worker の
-in-flight 状態から導き、150ms 以上続いたときだけ右上3段目へ表示する。この150msは競合を吸収する
-時間窓ではなく、短時間処理を提示するかどうかだけの UI ゲートである。
+`Failed` entry にせず第1フレームを `PromotionFailed` の static として残す。進行表示は、現ページの
+全フレーム展開を所有する typed load purpose から導く。一覧から直接開いた初回 `Display` と、
+先読み第1フレームからの `AnimationPromotion` のどちらも同じ述語で扱い、150ms 以上続いたときだけ
+右上3段目へ表示する。この150msは競合を吸収する時間窓ではなく、短時間処理を提示するかどうかだけの
+UI ゲートである。
 
 ### 4.2 サムネイル / フルスクリーンの整合性
 

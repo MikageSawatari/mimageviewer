@@ -5002,12 +5002,14 @@ use crate::canonical_image_loader::{
 use crate::fs_animation::{AnimationPlayback, FsCacheEntry, FsLoadResult, StaticAnimationState};
 use crate::items_generation_cache::{ItemsGenerationMap, ItemsGenerationVec};
 
-const ANIMATION_PROMOTION_PROGRESS_DELAY: std::time::Duration =
+const ANIMATION_EXPANSION_PROGRESS_DELAY: std::time::Duration =
     std::time::Duration::from_millis(150);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FsLoadPurpose {
-    Display,
+    Display {
+        started_at: std::time::Instant,
+    },
     Prefetch,
     AnimationPromotion {
         target_idx: usize,
@@ -5016,9 +5018,11 @@ pub(crate) enum FsLoadPurpose {
 }
 
 impl FsLoadPurpose {
-    fn for_page(is_current: bool) -> Self {
+    pub(crate) fn for_page(is_current: bool) -> Self {
         if is_current {
-            Self::Display
+            Self::Display {
+                started_at: std::time::Instant::now(),
+            }
         } else {
             Self::Prefetch
         }
@@ -5027,7 +5031,21 @@ impl FsLoadPurpose {
     const fn animation_policy(self) -> AnimationPolicy {
         match self {
             Self::Prefetch => AnimationPolicy::FirstFrameOnly,
-            Self::Display | Self::AnimationPromotion { .. } => AnimationPolicy::FullFrames,
+            Self::Display { .. } | Self::AnimationPromotion { .. } => AnimationPolicy::FullFrames,
+        }
+    }
+
+    pub(crate) const fn animation_expansion_started_at_for(
+        self,
+        idx: usize,
+    ) -> Option<std::time::Instant> {
+        match self {
+            Self::Display { started_at } => Some(started_at),
+            Self::AnimationPromotion {
+                target_idx,
+                started_at,
+            } if target_idx == idx => Some(started_at),
+            Self::Prefetch | Self::AnimationPromotion { .. } => None,
         }
     }
 
@@ -5042,13 +5060,13 @@ impl FsLoadPurpose {
     }
 }
 
-pub(crate) fn animation_promotion_progress_visible(
+pub(crate) fn animation_expansion_progress_visible(
     started_at: Option<std::time::Instant>,
     now: std::time::Instant,
 ) -> bool {
     started_at.is_some_and(|started_at| {
         now.checked_duration_since(started_at)
-            .is_some_and(|elapsed| elapsed >= ANIMATION_PROMOTION_PROGRESS_DELAY)
+            .is_some_and(|elapsed| elapsed >= ANIMATION_EXPANSION_PROGRESS_DELAY)
     })
 }
 
@@ -49848,7 +49866,12 @@ impl App {
         let perf_seq = self.input_seq;
         self.fs_pending.insert(
             idx,
-            FsPendingValue::new(Arc::clone(&cancel), fs_rx, perf_seq, FsLoadPurpose::Display),
+            FsPendingValue::new(
+                Arc::clone(&cancel),
+                fs_rx,
+                perf_seq,
+                FsLoadPurpose::for_page(true),
+            ),
         );
 
         std::thread::spawn(move || {
@@ -55389,15 +55412,34 @@ impl App {
             .is_some_and(|pending| pending.purpose == purpose)
     }
 
-    pub(crate) fn current_animation_promotion_started_at(&self) -> Option<std::time::Instant> {
+    fn item_may_expand_animation(&self, idx: usize) -> bool {
+        let extension = match self.items.get(idx) {
+            Some(GridItem::Image(path)) => path.extension().and_then(|ext| ext.to_str()),
+            Some(GridItem::ZipImage { entry_name, .. }) => std::path::Path::new(entry_name)
+                .extension()
+                .and_then(|ext| ext.to_str()),
+            _ => None,
+        };
+        extension.is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "gif" | "png" | "webp"
+            )
+        })
+    }
+
+    pub(crate) fn current_animation_expansion_started_at(&self) -> Option<std::time::Instant> {
         let idx = self.fullscreen_idx?;
+        if !self.item_may_expand_animation(idx) {
+            return None;
+        }
         self.fs_pending
             .get(&idx)
-            .and_then(|pending| pending.purpose.promotion_started_at_for(idx))
+            .and_then(|pending| pending.purpose.animation_expansion_started_at_for(idx))
             .or_else(|| {
                 self.fs_upload_backlog.iter().find_map(|entry| {
                     (entry.idx == idx)
-                        .then(|| entry.purpose.promotion_started_at_for(idx))
+                        .then(|| entry.purpose.animation_expansion_started_at_for(idx))
                         .flatten()
                 })
             })

@@ -103,6 +103,10 @@ keymap 対象にする。`Esc` / 修飾なし矢印ナビゲーション、Ctrl+
 `Z:down` を報告した frame も候補にし、さらに音声モード中は理由や Z 観測の有無に関係なく
 最低 1 秒に 1 行を出す。停止中に通常 repaint が無くても heartbeat 時刻の repaint を予約する。
 調査中の信号が全て false でも診断自体が黙らないことを不変条件とする。
+`[fs-key] source=fullscreen` が音声モード中の `Z:down` を直接観測した地点では、
+`handle_fs_key_input` 呼出し前の guard chain、`video_audio_mode`、viewport / pass を
+rate limit せず別行へ記録する。下流の `exit key diagnostic` は残し、両行の viewport / pass を
+突き合わせる。この source-side 行も read-only 計装であり、consume や dispatch には使用しない。
 
 Windows の egui 経路では、KeySlot でショートカットを所有した押下を egui event queue からも
 同時に除去する。ただし egui 0.33 は UI 実行前の `begin_pass` で <kbd>Tab</kbd> から focus

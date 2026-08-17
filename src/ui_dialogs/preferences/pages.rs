@@ -2365,6 +2365,9 @@ fn draw_keyboard_picker_rows(
                         .inner
                         .on_hover_text("現在は割り当て対象外です。");
                     }
+                    KeyboardPickerCell::KeyIndent(label) => {
+                        ui.add_space(keyboard_picker_label_width(label));
+                    }
                     KeyboardPickerCell::Spacer(width) => {
                         ui.add_space(width);
                     }
@@ -2378,11 +2381,15 @@ fn draw_keyboard_picker_rows(
 enum KeyboardPickerCell {
     Key(KeyName, Option<&'static str>),
     Disabled(&'static str),
+    /// Assignable key rows use this when the key occupying the same leading column is omitted.
+    /// The renderer derives the indent from the same label-width table as a real key, so changing
+    /// standard key widths cannot leave the rows out of alignment.
+    KeyIndent(&'static str),
     Spacer(f32),
 }
 
 fn keyboard_picker_main_rows() -> [&'static [KeyboardPickerCell]; 6] {
-    use KeyboardPickerCell::{Key, Spacer};
+    use KeyboardPickerCell::{Key, KeyIndent};
     const EXTENDED_FUNCTION: &[KeyboardPickerCell] = &[
         Key(KeyName::F13, None),
         Key(KeyName::F14, None),
@@ -2444,11 +2451,10 @@ fn keyboard_picker_main_rows() -> [&'static [KeyboardPickerCell]; 6] {
         Key(KeyName::OpenBracket, None),
     ];
     // The rows below stand in for CapsLock and Shift, which are not assignable and so are not
-    // drawn. Without the indent A sat flush left while Q sat one Tab in, which read as the whole
-    // row being shifted a key to the left. `Spacer(48.0)` is the one-cell indent the navigation
-    // cluster already uses (44.0 key plus item spacing).
+    // drawn. Align them with Q by substituting the width of the real Tab cell. `add_space` does
+    // not add item spacing; the following key supplies the same spacing as Q after the real Tab.
     const HOME: &[KeyboardPickerCell] = &[
-        Spacer(48.0),
+        KeyIndent("Tab"),
         Key(KeyName::A, None),
         Key(KeyName::S, None),
         Key(KeyName::D, None),
@@ -2464,7 +2470,7 @@ fn keyboard_picker_main_rows() -> [&'static [KeyboardPickerCell]; 6] {
         Key(KeyName::Enter, None),
     ];
     const BOTTOM: &[KeyboardPickerCell] = &[
-        Spacer(48.0),
+        KeyIndent("Tab"),
         Key(KeyName::Z, None),
         Key(KeyName::X, None),
         Key(KeyName::C, None),
@@ -7843,8 +7849,9 @@ mod tests {
         AI_SIZE_LIMIT_OPTIONS, KeyboardPickerCell, OperationAssignmentTab,
         OperationAssignmentTarget, PreferencesState, apply_command_editor,
         close_assignment_editors, command_action_matches_filter, command_key_labels_match_filter,
-        compact_key_action_label, compact_operation_label, keyboard_picker_main_rows,
-        modifier_hold_editor_choice, natural_operation_label_cmp, open_operation_assignment_editor,
+        compact_key_action_label, compact_operation_label, keyboard_picker_cell_width,
+        keyboard_picker_label_width, keyboard_picker_main_rows, modifier_hold_editor_choice,
+        natural_operation_label_cmp, open_operation_assignment_editor,
         ring_bindings_for_key_action,
     };
     use crate::app::MAX_TEXTURE_DIM;
@@ -8048,7 +8055,9 @@ mod tests {
     fn letter_rows_are_indented_where_capslock_and_shift_would_sit() {
         let rows = keyboard_picker_main_rows();
         let leading_indent = |row: &[KeyboardPickerCell]| match row.first() {
-            Some(KeyboardPickerCell::Spacer(width)) => Some(*width),
+            Some(KeyboardPickerCell::KeyIndent(label)) => {
+                Some((*label, keyboard_picker_label_width(label)))
+            }
             _ => None,
         };
 
@@ -8067,11 +8076,13 @@ mod tests {
             ("home", rows[4], KeyName::A),
             ("bottom", rows[5], KeyName::Z),
         ] {
-            let indent = leading_indent(row)
-                .unwrap_or_else(|| panic!("{label} row must start with a spacer indent"));
-            assert!(
-                indent > 0.0,
-                "{label} row indent must be positive, got {indent}"
+            let (indent_key, indent) = leading_indent(row)
+                .unwrap_or_else(|| panic!("{label} row must start with a key indent"));
+            assert_eq!(indent_key, "Tab", "{label} row must substitute Tab");
+            assert_eq!(
+                indent,
+                keyboard_picker_cell_width(KeyName::Tab.display_name(), KeyName::Tab),
+                "{label} row indent must exactly match the standard Tab key width"
             );
             assert!(
                 matches!(row.get(1), Some(KeyboardPickerCell::Key(key, _)) if *key == first_key),

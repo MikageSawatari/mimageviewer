@@ -88,14 +88,14 @@ fn fullscreen_fs_cache_does_not_cross_install_new_items_generation() {
             std::sync::Arc::clone(&cancel),
             rx,
             9,
-            FsLoadPurpose::Display,
+            FsLoadPurpose::for_page(true),
         ),
     );
     app.fs_upload_backlog.push(FsUploadResult::new(
         0,
         FsLoadResult::Failed,
         9,
-        FsLoadPurpose::Display,
+        FsLoadPurpose::for_page(true),
     ));
 
     app.install_new_items(
@@ -122,7 +122,7 @@ fn stale_fullscreen_load_completion_is_not_enqueued_for_new_items() {
         0,
         FsLoadResult::Failed,
         17,
-        FsLoadPurpose::Display,
+        FsLoadPurpose::for_page(true),
     );
 
     assert!(!accepted);
@@ -23426,7 +23426,7 @@ mod pipeline_cache_refactor_tests {
                 source_dims: [4, 4],
             },
             7,
-            FsLoadPurpose::Display,
+            FsLoadPurpose::for_page(true),
         ));
 
         app.poll_prefetch(&ctx);
@@ -26572,7 +26572,12 @@ mod pipeline_cache_refactor_tests {
         let input_seq = app.input_seq;
         app.fs_pending.insert(
             idx,
-            FsPendingValue::new(Arc::clone(&cancel), rx, input_seq, FsLoadPurpose::Display),
+            FsPendingValue::new(
+                Arc::clone(&cancel),
+                rx,
+                input_seq,
+                FsLoadPurpose::for_page(true),
+            ),
         );
 
         for _ in 0..120 {
@@ -26661,14 +26666,14 @@ mod pipeline_cache_refactor_tests {
                 Arc::clone(&fs_cancel),
                 fs_rx,
                 input_seq,
-                FsLoadPurpose::Display,
+                FsLoadPurpose::for_page(true),
             ),
         );
         app.fs_upload_backlog.push(FsUploadResult::new(
             pending_idx,
             FsLoadResult::Failed,
             input_seq,
-            FsLoadPurpose::Display,
+            FsLoadPurpose::for_page(true),
         ));
 
         let ai_key = FinalAiKey {
@@ -27000,6 +27005,16 @@ mod pipeline_cache_refactor_tests {
                 .animation_policy(),
             crate::canonical_image_loader::AnimationPolicy::FirstFrameOnly
         );
+        let started_at = app
+            .current_animation_expansion_started_at()
+            .expect("the current Display request must expose its in-flight animation expansion");
+        assert!(
+            animation_expansion_progress_visible(
+                Some(started_at),
+                started_at + std::time::Duration::from_millis(150),
+            ),
+            "Display expansion must reach the shared visible predicate"
+        );
     }
 
     #[test]
@@ -27019,6 +27034,18 @@ mod pipeline_cache_refactor_tests {
         assert!(app.ensure_fs_page_load(idx).is_display_ready());
         let purpose = app.fs_pending.get(&idx).unwrap().purpose;
         assert!(purpose.promotion_started_at_for(idx).is_some());
+        assert_eq!(
+            app.current_animation_expansion_started_at(),
+            purpose.animation_expansion_started_at_for(idx),
+            "promotion must remain visible through the shared expansion predicate"
+        );
+        let started_at = purpose
+            .animation_expansion_started_at_for(idx)
+            .expect("promotion owns an expansion start time");
+        assert!(animation_expansion_progress_visible(
+            Some(started_at),
+            started_at + std::time::Duration::from_millis(150),
+        ));
         assert_eq!(
             purpose.animation_policy(),
             crate::canonical_image_loader::AnimationPolicy::FullFrames
@@ -27126,21 +27153,33 @@ mod pipeline_cache_refactor_tests {
     }
 
     #[test]
-    fn animation_promotion_progress_visibility_tracks_in_flight_state_and_delay() {
+    fn animation_expansion_progress_visibility_keeps_the_150ms_gate() {
         let started_at = std::time::Instant::now();
-        assert!(!animation_promotion_progress_visible(None, started_at));
-        assert!(!animation_promotion_progress_visible(
+        assert!(!animation_expansion_progress_visible(None, started_at));
+        assert!(!animation_expansion_progress_visible(
             Some(started_at),
             started_at + std::time::Duration::from_millis(149)
         ));
-        assert!(animation_promotion_progress_visible(
+        assert!(animation_expansion_progress_visible(
             Some(started_at),
             started_at + std::time::Duration::from_millis(150)
         ));
-        assert!(!animation_promotion_progress_visible(
+        assert!(!animation_expansion_progress_visible(
             None,
             started_at + std::time::Duration::from_secs(1)
         ));
+    }
+
+    #[test]
+    fn static_display_request_does_not_claim_animation_expansion_progress() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\missing\still.jpg");
+        app.fullscreen_idx = Some(idx);
+
+        app.start_fs_load(idx);
+
+        assert!(app.fs_pending.contains_key(&idx));
+        assert_eq!(app.current_animation_expansion_started_at(), None);
     }
 
     #[test]
