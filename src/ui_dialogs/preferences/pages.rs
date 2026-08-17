@@ -2366,7 +2366,13 @@ fn draw_keyboard_picker_rows(
                         .on_hover_text("現在は割り当て対象外です。");
                     }
                     KeyboardPickerCell::KeyIndent(label) => {
-                        ui.add_space(keyboard_picker_label_width(label));
+                        // The substituted key's width plus the gap that would follow it. add_space
+                        // only advances the cursor, and the key after it is treated as the row's
+                        // first item, so it gets no leading item_spacing - which left A short of
+                        // Q by exactly one gap when this was the width alone.
+                        ui.add_space(
+                            keyboard_picker_label_width(label) + ui.spacing().item_spacing.x,
+                        );
                     }
                     KeyboardPickerCell::Spacer(width) => {
                         ui.add_space(width);
