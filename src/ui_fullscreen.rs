@@ -45,7 +45,7 @@ use crate::items_generation_cache::ItemsGenerationMap;
 use crate::keymap::DiagnosticChordPressSnapshot;
 use crate::keymap::{
     Chord, CommandScope, FS_IMAGE_ACTIVE_SCOPES, FS_VIDEO_ACTIVE_SCOPES, KeyAction, KeyName,
-    KeyTrigger, Keymap, command_catalog,
+    KeyTrigger, Keymap, ModKind, command_catalog, modifier_held_via_os,
 };
 use crate::pdf_loader::PdfPageContentType;
 use crate::settings::{
@@ -8304,6 +8304,76 @@ struct FsPageTurnFrameDecision {
     decision: FsPageTurnDecision,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FsPageTurnCtrlProbeLevels {
+    right_ctrl_held: Option<bool>,
+    left_ctrl_held: Option<bool>,
+}
+
+impl FsPageTurnCtrlProbeLevels {
+    fn sample(permit: Option<crate::keyboard_input::FocusedKeyStatePermit>) -> Self {
+        let Some(permit) = permit else {
+            return Self::default();
+        };
+        Self {
+            right_ctrl_held: Some(modifier_held_via_os(permit, ModKind::RightCtrl)),
+            left_ctrl_held: Some(modifier_held_via_os(permit, ModKind::Ctrl)),
+        }
+    }
+}
+
+fn fs_page_turn_decision_probe_fields(
+    frame_counter: u64,
+    frame_nr: u64,
+    idx: usize,
+    items_generation: u64,
+    decision: FsPageTurnDecision,
+    reason: &'static str,
+    original_preview_active: bool,
+    context_blocker: Option<&'static str>,
+    ctrl_levels: FsPageTurnCtrlProbeLevels,
+) -> Vec<(&'static str, serde_json::Value)> {
+    let optional_bool = |value: Option<bool>| {
+        value
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null)
+    };
+    vec![
+        ("n", serde_json::Value::from(frame_counter)),
+        ("frame_nr", serde_json::Value::from(frame_nr)),
+        ("idx", serde_json::Value::from(idx)),
+        (
+            "items_generation",
+            serde_json::Value::from(items_generation),
+        ),
+        ("mode", serde_json::Value::from(decision.perf_label())),
+        ("reason", serde_json::Value::from(reason)),
+        (
+            "defer_ui_uploads",
+            serde_json::Value::from(decision.defer_ui_uploads()),
+        ),
+        (
+            "passthrough_rendition_ready",
+            serde_json::Value::from(decision.passthrough_rendition_ready),
+        ),
+        (
+            "original_preview_active",
+            serde_json::Value::from(original_preview_active),
+        ),
+        (
+            "context_blocker",
+            context_blocker
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null),
+        ),
+        (
+            "right_ctrl_held",
+            optional_bool(ctrl_levels.right_ctrl_held),
+        ),
+        ("left_ctrl_held", optional_bool(ctrl_levels.left_ctrl_held)),
+    ]
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FsOriginalPreviewFrameSample {
     frame_nr: u64,
@@ -15277,16 +15347,30 @@ impl App {
 
     fn emit_fs_page_turn_decision_probe(
         &mut self,
+        ctx: &egui::Context,
+        viewport: egui::ViewportId,
         frame_nr: u64,
         fs_idx: usize,
         ordinary_blocker: Option<&'static str>,
         page_turn_input_held: bool,
         page_turn_burst_active: bool,
         decision: FsPageTurnDecision,
+        original_preview_active: bool,
     ) {
         if !crate::perf::is_enabled() {
             return;
         }
+        let viewport_focused = if viewport == ctx.viewport_id() {
+            ctx.input(|input| input.viewport().focused).unwrap_or(true)
+        } else {
+            self.fs_prev_focused
+        };
+        let ctrl_levels = FsPageTurnCtrlProbeLevels::sample(
+            crate::keyboard_input::focused_key_state_permit_for_viewport(
+                viewport,
+                viewport_focused,
+            ),
+        );
         let reason = if let Some(blocker) = ordinary_blocker {
             blocker
         } else if !page_turn_input_held {
@@ -15299,30 +15383,23 @@ impl App {
             "pass_through"
         };
         for idx in self.fs_display_unit_page_indices(fs_idx) {
+            let fields = fs_page_turn_decision_probe_fields(
+                self.frame_counter,
+                frame_nr,
+                idx,
+                self.items_generation,
+                decision,
+                reason,
+                original_preview_active,
+                ordinary_blocker,
+                ctrl_levels,
+            );
             crate::perf::event(
                 "fs",
                 "page_turn_decision",
                 self.perf_item_key(idx).as_deref(),
                 self.input_seq,
-                &[
-                    ("n", serde_json::Value::from(self.frame_counter)),
-                    ("frame_nr", serde_json::Value::from(frame_nr)),
-                    ("idx", serde_json::Value::from(idx)),
-                    (
-                        "items_generation",
-                        serde_json::Value::from(self.items_generation),
-                    ),
-                    ("mode", serde_json::Value::from(decision.perf_label())),
-                    ("reason", serde_json::Value::from(reason)),
-                    (
-                        "defer_ui_uploads",
-                        serde_json::Value::from(decision.defer_ui_uploads()),
-                    ),
-                    (
-                        "passthrough_rendition_ready",
-                        serde_json::Value::from(decision.passthrough_rendition_ready),
-                    ),
-                ],
+                &fields,
             );
         }
     }
@@ -15385,12 +15462,15 @@ impl App {
             );
             self.note_upload_deferral(fs_idx, decision);
             self.emit_fs_page_turn_decision_probe(
+                ctx,
+                viewport,
                 frame_nr,
                 fs_idx,
                 ordinary_blocker,
                 page_turn_input_held,
                 page_turn_burst_active,
                 decision,
+                original_preview_active,
             );
             ctx.data_mut(|data| {
                 data.insert_temp(
@@ -35550,6 +35630,83 @@ mod tests {
         assert_eq!(decision.paint_source(), FsPageTurnPaintSource::Materialized);
         assert!(decision.defer_ui_uploads());
         assert!(!decision.passthrough_rendition_ready);
+    }
+
+    fn page_turn_probe_field<'a>(
+        fields: &'a [(&'static str, serde_json::Value)],
+        name: &str,
+    ) -> &'a serde_json::Value {
+        fields
+            .iter()
+            .find_map(|(field_name, value)| (*field_name == name).then_some(value))
+            .unwrap_or_else(|| panic!("missing page-turn probe field: {name}"))
+    }
+
+    #[test]
+    fn page_turn_probe_keeps_context_fields_present_when_level_permit_is_missing() {
+        let fields = fs_page_turn_decision_probe_fields(
+            10,
+            11,
+            12,
+            13,
+            page_turn_decision_for_inputs(false, false),
+            "pending_zero",
+            false,
+            None,
+            FsPageTurnCtrlProbeLevels::sample(None),
+        );
+
+        assert_eq!(
+            page_turn_probe_field(&fields, "original_preview_active"),
+            &serde_json::Value::Bool(false)
+        );
+        assert_eq!(
+            page_turn_probe_field(&fields, "context_blocker"),
+            &serde_json::Value::Null
+        );
+        assert_eq!(
+            page_turn_probe_field(&fields, "right_ctrl_held"),
+            &serde_json::Value::Null
+        );
+        assert_eq!(
+            page_turn_probe_field(&fields, "left_ctrl_held"),
+            &serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn page_turn_probe_records_original_preview_blocker_and_ctrl_levels() {
+        let fields = fs_page_turn_decision_probe_fields(
+            20,
+            21,
+            22,
+            23,
+            page_turn_decision_for_inputs(false, false),
+            "original_preview",
+            true,
+            Some("original_preview"),
+            FsPageTurnCtrlProbeLevels {
+                right_ctrl_held: Some(true),
+                left_ctrl_held: Some(true),
+            },
+        );
+
+        assert_eq!(
+            page_turn_probe_field(&fields, "original_preview_active"),
+            &serde_json::Value::Bool(true)
+        );
+        assert_eq!(
+            page_turn_probe_field(&fields, "context_blocker"),
+            &serde_json::Value::String("original_preview".to_owned())
+        );
+        assert_eq!(
+            page_turn_probe_field(&fields, "right_ctrl_held"),
+            &serde_json::Value::Bool(true)
+        );
+        assert_eq!(
+            page_turn_probe_field(&fields, "left_ctrl_held"),
+            &serde_json::Value::Bool(true)
+        );
     }
 
     #[test]

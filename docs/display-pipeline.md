@@ -2019,6 +2019,11 @@ sequence を retire する。ページ矩形の canonical layout 契約は paged
 しないため、本番計測では `checked bursts>0` も完了条件に含める。
 **規則を変えたらこの不変条件も同時に更新する。**
 
+`fs/page_turn_decision` は、元画像ホールドの入力経路を信号自体で gate せず調査できるよう、
+`original_preview_active`、`context_blocker`、`right_ctrl_held`、`left_ctrl_held` を全 event に持つ。
+`context_blocker` は blocker が無ければ null、左右 Ctrl は focused current-level permit が無ければ
+どちらも null とする。Ctrl は egui modifiers ではなく非消費の OS 物理レベルを記録する。
+
 | ID | 不変条件 | 対応する要件 |
 | --- | --- | --- |
 | I1 | 1 バースト内で、同じ idx の `source` が `final_composite` → `thumbnail` へ戻らない | R2 |
