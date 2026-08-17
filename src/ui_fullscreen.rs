@@ -300,9 +300,21 @@ const COMPARE_NAVIGATOR_SHADER_SLOT: crate::compare_wgpu::CompareShaderSlot =
 /// This map serves both the navigator and the presentation trace seam. Missing navigator entries
 /// deliberately fall back to the catalog thumbnail, while missing trace entries mean that page
 /// was not reported as presented.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FsDisplayUnitPageProvenance {
+    Live,
+    Holdover,
+}
+
+struct FsNavigatorTextureSource {
+    idx: usize,
+    resource: FullscreenPaintResource,
+    provenance: FsDisplayUnitPageProvenance,
+}
+
 #[derive(Default)]
 struct FsNavigatorTextureSources {
-    pages: Vec<(usize, FullscreenPaintResource)>,
+    pages: Vec<FsNavigatorTextureSource>,
 }
 
 #[derive(Clone, Copy)]
@@ -319,7 +331,11 @@ impl FsNavigatorTextureSources {
         Self {
             pages: texture
                 .into_iter()
-                .map(|texture| (page_idx, texture))
+                .map(|resource| FsNavigatorTextureSource {
+                    idx: page_idx,
+                    resource,
+                    provenance: FsDisplayUnitPageProvenance::Live,
+                })
                 .collect(),
         }
     }
@@ -331,11 +347,19 @@ impl FsNavigatorTextureSources {
         right: Option<FullscreenPaintResource>,
     ) -> Self {
         let mut pages = Vec::with_capacity(2);
-        if let Some(texture) = left {
-            pages.push((left_idx, texture));
+        if let Some(resource) = left {
+            pages.push(FsNavigatorTextureSource {
+                idx: left_idx,
+                resource,
+                provenance: FsDisplayUnitPageProvenance::Live,
+            });
         }
-        if let Some(texture) = right {
-            pages.push((right_idx, texture));
+        if let Some(resource) = right {
+            pages.push(FsNavigatorTextureSource {
+                idx: right_idx,
+                resource,
+                provenance: FsDisplayUnitPageProvenance::Live,
+            });
         }
         Self { pages }
     }
@@ -346,7 +370,11 @@ impl FsNavigatorTextureSources {
         self.pages = unit
             .pages
             .iter()
-            .map(|page| (page.idx, page.texture.clone()))
+            .map(|page| FsNavigatorTextureSource {
+                idx: page.idx,
+                resource: page.texture.clone(),
+                provenance: FsDisplayUnitPageProvenance::Holdover,
+            })
             .collect();
     }
 
@@ -357,8 +385,8 @@ impl FsNavigatorTextureSources {
     ) -> Option<&'a egui::TextureHandle> {
         self.pages
             .iter()
-            .find(|(idx, _)| *idx == page_idx)
-            .map(|(_, resource)| resource.source_texture())
+            .find(|source| source.idx == page_idx)
+            .map(|source| source.resource.source_texture())
             .or(thumbnail)
     }
 }
@@ -4634,13 +4662,10 @@ impl App {
         &self,
         idx: usize,
         texture: &egui::TextureHandle,
+        provenance: FsDisplayUnitPageProvenance,
     ) -> &'static str {
         let texture_id = texture.id();
-        if self
-            .fs_holdover_tex
-            .as_ref()
-            .is_some_and(|holdover| holdover.contains_texture_id(texture_id))
-        {
+        if provenance == FsDisplayUnitPageProvenance::Holdover {
             return "holdover";
         }
         if self.is_passthrough_rendition_texture(texture) {
@@ -4816,7 +4841,8 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<FsDisplayUnitHoldover> {
-        self.capture_fs_display_unit_with_rendition(Some(ctx), idx)
+        let visible_pair = self.resolve_visible_spread_pair(idx);
+        self.capture_fs_display_unit_with_rendition_for_pair(Some(ctx), idx, visible_pair)
     }
 
     fn capture_fs_display_unit_with_rendition(
@@ -4824,7 +4850,17 @@ impl App {
         rendition_ctx: Option<&egui::Context>,
         idx: usize,
     ) -> Option<FsDisplayUnitHoldover> {
-        match self.resolve_spread_pair(idx) {
+        let pair = self.resolve_spread_pair(idx);
+        self.capture_fs_display_unit_with_rendition_for_pair(rendition_ctx, idx, pair)
+    }
+
+    fn capture_fs_display_unit_with_rendition_for_pair(
+        &mut self,
+        rendition_ctx: Option<&egui::Context>,
+        idx: usize,
+        pair: SpreadPair,
+    ) -> Option<FsDisplayUnitHoldover> {
+        match pair {
             SpreadPair::Single => {
                 let rotation = self.get_rotation(idx);
                 let content_bbox = if rotation.is_none() {
@@ -7875,6 +7911,24 @@ fn spread_shift_anchor_pos_for_target(target_pos: usize, landscape_flags: &[bool
     anchor_pos.min(target_pos)
 }
 
+fn spread_shift_direction_for_input(
+    ctrl_left: bool,
+    ctrl_right: bool,
+    spread_shift_prev: bool,
+    spread_shift_next: bool,
+    page_rtl: bool,
+) -> Option<i32> {
+    let ctrl_nudge_next = (ctrl_right && !page_rtl) || (ctrl_left && page_rtl);
+    let ctrl_nudge_prev = (ctrl_left && !page_rtl) || (ctrl_right && page_rtl);
+    (ctrl_nudge_next || ctrl_nudge_prev || spread_shift_prev || spread_shift_next).then_some(
+        if spread_shift_next || ctrl_nudge_next {
+            1
+        } else {
+            -1
+        },
+    )
+}
+
 // ── フルスクリーン状態の中間構造体 ──────────────────────────────────────
 
 /// フルスクリーン描画 1 フレーム分の事前計算済み状態。
@@ -8048,6 +8102,7 @@ fn fs_page_turn_ready_signature_changed(
 struct FsDisplayUnitTracePage {
     idx: usize,
     texture_id: egui::TextureId,
+    provenance: FsDisplayUnitPageProvenance,
     source: &'static str,
 }
 
@@ -12103,7 +12158,11 @@ impl App {
         let texture_source = if let Some(live_tex) = live_tex.as_ref() {
             if crate::perf::is_enabled() {
                 self.fullscreen_idx.map_or("processed_other", |idx| {
-                    self.fs_texture_source_for_trace(idx, live_tex)
+                    self.fs_texture_source_for_trace(
+                        idx,
+                        live_tex,
+                        FsDisplayUnitPageProvenance::Live,
+                    )
                 })
             } else {
                 "live_display"
@@ -14891,13 +14950,15 @@ impl App {
                 sources
                     .pages
                     .iter()
-                    .find(|(page_idx, _)| page_idx == idx)
-                    .map(|(_, resource)| {
-                        let texture = resource.source_texture();
-                        let source = self.fs_texture_source_for_trace(*idx, texture);
+                    .find(|selected| selected.idx == *idx)
+                    .map(|selected| {
+                        let texture = selected.resource.source_texture();
+                        let source =
+                            self.fs_texture_source_for_trace(*idx, texture, selected.provenance);
                         FsDisplayUnitTracePage {
                             idx: *idx,
                             texture_id: texture.id(),
+                            provenance: selected.provenance,
                             source,
                         }
                     })
@@ -14946,7 +15007,9 @@ impl App {
         let trace_pages = self
             .fs_display_unit_trace_pages(fs_idx, spread_pair, sources)
             .unwrap_or_default();
-        let captured_display_unit = trace_pages.iter().any(|page| page.source == "holdover");
+        let captured_display_unit = trace_pages
+            .iter()
+            .any(|page| page.provenance == FsDisplayUnitPageProvenance::Holdover);
         let viewport = self.fs_trace_viewport(ctx, captured_display_unit);
         let cache_id = egui::Id::new(("fs_paint_display_unit", viewport));
         let previous = ctx.data(|data| data.get_temp::<FsPaintDisplayUnitSignature>(cache_id));
@@ -14993,10 +15056,13 @@ impl App {
         ctx.data_mut(|data| data.insert_temp(cache_id, current));
 
         for (page, signature) in changed_pages {
-            let held_trace = self
-                .fs_holdover_tex
-                .as_ref()
-                .and_then(|holdover| holdover.page_for_texture_id(page.texture_id))
+            let held_trace = (page.provenance == FsDisplayUnitPageProvenance::Holdover)
+                .then(|| {
+                    self.fs_holdover_tex
+                        .as_ref()
+                        .and_then(|holdover| holdover.page_for_texture_id(page.texture_id))
+                })
+                .flatten()
                 .map(|held| (held.trace_key.clone(), held.trace_load_seq));
             let entry_seq = match held_trace.as_ref() {
                 Some((_, load_seq)) => *load_seq,
@@ -15126,16 +15192,13 @@ impl App {
         if target.items_generation != self.items_generation {
             return;
         }
-        let captured_page_visible = trace_pages.iter().any(|page| {
-            self.fs_holdover_tex
-                .as_ref()
-                .and_then(|holdover| holdover.page_for_texture_id(page.texture_id))
-                .is_some()
-        });
+        let target_fully_live = trace_pages
+            .iter()
+            .all(|page| page.provenance == FsDisplayUnitPageProvenance::Live);
         let mut presented_pages = trace_pages.iter().map(|page| page.idx).collect::<Vec<_>>();
         presented_pages.sort_unstable();
         presented_pages.dedup();
-        if !captured_page_visible && presented_pages == target.pages {
+        if target_fully_live && presented_pages == target.pages {
             self.fs_nav_locked_gen = None;
             self.fs_holdover_tex = None;
         }
@@ -15190,7 +15253,9 @@ impl App {
         // and nothing the viewport would be needed for.
         #[cfg(windows)]
         let script_hold_id = {
-            let captured_display_unit = trace_pages.iter().any(|page| page.source == "holdover");
+            let captured_display_unit = trace_pages
+                .iter()
+                .any(|page| page.provenance == FsDisplayUnitPageProvenance::Holdover);
             let viewport = self.fs_trace_viewport(ctx, captured_display_unit);
             crate::key_input::synthetic_frame_hold_id(ctx, viewport)
         };
@@ -15198,10 +15263,13 @@ impl App {
         let script_hold_id: Option<u64> = None;
 
         for page in trace_pages {
-            let held_page = self
-                .fs_holdover_tex
-                .as_ref()
-                .and_then(|holdover| holdover.page_for_texture_id(page.texture_id));
+            let held_page = (page.provenance == FsDisplayUnitPageProvenance::Holdover)
+                .then(|| {
+                    self.fs_holdover_tex
+                        .as_ref()
+                        .and_then(|holdover| holdover.page_for_texture_id(page.texture_id))
+                })
+                .flatten();
             let event_key = match held_page {
                 Some(held) => held.trace_key.clone(),
                 None => self.perf_item_key(page.idx),
@@ -18763,14 +18831,13 @@ impl App {
         }
         // Ctrl+←/→: 見開きモードでは「1 ページずらし」(現在の表示ユニット先頭を
         // 1 ページぶんずらす)、Single モードでは 1 ページ移動。RTL は左右の意味を反転 (plain 矢印と同じ)。
-        let ctrl_nudge_next = (ctrl_right && !page_rtl) || (ctrl_left && page_rtl);
-        let ctrl_nudge_prev = (ctrl_left && !page_rtl) || (ctrl_right && page_rtl);
-        if ctrl_nudge_next || ctrl_nudge_prev || spread_shift_prev || spread_shift_next {
-            let dir = if spread_shift_next || ctrl_nudge_next {
-                1
-            } else {
-                -1
-            };
+        if let Some(dir) = spread_shift_direction_for_input(
+            ctrl_left,
+            ctrl_right,
+            spread_shift_prev,
+            spread_shift_next,
+            page_rtl,
+        ) {
             self.queue_spread_shift_action(fs_idx, dir, &mut action);
         }
         let mouse_nav_forward = mouse_forward || browser_forward;
@@ -20124,11 +20191,10 @@ impl App {
         fs_idx: usize,
         texture_sources: &FsNavigatorTextureSources,
     ) {
-        let captured_display_unit = texture_sources.pages.iter().any(|(_, resource)| {
-            self.fs_holdover_tex
-                .as_ref()
-                .is_some_and(|holdover| holdover.contains_texture_id(resource.source_texture_id()))
-        });
+        let captured_display_unit = texture_sources
+            .pages
+            .iter()
+            .any(|source| source.provenance == FsDisplayUnitPageProvenance::Holdover);
         if !self.fs_navigator_allowed_for_display_unit(ctx, fs_idx, captured_display_unit) {
             return;
         }
@@ -24950,7 +25016,11 @@ impl App {
                 }
                 self.fullscreen_page_layout.push(transform);
                 if let Some(resource) = draw_tex {
-                    painted_sources.pages.push((page.idx, resource));
+                    painted_sources.pages.push(FsNavigatorTextureSource {
+                        idx: page.idx,
+                        resource,
+                        provenance: FsDisplayUnitPageProvenance::Live,
+                    });
                 }
             }
         }
@@ -34279,6 +34349,345 @@ mod tests {
         assert!(panned.length_sq() > PAN_EPSILON_SQ);
     }
 
+    fn navigation_trace_page(
+        idx: usize,
+        texture_id: egui::TextureId,
+        provenance: FsDisplayUnitPageProvenance,
+    ) -> FsDisplayUnitTracePage {
+        let source = match provenance {
+            FsDisplayUnitPageProvenance::Live => stringify!(thumbnail),
+            FsDisplayUnitPageProvenance::Holdover => stringify!(holdover),
+        };
+        FsDisplayUnitTracePage {
+            idx,
+            texture_id,
+            provenance,
+            source,
+        }
+    }
+
+    fn navigation_holdover_page(
+        idx: usize,
+        texture: egui::TextureHandle,
+    ) -> FsDisplayUnitHoldoverPage {
+        FsDisplayUnitHoldoverPage {
+            idx,
+            layout_size: texture.size_vec2(),
+            post_filter: crate::adjustment::PostFilter::None,
+            trace_key: None,
+            trace_load_seq: 0,
+            texture: FullscreenPaintResource::direct(texture),
+            rotation: crate::rotation_db::Rotation::None,
+            source_size: None,
+            content_bbox: None,
+        }
+    }
+
+    #[test]
+    fn shared_previous_texture_drawn_live_retires_spread_shift_sequence() {
+        let ctx = egui::Context::default();
+        let page_2 = ctx.load_texture(
+            stringify!(page_2),
+            egui::ColorImage::filled([1, 1], egui::Color32::RED),
+            egui::TextureOptions::LINEAR,
+        );
+        let shared_page_3 = ctx.load_texture(
+            stringify!(shared_page_3),
+            egui::ColorImage::filled([1, 1], egui::Color32::GREEN),
+            egui::TextureOptions::LINEAR,
+        );
+        let page_4 = ctx.load_texture(
+            stringify!(page_4),
+            egui::ColorImage::filled([1, 1], egui::Color32::BLUE),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut app = crate::app::setup_app_for_test();
+        app.items_generation = 12;
+        app.fs_nav_locked_gen = Some(12);
+        app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous: Some(FsDisplayUnitHoldover {
+                pages: vec![
+                    navigation_holdover_page(2, page_2),
+                    navigation_holdover_page(3, shared_page_3.clone()),
+                ],
+            }),
+            target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                items_generation: 12,
+                pages: vec![3, 4],
+                phase: FsNavigationTargetPhase::Presenting(FsNavigationPresentation::Rendition),
+            }),
+        }));
+
+        let sources = FsNavigatorTextureSources::spread(
+            3,
+            Some(FullscreenPaintResource::direct(shared_page_3.clone())),
+            4,
+            Some(FullscreenPaintResource::direct(page_4)),
+        );
+        let trace = app
+            .fs_display_unit_trace_pages(3, SpreadPair::Double { left: 3, right: 4 }, &sources)
+            .unwrap();
+        assert!(
+            trace
+                .iter()
+                .all(|page| page.provenance == FsDisplayUnitPageProvenance::Live
+                    && page.source != stringify!(holdover))
+        );
+        app.observe_fs_navigation_sequence_presented(&trace);
+
+        assert!(app.fs_holdover_tex.is_none());
+        assert!(app.fs_nav_locked_gen.is_none());
+    }
+
+    #[test]
+    fn shared_previous_texture_actually_drawn_from_holdover_keeps_sequence_blocked() {
+        let ctx = egui::Context::default();
+        let page_2 = ctx.load_texture(
+            stringify!(held_page_2),
+            egui::ColorImage::filled([1, 1], egui::Color32::RED),
+            egui::TextureOptions::LINEAR,
+        );
+        let shared_page_3 = ctx.load_texture(
+            stringify!(held_shared_page_3),
+            egui::ColorImage::filled([1, 1], egui::Color32::GREEN),
+            egui::TextureOptions::LINEAR,
+        );
+        let page_4 = ctx.load_texture(
+            stringify!(live_page_4),
+            egui::ColorImage::filled([1, 1], egui::Color32::BLUE),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut app = crate::app::setup_app_for_test();
+        app.items_generation = 13;
+        app.fs_nav_locked_gen = Some(13);
+        app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous: Some(FsDisplayUnitHoldover {
+                pages: vec![
+                    navigation_holdover_page(2, page_2),
+                    navigation_holdover_page(3, shared_page_3.clone()),
+                ],
+            }),
+            target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                items_generation: 13,
+                pages: vec![3, 4],
+                phase: FsNavigationTargetPhase::Presenting(FsNavigationPresentation::Rendition),
+            }),
+        }));
+
+        let sources = FsNavigatorTextureSources {
+            pages: vec![
+                FsNavigatorTextureSource {
+                    idx: 3,
+                    resource: FullscreenPaintResource::direct(shared_page_3),
+                    provenance: FsDisplayUnitPageProvenance::Holdover,
+                },
+                FsNavigatorTextureSource {
+                    idx: 4,
+                    resource: FullscreenPaintResource::direct(page_4),
+                    provenance: FsDisplayUnitPageProvenance::Live,
+                },
+            ],
+        };
+        let trace = app
+            .fs_display_unit_trace_pages(3, SpreadPair::Double { left: 3, right: 4 }, &sources)
+            .unwrap();
+        assert_eq!(
+            trace
+                .iter()
+                .find(|page| page.idx == 3)
+                .map(|page| (page.provenance, page.source)),
+            Some((FsDisplayUnitPageProvenance::Holdover, "holdover"))
+        );
+        app.observe_fs_navigation_sequence_presented(&trace);
+
+        assert!(app.fs_navigation_sequence_blocks_new_target());
+        assert_eq!(app.fs_nav_locked_gen, Some(13));
+    }
+
+    #[test]
+    fn spread_shift_keymap_directions_follow_ltr_and_rtl() {
+        assert_eq!(
+            spread_shift_direction_for_input(false, true, false, false, false),
+            Some(1)
+        );
+        assert_eq!(
+            spread_shift_direction_for_input(true, false, false, false, false),
+            Some(-1)
+        );
+        assert_eq!(
+            spread_shift_direction_for_input(false, true, false, false, true),
+            Some(-1)
+        );
+        assert_eq!(
+            spread_shift_direction_for_input(true, false, false, false, true),
+            Some(1)
+        );
+        for page_rtl in [false, true] {
+            assert_eq!(
+                spread_shift_direction_for_input(false, false, true, false, page_rtl),
+                Some(-1)
+            );
+            assert_eq!(
+                spread_shift_direction_for_input(false, false, false, true, page_rtl),
+                Some(1)
+            );
+        }
+    }
+
+    fn record_test_spread_layout(app: &mut crate::app::AppTestEnvForTest, pair: SpreadPair) {
+        app.fullscreen_page_layout.clear();
+        app.fullscreen_page_layout
+            .begin(FullscreenPageLayoutKind::Spread);
+        let SpreadPair::Double { left, right } = pair else {
+            panic!();
+        };
+        for idx in [left, right] {
+            app.fullscreen_page_layout.push(navigator_test_transform(
+                idx,
+                crate::rotation_db::Rotation::None,
+                ResolvedDisplayPlacement::Normal { zoom_pan: None },
+            ));
+        }
+    }
+
+    fn sorted_pair_pages(pair: SpreadPair) -> Vec<usize> {
+        let SpreadPair::Double { left, right } = pair else {
+            panic!();
+        };
+        let mut pages = vec![left, right];
+        pages.sort_unstable();
+        pages
+    }
+
+    fn navigation_sequence_pages(app: &crate::app::AppTestEnvForTest) -> (Vec<usize>, Vec<usize>) {
+        let sequence = app
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .unwrap();
+        let mut previous = sequence
+            .previous
+            .as_ref()
+            .unwrap()
+            .pages
+            .iter()
+            .map(|page| page.idx)
+            .collect::<Vec<_>>();
+        previous.sort_unstable();
+        let FsNavigationSequenceTarget::Display(target) = &sequence.target else {
+            panic!();
+        };
+        (previous, target.pages.clone())
+    }
+
+    #[test]
+    fn spread_shift_capture_keeps_previous_pairing_for_both_directions_and_repeat() {
+        let ctx = egui::Context::default();
+        for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
+            for dir in [-1, 1] {
+                let mut app = crate::app::setup_app_for_test();
+                app.items = (0..7).map(|_| GridItem::Image(PathBuf::new())).collect();
+                app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+                app.visible_indices = (0..app.items.len()).collect();
+                app.cached_nav_indices = None;
+                app.spread_mode = mode;
+                app.fullscreen_idx = Some(2);
+                for idx in 0..app.items.len() {
+                    let pixels = std::sync::Arc::new(egui::ColorImage::filled(
+                        [2, 3],
+                        egui::Color32::from_gray(40 + idx as u8),
+                    ));
+                    let texture = ctx.load_texture(
+                        idx.to_string(),
+                        pixels.as_ref().clone(),
+                        egui::TextureOptions::LINEAR,
+                    );
+                    app.fs_cache.insert(
+                        idx,
+                        FsCacheEntry::Static {
+                            tex: texture,
+                            pixels,
+                            source_dims: Some([2, 3]),
+                            load_seq: idx as u64,
+                        },
+                    );
+                }
+
+                let first_previous_pair = app.resolve_spread_pair(2);
+                let first_previous_pages = sorted_pair_pages(first_previous_pair);
+                record_test_spread_layout(&mut app, first_previous_pair);
+                let mut first_action = FsKeyAction::default();
+                app.queue_spread_shift_action(2, dir, &mut first_action);
+                let FsPageNav::Target(first_target_idx) = first_action.page_nav else {
+                    panic!();
+                };
+                let first_target_pair = app.resolve_spread_pair(first_target_idx);
+                let first_target_pages = sorted_pair_pages(first_target_pair);
+                app.handle_fs_navigation(
+                    &ctx,
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                    first_action.page_nav,
+                    None,
+                    2,
+                );
+                assert_eq!(
+                    navigation_sequence_pages(&app),
+                    (first_previous_pages, first_target_pages.clone())
+                );
+
+                if let Some(sequence) = app
+                    .fs_holdover_tex
+                    .as_mut()
+                    .and_then(FsHoldover::navigation_sequence_mut)
+                    && let FsNavigationSequenceTarget::Display(target) = &mut sequence.target
+                {
+                    target.phase =
+                        FsNavigationTargetPhase::Presenting(FsNavigationPresentation::Rendition);
+                }
+                let first_trace = first_target_pages
+                    .iter()
+                    .map(|idx| {
+                        navigation_trace_page(
+                            *idx,
+                            egui::TextureId::Managed(100 + *idx as u64),
+                            FsDisplayUnitPageProvenance::Live,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                app.observe_fs_navigation_sequence_presented(&first_trace);
+                assert!(app.fs_holdover_tex.is_none());
+
+                record_test_spread_layout(&mut app, first_target_pair);
+                let mut repeat_action = FsKeyAction::default();
+                app.queue_spread_shift_action(first_target_idx, dir, &mut repeat_action);
+                let FsPageNav::Target(repeat_target_idx) = repeat_action.page_nav else {
+                    panic!();
+                };
+                let repeat_target_pages =
+                    sorted_pair_pages(app.resolve_spread_pair(repeat_target_idx));
+                app.handle_fs_navigation(
+                    &ctx,
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                    repeat_action.page_nav,
+                    None,
+                    first_target_idx,
+                );
+                assert_eq!(
+                    navigation_sequence_pages(&app),
+                    (first_target_pages, repeat_target_pages)
+                );
+            }
+        }
+    }
+
     #[test]
     fn navigation_sequence_requires_the_complete_atomic_target_unit() {
         let mut app = crate::app::setup_app_for_test();
@@ -34294,6 +34703,7 @@ mod tests {
         let first = FsDisplayUnitTracePage {
             idx: 3,
             texture_id: egui::TextureId::Managed(31),
+            provenance: FsDisplayUnitPageProvenance::Live,
             source: stringify!(thumbnail),
         };
         app.observe_fs_navigation_sequence_presented(&[first]);
@@ -34302,6 +34712,7 @@ mod tests {
         let second = FsDisplayUnitTracePage {
             idx: 4,
             texture_id: egui::TextureId::Managed(32),
+            provenance: FsDisplayUnitPageProvenance::Live,
             source: stringify!(thumbnail),
         };
         app.observe_fs_navigation_sequence_presented(&[first, second]);
@@ -34540,6 +34951,7 @@ mod tests {
         app.observe_fs_navigation_sequence_presented(&[FsDisplayUnitTracePage {
             idx: 0,
             texture_id: old.id(),
+            provenance: FsDisplayUnitPageProvenance::Holdover,
             source: stringify!(holdover),
         }]);
         assert!(app.fs_navigation_sequence_blocks_new_target());
@@ -34547,6 +34959,7 @@ mod tests {
         app.observe_fs_navigation_sequence_presented(&[FsDisplayUnitTracePage {
             idx: 0,
             texture_id: egui::TextureId::Managed(99),
+            provenance: FsDisplayUnitPageProvenance::Live,
             source: stringify!(thumbnail),
         }]);
         assert!(app.fs_holdover_tex.is_none());
@@ -35256,7 +35669,11 @@ mod tests {
         let held_texture = unit.pages[0].texture.source_texture();
 
         assert_eq!(
-            app.fs_texture_source_for_trace(idx, held_texture),
+            app.fs_texture_source_for_trace(
+                idx,
+                held_texture,
+                FsDisplayUnitPageProvenance::Holdover,
+            ),
             "holdover"
         );
     }

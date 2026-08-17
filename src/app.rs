@@ -6540,10 +6540,6 @@ impl FsHoldover {
         }
     }
 
-    pub(crate) fn contains_texture_id(&self, texture_id: egui::TextureId) -> bool {
-        self.page_for_texture_id(texture_id).is_some()
-    }
-
     pub(crate) fn page_for_texture_id(
         &self,
         texture_id: egui::TextureId,

@@ -1962,8 +1962,11 @@ unit 全体を描く。target と同じ idx に旧 texture が残っていても
 previous に属するなら提示とは数えない。
 
 描画直前に `Ready` を `Presenting` へ一方向遷移させて previous overlay を外す。描画末尾で
-`fs_display_unit_trace_pages` が target generation と完全な page set を返し、captured texture が
-1 枚も選ばれていないことを確認して初めて「提示済み」と判定し sequence を解放する。
+`fs_display_unit_trace_pages` が target generation、完全な page set、各ページを実際に選んだ
+`Live` / `Holdover` provenance を返し、target の全ページが `Live` として描かれたことを確認して
+初めて「提示済み」と判定し sequence を解放する。旧 unit と target unit が同じページを共有して
+同じ texture id を使っても、選択元が live なら `Live` であり、texture id の包含から ownership を
+推測しない。previous overlay を実際に描いたページは `Holdover` なので解放しない。
 したがって次の同 frame repeat が受理される場合でも、その前に target の draw command は確定済みで
 あり、見開き片側だけを提示済みと数えることはない。
 

@@ -1142,6 +1142,15 @@
 
 ### 1.88 見開き 1 ページずらし後にページ送りが停止する — 利用者報告
 
+- **完了 (2026-08-17):** `FsNavigatorTextureSources` の各ページへ typed な `Live` /
+  `Holdover` provenance を持たせ、選択元から `FsDisplayUnitTracePage` まで伝播した。
+  sequence は target の完全な page set がすべて `Live` として描かれた frame だけで解放し、
+  共有ページの texture id が previous にも含まれることから ownership を推測しない。
+  previous overlay の実描画、片側だけ ready、不完全 target は従来どおり解放しない。
+- `spread_shift_anchor_idx` は input 解決時に target pairing へ更新されるため、navigation の
+  previous capture は更新後の mutable pairing ではなく、直前に実描画された
+  `fullscreen_page_layout` の unit を優先するよう固定した。LTR / RTL、前後方向、単発 / repeat の
+  状態遷移テストで previous / target page set の分離を確認済み。
 - 出典: 専用スレ >>239 (2026-08-16)。v3.0.0 / v3.1.0 で再現し、v2.9.1 では
   発生しない。手元でも再現済み。
 - 再現:
