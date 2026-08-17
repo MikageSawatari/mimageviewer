@@ -1,170 +1,272 @@
-﻿# §1.31-B (前半) — acquire の待ちに上限を持たせる
+﻿# §1.31-B0 — どの待ちが実際に UI を止めているのかを先に測る
 
-対象: [next-release-backlog.md](../next-release-backlog.md) §1.31 の後半のうち **acquire 側だけ**。
+対象: [next-release-backlog.md](../next-release-backlog.md) §1.31 の後半 (B) の**着手判断のため**の計測。
 前提 = §1.31-A (`4e6e5efe`) が master へ merge 済み。
 
-**Present 側には手を出さない (§8)。**
+> **2026-08-17 改訂**。本書は当初「acquire に readiness gate を入れる」実装ブリーフだった。
+> Codex Sol の設計レビューで **P0 が 6 件**出て差し戻し、計測ブリーフに書き換えた。
+> 旧案の設計と、それが差し戻された理由は §3 に残してある (捨てない。測定で正当化されたら使う)。
 
-## 0. なぜ acquire だけを先にやるか
+## 0. なぜ実装ではなく計測から始めるのか
 
-§1.31-A は「同期メッセージ**自身が** GPU 待ちを開始する」経路を消した。だが UI スレッドが
-外側の paint で GPU を待っている間も message pump は止まるので、その最中に他スレッドが
-`SendMessage` すれば sender は待たされる。これを閉じるのが B。
+当初の計画は「acquire は public API だけで閉じられると分かったので、そこから実装する」だった。
+**API に手が届くことは、そこを先に直す根拠にならない。** 差し戻しの決め手は次の 2 つ。
 
-B は 2 つに分かれ、**難易度が桁違いに違う**:
+### 0.1 acquire を閉じても message service latency は上限化されない ⚠️
 
-- **acquire (本ブリーフ)**: wgpu の vendoring **不要**。public API だけで組める (§2 で実証済み)。
-- **Present**: `SurfaceTexture::present()` の戻り値が `()` で、HAL の FIFO Present は interval 1
-  かつ `DXGI_PRESENT_DO_NOT_WAIT` 無し。厳密に bounded にするには wgpu / core / hal の patch か
-  render thread 分離が要る。**A 後の実測を見てから判断する**ので、今回は対象外。
+非ゼロ `Resized` は message-dispatch 中に `painter.on_window_resized`
+([wgpu_integration.rs](../../vendor/eframe/src/native/wgpu_integration.rs)) →
+`configure_surface` ([winit.rs](../../vendor/egui-wgpu/src/winit.rs)) を通る。
+その先の wgpu-hal DX12 `configure` は `ResizeBuffers` の前に必ずこれを実行する:
 
-## 1. 現状 — 既定で「待って、結果を捨てる」
+```rust
+// wgpu-hal-27.0.4/src/dx12/mod.rs
+unsafe { device.wait_for_present_queue_idle() }?;
+```
 
-- `Dx12UseFrameLatencyWaitableObject` の既定は **`Wait`**
-  (`wgpu-types-27.0.1/src/instance.rs`)。swapchain は
-  `DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT` 付きで作られ、
-  `acquire_texture` が waitable object を待つ。
-- wgpu-core は `FRAME_TIMEOUT_MS = 1000` を渡す (`wgpu-core-27.0.3/src/present.rs`)。
-- wgpu-hal DX12 は `unsafe { sc.wait(timeout) }?;` と書いており、**戻り値の bool を捨てる**
-  (`wgpu-hal-27.0.4/src/dx12/mod.rs`)。timeout してもそのまま `GetCurrentBackBufferIndex` へ進む。
+```rust
+// wgpu-hal-27.0.4/src/dx12/device.rs
+unsafe { Threading::WaitForSingleObject(event.0, Threading::INFINITE) };
+```
 
-つまり **UI スレッドは 1 フレームあたり最大 1 秒ブロックし得て、timeout しても何も起きない**。
-§1.30 が「デッドロックか飢餓か区別できない」と書いていたのはこの構造。
+**`INFINITE` である。** unconfigure / drop 側にも同じ待ちがある。
+つまり §1.31-A が残した inline resize 例外は、acquire より**手前**で無期限 GPU wait に入れる。
+acquire 直前に gate を置いても、この経路は閉じない。
 
-## 2. 設計 — `DontWait` + 自前の非ブロッキング readiness gate
+「acquire は最大 1 秒」も厳密には強すぎた。1000ms は frame-latency wait に渡す timeout であって、
+acquire 全体の hard upper bound ではない。
 
-`DontWait` の doc に明記がある:
+### 0.2 §1.31-A の後、acquire が実害を起こしている証拠がまだ無い
 
-> Create the swapchain with the `DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT` flag and
-> obtain a waitable handle, but do not wait for it before acquiring the next swapchain image.
-> **This is useful if the application wants to wait for the waitable object itself.**
+現状で言えるのはここまで:
 
-到達経路はすべて public (確認済み):
+- コード上 1000ms の待ちが存在する
+- §1.30 の実スタックが**本当にこの wait だったかは未確定** (backlog §1.30 の「次回に取るべき証拠」は未取得のまま)
+- §1.31-A の後に acquire が UI を止めた観測はゼロ
+- `configure` の `INFINITE` と Present も同格の候補
 
-- `wgpu::Surface::as_hal::<A: hal::Api>()` (`wgpu-27.0.1/src/api/surface.rs`)
-- `wgpu_hal::dx12::Surface::waitable_handle() -> Option<HANDLE>` (`wgpu-hal-27.0.4/src/dx12/mod.rs`)
+**競合候補が 3 つあって、どれが効いているか分からない状態で 1 つを選んで直さない。**
+このプロジェクトは原因不明の不具合を推測で直して外した実績があり、直近では §4.2 で
+「Z が効かない」と読んで入力経路を疑ったが、ログを見たら Z は効いていて別の場所が壊れていた。
 
-### 手順
+## 1. 測ること
 
-1. instance descriptor で `Dx12UseFrameLatencyWaitableObject::DontWait` を設定する。
-   mIV は既に `MIV_WGPU_FRAME_LATENCY` で `desired_maximum_frame_latency` を触っている
-   ([lib.rs](../../src/lib.rs)) ので、同じ場所が素直。
-2. §1.31-A の outer paint phase で、その viewport の paint に入る**前**に
-   `WaitForSingleObject(handle, 0)` を呼ぶ (timeout 0 = 非ブロッキング)。
-3. `WAIT_OBJECT_0` なら通常どおり paint する。`acquire_texture` は `DontWait` なので待たない。
-4. `WAIT_TIMEOUT` なら **`DeferredNotReady`** としてその frame を捨てる。
-   - damage は**保持する** (次に readiness が来たら描く)
-   - readiness の wake を arm する (§3)
-   - **warning にしない**。通常動作である
+**現行の `Wait` 設定のまま**測る。`DontWait` に変えて測るのは正しい待機契約を壊すので、
+比較実験に使わない。
 
-### 2.1 これは時間窓ではない (憲法 5)
+### 1.1 区間 (それぞれ begin / end を別イベントで)
 
-判定は `WaitForSingleObject(handle, 0)` という **OS が持つ事実**であり、
-debounce / grace / settle ms ではない。憲法 5 に抵触しない。
-**「N ms 待ってダメなら諦める」形にしないこと。**
+- `surface.configure` (← 0.1 の `INFINITE` はここ)
+- `get_current_texture`
+- `queue.submit`
+- `SurfaceTexture::present`
 
-### 2.2 DX12 以外へのフォールバック
+### 1.2 各イベントに付ける文脈
 
-`as_hal::<Dx12>()` は backend が DX12 でなければ `None` を返す。その場合は
-**現行挙動 (gate 無し) にフォールバックする**。新しい失敗経路を作らない。
-handle が取れない場合も同じ。フォールバックしたことは起動時に 1 回ログへ残す
-(毎フレーム出さない)。
+- outer / inline の別と、inline なら reason (`Bootstrap` / `AccessKit` / `InteractiveResize`)
+- WindowId / ViewportId / surface generation / size / visible / minimized
 
-## 3. readiness の wake — ここが設計の要 ⚠️
+### 1.3 別スレッドからの service latency
 
-frame を捨てたあと、**誰が次の paint を起こすか**を決めないと止まる。
+別スレッドから定期的に `SendMessageTimeoutW` を打ち、**戻るまでの時間**を記録する。
+これが §1.31 が本来下げたい量そのもの。上の 4 区間のどれと相関するかを見る。
 
-- **drop 後に即 repost しないこと**。spin する (Codex 指摘)。
-- 時間で起こさないこと (憲法 5)。
-- waitable handle が signal されたことを事実として拾って起こす。
+### 1.4 出力の形
 
-実装候補 (いずれかを選び、理由を報告に書くこと):
+**毎フレーム全件を出さない。** ヒストグラムと、`>8 / 16 / 33 / 100 / 500 / 900ms` の
+slow event だけを出す。`scripts/analyze_perf.py` に集計サブコマンドを足す。
 
-1. **専用の待機スレッド**: handle を `WaitForSingleObject(handle, INFINITE)` で待ち、
-   signal されたら event loop へ user event を post する。UI スレッドは一切待たない。
-   viewport ごとに handle が違うので、生成 / 破棄のライフサイクルを surface と揃える必要がある。
-2. **`MsgWaitForMultipleObjects`**: event loop の待機に handle を混ぜる。winit の
-   `ControlFlow` と噛み合うかの確認が要る (winit を触らずに実現できるかを先に確かめること)。
+### 1.5 遅いイベントのスタック
 
-**1 を第一候補とする**。winit に触らずに済み、§1.31-A の outer phase と自然に繋がる。
-ただし surface の再生成 (resize / device loss) で handle が変わるので、
-**surface generation と対応付けて古い wake を捨てる**こと (§1.31-A の dirty が既に
-surface generation を持っている)。
+区間ログだけでは「どの Win32 wait か」までは割れない。長いイベントを捕まえたら
+WPR / WPA の CPU sampling + Wait Analysis / DXGI で、
+`wgpu-hal::SwapChain::wait` / present-queue idle fence / Present のどれかを確定する。
 
-## 4. §1.86 の契約を必ず通す ⚠️
+### 1.6 シナリオ
 
-`DeferredNotReady` でも `begin_delivery` / `finish_delivery` を必ず通す。
-これは §1.86 でこの契約を作った理由そのもの。
+通常スクロール / 連続ページ送り / フルスクリーン / immediate・deferred detached /
+複数窓同時 repaint / **resize ドラッグ** / tray hide・restore / 動画再生・VST /
+モニター跨ぎ / GPU 高負荷時。同じ release profile で `MIV_WGPU_FRAME_LATENCY=1` と `2` も比較する。
 
-- `DeferredNotReady` を `Skipped` と**別の variant** にする。通常動作なので warning 対象ではない。
-- `textures_delta` の `set` / `free` はちょうど一度ずつ配送される。
+## 2. 判断基準 (測ったあと何を決めるのか)
 
-## 5. screenshot
+- **`configure` だけが長い** → acquire gate は先送り。inline resize 例外の扱い (§1.31-A §3) を
+  再設計する方が効く。
+- **Present だけが長い** → acquire gate は先送り。wgpu patch か render thread 分離の検討へ。
+- **`get_current_texture` が長い** → §3 の acquire gate 設計を、下記の訂正を織り込んで書き直す。
+- **どれも短い** → §1.31-B は着手しない。§1.31-A で得た効果を記録して閉じる。
 
-現在は painter 呼び出しの**前**に `actions_requested` から screenshot command を除去している
-([wgpu_integration.rs](../../vendor/eframe/src/native/wgpu_integration.rs))。
-`DeferredNotReady` で frame を捨てると **screenshot 要求が消える**。
+## 3. acquire gate の設計 — 差し戻された旧案と、その訂正 (測定で正当化されたら使う)
 
-`Submitted` になるまで viewport が要求を保持し、一度だけ成功するようにすること。
+到達性の結論は**正しかった** ので残す:
 
-## 6. 触ってよいファイル
+- `Dx12UseFrameLatencyWaitableObject` の既定は `Wait`。`DontWait` は doc に
+  「application 自身が待つ用途」と明記。
+- wgpu 27 に `hal` feature は無いが、native build では `cfg(wgpu_core)` により
+  `wgpu::hal` が `pub extern crate wgpu_hal as hal` で re-export される。
+  `Surface::as_hal` も同 cfg 下で public (ただし `unsafe`)。
+- mIV の依存構成では `wgpu/dx12` と `wgpu-hal/dx12` が有効で、`wgpu-hal 27.0.4` 一つに解決される。
+- → **acquire handle へ到達するための wgpu vendoring は不要**。
 
-- `src/lib.rs` (instance descriptor の `Dx12UseFrameLatencyWaitableObject`)
-- `vendor/eframe/src/native/run.rs` (outer phase の readiness gate と wake)
-- `vendor/eframe/src/native/wgpu_integration.rs` (screenshot 保持、outcome 配線)
-- `vendor/egui-wgpu/src/winit.rs` (`DeferredNotReady` outcome の追加のみ。
-  §1.86 の transaction 構造を壊さない)
-- `scripts/test-full.ps1` / `docs/`
+以下は旧案の誤りで、実装するなら**先に潰すこと**。
 
-winit / wgpu / wgpu-hal を vendor しない。
+### 3.1 borrowed handle を worker で `INFINITE` 待ちするのは unsafe ⚠️
 
-## 7. 検証
+実際の署名は `pub unsafe fn waitable_handle(&self) -> Option<HANDLE>` で、doc に
+**「Handle is only valid while the swap chain is alive」**と書いてある。
+raw handle をコピーして worker に渡し、その間に resize / configure / drop が HAL 側で
+`CloseHandle` すると、pending wait 中に handle が閉じられる (Windows は動作未定義)。
 
-### 7.1 Windows process test (§1.31-A の §6.1 と対になる)
+安全な形:
 
-**性質**: presentation が不能な間も、外側の service latency が有界である。
+- `as_hal` guard が有効な **UI スレッド上で** original handle を読む
+- `DuplicateHandle` で **worker 所有の handle** を作る
+- guard はその場で drop し、HAL surface / 参照を別スレッドへ渡さない
+- worker は duplicated handle と cancel / rebind event を `WaitForMultipleObjects` する
+- surface の configure / drop は cancel / rebind を signal する
+- original handle はアプリ側で閉じない。duplicated handle だけ worker が閉じる
 
-- deterministic な readiness handle を unsignaled にする。
-- outer paint を要求する。
-- `DeferredNotReady` が**一度だけ**出ることを確認する (spin していない)。
-- gate 閉鎖中、別スレッドから ping message を連続 `SendMessageTimeoutW` し、
-  **全部が hard limit 内で戻る**こと。
-- gate 閉鎖中に paint attempt / wake が増えないこと。
-- readiness を一度 signal する。
-- **generation 一致の wake が一度だけ**入り、最終的に `Submitted` になること。
-- dirty が消えること。
-- screenshot 要求が一度だけ成功すること。
-- `textures_delta` の `set` / `free` が一度ずつ配送されること。
+### 3.2 UI と worker を同時 waiter にしない ⚠️
 
-§1.31-A の Windows test と同じ形 (子プロセス + `SendMessageTimeoutW` +
-`SMTO_BLOCK | SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT` + 親側 watchdog) を踏襲する。
+worker の wait 自体が「そのフレームの wait」を消費する。worker が signal を取った後に
+UI が同じ object を `WaitForSingleObject(handle, 0)` すると、**UI が `WAIT_TIMEOUT` へ落ちる競合**になる。
 
-### 7.2 unit test
+単一の typed state を置き、**同時 waiter を作らない**ことを不変条件にする:
 
-- `DeferredNotReady` で damage が保持される
-- stale generation の wake が捨てられる
-- 同じ readiness signal で wake が二重に入らない
-- `DeferredNotReady` でも delta 配送が一度ずつ行われる
+```text
+Unsupported
+Idle
+Armed      { handle_generation, arm_seq }
+ReadyPermit{ handle_generation, arm_seq }
+```
 
-### 7.3 実機 (利用者に依頼する分)
+worker が `Armed → ReadyPermit` にして user event を post し、UI は `ReadyPermit` を消費して acquire する。
+surface miss ごとに thread を作らない (resize で handle は頻繁に変わる)。
+surface / viewport 単位の再利用 worker か中央 wait broker にする。
 
-- idle health 全シナリオ (`scripts/check-idle-health.ps1`)。
-  **特に「readiness 待ちで spin していないか」**。
-- perf smoke。`DeferredNotReady` の発生率と、入力 → 提示完了 latency。
-- 通常操作、フルスクリーン、detached、動画再生、resize ドラッグ。
+### 3.3 §1.31-A の `surface_generation` は handle generation の正本ではない ⚠️
 
-## 8. やらないこと
+旧案の「dirty が既に surface generation を持っているので対応付ける」は**不十分**。
 
-- **Present 側に手を出さない** (§0)。`present()` は現行のまま。
-- 時間窓で readiness を代替しない (§2.1)。
-- drop 後の即 repost をしない (§3)。
-- DX12 以外で新しい失敗経路を作らない (§2.2)。
-- §1.86 の transaction 構造を壊さない (§4)。
+- 現在の generation は非ゼロ resize と window initialize では増えるが、
+  `SurfaceErrorAction::RecreateSurface` の再 configure では**増えない**。
+- `set_window(None)` ([winit.rs](../../vendor/egui-wgpu/src/winit.rs)) は対象 viewport だけでなく
+  **全 surface を clear する**。ある viewport の recreate で sibling の handle まで消えるのに、
+  sibling の eframe generation は増えない。
 
-## 9. 凍結ルール
+分離する:
 
-[detached-rework-plan.md](../detached-rework-plan.md) §2 (憲法) の対象。着手前に読むこと。
-§11 への記録が要る。憲法 5 (時間窓で競合を吸収しない) が特に効くので §2.1 を守ること。
+- handle generation の正本は `egui-wgpu::Painter` の `SurfaceState` 側。
+  configure 成功 / clear / gc / drop ごとに local generation を更新
+- wake は `(ViewportId, handle_generation, arm_seq)` を持つ
+- eframe scheduler generation は window / size の stale claim 判定に使う
+- **同じ `u64` を流用しない**
 
-**着手前に ClaudeCode / Codex Sol の設計レビューを通すこと。** §1.31-A では私の前提が
-3 点誤っていて、レビューで訂正された。B も同じ手順を踏む。
+### 3.4 gate は outer だけでは足りない — immediate viewport ⚠️
+
+immediate child は親の `App::update` 内で `render_immediate_viewport`
+([wgpu_integration.rs](../../vendor/eframe/src/native/wgpu_integration.rs)) へ同期再帰し、
+そこで**独自 surface の `get_current_texture`** を呼ぶ。§1.31-A の scheduler はこの再帰を見ない。
+
+→ **gate の実体は per-surface の acquire seam、つまり `egui-wgpu::Painter` 内**に要る。
+run.rs の outer claim 前だけに置いても child の acquire が残る。
+
+子が not-ready になった時点で、子の egui pass と texture delta 生成は既に終わっており、
+親も進行中なので**親フレーム全体をロールバックできない**。構造的な扱い:
+
+- ready な親 surface は通常どおり submit する
+- child の `DeferredNotReady(token)` を frame aggregate に記録する
+- token の readiness wake は child ではなく **immediate child を生成する親 window** を dirty にする
+- 親 scheduler claim の reason (特に `InteractiveResize`) を保持する
+- 複数 child の blocker を集合として扱う
+- signal 一回につき最大一回だけ親を再要求し、**複数 surface の交互 wake が busy-loop にならない**
+  ことをテストする
+
+### 3.5 inline resize の liveness が未設計 ⚠️
+
+inline resize claim を `DeferredNotReady` で単に finish すると内容が固まる
+(modal size/move 中は outer `about_to_wait` が回らない)。
+
+- deferred demand の所有者が元の `InteractiveResize` provenance を保持する
+- **readiness user event が modal loop 中にも winit から配送されるか**を Windows process test で確認する
+- 配送されるなら、保存済み claim の causal continuation として inline 再開する
+- **配送されないなら `EventLoopProxy` worker 案では resize liveness を満たさない**ので設計を止める
+
+「readiness wake も message-dispatch から描く」は §1.31-A の例外拡張になる。
+時間や geometry ではなく保存済み provenance による構造的拡張だが、
+ブリーフと `detached-rework-plan` §11 に明記して**事前合意が要る**。
+
+### 3.6 outcome の境界は 2 段 ⚠️
+
+`PaintOutcome` は現在 private で、`paint_and_update_textures` は `f32` しか返さない。
+**variant を 1 つ足すだけでは eframe へ伝播しない。**
+
+- egui-wgpu 側: per-surface の delta transaction outcome に `DeferredNotReady(token)` を足す。
+  gate は `begin_delivery` の後、encoder / `update_buffers` / acquire の**前**。
+  全 outcome が `finish_delivery` を通る (§1.86 の契約)
+- eframe 側: root / descendant を集約した `FrameRenderOutcome`。scheduler claim を clean にするか
+  readiness pending owner へ移管するかを決め、immediate child token を親へ routing する
+
+旧案は「outer preflight」と「生成済み frame の non-submit outcome」を混同していた。
+**outer claim の前に UI pass 自体を止めるなら、その時点では texture delta が存在しないので
+§1.86 の transaction は関係ない。**
+
+### 3.7 落とすと壊れるもの
+
+- **初回表示**: `post_rendering` ([epi_integration.rs](../../vendor/eframe/src/native/epi_integration.rs))
+  が最初の paint 後に visible にする。現在 surface submit の成否を見ていないので、
+  Deferred でも呼ぶと**未描画の白 / 黒 window を表示する**。
+  root surface が `Submitted` になった後だけ first-frame visible を解除する。
+- **screenshot**: 同じ surface が `Submitted` になるまで保持する。`DeferredNotReady` だけでなく
+  `SurfaceRecreated` / `Skipped` も同じ原則に揃えないと「Submitted まで保持」という契約にならない。
+- **hidden / tray**: `Visible(true)` 等を処理するため UI pass 自体は走らせる必要がある。
+  **surface gate を `run_ui_and_paint` の前に置いてはいけない。**
+- **bootstrap**: deferred demand を hidden 100ms throttle へ落とさず、元の Bootstrap reason を保持する。
+- **close / gc / recreate**: worker を cancel し、queued wake を generation で破棄する。
+  read-only の open / close で sibling の wake を誤って invalidate しない。
+
+### 3.8 `MsgWaitForMultipleObjects` 案は現行 winit では不可
+
+`MsgWaitForMultipleObjects` は window を所有し message queue を pump する thread の outer loop で
+呼ぶ必要がある。現在その loop を所有しているのは winit の `run_app` で、`ControlFlow` に
+任意 HANDLE を登録する API は無い。winit を変更するか `pump_app_events` で eframe が
+Windows message loop 全体を所有し直すかで、後者は event-loop architecture の置換に等しい。
+**第一候補は cancel 可能な worker + `EventLoopProxy` のままでよい。**
+
+### 3.9 Windows API 依存の追加が要る
+
+worker が Win32 wait / `DuplicateHandle` / event を使うため:
+
+- `vendor/egui-wgpu` には現在 Windows 依存が**無い**
+- `vendor/eframe` の `windows-sys` に `Win32_System_Threading` feature が**無い**
+
+両方の `Cargo.toml` が触る対象に入る。
+
+## 4. スコープの正直な表現
+
+本作業 (仮に acquire gate まで進んだとして) で言えるのは
+
+> eframe の DX12 surface acquire にある frame-latency wait を外出しした
+
+まで。**「§1.31-B 完了」「message service latency を上限化した」とは言えない。**
+`configure` の `INFINITE` と Present が残るため。
+
+さらに、native presenter 内の `NativeEguiOverlay` は**別の `wgpu::Instance`**
+([render_core.rs](../../src/video/native_presenter/render_core.rs)) で既定 `Wait` のまま動くので、
+`src/lib.rs` の `DontWait` 設定は届かない。UI の message pump ではなく native render thread を
+止める経路なので §1.31 の主目的とは別だが、**「mIV の acquire 全体を直した」とも言えない**。
+
+## 5. 触ってよいファイル (B0 = 計測のみ)
+
+- `vendor/egui-wgpu/src/winit.rs` (区間の perf event。**挙動は変えない**)
+- `vendor/eframe/src/native/run.rs` / `wgpu_integration.rs` (文脈の付与)
+- `src/` の perf イベント定義と `scripts/analyze_perf.py`
+- `docs/`
+
+**この段階で `Dx12UseFrameLatencyWaitableObject` を変えない。gate を入れない。**
+
+## 6. 凍結ルール
+
+[detached-rework-plan.md](../detached-rework-plan.md) §2 (憲法) の対象。
+B0 は計測のみで production の制御フローを変えないが、着手前に §2 を読むこと。
+gate の実装に進む段階では §11 記録と事前合意が要る (特に §3.5 の inline 再開)。

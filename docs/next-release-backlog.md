@@ -283,7 +283,35 @@
     戻り値が `()` で、HAL の FIFO Present は interval 1 かつ `DXGI_PRESENT_DO_NOT_WAIT` 無し
     (`DO_NOT_WAIT` は blocked 時に `DXGI_ERROR_WAS_STILL_DRAWING` を返す契約)。
     厳密に bounded にするなら wgpu / core / hal の patch か render thread 分離が要る。
-    **B は acquire だけ先に閉じて、Present は A 後の実測を見てから判断する**のが妥当。
+  - ~~**B は acquire だけ先に閉じて、Present は A 後の実測を見てから判断する**のが妥当。~~
+    **2026-08-17 撤回。acquire も先に測る**。下記参照。
+- **B は「計測 (B0) が先」に変更 (2026-08-17、Codex Sol の設計レビューで差し戻し)**。
+  正本 = [codex-acquire-readiness-gate-brief.md](briefs/codex-acquire-readiness-gate-brief.md)。
+  差し戻しの決め手 2 つ (どちらもコードで実地確認済み):
+  - **acquire を閉じても message service latency は上限化されない**。非ゼロ `Resized` は
+    message-dispatch 中に `on_window_resized` → `configure_surface` を通り、wgpu-hal DX12 の
+    `configure` は `ResizeBuffers` の前に `wait_for_present_queue_idle()` を呼ぶ。その中身は
+    **`WaitForSingleObject(event, INFINITE)`** (`wgpu-hal-27.0.4/src/dx12/device.rs`)。
+    unconfigure / drop 側にも同じ待ちがある。**§1.31-A が残した inline resize 例外は、
+    acquire より手前で無期限 GPU wait に入れる。** 「acquire は最大 1 秒」も強すぎた
+    (1000ms は frame-latency wait の timeout であって acquire 全体の上限ではない)。
+  - **§1.31-A の後、acquire が実害を起こしている証拠が無い**。§1.30 の実スタックが本当に
+    この wait だったかも未確定のまま。`configure` の `INFINITE` / acquire / Present の
+    3 候補があり、どれが効いているか不明な状態で 1 つを選んで直さない。
+  - 旧 acquire gate 案には他に P0 が 4 件あった (ブリーフ §3 に訂正付きで保存):
+    `waitable_handle` は `unsafe` で「swap chain が生きている間だけ有効」→ worker へ raw handle を
+    渡すのは未定義動作 (`DuplicateHandle` が要る) / UI と worker を同時 waiter にすると signal の
+    取り合いになる / §1.31-A の `surface_generation` は handle generation の正本ではない
+    (`RecreateSurface` で増えず、`set_window(None)` は全 surface を clear する) /
+    immediate viewport は親の pass 内で自前 surface を acquire するので outer gate では捕まらず、
+    gate の実体は `egui-wgpu::Painter` の per-surface seam に要る。
+  - **API 到達性の結論は正しかった**: wgpu 27 に `hal` feature は無いが native build では
+    `cfg(wgpu_core)` で `wgpu::hal` が re-export され、`Surface::as_hal` も public (`unsafe`)。
+    mIV の依存構成で `wgpu/dx12` / `wgpu-hal/dx12` が有効、`wgpu-hal 27.0.4` 一つに解決される。
+    **acquire handle へ到達するための wgpu vendoring は不要**。
+  - **`NativeEguiOverlay` は別の `wgpu::Instance`** (`src/video/native_presenter/render_core.rs`)
+    で既定 `Wait` のまま動く。`src/lib.rs` の設定は届かないので、
+    「mIV の acquire 全体を直した」とは言えない。
 - **§1.31-A 着手前の 2026-08-16 に訂正した認識**
   (前セッションの読み違い。同じ誤りを繰り返さないため履歴として残す):
   - **外側の paint 位相は現在存在しない**。`check_redraw_requests` は
