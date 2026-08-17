@@ -97,16 +97,21 @@ keymap 対象にする。`Esc` / 修飾なし矢印ナビゲーション、Ctrl+
 音楽ビューでも使える。左右パネル表示モードの <kbd>I</kbd> / <kbd>Tab</kbd> は 3 面で同じ
 `FsToggleMetadata` を使い、native 動画も effective chord を App 側へ転送する。
 
+`KeyContext` が異なる Action には同じ物理キーを割り当ててよい。ただし `KeyContext` は
+割り当て時の競合検査とヘルプ表示の契約であり、実行時の active context を自動判定しない。
+したがって key edge を消費する call site は、**消費する前に現在の item / mode が自分の
+context かを確認し、自分の所有でない edge を残す**責務を持つ。既定 <kbd>Z</kbd> を共有する
+`FsZoomMode` (FsImage) と `VideoToggleAudioMode` (FsVideo) では、前者が Video / Audio を
+先に除外してから `take_key_hold_edges` を呼ぶ。同じ FsImage context 内で現在だけ使えない状態
+(連結表示、パノラマ、分析、編集、比較) は別であり、従来どおり FsImage 側が edge を消費して
+no-op 理由または状態リセットを行う。
+
 音声モードから戻る `VideoToggleAudioMode` の診断計装は、調査対象の
 `action_peek` / Win32 viewport Z / 全 viewport Z / egui Z の成否だけをログ候補の
 抑制条件にしてはならない。`[fs-key]` と同じ `fullscreen_shortcut_event_summary` が
 `Z:down` を報告した frame も候補にし、さらに音声モード中は理由や Z 観測の有無に関係なく
 最低 1 秒に 1 行を出す。停止中に通常 repaint が無くても heartbeat 時刻の repaint を予約する。
 調査中の信号が全て false でも診断自体が黙らないことを不変条件とする。
-`[fs-key] source=fullscreen` が音声モード中の `Z:down` を直接観測した地点では、
-`handle_fs_key_input` 呼出し前の guard chain、`video_audio_mode`、viewport / pass を
-rate limit せず別行へ記録する。下流の `exit key diagnostic` は残し、両行の viewport / pass を
-突き合わせる。この source-side 行も read-only 計装であり、consume や dispatch には使用しない。
 
 Windows の egui 経路では、KeySlot でショートカットを所有した押下を egui event queue からも
 同時に除去する。ただし egui 0.33 は UI 実行前の `begin_pass` で <kbd>Tab</kbd> から focus

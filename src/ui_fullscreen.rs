@@ -154,46 +154,6 @@ struct VideoAudioExitKeyDiagnosticRecord {
 }
 
 #[cfg(windows)]
-#[derive(Clone, Debug)]
-struct VideoAudioPreHandleFsKeyDiagnostic<'a> {
-    fs_idx: usize,
-    keys: &'a str,
-    video_audio_mode: Option<usize>,
-    fs_music_view_active: bool,
-    wants_keyboard_input: bool,
-    ime_input_active: bool,
-    music_bookmark_modal_open: bool,
-    music_normalize_modal_active: bool,
-    fs_context_menu_idx: Option<usize>,
-    viewport: egui::ViewportId,
-    pass: u64,
-}
-
-#[cfg(windows)]
-fn format_video_audio_pre_handle_fs_key_diagnostic(
-    record: &VideoAudioPreHandleFsKeyDiagnostic<'_>,
-) -> String {
-    format!(
-        "[video-audio] stage=before_handle_fs_key_input fs_idx={} keys={} \
-         video_audio_mode={:?} fs_music_view_active={} wants_keyboard_input={} \
-         ime_input_active={} music_bookmark_modal_open={} \
-         music_normalize_modal_active={} fs_context_menu_idx={:?} \
-         viewport={:?} pass={}",
-        record.fs_idx,
-        record.keys,
-        record.video_audio_mode,
-        record.fs_music_view_active,
-        record.wants_keyboard_input,
-        record.ime_input_active,
-        record.music_bookmark_modal_open,
-        record.music_normalize_modal_active,
-        record.fs_context_menu_idx,
-        record.viewport,
-        record.pass,
-    )
-}
-
-#[cfg(windows)]
 #[derive(Clone, Debug, Default)]
 struct VideoAudioExitKeyDiagnosticRateState {
     last_observed_outcome: Option<VideoAudioExitKeyOutcome>,
@@ -6179,6 +6139,19 @@ impl App {
         self.fs_zoom_active || self.fs_zoom_aiming
     }
 
+    /// フルスクリーンの現ページが FsVideo コンテキストか (動画 / 音声 / 動画→音声モード)。
+    ///
+    /// keymap は同じキーを FsImage と FsVideo の両方へ割り当てても衝突扱いしない
+    /// (既定の Z = `FsZoomMode` / `VideoToggleAudioMode`、keymap.rs の default_chords 参照)。
+    /// 実行時に「今どちらのコンテキストか」を表す状態は無いので、キーを消費する側が
+    /// 自分の所有でないキーを取らないためにこれを見る。
+    fn fs_video_key_context_active(&self, fs_idx: usize) -> bool {
+        matches!(
+            self.items.get(fs_idx),
+            Some(GridItem::Video(_)) | Some(GridItem::Audio(_))
+        )
+    }
+
     fn fs_zoom_mode_context_ok(&self, fs_idx: usize) -> bool {
         self.reading_flow.is_paged()
             && !self.is_panorama_mode_active(fs_idx)
@@ -6192,6 +6165,8 @@ impl App {
             // ここで fs_zoom_active をラッチし、音楽ビューでは見た目の変化がないまま
             // 次に画像へナビした瞬間に全画面ズームモードで表示される (review-v2.3.0 P2-10)。
             // 動画→音声モードは item が Video なので下の Video 除外で既に守られている。
+            // キー経路は fs_video_key_context_active で消費前に返るため、ここへ Video / Audio が
+            // 来るのはキー edge を扱わない Ring / マウス経路。
             && !matches!(
                 self.items.get(fs_idx),
                 Some(GridItem::Video(_)) | Some(GridItem::Audio(_))
@@ -6252,9 +6227,28 @@ impl App {
         fs_idx: usize,
         level_permit: Option<crate::keyboard_input::FocusedKeyStatePermit>,
     ) {
+        if self.fs_video_key_context_active(fs_idx) {
+            // 同じキーは FsVideo の action (既定 Z = VideoToggleAudioMode) の所有物なので
+            // edge を消費しない。消費すると音楽ビューの Z が届かず、音声モードから動画へ
+            // 戻れなくなる (backlog §4.2)。
+            //
+            // 状態だけは畳む: Z ホールド中に画像→動画へ移ったとき、ズームがラッチしたまま
+            // 残るのを防ぐ (今の除外分岐が fs_zoom_reset していたのと同じ理由)。ラッチは
+            // OS 直読み (非消費) で現在の押下レベルに合わせ、動画から画像へ戻った瞬間に
+            // 押しっぱなしの Z が rising edge として照準を始めないようにする。
+            self.fs_zoom_reset();
+            if let Some(permit) = level_permit {
+                self.fs_zoom_z_was_down =
+                    self.keymap
+                        .key_held_action(ctx, permit, KeyAction::FsZoomMode);
+            }
+            return;
+        }
+
         // FsZoomMode (KeyHold、既定 Z) の押下/離しを (a) egui イベント (b) OS 直読みの両方から取る。
-        // コンテキスト外でも先に edge を消費し、連結表示では無言抑止せず rising edge に一度だけ
-        // 理由を表示する。`fs_zoom_z_was_down` のラッチでホールド中の連打を防ぐ。
+        // FsImage 内で現在使えない場合も先に edge を消費し、連結表示では無言抑止せず
+        // rising edge に一度だけ理由を表示する。`fs_zoom_z_was_down` のラッチでホールド中の
+        // 連打を防ぐ。FsVideo 所有の edge は上の所有権判定で消費前に返している。
         let (z_press_event, z_release_event) =
             self.keymap.take_key_hold_edges(ctx, KeyAction::FsZoomMode);
         // A routed Z edge is still drained after focus loss, but KeyHold is a
@@ -13477,28 +13471,6 @@ impl App {
                                 current_foreground_hwnd(),
                                 keys
                             ));
-                            #[cfg(windows)]
-                            if self.video_audio_mode.is_some()
-                                && fullscreen_summary_saw_key_down(&keys, "Z")
-                            {
-                                let record = VideoAudioPreHandleFsKeyDiagnostic {
-                                    fs_idx,
-                                    keys: &keys,
-                                    video_audio_mode: self.video_audio_mode,
-                                    fs_music_view_active: self.fs_music_view_active(fs_idx),
-                                    wants_keyboard_input: ctx.wants_keyboard_input(),
-                                    ime_input_active: self.ime_input_active(ctx),
-                                    music_bookmark_modal_open: self.music_bookmark_modal_open(),
-                                    music_normalize_modal_active: self
-                                        .music_normalize_modal_active(fs_idx),
-                                    fs_context_menu_idx: self.fs_context_menu_idx,
-                                    viewport: ctx.viewport_id(),
-                                    pass: ctx.cumulative_pass_nr(),
-                                };
-                                crate::logger::log(
-                                    format_video_audio_pre_handle_fs_key_diagnostic(&record),
-                                );
-                            }
                         }
                         let key_action = self.handle_fs_key_input(ctx, fs_idx, is_spread_double);
                         if key_action.close {
@@ -34117,6 +34089,205 @@ mod tests {
     use crate::ring_shortcut::{RightDragContext, ViewerShortRightClickAction};
     use std::path::PathBuf;
 
+    fn cache_fullscreen_keyboard_owner_for_test(ctx: &egui::Context) {
+        crate::keyboard_input::cache_keyboard_owner(
+            ctx,
+            crate::keyboard_input::KeyboardOwner::ApplicationShortcut {
+                scope: crate::keyboard_input::ShortcutScope::new(
+                    ctx.viewport_id(),
+                    crate::keyboard_input::ShortcutSurface::Fullscreen,
+                ),
+            },
+        );
+    }
+
+    fn plain_key_press(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[cfg(windows)]
+    struct ClearTestKeyFrame;
+
+    #[cfg(windows)]
+    impl Drop for ClearTestKeyFrame {
+        fn drop(&mut self) {
+            crate::key_input::clear_test_frame();
+        }
+    }
+
+    #[test]
+    fn fs_zoom_key_leaves_video_context_z_press_for_its_owner() {
+        let mut outcomes = Vec::new();
+        for (label, item) in [
+            ("Video", GridItem::Video(PathBuf::from("clip.mp4"))),
+            ("Audio", GridItem::Audio(PathBuf::from("track.mp3"))),
+        ] {
+            let mut app = crate::app::setup_app_for_test();
+            app.items = vec![item];
+            app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+            app.fullscreen_idx = Some(0);
+            let ctx = egui::Context::default();
+            #[cfg(windows)]
+            let _serial = crate::key_input::TEST_INPUT_LOCK
+                .get_or_init(|| std::sync::Mutex::new(()))
+                .lock()
+                .expect("key input test lock poisoned");
+            #[cfg(windows)]
+            let _clear = ClearTestKeyFrame;
+            #[cfg(windows)]
+            crate::key_input::clear_test_frame();
+
+            ctx.begin_pass(egui::RawInput {
+                events: vec![plain_key_press(egui::Key::Z)],
+                ..Default::default()
+            });
+            cache_fullscreen_keyboard_owner_for_test(&ctx);
+            let level_permit = crate::keyboard_input::keyboard_input_permits(&ctx).current_level;
+            app.update_fs_zoom_mode_keys(&ctx, 0, level_permit);
+            outcomes.push((
+                label,
+                app.keymap
+                    .consume_action_no_repeat(&ctx, KeyAction::VideoToggleAudioMode),
+            ));
+            let _ = ctx.end_pass();
+        }
+
+        assert_eq!(
+            outcomes,
+            vec![("Video", true), ("Audio", true)],
+            "FsImage の KeyHold reader は FsVideo が所有する Z edge を消費してはならない"
+        );
+    }
+
+    #[test]
+    fn fs_zoom_video_context_collapses_state_and_tracks_the_held_zoom_key() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![GridItem::Video(PathBuf::from("clip.mp4"))];
+        app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+        app.fullscreen_idx = Some(0);
+        app.fs_zoom_active = true;
+        app.fs_zoom_aiming = true;
+        app.fs_zoom_exit_pending = true;
+        app.fs_zoom_z_was_down = false;
+
+        #[cfg(windows)]
+        {
+            // Windows の hold level は OS 直読みが正本。テスト用に source-routed level を
+            // 注入できる NumpadEnter へ KeyHold action を差し替えて同じ状態遷移を検証する。
+            let mut settings = crate::keymap::KeymapSettings::default();
+            settings.set_override_chords(
+                KeyAction::FsZoomMode,
+                vec![crate::keymap::Chord::key(
+                    crate::keymap::KeyName::NumpadEnter,
+                )],
+            );
+            app.keymap = crate::keymap::Keymap::from_settings(&settings);
+        }
+
+        let ctx = egui::Context::default();
+        #[cfg(windows)]
+        let _serial = crate::key_input::TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        #[cfg(windows)]
+        let _clear = ClearTestKeyFrame;
+        #[cfg(windows)]
+        crate::key_input::set_test_frame_for_viewport(ctx.viewport_id(), Vec::new());
+        #[cfg(windows)]
+        crate::key_input::set_test_return_key_state(ctx.viewport_id(), false, true);
+        #[cfg(windows)]
+        let events = Vec::new();
+        #[cfg(not(windows))]
+        let events = vec![plain_key_press(egui::Key::Z)];
+
+        ctx.begin_pass(egui::RawInput {
+            events,
+            ..Default::default()
+        });
+        cache_fullscreen_keyboard_owner_for_test(&ctx);
+        let level_permit = crate::keyboard_input::keyboard_input_permits(&ctx).current_level;
+        app.update_fs_zoom_mode_keys(&ctx, 0, level_permit);
+        let _ = ctx.end_pass();
+
+        assert!(!app.fs_zoom_active);
+        assert!(!app.fs_zoom_aiming);
+        assert!(!app.fs_zoom_exit_pending);
+        assert!(
+            app.fs_zoom_z_was_down,
+            "foreign context へ移った時も現在の KeyHold level をラッチへ反映する"
+        );
+    }
+
+    #[test]
+    fn fs_zoom_key_still_consumes_continuous_reading_z_and_reports_why() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![GridItem::Image(PathBuf::from("page.jpg"))];
+        app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+        app.fullscreen_idx = Some(0);
+        app.reading_flow = ReadingFlow::Vertical;
+        let ctx = egui::Context::default();
+        #[cfg(windows)]
+        let _serial = crate::key_input::TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        #[cfg(windows)]
+        let _clear = ClearTestKeyFrame;
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
+
+        ctx.begin_pass(egui::RawInput {
+            events: vec![plain_key_press(egui::Key::Z)],
+            ..Default::default()
+        });
+        cache_fullscreen_keyboard_owner_for_test(&ctx);
+        let level_permit = crate::keyboard_input::keyboard_input_permits(&ctx).current_level;
+        app.update_fs_zoom_mode_keys(&ctx, 0, level_permit);
+        let leaked_to_video = app
+            .keymap
+            .consume_action_no_repeat(&ctx, KeyAction::VideoToggleAudioMode);
+        let _ = ctx.end_pass();
+
+        assert!(
+            !leaked_to_video,
+            "FsImage が所有する Z edge は下流へ漏らさない"
+        );
+        assert!(matches!(
+            app.fs_boundary_hint,
+            Some(FsBoundaryHint::NavNoOp {
+                reason: FsNavNoOpReason::ContinuousReadingUnavailable(
+                    FsContinuousReadingUnavailableFeature::Zoom
+                ),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn fs_zoom_ring_action_still_rejects_video_with_feedback() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![GridItem::Video(PathBuf::from("clip.mp4"))];
+        app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+        app.fullscreen_idx = Some(0);
+        let ctx = egui::Context::default();
+
+        app.toggle_fs_zoom_mode_action(&ctx, 0);
+
+        assert!(!app.fs_zoom_active);
+        assert!(!app.fs_zoom_aiming);
+        assert!(matches!(
+            app.fs_feedback_toast.as_ref(),
+            Some((text, _, _)) if text == "この表示では全画面ズームモードを使えません"
+        ));
+    }
+
     #[cfg(windows)]
     fn video_audio_exit_diagnostic_record(
         outcome: VideoAudioExitKeyOutcome,
@@ -34215,43 +34386,6 @@ mod tests {
             .observe(start + std::time::Duration::from_millis(1200), baseline)
             .expect("the independently observed fullscreen Z must remain a candidate");
         assert!(emitted.inputs.fullscreen_summary_saw_z_down());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn video_audio_pre_handle_diagnostic_is_sourced_from_z_down_and_lists_every_guard() {
-        assert!(fullscreen_summary_saw_key_down("Z:down:Modifiers", "Z"));
-        assert!(!fullscreen_summary_saw_key_down("Z:up:Modifiers", "Z"));
-        let record = VideoAudioPreHandleFsKeyDiagnostic {
-            fs_idx: 7,
-            keys: "Z:down:Modifiers",
-            video_audio_mode: Some(7),
-            fs_music_view_active: true,
-            wants_keyboard_input: false,
-            ime_input_active: false,
-            music_bookmark_modal_open: false,
-            music_normalize_modal_active: true,
-            fs_context_menu_idx: Some(3),
-            viewport: egui::ViewportId::ROOT,
-            pass: 42,
-        };
-
-        let line = format_video_audio_pre_handle_fs_key_diagnostic(&record);
-
-        for field in [
-            "stage=before_handle_fs_key_input",
-            "video_audio_mode=Some(7)",
-            "fs_music_view_active=true",
-            "wants_keyboard_input=false",
-            "ime_input_active=false",
-            "music_bookmark_modal_open=false",
-            "music_normalize_modal_active=true",
-            "fs_context_menu_idx=Some(3)",
-            "viewport=",
-            "pass=42",
-        ] {
-            assert!(line.contains(field), "missing {field}: {line}");
-        }
     }
 
     #[cfg(windows)]

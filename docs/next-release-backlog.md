@@ -975,6 +975,24 @@
 - 既存の `exit key diagnostic` は残し、source-side 行と viewport / pass を突き合わせる。
   production の key consume / dispatch / audio-mode state は変更せず、原因修正も行わない。
 
+#### 原因修正・完了 (2026-08-18)
+
+- **原因確定**: `update_fs_zoom_mode_keys` が `fs_zoom_mode_context_ok` より先に
+  `take_key_hold_edges(KeyAction::FsZoomMode)` を呼び、Video / Audio 上でも FsImage 側が
+  <kbd>Z</kbd> の Win32 / egui edge を消費していた。約 400 行後の音楽ビュー
+  `VideoToggleAudioMode` が読む時点では edge が残っていなかった。
+- **修正**: Video / Audio を表す `fs_video_key_context_active` を独立させ、
+  `update_fs_zoom_mode_keys` の消費前に判定する。FsVideo 所有時は edge を残しつつ、
+  `fs_zoom_reset` と非消費の hold level 読み取りだけで画像ズームの transient state を畳む。
+  連結表示など FsImage 内の unavailable state は従来どおり edge を消費して理由を表示する。
+  Ring / マウス経路の Video / Audio 除外も `fs_zoom_mode_context_ok` に残した。
+- **回帰テスト**: 修正前に Video / Audio の両方で所有権テストが
+  `[(Video, false), (Audio, false)]` となることを確認。所有権、state collapse、連結表示の
+  consume + no-op 理由、Ring 経路の拒否 + feedback を handler-level test で固定した。
+- 原因調査用の無制限 `stage=before_handle_fs_key_input` probe は撤去した。既存の rate-limit
+  付き `exit key diagnostic` は残す。
+- 状態: **完了**。P2 close。
+
 ### 4.1 Shift / Alt + ホイールのカスタマイズ再設計
 
 - 背景: v1.7.0 のリングショートカット / マウスボタン実装中に、Shift / Alt + ホイールのペアバインドを
