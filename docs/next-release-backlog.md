@@ -866,6 +866,17 @@
   AI ON/OFF / デノイズ / post-filter / スマートシャープのどれかを最初に切り分ける。
 - 優先度: P3 monitor / 再現待ち。
 
+### 3.3 ページ送り中の AI アップスケールを待たない / 打ち切る
+
+- 出典: §1.89 の実 perf log。見開き 1 ページずらしの停止中に AI upscale 1.3s × 3 回が
+  逐次実行され、5.22s / 4.30s の停止時間の大半を占めた。
+- §1.89 は「元画像を描く frame が加工済み source を readiness として待つ」不整合だけを修正した。
+  AI コストそのものは変更しておらず、元画像表示以外でも通過先 / stale target の推論待ちが起こり得る。
+- 方針: ページ送りで表示 target から外れた AI upscale を待たず、context-owned producer の cancel / 打切りと
+  着地点だけの再開を ownership・generation・完了回収まで含めて設計する。時間窓や `Awaiting` の強制解除、
+  AI 結果の silent fallback では直さない。
+- 規模 / 優先度: 中 / P2 performance。
+
 ## 4. 入力カスタマイズ / マウス / ゲームパッド
 
 ### 4.2 音声モードから戻る Z が 1 回だけ効かなかった (未再現・報告者の追加情報待ち)
@@ -1194,6 +1205,24 @@
      index 再利用を検出するテストを維持する。
 - 関連: [display-pipeline.md](display-pipeline.md) §2.5.4 の atomic display-unit 契約。
 - 規模 / 優先度: 小〜中 / **P1 (次バージョンで修正)**。
+
+### 1.89 元画像プレビュー中の見開き 1 ページずらしが 4〜5 秒停止する
+
+- **完了 (2026-08-17):** navigation target の `materialized_ready` を、その frame の描画 resolver が
+  実際に選ぶ source と一致させた。`fs_display_bypasses_final_pipeline` が true の元画像表示 / 分析モードは
+  target 全ページの `resolve_original_preview_tex` を、false の通常表示は従来の加工済み source を要求する。
+  元画像が無い target は `Awaiting` のまま、見開きは両ページの `all` が成立するまで ready にしない。
+- 根本原因: 描画側は raw 元画像を選んでいた一方、readiness だけが AI + カラー化済み source を待っていた。
+  右 Ctrl + Ctrl+Right の実 log では同じページ対で 5.22s / 4.30s 停止し、5.22s の間に 54 入力を consume
+  して target は進まなかった。内訳は PDF decode 約150ms、AI upscale 1.3s × 3、final composite 73ms。
+- OS キー状態は frame-local sample を producer gate / readiness / draw で共有し、同一 frame 内の source 判定を
+  分裂させない。`original_preview` 専用 carve-out、`blocks_new_target()` の迂回、通過表示 blocker の解除、
+  AI producer、時間窓 / timeout は変更していない。
+- 回帰テスト: bypass raw ready、通常表示の加工済み待ち、raw 不在 `Awaiting`、分析モード、見開き atomic の
+  5 条件を追加。§1.88 の4本と既存 atomic 契約テストは無修正で通過。
+- AI upscale のコスト自体は範囲外で、別項 §3.3 に継続記録。
+- 正本: [codex-original-preview-readiness-brief.md](briefs/codex-original-preview-readiness-brief.md)。
+  関連: [display-pipeline.md](display-pipeline.md) §2.5.4。
 
 ### 5.8 検索ベンチのゲートに絶対時間の下限が無い
 

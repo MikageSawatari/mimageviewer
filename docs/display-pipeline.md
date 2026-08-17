@@ -1970,6 +1970,14 @@ previous に属するなら提示とは数えない。
 したがって次の同 frame repeat が受理される場合でも、その前に target の draw command は確定済みで
 あり、見開き片側だけを提示済みと数えることはない。
 
+target の `materialized_ready` は、その frame の描画 resolver が実際に選ぶ source に対して評価する。
+`fs_display_bypasses_final_pipeline` が true の元画像表示 / 分析モードでは target 全ページの raw
+`fs_cache` (`resolve_original_preview_tex`) が解決したときだけ ready とし、AI・カラー化済み final の
+完成は要求しない。false の通常表示は従来どおり加工済み source を要求し、raw があるだけでは ready
+にしない。元画像も無ければ `Awaiting` を維持する。見開きはどちらの source でも全ページの `all`
+判定を保ち、片側だけで ready にしない。元画像表示の OS キー状態は frame ごとに一度だけ sample し、
+producer gate / readiness / draw が同じ値を共有する。
+
 通過 rendition の外側の**ページ矩形**は、低解像度 texture の整数寸法ではなく source/header 寸法
 から求める。PDF は thumbnail / fullscreen の各 raster 寸法が別々に整数丸めされるため、PDFium が
 読む page box を `layout_width/layout_height` に 1/1000 point の固定小数点レイアウト寸法として

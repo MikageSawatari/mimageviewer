@@ -5099,6 +5099,42 @@ impl App {
         )
     }
 
+    /// OS キー状態は同じ frame の producer gate / readiness / draw で一度だけ読む。
+    /// egui の一時データなので viewer context をまたいだ状態は App に追加しない。
+    fn original_preview_active_for_frame(&self, ctx: &egui::Context, idx: usize) -> bool {
+        let frame_nr = ctx.cumulative_frame_nr();
+        let viewport = if self.fullscreen_embedded_still_active() {
+            ctx.viewport_id()
+        } else {
+            self.fullscreen_viewport_id()
+        };
+        let cache_id = egui::Id::new(("fs_original_preview_active", viewport));
+        if let Some(sample) = ctx
+            .data(|data| data.get_temp::<FsOriginalPreviewFrameSample>(cache_id))
+            .filter(|sample| {
+                sample.frame_nr == frame_nr
+                    && sample.items_generation == self.items_generation
+                    && sample.idx == idx
+            })
+        {
+            return sample.active;
+        }
+
+        let active = self.original_preview_active(ctx, idx);
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                cache_id,
+                FsOriginalPreviewFrameSample {
+                    frame_nr,
+                    items_generation: self.items_generation,
+                    idx,
+                    active,
+                },
+            );
+        });
+        active
+    }
+
     /// 現在の表示が final pipeline (補正 / AI / カラー化合成) を迂回するか。
     ///
     /// 元画像表示と分析モードは raw `fs_cache` を直接描くため、
@@ -5446,7 +5482,12 @@ impl App {
         false
     }
 
-    fn resolve_fs_navigation_sequence_target(&mut self, ctx: &egui::Context, fs_idx: usize) {
+    fn resolve_fs_navigation_sequence_target(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        original_preview_active: bool,
+    ) {
         let Some(target) = self
             .fs_holdover_tex
             .as_ref()
@@ -5472,13 +5513,22 @@ impl App {
         if accept_rendition {
             self.ensure_navigation_target_thumbnail_requests(ctx, &target.pages);
         }
+        let bypasses_final_pipeline =
+            self.fs_display_bypasses_final_pipeline(original_preview_active);
         let materialized_ready = target.pages.iter().all(|idx| {
-            self.resolve_fs_display_tex(*idx, true).is_some()
-                || (!self.items.get(*idx).is_some_and(GridItem::has_page_data)
-                    && matches!(
-                        self.thumbnails.get(*idx),
-                        Some(ThumbnailState::Loaded { .. })
-                    ))
+            if bypasses_final_pipeline {
+                // この frame は描画側も raw source を明示的に選ぶ。通常表示では下の final
+                // pipeline gate を維持するため、白黒からカラーへの途中切替を見せない契約は
+                // 緩めず、利用者が元画像を要求した frame だけ readiness source を揃える。
+                self.resolve_original_preview_tex(*idx).is_some()
+            } else {
+                self.resolve_fs_display_tex(*idx, true).is_some()
+                    || (!self.items.get(*idx).is_some_and(GridItem::has_page_data)
+                        && matches!(
+                            self.thumbnails.get(*idx),
+                            Some(ThumbnailState::Loaded { .. })
+                        ))
+            }
         });
         let materialized_failed = target
             .pages
@@ -5812,7 +5862,8 @@ impl App {
                 self.bind_fs_navigation_sequence_to_current_target();
             }
             if let Some(idx) = self.fullscreen_idx {
-                self.resolve_fs_navigation_sequence_target(ctx, idx);
+                let original_preview_active = self.original_preview_active_for_frame(ctx, idx);
+                self.resolve_fs_navigation_sequence_target(ctx, idx, original_preview_active);
             }
             return;
         }
@@ -5859,7 +5910,7 @@ impl App {
         // 新 idx のデコードが失敗確定 (Failed) の場合も lock を解放する。さもないと
         // holdover (旧画像) が残り続け、以降の Ctrl+↑↓ が lock でブロックされる。
         let has_failed = matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Failed));
-        let original_preview_active = self.original_preview_active(ctx, idx);
+        let original_preview_active = self.original_preview_active_for_frame(ctx, idx);
         let requires_final_effect = !self
             .fs_display_bypasses_final_pipeline(original_preview_active)
             && self.colorize_display_requires_final_effect(idx);
@@ -8019,6 +8070,14 @@ struct FsPageTurnFrameDecision {
     items_generation: u64,
     idx: usize,
     decision: FsPageTurnDecision,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FsOriginalPreviewFrameSample {
+    frame_nr: u64,
+    items_generation: u64,
+    idx: usize,
+    active: bool,
 }
 
 /// A page-turn burst exists only after a held page-turn input has actually
@@ -14619,7 +14678,7 @@ impl App {
             Some("compare_mode")
         } else if self.is_panorama_mode_active(fs_idx) {
             Some("panorama_mode")
-        } else if self.original_preview_active(ctx, fs_idx) {
+        } else if self.original_preview_active_for_frame(ctx, fs_idx) {
             Some("original_preview")
         } else {
             None
@@ -14807,7 +14866,8 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
     ) -> FsPageTurnDecision {
-        self.resolve_fs_navigation_sequence_target(ctx, fs_idx);
+        let original_preview_active = self.original_preview_active_for_frame(ctx, fs_idx);
+        self.resolve_fs_navigation_sequence_target(ctx, fs_idx, original_preview_active);
         let (rendition_sequence_active, passthrough_rendition_ready) =
             self.fs_navigation_sequence_rendition_state(fs_idx);
         #[cfg(not(windows))]
@@ -15308,7 +15368,7 @@ impl App {
         page_turn_decision: FsPageTurnDecision,
     ) -> FsFrameState {
         let is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
-        let original_preview_active = self.original_preview_active(ctx, fs_idx);
+        let original_preview_active = self.original_preview_active_for_frame(ctx, fs_idx);
 
         let pass_through = matches!(
             page_turn_decision.paint_source(),
@@ -33592,6 +33652,167 @@ mod tests {
             });
             assert!(text.starts_with(expected));
         }
+    }
+
+    fn setup_navigation_readiness_app(page_count: usize) -> crate::app::AppTestEnvForTest {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = (0..page_count)
+            .map(|idx| GridItem::Image(PathBuf::from(format!("readiness_page_{idx}.png"))))
+            .collect();
+        app.thumbnails = vec![ThumbnailState::Pending; page_count];
+        app.items_generation = 41;
+        app.fullscreen_idx = Some(0);
+        app.settings.global_preset.colorize.mode = crate::colorize::ColorizeMode::AllImages;
+        app
+    }
+
+    fn insert_navigation_original_page(
+        app: &mut crate::app::AppTestEnvForTest,
+        ctx: &egui::Context,
+        idx: usize,
+    ) {
+        let pixels = std::sync::Arc::new(egui::ColorImage::filled(
+            [2, 2],
+            egui::Color32::from_gray(40 + idx as u8),
+        ));
+        let texture = ctx.load_texture(
+            format!("readiness_original_{idx}"),
+            pixels.as_ref().clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex: texture,
+                pixels,
+                source_dims: Some([2, 2]),
+                load_seq: idx as u64 + 1,
+            },
+        );
+    }
+
+    fn set_awaiting_navigation_target(app: &mut crate::app::AppTestEnvForTest, pages: Vec<usize>) {
+        app.fs_nav_locked_gen = Some(app.items_generation);
+        app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous: None,
+            target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                items_generation: app.items_generation,
+                pages,
+                phase: FsNavigationTargetPhase::Awaiting {
+                    accept_rendition: false,
+                },
+            }),
+        }));
+    }
+
+    fn navigation_target_phase(app: &crate::app::AppTestEnvForTest) -> FsNavigationTargetPhase {
+        let target = app
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .and_then(|sequence| match &sequence.target {
+                FsNavigationSequenceTarget::Display(target) => Some(target),
+                FsNavigationSequenceTarget::FolderItems { .. } => None,
+            })
+            .expect("display navigation target");
+        target.phase
+    }
+
+    #[test]
+    fn bypass_readiness_accepts_original_without_processed_texture() {
+        let ctx = egui::Context::default();
+        let mut app = setup_navigation_readiness_app(1);
+        insert_navigation_original_page(&mut app, &ctx, 0);
+        set_awaiting_navigation_target(&mut app, vec![0]);
+
+        assert!(app.fs_display_bypasses_final_pipeline(true));
+        assert!(app.resolve_original_preview_tex(0).is_some());
+        assert!(app.resolve_fs_display_tex(0, true).is_none());
+        app.resolve_fs_navigation_sequence_target(&ctx, 0, true);
+
+        assert_eq!(
+            navigation_target_phase(&app),
+            FsNavigationTargetPhase::Ready(FsNavigationPresentation::Materialized)
+        );
+    }
+
+    #[test]
+    fn ordinary_readiness_still_requires_processed_texture() {
+        let ctx = egui::Context::default();
+        let mut app = setup_navigation_readiness_app(1);
+        insert_navigation_original_page(&mut app, &ctx, 0);
+        set_awaiting_navigation_target(&mut app, vec![0]);
+
+        assert!(!app.fs_display_bypasses_final_pipeline(false));
+        assert!(app.resolve_original_preview_tex(0).is_some());
+        assert!(app.resolve_fs_display_tex(0, true).is_none());
+        app.resolve_fs_navigation_sequence_target(&ctx, 0, false);
+
+        assert_eq!(
+            navigation_target_phase(&app),
+            FsNavigationTargetPhase::Awaiting {
+                accept_rendition: false
+            }
+        );
+        assert!(app.fs_navigation_sequence_blocks_new_target());
+    }
+
+    #[test]
+    fn bypass_readiness_without_original_stays_awaiting() {
+        let ctx = egui::Context::default();
+        let mut app = setup_navigation_readiness_app(1);
+        set_awaiting_navigation_target(&mut app, vec![0]);
+
+        app.resolve_fs_navigation_sequence_target(&ctx, 0, true);
+
+        assert_eq!(
+            navigation_target_phase(&app),
+            FsNavigationTargetPhase::Awaiting {
+                accept_rendition: false
+            }
+        );
+        assert!(app.fs_navigation_sequence_blocks_new_target());
+    }
+
+    #[test]
+    fn analysis_mode_readiness_uses_the_original_source() {
+        let ctx = egui::Context::default();
+        let mut app = setup_navigation_readiness_app(1);
+        app.analysis_mode = true;
+        insert_navigation_original_page(&mut app, &ctx, 0);
+        set_awaiting_navigation_target(&mut app, vec![0]);
+
+        assert!(app.fs_display_bypasses_final_pipeline(false));
+        assert!(app.resolve_fs_display_tex(0, true).is_none());
+        app.resolve_fs_navigation_sequence_target(&ctx, 0, false);
+
+        assert_eq!(
+            navigation_target_phase(&app),
+            FsNavigationTargetPhase::Ready(FsNavigationPresentation::Materialized)
+        );
+    }
+
+    #[test]
+    fn bypass_spread_readiness_requires_both_original_pages() {
+        let ctx = egui::Context::default();
+        let mut app = setup_navigation_readiness_app(2);
+        insert_navigation_original_page(&mut app, &ctx, 0);
+        set_awaiting_navigation_target(&mut app, vec![0, 1]);
+
+        app.resolve_fs_navigation_sequence_target(&ctx, 0, true);
+        assert_eq!(
+            navigation_target_phase(&app),
+            FsNavigationTargetPhase::Awaiting {
+                accept_rendition: false
+            }
+        );
+
+        insert_navigation_original_page(&mut app, &ctx, 1);
+        app.resolve_fs_navigation_sequence_target(&ctx, 0, true);
+        assert_eq!(
+            navigation_target_phase(&app),
+            FsNavigationTargetPhase::Ready(FsNavigationPresentation::Materialized)
+        );
     }
 
     /// Reported 2026-08-14: holding the key one way stayed at full quality while the other way
