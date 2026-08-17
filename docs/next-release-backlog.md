@@ -1238,6 +1238,24 @@
 - 正本: [codex-original-preview-readiness-brief.md](briefs/codex-original-preview-readiness-brief.md)。
   関連: [display-pipeline.md](display-pipeline.md) §2.5.4。
 
+### 1.90 アニメーション先読みの全フレーム展開で archive 閲覧が停止する — 利用者報告 >>241
+
+- **完了 (2026-08-17):** fullscreen canonical decode に typed `AnimationPolicy` を追加し、通常ファイル /
+  archive entry と GIF / APNG / WebP の全組み合わせで、先読みは第1フレームだけ、現ページは全フレーム
+  とした。archive 内 GIF / APNG も WebP と同じくアニメーション再生する。
+- 先読みしたアニメ第1フレームは cache entry に形式付きで記録する。現ページ化したら第1フレームを
+  表示したまま全フレームへ昇格し、items generation / target idx が一致する結果だけを差し替える。
+  ページを離れた worker と upload backlog は cancel / 破棄し、失敗時は静止した第1フレームを残す。
+- 昇格が150ms以上続く場合だけ、in-flight 状態から「アニメーションを読み込み中…」を右上3段目へ
+  表示する。時間で消える feedback toast は使わず、完了時には同じ state owner から即座に消える。
+- 回帰テストは FirstFrameOnly の3形式の先頭画素一致、FullFrames の file / archive 3形式、spawn 方針、
+  現ページ昇格、移動 cancel + stale 拒否、失敗時の第1フレーム維持、150ms表示述語を固定した。
+  既存 `fs_animation` の10テストは無修正で通過。
+- 現ページ1本の全フレーム常駐は確定仕様。ストリーミング / リングバッファ化は今回の範囲外で、
+  将来必要になった場合は GIF / WebP のフレーム依存とループ再decodeを含めて別設計にする。
+- 正本: [codex-animation-prefetch-policy-brief.md](briefs/codex-animation-prefetch-policy-brief.md)。
+  関連: [display-pipeline.md](display-pipeline.md) §4.1.1。
+
 ### 5.8 検索ベンチのゲートに絶対時間の下限が無い
 
 - 出典: v3.0.0 リリース前確認 (2026-08-14)。`check_bench_regression.py` が 10 件中 7 件を

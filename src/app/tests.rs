@@ -82,9 +82,21 @@ fn fullscreen_fs_cache_does_not_cross_install_new_items_generation() {
     app.fs_early_dims.insert(0, [1200, 1800]);
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (_tx, rx) = std::sync::mpsc::channel();
-    app.fs_pending
-        .insert(0, (std::sync::Arc::clone(&cancel), rx, 9));
-    app.fs_upload_backlog.push((0, FsLoadResult::Failed, 9));
+    app.fs_pending.insert(
+        0,
+        FsPendingValue::new(
+            std::sync::Arc::clone(&cancel),
+            rx,
+            9,
+            FsLoadPurpose::Display,
+        ),
+    );
+    app.fs_upload_backlog.push(FsUploadResult::new(
+        0,
+        FsLoadResult::Failed,
+        9,
+        FsLoadPurpose::Display,
+    ));
 
     app.install_new_items(
         vec![GridItem::Image(PathBuf::from("C:/new/book/page.png"))],
@@ -110,6 +122,7 @@ fn stale_fullscreen_load_completion_is_not_enqueued_for_new_items() {
         0,
         FsLoadResult::Failed,
         17,
+        FsLoadPurpose::Display,
     );
 
     assert!(!accepted);
@@ -162,6 +175,7 @@ fn spread_page_dims_survive_fs_cache_and_thumbnail_eviction() {
             pixels: std::sync::Arc::new(egui::ColorImage::filled([2, 1], egui::Color32::WHITE)),
             source_dims: Some([1800, 1100]),
             load_seq: 0,
+            animation: crate::fs_animation::StaticAnimationState::Still,
         },
     );
 
@@ -10011,8 +10025,9 @@ mod relative_page_io_boundary_tests {
         }
         app.jump_to_current_book_bookmark(&egui::Context::default(), &bookmark);
 
-        let (_, rx, _) = app.fs_pending.get(&0).expect("fullscreen load pending");
-        let result = rx
+        let pending = app.fs_pending.get(&0).expect("fullscreen load pending");
+        let result = pending
+            .rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("fullscreen worker result");
         assert!(matches!(result, FsLoadResult::Failed));
@@ -18671,6 +18686,7 @@ mod favorite_adjustment_defaults_tests {
                 pixels: std::sync::Arc::new(left_pixels),
                 source_dims: None,
                 load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
         app.fs_cache.insert(
@@ -18684,6 +18700,7 @@ mod favorite_adjustment_defaults_tests {
                 pixels: std::sync::Arc::new(right_pixels),
                 source_dims: None,
                 load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
         app.fullscreen_idx = Some(0);
@@ -18778,6 +18795,7 @@ mod favorite_adjustment_defaults_tests {
                     pixels: std::sync::Arc::new(px),
                     source_dims: None,
                     load_seq: 0,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
                 },
             );
         };
@@ -18880,6 +18898,7 @@ mod favorite_adjustment_defaults_tests {
                 )),
                 source_dims: None,
                 load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
         assert!(
@@ -18939,6 +18958,7 @@ mod favorite_adjustment_defaults_tests {
                 pixels: std::sync::Arc::new(egui::ColorImage::filled([4, 7], egui::Color32::WHITE)),
                 source_dims: Some([400, 700]),
                 load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
         app.rotation_cache
@@ -19103,6 +19123,7 @@ mod favorite_adjustment_defaults_tests {
                     pixels: std::sync::Arc::new(px),
                     source_dims: None,
                     load_seq: 0,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
                 },
             );
         };
@@ -19164,6 +19185,7 @@ mod favorite_adjustment_defaults_tests {
                 pixels: std::sync::Arc::new(left_pixels),
                 source_dims: None,
                 load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
         app.fs_cache.insert(
@@ -19177,6 +19199,7 @@ mod favorite_adjustment_defaults_tests {
                 pixels: std::sync::Arc::new(right_pixels),
                 source_dims: None,
                 load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
         app.fullscreen_idx = Some(1);
@@ -19254,6 +19277,7 @@ mod favorite_adjustment_defaults_tests {
                 pixels: std::sync::Arc::new(pixels),
                 source_dims: None,
                 load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
         app.fullscreen_idx = Some(0);
@@ -19296,6 +19320,7 @@ mod favorite_adjustment_defaults_tests {
                 pixels: std::sync::Arc::new(pixels),
                 source_dims: None,
                 load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
         app.fullscreen_idx = Some(0);
@@ -19368,6 +19393,7 @@ mod favorite_adjustment_defaults_tests {
                 pixels: std::sync::Arc::new(pixels),
                 source_dims: None,
                 load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
         app.ai_upscale_enabled = true;
@@ -21560,6 +21586,7 @@ mod favorite_adjustment_defaults_tests {
                 pixels: raw_pixels,
                 source_dims: Some([1, 1]),
                 load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
         app.erase_base_cache
@@ -21603,6 +21630,7 @@ mod favorite_adjustment_defaults_tests {
                 pixels: std::sync::Arc::new(raw),
                 source_dims: Some([1, 1]),
                 load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
         let ai = egui::ColorImage::new([4, 4], vec![egui::Color32::from_rgb(240, 240, 240); 16]);
@@ -21619,6 +21647,7 @@ mod favorite_adjustment_defaults_tests {
                 pixels: std::sync::Arc::new(ai),
                 source_dims: None,
                 load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
 
@@ -22567,6 +22596,7 @@ mod pipeline_cache_refactor_tests {
                 pixels: Arc::clone(&pixels),
                 source_dims: Some([2, 1]),
                 load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
         pixels
@@ -22960,6 +22990,7 @@ mod pipeline_cache_refactor_tests {
                     pixels: Arc::new(image),
                     source_dims: None,
                     load_seq: 0,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
                 },
             );
         }
@@ -23186,6 +23217,7 @@ mod pipeline_cache_refactor_tests {
                 pixels: Arc::clone(&pixels),
                 source_dims: Some([1, 1]),
                 load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
 
@@ -23387,13 +23419,14 @@ mod pipeline_cache_refactor_tests {
             [4, 4],
             egui::Color32::from_gray(180),
         ));
-        app.fs_upload_backlog.push((
+        app.fs_upload_backlog.push(FsUploadResult::new(
             idx,
             FsLoadResult::StaticCached {
                 pixels: rerendered_pixels,
                 source_dims: [4, 4],
             },
             7,
+            FsLoadPurpose::Display,
         ));
 
         app.poll_prefetch(&ctx);
@@ -23978,6 +24011,7 @@ mod pipeline_cache_refactor_tests {
                 pixels: raw_pixels,
                 source_dims: Some([1, 1]),
                 load_seq: 1,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
         app.fs_holdover_tex = Some(single_folder_navigation_holdover(
@@ -24022,6 +24056,7 @@ mod pipeline_cache_refactor_tests {
                 pixels,
                 source_dims: None,
                 load_seq: 1,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
     }
@@ -24839,6 +24874,7 @@ mod pipeline_cache_refactor_tests {
                 pixels: raw_pixels,
                 source_dims: Some([2, 2]),
                 load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
 
@@ -24945,6 +24981,7 @@ mod pipeline_cache_refactor_tests {
                 pixels: Arc::clone(&raw_pixels),
                 source_dims: Some([1, 1]),
                 load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
         app.settings.global_preset.post_filter = PostFilter::Sepia;
@@ -26533,12 +26570,18 @@ mod pipeline_cache_refactor_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let input_seq = app.input_seq;
-        app.fs_pending
-            .insert(idx, (Arc::clone(&cancel), rx, input_seq));
+        app.fs_pending.insert(
+            idx,
+            FsPendingValue::new(Arc::clone(&cancel), rx, input_seq, FsLoadPurpose::Display),
+        );
 
         for _ in 0..120 {
             assert_eq!(app.ensure_fs_page_load(idx), FsPageLoadState::LoadPending);
-            let active_cancel = &app.fs_pending.get(&idx).expect("same pending request").0;
+            let active_cancel = &app
+                .fs_pending
+                .get(&idx)
+                .expect("same pending request")
+                .cancel;
             assert!(
                 Arc::ptr_eq(active_cancel, &cancel),
                 "the per-frame guard must not replace an equivalent in-flight request"
@@ -26605,16 +26648,28 @@ mod pipeline_cache_refactor_tests {
                 pixels: Arc::clone(&resident_pixels),
                 source_dims: Some([2, 2]),
                 load_seq: 1,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
 
         let (_fs_tx, fs_rx) = std::sync::mpsc::channel();
         let fs_cancel = Arc::new(AtomicBool::new(false));
         let input_seq = app.input_seq;
-        app.fs_pending
-            .insert(pending_idx, (Arc::clone(&fs_cancel), fs_rx, input_seq));
-        app.fs_upload_backlog
-            .push((pending_idx, FsLoadResult::Failed, input_seq));
+        app.fs_pending.insert(
+            pending_idx,
+            FsPendingValue::new(
+                Arc::clone(&fs_cancel),
+                fs_rx,
+                input_seq,
+                FsLoadPurpose::Display,
+            ),
+        );
+        app.fs_upload_backlog.push(FsUploadResult::new(
+            pending_idx,
+            FsLoadResult::Failed,
+            input_seq,
+            FsLoadPurpose::Display,
+        ));
 
         let ai_key = FinalAiKey {
             edit_key: dummy_edit_key(&app, pending_idx),
@@ -26872,8 +26927,15 @@ mod pipeline_cache_refactor_tests {
         let (_tx, rx) = std::sync::mpsc::channel();
         let sibling_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let input_seq = app.input_seq;
-        app.fs_pending
-            .insert(sibling, (Arc::clone(&sibling_cancel), rx, input_seq));
+        app.fs_pending.insert(
+            sibling,
+            FsPendingValue::new(
+                Arc::clone(&sibling_cancel),
+                rx,
+                input_seq,
+                FsLoadPurpose::Prefetch,
+            ),
+        );
 
         app.update_prefetch_window(current);
 
@@ -26884,6 +26946,201 @@ mod pipeline_cache_refactor_tests {
             FsPageLoadState::LoadPending,
             "the paged twin must re-assert the current producer before returning",
         );
+    }
+
+    fn insert_animation_first_frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        format: crate::canonical_image_loader::CanonicalAnimatedFormat,
+    ) -> egui::TextureId {
+        let pixels = Arc::new(egui::ColorImage::filled([2, 2], egui::Color32::LIGHT_BLUE));
+        let texture = ctx.load_texture(
+            format!("animation_first_frame_{idx}"),
+            pixels.as_ref().clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        let texture_id = texture.id();
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex: texture,
+                pixels,
+                source_dims: Some([2, 2]),
+                load_seq: 1,
+                animation: crate::fs_animation::StaticAnimationState::FirstFrameOnly(format),
+            },
+        );
+        texture_id
+    }
+
+    #[test]
+    fn fullscreen_load_spawns_current_with_full_frames_and_prefetch_with_first_frame_only() {
+        let mut app = setup_app();
+        let current = push_image(&mut app, r"C:\missing\current.gif");
+        let prefetch = push_image(&mut app, r"C:\missing\prefetch.gif");
+        app.fullscreen_idx = Some(current);
+
+        app.start_fs_load(current);
+        app.start_fs_load(prefetch);
+
+        assert_eq!(
+            app.fs_pending
+                .get(&current)
+                .unwrap()
+                .purpose
+                .animation_policy(),
+            crate::canonical_image_loader::AnimationPolicy::FullFrames
+        );
+        assert_eq!(
+            app.fs_pending
+                .get(&prefetch)
+                .unwrap()
+                .purpose
+                .animation_policy(),
+            crate::canonical_image_loader::AnimationPolicy::FirstFrameOnly
+        );
+    }
+
+    #[test]
+    fn prefetched_animation_first_frame_starts_promotion_when_it_becomes_current() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\missing\promote.gif");
+        app.fullscreen_idx = Some(idx);
+        insert_animation_first_frame(
+            &mut app,
+            &ctx,
+            idx,
+            crate::canonical_image_loader::CanonicalAnimatedFormat::Gif,
+        );
+
+        assert!(app.fs_entry_is_animated(idx));
+        assert!(app.ensure_fs_page_load(idx).is_display_ready());
+        let purpose = app.fs_pending.get(&idx).unwrap().purpose;
+        assert!(purpose.promotion_started_at_for(idx).is_some());
+        assert_eq!(
+            purpose.animation_policy(),
+            crate::canonical_image_loader::AnimationPolicy::FullFrames
+        );
+    }
+
+    #[test]
+    fn leaving_a_page_cancels_promotion_and_discards_its_stale_result() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let old = push_image(&mut app, r"C:\missing\old.gif");
+        let current = push_image(&mut app, r"C:\missing\current.png");
+        app.visible_indices = vec![old, current];
+        app.details_order = vec![old, current];
+        app.fullscreen_idx = Some(old);
+        let first_texture = insert_animation_first_frame(
+            &mut app,
+            &ctx,
+            old,
+            crate::canonical_image_loader::CanonicalAnimatedFormat::Gif,
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let started_at = std::time::Instant::now();
+        let input_seq = app.input_seq;
+        app.fs_pending.insert(
+            old,
+            FsPendingValue::new(
+                Arc::clone(&cancel),
+                rx,
+                input_seq,
+                FsLoadPurpose::AnimationPromotion {
+                    target_idx: old,
+                    started_at,
+                },
+            ),
+        );
+
+        app.fullscreen_idx = Some(current);
+        app.update_prefetch_window(current);
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(!app.fs_pending.contains_key(&old));
+
+        app.fs_upload_backlog.push(FsUploadResult::new(
+            old,
+            FsLoadResult::Animated(vec![(
+                egui::ColorImage::filled([2, 2], egui::Color32::RED),
+                0.1,
+            )]),
+            input_seq,
+            FsLoadPurpose::AnimationPromotion {
+                target_idx: old,
+                started_at,
+            },
+        ));
+        app.poll_prefetch(&ctx);
+
+        assert!(app.fs_upload_backlog.is_empty());
+        assert!(matches!(
+            app.fs_cache.get(&old),
+            Some(FsCacheEntry::Static {
+                tex,
+                animation: crate::fs_animation::StaticAnimationState::FirstFrameOnly(_),
+                ..
+            }) if tex.id() == first_texture
+        ));
+    }
+
+    #[test]
+    fn failed_animation_promotion_keeps_the_first_frame_displayable() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, r"C:\missing\failed.gif");
+        app.fullscreen_idx = Some(idx);
+        let first_texture = insert_animation_first_frame(
+            &mut app,
+            &ctx,
+            idx,
+            crate::canonical_image_loader::CanonicalAnimatedFormat::Gif,
+        );
+        let input_seq = app.input_seq;
+        app.fs_upload_backlog.push(FsUploadResult::new(
+            idx,
+            FsLoadResult::Failed,
+            input_seq,
+            FsLoadPurpose::AnimationPromotion {
+                target_idx: idx,
+                started_at: std::time::Instant::now(),
+            },
+        ));
+
+        app.poll_prefetch(&ctx);
+
+        assert!(matches!(
+            app.fs_cache.get(&idx),
+            Some(FsCacheEntry::Static {
+                tex,
+                animation: crate::fs_animation::StaticAnimationState::PromotionFailed(
+                    crate::canonical_image_loader::CanonicalAnimatedFormat::Gif
+                ),
+                ..
+            }) if tex.id() == first_texture
+        ));
+        assert!(!app.fs_entry_is_animated(idx));
+    }
+
+    #[test]
+    fn animation_promotion_progress_visibility_tracks_in_flight_state_and_delay() {
+        let started_at = std::time::Instant::now();
+        assert!(!animation_promotion_progress_visible(None, started_at));
+        assert!(!animation_promotion_progress_visible(
+            Some(started_at),
+            started_at + std::time::Duration::from_millis(149)
+        ));
+        assert!(animation_promotion_progress_visible(
+            Some(started_at),
+            started_at + std::time::Duration::from_millis(150)
+        ));
+        assert!(!animation_promotion_progress_visible(
+            None,
+            started_at + std::time::Duration::from_secs(1)
+        ));
     }
 
     #[test]
@@ -26915,8 +27172,15 @@ mod pipeline_cache_refactor_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let right_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let input_seq = app.input_seq;
-        app.fs_pending
-            .insert(right, (Arc::clone(&right_cancel), rx, input_seq));
+        app.fs_pending.insert(
+            right,
+            FsPendingValue::new(
+                Arc::clone(&right_cancel),
+                rx,
+                input_seq,
+                FsLoadPurpose::Prefetch,
+            ),
+        );
 
         // Repeated display-target reconciliation must not classify the retained left page as
         // loading and cancel the right page on every frame.
@@ -27461,6 +27725,7 @@ mod pipeline_cache_refactor_tests {
                 pixels: Arc::new(egui::ColorImage::filled([1, 1], egui::Color32::WHITE)),
                 source_dims: None,
                 load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
         app.ai_upscale_failed.insert((1, 0));
@@ -27687,6 +27952,7 @@ mod pipeline_cache_refactor_tests {
                 pixels: Arc::clone(&target_pixels),
                 source_dims: Some(target_pixels.size),
                 load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
         app.edit_result_cache.insert(
@@ -28645,6 +28911,7 @@ mod pipeline_display_edit_split_tests {
                 pixels: Arc::clone(&pixels),
                 source_dims: Some([1, 1]),
                 load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
         pixels
@@ -28789,6 +29056,7 @@ mod pipeline_display_edit_split_tests {
                 pixels: Arc::new(ai),
                 source_dims: None,
                 load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
         let erase = insert_current_erase_result(
@@ -28975,6 +29243,7 @@ mod edit_materialize_worker_tests {
                 pixels: raw_pixels,
                 source_dims: Some([1, 1]),
                 load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
         app.local_adjust_page_layers
@@ -29019,6 +29288,7 @@ mod edit_materialize_worker_tests {
                 pixels: raw_pixels,
                 source_dims: Some([1, 1]),
                 load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
         app.conceal_pages.insert(idx);
@@ -30713,6 +30983,7 @@ mod still_window_mode_key_tests {
                 pixels: std::sync::Arc::new(pixels),
                 source_dims: Some([2, 1]),
                 load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
     }
@@ -39057,6 +39328,7 @@ mod still_window_mode_key_tests {
                     pixels: std::sync::Arc::new(pixels),
                     source_dims: Some([1, 2]),
                     load_seq: 0,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
                 },
             );
         }
@@ -39143,6 +39415,7 @@ mod still_window_mode_key_tests {
                     pixels: std::sync::Arc::new(pixels),
                     source_dims: Some([1, 2]),
                     load_seq: 0,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
                 },
             );
         }
@@ -39210,6 +39483,7 @@ mod still_window_mode_key_tests {
                     pixels: std::sync::Arc::new(pixels),
                     source_dims: Some([1, 2]),
                     load_seq: 0,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
                 },
             );
         }
@@ -39307,6 +39581,7 @@ mod still_window_mode_key_tests {
                     pixels: std::sync::Arc::new(pixels),
                     source_dims: Some([20, 20]),
                     load_seq: 0,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
                 },
             );
         }
@@ -46667,6 +46942,7 @@ mod ai_upscale_livelock_tests {
                 pixels: std::sync::Arc::new(egui::ColorImage::filled([4, 4], egui::Color32::WHITE)),
                 source_dims: None,
                 load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
         app.fullscreen_idx = Some(0);
@@ -46737,6 +47013,7 @@ mod ai_upscale_livelock_tests {
             pixels: std::sync::Arc::new(egui::ColorImage::filled([w, h], egui::Color32::WHITE)),
             source_dims: None,
             load_seq: 0,
+            animation: crate::fs_animation::StaticAnimationState::Still,
         }
     }
 

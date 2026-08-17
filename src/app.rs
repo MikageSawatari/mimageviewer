@@ -2629,8 +2629,8 @@ impl ViewerContextBundle {
         }
         self.pending_folder_nav_steps = 0;
         self.pending_folder_nav_mode = FolderNavMode::Grid;
-        for (_, (cancel, _, _)) in self.fs_pending.drain() {
-            cancel.store(true, Ordering::Relaxed);
+        for (_, pending) in self.fs_pending.drain() {
+            pending.cancel.store(true, Ordering::Relaxed);
         }
         self.texture_backlog.clear();
         for pending in self.final_ai_pending.values() {
@@ -4995,21 +4995,117 @@ pub(crate) use crate::thumb_loader::{
 };
 
 use crate::canonical_image_loader::{
-    CanonicalAnimatedFormat, CanonicalDecodeError, CanonicalDecodeOptions, CanonicalImageDecode,
-    CanonicalImageSource, CanonicalStaticImage, decode_canonical_image,
+    AnimationPolicy, CanonicalAnimatedFormat, CanonicalDecodeError, CanonicalDecodeOptions,
+    CanonicalImageDecode, CanonicalImageSource, CanonicalStaticAnimation, CanonicalStaticImage,
+    decode_canonical_image,
 };
-use crate::fs_animation::{AnimationPlayback, FsCacheEntry, FsLoadResult};
+use crate::fs_animation::{AnimationPlayback, FsCacheEntry, FsLoadResult, StaticAnimationState};
 use crate::items_generation_cache::{ItemsGenerationMap, ItemsGenerationVec};
 
-type FsPendingValue = (Arc<AtomicBool>, mpsc::Receiver<FsLoadResult>, u64);
-type FsUploadBacklog = ItemsGenerationVec<(usize, FsLoadResult, u64)>;
+const ANIMATION_PROMOTION_PROGRESS_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(150);
 
-fn cancel_fs_pending_value(value: &mut FsPendingValue) {
-    value.0.store(true, Ordering::Relaxed);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FsLoadPurpose {
+    Display,
+    Prefetch,
+    AnimationPromotion {
+        target_idx: usize,
+        started_at: std::time::Instant,
+    },
 }
 
-fn fs_upload_backlog_idx(value: &(usize, FsLoadResult, u64)) -> usize {
-    value.0
+impl FsLoadPurpose {
+    fn for_page(is_current: bool) -> Self {
+        if is_current {
+            Self::Display
+        } else {
+            Self::Prefetch
+        }
+    }
+
+    const fn animation_policy(self) -> AnimationPolicy {
+        match self {
+            Self::Prefetch => AnimationPolicy::FirstFrameOnly,
+            Self::Display | Self::AnimationPromotion { .. } => AnimationPolicy::FullFrames,
+        }
+    }
+
+    pub(crate) const fn promotion_started_at_for(self, idx: usize) -> Option<std::time::Instant> {
+        match self {
+            Self::AnimationPromotion {
+                target_idx,
+                started_at,
+            } if target_idx == idx => Some(started_at),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) fn animation_promotion_progress_visible(
+    started_at: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    started_at.is_some_and(|started_at| {
+        now.checked_duration_since(started_at)
+            .is_some_and(|elapsed| elapsed >= ANIMATION_PROMOTION_PROGRESS_DELAY)
+    })
+}
+
+pub(crate) struct FsPendingValue {
+    pub(crate) cancel: Arc<AtomicBool>,
+    pub(crate) rx: mpsc::Receiver<FsLoadResult>,
+    pub(crate) load_seq: u64,
+    pub(crate) purpose: FsLoadPurpose,
+}
+
+impl FsPendingValue {
+    pub(crate) fn new(
+        cancel: Arc<AtomicBool>,
+        rx: mpsc::Receiver<FsLoadResult>,
+        load_seq: u64,
+        purpose: FsLoadPurpose,
+    ) -> Self {
+        Self {
+            cancel,
+            rx,
+            load_seq,
+            purpose,
+        }
+    }
+}
+
+pub(crate) struct FsUploadResult {
+    pub(crate) idx: usize,
+    pub(crate) result: FsLoadResult,
+    pub(crate) load_seq: u64,
+    pub(crate) purpose: FsLoadPurpose,
+}
+
+impl FsUploadResult {
+    pub(crate) fn new(
+        idx: usize,
+        result: FsLoadResult,
+        load_seq: u64,
+        purpose: FsLoadPurpose,
+    ) -> Self {
+        Self {
+            idx,
+            result,
+            load_seq,
+            purpose,
+        }
+    }
+}
+
+type FsUploadBacklog = ItemsGenerationVec<FsUploadResult>;
+
+fn cancel_fs_pending_value(value: &mut FsPendingValue) {
+    value.cancel.store(true, Ordering::Relaxed);
+}
+
+fn fs_upload_backlog_idx(value: &FsUploadResult) -> usize {
+    value.idx
 }
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::thumb_loader::{
@@ -25261,8 +25357,8 @@ impl App {
         self.fs_upload_backlog.clear();
 
         // in-flight pending (idx-keyed) をキャンセル
-        for (cancel, _, _) in self.fs_pending.values() {
-            cancel.store(true, Ordering::Relaxed);
+        for pending in self.fs_pending.values() {
+            pending.cancel.store(true, Ordering::Relaxed);
         }
         self.fs_pending.clear();
         for (cancel, _) in self.ai_upscale_pending.values() {
@@ -41829,11 +41925,12 @@ impl App {
             if item_key_changed {
                 self.fs_cache.remove(&selected);
                 self.fs_margin_bbox_cache.remove(&selected);
-                if let Some((cancel, _, _)) = self.fs_pending.remove(&selected) {
-                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                if let Some(pending) = self.fs_pending.remove(&selected) {
+                    pending
+                        .cancel
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
-                self.fs_upload_backlog
-                    .retain(|(idx, _, _)| *idx != selected);
+                self.fs_upload_backlog.retain(|entry| entry.idx != selected);
             }
             let cursor_state = self.fullscreen_cursor_state();
             self.open_fullscreen(selected, crate::app::HistoryTrigger::UserChosen);
@@ -48785,9 +48882,13 @@ impl App {
 
     /// 1枚のフルサイズ画像を非同期で読み込み開始する。
     /// 通常画像 / ZIP エントリ / PDF ページ の全てに対応。
-    /// GIF / APNG (通常画像) と WebP (通常画像 / ZIP 内画像) は
-    /// アニメーションフレームを全デコードして FsLoadResult::Animated を送信する。
+    /// 現在ページは全フレーム、先読みは全形式とも第1フレームだけを decode する。
     pub(crate) fn start_fs_load(&mut self, idx: usize) {
+        let purpose = FsLoadPurpose::for_page(self.fullscreen_idx == Some(idx));
+        self.start_fs_load_with_purpose(idx, purpose);
+    }
+
+    fn start_fs_load_with_purpose(&mut self, idx: usize, purpose: FsLoadPurpose) {
         // 360 度パノラマビュー Phase 2a: 内部で使う tee 判定パラメータ。
         // `start_fs_load` 開始時点で App の状態をスナップショットして worker に渡す
         // (docs/panorama-360-view-plan.md §4.6.0)。
@@ -49089,8 +49190,10 @@ impl App {
         let pdf_ct_tx = self.pdf_content_type_tx.clone();
         let perf_key = self.perf_item_key(idx);
         let perf_seq = self.input_seq;
-        self.fs_pending
-            .insert(idx, (Arc::clone(&cancel), rx, perf_seq));
+        self.fs_pending.insert(
+            idx,
+            FsPendingValue::new(Arc::clone(&cancel), rx, perf_seq, purpose),
+        );
         // 360 度パノラマビュー Phase 2a: 通常画像 (= PDF / ZIP 除く) のみで
         // tee デコード判断を持ち込む (§3.6.2 / §4.6.0)。
         // App 側で「XMP equirect 判定済みか」「approved_max_pixels」「BaseOnly か」を
@@ -49286,7 +49389,11 @@ impl App {
                                 ],
                             );
                         }
-                        let _ = tx.send(FsLoadResult::Static { ci, source_dims });
+                        let _ = tx.send(FsLoadResult::Static {
+                            ci,
+                            source_dims,
+                            animation: StaticAnimationState::Still,
+                        });
                         // content_type をメインスレッドに送る
                         let _ = pdf_ct_tx.send((idx, content_type));
                     }
@@ -49348,8 +49455,14 @@ impl App {
                     verified_bytes: verified_source_bytes.as_deref(),
                 }
             };
-            let canonical_decode =
-                decode_canonical_image(canonical_source, CanonicalDecodeOptions::fullscreen());
+            let canonical_decode = decode_canonical_image(
+                canonical_source,
+                CanonicalDecodeOptions::fullscreen(purpose.animation_policy()),
+            );
+            if cancel.load(Ordering::Relaxed) {
+                emit_exit("cancel_after_decode");
+                return;
+            }
 
             match canonical_decode {
                 Ok(CanonicalImageDecode::Animated { format, frames }) => {
@@ -49383,6 +49496,7 @@ impl App {
                 Ok(CanonicalImageDecode::Static(CanonicalStaticImage {
                     image: img,
                     source_dims,
+                    animation,
                 })) => {
                     let source_pixels = (source_dims[0] as u64) * (source_dims[1] as u64);
                     // 360 度パノラマビュー Phase 2a: tee 判定
@@ -49482,6 +49596,7 @@ impl App {
                     let raster = CanonicalStaticImage {
                         image: img,
                         source_dims,
+                        animation,
                     }
                     .into_gpu_raster();
                     let (w, h) = (raster.pixels.size[0], raster.pixels.size[1]);
@@ -49505,7 +49620,17 @@ impl App {
                             ],
                         );
                     }
-                    let _ = tx.send(FsLoadResult::Static { ci, source_dims });
+                    let animation = match animation {
+                        CanonicalStaticAnimation::Still => StaticAnimationState::Still,
+                        CanonicalStaticAnimation::FirstFrameOnly(format) => {
+                            StaticAnimationState::FirstFrameOnly(format)
+                        }
+                    };
+                    let _ = tx.send(FsLoadResult::Static {
+                        ci,
+                        source_dims,
+                        animation,
+                    });
                     emit_exit("static_ok");
                 }
                 Err(CanonicalDecodeError::SourceRead(e)) => {
@@ -49690,8 +49815,8 @@ impl App {
         if let Some((pixels, source_dims)) =
             self.lookup_retained_pdf_page_raster(idx, target_px, "request_pdf_rerender")
         {
-            if let Some((cancel, _, _)) = self.fs_pending.remove(&idx) {
-                cancel.store(true, Ordering::Relaxed);
+            if let Some(pending) = self.fs_pending.remove(&idx) {
+                pending.cancel.store(true, Ordering::Relaxed);
             }
             self.enqueue_retained_pdf_page_raster_result(
                 idx,
@@ -49704,8 +49829,8 @@ impl App {
         }
 
         // 進行中の再レンダリングがあればキャンセル
-        if let Some((cancel, _, _)) = self.fs_pending.remove(&idx) {
-            cancel.store(true, Ordering::Relaxed);
+        if let Some(pending) = self.fs_pending.remove(&idx) {
+            pending.cancel.store(true, Ordering::Relaxed);
         }
 
         // ワーカーに非同期リクエスト (UI スレッドをブロックしない)
@@ -49721,8 +49846,10 @@ impl App {
         // FsLoadResult チャネルを期待するため、ブリッジスレッドで変換する
         let (fs_tx, fs_rx) = mpsc::channel::<FsLoadResult>();
         let perf_seq = self.input_seq;
-        self.fs_pending
-            .insert(idx, (Arc::clone(&cancel), fs_rx, perf_seq));
+        self.fs_pending.insert(
+            idx,
+            FsPendingValue::new(Arc::clone(&cancel), fs_rx, perf_seq, FsLoadPurpose::Display),
+        );
 
         std::thread::spawn(move || {
             match render_rx.recv() {
@@ -49747,7 +49874,11 @@ impl App {
                     let source_dims = [img.width() as usize, img.height() as usize];
                     let img = clamp_dynamic_for_gpu(img);
                     let ci = dynamic_image_to_color_image(&img);
-                    let _ = fs_tx.send(FsLoadResult::Static { ci, source_dims });
+                    let _ = fs_tx.send(FsLoadResult::Static {
+                        ci,
+                        source_dims,
+                        animation: StaticAnimationState::Still,
+                    });
                 }
                 Ok(Err(e)) => {
                     crate::logger::log(format!("  pdf rerender FAIL: {e}"));
@@ -49806,6 +49937,28 @@ impl App {
         self.fs_margin_bbox_cache
             .retain(|k, _| keep_set.contains(k));
 
+        // 昇格は表示対象 idx にだけ属する。KEEP 範囲内かどうかとは独立に、ページを
+        // 離れた時点で worker を止め、decode 済み backlog も捨てる。
+        let stale_promotions: Vec<usize> = self
+            .fs_pending
+            .iter()
+            .filter_map(|(&idx, pending)| {
+                (idx != current_idx && pending.purpose.promotion_started_at_for(idx).is_some())
+                    .then_some(idx)
+            })
+            .collect();
+        for idx in stale_promotions {
+            if let Some(pending) = self.fs_pending.remove(&idx) {
+                pending.cancel.store(true, Ordering::Relaxed);
+            }
+            self.fs_early_dims.remove(&idx);
+        }
+        self.fs_upload_backlog.retain(|entry| {
+            entry.purpose.promotion_started_at_for(entry.idx).is_none() || entry.idx == current_idx
+        });
+
+        self.start_animation_promotion_if_needed(current_idx);
+
         // 現在表示中の画像がまだ表示可能な状態へ到達していないなら、
         // その画像に CPU を独占させるため他の pending をすべてキャンセルする。
         // 現在画像が完了したあと poll_prefetch から再度 update_prefetch_window が
@@ -49816,19 +49969,21 @@ impl App {
 
         let to_cancel: Vec<usize> = self
             .fs_pending
-            .keys()
-            .filter(|&&k| {
+            .iter()
+            .filter_map(|(&k, pending)| {
                 if k == current_idx {
-                    return false;
+                    return None;
                 }
                 // 現在画像がロード中なら全 pending をキャンセル。そうでなければ KEEP 範囲外のみ。
-                current_loading || !keep_set.contains(&k)
+                (current_loading
+                    || !keep_set.contains(&k)
+                    || pending.purpose.promotion_started_at_for(k).is_some())
+                .then_some(k)
             })
-            .cloned()
             .collect();
         for k in to_cancel {
-            if let Some((cancel, _, _)) = self.fs_pending.remove(&k) {
-                cancel.store(true, Ordering::Relaxed);
+            if let Some(pending) = self.fs_pending.remove(&k) {
+                pending.cancel.store(true, Ordering::Relaxed);
             }
             // 先行 dims ヒントはキャンセルされた idx では意味がないので破棄。
             self.fs_early_dims.remove(&k);
@@ -50481,8 +50636,8 @@ impl App {
         self.erase_result_cache.clear();
         self.edit_result_cache.clear();
         self.clear_all_final_pipeline_caches_for_session_close();
-        for (cancel, _, _) in self.fs_pending.values() {
-            cancel.store(true, Ordering::Relaxed);
+        for pending in self.fs_pending.values() {
+            pending.cancel.store(true, Ordering::Relaxed);
         }
         self.fs_pending.clear();
         self.fs_early_dims.clear();
@@ -51124,6 +51279,7 @@ impl App {
                     pixels,
                     source_dims: None,
                     load_seq: 0,
+                    animation: StaticAnimationState::Still,
                 },
             );
             // 360 度パノラマビュー: AI 完了で cache 内容が変わったので世代 bump (§3.6.2.2)。
@@ -54061,12 +54217,19 @@ impl App {
 
     /// Animated images are playback-only and must bypass edit/final caches.
     pub(crate) fn fs_entry_is_animated(&self, idx: usize) -> bool {
-        matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Animated { .. }))
+        self.fs_cache
+            .get(&idx)
+            .is_some_and(FsCacheEntry::is_animation_source)
     }
 
     /// Currently selected animation frame texture for display.
     pub(crate) fn current_animated_frame_texture(&self, idx: usize) -> Option<egui::TextureHandle> {
         match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Static {
+                tex,
+                animation: StaticAnimationState::FirstFrameOnly(_),
+                ..
+            }) => Some(tex.clone()),
             Some(FsCacheEntry::Animated {
                 frames,
                 current_frame,
@@ -55146,6 +55309,7 @@ impl App {
         idx: usize,
         result: FsLoadResult,
         load_seq: u64,
+        purpose: FsLoadPurpose,
     ) -> bool {
         if !self
             .fs_upload_backlog
@@ -55156,16 +55320,14 @@ impl App {
         let backlog_pos = self
             .fs_upload_backlog
             .iter()
-            .position(|(key, _, _)| *key == idx);
+            .position(|entry| entry.idx == idx);
+        let entry = FsUploadResult::new(idx, result, load_seq, purpose);
         if let Some(pos) = backlog_pos {
-            self.fs_upload_backlog.replace_for_generation(
-                pos,
-                items_generation,
-                (idx, result, load_seq),
-            )
+            self.fs_upload_backlog
+                .replace_for_generation(pos, items_generation, entry)
         } else {
             self.fs_upload_backlog
-                .push_for_generation(items_generation, (idx, result, load_seq))
+                .push_for_generation(items_generation, entry)
         }
     }
 
@@ -55181,7 +55343,13 @@ impl App {
             pixels,
             source_dims,
         };
-        self.enqueue_fs_upload_result_for_generation(self.items_generation, idx, result, load_seq);
+        self.enqueue_fs_upload_result_for_generation(
+            self.items_generation,
+            idx,
+            result,
+            load_seq,
+            FsLoadPurpose::for_page(self.fullscreen_idx == Some(idx)),
+        );
         self.fs_early_dims.remove(&idx);
         crate::logger::log(format!(
             "[PDF] Retained page enqueue idx={idx} kind=raster backlog={} reason={reason}",
@@ -55190,7 +55358,49 @@ impl App {
     }
 
     fn fs_upload_backlog_contains(&self, idx: usize) -> bool {
-        self.fs_upload_backlog.iter().any(|(key, _, _)| *key == idx)
+        self.fs_upload_backlog.iter().any(|entry| entry.idx == idx)
+    }
+
+    fn mark_animation_promotion_failed(&mut self, idx: usize) {
+        if let Some(entry) = self.fs_cache.get_mut(&idx) {
+            entry.mark_animation_promotion_failed();
+        }
+    }
+
+    fn start_animation_promotion_if_needed(&mut self, idx: usize) -> bool {
+        if self.fullscreen_idx != Some(idx)
+            || self
+                .fs_cache
+                .get(&idx)
+                .and_then(FsCacheEntry::animation_needs_promotion)
+                .is_none()
+            || self.fs_pending.contains_key(&idx)
+            || self.fs_upload_backlog_contains(idx)
+        {
+            return false;
+        }
+        let purpose = FsLoadPurpose::AnimationPromotion {
+            target_idx: idx,
+            started_at: std::time::Instant::now(),
+        };
+        self.start_fs_load_with_purpose(idx, purpose);
+        self.fs_pending
+            .get(&idx)
+            .is_some_and(|pending| pending.purpose == purpose)
+    }
+
+    pub(crate) fn current_animation_promotion_started_at(&self) -> Option<std::time::Instant> {
+        let idx = self.fullscreen_idx?;
+        self.fs_pending
+            .get(&idx)
+            .and_then(|pending| pending.purpose.promotion_started_at_for(idx))
+            .or_else(|| {
+                self.fs_upload_backlog.iter().find_map(|entry| {
+                    (entry.idx == idx)
+                        .then(|| entry.purpose.promotion_started_at_for(idx))
+                        .flatten()
+                })
+            })
     }
 
     /// フルスクリーン表示側が参照するページロード状態の正本。
@@ -55223,6 +55433,9 @@ impl App {
         // that sees each page before the user does.
         self.verify_display_identity(idx);
         let state = self.fs_page_load_state(idx);
+        if matches!(state, FsPageLoadState::DisplayReady(_)) {
+            self.start_animation_promotion_if_needed(idx);
+        }
         if state.needs_load_request() {
             self.start_fs_load(idx);
             self.fs_page_load_state(idx)
@@ -59443,6 +59656,7 @@ impl App {
                 pixels: adjusted_pixels,
                 source_dims: None,
                 load_seq: 0,
+                animation: StaticAnimationState::Still,
             },
         );
         // 360 度パノラマビュー: cache 内容が変わったので世代 bump (§3.6.2.2)。
@@ -61434,6 +61648,7 @@ impl App {
         upload_t0: std::time::Instant,
         result_kind: &'static str,
         store_retained_pdf_page_raster: bool,
+        animation: StaticAnimationState,
     ) -> FsCacheEntry {
         if store_retained_pdf_page_raster {
             self.insert_retained_pdf_page_raster(key, source_dims, Arc::clone(&pixels));
@@ -61466,7 +61681,7 @@ impl App {
         // 表示中の画像のみ色調補正を即座に適用（チラつき防止）。
         // 先読み分は表示に入った時点で final pipeline
         // (ensure_final_composite_texture) が処理する。
-        if self.fullscreen_idx == Some(key) {
+        if self.fullscreen_idx == Some(key) && animation == StaticAnimationState::Still {
             self.apply_sync_adjustment(ctx, key, &pixels);
         }
         FsCacheEntry::Static {
@@ -61474,6 +61689,7 @@ impl App {
             pixels,
             source_dims: Some(source_dims),
             load_seq,
+            animation,
         }
     }
 
@@ -61769,22 +61985,28 @@ impl App {
         // `DimsOnly` は非終端 (後続メッセージあり) なので fs_pending は維持して
         // drain を続ける。fs_early_dims への書き込みは fs_pending 借用中はできないので
         // ローカル vec に積んでから後段で apply する。
-        let mut completed: Vec<(usize, FsLoadResult, u64, u64)> = Vec::new();
-        let mut disconnected: Vec<usize> = Vec::new();
+        let mut completed: Vec<(usize, FsLoadResult, u64, u64, FsLoadPurpose)> = Vec::new();
+        let mut disconnected: Vec<(usize, FsLoadPurpose)> = Vec::new();
         let mut early_dims_updates: Vec<(usize, [usize; 2], u64)> = Vec::new();
-        for (&key, items_generation, (_, rx, seq)) in self.fs_pending.iter_with_generation() {
+        for (&key, items_generation, pending) in self.fs_pending.iter_with_generation() {
             loop {
-                match rx.try_recv() {
+                match pending.rx.try_recv() {
                     Ok(FsLoadResult::DimsOnly { source_dims }) => {
                         early_dims_updates.push((key, source_dims, items_generation));
                         continue;
                     }
                     Ok(result) => {
-                        completed.push((key, result, *seq, items_generation));
+                        completed.push((
+                            key,
+                            result,
+                            pending.load_seq,
+                            items_generation,
+                            pending.purpose,
+                        ));
                         break;
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        disconnected.push(key);
+                        disconnected.push((key, pending.purpose));
                         break;
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
@@ -61797,13 +62019,16 @@ impl App {
                 .insert_for_generation(key, items_generation, dims);
         }
         // 送信側が drop されたエントリを除去 (キャンセル済みスレッドが送信せずに終了)
-        for key in disconnected {
+        for (key, purpose) in disconnected {
             self.fs_pending.remove(&key);
             self.fs_early_dims.remove(&key);
+            if purpose.promotion_started_at_for(key).is_some() {
+                self.mark_animation_promotion_failed(key);
+            }
         }
         // fs_pending からは即座に除去 (「先読み中 / 完了」状態の重複を防ぐ)。
         // backlog に積まれた時点で fs_cache に載る手前の最終中継点として扱う。
-        for (key, _, _, _) in &completed {
+        for (key, _, _, _, _) in &completed {
             self.fs_pending.remove(key);
             self.fs_early_dims.remove(key);
         }
@@ -61813,7 +62038,7 @@ impl App {
         // pano_high_res_source には入らないので、backlog に複数滞留させる必要なし。
         // mpsc 受信直後に drop して memory peak を最小化する。
         let current_fs = self.fullscreen_idx;
-        for (key, mut result, load_seq, items_generation) in completed {
+        for (key, mut result, load_seq, items_generation, purpose) in completed {
             if Some(key) != current_fs {
                 if let FsLoadResult::StaticPanorama {
                     ci,
@@ -61822,10 +62047,20 @@ impl App {
                 } = result
                 {
                     // high_res は scope 末で即 drop される
-                    result = FsLoadResult::Static { ci, source_dims };
+                    result = FsLoadResult::Static {
+                        ci,
+                        source_dims,
+                        animation: StaticAnimationState::Still,
+                    };
                 }
             }
-            self.enqueue_fs_upload_result_for_generation(items_generation, key, result, load_seq);
+            self.enqueue_fs_upload_result_for_generation(
+                items_generation,
+                key,
+                result,
+                load_seq,
+                purpose,
+            );
         }
 
         // ── ペーシング: このフレームで何枚アップロードするか決める ──
@@ -61843,8 +62078,8 @@ impl App {
         }
         let cur = self.fullscreen_idx;
         let (mut cur_pos, mut other_pos) = (None, None);
-        for (i, (k, _, _)) in self.fs_upload_backlog.iter().enumerate() {
-            if Some(*k) == cur {
+        for (i, entry) in self.fs_upload_backlog.iter().enumerate() {
+            if Some(entry.idx) == cur {
                 cur_pos = Some(i);
             } else if other_pos.is_none() {
                 other_pos = Some(i);
@@ -61857,7 +62092,7 @@ impl App {
         // 両方ある場合は元の位置順 (FIFO) を維持するため、大きい位置から remove する。
         let mut positions: Vec<usize> = [cur_pos, other_pos].into_iter().flatten().collect();
         positions.sort_unstable_by(|a, b| b.cmp(a));
-        let mut to_process: Vec<(u64, (usize, FsLoadResult, u64))> = positions
+        let mut to_process: Vec<(u64, FsUploadResult)> = positions
             .into_iter()
             .map(|pos| self.fs_upload_backlog.remove_with_generation(pos))
             .collect();
@@ -61866,9 +62101,24 @@ impl App {
 
         let has_more_backlog = !self.fs_upload_backlog.is_empty();
         let repaint = !to_process.is_empty() || early_dims_repaint || has_more_backlog;
-        for (items_generation, (key, result, load_seq)) in to_process {
+        for (items_generation, upload) in to_process {
+            let FsUploadResult {
+                idx: key,
+                result,
+                load_seq,
+                purpose,
+            } = upload;
             if !self.fs_cache.accepts_generation(key, items_generation) {
                 continue;
+            }
+            if purpose.promotion_started_at_for(key).is_some() {
+                if self.fullscreen_idx != Some(key) {
+                    continue;
+                }
+                if !matches!(result, FsLoadResult::Animated(_)) {
+                    self.mark_animation_promotion_failed(key);
+                    continue;
+                }
             }
             // 本体メッセージで fs_cache が埋まるので先行ヒントはもう不要。
             // (ホバーバーは fs_cache.source_dims を優先して見るため、残っていても
@@ -61888,7 +62138,11 @@ impl App {
                 self.capture_final_effect_source_reload_holdover(key);
             }
             let entry = match result {
-                FsLoadResult::Static { ci, source_dims } => {
+                FsLoadResult::Static {
+                    ci,
+                    source_dims,
+                    animation,
+                } => {
                     let pixels = std::sync::Arc::new(ci);
                     self.build_static_fs_cache_entry(
                         ctx,
@@ -61900,6 +62154,7 @@ impl App {
                         upload_t0,
                         "static",
                         true,
+                        animation,
                     )
                 }
                 FsLoadResult::StaticCached {
@@ -61915,6 +62170,7 @@ impl App {
                     upload_t0,
                     "static_cached",
                     false,
+                    StaticAnimationState::Still,
                 ),
                 FsLoadResult::Animated(frames) => {
                     let mut frame_pixels = Vec::with_capacity(frames.len());
@@ -62019,6 +62275,7 @@ impl App {
                         pixels,
                         source_dims: Some(source_dims),
                         load_seq,
+                        animation: StaticAnimationState::Still,
                     }
                 }
                 FsLoadResult::Failed => FsCacheEntry::Failed,

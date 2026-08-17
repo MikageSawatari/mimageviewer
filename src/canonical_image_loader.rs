@@ -6,6 +6,7 @@
 //! clamp は [`CanonicalStaticImage::into_gpu_raster`] で明示的に後段適用する。
 
 use std::borrow::Cow;
+use std::io::{Cursor, Read};
 use std::path::Path;
 use std::sync::{Arc, atomic::AtomicBool};
 
@@ -31,15 +32,27 @@ pub enum CanonicalImageSource<'a> {
 pub struct CanonicalDecodeOptions<'a> {
     pub susie_priority: bool,
     pub susie_cancel: Option<&'a Arc<AtomicBool>>,
+    pub animation_policy: AnimationPolicy,
 }
 
 impl CanonicalDecodeOptions<'_> {
-    pub const fn fullscreen() -> Self {
+    pub const fn fullscreen(animation_policy: AnimationPolicy) -> Self {
         Self {
             susie_priority: true,
             susie_cancel: None,
+            animation_policy,
         }
     }
+}
+
+/// canonical decoder がアニメーション対応形式をどう扱うか。
+///
+/// prefetch は [`FirstFrameOnly`](Self::FirstFrameOnly) で静止画 fallback だけを通し、
+/// 現在ページと remote AI の適用可否判定は [`FullFrames`](Self::FullFrames) を使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnimationPolicy {
+    FullFrames,
+    FirstFrameOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +60,14 @@ pub enum CanonicalAnimatedFormat {
     Gif,
     Apng,
     WebP,
+}
+
+/// static decode が返した画素と、後段のアニメーション昇格との関係。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalStaticAnimation {
+    Still,
+    /// コンテナヘッダで複数フレームを確認したうえで、policy により第1フレームだけを返した。
+    FirstFrameOnly(CanonicalAnimatedFormat),
 }
 
 impl CanonicalAnimatedFormat {
@@ -76,11 +97,13 @@ pub struct CanonicalStaticImage {
     pub image: image::DynamicImage,
     /// EXIF orientation 適用後、GPU clamp 前の寸法。
     pub source_dims: [usize; 2],
+    pub animation: CanonicalStaticAnimation,
 }
 
 pub struct CanonicalRaster {
     pub pixels: egui::ColorImage,
     pub source_dims: [usize; 2],
+    pub animation: CanonicalStaticAnimation,
 }
 
 impl CanonicalStaticImage {
@@ -91,6 +114,7 @@ impl CanonicalStaticImage {
         CanonicalRaster {
             pixels: dynamic_image_to_color_image(&image),
             source_dims: self.source_dims,
+            animation: self.animation,
         }
     }
 }
@@ -180,7 +204,6 @@ struct ResolvedSource<'a> {
     bytes: Option<Cow<'a, [u8]>>,
     filename_hint: Cow<'a, str>,
     extension: String,
-    is_archive_entry: bool,
 }
 
 impl<'a> ResolvedSource<'a> {
@@ -202,7 +225,6 @@ impl<'a> ResolvedSource<'a> {
                     .and_then(|extension| extension.to_str())
                     .unwrap_or("")
                     .to_ascii_lowercase(),
-                is_archive_entry: false,
             }),
             CanonicalImageSource::ArchiveEntry {
                 archive_path,
@@ -221,7 +243,6 @@ impl<'a> ResolvedSource<'a> {
                     bytes: Some(Cow::Owned(bytes)),
                     filename_hint: Cow::Borrowed(entry_name),
                     extension,
-                    is_archive_entry: true,
                 })
             }
         }
@@ -229,8 +250,7 @@ impl<'a> ResolvedSource<'a> {
 }
 
 /// 本体 fullscreen と同じ source/animation/fallback/EXIF 規則で native image を読む。
-/// archive 内 GIF/APNG は static fallback、WebP だけは archive bytes でも animation probe
-/// を行う、という現行分類もそのまま共有する。
+/// GIF / APNG / WebP は file / archive entry の別なく同じ animation policy に従う。
 pub fn decode_canonical_image(
     source: CanonicalImageSource<'_>,
     options: CanonicalDecodeOptions<'_>,
@@ -245,8 +265,13 @@ fn decode_canonical_image_with_fallbacks(
 ) -> Result<CanonicalImageDecode, CanonicalDecodeError> {
     let source = ResolvedSource::resolve(source)?;
     let bytes = source.bytes.as_deref();
+    let static_animation = if options.animation_policy == AnimationPolicy::FirstFrameOnly {
+        probe_static_animation(&source)
+    } else {
+        CanonicalStaticAnimation::Still
+    };
 
-    if source.extension == "gif" && !source.is_archive_entry {
+    if options.animation_policy == AnimationPolicy::FullFrames && source.extension == "gif" {
         let frames = match bytes {
             Some(bytes) => decode_gif_frames_from_bytes(bytes),
             None => decode_gif_frames(source.path),
@@ -259,7 +284,7 @@ fn decode_canonical_image_with_fallbacks(
         }
     }
 
-    if source.extension == "png" && !source.is_archive_entry {
+    if options.animation_policy == AnimationPolicy::FullFrames && source.extension == "png" {
         let frames = match bytes {
             Some(bytes) => decode_apng_frames_from_bytes(bytes),
             None => decode_apng_frames(source.path),
@@ -272,7 +297,7 @@ fn decode_canonical_image_with_fallbacks(
         }
     }
 
-    if source.extension == "webp" {
+    if options.animation_policy == AnimationPolicy::FullFrames && source.extension == "webp" {
         let frames = match bytes {
             Some(bytes) => decode_webp_frames_from_bytes(bytes),
             None => decode_webp_frames(source.path),
@@ -308,15 +333,174 @@ fn decode_canonical_image_with_fallbacks(
     }
     .map_err(CanonicalDecodeError::Decode)?;
 
-    let image = match bytes {
-        Some(bytes) => crate::thumb_loader::apply_exif_orientation_from_bytes(image, bytes),
-        None => crate::thumb_loader::apply_exif_orientation(image, source.path),
+    // FullFrames のアニメ decoder は各フレームへ EXIF orientation を適用しない。
+    // 昇格前後の第1フレームを同じ画素に保つため、アニメと確認済みの FirstFrameOnly
+    // も同じ向きのまま返す。通常静止画だけは従来どおり orientation を適用する。
+    let image = match (static_animation, bytes) {
+        (CanonicalStaticAnimation::FirstFrameOnly(_), _) => image,
+        (CanonicalStaticAnimation::Still, Some(bytes)) => {
+            crate::thumb_loader::apply_exif_orientation_from_bytes(image, bytes)
+        }
+        (CanonicalStaticAnimation::Still, None) => {
+            crate::thumb_loader::apply_exif_orientation(image, source.path)
+        }
     };
     let source_dims = [image.width() as usize, image.height() as usize];
     Ok(CanonicalImageDecode::Static(CanonicalStaticImage {
         image,
         source_dims,
+        animation: static_animation,
     }))
+}
+
+/// FirstFrameOnly の static fallback が「本当にアニメの第1フレーム」かを、画素展開せず
+/// コンテナ構造だけで判定する。通常の静止 PNG/WebP を現ページ化のたびに再 decode しないため、
+/// 拡張子だけを sentinel にしない。
+fn probe_static_animation(source: &ResolvedSource<'_>) -> CanonicalStaticAnimation {
+    let probe = |reader: &mut dyn Read| match source.extension.as_str() {
+        "gif" => gif_has_multiple_frames(reader).then_some(CanonicalAnimatedFormat::Gif),
+        "png" => apng_has_multiple_frames(reader).then_some(CanonicalAnimatedFormat::Apng),
+        "webp" => webp_has_animation(reader).then_some(CanonicalAnimatedFormat::WebP),
+        _ => None,
+    };
+    let format = match source.bytes.as_deref() {
+        Some(bytes) => probe(&mut Cursor::new(bytes)),
+        None => std::fs::File::open(source.path)
+            .ok()
+            .and_then(|mut file| probe(&mut file)),
+    };
+    format.map_or(
+        CanonicalStaticAnimation::Still,
+        CanonicalStaticAnimation::FirstFrameOnly,
+    )
+}
+
+fn read_byte(reader: &mut dyn Read) -> Option<u8> {
+    let mut byte = [0_u8; 1];
+    reader.read_exact(&mut byte).ok()?;
+    Some(byte[0])
+}
+
+fn skip_bytes(reader: &mut dyn Read, mut len: usize) -> bool {
+    let mut scratch = [0_u8; 4096];
+    while len > 0 {
+        let chunk = len.min(scratch.len());
+        if reader.read_exact(&mut scratch[..chunk]).is_err() {
+            return false;
+        }
+        len -= chunk;
+    }
+    true
+}
+
+fn skip_gif_sub_blocks(reader: &mut dyn Read) -> bool {
+    loop {
+        let Some(len) = read_byte(reader) else {
+            return false;
+        };
+        if len == 0 {
+            return true;
+        }
+        if !skip_bytes(reader, usize::from(len)) {
+            return false;
+        }
+    }
+}
+
+fn gif_has_multiple_frames(reader: &mut dyn Read) -> bool {
+    let mut header = [0_u8; 13];
+    if reader.read_exact(&mut header).is_err() || !matches!(&header[..6], b"GIF87a" | b"GIF89a") {
+        return false;
+    }
+    if header[10] & 0x80 != 0 {
+        let color_table_len = 3_usize << (usize::from(header[10] & 0x07) + 1);
+        if !skip_bytes(reader, color_table_len) {
+            return false;
+        }
+    }
+
+    let mut frames = 0_u8;
+    loop {
+        match read_byte(reader) {
+            Some(0x2c) => {
+                frames += 1;
+                if frames > 1 {
+                    return true;
+                }
+                let mut descriptor = [0_u8; 9];
+                if reader.read_exact(&mut descriptor).is_err() {
+                    return false;
+                }
+                if descriptor[8] & 0x80 != 0 {
+                    let color_table_len = 3_usize << (usize::from(descriptor[8] & 0x07) + 1);
+                    if !skip_bytes(reader, color_table_len) {
+                        return false;
+                    }
+                }
+                if read_byte(reader).is_none() || !skip_gif_sub_blocks(reader) {
+                    return false;
+                }
+            }
+            Some(0x21) => {
+                if read_byte(reader).is_none() || !skip_gif_sub_blocks(reader) {
+                    return false;
+                }
+            }
+            Some(0x3b) | None => return false,
+            Some(0x00) => {}
+            Some(_) => return false,
+        }
+    }
+}
+
+fn apng_has_multiple_frames(reader: &mut dyn Read) -> bool {
+    let mut signature = [0_u8; 8];
+    if reader.read_exact(&mut signature).is_err() || signature != *b"\x89PNG\r\n\x1a\n" {
+        return false;
+    }
+    loop {
+        let mut header = [0_u8; 8];
+        if reader.read_exact(&mut header).is_err() {
+            return false;
+        }
+        let len = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+        let kind = &header[4..8];
+        if kind == b"acTL" {
+            let mut control = [0_u8; 8];
+            return len == control.len()
+                && reader.read_exact(&mut control).is_ok()
+                && u32::from_be_bytes(control[..4].try_into().unwrap()) > 1;
+        }
+        if kind == b"IDAT" || kind == b"IEND" || !skip_bytes(reader, len.saturating_add(4)) {
+            return false;
+        }
+    }
+}
+
+fn webp_has_animation(reader: &mut dyn Read) -> bool {
+    let mut header = [0_u8; 12];
+    if reader.read_exact(&mut header).is_err() || &header[..4] != b"RIFF" || &header[8..] != b"WEBP"
+    {
+        return false;
+    }
+    let mut remaining =
+        (u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize).saturating_sub(4);
+    while remaining >= 8 {
+        let mut chunk = [0_u8; 8];
+        if reader.read_exact(&mut chunk).is_err() {
+            return false;
+        }
+        let len = u32::from_le_bytes(chunk[4..8].try_into().unwrap()) as usize;
+        let padded = len.saturating_add(len & 1);
+        if &chunk[..4] == b"ANIM" || &chunk[..4] == b"ANMF" {
+            return true;
+        }
+        if padded > remaining.saturating_sub(8) || !skip_bytes(reader, padded) {
+            return false;
+        }
+        remaining -= 8 + padded;
+    }
+    false
 }
 
 pub fn dynamic_image_to_color_image(image: &image::DynamicImage) -> egui::ColorImage {
@@ -618,7 +802,7 @@ mod tests {
                     path: &path,
                     verified_bytes: None,
                 },
-                CanonicalDecodeOptions::fullscreen(),
+                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
             )
             .unwrap(),
         );
@@ -628,7 +812,7 @@ mod tests {
                     path: &path,
                     verified_bytes: Some(&bytes),
                 },
-                CanonicalDecodeOptions::fullscreen(),
+                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
             )
             .unwrap(),
         );
@@ -652,7 +836,7 @@ mod tests {
                     path,
                     verified_bytes: Some(&bytes),
                 },
-                CanonicalDecodeOptions::fullscreen(),
+                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
             )
             .unwrap(),
         );
@@ -675,7 +859,7 @@ mod tests {
                     archive_path: &outer,
                     entry_name: "chapter.zip/page.png",
                 },
-                CanonicalDecodeOptions::fullscreen(),
+                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
             )
             .unwrap(),
         );
@@ -685,7 +869,7 @@ mod tests {
                     path: Path::new("page.png"),
                     verified_bytes: Some(&page),
                 },
-                CanonicalDecodeOptions::fullscreen(),
+                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
             )
             .unwrap(),
         );
@@ -694,122 +878,176 @@ mod tests {
         assert_same_image(&archive_image.image, &bytes_image.image);
     }
 
+    fn assert_first_frame(
+        source: CanonicalImageSource<'_>,
+        format: CanonicalAnimatedFormat,
+        expected: &egui::ColorImage,
+    ) {
+        let image = static_image(
+            decode_canonical_image(
+                source,
+                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FirstFrameOnly),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            image.animation,
+            CanonicalStaticAnimation::FirstFrameOnly(format)
+        );
+        let actual = dynamic_image_to_color_image(&image.image);
+        assert_eq!(actual.size, expected.size);
+        assert_eq!(actual.pixels, expected.pixels);
+    }
+
+    fn assert_full_frames(
+        source: CanonicalImageSource<'_>,
+        format: CanonicalAnimatedFormat,
+        expected: &[(egui::ColorImage, f64)],
+    ) {
+        let decoded = decode_canonical_image(
+            source,
+            CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
+        )
+        .unwrap();
+        let CanonicalImageDecode::Animated {
+            format: actual_format,
+            frames,
+        } = decoded
+        else {
+            panic!("FullFrames should return Animated");
+        };
+        assert_eq!(actual_format, format);
+        assert_same_frames(&frames, expected);
+    }
+
     #[test]
-    fn animated_gif_is_animated_as_a_file_but_static_inside_zip() {
+    fn first_frame_only_matches_the_first_decoded_frame_for_all_animated_formats() {
         let temp = tempfile::tempdir().unwrap();
         let gif_path = temp.path().join("animated.gif");
-        let zip_path = temp.path().join("book.zip");
-        let bytes = animated_gif_bytes();
-        std::fs::write(&gif_path, &bytes).unwrap();
-        write_zip(&zip_path, &[("animated.gif", &bytes)]);
-        let expected_frames = decode_gif_frames(&gif_path).unwrap();
-
-        let file_result = decode_canonical_image(
-            CanonicalImageSource::File {
-                path: &gif_path,
-                verified_bytes: None,
-            },
-            CanonicalDecodeOptions::fullscreen(),
-        )
-        .unwrap();
-        let CanonicalImageDecode::Animated { format, frames } = file_result else {
-            panic!("normal GIF should preserve fullscreen animation classification");
-        };
-        assert_eq!(format, CanonicalAnimatedFormat::Gif);
-        assert_same_frames(&frames, &expected_frames);
-
-        let archive_image = static_image(
-            decode_canonical_image(
-                CanonicalImageSource::ArchiveEntry {
-                    archive_path: &zip_path,
-                    entry_name: "animated.gif",
-                },
-                CanonicalDecodeOptions::fullscreen(),
-            )
-            .unwrap(),
-        );
-        assert_eq!(archive_image.source_dims, [1, 1]);
-        assert_eq!(
-            archive_image.image.to_rgba8().get_pixel(0, 0).0,
-            [255, 0, 0, 255]
-        );
-    }
-
-    #[test]
-    fn animated_apng_is_animated_as_a_file_but_static_inside_zip() {
-        let temp = tempfile::tempdir().unwrap();
-        let png_path = temp.path().join("animated.png");
-        let zip_path = temp.path().join("book.zip");
-        let bytes = animated_apng_bytes();
-        std::fs::write(&png_path, &bytes).unwrap();
-        write_zip(&zip_path, &[("animated.png", &bytes)]);
-        let expected_frames = decode_apng_frames(&png_path).unwrap();
-
-        let file_result = decode_canonical_image(
-            CanonicalImageSource::File {
-                path: &png_path,
-                verified_bytes: None,
-            },
-            CanonicalDecodeOptions::fullscreen(),
-        )
-        .unwrap();
-        let CanonicalImageDecode::Animated { format, frames } = file_result else {
-            panic!("normal APNG should preserve fullscreen animation classification");
-        };
-        assert_eq!(format, CanonicalAnimatedFormat::Apng);
-        assert_same_frames(&frames, &expected_frames);
-
-        let archive_image = static_image(
-            decode_canonical_image(
-                CanonicalImageSource::ArchiveEntry {
-                    archive_path: &zip_path,
-                    entry_name: "animated.png",
-                },
-                CanonicalDecodeOptions::fullscreen(),
-            )
-            .unwrap(),
-        );
-        assert_eq!(archive_image.source_dims, [1, 1]);
-        assert_eq!(
-            archive_image.image.to_rgba8().get_pixel(0, 0).0,
-            [255, 0, 0, 255]
-        );
-    }
-
-    #[test]
-    fn animated_webp_is_animated_both_as_a_file_and_inside_zip() {
-        let temp = tempfile::tempdir().unwrap();
+        let apng_path = temp.path().join("animated.png");
         let webp_path = temp.path().join("animated.webp");
-        let zip_path = temp.path().join("book.zip");
-        let bytes = animated_webp_bytes();
-        std::fs::write(&webp_path, &bytes).unwrap();
-        write_zip(&zip_path, &[("animated.webp", &bytes)]);
-        let expected_file = decode_webp_frames(&webp_path).unwrap();
-        let expected_bytes = decode_webp_frames_from_bytes(&bytes).unwrap();
+        let gif = animated_gif_bytes();
+        let apng = animated_apng_bytes();
+        let webp = animated_webp_bytes();
+        for (path, bytes) in [
+            (&gif_path, gif.as_slice()),
+            (&apng_path, apng.as_slice()),
+            (&webp_path, webp.as_slice()),
+        ] {
+            std::fs::write(path, bytes).unwrap();
+        }
 
-        for (source, expected) in [
-            (
+        let gif_frames = decode_gif_frames(&gif_path).unwrap();
+        let apng_frames = decode_apng_frames(&apng_path).unwrap();
+        let webp_frames = decode_webp_frames(&webp_path).unwrap();
+        for (path, format, first) in [
+            (&gif_path, CanonicalAnimatedFormat::Gif, &gif_frames[0].0),
+            (&apng_path, CanonicalAnimatedFormat::Apng, &apng_frames[0].0),
+            (&webp_path, CanonicalAnimatedFormat::WebP, &webp_frames[0].0),
+        ] {
+            assert_first_frame(
                 CanonicalImageSource::File {
-                    path: &webp_path,
+                    path,
                     verified_bytes: None,
                 },
-                expected_file.as_slice(),
+                format,
+                first,
+            );
+        }
+    }
+
+    #[test]
+    fn full_frames_returns_animated_for_all_file_formats() {
+        let temp = tempfile::tempdir().unwrap();
+        let gif_path = temp.path().join("animated.gif");
+        let apng_path = temp.path().join("animated.png");
+        let webp_path = temp.path().join("animated.webp");
+        let gif = animated_gif_bytes();
+        let apng = animated_apng_bytes();
+        let webp = animated_webp_bytes();
+        for (path, bytes) in [
+            (&gif_path, gif.as_slice()),
+            (&apng_path, apng.as_slice()),
+            (&webp_path, webp.as_slice()),
+        ] {
+            std::fs::write(path, bytes).unwrap();
+        }
+
+        let gif_frames = decode_gif_frames(&gif_path).unwrap();
+        let apng_frames = decode_apng_frames(&apng_path).unwrap();
+        let webp_frames = decode_webp_frames(&webp_path).unwrap();
+        for (path, format, expected) in [
+            (
+                &gif_path,
+                CanonicalAnimatedFormat::Gif,
+                gif_frames.as_slice(),
             ),
             (
-                CanonicalImageSource::ArchiveEntry {
-                    archive_path: &zip_path,
-                    entry_name: "animated.webp",
-                },
-                expected_bytes.as_slice(),
+                &apng_path,
+                CanonicalAnimatedFormat::Apng,
+                apng_frames.as_slice(),
+            ),
+            (
+                &webp_path,
+                CanonicalAnimatedFormat::WebP,
+                webp_frames.as_slice(),
             ),
         ] {
-            let decoded =
-                decode_canonical_image(source, CanonicalDecodeOptions::fullscreen()).unwrap();
-            let CanonicalImageDecode::Animated { format, frames } = decoded else {
-                panic!("WebP should preserve fullscreen animation classification");
-            };
-            assert_eq!(format, CanonicalAnimatedFormat::WebP);
-            assert_same_frames(&frames, expected);
+            assert_full_frames(
+                CanonicalImageSource::File {
+                    path,
+                    verified_bytes: None,
+                },
+                format,
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn full_frames_returns_animated_for_all_archive_entry_formats() {
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("book.zip");
+        let gif = animated_gif_bytes();
+        let apng = animated_apng_bytes();
+        let webp = animated_webp_bytes();
+        write_zip(
+            &zip_path,
+            &[
+                ("animated.gif", &gif),
+                ("animated.png", &apng),
+                ("animated.webp", &webp),
+            ],
+        );
+
+        let gif_frames = decode_gif_frames_from_bytes(&gif).unwrap();
+        let apng_frames = decode_apng_frames_from_bytes(&apng).unwrap();
+        let webp_frames = decode_webp_frames_from_bytes(&webp).unwrap();
+        for (entry_name, format, expected) in [
+            (
+                "animated.gif",
+                CanonicalAnimatedFormat::Gif,
+                gif_frames.as_slice(),
+            ),
+            (
+                "animated.png",
+                CanonicalAnimatedFormat::Apng,
+                apng_frames.as_slice(),
+            ),
+            (
+                "animated.webp",
+                CanonicalAnimatedFormat::WebP,
+                webp_frames.as_slice(),
+            ),
+        ] {
+            assert_full_frames(
+                CanonicalImageSource::ArchiveEntry {
+                    archive_path: &zip_path,
+                    entry_name,
+                },
+                format,
+                expected,
+            );
         }
     }
 
@@ -823,7 +1061,7 @@ mod tests {
                     path: Path::new("wide.png"),
                     verified_bytes: Some(&bytes),
                 },
-                CanonicalDecodeOptions::fullscreen(),
+                CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
             )
             .unwrap(),
         );
@@ -921,7 +1159,7 @@ mod tests {
                 path,
                 verified_bytes: Some(invalid),
             },
-            CanonicalDecodeOptions::fullscreen(),
+            CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
             &wic_hit,
         )
         .unwrap();
@@ -938,7 +1176,7 @@ mod tests {
                 path,
                 verified_bytes: Some(invalid),
             },
-            CanonicalDecodeOptions::fullscreen(),
+            CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
             &susie_hit,
         )
         .unwrap();
@@ -961,7 +1199,7 @@ mod tests {
                 path: &path,
                 verified_bytes: None,
             },
-            CanonicalDecodeOptions::fullscreen(),
+            CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
             &fallbacks,
         )
         .unwrap();
@@ -983,7 +1221,7 @@ mod tests {
                 path: Path::new("page.png"),
                 verified_bytes: Some(&bytes),
             },
-            CanonicalDecodeOptions::fullscreen(),
+            CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
             &fallbacks,
         )
         .unwrap();
@@ -1005,7 +1243,7 @@ mod tests {
                 path: Path::new("invalid.pi"),
                 verified_bytes: Some(invalid),
             },
-            CanonicalDecodeOptions::fullscreen(),
+            CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
             &fallbacks,
         );
 

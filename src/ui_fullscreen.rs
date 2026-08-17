@@ -24865,6 +24865,25 @@ impl App {
         self.fs_lanczos_cache.retain_page_indices(&keep_set);
 
         let current_idx = self.fullscreen_idx.unwrap_or(units[current_pos].anchor_idx);
+        let stale_promotions = self
+            .fs_pending
+            .iter()
+            .filter_map(|(&idx, pending)| {
+                (idx != current_idx && pending.purpose.promotion_started_at_for(idx).is_some())
+                    .then_some(idx)
+            })
+            .collect::<Vec<_>>();
+        for idx in stale_promotions {
+            if let Some(pending) = self.fs_pending.remove(&idx) {
+                pending
+                    .cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.fs_early_dims.remove(&idx);
+        }
+        self.fs_upload_backlog.retain(|entry| {
+            entry.purpose.promotion_started_at_for(entry.idx).is_none() || entry.idx == current_idx
+        });
         let current_loading = keep_set.contains(&current_idx)
             && self.fs_page_load_state(current_idx).waiting_for_display();
         let to_cancel = self
@@ -24879,8 +24898,10 @@ impl App {
             .copied()
             .collect::<Vec<_>>();
         for idx in to_cancel {
-            if let Some((cancel, _, _)) = self.fs_pending.remove(&idx) {
-                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(pending) = self.fs_pending.remove(&idx) {
+                pending
+                    .cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
             self.fs_early_dims.remove(&idx);
         }
@@ -25178,7 +25199,7 @@ impl App {
                     || self
                         .fs_upload_backlog
                         .iter()
-                        .any(|(idx, _, _)| *idx == page.idx))
+                        .any(|entry| entry.idx == page.idx))
             {
                 any_raw_work_pending = true;
             }
@@ -29787,6 +29808,7 @@ impl App {
         // 消しゴム補完は一時トーストより長く続くことがあるため、同じ描画チョークポイントで
         // ジョブ寿命に連動した専用ステータスも描く。トーストが無いフレームでも必要。
         self.draw_erase_inpaint_progress(ui, full_rect, ctx, drawing_surface);
+        self.draw_animation_promotion_progress(ui, full_rect, ctx, drawing_surface);
 
         let Some((ref text, start_time, duration)) = self.fs_feedback_toast else {
             return;
@@ -29867,6 +29889,81 @@ impl App {
         }
 
         // フェードアウト中は 30fps で再描画
+        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+    }
+
+    /// 先読み済みの第1フレームを全フレームへ昇格している間だけ出す持続型ステータス。
+    fn draw_animation_promotion_progress(
+        &self,
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        ctx: &egui::Context,
+        drawing_surface: crate::app::ActionSurface,
+    ) {
+        if drawing_surface != crate::app::ActionSurface::Viewer {
+            return;
+        }
+        let Some(started_at) = self.current_animation_promotion_started_at() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        // 150ms は競合を時間窓で吸収するものではなく、短い処理を提示するかだけを決める
+        // UI のちらつき防止ゲート。昇格の生存・完了・stale 判定は typed in-flight 状態に従う。
+        if !crate::app::animation_promotion_progress_visible(Some(started_at), now) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            return;
+        }
+
+        let text = "アニメーションを読み込み中…";
+        let font = egui::FontId::proportional(17.0);
+        let galley =
+            ui.painter()
+                .layout_no_wrap(text.to_string(), font.clone(), egui::Color32::WHITE);
+        let padding = egui::vec2(14.0, 9.0);
+        let indicator_h = 3.0;
+        let box_size = egui::vec2(
+            galley.size().x + padding.x * 2.0,
+            galley.size().y + padding.y * 2.0 + indicator_h + 4.0,
+        );
+        let min_x = (full_rect.max.x - box_size.x - 20.0).max(full_rect.min.x + 8.0);
+        let min_y = (full_rect.min.y + 160.0)
+            .min((full_rect.max.y - box_size.y - 8.0).max(full_rect.min.y + 8.0));
+        let rect = egui::Rect::from_min_size(egui::pos2(min_x, min_y), box_size);
+        ui.painter().rect_filled(
+            rect,
+            8.0,
+            egui::Color32::from_rgba_unmultiplied(30, 30, 30, 225),
+        );
+        ui.painter().text(
+            egui::pos2(rect.center().x, rect.center().y - 3.0),
+            egui::Align2::CENTER_CENTER,
+            text,
+            font,
+            egui::Color32::WHITE,
+        );
+
+        let track = egui::Rect::from_min_max(
+            egui::pos2(rect.min.x + padding.x, rect.max.y - padding.y),
+            egui::pos2(rect.max.x - padding.x, rect.max.y - padding.y + indicator_h),
+        );
+        ui.painter().rect_filled(
+            track,
+            indicator_h * 0.5,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 45),
+        );
+        let segment_w = (track.width() * 0.28).max(20.0).min(track.width());
+        let travel = (track.width() - segment_w).max(0.0);
+        let elapsed = now.duration_since(started_at);
+        let phase = (elapsed.as_secs_f32() * 0.8) % 1.0;
+        let segment = egui::Rect::from_min_size(
+            egui::pos2(track.min.x + travel * phase, track.min.y),
+            egui::vec2(segment_w, indicator_h),
+        );
+        ui.painter().rect_filled(
+            segment,
+            indicator_h * 0.5,
+            egui::Color32::from_rgb(90, 170, 255),
+        );
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
     }
 
@@ -33953,6 +34050,7 @@ mod tests {
                 pixels,
                 source_dims: Some([2, 2]),
                 load_seq: idx as u64 + 1,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
     }
@@ -35096,6 +35194,7 @@ mod tests {
                             pixels,
                             source_dims: Some([2, 3]),
                             load_seq: idx as u64,
+                            animation: crate::fs_animation::StaticAnimationState::Still,
                         },
                     );
                 }
@@ -35781,6 +35880,7 @@ mod tests {
                 pixels,
                 source_dims: Some([2, 2]),
                 load_seq: 1,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
 
@@ -36013,6 +36113,7 @@ mod tests {
                 )),
                 source_dims: Some([400, 800]),
                 load_seq: 17,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
 
@@ -37953,10 +38054,11 @@ mod tests {
         let (_load_tx, load_rx) = std::sync::mpsc::channel();
         app.fs_pending.insert(
             7,
-            (
+            crate::app::FsPendingValue::new(
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 load_rx,
                 0,
+                crate::app::FsLoadPurpose::Display,
             ),
         );
         app.compare_preparation =
@@ -38400,6 +38502,7 @@ mod tests {
                 pixels,
                 source_dims: Some([2, 2]),
                 load_seq: 1,
+                animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
 

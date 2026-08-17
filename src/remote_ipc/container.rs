@@ -6023,6 +6023,7 @@ fn decode_remote_ai_canonical(
         crate::canonical_image_loader::CanonicalDecodeOptions {
             susie_priority: true,
             susie_cancel: Some(cancel),
+            animation_policy: crate::canonical_image_loader::AnimationPolicy::FullFrames,
         },
     )
     .map_err(|error| RemoteAiRunError::Failed(error.to_string()))?;

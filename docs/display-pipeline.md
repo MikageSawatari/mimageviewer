@@ -2303,11 +2303,30 @@ colorize / Creative LUT / post-filter は意図的に飛ばすため、grid / fu
 | サムネイルデコード | image/turbojpeg/WIC | image::load_from_memory | PDFium ワーカー | Shell API (別スレッド) |
 | フルスクリーンデコード | 同上 + EXIF + 動画判定 | bytes から decode + EXIF | PDFium で実 viewport×ppp に fit (raster は native 上限) | なし (サムネのみ) |
 | EXIF Orientation | ✅ path から読む | ✅ bytes から読む | ❌ | — |
-| アニメーション | GIF/APNG/WebP ✅ | WebP ✅ | ❌ | — |
+| アニメーション | GIF/APNG/WebP ✅ | GIF/APNG/WebP ✅ | ❌ | — |
 | 回転 (rotation_db) | ✅ | ✅ (path+entry キー) | ✅ (path+page キー) | — |
 | プリセット補正 | ✅ | ✅ | ✅ | — |
 | AI アップスケール | ✅ | ✅ | ✅ | — |
 | 消しゴム (inpaint) | ✅ | ✅ | ✅ | — |
+
+#### 4.1.1 アニメーションの先読みと現ページ昇格
+
+fullscreen の canonical decode は `AnimationPolicy` を正本にする。現ページと remote AI の
+形式判定は `FullFrames`、前後の先読みは GIF / APNG / WebP と通常ファイル / archive entry の
+組み合わせに関係なく `FirstFrameOnly` を使う。サムネイル生成経路はこの方針の対象外。
+
+`FirstFrameOnly` で複数フレーム形式と確認した static entry は、その事実を
+`StaticAnimationState::FirstFrameOnly(format)` として `fs_cache` に保持する。ページが現表示の
+`fullscreen_idx` になったら、第1フレームを描いたまま `AnimationPromotion` として全フレームを
+非同期 decode し、完了時に同じ idx / items generation の `Animated` entry へ原子的に差し替える。
+第1フレームは FullFrames decoder の先頭フレームと同じ向き・画素を保ち、差し替えで描画元を
+サムネイル等へ切り替えない。
+
+昇格 worker / upload backlog は load purpose、items generation、target idx を保持する。別ページへ
+移動した昇格は cancel し、完了が遅れても target idx が現在ページでなければ適用しない。昇格失敗は
+`Failed` entry にせず第1フレームを `PromotionFailed` の static として残す。進行表示は worker の
+in-flight 状態から導き、150ms 以上続いたときだけ右上3段目へ表示する。この150msは競合を吸収する
+時間窓ではなく、短時間処理を提示するかどうかだけの UI ゲートである。
 
 ### 4.2 サムネイル / フルスクリーンの整合性
 

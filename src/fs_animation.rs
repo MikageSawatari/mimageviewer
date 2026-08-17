@@ -29,6 +29,7 @@ pub enum FsLoadResult {
     Static {
         ci: egui::ColorImage,
         source_dims: [usize; 2],
+        animation: StaticAnimationState,
     },
     /// 保持済み CPU ピクセルから再投入する静止画。
     ///
@@ -62,6 +63,15 @@ pub enum AnimationPlayback {
     Paused,
 }
 
+/// Static cache entry が通常静止画か、先読みされたアニメ第1フレームかを表す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaticAnimationState {
+    Still,
+    FirstFrameOnly(crate::canonical_image_loader::CanonicalAnimatedFormat),
+    /// 全フレーム昇格に失敗した。第1フレームを保持し、自動再試行はしない。
+    PromotionFailed(crate::canonical_image_loader::CanonicalAnimatedFormat),
+}
+
 pub enum FsCacheEntry {
     /// 静止画。GPU テクスチャと CPU 側ピクセルデータ（分析パネル用）を保持する。
     Static {
@@ -75,6 +85,7 @@ pub enum FsCacheEntry {
         /// `fs.paint` で `fs.ready` と同じ seq を使うために保持する。
         /// 計装無効時や内部起因のエントリは 0。
         load_seq: u64,
+        animation: StaticAnimationState,
     },
     Animated {
         frames: Vec<(egui::TextureHandle, f64)>, // (texture, delay_secs)
@@ -97,6 +108,37 @@ pub enum FsCacheEntry {
 }
 
 impl FsCacheEntry {
+    pub fn is_animation_source(&self) -> bool {
+        matches!(self, Self::Animated { .. })
+            || matches!(
+                self,
+                Self::Static {
+                    animation: StaticAnimationState::FirstFrameOnly(_),
+                    ..
+                }
+            )
+    }
+
+    pub fn animation_needs_promotion(
+        &self,
+    ) -> Option<crate::canonical_image_loader::CanonicalAnimatedFormat> {
+        match self {
+            Self::Static {
+                animation: StaticAnimationState::FirstFrameOnly(format),
+                ..
+            } => Some(*format),
+            _ => None,
+        }
+    }
+
+    pub fn mark_animation_promotion_failed(&mut self) {
+        if let Self::Static { animation, .. } = self
+            && let StaticAnimationState::FirstFrameOnly(format) = *animation
+        {
+            *animation = StaticAnimationState::PromotionFailed(format);
+        }
+    }
+
     pub fn pause_animation(&mut self) -> bool {
         match self {
             FsCacheEntry::Animated { playback, .. }
