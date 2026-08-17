@@ -912,9 +912,10 @@
   描画スケジューリング無変更) でも同じ再現率で出る。**A/B 済み**。
 - **候補 (A) は否定された**。`[fs-key] source=fullscreen focused=true foreground=...` が
   無視された Z すべてに出ている。フルスクリーン viewport はフォーカスを持っており、
-  `has_focus` 早期 return ではない。ただし `[fs-key]` は Win32 KeySlot 経路のログで、
-  実際の exit は egui 側の `consume_action_no_repeat` を通るため、**egui 側に届いて
-  いるかは別問題**として残る。
+  `has_focus` 早期 return ではない。`[fs-key]` の要約元は同じ ctx の `egui::Event::Key` であり、
+  Z が egui event へ届いている事実までは確定している。一方、実際の exit は keymap の
+  Win32 frame 優先判定を通るため、そこで別 viewport の edge や別キー edge による早期 return が
+  起きているかは未確定。
 - **未記録の併発症状**: exit が成功した 0.4〜1.0 秒後に**勝手に音声モードへ再突入する**
   事象を 2 回観測 (`entered audio mode` が再度出る)。再突入後は Z がさらに効かなくなる。
 - **無言の分岐が 7 つある** (どれで消えているか現行ログでは判別不能):
@@ -928,6 +929,19 @@
   どこで消えているかを確定してから直す (`enter_video_audio_mode` の呼び出し元ログも
   同時に入れて再突入の出所を割る)。過去に推測で 2 回外し、計装した 1 回で当てた前例に従う。
 - 優先度: **P2**。利用者報告のある実害バグで、再現手段が手元にある。
+
+#### 診断計装の再修正 (2026-08-17)
+
+- 最初の §4.2 計装は全 `outcome=` を `diagnostic_peek_action_press` の true 配下に置いたため、
+  peek 自体が false の実ログでは 1 行も出ず、診断として機能しなかった。
+- `video_audio_mode.is_some()` の間は peek と独立に guard chain を評価する。1 本の
+  `[video-audio] exit key diagnostic` 行へ、`outcome`、対象 viewport の Win32 frame 状態、
+  viewport 内 / 全 viewport の Z down、送信元 viewport、egui Z event、fallback 2 判定、
+  `fullscreen_shortcut_event_summary` の読み取り元と要約をまとめる。
+- 診断は初回・理由変化・Z 観測だけを候補化し、候補を 1 秒間隔で最大 1 行出す。同一理由の
+  idle frame は畳み、rate limit 中に見えた Z は診断 snapshot のまま次の出力可能時刻まで保持する。
+- 全 viewport 走査は current frame の read-only 診断 projection で、consume / Action 成立 / dispatch
+  には使用しない。現時点では原因修正も production 分岐変更も行わない。
 
 ### 4.1 Shift / Alt + ホイールのカスタマイズ再設計
 

@@ -1782,7 +1782,7 @@ pub fn set_test_frame_for_viewport(viewport: egui::ViewportId, mut edges: Vec<Ke
 }
 
 #[cfg(test)]
-fn set_test_routed_frame(edges: Vec<KeyEdge>) {
+pub(crate) fn set_test_routed_frame(edges: Vec<KeyEdge>) {
     if let Ok(mut guard) = state().lock() {
         guard.frame_active_viewports.clear();
         for edge in &edges {
@@ -1924,6 +1924,24 @@ where
         .unwrap_or(false)
 }
 
+/// Return the first matching key-down edge regardless of source viewport without consuming it.
+///
+/// This is a diagnostics-only projection over the current frame. Application input routing must
+/// continue to use the viewport-scoped APIs above; this cross-viewport read must never decide or
+/// dispatch an action.
+pub fn diagnostic_pressed_key_down_any_viewport<F>(predicate: F) -> Option<KeyEdge>
+where
+    F: Fn(KeyEdge) -> bool,
+{
+    state().lock().ok().and_then(|guard| {
+        guard
+            .frame
+            .iter()
+            .copied()
+            .find(|edge| edge.pressed && predicate(*edge))
+    })
+}
+
 /// Consume all matching physical key edges from the current frame.
 ///
 /// Unlike egui's `Event::Key`, the Win32 edge retains scan-code and extended-bit
@@ -2050,10 +2068,11 @@ mod tests {
         SyntheticModifiers, SyntheticNavigationKey, SyntheticRoutingTargetError, TEST_INPUT_LOCK,
         arm_test_synthetic_input, arm_test_synthetic_input_without_registration, begin_frame,
         clear_test_synthetic_input, consume_all_key_down_with_result, consume_key_down,
-        consume_key_edges, enqueue_test_synthetic_command, materialize_test_synthetic_input,
-        physical_key_down, physical_key_down_from, pressed_key_down,
-        register_test_synthetic_target, resolve_synthetic_routing_target, set_test_frame,
-        set_test_routed_frame, set_test_synthetic_repeat, state,
+        consume_key_edges, diagnostic_pressed_key_down_any_viewport,
+        enqueue_test_synthetic_command, materialize_test_synthetic_input, physical_key_down,
+        physical_key_down_from, pressed_key_down, register_test_synthetic_target,
+        resolve_synthetic_routing_target, set_test_frame, set_test_routed_frame,
+        set_test_synthetic_repeat, state,
     };
     use std::time::{Duration, Instant};
 
@@ -2219,6 +2238,22 @@ mod tests {
         assert!(!consume_key_down(sibling, true, |_| true));
         assert!(pressed_key_down(source, |_| true));
         assert!(consume_key_down(source, true, |_| true));
+    }
+
+    #[test]
+    fn cross_viewport_diagnostic_scan_does_not_consume() {
+        let _serial = TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let source = egui::ViewportId::from_hash_of(51_u64);
+        let sibling = egui::ViewportId::from_hash_of(52_u64);
+        set_test_routed_frame(vec![raw_edge(0x5A, true).with_source(0x102, source)]);
+
+        let observed = diagnostic_pressed_key_down_any_viewport(|e| e.virtual_key == 0x5A);
+        assert_eq!(observed.map(|e| e.source_viewport), Some(source));
+        assert!(!pressed_key_down(sibling, |e| e.virtual_key == 0x5A));
+        assert!(consume_key_down(source, true, |e| e.virtual_key == 0x5A));
     }
 
     #[test]

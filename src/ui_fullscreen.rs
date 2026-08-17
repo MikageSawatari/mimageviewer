@@ -41,6 +41,8 @@ use crate::fs_animation::{AnimationPlayback, FsCacheEntry};
 use crate::gpu_lanczos::FullscreenPaintResource;
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::items_generation_cache::ItemsGenerationMap;
+#[cfg(windows)]
+use crate::keymap::DiagnosticChordPressSnapshot;
 use crate::keymap::{
     Chord, CommandScope, FS_IMAGE_ACTIVE_SCOPES, FS_VIDEO_ACTIVE_SCOPES, KeyAction, KeyName,
     KeyTrigger, Keymap, command_catalog,
@@ -113,17 +115,159 @@ impl VideoAudioExitKeyOutcome {
 }
 
 #[cfg(windows)]
-fn log_video_audio_exit_key_outcome(
-    ctx: &egui::Context,
+const VIDEO_AUDIO_EXIT_DIAGNOSTIC_MIN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(1);
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct VideoAudioExitKeyDiagnosticInputs {
     fs_idx: usize,
+    pass: u64,
     video_audio_mode: Option<usize>,
+    action_peek: bool,
+    z_press: DiagnosticChordPressSnapshot,
+    fullscreen_summary: Option<String>,
+}
+
+#[cfg(windows)]
+impl VideoAudioExitKeyDiagnosticInputs {
+    fn saw_z_or_action_press(&self) -> bool {
+        self.action_peek
+            || self.z_press.win32_viewport_key_down
+            || self.z_press.win32_any_key_down_source.is_some()
+            || self.z_press.egui_key_down
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct VideoAudioExitKeyDiagnosticRecord {
+    inputs: VideoAudioExitKeyDiagnosticInputs,
+    outcome: VideoAudioExitKeyOutcome,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Default)]
+struct VideoAudioExitKeyDiagnosticRateState {
+    last_observed_outcome: Option<VideoAudioExitKeyOutcome>,
+    last_observed_target: Option<(usize, Option<usize>)>,
+    last_emitted_at: Option<std::time::Instant>,
+    last_seen_at: Option<std::time::Instant>,
+    pending: Option<VideoAudioExitKeyDiagnosticRecord>,
+}
+
+#[cfg(windows)]
+impl VideoAudioExitKeyDiagnosticRateState {
+    fn reset_session(&mut self) {
+        self.last_observed_outcome = None;
+        self.last_observed_target = None;
+        self.last_seen_at = None;
+        self.pending = None;
+    }
+
+    fn observe(
+        &mut self,
+        now: std::time::Instant,
+        record: VideoAudioExitKeyDiagnosticRecord,
+    ) -> Option<VideoAudioExitKeyDiagnosticRecord> {
+        if self.last_seen_at.is_some_and(|last_seen| {
+            now.saturating_duration_since(last_seen) >= VIDEO_AUDIO_EXIT_DIAGNOSTIC_MIN_INTERVAL
+        }) {
+            self.last_observed_outcome = None;
+            self.last_observed_target = None;
+            self.pending = None;
+        }
+        self.last_seen_at = Some(now);
+
+        let outcome_changed = self.last_observed_outcome != Some(record.outcome);
+        let target = (record.inputs.fs_idx, record.inputs.video_audio_mode);
+        let target_changed = self.last_observed_target != Some(target);
+        self.last_observed_outcome = Some(record.outcome);
+        self.last_observed_target = Some(target);
+        if outcome_changed || target_changed || record.inputs.saw_z_or_action_press() {
+            let replace_pending = self.pending.as_ref().is_none_or(|pending| {
+                !pending.inputs.saw_z_or_action_press() && record.inputs.saw_z_or_action_press()
+            });
+            if replace_pending {
+                self.pending = Some(record);
+            }
+        }
+
+        let interval_elapsed = self.last_emitted_at.is_none_or(|last_emitted| {
+            now.saturating_duration_since(last_emitted) >= VIDEO_AUDIO_EXIT_DIAGNOSTIC_MIN_INTERVAL
+        });
+        if interval_elapsed {
+            let ready = self.pending.take();
+            if ready.is_some() {
+                self.last_emitted_at = Some(now);
+            }
+            ready
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+static VIDEO_AUDIO_EXIT_DIAGNOSTIC_RATE_STATE: std::sync::OnceLock<
+    std::sync::Mutex<VideoAudioExitKeyDiagnosticRateState>,
+> = std::sync::OnceLock::new();
+
+#[cfg(windows)]
+pub(crate) fn reset_video_audio_exit_key_diagnostic_rate() {
+    if let Ok(mut state) = VIDEO_AUDIO_EXIT_DIAGNOSTIC_RATE_STATE
+        .get_or_init(Default::default)
+        .lock()
+    {
+        state.reset_session();
+    }
+}
+
+#[cfg(windows)]
+fn log_video_audio_exit_key_outcome(
+    inputs: &VideoAudioExitKeyDiagnosticInputs,
     outcome: VideoAudioExitKeyOutcome,
 ) {
+    let record = VideoAudioExitKeyDiagnosticRecord {
+        inputs: inputs.clone(),
+        outcome,
+    };
+    let ready = VIDEO_AUDIO_EXIT_DIAGNOSTIC_RATE_STATE
+        .get_or_init(Default::default)
+        .lock()
+        .ok()
+        .and_then(|mut state| state.observe(std::time::Instant::now(), record));
+    let Some(record) = ready else {
+        return;
+    };
+    let inputs = record.inputs;
+    let z = inputs.z_press;
     crate::logger::log(format!(
-        "[video-audio] exit key edge fs_idx={fs_idx} viewport={:?} pass={} video_audio_mode={video_audio_mode:?} outcome={}",
-        ctx.viewport_id(),
-        ctx.cumulative_pass_nr(),
-        outcome.as_str()
+        "[video-audio] exit key diagnostic fs_idx={} viewport={:?} pass={} \
+         video_audio_mode={:?} outcome={} peek_action={} peek_z_chord={} \
+         frame_active={} frame_had_key_down={} pressed_key_down_viewport_z={} \
+         pressed_key_down_viewport_z_chord={} any_viewport_z_down={} \
+         any_viewport_z_source={:?} egui_z_pressed={} egui_z_chord_pressed={} \
+         egui_fallback_allowed={} frame_active_blocks_egui_fallback={} \
+         fs_summary_source=egui_events fs_summary={:?}",
+        inputs.fs_idx,
+        z.viewport,
+        inputs.pass,
+        inputs.video_audio_mode,
+        record.outcome.as_str(),
+        inputs.action_peek,
+        z.result,
+        z.frame_active,
+        z.frame_had_key_down,
+        z.win32_viewport_key_down,
+        z.win32_viewport_chord_down,
+        z.win32_any_key_down_source.is_some(),
+        z.win32_any_key_down_source,
+        z.egui_key_down,
+        z.egui_chord_down,
+        z.egui_fallback_allowed,
+        z.frame_active_blocks_egui_fallback,
+        inputs.fullscreen_summary
     ));
 }
 
@@ -17187,11 +17331,26 @@ impl App {
         let current_item_is_audio = matches!(self.items.get(fs_idx), Some(GridItem::Audio(_)));
         let fs_music_view_active = self.fs_music_view_active(fs_idx);
         #[cfg(windows)]
-        let video_audio_exit_key_edge = self
-            .keymap
-            .diagnostic_peek_action_press(ctx, KeyAction::VideoToggleAudioMode);
+        let video_audio_exit_key_diagnostic =
+            self.video_audio_mode
+                .map(|_| VideoAudioExitKeyDiagnosticInputs {
+                    fs_idx,
+                    pass: ctx.cumulative_pass_nr(),
+                    video_audio_mode: self.video_audio_mode,
+                    action_peek: self
+                        .keymap
+                        .diagnostic_peek_action_press(ctx, KeyAction::VideoToggleAudioMode),
+                    z_press: self
+                        .keymap
+                        .diagnostic_chord_press_snapshot(ctx, Chord::key(KeyName::Z)),
+                    fullscreen_summary: fullscreen_shortcut_event_summary(
+                        ctx,
+                        &self.keymap,
+                        FS_VIDEO_ACTIVE_SCOPES,
+                    ),
+                });
         #[cfg(windows)]
-        let video_audio_exit_key_blocker = if !video_audio_exit_key_edge {
+        let video_audio_exit_key_blocker = if self.video_audio_mode.is_none() {
             None
         } else if !fs_music_view_active {
             Some(VideoAudioExitKeyOutcome::MusicViewInactive)
@@ -17208,10 +17367,6 @@ impl App {
         } else {
             None
         };
-        #[cfg(windows)]
-        if let Some(outcome) = video_audio_exit_key_blocker {
-            log_video_audio_exit_key_outcome(ctx, fs_idx, self.video_audio_mode, outcome);
-        }
         // 音楽ビューのパネル内 TextEdit (ブックマーク改名 / 一括登録 / タグピッカー) に
         // フォーカスがある / IME 変換中 / 中央モーダル (改名・一括登録) 表示中は、フルスクリーンの
         // ナビ・ショートカットキーを一切消費しない (Inc 5 FB / 5c-A)。矢印 (IME 候補選択) や
@@ -17224,6 +17379,14 @@ impl App {
                 || self.music_bookmark_modal_open()
                 || self.music_normalize_modal_active(fs_idx))
         {
+            #[cfg(windows)]
+            if let Some(inputs) = video_audio_exit_key_diagnostic.as_ref() {
+                log_video_audio_exit_key_outcome(
+                    inputs,
+                    video_audio_exit_key_blocker
+                        .unwrap_or(VideoAudioExitKeyOutcome::ActionNotConsumed),
+                );
+            }
             return action;
         }
         if !self.ime_input_active(ctx)
@@ -17231,12 +17394,11 @@ impl App {
             && self.consume_context_shortcuts_help_key(ctx)
         {
             #[cfg(windows)]
-            if video_audio_exit_key_edge && video_audio_exit_key_blocker.is_none() {
+            if let Some(inputs) = video_audio_exit_key_diagnostic.as_ref() {
                 log_video_audio_exit_key_outcome(
-                    ctx,
-                    fs_idx,
-                    self.video_audio_mode,
-                    VideoAudioExitKeyOutcome::ContextShortcutsHelpPreempted,
+                    inputs,
+                    video_audio_exit_key_blocker
+                        .unwrap_or(VideoAudioExitKeyOutcome::ContextShortcutsHelpPreempted),
                 );
             }
             self.show_context_shortcuts_help = true;
@@ -17282,12 +17444,11 @@ impl App {
                 .consume_action(ctx, KeyAction::VideoCloseFullscreen)
         {
             #[cfg(windows)]
-            if video_audio_exit_key_edge && video_audio_exit_key_blocker.is_none() {
+            if let Some(inputs) = video_audio_exit_key_diagnostic.as_ref() {
                 log_video_audio_exit_key_outcome(
-                    ctx,
-                    fs_idx,
-                    self.video_audio_mode,
-                    VideoAudioExitKeyOutcome::CloseFullscreenPreempted,
+                    inputs,
+                    video_audio_exit_key_blocker
+                        .unwrap_or(VideoAudioExitKeyOutcome::CloseFullscreenPreempted),
                 );
             }
             // この egui 経路では close は `action.close` で呼び出し側に伝える (esc と同じ方式、
@@ -17313,30 +17474,28 @@ impl App {
         {
             #[cfg(windows)]
             if self.video_audio_mode == Some(fs_idx) {
-                log_video_audio_exit_key_outcome(
-                    ctx,
-                    fs_idx,
-                    self.video_audio_mode,
-                    VideoAudioExitKeyOutcome::ExitRequested,
-                );
+                if let Some(inputs) = video_audio_exit_key_diagnostic.as_ref() {
+                    log_video_audio_exit_key_outcome(
+                        inputs,
+                        VideoAudioExitKeyOutcome::ExitRequested,
+                    );
+                }
                 self.exit_video_audio_mode(ctx, fs_idx);
             } else {
-                log_video_audio_exit_key_outcome(
-                    ctx,
-                    fs_idx,
-                    self.video_audio_mode,
-                    VideoAudioExitKeyOutcome::ConsumedWithoutActiveVideoAudioMode,
-                );
+                if let Some(inputs) = video_audio_exit_key_diagnostic.as_ref() {
+                    log_video_audio_exit_key_outcome(
+                        inputs,
+                        VideoAudioExitKeyOutcome::ConsumedWithoutActiveVideoAudioMode,
+                    );
+                }
             }
             return action;
         }
         #[cfg(windows)]
-        if video_audio_exit_key_edge && video_audio_exit_key_blocker.is_none() {
+        if let Some(inputs) = video_audio_exit_key_diagnostic.as_ref() {
             log_video_audio_exit_key_outcome(
-                ctx,
-                fs_idx,
-                self.video_audio_mode,
-                VideoAudioExitKeyOutcome::ActionNotConsumed,
+                inputs,
+                video_audio_exit_key_blocker.unwrap_or(VideoAudioExitKeyOutcome::ActionNotConsumed),
             );
         }
 
@@ -33499,6 +33658,113 @@ mod tests {
     use crate::grid_item::GridItem;
     use crate::ring_shortcut::{RightDragContext, ViewerShortRightClickAction};
     use std::path::PathBuf;
+
+    #[cfg(windows)]
+    fn video_audio_exit_diagnostic_record(
+        outcome: VideoAudioExitKeyOutcome,
+        saw_z: bool,
+    ) -> VideoAudioExitKeyDiagnosticRecord {
+        VideoAudioExitKeyDiagnosticRecord {
+            inputs: VideoAudioExitKeyDiagnosticInputs {
+                fs_idx: 1,
+                pass: 1,
+                video_audio_mode: Some(1),
+                action_peek: saw_z,
+                z_press: DiagnosticChordPressSnapshot {
+                    viewport: egui::ViewportId::ROOT,
+                    frame_active: true,
+                    frame_had_key_down: saw_z,
+                    win32_viewport_key_down: saw_z,
+                    win32_viewport_chord_down: saw_z,
+                    win32_any_key_down_source: saw_z.then_some(egui::ViewportId::ROOT),
+                    egui_key_down: saw_z,
+                    egui_chord_down: saw_z,
+                    egui_fallback_allowed: true,
+                    frame_active_blocks_egui_fallback: false,
+                    result: saw_z,
+                },
+                fullscreen_summary: None,
+            },
+            outcome,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn video_audio_exit_diagnostic_folds_repeats_and_preserves_rate_limited_z() {
+        let start = std::time::Instant::now();
+        let mut state = VideoAudioExitKeyDiagnosticRateState::default();
+        let baseline =
+            video_audio_exit_diagnostic_record(VideoAudioExitKeyOutcome::ActionNotConsumed, false);
+        assert!(state.observe(start, baseline.clone()).is_some());
+        assert!(
+            state
+                .observe(
+                    start + std::time::Duration::from_millis(100),
+                    baseline.clone()
+                )
+                .is_none()
+        );
+
+        let z =
+            video_audio_exit_diagnostic_record(VideoAudioExitKeyOutcome::ActionNotConsumed, true);
+        assert!(
+            state
+                .observe(start + std::time::Duration::from_millis(200), z)
+                .is_none()
+        );
+        assert!(
+            state
+                .observe(
+                    start + std::time::Duration::from_millis(999),
+                    baseline.clone()
+                )
+                .is_none()
+        );
+        let emitted = state
+            .observe(start + std::time::Duration::from_secs(1), baseline.clone())
+            .unwrap();
+        assert!(emitted.inputs.saw_z_or_action_press());
+        assert!(
+            state
+                .observe(start + std::time::Duration::from_millis(1500), baseline)
+                .is_none()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn video_audio_exit_diagnostic_rearms_for_new_audio_mode_session() {
+        let start = std::time::Instant::now();
+        let mut state = VideoAudioExitKeyDiagnosticRateState::default();
+        let first =
+            video_audio_exit_diagnostic_record(VideoAudioExitKeyOutcome::ActionNotConsumed, false);
+        assert!(state.observe(start, first).is_some());
+
+        let steady =
+            video_audio_exit_diagnostic_record(VideoAudioExitKeyOutcome::ActionNotConsumed, false);
+        assert!(
+            state
+                .observe(start + std::time::Duration::from_millis(100), steady)
+                .is_none()
+        );
+
+        state.reset_session();
+        let reentered =
+            video_audio_exit_diagnostic_record(VideoAudioExitKeyOutcome::ActionNotConsumed, false);
+        assert!(
+            state
+                .observe(start + std::time::Duration::from_millis(200), reentered)
+                .is_none()
+        );
+        let next =
+            video_audio_exit_diagnostic_record(VideoAudioExitKeyOutcome::ActionNotConsumed, false);
+        assert!(
+            state
+                .observe(start + std::time::Duration::from_secs(1), next)
+                .is_some()
+        );
+    }
 
     #[test]
     fn processing_status_visibility_requires_setting_and_active_state() {

@@ -188,6 +188,11 @@ Enter-held の各 API は対象 `ViewportId` を必須引数にし、別 viewpor
 配送して診断ログへ記録する。メイン HWND は subclass が edge を publish できる前に `ROOT` 対応を
 登録済みにすることを不変条件とする。
 
+診断だけは `diagnostic_pressed_key_down_any_viewport` で current frame の全 edge を横断して
+送信元 viewport を観測できる。この API は read-only であり、edge を consume せず、Action の
+成立・dispatch・fallback 判定には使用しない。production の入力所有権は引き続き viewport 必須の
+API だけが担う。非消費であることは queue-level test で固定する。
+
 ### 配送済み edge と現在レベルの ownership 境界
 
 同一 viewport に stamped された key-down edge は、OS が配送した時点の input ownership を表す

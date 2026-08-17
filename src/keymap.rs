@@ -5572,6 +5572,22 @@ pub struct Keymap {
     warnings: Vec<String>,
 }
 
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DiagnosticChordPressSnapshot {
+    pub viewport: egui::ViewportId,
+    pub frame_active: bool,
+    pub frame_had_key_down: bool,
+    pub win32_viewport_key_down: bool,
+    pub win32_viewport_chord_down: bool,
+    pub win32_any_key_down_source: Option<egui::ViewportId>,
+    pub egui_key_down: bool,
+    pub egui_chord_down: bool,
+    pub egui_fallback_allowed: bool,
+    pub frame_active_blocks_egui_fallback: bool,
+    pub result: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PageTurnPressKind {
     InitialPress,
@@ -7692,24 +7708,45 @@ impl Keymap {
 
     #[cfg(windows)]
     fn diagnostic_peek_chord_press(&self, ctx: &egui::Context, chord: Chord) -> bool {
-        if chord.key_name().is_none() {
-            return false;
-        }
-        if crate::key_input::is_frame_active(ctx.viewport_id()) {
-            if crate::key_input::frame_had_key_down(ctx.viewport_id()) {
-                return crate::key_input::pressed_key_down(ctx.viewport_id(), |edge| {
-                    chord.matches_key_edge(edge)
-                });
-            }
-            if Self::frame_active_blocks_egui_fallback(chord) {
-                return false;
-            }
-        }
-        if !Self::egui_key_event_fallback_allowed(ctx) {
-            return false;
-        }
-        ctx.input(|input| {
-            input.events.iter().any(|event| {
+        self.diagnostic_chord_press_snapshot(ctx, chord).result
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn diagnostic_chord_press_snapshot(
+        &self,
+        ctx: &egui::Context,
+        chord: Chord,
+    ) -> DiagnosticChordPressSnapshot {
+        let viewport = ctx.viewport_id();
+        let key_name = chord.key_name();
+        let frame_active = crate::key_input::is_frame_active(viewport);
+        let frame_had_key_down = crate::key_input::frame_had_key_down(viewport);
+        let win32_viewport_key_down = crate::key_input::pressed_key_down(viewport, |edge| {
+            key_name.is_some_and(|key| {
+                key.matches_win32(edge.virtual_key, edge.scan_code, edge.extended)
+            })
+        });
+        let win32_viewport_chord_down =
+            crate::key_input::pressed_key_down(viewport, |edge| chord.matches_key_edge(edge));
+        let win32_any_key_down_source =
+            crate::key_input::diagnostic_pressed_key_down_any_viewport(|edge| {
+                key_name.is_some_and(|key| {
+                    key.matches_win32(edge.virtual_key, edge.scan_code, edge.extended)
+                })
+            })
+            .map(|edge| edge.source_viewport);
+        let (egui_key_down, egui_chord_down) = ctx.input(|input| {
+            let key_down = input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        ..
+                    } if key_name.is_some_and(|name| name.to_egui() == Some(*key))
+                )
+            });
+            let chord_down = input.events.iter().any(|event| {
                 matches!(
                     event,
                     egui::Event::Key {
@@ -7719,8 +7756,33 @@ impl Keymap {
                         ..
                     } if chord.matches_egui(*key, *modifiers)
                 )
-            })
-        })
+            });
+            (key_down, chord_down)
+        });
+        let egui_fallback_allowed = Self::egui_key_event_fallback_allowed(ctx);
+        let frame_active_blocks_egui_fallback = Self::frame_active_blocks_egui_fallback(chord);
+        let result = key_name.is_some()
+            && if frame_active && frame_had_key_down {
+                win32_viewport_chord_down
+            } else if frame_active && frame_active_blocks_egui_fallback {
+                false
+            } else {
+                egui_fallback_allowed && egui_chord_down
+            };
+
+        DiagnosticChordPressSnapshot {
+            viewport,
+            frame_active,
+            frame_had_key_down,
+            win32_viewport_key_down,
+            win32_viewport_chord_down,
+            win32_any_key_down_source,
+            egui_key_down,
+            egui_chord_down,
+            egui_fallback_allowed,
+            frame_active_blocks_egui_fallback,
+            result,
+        }
     }
 
     fn key_held_chord(
@@ -10786,6 +10848,35 @@ mod tests {
             ctx.viewport_id(),
             |edge| edge.virtual_key == 0x54
         ));
+        let _ = ctx.end_pass();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn diagnostic_snapshot_exposes_cross_viewport_z_without_consuming_it() {
+        let _serial = native_video_shortcut_test_guard();
+        let _clear = ClearTestKeyFrame;
+        let keymap = Keymap::empty();
+        let ctx = egui::Context::default();
+        let sibling = egui::ViewportId::from_hash_of(53_u64);
+        begin_key_pass(&ctx, egui::Key::Z, egui::Modifiers::NONE);
+        let root_other = plain_key_edge(0x59, 0x15);
+        let mut sibling_z = plain_key_edge(0x5A, 0x2C);
+        sibling_z.source_viewport = sibling;
+        crate::key_input::set_test_routed_frame(vec![root_other, sibling_z]);
+
+        let snapshot = keymap.diagnostic_chord_press_snapshot(&ctx, Chord::key(KeyName::Z));
+        assert!(snapshot.frame_active);
+        assert!(snapshot.frame_had_key_down);
+        assert!(!snapshot.win32_viewport_key_down);
+        assert_eq!(snapshot.win32_any_key_down_source, Some(sibling));
+        assert!(snapshot.egui_key_down);
+        assert!(snapshot.egui_chord_down);
+        assert!(!snapshot.result);
+        assert!(!keymap.diagnostic_peek_action_press(&ctx, KeyAction::VideoToggleAudioMode));
+        assert!(crate::key_input::consume_key_down(sibling, true, |edge| {
+            edge.virtual_key == 0x5A
+        }));
         let _ = ctx.end_pass();
     }
 

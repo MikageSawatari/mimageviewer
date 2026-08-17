@@ -7575,6 +7575,8 @@ impl App {
         self.video_audio_exit_pending = None;
         self.reset_video_audio_side_panel_sessions(fs_idx);
         self.video_audio_mode = Some(fs_idx);
+        // 診断ログの session 境界だけを再 arm する。入力判定・presenter 遷移には使わない。
+        crate::ui_fullscreen::reset_video_audio_exit_key_diagnostic_rate();
         // 動画モードで追加/改名/削除したブックマークを音楽ビューへ確実に反映する (#6 修正)。
         // 動画側は video_bookmark_db + fullscreen_video_marker_cache を更新するが、音楽ビューの
         // music_bookmarks は別キャッシュ (music_bookmarks_loaded_for でゲート) なので、exit で
