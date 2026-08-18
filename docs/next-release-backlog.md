@@ -1423,6 +1423,24 @@
 
 ### 5.4 idle health の video-pin evidence 窓が狭い
 
+- **v3.1.1 (2026-08-18) の実測。3 回走らせて 3 回とも FAIL したが、いずれも製品側ではない。**
+  1. **接続先を取り違える**: `-NoLaunch` が `%APPDATA%\mimagevieweruntime.1.1\` の core
+     (ランチャー版が展開した別 instance、`--perf-log` 無し) に接続した。perf を 1 行も書かない
+     instance なのに「同一 session PID は確認済み」と表示し、`events=0` を完全 sleep として
+     扱った。**perf log growth が 0 のまま measured window を評価したら、sleep ではなく
+     「記録していない」を疑う**べき。接続先の exe path が測定対象として妥当か
+     (script が起動した instance か) を確認する条件が要る。
+  2. **起動直後の初回索引と競合する**: 起動 11 秒後に測ると、全文検索の initial scan
+     (walker が 52 万 / 11 万 / 6 万ファイル) が並列で走っていて CPU one-core ratio 2.302 で FAIL。
+     索引は text log にしか書かないので perf 側は静かなまま、CPU だけが跳ねる。
+     **「起動後 N 秒」ではなく、初回スキャン完了 (name_index / indexer の initial scan done) を
+     待ってから測る**のが正しい条件。
+  3. 索引完了後に測り直すと **CPU one-core ratio 0.0094 / perf event 0 件 / repaint streak 0 /
+     同一 work 0** で、製品側は完全に静止していた。残った FAIL は本項の evidence 窓だけ
+     (同一 session の 1 つ前の窓では `matched=64 (enqueue=32, ready=28,
+     idle_upgrade_ineligible=4)` を記録済みで、タイルは keep 範囲に入っていた)。
+  - 結論: v3.1.1 は **evidence 窓の既知欠陥による FAIL** として通した。実体の測定は PASS。
+
 - 出典: v2.9.1 リリース前確認 (2026-08-01)。`-TargetKey` 方式に変えた直後の実測で FAIL。
   原因は**ゲートの窓**で、製品側でもセットアップ手順の誤りでもない。
 - 何が起きたか: 対象キーのサムネイル処理は **t≈177-182 に 519 件**あり、そのままアプリが
