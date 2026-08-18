@@ -912,7 +912,7 @@ impl App {
         }
     }
 
-    fn trigger_mouse_gesture_action(
+    pub(crate) fn trigger_mouse_gesture_action(
         &mut self,
         ctx: &egui::Context,
         context: RightDragContext,
@@ -925,6 +925,11 @@ impl App {
             .mouse_gesture_profile(context)
             .action_for_pattern(pattern);
         let pattern_label = format_mouse_gesture_pattern(pattern);
+        // 通知だけの設定。ジェスチャの実行そのものは常に行う (backlog §4.4)。
+        let show_result_toast = self
+            .settings
+            .ring_shortcuts
+            .mouse_gesture_result_toast_visible;
         if !action.is_valid_for_right_drag_context(context) {
             crate::logger::log(format!(
                 "mouse gesture ignored invalid action={} context={context:?}",
@@ -933,13 +938,17 @@ impl App {
             return None;
         }
         if matches!(action, RingActionId::None) {
-            self.show_feedback_toast(format!("[Gesture: {pattern_label} なし]"));
+            if show_result_toast {
+                self.show_feedback_toast(format!("[Gesture: {pattern_label} なし]"));
+            }
             return None;
         }
-        self.show_feedback_toast(format!(
-            "[Gesture: {pattern_label} {}]",
-            action.label_for_context(action_context)
-        ));
+        if show_result_toast {
+            self.show_feedback_toast(format!(
+                "[Gesture: {pattern_label} {}]",
+                action.label_for_context(action_context)
+            ));
+        }
         self.apply_ring_action(ctx, action_context, action, "mouse-gesture")
     }
     pub(crate) fn mouse_ring_context_menu_suppressed(&self, ctx: &egui::Context) -> bool {

@@ -46519,6 +46519,113 @@ mod rating_view_navigation_tests {
         }
     }
 
+    fn set_grid_gesture_action(
+        app: &mut App,
+        pattern: Vec<crate::ring_shortcut::MouseGestureDirection>,
+        action: crate::ring_shortcut::RingActionId,
+    ) {
+        app.settings.ring_shortcuts.mouse_gestures_grid.bindings =
+            vec![crate::ring_shortcut::MouseGestureBinding::new(
+                pattern, action,
+            )];
+    }
+
+    #[test]
+    fn mouse_gesture_result_toast_visible_reports_assigned_and_unassigned_patterns() {
+        use crate::ring_shortcut::{MouseGestureDirection, RightDragContext, RingActionId};
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        set_grid_gesture_action(
+            &mut app,
+            vec![MouseGestureDirection::Up],
+            RingActionId::GridScrollTop,
+        );
+        app.settings
+            .ring_shortcuts
+            .mouse_gesture_result_toast_visible = true;
+
+        app.trigger_mouse_gesture_action(
+            &ctx,
+            RightDragContext::Grid,
+            &[MouseGestureDirection::Up],
+        );
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|(text, _, _)| {
+            text == "[Gesture: ↑ 一覧の先頭へスクロール]"
+        }));
+
+        app.fs_feedback_toast = None;
+        app.trigger_mouse_gesture_action(
+            &ctx,
+            RightDragContext::Grid,
+            &[MouseGestureDirection::Down],
+        );
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|(text, _, _)| text == "[Gesture: ↓ なし]")
+        );
+    }
+
+    #[test]
+    fn mouse_gesture_result_toast_hidden_suppresses_both_but_still_runs_action() {
+        use crate::ring_shortcut::{MouseGestureDirection, RightDragContext, RingActionId};
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        set_grid_gesture_action(
+            &mut app,
+            vec![MouseGestureDirection::Up],
+            RingActionId::GridScrollTop,
+        );
+        app.settings
+            .ring_shortcuts
+            .mouse_gesture_result_toast_visible = false;
+
+        app.trigger_mouse_gesture_action(
+            &ctx,
+            RightDragContext::Grid,
+            &[MouseGestureDirection::Up],
+        );
+        assert_eq!(app.pending_grid_scroll, Some(GridScrollIntent::Top));
+        assert!(app.fs_feedback_toast.is_none());
+
+        app.trigger_mouse_gesture_action(
+            &ctx,
+            RightDragContext::Grid,
+            &[MouseGestureDirection::Down],
+        );
+        assert!(app.fs_feedback_toast.is_none());
+    }
+
+    #[test]
+    fn hidden_gesture_result_toast_preserves_feedback_from_the_action_itself() {
+        use crate::ring_shortcut::{MouseGestureDirection, RightDragContext, RingActionId};
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.recent_folders = vec![app.tmp.path().join("recent")];
+        set_grid_gesture_action(
+            &mut app,
+            vec![MouseGestureDirection::Up],
+            RingActionId::ClearRecentFolders,
+        );
+        app.settings
+            .ring_shortcuts
+            .mouse_gesture_result_toast_visible = false;
+
+        app.trigger_mouse_gesture_action(
+            &ctx,
+            RightDragContext::Grid,
+            &[MouseGestureDirection::Up],
+        );
+
+        assert!(app.settings.recent_folders.is_empty());
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|(text, _, _)| {
+            text == "最近開いたフォルダ履歴をクリアしました"
+        }));
+    }
+
     #[test]
     fn folder_nav_history_snapshot_restores_rating_view_stack() {
         let mut app = setup_app();

@@ -1937,6 +1937,8 @@ pub struct RingShortcutSettings {
     pub mouse_ring_help_visible: bool,
     #[serde(default = "default_true")]
     pub mouse_gesture_help_visible: bool,
+    #[serde(default = "default_true")]
+    pub mouse_gesture_result_toast_visible: bool,
     #[serde(default = "default_grid_profile")]
     pub grid: RingShortcutProfile,
     #[serde(default = "default_image_profile")]
@@ -2168,6 +2170,7 @@ impl Default for RingShortcutSettings {
             x_picker_hint_shown: false,
             mouse_ring_help_visible: true,
             mouse_gesture_help_visible: true,
+            mouse_gesture_result_toast_visible: true,
             grid: default_grid_profile(),
             image: default_image_profile(),
             video: default_video_profile(),
@@ -2647,6 +2650,7 @@ mod tests {
         assert_eq!(defaults.gamepad_ring_enabled, true);
         assert!(defaults.mouse_ring_help_visible);
         assert!(defaults.mouse_gesture_help_visible);
+        assert!(defaults.mouse_gesture_result_toast_visible);
         assert_eq!(defaults.shift_wheel_pair, WheelPairActionId::None);
         assert_eq!(defaults.alt_wheel_pair, WheelPairActionId::None);
         assert_eq!(
@@ -2705,6 +2709,19 @@ mod tests {
             defaults.video.slots[RingDirection::UpLeft.slot_index()],
             RingActionId::VideoCapture
         );
+    }
+
+    #[test]
+    fn missing_mouse_gesture_result_toast_setting_defaults_to_visible() {
+        let mut legacy = serde_json::to_value(RingShortcutSettings::default()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("mouse_gesture_result_toast_visible");
+
+        let loaded: RingShortcutSettings = serde_json::from_value(legacy).unwrap();
+
+        assert!(loaded.mouse_gesture_result_toast_visible);
     }
 
     #[test]

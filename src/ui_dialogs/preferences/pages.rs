@@ -886,7 +886,7 @@ pub(super) fn page_capture(ui: &mut egui::Ui, state: &mut PreferencesState) {
 pub(super) fn page_operation_behavior(ui: &mut egui::Ui, state: &mut PreferencesState) {
     let settings = &mut state.settings.ring_shortcuts;
 
-    ui.small("右ドラッグ操作中に表示するガイドを切り替えます。オフにしても、割り当てたリングショートカットやマウスジェスチャ自体は実行されます。");
+    ui.small("右ドラッグ操作中に表示するガイドと、マウスジェスチャ実行後の通知を切り替えます。オフにしても、割り当てたリングショートカットやマウスジェスチャ自体は実行されます。");
     ui.add_space(8.0);
     ui.checkbox(
         &mut settings.mouse_ring_help_visible,
@@ -895,6 +895,10 @@ pub(super) fn page_operation_behavior(ui: &mut egui::Ui, state: &mut Preferences
     ui.checkbox(
         &mut settings.mouse_gesture_help_visible,
         "マウスジェスチャの登録一覧 / 入力中表示を表示する",
+    );
+    ui.checkbox(
+        &mut settings.mouse_gesture_result_toast_visible,
+        "マウスジェスチャ実行後の通知を表示する",
     );
 }
 
