@@ -828,6 +828,92 @@
 - 規模 / 優先度: Medium / P2 candidate。現在の重なりだけを座標ずらしで直す症状パッチは
   入れず、まず左上レーンの単一所有化から着手する。
 
+### 2.3 RAR が多いフォルダで、全件判定が終わるまでサムネイルが出ない — 専用スレ >>246, >>249-250
+
+- 出典: 2026-08-18 の利用者報告。ローカル上の RAR でも、フォルダを開いた直後は
+  2〜10 秒ほど形式アイコンのままで、サムネイル表示が遅いことがある。
+- **再現・計測済み**:
+  - `C:\tmp\miv-rar-thumbnail-test-100` に、30,000 entry を持ち代表画像が末尾にある
+    RAR を 30 個複製して混在させると、サムネイルが数秒遅れてまとまって出る。
+  - perf log の `nav/archive_cache_peek` は 133 RAR に対して 3,280.7 / 3,913.6 /
+    3,363.4ms。ある run ではフォルダ一覧の install 後、対応表完成まで約3.32秒、
+    最後の重い RAR のサムネイル ready まで約5.91秒だった。
+  - 同じ状態でも Enter / ダブルクリックによる RAR open は成功する。下の §2.6 とは別件。
+- 根本原因:
+  1. `start_converted_archive_cache_paths_refresh` がフォルダ内の変換対象アーカイブを
+     1 worker で順番に調べ、RAR ごとに `inspect_for_direct_read` を実行する。
+  2. 結果は全候補の確認が終わった後に 1 個の `HashMap` として UI へ届く。途中結果を
+     公開しないため、先頭の RAR の判定が終わっていてもサムネイル要求へ進めない。
+  3. `make_load_request` は `ConvertibleArchive` の対応表 entry が無い間 `None` を返すため、
+     heavy thumbnail queue 自体に要求が入らない。
+  4. `rar_loader` の完全判定 cache は 32 件なので、多数の RAR を同じ順番で再走査すると
+     folder scan / thumbnail / open 間で判定を十分再利用できない。
+- 修正方針:
+  1. 現在フォルダの各候補を `Pending / Direct / CachedZip / Unavailable` の typed state で
+     所有し、**1 件の判定完了ごとに**同世代の結果を UI へ公開する。map entry の有無だけを
+     pending / unavailable の兼用 sentinel にしない。
+  2. 可視範囲と keep range を先に判定し、残りは距離順で進める。全件完了を最初の
+     サムネイル表示条件にしない。同期 header scan を UI thread へ戻さない。
+  3. current-folder generation 内で得た RAR 判定は、そのフォルダのサムネイル要求と open
+     から再利用する。`DECISION_CACHE_CAPACITY` を単に増やすだけの修正にはしない。
+  4. フォルダ切替 / 再読み込みでは cancel と `items_generation` を照合し、旧フォルダの
+     途中結果を新しい一覧へ反映しない。既存の heavy I/O 予算を無視して候補数ぶん thread を
+     spawn しない。
+- 完了条件:
+  - 上記 stress folder で、可視 RAR のサムネイルが全133件の判定完了を待たず順次表示される。
+  - 100件程度の通常 RAR、直読み RAR、変換 cache 済み RAR、変換が必要な RAR、分割 RARを
+    混在させても、形式判定・代表サムネイル・open 結果が従来と一致する。
+  - 同一 RAR の header 判定回数を計装または test double で固定し、一覧判定直後のサムネイル
+    生成で同じ全 entry scan を繰り返さない。
+- 規模 / 優先度: 中 / P2。利用者へ「本日リリース予定版の次で対応」と回答済み。
+
+### 2.5 選択済み項目を、修飾なしの再クリックで開く — 専用スレ >>246
+
+- 要望: 一覧で現在選択されている項目をもう一度シングルクリックしたとき、Enter /
+  ダブルクリックと同じ open を実行する。
+- 仕様:
+  - current click の選択処理前に、そのセルが既に `selected` だったかを snapshot する。
+    1 回目のクリックで選択された直後に同じ click で開かない。
+  - 修飾なしの primary mouse click だけを対象にする。Ctrl / Shift、右クリック、タグバッジ、
+    drag 開始、ダイアログで open が抑止されている状態では発火しない。
+  - Explorer 方式を対象とする。チェック方式で checked set を変更するクリックは従来どおり
+    選択操作として扱い、open に変えない。
+  - touch-derived pointer は対象外とし、`touch-support-plan.md` §5.8 の「再タップ open は
+    入れない」を維持する。
+  - 同じ pointer release が egui の `double_clicked()` でもある場合、open は 1 回だけ実行する。
+    item 種別ごとの open 分岐を複製せず、既存の Enter / ダブルクリックと同じ activation
+    boundary へ合流させる。
+- 回帰確認: Folder / ZIP / PDF / 直読み RAR / 変換対象アーカイブ / Image / Video、
+  Ctrl・Shift 選択、native D&D、タグバッジ、touch tap。
+- 規模 / 優先度: 小〜中 / P2。利用者へ「本日リリース予定版の次で対応」と回答済み。
+
+### 2.6 ZIP / RAR のダブルクリックが時々無反応 — 未再現、専用スレ >>246, >>249-250
+
+- 報告条件: サムネイル表示、ZIP / RAR、Enter では開ける。しばらく待って再度
+  ダブルクリックすると開くことがある。RAR はローカル上の直読み対象。
+- **2026-08-18 時点では未再現**。§2.3 の stress folder でサムネイルが約6秒遅れる状態でも
+  ダブルクリック open は成立したため、RARサムネイル遅延をこの不具合の原因と決めない。
+- コード上の確認候補:
+  1. サムネイル比率が `自動` のとき、2 click の間に実際の cell height / scroll offset が
+     変わると、2 回目が別セルまたは余白へ当たり得る。判定結果が同じ比率で配置が変わらない
+     場合は原因にならない。
+  2. セル全体が `Sense::click_and_drag()` なので、小さな pointer 移動で2回目が native D&D
+     開始へ変わる可能性がある。
+  3. タグバッジの hit-test は item open より先に処理される。ダイアログ / context menu が
+     open の場合も `grid_open_from_click_allowed` が item open を止める。
+  4. RAR open 自体は direct-read 可否の hidden scan を開始する。重い RAR では無反応に見え得るが、
+     click が成立していれば再操作なしで scan 完了後に開くはずなので区別する。
+- 利用者へ確認中: viewer mode、起動直後か操作後か、1回だけダブルクリックして10秒待っても
+  開かないか、1 click目で選択枠が付くか、発生時にセル比率・位置が変わるか。
+- 次の一手: 再現条件が得られなければ、修正より先に perf log へ次を追加する。
+  - cell の first click / `double_clicked` / `drag_started` と idx・item key・pointer position。
+  - `grid_open_from_click_allowed` の結果と `modal_dialog_block_reason`。
+  - activation 要求の accepted / ignored、RAR hidden scan の開始・完了。
+  - auto-aspect の実切替 old/new と、その frame の pointer stream 状態。
+- **§2.5 の再クリック open で症状が見えなくなっても、本項を解決扱いにしない。** 既存の
+  ダブルクリック経路は独立して診断し、根本原因が判明してから修正・回帰テストを入れる。
+- 優先度: P2 調査。再現または診断ログ待ち。
+
 ### 2.4 CSV / TSV からの一括タグ / レーティング付与 — 保留
 
 - 出典: 同じメール往復。こちらから代替案として提案し利用者も歓迎したが、**利用者の実際の
@@ -1017,6 +1103,22 @@
   QWERTY の実 Tab と同じ label-width 44px だけを代替する。
 - 描画は実キーと同じ `keyboard_picker_label_width` から幅を導く。将来の標準キー幅変更でも
   インデントだけがずれない。HOME / BOTTOM の先頭 variant と Tab 幅一致を unit test で固定する。
+
+### 4.4 マウスジェスチャ実行後の通知を非表示にする — 専用スレ >>246
+
+- 要望: ジェスチャ実行後に右上へ出る `[Gesture: ...]` の feedback toast を設定で
+  非表示にできるようにする。
+- これは右ドラッグ中に登録済み軌跡を示す「操作中のジェスチャガイド」とは別機能。
+  ガイドの既存表示設定は変更しない。
+- 仕様:
+  - 操作カスタマイズで、既存の入力中ガイド設定と同じページへ
+    「マウスジェスチャ実行後の通知を表示」を追加する。
+  - 既存利用者の挙動を変えないため既定 ON。OFF では割り当て済み action と「なし」の両方で
+    `[Gesture: ...]` 通知を抑止する。action 実行先が出すエラー等、別用途の feedback は消さない。
+  - Grid / Image / Video / Edit の全ジェスチャ文脈で同じ設定を使う。
+- 回帰確認: ガイド ON/OFF との4組み合わせ、成功 toast、未割り当て / 実行不能時の feedback、
+  detached / native video 発火面。
+- 規模 / 優先度: 小 / P2。利用者へ「本日リリース予定版の次で対応」と回答済み。
 
 ## 5. リリース前確認 / 依存更新
 
