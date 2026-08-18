@@ -1731,6 +1731,23 @@ untime.1.1\` の core
     後者は native video window が生きている間だけ 1 秒に 1 回 pump へ ping を送る。
     無再生時は送らないが、**動画を開いたまま放置したときのアイドル影響は未実測**。
 
+- **v3.1.2 で解消・close (2026-08-18)**:
+  - A: `-ProcessId` / `-NoLaunch` / 自前 launch の選択後に 1 箇所で `Win32_Process` を照合し、
+    `--perf-log` のない command line と `%APPDATA%\mimageviewer\runtime\` 配下の展開コピーを
+    測定前に reject する。WMI が拒否された場合は path 検査だけ続け、`identity_evidence=path_only`
+    として空の測定窓を sleep 扱いしない。process report に identity evidence / command line / path を
+    保存する。
+  - B: FTS / name の各 supervisor が worker thread から `index.initial_scan_done` を出し、App は
+    両系統が完了した最初の 1 回だけ `index.initial_scan_settled` を出す。両 one-shot 完了後は
+    supervisor stats を取得せず即 return し、housekeeping の FTS-only 条件は維持した。script は
+    prompt 前にこの完了を最大 180 秒待ち、timeout は warning と
+    `index_scan_wait=timeout` で明示するが FAIL 条件にはしない。
+  - C: video-pin evidence の下限を、測定終了以前で最後の `nav.load_folder_begin` (無ければ
+    session 先頭) から analyzer が導出するよう変更し、`--evidence-start-t` を削除した。
+    report に `evidence_floor_t` / `evidence_floor_basis` を残す。
+  - analyzer の境界回帰、aggregate one-shot / supervisor 0 件 / housekeeping 不変の Rust test、
+    PowerShell の 2 reject 条件の `-SkipPrompt` 手動確認を追加・実施した。
+
 ## 6. 着手時に読み直す関連ドキュメント
 
 | 領域 | ドキュメント |

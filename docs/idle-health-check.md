@@ -12,9 +12,13 @@
 
 アプリ内に周期 heartbeat を置くと、正常時にもアプリ自身を起こしてしまう。完全に sleep して
 測定区間内の perf event が 0 件になる状態を正常として扱うため、wall time と CPU は
-PowerShell 側で測る。ただし空の窓を時刻ずれと誤認しないよう、perf log 冒頭の
-`session.start` に記録した PID と測定対象 PID の一致を必須にし、同一セッションが確認できた
-場合だけ「完全 sleep」を明示的に許可する。解析コマンド単体では空の窓は FAIL になる。
+PowerShell 側で測る。ただし空の窓を、perf log を書かない別 instance の sleep と誤認しないよう、
+外部 sampler は取得できた `Win32_Process.CommandLine` に `--perf-log` があることを、完全 sleep を
+許可するための必須証拠にする。WMI が拒否されて command line を取得できない環境では、path だけを
+記録して warning を出し、空の窓を FAIL にする。実行パスが取得できた場合は常に
+`%APPDATA%\mimageviewer\runtime\` 配下のランチャー展開コピーではないことも確認する。
+analyzer の `session.start.pid` 照合はその後のログ整合性確認であり、単独ではプロセス同一性の証拠に
+しない。
 
 ## 2. 実行方法
 
@@ -31,15 +35,23 @@ Enter を押すと、5 秒 warmup 後に 15 秒測定する。測定中はマウ
 idle 測定を無効にする。シナリオ名に `foreground` / `background` が含まれる場合は、測定開始・
 終了時の foreground process ID も検査し、実際の状態と名前が一致しなければ FAIL にする。
 
+スクリプトは Enter の prompt を出す前に、FTS と名前索引の全 supervisor が初回スキャンを
+終えたことを表す `index.initial_scan_settled` を待つ。待ち上限は
+`idle_health_thresholds.json` の `index_settle_wait_seconds` (既定 180 秒)。上限に達した場合は
+`Initial index scan completion could not be confirmed; measuring anyway.` と warning を出し、process report の
+`index_scan_wait` を `timeout` にするが、それ自体は FAIL にしない。完了を確認した場合は
+`settled`。これは時間窓で索引負荷を隠す待ちではなく、明示的な完了イベント待ちである。
+
 ```powershell
 .\scripts\check-idle-health.ps1 -Scenario static-foreground
 ```
 
 同じプロセスで続ける場合は `-NoLaunch` を使う。`-NoLaunch` はプロセス名の最新候補ではなく、
 perf log の `session.start.pid` と一致するプロセスを選ぶ。背面シナリオでは、別ウィンドウを
-前面へ移してから Enter を押す。この経路の expected PID 検査は、同じ perf log から取得した
-PID との整合性と計測窓の有効性を確認するもので、独立した PID 情報源との照合ではない。
-独立して対象を指定したい場合は `-ProcessId` または通常の起動経路を使う。
+前面へ移してから Enter を押す。選択後は `-ProcessId` / `-NoLaunch` / 自前 launch のどの経路も
+同じ `Win32_Process` 検査を通る。command line を取得できて `--perf-log` のない instance、または
+判明した path がランチャー展開コピーなら測定前に停止する。WMI が拒否された場合は
+`identity_evidence=path_only` として続行するが、空の測定窓を完全 sleep としては許可しない。
 
 ```powershell
 .\scripts\check-idle-health.ps1 -NoLaunch -Scenario static-background
@@ -54,7 +66,8 @@ PID との整合性と計測窓の有効性を確認するもので、独立し�
 結果は `target/idle-health/` に 2 ファイル出る。
 
 - `*-perf.json`: update / repaint / work 反復の解析結果
-- `*-process.json`: CPU / ログ増加量、top-level / visible window 数と、両検査を統合した最終 PASS / FAIL
+- `*-process.json`: CPU / ログ増加量、top-level / visible window 数、対象の
+  `identity_evidence` / `command_line` / `path`、`index_scan_wait` と、両検査を統合した最終 PASS / FAIL
 
 スクリプトは失敗時に exit 1 を返す。起動した mImageViewer は追加シナリオを続けられるよう
 終了させないので、検査後に通常操作で完全終了する。
@@ -89,9 +102,12 @@ paused media / still は完全 sleep、active media はこの静止シナリオ�
 
 `video-pin-background` では、動画を代表画像に固定したフォルダのパスを `-TargetKey` で渡す。
 この値は perf log の thumbnail event の `key` に対して、大文字小文字を無視した部分一致で
-照合する (フォルダタイルの `key` は `dir::<path>` 形式)。スクリプトを起動してから対象
-フォルダを開く／再読み込みし、そのタイルを keep 範囲へ入れる。準備開始から測定終了までに
-対象 `key` の thumbnail work が 1 件も無ければ、keep 範囲へ入った証拠がないため FAIL になる。
+照合する (フォルダタイルの `key` は `dir::<path>` 形式)。analyzer は測定終了以前で最後の
+`nav.load_folder_begin` まで evidence の下限を戻し、それが無い log では session 先頭 (`t=0`) を
+下限にする。その下限から測定終了までに対象 `key` の thumbnail work が 1 件も無ければ、現在の
+場所で keep 範囲へ入った証拠がないため FAIL になる。測定より前に work が完了していても、
+最後のフォルダ load より後なら有効なので、連続シナリオのために対象場所を開き直す必要はない。
+根拠は perf report の `evidence_floor_t` / `evidence_floor_basis` に残る。
 対象タイルの work はあっても `idle_upgrade_enqueue` / `idle_upgrade_ineligible` が無い場合は、
 アイドル高画質化パスがそのタイルを評価していないことを warning で知らせる。
 

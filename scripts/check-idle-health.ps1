@@ -160,6 +160,54 @@ function Get-LiveProcess {
     }
 }
 
+function Get-MeasuredProcessInfo {
+    param([System.Diagnostics.Process]$Process)
+    $commandLine = $null
+    $path = [string]$Process.Path
+    try {
+        $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$($Process.Id)" -ErrorAction Stop
+        if ($null -ne $cim) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$cim.CommandLine)) {
+                $commandLine = [string]$cim.CommandLine
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$cim.ExecutablePath)) {
+                $path = [string]$cim.ExecutablePath
+            }
+        }
+    }
+    catch {
+        # A denied WMI query must not make the gate unrunnable. Without a command line,
+        # the analyzer is deliberately not allowed to treat an empty window as sleep.
+    }
+    return [pscustomobject]@{
+        CommandLine = $commandLine
+        Path = $path
+    }
+}
+
+function Test-InitialIndexScanSettled {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $false
+    }
+    $literal = '"initial_scan_settled"'
+    if (-not (Select-String -LiteralPath $Path -Pattern $literal -SimpleMatch -Quiet)) {
+        return $false
+    }
+    foreach ($match in (Select-String -LiteralPath $Path -Pattern $literal -SimpleMatch)) {
+        try {
+            $event = $match.Line | ConvertFrom-Json
+            if ($event.cat -eq "index" -and $event.kind -eq "initial_scan_settled") {
+                return $true
+            }
+        }
+        catch {
+            # The writer may still be appending the final JSONL line. Retry on the next poll.
+        }
+    }
+    return $false
+}
+
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 if ([string]::IsNullOrWhiteSpace($ThresholdPath)) {
     $ThresholdPath = Join-Path $PSScriptRoot "idle_health_thresholds.json"
@@ -170,6 +218,7 @@ if (-not (Test-Path -LiteralPath $ThresholdPath)) {
 $Thresholds = Get-Content -LiteralPath $ThresholdPath -Encoding UTF8 -Raw | ConvertFrom-Json
 $WarmupSeconds = [int]$Thresholds.warmup_seconds
 $MeasureSeconds = [int]$Thresholds.measure_seconds
+$IndexSettleWaitSeconds = [int]$Thresholds.index_settle_wait_seconds
 
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $OutputDirectory = Join-Path $RepoRoot "target\idle-health"
@@ -214,6 +263,39 @@ else {
     $Launched = $true
 }
 
+# Validate every attachment route at one boundary using evidence independent of the perf log.
+$MeasuredProcessInfo = Get-MeasuredProcessInfo -Process $Process
+$MeasuredPath = [string]$MeasuredProcessInfo.Path
+$RuntimeRoot = [System.IO.Path]::GetFullPath(
+    (Join-Path (Join-Path $env:APPDATA "mimageviewer") "runtime")
+)
+$RuntimePrefix = $RuntimeRoot.TrimEnd([System.IO.Path]::DirectorySeparatorChar) +
+    [System.IO.Path]::DirectorySeparatorChar
+if (-not [string]::IsNullOrWhiteSpace($MeasuredPath)) {
+    $MeasuredPath = [System.IO.Path]::GetFullPath($MeasuredPath)
+    if ($MeasuredPath.StartsWith(
+            $RuntimePrefix,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw ("launcher-extracted runtime copies cannot be measured: " + $MeasuredPath)
+    }
+}
+$IdentityEvidence = "path_only"
+if (-not [string]::IsNullOrWhiteSpace([string]$MeasuredProcessInfo.CommandLine)) {
+    if ($MeasuredProcessInfo.CommandLine.IndexOf(
+            "--perf-log",
+            [System.StringComparison]::OrdinalIgnoreCase
+        ) -lt 0) {
+        throw ("The process does not write a perf log and cannot be measured. " +
+            "Specify an instance started with --perf-log or omit -NoLaunch.")
+    }
+    $IdentityEvidence = "command_line"
+}
+else {
+    Write-Warning ("Process command line is unavailable; identity could not be verified. " +
+        "Empty measurement windows will not be accepted as sleep.")
+}
+
 # Wait for a perf log the measured process actually wrote. Existence alone is not
 # enough: APPDATA keeps the previous session's perf_events.jsonl, so on every run
 # after the first one a stale file is already there when Start-Process returns,
@@ -240,6 +322,26 @@ while ($true) {
     Start-Sleep -Milliseconds 200
 }
 
+# This waits for an explicit completion event, not for a time window to absorb index work.
+# The limit only stops waiting and reports uncertainty; it is not a PASS/FAIL threshold.
+$IndexScanWait = "timeout"
+$IndexSettleDeadline = (Get-Date).AddSeconds($IndexSettleWaitSeconds)
+Write-Host "Waiting for the initial index scans to settle (up to $IndexSettleWaitSeconds seconds)..."
+while ($true) {
+    if (Test-InitialIndexScanSettled -Path $PerfLog) {
+        $IndexScanWait = "settled"
+        break
+    }
+    if ((Get-Date) -ge $IndexSettleDeadline) {
+        break
+    }
+    $Process = Get-LiveProcess -Id $Process.Id
+    Start-Sleep -Milliseconds 500
+}
+if ($IndexScanWait -eq "timeout") {
+    Write-Warning "Initial index scan completion could not be confirmed; measuring anyway."
+}
+
 Write-Host ""
 Write-Host "=== idle health measurement ==="
 Write-Host "Scenario : $Scenario"
@@ -258,11 +360,9 @@ else {
 }
 Write-Host "Input during warmup is excluded; stop interacting when the measurement countdown begins."
 $Process = Get-LiveProcess -Id $Process.Id
-$EvidenceStartWall = Get-Date
-$EvidenceStartProcessElapsed = ($EvidenceStartWall - $Process.StartTime).TotalSeconds
 if ($Scenario -eq "video-pin-background") {
-    Write-Host "During setup, open/reload the target folder and ensure its tile enters the keep range."
-    Write-Host "The gate requires thumbnail work whose key contains TargetKey before measurement ends."
+    Write-Host "Ensure the target tile is in the current folder's keep range."
+    Write-Host "The gate accepts matching work after the session's last folder load and before measurement ends."
 }
 if (-not $SkipPrompt) {
     Read-Host "Press Enter when the scenario is ready" | Out-Null
@@ -320,12 +420,13 @@ $AnalyzerArgs = @(
     "--max-same-work", ([string][int]$Thresholds.max_same_work),
     "--max-input-events", ([string][int]$Thresholds.max_input_events),
     "--expected-pid", ([string][int]$Process.Id),
-    "--allow-sleeping-window",
     "--json-out", $PerfReportPath
 )
+if ($IdentityEvidence -eq "command_line") {
+    $AnalyzerArgs += "--allow-sleeping-window"
+}
 if ($Scenario -eq "video-pin-background") {
     $AnalyzerArgs += @(
-        "--evidence-start-t", (Format-Invariant -Value $EvidenceStartProcessElapsed),
         "--require-work-key", $TargetKey
     )
 }
@@ -404,10 +505,13 @@ $ProcessReport = [ordered]@{
     status = $Status
     scenario = $Scenario
     timestamp = $Timestamp
+    index_scan_wait = $IndexScanWait
     process = [ordered]@{
         id = $Process.Id
         launched_by_script = $Launched
-        path = $Process.Path
+        identity_evidence = $IdentityEvidence
+        command_line = $MeasuredProcessInfo.CommandLine
+        path = $MeasuredPath
     }
     window = [ordered]@{
         start_process_elapsed_secs = $StartProcessElapsed

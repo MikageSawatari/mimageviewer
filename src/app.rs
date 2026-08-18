@@ -12242,6 +12242,9 @@ pub struct App {
     /// `spawn_housekeeping` を 1 回呼んで false に倒す (Codex 指摘: VACUUM が
     /// supervisor の初回 scan と writer mutex を取り合うのを避ける)。
     pub(crate) housekeeping_armed: bool,
+    /// FTS / name index の全 initial scan が完了したことを perf log へ 1 回だけ出すための
+    /// one-shot。housekeeping は FTS だけを待つため、そちらの armed flag とは分ける。
+    pub(crate) initial_scan_settled_pending: bool,
 
     // ── VST3 プラグイン処理 (v0.9.0+) ──
     /// DspBridge — VST3 ホスト bridge プロセスとの対話を管理する singleton。
@@ -13837,6 +13840,7 @@ impl App {
             startup_done: false,
             play_test: None,
             housekeeping_armed: false,
+            initial_scan_settled_pending: true,
 
             #[cfg(windows)]
             dsp_bridge: crate::video::dsp::DspBridge::new(),
@@ -19038,23 +19042,69 @@ impl App {
             .unwrap_or_else(|| "VST3 プラグインを初期化中…".to_string())
     }
 
-    /// 起動 init の完了を確認する。完了していれば `indexer_manager` に注入し
-    /// `startup_init = None`、`startup_done = true` に遷移する。
-    /// `housekeeping_armed=true` の間、毎フレーム supervisor の idle 状態を見て、
-    /// 全 supervisor が初回 scan を完了して idle になったら一度だけ spawn する。
-    /// これにより VACUUM が初回 ingest と Mutex を取り合わないようにする。
+    fn take_initial_scan_settled_event(
+        pending: &mut bool,
+        startup_done: bool,
+        fts_all_idle: bool,
+        name_all_done: bool,
+    ) -> bool {
+        if *pending && startup_done && fts_all_idle && name_all_done {
+            *pending = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn take_housekeeping_spawn(armed: &mut bool, fts_all_idle: Option<bool>) -> bool {
+        if !*armed {
+            return false;
+        }
+        match fts_all_idle {
+            None => {
+                *armed = false;
+                false
+            }
+            Some(false) => false,
+            Some(true) => {
+                *armed = false;
+                true
+            }
+        }
+    }
+
+    /// FTS / name index の初回 scan 完了 perf event と、FTS housekeeping の one-shot を
+    /// それぞれ独立に進める。housekeeping の発火条件は従来どおり FTS だけを見る。
     pub(crate) fn poll_housekeeping_arm(&mut self) {
-        if !self.housekeeping_armed {
+        // 両方の one-shot が済んだら以降は何も読まない。この関数は毎フレーム走り、下の
+        // 2 つの述語は supervisor ごとに stats の Mutex を取る。返らずに評価を続けると、
+        // 静止中も恒久的にフレームあたりの作業が増える (= idle health が検出すべきもの)。
+        if !self.initial_scan_settled_pending && !self.housekeeping_armed {
             return;
         }
-        let Some(mgr) = self.indexer_manager.as_ref() else {
-            // indexer 初期化失敗時はそもそも housekeeping も走らせない
-            self.housekeeping_armed = false;
-            return;
-        };
-        if mgr.all_supervisors_idle() {
+
+        let fts_all_idle = self
+            .indexer_manager
+            .as_ref()
+            .map(crate::indexer_manager::IndexerManager::all_supervisors_idle);
+        let name_all_done = self
+            .name_index_supervisors
+            .values()
+            .all(|handle| handle.snapshot_stats().initial_scan_done);
+
+        if Self::take_initial_scan_settled_event(
+            &mut self.initial_scan_settled_pending,
+            self.startup_done,
+            fts_all_idle.unwrap_or(true),
+            name_all_done,
+        ) {
+            crate::perf::event("index", "initial_scan_settled", None, 0, &[]);
+        }
+
+        if Self::take_housekeeping_spawn(&mut self.housekeeping_armed, fts_all_idle)
+            && let Some(mgr) = self.indexer_manager.as_ref()
+        {
             mgr.spawn_housekeeping(&crate::data_dir::get());
-            self.housekeeping_armed = false;
         }
     }
 

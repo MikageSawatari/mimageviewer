@@ -1,6 +1,7 @@
 {
   "warmup_seconds": 5,
   "measure_seconds": 15,
+  "index_settle_wait_seconds": 180,
   "target_cpu_core_ratio": 0.05,
   "max_cpu_core_ratio": 0.1,
   "target_update_rate_per_sec": 2.0,

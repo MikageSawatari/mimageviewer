@@ -26,12 +26,21 @@
 
 ## 1. 利用者判断 (2026-08-19、確定)
 
-**音声モードでは動画補正スロットを読み込めないようにする。**
+**判定基準は「映像が見えているか」。** 見えていれば補正を反映できるので読み込める。
+見えていなければ反映先が無いので読み込まない。
 
-これは現状の native gate
-(`!self.video_audio_mode_hides_native_presenter_for(fs_idx)`、
-[native_video.rs:7141](../../src/app/native_video.rs:7141)) と一致する。したがって
-**native 側の挙動は変えない**。egui 側へ同じ述語を置けば両経路が揃う。
+- 通常の音声モード (音楽ビュー) — 画面はスペクトラム等で、映像は出ていない → **読み込まない**
+- VST GUI 表示中の音声モード — presenter を un-hide して**動画自体が出ている** → **読み込む**
+
+これはちょうど既存の述語
+`!self.video_audio_mode_hides_native_presenter_for(fs_idx)`
+([native_video.rs:7141](../../src/app/native_video.rs:7141)) が表している条件そのもの
+(= presenter が隠されていない = 映像が見えている)。したがって **native 側の挙動は変えず**、
+egui 側へ同じ述語を置けば両経路が揃い、かつ上の基準を満たす。
+
+**この述語を `video_audio_mode != Some(fs_idx)` へ「単純化」しないこと。** 音声モードか
+どうかではなく映像が見えているかが基準であり、VST サブケースで意味が変わる。
+その理由をコメントに残す。
 
 補足 (実装時に確認すること): `handle_video_input` の呼び出し自体が
 `is_video_fs && !fs_music_view_active` で gate されている
@@ -89,10 +98,8 @@ settings 更新 + `sync_native_video_grade` + save + toast まで持っている
 
 ## 3. やらないこと
 
-- **native 側の gate を変えない。** VST GUI 表示中の音声モード
-  (`video_audio_vst_active_for` が true) では `video_audio_mode_hides_native_presenter_for`
-  が false になり、slot の読み込みが通る。これは現状の挙動で、**今回は揃えるのが目的**
-  なので egui 側も同じにする。ここを締めるかどうかは別途利用者判断が要る (報告に書くこと)。
+- **native 側の gate を変えない。** VST GUI 表示中に slot を読み込めるのは仕様どおり
+  (§1 の基準: 映像が見えている)。締めない。
 - 保存 (`VideoAdjustSaveSlot`) にキー割り当てを足さない。
 - `KeyContext` の実行時モデルを一般化しない。
 - 時間窓で競合を吸収しない (憲法 §2 規則 5)。
@@ -106,15 +113,19 @@ settings 更新 + `sync_native_video_grade` + save + toast まで持っている
 1. **parity**: item = Video、fullscreen で <kbd>Ctrl</kbd>+<kbd>1</kbd> を egui へ入れて
    `handle_video_input` を通すと、slot 1 が読み込まれる (`settings.video_adjustments` が
    slot の内容になる)。**修正前に落ちることを確認して報告する** (ソース読解だけで終えない)。
-2. **音声モードでは読み込まない**: `video_audio_mode == Some(idx)` の状態で同じキーを
-   入れても `video_adjustments` が変わらないこと。
-3. **空スロット**: 未保存の slot を指すキーで `video_adjustments` が変わらないこと
+2. **映像が見えていないときは読み込まない**: `video_audio_mode == Some(idx)` かつ
+   VST 非表示 (= presenter が隠れている) の状態で同じキーを入れても
+   `video_adjustments` が変わらないこと。
+3. **映像が見えているときは読み込む**: `video_audio_mode == Some(idx)` でも
+   `video_audio_vst_active_for(idx)` が true (= presenter が出ている) なら読み込まれること。
+   2 と 3 の対で §1 の基準を固定する。**片方だけ書かない。**
+4. **空スロット**: 未保存の slot を指すキーで `video_adjustments` が変わらないこと
    (既存の空スロット分岐が効いていることの確認)。
-4. **所有権**: 上のガードが立っているとき (例: modal が開いている)、キーが**消費されずに
+5. **所有権**: 上のガードが立っているとき (例: modal が開いている)、キーが**消費されずに
    残る**こと。§4.2 と同じ回帰。
-5. **一覧の単一化**: `VIDEO_ADJUST_SLOT_ACTIONS` の要素数と、`KeyAction` 側の
+6. **一覧の単一化**: `VIDEO_ADJUST_SLOT_ACTIONS` の要素数と、`KeyAction` 側の
    `VideoAdjustSlot*` の総数が一致することを test で固定する (片方だけ増えたら落ちる)。
-6. mutation: 1, 2, 4 のガード / mapping を削除または反転して**実際に落ちることを確認**し、
+7. mutation: 1, 2, 3, 5 のガード / mapping を削除または反転して**実際に落ちることを確認**し、
    結果を報告に含める (「落ちるはず」ではなく実行結果)。
 
 ## 5. 凍結ルール
@@ -143,5 +154,4 @@ cargo check -p mimageviewer --bin mimageviewer-core
 ```
 
 commit / stage はしない。ブランチは `master`。
-報告には 4.1 の修正前 fail、mutation 結果、変更ファイル一覧、§3 の VST サブケースの
-確認結果を含める。
+報告には 4.1 の修正前 fail、mutation 結果、変更ファイル一覧を含める。

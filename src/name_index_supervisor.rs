@@ -307,6 +307,22 @@ fn run_full_scan(
             s.initial_entries_written = summary.entries_written;
         }
     }
+    if is_initial {
+        crate::perf::event(
+            "index",
+            "initial_scan_done",
+            None,
+            0,
+            &[
+                ("index_kind", serde_json::Value::from("name")),
+                (
+                    "favorite_id",
+                    serde_json::Value::from(favorite_id.to_string()),
+                ),
+                ("duration_ms", serde_json::Value::from(dur_ms)),
+            ],
+        );
+    }
     progress.clear();
 }
 

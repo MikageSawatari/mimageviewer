@@ -5,6 +5,58 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 #[test]
+fn initial_scan_settled_gate_is_vacuously_ready_without_supervisors_and_emits_once() {
+    let fts_all_idle = std::iter::empty::<bool>().all(|idle| idle);
+    let name_all_done = std::iter::empty::<bool>().all(|done| done);
+    let mut pending = true;
+
+    assert!(App::take_initial_scan_settled_event(
+        &mut pending,
+        true,
+        fts_all_idle,
+        name_all_done,
+    ));
+    assert!(!App::take_initial_scan_settled_event(
+        &mut pending,
+        true,
+        fts_all_idle,
+        name_all_done,
+    ));
+}
+
+#[test]
+fn initial_scan_settled_gate_waits_for_both_index_kinds() {
+    let mut pending = true;
+
+    assert!(!App::take_initial_scan_settled_event(
+        &mut pending,
+        true,
+        true,
+        false,
+    ));
+    assert!(pending);
+    assert!(App::take_initial_scan_settled_event(
+        &mut pending,
+        true,
+        true,
+        true,
+    ));
+}
+
+#[test]
+fn housekeeping_gate_remains_fts_only() {
+    let mut armed = true;
+    assert!(!App::take_housekeeping_spawn(&mut armed, Some(false)));
+    assert!(armed);
+    assert!(App::take_housekeeping_spawn(&mut armed, Some(true)));
+    assert!(!armed);
+
+    let mut failed_init_armed = true;
+    assert!(!App::take_housekeeping_spawn(&mut failed_init_armed, None,));
+    assert!(!failed_init_armed);
+}
+
+#[test]
 /// The overflow panel is a menu, and a menu holds nothing.
 ///
 /// It shipped classified with dialogs, which meant it held every key while open - including the

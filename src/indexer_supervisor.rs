@@ -326,7 +326,28 @@ fn supervisor_loop(
         &progress,
     );
     mark_activity(&stats);
-    stats.lock().unwrap().initial_scan_done = true;
+    let initial_scan_duration_ms = {
+        let mut stats = stats.lock().unwrap();
+        stats.initial_scan_done = true;
+        stats.initial_scan_duration_ms.unwrap_or_default()
+    };
+    crate::perf::event(
+        "index",
+        "initial_scan_done",
+        None,
+        0,
+        &[
+            ("index_kind", serde_json::Value::from("fts")),
+            (
+                "favorite_id",
+                serde_json::Value::from(favorite_id.to_string()),
+            ),
+            (
+                "duration_ms",
+                serde_json::Value::from(initial_scan_duration_ms),
+            ),
+        ],
+    );
     // スキャン完了後は "今の作業" を消す (UI が ⏳→✅ に切り替わるタイミング)
     progress.clear();
 

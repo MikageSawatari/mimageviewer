@@ -75,6 +75,15 @@ def thumb(t: float, kind: str, key: str) -> dict:
     }
 
 
+def load_folder_begin(t: float, path: str = "C:/books") -> dict:
+    return {
+        "t": t,
+        "cat": "nav",
+        "kind": "load_folder_begin",
+        "path": path,
+    }
+
+
 def page_turn(
     t: float,
     idx: int,
@@ -903,7 +912,9 @@ class IdleHealthTests(unittest.TestCase):
         self.assertIn("--test-script", source)
         self.assertNotIn("MivSmokeInput", source)
 
-    def test_empty_window_fails_without_explicit_same_session_evidence(self) -> None:
+    def test_empty_window_requires_external_sampler_confirmation_not_pid_alone(
+        self,
+    ) -> None:
         events = [session(42), frame(1.0, 1), tail(1.0, 1)]
 
         report = analyze_idle_health(events, 10.0, 25.0)
@@ -911,6 +922,14 @@ class IdleHealthTests(unittest.TestCase):
         self.assertEqual(report["status"], "fail")
         self.assertEqual(report["metrics"]["frames"], 0)
         self.assertEqual(report["metrics"]["update_rate_per_sec"], 0.0)
+
+        pid_only_report = analyze_idle_health(
+            events,
+            10.0,
+            25.0,
+            expected_pid=42,
+        )
+        self.assertEqual(pid_only_report["status"], "fail")
 
         report = analyze_idle_health(
             events,
@@ -943,7 +962,6 @@ class IdleHealthTests(unittest.TestCase):
             1.0,
             10.0,
             expected_pid=42,
-            evidence_start_t=0.5,
             require_work_key="C:/books/video-pin",
         )
 
@@ -955,15 +973,23 @@ class IdleHealthTests(unittest.TestCase):
         )
         self.assertEqual(report["setup_evidence"]["first_match_t"], 0.75)
         self.assertEqual(report["setup_evidence"]["last_match_t"], 0.75)
+        self.assertEqual(report["setup_evidence"]["evidence_floor_t"], 0.0)
+        self.assertEqual(
+            report["setup_evidence"]["evidence_floor_basis"],
+            "session_start",
+        )
         self.assertEqual(report["warnings"], [])
 
-    def test_video_pin_scenario_rejects_other_or_out_of_window_work(self) -> None:
+    def test_video_pin_scenario_rejects_target_work_before_last_folder_load(
+        self,
+    ) -> None:
         events = [
             session(42),
             frame(1.0, 1),
             tail(1.0, 1),
             thumb(0.25, "idle_upgrade_ineligible", "dir::c:/books/video-pin"),
             thumb(0.75, "idle_upgrade_enqueue", "dir::c:/books/other"),
+            load_folder_begin(0.5),
         ]
 
         report = analyze_idle_health(
@@ -971,7 +997,6 @@ class IdleHealthTests(unittest.TestCase):
             1.0,
             10.0,
             expected_pid=42,
-            evidence_start_t=0.5,
             require_work_key="C:/books/video-pin",
         )
 
@@ -980,6 +1005,35 @@ class IdleHealthTests(unittest.TestCase):
         self.assertTrue(
             any("C:/books/video-pin" in item for item in report["failures"])
         )
+        self.assertEqual(report["setup_evidence"]["evidence_floor_t"], 0.5)
+        self.assertEqual(
+            report["setup_evidence"]["evidence_floor_basis"],
+            "last_load_folder_begin",
+        )
+
+    def test_video_pin_work_after_last_folder_load_passes_outside_measurement_window(
+        self,
+    ) -> None:
+        events = [
+            session(42),
+            load_folder_begin(2.0),
+            thumb(3.0, "idle_upgrade_ineligible", "dir::c:/books/video-pin"),
+            frame(5.0, 1),
+            tail(5.0, 1),
+        ]
+
+        report = analyze_idle_health(
+            events,
+            5.0,
+            10.0,
+            expected_pid=42,
+            require_work_key="C:/books/video-pin",
+        )
+
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(report["setup_evidence"]["matched_events"], 1)
+        self.assertEqual(report["setup_evidence"]["first_match_t"], 3.0)
+        self.assertEqual(report["setup_evidence"]["evidence_floor_t"], 2.0)
 
     def test_video_pin_scenario_warns_when_idle_upgrade_did_not_evaluate_tile(
         self,
@@ -996,7 +1050,6 @@ class IdleHealthTests(unittest.TestCase):
             1.0,
             10.0,
             expected_pid=42,
-            evidence_start_t=0.5,
             require_work_key="C:/books/video-pin",
         )
 
@@ -1013,7 +1066,6 @@ class IdleHealthTests(unittest.TestCase):
             1.0,
             10.0,
             expected_pid=42,
-            evidence_start_t=0.5,
             require_work_key=None,
         )
 

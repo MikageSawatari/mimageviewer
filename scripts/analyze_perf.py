@@ -1756,7 +1756,6 @@ def analyze_idle_health(
     max_input_events: int = 0,
     expected_pid: int | None = None,
     allow_sleeping_window: bool = False,
-    evidence_start_t: float | None = None,
     require_work_key: str | None = None,
 ) -> dict:
     """静止測定区間を解析し、JSON 化可能な report を返す。
@@ -1860,14 +1859,28 @@ def analyze_idle_health(
 
     failures: list[str] = []
     warnings: list[str] = []
-    evidence_start = start_t if evidence_start_t is None else evidence_start_t
+    load_folder_events = [
+        e
+        for e in events
+        if float(e.get("t", 0.0)) <= end_t
+        and e.get("cat") == "nav"
+        and e.get("kind") == "load_folder_begin"
+    ]
+    if load_folder_events:
+        evidence_floor_t = max(
+            float(event.get("t", 0.0)) for event in load_folder_events
+        )
+        evidence_floor_basis = "last_load_folder_begin"
+    else:
+        evidence_floor_t = 0.0
+        evidence_floor_basis = "session_start"
     matched_evidence: list[dict] = []
     if require_work_key is not None:
         required_key = require_work_key.casefold()
         matched_evidence = [
             e
             for e in events
-            if evidence_start <= float(e.get("t", 0.0)) <= end_t
+            if evidence_floor_t <= float(e.get("t", 0.0)) <= end_t
             and e.get("cat") == "thumb"
             and required_key in str(e.get("key") or "").casefold()
         ]
@@ -1906,13 +1919,13 @@ def analyze_idle_health(
         else:
             warnings.append(
                 "測定区間は完全に sleep しており perf event は 0 件です "
-                "(同一 session PID は確認済み)"
+                "(外部 sampler が同一プロセスを確認済みとして渡した測定です)"
             )
     if require_work_key is not None:
         if not matched_evidence:
             failures.append(
                 f'対象タイル (key に "{require_work_key}" を含む) の thumbnail work が'
-                "準備・測定区間に無く、keep 範囲へ入った証拠がありません"
+                "evidence 下限から測定終了までに無く、keep 範囲へ入った証拠がありません"
             )
         elif not any(
             event.get("kind")
@@ -1988,11 +2001,12 @@ def analyze_idle_health(
             "max_input_events": max_input_events,
             "expected_pid": expected_pid,
             "allow_sleeping_window": allow_sleeping_window,
-            "evidence_start_t": evidence_start_t,
             "require_work_key": require_work_key,
         },
         "setup_evidence": {
             "require_work_key": require_work_key,
+            "evidence_floor_t": evidence_floor_t,
+            "evidence_floor_basis": evidence_floor_basis,
             "matched_events": len(matched_evidence),
             "matched_kinds": dict(sorted(matched_kinds.items())),
             "first_match_t": (
@@ -2029,7 +2043,6 @@ def cmd_idle_health(
     json_out: Path | None,
     expected_pid: int | None = None,
     allow_sleeping_window: bool = False,
-    evidence_start_t: float | None = None,
     require_work_key: str | None = None,
 ) -> int:
     if not events:
@@ -2051,7 +2064,6 @@ def cmd_idle_health(
             max_input_events=max_input_events,
             expected_pid=expected_pid,
             allow_sleeping_window=allow_sleeping_window,
-            evidence_start_t=evidence_start_t,
             require_work_key=require_work_key,
         )
     except ValueError as error:
@@ -2085,6 +2097,8 @@ def cmd_idle_health(
         kinds = ", ".join(f"{k}={v}" for k, v in setup["matched_kinds"].items())
         print(
             f"setup evidence: key={fmt_key(setup['require_work_key'])} "
+            f"floor={setup['evidence_floor_t']:.3f} "
+            f"basis={setup['evidence_floor_basis']} "
             f"matched={setup['matched_events']}"
             + (f" ({kinds})" if kinds else "")
         )
@@ -2912,12 +2926,14 @@ def main() -> None:
     p_idle.add_argument("--max-input-events", type=int, default=0)
     p_idle.add_argument("--expected-pid", type=int, default=None)
     p_idle.add_argument("--allow-sleeping-window", action="store_true")
-    p_idle.add_argument("--evidence-start-t", type=float, default=None)
     p_idle.add_argument(
         "--require-work-key",
         type=str,
         default=None,
-        help="準備開始から測定終了までに key が指定文字列を含む thumbnail work を要求",
+        help=(
+            "測定終了以前の最後の nav.load_folder_begin 以降に、"
+            "key が指定文字列を含む thumbnail work を要求"
+        ),
     )
     p_idle.add_argument("--json-out", type=Path, default=None)
     p_avd = subs.add_parser("av_drift")
@@ -2996,7 +3012,6 @@ def main() -> None:
                 args.json_out,
                 args.expected_pid,
                 args.allow_sleeping_window,
-                args.evidence_start_t,
                 args.require_work_key,
             )
         )
