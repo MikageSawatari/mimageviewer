@@ -1302,6 +1302,26 @@
 - 正本: [codex-original-preview-readiness-brief.md](briefs/codex-original-preview-readiness-brief.md)。
   関連: [display-pipeline.md](display-pipeline.md) §2.5.4。
 
+### 1.92 別ウィンドウの動画再生中に外部アプリから戻ると Z だけ効かない
+
+- 出典: 利用者報告 (2026-08-18)。**v3.1.1 の変更が原因ではない**。利用者が以前のバージョンでも
+  再現することを確認済み。
+- 症状: 別ウィンドウで**動画を再生している**状態で、他アプリからそのウィンドウをクリックして戻すと
+  <kbd>Z</kbd> (`VideoToggleAudioMode`) だけが無反応。P やカーソルキーは効く。上部 HUD から
+  マウスで音声モードへ切り替えると、以降は <kbd>Z</kbd> も効く。**音声モード表示中に戻した場合は
+  起きない**。
+- 分かっていること: 失敗する経路は native presenter の `handle_native_video_key`。egui 側の音楽ビュー
+  経路 (§4.2 で直した側) ではない。Z の分岐は P / カーソルと同じ match の中にあり、表面上の特別扱いは
+  無い。ただし到達先の `enter_video_audio_mode` にだけ「音声トラック無し / detached / 切り替え中は
+  弾く」という追加条件がある。
+- **今のログでは切り分けられない**: 「キーが native 側へ届いていない」のか「届いたが match しない」のか
+  「match したが `enter_video_audio_mode` が弾いた」のかを区別する記録が無い。`enter request
+  source=native_key` は成功時にしか出ない。**最初の一手は観測**で、native key の入口に無条件の記録を
+  置き、外部アプリから戻った直後の 1 打鍵を追う。抑制条件を調査対象の信号に依存させないこと
+  (keymap-spec.md の原則)。
+- detached viewer のリワーク凍結対象領域。症状パッチを入れず、原因に対応付けてから直す。
+- 利用者向けページには掲載済み: [known-issues.html](../htdocs/mimageviewer/manual/known-issues.html)。
+
 ### 1.90 アニメーション先読みの全フレーム展開で archive 閲覧が停止する — 利用者報告 >>241
 
 - **実機確認 (2026-08-18)**: `animeted.zip` 内の画像がアニメーションすることを確認。一覧から Enter で開いた直後も右上の展開中表示が出る。
