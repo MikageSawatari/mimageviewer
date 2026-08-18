@@ -991,6 +991,8 @@
   consume + no-op 理由、Ring 経路の拒否 + feedback を handler-level test で固定した。
 - 原因調査用の無制限 `stage=before_handle_fs_key_input` probe は撤去した。既存の rate-limit
   付き `exit key diagnostic` は残す。
+- **実機確認 (2026-08-18)**: 動画 → Z → 音声モード → Z → 動画の往復、音声ファイル単体の
+  no-op、画像の Z ホールドによる全画面ズーム、連結表示の no-op 理由表示をすべて確認。
 - 状態: **完了**。P2 close。
 
 ### 4.1 Shift / Alt + ホイールのカスタマイズ再設計
@@ -1351,6 +1353,12 @@
   `original_preview_active` と `fs_page_turn_input_held` は同じ sample を共有し、時間窓と先読み窓変更は
   追加しない。マウス / リング由来のページ送りと元画像要求の矛盾を防ぐため、`original_preview`
   blocker 自体は残す。
+- **実機確認 (2026-08-18)**: 修正後の perf log で、右 Ctrl ホールド中の `pass_through` が
+  **0 件 → 130 件** (materialized 31)。左 Ctrl は 46 / 9 で、両者の比率がほぼ一致した。
+  auto-repeat がページを進めた割合は戻り方向で **17% → 72%** (左 Ctrl は 69%)。
+  利用者確認でも「速さも元表示も OK」。押しっぱなし中の一瞬の元画像は出ない。
+  矢印を離して右 Ctrl だけ保持したときは従来どおり元画像へ戻る
+  (`right_ctrl_held=true` / `original_preview_active=true` が 1,452 frame 記録されている)。
 - 関連: [display-pipeline.md](display-pipeline.md) §§2.3, 2.5.4、
   [keymap-spec.md](keymap-spec.md)「画像フルスクリーン」。
 
