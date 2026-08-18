@@ -906,6 +906,12 @@
 - 回帰確認: Folder / ZIP / PDF / 直読み RAR / 変換対象アーカイブ / Image / Video、
   Ctrl・Shift 選択、native D&D、タグバッジ、touch tap。
 - 規模 / 優先度: 小〜中 / P2。利用者へ「本日リリース予定版の次で対応」と回答済み。
+- **完了 (2026-08-18):** クリック前の `selected` snapshot と既存の
+  `double_clicked()` を 1 つの activation 述語に合流させた。item 種別ごとの open
+  分岐は複製していない。純関数の全条件、初回 / 再クリック、Ctrl / Shift、
+  チェック方式、ダブルクリック、ダイアログ、touch-derived pointer の handler-level
+  回帰テストを追加して閉じた。Shift 範囲 / Ctrl 複数選択の現在セルを通常クリックした場合は
+  open せず単一選択へ畳み、Ctrl で作った単一選択の再クリックは open することも固定した。
 
 ### 2.6 ZIP / RAR のダブルクリックが時々無反応 — 未再現、専用スレ >>246, >>249-250
 
