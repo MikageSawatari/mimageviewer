@@ -42,42 +42,45 @@ cd "$(dirname "$0")/.."
 # `autobuild-*` release にあるコミット hash 込みの版付き資産だけを採用する。
 echo "Querying $REPO for versioned asset matching $ASSET_GLOB ..."
 release_tags=$(gh release list --repo "$REPO" --limit 20 --json tagName --jq '.[].tagName')
+
+# 新しい tag から順に見て、**該当アセットを実際に持っている**最初の tag を採用する。
+# 最新 tag だけを見ると、BtbN が次のメジャーへ移って n7.1 資産を出さなくなった日に、
+# 固定中のバージョンがまだ古い tag に存在していても取得できなくなる (2026-08-18 に CI が
+# これで停止した)。tag の新しさではなく「欲しい資産があるか」で選ぶ。
 latest_tag=""
-while IFS= read -r candidate; do
-    case "$candidate" in
-        $RELEASE_TAG_GLOB)
-            latest_tag="$candidate"
-            break
-            ;;
+matched=""
+searched=0
+while IFS= read -r candidate_tag; do
+    case "$candidate_tag" in
+        $RELEASE_TAG_GLOB) ;;
+        *) continue ;;
     esac
+    searched=$((searched + 1))
+    # 該当アセット名を shell glob で解決し、rolling `-latest-` は明示的に拒否する。
+    assets=$(gh release view "$candidate_tag" --repo "$REPO" --json assets --jq '.assets[].name')
+    while IFS= read -r candidate; do
+        case "$candidate" in
+            $ASSET_GLOB)
+                if [[ "$candidate" == *-latest-* ]]; then
+                    continue
+                fi
+                matched="$candidate"
+                break
+                ;;
+        esac
+    done <<< "$assets"
+    if [ -n "$matched" ]; then
+        latest_tag="$candidate_tag"
+        break
+    fi
 done <<< "$release_tags"
 
 if [ -z "$latest_tag" ]; then
-    echo "Failed to find a versioned BtbN release matching $RELEASE_TAG_GLOB." >&2
+    echo "No versioned asset matching $ASSET_GLOB in the newest $searched $RELEASE_TAG_GLOB releases." >&2
+    echo "Try a different ASSET_GLOB (e.g. ffmpeg-n8.0*-win64-lgpl-shared*.zip)." >&2
     exit 1
 fi
-echo "Latest versioned tag: $latest_tag"
-
-# 該当アセット名を shell glob で解決し、rolling `-latest-` は明示的に拒否する。
-assets=$(gh release view "$latest_tag" --repo "$REPO" --json assets --jq '.assets[].name')
-matched=""
-while IFS= read -r candidate; do
-    case "$candidate" in
-        $ASSET_GLOB)
-            if [[ "$candidate" == *-latest-* ]]; then
-                continue
-            fi
-            matched="$candidate"
-            break
-            ;;
-    esac
-done <<< "$assets"
-
-if [ -z "$matched" ]; then
-    echo "No versioned asset matching $ASSET_GLOB in $latest_tag." >&2
-    echo "Try a different ASSET_GLOB (e.g. ffmpeg-n7.0*-win64-lgpl-shared*.zip)." >&2
-    exit 1
-fi
+echo "Newest versioned tag carrying the asset: $latest_tag"
 if [[ "$matched" == *-latest-* ]]; then
     echo "Refusing rolling BtbN asset: $matched" >&2
     exit 1
