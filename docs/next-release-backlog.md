@@ -1458,6 +1458,27 @@
   置き、外部アプリから戻った直後の 1 打鍵を追う。抑制条件を調査対象の信号に依存させないこと
   (keymap-spec.md の原則)。
 - detached viewer のリワーク凍結対象領域。症状パッチを入れず、原因に対応付けてから直す。
+- **観測結果 (2026-08-18、計装 `b9448ca8` を入れて 1 回再現)**:
+  - 効かなかった Z は `[fs-key] source=fullscreen keys=Z:down` として **egui 側**に届いていた。
+  - `[native-video-key]` はセッション全体で **1 行だけ** (終了時の Escape)。**Z も P もカーソルも
+    native の `handle_native_video_key_event` には届いていない。**
+  - native 行の `foreground_hwnd=0x3BC25CC` != `presenter_hwnd=0x7982452`。detached ではホスト
+    (egui) 側がフォーカスを持ち、presenter は子として内側にいる。
+  - HUD 経由の入場は `source=native_output_event` として記録され、音声モードからの Z は
+    egui の音楽ビュー分岐が処理していた (`exit fs_idx=9`)。
+- **原因**: キーが奪われているのではなく、**`VideoToggleAudioMode` の動画→音声方向が egui 入力
+  経路に持ち主を持たない**。この action は 2 方向 × 2 経路あるのに、ハンドラが片方ずつしかない。
+
+  | | native 経路 | egui 経路 |
+  | --- | --- | --- |
+  | 動画 → 音声 | あり (`handle_native_video_key_event`) | **無い** |
+  | 音声 → 動画 | — | あり ([ui_fullscreen.rs](../src/ui_fullscreen.rs) の音楽ビュー分岐) |
+
+  報告の 3 点がこれで説明できる。P とカーソルが効くのは egui 側にハンドラがあるから。Z だけ
+  効かないのは誰も拾わないから。音声モードなら起きないのは presenter が居らず全て egui を通り、
+  音声→動画のハンドラは存在するから。**§4.2 と同じ形の鏡像**。
+- なお §4.2 の修正 (画像側が Video / Audio 上で Z を消費しないようにした) は本件の**前提**でもある。
+  あれが無いと、egui 経路に持ち主を足しても `FsZoomMode` が先に edge を消費してしまう。
 - 利用者向けページには掲載済み: [known-issues.html](../htdocs/mimageviewer/manual/known-issues.html)。
 
 ### 1.90 アニメーション先読みの全フレーム展開で archive 閲覧が停止する — 利用者報告 >>241
@@ -1562,7 +1583,8 @@
 ### 5.4 idle health の video-pin evidence 窓が狭い
 
 - **v3.1.1 (2026-08-18) の実測。3 回走らせて 3 回とも FAIL したが、いずれも製品側ではない。**
-  1. **接続先を取り違える**: `-NoLaunch` が `%APPDATA%\mimagevieweruntime.1.1\` の core
+  1. **接続先を取り違える**: `-NoLaunch` が `%APPDATA%\mimageviewer
+untime.1.1\` の core
      (ランチャー版が展開した別 instance、`--perf-log` 無し) に接続した。perf を 1 行も書かない
      instance なのに「同一 session PID は確認済み」と表示し、`events=0` を完全 sleep として
      扱った。**perf log growth が 0 のまま measured window を評価したら、sleep ではなく
