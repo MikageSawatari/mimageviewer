@@ -182,7 +182,8 @@ rehydrate 側。`clear_page_edit_state()` 単独は上記 idx-keyed セットの
 
 動画補正は画像用とは独立した 10 個の名前付きスロット (`Settings::video_preset_slots`) を持つ。
 native presenter の画像補正パネル末尾に読込行と保存行を表示し、読込は空スロットを disabled にする。
-`Ctrl+1〜9` / `Ctrl+0` は動画表示中だけ動画補正スロットを読み込み、音声モード中は発火しない。
+`Ctrl+1〜9` / `Ctrl+0` は映像が見えている間だけ動画補正スロットを読み込む。presenter が
+隠れた通常の音声モードでは発火しないが、VST GUI 表示で presenter が再表示されている間は発火する。
 保存はパネルのボタンだけから行う。読み込んだ明るさ・コントラスト・ガンマ・彩度・色温度・
 レベル補正・Creative LUT は viewer-wide な `Settings::video_adjustments` を置き換え、
 再生中の presenter へ即時同期する。可視 presenter が一時停止中なら現在の frame を 1 回だけ

@@ -92,8 +92,10 @@ keymap 対象にする。`Esc` / 修飾なし矢印ナビゲーション、Ctrl+
 消して音声だけ聴くモードは、どちらも `[FsVideo]` のキーをそのまま流用する。映像 ↔ 音声の切り替えは
 `VideoToggleAudioMode` (既定 <kbd>Z</kbd>)。`VideoLoop` / `VideoBookmark` / `VideoMarkerPrev` /
 `VideoMarkerNext` は音楽ビューでは音楽のループ / ブックマーク / ブックマーク移動へ翻訳される。
-動画専用の `VideoTileMode` / `VideoCapture` / `VideoFrameStep` / `VideoPin` / `VideoAdjustSlot1..10` は音楽ビューでは無効
-(キャプチャパレット / コマ送り UI を出さない)。`[Rating]` グループは静止画・動画と同じく
+動画専用の `VideoTileMode` / `VideoCapture` / `VideoFrameStep` / `VideoPin` は音楽ビューでは無効
+(キャプチャパレット / コマ送り UI を出さない)。`VideoAdjustSlot1..10` も映像が隠れている通常の
+音声モードでは無効だが、VST GUI 表示で presenter が再表示され映像が見えている間は有効。
+`[Rating]` グループは静止画・動画と同じく
 音楽ビューでも使える。左右パネル表示モードの <kbd>I</kbd> / <kbd>Tab</kbd> は 3 面で同じ
 `FsToggleMetadata` を使い、native 動画も effective chord を App 側へ転送する。
 
@@ -112,6 +114,12 @@ no-op 理由または状態リセットを行う。
 `Z:down` を報告した frame も候補にし、さらに音声モード中は理由や Z 観測の有無に関係なく
 最低 1 秒に 1 行を出す。停止中に通常 repaint が無くても heartbeat 時刻の repaint を予約する。
 調査中の信号が全て false でも診断自体が黙らないことを不変条件とする。
+
+動画フルスクリーンの `FsVideo` action は、native presenter がキーを所有する経路と、
+focus handoff や detached 窓へ他アプリから戻った直後などに egui がキーを受ける経路の両方へ
+届き得る。したがって `VideoToggleAudioMode` と `VideoAdjustSlot1..10` のように両面で成立する
+操作は native / egui の双方に mapping を持たせる。slot action の順序付き一覧は
+`VIDEO_ADJUST_SLOT_ACTIONS` を唯一の正本とし、片方の経路だけへ追加しない。
 
 Windows の egui 経路では、KeySlot でショートカットを所有した押下を egui event queue からも
 同時に除去する。ただし egui 0.33 は UI 実行前の `begin_pass` で <kbd>Tab</kbd> から focus
@@ -612,7 +620,7 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 | <kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 1 秒シーク (細かい) | Action: `VideoSeekBackSmall` / `VideoSeekForwardSmall` |
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 30 秒シーク (大きい) | Action: `VideoSeekBackLarge` / `VideoSeekForwardLarge` |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 1 フレーム戻る / 進む | Action: `VideoFrameStepBack` / `VideoFrameStepForward` |
-| <kbd>Ctrl</kbd>+<kbd>1</kbd>〜<kbd>9</kbd> / <kbd>Ctrl</kbd>+<kbd>0</kbd> | 動画補正保存スロット 1〜10 を読み込む | Action: `VideoAdjustSlot1..10`。通常数字とテンキー数字の両方を既定割り当てにし、音声モードでは無効 |
+| <kbd>Ctrl</kbd>+<kbd>1</kbd>〜<kbd>9</kbd> / <kbd>Ctrl</kbd>+<kbd>0</kbd> | 動画補正保存スロット 1〜10 を読み込む | Action: `VideoAdjustSlot1..10`。通常数字とテンキー数字の両方を既定割り当てにする。映像が隠れた通常の音声モードでは無効、VST GUI で映像が見えている間は有効 |
 | <kbd>←</kbd> / <kbd>→</kbd> (タイル中) | タイルカーソルを前 / 次へ移動 | seek しない。現在位置より後の最初のタイルを時刻ラベル込みで強調表示 |
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd> (タイル中) | タイルカーソルを 1 行分移動 | 列数分だけ前 / 次へ移動 |
 | <kbd>Space</kbd> / <kbd>Enter</kbd> (タイル中) | タイルカーソル位置から再生 | S / Esc で閉じた場合は再生位置を変更しない |

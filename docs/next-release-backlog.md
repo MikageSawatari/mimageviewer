@@ -1570,6 +1570,20 @@
   load/save 修飾子、repeat、context-menu / IME / modal guard、画像側との ownership を固定してから
   action owner を決める。
 - 今回は `VideoToggleAudioMode` だけを対象とし、本項の修正は行わない。
+- **完了 (2026-08-19):** `handle_video_input` を直接呼ぶ pre-fix test で、可視動画へ
+  <kbd>Ctrl</kbd>+<kbd>1</kbd> を入力しても保存済み `brightness=42.0` が読み込まれず
+  `0.0` のままになる failure を確認した。`VIDEO_ADJUST_SLOT_ACTIONS` を
+  `keymap.rs` の単一の順序付き一覧とし、native / egui / keymap test の 3 箇所を同じ一覧へ
+  合流した。egui mapping は既存 `VideoToggleAudioMode` の直後に置き、context menu /
+  keyboard focus / modal / normalize scan と
+  `!video_audio_mode_hides_native_presenter_for(fs_idx)` を consume 前に評価する。
+  通常の hidden 音声モードでは読込せず、VST GUI で presenter が見えている音声モードでは
+  読み込む。保存操作は従来どおり HUD パネルだけ。
+- handler-level regression は通常動画 parity、hidden 音声モード、VST-visible 音声モード、
+  空 slot、modal 未消費の 5 本と、action 一覧完全性を追加。mutation は mapping 削除、
+  可視性 guard 削除、`video_audio_mode != Some(fs_idx)` への誤単純化、modal guard 削除の
+  4 種すべてで対応 test が exit 101 になり、復元後は全件通過した。key 発火時は typed
+  `VideoAdjustSlotInputSource` により `egui_key` / `native_key` と slot を 1 行記録する。
 
 ### 1.90 アニメーション先読みの全フレーム展開で archive 閲覧が停止する — 利用者報告 >>241
 

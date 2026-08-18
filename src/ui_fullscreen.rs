@@ -41,12 +41,12 @@ use crate::fs_animation::{AnimationPlayback, FsCacheEntry};
 use crate::gpu_lanczos::FullscreenPaintResource;
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::items_generation_cache::ItemsGenerationMap;
-#[cfg(windows)]
-use crate::keymap::DiagnosticChordPressSnapshot;
 use crate::keymap::{
     Chord, CommandScope, FS_IMAGE_ACTIVE_SCOPES, FS_VIDEO_ACTIVE_SCOPES, KeyAction, KeyName,
     KeyTrigger, Keymap, ModKind, command_catalog, modifier_held_via_os,
 };
+#[cfg(windows)]
+use crate::keymap::{DiagnosticChordPressSnapshot, VIDEO_ADJUST_SLOT_ACTIONS};
 use crate::pdf_loader::PdfPageContentType;
 use crate::settings::{
     FULLSCREEN_NAVIGATOR_SIZE_MAX, FULLSCREEN_NAVIGATOR_SIZE_MIN, FullscreenFitMode,
@@ -33100,6 +33100,32 @@ impl App {
         {
             self.toggle_video_audio_mode(ctx, fs_idx, crate::app::VideoAudioEnterSource::EguiKey);
             return;
+        }
+
+        #[cfg(windows)]
+        // handle_video_input is currently called only outside the ordinary music view, but keep
+        // the visibility rule explicit so a future caller cannot make hidden audio mode consume
+        // an FsVideo slot key. Do not simplify this to video_audio_mode != Some(fs_idx): the VST
+        // host intentionally un-hides the presenter, so its video is visible and may be adjusted
+        // even while audio mode remains active. All ownership guards must run before the action
+        // is consumed.
+        if self.fs_context_menu_idx.is_none()
+            && !ctx.wants_keyboard_input()
+            && !self.any_modal_dialog_open_for_fullscreen_keys()
+            && !self.normalize_scan_is_modal_for_current_player(fs_idx)
+            && !self.video_audio_mode_hides_native_presenter_for(fs_idx)
+        {
+            if let Some(slot_idx) = VIDEO_ADJUST_SLOT_ACTIONS
+                .iter()
+                .position(|action| self.keymap.consume_action_no_repeat(ctx, *action))
+            {
+                self.dispatch_video_adjust_slot_key(
+                    ctx,
+                    slot_idx,
+                    crate::app::VideoAdjustSlotInputSource::EguiKey,
+                );
+                return;
+            }
         }
 
         // F11: ウィンドウ / 全画面 切り替え (HUD トグルボタンと同じ動作)。

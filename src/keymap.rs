@@ -1789,6 +1789,23 @@ pub enum KeyAction {
     LaSpacePan,
 }
 
+/// Video adjustment-slot load actions in slot-index order.
+///
+/// The array length is the number of slots, and element slot_idx is the
+/// action that loads that slot.
+pub const VIDEO_ADJUST_SLOT_ACTIONS: [KeyAction; 10] = [
+    KeyAction::VideoAdjustSlot1,
+    KeyAction::VideoAdjustSlot2,
+    KeyAction::VideoAdjustSlot3,
+    KeyAction::VideoAdjustSlot4,
+    KeyAction::VideoAdjustSlot5,
+    KeyAction::VideoAdjustSlot6,
+    KeyAction::VideoAdjustSlot7,
+    KeyAction::VideoAdjustSlot8,
+    KeyAction::VideoAdjustSlot9,
+    KeyAction::VideoAdjustSlot10,
+];
+
 const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GlobalLocalSearch,
     KeyAction::GlobalFavSearch,
@@ -8951,7 +8968,7 @@ mod tests {
 
     #[test]
     fn adjustment_slot_actions_are_registered_and_have_unique_context_defaults() {
-        let actions = [
+        let image_actions = [
             KeyAction::FsAdjustSlotDefault1,
             KeyAction::FsAdjustSlotDefault2,
             KeyAction::FsAdjustSlotDefault3,
@@ -8963,19 +8980,9 @@ mod tests {
             KeyAction::FsAdjustSlotDefault9,
             KeyAction::FsAdjustSlotDefault10,
             KeyAction::FsAdjustCopyGlobalDefaultToFavorite,
-            KeyAction::VideoAdjustSlot1,
-            KeyAction::VideoAdjustSlot2,
-            KeyAction::VideoAdjustSlot3,
-            KeyAction::VideoAdjustSlot4,
-            KeyAction::VideoAdjustSlot5,
-            KeyAction::VideoAdjustSlot6,
-            KeyAction::VideoAdjustSlot7,
-            KeyAction::VideoAdjustSlot8,
-            KeyAction::VideoAdjustSlot9,
-            KeyAction::VideoAdjustSlot10,
         ];
 
-        for action in actions {
+        for action in image_actions.into_iter().chain(VIDEO_ADJUST_SLOT_ACTIONS) {
             assert!(KeyAction::all().contains(&action));
             assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
             assert_eq!(action.trigger(), KeyTrigger::Press);
@@ -8999,6 +9006,21 @@ mod tests {
                 }
             }
         }
+
+        let registered_video_slot_count = KeyAction::all()
+            .iter()
+            .filter(|action| {
+                action
+                    .ini_name()
+                    .strip_prefix("VideoAdjustSlot")
+                    .is_some_and(|suffix| suffix.parse::<usize>().is_ok())
+            })
+            .count();
+        assert_eq!(
+            VIDEO_ADJUST_SLOT_ACTIONS.len(),
+            registered_video_slot_count,
+            "the indexed slot-action list must cover every VideoAdjustSlot action"
+        );
 
         assert_eq!(
             KeyAction::FsAdjustSlotDefault1

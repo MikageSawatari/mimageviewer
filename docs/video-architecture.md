@@ -164,8 +164,10 @@ viewer-wide な `Settings::video_adjustments` を正本とする。画像補正�
 `Settings::video_preset_slots` が正本で、presenter へは `VideoGradeSnapshot` で名前だけを同期するため、
 render thread は設定 I/O を行わない。パネル操作は `NativeOverlayCommand` →
 `NativeVideoOutputEvent` で App に戻し、保存または読込後に最新の補正値とスロット名を再同期する。
-`VideoAdjustSlot1..10` の既定 `Ctrl+1〜9` / `Ctrl+0` は映像表示中だけ読込を行い、動画→音声モードでは
-発火させない。新しい動画への source swap では左を presenter 内で閉じ、右も App から false を同期する。
+`VideoAdjustSlot1..10` の既定 `Ctrl+1〜9` / `Ctrl+0` は映像が見えている間だけ読込を行う。
+presenter が隠れた通常の動画→音声モードでは発火させないが、VST GUI 表示のため presenter を
+un-hide して映像が出ている間は発火させる。新しい動画への source swap では左を presenter 内で閉じ、
+右も App から false を同期する。
 callout は実際にクリックする UI なので、表示中の bar rect だけを HUD region に含める。
 動画↔音声モードの遷移も左右パネルの session 境界として扱い、presenter の左ジャンプ状態と
 音楽ビューの左ブックマーク状態を両方閉じる。同じファイル内の遷移では右状態を保持するが、
@@ -2090,6 +2092,14 @@ native HUD event、egui 動画入力、egui 音楽ビューの各入口はこの
 既存遷移を選ぶ。音声 VST 表示中は `fs_music_view_active` が意図的に false になるため、この表示
 述語を enter/exit の排他には使わず、`video_audio_vst_active_for` を最初に判定する。egui の press
 経路は `consume_action_no_repeat` を使い、native の `!key.repeat` と同じく長押し再トグルを起こさない。
+
+`VideoAdjustSlot1..10` も native key と egui 動画入力の両方から同じ
+`dispatch_video_adjust_slot_key` へ合流する。action と slot index の対応は
+`keymap::VIDEO_ADJUST_SLOT_ACTIONS` の順序付き配列だけが所有し、両経路が同じ一覧を参照する。
+読込可否は音声モードそのものではなく `!video_audio_mode_hides_native_presenter_for(fs_idx)`
+(映像が見えていること) で判定するため、通常の音声モードでは無効、VST GUI が presenter を
+un-hide している間は有効になる。egui 側も外側の音楽ビュー gate に依存せず、この可視性述語と
+context menu / keyboard focus / modal / normalize scan の所有権 guard を consume 前に評価する。
 
 **presenter を drop せず hide する (consume-and-hold)**。動画→音声モードへ入るとき native
 D3D11 presenter を破棄せず、`NativeVideoOutputCommand::SetWindowVisible{visible:false}` で

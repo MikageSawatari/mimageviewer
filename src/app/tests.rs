@@ -50697,6 +50697,168 @@ fn video_audio_toggle_normal_video_egui_requests_enter() {
 }
 
 #[cfg(windows)]
+#[test]
+fn video_adjust_slot_egui_loads_saved_slot_when_video_is_visible() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let mut app = phase_c_support::setup_app();
+    let idx = app.items.len();
+    app.items.push(GridItem::Video(PathBuf::from(
+        "C:/clips/egui-adjust-slot.mp4",
+    )));
+    app.fullscreen_idx = Some(idx);
+    let mut saved = crate::creative_lut::VideoAdjustments::default();
+    saved.brightness = 42.0;
+    app.settings.video_preset_slots.slots[0] = Some(crate::creative_lut::VideoPresetSlot {
+        name: "Parity".to_string(),
+        adjustments: saved.clone(),
+    });
+    let ctx = egui::Context::default();
+    ctx.begin_pass(egui::RawInput {
+        events: vec![egui::Event::Key {
+            key: egui::Key::Num1,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        }],
+        ..Default::default()
+    });
+    let _ = app.keyboard_owner_for_pass(&ctx);
+
+    app.handle_video_input(&ctx, idx, None);
+    let _ = ctx.end_pass();
+
+    assert_eq!(app.settings.video_adjustments, saved);
+}
+
+#[cfg(windows)]
+fn begin_video_adjust_slot_egui_pass(app: &mut App, ctx: &egui::Context, key: egui::Key) {
+    ctx.begin_pass(egui::RawInput {
+        events: vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        }],
+        ..Default::default()
+    });
+    let _ = app.keyboard_owner_for_pass(ctx);
+}
+
+#[cfg(windows)]
+fn saved_video_adjustments(brightness: f32) -> crate::creative_lut::VideoAdjustments {
+    let mut saved = crate::creative_lut::VideoAdjustments::default();
+    saved.brightness = brightness;
+    saved
+}
+
+#[cfg(windows)]
+fn install_video_adjust_slot(
+    app: &mut App,
+    slot_idx: usize,
+    name: &str,
+    adjustments: crate::creative_lut::VideoAdjustments,
+) {
+    app.settings.video_preset_slots.slots[slot_idx] = Some(crate::creative_lut::VideoPresetSlot {
+        name: name.to_string(),
+        adjustments,
+    });
+}
+
+#[cfg(windows)]
+fn setup_video_adjust_slot_app(path: &str) -> (phase_c_support::AppTestEnv, usize, egui::Context) {
+    let mut app = phase_c_support::setup_app();
+    let idx = app.items.len();
+    app.items
+        .push(GridItem::Video(PathBuf::from(path.to_string())));
+    app.fullscreen_idx = Some(idx);
+    (app, idx, egui::Context::default())
+}
+
+#[cfg(windows)]
+#[test]
+fn video_adjust_slot_egui_does_not_load_when_presenter_is_hidden() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let (mut app, idx, ctx) = setup_video_adjust_slot_app("C:/clips/hidden-adjust-slot.mp4");
+    let saved = saved_video_adjustments(42.0);
+    install_video_adjust_slot(&mut app, 0, "Hidden", saved);
+    app.video_audio_mode = Some(idx);
+    let before = app.settings.video_adjustments.clone();
+    begin_video_adjust_slot_egui_pass(&mut app, &ctx, egui::Key::Num1);
+
+    app.handle_video_input(&ctx, idx, None);
+    let _ = ctx.end_pass();
+
+    assert_eq!(app.settings.video_adjustments, before);
+}
+
+#[cfg(windows)]
+#[test]
+fn video_adjust_slot_egui_loads_when_audio_mode_vst_makes_video_visible() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let (mut app, idx, ctx) = setup_video_adjust_slot_app("C:/clips/vst-adjust-slot.mp4");
+    let saved = saved_video_adjustments(37.0);
+    install_video_adjust_slot(&mut app, 0, "VST visible", saved.clone());
+    app.video_audio_mode = Some(idx);
+    app.video_audio_vst = Some(VideoAudioVstState {
+        fs_idx: idx,
+        phase: VideoAudioVstPhase::Opening,
+    });
+    begin_video_adjust_slot_egui_pass(&mut app, &ctx, egui::Key::Num1);
+
+    app.handle_video_input(&ctx, idx, None);
+    let _ = ctx.end_pass();
+
+    assert_eq!(app.settings.video_adjustments, saved);
+}
+
+#[cfg(windows)]
+#[test]
+fn video_adjust_slot_egui_empty_slot_keeps_current_adjustments() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let (mut app, idx, ctx) = setup_video_adjust_slot_app("C:/clips/empty-adjust-slot.mp4");
+    app.settings.video_adjustments = saved_video_adjustments(-18.0);
+    let before = app.settings.video_adjustments.clone();
+    begin_video_adjust_slot_egui_pass(&mut app, &ctx, egui::Key::Num2);
+
+    app.handle_video_input(&ctx, idx, None);
+    let _ = ctx.end_pass();
+
+    assert_eq!(app.settings.video_adjustments, before);
+}
+
+#[cfg(windows)]
+#[test]
+fn video_adjust_slot_egui_modal_guard_leaves_key_unconsumed() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let (mut app, idx, ctx) = setup_video_adjust_slot_app("C:/clips/modal-adjust-slot.mp4");
+    let saved = saved_video_adjustments(29.0);
+    install_video_adjust_slot(&mut app, 0, "Modal", saved);
+    app.show_settings_restore = true;
+    let before = app.settings.video_adjustments.clone();
+    begin_video_adjust_slot_egui_pass(&mut app, &ctx, egui::Key::Num1);
+
+    app.handle_video_input(&ctx, idx, None);
+    assert!(ctx.input(|input| {
+        input.events.iter().any(|event| {
+            matches!(
+                event,
+                egui::Event::Key {
+                    key: egui::Key::Num1,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers.ctrl && !modifiers.shift && !modifiers.alt
+            )
+        })
+    }));
+    let _ = ctx.end_pass();
+
+    assert_eq!(app.settings.video_adjustments, before);
+}
+
+#[cfg(windows)]
 fn video_audio_native_z(repeat: bool) -> crate::video::native_window::NativeVideoKeyEvent {
     crate::video::native_window::NativeVideoKeyEvent {
         virtual_key: 0x5a,

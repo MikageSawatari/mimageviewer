@@ -1,5 +1,7 @@
 use super::*;
-use crate::keymap::{CommandDisplayRow, CommandScope, FS_VIDEO_ACTIVE_SCOPES, KeyAction};
+use crate::keymap::{
+    CommandDisplayRow, CommandScope, FS_VIDEO_ACTIVE_SCOPES, KeyAction, VIDEO_ADJUST_SLOT_ACTIONS,
+};
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8,6 +10,23 @@ pub(crate) enum VideoAudioEnterSource {
     NativeKey,
     NativeOutputEvent,
     DeferredCompletion,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VideoAdjustSlotInputSource {
+    EguiKey,
+    NativeKey,
+}
+
+#[cfg(windows)]
+impl VideoAdjustSlotInputSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::EguiKey => "egui_key",
+            Self::NativeKey => "native_key",
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -753,6 +772,22 @@ impl App {
         self.sync_native_video_grade();
         self.settings.save();
         self.show_feedback_toast(format!("[動画スロット{key_label}: {}]", slot.name));
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn dispatch_video_adjust_slot_key(
+        &mut self,
+        ctx: &egui::Context,
+        slot_idx: usize,
+        source: VideoAdjustSlotInputSource,
+    ) {
+        self.load_video_adjust_slot(slot_idx);
+        self.request_native_video_hud_repaint(ctx);
+        crate::logger::log(format!(
+            "[video-adjust-slot] load source={} slot={} slot_idx={slot_idx}",
+            source.as_str(),
+            slot_idx + 1,
+        ));
     }
 
     #[cfg(windows)]
@@ -7139,25 +7174,16 @@ impl App {
             return NativeVideoKeyOutcome::FixedAction(action);
         }
         if !key.repeat && !self.video_audio_mode_hides_native_presenter_for(fs_idx) {
-            let slot_actions = [
-                KeyAction::VideoAdjustSlot1,
-                KeyAction::VideoAdjustSlot2,
-                KeyAction::VideoAdjustSlot3,
-                KeyAction::VideoAdjustSlot4,
-                KeyAction::VideoAdjustSlot5,
-                KeyAction::VideoAdjustSlot6,
-                KeyAction::VideoAdjustSlot7,
-                KeyAction::VideoAdjustSlot8,
-                KeyAction::VideoAdjustSlot9,
-                KeyAction::VideoAdjustSlot10,
-            ];
-            if let Some(slot_idx) = slot_actions
+            if let Some(slot_idx) = VIDEO_ADJUST_SLOT_ACTIONS
                 .iter()
                 .position(|action| self.keymap.matches_vk_action(*action, &key))
             {
-                self.load_video_adjust_slot(slot_idx);
-                self.request_native_video_hud_repaint(ctx);
-                return NativeVideoKeyOutcome::Action(slot_actions[slot_idx]);
+                self.dispatch_video_adjust_slot_key(
+                    ctx,
+                    slot_idx,
+                    VideoAdjustSlotInputSource::NativeKey,
+                );
+                return NativeVideoKeyOutcome::Action(VIDEO_ADJUST_SLOT_ACTIONS[slot_idx]);
             }
         }
         let side_panel_key_owned_by_native = crate::ui_helpers::fs_side_panel_key_owner(

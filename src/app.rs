@@ -112,7 +112,7 @@ mod metadata_ops;
 #[cfg(windows)]
 mod native_video;
 #[cfg(windows)]
-pub(crate) use native_video::VideoAudioEnterSource;
+pub(crate) use native_video::{VideoAdjustSlotInputSource, VideoAudioEnterSource};
 pub(crate) mod normalize;
 mod prefetch_policy;
 mod recursive_snapshot_scan;
