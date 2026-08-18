@@ -1284,6 +1284,8 @@
 
 ### 1.89 元画像プレビュー中の見開き 1 ページずらしが 4〜5 秒停止する
 
+- **実機確認 (2026-08-18)**: 単発タップと分析モードの双方で 4〜5 秒停止は再現しない。AI アップスケールとカラー化の ON / OFF いずれの組み合わせでも停止なし。なお §1.91 の続報修正でホールド中は元画像表示自体が成立しなくなったため、元の再現手順 (右 Ctrl ホールド + Ctrl+→) からはこの経路に入らない。
+
 - **完了 (2026-08-17):** navigation target の `materialized_ready` を、その frame の描画 resolver が
   実際に選ぶ source と一致させた。`fs_display_bypasses_final_pipeline` が true の元画像表示 / 分析モードは
   target 全ページの `resolve_original_preview_tex` を、false の通常表示は従来の加工済み source を要求する。
