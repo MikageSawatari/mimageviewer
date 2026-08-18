@@ -1,10 +1,425 @@
 use super::*;
 use crate::keymap::{CommandDisplayRow, CommandScope, FS_VIDEO_ACTIVE_SCOPES, KeyAction};
 
-fn log_video_audio_enter_request(source: &str, fs_idx: usize) {
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VideoAudioEnterSource {
+    NativeKey,
+    NativeOutputEvent,
+    DeferredCompletion,
+}
+
+#[cfg(windows)]
+impl VideoAudioEnterSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NativeKey => "native_key",
+            Self::NativeOutputEvent => "native_output_event",
+            Self::DeferredCompletion => "deferred_completion",
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VideoAudioEnterRejectReason {
+    AlreadyActive,
+    ItemOrFullscreenMismatch,
+    TransitionInProgress {
+        mode_switch: bool,
+        source_swap: bool,
+        detached_host_switch: bool,
+    },
+    PresenterUnavailable,
+    NoAudioTrack,
+    DetachedEntryTargetUnavailable,
+}
+
+#[cfg(windows)]
+impl VideoAudioEnterRejectReason {
+    fn format(self) -> String {
+        match self {
+            Self::AlreadyActive => "already_active".to_string(),
+            Self::ItemOrFullscreenMismatch => "item_or_fullscreen_mismatch".to_string(),
+            Self::TransitionInProgress {
+                mode_switch,
+                source_swap,
+                detached_host_switch,
+            } => format!(
+                "transition_in_progress(mode_switch={mode_switch},source_swap={source_swap},detached_host_switch={detached_host_switch})"
+            ),
+            Self::PresenterUnavailable => "presenter_unavailable".to_string(),
+            Self::NoAudioTrack => "no_audio_track".to_string(),
+            Self::DetachedEntryTargetUnavailable => "detached_entry_target_unavailable".to_string(),
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VideoAudioEnterGate {
+    AlreadyActive(bool),
+    ItemOrFullscreen {
+        is_video: bool,
+        fullscreen_matches: bool,
+    },
+    Transition {
+        mode_switch: bool,
+        source_swap: bool,
+        detached_host_switch: bool,
+    },
+    PresenterAvailable(bool),
+    AudioTrackMissing(bool),
+    DetachedEntryTarget {
+        detached: bool,
+        target_available: bool,
+    },
+}
+
+#[cfg(windows)]
+fn video_audio_enter_gate_rejection(
+    gate: VideoAudioEnterGate,
+) -> Option<VideoAudioEnterRejectReason> {
+    match gate {
+        VideoAudioEnterGate::AlreadyActive(active) => {
+            active.then_some(VideoAudioEnterRejectReason::AlreadyActive)
+        }
+        VideoAudioEnterGate::ItemOrFullscreen {
+            is_video,
+            fullscreen_matches,
+        } => (!is_video || !fullscreen_matches)
+            .then_some(VideoAudioEnterRejectReason::ItemOrFullscreenMismatch),
+        VideoAudioEnterGate::Transition {
+            mode_switch,
+            source_swap,
+            detached_host_switch,
+        } => (mode_switch || source_swap || detached_host_switch).then_some(
+            VideoAudioEnterRejectReason::TransitionInProgress {
+                mode_switch,
+                source_swap,
+                detached_host_switch,
+            },
+        ),
+        VideoAudioEnterGate::PresenterAvailable(available) => {
+            (!available).then_some(VideoAudioEnterRejectReason::PresenterUnavailable)
+        }
+        VideoAudioEnterGate::AudioTrackMissing(missing) => {
+            missing.then_some(VideoAudioEnterRejectReason::NoAudioTrack)
+        }
+        VideoAudioEnterGate::DetachedEntryTarget {
+            detached,
+            target_available,
+        } => (detached && !target_available)
+            .then_some(VideoAudioEnterRejectReason::DetachedEntryTargetUnavailable),
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VideoAudioEnterOutcome {
+    Rejected(VideoAudioEnterRejectReason),
+    Entered,
+}
+
+#[cfg(windows)]
+fn format_video_audio_enter_result(
+    source: VideoAudioEnterSource,
+    fs_idx: usize,
+    outcome: VideoAudioEnterOutcome,
+) -> String {
+    let outcome = match outcome {
+        VideoAudioEnterOutcome::Rejected(reason) => format!("rejected:{}", reason.format()),
+        VideoAudioEnterOutcome::Entered => "entered".to_string(),
+    };
+    format!(
+        "[video-audio] enter result source={} fs_idx={} outcome={}",
+        source.as_str(),
+        fs_idx,
+        outcome
+    )
+}
+
+#[cfg(windows)]
+fn log_video_audio_enter_request(source: VideoAudioEnterSource, fs_idx: usize) {
     crate::logger::log(format!(
-        "[video-audio] enter request source={source} fs_idx={fs_idx}"
+        "[video-audio] enter request source={} fs_idx={fs_idx}",
+        source.as_str()
     ));
+}
+
+#[cfg(windows)]
+fn log_video_audio_enter_result(
+    source: VideoAudioEnterSource,
+    fs_idx: usize,
+    outcome: VideoAudioEnterOutcome,
+) {
+    crate::logger::log(format_video_audio_enter_result(source, fs_idx, outcome));
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeVideoKeyBlockReason {
+    MusicVstShell,
+    NormalizeModal,
+    StaleDetachedToggle,
+}
+
+#[cfg(windows)]
+impl NativeVideoKeyBlockReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::MusicVstShell => "music_vst_shell",
+            Self::NormalizeModal => "normalize_modal",
+            Self::StaleDetachedToggle => "stale_detached_toggle",
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeVideoFixedKeyAction {
+    ExitMusicVstShell,
+    ExitVideoAudioVst,
+    CloseDetachedSession,
+    CancelNormalizeScan,
+    CloseVideoTileMode,
+    CloseFullscreen,
+    TileCursorPrevious,
+    TileCursorNext,
+    SeekBackFiveSeconds,
+    SeekForwardFiveSeconds,
+    MouseBack,
+    MouseForward,
+    RatingItem(u8),
+    RatingContainer(u8),
+    ComparisonUnsupported,
+}
+
+#[cfg(windows)]
+impl NativeVideoFixedKeyAction {
+    fn format(self) -> String {
+        match self {
+            Self::ExitMusicVstShell => "exit_music_vst_shell".to_string(),
+            Self::ExitVideoAudioVst => "exit_video_audio_vst".to_string(),
+            Self::CloseDetachedSession => "close_detached_session".to_string(),
+            Self::CancelNormalizeScan => "cancel_normalize_scan".to_string(),
+            Self::CloseVideoTileMode => "close_video_tile_mode".to_string(),
+            Self::CloseFullscreen => "close_fullscreen".to_string(),
+            Self::TileCursorPrevious => "tile_cursor_previous".to_string(),
+            Self::TileCursorNext => "tile_cursor_next".to_string(),
+            Self::SeekBackFiveSeconds => "seek_back_5s".to_string(),
+            Self::SeekForwardFiveSeconds => "seek_forward_5s".to_string(),
+            Self::MouseBack => "mouse_back".to_string(),
+            Self::MouseForward => "mouse_forward".to_string(),
+            Self::RatingItem(stars) => format!("rating_item_{stars}"),
+            Self::RatingContainer(stars) => format!("rating_container_{stars}"),
+            Self::ComparisonUnsupported => "comparison_unsupported".to_string(),
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeVideoKeyOutcome {
+    Blocked(NativeVideoKeyBlockReason),
+    Action(KeyAction),
+    FixedAction(NativeVideoFixedKeyAction),
+    NoMatch,
+}
+
+#[cfg(windows)]
+impl NativeVideoKeyOutcome {
+    fn format(self) -> String {
+        match self {
+            Self::Blocked(reason) => format!("blocked:{}", reason.as_str()),
+            Self::Action(action) => format!("action:{}", action.ini_name()),
+            Self::FixedAction(action) => format!("action:{}", action.format()),
+            Self::NoMatch => "no_match".to_string(),
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct NativeVideoKeyDiagnosticRecord {
+    seq: u64,
+    fs_idx: usize,
+    presentation: ViewerPresentation,
+    video_audio_mode: Option<usize>,
+    music_vst_shell: bool,
+    foreground_hwnd: u64,
+    presenter_hwnd: u64,
+    key: crate::video::native_window::NativeVideoKeyEvent,
+    outcome: NativeVideoKeyOutcome,
+}
+
+#[cfg(windows)]
+fn viewer_presentation_diagnostic_name(presentation: ViewerPresentation) -> &'static str {
+    match presentation {
+        ViewerPresentation::MainWindow => "in_window",
+        ViewerPresentation::Fullscreen => "fullscreen",
+        ViewerPresentation::DetachedWindow => "detached",
+    }
+}
+
+#[cfg(windows)]
+fn format_native_video_key_diagnostic_fields(record: &NativeVideoKeyDiagnosticRecord) -> String {
+    format!(
+        "seq={} virtual_key=0x{:02X} scan_code=0x{:04X} extended={} ctrl={} shift={} alt={} \
+         repeat={} fs_idx={} presentation={} video_audio_mode={:?} music_vst_shell={} \
+         foreground_hwnd=0x{:X} presenter_hwnd=0x{:X} outcome={}",
+        record.seq,
+        record.key.virtual_key,
+        record.key.scan_code,
+        record.key.extended,
+        record.key.ctrl,
+        record.key.shift,
+        record.key.alt,
+        record.key.repeat,
+        record.fs_idx,
+        viewer_presentation_diagnostic_name(record.presentation),
+        record.video_audio_mode,
+        record.music_vst_shell,
+        record.foreground_hwnd,
+        record.presenter_hwnd,
+        record.outcome.format(),
+    )
+}
+
+#[cfg(windows)]
+fn format_native_video_key_diagnostic(record: &NativeVideoKeyDiagnosticRecord) -> String {
+    format!(
+        "[native-video-key] {}",
+        format_native_video_key_diagnostic_fields(record)
+    )
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct NativeVideoKeyRepeatBatch {
+    first: NativeVideoKeyDiagnosticRecord,
+    last: NativeVideoKeyDiagnosticRecord,
+    count: u64,
+    outcomes: Vec<(NativeVideoKeyOutcome, u64)>,
+}
+
+#[cfg(windows)]
+impl NativeVideoKeyRepeatBatch {
+    fn new(record: NativeVideoKeyDiagnosticRecord) -> Self {
+        Self {
+            first: record.clone(),
+            last: record.clone(),
+            count: 1,
+            outcomes: vec![(record.outcome, 1)],
+        }
+    }
+
+    fn observe(&mut self, record: NativeVideoKeyDiagnosticRecord) {
+        self.last = record.clone();
+        self.count = self.count.saturating_add(1);
+        if let Some((_, count)) = self
+            .outcomes
+            .iter_mut()
+            .find(|(outcome, _)| *outcome == record.outcome)
+        {
+            *count = count.saturating_add(1);
+        } else {
+            self.outcomes.push((record.outcome, 1));
+        }
+    }
+}
+
+#[cfg(windows)]
+fn format_native_video_key_repeat_batch(batch: &NativeVideoKeyRepeatBatch) -> String {
+    let outcomes = batch
+        .outcomes
+        .iter()
+        .map(|(outcome, count)| format!("{}={count}", outcome.format()))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "[native-video-key] repeat_batch count={} seq_first={} seq_last={} outcomes=[{}] \
+         first=({}) last=({})",
+        batch.count,
+        batch.first.seq,
+        batch.last.seq,
+        outcomes,
+        format_native_video_key_diagnostic_fields(&batch.first),
+        format_native_video_key_diagnostic_fields(&batch.last),
+    )
+}
+
+#[cfg(windows)]
+#[derive(Debug, Default)]
+struct NativeVideoKeyRepeatRateState {
+    generation: u64,
+    batch: Option<NativeVideoKeyRepeatBatch>,
+}
+
+#[cfg(windows)]
+static NATIVE_VIDEO_KEY_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+static NATIVE_VIDEO_KEY_REPEAT_RATE_STATE: std::sync::OnceLock<
+    std::sync::Mutex<NativeVideoKeyRepeatRateState>,
+> = std::sync::OnceLock::new();
+
+#[cfg(windows)]
+const NATIVE_VIDEO_KEY_REPEAT_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[cfg(windows)]
+fn log_native_video_key_diagnostic(record: NativeVideoKeyDiagnosticRecord) {
+    if !record.key.repeat {
+        crate::logger::log(format_native_video_key_diagnostic(&record));
+        return;
+    }
+
+    let rate_state = NATIVE_VIDEO_KEY_REPEAT_RATE_STATE.get_or_init(Default::default);
+    let generation = match rate_state.lock() {
+        Ok(mut state) => {
+            if let Some(batch) = state.batch.as_mut() {
+                batch.observe(record);
+                return;
+            }
+            state.generation = state.generation.wrapping_add(1);
+            let generation = state.generation;
+            state.batch = Some(NativeVideoKeyRepeatBatch::new(record));
+            generation
+        }
+        Err(_) => {
+            crate::logger::log(format_native_video_key_diagnostic(&record));
+            return;
+        }
+    };
+
+    let spawn_result = std::thread::Builder::new()
+        .name("native-video-key-repeat-log".to_string())
+        .spawn(move || {
+            std::thread::sleep(NATIVE_VIDEO_KEY_REPEAT_LOG_INTERVAL);
+            let batch = NATIVE_VIDEO_KEY_REPEAT_RATE_STATE
+                .get_or_init(Default::default)
+                .lock()
+                .ok()
+                .and_then(|mut state| {
+                    (state.generation == generation)
+                        .then(|| state.batch.take())
+                        .flatten()
+                });
+            if let Some(batch) = batch {
+                crate::logger::log(format_native_video_key_repeat_batch(&batch));
+            }
+        });
+    if spawn_result.is_err() {
+        let batch = rate_state.lock().ok().and_then(|mut state| {
+            (state.generation == generation)
+                .then(|| state.batch.take())
+                .flatten()
+        });
+        if let Some(batch) = batch {
+            crate::logger::log(format_native_video_key_repeat_batch(&batch));
+        }
+    }
 }
 
 /// native presenter が転送してきた KeyDown の virtual key が **いま物理的に押下中か**を
@@ -1606,8 +2021,7 @@ impl App {
         // した後この 1 箇所で戻す。ParkedLive completion は `open_fullscreen` を呼ばず、
         // defer 開始時に video_audio_mode=Some(target) へ進めた bundle 内状態をそのまま保つ。
         if audio_mode_after_swap && completed_via_open_fullscreen {
-            log_video_audio_enter_request("deferred_completion", target_idx);
-            self.enter_video_audio_mode(ctx, target_idx);
+            self.enter_video_audio_mode(ctx, target_idx, VideoAudioEnterSource::DeferredCompletion);
         }
 
         if reason == "tile" {
@@ -3331,8 +3745,7 @@ impl App {
                 // native presenter を detach するので、このイベントを処理した後は同バッチの残り
                 // イベントが stale になる → poll_video 側で batch を打ち切る (video_audio_mode の
                 // None→Some 遷移を検出)。fs_idx / fullscreen 前提の guard は enter 側で行う。
-                log_video_audio_enter_request("native_output_event", fs_idx);
-                self.enter_video_audio_mode(ctx, fs_idx);
+                self.enter_video_audio_mode(ctx, fs_idx, VideoAudioEnterSource::NativeOutputEvent);
             }
             crate::video::NativeVideoOutputEvent::CloseFullscreen { generation } => {
                 if !self.accept_native_video_close(fs_idx, generation, "output_close") {
@@ -6561,6 +6974,45 @@ impl App {
         fs_idx: usize,
         key: crate::video::native_window::NativeVideoKeyEvent,
     ) {
+        let seq = NATIVE_VIDEO_KEY_SEQUENCE
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1);
+        let presentation = self.viewer_presentation;
+        let video_audio_mode = self.video_audio_mode;
+        let music_vst_shell = self.music_vst_shell.is_some();
+        let foreground_hwnd = crate::video::native_window::foreground_hwnd();
+        let presenter_hwnd = self
+            .pending_native_video_output_hwnds_for_fs(fs_idx)
+            .map(|(hwnd, _)| hwnd)
+            .or_else(|| match self.fs_cache.get(&fs_idx) {
+                Some(FsCacheEntry::Video { player, .. }) => {
+                    let hwnd = player.native_presenter_hwnd();
+                    (hwnd != 0).then_some(hwnd)
+                }
+                _ => None,
+            })
+            .unwrap_or(0);
+        let outcome = self.dispatch_native_video_key_event(ctx, fs_idx, key);
+        log_native_video_key_diagnostic(NativeVideoKeyDiagnosticRecord {
+            seq,
+            fs_idx,
+            presentation,
+            video_audio_mode,
+            music_vst_shell,
+            foreground_hwnd,
+            presenter_hwnd,
+            key,
+            outcome,
+        });
+    }
+
+    #[cfg(windows)]
+    fn dispatch_native_video_key_event(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        key: crate::video::native_window::NativeVideoKeyEvent,
+    ) -> NativeVideoKeyOutcome {
         // 音声 VST シェル (Inc 6 ②-3): Escape はモード離脱、他キーは動画専用 (tile / frame step 等)
         // が多く audio に不適なので無視する。再生操作は HUD のマウス操作で行う。
         if self
@@ -6571,8 +7023,11 @@ impl App {
             if key.virtual_key == 0x1B && !key.repeat && !key.shift && !key.ctrl && !key.alt {
                 self.exit_music_vst_shell();
                 self.request_native_video_hud_repaint(ctx);
+                return NativeVideoKeyOutcome::FixedAction(
+                    NativeVideoFixedKeyAction::ExitMusicVstShell,
+                );
             }
-            return;
+            return NativeVideoKeyOutcome::Blocked(NativeVideoKeyBlockReason::MusicVstShell);
         }
         // 7e: 「動画→音声モード」の VST ホスト表示中は Escape / Z (音声モードトグル) で VST ホストを
         // 畳んで波形ビュー (音声モード) へ戻る。他キーは通常動画として処理する (presenter 前面で
@@ -6587,7 +7042,9 @@ impl App {
             if esc || toggle {
                 self.exit_video_audio_vst(ctx, fs_idx);
                 self.request_native_video_hud_repaint(ctx);
-                return;
+                return NativeVideoKeyOutcome::FixedAction(
+                    NativeVideoFixedKeyAction::ExitVideoAudioVst,
+                );
             }
         }
         // 仮 gain 適用前のノーマライズスキャンはモーダル動作のため、ESC (cancel)
@@ -6596,7 +7053,7 @@ impl App {
         if self.normalize_scan_is_modal_for_current_player(fs_idx)
             && !(key.virtual_key == 0x1B && !key.repeat && !key.shift && !key.ctrl && !key.alt)
         {
-            return;
+            return NativeVideoKeyOutcome::Blocked(NativeVideoKeyBlockReason::NormalizeModal);
         }
         if self.viewer_session_is_detached()
             && !key.repeat
@@ -6606,7 +7063,9 @@ impl App {
             && matches!(key.virtual_key, 0x0D | 0x1B)
         {
             self.handle_fullscreen_close_request_immediate();
-            return;
+            return NativeVideoKeyOutcome::FixedAction(
+                NativeVideoFixedKeyAction::CloseDetachedSession,
+            );
         }
         let mut hud_activity = true;
         if let Some(rating_key) = self.keymap.native_video_rating_action(&key) {
@@ -6625,7 +7084,12 @@ impl App {
             if hud_activity {
                 self.request_native_video_hud_repaint(ctx);
             }
-            return;
+            let action = if rating_key.container {
+                NativeVideoFixedKeyAction::RatingContainer(rating_key.stars)
+            } else {
+                NativeVideoFixedKeyAction::RatingItem(rating_key.stars)
+            };
+            return NativeVideoKeyOutcome::FixedAction(action);
         }
         if !key.repeat && !self.video_audio_mode_hides_native_presenter_for(fs_idx) {
             let slot_actions = [
@@ -6646,7 +7110,7 @@ impl App {
             {
                 self.load_video_adjust_slot(slot_idx);
                 self.request_native_video_hud_repaint(ctx);
-                return;
+                return NativeVideoKeyOutcome::Action(slot_actions[slot_idx]);
             }
         }
         let side_panel_key_owned_by_native = crate::ui_helpers::fs_side_panel_key_owner(
@@ -6665,9 +7129,9 @@ impl App {
             self.show_native_video_overlay_toast(format!("パネル表示: {label}"), false);
             self.sync_native_video_metadata(fs_idx);
             self.request_native_video_hud_repaint(ctx);
-            return;
+            return NativeVideoKeyOutcome::Action(KeyAction::FsToggleMetadata);
         }
-        match key.virtual_key {
+        let outcome = match key.virtual_key {
             _ if !key.repeat
                 && self
                     .keymap
@@ -6675,6 +7139,7 @@ impl App {
             {
                 self.handle_fullscreen_close_request_immediate();
                 hud_activity = false;
+                NativeVideoKeyOutcome::Action(KeyAction::VideoCloseFullscreen)
             }
             // Shift+Enter: open in external player, matching the legacy egui
             // fullscreen video path.
@@ -6686,6 +7151,7 @@ impl App {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     crate::ui_helpers::open_external_player(player.path());
                 }
+                NativeVideoKeyOutcome::Action(KeyAction::VideoExternalPlayer)
             }
             // Enter in tile mode: start playback from the keyboard cursor.
             _ if !key.repeat
@@ -6695,6 +7161,7 @@ impl App {
                     .matches_vk_action(KeyAction::VideoPlayPause, &key) =>
             {
                 self.play_selected_video_tile(ctx, fs_idx);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoPlayPause)
             }
             // Enter: play / pause.
             _ if !key.repeat
@@ -6703,6 +7170,7 @@ impl App {
                     .matches_vk_action(KeyAction::VideoPlayPause, &key) =>
             {
                 self.handle_native_video_toggle_play_command(ctx, fs_idx);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoPlayPause)
             }
             // Escape: close native fullscreen. If the native overlay has a text
             // editor focused this key is not forwarded here, so dialog editing
@@ -6712,15 +7180,23 @@ impl App {
             0x1B if !key.repeat && !key.shift && !key.ctrl && !key.alt => {
                 if self.normalize_scan_is_modal_for_current_player(fs_idx) {
                     self.handle_cancel_normalize_scan(ctx, fs_idx);
+                    NativeVideoKeyOutcome::FixedAction(
+                        NativeVideoFixedKeyAction::CancelNormalizeScan,
+                    )
                 } else if self.close_video_tile_mode() {
                     self.sync_native_video_tile_overlay(ctx, fs_idx);
+                    NativeVideoKeyOutcome::FixedAction(
+                        NativeVideoFixedKeyAction::CloseVideoTileMode,
+                    )
                 } else {
                     self.handle_fullscreen_close_request_immediate();
+                    NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::CloseFullscreen)
                 }
             }
             _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::FsBackToList, &key) => {
                 self.close_fullscreen();
                 hud_activity = false;
+                NativeVideoKeyOutcome::Action(KeyAction::FsBackToList)
             }
             // W: seek to start and play.
             _ if !key.repeat
@@ -6734,6 +7210,7 @@ impl App {
                     player.seek(0.0);
                 }
                 self.maybe_start_normalize_scan_for_play_intent(fs_idx);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoSeekStart)
             }
             // F12: detached viewer mode toggle. Keep this as a keymap action
             // so a future remap works when the native video HWND has focus.
@@ -6754,10 +7231,13 @@ impl App {
                          presentation={:?} (rebuild re-delivery of a released key)",
                         self.viewer_presentation
                     ));
-                    return;
+                    return NativeVideoKeyOutcome::Blocked(
+                        NativeVideoKeyBlockReason::StaleDetachedToggle,
+                    );
                 }
                 self.toggle_detached_viewer_mode();
                 hud_activity = false;
+                NativeVideoKeyOutcome::Action(KeyAction::ToggleDetachedViewerMode)
             }
             // F11: ウィンドウ / 全画面 切り替え (HUD トグルボタンと同じ動作)。
             // toggle_video_window_mode は presenter rebuild を伴うので
@@ -6770,11 +7250,18 @@ impl App {
             {
                 self.toggle_video_window_mode_for_input(ctx);
                 hud_activity = false;
+                NativeVideoKeyOutcome::Action(KeyAction::FsToggleWindowMode)
             }
             // Tile mode: left/right move the keyboard cursor instead of seeking
             // behind the opaque tile grid. Ctrl moves by one visible row.
             0x25 | 0x27 if self.video_tile_mode_active && !key.alt => {
                 self.handle_video_tile_cursor_key(ctx, fs_idx, key.ctrl, key.virtual_key == 0x25);
+                let action = if key.virtual_key == 0x25 {
+                    NativeVideoFixedKeyAction::TileCursorPrevious
+                } else {
+                    NativeVideoFixedKeyAction::TileCursorNext
+                };
+                NativeVideoKeyOutcome::FixedAction(action)
             }
             // Ctrl+Shift+Left / Right by default: frame step and pause.
             _ if self
@@ -6782,43 +7269,53 @@ impl App {
                 .matches_vk_action(KeyAction::VideoFrameStepBack, &key) =>
             {
                 self.step_video_frame(ctx, fs_idx, -1);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoFrameStepBack)
             }
             _ if self
                 .keymap
                 .matches_vk_action(KeyAction::VideoFrameStepForward, &key) =>
             {
                 self.step_video_frame(ctx, fs_idx, 1);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoFrameStepForward)
             }
             _ if self
                 .keymap
                 .matches_vk_action(KeyAction::VideoSeekBackSmall, &key) =>
             {
                 self.native_video_seek_relative_with_hint(fs_idx, -1.0);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoSeekBackSmall)
             }
             _ if self
                 .keymap
                 .matches_vk_action(KeyAction::VideoSeekForwardSmall, &key) =>
             {
                 self.native_video_seek_relative_with_hint(fs_idx, 1.0);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoSeekForwardSmall)
             }
             _ if self
                 .keymap
                 .matches_vk_action(KeyAction::VideoSeekBackLarge, &key) =>
             {
                 self.native_video_seek_relative_with_hint(fs_idx, -30.0);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoSeekBackLarge)
             }
             _ if self
                 .keymap
                 .matches_vk_action(KeyAction::VideoSeekForwardLarge, &key) =>
             {
                 self.native_video_seek_relative_with_hint(fs_idx, 30.0);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoSeekForwardLarge)
             }
             // Left / Right: same seek granularity as the egui fullscreen path.
             0x25 if !key.ctrl && !key.shift && !key.alt => {
                 self.native_video_seek_relative_with_hint(fs_idx, -5.0);
+                NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::SeekBackFiveSeconds)
             }
             0x27 if !key.ctrl && !key.shift && !key.alt => {
                 self.native_video_seek_relative_with_hint(fs_idx, 5.0);
+                NativeVideoKeyOutcome::FixedAction(
+                    NativeVideoFixedKeyAction::SeekForwardFiveSeconds,
+                )
             }
             // Plain Up / Down: navigate files, matching the egui fullscreen path.
             _ if !key.repeat
@@ -6830,6 +7327,7 @@ impl App {
                     "[input-nav] source=native-video-key action=ctrl_nav_back fs_idx={fs_idx} keymap=FsCtrlNavPrev"
                 ));
                 self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, false, true);
+                NativeVideoKeyOutcome::Action(KeyAction::FsCtrlNavPrev)
             }
             _ if !key.repeat
                 && self
@@ -6840,6 +7338,7 @@ impl App {
                     "[input-nav] source=native-video-key action=ctrl_nav_forward fs_idx={fs_idx} keymap=FsCtrlNavNext"
                 ));
                 self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, true, true);
+                NativeVideoKeyOutcome::Action(KeyAction::FsCtrlNavNext)
             }
             // Ctrl+PageUp / PageDown: move to the previous / next sibling folder.
             _ if !key.repeat
@@ -6848,6 +7347,7 @@ impl App {
                     .matches_vk_action(KeyAction::FsSiblingPrev, &key) =>
             {
                 self.handle_fullscreen_sibling_nav_context(ctx, fs_idx, false, true);
+                NativeVideoKeyOutcome::Action(KeyAction::FsSiblingPrev)
             }
             _ if !key.repeat
                 && self
@@ -6855,6 +7355,7 @@ impl App {
                     .matches_vk_action(KeyAction::FsSiblingNext, &key) =>
             {
                 self.handle_fullscreen_sibling_nav_context(ctx, fs_idx, true, true);
+                NativeVideoKeyOutcome::Action(KeyAction::FsSiblingNext)
             }
             // VK_BROWSER_BACK / VK_BROWSER_FORWARD: マウス進む/戻るボタンが Browser_Back/Forward
             // keystroke として届くケース (mouse driver や AutoHotkey が変換する経路)、または
@@ -6866,6 +7367,7 @@ impl App {
                     crate::app::ActionSurface::Viewer,
                     "native-video-key",
                 );
+                NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::MouseBack)
             }
             0xA7 => {
                 self.mouse_ring_nav = self.apply_mouse_back_forward_button(
@@ -6874,18 +7376,21 @@ impl App {
                     crate::app::ActionSurface::Viewer,
                     "native-video-key",
                 );
+                NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::MouseForward)
             }
             _ if self
                 .keymap
                 .matches_vk_action(KeyAction::VideoPrevFile, &key) =>
             {
                 self.navigate_native_video_fullscreen(ctx, fs_idx, -1);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoPrevFile)
             }
             _ if self
                 .keymap
                 .matches_vk_action(KeyAction::VideoNextFile, &key) =>
             {
                 self.navigate_native_video_fullscreen(ctx, fs_idx, 1);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoNextFile)
             }
             // Home / End (keymap: FsJumpFirst/FsJumpLast): jump to the first / last visible navigable item.
             // Home: 先頭アイテムへ。既に先頭なら境界トーストを出す
@@ -6906,6 +7411,7 @@ impl App {
                         self.show_native_video_boundary_toast(ctx, false);
                     }
                 }
+                NativeVideoKeyOutcome::Action(KeyAction::FsJumpFirst)
             }
             // End: 末尾アイテムへ。既に末尾なら境界トーストを出す。
             _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::FsJumpLast, &key) => {
@@ -6924,6 +7430,7 @@ impl App {
                         self.show_native_video_boundary_toast(ctx, true);
                     }
                 }
+                NativeVideoKeyOutcome::Action(KeyAction::FsJumpLast)
             }
             // Shift+Up / Shift+Down: volume. Plain Up/Down remains for the
             // future full overlay phase as well, but the native HWND can already
@@ -6939,6 +7446,7 @@ impl App {
                     self.settings.video_volume = v;
                     self.settings.save();
                 }
+                NativeVideoKeyOutcome::Action(KeyAction::VideoVolumeUp)
             }
             _ if self
                 .keymap
@@ -6951,16 +7459,19 @@ impl App {
                     self.settings.video_volume = v;
                     self.settings.save();
                 }
+                NativeVideoKeyOutcome::Action(KeyAction::VideoVolumeDown)
             }
             // M: mute
             _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::VideoMute, &key) => {
                 if self.toggle_video_session_mute_for_fs_idx(fs_idx) {
                     self.request_native_video_hud_repaint(ctx);
                 }
+                NativeVideoKeyOutcome::Action(KeyAction::VideoMute)
             }
             // L: loop (4 段階サイクル: Off → Full → Chapter → Bookmark)
             _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::VideoLoop, &key) => {
                 self.cycle_native_video_loop_common(ctx, fs_idx);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoLoop)
             }
             // J / K: previous / next chapter, bookmark, or pin marker.
             _ if !key.repeat
@@ -6969,6 +7480,7 @@ impl App {
                     .matches_vk_action(KeyAction::VideoMarkerPrev, &key) =>
             {
                 self.jump_native_video_marker(fs_idx, false);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoMarkerPrev)
             }
             _ if !key.repeat
                 && self
@@ -6976,6 +7488,7 @@ impl App {
                     .matches_vk_action(KeyAction::VideoMarkerNext, &key) =>
             {
                 self.jump_native_video_marker(fs_idx, true);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoMarkerNext)
             }
             // Space in tile mode: start playback from the keyboard cursor (= Enter と同じ).
             // 動画 HUD 2 段化リデザイン (Phase 1): Space を動画プレイヤー慣習に合わせて
@@ -6988,6 +7501,7 @@ impl App {
                     .matches_vk_action(KeyAction::VideoPlayPause, &key) =>
             {
                 self.play_selected_video_tile(ctx, fs_idx);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoPlayPause)
             }
             // Space: play / pause (= Enter と等価)。
             _ if !key.repeat
@@ -6996,6 +7510,7 @@ impl App {
                     .matches_vk_action(KeyAction::VideoPlayPause, &key) =>
             {
                 self.handle_native_video_toggle_play_command(ctx, fs_idx);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoPlayPause)
             }
             // P: pin the selected tile while tile mode is open; otherwise pin the current
             // frame (= HUD 📌 button). グリッドの P と統一した
@@ -7008,6 +7523,7 @@ impl App {
                     // different frame than the highlighted tile UI suggests.
                     hud_activity = false;
                 }
+                NativeVideoKeyOutcome::Action(KeyAction::VideoPin)
             }
             // F: perf / framerate overlay toggle (旧 P)。Frames / FPS mnemonic。
             _ if !key.repeat
@@ -7019,10 +7535,12 @@ impl App {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     player.set_native_perf_overlay_visible(self.video_perf_overlay_visible);
                 }
+                NativeVideoKeyOutcome::Action(KeyAction::VideoPerfOverlay)
             }
             // Ctrl+S: save current video frame to the capture folder.
             _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::VideoCapture, &key) => {
                 self.save_video_frame_to_file(ctx, fs_idx);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoCapture)
             }
             // Ctrl+B: add current video frame to the active compiled book.
             _ if !key.repeat
@@ -7031,6 +7549,7 @@ impl App {
                     .matches_vk_action(KeyAction::VideoAddToActiveBook, &key) =>
             {
                 self.add_current_video_frame_to_active_book(ctx, fs_idx);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoAddToActiveBook)
             }
             // X / C: comparison view is static-image only. Consume as silent no-op.
             _ if !key.repeat
@@ -7048,6 +7567,7 @@ impl App {
                         .matches_vk_action(KeyAction::VideoCompareDiff, &key)) =>
             {
                 hud_activity = false;
+                NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::ComparisonUnsupported)
             }
             // S: tile mode toggle.
             _ if !key.repeat
@@ -7058,6 +7578,7 @@ impl App {
                 let screen = self.video_tile_layout_size(fs_idx, ctx);
                 self.toggle_video_tile_mode(fs_idx, screen);
                 self.sync_native_video_tile_overlay(ctx, fs_idx);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoTileMode)
             }
             // B: add video bookmark.
             _ if !key.repeat
@@ -7066,6 +7587,7 @@ impl App {
                     .matches_vk_action(KeyAction::VideoBookmark, &key) =>
             {
                 self.add_native_video_bookmark(fs_idx, None);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoBookmark)
             }
             // Z (default): 動画→音声モードへ切り替え (映像を消して音楽ビューで聴く、Inc 7)。
             // enter_video_audio_mode 内で音声トラック無し / detached / switch 中などは弾かれる。
@@ -7074,16 +7596,18 @@ impl App {
                     .keymap
                     .matches_vk_action(KeyAction::VideoToggleAudioMode, &key) =>
             {
-                log_video_audio_enter_request("native_key", fs_idx);
-                self.enter_video_audio_mode(ctx, fs_idx);
+                self.enter_video_audio_mode(ctx, fs_idx, VideoAudioEnterSource::NativeKey);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoToggleAudioMode)
             }
             _ => {
                 hud_activity = false;
+                NativeVideoKeyOutcome::NoMatch
             }
-        }
+        };
         if hud_activity {
             self.request_native_video_hud_repaint(ctx);
         }
+        outcome
     }
 
     #[cfg(windows)]
@@ -7476,15 +8000,36 @@ impl App {
         }
     }
 
-    pub(crate) fn enter_video_audio_mode(&mut self, ctx: &egui::Context, fs_idx: usize) {
-        if self.video_audio_mode.is_some() {
-            return;
+    pub(crate) fn enter_video_audio_mode(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        source: VideoAudioEnterSource,
+    ) {
+        log_video_audio_enter_request(source, fs_idx);
+        let outcome = self.enter_video_audio_mode_inner(ctx, fs_idx);
+        log_video_audio_enter_result(source, fs_idx, outcome);
+    }
+
+    #[cfg(windows)]
+    fn enter_video_audio_mode_inner(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) -> VideoAudioEnterOutcome {
+        if let Some(reason) = video_audio_enter_gate_rejection(VideoAudioEnterGate::AlreadyActive(
+            self.video_audio_mode.is_some(),
+        )) {
+            return VideoAudioEnterOutcome::Rejected(reason);
         }
         // 動画アイテムのみ・現在フルスクリーンで開いている idx・borderless presenter 前提。
-        if !matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
-            || self.fullscreen_idx != Some(fs_idx)
+        if let Some(reason) =
+            video_audio_enter_gate_rejection(VideoAudioEnterGate::ItemOrFullscreen {
+                is_video: matches!(self.items.get(fs_idx), Some(GridItem::Video(_))),
+                fullscreen_matches: self.fullscreen_idx == Some(fs_idx),
+            })
         {
-            return;
+            return VideoAudioEnterOutcome::Rejected(reason);
         }
         // フルスクリーン / ウィンドウ内 (MainWindow) / 別ウィンドウ (F12 DetachedWindow) の
         // いずれでも使える。DetachedWindow は presenter child が detached viewport host に
@@ -7503,11 +8048,16 @@ impl App {
         // が `switch_native_video_viewer_presentation` を走らせ、hidden presenter を un-hide して
         // 「音声モードなのに動画が出る」ことがあるため (Codex 7e P2)。migration 完了後に再度
         // ♪/Z を押せば通常経路で音声モードへ入れる。
-        if self.native_video_mode_switch.is_some()
-            || self.native_video_source_swap_pending.is_some()
-            || self.detached_video_host_switch_pending()
-        {
-            return;
+        let mode_switch = self.native_video_mode_switch.is_some();
+        let source_swap = !mode_switch && self.native_video_source_swap_pending.is_some();
+        let detached_host_switch =
+            !mode_switch && !source_swap && self.detached_video_host_switch_pending();
+        if let Some(reason) = video_audio_enter_gate_rejection(VideoAudioEnterGate::Transition {
+            mode_switch,
+            source_swap,
+            detached_host_switch,
+        }) {
+            return VideoAudioEnterOutcome::Rejected(reason);
         }
         // presenter が実際に上がっている (HWND publish 済み) ことを確認する。まだ preparing の
         // 動画で音声モードに入るのは無意味なので弾く。
@@ -7515,8 +8065,10 @@ impl App {
             self.fs_cache.get(&fs_idx),
             Some(FsCacheEntry::Video { player, .. }) if player.native_presenter_hwnd() != 0
         );
-        if !has_presenter {
-            return;
+        if let Some(reason) =
+            video_audio_enter_gate_rejection(VideoAudioEnterGate::PresenterAvailable(has_presenter))
+        {
+            return VideoAudioEnterOutcome::Rejected(reason);
         }
         // 音声トラックが無い動画は音声モードにしても無音 + 空波形なので弾く (Codex 7d P3)。
         // info 未取得 (稀、presenter 起動済みなら通常取得済み) のときは許可する。
@@ -7524,9 +8076,11 @@ impl App {
             self.fs_cache.get(&fs_idx),
             Some(FsCacheEntry::Video { player, .. }) if player.info().is_some_and(|i| !i.has_audio)
         );
-        if no_audio_track {
+        if let Some(reason) =
+            video_audio_enter_gate_rejection(VideoAudioEnterGate::AudioTrackMissing(no_audio_track))
+        {
             self.show_feedback_toast("この動画には音声トラックがありません".to_string());
-            return;
+            return VideoAudioEnterOutcome::Rejected(reason);
         }
         // exit で placement 復帰の判定に使う enter 時点の物理ターゲット (placement / rect /
         // owner_hwnd) を先に捕捉する。DetachedWindow では host HWND / client rect が取れない
@@ -7535,13 +8089,16 @@ impl App {
         // target 確定を必須にして、取れなければ teardown 前に no-op で抜ける (Codex 7e 助言)。
         // Fullscreen / MainWindow は main_hwnd 前提なので通常 Some。
         let entry_target = self.native_video_target_for_presentation(self.viewer_presentation);
-        if matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow)
-            && entry_target.is_none()
+        if let Some(reason) =
+            video_audio_enter_gate_rejection(VideoAudioEnterGate::DetachedEntryTarget {
+                detached: matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow),
+                target_available: entry_target.is_some(),
+            })
         {
             self.show_feedback_toast(
                 "別ウィンドウの準備中です。少し待ってからもう一度お試しください".to_string(),
             );
-            return;
+            return VideoAudioEnterOutcome::Rejected(reason);
         }
         // ── VST/owner/HUD teardown (exit_music_vst_shell と同じ順序、presenter HWND 生存中に) ──
         self.dsp_bridge.set_existing_guis_owner_to_main();
@@ -7593,9 +8150,7 @@ impl App {
             player.set_native_window_visible(false);
         }
         ctx.request_repaint();
-        crate::logger::log(format!(
-            "[video-audio] entered audio mode (hidden presenter) for fs_idx={fs_idx}"
-        ));
+        VideoAudioEnterOutcome::Entered
     }
 
     /// 「動画→音声モード」を抜けて動画表示へ戻る (Inc 7 hidden presenter、docs §5.7.0)。
@@ -9226,5 +9781,233 @@ mod iconic_thumbnail_tests {
         assert!(!main_iconic_video_source_enabled(true, true, false));
         assert!(!main_iconic_video_source_enabled(false, false, false));
         assert!(!main_iconic_video_source_enabled(false, true, true));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod native_video_key_observation_tests {
+    use super::*;
+
+    fn diagnostic_record(
+        seq: u64,
+        repeat: bool,
+        outcome: NativeVideoKeyOutcome,
+    ) -> NativeVideoKeyDiagnosticRecord {
+        NativeVideoKeyDiagnosticRecord {
+            seq,
+            fs_idx: 7,
+            presentation: ViewerPresentation::DetachedWindow,
+            video_audio_mode: Some(7),
+            music_vst_shell: true,
+            foreground_hwnd: 0xA1,
+            presenter_hwnd: 0xB2,
+            key: crate::video::native_window::NativeVideoKeyEvent {
+                virtual_key: 0x5A,
+                scan_code: 0x2C,
+                extended: true,
+                shift: false,
+                ctrl: true,
+                alt: true,
+                repeat,
+            },
+            outcome,
+        }
+    }
+
+    #[test]
+    fn native_video_key_diagnostic_format_contains_every_observation_field() {
+        let line = format_native_video_key_diagnostic(&diagnostic_record(
+            42,
+            false,
+            NativeVideoKeyOutcome::Action(KeyAction::VideoToggleAudioMode),
+        ));
+        assert_eq!(
+            line,
+            "[native-video-key] seq=42 virtual_key=0x5A scan_code=0x002C extended=true ctrl=true shift=false alt=true repeat=false fs_idx=7 presentation=detached video_audio_mode=Some(7) music_vst_shell=true foreground_hwnd=0xA1 presenter_hwnd=0xB2 outcome=action:VideoToggleAudioMode"
+        );
+    }
+
+    #[test]
+    fn native_video_key_outcome_format_is_typed_and_complete() {
+        let cases = [
+            (
+                NativeVideoKeyOutcome::Blocked(NativeVideoKeyBlockReason::MusicVstShell),
+                "blocked:music_vst_shell",
+            ),
+            (
+                NativeVideoKeyOutcome::Blocked(NativeVideoKeyBlockReason::NormalizeModal),
+                "blocked:normalize_modal",
+            ),
+            (
+                NativeVideoKeyOutcome::Blocked(NativeVideoKeyBlockReason::StaleDetachedToggle),
+                "blocked:stale_detached_toggle",
+            ),
+            (
+                NativeVideoKeyOutcome::Action(KeyAction::VideoPin),
+                "action:VideoPin",
+            ),
+            (
+                NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::RatingContainer(5)),
+                "action:rating_container_5",
+            ),
+            (NativeVideoKeyOutcome::NoMatch, "no_match"),
+        ];
+        for (outcome, expected) in cases {
+            assert_eq!(outcome.format(), expected);
+        }
+    }
+
+    #[test]
+    fn native_video_repeat_batch_counts_every_event_and_outcome() {
+        let mut batch = NativeVideoKeyRepeatBatch::new(diagnostic_record(
+            10,
+            true,
+            NativeVideoKeyOutcome::Action(KeyAction::VideoSeekBackSmall),
+        ));
+        batch.observe(diagnostic_record(
+            11,
+            true,
+            NativeVideoKeyOutcome::Action(KeyAction::VideoSeekBackSmall),
+        ));
+        batch.observe(diagnostic_record(12, true, NativeVideoKeyOutcome::NoMatch));
+
+        let line = format_native_video_key_repeat_batch(&batch);
+        assert_eq!(batch.count, 3);
+        assert!(line.contains("repeat_batch count=3 seq_first=10 seq_last=12"));
+        assert!(line.contains("outcomes=[action:VideoSeekBackSmall=2,no_match=1]"));
+        assert!(line.contains("first=(seq=10 virtual_key=0x5A"));
+        assert!(line.contains("last=(seq=12 virtual_key=0x5A"));
+    }
+
+    #[test]
+    fn video_audio_enter_gate_covers_all_six_early_return_reasons() {
+        let transition_reason = VideoAudioEnterRejectReason::TransitionInProgress {
+            mode_switch: false,
+            source_swap: true,
+            detached_host_switch: false,
+        };
+        let reject_cases = [
+            (
+                VideoAudioEnterGate::AlreadyActive(true),
+                VideoAudioEnterRejectReason::AlreadyActive,
+            ),
+            (
+                VideoAudioEnterGate::ItemOrFullscreen {
+                    is_video: true,
+                    fullscreen_matches: false,
+                },
+                VideoAudioEnterRejectReason::ItemOrFullscreenMismatch,
+            ),
+            (
+                VideoAudioEnterGate::Transition {
+                    mode_switch: false,
+                    source_swap: true,
+                    detached_host_switch: false,
+                },
+                transition_reason,
+            ),
+            (
+                VideoAudioEnterGate::PresenterAvailable(false),
+                VideoAudioEnterRejectReason::PresenterUnavailable,
+            ),
+            (
+                VideoAudioEnterGate::AudioTrackMissing(true),
+                VideoAudioEnterRejectReason::NoAudioTrack,
+            ),
+            (
+                VideoAudioEnterGate::DetachedEntryTarget {
+                    detached: true,
+                    target_available: false,
+                },
+                VideoAudioEnterRejectReason::DetachedEntryTargetUnavailable,
+            ),
+        ];
+        assert_eq!(reject_cases.len(), 6);
+        for (gate, expected) in reject_cases {
+            assert_eq!(video_audio_enter_gate_rejection(gate), Some(expected));
+        }
+
+        let allowed_cases = [
+            VideoAudioEnterGate::AlreadyActive(false),
+            VideoAudioEnterGate::ItemOrFullscreen {
+                is_video: true,
+                fullscreen_matches: true,
+            },
+            VideoAudioEnterGate::Transition {
+                mode_switch: false,
+                source_swap: false,
+                detached_host_switch: false,
+            },
+            VideoAudioEnterGate::PresenterAvailable(true),
+            VideoAudioEnterGate::AudioTrackMissing(false),
+            VideoAudioEnterGate::DetachedEntryTarget {
+                detached: false,
+                target_available: false,
+            },
+        ];
+        for gate in allowed_cases {
+            assert_eq!(video_audio_enter_gate_rejection(gate), None);
+        }
+    }
+
+    #[test]
+    fn video_audio_enter_result_format_includes_source_and_typed_reason() {
+        let cases = [
+            (
+                VideoAudioEnterSource::NativeKey,
+                VideoAudioEnterOutcome::Rejected(VideoAudioEnterRejectReason::AlreadyActive),
+                "[video-audio] enter result source=native_key fs_idx=9 outcome=rejected:already_active",
+            ),
+            (
+                VideoAudioEnterSource::NativeOutputEvent,
+                VideoAudioEnterOutcome::Rejected(
+                    VideoAudioEnterRejectReason::ItemOrFullscreenMismatch,
+                ),
+                "[video-audio] enter result source=native_output_event fs_idx=9 outcome=rejected:item_or_fullscreen_mismatch",
+            ),
+            (
+                VideoAudioEnterSource::DeferredCompletion,
+                VideoAudioEnterOutcome::Rejected(
+                    VideoAudioEnterRejectReason::TransitionInProgress {
+                        mode_switch: true,
+                        source_swap: false,
+                        detached_host_switch: false,
+                    },
+                ),
+                "[video-audio] enter result source=deferred_completion fs_idx=9 outcome=rejected:transition_in_progress(mode_switch=true,source_swap=false,detached_host_switch=false)",
+            ),
+            (
+                VideoAudioEnterSource::NativeKey,
+                VideoAudioEnterOutcome::Rejected(VideoAudioEnterRejectReason::PresenterUnavailable),
+                "[video-audio] enter result source=native_key fs_idx=9 outcome=rejected:presenter_unavailable",
+            ),
+            (
+                VideoAudioEnterSource::NativeOutputEvent,
+                VideoAudioEnterOutcome::Rejected(VideoAudioEnterRejectReason::NoAudioTrack),
+                "[video-audio] enter result source=native_output_event fs_idx=9 outcome=rejected:no_audio_track",
+            ),
+            (
+                VideoAudioEnterSource::DeferredCompletion,
+                VideoAudioEnterOutcome::Rejected(
+                    VideoAudioEnterRejectReason::DetachedEntryTargetUnavailable,
+                ),
+                "[video-audio] enter result source=deferred_completion fs_idx=9 outcome=rejected:detached_entry_target_unavailable",
+            ),
+        ];
+        assert_eq!(cases.len(), 6);
+        for (source, outcome, expected) in cases {
+            assert_eq!(
+                format_video_audio_enter_result(source, 9, outcome),
+                expected
+            );
+        }
+        assert_eq!(
+            format_video_audio_enter_result(
+                VideoAudioEnterSource::NativeKey,
+                9,
+                VideoAudioEnterOutcome::Entered,
+            ),
+            "[video-audio] enter result source=native_key fs_idx=9 outcome=entered"
+        );
     }
 }
