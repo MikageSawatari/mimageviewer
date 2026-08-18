@@ -441,21 +441,24 @@ README の更新履歴で確認できる最新リリース v2.13.0 までの cat
 `pdfthumb:` 行だけを一度削除して両寸法を再生成する。画像 / ZIP 等の行は残す。旧 catalog を
 読み取り専用で参照する経路では、未追加の `layout_*` を NULL として扱う。
 
-`ConvertibleArchive` の cache ZIP 対応表 (`App.converted_archive_cache_paths`) は
-`install_new_items` で現在 items の path/mtime/size と、folder thumb pin を引く container root
-だけを snapshot する。SQLite `peek`、cache ZIP の `exists()`、pin の DB lookup・cascade・stat は
-`ConvertedArchiveCachePathsPending` worker で解決し、最終 leaf が RAR / 7z / LZH のときだけ
-対応表へ加える。refresh 開始時には現行 map を clear せず、worker の新しい snapshot が届くまで
-前の値を保つ。key は正規化済み元アーカイブ path なので、別フォルダ由来の値が無関係なタイルへ
-誤適用されることはない。
+`ConvertibleArchive` の読み取り元表 (`App.converted_archive_cache_paths`) は、候補ごとに
+`Pending / Direct(PathBuf) / CachedZip(PathBuf) / Unavailable` を持つ。map entry の欠落を
+「未判定」と「判定済みだが読み取り元なし」の兼用 sentinel にしない。`install_new_items` は
+current-folder generation の候補を先に `Pending` で登録し、path/mtime/size と folder thumb pin を
+引く container root だけを snapshot する。SQLite `peek`、cache ZIP の `exists()`、RAR header
+inspection、pin の DB lookup・cascade・stat は `ConvertedArchiveCachePathsPending` worker で行う。
 
-worker 完了前、直接の `ConvertibleArchive` タイルは `make_load_request` が `None` を返して
-Pending のまま再試行される。一方、Folder タイルの pin が変換対象アーカイブへ解決される場合は
-base request へ fallback できるため、その request が先に Loaded へ進むことがある。worker は
-pin 解決と同時に `(item index, archive key)` の依存集合も返し、poll で map の値が実際に変わった
-key に依存するタイルだけを Evicted に戻す。reload/heavy queue と `requested` も通常の thumbnail
-再要求 helper で同時に外し、次の keep-range update が新 map から request を組み直す。
-同じ map が再度届いた場合は失効を行わないため、この handoff は `load_folder` や
+worker は spawn 時点の可視範囲、keep range、可視範囲からの距離順に 1 本で候補を処理し、
+1 件の判定が終わるたび `Direct` / `CachedZip` / `Unavailable` を UI へ送る。スクロール後の動的な
+優先度変更は行わない。poll は通知ごとに `items_generation` を照合し、同世代だけ map へ反映して
+repaint を要求する。全候補完了時だけ従来の総括 perf event `nav/archive_cache_peek` を 1 回記録する。
+`make_load_request` は `Direct` / `CachedZip` だけから heavy thumbnail request を作り、`Pending` /
+`Unavailable` では `None` を返すため、全候補の完了を可視 RAR のサムネイル開始条件にしない。
+
+Folder タイルの pin が変換対象アーカイブへ解決される場合は、worker が dependency を結果より先に
+逐次通知する。読み取り元が実際に変わった key に依存するタイルだけを Evicted に戻し、reload/heavy
+queue と `requested` も通常の thumbnail 再要求 helper で同時に外す。同一 generation の refresh が
+同じ終端状態を再通知しても失効しないため、この handoff は `load_folder` や
 `folder_thumb_pin_dirty` を介さず有限回で収束する。
 この経路で `make_load_request` から `archive_cache.db` やファイルシステムを直接触らないこと。
 

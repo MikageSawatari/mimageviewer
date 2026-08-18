@@ -7656,8 +7656,10 @@ mod phase_c_drill_nav_tests {
             "cache ZIP map が無い間は従来どおり元アーカイブ root だけを見る"
         );
 
-        app.converted_archive_cache_paths
-            .insert(crate::path_key::normalize_keep_drive(&src), cache.clone());
+        app.converted_archive_cache_paths.insert(
+            crate::path_key::normalize_keep_drive(&src),
+            crate::app::ConvertedArchiveSourceState::CachedZip(cache.clone()),
+        );
         app.rebuild_visible_indices();
         assert_eq!(
             app.visible_indices,
@@ -10798,7 +10800,9 @@ fn begin_detached_bookmark_media_test(
     );
     app.converted_archive_cache_paths.insert(
         "main-grid-archive".to_string(),
-        PathBuf::from(r"C:\main-grid\cached.zip"),
+        crate::app::ConvertedArchiveSourceState::CachedZip(PathBuf::from(
+            r"C:\main-grid\cached.zip",
+        )),
     );
     app.current_color_cache_map = Some(std::sync::Arc::new(std::sync::RwLock::new(
         std::collections::HashMap::from([(
@@ -16740,7 +16744,10 @@ mod favorite_adjustment_defaults_tests {
             format: crate::archive_converter::ArchiveFormat::SevenZ,
         };
         let mut converted = std::collections::HashMap::new();
-        converted.insert(crate::path_key::normalize_keep_drive(&src), cache.clone());
+        converted.insert(
+            crate::path_key::normalize_keep_drive(&src),
+            crate::app::ConvertedArchiveSourceState::CachedZip(cache.clone()),
+        );
         let pins: std::collections::HashMap<String, FolderPinSource> =
             std::collections::HashMap::new();
 
@@ -16818,9 +16825,10 @@ mod favorite_adjustment_defaults_tests {
         );
 
         let key = crate::path_key::normalize_keep_drive(&src);
-        assert!(
-            app.converted_archive_cache_paths.is_empty(),
-            "install_new_items must not synchronously peek archive_cache.db"
+        assert_eq!(
+            app.converted_archive_cache_paths.get(&key),
+            Some(&crate::app::ConvertedArchiveSourceState::Pending),
+            "install_new_items must publish an explicit Pending state without peeking the DB"
         );
         assert!(app.converted_archive_cache_paths_pending.is_some());
 
@@ -16834,7 +16842,182 @@ mod favorite_adjustment_defaults_tests {
         }
 
         assert!(app.converted_archive_cache_paths_pending.is_none());
-        assert_eq!(app.converted_archive_cache_paths.get(&key), Some(&cached));
+        assert_eq!(
+            app.converted_archive_cache_paths
+                .get(&key)
+                .and_then(crate::app::ConvertedArchiveSourceState::load_path),
+            Some(cached.as_path())
+        );
+    }
+
+    #[test]
+    fn convertible_archive_typed_states_distinguish_waiting_from_unavailable() {
+        let src = PathBuf::from(r"C:\books\book.7z");
+        let direct = PathBuf::from(r"C:\books\book.rar");
+        let cached = PathBuf::from(r"C:\cache\book.zip");
+        let item = GridItem::ConvertibleArchive {
+            path: src.clone(),
+            format: crate::archive_converter::ArchiveFormat::SevenZ,
+        };
+        let key = crate::path_key::normalize_keep_drive(&src);
+        let pins = std::collections::HashMap::new();
+
+        for state in [
+            crate::app::ConvertedArchiveSourceState::Pending,
+            crate::app::ConvertedArchiveSourceState::Unavailable,
+        ] {
+            let sources = std::collections::HashMap::from([(key.clone(), state)]);
+            assert!(
+                make_load_request(
+                    &item, 0, 1, 2, false, None, None, 0, &pins, &sources, None, None, None, None,
+                    false,
+                )
+                .is_none(),
+                "Pending and Unavailable are distinct typed states but neither has a load source"
+            );
+        }
+
+        for state in [
+            crate::app::ConvertedArchiveSourceState::Direct(direct.clone()),
+            crate::app::ConvertedArchiveSourceState::CachedZip(cached.clone()),
+        ] {
+            let expected = state.load_path().unwrap().to_path_buf();
+            let sources = std::collections::HashMap::from([(key.clone(), state)]);
+            let request = make_load_request(
+                &item, 0, 1, 2, false, None, None, 0, &pins, &sources, None, None, None, None,
+                false,
+            )
+            .expect("resolved archive state should build a request");
+            assert_eq!(request.path, expected);
+        }
+    }
+
+    #[test]
+    fn first_incremental_archive_result_builds_request_while_others_are_pending() {
+        let mut app = setup_app();
+        let paths = [
+            app.tmp.path().join("first.7z"),
+            app.tmp.path().join("second.7z"),
+            app.tmp.path().join("third.7z"),
+        ];
+        app.items = paths
+            .iter()
+            .cloned()
+            .map(|path| GridItem::ConvertibleArchive {
+                path,
+                format: crate::archive_converter::ArchiveFormat::SevenZ,
+            })
+            .collect();
+        app.image_metas = vec![Some((1, 2)); paths.len()];
+        app.thumbnails = vec![ThumbnailState::Pending; paths.len()];
+        let keys: Vec<_> = paths
+            .iter()
+            .map(|path| crate::path_key::normalize_keep_drive(path))
+            .collect();
+        app.converted_archive_cache_paths = keys
+            .iter()
+            .cloned()
+            .map(|key| (key, crate::app::ConvertedArchiveSourceState::Pending))
+            .collect();
+        let generation = app.items_generation;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.converted_archive_cache_paths_pending = Some(ConvertedArchiveCachePathsPending {
+            generation,
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+            pin_archive_dependencies: std::collections::HashMap::new(),
+        });
+        let cached = app.tmp.path().join("first.zip");
+        tx.send(ConvertedArchiveCachePathsMsg::Resolved {
+            archive_key: keys[0].clone(),
+            state: crate::app::ConvertedArchiveSourceState::CachedZip(cached.clone()),
+            idx: 0,
+            ordinal: 1,
+            elapsed_ms: 5.0,
+            input_seq: 7,
+        })
+        .unwrap();
+
+        app.poll_converted_archive_cache_paths(&egui::Context::default());
+
+        assert!(
+            app.converted_archive_cache_paths_pending.is_some(),
+            "the batch must remain active until Finished"
+        );
+        let request = make_load_request(
+            &app.items[0],
+            0,
+            1,
+            2,
+            false,
+            None,
+            None,
+            0,
+            &std::collections::HashMap::new(),
+            &app.converted_archive_cache_paths,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("the first resolved candidate should not wait for the remaining two");
+        assert_eq!(request.path, cached);
+        assert!(matches!(
+            app.converted_archive_cache_paths.get(&keys[1]),
+            Some(crate::app::ConvertedArchiveSourceState::Pending)
+        ));
+        assert!(matches!(
+            app.converted_archive_cache_paths.get(&keys[2]),
+            Some(crate::app::ConvertedArchiveSourceState::Pending)
+        ));
+    }
+
+    #[test]
+    fn stale_incremental_archive_result_is_rejected_per_message() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("stale.7z");
+        let key = crate::path_key::normalize_keep_drive(&source);
+        app.converted_archive_cache_paths.insert(
+            key.clone(),
+            crate::app::ConvertedArchiveSourceState::Pending,
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.converted_archive_cache_paths_pending = Some(ConvertedArchiveCachePathsPending {
+            generation: app.items_generation.wrapping_sub(1),
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+            pin_archive_dependencies: std::collections::HashMap::new(),
+        });
+        tx.send(ConvertedArchiveCachePathsMsg::Resolved {
+            archive_key: key.clone(),
+            state: crate::app::ConvertedArchiveSourceState::CachedZip(
+                app.tmp.path().join("stale.zip"),
+            ),
+            idx: 0,
+            ordinal: 1,
+            elapsed_ms: 1.0,
+            input_seq: 1,
+        })
+        .unwrap();
+
+        app.poll_converted_archive_cache_paths(&egui::Context::default());
+
+        assert!(app.converted_archive_cache_paths_pending.is_none());
+        assert_eq!(
+            app.converted_archive_cache_paths.get(&key),
+            Some(&crate::app::ConvertedArchiveSourceState::Pending)
+        );
+    }
+
+    #[test]
+    fn archive_candidate_priority_is_visible_then_keep_then_distance() {
+        let visible = (20, 30);
+        let keep = (10, 40);
+        let mut indices = vec![80, 39, 24, 12, 3, 30, 20];
+        indices
+            .sort_unstable_by_key(|idx| converted_archive_candidate_priority(*idx, visible, keep));
+        assert_eq!(indices, vec![20, 24, 30, 12, 39, 3, 80]);
     }
 
     #[test]
@@ -16905,8 +17088,9 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.converted_archive_cache_paths_pending.is_none());
         assert_eq!(
             app.converted_archive_cache_paths
-                .get(&crate::path_key::normalize_keep_drive(&src)),
-            Some(&cached)
+                .get(&crate::path_key::normalize_keep_drive(&src))
+                .and_then(crate::app::ConvertedArchiveSourceState::load_path),
+            Some(cached.as_path())
         );
     }
 
@@ -17045,8 +17229,9 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.converted_archive_cache_paths_pending.is_none());
         assert_eq!(
             app.converted_archive_cache_paths
-                .get(&crate::path_key::normalize_keep_drive(&src)),
-            Some(&cached)
+                .get(&crate::path_key::normalize_keep_drive(&src))
+                .and_then(crate::app::ConvertedArchiveSourceState::load_path),
+            Some(cached.as_path())
         );
         assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
         assert!(!app.requested.contains_key(&0));
@@ -17162,7 +17347,10 @@ mod favorite_adjustment_defaults_tests {
             entry: "inner/p01.png".to_string(),
         };
         let mut converted = std::collections::HashMap::new();
-        converted.insert(crate::path_key::normalize_keep_drive(&src), cache.clone());
+        converted.insert(
+            crate::path_key::normalize_keep_drive(&src),
+            crate::app::ConvertedArchiveSourceState::CachedZip(cache.clone()),
+        );
         let mut pins = std::collections::HashMap::new();
         pins.insert(crate::path_key::normalize_keep_drive(&src), source.clone());
 
@@ -17270,7 +17458,7 @@ mod favorite_adjustment_defaults_tests {
         let mut converted = std::collections::HashMap::new();
         converted.insert(
             crate::path_key::normalize_keep_drive(&archive),
-            cached.clone(),
+            crate::app::ConvertedArchiveSourceState::CachedZip(cached.clone()),
         );
 
         let req = make_load_request(
@@ -17364,7 +17552,7 @@ mod favorite_adjustment_defaults_tests {
         let mut converted = std::collections::HashMap::new();
         converted.insert(
             crate::path_key::normalize_keep_drive(&archive),
-            cached.clone(),
+            crate::app::ConvertedArchiveSourceState::CachedZip(cached.clone()),
         );
 
         let req = make_load_request(
@@ -17785,7 +17973,7 @@ mod favorite_adjustment_defaults_tests {
 
         app.converted_archive_cache_paths.insert(
             crate::path_key::normalize_keep_drive(&archive),
-            cached.clone(),
+            crate::app::ConvertedArchiveSourceState::CachedZip(cached.clone()),
         );
         let ready_in_memory = app.compute_folder_pin_button_state().unwrap();
         assert!(ready_in_memory.enabled);

@@ -1553,7 +1553,8 @@ impl crate::app::App {
         if let GridItem::ConvertibleArchive { path, .. } = &target.item
             && !self
                 .converted_archive_cache_paths
-                .contains_key(&crate::path_key::normalize_keep_drive(path))
+                .get(&crate::path_key::normalize_keep_drive(path))
+                .is_some_and(crate::app::ConvertedArchiveSourceState::is_available)
         {
             return Some(("📌 代表サムネ固定: 変換後に設定可能".to_string(), false));
         }

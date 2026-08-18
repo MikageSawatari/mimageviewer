@@ -886,6 +886,25 @@
   - 同一 RAR の header 判定回数を計装または test double で固定し、一覧判定直後のサムネイル
     生成で同じ全 entry scan を繰り返さない。
 - 規模 / 優先度: 中 / P2。利用者へ「本日リリース予定版の次で対応」と回答済み。
+- **対応済み (2026-08-18、backlog 2.3 close)**:
+  - `converted_archive_cache_paths` を `Pending / Direct / CachedZip / Unavailable` の typed state
+    に変更し、未判定と判定済み利用不可を分離した。worker は候補 1 件ごとに結果を送り、UI は
+    メッセージごとに `items_generation` を検証して同世代だけを反映する。pin dependency も先に
+    逐次登録し、解決した archive key に依存する tile だけを再要求する。
+  - 判定順は spawn 時点の visible → keep → visible からの距離順。worker は従来どおり 1 本で、
+    同期 header scan を UI thread へ戻していない。スクロール後の動的な再優先化は今回見送り、
+    PDF pool の promotion に相当する仕組みが必要なら別案件で扱う。
+  - `nav/archive_cache_peek` は全体総括として維持し、逐次表示との比較用に候補ごとの
+    `nav/archive_cache_candidate` (ordinal / idx / state / 累積 ms) を追加した。
+  - isolated portable smoke (`target\portable-smoke\data`、`--perf-log`) で上記 133 RAR を
+    再計測した。visible `[0..12)` の12件は起動後 **0.801〜0.860秒**で `thumb/ready`。
+    候補 #100 は 0.787秒、最初の重い RAR である #101 は 0.892秒、#130 は 4.021秒
+    (`archive-cache-peek` worker 内の累積 3,257.5ms) だった。したがって可視12件は、残り
+    33件の判定が終わる前にすべてサムネイル化されており、従来の全133件待ちは解消した。
+  - §1.4 の重複 header scan は caller を全件監査した。folder 一覧の eligibility inspection の後、
+    thumbnail worker の代表画像選択が `enumerate_image_entries_detailed` でもう一度 RAR 全 header を
+    列挙する。これを 1 回へ統合するには `RarInspection` と thumbnail/open の列挙契約をまたぐため、
+    brief の停止条件に従い本件には押し込まなかった。今回閉じるのは全件判定待ちの表示遅延である。
 
 ### 2.5 選択済み項目を、修飾なしの再クリックで開く — 専用スレ >>246
 

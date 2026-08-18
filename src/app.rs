@@ -2150,7 +2150,7 @@ struct ViewerContextBundle {
     current_folder_last_mtime: Option<std::time::SystemTime>,
     current_folder_signature: Option<u64>,
     folder_pin_map: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
-    converted_archive_cache_paths: std::collections::HashMap<String, PathBuf>,
+    converted_archive_cache_paths: std::collections::HashMap<String, ConvertedArchiveSourceState>,
     converted_archive_cache_paths_pending: Option<ConvertedArchiveCachePathsPending>,
     current_color_cache_map: Option<
         Arc<std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>>,
@@ -4292,13 +4292,51 @@ enum DetachedPhysicalFolderOpenPoll {
     Failed,
 }
 
-/// 親フォルダ上の `ConvertibleArchive` タイル用に、変換済み cache ZIP の対応表を
+/// この items generation における変換対象アーカイブの読み取り元。
+///
+/// `HashMap` の entry 有無を「未判定」と「判定済みで利用不可」の
+/// sentinel にしない。候補は worker 起動前に `Pending` として公開し、
+/// 1 件ずつ終端状態へ遷移する。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ConvertedArchiveSourceState {
+    Pending,
+    Direct(PathBuf),
+    CachedZip(PathBuf),
+    Unavailable,
+}
+
+impl ConvertedArchiveSourceState {
+    pub(crate) fn load_path(&self) -> Option<&Path> {
+        match self {
+            Self::Direct(path) | Self::CachedZip(path) => Some(path),
+            Self::Pending | Self::Unavailable => None,
+        }
+    }
+
+    pub(crate) fn is_available(&self) -> bool {
+        self.load_path().is_some()
+    }
+
+    fn perf_label(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Direct(_) => "direct",
+            Self::CachedZip(_) => "cached_zip",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// 親フォルダ上の `ConvertibleArchive` タイル用読み取り元を
 /// UI スレッド外で解決している状態。
 pub(crate) struct ConvertedArchiveCachePathsPending {
     /// 起動時の items 世代。完了時に変わっていれば結果を捨てる。
     generation: u64,
     cancel: Arc<AtomicBool>,
-    rx: mpsc::Receiver<ConvertedArchiveCachePathsResult>,
+    rx: mpsc::Receiver<ConvertedArchiveCachePathsMsg>,
+    /// normalized source archive key -> その読み取り元に依存する tile idx。
+    /// worker が pin cascade を解決した時点で逐次追加する。
+    pin_archive_dependencies: std::collections::HashMap<String, Vec<usize>>,
 }
 
 impl ConvertedArchiveCachePathsPending {
@@ -4313,16 +4351,104 @@ impl Drop for ConvertedArchiveCachePathsPending {
     }
 }
 
-struct ConvertedArchiveCachePathsResult {
-    paths: std::collections::HashMap<String, PathBuf>,
-    /// (item index, normalized source archive key) pairs for tiles whose
-    /// folder-thumb pin resolution needs paths to build its LoadRequest.
-    /// The indices are safe to apply only while generation still matches.
-    pin_archive_dependencies: Vec<(usize, String)>,
-    peeked: usize,
-    hits: usize,
-    elapsed_ms: f64,
-    input_seq: u64,
+enum ConvertedArchiveCachePathsMsg {
+    /// pin cascade から見つかった候補。候補結果より必ず先に送る。
+    PinDependency { idx: usize, archive_key: String },
+    /// 候補 1 件の判定完了。残り候補の完了を待たず UI へ公開する。
+    Resolved {
+        archive_key: String,
+        state: ConvertedArchiveSourceState,
+        idx: usize,
+        ordinal: usize,
+        elapsed_ms: f64,
+        input_seq: u64,
+    },
+    /// 全候補の総括。`nav/archive_cache_peek` の従来の意味を保つ。
+    Finished {
+        peeked: usize,
+        hits: usize,
+        elapsed_ms: f64,
+        input_seq: u64,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct ConvertedArchiveCandidate {
+    archive_key: String,
+    path: PathBuf,
+    mtime: i64,
+    file_size: i64,
+    idx: usize,
+}
+
+fn index_distance_from_range(idx: usize, range: (usize, usize)) -> usize {
+    if idx < range.0 {
+        range.0 - idx
+    } else if idx >= range.1 {
+        idx - range.1.saturating_sub(1)
+    } else {
+        0
+    }
+}
+
+/// spawn 時点の visible -> keep -> その他の順で、visible からの距離を返す。
+fn converted_archive_candidate_priority(
+    idx: usize,
+    visible_range: (usize, usize),
+    keep_range: (usize, usize),
+) -> (u8, usize, usize) {
+    let band = if idx >= visible_range.0 && idx < visible_range.1 {
+        0
+    } else if idx >= keep_range.0 && idx < keep_range.1 {
+        1
+    } else {
+        2
+    };
+    (band, index_distance_from_range(idx, visible_range), idx)
+}
+
+fn resolve_converted_archive_candidate(
+    candidate: &ConvertedArchiveCandidate,
+    db: Option<&crate::archive_cache::ArchiveCacheDb>,
+    cancel: &AtomicBool,
+) -> Option<ConvertedArchiveSourceState> {
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    let mut cache_src = candidate.path.clone();
+    let mut cache_mtime = candidate.mtime;
+    let mut cache_file_size = candidate.file_size;
+    if crate::rar_loader::is_rar_path(&candidate.path) {
+        match crate::rar_loader::inspect_for_direct_read_cancelable(&candidate.path, cancel) {
+            Ok(inspection)
+                if inspection.decision == crate::rar_loader::RarDirectReadDecision::Direct =>
+            {
+                return Some(ConvertedArchiveSourceState::Direct(
+                    inspection.resolved_path,
+                ));
+            }
+            Ok(inspection) => {
+                // A visible subsequent volume represents the same logical book as its first
+                // volume. Cache lookup therefore uses the header-resolved first path while the
+                // grid cell keeps the exact file used by shell operations.
+                cache_src = inspection.resolved_path;
+                if let Ok(metadata) = std::fs::metadata(&cache_src) {
+                    cache_mtime = crate::ui_helpers::mtime_secs(&metadata);
+                    cache_file_size = metadata.len() as i64;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => return None,
+            Err(_) => {}
+        }
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    let state = db
+        .and_then(|db| db.peek(&cache_src, cache_mtime, cache_file_size))
+        .map(ConvertedArchiveSourceState::CachedZip)
+        .unwrap_or(ConvertedArchiveSourceState::Unavailable);
+    (!cancel.load(Ordering::Relaxed)).then_some(state)
 }
 
 /// `poll_folder_nav` がワーカー完了を検知したときに返す情報。
@@ -10200,11 +10326,13 @@ pub struct App {
     /// 同期参照する (per-frame DB アクセス回避)。キーは `normalize_keep_drive(container)`。
     pub(crate) folder_pin_map:
         std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
-    /// 現在ロード済み items のうち、変換済みキャッシュを持つ RAR/7z/LZH の対応表。
-    /// キーは元アーカイブの `normalize_keep_drive(path)`、値は読み取り元の cache ZIP。
-    /// 親フォルダ上の `ConvertibleArchive` タイルはこの ZIP の先頭画像 / ピン画像を
-    /// `archivethumb:` キーで表示する。
-    pub(crate) converted_archive_cache_paths: std::collections::HashMap<String, PathBuf>,
+    /// 現在ロード済み items の変換対象アーカイブごとの判定状態。
+    /// キーは元アーカイブの `normalize_keep_drive(path)`。候補は `Pending` から
+    /// `Direct` / `CachedZip` / `Unavailable` のいずれかへ 1 件ずつ遷移する。
+    /// 親フォルダ上の `ConvertibleArchive` タイルは解決済み読み取り元の先頭画像 /
+    /// ピン画像を `archivethumb:` キーで表示する。
+    pub(crate) converted_archive_cache_paths:
+        std::collections::HashMap<String, ConvertedArchiveSourceState>,
     /// `converted_archive_cache_paths` を UI スレッド外で構築している worker。
     pub(crate) converted_archive_cache_paths_pending: Option<ConvertedArchiveCachePathsPending>,
     /// 親コンテナのピン書き換えがあったので、次の機会にフォルダを再ロードして
@@ -23832,6 +23960,10 @@ impl App {
         // make_load_request からの per-frame DB ヒットを回避する。pin がレアケースで
         // 大半は empty なので、典型的なフォルダで HashMap は数百 bytes に収まる。
         if refresh_container_metadata {
+            // items_generation が進んだので前 generation の終端値を使い回さない。
+            // `start_*_refresh` は同 generation 内の再確認では完了値を
+            // 維持するため、generation 境界の clear は owner であるここで行う。
+            self.converted_archive_cache_paths.clear();
             self.start_converted_archive_cache_paths_refresh();
             self.refresh_folder_pin_map();
         } else {
@@ -23855,10 +23987,6 @@ impl App {
         if let Some(pending) = self.converted_archive_cache_paths_pending.take() {
             pending.cancel();
         }
-        // Keep the previous snapshot usable until the worker publishes its replacement.
-        // Keys are normalized source archive paths, so entries from the previous folder
-        // cannot resolve an unrelated tile. Clearing here used to create an empty window
-        // in which a folder pin fell back to (and permanently loaded) its base thumbnail.
         // サブ展開は Image / Video / Folder / ZipFile / PdfFile だけで、ConvertibleArchive は
         // 取り込まない。数百万件を判定しても必ず空なので synthetic path で即終了する。
         if self.current_folder.as_ref().is_some_and(|folder| {
@@ -23866,31 +23994,79 @@ impl App {
         }) {
             return;
         }
-        let Some(db) = self.archive_cache_db.clone() else {
-            return;
+        let total = self.items.len();
+        let cols = self.settings.grid_cols.max(1);
+        let cell_h = self.last_cell_h.max(32.0);
+        let viewport_h = self.last_viewport_h.max(cell_h);
+        let rows_per_page = (viewport_h / cell_h).ceil() as usize;
+        let items_per_page = (rows_per_page * cols).max(1);
+        let visible_start = if total == 0 {
+            0
+        } else {
+            ((self.scroll_offset_y / cell_h) as usize * cols).min(total - 1)
         };
-        let direct_inputs: Vec<(PathBuf, i64, i64)> = self
-            .items
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, item)| {
-                let path = match item {
-                    GridItem::ConvertibleArchive { path, .. } => path,
-                    GridItem::ZipDir { zip_path, .. }
-                        if zip_path
-                            .extension()
-                            .and_then(|ext| ext.to_str())
-                            .and_then(crate::archive_converter::ArchiveFormat::from_extension)
-                            .is_some() =>
+        let visible_range = (
+            visible_start,
+            visible_start.saturating_add(items_per_page).min(total),
+        );
+        let keep_range = (
+            visible_start.saturating_sub(self.settings.thumb_prev_pages as usize * items_per_page),
+            visible_start
+                .saturating_add((1 + self.settings.thumb_next_pages as usize) * items_per_page)
+                .min(total),
+        );
+
+        let mut direct_inputs: std::collections::HashMap<String, ConvertedArchiveCandidate> =
+            std::collections::HashMap::new();
+        for (idx, item) in self.items.iter().enumerate() {
+            let path = match item {
+                GridItem::ConvertibleArchive { path, .. } => path,
+                GridItem::ZipDir { zip_path, .. }
+                    if zip_path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .and_then(crate::archive_converter::ArchiveFormat::from_extension)
+                        .is_some() =>
+                {
+                    zip_path
+                }
+                _ => continue,
+            };
+            let archive_key = crate::path_key::normalize_keep_drive(path);
+            let Some((mtime, file_size)) = self.image_metas.get(idx).and_then(|meta| *meta) else {
+                self.converted_archive_cache_paths
+                    .insert(archive_key, ConvertedArchiveSourceState::Unavailable);
+                continue;
+            };
+            let candidate = ConvertedArchiveCandidate {
+                archive_key: archive_key.clone(),
+                path: path.clone(),
+                mtime,
+                file_size,
+                idx,
+            };
+            match direct_inputs.entry(archive_key.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(candidate);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if converted_archive_candidate_priority(idx, visible_range, keep_range)
+                        < converted_archive_candidate_priority(
+                            entry.get().idx,
+                            visible_range,
+                            keep_range,
+                        )
                     {
-                        zip_path
+                        entry.insert(candidate);
                     }
-                    _ => return None,
-                };
-                let (mtime, file_size) = self.image_metas.get(idx).and_then(|m| *m)?;
-                Some((path.clone(), mtime, file_size))
-            })
-            .collect();
+                }
+            }
+            // 新 generation では install 側が map を clear している。同 generation
+            // 内の再確認では、同じ完了値の再公開で tile を再 load しない。
+            self.converted_archive_cache_paths
+                .entry(archive_key)
+                .or_insert(ConvertedArchiveSourceState::Pending);
+        }
         // Folder タイル自身の pin が指す変換対象アーカイブは current items に現れない。
         // container root だけを snapshot し、DB lookup + cascade + metadata は worker 側で行う。
         let pin_roots: Vec<(usize, PathBuf)> = self
@@ -23906,6 +24082,7 @@ impl App {
         if direct_inputs.is_empty() && (pin_roots.is_empty() || pin_db.is_none()) {
             return;
         }
+        let db = self.archive_cache_db.clone();
         let max_cascade_depth = self.settings.folder_thumb_depth as usize;
 
         let generation = self.items_generation;
@@ -23917,18 +24094,9 @@ impl App {
             .name("archive-cache-peek".to_string())
             .spawn(move || {
                 let t0 = std::time::Instant::now();
-                let mut paths = std::collections::HashMap::new();
-                let mut pin_archive_dependencies = Vec::new();
                 let mut peeked = 0usize;
                 let mut hits = 0usize;
-                let mut candidates: std::collections::HashMap<String, (PathBuf, i64, i64)> =
-                    std::collections::HashMap::new();
-                for (path, mtime, file_size) in direct_inputs {
-                    candidates.insert(
-                        crate::path_key::normalize_keep_drive(&path),
-                        (path, mtime, file_size),
-                    );
-                }
+                let mut candidates = direct_inputs;
                 if let Some(pin_db) = pin_db.as_deref() {
                     for (idx, root) in pin_roots {
                         if worker_cancel.load(Ordering::Relaxed) {
@@ -23956,64 +24124,84 @@ impl App {
                         {
                             let archive_key =
                                 crate::path_key::normalize_keep_drive(&resolved.abs_path);
-                            pin_archive_dependencies.push((idx, archive_key.clone()));
-                            candidates.entry(archive_key).or_insert((
-                                resolved.abs_path,
-                                resolved.mtime,
-                                resolved.file_size,
-                            ));
+                            if tx
+                                .send(ConvertedArchiveCachePathsMsg::PinDependency {
+                                    idx,
+                                    archive_key: archive_key.clone(),
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                            let candidate = ConvertedArchiveCandidate {
+                                archive_key: archive_key.clone(),
+                                path: resolved.abs_path,
+                                mtime: resolved.mtime,
+                                file_size: resolved.file_size,
+                                idx,
+                            };
+                            match candidates.entry(archive_key) {
+                                std::collections::hash_map::Entry::Vacant(entry) => {
+                                    entry.insert(candidate);
+                                }
+                                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                                    if converted_archive_candidate_priority(
+                                        idx,
+                                        visible_range,
+                                        keep_range,
+                                    ) < converted_archive_candidate_priority(
+                                        entry.get().idx,
+                                        visible_range,
+                                        keep_range,
+                                    ) {
+                                        entry.insert(candidate);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
-                for (_, (path, mtime, file_size)) in candidates {
+                let mut candidates: Vec<_> = candidates.into_values().collect();
+                candidates.sort_unstable_by(|left, right| {
+                    converted_archive_candidate_priority(left.idx, visible_range, keep_range)
+                        .cmp(&converted_archive_candidate_priority(
+                            right.idx,
+                            visible_range,
+                            keep_range,
+                        ))
+                        .then_with(|| left.archive_key.cmp(&right.archive_key))
+                });
+                for (ordinal, candidate) in candidates.iter().enumerate() {
                     if worker_cancel.load(Ordering::Relaxed) {
                         return;
                     }
                     peeked += 1;
-                    let mut cache_src = path.clone();
-                    let mut cache_mtime = mtime;
-                    let mut cache_file_size = file_size;
-                    if crate::rar_loader::is_rar_path(&path) {
-                        match crate::rar_loader::inspect_for_direct_read(&path) {
-                            Ok(inspection)
-                                if inspection.decision
-                                    == crate::rar_loader::RarDirectReadDecision::Direct =>
-                            {
-                                hits += 1;
-                                paths.insert(
-                                    crate::path_key::normalize_keep_drive(&path),
-                                    inspection.resolved_path,
-                                );
-                                continue;
-                            }
-                            Ok(inspection) => {
-                                // A visible subsequent volume represents the same logical book as
-                                // its first volume. Cache lookup and thumbnail loading therefore use
-                                // the header-resolved first path while the grid cell keeps the exact
-                                // file the user can manage via shell operations.
-                                cache_src = inspection.resolved_path;
-                                if let Ok(metadata) = std::fs::metadata(&cache_src) {
-                                    cache_mtime = crate::ui_helpers::mtime_secs(&metadata);
-                                    cache_file_size = metadata.len() as i64;
-                                }
-                            }
-                            Err(_) => {}
-                        }
-                    }
-                    // peek = 読み取り専用 lookup。フォルダを表示しただけで全アーカイブに
-                    // last_access UPDATE (書き込みトランザクション) を発行しない。
-                    if let Some(cached_zip) = db.peek(&cache_src, cache_mtime, cache_file_size) {
-                        if worker_cancel.load(Ordering::Relaxed) {
-                            return;
-                        }
+                    let Some(state) = resolve_converted_archive_candidate(
+                        candidate,
+                        db.as_deref(),
+                        &worker_cancel,
+                    ) else {
+                        return;
+                    };
+                    if state.is_available() {
                         hits += 1;
-                        paths.insert(crate::path_key::normalize_keep_drive(&path), cached_zip);
+                    }
+                    if tx
+                        .send(ConvertedArchiveCachePathsMsg::Resolved {
+                            archive_key: candidate.archive_key.clone(),
+                            state,
+                            idx: candidate.idx,
+                            ordinal: ordinal + 1,
+                            elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
+                            input_seq,
+                        })
+                        .is_err()
+                    {
+                        return;
                     }
                 }
                 if !worker_cancel.load(Ordering::Relaxed) {
-                    let _ = tx.send(ConvertedArchiveCachePathsResult {
-                        paths,
-                        pin_archive_dependencies,
+                    let _ = tx.send(ConvertedArchiveCachePathsMsg::Finished {
                         peeked,
                         hits,
                         elapsed_ms: t0.elapsed().as_secs_f64() * 1000.0,
@@ -24028,73 +24216,136 @@ impl App {
                         generation,
                         cancel,
                         rx,
+                        pin_archive_dependencies: std::collections::HashMap::new(),
                     });
             }
             Err(e) => {
+                for state in self.converted_archive_cache_paths.values_mut() {
+                    if matches!(state, ConvertedArchiveSourceState::Pending) {
+                        *state = ConvertedArchiveSourceState::Unavailable;
+                    }
+                }
                 crate::logger::log(format!("archive_cache_peek spawn failed: {e}"));
             }
         }
     }
 
     fn poll_converted_archive_cache_paths(&mut self, ctx: &egui::Context) {
-        let Some(pending) = self.converted_archive_cache_paths_pending.as_ref() else {
-            return;
-        };
-        let result = match pending.rx.try_recv() {
-            Ok(result) => result,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.converted_archive_cache_paths_pending = None;
-                return;
-            }
-        };
-        let generation = pending.generation;
-        self.converted_archive_cache_paths_pending = None;
-        if generation != self.items_generation {
-            return;
-        }
-        if crate::perf::is_enabled() {
-            crate::perf::event(
-                "nav",
-                "archive_cache_peek",
-                None,
-                result.input_seq,
-                &[
-                    ("ms", serde_json::Value::from(result.elapsed_ms)),
-                    ("peeked", serde_json::Value::from(result.peeked)),
-                    ("hits", serde_json::Value::from(result.hits)),
-                    ("async", serde_json::Value::from(true)),
-                ],
-            );
-        }
-        if self.converted_archive_cache_paths != result.paths {
-            let changed_keys: std::collections::HashSet<String> = self
-                .converted_archive_cache_paths
-                .keys()
-                .chain(result.paths.keys())
-                .filter(|key| {
-                    self.converted_archive_cache_paths.get(*key) != result.paths.get(*key)
-                })
-                .cloned()
-                .collect();
-            let mut dependent_indices: Vec<usize> = result
-                .pin_archive_dependencies
-                .iter()
-                .filter_map(|(idx, archive_key)| changed_keys.contains(archive_key).then_some(*idx))
-                .collect();
-            dependent_indices.sort_unstable();
-            dependent_indices.dedup();
+        // 逐次通知は 1 フレームで数百件届き得るので、一覧の作り直しと repaint 要求は
+        // drain の後に 1 回だけ行う。メッセージごとに呼ぶと、候補数 × items の
+        // 作り直しが 1 フレームに積まれる。
+        let mut rebuild_visible = false;
+        let mut request_repaint = false;
+        loop {
+            let (generation, message) = {
+                let Some(pending) = self.converted_archive_cache_paths_pending.as_ref() else {
+                    break;
+                };
+                (pending.generation, pending.rx.try_recv())
+            };
+            let message = match message {
+                Ok(message) => message,
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.converted_archive_cache_paths_pending = None;
+                    break;
+                }
+            };
 
-            self.converted_archive_cache_paths = result.paths;
-            for idx in dependent_indices {
-                self.evict_thumbnail_for_reload(idx);
+            // 逐次通知は受信窓が長いため、1 件ごとに generation を照合する。
+            if generation != self.items_generation {
+                if let Some(pending) = self.converted_archive_cache_paths_pending.take() {
+                    pending.cancel();
+                }
+                break;
             }
-            if self.settings.facet_filter.has_rollup_edit_filter() {
-                self.rebuild_visible_indices();
+
+            match message {
+                ConvertedArchiveCachePathsMsg::PinDependency { idx, archive_key } => {
+                    self.converted_archive_cache_paths
+                        .entry(archive_key.clone())
+                        .or_insert(ConvertedArchiveSourceState::Pending);
+                    if let Some(pending) = self.converted_archive_cache_paths_pending.as_mut() {
+                        let indices = pending
+                            .pin_archive_dependencies
+                            .entry(archive_key)
+                            .or_default();
+                        if !indices.contains(&idx) {
+                            indices.push(idx);
+                        }
+                    }
+                }
+                ConvertedArchiveCachePathsMsg::Resolved {
+                    archive_key,
+                    state,
+                    idx,
+                    ordinal,
+                    elapsed_ms,
+                    input_seq,
+                } => {
+                    if crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "nav",
+                            "archive_cache_candidate",
+                            Some(&archive_key),
+                            input_seq,
+                            &[
+                                ("idx", serde_json::Value::from(idx)),
+                                ("ordinal", serde_json::Value::from(ordinal)),
+                                ("ms", serde_json::Value::from(elapsed_ms)),
+                                ("state", serde_json::Value::from(state.perf_label())),
+                            ],
+                        );
+                    }
+                    let changed =
+                        self.converted_archive_cache_paths.get(&archive_key) != Some(&state);
+                    if !changed {
+                        continue;
+                    }
+                    self.converted_archive_cache_paths
+                        .insert(archive_key.clone(), state);
+                    let dependent_indices = self
+                        .converted_archive_cache_paths_pending
+                        .as_ref()
+                        .and_then(|pending| {
+                            pending.pin_archive_dependencies.get(&archive_key).cloned()
+                        })
+                        .unwrap_or_default();
+                    for idx in dependent_indices {
+                        self.evict_thumbnail_for_reload(idx);
+                    }
+                    rebuild_visible |= self.settings.facet_filter.has_rollup_edit_filter();
+                    request_repaint = true;
+                }
+                ConvertedArchiveCachePathsMsg::Finished {
+                    peeked,
+                    hits,
+                    elapsed_ms,
+                    input_seq,
+                } => {
+                    if crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "nav",
+                            "archive_cache_peek",
+                            None,
+                            input_seq,
+                            &[
+                                ("ms", serde_json::Value::from(elapsed_ms)),
+                                ("peeked", serde_json::Value::from(peeked)),
+                                ("hits", serde_json::Value::from(hits)),
+                                ("async", serde_json::Value::from(true)),
+                            ],
+                        );
+                    }
+                    self.converted_archive_cache_paths_pending = None;
+                    break;
+                }
             }
-            // This is deliberately driven only by a value change. A subsequent refresh
-            // that returns the same snapshot performs no eviction, so this cannot become
-            // a reload -> refresh -> eviction loop (and never uses folder_thumb_pin_dirty).
+        }
+        if rebuild_visible {
+            self.rebuild_visible_indices();
+        }
+        if request_repaint {
             ctx.request_repaint();
         }
     }
@@ -24793,7 +25044,8 @@ impl App {
             selected_item,
             Some(GridItem::ConvertibleArchive { path, .. })
                 if !self.converted_archive_cache_paths
-                    .contains_key(&crate::path_key::normalize_keep_drive(path))
+                    .get(&crate::path_key::normalize_keep_drive(path))
+                    .is_some_and(ConvertedArchiveSourceState::is_available)
         );
 
         let matches_current_pin = match (&existing_pin, &selected_source) {
@@ -24998,6 +25250,7 @@ impl App {
             let has_direct_rar = self
                 .converted_archive_cache_paths
                 .get(&crate::path_key::normalize_keep_drive(&abs))
+                .and_then(ConvertedArchiveSourceState::load_path)
                 .is_some_and(|load_path| {
                     crate::rar_loader::is_rar_path(load_path)
                         && load_path.try_exists().unwrap_or(false)
@@ -25265,7 +25518,8 @@ impl App {
             item,
             GridItem::ConvertibleArchive { path, .. }
                 if !self.converted_archive_cache_paths
-                    .contains_key(&crate::path_key::normalize_keep_drive(path))
+                    .get(&crate::path_key::normalize_keep_drive(path))
+                    .is_some_and(ConvertedArchiveSourceState::is_available)
         ) {
             ui.separator();
             ui.add_enabled(false, egui::Button::new("📌 代表サムネに固定"))
@@ -45141,7 +45395,7 @@ impl App {
     fn converted_archive_cache_path(&self, path: &std::path::Path) -> Option<&std::path::Path> {
         self.converted_archive_cache_paths
             .get(&crate::path_key::normalize_keep_drive(path))
-            .map(std::path::PathBuf::as_path)
+            .and_then(ConvertedArchiveSourceState::load_path)
     }
 
     fn archive_or_converted_cache_contains_page_key(
@@ -66685,14 +66939,15 @@ fn convertible_archive_cache_base_key(
 /// 非アーカイブ target は元の path をそのまま返す。
 fn folder_pin_load_path(
     resolved_path: &std::path::Path,
-    converted_archive_cache_paths: &std::collections::HashMap<String, PathBuf>,
+    converted_archive_cache_paths: &std::collections::HashMap<String, ConvertedArchiveSourceState>,
 ) -> Option<PathBuf> {
     if !crate::folder_tree::is_convertible_archive_path(resolved_path) {
         return Some(resolved_path.to_path_buf());
     }
     converted_archive_cache_paths
         .get(&crate::path_key::normalize_keep_drive(resolved_path))
-        .cloned()
+        .and_then(ConvertedArchiveSourceState::load_path)
+        .map(Path::to_path_buf)
 }
 
 impl App {
@@ -67176,7 +67431,7 @@ fn make_load_request(
     folder_thumb_sort: Option<crate::settings::SortOrder>,
     folder_thumb_depth: u32,
     pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
-    converted_archive_cache_paths: &std::collections::HashMap<String, PathBuf>,
+    converted_archive_cache_paths: &std::collections::HashMap<String, ConvertedArchiveSourceState>,
     archive_source_override: Option<&std::path::Path>,
     current_folder: Option<&std::path::Path>,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
@@ -67245,6 +67500,7 @@ fn make_load_request(
             let archive_key = crate::path_key::normalize_keep_drive(zip_path);
             let load_zip_path = converted_archive_cache_paths
                 .get(&archive_key)
+                .and_then(ConvertedArchiveSourceState::load_path)
                 .unwrap_or(zip_path);
             let book_root = zip_pin_root_path(zip_path, archive_source_override, current_folder);
             let book_container = book_container_key(book_root, dir_prefix);
@@ -67255,7 +67511,7 @@ fn make_load_request(
                         if zip_rel.is_empty() && !entry.is_empty() =>
                     {
                         return Some(LoadRequest {
-                            path: load_zip_path.clone(),
+                            path: load_zip_path.to_path_buf(),
                             zip_entry: Some(entry.clone()),
                             edit_preview_key: Some(crate::adjustment_db::zip_entry_key(
                                 load_zip_path,
@@ -67300,7 +67556,7 @@ fn make_load_request(
                                             resolved.pdf_page,
                                         );
                                     return Some(LoadRequest {
-                                        path: load_zip_path.clone(),
+                                        path: load_zip_path.to_path_buf(),
                                         zip_entry: resolved.zip_entry,
                                         pinned_page_adjustment_key: edit_preview_key.clone(),
                                         edit_preview_key,
@@ -67313,7 +67569,7 @@ fn make_load_request(
                                 }
                                 crate::folder_thumb_pins::ResolvedKind::ZipDirRepresentative => {
                                     return Some(LoadRequest {
-                                        path: load_zip_path.clone(),
+                                        path: load_zip_path.to_path_buf(),
                                         zip_dir_prefix: resolved.zip_dir_prefix,
                                         cache_key_override: Some(cache_key),
                                         resolve_override: Some(
@@ -67335,7 +67591,7 @@ fn make_load_request(
             }
             let entry = representative.clone()?;
             Some(LoadRequest {
-                path: load_zip_path.clone(),
+                path: load_zip_path.to_path_buf(),
                 zip_entry: Some(entry),
                 cache_key_override: Some(crate::grid_item::zipdir_cache_key(dir_prefix)),
                 ..base
@@ -67351,10 +67607,12 @@ fn make_load_request(
         }),
         GridItem::ConvertibleArchive { path, format } => {
             let archive_key = crate::path_key::normalize_keep_drive(path);
-            let cached_zip = converted_archive_cache_paths.get(&archive_key)?;
+            let load_path = converted_archive_cache_paths
+                .get(&archive_key)?
+                .load_path()?;
             let base_key = convertible_archive_cache_base_key(path, *format, use_full_path_keys)?;
             let req = LoadRequest {
-                path: cached_zip.clone(),
+                path: load_path.to_path_buf(),
                 cache_key_override: Some(base_key.clone()),
                 resolve_override: Some(crate::thumb_loader::ResolveStrategy::ZipFirstImage),
                 folder_thumb_sort,
@@ -67723,7 +67981,7 @@ fn apply_folder_thumb_pin(
     base_key: &str,
     container_kind: ContainerKindForPin,
     pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
-    converted_archive_cache_paths: &std::collections::HashMap<String, PathBuf>,
+    converted_archive_cache_paths: &std::collections::HashMap<String, ConvertedArchiveSourceState>,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
     // cascade resolve が Video kind に到達したとき、`video_pins.db` に有効な WebP が
     // あるか確認するために渡す。WebP が無い (= フルスクリーン pin 削除済み / 旧版の

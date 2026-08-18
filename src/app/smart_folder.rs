@@ -237,7 +237,7 @@ pub(crate) struct ReusedSmartFolderMetadata {
     conceal_paths: HashSet<String>,
     comic_paths: HashSet<String>,
     folder_pin_map: HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
-    converted_archive_cache_paths: HashMap<String, PathBuf>,
+    converted_archive_cache_paths: HashMap<String, ConvertedArchiveSourceState>,
 }
 
 /// The already-materialized root grid is moved here while the user is inside a folder, PDF, or
@@ -316,7 +316,7 @@ pub(crate) struct SmartFolderPreparedGrid {
     conceal_pages: HashSet<usize>,
     comic_pages: HashSet<usize>,
     folder_pin_map: HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
-    converted_archive_cache_paths: HashMap<String, PathBuf>,
+    converted_archive_cache_paths: HashMap<String, ConvertedArchiveSourceState>,
     color_cache_map: Option<Arc<std::sync::RwLock<HashMap<String, crate::catalog::CacheEntry>>>>,
     color_catalog: Option<Arc<crate::catalog::CatalogDb>>,
 }
@@ -411,14 +411,15 @@ impl SmartFolderPreparedGrid {
         });
         self.folder_pin_map
             .retain(|path, _| !smart_folder_path_is_removed(path, removed_paths));
-        self.converted_archive_cache_paths
-            .retain(|path, cache_path| {
-                !smart_folder_path_is_removed(path, removed_paths)
-                    && !smart_folder_path_is_removed(
+        self.converted_archive_cache_paths.retain(|path, state| {
+            !smart_folder_path_is_removed(path, removed_paths)
+                && state.load_path().is_none_or(|cache_path| {
+                    !smart_folder_path_is_removed(
                         &crate::path_key::normalize_keep_drive(cache_path),
                         removed_paths,
                     )
-            });
+                })
+        });
         true
     }
 }
@@ -1211,7 +1212,7 @@ fn metadata_filter_passes(
     tags: &HashMap<String, Vec<String>>,
     edits: &SmartEditKeySets,
     bookmarks: &crate::bookmark_browser::BookmarkPresence,
-    converted_archive_paths: &HashMap<String, PathBuf>,
+    converted_archive_paths: &HashMap<String, ConvertedArchiveSourceState>,
 ) -> bool {
     use crate::settings::{FacetEditFlag, FacetTagMode};
 
@@ -1316,7 +1317,7 @@ fn edit_key_matches_for_entry(
     entry: &SmartFolderEntry,
     key: &str,
     include_descendants: bool,
-    converted_archive_paths: &HashMap<String, PathBuf>,
+    converted_archive_paths: &HashMap<String, ConvertedArchiveSourceState>,
 ) -> bool {
     if edit_key_matches(keys, entry, key, include_descendants) {
         return true;
@@ -1326,6 +1327,7 @@ fn edit_key_matches_for_entry(
     }
     converted_archive_paths
         .get(&crate::path_key::normalize_keep_drive(&entry.path))
+        .and_then(ConvertedArchiveSourceState::load_path)
         .is_some_and(|cache_path| {
             let cache_key = crate::adjustment_db::normalize_path(cache_path);
             edit_key_matches(keys, entry, &cache_key, include_descendants)
@@ -1547,15 +1549,15 @@ fn prepared_converted_archive_path(
     path: &Path,
     mut mtime: i64,
     mut size: i64,
-    db: &crate::archive_cache::ArchiveCacheDb,
-) -> Option<PathBuf> {
+    db: Option<&crate::archive_cache::ArchiveCacheDb>,
+) -> ConvertedArchiveSourceState {
     let mut source = path.to_path_buf();
     if crate::rar_loader::is_rar_path(path) {
         match crate::rar_loader::inspect_for_direct_read(path) {
             Ok(inspection)
                 if inspection.decision == crate::rar_loader::RarDirectReadDecision::Direct =>
             {
-                return Some(inspection.resolved_path);
+                return ConvertedArchiveSourceState::Direct(inspection.resolved_path);
             }
             Ok(inspection) => {
                 source = inspection.resolved_path;
@@ -1567,7 +1569,9 @@ fn prepared_converted_archive_path(
             Err(_) => {}
         }
     }
-    db.peek(&source, mtime, size)
+    db.and_then(|db| db.peek(&source, mtime, size))
+        .map(ConvertedArchiveSourceState::CachedZip)
+        .unwrap_or(ConvertedArchiveSourceState::Unavailable)
 }
 
 struct PreparedVideoFolderPinSeed {
@@ -1655,7 +1659,7 @@ struct EvaluatedSmartFolderMembership {
     ratings: HashMap<String, u8>,
     tags: HashMap<String, Vec<String>>,
     local_adjust: HashSet<String>,
-    converted_archive_paths: HashMap<String, PathBuf>,
+    converted_archive_paths: HashMap<String, ConvertedArchiveSourceState>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1798,7 +1802,7 @@ fn evaluate_smart_folder_membership(
     let mut converted_archive_paths = reused_metadata
         .map(|metadata| metadata.converted_archive_cache_paths.clone())
         .unwrap_or_default();
-    if !reuse_metadata && let Some(db) = archive_cache_db {
+    if !reuse_metadata {
         for (index, entry) in snapshot.entries.iter().enumerate() {
             if index.is_multiple_of(METADATA_CHUNK_SIZE) && cancel.load(Ordering::Relaxed) {
                 return Ok(None);
@@ -1806,14 +1810,14 @@ fn evaluate_smart_folder_membership(
             if entry.kind != SmartFolderEntryKind::Archive {
                 continue;
             }
-            if let Some(cache_path) =
-                prepared_converted_archive_path(&entry.path, entry.mtime, entry.file_size, db)
-            {
-                converted_archive_paths.insert(
-                    crate::path_key::normalize_keep_drive(&entry.path),
-                    cache_path,
-                );
-            }
+            let state = prepared_converted_archive_path(
+                &entry.path,
+                entry.mtime,
+                entry.file_size,
+                archive_cache_db,
+            );
+            converted_archive_paths
+                .insert(crate::path_key::normalize_keep_drive(&entry.path), state);
         }
     }
 
@@ -5722,7 +5726,7 @@ mod tests {
         edits.adjustment.insert(format!("{cache_key}::page:0"));
         let converted = HashMap::from([(
             crate::path_key::normalize_keep_drive(&archive_path),
-            cache_path,
+            ConvertedArchiveSourceState::CachedZip(cache_path),
         )]);
 
         assert!(metadata_filter_passes(
