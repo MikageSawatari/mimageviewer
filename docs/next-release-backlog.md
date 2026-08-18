@@ -1010,6 +1010,8 @@
 
 ### 4.3 操作カスタマイズのキーボード図 HOME / BOTTOM が 4px 右へずれる
 
+- **実機確認 (2026-08-18)**: Q 列と A 列が揃っていることを確認。ずれは Tab の幅だけでなく、その後ろに続く `item_spacing.x` の分も足りていなかった。
+
 - **完了 (2026-08-17):** HOME / BOTTOM 先頭の `Spacer(48.0)` を typed `KeyIndent("Tab")`
   へ置換した。`egui::Ui::add_space` は `item_spacing` を足さず、後続キー配置が spacing を足すため、
   QWERTY の実 Tab と同じ label-width 44px だけを代替する。
@@ -1299,6 +1301,8 @@
   関連: [display-pipeline.md](display-pipeline.md) §2.5.4。
 
 ### 1.90 アニメーション先読みの全フレーム展開で archive 閲覧が停止する — 利用者報告 >>241
+
+- **実機確認 (2026-08-18)**: `animeted.zip` 内の画像がアニメーションすることを確認。一覧から Enter で開いた直後も右上の展開中表示が出る。
 
 - **完了 (2026-08-17):** fullscreen canonical decode に typed `AnimationPolicy` を追加し、通常ファイル /
   archive entry と GIF / APNG / WebP の全組み合わせで、先読みは第1フレームだけ、現ページは全フレーム
