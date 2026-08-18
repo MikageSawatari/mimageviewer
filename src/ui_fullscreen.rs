@@ -34267,6 +34267,14 @@ mod tests {
 
     #[test]
     fn fs_zoom_key_leaves_video_context_z_press_for_its_owner() {
+        // The app test environment holds the data-dir override lock for its whole life, so this
+        // lock has to come first everywhere: taking it after setup_app_for_test() inverts the order
+        // against every test that takes it before, and the two deadlock under a parallel run.
+        #[cfg(windows)]
+        let _serial = crate::key_input::TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
         let mut outcomes = Vec::new();
         for (label, item) in [
             ("Video", GridItem::Video(PathBuf::from("clip.mp4"))),
@@ -34277,11 +34285,6 @@ mod tests {
             app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
             app.fullscreen_idx = Some(0);
             let ctx = egui::Context::default();
-            #[cfg(windows)]
-            let _serial = crate::key_input::TEST_INPUT_LOCK
-                .get_or_init(|| std::sync::Mutex::new(()))
-                .lock()
-                .expect("key input test lock poisoned");
             #[cfg(windows)]
             let _clear = ClearTestKeyFrame;
             #[cfg(windows)]
@@ -34311,6 +34314,14 @@ mod tests {
 
     #[test]
     fn fs_zoom_video_context_collapses_state_and_tracks_the_held_zoom_key() {
+        // The app test environment holds the data-dir override lock for its whole life, so this
+        // lock has to come first everywhere: taking it after setup_app_for_test() inverts the order
+        // against every test that takes it before, and the two deadlock under a parallel run.
+        #[cfg(windows)]
+        let _serial = crate::key_input::TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
         let mut app = crate::app::setup_app_for_test();
         app.items = vec![GridItem::Video(PathBuf::from("clip.mp4"))];
         app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
@@ -34335,11 +34346,6 @@ mod tests {
         }
 
         let ctx = egui::Context::default();
-        #[cfg(windows)]
-        let _serial = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
         #[cfg(windows)]
         let _clear = ClearTestKeyFrame;
         #[cfg(windows)]
@@ -34371,17 +34377,20 @@ mod tests {
 
     #[test]
     fn fs_zoom_key_still_consumes_continuous_reading_z_and_reports_why() {
+        // The app test environment holds the data-dir override lock for its whole life, so this
+        // lock has to come first everywhere: taking it after setup_app_for_test() inverts the order
+        // against every test that takes it before, and the two deadlock under a parallel run.
+        #[cfg(windows)]
+        let _serial = crate::key_input::TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
         let mut app = crate::app::setup_app_for_test();
         app.items = vec![GridItem::Image(PathBuf::from("page.jpg"))];
         app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
         app.fullscreen_idx = Some(0);
         app.reading_flow = ReadingFlow::Vertical;
         let ctx = egui::Context::default();
-        #[cfg(windows)]
-        let _serial = crate::key_input::TEST_INPUT_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("key input test lock poisoned");
         #[cfg(windows)]
         let _clear = ClearTestKeyFrame;
         #[cfg(windows)]
