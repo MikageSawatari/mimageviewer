@@ -2084,6 +2084,13 @@ viewport へ切り替わる間に新 viewport がフォーカスを取るまで�
 (波形 / スペクトラム / 各種パネル) に差し替える。ユーザー視点の画面構成は
 [spec.md](spec.md) § 4.3、解析ワーカーは [async-architecture.md](async-architecture.md) を参照。
 
+`VideoToggleAudioMode` の意味は `App::toggle_video_audio_mode` が単独で所有する。native key、
+native HUD event、egui 動画入力、egui 音楽ビューの各入口はこの helper へ合流し、現在状態から
+「音声 VST 表示を畳む → 音声モードから動画へ戻す → 通常動画から音声モードへ入る」の優先順で
+既存遷移を選ぶ。音声 VST 表示中は `fs_music_view_active` が意図的に false になるため、この表示
+述語を enter/exit の排他には使わず、`video_audio_vst_active_for` を最初に判定する。egui の press
+経路は `consume_action_no_repeat` を使い、native の `!key.repeat` と同じく長押し再トグルを起こさない。
+
 **presenter を drop せず hide する (consume-and-hold)**。動画→音声モードへ入るとき native
 D3D11 presenter を破棄せず、`NativeVideoOutputCommand::SetWindowVisible{visible:false}` で
 `SW_HIDE` して生かしたままにする。理由:

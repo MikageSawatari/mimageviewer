@@ -50613,6 +50613,183 @@ fn music_fullscreen_i_and_tab_return_to_hover_without_repeat_retoggle() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn video_audio_toggle_normal_video_egui_requests_enter() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let mut app = phase_c_support::setup_app();
+    let idx = app.items.len();
+    app.items
+        .push(GridItem::Video(PathBuf::from("C:/clips/egui-toggle.mp4")));
+    app.fullscreen_idx = Some(idx);
+    app.settings.first_setup_completed = true;
+    let ctx = egui::Context::default();
+    crate::app::native_video::clear_video_audio_enter_requests_for_test();
+    ctx.begin_pass(egui::RawInput {
+        events: vec![fullscreen_fixed_key_event(egui::Key::Z)],
+        ..Default::default()
+    });
+    let _ = app.keyboard_owner_for_pass(&ctx);
+
+    app.handle_video_input(&ctx, idx, None);
+    let _ = ctx.end_pass();
+
+    assert_eq!(
+        crate::app::native_video::take_video_audio_enter_requests_for_test(),
+        vec![(
+            idx,
+            crate::app::native_video::VideoAudioEnterSource::EguiKey
+        )],
+        "通常動画の egui Z は動画→音声モード enter を要求する"
+    );
+}
+
+#[cfg(windows)]
+fn video_audio_native_z(repeat: bool) -> crate::video::native_window::NativeVideoKeyEvent {
+    crate::video::native_window::NativeVideoKeyEvent {
+        virtual_key: 0x5a,
+        scan_code: 0x2c,
+        extended: false,
+        shift: false,
+        ctrl: false,
+        alt: false,
+        repeat,
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn video_audio_toggle_normal_video_native_still_requests_enter() {
+    let mut app = phase_c_support::setup_app();
+    let idx = app.items.len();
+    app.items
+        .push(GridItem::Video(PathBuf::from("C:/clips/native-toggle.mp4")));
+    app.fullscreen_idx = Some(idx);
+    let ctx = egui::Context::default();
+    crate::app::native_video::clear_video_audio_enter_requests_for_test();
+
+    app.handle_native_video_key_event(&ctx, idx, video_audio_native_z(false));
+
+    assert_eq!(
+        crate::app::native_video::take_video_audio_enter_requests_for_test(),
+        vec![(
+            idx,
+            crate::app::native_video::VideoAudioEnterSource::NativeKey
+        )],
+        "通常動画の native Z は従来どおり enter を要求する"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn video_audio_toggle_audio_mode_egui_requests_exit() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let mut app = phase_c_support::setup_app();
+    let idx = app.items.len();
+    app.items.push(GridItem::Video(PathBuf::from(
+        "C:/clips/audio-mode-toggle.mp4",
+    )));
+    app.fullscreen_idx = Some(idx);
+    app.video_audio_mode = Some(idx);
+    app.settings.first_setup_completed = true;
+    let ctx = egui::Context::default();
+    crate::app::native_video::clear_video_audio_enter_requests_for_test();
+    ctx.begin_pass(egui::RawInput {
+        events: vec![fullscreen_fixed_key_event(egui::Key::Z)],
+        ..Default::default()
+    });
+
+    let _ = app.handle_fs_key_input(&ctx, idx, false);
+    let _ = ctx.end_pass();
+
+    assert_eq!(app.video_audio_mode, None);
+    assert!(
+        crate::app::native_video::take_video_audio_enter_requests_for_test().is_empty(),
+        "音声モードの egui Z は enter gate へ戻ってはならない"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn video_audio_toggle_vst_native_exits_vst_without_enter_fallback() {
+    let mut app = phase_c_support::setup_app();
+    let idx = app.items.len();
+    app.items
+        .push(GridItem::Video(PathBuf::from("C:/clips/vst-toggle.mp4")));
+    app.fullscreen_idx = Some(idx);
+    app.video_audio_mode = Some(idx);
+    app.video_audio_vst = Some(VideoAudioVstState {
+        fs_idx: idx,
+        phase: VideoAudioVstPhase::Opening,
+    });
+    let ctx = egui::Context::default();
+    crate::app::native_video::clear_video_audio_enter_requests_for_test();
+
+    app.handle_native_video_key_event(&ctx, idx, video_audio_native_z(false));
+
+    assert!(app.video_audio_vst.is_none());
+    assert_eq!(
+        app.video_audio_mode,
+        Some(idx),
+        "VST を畳んだ後も動画→音声モード自体は維持する"
+    );
+    assert!(
+        crate::app::native_video::take_video_audio_enter_requests_for_test().is_empty(),
+        "VST 表示中の Z は enter の AlreadyActive gate へ落としてはならない"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn video_audio_toggle_repeat_egui_does_not_request_transition() {
+    let _input_guard = fullscreen_fixed_key_test_guard();
+    let mut app = phase_c_support::setup_app();
+    let idx = app.items.len();
+    app.items
+        .push(GridItem::Video(PathBuf::from("C:/clips/repeat-toggle.mp4")));
+    app.fullscreen_idx = Some(idx);
+    app.settings.first_setup_completed = true;
+    let ctx = egui::Context::default();
+    crate::app::native_video::clear_video_audio_enter_requests_for_test();
+    ctx.begin_pass(egui::RawInput {
+        events: vec![fullscreen_fixed_key_event(egui::Key::Z)],
+        ..Default::default()
+    });
+    let _ = ctx.end_pass();
+    ctx.begin_pass(egui::RawInput {
+        events: vec![fullscreen_fixed_key_event_with_state(
+            egui::Key::Z,
+            true,
+            true,
+        )],
+        ..Default::default()
+    });
+    let _ = app.keyboard_owner_for_pass(&ctx);
+    assert!(ctx.input(|input| {
+        input.events.iter().any(|event| {
+            matches!(
+                event,
+                egui::Event::Key {
+                    key: egui::Key::Z,
+                    pressed: true,
+                    repeat: true,
+                    ..
+                }
+            )
+        })
+    }));
+
+    app.handle_video_input(&ctx, idx, None);
+    let _ = ctx.end_pass();
+
+    assert_eq!(app.video_audio_mode, None);
+    assert_eq!(
+        crate::app::native_video::take_video_audio_enter_requests_for_test(),
+        Vec::new(),
+        "repeat Z は動画↔音声遷移を要求しない"
+    );
+}
+
 #[test]
 fn fullscreen_tab_round_trips_with_open_panels_on_all_egui_surfaces() {
     for kind in 0..3 {

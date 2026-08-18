@@ -1481,7 +1481,26 @@
   音声→動画のハンドラは存在するから。**§4.2 と同じ形の鏡像**。
 - なお §4.2 の修正 (画像側が Video / Audio 上で Z を消費しないようにした) は本件の**前提**でもある。
   あれが無いと、egui 経路に持ち主を足しても `FsZoomMode` が先に edge を消費してしまう。
-- 利用者向けページには掲載済み: [known-issues.html](../htdocs/mimageviewer/manual/known-issues.html)。
+- 修正前は利用者向け [known-issues.html](../htdocs/mimageviewer/manual/known-issues.html) に掲載していたが、
+  下記完了に伴い削除した。
+- **完了 (2026-08-18):** `VideoToggleAudioMode` を `toggle_video_audio_mode` の単一 semantic owner
+  へ集約し、native key / native HUD / egui 動画 / egui 音楽ビューの各入口から呼ぶようにした。
+  分岐順は音声 VST 表示 → 音声モード → 通常動画で、VST 表示中に `fs_music_view_active == false`
+  でも `enter_video_audio_mode` の `AlreadyActive` gate へ落ちず、先に `exit_video_audio_vst` する。
+  egui 経路は既存 guard の下で `consume_action_no_repeat` を使う。3 状態 × 2 経路の対象 5 テストと
+  §4.2 の画像 / Video / Audio 所有権テストで固定した。detached / focus / placement / presenter
+  lifecycle の述語・状態・時間窓は追加していない。
+
+### 1.93 `VideoAdjustSlot1..10` の egui 動画入力 parity を確認する
+
+- §1.92 の同型 action 監査で、`VideoAdjustSlot1..10` の key dispatch は
+  `src/app/native_video.rs` の native dispatcher にだけ存在し、`handle_video_input` の egui 経路には
+  mapping が見当たらなかった。
+- in-window、detached host focus、focus handoff など egui に動画キーが届く場面で
+  `Ctrl+1..0` が無反応になる可能性がある。実ログまたは handler-level test で parity 欠落を確認し、
+  load/save 修飾子、repeat、context-menu / IME / modal guard、画像側との ownership を固定してから
+  action owner を決める。
+- 今回は `VideoToggleAudioMode` だけを対象とし、本項の修正は行わない。
 
 ### 1.90 アニメーション先読みの全フレーム展開で archive 閲覧が停止する — 利用者報告 >>241
 

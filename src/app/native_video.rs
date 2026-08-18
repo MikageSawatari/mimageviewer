@@ -4,6 +4,7 @@ use crate::keymap::{CommandDisplayRow, CommandScope, FS_VIDEO_ACTIVE_SCOPES, Key
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VideoAudioEnterSource {
+    EguiKey,
     NativeKey,
     NativeOutputEvent,
     DeferredCompletion,
@@ -13,6 +14,7 @@ pub(crate) enum VideoAudioEnterSource {
 impl VideoAudioEnterSource {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::EguiKey => "egui_key",
             Self::NativeKey => "native_key",
             Self::NativeOutputEvent => "native_output_event",
             Self::DeferredCompletion => "deferred_completion",
@@ -22,7 +24,7 @@ impl VideoAudioEnterSource {
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum VideoAudioEnterRejectReason {
+pub(crate) enum VideoAudioEnterRejectReason {
     AlreadyActive,
     ItemOrFullscreenMismatch,
     TransitionInProgress {
@@ -116,9 +118,17 @@ fn video_audio_enter_gate_rejection(
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum VideoAudioEnterOutcome {
+pub(crate) enum VideoAudioEnterOutcome {
     Rejected(VideoAudioEnterRejectReason),
     Entered,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VideoAudioToggleOutcome {
+    ExitedVst,
+    RequestedVideoModeExit,
+    RequestedAudioModeEnter(VideoAudioEnterOutcome),
 }
 
 #[cfg(windows)]
@@ -154,6 +164,24 @@ fn log_video_audio_enter_result(
     outcome: VideoAudioEnterOutcome,
 ) {
     crate::logger::log(format_video_audio_enter_result(source, fs_idx, outcome));
+}
+
+#[cfg(all(test, windows))]
+thread_local! {
+    static VIDEO_AUDIO_ENTER_REQUESTS_FOR_TEST:
+        std::cell::RefCell<Vec<(usize, VideoAudioEnterSource)>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn clear_video_audio_enter_requests_for_test() {
+    VIDEO_AUDIO_ENTER_REQUESTS_FOR_TEST.with(|requests| requests.borrow_mut().clear());
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn take_video_audio_enter_requests_for_test() -> Vec<(usize, VideoAudioEnterSource)> {
+    VIDEO_AUDIO_ENTER_REQUESTS_FOR_TEST.with(|requests| std::mem::take(&mut *requests.borrow_mut()))
 }
 
 #[cfg(windows)]
@@ -3604,8 +3632,18 @@ impl App {
         if self.video_audio_vst_active_for(fs_idx) {
             use crate::video::NativeVideoOutputEvent as Ev;
             match &event {
-                Ev::ToggleVst3Gui | Ev::ToggleAudioMode => {
+                Ev::ToggleVst3Gui => {
                     self.exit_video_audio_vst(ctx, fs_idx);
+                    ctx.request_repaint();
+                    return;
+                }
+                Ev::ToggleAudioMode => {
+                    let outcome = self.toggle_video_audio_mode(
+                        ctx,
+                        fs_idx,
+                        VideoAudioEnterSource::NativeOutputEvent,
+                    );
+                    debug_assert_eq!(outcome, VideoAudioToggleOutcome::ExitedVst);
                     ctx.request_repaint();
                     return;
                 }
@@ -3741,11 +3779,11 @@ impl App {
                 self.mark_native_video_hud_activity(ctx);
             }
             crate::video::NativeVideoOutputEvent::ToggleAudioMode => {
-                // 動画 HUD の「音声モード」ボタン (Inc 7): 映像を切って音楽ビューへ。enter は
-                // native presenter を detach するので、このイベントを処理した後は同バッチの残り
-                // イベントが stale になる → poll_video 側で batch を打ち切る (video_audio_mode の
-                // None→Some 遷移を検出)。fs_idx / fullscreen 前提の guard は enter 側で行う。
-                self.enter_video_audio_mode(ctx, fs_idx, VideoAudioEnterSource::NativeOutputEvent);
+                // 動画 HUD の「音声モード」ボタン (Inc 7) もキーと同じ toggle owner へ流す。
+                // enter 後は native presenter が hidden になるため、このイベントを処理した後は
+                // 同バッチの残りが stale になる → poll_video 側で video_audio_mode の遷移を検出して
+                // batch を打ち切る。fs_idx / fullscreen 前提の guard は enter 側が正本。
+                self.toggle_video_audio_mode(ctx, fs_idx, VideoAudioEnterSource::NativeOutputEvent);
             }
             crate::video::NativeVideoOutputEvent::CloseFullscreen { generation } => {
                 if !self.accept_native_video_close(fs_idx, generation, "output_close") {
@@ -7039,8 +7077,17 @@ impl App {
                 && self
                     .keymap
                     .matches_vk_action(KeyAction::VideoToggleAudioMode, &key);
-            if esc || toggle {
+            if esc {
                 self.exit_video_audio_vst(ctx, fs_idx);
+                self.request_native_video_hud_repaint(ctx);
+                return NativeVideoKeyOutcome::FixedAction(
+                    NativeVideoFixedKeyAction::ExitVideoAudioVst,
+                );
+            }
+            if toggle {
+                let outcome =
+                    self.toggle_video_audio_mode(ctx, fs_idx, VideoAudioEnterSource::NativeKey);
+                debug_assert_eq!(outcome, VideoAudioToggleOutcome::ExitedVst);
                 self.request_native_video_hud_repaint(ctx);
                 return NativeVideoKeyOutcome::FixedAction(
                     NativeVideoFixedKeyAction::ExitVideoAudioVst,
@@ -7596,7 +7643,7 @@ impl App {
                     .keymap
                     .matches_vk_action(KeyAction::VideoToggleAudioMode, &key) =>
             {
-                self.enter_video_audio_mode(ctx, fs_idx, VideoAudioEnterSource::NativeKey);
+                self.toggle_video_audio_mode(ctx, fs_idx, VideoAudioEnterSource::NativeKey);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoToggleAudioMode)
             }
             _ => {
@@ -8000,15 +8047,42 @@ impl App {
         }
     }
 
+    /// `VideoToggleAudioMode` の単一 semantic owner。
+    ///
+    /// VST 表示中は `fs_music_view_active` が false になるため、music-view 判定を enter/exit の
+    /// 排他に使わない。VST → 音声モード → 通常動画の順に既存状態を直接見て遷移を選ぶ。
+    pub(crate) fn toggle_video_audio_mode(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        source: VideoAudioEnterSource,
+    ) -> VideoAudioToggleOutcome {
+        if self.video_audio_vst_active_for(fs_idx) {
+            self.exit_video_audio_vst(ctx, fs_idx);
+            VideoAudioToggleOutcome::ExitedVst
+        } else if self.video_audio_mode == Some(fs_idx) {
+            self.exit_video_audio_mode(ctx, fs_idx);
+            VideoAudioToggleOutcome::RequestedVideoModeExit
+        } else {
+            VideoAudioToggleOutcome::RequestedAudioModeEnter(
+                self.enter_video_audio_mode(ctx, fs_idx, source),
+            )
+        }
+    }
+
     pub(crate) fn enter_video_audio_mode(
         &mut self,
         ctx: &egui::Context,
         fs_idx: usize,
         source: VideoAudioEnterSource,
-    ) {
+    ) -> VideoAudioEnterOutcome {
+        #[cfg(test)]
+        VIDEO_AUDIO_ENTER_REQUESTS_FOR_TEST
+            .with(|requests| requests.borrow_mut().push((fs_idx, source)));
         log_video_audio_enter_request(source, fs_idx);
         let outcome = self.enter_video_audio_mode_inner(ctx, fs_idx);
         log_video_audio_enter_result(source, fs_idx, outcome);
+        outcome
     }
 
     #[cfg(windows)]

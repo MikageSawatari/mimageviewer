@@ -17957,7 +17957,11 @@ impl App {
                         VideoAudioExitKeyOutcome::ExitRequested,
                     );
                 }
-                self.exit_video_audio_mode(ctx, fs_idx);
+                self.toggle_video_audio_mode(
+                    ctx,
+                    fs_idx,
+                    crate::app::VideoAudioEnterSource::EguiKey,
+                );
             } else {
                 if let Some(inputs) = video_audio_exit_key_diagnostic.as_ref() {
                     log_video_audio_exit_key_outcome(
@@ -33082,6 +33086,19 @@ impl App {
             .consume_action_no_repeat(ctx, KeyAction::ToggleDetachedViewerMode)
         {
             self.toggle_detached_viewer_mode();
+            return;
+        }
+
+        #[cfg(windows)]
+        if self.fs_context_menu_idx.is_none()
+            && !ctx.wants_keyboard_input()
+            && !self.any_modal_dialog_open_for_fullscreen_keys()
+            && !self.normalize_scan_is_modal_for_current_player(fs_idx)
+            && self
+                .keymap
+                .consume_action_no_repeat(ctx, KeyAction::VideoToggleAudioMode)
+        {
+            self.toggle_video_audio_mode(ctx, fs_idx, crate::app::VideoAudioEnterSource::EguiKey);
             return;
         }
 
