@@ -1508,6 +1508,42 @@
   §4.2 の画像 / Video / Audio 所有権テストで固定した。detached / focus / placement / presenter
   lifecycle の述語・状態・時間窓は追加していない。
 
+### 1.94 音声モードの退出が期限切れで detach+attach+seek に落ち、音が途切れる
+
+- 出典: 利用者報告 (2026-08-18)。メインウィンドウへ結合した状態で <kbd>F11</kbd> と <kbd>Z</kbd> を
+  連打すると、切り替えのたびに**メインウィンドウのグリッドが一瞬見えるちらつき**と、
+  **音の途切れ**が起きる。
+- **§1.92 の修正が原因ではない**。今日追加した経路は `source=egui_key` で記録されるが、実ログ中に
+  2 回しか無く (別ウィンドウでの成功例)、後述のタイムアウト 7 件のいずれとも時刻が重ならない。
+  失敗時の enter はすべて既存の `source=native_key`。ちらつき自体はリリース版 v3.1.1
+  (本修正を含まないプロセス) でも観測されている。
+- **実測した機構** (1 セッションで 7 回発生、`mimageviewer.log`):
+
+  ```
+  180.776 exit: placement changed, re-placing via SwitchPlacement
+  180.877 exit ignored reason=exit_pending  deadline_remaining_ms=1099
+  181.409 exit ignored reason=exit_pending  deadline_remaining_ms=567
+  181.986 exit timed out; falling back to detach+attach+seek
+  181.986 fallback exit: re-attached presenter, seek=32.298
+  ```
+
+  placement 切替を伴う退出が **`VideoAudioExitPending.deadline` 内に完了せず**、
+  detach → attach → **seek** のフォールバックへ落ちる。この seek が**音の途切れ**、presenter の
+  付け直しが**ちらつき**。連打すると毎回この経路に入る。
+- **構造上の問題**: 退出の完了判定に**時間窓 (`deadline`) を使っている**。憲法 §2 規則 5
+  「races を時間窓で吸収しない」に当たる。本来は placement 切替の完了イベントで確定すべきところを
+  経過時間で見切っているため、切替が遅い状況では必ずフォールバックする。
+- **直す方向**: deadline を伸ばさない。`SwitchPlacement` の完了 (または presenter の再配置完了) を
+  typed なイベントとして受け、それで退出を確定させる。フォールバックは「イベントが来ない」ことが
+  確定した場合の最後の手段に落とす。着手前に、退出の producer / consumer と
+  open / switch / close / cancel / error の各 lifecycle を列挙すること。
+- detached / native video のリワーク凍結領域。症状パッチを入れず、原因に対応付けてから直す。
+  着手時は [detached-rework-plan.md](detached-rework-plan.md) §2 を読み、
+  ClaudeCode / Codex 双方で「症状パッチではない」ことの合意を取る。
+- 再現手順: メインウィンドウのフルスクリーンで動画再生 → <kbd>F11</kbd> と <kbd>Z</kbd> を連打。
+  判定はログの `timed out; falling back to detach+attach+seek` の有無で機械的にできる。
+- 規模 / 優先度: 中 / P2 (音が途切れるので体感は悪いが、連打しない通常操作では出ない)。
+
 ### 1.93 `VideoAdjustSlot1..10` の egui 動画入力 parity を確認する
 
 - §1.92 の同型 action 監査で、`VideoAdjustSlot1..10` の key dispatch は
