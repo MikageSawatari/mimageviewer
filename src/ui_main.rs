@@ -4245,6 +4245,35 @@ fn grid_reclick_open_allowed(
         && !touch_derived_pointer_activity
 }
 
+fn grid_item_diagnostic_kind(item: &GridItem) -> &'static str {
+    match item {
+        GridItem::Folder(_) => "folder",
+        GridItem::Image(_) => "image",
+        GridItem::Video(_) => "video",
+        GridItem::Audio(_) => "audio",
+        GridItem::ZipFile(_) => "zip_file",
+        GridItem::PdfFile(_) => "pdf_file",
+        GridItem::ConvertibleArchive { .. } => "convertible_archive",
+        GridItem::ZipImage { .. } => "zip_image",
+        GridItem::ZipDir { .. } => "zip_dir",
+        GridItem::PdfPage { .. } => "pdf_page",
+        GridItem::SearchContainer { .. } => "search_container",
+        GridItem::Stack { .. } => "stack",
+    }
+}
+
+fn grid_item_archive_key(item: &GridItem) -> Option<String> {
+    match item {
+        GridItem::ConvertibleArchive { path, .. } => {
+            Some(crate::path_key::normalize_keep_drive(path))
+        }
+        GridItem::ZipFile(path) if crate::rar_loader::is_rar_path(path) => {
+            Some(crate::path_key::normalize_keep_drive(path))
+        }
+        _ => None,
+    }
+}
+
 /// サムネイル / 詳細表示に共通のクリック選択状態遷移。
 ///
 /// 単一選択は `selected`、複数選択は `checked` で表す既存モデルを維持する。
@@ -12428,6 +12457,220 @@ impl App {
 
     // ── セルインタラクション ─────────────────────────────────────────
 
+    fn start_grid_pointer_trace(
+        &mut self,
+        target: crate::grid_input_diagnostics::GridPointerTarget,
+        pos: egui::Pos2,
+    ) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        if let Some(previous) = self.grid_pointer_trace.take() {
+            let block_reason = crate::grid_input_diagnostics::GridOpenBlockReason::from_state(
+                self.any_dialog_open(),
+                self.context_menu_idx.is_some(),
+                false,
+                false,
+            );
+            crate::grid_input_diagnostics::emit_all(
+                crate::grid_input_diagnostics::cell_signal_events(
+                    true,
+                    &previous,
+                    &crate::grid_input_diagnostics::GridCellSignal {
+                        first_click: false,
+                        double_clicked: false,
+                        drag_started: false,
+                        release_pos: None,
+                        block_reason,
+                        activation: crate::grid_input_diagnostics::GridActivationDiagnostic::Ignored(
+                            block_reason
+                                .map(Into::into)
+                                .unwrap_or(
+                                    crate::grid_input_diagnostics::GridActivationIgnoredReason::NoCellSignal,
+                                ),
+                        ),
+                    },
+                ),
+            );
+            crate::grid_input_diagnostics::emit_all(
+                crate::grid_input_diagnostics::pointer_release_events(true, &previous, None),
+            );
+        }
+        let item_key = match &target {
+            crate::grid_input_diagnostics::GridPointerTarget::Cell { item_key, .. } => {
+                Some(item_key.clone())
+            }
+            crate::grid_input_diagnostics::GridPointerTarget::Background => None,
+        };
+        let seq = self.bump_input_seq("grid_pointer_press", item_key.as_deref());
+        let trace = crate::grid_input_diagnostics::GridPointerTrace {
+            seq,
+            target,
+            current_folder: self
+                .current_folder
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            items_generation: self.items_generation,
+            press_x: pos.x,
+            press_y: pos.y,
+            terminal_reported: false,
+        };
+        crate::grid_input_diagnostics::emit_all(
+            crate::grid_input_diagnostics::pointer_press_events(true, &trace),
+        );
+        self.grid_pointer_trace = Some(trace);
+    }
+
+    fn begin_grid_cell_pointer_trace(
+        &mut self,
+        ctx: &egui::Context,
+        cell_rect: egui::Rect,
+        idx: usize,
+    ) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let Some(pos) = ctx.input(|input| {
+            input.pointer.primary_pressed().then(|| {
+                input
+                    .pointer
+                    .interact_pos()
+                    .or_else(|| input.pointer.latest_pos())
+            })
+        }) else {
+            return;
+        };
+        let Some(pos) = pos.filter(|pos| cell_rect.contains(*pos)) else {
+            return;
+        };
+        let Some(item) = self.items.get(idx) else {
+            return;
+        };
+        self.start_grid_pointer_trace(
+            crate::grid_input_diagnostics::GridPointerTarget::Cell {
+                idx,
+                item_key: item.perf_key(),
+                archive_key: grid_item_archive_key(item),
+                item_kind: grid_item_diagnostic_kind(item),
+            },
+            pos,
+        );
+    }
+
+    fn report_grid_cell_signal(
+        &mut self,
+        idx: usize,
+        signal: crate::grid_input_diagnostics::GridCellSignal,
+    ) -> Option<crate::grid_input_diagnostics::GridActivationDispatchGuard> {
+        if !crate::perf::is_enabled() {
+            return None;
+        }
+        let target_matches = self
+            .grid_pointer_trace
+            .as_ref()
+            .and_then(|trace| trace.idx())
+            == Some(idx);
+        if !target_matches {
+            let Some(item) = self.items.get(idx) else {
+                return None;
+            };
+            let pos = signal
+                .release_pos
+                .map(|(x, y)| egui::pos2(x, y))
+                .unwrap_or_default();
+            self.start_grid_pointer_trace(
+                crate::grid_input_diagnostics::GridPointerTarget::Cell {
+                    idx,
+                    item_key: item.perf_key(),
+                    archive_key: grid_item_archive_key(item),
+                    item_kind: grid_item_diagnostic_kind(item),
+                },
+                pos,
+            );
+        }
+        let trace = self.grid_pointer_trace.as_mut()?;
+        trace.terminal_reported = true;
+        let trace = trace.clone();
+        crate::grid_input_diagnostics::emit_all(crate::grid_input_diagnostics::cell_signal_events(
+            true, &trace, &signal,
+        ));
+        matches!(
+            signal.activation,
+            crate::grid_input_diagnostics::GridActivationDiagnostic::Accepted
+        )
+        .then(|| crate::grid_input_diagnostics::GridActivationDispatchGuard::new(&trace))
+    }
+
+    fn finish_grid_pointer_trace(&mut self, ctx: &egui::Context) {
+        if !crate::perf::is_enabled() || !ctx.input(|input| input.pointer.primary_released()) {
+            return;
+        }
+        let Some(trace) = self.grid_pointer_trace.take() else {
+            return;
+        };
+        let release_pos = ctx.input(|input| {
+            input
+                .pointer
+                .interact_pos()
+                .or_else(|| input.pointer.latest_pos())
+                .map(|pos| (pos.x, pos.y))
+        });
+        if !trace.terminal_reported {
+            let block_reason = crate::grid_input_diagnostics::GridOpenBlockReason::from_state(
+                self.any_dialog_open(),
+                self.context_menu_idx.is_some(),
+                false,
+                false,
+            );
+            crate::grid_input_diagnostics::emit_all(
+                crate::grid_input_diagnostics::cell_signal_events(
+                    true,
+                    &trace,
+                    &crate::grid_input_diagnostics::GridCellSignal {
+                        first_click: false,
+                        double_clicked: false,
+                        drag_started: false,
+                        release_pos,
+                        block_reason,
+                        activation: crate::grid_input_diagnostics::GridActivationDiagnostic::Ignored(
+                            block_reason
+                                .map(Into::into)
+                                .unwrap_or(
+                                    crate::grid_input_diagnostics::GridActivationIgnoredReason::NoCellSignal,
+                                ),
+                        ),
+                    },
+                ),
+            );
+        }
+        crate::grid_input_diagnostics::emit_all(
+            crate::grid_input_diagnostics::pointer_release_events(true, &trace, release_pos),
+        );
+    }
+
+    fn begin_grid_background_pointer_trace(&mut self, ctx: &egui::Context, grid_rect: egui::Rect) {
+        if !crate::perf::is_enabled() || self.grid_pointer_trace.is_some() {
+            return;
+        }
+        let Some(pos) = ctx.input(|input| {
+            input.pointer.primary_pressed().then(|| {
+                input
+                    .pointer
+                    .interact_pos()
+                    .or_else(|| input.pointer.latest_pos())
+            })
+        }) else {
+            return;
+        };
+        let Some(pos) = pos.filter(|pos| grid_rect.contains(*pos)) else {
+            return;
+        };
+        self.start_grid_pointer_trace(
+            crate::grid_input_diagnostics::GridPointerTarget::Background,
+            pos,
+        );
+    }
+
     /// グリッドセルのクリック・ダブルクリック・右クリックを処理する。
     /// ダブルクリックでフォルダに入る場合はそのパスを返す。
     fn handle_cell_interaction(
@@ -12442,6 +12685,7 @@ impl App {
         // click_and_drag: clicked() / double_clicked() / secondary_clicked() は従来通り
         // 発火しつつ、drag_started_by(Primary) で native ファイル D&D を開始できる。
         let response = ui.interact(cell_rect, ui.id().with(idx), egui::Sense::click_and_drag());
+        self.begin_grid_cell_pointer_trace(ctx, cell_rect, idx);
         let mut nav = None;
         if !self.any_dialog_open()
             && !self.items_are_drive_list
@@ -12502,22 +12746,19 @@ impl App {
                     .on_hover_text(format!("{tag_name} をタグビューで探す"));
             }
         }
-        if response.clicked()
+        let badge_clicked = response.clicked()
             && !ctx.input(|i| i.modifiers.ctrl || i.modifiers.shift)
-            && let Some((tag_name, badge_rect)) = tag_badge_target
-            && response
-                .interact_pointer_pos()
-                .is_some_and(|pos| badge_rect.contains(pos))
-        {
-            self.open_tag_view_for_tag(&tag_name);
-            return None;
-        }
+            && tag_badge_target.as_ref().is_some_and(|(_, badge_rect)| {
+                response
+                    .interact_pointer_pos()
+                    .is_some_and(|pos| badge_rect.contains(pos))
+            });
         let selected_before_click = self.selected == Some(idx);
         let no_other_cell_checked_before_click =
             self.checked.iter().all(|&checked_idx| checked_idx == idx);
         let ctrl = ctx.input(|i| i.modifiers.ctrl);
         let shift = ctx.input(|i| i.modifiers.shift);
-        if response.clicked() {
+        if response.clicked() && !badge_clicked {
             let display_order = if ctrl || shift {
                 self.current_grid_order().to_vec()
             } else {
@@ -12549,6 +12790,43 @@ impl App {
                     shift,
                     touch_derived_pointer_activity,
                 ));
+        let drag_started = response.drag_started_by(egui::PointerButton::Primary);
+        let native_drag_started = native_grid_drag_start_allowed(
+            self.items_are_drive_list,
+            self.native_drag_just_finished,
+            touch_derived_pointer_activity,
+        ) && drag_started;
+        let release_pos = response.interact_pointer_pos().map(|pos| (pos.x, pos.y));
+        let block_reason = crate::grid_input_diagnostics::GridOpenBlockReason::from_state(
+            self.any_dialog_open(),
+            self.context_menu_idx.is_some() && !activate,
+            badge_clicked,
+            native_drag_started,
+        );
+        let trace_matches_idx = self
+            .grid_pointer_trace
+            .as_ref()
+            .and_then(|trace| trace.idx())
+            == Some(idx);
+        if badge_clicked {
+            let _dispatch = self.report_grid_cell_signal(
+                idx,
+                crate::grid_input_diagnostics::GridCellSignal {
+                    first_click: response.clicked(),
+                    double_clicked: response.double_clicked(),
+                    drag_started,
+                    release_pos,
+                    block_reason,
+                    activation: crate::grid_input_diagnostics::GridActivationDiagnostic::Ignored(
+                        crate::grid_input_diagnostics::GridActivationIgnoredReason::BadgeHit,
+                    ),
+                },
+            );
+            if let Some((tag_name, _)) = tag_badge_target {
+                self.open_tag_view_for_tag(&tag_name);
+            }
+            return None;
+        }
         // An open dialog already stops the keyboard and the wheel. It did not stop this, so a
         // reader could leave the cache manager open, double-click a PDF, and land in fullscreen -
         // where that dialog is no longer drawn but still holds every key in the application, with
@@ -12556,15 +12834,89 @@ impl App {
         // Selection above stays available: what a dialog owns is what happens next, not the
         // cursor. The right-click branch has guarded on this predicate all along.
         if !self.grid_open_from_click_allowed() {
+            if trace_matches_idx || response.clicked() || response.double_clicked() || drag_started
+            {
+                let _dispatch = self.report_grid_cell_signal(
+                    idx,
+                    crate::grid_input_diagnostics::GridCellSignal {
+                        first_click: response.clicked(),
+                        double_clicked: response.double_clicked(),
+                        drag_started,
+                        release_pos,
+                        block_reason,
+                        activation:
+                            crate::grid_input_diagnostics::GridActivationDiagnostic::Ignored(
+                                block_reason.map(Into::into).unwrap_or(
+                                    crate::grid_input_diagnostics::GridActivationIgnoredReason::ModalDialog,
+                                ),
+                            ),
+                    },
+                );
+            }
             return nav;
         }
         if activate && self.items_are_bookmark_view {
+            let _dispatch = self.report_grid_cell_signal(
+                idx,
+                crate::grid_input_diagnostics::GridCellSignal {
+                    first_click: response.clicked(),
+                    double_clicked: response.double_clicked(),
+                    drag_started,
+                    release_pos,
+                    block_reason,
+                    activation: crate::grid_input_diagnostics::GridActivationDiagnostic::Accepted,
+                },
+            );
             if let Some(row) = self.bookmark_browser_rows.get(idx).cloned() {
                 self.open_bookmark_browser_row(ctx, &row);
             }
             return None;
         }
-        if activate && self.guard_reading_history_open(idx) {
+        let activation_allowed = activate && self.guard_reading_history_open(idx);
+        let _activation_dispatch = if activation_allowed {
+            self.report_grid_cell_signal(
+                idx,
+                crate::grid_input_diagnostics::GridCellSignal {
+                    first_click: response.clicked(),
+                    double_clicked: response.double_clicked(),
+                    drag_started,
+                    release_pos,
+                    block_reason,
+                    activation: crate::grid_input_diagnostics::GridActivationDiagnostic::Accepted,
+                },
+            )
+        } else if activate
+            || response.clicked()
+            || response.double_clicked()
+            || drag_started
+            || (trace_matches_idx && ctx.input(|input| input.pointer.primary_released()))
+        {
+            let ignored_reason = block_reason.map(Into::into).unwrap_or(if activate {
+                crate::grid_input_diagnostics::GridActivationIgnoredReason::ReadingHistoryGuard
+            } else if native_drag_started {
+                crate::grid_input_diagnostics::GridActivationIgnoredReason::NativeDragDrop
+            } else if response.clicked() {
+                crate::grid_input_diagnostics::GridActivationIgnoredReason::SelectionOnly
+            } else {
+                crate::grid_input_diagnostics::GridActivationIgnoredReason::ClickNotRecognized
+            });
+            self.report_grid_cell_signal(
+                idx,
+                crate::grid_input_diagnostics::GridCellSignal {
+                    first_click: response.clicked(),
+                    double_clicked: response.double_clicked(),
+                    drag_started,
+                    release_pos,
+                    block_reason,
+                    activation: crate::grid_input_diagnostics::GridActivationDiagnostic::Ignored(
+                        ignored_reason,
+                    ),
+                },
+            )
+        } else {
+            None
+        };
+        if activation_allowed {
             // 閲覧履歴ビューから本を開く場合は、閉じたときに閲覧履歴へ戻れるよう予約する。
             self.note_reading_history_open(idx);
             // ファイル名スタックの集約グリッドでメディアセルをダブルクリックしたら、フラット読書
@@ -12635,7 +12987,11 @@ impl App {
                     if !self.prepare_detached_context_for_grid_open(ctx, idx) {
                         return nav;
                     }
-                    self.bump_input_seq_for_item("grid_double_click", idx);
+                    // With perf diagnostics enabled the physical press already owns the
+                    // correlation id. Keep the legacy open-time bump when perf is off.
+                    if !crate::perf::is_enabled() {
+                        self.bump_input_seq_for_item("grid_double_click", idx);
+                    }
                     if matches!(self.items.get(idx), Some(GridItem::Video(_))) {
                         // Prevent the second click of the grid double-click from
                         // reaching the newly-opened fullscreen video and toggling
@@ -12751,12 +13107,7 @@ impl App {
         // ── native ファイル D&D の開始検出 (docs/file-drag-drop-design.md §5.4) ──
         // primary (左) ボタンのドラッグだけを起点にする。native drag 直後の
         // 1 フレームは抑止 (幽霊ドラッグ防止の保険、§6.1)。
-        if native_grid_drag_start_allowed(
-            self.items_are_drive_list,
-            self.native_drag_just_finished,
-            touch_derived_pointer_activity,
-        ) && response.drag_started_by(egui::PointerButton::Primary)
-        {
+        if native_drag_started {
             match decide_drag_payload(&self.items, &self.checked, idx) {
                 DragDecision::Start {
                     paths,
@@ -14773,6 +15124,8 @@ impl App {
                         "フォルダを入力して Enter キーを押してください"
                     };
                     ui.centered_and_justified(|ui| ui.label(msg));
+                    self.begin_grid_background_pointer_trace(ctx, ui.max_rect());
+                    self.finish_grid_pointer_trace(ctx);
                     // 空フォルダでも右クリックでフォルダ操作可能にする
                     self.start_grid_background_mouse_ring_flick_if_pressed(ctx, ui.max_rect());
                     self.update_grid_mouse_ring_flick(ctx);
@@ -14836,6 +15189,8 @@ impl App {
                             "検索結果なし"
                         });
                     });
+                    self.begin_grid_background_pointer_trace(ctx, ui.max_rect());
+                    self.finish_grid_pointer_trace(ctx);
                     self.start_grid_background_mouse_ring_flick_if_pressed(ctx, ui.max_rect());
                     self.update_grid_mouse_ring_flick(ctx);
                     self.handle_grid_background_primary_click(ctx, ui.max_rect(), false);
@@ -14891,6 +15246,8 @@ impl App {
 
                 if self.settings.grid_view_mode == GridViewMode::Details {
                     let nav = self.render_details_list(ui, ctx, scroll_to, spread_pair_cursor_idx);
+                    self.begin_grid_background_pointer_trace(ctx, ui.max_rect());
+                    self.finish_grid_pointer_trace(ctx);
                     return nav;
                 }
 
@@ -15397,6 +15754,9 @@ impl App {
                             }
                         }
                     });
+
+                self.begin_grid_background_pointer_trace(ctx, scroll_output.inner_rect);
+                self.finish_grid_pointer_trace(ctx);
 
                 // グリッドの空白部分で右クリック → フォルダメニュー。
                 // セルの右クリックは handle_cell_interaction 側で先に `context_menu_idx`

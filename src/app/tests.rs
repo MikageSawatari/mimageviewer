@@ -3241,6 +3241,7 @@ mod startup_open_path_resolve_tests {
         let cancel = Arc::new(AtomicBool::new(false));
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
             src_path: source,
+            input_seq: 0,
             format,
             password: None,
             password_input: String::new(),
@@ -3274,6 +3275,7 @@ mod startup_open_path_resolve_tests {
         let cancel = Arc::new(AtomicBool::new(false));
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
             src_path: source,
+            input_seq: 0,
             format: ArchiveFormat::SevenZ,
             password: None,
             password_input: String::new(),
@@ -5824,6 +5826,7 @@ mod phase_c_folder_nav_history_tests {
         let (_tx, rx) = mpsc::channel();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
             src_path: archive.clone(),
+            input_seq: 0,
             format: ArchiveFormat::Lzh,
             password: None,
             password_input: String::new(),
@@ -5886,6 +5889,7 @@ mod phase_c_folder_nav_history_tests {
         let (_tx, rx) = mpsc::channel();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
             src_path: archive,
+            input_seq: 0,
             format: ArchiveFormat::Lzh,
             password: None,
             password_input: String::new(),
@@ -5926,6 +5930,7 @@ mod phase_c_folder_nav_history_tests {
         let (_tx, rx) = mpsc::channel();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
             src_path: PathBuf::from(r"C:\miv-test\book.lzh"),
+            input_seq: 0,
             format: ArchiveFormat::Lzh,
             password: None,
             password_input: String::new(),
@@ -5971,6 +5976,7 @@ mod phase_c_folder_nav_history_tests {
         let (_tx, rx) = mpsc::channel();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
             src_path: PathBuf::from(r"C:\miv-test\book.lzh"),
+            input_seq: 0,
             format: ArchiveFormat::Lzh,
             password: None,
             password_input: String::new(),
@@ -20730,6 +20736,7 @@ mod favorite_adjustment_defaults_tests {
         let (_tx, rx) = std::sync::mpsc::channel();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
             src_path: PathBuf::from(r"C:\books\02.7z"),
+            input_seq: 0,
             format: ArchiveFormat::SevenZ,
             password: None,
             password_input: String::new(),
@@ -20771,6 +20778,7 @@ mod favorite_adjustment_defaults_tests {
         let (_tx, rx) = std::sync::mpsc::channel();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
             src_path: PathBuf::from(r"C:\books\03.7z"),
+            input_seq: 0,
             format: ArchiveFormat::SevenZ,
             password: None,
             password_input: String::new(),
@@ -20804,6 +20812,7 @@ mod favorite_adjustment_defaults_tests {
         let (_tx, rx) = std::sync::mpsc::channel();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
             src_path: PathBuf::from(r"C:\books\04.rar"),
+            input_seq: 0,
             format: ArchiveFormat::Rar,
             password: None,
             password_input: String::new(),
@@ -20864,6 +20873,7 @@ mod favorite_adjustment_defaults_tests {
         .unwrap();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
             src_path: PathBuf::from(r"C:\books\locked.rar"),
+            input_seq: 0,
             format: ArchiveFormat::Rar,
             password: None,
             password_input: String::new(),
@@ -20924,6 +20934,7 @@ mod favorite_adjustment_defaults_tests {
         .unwrap();
         app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
             src_path: PathBuf::from(r"C:\books\gone.rar"),
+            input_seq: 0,
             format: ArchiveFormat::Rar,
             password: None,
             password_input: String::new(),
@@ -34602,6 +34613,7 @@ mod still_window_mode_key_tests {
             bundle.current_folder = Some(PathBuf::from(r"C:\books\second.zip"));
             bundle.zip_enumerate_pending = Some(ZipEnumeratePending {
                 zip_path: PathBuf::from(r"C:\books\second.zip"),
+                input_seq: 0,
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx: zip_rx,
             });

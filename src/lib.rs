@@ -96,6 +96,7 @@ mod global_search_ui;
 pub mod gpu_info;
 #[cfg(any(test, feature = "dev-tools"))]
 pub mod gpu_lanczos_spike;
+mod grid_input_diagnostics;
 pub mod grid_item;
 mod ime_focus;
 pub mod indexer_manager;

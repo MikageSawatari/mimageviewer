@@ -18,6 +18,38 @@ pub fn export_diagnostics_zip() -> Result<PathBuf, String> {
     let out_dir = desktop_dir().unwrap_or_else(|| logs_dir.clone());
     let zip_path = out_dir.join(format!("mImageViewer_diag_{}.zip", local_timestamp()));
 
+    let included = export_diagnostics_zip_from(&logs_dir, &zip_path, || {
+        // This event is the end witness for the perf log inside the archive. It must be queued
+        // before either logger is flushed, and both flushes must finish before any log file is
+        // opened for ZIP collection.
+        crate::perf::event(
+            "diagnostics",
+            "export_requested",
+            None,
+            0,
+            &[("pid", serde_json::Value::from(std::process::id()))],
+        );
+        crate::perf::flush();
+        crate::logger::flush();
+    })?;
+
+    crate::logger::log(format!(
+        "diagnostics: exported {included} files -> {}",
+        zip_path.display()
+    ));
+    Ok(zip_path)
+}
+
+/// Build a diagnostics archive after `prepare_logs` has made every buffered log write visible.
+/// Keeping this boundary injectable lets the regression test exercise a real sub-64KiB
+/// `BufWriter` without mutating the process-global logger singletons.
+fn export_diagnostics_zip_from(
+    logs_dir: &std::path::Path,
+    zip_path: &std::path::Path,
+    prepare_logs: impl FnOnce(),
+) -> Result<usize, String> {
+    prepare_logs();
+
     let file = std::fs::File::create(&zip_path)
         .map_err(|e| format!("zip ファイルを作成できません ({}): {e}", zip_path.display()))?;
     let mut zw = zip::ZipWriter::new(std::io::BufWriter::new(file));
@@ -66,12 +98,7 @@ pub fn export_diagnostics_zip() -> Result<PathBuf, String> {
 
     zw.finish()
         .map_err(|e| format!("zip のクローズに失敗: {e}"))?;
-
-    crate::logger::log(format!(
-        "diagnostics: exported {included} log file(s) -> {}",
-        zip_path.display()
-    ));
-    Ok(zip_path)
+    Ok(included)
 }
 
 /// `perf_events.<N>.jsonl` (N >= 1、rotate 済みの過去世代) かどうか。
@@ -147,7 +174,8 @@ fn desktop_dir() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_rotated_perf_generation;
+    use super::{export_diagnostics_zip_from, is_rotated_perf_generation};
+    use std::io::{Read as _, Write as _};
 
     #[test]
     fn rotated_perf_generations_are_detected() {
@@ -163,5 +191,45 @@ mod tests {
         assert!(!is_rotated_perf_generation("panic.log"));
         assert!(!is_rotated_perf_generation("perf_events.abc.jsonl"));
         assert!(!is_rotated_perf_generation("perf_events..jsonl"));
+    }
+
+    #[test]
+    fn export_flushes_sub_64k_perf_tail_and_includes_end_witness() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logs_dir = tmp.path().join("logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        let perf_path = logs_dir.join("perf_events.jsonl");
+        let perf_file = std::fs::File::create(&perf_path).unwrap();
+        let mut perf_writer = std::io::BufWriter::with_capacity(64 * 1024, perf_file);
+        let buffered_line = r#"{"cat":"grid","kind":"buffered_before_export","seq":41}"#;
+        writeln!(perf_writer, "{buffered_line}").unwrap();
+        assert_eq!(
+            std::fs::metadata(&perf_path).unwrap().len(),
+            0,
+            "the fixture must still be below the BufWriter flush threshold"
+        );
+
+        let zip_path = tmp.path().join("diagnostics.zip");
+        let included = export_diagnostics_zip_from(&logs_dir, &zip_path, || {
+            writeln!(
+                perf_writer,
+                r#"{{"cat":"diagnostics","kind":"export_requested","seq":42}}"#
+            )
+            .unwrap();
+            perf_writer.flush().unwrap();
+        })
+        .unwrap();
+        assert_eq!(included, 1);
+
+        let zip_file = std::fs::File::open(zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(zip_file).unwrap();
+        let mut perf_log = String::new();
+        archive
+            .by_name("logs/perf_events.jsonl")
+            .unwrap()
+            .read_to_string(&mut perf_log)
+            .unwrap();
+        assert!(perf_log.contains("buffered_before_export"));
+        assert!(perf_log.contains(r#""kind":"export_requested""#));
     }
 }

@@ -123,6 +123,8 @@ pub(crate) struct ArchiveConvertDeferredFullscreen {
 
 pub(crate) struct ArchiveConvertState {
     pub src_path: PathBuf,
+    /// Correlation id owned by the pointer/open request that created this lifecycle.
+    pub input_seq: u64,
     pub format: ArchiveFormat,
     pub password: Option<String>,
     pub password_input: String,
@@ -171,11 +173,17 @@ fn spawn_archive_scan(
     format: ArchiveFormat,
     password: Option<String>,
     allow_direct_read: bool,
+    input_seq: u64,
     cancel: Arc<AtomicBool>,
 ) -> mpsc::Receiver<ArchiveConvertMsg> {
     spawn_archive_scan_task(cancel, move |cancel| {
         if allow_direct_read && format == ArchiveFormat::Rar && password.is_none() {
-            match crate::rar_loader::inspect_for_direct_read_cancelable(&src, cancel) {
+            match crate::rar_loader::inspect_for_direct_read_cancelable_traced(
+                &src,
+                cancel,
+                crate::rar_loader::RarInspectionOrigin::ExplicitOpen,
+                input_seq,
+            ) {
                 Ok(inspection) => Ok((
                     inspection.summary,
                     inspection.decision == crate::rar_loader::RarDirectReadDecision::Direct,
@@ -372,10 +380,18 @@ impl App {
             return false;
         }
         let cancel = Arc::new(AtomicBool::new(false));
-        let rx = spawn_archive_scan(src.clone(), format, None, false, Arc::clone(&cancel));
+        let rx = spawn_archive_scan(
+            src.clone(),
+            format,
+            None,
+            false,
+            self.input_seq,
+            Arc::clone(&cancel),
+        );
         let suppress_confirm = self.settings.archive_convert_suppresses_confirm();
         self.archive_convert = Some(ArchiveConvertState {
             src_path: src,
+            input_seq: self.input_seq,
             format,
             password: None,
             password_input: String::new(),
@@ -425,10 +441,12 @@ impl App {
             ArchiveFormat::Rar,
             None,
             true,
+            self.input_seq,
             Arc::clone(&cancel),
         );
         self.archive_convert = Some(ArchiveConvertState {
             src_path: src,
+            input_seq: self.input_seq,
             format: ArchiveFormat::Rar,
             password: None,
             password_input: String::new(),
@@ -466,9 +484,17 @@ impl App {
             return false;
         }
         let cancel = Arc::new(AtomicBool::new(false));
-        let rx = spawn_archive_scan(src.clone(), format, None, false, Arc::clone(&cancel));
+        let rx = spawn_archive_scan(
+            src.clone(),
+            format,
+            None,
+            false,
+            self.input_seq,
+            Arc::clone(&cancel),
+        );
         self.archive_convert = Some(ArchiveConvertState {
             src_path: src,
+            input_seq: self.input_seq,
             format,
             password: None,
             password_input: String::new(),
@@ -659,10 +685,21 @@ impl App {
                 .pending_direct_nav
                 .take()
                 .expect("direct archive path must exist");
+            let input_seq = state.input_seq;
             let auto_fs = state.auto_fullscreen;
             let deferred = state.deferred_fullscreen.take();
             let completion = state.completion.clone();
             drop(state);
+            if crate::perf::is_enabled() {
+                let archive_key = crate::path_key::normalize_keep_drive(&src);
+                crate::perf::event(
+                    "archive",
+                    "pending_direct_nav_consume",
+                    Some(&archive_key),
+                    input_seq,
+                    &[],
+                );
+            }
             if let ArchiveConvertCompletionPolicy::Bookmark(owner) = &completion {
                 if !self.bookmark_open_owner_is_current(owner) {
                     self.cancel_bookmark_open_request(
@@ -690,7 +727,7 @@ impl App {
             if auto_fs {
                 self.pending_auto_fs_open = true;
             }
-            self.load_zip_as_folder(src.clone());
+            self.load_zip_as_folder_with_input_seq(src.clone(), input_seq);
             let loaded = self
                 .current_folder
                 .as_ref()
@@ -1252,6 +1289,17 @@ impl App {
                     }
                     if direct_read {
                         state.pending_direct_nav = Some(state.src_path.clone());
+                        if crate::perf::is_enabled() {
+                            let archive_key =
+                                crate::path_key::normalize_keep_drive(&state.src_path);
+                            crate::perf::event(
+                                "archive",
+                                "pending_direct_nav_publish",
+                                Some(&archive_key),
+                                state.input_seq,
+                                &[],
+                            );
+                        }
                         continue;
                     }
                     state.allow_direct_read = false;
@@ -1397,6 +1445,7 @@ impl App {
                         format,
                         Some(password),
                         false,
+                        state.input_seq,
                         Arc::clone(&state.cancel),
                     );
                     state.allow_direct_read = false;
@@ -1629,7 +1678,7 @@ mod tests {
         assert!(stopped.load(Ordering::Relaxed));
 
         let followup = Arc::new(AtomicBool::new(false));
-        let followup_rx = spawn_archive_scan(source, ArchiveFormat::Zip, None, false, followup);
+        let followup_rx = spawn_archive_scan(source, ArchiveFormat::Zip, None, false, 0, followup);
         match followup_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("follow-up scan result")
@@ -1645,6 +1694,7 @@ mod tests {
         let (_tx, rx) = mpsc::channel();
         ArchiveConvertState {
             src_path: PathBuf::from(r"C:\tmp\locked.rar"),
+            input_seq: 0,
             format: ArchiveFormat::Rar,
             password: None,
             password_input: "  mivtest2026  ".to_string(),

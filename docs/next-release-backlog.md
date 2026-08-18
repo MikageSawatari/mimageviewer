@@ -985,8 +985,10 @@
      click が成立していれば再操作なしで scan 完了後に開くはずなので区別する。
 - 利用者から確認済み: フル機能ウィンドウ、1 click目で選択枠あり、症状発生時にセル比率・
   位置の切替なし。起動直後か操作後かは特定できていない。
-- **次の一手は診断 perf log の追加**。高頻度イベントを常時出さず、pointer 操作と archive
-  request の境界だけを同一 `input_seq` / open request id で相関できるようにする。
+- **2026-08-19: 計装入り版を実装済み。症状修正ではなく、報告環境の診断 ZIP 待ち。**
+  高頻度イベントを常時出さず、性能ログ ON のときだけ pointer 操作と archive request の
+  境界を同一 `input_seq` で相関する。物理 primary press を起点にするため、調査対象である
+  `clicked` / `double_clicked` が成立しなかった操作も記録に残る。
   1. cell の first click / `double_clicked` / `drag_started` と idx、item key、pointer position、
      current folder / `items_generation`。
   2. `grid_open_from_click_allowed` の結果。拒否時は modal / context menu / badge hit / D&D 等を
@@ -998,6 +1000,22 @@
   5. `pending_direct_nav` publish / consume、RAR image enumeration の begin / end、一覧 install、
      自動 fullscreen 要求 / paint を同じ相関 id で追えるようにする。
   6. auto-aspect の実切替 old/new と、その frame の pointer stream 状態。
+- ログの読み方:
+  - 1 回目 / 2 回目の各物理 press は `grid/pointer_press` から始まり、同じ `seq` の
+    `grid/cell_signal`、`grid/open_gate`、`grid/activation_request`、`grid/pointer_release` を追う。
+    2 回目に `double_clicked=false`、または `accepted=false` / `ignored_reason=no_cell_signal`
+    なら入力未成立側。`block_reason` は `modal_dialog` / `context_menu` / `badge_hit` /
+    `native_drag_drop` の閉じた値で、自由文ではない。
+  - `grid/activation_request accepted=true` と `grid/activation_dispatch_complete` がある場合は、
+    同じ `seq` と archive key で `rar/inspection_begin` → `rar/decision_cache_hit|miss` →
+    `rar/inspection_end|cancel|error` を追う。`inspection_end` は `origin`、`ms`、
+    `scanned_entries`、`decision=Direct|Solid|Nested|Encrypted` を持つため、accepted 後の
+    RAR 判定待ちを入力未成立と分離できる。
+  - Direct 判定後は同じ `seq` の `archive/pending_direct_nav_publish` / `consume`、
+    `rar/image_enumeration_begin` / `end|error`、`archive/items_installed`、設定が有効なら
+    `archive/auto_fullscreen_request` / `paint` を追う。`nav/archive_cache_candidate` とは
+    normalized archive key で突き合わせる。
+  - 実切替があった場合だけ `grid/auto_aspect_switch` が old / new と press 中か idle かを記録する。
 - **診断 ZIP の終端保証も同時に直す**:
   - 現在の perf log は64KiB `BufWriter`で、App frameから約1秒ごとに flush しているが、
     `diagnostics::export_diagnostics_zip` は直前 flush をせずログファイルを読んでいる。そのため
@@ -1008,12 +1026,15 @@
   - 診断 ZIP に含める perf log は現行 `perf_events.jsonl` のみで、rotate 済み `.1`〜`.4` は
     従来どおり除外する。UIにも「性能ログONは次回起動から」「再現後は再起動せずZIP化」を
     維持し、実装テストでは64KiB未満の未flushデータも ZIP に含まれることを確認する。
+  - 実装済みの終端 witness は `diagnostics/export_requested`。ZIP 内の
+    `perf_events.jsonl` にこの event があれば、その直前までの worker / pointer event が
+    flush 済みである。rotate 済み `perf_events.1.jsonl`〜`.4` は従来どおり含めない。
 - 計装入り版で利用者へ依頼する手順: 開発者で性能ログON → 再起動 → 症状再現 → **再起動せず**
   「ログを zip にする」→作成された診断 ZIP を送付。ログにはファイル名 / path が含まれる
   既存注意書きも案内する。
 - **§2.5 の再クリック open で症状が見えなくなっても、本項を解決扱いにしない。** 既存の
   ダブルクリック経路は独立して診断し、根本原因が判明してから修正・回帰テストを入れる。
-- 優先度: P2 調査。先に計装と診断 ZIP flush を実装し、報告環境のログ待ち。
+- 優先度: P2 調査。計装と診断 ZIP flush は実装済み。**未解決のまま報告環境のログ待ち**。
 
 ### 2.4 CSV / TSV からの一括タグ / レーティング付与 — 保留
 

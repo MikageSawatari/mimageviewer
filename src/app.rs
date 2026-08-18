@@ -2849,6 +2849,7 @@ pub(crate) enum FolderNavScanResult {
 /// 来たら自動で破棄される (worker は cancel を見て早期 return する)。
 pub(crate) struct ZipEnumeratePending {
     pub zip_path: PathBuf,
+    pub input_seq: u64,
     pub cancel: Arc<AtomicBool>,
     pub rx: mpsc::Receiver<Result<crate::zip_loader::ZipEnumeration, String>>,
 }
@@ -4411,6 +4412,7 @@ fn resolve_converted_archive_candidate(
     candidate: &ConvertedArchiveCandidate,
     db: Option<&crate::archive_cache::ArchiveCacheDb>,
     cancel: &AtomicBool,
+    input_seq: u64,
 ) -> Option<ConvertedArchiveSourceState> {
     if cancel.load(Ordering::Relaxed) {
         return None;
@@ -4419,7 +4421,12 @@ fn resolve_converted_archive_candidate(
     let mut cache_mtime = candidate.mtime;
     let mut cache_file_size = candidate.file_size;
     if crate::rar_loader::is_rar_path(&candidate.path) {
-        match crate::rar_loader::inspect_for_direct_read_cancelable(&candidate.path, cancel) {
+        match crate::rar_loader::inspect_for_direct_read_cancelable_traced(
+            &candidate.path,
+            cancel,
+            crate::rar_loader::RarInspectionOrigin::FolderDecisionWorker,
+            input_seq,
+        ) {
             Ok(inspection)
                 if inspection.decision == crate::rar_loader::RarDirectReadDecision::Direct =>
             {
@@ -12140,6 +12147,9 @@ pub struct App {
     /// などの入力イベントで +1 する。ワーカーに投げるタスクに copy して渡し、
     /// "入力 → 表示" のレイテンシを相関させる。0 は「未設定」の意味。
     pub(crate) input_seq: u64,
+    /// Perf-log-only primary-pointer operation currently crossing the main grid. The trace starts
+    /// on press, before egui produces `clicked` / `double_clicked`, so a missing signal is kept.
+    pub(crate) grid_pointer_trace: Option<crate::grid_input_diagnostics::GridPointerTrace>,
     /// 直近のユーザー入力時刻 (`bump_input_seq` で更新)。
     /// 入力直後のクールダウン中はアイドル品質アップグレードを抑制するために使用。
     pub(crate) last_input_at: Option<std::time::Instant>,
@@ -12160,6 +12170,9 @@ pub struct App {
     /// 直近フレームでフルスクリーンが描画した (idx, texture_id, input_seq)。
     /// 変化を検出したフレームで `fs.paint` イベントを発火する。
     pub(crate) fs_painted_last: Option<(usize, egui::TextureId, u64)>,
+    /// One explicit archive auto-fullscreen request waiting for its first painted display unit.
+    pub(crate) archive_auto_fs_paint_trace:
+        Option<crate::grid_input_diagnostics::ArchiveAutoFullscreenPaintTrace>,
     /// final-effect 先読み拒否を idx / 理由ごとに 1 秒へ間引く perf-log 専用状態。
     final_effect_prefetch_block_log: FinalEffectPrefetchBlockLog,
 
@@ -13884,6 +13897,7 @@ impl App {
             current_color_cache_map: None,
             current_color_catalog: None,
             input_seq: 0,
+            grid_pointer_trace: None,
             last_input_at: None,
             frame_counter: 0,
             colorize_mono_summary_last_reconcile_frame: u64::MAX,
@@ -13892,6 +13906,7 @@ impl App {
             last_vram_accounting_at: None,
             perf_last_flush: None,
             fs_painted_last: None,
+            archive_auto_fs_paint_trace: None,
             final_effect_prefetch_block_log: FinalEffectPrefetchBlockLog::default(),
             video_resume_last_save: None,
             #[cfg(windows)]
@@ -14588,6 +14603,17 @@ impl App {
 
         // ── 切替を適用 ──
         let old = current;
+        let current_folder = self
+            .current_folder
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        crate::grid_input_diagnostics::emit_auto_aspect_switch(
+            self.grid_pointer_trace.as_ref(),
+            current_folder.as_deref(),
+            self.items_generation,
+            old.label(),
+            new_aspect.label(),
+        );
         self.fixup_scroll_for_aspect_change(new_aspect);
         self.auto_aspect.current = Some(new_aspect);
         self.auto_aspect.switches_done = self.auto_aspect.switches_done.saturating_add(1);
@@ -20941,6 +20967,11 @@ impl App {
     /// UI 側は即座に「読み込み中…」を表示し、BS / Ctrl+↑↓ で中断可能。
     /// 結果は `poll_zip_enumerate` が受け取り `start_loading_items` を呼ぶ。
     pub fn load_zip_as_folder(&mut self, zip_path: PathBuf) {
+        let input_seq = self.input_seq;
+        self.load_zip_as_folder_with_input_seq(zip_path, input_seq);
+    }
+
+    pub(crate) fn load_zip_as_folder_with_input_seq(&mut self, zip_path: PathBuf, input_seq: u64) {
         crate::logger::log(format!(
             "=== load_zip_as_folder: {} ===",
             zip_path.display()
@@ -20989,9 +21020,27 @@ impl App {
         self.zip_enumerate_pending = None;
         self.pdf_enumerate_pending = None;
         self.fs_nav_after_pdf_enumerate = None;
+        self.archive_auto_fs_paint_trace = None;
         // 自動 1 ページ目フルスクリーン (環境設定 ON で grid から ZIP を開いた) の予約を、
         // enumerate 完了で先頭ページを開く既存 deferred 機構へ載せ替える。
         if std::mem::take(&mut self.pending_auto_fs_open) {
+            if crate::perf::is_enabled() {
+                let archive_key = crate::path_key::normalize_keep_drive(&zip_path);
+                crate::perf::event(
+                    "archive",
+                    "auto_fullscreen_request",
+                    Some(&archive_key),
+                    input_seq,
+                    &[("stage", serde_json::Value::from("zip_enumeration"))],
+                );
+                self.archive_auto_fs_paint_trace = Some(
+                    crate::grid_input_diagnostics::ArchiveAutoFullscreenPaintTrace {
+                        seq: input_seq,
+                        archive_key,
+                        items_generation: u64::MAX,
+                    },
+                );
+            }
             self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
                 history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
@@ -21075,8 +21124,12 @@ impl App {
                 if cancel_w.load(Ordering::Relaxed) {
                     return;
                 }
-                let result = crate::zip_loader::enumerate_image_entries_detailed(&path_w)
-                    .map_err(|e| e.to_string());
+                let result = if crate::rar_loader::is_rar_path(&path_w) {
+                    crate::rar_loader::enumerate_image_entries_detailed_traced(&path_w, input_seq)
+                } else {
+                    crate::zip_loader::enumerate_image_entries_detailed(&path_w)
+                }
+                .map_err(|e| e.to_string());
                 if let Ok(enumeration) = &result {
                     // CP932 デコード対応で entry_name が変わった ZIP のリリース済み
                     // per-page キー (★/補正/注釈等) を、結果を UI へ返す**前**に移行する。
@@ -21097,14 +21150,19 @@ impl App {
                 "zip-enumerate: spawn failed ({e}), falling back to synchronous enumerate"
             ));
             drop(rx);
-            let result = crate::zip_loader::enumerate_image_entries_detailed(&zip_path)
-                .map_err(|e| e.to_string());
-            self.finalize_zip_enumerate(zip_path, result);
+            let result = if crate::rar_loader::is_rar_path(&zip_path) {
+                crate::rar_loader::enumerate_image_entries_detailed_traced(&zip_path, input_seq)
+            } else {
+                crate::zip_loader::enumerate_image_entries_detailed(&zip_path)
+            }
+            .map_err(|e| e.to_string());
+            self.finalize_zip_enumerate(zip_path, input_seq, result);
             return;
         }
 
         self.zip_enumerate_pending = Some(ZipEnumeratePending {
             zip_path,
+            input_seq,
             cancel,
             rx,
         });
@@ -21150,8 +21208,9 @@ impl App {
             }
         };
         let zip_path = pending.zip_path.clone();
+        let input_seq = pending.input_seq;
         self.zip_enumerate_pending = None;
-        self.finalize_zip_enumerate(zip_path, result);
+        self.finalize_zip_enumerate(zip_path, input_seq, result);
     }
 
     /// enumerate 結果 → group/sort → `start_loading_items`。
@@ -21159,6 +21218,7 @@ impl App {
     fn finalize_zip_enumerate(
         &mut self,
         zip_path: PathBuf,
+        input_seq: u64,
         result: Result<crate::zip_loader::ZipEnumeration, String>,
     ) {
         let sort = BOOK_READING_PAGE_ORDER;
@@ -21168,6 +21228,7 @@ impl App {
                 // 失敗時はフルスクリーンを開き直さないので defer フラグを破棄する
                 // (line 6142 の `.take()` には到達しない早期 return パス)。
                 self.fs_nav_after_pdf_enumerate = None;
+                self.archive_auto_fs_paint_trace = None;
                 self.release_fs_nav_lock();
                 self.start_loading_items(
                     zip_path,
@@ -21284,6 +21345,7 @@ impl App {
             &self.settings.grid_display_order,
             Some(sort),
         );
+        let installed_items = items.len();
 
         self.start_loading_items(
             zip_path.clone(),
@@ -21293,6 +21355,27 @@ impl App {
             Vec::new(),
             None,
         );
+        let archive_key = crate::path_key::normalize_keep_drive(&zip_path);
+        if let Some(trace) = self.archive_auto_fs_paint_trace.as_mut()
+            && trace.archive_key == archive_key
+        {
+            trace.items_generation = self.items_generation;
+        }
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "archive",
+                "items_installed",
+                Some(&archive_key),
+                input_seq,
+                &[
+                    ("item_count", serde_json::Value::from(installed_items)),
+                    (
+                        "items_generation",
+                        serde_json::Value::from(self.items_generation),
+                    ),
+                ],
+            );
+        }
         // start_loading_items が zip_nav を None にした後で、新しいツリーナビを設定する。
         self.zip_nav = Some(nav);
         // アドレス欄をパンくず表示に更新 (単一ラッパー ZIP は collapse 済み実効 prefix を反映)。
@@ -24180,6 +24263,7 @@ impl App {
                         candidate,
                         db.as_deref(),
                         &worker_cancel,
+                        input_seq,
                     ) else {
                         return;
                     };

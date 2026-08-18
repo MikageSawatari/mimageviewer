@@ -26,6 +26,39 @@ pub enum RarDirectReadDecision {
     Encrypted,
 }
 
+impl RarDirectReadDecision {
+    fn diagnostic_label(self) -> &'static str {
+        match self {
+            Self::Direct => "Direct",
+            Self::Solid => "Solid",
+            Self::NestedArchive => "Nested",
+            Self::Encrypted => "Encrypted",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RarInspectionOrigin {
+    FolderDecisionWorker,
+    ExplicitOpen,
+}
+
+impl RarInspectionOrigin {
+    fn diagnostic_label(self) -> &'static str {
+        match self {
+            Self::FolderDecisionWorker => "folder_decision_worker",
+            Self::ExplicitOpen => "explicit_open",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InspectionCacheOutcome {
+    Unknown,
+    Hit,
+    Miss,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RarVolumeKind {
     Single,
@@ -264,63 +297,161 @@ pub fn inspect_for_direct_read_cancelable(
     path: &Path,
     cancel: &AtomicBool,
 ) -> io::Result<RarInspection> {
-    check_inspection_cancel(cancel)?;
-    let key = cache_key(path)?;
-    if let Ok(cache) = DECISION_CACHE.lock()
-        && let Some((_, inspection)) = cache.iter().find(|(cached, _)| cached == &key)
-    {
-        check_inspection_cancel(cancel)?;
-        return Ok(inspection.clone());
+    inspect_for_direct_read_run(path, cancel).0
+}
+
+/// Diagnostic wrapper for the two RAR decision boundaries relevant to an explicit grid open.
+/// It emits one bounded summary per inspection; individual archive entries are never logged.
+pub(crate) fn inspect_for_direct_read_cancelable_traced(
+    path: &Path,
+    cancel: &AtomicBool,
+    origin: RarInspectionOrigin,
+    input_seq: u64,
+) -> io::Result<RarInspection> {
+    if !crate::perf::is_enabled() {
+        return inspect_for_direct_read_cancelable(path, cancel);
     }
-    check_inspection_cancel(cancel)?;
-    let (mut archive, volume_kind, resolved_path) =
-        open_listing_from_volume_with_key(path, Some(&key))?;
-    let is_solid = archive.is_solid();
-    let mut has_encrypted = archive.has_encrypted_headers();
-    let mut image_count = 0u32;
-    let mut total_uncompressed_bytes = 0u64;
-    let mut nested_archive_count = 0u32;
-    loop {
+    let started = std::time::Instant::now();
+    let archive_key = crate::path_key::normalize_keep_drive(path);
+    crate::perf::event(
+        "rar",
+        "inspection_begin",
+        Some(&archive_key),
+        input_seq,
+        &[("origin", serde_json::Value::from(origin.diagnostic_label()))],
+    );
+    let (result, cache_outcome, scanned_entries) = inspect_for_direct_read_run(path, cancel);
+    match cache_outcome {
+        InspectionCacheOutcome::Hit | InspectionCacheOutcome::Miss => crate::perf::event(
+            "rar",
+            if cache_outcome == InspectionCacheOutcome::Hit {
+                "decision_cache_hit"
+            } else {
+                "decision_cache_miss"
+            },
+            Some(&archive_key),
+            input_seq,
+            &[("origin", serde_json::Value::from(origin.diagnostic_label()))],
+        ),
+        InspectionCacheOutcome::Unknown => {}
+    }
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    match &result {
+        Ok(inspection) => crate::perf::event(
+            "rar",
+            "inspection_end",
+            Some(&archive_key),
+            input_seq,
+            &[
+                ("origin", serde_json::Value::from(origin.diagnostic_label())),
+                ("ms", serde_json::Value::from(elapsed_ms)),
+                ("scanned_entries", serde_json::Value::from(scanned_entries)),
+                (
+                    "decision",
+                    serde_json::Value::from(inspection.decision.diagnostic_label()),
+                ),
+            ],
+        ),
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => crate::perf::event(
+            "rar",
+            "inspection_cancel",
+            Some(&archive_key),
+            input_seq,
+            &[
+                ("origin", serde_json::Value::from(origin.diagnostic_label())),
+                ("ms", serde_json::Value::from(elapsed_ms)),
+                ("scanned_entries", serde_json::Value::from(scanned_entries)),
+            ],
+        ),
+        Err(error) => crate::perf::event(
+            "rar",
+            "inspection_error",
+            Some(&archive_key),
+            input_seq,
+            &[
+                ("origin", serde_json::Value::from(origin.diagnostic_label())),
+                ("ms", serde_json::Value::from(elapsed_ms)),
+                ("scanned_entries", serde_json::Value::from(scanned_entries)),
+                (
+                    "error_kind",
+                    serde_json::Value::from(format!("{:?}", error.kind())),
+                ),
+            ],
+        ),
+    }
+    result
+}
+
+fn inspect_for_direct_read_run(
+    path: &Path,
+    cancel: &AtomicBool,
+) -> (io::Result<RarInspection>, InspectionCacheOutcome, u64) {
+    let mut cache_outcome = InspectionCacheOutcome::Unknown;
+    let mut scanned_entries = 0u64;
+    let result = (|| {
         check_inspection_cancel(cancel)?;
-        let Some(entry) = archive.next() else {
-            break;
+        let key = cache_key(path)?;
+        if let Ok(cache) = DECISION_CACHE.lock()
+            && let Some((_, inspection)) = cache.iter().find(|(cached, _)| cached == &key)
+        {
+            cache_outcome = InspectionCacheOutcome::Hit;
+            check_inspection_cancel(cancel)?;
+            return Ok(inspection.clone());
+        }
+        cache_outcome = InspectionCacheOutcome::Miss;
+        check_inspection_cancel(cancel)?;
+        let (mut archive, volume_kind, resolved_path) =
+            open_listing_from_volume_with_key(path, Some(&key))?;
+        let is_solid = archive.is_solid();
+        let mut has_encrypted = archive.has_encrypted_headers();
+        let mut image_count = 0u32;
+        let mut total_uncompressed_bytes = 0u64;
+        let mut nested_archive_count = 0u32;
+        loop {
+            check_inspection_cancel(cancel)?;
+            let Some(entry) = archive.next() else {
+                break;
+            };
+            let entry = entry.map_err(unrar_io)?;
+            scanned_entries = scanned_entries.saturating_add(1);
+            // Encryption is an archive eligibility property, including entries hidden from the UI.
+            has_encrypted |= entry.is_encrypted();
+            if !entry.is_file() {
+                continue;
+            }
+            let name = normalized_entry_name(&entry.filename);
+            if should_ignore_entry(&name) {
+                continue;
+            }
+            if is_image_entry(&name) {
+                image_count = image_count.saturating_add(1);
+                total_uncompressed_bytes =
+                    total_uncompressed_bytes.saturating_add(entry.unpacked_size);
+            } else if nested_archive_kind(&name).is_some() {
+                nested_archive_count = nested_archive_count.saturating_add(1);
+            }
+        }
+        check_inspection_cancel(cancel)?;
+        let inspection = RarInspection {
+            decision: classify_direct_read(is_solid, nested_archive_count > 0, has_encrypted),
+            summary: ArchiveImageSummary {
+                image_count,
+                total_uncompressed_bytes,
+                nested_archive_count,
+            },
+            volume_kind,
+            resolved_path,
         };
-        let entry = entry.map_err(unrar_io)?;
-        // Encryption is an archive eligibility property, including entries hidden from the UI.
-        has_encrypted |= entry.is_encrypted();
-        if !entry.is_file() {
-            continue;
+        if let Ok(mut cache) = DECISION_CACHE.lock() {
+            cache.retain(|(cached, _)| cached.path != key.path);
+            if cache.len() >= DECISION_CACHE_CAPACITY {
+                cache.remove(0);
+            }
+            cache.push((key, inspection.clone()));
         }
-        let name = normalized_entry_name(&entry.filename);
-        if should_ignore_entry(&name) {
-            continue;
-        }
-        if is_image_entry(&name) {
-            image_count = image_count.saturating_add(1);
-            total_uncompressed_bytes = total_uncompressed_bytes.saturating_add(entry.unpacked_size);
-        } else if nested_archive_kind(&name).is_some() {
-            nested_archive_count = nested_archive_count.saturating_add(1);
-        }
-    }
-    check_inspection_cancel(cancel)?;
-    let inspection = RarInspection {
-        decision: classify_direct_read(is_solid, nested_archive_count > 0, has_encrypted),
-        summary: ArchiveImageSummary {
-            image_count,
-            total_uncompressed_bytes,
-            nested_archive_count,
-        },
-        volume_kind,
-        resolved_path,
-    };
-    if let Ok(mut cache) = DECISION_CACHE.lock() {
-        cache.retain(|(cached, _)| cached.path != key.path);
-        if cache.len() >= DECISION_CACHE_CAPACITY {
-            cache.remove(0);
-        }
-        cache.push((key, inspection.clone()));
-    }
-    Ok(inspection)
+        Ok(inspection)
+    })();
+    (result, cache_outcome, scanned_entries)
 }
 
 #[cfg(test)]
@@ -374,6 +505,55 @@ pub fn enumerate_image_entries_detailed(path: &Path) -> io::Result<ZipEnumeratio
         has_foreign_archives: false,
         legacy_renames: Vec::new(),
     })
+}
+
+pub(crate) fn enumerate_image_entries_detailed_traced(
+    path: &Path,
+    input_seq: u64,
+) -> io::Result<ZipEnumeration> {
+    if !crate::perf::is_enabled() {
+        return enumerate_image_entries_detailed(path);
+    }
+    let started = std::time::Instant::now();
+    let archive_key = crate::path_key::normalize_keep_drive(path);
+    crate::perf::event(
+        "rar",
+        "image_enumeration_begin",
+        Some(&archive_key),
+        input_seq,
+        &[],
+    );
+    let result = enumerate_image_entries_detailed(path);
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    match &result {
+        Ok(enumeration) => crate::perf::event(
+            "rar",
+            "image_enumeration_end",
+            Some(&archive_key),
+            input_seq,
+            &[
+                ("ms", serde_json::Value::from(elapsed_ms)),
+                (
+                    "image_entries",
+                    serde_json::Value::from(enumeration.entries.len()),
+                ),
+            ],
+        ),
+        Err(error) => crate::perf::event(
+            "rar",
+            "image_enumeration_error",
+            Some(&archive_key),
+            input_seq,
+            &[
+                ("ms", serde_json::Value::from(elapsed_ms)),
+                (
+                    "error_kind",
+                    serde_json::Value::from(format!("{:?}", error.kind())),
+                ),
+            ],
+        ),
+    }
+    result
 }
 
 pub fn first_image_entry(path: &Path, cancel: Option<&AtomicBool>) -> Option<String> {

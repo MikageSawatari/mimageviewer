@@ -15682,6 +15682,31 @@ impl App {
         let trace_pages = self
             .fs_display_unit_trace_pages(fs_idx, spread_pair, sources)
             .unwrap_or_default();
+        if let Some(trace) = self.archive_auto_fs_paint_trace.take() {
+            if trace.items_generation == self.items_generation {
+                if let Some(page) = trace_pages.first() {
+                    crate::perf::event(
+                        "archive",
+                        "auto_fullscreen_paint",
+                        Some(&trace.archive_key),
+                        trace.seq,
+                        &[
+                            ("idx", serde_json::Value::from(page.idx)),
+                            (
+                                "item_key",
+                                serde_json::Value::from(self.perf_item_key(page.idx)),
+                            ),
+                            (
+                                "items_generation",
+                                serde_json::Value::from(self.items_generation),
+                            ),
+                        ],
+                    );
+                } else {
+                    self.archive_auto_fs_paint_trace = Some(trace);
+                }
+            }
+        }
         let captured_display_unit = trace_pages
             .iter()
             .any(|page| page.provenance == FsDisplayUnitPageProvenance::Holdover);
