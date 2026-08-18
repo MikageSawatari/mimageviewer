@@ -1340,6 +1340,17 @@
   両時点の `fs_navigation_sequence_blocks_new_target()` を read-only で記録する。1秒ごとの
   `fs/original_preview_blocker_summary` は sequence in-flight 中の original-preview return 数を集計し、
   return が0件でも heartbeat を出す。抑制条件を original-preview / sequence の成立自体には依存させない。
+- **続報と修正 (2026-08-18):** 4 属性付き perf log では、右 Ctrl ホールド中の
+  `pass_through` は 0 件、`right_ctrl_held=true` / `original_preview_active=true` /
+  `context_blocker="original_preview"` は 1,888 frame だった。typed sequence の間だけを抑止すると、
+  auto-repeat のシーケンス間の隙間で元画像表示が復帰し、blocker が burst を解除していた。
+- 利用者判断により、ページ送り入力が物理的に押されている間も元画像表示を無効にする。既存の
+  sequence 抑止は単発タップの release 後から提示完了までを守るため残す。物理レベルは blocker を
+  一切参照しない helper に分離し、edge の `still_held`、または focused viewport permit 下の
+  configurable / fixed page-turn chord を解決して `(frame_nr, viewport)` 単位で memo 化する。
+  `original_preview_active` と `fs_page_turn_input_held` は同じ sample を共有し、時間窓と先読み窓変更は
+  追加しない。マウス / リング由来のページ送りと元画像要求の矛盾を防ぐため、`original_preview`
+  blocker 自体は残す。
 - 関連: [display-pipeline.md](display-pipeline.md) §§2.3, 2.5.4、
   [keymap-spec.md](keymap-spec.md)「画像フルスクリーン」。
 

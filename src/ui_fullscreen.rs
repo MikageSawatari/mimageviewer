@@ -5216,17 +5216,26 @@ impl App {
             // 用途である。移動中に補正が乗っていることは仕様として問題ない。
             return false;
         }
+        let focus_viewport = if self.fullscreen_embedded_still_active() {
+            ctx.viewport_id()
+        } else {
+            self.fullscreen_viewport_id()
+        };
+        #[cfg(windows)]
+        if self
+            .fs_page_turn_physical_input_for_frame(ctx, focus_viewport)
+            .held
+        {
+            // A held page-turn input still means navigation between typed sequences. Showing the
+            // original here would flicker and would also clear the burst through its blocker.
+            return false;
+        }
         if !self.fs_prev_focused {
             return false;
         }
         if self.any_modal_dialog_open_for_fullscreen_keys() {
             return false;
         }
-        let focus_viewport = if self.fullscreen_embedded_still_active() {
-            ctx.viewport_id()
-        } else {
-            self.fullscreen_viewport_id()
-        };
         let Some(level_permit) = crate::keyboard_input::focused_key_state_permit_for_viewport(
             focus_viewport,
             self.fs_prev_focused,
@@ -8302,6 +8311,22 @@ struct FsPageTurnFrameDecision {
     items_generation: u64,
     idx: usize,
     decision: FsPageTurnDecision,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FsPageTurnPhysicalInput {
+    held: bool,
+    /// No focused key-state permit for the owning viewport, so no level could be read at all.
+    /// Kept apart from `held: false` because the page-turn probe reports the two differently.
+    viewport_unfocused: bool,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FsPageTurnPhysicalInputFrameSample {
+    frame_nr: u64,
+    input: FsPageTurnPhysicalInput,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -15240,9 +15265,80 @@ impl App {
         })
     }
 
-    /// Resolve the physical page-turn level for the owning viewport. This reads
-    /// current OS/synthetic level only: repeat edges, elapsed time and prior frames
-    /// do not participate.
+    /// Resolve only the physical page-turn level for the owning viewport.
+    ///
+    /// This deliberately does not consult ordinary context blockers. Original preview uses this
+    /// level to suppress itself, while the ordinary blocker uses original preview; joining those
+    /// responsibilities would make the level unreadable exactly while preview is held.
+    #[cfg(windows)]
+    fn fs_page_turn_physical_input_for_frame(
+        &self,
+        ctx: &egui::Context,
+        viewport: egui::ViewportId,
+    ) -> FsPageTurnPhysicalInput {
+        let frame_nr = ctx.cumulative_frame_nr();
+        let cache_id = egui::Id::new(("fs_page_turn_physical_input_held", viewport));
+        if let Some(sample) = ctx
+            .data(|data| data.get_temp::<FsPageTurnPhysicalInputFrameSample>(cache_id))
+            .filter(|sample| sample.frame_nr == frame_nr)
+        {
+            return sample.input;
+        }
+
+        // An edge consumed in this pass describes the accepted move more precisely than a later
+        // OS read, which could already observe the key-up after the last repeat.
+        let input = if let Some(still_held) =
+            crate::keymap::page_turn_edge_hold_this_frame(ctx, viewport)
+        {
+            FsPageTurnPhysicalInput {
+                held: still_held,
+                viewport_unfocused: false,
+            }
+        } else {
+            let viewport_focused = if viewport == ctx.viewport_id() {
+                ctx.input(|input| input.viewport().focused).unwrap_or(true)
+            } else {
+                self.fs_prev_focused
+            };
+            let level = crate::keyboard_input::focused_key_state_permit_for_viewport(
+                viewport,
+                viewport_focused,
+            )
+            .map(|level_permit| {
+                let configurable = FS_PAGE_TURN_COALESCE_ACTIONS.into_iter().any(|action| {
+                    self.keymap
+                        .effective_chords(action)
+                        .into_iter()
+                        .any(|chord| {
+                            self.keymap.key_held_chord_via_os(level_permit, chord)
+                                && self.fs_page_turn_chord_is_unambiguous(chord)
+                        })
+                });
+                let fixed = FS_FIXED_PAGE_TURN_CHORDS
+                    .into_iter()
+                    .chain((!self.stack_showing_flat).then_some(Chord::shift(KeyName::Up)))
+                    .chain((!self.stack_showing_flat).then_some(Chord::shift(KeyName::Down)))
+                    .any(|chord| {
+                        self.keymap.key_held_chord_via_os(level_permit, chord)
+                            && self.fs_page_turn_chord_is_unambiguous(chord)
+                    });
+                configurable || fixed
+            });
+            FsPageTurnPhysicalInput {
+                held: level.unwrap_or(false),
+                viewport_unfocused: level.is_none(),
+            }
+        };
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                cache_id,
+                FsPageTurnPhysicalInputFrameSample { frame_nr, input },
+            );
+        });
+        input
+    }
+
+    /// Combine the frame-local physical level with the ordinary context gate.
     #[cfg(windows)]
     fn fs_page_turn_input_held(
         &self,
@@ -15254,47 +15350,15 @@ impl App {
         } else {
             self.fullscreen_viewport_id()
         };
+        let physical = self.fs_page_turn_physical_input_for_frame(ctx, viewport);
         let blocker = self.fs_page_turn_ordinary_context_blocker(ctx, fs_idx);
         if blocker.is_some() {
             return (false, blocker, viewport);
         }
-        // A page turn taken in this pass already answered this, at the instant the move was
-        // accepted. Asking the OS again here reads a later moment, and a key released in between
-        // makes the last repeat of a burst look like a lone press - the page it lands on then
-        // skips the stand-in and appears at full quality a quarter of a second later, which reads
-        // as the viewer moving on by itself after the key was let go.
-        if let Some(still_held) = crate::keymap::page_turn_edge_hold_this_frame(ctx, viewport) {
-            return (still_held, None, viewport);
-        }
-        let viewport_focused = if viewport == ctx.viewport_id() {
-            ctx.input(|input| input.viewport().focused).unwrap_or(true)
-        } else {
-            self.fs_prev_focused
-        };
-        let Some(level_permit) = crate::keyboard_input::focused_key_state_permit_for_viewport(
-            viewport,
-            viewport_focused,
-        ) else {
+        if physical.viewport_unfocused {
             return (false, Some("viewport_unfocused"), viewport);
-        };
-        let configurable = FS_PAGE_TURN_COALESCE_ACTIONS.into_iter().any(|action| {
-            self.keymap
-                .effective_chords(action)
-                .into_iter()
-                .any(|chord| {
-                    self.keymap.key_held_chord_via_os(level_permit, chord)
-                        && self.fs_page_turn_chord_is_unambiguous(chord)
-                })
-        });
-        let fixed = FS_FIXED_PAGE_TURN_CHORDS
-            .into_iter()
-            .chain((!self.stack_showing_flat).then_some(Chord::shift(KeyName::Up)))
-            .chain((!self.stack_showing_flat).then_some(Chord::shift(KeyName::Down)))
-            .any(|chord| {
-                self.keymap.key_held_chord_via_os(level_permit, chord)
-                    && self.fs_page_turn_chord_is_unambiguous(chord)
-            });
-        (configurable || fixed, None, viewport)
+        }
+        (physical.held, None, viewport)
     }
 
     /// Say when texture uploads have been deferred for long enough that they cannot be waiting on
@@ -34816,7 +34880,10 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn arm_reassigned_original_preview_hold(app: &mut crate::app::AppTestEnvForTest) {
+    fn arm_reassigned_original_preview_hold(
+        app: &mut crate::app::AppTestEnvForTest,
+        key: crate::key_input::SyntheticNavigationKey,
+    ) {
         app.keymap = Keymap::from_ini_str("[FsImage]\nFsOriginalPreviewHold = Ctrl\n");
         app.fs_prev_focused = true;
         let viewport = app.fullscreen_viewport_id();
@@ -34825,7 +34892,7 @@ mod tests {
         crate::key_input::enqueue_test_synthetic_command(
             crate::key_input::SyntheticKeyCommand::down(
                 now,
-                crate::key_input::SyntheticNavigationKey::Right,
+                key,
                 crate::key_input::SyntheticModifiers {
                     ctrl: true,
                     ..Default::default()
@@ -34845,7 +34912,10 @@ mod tests {
         let _clear = ClearOriginalPreviewSyntheticInput;
         let ctx = egui::Context::default();
         let mut app = setup_navigation_readiness_app(1);
-        arm_reassigned_original_preview_hold(&mut app);
+        arm_reassigned_original_preview_hold(
+            &mut app,
+            crate::key_input::SyntheticNavigationKey::Home,
+        );
         assert!(
             app.original_preview_active(&ctx, 0),
             "the reassigned hold must be active before navigation starts"
@@ -34867,10 +34937,87 @@ mod tests {
         let _clear = ClearOriginalPreviewSyntheticInput;
         let ctx = egui::Context::default();
         let mut app = setup_navigation_readiness_app(1);
-        arm_reassigned_original_preview_hold(&mut app);
+        arm_reassigned_original_preview_hold(
+            &mut app,
+            crate::key_input::SyntheticNavigationKey::Home,
+        );
 
         assert!(!app.fs_navigation_sequence_blocks_new_target());
+        assert!(
+            !app.fs_page_turn_physical_input_for_frame(&ctx, app.fullscreen_viewport_id())
+                .held
+        );
         assert!(app.original_preview_active(&ctx, 0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn original_preview_hold_is_inactive_while_page_turn_input_is_held() {
+        let _serial = crate::key_input::TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("test input lock poisoned");
+        let _clear = ClearOriginalPreviewSyntheticInput;
+        let ctx = egui::Context::default();
+        let mut app = setup_navigation_readiness_app(1);
+        arm_reassigned_original_preview_hold(
+            &mut app,
+            crate::key_input::SyntheticNavigationKey::Right,
+        );
+
+        assert!(!app.fs_navigation_sequence_blocks_new_target());
+        assert!(
+            app.fs_page_turn_physical_input_for_frame(&ctx, app.fullscreen_viewport_id())
+                .held
+        );
+        assert!(!app.original_preview_active(&ctx, 0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_unfocused_viewport_still_names_itself_in_the_page_turn_reason() {
+        let _serial = crate::key_input::TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("test input lock poisoned");
+        let _clear = ClearOriginalPreviewSyntheticInput;
+        let ctx = egui::Context::default();
+        let mut app = setup_navigation_readiness_app(1);
+        app.reading_flow = ReadingFlow::Paged;
+        arm_reassigned_original_preview_hold(
+            &mut app,
+            crate::key_input::SyntheticNavigationKey::Right,
+        );
+        // No permit for the owning viewport: the level cannot be read at all, which is a
+        // different answer from "read it, nothing held" and the probe has to keep saying so.
+        app.fs_prev_focused = false;
+
+        let (held, blocker, _) = app.fs_page_turn_input_held(&ctx, 0);
+
+        assert!(!held);
+        assert_eq!(blocker, Some("viewport_unfocused"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn held_page_turn_does_not_create_an_original_preview_context_blocker() {
+        let _serial = crate::key_input::TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("test input lock poisoned");
+        let _clear = ClearOriginalPreviewSyntheticInput;
+        let ctx = egui::Context::default();
+        let mut app = setup_navigation_readiness_app(1);
+        app.reading_flow = ReadingFlow::Paged;
+        arm_reassigned_original_preview_hold(
+            &mut app,
+            crate::key_input::SyntheticNavigationKey::Right,
+        );
+
+        assert_eq!(app.fs_page_turn_ordinary_context_blocker(&ctx, 0), None);
+        let (held, blocker, _) = app.fs_page_turn_input_held(&ctx, 0);
+        assert!(held);
+        assert_eq!(blocker, None);
     }
 
     fn insert_navigation_original_page(
