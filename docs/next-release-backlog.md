@@ -886,7 +886,7 @@
   - 同一 RAR の header 判定回数を計装または test double で固定し、一覧判定直後のサムネイル
     生成で同じ全 entry scan を繰り返さない。
 - 規模 / 優先度: 中 / P2。利用者へ「本日リリース予定版の次で対応」と回答済み。
-- **対応済み (2026-08-18、backlog 2.3 close)**:
+- **対応済み (2026-08-19、backlog 2.3 close)**:
   - `converted_archive_cache_paths` を `Pending / Direct / CachedZip / Unavailable` の typed state
     に変更し、未判定と判定済み利用不可を分離した。worker は候補 1 件ごとに結果を送り、UI は
     メッセージごとに `items_generation` を検証して同世代だけを反映する。pin dependency も先に
@@ -905,6 +905,30 @@
     thumbnail worker の代表画像選択が `enumerate_image_entries_detailed` でもう一度 RAR 全 header を
     列挙する。これを 1 回へ統合するには `RarInspection` と thumbnail/open の列挙契約をまたぐため、
     brief の停止条件に従い本件には押し込まなかった。今回閉じるのは全件判定待ちの表示遅延である。
+
+### 2.7 RAR の header 全走査が、一覧判定とサムネイル生成で 2 回走る
+
+- 出典: §2.3 の caller 監査 (2026-08-19)。§2.3 の brief §1.4 として着手したが、範囲が
+  1.1-1.3 を超えると判断して停止条件どおり切り出した。**§2.3 が閉じたのは「全件判定を
+  待つ表示遅延」であって、判定そのものの重複ではない。**
+- 機構: フォルダ一覧の eligibility 判定が `inspect_for_direct_read_cancelable` で RAR の
+  header を全走査した後、thumbnail worker の代表画像選択が
+  `enumerate_image_entries_detailed` で**同じ RAR の header をもう一度全部**列挙する。
+  30,000 entry 級の RAR が多いフォルダでは、この 2 回目がそのまま体感時間に乗る。
+- なぜ今回入れなかったか: 1 回へ統合するには `RarInspection` が entry / 代表情報を保持し、
+  thumbnail と open 双方の列挙契約を変える必要がある。§2.3 の逐次公開とは独立した変更で、
+  同じ commit に混ぜると切り分けられなくなる。
+- 直す方向:
+  - `rar_loader` の判定結果が、そのフォルダ generation の間だけ代表画像選択に必要な情報も
+    持つようにする。`DECISION_CACHE_CAPACITY` (32、full inspection 保持) を単に増やす修正には
+    しない。メモリが増えるだけで、判定回数は減らない。
+  - 統合後は **同一 RAR の header 判定回数を計装または test double で 1 回に固定する**
+    (§2.3 の完了条件として書かれていた項目をここへ引き継ぐ)。
+- 計測の起点: `C:\tmp\miv-rar-thumbnail-test-100` (30,000 entry の RAR を 30 個複製)。
+  §2.3 後の実測は visible 12 件が 0.801〜0.860 秒、候補 #130 が 4.021 秒
+  (worker 累積 3,257.5ms)。2 回目の走査を消せばここがさらに下がるはず。
+- 規模 / 優先度: 中 / P2。表示は既に出るようになったので体感の急所ではないが、
+  同じ I/O を 2 回やっている事実は残っている。
 
 ### 2.5 選択済み項目を、修飾なしの再クリックで開く — 専用スレ >>246
 
