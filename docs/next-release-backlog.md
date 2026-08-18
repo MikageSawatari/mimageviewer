@@ -848,6 +848,10 @@
      heavy thumbnail queue 自体に要求が入らない。
   4. `rar_loader` の完全判定 cache は 32 件なので、多数の RAR を同じ順番で再走査すると
      folder scan / thumbnail / open 間で判定を十分再利用できない。
+     これは `(path, size, mtime)` ごとの直読み可否と集計結果をプロセス内に保持する cache で、
+     変換済み ZIP 本体を永続保存する `archive_cache.db` / `archive_cache` とは別物。ネスト RAR は
+     有効な変換済み ZIP があっても、現状は先に直読み判定を行い、非 Direct と分かってから
+     `fallback_cached_zip` へ進むため、32 件から外れた後や再起動後は全 header scan が再発する。
 - 修正方針:
   1. 現在フォルダの各候補を `Pending / Direct / CachedZip / Unavailable` の typed state で
      所有し、**1 件の判定完了ごとに**同世代の結果を UI へ公開する。map entry の有無だけを
@@ -889,10 +893,21 @@
 
 ### 2.6 ZIP / RAR のダブルクリックが時々無反応 — 未再現、専用スレ >>246, >>249-250
 
-- 報告条件: サムネイル表示、ZIP / RAR、Enter では開ける。しばらく待って再度
-  ダブルクリックすると開くことがある。RAR はローカル上の直読み対象。
+- 報告条件: サムネイル表示、ZIP / RAR、Enter では開ける。1 回だけダブルクリックして
+  約10秒ほかの操作をせず待つと開くことがある。RAR はローカル上の直読み対象。
 - **2026-08-18 時点では未再現**。§2.3 の stress folder でサムネイルが約6秒遅れる状態でも
   ダブルクリック open は成立したため、RARサムネイル遅延をこの不具合の原因と決めない。
+- **追加の極端条件でも未再現**:
+  - `C:\tmp\miv-rar-decision-cache-stress\01-direct-64x-120000` に、各12万 entry の
+    直読み可能 RAR を判定 cache 上限の2倍に当たる64個配置した。
+  - `03-mixed-128x-120000` には、各12万 entry の直読み可能 RAR 64個と、末尾にネスト
+    archive を置いて最後まで走査しないと非 Direct と確定しない RAR 64個を混在させた。
+    フォルダ判定 worker と明示 open が同じフォルダで並行する条件でも、待ってから自動で
+    開く症状は再現しなかった。別フォルダ間の移動は旧 worker を cancel するので再現条件に
+    数えない。
+  - この結果から hidden scan には独立した性能改善余地があるものの、ローカル実機での
+    ダブルクリック症状の主原因とは扱わない。さらに人工的な entry 数だけを増やさず、
+    報告環境の診断ログで「入力未成立 / accepted 後の待機」を分離する。
 - コード上の確認候補:
   1. サムネイル比率が `自動` のとき、2 click の間に実際の cell height / scroll offset が
      変わると、2 回目が別セルまたは余白へ当たり得る。判定結果が同じ比率で配置が変わらない
@@ -903,16 +918,37 @@
      open の場合も `grid_open_from_click_allowed` が item open を止める。
   4. RAR open 自体は direct-read 可否の hidden scan を開始する。重い RAR では無反応に見え得るが、
      click が成立していれば再操作なしで scan 完了後に開くはずなので区別する。
-- 利用者へ確認中: viewer mode、起動直後か操作後か、1回だけダブルクリックして10秒待っても
-  開かないか、1 click目で選択枠が付くか、発生時にセル比率・位置が変わるか。
-- 次の一手: 再現条件が得られなければ、修正より先に perf log へ次を追加する。
-  - cell の first click / `double_clicked` / `drag_started` と idx・item key・pointer position。
-  - `grid_open_from_click_allowed` の結果と `modal_dialog_block_reason`。
-  - activation 要求の accepted / ignored、RAR hidden scan の開始・完了。
-  - auto-aspect の実切替 old/new と、その frame の pointer stream 状態。
+- 利用者から確認済み: フル機能ウィンドウ、1 click目で選択枠あり、症状発生時にセル比率・
+  位置の切替なし。起動直後か操作後かは特定できていない。
+- **次の一手は診断 perf log の追加**。高頻度イベントを常時出さず、pointer 操作と archive
+  request の境界だけを同一 `input_seq` / open request id で相関できるようにする。
+  1. cell の first click / `double_clicked` / `drag_started` と idx、item key、pointer position、
+     current folder / `items_generation`。
+  2. `grid_open_from_click_allowed` の結果。拒否時は modal / context menu / badge hit / D&D 等を
+     構造化した block reason で記録し、単なる bool や自由文だけにしない。
+  3. activation 要求の accepted / ignored、所有者、item kind、dispatch 完了。
+  4. RAR inspection の begin / decision-cache hit・miss / end / cancel / error。elapsed、走査 entry
+     数、Direct / Solid / Nested / Encrypted、folder 判定 worker と明示 open の呼出元を記録する。
+     entry ごとのイベントは出さない。
+  5. `pending_direct_nav` publish / consume、RAR image enumeration の begin / end、一覧 install、
+     自動 fullscreen 要求 / paint を同じ相関 id で追えるようにする。
+  6. auto-aspect の実切替 old/new と、その frame の pointer stream 状態。
+- **診断 ZIP の終端保証も同時に直す**:
+  - 現在の perf log は64KiB `BufWriter`で、App frameから約1秒ごとに flush しているが、
+    `diagnostics::export_diagnostics_zip` は直前 flush をせずログファイルを読んでいる。そのため
+    通常はボタン直前の約1秒分、UI sleep中にworker eventだけが追加された場合は次のframeまでの
+    未flush分が ZIP に入らない可能性がある。
+  - 「ログを zip にする」受付を perf event に記録し、`perf::flush()` と `logger::flush()` が
+    完了してから logs を読み込む。受付イベントを ZIP 内ログの明確な終端 witness とする。
+  - 診断 ZIP に含める perf log は現行 `perf_events.jsonl` のみで、rotate 済み `.1`〜`.4` は
+    従来どおり除外する。UIにも「性能ログONは次回起動から」「再現後は再起動せずZIP化」を
+    維持し、実装テストでは64KiB未満の未flushデータも ZIP に含まれることを確認する。
+- 計装入り版で利用者へ依頼する手順: 開発者で性能ログON → 再起動 → 症状再現 → **再起動せず**
+  「ログを zip にする」→作成された診断 ZIP を送付。ログにはファイル名 / path が含まれる
+  既存注意書きも案内する。
 - **§2.5 の再クリック open で症状が見えなくなっても、本項を解決扱いにしない。** 既存の
   ダブルクリック経路は独立して診断し、根本原因が判明してから修正・回帰テストを入れる。
-- 優先度: P2 調査。再現または診断ログ待ち。
+- 優先度: P2 調査。先に計装と診断 ZIP flush を実装し、報告環境のログ待ち。
 
 ### 2.4 CSV / TSV からの一括タグ / レーティング付与 — 保留
 
