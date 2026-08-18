@@ -1462,8 +1462,10 @@
   - 効かなかった Z は `[fs-key] source=fullscreen keys=Z:down` として **egui 側**に届いていた。
   - `[native-video-key]` はセッション全体で **1 行だけ** (終了時の Escape)。**Z も P もカーソルも
     native の `handle_native_video_key_event` には届いていない。**
-  - native 行の `foreground_hwnd=0x3BC25CC` != `presenter_hwnd=0x7982452`。detached ではホスト
-    (egui) 側がフォーカスを持ち、presenter は子として内側にいる。
+  - native 行は `foreground_hwnd=0x3BC25CC` != `presenter_hwnd=0x7982452` を記録しているが、
+    **これは host focus の証拠にはならない** (detached presenter は `WS_CHILD` なので、子に
+    focus があっても foreground は top-level host になる。Codex 指摘)。証拠は
+    **`[fs-key]` が出ていて native event が無いこと**そのもの。
   - HUD 経由の入場は `source=native_output_event` として記録され、音声モードからの Z は
     egui の音楽ビュー分岐が処理していた (`exit fs_idx=9`)。
 - **原因**: キーが奪われているのではなく、**`VideoToggleAudioMode` の動画→音声方向が egui 入力
