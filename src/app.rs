@@ -16635,6 +16635,13 @@ impl App {
         self.grid_click_selection_anchor = None;
         self.update_last_selected_image();
         self.sync_quick_folder_settings();
+
+        // The active slot must continue to own the location that remains on screen after the
+        // clear. Only its target and drive-current entry are reseeded; all position and navigation
+        // history above stays cleared, so the visible list still starts at the top.
+        if let Some(current) = self.effective_folder() {
+            self.update_active_quick_folder_target(&current);
+        }
     }
 
     /// フォルダバーのメニュー・キー・リングから共有する場所記憶クリア入口。

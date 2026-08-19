@@ -4227,20 +4227,25 @@ fn add_grid_selection_range(
     }
 }
 
-/// A plain mouse click may open only a cell that was selected before this click
-/// and is not the cursor of a multi-selection that the click must collapse.
+/// Whether a modifier-free click replaces the checked set as part of moving the cursor.
+fn grid_plain_click_clears_checks(mode: GridClickSelectionMode) -> bool {
+    mode.normalized() == GridClickSelectionMode::Explorer
+}
+
+/// A plain mouse click may open only a cell that was selected before this click.
+/// When the click behavior clears checks, it must first collapse any other checked cells
+/// instead of opening the cursor; click behaviors that preserve checks have nothing to collapse.
 fn grid_reclick_open_allowed(
     selected_before_click: bool,
     no_other_cell_checked: bool,
-    mode: GridClickSelectionMode,
+    plain_click_clears_checks: bool,
     open_selected_item_on_click: bool,
     ctrl: bool,
     shift: bool,
     touch_derived_pointer_activity: bool,
 ) -> bool {
     selected_before_click
-        && no_other_cell_checked
-        && mode.normalized() == GridClickSelectionMode::Explorer
+        && (!plain_click_clears_checks || no_other_cell_checked)
         && open_selected_item_on_click
         && !ctrl
         && !shift
@@ -4295,6 +4300,7 @@ fn apply_grid_click_selection(
     shift: bool,
 ) {
     let mode = mode.normalized();
+    let plain_click_clears_checks = grid_plain_click_clears_checks(mode);
     if shift {
         let previous_anchor_is_valid = anchor
             .and_then(|anchor| anchor.index_for_generation(items_generation))
@@ -4328,7 +4334,7 @@ fn apply_grid_click_selection(
     }
 
     if !ctrl {
-        if mode == GridClickSelectionMode::Explorer {
+        if plain_click_clears_checks {
             checked.clear();
         }
         *selected = Some(clicked_idx);
@@ -12768,6 +12774,8 @@ impl App {
         let same_cell_as_previous_primary_click = previous_primary_clicked_grid_idx == Some(idx);
         let no_other_cell_checked_before_click =
             self.checked.iter().all(|&checked_idx| checked_idx == idx);
+        let plain_click_clears_checks =
+            grid_plain_click_clears_checks(self.settings.grid_click_selection_mode);
         let ctrl = ctx.input(|i| i.modifiers.ctrl);
         let shift = ctx.input(|i| i.modifiers.shift);
         if response.clicked() && !badge_clicked {
@@ -12797,7 +12805,7 @@ impl App {
                 && grid_reclick_open_allowed(
                     selected_before_click,
                     no_other_cell_checked_before_click,
-                    self.settings.grid_click_selection_mode,
+                    plain_click_clears_checks,
                     self.settings.grid_open_selected_item_on_click,
                     ctrl,
                     shift,
@@ -20928,77 +20936,35 @@ mod grid_reclick_open_tests {
 
     #[test]
     fn reclick_predicate_requires_every_condition() {
+        assert!(grid_plain_click_clears_checks(
+            GridClickSelectionMode::Explorer
+        ));
+        assert!(!grid_plain_click_clears_checks(
+            GridClickSelectionMode::Check
+        ));
         assert!(grid_reclick_open_allowed(
-            true,
-            true,
-            GridClickSelectionMode::Explorer,
-            true,
-            false,
-            false,
-            false,
+            true, true, true, true, false, false, false,
         ));
         assert!(!grid_reclick_open_allowed(
-            false,
-            true,
-            GridClickSelectionMode::Explorer,
-            true,
-            false,
-            false,
-            false,
+            false, true, true, true, false, false, false,
+        ));
+        assert!(grid_reclick_open_allowed(
+            true, false, false, true, false, false, false,
         ));
         assert!(!grid_reclick_open_allowed(
-            true,
-            true,
-            GridClickSelectionMode::Check,
-            true,
-            false,
-            false,
-            false,
+            true, true, true, true, true, false, false,
         ));
         assert!(!grid_reclick_open_allowed(
-            true,
-            true,
-            GridClickSelectionMode::Explorer,
-            true,
-            true,
-            false,
-            false,
+            true, true, true, true, false, true, false,
         ));
         assert!(!grid_reclick_open_allowed(
-            true,
-            true,
-            GridClickSelectionMode::Explorer,
-            true,
-            false,
-            true,
-            false,
+            true, true, true, true, false, false, true,
         ));
         assert!(!grid_reclick_open_allowed(
-            true,
-            true,
-            GridClickSelectionMode::Explorer,
-            true,
-            false,
-            false,
-            true,
+            true, false, true, true, false, false, false,
         ));
         assert!(!grid_reclick_open_allowed(
-            true,
-            false,
-            GridClickSelectionMode::Explorer,
-            true,
-            false,
-            false,
-            false,
-        ));
-        assert!(!grid_reclick_open_allowed(
-            true,
-            true,
-            GridClickSelectionMode::Explorer,
-            false,
-            false,
-            false,
-            false,
+            true, true, true, false, false, false, false,
         ));
     }
 
@@ -21085,11 +21051,23 @@ mod grid_reclick_open_tests {
     }
 
     #[test]
-    fn check_mode_click_does_not_open_selected_item() {
+    fn check_mode_plain_reclick_opens_selected_item() {
         let mut harness =
             handler_harness(GridClickSelectionMode::Check, true, Some(0), false, false);
         click_cell(&mut harness, 0, egui::Modifiers::NONE);
-        assert_eq!(harness.state().activations, 0);
+        assert_eq!(harness.state().activations, 1);
+    }
+
+    #[test]
+    fn check_mode_plain_reclick_opens_while_preserving_other_checks() {
+        let mut harness =
+            handler_harness(GridClickSelectionMode::Check, true, Some(0), false, false);
+        harness.state_mut().app.checked = HashSet::from([1]);
+
+        click_cell(&mut harness, 0, egui::Modifiers::NONE);
+
+        assert_eq!(harness.state().app.checked, HashSet::from([1]));
+        assert_eq!(harness.state().activations, 1);
     }
 
     #[test]
@@ -21143,17 +21121,16 @@ mod grid_reclick_open_tests {
     }
 
     #[test]
-    fn reclick_setting_off_keeps_selected_item_closed() {
-        let mut harness = handler_harness(
+    fn reclick_setting_off_keeps_selected_item_closed_in_both_modes() {
+        for mode in [
             GridClickSelectionMode::Explorer,
-            false,
-            Some(0),
-            false,
-            false,
-        );
-        click_cell(&mut harness, 0, egui::Modifiers::NONE);
-        assert_eq!(harness.state().app.selected, Some(0));
-        assert_eq!(harness.state().activations, 0);
+            GridClickSelectionMode::Check,
+        ] {
+            let mut harness = handler_harness(mode, false, Some(0), false, false);
+            click_cell(&mut harness, 0, egui::Modifiers::NONE);
+            assert_eq!(harness.state().app.selected, Some(0));
+            assert_eq!(harness.state().activations, 0);
+        }
     }
 }
 

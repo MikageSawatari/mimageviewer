@@ -5191,8 +5191,8 @@ mod folder_pane_open_nav_tests {
 mod phase_c_folder_nav_history_tests {
     use crate::app::{
         FolderNavHistoryState, GridClickSelectionAnchor, GridScrollIntent, QuickFolderSlotId,
-        QuickFolderSwitchTarget, drive_current_key_for_letter, drive_root_path_for_letter,
-        location_root_for_path,
+        QuickFolderSwitchTarget, drive_current_key_for_letter, drive_current_key_for_path,
+        drive_root_path_for_letter, location_root_for_path,
     };
     use crate::archive_converter::ArchiveFormat;
     use crate::grid_item::GridItem;
@@ -5360,6 +5360,7 @@ mod phase_c_folder_nav_history_tests {
     fn clear_quick_folder_slots_command_clears_all_positions_and_preserves_content_state() {
         let mut app = setup_app();
         let current = PathBuf::from(r"C:\miv-test\current");
+        app.current_folder = Some(current.clone());
         app.set_quick_folder_slot_target(
             QuickFolderSlotId::A,
             PathBuf::from(r"C:\miv-test\source"),
@@ -5413,13 +5414,34 @@ mod phase_c_folder_nav_history_tests {
         );
 
         assert_eq!(app.active_quick_folder_slot, Some(QuickFolderSlotId::A));
+        let drive_key = drive_current_key_for_path(&current).unwrap();
+        assert_eq!(
+            app.quick_folder_workspaces[QuickFolderSlotId::A.index()].target,
+            Some(current.clone())
+        );
+        assert_eq!(
+            app.quick_folder_workspaces[QuickFolderSlotId::A.index()]
+                .drive_current_dirs
+                .get(&drive_key),
+            Some(&current)
+        );
+        assert!(
+            app.quick_folder_workspaces[QuickFolderSlotId::B.index()]
+                .target
+                .is_none()
+        );
+        assert!(
+            app.quick_folder_workspaces[QuickFolderSlotId::B.index()]
+                .drive_current_dirs
+                .is_empty()
+        );
         assert!(
             app.quick_folder_workspaces
                 .iter()
-                .all(|workspace| workspace.target.is_none()
-                    && workspace.history == FolderNavHistoryState::default()
-                    && workspace.drive_current_dirs.is_empty()
-                    && workspace.recent_folders.is_empty())
+                .all(
+                    |workspace| workspace.history == FolderNavHistoryState::default()
+                        && workspace.recent_folders.is_empty()
+                )
         );
         assert!(app.folder_history.is_empty());
         assert_eq!(app.scroll_offset_y, 0.0);
@@ -5443,12 +5465,17 @@ mod phase_c_folder_nav_history_tests {
                 .get("/miv-test/movie.mp4"),
             Some(&91.5)
         );
-        assert_eq!(app.settings.quick_folder_slots, [None, None]);
+        assert_eq!(
+            app.settings.quick_folder_slots,
+            [Some(current.clone()), None]
+        );
+        assert_eq!(
+            app.settings.quick_folder_drive_current_dirs[QuickFolderSlotId::A.index()]
+                .get(&drive_key),
+            Some(&current)
+        );
         assert!(
-            app.settings
-                .quick_folder_drive_current_dirs
-                .iter()
-                .all(|dirs| dirs.is_empty())
+            app.settings.quick_folder_drive_current_dirs[QuickFolderSlotId::B.index()].is_empty()
         );
         assert!(
             app.settings
@@ -5457,13 +5484,12 @@ mod phase_c_folder_nav_history_tests {
                 .all(Vec::is_empty)
         );
         let persisted = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
-        assert_eq!(persisted.quick_folder_slots, [None, None]);
-        assert!(
-            persisted
-                .quick_folder_drive_current_dirs
-                .iter()
-                .all(|dirs| dirs.is_empty())
+        assert_eq!(persisted.quick_folder_slots, [Some(current.clone()), None]);
+        assert_eq!(
+            persisted.quick_folder_drive_current_dirs[QuickFolderSlotId::A.index()].get(&drive_key),
+            Some(&current)
         );
+        assert!(persisted.quick_folder_drive_current_dirs[QuickFolderSlotId::B.index()].is_empty());
         assert!(
             persisted
                 .quick_folder_recent_folders
@@ -5497,6 +5523,51 @@ mod phase_c_folder_nav_history_tests {
         assert!(!app.scroll_to_selected);
         assert_eq!(app.pending_grid_scroll, None);
         assert_eq!(app.grid_click_selection_anchor, None);
+    }
+
+    #[test]
+    fn clear_quick_folder_slots_keeps_current_location_owned_across_b_then_a() {
+        let mut app = setup_app();
+        let current = app.tmp.path().to_path_buf();
+        let old_b = current.parent().unwrap().to_path_buf();
+        app.current_folder = Some(current.clone());
+        app.items_are_drive_list = false;
+        app.set_quick_folder_slot_target(QuickFolderSlotId::A, current.clone());
+        app.set_quick_folder_slot_target(QuickFolderSlotId::B, old_b);
+        app.active_quick_folder_slot = Some(QuickFolderSlotId::B);
+
+        app.execute_clear_quick_folder_slots();
+
+        assert_eq!(
+            app.quick_folder_target(QuickFolderSlotId::A),
+            Some(&current)
+        );
+        assert_eq!(app.quick_folder_target(QuickFolderSlotId::B), None);
+        assert_eq!(
+            app.activate_quick_folder_slot(QuickFolderSlotId::B),
+            QuickFolderSwitchTarget::DriveList
+        );
+        app.enter_drive_list_from_navigation(None);
+        assert_eq!(
+            app.activate_quick_folder_slot(QuickFolderSlotId::A),
+            QuickFolderSwitchTarget::Folder(current)
+        );
+    }
+
+    #[test]
+    fn clear_quick_folder_slots_does_not_seed_a_from_a_synthetic_view() {
+        let mut app = setup_app();
+        let old_target = app.tmp.path().to_path_buf();
+        app.current_folder = Some(super::reading_history_synthetic_path());
+        app.set_quick_folder_slot_target(QuickFolderSlotId::A, old_target.clone());
+        app.set_quick_folder_slot_target(QuickFolderSlotId::B, old_target);
+
+        app.execute_clear_quick_folder_slots();
+
+        assert_eq!(app.active_quick_folder_slot, Some(QuickFolderSlotId::A));
+        assert_eq!(app.quick_folder_target(QuickFolderSlotId::A), None);
+        assert_eq!(app.quick_folder_target(QuickFolderSlotId::B), None);
+        assert_eq!(app.settings.quick_folder_slots, [None, None]);
     }
 
     #[test]
