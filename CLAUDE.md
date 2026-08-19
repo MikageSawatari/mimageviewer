@@ -1688,6 +1688,7 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
    .\scripts\check-idle-health.ps1 -Scenario static-foreground
    .\scripts\check-idle-health.ps1 -NoLaunch -Scenario static-background
    .\scripts\check-idle-health.ps1 -NoLaunch -Scenario video-pin-background -TargetKey '<動画を代表画像に固定したフォルダのパス>'
+   .\scripts\check-idle-health.ps1 -NoLaunch -Scenario tray-residency
    ```
    - 最初のコマンドが `mimageviewer-core.exe --perf-log` を起動する。各シナリオを準備して
      Enter を押す。前面シナリオは warmup 5 秒中にアプリへフォーカスを戻し、測定 15 秒の
@@ -1701,7 +1702,10 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
    - CPU one-core ratio、update rate、repaint reason streak、同一 thumbnail work、通常 / perf
      ログ増加量のどれかが上限を超えたら exit 1。失敗を閾値緩和だけで通さず、
      `target/idle-health/*-perf.json` の原因と反復 key を確認する。
-   - `-Scenario` は上記3値だけを受け付ける。perf log の session PID と測定対象 PID が違えば失敗し、
+   - **4 番目はトレイ常駐が既定 OFF** なので、環境設定 →「タスクトレイ常駐」を ON にしてから
+     `[×]` で閉じる。最小化では成立しない (Win32 は最小化したウィンドウも `IsWindowVisible` が
+     真を返すため)。サムネイルが多いフォルダを読込完了前に閉じた状態で測る。
+   - `-Scenario` は上記4値だけを受け付ける。perf log の session PID と測定対象 PID が違えば失敗し、
      空の測定窓は同一 session を確認できた場合だけ完全 sleep として扱う。動画ピンシナリオは
      準備開始後の `thumb.idle_upgrade_ineligible` が無ければセットアップ不成立として失敗する。
    - ZIP / PDF / スマートフォルダ、AI、動画・音楽の非同期経路を変更した場合は、その処理が
