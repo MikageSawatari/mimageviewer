@@ -3197,6 +3197,8 @@ pub struct Settings {
     #[serde(default)]
     pub grid_click_selection_mode: GridClickSelectionMode,
     #[serde(default)]
+    pub grid_open_selected_item_on_click: bool,
+    #[serde(default)]
     pub grid_cursor_wrap: bool,
     #[serde(default)]
     pub details_sort_key: DetailsSortKey,
@@ -5224,6 +5226,7 @@ impl Default for Settings {
             grid_cols: default_grid_cols(),
             grid_view_mode: GridViewMode::default(),
             grid_click_selection_mode: GridClickSelectionMode::default(),
+            grid_open_selected_item_on_click: false,
             grid_cursor_wrap: false,
             details_sort_key: DetailsSortKey::default(),
             details_page_count_sort_stash: false,
@@ -7109,8 +7112,9 @@ impl Settings {
             ToolbarFacetFilterItem::visible_order(&self.toolbar_facet_filter_items);
         self.facet_name_filter_width = self.facet_name_filter_width.normalized();
         self.grid_click_selection_mode = self.grid_click_selection_mode.normalized();
-        // grid_cursor_wrap は bool のため不正値を持たない。旧設定の欠落は serde default で
-        // false に補い、sanitize では読み込んだ ON/OFF をそのまま維持する。
+        // grid_open_selected_item_on_click / grid_cursor_wrap は bool のため不正値を持たない。
+        // 旧設定の欠落は serde default で false に補い、sanitize では読み込んだ ON/OFF を
+        // そのまま維持する。
         self.selection_info_display_mode = self.selection_info_display_mode.normalized();
         self.details_selection_bar_mode = self.details_selection_bar_mode.normalized();
         self.fullscreen_side_panel_mode = self.fullscreen_side_panel_mode.normalized();
@@ -8054,6 +8058,31 @@ mod tests {
             loaded.grid_click_selection_mode,
             GridClickSelectionMode::Check
         );
+    }
+
+    #[test]
+    fn grid_open_selected_item_on_click_defaults_off_and_survives_sanitize() {
+        assert!(!Settings::default().grid_open_selected_item_on_click);
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!loaded.grid_open_selected_item_on_click);
+        let mut loaded: Settings =
+            serde_json::from_str(r#"{"grid_open_selected_item_on_click":true}"#).unwrap();
+        loaded.sanitize();
+        assert!(loaded.grid_open_selected_item_on_click);
+    }
+
+    #[test]
+    fn grid_open_selected_item_on_click_roundtrips_json() {
+        let mut original = Settings::default();
+        original.grid_open_selected_item_on_click = true;
+        let value = serde_json::to_value(&original).unwrap();
+        assert_eq!(
+            value["grid_open_selected_item_on_click"],
+            serde_json::Value::Bool(true)
+        );
+        let mut loaded: Settings = serde_json::from_value(value).unwrap();
+        loaded.sanitize();
+        assert!(loaded.grid_open_selected_item_on_click);
     }
 
     #[test]

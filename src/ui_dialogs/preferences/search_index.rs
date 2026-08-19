@@ -141,7 +141,15 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         "thumbnail/click-selection",
         Thumbnail,
         "選択方式:",
-        ["クリック", "チェック", "エクスプローラー", "複数選択"]
+        [
+            "クリック",
+            "チェック",
+            "エクスプローラー",
+            "複数選択",
+            "選択済み項目",
+            "もう一度",
+            "開く"
+        ]
     ),
     entry!(
         "thumbnail/cursor-wrap",

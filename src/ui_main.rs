@@ -4233,6 +4233,7 @@ fn grid_reclick_open_allowed(
     selected_before_click: bool,
     no_other_cell_checked: bool,
     mode: GridClickSelectionMode,
+    open_selected_item_on_click: bool,
     ctrl: bool,
     shift: bool,
     touch_derived_pointer_activity: bool,
@@ -4240,6 +4241,7 @@ fn grid_reclick_open_allowed(
     selected_before_click
         && no_other_cell_checked
         && mode.normalized() == GridClickSelectionMode::Explorer
+        && open_selected_item_on_click
         && !ctrl
         && !shift
         && !touch_derived_pointer_activity
@@ -12786,6 +12788,7 @@ impl App {
                     selected_before_click,
                     no_other_cell_checked_before_click,
                     self.settings.grid_click_selection_mode,
+                    self.settings.grid_open_selected_item_on_click,
                     ctrl,
                     shift,
                     touch_derived_pointer_activity,
@@ -20809,6 +20812,7 @@ mod grid_reclick_open_tests {
 
     fn handler_harness(
         mode: GridClickSelectionMode,
+        open_selected_item_on_click: bool,
         selected: Option<usize>,
         dialog_open: bool,
         touch_derived_pointer_activity: bool,
@@ -20817,6 +20821,7 @@ mod grid_reclick_open_tests {
         app.items = (0..3).map(|_| GridItem::ZipFile(PathBuf::new())).collect();
         app.visible_indices = (0..app.items.len()).collect();
         app.settings.grid_click_selection_mode = mode;
+        app.settings.grid_open_selected_item_on_click = open_selected_item_on_click;
         app.selected = selected;
         app.show_cache_manager = dialog_open;
         let state = HandlerState {
@@ -20879,6 +20884,7 @@ mod grid_reclick_open_tests {
             true,
             true,
             GridClickSelectionMode::Explorer,
+            true,
             false,
             false,
             false,
@@ -20887,6 +20893,7 @@ mod grid_reclick_open_tests {
             false,
             true,
             GridClickSelectionMode::Explorer,
+            true,
             false,
             false,
             false,
@@ -20895,7 +20902,17 @@ mod grid_reclick_open_tests {
             true,
             true,
             GridClickSelectionMode::Check,
+            true,
             false,
+            false,
+            false,
+        ));
+        assert!(!grid_reclick_open_allowed(
+            true,
+            true,
+            GridClickSelectionMode::Explorer,
+            true,
+            true,
             false,
             false,
         ));
@@ -20905,13 +20922,6 @@ mod grid_reclick_open_tests {
             GridClickSelectionMode::Explorer,
             true,
             false,
-            false,
-        ));
-        assert!(!grid_reclick_open_allowed(
-            true,
-            true,
-            GridClickSelectionMode::Explorer,
-            false,
             true,
             false,
         ));
@@ -20919,6 +20929,7 @@ mod grid_reclick_open_tests {
             true,
             true,
             GridClickSelectionMode::Explorer,
+            true,
             false,
             false,
             true,
@@ -20927,6 +20938,16 @@ mod grid_reclick_open_tests {
             true,
             false,
             GridClickSelectionMode::Explorer,
+            true,
+            false,
+            false,
+            false,
+        ));
+        assert!(!grid_reclick_open_allowed(
+            true,
+            true,
+            GridClickSelectionMode::Explorer,
+            false,
             false,
             false,
             false,
@@ -20935,7 +20956,8 @@ mod grid_reclick_open_tests {
 
     #[test]
     fn first_click_selects_without_opening_then_later_reclick_opens() {
-        let mut harness = handler_harness(GridClickSelectionMode::Explorer, None, false, false);
+        let mut harness =
+            handler_harness(GridClickSelectionMode::Explorer, true, None, false, false);
 
         click_cell(&mut harness, 0, egui::Modifiers::NONE);
         assert_eq!(harness.state().app.selected, Some(0));
@@ -20950,8 +20972,13 @@ mod grid_reclick_open_tests {
     #[test]
     fn ctrl_and_shift_clicks_remain_selection_operations() {
         for modifiers in [egui::Modifiers::CTRL, egui::Modifiers::SHIFT] {
-            let mut harness =
-                handler_harness(GridClickSelectionMode::Explorer, Some(0), false, false);
+            let mut harness = handler_harness(
+                GridClickSelectionMode::Explorer,
+                true,
+                Some(0),
+                false,
+                false,
+            );
             click_cell(&mut harness, 0, modifiers);
             assert_eq!(harness.state().activations, 0);
         }
@@ -20959,7 +20986,8 @@ mod grid_reclick_open_tests {
 
     #[test]
     fn shift_range_plain_click_on_cursor_collapses_without_opening() {
-        let mut harness = handler_harness(GridClickSelectionMode::Explorer, None, false, false);
+        let mut harness =
+            handler_harness(GridClickSelectionMode::Explorer, true, None, false, false);
         click_cell(&mut harness, 0, egui::Modifiers::NONE);
         harness.run_steps(40);
         click_cell(&mut harness, 2, egui::Modifiers::SHIFT);
@@ -20977,7 +21005,8 @@ mod grid_reclick_open_tests {
 
     #[test]
     fn ctrl_multi_selection_plain_click_on_cursor_collapses_without_opening() {
-        let mut harness = handler_harness(GridClickSelectionMode::Explorer, None, false, false);
+        let mut harness =
+            handler_harness(GridClickSelectionMode::Explorer, true, None, false, false);
         click_cell(&mut harness, 0, egui::Modifiers::CTRL);
         harness.run_steps(40);
         click_cell(&mut harness, 1, egui::Modifiers::CTRL);
@@ -20995,7 +21024,8 @@ mod grid_reclick_open_tests {
 
     #[test]
     fn ctrl_single_selection_plain_reclick_still_opens() {
-        let mut harness = handler_harness(GridClickSelectionMode::Explorer, None, false, false);
+        let mut harness =
+            handler_harness(GridClickSelectionMode::Explorer, true, None, false, false);
         click_cell(&mut harness, 1, egui::Modifiers::CTRL);
         assert_eq!(harness.state().app.selected, Some(1));
         assert!(harness.state().app.checked.is_empty());
@@ -21008,14 +21038,15 @@ mod grid_reclick_open_tests {
 
     #[test]
     fn check_mode_click_does_not_open_selected_item() {
-        let mut harness = handler_harness(GridClickSelectionMode::Check, Some(0), false, false);
+        let mut harness =
+            handler_harness(GridClickSelectionMode::Check, true, Some(0), false, false);
         click_cell(&mut harness, 0, egui::Modifiers::NONE);
         assert_eq!(harness.state().activations, 0);
     }
 
     #[test]
     fn double_click_still_opens_in_check_mode_exactly_once() {
-        let mut harness = handler_harness(GridClickSelectionMode::Check, None, false, false);
+        let mut harness = handler_harness(GridClickSelectionMode::Check, false, None, false, false);
         click_cell(&mut harness, 0, egui::Modifiers::NONE);
         click_cell(&mut harness, 0, egui::Modifiers::NONE);
         assert_eq!(harness.state().activations, 1);
@@ -21023,15 +21054,31 @@ mod grid_reclick_open_tests {
 
     #[test]
     fn dialog_blocks_reclick_open() {
-        let mut harness = handler_harness(GridClickSelectionMode::Explorer, Some(0), true, false);
+        let mut harness =
+            handler_harness(GridClickSelectionMode::Explorer, true, Some(0), true, false);
         click_cell(&mut harness, 0, egui::Modifiers::NONE);
         assert_eq!(harness.state().activations, 0);
     }
 
     #[test]
     fn touch_derived_click_does_not_open_selected_item() {
-        let mut harness = handler_harness(GridClickSelectionMode::Explorer, Some(0), false, true);
+        let mut harness =
+            handler_harness(GridClickSelectionMode::Explorer, true, Some(0), false, true);
         click_cell(&mut harness, 0, egui::Modifiers::NONE);
+        assert_eq!(harness.state().activations, 0);
+    }
+
+    #[test]
+    fn reclick_setting_off_keeps_selected_item_closed() {
+        let mut harness = handler_harness(
+            GridClickSelectionMode::Explorer,
+            false,
+            Some(0),
+            false,
+            false,
+        );
+        click_cell(&mut harness, 0, egui::Modifiers::NONE);
+        assert_eq!(harness.state().app.selected, Some(0));
         assert_eq!(harness.state().activations, 0);
     }
 }

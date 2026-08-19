@@ -649,6 +649,13 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
         "チェック方式は通常クリックや空白クリックで既存チェックを維持します。\n\
          エクスプローラー方式は通常クリックや空白クリックで選択を置き換え、Ctrl / Shift クリックで複数選択します。",
     );
+        ui.checkbox(
+            &mut s.grid_open_selected_item_on_click,
+            "選択済み項目をもう一度クリックすると開く",
+        );
+        ui.small(
+            "エクスプローラー方式で、修飾キーなしのマウスクリックにだけ適用します。複数選択中は 1 件へ戻すだけで開きません。タッチ操作は対象外です。",
+        );
     });
     ui.add_space(6.0);
     anchored(ui, state, "thumbnail/cursor-wrap", |ui, state| {

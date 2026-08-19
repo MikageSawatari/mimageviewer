@@ -3280,6 +3280,7 @@ mod tests {
         let mut s = Settings::default();
         s.grid_cols = 7;
         s.grid_click_selection_mode = crate::settings::GridClickSelectionMode::Explorer;
+        s.grid_open_selected_item_on_click = true;
         s.grid_cursor_wrap = true;
         s.ui_scale_factor = 1.5;
         s.thumb_quality = 88;
@@ -3487,6 +3488,7 @@ mod tests {
             loaded.grid_click_selection_mode,
             crate::settings::GridClickSelectionMode::Explorer
         );
+        assert!(loaded.grid_open_selected_item_on_click);
         assert!(loaded.grid_cursor_wrap);
         let video_slot = loaded.video_preset_slots.slots[0]
             .as_ref()
