@@ -16620,14 +16620,24 @@ impl App {
             *workspace = QuickFolderWorkspace::default();
         }
         self.active_quick_folder_slot = Some(QuickFolderSlotId::A);
+        self.folder_history.clear();
+
+        // 「場所を忘れる」操作なので、現在表示中の一覧も同じ所有境界で先頭へ戻す。
+        // current_grid_order は詳細表示の並べ替えも含む、画面上の実際の表示順。
+        self.scroll_offset_y = 0.0;
+        self.selected = self.current_grid_order().first().copied();
+        self.scroll_to_selected = false;
+        self.pending_grid_scroll = None;
+        self.grid_click_selection_anchor = None;
+        self.update_last_selected_image();
         self.sync_quick_folder_settings();
     }
 
-    /// フォルダバーのメニュー・キー・リングから共有する A/B 記憶場所クリア入口。
+    /// フォルダバーのメニュー・キー・リングから共有する場所記憶クリア入口。
     pub(crate) fn execute_clear_quick_folder_slots(&mut self) {
         self.clear_quick_folder_slots();
         self.settings.save();
-        self.show_feedback_toast("A/B の記憶した場所をクリアしました".to_string());
+        self.show_feedback_toast("A/B の記憶した場所と一覧位置をクリアしました".to_string());
     }
 
     pub(crate) fn activate_quick_folder_slot(

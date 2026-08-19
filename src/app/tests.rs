@@ -5190,8 +5190,9 @@ mod folder_pane_open_nav_tests {
 #[cfg(test)]
 mod phase_c_folder_nav_history_tests {
     use crate::app::{
-        FolderNavHistoryState, QuickFolderSlotId, QuickFolderSwitchTarget,
-        drive_current_key_for_letter, drive_root_path_for_letter, location_root_for_path,
+        FolderNavHistoryState, GridClickSelectionAnchor, GridScrollIntent, QuickFolderSlotId,
+        QuickFolderSwitchTarget, drive_current_key_for_letter, drive_root_path_for_letter,
+        location_root_for_path,
     };
     use crate::archive_converter::ArchiveFormat;
     use crate::grid_item::GridItem;
@@ -5356,8 +5357,9 @@ mod phase_c_folder_nav_history_tests {
     }
 
     #[test]
-    fn clear_quick_folder_slots_command_updates_session_storage_and_toast() {
+    fn clear_quick_folder_slots_command_clears_all_positions_and_preserves_content_state() {
         let mut app = setup_app();
+        let current = PathBuf::from(r"C:\miv-test\current");
         app.set_quick_folder_slot_target(
             QuickFolderSlotId::A,
             PathBuf::from(r"C:\miv-test\source"),
@@ -5366,6 +5368,41 @@ mod phase_c_folder_nav_history_tests {
             QuickFolderSlotId::B,
             PathBuf::from(r"D:\miv-test\destination"),
         );
+        app.active_quick_folder_slot = Some(QuickFolderSlotId::A);
+        app.remember_recent_folder(&PathBuf::from(r"C:\miv-test\recent-a"));
+        app.active_quick_folder_slot = Some(QuickFolderSlotId::B);
+        app.remember_recent_folder(&PathBuf::from(r"D:\miv-test\recent-b"));
+        for (index, workspace) in app.quick_folder_workspaces.iter_mut().enumerate() {
+            workspace.history.back_stack =
+                vec![PathBuf::from(format!(r"C:\miv-test\slot-{index}-back"))];
+            workspace.history.forward_stack =
+                vec![PathBuf::from(format!(r"C:\miv-test\slot-{index}-forward"))];
+            workspace.history.suppress_record_once = true;
+        }
+        app.folder_history.insert(current.clone(), (420.0, Some(3)));
+        app.folder_history
+            .insert(PathBuf::from(r"D:\miv-test\other"), (840.0, Some(7)));
+        app.items = (0..4)
+            .map(|index| GridItem::Image(PathBuf::from(format!(r"C:\miv-test\{index}.jpg"))))
+            .collect();
+        app.visible_indices = vec![1, 3];
+        app.selected = Some(3);
+        app.scroll_offset_y = 420.0;
+        app.scroll_to_selected = true;
+        app.pending_grid_scroll = Some(GridScrollIntent::Bottom);
+        app.grid_click_selection_anchor =
+            Some(GridClickSelectionAnchor::new(3, app.items_generation));
+        app.checked = HashSet::from([1, 3]);
+        let book = PathBuf::from(r"C:\miv-test\book.zip");
+        app.book_resume_db
+            .as_ref()
+            .expect("book resume DB")
+            .set(&book, 12)
+            .expect("seed book resume");
+        app.last_book_resume = Some((book.clone(), 12));
+        app.settings
+            .video_resume_positions
+            .insert("/miv-test/movie.mp4".to_string(), 91.5);
         app.settings.save();
 
         let _ = app.apply_ring_action(
@@ -5381,7 +5418,30 @@ mod phase_c_folder_nav_history_tests {
                 .iter()
                 .all(|workspace| workspace.target.is_none()
                     && workspace.history == FolderNavHistoryState::default()
-                    && workspace.drive_current_dirs.is_empty())
+                    && workspace.drive_current_dirs.is_empty()
+                    && workspace.recent_folders.is_empty())
+        );
+        assert!(app.folder_history.is_empty());
+        assert_eq!(app.scroll_offset_y, 0.0);
+        assert_eq!(app.selected, Some(1));
+        assert!(!app.scroll_to_selected);
+        assert_eq!(app.pending_grid_scroll, None);
+        assert_eq!(app.grid_click_selection_anchor, None);
+
+        // 場所の記憶以外はこの操作の対象外。
+        assert_eq!(app.checked, HashSet::from([1, 3]));
+        assert_eq!(app.last_book_resume, Some((book.clone(), 12)));
+        assert_eq!(
+            app.book_resume_db
+                .as_ref()
+                .and_then(|database| database.get(&book)),
+            Some(12)
+        );
+        assert_eq!(
+            app.settings
+                .video_resume_positions
+                .get("/miv-test/movie.mp4"),
+            Some(&91.5)
         );
         assert_eq!(app.settings.quick_folder_slots, [None, None]);
         assert!(
@@ -5389,6 +5449,12 @@ mod phase_c_folder_nav_history_tests {
                 .quick_folder_drive_current_dirs
                 .iter()
                 .all(|dirs| dirs.is_empty())
+        );
+        assert!(
+            app.settings
+                .quick_folder_recent_folders
+                .iter()
+                .all(Vec::is_empty)
         );
         let persisted = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
         assert_eq!(persisted.quick_folder_slots, [None, None]);
@@ -5398,10 +5464,62 @@ mod phase_c_folder_nav_history_tests {
                 .iter()
                 .all(|dirs| dirs.is_empty())
         );
+        assert!(
+            persisted
+                .quick_folder_recent_folders
+                .iter()
+                .all(Vec::is_empty)
+        );
+        assert_eq!(
+            persisted.video_resume_positions.get("/miv-test/movie.mp4"),
+            Some(&91.5)
+        );
         assert_eq!(
             app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
-            Some("A/B の記憶した場所をクリアしました")
+            Some("A/B の記憶した場所と一覧位置をクリアしました")
         );
+    }
+
+    #[test]
+    fn clear_quick_folder_slots_selects_none_for_an_empty_visible_list() {
+        let mut app = setup_app();
+        app.selected = Some(5);
+        app.scroll_offset_y = 300.0;
+        app.scroll_to_selected = true;
+        app.pending_grid_scroll = Some(GridScrollIntent::Bottom);
+        app.grid_click_selection_anchor =
+            Some(GridClickSelectionAnchor::new(5, app.items_generation));
+
+        app.execute_clear_quick_folder_slots();
+
+        assert_eq!(app.selected, None);
+        assert_eq!(app.scroll_offset_y, 0.0);
+        assert!(!app.scroll_to_selected);
+        assert_eq!(app.pending_grid_scroll, None);
+        assert_eq!(app.grid_click_selection_anchor, None);
+    }
+
+    #[test]
+    fn clear_quick_folder_slots_forgets_one_shared_position_used_by_both_slots() {
+        let mut app = setup_app();
+        let shared = PathBuf::from(r"C:\miv-test\shared");
+        app.set_quick_folder_slot_target(QuickFolderSlotId::A, shared.clone());
+        app.set_quick_folder_slot_target(QuickFolderSlotId::B, shared.clone());
+        app.folder_history.insert(shared.clone(), (640.0, Some(9)));
+
+        app.apply_history_clear_key_action(
+            &egui::Context::default(),
+            KeyAction::GridClearQuickFolderSlots,
+            "test-key",
+        );
+
+        assert!(app.folder_history.is_empty());
+        assert!(
+            app.quick_folder_workspaces
+                .iter()
+                .all(|workspace| workspace.target.is_none())
+        );
+        assert_eq!(app.settings.quick_folder_slots, [None, None]);
     }
 
     #[test]

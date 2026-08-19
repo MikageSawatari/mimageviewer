@@ -93,3 +93,42 @@ python scripts/check_ui_glyphs.py
 ```
 
 commit / stage はしない。ブランチは `master`。
+
+## 6. 実装結果 (2026-08-19)
+
+- 既存の `clear_quick_folder_slots` を状態変更の所有境界として広げ、A/B workspace と
+  `folder_history` を同時にクリアするようにした。
+- 現在の一覧は実表示順の先頭へ戻す。スクロール offset、選択追従 scroll、保留中の
+  top / bottom scroll、Shift+クリック anchor を同時に破棄し、表示項目がなければ未選択にする。
+- チェック済み項目、読書位置 DB、動画・音声の再生位置は変更しない回帰テストを追加した。
+- 表示名、メニュー、toast だけを新しい意味へ更新した。
+  `GridClearQuickFolderSlots` / `clear_quick_folder_slots` は変更せず、保存済みキー割り当ての
+  settings round-trip と ring 名の round-trip をテストした。
+- フォルダバー、操作カスタマイズ、仕様、keymap の文書を更新し、完了した §1.98 は
+  `next-release-backlog.md` から削除した。
+
+### Mutation 結果
+
+`clear_quick_folder_slots_command_clears_all_positions_and_preserves_content_state` を対象に、
+各リセットを 1 つずつ外して実行した。全 mutation は意図した assertion で失敗
+(`TEST_EXIT=101`) し、各試行後の復元は成功した (`RESTORE_EXIT=0`)。
+
+| 外したリセット | 検出した stale 値 |
+| --- | --- |
+| `scroll_offset_y = 0.0` | `420.0` (期待 `0.0`) |
+| 先頭項目への `selected` 更新 | `Some(3)` (期待 `Some(1)`) |
+| `scroll_to_selected = false` | `true` |
+| `pending_grid_scroll = None` | `Some(Bottom)` |
+| `grid_click_selection_anchor = None` | index 3 の anchor |
+
+復元後は対象 3 テストがすべて成功した。
+
+### 検証結果
+
+- `cargo fmt --all` / `cargo fmt --all -- --check`: PASS
+- `cargo check -p mimageviewer --bin mimageviewer-core`: PASS (既存 warning のみ)
+- `python scripts/check_ui_glyphs.py`: PASS (dangerous glyph 0)
+- 対象テスト: clear 3 件 + key / ring stable-name 2 件 PASS
+- `.\scripts\test-full.ps1`: PASS
+- `.\scripts\build-dev.ps1`: PASS
+  (`target\dev-runtime\mimageviewer-core.exe` を生成、未起動)

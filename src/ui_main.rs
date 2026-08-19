@@ -9198,7 +9198,7 @@ impl App {
             clear_recent = true;
             ui.close();
         }
-        if ui.button("A/B の記憶した場所をクリア").clicked() {
+        if ui.button("A/B の記憶した場所と一覧位置をクリア").clicked() {
             clear_quick = true;
             ui.close();
         }

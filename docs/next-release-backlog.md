@@ -1945,6 +1945,16 @@
   メニュー / キー / リングの parity、保存後も stable action 名を読み戻せること。
 - 規模 / 優先度: Small / P2。利用者要望。
 
+- **完了 (2026-08-19):** 同じ 1 操作で `quick_folder_workspaces` と、セッション共通の
+  `folder_history` を消すようにした。現在の一覧は先頭の可視項目へカーソルを移し、スクロール
+  位置・保留中の scroll 指示・Shift+クリックの anchor も破棄する。表示項目が無ければ未選択。
+  チェック済み・読書位置・再生位置は対象外のまま。
+- 表示名 / toast / メニュー文言だけを新しい意味へ変え、**`ini_name` の
+  `GridClearQuickFolderSlots` と ring の永続名 `clear_quick_folder_slots` は変更していない**。
+  保存済み割り当ての round-trip をテストで固定した。既定キーは引き続き未割り当て。
+- 入口は元から `execute_clear_quick_folder_slots` の 1 本に集約されていたので、
+  routing は追加せず消す範囲だけを広げた。
+
 ### 5.10 入力テストの共有ロックが poison して、失敗 1 件が全滅に見える
 
 - 出典: §1.93 の mutation 確認中 (2026-08-19)。可視性ガードを外して 1 件だけ落とすつもりが、

@@ -1186,7 +1186,7 @@ impl RingActionId {
             Self::OpenPreferences => "環境設定を開く",
             Self::OpenOperationCustomize => "操作カスタマイズを開く",
             Self::ClearRecentFolders => "最近開いたフォルダ履歴をクリア",
-            Self::ClearQuickFolderSlots => "A/B の記憶した場所をクリア",
+            Self::ClearQuickFolderSlots => "A/B の記憶した場所と一覧位置をクリア",
             Self::CycleFavorite => "お気に入り巡回",
             Self::OpenFavorite1
             | Self::OpenFavorite2
@@ -2978,7 +2978,7 @@ mod tests {
             (
                 RingActionId::ClearQuickFolderSlots,
                 "clear_quick_folder_slots",
-                "A/B の記憶した場所をクリア",
+                "A/B の記憶した場所と一覧位置をクリア",
             ),
         ];
 

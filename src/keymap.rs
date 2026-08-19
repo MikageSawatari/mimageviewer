@@ -3988,7 +3988,7 @@ impl KeyAction {
             GridOpenLocationPictures => "ピクチャを開く",
             GridOpenLocationDownloads => "ダウンロードを開く",
             GridClearRecentFolders => "最近開いたフォルダ履歴をクリアする",
-            GridClearQuickFolderSlots => "A/B の記憶した場所をクリアする",
+            GridClearQuickFolderSlots => "A/B の記憶した場所と一覧位置をクリアする",
             GridSelectAll => "表示中のチェック可能な項目をすべてチェックする",
             GridDeselect => "チェックをすべて解除する",
             GridToggleCheck => "選択中の項目のチェックを切り替える",
@@ -9745,6 +9745,23 @@ mod tests {
             assert!(action.default_chords().is_empty());
             assert!(action.is_user_facing());
         }
+
+        let action = KeyAction::GridClearQuickFolderSlots;
+        assert_eq!(action.ini_name(), "GridClearQuickFolderSlots");
+        assert_eq!(
+            action.description(),
+            "A/B の記憶した場所と一覧位置をクリアする"
+        );
+
+        // 表示名を変えても、保存済みの旧 ini action 名から割り当てを復元できる。
+        let keymap = Keymap::from_ini_str("[Grid]\nGridClearQuickFolderSlots = F13\n");
+        assert!(keymap.warnings().is_empty(), "{:?}", keymap.warnings());
+        let settings = KeymapSettings::from_keymap(&keymap);
+        let restored = Keymap::from_settings(&settings);
+        assert_eq!(
+            restored.effective_chords(action),
+            vec![Chord::key(KeyName::F13)]
+        );
     }
 
     #[test]
