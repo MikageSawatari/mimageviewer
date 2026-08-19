@@ -44,6 +44,7 @@ mod dcomp_presenter_test;
 pub mod delete_worker;
 pub mod diagnostics;
 mod displayed_image_transform;
+mod double_click_time;
 #[cfg(windows)]
 pub mod dwm_iconic_thumbnail;
 #[cfg(windows)]
@@ -1221,6 +1222,7 @@ pub fn run() -> eframe::Result {
     // これ以降は eframe (winit + wgpu) の初期化が走り、creator closure が呼ばれる。
     emit_startup("before_run_native", None);
     install_ui_heartbeat_watchdog();
+    double_click_time::capture_startup_setting();
 
     let run_result = eframe::run_native(
         "mimageviewer",
@@ -1233,6 +1235,7 @@ pub fn run() -> eframe::Result {
             key_input::install_synthetic_input_plugin(&cc.egui_ctx);
             ime_focus::install_ime_input_policy(&cc.egui_ctx);
             egui_focus_policy::install_tab_shortcut_focus_policy(&cc.egui_ctx);
+            double_click_time::configure_context(&cc.egui_ctx);
             let t = Instant::now();
             ui_fonts::configure_fonts_with_settings(&cc.egui_ctx, &saved.ui_font);
             emit_startup("setup_fonts", Some(t));

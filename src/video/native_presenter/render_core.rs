@@ -3891,6 +3891,7 @@ impl NativeEguiOverlay {
         let egui_ctx = egui::Context::default();
         crate::ime_focus::install_ime_input_policy(&egui_ctx);
         crate::egui_focus_policy::install_tab_shortcut_focus_policy(&egui_ctx);
+        crate::double_click_time::configure_context(&egui_ctx);
         egui_ctx.options_mut(|options| options.zoom_with_keyboard = false);
         configure_overlay_fonts(&egui_ctx, &ui_font);
         configure_overlay_style(&egui_ctx, text_contrast);
