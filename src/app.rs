@@ -24525,7 +24525,19 @@ impl App {
                             pending.pin_archive_dependencies.get(&archive_key).cloned()
                         })
                         .unwrap_or_default();
-                    if !dependent_indices.contains(&idx) {
+                    // 判定が付いた候補自身は、cache-only 要求が miss したまま `Requested` で
+                    // 止まっているときだけ組み直す。cache hit で既に描けているサムネイルは、
+                    // 解決後の要求と cache key (`convertible_archive_cache_base_key`) も
+                    // mtime / file_size (アーカイブ自身のもの) も同一なので、作り直しても
+                    // 同じ絵にしかならない。evict は texture を落として `Evicted` に戻すため、
+                    // ここで無条件に組み直すと**表示済みのタイルが 1 回ちらつく**
+                    // (2026-08-19 実機報告)。ピン依存の tile は別で、`Pending` の間は
+                    // ピンなしの自動選択で描かれているので必ず組み直す。
+                    let self_needs_reload = !matches!(
+                        self.thumbnails.get(idx),
+                        Some(ThumbnailState::Loaded { .. })
+                    );
+                    if self_needs_reload && !dependent_indices.contains(&idx) {
                         dependent_indices.push(idx);
                     }
                     for idx in dependent_indices {

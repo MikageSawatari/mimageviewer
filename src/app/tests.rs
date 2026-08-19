@@ -17180,6 +17180,121 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(done.load(Ordering::Relaxed), 1);
     }
 
+    /// One folder of three convertible archives, all still `Pending`, with an active batch
+    /// whose channel the caller can push resolutions into.
+    fn pending_archive_batch_for_resolution_test() -> (
+        AppTestEnv,
+        Vec<String>,
+        std::sync::mpsc::Sender<ConvertedArchiveCachePathsMsg>,
+    ) {
+        let mut app = setup_app();
+        let paths = [
+            app.tmp.path().join("first.7z"),
+            app.tmp.path().join("second.7z"),
+            app.tmp.path().join("third.7z"),
+        ];
+        app.items = paths
+            .iter()
+            .cloned()
+            .map(|path| GridItem::ConvertibleArchive {
+                path,
+                format: crate::archive_converter::ArchiveFormat::SevenZ,
+            })
+            .collect();
+        app.image_metas = vec![Some((1, 2)); paths.len()];
+        app.thumbnails = vec![ThumbnailState::Pending; paths.len()];
+        let keys: Vec<_> = paths
+            .iter()
+            .map(|path| crate::path_key::normalize_keep_drive(path))
+            .collect();
+        app.converted_archive_cache_paths = keys
+            .iter()
+            .cloned()
+            .map(|key| (key, crate::app::ConvertedArchiveSourceState::Pending))
+            .collect();
+        let generation = app.items_generation;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.converted_archive_cache_paths_pending = Some(ConvertedArchiveCachePathsPending {
+            generation,
+            cancel: Arc::new(AtomicBool::new(false)),
+            desired_indices: Arc::new(std::sync::RwLock::new(HashSet::from([0, 1, 2]))),
+            rx,
+            pin_archive_dependencies: std::collections::HashMap::new(),
+        });
+        (app, keys, tx)
+    }
+
+    #[test]
+    fn resolved_archive_does_not_evict_a_thumbnail_the_cache_only_request_already_drew() {
+        // The cache-only request made while the candidate was Pending uses the same cache key
+        // and the same mtime/file_size as the resolved one, so a hit is already the final
+        // picture. Evicting it drops the texture and the tile visibly blinks once
+        // (2026-08-19 device report).
+        let ctx = egui::Context::default();
+        let (mut app, keys, tx) = pending_archive_batch_for_resolution_test();
+        let texture = ctx.load_texture(
+            "already_drawn",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+            egui::TextureOptions::LINEAR,
+        );
+        app.thumbnails[0] = ThumbnailState::Loaded {
+            tex: texture,
+            from_cache: true,
+            from_edit_preview: false,
+            rendered_at_px: 1,
+            source_dims: None,
+            layout_dims: None,
+        };
+        tx.send(ConvertedArchiveCachePathsMsg::Resolved {
+            archive_key: keys[0].clone(),
+            state: crate::app::ConvertedArchiveSourceState::CachedZip(
+                app.tmp.path().join("first.zip"),
+            ),
+            idx: 0,
+            ordinal: 1,
+            elapsed_ms: 5.0,
+            input_seq: 7,
+        })
+        .unwrap();
+
+        app.poll_converted_archive_cache_paths(&ctx);
+
+        assert!(
+            matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }),
+            "a thumbnail already drawn from the cache must survive the decision arriving"
+        );
+    }
+
+    #[test]
+    fn resolved_archive_reloads_a_tile_whose_cache_only_request_missed() {
+        // The other half of the pair: nothing is on screen, so the tile has to be requested
+        // again now that the source is known. Without this the cache-only miss would sit in
+        // `requested` forever and the archive would never get a thumbnail.
+        let ctx = egui::Context::default();
+        let (mut app, keys, tx) = pending_archive_batch_for_resolution_test();
+        app.thumbnails[0] = ThumbnailState::Pending;
+        app.requested.insert(0, false);
+        tx.send(ConvertedArchiveCachePathsMsg::Resolved {
+            archive_key: keys[0].clone(),
+            state: crate::app::ConvertedArchiveSourceState::CachedZip(
+                app.tmp.path().join("first.zip"),
+            ),
+            idx: 0,
+            ordinal: 1,
+            elapsed_ms: 5.0,
+            input_seq: 7,
+        })
+        .unwrap();
+
+        app.poll_converted_archive_cache_paths(&ctx);
+
+        assert!(
+            matches!(app.thumbnails[0], ThumbnailState::Evicted),
+            "a tile with nothing drawn must be queued again once the source is known"
+        );
+        assert!(!app.requested.contains_key(&0));
+    }
+
     #[test]
     fn first_incremental_archive_result_builds_request_while_others_are_pending() {
         let mut app = setup_app();
