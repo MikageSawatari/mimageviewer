@@ -1414,7 +1414,7 @@ fn detached_placement_from_viewport_rects(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FsCursorHide {
     Idle,
-    ZoomAiming { restore_idle: bool },
+    ZoomAiming,
 }
 
 #[derive(Clone, Copy)]
@@ -2806,24 +2806,17 @@ fn next_fullscreen_cursor_hide_reason(
     clean: bool,
     idle_hide_ready: bool,
 ) -> Option<FsCursorHide> {
-    let restore_idle = clean
-        && match current {
-            Some(FsCursorHide::Idle) => true,
-            Some(FsCursorHide::ZoomAiming { restore_idle }) => restore_idle,
-            None => false,
-        };
-
     if zoom_aiming {
-        // ZoomAiming is derived from fs_zoom_aiming every frame and is never latched.
-        // Keep whether Idle was already latched inside the same typed state so pointer
-        // activity used for aiming cannot destroy the pre-existing idle hide.
-        return Some(FsCursorHide::ZoomAiming { restore_idle });
+        // ZoomAiming is derived from fs_zoom_aiming every frame and is never latched,
+        // so every way aiming can end returns the cursor without its own exit branch.
+        return Some(FsCursorHide::ZoomAiming);
     }
 
-    if clean
-        && ((matches!(current, Some(FsCursorHide::Idle)) && !cursor_active)
-            || restore_idle
-            || idle_hide_ready)
+    // Idle keeps its pre-existing latch: it survives frames with no pointer activity and
+    // is cleared by any activity. Aiming needs no carried-over copy of that fact. The
+    // caller restarts the idle countdown on activity, so a hide that predates aiming is
+    // re-derived here through `idle_hide_ready` when the pointer really did stay still.
+    if clean && ((matches!(current, Some(FsCursorHide::Idle)) && !cursor_active) || idle_hide_ready)
     {
         Some(FsCursorHide::Idle)
     } else {
@@ -34454,12 +34447,7 @@ mod tests {
     fn prime_zoom_aim_cursor_hidden(app: &mut crate::app::App, ctx: &egui::Context) {
         app.fs_zoom_aiming = true;
         let _ = run_cursor_visibility_frame(app, ctx, false);
-        assert_eq!(
-            app.cursor_hide_reason,
-            Some(FsCursorHide::ZoomAiming {
-                restore_idle: false
-            })
-        );
+        assert_eq!(app.cursor_hide_reason, Some(FsCursorHide::ZoomAiming));
     }
 
     #[cfg(windows)]
@@ -34493,12 +34481,7 @@ mod tests {
         app.update_fullscreen_cursor_visibility(&ctx, ctx.viewport_id(), true, true, false);
         let output = ctx.end_pass();
         assert!(app.fs_zoom_aiming);
-        assert_eq!(
-            app.cursor_hide_reason,
-            Some(FsCursorHide::ZoomAiming {
-                restore_idle: false
-            })
-        );
+        assert_eq!(app.cursor_hide_reason, Some(FsCursorHide::ZoomAiming));
         assert_eq!(cursor_visible_commands(&output), vec![false]);
     }
 
@@ -34509,12 +34492,7 @@ mod tests {
         app.fs_zoom_aiming = true;
         for _ in 0..3 {
             let output = run_cursor_visibility_frame(&mut app, &ctx, true);
-            assert_eq!(
-                app.cursor_hide_reason,
-                Some(FsCursorHide::ZoomAiming {
-                    restore_idle: false
-                })
-            );
+            assert_eq!(app.cursor_hide_reason, Some(FsCursorHide::ZoomAiming));
             assert!(!cursor_visible_commands(&output).contains(&true));
         }
     }
@@ -34598,8 +34576,25 @@ mod tests {
         assert_eq!(cursor_visible_commands(&output), vec![true]);
     }
 
+    /// Pointer activity clears the idle hide. This is the pre-existing contract for the
+    /// auto-hide and is unrelated to aiming, but a carried-over "was idle" flag once made
+    /// the latch survive every frame of pointer motion and the cursor never came back.
     #[test]
-    fn fs_cursor_zoom_aim_restores_prior_idle_hide() {
+    fn fs_cursor_idle_hide_is_cleared_by_pointer_activity() {
+        let mut app = setup_zoom_cursor_app();
+        let ctx = egui::Context::default();
+        app.cursor_last_activity =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(120));
+        app.cursor_hide_reason = Some(FsCursorHide::Idle);
+        let output = run_cursor_visibility_frame(&mut app, &ctx, true);
+        assert_eq!(app.cursor_hide_reason, None);
+        assert_eq!(cursor_visible_commands(&output), vec![true]);
+    }
+
+    /// Aiming is nothing but pointer motion, so an idle hide that preceded it does not
+    /// survive it: the countdown restarted while the frame was being aimed.
+    #[test]
+    fn fs_cursor_zoom_aim_with_motion_does_not_keep_a_prior_idle_hide() {
         let mut app = setup_zoom_cursor_app();
         let ctx = egui::Context::default();
         app.cursor_last_activity =
@@ -34607,13 +34602,29 @@ mod tests {
         app.cursor_hide_reason = Some(FsCursorHide::Idle);
         app.fs_zoom_aiming = true;
         let _ = run_cursor_visibility_frame(&mut app, &ctx, true);
-        assert_eq!(
-            app.cursor_hide_reason,
-            Some(FsCursorHide::ZoomAiming { restore_idle: true })
-        );
+        assert_eq!(app.cursor_hide_reason, Some(FsCursorHide::ZoomAiming));
         app.fs_zoom_reset();
-        let _ = run_cursor_visibility_frame(&mut app, &ctx, true);
+        let output = run_cursor_visibility_frame(&mut app, &ctx, true);
+        assert_eq!(app.cursor_hide_reason, None);
+        assert_eq!(cursor_visible_commands(&output), vec![true]);
+    }
+
+    /// Holding the key without moving keeps the cursor hidden after aiming ends, because
+    /// the idle countdown was never restarted. Same rule, opposite input.
+    #[test]
+    fn fs_cursor_zoom_aim_without_motion_keeps_the_idle_hide() {
+        let mut app = setup_zoom_cursor_app();
+        let ctx = egui::Context::default();
+        app.cursor_last_activity =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(120));
+        app.cursor_hide_reason = Some(FsCursorHide::Idle);
+        app.fs_zoom_aiming = true;
+        let _ = run_cursor_visibility_frame(&mut app, &ctx, false);
+        assert_eq!(app.cursor_hide_reason, Some(FsCursorHide::ZoomAiming));
+        app.fs_zoom_reset();
+        let output = run_cursor_visibility_frame(&mut app, &ctx, false);
         assert_eq!(app.cursor_hide_reason, Some(FsCursorHide::Idle));
+        assert!(!cursor_visible_commands(&output).contains(&true));
     }
 
     #[test]
