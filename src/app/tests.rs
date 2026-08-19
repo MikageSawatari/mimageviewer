@@ -16949,6 +16949,27 @@ mod favorite_adjustment_defaults_tests {
         panic!("archive decision worker did not finish");
     }
 
+    fn install_folder_item_for_archive_pin_test(app: &mut App, folder: &Path) {
+        let metadata = std::fs::metadata(folder).unwrap();
+        app.install_new_items(
+            vec![GridItem::Folder(folder.to_path_buf())],
+            vec![Some((
+                crate::ui_helpers::mtime_secs(&metadata),
+                metadata.len() as i64,
+            ))],
+        );
+    }
+
+    fn assert_archive_pin_root_refresh_stays_idle(app: &mut App, frames: usize) {
+        for frame in 0..frames {
+            start_archive_decisions_for_test(app, 0..1);
+            assert!(
+                app.converted_archive_cache_paths_pending.is_none(),
+                "stable archive pin root restarted on idle frame {frame}"
+            );
+        }
+    }
+
     fn install_pending_archive_items(app: &mut App, count: usize) -> Vec<String> {
         let paths: Vec<_> = (0..count)
             .map(|idx| PathBuf::from(format!(r"C:\archive-scope-test\book-{idx:03}.7z")))
@@ -17405,6 +17426,7 @@ mod favorite_adjustment_defaults_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         app.converted_archive_cache_paths_pending = Some(ConvertedArchiveCachePathsPending {
             generation,
+            cascade_depth: app.settings.folder_thumb_depth as usize,
             cancel: Arc::new(AtomicBool::new(false)),
             desired_indices: Arc::new(std::sync::RwLock::new(HashSet::from([0, 1, 2]))),
             rx,
@@ -17515,6 +17537,7 @@ mod favorite_adjustment_defaults_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         app.converted_archive_cache_paths_pending = Some(ConvertedArchiveCachePathsPending {
             generation,
+            cascade_depth: app.settings.folder_thumb_depth as usize,
             cancel: Arc::new(AtomicBool::new(false)),
             desired_indices: Arc::new(std::sync::RwLock::new(HashSet::from([0, 1, 2]))),
             rx,
@@ -17578,6 +17601,7 @@ mod favorite_adjustment_defaults_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         app.converted_archive_cache_paths_pending = Some(ConvertedArchiveCachePathsPending {
             generation: app.items_generation.wrapping_sub(1),
+            cascade_depth: app.settings.folder_thumb_depth as usize,
             cancel: Arc::new(AtomicBool::new(false)),
             desired_indices: Arc::new(std::sync::RwLock::new(HashSet::from([0]))),
             rx,
@@ -17682,6 +17706,7 @@ mod favorite_adjustment_defaults_tests {
         let desired_indices = Arc::new(std::sync::RwLock::new(HashSet::from([0, 1])));
         app.converted_archive_cache_paths_pending = Some(ConvertedArchiveCachePathsPending {
             generation: app.items_generation,
+            cascade_depth: app.settings.folder_thumb_depth as usize,
             cancel: Arc::new(AtomicBool::new(false)),
             desired_indices: Arc::clone(&desired_indices),
             rx,
@@ -17733,6 +17758,322 @@ mod favorite_adjustment_defaults_tests {
                 Some(&crate::app::ConvertedArchiveSourceState::Unavailable)
             );
         }
+    }
+
+    #[test]
+    fn archive_pin_root_without_convertible_target_stays_idle_after_refresh() {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("plain-pinned-folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("cover.png"), b"not decoded in this test").unwrap();
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &folder,
+                &FolderPinSource::File {
+                    rel: "cover.png".to_string(),
+                    kind: FileKind::Image,
+                },
+            )
+            .unwrap();
+        install_folder_item_for_archive_pin_test(&mut app, &folder);
+
+        start_archive_decisions_for_test(&mut app, 0..1);
+        poll_archive_decisions_for_test(&mut app);
+
+        assert_archive_pin_root_refresh_stays_idle(&mut app, 4);
+    }
+
+    #[test]
+    fn archive_pin_root_with_resolved_archive_stays_idle_after_refresh() {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("archive-pinned-folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        let source = folder.join("book.7z");
+        let cached = app.tmp.path().join("book-resolved.zip");
+        std::fs::write(&source, b"archive").unwrap();
+        std::fs::write(&cached, b"cached zip").unwrap();
+        let source_metadata = std::fs::metadata(&source).unwrap();
+        app.archive_cache_db
+            .as_ref()
+            .unwrap()
+            .record(
+                &source,
+                crate::ui_helpers::mtime_secs(&source_metadata),
+                source_metadata.len() as i64,
+                crate::archive_converter::ArchiveFormat::SevenZ,
+                &cached,
+                std::fs::metadata(&cached).unwrap().len() as i64,
+                1,
+                false,
+            )
+            .unwrap();
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &folder,
+                &FolderPinSource::File {
+                    rel: "book.7z".to_string(),
+                    kind: FileKind::ConvertibleArchive,
+                },
+            )
+            .unwrap();
+        install_folder_item_for_archive_pin_test(&mut app, &folder);
+
+        start_archive_decisions_for_test(&mut app, 0..1);
+        poll_archive_decisions_for_test(&mut app);
+        assert_eq!(
+            app.converted_archive_cache_paths
+                .get(&crate::path_key::normalize_keep_drive(&source))
+                .and_then(crate::app::ConvertedArchiveSourceState::load_path),
+            Some(cached.as_path())
+        );
+
+        app.thumbnails[0] = ThumbnailState::Evicted;
+        app.requested.remove(&0);
+        assert_archive_pin_root_refresh_stays_idle(&mut app, 4);
+    }
+
+    #[test]
+    fn archive_pin_root_deferred_outside_scope_retries_then_stays_idle() {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("deferred-pinned-folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        let source = folder.join("book.7z");
+        let cached = app.tmp.path().join("deferred-book.zip");
+        std::fs::write(&source, b"archive").unwrap();
+        std::fs::write(&cached, b"cached zip").unwrap();
+        let source_metadata = std::fs::metadata(&source).unwrap();
+        let source_mtime = crate::ui_helpers::mtime_secs(&source_metadata);
+        let source_size = source_metadata.len() as i64;
+        app.archive_cache_db
+            .as_ref()
+            .unwrap()
+            .record(
+                &source,
+                source_mtime,
+                source_size,
+                crate::archive_converter::ArchiveFormat::SevenZ,
+                &cached,
+                std::fs::metadata(&cached).unwrap().len() as i64,
+                1,
+                false,
+            )
+            .unwrap();
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &folder,
+                &FolderPinSource::File {
+                    rel: "book.7z".to_string(),
+                    kind: FileKind::ConvertibleArchive,
+                },
+            )
+            .unwrap();
+        install_folder_item_for_archive_pin_test(&mut app, &folder);
+
+        // The cascade itself completed while this tile was desired, but its archive candidate
+        // was skipped after the desired scope shrank. The remembered root answer must retain
+        // the Pending archive so returning to scope can retry without re-running the cascade.
+        let archive_key = crate::path_key::normalize_keep_drive(&source);
+        app.converted_archive_cache_paths.insert(
+            archive_key.clone(),
+            crate::app::ConvertedArchiveSourceState::Pending,
+        );
+        let cascade_depth = app.settings.folder_thumb_depth as usize;
+        app.converted_archive_pin_root_states.insert(
+            crate::path_key::normalize_keep_drive(&folder),
+            ConvertedArchivePinRootState::Resolved {
+                cascade_depth,
+                candidates: vec![ConvertedArchivePinCandidate {
+                    archive_key: archive_key.clone(),
+                    path: source,
+                    mtime: source_mtime,
+                    file_size: source_size,
+                }],
+            },
+        );
+
+        start_archive_decisions_for_test(&mut app, std::iter::empty());
+        assert!(app.converted_archive_cache_paths_pending.is_none());
+
+        start_archive_decisions_for_test(&mut app, 0..1);
+        assert!(
+            app.converted_archive_cache_paths_pending.is_some(),
+            "a Pending archive found by a completed cascade must retry after returning to scope"
+        );
+        poll_archive_decisions_for_test(&mut app);
+        assert_eq!(
+            app.converted_archive_cache_paths
+                .get(&archive_key)
+                .and_then(crate::app::ConvertedArchiveSourceState::load_path),
+            Some(cached.as_path())
+        );
+        app.thumbnails[0] = ThumbnailState::Evicted;
+        app.requested.remove(&0);
+        assert_archive_pin_root_refresh_stays_idle(&mut app, 4);
+    }
+
+    #[test]
+    fn archive_pin_root_answer_is_invalidated_by_items_generation() {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("generation-pinned-folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("cover.png"), b"not decoded in this test").unwrap();
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &folder,
+                &FolderPinSource::File {
+                    rel: "cover.png".to_string(),
+                    kind: FileKind::Image,
+                },
+            )
+            .unwrap();
+        install_folder_item_for_archive_pin_test(&mut app, &folder);
+        start_archive_decisions_for_test(&mut app, 0..1);
+        poll_archive_decisions_for_test(&mut app);
+
+        let previous_generation = app.items_generation;
+        install_folder_item_for_archive_pin_test(&mut app, &folder);
+        assert_ne!(app.items_generation, previous_generation);
+        start_archive_decisions_for_test(&mut app, 0..1);
+        assert!(
+            app.converted_archive_cache_paths_pending.is_some(),
+            "a new items generation must invalidate the previous pin cascade answer"
+        );
+        poll_archive_decisions_for_test(&mut app);
+        assert_archive_pin_root_refresh_stays_idle(&mut app, 2);
+    }
+
+    #[test]
+    fn archive_pin_root_answer_is_invalidated_by_pin_set_and_remove() {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("edited-pinned-folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("first.png"), b"not decoded in this test").unwrap();
+        std::fs::write(folder.join("second.png"), b"not decoded in this test").unwrap();
+        let first = FolderPinSource::File {
+            rel: "first.png".to_string(),
+            kind: FileKind::Image,
+        };
+        let second = FolderPinSource::File {
+            rel: "second.png".to_string(),
+            kind: FileKind::Image,
+        };
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(&folder, &first)
+            .unwrap();
+        install_folder_item_for_archive_pin_test(&mut app, &folder);
+        start_archive_decisions_for_test(&mut app, 0..1);
+        poll_archive_decisions_for_test(&mut app);
+
+        assert!(app.set_folder_thumb_pin(&folder, second));
+        start_archive_decisions_for_test(&mut app, 0..1);
+        assert!(
+            app.converted_archive_cache_paths_pending.is_some(),
+            "changing a representative pin must invalidate its cascade answer"
+        );
+        poll_archive_decisions_for_test(&mut app);
+        assert_archive_pin_root_refresh_stays_idle(&mut app, 2);
+
+        assert!(app.remove_folder_thumb_pin(&folder));
+        start_archive_decisions_for_test(&mut app, 0..1);
+        assert!(
+            app.converted_archive_cache_paths_pending.is_some(),
+            "removing a representative pin must invalidate its cascade answer"
+        );
+        poll_archive_decisions_for_test(&mut app);
+        assert_archive_pin_root_refresh_stays_idle(&mut app, 2);
+    }
+
+    #[test]
+    fn archive_pin_root_answer_is_invalidated_by_cascade_depth() {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("depth-pinned-folder");
+        let child = folder.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let source = child.join("book.7z");
+        let cached = app.tmp.path().join("depth-book.zip");
+        std::fs::write(&source, b"archive").unwrap();
+        std::fs::write(&cached, b"cached zip").unwrap();
+        let source_metadata = std::fs::metadata(&source).unwrap();
+        app.archive_cache_db
+            .as_ref()
+            .unwrap()
+            .record(
+                &source,
+                crate::ui_helpers::mtime_secs(&source_metadata),
+                source_metadata.len() as i64,
+                crate::archive_converter::ArchiveFormat::SevenZ,
+                &cached,
+                std::fs::metadata(&cached).unwrap().len() as i64,
+                1,
+                false,
+            )
+            .unwrap();
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &folder,
+                &FolderPinSource::File {
+                    rel: "child".to_string(),
+                    kind: FileKind::Folder,
+                },
+            )
+            .unwrap();
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &child,
+                &FolderPinSource::File {
+                    rel: "book.7z".to_string(),
+                    kind: FileKind::ConvertibleArchive,
+                },
+            )
+            .unwrap();
+        app.settings.folder_thumb_depth = 0;
+        install_folder_item_for_archive_pin_test(&mut app, &folder);
+        start_archive_decisions_for_test(&mut app, 0..1);
+        poll_archive_decisions_for_test(&mut app);
+        assert!(app.converted_archive_cache_paths.is_empty());
+
+        app.settings.folder_thumb_depth = 1;
+        start_archive_decisions_for_test(&mut app, 0..1);
+        assert!(
+            app.converted_archive_cache_paths_pending.is_some(),
+            "changing cascade depth must invalidate the previous root answer"
+        );
+        poll_archive_decisions_for_test(&mut app);
+        assert_eq!(
+            app.converted_archive_cache_paths
+                .get(&crate::path_key::normalize_keep_drive(&source))
+                .and_then(crate::app::ConvertedArchiveSourceState::load_path),
+            Some(cached.as_path())
+        );
+        app.thumbnails[0] = ThumbnailState::Evicted;
+        app.requested.remove(&0);
+        assert_archive_pin_root_refresh_stays_idle(&mut app, 2);
     }
 
     #[test]

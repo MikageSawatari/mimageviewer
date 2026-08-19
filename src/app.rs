@@ -2151,6 +2151,8 @@ struct ViewerContextBundle {
     current_folder_signature: Option<u64>,
     folder_pin_map: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
     converted_archive_cache_paths: std::collections::HashMap<String, ConvertedArchiveSourceState>,
+    converted_archive_pin_root_states:
+        std::collections::HashMap<String, ConvertedArchivePinRootState>,
     converted_archive_cache_paths_pending: Option<ConvertedArchiveCachePathsPending>,
     current_color_cache_map: Option<
         Arc<std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>>,
@@ -2463,6 +2465,7 @@ impl ViewerContextBundle {
             current_folder_signature: None,
             folder_pin_map: std::collections::HashMap::new(),
             converted_archive_cache_paths: std::collections::HashMap::new(),
+            converted_archive_pin_root_states: std::collections::HashMap::new(),
             converted_archive_cache_paths_pending: None,
             current_color_cache_map: None,
             current_color_catalog: None,
@@ -4333,6 +4336,8 @@ impl ConvertedArchiveSourceState {
 pub(crate) struct ConvertedArchiveCachePathsPending {
     /// 起動時の items 世代。完了時に変わっていれば結果を捨てる。
     generation: u64,
+    /// Cascade depth used by this batch; a setting change invalidates the batch.
+    cascade_depth: usize,
     cancel: Arc<AtomicBool>,
     /// UI が最後に公開した visible + keep scope。worker は候補を 1 冊処理し終えるたび
     /// 次候補がまだ scope 内か確認するため、scroll で範囲外になった queued 候補を
@@ -4363,6 +4368,12 @@ impl Drop for ConvertedArchiveCachePathsPending {
 }
 
 enum ConvertedArchiveCachePathsMsg {
+    /// A pin-root cascade finished; an empty result is also a terminal answer.
+    PinRootResolved {
+        root_key: String,
+        cascade_depth: usize,
+        candidates: Vec<ConvertedArchivePinCandidate>,
+    },
     /// pin cascade から見つかった候補。候補結果より必ず先に送る。
     PinDependency { idx: usize, archive_key: String },
     /// 候補 1 件の判定完了。残り候補の完了を待たず UI へ公開する。
@@ -4390,6 +4401,23 @@ struct ConvertedArchiveCandidate {
     mtime: i64,
     file_size: i64,
     idx: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConvertedArchivePinCandidate {
+    archive_key: String,
+    path: PathBuf,
+    mtime: i64,
+    file_size: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ConvertedArchivePinRootState {
+    Unresolved,
+    Resolved {
+        cascade_depth: usize,
+        candidates: Vec<ConvertedArchivePinCandidate>,
+    },
 }
 
 fn index_distance_from_range(idx: usize, range: (usize, usize)) -> usize {
@@ -10452,6 +10480,10 @@ pub struct App {
     /// ピン画像を `archivethumb:` キーで表示する。
     pub(crate) converted_archive_cache_paths:
         std::collections::HashMap<String, ConvertedArchiveSourceState>,
+    /// Per-pin-root cascade answers for the current items generation.
+    /// A resolved root is rescheduled only while one of its archive keys remains `Pending`.
+    converted_archive_pin_root_states:
+        std::collections::HashMap<String, ConvertedArchivePinRootState>,
     /// `converted_archive_cache_paths` を UI スレッド外で構築している worker。
     pub(crate) converted_archive_cache_paths_pending: Option<ConvertedArchiveCachePathsPending>,
     /// 親コンテナのピン書き換えがあったので、次の機会にフォルダを再ロードして
@@ -13399,6 +13431,7 @@ impl App {
             folder_thumb_pin_db,
             folder_pin_map: std::collections::HashMap::new(),
             converted_archive_cache_paths: std::collections::HashMap::new(),
+            converted_archive_pin_root_states: std::collections::HashMap::new(),
             converted_archive_cache_paths_pending: None,
             folder_thumb_pin_dirty: false,
             #[cfg(windows)]
@@ -15544,6 +15577,7 @@ impl App {
             current_folder_signature,
             folder_pin_map,
             converted_archive_cache_paths,
+            converted_archive_pin_root_states,
             converted_archive_cache_paths_pending,
             current_color_cache_map,
             current_color_catalog,
@@ -15772,6 +15806,7 @@ impl App {
         swap_field!(current_folder_signature);
         swap_field!(folder_pin_map);
         swap_field!(converted_archive_cache_paths);
+        swap_field!(converted_archive_pin_root_states);
         swap_field!(converted_archive_cache_paths_pending);
         swap_field!(current_color_cache_map);
         swap_field!(current_color_catalog);
@@ -24180,19 +24215,22 @@ impl App {
             self.initialize_converted_archive_cache_paths();
             self.refresh_folder_pin_map();
         } else {
-            if let Some(pending) = self.converted_archive_cache_paths_pending.take() {
-                pending.cancel();
-            }
+            self.invalidate_converted_archive_pin_root_states();
             self.converted_archive_cache_paths.clear();
             self.folder_pin_map.clear();
         }
     }
 
-    /// 新しい items generation の変換アーカイブを、判定 I/O を行わず typed state へ登録する。
-    fn initialize_converted_archive_cache_paths(&mut self) {
+    fn invalidate_converted_archive_pin_root_states(&mut self) {
+        self.converted_archive_pin_root_states.clear();
         if let Some(pending) = self.converted_archive_cache_paths_pending.take() {
             pending.cancel();
         }
+    }
+
+    /// 新しい items generation の変換アーカイブを、判定 I/O を行わず typed state へ登録する。
+    fn initialize_converted_archive_cache_paths(&mut self) {
+        self.invalidate_converted_archive_pin_root_states();
         self.converted_archive_cache_paths.clear();
         for (idx, item) in self.items.iter().enumerate() {
             let path = match item {
@@ -24239,6 +24277,15 @@ impl App {
         visible_range: (usize, usize),
         keep_range: (usize, usize),
     ) {
+        let max_cascade_depth = self.settings.folder_thumb_depth as usize;
+        if self
+            .converted_archive_cache_paths_pending
+            .as_ref()
+            .is_some_and(|pending| pending.cascade_depth != max_cascade_depth)
+            && let Some(pending) = self.converted_archive_cache_paths_pending.take()
+        {
+            pending.cancel();
+        }
         // 実行中 batch には最新 scope だけを渡す。worker は候補境界でこれを読み直すため、
         // 既に開始済みの 1 冊は完了する一方、旧 range の残りは走査しない。
         // 同時に別 batch は起動せず、完了後に新 range の未解決候補だけを追加投入する。
@@ -24309,30 +24356,93 @@ impl App {
             }
         }
         // Folder タイル自身の pin が指す変換対象アーカイブは current items に現れない。
-        // container root だけを snapshot し、DB lookup + cascade + metadata は worker 側で行う。
-        let pin_roots: Vec<(usize, PathBuf)> = self
-            .items
-            .iter()
-            .enumerate()
-            .filter(|(idx, _)| candidate_indices.contains(idx))
-            .filter(|(idx, _)| {
-                !self.requested.contains_key(idx)
-                    && matches!(
-                        self.thumbnails.get(*idx),
-                        Some(ThumbnailState::Pending | ThumbnailState::Evicted)
-                    )
-            })
-            .filter_map(|(idx, item)| {
-                self.folder_pin_lookup_target_for_item(item)
-                    .map(|target| (idx, target.path))
-            })
-            .collect();
+        // root ごとの cascade 回答を記憶し、未走査または Pending archive を持つ root だけを渡す。
+        let mut pin_roots: Vec<(usize, String, PathBuf)> = Vec::new();
+        let mut pin_archive_dependencies: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+        for idx in 0..self.items.len() {
+            if !candidate_indices.contains(&idx)
+                || self.requested.contains_key(&idx)
+                || !matches!(
+                    self.thumbnails.get(idx),
+                    Some(ThumbnailState::Pending | ThumbnailState::Evicted)
+                )
+            {
+                continue;
+            }
+            let Some(target) = self
+                .items
+                .get(idx)
+                .and_then(|item| self.folder_pin_lookup_target_for_item(item))
+            else {
+                continue;
+            };
+            let root_key = crate::path_key::normalize_keep_drive(&target.path);
+            let root_state = self
+                .converted_archive_pin_root_states
+                .entry(root_key.clone())
+                .or_insert(ConvertedArchivePinRootState::Unresolved)
+                .clone();
+            match root_state {
+                ConvertedArchivePinRootState::Unresolved => {
+                    pin_roots.push((idx, root_key, target.path));
+                }
+                ConvertedArchivePinRootState::Resolved {
+                    cascade_depth,
+                    candidates,
+                } if cascade_depth == max_cascade_depth => {
+                    for source in candidates {
+                        if !matches!(
+                            self.converted_archive_cache_paths.get(&source.archive_key),
+                            Some(ConvertedArchiveSourceState::Pending)
+                        ) {
+                            continue;
+                        }
+                        let dependencies = pin_archive_dependencies
+                            .entry(source.archive_key.clone())
+                            .or_default();
+                        if !dependencies.contains(&idx) {
+                            dependencies.push(idx);
+                        }
+                        let candidate = ConvertedArchiveCandidate {
+                            archive_key: source.archive_key.clone(),
+                            path: source.path,
+                            mtime: source.mtime,
+                            file_size: source.file_size,
+                            idx,
+                        };
+                        match direct_inputs.entry(source.archive_key) {
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                entry.insert(candidate);
+                            }
+                            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                                if converted_archive_candidate_priority(
+                                    idx,
+                                    visible_range,
+                                    keep_range,
+                                ) < converted_archive_candidate_priority(
+                                    entry.get().idx,
+                                    visible_range,
+                                    keep_range,
+                                ) {
+                                    entry.insert(candidate);
+                                }
+                            }
+                        }
+                    }
+                }
+                ConvertedArchivePinRootState::Resolved { .. } => {
+                    self.converted_archive_pin_root_states
+                        .insert(root_key.clone(), ConvertedArchivePinRootState::Unresolved);
+                    pin_roots.push((idx, root_key, target.path));
+                }
+            }
+        }
         let pin_db = self.folder_thumb_pin_db.clone();
         if direct_inputs.is_empty() && (pin_roots.is_empty() || pin_db.is_none()) {
             return;
         }
         let db = self.archive_cache_db.clone();
-        let max_cascade_depth = self.settings.folder_thumb_depth as usize;
         let already_resolved: HashSet<String> = self
             .converted_archive_cache_paths
             .iter()
@@ -24357,7 +24467,7 @@ impl App {
                 let mut hits = 0usize;
                 let mut candidates = direct_inputs;
                 if let Some(pin_db) = pin_db.as_deref() {
-                    for (idx, root) in pin_roots {
+                    for (idx, root_key, root) in pin_roots {
                         if worker_cancel.load(Ordering::Relaxed) {
                             return;
                         }
@@ -24367,48 +24477,71 @@ impl App {
                         {
                             continue;
                         }
-                        let Some(source) = pin_db.lookup(&root) else {
-                            continue;
-                        };
-                        let Some(resolved) =
-                            crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
-                                &root,
-                                &source,
-                                |path| pin_db.lookup(path),
-                                max_cascade_depth,
-                            )
-                        else {
-                            continue;
-                        };
-                        if matches!(
-                            resolved.kind,
-                            crate::folder_thumb_pins::ResolvedKind::ArchiveFirstImage
-                                | crate::folder_thumb_pins::ResolvedKind::ZipEntry
-                                | crate::folder_thumb_pins::ResolvedKind::ZipDirRepresentative
-                        ) && crate::folder_tree::is_convertible_archive_path(&resolved.abs_path)
+                        let pin_candidates = pin_db
+                            .lookup(&root)
+                            .and_then(|source| {
+                                crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
+                                    &root,
+                                    &source,
+                                    |path| pin_db.lookup(path),
+                                    max_cascade_depth,
+                                )
+                            })
+                            .filter(|resolved| {
+                                matches!(
+                                    resolved.kind,
+                                    crate::folder_thumb_pins::ResolvedKind::ArchiveFirstImage
+                                        | crate::folder_thumb_pins::ResolvedKind::ZipEntry
+                                        | crate::folder_thumb_pins::ResolvedKind::ZipDirRepresentative
+                                ) && crate::folder_tree::is_convertible_archive_path(
+                                    &resolved.abs_path,
+                                )
+                            })
+                            .map(|resolved| {
+                                vec![ConvertedArchivePinCandidate {
+                                    archive_key: crate::path_key::normalize_keep_drive(
+                                        &resolved.abs_path,
+                                    ),
+                                    path: resolved.abs_path,
+                                    mtime: resolved.mtime,
+                                    file_size: resolved.file_size,
+                                }]
+                            })
+                            .unwrap_or_default();
+                        if worker_cancel.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        if tx
+                            .send(ConvertedArchiveCachePathsMsg::PinRootResolved {
+                                root_key,
+                                cascade_depth: max_cascade_depth,
+                                candidates: pin_candidates.clone(),
+                            })
+                            .is_err()
                         {
-                            let archive_key =
-                                crate::path_key::normalize_keep_drive(&resolved.abs_path);
-                            if already_resolved.contains(&archive_key) {
+                            return;
+                        }
+                        for source in pin_candidates {
+                            if already_resolved.contains(&source.archive_key) {
                                 continue;
                             }
                             if tx
                                 .send(ConvertedArchiveCachePathsMsg::PinDependency {
                                     idx,
-                                    archive_key: archive_key.clone(),
+                                    archive_key: source.archive_key.clone(),
                                 })
                                 .is_err()
                             {
                                 return;
                             }
                             let candidate = ConvertedArchiveCandidate {
-                                archive_key: archive_key.clone(),
-                                path: resolved.abs_path,
-                                mtime: resolved.mtime,
-                                file_size: resolved.file_size,
+                                archive_key: source.archive_key.clone(),
+                                path: source.path,
+                                mtime: source.mtime,
+                                file_size: source.file_size,
                                 idx,
                             };
-                            match candidates.entry(archive_key) {
+                            match candidates.entry(source.archive_key) {
                                 std::collections::hash_map::Entry::Vacant(entry) => {
                                     entry.insert(candidate);
                                 }
@@ -24489,10 +24622,11 @@ impl App {
                 self.converted_archive_cache_paths_pending =
                     Some(ConvertedArchiveCachePathsPending {
                         generation,
+                        cascade_depth: max_cascade_depth,
                         cancel,
                         desired_indices,
                         rx,
-                        pin_archive_dependencies: std::collections::HashMap::new(),
+                        pin_archive_dependencies,
                     });
             }
             Err(e) => {
@@ -24515,6 +24649,15 @@ impl App {
         visible_range: (usize, usize),
         keep_range: (usize, usize),
     ) {
+        let max_cascade_depth = self.settings.folder_thumb_depth as usize;
+        if self
+            .converted_archive_cache_paths_pending
+            .as_ref()
+            .is_some_and(|pending| pending.cascade_depth != max_cascade_depth)
+            && let Some(pending) = self.converted_archive_cache_paths_pending.take()
+        {
+            pending.cancel();
+        }
         if let Some(pending) = self.converted_archive_cache_paths_pending.as_ref() {
             // Block 中も旧 batch の queued 候補を止めるため、admission とは独立して
             // latest scope を共有する。新 worker の起動だけを prefetch gate で抑える。
@@ -24535,11 +24678,15 @@ impl App {
         let mut rebuild_visible = false;
         let mut request_repaint = false;
         loop {
-            let (generation, message) = {
+            let (generation, cascade_depth, message) = {
                 let Some(pending) = self.converted_archive_cache_paths_pending.as_ref() else {
                     break;
                 };
-                (pending.generation, pending.rx.try_recv())
+                (
+                    pending.generation,
+                    pending.cascade_depth,
+                    pending.rx.try_recv(),
+                )
             };
             let message = match message {
                 Ok(message) => message,
@@ -24550,8 +24697,10 @@ impl App {
                 }
             };
 
-            // 逐次通知は受信窓が長いため、1 件ごとに generation を照合する。
-            if generation != self.items_generation {
+            // 逐次通知は受信窓が長いため、1 件ごとに generation と cascade 深さを照合する。
+            if generation != self.items_generation
+                || cascade_depth != self.settings.folder_thumb_depth as usize
+            {
                 if let Some(pending) = self.converted_archive_cache_paths_pending.take() {
                     pending.cancel();
                 }
@@ -24559,6 +24708,19 @@ impl App {
             }
 
             match message {
+                ConvertedArchiveCachePathsMsg::PinRootResolved {
+                    root_key,
+                    cascade_depth,
+                    candidates,
+                } => {
+                    self.converted_archive_pin_root_states.insert(
+                        root_key,
+                        ConvertedArchivePinRootState::Resolved {
+                            cascade_depth,
+                            candidates,
+                        },
+                    );
+                }
                 ConvertedArchiveCachePathsMsg::PinDependency { idx, archive_key } => {
                     self.converted_archive_cache_paths
                         .entry(archive_key.clone())
@@ -25152,6 +25314,7 @@ impl App {
 
     /// 現在items中の親コンテナとcontext固有identityをDBから一括取得する。
     fn refresh_folder_pin_map(&mut self) {
+        self.invalidate_converted_archive_pin_root_states();
         self.folder_pin_map.clear();
         // サブ展開はprepare workerが全対象を照会済み。
         if self.current_folder.as_ref().is_some_and(|folder| {
@@ -25221,6 +25384,7 @@ impl App {
         };
         match db.set(container, &source) {
             Ok(()) => {
+                self.invalidate_converted_archive_pin_root_states();
                 let key = crate::path_key::normalize_keep_drive(container);
                 self.folder_pin_map.insert(key, source);
                 self.invalidate_smart_folder_resort_metadata();
@@ -25242,6 +25406,7 @@ impl App {
         };
         match db.remove(container) {
             Ok(()) => {
+                self.invalidate_converted_archive_pin_root_states();
                 let key = crate::path_key::normalize_keep_drive(container);
                 self.folder_pin_map.remove(&key);
                 self.invalidate_smart_folder_resort_metadata();
@@ -27575,6 +27740,7 @@ impl App {
             .as_ref()
             .is_some_and(|indices| !indices.is_empty());
         if let Some(folder_pins) = result.folder_pin_map.take() {
+            self.invalidate_converted_archive_pin_root_states();
             self.folder_pin_map = folder_pins;
         }
         if let Some(indices) = result.folder_pin_reset_indices.take() {
@@ -40776,6 +40942,7 @@ impl App {
             current_folder_signature,
             folder_pin_map,
             converted_archive_cache_paths,
+            converted_archive_pin_root_states,
             converted_archive_cache_paths_pending,
             current_color_cache_map,
             current_color_catalog,
@@ -41101,6 +41268,7 @@ impl App {
             pending_folder_nav_mode,
             folder_pin_map,
             converted_archive_cache_paths,
+            converted_archive_pin_root_states,
             converted_archive_cache_paths_pending,
             current_color_cache_map,
             current_color_catalog,

@@ -151,6 +151,13 @@ UI が共有 desired scope を差し替える。worker は pin root / archive �
 その結果は同 generation なら採用し、現 batch 終了後に新 range の `Pending` key だけを次 batch へ渡す。
 終端 key は再投入しない。
 
+pin root の cascade 結果は `converted_archive_pin_root_states` に root 単位で保持する。root が batch
+候補になるのは、同 generation / 同 `folder_thumb_depth` で未走査か、記録済み archive key にまだ
+`Pending` がある場合だけ。cascade 後に desired scope から外れて archive 判定を skip した場合は、
+root 回答と `Pending` key を残すため、scope 復帰時に archive 判定だけを再投入できる。空の cascade
+結果と終端 key だけの結果は再投入しない。items generation、代表 pin の set/remove、cascade 深さ変更で
+root 回答を失効し、深さが変わった in-flight batch も cancel する。
+
 batch admission は `decide_prefetch_allowed` の scroll idle 100ms / visible-ready / 3秒 backstop を
 再利用し、新しい debounce 時間を持たない。判定待ち container 自身は visible blocker へ数えると
 cache-only miss と相互待ちになるため除外し、通常サムネイルの Pending だけを blocker とする。

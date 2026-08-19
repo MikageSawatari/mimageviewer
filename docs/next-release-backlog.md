@@ -905,6 +905,11 @@
     thumbnail worker の代表画像選択が `enumerate_image_entries_detailed` でもう一度 RAR 全 header を
     列挙する。これを 1 回へ統合するには `RarInspection` と thumbnail/open の列挙契約をまたぐため、
     brief の停止条件に従い本件には押し込まなかった。今回閉じるのは全件判定待ちの表示遅延である。
+  - §2.3 の range-gated 起動へ移した際、folder-thumb pin の cascade 完了結果だけが generation 内に
+    記録されず、静止中に候補ゼロの `archive-cache-peek` worker を毎フレーム再生成していた。
+    pin root ごとに空結果を含む cascade 回答と発見済み archive key を保持し、未走査または
+    `Pending` key が残る root だけを再投入するよう修正した。items generation、pin set/remove、
+    `folder_thumb_depth` 変更で失効し、scope 外へ後回しされた `Pending` key の再試行は維持する。
 
 ### 2.8 RAR の直読み判定を、安い順・可視範囲だけに絞る
 

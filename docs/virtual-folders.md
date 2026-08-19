@@ -475,6 +475,12 @@ queue と `requested` も通常の thumbnail 再要求 helper で同時に外す
 `folder_thumb_pin_dirty` を介さず有限回で収束する。
 この経路で `make_load_request` から `archive_cache.db` やファイルシステムを直接触らないこと。
 
+pin root の cascade 自体にも generation 内の終端状態を持たせる。未走査 root、または cascade が
+見つけた archive key に `Pending` が残る root だけを次 batch の候補にし、空結果や全 key 終端後は
+worker を再起動しない。archive 候補が desired scope から外れて skip された場合は `Pending` を
+維持するため、scope 復帰時に再試行される。root 状態は items generation、pin の set/remove、
+`folder_thumb_depth` の変更で失効する。
+
 **キャッシュキーの命名規則**を勝手に変えないこと。Folder 自動代表は選定
 アルゴリズム世代を明示して、意図したロジック変更時だけ既存キャッシュを外す。
 
