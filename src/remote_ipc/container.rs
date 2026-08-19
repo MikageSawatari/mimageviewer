@@ -1020,7 +1020,7 @@ impl RemoteSourceDecodeIdentity {
         target_px: u32,
         full_page: bool,
     ) -> Self {
-        debug_assert_eq!(request.skip_cache, full_page);
+        debug_assert_eq!(request.source_policy.bypasses_cache(), full_page);
         debug_assert!(request.relative_page_provenance.is_none());
         debug_assert!(request.edit_preview_key.is_none());
         debug_assert!(!request.edit_preview_validate_container);
@@ -1049,7 +1049,7 @@ impl RemoteSourceDecodeIdentity {
         // - idx routes ThumbMsg; input_seq only correlates perf events; items_gen only lets the
         //   UI reject stale ThumbMsg values. None changes pixels.
         // - priority changes scheduling, never pixels.
-        // - skip_cache is exactly `full_page`, which is included (and also separates Thumbnail's
+        // - source_policy is SourceOnly exactly for `full_page`, which is included (and also separates Thumbnail's
         //   cache_decision from full-page requests).
         // - pdf_password comes from this ContainerEngine's immutable password-store snapshot, so
         //   it cannot vary for the same path within this coordinator and is not retained as a
@@ -5049,7 +5049,11 @@ impl ContainerEngine {
             path: resolved.readable_logical().to_path_buf(),
             mtime,
             file_size,
-            skip_cache: full_page,
+            source_policy: if full_page {
+                crate::thumb_loader::LoadSourcePolicy::SourceOnly
+            } else {
+                crate::thumb_loader::LoadSourcePolicy::CacheOrSource
+            },
             // foreground でも HighNormal までとし、ローカル UI 用 Critical 予約枠は
             // 消費しない。prefetch は Normal lane へ分離する。
             priority: foreground,
@@ -6932,7 +6936,7 @@ mod tests {
             path: PathBuf::from("page.png"),
             mtime: 10,
             file_size: 20,
-            skip_cache: true,
+            source_policy: crate::thumb_loader::LoadSourcePolicy::SourceOnly,
             ..Default::default()
         };
         let identity = RemoteSourceDecodeIdentity::from_load_request(

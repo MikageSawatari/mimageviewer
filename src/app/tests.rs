@@ -7769,6 +7769,11 @@ mod phase_c_drill_nav_tests {
             app.visible_indices.is_empty(),
             "worker 完了前は cache ZIP 側の補正キーをまだ拾わない"
         );
+        app.start_converted_archive_cache_paths_refresh(
+            &std::collections::HashSet::from([0]),
+            (0, 1),
+            (0, 1),
+        );
 
         let ctx = egui::Context::default();
         for _ in 0..50 {
@@ -13517,7 +13522,7 @@ mod favorite_adjustment_defaults_tests {
         )
         .expect("a valid video pin WebP should produce a folder thumbnail request");
         assert!(
-            !req.skip_cache,
+            !req.source_policy.bypasses_cache(),
             "video pins must keep using the seeded WebP instead of overwriting it with auto-pick"
         );
 
@@ -13570,7 +13575,7 @@ mod favorite_adjustment_defaults_tests {
         );
 
         // 判定済みの同じ Loaded サムネイルは、次フレームで pin 解決を繰り返さない。
-        // WebP を消して再評価されれば通常の skip_cache=true 要求へフォールバックして
+        // WebP を消して再評価されれば通常の SourceOnly 要求へフォールバックして
         // enqueue されるため、キューが空のままであることが memo の回帰テストになる。
         app.video_pin_db.as_ref().unwrap().remove(&video).unwrap();
         app.enqueue_idle_upgrades();
@@ -13630,7 +13635,7 @@ mod favorite_adjustment_defaults_tests {
         let queue = app.reload_queue.as_ref().unwrap().0.lock().unwrap();
         assert_eq!(queue.len(), 1);
         assert!(
-            queue[0].skip_cache,
+            queue[0].source_policy.bypasses_cache(),
             "ordinary cached images must still bypass the cache during idle upgrade"
         );
         assert!(
@@ -16737,6 +16742,45 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    fn start_archive_decisions_for_test(app: &mut App, indices: impl IntoIterator<Item = usize>) {
+        let scope: HashSet<usize> = indices.into_iter().collect();
+        let end = app.items.len();
+        app.start_converted_archive_cache_paths_refresh(&scope, (0, end), (0, end));
+    }
+
+    fn poll_archive_decisions_for_test(app: &mut App) {
+        let ctx = egui::Context::default();
+        for _ in 0..100 {
+            app.poll_converted_archive_cache_paths(&ctx);
+            if app.converted_archive_cache_paths_pending.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("archive decision worker did not finish");
+    }
+
+    fn install_pending_archive_items(app: &mut App, count: usize) -> Vec<String> {
+        let paths: Vec<_> = (0..count)
+            .map(|idx| PathBuf::from(format!(r"C:\archive-scope-test\book-{idx:03}.7z")))
+            .collect();
+        app.install_new_items(
+            paths
+                .iter()
+                .cloned()
+                .map(|path| GridItem::ConvertibleArchive {
+                    path,
+                    format: crate::archive_converter::ArchiveFormat::SevenZ,
+                })
+                .collect(),
+            vec![Some((1, 2)); count],
+        );
+        paths
+            .iter()
+            .map(|path| crate::path_key::normalize_keep_drive(path))
+            .collect()
+    }
+
     #[test]
     fn convertible_archive_with_cache_builds_zip_first_thumb_request() {
         use crate::folder_thumb_pins::FolderPinSource;
@@ -16784,6 +16828,79 @@ mod favorite_adjustment_defaults_tests {
             req.cache_key_override.as_deref(),
             Some("archivethumb:7z:book.7z")
         );
+    }
+
+    #[test]
+    fn converted_rar_cache_hit_skips_direct_read_inspection() {
+        let source = PathBuf::from(r"C:\books\book.rar");
+        let cached = PathBuf::from(r"C:\cache\book.zip");
+        let candidate = ConvertedArchiveCandidate {
+            archive_key: crate::path_key::normalize_keep_drive(&source),
+            path: source.clone(),
+            mtime: 10,
+            file_size: 20,
+            idx: 0,
+        };
+        let inspections = Cell::new(0usize);
+
+        let state = resolve_converted_archive_candidate_with(
+            &candidate,
+            &AtomicBool::new(false),
+            |path| Ok(path.to_path_buf()),
+            |path, mtime, file_size| {
+                assert_eq!(path, source);
+                assert_eq!((mtime, file_size), (10, 20));
+                Some(cached.clone())
+            },
+            |path, _| {
+                inspections.set(inspections.get() + 1);
+                Ok((
+                    crate::rar_loader::RarDirectReadDecision::Direct,
+                    path.to_path_buf(),
+                ))
+            },
+        );
+
+        assert_eq!(
+            state,
+            Some(crate::app::ConvertedArchiveSourceState::CachedZip(cached))
+        );
+        assert_eq!(inspections.get(), 0);
+    }
+
+    #[test]
+    fn direct_readable_rar_with_converted_zip_intentionally_prefers_cached_zip() {
+        let source = PathBuf::from(r"C:\books\direct.rar");
+        let cached = PathBuf::from(r"C:\cache\direct.zip");
+        let candidate = ConvertedArchiveCandidate {
+            archive_key: crate::path_key::normalize_keep_drive(&source),
+            path: source.clone(),
+            mtime: 30,
+            file_size: 40,
+            idx: 0,
+        };
+        let direct_inspection_would_run = Cell::new(false);
+
+        let state = resolve_converted_archive_candidate_with(
+            &candidate,
+            &AtomicBool::new(false),
+            |path| Ok(path.to_path_buf()),
+            |_, _, _| Some(cached.clone()),
+            |path, _| {
+                direct_inspection_would_run.set(true);
+                Ok((
+                    crate::rar_loader::RarDirectReadDecision::Direct,
+                    path.to_path_buf(),
+                ))
+            },
+        );
+
+        assert_eq!(
+            state,
+            Some(crate::app::ConvertedArchiveSourceState::CachedZip(cached)),
+            "A1 intentionally changes Direct + converted from Direct to CachedZip"
+        );
+        assert!(!direct_inspection_would_run.get());
     }
 
     #[test]
@@ -16836,6 +16953,8 @@ mod favorite_adjustment_defaults_tests {
             Some(&crate::app::ConvertedArchiveSourceState::Pending),
             "install_new_items must publish an explicit Pending state without peeking the DB"
         );
+        assert!(app.converted_archive_cache_paths_pending.is_none());
+        start_archive_decisions_for_test(&mut app, 0..1);
         assert!(app.converted_archive_cache_paths_pending.is_some());
 
         let ctx = egui::Context::default();
@@ -16868,20 +16987,56 @@ mod favorite_adjustment_defaults_tests {
         let key = crate::path_key::normalize_keep_drive(&src);
         let pins = std::collections::HashMap::new();
 
-        for state in [
+        let pending_sources = std::collections::HashMap::from([(
+            key.clone(),
             crate::app::ConvertedArchiveSourceState::Pending,
+        )]);
+        let pending = make_load_request(
+            &item,
+            0,
+            1,
+            2,
+            false,
+            None,
+            None,
+            0,
+            &pins,
+            &pending_sources,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("Pending must build a cache-only request");
+        assert_eq!(pending.path, src);
+        assert_eq!(pending.source_policy, LoadSourcePolicy::CacheOnly);
+
+        let unavailable_sources = std::collections::HashMap::from([(
+            key.clone(),
             crate::app::ConvertedArchiveSourceState::Unavailable,
-        ] {
-            let sources = std::collections::HashMap::from([(key.clone(), state)]);
-            assert!(
-                make_load_request(
-                    &item, 0, 1, 2, false, None, None, 0, &pins, &sources, None, None, None, None,
-                    false,
-                )
-                .is_none(),
-                "Pending and Unavailable are distinct typed states but neither has a load source"
-            );
-        }
+        )]);
+        assert!(
+            make_load_request(
+                &item,
+                0,
+                1,
+                2,
+                false,
+                None,
+                None,
+                0,
+                &pins,
+                &unavailable_sources,
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .is_none(),
+            "Unavailable remains a terminal no-request state"
+        );
 
         for state in [
             crate::app::ConvertedArchiveSourceState::Direct(direct.clone()),
@@ -16896,6 +17051,133 @@ mod favorite_adjustment_defaults_tests {
             .expect("resolved archive state should build a request");
             assert_eq!(request.path, expected);
         }
+    }
+
+    #[test]
+    fn pending_convertible_archive_cache_only_request_returns_cached_thumbnail() {
+        let source = PathBuf::from(r"C:\books\book.rar");
+        let item = GridItem::ConvertibleArchive {
+            path: source.clone(),
+            format: crate::archive_converter::ArchiveFormat::Rar,
+        };
+        let sources = std::collections::HashMap::from([(
+            crate::path_key::normalize_keep_drive(&source),
+            crate::app::ConvertedArchiveSourceState::Pending,
+        )]);
+        let request = make_load_request(
+            &item,
+            0,
+            11,
+            22,
+            false,
+            None,
+            None,
+            0,
+            &std::collections::HashMap::new(),
+            &sources,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("Pending archive should build cache-only request");
+        assert_eq!(request.source_policy, LoadSourcePolicy::CacheOnly);
+
+        let mut webp = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([10, 20, 30, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut webp),
+            image::ImageFormat::WebP,
+        )
+        .unwrap();
+        let key = request.cache_key_override.clone().unwrap();
+        let cache_map = std::sync::RwLock::new(std::collections::HashMap::from([(
+            key,
+            crate::catalog::CacheEntry {
+                mtime: 11,
+                file_size: 22,
+                jpeg_data: webp,
+                source_dims: Some((2, 2)),
+                layout_dims: None,
+            },
+        )]));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let done = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+        let keep_start = Arc::new(AtomicUsize::new(0));
+        let keep_end = Arc::new(AtomicUsize::new(1));
+        crate::thumb_loader::process_load_request(
+            &request,
+            &cache_map,
+            &tx,
+            None,
+            64,
+            75,
+            64,
+            CacheDecision::from_settings(&crate::settings::Settings::default()),
+            &done,
+            &stats,
+            None,
+            &keep_start,
+            &keep_end,
+            None,
+            None,
+            None,
+        );
+
+        let message = rx.recv().expect("cache-only hit should emit thumbnail");
+        assert!(message.image.is_some());
+        assert!(message.origin.from_cache());
+    }
+
+    #[test]
+    fn cache_only_miss_does_not_open_convertible_archive_source() {
+        let missing = PathBuf::from(r"C:\missing\must-not-open.rar");
+        let request = LoadRequest {
+            idx: 0,
+            path: missing,
+            mtime: 1,
+            file_size: 2,
+            cache_key_override: Some("archivethumb:rar:must-not-open.rar".to_string()),
+            resolve_override: Some(crate::thumb_loader::ResolveStrategy::ZipFirstImage),
+            source_policy: LoadSourcePolicy::CacheOnly,
+            ..Default::default()
+        };
+        let cache_map = std::sync::RwLock::new(std::collections::HashMap::new());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let done = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+        let keep_start = Arc::new(AtomicUsize::new(0));
+        let keep_end = Arc::new(AtomicUsize::new(1));
+        crate::thumb_loader::process_load_request(
+            &request,
+            &cache_map,
+            &tx,
+            None,
+            64,
+            75,
+            64,
+            CacheDecision::from_settings(&crate::settings::Settings::default()),
+            &done,
+            &stats,
+            None,
+            &keep_start,
+            &keep_end,
+            None,
+            None,
+            None,
+        );
+
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(done.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -16930,6 +17212,7 @@ mod favorite_adjustment_defaults_tests {
         app.converted_archive_cache_paths_pending = Some(ConvertedArchiveCachePathsPending {
             generation,
             cancel: Arc::new(AtomicBool::new(false)),
+            desired_indices: Arc::new(std::sync::RwLock::new(HashSet::from([0, 1, 2]))),
             rx,
             pin_archive_dependencies: std::collections::HashMap::new(),
         });
@@ -16992,6 +17275,7 @@ mod favorite_adjustment_defaults_tests {
         app.converted_archive_cache_paths_pending = Some(ConvertedArchiveCachePathsPending {
             generation: app.items_generation.wrapping_sub(1),
             cancel: Arc::new(AtomicBool::new(false)),
+            desired_indices: Arc::new(std::sync::RwLock::new(HashSet::from([0]))),
             rx,
             pin_archive_dependencies: std::collections::HashMap::new(),
         });
@@ -17024,6 +17308,127 @@ mod favorite_adjustment_defaults_tests {
         indices
             .sort_unstable_by_key(|idx| converted_archive_candidate_priority(*idx, visible, keep));
         assert_eq!(indices, vec![20, 24, 30, 12, 39, 3, 80]);
+    }
+
+    #[test]
+    fn archive_decision_scope_leaves_out_of_range_candidates_pending() {
+        let mut app = setup_app();
+        let keys = install_pending_archive_items(&mut app, 3);
+
+        start_archive_decisions_for_test(&mut app, [0]);
+        poll_archive_decisions_for_test(&mut app);
+
+        assert_eq!(
+            app.converted_archive_cache_paths.get(&keys[0]),
+            Some(&crate::app::ConvertedArchiveSourceState::Unavailable)
+        );
+        for key in &keys[1..] {
+            assert_eq!(
+                app.converted_archive_cache_paths.get(key),
+                Some(&crate::app::ConvertedArchiveSourceState::Pending)
+            );
+        }
+    }
+
+    #[test]
+    fn archive_decision_scope_adds_candidate_after_scroll_into_range() {
+        let mut app = setup_app();
+        let keys = install_pending_archive_items(&mut app, 3);
+        start_archive_decisions_for_test(&mut app, [0]);
+        poll_archive_decisions_for_test(&mut app);
+        assert_eq!(
+            app.converted_archive_cache_paths.get(&keys[2]),
+            Some(&crate::app::ConvertedArchiveSourceState::Pending)
+        );
+
+        start_archive_decisions_for_test(&mut app, [2]);
+        poll_archive_decisions_for_test(&mut app);
+        assert_eq!(
+            app.converted_archive_cache_paths.get(&keys[2]),
+            Some(&crate::app::ConvertedArchiveSourceState::Unavailable)
+        );
+    }
+
+    #[test]
+    fn archive_decision_scope_does_not_submit_while_scroll_gate_is_blocked() {
+        let mut app = setup_app();
+        let keys = install_pending_archive_items(&mut app, 1);
+        let scope = HashSet::from([0]);
+
+        app.maybe_start_converted_archive_cache_paths_refresh(
+            PrefetchDecision::Block {
+                reason: BlockReason::ScrollNotIdle { elapsed_ms: 25 },
+            },
+            &scope,
+            (0, 1),
+            (0, 1),
+        );
+
+        assert!(app.converted_archive_cache_paths_pending.is_none());
+        assert_eq!(
+            app.converted_archive_cache_paths.get(&keys[0]),
+            Some(&crate::app::ConvertedArchiveSourceState::Pending)
+        );
+    }
+
+    #[test]
+    fn archive_decision_scope_updates_active_batch_while_scroll_gate_is_blocked() {
+        let mut app = setup_app();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let desired_indices = Arc::new(std::sync::RwLock::new(HashSet::from([0, 1])));
+        app.converted_archive_cache_paths_pending = Some(ConvertedArchiveCachePathsPending {
+            generation: app.items_generation,
+            cancel: Arc::new(AtomicBool::new(false)),
+            desired_indices: Arc::clone(&desired_indices),
+            rx,
+            pin_archive_dependencies: std::collections::HashMap::new(),
+        });
+        let new_scope = HashSet::from([2]);
+
+        app.maybe_start_converted_archive_cache_paths_refresh(
+            PrefetchDecision::Block {
+                reason: BlockReason::ScrollNotIdle { elapsed_ms: 25 },
+            },
+            &new_scope,
+            (2, 3),
+            (2, 3),
+        );
+
+        assert_eq!(
+            desired_indices.read().unwrap().clone(),
+            new_scope,
+            "the in-flight item may finish, but queued candidates must follow the latest scope"
+        );
+        assert!(app.converted_archive_cache_paths_pending.is_some());
+    }
+
+    #[test]
+    fn archive_rollup_edit_filter_expands_decision_scope_to_whole_folder() {
+        use crate::settings::FacetEditFlag;
+
+        let mut app = setup_app();
+        let keys = install_pending_archive_items(&mut app, 3);
+        app.keep_set = HashSet::from([0]);
+        app.settings
+            .facet_filter
+            .edits
+            .insert(FacetEditFlag::Adjustment);
+        assert!(app.settings.facet_filter.has_rollup_edit_filter());
+        let scope = converted_archive_candidate_scope(
+            app.items.len(),
+            &app.keep_set,
+            app.settings.facet_filter.has_rollup_edit_filter(),
+        );
+        assert_eq!(scope, HashSet::from([0, 1, 2]));
+
+        app.start_converted_archive_cache_paths_refresh(&scope, (0, 1), (0, 1));
+        poll_archive_decisions_for_test(&mut app);
+        for key in keys {
+            assert_eq!(
+                app.converted_archive_cache_paths.get(&key),
+                Some(&crate::app::ConvertedArchiveSourceState::Unavailable)
+            );
+        }
     }
 
     #[test]
@@ -17081,6 +17486,7 @@ mod favorite_adjustment_defaults_tests {
                 folder_meta.len() as i64,
             ))],
         );
+        start_archive_decisions_for_test(&mut app, 0..1);
 
         let ctx = egui::Context::default();
         for _ in 0..50 {
@@ -17156,6 +17562,7 @@ mod favorite_adjustment_defaults_tests {
                 )),
             ],
         );
+        start_archive_decisions_for_test(&mut app, 0..2);
         assert!(app.converted_archive_cache_paths.is_empty());
         let fallback = make_load_request(
             &app.items[0],
@@ -17299,19 +17706,11 @@ mod favorite_adjustment_defaults_tests {
             ..Default::default()
         });
         let first_snapshot = app.converted_archive_cache_paths.clone();
-        app.start_converted_archive_cache_paths_refresh();
+        start_archive_decisions_for_test(&mut app, 0..1);
         assert_eq!(
             app.converted_archive_cache_paths, first_snapshot,
-            "refresh must keep the previous map while the worker is running"
+            "resolved candidates must retain their previous terminal states"
         );
-        for _ in 0..100 {
-            app.poll_converted_archive_cache_paths(&ctx);
-            if app.converted_archive_cache_paths_pending.is_none() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-
         assert!(app.converted_archive_cache_paths_pending.is_none());
         assert_eq!(app.converted_archive_cache_paths, first_snapshot);
         assert!(matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
@@ -17397,6 +17796,99 @@ mod favorite_adjustment_defaults_tests {
             req.cache_key_override.as_deref(),
             Some(expected_key.as_str())
         );
+    }
+
+    #[test]
+    fn pending_pinned_rar_uses_pinned_cache_key_before_decision_finishes() {
+        use crate::folder_thumb_pins::FolderPinSource;
+
+        let source_path = PathBuf::from(r"C:\books\book.rar");
+        let item = GridItem::ConvertibleArchive {
+            path: source_path.clone(),
+            format: crate::archive_converter::ArchiveFormat::Rar,
+        };
+        let mut pins = std::collections::HashMap::new();
+        pins.insert(
+            crate::path_key::normalize_keep_drive(&source_path),
+            FolderPinSource::ZipEntry {
+                zip_rel: String::new(),
+                entry: "inner/pinned.png".to_string(),
+            },
+        );
+        let sources = std::collections::HashMap::from([(
+            crate::path_key::normalize_keep_drive(&source_path),
+            crate::app::ConvertedArchiveSourceState::Pending,
+        )]);
+        let request = make_load_request(
+            &item,
+            0,
+            333,
+            444,
+            false,
+            None,
+            Some(crate::settings::SortOrder::Numeric),
+            3,
+            &pins,
+            &sources,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("Pending pinned archive should still build a cache-only request");
+        assert_eq!(request.source_policy, LoadSourcePolicy::CacheOnly);
+        assert_eq!(request.path, source_path);
+        assert_eq!(request.zip_entry.as_deref(), Some("inner/pinned.png"));
+        let pinned_key = request.cache_key_override.clone().unwrap();
+        assert!(pinned_key.contains("#pin:zipentry||inner/pinned.png"));
+
+        let mut webp = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([200, 100, 50, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut webp),
+            image::ImageFormat::WebP,
+        )
+        .unwrap();
+        let cache_map = std::sync::RwLock::new(std::collections::HashMap::from([(
+            pinned_key,
+            crate::catalog::CacheEntry {
+                mtime: 333,
+                file_size: 444,
+                jpeg_data: webp,
+                source_dims: Some((2, 2)),
+                layout_dims: None,
+            },
+        )]));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let done = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+        let keep_start = Arc::new(AtomicUsize::new(0));
+        let keep_end = Arc::new(AtomicUsize::new(1));
+        crate::thumb_loader::process_load_request(
+            &request,
+            &cache_map,
+            &tx,
+            None,
+            64,
+            75,
+            64,
+            CacheDecision::from_settings(&crate::settings::Settings::default()),
+            &done,
+            &stats,
+            None,
+            &keep_start,
+            &keep_end,
+            None,
+            None,
+            None,
+        );
+
+        assert!(rx.recv().unwrap().image.is_some());
     }
 
     #[test]

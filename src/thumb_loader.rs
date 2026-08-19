@@ -237,6 +237,31 @@ pub struct ThumbMsg {
 /// UI スレッドが `reload_queue` に push し、永続ワーカースレッドが pop して処理する。
 /// ワーカーはまず `cache_map` を参照し、ヒットすれば WebP デコード、
 /// ミスすれば `load_one_cached` に委譲する。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LoadSourcePolicy {
+    /// 永続キャッシュを先に確認し、miss なら元ソースを読む通常要求。
+    #[default]
+    CacheOrSource,
+    /// 永続キャッシュだけを確認し、miss でも元ソースを開かない要求。
+    CacheOnly,
+    /// 永続キャッシュを迂回し、元ソースから再生成する品質 upgrade 要求。
+    SourceOnly,
+}
+
+impl LoadSourcePolicy {
+    pub fn allows_cache(self) -> bool {
+        !matches!(self, Self::SourceOnly)
+    }
+
+    pub fn allows_source(self) -> bool {
+        !matches!(self, Self::CacheOnly)
+    }
+
+    pub fn bypasses_cache(self) -> bool {
+        matches!(self, Self::SourceOnly)
+    }
+}
+
 #[derive(Default)]
 pub struct LoadRequest {
     pub idx: usize,
@@ -257,8 +282,8 @@ pub struct LoadRequest {
     /// worker はこのキーのページ個別色調補正だけを親セルへ適用する。edit-preview
     /// cache を無効にしても必要なため `edit_preview_key` とは所有権を分ける。
     pub pinned_page_adjustment_key: Option<String>,
-    /// 段階 E: true の場合はキャッシュを無視して元画像から再デコードする
-    pub skip_cache: bool,
+    /// 永続キャッシュと元ソースのどちらを読める要求か。
+    pub source_policy: LoadSourcePolicy,
     /// true = 画面上に見えている可視範囲のアイテム。ワーカーは priority 要求を
     /// 先読み要求より常に先に処理する。
     pub priority: bool,
@@ -944,7 +969,7 @@ fn send_pinned_only_cached(
 ///
 /// - 通常: `cache_map` を参照しキャッシュヒットしていれば WebP を復号して送信する
 ///   (`ThumbLoadOrigin::UpgradeableCache`)
-/// - ミスまたは `req.skip_cache = true`: `load_one_cached` に委譲してフルデコード
+/// - ミスまたは `SourceOnly`: `load_one_cached` に委譲してフルデコード
 ///   (`ThumbLoadOrigin::Source`、段階 E のアップグレード経路)
 #[allow(clippy::too_many_arguments)]
 pub fn process_load_request(
@@ -995,7 +1020,7 @@ pub fn process_load_request(
         .and_then(|key| adjustment_db.and_then(|db| db.get_page_params(key)))
         .filter(|params| !params.is_color_identity());
 
-    let edit_preview = if req.skip_cache {
+    let edit_preview = if req.source_policy.bypasses_cache() {
         None
     } else if let (Some(item_key), Some(db)) = (req.edit_preview_key.as_deref(), edit_preview_db) {
         if req.edit_preview_validate_container {
@@ -1058,14 +1083,17 @@ pub fn process_load_request(
             &[
                 ("idx", serde_json::Value::from(req.idx)),
                 ("priority", serde_json::Value::from(req.priority)),
-                ("skip_cache", serde_json::Value::from(req.skip_cache)),
+                (
+                    "skip_cache",
+                    serde_json::Value::from(req.source_policy.bypasses_cache()),
+                ),
             ],
         );
     }
 
-    // 段階 E: skip_cache = true のときはキャッシュヒット判定を飛ばして
+    // 段階 E: SourceOnly のときはキャッシュヒット判定を飛ばして
     // 必ず元画像からデコードする (アイドル時の画質アップグレード用)
-    if !req.skip_cache {
+    if req.source_policy.allows_cache() {
         // read ロックは最短に保つ: エントリのデータだけ clone して即解放。
         // WebP デコード (2-3 ms) をロック外で実行することで、
         // 他ワーカーの write (キャッシュ保存) をブロックしない。
@@ -1134,7 +1162,24 @@ pub fn process_load_request(
         }
     }
 
-    // キャッシュミス or skip_cache: フルデコード (+ 必要なら保存)
+    // Pending な変換アーカイブの cache-only 要求は、catalog miss ならここで完了する。
+    // UI の `requested` は判定結果の publish 時に対象 idx を evict するまで保持し、
+    // 毎フレーム同じ miss を再投入しない。元アーカイブを開く処理には進まない。
+    if !req.source_policy.allows_source() {
+        gen_done.fetch_add(1, Ordering::Relaxed);
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "thumb",
+                "cache_only_miss",
+                Some(filename),
+                req.input_seq,
+                &[("idx", serde_json::Value::from(req.idx))],
+            );
+        }
+        return;
+    }
+
+    // キャッシュミス or SourceOnly: フルデコード (+ 必要なら保存)
     // load_one_cached は Source origin を送信する
 
     // 重い I/O (Folder / ZipFile / ConvertibleArchive / ZipDir) は専用 I/O ワーカーキューで処理されるため、
@@ -1463,7 +1508,7 @@ pub fn process_load_request(
     // PDFium レンダは 1 枚 1 秒クラスの重処理なので、cache miss 時にも
     // 開始前に keep_range 外になっていれば中断する。これがないと
     // スクロール往復で同じページが複数回レンダされる事故が起きる。
-    if req.pdf_page.is_some() && !req.skip_cache {
+    if req.pdf_page.is_some() && req.source_policy.allows_cache() {
         let ks = keep_start.load(Ordering::Relaxed);
         let ke = keep_end.load(Ordering::Relaxed);
         if req.idx < ks || req.idx >= ke {
@@ -1504,14 +1549,15 @@ pub fn process_load_request(
 
     // PDF render 経路 (pdf_page=Some) で cache 保存可能なら HarvestOnCancel に切替。
     // = 「PDFium が既に処理した結果を捨てない」ための投資回収。
-    // 静的 gate: skip_cache / catalog 無し / cache_map 無し のいずれかが該当すれば
+    // 静的 gate: SourceOnly / catalog 無し / cache_map 無し のいずれかが該当すれば
     // どうせ cache 保存しないので harvest 待ちの意味が無く AbortOnCancel に倒す。
     // (詳細は docs/pdf-pool-harvest-on-cancel-plan.md)
-    let cancel_policy = if req.pdf_page.is_some() && !req.skip_cache && catalog_ref.is_some() {
-        crate::pdf_loader::CancelWaitPolicy::HarvestOnCancel
-    } else {
-        crate::pdf_loader::CancelWaitPolicy::AbortOnCancel
-    };
+    let cancel_policy =
+        if req.pdf_page.is_some() && req.source_policy.allows_cache() && catalog_ref.is_some() {
+            crate::pdf_loader::CancelWaitPolicy::HarvestOnCancel
+        } else {
+            crate::pdf_loader::CancelWaitPolicy::AbortOnCancel
+        };
 
     let verified_source_bytes = match req.relative_page_provenance.as_ref() {
         Some(provenance) => match with_verified_relative_page_bytes(provenance, |bytes| bytes) {
@@ -1555,7 +1601,7 @@ pub fn process_load_request(
         req.context_epoch,
         cancel_policy,
         req.force_cache,
-        req.skip_cache,
+        req.source_policy.bypasses_cache(),
         pinned_page_adjustment.as_ref(),
     );
     if crate::perf::is_enabled() {
@@ -3651,7 +3697,7 @@ mod tests {
                 path: img_path.clone(),
                 edit_preview_key: Some(key.clone()),
                 pinned_page_adjustment_key: apply_pinned_page_adjustment.then(|| key.clone()),
-                skip_cache: true,
+                source_policy: LoadSourcePolicy::SourceOnly,
                 items_gen: 1,
                 ..Default::default()
             };

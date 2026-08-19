@@ -444,16 +444,29 @@ README の更新履歴で確認できる最新リリース v2.13.0 までの cat
 `ConvertibleArchive` の読み取り元表 (`App.converted_archive_cache_paths`) は、候補ごとに
 `Pending / Direct(PathBuf) / CachedZip(PathBuf) / Unavailable` を持つ。map entry の欠落を
 「未判定」と「判定済みだが読み取り元なし」の兼用 sentinel にしない。`install_new_items` は
-current-folder generation の候補を先に `Pending` で登録し、path/mtime/size と folder thumb pin を
-引く container root だけを snapshot する。SQLite `peek`、cache ZIP の `exists()`、RAR header
-inspection、pin の DB lookup・cascade・stat は `ConvertedArchiveCachePathsPending` worker で行う。
+current-folder generation の全候補を I/O なしで先に `Pending` 登録する。実際の判定 batch は
+**現在の可視範囲 + thumbnail keep set + その範囲の container pin 依存先**だけを対象にする。
+range が動けば worker と共有する desired scope を更新し、旧範囲の queued 候補は次の開始前に
+skip する。既に走査を始めた in-flight 1 冊だけは cancel せず完了させ、同 generation なら結果を
+採用する。現 batch の終了後、既に終端状態の key を除外して新しく入った候補を追加投入する。
 
-worker は spawn 時点の可視範囲、keep range、可視範囲からの距離順に 1 本で候補を処理し、
-1 件の判定が終わるたび `Direct` / `CachedZip` / `Unavailable` を UI へ送る。スクロール後の動的な
-優先度変更は行わない。poll は通知ごとに `items_generation` を照合し、同世代だけ map へ反映して
-repaint を要求する。全候補完了時だけ従来の総括 perf event `nav/archive_cache_peek` を 1 回記録する。
-`make_load_request` は `Direct` / `CachedZip` だけから heavy thumbnail request を作り、`Pending` /
-`Unavailable` では `None` を返すため、全候補の完了を可視 RAR のサムネイル開始条件にしない。
+投入は thumbnail prefetch と同じ `decide_prefetch_allowed` を使い、scroll input 後 100ms 未満と
+可視通常サムネイル待ちの間は止め、3 秒 backstop を共有する。decision 自身を待つ container tile は
+visible blocker から除外し、自己 deadlock を作らない。`has_rollup_edit_filter()` が true の場合だけ、
+範囲外 container の分類も表示集合に必要なので folder 全体を対象にする (Details view も同じ)。
+
+RAR 1 件の順序は、(1) 128 件 cache 付きの volume header 解決、(2) `archive_cache.db::peek`、
+(3) miss 時だけ `inspect_for_direct_read` の全 entry 走査。変換済み ZIP があれば inspection は走らない。
+この順序により、**直読み可能かつ変換済み ZIP もある RAR は従来の `Direct` ではなく
+`CachedZip` を選ぶ**。どちらも元 RAR の mtime/size で検証済みの正当な読み取り元だが、これは
+意図した優先順位変更である。
+
+worker は 1 件の判定が終わるたび `Direct` / `CachedZip` / `Unavailable` を UI へ送り、poll は
+通知ごとに `items_generation` を照合する。`nav/archive_cache_peek` は folder 全体ではなく各 range
+batch の総括になる。`make_load_request` は `Pending` でも RAR 自身の path/mtime/size と
+`archivethumb:` key から `CacheOnly` 要求を作り、pin 適用後の key も同じように読む。cache hit は
+判定中でも表示し、miss は元 archive を開かず、判定 publish が対象 tile を通常要求へ入れ替えるまで
+`Pending` のまま待つ。`Unavailable` だけは従来どおり要求を作らない。
 
 Folder タイルの pin が変換対象アーカイブへ解決される場合は、worker が dependency を結果より先に
 逐次通知する。読み取り元が実際に変わった key に依存するタイルだけを Evicted に戻し、reload/heavy
@@ -496,7 +509,7 @@ queue と `requested` も通常の thumbnail 再要求 helper で同時に外す
   下に catalog + cache_map をミラー seed する。worker は通常の cache_hit 経路で
   動画フレームを取り出す。WebP が無い / 失敗時は seed を skip / 旧 seed 行を purge して
   worker を folder auto-pick fallback (`resolve_folder_thumb_image`) に落とす。
-  video pin は `skip_cache = false` 固定で idle quality-upgrade の対象外 (WebP IS the source)。
+  video pin は `LoadSourcePolicy::CacheOrSource` 固定で idle quality-upgrade の対象外 (WebP IS the source)。
   - **「動画内 PIN 必須」仕様** (Codex post-merge P2 → ユーザー合意): video source の
     folder pin は `try_set_folder_thumb_pin_with_guard` が **set 時に `video_pins.db`
     の WebP 有無をチェック**し、無ければトーストで案内して set を拒否する。sidecar

@@ -942,6 +942,32 @@
   走査ゼロ。待つ場所が「フォルダを開いた瞬間に全部」から「その本を開いた瞬間に 1 冊」へ移る。
 - §2.7 (header の二重走査) は**これで消えない**。走る回数が減るだけなので別項のまま残す。
 - 規模 / 優先度: A = 小〜中、B = 中 / P2。v3.1.2 で両方入れる (利用者判断 2026-08-19)。
+- **対応済み (2026-08-19、backlog 2.8 close)**:
+  - **A**: RAR は volume header 解決 → `archive_cache.db::peek` → miss 時だけ full inspection の
+    順に変更した。変換済み ZIP hit は `rar/inspection_begin` を出さない。これに伴い、
+    **直読み可能かつ変換済み ZIP も持つ RAR は `Direct` ではなく `CachedZip` を選ぶ**。
+    これは mtime/size 検証済み cache を先に使う意図した挙動変更として unit test で固定した。
+    `LoadRequest` の旧 `skip_cache: bool` は `CacheOrSource / CacheOnly / SourceOnly` の typed policy に
+    置き換え、`Pending` archive とその pin key は cache-only hit を判定完了前に表示する。
+    cache-only miss は元 archive を開かず、判定 publish まで tile を再投入しない。
+  - **B**: generation 開始時の全候補 `Pending` 登録と worker scope を分離し、通常は可視 + keep set +
+    その item の pin 依存先だけを投入する。range 移動中も共有 desired scope を更新し、旧 range の
+    queued 候補は skip、既に開始済みの in-flight 1 冊だけ完了を採用する。batch 終了後は新 range の
+    未解決 key だけを追加する。投入は既存 `decide_prefetch_allowed` の scroll/visible/backstop gate を
+    共有する。`has_rollup_edit_filter()` のときだけ Details view を含め folder 全体を判定する。
+  - focused regression は cheap-first / `CachedZip` 優先 / cache-only hit・miss / Pending pin /
+    `Unavailable` / range 外 Pending / range 進入 / scroll block / rollup 全体 scope を固定した。
+    §2.3 の逐次結果、pin dependency、rollup rebuild テストもそのまま通る。§2.7 は未変更で開いたまま。
+  - `C:	mpmiv-rar-thumbnail-test-100` を `1400x860` の isolated portable smoke
+    (`targetportable-smokedata`、`--perf-log`) で再計測した。**cold** は 133 RAR 中、
+    visible + keep の idx 0〜39 に当たる **40 候補だけ**が
+    `nav/archive_cache_candidate` / `rar/inspection_begin` を出し、可視 idx 0〜11 の
+    `thumb/ready` は起動後 **0.878〜0.926秒**。従来 `2.3 の全 133 候補に対する
+    0.801〜0.860秒 / 候補 #130 が 4.021秒という batch は、先頭 40 件で終わるようになった。
+  - **warm** は同じ isolated profile の idx 0〜39 に実際の変換 ZIP と
+    `archive_cache.db` 行を用意した。40 候補すべてが `CachedZip` となり、
+    `rar/inspection_begin` は **0 件**、可視 12 件の `thumb/ready` は
+    **0.790〜0.857秒**だった。cold / warm とも folder 全体の残り 93 RAR は未判定のまま。
 
 ### 2.7 RAR の header 全走査が、一覧判定とサムネイル生成で 2 回走る
 

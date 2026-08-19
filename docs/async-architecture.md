@@ -56,7 +56,7 @@
 | 動画音声 RT 出力 | `cpal::Stream` 内部スレッド | 動画 1 つにつき 1 本 | WASAPI Shared モード。コールバックで ring buffer から f32 stereo を pop し、**実消費サンプル数 (= `real_consumed`) 分のみ** `next_pts_secs` を進めて `AvClock::set_audio_pts` でマスタークロックを更新。silence 出力中 (= `real_consumed=0`) は pts 進行 skip。`!clock.is_playing()` (= 一時停止 / EOF) と `pump_seek_serial < clock_serial` (= pre-seek サンプル全消去) は早期 return。`AvClock::set_audio_pts` 側に defensive wall-rate cap (= `wall_dt + 5ms` で pts 進行を頭打ち) を保持し、buffer 非空 pre-fill burst の異常前進への保険にしている (Phase 9 後の cleanup refactor、詳細は [docs/video-engine-redesign.md](video-engine-redesign.md) の「Phase 9 後の Post-cleanup refactor」節) |
 | 起動 / activation パス解決 | `std::thread` (`startup-open-resolve`) | 起動引数 / 2 重起動 activation ごとに最大 1 本 | `resolve_openable_path_detailed` (`Path::is_dir` / `is_file` + 親探索) を UI スレッド外で実行する。400ms 以上未完了ならメインウィンドウに「パスを確認しています…」toast を出し、完了後だけ UI スレッドで既存の `load_folder_or_convert_archive...` に戻す。新しい activation が来たら旧 pending を cancel し、古い結果は適用しない |
 | RAR / 7z / LZH / ZIP スキャン・変換 | `std::thread` (scan / convert ごとの使い捨て) + mpsc | `ArchiveConvertState` 1 件 | 直接 RAR 判定、画像 inventory、パスワード再試行、キャッシュ ZIP 変換を行う。`ArchiveConvertState.cancel` は事前 scan から変換完了までの単一 owner で、RAR / 7z / LZH / ZIP の各 entry 境界が同じ token を確認する。`OpenRequestOwner::Navigation` はarchive種別判定より前にvisible-open lifecycleを取得し、archive Aのscan中にarchive Bを開く場合もAのtokenとreceiverを終了してからBのstateを作る。state drop、Esc / cancel、activation、競合する通常 navigation、後続 bookmarkも同じ規約で古いworkerとlate resultを無効化する。ブックマーク起点では`completion`がrequest IDとtarget identityも保持し、直接RARまたは元アーカイブ→キャッシュZIPのmount後に同じownerでページ待機へ進める。確認・パスワード・変換中は通常の45秒resolve timeoutを適用せず、完了はownerが現在値と一致する場合だけ表示へ適用する |
-| フォルダ一覧の変換アーカイブ読み取り元判定 | `std::thread` (`archive-cache-peek`) + mpsc | viewer context / items generation ごとに最大 1 | 候補を UI 側で `Pending` として先に登録し、spawn 時点の visible → keep → visible からの距離順に 1 worker で RAR header inspection と cache DB peek を行う。候補ごとに `Direct` / `CachedZip` / `Unavailable` を逐次送信し、UI は通知 1 件ごとに `items_generation` を照合して同世代だけを適用する。folder thumb pin の dependency も候補結果より先に通知し、解決した key に依存する tile だけを再要求する。context の再読込・切替・drop は共有 cancel token を立て、RAR entry 境界で中断する。スクロール追従の動的優先度変更と候補数ぶんの thread spawn は行わない。全件完了時は総括 `nav/archive_cache_peek`、各候補完了時は `nav/archive_cache_candidate` を perf log へ記録する |
+| フォルダ一覧の変換アーカイブ読み取り元判定 | `std::thread` (`archive-cache-peek`) + mpsc | viewer context / items generation ごとに最大 1 | 全候補を UI 側で `Pending` 登録するが、worker へは visible + keep + その item の pin 依存先だけを渡す。RAR は volume header 解決 → cache DB peek → miss 時だけ full inspection の順。候補ごとに `Direct` / `CachedZip` / `Unavailable` を逐次送信し、UI は通知ごとに `items_generation` を照合する。range 移動時は共有 scope を差し替え、既に開始済みの 1 冊だけを完了可として旧 range の queued 候補を skip する。現 batch 終了後に新 range の未解決候補を追加する。folder 切替・再読込・drop は cancel token を立てる。rollup edit filter 時だけ folder 全体 scope。batch 完了時は `nav/archive_cache_peek`、各候補は `nav/archive_cache_candidate` を記録する |
 | フォルダナビゲーション | `std::thread` | 1 (常時 ≤ 1 本) | 深さ優先で次フォルダを検索。連打は `pending_folder_nav_steps` に累積され、完了ごとに連鎖実行する (並行 DFS による FS 競合を避ける) |
 | メディア前後送り候補の存在確認 | 常駐 `std::thread` (`media-nav-resolver`) + mpsc mailbox | App-global 0 or 1 (初回要求時に lazy 起動) | EOF / 手動前後送り時、UI が bundle items から抽出した方向付き候補列の実ファイルだけを `Path::exists` で順次検証する。worker は受信時に mailbox を drain して最新 request だけを処理し、キャンセル不能な `Path::exists` 中の新要求も同じ 1 thread に滞留させる。結果は単調増加 request id が最新 pending と一致する場合だけ検討し、`items_generation` / owner window / 開始時 `fullscreen_idx` を context-local stale 条件とする。App-global `input_seq` の一致は owner なしの mounted context だけで要求し、ParkedLive では無関係な main 入力を stale 理由にしない。owner 不一致中は結果を受信せず保留する。EOF action を stale / superseded / context close・load / resolver 切断 / apply 拒否のいずれかで捨てる場合は、対応する `(fs_idx, seek_serial)` と現在値が一致するときだけ video / 動画音声モード / music 共通 dedup latch を解除して次 tick の再試行を許す。ZIP/PDF 仮想 entry は I/O せず候補に残す。App drop で request sender が drop され、in-flight I/O が戻った後に receiver disconnect で自然終了する (終了時 join なし)。 |
 | ファイル名スタック分類 | `std::thread` (`stack-script`) + mpsc | スタックモード ON かつスクリプト有効時、フォルダ読込ごとに最大 1 本 | ユーザー定義 Rhai スクリプト ([`filename_stack_script`](../src/filename_stack_script.rs)) でフォルダ内画像のグループキーを算出する。重くなり得る (実測 10 万件 ~1 秒) ので UI スレッドから外す。通常フォルダを先に表示し、完了後 `poll_stack_script` が `start_loading_items` 経由で集約ビューへ差し替える。`StackScriptPending` の cancel + folder 一致で stale 判定、別フォルダ移動 / スタック OFF / 再ロードで cancel、失敗は組み込み既定へフォールバック。組み込み既定 (separator) ルールは軽量なので同期構築のまま。詳細 [filename-stack-scripting-plan.md](filename-stack-scripting-plan.md) |
@@ -140,6 +140,28 @@ foreground は前景待機者がいる間その共有通信を cancel しない�
 | `CatchupQueue` (`thumb_loader.rs`) | `Arc<(Mutex<CatchupQueueState>, Condvar)>` | `pdf_meta` 背景書き込みキュー (v1.0.0)。`high: VecDeque<NeighborPrefetch>` (cap 16) + `low: VecDeque<MetaOnly>` (cap 256) + `pending: HashSet<PathBuf>` を同一 Mutex で保護。worker は high → low の順で pop。同 path が low にいる時に高優先が後から来ると **`high` 空き確認後に `low` から remove → `high` に push** で昇格する (lane が満杯のときだけ drop、lane 間は独立)。詳細は [docs/pdf-page-count-cache-plan.md の「最終形」セクション](pdf-page-count-cache-plan.md) |
 | `AiJobQueue` (`app.rs`) | `Arc<(Mutex<AiJobQueueState>, Condvar)>` | final AI (upscale/denoise) ジョブ。`display: VecDeque` (表示中ページ, push_front=LIFO) + `prefetch: VecDeque` (先読み, push_back=FIFO) + `shutdown` を同一 Mutex で保護。`final-ai-worker` が `display → prefetch` の順で pop。enqueue 重複は呼び出し側 `final_ai_pending.contains_key` で dedup。cancel は `final_ai_pending[key].cancel` (Drop でも立つ) を worker が pop 時に確認し、立っていれば推論せず `Cancelled` を返す (= 高速ページ送りで keep_set 外になったジョブは GPU 推論が始まる前に止まる)。PDF の表示中 final AI だけは、保持 LRU に入れる価値が高いので session close / keep-set evict 時に最大 1 件まで `retained_final_ai_orphans` へ移し、live pending から外したまま完走を許可する |
 | `texture_backlog` | ローカル Vec (App) | GPU アップロード未完の ColorImage。MAX_TEXTURES_PER_FRAME=8 超過分 |
+
+#### 2.3.1 変換アーカイブ判定 batch の range 追従
+
+`converted_archive_cache_paths` は items generation 開始時に全候補を `Pending` 登録するが、
+`ConvertedArchiveCachePathsPending` worker へ渡すのは現在の可視範囲 + thumbnail keep set と、
+その範囲内 item の folder-thumb pin 依存先だけである。range 変更は worker を cancel / respawn せず、
+UI が共有 desired scope を差し替える。worker は pin root / archive 候補を 1 件開始する前に scope を
+読み直すため、範囲外へ出た queued 候補は skip し、既に開始済みの in-flight 1 冊だけを完了させる。
+その結果は同 generation なら採用し、現 batch 終了後に新 range の `Pending` key だけを次 batch へ渡す。
+終端 key は再投入しない。
+
+batch admission は `decide_prefetch_allowed` の scroll idle 100ms / visible-ready / 3秒 backstop を
+再利用し、新しい debounce 時間を持たない。判定待ち container 自身は visible blocker へ数えると
+cache-only miss と相互待ちになるため除外し、通常サムネイルの Pending だけを blocker とする。
+ロールアップ編集 facet (`has_rollup_edit_filter`) のときだけ、一覧の分類を安定させるため folder 全体を
+scope にする。Details view は thumbnail keep set を作らないが、この例外 batch は early return 前に
+同じ gate で起動する。
+
+フォルダ切替 / items 差し替えでは従来どおり cancel token を立て、通知ごとに `items_generation` を
+照合する。scroll による scope 変更では cancel token を立てず、admission が Block 中でも desired
+scope だけは更新する。worker は UI state を直接変更せず、候補結果と pin dependency を channel で
+逐次通知する。
 
 ワーカーが要求を取り出すときは **優先度 (priority フラグ) → 距離 → forward/backward** でソート。
 距離計算は可視範囲の端からの歩数: backward は `scroll_hint - idx`, forward は `idx - visible_end + 1`

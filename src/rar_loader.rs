@@ -249,7 +249,7 @@ fn open_listing_from_volume(
     open_listing_from_volume_with_key(path, key.as_ref())
 }
 
-fn resolved_volume_path(path: &Path) -> io::Result<(PathBuf, RarVolumeKind)> {
+pub(crate) fn resolved_volume_path(path: &Path) -> io::Result<(PathBuf, RarVolumeKind)> {
     let key = cache_key(path).ok();
     if let Some(resolution) = key.as_ref().and_then(cached_volume_resolution) {
         return Ok((resolution.resolved_path, resolution.volume_kind));
