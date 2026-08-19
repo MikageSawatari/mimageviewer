@@ -1964,6 +1964,12 @@ scale_x=3.0443971, scale_y=3.0443973` で、論理 1440 × ppp1.5 = 実 2160px �
 単一ページは 1 ページ、見開きは左右 2 ページを表示単位として、**表示単位全体を 1 回で解決する**。
 受理時に current unit の texture / rotation / Part A の captured layout geometry を
 `FsNavigationSequence::previous` へ 1 unit として取り、target page set も 1 typed owner に保持する。
+`FsNavigationSequenceTarget::Display` の target page set は、page renderer が描く
+`GridItem::has_page_data` の項目だけで構成する。動画 / 音声など native presenter が描く項目を
+1 ページでも含む unit では `Display` sequence を作らず、そのまま移動先へ着地する。
+sequence を解放する presentation trace は page renderer だけが emit するため、native presenter 所有の
+項目を target にすると閉じられない sequence になり、後続 target を永久に block するためである。
+この条件は単一ページだけでなく、片側だけが native presenter 所有になり得る混在 unit にも適用する。
 見開きは左右 rendition が揃った frame だけ `Ready(Rendition)` になり、片側だけ完成画像、もう片側
 だけ rendition という組み合わせを描かない。rendition がまだ無ければ `Awaiting` のまま previous
 unit 全体を描く。target と同じ idx に旧 texture が残っていても、texture identity が captured

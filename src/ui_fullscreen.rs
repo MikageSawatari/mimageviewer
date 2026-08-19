@@ -5622,14 +5622,23 @@ impl App {
         if self.fs_navigation_sequence_blocks_new_target() {
             return false;
         }
+        let mut pages = self.fs_display_unit_page_indices(target_idx);
+        pages.sort_unstable();
+        if pages
+            .iter()
+            .any(|page| !self.items.get(*page).is_some_and(GridItem::has_page_data))
+        {
+            // A Display target is retired only by the page renderer's presentation trace.
+            // Native media presenters never emit that trace, so opening a sequence for a unit
+            // they own would leave every later page-navigation target blocked permanently.
+            return true;
+        }
         let previous = self
             .fs_holdover_tex
             .as_ref()
             .and_then(FsHoldover::navigation_sequence)
             .and_then(|sequence| sequence.previous.clone())
             .or_else(|| self.capture_fs_navigation_display_unit(ctx, current_idx));
-        let mut pages = self.fs_display_unit_page_indices(target_idx);
-        pages.sort_unstable();
         self.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
             previous,
             target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
@@ -36614,7 +36623,6 @@ mod tests {
     /// checking `blocks_new_target()` right after resolution would encode the wrong contract.
     /// The defect is that the target was built at all.
     #[test]
-    #[ignore = "red until a natively presented item stops being described as a page display unit"]
     fn page_navigation_never_describes_a_natively_presented_item_as_a_page_unit() {
         let ctx = egui::Context::default();
         let mut app = app_in_fullscreen_on_a_video(&ctx);
@@ -36627,7 +36635,7 @@ mod tests {
         app.thumbnails.insert(0, still);
         app.fullscreen_idx = Some(0);
 
-        app.begin_fs_page_navigation_sequence(&ctx, 0, 1, true);
+        assert!(app.begin_fs_page_navigation_sequence(&ctx, 0, 1, true));
 
         let target = app
             .fs_holdover_tex
@@ -36645,6 +36653,121 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn page_navigation_onto_video_does_not_wedge_the_next_handler_navigation() {
+        let ctx = egui::Context::default();
+        let mut app = app_in_fullscreen_on_a_video(&ctx);
+        app.items.insert(
+            0,
+            GridItem::Image(PathBuf::from("c:/clips/before-video.png")),
+        );
+        app.items.push(GridItem::ZipImage {
+            zip_path: PathBuf::from("c:/clips/pages.zip"),
+            entry_name: "after-video.png".to_owned(),
+        });
+        app.items
+            .push(GridItem::Image(PathBuf::from("c:/clips/next-page.png")));
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.visible_indices = (0..app.items.len()).collect();
+        app.fullscreen_idx = Some(0);
+
+        app.handle_fs_navigation(
+            &ctx,
+            false,
+            false,
+            None,
+            None,
+            None,
+            FsPageNav::Target(1),
+            None,
+            0,
+        );
+        assert_eq!(app.fullscreen_idx, Some(1));
+        assert!(
+            !app.fs_navigation_sequence_blocks_new_target(),
+            "the still-to-video handler must not leave a Display sequence that native video \
+             presentation cannot retire"
+        );
+
+        // The video handler resolves filesystem-backed candidates asynchronously. A virtual page
+        // has no filesystem existence check, so it exercises that production branch without a
+        // test fixture file and still lands through the normal fullscreen-open boundary.
+        app.handle_fs_navigation(
+            &ctx,
+            false,
+            false,
+            None,
+            None,
+            None,
+            FsPageNav::Target(2),
+            None,
+            1,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while app.fullscreen_idx != Some(2) && std::time::Instant::now() < deadline {
+            app.poll_video(&ctx);
+            std::thread::yield_now();
+        }
+        assert_eq!(app.fullscreen_idx, Some(2));
+        assert!(!app.fs_navigation_sequence_blocks_new_target());
+        app.handle_fs_navigation(
+            &ctx,
+            false,
+            false,
+            None,
+            None,
+            None,
+            FsPageNav::Target(3),
+            None,
+            2,
+        );
+
+        assert_eq!(app.fullscreen_idx, Some(3));
+        let target = app
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .map(|sequence| sequence.target.clone());
+        assert!(matches!(
+            target,
+            Some(FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                pages,
+                ..
+            })) if pages == vec![3]
+        ));
+    }
+
+    #[test]
+    fn page_navigation_between_images_still_builds_a_display_sequence() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![
+            GridItem::Image(PathBuf::from("c:/pages/one.png")),
+            GridItem::Image(PathBuf::from("c:/pages/two.png")),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.fullscreen_idx = Some(0);
+        app.items_generation = 12;
+
+        assert!(app.begin_fs_page_navigation_sequence(&ctx, 0, 1, true));
+
+        let target = app
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .map(|sequence| sequence.target.clone());
+        assert!(matches!(
+            target,
+            Some(FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                items_generation: 12,
+                pages,
+                phase: FsNavigationTargetPhase::Awaiting {
+                    accept_rendition: true
+                },
+            })) if pages == vec![1]
+        ));
     }
 
     #[test]
