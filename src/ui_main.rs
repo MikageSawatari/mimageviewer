@@ -10,8 +10,8 @@ use std::sync::atomic::Ordering;
 use eframe::egui;
 
 use crate::app::{
-    App, FacetField, GridClickSelectionAnchor, GridScrollIntent, LazyColumnState,
-    QuickFolderSlotId, QuickFolderSwitchTarget,
+    App, FacetField, GridClickPairingState, GridClickSelectionAnchor, GridScrollIntent,
+    LazyColumnState, QuickFolderSlotId, QuickFolderSwitchTarget,
 };
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::keymap::{KeyAction, Keymap, MenuCommandId, TopMenuId, resolve_menu_layout};
@@ -12696,12 +12696,9 @@ impl App {
         );
     }
 
-    fn begin_grid_primary_click_frame(&mut self, primary_clicked: bool) -> Option<usize> {
-        if primary_clicked {
-            self.last_primary_clicked_grid_idx.take()
-        } else {
-            self.last_primary_clicked_grid_idx
-        }
+    fn begin_grid_primary_click_frame(&mut self, primary_clicked: bool) -> GridClickPairingState {
+        self.grid_click_pairing
+            .begin_primary_click_frame(primary_clicked)
     }
 
     /// グリッドセルのクリック・ダブルクリック・右クリックを処理する。
@@ -12714,7 +12711,7 @@ impl App {
         idx: usize,
         overlay_layout: &crate::thumb_overlay_layout::ThumbnailOverlayLayout,
         touch_derived_pointer_activity: bool,
-        previous_primary_clicked_grid_idx: Option<usize>,
+        previous_grid_click_pairing: GridClickPairingState,
     ) -> Option<PathBuf> {
         // click_and_drag: clicked() / double_clicked() / secondary_clicked() は従来通り
         // 発火しつつ、drag_started_by(Primary) で native ファイル D&D を開始できる。
@@ -12803,7 +12800,6 @@ impl App {
                     .is_some_and(|pos| badge_rect.contains(pos))
             });
         let selected_before_click = self.selected == Some(idx);
-        let same_cell_as_previous_primary_click = previous_primary_clicked_grid_idx == Some(idx);
         let no_other_cell_checked_before_click =
             self.checked.iter().all(|&checked_idx| checked_idx == idx);
         let plain_click_clears_checks =
@@ -12832,16 +12828,20 @@ impl App {
             );
             self.update_last_selected_image();
         }
-        // egui counts a click as a triple when it lands within twice the double-click delay of
-        // the one before last, and `double_clicked()` is `count == 2` exactly, so the third click
-        // of a run reports itself as a triple and nothing opens. A reader who clicks again
-        // because the first attempt did nothing lands exactly there, which is what made opening
-        // look intermittent (backlog 2.6, measured 2026-08-19: releases at 165.735 / 166.384 /
-        // 166.612 with a 500ms delay - the last is 228ms after its predecessor and 877ms after
-        // the first, so egui called it a triple). Opening is what every count above one means
-        // here.
-        let double_or_triple = response.double_clicked() || response.triple_clicked();
-        let activate = (double_or_triple && same_cell_as_previous_primary_click)
+        // egui remains the owner of whether this release is a click at all. Pairing is grid-local:
+        // the same cell in the same items generation, within the OS delay installed in the ctx.
+        // We intentionally do not read egui's double/triple click count here; its triple count is
+        // meaningful for text line selection but made a completed grid activation leak into the
+        // next single click (backlog 2.6 / 2.9, measured 2026-08-19).
+        let paired_grid_click = response.clicked()
+            && self.grid_click_pairing.register_cell_click(
+                previous_grid_click_pairing,
+                idx,
+                self.items_generation,
+                ctx.input(|input| input.time),
+                ctx.options(|options| options.input_options.max_double_click_delay),
+            );
+        let activate = paired_grid_click
             || (response.clicked()
                 && grid_reclick_open_allowed(
                     selected_before_click,
@@ -12852,10 +12852,8 @@ impl App {
                     shift,
                     touch_derived_pointer_activity,
                 ));
-        // The same-cell flag must be captured before this update. Otherwise every double-click
-        // signal would compare the current cell with itself.
-        if response.clicked() {
-            self.last_primary_clicked_grid_idx = Some(idx);
+        if activate {
+            self.grid_click_pairing.end_activation();
         }
         let drag_started = response.drag_started_by(egui::PointerButton::Primary);
         let native_drag_started = native_grid_drag_start_allowed(
@@ -13398,7 +13396,7 @@ impl App {
         ctx: &egui::Context,
         scroll_to: bool,
         spread_pair_cursor_idx: Option<usize>,
-        previous_primary_clicked_grid_idx: Option<usize>,
+        previous_grid_click_pairing: GridClickPairingState,
     ) -> Option<PathBuf> {
         let horizontal_source_rect = ui.available_rect_before_wrap();
         let avail_w = horizontal_source_rect.width().max(1.0);
@@ -13544,7 +13542,7 @@ impl App {
                                 idx,
                                 &no_thumbnail_overlays,
                                 false,
-                                previous_primary_clicked_grid_idx,
+                                previous_grid_click_pairing,
                             ) {
                                 nav = Some(n);
                             }
@@ -15164,10 +15162,10 @@ impl App {
 
         egui::CentralPanel::default()
             .show(ctx, |ui| -> Option<PathBuf> {
-                // egui pairs clicks by time only. Preserve the previous cell for this frame's
-                // activation check, while clearing App state up front so any primary click that
-                // is not accepted by a cell breaks the pair.
-                let previous_primary_clicked_grid_idx = self.begin_grid_primary_click_frame(
+                // Preserve the grid-owned pending click for this frame's cell check, while
+                // clearing App state up front so a primary click not accepted by any cell breaks
+                // the pair.
+                let previous_grid_click_pairing = self.begin_grid_primary_click_frame(
                     ctx.input(|input| input.pointer.primary_clicked()),
                 );
                 // Sole MainGrid driver. Embedded still fullscreen returns
@@ -15350,7 +15348,7 @@ impl App {
                         ctx,
                         scroll_to,
                         spread_pair_cursor_idx,
-                        previous_primary_clicked_grid_idx,
+                        previous_grid_click_pairing,
                     );
                     self.begin_grid_background_pointer_trace(ctx, ui.max_rect());
                     self.finish_grid_pointer_trace(ctx);
@@ -15761,7 +15759,7 @@ impl App {
                                     idx,
                                     &overlay_layout,
                                     touch_derived_pointer_activity,
-                                    previous_primary_clicked_grid_idx,
+                                    previous_grid_click_pairing,
                                 ) {
                                     nav = Some(n);
                                 }
@@ -20939,10 +20937,9 @@ mod grid_reclick_open_tests {
             .build_state(
                 |ctx, state| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        let previous_primary_clicked_grid_idx =
-                            state.app.begin_grid_primary_click_frame(
-                                ctx.input(|input| input.pointer.primary_clicked()),
-                            );
+                        let previous_grid_click_pairing = state.app.begin_grid_primary_click_frame(
+                            ctx.input(|input| input.pointer.primary_clicked()),
+                        );
                         for idx in 0..state.app.items.len() {
                             if state
                                 .app
@@ -20953,7 +20950,7 @@ mod grid_reclick_open_tests {
                                     idx,
                                     &crate::thumb_overlay_layout::ThumbnailOverlayLayout::default(),
                                     state.touch_derived_pointer_activity,
-                                    previous_primary_clicked_grid_idx,
+                                    previous_grid_click_pairing,
                                 )
                                 .is_some()
                             {
@@ -21000,6 +20997,17 @@ mod grid_reclick_open_tests {
         harness.run();
     }
 
+    fn register_pairing_click(
+        state: &mut GridClickPairingState,
+        idx: usize,
+        items_generation: u64,
+        at: f64,
+        max_delay: f64,
+    ) -> bool {
+        let previous = state.begin_primary_click_frame(true);
+        state.register_cell_click(previous, idx, items_generation, at, max_delay)
+    }
+
     #[test]
     fn reclick_predicate_requires_every_condition() {
         assert!(grid_plain_click_clears_checks(
@@ -21032,6 +21040,22 @@ mod grid_reclick_open_tests {
         assert!(!grid_reclick_open_allowed(
             true, true, true, false, false, false, false,
         ));
+    }
+
+    #[test]
+    fn expired_click_is_replaced_and_the_next_close_click_pairs() {
+        let mut state = GridClickPairingState::default();
+        assert!(!register_pairing_click(&mut state, 0, 7, 1.0, 0.5));
+        assert!(!register_pairing_click(&mut state, 0, 7, 1.6, 0.5));
+        assert!(register_pairing_click(&mut state, 0, 7, 1.7, 0.5));
+    }
+
+    #[test]
+    fn pairing_state_requires_the_same_cell() {
+        let mut state = GridClickPairingState::default();
+        assert!(!register_pairing_click(&mut state, 0, 7, 1.0, 0.5));
+        assert!(!register_pairing_click(&mut state, 1, 7, 1.1, 0.5));
+        assert_eq!(state.pending_index_for_generation(7), Some(1));
     }
 
     #[test]
@@ -21184,7 +21208,14 @@ mod grid_reclick_open_tests {
         click_cell(&mut harness, 1, egui::Modifiers::NONE);
 
         assert_eq!(harness.state().activations, 0);
-        assert_eq!(harness.state().app.last_primary_clicked_grid_idx, Some(1));
+        assert_eq!(
+            harness
+                .state()
+                .app
+                .grid_click_pairing
+                .pending_index_for_generation(harness.state().app.items_generation),
+            Some(1)
+        );
     }
 
     #[test]
@@ -21195,8 +21226,53 @@ mod grid_reclick_open_tests {
         // the only click that the following cell click could pair with.
         harness.run_steps(40);
         click_at(&mut harness, egui::pos2(440.0, 170.0));
-        assert_eq!(harness.state().app.last_primary_clicked_grid_idx, None);
+        assert_eq!(
+            harness
+                .state()
+                .app
+                .grid_click_pairing
+                .pending_index_for_generation(harness.state().app.items_generation),
+            None
+        );
 
+        click_cell(&mut harness, 0, egui::Modifiers::NONE);
+
+        assert_eq!(harness.state().activations, 0);
+    }
+
+    #[test]
+    fn activation_ends_grid_click_pairing_run() {
+        let mut harness = handler_harness(GridClickSelectionMode::Check, false, None, false, false);
+
+        click_cell(&mut harness, 0, egui::Modifiers::NONE);
+        click_cell(&mut harness, 0, egui::Modifiers::NONE);
+        assert_eq!(harness.state().activations, 1);
+
+        // The open consumed the pair. After closing the viewer, one click starts a new run.
+        click_cell(&mut harness, 0, egui::Modifiers::NONE);
+        assert_eq!(harness.state().activations, 1);
+    }
+
+    #[test]
+    fn double_click_after_activation_starts_new_pair_and_opens() {
+        let mut harness = handler_harness(GridClickSelectionMode::Check, false, None, false, false);
+
+        click_cell(&mut harness, 0, egui::Modifiers::NONE);
+        click_cell(&mut harness, 0, egui::Modifiers::NONE);
+        assert_eq!(harness.state().activations, 1);
+
+        click_cell(&mut harness, 0, egui::Modifiers::NONE);
+        assert_eq!(harness.state().activations, 1);
+        click_cell(&mut harness, 0, egui::Modifiers::NONE);
+        assert_eq!(harness.state().activations, 2);
+    }
+
+    #[test]
+    fn items_generation_change_breaks_grid_click_pair() {
+        let mut harness = handler_harness(GridClickSelectionMode::Check, false, None, false, false);
+
+        click_cell(&mut harness, 0, egui::Modifiers::NONE);
+        harness.state_mut().app.bump_items_generation();
         click_cell(&mut harness, 0, egui::Modifiers::NONE);
 
         assert_eq!(harness.state().activations, 0);

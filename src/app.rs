@@ -8919,6 +8919,71 @@ impl GridClickSelectionAnchor {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PendingGridCellClick {
+    index: usize,
+    items_generation: u64,
+    at: f64,
+}
+
+/// グリッドセルを開くためのクリック対を所有する状態。
+///
+/// egui には click として成立したかだけを任せ、同じ一覧・同じセル・OS 由来の時間内かは
+/// この owner が判定する。起動した対を `None` に戻すことで、3 打目や fullscreen 退出後の
+/// 1 打目を前の対へ連結しない。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct GridClickPairingState {
+    pending: Option<PendingGridCellClick>,
+}
+
+impl GridClickPairingState {
+    /// primary click の frame では直前状態を一時的に取り出す。セルが `clicked()` を
+    /// 受理しなければ App 側は空のままなので、空白や別 widget の click が対を切る。
+    pub(crate) fn begin_primary_click_frame(&mut self, primary_clicked: bool) -> Self {
+        if primary_clicked {
+            std::mem::take(self)
+        } else {
+            *self
+        }
+    }
+
+    pub(crate) fn register_cell_click(
+        &mut self,
+        previous: Self,
+        index: usize,
+        items_generation: u64,
+        at: f64,
+        max_delay: f64,
+    ) -> bool {
+        let paired = previous.pending.is_some_and(|pending| {
+            pending.index == index
+                && pending.items_generation == items_generation
+                && at - pending.at < max_delay
+        });
+        // Store this click first. The caller clears it when either this pair or the independent
+        // selected-item reclick path activates the item, so every activation has one end-run
+        // transition instead of separate cleanup branches.
+        self.pending = Some(PendingGridCellClick {
+            index,
+            items_generation,
+            at,
+        });
+        paired
+    }
+
+    /// §2.5 の選択済みセル再クリックを含め、item activation は click run を終える。
+    pub(crate) fn end_activation(&mut self) {
+        self.pending = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_index_for_generation(self, items_generation: u64) -> Option<usize> {
+        self.pending
+            .filter(|pending| pending.items_generation == items_generation)
+            .map(|pending| pending.index)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GridScrollIntent {
     Top,
@@ -9181,9 +9246,7 @@ pub struct App {
     pub(crate) display_identity_error: std::cell::RefCell<Option<String>>,
     pub(crate) thumbnails: Vec<ThumbnailState>,
     pub(crate) selected: Option<usize>,
-    /// 直前に primary click を受理したグリッドセル。egui のダブルクリック判定には
-    /// 前回位置が無いため、セルを開く側で同じセルか確認する。
-    pub(crate) last_primary_clicked_grid_idx: Option<usize>,
+    pub(crate) grid_click_pairing: GridClickPairingState,
     /// Shift+クリックの起点。index と items 世代を一体で保持し、別一覧の同じ index を
     /// 誤って起点にしない。表示中の一覧コンテキストと一緒に所有・交換する。
     pub(crate) grid_click_selection_anchor: Option<GridClickSelectionAnchor>,
@@ -12896,7 +12959,7 @@ impl App {
             display_identity_error: std::cell::RefCell::new(None),
             thumbnails: Vec::new(),
             selected: None,
-            last_primary_clicked_grid_idx: None,
+            grid_click_pairing: GridClickPairingState::default(),
             grid_click_selection_anchor: None,
             settings,
             creative_lut_library,

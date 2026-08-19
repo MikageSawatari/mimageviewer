@@ -1149,6 +1149,19 @@
   300ms でも 600ms 以内に 3 回クリックすれば同じ。**§2.6 は v3.1.1 以前からあった。**
 - 修正: グリッドの起動判定を `double_clicked() || triple_clicked()` にした。
   ここでは 1 を超える count はすべて「開く」意味しか持たない。同セル条件は据え置き。
+- **2026-08-19 追補 (利用者実機確認を受けた最終修正):** 上の click count 修正は置き換えた。
+  PDF をダブルクリックで開いて Esc で閉じた直後、同じ PDF を 1 回クリックしただけで再度開いた。
+  実測では `double_clicked=false` のまま `triple_clicked()` 経由で起動しており、完了済みの対へ
+  次の単発クリックが連結されていた。
+  - グリッドは egui の click count を起動判定に使わず、`response.clicked()` で click 成立だけを
+    受け取る。同じ `items_generation`・同じセル idx・§2.9 の OS 由来時間内にある 2 click を
+    自前の単一 pairing state で対にする。item activation 後、セル以外の primary click、一覧世代変更で
+    対を切る。これにより「開く → Esc → 単発」は開かず、次の通常ダブルクリックは開く。
+  - egui 本体は変更しない。triple click は text field の行選択で使われる
+    (`text_selection/text_cursor_state.rs`) ため、グリッド widget だけが click count を読まない。
+  - `last_primary_clicked_grid_idx` は idx・世代・時刻を一体で持つ pairing state へ吸収して削除した。
+    既存 `grid_reclick_open_tests` 15 本は期待挙動を変えず通し、activation 終端・再ダブルクリック・
+    世代変更の回帰を追加した。
 
 ### 2.9 一覧のダブルクリック間隔を Windows 設定へ合わせる — 対応済み (v3.1.2、専用スレ >>253-254)
 
@@ -1181,6 +1194,12 @@
     open 判定後に行う。セル以外の primary click は記憶を消す。
   - Windows のピクセル距離は再実装しない。セル内で少し移動した 2 打目は従来どおり開ける。
     グリッド以外に残る egui の `double_clicked()` 消費箇所は §2.10 へ分離した。
+- **2026-08-19 pairing state 追補:** OS から取得して各 egui Context へ設定する時間値は維持し、
+  グリッド自身も `ctx.options(|o| o.input_options.max_double_click_delay)` から同じ値を読む。
+  一方、起動判定は egui の `double_clicked()` / `triple_clicked()` から独立させ、同一一覧世代の
+  同一セルに対する直前の `response.clicked()` とだけ対にする。対による起動、§2.5 の再クリック起動、
+  セル外 click は run を終える。egui の triple click は text field の行選択に必要なので本体側は
+  変更しない。
 - 規模 / 優先度: Small / P2。v3.1.2 対応済み。
 
 ### 2.10 グリッド以外の egui ダブルクリック消費箇所に場所条件が無い
