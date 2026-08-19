@@ -1832,6 +1832,22 @@
 
 ### 1.96 動画と画像が混在するフォルダで、動画を通過した後にキーが効かなくなる — 利用者報告
 
+- **v3.1.2 向け完了 (2026-08-19):** 原因は input permit / focus ではなく、静止画から動画へ
+  ページ移動した時点で、page renderer が描かない動画を `Display` target とする navigation sequence を
+  作っていたこと。sequence の唯一の production retire 経路は page renderer の presentation trace
+  なので、native presenter 所有の動画では `Awaiting` / `Presenting` が閉じず、
+  `blocks_new_target()` が後続の画像ナビゲーションを拒否し続けていた。
+- 当初仮説は、停止中にも Space のチェック、Esc、ルーペ ON/OFF が動くという追加報告で棄却した。
+  ルーペ操作は `handle_fs_key_input` 内の `input_permits.discrete` gate より後で消費されるため、
+  ルーペが動いた frame で gate の fail-closed return は成立していない。効かないのがカーソル 4 方向
+  だけという症状も navigation sequence の block と一致する。以下の当初記述は調査履歴として残す。
+- `begin_fs_page_navigation_sequence` は target unit の全 page が `GridItem::has_page_data` を満たす場合だけ
+  `Display` sequence を作る。動画 / 音声を含む unit は sequence を作らず直接着地し、通常の
+  画像 → 画像では従来どおり atomic display-unit sequence を維持する。`blocks_new_target()`、timeout、
+  focus、input permit、media 分岐、Ctrl+↑↓ の `FolderItems` 経路は変更していない。
+- 回帰テストは、既存の ignored test を通常実行へ戻したほか、画像 → 動画 → 画像後の次 handler
+  navigation が受理されること、画像 → 画像で `Display` sequence が作られること、既存の
+  folder navigation → 動画が wedge しないことを固定した。
 - 出典: 利用者メール (pattier、v3.1.1)。開発側でも再現済み (2026-08-19)。
 - 症状: 動画と画像が混在するフォルダを <kbd>↑</kbd> / <kbd>↓</kbd> で送っていくと、
   **画像 → 動画 → 画像 と進んだ後に次へ移れなくなる**。<kbd>Esc</kbd> では一覧へ戻れるので、
@@ -1857,6 +1873,23 @@
   §1.92 (別ウィンドウの動画再生中に外部アプリから戻ると Z だけ効かない)。
   **同型が 4 件目なので、個別のガードではなく所有権側の構造を疑うこと。**
 - 規模 / 優先度: Small〜Medium / **P2** (操作不能に見えるが Esc で脱出可能)。
+
+### 1.97 「ダウンスケール表示中」が通常の縮小表示と紛らわしい — 専用スレ >>260
+
+- 質問: フルスクリーン上部情報バーの解像度欄へ「⚠ ダウンスケール表示中」が出る場合と
+  出ない場合の違いが分かりにくい。
+- 現行の意味: 現在のズーム倍率や画面フィットによる縮小とは無関係。静止画の元画像の幅または
+  高さが GPU テクスチャ互換上限の 8192px を超え、表示用画像を長辺 8192px 以内へ縮小した場合に
+  `FsCacheEntry::Static.source_dims` と texture 寸法の差から表示している。
+- 修正方針:
+  - 表示を「⚠ GPU上限により解像度制限中」へ変更し、通常の画面フィットによる縮小ではなく、
+    GPU へ載せる表示用テクスチャの解像度を制限している状態だと明示する。
+  - 警告の黄色表示と、元画像解像度を表示する既存仕様は維持する。
+  - 発生条件は変更しない。Animated GIF / APNG / WebP、動画、PDF 等の別経路で警告を出すかは
+    今回の文言修正へ含めず、必要性が出た場合に各経路の原寸と表示 raster の契約を確認して扱う。
+- 回帰確認: 上限内 / 幅超過 / 高さ超過で marker の有無、AI 情報併記時の文字列、見開き左右の
+  情報表示、黄色 marker の切り分け描画。
+- 規模 / 優先度: Small / P3。表示文言のみ。
 
 ### 5.10 入力テストの共有ロックが poison して、失敗 1 件が全滅に見える
 
