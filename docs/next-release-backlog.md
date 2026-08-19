@@ -361,31 +361,21 @@
 - 規模 / 優先度: **残るのは §1.31-B の上限制約 = Large / P1 candidate (基盤)**。
   watchdog の穴 (Small / P2) は上記のとおり解消済み。
 
-### 1.35 リネーム移行ジャーナルの永続化 2 件
+### 1.35 リネーム移行ジャーナルの部分失敗が再試行されない
 
-- 出典: v2.9.1 出荷後の他セッションレビュー (2026-08-01、Codex)。両方とも source inspection で確認済み。
-  1. **対応済み (v2.10.0): UI スレッドでの同期 I/O (P2)**: [app.rs](../src/app.rs) の
-     `persist_rename_migration_journal` / `ensure_rename_migration_journal_loaded` は
-     `rename_key_migration::journal_save` / `journal_load` を同期で呼び、その中身は
-     `std::fs::read` / `write` / `remove_file` / `rename`。呼び出し元は
-     `poll_rename_migration_pending` などの UI スレッド経路である。小さな JSON なので通常は
-     短いが、ウイルス対策・低速ディスク・プロファイル同期の影響下では UI が止まる。
-     CLAUDE.md の「UI スレッドで同期 I/O を行わない」方針にも反する。
-     対応 = App が in-flight + queue + boot-retry の完全 snapshot を組み立てる所有境界は維持し、
-     書き出しだけを単一 latest-value worker へ移した。worker は revision 順に直列保存し、I/O 中の
-     中間 snapshot は最新値へ coalesce する。起動時 load は回復 entry を新規保存で消さない lazy guard を
-     優先して同期 1 回を維持し、通常 update の保存経路は enqueue のみ。終了時は最新 revision まで flush する。
-  2. **部分失敗が再試行されない (P2、仕様判断あり)**: worker が `panicked` を返したときだけ
-     ジョブを `rename_migration_boot_retry` へ戻す。`report.errors` に個別ストアの失敗が
-     入った場合はトーストを出すものの、ジョブは完了扱いでジャーナルから消える。一時的な
-     DB ロックや I/O エラーだと、編集結果やパス依存設定の一部が旧パスに残ったまま再起動でも
-     回復しない。
-     - **これは現状のコードコメントが明記している意図的な選択**である
-       (「per-store エラーは通常経路と同じ best-effort = 再試行しない」、v2.3.0 角度⑤ 検収時の判断)。
-       したがって着手前に「一時エラーと恒久エラーを区別できるか」「再試行の上限をどう置くか」を
-       決めること。無条件の再試行は、決定的に失敗するストアで無限ループになる。
-     - 移行処理自体は冪等に設計されているので、失敗ストアを保持して再試行する形にはできる。
-- 規模 / 優先度: 1 = Small〜Medium / P2、2 = Medium / P2 (仕様判断を先に決める)。
+- 出典: v2.9.1 出荷後の他セッションレビュー (2026-08-01、Codex)。source inspection で確認済み。
+- 機構 (仕様判断あり): worker が `panicked` を返したときだけ
+  ジョブを `rename_migration_boot_retry` へ戻す。`report.errors` に個別ストアの失敗が
+  入った場合はトーストを出すものの、ジョブは完了扱いでジャーナルから消える。一時的な
+  DB ロックや I/O エラーだと、編集結果やパス依存設定の一部が旧パスに残ったまま再起動でも
+  回復しない。
+  - **これは現状のコードコメントが明記している意図的な選択**である
+    (「per-store エラーは通常経路と同じ best-effort = 再試行しない」、v2.3.0 角度⑤ 検収時の判断)。
+    したがって着手前に「一時エラーと恒久エラーを区別できるか」「再試行の上限をどう置くか」を
+    決めること。無条件の再試行は、決定的に失敗するストアで無限ループになる。
+  - 移行処理自体は冪等に設計されているので、失敗ストアを保持して再試行する形にはできる。
+- 規模 / 優先度: Medium / P2 (仕様判断を先に決める)。もう 1 件あった「UI スレッドでの同期 I/O」は
+  v2.10.0 で latest-value worker へ移して close 済み。
 
 ### 1.36 ゲームパッドの文字入力ゲートは 3 面の union が必要 (2026-08-01 訂正)
 
@@ -408,20 +398,12 @@
   1 つの predicate test で固定し、snapshot publish が semantic event として App へ漏れないことも固定する。
 - 規模 / 優先度: Small / P2。前段差分を本訂正で置換。
 
-### 1.37 トレイ常駐再生まわりの所有境界 3 件
+### 1.37 トレイ常駐再生まわりの所有境界 2 件
 
 - 出典: v2.9.1 出荷後の他セッションレビュー (2026-08-01、ClaudeCode)。source inspection で確認済み。
   v2.9.1 で「トレイ格納中も再生を続ける」経路を新設したことで、いずれも**この版から初めて
   実際に通る**組み合わせになった。
-  1. **対応済み (v2.10.0) / P2: WM_PAINT ブリッジに背圧が無い**。[tray.rs](../src/tray.rs) の常駐ループは 50ms ごとに
-     `PostMessageW(WM_PAINT)` を投げるが、**未処理の wake を数えていない**。posted WM_PAINT は
-     無効領域由来のものと違って合体されないため、隠れている間の `App::update` が 50ms を
-     超えると投函が消費を上回る。戻り値は `let _ =` で捨てているので、スレッドの posted message
-     queue が溢れても検出できない。
-     対応 = `resident_media_wake_pending` を既存共有 atomic 群へ追加し、tray thread が false→true を
-     claim できた 1 件だけ投函、`App::update` 入口で ack する構造にした。可視化・wake 不要化・
-     `PostMessageW` 失敗では pending を reset し、失敗ログは状態変化時だけ出す。
-  2. **P3: 再生継続中に video processor cache を落とす**。
+  1. **P3: 再生継続中に video processor cache を落とす**。
      [tray_integration.rs](../src/tray_integration.rs) の `release_gpu_resources` は
      detached 早期 return より前で `release_idle_pools()` を呼び、その中の
      `processor_cache.take()` は**無条件**である (`hw_frames_pool.clear()` と
@@ -429,13 +411,14 @@
      ⚠ **呼び出し順自体は v0.9.1 (`287eea9f`, 2026-05-19) からで、v2.9.1 で動かしたわけではない**。
      新しいのは「格納中も再生が続く」ことのほうで、その結果この経路が再生中に走るようになった。
      トレイ格納の瞬間に video processor の作り直しが 1 回入るはずで、実害は小さい。
-  3. **P3: 外部 hide 検出が tray 所有権に追随していない**。[app.rs](../src/app.rs) の
+  2. **P3: 外部 hide 検出が tray 所有権に追随していない**。[app.rs](../src/app.rs) の
      `IsWindowVisible` 追従分岐は `viewer_session_is_detached_or_switching()` だけで heartbeat
      suspension を決め、`sync_media_presenter_visibility_for_tray()` /
      `sync_retained_viewport_visibility_for_tray()` を呼ばない (これらは `hide_to_tray` /
      復帰経路にしか無い)。同フレーム後半の `sync_tray_resident_media_wake()` が**値が変化した
      ときだけ**自己修復するので実害は出にくいが、hide の所有者が 2 つある状態である。
-- 規模 / 優先度: 1 = Small / P2、2 と 3 = Small / P3。
+- 規模 / 優先度: どちらも Small / P3。3 件目だった「WM_PAINT ブリッジに背圧が無い」は
+  v2.10.0 で claim / ack 構造へ変えて close 済み。
 
 ### 1.38 ネイティブ名前ダイアログが `App::update` の内側でモーダルを回す
 
@@ -453,22 +436,18 @@
   シェル rename 実行中の「変更中...」表示を復帰した。モーダル構造は変更していない。
 - 規模 / 優先度: Medium / P2 (§1.31 に合流)。残るのはモーダル span の構造だけ。
 
-### 1.39 見開き / 先読みの残り 1 件 (`9590b661` の続き)
+### 1.39 `fs_page_load_state` が PDF ページで毎フレーム String を作る (`9590b661` の続き)
 
 - 出典: v2.9.1 出荷後の他セッションレビュー (2026-08-01、ClaudeCode)。source inspection で確認済み。
-  1. **対応済み (2026-08-01)**: paged 側も `current_loading` で sibling pending を cancel した後、
-     return 前に `ensure_fs_page_load(current_idx)` で current producer を再確認する形へ統一した。
-     current が `NeedsLoad` の状態遷移テストで、cancel だけで終わらず `LoadPending` になることを固定した。
-  2. **P3: `fs_page_load_state` が PDF ページで毎フレーム String を作る**。
-     `has_retained_pdf_final_ai_for_current_params` → `retained_pdf_page_key_for` →
-     `metadata_cache_key(idx)` が String を生成し、HashMap を引く。
-     ⚠ **レビュー報告より実コストは小さい**: `effective_params` / `final_ai_key_for_pixels` は
-     retained cache に**該当エントリがあるときだけ**走る (無ければ `?` で抜ける)。
-     非 PDF は `items.get` + `matches!` で即 return なので無コスト。
-     とはいえ PDF フルスクリーンでは `update_prefetch_window` の current、prefetch ターゲット
-     全件、連結読み keep 範囲ループ全件、見開きパートナーから毎フレーム走るため、
-     key を 1 回作って使い回す形にできるかは見ておく。
-- 規模 / 優先度: 残る 2 は Small / P3。
+- 機構: `has_retained_pdf_final_ai_for_current_params` → `retained_pdf_page_key_for` →
+  `metadata_cache_key(idx)` が String を生成し、HashMap を引く。
+  ⚠ **レビュー報告より実コストは小さい**: `effective_params` / `final_ai_key_for_pixels` は
+  retained cache に**該当エントリがあるときだけ**走る (無ければ `?` で抜ける)。
+  非 PDF は `items.get` + `matches!` で即 return なので無コスト。
+  とはいえ PDF フルスクリーンでは `update_prefetch_window` の current、prefetch ターゲット
+  全件、連結読み keep 範囲ループ全件、見開きパートナーから毎フレーム走るため、
+  key を 1 回作って使い回す形にできるかは見ておく。
+- 規模 / 優先度: Small / P3。
 
 ### 1.42 右クリックメニューの表示が遅い (シェル拡張を UI スレッドで同期ロード)
 
@@ -639,106 +618,6 @@
   出るならどれかを見る。観測だけで「直った」と判断しないこと。
 - 規模 / 優先度: Small〜Medium / P2。
 
-### 1.77 連結読み中に横断方向のキーで動画へ入ると、戻れなくなる — 利用者報告
-
-- **完了 (2026-08-13、`f1bbb18a`、v3.0.0 で出荷済み):** 連結読みでは連結方向と直交する矢印キーが
-  途中の動画・音声を飛ばして次の静止画へ着地する。ホイールと同じ対象になり、「入るのに使った
-  キーが入った先では無割り当て」という状況自体へ到達しなくなった。`[FsVideo]` へ素の
-  Left / Right を足す案は採らなかった (修飾キー付き seek と紛らわしいため)。ページ単位表示と、
-  動画・音声を表示中の前後ファイル移動は従来どおり。
-  `docs/fullscreen-navigation-consistency.md` / `keymap-spec.md` / `spec.md` /
-  `manual/tut-reading.html` も同時に更新済み。
-- **2026-08-19 追記**: 本項は修正済みだったが完了印が付いていなかった。以下は当時の調査記録。
-
-- 出典: 利用者メール (pattier、2026-08-13)。連結表示 (縦連結なら左右、横連結なら上下) の
-  **連結方向と逆のキー**で表示を切り替えると、**ホイールスクロールではスキップされる動画も
-  対象になる**。その結果、動画表示から戻れなくなる。
-- **2 つの問題が重なっている。片方だけ直して終わりにしないこと。**
-  1. **一貫性**: ホイールは動画をスキップするのに、横断キーはスキップしない。
-     利用者の提案どおり「連結モードでは動画を黙ってスキップ」で揃えるのが素直
-     (連結読みは本を読む文脈で、動画は連結対象にならないため)。
-  2. **戻れない**: こちらが本体。動画へ入った後に戻れないのは、**入口を塞げば見えなくなるが
-     消えたわけではない**。同じ状態 (連結読みセッション中にメディアセッションへ遷移) に
-     到達する他の経路 (スライドショー / 連続再生 / detached / 検索結果からの遷移 /
-     ファイル一覧の更新) が無いかを列挙してから直す。
-- 未確認: 「戻れない」の具体的な失敗 (キーが効かない / 連結セッションが失われる /
-  ナビ対象が空になる) をまだ観測していない。**推測で guard を足さず、まず再現して
-  どの経路が壊れているかを特定する**こと。
-- **再現できた (2026-08-13)**。手作業ではなくアプリ内蔵ハーネスで自動再現した。
-  再現データ `C:\tmp\miv-continuous-video\` (画像 11 + 動画 1 + 画像 6)、
-  スクリプト [continuous-video-nav.rhai](../scripts/page-turn/continuous-video-nav.rhai)。
-  縦連結で `Right` を 11 回叩くと **`current_is_still_image` が false になり、動画へ入った**。
-  横断キーが動画をスキップしないことは、これで観測として確定した。
-- **「戻れない」の正体はキーの割り当ての穴だった** (`docs/keymap.ini.default` で確認):
-  **`[FsVideo]` には素の `Left` / `Right` の割り当てが 1 つも無い。**
-  Left / Right を使う動画の操作はすべて修飾キー付き (`Shift+Left` = 1 秒戻す、
-  `Ctrl+Left` = 30 秒戻す、`Ctrl+Shift+Left` = 1 フレーム戻す)。
-  ファイル移動は **`Up` / `Down` (`VideoPrevFile` / `VideoNextFile`) だけ**。
-  つまり **入るのに使ったキーが、入った先では何の意味も持たない**。
-  ライフサイクルの不具合ではなく、素の Left / Right が動画では無割り当てなだけ。
-  利用者から見れば「押しても何も起きない = 戻れない」で、報告どおりの体験になる。
-- 方針: 利用者提案どおり **連結読みでは横断キーが動画・音声をスキップする**。
-  ホイールと挙動が揃い、この状況自体が到達不能になる。
-  **`[FsVideo]` に素の Left / Right を足すのは採らない** (修飾キー付きの seek 系と
-  紛らわしく、誤爆で再生位置が飛ぶ)。
-- **ハーネスの限界 (記録)**: ネイティブ動画ウィンドウは合成キーの target registry に
-  登録されないため、**動画コンテキストのキー操作はハーネスで検証できない**
-  (`key_target satisfied=False`)。上のスクリプトも check 1 までしか自動化できていない。
-- 規模 / 優先度: Small / P2。
-
-### 1.78 動画の回転メタデータを反映して、縦長動画を正しい向きで再生する — 利用者要望
-
-- **完了 (2026-08-13、`39550ca8`、v3.0.0 で出荷済み):** `src/video/display_metadata.rs` を新設し、
-  stream side data の display matrix から回転と反転を読む。提示は既存の `Matrix3x2` /
-  `SetTransform2` の枠へ載せ、90 / 270 では表示寸法を転置する。再生・タイル表示・キャプチャ・
-  動画サムネイル (mIV 生成側) を揃え、Windows Shell API 由来のサムネイルは既に回転済みなので
-  二重回転させていない。`docs/video-architecture.md` も同時に更新済み。
-- **2026-08-19 追記**: 本項は修正済みだったが完了印が付いていなかった。以下は当時の調査記録。
-
-- 出典: 利用者メール (pattier、2026-08-13)。「サムネイルは縦長なのに、動画再生すると横で
-  再生される」。
-- **確定 (source inspection、2026-08-13)**: `src/video/` に回転メタデータを読む処理が
-  **一切無い** (`displaymatrix` / `rotate` の参照が 0 件)。一方 **サムネイルは Windows Shell API
-  (IShellItemImageFactory) が生成しており、そちらは回転を尊重する**。この非対称が
-  「サムネと再生で向きが違う」の正体。
-- 方針: FFmpeg の stream side data `AV_PKT_DATA_DISPLAYMATRIX` を読み、
-  `av_display_rotation_get()` で角度を得て提示側で適用する。0 / 90 / 180 / 270 と
-  水平反転を含む行列があり得るので、**90 度だけを特別扱いしない**。
-- 確認が要る点:
-  - 適用場所。native presenter は D3D11 / DComp 経路なので、swapchain の手前で回すのか、
-    表示変換で回すのかを決める ([video-architecture.md](video-architecture.md) を先に読む)。
-  - 回転で **表示解像度と HUD レイアウトの前提 (アスペクト・fit)** が変わる。
-    §1.47 (拡大縮小のシェーダ化) と同じ座標系に載るかを確認する。
-  - 音声モード / detached / タイル表示 / キャプチャ / サムネ生成のどこまで回すか。
-    **キャプチャした静止画の向き**も揃える必要がある。
-- 縦長動画は**スマートフォン撮影で普通に発生する** (センサーは横向きで記録し、
-  回転タグで向きを表す)。
-- **テスト素材は既にリポジトリにある (2026-08-13 に tkhd の matrix を直接読んで確認)**:
-  - `testimage/iphone/IMG_1197.MOV` — rotate=90、格納 1280×720 → 表示は 720×1280
-  - `testimage/iphone/PIR-206_3.MOV` — rotate=90、格納 640×480 → 表示は 480×640
-  - 同フォルダの他の MP4/MOV と `testimage/movie/*.mp4` は rotate=0 なので、
-    **回転 0 の回帰確認**に使える。
-- **難易度は見た目より低い (2026-08-13 の調査)**。SAR と同じ座席に座らせられる。
-  - `update_video_visual_transform` は既に **`Matrix3x2` + `SetTransform2`** で DComp へ渡して
-    おり、**M12 / M21 を 0.0 で埋めているだけ** ([render_core.rs:3406](../src/video/native_presenter/render_core.rs:3406))。
-    回転は**既にある枠の 2 フィールドを埋める**話で、シェーダも swap chain 変更も要らない。
-  - 刻みを決める純関数 `compute_video_visual_transform()` (unit test 6 件) が既にあり、
-    SAR は「display_w = surface_w × sar」でここに入っている。回転 90/270 のときに
-    表示寸法を転置し、戻り値を 2x2 へ広げる。**回転 0 で現在と完全一致することをテストで固定する。**
-  - `ffmpeg-the-third` 3.0.2 は `Stream::side_data()` / `Frame::side_data()` と
-    `Type::DisplayMatrix` を公開済み。`av_display_rotation_get` 相当 (行列の
-    `atan2(m[1], m[0])`、16.16 固定小数) は 15 行程度で自前実装できる。**新しい依存は不要。**
-  - デコードや swap chain には触らない (SAR と同じく DComp 側で 1 度だけ回る)。
-- **⚠ 二重回転の罠**: サムネイルは Windows Shell API が作っており**既に回転済み**。
-  サムネ経路・タイル一覧のサムネへ回転を適用してはいけない。回転を足すのは
-  「再生の表示」と、必要なら「キャプチャした静止画」だけ。
-- **libmpv 置き換えは採らない** (同メールの提案)。理由: ①mIV の再生は native presenter /
-  D3D11 共有サーフェス / VST3 チェーン / トレイ常駐と密結合で、エンジン差し替えは
-  再生機能の作り直しに等しい ②libmpv は既定 LGPL だが構成次第で GPL 汚染する
-  ③今回の要望 (回転) は FFmpeg 側のメタデータ 1 つで解ける。
-  GLSL ユーザーシェーダの発想自体は §1.47 と地続きなので、そちらで検討する。
-- 規模 / 優先度: Medium / P2。
-
 ### 1.79 比較表示中の元画像表示 (押している間だけ両側を元画像にする) — 利用者要望
 
 - 出典: 利用者実機確認 2026-08-13。比較 (ワイプ) 表示中に元画像表示 (`FsOriginalPreviewHold`、
@@ -844,372 +723,68 @@
 - 規模 / 優先度: Medium / P2 candidate。現在の重なりだけを座標ずらしで直す症状パッチは
   入れず、まず左上レーンの単一所有化から着手する。
 
-### 2.3 RAR が多いフォルダで、全件判定が終わるまでサムネイルが出ない — 専用スレ >>246, >>249-250
-
-- 出典: 2026-08-18 の利用者報告。ローカル上の RAR でも、フォルダを開いた直後は
-  2〜10 秒ほど形式アイコンのままで、サムネイル表示が遅いことがある。
-- **再現・計測済み**:
-  - `C:\tmp\miv-rar-thumbnail-test-100` に、30,000 entry を持ち代表画像が末尾にある
-    RAR を 30 個複製して混在させると、サムネイルが数秒遅れてまとまって出る。
-  - perf log の `nav/archive_cache_peek` は 133 RAR に対して 3,280.7 / 3,913.6 /
-    3,363.4ms。ある run ではフォルダ一覧の install 後、対応表完成まで約3.32秒、
-    最後の重い RAR のサムネイル ready まで約5.91秒だった。
-  - 同じ状態でも Enter / ダブルクリックによる RAR open は成功する。下の §2.6 とは別件。
-- 根本原因:
-  1. `start_converted_archive_cache_paths_refresh` がフォルダ内の変換対象アーカイブを
-     1 worker で順番に調べ、RAR ごとに `inspect_for_direct_read` を実行する。
-  2. 結果は全候補の確認が終わった後に 1 個の `HashMap` として UI へ届く。途中結果を
-     公開しないため、先頭の RAR の判定が終わっていてもサムネイル要求へ進めない。
-  3. `make_load_request` は `ConvertibleArchive` の対応表 entry が無い間 `None` を返すため、
-     heavy thumbnail queue 自体に要求が入らない。
-  4. `rar_loader` の完全判定 cache は 32 件なので、多数の RAR を同じ順番で再走査すると
-     folder scan / thumbnail / open 間で判定を十分再利用できない。
-     これは `(path, size, mtime)` ごとの直読み可否と集計結果をプロセス内に保持する cache で、
-     変換済み ZIP 本体を永続保存する `archive_cache.db` / `archive_cache` とは別物。ネスト RAR は
-     有効な変換済み ZIP があっても、現状は先に直読み判定を行い、非 Direct と分かってから
-     `fallback_cached_zip` へ進むため、32 件から外れた後や再起動後は全 header scan が再発する。
-- 修正方針:
-  1. 現在フォルダの各候補を `Pending / Direct / CachedZip / Unavailable` の typed state で
-     所有し、**1 件の判定完了ごとに**同世代の結果を UI へ公開する。map entry の有無だけを
-     pending / unavailable の兼用 sentinel にしない。
-  2. 可視範囲と keep range を先に判定し、残りは距離順で進める。全件完了を最初の
-     サムネイル表示条件にしない。同期 header scan を UI thread へ戻さない。
-  3. current-folder generation 内で得た RAR 判定は、そのフォルダのサムネイル要求と open
-     から再利用する。`DECISION_CACHE_CAPACITY` を単に増やすだけの修正にはしない。
-  4. フォルダ切替 / 再読み込みでは cancel と `items_generation` を照合し、旧フォルダの
-     途中結果を新しい一覧へ反映しない。既存の heavy I/O 予算を無視して候補数ぶん thread を
-     spawn しない。
-- 完了条件:
-  - 上記 stress folder で、可視 RAR のサムネイルが全133件の判定完了を待たず順次表示される。
-  - 100件程度の通常 RAR、直読み RAR、変換 cache 済み RAR、変換が必要な RAR、分割 RARを
-    混在させても、形式判定・代表サムネイル・open 結果が従来と一致する。
-  - 同一 RAR の header 判定回数を計装または test double で固定し、一覧判定直後のサムネイル
-    生成で同じ全 entry scan を繰り返さない。
-- 規模 / 優先度: 中 / P2。利用者へ「本日リリース予定版の次で対応」と回答済み。
-- **対応済み (2026-08-19、backlog 2.3 close)**:
-  - `converted_archive_cache_paths` を `Pending / Direct / CachedZip / Unavailable` の typed state
-    に変更し、未判定と判定済み利用不可を分離した。worker は候補 1 件ごとに結果を送り、UI は
-    メッセージごとに `items_generation` を検証して同世代だけを反映する。pin dependency も先に
-    逐次登録し、解決した archive key に依存する tile だけを再要求する。
-  - 判定順は spawn 時点の visible → keep → visible からの距離順。worker は従来どおり 1 本で、
-    同期 header scan を UI thread へ戻していない。スクロール後の動的な再優先化は今回見送り、
-    PDF pool の promotion に相当する仕組みが必要なら別案件で扱う。
-  - `nav/archive_cache_peek` は全体総括として維持し、逐次表示との比較用に候補ごとの
-    `nav/archive_cache_candidate` (ordinal / idx / state / 累積 ms) を追加した。
-  - isolated portable smoke (`target\portable-smoke\data`、`--perf-log`) で上記 133 RAR を
-    再計測した。visible `[0..12)` の12件は起動後 **0.801〜0.860秒**で `thumb/ready`。
-    候補 #100 は 0.787秒、最初の重い RAR である #101 は 0.892秒、#130 は 4.021秒
-    (`archive-cache-peek` worker 内の累積 3,257.5ms) だった。したがって可視12件は、残り
-    33件の判定が終わる前にすべてサムネイル化されており、従来の全133件待ちは解消した。
-  - §1.4 の重複 header scan は caller を全件監査した。folder 一覧の eligibility inspection の後、
-    thumbnail worker の代表画像選択が `enumerate_image_entries_detailed` でもう一度 RAR 全 header を
-    列挙する。これを 1 回へ統合するには `RarInspection` と thumbnail/open の列挙契約をまたぐため、
-    brief の停止条件に従い本件には押し込まなかった。今回閉じるのは全件判定待ちの表示遅延である。
-  - §2.3 の range-gated 起動へ移した際、folder-thumb pin の cascade 完了結果だけが generation 内に
-    記録されず、静止中に候補ゼロの `archive-cache-peek` worker を毎フレーム再生成していた。
-    pin root ごとに空結果を含む cascade 回答と発見済み archive key を保持し、未走査または
-    `Pending` key が残る root だけを再投入するよう修正した。items generation、pin set/remove、
-    `folder_thumb_depth` 変更で失効し、scope 外へ後回しされた `Pending` key の再試行は維持する。
-
-### 2.8 RAR の直読み判定を、安い順・可視範囲だけに絞る
-
-- 出典: §2.3 完了後の利用者との検討 (2026-08-19)。§2.3 は「全件判定を待つ表示遅延」を
-  逐次公開で解消したが、**判定そのものを folder 全体で走らせている**構造は残っている。
-- **判定表 (`converted_archive_cache_paths`) はグリッドのためだけに存在する**。本を開く経路は
-  `spawn_archive_scan` ([archive_convert.rs](../src/ui_dialogs/archive_convert.rs)) が
-  `RarInspectionOrigin::ExplicitOpen` でその 1 冊分を自前で走らせており、判定表を参照しない。
-  したがって事前判定を減らしても**開く動作は変わらない**。
-- 全走査が要る理由は 3 つのうち一部だけ:
-
-  | 生成物 | 全走査 | 使う場所 |
-  | --- | --- | --- |
-  | `decision` | entry ごとの `is_encrypted` / nested の**不在証明**だけ要る (`is_solid` と `has_encrypted_headers` はヘッダで即) | グリッド、開く判断 |
-  | `summary` (画像数 / 展開サイズ / nested 数) | 要る | 変換ダイアログ、リモートの開く導線 |
-  | `resolved_path` (分割 RAR) | **不要** (`open_for_listing` + `volume_info`、128 件の専用 cache 付き) | 全経路 |
-
-- **A: 安い順に並べ替える + キャッシュ限定要求**
-  - worker は RAR に対して先に `inspect_for_direct_read` を回してから `db.peek` を引いている。
-    peek に要るのは `resolved_path` (安いヘッダ操作) だけなので、**変換済み ZIP がある RAR でも
-    毎回全走査を払っている**。順序を入れ替えれば、既知のアーカイブは走査ゼロで解決する。
-  - `Pending` の間も **cache-only の load request** を組む。thumbnail の cache key は
-    `convertible_archive_cache_base_key(path, format, ...)` で **RAR 自身のパスと形式**から作られ、
-    `mtime` / `file_size` も RAR 自身のものなので、解決後のパスは cache 参照に不要。ヒットすれば
-    即表示、ミスならアーカイブを開かず判定完了を待つ。P キーでピンした RAR の待ちもこれで消える。
-- **B: 候補を可視範囲 + 先読み範囲に絞る**
-  - 候補集合を「可視 + keep range + それらのピン依存先」にし、範囲が動いたら追加投入する。
-    スクロール中は既存の `decide_prefetch_allowed` と同じ抑制に乗せる。
-  - **例外**: ロールアップする編集ファセット絞り込み (`has_rollup_edit_filter`) が有効なときは、
-    範囲外コンテナを分類できないと絞り込み結果が不完全になり、スクロールで一覧が変わって
-    見える。この場合は従来どおり folder 全体を判定する。
-  - 他の消費者 (色フィルタ / スマートフォルダ / サブ展開 / 右クリックメニュー) は 1 項目ごとの
-    解決しか要求していないことを確認済み。
-- 期待する効果: 未知 RAR 133 本のフォルダで可視 12 本 + 先読み分だけの判定になり、2 回目以降は
-  走査ゼロ。待つ場所が「フォルダを開いた瞬間に全部」から「その本を開いた瞬間に 1 冊」へ移る。
-- §2.7 (header の二重走査) は**これで消えない**。走る回数が減るだけなので別項のまま残す。
-- 規模 / 優先度: A = 小〜中、B = 中 / P2。v3.1.2 で両方入れる (利用者判断 2026-08-19)。
-- **対応済み (2026-08-19、backlog 2.8 close)**:
-  - **A**: RAR は volume header 解決 → `archive_cache.db::peek` → miss 時だけ full inspection の
-    順に変更した。変換済み ZIP hit は `rar/inspection_begin` を出さない。これに伴い、
-    **直読み可能かつ変換済み ZIP も持つ RAR は `Direct` ではなく `CachedZip` を選ぶ**。
-    これは mtime/size 検証済み cache を先に使う意図した挙動変更として unit test で固定した。
-    `LoadRequest` の旧 `skip_cache: bool` は `CacheOrSource / CacheOnly / SourceOnly` の typed policy に
-    置き換え、`Pending` archive とその pin key は cache-only hit を判定完了前に表示する。
-    cache-only miss は元 archive を開かず、判定 publish まで tile を再投入しない。
-  - **B**: generation 開始時の全候補 `Pending` 登録と worker scope を分離し、通常は可視 + keep set +
-    その item の pin 依存先だけを投入する。range 移動中も共有 desired scope を更新し、旧 range の
-    queued 候補は skip、既に開始済みの in-flight 1 冊だけ完了を採用する。batch 終了後は新 range の
-    未解決 key だけを追加する。投入は既存 `decide_prefetch_allowed` の scroll/visible/backstop gate を
-    共有する。`has_rollup_edit_filter()` のときだけ Details view を含め folder 全体を判定する。
-  - focused regression は cheap-first / `CachedZip` 優先 / cache-only hit・miss / Pending pin /
-    `Unavailable` / range 外 Pending / range 進入 / scroll block / rollup 全体 scope を固定した。
-    §2.3 の逐次結果、pin dependency、rollup rebuild テストもそのまま通る。§2.7 は未変更で開いたまま。
-  - `C:	mpmiv-rar-thumbnail-test-100` を `1400x860` の isolated portable smoke
-    (`targetportable-smokedata`、`--perf-log`) で再計測した。**cold** は 133 RAR 中、
-    visible + keep の idx 0〜39 に当たる **40 候補だけ**が
-    `nav/archive_cache_candidate` / `rar/inspection_begin` を出し、可視 idx 0〜11 の
-    `thumb/ready` は起動後 **0.878〜0.926秒**。従来 `2.3 の全 133 候補に対する
-    0.801〜0.860秒 / 候補 #130 が 4.021秒という batch は、先頭 40 件で終わるようになった。
-  - **warm** は同じ isolated profile の idx 0〜39 に実際の変換 ZIP と
-    `archive_cache.db` 行を用意した。40 候補すべてが `CachedZip` となり、
-    `rar/inspection_begin` は **0 件**、可視 12 件の `thumb/ready` は
-    **0.790〜0.857秒**だった。cold / warm とも folder 全体の残り 93 RAR は未判定のまま。
-
 ### 2.7 RAR の header 全走査が、一覧判定とサムネイル生成で 2 回走る
 
-- 出典: §2.3 の caller 監査 (2026-08-19)。§2.3 の brief §1.4 として着手したが、範囲が
-  1.1-1.3 を超えると判断して停止条件どおり切り出した。**§2.3 が閉じたのは「全件判定を
-  待つ表示遅延」であって、判定そのものの重複ではない。**
+- 出典: v3.1.2 で入れた RAR 判定の逐次公開 (旧 §2.3) の caller 監査 (2026-08-19)。その brief の
+  §1.4 として着手したが、範囲を超えると判断して停止条件どおり切り出した。**v3.1.2 で閉じたのは
+  「全件判定を待つ表示遅延」であって、判定そのものの重複ではない。**
 - 機構: フォルダ一覧の eligibility 判定が `inspect_for_direct_read_cancelable` で RAR の
   header を全走査した後、thumbnail worker の代表画像選択が
   `enumerate_image_entries_detailed` で**同じ RAR の header をもう一度全部**列挙する。
   30,000 entry 級の RAR が多いフォルダでは、この 2 回目がそのまま体感時間に乗る。
 - なぜ今回入れなかったか: 1 回へ統合するには `RarInspection` が entry / 代表情報を保持し、
-  thumbnail と open 双方の列挙契約を変える必要がある。§2.3 の逐次公開とは独立した変更で、
+  thumbnail と open 双方の列挙契約を変える必要がある。逐次公開とは独立した変更で、
   同じ commit に混ぜると切り分けられなくなる。
 - 直す方向:
   - `rar_loader` の判定結果が、そのフォルダ generation の間だけ代表画像選択に必要な情報も
     持つようにする。`DECISION_CACHE_CAPACITY` (32、full inspection 保持) を単に増やす修正には
     しない。メモリが増えるだけで、判定回数は減らない。
   - 統合後は **同一 RAR の header 判定回数を計装または test double で 1 回に固定する**
-    (§2.3 の完了条件として書かれていた項目をここへ引き継ぐ)。
+    (逐次公開側の完了条件として書かれていた項目をここへ引き継ぐ)。
 - 計測の起点: `C:\tmp\miv-rar-thumbnail-test-100` (30,000 entry の RAR を 30 個複製)。
-  §2.3 後の実測は visible 12 件が 0.801〜0.860 秒、候補 #130 が 4.021 秒
+  v3.1.2 時点の実測は visible 12 件が 0.801〜0.860 秒、候補 #130 が 4.021 秒
   (worker 累積 3,257.5ms)。2 回目の走査を消せばここがさらに下がるはず。
 - 規模 / 優先度: 中 / P2。表示は既に出るようになったので体感の急所ではないが、
   同じ I/O を 2 回やっている事実は残っている。
 
-### 2.5 選択済み項目を、修飾なしの再クリックで開く — 専用スレ >>246
-
-- 要望: 一覧で現在選択されている項目をもう一度シングルクリックしたとき、Enter /
-  ダブルクリックと同じ open を実行する。
-- 仕様:
-  - current click の選択処理前に、そのセルが既に `selected` だったかを snapshot する。
-    1 回目のクリックで選択された直後に同じ click で開かない。
-  - 修飾なしの primary mouse click だけを対象にする。Ctrl / Shift、右クリック、タグバッジ、
-    drag 開始、ダイアログで open が抑止されている状態では発火しない。
-  - Explorer 方式を対象とする。チェック方式で checked set を変更するクリックは従来どおり
-    選択操作として扱い、open に変えない。
-  - touch-derived pointer は対象外とし、`touch-support-plan.md` §5.8 の「再タップ open は
-    入れない」を維持する。
-  - 同じ pointer release が egui の `double_clicked()` でもある場合、open は 1 回だけ実行する。
-    item 種別ごとの open 分岐を複製せず、既存の Enter / ダブルクリックと同じ activation
-    boundary へ合流させる。
-- 回帰確認: Folder / ZIP / PDF / 直読み RAR / 変換対象アーカイブ / Image / Video、
-  Ctrl・Shift 選択、native D&D、タグバッジ、touch tap。
-- 規模 / 優先度: 小〜中 / P2。利用者へ「本日リリース予定版の次で対応」と回答済み。
-- **完了 (2026-08-18):** クリック前の `selected` snapshot と既存の
-  `double_clicked()` を 1 つの activation 述語に合流させた。item 種別ごとの open
-  分岐は複製していない。純関数の全条件、初回 / 再クリック、Ctrl / Shift、
-  チェック方式、ダブルクリック、ダイアログ、touch-derived pointer の handler-level
-  回帰テストを追加して閉じた。Shift 範囲 / Ctrl 複数選択の現在セルを通常クリックした場合は
-  open せず単一選択へ畳み、Ctrl で作った単一選択の再クリックは open することも固定した。
-- **追補 (2026-08-19):** 利用者判断で「選択済み項目をもう一度クリックすると開く」を
-  環境設定 → 表示 → サムネイルの「一覧のクリック選択」節へ追加し、既定を OFF にした。
-  OFF では v3.1.1 と同じく再クリックを選択操作だけとして扱い、希望する利用者だけが ON にする。
-  フォルダ / アーカイブだけを対象にする案は、画像のみフォルダを本として開く設定により、同じ
-  フォルダ種別でも中身と設定次第でクリックの意味が変わって予測不能になるため採用しない。
-- **実機確認からの追補 (2026-08-19):** v3.1.2 の端末確認がチェック方式だったため、
-  Explorer 限定 gate により設定を ON にしても再クリック open が発火しないと判明した。
-  利用者判断で方式限定をやめ、両方式で有効にした。`no_other_cell_checked` による veto は
-  「その方式の名前」ではなく「修飾なしクリックが他のチェックを消して単一選択へ畳むか」で
-  決める。Explorer の通常クリックは `checked.clear()` を通るため他のチェックがあれば open
-  せず畳み、チェック方式の通常クリックはチェックを変更しないため他のチェックがあっても
-  open する。設定 OFF、修飾キー、touch-derived pointer の扱いは変更しない。
-
-### 2.6 ZIP / RAR のダブルクリックが時々無反応 — 未再現、専用スレ >>246, >>249-250
+### 2.6 ZIP / RAR のダブルクリックが時々無反応 — 原因確定・修正済み、利用者の確認待ち
 
 - 報告条件: サムネイル表示、ZIP / RAR、Enter では開ける。最初のダブルクリックでは開かず、
   そのまま待つだけでも開かないが、しばらくして再度ダブルクリックすると開くことがある
   (専用スレ >>257 で訂正)。RAR はローカル上の直読み対象。
-- **2026-08-18 時点では未再現**。§2.3 の stress folder でサムネイルが約6秒遅れる状態でも
-  ダブルクリック open は成立したため、RARサムネイル遅延をこの不具合の原因と決めない。
-- **追加の極端条件でも未再現**:
-  - `C:\tmp\miv-rar-decision-cache-stress\01-direct-64x-120000` に、各12万 entry の
-    直読み可能 RAR を判定 cache 上限の2倍に当たる64個配置した。
-  - `03-mixed-128x-120000` には、各12万 entry の直読み可能 RAR 64個と、末尾にネスト
-    archive を置いて最後まで走査しないと非 Direct と確定しない RAR 64個を混在させた。
-    フォルダ判定 worker と明示 open が同じフォルダで並行する条件でも、初回無反応後に
-    再度ダブルクリックすると開く症状は再現しなかった。別フォルダ間の移動は旧 worker を cancel するので再現条件に
-    数えない。
-  - この結果から hidden scan には独立した性能改善余地があるものの、ローカル実機での
-    ダブルクリック症状の主原因とは扱わない。さらに人工的な entry 数だけを増やさず、
-    報告環境の診断ログで「入力未成立 / accepted 後の待機」を分離する。
-- コード上の確認候補:
-  1. サムネイル比率が `自動` のとき、2 click の間に実際の cell height / scroll offset が
-     変わると、2 回目が別セルまたは余白へ当たり得る。判定結果が同じ比率で配置が変わらない
-     場合は原因にならない。
-  2. セル全体が `Sense::click_and_drag()` なので、小さな pointer 移動で2回目が native D&D
-     開始へ変わる可能性がある。
-  3. タグバッジの hit-test は item open より先に処理される。ダイアログ / context menu が
-     open の場合も `grid_open_from_click_allowed` が item open を止める。
-  4. RAR open 自体は direct-read 可否の hidden scan を開始する。重い RAR では無反応に見え得るが、
-     click が成立していれば再操作なしで scan 完了後に開くはずなので区別する。
-- 利用者から確認済み: フル機能ウィンドウ、1 click目で選択枠あり、症状発生時にセル比率・
-  位置の切替なし。起動直後か操作後かは特定できていない。
-- **2026-08-19: 計装入り版を実装済み。症状修正ではなく、報告環境の診断 ZIP 待ち。**
-  高頻度イベントを常時出さず、性能ログ ON のときだけ pointer 操作と archive request の
-  境界を同一 `input_seq` で相関する。物理 primary press を起点にするため、調査対象である
-  `clicked` / `double_clicked` が成立しなかった操作も記録に残る。
-  1. cell の first click / `double_clicked` / `drag_started` と idx、item key、pointer position、
-     current folder / `items_generation`。
-  2. `grid_open_from_click_allowed` の結果。拒否時は modal / context menu / badge hit / D&D 等を
-     構造化した block reason で記録し、単なる bool や自由文だけにしない。
-  3. activation 要求の accepted / ignored、所有者、item kind、dispatch 完了。
-  4. RAR inspection の begin / decision-cache hit・miss / end / cancel / error。elapsed、走査 entry
-     数、Direct / Solid / Nested / Encrypted、folder 判定 worker と明示 open の呼出元を記録する。
-     entry ごとのイベントは出さない。
-  5. `pending_direct_nav` publish / consume、RAR image enumeration の begin / end、一覧 install、
-     自動 fullscreen 要求 / paint を同じ相関 id で追えるようにする。
-  6. auto-aspect の実切替 old/new と、その frame の pointer stream 状態。
-- ログの読み方:
-  - 1 回目 / 2 回目の各物理 press は `grid/pointer_press` から始まり、同じ `seq` の
-    `grid/cell_signal`、`grid/open_gate`、`grid/activation_request`、`grid/pointer_release` を追う。
-    2 回目に `double_clicked=false`、または `accepted=false` / `ignored_reason=no_cell_signal`
-    なら入力未成立側。`block_reason` は `modal_dialog` / `context_menu` / `badge_hit` /
-    `native_drag_drop` の閉じた値で、自由文ではない。
-  - `cell_signal` は成功 / 失敗を問わず `time_since_last_click`、`max_double_click_delay`、
-    `clicked_by_primary`、`double_clicked_by_primary` を持つ。失敗例だけに限定せず、同じ session の
+- **原因確定 (2026-08-19、報告環境の perf log)**: egui は
+  `count = if triple_click { 3 } else if double_click { 2 } else { 1 }` で数え、`is_double()` は
+  **`count == 2` の完全一致**。`triple_click` は `max_double_click_delay * 2` を**前々回のクリック**から
+  測る (`egui-0.33.3/src/input_state/mod.rs:1213-1222`, `1006-1011`)。つまり **3 回目のクリックは
+  triple になり `double_clicked()` が false になる**。1 回目で開かなかった利用者はもう一度
+  クリックするので、その 3 回目がちょうどここに落ちていた。
+  - 実測 (idx 9、同一セル、同一座標): 離す時刻 165.735 / 166.384 / 166.612。3 回目は前回から
+    **228ms** で double 成立圏内だが、前々回から **877ms** で `2 x 500ms` の内側 → triple 判定。
+    同 session の成功例は 400ms 間隔の 2 回目。**400ms が成立して 228ms が成立しない**という
+    逆転がこれで説明できる。
+  - v3.1.2 のダブルクリック時間の OS 追従はこれを**悪化させた** (triple 窓 600ms → 1000ms) が、
+    原因ではない。300ms でも 600ms 以内に 3 回クリックすれば同じで、**本項は v3.1.1 以前からあった**。
+- **修正 (v3.1.2)**: グリッドは egui の click count を起動判定に使わず、`response.clicked()` で
+  click 成立だけを受け取る。同じ `items_generation`・同じセル idx・OS 由来のダブルクリック時間内に
+  ある 2 click を自前の単一 pairing state で対にし、item activation 後・セル以外の primary click・
+  一覧世代変更で対を切る。「開く → Esc → 単発クリック」で再度開いてしまう追補も同時に閉じた。
+  egui 本体は変更していない (triple click は text field の行選択が使うため)。
+- **状態: 利用者の再確認待ち**。再発報告が来なければ close する。再発した場合に使える観測手段:
+  - `grid/cell_signal` が成功 / 失敗を問わず `time_since_last_click`、`max_double_click_delay`、
+    `clicked_by_primary`、`double_clicked_by_primary` を出す。失敗例だけを見ず、同じ session の
     成功例を control として比較する。
-  - `time_since_last_click` が実測間隔と一致し、`max_double_click_delay` がそれより大きいのに
-    `double_clicked_by_primary=false` なら egui の判定と矛盾するため、pass 構成や widget id を疑う。
-  - `time_since_last_click` が実測間隔より大きいなら、直前のクリックが egui の
-    `last_click_time` を更新していない。特に `clicked_by_primary=false` かつ `first_click=true` なら
-    fake primary click 由来で、pointer click として成立していない可能性が本命になる。
-  - `max_double_click_delay=0.3` のままなら、§2.9 の設定がその egui Context へ届いていない。
-  - `grid/activation_request accepted=true` と `grid/activation_dispatch_complete` がある場合は、
-    同じ `seq` と archive key で `rar/inspection_begin` → `rar/decision_cache_hit|miss` →
-    `rar/inspection_end|cancel|error` を追う。`inspection_end` は `origin`、`ms`、
-    `scanned_entries`、`decision=Direct|Solid|Nested|Encrypted` を持つため、accepted 後の
-    RAR 判定待ちを入力未成立と分離できる。
-  - Direct 判定後は同じ `seq` の `archive/pending_direct_nav_publish` / `consume`、
-    `rar/image_enumeration_begin` / `end|error`、`archive/items_installed`、設定が有効なら
-    `archive/auto_fullscreen_request` / `paint` を追う。`nav/archive_cache_candidate` とは
-    normalized archive key で突き合わせる。
-  - 実切替があった場合だけ `grid/auto_aspect_switch` が old / new と press 中か idle かを記録する。
-- **診断 ZIP の終端保証も同時に直す**:
-  - 現在の perf log は64KiB `BufWriter`で、App frameから約1秒ごとに flush しているが、
-    `diagnostics::export_diagnostics_zip` は直前 flush をせずログファイルを読んでいる。そのため
-    通常はボタン直前の約1秒分、UI sleep中にworker eventだけが追加された場合は次のframeまでの
-    未flush分が ZIP に入らない可能性がある。
-  - 「ログを zip にする」受付を perf event に記録し、`perf::flush()` と `logger::flush()` が
-    完了してから logs を読み込む。受付イベントを ZIP 内ログの明確な終端 witness とする。
-  - 診断 ZIP に含める perf log は現行 `perf_events.jsonl` のみで、rotate 済み `.1`〜`.4` は
-    従来どおり除外する。UIにも「性能ログONは次回起動から」「再現後は再起動せずZIP化」を
-    維持し、実装テストでは64KiB未満の未flushデータも ZIP に含まれることを確認する。
-  - 実装済みの終端 witness は `diagnostics/export_requested`。ZIP 内の
-    `perf_events.jsonl` にこの event があれば、その直前までの worker / pointer event が
-    flush 済みである。rotate 済み `perf_events.1.jsonl`〜`.4` は従来どおり含めない。
-- 計装入り版で利用者へ依頼する手順: 開発者で性能ログON → 再起動 → 症状再現 → **再起動せず**
-  「ログを zip にする」→作成された診断 ZIP を送付。ログにはファイル名 / path が含まれる
-  既存注意書きも案内する。
-- **§2.5 の再クリック open で症状が見えなくなっても、本項を解決扱いにしない。** 既存の
-  ダブルクリック経路は独立して診断し、根本原因が判明してから修正・回帰テストを入れる。
-- **2026-08-19: 報告環境の perf log で症状を捕捉したが、本項は未解決のまま。** PDF を Esc で
-  閉じた直後、アイドル高画質化中に同じ PDF タイル (idx 9) を 3 回クリックし、3 回とも
-  `first_click=true` / `double_clicked=false` だった。2 回目の release から 3 回目の release まで
-  228ms なのに成立せず、同じ session の idx 12 では 400ms 間隔で `double_clicked=true` が
-  成立した。実機の `GetDoubleClickTime()` は 500ms であり、228ms は egui 既定 300ms の内側でも
-  ある。位置も同じセル内なので、最近変更した時間閾値と same-cell / 距離条件は原因ではない。
-  egui が直前のクリックを `last_click_time` へ数えていない可能性を次に観測する。
-- この観測のため、既存 `grid/cell_signal` へ上記 4 属性を無条件追加した。新しいイベントや
-  発火条件は増やさず、成功クリックも同じ属性を出して比較対象にする。原因が確定するまで
-  guard / retry / 閾値再調整などの症状修正は行わない。
-- 優先度: P2 調査。計装と診断 ZIP flush、egui click-count 観測属性は実装済み。
-  **エントリは閉じず、追加属性を含む報告環境のログ待ち**。
-
-- **原因確定 (2026-08-19、実機 perf log)。§2.6 の「時々無反応」はこれだった:**
-  egui は `count = if triple_click { 3 } else if double_click { 2 } else { 1 }` で数え、
-  `is_double()` は **`count == 2` の完全一致**。`triple_click` は
-  **`max_double_click_delay * 2` を「前々回のクリック」から測る**
-  (`egui-0.33.3/src/input_state/mod.rs:1213-1222`, `1006-1011`)。
-  つまり **3 回目のクリックは triple になり、`double_clicked()` が false になる**。
-- 実測ログ (idx 9、同一セル、同一座標): 離す時刻 165.735 / 166.384 / 166.612。
-  3 回目は前回から **228ms** (double 成立) だが、前々回から **877ms** で
-  `2 x 500ms = 1000ms` の内側 → **triple 判定 → 何も開かない**。
-  同 session の成功例は 400ms 間隔の 2 回目 (`double_clicked: true`)。
-  **400ms が成立して 228ms が成立しない**という逆転がこれで説明できる。
-- **1 回目が開かなかった利用者はもう一度クリックする。その 3 回目がちょうどここに落ちる。**
-  「何度かやると反応する」はクリック回数の位相の問題だった。
-- §2.9 はこれを**悪化させた** (triple 窓が 600ms → 1000ms)。ただし原因ではなく、
-  300ms でも 600ms 以内に 3 回クリックすれば同じ。**§2.6 は v3.1.1 以前からあった。**
-- 修正: グリッドの起動判定を `double_clicked() || triple_clicked()` にした。
-  ここでは 1 を超える count はすべて「開く」意味しか持たない。同セル条件は据え置き。
-- **2026-08-19 追補 (利用者実機確認を受けた最終修正):** 上の click count 修正は置き換えた。
-  PDF をダブルクリックで開いて Esc で閉じた直後、同じ PDF を 1 回クリックしただけで再度開いた。
-  実測では `double_clicked=false` のまま `triple_clicked()` 経由で起動しており、完了済みの対へ
-  次の単発クリックが連結されていた。
-  - グリッドは egui の click count を起動判定に使わず、`response.clicked()` で click 成立だけを
-    受け取る。同じ `items_generation`・同じセル idx・§2.9 の OS 由来時間内にある 2 click を
-    自前の単一 pairing state で対にする。item activation 後、セル以外の primary click、一覧世代変更で
-    対を切る。これにより「開く → Esc → 単発」は開かず、次の通常ダブルクリックは開く。
-  - egui 本体は変更しない。triple click は text field の行選択で使われる
-    (`text_selection/text_cursor_state.rs`) ため、グリッド widget だけが click count を読まない。
-  - `last_primary_clicked_grid_idx` は idx・世代・時刻を一体で持つ pairing state へ吸収して削除した。
-    既存 `grid_reclick_open_tests` 15 本は期待挙動を変えず通し、activation 終端・再ダブルクリック・
-    世代変更の回帰を追加した。
-
-### 2.9 一覧のダブルクリック間隔を Windows 設定へ合わせる — 対応済み (v3.1.2、専用スレ >>253-254)
-
-- 要望: 一覧のダブルクリック判定が Windows より厳しく、約0.19秒以内でないと成立しないように
-  感じるとの報告。コード確認では egui 既定の300ms固定で、Windows側の設定値を参照していない。
-- 方針:
-  - アプリ起動時に Win32 `GetDoubleClickTime` からシステムのダブルクリック時間を取得し、
-    egui の `InputOptions::max_double_click_delay` へ反映する。
-  - 取得失敗時と Windows 以外では現在相当の300msを fallback とし、Windows設定を上書きしない。
-  - メイン一覧だけの独自判定を足さず、同じ egui context を使うクリック面へ一貫して反映する。
-  - §2.6 の「時々無反応」とは分離する。時間設定を合わせても、報告環境で起きる入力未成立の
-    根本原因が解決したとは扱わず、診断ログ待ちを継続する。
-- 回帰確認: Windows設定の短い値 / 長い値、閾値直前 / 直後、single click / double click、
-  touch-derived pointer、§2.5 の選択済み再クリック open。
-- **2026-08-19 実装結果**:
-  - Win32 `GetDoubleClickTime` を起動時に 1 回だけ読み、`0` は egui 既定相当の 300ms へ
-    fallback、それ以外は上限・下限を設けず秒へ変換する。
-  - production の click 入力を受ける `egui::Context` 生成経路は 2 系統。eframe の共有 context
-    (メイン / フルスクリーン viewport / detached viewport) と native video presenter の
-    HUD/overlay context の両方へ、起動時に取得した同じ値を適用する。
-  - Windows 以外は egui 既定の 300ms を変更しない。セッション中の OS 設定変更には追随せず、
-    再起動時に反映する。
-  - §2.6 は最有力仮説との位置付けに留め、未解決・診断ログ待ちのまま維持する。
-- **2026-08-19 追補 (利用者の v2.9 実機確認)**:
-  - egui 0.33.3 はクリック間の時間だけを保持し、前回クリック位置を保持しない。一方 Windows は
-    `GetDoubleClickTime` と `SM_CXDOUBLECLK` / `SM_CYDOUBLECLK` の両方でクリックを組にする。
-    §2.9 で時間を OS 設定へ合わせた判断は維持し、不足していた場所条件を一覧セル側へ追加した。
-  - グリッドの `response.double_clicked()` は、直前に primary click を受理したセルの idx が同じ場合
-    だけ open として扱う。前回 idx は選択変更前に読み、今回の `response.clicked()` による更新は
-    open 判定後に行う。セル以外の primary click は記憶を消す。
-  - Windows のピクセル距離は再実装しない。セル内で少し移動した 2 打目は従来どおり開ける。
-    グリッド以外に残る egui の `double_clicked()` 消費箇所は §2.10 へ分離した。
-- **2026-08-19 pairing state 追補:** OS から取得して各 egui Context へ設定する時間値は維持し、
-  グリッド自身も `ctx.options(|o| o.input_options.max_double_click_delay)` から同じ値を読む。
-  一方、起動判定は egui の `double_clicked()` / `triple_clicked()` から独立させ、同一一覧世代の
-  同一セルに対する直前の `response.clicked()` とだけ対にする。対による起動、§2.5 の再クリック起動、
-  セル外 click は run を終える。egui の triple click は text field の行選択に必要なので本体側は
-  変更しない。
-- 規模 / 優先度: Small / P2。v3.1.2 対応済み。
+  - `grid/activation_request accepted=true` と `grid/activation_dispatch_complete` があれば click は
+    成立しているので、以降の dispatch / open 側を疑う。`double_clicked_by_primary=false` かつ
+    `first_click=true` なら pointer click として成立していない側を疑う。
+  - 依頼手順: 開発者で性能ログ ON → 再起動 → 症状再現 → **再起動せず**「ログを zip にする」→
+    診断 ZIP を送付。ログにファイル名 / path が含まれる既存の注意書きも案内する。
+- 優先度: P2。原因が確定するまで guard / retry / 閾値再調整の症状修正を入れなかった方針は、
+  再発時も維持する。
 
 ### 2.10 グリッド以外の egui ダブルクリック消費箇所に場所条件が無い
 
-- 出典: §2.9 追補の `Response::double_clicked()` 全箇所棚卸し (2026-08-19)。egui 0.33.3 は
+- 出典: v3.1.2 のダブルクリック対応の追補として行った `Response::double_clicked()` 全箇所棚卸し
+  (2026-08-19)。egui 0.33.3 は
   前回クリック位置を持たないため、同じ context 内の離れた widget / 領域のクリックも時間内なら
   ダブルクリックとして各 consumer へ届き得る。
 - 今回は利用者報告のあったグリッドセルだけを修正し、本項の consumer は変更しない。現存する
@@ -1225,7 +800,7 @@
 
 - 出典: 同じメール往復。こちらから代替案として提案し利用者も歓迎したが、**利用者の実際の
   使い方 (参照は一時的で、タグを付けても後から参照しないことが多い) とは噛み合わない**ため、
-  §2.3 を優先すると回答した。
+  RAR フォルダのサムネイル表示遅延 (v3.1.2 で対応済み) を優先すると回答した。
 - 位置づけ: 外部ツールで抽出した結果を mIV へ持ち込む導線としては筋が良い。単独では需要が
   薄いので、タグ運用側の要望が別に出たときに合わせて再判断する。
 - 実装するときの前提 (利用者へ明言済み): **明示的な「取り込み」操作のときだけ動く**こと。
@@ -1261,9 +836,10 @@
 
 ### 3.3 ページ送り中の AI アップスケールを待たない / 打ち切る
 
-- 出典: §1.89 の実 perf log。見開き 1 ページずらしの停止中に AI upscale 1.3s × 3 回が
+- 出典: 元画像プレビュー中の見開き 1 ページずらし停止 (2026-08-17 修正済み) の実 perf log。
+  停止中に AI upscale 1.3s × 3 回が
   逐次実行され、5.22s / 4.30s の停止時間の大半を占めた。
-- §1.89 は「元画像を描く frame が加工済み source を readiness として待つ」不整合だけを修正した。
+- その修正は「元画像を描く frame が加工済み source を readiness として待つ」不整合だけを直した。
   AI コストそのものは変更しておらず、元画像表示以外でも通過先 / stale target の推論待ちが起こり得る。
 - 方針: ページ送りで表示 target から外れた AI upscale を待たず、context-owned producer の cancel / 打切りと
   着地点だけの再開を ownership・generation・完了回収まで含めて設計する。時間窓や `Awaiting` の強制解除、
@@ -1271,122 +847,6 @@
 - 規模 / 優先度: 中 / P2 performance。
 
 ## 4. 入力カスタマイズ / マウス / ゲームパッド
-
-### 4.2 音声モードから戻る Z が 1 回だけ効かなかった (未再現・報告者の追加情報待ち)
-
-- 出典: 利用者メール (pattier)、v2.10.0 で確認。
-- 経緯: v2.9.1 で毎回再現していた「音声モード中の Z で動画表示へ戻れない」は、`713d36bf`
-  (キーエッジに送信元 HWND / viewport を持たせた) で解消し、v2.10.0 では戻れる。ただし
-  利用者の試用中に **1 回だけ**戻れない状態が起き、その後は再現していない。
-- 確定している事実 (利用者による切り分け): ツールチップに `(Z)` が出る = 割り当ては生きて
-  いる。「動画表示に戻る」ボタンの表示条件は `video_audio_mode == Some(fs_idx)` なので、
-  ボタンが見えて効いた時点で **キー側 exit の判定条件も成立していた**。状態ではなく入力
-  経路の問題として扱う。
-- 候補 (再現時に Z 以外のキーも効かないかで割れる):
-  - (A) フルスクリーン viewport がフォーカスを持っていない → `handle_fs_key_input` 冒頭の
-    `has_focus` 判定で全ショートカットが早期 return する。Z 以外も効かない。
-  - (B) 同一フレームで Z が別の consumer に取られた → Z は画像フルスクリーンの `FsZoomMode`
-    の既定でもあり、音楽ビューでの取り合いは過去にも起きて明示的に除外した経緯がある
-    (`ui_fullscreen.rs` の fs_zoom ラッチ除外コメント)。Z だけ効かない。
-- 依頼済み: 再現したら (a) mIV ウィンドウの余白を 1 回クリックして復帰するか (b) そのとき
-  Z 以外のキー ([Space] など) も効かなかったか (c) 直前に別ウィンドウ / タスクバーを
-  クリックしていないか。
-- ~~優先度: P3 / 再現待ち。**報告が来るまで着手しない** (ユーザー判断 2026-08-02)。~~
-
-### 4.2 の更新 (2026-08-17) — 「1 回だけ」ではなく常時再現。着手可能になった ⚠️
-
-§1.31-A の実機確認中に開発機で再現し、**追加情報を待たずに着手できる状態**になった。
-
-- **再現率**: 「1 回だけ」ではない。**押した Z のほとんどが無視される**。実測:
-  - §1.31-A 込みビルド: 音声モード突入後の `Z:down` 12 回すべて無視
-  - §1.31-A 無しビルド (`pre-1.31a-master`): 突入後 **21 回**すべて無視 → 6 秒後にようやく exit
-  - 別の回では 3 回無視 → 12.9 秒後に exit、8 回無視 → exit したが timeout → fallback
-- **§1.31-A の退行ではない**。上記のとおり `pre-1.31a-master` (v3.1.0 + §1.85-A + §1.86、
-  描画スケジューリング無変更) でも同じ再現率で出る。**A/B 済み**。
-- **候補 (A) は否定された**。`[fs-key] source=fullscreen focused=true foreground=...` が
-  無視された Z すべてに出ている。フルスクリーン viewport はフォーカスを持っており、
-  `has_focus` 早期 return ではない。`[fs-key]` の要約元は同じ ctx の `egui::Event::Key` であり、
-  Z が egui event へ届いている事実までは確定している。一方、実際の exit は keymap の
-  Win32 frame 優先判定を通るため、そこで別 viewport の edge や別キー edge による早期 return が
-  起きているかは未確定。
-- **未記録の併発症状**: exit が成功した 0.4〜1.0 秒後に**勝手に音声モードへ再突入する**
-  事象を 2 回観測 (`entered audio mode` が再度出る)。再突入後は Z がさらに効かなくなる。
-- **無言の分岐が 7 つある** (どれで消えているか現行ログでは判別不能):
-  - [ui_fullscreen.rs](../src/ui_fullscreen.rs) の音楽ビュー Z 経路 6 項 —
-    `fs_music_view_active` / `fs_context_menu_idx.is_none()` / `!ime_input_active` /
-    `!ctx.wants_keyboard_input()` / `!music_bookmark_modal_open()` /
-    `consume_action_no_repeat`
-  - [native_video.rs](../src/app/native_video.rs) `exit_video_audio_mode` 冒頭 2 つ —
-    `video_audio_mode != Some(fs_idx)` / `video_audio_exit_pending.is_some()`
-- **進め方**: 推測で直さない。7 箇所へ型付きの理由ログを入れてから 1 回再現し、
-  どこで消えているかを確定してから直す (`enter_video_audio_mode` の呼び出し元ログも
-  同時に入れて再突入の出所を割る)。過去に推測で 2 回外し、計装した 1 回で当てた前例に従う。
-- 優先度: **P2**。利用者報告のある実害バグで、再現手段が手元にある。
-
-#### 診断計装の再修正 (2026-08-17)
-
-- 最初の §4.2 計装は全 `outcome=` を `diagnostic_peek_action_press` の true 配下に置いたため、
-  peek 自体が false の実ログでは 1 行も出ず、診断として機能しなかった。
-- `video_audio_mode.is_some()` の間は peek と独立に guard chain を評価する。1 本の
-  `[video-audio] exit key diagnostic` 行へ、`outcome`、対象 viewport の Win32 frame 状態、
-  viewport 内 / 全 viewport の Z down、送信元 viewport、egui Z event、fallback 2 判定、
-  `fullscreen_shortcut_event_summary` の読み取り元と要約をまとめる。
-- 診断は初回・理由変化・Z 観測だけを候補化し、候補を 1 秒間隔で最大 1 行出す。同一理由の
-  idle frame は畳み、rate limit 中に見えた Z は診断 snapshot のまま次の出力可能時刻まで保持する。
-- 全 viewport 走査は current frame の read-only 診断 projection で、consume / Action 成立 / dispatch
-  には使用しない。現時点では原因修正も production 分岐変更も行わない。
-
-#### 診断計装の 2 回目の再修正 (2026-08-17)
-
-- 再修正後の実ログも session 全体で 1 行しか出なかった。その 1 行は音声モード突入直後の
-  Z 未押下 idle frame で、以後 `[fs-key]` が t=9.321 から `Z:down` を繰り返し報告しても
-  `[video-audio] exit key diagnostic` は追加されなかった。
-- 原因は候補判定 `saw_z_or_action_press` が `action_peek`、viewport Win32 Z、
-  全 viewport Win32 Z、egui Z という**調査対象の 4 probe だけ**で決まっていたこと。
-  4 probe が全て false、`outcome` も不変なので、候補が永久に作られなかった。一方、
-  同じ record の `fullscreen_summary` は `Z:down` を持っていたが候補判定に未接続だった。
-- `fullscreen_summary` が `Z:down` を報告した frame も候補にし、rate limit 中はその snapshot を
-  保持する。加えて音声モード中は、候補・理由・Z 観測の有無に関係なく 1 秒ごとに現在 record を
-  heartbeat として出す。停止中に通常 repaint が無い場合も 1 秒後の repaint を予約する。
-  ログ量増加は許容し、診断が黙ることを禁止する。
-- 恒久原則: **診断ログの抑制条件を、調査している信号そのものだけに依存させない。**
-  独立した観測経路または無条件 heartbeat を持たせる。本計装では peek gate と 4-probe
-  candidate gate の 2 回、この原則違反で失敗した。
-- 変更は read-only 診断 snapshot の候補化と出力頻度だけ。production の key consume、Action 成立、
-  dispatch、音声モード enter / exit 挙動、原因修正には触れない。
-
-#### 診断計装の 3 回目の再修正 (2026-08-17)
-
-- heartbeat 追加後も、実ログでは `[fs-key] source=fullscreen ... Z:down` と同じ時刻帯に
-  `exit key diagnostic fs_summary=None` しか出ず、Z frame を下流から候補化できなかった。
-- Z が見えていることを実ログで確認済みの `fullscreen_shortcut_event_summary` 直後へ
-  source-side 行を追加する。音声モード中の `Z:down` ごとに、これから
-  `handle_fs_key_input` を呼ぶ stage、`video_audio_mode`、`fs_music_view_active` /
-  `wants_keyboard_input` / `ime_input_active` / bookmark modal / normalize modal / context menu の
-  全 guard 値、`ctx.viewport_id()` と
-  `cumulative_pass_nr()` を rate limit なしで記録する。
-- 既存の `exit key diagnostic` は残し、source-side 行と viewport / pass を突き合わせる。
-  production の key consume / dispatch / audio-mode state は変更せず、原因修正も行わない。
-
-#### 原因修正・完了 (2026-08-18)
-
-- **原因確定**: `update_fs_zoom_mode_keys` が `fs_zoom_mode_context_ok` より先に
-  `take_key_hold_edges(KeyAction::FsZoomMode)` を呼び、Video / Audio 上でも FsImage 側が
-  <kbd>Z</kbd> の Win32 / egui edge を消費していた。約 400 行後の音楽ビュー
-  `VideoToggleAudioMode` が読む時点では edge が残っていなかった。
-- **修正**: Video / Audio を表す `fs_video_key_context_active` を独立させ、
-  `update_fs_zoom_mode_keys` の消費前に判定する。FsVideo 所有時は edge を残しつつ、
-  `fs_zoom_reset` と非消費の hold level 読み取りだけで画像ズームの transient state を畳む。
-  連結表示など FsImage 内の unavailable state は従来どおり edge を消費して理由を表示する。
-  Ring / マウス経路の Video / Audio 除外も `fs_zoom_mode_context_ok` に残した。
-- **回帰テスト**: 修正前に Video / Audio の両方で所有権テストが
-  `[(Video, false), (Audio, false)]` となることを確認。所有権、state collapse、連結表示の
-  consume + no-op 理由、Ring 経路の拒否 + feedback を handler-level test で固定した。
-- 原因調査用の無制限 `stage=before_handle_fs_key_input` probe は撤去した。既存の rate-limit
-  付き `exit key diagnostic` は残す。
-- **実機確認 (2026-08-18)**: 動画 → Z → 音声モード → Z → 動画の往復、音声ファイル単体の
-  no-op、画像の Z ホールドによる全画面ズーム、連結表示の no-op 理由表示をすべて確認。
-- 状態: **完了**。P2 close。
 
 ### 4.1 Shift / Alt + ホイールのカスタマイズ再設計
 
@@ -1400,41 +860,6 @@
 - 実装メモ: `ring_shortcuts.shift_wheel_pair` / `alt_wheel_pair` は互換読み込み用フィールドとして残すが、
   現行 UI / 入力経路からは参照しない。
 - 規模 / リスク: Medium / 中。動画系の手動確認を含めて別タスクで扱う。
-
-### 4.3 環境設定の矢印列・キーボード図の位置ずれ — 専用スレ >>243
-
-- **同名ファイル処理の矢印列は完了 (2026-08-17):** 画像拡張子の優先順位リストで、
-  最終行は無効な「下へ」ボタンを描かなかったため、「上へ」ボタンが他の行の下向き列へ
-  ずれていた。上下両ボタンを全行で描き、使えない側だけ disabled にして列幅を固定した。
-
-- **実機確認 (2026-08-18)**: Q 列と A 列が揃っていることを確認。ずれは Tab の幅だけでなく、その後ろに続く `item_spacing.x` の分も足りていなかった。
-
-- **完了 (2026-08-17):** HOME / BOTTOM 先頭の `Spacer(48.0)` を typed `KeyIndent("Tab")`
-  へ置換した。`egui::Ui::add_space` は `item_spacing` を足さず、後続キー配置が spacing を足すため、
-  QWERTY の実 Tab と同じ label-width 44px だけを代替する。
-- 描画は実キーと同じ `keyboard_picker_label_width` から幅を導く。将来の標準キー幅変更でも
-  インデントだけがずれない。HOME / BOTTOM の先頭 variant と Tab 幅一致を unit test で固定する。
-
-### 4.4 マウスジェスチャ実行後の通知を非表示にする — 専用スレ >>246
-
-- 要望: ジェスチャ実行後に右上へ出る `[Gesture: ...]` の feedback toast を設定で
-  非表示にできるようにする。
-- これは右ドラッグ中に登録済み軌跡を示す「操作中のジェスチャガイド」とは別機能。
-  ガイドの既存表示設定は変更しない。
-- 仕様:
-  - 操作カスタマイズで、既存の入力中ガイド設定と同じページへ
-    「マウスジェスチャ実行後の通知を表示」を追加する。
-  - 既存利用者の挙動を変えないため既定 ON。OFF では割り当て済み action と「なし」の両方で
-    `[Gesture: ...]` 通知を抑止する。action 実行先が出すエラー等、別用途の feedback は消さない。
-  - Grid / Image / Video / Edit の全ジェスチャ文脈で同じ設定を使う。
-- 回帰確認: ガイド ON/OFF との4組み合わせ、成功 toast、未割り当て / 実行不能時の feedback、
-  detached / native video 発火面。
-- 規模 / 優先度: 小 / P2。利用者へ「本日リリース予定版の次で対応」と回答済み。
-- **完了 (2026-08-18):** `mouse_gesture_result_toast_visible` (既定 ON、旧設定も ON)
-  を追加し、割り当て済み / 「なし」の `[Gesture: ...]` だけを共通発火点で抑止できるようにした。
-  OFF でもジェスチャのアクションは実行し、アクション自身が出す結果・エラー表示は維持する。
-  環境設定「操作 → 動作」、マニュアル、仕様書へ反映し、通知 ON/OFF、未割り当て、動作継続、
-  action-owned feedback、旧設定の既定値を自動テストで固定した。
 
 ## 5. リリース前確認 / 依存更新
 
@@ -1645,155 +1070,13 @@
   (起動直後に足すと今度は起動が遅くなる)。
 - 規模 / 優先度: 小〜中 / P3。
 
-### 1.88 見開き 1 ページずらし後にページ送りが停止する — 利用者報告
-
-- **完了 (2026-08-17):** `FsNavigatorTextureSources` の各ページへ typed な `Live` /
-  `Holdover` provenance を持たせ、選択元から `FsDisplayUnitTracePage` まで伝播した。
-  sequence は target の完全な page set がすべて `Live` として描かれた frame だけで解放し、
-  共有ページの texture id が previous にも含まれることから ownership を推測しない。
-  previous overlay の実描画、片側だけ ready、不完全 target は従来どおり解放しない。
-- `spread_shift_anchor_idx` は input 解決時に target pairing へ更新されるため、navigation の
-  previous capture は更新後の mutable pairing ではなく、直前に実描画された
-  `fullscreen_page_layout` の unit を優先するよう固定した。LTR / RTL、前後方向、単発 / repeat の
-  状態遷移テストで previous / target page set の分離を確認済み。
-- 出典: 専用スレ >>239 (2026-08-16)。v3.0.0 / v3.1.0 で再現し、v2.9.1 では
-  発生しない。手元でも再現済み。
-- 再現:
-  1. フルスクリーンで右綴じの見開き (テンキー 4 / 5) にし、
-     `見開き表示を右方向へ1ページずらす` (既定 Ctrl+Right) を実行する。
-  2. または左綴じの見開き (テンキー 2 / 3) で、左方向へ1ページずらす。
-  3. その後、カーソルキーによるページ移動を受け付けなくなることがある。
-     連打 / hold で起きやすいが、1 回だけでも起きる。左右どちらの Ctrl でも発生する。
-  4. Backspace でフルスクリーンを閉じると復旧する。
-- 根本原因:
-  - 見開き 1 ページずらしは、旧 unit `[2, 3]` から新 unit `[3, 4]` のように、
-    移動前後の表示単位で 1 ページを意図的に共有する。
-  - v3.0.0 の `96faeee6` で追加した navigation sequence は、target の完全な page set を
-    描いた後、`observe_fs_navigation_sequence_presented` で previous holdover の texture が
-    1 枚も見えていないことを確認して sequence を解放する。
-  - 現在は描画元を明示的に追跡せず、target の texture id が previous holdover の
-    `page_for_texture_id` に存在するかだけで旧表示の残存を推測する。共有ページは正しい
-    target として live 描画されても同じ texture id が previous に含まれるため、
-    `captured_page_visible=true` と誤判定される。
-  - sequence が `Presenting` のまま残り、`blocks_new_target()` が後続ナビを拒否し続ける。
-    フルスクリーン終了で sequence が破棄されるため Backspace 後は直る。
-  - 当初疑った右 Ctrl 既定の `押している間だけ元画像を表示する` との競合は根本原因ではない。
-    右 Ctrl は texture 選択のタイミングへ影響し得るが、左 Ctrl でも同じ ownership 誤判定が
-    成立する。
-- 修正方針:
-  - previous holdover が**実際に描かれた**ことと、target の live 描画が previous と同じ
-    texture handle を共有したことを区別する。texture id の包含だけから描画所有元を推測しない。
-    `FsDisplayUnitTracePage` まで live / holdover の provenance を明示的に通し、完全な target
-    page set が live source として描かれた frame で sequence を解放する方向を第一候補とする。
-  - previous overlay を本当に描いている間、片側だけ target が揃った間、target page set が
-    不完全な間は従来どおり sequence を解放しない。ちらつき防止の atomic unit 契約を弱める
-    条件緩和では直さない。
-  - `spread_shift_anchor_idx` の更新と previous unit capture の順序も確認し、遷移前 unit と
-    遷移後 unit の所有者を同じ mutable pairing から取り違えていないことを固定する。
-- 回帰テスト:
-  1. previous `[2, 3]` / target `[3, 4]` で 3 の texture id が同一でも、3 と 4 が target の
-     live source として完全に描かれたら sequence が解放される。
-  2. 同じ page set でも共有ページを previous holdover から実際に描いた場合は解放しない。
-  3. 左綴じ / 右綴じ、左右へのずらし、左 Ctrl / 右 Ctrl、単発 / repeat を確認する。
-  4. 既存の disjoint な通常ページ送り、片側だけ ready、不完全 target、旧 texture の
-     index 再利用を検出するテストを維持する。
-- 関連: [display-pipeline.md](display-pipeline.md) §2.5.4 の atomic display-unit 契約。
-- 規模 / 優先度: 小〜中 / **P1 (次バージョンで修正)**。
-
-### 1.89 元画像プレビュー中の見開き 1 ページずらしが 4〜5 秒停止する
-
-- **実機確認 (2026-08-18)**: 単発タップと分析モードの双方で 4〜5 秒停止は再現しない。AI アップスケールとカラー化の ON / OFF いずれの組み合わせでも停止なし。なお §1.91 の続報修正でホールド中は元画像表示自体が成立しなくなったため、元の再現手順 (右 Ctrl ホールド + Ctrl+→) からはこの経路に入らない。
-
-- **完了 (2026-08-17):** navigation target の `materialized_ready` を、その frame の描画 resolver が
-  実際に選ぶ source と一致させた。`fs_display_bypasses_final_pipeline` が true の元画像表示 / 分析モードは
-  target 全ページの `resolve_original_preview_tex` を、false の通常表示は従来の加工済み source を要求する。
-  元画像が無い target は `Awaiting` のまま、見開きは両ページの `all` が成立するまで ready にしない。
-- 根本原因: 描画側は raw 元画像を選んでいた一方、readiness だけが AI + カラー化済み source を待っていた。
-  右 Ctrl + Ctrl+Right の実 log では同じページ対で 5.22s / 4.30s 停止し、5.22s の間に 54 入力を consume
-  して target は進まなかった。内訳は PDF decode 約150ms、AI upscale 1.3s × 3、final composite 73ms。
-- OS キー状態は frame-local sample を producer gate / readiness / draw で共有し、同一 frame 内の source 判定を
-  分裂させない。`original_preview` 専用 carve-out、`blocks_new_target()` の迂回、通過表示 blocker の解除、
-  AI producer、時間窓 / timeout は変更していない。
-- 回帰テスト: bypass raw ready、通常表示の加工済み待ち、raw 不在 `Awaiting`、分析モード、見開き atomic の
-  5 条件を追加。§1.88 の4本と既存 atomic 契約テストは無修正で通過。
-- AI upscale のコスト自体は範囲外で、別項 §3.3 に継続記録。
-- 正本: [codex-original-preview-readiness-brief.md](briefs/codex-original-preview-readiness-brief.md)。
-  関連: [display-pipeline.md](display-pipeline.md) §2.5.4。
-
-### 1.92 別ウィンドウの動画再生中に外部アプリから戻ると Z だけ効かない
-
-- **実機確認 (2026-08-18)**: 別ウィンドウで動画再生 → 他アプリへ移動 → 戻る → <kbd>Z</kbd> で
-  音声モードへ入り、もう一度 <kbd>Z</kbd> で動画へ戻ることを確認。ログの裏付けは
-  `source=egui_key` の `enter request` / `enter result outcome=entered` が 2 往復分
-  (`fs_idx=59`、presentation=detached)。**これが今まで持ち主の居なかった経路**。
-  - 同じ detached ウィンドウで `[native-video-key] ... outcome=action:VideoToggleAudioMode` も
-    出ている。**フォーカスの位置によって native / egui のどちらにも届く**ため、両経路に mapping
-    を置く設計 (presentation で分岐しない) が実測で正しかったことになる。押下ごとに遷移は 1 回で、
-    二重発火は観測されなかった。
-  - 音声モードで VST 表示中の <kbd>Z</kbd> が VST だけを畳むことも確認 (メインウィンドウの
-    フルスクリーンで。**F12 別ウィンドウでは VST 自体が使えない**仕様)。
-  - 画像の <kbd>Z</kbd> ホールド (全画面ズーム) に退行なし。
-  - 1 回目の確認は**リリース版 v3.1.1 が常駐したまま**で行われ、単一インスタンス mutex により
-    dev バイナリが既存プロセスへ処理を渡していた。`[native-video-key]` が 0 行なのに
-    `enter request source=native_key` が出る、という組み合わせで判別できる。
-    **確認依頼の前にプロセスの exe path を見ること。**
-- 状態: **完了**。
-
-- 出典: 利用者報告 (2026-08-18)。**v3.1.1 の変更が原因ではない**。利用者が以前のバージョンでも
-  再現することを確認済み。
-- 症状: 別ウィンドウで**動画を再生している**状態で、他アプリからそのウィンドウをクリックして戻すと
-  <kbd>Z</kbd> (`VideoToggleAudioMode`) だけが無反応。P やカーソルキーは効く。上部 HUD から
-  マウスで音声モードへ切り替えると、以降は <kbd>Z</kbd> も効く。**音声モード表示中に戻した場合は
-  起きない**。
-- 分かっていること: 失敗する経路は native presenter の `handle_native_video_key`。egui 側の音楽ビュー
-  経路 (§4.2 で直した側) ではない。Z の分岐は P / カーソルと同じ match の中にあり、表面上の特別扱いは
-  無い。ただし到達先の `enter_video_audio_mode` にだけ「音声トラック無し / detached / 切り替え中は
-  弾く」という追加条件がある。
-- **今のログでは切り分けられない**: 「キーが native 側へ届いていない」のか「届いたが match しない」のか
-  「match したが `enter_video_audio_mode` が弾いた」のかを区別する記録が無い。`enter request
-  source=native_key` は成功時にしか出ない。**最初の一手は観測**で、native key の入口に無条件の記録を
-  置き、外部アプリから戻った直後の 1 打鍵を追う。抑制条件を調査対象の信号に依存させないこと
-  (keymap-spec.md の原則)。
-- detached viewer のリワーク凍結対象領域。症状パッチを入れず、原因に対応付けてから直す。
-- **観測結果 (2026-08-18、計装 `b9448ca8` を入れて 1 回再現)**:
-  - 効かなかった Z は `[fs-key] source=fullscreen keys=Z:down` として **egui 側**に届いていた。
-  - `[native-video-key]` はセッション全体で **1 行だけ** (終了時の Escape)。**Z も P もカーソルも
-    native の `handle_native_video_key_event` には届いていない。**
-  - native 行は `foreground_hwnd=0x3BC25CC` != `presenter_hwnd=0x7982452` を記録しているが、
-    **これは host focus の証拠にはならない** (detached presenter は `WS_CHILD` なので、子に
-    focus があっても foreground は top-level host になる。Codex 指摘)。証拠は
-    **`[fs-key]` が出ていて native event が無いこと**そのもの。
-  - HUD 経由の入場は `source=native_output_event` として記録され、音声モードからの Z は
-    egui の音楽ビュー分岐が処理していた (`exit fs_idx=9`)。
-- **原因**: キーが奪われているのではなく、**`VideoToggleAudioMode` の動画→音声方向が egui 入力
-  経路に持ち主を持たない**。この action は 2 方向 × 2 経路あるのに、ハンドラが片方ずつしかない。
-
-  | | native 経路 | egui 経路 |
-  | --- | --- | --- |
-  | 動画 → 音声 | あり (`handle_native_video_key_event`) | **無い** |
-  | 音声 → 動画 | — | あり ([ui_fullscreen.rs](../src/ui_fullscreen.rs) の音楽ビュー分岐) |
-
-  報告の 3 点がこれで説明できる。P とカーソルが効くのは egui 側にハンドラがあるから。Z だけ
-  効かないのは誰も拾わないから。音声モードなら起きないのは presenter が居らず全て egui を通り、
-  音声→動画のハンドラは存在するから。**§4.2 と同じ形の鏡像**。
-- なお §4.2 の修正 (画像側が Video / Audio 上で Z を消費しないようにした) は本件の**前提**でもある。
-  あれが無いと、egui 経路に持ち主を足しても `FsZoomMode` が先に edge を消費してしまう。
-- 修正前は利用者向け [known-issues.html](../htdocs/mimageviewer/manual/known-issues.html) に掲載していたが、
-  下記完了に伴い削除した。
-- **完了 (2026-08-18):** `VideoToggleAudioMode` を `toggle_video_audio_mode` の単一 semantic owner
-  へ集約し、native key / native HUD / egui 動画 / egui 音楽ビューの各入口から呼ぶようにした。
-  分岐順は音声 VST 表示 → 音声モード → 通常動画で、VST 表示中に `fs_music_view_active == false`
-  でも `enter_video_audio_mode` の `AlreadyActive` gate へ落ちず、先に `exit_video_audio_vst` する。
-  egui 経路は既存 guard の下で `consume_action_no_repeat` を使う。3 状態 × 2 経路の対象 5 テストと
-  §4.2 の画像 / Video / Audio 所有権テストで固定した。detached / focus / placement / presenter
-  lifecycle の述語・状態・時間窓は追加していない。
-
 ### 1.94 音声モードの退出が期限切れで detach+attach+seek に落ち、音が途切れる
 
 - 出典: 利用者報告 (2026-08-18)。メインウィンドウへ結合した状態で <kbd>F11</kbd> と <kbd>Z</kbd> を
   連打すると、切り替えのたびに**メインウィンドウのグリッドが一瞬見えるちらつき**と、
   **音の途切れ**が起きる。
-- **§1.92 の修正が原因ではない**。今日追加した経路は `source=egui_key` で記録されるが、実ログ中に
+- **同日 (2026-08-18) に入れた「別ウィンドウの動画再生中に外部アプリから戻ると Z だけ効かない」の
+  修正が原因ではない**。その経路は `source=egui_key` で記録されるが、実ログ中に
   2 回しか無く (別ウィンドウでの成功例)、後述のタイムアウト 7 件のいずれとも時刻が重ならない。
   失敗時の enter はすべて既存の `source=native_key`。ちらつき自体はリリース版 v3.1.1
   (本修正を含まないプロセス) でも観測されている。
@@ -1824,98 +1107,7 @@
   判定はログの `timed out; falling back to detach+attach+seek` の有無で機械的にできる。
 - 規模 / 優先度: 中 / P2 (音が途切れるので体感は悪いが、連打しない通常操作では出ない)。
 
-### 1.93 `VideoAdjustSlot1..10` の egui 動画入力 parity を確認する
-
-- §1.92 の同型 action 監査で、`VideoAdjustSlot1..10` の key dispatch は
-  `src/app/native_video.rs` の native dispatcher にだけ存在し、`handle_video_input` の egui 経路には
-  mapping が見当たらなかった。
-- in-window、detached host focus、focus handoff など egui に動画キーが届く場面で
-  `Ctrl+1..0` が無反応になる可能性がある。実ログまたは handler-level test で parity 欠落を確認し、
-  load/save 修飾子、repeat、context-menu / IME / modal guard、画像側との ownership を固定してから
-  action owner を決める。
-- 今回は `VideoToggleAudioMode` だけを対象とし、本項の修正は行わない。
-- **完了 (2026-08-19):** `handle_video_input` を直接呼ぶ pre-fix test で、可視動画へ
-  <kbd>Ctrl</kbd>+<kbd>1</kbd> を入力しても保存済み `brightness=42.0` が読み込まれず
-  `0.0` のままになる failure を確認した。`VIDEO_ADJUST_SLOT_ACTIONS` を
-  `keymap.rs` の単一の順序付き一覧とし、native / egui / keymap test の 3 箇所を同じ一覧へ
-  合流した。egui mapping は既存 `VideoToggleAudioMode` の直後に置き、context menu /
-  keyboard focus / modal / normalize scan と
-  `!video_audio_mode_hides_native_presenter_for(fs_idx)` を consume 前に評価する。
-  通常の hidden 音声モードでは読込せず、VST GUI で presenter が見えている音声モードでは
-  読み込む。保存操作は従来どおり HUD パネルだけ。
-- handler-level regression は通常動画 parity、hidden 音声モード、VST-visible 音声モード、
-  空 slot、modal 未消費の 5 本と、action 一覧完全性を追加。mutation は mapping 削除、
-  可視性 guard 削除、`video_audio_mode != Some(fs_idx)` への誤単純化、modal guard 削除の
-  4 種すべてで対応 test が exit 101 になり、復元後は全件通過した。key 発火時は typed
-  `VideoAdjustSlotInputSource` により `egui_key` / `native_key` と slot を 1 行記録する。
-
-### 1.90 アニメーション先読みの全フレーム展開で archive 閲覧が停止する — 利用者報告 >>241
-
-- **実機確認 (2026-08-18)**: `animeted.zip` 内の画像がアニメーションすることを確認。一覧から Enter で開いた直後も右上の展開中表示が出る。
-
-- **完了 (2026-08-17):** fullscreen canonical decode に typed `AnimationPolicy` を追加し、通常ファイル /
-  archive entry と GIF / APNG / WebP の全組み合わせで、先読みは第1フレームだけ、現ページは全フレーム
-  とした。archive 内 GIF / APNG も WebP と同じくアニメーション再生する。
-- 先読みしたアニメ第1フレームは cache entry に形式付きで記録する。現ページ化したら第1フレームを
-  表示したまま全フレームへ昇格し、items generation / target idx が一致する結果だけを差し替える。
-  ページを離れた worker と upload backlog は cancel / 破棄し、失敗時は静止した第1フレームを残す。
-- 昇格が150ms以上続く場合だけ、in-flight 状態から「アニメーションを読み込み中…」を右上3段目へ
-  表示する。時間で消える feedback toast は使わず、完了時には同じ state owner から即座に消える。
-- 回帰テストは FirstFrameOnly の3形式の先頭画素一致、FullFrames の file / archive 3形式、spawn 方針、
-  現ページ昇格、移動 cancel + stale 拒否、失敗時の第1フレーム維持、150ms表示述語を固定した。
-  既存 `fs_animation` の10テストは無修正で通過。
-- 現ページ1本の全フレーム常駐は確定仕様。ストリーミング / リングバッファ化は今回の範囲外で、
-  将来必要になった場合は GIF / WebP のフレーム依存とループ再decodeを含めて別設計にする。
-- **表示述語追補 (2026-08-17):** 進行表示を `AnimationPromotion` 専用から「現ページの
-  アニメーション全フレーム展開が in-flight」へ統一した。初回 `Display` と先読み後の昇格の
-  typed load purpose が同じ開始時刻 projection を公開し、150ms gate と右上3段目の位置は変更しない。
-  アニメーション非対応拡張子と PDF は表示対象にしない。
-- 正本: [codex-animation-prefetch-policy-brief.md](briefs/codex-animation-prefetch-policy-brief.md)。
-  関連: [display-pipeline.md](display-pipeline.md) §4.1.1。
-
-### 1.91 元画像ホールド併用の連続ページずらしで戻り方向だけ 2〜3 倍遅い
-
-- **完了 (2026-08-17):** `original_preview_active` は、既存の
-  `fs_navigation_sequence_blocks_new_target()` が true の間だけ false を返す。シーケンス終了後は
-  `FsOriginalPreviewHold` の effective modifier が成立すれば従来どおり元画像を表示する。
-- 実測は元画像プレビューなしの左右と preview ありの Left が 14.2〜17.2 手/秒だったのに対し、
-  Right + preview だけ 5.2〜5.8 手/秒。遅い区間の texture 選択 878 件は全て
-  `source=nav_holdover` で、4.5 秒間、補正済みの前表示単位を描き続けていた。
-- 機構は、元画像要求に矛盾する加工済み pass-through を正しく無効にした結果、設計どおりの
-  非対称先読み窓 12:4 の戻り側が露出し、target ready まで holdover が残るもの。画面にあるのは
-  現ページでなく前の表示単位なので、「現ページの元画像を見せる」約束自体が進行中は成立しない。
-- 利用者判断: 元画像ホールドは静止して画像を見ているときの確認用途であり、移動中に補正が
-  乗っていることは仕様として問題ない。判定は割り当て chord でなく typed navigation sequence
-  だけを使う。時間窓、pass-through 復活、先読み窓変更、`blocks_new_target()` caller 例外は追加しない。
-- 回帰テストは `FsOriginalPreviewHold` を Ctrl へ再割り当てして、sequence in flight 中の false と
-  sequence 不在時の true を固定する。既存の元画像 preview / readiness テストは変更しない。
-- **実測後の判別計装 (2026-08-17、原因修正なし):** 修正後の perf log でも
-  `page_turn_decision reason=original_preview` と holdover が支配的だったため、blocker 到達ごとに
-  memo の cache hit / fresh evaluation、memo 書込時と blocker 時の frame / pass / frame内 call order、
-  両時点の `fs_navigation_sequence_blocks_new_target()` を read-only で記録する。1秒ごとの
-  `fs/original_preview_blocker_summary` は sequence in-flight 中の original-preview return 数を集計し、
-  return が0件でも heartbeat を出す。抑制条件を original-preview / sequence の成立自体には依存させない。
-- **続報と修正 (2026-08-18):** 4 属性付き perf log では、右 Ctrl ホールド中の
-  `pass_through` は 0 件、`right_ctrl_held=true` / `original_preview_active=true` /
-  `context_blocker="original_preview"` は 1,888 frame だった。typed sequence の間だけを抑止すると、
-  auto-repeat のシーケンス間の隙間で元画像表示が復帰し、blocker が burst を解除していた。
-- 利用者判断により、ページ送り入力が物理的に押されている間も元画像表示を無効にする。既存の
-  sequence 抑止は単発タップの release 後から提示完了までを守るため残す。物理レベルは blocker を
-  一切参照しない helper に分離し、edge の `still_held`、または focused viewport permit 下の
-  configurable / fixed page-turn chord を解決して `(frame_nr, viewport)` 単位で memo 化する。
-  `original_preview_active` と `fs_page_turn_input_held` は同じ sample を共有し、時間窓と先読み窓変更は
-  追加しない。マウス / リング由来のページ送りと元画像要求の矛盾を防ぐため、`original_preview`
-  blocker 自体は残す。
-- **実機確認 (2026-08-18)**: 修正後の perf log で、右 Ctrl ホールド中の `pass_through` が
-  **0 件 → 130 件** (materialized 31)。左 Ctrl は 46 / 9 で、両者の比率がほぼ一致した。
-  auto-repeat がページを進めた割合は戻り方向で **17% → 72%** (左 Ctrl は 69%)。
-  利用者確認でも「速さも元表示も OK」。押しっぱなし中の一瞬の元画像は出ない。
-  矢印を離して右 Ctrl だけ保持したときは従来どおり元画像へ戻る
-  (`right_ctrl_held=true` / `original_preview_active=true` が 1,452 frame 記録されている)。
-- 関連: [display-pipeline.md](display-pipeline.md) §§2.3, 2.5.4、
-  [keymap-spec.md](keymap-spec.md)「画像フルスクリーン」。
-
-### 1.95 Z 照準中の拡大中心がカーソル位置とずれる — 利用者報告 (実装中)
+### 1.95 Z 照準中の拡大中心がカーソル位置とずれる — 利用者報告 (方針決定済み・未実装)
 
 - 出典: 利用者メール (pattier、2026-08-19)。Z を押している間に出る照準枠が、カーソルの真下に
   来ないことがある。画面の端へ寄るほどずれが大きい、という指摘。
@@ -1956,122 +1148,10 @@
   二重管理にならないこと。
 - 規模 / 優先度: Small / P2。
 
-### 1.96 動画と画像が混在するフォルダで、動画を通過した後にキーが効かなくなる — 利用者報告
-
-- **v3.1.2 向け完了 (2026-08-19):** 原因は input permit / focus ではなく、静止画から動画へ
-  ページ移動した時点で、page renderer が描かない動画を `Display` target とする navigation sequence を
-  作っていたこと。sequence の唯一の production retire 経路は page renderer の presentation trace
-  なので、native presenter 所有の動画では `Awaiting` / `Presenting` が閉じず、
-  `blocks_new_target()` が後続の画像ナビゲーションを拒否し続けていた。
-- 当初仮説は、停止中にも Space のチェック、Esc、ルーペ ON/OFF が動くという追加報告で棄却した。
-  ルーペ操作は `handle_fs_key_input` 内の `input_permits.discrete` gate より後で消費されるため、
-  ルーペが動いた frame で gate の fail-closed return は成立していない。効かないのがカーソル 4 方向
-  だけという症状も navigation sequence の block と一致する。以下の当初記述は調査履歴として残す。
-- `begin_fs_page_navigation_sequence` は target unit の全 page が `GridItem::has_page_data` を満たす場合だけ
-  `Display` sequence を作る。動画 / 音声を含む unit は sequence を作らず直接着地し、通常の
-  画像 → 画像では従来どおり atomic display-unit sequence を維持する。`blocks_new_target()`、timeout、
-  focus、input permit、media 分岐、Ctrl+↑↓ の `FolderItems` 経路は変更していない。
-- 回帰テストは、既存の ignored test を通常実行へ戻したほか、画像 → 動画 → 画像後の次 handler
-  navigation が受理されること、画像 → 画像で `Display` sequence が作られること、既存の
-  folder navigation → 動画が wedge しないことを固定した。
-- 出典: 利用者メール (pattier、v3.1.1)。開発側でも再現済み (2026-08-19)。
-- 症状: 動画と画像が混在するフォルダを <kbd>↑</kbd> / <kbd>↓</kbd> で送っていくと、
-  **画像 → 動画 → 画像 と進んだ後に次へ移れなくなる**。<kbd>Esc</kbd> では一覧へ戻れるので、
-  フリーズではなく「キーが届いていない」形。
-- 仮説 (未確定。コード上の経路としては一貫する):
-  - フルスクリーンのキー処理は `input_permits.discrete` が無いと**その frame のキーを全部捨てて
-    return する** fail-closed ([ui_fullscreen.rs:17515](../src/ui_fullscreen.rs:17515))。
-  - `discrete` が出る条件は「このビューポートがフォーカスを持つ」か「このビューポート宛に
-    振り分けられた生キーが今 frame 届いた」のいずれか
-    ([keyboard_input.rs:159](../src/keyboard_input.rs:159))。
-  - 動画は native presenter (別 HWND) がキーを受ける。動画から画像へ移った後もそちらが
-    キーボードを持ったままなら、上の条件が両方とも成立せず、ナビキーが全滅する。
-  - **Esc だけ効くのは、Esc が presenter 側の native 経路で処理されるため**と考えると辻褄が合う。
-  - ただし「presenter が残ってフォーカスを保持している」のか「フォーカスがメインウィンドウへ
-    落ちた」のかは、コードだけでは決まらない。
-- **切り分けの決め手**: 効かないのが**全キーか、上下だけか**。全キーなら入力の届き先の問題
-  (上の仮説)、上下だけならナビゲーション側の問題で、仮説は棄却される。
-- 観測手段: `publish_fullscreen_input_state` が `has_focus` / raw key permit / owner を publish して
-  いるので、再現時にこれを見れば確定する。ただし §1.77 の調査で **harness は native video window を
-  操作できない**と分かっているため、動画 → 画像の遷移は手動で行い、ログ側で観測する。
-- 同型の前例 (いずれも「presenter がキーボードを持ったまま表示だけ先へ進む」形):
-  §4.2 (音声モードの Z)、§1.77 (連結読み中の横断キーで動画へ入ると戻れない)、
-  §1.92 (別ウィンドウの動画再生中に外部アプリから戻ると Z だけ効かない)。
-  **同型が 4 件目なので、個別のガードではなく所有権側の構造を疑うこと。**
-- 規模 / 優先度: Small〜Medium / **P2** (操作不能に見えるが Esc で脱出可能)。
-
-### 1.97 「ダウンスケール表示中」が通常の縮小表示と紛らわしい — 専用スレ >>260
-
-- 質問: フルスクリーン上部情報バーの解像度欄へ「⚠ ダウンスケール表示中」が出る場合と
-  出ない場合の違いが分かりにくい。
-- 現行の意味: 現在のズーム倍率や画面フィットによる縮小とは無関係。静止画の元画像の幅または
-  高さが GPU テクスチャ互換上限の 8192px を超え、表示用画像を長辺 8192px 以内へ縮小した場合に
-  `FsCacheEntry::Static.source_dims` と texture 寸法の差から表示している。
-- 修正方針:
-  - 表示を「⚠ GPU上限により解像度制限中」へ変更し、通常の画面フィットによる縮小ではなく、
-    GPU へ載せる表示用テクスチャの解像度を制限している状態だと明示する。
-  - 警告の黄色表示と、元画像解像度を表示する既存仕様は維持する。
-  - 発生条件は変更しない。Animated GIF / APNG / WebP、動画、PDF 等の別経路で警告を出すかは
-    今回の文言修正へ含めず、必要性が出た場合に各経路の原寸と表示 raster の契約を確認して扱う。
-- 回帰確認: 上限内 / 幅超過 / 高さ超過で marker の有無、AI 情報併記時の文字列、見開き左右の
-  情報表示、黄色 marker の切り分け描画。
-- 規模 / 優先度: Small / P3。表示文言のみ。
-
-- **完了 (2026-08-19):** マーカーを「⚠ GPU上限により解像度制限中」へ変更した。発生条件、
-  黄色の切り分け描画、元画像解像度の表示は変更していない。文言は
-  `ui_fullscreen/draw_icons.rs` の `DOWNSCALE_MARKER` を単一の定義元にし、描画側の切り出しと
-  build_info_text のテストも同じ定数を読むようにした (以前はテストが文言をリテラルで持っていて、
-  片方だけ変わっても気づけなかった)。動画 / PDF / アニメーション経路は方針どおり対象外。
-
-### 1.98 A/B の場所と、起動中に記憶した一覧位置を1操作でクリアする — 専用スレ >>262
-
-- 要望: `A/B の記憶した場所をクリア`を実行しても、フォルダへ入り直すと以前の
-  カーソル位置が階層ごとに復元される。アプリを終了せず、A/B の場所と全フォルダの一覧位置を
-  まとめて消し、現在の一覧も先頭へ戻せるキー割り当て可能な操作が欲しい。
-- 現行構造:
-  - A/B の target、戻る / 進む履歴、最近使った場所、ドライブ別の最後の場所は
-    `quick_folder_workspaces[2]` に分かれている。
-  - 一覧のスクロール位置とカーソル位置は A/B 別ではなく、セッション共通の
-    `folder_history: HashMap<PathBuf, (f32, Option<usize>)>` に保存している。同じフォルダを
-    A/B の両方で開いても位置は共有され、現在はアプリ終了時にだけ消える。
-  - 既存 `GridClearQuickFolderSlots` は前者だけを初期化するため、報告された動作は現行仕様どおり。
-- 仕様:
-  - 既存操作を「A/B の記憶した場所と一覧位置の履歴をクリア」へ改名し、同じ1操作で
-    両 A/B workspace とセッション共通の `folder_history` をクリアする。
-  - 現在表示中の一覧は先頭の可視項目へカーソルを移し、スクロール位置を先頭へ戻す。
-    可視項目が無ければカーソルは未選択とする。保留中の scroll 指示とクリック範囲選択 anchor も
-    破棄し、操作直後に古い位置へ戻らないようにする。
-  - チェック済み項目、レーティング / タグ、本の読書位置、動画・音声の再生位置、ブックマーク等は
-    対象外とし、変更しない。
-  - 既存の `KeyAction::GridClearQuickFolderSlots` と永続名は互換性のため維持し、表示名、toast、
-    メニュー文言だけを新しい意味へ揃える。既定キーは引き続き未割り当てとする。
-  - フォルダバーメニュー、キー、リング / ジェスチャの全入口を共通実行関数へ合流し、どの入口でも
-    同じ範囲を1回でクリアする。複数コマンド割り当て機能は追加しない。
-- 回帰確認: A/B 両方の target / drive-current / nav history、セッション共通 `folder_history`、
-  現在一覧の先頭復帰、空一覧、同一フォルダを A/B で開いたケース、チェックと読書 / 再生位置の維持、
-  メニュー / キー / リングの parity、保存後も stable action 名を読み戻せること。
-- 規模 / 優先度: Small / P2。利用者要望。
-
-- **完了 (2026-08-19):** 同じ 1 操作で `quick_folder_workspaces` と、セッション共通の
-  `folder_history` を消すようにした。現在の一覧は先頭の可視項目へカーソルを移し、スクロール
-  位置・保留中の scroll 指示・Shift+クリックの anchor も破棄する。表示項目が無ければ未選択。
-  チェック済み・読書位置・再生位置は対象外のまま。
-- 表示名 / toast / メニュー文言だけを新しい意味へ変え、**`ini_name` の
-  `GridClearQuickFolderSlots` と ring の永続名 `clear_quick_folder_slots` は変更していない**。
-  保存済み割り当ての round-trip をテストで固定した。既定キーは引き続き未割り当て。
-- 入口は元から `execute_clear_quick_folder_slots` の 1 本に集約されていたので、
-  routing は追加せず消す範囲だけを広げた。
-- **実機確認からの追補 (2026-08-19):** クリアは両 workspace の target を空にしたまま現在の
-  一覧を表示し続けるため、次のフォルダ移動まで「画面上の場所をどちらのスロットも所有しない」
-  状態になっていた。その直後に B → A と切り替えると両方が空なのでドライブ一覧へ戻っていた。
-  クリアの最後に通常の現在地を active スロット A の target / drive-current へ記録し直す。
-  **active スロットの target は常に画面に出ている場所と一致する**ことを不変条件とし、クリアも
-  これを破らない。B は空のまま、合成ビュー / 現在地なしは記録しない。`folder_history`、recent、
-  A/B の戻る / 進む履歴は消えたままで、現在一覧を先頭へ戻す §1.98 の挙動も維持する。
-
 ### 5.10 入力テストの共有ロックが poison して、失敗 1 件が全滅に見える
 
-- 出典: §1.93 の mutation 確認中 (2026-08-19)。可視性ガードを外して 1 件だけ落とすつもりが、
+- 出典: 動画補正スロットの入力 parity 確認 (2026-08-19) の mutation 確認中。可視性ガードを外して
+  1 件だけ落とすつもりが、
   同じフィルタの 5 件すべてが FAILED になった。実際に落ちたのは 1 件で、残り 4 件は
   `fullscreen fixed-key test lock poisoned: PoisonError { .. }` だった。
 - 機構: `crate::key_input::TEST_INPUT_LOCK` は入力テストを直列化するためだけの
@@ -2119,84 +1199,6 @@
   ノイズと判断した場合に `--save` で baseline を上書きしないこと (ノイズを基準値にすると
   次から本物の劣化を見逃す)。
 - 規模 / 優先度: 小 / P3 (リリースのたびに人が判断すれば回るが、毎回時間を取られる)。
-
-### 5.4 idle health の video-pin evidence 窓が狭い
-
-- **v3.1.1 (2026-08-18) の実測。3 回走らせて 3 回とも FAIL したが、いずれも製品側ではない。**
-  1. **接続先を取り違える**: `-NoLaunch` が `%APPDATA%\mimageviewer
-untime.1.1\` の core
-     (ランチャー版が展開した別 instance、`--perf-log` 無し) に接続した。perf を 1 行も書かない
-     instance なのに「同一 session PID は確認済み」と表示し、`events=0` を完全 sleep として
-     扱った。**perf log growth が 0 のまま measured window を評価したら、sleep ではなく
-     「記録していない」を疑う**べき。接続先の exe path が測定対象として妥当か
-     (script が起動した instance か) を確認する条件が要る。
-  2. **起動直後の初回索引と競合する**: 起動 11 秒後に測ると、全文検索の initial scan
-     (walker が 52 万 / 11 万 / 6 万ファイル) が並列で走っていて CPU one-core ratio 2.302 で FAIL。
-     索引は text log にしか書かないので perf 側は静かなまま、CPU だけが跳ねる。
-     **「起動後 N 秒」ではなく、初回スキャン完了 (name_index / indexer の initial scan done) を
-     待ってから測る**のが正しい条件。
-  3. 索引完了後に測り直すと **CPU one-core ratio 0.0094 / perf event 0 件 / repaint streak 0 /
-     同一 work 0** で、製品側は完全に静止していた。残った FAIL は本項の evidence 窓だけ
-     (同一 session の 1 つ前の窓では `matched=64 (enqueue=32, ready=28,
-     idle_upgrade_ineligible=4)` を記録済みで、タイルは keep 範囲に入っていた)。
-  - 結論: v3.1.1 は **evidence 窓の既知欠陥による FAIL** として通した。実体の測定は PASS。
-
-- 出典: v2.9.1 リリース前確認 (2026-08-01)。`-TargetKey` 方式に変えた直後の実測で FAIL。
-  原因は**ゲートの窓**で、製品側でもセットアップ手順の誤りでもない。
-- 何が起きたか: 対象キーのサムネイル処理は **t≈177-182 に 519 件**あり、そのままアプリが
-  就寝して測定区間へ入った。ところが evidence 窓は「Enter プロンプト表示〜測定終了」
-  (t≈199.7-219.8) なので、**20 秒前に完了していた keep 範囲入りが窓の外**になり
-  `matched=0` で FAIL した。`-NoLaunch` で 3 シナリオを連続実行すると必ずこうなる。
-- ずれている前提: ゲートは「evidence 窓の**中で** keep 範囲へ入ったこと」を要求するが、
-  シナリオが必要とするのは「測定中にタイルが keep 範囲に**ある**こと」。先に入って
-  居残っているタイルも等しく正しいセットアップ。
-- 直す方向 (どちらか):
-  1. 窓をセッション全体へ広げ、**最後の `nav.load_folder_begin` より後**に対象キーの
-     work があることを条件にする (= 今表示している場所のタイルだと言える)。
-  2. 窓は現状のまま、「セッション内に対象キーの work はあるが evidence 窓の外」を
-     FAIL ではなく warning にし、手順書で「連続実行時は開き直す」を明示する。
-- 1 のほうが構造的 (操作者の手順に依存しない)。着手時は
-  [idle-health-check.md](idle-health-check.md) の §3 も揃えること。
-- 規模 / 優先度: Small / P2。**毎リリース必須のチェックが手順どおりでも落ちる**状態なので、
-  次版で片付ける。
-- **v2.10.0 (2026-08-02) は 3 シナリオとも PASS**。waiver 不要。今回窓に当たらなかったのは、
-  **Enter を押す直前に対象フォルダを開き直した**ため。証拠は
-  `matched=170 (enqueue=23, idle_upgrade_enqueue=2, idle_upgrade_ineligible=2, ready=143)` で、
-  アイドル高画質化パスが対象タイルを実際に評価したうえで測定区間は完全 sleep
-  (perf event 0 件 / perf log 増加 0 バイト / CPU 1.2%)。
-  つまり**現状でも手順を「準備 → 即 Enter」に揃えれば通る**。ただしそれは操作者の手際に
-  依存する状態であり、上記の対応方針 1 (窓をセッション全体へ広げる) は引き続き有効。
-  なお `-TargetKey` が checklist から抜けていた件は `31b45449` で別途修正済み。
-- v2.9.1 の waiver 根拠 (2026-08-01 更新)。`static-foreground` / `static-background` の PASS に加え、
-  この版の変更が `video-pin-background` が見ている経路 (アイドル高画質化 / 動画ピンのタイル保持)
-  に触れていないこと。対象の変更は次のとおり:
-  - バッジレイアウト、rename 移行、ネイティブ名前ダイアログ
-  - **トレイ常駐中の再生継続** — hidden 中の `App::update` を 50ms で起こす経路を新設した。
-    アイドル高画質化とは別の wake 源だが、**静止時の消費は未実測**。次版で
-    `tray-resident` シナリオを足すこと (今回は前 2 シナリオが常駐なしの静止を見ている)。
-  - **スマートフォルダ セッション** — parked grid が keep 範囲分のサムネイルを保持する。
-  - **見開きの表示可否判定 (`FsPageLoadState`)** — 再入ループを止めた側なので、アイドル時の
-    work はむしろ減る (`9590b661`)。
-  - **入力所有権 (raw key permit / IME の viewport 分離)** と **native window health** —
-    後者は native video window が生きている間だけ 1 秒に 1 回 pump へ ping を送る。
-    無再生時は送らないが、**動画を開いたまま放置したときのアイドル影響は未実測**。
-
-- **v3.1.2 で解消・close (2026-08-18)**:
-  - A: `-ProcessId` / `-NoLaunch` / 自前 launch の選択後に 1 箇所で `Win32_Process` を照合し、
-    `--perf-log` のない command line と `%APPDATA%\mimageviewer\runtime\` 配下の展開コピーを
-    測定前に reject する。WMI が拒否された場合は path 検査だけ続け、`identity_evidence=path_only`
-    として空の測定窓を sleep 扱いしない。process report に identity evidence / command line / path を
-    保存する。
-  - B: FTS / name の各 supervisor が worker thread から `index.initial_scan_done` を出し、App は
-    両系統が完了した最初の 1 回だけ `index.initial_scan_settled` を出す。両 one-shot 完了後は
-    supervisor stats を取得せず即 return し、housekeeping の FTS-only 条件は維持した。script は
-    prompt 前にこの完了を最大 180 秒待ち、timeout は warning と
-    `index_scan_wait=timeout` で明示するが FAIL 条件にはしない。
-  - C: video-pin evidence の下限を、測定終了以前で最後の `nav.load_folder_begin` (無ければ
-    session 先頭) から analyzer が導出するよう変更し、`--evidence-start-t` を削除した。
-    report に `evidence_floor_t` / `evidence_floor_basis` を残す。
-  - analyzer の境界回帰、aggregate one-shot / supervisor 0 件 / housekeeping 不変の Rust test、
-    PowerShell の 2 reject 条件の `-SkipPrompt` 手動確認を追加・実施した。
 
 ## 6. 着手時に読み直す関連ドキュメント
 
