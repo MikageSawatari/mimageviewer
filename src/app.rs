@@ -34285,6 +34285,7 @@ impl App {
         // 割り当てた場合は競合警告の対象にし、先に消費した処理を優先する。
         let parent_key = self.keymap.consume_action(ctx, KeyAction::GridParentFolder);
         if parent_key {
+            crate::modifier_probe::record_modified_action(ctx, "GridParentFolder", "keymap");
             // フルスクリーン中の BS はフルスクリーン側ビューポートで処理する (ZIP/PDF ページ
             // なら 1 段戻って L2 ページ一覧)。ここは grid (L1/L2) での BS = 親フォルダへ。
             // Fix-B (ユーザー指摘): ★固定 中の BS は snapshot list view (= snapshot.items を

@@ -123,6 +123,7 @@ mod manual_mask_tools;
 pub mod margin_fit;
 pub mod mask_db;
 pub mod metadata_cleanup;
+mod modifier_probe;
 pub mod monitor;
 pub mod name_bulk_indexer;
 pub mod name_index_supervisor;
@@ -1233,6 +1234,7 @@ pub fn run() -> eframe::Result {
             emit_startup("creator_enter", None);
             #[cfg(windows)]
             key_input::install_synthetic_input_plugin(&cc.egui_ctx);
+            modifier_probe::install(&cc.egui_ctx);
             ime_focus::install_ime_input_policy(&cc.egui_ctx);
             egui_focus_policy::install_tab_shortcut_focus_policy(&cc.egui_ctx);
             double_click_time::configure_context(&cc.egui_ctx);

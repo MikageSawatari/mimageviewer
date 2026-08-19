@@ -18301,7 +18301,7 @@ impl App {
 
         // ナビゲーションキーは input_mut で消費して、パネル内ウィジェット（スライダー等）に
         // 奪われないようにする
-        let esc = fullscreen_raw_key_permit.is_some_and(|permit| {
+        let escape_close = fullscreen_raw_key_permit.is_some_and(|permit| {
             crate::keyboard_input::consume_fullscreen_raw_key(
                 ctx,
                 permit,
@@ -18335,9 +18335,16 @@ impl App {
             self.fs_context_menu_idx.is_some(),
             self.fs_suppress_enter_close_until_release,
         );
-        let fs_close_key =
-            !esc && enter_consume_ok && self.keymap.consume_action(ctx, KeyAction::FsClose);
-        let esc = esc || fs_close_key;
+        let fs_close_key = !escape_close
+            && enter_consume_ok
+            && self.keymap.consume_action(ctx, KeyAction::FsClose);
+        if escape_close {
+            crate::modifier_probe::record_modified_action(ctx, "FsClose", "escape");
+        }
+        if fs_close_key {
+            crate::modifier_probe::record_modified_action(ctx, "FsClose", "keymap");
+        }
+        let esc = escape_close || fs_close_key;
         // 左右キーは上下と分離して処理（RTL 反転のため）
         let ctrl_d_count = self
             .keymap
@@ -19065,6 +19072,9 @@ impl App {
         // Q は片手で押しやすいショートカット (補正パネルでの操作中に素早く元に戻したい用途)
         let clear_page_key =
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsClearAdjust);
+        if clear_page_key {
+            crate::modifier_probe::record_modified_action(ctx, "FsClearAdjust", "keymap");
+        }
 
         // 表示モード切替 + フィードバック表示
         let new_spread = if key_1 {
@@ -19289,6 +19299,7 @@ impl App {
             .is_some_and(crate::folder_tree::is_open_as_container)
             || self.auto_open_for_current_container();
         if self.keymap.consume_action(ctx, KeyAction::FsBackToList) {
+            crate::modifier_probe::record_modified_action(ctx, "FsBackToList", "keymap");
             if viewing_container_page {
                 action.close_to_page_list = true;
             } else {
@@ -22107,6 +22118,7 @@ impl App {
             if self.fs_zoom_aiming || (self.fs_zoom_active && ctrl_held) {
                 // ZipPla 準拠: 照準中 (Z 押下中) はホイールで枠サイズ=倍率。ズーム確定後は
                 // Ctrl+ホイールのときだけ倍率変更。
+                crate::modifier_probe::record_modified_action(ctx, "FsWheelZoom", "zoom_mode");
                 self.adjust_fs_zoom_factor(wheel_y);
             } else if self.fs_zoom_active {
                 // ZipPla 準拠: ズーム確定中の修飾なしホイールは通常どおり前後ページ移動。
@@ -22114,6 +22126,7 @@ impl App {
                 page_nav = self.spread_page_nav(base);
             } else if self.analysis_mode {
                 // 分析モード: ホイールでズーム
+                crate::modifier_probe::record_modified_action(ctx, "FsWheelZoom", "analysis");
                 let mouse = ctx.input(|i| i.pointer.hover_pos());
                 let image_rect = analysis_image_rect(full_rect);
                 let changed = Self::apply_wheel_zoom(
@@ -22128,6 +22141,7 @@ impl App {
                 }
             } else if self.handle_panorama_wheel_if_active(ctx, wheel_y, ctrl_held) {
                 // 360 度パノラマビュー: ホイールを FOV 調整に転用 (Ctrl 有無に関わらず)。
+                crate::modifier_probe::record_modified_action(ctx, "FsWheelZoom", "panorama_fov");
                 // 2026-05 ユーザー要望: 拡大縮小のつもりでホイールを回して画像が切り替
                 // わる事故を避けるため、360 ON 時はホイール全部 (= 修飾キー無視) を
                 // FOV 操作に振る。前後ナビは矢印キーで行う。
@@ -22140,6 +22154,7 @@ impl App {
                     // 消しゴム / 隠蔽加工モード中は画像上の修飾なしホイールも
                     // ズームへ割り当てる。パネル上は cursor_in_panel でここへ来ないため
                     // パネルスクロールを維持できる。
+                    crate::modifier_probe::record_modified_action(ctx, "FsWheelZoom", "edit_mode");
                     let mouse = ctx.input(|i| i.pointer.hover_pos());
                     let mut proposed_zoom = self.fs_zoom;
                     let mut proposed_pan = self.fs_pan;
