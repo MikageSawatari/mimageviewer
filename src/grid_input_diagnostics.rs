@@ -144,6 +144,10 @@ impl GridPointerTrace {
 pub(crate) struct GridCellSignal {
     pub(crate) first_click: bool,
     pub(crate) double_clicked: bool,
+    pub(crate) time_since_last_click: f32,
+    pub(crate) max_double_click_delay: f64,
+    pub(crate) clicked_by_primary: bool,
+    pub(crate) double_clicked_by_primary: bool,
     pub(crate) drag_started: bool,
     pub(crate) release_pos: Option<(f32, f32)>,
     pub(crate) block_reason: Option<GridOpenBlockReason>,
@@ -219,6 +223,19 @@ pub(crate) fn cell_signal_events(
     signal_extras.extend([
         ("first_click", Value::from(signal.first_click)),
         ("double_clicked", Value::from(signal.double_clicked)),
+        (
+            "time_since_last_click",
+            Value::from(signal.time_since_last_click),
+        ),
+        (
+            "max_double_click_delay",
+            Value::from(signal.max_double_click_delay),
+        ),
+        ("clicked_by_primary", Value::from(signal.clicked_by_primary)),
+        (
+            "double_clicked_by_primary",
+            Value::from(signal.double_clicked_by_primary),
+        ),
         ("drag_started", Value::from(signal.drag_started)),
         (
             "release_x",
@@ -419,6 +436,10 @@ mod tests {
         let signal = GridCellSignal {
             first_click: false,
             double_clicked: true,
+            time_since_last_click: 0.228,
+            max_double_click_delay: 0.5,
+            clicked_by_primary: true,
+            double_clicked_by_primary: true,
             drag_started: false,
             release_pos: Some((121.0, 241.0)),
             block_reason: Some(GridOpenBlockReason::BadgeHit),
@@ -442,6 +463,10 @@ mod tests {
         let signal = GridCellSignal {
             first_click: false,
             double_clicked: false,
+            time_since_last_click: 0.649,
+            max_double_click_delay: 0.5,
+            clicked_by_primary: false,
+            double_clicked_by_primary: false,
             drag_started: false,
             release_pos: Some((500.0, 500.0)),
             block_reason: None,
@@ -464,6 +489,70 @@ mod tests {
     }
 
     #[test]
+    fn cell_signal_always_reports_egui_click_observations() {
+        let cases = [
+            GridCellSignal {
+                first_click: true,
+                double_clicked: false,
+                time_since_last_click: 0.228,
+                max_double_click_delay: 0.5,
+                clicked_by_primary: false,
+                double_clicked_by_primary: false,
+                drag_started: false,
+                release_pos: Some((121.0, 241.0)),
+                block_reason: None,
+                activation: GridActivationDiagnostic::Ignored(
+                    GridActivationIgnoredReason::SelectionOnly,
+                ),
+            },
+            GridCellSignal {
+                first_click: true,
+                double_clicked: true,
+                time_since_last_click: 0.4,
+                max_double_click_delay: 0.5,
+                clicked_by_primary: true,
+                double_clicked_by_primary: true,
+                drag_started: false,
+                release_pos: Some((121.0, 241.0)),
+                block_reason: None,
+                activation: GridActivationDiagnostic::Accepted,
+            },
+        ];
+        assert!(cases[0].first_click);
+        assert!(!cases[0].clicked_by_primary);
+
+        for signal in cases {
+            let events = cell_signal_events(true, &cell_trace(), &signal);
+            let cell_signal = events
+                .iter()
+                .find(|event| event.kind == "cell_signal")
+                .unwrap();
+            assert!(
+                cell_signal
+                    .extras
+                    .contains(&("first_click", Value::from(signal.first_click)))
+            );
+            assert!(cell_signal.extras.contains(&(
+                "time_since_last_click",
+                Value::from(signal.time_since_last_click)
+            )));
+            assert!(cell_signal.extras.contains(&(
+                "max_double_click_delay",
+                Value::from(signal.max_double_click_delay)
+            )));
+            assert!(
+                cell_signal
+                    .extras
+                    .contains(&("clicked_by_primary", Value::from(signal.clicked_by_primary),))
+            );
+            assert!(cell_signal.extras.contains(&(
+                "double_clicked_by_primary",
+                Value::from(signal.double_clicked_by_primary),
+            )));
+        }
+    }
+
+    #[test]
     fn perf_off_builds_no_grid_events() {
         let trace = cell_trace();
         assert!(pointer_press_events(false, &trace).is_empty());
@@ -474,6 +563,10 @@ mod tests {
                 &GridCellSignal {
                     first_click: true,
                     double_clicked: false,
+                    time_since_last_click: 0.2,
+                    max_double_click_delay: 0.5,
+                    clicked_by_primary: true,
+                    double_clicked_by_primary: false,
                     drag_started: false,
                     release_pos: None,
                     block_reason: None,

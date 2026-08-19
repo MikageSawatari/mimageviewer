@@ -1082,6 +1082,15 @@
     2 回目に `double_clicked=false`、または `accepted=false` / `ignored_reason=no_cell_signal`
     なら入力未成立側。`block_reason` は `modal_dialog` / `context_menu` / `badge_hit` /
     `native_drag_drop` の閉じた値で、自由文ではない。
+  - `cell_signal` は成功 / 失敗を問わず `time_since_last_click`、`max_double_click_delay`、
+    `clicked_by_primary`、`double_clicked_by_primary` を持つ。失敗例だけに限定せず、同じ session の
+    成功例を control として比較する。
+  - `time_since_last_click` が実測間隔と一致し、`max_double_click_delay` がそれより大きいのに
+    `double_clicked_by_primary=false` なら egui の判定と矛盾するため、pass 構成や widget id を疑う。
+  - `time_since_last_click` が実測間隔より大きいなら、直前のクリックが egui の
+    `last_click_time` を更新していない。特に `clicked_by_primary=false` かつ `first_click=true` なら
+    fake primary click 由来で、pointer click として成立していない可能性が本命になる。
+  - `max_double_click_delay=0.3` のままなら、§2.9 の設定がその egui Context へ届いていない。
   - `grid/activation_request accepted=true` と `grid/activation_dispatch_complete` がある場合は、
     同じ `seq` と archive key で `rar/inspection_begin` → `rar/decision_cache_hit|miss` →
     `rar/inspection_end|cancel|error` を追う。`inspection_end` は `origin`、`ms`、
@@ -1110,10 +1119,36 @@
   既存注意書きも案内する。
 - **§2.5 の再クリック open で症状が見えなくなっても、本項を解決扱いにしない。** 既存の
   ダブルクリック経路は独立して診断し、根本原因が判明してから修正・回帰テストを入れる。
-- **2026-08-19: §2.9 を実装したが、本項は未解決のまま。** Windows のダブルクリック間隔へ
-  合わせる修正は現時点の最有力仮説だが、原因を証明するものではない。報告環境での再現と
-  既存計装ログにより、2 回の押下に対して `double_clicked` が成立したかを確認して判断する。
-- 優先度: P2 調査。計装と診断 ZIP flush は実装済み。**未解決のまま報告環境のログ待ち**。
+- **2026-08-19: 報告環境の perf log で症状を捕捉したが、本項は未解決のまま。** PDF を Esc で
+  閉じた直後、アイドル高画質化中に同じ PDF タイル (idx 9) を 3 回クリックし、3 回とも
+  `first_click=true` / `double_clicked=false` だった。2 回目の release から 3 回目の release まで
+  228ms なのに成立せず、同じ session の idx 12 では 400ms 間隔で `double_clicked=true` が
+  成立した。実機の `GetDoubleClickTime()` は 500ms であり、228ms は egui 既定 300ms の内側でも
+  ある。位置も同じセル内なので、最近変更した時間閾値と same-cell / 距離条件は原因ではない。
+  egui が直前のクリックを `last_click_time` へ数えていない可能性を次に観測する。
+- この観測のため、既存 `grid/cell_signal` へ上記 4 属性を無条件追加した。新しいイベントや
+  発火条件は増やさず、成功クリックも同じ属性を出して比較対象にする。原因が確定するまで
+  guard / retry / 閾値再調整などの症状修正は行わない。
+- 優先度: P2 調査。計装と診断 ZIP flush、egui click-count 観測属性は実装済み。
+  **エントリは閉じず、追加属性を含む報告環境のログ待ち**。
+
+- **原因確定 (2026-08-19、実機 perf log)。§2.6 の「時々無反応」はこれだった:**
+  egui は `count = if triple_click { 3 } else if double_click { 2 } else { 1 }` で数え、
+  `is_double()` は **`count == 2` の完全一致**。`triple_click` は
+  **`max_double_click_delay * 2` を「前々回のクリック」から測る**
+  (`egui-0.33.3/src/input_state/mod.rs:1213-1222`, `1006-1011`)。
+  つまり **3 回目のクリックは triple になり、`double_clicked()` が false になる**。
+- 実測ログ (idx 9、同一セル、同一座標): 離す時刻 165.735 / 166.384 / 166.612。
+  3 回目は前回から **228ms** (double 成立) だが、前々回から **877ms** で
+  `2 x 500ms = 1000ms` の内側 → **triple 判定 → 何も開かない**。
+  同 session の成功例は 400ms 間隔の 2 回目 (`double_clicked: true`)。
+  **400ms が成立して 228ms が成立しない**という逆転がこれで説明できる。
+- **1 回目が開かなかった利用者はもう一度クリックする。その 3 回目がちょうどここに落ちる。**
+  「何度かやると反応する」はクリック回数の位相の問題だった。
+- §2.9 はこれを**悪化させた** (triple 窓が 600ms → 1000ms)。ただし原因ではなく、
+  300ms でも 600ms 以内に 3 回クリックすれば同じ。**§2.6 は v3.1.1 以前からあった。**
+- 修正: グリッドの起動判定を `double_clicked() || triple_clicked()` にした。
+  ここでは 1 を超える count はすべて「開く」意味しか持たない。同セル条件は据え置き。
 
 ### 2.9 一覧のダブルクリック間隔を Windows 設定へ合わせる — 対応済み (v3.1.2、専用スレ >>253-254)
 

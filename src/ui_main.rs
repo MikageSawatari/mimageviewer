@@ -12467,6 +12467,7 @@ impl App {
 
     fn start_grid_pointer_trace(
         &mut self,
+        ctx: &egui::Context,
         target: crate::grid_input_diagnostics::GridPointerTarget,
         pos: egui::Pos2,
     ) {
@@ -12487,6 +12488,12 @@ impl App {
                     &crate::grid_input_diagnostics::GridCellSignal {
                         first_click: false,
                         double_clicked: false,
+                        time_since_last_click: ctx
+                            .input(|input| input.pointer.time_since_last_click()),
+                        max_double_click_delay: ctx
+                            .options(|options| options.input_options.max_double_click_delay),
+                        clicked_by_primary: false,
+                        double_clicked_by_primary: false,
                         drag_started: false,
                         release_pos: None,
                         block_reason,
@@ -12555,6 +12562,7 @@ impl App {
             return;
         };
         self.start_grid_pointer_trace(
+            ctx,
             crate::grid_input_diagnostics::GridPointerTarget::Cell {
                 idx,
                 item_key: item.perf_key(),
@@ -12567,6 +12575,7 @@ impl App {
 
     fn report_grid_cell_signal(
         &mut self,
+        ctx: &egui::Context,
         idx: usize,
         signal: crate::grid_input_diagnostics::GridCellSignal,
     ) -> Option<crate::grid_input_diagnostics::GridActivationDispatchGuard> {
@@ -12587,6 +12596,7 @@ impl App {
                 .map(|(x, y)| egui::pos2(x, y))
                 .unwrap_or_default();
             self.start_grid_pointer_trace(
+                ctx,
                 crate::grid_input_diagnostics::GridPointerTarget::Cell {
                     idx,
                     item_key: item.perf_key(),
@@ -12637,6 +12647,12 @@ impl App {
                     &crate::grid_input_diagnostics::GridCellSignal {
                         first_click: false,
                         double_clicked: false,
+                        time_since_last_click: ctx
+                            .input(|input| input.pointer.time_since_last_click()),
+                        max_double_click_delay: ctx
+                            .options(|options| options.input_options.max_double_click_delay),
+                        clicked_by_primary: false,
+                        double_clicked_by_primary: false,
                         drag_started: false,
                         release_pos,
                         block_reason,
@@ -12674,6 +12690,7 @@ impl App {
             return;
         };
         self.start_grid_pointer_trace(
+            ctx,
             crate::grid_input_diagnostics::GridPointerTarget::Background,
             pos,
         );
@@ -12703,6 +12720,21 @@ impl App {
         // 発火しつつ、drag_started_by(Primary) で native ファイル D&D を開始できる。
         let response = ui.interact(cell_rect, ui.id().with(idx), egui::Sense::click_and_drag());
         self.begin_grid_cell_pointer_trace(ctx, cell_rect, idx);
+        let (
+            time_since_last_click,
+            max_double_click_delay,
+            clicked_by_primary,
+            double_clicked_by_primary,
+        ) = if crate::perf::is_enabled() {
+            (
+                ctx.input(|input| input.pointer.time_since_last_click()),
+                ctx.options(|options| options.input_options.max_double_click_delay),
+                response.clicked_by(egui::PointerButton::Primary),
+                response.double_clicked_by(egui::PointerButton::Primary),
+            )
+        } else {
+            (0.0, 0.0, false, false)
+        };
         let mut nav = None;
         if !self.any_dialog_open()
             && !self.items_are_drive_list
@@ -12800,7 +12832,16 @@ impl App {
             );
             self.update_last_selected_image();
         }
-        let activate = (response.double_clicked() && same_cell_as_previous_primary_click)
+        // egui counts a click as a triple when it lands within twice the double-click delay of
+        // the one before last, and `double_clicked()` is `count == 2` exactly, so the third click
+        // of a run reports itself as a triple and nothing opens. A reader who clicks again
+        // because the first attempt did nothing lands exactly there, which is what made opening
+        // look intermittent (backlog 2.6, measured 2026-08-19: releases at 165.735 / 166.384 /
+        // 166.612 with a 500ms delay - the last is 228ms after its predecessor and 877ms after
+        // the first, so egui called it a triple). Opening is what every count above one means
+        // here.
+        let double_or_triple = response.double_clicked() || response.triple_clicked();
+        let activate = (double_or_triple && same_cell_as_previous_primary_click)
             || (response.clicked()
                 && grid_reclick_open_allowed(
                     selected_before_click,
@@ -12836,10 +12877,15 @@ impl App {
             == Some(idx);
         if badge_clicked {
             let _dispatch = self.report_grid_cell_signal(
+                ctx,
                 idx,
                 crate::grid_input_diagnostics::GridCellSignal {
                     first_click: response.clicked(),
                     double_clicked: response.double_clicked(),
+                    time_since_last_click,
+                    max_double_click_delay,
+                    clicked_by_primary,
+                    double_clicked_by_primary,
                     drag_started,
                     release_pos,
                     block_reason,
@@ -12863,10 +12909,15 @@ impl App {
             if trace_matches_idx || response.clicked() || response.double_clicked() || drag_started
             {
                 let _dispatch = self.report_grid_cell_signal(
+                    ctx,
                     idx,
                     crate::grid_input_diagnostics::GridCellSignal {
                         first_click: response.clicked(),
                         double_clicked: response.double_clicked(),
+                        time_since_last_click,
+                        max_double_click_delay,
+                        clicked_by_primary,
+                        double_clicked_by_primary,
                         drag_started,
                         release_pos,
                         block_reason,
@@ -12883,10 +12934,15 @@ impl App {
         }
         if activate && self.items_are_bookmark_view {
             let _dispatch = self.report_grid_cell_signal(
+                ctx,
                 idx,
                 crate::grid_input_diagnostics::GridCellSignal {
                     first_click: response.clicked(),
                     double_clicked: response.double_clicked(),
+                    time_since_last_click,
+                    max_double_click_delay,
+                    clicked_by_primary,
+                    double_clicked_by_primary,
                     drag_started,
                     release_pos,
                     block_reason,
@@ -12901,10 +12957,15 @@ impl App {
         let activation_allowed = activate && self.guard_reading_history_open(idx);
         let _activation_dispatch = if activation_allowed {
             self.report_grid_cell_signal(
+                ctx,
                 idx,
                 crate::grid_input_diagnostics::GridCellSignal {
                     first_click: response.clicked(),
                     double_clicked: response.double_clicked(),
+                    time_since_last_click,
+                    max_double_click_delay,
+                    clicked_by_primary,
+                    double_clicked_by_primary,
                     drag_started,
                     release_pos,
                     block_reason,
@@ -12927,10 +12988,15 @@ impl App {
                 crate::grid_input_diagnostics::GridActivationIgnoredReason::ClickNotRecognized
             });
             self.report_grid_cell_signal(
+                ctx,
                 idx,
                 crate::grid_input_diagnostics::GridCellSignal {
                     first_click: response.clicked(),
                     double_clicked: response.double_clicked(),
+                    time_since_last_click,
+                    max_double_click_delay,
+                    clicked_by_primary,
+                    double_clicked_by_primary,
                     drag_started,
                     release_pos,
                     block_reason,
@@ -20981,6 +21047,38 @@ mod grid_reclick_open_tests {
         harness.run_steps(40);
         click_cell(&mut harness, 0, egui::Modifiers::NONE);
         assert_eq!(harness.state().activations, 1);
+    }
+
+    #[test]
+    fn third_click_of_a_run_still_opens_although_egui_calls_it_a_triple() {
+        // egui labels a click a triple when it lands within twice the double-click delay of the
+        // one before last, and `double_clicked()` is `count == 2` exactly. A reader whose first
+        // attempt did nothing clicks again and lands on that third click, so opening looked
+        // intermittent (backlog 2.6).
+        let mut harness =
+            handler_harness(GridClickSelectionMode::Explorer, false, None, false, false);
+
+        click_cell(&mut harness, 0, egui::Modifiers::NONE);
+        assert_eq!(
+            harness.state().activations,
+            0,
+            "the first click only selects"
+        );
+
+        // Far enough apart that egui counts this as a fresh first click, which is the state the
+        // reader is in after a double click failed to register.
+        harness.run_steps(40);
+        click_cell(&mut harness, 0, egui::Modifiers::NONE);
+        assert_eq!(harness.state().activations, 0);
+
+        // Close enough to be a double, but also inside twice the delay from the click before it,
+        // so egui reports a triple and nothing but this fix opens the item.
+        click_cell(&mut harness, 0, egui::Modifiers::NONE);
+        assert_eq!(
+            harness.state().activations,
+            1,
+            "a third click on the same cell has to open it like the second would have"
+        );
     }
 
     #[test]
