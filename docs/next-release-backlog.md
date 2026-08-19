@@ -1130,7 +1130,30 @@
   - Windows 以外は egui 既定の 300ms を変更しない。セッション中の OS 設定変更には追随せず、
     再起動時に反映する。
   - §2.6 は最有力仮説との位置付けに留め、未解決・診断ログ待ちのまま維持する。
+- **2026-08-19 追補 (利用者の v2.9 実機確認)**:
+  - egui 0.33.3 はクリック間の時間だけを保持し、前回クリック位置を保持しない。一方 Windows は
+    `GetDoubleClickTime` と `SM_CXDOUBLECLK` / `SM_CYDOUBLECLK` の両方でクリックを組にする。
+    §2.9 で時間を OS 設定へ合わせた判断は維持し、不足していた場所条件を一覧セル側へ追加した。
+  - グリッドの `response.double_clicked()` は、直前に primary click を受理したセルの idx が同じ場合
+    だけ open として扱う。前回 idx は選択変更前に読み、今回の `response.clicked()` による更新は
+    open 判定後に行う。セル以外の primary click は記憶を消す。
+  - Windows のピクセル距離は再実装しない。セル内で少し移動した 2 打目は従来どおり開ける。
+    グリッド以外に残る egui の `double_clicked()` 消費箇所は §2.10 へ分離した。
 - 規模 / 優先度: Small / P2。v3.1.2 対応済み。
+
+### 2.10 グリッド以外の egui ダブルクリック消費箇所に場所条件が無い
+
+- 出典: §2.9 追補の `Response::double_clicked()` 全箇所棚卸し (2026-08-19)。egui 0.33.3 は
+  前回クリック位置を持たないため、同じ context 内の離れた widget / 領域のクリックも時間内なら
+  ダブルクリックとして各 consumer へ届き得る。
+- 今回は利用者報告のあったグリッドセルだけを修正し、本項の consumer は変更しない。現存する
+  8 分岐は、詳細表示の列幅 best-fit、360° navigator の視点移動、通常 navigator の zoom 中心移動、
+  分析表示の zoom reset、通常 fullscreen の transform reset、360° canvas の視点 reset、native
+  presenter egui overlay の音量 reset と再生速度 reset。
+- native HWND が `WM_*BUTTONDBLCLK` から作る `double_click` は Windows 自身の時間・距離判定を
+  通るため本項の対象外。着手時は一律のピクセル閾値を足さず、各 consumer の意味単位 (同じ
+  handle / navigator / canvas / slider など) と、別 widget クリックで pair を切る owner を決める。
+- 優先度: P2。latent 誤操作の棚卸し項目で、実害報告が出た consumer から個別に再現確認する。
 
 ### 2.4 CSV / TSV からの一括タグ / レーティング付与 — 保留
 

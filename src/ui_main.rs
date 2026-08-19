@@ -12673,6 +12673,14 @@ impl App {
         );
     }
 
+    fn begin_grid_primary_click_frame(&mut self, primary_clicked: bool) -> Option<usize> {
+        if primary_clicked {
+            self.last_primary_clicked_grid_idx.take()
+        } else {
+            self.last_primary_clicked_grid_idx
+        }
+    }
+
     /// グリッドセルのクリック・ダブルクリック・右クリックを処理する。
     /// ダブルクリックでフォルダに入る場合はそのパスを返す。
     fn handle_cell_interaction(
@@ -12683,6 +12691,7 @@ impl App {
         idx: usize,
         overlay_layout: &crate::thumb_overlay_layout::ThumbnailOverlayLayout,
         touch_derived_pointer_activity: bool,
+        previous_primary_clicked_grid_idx: Option<usize>,
     ) -> Option<PathBuf> {
         // click_and_drag: clicked() / double_clicked() / secondary_clicked() は従来通り
         // 発火しつつ、drag_started_by(Primary) で native ファイル D&D を開始できる。
@@ -12756,6 +12765,7 @@ impl App {
                     .is_some_and(|pos| badge_rect.contains(pos))
             });
         let selected_before_click = self.selected == Some(idx);
+        let same_cell_as_previous_primary_click = previous_primary_clicked_grid_idx == Some(idx);
         let no_other_cell_checked_before_click =
             self.checked.iter().all(|&checked_idx| checked_idx == idx);
         let ctrl = ctx.input(|i| i.modifiers.ctrl);
@@ -12782,7 +12792,7 @@ impl App {
             );
             self.update_last_selected_image();
         }
-        let activate = response.double_clicked()
+        let activate = (response.double_clicked() && same_cell_as_previous_primary_click)
             || (response.clicked()
                 && grid_reclick_open_allowed(
                     selected_before_click,
@@ -12793,6 +12803,11 @@ impl App {
                     shift,
                     touch_derived_pointer_activity,
                 ));
+        // The same-cell flag must be captured before this update. Otherwise every double-click
+        // signal would compare the current cell with itself.
+        if response.clicked() {
+            self.last_primary_clicked_grid_idx = Some(idx);
+        }
         let drag_started = response.drag_started_by(egui::PointerButton::Primary);
         let native_drag_started = native_grid_drag_start_allowed(
             self.items_are_drive_list,
@@ -13309,6 +13324,7 @@ impl App {
         ctx: &egui::Context,
         scroll_to: bool,
         spread_pair_cursor_idx: Option<usize>,
+        previous_primary_clicked_grid_idx: Option<usize>,
     ) -> Option<PathBuf> {
         let horizontal_source_rect = ui.available_rect_before_wrap();
         let avail_w = horizontal_source_rect.width().max(1.0);
@@ -13454,6 +13470,7 @@ impl App {
                                 idx,
                                 &no_thumbnail_overlays,
                                 false,
+                                previous_primary_clicked_grid_idx,
                             ) {
                                 nav = Some(n);
                             }
@@ -15073,6 +15090,12 @@ impl App {
 
         egui::CentralPanel::default()
             .show(ctx, |ui| -> Option<PathBuf> {
+                // egui pairs clicks by time only. Preserve the previous cell for this frame's
+                // activation check, while clearing App state up front so any primary click that
+                // is not accepted by a cell breaks the pair.
+                let previous_primary_clicked_grid_idx = self.begin_grid_primary_click_frame(
+                    ctx.input(|input| input.pointer.primary_clicked()),
+                );
                 // Sole MainGrid driver. Embedded still fullscreen returns
                 // before render_grid, preventing a double feed on main ctx.
                 let touch_scroll_enabled =
@@ -15248,7 +15271,13 @@ impl App {
                 let spread_pair_cursor_idx = self.main_grid_spread_pair_cursor_idx();
 
                 if self.settings.grid_view_mode == GridViewMode::Details {
-                    let nav = self.render_details_list(ui, ctx, scroll_to, spread_pair_cursor_idx);
+                    let nav = self.render_details_list(
+                        ui,
+                        ctx,
+                        scroll_to,
+                        spread_pair_cursor_idx,
+                        previous_primary_clicked_grid_idx,
+                    );
                     self.begin_grid_background_pointer_trace(ctx, ui.max_rect());
                     self.finish_grid_pointer_trace(ctx);
                     return nav;
@@ -15658,6 +15687,7 @@ impl App {
                                     idx,
                                     &overlay_layout,
                                     touch_derived_pointer_activity,
+                                    previous_primary_clicked_grid_idx,
                                 ) {
                                     nav = Some(n);
                                 }
@@ -20835,6 +20865,10 @@ mod grid_reclick_open_tests {
             .build_state(
                 |ctx, state| {
                     egui::CentralPanel::default().show(ctx, |ui| {
+                        let previous_primary_clicked_grid_idx =
+                            state.app.begin_grid_primary_click_frame(
+                                ctx.input(|input| input.pointer.primary_clicked()),
+                            );
                         for idx in 0..state.app.items.len() {
                             if state
                                 .app
@@ -20845,6 +20879,7 @@ mod grid_reclick_open_tests {
                                     idx,
                                     &crate::thumb_overlay_layout::ThumbnailOverlayLayout::default(),
                                     state.touch_derived_pointer_activity,
+                                    previous_primary_clicked_grid_idx,
                                 )
                                 .is_some()
                             {
@@ -20874,6 +20909,19 @@ mod grid_reclick_open_tests {
                 },
                 modifiers,
             );
+        }
+        harness.run();
+    }
+
+    fn click_at(harness: &mut Harness<'static, HandlerState>, pos: egui::Pos2) {
+        harness.hover_at(pos);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
         }
         harness.run();
     }
@@ -21050,6 +21098,32 @@ mod grid_reclick_open_tests {
         click_cell(&mut harness, 0, egui::Modifiers::NONE);
         click_cell(&mut harness, 0, egui::Modifiers::NONE);
         assert_eq!(harness.state().activations, 1);
+    }
+
+    #[test]
+    fn quick_click_on_different_cell_does_not_open_in_check_mode() {
+        let mut harness = handler_harness(GridClickSelectionMode::Check, false, None, false, false);
+
+        click_cell(&mut harness, 0, egui::Modifiers::NONE);
+        click_cell(&mut harness, 1, egui::Modifiers::NONE);
+
+        assert_eq!(harness.state().activations, 0);
+        assert_eq!(harness.state().app.last_primary_clicked_grid_idx, Some(1));
+    }
+
+    #[test]
+    fn non_cell_click_breaks_grid_double_click_pair() {
+        let mut harness = handler_harness(GridClickSelectionMode::Check, false, None, false, false);
+        click_cell(&mut harness, 0, egui::Modifiers::NONE);
+        // Keep the remembered cell but end egui's first timing window, then make the blank click
+        // the only click that the following cell click could pair with.
+        harness.run_steps(40);
+        click_at(&mut harness, egui::pos2(440.0, 170.0));
+        assert_eq!(harness.state().app.last_primary_clicked_grid_idx, None);
+
+        click_cell(&mut harness, 0, egui::Modifiers::NONE);
+
+        assert_eq!(harness.state().activations, 0);
     }
 
     #[test]

@@ -9181,6 +9181,9 @@ pub struct App {
     pub(crate) display_identity_error: std::cell::RefCell<Option<String>>,
     pub(crate) thumbnails: Vec<ThumbnailState>,
     pub(crate) selected: Option<usize>,
+    /// 直前に primary click を受理したグリッドセル。egui のダブルクリック判定には
+    /// 前回位置が無いため、セルを開く側で同じセルか確認する。
+    pub(crate) last_primary_clicked_grid_idx: Option<usize>,
     /// Shift+クリックの起点。index と items 世代を一体で保持し、別一覧の同じ index を
     /// 誤って起点にしない。表示中の一覧コンテキストと一緒に所有・交換する。
     pub(crate) grid_click_selection_anchor: Option<GridClickSelectionAnchor>,
@@ -12893,6 +12896,7 @@ impl App {
             display_identity_error: std::cell::RefCell::new(None),
             thumbnails: Vec::new(),
             selected: None,
+            last_primary_clicked_grid_idx: None,
             grid_click_selection_anchor: None,
             settings,
             creative_lut_library,
