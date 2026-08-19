@@ -11580,12 +11580,11 @@ pub struct App {
     /// `None` はまだ活動が記録されていない状態 (= 直前に活動があったとみなしカーソル表示)。
     /// パネル / HUD 表示中もタイマをリセットする (= 表示が消えてから設定秒数を測り直し)。
     pub(crate) cursor_last_activity: Option<std::time::Instant>,
-    /// 直前フレームでカーソルを `CursorIcon::None` で隠した sticky フラグ。
-    /// 隠した後は次のマウス操作 / UI 表示までこの状態を維持する。これにより idle 判定直後の
-    /// 1 フレームで隠した後、render が間引かれてもカーソルが復活しない (egui は
-    /// 毎フレーム set_cursor_icon を呼ばないと cursor 状態が消えるため、`cursor_hidden`
-    /// が true の間は毎フレーム None を打ち続ける)。
-    pub(crate) cursor_hidden: bool,
+    /// OS カーソルを隠している理由。idle は次のマウス操作 / UI 表示まで sticky、
+    /// Z 照準は `fs_zoom_aiming` から毎フレーム導出する。
+    /// egui の cursor icon は frame 跨ぎで sticky にならないため、理由がある間は
+    /// `update_fullscreen_cursor_visibility` が毎フレーム `CursorIcon::None` を適用する。
+    pub(crate) cursor_hide_reason: Option<crate::ui_fullscreen::FsCursorHide>,
     /// 動画倍速再生の現在設定。HUD 操作時は settings.video_playback_speed に保存する。
     pub(crate) video_playback_speed: f64,
     /// 動画ミュートのセッション内状態。HUD 操作時は settings.video_muted に保存し、
@@ -13827,7 +13826,7 @@ impl App {
             fs_feedback_toast_surface: None,
             stamp_embed_pending: None,
             cursor_last_activity: None,
-            cursor_hidden: false,
+            cursor_hide_reason: None,
             video_playback_speed,
             video_session_muted,
             music_analysis_path: None,
@@ -37625,7 +37624,7 @@ impl App {
             // main / 次の viewer へ持ち越さない。新規 viewer は open_fullscreen で timer を
             // 初期化するため、ここでは close_fullscreen と同じ空の baseline に戻す。
             self.cursor_last_activity = None;
-            self.cursor_hidden = false;
+            self.cursor_hide_reason = None;
         }
 
         // Active -> Passive の切替では OS viewport 自体は閉じない。active session と
@@ -43441,7 +43440,7 @@ impl App {
         // fullscreen 内ナビは cursor 状態を保存・復元する
         // `open_fullscreen_from_fs_navigation` のようなラッパーを通すこと。
         self.cursor_last_activity = Some(std::time::Instant::now());
-        self.cursor_hidden = false;
+        self.cursor_hide_reason = None;
         self.refresh_fullscreen_video_marker_cache(idx);
         self.adjust_spread_target = AdjustSpreadTarget::Left;
         // PDF pool の Critical 予約は `pdf_loader::CRITICAL_RESERVATION_ACTIVE` を
@@ -51382,7 +51381,7 @@ impl App {
         }
         // 次回フルスクリーン入場時に古い活動時刻 / hidden 状態を引き継がないようクリア。
         self.cursor_last_activity = None;
-        self.cursor_hidden = false;
+        self.cursor_hide_reason = None;
         // ※ ここで `fs_nav_locked` / `fs_holdover_tex` を即時クリアしてはいけない:
         //   `apply_folder_nav_result` の Fullscreen 分岐は close_fullscreen → load_folder
         //   → open_fullscreen と直列に呼ぶ。途中で lock を捨てると PDF/ZIP enumerate defer

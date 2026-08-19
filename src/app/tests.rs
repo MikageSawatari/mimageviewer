@@ -32153,7 +32153,7 @@ mod still_window_mode_key_tests {
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.cursor_last_activity = Some(std::time::Instant::now());
-        app.cursor_hidden = true;
+        app.cursor_hide_reason = Some(crate::ui_fullscreen::FsCursorHide::Idle);
 
         app.handoff_active_detached_viewport_to_passive("test_handoff");
 
@@ -32181,7 +32181,7 @@ mod still_window_mode_key_tests {
         );
         assert_eq!(app.cursor_last_activity, None);
         assert!(
-            !app.cursor_hidden,
+            !app.cursor_hidden(),
             "active viewer auto-hide state must not leak into the passive or next viewer"
         );
     }
@@ -39524,7 +39524,7 @@ mod still_window_mode_key_tests {
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.begin_active_detached_session(7, DetachedSource::Image);
         app.cursor_last_activity = Some(std::time::Instant::now());
-        app.cursor_hidden = true;
+        app.cursor_hide_reason = Some(crate::ui_fullscreen::FsCursorHide::Idle);
 
         assert!(app.preserve_active_detached_image_window_for_main_context_change());
         let viewport_id = App::detached_image_window_viewport_id(7);

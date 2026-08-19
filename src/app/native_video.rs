@@ -4090,7 +4090,7 @@ impl App {
                 let moved = crate::video::native_presenter::cursor_move_is_activity(
                     self.native_video_last_move_client,
                     pos,
-                    self.cursor_hidden,
+                    self.cursor_hidden(),
                 );
                 self.native_video_last_move_client = Some(pos);
                 if moved {
@@ -9847,7 +9847,12 @@ impl App {
         // input には現れないため、カーソル auto-hide のアクティビティタイマもここで更新する。
         // キー操作はカーソルを再表示しないので `request_native_video_hud_repaint` を使う。
         self.cursor_last_activity = Some(now);
-        self.cursor_hidden = false;
+        if matches!(
+            self.cursor_hide_reason,
+            Some(crate::ui_fullscreen::FsCursorHide::Idle)
+        ) {
+            self.cursor_hide_reason = None;
+        }
         // eframe 経由の pointer 活動は native presenter HWND の `push_native_event` を
         // 経由しないことがあるため、current の player に明示的に伝搬する。
         if let Some(idx) = self.fullscreen_idx

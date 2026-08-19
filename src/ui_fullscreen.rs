@@ -1411,10 +1411,16 @@ fn detached_placement_from_viewport_rects(
     placement
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FsCursorHide {
+    Idle,
+    ZoomAiming { restore_idle: bool },
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct FullscreenCursorState {
     last_activity: Option<std::time::Instant>,
-    hidden: bool,
+    hide_reason: Option<FsCursorHide>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2791,6 +2797,38 @@ fn still_passive_side_panel_hover_enabled(cursor_hidden: bool, touch_chrome_latc
     // visible handle commits. Once touch chrome owns the panel reach path,
     // passive hover must not pre-open a panel and invert its toggle.
     !cursor_hidden && !touch_chrome_latched
+}
+
+fn next_fullscreen_cursor_hide_reason(
+    current: Option<FsCursorHide>,
+    zoom_aiming: bool,
+    cursor_active: bool,
+    clean: bool,
+    idle_hide_ready: bool,
+) -> Option<FsCursorHide> {
+    let restore_idle = clean
+        && match current {
+            Some(FsCursorHide::Idle) => true,
+            Some(FsCursorHide::ZoomAiming { restore_idle }) => restore_idle,
+            None => false,
+        };
+
+    if zoom_aiming {
+        // ZoomAiming is derived from fs_zoom_aiming every frame and is never latched.
+        // Keep whether Idle was already latched inside the same typed state so pointer
+        // activity used for aiming cannot destroy the pre-existing idle hide.
+        return Some(FsCursorHide::ZoomAiming { restore_idle });
+    }
+
+    if clean
+        && ((matches!(current, Some(FsCursorHide::Idle)) && !cursor_active)
+            || restore_idle
+            || idle_hide_ready)
+    {
+        Some(FsCursorHide::Idle)
+    } else {
+        None
+    }
 }
 
 fn should_handle_fullscreen_wheel(
@@ -9361,7 +9399,7 @@ impl App {
             return;
         }
         let pointer = ctx.input(|i| {
-            if self.cursor_hidden {
+            if self.cursor_hidden() {
                 None
             } else {
                 i.pointer.hover_pos()
@@ -9540,7 +9578,7 @@ impl App {
             return;
         }
         let pointer = ctx.input(|i| {
-            if self.cursor_hidden {
+            if self.cursor_hidden() {
                 None
             } else {
                 i.pointer.hover_pos()
@@ -13383,13 +13421,9 @@ impl App {
                         || i.pointer.any_click()
                         || i.smooth_scroll_delta != egui::Vec2::ZERO
                 });
-                if cursor_active {
-                    self.cursor_last_activity = Some(std::time::Instant::now());
-                    if self.cursor_hidden {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
-                    }
-                    self.cursor_hidden = false;
-                }
+                // Do not mutate cursor visibility here. Z aiming is updated below by
+                // handle_fs_key_input, after which one owner resolves pointer activity,
+                // idle latching, and ZoomAiming together for this frame.
 
                 // event consume される前に捕捉 (handle_fs_key_input が矢印等を
                 // 消費するとイベントが見えなくなるため)。マウス移動は操作と見なさない。
@@ -14412,7 +14446,7 @@ impl App {
                                 self.fullscreen_opened_at(),
                             );
                             let hover_in_top = ctx.input(|i| {
-                                !self.cursor_hidden
+                                !self.cursor_hidden()
                                     && i.pointer.hover_pos().is_some_and(|p| {
                                         p.y < TOP_BAR_HOVER_Y
                                             && fullscreen_edge_hover_allowed(p, navigator_exclusion)
@@ -14456,6 +14490,7 @@ impl App {
                             } else {
                                 Vec::new()
                             };
+                            let cursor_hidden = self.cursor_hidden();
                             Self::draw_fs_hover_bar(
                                 ui,
                                 ctx,
@@ -14512,7 +14547,7 @@ impl App {
                                 &mut window_mode_pressed,
                                 self.settings.fullscreen_top_bar_locked,
                                 &mut top_bar_lock_pressed,
-                                self.cursor_hidden,
+                                cursor_hidden,
                                 navigator_exclusion,
                                 touch_chrome_latched,
                                 self.frame_counter,
@@ -14790,7 +14825,6 @@ impl App {
                         if !detached || detached_activate_on_show.unwrap_or(false) {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                         }
-                        ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
                     } else {
                         ctx.request_repaint();
                     }
@@ -14803,42 +14837,21 @@ impl App {
                 // 正しく非表示処理する。VST3 manager 等のダイアログ表示中は
                 // `any_dialog_open()` で `fs_ui_is_clean` が false を返すため抑制される。
                 //
-                // 状態機械:
-                // - マウス操作あり / UI 表示中: `cursor_last_activity = Some(now)`,
-                //   `cursor_hidden = false` (idle タイマをリセット)。これにより
-                //   一時停止 (HUD 表示中) の間にタイマが古くなり、再開直後に即座に
-                //   カーソルが消える事故を防ぐ。
-                // - clean かつ idle >= 設定秒数、または `cursor_hidden` が立っている:
-                //   `CursorIcon::None` を毎フレーム適用 (egui は frame 跨ぎで sticky に
-                //   ならないため)、`cursor_hidden = true` をセット。
+                // 状態機械は `cursor_hide_reason` 1 つに集約する。Idle は従来どおり
+                // pointer activity / UI 表示までラッチし、ZoomAiming は fs_zoom_aiming から
+                // 毎フレーム導出する。両入力を同時に解決してから command を送るため、照準中の
+                // pointer motion が show/hide を同一 frame で競合させない。
                 {
                     let full_rect = ctx.content_rect();
                     let is_video = state.is_video;
                     let clean = self.fs_ui_is_clean(ctx, full_rect, is_video, music_view_frame_ui);
-                    if !clean {
-                        // UI が出ている間はタイマを today に戻して countdown を停止。
-                        self.cursor_last_activity = Some(std::time::Instant::now());
-                        if self.cursor_hidden {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
-                        }
-                        self.cursor_hidden = false;
-                    }
-                    let idle = self
-                        .cursor_last_activity
-                        .map(|t| t.elapsed().as_secs_f32())
-                        .unwrap_or(0.0);
-                    let threshold = self.settings.fullscreen_cursor_hide_delay_secs;
-                    if clean && (idle >= threshold || self.cursor_hidden) {
-                        if !self.cursor_hidden {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
-                        }
-                        ctx.set_cursor_icon(egui::CursorIcon::None);
-                        self.cursor_hidden = true;
-                    } else if clean {
-                        // カウントダウン中: 残時間後に再描画予約して設定秒数で隠す。
-                        let remain = (threshold - idle).max(0.05);
-                        ctx.request_repaint_after(std::time::Duration::from_secs_f32(remain));
-                    }
+                    self.update_fullscreen_cursor_visibility(
+                        ctx,
+                        ctx.viewport_id(),
+                        clean,
+                        cursor_active,
+                        need_show && !embedded,
+                    );
                 }
 
                 // ── VST3 プラグイン管理ウィンドウ + チェーンエディタ (フルスクリーン中も表示) ──
@@ -17063,7 +17076,69 @@ impl App {
     pub(crate) fn fullscreen_cursor_state(&self) -> FullscreenCursorState {
         FullscreenCursorState {
             last_activity: self.cursor_last_activity,
-            hidden: self.cursor_hidden,
+            hide_reason: self.cursor_hide_reason,
+        }
+    }
+
+    pub(crate) fn cursor_hidden(&self) -> bool {
+        self.cursor_hide_reason.is_some()
+    }
+
+    fn apply_fullscreen_cursor_hide_reason(
+        &mut self,
+        ctx: &egui::Context,
+        viewport_id: egui::ViewportId,
+        next: Option<FsCursorHide>,
+        force_visibility_sync: bool,
+    ) {
+        let reason_changed = self.cursor_hide_reason != next;
+        self.cursor_hide_reason = next;
+        if reason_changed || force_visibility_sync {
+            // This is the single active-fullscreen owner of CursorVisible. A newly
+            // shown viewport needs one forced sync because winit keeps its prior
+            // hidden flag even though there is no preceding App-state transition.
+            ctx.send_viewport_cmd_to(
+                viewport_id,
+                egui::ViewportCommand::CursorVisible(next.is_none()),
+            );
+        }
+        if next.is_some() {
+            // egui cursor icons are frame-local, so reapply None for every hidden frame.
+            ctx.set_cursor_icon(egui::CursorIcon::None);
+        }
+    }
+
+    fn update_fullscreen_cursor_visibility(
+        &mut self,
+        ctx: &egui::Context,
+        viewport_id: egui::ViewportId,
+        clean: bool,
+        cursor_active: bool,
+        force_visibility_sync: bool,
+    ) {
+        if cursor_active || !clean {
+            // Pointer activity and visible chrome restart the idle countdown. They
+            // can clear Idle, but ZoomAiming remains derived from fs_zoom_aiming.
+            self.cursor_last_activity = Some(std::time::Instant::now());
+        }
+        let idle = self
+            .cursor_last_activity
+            .map(|t| t.elapsed().as_secs_f32())
+            .unwrap_or(0.0);
+        let threshold = self.settings.fullscreen_cursor_hide_delay_secs;
+        let next = next_fullscreen_cursor_hide_reason(
+            self.cursor_hide_reason,
+            self.fs_zoom_aiming,
+            cursor_active,
+            clean,
+            clean && idle >= threshold,
+        );
+        self.apply_fullscreen_cursor_hide_reason(ctx, viewport_id, next, force_visibility_sync);
+
+        if clean && next.is_none() {
+            // Countdown in progress: wake once the configured hide threshold arrives.
+            let remain = (threshold - idle).max(0.05);
+            ctx.request_repaint_after(std::time::Duration::from_secs_f32(remain));
         }
     }
 
@@ -17073,14 +17148,15 @@ impl App {
         state: FullscreenCursorState,
     ) {
         self.cursor_last_activity = state.last_activity;
-        self.cursor_hidden = state.hidden;
-        if state.hidden {
-            ctx.send_viewport_cmd_to(
-                self.fullscreen_viewport_id(),
-                egui::ViewportCommand::CursorVisible(false),
-            );
-            ctx.set_cursor_icon(egui::CursorIcon::None);
-        }
+        // Carry the typed reason so fullscreen-internal navigation and native-video
+        // placement switches preserve the Idle latch exactly. ZoomAiming is still
+        // non-sticky: the next render derives it again from fs_zoom_aiming.
+        self.apply_fullscreen_cursor_hide_reason(
+            ctx,
+            self.fullscreen_viewport_id(),
+            state.hide_reason,
+            false,
+        );
     }
 
     /// 見開きモード切替後、fullscreen_idx をペアの先頭に正規化する。
@@ -21350,7 +21426,7 @@ impl App {
                 animated: panel_fs_idx.is_some_and(|idx| self.fs_entry_is_animated(idx)),
             });
         let passive_side_panel_hover_enabled =
-            still_passive_side_panel_hover_enabled(self.cursor_hidden, touch_chrome_latched);
+            still_passive_side_panel_hover_enabled(self.cursor_hidden(), touch_chrome_latched);
         self.update_metadata_panel_hover_latch(
             ctx,
             full_rect,
@@ -21383,7 +21459,7 @@ impl App {
         // When the OS cursor is hidden, egui still exposes the last hover position.
         // Treat that position as stale and block passive hover side effects until a
         // real input event revives the cursor.
-        let passive_hover_enabled = !self.cursor_hidden;
+        let passive_hover_enabled = !self.cursor_hidden();
         // ZipPla ズーム中 (照準含む) は左右パネルを抑止しているので、当たり判定でもパネル領域を
         // 無効化する。さもないと右ホバー帯 / ピン留めメタデータ等でホイール (倍率変更) や
         // クリック (ページ送り) が奪われる (Codex P2)。
@@ -21593,7 +21669,7 @@ impl App {
         let side_panel_visible =
             side_panel_chrome_enabled && (has_right_panel || self.adjustment_mode.is_open());
         let hover_in_top = ctx.input(|input| {
-            !self.cursor_hidden
+            !self.cursor_hidden()
                 && input.pointer.hover_pos().is_some_and(|pos| {
                     pos.y < TOP_BAR_HOVER_Y
                         && fullscreen_edge_hover_allowed(pos, navigator_exclusion)
@@ -28388,7 +28464,7 @@ impl App {
         // Once the cursor is hidden, the last hover position is stale until a real input
         // event arrives. Do not let that passive position keep hover UI "visible" and
         // immediately revive the OS cursor after slideshow advances.
-        let passive_hover_enabled = !self.cursor_hidden;
+        let passive_hover_enabled = !self.cursor_hidden();
         let navigator_exclusion = self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
         let in_top = passive_hover_enabled
             && pointer.is_some_and(|p| {
@@ -33929,7 +34005,7 @@ impl App {
         let music_modal_open =
             self.music_bookmark_modal_open() || self.music_normalize_modal_active(fs_idx);
         let hover_pos = ctx.input(|i| {
-            if self.cursor_hidden {
+            if self.cursor_hidden() {
                 None
             } else {
                 i.pointer.hover_pos()
@@ -34332,6 +34408,60 @@ mod tests {
         }
     }
 
+    fn plain_key_release(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn setup_zoom_cursor_app() -> crate::app::AppTestEnvForTest {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![GridItem::Image(PathBuf::from("page.jpg"))];
+        app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+        app.fullscreen_idx = Some(0);
+        app.settings.fullscreen_cursor_hide_delay_secs = 60.0;
+        app.cursor_last_activity = Some(std::time::Instant::now());
+        app.cursor_hide_reason = None;
+        app
+    }
+
+    fn run_cursor_visibility_frame(
+        app: &mut crate::app::App,
+        ctx: &egui::Context,
+        cursor_active: bool,
+    ) -> egui::FullOutput {
+        ctx.begin_pass(egui::RawInput::default());
+        app.update_fullscreen_cursor_visibility(ctx, ctx.viewport_id(), true, cursor_active, false);
+        ctx.end_pass()
+    }
+
+    fn cursor_visible_commands(output: &egui::FullOutput) -> Vec<bool> {
+        output
+            .viewport_output
+            .values()
+            .flat_map(|viewport| viewport.commands.iter())
+            .filter_map(|command| match command {
+                egui::ViewportCommand::CursorVisible(visible) => Some(*visible),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn prime_zoom_aim_cursor_hidden(app: &mut crate::app::App, ctx: &egui::Context) {
+        app.fs_zoom_aiming = true;
+        let _ = run_cursor_visibility_frame(app, ctx, false);
+        assert_eq!(
+            app.cursor_hide_reason,
+            Some(FsCursorHide::ZoomAiming {
+                restore_idle: false
+            })
+        );
+    }
+
     #[cfg(windows)]
     struct ClearTestKeyFrame;
 
@@ -34340,6 +34470,166 @@ mod tests {
         fn drop(&mut self) {
             crate::key_input::clear_test_frame();
         }
+    }
+
+    #[test]
+    fn fs_cursor_zoom_aim_start_hides_cursor() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        let mut app = setup_zoom_cursor_app();
+        let ctx = egui::Context::default();
+        #[cfg(windows)]
+        let _clear = ClearTestKeyFrame;
+        ctx.begin_pass(egui::RawInput {
+            events: vec![plain_key_press(egui::Key::Z)],
+            ..Default::default()
+        });
+        cache_fullscreen_keyboard_owner_for_test(&ctx);
+        let permit = crate::keyboard_input::keyboard_input_permits(&ctx).current_level;
+        app.update_fs_zoom_mode_keys(&ctx, 0, permit);
+        app.update_fullscreen_cursor_visibility(&ctx, ctx.viewport_id(), true, true, false);
+        let output = ctx.end_pass();
+        assert!(app.fs_zoom_aiming);
+        assert_eq!(
+            app.cursor_hide_reason,
+            Some(FsCursorHide::ZoomAiming {
+                restore_idle: false
+            })
+        );
+        assert_eq!(cursor_visible_commands(&output), vec![false]);
+    }
+
+    #[test]
+    fn fs_cursor_zoom_aim_pointer_activity_does_not_show_cursor() {
+        let mut app = setup_zoom_cursor_app();
+        let ctx = egui::Context::default();
+        app.fs_zoom_aiming = true;
+        for _ in 0..3 {
+            let output = run_cursor_visibility_frame(&mut app, &ctx, true);
+            assert_eq!(
+                app.cursor_hide_reason,
+                Some(FsCursorHide::ZoomAiming {
+                    restore_idle: false
+                })
+            );
+            assert!(!cursor_visible_commands(&output).contains(&true));
+        }
+    }
+
+    #[test]
+    fn fs_cursor_zoom_aim_falling_edge_restores_cursor() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::TEST_INPUT_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("key input test lock poisoned");
+        let mut app = setup_zoom_cursor_app();
+        let ctx = egui::Context::default();
+        #[cfg(windows)]
+        let _clear = ClearTestKeyFrame;
+        prime_zoom_aim_cursor_hidden(&mut app, &ctx);
+        app.fs_zoom_z_was_down = true;
+        ctx.begin_pass(egui::RawInput {
+            events: vec![plain_key_release(egui::Key::Z)],
+            ..Default::default()
+        });
+        cache_fullscreen_keyboard_owner_for_test(&ctx);
+        let permit = crate::keyboard_input::keyboard_input_permits(&ctx).current_level;
+        app.update_fs_zoom_mode_keys(&ctx, 0, permit);
+        app.update_fullscreen_cursor_visibility(&ctx, ctx.viewport_id(), true, false, false);
+        let output = ctx.end_pass();
+        assert!(app.fs_zoom_active);
+        assert!(!app.fs_zoom_aiming);
+        assert_eq!(app.cursor_hide_reason, None);
+        assert_eq!(cursor_visible_commands(&output), vec![true]);
+    }
+
+    #[test]
+    fn fs_cursor_zoom_aim_reset_restores_cursor() {
+        let mut app = setup_zoom_cursor_app();
+        let ctx = egui::Context::default();
+        prime_zoom_aim_cursor_hidden(&mut app, &ctx);
+        app.fs_zoom_reset();
+        let output = run_cursor_visibility_frame(&mut app, &ctx, false);
+        assert_eq!(app.cursor_hide_reason, None);
+        assert_eq!(cursor_visible_commands(&output), vec![true]);
+    }
+
+    #[test]
+    fn fs_cursor_zoom_aim_transient_reset_restores_cursor() {
+        let mut app = setup_zoom_cursor_app();
+        let ctx = egui::Context::default();
+        prime_zoom_aim_cursor_hidden(&mut app, &ctx);
+        app.fs_zoom_reset_transient();
+        let output = run_cursor_visibility_frame(&mut app, &ctx, false);
+        assert_eq!(app.cursor_hide_reason, None);
+        assert_eq!(cursor_visible_commands(&output), vec![true]);
+    }
+
+    #[test]
+    fn fs_cursor_zoom_aim_video_context_restores_cursor() {
+        let mut app = setup_zoom_cursor_app();
+        let ctx = egui::Context::default();
+        prime_zoom_aim_cursor_hidden(&mut app, &ctx);
+        app.items[0] = GridItem::Video(PathBuf::from("clip.mp4"));
+        ctx.begin_pass(egui::RawInput::default());
+        app.update_fs_zoom_mode_keys(&ctx, 0, None);
+        app.update_fullscreen_cursor_visibility(&ctx, ctx.viewport_id(), true, false, false);
+        let output = ctx.end_pass();
+        assert!(!app.fs_zoom_aiming);
+        assert_eq!(app.cursor_hide_reason, None);
+        assert_eq!(cursor_visible_commands(&output), vec![true]);
+    }
+
+    #[test]
+    fn fs_cursor_zoom_aim_missing_level_permit_restores_cursor() {
+        let mut app = setup_zoom_cursor_app();
+        let ctx = egui::Context::default();
+        prime_zoom_aim_cursor_hidden(&mut app, &ctx);
+        ctx.begin_pass(egui::RawInput::default());
+        app.update_fs_zoom_mode_keys(&ctx, 0, None);
+        app.update_fullscreen_cursor_visibility(&ctx, ctx.viewport_id(), true, false, false);
+        let output = ctx.end_pass();
+        assert!(!app.fs_zoom_aiming);
+        assert_eq!(app.cursor_hide_reason, None);
+        assert_eq!(cursor_visible_commands(&output), vec![true]);
+    }
+
+    #[test]
+    fn fs_cursor_zoom_aim_restores_prior_idle_hide() {
+        let mut app = setup_zoom_cursor_app();
+        let ctx = egui::Context::default();
+        app.cursor_last_activity =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(120));
+        app.cursor_hide_reason = Some(FsCursorHide::Idle);
+        app.fs_zoom_aiming = true;
+        let _ = run_cursor_visibility_frame(&mut app, &ctx, true);
+        assert_eq!(
+            app.cursor_hide_reason,
+            Some(FsCursorHide::ZoomAiming { restore_idle: true })
+        );
+        app.fs_zoom_reset();
+        let _ = run_cursor_visibility_frame(&mut app, &ctx, true);
+        assert_eq!(app.cursor_hide_reason, Some(FsCursorHide::Idle));
+    }
+
+    #[test]
+    fn fs_cursor_visibility_command_only_changes_with_hide_reason() {
+        let mut app = setup_zoom_cursor_app();
+        let ctx = egui::Context::default();
+        app.fs_zoom_aiming = true;
+        let first = run_cursor_visibility_frame(&mut app, &ctx, true);
+        let second = run_cursor_visibility_frame(&mut app, &ctx, true);
+        let third = run_cursor_visibility_frame(&mut app, &ctx, false);
+        app.fs_zoom_reset();
+        let exit = run_cursor_visibility_frame(&mut app, &ctx, false);
+        assert_eq!(cursor_visible_commands(&first), vec![false]);
+        assert!(cursor_visible_commands(&second).is_empty());
+        assert!(cursor_visible_commands(&third).is_empty());
+        assert_eq!(cursor_visible_commands(&exit), vec![true]);
     }
 
     #[test]

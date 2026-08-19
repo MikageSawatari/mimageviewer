@@ -56,7 +56,7 @@ impl App {
         navigator_exclusion: Option<egui::Rect>,
     ) {
         let pointer_pos = ctx.input(|i| {
-            if self.cursor_hidden {
+            if self.cursor_hidden() {
                 None
             } else {
                 i.pointer.hover_pos()

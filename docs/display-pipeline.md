@@ -737,6 +737,11 @@ UI / パネル / ダイアログが出ていない状態でマウス操作が止
 画面上に残らない。スライドショーのタイマー送りやキーによるページ送りではこの idle 状態を
 次画像へ引き継ぎ、画像切替だけでカーソルを再表示しない。`open_fullscreen` の cursor
 リセットは fullscreen 新規入場向けであり、fullscreen 内ナビでは呼び出し元が状態を引き継ぐ。
+非表示状態は `cursor_hide_reason: Option<FsCursorHide>` が単独で所有し、`Idle` は従来どおり
+ラッチ、`ZoomAiming { restore_idle }` は `fs_zoom_aiming` から毎フレーム導出する。照準中の
+pointer activity は `ZoomAiming` を解除せず、照準前から `Idle` だった場合は payload で保持して
+照準終了後に戻す。active fullscreen の `CursorVisible` と `CursorIcon::None` は同じ apply 境界だけが
+送り、理由が変わった frame だけ visibility command を送りつつ、非表示中は icon を毎フレーム適用する。
 カーソル非表示中は最後の hover 座標を stale とみなし、上バー / 右パネル /
 補正パネル edge hover / panel 内判定など、passive hover 由来の状態遷移では
 `!cursor_hidden` で gate する。マウス操作または固定 UI 表示が戻ったら
@@ -1288,9 +1293,10 @@ clamp する。`adjust_fs_zoom_factor` は広めに `[0.05, 16]` で受け、描
 詰めた矩形で、**カーソルがホバー領域へ入る前に画像の上端・下端へ到達**する (実機 FB 2026-06-21)。
 ズーム中は左右の補正/メタデータパネルを抑止して (`adjustment_active` / メタデータ描画を
 `!fs_zoom_active` ゲート、左端ホバーの `adjustment_mode` も抑止) パン操作を邪魔しない。
-照準中 (Z 押下中) は**トリム後コンテンツを contain 表示**して (表示トリムが無ければ画像全体)
-ズーム範囲の枠 (`zip_aim_frame_rect`) を重ねる (パン操作帯と同じ写像なので、離した瞬間の表示範囲と
-枠が一致)。倍率・状態は settings に
+照準中 (Z 押下中) は **OS カーソルを隠し**、**トリム後コンテンツを contain 表示**して
+(表示トリムが無ければ画像全体) ズーム範囲の枠 (`zip_aim_frame_rect`) を重ねる。カーソルを
+隠すだけで `pan_band` の写像は変えないため、枠と離した瞬間の表示範囲は従来どおり一致する。
+倍率・状態は settings に
 保存せずセッション内のみ保持し、ページ送りをまたいで維持・グリッドへ戻ると解除。
 単ページ・見開きの通常閲覧で動作 (連結 / パノラマ / 動画 / 分析モードでは無効)。**見開き** は
 `draw_fs_spread` 側で合成ページを対象に `zip_spread_zoom_pan` で同様にズーム/パン
