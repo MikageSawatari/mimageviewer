@@ -850,8 +850,10 @@ per-frame 経路 (`d3d11_shared` / `cpu_upload`) はプレゼン側の判定で�
 
 `FsCacheEntry::Static.source_dims: Option<[usize; 2]>` は **clamp 前** の原寸。
 fs_load ワーカーが `clamp_dynamic_for_gpu` を掛ける直前に記録して送る。ホバーバーの
-画像サイズ表示はこれを優先して使い、`pixels.size` と不一致なら「⚠ ダウンスケール
-表示中」マーカーを出す (利用者が縮小表示に気づけるように)。
+画像サイズ表示はこれを優先して使い、`pixels.size` と不一致なら「⚠ GPU上限により解像度
+制限中」マーカーを出す (利用者が縮小表示に気づけるように)。文言の定義元は
+`ui_fullscreen/draw_icons.rs` の `DOWNSCALE_MARKER` 一箇所で、描画側の色分け切り出しと
+テストも同じ定数を読む。
 
 派生キャッシュ (`edit_result_cache` / `final_ai_cache` / `final_composite_cache` など) や
 消しゴム再挿入の entry は `source_dims: None` で良い。ホバー UI は `fs_cache` 側のエントリから原寸を読むため、

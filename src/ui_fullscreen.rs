@@ -45291,7 +45291,7 @@ mod tests {
         let s = build_info_text(Some((7168, 9216)), None, true, None, None);
         assert!(s.starts_with("7168 × 9216"));
         assert!(
-            s.contains("ダウンスケール表示中"),
+            s.contains(DOWNSCALE_MARKER),
             "warning marker present: {s:?}"
         );
     }
@@ -45307,7 +45307,7 @@ mod tests {
             None,
         );
         let ai_end = s.find(')').expect("AI closing paren exists");
-        let marker_pos = s.find("ダウンスケール").expect("marker present");
+        let marker_pos = s.find(DOWNSCALE_MARKER).expect("marker present");
         assert!(
             marker_pos > ai_end,
             "marker should come after AI info: {s:?}"
@@ -45319,7 +45319,7 @@ mod tests {
         // dims が None のとき (まだロード中) は downscaled=true でも警告を出さない。
         let s = build_info_text(None, Some(1_234_567), true, None, None);
         assert!(
-            !s.contains("ダウンスケール"),
+            !s.contains(DOWNSCALE_MARKER),
             "no marker without dims: {s:?}"
         );
     }

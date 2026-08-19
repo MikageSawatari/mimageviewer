@@ -1159,7 +1159,9 @@ pub(super) fn compute_location_display(
     }
 }
 
-const DOWNSCALE_MARKER: &str = " ⚠ ダウンスケール表示中";
+/// 画面フィットによる縮小とは無関係で、GPU テクスチャの互換上限 (8192px) を超えた元画像を
+/// 表示用に縮小していることを示す。文言とテストが離れないよう定義元はここだけにする。
+pub(super) const DOWNSCALE_MARKER: &str = " ⚠ GPU上限により解像度制限中";
 
 /// ファイル情報テキスト (PDF 種別・寸法・AI・ファイルサイズ) を描画する。
 /// ファイル名は左側 `location_display` に統合済みなのでここでは扱わない。
@@ -1227,7 +1229,7 @@ pub(super) fn draw_fs_bar_info_text(
 
 /// 上部バー右側に表示する画像情報テキスト (PDF 種別 / 寸法 / AI / サイズ) を組み立てる。
 /// `image_downscaled` が true の場合、dims の直後 (AI 情報がある場合はその後) に
-/// `⚠ ダウンスケール表示中` マーカーを挿入する。
+/// [`DOWNSCALE_MARKER`] を挿入する。
 pub(super) fn build_info_text(
     image_dims: Option<(u32, u32)>,
     image_file_size: Option<u64>,
