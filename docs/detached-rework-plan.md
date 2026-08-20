@@ -328,6 +328,33 @@ Windows 実機で確認済み。次は表示中 `App` の session 化か `MediaW
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-08-20 サムネイル結果の所有権 (ClaudeCode / Codex 双方が構造的修正と合意):**
+mount 中の active detached context がサムネイル worker の結果を
+`drain_thumb_results_discard` で読み捨てていた ([app.rs](../src/app.rs) 40392 付近)。
+根拠は「detached はグリッドを描かないので表示する場が無い」だったが、**その後に入った
+pass-through rendition (ページ送り連打時の代役表示) が、グリッドではなくフルスクリーン側で
+サムネイルを消費する**ようになったため、前提が失効していた。
+
+- **実測** (利用者実機、2026-08-20): `passthrough_unavailable` が **12,773 回** (理由はすべて
+  `thumbnail_not_loaded`)、代役を要求した sequence が **2,424 個**、実際に代役で描いた回数は
+  **0 回**。`page_turn_decision` の paint mode は 100% `materialized`。
+  **別ウィンドウでは連打の軽量化が一度も成立していなかった。**
+- **変更**: 捨てるのをやめ、**所有 context 自身の `poll_thumbnails` に処理させる**。
+  producer と consumer の間に guard / retry / 時間窓を足すのではなく、結果を持ち主の
+  既存 reducer へ戻す変更なので、所有境界での構造的修正である。
+- **同時に決めたこと**: グリッドを描かない context では **keep 外 Video を強制テクスチャ化しない**、
+  **auto-aspect を回さない**。`poll_thumbnails` は Video を keep 範囲外でも常にテクスチャ化し、
+  末尾で `maybe_apply_auto_aspect` を呼ぶが、どちらもグリッド用の政策であり、代役のためだけに
+  poll する context には消費者が居ない (代役が要求する `thumb_pixels` は Image / ZipImage /
+  PdfPage のみ保持で、Video は対象外)。区別は**呼び出し時の型付き consumption policy** で行い、
+  **App に新しい bool / Option を足していない** (憲法 3)。
+- **憲法チェック**: 3 抵触なし (App state を増やさない) / 5 抵触なし (判断材料は channel 受信・
+  generation・index・keep_set であって時間ではない) / 7 範囲内 (panorama、一般の auto-aspect、
+  他の detached lifecycle 不具合は触れていない) / 8 既存 104 本を維持。
+- **リワーク側への申し送り**: 「グリッドを描く context」と「代役のためだけに poll する context」の
+  区別は、R2 で `DetachedWindowRuntime` に状態を集約するときに **consumption policy として
+  型に載せ直せる**。現在は呼び出し時引数なので、状態化する場合はここを起点にすること。
+
 **2026-08-02 利用者仕様変更により撤回:** remote video は fullscreen player / native presenter を
 使わず、streaming UI state が headless player を所有する構造へ変更した。このため増分 13 の
 `FullscreenEguiMediaSurface::RemoteStreaming`、owner-scoped presenter hide、専用 snapshot を削除し、

@@ -13610,7 +13610,7 @@ mod favorite_adjustment_defaults_tests {
         app.request_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE);
         assert!(!app.main_font_atlas_resync_defers_texture_uploads());
         send(&app, &color, cur_gen);
-        app.poll_thumbnails(&ctx);
+        app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
         assert!(
             matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }),
             "pending safe-frame wait alone must not block thumbnail uploads"
@@ -13624,7 +13624,7 @@ mod favorite_adjustment_defaults_tests {
         app.thumbnails[0] = ThumbnailState::Pending;
         app.requested.insert(0, false);
         send(&app, &color, cur_gen);
-        app.poll_thumbnails(&ctx);
+        app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
         assert!(
             matches!(app.thumbnails[0], ThumbnailState::Pending),
             "during active resync repeats the thumbnail must not be uploaded (would be discarded -> black)"
@@ -13638,7 +13638,7 @@ mod favorite_adjustment_defaults_tests {
         // resync 解除後: 次の poll で backlog から Loaded 化する。
         app.main_font_atlas_resync_pending = false;
         app.main_font_atlas_resync_repeats_left = 0;
-        app.poll_thumbnails(&ctx);
+        app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
         assert!(
             matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }),
             "after the surface returns the thumbnail uploads normally"
@@ -13684,7 +13684,7 @@ mod favorite_adjustment_defaults_tests {
             })
             .unwrap();
 
-        app.poll_thumbnails(&egui::Context::default());
+        app.poll_thumbnails(&egui::Context::default(), ThumbnailConsumptionPolicy::Grid);
         app.enqueue_idle_upgrades();
 
         assert!(matches!(
@@ -31952,6 +31952,41 @@ mod still_window_mode_key_tests {
         assert!(updated, "the active detached context must be updated");
     }
 
+    fn thumbnail_msg_for_test(
+        idx: usize,
+        items_gen: u64,
+        size: [usize; 2],
+        source_dims: Option<(u32, u32)>,
+    ) -> crate::thumb_loader::ThumbMsg {
+        crate::thumb_loader::ThumbMsg {
+            idx,
+            image: Some(egui::ColorImage::filled(
+                size,
+                egui::Color32::from_rgb(32, 96, 160),
+            )),
+            origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+            from_edit_preview: false,
+            edit_preview_adjustment: None,
+            source_dims,
+            layout_dims: None,
+            canceled: false,
+            finalized: false,
+            input_seq: 0,
+            items_gen,
+        }
+    }
+
+    fn keep_detached_transition_gap_open(bundle: &mut ViewerContextBundle) {
+        bundle.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+            history_trigger: crate::app::HistoryTrigger::UserChosen,
+            resume_slideshow: false,
+            target: DeferredFsTarget::None,
+            resume_to_last_page: false,
+            from_explicit_open: false,
+            preserve_after_password_prompt: false,
+        });
+    }
+
     #[test]
     #[cfg(windows)]
     fn detached_ctrl_nav_can_repeat_after_previous_nav_completed() {
@@ -35894,6 +35929,14 @@ mod still_window_mode_key_tests {
         app.settings.rating_filter = [false, true, false, true, false, true];
         app.folder_history
             .insert(history_folder.clone(), (88.0, Some(0)));
+        app.requested.insert(1, false);
+        let main_generation = app.items_generation;
+        app.texture_backlog.push(thumbnail_msg_for_test(
+            1,
+            main_generation,
+            [3, 3],
+            Some((3, 3)),
+        ));
 
         let expected_folder = app.current_folder.clone();
         let expected_item_paths: Vec<PathBuf> = app
@@ -35913,16 +35956,39 @@ mod still_window_mode_key_tests {
         let expected_search_origin = app.search_filter_origin_folder.clone();
         let expected_rating_filter = app.settings.rating_filter;
         let expected_history = app.folder_history.clone();
+        let expected_requested = app.requested.clone();
+        let expected_backlog = app
+            .texture_backlog
+            .iter()
+            .map(|msg| {
+                (
+                    msg.idx,
+                    msg.items_gen,
+                    msg.image.as_ref().map(|image| image.size),
+                )
+            })
+            .collect::<Vec<_>>();
 
         install_detached_transition_gap_for_test(&mut app, window_id, |bundle| {
-            bundle.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
-                history_trigger: crate::app::HistoryTrigger::UserChosen,
-                resume_slideshow: false,
-                target: DeferredFsTarget::None,
-                resume_to_last_page: false,
-                from_explicit_open: false,
-                preserve_after_password_prompt: false,
-            });
+            bundle.items = vec![GridItem::Image(PathBuf::from(
+                r"C:\books\second\detached.jpg",
+            ))];
+            bundle.thumbnails = vec![ThumbnailState::Pending];
+            bundle.image_metas = vec![None];
+            bundle.visible_indices = vec![0];
+            bundle.keep_range = (0, 1);
+            bundle.keep_set.insert(0);
+            bundle.requested.insert(0, false);
+            bundle
+                .tx
+                .send(thumbnail_msg_for_test(
+                    0,
+                    bundle.items_generation,
+                    [4, 6],
+                    Some((4, 6)),
+                ))
+                .unwrap();
+            keep_detached_transition_gap_open(bundle);
         });
         run_active_detached_frame_for_test(&mut app, &ctx);
 
@@ -35945,10 +36011,297 @@ mod still_window_mode_key_tests {
         assert_eq!(app.search_filter_origin_folder, expected_search_origin);
         assert_eq!(app.settings.rating_filter, expected_rating_filter);
         assert_eq!(app.folder_history, expected_history);
+        assert_eq!(app.requested, expected_requested);
+        let actual_backlog = app
+            .texture_backlog
+            .iter()
+            .map(|msg| {
+                (
+                    msg.idx,
+                    msg.items_gen,
+                    msg.image.as_ref().map(|image| image.size),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual_backlog, expected_backlog);
         assert!(
-            app.active_detached_viewer_context.is_some(),
-            "the detached transition must remain isolated from the preserved main context"
+            app.thumbnails
+                .iter()
+                .all(|state| matches!(state, ThumbnailState::Pending))
         );
+
+        let detached = &app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("the detached transition must remain isolated from the preserved main context")
+            .bundle;
+        assert!(matches!(
+            detached.thumbnails[0],
+            ThumbnailState::Loaded { .. }
+        ));
+        assert_eq!(
+            detached.thumb_pixels.get(&0).map(|pixels| pixels.size),
+            Some([4, 6]),
+            "the owner context must retain CPU pixels for pass-through rendition"
+        );
+        assert!(detached.requested.is_empty());
+        assert!(detached.texture_backlog.is_empty());
+    }
+
+    #[test]
+    fn detached_thumbnail_poll_carries_results_over_the_eight_texture_budget() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let item_count = 10usize;
+
+        install_detached_transition_gap_for_test(&mut app, 124, |bundle| {
+            bundle.items = (0..item_count)
+                .map(|idx| GridItem::Image(PathBuf::from(format!(r"C:\books\p{idx}.jpg"))))
+                .collect();
+            bundle.thumbnails = vec![ThumbnailState::Pending; item_count];
+            bundle.image_metas = vec![None; item_count];
+            bundle.visible_indices = (0..item_count).collect();
+            bundle.keep_range = (0, item_count);
+            bundle.keep_set.extend(0..item_count);
+            bundle
+                .requested
+                .extend((0..item_count).map(|idx| (idx, false)));
+            for idx in 0..item_count {
+                bundle
+                    .tx
+                    .send(thumbnail_msg_for_test(
+                        idx,
+                        bundle.items_generation,
+                        [4, 6],
+                        Some((4, 6)),
+                    ))
+                    .unwrap();
+            }
+            keep_detached_transition_gap_open(bundle);
+        });
+
+        run_active_detached_frame_for_test(&mut app, &ctx);
+        let detached = &app.active_detached_viewer_context.as_ref().unwrap().bundle;
+        assert_eq!(
+            detached
+                .thumbnails
+                .iter()
+                .filter(|state| matches!(state, ThumbnailState::Loaded { .. }))
+                .count(),
+            8
+        );
+        assert_eq!(detached.texture_backlog.len(), 2);
+        assert_eq!(detached.thumb_pixels.len(), 8);
+
+        run_active_detached_frame_for_test(&mut app, &ctx);
+        let detached = &app.active_detached_viewer_context.as_ref().unwrap().bundle;
+        assert!(
+            detached
+                .thumbnails
+                .iter()
+                .all(|state| matches!(state, ThumbnailState::Loaded { .. })),
+            "the owner must drain its staged results on the next frame"
+        );
+        assert!(detached.texture_backlog.is_empty());
+        assert_eq!(detached.thumb_pixels.len(), item_count);
+        assert!(detached.requested.is_empty());
+    }
+
+    #[test]
+    fn detached_thumbnail_backlog_survives_main_font_resync() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+
+        install_detached_transition_gap_for_test(&mut app, 125, |bundle| {
+            bundle.items = vec![GridItem::Image(PathBuf::from(r"C:\books\deferred.jpg"))];
+            bundle.thumbnails = vec![ThumbnailState::Pending];
+            bundle.image_metas = vec![None];
+            bundle.visible_indices = vec![0];
+            bundle.keep_range = (0, 1);
+            bundle.keep_set.insert(0);
+            bundle.requested.insert(0, false);
+            bundle
+                .tx
+                .send(thumbnail_msg_for_test(
+                    0,
+                    bundle.items_generation,
+                    [5, 7],
+                    Some((5, 7)),
+                ))
+                .unwrap();
+            keep_detached_transition_gap_open(bundle);
+        });
+
+        // begin_active_detached_session intentionally defers an already-pending main resync.
+        // Schedule the active repeat after the detached owner exists to reproduce a resync that
+        // overlaps this context's thumbnail result.
+        app.request_main_font_atlas_resync(FONT_ATLAS_RESYNC_REASON_NATIVE_VIDEO_BACKDROP_HIDE);
+        app.main_font_atlas_resync_repeats_left = MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES - 1;
+        assert!(app.main_font_atlas_resync_defers_texture_uploads());
+
+        run_active_detached_frame_for_test(&mut app, &ctx);
+        let detached = &app.active_detached_viewer_context.as_ref().unwrap().bundle;
+        assert!(matches!(detached.thumbnails[0], ThumbnailState::Pending));
+        assert_eq!(detached.texture_backlog.len(), 1);
+        assert!(detached.thumb_pixels.is_empty());
+
+        app.main_font_atlas_resync_pending = false;
+        app.main_font_atlas_resync_repeats_left = 0;
+        run_active_detached_frame_for_test(&mut app, &ctx);
+        let detached = &app.active_detached_viewer_context.as_ref().unwrap().bundle;
+        assert!(matches!(
+            detached.thumbnails[0],
+            ThumbnailState::Loaded { .. }
+        ));
+        assert!(detached.texture_backlog.is_empty());
+        assert_eq!(
+            detached.thumb_pixels.get(&0).map(|pixels| pixels.size),
+            Some([5, 7])
+        );
+    }
+
+    #[test]
+    fn detached_thumbnail_poll_does_not_force_out_of_keep_video_texture() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+
+        install_detached_transition_gap_for_test(&mut app, 126, |bundle| {
+            bundle.items = vec![GridItem::Video(PathBuf::from(r"C:\clips\outside.mp4"))];
+            bundle.thumbnails = vec![ThumbnailState::Pending];
+            bundle.image_metas = vec![None];
+            bundle.visible_indices = vec![0];
+            bundle.keep_range = (0, 0);
+            bundle.keep_set.clear();
+            bundle
+                .tx
+                .send(thumbnail_msg_for_test(
+                    0,
+                    bundle.items_generation,
+                    [16, 9],
+                    None,
+                ))
+                .unwrap();
+            keep_detached_transition_gap_open(bundle);
+        });
+
+        run_active_detached_frame_for_test(&mut app, &ctx);
+        let detached = &app.active_detached_viewer_context.as_ref().unwrap().bundle;
+        assert!(matches!(detached.thumbnails[0], ThumbnailState::Evicted));
+        assert!(detached.texture_backlog.is_empty());
+        assert!(detached.thumb_pixels.is_empty());
+    }
+
+    #[test]
+    fn detached_thumbnail_poll_does_not_drive_grid_auto_aspect() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.thumb_aspect_auto = true;
+        app.last_input_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+
+        install_detached_transition_gap_for_test(&mut app, 127, |bundle| {
+            bundle.items = (0..8)
+                .map(|idx| GridItem::Image(PathBuf::from(format!(r"C:\books\auto{idx}.jpg"))))
+                .collect();
+            bundle.thumbnails = vec![ThumbnailState::Pending; 8];
+            bundle.image_metas = vec![None; 8];
+            bundle.visible_indices = (0..8).collect();
+            bundle.keep_range = (0, 1);
+            bundle.keep_set.insert(0);
+            bundle.auto_aspect.current = Some(ThumbAspect::Square);
+            bundle.auto_aspect.samples = (0..8)
+                .map(|idx| (idx, ThumbAspect::Portrait3x4.height_ratio()))
+                .collect();
+            bundle.auto_aspect.streak = Some((
+                ThumbAspect::Portrait3x4,
+                std::time::Instant::now() - std::time::Duration::from_secs(1),
+                8,
+            ));
+            bundle.scroll_offset_y = 250.0;
+            bundle
+                .tx
+                .send(thumbnail_msg_for_test(
+                    0,
+                    bundle.items_generation,
+                    [16, 9],
+                    Some((16, 9)),
+                ))
+                .unwrap();
+            keep_detached_transition_gap_open(bundle);
+        });
+
+        run_active_detached_frame_for_test(&mut app, &ctx);
+        let detached = &app.active_detached_viewer_context.as_ref().unwrap().bundle;
+        assert!(matches!(
+            detached.thumbnails[0],
+            ThumbnailState::Loaded { .. }
+        ));
+        assert_eq!(
+            detached.auto_aspect.samples.get(&0),
+            Some(&ThumbAspect::Portrait3x4.height_ratio()),
+            "fullscreen-only consumption must not record grid aspect samples"
+        );
+        assert_eq!(detached.auto_aspect.current, Some(ThumbAspect::Square));
+        assert_eq!(detached.auto_aspect.switches_done, 0);
+        assert_eq!(detached.scroll_offset_y, 250.0);
+    }
+
+    #[test]
+    fn grid_thumbnail_poll_still_keeps_out_of_range_video_texture() {
+        let mut app = setup_app();
+        app.items = vec![GridItem::Video(PathBuf::from(r"C:\clips\grid.mp4"))];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.keep_range = (0, 0);
+        app.keep_set.clear();
+        app.tx
+            .send(thumbnail_msg_for_test(
+                0,
+                app.items_generation,
+                [16, 9],
+                None,
+            ))
+            .unwrap();
+
+        app.poll_thumbnails(&egui::Context::default(), ThumbnailConsumptionPolicy::Grid);
+
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
+        assert!(app.texture_backlog.is_empty());
+    }
+
+    #[test]
+    fn grid_thumbnail_poll_still_drives_auto_aspect() {
+        let mut app = setup_app();
+        app.settings.thumb_aspect_auto = true;
+        app.items = (0..8)
+            .map(|idx| GridItem::Image(PathBuf::from(format!(r"C:\grid\auto{idx}.jpg"))))
+            .collect();
+        app.thumbnails = vec![ThumbnailState::Pending; 8];
+        app.image_metas = vec![None; 8];
+        app.keep_range = (0, 1);
+        app.keep_set.insert(0);
+        app.auto_aspect.current = Some(ThumbAspect::Square);
+        app.auto_aspect.samples = (0..8)
+            .map(|idx| (idx, ThumbAspect::Portrait3x4.height_ratio()))
+            .collect();
+        app.auto_aspect.streak = Some((
+            ThumbAspect::Portrait3x4,
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+            8,
+        ));
+        app.last_input_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        app.tx
+            .send(thumbnail_msg_for_test(
+                0,
+                app.items_generation,
+                [3, 4],
+                Some((3, 4)),
+            ))
+            .unwrap();
+
+        app.poll_thumbnails(&egui::Context::default(), ThumbnailConsumptionPolicy::Grid);
+
+        assert_eq!(app.auto_aspect.current, Some(ThumbAspect::Portrait3x4));
+        assert_eq!(app.auto_aspect.switches_done, 1);
     }
 
     #[test]
