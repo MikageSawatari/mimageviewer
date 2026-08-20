@@ -938,6 +938,36 @@
   - トリム表示中 (`content_bbox` あり) と回転ページでも枠と写像が一致すること。
 - 規模 / 優先度: Small〜Medium / P2。
 
+### 1.99 開くときは黒地、切り替えるときは前の画像 — 表示先の占有を routing 境界で判定する
+
+- 出典: 2026-08-20 の利用者報告 (グリッドで PDF をダブルクリックすると、1 ページ目が遅いときに
+  無反応に見える) と、それに続く仕様整理。
+- **確定した規則 (利用者判断)**: **表示先に既に中身があるか**で分ける。
+  - **A (中身が無い)**: 新しいウィンドウが開く / F12 デタッチで新規窓 / 同一ウィンドウ内で
+    ファイルを開く → **黒地を挟んでフルスクリーンへ移る**。開く操作の結果が即座に返る
+  - **B (中身がある)**: Ctrl+↑↓ / メイン側から既存 detached を切り替え → **前の画像を保持**。
+    黒を挟むとちらつく
+  - どちらも待ちが 500ms を超えたら中央に「読み込み中」(v3.1.3 で実装済み)
+- **却下された導出**: `FsNavigationSequence::previous.is_none()` では分離できない。詳細と
+  全経路の分類は [docs/briefs/fs-open-black-vs-holdover.md](briefs/fs-open-black-vs-holdover.md)
+  の「第 1 段階の結果」。要点:
+  - `previous` は「直前の表示単位を texture として捕捉できたか」であり、表示先の占有ではない
+  - **A の production 経路のほとんどに navigation sequence が無い** (`open_fullscreen` を直接通る)
+  - **B の多くにも sequence が無い** (Home/End、スタック Shift+↑↓、連結読みのシーク、
+    スライドショー、native 動画の前後移動、passive snapshot クリック、remote 復元 等)
+  - 反例: グリッド由来・`from_explicit_open == true` でも、linked detached の既存窓を
+    更新するなら B
+- **正しい判定地点**: teardown 後の `open_fullscreen` ではなく、**表示先の surface / context を
+  選ぶ routing 境界**。`ViewerPresentation`、viewer session、detached runtime state、
+  mounted bundle の `fullscreen_idx`、native presenter の owner を見る必要がある。
+- **リワーク R2 (状態の集約) が所有する領域と重なる。**独立した作業として着手しない。
+  `previous.is_none()` を viewport 側へ足す実装は §2 の症状パッチに当たる (Codex 判定)。
+  条件を増やす形の部分対応も、単一の所有者を持たない routing 判断へ条件を足すことになるため
+  採らない (利用者判断)。
+- 現状: 中央の「読み込み中」により**無反応に見える問題は解消済み**。残るのは
+  「グリッドが見えたまま待つ (黒地にならない)」という見た目の差のみ。
+- 規模 / 優先度: 中〜大 / P3 (実害は見た目。R2 で routing の所有者が決まってから)。
+
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断
