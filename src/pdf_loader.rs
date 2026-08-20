@@ -41,17 +41,17 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 ///
 /// dispatcher の pop 順: `Critical → HighNormal → Normal`。
 ///
-/// **常時 1 ワーカー予約**: プールが 2 ワーカー以上ある場合、HighNormal + Normal の
+/// **lane ごとの静的予約**: プールが 2 ワーカー以上ある場合、HighNormal + Normal の
 /// 同時実行数を `worker_count - 1` (最低 1) に制限し、残り 1 ワーカーを Critical 用に
-/// 温存する。グリッドで先読みが 3 ワーカー全部を埋めて、`Enter` で開いた PDF の Critical
-/// な enumerate が「in-flight な Normal IPC の終了を待つ」状態 (実測 2-3 秒) を防ぐ。
-/// 代償はバルクサムネ生成のスループットが 3→2 になる -33%。手動キャッシュ作成等で
-/// しか観測されない非対話処理なので受容範囲。
+/// 温存する。さらに Normal の開始上限だけを `worker_count - 2` (最低 1) に下げ、
+/// Normal が何件積まれても HighNormal が開始できる枠を 1 つ残す。グリッドで先読みが
+/// 全ワーカーを埋めて、Critical な enumerate や表示待ちの HighNormal が in-flight な
+/// Normal IPC の終了を待つ状態を防ぐ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobPriority {
     Critical,
     /// 可視セルのサムネ render。`req.priority=true` の grid item から来る。
-    /// Critical 予約下では `worker_count - 1` 枠を Normal と共有する。
+    /// Critical 予約下では `worker_count - 1` まで開始でき、Normal より 1 枠多い。
     HighNormal,
     Normal,
 }
@@ -1346,8 +1346,8 @@ fn core_render_with_count(
 //   スレッド内に閉じ込める (共有 Mutex 不要)
 // - リクエスト側は Job を enqueue → `mpsc::Receiver` で応答待ち (途中で
 //   cancel が立てば早期 bail)
-// - worker スレッドは Condvar で起床し、Critical を先に取り、続いて Normal
-//   (予約中は `max_normal` 制限) を pop する。pop 時に cancel チェック、
+// - worker スレッドは Condvar で起床し、Critical、HighNormal、Normal の順に
+//   lane ごとの静的 cap の範囲で pop する。pop 時に cancel チェック、
 //   セットされていれば IPC せず Err を送る。
 
 struct ProcessWorkerIo {
@@ -1597,10 +1597,11 @@ struct Job {
 
 struct JobQueue {
     critical: std::collections::VecDeque<Job>,
-    /// 可視セルのサムネ render。Normal より先に pop される (両方とも `normal_in_flight` 枠を共有)。
+    /// 可視セルのサムネ render。Normal より先に pop され、Normal の開始上限を
+    /// 使い切った後も HighNormal 自身の上限まで開始できる。
     high_normal: std::collections::VecDeque<Job>,
     normal: std::collections::VecDeque<Job>,
-    /// 現在処理中の HighNormal + Normal ジョブ数 (`max_normal` 以下に制限)。
+    /// 現在処理中の HighNormal + Normal ジョブ数。lane ごとの開始判定に使う。
     /// Critical はこのカウントに含めない (= 予約枠を消費しない)。
     normal_in_flight: usize,
     /// 現在 IPC 実行中のワーカー数 (perf 用)
@@ -1628,7 +1629,8 @@ struct PdfWorkerPool {
 /// PDFium worker child process count.
 ///
 /// Critical reservation (`CRITICAL_RESERVATION_ACTIVE = true`) で 1 worker を Enter 用に
-/// 予約するので、HighNormal/Normal は `POOL_SIZE - 1 = 4` workers で消費する。
+/// 予約するので HighNormal は最大 `POOL_SIZE - 1 = 4` workers、Normal はさらに
+/// HighNormal 用の 1 worker を残して最大 `POOL_SIZE - 2 = 3` workers で消費する。
 ///
 /// **5 を選んだ理由 (2026-05):**
 /// - 個別 PDF render が 4-5 秒/page (重い PDF で 20-45 秒) のことがあり、可視 16 枚を
@@ -1636,7 +1638,7 @@ struct PdfWorkerPool {
 /// - 各 worker は別プロセスで PDFium DLL + state を独立保持 (~50-150 MB)。
 ///   5 workers で合計 +400 MB 程度の RAM、Windows 11 / 8GB+ 機なら十分許容範囲。
 /// - PDFium は single-threaded per render なので worker 数 × CPU core 並列度が線形に効く。
-/// - 値変更は再起動が必要 (`in_flight_started_at` の固定長 vec / `max_normal` 計算が
+/// - 値変更は再起動が必要 (`in_flight_started_at` の固定長 vec / lane cap 計算が
 ///   各所に焼き付いているため、動的変更は数百行の refactor になる)。
 ///
 /// より小さく / より大きくしたい場合は const を直接書き換える (= リビルド必要)。
@@ -1687,9 +1689,9 @@ impl PdfWorkerPool {
         ));
 
         // 子プロセスを先に全部 spawn してから worker_count を確定させ、その値を
-        // dispatcher スレッドに渡す (run_dispatcher が `max_normal` を計算するときに
+        // dispatcher スレッドに渡す (run_dispatcher が lane cap を計算するときに
         // 「実際に生きているワーカー数」を使うため。POOL_SIZE 固定だと、起動失敗で
-        // 1-2 worker しか居ない degraded 環境で `max_normal` が間違って計算され、
+        // 1-2 worker しか居ない degraded 環境で cap が間違って計算され、
         // Critical 予約が機能しなくなる)。
         let mut pending_workers: Vec<(usize, Child, ProcessWorkerIo)> =
             Vec::with_capacity(POOL_SIZE);
@@ -2219,15 +2221,64 @@ impl PdfWorkerPool {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NonCriticalLaneCaps {
+    high_normal: usize,
+    normal: usize,
+}
+
+/// 実際に起動できた worker 数と既存の Critical 予約設定だけから lane cap を決める。
+/// 実行時の待ち時間や queue 圧力には適応させない。
+fn non_critical_lane_caps(worker_count: usize, critical_reservation: bool) -> NonCriticalLaneCaps {
+    let high_normal = if critical_reservation {
+        worker_count.saturating_sub(1).max(1)
+    } else {
+        worker_count.max(1)
+    };
+    NonCriticalLaneCaps {
+        high_normal,
+        // HighNormal 用に 1 枠残す。ただし degraded な 1-2 worker pool で
+        // Normal を永久停止させないよう最低 1 に clamp する。
+        normal: high_normal.saturating_sub(1).max(1),
+    }
+}
+
+/// 現在の lane cap で開始可能な次の job を 1 件取り出す。
+/// Critical は従来どおり cap の影響を受けない。
+fn try_pop_dispatch_job(q: &mut JobQueue, caps: NonCriticalLaneCaps) -> Option<Job> {
+    if let Some(job) = q.critical.pop_front() {
+        q.workers_busy = q.workers_busy.saturating_add(1);
+        return Some(job);
+    }
+
+    if q.normal_in_flight < caps.high_normal
+        && let Some(job) = q.high_normal.pop_front()
+    {
+        q.normal_in_flight += 1;
+        q.workers_busy = q.workers_busy.saturating_add(1);
+        return Some(job);
+    }
+
+    if q.normal_in_flight < caps.normal
+        && let Some(job) = q.normal.pop_front()
+    {
+        q.normal_in_flight += 1;
+        q.workers_busy = q.workers_busy.saturating_add(1);
+        return Some(job);
+    }
+
+    None
+}
+
 /// ディスパッチャースレッドのメインループ。
 ///
-/// キューを覗き込み、Critical > Normal の順に pop して IPC を実行する。
-/// Normal は `critical_reservation_active()` が true のとき
-/// `worker_count - 1` (最低 1) 件までしか同時に走らない (1 ワーカー分を Critical 用に予約)。
+/// キューを覗き込み、Critical > HighNormal > Normal の順に pop して IPC を実行する。
+/// Critical 予約中は HighNormal を `worker_count - 1`、Normal を `worker_count - 2`
+/// (どちらも最低 1) までに制限する。これにより Critical と HighNormal に各 1 枠を残す。
 ///
 /// `worker_count` は `PdfWorkerPool::start()` が実際に spawn に成功した数 (POOL_SIZE
-/// と異なる degraded 環境を想定)。`worker_count == 1` の最劣化ケースでは予約による
-/// `max_n = 0` (= Normal 全凍結) を防ぐため `max(1)` でクランプする。
+/// と異なる degraded 環境を想定)。各 cap を最低 1 に clamp し、1-2 worker pool でも
+/// Normal ジョブが永久に開始できない deadlock を防ぐ。
 ///
 /// `shutdown` フラグが立つと、サブプロセスに shutdown メッセージを送って
 /// 子プロセスの終了を待ち、スレッド自体も終了する。
@@ -2256,32 +2307,9 @@ fn run_dispatcher(
                 if q.shutdown {
                     break None;
                 }
-                // Critical を最優先
-                if let Some(j) = q.critical.pop_front() {
-                    q.workers_busy = q.workers_busy.saturating_add(1);
-                    break Some(j);
-                }
-                // HighNormal / Normal: 予約中なら max_normal 制限 (両者で枠を共有)。
-                // 最低でも 1 は確保しないと、1-worker pool で Normal ジョブが永久に
-                // 動かなくなる (deadlock)。
-                let reservation = critical_reservation_active();
-                let max_n = if reservation {
-                    worker_count.saturating_sub(1).max(1)
-                } else {
-                    worker_count.max(1)
-                };
-                if q.normal_in_flight < max_n {
-                    // HighNormal (= 可視セル) を Normal より先に取る
-                    if let Some(j) = q.high_normal.pop_front() {
-                        q.normal_in_flight += 1;
-                        q.workers_busy = q.workers_busy.saturating_add(1);
-                        break Some(j);
-                    }
-                    if let Some(j) = q.normal.pop_front() {
-                        q.normal_in_flight += 1;
-                        q.workers_busy = q.workers_busy.saturating_add(1);
-                        break Some(j);
-                    }
+                let caps = non_critical_lane_caps(worker_count, critical_reservation_active());
+                if let Some(job) = try_pop_dispatch_job(&mut q, caps) {
+                    break Some(job);
                 }
                 // 取れなかった → Condvar で寝る
                 q = cv.wait(q).unwrap();
@@ -2293,8 +2321,8 @@ fn run_dispatcher(
             break;
         };
 
-        // HighNormal と Normal の両方が `normal_in_flight` 枠を消費する
-        let counts_against_normal_slots =
+        // HighNormal と Normal の両方が非 Critical in-flight 数を消費する
+        let counts_against_non_critical_slots =
             matches!(job.priority, JobPriority::HighNormal | JobPriority::Normal);
 
         // ── cancel + epoch チェック (pop 後): どちらかが立っていれば IPC せず Err を送る ──
@@ -2378,7 +2406,7 @@ fn run_dispatcher(
             let (mtx, cv) = &*queue;
             let mut q = mtx.lock().unwrap();
             q.workers_busy = q.workers_busy.saturating_sub(1);
-            if counts_against_normal_slots {
+            if counts_against_non_critical_slots {
                 q.normal_in_flight = q.normal_in_flight.saturating_sub(1);
             }
             // in-flight metadata clear (cancel skip 経由でもここに来るので no-op で安全)
@@ -4264,6 +4292,87 @@ C:\isolated\miv-data"#
             }),
             Condvar::new(),
         ))
+    }
+
+    #[test]
+    fn dispatcher_high_normal_starts_at_normal_lane_cap() {
+        let caps = non_critical_lane_caps(5, true);
+        assert_eq!(caps.high_normal, 4);
+        assert_eq!(caps.normal, 3);
+        let queue = empty_queue();
+        let (high, _high_rx) = make_test_job(JobPriority::HighNormal, 1);
+        let (normal, _normal_rx) = make_test_job(JobPriority::Normal, 1);
+        let (mtx, _) = &*queue;
+        let mut q = mtx.lock().unwrap();
+        q.normal_in_flight = caps.normal;
+        q.high_normal.push_back(high);
+        q.normal.push_back(normal);
+
+        let popped = try_pop_dispatch_job(&mut q, caps).unwrap();
+
+        assert_eq!(popped.priority, JobPriority::HighNormal);
+        assert_eq!(q.normal_in_flight, caps.high_normal);
+        assert_eq!(q.normal.len(), 1);
+    }
+
+    #[test]
+    fn dispatcher_critical_bypasses_non_critical_lane_caps() {
+        let caps = non_critical_lane_caps(5, true);
+        let queue = empty_queue();
+        let (critical, _critical_rx) = make_test_job(JobPriority::Critical, 0);
+        let (high, _high_rx) = make_test_job(JobPriority::HighNormal, 1);
+        let (mtx, _) = &*queue;
+        let mut q = mtx.lock().unwrap();
+        q.normal_in_flight = caps.high_normal;
+        q.critical.push_back(critical);
+        q.high_normal.push_back(high);
+
+        let popped = try_pop_dispatch_job(&mut q, caps).unwrap();
+
+        assert_eq!(popped.priority, JobPriority::Critical);
+        assert_eq!(q.normal_in_flight, caps.high_normal);
+        assert_eq!(q.high_normal.len(), 1);
+    }
+
+    #[test]
+    fn dispatcher_one_worker_keeps_normal_runnable() {
+        let caps = non_critical_lane_caps(1, true);
+        assert_eq!(caps.high_normal, 1);
+        assert_eq!(caps.normal, 1);
+        let queue = empty_queue();
+        let (normal, _normal_rx) = make_test_job(JobPriority::Normal, 1);
+        let (mtx, _) = &*queue;
+        let mut q = mtx.lock().unwrap();
+        q.normal.push_back(normal);
+
+        let popped = try_pop_dispatch_job(&mut q, caps).unwrap();
+
+        assert_eq!(popped.priority, JobPriority::Normal);
+        assert_eq!(q.normal_in_flight, 1);
+    }
+
+    #[test]
+    fn dispatcher_two_workers_keeps_normal_runnable() {
+        let caps = non_critical_lane_caps(2, true);
+        assert_eq!(caps.high_normal, 1);
+        assert_eq!(caps.normal, 1);
+        let queue = empty_queue();
+        let (normal, _normal_rx) = make_test_job(JobPriority::Normal, 1);
+        let (mtx, _) = &*queue;
+        let mut q = mtx.lock().unwrap();
+        q.normal.push_back(normal);
+
+        let popped = try_pop_dispatch_job(&mut q, caps).unwrap();
+
+        assert_eq!(popped.priority, JobPriority::Normal);
+        assert_eq!(q.normal_in_flight, 1);
+    }
+
+    #[test]
+    fn dispatcher_disabled_critical_reservation_keeps_full_high_normal_capacity() {
+        let caps = non_critical_lane_caps(5, false);
+        assert_eq!(caps.high_normal, 5);
+        assert_eq!(caps.normal, 4);
     }
 
     /// prune_stale_jobs の代替実装 (pool 起動なし、JobQueue 直操作)。
