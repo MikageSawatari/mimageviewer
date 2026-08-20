@@ -728,6 +728,11 @@ PDF worker pool は最初の PDF 操作時に遅延初期化する。起動時�
 `OnceLock` に失敗理由を確定して、以後の新しい PDFium 操作は Err を返す。アプリ本体と画像・動画・
 アーカイブ閲覧は止めず、失敗理由は persistent notice で 1 回だけ通知する。
 
+各 PDF worker process は PDFium と並べて直前 1 冊の document cache を所有する。enumerate / render /
+analyze / metadata 取得はすべて同じ cache を通り、要求ごとに stat した
+`(path, password, mtime, file_size)` が完全一致した場合だけ document を再利用する。stat 失敗では
+保持 document を閉じ、古い内容を返さない。cache は 1 件固定で、時間窓や context epoch 解放は持たない。
+
 一方、**起動成功後に PDF / Susie worker が想定外終了しても、現在は自動 respawn しない**。
 dispatcher は stdin/stdout の切断をその要求の Err として返すだけで、worker 数も補充しない。
 したがって、この節は起動後の自己回復を保証しない。respawn を追加する場合は、in-flight request の
@@ -996,7 +1001,10 @@ button_state` / `render_folder_pin_menu_entry` が `None`/false を返してエ�
 - `frame`  — 毎フレーム begin。`n` はフレーム番号
 - `fs`     — フルスクリーン画像: `load_begin` / `decode_begin` / `decode_end` / `ready` / `paint`。`final_effect_worker` は `worker_ms` に加えて `colorize_check_ms` / `colorize_apply_ms`、各補正段、`clamp_ms` / `load_texture_ms`、`colorize_applied`、方式・設定スケール・長辺換算後の実効スケール、`prefetch` / `complete` を記録する。完成済み final composite を drop 後 30 秒以内に同じ key で再生成した場合は `final_effect_recompute` に `idx` / `age_ms` / `drop_reason` / 窓内・累計件数を記録し、窓内 8 件超では 30 秒に 1 回だけ通常ログへ警告する。先読み admission の拒否は `final_effect_prefetch_blocked` に `idx` / `reason` (`not_in_keep_set` または `over_low_watermark`) / `loaded_texels` / `low_watermark` を記録する。同じ idx・理由は 1 秒に 1 回へ間引き、理由変更時は即時記録する
 - `thumb`  — サムネイル: `enqueue` / `pick` / `skip` / `decode_begin` / `decode_end` / `ready`。アイドル高画質化の最終判定は `idle_upgrade_enqueue` / `idle_upgrade_ineligible` に `key` / `idx` / `items_gen` を載せ、同一状態の反復を検出できるようにする
-- `pdf`    — PDF ワーカー IPC: `pool_send` / `pool_recv` / `enumerate_send`
+- `pdf`    — PDF ワーカー IPC: `pool_send` / `pool_recv` / `enumerate_send`。render 成功時の
+  `pool_recv` は `worker_open_ms`（cache miss の `load_pdf_from_file`）、`worker_page_ms`
+  （page 取得・content 解析・寸法取得）、`worker_render_ms`（`render_with_config` のみ）、
+  `doc_reused` を持つ。cache hit では `doc_reused=true` かつ `worker_open_ms=0`
 - `ai`     — AI: `upscale_begin` / `upscale_tile` / `upscale_end` / `denoise_*` / `job_start` / `job_ready`
 - `ui`     — UI フレーム: `tail_repaint` / `slow_frame_breakdown` / `pre_grid_breakdown`。
   `pre_grid_breakdown` は `n` / `total_ms` と、検索・お気に入り・タグ・ファセット・遅延状態・

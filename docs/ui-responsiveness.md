@@ -487,7 +487,10 @@ python scripts/analyze_perf.py <perf_events.jsonl> remote-page
 PDF worker process の Render では、性能ログが有効な要求だけ、既存画像レスポンスの直後に固定長の
 計測フレームを返す。`pdf.pool_recv` は従来の `rtt_ms` を変えず、次を追加で記録する。
 
-- `worker_render_ms`: document open、page 解析、PDFium bitmap 作成、`as_image` 完了まで
+- `worker_open_ms`: cache miss 時の `load_pdf_from_file`。cache hit は 0
+- `worker_page_ms`: `doc.pages().get()`、page content 解析、ページ寸法取得
+- `worker_render_ms`: `render_with_config` のみ（document open と page 解析を含まない）
+- `doc_reused`: worker の直前 1 冊 document cache を再利用したか
 - `worker_serialize_ms`: RGBA 化と既存画像レスポンス `Vec<u8>` の組立
 - `worker_write_ms`: 画像フレームの `[4B len] + payload + flush` 完了まで
 - `parent_read_ms`: 親の最初の応答 read が完了してから画像フレーム全体を読み終えるまで。
@@ -499,7 +502,7 @@ PDF worker process の Render では、性能ログが有効な要求だけ、�
   `ChildStdout.read` を数え、次の小さい計測フレームを先読みした場合は byte 数が大きくなり得る
 
 write と read は同じ pipe 転送区間を両端から測るため加算しない。
-`critical_path_ms = worker_render_ms + worker_serialize_ms + max(worker_write_ms, parent_read_ms)`
+`critical_path_ms = worker_open_ms + worker_page_ms + worker_render_ms + worker_serialize_ms + max(worker_write_ms, parent_read_ms)`
 とし、`timing_consistent` は計測フレームを取得でき、かつこの値が `rtt_ms` 以下のときだけ true。
 残りは `unaccounted_ms`（queue/dispatch、request write、response parse/copy 等）に残す。
 `metrics_available=false` では計測値を 0 として扱い、計測フレームの異常で受信済み画像を破棄しない。

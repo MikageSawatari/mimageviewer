@@ -326,6 +326,12 @@ static snapshot へ固定し、遅延初期化時には設定を読み直さな�
 以後の新しい PDFium 操作は Err になるが、アプリ本体、画像・動画・アーカイブ経路、保持済みの
 PDF raster 表示は止めない。失敗理由と `<data_dir>/logs` は persistent notice で 1 回だけ示す。
 
+各ワーカープロセスは最後に開いた PDF 文書を 1 冊だけ保持し、enumerate / render / analyze /
+metadata 取得で共用する。再利用キーは `(path, password, mtime, file_size)` で、要求ごとに
+filesystem metadata を取り直して全要素が一致した場合だけ再利用する。stat 失敗では保持文書を閉じ、
+mtime / size を含むキーのいずれかが変わった差し替えやパスワード変更では開き直す。時間による解放や
+context epoch による解放は行わない。
+
 ### 2.3 自動 1 ページ目フルスクリーン (`auto_fullscreen_zip_pdf`)
 
 環境設定のフル機能ウィンドウで「本をページ表示で開く」が ON、または複数ウィンドウモードが

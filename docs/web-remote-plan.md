@@ -2649,14 +2649,22 @@ raw 取得は現在ページの source 比較を崩さないため trim に分�
 増える直列化と、待ちはほぼ 0 だが実処理が伸びる CPU / メモリ帯域飽和を区別してから速度変更を決める。
 この増分は計測だけで、pool、並列上限、画質、先読み、表示 ownership は変更しない。
 
-2026-08-13 に PDF worker 内訳計測を追加した。`pdf.pool_recv` は従来の `rtt_ms` に加え、
+2026-08-13 に PDF worker 内訳計測を最初に追加した。`pdf.pool_recv` は従来の `rtt_ms` に加え、
 PDFium bitmap までの `worker_render_ms`、RGBA / response 組立の `worker_serialize_ms`、
 stdout 完了までの `worker_write_ms`、親側の `parent_read_ms`、両側の byte / call 数を持つ。
 write/read は同一 pipe 区間なので、内訳の critical path は
 `render + serialize + max(write, read)` とし、`timing_consistent` で `rtt_ms` 以下を検査する。
 自動テストでは既存 render response の header / RGBA が変わらず、計測 frame の encode/decode、
-framing byte 数、call 数、error 応答で追加 frame を待たないことを確認した。実 PDF の dominance
-（render 対 transfer）は、隔離した debug worker で 4096 px の同一ページを 3 回計測した。
+framing byte 数、call 数、error 応答で追加 frame を待たないことを確認した。
+
+2026-08-20 に worker ごとの直前 1 冊 document cache と段別計測を追加し、`worker_render_ms` の意味を
+`render_with_config` だけへ変更した。`worker_open_ms` は cache miss 時の document open、
+`worker_page_ms` は page 取得・content 解析・寸法取得、`doc_reused` は document 再利用の成否を示す。
+critical path は `open + page + render + serialize + max(write, read)` である。以下の 2026-08-13 実測値の
+render は分割前の旧定義（open + page + render）である。
+
+実 PDF の dominance（render 対 transfer）は、隔離した debug worker で 4096 px の同一ページを
+3 回計測した。
 45.25 MiB 応答の warm 2 回は render 30.7–30.9 ms、serialize 24.9–27.0 ms、
 write 24.2–28.3 ms、worker RTT 87.0–87.4 ms だった。cold 1 回目は render 86.4 ms、
 serialize 23.9 ms、write 15.6 ms、RTT 137.9 ms である。warm 時は転送だけが単独で支配しておらず、

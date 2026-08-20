@@ -391,32 +391,154 @@ fn estimate_tiled_size(sizes: &[(u32, u32)]) -> PdfPageContentType {
     PdfPageContentType::Raster { w, h }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct PdfDocumentCacheKey {
+    path: PathBuf,
+    password: Option<Box<str>>,
+    modified: std::time::SystemTime,
+    file_size: u64,
+}
+
+impl PdfDocumentCacheKey {
+    fn from_request(path: &Path, password: Option<&str>) -> std::io::Result<Self> {
+        let metadata = std::fs::metadata(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            password: password.map(|value| value.to_owned().into_boxed_str()),
+            modified: metadata.modified()?,
+            file_size: metadata.len(),
+        })
+    }
+
+    fn mtime_seconds(&self) -> i64 {
+        self.modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map_or(0, |duration| duration.as_secs() as i64)
+    }
+}
+
+/// 前回の document と今回 stat した要求が同じ PDF を指す場合だけ再利用する。
+/// `requested=None` は stat 失敗を表し、古い document を決して再利用しない。
+fn should_reuse_pdf_document(
+    cached: Option<&PdfDocumentCacheKey>,
+    requested: Option<&PdfDocumentCacheKey>,
+) -> bool {
+    matches!((cached, requested), (Some(cached), Some(requested)) if cached == requested)
+}
+
+/// 1 プロセスがこれまでに見たパスワード。同じ文字列は 1 度しか確保しない。
+///
+/// `Pdfium::load_pdf_from_file` は `password: Option<&'a str>` の `'a` を `&'a Pdfium` と
+/// 同じにしているため、開いた document を長く持つとパスワード文字列も同じだけ生かす必要が
+/// ある。実際には PDFium が `FPDF_LoadCustomDocument` の中でコピーし、返される
+/// `PdfDocument` はパスワードを保持しない (保持するのは file-access reader だけ) ので、
+/// これは API 側の過剰制約である。
+///
+/// `&'static str` にすれば、lifetime の transmute を書かずに署名を満たせる。確保量は
+/// **そのプロセスが実際に使った相異なるパスワードの数**に等しく、パスワード付き PDF を
+/// 開かなければ 0 のままになる。
+static INTERNED_PDF_PASSWORDS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+fn interned_pdf_password(value: &str) -> &'static str {
+    let mut interned = INTERNED_PDF_PASSWORDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(found) = interned.iter().copied().find(|known| *known == value) {
+        return found;
+    }
+    let leaked: &'static str = Box::leak(value.to_owned().into_boxed_str());
+    interned.push(leaked);
+    leaked
+}
+
+struct CachedPdfDocument<'pdfium> {
+    document: PdfDocument<'pdfium>,
+    key: PdfDocumentCacheKey,
+}
+
+impl<'pdfium> CachedPdfDocument<'pdfium> {
+    fn open(pdfium: &'pdfium Pdfium, key: PdfDocumentCacheKey) -> std::io::Result<Self> {
+        let password = key.password.as_deref().map(interned_pdf_password);
+        let document = pdfium
+            .load_pdf_from_file(&key.path, password)
+            .map_err(pdfium_open_error)?;
+        Ok(Self { document, key })
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PdfDocumentAccessMetrics {
+    open_us: u64,
+    doc_reused: bool,
+}
+
+/// PDF worker process ごとの「直前 1 冊」キャッシュ。
+///
+/// 毎要求で metadata を取り直し、path/password/mtime/size の全てが一致するときだけ
+/// document を再利用する。stat 失敗時は古い document を即座に閉じる。
+struct PdfDocumentCache<'pdfium> {
+    pdfium: &'pdfium Pdfium,
+    cached: Option<CachedPdfDocument<'pdfium>>,
+}
+
+impl<'pdfium> PdfDocumentCache<'pdfium> {
+    fn new(pdfium: &'pdfium Pdfium) -> Self {
+        Self {
+            pdfium,
+            cached: None,
+        }
+    }
+
+    fn with_document<T>(
+        &mut self,
+        path: &Path,
+        password: Option<&str>,
+        operation: impl FnOnce(&PdfDocument<'pdfium>, &PdfDocumentCacheKey) -> std::io::Result<T>,
+    ) -> std::io::Result<(T, PdfDocumentAccessMetrics)> {
+        let requested = PdfDocumentCacheKey::from_request(path, password);
+        let doc_reused = should_reuse_pdf_document(
+            self.cached.as_ref().map(|cached| &cached.key),
+            requested.as_ref().ok(),
+        );
+        if !doc_reused {
+            self.cached = None;
+        }
+        let requested = requested?;
+        let open_us = if doc_reused {
+            0
+        } else {
+            let open_started = std::time::Instant::now();
+            let opened = CachedPdfDocument::open(self.pdfium, requested);
+            let open_us = duration_us(open_started.elapsed());
+            self.cached = Some(opened?);
+            open_us
+        };
+        let cached = self
+            .cached
+            .as_ref()
+            .expect("PDF document cache populated before operation");
+        let result = operation(&cached.document, &cached.key)?;
+        Ok((
+            result,
+            PdfDocumentAccessMetrics {
+                open_us,
+                doc_reused,
+            },
+        ))
+    }
+}
+
 /// PDF のページ一覧を列挙する (コアロジック)。
-fn core_enumerate(
-    pdfium: &Pdfium,
-    path: &Path,
-    password: Option<&str>,
-) -> std::io::Result<Vec<PdfPageEntry>> {
-    let meta = std::fs::metadata(path)?;
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs() as i64);
-    let file_size = meta.len();
-
-    let doc = pdfium
-        .load_pdf_from_file(path, password)
-        .map_err(pdfium_open_error)?;
-
-    let count = doc.pages().len() as u32;
-    Ok((0..count)
+fn core_enumerate(document: &PdfDocument<'_>, key: &PdfDocumentCacheKey) -> Vec<PdfPageEntry> {
+    let count = document.pages().len() as u32;
+    (0..count)
         .map(|i| PdfPageEntry {
             page_num: i,
-            mtime,
-            file_size,
+            mtime: key.mtime_seconds(),
+            file_size: key.file_size,
         })
-        .collect())
+        .collect()
 }
 
 fn pdfium_open_error(error: PdfiumError) -> std::io::Error {
@@ -442,7 +564,8 @@ pub(crate) fn is_password_required_error(error: &std::io::Error) -> bool {
 }
 
 // (旧 `core_render` は `core_render_with_count` (v1.0.0 で page_count も返す)
-//  に置き換えられた。後者は ipc_render と in-process worker の両方から使われる。)
+//  に置き換えられた。後者は in-process worker 専用で、IPC worker は同じ
+//  document 描画 helper を直前 1 冊キャッシュ経由で呼ぶ。)
 //
 // **lopdf fast-path 検討 (撤回、v1.0.0 開発中)**:
 // `Document::load` は eager に全オブジェクトをパースする実装で、PDFium の lazy
@@ -473,7 +596,7 @@ pub(crate) fn is_password_required_error(error: &std::io::Error) -> bool {
 //       Enumerate: [4B page_count][per page: 8B mtime LE + 8B file_size LE]
 //       Render:    [4B width][4B height][rgba_bytes...]
 //       Render metrics (perf 有効時だけ Render success の次フレーム):
-//         [4B magic PDM1][1B version][7 * 8B counters]
+//         [4B magic PDM1][1B version][1B doc_reused][9 * 8B counters]
 //     Error (1): [error_message_utf8]
 
 const MSG_ENUMERATE: u8 = 1;
@@ -487,12 +610,15 @@ const MSG_ANALYZE_PAGE: u8 = 6;
 const STATUS_OK: u8 = 0;
 const STATUS_ERR: u8 = 1;
 const RENDER_METRICS_MAGIC: &[u8; 4] = &[0x50, 0x44, 0x4d, 0x31];
-const RENDER_METRICS_VERSION: u8 = 1;
-const RENDER_METRICS_LEN: usize = 4 + 1 + 7 * std::mem::size_of::<u64>();
+const RENDER_METRICS_VERSION: u8 = 2;
+const RENDER_METRICS_LEN: usize = 4 + 1 + 1 + 9 * std::mem::size_of::<u64>();
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct WorkerRenderMetrics {
+    open_us: u64,
+    page_us: u64,
     render_us: u64,
+    doc_reused: bool,
     serialize_us: u64,
     write_us: u64,
     response_bytes: u64,
@@ -636,7 +762,10 @@ fn encode_worker_render_metrics(metrics: WorkerRenderMetrics) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(RENDER_METRICS_LEN);
     bytes.extend_from_slice(RENDER_METRICS_MAGIC);
     bytes.push(RENDER_METRICS_VERSION);
+    bytes.push(u8::from(metrics.doc_reused));
     for value in [
+        metrics.open_us,
+        metrics.page_us,
         metrics.render_us,
         metrics.serialize_us,
         metrics.write_us,
@@ -654,20 +783,25 @@ fn decode_worker_render_metrics(bytes: &[u8]) -> std::io::Result<WorkerRenderMet
     if bytes.len() != RENDER_METRICS_LEN
         || &bytes[..4] != RENDER_METRICS_MAGIC
         || bytes[4] != RENDER_METRICS_VERSION
+        || bytes[5] > 1
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "invalid PDF render metrics frame",
         ));
     }
-    let mut offset = 5;
+    let doc_reused = bytes[5] != 0;
+    let mut offset = 6;
     let mut next = || {
         let value = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
         offset += 8;
         value
     };
     Ok(WorkerRenderMetrics {
+        open_us: next(),
+        page_us: next(),
         render_us: next(),
+        doc_reused,
         serialize_us: next(),
         write_us: next(),
         response_bytes: next(),
@@ -678,11 +812,13 @@ fn decode_worker_render_metrics(bytes: &[u8]) -> std::io::Result<WorkerRenderMet
 }
 
 fn render_critical_path_ms(worker: WorkerRenderMetrics, parent: ParentReadMetrics) -> f64 {
+    let open_ms = worker.open_us as f64 / 1000.0;
+    let page_ms = worker.page_us as f64 / 1000.0;
     let render_ms = worker.render_us as f64 / 1000.0;
     let serialize_ms = worker.serialize_us as f64 / 1000.0;
     let write_ms = worker.write_us as f64 / 1000.0;
     let read_ms = parent.read_us as f64 / 1000.0;
-    render_ms + serialize_ms + write_ms.max(read_ms)
+    open_ms + page_ms + render_ms + serialize_ms + write_ms.max(read_ms)
 }
 
 fn write_msg(w: &mut impl std::io::Write, data: &[u8]) -> std::io::Result<()> {
@@ -1023,6 +1159,7 @@ pub fn run_worker_process() {
         }
     };
     let pdfium = Pdfium::new(bindings);
+    let mut document_cache = PdfDocumentCache::new(&pdfium);
 
     let mut stdin = std::io::stdin().lock();
     // std::io::stdout() は常に 1 KiB LineWriter を挟む。バイナリ内の最後の改行までを
@@ -1057,7 +1194,7 @@ pub fn run_worker_process() {
 
         match req {
             DecodedRequest::Enumerate { path, password } => {
-                match ipc_enumerate(&pdfium, &path, password.as_deref()) {
+                match ipc_enumerate(&mut document_cache, &path, password.as_deref()) {
                     Ok(resp) => {
                         let _ = write_msg(&mut stdout, &resp);
                     }
@@ -1072,8 +1209,14 @@ pub fn run_worker_process() {
                 target,
                 password,
                 collect_metrics,
-            } => match ipc_render(&pdfium, &path, page_num, target, password.as_deref()) {
-                Ok((resp, render_us, serialize_us)) => {
+            } => match ipc_render(
+                &mut document_cache,
+                &path,
+                page_num,
+                target,
+                password.as_deref(),
+            ) {
+                Ok((resp, mut metrics)) => {
                     let before = stdout.snapshot();
                     let write_started = std::time::Instant::now();
                     let write_result = write_msg(&mut stdout, &resp);
@@ -1083,16 +1226,13 @@ pub fn run_worker_process() {
                         break;
                     }
                     if collect_metrics {
-                        let metrics = encode_worker_render_metrics(WorkerRenderMetrics {
-                            render_us,
-                            serialize_us,
-                            write_us,
-                            response_bytes: resp.len() as u64,
-                            wire_bytes: written.bytes,
-                            write_calls: written.write_calls,
-                            flush_calls: written.flush_calls,
-                        });
-                        if write_msg(&mut stdout, &metrics).is_err() {
+                        metrics.write_us = write_us;
+                        metrics.response_bytes = resp.len() as u64;
+                        metrics.wire_bytes = written.bytes;
+                        metrics.write_calls = written.write_calls;
+                        metrics.flush_calls = written.flush_calls;
+                        let metrics_frame = encode_worker_render_metrics(metrics);
+                        if write_msg(&mut stdout, &metrics_frame).is_err() {
                             break;
                         }
                     }
@@ -1102,7 +1242,7 @@ pub fn run_worker_process() {
                 }
             },
             DecodedRequest::GetInfo { path, password } => {
-                match ipc_get_info(&pdfium, &path, password.as_deref()) {
+                match ipc_get_info(&mut document_cache, &path, password.as_deref()) {
                     Ok(resp) => {
                         let _ = write_msg(&mut stdout, &resp);
                     }
@@ -1115,14 +1255,16 @@ pub fn run_worker_process() {
                 path,
                 page_num,
                 password,
-            } => match ipc_analyze_page(&pdfium, &path, page_num, password.as_deref()) {
-                Ok(resp) => {
-                    let _ = write_msg(&mut stdout, &resp);
+            } => {
+                match ipc_analyze_page(&mut document_cache, &path, page_num, password.as_deref()) {
+                    Ok(resp) => {
+                        let _ = write_msg(&mut stdout, &resp);
+                    }
+                    Err(e) => {
+                        let _ = send_error(&mut stdout, &e.to_string());
+                    }
                 }
-                Err(e) => {
-                    let _ = send_error(&mut stdout, &e.to_string());
-                }
-            },
+            }
             DecodedRequest::Shutdown => break,
         }
     }
@@ -1136,8 +1278,14 @@ fn send_error(w: &mut impl std::io::Write, msg: &str) -> std::io::Result<()> {
 }
 
 /// core_enumerate の結果を IPC バイナリにシリアライズする。
-fn ipc_enumerate(pdfium: &Pdfium, path: &Path, password: Option<&str>) -> std::io::Result<Vec<u8>> {
-    let entries = core_enumerate(pdfium, path, password)?;
+fn ipc_enumerate(
+    cache: &mut PdfDocumentCache<'_>,
+    path: &Path,
+    password: Option<&str>,
+) -> std::io::Result<Vec<u8>> {
+    let (entries, _) = cache.with_document(path, password, |document, key| {
+        Ok(core_enumerate(document, key))
+    })?;
     let count = entries.len() as u32;
     let mut buf = Vec::with_capacity(1 + 4 + entries.len() * 16);
     buf.push(STATUS_OK);
@@ -1154,17 +1302,10 @@ fn ipc_enumerate(pdfium: &Pdfium, path: &Path, password: Option<&str>) -> std::i
 /// 全文検索インデクサが PDF のタイトル等を ingest するために使う (§16 step 17)。
 /// pdfium-render の PdfDocument::metadata() で取れる 4 タグだけを抽出する。
 /// v1 では他のタグ (Creator / Producer / *Date) は取らない (検索価値が低い)。
-fn core_get_info(
-    pdfium: &Pdfium,
-    path: &Path,
-    password: Option<&str>,
-) -> std::io::Result<PdfDocumentInfo> {
+fn core_get_info(document: &PdfDocument<'_>) -> std::io::Result<PdfDocumentInfo> {
     use pdfium_render::prelude::PdfDocumentMetadataTagType;
 
-    let doc = pdfium
-        .load_pdf_from_file(path, password)
-        .map_err(pdfium_open_error)?;
-    let metadata = doc.metadata();
+    let metadata = document.metadata();
     let extract = |tag: PdfDocumentMetadataTagType| -> Option<String> {
         metadata.get(tag).and_then(|t| {
             let v = t.value().to_string();
@@ -1181,8 +1322,12 @@ fn core_get_info(
 
 /// core_get_info の結果を IPC バイナリにシリアライズする。
 /// フォーマット: [status][4B title_len][title_bytes][4B author_len][author_bytes]...×4
-fn ipc_get_info(pdfium: &Pdfium, path: &Path, password: Option<&str>) -> std::io::Result<Vec<u8>> {
-    let info = core_get_info(pdfium, path, password)?;
+fn ipc_get_info(
+    cache: &mut PdfDocumentCache<'_>,
+    path: &Path,
+    password: Option<&str>,
+) -> std::io::Result<Vec<u8>> {
+    let (info, _) = cache.with_document(path, password, |document, _| core_get_info(document))?;
     let mut buf = Vec::with_capacity(256);
     buf.push(STATUS_OK);
     for field in [&info.title, &info.author, &info.subject, &info.keywords] {
@@ -1201,18 +1346,17 @@ fn ipc_get_info(pdfium: &Pdfium, path: &Path, password: Option<&str>) -> std::io
 /// ピクセル開始オフセット = 30B。ページ box のポイント寸法は、thumbnail raster の
 /// 整数丸めに依存しない表示レイアウト比を catalog へ残すために返す。
 fn ipc_render(
-    pdfium: &Pdfium,
+    cache: &mut PdfDocumentCache<'_>,
     path: &Path,
     page_num: u32,
     target: PdfRenderTarget,
     password: Option<&str>,
-) -> std::io::Result<(Vec<u8>, u64, u64)> {
-    let render_started = std::time::Instant::now();
-    let (img, content_type, page_count, page_size_points) =
-        core_render_with_count(pdfium, path, page_num, target, password)?;
-    let render_us = duration_us(render_started.elapsed());
+) -> std::io::Result<(Vec<u8>, WorkerRenderMetrics)> {
+    let (rendered, access) = cache.with_document(path, password, |document, _| {
+        core_render_document(document, page_num, target)
+    })?;
     let serialize_started = std::time::Instant::now();
-    let rgba = img.to_rgba8();
+    let rgba = rendered.image.to_rgba8();
     let w = rgba.width();
     let h = rgba.height();
     let pixels = rgba.as_raw();
@@ -1220,7 +1364,7 @@ fn ipc_render(
     buf.push(STATUS_OK);
     buf.extend_from_slice(&w.to_le_bytes());
     buf.extend_from_slice(&h.to_le_bytes());
-    match content_type {
+    match rendered.content_type {
         PdfPageContentType::Vector => {
             buf.push(0);
             buf.extend_from_slice(&0u32.to_le_bytes());
@@ -1232,22 +1376,34 @@ fn ipc_render(
             buf.extend_from_slice(&rh.to_le_bytes());
         }
     }
-    buf.extend_from_slice(&page_count.to_le_bytes());
-    buf.extend_from_slice(&page_size_points.width.to_le_bytes());
-    buf.extend_from_slice(&page_size_points.height.to_le_bytes());
+    buf.extend_from_slice(&rendered.page_count.to_le_bytes());
+    buf.extend_from_slice(&rendered.page_size_points.width.to_le_bytes());
+    buf.extend_from_slice(&rendered.page_size_points.height.to_le_bytes());
     buf.extend_from_slice(pixels);
     let serialize_us = duration_us(serialize_started.elapsed());
-    Ok((buf, render_us, serialize_us))
+    Ok((
+        buf,
+        WorkerRenderMetrics {
+            open_us: access.open_us,
+            page_us: rendered.page_us,
+            render_us: rendered.render_us,
+            doc_reused: access.doc_reused,
+            serialize_us,
+            ..WorkerRenderMetrics::default()
+        },
+    ))
 }
 
 /// Render を行わず、AI canonical 判定に必要な page content と native raster 寸法だけ返す。
 fn ipc_analyze_page(
-    pdfium: &Pdfium,
+    cache: &mut PdfDocumentCache<'_>,
     path: &Path,
     page_num: u32,
     password: Option<&str>,
 ) -> std::io::Result<Vec<u8>> {
-    let analysis = core_analyze_page(pdfium, path, page_num, password)?;
+    let (analysis, _) = cache.with_document(path, password, |document, _| {
+        core_analyze_page(document, page_num)
+    })?;
     let mut buf = Vec::with_capacity(14);
     buf.push(STATUS_OK);
     match analysis.content_type {
@@ -1267,16 +1423,11 @@ fn ipc_analyze_page(
 }
 
 fn core_analyze_page(
-    pdfium: &Pdfium,
-    path: &Path,
+    document: &PdfDocument<'_>,
     page_num: u32,
-    password: Option<&str>,
 ) -> std::io::Result<PdfPageAnalysis> {
-    let doc = pdfium
-        .load_pdf_from_file(path, password)
-        .map_err(pdfium_open_error)?;
-    let page_count = doc.pages().len() as u32;
-    let page = doc
+    let page_count = document.pages().len() as u32;
+    let page = document
         .pages()
         .get(page_num as u16)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
@@ -1286,8 +1437,17 @@ fn core_analyze_page(
     })
 }
 
+struct CoreRenderOutput {
+    image: image::DynamicImage,
+    content_type: PdfPageContentType,
+    page_count: u32,
+    page_size_points: PdfPageSizePoints,
+    page_us: u64,
+    render_us: u64,
+}
+
 /// core_render に page_count 取得を追加した拡張版 (v1.0.0)。
-/// ipc_render と in-process worker から共用する。
+/// in-process worker 用。IPC worker は `core_render_document` を cache 経由で呼ぶ。
 fn core_render_with_count(
     pdfium: &Pdfium,
     path: &Path,
@@ -1328,6 +1488,44 @@ fn core_render_with_count(
             height: page_h,
         },
     ))
+}
+
+fn core_render_document(
+    document: &PdfDocument<'_>,
+    page_num: u32,
+    target: PdfRenderTarget,
+) -> std::io::Result<CoreRenderOutput> {
+    let page_started = std::time::Instant::now();
+    let page_count = document.pages().len() as u32;
+    let page = document
+        .pages()
+        .get(page_num as u16)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+    let content_type = analyze_page_content(&page);
+    let page_w = page.width().value;
+    let page_h = page.height().value;
+    let page_us = duration_us(page_started.elapsed());
+    let target_px = resolve_render_target_long_edge(target, page_w, page_h, content_type);
+    let (tw, th) = fit_to_target(page_w, page_h, target_px as f32);
+    let render_config = PdfRenderConfig::new()
+        .set_target_width(tw as i32)
+        .set_maximum_height(th as i32);
+    let render_started = std::time::Instant::now();
+    let bitmap = page
+        .render_with_config(&render_config)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+    let render_us = duration_us(render_started.elapsed());
+    Ok(CoreRenderOutput {
+        image: bitmap.as_image(),
+        content_type,
+        page_count,
+        page_size_points: PdfPageSizePoints {
+            width: page_w,
+            height: page_h,
+        },
+        page_us,
+        render_us,
+    })
 }
 
 // -----------------------------------------------------------------------
@@ -3386,6 +3584,8 @@ fn render_page_target(
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         let metrics_available = resp.worker_render.is_some();
         let worker = resp.worker_render.unwrap_or_default();
+        let worker_open_ms = worker.open_us as f64 / 1000.0;
+        let worker_page_ms = worker.page_us as f64 / 1000.0;
         let worker_render_ms = worker.render_us as f64 / 1000.0;
         let worker_serialize_ms = worker.serialize_us as f64 / 1000.0;
         let worker_write_ms = worker.write_us as f64 / 1000.0;
@@ -3409,10 +3609,13 @@ fn render_page_target(
             &[
                 ("page", serde_json::Value::from(page_num)),
                 ("rtt_ms", serde_json::Value::from(ms)),
+                ("worker_open_ms", serde_json::Value::from(worker_open_ms)),
+                ("worker_page_ms", serde_json::Value::from(worker_page_ms)),
                 (
                     "worker_render_ms",
                     serde_json::Value::from(worker_render_ms),
                 ),
+                ("doc_reused", serde_json::Value::from(worker.doc_reused)),
                 (
                     "worker_serialize_ms",
                     serde_json::Value::from(worker_serialize_ms),
@@ -3697,6 +3900,41 @@ mod tests {
     use super::*;
 
     static CONFIGURED_POOL_SIZE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn document_cache_key(
+        path: &str,
+        password: Option<&str>,
+        mtime_secs: u64,
+        file_size: u64,
+    ) -> PdfDocumentCacheKey {
+        PdfDocumentCacheKey {
+            path: PathBuf::from(path),
+            password: password.map(|value| value.to_owned().into_boxed_str()),
+            modified: std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime_secs),
+            file_size,
+        }
+    }
+
+    #[test]
+    fn document_cache_reuses_only_an_identical_key() {
+        let cached = document_cache_key("a.pdf", Some("secret"), 10, 100);
+        assert!(should_reuse_pdf_document(Some(&cached), Some(&cached)));
+
+        for changed in [
+            document_cache_key("b.pdf", Some("secret"), 10, 100),
+            document_cache_key("a.pdf", Some("secret"), 11, 100),
+            document_cache_key("a.pdf", Some("secret"), 10, 101),
+            document_cache_key("a.pdf", Some("other"), 10, 100),
+        ] {
+            assert!(!should_reuse_pdf_document(Some(&cached), Some(&changed)));
+        }
+    }
+
+    #[test]
+    fn document_cache_does_not_reuse_after_stat_failure() {
+        let cached = document_cache_key("deleted.pdf", None, 10, 100);
+        assert!(!should_reuse_pdf_document(Some(&cached), None));
+    }
 
     #[test]
     fn pdf_worker_command_inherits_the_parent_data_directory() {
@@ -3992,7 +4230,10 @@ C:\isolated\miv-data"#
     #[test]
     fn render_metrics_frame_roundtrip_preserves_worker_breakdown() {
         let metrics = WorkerRenderMetrics {
-            render_us: 410_000,
+            open_us: 105_000,
+            page_us: 25_000,
+            render_us: 280_000,
+            doc_reused: true,
             serialize_us: 12_000,
             write_us: 220_000,
             response_bytes: 186_000_030,
@@ -4030,7 +4271,9 @@ C:\isolated\miv-data"#
     #[test]
     fn render_timing_critical_path_counts_overlapping_transfer_once() {
         let worker = WorkerRenderMetrics {
-            render_us: 400_000,
+            open_us: 100_000,
+            page_us: 50_000,
+            render_us: 250_000,
             serialize_us: 20_000,
             write_us: 250_000,
             ..WorkerRenderMetrics::default()
@@ -4272,6 +4515,21 @@ C:\isolated\miv-data"#
     }
 
     #[test]
+    /// 同じパスワードは 1 度しか確保せず、確保済みの文字列をそのまま返す。
+    /// (pdfium-render の過剰な lifetime 制約を lifetime transmute なしで満たすための仕組み)
+    #[test]
+    fn interning_a_password_twice_reuses_the_same_allocation() {
+        let first = interned_pdf_password("open-sesame");
+        let second = interned_pdf_password(&String::from("open-sesame"));
+
+        assert_eq!(first, "open-sesame");
+        assert!(
+            std::ptr::eq(first, second),
+            "同じ文字列で確保が重複している"
+        );
+        assert!(!std::ptr::eq(first, interned_pdf_password("another")));
+    }
+
     fn dll_failure_skips_all_worker_attempts() {
         let mut calls = 0;
         let result: Result<((), WorkerSlotStartup<()>), String> =
