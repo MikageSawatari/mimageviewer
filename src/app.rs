@@ -22167,10 +22167,17 @@ impl App {
         self.cancel_token.store(true, Ordering::Relaxed);
         self.wake_all_workers();
 
-        // 旧 pending を drop すると `PdfEnumerateHandle::Drop` が cancel を立て、
-        // pool dispatcher は pop 時に IPC 前で古いジョブを捨てる。
+        // 同じ PDF の再 open では、旧 handle を新しい waiter の登録まで保持する。
+        // 先に drop すると一瞬だけ全 waiter が 0 になり、合流すべき source request を
+        // cancel してしまう。別 path は従来どおりここで直ちに cancel する。
         // ZIP 側 pending も一緒に捨てる (ZIP → PDF 遷移時の取り残し防止、Codex P2)。
-        self.pdf_enumerate_pending = None;
+        let mut previous_pdf_enumerate = self.pdf_enumerate_pending.take();
+        if previous_pdf_enumerate
+            .as_ref()
+            .is_some_and(|(path, _, _)| !crate::path_key::eq_keep_drive(path, &pdf_path))
+        {
+            previous_pdf_enumerate = None;
+        }
         self.zip_enumerate_pending = None;
         // 直前の cache-hit の placeholder 情報はクリア (= 新規 nav の出発点)。
         self.pdf_placeholder_count = None;
@@ -22200,6 +22207,13 @@ impl App {
         let password: Option<String> = saved_password
             .clone()
             .or_else(|| self.pdf_current_password.clone());
+        if previous_pdf_enumerate
+            .as_ref()
+            .is_some_and(|(_, previous_password, _)| previous_password != &password)
+        {
+            // 同じ path でも password が違えば別 request。旧 source はここで cancel する。
+            previous_pdf_enumerate = None;
+        }
 
         // パスワードチェックも非同期化したいが、ダイアログ表示のフローが複雑になるため
         // ここでは簡易判定: 保存済みパスワードがなければ非同期で check_password を含めて
@@ -22222,6 +22236,9 @@ impl App {
         // ── 非同期でページ列挙をリクエスト (検証 + cache 更新) ──
         let handle = crate::pdf_loader::enumerate_pages_async(&pdf_path, password.as_deref());
         self.pdf_enumerate_pending = Some((pdf_path.clone(), password, handle));
+        // 同じ key なら新 handle が既に waiter として登録済みなので、ここで旧 handle を
+        // drop しても source request は継続する。
+        drop(previous_pdf_enumerate);
         if placeholder_built.is_some() {
             // 検証用に覚えておく: 一致なら grid 再構築 skip、不一致なら再構築する。
             self.pdf_placeholder_count = placeholder_built;
