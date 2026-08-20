@@ -42239,7 +42239,9 @@ impl App {
             self.items_generation,
             self.items.len(),
             self.fullscreen_idx,
-            self.active_detached_viewer_context.is_some(),
+            // `with_active_detached_viewer_context` takes the context out for the span it is
+            // mounted, so `is_none()` is what means App state currently *is* the viewer's.
+            self.active_detached_viewer_context.is_none(),
             self.active_detached_session
                 .map(|session| session.window_id),
         ));
