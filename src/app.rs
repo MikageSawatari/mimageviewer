@@ -42162,6 +42162,65 @@ impl App {
         }
     }
 
+    /// 別ウィンドウのタイトルがずれる不具合の観測 (利用者報告 2026-08-20)。
+    ///
+    /// 「計算されたタイトル」と「OS が実際に表示しているタイトル」の両方を記録する。
+    /// 2 つの故障モードを区別するのが目的:
+    ///
+    /// - 計算が古い名前 → **元データが古い** (idx / items / bundle 側)
+    /// - 計算は新しいのに OS が古いまま → **配送されていない** (builder の差分が届いていない)
+    ///
+    /// **一致しているときも一定間隔で記録する。** 調べている信号が「変わらないこと」なので、
+    /// 「食い違ったときだけ出す」と抑制条件が調査対象そのものに依存し、出力がゼロになる。
+    ///
+    /// 状態を静的に持つのは、builder を作る経路が `&self` だからで、原因が確定したら
+    /// この関数ごと消す。
+    #[cfg(windows)]
+    pub(crate) fn probe_detached_window_title(
+        &self,
+        source: &'static str,
+        fs_idx: usize,
+        computed: &str,
+    ) {
+        use std::sync::Mutex;
+        use windows::Win32::Foundation::HWND;
+
+        /// `(計算されたタイトル, OS のタイトル, 最後に記録した frame)`
+        static LAST: Mutex<Option<(String, String, u64)>> = Mutex::new(None);
+
+        let hwnd_raw = self.detached_viewer_host_hwnd_raw();
+        let os_title = if hwnd_raw == 0 {
+            String::new()
+        } else {
+            crate::dwm_transitions::window_text(HWND(hwnd_raw as *mut _))
+        };
+        let frame = self.frame_counter;
+        let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let changed = last.as_ref().is_none_or(|(last_computed, last_os, _)| {
+            last_computed != computed || last_os != &os_title
+        });
+        // 変化時は即時。一致していても 300 frame ごとに残す (上記のとおり、間引きを
+        // 調査対象の信号に依存させない)。
+        let stale_enough = last
+            .as_ref()
+            .is_none_or(|(_, _, last_frame)| frame.saturating_sub(*last_frame) >= 300);
+        if !changed && !stale_enough {
+            return;
+        }
+        *last = Some((computed.to_string(), os_title.clone(), frame));
+        drop(last);
+        let matches = os_title == computed;
+        crate::logger::log(format!(
+            "[detached-title] source={source} frame={frame} fs_idx={fs_idx}              items_gen={} items_len={} main_fs_idx={:?} mounted={} session={:?} hwnd=0x{hwnd_raw:x}              matches={matches} computed={computed:?} os={os_title:?}",
+            self.items_generation,
+            self.items.len(),
+            self.fullscreen_idx,
+            self.active_detached_viewer_context.is_some(),
+            self.active_detached_session
+                .map(|session| session.window_id),
+        ));
+    }
+
     #[cfg(windows)]
     pub(crate) fn detached_viewer_host_debug_state(&self) -> String {
         let hwnd = self

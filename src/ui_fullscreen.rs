@@ -16857,6 +16857,9 @@ impl App {
         } else {
             format!("{name} - mimageviewer")
         };
+        // タイトルずれの観測 (利用者報告 2026-08-20)。builder を作るすべての経路がここを通るので、
+        // どの経路がどの idx で何を計算し、OS 側が何を表示しているかを 1 箇所で見られる。
+        self.probe_detached_window_title(source, fs_idx, &title);
 
         let borderless = self.detached_viewer_borderless_fullscreen;
 

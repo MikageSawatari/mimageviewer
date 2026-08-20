@@ -347,7 +347,11 @@ fn window_class_name(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..len as usize])
 }
 
-fn window_text(hwnd: HWND) -> String {
+/// Read a window's current caption straight from Win32.
+/// The detached title probe uses this to compare what the OS actually shows against what
+/// the viewport builder computed, which is the only way to tell a stale source from a
+/// title that was computed correctly and never delivered.
+pub(crate) fn window_text(hwnd: HWND) -> String {
     let mut buf = [0_u16; 256];
     let len = unsafe { GetWindowTextW(hwnd, &mut buf) };
     if len <= 0 {
