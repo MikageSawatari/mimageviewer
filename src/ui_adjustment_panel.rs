@@ -778,9 +778,10 @@ mod local_adjust_segmentation_tests {
 
         let fill = crate::mask_db::BucketFill {
             tolerance: 0,
-            connected: true,
+            region: crate::mask_db::BucketRegion::Connected,
             value: true,
             leak_stop: 0.0,
+            outset: 0.0,
         };
         let filled = crate::mask_db::BucketFillOutcome::Filled;
 
@@ -812,7 +813,7 @@ mod local_adjust_segmentation_tests {
                 0,
                 0,
                 crate::mask_db::BucketFill {
-                    connected: false,
+                    region: crate::mask_db::BucketRegion::Whole,
                     ..fill
                 },
             ),
@@ -2735,8 +2736,9 @@ fn draw_local_tool_settings(
     boundary_gap_px: &mut f32,
     edge_snap_radius: &mut f32,
     edge_brush_tolerance: &mut f32,
-    bucket_connected: &mut bool,
+    bucket_region: &mut crate::mask_db::BucketRegion,
     bucket_leak_stop: &mut f32,
+    bucket_outset: &mut f32,
     edge_brush_include_boundary: &mut bool,
 ) {
     ui.label(
@@ -2789,15 +2791,12 @@ fn draw_local_tool_settings(
                     .text("色差の許容値")
                     .step_by(1.0),
             );
-            ui.checkbox(bucket_connected, "隣接のみ");
-            if *bucket_connected {
-                ui.add(
-                    egui::Slider::new(bucket_leak_stop, 0.0..=16.0)
-                        .text("漏れ止め")
-                        .step_by(0.1),
-                )
-                .on_hover_text("細い線や小さな隙間から塗りが漏れるのを防ぎます。0 で無効。");
-            }
+            crate::ui_helpers::draw_bucket_region_controls(
+                ui,
+                bucket_region,
+                bucket_leak_stop,
+                bucket_outset,
+            );
             ui.label(
                 egui::RichText::new("画像をクリックしたときに1回だけ塗りつぶします。")
                     .size(10.0)
@@ -2889,8 +2888,9 @@ fn draw_selected_local_adjust_layer_editor(
     boundary_gap_px: &mut f32,
     edge_snap_radius: &mut f32,
     edge_brush_tolerance: &mut f32,
-    bucket_connected: &mut bool,
+    bucket_region: &mut crate::mask_db::BucketRegion,
     bucket_leak_stop: &mut f32,
+    bucket_outset: &mut f32,
     edge_brush_include_boundary: &mut bool,
     region_color_tolerance: &mut f32,
     region_min_area: &mut usize,
@@ -2925,8 +2925,9 @@ fn draw_selected_local_adjust_layer_editor(
                 boundary_gap_px,
                 edge_snap_radius,
                 edge_brush_tolerance,
-                bucket_connected,
+                bucket_region,
                 bucket_leak_stop,
+                bucket_outset,
                 edge_brush_include_boundary,
             );
             if selected_line_thickness.is_some()
@@ -9649,9 +9650,10 @@ impl App {
         let paint = self.local_adjust_mask_paint_add;
         let fill = crate::mask_db::BucketFill {
             tolerance,
-            connected: self.local_adjust_bucket_connected,
+            region: self.local_adjust_bucket_region,
             value: paint,
             leak_stop: self.local_adjust_bucket_leak_stop.max(0.0),
+            outset: self.local_adjust_bucket_outset.max(0.0),
         };
         let mut outcome = crate::mask_db::BucketFillOutcome::Invalid;
         let changed =
@@ -9677,6 +9679,12 @@ impl App {
             self.show_feedback_toast(
                 "漏れ止めより細い場所です。漏れ止めを小さくしてください。".to_string(),
             );
+        }
+        if outcome == crate::mask_db::BucketFillOutcome::ShapeFitFailed
+            && let Some(message) =
+                crate::ui_helpers::bucket_shape_fit_failed_message(self.local_adjust_bucket_region)
+        {
+            self.show_feedback_toast(message.to_string());
         }
         if changed {
             self.local_adjust_show_mask = true;
@@ -12901,8 +12909,9 @@ impl App {
         let mut boundary_gap_px = self.local_adjust_boundary_gap_px;
         let mut edge_snap_radius = self.local_adjust_edge_snap_radius;
         let mut edge_brush_tolerance = self.local_adjust_edge_brush_tolerance;
-        let mut bucket_connected = self.local_adjust_bucket_connected;
+        let mut bucket_region = self.local_adjust_bucket_region;
         let mut bucket_leak_stop = self.local_adjust_bucket_leak_stop;
+        let mut bucket_outset = self.local_adjust_bucket_outset;
         let mut edge_brush_include_boundary = self.local_adjust_edge_brush_include_boundary;
         let mut region_color_tolerance = self.local_adjust_region_color_tolerance;
         let mut region_min_area = self.local_adjust_region_min_area;
@@ -13148,8 +13157,9 @@ impl App {
                                         &mut boundary_gap_px,
                                         &mut edge_snap_radius,
                                         &mut edge_brush_tolerance,
-                                        &mut bucket_connected,
+                                        &mut bucket_region,
                                         &mut bucket_leak_stop,
+                                        &mut bucket_outset,
                                         &mut edge_brush_include_boundary,
                                         &mut region_color_tolerance,
                                         &mut region_min_area,
@@ -13216,8 +13226,9 @@ impl App {
         self.local_adjust_boundary_gap_px = boundary_gap_px.clamp(0.0, 8.0);
         self.local_adjust_edge_snap_radius = edge_snap_radius.clamp(2.0, 64.0);
         self.local_adjust_edge_brush_tolerance = edge_brush_tolerance.clamp(0.0, 255.0);
-        self.local_adjust_bucket_connected = bucket_connected;
+        self.local_adjust_bucket_region = bucket_region;
         self.local_adjust_bucket_leak_stop = bucket_leak_stop.clamp(0.0, 16.0);
+        self.local_adjust_bucket_outset = bucket_outset.clamp(0.0, 8.0);
         self.local_adjust_edge_brush_include_boundary = edge_brush_include_boundary;
         self.local_adjust_region_color_tolerance = region_color_tolerance.clamp(4.0, 120.0);
         self.local_adjust_region_min_area = region_min_area.clamp(1, 2048);

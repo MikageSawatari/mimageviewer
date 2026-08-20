@@ -741,13 +741,38 @@ fn squared_distance_map(seeds: &[bool], width: usize, height: usize) -> Vec<f64>
     buf
 }
 
+/// バケツで色の近い範囲を決める方法。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketRegion {
+    /// 画像全体に散らばる近似色。
+    Whole,
+    /// seed から 4 近傍でつながる近似色。
+    Connected,
+    /// 連結領域へ最小面積外接長方形を当てはめる。
+    Rect,
+    /// 連結領域へ楕円を当てはめる。
+    Ellipse,
+    /// 連結領域へ円を当てはめる。
+    Circle,
+}
+
+impl BucketRegion {
+    pub fn uses_leak_stop(self) -> bool {
+        self != Self::Whole
+    }
+
+    pub fn is_shape(self) -> bool {
+        matches!(self, Self::Rect | Self::Ellipse | Self::Circle)
+    }
+}
+
 /// バケツの設定。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BucketFill {
     /// seed RGB との最大チャンネル差の許容値。
     pub tolerance: u8,
-    /// seed からつながっている領域だけを対象にするか。
-    pub connected: bool,
+    /// 近似色領域の決め方と、必要なら適用する図形整形。
+    pub region: BucketRegion,
     /// マスクへ書き込む値 (塗る / 消す)。
     pub value: bool,
     /// 漏れ止めの半径 (px)。0 以下で無効。**小数を取る**。
@@ -756,11 +781,13 @@ pub struct BucketFill {
     /// やせさせてから塗り、結果を同じだけ太らせて元の領域と重ねる。
     /// 幅が `2 * leak_stop` 未満の線や隙間はやせた時点で消えるので塗りが入り込めず、
     /// 長方形の隅は太らせる段階で回復するので**隅までは塗れる**。
-    /// `connected` が false のときは伝播しないので無視する。
+    /// [`BucketRegion::Whole`] は伝播しないので無視する。
     ///
     /// 判定はユークリッド距離で行う。整数の正方近傍だと 1 の次が 2 で、その間が
     /// 無い上に角を余計に削る。距離なら 1.4 や 1.7 が意味を持ち、近傍の形も円になる。
     pub leak_stop: f32,
+    /// 図形の半径を外側へ広げる量 (px)。図形モード以外では無視する。
+    pub outset: f32,
 }
 
 /// バケツの結果。
@@ -775,6 +802,8 @@ pub enum BucketFillOutcome {
     NoChange,
     /// seed が漏れ止めで消える細さの場所にある。マスクは変えていない。
     SeedTooThin,
+    /// 連結領域の被覆率が低いなど、指定図形として安全に当てはまらない。
+    ShapeFitFailed,
     /// 寸法 0 / seed が範囲外 / 配列長が足りない。
     Invalid,
 }
@@ -900,8 +929,9 @@ fn bucket_regrow(
 
 /// seed 色に近い画素へ 1bit マスクを書き込む。
 ///
-/// `connected` で seed からつながる範囲だけに絞り、`leak_stop` で細い通路と
-/// 小さな隙間からの漏れを止める。alpha は色差判定に使わない。
+/// [`BucketRegion`] で近似色の範囲を決め、`leak_stop` で細い通路と小さな隙間からの
+/// 漏れを止める。図形モードでは連結領域へ図形を当てはめてから書く。
+/// alpha は色差判定に使わない。
 pub fn flood_fill_bitmap_mask(
     mask: &mut [bool],
     image: &egui::ColorImage,
@@ -925,7 +955,7 @@ pub fn flood_fill_bitmap_mask(
     let seed = [seed_color.r(), seed_color.g(), seed_color.b()];
     let fillable = bucket_fillable_map(&image.pixels, expected_len, seed, fill.tolerance);
 
-    let region = if !fill.connected {
+    let mut region = if fill.region == BucketRegion::Whole {
         fillable
     } else if !(fill.leak_stop > 0.0) {
         bucket_reach(&fillable, width, height, seed_x, seed_y)
@@ -958,6 +988,53 @@ pub fn flood_fill_bitmap_mask(
             radius.ceil().max(0.0) as usize,
         )
     };
+
+    if fill.region.is_shape() {
+        let fit_options = crate::shape_fit::FitOptions {
+            outset: fill.outset,
+            ..crate::shape_fit::FitOptions::default()
+        };
+        let fitted = match fill.region {
+            BucketRegion::Rect => crate::shape_fit::fit_rect(&region, width, height, fit_options),
+            BucketRegion::Ellipse => {
+                crate::shape_fit::fit_ellipse(&region, width, height, fit_options, false)
+            }
+            BucketRegion::Circle => {
+                crate::shape_fit::fit_ellipse(&region, width, height, fit_options, true)
+            }
+            BucketRegion::Whole | BucketRegion::Connected => unreachable!(),
+        };
+        let Some(fitted) = fitted else {
+            return BucketFillOutcome::ShapeFitFailed;
+        };
+        region.fill(false);
+        match fitted {
+            crate::shape_fit::FittedShape::Rect {
+                center,
+                half_w,
+                half_h,
+                rotation_rad,
+            } => {
+                let corners = rect_corners(center, half_w, half_h, rotation_rad);
+                scanline_fill_polygon(&mut region, &corners, width, height, true);
+            }
+            crate::shape_fit::FittedShape::Ellipse {
+                center,
+                rx,
+                ry,
+                rotation_rad,
+            } => scanline_fill_ellipse(
+                &mut region,
+                center,
+                rx,
+                ry,
+                rotation_rad,
+                width,
+                height,
+                true,
+            ),
+        }
+    }
 
     let mut changed = false;
     for (idx, inside) in region.into_iter().enumerate() {
@@ -1655,9 +1732,10 @@ mod tests {
                 0,
                 BucketFill {
                     tolerance: 0,
-                    connected: true,
+                    region: BucketRegion::Connected,
                     value: true,
                     leak_stop: 0.0,
+                    outset: 0.0,
                 },
             ),
             BucketFillOutcome::Filled
@@ -1672,9 +1750,10 @@ mod tests {
                 0,
                 BucketFill {
                     tolerance: 0,
-                    connected: true,
+                    region: BucketRegion::Connected,
                     value: false,
                     leak_stop: 0.0,
+                    outset: 0.0,
                 },
             ),
             BucketFillOutcome::Filled
@@ -1723,9 +1802,10 @@ mod tests {
                 3,
                 BucketFill {
                     tolerance: 0,
-                    connected: true,
+                    region: BucketRegion::Connected,
                     value: true,
                     leak_stop: 0.0,
+                    outset: 0.0,
                 },
             );
             mask
@@ -1740,9 +1820,10 @@ mod tests {
             3,
             BucketFill {
                 tolerance: 0,
-                connected: true,
+                region: BucketRegion::Connected,
                 value: true,
                 leak_stop: 1.0,
+                outset: 0.0,
             },
         );
         assert_eq!(outcome, BucketFillOutcome::Filled);
@@ -1782,9 +1863,10 @@ mod tests {
                 1,
                 BucketFill {
                     tolerance: 0,
-                    connected: true,
+                    region: BucketRegion::Connected,
                     value: true,
                     leak_stop,
+                    outset: 0.0,
                 },
             )
         };
@@ -1811,9 +1893,10 @@ mod tests {
                 1,
                 BucketFill {
                     tolerance: 0,
-                    connected: true,
+                    region: BucketRegion::Connected,
                     value: true,
                     leak_stop,
+                    outset: 0.0,
                 },
             )
         };
@@ -1841,9 +1924,10 @@ mod tests {
             1,
             BucketFill {
                 tolerance: 0,
-                connected: true,
+                region: BucketRegion::Connected,
                 value: true,
                 leak_stop: 2.0,
+                outset: 0.0,
             },
         );
         assert_eq!(outcome, BucketFillOutcome::SeedTooThin);
@@ -1878,9 +1962,10 @@ mod tests {
                 0,
                 BucketFill {
                     tolerance: 0,
-                    connected: true,
+                    region: BucketRegion::Connected,
                     value: true,
                     leak_stop: 0.0,
+                    outset: 0.0,
                 },
             ),
             BucketFillOutcome::Filled
@@ -1918,9 +2003,10 @@ mod tests {
                 0,
                 BucketFill {
                     tolerance: 0,
-                    connected: true,
+                    region: BucketRegion::Connected,
                     value: true,
                     leak_stop: 0.0,
+                    outset: 0.0,
                 },
             ),
             BucketFillOutcome::Filled
@@ -1949,9 +2035,10 @@ mod tests {
                 0,
                 BucketFill {
                     tolerance: 0,
-                    connected: true,
+                    region: BucketRegion::Connected,
                     value: true,
                     leak_stop: 0.0,
+                    outset: 0.0,
                 },
             ),
             BucketFillOutcome::Filled
@@ -1974,9 +2061,10 @@ mod tests {
                 0,
                 BucketFill {
                     tolerance: 0,
-                    connected: false,
+                    region: BucketRegion::Whole,
                     value: true,
                     leak_stop: 0.0,
+                    outset: 0.0,
                 },
             ),
             BucketFillOutcome::Filled
@@ -2005,14 +2093,93 @@ mod tests {
                 0,
                 BucketFill {
                     tolerance: 10,
-                    connected: false,
+                    region: BucketRegion::Whole,
                     value: true,
                     leak_stop: 0.0,
+                    outset: 0.0,
                 },
             ),
             BucketFillOutcome::Filled
         );
         assert_eq!(mask, vec![true, true, false]);
+    }
+
+    #[test]
+    fn bitmap_mask_flood_fill_rect_closes_internal_holes() {
+        let (w, h) = (16, 12);
+        let red = egui::Color32::from_rgb(180, 30, 30);
+        let blue = egui::Color32::from_rgb(30, 30, 180);
+        let mut colors = vec![blue; w * h];
+        for y in 3..9 {
+            for x in 3..13 {
+                colors[y * w + x] = red;
+            }
+        }
+        for y in 5..7 {
+            for x in 6..8 {
+                colors[y * w + x] = blue;
+            }
+        }
+        let image = color_image(&colors, w, h);
+        let mut mask = vec![false; w * h];
+
+        assert_eq!(
+            flood_fill_bitmap_mask(
+                &mut mask,
+                &image,
+                3,
+                3,
+                BucketFill {
+                    tolerance: 0,
+                    region: BucketRegion::Rect,
+                    value: true,
+                    leak_stop: 0.0,
+                    outset: 0.0,
+                },
+            ),
+            BucketFillOutcome::Filled
+        );
+        for y in 0..h {
+            for x in 0..w {
+                assert_eq!(mask[y * w + x], (3..13).contains(&x) && (3..9).contains(&y));
+            }
+        }
+    }
+
+    #[test]
+    fn bitmap_mask_flood_fill_shape_failure_keeps_mask_unchanged() {
+        let (w, h) = (18, 12);
+        let red = egui::Color32::from_rgb(180, 30, 30);
+        let blue = egui::Color32::from_rgb(30, 30, 180);
+        let mut colors = vec![blue; w * h];
+        for y in 4..8 {
+            for x in 2..8 {
+                colors[y * w + x] = red;
+            }
+        }
+        for x in 8..15 {
+            colors[5 * w + x] = red;
+        }
+        let image = color_image(&colors, w, h);
+        let mut mask = vec![false; w * h];
+
+        assert_eq!(
+            flood_fill_bitmap_mask(
+                &mut mask,
+                &image,
+                2,
+                4,
+                BucketFill {
+                    tolerance: 0,
+                    region: BucketRegion::Rect,
+                    value: true,
+                    leak_stop: 0.0,
+                    outset: 0.0,
+                },
+            ),
+            BucketFillOutcome::ShapeFitFailed
+        );
+        assert!(mask.iter().all(|inside| !inside));
     }
 
     #[test]
@@ -2022,9 +2189,10 @@ mod tests {
         let mut mask = Vec::new();
         let fill = BucketFill {
             tolerance: 0,
-            connected: true,
+            region: BucketRegion::Connected,
             value: true,
             leak_stop: 0.0,
+            outset: 0.0,
         };
         assert_eq!(
             flood_fill_bitmap_mask(&mut mask, &width_zero, 0, 0, fill),
@@ -2037,7 +2205,7 @@ mod tests {
                 0,
                 0,
                 BucketFill {
-                    connected: false,
+                    region: BucketRegion::Whole,
                     ..fill
                 },
             ),
@@ -2068,9 +2236,10 @@ mod tests {
                     0,
                     BucketFill {
                         tolerance: 0,
-                        connected: true,
+                        region: BucketRegion::Connected,
                         value: true,
                         leak_stop: 0.0,
+                        outset: 0.0,
                     },
                 ),
                 BucketFillOutcome::Filled
@@ -2087,9 +2256,10 @@ mod tests {
                     0,
                     BucketFill {
                         tolerance: 0,
-                        connected: false,
+                        region: BucketRegion::Whole,
                         value: true,
                         leak_stop: 0.0,
+                        outset: 0.0,
                     },
                 ),
                 BucketFillOutcome::Filled

@@ -937,9 +937,10 @@ impl App {
             seed_y,
             crate::mask_db::BucketFill {
                 tolerance: self.conceal_bucket_tolerance.round().clamp(0.0, 255.0) as u8,
-                connected: self.conceal_bucket_connected,
+                region: self.conceal_bucket_region,
                 value: self.conceal_paint_mode,
                 leak_stop: self.conceal_bucket_leak_stop.max(0.0),
+                outset: self.conceal_bucket_outset.max(0.0),
             },
         );
         match outcome {
@@ -948,6 +949,14 @@ impl App {
                 self.show_feedback_toast(
                     "漏れ止めより細い場所です。漏れ止めを小さくしてください。".to_string(),
                 );
+                return;
+            }
+            crate::mask_db::BucketFillOutcome::ShapeFitFailed => {
+                if let Some(message) =
+                    crate::ui_helpers::bucket_shape_fit_failed_message(self.conceal_bucket_region)
+                {
+                    self.show_feedback_toast(message.to_string());
+                }
                 return;
             }
             crate::mask_db::BucketFillOutcome::NoChange
@@ -2370,21 +2379,12 @@ impl App {
                                                     .text("色差の許容値")
                                                     .step_by(1.0),
                                                 );
-                                                ui.checkbox(
-                                                    &mut self.conceal_bucket_connected,
-                                                    "隣接のみ",
+                                                crate::ui_helpers::draw_bucket_region_controls(
+                                                    ui,
+                                                    &mut self.conceal_bucket_region,
+                                                    &mut self.conceal_bucket_leak_stop,
+                                                    &mut self.conceal_bucket_outset,
                                                 );
-                                                if self.conceal_bucket_connected {
-                                                    ui.add(
-                                                        egui::Slider::new(
-                                                            &mut self.conceal_bucket_leak_stop,
-                                                            0.0..=16.0
-                                                        )
-                                                        .text("漏れ止め")
-                                                        .step_by(0.1),
-                                                    )
-                                                    .on_hover_text("細い線や小さな隙間から塗りが漏れるのを防ぎます。0 で無効。");
-                                                }
                                                 ui.add(
                                                     egui::Label::new(
                                                         egui::RichText::new(

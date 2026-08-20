@@ -108,7 +108,7 @@ use crate::vector_edit::{HoverTarget, hit_test, cursor_icon_for, draw_handles, a
 | `LineKind` enum (Vert / Horiz / Diag) | `mask_db.rs` | Line variant 内で使用、ツールパレット統一に伴い共有 |
 | `rasterize_shape_into` 関数 (新規) | `mask_db.rs` | Shape variant ごとのラスタライズ (Line/Rect=多角形、Ellipse=楕円方程式) |
 | `scanline_fill_polygon` 関数 | `mask_db.rs` (既存) | 筆 / 囲み / Line / Rect 共通の多角形塗り |
-| `flood_fill_bitmap_mask` 関数 | `mask_db.rs` | バケツの連結 / 非連結塗りを消しゴム・隠蔽加工と共有 |
+| `flood_fill_bitmap_mask` 関数 | `mask_db.rs` | バケツの全体 / 連結塗りと、長方形 / 楕円 / 円への整形を消しゴム・隠蔽加工・補正レイヤーで共有 |
 | `scanline_fill_ellipse` 関数 (新規) | `mask_db.rs` | Ellipse variant 専用 (~50 行) |
 | `vector_edit.rs` (新規モジュール) | 新規 | ハンドル操作・カーソル選択・ドラッグ状態機械 (両ツール共通) |
 
@@ -152,7 +152,8 @@ conceal_line_width: f32,
 
 // バケツ設定 (App のセッション内保持。settings.db のスキーマは変更しない)
 conceal_bucket_tolerance: f32,
-conceal_bucket_connected: bool,
+conceal_bucket_region: BucketRegion, // Whole / Connected / Rect / Ellipse / Circle
+conceal_bucket_outset: f32,
 
 // 隠蔽パラメータ (グローバル、settings.db の settings_kv に永続化)
 conceal_type: ConcealType,                  // Mosaic / WhiteFill / BlackFill / Blur
@@ -187,7 +188,7 @@ conceal_pages: HashSet<usize>,
 **設計判断: すべてのパラメータ (隠蔽タイプ、タイル倍率、不透明度、ぼかし半径、
 境界モード等) は「グローバル設定」**。ページ個別にはしない。これで「ツールの好み」と
 「ページごとのマスク内容」が分離される。複数の好みを保持したいときはプリセット 4 スロット
-を使う (§8.3)。バケツの色差許容値と「隣接のみ」は編集セッションの操作値として
+を使う (§8.3)。バケツの色差許容値、塗る範囲、漏れ止め、はみ出しは編集セッションの操作値として
 `App` にだけ保持し、`settings.db` やプリセットには追加しない。
 
 ```rust
@@ -322,7 +323,7 @@ enum BlurMode { AsMask, ExtendByRadius, InsideOnly }     // ぼかし専用
 | --- | --- | --- | --- |
 | 選択 | S | ベクタ本体を hit test、ハンドルドラッグで編集 (`vector_edit.rs` 参照) | `Shape` 編集 |
 | 筆 | B | 半径 `brush_radius`、ストロークで `scanline_fill_polygon` ラスタライズ | ビットマップ |
-| バケツ | K | 画像クリック時に 1 回だけ、開始色との許容差で連結領域または画像全体の近似色を描画 / 消去 | ビットマップ |
+| バケツ | K | 画像クリック時に 1 回だけ、開始色との許容差で全体 / 連結領域を描画 / 消去。長方形 / 楕円 / 円では連結領域を選択図形へ整形 | ビットマップ |
 | 囲み | L | ポリゴン → `scanline_fill_polygon` | ビットマップ |
 | 多角形 | P | クリックで頂点追加、始点付近 / 右クリック / Enter で確定して `scanline_fill_polygon` | ビットマップ |
 | 直線 | I | `Shape::Line { p0, p1, thickness }`、両端ドラッグで端点編集 | `Shape` vec |
@@ -330,6 +331,12 @@ enum BlurMode { AsMask, ExtendByRadius, InsideOnly }     // ぼかし専用
 | 横線 | H | `Shape::Line { kind: Horiz, .. }`、生成時に横に拘束 | `Shape` vec |
 | 矩形 | R | `Shape::Rect { center, half_w, half_h, rotation_rad }`、corner→corner ドラッグで作成 | `Shape` vec |
 | 楕円 | O | `Shape::Ellipse { center, rx, ry, rotation_rad }`、内接 bbox ドラッグで作成 | `Shape` vec |
+
+バケツの「塗る範囲」は **全体 / 隣接のみ / 長方形 / 楕円 / 円** の排他 5 択。
+長方形 / 楕円 / 円は、漏れ止めを含む「隣接のみ」と同じ領域を求めてから図形へ整形し、
+文字などによる内側の欠けを埋め、図形から外れた部分を切る。領域が指定図形に十分当てはまらない
+場合はマスクを変更せず、漏れ止めまたは色差許容値の見直しを案内する。「はみ出し」は図形だけを
+0〜8px 外側へ広げ、縁のにじみを覆う。これらは消しゴム / 隠蔽加工 / 補正レイヤーで共通とする。
 
 ベクタオブジェクト編集の挙動 (ハンドル方式、Ctrl/Shift/Alt 修飾子) は消しゴムと完全一致。
 選択ツール中は未選択 Shape も編集用アウトラインで表示し、`Add` と `Subtract` を色分けする。
@@ -1232,7 +1239,7 @@ CLAUDE.md の「コード修正時のドキュメント同時更新」ルール�
 - 加工パラメータ (タイプ、タイルモード、不透明度、ぼかし半径、境界モード等) は
   **グローバル設定** (`settings.db` の `settings_kv` に永続化、ページ間共有)。複数の好みを保持したい
   ときは **パラメータプリセット 4 スロット** (`1`〜`4` キーで適用)
-- バケツの色差許容値と「隣接のみ」は `App` のセッション内保持とし、設定 DB のスキーマは変えない
+- バケツの色差許容値、塗る範囲、漏れ止め、はみ出しは `App` のセッション内保持とし、設定 DB のスキーマは変えない
 - マスクは **ページ個別** に保存 (`conceal.db` + サイドカー)
 - マスク用 2 スロット (`__slot_1` / `__slot_2`) で差分画像生成をサポート
 - **特定の投稿サイト名・基準名・基準への適合判定を UI / ドキュメント / ヘルプ文に書かない**。

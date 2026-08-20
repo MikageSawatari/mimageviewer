@@ -21,6 +21,60 @@ pub(crate) const ERROR_TEXT_COLOR: eframe::egui::Color32 =
 #[allow(dead_code)]
 pub(crate) const ERROR_TEXT_SIZE: f32 = 13.0;
 
+/// 3 系統のバケツで共有する範囲選択と、範囲に応じた補助スライダー。
+pub(crate) fn draw_bucket_region_controls(
+    ui: &mut egui::Ui,
+    region: &mut crate::mask_db::BucketRegion,
+    leak_stop: &mut f32,
+    outset: &mut f32,
+) {
+    use crate::mask_db::BucketRegion;
+
+    ui.label("塗る範囲");
+    ui.horizontal_wrapped(|ui| {
+        ui.selectable_value(region, BucketRegion::Whole, "全体");
+        ui.selectable_value(region, BucketRegion::Connected, "隣接のみ");
+        ui.selectable_value(region, BucketRegion::Rect, "長方形");
+        ui.selectable_value(region, BucketRegion::Ellipse, "楕円");
+        ui.selectable_value(region, BucketRegion::Circle, "円");
+    });
+    if region.uses_leak_stop() {
+        ui.add(
+            egui::Slider::new(leak_stop, 0.0..=16.0)
+                .text("漏れ止め")
+                .step_by(0.1),
+        )
+        .on_hover_text("細い線や小さな隙間から塗りが漏れるのを防ぎます。0 で無効。");
+    }
+    if region.is_shape() {
+        ui.add(
+            egui::Slider::new(outset, 0.0..=8.0)
+                .text("はみ出し")
+                .step_by(0.5),
+        )
+        .on_hover_text("図形を外側へ広げます。縁のにじみが残るときに上げてください。");
+    }
+}
+
+pub(crate) fn bucket_shape_fit_failed_message(
+    region: crate::mask_db::BucketRegion,
+) -> Option<&'static str> {
+    use crate::mask_db::BucketRegion;
+
+    match region {
+        BucketRegion::Rect => Some(
+            "長方形として当てはまりませんでした。漏れ止めを上げるか、色差の許容値を下げてください。",
+        ),
+        BucketRegion::Ellipse => Some(
+            "楕円として当てはまりませんでした。漏れ止めを上げるか、色差の許容値を下げてください。",
+        ),
+        BucketRegion::Circle => Some(
+            "円として当てはまりませんでした。漏れ止めを上げるか、色差の許容値を下げてください。",
+        ),
+        BucketRegion::Whole | BucketRegion::Connected => None,
+    }
+}
+
 pub(crate) fn processing_size_outside_note(bound: &str) -> String {
     format!("（この画像は処理対象サイズ {bound}の範囲外なので実行されません）")
 }
