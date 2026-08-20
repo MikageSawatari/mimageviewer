@@ -113,7 +113,9 @@ pub fn bump_render_context_epoch() -> u64 {
 pub struct PromoteStats {
     /// Normal lane から HighNormal lane に移動したジョブ数
     pub promoted: usize,
-    /// 既に HighNormal lane に居て match したジョブ数 (= 移動不要だった)
+    /// 既に HighNormal 以上の lane に居て match したジョブ数
+    /// (= 移動不要だった)。grid 用 API は HighNormal のみ、fullscreen 用
+    /// API は HighNormal + Critical を数える。
     pub already_high: usize,
     /// `keys` の中で pool 内 (Normal/HighNormal) に見つからなかったキー数
     /// (= in-flight / completed / never sent)
@@ -135,7 +137,30 @@ pub fn promote_to_high_normal(keys: &HashSet<String>) -> PromoteStats {
             not_found_keys: keys.len(),
         };
     };
-    pool.promote_to_high_normal_impl(keys)
+    pool.promote_to_high_normal_impl(keys, PromoteScope::GridVisible)
+}
+
+/// 現在 fullscreen に表示する PDF ページのジョブを Normal → HighNormal に昇格。
+///
+/// [`promote_to_high_normal`] と同じ queue 移動を使うが、すでに Critical に居る
+/// match も `already_high` として found 扱いにする。これにより、新規 fullscreen
+/// load が Critical で enqueue 済みの場合に `not_found` retry を永続させず、
+/// Critical からの降格も行わない。
+pub fn promote_fullscreen_to_high_normal(keys: &HashSet<String>) -> PromoteStats {
+    let Some(pool) = POOL.get() else {
+        return PromoteStats {
+            promoted: 0,
+            already_high: 0,
+            not_found_keys: keys.len(),
+        };
+    };
+    pool.promote_to_high_normal_impl(keys, PromoteScope::FullscreenCurrent)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromoteScope {
+    GridVisible,
+    FullscreenCurrent,
 }
 
 /// PDF pool queue の状態 snapshot (perf 用)。
@@ -1744,7 +1769,11 @@ impl PdfWorkerPool {
     /// の順序を触らなかったため、スクロール前に可視だった古い HighNormal が頭に居て、
     /// 今可視の昇格 job が **後ろ** に並ぶ事象があった。修正後は HighNormal lane を
     /// 「現可視 → 旧可視」の順に再構築する。
-    fn promote_to_high_normal_impl(&self, keys: &HashSet<String>) -> PromoteStats {
+    fn promote_to_high_normal_impl(
+        &self,
+        keys: &HashSet<String>,
+        scope: PromoteScope,
+    ) -> PromoteStats {
         if keys.is_empty() {
             return PromoteStats::default();
         }
@@ -1752,14 +1781,27 @@ impl PdfWorkerPool {
             let (mtx, cv) = &*self.queue;
             let mut q = mtx.lock().unwrap();
 
+            // fullscreen 用では Critical の match も「すでに目標以上」と数える。
+            // lane 自体は触らない (= Critical 予約ワーカーの意味論を変えない)。
+            let mut found_keys: HashSet<String> = HashSet::new();
+            let mut already_high = 0usize;
+            if matches!(scope, PromoteScope::FullscreenCurrent) {
+                for j in &q.critical {
+                    if j.perf_key.as_ref().is_some_and(|k| keys.contains(k)) {
+                        if let Some(k) = j.perf_key.as_ref() {
+                            found_keys.insert(k.clone());
+                        }
+                        already_high += 1;
+                    }
+                }
+            }
+
             // (1) 既存 high_normal を「現可視 (match) / 旧可視 (= stale)」に分けて再構築する。
             // 同時に match を数える (= already_high) し found_keys にも記録。
-            let mut found_keys: HashSet<String> = HashSet::new();
             let mut current_high: std::collections::VecDeque<Job> =
                 std::collections::VecDeque::with_capacity(q.high_normal.len());
             let mut stale_high: std::collections::VecDeque<Job> =
                 std::collections::VecDeque::with_capacity(q.high_normal.len());
-            let mut already_high = 0usize;
             while let Some(j) = q.high_normal.pop_front() {
                 if j.perf_key.as_ref().is_some_and(|k| keys.contains(k)) {
                     if let Some(k) = j.perf_key.as_ref() {
@@ -4480,6 +4522,21 @@ C:\isolated\miv-data"#
         queue: &Arc<(Mutex<JobQueue>, Condvar)>,
         keys: &HashSet<String>,
     ) -> PromoteStats {
+        promote_in_queue_for_scope(queue, keys, PromoteScope::GridVisible)
+    }
+
+    fn promote_fullscreen_in_queue(
+        queue: &Arc<(Mutex<JobQueue>, Condvar)>,
+        keys: &HashSet<String>,
+    ) -> PromoteStats {
+        promote_in_queue_for_scope(queue, keys, PromoteScope::FullscreenCurrent)
+    }
+
+    fn promote_in_queue_for_scope(
+        queue: &Arc<(Mutex<JobQueue>, Condvar)>,
+        keys: &HashSet<String>,
+        scope: PromoteScope,
+    ) -> PromoteStats {
         if keys.is_empty() {
             return PromoteStats::default();
         }
@@ -4487,13 +4544,24 @@ C:\isolated\miv-data"#
             let (mtx, cv) = &**queue;
             let mut q = mtx.lock().unwrap();
 
-            // (1) high_normal を current / stale に振り分け
             let mut found_keys: HashSet<String> = HashSet::new();
+            let mut already_high = 0usize;
+            if matches!(scope, PromoteScope::FullscreenCurrent) {
+                for j in &q.critical {
+                    if j.perf_key.as_ref().is_some_and(|k| keys.contains(k)) {
+                        if let Some(k) = j.perf_key.as_ref() {
+                            found_keys.insert(k.clone());
+                        }
+                        already_high += 1;
+                    }
+                }
+            }
+
+            // (1) high_normal を current / stale に振り分け
             let mut current_high: std::collections::VecDeque<Job> =
                 std::collections::VecDeque::with_capacity(q.high_normal.len());
             let mut stale_high: std::collections::VecDeque<Job> =
                 std::collections::VecDeque::with_capacity(q.high_normal.len());
-            let mut already_high = 0usize;
             while let Some(j) = q.high_normal.pop_front() {
                 if j.perf_key.as_ref().is_some_and(|k| keys.contains(k)) {
                     if let Some(k) = j.perf_key.as_ref() {
@@ -4594,6 +4662,46 @@ C:\isolated\miv-data"#
         let (mtx, _) = &*queue;
         let q = mtx.lock().unwrap();
         assert_eq!(q.critical.len(), 1, "Critical はそのまま");
+    }
+
+    #[test]
+    fn fullscreen_promote_moves_normal_and_preserves_higher_priority_jobs() {
+        let queue = empty_queue();
+        let (normal, _normal_rx) =
+            make_test_job_with_perf_key(JobPriority::Normal, Some("pdf::normal.pdf#0"));
+        let (high, _high_rx) =
+            make_test_job_with_perf_key(JobPriority::HighNormal, Some("pdf::high.pdf#0"));
+        let (critical, _critical_rx) =
+            make_test_job_with_perf_key(JobPriority::Critical, Some("pdf::critical.pdf#0"));
+        {
+            let (mtx, _) = &*queue;
+            let mut q = mtx.lock().unwrap();
+            q.normal.push_back(normal);
+            q.high_normal.push_back(high);
+            q.critical.push_back(critical);
+        }
+        let keys = HashSet::from([
+            "pdf::normal.pdf#0".to_string(),
+            "pdf::high.pdf#0".to_string(),
+            "pdf::critical.pdf#0".to_string(),
+        ]);
+
+        let stats = promote_fullscreen_in_queue(&queue, &keys);
+
+        assert_eq!(stats.promoted, 1);
+        assert_eq!(stats.already_high, 2);
+        assert_eq!(stats.not_found_keys, 0);
+        let (mtx, _) = &*queue;
+        let q = mtx.lock().unwrap();
+        assert!(q.normal.is_empty());
+        assert_eq!(q.high_normal.len(), 2);
+        assert_eq!(q.critical.len(), 1);
+        assert_eq!(q.critical[0].priority, JobPriority::Critical);
+        assert!(
+            q.high_normal
+                .iter()
+                .all(|job| job.priority == JobPriority::HighNormal)
+        );
     }
 
     #[test]

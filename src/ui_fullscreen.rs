@@ -12085,7 +12085,8 @@ impl App {
     }
 
     fn seek_to_continuous_page(&mut self, ctx: &egui::Context, target_idx: usize) {
-        if self.fullscreen_idx != Some(target_idx) {
+        let current_page_changed = self.fullscreen_idx != Some(target_idx);
+        if current_page_changed {
             if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
@@ -12101,6 +12102,9 @@ impl App {
         self.update_last_selected_image();
         self.record_book_resume(target_idx);
         self.record_reading_history(target_idx, crate::app::HistoryTrigger::UserChosen);
+        if current_page_changed {
+            self.refresh_fullscreen_pdf_promotion();
+        }
         ctx.request_repaint();
     }
 
@@ -12976,6 +12980,7 @@ impl App {
             self.advance_animation(ctx, partner);
             if !page_turn_decision.defer_ui_uploads() {
                 self.ensure_fs_page_load(partner);
+                self.refresh_fullscreen_pdf_promotion();
             }
         }
         // in-window モード中は静止画を専用 viewport ではなくメインウィンドウの
@@ -13505,6 +13510,7 @@ impl App {
                         {
                             if matches!(self.items.get(partner), Some(GridItem::PdfPage { .. })) {
                                 self.ensure_fs_page_load(partner);
+                                self.refresh_fullscreen_pdf_promotion();
                                 self.ensure_pdf_display_resolution(partner, pdf_partner_bbox);
                             }
                         }
@@ -25589,7 +25595,8 @@ impl App {
         if self.items.get(new_idx).is_none() {
             return;
         }
-        if self.fullscreen_idx != Some(new_idx) {
+        let current_page_changed = self.fullscreen_idx != Some(new_idx);
+        if current_page_changed {
             // 連結ストリーム内の再アンカーはファイルを開き直す遷移ではないため、
             // pointer-open の左右パネルは維持する。touch handle の右パネルは current-file
             // state なので閉じ、表示トリムの pending 値だけ旧対象へ確定する。
@@ -25603,6 +25610,9 @@ impl App {
         self.record_book_resume(new_idx);
         self.record_reading_history(new_idx, history_trigger);
         self.slideshow_scroll_range_cache = None;
+        if current_page_changed {
+            self.refresh_fullscreen_pdf_promotion();
+        }
         ctx.request_repaint();
     }
 

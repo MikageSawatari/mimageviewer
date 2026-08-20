@@ -2194,6 +2194,7 @@ struct ViewerContextBundle {
     fs_margin_bbox_cache: std::collections::HashMap<usize, (u64, usize, Option<egui::Rect>)>,
     input_generation: std::collections::HashMap<usize, u64>,
     fs_pending: ItemsGenerationMap<FsPendingValue>,
+    fullscreen_pdf_promotion: FullscreenPdfPromotionState,
     /// この viewer context の実描画先から得た PDF 初回レンダターゲット。
     fs_pdf_display_target: Option<crate::pdf_loader::PdfDisplayTarget>,
     fs_early_dims: ItemsGenerationMap<[usize; 2]>,
@@ -2499,6 +2500,7 @@ impl ViewerContextBundle {
             fs_margin_bbox_cache: std::collections::HashMap::new(),
             input_generation: std::collections::HashMap::new(),
             fs_pending: ItemsGenerationMap::with_discard("fs_pending", cancel_fs_pending_value),
+            fullscreen_pdf_promotion: FullscreenPdfPromotionState::default(),
             fs_pdf_display_target: None,
             fs_early_dims: ItemsGenerationMap::new("fs_early_dims"),
             fs_upload_backlog: FsUploadBacklog::new("fs_upload_backlog", fs_upload_backlog_idx),
@@ -5300,6 +5302,55 @@ impl FsPendingValue {
             purpose,
         }
     }
+}
+
+/// fullscreen の現在表示単位に属する PDF pool 昇格の context-owned state。
+///
+/// `display_keys` が同じ `Settled` frame では pool lock を取らない。`Retry` は、昇格時に
+/// `not_found` だった pending job が thumb/fs worker から pool へ遅れて enqueue される
+/// race だけを追う。frame 番号は同一 frame 内の二重試行を抑止する事実ベースの dedup で、
+/// 時間窓や delay ではない。
+#[derive(Debug)]
+enum FullscreenPdfPromotionState {
+    Idle,
+    Settled {
+        display_keys: HashSet<String>,
+        pending_keys: HashSet<String>,
+    },
+    Retry {
+        display_keys: HashSet<String>,
+        pending_keys: HashSet<String>,
+        last_attempt_frame: u64,
+    },
+}
+
+impl Default for FullscreenPdfPromotionState {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullscreenPdfPromotionTrigger {
+    CurrentDisplayChanged,
+    PendingJobQueued,
+    NotFoundRetry,
+}
+
+impl FullscreenPdfPromotionTrigger {
+    const fn perf_label(self) -> &'static str {
+        match self {
+            Self::CurrentDisplayChanged => "current_display_changed",
+            Self::PendingJobQueued => "pending_job_queued",
+            Self::NotFoundRetry => "not_found_retry",
+        }
+    }
+}
+
+struct FullscreenPdfPromotionAttempt {
+    trigger: FullscreenPdfPromotionTrigger,
+    target_count: usize,
+    stats: crate::pdf_loader::PromoteStats,
 }
 
 pub(crate) struct FsUploadResult {
@@ -9611,6 +9662,10 @@ pub struct App {
     /// 別のユーザー操作にずれる。計装無効時や内部起動は 0。
     pub(crate) fs_pending: ItemsGenerationMap<FsPendingValue>,
 
+    /// 現在表示単位の PDF pool 昇格 dedup / not_found retry。items / fullscreen_idx と
+    /// 同じ viewer context が所有し、detached bundle mount 時も一緒に swap する。
+    fullscreen_pdf_promotion: FullscreenPdfPromotionState,
+
     /// fullscreen / detached / in-window の実 viewport と effective ppp から得た
     /// PDF 初回レンダターゲット。viewer context と一緒に swap する。
     pub(crate) fs_pdf_display_target: Option<crate::pdf_loader::PdfDisplayTarget>,
@@ -13111,6 +13166,7 @@ impl App {
             view_trim_db,
             input_generation: std::collections::HashMap::new(),
             fs_pending: ItemsGenerationMap::with_discard("fs_pending", cancel_fs_pending_value),
+            fullscreen_pdf_promotion: FullscreenPdfPromotionState::default(),
             fs_pdf_display_target: None,
             fs_upload_backlog: FsUploadBacklog::new("fs_upload_backlog", fs_upload_backlog_idx),
             fs_early_dims: ItemsGenerationMap::new("fs_early_dims"),
@@ -15610,6 +15666,7 @@ impl App {
             fs_margin_bbox_cache,
             input_generation,
             fs_pending,
+            fullscreen_pdf_promotion,
             fs_pdf_display_target,
             fs_early_dims,
             fs_upload_backlog,
@@ -15847,6 +15904,7 @@ impl App {
         swap_field!(fs_margin_bbox_cache);
         swap_field!(input_generation);
         swap_field!(fs_pending);
+        swap_field!(fullscreen_pdf_promotion);
         swap_field!(fs_pdf_display_target);
         swap_field!(fs_early_dims);
         swap_field!(fs_upload_backlog);
@@ -40976,6 +41034,7 @@ impl App {
             fs_margin_bbox_cache,
             input_generation,
             fs_pending,
+            fullscreen_pdf_promotion,
             fs_pdf_display_target,
             fs_early_dims,
             fs_upload_backlog,
@@ -41163,6 +41222,7 @@ impl App {
             fs_margin_bbox_cache,
             input_generation,
             fs_pending,
+            fullscreen_pdf_promotion,
             fs_pdf_display_target,
             fs_early_dims,
             fs_upload_backlog,
@@ -43569,6 +43629,9 @@ impl App {
                         self.update_prefetch_window(idx);
                     }
                 }
+                // `ensure_fs_page_load` 後に見開き partner の prefetch が追加された場合も、
+                // 同じ page-change frame で pending set の増加を拾って pool へ昇格を依頼する。
+                self.refresh_fullscreen_pdf_promotion();
             }
             Some(GridItem::Video(_)) => {
                 // 動画はインライン再生 (フルスクリーン化と同時に VideoPlayer を起動)。
@@ -51292,6 +51355,7 @@ impl App {
 
         self.reset_fs_side_panel_runtime_for_file_change();
         self.fullscreen_idx = None;
+        self.fullscreen_pdf_promotion = FullscreenPdfPromotionState::Idle;
         self.fs_pdf_display_target = None;
         // `close_fullscreen` is also used as a generic teardown from
         // `start_loading_items`, even when no viewer is open.  Refreshing the
@@ -56314,6 +56378,173 @@ impl App {
         }
     }
 
+    fn current_fullscreen_pdf_promotion_keys(&mut self) -> (HashSet<String>, HashSet<String>) {
+        let Some(fs_idx) = self.fullscreen_idx else {
+            return (HashSet::new(), HashSet::new());
+        };
+        let page_indices = match self.resolve_spread_pair(fs_idx) {
+            crate::ui_fullscreen::SpreadPair::Single => vec![fs_idx],
+            crate::ui_fullscreen::SpreadPair::Double { left, right } => vec![left, right],
+        };
+        let mut display_keys = HashSet::with_capacity(page_indices.len());
+        let mut pending_keys = HashSet::with_capacity(page_indices.len());
+        for idx in page_indices {
+            let Some(GridItem::PdfPage {
+                pdf_path, page_num, ..
+            }) = self.items.get(idx)
+            else {
+                continue;
+            };
+            let key = crate::grid_item::pdf_page_perf_key(pdf_path, *page_num);
+            display_keys.insert(key.clone());
+            if self.fs_pending.contains_key(&idx) {
+                pending_keys.insert(key);
+            }
+        }
+        (display_keys, pending_keys)
+    }
+
+    fn refresh_fullscreen_pdf_promotion_with(
+        &mut self,
+        promote: impl FnOnce(&HashSet<String>) -> crate::pdf_loader::PromoteStats,
+    ) -> Option<FullscreenPdfPromotionAttempt> {
+        let (display_keys, pending_keys) = self.current_fullscreen_pdf_promotion_keys();
+        if display_keys.is_empty() {
+            self.fullscreen_pdf_promotion = FullscreenPdfPromotionState::Idle;
+            return None;
+        }
+
+        let previous = std::mem::take(&mut self.fullscreen_pdf_promotion);
+        let (trigger, keys_to_promote) = match previous {
+            FullscreenPdfPromotionState::Idle => (
+                FullscreenPdfPromotionTrigger::CurrentDisplayChanged,
+                pending_keys.clone(),
+            ),
+            FullscreenPdfPromotionState::Settled {
+                display_keys: previous_display,
+                pending_keys: previous_pending,
+            } if previous_display == display_keys => {
+                let newly_pending: HashSet<String> = pending_keys
+                    .difference(&previous_pending)
+                    .cloned()
+                    .collect();
+                if newly_pending.is_empty() {
+                    self.fullscreen_pdf_promotion = FullscreenPdfPromotionState::Settled {
+                        display_keys,
+                        pending_keys,
+                    };
+                    return None;
+                }
+                (
+                    FullscreenPdfPromotionTrigger::PendingJobQueued,
+                    newly_pending,
+                )
+            }
+            FullscreenPdfPromotionState::Settled { .. } => (
+                FullscreenPdfPromotionTrigger::CurrentDisplayChanged,
+                pending_keys.clone(),
+            ),
+            FullscreenPdfPromotionState::Retry {
+                display_keys: previous_display,
+                pending_keys: previous_pending,
+                last_attempt_frame,
+            } if previous_display == display_keys => {
+                if pending_keys.is_empty() {
+                    self.fullscreen_pdf_promotion = FullscreenPdfPromotionState::Settled {
+                        display_keys,
+                        pending_keys,
+                    };
+                    return None;
+                }
+                let has_new_pending = pending_keys.difference(&previous_pending).next().is_some();
+                if has_new_pending {
+                    (
+                        FullscreenPdfPromotionTrigger::PendingJobQueued,
+                        pending_keys.clone(),
+                    )
+                } else if last_attempt_frame == self.frame_counter {
+                    self.fullscreen_pdf_promotion = FullscreenPdfPromotionState::Retry {
+                        display_keys,
+                        pending_keys,
+                        last_attempt_frame,
+                    };
+                    return None;
+                } else {
+                    (
+                        FullscreenPdfPromotionTrigger::NotFoundRetry,
+                        pending_keys.clone(),
+                    )
+                }
+            }
+            FullscreenPdfPromotionState::Retry { .. } => (
+                FullscreenPdfPromotionTrigger::CurrentDisplayChanged,
+                pending_keys.clone(),
+            ),
+        };
+
+        if keys_to_promote.is_empty() {
+            self.fullscreen_pdf_promotion = FullscreenPdfPromotionState::Settled {
+                display_keys,
+                pending_keys,
+            };
+            return None;
+        }
+
+        let stats = promote(&keys_to_promote);
+        self.fullscreen_pdf_promotion = if stats.not_found_keys > 0 {
+            FullscreenPdfPromotionState::Retry {
+                display_keys,
+                pending_keys,
+                last_attempt_frame: self.frame_counter,
+            }
+        } else {
+            FullscreenPdfPromotionState::Settled {
+                display_keys,
+                pending_keys,
+            }
+        };
+        Some(FullscreenPdfPromotionAttempt {
+            trigger,
+            target_count: keys_to_promote.len(),
+            stats,
+        })
+    }
+
+    pub(crate) fn refresh_fullscreen_pdf_promotion(&mut self) {
+        let Some(attempt) = self.refresh_fullscreen_pdf_promotion_with(|keys| {
+            crate::pdf_loader::promote_fullscreen_to_high_normal(keys)
+        }) else {
+            return;
+        };
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "pdf",
+                "pool_promote_fullscreen",
+                None,
+                self.input_seq,
+                &[
+                    (
+                        "trigger",
+                        serde_json::Value::from(attempt.trigger.perf_label()),
+                    ),
+                    (
+                        "target_count",
+                        serde_json::Value::from(attempt.target_count),
+                    ),
+                    ("promoted", serde_json::Value::from(attempt.stats.promoted)),
+                    (
+                        "already_high",
+                        serde_json::Value::from(attempt.stats.already_high),
+                    ),
+                    (
+                        "not_found",
+                        serde_json::Value::from(attempt.stats.not_found_keys),
+                    ),
+                ],
+            );
+        }
+    }
+
     /// 同じ typed state を入口ガードにも使い、必要なときだけ producer を起動する。
     pub(crate) fn ensure_fs_page_load(&mut self, idx: usize) -> FsPageLoadState {
         // Every page that is about to be shown passes through here, which makes it the one place
@@ -56323,13 +56554,17 @@ impl App {
         if matches!(state, FsPageLoadState::DisplayReady(_)) {
             self.start_animation_promotion_if_needed(idx);
         }
-        if state.needs_load_request() {
+        let state = if state.needs_load_request() {
             self.start_fs_load(idx);
             self.fs_page_load_state(idx)
         } else {
             self.note_fs_page_load_skipped(idx, state);
             state
+        };
+        if self.fullscreen_idx == Some(idx) {
+            self.refresh_fullscreen_pdf_promotion();
         }
+        state
     }
 
     /// Record that the page the user is looking at was considered already loaded.

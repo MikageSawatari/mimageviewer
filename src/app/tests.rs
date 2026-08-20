@@ -1305,6 +1305,140 @@ fn fullscreen_pdf_loads_are_not_pruned_by_grid_epoch() {
     }
 }
 
+fn add_fullscreen_pdf_test_pending(app: &mut App, idx: usize) {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (_tx, rx) = mpsc::channel();
+    app.fs_pending.insert(
+        idx,
+        FsPendingValue::new(cancel, rx, 1, FsLoadPurpose::for_page(true)),
+    );
+}
+
+#[test]
+fn fullscreen_pdf_promotion_promotes_single_pending_page_once_per_stable_state() {
+    let mut app = setup_app_for_test();
+    let pdf_path = PathBuf::from(r"C:\books\single.pdf");
+    app.items = vec![GridItem::PdfPage {
+        pdf_path: pdf_path.clone(),
+        page_num: 4,
+        content_type: None,
+    }];
+    app.fullscreen_idx = Some(0);
+    add_fullscreen_pdf_test_pending(&mut app, 0);
+    let expected = crate::grid_item::pdf_page_perf_key(&pdf_path, 4);
+    let mut calls = 0;
+
+    let attempt = app
+        .refresh_fullscreen_pdf_promotion_with(|keys| {
+            calls += 1;
+            assert_eq!(keys, &HashSet::from([expected.clone()]));
+            crate::pdf_loader::PromoteStats {
+                promoted: 1,
+                already_high: 0,
+                not_found_keys: 0,
+            }
+        })
+        .expect("a newly current pending PDF page must request promotion");
+
+    assert_eq!(
+        attempt.trigger,
+        FullscreenPdfPromotionTrigger::CurrentDisplayChanged
+    );
+    assert_eq!(attempt.target_count, 1);
+    assert_eq!(calls, 1);
+    assert!(
+        app.refresh_fullscreen_pdf_promotion_with(|_| {
+            panic!("an unchanged settled current page must not lock the PDF pool")
+        })
+        .is_none()
+    );
+}
+
+#[test]
+fn fullscreen_pdf_promotion_targets_both_pending_spread_pages() {
+    let mut app = setup_app_for_test();
+    let pdf_path = PathBuf::from(r"C:\books\spread.pdf");
+    app.items = (0..2)
+        .map(|page_num| GridItem::PdfPage {
+            pdf_path: pdf_path.clone(),
+            page_num,
+            content_type: None,
+        })
+        .collect();
+    app.visible_indices = vec![0, 1];
+    app.spread_mode = crate::settings::SpreadMode::Ltr;
+    app.fullscreen_idx = Some(0);
+    add_fullscreen_pdf_test_pending(&mut app, 0);
+    add_fullscreen_pdf_test_pending(&mut app, 1);
+    let expected = HashSet::from([
+        crate::grid_item::pdf_page_perf_key(&pdf_path, 0),
+        crate::grid_item::pdf_page_perf_key(&pdf_path, 1),
+    ]);
+
+    let attempt = app
+        .refresh_fullscreen_pdf_promotion_with(|keys| {
+            assert_eq!(keys, &expected);
+            crate::pdf_loader::PromoteStats {
+                promoted: 2,
+                already_high: 0,
+                not_found_keys: 0,
+            }
+        })
+        .expect("both pending pages in the spread must request promotion together");
+
+    assert_eq!(attempt.target_count, 2);
+}
+
+#[test]
+fn fullscreen_pdf_promotion_retries_not_found_on_the_next_frame() {
+    let mut app = setup_app_for_test();
+    let pdf_path = PathBuf::from(r"C:\books\retry.pdf");
+    app.items = vec![GridItem::PdfPage {
+        pdf_path,
+        page_num: 0,
+        content_type: None,
+    }];
+    app.fullscreen_idx = Some(0);
+    add_fullscreen_pdf_test_pending(&mut app, 0);
+    app.frame_counter = 10;
+
+    let first = app
+        .refresh_fullscreen_pdf_promotion_with(|_| crate::pdf_loader::PromoteStats {
+            promoted: 0,
+            already_high: 0,
+            not_found_keys: 1,
+        })
+        .expect("not_found must create a retry latch");
+    assert_eq!(
+        first.trigger,
+        FullscreenPdfPromotionTrigger::CurrentDisplayChanged
+    );
+    assert!(
+        app.refresh_fullscreen_pdf_promotion_with(|_| {
+            panic!("the retry latch must not run twice in one frame")
+        })
+        .is_none()
+    );
+
+    app.frame_counter += 1;
+    let retry = app
+        .refresh_fullscreen_pdf_promotion_with(|_| crate::pdf_loader::PromoteStats {
+            promoted: 1,
+            already_high: 0,
+            not_found_keys: 0,
+        })
+        .expect("not_found must be retried while the same fullscreen load is pending");
+    assert_eq!(retry.trigger, FullscreenPdfPromotionTrigger::NotFoundRetry);
+
+    app.frame_counter += 1;
+    assert!(
+        app.refresh_fullscreen_pdf_promotion_with(|_| {
+            panic!("a successful retry must settle the state")
+        })
+        .is_none()
+    );
+}
+
 #[test]
 fn fullscreen_pdf_interrupted_render_is_cancel_like() {
     let interrupted =
