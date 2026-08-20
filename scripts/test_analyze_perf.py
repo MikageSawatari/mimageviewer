@@ -221,8 +221,9 @@ def page_turn_gate_decision(
     generation: int = 2,
     reason: str = "pass_through",
     passthrough_rendition_ready: bool = True,
+    ui_work_admission: str | None = None,
 ) -> dict:
-    return {
+    event = {
         "t": t,
         "cat": "fs",
         "kind": "page_turn_decision",
@@ -232,6 +233,9 @@ def page_turn_gate_decision(
         "passthrough_rendition_ready": passthrough_rendition_ready,
         "defer_ui_uploads": defer_ui_uploads,
     }
+    if ui_work_admission is not None:
+        event["ui_work_admission"] = ui_work_admission
+    return event
 
 
 def page_turn_decision(
@@ -525,9 +529,23 @@ class PageTurnInvariantCliTests(unittest.TestCase):
             ),
             "I5": (
                 common_good
-                + [page_turn_gate_decision(1.05, 2, defer_ui_uploads=False)],
+                + [
+                    page_turn_gate_decision(
+                        1.05,
+                        2,
+                        defer_ui_uploads=True,
+                        ui_work_admission="all",
+                    )
+                ],
                 common_good
-                + [page_turn_gate_decision(1.05, 2, defer_ui_uploads=True)],
+                + [
+                    page_turn_gate_decision(
+                        1.05,
+                        2,
+                        defer_ui_uploads=True,
+                        ui_work_admission="navigation_target_uploads_only",
+                    )
+                ],
             ),
         }
 
