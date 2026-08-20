@@ -1,7 +1,8 @@
 ﻿# 修飾キー所有権の再設計 (design proposal / 合意用) — 第 3 版
 
-**状態: 提案。第 1 版は中核が否決、第 2 版は方向を承認されたが 6 点の未確定で保留。
-本版はその 6 点を確定させたもの。実装は合意後。** 凍結領域
+**状態: 提案。第 4 版。Codex は構造的修正であることに同意済み (§11 用の文面あり) だが、
+実装前決定 6 件が残っていた。本版はそれを確定させたもの。末尾の第 4 版節が §3.1 / §3.2 /
+§3.3 / §6 / §7 を上書きする。実装は §9.7 の実機観測 2 件と、本版への合意の後。** 凍結領域
 ([detached-rework-plan.md](../detached-rework-plan.md) §2) に触れるため、合意後に §11 へ記録する。
 
 ## 0. 却下・修正の履歴 (同じ轍を踏まないための記録)
@@ -172,3 +173,126 @@ AltGr 配列の RAlt、StickyKeys ON、seed が `Unknown` のとき、Shift / Al
   latch をどう投影するかを**実機で観測してから**決める。推測で書かない。
 - **transient `AttachThreadInput`**: 現行の foreground claim ごとの attach / detach が、実際に
   key state reset を起こすかを実機で確認する。§3.1 の topology 境界の設計はこの観測に依存する。
+
+---
+
+# 第 4 版 — 実装前決定 6 件の確定
+
+**本節は §3.1 / §3.2 / §3.3 / §6 / §7 の該当箇所を上書きする。** 第 3 版は「文言では答えたが
+実質を外している」点が 4 つあり、うち 2 つは反証を伴っていた。以下が確定版。
+
+## 9.1 epoch 境界の **FIFO 上の位置** (§3.1 を上書き)
+
+第 3 版は境界を「観測」できるようにしただけで、**キュー内のどこか**を決めていなかった。
+`WM_SETFOCUS` は sent message であり、`GetMessage` は queued input を返す前に sent message を
+先に配送する。したがって次の順序が成立してしまう。
+
+1. 旧 epoch のキーが既にキューにある (アプリが忙しく drain できていない)
+2. sent `WM_SETFOCUS` を hook が観測し、新 epoch を開始
+3. **その後で旧キーが dequeue され、新 epoch へ fold される** ← 誤り
+
+**確定: 取得を観測したら、そのキューへ private な marker message を `PostMessage` する。**
+
+- marker は**現時点のキュー末尾に入る**ので、marker より前 = 旧 epoch、後 = 新 epoch と
+  FIFO 上で一意に決まる。時刻比較も watermark も要らない
+- **物理状態のサンプルは marker を post する時点で取り、marker の payload として運ぶ**。
+  dequeue 時点で取り直さない (取得から dequeue までの遷移は marker の後ろに並ぶため、
+  seed に含めると二重適用になる)
+- **同一キュー内**の focus 移動 (child / common dialog / IME HWND 間) は routing の再取得では
+  ないので **marker を出さない**。判定は「routing owner が別のキュー / group からこのキューへ
+  変わったか」で行い、重複する activation → focus 通知は 1 つの marker へ coalesce する
+
+`WH_CALLWNDPROC` と `WH_CBT` は代替関係にない。キューをまたぐ `WM_ACTIVATE` は非同期で
+ウィンドウは即時 activate され、`HCBT_*` は操作**前**の通知である。よって
+**`HCBT_*` を候補通知、`WM_ACTIVATE` / `WM_SETFOCUS` を成功確認**として使い、marker の post は
+成功確認側で行う。
+
+## 9.2 `AttachThreadInput` 中の所有権 (§3.1 を上書き)
+
+attach 中は 2 スレッドが**入力状態を共有し、両者のイベントを受信順に処理する**。この間に
+2 つの独立したキュー状態をローカル FIFO だけで fold すると、片方が処理した Ctrl の遷移が
+他方へ反映されない。「各 producer が次の dequeue 前に generation を見る」だけでは、
+API 成功と invalidation の publish の間に相手が dequeue する race が残る。
+
+**確定: attach 中は両キューを 1 つの topology component として扱い、単一の状態を共有する。**
+`claim_foreground` は attach → focus API → detach を同期実行しており
+([native_window.rs:1001](../../src/video/native_window.rs:1001))、この span は自コードで閉じている。
+span の入口で component を統合し、出口で分離して**両キューへ marker を post する** (detach 後は
+OS 側でキー状態が reset されるため、両方が新 epoch になる)。detach の戻り値は現在捨てているので、
+**成功可否を見るよう変更する** (失敗したまま分離扱いにしない)。
+
+## 9.3 `Unknown` の照合 — **not held 既定を撤回** (§3.2 を上書き)
+
+第 3 版の「解消前の `Unknown` は not held として照合する」は**誤り**。反証がある。
+
+`FsClearAdjust` は <kbd>Ctrl</kbd>+<kbd>BS</kbd> だけでなく **bare <kbd>Q</kbd>** にも割り当てられて
+いる ([keymap.rs:5471](../../src/keymap.rs:5471))。Ctrl が `Unknown` のとき false と決めつけると、
+実際には Ctrl を押している <kbd>Ctrl</kbd>+<kbd>Q</kbd> が **bare <kbd>Q</kbd> と誤認され、
+補正が破棄される**。「破壊的でない側へ倒す」という私の論拠は、同じ action の別 chord で崩れる。
+1 例からの一般化だった。
+
+**確定: 照合結果を `Match` / `NoMatch` / `Indeterminate` の 3 値にする。**
+`Indeterminate` は **action を発火させず、perf event に必ず出す**。特定の action だけ
+fallback させたい場合は、action ごとの明示 policy として宣言する (既定では無い)。
+
+**`Unknown` は epoch 全期間続き得る。** 修飾キーごとに最初の遷移でしか解消しないので、
+Ctrl の遷移が起きなければ Ctrl は `Unknown` のままである。よって:
+
+- sampling の事前条件が後から成立したら、**recovery として新しい epoch を開始してよい**
+  (marker を post して seed し直す)。これは「推測で埋める」ことではなく、
+  条件が整った時点で正しい seed を取り直す操作である
+
+## 9.4 AltGr — **RAlt が LCtrl を抑制する案を撤回** (§3.3 を上書き)
+
+第 3 版の案は**誤り**。AltGr を無害化せず **Alt-only の chord に変換してしまう**。
+grid には `Alt+1..0` (列数変更、[keymap.rs:5292](../../src/keymap.rs:5292)) があり、
+`Ctrl+Alt+1..0` は標準補正 ([keymap.rs:5458](../../src/keymap.rs:5458))。提案方式では
+**AltGr+数字が列数変更を誤爆する**。意図的な LCtrl+RAlt も、Ctrl+Alt が成立せず Alt-only が
+成立するという最悪の形になる。さらに「Ctrl / Alt は左右どちらでもよい」という現行の意味
+([keymap.rs:110](../../src/keymap.rs:110)) を壊す。
+
+Win32 に「これは synthetic AltGr」を無損失で示す標準フラグは無い。Windows Terminal は
+LCtrl と RAlt の時間差 50ms と生成 codepoint を使うが、自ら heuristic と明記している。
+Chromium は layout の `KLLF_ALTGR` を公開 API から取れず `ToUnicodeEx` で推定している。
+
+**確定: AltGr は sided bit の書き換えではなく provenance として保持し、AltGr sequence 中は
+通常の chord matching 全体を抑止する。** 「事前から LCtrl が押されていたら genuine Ctrl」という
+timing heuristic は採らない (ほぼ同時の意図的 LCtrl+RAlt と完全には識別できず、
+§2 規則 5 の時間窓禁止にも触れる)。**AltGr 中に chord を発火させないことは機能低下ではなく、
+現状の誤爆を止める側である。**
+
+## 9.5 consumer 分類 — call-site 単位で `Delivery` / `Current` を決める (§6 を上書き)
+
+§6 は場所の列挙であって分類になっていなかった。**実装前に全 call-site を 2 分類する。**
+
+**確定した分類方針**:
+
+- **キーの chord 判定は `Delivery`**。「そのキーが来たとき何が押されていたか」が意味だから。
+- **ホイール / クリック / ドラッグの修飾キーは `Current`**。「今 Ctrl を押しながら回している」が
+  利用者の意味であり、配送位置ではない。これにより「1 frame 内で Ctrl 遷移と複数ホイールが
+  交錯したとき各ホイールの配送位置を復元できない」という問題自体が消える
+  (sidecar event を新設しない)。
+- **ホールド系は `Current`** (現状どおり)。
+
+未分類の残り (grid click [ui_main.rs:12795](../../src/ui_main.rs:12795)、rating click
+[ui_main.rs:1481](../../src/ui_main.rs:1481)、erase / conceal の vector drag
+[ui_erase.rs:1466](../../src/ui_erase.rs:1466)、local-adjust の Alt preview
+[ui_adjustment_panel.rs:11387](../../src/ui_adjustment_panel.rs:11387)) はすべて pointer 由来
+なので `Current`。
+
+## 9.6 不変条件の追補 (§7 を上書き)
+
+- **修飾キー自身のエッジは、自分の遷移を適用した後の snapshot を持つ** (Ctrl down のエッジは
+  `ctrl=true`)。現行 `GetKeyState` の挙動と一致する。
+- **pointer / wheel は `Current` なので FIFO fold の対象外**。
+- **`WM_APPCOMMAND` 由来の合成イベントは、意味として modifier-none とする**。これらは
+  key chord ではなくアプリコマンドであり、現在も全 false で作られている
+  ([native_window.rs:1601](../../src/video/native_window.rs:1601))。「owner から導く」ではなく
+  **明示的に modifier-none と宣言する**ことで意味を一意にする。
+
+## 9.7 実機観測が先に要る 2 件 (S0 の前提)
+
+- **StickyKeys**: latch / lock が獲得時 seed の物理サンプルにどう映るか。
+- **transient `AttachThreadInput`**: 現行の attach / detach が実際にキー状態 reset を起こすか。
+
+**この 2 件の観測結果が出るまで S0 の契約は確定しない。**観測は利用者の実機で行う。
