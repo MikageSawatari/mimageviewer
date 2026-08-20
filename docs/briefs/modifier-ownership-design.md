@@ -366,3 +366,118 @@ attach が実際にキー状態を reset するかは未確認のままだが、
 2. StickyKeys latch 中のホイール (latch がマウスメッセージへ適用されるか)
 
 どちらも既存の計装のまま拾えるので、追加実装は不要。
+
+---
+
+# 第 5 版 — 契約の確定 (§9.1 / §9.2 / §9.4 / §9.5 / §9.6 を上書き)
+
+第 4 版の 4 つの穴を埋めた。**うち 3 つは Codex の対案をそのまま採用**し、fence は
+**私の marker 案を破棄**して Codex の fail-closed 契約に置き換える。
+
+## 10.1 epoch fence — **marker 案を破棄**。`Acquiring` 位相 + fail-closed
+
+**却下理由**: Windows は posted message を hardware input より先に処理する。よって acquisition
+時に post した marker は、**既にキューにある古いキーメッセージを追い越し得る**。「marker より前が
+旧 epoch」は偽だった。presenter の pump は unfiltered `PeekMessageW(..., 0, 0, PM_REMOVE)` なので
+机上の話ではない ([native_window.rs:1230](../../src/video/native_window.rs:1230))。
+
+**`WH_KEYBOARD_LL` に ordinal を振る案も採らない。** hook が受け取る `KBDLLHOOKSTRUCT` と後で
+dequeue する `MSG` に**共通の一意な ID が公開されていない**。`(vk, scan, time, flags)` の照合や
+「dequeue 順は hook 順と一対一」の仮定に落ちる。加えて `PostMessage` 由来の入力は hook を通らず、
+**hook は timeout で通知なく削除され、削除を検出する方法も無い**と Microsoft が明記している。
+
+**確定した契約 (Codex 案)**:
+
+1. routing acquisition を観測したキューは **`Acquiring`** に入る
+2. それ以降、**最初の message-drain が完了するまで**に dequeue された key event は、
+   旧 epoch か新 epoch かを**断定しない**
+3. その batch の chord 判定は**すべて `Indeterminate`** とし、アプリの shortcut を発火させない。
+   通常の文字入力 / IME は維持する (抑止されるのは chord command)
+4. drain 完了時に、曖昧 batch が作った modifier fold を**捨て**、acquisition 時点の物理状態から
+   新 epoch を seed する
+5. **キューが空にならなければ `Acquiring` のまま**。時間 timeout も推測 fallback も置かない
+
+**dequeue の chokepoint**:
+UI は `WH_GETMESSAGE` の **`wParam == PM_REMOVE`** (Microsoft が「取得後・呼び出し元へ返す前」に
+呼ばれると明記。現行 hook は `wParam` を受け取っているが判定していない
+[lib.rs:571](../../src/lib.rs:571))。presenter は `PeekMessageW` 直後から
+`TranslateMessage` / `DispatchMessageW` までの区間。**marker の順位に依存しないので unfiltered
+pump でも成立する。**
+
+**代償は明示的**: focus 切替と同じ drain に入った shortcut が 1 回無視され得る。
+**ただしこれは現状より良い。**今は誤った action が成立し得る (<kbd>BS</kbd> が
+`FsClearAdjust` になり補正を破棄する) のに対し、この契約では**何も起きない**だけである。
+破壊的な誤動作から、1 回の取りこぼしへ置き換わる。
+
+**採らなかった案**: `WH_CBT` の `HCBT_ACTIVATE` / `HCBT_SETFOCUS` は操作**前**に呼ばれ非ゼロを
+返せば阻止できるので、「acquisition を阻止 → 旧キーを完全 drain → 空を確認 → 一回限りの permit で
+再実行」とすれば exact にできる。しかし Alt+Tab や activation click をキャンセルして再現するのは
+元の OS 操作と同値ではなく、focus / z-order / mouse-activation の仕様変更になる。
+**この modifier 修正へ持ち込む ownership 拡張としては大きすぎる。**
+
+## 10.2 attach transaction (§9.2 を上書き)
+
+私の「reset してもしなくても境界にするのは正しい」という**論法は撤回する**。reseed は同じビットでも
+delivery 帰属を分断し得るので、「無視できる確率」は不変条件ではない。
+**結論は維持する**が、根拠を差し替える: **Microsoft が attach / detach 後の key state reset を
+仕様として文書化している**ので、1 台での再現は不要である。
+
+契約:
+
+- **transactional attach**: prepare → API 結果 → post-attach seed で commit、または abort
+- **detach 成功**: 登録済み mIV キューを split し、両方を reseed
+- **detach 失敗**: attach されたままとして扱い、**split した epoch を publish しない**
+- **相手が外部プロセス**: `claim_foreground` は foreground を持つ任意のスレッドへ attach し得る
+  ([native_window.rs:1113](../../src/video/native_window.rs:1113))。プロセスローカルな owner は
+  外部プロセスが dequeue したイベントを fold できないので、**`ExternallyAttached` として明示的に
+  型で表す**。観測可能な共有状態を持っているかのように装わない
+
+現行コードは attach と detach の結果を別々に得ているので、この typed outcome は実装可能。
+
+## 10.3 AltGr (§9.4 を上書き)
+
+第 4 版は provenance と書きながら**その producer を定義していなかった**。無損失なフラグは無いと
+認めた直後に「AltGr sequence は識別できる」と仮定していた。
+
+**確定 (Codex 推奨の決定的方針)**: **`LCtrl + RAlt` の重なりをすべて `PossibleAltGr` と分類し、
+通常の chord 照合を抑止する。** 意図的な LCtrl+RAlt は犠牲になるが、**timing heuristic を使わず、
+AltGr を Alt-only へ変換することも決してない**。
+
+## 10.4 ポインタの分類 (§9.5 を上書き)
+
+**「クリック / ドラッグ = `Current`」は誤りだった。** StickyKeys の latch は**マウスのボタン
+クリックでも消費される** (Microsoft の仕様)。よってボタンは <kbd>BS</kbd> と同型で、
+`Current` で読むと壊れる。
+
+ホイールは latch を消費しないが、**1 フレームに修飾キーの異なる複数のホイールパケットが届き得る**
+ので、集約後の `i.modifiers` と組み合わせると曖昧になる。
+
+**確定した分類**:
+
+| 対象 | 分類 |
+| --- | --- |
+| キー、**ホイールパケット**、**ボタン押下 / 解放 / クリック** | **`Delivery`** (event-time) |
+| ホールド、ホバー / 移動、「押している間」と明示された挙動 | `Current` |
+| **ドラッグ** | **両方**。ボタン押下時の修飾キーを gesture 選択に、ドラッグ中に意図的に変える修飾キーは `Current` |
+
+**新しい sidecar は不要**。egui の `Event::MouseWheel` は既に修飾キーを持ち、presenter も
+`wParam` から刻んでいる ([native_window.rs:2127](../../src/video/native_window.rs:2127))。
+現在の消費側が `raw_scroll_delta` の集約と frame 時点の `i.modifiers` を組み合わせて
+**その情報を捨てている**だけである ([app.rs:35961](../../src/app.rs:35961),
+[ui_fullscreen.rs:22007](../../src/ui_fullscreen.rs:22007))。grid のクリック選択も同様に
+egui の click 報告後に現在の修飾キーを読んでいる ([ui_main.rs:12795](../../src/ui_main.rs:12795))。
+一方、vector 編集中の修飾キーは**本当に per-frame の挙動**なので `Current` のままでよい
+([ui_erase.rs:1466](../../src/ui_erase.rs:1466))。
+
+## 10.5 不変条件の追補 (§9.6 を上書き)
+
+§9.6 の「pointer は `Current` なので FIFO fold の対象外」を撤回する。**ホイールパケットとボタン
+イベントは `Delivery` なので、キーと同じく epoch の FIFO fold に従う。** ホバー / 移動と
+ドラッグ中の変更のみ `Current`。
+
+加えて `Acquiring` 位相の不変条件:
+
+- `Acquiring` 中に dequeue された key / wheel packet / button event の chord 判定は `Indeterminate`
+- `Indeterminate` は action を発火させず、**perf event に必ず出す**
+- drain 完了時、曖昧 batch の fold は捨てられ、acquisition 時点の物理状態が新 epoch の seed になる
+- キューが空にならない限り `Acquiring` を抜けない (時間で抜けない)
