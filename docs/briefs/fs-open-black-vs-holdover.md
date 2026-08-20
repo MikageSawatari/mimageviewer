@@ -71,3 +71,67 @@
 - B: 500ms 超で中央表示が出る (既存テストが担保)。
 - A と B の中央表示が**同時に出ない**。
 - 分類が `previous.is_none()` から導かれていること (新しいフラグを参照していない)。
+
+---
+
+# 第 1 段階の結果 (2026-08-20) — **仮説は否決。実装は見送り**
+
+経路を列挙・分類した結果、**§1 の「`previous.is_none()` で A / B を導く」は成立しない。**
+
+## なぜ成立しないか
+
+`FsNavigationSequence::previous` が表すのは「**直前の egui 表示単位を `TextureHandle` として
+捕捉できたか**」であって、**表示先が空かどうかではない**。
+
+1. **A の production 経路のほとんどに navigation sequence が無い。**共通の
+   [open_fullscreen](../../src/app.rs:43378) は sequence を作らない。
+   名前に反して [open_fullscreen_from_fs_navigation](../../src/ui_fullscreen.rs:23039) も作らない。
+   sequence を作る入口は実質 `begin_fs_folder_navigation_sequence` と
+   `begin_fs_page_navigation_sequence` の 2 つだけ。
+2. **B の多くにも sequence が無い。**Home/End・大ジャンプ・シークバー、スタックの Shift+↑↓、
+   ブックマークジャンプ、連結読みのシーク / 再アンカー、スライドショー、native 動画・音声の
+   前後移動、passive snapshot のクリック復帰、remote 解放後の復元、削除後の詰め、
+   同一ページの補正 / AI reload — いずれも sequence を通らない。
+3. **sequence がある B でも `previous` は `None` になり得る。**capture の成否なので、
+   native presenter (egui texture ではない) や捕捉可能な rendition が無い場合に落ちる。
+4. `begin_fs_page_navigation_sequence` は連結読みと native media target では
+   **意図的に sequence を作らず成功扱いで戻る**。
+
+## 決定的な反例
+
+**グリッド由来で `from_explicit_open == true` なのに B** —
+linked detached の既存窓を更新する場合。`fs_open_intent_from_grid` も
+`DeferredFsReopen.from_explicit_open` も `previous.is_none()` も、**単独では A を意味しない**。
+
+## 正しい判定地点
+
+teardown 後の `open_fullscreen` ではなく、**表示先の surface / context を選ぶ routing 境界**。
+そこで `ViewerPresentation`、viewer session、detached runtime state、mounted bundle の
+`fullscreen_idx`、native presenter の owner を見る必要がある。
+
+**`previous` だけへ寄せる案は構造的でなく、sequence を持たない同値経路を再び取りこぼす。**
+Codex の判定: 「`previous.is_none()` だけを viewport 側へ足す実装は、
+[detached-rework-plan.md](../detached-rework-plan.md) §2 の意味で症状パッチになる」。
+
+## 分類の要約 (詳細は上記の調査記録)
+
+- **A (表示先が空)**: グリッドからの open 全般 (Enter / ダブルクリック / 再クリック / ゲームパッド)、
+  スタック集約セルからのフラット open、読書履歴 / ブックマーク / 検索結果 / ★固定からの open、
+  画像のみフォルダの自動 fullscreen、ZIP/PDF/変換アーカイブの自動 fullscreen (列挙 defer あり)、
+  起動引数 / SendTo / 二重起動 activation (新規表示先の場合)、always-new / 複数ウィンドウの新規窓、
+  新規 independent detached への移送、F12 で空の surface へ移す、F11 の embedded ↔ viewport 切替。
+- **B (表示先に中身がある)**: linked detached の既存窓更新、Parked linked の再利用、
+  通常のページ送り (sequence あり)、Home/End / 大ジャンプ / シークバー、スタック Shift+↑↓、
+  ブックマークジャンプ、連結読みのシーク、Ctrl+↑↓ のフォルダ移動 (`FolderItems` sequence あり)、
+  independent detached の Ctrl+↑↓ (legacy `FolderNavigation` holdover)、スライドショー各種、
+  native 動画・音声の前後 / EOF / swap、passive snapshot クリック、remote 解放後の復元、
+  外部 activation での更新、削除後の詰め、同一ページの補正 / AI reload。
+
+## 結論
+
+**規則そのもの (表示先に中身があるか) は正しい。導出元が間違っていた。**
+正しく実装するには routing 境界に typed な判定を置く必要があり、それは detached リワーク
+**R2 (状態の集約)** が所有する領域と重なる。**独立した作業として今やらず、バックログへ積む。**
+
+今日入れた中央の「読み込み中」により、**無反応に見える問題自体は解消済み**。
+残るのは「グリッドが見えたまま待つ (黒地にならない)」という見た目の差だけ。
