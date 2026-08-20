@@ -4886,6 +4886,46 @@ pub(super) fn page_parallelism(ui: &mut egui::Ui, state: &mut PreferencesState) 
             }
         });
     });
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
+
+    anchored(ui, state, "parallelism/pdf", |ui, state| {
+        let s = &mut state.settings;
+        ui.label(egui::RichText::new("PDF の同時処理数").strong());
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            ui.label("同時処理数:");
+            let mut count = settings::clamp_pdf_worker_count(s.pdf_worker_count) as u32;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut count)
+                        .range(settings::PDF_WORKER_COUNT_MIN..=settings::PDF_WORKER_COUNT_MAX)
+                        .suffix(" 個"),
+                )
+                .changed()
+            {
+                s.pdf_worker_count = count;
+            }
+        });
+
+        ui.add_space(6.0);
+        ui.label("増やすと、PDF を同時に描ける数が増えます。");
+        ui.label(
+            egui::RichText::new(
+                "数を 1 つ増やすごとに専用のプロセスが 1 つ増え、描く画像の大きさに応じたメモリを使います。",
+            )
+            .weak()
+            .size(11.0),
+        );
+        ui.label(
+            egui::RichText::new("※ 変更は次回起動から有効です。")
+                .weak()
+                .size(11.0),
+        );
+    });
 }
 
 pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {

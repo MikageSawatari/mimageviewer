@@ -29,7 +29,7 @@ use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 
 /// PDF レンダ要求の優先度 (3 段階)。
@@ -191,7 +191,7 @@ pub fn pool_queue_snapshot() -> Option<PoolQueueSnapshot> {
     ages_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let max = ages_ms.last().copied().unwrap_or(0.0);
     // Codex P3 対応: n が小さい (2-3) ときの p95 計算。
-    // worker 数 = POOL_SIZE (= 5) なので in-flight も最大 5。`(n * 0.95) as usize - 1` だと
+    // 設定範囲は最大 10 なので in-flight も 20 未満。`(n * 0.95) as usize - 1` だと
     // n=1: -1 で underflow / n=2: 0.9 → 0 で 1番目 / n=3: 1.85 → 1 で 2番目 で max が出ない。
     // 「上位 5% のうちの最大」= ceil(0.95 * n) - 1 番目 (= 最後尾 1 件残し)、n<20 は max 扱い。
     let p95 = if ages_ms.is_empty() {
@@ -1607,11 +1607,25 @@ struct JobQueue {
     /// 現在 IPC 実行中のワーカー数 (perf 用)
     workers_busy: usize,
     /// in-flight metadata: worker_id 別の IPC 開始時刻。`Some(t)` なら IPC 中。
-    /// `pool_queue_snapshot` の age 計算に使う。サイズは POOL_SIZE 固定 (out-of-order
-    /// completion 対応、Codex review R3 P2)。
+    /// `pool_queue_snapshot` の age 計算に使う。worker_id は起動失敗した枠を詰めないため、
+    /// 実際の起動数ではなく起動時に設定された数で確保する (out-of-order completion 対応)。
     in_flight_started_at: Vec<Option<std::time::Instant>>,
     /// Drop 時に true になり、ディスパッチャースレッドが cleanly 終了する
     shutdown: bool,
+}
+
+impl JobQueue {
+    fn new(configured_pool_size: usize) -> Self {
+        Self {
+            critical: std::collections::VecDeque::new(),
+            high_normal: std::collections::VecDeque::new(),
+            normal: std::collections::VecDeque::new(),
+            normal_in_flight: 0,
+            workers_busy: 0,
+            in_flight_started_at: vec![None; configured_pool_size],
+            shutdown: false,
+        }
+    }
 }
 
 struct PdfWorkerPool {
@@ -1626,27 +1640,28 @@ struct PdfWorkerPool {
     worker_children: Vec<Arc<Mutex<Option<Child>>>>,
 }
 
-/// PDFium worker child process count.
-///
-/// Critical reservation (`CRITICAL_RESERVATION_ACTIVE = true`) で 1 worker を Enter 用に
-/// 予約するので HighNormal は最大 `POOL_SIZE - 1 = 4` workers、Normal はさらに
-/// HighNormal 用の 1 worker を残して最大 `POOL_SIZE - 2 = 3` workers で消費する。
-///
-/// **5 を選んだ理由 (2026-05):**
-/// - 個別 PDF render が 4-5 秒/page (重い PDF で 20-45 秒) のことがあり、可視 16 枚を
-///   2 worker (旧 POOL_SIZE=3 構成) で捌くと all_ready が 20 秒超え。
-/// - 各 worker は別プロセスで PDFium DLL + state を独立保持 (~50-150 MB)。
-///   5 workers で合計 +400 MB 程度の RAM、Windows 11 / 8GB+ 機なら十分許容範囲。
-/// - PDFium は single-threaded per render なので worker 数 × CPU core 並列度が線形に効く。
-/// - 値変更は再起動が必要 (`in_flight_started_at` の固定長 vec / lane cap 計算が
-///   各所に焼き付いているため、動的変更は数百行の refactor になる)。
-///
-/// より小さく / より大きくしたい場合は const を直接書き換える (= リビルド必要)。
-const POOL_SIZE: usize = 5;
+/// PDFium worker child process count の既定値。
+const DEFAULT_POOL_SIZE: usize = crate::settings::PDF_WORKER_COUNT_DEFAULT as usize;
 /// Critical / HighNormal / Normal の各 lane に最低 1 枠を持てる正式サポート下限。
-const MIN_POOL_SIZE: usize = 3;
+const MIN_POOL_SIZE: usize = crate::settings::PDF_WORKER_COUNT_MIN as usize;
 /// 各 worker 枠の最大起動試行回数 (初回を含む)。時間窓ではなく回数で打ち切る。
 const WORKER_STARTUP_ATTEMPTS_PER_SLOT: usize = 3;
+
+/// 起動時に保存済み設定から 1 回だけ渡される pool size のスナップショット。
+///
+/// pool 自体は遅延初期化されるため、`PdfWorkerPool::start()` から Settings を読むと
+/// PDF を初めて開いた時期によって設定反映タイミングが変わってしまう。static へ起動時に
+/// 固定することで、変更は常に次回起動から有効になる。setter が呼ばれない bench 等は
+/// 既定値で動く。
+static CONFIGURED_POOL_SIZE: AtomicUsize = AtomicUsize::new(DEFAULT_POOL_SIZE);
+
+pub(crate) fn set_configured_pool_size(pool_size: usize) {
+    CONFIGURED_POOL_SIZE.store(pool_size, Ordering::Relaxed);
+}
+
+fn configured_pool_size() -> usize {
+    CONFIGURED_POOL_SIZE.load(Ordering::Relaxed)
+}
 
 type PdfWorkerPoolInit = Result<PdfWorkerPool, PdfWorkerPoolStartupFailure>;
 
@@ -1673,10 +1688,10 @@ struct PdfWorkerPoolStartupFailure {
 }
 
 impl PdfWorkerPoolStartupFailure {
-    fn new(ready_workers: usize, last_error: String) -> Self {
+    fn new(ready_workers: usize, requested_workers: usize, last_error: String) -> Self {
         Self {
             ready_workers,
-            requested_workers: POOL_SIZE,
+            requested_workers,
             minimum_workers: MIN_POOL_SIZE,
             last_error,
             logs_dir: crate::data_dir::logs_dir(),
@@ -1842,11 +1857,12 @@ where
 
 impl PdfWorkerPool {
     fn start() -> Result<Self, PdfWorkerPoolStartupFailure> {
+        let configured_pool_size = configured_pool_size();
         let exe_path =
             std::env::current_exe().unwrap_or_else(|_| PathBuf::from("mimageviewer.exe"));
         let data_dir = crate::data_dir::get();
         crate::logger::log(format!(
-            "pdf-pool: init begin exe={} data_dir={} requested_workers={POOL_SIZE}",
+            "pdf-pool: init begin exe={} data_dir={} requested_workers={configured_pool_size}",
             exe_path.display(),
             data_dir.display()
         ));
@@ -1871,7 +1887,7 @@ impl PdfWorkerPool {
         // 再試行し、成功済み child は pending_workers に保持する。
         let (_, startup) = attempt_worker_slots_after_prerequisite(
             dll_result,
-            POOL_SIZE,
+            configured_pool_size,
             WORKER_STARTUP_ATTEMPTS_PER_SLOT,
             |_, worker_id, attempt| match spawn_worker_process(
                 &exe_path,
@@ -1896,7 +1912,9 @@ impl PdfWorkerPool {
                 }
             },
         )
-        .map_err(|last_error| PdfWorkerPoolStartupFailure::new(0, last_error))?;
+        .map_err(|last_error| {
+            PdfWorkerPoolStartupFailure::new(0, configured_pool_size, last_error)
+        })?;
 
         let last_error = startup
             .failures
@@ -1924,23 +1942,19 @@ impl PdfWorkerPool {
                     "pdf-pool: terminated ready worker {worker_id} pid={pid} after underfilled startup ({status})"
                 ));
             }
-            return Err(PdfWorkerPoolStartupFailure::new(worker_count, last_error));
+            return Err(PdfWorkerPoolStartupFailure::new(
+                worker_count,
+                configured_pool_size,
+                last_error,
+            ));
         }
 
         crate::logger::log(format!(
-            "pdf-pool: startup complete ready={worker_count} requested={POOL_SIZE} minimum={MIN_POOL_SIZE}"
+            "pdf-pool: startup complete ready={worker_count} requested={configured_pool_size} minimum={MIN_POOL_SIZE}"
         ));
 
         let queue = Arc::new((
-            Mutex::new(JobQueue {
-                critical: std::collections::VecDeque::new(),
-                high_normal: std::collections::VecDeque::new(),
-                normal: std::collections::VecDeque::new(),
-                normal_in_flight: 0,
-                workers_busy: 0,
-                in_flight_started_at: vec![None; POOL_SIZE],
-                shutdown: false,
-            }),
+            Mutex::new(JobQueue::new(configured_pool_size)),
             Condvar::new(),
         ));
 
@@ -2493,7 +2507,8 @@ fn try_pop_dispatch_job(q: &mut JobQueue, caps: NonCriticalLaneCaps) -> Option<J
 /// Critical 予約中は HighNormal を `worker_count - 1`、Normal を `worker_count - 2`
 /// (どちらも最低 1) までに制限する。これにより Critical と HighNormal に各 1 枠を残す。
 ///
-/// `worker_count` は `PdfWorkerPool::start()` が受理した実 worker 数 (3〜POOL_SIZE)。
+/// `worker_count` は `PdfWorkerPool::start()` が受理した実 worker 数
+/// (3〜起動時に設定された数)。
 /// cap の最低 1 clamp は 1-2 worker を正式受理するためではなく、純関数を防御的に保つ。
 ///
 /// `shutdown` フラグが立つと、サブプロセスに shutdown メッセージを送って
@@ -3556,7 +3571,7 @@ pub fn enumerate_pages_async(pdf_path: &Path, password: Option<&str>) -> PdfEnum
     if let Err(e) = std::thread::Builder::new()
         .name("pdf-enumerate-nav".into())
         .spawn(move || {
-            // 初期化は初回だけ最大 5 worker の readiness 待ちを含むため、必ずこの
+            // 初期化は初回だけ設定数 (最大 10) の readiness 待ちを含むため、必ずこの
             // UI 外スレッドから開始する。
             let pool = get_pool();
             // Critical は epoch チェック対象外 (= 0 で send) + AbortOnCancel
@@ -3680,6 +3695,8 @@ fn fit_to_target(w: f32, h: f32, target: f32) -> (f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static CONFIGURED_POOL_SIZE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn pdf_worker_command_inherits_the_parent_data_directory() {
@@ -4237,6 +4254,24 @@ C:\isolated\miv-data"#
     }
 
     #[test]
+    fn configured_pool_size_drives_worker_id_slots_and_failure_request_count() {
+        let _guard = CONFIGURED_POOL_SIZE_TEST_LOCK.lock().unwrap();
+        let previous = configured_pool_size();
+        set_configured_pool_size(10);
+
+        let configured = configured_pool_size();
+        let queue = JobQueue::new(configured);
+        let failure = PdfWorkerPoolStartupFailure::new(0, configured, "test failure".to_string());
+        let slot_count = queue.in_flight_started_at.len();
+        let requested_workers = failure.requested_workers;
+
+        set_configured_pool_size(previous);
+
+        assert_eq!(slot_count, 10);
+        assert_eq!(requested_workers, 10);
+    }
+
+    #[test]
     fn dll_failure_skips_all_worker_attempts() {
         let mut calls = 0;
         let result: Result<((), WorkerSlotStartup<()>), String> =
@@ -4327,18 +4362,7 @@ C:\isolated\miv-data"#
     }
 
     fn empty_queue() -> Arc<(Mutex<JobQueue>, Condvar)> {
-        Arc::new((
-            Mutex::new(JobQueue {
-                critical: std::collections::VecDeque::new(),
-                high_normal: std::collections::VecDeque::new(),
-                normal: std::collections::VecDeque::new(),
-                normal_in_flight: 0,
-                workers_busy: 0,
-                in_flight_started_at: vec![None; POOL_SIZE],
-                shutdown: false,
-            }),
-            Condvar::new(),
-        ))
+        Arc::new((Mutex::new(JobQueue::new(DEFAULT_POOL_SIZE)), Condvar::new()))
     }
 
     #[test]
@@ -4416,7 +4440,7 @@ C:\isolated\miv-data"#
     }
 
     #[test]
-    fn supported_three_and_four_worker_pools_have_expected_lane_caps() {
+    fn supported_three_four_and_ten_worker_pools_have_expected_lane_caps() {
         assert_eq!(
             non_critical_lane_caps(3, true),
             NonCriticalLaneCaps {
@@ -4429,6 +4453,13 @@ C:\isolated\miv-data"#
             NonCriticalLaneCaps {
                 high_normal: 3,
                 normal: 2,
+            }
+        );
+        assert_eq!(
+            non_critical_lane_caps(10, true),
+            NonCriticalLaneCaps {
+                high_normal: 9,
+                normal: 8,
             }
         );
     }

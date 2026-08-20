@@ -10,8 +10,24 @@ pub const UI_SCALE_FACTOR_MAX: f32 = 2.0;
 pub const UI_SCALE_FACTOR_STEP: f32 = 0.1;
 pub const UI_SCALE_FACTOR_STEP_COUNT: usize = 16;
 
+pub const PDF_WORKER_COUNT_MIN: u32 = 3;
+pub const PDF_WORKER_COUNT_MAX: u32 = 10;
+pub const PDF_WORKER_COUNT_DEFAULT: u32 = 5;
+
 fn default_ui_scale_factor() -> f32 {
     1.0
+}
+
+fn default_pdf_worker_count() -> u32 {
+    PDF_WORKER_COUNT_DEFAULT
+}
+
+/// 保存値を PDF の同時処理数として正式に対応する範囲へ補正する。
+///
+/// 設定 DB の直接編集や破損で範囲外の値が入っても、プロセス数の決定境界では必ず
+/// この純関数を通し、PDF worker pool へ不正な値を渡さない。
+pub fn clamp_pdf_worker_count(value: u32) -> usize {
+    value.clamp(PDF_WORKER_COUNT_MIN, PDF_WORKER_COUNT_MAX) as usize
 }
 
 /// UI 表示倍率を設定 UI と同じ 50%..=200% / 10% 刻みに正規化する。
@@ -3357,6 +3373,9 @@ pub struct Settings {
     pub window_size: Option<[f32; 2]>,
     #[serde(default)]
     pub parallelism: Parallelism,
+    /// PDF worker pool のプロセス数。変更は次回起動時に反映される。
+    #[serde(default = "default_pdf_worker_count")]
+    pub pdf_worker_count: u32,
     /// フルサイズ表示時の後方先読み枚数（現在位置より前）
     #[serde(default = "default_prefetch_back")]
     pub prefetch_back: usize,
@@ -5293,6 +5312,7 @@ impl Default for Settings {
             window_pos: None,
             window_size: None,
             parallelism: Parallelism::default(),
+            pdf_worker_count: default_pdf_worker_count(),
             prefetch_back: default_prefetch_back(),
             prefetch_forward: default_prefetch_forward(),
             folder_skip_limit: default_folder_skip_limit(),
@@ -6886,6 +6906,7 @@ impl Settings {
         self.text_contrast = self.text_contrast.normalized();
         self.ui_scale_factor = normalize_ui_scale_factor(self.ui_scale_factor);
         self.ui_font.sanitize();
+        self.pdf_worker_count = clamp_pdf_worker_count(self.pdf_worker_count) as u32;
         self.grid_display_order.normalize();
         self.subfolder_expansion_filter_kinds.retain(|kind| {
             matches!(
@@ -7571,6 +7592,21 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pdf_worker_count_defaults_and_clamps_supported_range() {
+        assert_eq!(Settings::default().pdf_worker_count, 5);
+        assert_eq!(clamp_pdf_worker_count(0), 3);
+        assert_eq!(clamp_pdf_worker_count(2), 3);
+        assert_eq!(clamp_pdf_worker_count(3), 3);
+        assert_eq!(clamp_pdf_worker_count(5), 5);
+        assert_eq!(clamp_pdf_worker_count(10), 10);
+        assert_eq!(clamp_pdf_worker_count(11), 10);
+        assert_eq!(clamp_pdf_worker_count(u32::MAX), 10);
+
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(loaded.pdf_worker_count, 5);
+    }
 
     #[test]
     fn remote_video_streaming_defaults_and_enum_storage_are_stable() {

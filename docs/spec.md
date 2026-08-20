@@ -1728,6 +1728,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | 設定名 | 型 | デフォルト | 説明 |
 |--------|-----|---------|------|
 | `parallelism` | Parallelism | Auto | 並列読み込みスレッド数 |
+| `pdf_worker_count` | u32 | 5 | PDF worker pool のプロセス数。UI と起動時読み出しは 3〜10 に clamp する。pool は遅延初期化だが、起動時に static snapshot へ固定するため変更は常に次回起動から有効 |
 | `folder_skip_limit` | usize | 5 | Ctrl+↑↓ で空フォルダ・画像なし ZIP をスキップする上限（UI 上限 30）。PDF/変換アーカイブはコンテナ候補として停止対象 |
 | `show_hidden_files` | bool | false | Hidden 属性のファイル / フォルダをグリッド一覧とフォルダツリーペインに表示する。Hidden + System 属性の保護された OS ファイルは設定に関係なく常に非表示。非 Windows では先頭 `.` を Hidden 相当として扱う |
 | `video_volume` | f64 | 1.0 | 動画再生時の既定音量（線形ゲイン。UI は -∞dB〜+18dB の dB フェーダー）。1.0 超は手動 boost として safety limiter 前で適用 |

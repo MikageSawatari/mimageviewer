@@ -230,6 +230,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["自動", "スレッド", "CPU", "並列", "parallel"]
     ),
     entry!(
+        "parallelism/pdf",
+        Parallelism,
+        "PDF の同時処理数",
+        ["PDF", "同時", "プロセス", "メモリ", "次回起動"]
+    ),
+    entry!(
         "prefetch/full-image",
         Prefetch,
         "フルサイズ画像の先読み",

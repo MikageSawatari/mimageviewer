@@ -28,7 +28,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 │  非同期ワーカー層                                              │
 │   - サムネイルワーカー (通常/重 I/O の 2 系統)                 │
 │   - フルスクリーンロードスレッド (1 画像ごとに spawn)          │
-│   - PDF ワーカープロセス (--pdf-worker サブプロセス × 5)       │
+│   - PDF ワーカープロセス (--pdf-worker、設定 3〜10、既定 5)     │
 │   - Susie 32bit ワーカープロセス (mimageviewer-susie32.exe × N)│
 │   - TRT エンジンビルダー (--tensorrt-build サブプロセス、初回1回)│
 │   - TRT 推論ワーカー (--tensorrt-infer-worker サブプロセス × 1)│

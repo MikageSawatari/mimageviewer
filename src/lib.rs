@@ -1082,6 +1082,11 @@ pub fn run() -> eframe::Result {
         }
     }
 
+    // PDF pool は遅延初期化されるため、設定を pool 初期化時に読むと変更の反映時期が
+    // 「最初の PDF を既に開いたか」に依存してしまう。起動時の設定 snapshot をここで
+    // 1 回だけ固定し、環境設定での変更は常に次回起動から有効にする。
+    pdf_loader::set_configured_pool_size(settings::clamp_pdf_worker_count(saved.pdf_worker_count));
+
     // 設定 (開発者タブ) で性能ログが ON なら、ここで perf を有効化する。
     // `perf::init_with_path` の START / FILE は OnceLock なので、CLI の `--perf-log`
     // で既に有効化済みなら 2 回目の呼び出しは no-op。逆に CLI 未指定でこの設定だけ

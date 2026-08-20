@@ -114,10 +114,10 @@ scrollbar dragback を反映するため、それより前で settle 判定す�
 **Codex R1 P2 / R2 P2 / R3 P2 対応**:
 - `POOL.get()` で pool 未初期化なら **skip emit** (= 無 PDF のフォルダで pool 起動しない)
 - in_flight metadata: `JobQueue` に `in_flight_started_at: Vec<Option<Instant>>` を追加。
-  **`POOL_SIZE` (= 3、定数) サイズで `vec![None; POOL_SIZE]` で固定確保**。
+  **起動時に確定した設定数 (3〜10、既定 5) のサイズで `vec![None; configured_pool_size]` として確保**。
   `run_dispatcher` の worker_id を index に使う。`pending_workers.push((i, ...))` で
-  原本の loop index `i` を保持するので、worker 0 が spawn 失敗で worker 1, 2 だけ動いても
-  index は POOL_SIZE 内に収まる (= 安全)
+  原本の loop index `i` を保持するので、一部の spawn が失敗して worker_id に欠番が生じても
+  index は設定数の範囲内に収まる (= 安全)。実際に起動した数へ縮めてはならない
 - `run_dispatcher` で IPC 実行直前に `slot[worker_id] = Some(now)`、完了直後に `slot[worker_id] = None`
 - `in_flight_age_ms` (max/p95/p50) は Vec の `Some(t)` を集めて `Instant::now() - t` から計算
 

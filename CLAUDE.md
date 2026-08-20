@@ -103,7 +103,7 @@ dual-window approach.
 - **Video thumbnails**: Windows Shell API (IShellItemImageFactory)
 - **Video inline playback**: `ffmpeg-the-third` クレート + FFmpeg LGPL shared DLL (BtbN ビルド) + `cpal` (WASAPI Shared 音声出力)。フルスクリーンで動画を MP4 / MKV / MOV / AVI / WMV / MPG / MPEG / HEVC / AV1 として再生する。`avcodec / avformat / avutil / avfilter / swscale / swresample` の 6 DLL を launcher (`crates/launcher/`) が core / remote service とともに `include_bytes!` で内包し、初回起動時に `%APPDATA%/mimageviewer/runtime/<version>/` へ展開して本体 (`mimageviewer-core.exe`) を spawn する。本体側は exe と同じディレクトリの DLL を Windows ローダが解決するだけで個別ロード処理は持たない。ビルドに libclang (LLVM/Clang) が必要。詳細は「FFmpeg LGPL DLL 管理」節を参照
 - **ZIP support**: `zip` crate
-- **PDF support**: `pdfium-render` crate + PDFium DLL (exe に埋め込み) + マルチプロセスワーカープール (5 プロセス並列レンダリング、1 つを Critical 予約)
+- **PDF support**: `pdfium-render` crate + PDFium DLL (exe に埋め込み) + マルチプロセスワーカープール (設定 3〜10、既定 5、1 つを Critical 予約)
 - **PDF password**: `windows-dpapi` crate (DPAPI 暗号化でパスワード永続保存)
 - **AI upscaling**: `ort` crate (ONNX Runtime v2、`load-dynamic` モード、`directml` + `cuda` + `tensorrt` features)。Real-ESRGAN / Real-CUGAN / NMKD-Siax ONNX モデルでタイル分割 4x アップスケール。バックエンドは Settings の `ai_backend` で DirectML / TensorRT を切替 (TRT は NVIDIA 専用)
 - **ONNX Runtime DLL**: `onnxruntime.dll` / `onnxruntime_providers_shared.dll` (Microsoft.ML.OnnxRuntime.DirectML NuGet v1.24.2) を exe に `include_bytes!` で埋め込み、初回 AiRuntime 作成時に `%APPDATA%/mimageviewer/` に展開。`ort::init_from()` で動的ロードする。これにより VC++ 再頒布可能パッケージ不要
@@ -772,9 +772,11 @@ DLL は exe に `include_bytes!` で埋め込まれ、初回起動時に
 ### マルチプロセス並列レンダリング
 
 PDFium はスレッドセーフではないため、マルチプロセスで並列化している。
-`mimageviewer.exe --pdf-worker` で起動したワーカープロセス (デフォルト 3 個) が
+`mimageviewer.exe --pdf-worker` で起動したワーカープロセス (設定 3〜10、既定 5) が
 各自独立に PDFium を初期化し、stdin/stdout バイナリプロトコルでメインプロセスと通信する。
 ワーカーは GUI を持たず、メインプロセス終了時に自動終了する。
+設定値は App 起動時に static snapshot へ 1 回だけ固定し、pool の遅延初期化時には
+`Settings` を読み直さない。このため変更は、最初に PDF を開いた時期にかかわらず次回起動から有効。
 
 ### セットアップ
 

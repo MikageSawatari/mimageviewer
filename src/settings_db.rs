@@ -3408,6 +3408,18 @@ mod tests {
     }
 
     #[test]
+    fn pdf_worker_count_roundtrips_through_settings_db() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut original = Settings::default();
+        original.pdf_worker_count = 10;
+
+        db.save_full(&original).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+
+        assert_eq!(loaded.pdf_worker_count, 10);
+    }
+
+    #[test]
     fn remote_listing_settings_overlay_reads_every_live_field_only() {
         use crate::settings::{
             ArchiveFileHandling, GridDisplayOrder, GridItemDisplayKind, SortOrder, ThumbAspect,
