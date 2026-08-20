@@ -32266,6 +32266,7 @@ impl App {
             self.ensure_ai_runtime();
             let runtime = self.ai_runtime.clone();
             let manager = Arc::clone(&self.ai_model_manager);
+            let mono_tolerance = self.settings.erase_inpaint_mono_tolerance;
             let run: crate::books::BookEraseRunner =
                 Box::new(move |base, bitmap, shapes, cancel| {
                     let result = crate::ui_erase::erase_from_saved_mask(
@@ -32274,6 +32275,7 @@ impl App {
                         base,
                         bitmap,
                         shapes,
+                        mono_tolerance,
                         cancel,
                         "book-composite",
                     )?;

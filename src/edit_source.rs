@@ -21,6 +21,7 @@ pub(crate) struct EraseMaterialize {
     pub(crate) mask: MaskSnapshot,
     pub(crate) runtime: Option<Arc<crate::ai::runtime::AiRuntime>>,
     pub(crate) manager: Arc<crate::ai::model_manager::ModelManager>,
+    pub(crate) mono_tolerance: u8,
     pub(crate) log_prefix: String,
 }
 
@@ -162,6 +163,7 @@ pub(crate) fn run_inpaint_pure(
     composite: &[bool],
     w: usize,
     h: usize,
+    mono_tone_axis: Option<crate::colorize::MonoToneAxis>,
     cancel: &Arc<AtomicBool>,
     log_prefix: &str,
     progress_tx: Option<&std::sync::mpsc::Sender<crate::ui_erase::EraseInpaintProgress>>,
@@ -193,6 +195,7 @@ pub(crate) fn run_inpaint_pure(
                     composite,
                     w,
                     h,
+                    mono_tone_axis,
                     cancel,
                     progress_tx,
                 ) {
@@ -235,6 +238,7 @@ pub(crate) fn materialize_erase(
         source,
         &mask.bitmap,
         &mask.shapes,
+        edit.mono_tolerance,
         cancel,
         &edit.log_prefix,
     )

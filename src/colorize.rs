@@ -237,17 +237,25 @@ fn required_mono_inliers(sample_count: usize) -> usize {
     required
 }
 
-/// 黄ばみ・青みなど一方向の紙色を許容する近モノクロ判定の要約値。
+/// 画像内の RGB がほぼ 1 本の色の線に並ぶかを表す要約。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MonoToneAxis {
+    pub mean: [f32; 3],
+    pub axis: [f32; 3],
+    pub p95_residual: f32,
+}
+
+/// 黄ばみ・青みなど一方向の紙色を許容する近モノクロ判定の要約値と色の軸を求める。
 ///
 /// サンプル RGB の主成分軸を power iteration で求め、軸からの直交残差を
 /// 小さい順に並べたとき、従来の「内点が 95% 以上」と同じ最小内点数に対応する
 /// 残差を返す。平均・共分散・主成分軸は許容値に依存しないため、この値は
-/// `mono_tolerance` が変わっても再利用できる。判定不能な極小サンプルや
-/// ほぼ単色な画像は、従来の早期 `true` と等価な `0.0` を返す。
-pub fn near_monochrome_p95_residual(src: &ColorImage) -> f32 {
+/// `mono_tolerance` が変わっても再利用できる。判定不能な極小サンプル、
+/// ほぼ単色な画像、主成分軸が縮退した画像では `None` を返す。
+pub fn mono_tone_axis(src: &ColorImage) -> Option<MonoToneAxis> {
     let total = src.pixels.len();
     if total == 0 {
-        return 0.0;
+        return None;
     }
     let stride = total.div_ceil(MONO_SAMPLE_LIMIT).max(1);
     let samples: Vec<[f32; 3]> = src
@@ -259,7 +267,7 @@ pub fn near_monochrome_p95_residual(src: &ColorImage) -> f32 {
         .map(|pixel| [pixel.r() as f32, pixel.g() as f32, pixel.b() as f32])
         .collect();
     if samples.len() < 8 {
-        return 0.0;
+        return None;
     }
 
     let inv_n = 1.0 / samples.len() as f32;
@@ -286,7 +294,7 @@ pub fn near_monochrome_p95_residual(src: &ColorImage) -> f32 {
 
     let total_variance = covariance[0][0] + covariance[1][1] + covariance[2][2];
     if total_variance <= 1.0 {
-        return 0.0;
+        return None;
     }
     let mut axis = [0.577_350_26_f32; 3];
     for _ in 0..12 {
@@ -297,7 +305,7 @@ pub fn near_monochrome_p95_residual(src: &ColorImage) -> f32 {
         ];
         let length = (next[0] * next[0] + next[1] * next[1] + next[2] * next[2]).sqrt();
         if length <= 1e-5 {
-            return 0.0;
+            return None;
         }
         axis = [next[0] / length, next[1] / length, next[2] / length];
     }
@@ -318,7 +326,20 @@ pub fn near_monochrome_p95_residual(src: &ColorImage) -> f32 {
         .collect::<Vec<_>>();
     let percentile_index = required_mono_inliers(residuals.len()) - 1;
     let (_, p95, _) = residuals.select_nth_unstable_by(percentile_index, |a, b| a.total_cmp(b));
-    *p95
+    Some(MonoToneAxis {
+        mean,
+        axis,
+        p95_residual: *p95,
+    })
+}
+
+/// 許容値に依存しない近モノクロ判定の要約値。
+///
+/// 軸を求められない画像は、従来の早期 `true` と等価な `0.0` を返す。
+pub fn near_monochrome_p95_residual(src: &ColorImage) -> f32 {
+    mono_tone_axis(src)
+        .map(|summary| summary.p95_residual)
+        .unwrap_or(0.0)
 }
 
 /// 許容値に依存しない近モノクロ要約値を、現在の UI 設定と比較する。
@@ -1110,6 +1131,32 @@ mod tests {
             _ => Color32::YELLOW,
         });
         assert!(!is_near_monochrome(&colored, 12));
+    }
+
+    #[test]
+    fn mono_tone_axis_returns_mean_axis_and_same_residual_summary() {
+        let source = image(64, 64, |x, y| {
+            let v = ((x * 3 + y * 2) % 180) as u8;
+            Color32::from_rgb(v, v.saturating_add(20), v.saturating_add(35))
+        });
+
+        let summary = mono_tone_axis(&source).expect("tinted grayscale has a stable color axis");
+        assert_eq!(summary.p95_residual, near_monochrome_p95_residual(&source));
+        assert!(summary.axis.iter().all(|component| component.is_finite()));
+        assert!(summary.mean.iter().all(|component| component.is_finite()));
+    }
+
+    #[test]
+    fn mono_tone_axis_is_none_when_the_axis_cannot_be_estimated() {
+        let tiny = image(2, 2, |x, y| {
+            Color32::from_rgb((x * 127) as u8, (y * 127) as u8, 80)
+        });
+        let uniform = ColorImage::filled([64, 64], Color32::from_rgb(210, 190, 150));
+
+        assert_eq!(mono_tone_axis(&tiny), None);
+        assert_eq!(mono_tone_axis(&uniform), None);
+        assert_eq!(near_monochrome_p95_residual(&tiny), 0.0);
+        assert_eq!(near_monochrome_p95_residual(&uniform), 0.0);
     }
 
     #[test]

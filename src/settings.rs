@@ -4139,6 +4139,10 @@ pub struct Settings {
     #[serde(default)]
     pub ai_backend: Option<String>,
 
+    /// 消しゴム MI-GAN 補完を元画像の色調へ合わせる近モノクロ判定の許容値。
+    #[serde(default = "default_erase_inpaint_mono_tolerance")]
+    pub erase_inpaint_mono_tolerance: u8,
+
     // 注: ai_tensorrt_fp16 フィールドは廃止。FP16 はランタイム側で常時 ON
     // (画質劣化は知覚不能、1.5-2x 高速化のメリットが大きい)。古い settings.json に
     // 残っているフィールドは serde の default で無視される。
@@ -5082,6 +5086,9 @@ fn default_ai_upscale_skip_px() -> u32 {
 fn default_ai_denoise_skip_px() -> u32 {
     2048
 }
+pub(crate) const fn default_erase_inpaint_mono_tolerance() -> u8 {
+    12
+}
 pub fn default_exif_hidden_tags() -> Vec<String> {
     [
         // バイナリ / 巨大データ
@@ -5509,6 +5516,7 @@ impl Default for Settings {
             ai_upscale_size_limit: None,
             ai_denoise_size_limit: None,
             ai_backend: None,
+            erase_inpaint_mono_tolerance: default_erase_inpaint_mono_tolerance(),
             global_preset: crate::adjustment::AdjustParams::default(),
             preset_slots: crate::adjustment::PresetSlots::default(),
             post_filter_global_preset_stash: PostFilterDowngradeStash::default(),
@@ -6931,6 +6939,7 @@ impl Settings {
         // 事実上機能しなくなる。上限を超える値は ZIP 中身検査込みの DFS が
         // 長時間走り UI 非応答を招くので、両側クランプする。
         self.folder_skip_limit = self.folder_skip_limit.clamp(1, 30);
+        self.erase_inpaint_mono_tolerance = self.erase_inpaint_mono_tolerance.clamp(1, 64);
         if self.video_autoplay_mode == VideoAutoplayMode::OnlyFromGrid {
             self.video_autoplay = false;
             self.video_autoplay_mode = VideoAutoplayMode::Off;
@@ -9984,6 +9993,10 @@ mod tests {
         assert_eq!(loaded.video_volume, VIDEO_VOLUME_DEFAULT);
         assert_eq!(loaded.video_playback_speed, 1.0);
         assert_eq!(
+            loaded.erase_inpaint_mono_tolerance,
+            default_erase_inpaint_mono_tolerance()
+        );
+        assert_eq!(
             loaded.downscale_smoothing_percent,
             DOWNSCALE_SMOOTHING_PERCENT_MIN
         );
@@ -10258,6 +10271,18 @@ mod tests {
         s.folder_skip_limit = 999;
         s.sanitize();
         assert_eq!(s.folder_skip_limit, 30);
+    }
+
+    #[test]
+    fn sanitize_clamps_erase_inpaint_mono_tolerance() {
+        let mut settings = Settings::default();
+        settings.erase_inpaint_mono_tolerance = 0;
+        settings.sanitize();
+        assert_eq!(settings.erase_inpaint_mono_tolerance, 1);
+
+        settings.erase_inpaint_mono_tolerance = u8::MAX;
+        settings.sanitize();
+        assert_eq!(settings.erase_inpaint_mono_tolerance, 64);
     }
 
     #[test]

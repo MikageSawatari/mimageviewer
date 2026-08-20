@@ -5198,6 +5198,24 @@ pub(super) fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
     );
     ui.add_space(8.0);
 
+    ui.separator();
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("消しゴム AI 補完").strong());
+    ui.add_space(4.0);
+    anchored(ui, state, "ai-backend/erase-tone-tolerance", |ui, state| {
+        ui.label("補完の色調を画像に合わせる許容値");
+        ui.add(
+            egui::Slider::new(&mut state.settings.erase_inpaint_mono_tolerance, 1..=64)
+                .show_value(true),
+        )
+        .on_hover_text(
+            "画像の色が 1 本の線に乗っているとみなす許容量です。値を上げるほど、色味の散った画像でも補完結果を画像の色調に合わせます。",
+        );
+    });
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(8.0);
+
     // 検出 GPU の表示
     let vendor_label = match state.gpu_vendor {
         Some(GpuVendor::Nvidia) => "NVIDIA (TensorRT 利用可能)",

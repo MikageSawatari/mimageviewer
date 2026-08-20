@@ -3047,6 +3047,8 @@ impl App {
         let (progress_tx, progress_rx) = mpsc::channel::<EraseInpaintProgress>();
         let ctx_clone = ctx.clone();
         let local_ai_activity = self.local_ai_activity_lease();
+        let mono_tone_axis =
+            inpaint_mono_tone_axis(&original, self.settings.erase_inpaint_mono_tolerance);
 
         let spawn_result = std::thread::Builder::new()
             .name("erase-inpaint".to_string())
@@ -3059,6 +3061,7 @@ impl App {
                     &composite,
                     w,
                     h,
+                    mono_tone_axis,
                     &cancel_for_thread,
                     log_prefix,
                     Some(&progress_tx),
@@ -3356,6 +3359,7 @@ pub(crate) fn erase_from_saved_mask(
     base: &egui::ColorImage,
     bitmap: &[bool],
     shapes: &[crate::mask_db::Shape],
+    mono_tolerance: u8,
     cancel: &Arc<AtomicBool>,
     log_prefix: &str,
 ) -> Result<InpaintOutcome, String> {
@@ -3377,8 +3381,18 @@ pub(crate) fn erase_from_saved_mask(
     }
     let flattened = black_flatten_if_transparent(base);
     let input = flattened.as_ref().unwrap_or(base);
+    let mono_tone_axis = inpaint_mono_tone_axis(input, mono_tolerance);
     Ok(crate::edit_source::run_inpaint_pure(
-        runtime, manager, input, &composite, w, h, cancel, log_prefix, None,
+        runtime,
+        manager,
+        input,
+        &composite,
+        w,
+        h,
+        mono_tone_axis,
+        cancel,
+        log_prefix,
+        None,
     ))
 }
 
@@ -3393,6 +3407,46 @@ const INPAINT_STAGE_DEPTH: u32 = 48;
 /// マスク周囲から MI-GAN 入力へ含める既知画素の目安。
 const INPAINT_CONTEXT_PAD: usize = MIGAN_SIZE / 4;
 
+pub(crate) fn inpaint_mono_tone_axis(
+    original: &egui::ColorImage,
+    tolerance: u8,
+) -> Option<crate::colorize::MonoToneAxis> {
+    crate::colorize::mono_tone_axis(original).filter(|summary| {
+        crate::colorize::is_near_monochrome_residual(summary.p95_residual, tolerance)
+    })
+}
+
+fn match_migan_rgb_to_tone(rgb: [f32; 3], tone: crate::colorize::MonoToneAxis) -> [f32; 3] {
+    const REC709: [f32; 3] = [0.2126, 0.7152, 0.0722];
+
+    let mut axis = tone.axis;
+    let mut axis_luma = axis[0] * REC709[0] + axis[1] * REC709[1] + axis[2] * REC709[2];
+    if axis_luma.abs() <= 1e-6 {
+        return rgb;
+    }
+    if axis_luma < 0.0 {
+        axis = [-axis[0], -axis[1], -axis[2]];
+        axis_luma = -axis_luma;
+    }
+
+    let target_luma = rgb[0] * REC709[0] + rgb[1] * REC709[1] + rgb[2] * REC709[2];
+    let mean_luma = tone.mean[0] * REC709[0] + tone.mean[1] * REC709[1] + tone.mean[2] * REC709[2];
+    let t = (target_luma - mean_luma) / axis_luma;
+    [
+        (tone.mean[0] + axis[0] * t).clamp(0.0, 255.0),
+        (tone.mean[1] + axis[1] * t).clamp(0.0, 255.0),
+        (tone.mean[2] + axis[2] * t).clamp(0.0, 255.0),
+    ]
+}
+
+fn match_migan_rgb_to_tone_if_needed(
+    rgb: [f32; 3],
+    tone: Option<crate::colorize::MonoToneAxis>,
+) -> [f32; 3] {
+    tone.map(|tone| match_migan_rgb_to_tone(rgb, tone))
+        .unwrap_or(rgb)
+}
+
 /// MI-GAN による段階的タイル inpainting。
 ///
 /// 実在する既知画素に近い領域から 48px ずつ内側へ確定する。各段では
@@ -3404,6 +3458,7 @@ pub(crate) fn inpaint_migan(
     mask: &[bool],
     w: usize,
     h: usize,
+    mono_tone_axis: Option<crate::colorize::MonoToneAxis>,
     cancel: &Arc<std::sync::atomic::AtomicBool>,
     progress_tx: Option<&mpsc::Sender<EraseInpaintProgress>>,
 ) -> Result<egui::ColorImage, crate::ai::AiError> {
@@ -3453,6 +3508,7 @@ pub(crate) fn inpaint_migan(
             &commit,
             w,
             h,
+            mono_tone_axis,
             cancel,
             pass_index + 1,
             pass_count,
@@ -3477,6 +3533,7 @@ pub(crate) fn inpaint_migan(
             &remaining,
             w,
             h,
+            mono_tone_axis,
             cancel,
             finite_passes + 1,
             finite_passes + 1,
@@ -3496,6 +3553,7 @@ fn inpaint_migan_single_pass(
     commit_mask: &[bool],
     w: usize,
     h: usize,
+    mono_tone_axis: Option<crate::colorize::MonoToneAxis>,
     cancel: &Arc<std::sync::atomic::AtomicBool>,
     pass_index: usize,
     pass_count: usize,
@@ -3714,9 +3772,11 @@ fn inpaint_migan_single_pass(
             if wt <= f32::EPSILON {
                 continue;
             }
-            let r = (accum_r[ri] / wt).clamp(0.0, 255.0) as u8;
-            let g = (accum_g[ri] / wt).clamp(0.0, 255.0) as u8;
-            let b = (accum_b[ri] / wt).clamp(0.0, 255.0) as u8;
+            let inferred = [accum_r[ri] / wt, accum_g[ri] / wt, accum_b[ri] / wt];
+            let [r, g, b] = match_migan_rgb_to_tone_if_needed(inferred, mono_tone_axis);
+            let r = r.clamp(0.0, 255.0) as u8;
+            let g = g.clamp(0.0, 255.0) as u8;
+            let b = b.clamp(0.0, 255.0) as u8;
             // 元画素の alpha を保持する。from_rgb は alpha=255 固定なので、透過 PNG の
             // マスク域が不透明化し diffusion fallback (alpha 保持) と非一貫になる
             // (v1.0.0 安定性レビュー P3-8)。MI-GAN は RGB 出力なので alpha は元画像由来。
@@ -4292,6 +4352,89 @@ mod book_erase_tests {
         assert_eq!(input[[0, 1, 0, 0]], 0.0);
     }
 
+    fn rec709_luma(rgb: [f32; 3]) -> f32 {
+        rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722
+    }
+
+    fn tone_source(pixel: impl Fn(usize) -> egui::Color32) -> egui::ColorImage {
+        egui::ColorImage::new([256, 1], (0..256).map(pixel).collect())
+    }
+
+    #[test]
+    fn gray_source_removes_inference_color_without_changing_luma() {
+        let source = tone_source(|index| egui::Color32::from_gray(index as u8));
+        let tone = inpaint_mono_tone_axis(&source, 12).expect("grayscale has a stable tone axis");
+        let inferred = [220.0, 45.0, 150.0];
+
+        let matched = match_migan_rgb_to_tone_if_needed(inferred, Some(tone));
+        assert!((matched[0] - matched[1]).abs() < 1e-3);
+        assert!((matched[1] - matched[2]).abs() < 1e-3);
+        assert!((rec709_luma(matched) - rec709_luma(inferred)).abs() < 1e-3);
+        let channels = matched.map(|channel| channel as u8);
+        assert_eq!(channels[0], channels[1]);
+        assert_eq!(channels[1], channels[2]);
+    }
+
+    #[test]
+    fn sepia_source_keeps_inference_luma_on_the_source_tone_line() {
+        let source = tone_source(|index| {
+            let v = index.min(220) as f32;
+            egui::Color32::from_rgb(v as u8, (v * 0.82) as u8, (v * 0.58) as u8)
+        });
+        let tone = inpaint_mono_tone_axis(&source, 12).expect("sepia ramp has a stable tone axis");
+        let inferred = [210.0, 55.0, 135.0];
+
+        let matched = match_migan_rgb_to_tone_if_needed(inferred, Some(tone));
+        assert!((rec709_luma(matched) - rec709_luma(inferred)).abs() < 1e-3);
+        let d = [
+            matched[0] - tone.mean[0],
+            matched[1] - tone.mean[1],
+            matched[2] - tone.mean[2],
+        ];
+        let projection = d[0] * tone.axis[0] + d[1] * tone.axis[1] + d[2] * tone.axis[2];
+        let residual_sq =
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] - projection * projection).max(0.0);
+        assert!(residual_sq.sqrt() < 0.05);
+    }
+
+    #[test]
+    fn colorful_source_leaves_inference_color_unchanged() {
+        let source = egui::ColorImage::new(
+            [64, 64],
+            (0..64 * 64)
+                .map(|index| match (index / 16 + index % 64 / 16) % 4 {
+                    0 => egui::Color32::RED,
+                    1 => egui::Color32::GREEN,
+                    2 => egui::Color32::BLUE,
+                    _ => egui::Color32::YELLOW,
+                })
+                .collect(),
+        );
+        let inferred = [220.0, 45.0, 150.0];
+        let tone = inpaint_mono_tone_axis(&source, 12);
+
+        assert!(tone.is_none());
+        assert_eq!(match_migan_rgb_to_tone_if_needed(inferred, tone), inferred);
+    }
+
+    #[test]
+    fn tiny_source_without_axis_leaves_inference_color_unchanged() {
+        let source = egui::ColorImage::new(
+            [2, 2],
+            vec![
+                egui::Color32::RED,
+                egui::Color32::GREEN,
+                egui::Color32::BLUE,
+                egui::Color32::WHITE,
+            ],
+        );
+        let inferred = [220.0, 45.0, 150.0];
+        let tone = inpaint_mono_tone_axis(&source, 64);
+
+        assert!(tone.is_none());
+        assert_eq!(match_migan_rgb_to_tone_if_needed(inferred, tone), inferred);
+    }
+
     #[test]
     fn saved_mask_without_runtime_uses_deterministic_diffusion_fallback() {
         let base = egui::ColorImage::new(
@@ -4311,6 +4454,7 @@ mod book_erase_tests {
             &base,
             &[false, true, false],
             &[],
+            crate::settings::default_erase_inpaint_mono_tolerance(),
             &cancel,
             "book-test",
         )
