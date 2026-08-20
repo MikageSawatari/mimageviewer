@@ -481,3 +481,107 @@ egui の click 報告後に現在の修飾キーを読んでいる ([ui_main.rs:
 - `Indeterminate` は action を発火させず、**perf event に必ず出す**
 - drain 完了時、曖昧 batch の fold は捨てられ、acquisition 時点の物理状態が新 epoch の seed になる
 - キューが空にならない限り `Acquiring` を抜けない (時間で抜けない)
+
+---
+
+# 第 6 版 — 残る 4 ゲートを閉じる (§10.1 / §10.2 / §10.4 を上書き、S0 の型を確定)
+
+## 11.1 reseed の時点 — **acquisition 時ではなく drain 完了時** (§10.1 を修正)
+
+第 5 版の「acquisition 時点の物理状態から seed する」は**誤り**。反例:
+
+1. acquisition のサンプルが `Ctrl=false`
+2. 曖昧な drain の途中で `CtrlDown` が dequeue され、**捨てられる**
+3. drain が空になった時点で **Ctrl は物理的に押されたまま**
+4. acquisition 時のサンプルで seed すると、新 epoch は `Ctrl=false` で始まる ← 誤り
+
+**確定: seed は drain 完了時にサンプルする。** `GetAsyncKeyState` は「呼んだ時点」の状態を返すので、
+そこで必要な事実がそのまま取れる。acquisition 時のサンプルは**診断データとしてのみ残し、
+安定 epoch の seed には使わない**。
+
+## 11.2 drain 完了の producer (§10.1 を補完)
+
+**presenter 側**: 1 回の dequeue = 成功した `PeekMessageW(..., PM_REMOVE)`。
+**drain 完了 = 次に `PeekMessageW` が false を返した時点**であり、`DispatchMessageW` までの
+span ではない ([native_window.rs:1235](../../src/video/native_window.rs:1235))。
+
+**UI 側**: `WH_GETMESSAGE` は**取得に成功したメッセージごとにしか呼ばれない**。
+空振りの probe では呼ばれないので、**この hook だけでは `DrainComplete` を publish できない**
+([lib.rs:571](../../src/lib.rs:571))。hook は dequeue producer 専用である。
+
+**確定した完了 producer**: eframe の外側イベントループにある `about_to_wait`
+([vendor/eframe/src/native/run.rs:1261](../../vendor/eframe/src/native/run.rs:1261))。
+message dispatch の callback の外側に既に存在しており、「このスレッドのキューが空になった」
+という事実を表す唯一の地点。
+
+## 11.3 attach span も fail-closed にする (§10.2 を上書き)
+
+第 5 版の `ExternallyAttached` は**権限の喪失を名付けただけで、動作上の意味を定義していなかった**。
+さらに「post-attach seed」「split して reseed」は、**新しい fence を迂回していた** —
+`AttachThreadInput` がキー状態を reset した時点で、既にキューに入っている古いメッセージがあり得る。
+
+**確定 (attach span 全体を fail-closed にする)**:
+
+- **attach されている間、アプリの chord 判定はすべて `Indeterminate`**
+- **detach 失敗**: `ExternallyAttached` のまま。**split した epoch を publish しない**
+- **detach 成功**: 各ローカルキューを **`Acquiring` へ送る**。**即座に reseed しない**
+- 各キューは**自分の drain 完了シグナルと、その時点のサンプル**でのみ `Acquiring` を抜ける
+
+現行の attach / focus / detach span は同期的に閉じている
+([native_window.rs:1129](../../src/video/native_window.rs:1129)) ので、
+**span 全体を fail-closed にするのが、スレッドをまたぐ dequeue 順序を作ろうとするより単純で厳密**。
+
+## 11.4 派生クリックの帰属 (§10.4 を上書き)
+
+第 5 版は button down / up それぞれに event-time 修飾キーがあると書いたが、
+**`clicked()` は両方から派生する**のに、**どちらのパケットがクリックの修飾キーを所有するかを
+決めていなかった**。現行 grid は `response.clicked()` を受けてから frame 最終の `i.modifiers` を
+読む ([ui_main.rs:12795](../../src/ui_main.rs:12795))。上流に生の修飾キーがあっても、
+**この派生を通ると保存されない**。
+
+**確定**:
+
+- **クリック / ダブルクリック / ジェスチャ選択は、起点となった button-down の `DeliveryModifiers`**
+  を使う
+- **その押下が `Indeterminate` だった場合、離しが acquisition 完了後でも、派生ジェスチャは
+  `Indeterminate` のまま**
+- 離し固有の挙動は release パケットを使ってよい
+- ドラッグは**起点の delivery 刻印**と**毎フレームの `CurrentModifiers`** の両方を保持する
+
+**「sidecar は不要」は帰属の必要性を消さない。** typed な pointer-event → interaction の橋渡し
+(ジェスチャ状態) が要る。StickyKeys の latch が**マウスのボタンクリックまで持続する**ので、
+これは実害のある論点である。
+
+## 11.5 chord と文字入力の分離 — drain の中で決めない
+
+`Indeterminate` の判定を drain の内側で行わない。**`TranslateMessage` / `DispatchMessage` は
+従来どおり続け、`Indeterminate` をそのキーの command provenance として運び、
+アプリ command の consumer 側が受け取りを拒否する。**
+
+`TranslateMessage` は文字メッセージを別に生成し、Microsoft は**キー押下と文字メッセージが
+必ずしも 1 対 1 でない**と明記している。この分離は概念としては既にあり、routed Win32 キューは
+shortcut 照合用、egui が text / IME を保持する ([key_input.rs](../../src/key_input.rs))。
+presenter も key / text / IME を別々に emit している
+([native_window.rs:1752](../../src/video/native_window.rs:1752))。
+
+**egui widget 内部の chord (TextEdit の Ctrl+C 等) まで対象にする場合は、egui キーのフィルタ契約が
+別途要る。**S0 ではまず**アプリ command routing のみ**を対象とし、widget 内部は現状維持とする。
+
+## 11.6 S0 が型で固定するもの (これが揃わないと S1/S2 が第 2 の真実を再導入できる)
+
+- **キュー権限の単一 typed state**: `Stable` / `Acquiring` / 内部 attach / `ExternallyAttached`。
+  並列した bool にしない
+- **`DeliveryModifiers` と `CurrentModifiers` を不透明かつ相互変換不可**にする
+- 左右別ビットごとの `Known` / `Unknown` と `PossibleAltGr`
+- `ChordMatch::{Match, NoMatch, Indeterminate(reason)}`
+- キー / ホイールパケット / button-down / button-up の **delivery 刻印付き envelope**
+- **ジェスチャ型**: `start: DeliveryModifiers` + `current: CurrentModifiers`
+- **detach 失敗を split topology として表現できない** attach transaction outcome
+- **owner 専用コンストラクタ**。production に `From<egui::Modifiers>` や生 bool の
+  コンストラクタを置かない
+
+**S1+S2 の着地時点で**、`KeyEdge` の public scalar 修飾キーフィールド
+([key_input.rs:243](../../src/key_input.rs:243)) と native の key / pointer パケット
+([native_window.rs:57](../../src/video/native_window.rs:57)) は**消えるか private な互換
+projection になる**。chord 照合がそれらの bool を直接受け取ることも無くす
+([keymap.rs:1216](../../src/keymap.rs:1216))。**さもないと S1 か S2 が静かに第 2 の権威を作れる。**
