@@ -1290,42 +1290,34 @@ fn colorize_wait_indicator_visible(holdover: Option<&FsHoldover>, now: std::time
 /// visible holdover to the user.
 ///
 /// The navigation sequence is the presentation fact: it is retired only after every page in the
-/// target display unit was painted live. Pending loads supply only the UX-delay anchor, so a
-/// current-page quality upgrade cannot make this predicate true on its own.
+/// target display unit was painted live. Its own lifetime supplies the UX-delay anchor, independent
+/// of whether decode has completed and presentation is waiting on a later pipeline stage.
 fn fs_page_wait_indicator_visible(
     processing_status_visible: bool,
     holdover: Option<&FsHoldover>,
     current_idx: usize,
     items_generation: u64,
-    pending_display_loads: impl IntoIterator<Item = (usize, std::time::Instant)>,
     now: std::time::Instant,
 ) -> bool {
     if !processing_status_visible {
         return false;
     }
-    let Some(target) = holdover
+    let Some(sequence) = holdover
         .and_then(FsHoldover::navigation_sequence)
-        .and_then(|sequence| match &sequence.target {
+        .filter(|sequence| match &sequence.target {
             FsNavigationSequenceTarget::Display(target)
                 if target.items_generation == items_generation
                     && target.pages.contains(&current_idx) =>
             {
-                Some(target)
+                true
             }
             FsNavigationSequenceTarget::FolderItems { .. }
-            | FsNavigationSequenceTarget::Display(_) => None,
+            | FsNavigationSequenceTarget::Display(_) => false,
         })
     else {
         return false;
     };
-    let Some(started_at) = pending_display_loads
-        .into_iter()
-        .filter_map(|(idx, started_at)| target.pages.contains(&idx).then_some(started_at))
-        .min()
-    else {
-        return false;
-    };
-    now.saturating_duration_since(started_at) >= FS_PAGE_WAIT_INDICATOR_DELAY
+    now.saturating_duration_since(sequence.opened_at) >= FS_PAGE_WAIT_INDICATOR_DELAY
 }
 
 fn paint_centered_dark_status_overlay(ui: &egui::Ui, full_rect: egui::Rect, text: &str) {
@@ -5694,6 +5686,7 @@ impl App {
             .or_else(|| self.capture_fs_navigation_display_unit(ctx, fs_idx));
         self.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
             previous,
+            opened_at: std::time::Instant::now(),
             target: FsNavigationSequenceTarget::FolderItems {
                 accepted_generation: self.items_generation,
             },
@@ -5733,6 +5726,7 @@ impl App {
             .or_else(|| self.capture_fs_navigation_display_unit(ctx, current_idx));
         self.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
             previous,
+            opened_at: std::time::Instant::now(),
             target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
                 items_generation: self.items_generation,
                 pages,
@@ -14209,28 +14203,13 @@ impl App {
                         // ── 移動先ページ未提示インジケーター ──
                         // NavigationSequence は target display unit の全ページが live に描かれた
                         // frame で上の emit_fs_page_turn_ready_for_display_unit が破棄する。したがって
-                        // fs_pending 単独ではなく、この typed presentation state との積で判定する。
-                        let pending_display_loads = self
-                            .fs_pending
-                            .iter()
-                            .filter_map(|(&idx, pending)| {
-                                pending
-                                    .purpose
-                                    .display_started_at()
-                                    .map(|started_at| (idx, started_at))
-                            })
-                            .chain(self.fs_upload_backlog.iter().filter_map(|entry| {
-                                entry
-                                    .purpose
-                                    .display_started_at()
-                                    .map(|started_at| (entry.idx, started_at))
-                            }));
+                        // sequence 自身の未 retire 時間だけで判定し、decode pending の有無には
+                        // 結び付けない。decode 済みでも upload / presentation 待ちは起こり得る。
                         if fs_page_wait_indicator_visible(
                             self.settings.fullscreen_processing_status_visible,
                             self.fs_holdover_tex.as_ref(),
                             fs_idx,
                             self.items_generation,
-                            pending_display_loads,
                             std::time::Instant::now(),
                         ) {
                             paint_centered_dark_status_overlay(ui, full_rect, "読み込み中");
@@ -34496,12 +34475,14 @@ mod tests {
     use std::path::PathBuf;
 
     fn page_wait_navigation_sequence(
+        opened_at: std::time::Instant,
         items_generation: u64,
         pages: Vec<usize>,
         phase: FsNavigationTargetPhase,
     ) -> FsHoldover {
         FsHoldover::NavigationSequence(FsNavigationSequence {
             previous: None,
+            opened_at,
             target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
                 items_generation,
                 pages,
@@ -35231,8 +35212,9 @@ mod tests {
 
     #[test]
     fn page_wait_indicator_stays_hidden_before_500ms_for_unpresented_navigation_target() {
-        let started_at = std::time::Instant::now();
+        let opened_at = std::time::Instant::now();
         let holdover = page_wait_navigation_sequence(
+            opened_at,
             3,
             vec![7],
             FsNavigationTargetPhase::Awaiting {
@@ -35244,15 +35226,15 @@ mod tests {
             Some(&holdover),
             7,
             3,
-            [(7, started_at)],
-            started_at + std::time::Duration::from_millis(499),
+            opened_at + std::time::Duration::from_millis(499),
         ));
     }
 
     #[test]
-    fn page_wait_indicator_appears_after_500ms_for_unpresented_navigation_target() {
-        let started_at = std::time::Instant::now();
+    fn page_wait_indicator_appears_after_500ms_without_pending_target_load() {
+        let opened_at = std::time::Instant::now();
         let holdover = page_wait_navigation_sequence(
+            opened_at,
             3,
             vec![7],
             FsNavigationTargetPhase::Awaiting {
@@ -35264,62 +35246,53 @@ mod tests {
             Some(&holdover),
             7,
             3,
-            [(7, started_at)],
-            started_at + std::time::Duration::from_millis(501),
+            opened_at + std::time::Duration::from_millis(501),
         ));
     }
 
     #[test]
     fn page_wait_indicator_hides_on_the_frame_navigation_target_is_presented() {
-        let started_at = std::time::Instant::now();
+        let opened_at = std::time::Instant::now();
         let presenting = page_wait_navigation_sequence(
+            opened_at,
             3,
             vec![7],
             FsNavigationTargetPhase::Presenting(FsNavigationPresentation::Materialized),
         );
-        let now = started_at + std::time::Duration::from_secs(1);
+        let now = opened_at + std::time::Duration::from_secs(1);
         assert!(fs_page_wait_indicator_visible(
             true,
             Some(&presenting),
             7,
             3,
-            [(7, started_at)],
             now,
         ));
-        assert!(!fs_page_wait_indicator_visible(
-            true,
-            None,
-            7,
-            3,
-            [(7, started_at)],
-            now,
-        ));
+        assert!(!fs_page_wait_indicator_visible(true, None, 7, 3, now));
     }
 
     #[test]
-    fn page_wait_indicator_appears_when_one_spread_page_is_still_pending() {
-        let started_at = std::time::Instant::now();
+    fn page_wait_indicator_appears_when_one_spread_page_is_still_unpresented() {
+        let opened_at = std::time::Instant::now();
         let holdover = page_wait_navigation_sequence(
+            opened_at,
             3,
             vec![7, 8],
-            FsNavigationTargetPhase::Awaiting {
-                accept_rendition: false,
-            },
+            FsNavigationTargetPhase::Presenting(FsNavigationPresentation::Materialized),
         );
         assert!(fs_page_wait_indicator_visible(
             true,
             Some(&holdover),
             7,
             3,
-            [(8, started_at)],
-            started_at + std::time::Duration::from_secs(1),
+            opened_at + std::time::Duration::from_secs(1),
         ));
     }
 
     #[test]
     fn page_wait_indicator_respects_processing_status_setting() {
-        let started_at = std::time::Instant::now();
+        let opened_at = std::time::Instant::now();
         let holdover = page_wait_navigation_sequence(
+            opened_at,
             3,
             vec![7],
             FsNavigationTargetPhase::Awaiting {
@@ -35331,21 +35304,19 @@ mod tests {
             Some(&holdover),
             7,
             3,
-            [(7, started_at)],
-            started_at + std::time::Duration::from_secs(1),
+            opened_at + std::time::Duration::from_secs(1),
         ));
     }
 
     #[test]
     fn page_wait_indicator_stays_hidden_for_current_page_resolution_upgrade() {
-        let started_at = std::time::Instant::now();
+        let opened_at = std::time::Instant::now();
         assert!(!fs_page_wait_indicator_visible(
             true,
             None,
             7,
             3,
-            [(7, started_at)],
-            started_at + std::time::Duration::from_secs(1),
+            opened_at + std::time::Duration::from_secs(1),
         ));
     }
 
@@ -35688,6 +35659,7 @@ mod tests {
         app.fs_nav_locked_gen = Some(app.items_generation);
         app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
             previous: None,
+            opened_at: std::time::Instant::now(),
             target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
                 items_generation: app.items_generation,
                 pages,
@@ -36532,6 +36504,7 @@ mod tests {
     fn navigation_sequence_blocks_until_presented_but_not_after_terminal_failure() {
         let target = |phase| FsNavigationSequence {
             previous: None,
+            opened_at: std::time::Instant::now(),
             target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
                 items_generation: 7,
                 pages: vec![2],
@@ -36702,6 +36675,7 @@ mod tests {
                     navigation_holdover_page(3, shared_page_3.clone()),
                 ],
             }),
+            opened_at: std::time::Instant::now(),
             target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
                 items_generation: 12,
                 pages: vec![3, 4],
@@ -36758,6 +36732,7 @@ mod tests {
                     navigation_holdover_page(3, shared_page_3.clone()),
                 ],
             }),
+            opened_at: std::time::Instant::now(),
             target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
                 items_generation: 13,
                 pages: vec![3, 4],
@@ -36986,6 +36961,7 @@ mod tests {
         app.items_generation = 9;
         app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
             previous: None,
+            opened_at: std::time::Instant::now(),
             target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
                 items_generation: 9,
                 pages: vec![3, 4],
@@ -37058,6 +37034,7 @@ mod tests {
         app.fs_nav_locked_gen = Some(app.items_generation);
         app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
             previous: None,
+            opened_at: std::time::Instant::now(),
             target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
                 items_generation: app.items_generation,
                 pages: vec![0, 1],
@@ -37150,6 +37127,7 @@ mod tests {
         let mut app = app_in_fullscreen_on_a_video(&ctx);
         app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
             previous: None,
+            opened_at: std::time::Instant::now(),
             target: FsNavigationSequenceTarget::FolderItems {
                 accepted_generation: 4,
             },
@@ -37347,6 +37325,7 @@ mod tests {
         app.items_generation = 11;
         app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
             previous: Some(previous),
+            opened_at: std::time::Instant::now(),
             target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
                 items_generation: 11,
                 pages: vec![0],

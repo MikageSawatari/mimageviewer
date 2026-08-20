@@ -5246,13 +5246,6 @@ impl FsLoadPurpose {
         }
     }
 
-    pub(crate) const fn display_started_at(self) -> Option<std::time::Instant> {
-        match self {
-            Self::Display { started_at } => Some(started_at),
-            Self::Prefetch | Self::AnimationPromotion { .. } => None,
-        }
-    }
-
     pub(crate) const fn animation_expansion_started_at_for(
         self,
         idx: usize,
@@ -7006,6 +6999,8 @@ pub(crate) struct FsDisplayUnitHoldoverPage {
 pub(crate) struct FsNavigationSequence {
     /// None is permitted only when the viewer genuinely had no material to hold.
     pub(crate) previous: Option<FsDisplayUnitHoldover>,
+    /// When this accepted navigation target began waiting to be presented.
+    pub(crate) opened_at: std::time::Instant,
     pub(crate) target: FsNavigationSequenceTarget,
 }
 
