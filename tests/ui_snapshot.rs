@@ -234,6 +234,15 @@ fn fullscreen_prefetch_direction_dark() {
 }
 
 #[test]
+fn fullscreen_page_wait_indicator_dark() {
+    snapshot_with_theme(
+        "fullscreen_page_wait_indicator_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::draw_fs_page_wait_indicator_snapshot_fixture,
+    );
+}
+
+#[test]
 fn still_touch_panel_handles_latched_dark() {
     snapshot_with_theme(
         "still_touch_panel_handles_latched_dark",

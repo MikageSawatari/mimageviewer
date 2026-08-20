@@ -62,6 +62,7 @@ const COMPARE_SPREAD_UNAVAILABLE_MESSAGE: &str =
     "見開き表示では比較できません。単ページ表示に切り替えてください";
 // Tuned on real hardware to avoid a brief status flash on normal page turns.
 const COLORIZE_WAIT_INDICATOR_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
+const FS_PAGE_WAIT_INDICATOR_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 const FS_NAVIGATOR_HEADER_HEIGHT: f32 = 26.0;
 const FS_NAVIGATOR_MARGIN: f32 = 12.0;
 const FS_NAVIGATOR_WHEEL_STEP: f32 = 20.0;
@@ -1285,6 +1286,48 @@ fn colorize_wait_indicator_visible(holdover: Option<&FsHoldover>, now: std::time
         })
 }
 
+/// Whether the accepted navigation target has not yet been presented long enough to explain the
+/// visible holdover to the user.
+///
+/// The navigation sequence is the presentation fact: it is retired only after every page in the
+/// target display unit was painted live. Pending loads supply only the UX-delay anchor, so a
+/// current-page quality upgrade cannot make this predicate true on its own.
+fn fs_page_wait_indicator_visible(
+    processing_status_visible: bool,
+    holdover: Option<&FsHoldover>,
+    current_idx: usize,
+    items_generation: u64,
+    pending_display_loads: impl IntoIterator<Item = (usize, std::time::Instant)>,
+    now: std::time::Instant,
+) -> bool {
+    if !processing_status_visible {
+        return false;
+    }
+    let Some(target) = holdover
+        .and_then(FsHoldover::navigation_sequence)
+        .and_then(|sequence| match &sequence.target {
+            FsNavigationSequenceTarget::Display(target)
+                if target.items_generation == items_generation
+                    && target.pages.contains(&current_idx) =>
+            {
+                Some(target)
+            }
+            FsNavigationSequenceTarget::FolderItems { .. }
+            | FsNavigationSequenceTarget::Display(_) => None,
+        })
+    else {
+        return false;
+    };
+    let Some(started_at) = pending_display_loads
+        .into_iter()
+        .filter_map(|(idx, started_at)| target.pages.contains(&idx).then_some(started_at))
+        .min()
+    else {
+        return false;
+    };
+    now.saturating_duration_since(started_at) >= FS_PAGE_WAIT_INDICATOR_DELAY
+}
+
 fn paint_centered_dark_status_overlay(ui: &egui::Ui, full_rect: egui::Rect, text: &str) {
     let font = egui::FontId::proportional(20.0);
     let galley = ui
@@ -1305,6 +1348,24 @@ fn paint_centered_dark_status_overlay(ui: &egui::Ui, full_rect: egui::Rect, text
         font,
         egui::Color32::WHITE,
     );
+}
+
+/// Visual-only fixture for the fullscreen page-wait indicator snapshot.
+#[doc(hidden)]
+pub fn draw_fs_page_wait_indicator_snapshot_fixture(ui: &mut egui::Ui) {
+    let full_rect = ui.max_rect();
+    ui.painter()
+        .rect_filled(full_rect, 0.0, egui::Color32::BLACK);
+    let held_page = egui::Rect::from_center_size(full_rect.center(), egui::vec2(220.0, 300.0));
+    ui.painter()
+        .rect_filled(held_page, 2.0, egui::Color32::from_rgb(70, 82, 96));
+    ui.painter().rect_stroke(
+        held_page.shrink(18.0),
+        2.0,
+        egui::Stroke::new(2.0, egui::Color32::from_rgb(126, 145, 164)),
+        egui::StrokeKind::Inside,
+    );
+    paint_centered_dark_status_overlay(ui, full_rect, "読み込み中");
 }
 
 fn compare_indicator_size(width: u32, height: u32) -> Option<(u32, u32)> {
@@ -14143,6 +14204,36 @@ impl App {
                         // ── チェックマーク ──
                         if self.checked.contains(&fs_idx) {
                             draw_fs_checkmark(ui, full_rect);
+                        }
+
+                        // ── 移動先ページ未提示インジケーター ──
+                        // NavigationSequence は target display unit の全ページが live に描かれた
+                        // frame で上の emit_fs_page_turn_ready_for_display_unit が破棄する。したがって
+                        // fs_pending 単独ではなく、この typed presentation state との積で判定する。
+                        let pending_display_loads = self
+                            .fs_pending
+                            .iter()
+                            .filter_map(|(&idx, pending)| {
+                                pending
+                                    .purpose
+                                    .display_started_at()
+                                    .map(|started_at| (idx, started_at))
+                            })
+                            .chain(self.fs_upload_backlog.iter().filter_map(|entry| {
+                                entry
+                                    .purpose
+                                    .display_started_at()
+                                    .map(|started_at| (entry.idx, started_at))
+                            }));
+                        if fs_page_wait_indicator_visible(
+                            self.settings.fullscreen_processing_status_visible,
+                            self.fs_holdover_tex.as_ref(),
+                            fs_idx,
+                            self.items_generation,
+                            pending_display_loads,
+                            std::time::Instant::now(),
+                        ) {
+                            paint_centered_dark_status_overlay(ui, full_rect, "読み込み中");
                         }
 
                         // ── 高解像度読込中インジケーター ──
@@ -34404,6 +34495,21 @@ mod tests {
     use crate::ring_shortcut::{RightDragContext, ViewerShortRightClickAction};
     use std::path::PathBuf;
 
+    fn page_wait_navigation_sequence(
+        items_generation: u64,
+        pages: Vec<usize>,
+        phase: FsNavigationTargetPhase,
+    ) -> FsHoldover {
+        FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous: None,
+            target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                items_generation,
+                pages,
+                phase,
+            }),
+        })
+    }
+
     fn cache_fullscreen_keyboard_owner_for_test(ctx: &egui::Context) {
         crate::keyboard_input::cache_keyboard_owner(
             ctx,
@@ -35121,6 +35227,126 @@ mod tests {
         assert!(!fullscreen_processing_status_visible(true, false));
         assert!(!fullscreen_processing_status_visible(false, true));
         assert!(!fullscreen_processing_status_visible(false, false));
+    }
+
+    #[test]
+    fn page_wait_indicator_stays_hidden_before_500ms_for_unpresented_navigation_target() {
+        let started_at = std::time::Instant::now();
+        let holdover = page_wait_navigation_sequence(
+            3,
+            vec![7],
+            FsNavigationTargetPhase::Awaiting {
+                accept_rendition: false,
+            },
+        );
+        assert!(!fs_page_wait_indicator_visible(
+            true,
+            Some(&holdover),
+            7,
+            3,
+            [(7, started_at)],
+            started_at + std::time::Duration::from_millis(499),
+        ));
+    }
+
+    #[test]
+    fn page_wait_indicator_appears_after_500ms_for_unpresented_navigation_target() {
+        let started_at = std::time::Instant::now();
+        let holdover = page_wait_navigation_sequence(
+            3,
+            vec![7],
+            FsNavigationTargetPhase::Awaiting {
+                accept_rendition: false,
+            },
+        );
+        assert!(fs_page_wait_indicator_visible(
+            true,
+            Some(&holdover),
+            7,
+            3,
+            [(7, started_at)],
+            started_at + std::time::Duration::from_millis(501),
+        ));
+    }
+
+    #[test]
+    fn page_wait_indicator_hides_on_the_frame_navigation_target_is_presented() {
+        let started_at = std::time::Instant::now();
+        let presenting = page_wait_navigation_sequence(
+            3,
+            vec![7],
+            FsNavigationTargetPhase::Presenting(FsNavigationPresentation::Materialized),
+        );
+        let now = started_at + std::time::Duration::from_secs(1);
+        assert!(fs_page_wait_indicator_visible(
+            true,
+            Some(&presenting),
+            7,
+            3,
+            [(7, started_at)],
+            now,
+        ));
+        assert!(!fs_page_wait_indicator_visible(
+            true,
+            None,
+            7,
+            3,
+            [(7, started_at)],
+            now,
+        ));
+    }
+
+    #[test]
+    fn page_wait_indicator_appears_when_one_spread_page_is_still_pending() {
+        let started_at = std::time::Instant::now();
+        let holdover = page_wait_navigation_sequence(
+            3,
+            vec![7, 8],
+            FsNavigationTargetPhase::Awaiting {
+                accept_rendition: false,
+            },
+        );
+        assert!(fs_page_wait_indicator_visible(
+            true,
+            Some(&holdover),
+            7,
+            3,
+            [(8, started_at)],
+            started_at + std::time::Duration::from_secs(1),
+        ));
+    }
+
+    #[test]
+    fn page_wait_indicator_respects_processing_status_setting() {
+        let started_at = std::time::Instant::now();
+        let holdover = page_wait_navigation_sequence(
+            3,
+            vec![7],
+            FsNavigationTargetPhase::Awaiting {
+                accept_rendition: false,
+            },
+        );
+        assert!(!fs_page_wait_indicator_visible(
+            false,
+            Some(&holdover),
+            7,
+            3,
+            [(7, started_at)],
+            started_at + std::time::Duration::from_secs(1),
+        ));
+    }
+
+    #[test]
+    fn page_wait_indicator_stays_hidden_for_current_page_resolution_upgrade() {
+        let started_at = std::time::Instant::now();
+        assert!(!fs_page_wait_indicator_visible(
+            true,
+            None,
+            7,
+            3,
+            [(7, started_at)],
+            started_at + std::time::Duration::from_secs(1),
+        ));
     }
 
     #[test]

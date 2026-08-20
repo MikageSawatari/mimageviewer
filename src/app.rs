@@ -5246,6 +5246,13 @@ impl FsLoadPurpose {
         }
     }
 
+    pub(crate) const fn display_started_at(self) -> Option<std::time::Instant> {
+        match self {
+            Self::Display { started_at } => Some(started_at),
+            Self::Prefetch | Self::AnimationPromotion { .. } => None,
+        }
+    }
+
     pub(crate) const fn animation_expansion_started_at_for(
         self,
         idx: usize,
