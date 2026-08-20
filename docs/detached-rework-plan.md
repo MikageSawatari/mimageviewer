@@ -328,6 +328,46 @@ Windows 実機で確認済み。次は表示中 `App` の session 化か `MediaW
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-08-20 keep-alive backstop の所有権 (ClaudeCode / Codex 双方が構造的修正と合意):**
+`render_active_detached_viewport_backstop` ([ui_fullscreen.rs](../src/ui_fullscreen.rs) 12740 付近) が
+**mount の外**で走り、**App にマウントされている別 context の状態から detached window の内容を
+組み立てていた**。題の index は `self.fullscreen_idx.unwrap_or(0)`、題そのものは `self.items[..]`、
+live texture も `self.fullscreen_idx` と App 上の cache から解決していた。
+
+- **実機ログの証拠** (利用者、2026-08-20)。動画ウィンドウ (session 6, hwnd 0x3c1a2c) の 1 フレーム:
+
+  ```
+  frame=25216 source=keepalive_backstop session=Some(6) hwnd=0x3c1a2c
+    fs_idx=0 items_gen=4 items_len=785 main_fs_idx=None
+    computed="（成）だれにもいえないコト…pdf - mimageviewer"   ← PDF の名前
+    os="【東方Full Flavor】Petaverse….mp4 - mimageviewer"
+  frame=25217 source=active_render session=Some(6) hwnd=0x3c1a2c
+    fs_idx=59 items_gen=8 items_len=167
+    computed="【東方Full Flavor】Super Rabbit….mp4 - mimageviewer"   ← 正しい
+  ```
+
+  利用者の再現条件とも一致する: **他のウィンドウがアクティブな間は backstop だけが描くので
+  題が別 context のものになり、動画ウィンドウを再びアクティブにすると `active_render` に戻って直る。**
+- **変更**: backstop も所有 bundle を通してから組み立てる。**3 分岐**にした:
+  bundle が `Some` なら mount して実行 / `None` かつ active session が alive なら
+  **App が既に所有者なのでそのまま実行** / owner の bundle が本当に消失しているなら sibling を描かない。
+  **`None` に「mount 中で take 済み」と「別 bundle を持たない直マウント経路」の 2 つの正規な意味が
+  ある**ことは Codex のフェーズ 1 指摘で判明した。無条件に mount helper で包む当初案は誤りだった。
+- **採らなかった案**: 題と `resolve_fs_display_tex` だけを bundle 直接参照へ変える案。holdover の
+  一方向ラッチ、processed / edit / conceal / local-adjust / animation cache、thumbnail 判定、
+  generation 付き描画資源を取りこぼし、同種の漏れを再生産する (双方合意)。
+- **費用**: `alive_wanted` / frame marker / first-host の判定は mount の**前**に評価するので、
+  **backstop が実際に必要なフレームだけ** mount/unmount が 1 往復増える。
+- **憲法チェック**: 3 抵触なし (既存の `Option` と mount helper だけで振り分け、新しい state を
+  足さない) / 5 抵触なし (alive session・frame marker・HWND registry・既存 content state で判定し、
+  時間窓を使わない) / 7 範囲内 / 8 既存 104 本を維持。
+- **今回あえて直していない**: `fullscreen_idx=None` のとき題が item 0 へ fallback する
+  ([ui_fullscreen.rs](../src/ui_fullscreen.rs) 12791)。今回の cross-context 問題とは別件であり、
+  同時に触ると範囲が混ざる (憲法 7、Codex の指摘)。
+- **リワーク側への申し送り**: 分類は BA-5 / K1 の「複数描画入口・複数 context」seam。今回は
+  **現行 K0 の入口を owner-correct にする限定修正**であって K1 (単一描画入口) を完成させるものではない。
+  K1 を設計するとき、backstop がこの 3 分岐で何を必要としていたかを出発点にできる。
+
 **2026-08-20 サムネイル結果の所有権 (ClaudeCode / Codex 双方が構造的修正と合意):**
 mount 中の active detached context がサムネイル worker の結果を
 `drain_thumb_results_discard` で読み捨てていた ([app.rs](../src/app.rs) 40392 付近)。

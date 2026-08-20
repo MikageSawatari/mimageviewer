@@ -45744,6 +45744,200 @@ mod still_window_mode_key_tests {
         assert!(!app.active_detached_viewport_rendered_this_frame());
     }
 
+    fn insert_backstop_conceal_texture(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        label: &str,
+        color: egui::Color32,
+    ) -> egui::TextureId {
+        let image = egui::ColorImage::filled([2, 1], color);
+        let texture = ctx.load_texture(label, image.clone(), egui::TextureOptions::LINEAR);
+        let texture_id = texture.id();
+        app.conceal_cache.insert(
+            idx,
+            ConcealCacheEntry {
+                pixels: std::sync::Arc::new(image),
+                texture,
+                generation: app.conceal_generation,
+            },
+        );
+        texture_id
+    }
+
+    fn shape_uses_texture(shape: &egui::epaint::Shape, texture_id: egui::TextureId) -> bool {
+        match shape {
+            egui::epaint::Shape::Vec(shapes) => shapes
+                .iter()
+                .any(|shape| shape_uses_texture(shape, texture_id)),
+            _ => shape.texture_id() == texture_id,
+        }
+    }
+
+    fn output_uses_texture(output: &egui::FullOutput, texture_id: egui::TextureId) -> bool {
+        output
+            .shapes
+            .iter()
+            .any(|clipped| shape_uses_texture(&clipped.shape, texture_id))
+    }
+
+    /// Run the production immediate-viewport path and retain the child output. The renderer is
+    /// thread-local in egui; each caller runs this helper on a dedicated test thread so installing
+    /// it cannot affect another test that expects embedded viewports.
+    fn render_backstop_with_captured_viewport(
+        app: &mut App,
+        ctx: &egui::Context,
+    ) -> Option<(egui::ViewportBuilder, egui::FullOutput)> {
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let renderer_capture = std::rc::Rc::clone(&captured);
+        egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
+            let builder = viewport.builder.clone();
+            let mut input = egui::RawInput {
+                viewport_id: viewport.ids.this,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 480.0),
+                )),
+                ..Default::default()
+            };
+            input
+                .viewports
+                .insert(viewport.ids.this, egui::ViewportInfo::default());
+            let output = ctx.run(input, |ctx| (viewport.viewport_ui_cb)(ctx));
+            *renderer_capture.borrow_mut() = Some((builder, output));
+        });
+        ctx.set_embed_viewports(false);
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 480.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.render_active_detached_viewport_backstop(ctx),
+        );
+        let output = captured.borrow_mut().take();
+        output
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn keepalive_backstop_mounts_owner_bundle_for_title_and_processed_display() {
+        std::thread::spawn(|| {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            let _other = push_image(&mut app, r"C:\owner\other.jpg");
+            let owner_idx = push_image(&mut app, r"C:\owner\owner.jpg");
+            app.fullscreen_idx = Some(owner_idx);
+            app.viewer_presentation = ViewerPresentation::DetachedWindow;
+            let owner_texture = insert_backstop_conceal_texture(
+                &mut app,
+                &ctx,
+                owner_idx,
+                "backstop_owner",
+                egui::Color32::LIGHT_BLUE,
+            );
+            let owner_bundle = app.take_current_viewer_context_bundle();
+            let main_idx = push_image(&mut app, r"C:\main\sibling.jpg");
+            app.fullscreen_idx = Some(main_idx);
+            app.viewer_presentation = ViewerPresentation::DetachedWindow;
+            let main_texture = insert_backstop_conceal_texture(
+                &mut app,
+                &ctx,
+                main_idx,
+                "backstop_main",
+                egui::Color32::LIGHT_RED,
+            );
+            app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+                bundle: owner_bundle,
+            });
+            app.begin_active_detached_session(205, DetachedSource::Image);
+            set_detached_host_for_test(&mut app, 205, 0x2050, true);
+            app.frame_counter = 200;
+            let rendered = render_backstop_with_captured_viewport(&mut app, &ctx).unwrap();
+            assert!(rendered.0.title.is_some());
+            assert!(
+                rendered
+                    .0
+                    .title
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("owner.jpg")
+            );
+            assert!(output_uses_texture(&rendered.1, owner_texture));
+            assert!(!output_uses_texture(&rendered.1, main_texture));
+            assert!(app.active_detached_viewport_rendered_this_frame());
+            assert_eq!(app.fullscreen_idx, Some(main_idx));
+            let parked = &app.active_detached_viewer_context.as_ref().unwrap().bundle;
+            assert_eq!(parked.fullscreen_idx, Some(owner_idx));
+            assert_eq!(parked.conceal_cache[&owner_idx].texture.id(), owner_texture);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn keepalive_backstop_draws_when_owner_is_already_mounted_on_app() {
+        std::thread::spawn(|| {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            let idx = push_image(&mut app, r"C:\owner\direct.jpg");
+            app.fullscreen_idx = Some(idx);
+            app.viewer_presentation = ViewerPresentation::DetachedWindow;
+            let texture = insert_backstop_conceal_texture(
+                &mut app,
+                &ctx,
+                idx,
+                "backstop_direct",
+                egui::Color32::LIGHT_GREEN,
+            );
+            app.begin_active_detached_session(206, DetachedSource::Image);
+            set_detached_host_for_test(&mut app, 206, 0x2060, true);
+            app.frame_counter = 201;
+            assert!(app.active_detached_viewer_context.is_none());
+            let rendered = render_backstop_with_captured_viewport(&mut app, &ctx).unwrap();
+            assert!(
+                rendered
+                    .0
+                    .title
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("direct.jpg")
+            );
+            assert!(output_uses_texture(&rendered.1, texture));
+            assert!(app.active_detached_viewport_rendered_this_frame());
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn keepalive_backstop_marker_skips_before_mounting_parked_owner() {
+        std::thread::spawn(|| {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            let idx = push_image(&mut app, r"C:\owner\already-drawn.jpg");
+            app.fullscreen_idx = Some(idx);
+            let owner_bundle = app.take_current_viewer_context_bundle();
+            app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+                bundle: owner_bundle,
+            });
+            app.begin_active_detached_session(207, DetachedSource::Image);
+            set_detached_host_for_test(&mut app, 207, 0x2070, true);
+            app.frame_counter = 202;
+            app.mark_active_detached_viewport_rendered();
+
+            assert!(render_backstop_with_captured_viewport(&mut app, &ctx).is_none());
+            assert!(app.active_detached_viewer_context.is_some());
+            assert_eq!(app.fullscreen_idx, None);
+        })
+        .join()
+        .unwrap();
+    }
+
     #[test]
     #[cfg(windows)]
     fn keepalive_backstop_does_not_create_first_detached_host() {

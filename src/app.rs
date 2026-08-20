@@ -16096,7 +16096,7 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn with_active_detached_viewer_context<R>(
+    pub(crate) fn with_active_detached_viewer_context<R>(
         &mut self,
         f: impl FnOnce(&mut Self) -> R,
     ) -> Option<R> {
