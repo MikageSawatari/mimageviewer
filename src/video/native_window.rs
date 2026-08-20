@@ -947,6 +947,126 @@ pub fn is_window_alive(hwnd_raw: u64) -> bool {
     unsafe { IsWindow(Some(HWND(hwnd_raw as *mut _))).as_bool() }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttachSpanSamplePoint {
+    BeforeAttach,
+    AfterAttach,
+    AfterFocus,
+    AfterDetach,
+}
+
+impl AttachSpanSamplePoint {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::BeforeAttach => "before_attach",
+            Self::AfterAttach => "after_attach",
+            Self::AfterFocus => "after_focus",
+            Self::AfterDetach => "after_detach",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AttachSpanSample {
+    point: AttachSpanSamplePoint,
+    modifiers: crate::modifier_probe::SidedModifierSnapshot,
+}
+
+#[derive(Debug)]
+struct AttachSpanProbe {
+    enabled: bool,
+    this_tid: u32,
+    foreground_tid: u32,
+    partner_is_miv_ui_thread: bool,
+    samples: Vec<AttachSpanSample>,
+}
+
+impl AttachSpanProbe {
+    fn new(
+        enabled: bool,
+        this_tid: u32,
+        foreground_tid: u32,
+        partner_is_miv_ui_thread: bool,
+    ) -> Self {
+        Self {
+            enabled,
+            this_tid,
+            foreground_tid,
+            partner_is_miv_ui_thread,
+            samples: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, point: AttachSpanSamplePoint) {
+        self.record_with(point, crate::modifier_probe::sample_sided_modifier_snapshot);
+    }
+
+    fn record_with(
+        &mut self,
+        point: AttachSpanSamplePoint,
+        sample: impl FnOnce() -> crate::modifier_probe::SidedModifierSnapshot,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        self.samples.push(AttachSpanSample {
+            point,
+            modifiers: sample(),
+        });
+    }
+
+    fn into_fields(
+        self,
+        attach_ok: bool,
+        detach_ok: bool,
+    ) -> Option<Vec<(&'static str, serde_json::Value)>> {
+        if !self.enabled {
+            return None;
+        }
+        let samples = self
+            .samples
+            .into_iter()
+            .map(|sample| {
+                let serde_json::Value::Object(mut fields) = sample.modifiers.into_value() else {
+                    unreachable!("sided modifier snapshot must serialize as an object");
+                };
+                fields.insert(
+                    "point".to_owned(),
+                    serde_json::Value::from(sample.point.as_str()),
+                );
+                serde_json::Value::Object(fields)
+            })
+            .collect();
+        Some(vec![
+            ("this_tid", serde_json::Value::from(self.this_tid)),
+            (
+                "foreground_tid",
+                serde_json::Value::from(self.foreground_tid),
+            ),
+            (
+                "partner_is_miv_ui_thread",
+                serde_json::Value::from(self.partner_is_miv_ui_thread),
+            ),
+            ("attach_ok", serde_json::Value::from(attach_ok)),
+            ("detach_ok", serde_json::Value::from(detach_ok)),
+            ("samples", serde_json::Value::Array(samples)),
+        ])
+    }
+
+    fn emit(self, attach_ok: bool, detach_ok: bool) {
+        let Some(fields) = self.into_fields(attach_ok, detach_ok) else {
+            return;
+        };
+        crate::perf::event(
+            "native_presenter",
+            "attach_thread_input_probe",
+            None,
+            0,
+            &fields,
+        );
+    }
+}
+
 /// `hwnd_raw` が child window なら、現在の親 HWND を返す。
 ///
 /// HWND の生存だけでは、detached viewer host の再生成後も presenter child が旧 host の
@@ -998,16 +1118,28 @@ pub fn claim_foreground(target_hwnd_raw: u64) -> ForegroundClaimReport {
         } else {
             0
         };
+        let ui_thread_id = crate::modifier_probe::ui_thread_id();
+        let mut attach_probe = AttachSpanProbe::new(
+            crate::perf::is_enabled(),
+            this_tid,
+            foreground_tid,
+            ui_thread_id != 0 && foreground_tid == ui_thread_id,
+        );
+        attach_probe.record(AttachSpanSamplePoint::BeforeAttach);
         let attached = foreground_tid != 0
             && foreground_tid != this_tid
             && AttachThreadInput(this_tid, foreground_tid, true).as_bool();
+        if attached {
+            attach_probe.record(AttachSpanSamplePoint::AfterAttach);
+        }
         let set_foreground_ok = SetForegroundWindow(target).as_bool();
         let set_active_ok = SetActiveWindow(target).is_ok();
         let set_focus_ok = SetFocus(Some(target)).is_ok();
+        attach_probe.record(AttachSpanSamplePoint::AfterFocus);
         let post_foreground = GetForegroundWindow();
-        if attached {
-            let _ = AttachThreadInput(this_tid, foreground_tid, false);
-        }
+        let detach_ok = attached && AttachThreadInput(this_tid, foreground_tid, false).as_bool();
+        attach_probe.record(AttachSpanSamplePoint::AfterDetach);
+        attach_probe.emit(attached, detach_ok);
         ForegroundClaimReport {
             foreground_hwnd: foreground.0 as u64,
             post_foreground_hwnd: post_foreground.0 as u64,
@@ -2115,6 +2247,119 @@ mod tests {
             alt: false,
             repeat: false,
         })
+    }
+
+    fn attach_span_sample_points(fields: &[(&'static str, serde_json::Value)]) -> Vec<String> {
+        fields
+            .iter()
+            .find_map(|(name, value)| (*name == "samples").then_some(value))
+            .and_then(serde_json::Value::as_array)
+            .expect("attach span samples field")
+            .iter()
+            .map(|sample| {
+                sample
+                    .get("point")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("attach span sample point")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn claim_foreground_modifier_probe_records_four_samples_after_successful_attach() {
+        let mut probe = AttachSpanProbe::new(true, 10, 20, true);
+        for point in [
+            AttachSpanSamplePoint::BeforeAttach,
+            AttachSpanSamplePoint::AfterAttach,
+            AttachSpanSamplePoint::AfterFocus,
+            AttachSpanSamplePoint::AfterDetach,
+        ] {
+            probe.record_with(point, crate::modifier_probe::SidedModifierSnapshot::default);
+        }
+
+        let fields = probe
+            .into_fields(true, true)
+            .expect("enabled probe must emit fields");
+        assert_eq!(
+            attach_span_sample_points(&fields),
+            [
+                "before_attach",
+                "after_attach",
+                "after_focus",
+                "after_detach"
+            ]
+        );
+        assert_eq!(
+            fields
+                .iter()
+                .find_map(|(name, value)| (*name == "this_tid").then_some(value)),
+            Some(&serde_json::Value::from(10))
+        );
+        assert_eq!(
+            fields
+                .iter()
+                .find_map(|(name, value)| (*name == "foreground_tid").then_some(value)),
+            Some(&serde_json::Value::from(20))
+        );
+        assert_eq!(
+            fields.iter().find_map(|(name, value)| {
+                (*name == "partner_is_miv_ui_thread").then_some(value)
+            }),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            fields
+                .iter()
+                .find_map(|(name, value)| (*name == "attach_ok").then_some(value)),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            fields
+                .iter()
+                .find_map(|(name, value)| (*name == "detach_ok").then_some(value)),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn claim_foreground_modifier_probe_omits_after_attach_when_attach_is_unsuccessful() {
+        let mut probe = AttachSpanProbe::new(true, 10, 30, false);
+        for point in [
+            AttachSpanSamplePoint::BeforeAttach,
+            AttachSpanSamplePoint::AfterFocus,
+            AttachSpanSamplePoint::AfterDetach,
+        ] {
+            probe.record_with(point, crate::modifier_probe::SidedModifierSnapshot::default);
+        }
+
+        let fields = probe
+            .into_fields(false, false)
+            .expect("enabled probe must emit fields");
+        assert_eq!(
+            attach_span_sample_points(&fields),
+            ["before_attach", "after_focus", "after_detach"]
+        );
+    }
+
+    #[test]
+    fn claim_foreground_modifier_probe_is_silent_when_perf_is_disabled() {
+        let mut sampled = 0;
+        let mut probe = AttachSpanProbe::new(false, 10, 20, true);
+        for point in [
+            AttachSpanSamplePoint::BeforeAttach,
+            AttachSpanSamplePoint::AfterAttach,
+            AttachSpanSamplePoint::AfterFocus,
+            AttachSpanSamplePoint::AfterDetach,
+        ] {
+            probe.record_with(point, || {
+                sampled += 1;
+                crate::modifier_probe::SidedModifierSnapshot::default()
+            });
+        }
+
+        assert_eq!(sampled, 0);
+        assert!(probe.into_fields(true, true).is_none());
     }
 
     #[test]
