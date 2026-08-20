@@ -788,6 +788,8 @@ pub struct BucketFill {
     pub leak_stop: f32,
     /// 図形の半径を外側へ広げる量 (px)。図形モード以外では無視する。
     pub outset: f32,
+    /// region 面積に対して埋める個々の隙間の上限 (%)。図形モード以外では無視する。
+    pub gap_tolerance: f32,
 }
 
 /// バケツの結果。
@@ -1027,6 +1029,7 @@ pub fn flood_fill_bitmap_mask(
     if fill.region.is_shape() {
         let fit_options = crate::shape_fit::FitOptions {
             outset: fill.outset,
+            max_hole_area_ratio: fill.gap_tolerance.clamp(0.0, 50.0) / 100.0,
             ..crate::shape_fit::FitOptions::default()
         };
         let fitted = match fill.region {
@@ -1785,6 +1788,7 @@ mod tests {
                     value: true,
                     leak_stop: 0.0,
                     outset: 0.0,
+                    gap_tolerance: 10.0,
                 },
             ),
             BucketFillOutcome::Filled
@@ -1803,6 +1807,7 @@ mod tests {
                     value: false,
                     leak_stop: 0.0,
                     outset: 0.0,
+                    gap_tolerance: 10.0,
                 },
             ),
             BucketFillOutcome::Filled
@@ -1855,6 +1860,7 @@ mod tests {
                     value: true,
                     leak_stop: 0.0,
                     outset: 0.0,
+                    gap_tolerance: 10.0,
                 },
             );
             mask
@@ -1873,6 +1879,7 @@ mod tests {
                 value: true,
                 leak_stop: 1.0,
                 outset: 0.0,
+                gap_tolerance: 10.0,
             },
         );
         assert_eq!(outcome, BucketFillOutcome::Filled);
@@ -1916,6 +1923,7 @@ mod tests {
                     value: true,
                     leak_stop,
                     outset: 0.0,
+                    gap_tolerance: 10.0,
                 },
             )
         };
@@ -1946,6 +1954,7 @@ mod tests {
                     value: true,
                     leak_stop,
                     outset: 0.0,
+                    gap_tolerance: 10.0,
                 },
             )
         };
@@ -1977,6 +1986,7 @@ mod tests {
                 value: true,
                 leak_stop: 2.0,
                 outset: 0.0,
+                gap_tolerance: 10.0,
             },
         );
         assert_eq!(outcome, BucketFillOutcome::SeedTooThin);
@@ -2015,6 +2025,7 @@ mod tests {
                     value: true,
                     leak_stop: 0.0,
                     outset: 0.0,
+                    gap_tolerance: 10.0,
                 },
             ),
             BucketFillOutcome::Filled
@@ -2056,6 +2067,7 @@ mod tests {
                     value: true,
                     leak_stop: 0.0,
                     outset: 0.0,
+                    gap_tolerance: 10.0,
                 },
             ),
             BucketFillOutcome::Filled
@@ -2088,6 +2100,7 @@ mod tests {
                     value: true,
                     leak_stop: 0.0,
                     outset: 0.0,
+                    gap_tolerance: 10.0,
                 },
             ),
             BucketFillOutcome::Filled
@@ -2114,6 +2127,7 @@ mod tests {
                     value: true,
                     leak_stop: 0.0,
                     outset: 0.0,
+                    gap_tolerance: 10.0,
                 },
             ),
             BucketFillOutcome::Filled
@@ -2146,6 +2160,7 @@ mod tests {
                     value: true,
                     leak_stop: 0.0,
                     outset: 0.0,
+                    gap_tolerance: 10.0,
                 },
             ),
             BucketFillOutcome::Filled
@@ -2184,6 +2199,7 @@ mod tests {
                     value: true,
                     leak_stop: 0.0,
                     outset: 0.0,
+                    gap_tolerance: 10.0,
                 },
             ),
             BucketFillOutcome::Filled
@@ -2216,6 +2232,7 @@ mod tests {
                 value: true,
                 leak_stop: 0.0,
                 outset: 0.0,
+                gap_tolerance: 10.0,
             },
         );
         let BucketFillOutcome::ShapeFitFailed(preview) = outcome else {
@@ -2253,6 +2270,7 @@ mod tests {
             value: true,
             leak_stop: 0.0,
             outset: 0.0,
+            gap_tolerance: 10.0,
         };
         assert_eq!(
             flood_fill_bitmap_mask(&mut mask, &width_zero, 0, 0, fill),
@@ -2300,6 +2318,7 @@ mod tests {
                         value: true,
                         leak_stop: 0.0,
                         outset: 0.0,
+                        gap_tolerance: 10.0,
                     },
                 ),
                 BucketFillOutcome::Filled
@@ -2320,6 +2339,7 @@ mod tests {
                         value: true,
                         leak_stop: 0.0,
                         outset: 0.0,
+                        gap_tolerance: 10.0,
                     },
                 ),
                 BucketFillOutcome::Filled

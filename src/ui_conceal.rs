@@ -947,6 +947,7 @@ impl App {
                 value: self.conceal_paint_mode,
                 leak_stop: self.conceal_bucket_leak_stop.max(0.0),
                 outset: self.conceal_bucket_outset.max(0.0),
+                gap_tolerance: self.conceal_bucket_gap_tolerance.clamp(0.0, 50.0),
             },
         );
         match outcome {
@@ -2393,6 +2394,7 @@ impl App {
                                                     &mut self.conceal_bucket_region,
                                                     &mut self.conceal_bucket_leak_stop,
                                                     &mut self.conceal_bucket_outset,
+                                                    &mut self.conceal_bucket_gap_tolerance,
                                                 );
                                                 ui.add(
                                                     egui::Label::new(

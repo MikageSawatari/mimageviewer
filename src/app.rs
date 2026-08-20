@@ -11479,6 +11479,8 @@ pub struct App {
     pub(crate) local_adjust_bucket_leak_stop: f32,
     /// 補正レイヤーバケツの図形を外側へ広げる量 (px)。
     pub(crate) local_adjust_bucket_outset: f32,
+    /// 補正レイヤーバケツで埋める個々の隙間の上限 (%)。
+    pub(crate) local_adjust_bucket_gap_tolerance: f32,
     /// 補正レイヤー境界筆で塗り領域に接する境界線も含める。
     pub(crate) local_adjust_edge_brush_include_boundary: bool,
     /// Ctrl 境界表示用の縮小 texture cache。
@@ -11889,6 +11891,8 @@ pub struct App {
     pub(crate) erase_bucket_region: crate::mask_db::BucketRegion,
     /// バケツの図形を外側へ広げる量 (px)。
     pub(crate) erase_bucket_outset: f32,
+    /// バケツで埋める個々の隙間の上限 (%)。
+    pub(crate) erase_bucket_gap_tolerance: f32,
     /// 囲みツールのポイント列 (画像ピクセル座標)
     pub(crate) erase_lasso_points: Vec<(f32, f32)>,
     /// 縦線/横線ツールのドラッグ開始点 (画像ピクセル座標)
@@ -12009,6 +12013,8 @@ pub struct App {
     pub(crate) conceal_bucket_region: crate::mask_db::BucketRegion,
     /// バケツの図形を外側へ広げる量 (px)。
     pub(crate) conceal_bucket_outset: f32,
+    /// バケツで埋める個々の隙間の上限 (%)。
+    pub(crate) conceal_bucket_gap_tolerance: f32,
     /// 現在ページのマスクビットマップ (1bit/pixel、`erase_mask` と同じ表現)。
     pub(crate) conceal_mask: Option<Vec<bool>>,
     /// マスク対象の画像サイズ [width, height]。
@@ -13851,6 +13857,7 @@ impl App {
             local_adjust_bucket_region: crate::mask_db::BucketRegion::Connected,
             local_adjust_bucket_leak_stop: 0.0,
             local_adjust_bucket_outset: 1.0,
+            local_adjust_bucket_gap_tolerance: 10.0,
             local_adjust_edge_brush_include_boundary: false,
             local_adjust_edge_preview_cache: None,
             local_adjust_mask_lasso_points: Vec::new(),
@@ -13980,6 +13987,7 @@ impl App {
             erase_bucket_leak_stop: 0.0,
             erase_bucket_region: crate::mask_db::BucketRegion::Connected,
             erase_bucket_outset: 1.0,
+            erase_bucket_gap_tolerance: 10.0,
             erase_lasso_points: Vec::new(),
             erase_line_start: None,
             erase_line_end: None,
@@ -14017,6 +14025,7 @@ impl App {
             conceal_bucket_leak_stop: 0.0,
             conceal_bucket_region: crate::mask_db::BucketRegion::Connected,
             conceal_bucket_outset: 1.0,
+            conceal_bucket_gap_tolerance: 10.0,
             conceal_mask: None,
             conceal_mask_size: [0, 0],
             conceal_mask_texture: None,

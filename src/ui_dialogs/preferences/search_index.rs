@@ -308,12 +308,6 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ]
     ),
     entry!(
-        "ai-backend/erase-tone-tolerance",
-        AiBackend,
-        "補完の色調を画像に合わせる許容値",
-        ["消しゴム", "モノクロ", "セピア", "色味", "AI 補完"]
-    ),
-    entry!(
         "ai-backend/tensorrt-pack",
         AiBackend,
         "TensorRT",

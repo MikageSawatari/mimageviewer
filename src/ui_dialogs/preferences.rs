@@ -1718,7 +1718,6 @@ impl App {
                 let old_ai_backend = self.settings.ai_backend.clone();
                 let new_ai_backend = state.settings.ai_backend.clone();
                 let old_ai_feature_mode = self.settings.ai_feature_mode;
-                let old_erase_inpaint_mono_tolerance = self.settings.erase_inpaint_mono_tolerance;
                 let old_reading_history_limit = self.settings.reading_history_limit;
                 let old_keymap_settings = self.settings.keymap.clone();
                 let old_fullscreen_side_panel_mode =
@@ -1894,14 +1893,6 @@ impl App {
                 }
                 if old_ai_feature_mode != self.settings.ai_feature_mode {
                     self.apply_ai_feature_mode_change();
-                }
-                if old_erase_inpaint_mono_tolerance != self.settings.erase_inpaint_mono_tolerance {
-                    // 既存の補完結果と、その下流で合成済みの補正・隠蔽・final cache を
-                    // 新しい判定値で再生成する。進行中の補完も古い設定の結果なので破棄する。
-                    if let Some(service) = &self.edit_preview_cache {
-                        service.clear();
-                    }
-                    self.bump_all_input_generations();
                 }
                 let new_ai_size_limits = (
                     self.settings.ai_upscale_limit(),

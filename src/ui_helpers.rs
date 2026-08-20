@@ -23,14 +23,14 @@ pub(crate) const ERROR_TEXT_SIZE: f32 = 13.0;
 
 /// 3 系統のバケツで共有する範囲選択と、範囲に応じた補助スライダー。
 ///
-/// 2 本のスライダーは刻みと小数桁を揃える。egui は桁数を範囲の広さから決めるので、
-/// 指定しないと**範囲の狭い「はみ出し」だけが 2 桁表示**になり、刻みは粗いのに桁は
-/// 細かいという逆転が起きる (実機 FB)。
+/// px の 2 本は 0.1 刻み / 小数 1 桁、割合は 1 刻み / 整数表示に固定する。egui の
+/// 自動桁数へ任せると、刻みより細かい桁が出て 3 本の見た目が不揃いになる。
 pub(crate) fn draw_bucket_region_controls(
     ui: &mut egui::Ui,
     region: &mut crate::mask_db::BucketRegion,
     leak_stop: &mut f32,
     outset: &mut f32,
+    gap_tolerance: &mut f32,
 ) {
     use crate::mask_db::BucketRegion;
 
@@ -59,6 +59,16 @@ pub(crate) fn draw_bucket_region_controls(
                 .fixed_decimals(1),
         )
         .on_hover_text("図形を外側へ広げます。縁のにじみが残るときに上げてください。");
+        ui.add(
+            egui::Slider::new(gap_tolerance, 0.0..=50.0)
+                .text("隙間の許容")
+                .step_by(1.0)
+                .fixed_decimals(0)
+                .suffix("%"),
+        )
+        .on_hover_text(
+            "図形の中に混ざってよい別色の割合です。文字の抜けは埋め、大きな隙間は埋めません。0 で穴埋めなし。",
+        );
     }
 }
 

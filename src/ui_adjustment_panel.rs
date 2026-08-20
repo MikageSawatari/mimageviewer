@@ -782,6 +782,7 @@ mod local_adjust_segmentation_tests {
             value: true,
             leak_stop: 0.0,
             outset: 0.0,
+            gap_tolerance: 10.0,
         };
         let filled = crate::mask_db::BucketFillOutcome::Filled;
 
@@ -2739,6 +2740,7 @@ fn draw_local_tool_settings(
     bucket_region: &mut crate::mask_db::BucketRegion,
     bucket_leak_stop: &mut f32,
     bucket_outset: &mut f32,
+    bucket_gap_tolerance: &mut f32,
     edge_brush_include_boundary: &mut bool,
 ) {
     ui.label(
@@ -2796,6 +2798,7 @@ fn draw_local_tool_settings(
                 bucket_region,
                 bucket_leak_stop,
                 bucket_outset,
+                bucket_gap_tolerance,
             );
             ui.label(
                 egui::RichText::new("画像をクリックしたときに1回だけ塗りつぶします。")
@@ -2891,6 +2894,7 @@ fn draw_selected_local_adjust_layer_editor(
     bucket_region: &mut crate::mask_db::BucketRegion,
     bucket_leak_stop: &mut f32,
     bucket_outset: &mut f32,
+    bucket_gap_tolerance: &mut f32,
     edge_brush_include_boundary: &mut bool,
     region_color_tolerance: &mut f32,
     region_min_area: &mut usize,
@@ -2928,6 +2932,7 @@ fn draw_selected_local_adjust_layer_editor(
                 bucket_region,
                 bucket_leak_stop,
                 bucket_outset,
+                bucket_gap_tolerance,
                 edge_brush_include_boundary,
             );
             if selected_line_thickness.is_some()
@@ -9655,6 +9660,7 @@ impl App {
             value: paint,
             leak_stop: self.local_adjust_bucket_leak_stop.max(0.0),
             outset: self.local_adjust_bucket_outset.max(0.0),
+            gap_tolerance: self.local_adjust_bucket_gap_tolerance.clamp(0.0, 50.0),
         };
         let mut outcome = crate::mask_db::BucketFillOutcome::Invalid;
         let changed =
@@ -12921,6 +12927,7 @@ impl App {
         let mut bucket_region = self.local_adjust_bucket_region;
         let mut bucket_leak_stop = self.local_adjust_bucket_leak_stop;
         let mut bucket_outset = self.local_adjust_bucket_outset;
+        let mut bucket_gap_tolerance = self.local_adjust_bucket_gap_tolerance;
         let mut edge_brush_include_boundary = self.local_adjust_edge_brush_include_boundary;
         let mut region_color_tolerance = self.local_adjust_region_color_tolerance;
         let mut region_min_area = self.local_adjust_region_min_area;
@@ -13169,6 +13176,7 @@ impl App {
                                         &mut bucket_region,
                                         &mut bucket_leak_stop,
                                         &mut bucket_outset,
+                                        &mut bucket_gap_tolerance,
                                         &mut edge_brush_include_boundary,
                                         &mut region_color_tolerance,
                                         &mut region_min_area,
@@ -13238,6 +13246,7 @@ impl App {
         self.local_adjust_bucket_region = bucket_region;
         self.local_adjust_bucket_leak_stop = bucket_leak_stop.clamp(0.0, 16.0);
         self.local_adjust_bucket_outset = bucket_outset.clamp(0.0, 8.0);
+        self.local_adjust_bucket_gap_tolerance = bucket_gap_tolerance.clamp(0.0, 50.0);
         self.local_adjust_edge_brush_include_boundary = edge_brush_include_boundary;
         self.local_adjust_region_color_tolerance = region_color_tolerance.clamp(4.0, 120.0);
         self.local_adjust_region_min_area = region_min_area.clamp(1, 2048);

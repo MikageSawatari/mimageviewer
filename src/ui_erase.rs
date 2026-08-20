@@ -1042,6 +1042,7 @@ impl App {
                 value: self.erase_paint_mode,
                 leak_stop: self.erase_bucket_leak_stop.max(0.0),
                 outset: self.erase_bucket_outset.max(0.0),
+                gap_tolerance: self.erase_bucket_gap_tolerance.clamp(0.0, 50.0),
             },
         );
         match outcome {
@@ -2169,6 +2170,7 @@ impl App {
         let mut close_clicked = false;
         let mut switch_to: Option<usize> = None;
         let mut mask_delete_clicked = false;
+        let mut persist_inpaint_tone_tolerance = false;
 
         egui::Area::new(egui::Id::new("erase_tool_panel"))
             .fixed_pos(panel_pos)
@@ -2303,6 +2305,27 @@ impl App {
                         // padding (~10*2) - 中央 gap (4) を 2 で割って、片側 ~78px。
                         let btn_w = ((PANEL_W - 20.0 - 4.0) / 2.0).max(60.0);
                         let btn_size = egui::vec2(btn_w, 24.0);
+
+                        ui.label(
+                            egui::RichText::new("AI補完")
+                                .color(egui::Color32::from_gray(200)),
+                        );
+                        let tone_tolerance_response = ui
+                            .add(
+                                egui::Slider::new(
+                                    &mut self.settings.erase_inpaint_mono_tolerance,
+                                    1..=64,
+                                )
+                                .text("色調の許容")
+                                .step_by(1.0),
+                            )
+                            .on_hover_text(
+                                "画像の色が 1 本の線に乗っているとみなす許容量です。値を上げるほど、色味の散った画像でも補完結果を画像の色調に合わせます。",
+                            );
+                        persist_inpaint_tone_tolerance |= tone_tolerance_response.drag_stopped()
+                            || (tone_tolerance_response.changed()
+                                && !tone_tolerance_response.dragged());
+                        ui.separator();
 
                         // ── 見開きペアの左/右切替 (見開きから入った場合のみ) ──
                         if let Some((left_idx, right_idx)) =
@@ -2491,6 +2514,7 @@ impl App {
                                 &mut self.erase_bucket_region,
                                 &mut self.erase_bucket_leak_stop,
                                 &mut self.erase_bucket_outset,
+                                &mut self.erase_bucket_gap_tolerance,
                             );
                             ui.add(
                                 egui::Label::new(
@@ -2606,6 +2630,17 @@ impl App {
             }); // Area::show
 
         // ── closure 外でディスパッチ (& mut self の借用衝突を避ける) ──
+        if persist_inpaint_tone_tolerance {
+            self.settings.erase_inpaint_mono_tolerance =
+                self.settings.erase_inpaint_mono_tolerance.clamp(1, 64);
+            self.settings.save();
+            // 既存の補完結果と、その下流で合成済みの補正・隠蔽・final cache を
+            // 新しい判定値で再生成する。進行中の補完も古い設定の結果なので破棄する。
+            if let Some(service) = &self.edit_preview_cache {
+                service.clear();
+            }
+            self.bump_all_input_generations();
+        }
         // プレビューボタンの **押下 transition** (false → true) を検出して、
         // MI-GAN inpaint を **保存なしで** 投入する。これにより、新規に shape を
         // 描いた直後にプレビュー押下するだけで現在のマスク全体に対する inpaint

@@ -10,12 +10,15 @@ const MIN_SHAPE_RADIUS: f64 = 2.0;
 
 pub const DEFAULT_ANGLE_SNAP_DEG: f32 = 2.0;
 pub const DEFAULT_NEAR_CIRCLE_RATIO: f32 = 1.05;
+pub const DEFAULT_MAX_HOLE_AREA_RATIO: f32 = 0.10;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FitOptions {
     pub angle_snap_deg: f32,
     pub near_circle_ratio: f32,
     pub outset: f32,
+    /// region 面積に対して、この比率以下の背景成分だけを内部の欠けとして埋める。
+    pub max_hole_area_ratio: f32,
 }
 
 impl Default for FitOptions {
@@ -24,6 +27,7 @@ impl Default for FitOptions {
             angle_snap_deg: DEFAULT_ANGLE_SNAP_DEG,
             near_circle_ratio: DEFAULT_NEAR_CIRCLE_RATIO,
             outset: 0.0,
+            max_hole_area_ratio: DEFAULT_MAX_HOLE_AREA_RATIO,
         }
     }
 }
@@ -93,9 +97,9 @@ fn mark_exterior_component(
     h: usize,
     seed_x: usize,
     seed_y: usize,
-) {
+) -> usize {
     if region[seed_y * w + seed_x] || exterior[seed_y * w + seed_x] {
-        return;
+        return 0;
     }
     let fill_span = |exterior: &mut [bool], y: usize, x: usize| {
         let row = y * w;
@@ -112,6 +116,7 @@ fn mark_exterior_component(
     };
 
     let (start, end) = fill_span(exterior, seed_y, seed_x);
+    let mut marked = end - start;
     let mut spans = vec![(seed_y, start, end)];
     while let Some((y, start, end)) = spans.pop() {
         for adjacent_y in [y.checked_sub(1), y.checked_add(1).filter(|yy| *yy < h)]
@@ -119,22 +124,40 @@ fn mark_exterior_component(
             .flatten()
         {
             let row = adjacent_y * w;
-            let mut x = start;
-            while x < end {
+            // 前景を 4 近傍で扱うとき、背景は 8 近傍で外部との接続を判定する。
+            // 隣接行を左右へ 1px 広げ、斜めだけで接する背景も同じ成分へ含める。
+            let adjacent_start = start.saturating_sub(1);
+            let adjacent_end = end.saturating_add(1).min(w);
+            let mut x = adjacent_start;
+            while x < adjacent_end {
                 if region[row + x] || exterior[row + x] {
                     x += 1;
                     continue;
                 }
                 let (next_start, next_end) = fill_span(exterior, adjacent_y, x);
+                marked += next_end - next_start;
                 spans.push((adjacent_y, next_start, next_end));
                 x = next_end;
             }
         }
     }
+    marked
 }
 
-/// 外周から 4 近傍で届かない背景を穴とみなし、region へ取り込む。
-fn fill_internal_holes(region: &[bool], w: usize, h: usize) -> Vec<bool> {
+/// 外周から背景の 8 近傍で届かず、かつ region 面積に対して小さい背景成分だけを
+/// 内部の欠けとみなして region へ取り込む。
+fn fill_internal_holes(region: &[bool], w: usize, h: usize, max_hole_area_ratio: f32) -> Vec<bool> {
+    let mut filled = region[..w * h].to_vec();
+    let max_hole_area_ratio = max_hole_area_ratio.clamp(0.0, 1.0);
+    if max_hole_area_ratio <= 0.0 {
+        return filled;
+    }
+    let region_area = region[..w * h].iter().filter(|inside| **inside).count();
+    let max_hole_area = (region_area as f64 * f64::from(max_hole_area_ratio)).floor() as usize;
+    if max_hole_area == 0 {
+        return filled;
+    }
+
     let mut exterior = vec![false; w * h];
     for x in 0..w {
         mark_exterior_component(region, &mut exterior, w, h, x, 0);
@@ -149,11 +172,20 @@ fn fill_internal_holes(region: &[bool], w: usize, h: usize) -> Vec<bool> {
         }
     }
 
-    region
-        .iter()
-        .zip(exterior)
-        .map(|(inside, outside)| *inside || !outside)
-        .collect()
+    // 外部でない背景を成分ごとに数える。大きい成分の画素一覧を保持すると 60MP 級で
+    // 多量の追加メモリを使うため、まず面積だけを数え、小さい成分だけ 2 回目の走査で埋める。
+    for idx in 0..w * h {
+        if region[idx] || exterior[idx] {
+            continue;
+        }
+        let seed_x = idx % w;
+        let seed_y = idx / w;
+        let area = mark_exterior_component(region, &mut exterior, w, h, seed_x, seed_y);
+        if area <= max_hole_area {
+            mark_exterior_component(region, &mut filled, w, h, seed_x, seed_y);
+        }
+    }
+    filled
 }
 
 struct ScaledRegion {
@@ -385,7 +417,7 @@ pub fn fit_rect(
     if seed.0 >= w || seed.1 >= h || !region[seed.1 * w + seed.0] {
         return None;
     }
-    let filled = fill_internal_holes(region, w, h);
+    let filled = fill_internal_holes(region, w, h, opt.max_hole_area_ratio);
     let bounds = region_bounds(&filled, w, h)?;
     let coarse = make_scaled_region(&filled, w, bounds, seed);
     let coarse_bounds = region_bounds(&coarse.mask, coarse.w, coarse.h)?;
@@ -560,7 +592,7 @@ pub fn fit_ellipse(
     if seed.0 >= w || seed.1 >= h || !region[seed.1 * w + seed.0] {
         return None;
     }
-    let filled = fill_internal_holes(region, w, h);
+    let filled = fill_internal_holes(region, w, h, opt.max_hole_area_ratio);
     let bounds = region_bounds(&filled, w, h)?;
 
     let candidate = if circle {
@@ -819,7 +851,7 @@ mod tests {
     }
 
     #[test]
-    fn rect_with_internal_text_holes_fits_the_outer_rect() {
+    fn rect_with_internal_text_holes_fits_the_outer_rect_at_default_gap_tolerance() {
         let (w, h) = (260, 180);
         let mut region = vec![false; w * h];
         for y in 45..135 {
@@ -843,6 +875,69 @@ mod tests {
         assert_close(half_w, 100.0, 1.0);
         assert_close(half_h, 45.0, 1.0);
         assert_eq!(rotation_rad, 0.0);
+    }
+
+    #[test]
+    fn zero_gap_tolerance_does_not_fill_internal_text_holes() {
+        let (w, h) = (80, 60);
+        let mut region = vec![false; w * h];
+        for y in 10..50 {
+            region[y * w + 10..y * w + 70].fill(true);
+        }
+        for y in 22..38 {
+            region[y * w + 32..y * w + 38].fill(false);
+        }
+
+        assert_eq!(fill_internal_holes(&region, w, h, 0.0), region);
+    }
+
+    #[test]
+    fn diagonally_connected_background_remains_exterior() {
+        let (w, h) = (5, 5);
+        let mut region = vec![true; w * h];
+        region[0] = false;
+        region[w + 1] = false;
+
+        let filled = fill_internal_holes(&region, w, h, 0.5);
+        assert!(!filled[0]);
+        assert!(
+            !filled[w + 1],
+            "background connected to the edge only diagonally must not be filled"
+        );
+    }
+
+    #[test]
+    fn large_enclosed_gap_does_not_merge_parallel_rectangles() {
+        let (w, h) = (280, 200);
+        let mut region = vec![false; w * h];
+        for y in 30..170 {
+            region[y * w + 30..y * w + 80].fill(true);
+            region[y * w + 200..y * w + 250].fill(true);
+        }
+        for y in 30..36 {
+            region[y * w + 80..y * w + 200].fill(true);
+        }
+        for y in 164..170 {
+            region[y * w + 80..y * w + 200].fill(true);
+        }
+
+        let Some(FittedShape::Rect {
+            center,
+            half_w,
+            half_h,
+            rotation_rad,
+        }) = fit_rect(&region, w, h, (55, 100), FitOptions::default())
+        else {
+            panic!("clicked rectangle should fit");
+        };
+        assert_close(center.0, 55.0, 1.0);
+        assert_close(center.1, 100.0, 1.0);
+        assert_close(half_w, 25.0, 1.0);
+        assert_close(half_h, 70.0, 1.0);
+        assert_eq!(rotation_rad, 0.0);
+        let fitted_area = 4.0 * half_w * half_h;
+        let enclosing_area = 220.0 * 140.0;
+        assert!(fitted_area < enclosing_area * 0.4);
     }
 
     #[test]
