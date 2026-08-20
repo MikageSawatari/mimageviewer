@@ -296,3 +296,73 @@ timing heuristic は採らない (ほぼ同時の意図的 LCtrl+RAlt と完全�
 - **transient `AttachThreadInput`**: 現行の attach / detach が実際にキー状態 reset を起こすか。
 
 **この 2 件の観測結果が出るまで S0 の契約は確定しない。**観測は利用者の実機で行う。
+
+---
+
+# 実機観測の結果 (2026-08-20)
+
+計装: [modifier-observation-probe.md](modifier-observation-probe.md)。§9.7 の 2 件に対する回答。
+
+## Q1 StickyKeys — **確定。seed 規則はそのままでよい**
+
+latch 中 (`sticky_keys_flags` に `SKF_LCTLLATCHED`) の heartbeat 4 件で、
+**`GetAsyncKeyState` / `GetKeyState` / egui のすべてが `LCtrl = true`** を報告した
+(t=76.06 / 78.06、fullscreen viewport)。
+
+**したがって「取得時に物理状態から seed する」は StickyKeys 環境でも正しい。**latch は物理
+サンプルに映る。§3.2 に特別扱いを足す必要はない。
+
+## Q1 の副産物 — **delivery と current の区別が実測で裏付けられた**
+
+latch 直後の <kbd>BS</kbd> (t=78.19) は **`FsClearAdjust` として成立した** =
+Windows は Ctrl+BS として配送した。**同じ瞬間の probe は egui / async / sync すべて
+`ctrl = false`** を報告している (latch は既に消費済み)。
+
+- **配送時点では Ctrl が押されていた**。`KeyEdge` は WndProc 時点の `GetKeyState` で刻むので
+  これを正しく捉えた
+- **フレーム処理時点では Ctrl は上がっている**。これも正しい
+- **両方正しい。**これは §7 が「正常」と定めた高速 Ctrl+BS と同型の事象が、StickyKeys によって
+  自然に発生したもの
+
+**帰結**: §9.5 の「キーの chord 判定は `Delivery`」は実測で裏付けられた。もしキーを `Current` で
+判定していたら、**StickyKeys 利用者の Ctrl+BS が素の BS になる**。
+
+**新たに生じた論点**: §9.5 はホイール / クリック / ドラッグを `Current` に分類した。StickyKeys で
+「Ctrl を叩いてからホイールを回す」場合、latch が消費された後に `Current` を読むと Ctrl 無しに
+なる。**Windows が latch をマウスメッセージへ適用するかは未観測**。次の観測に含める。
+
+## Q2 `AttachThreadInput` — **未実施。attach が 1 度も起きなかった**
+
+`claim_foreground` は 3 回走ったが、**3 回とも `attach_ok = false`**。理由はコードの短絡評価:
+
+```rust
+let attached = foreground_tid != 0
+    && foreground_tid != this_tid          // ← ここで抜けた
+    && AttachThreadInput(this_tid, foreground_tid, true).as_bool();
+```
+
+3 回とも `this_tid == foreground_tid == 125704` (= UI スレッド)、`partner_is_miv_ui = true`。
+**動画を開く時点で既に mIV 自身が foreground だった**ため、attach は不要と判定された。
+呼び出し元は UI スレッド側 (`claim_native_window_focus` /
+presenter 破棄後の main foreground 再取得) だった。
+
+### この観測は設計を止めるか — **止めない**
+
+attach が実際にキー状態を reset するかは未確認のままだが、**設計はどちらでも成立する**。
+
+- reset する → 境界にする必要がある (設計どおり)
+- reset しない → 境界にしても、物理状態から seed し直すだけで同じ値になる
+
+**唯一の副作用**は、不要な境界が**進行中の高速 chord を分断**し得ること (BS がキューにあり Ctrl が
+既に離されている最中に marker が入ると、BS が `ctrl=false` で seed される)。ただし attach は
+利用者のウィンドウ切替に伴う操作なので、**その最中に高速 chord が進行している確率は無視できる**。
+
+**確定: 成功した attach / detach のみを境界とする** (§9.2 のまま)。reset の有無は観測できたら
+記録するが、S0 の前提条件からは外す。
+
+### 次の観測に回す項目
+
+1. `foreground_tid != this_tid` となる `claim_foreground` (= 実際に attach が走る場合) の 4 点
+2. StickyKeys latch 中のホイール (latch がマウスメッセージへ適用されるか)
+
+どちらも既存の計装のまま拾えるので、追加実装は不要。
