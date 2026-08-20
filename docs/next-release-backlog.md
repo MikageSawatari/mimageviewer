@@ -727,20 +727,42 @@
   確認する。固定解除後は既存の自動表示へ戻ること。
 - 規模 / 優先度: Medium / P2。
 
-### 1.102 動画シークバー付近へ複数の場面サムネイルを並べる — 専用スレ >>271、意図確認待ち
+### 1.102 YouTube 型の精密シーク用サムネイル列 — 専用スレ >>271 / >>277
 
 - 出典: 専用スレ >>271 (2026-08-20)。シークバーへサムネイルを並べたい要望。
+- **意図確認済み (専用スレ >>277)**: YouTube でシークバーを上へドラッグしたときに出る、
+  動画を見たまま複数の場面を横一列で選べる「精密シーク」相当が希望。常時表示する
+  サムネイル付きシークバーではない。
 - 既存機能との境界:
   - `S` / 上部 HUD のタイルボタンで、動画全体の場面を複数タイル表示してシークできる。
   - `B` の動画ブックマークは、左パネルへサムネイル・時刻・名前を並べる。
   - シークバー hover では、その位置のプレビューを 1 枚表示する。
-- 確認中の意図: 上記とは別に、動画を見ながらシークできるよう、下部 HUD の近くへ複数枚を
-  横一列に並べたい要望か。表示条件も次のどちらに近いか回答を待つ。
-  1. 下部 HUD が表示されている間はサムネイル列も表示する。
-  2. シークバーを固定していても、サムネイル列はマウスを近づけたときだけ表示する。
-- 回答を得るまで UI 仕様を確定しない。シークバー幅に対する枚数、映像を覆う高さ、抽出 worker /
-  `tile_thumb_cache` と seek hover cache の再利用範囲を決めてから規模を見積もる。
-- 規模 / 優先度: 未確定 / P3 (要望意図の回答待ち)。
+- YouTube デスクトップ版の観測 (2026-08-20、実装仕様の公式保証ではなく参考値):
+  - シークバーから上へドラッグすると、160x90px 程度のサムネイル列を現在位置中心に表示し、
+    列を横へ動かすことで動画全体をたどる。通常幅では約 5〜6 枚、広い画面ほど表示枚数が増える。
+  - ストーリーボードはキーフレーム列ではなく固定時間間隔。観測例は 3:33 = 2 秒間隔 / 108 枚、
+    8:14 = 5 秒 / 100 枚、20:17 = 10 秒 / 123 枚、2:00:53 = 10 秒 / 727 枚。
+  - YouTube は事前生成済み JPEG sprite を配信するため、ローカル動画からその場で作る mIV と
+    抽出コストの前提が異なる。見た目だけをそのまま真似て全時間分を先に生成しない。
+- mIV での UI 方向:
+  - シークバーから上方向へ一定量ドラッグしたときだけ、下部 HUD 上へサムネイル列を開く。
+    中央の時刻を選択位置とし、左右ドラッグで列を送る。固定シークバーでも通常時は列を隠す。
+  - 初期生成は画面に見える枚数 + 少量の前後だけとし、移動方向へ逐次追加する。動画全体の
+    サムネイル生成完了を待ってから表示する構造にはしない。
+  - 既存 `tile_thumb_cache`、seek hover cache、タイル抽出 worker のどこまでを共有できるか確認する。
+- **抽出方式は未決定 (性能との妥協を追加調査する)**:
+  - 表示時刻どおりの任意フレームは、素材によって 1 枚約 1 秒かかる。一方、直前のキーフレームを
+    そのまま採る場合は約 50ms。既存 §1.104 の実測でも精密側は最大約 1 秒、キーフレーム近傍は
+    約 40〜80ms で、GOP 距離が支配項と確認済み。
+  - キーフレームだけを列にすると高速だが、GOP によって時刻間隔が不均一になり、長い GOP では
+    内容が粗くなる。最終 UI をキーフレーム列に固定するとはまだ決めない。
+  - 比較候補は、(A) 固定間隔を精密復号、(B) キーフレームのみ、(C) キーフレームを先に表示して
+    固定間隔の精密画像へ非同期差し替え、(D) 表示範囲の先頭側キーフレームへ 1 回 seek して
+    順方向にまとめて復号、の 4 方式。素材 / GOP / HW decode 別に初回表示時間、列を送ったときの
+    待ち、CPU / GPU 負荷を測って決める。
+  - サムネイル画像が近似時刻でも、クリック後の本編 seek は選択した表示時刻へ行う。近似画像と
+    ラベル時刻のズレをどこまで許容するかは §1.104 の設定と共有するかも含めて判断する。
+- 規模 / 優先度: Medium〜Large / P3 (抽出方式の計測・設計後に着手)。
 
 ### 1.103 ごみ箱へ移す場合に mIV の削除確認を省略できる設定 — 専用スレ >>271
 
@@ -967,6 +989,66 @@
 - 現状: 中央の「読み込み中」により**無反応に見える問題は解消済み**。残るのは
   「グリッドが見えたまま待つ (黒地にならない)」という見た目の差のみ。
 - 規模 / 優先度: 中〜大 / P3 (実害は見た目。R2 で routing の所有者が決まってから)。
+
+### 1.109 複数ウィンドウ・見開き表示でページ戻りを長押しすると操作不能になる — 専用スレ >>276
+
+- 出典: 専用スレ >>276 (2026-08-20)。v3.1.2 の複数ウィンドウモードで報告。
+- 報告条件:
+  - 見開き表示でカーソルキーを長押ししてページを戻すと、その後操作不能になる。
+  - JPEG ではかなり多く戻ったとき、WebP では数ページで発生しやすい。
+  - **手元では、複数の静止画ウィンドウを開いた状態で、静止 WebP 600 枚の見開きを
+    長押しで往復すると再現した**。テストデータは
+    `C:\tmp\miv-spread-webp-portrait-600-20260820` (1200x1800、連番入り)。
+- 状態: **再現・perf log で原因確認済み**。WebP のデコード負荷や UI thread の停止ではなく、
+  通過表示用 navigation sequence と full-size upload pacing の循環待ち。
+- 実ログの時系列 (`perf_events.jsonl` / `mimageviewer.log`、2026-08-20):
+  1. 見開き `[415, 416]` の full-size load を開始し、静止 WebP の decode は両方とも
+     約 20〜21ms で完了した。
+  2. `idx=416` は `fs/ready` まで進んだが、`idx=415` は `fs_upload_backlog` に残ったまま、
+     次のページ戻り入力で `[415, 416]` が navigation target になった。
+  3. `idx=415` の thumbnail は `thumbnail_not_loaded` のため pass-through rendition を作れず、
+     `materialized_ready=false` / `rendition_ready=false` / `still_awaiting` になった。
+  4. 一方、`page_turn_decision_for_inputs` は rendition 対応 sequence が active というだけで
+     `defer_ui_uploads=true` にする (`src/ui_fullscreen.rs:8832-8845`)。
+     `poll_prefetch` はこの値で早期 return するため (`src/app.rs:63201-63207`)、すでに decode
+     済みの `idx=415` を backlog から GPU へ載せる経路まで止まった。
+  5. target が完成しないので sequence は退役できず、直前の `[417, 418]` を
+     `nav_holdover` で表示したまま循環した。ログでは `UI uploads deferred` が 32768 frames、
+     `no stand-in` が 131072 frames まで継続した。
+- **根本原因**: rendition が未準備の navigation sequence が、target を materialize するために
+  必要な upload 自体を抑止できる状態モデルになっている。見開きの片側だけ upload backlog に
+  残るタイミングで自己解除不能になる。複数ウィンドウはこの順序を再現しやすくする明確な条件だが、
+  共有 navigation / upload 経路の問題なので単一ウィンドウで絶対に起きないとは仮定しない。
+- 期待する不変条件: 長押し中に受理したページ移動が順に処理され、キーを離した後は最後に
+  表示したページで必ず settled になる。前方向 / 後方向、素材形式、先読み完了順にかかわらず、
+  次の入力を塞ぐ pending / transition 状態が残らない。
+- 修正方針:
+  - timeout、強制 reset、repaint 追加では直さない。
+  - pass-through rendition が未準備でも、対象見開きの完成済み full-size result を
+    `fs_upload_backlog` から反映して materialized target を settle できる状態遷移にする。
+    `rendition_sequence_active` だけで全 upload を止める現在の decision を見直し、
+    rendition の待機と target materialization の所有関係を typed phase で明確にする。
+  - 1 フレームあたりの upload pacing と「現在ページ + 見開き相方」の優先順位を確認し、
+    片側だけ反映された直後の入力でも完成経路を失わないようにする。
+  - navigation sequence、`fs_pending`、`fs_upload_backlog`、viewer context の mount / park / activate
+    を同じ context owner と generation で棚卸しし、前後移動・open / switch / close / cancel / error
+    の兄弟経路にも同じ循環がないか確認する。
+- 回帰確認:
+  - JPEG / PNG / 静止 WebP / Animated WebP、同一枚数・同一寸法で比較する。
+  - 左綴じ / 右綴じ、左右キー、前進 / 後退、先読み枚数、サムネイルキャッシュ有無を振る。
+  - 複数ウィンドウモードを主対象にし、フル機能ウィンドウと F12 detached を対照にする。
+  - 少なくとも「target の片側に thumbnail が無い」「もう片側だけ full-size ready」「残り片側の
+    full-size result は upload backlog」という実ログの順序を固定し、target が materialized で
+    settle して backlog が drain されることを検査する。
+  - page-turn request / accepted / materialized / settled、表示 generation、cache source、
+    key level / release、active viewer context を同じ perf log で追い、同一 target の
+    `still_awaiting` が無期限に継続しないことを確認する。
+- 修正時の注意: 複数ウィンドウの入力 / 表示状態所有に触れるため、
+  [detached-rework-plan.md](detached-rework-plan.md) §2 の禁止事項に従う。再現した症状だけに
+  reset を足さず、前後移動と全素材で共有する state transition の破れを所有境界で直す。
+  detached predicate / viewport 経路へ変更が及ぶ場合は ClaudeCode / Codex 双方で構造的修正と
+  合意し、`detached-rework-plan.md` §11 に変更範囲と理由を記録する。
+- 規模 / 優先度: Medium / P1。
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 
