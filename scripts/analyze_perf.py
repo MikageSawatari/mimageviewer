@@ -914,10 +914,16 @@ def analyze_page_turn_invariants(events: list[dict]) -> dict:
         key=lambda event: float(event.get("t", 0.0)),
     )
     for decision in decisions:
+        work_admission = decision.get("ui_work_admission")
+        target_uploads_only = (
+            work_admission == "navigation_target_uploads_only"
+            if work_admission is not None
+            else decision.get("defer_ui_uploads") is True
+        )
         if (
             decision.get("passthrough_rendition_ready") is True
             and decision.get("reason") != "pending_zero"
-            and decision.get("defer_ui_uploads") is not True
+            and not target_uploads_only
         ):
             violations.append({
                 "id": "I5",
@@ -1030,7 +1036,8 @@ def cmd_page_turn_check(events: list[dict]) -> int:
                 f"I5 violation: {label} idx={violation['idx']} "
                 f"decision t={float(decision.get('t', 0.0)):.3f} "
                 f"reason={decision.get('reason', '?')} "
-                f"defer_ui_uploads={decision.get('defer_ui_uploads', '?')}"
+                f"defer_ui_uploads={decision.get('defer_ui_uploads', '?')} "
+                f"ui_work_admission={decision.get('ui_work_admission', '?')}"
             )
             _print_page_turn_sources(burst)
 

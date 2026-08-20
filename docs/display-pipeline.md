@@ -1614,7 +1614,7 @@ delta に適用するため、ドラッグ途中の Ctrl 押下 / 解放でも�
 | --- | --- | --- |
 | **R1** | **ページ表示自体を飛ばさない。** キーを押しっぱなしで通り過ぎるページも、一瞬でも必ず 1 回は画面に出す | 利用者要件 (§1.58、2026-08-07) |
 | **R2** | **白黒 → カラーの切り替わりを見せない。** カラー化や LUT が乗る絵で、色が付く前の状態を一瞬でも出さない | 利用者報告 2026-07-29 (「LUT 未適用の絵が 1 フレーム見えてから色が変わる」)。確定要件 |
-| **R3** | **押しっぱなしでも内容を見せる。** 受理済み unit が未提示の間は次の repeat を drop し、idx だけを先行させない。通過 target の full-size upload / final 合成は rendition 提示後へ回す | 利用者判断 2026-08-14: seek bar / Ctrl+G は高速移動、held key は内容を見ながら読む操作 |
+| **R3** | **押しっぱなしでも内容を見せる。** 受理済み unit が未提示の間は次の repeat を drop し、idx だけを先行させない。新規 full-size producer / final 合成と target 外の先読み upload は rendition 提示後へ回す。ただし decode 完了済みの target upload は sequence 自身を settle する作業なので保留しない | 利用者判断 2026-08-14: seek bar / Ctrl+G は高速移動、held key は内容を見ながら読む操作。target upload 例外は 2026-08-20 の循環待ち修正 |
 | **R4** | **キーを離したら完成画像で終わる。** 押し終わったページは通常の画質・加工で表示する | 同上 |
 
 R1〜R4 は同時に満たす。**どれか 1 つのために他を崩す修正を入れない。**
@@ -1680,19 +1680,27 @@ R1〜R4 は同時に満たす。**どれか 1 つのために他を崩す修正�
 フォルダ移動 (Ctrl+↑↓) だけが押下回数を保つ —— は
 [docs/keymap-spec.md](keymap-spec.md) を正本とする。
 
-#### 2.5.2 2 つの軸を混ぜない
+#### 2.5.2 描画元と work admission は target materialization で接続する
 
-判定は**独立した 2 つの問い**からなる。1 つの真偽値で兼ねてはいけない
-(2026-08-11 の退行はこれが原因)。
+判定は 2 つの問いを持つが、**独立ではない**。描画元を待っている navigation target が、
+その待ちを終わらせる唯一の upload まで保留できてはならない。2026-08-20 の実ログでは、
+見開きの片側だけ thumbnail が無く、もう片側だけ full-size ready、残り片側の decode 結果が
+`fs_upload_backlog` にある状態で、旧 `defer_ui_uploads=true` が backlog 全体を止めた。
+target は materialize せず sequence も退役できないため、同じ `still_awaiting` が無期限に続いた。
 
 | 軸 | 問い | 誰が読むか |
 | --- | --- | --- |
 | **A. 描画元** (`paint_source`) | このフレームで**何を描くか** — カタログサムネイルか、完成画像か | `prepare_fullscreen_state` |
-| **B. 重い処理の保留** (`defer_ui_uploads`) | このフレームで**UI スレッドを使うか** — final-effect 結果の回収 / `fs_upload_batch` の消化 | `poll_final_effects` / `fs_upload_backlog` の消化 |
+| **B. 重い処理の admission** (`FsPageTurnWorkAdmission`) | このフレームで**どの UI work を許すか** — 全許可か、現在の navigation target に属する完成済み backlog upload だけか | `poll_final_effects` / `fs_upload_backlog` の消化 |
 
-- **B は未解決 sequence target が rendition を受け取るまで true**。physical key が先に
-  release されても、landing rendition の提示前に full work を再開して黒い placeholder を
-  露出してはいけない。
+- **B は未解決 rendition sequence 中、`NavigationTargetUploadsOnly`**。新規 full-resolution
+  producer、final-effect 回収、target 外の先読み upload は従来どおり保留する。一方、
+  target page set に属する `fs_upload_backlog` の完成済み result は
+  `Awaiting { accept_rendition: true }` の段階から許可する。見開きでは現在 idx と相方を
+  既存の 1 frame pacing (現在 + もう 1 枚) で処理する。
+- probe の `defer_ui_uploads=true` は既存ログ解析との互換フィールドとして残るが、意味は
+  「全 upload を止める」ではなく「新規 full work と非 target upload を保留する」である。
+  正確な typed 値は `ui_work_admission` を見る。
 - **A は B の結果ではない**。rendition 未着の間は `Materialized` を選ぶが、typed sequence が
   直前の complete unit を overlay する。rendition が atomic unit 全体で ready になった frame
   だけ `PassThrough` に切り替える。従来の「rendition が無くても PassThrough」は廃止した。
@@ -2050,7 +2058,7 @@ sequence を retire する。ページ矩形の canonical layout 契約は paged
 | I2 | 1 バースト内で `source` がページをまたいで混ざらない | R2 |
 | I3 | 受理した target unit の全 idx が、次 target の受理前に同じ final display-unit source として 1 回以上出る | R1 |
 | I4 | key-up より後に処理された auto-repeat は入力端で consume-only にし追加 target を発火させない。一方、受理済み landing target は取消さず、その rendition を提示した後に同 idx の `materialized` が現れる | R4 |
-| I5 | unresolved rendition sequence では ready 前も含め `defer_ui_uploads=true`、ready 前の `paint_source=materialized` は previous atomic holdover に覆われる | R3 |
+| I5 | unresolved rendition sequence では ready 前も含め `ui_work_admission=navigation_target_uploads_only`。target backlog upload は許可し、非 target / 新規 full work は保留する。ready 前の `paint_source=materialized` は previous atomic holdover に覆われる | R3 |
 
 `fs/paint` は単一ページでは既存の `(idx, texture)` producer が rendition も記録し、見開きでは
 holdover を含む最終表示単位の解決後に同じ page list から記録する。`source=thumbnail` が通過

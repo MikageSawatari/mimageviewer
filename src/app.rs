@@ -9681,8 +9681,9 @@ pub struct App {
     /// デコード完了済みだが GPU アップロード未了の先読みエントリ。
     /// 20MP 級 JPEG の `ctx.load_texture` は UI スレッドで 25-60ms/枚かかり、
     /// 10 枚連続で来ると 500ms 超の UI フリーズになる (計測実績あり)。
-    /// `poll_prefetch` では受信を drain してここに溜め、フレームあたり最大 1 枚だけ
-    /// アップロードする (現在ページは即時)。
+    /// `poll_prefetch` では受信を drain してここに溜め、現在ページ + もう 1 枚を上限に
+    /// アップロードする。unresolved page-turn sequence 中も target display unit の完成に
+    /// 必要な entry は許可し、target 外の先読みだけを保留する。
     /// `(idx, FsLoadResult, load_seq)` と entry の items_generation — FIFO 順で消化する。
     pub(crate) fs_upload_backlog: FsUploadBacklog,
 
@@ -57302,7 +57303,7 @@ impl App {
         if let Some(fs_idx) = self.fullscreen_idx
             && self
                 .fs_page_turn_decision_for_frame(ctx, fs_idx)
-                .defer_ui_uploads()
+                .defers_full_resolution_work()
         {
             // Completed workers retain their channel result until physical release.
             // Collecting here would perform a full-size UI-thread texture upload.
@@ -63097,8 +63098,9 @@ impl App {
             .map(|entry| entry.colorize_applied)
     }
 
-    /// 一旦 `fs_upload_backlog` に積み、1 フレームあたり最大 1 枚だけ `ctx.load_texture`
-    /// する。現在フルスクリーン表示中の idx は即時アップロードして表示遅延ゼロ。
+    /// 一旦 `fs_upload_backlog` に積み、現在ページ + もう 1 枚だけ `ctx.load_texture` する。
+    /// 現在の typed navigation target に属する完成済み result は page-turn suppression 中も
+    /// upload し、それ以外の先読みは sequence settle 後まで backlog に保持する。
     /// これにより 20MP JPEG 連続 prefetch 時の 500ms 級 UI フリーズを回避する。
     pub(crate) fn poll_prefetch(&mut self, ctx: &egui::Context) {
         // PDF ページの content_type を更新 (render 完了時にワーカーから受信)。
@@ -63195,19 +63197,32 @@ impl App {
         // ── ペーシング: このフレームで何枚アップロードするか決める ──
         // 1. 現在フルスクリーン表示中の idx (= ユーザーが待っている画像) は即時に処理
         // 2. 他の先読み分は FIFO 先頭から 1 枚だけ取り出す
-        // 3. ページ送り level が held の間は 0 枚。worker 結果は backlog に残し、
-        //    release 後の通常フレームで同じ優先順位のまま消化する。
-        // backlog は通常 <10 要素なので `Vec::remove` の O(n) は実質コストなし。
-        if let Some(fs_idx) = self.fullscreen_idx
-            && self
-                .fs_page_turn_decision_for_frame(ctx, fs_idx)
-                .defer_ui_uploads()
-        {
-            return;
-        }
+        // 3. unresolved page-turn sequence 中は、その typed navigation target に属する完成済み
+        //    result だけを許可する。その他の先読み upload は backlog に残し、sequence settle
+        //    後の通常フレームで同じ優先順位のまま消化する。
+        // backlog は通常 <10 要素なので Vec::remove の O(n) は実質コストなし。
+        let page_turn_upload_gate = self.fullscreen_idx.map(|fs_idx| {
+            let decision = self.fs_page_turn_decision_for_frame(ctx, fs_idx);
+            let target_pages = if decision.defers_full_resolution_work() {
+                self.fs_navigation_rendition_target_pages(fs_idx)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            (decision, target_pages)
+        });
+        let upload_is_admitted = |idx| match &page_turn_upload_gate {
+            Some((decision, target_pages)) => {
+                decision.admits_backlog_upload(target_pages.contains(&idx))
+            }
+            None => true,
+        };
         let cur = self.fullscreen_idx;
         let (mut cur_pos, mut other_pos) = (None, None);
         for (i, entry) in self.fs_upload_backlog.iter().enumerate() {
+            if !upload_is_admitted(entry.idx) {
+                continue;
+            }
             if Some(entry.idx) == cur {
                 cur_pos = Some(i);
             } else if other_pos.is_none() {
@@ -63228,8 +63243,11 @@ impl App {
         // descending で取り出したので元の位置順に直す
         to_process.reverse();
 
-        let has_more_backlog = !self.fs_upload_backlog.is_empty();
-        let repaint = !to_process.is_empty() || early_dims_repaint || has_more_backlog;
+        let has_more_admitted_backlog = self
+            .fs_upload_backlog
+            .iter()
+            .any(|entry| upload_is_admitted(entry.idx));
+        let repaint = !to_process.is_empty() || early_dims_repaint || has_more_admitted_backlog;
         for (items_generation, upload) in to_process {
             let FsUploadResult {
                 idx: key,
@@ -65966,7 +65984,7 @@ impl eframe::App for App {
             self.sync_upscale_from_preset(fs_idx);
             let defer_page_turn_materialization = self
                 .fs_page_turn_decision_for_frame(ctx, fs_idx)
-                .defer_ui_uploads();
+                .defers_full_resolution_work();
             if !defer_page_turn_materialization {
                 let continuous_keep_set = if !self.reading_flow.is_paged()
                     && self.fs_vertical_cache_keep_set.contains(&fs_idx)

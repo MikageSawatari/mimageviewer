@@ -418,6 +418,15 @@ materialization 待ちの edit / final assembly は `None` を返し、未完成
 3. `poll_prefetch` が現在画像の完了を検出したら、再度 `update_prefetch_window` を呼び、
    そこで初めて先読みが起動する。
 
+ページ送りの unresolved rendition sequence 中も、worker の完成結果は同じ viewer context /
+`items_generation` の `fs_upload_backlog` に集約する。UI 側の admission は新規
+full-resolution work と target 外の先読み upload を保留するが、現在の typed navigation target
+page set に属する完成済み upload は許可する。見開きの片側がすでに ready、もう片側が backlog、
+thumbnail は未準備という順序でも、target materialization が sequence 自身の抑止で止まらないための
+所有境界である。mount / park / activate では `fullscreen_idx`、navigation sequence、
+`fs_pending`、`fs_upload_backlog`、`items_generation` を同じ `ViewerContextBundle` として
+交換し、sibling context の result を target 例外として消化しない。
+
 AI アップスケール (`maybe_start_ai_upscale`) も同様: 同時実行は 1 枚のみで、現在画像が
 来たら古い先読みをキャンセル。**ただしこれは旧 `ai_upscale_*` 経路 (`#[allow(dead_code)]`)
 の記述。現行の final AI 経路は §3.2.1 の `AiJobQueue` (単一ワーカー + 優先度キュー) を使う。**
