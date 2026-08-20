@@ -654,3 +654,33 @@ StickyKeys、AltGr、attach トポロジ、framework widget の分離)。1 回�
 死んだ私の仮定 (記録として): timeline による順序付け / `Unavailable` で前 epoch を保持 /
 `Unknown` を not held / RAlt で LCtrl を抑制 / marker fence / ポインタ = `Current` /
 acquisition 時 seed / `about_to_wait` が空の証明。**8 件。**
+
+---
+
+# 合意 (2026-08-20) — S0 着手可能
+
+7 周の設計レビューを経て、Codex と **S0 および L1 について合意**した。§11 へ記録済み。
+
+## 12.5 S0 の追加不変条件
+
+**probe → reseed → transition を所有スレッド上で直列化する。**非同期・再入的な受け渡しにしない。
+`PM_NOREMOVE == false` は「以後メッセージが来ない」という約束ではなく**線形化点**である。
+後から届いたメッセージは:
+
+- commit 前に dequeue されれば owner はまだ `Acquiring` なので **fail-closed**
+- commit 後に dequeue されれば**新 epoch に属する**
+
+どちらでも正しい。これはゲートではなく S0 の不変条件として型とテストで固定する。
+
+## 12.6 L1 が主張してはならないこと
+
+**L1 はポインタの正しさも、レイヤの完成も主張しない。** drain 中に処理されたクリックは、
+現行 grid が `response.clicked()` を導出してから frame 最終の `i.modifiers` を読むため
+([ui_main.rs:12795](../../src/ui_main.rs:12795)) 誤帰属し得る。**これは L2 の既知欠陥であり、
+L1 の第 2 の権威ではない。**
+
+## 12.7 L1 着地時に消す command fallback
+
+[keymap.rs:7493](../../src/keymap.rs:7493) だけでなく、兄弟の command fallback が
+[keymap.rs:7566](../../src/keymap.rs:7566) と [keymap.rs:7708](../../src/keymap.rs:7708) にもある。
+**3 箇所すべて**を typed owner 経由にするか Windows では削除する。
