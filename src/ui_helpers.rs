@@ -22,6 +22,10 @@ pub(crate) const ERROR_TEXT_COLOR: eframe::egui::Color32 =
 pub(crate) const ERROR_TEXT_SIZE: f32 = 13.0;
 
 /// 3 系統のバケツで共有する範囲選択と、範囲に応じた補助スライダー。
+///
+/// 2 本のスライダーは刻みと小数桁を揃える。egui は桁数を範囲の広さから決めるので、
+/// 指定しないと**範囲の狭い「はみ出し」だけが 2 桁表示**になり、刻みは粗いのに桁は
+/// 細かいという逆転が起きる (実機 FB)。
 pub(crate) fn draw_bucket_region_controls(
     ui: &mut egui::Ui,
     region: &mut crate::mask_db::BucketRegion,
@@ -42,7 +46,8 @@ pub(crate) fn draw_bucket_region_controls(
         ui.add(
             egui::Slider::new(leak_stop, 0.0..=16.0)
                 .text("漏れ止め")
-                .step_by(0.1),
+                .step_by(0.1)
+                .fixed_decimals(1),
         )
         .on_hover_text("細い線や小さな隙間から塗りが漏れるのを防ぎます。0 で無効。");
     }
@@ -50,7 +55,8 @@ pub(crate) fn draw_bucket_region_controls(
         ui.add(
             egui::Slider::new(outset, 0.0..=8.0)
                 .text("はみ出し")
-                .step_by(0.5),
+                .step_by(0.1)
+                .fixed_decimals(1),
         )
         .on_hover_text("図形を外側へ広げます。縁のにじみが残るときに上げてください。");
     }
@@ -63,13 +69,13 @@ pub(crate) fn bucket_shape_fit_failed_message(
 
     match region {
         BucketRegion::Rect => Some(
-            "長方形として当てはまりませんでした。漏れ止めを上げるか、色差の許容値を下げてください。",
+            "長方形として当てはまりませんでした。選択範囲を点滅表示しました。漏れ止めを上げるか、色差の許容値を下げてください。",
         ),
         BucketRegion::Ellipse => Some(
-            "楕円として当てはまりませんでした。漏れ止めを上げるか、色差の許容値を下げてください。",
+            "楕円として当てはまりませんでした。選択範囲を点滅表示しました。漏れ止めを上げるか、色差の許容値を下げてください。",
         ),
         BucketRegion::Circle => Some(
-            "円として当てはまりませんでした。漏れ止めを上げるか、色差の許容値を下げてください。",
+            "円として当てはまりませんでした。選択範囲を点滅表示しました。漏れ止めを上げるか、色差の許容値を下げてください。",
         ),
         BucketRegion::Whole | BucketRegion::Connected => None,
     }

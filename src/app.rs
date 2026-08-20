@@ -5659,6 +5659,13 @@ pub(crate) struct MaskDirtyRect {
     pub y1: usize,
 }
 
+/// 図形バケツが退化して成立しなかったときだけ表示する、診断用の一時 overlay。
+pub(crate) struct BucketRegionFlash {
+    pub(crate) fs_idx: usize,
+    pub(crate) texture: egui::TextureHandle,
+    pub(crate) started_at: f64,
+}
+
 impl MaskDirtyRect {
     pub(crate) fn new(x0: usize, y0: usize, x1: usize, y1: usize) -> Option<Self> {
         (x0 < x1 && y0 < y1).then_some(Self { x0, y0, x1, y1 })
@@ -11854,6 +11861,8 @@ pub struct App {
     /// 最後/最初の項目でさらに進もう/戻ろうとしたとき、または Ctrl+↑↓ で
     /// 画像・動画のあるフォルダが skip_limit 以内に見つからなかったときに表示する。
     pub(crate) fs_boundary_hint: Option<crate::ui_fullscreen::FsBoundaryHint>,
+    /// 3 系統の図形バケツで共有する、整形前 region の一時表示。
+    pub(crate) bucket_region_flash: Option<BucketRegionFlash>,
 
     // ── 消しゴム (Erase) モード ───────────────────────────────────
     /// E キーで切り替える消しゴムモード
@@ -13956,6 +13965,7 @@ impl App {
             editing_addon_install_state: None,
             editing_addon_declined_session: false,
             fs_boundary_hint: None,
+            bucket_region_flash: None,
 
             // 消しゴムモード
             erase_mode: false,

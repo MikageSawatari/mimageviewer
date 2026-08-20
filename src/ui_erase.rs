@@ -1000,7 +1000,13 @@ impl App {
         );
     }
 
-    fn apply_erase_bucket(&mut self, fs_idx: usize, seed_x: usize, seed_y: usize) {
+    fn apply_erase_bucket(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        seed_x: usize,
+        seed_y: usize,
+    ) {
         let Some(source) = self.erase_base_cache.get(&fs_idx).cloned() else {
             self.show_feedback_toast(
                 "バケツに使う画像を準備中です。少し待ってからもう一度クリックしてください。"
@@ -1046,7 +1052,8 @@ impl App {
                 );
                 return;
             }
-            crate::mask_db::BucketFillOutcome::ShapeFitFailed => {
+            crate::mask_db::BucketFillOutcome::ShapeFitFailed(preview) => {
+                self.start_bucket_region_flash(ctx, fs_idx, preview);
                 if let Some(message) =
                     crate::ui_helpers::bucket_shape_fit_failed_message(self.erase_bucket_region)
                 {
@@ -1527,6 +1534,7 @@ impl App {
             {
                 if let Some(fs_idx) = self.fullscreen_idx {
                     self.apply_erase_bucket(
+                        ctx,
                         fs_idx,
                         img_pos.0.floor() as usize,
                         img_pos.1.floor() as usize,
@@ -1859,6 +1867,7 @@ impl App {
                 transform.paint_texture(&painter, tex.id(), egui::Color32::WHITE);
             }
         }
+        self.draw_bucket_region_flash(ui, ctx, transform);
 
         // ドラッグ中のプレビュー
         self.draw_tool_preview(ui, transform);

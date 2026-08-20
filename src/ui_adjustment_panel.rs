@@ -9620,6 +9620,7 @@ impl App {
 
     fn apply_local_adjust_bucket(
         &mut self,
+        ctx: &egui::Context,
         fs_idx: usize,
         layer_idx: usize,
         target: LocalAdjustMaskEditTarget,
@@ -9673,18 +9674,25 @@ impl App {
                     seed_y,
                     fill,
                 );
-                outcome == crate::mask_db::BucketFillOutcome::Filled
+                matches!(&outcome, crate::mask_db::BucketFillOutcome::Filled)
             });
-        if outcome == crate::mask_db::BucketFillOutcome::SeedTooThin {
-            self.show_feedback_toast(
-                "漏れ止めより細い場所です。漏れ止めを小さくしてください。".to_string(),
-            );
-        }
-        if outcome == crate::mask_db::BucketFillOutcome::ShapeFitFailed
-            && let Some(message) =
-                crate::ui_helpers::bucket_shape_fit_failed_message(self.local_adjust_bucket_region)
-        {
-            self.show_feedback_toast(message.to_string());
+        match outcome {
+            crate::mask_db::BucketFillOutcome::SeedTooThin => {
+                self.show_feedback_toast(
+                    "漏れ止めより細い場所です。漏れ止めを小さくしてください。".to_string(),
+                );
+            }
+            crate::mask_db::BucketFillOutcome::ShapeFitFailed(preview) => {
+                self.start_bucket_region_flash(ctx, fs_idx, preview);
+                if let Some(message) = crate::ui_helpers::bucket_shape_fit_failed_message(
+                    self.local_adjust_bucket_region,
+                ) {
+                    self.show_feedback_toast(message.to_string());
+                }
+            }
+            crate::mask_db::BucketFillOutcome::Filled
+            | crate::mask_db::BucketFillOutcome::NoChange
+            | crate::mask_db::BucketFillOutcome::Invalid => {}
         }
         if changed {
             self.local_adjust_show_mask = true;
@@ -11039,7 +11047,7 @@ impl App {
 
             if let Some(target) = active_mask_edit_target {
                 if self.local_adjust_mask_tool == LocalAdjustMaskTool::Bucket {
-                    self.apply_local_adjust_bucket(fs_idx, layer_idx, target, norm);
+                    self.apply_local_adjust_bucket(ctx, fs_idx, layer_idx, target, norm);
                     ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
                     ctx.request_repaint();
                     return;
@@ -11417,6 +11425,7 @@ impl App {
                     ));
             }
         }
+        self.draw_bucket_region_flash(ui, ui.ctx(), transform);
         let shape_layout = local_adjust_image_layout(transform, image_dims);
         let shape_to_screen = shape_layout.map(|_| {
             let w = image_dims.0.max(1) as f32;

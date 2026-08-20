@@ -905,7 +905,13 @@ impl App {
         );
     }
 
-    fn apply_conceal_bucket(&mut self, fs_idx: usize, seed_x: usize, seed_y: usize) {
+    fn apply_conceal_bucket(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        seed_x: usize,
+        seed_y: usize,
+    ) {
         let Some((source, _)) = self.current_conceal_source_pixels(fs_idx) else {
             self.show_feedback_toast(
                 "バケツに使う加工前の画像を準備中です。少し待ってからもう一度クリックしてください。"
@@ -951,7 +957,8 @@ impl App {
                 );
                 return;
             }
-            crate::mask_db::BucketFillOutcome::ShapeFitFailed => {
+            crate::mask_db::BucketFillOutcome::ShapeFitFailed(preview) => {
+                self.start_bucket_region_flash(ctx, fs_idx, preview);
                 if let Some(message) =
                     crate::ui_helpers::bucket_shape_fit_failed_message(self.conceal_bucket_region)
                 {
@@ -1230,6 +1237,7 @@ impl App {
             {
                 if let Some(fs_idx) = self.fullscreen_idx {
                     self.apply_conceal_bucket(
+                        ctx,
                         fs_idx,
                         img_pos.0.floor() as usize,
                         img_pos.1.floor() as usize,
@@ -1786,6 +1794,7 @@ impl App {
                 }
             }
         }
+        self.draw_bucket_region_flash(ui, ctx, transform);
 
         // ツールプレビュー (ドラッグ中)
         self.draw_conceal_tool_preview(ui, transform);

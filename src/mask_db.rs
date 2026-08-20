@@ -714,7 +714,7 @@ fn squared_distance_1d(f: &[f64], out: &mut [f64]) {
 /// 半径を整数に丸めずに済ませるためにこれを使う。正方形の近傍だと半径 1 の次が
 /// 2 で、その間が無い。距離で比較すれば 1.4 や 1.7 が意味を持ち、しかも近傍の
 /// 形が円になるので角を余計に削らない。
-fn squared_distance_map(seeds: &[bool], width: usize, height: usize) -> Vec<f64> {
+pub(crate) fn squared_distance_map(seeds: &[bool], width: usize, height: usize) -> Vec<f64> {
     let len = width * height;
     let mut buf: Vec<f64> = (0..len)
         .map(|i| if seeds[i] { 0.0 } else { f64::INFINITY })
@@ -748,11 +748,11 @@ pub enum BucketRegion {
     Whole,
     /// seed から 4 近傍でつながる近似色。
     Connected,
-    /// 連結領域へ最小面積外接長方形を当てはめる。
+    /// 連結領域内で seed を含む最大の長方形へ整える。
     Rect,
-    /// 連結領域へ楕円を当てはめる。
+    /// 連結領域内で seed を含む最大の楕円へ整える。
     Ellipse,
-    /// 連結領域へ円を当てはめる。
+    /// 連結領域内で seed を含む最大の円へ整える。
     Circle,
 }
 
@@ -794,7 +794,15 @@ pub struct BucketFill {
 ///
 /// 「何も起きなかった」を bool の false 1 つで表すと、**押したのに無反応**の理由が
 /// 利用者にも呼び出し側にも分からない。理由を型で返す。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketRegionPreview {
+    /// 縮小後の表示専用 mask サイズ。
+    pub size: [usize; 2],
+    /// true の画素だけを診断用 overlay として描く。
+    pub mask: Vec<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BucketFillOutcome {
     /// 少なくとも 1 画素が変わった。
     Filled,
@@ -802,10 +810,37 @@ pub enum BucketFillOutcome {
     NoChange,
     /// seed が漏れ止めで消える細さの場所にある。マスクは変えていない。
     SeedTooThin,
-    /// 連結領域の被覆率が低いなど、指定図形として安全に当てはまらない。
-    ShapeFitFailed,
+    /// 指定図形が退化して成立しない。整形前の領域は表示専用の縮小 mask で返す。
+    ShapeFitFailed(BucketRegionPreview),
     /// 寸法 0 / seed が範囲外 / 配列長が足りない。
     Invalid,
+}
+
+fn bucket_region_preview(region: &[bool], width: usize, height: usize) -> BucketRegionPreview {
+    const MAX_LONG_EDGE: usize = 1024;
+    let longest = width.max(height);
+    let scale = if longest > MAX_LONG_EDGE {
+        MAX_LONG_EDGE as f64 / longest as f64
+    } else {
+        1.0
+    };
+    let preview_w = ((width as f64 * scale).ceil() as usize).max(1);
+    let preview_h = ((height as f64 * scale).ceil() as usize).max(1);
+    let mut mask = vec![false; preview_w * preview_h];
+    for (idx, inside) in region.iter().copied().enumerate() {
+        if !inside {
+            continue;
+        }
+        let x = idx % width;
+        let y = idx / width;
+        let preview_x = (x * preview_w / width).min(preview_w - 1);
+        let preview_y = (y * preview_h / height).min(preview_h - 1);
+        mask[preview_y * preview_w + preview_x] = true;
+    }
+    BucketRegionPreview {
+        size: [preview_w, preview_h],
+        mask,
+    }
 }
 
 /// seed 色との差が許容内の画素を立てた地図。
@@ -995,17 +1030,31 @@ pub fn flood_fill_bitmap_mask(
             ..crate::shape_fit::FitOptions::default()
         };
         let fitted = match fill.region {
-            BucketRegion::Rect => crate::shape_fit::fit_rect(&region, width, height, fit_options),
-            BucketRegion::Ellipse => {
-                crate::shape_fit::fit_ellipse(&region, width, height, fit_options, false)
+            BucketRegion::Rect => {
+                crate::shape_fit::fit_rect(&region, width, height, (seed_x, seed_y), fit_options)
             }
-            BucketRegion::Circle => {
-                crate::shape_fit::fit_ellipse(&region, width, height, fit_options, true)
-            }
+            BucketRegion::Ellipse => crate::shape_fit::fit_ellipse(
+                &region,
+                width,
+                height,
+                (seed_x, seed_y),
+                fit_options,
+                false,
+            ),
+            BucketRegion::Circle => crate::shape_fit::fit_ellipse(
+                &region,
+                width,
+                height,
+                (seed_x, seed_y),
+                fit_options,
+                true,
+            ),
             BucketRegion::Whole | BucketRegion::Connected => unreachable!(),
         };
         let Some(fitted) = fitted else {
-            return BucketFillOutcome::ShapeFitFailed;
+            return BucketFillOutcome::ShapeFitFailed(bucket_region_preview(
+                &region, width, height,
+            ));
         };
         region.fill(false);
         match fitted {
@@ -2152,34 +2201,45 @@ mod tests {
         let red = egui::Color32::from_rgb(180, 30, 30);
         let blue = egui::Color32::from_rgb(30, 30, 180);
         let mut colors = vec![blue; w * h];
-        for y in 4..8 {
-            for x in 2..8 {
-                colors[y * w + x] = red;
-            }
-        }
-        for x in 8..15 {
-            colors[5 * w + x] = red;
-        }
+        colors[5 * w + 7] = red;
         let image = color_image(&colors, w, h);
         let mut mask = vec![false; w * h];
 
-        assert_eq!(
-            flood_fill_bitmap_mask(
-                &mut mask,
-                &image,
-                2,
-                4,
-                BucketFill {
-                    tolerance: 0,
-                    region: BucketRegion::Rect,
-                    value: true,
-                    leak_stop: 0.0,
-                    outset: 0.0,
-                },
-            ),
-            BucketFillOutcome::ShapeFitFailed
+        let outcome = flood_fill_bitmap_mask(
+            &mut mask,
+            &image,
+            7,
+            5,
+            BucketFill {
+                tolerance: 0,
+                region: BucketRegion::Rect,
+                value: true,
+                leak_stop: 0.0,
+                outset: 0.0,
+            },
         );
+        let BucketFillOutcome::ShapeFitFailed(preview) = outcome else {
+            panic!("one pixel cannot form a rectangle");
+        };
+        assert_eq!(preview.size, [w, h]);
+        assert_eq!(preview.mask.iter().filter(|inside| **inside).count(), 1);
+        assert!(preview.mask[5 * w + 7]);
         assert!(mask.iter().all(|inside| !inside));
+    }
+
+    #[test]
+    fn bucket_region_preview_caps_long_edge_and_keeps_sparse_pixels() {
+        let (w, h) = (2048, 1024);
+        let mut region = vec![false; w * h];
+        region[0] = true;
+        region[(h - 1) * w + w - 1] = true;
+
+        let preview = bucket_region_preview(&region, w, h);
+
+        assert_eq!(preview.size, [1024, 512]);
+        assert!(preview.mask[0]);
+        assert!(preview.mask[511 * 1024 + 1023]);
+        assert_eq!(preview.mask.iter().filter(|inside| **inside).count(), 2);
     }
 
     #[test]

@@ -4554,6 +4554,69 @@ pub(crate) fn slideshow_history_trigger() -> crate::app::HistoryTrigger {
 }
 
 impl App {
+    pub(crate) fn start_bucket_region_flash(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        preview: crate::mask_db::BucketRegionPreview,
+    ) {
+        let [w, h] = preview.size;
+        let expected_len = w.saturating_mul(h);
+        if w == 0 || h == 0 || preview.mask.len() < expected_len {
+            self.bucket_region_flash = None;
+            return;
+        }
+        let mut rgba = vec![0_u8; expected_len * 4];
+        for (idx, inside) in preview.mask.into_iter().take(expected_len).enumerate() {
+            if inside {
+                rgba[idx * 4] = 250;
+                rgba[idx * 4 + 1] = 210;
+                rgba[idx * 4 + 2] = 60;
+                rgba[idx * 4 + 3] = 150;
+            }
+        }
+        let texture = ctx.load_texture(
+            format!("bucket-region-flash-{fs_idx}"),
+            egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba),
+            egui::TextureOptions::NEAREST,
+        );
+        self.bucket_region_flash = Some(crate::app::BucketRegionFlash {
+            fs_idx,
+            texture,
+            started_at: ctx.input(|input| input.time),
+        });
+        ctx.request_repaint();
+    }
+
+    pub(crate) fn draw_bucket_region_flash(
+        &mut self,
+        ui: &egui::Ui,
+        ctx: &egui::Context,
+        transform: &DisplayedImageTransform,
+    ) {
+        const VISIBLE_SECONDS: f64 = 1.0;
+        const FADE_SECONDS: f64 = 0.3;
+
+        let now = ctx.input(|input| input.time);
+        let Some(flash) = self.bucket_region_flash.as_ref() else {
+            return;
+        };
+        let elapsed = (now - flash.started_at).max(0.0);
+        if elapsed >= VISIBLE_SECONDS || self.fullscreen_idx != Some(flash.fs_idx) {
+            self.bucket_region_flash = None;
+            return;
+        }
+        let opacity = if elapsed <= VISIBLE_SECONDS - FADE_SECONDS {
+            1.0
+        } else {
+            ((VISIBLE_SECONDS - elapsed) / FADE_SECONDS).clamp(0.0, 1.0)
+        };
+        let tint = egui::Color32::from_white_alpha((opacity * 255.0).round() as u8);
+        let painter = ui.painter().with_clip_rect(transform.viewport_rect);
+        transform.paint_texture(&painter, flash.texture.id(), tint);
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+    }
+
     /// 分析モードを解除し、関連する状態をリセットする。
     pub(crate) fn reset_analysis_mode(&mut self) {
         let restore_idx = self.fullscreen_idx;
