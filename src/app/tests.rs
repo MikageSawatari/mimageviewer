@@ -28157,6 +28157,26 @@ mod pipeline_cache_refactor_tests {
     }
 
     #[test]
+    fn navigation_target_only_open_starts_target_without_prefetching_neighbors() {
+        let mut app = setup_app();
+        let target = push_image(&mut app, r"C:\missing\page-turn-target.png");
+        let neighbor = push_image(&mut app, r"C:\missing\page-turn-neighbor.png");
+        app.visible_indices = vec![target, neighbor];
+        app.details_order = vec![target, neighbor];
+
+        app.open_fullscreen_with_materialization(
+            target,
+            HistoryTrigger::UserChosen,
+            FsOpenMaterialization::NavigationTargetMaterializationOnly,
+        );
+
+        assert_eq!(app.fs_page_load_state(target), FsPageLoadState::LoadPending);
+        assert_eq!(app.fs_page_load_state(neighbor), FsPageLoadState::NeedsLoad);
+        assert!(app.fs_pending.contains_key(&target));
+        assert!(!app.fs_pending.contains_key(&neighbor));
+    }
+
+    #[test]
     fn deferring_page_turn_work_cancels_producers_but_preserves_resident_results() {
         let ctx = egui::Context::default();
         let mut app = setup_app();
@@ -28236,6 +28256,65 @@ mod pipeline_cache_refactor_tests {
         assert!(app.final_effect_pending.is_empty());
         assert!(app.fs_cache.contains_key(&resident_idx));
         assert_eq!(app.fs_upload_backlog.len(), 1);
+    }
+
+    #[test]
+    fn materialized_page_turn_polls_target_final_effect_but_leaves_prefetch_result() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let target_idx = push_image(&mut app, r"C:\pics\target-final-effect.png");
+        let prefetch_idx = push_image(&mut app, r"C:\pics\prefetch-final-effect.png");
+        app.fullscreen_idx = Some(target_idx);
+        app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous: None,
+            opened_at: std::time::Instant::now(),
+            target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                items_generation: app.items_generation,
+                pages: vec![target_idx],
+                phase: FsNavigationTargetPhase::Awaiting {
+                    accept_rendition: true,
+                },
+            }),
+        }));
+
+        let mut senders = Vec::new();
+        let items_generation = app.items_generation;
+        for idx in [target_idx, prefetch_idx] {
+            let key = FinalCompositeKey {
+                edit_key: dummy_edit_key(&app, idx),
+                params_hash: 1,
+                bg: 0,
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(FinalCompositeResult::Cancelled).unwrap();
+            senders.push(tx);
+            app.final_effect_pending.insert(
+                key,
+                FinalEffectPending {
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    rx,
+                    items_generation,
+                    output_complete: true,
+                    nearest_sampler: false,
+                    prefetch: idx != target_idx,
+                },
+            );
+        }
+
+        app.poll_final_effects(&ctx);
+
+        assert!(
+            app.final_effect_pending
+                .keys()
+                .all(|key| key.edit_key.idx != target_idx),
+            "materialized target result must be consumed"
+        );
+        assert!(
+            app.final_effect_pending
+                .keys()
+                .any(|key| key.edit_key.idx == prefetch_idx),
+            "non-target result must remain deferred"
+        );
     }
 
     #[test]

@@ -419,10 +419,12 @@ materialization 待ちの edit / final assembly は `None` を返し、未完成
    そこで初めて先読みが起動する。
 
 ページ送りの unresolved rendition sequence 中も、worker の完成結果は同じ viewer context /
-`items_generation` の `fs_upload_backlog` に集約する。UI 側の admission は新規
-full-resolution work と target 外の先読み upload を保留するが、現在の typed navigation target
-page set に属する完成済み upload は許可する。見開きの片側がすでに ready、もう片側が backlog、
-thumbnail は未準備という順序でも、target materialization が sequence 自身の抑止で止まらないための
+`items_generation` の `fs_upload_backlog` に集約する。UI 側の admission は paint source に
+従う。ready rendition を描く `Deferred` では target を含む full-resolution work を保留する。
+rendition が無く materialized source を描く `NavigationTargetMaterializationOnly` では、
+現在の typed navigation target page set に属する producer、final-effect 回収、完成済み upload を
+許可し、target 外の先読みだけを保留する。見開きの片側がすでに ready、もう片側が未ロード、
+thumbnail も未準備という順序でも、target materialization が sequence 自身の抑止で止まらないための
 所有境界である。mount / park / activate では `fullscreen_idx`、navigation sequence、
 `fs_pending`、`fs_upload_backlog`、`items_generation` を同じ `ViewerContextBundle` として
 交換し、sibling context の result を target 例外として消化しない。

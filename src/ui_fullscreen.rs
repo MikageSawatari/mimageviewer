@@ -8346,9 +8346,9 @@ struct FsFrameState {
     pdf_content_type: Option<PdfPageContentType>,
 }
 
-/// Per-frame page-turn choices. Paint selection and full-resolution work admission are distinct,
-/// but they are not independent: an unresolved target must still be allowed to consume already
-/// completed uploads that can retire its own navigation sequence.
+/// Per-frame page-turn choices. Paint selection owns full-resolution work admission: a target
+/// painted from its materialized source must be allowed to produce and consume the work that can
+/// retire its navigation sequence, while a ready pass-through rendition keeps that work deferred.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FsPageTurnPaintSource {
     Materialized,
@@ -8358,10 +8358,13 @@ enum FsPageTurnPaintSource {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FsPageTurnWorkAdmission {
     All,
-    /// Keep new/full prefetch work deferred, but admit completed backlog uploads belonging to the
-    /// current typed navigation target. Otherwise the sequence can suppress the only transition
-    /// capable of retiring itself.
-    NavigationTargetUploadsOnly,
+    /// Admit producer and consumer work belonging to the current typed navigation target, while
+    /// keeping unrelated prefetch work deferred. Otherwise a materialized paint source can
+    /// suppress the only transition capable of retiring its own sequence.
+    NavigationTargetMaterializationOnly,
+    /// A ready pass-through rendition is the paint source, so all full-resolution work remains
+    /// deferred until that rendition has been presented.
+    Deferred,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8400,26 +8403,49 @@ impl FsPageTurnDecision {
         self.paint_source
     }
 
-    pub(crate) const fn defers_full_resolution_work(self) -> bool {
+    pub(crate) const fn admits_navigation_target_materialization(self) -> bool {
         matches!(
             self.work_admission,
-            FsPageTurnWorkAdmission::NavigationTargetUploadsOnly
+            FsPageTurnWorkAdmission::All
+                | FsPageTurnWorkAdmission::NavigationTargetMaterializationOnly
         )
+    }
+
+    pub(crate) const fn admits_non_target_full_resolution_work(self) -> bool {
+        matches!(self.work_admission, FsPageTurnWorkAdmission::All)
+    }
+
+    pub(crate) const fn defers_non_target_full_resolution_work(self) -> bool {
+        !self.admits_non_target_full_resolution_work()
+    }
+
+    const fn navigation_target_open_materialization(self) -> FsOpenMaterialization {
+        match self.work_admission {
+            FsPageTurnWorkAdmission::All => FsOpenMaterialization::Eager,
+            FsPageTurnWorkAdmission::NavigationTargetMaterializationOnly => {
+                FsOpenMaterialization::NavigationTargetMaterializationOnly
+            }
+            FsPageTurnWorkAdmission::Deferred => FsOpenMaterialization::DeferredPageTurn,
+        }
     }
 
     pub(crate) const fn admits_backlog_upload(self, belongs_to_navigation_target: bool) -> bool {
         match self.work_admission {
             FsPageTurnWorkAdmission::All => true,
-            FsPageTurnWorkAdmission::NavigationTargetUploadsOnly => belongs_to_navigation_target,
+            FsPageTurnWorkAdmission::NavigationTargetMaterializationOnly => {
+                belongs_to_navigation_target
+            }
+            FsPageTurnWorkAdmission::Deferred => false,
         }
     }
 
     const fn work_admission_label(self) -> &'static str {
         match self.work_admission {
             FsPageTurnWorkAdmission::All => "all",
-            FsPageTurnWorkAdmission::NavigationTargetUploadsOnly => {
-                "navigation_target_uploads_only"
+            FsPageTurnWorkAdmission::NavigationTargetMaterializationOnly => {
+                "navigation_target_materialization_only"
             }
+            FsPageTurnWorkAdmission::Deferred => "deferred",
         }
     }
 
@@ -8501,10 +8527,10 @@ fn fs_page_turn_decision_probe_fields(
         ("reason", serde_json::Value::from(reason)),
         (
             "defer_ui_uploads",
-            // Backward-compatible probe field: true still means that new/full-resolution work and
-            // non-target prefetch uploads are deferred. `ui_work_admission` records the target
-            // upload exception introduced after the 2026-08-20 deadlock.
-            serde_json::Value::from(decision.defers_full_resolution_work()),
+            // Backward-compatible probe field: true still means that at least non-target
+            // full-resolution work is deferred. `ui_work_admission` records whether target
+            // materialization is admitted by the selected paint source.
+            serde_json::Value::from(decision.defers_non_target_full_resolution_work()),
         ),
         (
             "ui_work_admission",
@@ -8878,8 +8904,10 @@ fn page_turn_decision_for_inputs(
         } else {
             FsPageTurnPaintSource::Materialized
         },
-        work_admission: if rendition_sequence_active {
-            FsPageTurnWorkAdmission::NavigationTargetUploadsOnly
+        work_admission: if pass_through {
+            FsPageTurnWorkAdmission::Deferred
+        } else if rendition_sequence_active {
+            FsPageTurnWorkAdmission::NavigationTargetMaterializationOnly
         } else {
             FsPageTurnWorkAdmission::All
         },
@@ -12997,6 +13025,19 @@ impl App {
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
     }
 
+    fn ensure_fs_page_turn_target_load(
+        &mut self,
+        decision: FsPageTurnDecision,
+        idx: usize,
+    ) -> Option<FsPageLoadState> {
+        if !decision.admits_navigation_target_materialization()
+            || !self.items.get(idx).is_some_and(GridItem::has_page_data)
+        {
+            return None;
+        }
+        Some(self.ensure_fs_page_load(idx))
+    }
+
     pub(crate) fn render_fullscreen_viewport(&mut self, ctx: &egui::Context) {
         let Some(fs_idx) = self.fullscreen_idx else {
             // in-window 静止画モードで PDF/ZIP enumerate defer 中:
@@ -13015,15 +13056,15 @@ impl App {
         self.harvest_page_dims_from_fs_cache();
 
         let page_turn_decision = self.fs_page_turn_decision_for_frame(ctx, fs_idx);
-        if !page_turn_decision.defers_full_resolution_work()
-            && self.items.get(fs_idx).is_some_and(GridItem::has_page_data)
+        let stop_page_needs_load =
+            matches!(self.fs_page_load_state(fs_idx), FsPageLoadState::NeedsLoad);
+        if self
+            .ensure_fs_page_turn_target_load(page_turn_decision, fs_idx)
+            .is_some()
         {
-            // A pass-through open intentionally did not start the full-resolution
-            // producer. The first physical-level release frame materializes only
-            // the page on which navigation stopped.
-            let stop_page_needs_load =
-                matches!(self.fs_page_load_state(fs_idx), FsPageLoadState::NeedsLoad);
-            self.ensure_fs_page_load(fs_idx);
+            // A pass-through open intentionally did not start the full-resolution producer.
+            // Materialized paint re-asserts it here, including while the navigation sequence is
+            // still waiting for a rendition that may never arrive.
             if stop_page_needs_load && self.reading_flow.is_paged() {
                 self.update_prefetch_window(fs_idx);
             }
@@ -13075,8 +13116,10 @@ impl App {
         if let SpreadPair::Double { left, right } = spread_pair {
             let partner = if left == fs_idx { right } else { left };
             self.advance_animation(ctx, partner);
-            if !page_turn_decision.defers_full_resolution_work() {
-                self.ensure_fs_page_load(partner);
+            if self
+                .ensure_fs_page_turn_target_load(page_turn_decision, partner)
+                .is_some()
+            {
                 self.refresh_fullscreen_pdf_promotion();
             }
         }
@@ -13598,21 +13641,25 @@ impl App {
                             })
                             .and_then(|idx| self.pdf_content_bbox_for_display_idx(idx));
 
-                        if current_is_pdf && !state.page_turn_decision.defers_full_resolution_work()
+                        if current_is_pdf
+                            && self
+                                .ensure_fs_page_turn_target_load(state.page_turn_decision, fs_idx)
+                                .is_some()
                         {
-                            self.ensure_fs_page_load(fs_idx);
                             self.ensure_pdf_display_resolution(fs_idx, pdf_current_bbox);
                         }
-                        if !state.page_turn_decision.defers_full_resolution_work()
-                            && let Some(partner) = pdf_partner
+                        if let Some(partner) = pdf_partner
+                            && matches!(self.items.get(partner), Some(GridItem::PdfPage { .. }))
+                            && self
+                                .ensure_fs_page_turn_target_load(state.page_turn_decision, partner)
+                                .is_some()
                         {
-                            if matches!(self.items.get(partner), Some(GridItem::PdfPage { .. })) {
-                                self.ensure_fs_page_load(partner);
-                                self.refresh_fullscreen_pdf_promotion();
-                                self.ensure_pdf_display_resolution(partner, pdf_partner_bbox);
-                            }
+                            self.refresh_fullscreen_pdf_promotion();
+                            self.ensure_pdf_display_resolution(partner, pdf_partner_bbox);
                         }
-                        if !state.page_turn_decision.defers_full_resolution_work()
+                        if state
+                            .page_turn_decision
+                            .admits_non_target_full_resolution_work()
                             && pdf_target_changed
                             && (current_is_pdf || partner_is_pdf)
                             && self.reading_flow.is_paged()
@@ -15497,11 +15544,12 @@ impl App {
 
     /// Say when non-target full-resolution work has remained deferred for an unusually long time.
     ///
-    /// Target-owned backlog uploads remain admitted, so this streak no longer describes a global
-    /// upload stop. It still identifies a navigation sequence that has taken unusually long to
-    /// present, while the passthrough diagnostic records which low-resolution source is missing.
+    /// Target-owned materialization remains admitted when the paint source needs it, so this
+    /// streak describes deferred non-target work rather than a global upload stop. It still
+    /// identifies a navigation sequence that has taken unusually long to present, while the
+    /// passthrough diagnostic records which low-resolution source is missing.
     fn note_upload_deferral(&mut self, fs_idx: usize, decision: FsPageTurnDecision) {
-        if !decision.defers_full_resolution_work() {
+        if !decision.defers_non_target_full_resolution_work() {
             self.upload_deferral_streak = 0;
             return;
         }
@@ -23099,17 +23147,13 @@ impl App {
         }
 
         let target_is_still_page = self.items.get(idx).is_some_and(GridItem::has_page_data);
-        let materialization = if target_is_still_page
-            && self.fullscreen_idx.is_some()
-            && self
-                .fs_page_turn_decision_for_frame(ctx, idx)
-                .defers_full_resolution_work()
-        {
-            FsOpenMaterialization::DeferredPageTurn
+        let materialization = if target_is_still_page && self.fullscreen_idx.is_some() {
+            self.fs_page_turn_decision_for_frame(ctx, idx)
+                .navigation_target_open_materialization()
         } else {
             FsOpenMaterialization::Eager
         };
-        if matches!(materialization, FsOpenMaterialization::DeferredPageTurn) {
+        if !matches!(materialization, FsOpenMaterialization::Eager) {
             self.defer_page_turn_full_resolution_work();
         }
 
@@ -36425,14 +36469,15 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_page_turn_keeps_atomic_holdover_while_admitting_target_uploads() {
+    fn unresolved_page_turn_keeps_atomic_holdover_while_admitting_target_materialization() {
         let decision = page_turn_decision_for_inputs(true, false);
 
         assert_eq!(decision.paint_source(), FsPageTurnPaintSource::Materialized);
         assert_eq!(
             decision.work_admission,
-            FsPageTurnWorkAdmission::NavigationTargetUploadsOnly
+            FsPageTurnWorkAdmission::NavigationTargetMaterializationOnly
         );
+        assert!(decision.admits_navigation_target_materialization());
         assert!(decision.admits_backlog_upload(true));
         assert!(!decision.admits_backlog_upload(false));
         assert!(!decision.passthrough_rendition_ready);
@@ -36453,7 +36498,7 @@ mod tests {
         );
         assert_eq!(
             page_turn_probe_field(&fields, "ui_work_admission"),
-            &serde_json::Value::String("navigation_target_uploads_only".to_owned())
+            &serde_json::Value::String("navigation_target_materialization_only".to_owned())
         );
     }
 
@@ -36535,19 +36580,19 @@ mod tests {
     }
 
     #[test]
-    fn page_turn_decision_preserves_target_materialization_without_admitting_prefetch() {
+    fn page_turn_decision_ties_target_materialization_and_open_to_paint_source() {
         let cases = [
             (
                 true,
                 true,
                 FsPageTurnPaintSource::PassThrough,
-                FsPageTurnWorkAdmission::NavigationTargetUploadsOnly,
+                FsPageTurnWorkAdmission::Deferred,
             ),
             (
                 true,
                 false,
                 FsPageTurnPaintSource::Materialized,
-                FsPageTurnWorkAdmission::NavigationTargetUploadsOnly,
+                FsPageTurnWorkAdmission::NavigationTargetMaterializationOnly,
             ),
             (
                 false,
@@ -36567,14 +36612,28 @@ mod tests {
             let decision = page_turn_decision_for_inputs(active, ready);
             assert_eq!(decision.paint_source(), expected_source);
             assert_eq!(decision.work_admission, expected_admission);
-            assert!(decision.admits_backlog_upload(true));
+            assert_eq!(
+                decision.admits_navigation_target_materialization(),
+                !active || !ready
+            );
+            assert_eq!(
+                decision.navigation_target_open_materialization(),
+                if active && ready {
+                    FsOpenMaterialization::DeferredPageTurn
+                } else if active {
+                    FsOpenMaterialization::NavigationTargetMaterializationOnly
+                } else {
+                    FsOpenMaterialization::Eager
+                }
+            );
+            assert_eq!(decision.admits_backlog_upload(true), !active || !ready);
             assert_eq!(decision.admits_backlog_upload(false), !active);
             assert_eq!(decision.passthrough_rendition_ready, ready);
         }
     }
 
     #[test]
-    fn navigation_target_upload_admission_is_phase_generation_and_target_scoped() {
+    fn navigation_target_materialization_scope_is_phase_generation_and_target_scoped() {
         let mut app = crate::app::setup_app_for_test();
         app.items = (0..3)
             .map(|idx| GridItem::Image(PathBuf::from(format!("c:/test/scope-{idx}.png"))))
@@ -36624,6 +36683,182 @@ mod tests {
             FsNavigationTargetPhase::Ready(FsNavigationPresentation::Materialized),
         ));
         assert_eq!(app.fs_navigation_rendition_target_pages(1), None);
+    }
+
+    #[test]
+    fn spread_target_without_thumbnail_or_full_size_starts_both_loads_and_settles_materialized() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = (0..2)
+            .map(|idx| {
+                GridItem::Image(PathBuf::from(format!(
+                    "c:/missing/spread-producer-deadlock-{idx}.webp"
+                )))
+            })
+            .collect();
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.image_metas = vec![None; app.items.len()];
+        app.visible_indices = vec![0, 1];
+        app.details_order = vec![0, 1];
+        app.fullscreen_idx = Some(0);
+        app.selected = Some(0);
+        app.reading_flow = ReadingFlow::Paged;
+        app.spread_mode = SpreadMode::Ltr;
+        app.fs_nav_locked_gen = Some(app.items_generation);
+        app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous: None,
+            opened_at: std::time::Instant::now(),
+            target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                items_generation: app.items_generation,
+                pages: vec![0, 1],
+                phase: FsNavigationTargetPhase::Awaiting {
+                    accept_rendition: true,
+                },
+            }),
+        }));
+
+        let decision = app.fs_page_turn_decision_for_frame(&ctx, 0);
+        assert_eq!(decision.paint_source(), FsPageTurnPaintSource::Materialized);
+        assert_eq!(
+            decision.work_admission,
+            FsPageTurnWorkAdmission::NavigationTargetMaterializationOnly
+        );
+        for idx in [0, 1] {
+            assert_eq!(
+                app.ensure_fs_page_turn_target_load(decision, idx),
+                Some(FsPageLoadState::LoadPending),
+                "target page {idx} must enter the full-size producer"
+            );
+            assert!(app.fs_pending.contains_key(&idx));
+        }
+
+        // Replace the real missing-file workers after proving they were started. Fake successful
+        // completions make the state-transition half deterministic without timing or filesystem
+        // retries.
+        for (idx, color) in [
+            (0, egui::Color32::LIGHT_BLUE),
+            (1, egui::Color32::LIGHT_GREEN),
+        ] {
+            let pending = app.fs_pending.remove(&idx).expect("started producer");
+            pending
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.fs_pending.insert(
+                idx,
+                crate::app::FsPendingValue::new(
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    rx,
+                    20 + idx as u64,
+                    crate::app::FsLoadPurpose::for_page(false),
+                ),
+            );
+            tx.send(crate::fs_animation::FsLoadResult::StaticCached {
+                pixels: std::sync::Arc::new(egui::ColorImage::filled([2, 3], color)),
+                source_dims: [2, 3],
+            })
+            .unwrap();
+        }
+
+        app.poll_prefetch(&ctx);
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Pending));
+        assert!(matches!(app.thumbnails[1], ThumbnailState::Pending));
+        assert!(app.fs_cache.contains_key(&0));
+        assert!(app.fs_cache.contains_key(&1));
+
+        app.resolve_fs_navigation_sequence_target(&ctx, 0, false);
+        assert!(matches!(
+            app.fs_holdover_tex
+                .as_ref()
+                .and_then(FsHoldover::navigation_sequence)
+                .map(|sequence| &sequence.target),
+            Some(FsNavigationSequenceTarget::Display(
+                FsNavigationDisplayTarget {
+                    phase: FsNavigationTargetPhase::Ready(FsNavigationPresentation::Materialized),
+                    ..
+                }
+            ))
+        ));
+
+        assert!(app.fs_nav_holdover_for_draw().is_none());
+        let trace_pages = [0, 1]
+            .into_iter()
+            .map(|idx| {
+                let texture_id = match app.fs_cache.get(&idx) {
+                    Some(FsCacheEntry::Static { tex, .. }) => tex.id(),
+                    _ => panic!("target page {idx} was not materialized"),
+                };
+                FsDisplayUnitTracePage {
+                    idx,
+                    texture_id,
+                    provenance: FsDisplayUnitPageProvenance::Live,
+                    source: "fs_cache",
+                }
+            })
+            .collect::<Vec<_>>();
+        app.observe_fs_navigation_sequence_presented(&trace_pages);
+        assert!(app.fs_holdover_tex.is_none());
+        assert!(app.fs_nav_locked_gen.is_none());
+    }
+
+    #[test]
+    fn ready_rendition_defers_target_full_resolution_producer_and_upload() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = (0..2)
+            .map(|idx| GridItem::Image(PathBuf::from(format!("c:/test/rendition-{idx}.png"))))
+            .collect();
+        app.thumbnails = (0..2)
+            .map(|idx| {
+                let pixels = std::sync::Arc::new(egui::ColorImage::filled(
+                    [2, 3],
+                    egui::Color32::from_rgb(40 + idx * 20, 80, 120),
+                ));
+                app.thumb_pixels.insert(idx as usize, pixels.clone());
+                ThumbnailState::Loaded {
+                    tex: ctx.load_texture(
+                        format!("ready_rendition_{idx}"),
+                        pixels.as_ref().clone(),
+                        egui::TextureOptions::LINEAR,
+                    ),
+                    from_cache: true,
+                    from_edit_preview: false,
+                    rendered_at_px: 3,
+                    source_dims: Some((2, 3)),
+                    layout_dims: None,
+                }
+            })
+            .collect();
+        app.fullscreen_idx = Some(0);
+        app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous: None,
+            opened_at: std::time::Instant::now(),
+            target: FsNavigationSequenceTarget::Display(FsNavigationDisplayTarget {
+                items_generation: app.items_generation,
+                pages: vec![0, 1],
+                phase: FsNavigationTargetPhase::Ready(FsNavigationPresentation::Rendition),
+            }),
+        }));
+
+        let decision = app.fs_page_turn_decision_for_frame(&ctx, 0);
+        assert_eq!(decision.paint_source(), FsPageTurnPaintSource::PassThrough);
+        assert_eq!(decision.work_admission, FsPageTurnWorkAdmission::Deferred);
+        assert_eq!(app.ensure_fs_page_turn_target_load(decision, 0), None);
+        assert_eq!(app.ensure_fs_page_turn_target_load(decision, 1), None);
+        assert!(app.fs_pending.is_empty());
+
+        app.fs_upload_backlog.push(crate::app::FsUploadResult::new(
+            0,
+            crate::fs_animation::FsLoadResult::StaticCached {
+                pixels: std::sync::Arc::new(egui::ColorImage::filled([2, 3], egui::Color32::WHITE)),
+                source_dims: [2, 3],
+            },
+            30,
+            crate::app::FsLoadPurpose::for_page(false),
+        ));
+        app.poll_prefetch(&ctx);
+        assert!(!app.fs_cache.contains_key(&0));
+        assert_eq!(app.fs_upload_backlog.len(), 1);
     }
 
     #[test]
@@ -36768,7 +37003,8 @@ mod tests {
         let presented = page_turn_decision_for_inputs(false, true);
 
         assert_eq!(ready.paint_source(), FsPageTurnPaintSource::PassThrough);
-        assert!(ready.defers_full_resolution_work());
+        assert!(ready.defers_non_target_full_resolution_work());
+        assert!(!ready.admits_navigation_target_materialization());
         assert_eq!(
             presented,
             FsPageTurnDecision {
@@ -37321,7 +37557,7 @@ mod tests {
             }),
         }));
         let decision = page_turn_decision_for_inputs(true, true);
-        assert!(decision.defers_full_resolution_work());
+        assert!(decision.defers_non_target_full_resolution_work());
         assert!(app.fs_nav_holdover_for_draw().is_none());
 
         let one_drawn = FsNavigatorTextureSources::single(
@@ -37362,7 +37598,7 @@ mod tests {
         assert!(app.fs_holdover_tex.is_none());
         let (sequence_active, rendition_ready) = app.fs_navigation_sequence_rendition_state(0);
         let next_decision = page_turn_decision_for_inputs(sequence_active, rendition_ready);
-        assert!(!next_decision.defers_full_resolution_work());
+        assert!(!next_decision.defers_non_target_full_resolution_work());
     }
 
     /// Build an app sitting in fullscreen on a video whose thumbnail has loaded.
@@ -37687,7 +37923,7 @@ mod tests {
         let decision = page_turn_decision_for_inputs(false, false);
 
         assert_eq!(decision.paint_source(), FsPageTurnPaintSource::Materialized);
-        assert!(!decision.defers_full_resolution_work());
+        assert!(!decision.defers_non_target_full_resolution_work());
         assert!(!decision.passthrough_rendition_ready);
 
         let previous = FsPageTurnReadySignature {

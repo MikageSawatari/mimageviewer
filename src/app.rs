@@ -6087,17 +6087,25 @@ pub(crate) enum FsPageDisplaySource {
     RetainedPdfFinalAi,
 }
 
-/// Whether an explicit fullscreen open should start full-resolution work now.
-/// Page-turn pass-through uses the deferred variant; release returns to Eager
-/// without storing a second navigation-mode flag in App state.
+/// Which full-resolution work an explicit fullscreen open may start. A materialized page-turn
+/// landing starts its target without opening the non-target prefetch window; pass-through keeps
+/// both deferred. Release returns to `Eager` without a second navigation-mode flag in App state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FsOpenMaterialization {
     Eager,
+    NavigationTargetMaterializationOnly,
     DeferredPageTurn,
 }
 
 impl FsOpenMaterialization {
-    const fn is_eager(self) -> bool {
+    const fn admits_navigation_target_materialization(self) -> bool {
+        matches!(
+            self,
+            Self::Eager | Self::NavigationTargetMaterializationOnly
+        )
+    }
+
+    const fn admits_non_target_full_resolution_work(self) -> bool {
         matches!(self, Self::Eager)
     }
 }
@@ -9315,7 +9323,7 @@ pub struct App {
     /// rendition that will not build, versus a draw path that has stopped running.
     pub(crate) passthrough_last_call:
         std::collections::HashMap<usize, (u64, Option<PassthroughUnavailable>)>,
-    /// Consecutive frames whose page-turn decision deferred texture uploads. See
+    /// Consecutive frames whose page-turn decision deferred non-target full-resolution work. See
     /// `App::note_upload_deferral`.
     pub(crate) upload_deferral_streak: u64,
     /// Set once when a display cache is found holding another page's entry. App-wide on
@@ -43687,12 +43695,14 @@ impl App {
             Some(GridItem::Image(_))
             | Some(GridItem::ZipImage { .. })
             | Some(GridItem::PdfPage { .. }) => {
-                if materialization.is_eager() {
+                if materialization.admits_navigation_target_materialization() {
                     let load_state = self.ensure_fs_page_load(idx);
                     if load_state.is_display_ready() {
                         crate::logger::log(format!("  cache hit idx={idx} → instant display"));
                     }
-                    if self.reading_flow.is_paged() {
+                    if materialization.admits_non_target_full_resolution_work()
+                        && self.reading_flow.is_paged()
+                    {
                         self.update_prefetch_window(idx);
                     }
                 }
@@ -57359,18 +57369,30 @@ impl App {
         if self.final_effect_pending.is_empty() {
             return;
         }
-        if let Some(fs_idx) = self.fullscreen_idx
-            && self
-                .fs_page_turn_decision_for_frame(ctx, fs_idx)
-                .defers_full_resolution_work()
-        {
-            // Completed workers retain their channel result until physical release.
-            // Collecting here would perform a full-size UI-thread texture upload.
-            return;
-        }
+        let page_turn_work_gate = self.fullscreen_idx.map(|fs_idx| {
+            let decision = self.fs_page_turn_decision_for_frame(ctx, fs_idx);
+            let target_pages = if decision.defers_non_target_full_resolution_work() {
+                self.fs_navigation_rendition_target_pages(fs_idx)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            (decision, target_pages)
+        });
+        let final_effect_is_admitted = |key: &FinalCompositeKey| match &page_turn_work_gate {
+            Some((decision, target_pages)) => {
+                decision.admits_backlog_upload(target_pages.contains(&key.edit_key.idx))
+            }
+            None => true,
+        };
         let mut completed = Vec::new();
         let mut disconnected = Vec::new();
         for (&key, pending) in &self.final_effect_pending {
+            if !final_effect_is_admitted(&key) {
+                // The worker retains its channel result. Once the paint source admits this page,
+                // a later poll consumes it without restarting the work.
+                continue;
+            }
             match pending.rx.try_recv() {
                 Ok(result) => completed.push((key, result)),
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -57499,7 +57521,11 @@ impl App {
                 }
             }
         }
-        if !self.final_effect_pending.is_empty() {
+        if self
+            .final_effect_pending
+            .keys()
+            .any(final_effect_is_admitted)
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
         if had_updates {
@@ -63262,7 +63288,7 @@ impl App {
         // backlog は通常 <10 要素なので Vec::remove の O(n) は実質コストなし。
         let page_turn_upload_gate = self.fullscreen_idx.map(|fs_idx| {
             let decision = self.fs_page_turn_decision_for_frame(ctx, fs_idx);
-            let target_pages = if decision.defers_full_resolution_work() {
+            let target_pages = if decision.defers_non_target_full_resolution_work() {
                 self.fs_navigation_rendition_target_pages(fs_idx)
                     .unwrap_or_default()
             } else {
@@ -66041,10 +66067,8 @@ impl eframe::App for App {
         if let Some(fs_idx) = self.fullscreen_idx {
             // プリセットに基づいてアップスケール設定を同期
             self.sync_upscale_from_preset(fs_idx);
-            let defer_page_turn_materialization = self
-                .fs_page_turn_decision_for_frame(ctx, fs_idx)
-                .defers_full_resolution_work();
-            if !defer_page_turn_materialization {
+            let page_turn_decision = self.fs_page_turn_decision_for_frame(ctx, fs_idx);
+            if page_turn_decision.admits_navigation_target_materialization() {
                 let continuous_keep_set = if !self.reading_flow.is_paged()
                     && self.fs_vertical_cache_keep_set.contains(&fs_idx)
                 {
@@ -66098,7 +66122,13 @@ impl eframe::App for App {
                 // 起こさない (= 内部で has_uncancelled_final_ai_pending を gate に使う)。
                 // Pipeline P1 リファクタで dead code 化していた旧 `prefetch_ai_upscale` の
                 // 後継 (= ページ送り時 AI を待たされる退行を直す)。
-                self.prefetch_final_ai(ctx, fs_idx);
+                if page_turn_decision.admits_non_target_full_resolution_work() {
+                    self.prefetch_final_ai(ctx, fs_idx);
+                } else {
+                    // Target final-effect results are part of materialization; unrelated
+                    // prefetch results stay in their channels until the sequence settles.
+                    self.poll_final_effects(ctx);
+                }
             }
         }
         let t_fullscreen_work = frame_t0.elapsed();

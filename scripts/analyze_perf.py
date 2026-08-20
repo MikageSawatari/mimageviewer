@@ -915,15 +915,28 @@ def analyze_page_turn_invariants(events: list[dict]) -> dict:
     )
     for decision in decisions:
         work_admission = decision.get("ui_work_admission")
-        target_uploads_only = (
-            work_admission == "navigation_target_uploads_only"
+        reason = decision.get("reason")
+        paint_source = decision.get("mode")
+        if paint_source is None and reason in {"materialized", "pass_through"}:
+            paint_source = reason
+        expected_admission = {
+            "materialized": "navigation_target_materialization_only",
+            "pass_through": "deferred",
+        }.get(paint_source)
+        admission_follows_paint_source = (
+            work_admission == expected_admission
             if work_admission is not None
             else decision.get("defer_ui_uploads") is True
         )
+        sequence_decision = decision.get("passthrough_rendition_ready") is True
+        if work_admission is not None:
+            sequence_decision = (
+                sequence_decision or reason == "passthrough_rendition_unavailable"
+            )
         if (
-            decision.get("passthrough_rendition_ready") is True
-            and decision.get("reason") != "pending_zero"
-            and not target_uploads_only
+            sequence_decision
+            and reason != "pending_zero"
+            and not admission_follows_paint_source
         ):
             violations.append({
                 "id": "I5",

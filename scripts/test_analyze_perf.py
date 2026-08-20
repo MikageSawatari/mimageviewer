@@ -543,7 +543,7 @@ class PageTurnInvariantCliTests(unittest.TestCase):
                         1.05,
                         2,
                         defer_ui_uploads=True,
-                        ui_work_admission="navigation_target_uploads_only",
+                        ui_work_admission="deferred",
                     )
                 ],
             ),
