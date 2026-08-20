@@ -308,7 +308,7 @@ PDF は **非同期**で開く:
 
 ```
 1. 即座に items = [] で画面を更新
-2. PDF ワーカープロセスに enumerate 要求を投げる (別スレッド)
+2. 別スレッド内で PDF worker pool を遅延初期化し、enumerate 要求を投げる
 3. pdf_enumerate_pending に受信チャネルを保持
 4. 毎フレーム poll_pdf_enumerate() で結果チェック
 5. 成功: GridItem::PdfPage を pages 分だけ追加
@@ -316,7 +316,9 @@ PDF は **非同期**で開く:
 ```
 
 PDF ワーカーは別プロセス (`mimageviewer.exe --pdf-worker`)。プロセス間通信は
-stdin/stdout の長さプレフィクス付きバイナリプロトコル。
+stdin/stdout の長さプレフィクス付きバイナリプロトコル。初回の子プロセス起動と readiness
+待ちは `pdf-enumerate-nav` スレッド上で行うため、UI スレッドは pool 初期化を待たない。
+列挙スレッド自体を起動できなかった場合も receiver へ明示的なエラーを返す。
 
 ### 2.3 自動 1 ページ目フルスクリーン (`auto_fullscreen_zip_pdf`)
 

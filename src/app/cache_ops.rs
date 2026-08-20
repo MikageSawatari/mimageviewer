@@ -620,7 +620,7 @@ impl App {
 
                         if batch_pdf {
                             // enumerate_pages がパスワード不正時に Err を返すので
-                            // check_password_needed は不要
+                            // 事前のパスワード判定は不要
                             let pages = match crate::pdf_loader::enumerate_pages(pdf_path, pw_ref) {
                                 Ok(p) => p,
                                 Err(_) => continue,

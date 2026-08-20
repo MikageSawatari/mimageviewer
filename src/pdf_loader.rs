@@ -16,8 +16,8 @@
 //!   │     ├── Worker 1: mimageviewer.exe --pdf-worker
 //!   │     └── Worker 2: mimageviewer.exe --pdf-worker
 //!   │
-//!   └── PdfWorker (in-process, 優先チャネル用)
-//!       Enumerate / CheckPassword / async Render は従来通り
+//!   └── PdfWorker (in-process, フルスクリーン再レンダリング専用)
+//!       async Render を優先 / 通常チャネルで処理
 //! ```
 //!
 //! 通信: stdin/stdout バイナリプロトコル (長さプレフィックス付き)。
@@ -1717,15 +1717,9 @@ impl PdfWorkerPool {
         }
         let worker_count = pending_workers.len();
 
-        if worker_count == 0 {
-            crate::logger::log(
-                "pdf-pool: startup complete ready=0; falling back to in-process worker",
-            );
-        } else {
-            crate::logger::log(format!(
-                "pdf-pool: startup complete ready={worker_count} requested={POOL_SIZE}"
-            ));
-        }
+        crate::logger::log(format!(
+            "pdf-pool: startup complete ready={worker_count} requested={POOL_SIZE}"
+        ));
 
         let mut dispatcher_threads = Vec::with_capacity(worker_count);
         // 各 worker の Child を Arc<Mutex<Option<Child>>> で共有。dispatcher は
@@ -2472,31 +2466,10 @@ impl Drop for PdfWorkerPool {
 }
 
 // -----------------------------------------------------------------------
-// In-process ワーカースレッド (UI スレッドの非同期 API 用)
+// フルスクリーン再レンダリング専用の in-process PDFium スレッド
 // -----------------------------------------------------------------------
 
 enum WorkerRequest {
-    Enumerate {
-        path: PathBuf,
-        password: Option<String>,
-        reply: mpsc::Sender<std::io::Result<Vec<PdfPageEntry>>>,
-        /// UI ナビゲーション経路 (`enumerate_pages_async`) のみ `Some(epoch)` を添え、
-        /// ワーカーが pickup 時に最新 epoch と比較して stale なら skip する。
-        /// バックグラウンド (キャッシュ作成等の `enumerate_pages` 同期経路) は `None` で、
-        /// 常に実行する (Codex P2 対策: UI nav の epoch とバックグラウンドが干渉して
-        /// アクティブな UI の PDF が Interrupted で落ちるのを防ぐ)。
-        epoch: Option<u64>,
-        /// **review #14 対応**: `enumerate_pages_async` の in-process fallback で、
-        /// `PdfEnumerateHandle::cancel` を worker 経路にも伝搬する。pool 経由なら
-        /// `pool.execute(.., Some(&cancel), ..)` で同じ仕組みが効くが、pool 不在環境
-        /// での fallback では従来 None だったため、ハンドル drop で cancel が立っても
-        /// 実 enumerate を止められなかった。pool ありの経路では None でよい。
-        cancel: Option<Arc<AtomicBool>>,
-    },
-    CheckPassword {
-        path: PathBuf,
-        reply: mpsc::Sender<PdfAccessStatus>,
-    },
     Render {
         path: PathBuf,
         page_num: u32,
@@ -2505,38 +2478,18 @@ enum WorkerRequest {
         cancel: Option<Arc<AtomicBool>>,
         reply: mpsc::Sender<std::io::Result<RenderResult>>,
     },
-    AnalyzePage {
-        path: PathBuf,
-        page_num: u32,
-        password: Option<String>,
-        cancel: Option<Arc<AtomicBool>>,
-        reply: mpsc::Sender<std::io::Result<PdfPageAnalysis>>,
-    },
-    /// PDF document info (§16 step 17, ingest_worker 経由で呼ばれる)
-    GetInfo {
-        path: PathBuf,
-        password: Option<String>,
-        reply: mpsc::Sender<std::io::Result<PdfDocumentInfo>>,
-    },
 }
 
+/// フルスクリーン再レンダリング専用の in-process PDFium スレッド。
 struct PdfWorker {
     tx: mpsc::Sender<WorkerRequest>,
     priority_tx: mpsc::Sender<WorkerRequest>,
 }
 
+/// フルスクリーン再レンダリング専用の in-process PDFium スレッドを保持する。
 static WORKER: OnceLock<PdfWorker> = OnceLock::new();
 
-/// Enumerate エポック。`enumerate_pages_async` が呼ばれるたびに +1 され、
-/// 要求に現在値を添付する。ワーカーが要求をピックアップした時点で `LATEST_ENUMERATE_EPOCH`
-/// より古いなら、ユーザーは既に別の PDF へ移動済みなので skip して次を処理する。
-///
-/// **バグ修正 (2026-04)**: Ctrl+↑↓ で PDF を連打すると enumerate 要求がキューに積まれ、
-/// ワーカー (pdfium はスレッドセーフ不可で 1 スレッド) が古い要求を律儀に処理し続けて
-/// 最新の PDF が開くまで 10 秒超の黒画面になる事故が発生していた。
-/// epoch 比較で stale 要求を即捨てれば、ユーザー視点では実質「最新の 1 件だけ」処理される。
-static LATEST_ENUMERATE_EPOCH: AtomicU64 = AtomicU64::new(0);
-
+/// フルスクリーン再レンダリング専用の in-process PDFium スレッドを返す。
 fn get_worker() -> &'static PdfWorker {
     WORKER.get_or_init(|| PdfWorker::start())
 }
@@ -2603,56 +2556,6 @@ impl PdfWorker {
 
     fn handle_request(pdfium: &Pdfium, req: WorkerRequest) {
         match req {
-            WorkerRequest::Enumerate {
-                path,
-                password,
-                reply,
-                epoch,
-                cancel,
-            } => {
-                // Stale な enumerate 要求は即捨てる。ユーザーが Ctrl+↑↓ 連打で複数 PDF を
-                // 通過した場合、古い要求を律儀に処理する必要はない。
-                //
-                // Codex P2 対策: epoch は UI ナビゲーション経路
-                // (`enumerate_pages_async`) のみ `Some(_)` で渡される。バックグラウンド
-                // のキャッシュ作成等で呼ばれる同期 `enumerate_pages()` は `None` を渡すので
-                // skip 判定の対象外。`is_stale = epoch.is_some_and(|e| e < latest)` とすること
-                // で、nav 側が後から来て epoch を進めても background 要求は影響を受けない。
-                if let Some(e) = epoch {
-                    let latest = LATEST_ENUMERATE_EPOCH.load(Ordering::SeqCst);
-                    if e < latest {
-                        crate::logger::log(format!(
-                            "pdf-worker: skipping stale enumerate (epoch {e} < latest {latest}) for {}",
-                            path.display()
-                        ));
-                        let _ = reply.send(Err(std::io::Error::new(
-                            std::io::ErrorKind::Interrupted,
-                            "enumerate request superseded by newer navigation",
-                        )));
-                        return;
-                    }
-                }
-                // **review #14 対応**: cancel が立っていれば実 PDFium を呼ばずに
-                // Interrupted を返す。fallback 経路で UI が `PdfEnumerateHandle` を
-                // drop した直後はここで捨てる (PDFium 呼び出しは長い場合に分秒級)。
-                if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
-                    let _ = reply.send(Err(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        "enumerate cancelled before start",
-                    )));
-                    return;
-                }
-                let result = core_enumerate(pdfium, &path, password.as_deref());
-                if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
-                    // 結果が出てから cancel に追いつかれたケース: rx は既に drop されて
-                    // いる可能性が高いので、send 失敗は無視。
-                    return;
-                }
-                let _ = reply.send(result);
-            }
-            WorkerRequest::CheckPassword { path, reply } => {
-                let _ = reply.send(Self::do_check_password(pdfium, &path));
-            }
             WorkerRequest::Render {
                 path,
                 page_num,
@@ -2679,29 +2582,6 @@ impl PdfWorker {
                 }
                 let _ = reply.send(result);
             }
-            WorkerRequest::AnalyzePage {
-                path,
-                page_num,
-                password,
-                cancel,
-                reply,
-            } => {
-                if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
-                    return;
-                }
-                let result = core_analyze_page(pdfium, &path, page_num, password.as_deref());
-                if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
-                    return;
-                }
-                let _ = reply.send(result);
-            }
-            WorkerRequest::GetInfo {
-                path,
-                password,
-                reply,
-            } => {
-                let _ = reply.send(core_get_info(pdfium, &path, password.as_deref()));
-            }
         }
     }
 
@@ -2720,43 +2600,12 @@ impl PdfWorker {
 
     fn reply_init_error(req: &WorkerRequest, e: &str) {
         match req {
-            WorkerRequest::Enumerate { reply, .. } => {
-                let _ = reply.send(Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                )));
-            }
-            WorkerRequest::CheckPassword { reply, .. } => {
-                let _ = reply.send(PdfAccessStatus::Error(e.to_string()));
-            }
             WorkerRequest::Render { reply, .. } => {
                 let _ = reply.send(Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     e.to_string(),
                 )));
             }
-            WorkerRequest::AnalyzePage { reply, .. } => {
-                let _ = reply.send(Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                )));
-            }
-            WorkerRequest::GetInfo { reply, .. } => {
-                let _ = reply.send(Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                )));
-            }
-        }
-    }
-
-    fn do_check_password(pdfium: &Pdfium, path: &Path) -> PdfAccessStatus {
-        match pdfium.load_pdf_from_file(path, None) {
-            Ok(_) => PdfAccessStatus::Ok,
-            Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError)) => {
-                PdfAccessStatus::PasswordRequired
-            }
-            Err(e) => PdfAccessStatus::Error(format!("{e}")),
         }
     }
 }
@@ -3034,12 +2883,6 @@ impl PdfDocumentInfo {
     }
 }
 
-pub enum PdfAccessStatus {
-    Ok,
-    PasswordRequired,
-    Error(String),
-}
-
 // -----------------------------------------------------------------------
 // 公開 API — 同期版 (バックグラウンドスレッド用)
 // -----------------------------------------------------------------------
@@ -3047,39 +2890,28 @@ pub enum PdfAccessStatus {
 /// PDF document info (Title / Author / Subject / Keywords) を取得する。
 /// 全文検索インデクサ (`ingest_worker`) が PDF メタを ingest するときに呼ぶ (§16 step 17)。
 ///
-/// worker プロセスプールがあれば IPC 経由、なければ in-process ワーカーにフォールバック。
+/// worker プロセスプールへ IPC 経由で要求する。
 pub fn get_document_info(
     pdf_path: &Path,
     password: Option<&str>,
 ) -> std::io::Result<PdfDocumentInfo> {
     let pool = get_pool();
-    if pool.worker_count > 0 {
-        let req = encode_get_info_request(pdf_path, password);
-        let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
-        // get_document_info は indexer 経由の background なので epoch=0 + AbortOnCancel
-        let resp = pool.execute(
-            &req,
-            None,
-            JobPriority::Normal,
-            Some(perf_key),
-            0,
-            CancelWaitPolicy::AbortOnCancel,
-        )?;
-        return PdfWorkerPool::parse_get_info_response(&resp.bytes);
-    }
-    // in-process フォールバック
-    let (tx, rx) = mpsc::channel();
-    let _ = get_worker().priority_tx.send(WorkerRequest::GetInfo {
-        path: pdf_path.to_path_buf(),
-        password: password.map(String::from),
-        reply: tx,
-    });
-    rx.recv()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?
+    let req = encode_get_info_request(pdf_path, password);
+    let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
+    // get_document_info は indexer 経由の background なので epoch=0 + AbortOnCancel
+    let resp = pool.execute(
+        &req,
+        None,
+        JobPriority::Normal,
+        Some(perf_key),
+        0,
+        CancelWaitPolicy::AbortOnCancel,
+    )?;
+    PdfWorkerPool::parse_get_info_response(&resp.bytes)
 }
 
 /// AI canonical loader が vector PDF を pixel 化する前に型付きで拒否するための解析 API。
-/// worker process pool と in-process fallback のどちらでも PDFium 呼び出しは worker 上で行う。
+/// PDFium 呼び出しは worker process pool 上で行う。
 pub fn analyze_page_content_type(
     pdf_path: &Path,
     page_num: u32,
@@ -3087,30 +2919,17 @@ pub fn analyze_page_content_type(
     cancel: Option<Arc<AtomicBool>>,
 ) -> std::io::Result<PdfPageAnalysis> {
     let pool = get_pool();
-    if pool.worker_count > 0 {
-        let req = encode_analyze_page_request(pdf_path, page_num, password);
-        let perf_key = crate::grid_item::pdf_page_perf_key(pdf_path, page_num);
-        let resp = pool.execute(
-            &req,
-            cancel.as_ref(),
-            JobPriority::Normal,
-            Some(perf_key),
-            0,
-            CancelWaitPolicy::AbortOnCancel,
-        )?;
-        return PdfWorkerPool::parse_analyze_page_response(&resp.bytes);
-    }
-
-    let (tx, rx) = mpsc::channel();
-    let _ = get_worker().priority_tx.send(WorkerRequest::AnalyzePage {
-        path: pdf_path.to_path_buf(),
-        page_num,
-        password: password.map(String::from),
-        cancel,
-        reply: tx,
-    });
-    rx.recv()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?
+    let req = encode_analyze_page_request(pdf_path, page_num, password);
+    let perf_key = crate::grid_item::pdf_page_perf_key(pdf_path, page_num);
+    let resp = pool.execute(
+        &req,
+        cancel.as_ref(),
+        JobPriority::Normal,
+        Some(perf_key),
+        0,
+        CancelWaitPolicy::AbortOnCancel,
+    )?;
+    PdfWorkerPool::parse_analyze_page_response(&resp.bytes)
 }
 
 pub fn enumerate_pages(
@@ -3122,8 +2941,7 @@ pub fn enumerate_pages(
 
 /// `enumerate_pages` の cancel 対応版。`process_meta_only` のように、上位の
 /// epoch / cancel 機構 (例: `thumb_loader::bump_catchup_epoch`) から呼ばれる経路で
-/// 使う (Codex P3-2 対応)。pool 経路では `pool.execute` の cancel に、in-process
-/// fallback では `WorkerRequest::Enumerate.cancel` に伝搬する。
+/// 使う (Codex P3-2 対応)。`pool.execute` の cancel に伝搬する。
 ///
 /// `cancel=None` だと旧 `enumerate_pages` と同等動作。バックグラウンドのキャッシュ
 /// 作成等で使う。
@@ -3133,37 +2951,20 @@ pub fn enumerate_pages_with_cancel(
     cancel: Option<Arc<AtomicBool>>,
 ) -> std::io::Result<Vec<PdfPageEntry>> {
     let pool = get_pool();
-    if pool.worker_count > 0 {
-        let req = encode_enumerate_request(pdf_path, password);
-        // enumerate は列挙のみで軽量 (PDFium page 列挙) だが Normal 扱いでよい
-        let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
-        // enumerate_pages_with_cancel は background catch-up 経路なので epoch=0
-        // + AbortOnCancel (enumerate は cheap、cache 保存ロジック無し)。
-        // (UI nav の enumerate は `enumerate_pages_async` 側で別途 LATEST_ENUMERATE_EPOCH
-        // で stale 判定する)
-        let resp = pool.execute(
-            &req,
-            cancel.as_ref(),
-            JobPriority::Normal,
-            Some(perf_key),
-            0,
-            CancelWaitPolicy::AbortOnCancel,
-        )?;
-        return PdfWorkerPool::parse_enumerate_response(&resp.bytes);
-    }
-    // フォールバック: in-process ワーカー。
-    // 同期経路 (キャッシュ作成等) なので epoch は None を渡す (Codex P2: UI nav の
-    // epoch 進行でキャッシュ作成中の enumerate が Interrupted で落ちるのを防ぐ)。
-    let (tx, rx) = mpsc::channel();
-    let _ = get_worker().priority_tx.send(WorkerRequest::Enumerate {
-        path: pdf_path.to_path_buf(),
-        password: password.map(String::from),
-        reply: tx,
-        epoch: None,
-        cancel,
-    });
-    rx.recv()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?
+    let req = encode_enumerate_request(pdf_path, password);
+    // enumerate は列挙のみで軽量 (PDFium page 列挙) だが Normal 扱いでよい
+    let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
+    // enumerate_pages_with_cancel は background catch-up 経路なので epoch=0
+    // + AbortOnCancel (enumerate は cheap、cache 保存ロジック無し)。
+    let resp = pool.execute(
+        &req,
+        cancel.as_ref(),
+        JobPriority::Normal,
+        Some(perf_key),
+        0,
+        CancelWaitPolicy::AbortOnCancel,
+    )?;
+    PdfWorkerPool::parse_enumerate_response(&resp.bytes)
 }
 
 pub fn render_page(
@@ -3315,178 +3116,128 @@ fn render_page_target(
     };
 
     let pool = get_pool();
-    if pool.worker_count > 0 {
-        if perf_enabled {
-            let busy_count = pool.workers_busy();
-            crate::perf::event(
-                "pdf",
-                "pool_send",
-                Some(&perf_key),
-                0,
-                &[
-                    ("page", serde_json::Value::from(page_num)),
-                    ("target_px", serde_json::Value::from(target_px)),
-                    ("target_kind", serde_json::Value::from(target_kind)),
-                    ("viewport_w", serde_json::Value::from(viewport_w)),
-                    ("viewport_h", serde_json::Value::from(viewport_h)),
-                    ("busy", serde_json::Value::from(busy_count)),
-                    ("total", serde_json::Value::from(pool.worker_count)),
-                    ("priority", serde_json::Value::from(format!("{priority:?}"))),
-                ],
-            );
-        }
-        let req = encode_render_request(pdf_path, page_num, target, password, perf_enabled);
-        let resp = pool.execute(
-            &req,
-            cancel.as_ref(),
-            priority,
-            Some(perf_key.clone()),
-            context_epoch,
-            cancel_policy,
-        )?;
-        let result = PdfWorkerPool::parse_render_response(&resp.bytes);
-        if perf_enabled {
-            let ms = t0.elapsed().as_secs_f64() * 1000.0;
-            let metrics_available = resp.worker_render.is_some();
-            let worker = resp.worker_render.unwrap_or_default();
-            let worker_render_ms = worker.render_us as f64 / 1000.0;
-            let worker_serialize_ms = worker.serialize_us as f64 / 1000.0;
-            let worker_write_ms = worker.write_us as f64 / 1000.0;
-            let parent_read_ms = resp.parent_read.read_us as f64 / 1000.0;
-            // write/read は同じ pipe 転送を両端から測った重複区間なので加算しない。
-            let critical_path_ms = render_critical_path_ms(worker, resp.parent_read);
-            let timing_consistent = metrics_available && critical_path_ms <= ms;
-            let (render_w, render_h, render_long_px) = result
-                .as_ref()
-                .map(|result| {
-                    let w = result.image.width();
-                    let h = result.image.height();
-                    (w, h, w.max(h))
-                })
-                .unwrap_or((0, 0, 0));
-            crate::perf::event(
-                "pdf",
-                "pool_recv",
-                Some(&perf_key),
-                0,
-                &[
-                    ("page", serde_json::Value::from(page_num)),
-                    ("rtt_ms", serde_json::Value::from(ms)),
-                    (
-                        "worker_render_ms",
-                        serde_json::Value::from(worker_render_ms),
-                    ),
-                    (
-                        "worker_serialize_ms",
-                        serde_json::Value::from(worker_serialize_ms),
-                    ),
-                    ("worker_write_ms", serde_json::Value::from(worker_write_ms)),
-                    ("parent_read_ms", serde_json::Value::from(parent_read_ms)),
-                    (
-                        "critical_path_ms",
-                        serde_json::Value::from(critical_path_ms),
-                    ),
-                    (
-                        "unaccounted_ms",
-                        serde_json::Value::from((ms - critical_path_ms).max(0.0)),
-                    ),
-                    (
-                        "timing_consistent",
-                        serde_json::Value::from(timing_consistent),
-                    ),
-                    (
-                        "metrics_available",
-                        serde_json::Value::from(metrics_available),
-                    ),
-                    (
-                        "response_bytes",
-                        serde_json::Value::from(worker.response_bytes),
-                    ),
-                    (
-                        "worker_wire_bytes",
-                        serde_json::Value::from(worker.wire_bytes),
-                    ),
-                    (
-                        "worker_write_calls",
-                        serde_json::Value::from(worker.write_calls),
-                    ),
-                    (
-                        "worker_flush_calls",
-                        serde_json::Value::from(worker.flush_calls),
-                    ),
-                    (
-                        "parent_wire_bytes",
-                        serde_json::Value::from(resp.parent_read.wire_bytes),
-                    ),
-                    (
-                        "parent_read_calls",
-                        serde_json::Value::from(resp.parent_read.read_calls),
-                    ),
-                    (
-                        "parent_pipe_bytes",
-                        serde_json::Value::from(resp.parent_read.pipe_bytes),
-                    ),
-                    (
-                        "parent_pipe_read_calls",
-                        serde_json::Value::from(resp.parent_read.pipe_read_calls),
-                    ),
-                    ("render_w", serde_json::Value::from(render_w)),
-                    ("render_h", serde_json::Value::from(render_h)),
-                    ("render_long_px", serde_json::Value::from(render_long_px)),
-                    ("ok", serde_json::Value::from(result.is_ok())),
-                ],
-            );
-        }
-        return result;
-    }
-
-    // フォールバック: in-process ワーカー
     if perf_enabled {
+        let busy_count = pool.workers_busy();
         crate::perf::event(
             "pdf",
-            "inproc_send",
+            "pool_send",
             Some(&perf_key),
             0,
-            &[("page", serde_json::Value::from(page_num))],
+            &[
+                ("page", serde_json::Value::from(page_num)),
+                ("target_px", serde_json::Value::from(target_px)),
+                ("target_kind", serde_json::Value::from(target_kind)),
+                ("viewport_w", serde_json::Value::from(viewport_w)),
+                ("viewport_h", serde_json::Value::from(viewport_h)),
+                ("busy", serde_json::Value::from(busy_count)),
+                ("total", serde_json::Value::from(pool.worker_count)),
+                ("priority", serde_json::Value::from(format!("{priority:?}"))),
+            ],
         );
     }
-    let (tx, rx) = mpsc::channel();
-    let _ = get_worker().tx.send(WorkerRequest::Render {
-        path: pdf_path.to_path_buf(),
-        page_num,
-        target,
-        password: password.map(String::from),
-        cancel,
-        reply: tx,
-    });
-    let result = rx
-        .recv()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+    let req = encode_render_request(pdf_path, page_num, target, password, perf_enabled);
+    let resp = pool.execute(
+        &req,
+        cancel.as_ref(),
+        priority,
+        Some(perf_key.clone()),
+        context_epoch,
+        cancel_policy,
+    )?;
+    let result = PdfWorkerPool::parse_render_response(&resp.bytes);
     if perf_enabled {
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let metrics_available = resp.worker_render.is_some();
+        let worker = resp.worker_render.unwrap_or_default();
+        let worker_render_ms = worker.render_us as f64 / 1000.0;
+        let worker_serialize_ms = worker.serialize_us as f64 / 1000.0;
+        let worker_write_ms = worker.write_us as f64 / 1000.0;
+        let parent_read_ms = resp.parent_read.read_us as f64 / 1000.0;
+        // write/read は同じ pipe 転送を両端から測った重複区間なので加算しない。
+        let critical_path_ms = render_critical_path_ms(worker, resp.parent_read);
+        let timing_consistent = metrics_available && critical_path_ms <= ms;
+        let (render_w, render_h, render_long_px) = result
+            .as_ref()
+            .map(|result| {
+                let w = result.image.width();
+                let h = result.image.height();
+                (w, h, w.max(h))
+            })
+            .unwrap_or((0, 0, 0));
         crate::perf::event(
             "pdf",
-            "inproc_recv",
+            "pool_recv",
             Some(&perf_key),
             0,
             &[
                 ("page", serde_json::Value::from(page_num)),
                 ("rtt_ms", serde_json::Value::from(ms)),
+                (
+                    "worker_render_ms",
+                    serde_json::Value::from(worker_render_ms),
+                ),
+                (
+                    "worker_serialize_ms",
+                    serde_json::Value::from(worker_serialize_ms),
+                ),
+                ("worker_write_ms", serde_json::Value::from(worker_write_ms)),
+                ("parent_read_ms", serde_json::Value::from(parent_read_ms)),
+                (
+                    "critical_path_ms",
+                    serde_json::Value::from(critical_path_ms),
+                ),
+                (
+                    "unaccounted_ms",
+                    serde_json::Value::from((ms - critical_path_ms).max(0.0)),
+                ),
+                (
+                    "timing_consistent",
+                    serde_json::Value::from(timing_consistent),
+                ),
+                (
+                    "metrics_available",
+                    serde_json::Value::from(metrics_available),
+                ),
+                (
+                    "response_bytes",
+                    serde_json::Value::from(worker.response_bytes),
+                ),
+                (
+                    "worker_wire_bytes",
+                    serde_json::Value::from(worker.wire_bytes),
+                ),
+                (
+                    "worker_write_calls",
+                    serde_json::Value::from(worker.write_calls),
+                ),
+                (
+                    "worker_flush_calls",
+                    serde_json::Value::from(worker.flush_calls),
+                ),
+                (
+                    "parent_wire_bytes",
+                    serde_json::Value::from(resp.parent_read.wire_bytes),
+                ),
+                (
+                    "parent_read_calls",
+                    serde_json::Value::from(resp.parent_read.read_calls),
+                ),
+                (
+                    "parent_pipe_bytes",
+                    serde_json::Value::from(resp.parent_read.pipe_bytes),
+                ),
+                (
+                    "parent_pipe_read_calls",
+                    serde_json::Value::from(resp.parent_read.pipe_read_calls),
+                ),
+                ("render_w", serde_json::Value::from(render_w)),
+                ("render_h", serde_json::Value::from(render_h)),
+                ("render_long_px", serde_json::Value::from(render_long_px)),
                 ("ok", serde_json::Value::from(result.is_ok())),
             ],
         );
     }
     result
-}
-
-pub fn check_password_needed(pdf_path: &Path) -> PdfAccessStatus {
-    let (tx, rx) = mpsc::channel();
-    let _ = get_worker().priority_tx.send(WorkerRequest::CheckPassword {
-        path: pdf_path.to_path_buf(),
-        reply: tx,
-    });
-    rx.recv()
-        .unwrap_or(PdfAccessStatus::Error("worker channel closed".to_string()))
 }
 
 // -----------------------------------------------------------------------
@@ -3543,7 +3294,7 @@ pub struct PdfEnumerateHandle {
 }
 
 impl PdfEnumerateHandle {
-    /// 明示キャンセル。pool dispatcher / in-process worker が pop 時に確認して早期破棄する。
+    /// 明示キャンセル。pool dispatcher が pop 時に確認して早期破棄する。
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
@@ -3559,15 +3310,15 @@ impl Drop for PdfEnumerateHandle {
 
 /// UI ナビゲーション経路の PDF ページ列挙。
 ///
-/// Ctrl+↑↓ で PDF を高速連打したときの grid 更新頻度を上げるため、以下の 3 点を組み合わせる:
+/// Ctrl+↑↓ で PDF を高速連打したときの grid 更新頻度を上げるため、以下を組み合わせる:
 ///
-/// 1. **multi-process pool + `JobPriority::Critical`** — pool が利用可能なら 3 並列で
-///    列挙、Normal priority のキャッシュ作成等を押しのけて先に処理する。
-/// 2. **cancel token をジョブに添える** — 旧ハンドルを drop すると `PdfEnumerateHandle::Drop`
+/// 1. **pool 初期化を列挙スレッド内で行う** — 初回の子プロセス起動完了を UI スレッドで
+///    待たず、呼び出し元へ直ちにハンドルを返す。
+/// 2. **multi-process pool + `JobPriority::Critical`** — Normal priority のキャッシュ作成等を
+///    押しのけて先に処理する。
+/// 3. **cancel token をジョブに添える** — 旧ハンドルを drop すると `PdfEnumerateHandle::Drop`
 ///    が cancel を立て、pool dispatcher が pop 時に IPC 前で捨てる。古いジョブが PDFium
 ///    時間を消費してキューを詰まらせない。
-/// 3. **in-process fallback では `LATEST_ENUMERATE_EPOCH` で stale skip** — pool 不在
-///    環境 (setup-pdfium.sh 未実行等) でも連打による黒画面長期化を抑止する。
 pub fn enumerate_pages_async(pdf_path: &Path, password: Option<&str>) -> PdfEnumerateHandle {
     let cancel = Arc::new(AtomicBool::new(false));
     if crate::perf::is_enabled() {
@@ -3575,71 +3326,39 @@ pub fn enumerate_pages_async(pdf_path: &Path, password: Option<&str>) -> PdfEnum
         crate::perf::event("pdf", "enumerate_send", Some(&perf_key), 0, &[]);
     }
 
-    let pool = get_pool();
-    if pool.worker_count > 0 {
-        // 別スレッドで pool.execute を呼ぶ (pool.execute は内部で reply_rx を待つため
-        // ブロッキング; UI は即 rx を受け取って pending に入れたい)。
-        // thread 寿命は dispatcher が job を pop して cancel 検出で早期 reply するまで、
-        // 通常 0〜数 ms。連打で 30/sec spawn しても CPU 負荷は許容範囲。
-        let (tx, rx) = mpsc::channel();
-        let req = encode_enumerate_request(pdf_path, password);
-        let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
-        let cancel_w = Arc::clone(&cancel);
-        match std::thread::Builder::new()
-            .name("pdf-enumerate-nav".into())
-            .spawn(move || {
-                // Critical は epoch チェック対象外 (= 0 で send) + AbortOnCancel
-                // (UI nav の即時応答 UX を優先、harvest は不要)
-                let resp = pool.execute(
-                    &req,
-                    Some(&cancel_w),
-                    JobPriority::Critical,
-                    Some(perf_key),
-                    0,
-                    CancelWaitPolicy::AbortOnCancel,
-                );
-                let result = resp
-                    .and_then(|response| PdfWorkerPool::parse_enumerate_response(&response.bytes));
-                let _ = tx.send(result);
-            }) {
-            Ok(_) => return PdfEnumerateHandle { cancel, rx },
-            Err(e) => {
-                // リソース不足等で Builder::spawn が失敗すると、tx が閉じ込められた
-                // closure もろとも drop されて rx が即 Disconnected になる → App 側で
-                // 「空 PDF」にフォールバックしてしまう。代わりに in-process worker 経路へ
-                // 落として、ユーザには正常な enumerate か explicit なエラーを返す。
-                crate::logger::log(format!(
-                    "pdf-enumerate-nav: spawn failed ({e}), falling back to in-process worker"
-                ));
-                drop(rx); // 旧 rx は使わない
-                // fall through to in-process path below
-            }
-        }
+    let (tx, rx) = mpsc::channel();
+    let tx_w = tx.clone();
+    let req = encode_enumerate_request(pdf_path, password);
+    let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
+    let cancel_w = Arc::clone(&cancel);
+    if let Err(e) = std::thread::Builder::new()
+        .name("pdf-enumerate-nav".into())
+        .spawn(move || {
+            // 初期化は初回だけ最大 5 worker の readiness 待ちを含むため、必ずこの
+            // UI 外スレッドから開始する。
+            let pool = get_pool();
+            // Critical は epoch チェック対象外 (= 0 で send) + AbortOnCancel
+            // (UI nav の即時応答 UX を優先、harvest は不要)
+            let resp = pool.execute(
+                &req,
+                Some(&cancel_w),
+                JobPriority::Critical,
+                Some(perf_key),
+                0,
+                CancelWaitPolicy::AbortOnCancel,
+            );
+            let result =
+                resp.and_then(|response| PdfWorkerPool::parse_enumerate_response(&response.bytes));
+            let _ = tx_w.send(result);
+        })
+    {
+        crate::logger::log(format!("pdf-enumerate-nav: spawn failed: {e}"));
+        let _ = tx.send(Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("failed to start PDF page enumeration thread: {e}"),
+        )));
     }
-
-    // Pool 不在 / spawn 失敗フォールバック: in-process worker + epoch skip の旧経路。
-    // **review #14 対応**: in-process worker にも cancel を伝搬する。これがないと
-    // `PdfEnumerateHandle` の drop で `cancel` が立っても worker は完走してしまい、
-    // ナビゲーション応答性 (v1.0.0 の目標) が pool 不在環境で失われていた。
-    let epoch = LATEST_ENUMERATE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
-    let (tx, rx) = mpsc::channel();
-    let _ = get_worker().priority_tx.send(WorkerRequest::Enumerate {
-        path: pdf_path.to_path_buf(),
-        password: password.map(String::from),
-        reply: tx,
-        epoch: Some(epoch),
-        cancel: Some(Arc::clone(&cancel)),
-    });
     PdfEnumerateHandle { cancel, rx }
-}
-
-pub fn check_password_async(pdf_path: &Path) -> mpsc::Receiver<PdfAccessStatus> {
-    let (tx, rx) = mpsc::channel();
-    let _ = get_worker().priority_tx.send(WorkerRequest::CheckPassword {
-        path: pdf_path.to_path_buf(),
-        reply: tx,
-    });
-    rx
 }
 
 // -----------------------------------------------------------------------
