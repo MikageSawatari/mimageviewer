@@ -137,7 +137,7 @@ foreground は前景待機者がいる間その共有通信を cancel しない�
 | --- | --- | --- |
 | `reload_queue` | `Arc<Mutex<Vec<LoadRequest>>>` | 通常サムネイル要求 (Image/ZipImage/PdfPage に加え、PdfFile のフォルダ代表画も IPC 待ちのためここに振る)。**スクロール中 / visible 待ち中は `prefetch_allowed_now` gate で `req.priority=false` の prefetch enqueue が抑制され、queue 内の既存 prefetch も `q.retain` で prune される** (= PDF pool に prefetch が流れる前に止めて in-flight 占有を防ぐ、docs/prefetch-suppression-during-scroll-plan.md) |
 | `heavy_io_queue` | `Arc<Mutex<Vec<LoadRequest>>>` | Folder/ZipFile/ConvertibleArchive/ZipDir 要求 (本物の同期 I/O または ZIP 内 prefix の代表解決)。Folder の再帰 pin 伝播で行う既存 catalog の read-only open / exact-row WebP lookup もここで実行し、UI スレッドへ SQLite cold open を持ち込まない。reload_queue と同じ prefetch suppression gate を共有 |
-| `pdf_pool.queue` | `Arc<(Mutex<JobQueue>, Condvar)>` | PDF ワーカーへのレンダ/列挙要求。`critical` / `high_normal` / `normal` VecDeque + `normal_in_flight` + `workers_busy` + `in_flight_started_at: Vec<Option<Instant>>` (POOL_SIZE 固定、worker_id index) を同一 Mutex で保護。dispatcher は `critical → high_normal → normal` の順で pop する。Critical は従来どおり lane cap の影響を受けない。**`CRITICAL_RESERVATION_ACTIVE` (v1.0.0 から常時 ON)** のとき HighNormal + Normal の in-flight は `max(worker_count - 1, 1)`、Normal の開始だけは `max(worker_count - 2, 1)` までに制限する。これにより最低 1 ワーカーを Critical 用に予約しつつ、Normal 先読みが積まれても HighNormal 用にさらに 1 枠を残す。1〜2 worker の degraded pool では Normal cap を 1 に clamp して永久停止を防ぐ。HighNormal は `req.priority=true` の可視セルと、`promote_fullscreen_to_high_normal` で昇格した現在 PDF ページ用 (= 画面外先読みより先に処理)。**Context epoch (`CURRENT_CONTEXT_EPOCH`)** で UI ナビゲーション (フォルダ移動 / Ctrl+G 結果差替え) ごとに HighNormal/Normal ジョブを世代管理し、bump で stale を一括 prune + dispatcher pop 時にも stale 判定。Critical と epoch=0 (background) はプルーン対象外。**`CancelWaitPolicy::HarvestOnCancel`** (thumbnail PDF render の cache-savable 経路のみ) では cancel が立っても in-flight IPC の reply を待ち、PDFium が既に処理した render 結果を harvest して cache 保存に進ませる (= 再エントリ時の再 render 地獄を防ぐ)。`promote_to_high_normal` はスクロール後の現可視 PDF サムネを同じ HighNormal lane へ昇格する。 |
+| `pdf_pool.queue` | `Arc<(Mutex<JobQueue>, Condvar)>` | PDF ワーカーへのレンダ/列挙要求。`critical` / `high_normal` / `normal` VecDeque + `normal_in_flight` + `workers_busy` + `in_flight_started_at: Vec<Option<Instant>>` (POOL_SIZE 固定、worker_id index) を同一 Mutex で保護。dispatcher は `critical → high_normal → normal` の順で pop する。Critical は従来どおり lane cap の影響を受けない。**`CRITICAL_RESERVATION_ACTIVE` (v1.0.0 から常時 ON)** のとき HighNormal + Normal の in-flight は `max(worker_count - 1, 1)`、Normal の開始だけは `max(worker_count - 2, 1)` までに制限する。これにより最低 1 ワーカーを Critical 用に予約しつつ、Normal 先読みが積まれても HighNormal 用にさらに 1 枠を残す。正式 pool は 3 worker 以上で、3 / 4 worker 時も同じ式から HighNormal / Normal cap がそれぞれ 2 / 1、3 / 2 になる。1〜2 の clamp は純関数の防御性と旧構成の回帰テスト用で、初期化結果としては公開しない。HighNormal は `req.priority=true` の可視セルと、`promote_fullscreen_to_high_normal` で昇格した現在 PDF ページ用 (= 画面外先読みより先に処理)。**Context epoch (`CURRENT_CONTEXT_EPOCH`)** で UI ナビゲーション (フォルダ移動 / Ctrl+G 結果差替え) ごとに HighNormal/Normal ジョブを世代管理し、bump で stale を一括 prune + dispatcher pop 時にも stale 判定。Critical と epoch=0 (background) はプルーン対象外。**`CancelWaitPolicy::HarvestOnCancel`** (thumbnail PDF render の cache-savable 経路のみ) では cancel が立っても in-flight IPC の reply を待ち、PDFium が既に処理した render 結果を harvest して cache 保存に進ませる (= 再エントリ時の再 render 地獄を防ぐ)。`promote_to_high_normal` はスクロール後の現可視 PDF サムネを同じ HighNormal lane へ昇格する。 |
 | `CatchupQueue` (`thumb_loader.rs`) | `Arc<(Mutex<CatchupQueueState>, Condvar)>` | `pdf_meta` 背景書き込みキュー (v1.0.0)。`high: VecDeque<NeighborPrefetch>` (cap 16) + `low: VecDeque<MetaOnly>` (cap 256) + `pending: HashSet<PathBuf>` を同一 Mutex で保護。worker は high → low の順で pop。同 path が low にいる時に高優先が後から来ると **`high` 空き確認後に `low` から remove → `high` に push** で昇格する (lane が満杯のときだけ drop、lane 間は独立)。詳細は [docs/pdf-page-count-cache-plan.md の「最終形」セクション](pdf-page-count-cache-plan.md) |
 | `AiJobQueue` (`app.rs`) | `Arc<(Mutex<AiJobQueueState>, Condvar)>` | final AI (upscale/denoise) ジョブ。`display: VecDeque` (表示中ページ, push_front=LIFO) + `prefetch: VecDeque` (先読み, push_back=FIFO) + `shutdown` を同一 Mutex で保護。`final-ai-worker` が `display → prefetch` の順で pop。enqueue 重複は呼び出し側 `final_ai_pending.contains_key` で dedup。cancel は `final_ai_pending[key].cancel` (Drop でも立つ) を worker が pop 時に確認し、立っていれば推論せず `Cancelled` を返す (= 高速ページ送りで keep_set 外になったジョブは GPU 推論が始まる前に止まる)。PDF の表示中 final AI だけは、保持 LRU に入れる価値が高いので session close / keep-set evict 時に最大 1 件まで `retained_final_ai_orphans` へ移し、live pending から外したまま完走を許可する |
 | `texture_backlog` | ローカル Vec (App) | GPU アップロード未完の ColorImage。MAX_TEXTURES_PER_FRAME=8 超過分 |
@@ -723,8 +723,15 @@ per-entry で `GetFileAttributes` syscall を呼ぶ件も記載。
 
 ### 5.4 PDF ワーカー / Susie ワーカーの想定外終了
 
-ワーカープロセスがクラッシュしたら、親は検出して再起動する仕組みになっている。
-新しい PDF / Susie 操作を追加する時はタイムアウト処理を忘れずに (stdout 読み取りで詰まらない)。
+PDF worker pool は最初の PDF 操作時に遅延初期化する。起動時は失敗した枠だけを初回を含め最大
+3 回試行し、3 worker 以上を確保できた場合だけ pool を公開する。3 未満なら起動済み child も終了し、
+`OnceLock` に失敗理由を確定して、以後の新しい PDFium 操作は Err を返す。アプリ本体と画像・動画・
+アーカイブ閲覧は止めず、失敗理由は persistent notice で 1 回だけ通知する。
+
+一方、**起動成功後に PDF / Susie worker が想定外終了しても、現在は自動 respawn しない**。
+dispatcher は stdin/stdout の切断をその要求の Err として返すだけで、worker 数も補充しない。
+したがって、この節は起動後の自己回復を保証しない。respawn を追加する場合は、in-flight request の
+再送可否、worker_count と lane cap の更新、終了・cancel との競合を別設計として扱う必要がある。
 
 **Susie プラグインの並列実行に関する注意**: Susie 画像プラグインは 1990〜2000 年代の
 レガシー規格で、並列実行 (特にプロセス跨ぎ) を想定していないプラグインが稀にある。

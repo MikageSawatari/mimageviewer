@@ -25,6 +25,7 @@ pub mod network_data_dir_notice;
 pub(crate) mod new_folder;
 mod open_folder;
 mod pdf_password;
+mod pdf_worker_notice;
 pub(crate) mod preferences;
 pub(crate) mod rename_item;
 mod rotation_reset;

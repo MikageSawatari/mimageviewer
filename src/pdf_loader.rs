@@ -102,7 +102,7 @@ pub fn current_render_context_epoch() -> u64 {
 /// 戻り値は bump 後の新 epoch。
 pub fn bump_render_context_epoch() -> u64 {
     let new = CURRENT_CONTEXT_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
-    if let Some(pool) = POOL.get() {
+    if let Some(pool) = initialized_pool() {
         pool.prune_stale_jobs(new);
     }
     new
@@ -130,7 +130,7 @@ pub struct PromoteStats {
 /// pool 未初期化なら no-op で empty stats を返す (= 無 PDF フォルダで pool 起動しない、
 /// Codex R3 P2 対応)。
 pub fn promote_to_high_normal(keys: &HashSet<String>) -> PromoteStats {
-    let Some(pool) = POOL.get() else {
+    let Some(pool) = initialized_pool() else {
         return PromoteStats {
             promoted: 0,
             already_high: 0,
@@ -147,7 +147,7 @@ pub fn promote_to_high_normal(keys: &HashSet<String>) -> PromoteStats {
 /// load が Critical で enqueue 済みの場合に `not_found` retry を永続させず、
 /// Critical からの降格も行わない。
 pub fn promote_fullscreen_to_high_normal(keys: &HashSet<String>) -> PromoteStats {
-    let Some(pool) = POOL.get() else {
+    let Some(pool) = initialized_pool() else {
         return PromoteStats {
             promoted: 0,
             already_high: 0,
@@ -179,7 +179,7 @@ pub struct PoolQueueSnapshot {
 /// PDF pool の現在の queue 状態を取得。pool 未初期化なら `None` (= snapshot emit skip)。
 /// 定期 (1 秒に 1 回程度) で App 側から呼ぶ。
 pub fn pool_queue_snapshot() -> Option<PoolQueueSnapshot> {
-    let pool = POOL.get()?;
+    let pool = initialized_pool()?;
     let (mtx, _cv) = &*pool.queue;
     let q = mtx.lock().ok()?;
     let now = std::time::Instant::now();
@@ -1643,15 +1643,205 @@ struct PdfWorkerPool {
 ///
 /// より小さく / より大きくしたい場合は const を直接書き換える (= リビルド必要)。
 const POOL_SIZE: usize = 5;
+/// Critical / HighNormal / Normal の各 lane に最低 1 枠を持てる正式サポート下限。
+const MIN_POOL_SIZE: usize = 3;
+/// 各 worker 枠の最大起動試行回数 (初回を含む)。時間窓ではなく回数で打ち切る。
+const WORKER_STARTUP_ATTEMPTS_PER_SLOT: usize = 3;
 
-static POOL: OnceLock<PdfWorkerPool> = OnceLock::new();
+type PdfWorkerPoolInit = Result<PdfWorkerPool, PdfWorkerPoolStartupFailure>;
 
-fn get_pool() -> &'static PdfWorkerPool {
-    POOL.get_or_init(|| PdfWorkerPool::start())
+static POOL: OnceLock<PdfWorkerPoolInit> = OnceLock::new();
+static PDF_WORKER_NOTICE: Mutex<Option<PdfWorkerNotice>> = Mutex::new(None);
+
+/// PDF worker pool の遅延初期化失敗を UI へ 1 回だけ渡す typed notice。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PdfWorkerNotice {
+    pub(crate) ready_workers: usize,
+    pub(crate) requested_workers: usize,
+    pub(crate) minimum_workers: usize,
+    pub(crate) last_error: String,
+    pub(crate) logs_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PdfWorkerPoolStartupFailure {
+    ready_workers: usize,
+    requested_workers: usize,
+    minimum_workers: usize,
+    last_error: String,
+    logs_dir: PathBuf,
+}
+
+impl PdfWorkerPoolStartupFailure {
+    fn new(ready_workers: usize, last_error: String) -> Self {
+        Self {
+            ready_workers,
+            requested_workers: POOL_SIZE,
+            minimum_workers: MIN_POOL_SIZE,
+            last_error,
+            logs_dir: crate::data_dir::logs_dir(),
+        }
+    }
+
+    fn notice(&self) -> PdfWorkerNotice {
+        PdfWorkerNotice {
+            ready_workers: self.ready_workers,
+            requested_workers: self.requested_workers,
+            minimum_workers: self.minimum_workers,
+            last_error: self.last_error.clone(),
+            logs_dir: self.logs_dir.clone(),
+        }
+    }
+}
+
+fn pdf_worker_pool_unavailable_error() -> std::io::Error {
+    std::io::Error::other("PDF worker subsystem is unavailable; see the persistent notice and logs")
+}
+
+fn initialized_pool() -> Option<&'static PdfWorkerPool> {
+    POOL.get().and_then(|result| result.as_ref().ok())
+}
+
+/// `OnceLock<Result<..>>` を呼び出し側へ露出させず、既存の `execute()` の Err 契約を保つ。
+/// 詳細理由は typed notice とログに載せ、通常 PDF open の Password 判定へは渡さない。
+trait PdfWorkerPoolInitExt {
+    fn execute(
+        &self,
+        request: &[u8],
+        cancel: Option<&Arc<AtomicBool>>,
+        priority: JobPriority,
+        perf_key: Option<String>,
+        context_epoch: u64,
+        cancel_policy: CancelWaitPolicy,
+    ) -> std::io::Result<ProcessResponse>;
+    fn workers_busy(&self) -> usize;
+    fn worker_count(&self) -> usize;
+}
+
+impl PdfWorkerPoolInitExt for PdfWorkerPoolInit {
+    fn execute(
+        &self,
+        request: &[u8],
+        cancel: Option<&Arc<AtomicBool>>,
+        priority: JobPriority,
+        perf_key: Option<String>,
+        context_epoch: u64,
+        cancel_policy: CancelWaitPolicy,
+    ) -> std::io::Result<ProcessResponse> {
+        match self {
+            Ok(pool) => pool.execute(
+                request,
+                cancel,
+                priority,
+                perf_key,
+                context_epoch,
+                cancel_policy,
+            ),
+            Err(_) => Err(pdf_worker_pool_unavailable_error()),
+        }
+    }
+
+    fn workers_busy(&self) -> usize {
+        self.as_ref().map_or(0, PdfWorkerPool::workers_busy)
+    }
+
+    fn worker_count(&self) -> usize {
+        self.as_ref().map_or(0, |pool| pool.worker_count)
+    }
+}
+
+fn get_pool() -> &'static PdfWorkerPoolInit {
+    POOL.get_or_init(|| match PdfWorkerPool::start() {
+        Ok(pool) => Ok(pool),
+        Err(failure) => {
+            crate::logger::log(format!(
+                "pdf-pool: initialization failed ready={} requested={} minimum={} last_error={} logs={}",
+                failure.ready_workers,
+                failure.requested_workers,
+                failure.minimum_workers,
+                failure.last_error,
+                failure.logs_dir.display()
+            ));
+            publish_worker_notice_to(&PDF_WORKER_NOTICE, failure.notice());
+            Err(failure)
+        }
+    })
+}
+
+fn publish_worker_notice_to(slot: &Mutex<Option<PdfWorkerNotice>>, notice: PdfWorkerNotice) {
+    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.is_none() {
+        *guard = Some(notice);
+    }
+}
+
+fn take_worker_notice_from(slot: &Mutex<Option<PdfWorkerNotice>>) -> Option<PdfWorkerNotice> {
+    slot.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+}
+
+/// App の update loop が poll する。取り出した notice は再送しない。
+pub(crate) fn take_worker_notice() -> Option<PdfWorkerNotice> {
+    take_worker_notice_from(&PDF_WORKER_NOTICE)
+}
+
+#[derive(Debug)]
+struct WorkerSlotStartup<T> {
+    ready: Vec<(usize, T)>,
+    failures: Vec<WorkerSlotFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkerSlotFailure {
+    error: String,
+}
+
+/// prerequisite が成功した場合だけ各枠を起動し、成功した枠は再試行しない。
+/// starter を注入できるので、子プロセスなしで retry の回数と対象を検証できる。
+fn attempt_worker_slots_after_prerequisite<P, T, F>(
+    prerequisite: Result<P, String>,
+    slot_count: usize,
+    attempts_per_slot: usize,
+    mut starter: F,
+) -> Result<(P, WorkerSlotStartup<T>), String>
+where
+    F: FnMut(&P, usize, usize) -> Result<T, String>,
+{
+    let prerequisite = prerequisite?;
+    let mut ready = Vec::with_capacity(slot_count);
+    let mut failures = Vec::new();
+    for worker_id in 0..slot_count {
+        for attempt in 1..=attempts_per_slot {
+            match starter(&prerequisite, worker_id, attempt) {
+                Ok(worker) => {
+                    ready.push((worker_id, worker));
+                    break;
+                }
+                Err(error) => failures.push(WorkerSlotFailure { error }),
+            }
+        }
+    }
+    Ok((prerequisite, WorkerSlotStartup { ready, failures }))
+}
+
+/// 最低数を満たさない候補だけを drain し、呼び出し側の明示終了処理へ渡す。
+fn terminate_if_underfilled<T, R, F>(
+    workers: &mut Vec<T>,
+    minimum_workers: usize,
+    terminate: F,
+) -> Option<Vec<R>>
+where
+    F: FnMut(T) -> R,
+{
+    if workers.len() >= minimum_workers {
+        return None;
+    }
+    Some(workers.drain(..).map(terminate).collect())
 }
 
 impl PdfWorkerPool {
-    fn start() -> Self {
+    fn start() -> Result<Self, PdfWorkerPoolStartupFailure> {
         let exe_path =
             std::env::current_exe().unwrap_or_else(|_| PathBuf::from("mimageviewer.exe"));
         let data_dir = crate::data_dir::get();
@@ -1660,20 +1850,86 @@ impl PdfWorkerPool {
             exe_path.display(),
             data_dir.display()
         ));
-        let dll_ready = match ensure_dll_extracted() {
+        let dll_result = ensure_dll_extracted()
+            .map_err(|error| format!("PDFium DLL initialization failed: {error}"));
+        match &dll_result {
             Ok(path) => {
                 let size = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
                 crate::logger::log(format!(
                     "pdf-pool: DLL ready path={} bytes={size}",
                     path.display()
                 ));
-                true
             }
             Err(error) => {
                 crate::logger::log(format!("pdf-pool: DLL initialization failed: {error}"));
-                false
             }
-        };
+        }
+
+        // 子プロセスを先に全部 spawn してから worker_count を確定させ、その値を
+        // dispatcher スレッドに渡す (run_dispatcher が lane cap を計算するときに
+        // 「実際に生きているワーカー数」を使う。失敗した枠だけを規定回数まで
+        // 再試行し、成功済み child は pending_workers に保持する。
+        let (_, startup) = attempt_worker_slots_after_prerequisite(
+            dll_result,
+            POOL_SIZE,
+            WORKER_STARTUP_ATTEMPTS_PER_SLOT,
+            |_, worker_id, attempt| match spawn_worker_process(
+                &exe_path,
+                &data_dir,
+                worker_id,
+            ) {
+                Ok((child, io)) => {
+                    let pid = child.id();
+                    crate::logger::log(format!(
+                        "pdf-pool: worker {worker_id} ready attempt={attempt}/{} pid={pid} data_dir={}",
+                        WORKER_STARTUP_ATTEMPTS_PER_SLOT,
+                        data_dir.display()
+                    ));
+                    Ok((child, io))
+                }
+                Err(error) => {
+                    crate::logger::log(format!(
+                        "pdf-pool: worker {worker_id} startup failed stage=spawn_or_readiness attempt={attempt}/{} error={error}",
+                        WORKER_STARTUP_ATTEMPTS_PER_SLOT
+                    ));
+                    Err(error.to_string())
+                }
+            },
+        )
+        .map_err(|last_error| PdfWorkerPoolStartupFailure::new(0, last_error))?;
+
+        let last_error = startup
+            .failures
+            .last()
+            .map(|failure| failure.error.clone())
+            .unwrap_or_else(|| "no worker reached readiness".to_string());
+        let mut pending_workers: Vec<(usize, Child, ProcessWorkerIo)> = startup
+            .ready
+            .into_iter()
+            .map(|(worker_id, (child, io))| (worker_id, child, io))
+            .collect();
+        let worker_count = pending_workers.len();
+
+        if let Some(terminated) = terminate_if_underfilled(
+            &mut pending_workers,
+            MIN_POOL_SIZE,
+            |(worker_id, mut child, _io)| {
+                let pid = child.id();
+                let status = terminate_failed_worker(&mut child);
+                (worker_id, pid, status)
+            },
+        ) {
+            for (worker_id, pid, status) in terminated {
+                crate::logger::log(format!(
+                    "pdf-pool: terminated ready worker {worker_id} pid={pid} after underfilled startup ({status})"
+                ));
+            }
+            return Err(PdfWorkerPoolStartupFailure::new(worker_count, last_error));
+        }
+
+        crate::logger::log(format!(
+            "pdf-pool: startup complete ready={worker_count} requested={POOL_SIZE} minimum={MIN_POOL_SIZE}"
+        ));
 
         let queue = Arc::new((
             Mutex::new(JobQueue {
@@ -1686,39 +1942,6 @@ impl PdfWorkerPool {
                 shutdown: false,
             }),
             Condvar::new(),
-        ));
-
-        // 子プロセスを先に全部 spawn してから worker_count を確定させ、その値を
-        // dispatcher スレッドに渡す (run_dispatcher が lane cap を計算するときに
-        // 「実際に生きているワーカー数」を使うため。POOL_SIZE 固定だと、起動失敗で
-        // 1-2 worker しか居ない degraded 環境で cap が間違って計算され、
-        // Critical 予約が機能しなくなる)。
-        let mut pending_workers: Vec<(usize, Child, ProcessWorkerIo)> =
-            Vec::with_capacity(POOL_SIZE);
-        for i in 0..POOL_SIZE {
-            if !dll_ready {
-                break;
-            }
-            match spawn_worker_process(&exe_path, &data_dir, i) {
-                Ok((child, io)) => {
-                    let pid = child.id();
-                    crate::logger::log(format!(
-                        "pdf-pool: worker {i} ready pid={pid} data_dir={}",
-                        data_dir.display()
-                    ));
-                    pending_workers.push((i, child, io));
-                }
-                Err(e) => {
-                    crate::logger::log(format!(
-                        "pdf-pool: worker {i} startup failed stage=spawn_or_readiness error={e}"
-                    ));
-                }
-            }
-        }
-        let worker_count = pending_workers.len();
-
-        crate::logger::log(format!(
-            "pdf-pool: startup complete ready={worker_count} requested={POOL_SIZE}"
         ));
 
         let mut dispatcher_threads = Vec::with_capacity(worker_count);
@@ -1738,12 +1961,12 @@ impl PdfWorkerPool {
             dispatcher_threads.push(handle);
         }
 
-        PdfWorkerPool {
+        Ok(PdfWorkerPool {
             queue,
             worker_count,
             dispatcher_threads: Mutex::new(dispatcher_threads),
             worker_children,
-        }
+        })
     }
 
     /// 現在 IPC 実行中のワーカー数 (perf イベント用の snapshot)。
@@ -2231,8 +2454,8 @@ fn non_critical_lane_caps(worker_count: usize, critical_reservation: bool) -> No
     };
     NonCriticalLaneCaps {
         high_normal,
-        // HighNormal 用に 1 枠残す。ただし degraded な 1-2 worker pool で
-        // Normal を永久停止させないよう最低 1 に clamp する。
+        // HighNormal 用に 1 枠残す。正式 pool は 3 worker 以上だが、純関数の防御性と
+        // 旧構成の回帰テスト用に 1-2 でも Normal を永久停止させない。
         normal: high_normal.saturating_sub(1).max(1),
     }
 }
@@ -2270,9 +2493,8 @@ fn try_pop_dispatch_job(q: &mut JobQueue, caps: NonCriticalLaneCaps) -> Option<J
 /// Critical 予約中は HighNormal を `worker_count - 1`、Normal を `worker_count - 2`
 /// (どちらも最低 1) までに制限する。これにより Critical と HighNormal に各 1 枠を残す。
 ///
-/// `worker_count` は `PdfWorkerPool::start()` が実際に spawn に成功した数 (POOL_SIZE
-/// と異なる degraded 環境を想定)。各 cap を最低 1 に clamp し、1-2 worker pool でも
-/// Normal ジョブが永久に開始できない deadlock を防ぐ。
+/// `worker_count` は `PdfWorkerPool::start()` が受理した実 worker 数 (3〜POOL_SIZE)。
+/// cap の最低 1 clamp は 1-2 worker を正式受理するためではなく、純関数を防御的に保つ。
 ///
 /// `shutdown` フラグが立つと、サブプロセスに shutdown メッセージを送って
 /// 子プロセスの終了を待ち、スレッド自体も終了する。
@@ -3130,7 +3352,7 @@ fn render_page_target(
                 ("viewport_w", serde_json::Value::from(viewport_w)),
                 ("viewport_h", serde_json::Value::from(viewport_h)),
                 ("busy", serde_json::Value::from(busy_count)),
-                ("total", serde_json::Value::from(pool.worker_count)),
+                ("total", serde_json::Value::from(pool.worker_count())),
                 ("priority", serde_json::Value::from(format!("{priority:?}"))),
             ],
         );
@@ -3977,6 +4199,112 @@ C:\isolated\miv-data"#
         assert!(result.is_err());
     }
 
+    #[test]
+    fn worker_startup_retries_only_failed_slots() {
+        let mut calls = Vec::new();
+        let (_, startup) =
+            attempt_worker_slots_after_prerequisite(Ok(()), 4, 3, |_, worker_id, attempt| {
+                calls.push((worker_id, attempt));
+                match worker_id {
+                    0 | 3 => Ok(worker_id),
+                    1 if attempt == 3 => Ok(worker_id),
+                    _ => Err(format!("slot {worker_id} attempt {attempt}")),
+                }
+            })
+            .unwrap();
+
+        assert_eq!(
+            calls,
+            vec![
+                (0, 1),
+                (1, 1),
+                (1, 2),
+                (1, 3),
+                (2, 1),
+                (2, 2),
+                (2, 3),
+                (3, 1)
+            ]
+        );
+        assert_eq!(
+            startup
+                .ready
+                .iter()
+                .map(|(worker_id, _)| *worker_id)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 3]
+        );
+    }
+
+    #[test]
+    fn dll_failure_skips_all_worker_attempts() {
+        let mut calls = 0;
+        let result: Result<((), WorkerSlotStartup<()>), String> =
+            attempt_worker_slots_after_prerequisite(
+                Err("dll failed".to_string()),
+                5,
+                3,
+                |_, _, _| {
+                    calls += 1;
+                    Ok(())
+                },
+            );
+
+        assert_eq!(result.unwrap_err(), "dll failed");
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn underfilled_startup_terminates_ready_workers_and_notifies_once() {
+        #[derive(Debug)]
+        struct FakeChild {
+            id: usize,
+            terminated: bool,
+        }
+
+        let mut workers = vec![
+            FakeChild {
+                id: 0,
+                terminated: false,
+            },
+            FakeChild {
+                id: 2,
+                terminated: false,
+            },
+        ];
+        let terminated = terminate_if_underfilled(&mut workers, 3, |mut child| {
+            child.terminated = true;
+            child
+        })
+        .unwrap();
+
+        assert!(workers.is_empty());
+        assert_eq!(
+            terminated.iter().map(|child| child.id).collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert!(terminated.iter().all(|child| child.terminated));
+
+        let notice = PdfWorkerNotice {
+            ready_workers: 2,
+            requested_workers: 5,
+            minimum_workers: 3,
+            last_error: "readiness timed out".to_string(),
+            logs_dir: PathBuf::from("logs"),
+        };
+        let slot = Mutex::new(None);
+        publish_worker_notice_to(&slot, notice.clone());
+        assert_eq!(take_worker_notice_from(&slot), Some(notice));
+        assert_eq!(take_worker_notice_from(&slot), None);
+    }
+
+    #[test]
+    fn pool_startup_failure_is_not_classified_as_a_password_error() {
+        let message = pdf_worker_pool_unavailable_error().to_string();
+        assert!(!message.contains("Password"));
+        assert!(!message.to_ascii_lowercase().contains("password"));
+    }
+
     // ── Context epoch tests (PdfWorkerPool 内部ロジックのみ、PDFium IPC は使わない) ──
 
     /// JobQueue を直接構築して prune_stale_jobs と pop ロジックを検証する。
@@ -4085,6 +4413,24 @@ C:\isolated\miv-data"#
 
         assert_eq!(popped.priority, JobPriority::Normal);
         assert_eq!(q.normal_in_flight, 1);
+    }
+
+    #[test]
+    fn supported_three_and_four_worker_pools_have_expected_lane_caps() {
+        assert_eq!(
+            non_critical_lane_caps(3, true),
+            NonCriticalLaneCaps {
+                high_normal: 2,
+                normal: 1,
+            }
+        );
+        assert_eq!(
+            non_critical_lane_caps(4, true),
+            NonCriticalLaneCaps {
+                high_normal: 3,
+                normal: 2,
+            }
+        );
     }
 
     #[test]

@@ -11803,6 +11803,10 @@ pub struct App {
     /// を維持する。呼び出し直後にハンドラが false へ戻す (通常ナビ経路の swap には影響させない)。
     #[cfg(windows)]
     pub(crate) source_swap_keep_audio_mode: bool,
+    /// PDF worker pool の遅延初期化失敗 notice。loader 側の one-shot notice を
+    /// update 毎に poll し、ユーザーが閉じるまで persistent window として保持する。
+    /// PDF の有効/無効状態ではなく UI 表示だけを所有する。
+    pub(crate) pdf_worker_notice: Option<crate::pdf_loader::PdfWorkerNotice>,
     /// TRT worker クラッシュ / 起動失敗の通知バナー (Phase 3 Step 5)。
     /// `AiRuntime::take_worker_notice()` を update 毎にポーリングし、`Some` を
     /// 引いたらここへ転写する。バナー UI で「再起動」/「閉じる」が押されるまで
@@ -13927,6 +13931,7 @@ impl App {
             video_audio_exit_pending: None,
             #[cfg(windows)]
             source_swap_keep_audio_mode: false,
+            pdf_worker_notice: None,
             trt_worker_notice: None,
             trt_auto_restart_attempts: 0,
             trt_spawn_restart_attempts: 0,
@@ -66498,6 +66503,9 @@ impl eframe::App for App {
             self.show_vst3_manager(ctx);
             self.vst3_pump_gui_signals();
         }
+        // PDF pool の遅延初期化失敗 notice。poll は pool 自体を初期化しない。
+        self.poll_pdf_worker_notice();
+        self.show_pdf_worker_notice_dialog(ctx);
         // Phase 3 Step 5: TRT ワーカー関連の通知バナー (起動失敗 / 推論中の死亡)。
         // poll で AiRuntime の通知キューを 1 回引き、show でバナー描画。
         self.poll_trt_worker_notice();
