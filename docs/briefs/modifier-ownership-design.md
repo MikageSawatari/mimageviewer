@@ -585,3 +585,72 @@ presenter も key / text / IME を別々に emit している
 ([native_window.rs:57](../../src/video/native_window.rs:57)) は**消えるか private な互換
 projection になる**。chord 照合がそれらの bool を直接受け取ることも無くす
 ([keymap.rs:1216](../../src/keymap.rs:1216))。**さもないと S1 か S2 が静かに第 2 の権威を作れる。**
+
+---
+
+# 第 7 版 — 最後のゲートを閉じ、着地を 2 つに分ける
+
+## 12.1 UI の `DrainComplete` producer (§11.2 を上書き)
+
+**`about_to_wait` は「Windows のキューが空である」証明にならない。**
+
+winit の Windows dispatcher は通常 `PeekMessageW` が false を返すと止まるが、
+**`interrupt_msg_dispatch` が立つと早期に止まる**。そして**dispatch された `RedrawRequested` が
+まさにその interrupt を立てる**。次のループ反復が `prepare_wait` を呼び `AboutToWait` を出すので、
+**未処理のメッセージが残ったまま eframe の callback が走り得る**。現行実装は外側の描画フェーズを
+決めているだけで、キューが空かどうかの検査はしていない
+([run.rs:1261](../../vendor/eframe/src/native/run.rs:1261))。
+
+**確定**: `about_to_wait` は**probe を走らせる場所**であって、証明ではない。
+そこで **unfiltered `PeekMessageW(..., PM_NOREMOVE)` を明示的に実行し、
+false を返したときだけ `DrainComplete` を publish する**。
+
+(winit の `PeekMessageW == false` 分岐から直接 publish する案もあるが、winit は vendor して
+いない registry 依存なので、probe 方式を採る。)
+
+presenter 側は現行ループが自分の `PeekMessageW` が false を返すまで続くので、そのままでよい
+([native_window.rs:1230](../../src/video/native_window.rs:1230))。
+
+## 12.2 着地の必須条件 — egui fallback を残さない
+
+アプリ command のコードが**既存の egui modifier fallback を保持してはならない**。
+現在 `consume_chord_inner` は command を `Event::Key.modifiers` に対して直接照合できる
+([keymap.rs:7493](../../src/keymap.rs:7493))。**これを typed owner 経由にするか、
+Windows では削除する。** 残せばそれが §11.6 の禁じている第 2 の権威そのものになる。
+
+egui 自身が内部でイベントを使い続けるのは問題ない。**TextEdit の <kbd>Ctrl</kbd>+<kbd>C</kbd> を
+そのままにするのは第 2 の権威ではない** — 既存の keyboard owner が `TextInput` と
+`ApplicationShortcut` を排他にしており ([keyboard_input.rs:55](../../src/keyboard_input.rs:55))、
+application owner の無い keymap 経路は fail-closed になる
+([keyboard_input.rs:480](../../src/keyboard_input.rs:480))。
+
+## 12.3 着地を 2 つに分ける
+
+契約は**元の不具合より面が広くなった** (キー、ホイールパケット、ボタン帰属、クリック、ドラッグ、
+StickyKeys、AltGr、attach トポロジ、framework widget の分離)。1 回で着地させない。
+
+**L1 — アプリのキーとホイールの所有権** (報告された不具合はここで直る)
+
+- キュー / attach / acquisition の所有権 (§10.1 / §11.3 / §12.1)
+- アプリ key command の envelope。**固定 <kbd>Esc</kbd> / <kbd>BS</kbd> 経路を含む**
+- **ホイールパケットの delivery 帰属** (既存の集約消費側
+  [app.rs:35962](../../src/app.rs:35962)、[ui_fullscreen.rs:18224](../../src/ui_fullscreen.rs:18224)、
+  [ui_fullscreen.rs:22007](../../src/ui_fullscreen.rs:22007) に届く)
+- 上記経路に必要な `DeliveryModifiers` / `CurrentModifiers` / `ChordMatch` / AltGr
+- **producer と consumer を同時に移行**する (キー + ホイールのスライスとして原子的に)
+
+**L2 — ポインタ (ボタン / クリック / ドラッグ) の帰属** — 別途レビューする垂直スライス。
+
+**L1 を「修飾キー所有権レイヤの完成」と呼ばない。**「アプリのキーとホイールの所有権」と
+正確に呼ぶ。§11.4 の contract は L2 のための確定事項として残す。
+
+## 12.4 収束についての記録
+
+1 周目は「アーキテクチャが成立しない」(プロセス全体の timeline を `GetMessageTime` で順序付け)、
+2〜4 周目は境界と型の欠落、5〜6 周目は「サンプルを取る時点」「producer の名前」「派生の帰属」
+という精密化だった。**global ordering → marker → fail-closed acquisition → 正確な drain 完了**
+という進み方は収束である。
+
+死んだ私の仮定 (記録として): timeline による順序付け / `Unavailable` で前 epoch を保持 /
+`Unknown` を not held / RAlt で LCtrl を抑制 / marker fence / ポインタ = `Current` /
+acquisition 時 seed / `about_to_wait` が空の証明。**8 件。**
