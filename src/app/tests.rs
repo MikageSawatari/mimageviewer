@@ -44078,7 +44078,7 @@ mod still_window_mode_key_tests {
         app.current_folder = Some(cache_zip.clone());
         app.archive_source_override = Some(source_zip);
         app.items = vec![GridItem::ZipImage {
-            zip_path: cache_zip,
+            zip_path: cache_zip.clone(),
             entry_name: "bookB/p1.jpg".to_string(),
         }];
         app.thumbnails = vec![ThumbnailState::Pending];
@@ -44087,7 +44087,7 @@ mod still_window_mode_key_tests {
 
         // ZIP 内 DFS の最後の本にいる状態。Ctrl+↓ は ZIP ツリー内では進めず、
         // 呼び出し側の通常フォルダ DFS へフォールバックする。
-        let mut nav = test_zip_nav(&["bookA/p1.jpg", "bookB/p1.jpg"]);
+        let mut nav = test_zip_nav_for(cache_zip, &["bookA/p1.jpg", "bookB/p1.jpg"]);
         nav.enter("bookB/");
         app.zip_nav = Some(nav);
 
@@ -44151,9 +44151,7 @@ mod still_window_mode_key_tests {
         let tmp = app.tmp.path().to_path_buf();
         let fixture = setup_converted_archive_nav_fixture(&mut app, &tmp);
 
-        app.pending_folder_nav_mode = FolderNavMode::Fullscreen;
-        app.pending_folder_nav_steps = 1;
-        app.chain_folder_nav_if_pending();
+        app.chain_folder_nav_if_pending(1, FolderNavMode::Fullscreen);
         let result = wait_folder_nav_result(&mut app);
 
         assert_eq!(result.path.as_ref(), Some(&fixture.expected_next));
@@ -44174,13 +44172,10 @@ mod still_window_mode_key_tests {
                 mtime: 0,
             }],
             has_foreign_archives: true,
+            legacy_renames: Vec::new(),
         };
 
-        app.finalize_zip_enumerate(
-            zip_path.clone(),
-            crate::settings::SortOrder::FileName,
-            Ok(enumeration),
-        );
+        app.finalize_zip_enumerate(zip_path.clone(), 0, Ok(enumeration));
 
         let state = app
             .archive_convert
