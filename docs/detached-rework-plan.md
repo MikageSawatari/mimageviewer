@@ -348,7 +348,31 @@ R2b の残件 (純粋 reducer / 合法遷移制約 / 散在 pending・flag の t
 | 項目 | 状態 | 指示書 | メモ |
 | --- | --- | --- | --- |
 | §1.99 複数ウィンドウでの RAR / 7z / LZH open | **実装済み・検収合格 (21c3dc0d + fix1 d7e139d0)。実機確認待ち** | [stage-archive-open](detached-rework-stage-archive-open.md) | typed open plan に `ConvertibleArchiveCandidate` を追加し、直読み完了 / 変換完了 / 変換キャッシュ命中の 3 経路すべてを detached へ着地。着地結果は `Opened` / `Cancelled(reason)` / `Failed` の typed outcome で、stale と設定 OFF はトーストを出さずログのみ。App に `detached_grid_archive_open_request_seq: u64` を 1 つ追加した (既存 `bookmark_open_request_seq` と同型の単調 sequence。**憲法 3 が禁じる detached 用 bool / Option フラグではない**と双方で判断)。visibility 述語 / `show_viewport_*` builder / viewport ID / HWND registry / activation watcher / placement には触れていない |
-| §1.100 非アクティブ窓の右ドラッグ | **実装済み・検収合格 (8db282e3 + fix1 5b83df3f)。実機確認待ち** | [stage-passive-gesture](detached-rework-stage-passive-gesture.md) | `MouseGestureState` / `MouseFlickState` は `RightDragOwner` を保持。deferred 静止画と `ParkedLive` は sequence 付きの同一 reducer を通り、成立コマンドは `DetachedWindowRuntime.activation_intent` の `Recognized → Activating → PendingExecution` を経て、`update_active_detached_viewer_context` の owner mount 中だけ実行する。通常クリックは同じ intent の `ActivateOnly` として従来動作を維持。実行の可否は active window ID 一致 / mounted window ID 一致 / `fullscreen_idx` の readiness / **認識時に控えた viewer identity** (paused bundle の `items_generation`、無ければ `reopen_sync_stamp`) の一致で決め、時間窓は使わない。fix1 = 種別 (`RightDragContext`) 比較だけでは、列挙が確定しないまま待ち続けたコマンドが同じ窓の別画像に当たり得た退行を閉じたもの。⚠ 実装コミットが backlog §1.100 の項目を丸ごと削除していたため 8f1c9b17 で復元した (憲法 7。実装コミットで backlog 項目を消さない) |
+| §1.100 非アクティブ窓の右ドラッグ | **実装済み・検収合格 (8db282e3 + fix1 5b83df3f)。実機確認済み 2026-08-21** | [stage-passive-gesture](detached-rework-stage-passive-gesture.md) | `MouseGestureState` / `MouseFlickState` は `RightDragOwner` を保持。deferred 静止画と `ParkedLive` は sequence 付きの同一 reducer を通り、成立コマンドは `DetachedWindowRuntime.activation_intent` の `Recognized → Activating → PendingExecution` を経て、`update_active_detached_viewer_context` の owner mount 中だけ実行する。通常クリックは同じ intent の `ActivateOnly` として従来動作を維持。実行の可否は active window ID 一致 / mounted window ID 一致 / `fullscreen_idx` の readiness / **認識時に控えた viewer identity** (paused bundle の `items_generation`、無ければ `reopen_sync_stamp`) の一致で決め、時間窓は使わない。fix1 = 種別 (`RightDragContext`) 比較だけでは、列挙が確定しないまま待ち続けたコマンドが同じ窓の別画像に当たり得た退行を閉じたもの。⚠ 実装コミットが backlog §1.100 の項目を丸ごと削除していたため 8f1c9b17 で復元した (憲法 7。実装コミットで backlog 項目を消さない) |
+
+### 9.6 非アクティブ窓のジェスチャガイド (2026-08-21)
+
+§1.100 の前段を実機確認した利用者から「非アクティブでも UI のガイド表示はそのまま出したい」
+という要望が出たため、続きとして実施した。指示書は
+[stage-passive-gesture-guide](detached-rework-stage-passive-gesture-guide.md)。
+
+- **原因**: ガイドを描く 2 関数が `owner != RightDragOwner::Root` で早期 return していたことと、
+  非アクティブな静止画窓の deferred コールバックが `self` を借りられず
+  `settings` / `mouse_gesture` / `mouse_ring_flick` を読めないこと。
+- **変更**: 各描画関数を「所有者を受け取って内容を組み立てる `right_drag_guide_for_owner`」と
+  「データだけを受け取る `draw_right_drag_guide`」に分割。**描画の実装は 1 本**で、
+  呼び出し元は 3 つ (アクティブ overlay / deferred 静止画窓 / `ParkedLive` 窓)。
+  抑止条件 (モード / `*_help_visible` / `ring_picker` / context 一致 / `guide_visible()`) は
+  すべて組み立て側へ集約した。
+- ⚠ **`owner != RightDragOwner::Root` の判定は全部で 6 箇所ある。変えたのは描画側の 2 箇所だけ。**
+  残り 4 箇所は Root 限定が正しいので温存した: 右クリックメニュー抑止
+  (`src/app/gamepad_input.rs:1379` / `:1399`) と native video HUD (`:3980` / `:4166`)。
+  ここを一律に変えると別機能が壊れる。
+- 子 viewport の repaint は、その窓のジェスチャが生きている間だけ
+  `request_detached_right_drag_guide_repaint` が要求し、終了 / cancel のフレームで
+  消去用に 1 回出す。**判定は所有者と状態で行い、時間窓では行っていない** (憲法 5)。
+  ガイド出現遅延 (`mouse_flick_menu_delay`) は既存の UX 仕様で、その時刻に描き直すだけ。
+- コミット: d2c19796。実機確認待ち。
 
 ## 10. 将来候補 (現行仕様では未採用)
 
