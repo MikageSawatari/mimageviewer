@@ -44160,6 +44160,28 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn load_zip_as_folder_clears_stale_override_when_switching_zip() {
+        let mut app = setup_app();
+        let tmp = app.tmp.path().to_path_buf();
+        let source_zip = tmp.join("library").join("01-source.zip");
+        let cache_zip = tmp.join("cache").join("01-cache.zip");
+        let next_zip = tmp.join("library").join("02-next.zip");
+        write_nav_test_zip(&source_zip);
+        write_nav_test_zip(&cache_zip);
+        write_nav_test_zip(&next_zip);
+
+        app.current_folder = Some(cache_zip.clone());
+        app.archive_source_override = Some(source_zip);
+        app.load_zip_as_folder(next_zip.clone());
+
+        assert_eq!(app.current_folder.as_ref(), Some(&next_zip));
+        assert!(
+            app.archive_source_override.is_none(),
+            "別ZIPへ遷移した時点で古い source override を破棄しないと Ctrl+上下が古い元アーカイブを起点にする"
+        );
+    }
+
+    #[test]
     fn zip_foreign_archive_offer_targets_whole_outer_zip() {
         let mut app = setup_app();
         let zip_path = app.tmp.path().join("outer.zip");
