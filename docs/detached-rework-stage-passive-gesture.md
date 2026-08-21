@@ -100,37 +100,77 @@ root 側は `queue_deferred_detached_image_window_event`
 `ParkedLive` の immediate 経路も同じ所有者で同じ reducer を通す
 (現在の `any_pressed` / `any_released` だけの収集を、同じサンプル形へ揃える)。
 
+**イベント protocol の要件** (これを満たさないと取りこぼす):
+
+- **順序を保つ。** root は per-window の queue を `HashMap::values` で回して drain するので
+  ([ui_fullscreen.rs:11550](../src/ui_fullscreen.rs:11550))、**窓をまたいだ drain 順は未定義**。
+  down / move / up / cancel をコールバック側で採番した sequence 付きで送り、
+  窓ごとに順序どおり適用する。
+- **入力を enqueue したら必ず root repaint を要求する。** 現在の deferred コールバックは
+  close と placement 変化のときしか root へ repaint を投げない
+  ([ui_fullscreen.rs:11695](../src/ui_fullscreen.rs:11695))。これを足さないと、
+  ポインタイベントが queue に溜まったまま root pass が回らない。
+- **明示的な cancel を持つ。** focus 喪失、release を観測しないままのボタン状態消失、
+  ウィンドウ close、runtime 削除で、その窓のジェスチャを理由付きで捨てる。
+  close は runtime と shared view の両方を消す ([ui_fullscreen.rs:11433](../src/ui_fullscreen.rs:11433))。
+- **アクティブ経路と同じ chrome / リモート制御の規則を適用する。**
+  overlay chrome 上で始まった押下はジェスチャを cancel する
+  ([ui_fullscreen.rs:22810](../src/ui_fullscreen.rs:22810))。
+  リモート制御中は passive のアクティブ化が抑止される
+  ([ui_fullscreen.rs:11911](../src/ui_fullscreen.rs:11911)) ので、同じ抑止をここにも通す。
+
 ### 3.3 成立したら「アクティブ化 → 実行」を型付きの順序で
 
-現在 `DetachedWindowRuntime` は `pending_deferred_activation: bool`
-([detached_window_manager.rs:432](../src/app/detached_window_manager.rs:432)) を持ち、
-`take_pending_deferred_activation` ([detached_window_manager.rs:670](../src/app/detached_window_manager.rs:670))
-が取り出している。**この bool を typed intent に置き換える** (R2b 残件の「散在 state の typed 集約」)。
+⚠ **重要 (2026-08-21 に Codex レビューで判明した誤り)**:
+「アクティブ化したのだから、その直後に実行すればそのウィンドウのコンテキストに当たる」は**誤り**。
+`activate_detached_image_window_snapshot` は bundle を `active_detached_viewer_context` に入れ、
+再アーム用にごく短くマウントするだけで、**Main をマウントしたまま return する**
+([app.rs:40130](../src/app.rs:40130) / [app.rs:40133](../src/app.rs:40133) /
+[app.rs:40142](../src/app.rs:40142))。detached の owner が実際にマウントされるのは、
+同じ pass の後段 `update_active_detached_viewer_context` ([app.rs:40380](../src/app.rs:40380))。
+root はこの順で呼ぶ ([app.rs:66256](../src/app.rs:66256) → [app.rs:66258](../src/app.rs:66258))。
+リングやジェスチャの action は**マウント中の `self` を読み書きする**
+([gamepad_input.rs:4726](../src/app/gamepad_input.rs:4726)) ので、
+アクティブ化から戻った直後に実行すると **Main に当たる**。
+
+したがって、typed な 3 状態にする。
 
 ```rust
-/// アクティブ化要求と、アクティブ化後に実行すべきこと。
+/// 非アクティブ窓で成立した右ドラッグの進行状態。発生元 window_id で keyed。
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum DetachedActivationIntent {
-    /// クリック等による通常のアクティブ化。
-    Plain,
-    /// 非アクティブ中に成立した右ドラッグ。アクティブ化の完了後に実行する。
-    RunRightDrag(PendingRightDragCommand),
+pub(crate) enum PendingRightDragCommand {
+    /// 成立した。まだアクティブ化を要求していない。
+    Recognized { command: RightDragCommand },
+    /// アクティブ化を要求し、commit を待っている。
+    Activating { command: RightDragCommand },
+    /// アクティブ化が commit された。所有 context のマウント中に実行する。
+    PendingExecution { command: RightDragCommand },
 }
 ```
 
-`PendingRightDragCommand` は成立したジェスチャ / リングの結果 (パターンまたは方向と
-`RightDragContext`) を持つ。**コマンドはアクティブ化が実際に完了した後にだけ実行する。**
-アクティブ化が失敗した / 対象ウィンドウが消えた場合は **理由付きでログを残して捨てる**
-(silent fallback にしない、憲法の一般原則)。
+これを、現在 `DetachedWindowRuntime` が持つ `pending_deferred_activation: bool`
+([detached_window_manager.rs:432](../src/app/detached_window_manager.rs:432)、取り出しは
+[detached_window_manager.rs:670](../src/app/detached_window_manager.rs:670)) と**同じ typed intent へ統合する**
+(= R2b 残件の「散在 state の typed 集約」)。通常のクリックによるアクティブ化は
+コマンドを持たない intent として同じ経路を通す。
 
-実行時は、対象ウィンドウがアクティブになっているので
-`with_active_detached_viewer_context` ([app.rs:16099](../src/app.rs:16099)) で
-そのコンテキストをマウントして既存の `trigger_mouse_gesture_action` /
-リング実行を呼ぶ。**アクティブ detached の window_id が intent の window_id と一致することを
-確認してから実行する。** 一致しなければ実行せずログに残す。
+**消費点は `update_active_detached_viewer_context` のマウントの中**。実行前に次を確認する:
 
-⚠ **`with_viewer_context` (R2e の registry) は要らない。** コマンドはアクティブ化後に走るため、
-マウントされていないコンテキストへ適用する必要が無い。
+1. アクティブ detached の window_id が、ジェスチャの発生元 window_id と**一致する**
+2. その action が要求する viewer state が**存在する** (例: `fullscreen_idx` が `Some`)
+
+`Recognized` / `Activating` のまま対象ウィンドウが閉じた、アクティブ化が失敗した、
+別のウィンドウがアクティブになった場合は、**理由付きでログに残して捨てる** (silent fallback にしない)。
+
+⚠ **descriptor 再オープン経路には readiness の問題もある。** parked snapshot に bundle が無く
+descriptor から開き直す場合、`start_active_detached_book_context_*` は**非同期の列挙を開始して
+成功を返す** ([app.rs:39832](../src/app.rs:39832) → [app.rs:39885](../src/app.rs:39885))ので、
+PDF / ZIP の列挙が終わるまで `fullscreen_idx` が `None` のことがある。
+上記 2 の条件で待つ (= **状態で待つ。時間窓で待たない**、憲法 5)。
+待っている間に対象が変わったら捨てる。
+
+⚠ **`with_viewer_context` (R2e の registry) は要らない。** 実行はアクティブ化 commit 後の
+既存マウント境界の中で行うので、マウントされていないコンテキストへ適用する必要が無い。
 
 ### 3.4 短い右クリックと右ドラッグ無効時
 
@@ -175,11 +215,16 @@ pub(crate) enum DetachedActivationIntent {
    - 所有者が違う pass は他面のジェスチャを消さない (Root と DetachedWindow(id) の相互)
    - 3 枚以上の独立ウィンドウで、各ウィンドウのサンプルがそのウィンドウのジェスチャだけを進める
    - ジェスチャは同時に 1 つしか存在しない
-   - 非アクティブウィンドウで成立したジェスチャが `RunRightDrag` intent を作り、
-     **アクティブ化完了後に**実行される (順序をテストで固定する)
+   - 非アクティブウィンドウで成立したジェスチャが `Recognized` → `Activating` →
+     `PendingExecution` と進み、**所有 context がマウントされている間にだけ**実行される
+     (アクティブ化から戻った直後には実行しないことをテストで固定する)
    - アクティブ化前に対象ウィンドウが閉じたら、コマンドは実行されず理由付きで捨てられる
    - 対象ウィンドウの window_id とアクティブ detached の window_id が食い違うときは実行しない
-   - `pending_deferred_activation: bool` の既存挙動 (`Plain` intent) が変わらない
+   - descriptor 再オープンで `fullscreen_idx` がまだ `None` の間は実行を保留し、
+     対象が変わったら捨てる (時間窓ではなく状態で判定していることをテストで示す)
+   - 窓をまたいだイベントが sequence どおりに適用され、片方の窓のイベントが
+     もう片方のジェスチャを進めない
+   - `pending_deferred_activation: bool` の既存挙動 (コマンド無しの intent) が変わらない
 3. `cargo fmt` 済み。`python scripts/check_ui_glyphs.py` が 0 件 (UI 文言を触った場合)。
 4. 完了報告に、`bool` → `DetachedActivationIntent` の置き換えで影響した箇所を file:line で列挙する。
 
