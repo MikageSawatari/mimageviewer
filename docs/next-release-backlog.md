@@ -1670,6 +1670,20 @@
 > [release-verification-records.md](release-verification-records.md) にある。ここには
 > **手順そのものの未解決点**だけを置く。
 
+### 5.0 次版の「重要な変更点」に載せるもの
+
+[src/version_highlights.rs](../src/version_highlights.rs) の `TABLE` へ書く候補。
+**既定の挙動が変わったもの**は `must_read` に入れる (更新後初回起動で自動表示される。
+ここに載せないと利用者に伝わらない)。載せたらこの節から消す。
+
+| 変更 | 区分 | 入った版 |
+| --- | --- | --- |
+| バケツの「全体」「隣接のみ」の塗りが既定で 1px 広がる (はみ出し 1.0px) | `must_read` | bucket-shape-fill (2026-08-21 merge) |
+| モノクロ・セピア原稿の消しゴム補完が既定で色調合わせされる | `must_read` | bucket-shape-fill (2026-08-21 merge) |
+| バケツに「塗る範囲」5 択 (全体 / 隣接のみ / 長方形 / 楕円 / 円) | `highlights` | 同上 |
+| マスク編集の Redo (Ctrl+Y / Ctrl+Shift+Z) | `highlights` | 同上 |
+| Shift+ホイールで筆サイズ | `highlights` | 同上 |
+
 ### 5.1 ネイティブ依存
 
 | 対象 | 現状 / 次の確認 | 注意点 |
