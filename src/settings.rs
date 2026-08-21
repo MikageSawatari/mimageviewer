@@ -4139,6 +4139,10 @@ pub struct Settings {
     #[serde(default)]
     pub ai_backend: Option<String>,
 
+    /// 消しゴム MI-GAN 補完を元画像の色調へ合わせる近モノクロ判定の許容値。
+    #[serde(default = "default_erase_inpaint_mono_tolerance")]
+    pub erase_inpaint_mono_tolerance: u8,
+
     // 注: ai_tensorrt_fp16 フィールドは廃止。FP16 はランタイム側で常時 ON
     // (画質劣化は知覚不能、1.5-2x 高速化のメリットが大きい)。古い settings.json に
     // 残っているフィールドは serde の default で無視される。
@@ -4163,6 +4167,11 @@ pub struct Settings {
     pub colorize_preset_slots: crate::colorize::ColorizePresetSlots,
 
     // ── フォルダ側サイドカー ───────────────────────────────────
+    /// 物理フォルダを開いたとき、内容が同じ既存ファイルの編集内容を復元する候補を探す。
+    /// OFF は検出だけを完全停止し、編集確定時の content identity 記録は止めない。
+    #[serde(default = "default_true")]
+    pub edit_restore_prompt_enabled: bool,
+
     /// 補正・消しゴムマスク設定をフォルダごとのサイドカーファイル
     /// (`mimageviewer.dat`、隠し+システム属性) にバックアップする。
     /// OFF 時は読み書き両方スキップ (既存の `.dat` は削除しない)。
@@ -5082,6 +5091,9 @@ fn default_ai_upscale_skip_px() -> u32 {
 fn default_ai_denoise_skip_px() -> u32 {
     2048
 }
+pub(crate) const fn default_erase_inpaint_mono_tolerance() -> u8 {
+    12
+}
 pub fn default_exif_hidden_tags() -> Vec<String> {
     [
         // バイナリ / 巨大データ
@@ -5509,11 +5521,13 @@ impl Default for Settings {
             ai_upscale_size_limit: None,
             ai_denoise_size_limit: None,
             ai_backend: None,
+            erase_inpaint_mono_tolerance: default_erase_inpaint_mono_tolerance(),
             global_preset: crate::adjustment::AdjustParams::default(),
             preset_slots: crate::adjustment::PresetSlots::default(),
             post_filter_global_preset_stash: PostFilterDowngradeStash::default(),
             post_filter_preset_slot_stashes: [PostFilterDowngradeStash::default(); 10],
             colorize_preset_slots: crate::colorize::ColorizePresetSlots::default(),
+            edit_restore_prompt_enabled: true,
             sidecar_backup_enabled: true,
             tag_sidecar_backup_enabled: false,
             metadata_export_recursive: true,
@@ -6931,6 +6945,7 @@ impl Settings {
         // 事実上機能しなくなる。上限を超える値は ZIP 中身検査込みの DFS が
         // 長時間走り UI 非応答を招くので、両側クランプする。
         self.folder_skip_limit = self.folder_skip_limit.clamp(1, 30);
+        self.erase_inpaint_mono_tolerance = self.erase_inpaint_mono_tolerance.clamp(1, 64);
         if self.video_autoplay_mode == VideoAutoplayMode::OnlyFromGrid {
             self.video_autoplay = false;
             self.video_autoplay_mode = VideoAutoplayMode::Off;
@@ -7592,6 +7607,13 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edit_restore_prompt_defaults_on_when_missing() {
+        assert!(Settings::default().edit_restore_prompt_enabled);
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert!(loaded.edit_restore_prompt_enabled);
+    }
 
     #[test]
     fn pdf_worker_count_defaults_and_clamps_supported_range() {
@@ -9984,6 +10006,10 @@ mod tests {
         assert_eq!(loaded.video_volume, VIDEO_VOLUME_DEFAULT);
         assert_eq!(loaded.video_playback_speed, 1.0);
         assert_eq!(
+            loaded.erase_inpaint_mono_tolerance,
+            default_erase_inpaint_mono_tolerance()
+        );
+        assert_eq!(
             loaded.downscale_smoothing_percent,
             DOWNSCALE_SMOOTHING_PERCENT_MIN
         );
@@ -10258,6 +10284,18 @@ mod tests {
         s.folder_skip_limit = 999;
         s.sanitize();
         assert_eq!(s.folder_skip_limit, 30);
+    }
+
+    #[test]
+    fn sanitize_clamps_erase_inpaint_mono_tolerance() {
+        let mut settings = Settings::default();
+        settings.erase_inpaint_mono_tolerance = 0;
+        settings.sanitize();
+        assert_eq!(settings.erase_inpaint_mono_tolerance, 1);
+
+        settings.erase_inpaint_mono_tolerance = u8::MAX;
+        settings.sanitize();
+        assert_eq!(settings.erase_inpaint_mono_tolerance, 64);
     }
 
     #[test]

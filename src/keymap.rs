@@ -1725,6 +1725,7 @@ pub enum KeyAction {
     VideoToggleAudioMode,
     EraseConfirm,
     EraseConfirmPolygon,
+    EraseRedo,
     EraseUndo,
     EraseDeleteShape,
     EraseToolSelect,
@@ -1742,6 +1743,7 @@ pub enum KeyAction {
     EraseSpacePan,
     ConcealExit,
     ConcealConfirmPolygon,
+    ConcealRedo,
     ConcealUndo,
     ConcealDeleteShape,
     ConcealPixelGrid,
@@ -2173,6 +2175,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::VideoToggleAudioMode,
     KeyAction::EraseConfirm,
     KeyAction::EraseConfirmPolygon,
+    KeyAction::EraseRedo,
     KeyAction::EraseUndo,
     KeyAction::EraseDeleteShape,
     KeyAction::EraseToolSelect,
@@ -2190,6 +2193,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::EraseSpacePan,
     KeyAction::ConcealExit,
     KeyAction::ConcealConfirmPolygon,
+    KeyAction::ConcealRedo,
     KeyAction::ConcealUndo,
     KeyAction::ConcealDeleteShape,
     KeyAction::ConcealPixelGrid,
@@ -3694,6 +3698,7 @@ impl KeyAction {
             VideoToggleAudioMode => "VideoToggleAudioMode",
             EraseConfirm => "EraseConfirm",
             EraseConfirmPolygon => "EraseConfirmPolygon",
+            EraseRedo => "EraseRedo",
             EraseUndo => "EraseUndo",
             EraseDeleteShape => "EraseDeleteShape",
             EraseToolSelect => "EraseToolSelect",
@@ -3711,6 +3716,7 @@ impl KeyAction {
             EraseSpacePan => "EraseSpacePan",
             ConcealExit => "ConcealExit",
             ConcealConfirmPolygon => "ConcealConfirmPolygon",
+            ConcealRedo => "ConcealRedo",
             ConcealUndo => "ConcealUndo",
             ConcealDeleteShape => "ConcealDeleteShape",
             ConcealPixelGrid => "ConcealPixelGrid",
@@ -4251,6 +4257,7 @@ impl KeyAction {
             }
             EraseConfirm => "消しゴム処理を実行して終了する",
             EraseConfirmPolygon => "消しゴム多角形を確定する",
+            EraseRedo => "消しゴム編集をやり直す",
             EraseUndo => "消しゴム編集を元に戻す",
             EraseDeleteShape => "選択中の消しゴム図形を削除する",
             EraseToolSelect => "選択ツールに切り替える",
@@ -4268,6 +4275,7 @@ impl KeyAction {
             EraseSpacePan => "押している間だけ画像をパン操作する",
             ConcealExit => "隠蔽加工モードを終了する",
             ConcealConfirmPolygon => "隠蔽加工の多角形を確定する",
+            ConcealRedo => "隠蔽加工編集をやり直す",
             ConcealUndo => "隠蔽加工編集を元に戻す",
             ConcealDeleteShape => "選択中の隠蔽図形を削除する",
             ConcealPixelGrid => "ピクセルグリッド表示を切り替える",
@@ -4667,14 +4675,14 @@ impl KeyAction {
             | VideoAdjustSlot9
             | VideoAdjustSlot10
             | VideoToggleAudioMode => KeyContext::FsVideo,
-            EraseConfirm | EraseConfirmPolygon | EraseUndo | EraseDeleteShape | EraseToolSelect
-            | EraseToolBrush | EraseToolBucket | EraseToolLasso | EraseToolPolygon
-            | EraseToolVLine | EraseToolHLine | EraseToolLine | EraseToolRect
-            | EraseToolEllipse | ErasePaintMode | EraseEraseMode | EraseSpacePan => {
-                KeyContext::Erase
-            }
+            EraseConfirm | EraseConfirmPolygon | EraseRedo | EraseUndo | EraseDeleteShape
+            | EraseToolSelect | EraseToolBrush | EraseToolBucket | EraseToolLasso
+            | EraseToolPolygon | EraseToolVLine | EraseToolHLine | EraseToolLine
+            | EraseToolRect | EraseToolEllipse | ErasePaintMode | EraseEraseMode
+            | EraseSpacePan => KeyContext::Erase,
             ConcealExit
             | ConcealConfirmPolygon
+            | ConcealRedo
             | ConcealUndo
             | ConcealDeleteShape
             | ConcealPixelGrid
@@ -5073,6 +5081,7 @@ impl KeyAction {
             | VideoToggleAudioMode
             | EraseConfirm
             | EraseConfirmPolygon
+            | EraseRedo
             | EraseUndo
             | EraseDeleteShape
             | EraseToolSelect
@@ -5089,6 +5098,7 @@ impl KeyAction {
             | EraseEraseMode
             | ConcealExit
             | ConcealConfirmPolygon
+            | ConcealRedo
             | ConcealUndo
             | ConcealDeleteShape
             | ConcealPixelGrid
@@ -5517,6 +5527,7 @@ impl KeyAction {
             VideoToggleAudioMode => ChordList::one(Chord::key(Z)),
             EraseConfirm => ChordList::one(Chord::key(E)),
             EraseConfirmPolygon => ChordList::one(Chord::key(Enter)),
+            EraseRedo => ChordList::two(Chord::ctrl(Y), Chord::ctrl_shift(Z)),
             EraseUndo => ChordList::one(Chord::ctrl(Z)),
             EraseDeleteShape => ChordList::one(Chord::key(Delete)),
             EraseToolSelect => ChordList::one(Chord::key(S)),
@@ -5534,6 +5545,7 @@ impl KeyAction {
             EraseSpacePan => ChordList::one(Chord::key(Space)),
             ConcealExit => ChordList::one(Chord::ctrl(M)),
             ConcealConfirmPolygon => ChordList::one(Chord::key(Enter)),
+            ConcealRedo => ChordList::two(Chord::ctrl(Y), Chord::ctrl_shift(Z)),
             ConcealUndo => ChordList::one(Chord::ctrl(Z)),
             ConcealDeleteShape => ChordList::one(Chord::key(Delete)),
             ConcealPixelGrid => ChordList::one(Chord::key(G)),
@@ -8380,6 +8392,37 @@ mod tests {
             ..Default::default()
         });
         cache_test_keyboard_owner(ctx);
+    }
+
+    #[test]
+    fn mask_redo_ctrl_shift_z_is_consumed_before_undo() {
+        #[cfg(windows)]
+        let _serial = native_video_shortcut_test_guard();
+        #[cfg(windows)]
+        let _clear = ClearTestKeyFrame;
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
+
+        let keymap = Keymap::empty();
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        for (redo, undo) in [
+            (KeyAction::ConcealRedo, KeyAction::ConcealUndo),
+            (KeyAction::EraseRedo, KeyAction::EraseUndo),
+        ] {
+            let ctx = egui::Context::default();
+            begin_key_pass(&ctx, egui::Key::Z, modifiers);
+            assert!(keymap.consume_action(&ctx, redo), "{redo:?}");
+            assert!(
+                !keymap.consume_action(&ctx, undo),
+                "Ctrl+Shift+Z must not fall through to {undo:?}"
+            );
+            assert_eq!(ctx.input(|input| input.events.len()), 0);
+            let _ = ctx.end_pass();
+        }
     }
 
     fn cache_test_keyboard_owner(ctx: &egui::Context) {

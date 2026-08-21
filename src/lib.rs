@@ -37,6 +37,7 @@ pub mod compare_wgpu;
 pub mod conceal;
 pub mod conceal_compose;
 pub mod conceal_db;
+mod content_identity;
 pub mod creative_lut;
 pub mod data_dir;
 #[cfg(windows)]
@@ -172,6 +173,7 @@ mod seek_ruler;
 pub mod settings;
 pub mod settings_db;
 pub mod settings_restore;
+pub mod shape_fit;
 pub mod shell_file_ops;
 pub mod sidecar;
 pub mod single_instance;

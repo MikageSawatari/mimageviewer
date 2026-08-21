@@ -1641,6 +1641,44 @@ mod tests {
     }
 
     #[test]
+    fn zip_convert_expands_mixed_nested_archives_in_folders() {
+        // ZIP > folders/{native.zip, foreign.7z, native.zip > foreign.7z}
+        // RAR はテスト内で生成できないため、常時実行の混在テストは 7z で
+        // 「非 ZIP 入れ子」経路を代表させる。実 RAR は dist/ziptest サンプルが
+        // ある環境で下の real_* テストが検証する。
+        let deep_seven = build_7z_bytes(&[("deep/p03.png", b"DEEP7")]);
+        let inner_zip = build_zip_bytes(&[
+            ("chapter/p01.jpg", b"ZIP1"),
+            ("chapter/foreign.7z", &deep_seven),
+        ]);
+        let top_seven = build_7z_bytes(&[("part/p02.jpg", b"TOP7")]);
+        let outer = build_zip_bytes(&[
+            ("series/native.zip", &inner_zip),
+            ("series/foreign.7z", &top_seven),
+            ("cover.jpg", b"COVER"),
+            ("notes/readme.txt", b"skip"),
+        ]);
+
+        let out = run_convert_bytes(&outer, "src.zip", ArchiveFormat::Zip);
+        assert_eq!(
+            names(&out),
+            vec![
+                "cover.jpg",
+                "series/foreign.7z/part/p02.jpg",
+                "series/native.zip/chapter/foreign.7z/deep/p03.png",
+                "series/native.zip/chapter/p01.jpg",
+            ]
+        );
+        assert_eq!(
+            out.iter()
+                .find(|(n, _)| n == "series/native.zip/chapter/foreign.7z/deep/p03.png")
+                .unwrap()
+                .1,
+            b"DEEP7"
+        );
+    }
+
+    #[test]
     fn sevenz_convert_expands_nested_zip() {
         // 7z > {d.jpg, x.zip > img.png} → RAR/7z を外側にした入れ子も展開される。
         let nested_zip = build_zip_bytes(&[("img.png", b"NZ")]);
@@ -1753,6 +1791,37 @@ mod tests {
             names.iter().any(|n| n.starts_with("inner.rar/")),
             "{names:?}"
         );
+    }
+
+    #[test]
+    fn real_foreign_in_zip_sample_expands_if_present() {
+        // scripts/make_nested_archive_test.py が作る総合サンプル。
+        // WinRAR が無い環境でも part1.7z と part2.zip は入る。WinRAR があれば
+        // part3.rar も入り、ここで同時に確認できる。
+        let Some(src) = ziptest_sample("foreign_in_zip.zip") else {
+            return;
+        };
+        let (summary, names) = convert_sample(&src, ArchiveFormat::Zip);
+        assert!(summary.image_count >= 8, "{names:?}");
+        assert!(
+            names.iter().any(|n| n.starts_with("inner/part1.7z/")),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.starts_with("inner/part2.zip/")),
+            "{names:?}"
+        );
+        let input_has_rar = {
+            let f = std::fs::File::open(&src).unwrap();
+            let ar = zip::ZipArchive::new(std::io::BufReader::new(f)).unwrap();
+            ar.file_names().any(|n| n == "inner/part3.rar")
+        };
+        if input_has_rar {
+            assert!(
+                names.iter().any(|n| n.starts_with("inner/part3.rar/")),
+                "{names:?}"
+            );
+        }
     }
 
     #[test]

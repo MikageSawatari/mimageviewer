@@ -20,9 +20,10 @@ use sha2::{Digest, Sha256};
 pub const PREVIEW_LONG_SIDE: u32 = 2048;
 pub const PREVIEW_WEBP_QUALITY: f32 = 90.0;
 pub const DEFAULT_MAX_BYTES: u64 = 1_000_000_000;
+// v6: 消しゴム補完の色調合わせ前に生成した下地を再利用しない。
 // v5: ZIP/PDF 内ページを親コンテナの手動代表サムネイルとして使うときも、
 // container の mtime + size で stale 判定できるよう source_container_size を保持する。
-const CACHE_FORMAT_VERSION: i64 = 5;
+const CACHE_FORMAT_VERSION: i64 = 6;
 
 /// edit-result の上にだけ注釈を焼くための worker payload。
 ///
@@ -143,7 +144,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<bool> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     let reset = version != CACHE_FORMAT_VERSION;
     if reset {
-        // v1 は comic 合成済み 1 枚だけを保存していた。v3 では MI-GAN の生成規約も
+        // v1 は comic 合成済み 1 枚だけを保存していた。v3 / v6 では MI-GAN の生成規約も
         // 更新した。いずれも派生キャッシュとして安全に全件作り直す。
         conn.execute_batch("DROP TABLE IF EXISTS edit_previews;")?;
     }

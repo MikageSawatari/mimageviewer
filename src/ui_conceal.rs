@@ -12,7 +12,7 @@
 //!   回転ハンドル + 端点)。Shift で軸拘束 / 等比 / 角度スナップ、Alt で中心固定
 //! - Brush / Lasso はビットマップ塗り (消しゴムと同じ scanline ロジック)
 //! - Line / VertLine / HorizLine / Rect / Ellipse はベクタ Shape を新規作成
-//! - Undo: `ConcealSnapshot` で mask + shapes をまとめて記録
+//! - Undo / Redo: `ConcealSnapshot` で mask + shapes をまとめて記録
 //!
 //! Phase 3 以降で合成 (Mosaic / Fill / Blur) と DB 永続化を追加する。
 
@@ -181,6 +181,7 @@ impl App {
         self.conceal_mask_texture_dirty_rect = None;
         self.conceal_paint_mode = true;
         self.conceal_undo_stack.clear();
+        self.conceal_redo_stack.clear();
         self.conceal_last_undo_at = None;
         self.conceal_shapes.clear();
         self.conceal_selected_shape = None;
@@ -285,6 +286,7 @@ impl App {
         self.conceal_shapes.clear();
         self.conceal_selected_shape = None;
         self.conceal_undo_stack.clear();
+        self.conceal_redo_stack.clear();
         self.conceal_last_undo_at = None;
         self.conceal_drag = None;
         self.conceal_last_paint_pos = None;
@@ -329,15 +331,45 @@ impl App {
 
     // ── Undo ────────────────────────────────────────────────────────
 
+    fn current_conceal_snapshot(&self) -> Option<ConcealSnapshot> {
+        Some(ConcealSnapshot {
+            mask: self.conceal_mask.as_ref()?.clone(),
+            shapes: self.conceal_shapes.clone(),
+        })
+    }
+
+    fn push_conceal_undo_snapshot(&mut self, snapshot: ConcealSnapshot) {
+        self.conceal_undo_stack.push_back(snapshot);
+        while self.conceal_undo_stack.len() > UNDO_MAX {
+            self.conceal_undo_stack.pop_front();
+        }
+    }
+
+    fn push_conceal_redo_snapshot(&mut self, snapshot: ConcealSnapshot) {
+        self.conceal_redo_stack.push_back(snapshot);
+        while self.conceal_redo_stack.len() > UNDO_MAX {
+            self.conceal_redo_stack.pop_front();
+        }
+    }
+
+    fn restore_conceal_snapshot(&mut self, snapshot: ConcealSnapshot) {
+        self.conceal_mask = Some(snapshot.mask);
+        self.conceal_shapes = snapshot.shapes;
+        self.conceal_selected_shape = None;
+        self.conceal_drag = None;
+        self.conceal_mask_texture = None;
+        // mask / shapes が変わったので合成 cache を失効させる。
+        if let Some(fs_idx) = self.fullscreen_idx {
+            self.clear_conceal_caches(fs_idx);
+        }
+    }
+
     pub(crate) fn push_conceal_undo(&mut self) {
-        if let Some(mask) = &self.conceal_mask {
-            self.conceal_undo_stack.push_back(ConcealSnapshot {
-                mask: mask.clone(),
-                shapes: self.conceal_shapes.clone(),
-            });
-            while self.conceal_undo_stack.len() > UNDO_MAX {
-                self.conceal_undo_stack.pop_front();
-            }
+        if let Some(snapshot) = self.current_conceal_snapshot() {
+            // この関数は新しい編集の共通入口。Undo/Redo 自身は専用 helper を使い、
+            // 分岐後の編集だけが redo 履歴を破棄する。
+            self.conceal_redo_stack.clear();
+            self.push_conceal_undo_snapshot(snapshot);
             self.conceal_last_undo_at = Some(std::time::Instant::now());
         }
     }
@@ -353,20 +385,35 @@ impl App {
     }
 
     pub(crate) fn undo_conceal(&mut self) -> bool {
-        if let Some(prev) = self.conceal_undo_stack.pop_back() {
-            self.conceal_mask = Some(prev.mask);
-            self.conceal_shapes = prev.shapes;
-            self.conceal_selected_shape = None;
-            self.conceal_drag = None;
-            self.conceal_mask_texture = None;
-            // mask / shapes が変わったので合成 cache を失効させる。
-            if let Some(fs_idx) = self.fullscreen_idx {
-                self.clear_conceal_caches(fs_idx);
-            }
-            true
-        } else {
-            false
+        if self.conceal_undo_stack.is_empty() {
+            return false;
         }
+        let Some(current) = self.current_conceal_snapshot() else {
+            return false;
+        };
+        let Some(prev) = self.conceal_undo_stack.pop_back() else {
+            return false;
+        };
+        self.push_conceal_redo_snapshot(current);
+        self.restore_conceal_snapshot(prev);
+        self.conceal_last_undo_at = None;
+        true
+    }
+
+    pub(crate) fn redo_conceal(&mut self) -> bool {
+        if self.conceal_redo_stack.is_empty() {
+            return false;
+        }
+        let Some(current) = self.current_conceal_snapshot() else {
+            return false;
+        };
+        let Some(next) = self.conceal_redo_stack.pop_back() else {
+            return false;
+        };
+        self.push_conceal_undo_snapshot(current);
+        self.restore_conceal_snapshot(next);
+        self.conceal_last_undo_at = None;
+        true
     }
 
     // ── マスクスロット (差分画像生成サポート、消しゴム save_mask_to_slot と対称) ──
@@ -572,6 +619,17 @@ impl App {
             } else {
                 "[ピクセルグリッド OFF]".to_string()
             });
+        }
+
+        // Redo は Ctrl+Shift+Z → Ctrl+Y → Ctrl+Z (Undo) の順に consume する。
+        // Undo を先にすると Ctrl+Shift+Z が Undo 側へ流れ得る。
+        let redo = self.keymap.consume_action(ctx, KeyAction::ConcealRedo);
+        if redo {
+            if self.redo_conceal() {
+                self.show_feedback_toast("[やり直す]".to_string());
+            } else {
+                self.show_feedback_toast("[履歴なし]".to_string());
+            }
         }
 
         // Ctrl+Z: Undo
@@ -905,7 +963,13 @@ impl App {
         );
     }
 
-    fn apply_conceal_bucket(&mut self, fs_idx: usize, seed_x: usize, seed_y: usize) {
+    fn apply_conceal_bucket(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        seed_x: usize,
+        seed_y: usize,
+    ) {
         let Some((source, _)) = self.current_conceal_source_pixels(fs_idx) else {
             self.show_feedback_toast(
                 "バケツに使う加工前の画像を準備中です。少し待ってからもう一度クリックしてください。"
@@ -937,9 +1001,11 @@ impl App {
             seed_y,
             crate::mask_db::BucketFill {
                 tolerance: self.conceal_bucket_tolerance.round().clamp(0.0, 255.0) as u8,
-                connected: self.conceal_bucket_connected,
+                region: self.conceal_bucket_region,
                 value: self.conceal_paint_mode,
                 leak_stop: self.conceal_bucket_leak_stop.max(0.0),
+                outset: self.conceal_bucket_outset.max(0.0),
+                gap_tolerance: self.conceal_bucket_gap_tolerance.clamp(0.0, 50.0),
             },
         );
         match outcome {
@@ -948,6 +1014,15 @@ impl App {
                 self.show_feedback_toast(
                     "漏れ止めより細い場所です。漏れ止めを小さくしてください。".to_string(),
                 );
+                return;
+            }
+            crate::mask_db::BucketFillOutcome::ShapeFitFailed(preview) => {
+                self.start_bucket_region_flash(ctx, fs_idx, preview);
+                if let Some(message) =
+                    crate::ui_helpers::bucket_shape_fit_failed_message(self.conceal_bucket_region)
+                {
+                    self.show_feedback_toast(message.to_string());
+                }
                 return;
             }
             crate::mask_db::BucketFillOutcome::NoChange
@@ -1221,6 +1296,7 @@ impl App {
             {
                 if let Some(fs_idx) = self.fullscreen_idx {
                     self.apply_conceal_bucket(
+                        ctx,
                         fs_idx,
                         img_pos.0.floor() as usize,
                         img_pos.1.floor() as usize,
@@ -1777,6 +1853,7 @@ impl App {
                 }
             }
         }
+        self.draw_bucket_region_flash(ui, ctx, transform);
 
         // ツールプレビュー (ドラッグ中)
         self.draw_conceal_tool_preview(ui, transform);
@@ -2344,12 +2421,26 @@ impl App {
                                             self.conceal_mask_texture = None;
                                         }
 
+                                        // ツール固有設定。設定を持たないツールでは区切りも見出しも出さない。
+                                        let settings_tool_name = match self.conceal_tool {
+                                            ConcealTool::Brush => Some("筆"),
+                                            ConcealTool::Bucket => Some("バケツ"),
+                                            ConcealTool::Line => Some("直線"),
+                                            ConcealTool::VertLine => Some("縦線"),
+                                            ConcealTool::HorizLine => Some("横線"),
+                                            _ => None,
+                                        };
+                                        crate::ui_helpers::draw_tool_settings_heading(
+                                            ui,
+                                            settings_tool_name,
+                                            egui::Color32::from_gray(200),
+                                        );
+
                                         // サイズスライダ (Brush は半径、Line 系は太さ)
                                         let [w, h] = self.conceal_mask_size;
                                         let long_edge = w.max(h).max(1) as f32;
                                         match self.conceal_tool {
                                             ConcealTool::Brush => {
-                                                ui.separator();
                                                 let mut r = self.settings.conceal_brush_radius;
                                                 ui.add(
                                                     egui::Slider::new(
@@ -2361,7 +2452,6 @@ impl App {
                                                 self.settings.conceal_brush_radius = r;
                                             }
                                             ConcealTool::Bucket => {
-                                                ui.separator();
                                                 ui.add(
                                                     egui::Slider::new(
                                                         &mut self.conceal_bucket_tolerance,
@@ -2370,21 +2460,13 @@ impl App {
                                                     .text("色差の許容値")
                                                     .step_by(1.0),
                                                 );
-                                                ui.checkbox(
-                                                    &mut self.conceal_bucket_connected,
-                                                    "隣接のみ",
+                                                crate::ui_helpers::draw_bucket_region_controls(
+                                                    ui,
+                                                    &mut self.conceal_bucket_region,
+                                                    &mut self.conceal_bucket_leak_stop,
+                                                    &mut self.conceal_bucket_outset,
+                                                    &mut self.conceal_bucket_gap_tolerance,
                                                 );
-                                                if self.conceal_bucket_connected {
-                                                    ui.add(
-                                                        egui::Slider::new(
-                                                            &mut self.conceal_bucket_leak_stop,
-                                                            0.0..=16.0
-                                                        )
-                                                        .text("漏れ止め")
-                                                        .step_by(0.1),
-                                                    )
-                                                    .on_hover_text("細い線や小さな隙間から塗りが漏れるのを防ぎます。0 で無効。");
-                                                }
                                                 ui.add(
                                                     egui::Label::new(
                                                         egui::RichText::new(
@@ -2399,7 +2481,6 @@ impl App {
                                             ConcealTool::Line
                                             | ConcealTool::VertLine
                                             | ConcealTool::HorizLine => {
-                                                ui.separator();
                                                 let mut t = self.settings.conceal_line_width;
                                                 ui.add(
                                                     egui::Slider::new(
@@ -2811,7 +2892,8 @@ impl App {
                                             Alt+ハンドル:中心固定\n\
                                             T:タイプ  G:グリッド  1-4:プリセット\n\
                                             多角形:始点クリック/右クリック/Enterで確定 Escで取消\n\
-                                            Ctrl+Z:戻す  Delete:選択削除\n\
+                                            Ctrl+Z:戻す  Ctrl+Y/Ctrl+Shift+Z:やり直す\n\
+                                            Delete:選択削除\n\
                                             Esc:解除/終了  Ctrl+M:終了\n\
                                             終了時に保存";
                                         ui.add(
@@ -2889,8 +2971,86 @@ fn conceal_preview_pointer_state(
 #[cfg(test)]
 mod tests {
     use super::{
-        App, ConcealTool, KeyAction, conceal_preview_pointer_active, conceal_preview_pointer_state,
+        App, ConcealTool, KeyAction, UNDO_MAX, conceal_preview_pointer_active,
+        conceal_preview_pointer_state,
     };
+    use crate::mask_db::{Shape, ShapeOp};
+
+    fn conceal_test_shape(revision: usize) -> Shape {
+        Shape::Rect {
+            op: ShapeOp::Add,
+            center: (revision as f32, 10.0),
+            half_w: 4.0,
+            half_h: 3.0,
+            rotation_rad: 0.0,
+        }
+    }
+
+    #[test]
+    fn conceal_edit_undo_redo_restores_mask_and_shapes() {
+        let mut app = crate::app::setup_app_for_test();
+        app.conceal_mask = Some(vec![false, false]);
+        app.conceal_shapes.clear();
+
+        app.push_conceal_undo();
+        app.conceal_mask = Some(vec![true, false]);
+        app.conceal_shapes = vec![conceal_test_shape(1)];
+
+        assert!(app.undo_conceal());
+        assert_eq!(app.conceal_mask.as_deref(), Some([false, false].as_slice()));
+        assert!(app.conceal_shapes.is_empty());
+        assert!(app.redo_conceal());
+        assert_eq!(app.conceal_mask.as_deref(), Some([true, false].as_slice()));
+        assert_eq!(app.conceal_shapes, vec![conceal_test_shape(1)]);
+    }
+
+    #[test]
+    fn conceal_new_edit_after_undo_discards_redo() {
+        let mut app = crate::app::setup_app_for_test();
+        app.conceal_mask = Some(vec![false]);
+        app.conceal_shapes.clear();
+        app.push_conceal_undo();
+        app.conceal_mask = Some(vec![true]);
+        app.conceal_shapes = vec![conceal_test_shape(1)];
+        assert!(app.undo_conceal());
+
+        app.push_conceal_undo();
+        app.conceal_mask = Some(vec![false]);
+        app.conceal_shapes = vec![conceal_test_shape(2)];
+
+        assert!(!app.redo_conceal());
+        assert_eq!(app.conceal_mask.as_deref(), Some([false].as_slice()));
+        assert_eq!(app.conceal_shapes, vec![conceal_test_shape(2)]);
+    }
+
+    #[test]
+    fn conceal_undo_redo_limit_stays_bounded_and_symmetric() {
+        let mut app = crate::app::setup_app_for_test();
+        app.conceal_mask = Some(vec![false]);
+        app.conceal_shapes = vec![conceal_test_shape(0)];
+        let final_revision = UNDO_MAX + 5;
+        for revision in 1..=final_revision {
+            app.push_conceal_undo();
+            app.conceal_mask = Some(vec![revision % 2 == 1]);
+            app.conceal_shapes = vec![conceal_test_shape(revision)];
+        }
+
+        assert_eq!(app.conceal_undo_stack.len(), UNDO_MAX);
+        assert_eq!(
+            (0..=UNDO_MAX).filter(|_| app.undo_conceal()).count(),
+            UNDO_MAX
+        );
+        assert_eq!(app.conceal_redo_stack.len(), UNDO_MAX);
+        assert_eq!(
+            (0..=UNDO_MAX).filter(|_| app.redo_conceal()).count(),
+            UNDO_MAX
+        );
+        assert_eq!(
+            app.conceal_mask.as_deref(),
+            Some([final_revision % 2 == 1].as_slice())
+        );
+        assert_eq!(app.conceal_shapes, vec![conceal_test_shape(final_revision)]);
+    }
 
     #[test]
     fn conceal_bucket_tool_maps_to_bucket_key_action() {

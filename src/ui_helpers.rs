@@ -20,6 +20,217 @@ pub(crate) const ERROR_TEXT_COLOR: eframe::egui::Color32 =
 /// エラー表示の標準フォントサイズ。
 #[allow(dead_code)]
 pub(crate) const ERROR_TEXT_SIZE: f32 = 13.0;
+const BRUSH_WHEEL_POINT_PER_NOTCH: f32 = 40.0;
+
+fn shift_wheel_notches(events: &[egui::Event]) -> f32 {
+    events
+        .iter()
+        .filter_map(|event| {
+            let egui::Event::MouseWheel {
+                unit,
+                delta,
+                modifiers,
+            } = event
+            else {
+                return None;
+            };
+            if *modifiers != egui::Modifiers::SHIFT {
+                return None;
+            }
+            // Shift による egui の水平スクロール化は raw_scroll_delta へ反映される。
+            // 元イベントは通常 y のままだが、OS が既に水平化する場合もあるため大きい軸を使う。
+            let delta = if delta.y.abs() >= delta.x.abs() {
+                delta.y
+            } else {
+                delta.x
+            };
+            Some(match unit {
+                egui::MouseWheelUnit::Line => delta,
+                egui::MouseWheelUnit::Point => delta / BRUSH_WHEEL_POINT_PER_NOTCH,
+                egui::MouseWheelUnit::Page => delta.signum(),
+            })
+        })
+        .sum()
+}
+
+/// 編集キャンバス上の Shift+ホイールを筆半径へ適用し、適用したときだけ wheel を消費する。
+///
+/// `radius=None` は筆半径を持たないツール、`cursor_on_canvas=false` はパネル上などを表す。
+/// どちらの場合も input state には一切触らず、従来の wheel 経路へ残す。
+pub(crate) fn apply_brush_radius_wheel(
+    ctx: &egui::Context,
+    radius: Option<&mut f32>,
+    min: f32,
+    max: f32,
+    cursor_on_canvas: bool,
+) -> Option<f32> {
+    if !cursor_on_canvas {
+        return None;
+    }
+    let radius = radius?;
+    let notches = ctx.input(|input| shift_wheel_notches(&input.events));
+    if notches.abs() <= f32::EPSILON {
+        return None;
+    }
+
+    *radius = crate::manual_mask_tools::brush_radius_after_wheel(*radius, notches, min, max);
+    let applied = *radius;
+    ctx.input_mut(|input| {
+        input.raw_scroll_delta = egui::Vec2::ZERO;
+        input.smooth_scroll_delta = egui::Vec2::ZERO;
+        input
+            .events
+            .retain(|event| !matches!(event, egui::Event::MouseWheel { .. }));
+    });
+    Some(applied)
+}
+
+/// 3 系統のバケツで共有する範囲選択と、範囲に応じた補助スライダー。
+///
+/// px の 2 本は 0.1 刻み / 小数 1 桁、割合は 1 刻み / 整数表示に固定する。egui の
+/// 自動桁数へ任せると、刻みより細かい桁が出て 3 本の見た目が不揃いになる。
+/// 戻り値は 5 択ボタン 2 行を確保した矩形。
+pub(crate) fn draw_bucket_region_controls(
+    ui: &mut egui::Ui,
+    region: &mut crate::mask_db::BucketRegion,
+    leak_stop: &mut f32,
+    outset: &mut f32,
+    gap_tolerance: &mut f32,
+) -> egui::Rect {
+    use crate::mask_db::BucketRegion;
+
+    ui.label("塗る範囲");
+    // ScrollArea の content Ui は、先に幅広い widget が置かれると max_rect が表示幅より
+    // 広がる。horizontal_wrapped は clip_rect ではなく、その max_rect 由来の
+    // available_size_before_wrap を折返し境界にするため、パネル外まで 1 行になり得る。
+    // 表示中の幅を上限に明示した 2 行へ固定し、パネル幅が異なる 3 系統で同じ規則を使う。
+    let visible_width = (ui.clip_rect().right() - ui.cursor().left()).max(0.0);
+    let controls_width = ui.available_width().min(visible_width).max(1.0);
+    let first_row = draw_bucket_region_row(
+        ui,
+        controls_width,
+        &[
+            (BucketRegion::Whole, "全体"),
+            (BucketRegion::Connected, "隣接のみ"),
+        ],
+        region,
+    );
+    let second_row = draw_bucket_region_row(
+        ui,
+        controls_width,
+        &[
+            (BucketRegion::Rect, "長方形"),
+            (BucketRegion::Ellipse, "楕円"),
+            (BucketRegion::Circle, "円"),
+        ],
+        region,
+    );
+    let region_controls_rect = first_row.union(second_row);
+    if region.uses_leak_stop() {
+        ui.add(
+            egui::Slider::new(leak_stop, 0.0..=16.0)
+                .text("漏れ止め")
+                .step_by(0.1)
+                .fixed_decimals(1),
+        )
+        .on_hover_text("細い線や小さな隙間から塗りが漏れるのを防ぎます。0 で無効。");
+    }
+    ui.add(
+        egui::Slider::new(outset, 0.0..=8.0)
+            .text("はみ出し")
+            .step_by(0.1)
+            .fixed_decimals(1),
+    )
+    .on_hover_text(
+        "塗った範囲を外側へ広げます。縁のにじみを含めたいときに上げてください。図形では図形を広げます。",
+    );
+    if region.is_shape() {
+        ui.add(
+            egui::Slider::new(gap_tolerance, 0.0..=50.0)
+                .text("隙間の許容")
+                .step_by(1.0)
+                .fixed_decimals(0)
+                .suffix("%"),
+        )
+        .on_hover_text(
+            "図形の中に混ざってよい別色の割合です。文字の抜けは埋め、大きな隙間は埋めません。0 で穴埋めなし。",
+        );
+    }
+    region_controls_rect
+}
+
+/// ツール固有設定の前に、パレット見出しと同じスタイルで区切りと見出しを描く。
+///
+/// `tool_name=None` は設定を持たないツールを表し、空の区切りや見出しを作らない。
+/// 戻り値は幅制約の回帰テストで使う見出し行の矩形。
+pub(crate) fn draw_tool_settings_heading(
+    ui: &mut egui::Ui,
+    tool_name: Option<&str>,
+    color: egui::Color32,
+) -> Option<egui::Rect> {
+    let tool_name = tool_name?;
+    ui.separator();
+    Some(
+        ui.add(
+            egui::Label::new(egui::RichText::new(format!("{tool_name}の設定:")).color(color))
+                .wrap(),
+        )
+        .rect,
+    )
+}
+
+fn draw_bucket_region_row(
+    ui: &mut egui::Ui,
+    row_width: f32,
+    choices: &[(crate::mask_db::BucketRegion, &str)],
+    region: &mut crate::mask_db::BucketRegion,
+) -> egui::Rect {
+    const BUTTON_HEIGHT: f32 = 24.0;
+    const BUTTON_GAP: f32 = 4.0;
+    let gap_total = BUTTON_GAP * choices.len().saturating_sub(1) as f32;
+    let button_width = ((row_width - gap_total) / choices.len().max(1) as f32).max(1.0);
+    ui.allocate_ui_with_layout(
+        egui::vec2(row_width, BUTTON_HEIGHT),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = BUTTON_GAP;
+            for &(value, label) in choices {
+                if crate::ui_fullscreen::draw_icons::panel_toggle_button(
+                    ui,
+                    label,
+                    *region == value,
+                    Some(egui::vec2(button_width, BUTTON_HEIGHT)),
+                    None,
+                )
+                .clicked()
+                {
+                    *region = value;
+                }
+            }
+        },
+    )
+    .response
+    .rect
+}
+
+pub(crate) fn bucket_shape_fit_failed_message(
+    region: crate::mask_db::BucketRegion,
+) -> Option<&'static str> {
+    use crate::mask_db::BucketRegion;
+
+    match region {
+        BucketRegion::Rect => Some(
+            "長方形として当てはまりませんでした。選択範囲を点滅表示しました。漏れ止めを上げるか、色差の許容値を下げてください。",
+        ),
+        BucketRegion::Ellipse => Some(
+            "楕円として当てはまりませんでした。選択範囲を点滅表示しました。漏れ止めを上げるか、色差の許容値を下げてください。",
+        ),
+        BucketRegion::Circle => Some(
+            "円として当てはまりませんでした。選択範囲を点滅表示しました。漏れ止めを上げるか、色差の許容値を下げてください。",
+        ),
+        BucketRegion::Whole | BucketRegion::Connected => None,
+    }
+}
 
 pub(crate) fn processing_size_outside_note(bound: &str) -> String {
     format!("（この画像は処理対象サイズ {bound}の範囲外なので実行されません）")
@@ -1620,6 +1831,183 @@ pub fn draw_centered_elided_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn begin_wheel_pass(ctx: &egui::Context, modifiers: egui::Modifiers) {
+        ctx.begin_pass(egui::RawInput {
+            modifiers,
+            events: vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, 1.0),
+                modifiers,
+            }],
+            ..Default::default()
+        });
+    }
+
+    fn wheel_input_remaining(ctx: &egui::Context) -> bool {
+        ctx.input(|input| {
+            input.raw_scroll_delta != egui::Vec2::ZERO
+                || input.smooth_scroll_delta != egui::Vec2::ZERO
+                || input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::MouseWheel { .. }))
+        })
+    }
+
+    #[test]
+    fn brush_radius_wheel_applies_then_consumes_shift_wheel() {
+        let ctx = egui::Context::default();
+        begin_wheel_pass(&ctx, egui::Modifiers::SHIFT);
+        let mut radius = 3.0;
+        let applied = apply_brush_radius_wheel(&ctx, Some(&mut radius), 1.0, 100.0, true);
+        assert_eq!(applied, Some(4.0));
+        assert_eq!(radius, 4.0);
+        assert!(!wheel_input_remaining(&ctx));
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn brush_radius_wheel_leaves_input_for_non_brush_tools() {
+        let ctx = egui::Context::default();
+        begin_wheel_pass(&ctx, egui::Modifiers::SHIFT);
+        assert_eq!(apply_brush_radius_wheel(&ctx, None, 1.0, 100.0, true), None);
+        assert!(wheel_input_remaining(&ctx));
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn brush_radius_wheel_leaves_input_on_panels() {
+        let ctx = egui::Context::default();
+        begin_wheel_pass(&ctx, egui::Modifiers::SHIFT);
+        let mut radius = 3.0;
+        assert_eq!(
+            apply_brush_radius_wheel(&ctx, Some(&mut radius), 1.0, 100.0, false),
+            None
+        );
+        assert_eq!(radius, 3.0);
+        assert!(wheel_input_remaining(&ctx));
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn brush_radius_wheel_requires_exact_shift_modifier() {
+        for modifiers in [
+            egui::Modifiers::NONE,
+            egui::Modifiers::SHIFT | egui::Modifiers::CTRL,
+        ] {
+            let ctx = egui::Context::default();
+            begin_wheel_pass(&ctx, modifiers);
+            let mut radius = 3.0;
+            assert_eq!(
+                apply_brush_radius_wheel(&ctx, Some(&mut radius), 1.0, 100.0, true),
+                None
+            );
+            assert_eq!(radius, 3.0);
+            assert!(wheel_input_remaining(&ctx));
+            let _ = ctx.end_pass();
+        }
+    }
+
+    #[test]
+    fn bucket_region_controls_stay_inside_a_200px_visible_ui() {
+        let ctx = egui::Context::default();
+        let mut controls_rect = egui::Rect::NOTHING;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 500.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let visible_rect = egui::Rect::from_min_size(
+                            ui.cursor().left_top(),
+                            egui::vec2(200.0, 400.0),
+                        );
+                        // ScrollArea の content Ui は、先行 widget が幅を広げると表示範囲より
+                        // 大きい max_rect を持ちうる。clip はパネル幅のままという実機条件を再現する。
+                        let wide_rect = egui::Rect::from_min_size(
+                            visible_rect.min,
+                            egui::vec2(800.0, visible_rect.height()),
+                        );
+                        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(wide_rect));
+                        child.set_clip_rect(visible_rect);
+                        let mut region = crate::mask_db::BucketRegion::Connected;
+                        controls_rect = draw_bucket_region_controls(
+                            &mut child,
+                            &mut region,
+                            &mut 0.0,
+                            &mut 1.0,
+                            &mut 10.0,
+                        );
+                    });
+            },
+        );
+
+        assert!(
+            controls_rect.width() <= 200.0 + 0.5,
+            "controls width={} exceeds the visible panel width",
+            controls_rect.width()
+        );
+    }
+
+    #[test]
+    fn tool_settings_heading_stays_inside_a_200px_visible_ui_and_skips_none() {
+        let ctx = egui::Context::default();
+        let mut heading_rect = egui::Rect::NOTHING;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 500.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let visible_rect = egui::Rect::from_min_size(
+                            ui.cursor().left_top(),
+                            egui::vec2(200.0, 200.0),
+                        );
+                        let wide_rect = egui::Rect::from_min_size(
+                            visible_rect.min,
+                            egui::vec2(800.0, visible_rect.height()),
+                        );
+                        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(wide_rect));
+                        child.set_clip_rect(visible_rect);
+                        let before_none = child.cursor().top();
+                        assert!(
+                            draw_tool_settings_heading(
+                                &mut child,
+                                None,
+                                egui::Color32::from_gray(200),
+                            )
+                            .is_none()
+                        );
+                        assert_eq!(child.cursor().top(), before_none);
+                        heading_rect = draw_tool_settings_heading(
+                            &mut child,
+                            Some("隙間補完"),
+                            egui::Color32::from_gray(200),
+                        )
+                        .expect("a configured tool must draw its heading");
+                    });
+            },
+        );
+
+        assert!(
+            heading_rect.width() <= 200.0 + 0.5,
+            "heading width={} exceeds the visible panel width",
+            heading_rect.width()
+        );
+    }
 
     #[test]
     fn processing_size_messages_share_the_ai_wording() {

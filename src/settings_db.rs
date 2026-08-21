@@ -351,6 +351,7 @@ pub(crate) struct AdjustmentRenderSettings {
     pub(crate) ai_upscale_limit: crate::ai::upscale::AiProcessSizeLimit,
     pub(crate) ai_denoise_limit: crate::ai::upscale::AiProcessSizeLimit,
     pub(crate) ai_backend: Option<String>,
+    pub(crate) erase_inpaint_mono_tolerance: u8,
     pub(crate) retained_final_ai_cache_max_entries: usize,
     pub(crate) retained_final_ai_cache_max_mib: u64,
 }
@@ -367,6 +368,7 @@ impl AdjustmentRenderSettings {
             ai_upscale_limit: settings.ai_upscale_limit(),
             ai_denoise_limit: settings.ai_denoise_limit(),
             ai_backend: settings.ai_backend.clone(),
+            erase_inpaint_mono_tolerance: settings.erase_inpaint_mono_tolerance,
             retained_final_ai_cache_max_entries: settings.retained_final_ai_cache_max_entries,
             retained_final_ai_cache_max_mib: settings.retained_final_ai_cache_max_mib,
         }
@@ -668,6 +670,12 @@ impl SettingsDb {
                 )?
                 .unwrap_or_else(|| crate::ai::upscale::AiProcessSizeLimit::square(denoise_skip_px)),
                 ai_backend: read_settings_kv_typed(&inner.conn, "ai_backend", || None)?,
+                erase_inpaint_mono_tolerance: read_settings_kv_typed(
+                    &inner.conn,
+                    "erase_inpaint_mono_tolerance",
+                    crate::settings::default_erase_inpaint_mono_tolerance,
+                )?
+                .clamp(1, 64),
                 retained_final_ai_cache_max_entries: read_settings_kv_typed(
                     &inner.conn,
                     "retained_final_ai_cache_max_entries",
@@ -3526,6 +3534,7 @@ mod tests {
         settings.global_preset.brightness = 11.0;
         settings.conceal_type = crate::conceal::ConcealType::BlackFill;
         settings.conceal_fill_opacity_percent = 73;
+        settings.erase_inpaint_mono_tolerance = 9;
         db.save_full(&settings).unwrap();
 
         let first = db.load_adjustment_render_settings().unwrap();
@@ -3533,6 +3542,7 @@ mod tests {
         assert_eq!(first.favorites[0].id, favorite.id);
         assert_eq!(first.favorites[0].path, favorite.path);
         assert_eq!(first.global_preset.brightness, 11.0);
+        assert_eq!(first.erase_inpaint_mono_tolerance, 9);
         assert_eq!(first.creative_luts, settings.creative_luts);
         assert_eq!(
             first.conceal_preset,
@@ -3544,15 +3554,27 @@ mod tests {
         settings.creative_luts.clear();
         settings.conceal_type = crate::conceal::ConcealType::Blur;
         settings.conceal_blur_radius_px = 41.0;
+        settings.erase_inpaint_mono_tolerance = 27;
         db.save_full(&settings).unwrap();
 
         let second = db.load_adjustment_render_settings().unwrap();
         assert!(second.favorites.is_empty());
         assert_eq!(second.global_preset.brightness, 37.0);
+        assert_eq!(second.erase_inpaint_mono_tolerance, 27);
         assert!(second.creative_luts.is_empty());
         assert_eq!(
             second.conceal_preset,
             crate::conceal::ConcealPreset::from_settings(&settings)
+        );
+    }
+
+    #[test]
+    fn adjustment_render_settings_default_missing_erase_tone_tolerance() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let loaded = db.load_adjustment_render_settings().unwrap();
+        assert_eq!(
+            loaded.erase_inpaint_mono_tolerance,
+            crate::settings::default_erase_inpaint_mono_tolerance()
         );
     }
 

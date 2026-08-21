@@ -250,7 +250,9 @@ pub(crate) enum StoreKeyNormalization {
 
 /// リネームと mIV 内削除成功時 hard purge が共有する path-keyed SQLite 記述子。
 ///
-/// `unique` は rename の衝突処理にだけ使う。purge は全行を素の `DELETE` にする。
+/// `unique` は rename の衝突処理と content-identity v1 copy の可否に使う。
+/// `false` のストアは path 以外の行 identity 再採番が必要なので copy 対象外。
+/// purge は全行を素の `DELETE` にする。
 /// `rename_generic=false` は raw `path` 列も同時更新する閲覧履歴だけで、rename 側は専用処理を
 /// 使うが purge 側は同じ記述子を使う。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -261,6 +263,17 @@ pub(crate) struct StoreDescriptor {
     pub(crate) unique: bool,
     pub(crate) normalization: StoreKeyNormalization,
     pub(crate) rename_generic: bool,
+}
+
+impl StoreDescriptor {
+    /// このストア自身が宣言する規則で物理 path を永続キーへ正規化する。
+    /// copy / rename / purge の呼び出し側がキー方式を推測しないための単一境界。
+    fn normalize_path(self, path: &Path) -> String {
+        match self.normalization {
+            StoreKeyNormalization::KeepDrive => crate::adjustment_db::normalize_path(path),
+            StoreKeyNormalization::DriveStripped => crate::path_key::normalize(path),
+        }
+    }
 }
 
 const fn store(
@@ -290,6 +303,13 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "rating.db",
         "ratings",
         "path",
+        true,
+        StoreKeyNormalization::KeepDrive,
+    ),
+    store(
+        "content_identity.db",
+        "edit_origin",
+        "file_key",
         true,
         StoreKeyNormalization::KeepDrive,
     ),
@@ -436,6 +456,107 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         rename_generic: false,
     },
 ];
+
+/// 内容 identity 復元で 1 つの物理 path 基底をコピーする面。
+///
+/// `Exact` はコンテナ / 実画像自身、`VirtualPrefix` は ZIP entry / PDF page の
+/// `<base>::...` family。正規化はこの型を作る側ではなく、各 [`StoreDescriptor`] が行う。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum StoreCopyPathMapping {
+    Exact {
+        old_path: PathBuf,
+        new_path: PathBuf,
+    },
+    VirtualPrefix {
+        old_path: PathBuf,
+        new_path: PathBuf,
+    },
+}
+
+impl StoreCopyPathMapping {
+    pub(crate) fn exact(old_path: impl Into<PathBuf>, new_path: impl Into<PathBuf>) -> Self {
+        Self::Exact {
+            old_path: old_path.into(),
+            new_path: new_path.into(),
+        }
+    }
+
+    pub(crate) fn virtual_prefix(
+        old_path: impl Into<PathBuf>,
+        new_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self::VirtualPrefix {
+            old_path: old_path.into(),
+            new_path: new_path.into(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct StoreCopyReport {
+    pub(crate) rows: usize,
+    pub(crate) database_opens: usize,
+    pub(crate) errors: Vec<String>,
+}
+
+#[derive(Debug)]
+enum NormalizedStoreCopyMapping {
+    Exact {
+        old_key: String,
+        new_key: String,
+        new_path: PathBuf,
+    },
+    Prefix {
+        old_prefix: String,
+        new_prefix: String,
+    },
+}
+
+/// 内容 identity 復元用の path-key copy。呼び出し側 worker が指定した `data_dir` の
+/// DB を直接開き、[`STORES`] のうち `unique` な記述子をすべて走査する。
+///
+/// `unique=false` は path 以外の PK 再採番が必要なストアを表すため v1 では対象外。
+/// DB 行は `INSERT OR IGNORE` で複製し、コピー先にある行を常に優先する。
+pub(crate) fn copy_stores_at(
+    data_dir: &Path,
+    mappings: &[StoreCopyPathMapping],
+) -> StoreCopyReport {
+    let mut report = StoreCopyReport::default();
+    for descriptor in STORES.iter().copied().filter(|store| store.unique) {
+        let normalized = mappings
+            .iter()
+            .filter_map(|mapping| match mapping {
+                StoreCopyPathMapping::Exact { old_path, new_path } => {
+                    let old_key = descriptor.normalize_path(old_path);
+                    let new_key = descriptor.normalize_path(new_path);
+                    (old_key != new_key).then(|| NormalizedStoreCopyMapping::Exact {
+                        old_key,
+                        new_key,
+                        new_path: new_path.clone(),
+                    })
+                }
+                StoreCopyPathMapping::VirtualPrefix { old_path, new_path } => {
+                    let old_key = descriptor.normalize_path(old_path);
+                    let new_key = descriptor.normalize_path(new_path);
+                    (old_key != new_key).then(|| NormalizedStoreCopyMapping::Prefix {
+                        old_prefix: format!("{old_key}::"),
+                        new_prefix: format!("{new_key}::"),
+                    })
+                }
+            })
+            .collect::<Vec<_>>();
+        if normalized.is_empty() {
+            continue;
+        }
+        copy_store(
+            &data_dir.join(descriptor.file),
+            descriptor,
+            &normalized,
+            &mut report,
+        );
+    }
+    report
+}
 
 /// リネーム移行の本体 (worker スレッドで呼ぶ)。`old_path` は改名前 (もう存在しない)、
 /// `new_path` は改名後の実 path。
@@ -837,6 +958,211 @@ fn move_prefix(
     Ok(changed)
 }
 
+fn copy_store(
+    db_path: &Path,
+    descriptor: StoreDescriptor,
+    mappings: &[NormalizedStoreCopyMapping],
+    report: &mut StoreCopyReport,
+) {
+    if !db_path.exists() {
+        return;
+    }
+    report.database_opens += 1;
+    let result = copy_store_transaction(db_path, descriptor, mappings);
+    match result {
+        Ok(rows) => report.rows += rows,
+        Err(error) => report.errors.push(format!(
+            "{}: {}.{}: {error}",
+            descriptor.file, descriptor.table, descriptor.column
+        )),
+    }
+}
+
+fn copy_store_transaction(
+    db_path: &Path,
+    descriptor: StoreDescriptor,
+    mappings: &[NormalizedStoreCopyMapping],
+) -> Result<usize, rusqlite::Error> {
+    let mut conn = rusqlite::Connection::open(db_path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let tx = conn.transaction()?;
+    let columns = table_columns(&tx, descriptor.table)?;
+    if !columns.iter().any(|column| column == descriptor.column) {
+        return Err(rusqlite::Error::InvalidColumnName(
+            descriptor.column.to_string(),
+        ));
+    }
+    let mut changed = 0usize;
+    for mapping in mappings {
+        let copied = copy_store_mapping(&tx, descriptor, &columns, mapping)?;
+        if copied > 0 && descriptor.table == "ratings" {
+            update_copied_rating_source_paths(&tx, mapping)?;
+        }
+        changed += copied;
+    }
+    tx.commit()?;
+    Ok(changed)
+}
+
+fn copy_store_mapping(
+    tx: &rusqlite::Transaction<'_>,
+    descriptor: StoreDescriptor,
+    columns: &[String],
+    mapping: &NormalizedStoreCopyMapping,
+) -> Result<usize, rusqlite::Error> {
+    match mapping {
+        NormalizedStoreCopyMapping::Exact {
+            old_key,
+            new_key,
+            new_path,
+        } => {
+            let copied = copy_exact(
+                tx,
+                descriptor.table,
+                descriptor.column,
+                columns,
+                old_key,
+                new_key,
+            )?;
+            if copied > 0 && !descriptor.rename_generic {
+                // 現在の non-generic descriptor は reading_history。`key` と並ぶ raw
+                // `path` も、コピーできた新行だけ destination path へ合わせる。
+                tx.execute(
+                    &format!(
+                        "UPDATE {} SET path = ?1 WHERE {} = ?2",
+                        descriptor.table, descriptor.column
+                    ),
+                    rusqlite::params![new_path.to_string_lossy(), new_key],
+                )?;
+            }
+            Ok(copied)
+        }
+        NormalizedStoreCopyMapping::Prefix {
+            old_prefix,
+            new_prefix,
+        } => copy_prefix(
+            tx,
+            descriptor.table,
+            descriptor.column,
+            columns,
+            old_prefix,
+            new_prefix,
+        ),
+    }
+}
+
+fn table_columns(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+) -> Result<Vec<String>, rusqlite::Error> {
+    let mut statement = tx.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    rows.collect()
+}
+
+/// exact キーの複製。全列を `PRAGMA table_info` 由来の順序で選び、キー列だけ
+/// destination へ差し替える。destination conflict は `INSERT OR IGNORE` で温存する。
+fn copy_exact(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    col: &str,
+    columns: &[String],
+    old_key: &str,
+    new_key: &str,
+) -> Result<usize, rusqlite::Error> {
+    if old_key == new_key {
+        return Ok(0);
+    }
+    let insert_columns = columns.join(", ");
+    let select_columns = columns
+        .iter()
+        .map(|column| {
+            if column == col {
+                "?1".to_string()
+            } else {
+                column.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    tx.execute(
+        &format!(
+            "INSERT OR IGNORE INTO {table} ({insert_columns}) \
+             SELECT {select_columns} FROM {table} WHERE {col} = ?2"
+        ),
+        rusqlite::params![new_key, old_key],
+    )
+}
+
+/// prefix キーを `substr` 等値で列挙し、suffix を保って 1 キーずつ複製する。
+/// SQLite の `substr` length は文字数なので byte length ではなく `chars().count()` を渡す。
+fn copy_prefix(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    col: &str,
+    columns: &[String],
+    old_prefix: &str,
+    new_prefix: &str,
+) -> Result<usize, rusqlite::Error> {
+    if old_prefix == new_prefix {
+        return Ok(0);
+    }
+    let keys = {
+        let mut statement = tx.prepare(&format!(
+            "SELECT DISTINCT {col} FROM {table} WHERE substr({col}, 1, ?1) = ?2"
+        ))?;
+        let rows = statement.query_map(
+            rusqlite::params![old_prefix.chars().count() as i64, old_prefix],
+            |row| row.get::<_, String>(0),
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let mut changed = 0usize;
+    for key in keys {
+        let Some(suffix) = key.strip_prefix(old_prefix) else {
+            continue;
+        };
+        changed += copy_exact(
+            tx,
+            table,
+            col,
+            columns,
+            &key,
+            &format!("{new_prefix}{suffix}"),
+        )?;
+    }
+    Ok(changed)
+}
+
+fn update_copied_rating_source_paths(
+    tx: &rusqlite::Transaction<'_>,
+    mapping: &NormalizedStoreCopyMapping,
+) -> Result<(), rusqlite::Error> {
+    match mapping {
+        NormalizedStoreCopyMapping::Exact { new_key, .. } => {
+            tx.execute(
+                "UPDATE ratings SET source_path = CASE
+                     WHEN instr(path, '::') > 0 THEN substr(path, 1, instr(path, '::') - 1)
+                     ELSE path
+                 END
+                 WHERE path = ?1",
+                [new_key],
+            )?;
+        }
+        NormalizedStoreCopyMapping::Prefix { new_prefix, .. } => {
+            tx.execute(
+                "UPDATE ratings SET source_path = CASE
+                     WHEN instr(path, '::') > 0 THEN substr(path, 1, instr(path, '::') - 1)
+                     ELSE path
+                 END
+                 WHERE substr(path, 1, ?1) = ?2",
+                rusqlite::params![new_prefix.chars().count() as i64, new_prefix],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// 動画/音声の .xmp サイドカーをファイルごと改名する。新側に既にサイドカーがある場合は
 /// 新側を優先して旧側を残す (上書きしない。孤児はログのみ)。
 fn migrate_sidecar_file(old_path: &Path, new_path: &Path, report: &mut RenameMigrationReport) {
@@ -925,6 +1251,251 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
+    }
+
+    fn setup_copy_store_rows(dir: &Path, old: &Path) {
+        for descriptor in STORES {
+            let connection = open(dir, descriptor.file);
+            if descriptor.unique {
+                let extras = if descriptor.table == "ratings" {
+                    ", source_path TEXT"
+                } else if !descriptor.rename_generic {
+                    ", path TEXT"
+                } else {
+                    ""
+                };
+                connection
+                    .execute_batch(&format!(
+                        "CREATE TABLE IF NOT EXISTS {} ({} TEXT PRIMARY KEY, payload TEXT{extras})",
+                        descriptor.table, descriptor.column
+                    ))
+                    .unwrap();
+                let old_key = descriptor.normalize_path(old);
+                for (key, payload) in [
+                    (old_key.clone(), "exact"),
+                    (format!("{old_key}::ページ/001.jpg"), "prefix"),
+                ] {
+                    if descriptor.table == "ratings" {
+                        connection
+                            .execute(
+                                "INSERT INTO ratings(path, payload, source_path) VALUES (?1, ?2, ?3)",
+                                rusqlite::params![key, payload, old_key],
+                            )
+                            .unwrap();
+                    } else if !descriptor.rename_generic {
+                        connection
+                            .execute(
+                                &format!(
+                                    "INSERT INTO {} ({}, payload, path) VALUES (?1, ?2, ?3)",
+                                    descriptor.table, descriptor.column
+                                ),
+                                rusqlite::params![key, payload, old.to_string_lossy()],
+                            )
+                            .unwrap();
+                    } else {
+                        connection
+                            .execute(
+                                &format!(
+                                    "INSERT INTO {} ({}, payload) VALUES (?1, ?2)",
+                                    descriptor.table, descriptor.column
+                                ),
+                                rusqlite::params![key, payload],
+                            )
+                            .unwrap();
+                    }
+                }
+            } else {
+                connection
+                    .execute_batch(
+                        "CREATE TABLE IF NOT EXISTS video_bookmarks (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            path TEXT NOT NULL,
+                            payload TEXT
+                         )",
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO video_bookmarks(path, payload) VALUES (?1, 'excluded')",
+                        [descriptor.normalize_path(old)],
+                    )
+                    .unwrap();
+            }
+        }
+    }
+
+    fn assert_copy_across_stores(old: &Path, new: &Path) {
+        let dir = tempfile::tempdir().unwrap();
+        setup_copy_store_rows(dir.path(), old);
+        let report = copy_stores_at(
+            dir.path(),
+            &[
+                StoreCopyPathMapping::exact(old, new),
+                StoreCopyPathMapping::virtual_prefix(old, new),
+            ],
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let covered = STORES.iter().filter(|descriptor| descriptor.unique).count();
+        assert_eq!(STORES.len(), 22, "A1 ledger を含む現行 descriptor 数");
+        assert_eq!(covered, 21);
+        assert_eq!(report.rows, covered * 2);
+
+        for descriptor in STORES {
+            let connection = open(dir.path(), descriptor.file);
+            let old_key = descriptor.normalize_path(old);
+            let new_key = descriptor.normalize_path(new);
+            if descriptor.unique {
+                for (key, payload) in [
+                    (new_key.clone(), "exact"),
+                    (format!("{new_key}::ページ/001.jpg"), "prefix"),
+                ] {
+                    let copied: String = connection
+                        .query_row(
+                            &format!(
+                                "SELECT payload FROM {} WHERE {} = ?1",
+                                descriptor.table, descriptor.column
+                            ),
+                            [key],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(copied, payload, "{}.{}", descriptor.file, descriptor.table);
+                }
+                let source_rows: i64 = connection
+                    .query_row(
+                        &format!(
+                            "SELECT COUNT(*) FROM {} WHERE {} = ?1 OR substr({}, 1, ?2) = ?3",
+                            descriptor.table, descriptor.column, descriptor.column
+                        ),
+                        rusqlite::params![
+                            old_key,
+                            format!("{old_key}::").chars().count() as i64,
+                            format!("{old_key}::"),
+                        ],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(source_rows, 2, "copy は source rows を残す");
+                if !descriptor.rename_generic {
+                    let raw_path: String = connection
+                        .query_row(
+                            &format!(
+                                "SELECT path FROM {} WHERE {} = ?1",
+                                descriptor.table, descriptor.column
+                            ),
+                            [new_key],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(raw_path, new.to_string_lossy());
+                }
+            } else {
+                let destination_rows: i64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM video_bookmarks WHERE path = ?1",
+                        [new_key],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(destination_rows, 0, "unique=false は v1 copy 対象外");
+            }
+        }
+    }
+
+    #[test]
+    fn copy_path_covers_all_unique_stores_for_image_zip_and_pdf_faces() {
+        for (old, new) in [
+            (r"C:\画像\旧.jpg", r"D:\画像\新.jpg"),
+            (r"C:\本\旧.cbz", r"D:\本\新.cbz"),
+            (r"C:\資料\旧.pdf", r"D:\資料\新.pdf"),
+        ] {
+            assert_copy_across_stores(Path::new(old), Path::new(new));
+        }
+    }
+
+    #[test]
+    fn copy_keeps_destination_rows_recomputes_rating_source_and_treats_wildcards_literally() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = PathBuf::from(r"C:\本\100%_旧.cbz");
+        let new = PathBuf::from(r"D:\本\100%_新.cbz");
+        let old_key = crate::path_key::normalize_keep_drive(&old);
+        let new_key = crate::path_key::normalize_keep_drive(&new);
+        let connection = open(dir.path(), "rating.db");
+        connection
+            .execute_batch(
+                "CREATE TABLE ratings (
+                    path TEXT PRIMARY KEY,
+                    stars INTEGER NOT NULL,
+                    source_path TEXT
+                 )",
+            )
+            .unwrap();
+        for (key, stars, source_path) in [
+            (old_key.clone(), 2_i64, old_key.clone()),
+            (format!("{old_key}::一/001.jpg"), 3, old_key.clone()),
+            (format!("{old_key}::一/002.jpg"), 4, old_key.clone()),
+            (new_key.clone(), 5, new_key.clone()),
+            (format!("{new_key}::一/002.jpg"), 5, new_key.clone()),
+            (
+                "c:/本/100x_旧.cbz::一/keep.jpg".to_string(),
+                1,
+                "unrelated".to_string(),
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO ratings(path, stars, source_path) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![key, stars, source_path],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let report = copy_stores_at(
+            dir.path(),
+            &[
+                StoreCopyPathMapping::exact(&old, &new),
+                StoreCopyPathMapping::virtual_prefix(&old, &new),
+            ],
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.rows, 1, "既存 destination 2 行は INSERT OR IGNORE");
+
+        let connection = open(dir.path(), "rating.db");
+        let (exact_stars, exact_source): (i64, String) = connection
+            .query_row(
+                "SELECT stars, source_path FROM ratings WHERE path = ?1",
+                [&new_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(exact_stars, 5);
+        assert_eq!(exact_source, new_key, "導出列は destination key 基準");
+        let (copied_stars, copied_source): (i64, String) = connection
+            .query_row(
+                "SELECT stars, source_path FROM ratings WHERE path = ?1",
+                [format!("{new_key}::一/001.jpg")],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(copied_stars, 3);
+        assert_eq!(copied_source, new_key);
+        let existing_prefix_stars: i64 = connection
+            .query_row(
+                "SELECT stars FROM ratings WHERE path = ?1",
+                [format!("{new_key}::一/002.jpg")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(existing_prefix_stars, 5);
+        let unrelated: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM ratings WHERE path = 'c:/本/100x_旧.cbz::一/keep.jpg'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unrelated, 1, "% / _ を LIKE wildcard として扱わない");
     }
 
     #[test]
@@ -1476,6 +2047,29 @@ mod tests {
             .unwrap();
         }
         {
+            let conn = open(dir.path(), "content_identity.db");
+            conn.execute_batch(
+                "CREATE TABLE edit_origin (
+                    file_key TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    head_hash TEXT NOT NULL,
+                    full_hash TEXT,
+                    hashed_mtime INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    last_edit_at INTEGER NOT NULL,
+                    has_restorable_content INTEGER NOT NULL)",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO edit_origin
+                    (file_key, size, head_hash, full_hash, hashed_mtime, kind, last_edit_at,
+                     has_restorable_content)
+                 VALUES (?1, 10, 'head', 'full', 20, 'image', 30, 1)",
+                [&old_k],
+            )
+            .unwrap();
+        }
+        {
             let conn = open(dir.path(), "tags.db");
             conn.execute_batch(
                 "CREATE TABLE item_tags (item_key TEXT NOT NULL, tag TEXT NOT NULL,
@@ -1535,7 +2129,7 @@ mod tests {
 
         let report = run_at(dir.path(), &old, &new);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
-        assert!(report.rows >= 5);
+        assert!(report.rows >= 6);
 
         let conn = open(dir.path(), "rating.db");
         let (stars, rated_at, source_path): (i64, i64, String) = conn
@@ -1547,6 +2141,20 @@ mod tests {
             .unwrap();
         assert_eq!((stars, rated_at), (4, 111), "★と設定時刻が引き継がれる");
         assert_eq!(source_path, new_k, "source_path も新キー由来に更新される");
+
+        let conn = open(dir.path(), "content_identity.db");
+        let (file_key, full_hash, has_restorable_content): (String, String, bool) = conn
+            .query_row(
+                "SELECT file_key, full_hash, has_restorable_content
+                   FROM edit_origin WHERE file_key = ?1",
+                [&new_k],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (file_key, full_hash, has_restorable_content),
+            (new_k.clone(), "full".to_string(), true)
+        );
 
         let conn = open(dir.path(), "tags.db");
         let tags: i64 = conn

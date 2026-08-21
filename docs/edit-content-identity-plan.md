@@ -5,7 +5,7 @@ OS 側 (エクスプローラー等) でファイルを移動・コピーする�
 本機能は **ファイル内容のハッシュ**を identity として編集内容を再結合し、
 利用者に確認したうえで新しい場所へ複製する。
 
-- 状態: **設計確定 / 未実装** (2026-08-20)
+- 状態: **Phase 1 実装済み (A1 台帳と記録 / A2 検出 / A3a コピーエンジン / A3b 確認 UI)** (2026-08-21)
 - 関連: [preset-and-adjustment.md §9](preset-and-adjustment.md) (フォルダ側サイドカー)、
   [src/rename_key_migration.rs](../src/rename_key_migration.rs) (アプリ内リネーム移行)、
   [src/metadata_transfer.rs](../src/metadata_transfer.rs) (明示的なメタ情報書き出し / 取り込み)
@@ -21,7 +21,7 @@ OS 側 (エクスプローラー等) でファイルを移動・コピーする�
 | 層 | 実体 | 効く場面 | 効かない場面 |
 | --- | --- | --- | --- |
 | フォルダ側サイドカー `mimageviewer.dat` | [src/sidecar.rs](../src/sidecar.rs)、既定 ON | **フォルダごと**の移動 / コピー (相対キー) | 単体ファイルのコピー、フォルダ外への移動 |
-| リネーム移行 | [src/rename_key_migration.rs](../src/rename_key_migration.rs) | **アプリ内**リネーム (21 ストア一括) | アプリ外のリネーム / 移動 (モジュール冒頭に「将来課題」と明記済み) |
+| リネーム移行 | [src/rename_key_migration.rs](../src/rename_key_migration.rs) | **アプリ内**リネーム (現行 `STORES` 22 descriptor) | アプリ外のリネーム / 移動 (モジュール冒頭に「将来課題」と明記済み) |
 | ポータブルメタ情報 | [src/metadata_transfer.rs](../src/metadata_transfer.rs) | 明示的な書き出し / 取り込み | 自動ではない。照合も **パス + size/mtime** で内容ハッシュではない |
 
 さらに調査で判明した点として、**サイドカーがミラーするのは
@@ -46,6 +46,11 @@ OS 側 (エクスプローラー等) でファイルを移動・コピーする�
   id 再採番が要る (Phase 2)
 - **ZIP エントリ単位の内容一致** (ZIP から展開したばら画像 ↔ ZIP 内エントリ): Phase 2
 - **PDF ページ単位の内容一致**: 対応するバイト同一性が無いため原理的に不可 (容器一致で足りる)
+- **PDF パスワード**: リネーム移行 (`rename_key_migration::run_at` の step 2) は
+  DPAPI 保存済みパスワードを新キーへ移すが、**復元では移さない** (A3a 実装時に確認、2026-08-21)。
+  リネームは同じファイルなので移さないと開けなくなるが、復元は**別のパスにある別ファイル**で、
+  §2 の復元範囲 (編集・表示状態・★・タグ) にパスワードは入っていない。資格情報を利用者の
+  明示操作なしに増やさない側に倒す。コピー先は初回オープン時に 1 回入力してもらう
 
 ---
 
@@ -78,7 +83,9 @@ CREATE TABLE edit_origin (
   full_hash     TEXT,              -- 全体 SHA-256 (未計算なら NULL)
   hashed_mtime  INTEGER NOT NULL,  -- 再ハッシュ要否の判定
   kind          TEXT NOT NULL,     -- image / zip / pdf / convertible
-  last_edit_at  INTEGER NOT NULL   -- 候補が複数あるときの既定選択に使う
+  last_edit_at  INTEGER NOT NULL,  -- 候補が複数あるときの既定選択に使う (0 = 未編集)
+  has_restorable_content INTEGER NOT NULL
+                                    -- 1: 復元可能な状態を持つ、0: 検出 hash cache のみ
 );
 CREATE INDEX edit_origin_full ON edit_origin(full_hash);
 
@@ -89,6 +96,24 @@ CREATE TABLE restore_declined (
 );
 ```
 
+> **`last_edit_at` は「編集」でしか進まない** (A1 実装時に確定、2026-08-21)。mIV の編集は
+> 非破壊なのでファイルのバイト列は変わらず、2 回目以降の編集は必ず「再ハッシュ不要」経路を
+> 通る。つまりこの列を維持するのはその経路だけであり、読書位置の記録 (ページ送りごとに発火)
+> を同じ経路に流すと**読んだだけで `last_edit_at` が進む**。それでは §5 の「別々に編集された
+> 候補のうち新しい方を既定にする」が成り立たず、読んだだけのコピーが既定になって、
+> 実際の編集を持つ側から復元されない。そのため記録は `Edit` / `ViewingState` の 2 種類を持つ:
+> **行の作成は両方が行い、`last_edit_at` を進めるのは `Edit` だけ**。`ViewingState` だけで
+> 作られた行は `last_edit_at = 0` (= 未編集) になり、A3 の既定選択では最後に回る。
+>
+> **`has_restorable_content` は `last_edit_at` と独立した事実である** (A2 修正時に確定、
+> 2026-08-21)。A1 の `Edit` / `ViewingState` はどちらも実際の復元対象状態から発火するため
+> `1` を設定する。本の続きは `ViewingState` で `last_edit_at = 0` の行を作るが、復元範囲内
+> なので有効な復元元である。一方、A2 が照合済みファイルの hash を cache するだけの行は
+> `0` で作り、既存の `1` は変更しない。起動時の size index は `1` の行だけを載せる。
+> これにより hash cache 行が次回検出を抑止せず、A1 が後から同じ行を記録すれば再 hash なしで
+> `1` へ昇格する。`content_identity.db` は未リリースのため、この列は migration なしで
+> 正本スキーマへ直接追加する。
+>
 > **`file_key` は path キーなので、[rename_key_migration.rs](../src/rename_key_migration.rs) の
 > `STORES` 表へ必ず追加すること。** この表はリネーム移行と削除 worker の hard purge が
 > 共有する正本で、追加を忘れるとアプリ内リネーム後に台帳だけ旧パスを指す。
@@ -146,13 +171,16 @@ metadata_transfer は 2 と 4 が同時に存在するとエラーにする (imp
 
 ## 5. 検出フロー
 
-1. **フォルダ読み込み完了時**、`image_metas` の size を、起動時にメモリへ載せた台帳の
-   size 集合と突き合わせる (I/O ゼロ)。台帳は数百〜数千行なので数十 KB。
+1. **フォルダ読み込み完了時**、`image_metas` の size を、起動時にメモリへ載せた
+   `has_restorable_content = 1` の台帳行の size 集合と突き合わせる (I/O ゼロ)。
+   台帳は数百〜数千行なので数十 KB。
    起動時ロードは既存の `adjusted_page_keys` 等 ([src/app.rs:12855](../src/app.rs:12855)) に相乗りする。
 2. ヒットした項目だけ worker へ。**`GlobalIoSemaphore` の Low 優先度**
    ([src/io_semaphore.rs](../src/io_semaphore.rs))、フォルダ切替でキャンセル。UI スレッドからは
    一切 I/O しない (CLAUDE.md「UI スレッドでの同期 I/O は即 worker 化する」)。
-3. 段 1 → 段 2 で確定。結果は台帳へキャッシュし、再訪時に再計算しない。
+3. 段 1 → 段 2 で確定。結果は `has_restorable_content = 0` の台帳行としてキャッシュする。
+   再訪時に対象を stat した `(size, hashed_mtime)` が一致すれば、その行の
+   `head_hash` / `full_hash` を再利用してファイルを読まない。
 4. 次のものは無言で捨てる:
    - 復元先に既に編集がある (サイドカーと同じ「既存が authoritative」)
    - `restore_declined` に載っている
@@ -203,8 +231,8 @@ metadata_transfer は 2 と 4 が同時に存在するとエラーにする (imp
 | `□ 次から確認しない` | **設定を OFF** (全体停止、§7) |
 
 - **「このフォルダ以下では聞かない」は作らない**。使わない利用者は全体 OFF で足りる、という判断。
-- 誤って閉じても取り返せるよう、右クリックメニューに「編集内容の復元を確認…」を置いて
-  手動で再実行できるようにする。
+- [閉じる] と × は何も記録せず、同じフォルダを次に開いたときに再提示する。右クリックからの
+  手動再確認は Phase 2 とし、Phase 1 には置かない。
 
 ---
 
@@ -234,7 +262,7 @@ metadata_transfer は 2 と 4 が同時に存在するとエラーにする (imp
 - `App::copy_book_page_edit_key` ([src/app.rs:30612](../src/app.rs:30612)) — 型付き 8 ストア横断コピー。
   ただし **App のハンドル経由 = UI スレッド前提**で worker から呼べない。
 - `rename_key_migration::migrate_store` — **DB ファイルを直接開く worker 実装**で、
-  `STORES` 表 (21 ストア) を網羅。
+  `STORES` 表 (A1 の `edit_origin` 追加後は 22 descriptor) を網羅。
 
 復元は worker で走るので、**`rename_key_migration` (または同じ `STORES` を共有する兄弟モジュール)
 に `copy_store` / `copy_exact` / `copy_prefix` を足すのが構造的に正しい**。同じ表を使うので、
@@ -266,6 +294,28 @@ INSERT OR IGNORE INTO t (c1, c2, ...) SELECT ?new, c2, ... FROM t WHERE c1 = ?ol
    `clear_tags_cache()` — `finish_book_page_edit_mapping`
    ([src/app.rs:30752](../src/app.rs:30752)) と同じ後始末を再利用する。
 4. 復元先にも `edit_origin` 行を作る (以後そのファイルが新たなコピー元になり得る)。
+
+**A3a / A3b 実装メモ (2026-08-21)**:
+
+- `restore_candidates_at(data_dir, selected, declined)` は App / egui に依存しない batch 入口。
+  全選択候補の物理 path exact / `::` prefix と、変換アーカイブの予測 cache path exact /
+  `::` prefix mapping を先に集約し、`copy_stores_at` を 1 回だけ呼ぶ。
+- copy は同じ `STORES` を走査し、`unique: true` の 21 descriptor を対象にする。
+  現行 22 descriptor のうち `unique: false` の `video_bookmarks` だけは id 再採番が必要なため
+  v1 対象外。正規化は各 descriptor の `normalization` から決める。候補 1 件でも 100 件でも
+  copy 対象 DB は 21 回だけ開き、`content_identity.db` の昇格 / 拒否記録と runtime state
+  読み出しも候補単位では開き直さない。
+- worker report は DB copy 後の destination 状態から sidecar mirror と 5 種類の presence 差分を
+  作る。A3b の短命 worker 完了後、既存 App owner へそれを適用し、
+  `finish_book_page_edit_mapping` と同じ cache invalidation を呼ぶ。sidecar の同期 flush は
+  増やさない。
+- target の `edit_origin` は `has_restorable_content = 1` へ昇格し、A2 の次回 index で復元元に
+  なる。チェックを外して [復元する] を押した行だけを `restore_declined` へ記録する。
+- 非モーダル `egui::Window` の可視性は
+  `fullscreen_idx.is_none() && restore_pending.is_none() && prompt.is_some()` で一元化し、
+  描画と背面入力 block の両方が同じ述語を使う。フルスクリーン中または先行 batch 完了待ちは
+  候補を保持したまま false。
+- [閉じる] / × は候補を閉じるだけで、`restore_declined` も復元 request も作らない。
 
 ---
 
@@ -301,7 +351,20 @@ Phase 1 は 1 回の差分にすると大きすぎてレビューが効かない
 | --- | --- | --- | --- |
 | **A1 台帳と記録** | `content_identity.db` (§3.2)、3 段照合のハッシュ計算 (§3.1)、編集確定点からの記録 worker (§3.3)、`STORES` への `file_key` 追加 | 新規モジュール + 編集保存経路のフック | 編集すると台帳に 1 行増える。`(file_key, size, hashed_mtime)` が同じなら再計算しない。**UI は何も変わらない** |
 | **A2 検出** | 起動時の台帳ロード、フォルダ読み込み完了時の段 0 照合、`GlobalIoSemaphore` Low の検出 worker、設定 1 個 (§7) | フォルダ走査完了フック + 新規 worker + 環境設定 | 候補が mpsc で UI へ届く (ログで確認)。**まだウィンドウは出さない**。設定 OFF で worker が起動しない |
-| **A3 復元** | `STORES` 駆動の `copy_store` / `copy_exact` / `copy_prefix` (§8.1)、変換アーカイブの 4 面キー (§4)、非モーダル復元ウィンドウ (§6)、`restore_declined`、復元後の後始末 (§8.2) | `rename_key_migration` の兄弟 + 新規ダイアログ | §9 のテストが全部通る |
+| **A3a コピーエンジン** | `STORES` 駆動の `copy_store` / `copy_exact` / `copy_prefix` (§8.1)、変換アーカイブの 4 面キー (§4)、`restore_declined` 書き込み API、復元後の後始末境界 (§8.2) | `rename_key_migration` の copy sibling + `content_identity/restore.rs` | App / egui 非依存の入口をテストだけから駆動し、21 unique descriptor・4 面・後始末 report を検証する。**UI は何も変わらない** |
+| **A3b 復元 UI** | **実装済み**。非モーダル復元ウィンドウ (§6)、A2 候補との配線、batch 復元 / `restore_declined`、A3a report の App owner への適用 | `ui_dialogs/content_restore.rs` + A2 poll 配線 | §9 の UI / lifecycle、1 / 100 候補の DB open 計測、UI snapshot を含むテストが通る |
+
+**A2 実装時の確定事項 (2026-08-21)**:
+
+- 物理フォルダ一覧は、最上位 surface が `Folder`、通常フォルダ走査が現在の
+  `current_folder` に公開した `normal_folder_omitted_entries` marker が一致し、かつ
+  ZIP / PDF 内一覧でも detached physical context でもないことを組み合わせて判定する。
+  smart folder / 検索 / snapshot / subfolder expansion などの合成 surface は `Folder` でなく、
+  ZIP / PDF は grid の container 状態で除外される。
+- 検出先の hash cache は A1 と同じ hash 関数・台帳へ、
+  `ContentIdentityTrigger::ViewingState` かつ `has_restorable_content = 0` の cache 観測として
+  記録する。検出は編集でも復元可能状態の記録でもないため `last_edit_at` を進めず、
+  新規行は `last_edit_at = 0` になる。既存の `has_restorable_content = 1` は維持する。
 
 **A1 を最初に出す理由**: 台帳は使われ始めるまで空なので、**早く入れるほど実データが溜まる**。
 A2 / A3 を実装している間に開発機の台帳が埋まり、A3 の実機確認が現実的なデータでできる。

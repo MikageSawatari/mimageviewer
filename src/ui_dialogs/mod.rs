@@ -13,6 +13,7 @@ pub(crate) mod archive_convert;
 pub(crate) mod batch_convert;
 mod cache_creator;
 mod cache_manager;
+pub mod content_restore;
 pub(crate) mod context_menu;
 mod context_shortcuts;
 pub(crate) mod editing_addon;

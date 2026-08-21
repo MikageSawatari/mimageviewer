@@ -100,6 +100,8 @@ fn thumbnail_keep_bounds_for_count(
 
 mod cache_ops;
 mod color_filter;
+mod content_identity_detection;
+pub(crate) mod content_identity_restore;
 #[cfg(windows)]
 mod detached_window_manager;
 mod facet_name_filter;
@@ -6064,6 +6066,13 @@ pub(crate) struct MaskDirtyRect {
     pub y1: usize,
 }
 
+/// 図形バケツが退化して成立しなかったときだけ表示する、診断用の一時 overlay。
+pub(crate) struct BucketRegionFlash {
+    pub(crate) fs_idx: usize,
+    pub(crate) texture: egui::TextureHandle,
+    pub(crate) started_at: f64,
+}
+
 impl MaskDirtyRect {
     pub(crate) fn new(x0: usize, y0: usize, x1: usize, y1: usize) -> Option<Self> {
         (x0 < x1 && y0 < y1).then_some(Self { x0, y0, x1, y1 })
@@ -10064,6 +10073,21 @@ pub struct App {
     pub(crate) view_trim_save_pending: bool,
     /// 表示トリム DB ハンドル。本ごとの適用モード / 本全体設定とページ個別設定を保存する。
     pub(crate) view_trim_db: Option<crate::view_trim_db::ViewTrimDb>,
+    /// 編集・表示状態・★・タグの commit 後に、対象の物理ファイルを ledger worker へ渡す。
+    /// この handle 自体は I/O を行わず、全ファイル読み出しは worker 側に閉じる。
+    pub(crate) content_identity_recorder: Option<crate::content_identity::ContentIdentityRecorder>,
+    pub(crate) content_identity_index_load_pending:
+        Option<crate::content_identity::ContentIdentityIndexLoadPending>,
+    pub(crate) content_identity_index: crate::content_identity::ContentIdentityIndex,
+    pub(crate) content_identity_index_loaded: bool,
+    pub(crate) content_identity_updates_before_load: Vec<crate::content_identity::LedgerEntry>,
+    pub(crate) content_identity_detection_pending:
+        Option<crate::content_identity::ContentIdentityDetectionPending>,
+    /// 現在の物理フォルダだけが所有する、候補・選択・復元元をまとめた確認状態。
+    pub(crate) content_restore_prompt: Option<content_identity_restore::ContentRestorePrompt>,
+    pub(crate) content_identity_restore_pending:
+        Option<content_identity_restore::ContentIdentityRestorePending>,
+    pub(crate) content_identity_fallback_io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
     /// 表示パイプライン入力の世代番号。
     ///
     /// raw decode / AI / 補正など、消しゴム確定結果の入力になるレイヤが変わるたび
@@ -11874,10 +11898,14 @@ pub struct App {
     pub(crate) local_adjust_edge_snap_radius: f32,
     /// 補正レイヤー境界筆の開始色からの許容差。
     pub(crate) local_adjust_edge_brush_tolerance: f32,
-    /// 補正レイヤーバケツで seed と連結する領域だけを対象にする。
-    pub(crate) local_adjust_bucket_connected: bool,
+    /// 補正レイヤーバケツの塗る範囲。
+    pub(crate) local_adjust_bucket_region: crate::mask_db::BucketRegion,
     /// バケツの漏れ止め半径 (px)。0 で無効。
     pub(crate) local_adjust_bucket_leak_stop: f32,
+    /// 補正レイヤーバケツの図形を外側へ広げる量 (px)。
+    pub(crate) local_adjust_bucket_outset: f32,
+    /// 補正レイヤーバケツで埋める個々の隙間の上限 (%)。
+    pub(crate) local_adjust_bucket_gap_tolerance: f32,
     /// 補正レイヤー境界筆で塗り領域に接する境界線も含める。
     pub(crate) local_adjust_edge_brush_include_boundary: bool,
     /// Ctrl 境界表示用の縮小 texture cache。
@@ -12260,6 +12288,8 @@ pub struct App {
     /// 最後/最初の項目でさらに進もう/戻ろうとしたとき、または Ctrl+↑↓ で
     /// 画像・動画のあるフォルダが skip_limit 以内に見つからなかったときに表示する。
     pub(crate) fs_boundary_hint: Option<crate::ui_fullscreen::FsBoundaryHint>,
+    /// 3 系統の図形バケツで共有する、整形前 region の一時表示。
+    pub(crate) bucket_region_flash: Option<BucketRegionFlash>,
 
     // ── 消しゴム (Erase) モード ───────────────────────────────────
     /// E キーで切り替える消しゴムモード
@@ -12282,8 +12312,12 @@ pub struct App {
     pub(crate) erase_bucket_tolerance: f32,
     /// バケツの漏れ止め半径 (px)。0 で無効。細い通路と小さな隙間からの漏れを止める。
     pub(crate) erase_bucket_leak_stop: f32,
-    /// バケツツールで seed と連結する領域だけを対象にする。
-    pub(crate) erase_bucket_connected: bool,
+    /// バケツツールの塗る範囲。
+    pub(crate) erase_bucket_region: crate::mask_db::BucketRegion,
+    /// バケツの図形を外側へ広げる量 (px)。
+    pub(crate) erase_bucket_outset: f32,
+    /// バケツで埋める個々の隙間の上限 (%)。
+    pub(crate) erase_bucket_gap_tolerance: f32,
     /// 囲みツールのポイント列 (画像ピクセル座標)
     pub(crate) erase_lasso_points: Vec<(f32, f32)>,
     /// 縦線/横線ツールのドラッグ開始点 (画像ピクセル座標)
@@ -12305,6 +12339,8 @@ pub struct App {
     pub(crate) mask_db: Option<crate::mask_db::MaskDb>,
     /// 消しゴムの Undo スタック (マスク/ベクタ両方のスナップショット、最大 20 エントリ)
     pub(crate) erase_undo_stack: std::collections::VecDeque<EraseSnapshot>,
+    /// 消しゴムの Redo スタック。要素型と上限は Undo と同じ。
+    pub(crate) erase_redo_stack: std::collections::VecDeque<EraseSnapshot>,
     /// メタ操作 (レーティング / タグ / 画像補正) の Undo/Redo スタック。フォルダ移動・
     /// フルスクリーン遷移・フルスクリーン中のページ移動・消しゴムモード遷移でクリアされる。
     pub(crate) meta_undo: crate::undo_stack::UndoStack,
@@ -12400,8 +12436,12 @@ pub struct App {
     pub(crate) conceal_bucket_tolerance: f32,
     /// バケツの漏れ止め半径 (px)。0 で無効。
     pub(crate) conceal_bucket_leak_stop: f32,
-    /// バケツツールで seed と連結する領域だけを対象にする。
-    pub(crate) conceal_bucket_connected: bool,
+    /// バケツツールの塗る範囲。
+    pub(crate) conceal_bucket_region: crate::mask_db::BucketRegion,
+    /// バケツの図形を外側へ広げる量 (px)。
+    pub(crate) conceal_bucket_outset: f32,
+    /// バケツで埋める個々の隙間の上限 (%)。
+    pub(crate) conceal_bucket_gap_tolerance: f32,
     /// 現在ページのマスクビットマップ (1bit/pixel、`erase_mask` と同じ表現)。
     pub(crate) conceal_mask: Option<Vec<bool>>,
     /// マスク対象の画像サイズ [width, height]。
@@ -12423,6 +12463,8 @@ pub struct App {
     pub(crate) conceal_db: Option<crate::conceal_db::ConcealDb>,
     /// 隠蔽加工 Undo スタック (Phase 2 で活性化、`ConcealSnapshot` で mask + shapes をまとめて記録)。
     pub(crate) conceal_undo_stack: std::collections::VecDeque<ConcealSnapshot>,
+    /// 隠蔽加工 Redo スタック。要素型と上限は Undo と同じ。
+    pub(crate) conceal_redo_stack: std::collections::VecDeque<ConcealSnapshot>,
     /// Undo スタック throttle 用 (キーリピート連打抑制)。
     pub(crate) conceal_last_undo_at: Option<std::time::Instant>,
     /// Select ツールでのハンドルドラッグ状態 (Phase 2)。
@@ -13296,6 +13338,20 @@ impl App {
         let t = std::time::Instant::now();
         let view_trim_db = crate::view_trim_db::ViewTrimDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_view_trim", 0, t);
+        // DB open / schema 作成も含めて worker 内で行う。ここでは thread spawn のみ。
+        let content_identity_recorder = crate::content_identity::ContentIdentityRecorder::spawn();
+        // A2 の全件索引は検出設定が ON のときだけ別 worker で読む。A1 recorder は
+        // この設定を参照せず、OFF 中も編集確定時の記録を継続する。
+        let content_identity_index_load_pending = settings
+            .edit_restore_prompt_enabled
+            .then(crate::content_identity::ContentIdentityIndexLoadPending::spawn)
+            .flatten();
+        let content_identity_index_loaded =
+            settings.edit_restore_prompt_enabled && content_identity_index_load_pending.is_none();
+        let content_identity_fallback_io_sem =
+            Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(
+                settings.indexer_speed_profile.io_permits().max(1),
+            ));
 
         let t = std::time::Instant::now();
         let book_resume_db = crate::book_resume_db::BookResumeDb::open().ok();
@@ -13587,6 +13643,15 @@ impl App {
             view_trim_dirty_page_overrides: std::collections::HashSet::new(),
             view_trim_save_pending: false,
             view_trim_db,
+            content_identity_recorder,
+            content_identity_index_load_pending,
+            content_identity_index: crate::content_identity::ContentIdentityIndex::default(),
+            content_identity_index_loaded,
+            content_identity_updates_before_load: Vec::new(),
+            content_identity_detection_pending: None,
+            content_restore_prompt: None,
+            content_identity_restore_pending: None,
+            content_identity_fallback_io_sem,
             input_generation: std::collections::HashMap::new(),
             fs_pending: ItemsGenerationMap::with_discard("fs_pending", cancel_fs_pending_value),
             fullscreen_pdf_promotion: FullscreenPdfPromotionState::default(),
@@ -14242,8 +14307,10 @@ impl App {
             local_adjust_boundary_gap_px: 2.0,
             local_adjust_edge_snap_radius: 16.0,
             local_adjust_edge_brush_tolerance: 48.0,
-            local_adjust_bucket_connected: true,
+            local_adjust_bucket_region: crate::mask_db::BucketRegion::Connected,
             local_adjust_bucket_leak_stop: 0.0,
+            local_adjust_bucket_outset: 1.0,
+            local_adjust_bucket_gap_tolerance: 10.0,
             local_adjust_edge_brush_include_boundary: false,
             local_adjust_edge_preview_cache: None,
             local_adjust_mask_lasso_points: Vec::new(),
@@ -14358,6 +14425,7 @@ impl App {
             editing_addon_install_state: None,
             editing_addon_declined_session: false,
             fs_boundary_hint: None,
+            bucket_region_flash: None,
 
             // 消しゴムモード
             erase_mode: false,
@@ -14370,7 +14438,9 @@ impl App {
             erase_brush_radius: 0.0, // enter_erase_mode で設定
             erase_bucket_tolerance: 48.0,
             erase_bucket_leak_stop: 0.0,
-            erase_bucket_connected: true,
+            erase_bucket_region: crate::mask_db::BucketRegion::Connected,
+            erase_bucket_outset: 1.0,
+            erase_bucket_gap_tolerance: 10.0,
             erase_lasso_points: Vec::new(),
             erase_line_start: None,
             erase_line_end: None,
@@ -14381,6 +14451,7 @@ impl App {
             mask_db,
             conceal_db,
             erase_undo_stack: std::collections::VecDeque::new(),
+            erase_redo_stack: std::collections::VecDeque::new(),
             meta_undo: crate::undo_stack::UndoStack::new(),
             adjustment_drag_session: None,
             adjustment_standard_drag_session: None,
@@ -14406,7 +14477,9 @@ impl App {
             conceal_paint_mode: true,
             conceal_bucket_tolerance: 48.0,
             conceal_bucket_leak_stop: 0.0,
-            conceal_bucket_connected: true,
+            conceal_bucket_region: crate::mask_db::BucketRegion::Connected,
+            conceal_bucket_outset: 1.0,
+            conceal_bucket_gap_tolerance: 10.0,
             conceal_mask: None,
             conceal_mask_size: [0, 0],
             conceal_mask_texture: None,
@@ -14415,6 +14488,7 @@ impl App {
             conceal_selected_shape: None,
             conceal_base_cache: std::collections::HashMap::new(),
             conceal_undo_stack: std::collections::VecDeque::new(),
+            conceal_redo_stack: std::collections::VecDeque::new(),
             conceal_last_undo_at: None,
             conceal_drag: None,
             conceal_last_paint_pos: None,
@@ -15764,6 +15838,7 @@ impl App {
             self.smart_folder_rule_draft.is_some() => "smart_folder_rule_draft",
             self.show_tag_editor => "tag_editor",
             self.show_tag_apply => "tag_apply",
+            self.content_restore_window_visible() => "content_restore",
             self.fullscreen_tag_picker_open => "fullscreen_tag_picker",
             // The top bar's overflow panel is deliberately absent. It is a menu, not a dialog:
             // it asks nothing and has nothing to confirm, and its siblings in the same bar - the
@@ -18386,6 +18461,10 @@ impl App {
         };
         if let Err(err) = db.set_book_state(&key, state) {
             crate::logger::log(format!("view_trim: failed to save book state: {err}"));
+        } else {
+            self.record_current_container_content_identity(
+                crate::content_identity::ContentIdentityTrigger::Edit,
+            );
         }
     }
 
@@ -18401,6 +18480,11 @@ impl App {
             crate::logger::log(format!(
                 "view_trim: failed to save page override idx={idx}: {err}"
             ));
+        } else {
+            self.record_content_identity_for_idx(
+                idx,
+                crate::content_identity::ContentIdentityTrigger::Edit,
+            );
         }
         self.invalidate_smart_folder_resort_metadata();
     }
@@ -18413,6 +18497,11 @@ impl App {
             crate::logger::log(format!(
                 "view_trim: failed to remove page override idx={idx}: {err}"
             ));
+        } else {
+            self.record_content_identity_for_idx(
+                idx,
+                crate::content_identity::ContentIdentityTrigger::Edit,
+            );
         }
         self.invalidate_smart_folder_resort_metadata();
     }
@@ -24628,6 +24717,9 @@ impl App {
                 ],
             );
         }
+        if !detached_physical {
+            self.maybe_start_content_identity_detection();
+        }
     }
 
     fn set_items_generation(&mut self, items_generation: u64) {
@@ -24696,6 +24788,9 @@ impl App {
         refresh_container_metadata: bool,
     ) {
         debug_assert_eq!(items.len(), image_metas.len());
+        if !self.navigation_scope.is_detached_physical() {
+            self.cancel_content_identity_detection();
+        }
         self.persist_pending_view_trim_state();
         self.items = items;
         self.image_metas = image_metas;
@@ -25934,6 +26029,16 @@ impl App {
                 self.invalidate_smart_folder_resort_metadata();
                 self.folder_thumb_pin_dirty = true;
                 crate::logger::log(format!("folder_thumb_pin set: {}", container.display()));
+                if self.zip_nav.is_some() {
+                    self.record_current_container_content_identity(
+                        crate::content_identity::ContentIdentityTrigger::Edit,
+                    );
+                } else {
+                    self.record_content_identity_for_path(
+                        container,
+                        crate::content_identity::ContentIdentityTrigger::Edit,
+                    );
+                }
                 true
             }
             Err(e) => {
@@ -25956,6 +26061,16 @@ impl App {
                 self.invalidate_smart_folder_resort_metadata();
                 self.folder_thumb_pin_dirty = true;
                 crate::logger::log(format!("folder_thumb_pin removed: {}", container.display()));
+                if self.zip_nav.is_some() {
+                    self.record_current_container_content_identity(
+                        crate::content_identity::ContentIdentityTrigger::Edit,
+                    );
+                } else {
+                    self.record_content_identity_for_path(
+                        container,
+                        crate::content_identity::ContentIdentityTrigger::Edit,
+                    );
+                }
                 true
             }
             Err(e) => {
@@ -36882,6 +36997,9 @@ impl App {
         // 書き込みは background writer へ逃がす (ページ送り毎の UI スレッド同期 I/O 回避)。
         if let Some(writer) = &self.book_resume_writer {
             writer.record(&folder, idx);
+            self.record_current_container_content_identity(
+                crate::content_identity::ContentIdentityTrigger::ViewingState,
+            );
         }
         self.last_book_resume = Some((folder, idx));
     }
@@ -48007,6 +48125,10 @@ impl App {
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
         );
+        self.record_content_identity_for_idx(
+            idx,
+            crate::content_identity::ContentIdentityTrigger::Edit,
+        );
     }
 
     // ── レーティング ───────────────────────────────────────────────
@@ -48418,6 +48540,10 @@ impl App {
                 });
             }
         }
+        self.record_content_identity_for_idx(
+            idx,
+            crate::content_identity::ContentIdentityTrigger::Edit,
+        );
         Ok(true)
     }
 
@@ -49202,7 +49328,7 @@ impl App {
         stars: u8,
         capture_undo: bool,
     ) -> Result<bool, String> {
-        let Some((key, _, meta)) = self.current_container_rating_target() else {
+        let Some((key, source, meta)) = self.current_container_rating_target() else {
             return Ok(false);
         };
         let stars = stars.min(5);
@@ -49238,6 +49364,10 @@ impl App {
             );
         }
         self.rebuild_visible_indices();
+        self.record_content_identity_for_path(
+            &source,
+            crate::content_identity::ContentIdentityTrigger::Edit,
+        );
         Ok(true)
     }
 
@@ -53673,6 +53803,71 @@ impl App {
 
     // ── 画像補正 ──────────────────────────────────────────────────
 
+    pub(crate) fn content_identity_source_for_idx(
+        &self,
+        idx: usize,
+    ) -> Option<crate::content_identity::ContentIdentitySource> {
+        crate::content_identity::ContentIdentitySource::for_grid_item(
+            self.items.get(idx)?,
+            self.archive_source_override.as_deref(),
+            self.current_folder.as_deref(),
+        )
+    }
+
+    pub(crate) fn record_content_identity_source(
+        &self,
+        source: crate::content_identity::ContentIdentitySource,
+        trigger: crate::content_identity::ContentIdentityTrigger,
+    ) {
+        if let Some(recorder) = self.content_identity_recorder.as_ref() {
+            recorder.record(source, trigger);
+        }
+    }
+
+    pub(crate) fn record_content_identity_for_idx(
+        &self,
+        idx: usize,
+        trigger: crate::content_identity::ContentIdentityTrigger,
+    ) {
+        // 製本ページは生成物であり、ユーザーが移動する元コンテンツではない。
+        if self.idx_is_compiled_book_page(idx) {
+            return;
+        }
+        if let Some(source) = self.content_identity_source_for_idx(idx) {
+            self.record_content_identity_source(source, trigger);
+        }
+    }
+
+    pub(crate) fn record_content_identity_for_path(
+        &self,
+        path: &std::path::Path,
+        trigger: crate::content_identity::ContentIdentityTrigger,
+    ) {
+        if let Some(source) = crate::content_identity::ContentIdentitySource::from_path(path) {
+            self.record_content_identity_source(source, trigger);
+        }
+    }
+
+    pub(crate) fn record_current_container_content_identity(
+        &self,
+        trigger: crate::content_identity::ContentIdentityTrigger,
+    ) {
+        let path = if let Some(nav) = self.zip_nav.as_ref() {
+            zip_pin_root_path(
+                &nav.tree.zip_path,
+                self.archive_source_override.as_deref(),
+                self.current_folder.as_deref(),
+            )
+        } else if let Some(source) = self.archive_source_override.as_deref() {
+            source
+        } else if let Some(folder) = self.current_folder.as_deref() {
+            folder
+        } else {
+            return;
+        };
+        self.record_content_identity_for_path(path, trigger);
+    }
+
     /// ページの正規化キーを返す（DB 保存用）。
     pub(crate) fn page_path_key(&self, idx: usize) -> Option<String> {
         crate::edit_source::page_key_for_grid_item(self.items.get(idx)?)
@@ -54273,6 +54468,10 @@ impl App {
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
         );
+        self.record_content_identity_for_idx(
+            idx,
+            crate::content_identity::ContentIdentityTrigger::Edit,
+        );
     }
 
     /// マスクを DB から削除し、サイドカーからも削除する。「マスク全削除」ボタン用。
@@ -54291,6 +54490,10 @@ impl App {
         self.with_sidecar_mut(idx, |sc, rel| sc.remove_mask(rel));
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
+        );
+        self.record_content_identity_for_idx(
+            idx,
+            crate::content_identity::ContentIdentityTrigger::Edit,
         );
     }
 
@@ -54354,6 +54557,10 @@ impl App {
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
         );
+        self.record_content_identity_for_idx(
+            idx,
+            crate::content_identity::ContentIdentityTrigger::Edit,
+        );
     }
 
     /// 隠蔽加工マスクを DB + サイドカーから削除する。「マスク全削除」ボタン用 +
@@ -54373,6 +54580,10 @@ impl App {
         self.with_sidecar_mut(idx, |sc, rel| sc.remove_conceal(rel));
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
+        );
+        self.record_content_identity_for_idx(
+            idx,
+            crate::content_identity::ContentIdentityTrigger::Edit,
         );
     }
 
@@ -54409,6 +54620,10 @@ impl App {
         self.set_local_adjust_layers_for_idx_memory_only(idx, layers);
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
+        );
+        self.record_content_identity_for_idx(
+            idx,
+            crate::content_identity::ContentIdentityTrigger::Edit,
         );
     }
 
@@ -54530,6 +54745,10 @@ impl App {
         // overlay のみ。実切り出しは save 時)。よって edit_result / final AI キャッシュは
         // 無効化しない。無効化すると crop ドラッグのたびに AI アップスケールを無駄に
         // 再実行 / キャンセルしてしまう (Codex P2)。
+        self.record_content_identity_for_idx(
+            idx,
+            crate::content_identity::ContentIdentityTrigger::Edit,
+        );
     }
 
     pub(crate) fn set_export_crop_for_idx_memory_only(
@@ -55715,6 +55934,7 @@ impl App {
         self.conceal_mask_texture = None;
         self.conceal_mask_texture_dirty_rect = None;
         self.conceal_undo_stack.clear();
+        self.conceal_redo_stack.clear();
         self.conceal_last_undo_at = None;
         self.clear_conceal_caches(idx);
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -58889,6 +59109,10 @@ impl App {
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
         );
+        self.record_content_identity_for_idx(
+            idx,
+            crate::content_identity::ContentIdentityTrigger::Edit,
+        );
     }
 
     /// この画像 (idx) に表示すべき注釈があるかの早期ゲート。下地 (final composite) に
@@ -60939,6 +61163,12 @@ impl App {
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
         );
+        if let Some(idx) = target.idx_hint {
+            self.record_content_identity_for_idx(
+                idx,
+                crate::content_identity::ContentIdentityTrigger::Edit,
+            );
+        }
         db_result
     }
 
@@ -61007,6 +61237,12 @@ impl App {
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
         );
+        if let Some(idx) = target.idx_hint {
+            self.record_content_identity_for_idx(
+                idx,
+                crate::content_identity::ContentIdentityTrigger::Edit,
+            );
+        }
         db_result
     }
 
@@ -66625,6 +66861,8 @@ impl eframe::App for App {
         let items_gen_pre_late = self.items_generation;
 
         self.poll_edit_preview_cache(ctx);
+        self.poll_content_identity_detection(ctx);
+        self.poll_content_identity_restore(ctx);
         self.reconcile_pinned_adjustment_refreshes();
         self.poll_smart_folder_metadata_refresh(ctx);
         self.poll_thumbnails(ctx, ThumbnailConsumptionPolicy::Grid);
@@ -67295,6 +67533,7 @@ impl eframe::App for App {
         self.show_smart_folder_editor_dialog(ctx);
         self.show_tag_editor_dialog(ctx);
         self.show_tag_apply_dialog(ctx);
+        self.show_content_restore_dialog(ctx);
         self.show_fav_add_dialog_window(ctx);
         let open_folder_nav = self.show_open_folder_dialog_window(ctx);
         self.show_subfolder_expansion_dialog_window(ctx);

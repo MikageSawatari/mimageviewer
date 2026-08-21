@@ -2967,6 +2967,190 @@ fn omitted_entries_are_exposed_only_for_the_normal_folder_surface() {
     assert_eq!(app.current_normal_folder_omitted_counts(), None);
 }
 
+#[test]
+fn content_identity_physical_listing_predicate_excludes_mixed_and_archive_surfaces() {
+    use crate::app::top_level_grid_view::{
+        SmartFolderViewState, TopLevelGridSurface, TopLevelSearchView,
+    };
+
+    let mut app = setup_app_for_test();
+    let folder = app.tmp.path().join("pictures");
+    app.current_folder = Some(folder.clone());
+    app.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
+        folder: folder.clone(),
+        counts: Default::default(),
+    });
+    app.top_level_grid_view
+        .replace_surface(TopLevelGridSurface::Folder);
+    app.items = vec![GridItem::Image(folder.join("page.png"))];
+    assert!(app.is_physical_folder_listing());
+
+    app.top_level_grid_view
+        .replace_surface(TopLevelGridSurface::Search(TopLevelSearchView::Global));
+    assert!(!app.is_physical_folder_listing(), "検索結果は対象外");
+    app.top_level_grid_view
+        .replace_surface(TopLevelGridSurface::SmartFolder(
+            SmartFolderViewState::root(uuid::Uuid::nil(), Vec::new()),
+        ));
+    assert!(
+        !app.is_physical_folder_listing(),
+        "スマートフォルダは対象外"
+    );
+
+    app.top_level_grid_view
+        .replace_surface(TopLevelGridSurface::Folder);
+    app.items = vec![GridItem::ZipImage {
+        zip_path: folder.join("book.zip"),
+        entry_name: "page.png".to_string(),
+    }];
+    assert!(!app.is_physical_folder_listing(), "ZIP 内一覧は対象外");
+    app.items = vec![GridItem::PdfPage {
+        pdf_path: folder.join("book.pdf"),
+        page_num: 0,
+        content_type: None,
+    }];
+    assert!(!app.is_physical_folder_listing(), "PDF 内一覧も対象外");
+
+    app.items = vec![GridItem::Image(folder.join("page.png"))];
+    app.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
+        folder: app.tmp.path().join("other"),
+        counts: Default::default(),
+    });
+    assert!(
+        !app.is_physical_folder_listing(),
+        "別 scan の marker は現在の一覧を物理フォルダと証明しない"
+    );
+}
+
+#[test]
+fn content_identity_setting_off_does_not_start_detection_worker() {
+    let mut app = setup_app_for_test();
+    let folder = app.tmp.path().join("pictures");
+    let target = folder.join("target.png");
+    app.settings.edit_restore_prompt_enabled = false;
+    app.content_identity_index_loaded = true;
+    app.content_identity_index
+        .upsert(crate::content_identity::LedgerEntry {
+            file_key: crate::path_key::normalize_keep_drive(&folder.join("origin.png")),
+            size: 42,
+            head_hash: "head".to_string(),
+            full_hash: Some("full".to_string()),
+            hashed_mtime: 1,
+            kind: crate::content_identity::ContentKind::Image,
+            last_edit_at: 10,
+            has_restorable_content: true,
+        });
+    app.current_folder = Some(folder.clone());
+    app.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
+        folder,
+        counts: Default::default(),
+    });
+    app.top_level_grid_view
+        .replace_surface(crate::app::top_level_grid_view::TopLevelGridSurface::Folder);
+    app.items = vec![GridItem::Image(target)];
+    app.image_metas = vec![Some((1, 42))];
+
+    app.maybe_start_content_identity_detection();
+
+    assert!(app.content_identity_detection_pending.is_none());
+}
+
+#[test]
+fn content_restore_prompt_is_held_without_blocking_input_during_fullscreen() {
+    let mut app = setup_app_for_test();
+    app.settings.first_setup_completed = true;
+    app.set_content_restore_candidates(vec![crate::content_identity::RestoreCandidate {
+        target_key: "c:/copied/target.png".to_string(),
+        target_path: std::path::PathBuf::from("C:/copied/target.png"),
+        target_kind: crate::content_identity::ContentKind::Image,
+        full_hash: "full".to_string(),
+        sources: vec![crate::content_identity::RestoreSourceCandidate {
+            file_key: "c:/original/source.png".to_string(),
+            path: std::path::PathBuf::from("C:/original/source.png"),
+            kind: crate::content_identity::ContentKind::Image,
+            last_edit_at: 10,
+            source_exists: true,
+        }],
+    }]);
+
+    assert!(app.content_restore_window_visible());
+    assert_eq!(app.modal_dialog_block_reason(), Some("content_restore"));
+
+    app.fullscreen_idx = Some(0);
+    assert!(!app.content_restore_window_visible());
+    assert_ne!(app.modal_dialog_block_reason(), Some("content_restore"));
+    assert!(
+        app.content_restore_prompt.is_some(),
+        "候補は一覧へ戻るまで保持"
+    );
+
+    app.fullscreen_idx = None;
+    assert!(app.content_restore_window_visible());
+    assert_eq!(app.modal_dialog_block_reason(), Some("content_restore"));
+}
+
+#[test]
+fn content_identity_folder_switch_cancels_worker_and_stale_result_is_not_applied() {
+    let mut app = setup_app_for_test();
+    let current_folder = app.tmp.path().join("current");
+    let old_folder = app.tmp.path().join("old");
+    app.settings.edit_restore_prompt_enabled = true;
+    app.content_identity_index_load_pending = None;
+    app.content_identity_index_loaded = true;
+    app.current_folder = Some(current_folder.clone());
+    app.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
+        folder: current_folder.clone(),
+        counts: Default::default(),
+    });
+    app.top_level_grid_view
+        .replace_surface(crate::app::top_level_grid_view::TopLevelGridSurface::Folder);
+    app.items = vec![GridItem::Image(current_folder.join("current.png"))];
+    app.image_metas = vec![Some((1, 1))];
+    app.items_generation = 9;
+
+    let stale = crate::content_identity::DetectionResult {
+        items_generation: 8,
+        folder_key: crate::path_key::normalize_keep_drive(&old_folder),
+        candidates: vec![crate::content_identity::RestoreCandidate {
+            target_key: "old-target".to_string(),
+            target_path: old_folder.join("target.png"),
+            target_kind: crate::content_identity::ContentKind::Image,
+            full_hash: "full".to_string(),
+            sources: Vec::new(),
+        }],
+        ledger_updates: Vec::new(),
+    };
+    assert!(!app.content_identity_detection_result_is_current(&stale));
+    let (pending, _cancel) =
+        crate::content_identity::ContentIdentityDetectionPending::for_test(Some(stale));
+    app.content_identity_detection_pending = Some(pending);
+    app.poll_content_identity_detection(&egui::Context::default());
+    assert!(app.content_restore_prompt.is_none(), "旧候補を適用しない");
+
+    let (pending, cancel) =
+        crate::content_identity::ContentIdentityDetectionPending::for_test(None);
+    app.content_identity_detection_pending = Some(pending);
+    app.set_content_restore_candidates(vec![crate::content_identity::RestoreCandidate {
+        target_key: "pending".to_string(),
+        target_path: current_folder.join("pending.png"),
+        target_kind: crate::content_identity::ContentKind::Image,
+        full_hash: "pending-full".to_string(),
+        sources: vec![crate::content_identity::RestoreSourceCandidate {
+            file_key: "origin".to_string(),
+            path: old_folder.join("origin.png"),
+            kind: crate::content_identity::ContentKind::Image,
+            last_edit_at: 1,
+            source_exists: false,
+        }],
+    }]);
+
+    app.install_new_items(Vec::new(), Vec::new());
+
+    assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+    assert!(app.content_identity_detection_pending.is_none());
+    assert!(app.content_restore_prompt.is_none());
+}
+
 /// `clamp_dynamic_for_gpu` は 8192 以内の画像には触れず、超えるときだけ
 /// 長辺 8192 にアスペクト比保持で縮小する。
 #[test]
@@ -45221,6 +45405,186 @@ mod still_window_mode_key_tests {
         assert!(
             !app.native_video_event_blocked_by_parked_live_filter(&wheel),
             "after ParkedLive restore, native wheel must return to the normal active-video path"
+        );
+    }
+
+    fn write_nav_test_zip(path: &std::path::Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let file = std::fs::File::create(path).unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        let opts: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zw.start_file("page.jpg", opts).unwrap();
+        std::io::Write::write_all(&mut zw, b"page").unwrap();
+        zw.finish().unwrap();
+    }
+
+    struct ConvertedArchiveNavFixture {
+        expected_next: std::path::PathBuf,
+        cache_wrong_next: std::path::PathBuf,
+    }
+
+    fn setup_converted_archive_nav_fixture(
+        app: &mut App,
+        tmp: &std::path::Path,
+    ) -> ConvertedArchiveNavFixture {
+        use crate::grid_item::GridItem;
+
+        let source_dir = tmp.join("library");
+        let cache_dir = tmp.join("archive-cache-like");
+        let source_zip = source_dir.join("01-source.zip");
+        let expected_next = source_dir.join("02-next");
+        let cache_zip = cache_dir.join("01-cache.zip");
+        let cache_wrong_next = cache_dir.join("02-cache-next");
+
+        write_nav_test_zip(&source_zip);
+        write_nav_test_zip(&cache_zip);
+        std::fs::create_dir_all(&expected_next).unwrap();
+        std::fs::write(expected_next.join("p.jpg"), b"expected").unwrap();
+        std::fs::create_dir_all(&cache_wrong_next).unwrap();
+        std::fs::write(cache_wrong_next.join("p.jpg"), b"wrong").unwrap();
+
+        app.settings.sort_order = crate::settings::SortOrder::FileName;
+        app.settings.folder_skip_limit = 8;
+        app.current_folder = Some(cache_zip.clone());
+        app.archive_source_override = Some(source_zip);
+        app.items = vec![GridItem::ZipImage {
+            zip_path: cache_zip.clone(),
+            entry_name: "bookB/p1.jpg".to_string(),
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.fullscreen_idx = Some(0);
+
+        // ZIP 内 DFS の最後の本にいる状態。Ctrl+↓ は ZIP ツリー内では進めず、
+        // 呼び出し側の通常フォルダ DFS へフォールバックする。
+        let mut nav = test_zip_nav_for(cache_zip, &["bookA/p1.jpg", "bookB/p1.jpg"]);
+        nav.enter("bookB/");
+        app.zip_nav = Some(nav);
+
+        ConvertedArchiveNavFixture {
+            expected_next,
+            cache_wrong_next,
+        }
+    }
+
+    fn wait_folder_nav_result(app: &mut App) -> FolderNavResult {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(result) = app.poll_folder_nav() {
+                return result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "folder nav worker did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn fullscreen_ctrl_nav_exits_converted_zip_from_source_path() {
+        let mut app = setup_app();
+        let tmp = app.tmp.path().to_path_buf();
+        let fixture = setup_converted_archive_nav_fixture(&mut app, &tmp);
+        let ctx = egui::Context::default();
+
+        app.handle_fullscreen_ctrl_nav_context(&ctx, 0, true, false);
+        let result = wait_folder_nav_result(&mut app);
+
+        assert_eq!(result.path.as_ref(), Some(&fixture.expected_next));
+        assert_ne!(
+            result.path.as_ref(),
+            Some(&fixture.cache_wrong_next),
+            "変換キャッシュ ZIP の物理パスを起点にすると archive_cache 側へ逸れる"
+        );
+        assert!(result.hit_image_folder);
+    }
+
+    #[test]
+    fn fullscreen_sibling_nav_exits_converted_zip_from_source_path() {
+        let mut app = setup_app();
+        let tmp = app.tmp.path().to_path_buf();
+        let fixture = setup_converted_archive_nav_fixture(&mut app, &tmp);
+        let ctx = egui::Context::default();
+
+        app.handle_fullscreen_sibling_nav_context(&ctx, 0, true, false);
+        let result = wait_folder_nav_result(&mut app);
+
+        assert_eq!(result.path.as_ref(), Some(&fixture.expected_next));
+        assert_ne!(result.path.as_ref(), Some(&fixture.cache_wrong_next));
+        assert!(result.hit_image_folder);
+    }
+
+    #[test]
+    fn pending_ctrl_nav_steps_use_source_path_after_converted_zip_landing() {
+        let mut app = setup_app();
+        let tmp = app.tmp.path().to_path_buf();
+        let fixture = setup_converted_archive_nav_fixture(&mut app, &tmp);
+
+        app.chain_folder_nav_if_pending(1, FolderNavMode::Fullscreen);
+        let result = wait_folder_nav_result(&mut app);
+
+        assert_eq!(result.path.as_ref(), Some(&fixture.expected_next));
+        assert_ne!(result.path.as_ref(), Some(&fixture.cache_wrong_next));
+        assert!(result.hit_image_folder);
+    }
+
+    #[test]
+    fn load_zip_as_folder_clears_stale_override_when_switching_zip() {
+        let mut app = setup_app();
+        let tmp = app.tmp.path().to_path_buf();
+        let source_zip = tmp.join("library").join("01-source.zip");
+        let cache_zip = tmp.join("cache").join("01-cache.zip");
+        let next_zip = tmp.join("library").join("02-next.zip");
+        write_nav_test_zip(&source_zip);
+        write_nav_test_zip(&cache_zip);
+        write_nav_test_zip(&next_zip);
+
+        app.current_folder = Some(cache_zip.clone());
+        app.archive_source_override = Some(source_zip);
+        app.load_zip_as_folder(next_zip.clone());
+
+        assert_eq!(app.current_folder.as_ref(), Some(&next_zip));
+        assert!(
+            app.archive_source_override.is_none(),
+            "別ZIPへ遷移した時点で古い source override を破棄しないと Ctrl+上下が古い元アーカイブを起点にする"
+        );
+    }
+
+    #[test]
+    fn zip_foreign_archive_offer_targets_whole_outer_zip() {
+        let mut app = setup_app();
+        let zip_path = app.tmp.path().join("outer.zip");
+        write_nav_test_zip(&zip_path);
+
+        let enumeration = crate::zip_loader::ZipEnumeration {
+            entries: vec![crate::zip_loader::ZipImageEntry {
+                entry_name: "native.zip/p01.jpg".to_string(),
+                uncompressed_size: 1,
+                mtime: 0,
+            }],
+            has_foreign_archives: true,
+            legacy_renames: Vec::new(),
+        };
+
+        app.finalize_zip_enumerate(zip_path.clone(), 0, Ok(enumeration));
+
+        let state = app
+            .archive_convert
+            .as_ref()
+            .expect("foreign archive flag should offer ZIP expansion");
+        assert_eq!(state.src_path, zip_path);
+        assert_eq!(state.format, ArchiveFormat::Zip);
+        assert!(
+            app.archive_source_override.is_none(),
+            "提案時点ではまだキャッシュへ振り替えず、変換承認後に外側ZIP全体を置換する"
+        );
+        assert!(
+            app.zip_nav.is_some(),
+            "キャンセルしても通常ZIPツリー閲覧は継続できる"
         );
     }
 
