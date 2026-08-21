@@ -2546,6 +2546,20 @@ impl App {
                             .wrap(),
                         );
 
+                        // ── ツール固有設定 ──
+                        // 設定を持たないツールでは区切りも見出しも出さない。
+                        let settings_tool_name = match self.erase_tool {
+                            EraseTool::Brush => Some("筆"),
+                            EraseTool::Bucket => Some("バケツ"),
+                            EraseTool::Line => Some("直線"),
+                            _ => None,
+                        };
+                        crate::ui_helpers::draw_tool_settings_heading(
+                            ui,
+                            settings_tool_name,
+                            egui::Color32::from_gray(200),
+                        );
+
                         // ── ブラシ半径 / 直線太さ スライダー ──
                         if self.erase_tool == EraseTool::Brush {
                             let max_r =

@@ -159,6 +159,26 @@ pub(crate) fn draw_bucket_region_controls(
     region_controls_rect
 }
 
+/// ツール固有設定の前に、パレット見出しと同じスタイルで区切りと見出しを描く。
+///
+/// `tool_name=None` は設定を持たないツールを表し、空の区切りや見出しを作らない。
+/// 戻り値は幅制約の回帰テストで使う見出し行の矩形。
+pub(crate) fn draw_tool_settings_heading(
+    ui: &mut egui::Ui,
+    tool_name: Option<&str>,
+    color: egui::Color32,
+) -> Option<egui::Rect> {
+    let tool_name = tool_name?;
+    ui.separator();
+    Some(
+        ui.add(
+            egui::Label::new(egui::RichText::new(format!("{tool_name}の設定:")).color(color))
+                .wrap(),
+        )
+        .rect,
+    )
+}
+
 fn draw_bucket_region_row(
     ui: &mut egui::Ui,
     row_width: f32,
@@ -1933,6 +1953,59 @@ mod tests {
             controls_rect.width() <= 200.0 + 0.5,
             "controls width={} exceeds the visible panel width",
             controls_rect.width()
+        );
+    }
+
+    #[test]
+    fn tool_settings_heading_stays_inside_a_200px_visible_ui_and_skips_none() {
+        let ctx = egui::Context::default();
+        let mut heading_rect = egui::Rect::NOTHING;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 500.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let visible_rect = egui::Rect::from_min_size(
+                            ui.cursor().left_top(),
+                            egui::vec2(200.0, 200.0),
+                        );
+                        let wide_rect = egui::Rect::from_min_size(
+                            visible_rect.min,
+                            egui::vec2(800.0, visible_rect.height()),
+                        );
+                        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(wide_rect));
+                        child.set_clip_rect(visible_rect);
+                        let before_none = child.cursor().top();
+                        assert!(
+                            draw_tool_settings_heading(
+                                &mut child,
+                                None,
+                                egui::Color32::from_gray(200),
+                            )
+                            .is_none()
+                        );
+                        assert_eq!(child.cursor().top(), before_none);
+                        heading_rect = draw_tool_settings_heading(
+                            &mut child,
+                            Some("隙間補完"),
+                            egui::Color32::from_gray(200),
+                        )
+                        .expect("a configured tool must draw its heading");
+                    });
+            },
+        );
+
+        assert!(
+            heading_rect.width() <= 200.0 + 0.5,
+            "heading width={} exceeds the visible panel width",
+            heading_rect.width()
         );
     }
 

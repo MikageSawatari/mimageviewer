@@ -2421,12 +2421,26 @@ impl App {
                                             self.conceal_mask_texture = None;
                                         }
 
+                                        // ツール固有設定。設定を持たないツールでは区切りも見出しも出さない。
+                                        let settings_tool_name = match self.conceal_tool {
+                                            ConcealTool::Brush => Some("筆"),
+                                            ConcealTool::Bucket => Some("バケツ"),
+                                            ConcealTool::Line => Some("直線"),
+                                            ConcealTool::VertLine => Some("縦線"),
+                                            ConcealTool::HorizLine => Some("横線"),
+                                            _ => None,
+                                        };
+                                        crate::ui_helpers::draw_tool_settings_heading(
+                                            ui,
+                                            settings_tool_name,
+                                            egui::Color32::from_gray(200),
+                                        );
+
                                         // サイズスライダ (Brush は半径、Line 系は太さ)
                                         let [w, h] = self.conceal_mask_size;
                                         let long_edge = w.max(h).max(1) as f32;
                                         match self.conceal_tool {
                                             ConcealTool::Brush => {
-                                                ui.separator();
                                                 let mut r = self.settings.conceal_brush_radius;
                                                 ui.add(
                                                     egui::Slider::new(
@@ -2438,7 +2452,6 @@ impl App {
                                                 self.settings.conceal_brush_radius = r;
                                             }
                                             ConcealTool::Bucket => {
-                                                ui.separator();
                                                 ui.add(
                                                     egui::Slider::new(
                                                         &mut self.conceal_bucket_tolerance,
@@ -2468,7 +2481,6 @@ impl App {
                                             ConcealTool::Line
                                             | ConcealTool::VertLine
                                             | ConcealTool::HorizLine => {
-                                                ui.separator();
                                                 let mut t = self.settings.conceal_line_width;
                                                 ui.add(
                                                     egui::Slider::new(

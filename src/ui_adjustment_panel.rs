@@ -1845,6 +1845,23 @@ fn local_mask_tool_label(tool: LocalAdjustMaskTool) -> &'static str {
     }
 }
 
+fn local_mask_tool_has_settings(
+    tool: LocalAdjustMaskTool,
+    selected_line_thickness: Option<f32>,
+) -> bool {
+    matches!(
+        tool,
+        LocalAdjustMaskTool::Brush
+            | LocalAdjustMaskTool::Bucket
+            | LocalAdjustMaskTool::EdgeBrush
+            | LocalAdjustMaskTool::GapFillBrush
+            | LocalAdjustMaskTool::Polygon
+            | LocalAdjustMaskTool::Line
+            | LocalAdjustMaskTool::VertLine
+            | LocalAdjustMaskTool::HorizLine
+    ) || (tool == LocalAdjustMaskTool::Select && selected_line_thickness.is_some())
+}
+
 fn local_mask_override_slot_mut(
     layer: &mut local_adjust_core::LocalAdjustmentLayer,
     target: LocalAdjustMaskEditTarget,
@@ -2743,18 +2760,15 @@ fn draw_local_tool_settings(
     bucket_gap_tolerance: &mut f32,
     edge_brush_include_boundary: &mut bool,
 ) {
-    ui.label(
-        egui::RichText::new("ツール設定")
-            .size(14.0)
-            .strong()
-            .color(egui::Color32::WHITE),
+    if !local_mask_tool_has_settings(mask_tool, selected_line_thickness) {
+        return;
+    }
+    let heading_color = ui.visuals().text_color();
+    crate::ui_helpers::draw_tool_settings_heading(
+        ui,
+        Some(local_mask_tool_label(mask_tool)),
+        heading_color,
     );
-    ui.label(
-        egui::RichText::new(local_mask_tool_label(mask_tool))
-            .size(11.0)
-            .weak(),
-    );
-    ui.separator();
 
     match mask_tool {
         LocalAdjustMaskTool::Brush
