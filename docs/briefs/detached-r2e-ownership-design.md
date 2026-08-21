@@ -236,6 +236,30 @@ Codex も同意した。ただし両方とも §11 のリワーク外合意プ�
 
 ---
 
+## 6.5 実務で 3 回踏んだ同型の失敗 (2026-08-21、第 3 版の設計材料)
+
+§1.100 の実装中に、**同じ構造の失敗を 3 回**踏んだ。いずれも
+「`None` が『存在しない』ではなく『今は別の場所にある』を意味していた」ケースで、
+**R2e が解こうとしている問題そのもの**である。第 3 版はこの 3 件を説明できる形にすること。
+
+| # | どこ | `None` / 単一値の誤読 | 症状 |
+| --- | --- | --- | --- |
+| 1 | `active_detached_viewer_context.is_none()` (§11 の keep-alive backstop) | 「所有者が居ない」ではなく「今マウント中」 | 別 context の題と texture で描画 |
+| 2 | `right_drag_pointer_pos(owner)` (`src/app/gamepad_input.rs:1161`) | 所有者でしか絞らず、**どの producer が持っているか**を区別しない | egui 側が native 側の開始したドラッグを `ButtonStateLost` でキャンセル |
+| 3 | `snapshot.paused_bundle.is_none()` (`src/app.rs:707` 付近) | 「bundle が無い」ではなく「parked-live poll がマウント中」 | 成立したコマンドが `viewer_identity_unavailable` で捨てられる |
+
+**3 件に共通する要求**: ある識別子 (window / context / owner) を渡したら、
+**その bundle が今どこにあるか (parked / mounted / 別 producer が保持中) を型で返す**こと。
+第 2 版の `MountPhase` は App の投影側しか表しておらず、
+**「この window の bundle は今マウント中か」を問い合わせる API が無い**。
+第 3 版ではこれを一級の問い合わせにする (2 の producer 所有まで含めるかは設計判断)。
+
+暫定の回避策として、3 は `native_video_parked_live_input_window_id`
+(`src/app.rs:1249`) を「その窓がマウント中である事実」として読んでいる。
+**これは parked-live 経路にしか無い facts なので、一般解にはならない。**
+
+---
+
 ## 7. 第 2 版で聞いたこと (回答済み)
 
 1. §2 の phase / slots / stack で、§1.3 と §1.4 の状態を**過不足なく**表現できているか。
