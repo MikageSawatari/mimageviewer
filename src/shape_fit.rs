@@ -1,6 +1,7 @@
 //! 連結ビットマップ領域の内側へ、クリック位置を含む単純な図形を当てはめる純関数。
 //!
-//! 探索は縮小マスクで候補を絞り、原寸マスクを走査するのは確定した候補の 1 回だけにする。
+//! 長方形は原寸の seed 断面から通路を追跡する。楕円は縮小マスクで候補を絞り、
+//! 原寸マスクを走査するのは確定した候補の 1 回だけにする。
 //! 座標は画像 pixel 座標で、各 pixel の中心は `(x + 0.5, y + 0.5)` とする。
 
 use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
@@ -274,101 +275,263 @@ fn projected_grid_range(
     )
 }
 
-fn largest_rect_at_angle(
+#[derive(Debug, Clone, Copy)]
+struct RectCrossSection {
+    normal_angle: f64,
+    negative: f64,
+    positive: f64,
+    width: f64,
+}
+
+fn region_contains_point(region: &[bool], w: usize, h: usize, point: (f64, f64)) -> bool {
+    point.0 >= 0.0
+        && point.1 >= 0.0
+        && point.0 < w as f64
+        && point.1 < h as f64
+        && region[point.1.floor() as usize * w + point.0.floor() as usize]
+}
+
+/// seed から指定方向へ進み、region を出る連続座標までの距離を求める。
+///
+/// 0.5px 刻みで壁を探したあと二分探索するので、角度候補 360 本を原寸で測っても
+/// region 全体の反復走査にはならない。
+fn ray_exit_distance(
+    region: &[bool],
+    w: usize,
+    h: usize,
+    seed_point: (f64, f64),
+    direction: (f64, f64),
+    max_distance: f64,
+) -> f64 {
+    const STEP: f64 = 0.5;
+    let mut inside_distance = 0.0;
+    let mut distance = STEP;
+    while distance <= max_distance {
+        let point = (
+            seed_point.0 + direction.0 * distance,
+            seed_point.1 + direction.1 * distance,
+        );
+        if !region_contains_point(region, w, h, point) {
+            let mut low = inside_distance;
+            let mut high = distance;
+            for _ in 0..20 {
+                let mid = (low + high) * 0.5;
+                let point = (
+                    seed_point.0 + direction.0 * mid,
+                    seed_point.1 + direction.1 * mid,
+                );
+                if region_contains_point(region, w, h, point) {
+                    low = mid;
+                } else {
+                    high = mid;
+                }
+            }
+            // `high` は region の直外側で、連続座標上の壁へ 1e-6px 未満まで寄せている。
+            // 中点を返すと seed が端寄りのとき中心が壁の内側へ偏り、軸平行矩形でも
+            // rasterize 時に端の 1 pixel を落としうる。
+            return high;
+        }
+        inside_distance = distance;
+        distance += STEP;
+    }
+    inside_distance
+}
+
+fn measure_rect_cross_section(
+    region: &[bool],
+    w: usize,
+    h: usize,
+    bounds: Bounds,
+    seed_point: (f64, f64),
+    normal_angle: f64,
+) -> RectCrossSection {
+    let normal = (normal_angle.cos(), normal_angle.sin());
+    let max_distance = (bounds.width() as f64)
+        .hypot(bounds.height() as f64)
+        .max(1.0)
+        + 2.0;
+    let negative = ray_exit_distance(
+        region,
+        w,
+        h,
+        seed_point,
+        (-normal.0, -normal.1),
+        max_distance,
+    );
+    let positive = ray_exit_distance(region, w, h, seed_point, normal, max_distance);
+    RectCrossSection {
+        normal_angle,
+        negative,
+        positive,
+        width: negative + positive,
+    }
+}
+
+fn rect_corridor_column_is_inside(
+    region: &[bool],
+    w: usize,
+    h: usize,
+    seed_point: (f64, f64),
+    along: (f64, f64),
+    normal: (f64, f64),
+    distance: f64,
+    section: RectCrossSection,
+    exact: bool,
+) -> bool {
+    // 回転 raster の外周は列ごとに 1〜2px 階段状に前後する。出力幅は seed で測った
+    // 壁間を保ちつつ、通路の継続判定だけ両端を最大 2px 内側で行う。細い 4px 帯では
+    // 比率上限も設け、中央断面そのものを失わない。
+    let edge_inset = (section.width * 0.20).min(2.0);
+    let validation_width = (section.width - edge_inset * 2.0).max(section.width * 0.5);
+    let exact_samples = validation_width.ceil().max(1.0) as usize;
+    let column_contains = |sample: usize, sample_count: usize| {
+        // 境界そのものは raster の階段状丸めで 1px 前後揺れる。各 pixel 区間の
+        // 中央を調べ、出力寸法は seed 断面で測った壁位置を保つ。
+        let ratio = (sample as f64 + 0.5) / sample_count as f64;
+        let offset = -section.negative + edge_inset + validation_width * ratio;
+        let point = (
+            seed_point.0 + along.0 * distance + normal.0 * offset,
+            seed_point.1 + along.1 * distance + normal.1 * offset,
+        );
+        region_contains_point(region, w, h, point)
+    };
+    let coarse_samples = exact_samples.min(7);
+    if !(0..coarse_samples).all(|sample| column_contains(sample, coarse_samples)) {
+        return false;
+    }
+    !exact || (0..exact_samples).all(|sample| column_contains(sample, exact_samples))
+}
+
+fn rect_corridor_side_opens_wider_than_width(
+    region: &[bool],
+    w: usize,
+    h: usize,
+    seed_point: (f64, f64),
+    along: (f64, f64),
+    normal: (f64, f64),
+    distance: f64,
+    boundary: f64,
+    side: f64,
+    width: f64,
+) -> bool {
+    // 壁の外側 0.5px から連続して W より先まで region があれば「横に開けた」とする。
+    // 最初の 1px が外なら通常の raster 境界なので、追加走査はそこで終わる。
+    let steps = width.floor().max(0.0) as usize + 1;
+    for step in 0..=steps {
+        let offset = boundary + side * (step as f64 + 0.5);
+        let point = (
+            seed_point.0 + along.0 * distance + normal.0 * offset,
+            seed_point.1 + along.1 * distance + normal.1 * offset,
+        );
+        if !region_contains_point(region, w, h, point) {
+            return false;
+        }
+    }
+    true
+}
+
+fn trace_rect_corridor_extent(
+    region: &[bool],
+    w: usize,
+    h: usize,
+    bounds: Bounds,
+    seed_point: (f64, f64),
+    along: (f64, f64),
+    normal: (f64, f64),
+    section: RectCrossSection,
+    direction_sign: f64,
+    exact: bool,
+) -> f64 {
+    let max_steps = (bounds.width() as f64).hypot(bounds.height() as f64).ceil() as usize + 2;
+    // T 字や交差部は、横に開く区間が通路幅より短いので通過させる。一方、広い塊は
+    // 同じ状態が W 程度以上続く。この非対称性で塊へ入る直前を帯の端として扱う。
+    let open_run_limit = section.width.ceil().max(4.0) as usize;
+    let mut open_run = 0usize;
+    let mut open_start_boundary = 0.0;
+
+    for step in 1..=max_steps {
+        let distance = direction_sign * step as f64;
+        if !rect_corridor_column_is_inside(
+            region, w, h, seed_point, along, normal, distance, section, exact,
+        ) {
+            return step as f64 - 0.5;
+        }
+        let opens = rect_corridor_side_opens_wider_than_width(
+            region,
+            w,
+            h,
+            seed_point,
+            along,
+            normal,
+            distance,
+            section.positive,
+            1.0,
+            section.width,
+        ) || rect_corridor_side_opens_wider_than_width(
+            region,
+            w,
+            h,
+            seed_point,
+            along,
+            normal,
+            distance,
+            -section.negative,
+            -1.0,
+            section.width,
+        );
+        if opens {
+            if open_run == 0 {
+                open_start_boundary = step as f64 - 0.5;
+            }
+            open_run += 1;
+            if open_run >= open_run_limit {
+                return open_start_boundary;
+            }
+        } else {
+            open_run = 0;
+        }
+    }
+    max_steps as f64 - 0.5
+}
+
+fn rect_from_seed_corridor(
     region: &[bool],
     w: usize,
     h: usize,
     bounds: Bounds,
     seed: (usize, usize),
-    angle: f64,
+    section: RectCrossSection,
+    exact: bool,
 ) -> Option<RectCandidate> {
-    let (sin, cos) = angle.sin_cos();
-    let u = (cos, sin);
-    let v = (-sin, cos);
-    let seed_point = (seed.0 as f64 + 0.5, seed.1 as f64 + 0.5);
-    let (min_k, max_k, min_l, max_l) = projected_grid_range(bounds, seed_point, u, v, 1.0);
-    let grid_w = usize::try_from(max_k - min_k + 1).ok()?;
-    let grid_h = usize::try_from(max_l - min_l + 1).ok()?;
-    let seed_col = usize::try_from(-min_k).ok()?;
-    let seed_row = usize::try_from(-min_l).ok()?;
-    if seed_col >= grid_w || seed_row >= grid_h {
+    if !(section.width > 0.0 && section.width.is_finite()) {
         return None;
     }
-
-    let mut heights = vec![0usize; grid_w];
-    let mut left_less = vec![None; grid_w];
-    let mut right_less = vec![grid_w; grid_w];
-    let mut stack = Vec::with_capacity(grid_w);
-    let mut best: Option<RectCandidate> = None;
-
-    for row in 0..grid_h {
-        let l = min_l + row as isize;
-        for (col, height) in heights.iter_mut().enumerate() {
-            let k = min_k + col as isize;
-            let source_x = seed_point.0 + k as f64 * u.0 + l as f64 * v.0;
-            let source_y = seed_point.1 + k as f64 * u.1 + l as f64 * v.1;
-            let inside = source_x >= 0.0
-                && source_y >= 0.0
-                && source_x < w as f64
-                && source_y < h as f64
-                && region[source_y.floor() as usize * w + source_x.floor() as usize];
-            *height = if inside { *height + 1 } else { 0 };
-        }
-
-        stack.clear();
-        for col in 0..grid_w {
-            while stack
-                .last()
-                .is_some_and(|previous: &usize| heights[*previous] >= heights[col])
-            {
-                stack.pop();
-            }
-            left_less[col] = stack.last().copied();
-            stack.push(col);
-        }
-        stack.clear();
-        for col in (0..grid_w).rev() {
-            while stack
-                .last()
-                .is_some_and(|previous: &usize| heights[*previous] >= heights[col])
-            {
-                stack.pop();
-            }
-            right_less[col] = stack.last().copied().unwrap_or(grid_w);
-            stack.push(col);
-        }
-
-        for col in 0..grid_w {
-            let rect_h = heights[col];
-            if rect_h == 0 {
-                continue;
-            }
-            let left = left_less[col].map_or(0, |idx| idx + 1);
-            let right = right_less[col];
-            let top = row + 1 - rect_h;
-            if !(left <= seed_col && seed_col < right && top <= seed_row && seed_row <= row) {
-                continue;
-            }
-            let rect_w = right - left;
-            let area = (rect_w * rect_h) as f64;
-            if best.is_some_and(|candidate| candidate.area >= area) {
-                continue;
-            }
-            let center_k = min_k as f64 + (left + right - 1) as f64 * 0.5;
-            let center_l = min_l as f64 + (top + row) as f64 * 0.5;
-            best = Some(RectCandidate {
-                center: (
-                    seed_point.0 + center_k * u.0 + center_l * v.0,
-                    seed_point.1 + center_k * u.1 + center_l * v.1,
-                ),
-                half_w: rect_w as f64 * 0.5,
-                half_h: rect_h as f64 * 0.5,
-                rotation_rad: angle,
-                area,
-            });
-        }
+    let seed_point = (seed.0 as f64 + 0.5, seed.1 as f64 + 0.5);
+    let normal = (section.normal_angle.cos(), section.normal_angle.sin());
+    let rotation_rad = section.normal_angle - FRAC_PI_2;
+    let along = (rotation_rad.cos(), rotation_rad.sin());
+    let negative = trace_rect_corridor_extent(
+        region, w, h, bounds, seed_point, along, normal, section, -1.0, exact,
+    );
+    let positive = trace_rect_corridor_extent(
+        region, w, h, bounds, seed_point, along, normal, section, 1.0, exact,
+    );
+    let length = negative + positive;
+    if !(length > 0.0 && length.is_finite()) {
+        return None;
     }
-    best
+    let along_offset = (positive - negative) * 0.5;
+    let normal_offset = (section.positive - section.negative) * 0.5;
+    Some(RectCandidate {
+        center: (
+            seed_point.0 + along.0 * along_offset + normal.0 * normal_offset,
+            seed_point.1 + along.1 * along_offset + normal.1 * normal_offset,
+        ),
+        half_w: length * 0.5,
+        half_h: section.width * 0.5,
+        rotation_rad,
+        area: length * section.width,
+    })
 }
 
 fn normalize_rect_for_output(mut candidate: RectCandidate, angle_snap_deg: f64) -> RectCandidate {
@@ -406,6 +569,19 @@ fn rect_candidate_is_better(candidate: RectCandidate, best: Option<RectCandidate
             && candidate.rotation_rad.abs() < best.rotation_rad.abs())
 }
 
+fn rect_cross_section_is_local_minimum(sections: &[RectCrossSection], index: usize) -> bool {
+    // seed が長方形の角寄りにあると、角を斜めに横切る極端に短い断面も生じる。
+    // 絶対最小だけに絞らず、±4度の各谷を通路候補にして追跡面積で選ぶことで、
+    // 本来の辺法線を残しつつ長軸方向や広い接続先（断面の山）は除外する。
+    const WINDOW_STEPS: usize = 8;
+    let current = sections[index].width;
+    (1..=WINDOW_STEPS).all(|offset| {
+        let previous = sections[(index + sections.len() - offset) % sections.len()].width;
+        let next = sections[(index + offset) % sections.len()].width;
+        current <= previous + 1.0e-6 && current <= next + 1.0e-6
+    })
+}
+
 pub fn fit_rect(
     region: &[bool],
     w: usize,
@@ -419,49 +595,75 @@ pub fn fit_rect(
     }
     let filled = fill_internal_holes(region, w, h, opt.max_hole_area_ratio);
     let bounds = region_bounds(&filled, w, h)?;
-    let coarse = make_scaled_region(&filled, w, bounds, seed);
-    let coarse_bounds = region_bounds(&coarse.mask, coarse.w, coarse.h)?;
+    let seed_point = (seed.0 as f64 + 0.5, seed.1 as f64 + 0.5);
+    let mut sections = Vec::with_capacity(360);
+    let mut min_width = f64::INFINITY;
+    for step in 0..360 {
+        let section = measure_rect_cross_section(
+            &filled,
+            w,
+            h,
+            bounds,
+            seed_point,
+            (step as f64 * 0.5).to_radians(),
+        );
+        min_width = min_width.min(section.width);
+        sections.push(section);
+    }
+    if !min_width.is_finite() {
+        return None;
+    }
 
-    let mut best = None;
-    for angle_deg in (-22..=22)
-        .map(|step| f64::from(step) * 2.0)
-        .chain([-45.0, 0.0])
+    // 通常の帯は絶対最小付近が法線になる。seed が角寄りの場合だけ斜めの短い断面が
+    // 絶対最小になるため、角度幅の局所最小も併せて残し、通路を追えた面積で決める。
+    let narrow_width_limit = min_width * 1.10 + 0.5;
+    let mut coarse_candidates = Vec::new();
+    for (_index, section) in sections
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(index, section)| {
+            section.width <= narrow_width_limit
+                || rect_cross_section_is_local_minimum(&sections, *index)
+        })
     {
-        if let Some(candidate) = largest_rect_at_angle(
-            &coarse.mask,
-            coarse.w,
-            coarse.h,
-            coarse_bounds,
-            coarse.seed,
-            angle_deg.to_radians(),
-        ) && rect_candidate_is_better(candidate, best)
+        if let Some(candidate) =
+            rect_from_seed_corridor(&filled, w, h, bounds, seed, section, false)
         {
-            best = Some(candidate);
+            coarse_candidates.push((section, candidate));
         }
     }
-    let coarse_best = best?;
+    coarse_candidates.sort_by(|(_, a), (_, b)| {
+        b.area
+            .total_cmp(&a.area)
+            .then_with(|| a.rotation_rad.abs().total_cmp(&b.rotation_rad.abs()))
+    });
 
-    // 2 度刻みで選んだ近傍だけを縮小マスク上で詰める。原寸を複数回回さない。
-    let mut refined = Some(coarse_best);
-    for step in -8..=8 {
-        let angle = coarse_best.rotation_rad + f64::from(step) * 0.25_f64.to_radians();
-        if let Some(candidate) = largest_rect_at_angle(
-            &coarse.mask,
-            coarse.w,
-            coarse.h,
-            coarse_bounds,
-            coarse.seed,
-            angle,
-        ) && rect_candidate_is_better(candidate, refined)
+    // 粗確認は厳密確認でも必ず再検査する 7 点なので、その長さ・面積は上限になる。
+    // 面積順に厳密確認し、未確認候補の上限が確定済みの面積以下になった時点で止める。
+    // 通常は 1 候補だけを幅全体で調べ、raster 境界で角度が紛らわしい場合だけ近傍へ進む。
+    let mut exact_best: Option<RectCandidate> = None;
+    for (section, coarse) in coarse_candidates {
+        if let Some(best) = exact_best
+            && coarse.area <= best.area + 1.0e-6
         {
-            refined = Some(candidate);
+            break;
+        }
+        let Some(candidate) = rect_from_seed_corridor(&filled, w, h, bounds, seed, section, true)
+        else {
+            continue;
+        };
+        if rect_candidate_is_better(candidate, exact_best) {
+            exact_best = Some(candidate);
         }
     }
-    let mut final_angle = refined?.rotation_rad;
-    if final_angle.to_degrees().abs() <= f64::from(opt.angle_snap_deg.max(0.0)) {
-        final_angle = 0.0;
+    let mut final_candidate = exact_best?;
+    if final_candidate.rotation_rad.to_degrees().abs() <= f64::from(opt.angle_snap_deg.max(0.0)) {
+        let snapped_section =
+            measure_rect_cross_section(&filled, w, h, bounds, seed_point, FRAC_PI_2);
+        final_candidate =
+            rect_from_seed_corridor(&filled, w, h, bounds, seed, snapped_section, true)?;
     }
-    let final_candidate = largest_rect_at_angle(&filled, w, h, bounds, seed, final_angle)?;
     if final_candidate.half_w < MIN_SHAPE_RADIUS || final_candidate.half_h < MIN_SHAPE_RADIUS {
         return None;
     }
@@ -815,7 +1017,8 @@ mod tests {
             let expected_area = 4.0 * 110.0 * 55.0;
             assert!(
                 ((fitted_area / expected_area) - 1.0).abs() <= 0.02,
-                "angle={angle_deg}, fitted_area={fitted_area}, expected_area={expected_area}"
+                "angle={angle_deg}, fitted_area={fitted_area}, expected_area={expected_area}, half=({half_w},{half_h}), rotation={}deg",
+                rotation_rad.to_degrees()
             );
         }
     }
@@ -848,6 +1051,96 @@ mod tests {
             (fitted_area / expected_area - 1.0).abs() <= 0.15,
             "fitted_area={fitted_area}, expected_area={expected_area}"
         );
+    }
+
+    #[test]
+    fn very_thin_rotated_band_is_recognized_as_a_rectangle() {
+        let (w, h) = (800, 320);
+        let angle = 12.0_f64.to_radians();
+        let region = raster_rect(w, h, (400.0, 160.0), 250.0, 2.0, angle);
+
+        let Some(FittedShape::Rect {
+            center,
+            half_w,
+            half_h,
+            rotation_rad,
+        }) = fit_rect(&region, w, h, (300, 139), FitOptions::default())
+        else {
+            panic!("a 4px by 500px band should fit");
+        };
+        assert_close(center.0, 400.0, 3.0);
+        assert_close(center.1, 160.0, 3.0);
+        assert!((half_w / 250.0 - 1.0).abs() <= 0.03, "half_w={half_w}");
+        assert!((half_h / 2.0 - 1.0).abs() <= 0.30, "half_h={half_h}");
+        assert!(angle_error_deg(rotation_rad, angle as f32) <= 2.0);
+    }
+
+    #[test]
+    fn thin_stem_does_not_stop_a_long_horizontal_t_bar() {
+        // 横棒自体は 400x30px。実スキャン相当の長い細線が接続すると region 全体の
+        // bounds だけが大きくなり、旧縮小探索では横棒の断面が数 pixel まで痩せる。
+        let (w, h) = (2200, 4600);
+        let angle = 12.0_f64.to_radians();
+        let center = (900.0, 4200.0);
+        let normal = (-angle.sin(), angle.cos());
+        let mut region = raster_rect(w, h, center, 200.0, 15.0, angle);
+        union_into(
+            &mut region,
+            &raster_rect(
+                w,
+                h,
+                (center.0 - normal.0 * 1915.0, center.1 - normal.1 * 1915.0),
+                1900.0,
+                4.0,
+                angle + FRAC_PI_2,
+            ),
+        );
+        let seed = (
+            (center.0 - angle.cos() * 150.0).floor() as usize,
+            (center.1 - angle.sin() * 150.0).floor() as usize,
+        );
+
+        let Some(FittedShape::Rect {
+            center,
+            half_w,
+            half_h,
+            rotation_rad,
+        }) = fit_rect(&region, w, h, seed, FitOptions::default())
+        else {
+            panic!("the horizontal bar of a T should fit");
+        };
+        assert_close(center.0, 900.0, 3.0);
+        assert_close(center.1, 4200.0, 3.0);
+        assert_close(half_w, 200.0, 2.0);
+        assert_close(half_h, 15.0, 2.0);
+        assert!(angle_error_deg(rotation_rad, angle as f32) <= 2.0);
+    }
+
+    #[test]
+    fn horizontal_band_stops_when_it_opens_into_a_large_region() {
+        let (w, h) = (1020, 520);
+        let mut region = vec![false; w * h];
+        for y in 245..275 {
+            region[y * w + 50..y * w + 350].fill(true);
+        }
+        for y in 60..460 {
+            region[y * w + 350..y * w + 950].fill(true);
+        }
+
+        let Some(FittedShape::Rect {
+            center,
+            half_w,
+            half_h,
+            rotation_rad,
+        }) = fit_rect(&region, w, h, (100, 260), FitOptions::default())
+        else {
+            panic!("the band leading into the large region should fit");
+        };
+        assert_close(center.0, 200.0, 3.0);
+        assert_close(center.1, 260.0, 2.0);
+        assert_close(half_w, 150.0, 3.0);
+        assert_close(half_h, 15.0, 2.0);
+        assert_eq!(rotation_rad, 0.0);
     }
 
     #[test]
@@ -1064,8 +1357,8 @@ mod tests {
         );
     }
 
-    /// 5 度刻みで一周ぶん確かめる。最大内接矩形は raster 境界の丸めで外周の
-    /// ごく一部を落としうるため、旧外接実装の厳密包含ではなく 98% の包含を不変条件とする。
+    /// 5 度刻みで一周ぶん確かめる。seed 断面の幅を保つ矩形は raster 境界の階段状丸めで
+    /// 外周のごく一部を落としうるため、旧外接実装の厳密包含ではなく 98% の包含を不変条件とする。
     #[test]
     fn rotated_rect_fit_always_encloses_the_region() {
         let (w, h) = (400, 320);
@@ -1100,9 +1393,10 @@ mod tests {
                 .count();
             assert!(
                 covered as f64 / region_count as f64 >= 0.98,
-                "coverage={} at {}deg",
+                "coverage={} at {}deg, center={center:?}, half=({half_w},{half_h}), rotation={}deg",
                 covered as f64 / region_count as f64,
-                angle.to_degrees()
+                angle.to_degrees(),
+                rotation_rad.to_degrees()
             );
         }
     }
