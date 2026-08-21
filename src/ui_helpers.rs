@@ -135,14 +135,16 @@ pub(crate) fn draw_bucket_region_controls(
         )
         .on_hover_text("細い線や小さな隙間から塗りが漏れるのを防ぎます。0 で無効。");
     }
+    ui.add(
+        egui::Slider::new(outset, 0.0..=8.0)
+            .text("はみ出し")
+            .step_by(0.1)
+            .fixed_decimals(1),
+    )
+    .on_hover_text(
+        "塗った範囲を外側へ広げます。縁のにじみを含めたいときに上げてください。図形では図形を広げます。",
+    );
     if region.is_shape() {
-        ui.add(
-            egui::Slider::new(outset, 0.0..=8.0)
-                .text("はみ出し")
-                .step_by(0.1)
-                .fixed_decimals(1),
-        )
-        .on_hover_text("図形を外側へ広げます。縁のにじみが残るときに上げてください。");
         ui.add(
             egui::Slider::new(gap_tolerance, 0.0..=50.0)
                 .text("隙間の許容")
