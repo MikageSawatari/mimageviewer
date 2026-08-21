@@ -1681,6 +1681,7 @@
 | バケツの「全体」「隣接のみ」の塗りが既定で 1px 広がる (はみ出し 1.0px) | `must_read` | bucket-shape-fill (2026-08-21 merge) |
 | モノクロ・セピア原稿の消しゴム補完が既定で色調合わせされる | `must_read` | bucket-shape-fill (2026-08-21 merge) |
 | バケツに「塗る範囲」5 択 (全体 / 隣接のみ / 長方形 / 楕円 / 円) | `highlights` | 同上 |
+| コピー・移動したファイルの編集内容を復元するか確認する (既定 ON、新機能) | `highlights` | A1-A3b (2026-08-21) |
 | マスク編集の Redo (Ctrl+Y / Ctrl+Shift+Z) | `highlights` | 同上 |
 | Shift+ホイールで筆サイズ | `highlights` | 同上 |
 
