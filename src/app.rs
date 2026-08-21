@@ -1238,6 +1238,27 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn right_drag_viewer_identity_for_window_id(
+        &self,
+        window_id: u64,
+    ) -> Option<DetachedRightDragViewerIdentity> {
+        let window = self
+            .detached_image_windows
+            .iter()
+            .find(|window| window.id == window_id)?;
+        if self.native_video_parked_live_input_window_id == Some(window_id) {
+            // ParkedLive polling sets this owner only after swapping its bundle onto App and
+            // restores it before swapping back. During that span paused_bundle is legitimately
+            // None, and the mounted App generation is this window's identity.
+            Some(DetachedRightDragViewerIdentity::ItemsGeneration(
+                self.items_generation,
+            ))
+        } else {
+            window.right_drag_viewer_identity()
+        }
+    }
+
+    #[cfg(windows)]
     pub(crate) fn queue_recognized_detached_right_drag_command(
         &mut self,
         window_id: u64,
@@ -1251,12 +1272,7 @@ impl App {
             ));
             return false;
         }
-        let Some(viewer_identity) = self
-            .detached_image_windows
-            .iter()
-            .find(|window| window.id == window_id)
-            .and_then(DetachedImageWindowSnapshot::right_drag_viewer_identity)
-        else {
+        let Some(viewer_identity) = self.right_drag_viewer_identity_for_window_id(window_id) else {
             self.log_detached_image_window_debug(format!(
                 "right_drag_command_dropped id={window_id} phase=recognized \
                  reason=viewer_identity_unavailable"

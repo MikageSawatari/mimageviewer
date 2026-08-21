@@ -32828,6 +32828,81 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
+    fn recognized_right_drag_command_captures_mounted_parked_live_identity() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_id = 22;
+        let mounted_generation = 73;
+        let mut bundle = passive_right_drag_image_bundle(r"C:\pics\mounted-identity.jpg");
+        bundle.items_generation = mounted_generation;
+        app.detached_image_windows
+            .push(paused_test_window(&ctx, window_id, bundle));
+        app.transition_detached_window_state(window_id, DetachedWindowState::ParkedLive, "test");
+
+        let window_pos = app
+            .detached_image_windows
+            .iter()
+            .position(|window| window.id == window_id)
+            .expect("ParkedLive owner snapshot");
+        let mut mounted_bundle = app.detached_image_windows[window_pos]
+            .paused_bundle
+            .take()
+            .expect("ParkedLive owner bundle");
+        app.swap_viewer_context_bundle(&mut mounted_bundle);
+        app.native_video_parked_live_input_window_id = Some(window_id);
+        assert_eq!(app.items_generation, mounted_generation);
+        assert!(
+            app.detached_image_windows[window_pos]
+                .paused_bundle
+                .is_none()
+        );
+
+        assert!(app.queue_recognized_detached_right_drag_command(
+            window_id,
+            passive_rotate_command(),
+            "test"
+        ));
+        assert!(matches!(
+            app.detached_window_manager.activation_intent(window_id),
+            Some(DetachedActivationIntent::RightDrag(
+                PendingRightDragCommand::Recognized { command }
+            )) if command.viewer_identity
+                == DetachedRightDragViewerIdentity::ItemsGeneration(mounted_generation)
+        ));
+
+        app.native_video_parked_live_input_window_id = None;
+        app.swap_viewer_context_bundle(&mut mounted_bundle);
+        app.detached_image_windows[window_pos].paused_bundle = Some(mounted_bundle);
+    }
+
+    #[test]
+    fn recognized_right_drag_command_captures_parked_bundle_identity() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_id = 23;
+        let parked_generation = 91;
+        let mut bundle = passive_right_drag_image_bundle(r"C:\pics\parked-identity.jpg");
+        bundle.items_generation = parked_generation;
+        app.items_generation = parked_generation + 1;
+        app.detached_image_windows
+            .push(paused_test_window(&ctx, window_id, bundle));
+        app.transition_detached_window_state(window_id, DetachedWindowState::Parked, "test");
+
+        assert!(app.queue_recognized_detached_right_drag_command(
+            window_id,
+            passive_rotate_command(),
+            "test"
+        ));
+        assert!(matches!(
+            app.detached_window_manager.activation_intent(window_id),
+            Some(DetachedActivationIntent::RightDrag(
+                PendingRightDragCommand::Recognized { command }
+            )) if command.viewer_identity
+                == DetachedRightDragViewerIdentity::ItemsGeneration(parked_generation)
+        ));
+    }
+
+    #[test]
     fn passive_command_progresses_to_execution_only_inside_owner_mount() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
