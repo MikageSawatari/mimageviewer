@@ -138,6 +138,13 @@ bench = false
 required-features = ["dev-tools"]
 
 [[bin]]
+name = "gen_bucket_figures"
+path = "src/bin/gen_bucket_figures.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
 name = "normalize_probe"
 path = "src/bin/normalize_probe.rs"
 test = false

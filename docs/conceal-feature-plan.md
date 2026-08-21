@@ -363,6 +363,11 @@ region があると楕円がそこまで伸びる場合がある。長方形の�
 これらは消しゴム / 隠蔽加工 / 補正レイヤーで
 共通とする。
 
+マニュアルのバケツ設定比較図 `fig-bucket-*.webp` は、決定的な合成画像へ本体の
+`mask_db::flood_fill_bitmap_mask` を適用する `src/bin/gen_bucket_figures.rs` で生成する。
+バケツの挙動を変更した場合は `cargo run --release --features dev-tools --bin gen_bucket_figures`
+で 7 点を再生成し、各パネルの差とクリック位置を目視確認してからマニュアルへ反映する。
+
 ベクタオブジェクト編集の挙動 (ハンドル方式、Ctrl/Shift/Alt 修飾子) は消しゴムと完全一致。
 選択ツール中は未選択 Shape も編集用アウトラインで表示し、`Add` と `Subtract` を色分けする。
 `Subtract` は合成済みマスクでは透明になるため、このアウトラインはクリック対象の存在を伝える
