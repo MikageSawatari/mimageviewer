@@ -5,7 +5,7 @@ OS 側 (エクスプローラー等) でファイルを移動・コピーする�
 本機能は **ファイル内容のハッシュ**を identity として編集内容を再結合し、
 利用者に確認したうえで新しい場所へ複製する。
 
-- 状態: **設計確定 / 未実装** (2026-08-20)
+- 状態: **設計確定 / A1 (台帳と記録) 実装済み、A2・A3 未実装** (2026-08-21)
 - 関連: [preset-and-adjustment.md §9](preset-and-adjustment.md) (フォルダ側サイドカー)、
   [src/rename_key_migration.rs](../src/rename_key_migration.rs) (アプリ内リネーム移行)、
   [src/metadata_transfer.rs](../src/metadata_transfer.rs) (明示的なメタ情報書き出し / 取り込み)
@@ -78,7 +78,7 @@ CREATE TABLE edit_origin (
   full_hash     TEXT,              -- 全体 SHA-256 (未計算なら NULL)
   hashed_mtime  INTEGER NOT NULL,  -- 再ハッシュ要否の判定
   kind          TEXT NOT NULL,     -- image / zip / pdf / convertible
-  last_edit_at  INTEGER NOT NULL   -- 候補が複数あるときの既定選択に使う
+  last_edit_at  INTEGER NOT NULL   -- 候補が複数あるときの既定選択に使う (0 = 未編集)
 );
 CREATE INDEX edit_origin_full ON edit_origin(full_hash);
 
@@ -89,6 +89,15 @@ CREATE TABLE restore_declined (
 );
 ```
 
+> **`last_edit_at` は「編集」でしか進まない** (A1 実装時に確定、2026-08-21)。mIV の編集は
+> 非破壊なのでファイルのバイト列は変わらず、2 回目以降の編集は必ず「再ハッシュ不要」経路を
+> 通る。つまりこの列を維持するのはその経路だけであり、読書位置の記録 (ページ送りごとに発火)
+> を同じ経路に流すと**読んだだけで `last_edit_at` が進む**。それでは §5 の「別々に編集された
+> 候補のうち新しい方を既定にする」が成り立たず、読んだだけのコピーが既定になって、
+> 実際の編集を持つ側から復元されない。そのため記録は `Edit` / `ViewingState` の 2 種類を持つ:
+> **行の作成は両方が行い、`last_edit_at` を進めるのは `Edit` だけ**。`ViewingState` だけで
+> 作られた行は `last_edit_at = 0` (= 未編集) になり、A3 の既定選択では最後に回る。
+>
 > **`file_key` は path キーなので、[rename_key_migration.rs](../src/rename_key_migration.rs) の
 > `STORES` 表へ必ず追加すること。** この表はリネーム移行と削除 worker の hard purge が
 > 共有する正本で、追加を忘れるとアプリ内リネーム後に台帳だけ旧パスを指す。

@@ -317,6 +317,35 @@ impl App {
                 ),
             ],
         );
+        if let Some(deferred) = crate::pdf_loader::take_pool_open_deferred_stats()
+            && !deferred.is_empty()
+        {
+            crate::perf::event(
+                "pdf",
+                "pool_open_deferred",
+                None,
+                0,
+                &[
+                    (
+                        "critical_cap",
+                        serde_json::Value::from(deferred.critical_cap),
+                    ),
+                    (
+                        "high_normal_cap",
+                        serde_json::Value::from(deferred.high_normal_cap),
+                    ),
+                    (
+                        "high_normal_higher_priority_pending",
+                        serde_json::Value::from(deferred.high_normal_higher_priority_pending),
+                    ),
+                    ("normal_cap", serde_json::Value::from(deferred.normal_cap)),
+                    (
+                        "normal_higher_priority_pending",
+                        serde_json::Value::from(deferred.normal_higher_priority_pending),
+                    ),
+                ],
+            );
+        }
     }
 
     /// 旧 `eframe::App::on_exit` の中身。trait impl は 1 つしか書けないので、

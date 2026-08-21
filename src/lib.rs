@@ -37,6 +37,7 @@ pub mod compare_wgpu;
 pub mod conceal;
 pub mod conceal_compose;
 pub mod conceal_db;
+mod content_identity;
 pub mod creative_lut;
 pub mod data_dir;
 #[cfg(windows)]

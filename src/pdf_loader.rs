@@ -218,6 +218,13 @@ pub fn pool_queue_snapshot() -> Option<PoolQueueSnapshot> {
     })
 }
 
+pub(crate) fn take_pool_open_deferred_stats() -> Option<OpenDeferredStats> {
+    let pool = initialized_pool()?;
+    let (mtx, _cv) = &*pool.queue;
+    let mut q = mtx.lock().ok()?;
+    Some(std::mem::take(&mut q.open_deferred_since_snapshot))
+}
+
 /// Critical 用ワーカー予約フラグ。
 ///
 /// 既定で `true` (常時 ON)。グリッド表示中・フルスクリーン中どちらでも Critical は
@@ -389,6 +396,17 @@ fn estimate_tiled_size(sizes: &[(u32, u32)]) -> PdfPageContentType {
         .copied()
         .unwrap_or((0, 0));
     PdfPageContentType::Raster { w, h }
+}
+
+/// Parent-side scheduling identity for one PDF document.
+///
+/// Unlike [PdfDocumentCacheKey], this intentionally omits metadata. The parent uses it only
+/// to decide whether an open admission permit is needed; the worker remains the correctness
+/// authority and continues comparing path, password, mtime, and size.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PdfDocumentIdentity {
+    path: PathBuf,
+    password: Option<Box<str>>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -585,6 +603,7 @@ pub(crate) fn is_password_required_error(error: &std::io::Error) -> bool {
 //     Enumerate (1): [2B path_len][path_utf8][2B pw_len][pw_utf8]
 //     Render    (2): [2B path_len][path_utf8][4B page_num][4B target_px][2B pw_len][pw_utf8]
 //     Shutdown  (3): (no payload)
+//     Open      (7): [2B path_len][path_utf8][2B pw_len][pw_utf8]
 //     DisplayRender (5):
 //       [2B path_len][path_utf8][4B page_num][4B viewport_w][4B viewport_h]
 //       [1B fit_mode][1B swap_page_axes][2B pw_len][pw_utf8]
@@ -607,6 +626,7 @@ const MSG_SHUTDOWN: u8 = 3;
 const MSG_GET_INFO: u8 = 4;
 const MSG_DISPLAY_RENDER: u8 = 5;
 const MSG_ANALYZE_PAGE: u8 = 6;
+const MSG_OPEN: u8 = 7;
 const STATUS_OK: u8 = 0;
 const STATUS_ERR: u8 = 1;
 const RENDER_METRICS_MAGIC: &[u8; 4] = &[0x50, 0x44, 0x4d, 0x31];
@@ -882,6 +902,13 @@ fn encode_analyze_page_request(path: &Path, page_num: u32, password: Option<&str
     buf
 }
 
+fn encode_open_request(path: &Path, password: Option<&str>) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    buf.push(MSG_OPEN);
+    encode_path_and_password(&mut buf, path, password);
+    buf
+}
+
 fn encode_render_request(
     path: &Path,
     page_num: u32,
@@ -1095,6 +1122,10 @@ fn decode_request(data: &[u8]) -> std::io::Result<DecodedRequest> {
                 password,
             })
         }
+        MSG_OPEN => {
+            let (path, password, _) = decode_path_and_password(payload)?;
+            Ok(DecodedRequest::Open { path, password })
+        }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("unknown message type: {msg_type}"),
@@ -1123,7 +1154,28 @@ enum DecodedRequest {
         page_num: u32,
         password: Option<String>,
     },
+    Open {
+        path: PathBuf,
+        password: Option<String>,
+    },
     Shutdown,
+}
+
+fn pdf_document_identity(request: &DecodedRequest) -> Option<PdfDocumentIdentity> {
+    let (path, password) = match request {
+        DecodedRequest::Enumerate { path, password }
+        | DecodedRequest::GetInfo { path, password }
+        | DecodedRequest::Open { path, password } => (path, password),
+        DecodedRequest::Render { path, password, .. }
+        | DecodedRequest::AnalyzePage { path, password, .. } => (path, password),
+        DecodedRequest::Shutdown => return None,
+    };
+    Some(PdfDocumentIdentity {
+        path: path.clone(),
+        password: password
+            .as_deref()
+            .map(|value| value.to_owned().into_boxed_str()),
+    })
 }
 
 // -----------------------------------------------------------------------
@@ -1265,6 +1317,16 @@ pub fn run_worker_process() {
                     }
                 }
             }
+            DecodedRequest::Open { path, password } => {
+                match ipc_open(&mut document_cache, &path, password.as_deref()) {
+                    Ok(resp) => {
+                        let _ = write_msg(&mut stdout, &resp);
+                    }
+                    Err(e) => {
+                        let _ = send_error(&mut stdout, &e.to_string());
+                    }
+                }
+            }
             DecodedRequest::Shutdown => break,
         }
     }
@@ -1275,6 +1337,15 @@ fn send_error(w: &mut impl std::io::Write, msg: &str) -> std::io::Result<()> {
     buf.push(STATUS_ERR);
     buf.extend_from_slice(msg.as_bytes());
     write_msg(w, &buf)
+}
+
+fn ipc_open(
+    cache: &mut PdfDocumentCache<'_>,
+    path: &Path,
+    password: Option<&str>,
+) -> std::io::Result<Vec<u8>> {
+    cache.with_document(path, password, |_document, _key| Ok(()))?;
+    Ok(vec![STATUS_OK])
 }
 
 /// core_enumerate の結果を IPC バイナリにシリアライズする。
@@ -1782,6 +1853,7 @@ fn render_request_collects_metrics(request: &[u8]) -> bool {
 /// ディスパッチャースレッドに渡される 1 件のジョブ。
 struct Job {
     request: Vec<u8>,
+    document_identity: PdfDocumentIdentity,
     cancel: Option<Arc<AtomicBool>>,
     reply: mpsc::Sender<std::io::Result<ProcessResponse>>,
     priority: JobPriority,
@@ -1793,6 +1865,61 @@ struct Job {
     context_epoch: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenAdmissionDeferReason {
+    Cap,
+    HigherPriorityPending,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OpenDeferredStats {
+    pub(crate) critical_cap: u64,
+    pub(crate) high_normal_cap: u64,
+    pub(crate) high_normal_higher_priority_pending: u64,
+    pub(crate) normal_cap: u64,
+    pub(crate) normal_higher_priority_pending: u64,
+}
+
+impl OpenDeferredStats {
+    fn record(&mut self, priority: JobPriority, reason: OpenAdmissionDeferReason) {
+        let counter = match priority {
+            JobPriority::Critical => {
+                debug_assert_eq!(reason, OpenAdmissionDeferReason::Cap);
+                &mut self.critical_cap
+            }
+            JobPriority::HighNormal => match reason {
+                OpenAdmissionDeferReason::Cap => &mut self.high_normal_cap,
+                OpenAdmissionDeferReason::HigherPriorityPending => {
+                    &mut self.high_normal_higher_priority_pending
+                }
+            },
+            JobPriority::Normal => match reason {
+                OpenAdmissionDeferReason::Cap => &mut self.normal_cap,
+                OpenAdmissionDeferReason::HigherPriorityPending => {
+                    &mut self.normal_higher_priority_pending
+                }
+            },
+        };
+        *counter = counter.saturating_add(1);
+    }
+
+    fn add_assign(&mut self, other: Self) {
+        self.critical_cap = self.critical_cap.saturating_add(other.critical_cap);
+        self.high_normal_cap = self.high_normal_cap.saturating_add(other.high_normal_cap);
+        self.high_normal_higher_priority_pending = self
+            .high_normal_higher_priority_pending
+            .saturating_add(other.high_normal_higher_priority_pending);
+        self.normal_cap = self.normal_cap.saturating_add(other.normal_cap);
+        self.normal_higher_priority_pending = self
+            .normal_higher_priority_pending
+            .saturating_add(other.normal_higher_priority_pending);
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
+
 struct JobQueue {
     critical: std::collections::VecDeque<Job>,
     /// 可視セルのサムネ render。Normal より先に pop され、Normal の開始上限を
@@ -1802,6 +1929,12 @@ struct JobQueue {
     /// 現在処理中の HighNormal + Normal ジョブ数。lane ごとの開始判定に使う。
     /// Critical はこのカウントに含めない (= 予約枠を消費しない)。
     normal_in_flight: usize,
+    /// worker_id ごとに親が確認済みの保持文書。正しさ判定ではなく open admission 専用。
+    worker_documents: Vec<Option<PdfDocumentIdentity>>,
+    /// MSG_OPEN を送信済みで、まだ応答を受け取っていない要求数。
+    open_in_flight: usize,
+    /// Open admission で見送った判定を lane/reason 別に 1 秒 tick まで集約する。
+    open_deferred_since_snapshot: OpenDeferredStats,
     /// 現在 IPC 実行中のワーカー数 (perf 用)
     workers_busy: usize,
     /// in-flight metadata: worker_id 別の IPC 開始時刻。`Some(t)` なら IPC 中。
@@ -1819,6 +1952,9 @@ impl JobQueue {
             high_normal: std::collections::VecDeque::new(),
             normal: std::collections::VecDeque::new(),
             normal_in_flight: 0,
+            worker_documents: vec![None; configured_pool_size],
+            open_in_flight: 0,
+            open_deferred_since_snapshot: OpenDeferredStats::default(),
             workers_busy: 0,
             in_flight_started_at: vec![None; configured_pool_size],
             shutdown: false,
@@ -2354,6 +2490,19 @@ impl PdfWorkerPool {
         context_epoch: u64,
         cancel_policy: CancelWaitPolicy,
     ) -> std::io::Result<ProcessResponse> {
+        let decoded = decode_request(request).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid PDF worker request",
+            )
+        })?;
+        let document_identity = pdf_document_identity(&decoded).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "PDF worker request has no document identity",
+            )
+        })?;
+
         if self.worker_count == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -2365,6 +2514,7 @@ impl PdfWorkerPool {
         // perf_key を後段 (cancel 検出時の perf イベント) でも使うので clone
         let job = Job {
             request: request.to_vec(),
+            document_identity,
             cancel: cancel.cloned(),
             reply: reply_tx,
             priority,
@@ -2672,28 +2822,258 @@ fn non_critical_lane_caps(worker_count: usize, critical_reservation: bool) -> No
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OpenAdmissionCaps {
+    /// Maximum number of concurrent document opens across all lanes.
+    total: usize,
+    /// Maximum share available to HighNormal and Normal; the remainder is Critical-only.
+    non_critical: usize,
+}
+
+const OPEN_ADMISSION_CAPS: OpenAdmissionCaps = OpenAdmissionCaps {
+    total: 3,
+    non_critical: 2,
+};
+
+fn open_admission_caps() -> OpenAdmissionCaps {
+    OPEN_ADMISSION_CAPS
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenAdmission {
+    Admit,
+    Defer,
+}
+
+fn decide_open_admission(
+    priority: JobPriority,
+    needs_open: bool,
+    open_in_flight: usize,
+    higher_priority_open_pending: bool,
+    caps: OpenAdmissionCaps,
+) -> OpenAdmission {
+    if !needs_open {
+        return OpenAdmission::Admit;
+    }
+    match priority {
+        JobPriority::Critical if open_in_flight < caps.total => OpenAdmission::Admit,
+        JobPriority::Critical => OpenAdmission::Defer,
+        JobPriority::HighNormal | JobPriority::Normal
+            if open_in_flight < caps.non_critical && !higher_priority_open_pending =>
+        {
+            OpenAdmission::Admit
+        }
+        JobPriority::HighNormal | JobPriority::Normal => OpenAdmission::Defer,
+    }
+}
+
+fn document_needs_open(
+    identity: &PdfDocumentIdentity,
+    worker_document: Option<&PdfDocumentIdentity>,
+) -> bool {
+    worker_document != Some(identity)
+}
+
+fn document_open_pending_on_all_workers(
+    identity: &PdfDocumentIdentity,
+    worker_documents: &[Option<PdfDocumentIdentity>],
+) -> bool {
+    !worker_documents
+        .iter()
+        .flatten()
+        .any(|worker_document| worker_document == identity)
+}
+
+fn higher_priority_open_pending(
+    priority: JobPriority,
+    critical: &std::collections::VecDeque<Job>,
+    high_normal: &std::collections::VecDeque<Job>,
+    worker_documents: &[Option<PdfDocumentIdentity>],
+) -> bool {
+    let lane_has_pending_open = |lane: &std::collections::VecDeque<Job>| {
+        lane.iter().any(|job| {
+            document_open_pending_on_all_workers(&job.document_identity, worker_documents)
+        })
+    };
+    match priority {
+        JobPriority::Critical => false,
+        JobPriority::HighNormal => lane_has_pending_open(critical),
+        JobPriority::Normal => {
+            lane_has_pending_open(critical) || lane_has_pending_open(high_normal)
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WorkerDocumentUpdate {
+    OpenSucceeded(PdfDocumentIdentity),
+    OpenFailed,
+    RequestTransportFailed,
+    RequestStatusError,
+}
+
+fn update_worker_document(
+    current: Option<PdfDocumentIdentity>,
+    update: WorkerDocumentUpdate,
+) -> Option<PdfDocumentIdentity> {
+    match update {
+        WorkerDocumentUpdate::OpenSucceeded(identity) => Some(identity),
+        WorkerDocumentUpdate::OpenFailed | WorkerDocumentUpdate::RequestTransportFailed => None,
+        WorkerDocumentUpdate::RequestStatusError => current,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LaneDispatchCandidate {
+    index: usize,
+    needs_open: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LaneDispatchDecision {
+    candidate: Option<LaneDispatchCandidate>,
+    deferred: OpenDeferredStats,
+}
+
+fn decide_lane_dispatch(
+    jobs: &std::collections::VecDeque<Job>,
+    priority: JobPriority,
+    worker_document: Option<&PdfDocumentIdentity>,
+    open_in_flight: usize,
+    higher_priority_open_pending: bool,
+    caps: OpenAdmissionCaps,
+) -> LaneDispatchDecision {
+    let Some(head) = jobs.front() else {
+        return LaneDispatchDecision::default();
+    };
+    let mut decision = LaneDispatchDecision::default();
+    if decide_open_admission(
+        priority,
+        true,
+        open_in_flight,
+        higher_priority_open_pending,
+        caps,
+    ) == OpenAdmission::Admit
+    {
+        decision.candidate = Some(LaneDispatchCandidate {
+            index: 0,
+            needs_open: document_needs_open(&head.document_identity, worker_document),
+        });
+        return decision;
+    }
+
+    let cap_reached = match priority {
+        JobPriority::Critical => open_in_flight >= caps.total,
+        JobPriority::HighNormal | JobPriority::Normal => open_in_flight >= caps.non_critical,
+    };
+    let reason = if cap_reached {
+        OpenAdmissionDeferReason::Cap
+    } else {
+        OpenAdmissionDeferReason::HigherPriorityPending
+    };
+    decision.deferred.record(priority, reason);
+
+    let Some(worker_document) = worker_document else {
+        return decision;
+    };
+    decision.candidate = jobs
+        .iter()
+        .position(|job| &job.document_identity == worker_document)
+        .map(|index| LaneDispatchCandidate {
+            index,
+            needs_open: false,
+        });
+    decision
+}
+
+struct DispatchJob {
+    job: Job,
+    needs_open: bool,
+    open_in_flight: usize,
+}
+
+fn mark_dispatch_started(q: &mut JobQueue, job: Job, needs_open: bool) -> DispatchJob {
+    if matches!(job.priority, JobPriority::HighNormal | JobPriority::Normal) {
+        q.normal_in_flight += 1;
+    }
+    q.workers_busy = q.workers_busy.saturating_add(1);
+    if needs_open {
+        q.open_in_flight += 1;
+    }
+    DispatchJob {
+        job,
+        needs_open,
+        open_in_flight: q.open_in_flight,
+    }
+}
+
 /// 現在の lane cap で開始可能な次の job を 1 件取り出す。
 /// Critical は従来どおり cap の影響を受けない。
-fn try_pop_dispatch_job(q: &mut JobQueue, caps: NonCriticalLaneCaps) -> Option<Job> {
-    if let Some(job) = q.critical.pop_front() {
-        q.workers_busy = q.workers_busy.saturating_add(1);
-        return Some(job);
+fn try_pop_dispatch_job(
+    q: &mut JobQueue,
+    worker_id: usize,
+    lane_caps: NonCriticalLaneCaps,
+    open_caps: OpenAdmissionCaps,
+) -> Option<DispatchJob> {
+    let worker_document = q.worker_documents.get(worker_id).cloned().flatten();
+
+    let critical_decision = decide_lane_dispatch(
+        &q.critical,
+        JobPriority::Critical,
+        worker_document.as_ref(),
+        q.open_in_flight,
+        false,
+        open_caps,
+    );
+    q.open_deferred_since_snapshot
+        .add_assign(critical_decision.deferred);
+    if let Some(candidate) = critical_decision.candidate {
+        let job = q.critical.remove(candidate.index).unwrap();
+        return Some(mark_dispatch_started(q, job, candidate.needs_open));
     }
 
-    if q.normal_in_flight < caps.high_normal
-        && let Some(job) = q.high_normal.pop_front()
-    {
-        q.normal_in_flight += 1;
-        q.workers_busy = q.workers_busy.saturating_add(1);
-        return Some(job);
+    if q.normal_in_flight < lane_caps.high_normal {
+        let higher_pending = higher_priority_open_pending(
+            JobPriority::HighNormal,
+            &q.critical,
+            &q.high_normal,
+            &q.worker_documents,
+        );
+        let decision = decide_lane_dispatch(
+            &q.high_normal,
+            JobPriority::HighNormal,
+            worker_document.as_ref(),
+            q.open_in_flight,
+            higher_pending,
+            open_caps,
+        );
+        q.open_deferred_since_snapshot.add_assign(decision.deferred);
+        if let Some(candidate) = decision.candidate {
+            let job = q.high_normal.remove(candidate.index).unwrap();
+            return Some(mark_dispatch_started(q, job, candidate.needs_open));
+        }
     }
 
-    if q.normal_in_flight < caps.normal
-        && let Some(job) = q.normal.pop_front()
-    {
-        q.normal_in_flight += 1;
-        q.workers_busy = q.workers_busy.saturating_add(1);
-        return Some(job);
+    if q.normal_in_flight < lane_caps.normal {
+        let higher_pending = higher_priority_open_pending(
+            JobPriority::Normal,
+            &q.critical,
+            &q.high_normal,
+            &q.worker_documents,
+        );
+        let decision = decide_lane_dispatch(
+            &q.normal,
+            JobPriority::Normal,
+            worker_document.as_ref(),
+            q.open_in_flight,
+            higher_pending,
+            open_caps,
+        );
+        q.open_deferred_since_snapshot.add_assign(decision.deferred);
+        if let Some(candidate) = decision.candidate {
+            let job = q.normal.remove(candidate.index).unwrap();
+            return Some(mark_dispatch_started(q, job, candidate.needs_open));
+        }
     }
 
     None
@@ -2736,19 +3116,26 @@ fn run_dispatcher(
                 if q.shutdown {
                     break None;
                 }
-                let caps = non_critical_lane_caps(worker_count, critical_reservation_active());
-                if let Some(job) = try_pop_dispatch_job(&mut q, caps) {
-                    break Some(job);
+                let lane_caps = non_critical_lane_caps(worker_count, critical_reservation_active());
+                if let Some(dispatch) =
+                    try_pop_dispatch_job(&mut q, worker_id, lane_caps, open_admission_caps())
+                {
+                    break Some(dispatch);
                 }
                 // 取れなかった → Condvar で寝る
                 q = cv.wait(q).unwrap();
             }
         };
 
-        let Some(job) = job else {
+        let Some(dispatch) = job else {
             // shutdown
             break;
         };
+        let DispatchJob {
+            job,
+            needs_open,
+            open_in_flight,
+        } = dispatch;
 
         // HighNormal と Normal の両方が非 Critical in-flight 数を消費する
         let counts_against_non_critical_slots =
@@ -2784,8 +3171,16 @@ fn run_dispatcher(
                             "priority",
                             serde_json::Value::from(format!("{:?}", job.priority)),
                         ),
+                        ("needs_open", serde_json::Value::from(needs_open)),
                     ],
                 );
+            }
+            if needs_open {
+                let (mtx, cv) = &*queue;
+                let mut q = mtx.lock().unwrap();
+                debug_assert!(q.open_in_flight > 0);
+                q.open_in_flight = q.open_in_flight.saturating_sub(1);
+                cv.notify_all();
             }
             let msg = if cancelled {
                 "cancelled in queue"
@@ -2812,6 +3207,7 @@ fn run_dispatcher(
                             "priority",
                             serde_json::Value::from(format!("{:?}", job.priority)),
                         ),
+                        ("needs_open", serde_json::Value::from(needs_open)),
                     ],
                 );
             }
@@ -2824,7 +3220,101 @@ fn run_dispatcher(
                     *slot = Some(std::time::Instant::now());
                 }
             }
-            let result = send_recv_io(&mut io, &job.request);
+            let (result, main_request_sent) = if needs_open {
+                let open_started = std::time::Instant::now();
+                let open_request = encode_open_request(
+                    &job.document_identity.path,
+                    job.document_identity.password.as_deref(),
+                );
+                let open_result = send_recv_io(&mut io, &open_request);
+                let open_ms = open_started.elapsed().as_secs_f64() * 1000.0;
+                let open_ok = matches!(
+                    &open_result,
+                    Ok(response) if response.bytes.as_slice() == [STATUS_OK]
+                );
+                {
+                    let (mtx, cv) = &*queue;
+                    let mut q = mtx.lock().unwrap();
+                    let update = if open_ok {
+                        WorkerDocumentUpdate::OpenSucceeded(job.document_identity.clone())
+                    } else {
+                        WorkerDocumentUpdate::OpenFailed
+                    };
+                    if let Some(slot) = q.worker_documents.get_mut(worker_id) {
+                        *slot = update_worker_document(slot.take(), update);
+                    }
+                    debug_assert!(q.open_in_flight > 0);
+                    q.open_in_flight = q.open_in_flight.saturating_sub(1);
+                    cv.notify_all();
+                }
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "pdf",
+                        "pool_open_request",
+                        job.perf_key.as_deref(),
+                        0,
+                        &[
+                            ("open_ms", serde_json::Value::from(open_ms)),
+                            (
+                                "priority",
+                                serde_json::Value::from(format!("{:?}", job.priority)),
+                            ),
+                            ("pid", serde_json::Value::from(pid)),
+                            ("open_in_flight", serde_json::Value::from(open_in_flight)),
+                            ("ok", serde_json::Value::from(open_ok)),
+                        ],
+                    );
+                }
+                if !open_ok {
+                    (open_result, false)
+                } else {
+                    (send_recv_io(&mut io, &job.request), true)
+                }
+            } else {
+                (send_recv_io(&mut io, &job.request), true)
+            };
+            if main_request_sent {
+                let update = match &result {
+                    Err(_) => Some(WorkerDocumentUpdate::RequestTransportFailed),
+                    Ok(response) if response.bytes.first() == Some(&STATUS_ERR) => {
+                        Some(WorkerDocumentUpdate::RequestStatusError)
+                    }
+                    Ok(_) => None,
+                };
+                if let Some(update) = update {
+                    let (mtx, _cv) = &*queue;
+                    let mut q = mtx.lock().unwrap();
+                    if let Some(slot) = q.worker_documents.get_mut(worker_id) {
+                        *slot = update_worker_document(slot.take(), update);
+                    }
+                }
+            }
+            if main_request_sent
+                && crate::perf::is_enabled()
+                && let Ok(response) = &result
+                && let Some(worker) = response.worker_render
+                && !worker.doc_reused
+            {
+                crate::perf::event(
+                    "pdf",
+                    "pool_open_prediction_mismatch",
+                    job.perf_key.as_deref(),
+                    0,
+                    &[
+                        ("pid", serde_json::Value::from(pid)),
+                        (
+                            "priority",
+                            serde_json::Value::from(format!("{:?}", job.priority)),
+                        ),
+                        ("needs_open", serde_json::Value::from(needs_open)),
+                        ("expected_doc_reused", serde_json::Value::from(true)),
+                        (
+                            "worker_doc_reused",
+                            serde_json::Value::from(worker.doc_reused),
+                        ),
+                    ],
+                );
+            }
             // reply 側 (requester) が既に recv_timeout で bail していると送信は失敗するが、
             // 無視してよい (結果は棄却されるだけで副作用なし)
             let _ = job.reply.send(result);
@@ -4343,6 +4833,13 @@ mod tests {
         }
     }
 
+    fn test_document_identity(path: &str, password: Option<&str>) -> PdfDocumentIdentity {
+        PdfDocumentIdentity {
+            path: PathBuf::from(path),
+            password: password.map(|value| value.to_owned().into_boxed_str()),
+        }
+    }
+
     #[test]
     fn document_cache_reuses_only_an_identical_key() {
         let cached = document_cache_key("a.pdf", Some("secret"), 10, 100);
@@ -4362,6 +4859,42 @@ mod tests {
     fn document_cache_does_not_reuse_after_stat_failure() {
         let cached = document_cache_key("deleted.pdf", None, 10, 100);
         assert!(!should_reuse_pdf_document(Some(&cached), None));
+    }
+
+    #[test]
+    fn all_document_requests_decode_to_the_same_scheduling_identity() {
+        let path = Path::new(r"C:\Books\same.pdf");
+        let password = Some("secret");
+        let expected = test_document_identity(r"C:\Books\same.pdf", password);
+        let requests = [
+            encode_enumerate_request(path, password),
+            encode_render_request(path, 3, PdfRenderTarget::LongEdge(800), password, false),
+            encode_get_info_request(path, password),
+            encode_analyze_page_request(path, 3, password),
+        ];
+
+        for request in requests {
+            let decoded = decode_request(&request).unwrap();
+            assert_eq!(pdf_document_identity(&decoded), Some(expected.clone()));
+        }
+    }
+
+    #[test]
+    fn open_request_round_trip_preserves_document_identity() {
+        let path = Path::new(r"C:\Books\open.pdf");
+        let request = encode_open_request(path, Some("secret"));
+        let decoded = decode_request(&request).unwrap();
+
+        assert!(matches!(
+            &decoded,
+            DecodedRequest::Open { path, password }
+                if path == Path::new(r"C:\Books\open.pdf")
+                    && password.as_deref() == Some("secret")
+        ));
+        assert_eq!(
+            pdf_document_identity(&decoded),
+            Some(test_document_identity(r"C:\Books\open.pdf", Some("secret")))
+        );
     }
 
     #[test]
@@ -5026,6 +5559,41 @@ C:\isolated\miv-data"#
         assert!(!message.to_ascii_lowercase().contains("password"));
     }
 
+    #[test]
+    fn execute_rejects_invalid_or_non_document_requests_without_enqueuing() {
+        let queue = Arc::new((Mutex::new(JobQueue::new(1)), Condvar::new()));
+        let pool = PdfWorkerPool {
+            queue: Arc::clone(&queue),
+            worker_count: 0,
+            dispatcher_threads: Mutex::new(Vec::new()),
+            worker_children: Vec::new(),
+        };
+
+        for request in [vec![0xff], encode_shutdown_request()] {
+            let error = pool
+                .execute(
+                    &request,
+                    None,
+                    JobPriority::Critical,
+                    None,
+                    0,
+                    CancelWaitPolicy::AbortOnCancel,
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(!error.to_string().contains("Password"));
+            assert!(!error.to_string().to_ascii_lowercase().contains("password"));
+        }
+
+        let (mtx, _cv) = &*queue;
+        let q = mtx.lock().unwrap();
+        assert!(q.critical.is_empty());
+        assert!(q.high_normal.is_empty());
+        assert!(q.normal.is_empty());
+        assert_eq!(q.workers_busy, 0);
+        assert_eq!(q.open_in_flight, 0);
+    }
+
     // ── Context epoch tests (PdfWorkerPool 内部ロジックのみ、PDFium IPC は使わない) ──
 
     /// JobQueue を直接構築して prune_stale_jobs と pop ロジックを検証する。
@@ -5037,6 +5605,7 @@ C:\isolated\miv-data"#
         let (tx, rx) = mpsc::channel();
         let job = Job {
             request: vec![],
+            document_identity: test_document_identity("test.pdf", None),
             cancel: None,
             reply: tx,
             priority,
@@ -5047,8 +5616,206 @@ C:\isolated\miv-data"#
         (job, rx)
     }
 
+    fn make_test_job_for_document(
+        priority: JobPriority,
+        context_epoch: u64,
+        identity: PdfDocumentIdentity,
+    ) -> (Job, mpsc::Receiver<std::io::Result<ProcessResponse>>) {
+        let (mut job, rx) = make_test_job(priority, context_epoch);
+        job.document_identity = identity;
+        (job, rx)
+    }
+
     fn empty_queue() -> Arc<(Mutex<JobQueue>, Condvar)> {
         Arc::new((Mutex::new(JobQueue::new(DEFAULT_POOL_SIZE)), Condvar::new()))
+    }
+
+    #[test]
+    fn open_admission_rules_are_table_driven() {
+        let caps = open_admission_caps();
+        assert_eq!(
+            caps,
+            OpenAdmissionCaps {
+                total: 3,
+                non_critical: 2,
+            }
+        );
+        let cases = [
+            (JobPriority::Critical, false, 3, false, OpenAdmission::Admit),
+            (JobPriority::Critical, false, 3, true, OpenAdmission::Admit),
+            (
+                JobPriority::HighNormal,
+                false,
+                3,
+                false,
+                OpenAdmission::Admit,
+            ),
+            (
+                JobPriority::HighNormal,
+                false,
+                3,
+                true,
+                OpenAdmission::Admit,
+            ),
+            (JobPriority::Normal, false, 3, false, OpenAdmission::Admit),
+            (JobPriority::Normal, false, 3, true, OpenAdmission::Admit),
+            (JobPriority::Critical, true, 0, false, OpenAdmission::Admit),
+            (JobPriority::Critical, true, 2, false, OpenAdmission::Admit),
+            (JobPriority::Critical, true, 2, true, OpenAdmission::Admit),
+            (JobPriority::Critical, true, 3, false, OpenAdmission::Defer),
+            (JobPriority::Critical, true, 3, true, OpenAdmission::Defer),
+            (
+                JobPriority::HighNormal,
+                true,
+                1,
+                false,
+                OpenAdmission::Admit,
+            ),
+            (
+                JobPriority::HighNormal,
+                true,
+                2,
+                false,
+                OpenAdmission::Defer,
+            ),
+            (JobPriority::HighNormal, true, 2, true, OpenAdmission::Defer),
+            (JobPriority::HighNormal, true, 0, true, OpenAdmission::Defer),
+            (JobPriority::Normal, true, 1, false, OpenAdmission::Admit),
+            (JobPriority::Normal, true, 2, false, OpenAdmission::Defer),
+            (JobPriority::Normal, true, 2, true, OpenAdmission::Defer),
+            (JobPriority::Normal, true, 0, true, OpenAdmission::Defer),
+        ];
+
+        for (priority, needs_open, in_flight, higher_pending, expected) in cases {
+            assert_eq!(
+                decide_open_admission(priority, needs_open, in_flight, higher_pending, caps,),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn higher_priority_open_pending_covers_empty_waiting_and_held_documents() {
+        let mut critical = std::collections::VecDeque::new();
+        let mut high_normal = std::collections::VecDeque::new();
+        let worker_documents = vec![None, None, None];
+        assert!(!higher_priority_open_pending(
+            JobPriority::HighNormal,
+            &critical,
+            &high_normal,
+            &worker_documents,
+        ));
+        assert!(!higher_priority_open_pending(
+            JobPriority::Normal,
+            &critical,
+            &high_normal,
+            &worker_documents,
+        ));
+
+        let identity = test_document_identity("waiting.pdf", None);
+        let (critical_job, _critical_rx) =
+            make_test_job_for_document(JobPriority::Critical, 0, identity.clone());
+        critical.push_back(critical_job);
+        assert!(higher_priority_open_pending(
+            JobPriority::HighNormal,
+            &critical,
+            &high_normal,
+            &worker_documents,
+        ));
+        assert!(higher_priority_open_pending(
+            JobPriority::Normal,
+            &critical,
+            &high_normal,
+            &worker_documents,
+        ));
+
+        let held_documents = vec![None, Some(identity), None];
+        assert!(!higher_priority_open_pending(
+            JobPriority::HighNormal,
+            &critical,
+            &high_normal,
+            &held_documents,
+        ));
+
+        critical.clear();
+        let identity = test_document_identity("visible.pdf", Some("pw"));
+        let (high_job, _high_rx) =
+            make_test_job_for_document(JobPriority::HighNormal, 1, identity.clone());
+        high_normal.push_back(high_job);
+        assert!(higher_priority_open_pending(
+            JobPriority::Normal,
+            &critical,
+            &high_normal,
+            &worker_documents,
+        ));
+        let held_documents = vec![Some(identity), None, None];
+        assert!(!higher_priority_open_pending(
+            JobPriority::Normal,
+            &critical,
+            &high_normal,
+            &held_documents,
+        ));
+    }
+
+    #[test]
+    fn blocked_lane_records_one_defer_per_decision_regardless_of_length() {
+        let mut jobs = std::collections::VecDeque::new();
+        for index in 0..500 {
+            let identity = test_document_identity(&format!("{index}.pdf"), None);
+            let (job, _rx) = make_test_job_for_document(JobPriority::Normal, 1, identity);
+            jobs.push_back(job);
+        }
+
+        let decision = decide_lane_dispatch(
+            &jobs,
+            JobPriority::Normal,
+            None,
+            open_admission_caps().non_critical,
+            false,
+            open_admission_caps(),
+        );
+
+        assert_eq!(decision.candidate, None);
+        assert_eq!(decision.deferred.normal_cap, 1);
+        assert_eq!(
+            decision.deferred,
+            OpenDeferredStats {
+                normal_cap: 1,
+                ..OpenDeferredStats::default()
+            }
+        );
+    }
+
+    #[test]
+    fn worker_document_updates_follow_the_four_state_transition_rules() {
+        let original = test_document_identity("original.pdf", None);
+        let opened = test_document_identity("opened.pdf", Some("pw"));
+        let cases = [
+            (
+                Some(original.clone()),
+                WorkerDocumentUpdate::OpenSucceeded(opened.clone()),
+                Some(opened),
+            ),
+            (
+                Some(original.clone()),
+                WorkerDocumentUpdate::OpenFailed,
+                None,
+            ),
+            (
+                Some(original.clone()),
+                WorkerDocumentUpdate::RequestTransportFailed,
+                None,
+            ),
+            (
+                Some(original.clone()),
+                WorkerDocumentUpdate::RequestStatusError,
+                Some(original),
+            ),
+        ];
+
+        for (current, update, expected) in cases {
+            assert_eq!(update_worker_document(current, update), expected);
+        }
     }
 
     #[test]
@@ -5065,9 +5832,9 @@ C:\isolated\miv-data"#
         q.high_normal.push_back(high);
         q.normal.push_back(normal);
 
-        let popped = try_pop_dispatch_job(&mut q, caps).unwrap();
+        let popped = try_pop_dispatch_job(&mut q, 0, caps, open_admission_caps()).unwrap();
 
-        assert_eq!(popped.priority, JobPriority::HighNormal);
+        assert_eq!(popped.job.priority, JobPriority::HighNormal);
         assert_eq!(q.normal_in_flight, caps.high_normal);
         assert_eq!(q.normal.len(), 1);
     }
@@ -5084,9 +5851,9 @@ C:\isolated\miv-data"#
         q.critical.push_back(critical);
         q.high_normal.push_back(high);
 
-        let popped = try_pop_dispatch_job(&mut q, caps).unwrap();
+        let popped = try_pop_dispatch_job(&mut q, 0, caps, open_admission_caps()).unwrap();
 
-        assert_eq!(popped.priority, JobPriority::Critical);
+        assert_eq!(popped.job.priority, JobPriority::Critical);
         assert_eq!(q.normal_in_flight, caps.high_normal);
         assert_eq!(q.high_normal.len(), 1);
     }
@@ -5102,9 +5869,9 @@ C:\isolated\miv-data"#
         let mut q = mtx.lock().unwrap();
         q.normal.push_back(normal);
 
-        let popped = try_pop_dispatch_job(&mut q, caps).unwrap();
+        let popped = try_pop_dispatch_job(&mut q, 0, caps, open_admission_caps()).unwrap();
 
-        assert_eq!(popped.priority, JobPriority::Normal);
+        assert_eq!(popped.job.priority, JobPriority::Normal);
         assert_eq!(q.normal_in_flight, 1);
     }
 
@@ -5119,9 +5886,9 @@ C:\isolated\miv-data"#
         let mut q = mtx.lock().unwrap();
         q.normal.push_back(normal);
 
-        let popped = try_pop_dispatch_job(&mut q, caps).unwrap();
+        let popped = try_pop_dispatch_job(&mut q, 0, caps, open_admission_caps()).unwrap();
 
-        assert_eq!(popped.priority, JobPriority::Normal);
+        assert_eq!(popped.job.priority, JobPriority::Normal);
         assert_eq!(q.normal_in_flight, 1);
     }
 
@@ -5155,6 +5922,81 @@ C:\isolated\miv-data"#
         let caps = non_critical_lane_caps(5, false);
         assert_eq!(caps.high_normal, 5);
         assert_eq!(caps.normal, 4);
+    }
+
+    #[test]
+    fn dispatcher_reuses_held_document_when_open_cap_is_full() {
+        let lane_caps = non_critical_lane_caps(5, true);
+        let open_caps = open_admission_caps();
+        let identity = test_document_identity("held.pdf", None);
+        let (job, _rx) = make_test_job_for_document(JobPriority::Normal, 1, identity.clone());
+        let mut q = JobQueue::new(5);
+        q.worker_documents[0] = Some(identity);
+        q.open_in_flight = open_caps.total;
+        q.normal.push_back(job);
+
+        let dispatch = try_pop_dispatch_job(&mut q, 0, lane_caps, open_caps).unwrap();
+
+        assert!(!dispatch.needs_open);
+        assert_eq!(q.open_in_flight, open_caps.total);
+    }
+
+    #[test]
+    fn dispatcher_skips_open_blocked_head_for_reusable_job_behind_it() {
+        let lane_caps = non_critical_lane_caps(5, true);
+        let open_caps = open_admission_caps();
+        let blocked = test_document_identity("blocked.pdf", None);
+        let reusable = test_document_identity("reusable.pdf", None);
+        let (blocked_job, _blocked_rx) =
+            make_test_job_for_document(JobPriority::Normal, 1, blocked.clone());
+        let (reusable_job, _reusable_rx) =
+            make_test_job_for_document(JobPriority::Normal, 1, reusable.clone());
+        let mut q = JobQueue::new(5);
+        q.worker_documents[0] = Some(reusable.clone());
+        q.open_in_flight = open_caps.total;
+        q.normal.push_back(blocked_job);
+        q.normal.push_back(reusable_job);
+
+        let dispatch = try_pop_dispatch_job(&mut q, 0, lane_caps, open_caps).unwrap();
+
+        assert_eq!(dispatch.job.document_identity, reusable);
+        assert!(!dispatch.needs_open);
+        assert_eq!(q.normal.len(), 1);
+        assert_eq!(q.normal.front().unwrap().document_identity, blocked);
+        assert_eq!(q.open_deferred_since_snapshot.normal_cap, 1);
+    }
+
+    #[test]
+    fn dispatcher_admits_waiting_open_immediately_after_permit_is_returned() {
+        let lane_caps = non_critical_lane_caps(5, true);
+        let open_caps = open_admission_caps();
+        let identity = test_document_identity("waiting.pdf", None);
+        let (job, _rx) = make_test_job_for_document(JobPriority::Normal, 1, identity);
+        let mut q = JobQueue::new(5);
+        q.open_in_flight = open_caps.non_critical;
+        q.normal.push_back(job);
+
+        assert!(try_pop_dispatch_job(&mut q, 0, lane_caps, open_caps).is_none());
+        q.open_in_flight = q.open_in_flight.saturating_sub(1);
+        let dispatch = try_pop_dispatch_job(&mut q, 0, lane_caps, open_caps).unwrap();
+
+        assert!(dispatch.needs_open);
+        assert_eq!(q.open_in_flight, open_caps.non_critical);
+    }
+
+    #[test]
+    fn open_gate_does_not_bypass_existing_normal_lane_cap() {
+        let lane_caps = non_critical_lane_caps(5, true);
+        let identity = test_document_identity("held.pdf", None);
+        let (job, _rx) = make_test_job_for_document(JobPriority::Normal, 1, identity.clone());
+        let mut q = JobQueue::new(5);
+        q.worker_documents[0] = Some(identity);
+        q.normal_in_flight = lane_caps.normal;
+        q.normal.push_back(job);
+
+        assert!(try_pop_dispatch_job(&mut q, 0, lane_caps, open_admission_caps()).is_none());
+        assert_eq!(q.normal.len(), 1);
+        assert_eq!(q.normal_in_flight, lane_caps.normal);
     }
 
     /// prune_stale_jobs の代替実装 (pool 起動なし、JobQueue 直操作)。
@@ -5397,6 +6239,7 @@ C:\isolated\miv-data"#
         let (tx, rx) = mpsc::channel();
         let job = Job {
             request: vec![],
+            document_identity: test_document_identity("test.pdf", None),
             cancel: None,
             reply: tx,
             priority,
