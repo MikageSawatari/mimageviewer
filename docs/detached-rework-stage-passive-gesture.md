@@ -114,10 +114,16 @@ root 側は `queue_deferred_detached_image_window_event`
   ウィンドウ close、runtime 削除で、その窓のジェスチャを理由付きで捨てる。
   close は runtime と shared view の両方を消す ([ui_fullscreen.rs:11433](../src/ui_fullscreen.rs:11433))。
 - **アクティブ経路と同じ chrome / リモート制御の規則を適用する。**
-  overlay chrome 上で始まった押下はジェスチャを cancel する
-  ([ui_fullscreen.rs:22810](../src/ui_fullscreen.rs:22810))。
+  アクティブ側は overlay chrome 上で始まった押下でジェスチャを cancel する
+  ([ui_fullscreen.rs:22810](../src/ui_fullscreen.rs:22810)、判定は
+  [ui_fullscreen.rs:1690](../src/ui_fullscreen.rs:1690))。
+  **非アクティブ窓の chrome はフルスクリーンの上部バーではなく、その窓自身のバー**
+  (`draw_detached_image_window_bar` [ui_fullscreen.rs:11092](../src/ui_fullscreen.rs:11092)、
+  上端 `TOP_BAR_HEIGHT`。× ボタンを含む) なので、そこで始まった押下は
+  ジェスチャにしない (既存の close 判定と競合させない)。
   リモート制御中は passive のアクティブ化が抑止される
-  ([ui_fullscreen.rs:11911](../src/ui_fullscreen.rs:11911)) ので、同じ抑止をここにも通す。
+  ([ui_fullscreen.rs:11912](../src/ui_fullscreen.rs:11912) の
+  `remote_session_blocks_local_control`) ので、**同じ抑止をジェスチャ経路にも通す**。
 
 ### 3.3 成立したら「アクティブ化 → 実行」を型付きの順序で
 
