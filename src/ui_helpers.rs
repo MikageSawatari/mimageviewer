@@ -20,6 +20,70 @@ pub(crate) const ERROR_TEXT_COLOR: eframe::egui::Color32 =
 /// エラー表示の標準フォントサイズ。
 #[allow(dead_code)]
 pub(crate) const ERROR_TEXT_SIZE: f32 = 13.0;
+const BRUSH_WHEEL_POINT_PER_NOTCH: f32 = 40.0;
+
+fn shift_wheel_notches(events: &[egui::Event]) -> f32 {
+    events
+        .iter()
+        .filter_map(|event| {
+            let egui::Event::MouseWheel {
+                unit,
+                delta,
+                modifiers,
+            } = event
+            else {
+                return None;
+            };
+            if *modifiers != egui::Modifiers::SHIFT {
+                return None;
+            }
+            // Shift による egui の水平スクロール化は raw_scroll_delta へ反映される。
+            // 元イベントは通常 y のままだが、OS が既に水平化する場合もあるため大きい軸を使う。
+            let delta = if delta.y.abs() >= delta.x.abs() {
+                delta.y
+            } else {
+                delta.x
+            };
+            Some(match unit {
+                egui::MouseWheelUnit::Line => delta,
+                egui::MouseWheelUnit::Point => delta / BRUSH_WHEEL_POINT_PER_NOTCH,
+                egui::MouseWheelUnit::Page => delta.signum(),
+            })
+        })
+        .sum()
+}
+
+/// 編集キャンバス上の Shift+ホイールを筆半径へ適用し、適用したときだけ wheel を消費する。
+///
+/// `radius=None` は筆半径を持たないツール、`cursor_on_canvas=false` はパネル上などを表す。
+/// どちらの場合も input state には一切触らず、従来の wheel 経路へ残す。
+pub(crate) fn apply_brush_radius_wheel(
+    ctx: &egui::Context,
+    radius: Option<&mut f32>,
+    min: f32,
+    max: f32,
+    cursor_on_canvas: bool,
+) -> Option<f32> {
+    if !cursor_on_canvas {
+        return None;
+    }
+    let radius = radius?;
+    let notches = ctx.input(|input| shift_wheel_notches(&input.events));
+    if notches.abs() <= f32::EPSILON {
+        return None;
+    }
+
+    *radius = crate::manual_mask_tools::brush_radius_after_wheel(*radius, notches, min, max);
+    let applied = *radius;
+    ctx.input_mut(|input| {
+        input.raw_scroll_delta = egui::Vec2::ZERO;
+        input.smooth_scroll_delta = egui::Vec2::ZERO;
+        input
+            .events
+            .retain(|event| !matches!(event, egui::Event::MouseWheel { .. }));
+    });
+    Some(applied)
+}
 
 /// 3 系統のバケツで共有する範囲選択と、範囲に応じた補助スライダー。
 ///
@@ -1745,6 +1809,83 @@ pub fn draw_centered_elided_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn begin_wheel_pass(ctx: &egui::Context, modifiers: egui::Modifiers) {
+        ctx.begin_pass(egui::RawInput {
+            modifiers,
+            events: vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, 1.0),
+                modifiers,
+            }],
+            ..Default::default()
+        });
+    }
+
+    fn wheel_input_remaining(ctx: &egui::Context) -> bool {
+        ctx.input(|input| {
+            input.raw_scroll_delta != egui::Vec2::ZERO
+                || input.smooth_scroll_delta != egui::Vec2::ZERO
+                || input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::MouseWheel { .. }))
+        })
+    }
+
+    #[test]
+    fn brush_radius_wheel_applies_then_consumes_shift_wheel() {
+        let ctx = egui::Context::default();
+        begin_wheel_pass(&ctx, egui::Modifiers::SHIFT);
+        let mut radius = 3.0;
+        let applied = apply_brush_radius_wheel(&ctx, Some(&mut radius), 1.0, 100.0, true);
+        assert_eq!(applied, Some(4.0));
+        assert_eq!(radius, 4.0);
+        assert!(!wheel_input_remaining(&ctx));
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn brush_radius_wheel_leaves_input_for_non_brush_tools() {
+        let ctx = egui::Context::default();
+        begin_wheel_pass(&ctx, egui::Modifiers::SHIFT);
+        assert_eq!(apply_brush_radius_wheel(&ctx, None, 1.0, 100.0, true), None);
+        assert!(wheel_input_remaining(&ctx));
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn brush_radius_wheel_leaves_input_on_panels() {
+        let ctx = egui::Context::default();
+        begin_wheel_pass(&ctx, egui::Modifiers::SHIFT);
+        let mut radius = 3.0;
+        assert_eq!(
+            apply_brush_radius_wheel(&ctx, Some(&mut radius), 1.0, 100.0, false),
+            None
+        );
+        assert_eq!(radius, 3.0);
+        assert!(wheel_input_remaining(&ctx));
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn brush_radius_wheel_requires_exact_shift_modifier() {
+        for modifiers in [
+            egui::Modifiers::NONE,
+            egui::Modifiers::SHIFT | egui::Modifiers::CTRL,
+        ] {
+            let ctx = egui::Context::default();
+            begin_wheel_pass(&ctx, modifiers);
+            let mut radius = 3.0;
+            assert_eq!(
+                apply_brush_radius_wheel(&ctx, Some(&mut radius), 1.0, 100.0, true),
+                None
+            );
+            assert_eq!(radius, 3.0);
+            assert!(wheel_input_remaining(&ctx));
+            let _ = ctx.end_pass();
+        }
+    }
 
     #[test]
     fn bucket_region_controls_stay_inside_a_200px_visible_ui() {

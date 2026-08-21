@@ -220,6 +220,7 @@ enum BlurMode { AsMask, ExtendByRadius, InsideOnly }     // ぼかし専用
 | `1` / `2` / `3` / `4` | パラメータプリセット 1〜4 を適用 |
 | `T` | 隠蔽タイプを順次切替 (Mosaic → WhiteFill → BlackFill → Blur → Mosaic …) |
 | Ctrl+wheel | (Mosaic 時) タイル倍率 ±0.25x / (Blur 時) ぼかし半径 ±5px / (Fill 時) 不透明度 ±5% |
+| Shift+wheel | 筆選択中かつキャンバス上で筆半径を比例変更 (1 ノッチ約 1.1 倍、最低 1px)。パネル上と筆以外では消費しない |
 | `Ctrl+Z` / `Ctrl+Y` / `Ctrl+Shift+Z` | Undo / Redo (マスク編集のみ) |
 | 矢印 / Ctrl+矢印 | マスク平行移動 (1px / 10px、消しゴムと同じ) |
 | `[` / `]` / Ctrl+`[` / Ctrl+`]` | マスク回転 ±0.1° / ±1° (消しゴムと同じ) |
@@ -333,6 +334,10 @@ enum BlurMode { AsMask, ExtendByRadius, InsideOnly }     // ぼかし専用
 | 横線 | H | `Shape::Line { kind: Horiz, .. }`、生成時に横に拘束 | `Shape` vec |
 | 矩形 | R | `Shape::Rect { center, half_w, half_h, rotation_rad }`、corner→corner ドラッグで作成 | `Shape` vec |
 | 楕円 | O | `Shape::Ellipse { center, rx, ry, rotation_rad }`、内接 bbox ドラッグで作成 | `Shape` vec |
+
+筆の半径はパネルスライダーに加え、筆選択中のキャンバス上で Shift+ホイールにより変更できる。
+消しゴム / 隠蔽加工 / 補正レイヤーで同じ比例刻みを使い、各スライダー範囲へクランプする。
+筆以外のツールやパネル上ではホイールを消費せず、既存のズーム / スクロールへ残す。
 
 バケツの「塗る範囲」は **全体 / 隣接のみ / 長方形 / 楕円 / 円** の排他 5 択。
 長方形 / 楕円 / 円は、漏れ止めを含む「隣接のみ」と同じ領域を求める。前景の 4 近傍に対応して

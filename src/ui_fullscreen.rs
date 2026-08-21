@@ -2904,6 +2904,43 @@ fn fullscreen_cursor_in_panel_for_wheel(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditBrushRadiusOwner {
+    Conceal,
+    Erase,
+    LocalAdjustment,
+}
+
+#[derive(Clone, Copy)]
+struct EditBrushRadiusContext {
+    canvas_available: bool,
+    conceal_tool: Option<crate::conceal::ConcealTool>,
+    erase_tool: Option<crate::app::EraseTool>,
+    local_adjust_tool: Option<crate::app::LocalAdjustMaskTool>,
+}
+
+fn edit_brush_radius_owner(context: EditBrushRadiusContext) -> Option<EditBrushRadiusOwner> {
+    if !context.canvas_available {
+        return None;
+    }
+    if context.conceal_tool == Some(crate::conceal::ConcealTool::Brush) {
+        Some(EditBrushRadiusOwner::Conceal)
+    } else if context.erase_tool == Some(crate::app::EraseTool::Brush) {
+        Some(EditBrushRadiusOwner::Erase)
+    } else if matches!(
+        context.local_adjust_tool,
+        Some(
+            crate::app::LocalAdjustMaskTool::Brush
+                | crate::app::LocalAdjustMaskTool::EdgeBrush
+                | crate::app::LocalAdjustMaskTool::GapFillBrush
+        )
+    ) {
+        Some(EditBrushRadiusOwner::LocalAdjustment)
+    } else {
+        None
+    }
+}
+
 fn fullscreen_click_nav_delta_for_side(left: bool, rtl: bool) -> i32 {
     let ltr_base = if left { -1 } else { 1 };
     if rtl { -ltr_base } else { ltr_base }
@@ -21412,6 +21449,68 @@ impl App {
         }
     }
 
+    fn handle_edit_brush_radius_wheel(
+        &mut self,
+        ctx: &egui::Context,
+        canvas_available: bool,
+    ) -> bool {
+        let owner = edit_brush_radius_owner(EditBrushRadiusContext {
+            canvas_available,
+            conceal_tool: self.conceal_mode.then_some(self.conceal_tool),
+            erase_tool: self.erase_mode.then_some(self.erase_tool),
+            local_adjust_tool: self
+                .local_adjust_mode
+                .then_some(self.local_adjust_mask_tool),
+        });
+        let Some(owner) = owner else {
+            return false;
+        };
+
+        let applied = match owner {
+            EditBrushRadiusOwner::Conceal => {
+                let max = (self.conceal_mask_size[0].max(self.conceal_mask_size[1]) as f32 / 5.0)
+                    .max(1.0);
+                crate::ui_helpers::apply_brush_radius_wheel(
+                    ctx,
+                    Some(&mut self.settings.conceal_brush_radius),
+                    1.0,
+                    max,
+                    true,
+                )
+            }
+            EditBrushRadiusOwner::Erase => {
+                let max =
+                    (self.erase_mask_size[0].max(self.erase_mask_size[1]) as f32 / 20.0).max(1.0);
+                crate::ui_helpers::apply_brush_radius_wheel(
+                    ctx,
+                    Some(&mut self.erase_brush_radius),
+                    1.0,
+                    max,
+                    true,
+                )
+            }
+            EditBrushRadiusOwner::LocalAdjustment => crate::ui_helpers::apply_brush_radius_wheel(
+                ctx,
+                Some(&mut self.local_adjust_mask_brush_radius),
+                1.0,
+                160.0,
+                true,
+            ),
+        };
+        let Some(radius) = applied else {
+            return false;
+        };
+
+        let value = if (radius - radius.round()).abs() < 0.05 {
+            format!("{radius:.0}")
+        } else {
+            format!("{radius:.1}")
+        };
+        self.show_feedback_toast(format!("筆の半径: {value}px"));
+        ctx.request_repaint();
+        true
+    }
+
     fn handle_fs_wheel_and_click(
         &mut self,
         ui: &mut egui::Ui,
@@ -21925,6 +22024,27 @@ impl App {
                     touch_chrome_latched,
                 })
         });
+        // 編集モード限定の固定入力。既存の panel 判定と top bar の表示矩形をそのまま使い、
+        // キャンバス上の筆系ツールだけで「判定 → 半径へ適用 → wheel 消費」を完結させる。
+        // 筆以外、各パネル上、popup / modal 中は input に触れず、下流の従来経路へ残す。
+        let edit_popup_open = self.spread_popup_open
+            || self.fit_popup_open
+            || self.slideshow_popup_open
+            || fs_rotation_popup_open(ctx)
+            || self.fs_overflow_panel_state.is_open();
+        let cursor_on_edit_canvas = !state.is_video
+            && !is_spread_double
+            && !modal_input_blocked
+            && !edit_popup_open
+            && self.fs_context_menu_idx.is_none()
+            && ctx.input(|input| {
+                input.pointer.hover_pos().is_some_and(|pos| {
+                    full_rect.contains(pos)
+                        && !cursor_in_panel
+                        && !(top_bar_visible && fullscreen_top_bar_rect(full_rect).contains(pos))
+                })
+            });
+        self.handle_edit_brush_radius_wheel(ctx, cursor_on_edit_canvas);
         let touch_input_enabled = still_touch_input_enabled(StillTouchInputEnabledInputs {
             is_video: state.is_video,
             is_music_view: music_view_active,
@@ -34626,6 +34746,83 @@ mod tests {
     use crate::grid_item::GridItem;
     use crate::ring_shortcut::{RightDragContext, ViewerShortRightClickAction};
     use std::path::PathBuf;
+
+    #[test]
+    fn edit_brush_wheel_owner_covers_all_radius_bearing_brushes() {
+        assert_eq!(
+            edit_brush_radius_owner(EditBrushRadiusContext {
+                canvas_available: true,
+                conceal_tool: Some(crate::conceal::ConcealTool::Brush),
+                erase_tool: None,
+                local_adjust_tool: None,
+            }),
+            Some(EditBrushRadiusOwner::Conceal)
+        );
+        assert_eq!(
+            edit_brush_radius_owner(EditBrushRadiusContext {
+                canvas_available: true,
+                conceal_tool: None,
+                erase_tool: Some(crate::app::EraseTool::Brush),
+                local_adjust_tool: None,
+            }),
+            Some(EditBrushRadiusOwner::Erase)
+        );
+        for tool in [
+            crate::app::LocalAdjustMaskTool::Brush,
+            crate::app::LocalAdjustMaskTool::EdgeBrush,
+            crate::app::LocalAdjustMaskTool::GapFillBrush,
+        ] {
+            assert_eq!(
+                edit_brush_radius_owner(EditBrushRadiusContext {
+                    canvas_available: true,
+                    conceal_tool: None,
+                    erase_tool: None,
+                    local_adjust_tool: Some(tool),
+                }),
+                Some(EditBrushRadiusOwner::LocalAdjustment)
+            );
+        }
+    }
+
+    #[test]
+    fn edit_brush_wheel_owner_rejects_non_brush_tools_and_non_canvas_pointer() {
+        assert_eq!(
+            edit_brush_radius_owner(EditBrushRadiusContext {
+                canvas_available: true,
+                conceal_tool: Some(crate::conceal::ConcealTool::Bucket),
+                erase_tool: None,
+                local_adjust_tool: None,
+            }),
+            None
+        );
+        assert_eq!(
+            edit_brush_radius_owner(EditBrushRadiusContext {
+                canvas_available: true,
+                conceal_tool: None,
+                erase_tool: Some(crate::app::EraseTool::Lasso),
+                local_adjust_tool: None,
+            }),
+            None
+        );
+        assert_eq!(
+            edit_brush_radius_owner(EditBrushRadiusContext {
+                canvas_available: true,
+                conceal_tool: None,
+                erase_tool: None,
+                local_adjust_tool: Some(crate::app::LocalAdjustMaskTool::Line),
+            }),
+            None
+        );
+        assert_eq!(
+            edit_brush_radius_owner(EditBrushRadiusContext {
+                canvas_available: false,
+                conceal_tool: Some(crate::conceal::ConcealTool::Brush),
+                erase_tool: None,
+                local_adjust_tool: None,
+            }),
+            None
+        );
+    }
 
     fn page_wait_navigation_sequence(
         opened_at: std::time::Instant,
