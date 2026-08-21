@@ -345,6 +345,12 @@ impl App {
             writes.push((change.path_key.clone(), target, meta));
         }
         self.write_user_ratings_shared(&writes)?;
+        for change in changes {
+            self.record_content_identity_for_path(
+                &change.source_path,
+                crate::content_identity::ContentIdentityTrigger::Edit,
+            );
+        }
 
         self.invalidate_rating_counts_cache();
         for change in changes {

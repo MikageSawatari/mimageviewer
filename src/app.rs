@@ -9683,6 +9683,9 @@ pub struct App {
     pub(crate) view_trim_save_pending: bool,
     /// 表示トリム DB ハンドル。本ごとの適用モード / 本全体設定とページ個別設定を保存する。
     pub(crate) view_trim_db: Option<crate::view_trim_db::ViewTrimDb>,
+    /// 編集・表示状態・★・タグの commit 後に、対象の物理ファイルを ledger worker へ渡す。
+    /// この handle 自体は I/O を行わず、全ファイル読み出しは worker 側に閉じる。
+    pub(crate) content_identity_recorder: Option<crate::content_identity::ContentIdentityRecorder>,
     /// 表示パイプライン入力の世代番号。
     ///
     /// raw decode / AI / 補正など、消しゴム確定結果の入力になるレイヤが変わるたび
@@ -12912,6 +12915,8 @@ impl App {
         let t = std::time::Instant::now();
         let view_trim_db = crate::view_trim_db::ViewTrimDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_view_trim", 0, t);
+        // DB open / schema 作成も含めて worker 内で行う。ここでは thread spawn のみ。
+        let content_identity_recorder = crate::content_identity::ContentIdentityRecorder::spawn();
 
         let t = std::time::Instant::now();
         let book_resume_db = crate::book_resume_db::BookResumeDb::open().ok();
@@ -13203,6 +13208,7 @@ impl App {
             view_trim_dirty_page_overrides: std::collections::HashSet::new(),
             view_trim_save_pending: false,
             view_trim_db,
+            content_identity_recorder,
             input_generation: std::collections::HashMap::new(),
             fs_pending: ItemsGenerationMap::with_discard("fs_pending", cancel_fs_pending_value),
             fullscreen_pdf_promotion: FullscreenPdfPromotionState::default(),
@@ -18001,6 +18007,10 @@ impl App {
         };
         if let Err(err) = db.set_book_state(&key, state) {
             crate::logger::log(format!("view_trim: failed to save book state: {err}"));
+        } else {
+            self.record_current_container_content_identity(
+                crate::content_identity::ContentIdentityTrigger::Edit,
+            );
         }
     }
 
@@ -18016,6 +18026,11 @@ impl App {
             crate::logger::log(format!(
                 "view_trim: failed to save page override idx={idx}: {err}"
             ));
+        } else {
+            self.record_content_identity_for_idx(
+                idx,
+                crate::content_identity::ContentIdentityTrigger::Edit,
+            );
         }
         self.invalidate_smart_folder_resort_metadata();
     }
@@ -18028,6 +18043,11 @@ impl App {
             crate::logger::log(format!(
                 "view_trim: failed to remove page override idx={idx}: {err}"
             ));
+        } else {
+            self.record_content_identity_for_idx(
+                idx,
+                crate::content_identity::ContentIdentityTrigger::Edit,
+            );
         }
         self.invalidate_smart_folder_resort_metadata();
     }
@@ -25493,6 +25513,16 @@ impl App {
                 self.invalidate_smart_folder_resort_metadata();
                 self.folder_thumb_pin_dirty = true;
                 crate::logger::log(format!("folder_thumb_pin set: {}", container.display()));
+                if self.zip_nav.is_some() {
+                    self.record_current_container_content_identity(
+                        crate::content_identity::ContentIdentityTrigger::Edit,
+                    );
+                } else {
+                    self.record_content_identity_for_path(
+                        container,
+                        crate::content_identity::ContentIdentityTrigger::Edit,
+                    );
+                }
                 true
             }
             Err(e) => {
@@ -25515,6 +25545,16 @@ impl App {
                 self.invalidate_smart_folder_resort_metadata();
                 self.folder_thumb_pin_dirty = true;
                 crate::logger::log(format!("folder_thumb_pin removed: {}", container.display()));
+                if self.zip_nav.is_some() {
+                    self.record_current_container_content_identity(
+                        crate::content_identity::ContentIdentityTrigger::Edit,
+                    );
+                } else {
+                    self.record_content_identity_for_path(
+                        container,
+                        crate::content_identity::ContentIdentityTrigger::Edit,
+                    );
+                }
                 true
             }
             Err(e) => {
@@ -36441,6 +36481,9 @@ impl App {
         // 書き込みは background writer へ逃がす (ページ送り毎の UI スレッド同期 I/O 回避)。
         if let Some(writer) = &self.book_resume_writer {
             writer.record(&folder, idx);
+            self.record_current_container_content_identity(
+                crate::content_identity::ContentIdentityTrigger::ViewingState,
+            );
         }
         self.last_book_resume = Some((folder, idx));
     }
@@ -47321,6 +47364,10 @@ impl App {
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
         );
+        self.record_content_identity_for_idx(
+            idx,
+            crate::content_identity::ContentIdentityTrigger::Edit,
+        );
     }
 
     // ── レーティング ───────────────────────────────────────────────
@@ -47732,6 +47779,10 @@ impl App {
                 });
             }
         }
+        self.record_content_identity_for_idx(
+            idx,
+            crate::content_identity::ContentIdentityTrigger::Edit,
+        );
         Ok(true)
     }
 
@@ -48516,7 +48567,7 @@ impl App {
         stars: u8,
         capture_undo: bool,
     ) -> Result<bool, String> {
-        let Some((key, _, meta)) = self.current_container_rating_target() else {
+        let Some((key, source, meta)) = self.current_container_rating_target() else {
             return Ok(false);
         };
         let stars = stars.min(5);
@@ -48552,6 +48603,10 @@ impl App {
             );
         }
         self.rebuild_visible_indices();
+        self.record_content_identity_for_path(
+            &source,
+            crate::content_identity::ContentIdentityTrigger::Edit,
+        );
         Ok(true)
     }
 
@@ -52987,6 +53042,71 @@ impl App {
 
     // ── 画像補正 ──────────────────────────────────────────────────
 
+    pub(crate) fn content_identity_source_for_idx(
+        &self,
+        idx: usize,
+    ) -> Option<crate::content_identity::ContentIdentitySource> {
+        crate::content_identity::ContentIdentitySource::for_grid_item(
+            self.items.get(idx)?,
+            self.archive_source_override.as_deref(),
+            self.current_folder.as_deref(),
+        )
+    }
+
+    pub(crate) fn record_content_identity_source(
+        &self,
+        source: crate::content_identity::ContentIdentitySource,
+        trigger: crate::content_identity::ContentIdentityTrigger,
+    ) {
+        if let Some(recorder) = self.content_identity_recorder.as_ref() {
+            recorder.record(source, trigger);
+        }
+    }
+
+    pub(crate) fn record_content_identity_for_idx(
+        &self,
+        idx: usize,
+        trigger: crate::content_identity::ContentIdentityTrigger,
+    ) {
+        // 製本ページは生成物であり、ユーザーが移動する元コンテンツではない。
+        if self.idx_is_compiled_book_page(idx) {
+            return;
+        }
+        if let Some(source) = self.content_identity_source_for_idx(idx) {
+            self.record_content_identity_source(source, trigger);
+        }
+    }
+
+    pub(crate) fn record_content_identity_for_path(
+        &self,
+        path: &std::path::Path,
+        trigger: crate::content_identity::ContentIdentityTrigger,
+    ) {
+        if let Some(source) = crate::content_identity::ContentIdentitySource::from_path(path) {
+            self.record_content_identity_source(source, trigger);
+        }
+    }
+
+    pub(crate) fn record_current_container_content_identity(
+        &self,
+        trigger: crate::content_identity::ContentIdentityTrigger,
+    ) {
+        let path = if let Some(nav) = self.zip_nav.as_ref() {
+            zip_pin_root_path(
+                &nav.tree.zip_path,
+                self.archive_source_override.as_deref(),
+                self.current_folder.as_deref(),
+            )
+        } else if let Some(source) = self.archive_source_override.as_deref() {
+            source
+        } else if let Some(folder) = self.current_folder.as_deref() {
+            folder
+        } else {
+            return;
+        };
+        self.record_content_identity_for_path(path, trigger);
+    }
+
     /// ページの正規化キーを返す（DB 保存用）。
     pub(crate) fn page_path_key(&self, idx: usize) -> Option<String> {
         crate::edit_source::page_key_for_grid_item(self.items.get(idx)?)
@@ -53587,6 +53707,10 @@ impl App {
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
         );
+        self.record_content_identity_for_idx(
+            idx,
+            crate::content_identity::ContentIdentityTrigger::Edit,
+        );
     }
 
     /// マスクを DB から削除し、サイドカーからも削除する。「マスク全削除」ボタン用。
@@ -53605,6 +53729,10 @@ impl App {
         self.with_sidecar_mut(idx, |sc, rel| sc.remove_mask(rel));
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
+        );
+        self.record_content_identity_for_idx(
+            idx,
+            crate::content_identity::ContentIdentityTrigger::Edit,
         );
     }
 
@@ -53668,6 +53796,10 @@ impl App {
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
         );
+        self.record_content_identity_for_idx(
+            idx,
+            crate::content_identity::ContentIdentityTrigger::Edit,
+        );
     }
 
     /// 隠蔽加工マスクを DB + サイドカーから削除する。「マスク全削除」ボタン用 +
@@ -53687,6 +53819,10 @@ impl App {
         self.with_sidecar_mut(idx, |sc, rel| sc.remove_conceal(rel));
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
+        );
+        self.record_content_identity_for_idx(
+            idx,
+            crate::content_identity::ContentIdentityTrigger::Edit,
         );
     }
 
@@ -53723,6 +53859,10 @@ impl App {
         self.set_local_adjust_layers_for_idx_memory_only(idx, layers);
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
+        );
+        self.record_content_identity_for_idx(
+            idx,
+            crate::content_identity::ContentIdentityTrigger::Edit,
         );
     }
 
@@ -53844,6 +53984,10 @@ impl App {
         // overlay のみ。実切り出しは save 時)。よって edit_result / final AI キャッシュは
         // 無効化しない。無効化すると crop ドラッグのたびに AI アップスケールを無駄に
         // 再実行 / キャンセルしてしまう (Codex P2)。
+        self.record_content_identity_for_idx(
+            idx,
+            crate::content_identity::ContentIdentityTrigger::Edit,
+        );
     }
 
     pub(crate) fn set_export_crop_for_idx_memory_only(
@@ -58203,6 +58347,10 @@ impl App {
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
         );
+        self.record_content_identity_for_idx(
+            idx,
+            crate::content_identity::ContentIdentityTrigger::Edit,
+        );
     }
 
     /// この画像 (idx) に表示すべき注釈があるかの早期ゲート。下地 (final composite) に
@@ -60253,6 +60401,12 @@ impl App {
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
         );
+        if let Some(idx) = target.idx_hint {
+            self.record_content_identity_for_idx(
+                idx,
+                crate::content_identity::ContentIdentityTrigger::Edit,
+            );
+        }
         db_result
     }
 
@@ -60321,6 +60475,12 @@ impl App {
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
         );
+        if let Some(idx) = target.idx_hint {
+            self.record_content_identity_for_idx(
+                idx,
+                crate::content_identity::ContentIdentityTrigger::Edit,
+            );
+        }
         db_result
     }
 

@@ -637,6 +637,7 @@ impl App {
         // 次フレームの `cell_tag_list` が正しい値を拾えるため add/remove 対称になる。
         let mut cache_updates: Vec<(PathBuf, Vec<String>)> = Vec::new();
         let mut sidecar_updates: Vec<(TagSidecarTarget, Vec<String>)> = Vec::new();
+        let mut identity_sources: Vec<PathBuf> = Vec::new();
         // pending_tag_undos に積み上げる: (tx_id, TagChange or failure marker)。
         // tx_id == 0 は「Undo 確定不要」(Undo/Redo 由来の SetTags 等) なのでスキップ。
         let mut pending_updates: Vec<PendingUpdate> = Vec::new();
@@ -645,6 +646,7 @@ impl App {
                 let path_disp = res.path.display().to_string();
                 match res.result {
                     Ok(action) => {
+                        let changed = !matches!(action, TagAction::NoOp);
                         match action {
                             TagAction::Added => {
                                 added += 1;
@@ -688,6 +690,9 @@ impl App {
                         if let Some(target) = res.tag_sidecar.clone() {
                             sidecar_updates.push((target, res.tags_after.clone()));
                         }
+                        if changed {
+                            identity_sources.push(res.path.clone());
+                        }
                         cache_updates.push((res.path, res.tags_after));
                     }
                     Err(e) => {
@@ -707,6 +712,12 @@ impl App {
             if !h.is_busy() && h.total.load(std::sync::atomic::Ordering::Relaxed) > 0 {
                 just_completed = true;
             }
+        }
+        for path in identity_sources {
+            self.record_content_identity_for_path(
+                &path,
+                crate::content_identity::ContentIdentityTrigger::Edit,
+            );
         }
         // 成功分は即座に tags_cache へ反映 (just_completed を待たず)。
         // これで bulk トグルの途中フレームでも、処理済みのセルからバッジが更新されていく。

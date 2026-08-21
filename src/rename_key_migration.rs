@@ -294,6 +294,13 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         StoreKeyNormalization::KeepDrive,
     ),
     store(
+        "content_identity.db",
+        "edit_origin",
+        "file_key",
+        true,
+        StoreKeyNormalization::KeepDrive,
+    ),
+    store(
         "adjustment.db",
         "page_params",
         "page_path",
@@ -1476,6 +1483,27 @@ mod tests {
             .unwrap();
         }
         {
+            let conn = open(dir.path(), "content_identity.db");
+            conn.execute_batch(
+                "CREATE TABLE edit_origin (
+                    file_key TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    head_hash TEXT NOT NULL,
+                    full_hash TEXT,
+                    hashed_mtime INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    last_edit_at INTEGER NOT NULL)",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO edit_origin
+                    (file_key, size, head_hash, full_hash, hashed_mtime, kind, last_edit_at)
+                 VALUES (?1, 10, 'head', 'full', 20, 'image', 30)",
+                [&old_k],
+            )
+            .unwrap();
+        }
+        {
             let conn = open(dir.path(), "tags.db");
             conn.execute_batch(
                 "CREATE TABLE item_tags (item_key TEXT NOT NULL, tag TEXT NOT NULL,
@@ -1535,7 +1563,7 @@ mod tests {
 
         let report = run_at(dir.path(), &old, &new);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
-        assert!(report.rows >= 5);
+        assert!(report.rows >= 6);
 
         let conn = open(dir.path(), "rating.db");
         let (stars, rated_at, source_path): (i64, i64, String) = conn
@@ -1547,6 +1575,16 @@ mod tests {
             .unwrap();
         assert_eq!((stars, rated_at), (4, 111), "★と設定時刻が引き継がれる");
         assert_eq!(source_path, new_k, "source_path も新キー由来に更新される");
+
+        let conn = open(dir.path(), "content_identity.db");
+        let (file_key, full_hash): (String, String) = conn
+            .query_row(
+                "SELECT file_key, full_hash FROM edit_origin WHERE file_key = ?1",
+                [&new_k],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((file_key, full_hash), (new_k.clone(), "full".to_string()));
 
         let conn = open(dir.path(), "tags.db");
         let tags: i64 = conn

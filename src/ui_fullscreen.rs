@@ -24643,26 +24643,38 @@ impl App {
     pub(crate) fn persist_current_spread_mode(&self) {
         // ネスト ZIP は本 (zip_path + 階層) ごとに独立記憶。通常は current_folder。
         if let (Some(db), Some(key)) = (&self.spread_db, self.spread_container_key()) {
-            let _ = db.set(
+            if let Err(error) = db.set(
                 &key,
                 self.spread_mode,
                 self.settings.default_spread_mode,
                 self.settings.default_reading_flow,
                 self.settings.default_reading_direction,
-            );
+            ) {
+                crate::logger::log(format!("spread: failed to save mode: {error}"));
+            } else {
+                self.record_current_container_content_identity(
+                    crate::content_identity::ContentIdentityTrigger::Edit,
+                );
+            }
         }
     }
 
     pub(crate) fn persist_current_reading_flow(&self) {
         if let (Some(db), Some(key)) = (&self.spread_db, self.spread_container_key()) {
-            let _ = db.set_flow(
+            if let Err(error) = db.set_flow(
                 &key,
                 self.reading_flow,
                 self.reading_direction,
                 self.settings.default_spread_mode,
                 self.settings.default_reading_flow,
                 self.settings.default_reading_direction,
-            );
+            ) {
+                crate::logger::log(format!("spread: failed to save reading flow: {error}"));
+            } else {
+                self.record_current_container_content_identity(
+                    crate::content_identity::ContentIdentityTrigger::Edit,
+                );
+            }
         }
     }
 
