@@ -18,9 +18,10 @@ use crate::ring_shortcut::{
     GamepadLocationNav, GamepadLocationPickerState, GamepadVideoMarkerPickerState,
     MOUSE_FLICK_MOVE_THRESHOLD_PX, MOUSE_FLICK_NEUTRAL_RADIUS_PX, MOUSE_GESTURE_STEP_THRESHOLD_PX,
     MouseButtonSlot, MouseFlickOutcome, MouseFlickState, MouseGestureDirection, MouseGestureState,
-    PickerListMode, PickerListState, RightDragContext, RightDragMode, RingActionId, RingDirection,
-    RingPickerAnchor, RingPickerOriginalState, RingPickerRatingTarget, RingPickerRowId,
-    RingPickerState, RingShortcutContext, format_mouse_gesture_pattern, mouse_flick_guide_delay,
+    PickerListMode, PickerListState, RightDragCommand, RightDragContext, RightDragMode,
+    RightDragOwner, RightDragRecognition, RingActionId, RingDirection, RingPickerAnchor,
+    RingPickerOriginalState, RingPickerRatingTarget, RingPickerRowId, RingPickerState,
+    RingShortcutContext, format_mouse_gesture_pattern, mouse_flick_guide_delay,
     mouse_flick_menu_delay, mouse_gesture_direction_from_delta,
 };
 use crate::settings::{
@@ -407,7 +408,7 @@ impl App {
         let Some(flick) = self.mouse_ring_flick.as_ref() else {
             return;
         };
-        if flick.context != surface_context {
+        if flick.owner != RightDragOwner::Root || flick.context != surface_context {
             return;
         }
         if !flick.guide_visible() {
@@ -462,7 +463,10 @@ impl App {
         let Some(gesture) = self.mouse_gesture.as_ref() else {
             return;
         };
-        if gesture.context != surface_context || !gesture.guide_visible() {
+        if gesture.owner != RightDragOwner::Root
+            || gesture.context != surface_context
+            || !gesture.guide_visible()
+        {
             return;
         }
         let profile = self
@@ -579,6 +583,7 @@ impl App {
     pub(crate) fn start_mouse_ring_flick(
         &mut self,
         ctx: &egui::Context,
+        owner: RightDragOwner,
         context: RingShortcutContext,
         pos: egui::Pos2,
         grid_target_idx: Option<usize>,
@@ -586,10 +591,10 @@ impl App {
         if !self.settings.ring_shortcuts.mouse_ring_enabled(context) || self.ring_picker.is_some() {
             return;
         }
-        if self.mouse_ring_flick.is_some() {
+        if self.mouse_ring_flick.is_some() || self.mouse_gesture.is_some() {
             return;
         }
-        self.mouse_ring_flick = Some(MouseFlickState::new(context, Instant::now(), pos));
+        self.mouse_ring_flick = Some(MouseFlickState::new(owner, context, Instant::now(), pos));
         self.mouse_ring_grid_target_idx = grid_target_idx;
         self.mouse_ring_suppress_context_menu_once = false;
         self.sync_native_video_ring_guide_overlay_for_context(ctx, context);
@@ -599,12 +604,13 @@ impl App {
     pub(crate) fn update_mouse_ring_flick(
         &mut self,
         ctx: &egui::Context,
+        owner: RightDragOwner,
         context: RingShortcutContext,
     ) -> MouseFlickOutcome {
         let Some(existing) = self.mouse_ring_flick.as_ref() else {
             return MouseFlickOutcome::None;
         };
-        if existing.context != context {
+        if existing.owner != owner || existing.context != context {
             // A per-surface updater must not cancel another surface's live flick. In ON
             // detached mode the root grid pass runs every frame with `context=Grid` while
             // the active detached viewer owns an ImageFullscreen flick. The root App state
@@ -625,55 +631,95 @@ impl App {
                     .unwrap_or(fallback_pos),
             )
         });
-        self.update_mouse_ring_flick_at(
+        let recognition = self.update_mouse_ring_flick_at(
             ctx,
+            owner,
             context,
             pointer_pos,
             secondary_down,
             secondary_released,
-        )
+        );
+        self.dispatch_right_drag_recognition(ctx, owner, recognition)
     }
 
     pub(crate) fn update_native_mouse_ring_flick(
         &mut self,
         ctx: &egui::Context,
+        owner: RightDragOwner,
         context: RingShortcutContext,
         pos: egui::Pos2,
         secondary_down: bool,
         secondary_released: bool,
     ) -> MouseFlickOutcome {
-        self.update_mouse_ring_flick_with_pos(ctx, context, pos, secondary_down, secondary_released)
+        let recognition = self.update_mouse_ring_flick_at(
+            ctx,
+            owner,
+            context,
+            pos,
+            secondary_down,
+            secondary_released,
+        );
+        self.dispatch_right_drag_recognition(ctx, owner, recognition)
     }
 
     pub(crate) fn update_mouse_ring_flick_with_pos(
         &mut self,
         ctx: &egui::Context,
+        owner: RightDragOwner,
         context: RingShortcutContext,
         pos: egui::Pos2,
         secondary_down: bool,
         secondary_released: bool,
     ) -> MouseFlickOutcome {
-        self.update_mouse_ring_flick_at(ctx, context, pos, secondary_down, secondary_released)
+        let recognition = self.update_mouse_ring_flick_at(
+            ctx,
+            owner,
+            context,
+            pos,
+            secondary_down,
+            secondary_released,
+        );
+        self.dispatch_right_drag_recognition(ctx, owner, recognition)
+    }
+
+    pub(crate) fn recognize_mouse_ring_flick_with_pos(
+        &mut self,
+        ctx: &egui::Context,
+        owner: RightDragOwner,
+        context: RingShortcutContext,
+        pos: egui::Pos2,
+        secondary_down: bool,
+        secondary_released: bool,
+    ) -> RightDragRecognition {
+        self.update_mouse_ring_flick_at(
+            ctx,
+            owner,
+            context,
+            pos,
+            secondary_down,
+            secondary_released,
+        )
     }
 
     fn update_mouse_ring_flick_at(
         &mut self,
         ctx: &egui::Context,
+        owner: RightDragOwner,
         context: RingShortcutContext,
         pointer_pos: egui::Pos2,
         secondary_down: bool,
         secondary_released: bool,
-    ) -> MouseFlickOutcome {
+    ) -> RightDragRecognition {
         let (moved, elapsed, armed, direction) = {
             let Some(flick) = self.mouse_ring_flick.as_mut() else {
-                return MouseFlickOutcome::None;
+                return RightDragRecognition::outcome(MouseFlickOutcome::None);
             };
             // The flick belongs to another surface (e.g. the detached viewer's per-frame
             // update runs with `secondary_down=false` while the user is right-dragging the
             // main window's grid). Leave it alone — otherwise the `!secondary_down` branch
             // below would cancel the other window's live flick.
-            if flick.context != context {
-                return MouseFlickOutcome::None;
+            if flick.owner != owner || flick.context != context {
+                return RightDragRecognition::outcome(MouseFlickOutcome::None);
             }
             flick.current_pos = pointer_pos;
             if flick.moved() >= MOUSE_FLICK_MOVE_THRESHOLD_PX {
@@ -695,55 +741,55 @@ impl App {
             if let Some(direction) = direction {
                 self.mouse_ring_grid_target_idx = None;
                 self.mouse_ring_suppress_context_menu_once = true;
-                if let Some(nav) =
-                    self.trigger_ring_shortcut_action(ctx, context, direction, "mouse-flick")
-                {
-                    self.mouse_ring_nav = Some(nav);
-                }
                 request_ring_overlay_repaint(ctx);
-                return MouseFlickOutcome::Fired;
+                return RightDragRecognition::command(self.right_drag_ring_command(
+                    context,
+                    direction,
+                    "mouse-flick",
+                ));
             }
             if moved < MOUSE_FLICK_MOVE_THRESHOLD_PX {
                 self.mouse_ring_suppress_context_menu_once = true;
                 request_ring_overlay_repaint(ctx);
-                return if long_press {
+                return RightDragRecognition::outcome(if long_press {
                     self.mouse_ring_grid_target_idx = None;
                     MouseFlickOutcome::Cancelled
                 } else {
                     MouseFlickOutcome::ShortTap
-                };
+                });
             }
             if ring_visible {
                 self.mouse_ring_grid_target_idx = None;
                 self.mouse_ring_suppress_context_menu_once = true;
                 request_ring_overlay_repaint(ctx);
-                return MouseFlickOutcome::Cancelled;
+                return RightDragRecognition::outcome(MouseFlickOutcome::Cancelled);
             }
             self.mouse_ring_grid_target_idx = None;
             request_ring_overlay_repaint(ctx);
-            return MouseFlickOutcome::None;
+            return RightDragRecognition::outcome(MouseFlickOutcome::None);
         }
 
         if !secondary_down {
             self.cancel_mouse_ring_flick();
             self.clear_native_video_ring_guide_overlay(ctx);
-            return MouseFlickOutcome::None;
+            return RightDragRecognition::outcome(MouseFlickOutcome::None);
         }
 
         if !armed && moved < MOUSE_FLICK_NEUTRAL_RADIUS_PX && elapsed >= mouse_flick_menu_delay() {
             self.sync_native_video_ring_guide_overlay_for_context(ctx, context);
             self.request_mouse_ring_flick_repaint(ctx);
-            return MouseFlickOutcome::None;
+            return RightDragRecognition::outcome(MouseFlickOutcome::None);
         }
 
         self.sync_native_video_ring_guide_overlay_for_context(ctx, context);
         self.request_mouse_ring_flick_repaint(ctx);
-        MouseFlickOutcome::None
+        RightDragRecognition::outcome(MouseFlickOutcome::None)
     }
 
     pub(crate) fn start_mouse_gesture(
         &mut self,
         ctx: &egui::Context,
+        owner: RightDragOwner,
         context: RightDragContext,
         pos: egui::Pos2,
         grid_target_idx: Option<usize>,
@@ -751,10 +797,11 @@ impl App {
         if self.settings.ring_shortcuts.right_drag_mode(context) != RightDragMode::MouseGesture
             || self.ring_picker.is_some()
             || self.mouse_gesture.is_some()
+            || self.mouse_ring_flick.is_some()
         {
             return;
         }
-        self.mouse_gesture = Some(MouseGestureState::new(context, Instant::now(), pos));
+        self.mouse_gesture = Some(MouseGestureState::new(owner, context, Instant::now(), pos));
         self.mouse_gesture_grid_target_idx = grid_target_idx;
         self.mouse_ring_suppress_context_menu_once = false;
         if context == RightDragContext::VideoFullscreen {
@@ -766,12 +813,13 @@ impl App {
     pub(crate) fn update_mouse_gesture(
         &mut self,
         ctx: &egui::Context,
+        owner: RightDragOwner,
         context: RightDragContext,
     ) -> MouseFlickOutcome {
         let Some(existing) = self.mouse_gesture.as_ref() else {
             return MouseFlickOutcome::None;
         };
-        if existing.context != context {
+        if existing.owner != owner || existing.context != context {
             // See `update_mouse_ring_flick`: a root/grid pass is not the owner of a
             // fullscreen or detached gesture, so it must leave the other surface's gesture
             // alive until that surface updates or closes.
@@ -790,6 +838,7 @@ impl App {
         });
         self.update_mouse_gesture_with_pos(
             ctx,
+            owner,
             context,
             pointer_pos,
             secondary_down,
@@ -800,28 +849,58 @@ impl App {
     pub(crate) fn update_native_mouse_gesture(
         &mut self,
         ctx: &egui::Context,
+        owner: RightDragOwner,
         context: RightDragContext,
         pos: egui::Pos2,
         secondary_down: bool,
         secondary_released: bool,
     ) -> MouseFlickOutcome {
-        self.update_mouse_gesture_with_pos(ctx, context, pos, secondary_down, secondary_released)
+        let recognition = self.recognize_mouse_gesture_with_pos(
+            ctx,
+            owner,
+            context,
+            pos,
+            secondary_down,
+            secondary_released,
+        );
+        self.dispatch_right_drag_recognition(ctx, owner, recognition)
     }
 
     pub(crate) fn update_mouse_gesture_with_pos(
         &mut self,
         ctx: &egui::Context,
+        owner: RightDragOwner,
         context: RightDragContext,
         pointer_pos: egui::Pos2,
         secondary_down: bool,
         secondary_released: bool,
     ) -> MouseFlickOutcome {
+        let recognition = self.recognize_mouse_gesture_with_pos(
+            ctx,
+            owner,
+            context,
+            pointer_pos,
+            secondary_down,
+            secondary_released,
+        );
+        self.dispatch_right_drag_recognition(ctx, owner, recognition)
+    }
+
+    pub(crate) fn recognize_mouse_gesture_with_pos(
+        &mut self,
+        ctx: &egui::Context,
+        owner: RightDragOwner,
+        context: RightDragContext,
+        pointer_pos: egui::Pos2,
+        secondary_down: bool,
+        secondary_released: bool,
+    ) -> RightDragRecognition {
         let (moved, elapsed, pattern, armed) = {
             let Some(gesture) = self.mouse_gesture.as_mut() else {
-                return MouseFlickOutcome::None;
+                return RightDragRecognition::outcome(MouseFlickOutcome::None);
             };
-            if gesture.context != context {
-                return MouseFlickOutcome::None;
+            if gesture.owner != owner || gesture.context != context {
+                return RightDragRecognition::outcome(MouseFlickOutcome::None);
             }
             gesture.current_pos = pointer_pos;
             let step_delta = pointer_pos - gesture.last_step_pos;
@@ -852,31 +931,30 @@ impl App {
             if !pattern.is_empty() {
                 self.mouse_gesture_grid_target_idx = None;
                 self.mouse_ring_suppress_context_menu_once = true;
-                if let Some(nav) = self.trigger_mouse_gesture_action(ctx, context, &pattern) {
-                    self.mouse_ring_nav = Some(nav);
-                }
                 request_ring_overlay_repaint(ctx);
-                return MouseFlickOutcome::Fired;
+                return RightDragRecognition::command(
+                    self.right_drag_mouse_gesture_command(context, &pattern),
+                );
             }
             if moved < MOUSE_FLICK_MOVE_THRESHOLD_PX {
                 self.mouse_ring_suppress_context_menu_once = true;
                 request_ring_overlay_repaint(ctx);
-                return if elapsed >= mouse_flick_menu_delay() {
+                return RightDragRecognition::outcome(if elapsed >= mouse_flick_menu_delay() {
                     self.mouse_gesture_grid_target_idx = None;
                     MouseFlickOutcome::Cancelled
                 } else {
                     MouseFlickOutcome::ShortTap
-                };
+                });
             }
             if armed || elapsed >= mouse_flick_menu_delay() {
                 self.mouse_gesture_grid_target_idx = None;
                 self.mouse_ring_suppress_context_menu_once = true;
                 request_ring_overlay_repaint(ctx);
-                return MouseFlickOutcome::Cancelled;
+                return RightDragRecognition::outcome(MouseFlickOutcome::Cancelled);
             }
             self.mouse_gesture_grid_target_idx = None;
             request_ring_overlay_repaint(ctx);
-            return MouseFlickOutcome::None;
+            return RightDragRecognition::outcome(MouseFlickOutcome::None);
         }
 
         if !secondary_down {
@@ -884,18 +962,54 @@ impl App {
             if context == RightDragContext::VideoFullscreen {
                 self.clear_native_video_mouse_gesture_overlay(ctx);
             }
-            return MouseFlickOutcome::None;
+            return RightDragRecognition::outcome(MouseFlickOutcome::None);
         }
         if context == RightDragContext::VideoFullscreen {
             self.sync_native_video_mouse_gesture_overlay(ctx);
         }
         self.request_mouse_gesture_repaint(ctx);
-        MouseFlickOutcome::None
+        RightDragRecognition::outcome(MouseFlickOutcome::None)
     }
 
     pub(crate) fn cancel_mouse_gesture(&mut self) {
         self.mouse_gesture = None;
         self.mouse_gesture_grid_target_idx = None;
+    }
+
+    pub(crate) fn cancel_right_drag_for_owner(&mut self, owner: RightDragOwner) -> bool {
+        let mut cancelled = false;
+        if self
+            .mouse_ring_flick
+            .as_ref()
+            .is_some_and(|flick| flick.owner == owner)
+        {
+            self.mouse_ring_flick = None;
+            self.mouse_ring_grid_target_idx = None;
+            cancelled = true;
+        }
+        if self
+            .mouse_gesture
+            .as_ref()
+            .is_some_and(|gesture| gesture.owner == owner)
+        {
+            self.mouse_gesture = None;
+            self.mouse_gesture_grid_target_idx = None;
+            cancelled = true;
+        }
+        cancelled
+    }
+
+    pub(crate) fn right_drag_pointer_pos(&self, owner: RightDragOwner) -> Option<egui::Pos2> {
+        self.mouse_ring_flick
+            .as_ref()
+            .filter(|flick| flick.owner == owner)
+            .map(|flick| flick.current_pos)
+            .or_else(|| {
+                self.mouse_gesture
+                    .as_ref()
+                    .filter(|gesture| gesture.owner == owner)
+                    .map(|gesture| gesture.current_pos)
+            })
     }
 
     fn request_mouse_gesture_repaint(&self, ctx: &egui::Context) {
@@ -912,54 +1026,157 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn trigger_mouse_gesture_action(
         &mut self,
         ctx: &egui::Context,
         context: RightDragContext,
         pattern: &[MouseGestureDirection],
     ) -> Option<AddressBarNav> {
-        let action_context = context.gesture_action_context();
+        let command = self.right_drag_mouse_gesture_command(context, pattern);
+        self.execute_right_drag_command(ctx, command)
+    }
+
+    fn right_drag_mouse_gesture_command(
+        &self,
+        context: RightDragContext,
+        pattern: &[MouseGestureDirection],
+    ) -> RightDragCommand {
         let action = self
             .settings
             .ring_shortcuts
             .mouse_gesture_profile(context)
             .action_for_pattern(pattern);
-        let pattern_label = format_mouse_gesture_pattern(pattern);
-        // 通知だけの設定。ジェスチャの実行そのものは常に行う (backlog §4.4)。
-        let show_result_toast = self
-            .settings
-            .ring_shortcuts
-            .mouse_gesture_result_toast_visible;
-        if !action.is_valid_for_right_drag_context(context) {
-            crate::logger::log(format!(
-                "mouse gesture ignored invalid action={} context={context:?}",
-                action.as_str()
-            ));
-            return None;
+        RightDragCommand::MouseGesture {
+            context,
+            action,
+            pattern_label: format_mouse_gesture_pattern(pattern),
+            // This setting controls notification only. The command is always executed.
+            show_result_toast: self
+                .settings
+                .ring_shortcuts
+                .mouse_gesture_result_toast_visible,
         }
-        if matches!(action, RingActionId::None) {
-            if show_result_toast {
-                self.show_feedback_toast(format!("[Gesture: {pattern_label} なし]"));
+    }
+
+    fn dispatch_right_drag_recognition(
+        &mut self,
+        ctx: &egui::Context,
+        owner: RightDragOwner,
+        recognition: RightDragRecognition,
+    ) -> MouseFlickOutcome {
+        let outcome = recognition.outcome;
+        if let Some(command) = recognition.command {
+            match owner {
+                RightDragOwner::Root => {
+                    if let Some(nav) = self.execute_right_drag_command(ctx, command) {
+                        self.mouse_ring_nav = Some(nav);
+                    }
+                }
+                RightDragOwner::DetachedWindow(window_id) => {
+                    #[cfg(windows)]
+                    self.queue_recognized_detached_right_drag_command(
+                        window_id,
+                        command,
+                        "passive_right_drag_recognized",
+                    );
+                    #[cfg(not(windows))]
+                    let _ = (window_id, command);
+                }
             }
-            return None;
         }
-        if show_result_toast {
-            self.show_feedback_toast(format!(
-                "[Gesture: {pattern_label} {}]",
-                action.label_for_context(action_context)
-            ));
+        outcome
+    }
+
+    pub(crate) fn execute_right_drag_command(
+        &mut self,
+        ctx: &egui::Context,
+        command: RightDragCommand,
+    ) -> Option<AddressBarNav> {
+        match command {
+            RightDragCommand::RingShortcut {
+                context,
+                action,
+                direction,
+                source,
+            } => {
+                if !action.is_valid_for_context(context) {
+                    crate::logger::log(format!(
+                        "ring shortcut ignored invalid action={} context={context:?}",
+                        action.as_str()
+                    ));
+                    return None;
+                }
+                if matches!(action, RingActionId::None) {
+                    self.show_feedback_toast(format!("[{}: なし]", direction.label()));
+                    return None;
+                }
+                self.apply_ring_action(ctx, context, action, source)
+            }
+            RightDragCommand::MouseGesture {
+                context,
+                action,
+                pattern_label,
+                show_result_toast,
+            } => {
+                let action_context = context.gesture_action_context();
+                if !action.is_valid_for_right_drag_context(context) {
+                    crate::logger::log(format!(
+                        "mouse gesture ignored invalid action={} context={context:?}",
+                        action.as_str()
+                    ));
+                    return None;
+                }
+                if matches!(action, RingActionId::None) {
+                    if show_result_toast {
+                        self.show_feedback_toast(format!("[Gesture: {pattern_label} なし]"));
+                    }
+                    return None;
+                }
+                if show_result_toast {
+                    self.show_feedback_toast(format!(
+                        "[Gesture: {pattern_label} {}]",
+                        action.label_for_context(action_context)
+                    ));
+                }
+                self.apply_ring_action(ctx, action_context, action, "mouse-gesture")
+            }
+            RightDragCommand::ViewerShortRightClick { context, pos } => {
+                let Some(fs_idx) = self.fullscreen_idx else {
+                    crate::logger::log(
+                        "passive right-drag short click dropped: fullscreen_idx_missing",
+                    );
+                    return None;
+                };
+                // Enabled ring/gesture modes preserve the existing configurable short-click
+                // action, but only after the passive window has become active and is mounted.
+                if self.apply_viewer_short_right_click_action(context, Some(fs_idx), pos) {
+                    self.handle_fs_navigation(
+                        ctx,
+                        true,
+                        false,
+                        None,
+                        None,
+                        None,
+                        crate::ui_fullscreen::FsPageNav::None,
+                        None,
+                        fs_idx,
+                    );
+                }
+                None
+            }
         }
-        self.apply_ring_action(ctx, action_context, action, "mouse-gesture")
     }
     pub(crate) fn mouse_ring_context_menu_suppressed(&self, ctx: &egui::Context) -> bool {
         if self.mouse_ring_suppress_context_menu_once {
             return true;
         }
         if let Some(flick) = self.mouse_ring_flick.as_ref() {
-            if !self
-                .settings
-                .ring_shortcuts
-                .mouse_ring_enabled(flick.context)
+            if flick.owner != RightDragOwner::Root
+                || !self
+                    .settings
+                    .ring_shortcuts
+                    .mouse_ring_enabled(flick.context)
             {
                 return false;
             }
@@ -975,11 +1192,12 @@ impl App {
             });
         }
         if let Some(gesture) = self.mouse_gesture.as_ref() {
-            if self
-                .settings
-                .ring_shortcuts
-                .right_drag_mode(gesture.context)
-                != RightDragMode::MouseGesture
+            if gesture.owner != RightDragOwner::Root
+                || self
+                    .settings
+                    .ring_shortcuts
+                    .right_drag_mode(gesture.context)
+                    != RightDragMode::MouseGesture
             {
                 return false;
             }
@@ -3555,7 +3773,10 @@ impl App {
         &self,
     ) -> Option<crate::video::native_presenter::NativeOverlayRingPicker> {
         let gesture = self.mouse_gesture.as_ref()?;
-        if gesture.context != RightDragContext::VideoFullscreen || !gesture.guide_visible() {
+        if gesture.owner != RightDragOwner::Root
+            || gesture.context != RightDragContext::VideoFullscreen
+            || !gesture.guide_visible()
+        {
             return None;
         }
         let profile = self
@@ -3738,7 +3959,10 @@ impl App {
                 return None;
             }
             let flick = self.mouse_ring_flick.as_ref()?;
-            if flick.context != context || !flick.guide_visible() {
+            if flick.owner != RightDragOwner::Root
+                || flick.context != context
+                || !flick.guide_visible()
+            {
                 return None;
             }
             let selected = mouse_flick_direction(flick);
@@ -4193,6 +4417,16 @@ impl App {
         direction: RingDirection,
         source: &'static str,
     ) -> Option<AddressBarNav> {
+        let command = self.right_drag_ring_command(context, direction, source);
+        self.execute_right_drag_command(ctx, command)
+    }
+
+    fn right_drag_ring_command(
+        &self,
+        context: RingShortcutContext,
+        direction: RingDirection,
+        source: &'static str,
+    ) -> RightDragCommand {
         let action = self
             .settings
             .ring_shortcuts
@@ -4201,18 +4435,12 @@ impl App {
             .get(direction.slot_index())
             .cloned()
             .unwrap_or_default();
-        if !action.is_valid_for_context(context) {
-            crate::logger::log(format!(
-                "ring shortcut ignored invalid action={} context={context:?}",
-                action.as_str()
-            ));
-            return None;
+        RightDragCommand::RingShortcut {
+            context,
+            action,
+            direction,
+            source,
         }
-        if matches!(action, RingActionId::None) {
-            self.show_feedback_toast(format!("[{}: なし]", direction.label()));
-            return None;
-        }
-        self.apply_ring_action(ctx, context, action, source)
     }
 
     pub(crate) fn current_ring_shortcut_context(&self) -> RingShortcutContext {
@@ -7402,6 +7630,7 @@ mod tests {
     #[test]
     fn mouse_flick_converts_screen_y_to_ring_direction() {
         let mut flick = MouseFlickState::new(
+            crate::ring_shortcut::RightDragOwner::Root,
             RingShortcutContext::Grid,
             std::time::Instant::now(),
             egui::pos2(100.0, 100.0),
@@ -7422,6 +7651,7 @@ mod tests {
     #[test]
     fn mouse_flick_keeps_center_neutral_after_move_threshold() {
         let mut flick = MouseFlickState::new(
+            crate::ring_shortcut::RightDragOwner::Root,
             RingShortcutContext::ImageFullscreen,
             std::time::Instant::now(),
             egui::pos2(100.0, 100.0),

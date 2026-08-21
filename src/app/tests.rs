@@ -32184,12 +32184,17 @@ mod still_window_mode_key_tests {
         let pos = egui::pos2(24.0, 32.0);
 
         app.mouse_ring_flick = Some(crate::ring_shortcut::MouseFlickState::new(
+            crate::ring_shortcut::RightDragOwner::Root,
             crate::ring_shortcut::RingShortcutContext::ImageFullscreen,
             std::time::Instant::now(),
             pos,
         ));
         assert_eq!(
-            app.update_mouse_ring_flick(&ctx, crate::ring_shortcut::RingShortcutContext::Grid),
+            app.update_mouse_ring_flick(
+                &ctx,
+                crate::ring_shortcut::RightDragOwner::Root,
+                crate::ring_shortcut::RingShortcutContext::Grid,
+            ),
             crate::ring_shortcut::MouseFlickOutcome::None
         );
         assert_eq!(
@@ -32198,12 +32203,17 @@ mod still_window_mode_key_tests {
         );
 
         app.mouse_gesture = Some(crate::ring_shortcut::MouseGestureState::new(
+            crate::ring_shortcut::RightDragOwner::Root,
             crate::ring_shortcut::RightDragContext::ImageFullscreen,
             std::time::Instant::now(),
             pos,
         ));
         assert_eq!(
-            app.update_mouse_gesture(&ctx, crate::ring_shortcut::RightDragContext::Grid),
+            app.update_mouse_gesture(
+                &ctx,
+                crate::ring_shortcut::RightDragOwner::Root,
+                crate::ring_shortcut::RightDragContext::Grid,
+            ),
             crate::ring_shortcut::MouseFlickOutcome::None
         );
         assert_eq!(
@@ -32219,11 +32229,13 @@ mod still_window_mode_key_tests {
         let idx = push_image(&mut app, r"C:\pics\right-drag-cleanup.jpg");
         app.fullscreen_idx = Some(idx);
         app.mouse_ring_flick = Some(crate::ring_shortcut::MouseFlickState::new(
+            crate::ring_shortcut::RightDragOwner::Root,
             crate::ring_shortcut::RingShortcutContext::ImageFullscreen,
             std::time::Instant::now(),
             pos,
         ));
         app.mouse_gesture = Some(crate::ring_shortcut::MouseGestureState::new(
+            crate::ring_shortcut::RightDragOwner::Root,
             crate::ring_shortcut::RightDragContext::ImageFullscreen,
             std::time::Instant::now(),
             pos,
@@ -32235,11 +32247,13 @@ mod still_window_mode_key_tests {
         assert!(app.mouse_gesture.is_none());
 
         app.mouse_ring_flick = Some(crate::ring_shortcut::MouseFlickState::new(
+            crate::ring_shortcut::RightDragOwner::Root,
             crate::ring_shortcut::RingShortcutContext::ImageFullscreen,
             std::time::Instant::now(),
             pos,
         ));
         app.mouse_gesture = Some(crate::ring_shortcut::MouseGestureState::new(
+            crate::ring_shortcut::RightDragOwner::Root,
             crate::ring_shortcut::RightDragContext::ImageFullscreen,
             std::time::Instant::now(),
             pos,
@@ -32249,6 +32263,391 @@ mod still_window_mode_key_tests {
 
         assert!(app.mouse_ring_flick.is_none());
         assert!(app.mouse_gesture.is_none());
+    }
+
+    fn passive_right_drag_input(
+        sequence: u64,
+        secondary_pressed: bool,
+        secondary_down: bool,
+        secondary_released: bool,
+        pos: egui::Pos2,
+    ) -> DetachedRightDragEvent {
+        DetachedRightDragEvent {
+            sequence,
+            kind: DetachedRightDragEventKind::Input {
+                secondary_pressed,
+                secondary_down,
+                secondary_released,
+                pointer_pos: Some(pos),
+            },
+        }
+    }
+
+    fn passive_right_drag_image_bundle(path: &str) -> ViewerContextBundle {
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = vec![GridItem::Image(PathBuf::from(path))];
+        bundle.thumbnails = vec![ThumbnailState::Pending];
+        bundle.image_metas = vec![None];
+        bundle.visible_indices = vec![0];
+        bundle.selected = Some(0);
+        bundle.fullscreen_idx = Some(0);
+        bundle
+    }
+
+    fn passive_rotate_command() -> crate::ring_shortcut::RightDragCommand {
+        crate::ring_shortcut::RightDragCommand::RingShortcut {
+            context: crate::ring_shortcut::RingShortcutContext::ImageFullscreen,
+            action: crate::ring_shortcut::RingActionId::ImageRotateRight,
+            direction: crate::ring_shortcut::RingDirection::Right,
+            source: "passive-right-drag-test",
+        }
+    }
+
+    #[test]
+    fn right_drag_owner_mismatch_preserves_root_and_detached_gestures_both_ways() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let pos = egui::pos2(80.0, 120.0);
+
+        app.mouse_gesture = Some(crate::ring_shortcut::MouseGestureState::new(
+            crate::ring_shortcut::RightDragOwner::DetachedWindow(41),
+            crate::ring_shortcut::RightDragContext::ImageFullscreen,
+            std::time::Instant::now(),
+            pos,
+        ));
+        assert_eq!(
+            app.update_mouse_gesture_with_pos(
+                &ctx,
+                crate::ring_shortcut::RightDragOwner::Root,
+                crate::ring_shortcut::RightDragContext::ImageFullscreen,
+                egui::pos2(180.0, 120.0),
+                false,
+                false,
+            ),
+            crate::ring_shortcut::MouseFlickOutcome::None
+        );
+        assert_eq!(
+            app.mouse_gesture.as_ref().map(|state| state.owner),
+            Some(crate::ring_shortcut::RightDragOwner::DetachedWindow(41))
+        );
+
+        app.mouse_gesture = Some(crate::ring_shortcut::MouseGestureState::new(
+            crate::ring_shortcut::RightDragOwner::Root,
+            crate::ring_shortcut::RightDragContext::ImageFullscreen,
+            std::time::Instant::now(),
+            pos,
+        ));
+        assert_eq!(
+            app.update_mouse_gesture_with_pos(
+                &ctx,
+                crate::ring_shortcut::RightDragOwner::DetachedWindow(41),
+                crate::ring_shortcut::RightDragContext::ImageFullscreen,
+                egui::pos2(180.0, 120.0),
+                false,
+                false,
+            ),
+            crate::ring_shortcut::MouseFlickOutcome::None
+        );
+        assert_eq!(
+            app.mouse_gesture.as_ref().map(|state| state.owner),
+            Some(crate::ring_shortcut::RightDragOwner::Root)
+        );
+
+        app.mouse_gesture = None;
+        app.mouse_ring_flick = Some(crate::ring_shortcut::MouseFlickState::new(
+            crate::ring_shortcut::RightDragOwner::DetachedWindow(41),
+            crate::ring_shortcut::RingShortcutContext::ImageFullscreen,
+            std::time::Instant::now(),
+            pos,
+        ));
+        assert_eq!(
+            app.update_mouse_ring_flick_with_pos(
+                &ctx,
+                crate::ring_shortcut::RightDragOwner::Root,
+                crate::ring_shortcut::RingShortcutContext::ImageFullscreen,
+                egui::pos2(180.0, 120.0),
+                false,
+                false,
+            ),
+            crate::ring_shortcut::MouseFlickOutcome::None
+        );
+        assert_eq!(
+            app.mouse_ring_flick.as_ref().map(|state| state.owner),
+            Some(crate::ring_shortcut::RightDragOwner::DetachedWindow(41))
+        );
+
+        app.mouse_ring_flick = Some(crate::ring_shortcut::MouseFlickState::new(
+            crate::ring_shortcut::RightDragOwner::Root,
+            crate::ring_shortcut::RingShortcutContext::ImageFullscreen,
+            std::time::Instant::now(),
+            pos,
+        ));
+        assert_eq!(
+            app.update_mouse_ring_flick_with_pos(
+                &ctx,
+                crate::ring_shortcut::RightDragOwner::DetachedWindow(41),
+                crate::ring_shortcut::RingShortcutContext::ImageFullscreen,
+                egui::pos2(180.0, 120.0),
+                false,
+                false,
+            ),
+            crate::ring_shortcut::MouseFlickOutcome::None
+        );
+        assert_eq!(
+            app.mouse_ring_flick.as_ref().map(|state| state.owner),
+            Some(crate::ring_shortcut::RightDragOwner::Root)
+        );
+    }
+
+    #[test]
+    fn right_drag_state_allows_only_one_live_interaction() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.ring_shortcuts.right_drag_image =
+            Some(crate::ring_shortcut::RightDragMode::MouseGesture);
+        let first = crate::ring_shortcut::RightDragOwner::DetachedWindow(1);
+        let second = crate::ring_shortcut::RightDragOwner::DetachedWindow(2);
+
+        app.start_mouse_gesture(
+            &ctx,
+            first,
+            crate::ring_shortcut::RightDragContext::ImageFullscreen,
+            egui::pos2(90.0, 90.0),
+            None,
+        );
+        app.start_mouse_gesture(
+            &ctx,
+            second,
+            crate::ring_shortcut::RightDragContext::ImageFullscreen,
+            egui::pos2(190.0, 90.0),
+            None,
+        );
+
+        assert_eq!(
+            app.mouse_gesture.as_ref().map(|state| state.owner),
+            Some(first)
+        );
+        assert!(app.mouse_ring_flick.is_none());
+    }
+
+    #[test]
+    fn three_passive_windows_apply_cross_window_samples_in_sequence_to_owner_only() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.ring_shortcuts.right_drag_image =
+            Some(crate::ring_shortcut::RightDragMode::MouseGesture);
+        for id in [11, 12, 13] {
+            app.detached_image_windows.push(paused_test_window(
+                &ctx,
+                id,
+                passive_right_drag_image_bundle(&format!(r"C:\pics\{id}.jpg")),
+            ));
+            app.transition_detached_window_state(id, DetachedWindowState::Parked, "test");
+        }
+        let first_pos = egui::pos2(100.0, 100.0);
+        app.process_passive_detached_right_drag_events_for_test(
+            &ctx,
+            vec![
+                (
+                    11,
+                    passive_right_drag_input(5, false, false, true, first_pos),
+                ),
+                (
+                    13,
+                    passive_right_drag_input(4, false, true, false, egui::pos2(300.0, 100.0)),
+                ),
+                (
+                    11,
+                    passive_right_drag_input(1, true, true, false, first_pos),
+                ),
+                (
+                    12,
+                    passive_right_drag_input(2, true, true, false, egui::pos2(200.0, 100.0)),
+                ),
+                (
+                    11,
+                    passive_right_drag_input(3, false, true, false, first_pos),
+                ),
+            ],
+        );
+
+        assert!(
+            app.mouse_gesture.is_none(),
+            "owner release must finish the gesture"
+        );
+        assert!(matches!(
+            app.detached_window_manager.activation_intent(11),
+            Some(DetachedActivationIntent::RightDrag(
+                PendingRightDragCommand::Recognized { .. }
+            ))
+        ));
+        assert!(app.detached_window_manager.activation_intent(12).is_none());
+        assert!(app.detached_window_manager.activation_intent(13).is_none());
+    }
+
+    #[test]
+    fn passive_disabled_right_click_does_not_queue_activation() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.ring_shortcuts.right_drag_image =
+            Some(crate::ring_shortcut::RightDragMode::Disabled);
+        app.detached_image_windows.push(paused_test_window(
+            &ctx,
+            21,
+            passive_right_drag_image_bundle(r"C:\pics\disabled.jpg"),
+        ));
+        app.transition_detached_window_state(21, DetachedWindowState::Parked, "test");
+
+        app.process_passive_detached_right_drag_events_for_test(
+            &ctx,
+            vec![(
+                21,
+                passive_right_drag_input(1, true, false, true, egui::pos2(100.0, 100.0)),
+            )],
+        );
+
+        assert!(app.detached_window_manager.activation_intent(21).is_none());
+        assert_eq!(
+            app.detached_window_state(21),
+            Some(DetachedWindowState::Parked)
+        );
+    }
+
+    #[test]
+    fn passive_command_progresses_to_execution_only_inside_owner_mount() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let main_idx = push_image(&mut app, r"C:\pics\main-owner-guard.jpg");
+        app.fullscreen_idx = Some(main_idx);
+        app.detached_image_windows.push(paused_test_window(
+            &ctx,
+            31,
+            passive_right_drag_image_bundle(r"C:\pics\detached-owner.jpg"),
+        ));
+        app.transition_detached_window_state(31, DetachedWindowState::Parked, "test");
+        app.queue_recognized_detached_right_drag_command(31, passive_rotate_command(), "test");
+        assert!(matches!(
+            app.detached_window_manager.activation_intent(31),
+            Some(DetachedActivationIntent::RightDrag(
+                PendingRightDragCommand::Recognized { .. }
+            ))
+        ));
+
+        assert!(app.commit_pending_deferred_detached_window_activation(&ctx));
+        assert!(matches!(
+            app.detached_window_manager.activation_intent(31),
+            Some(DetachedActivationIntent::RightDrag(
+                PendingRightDragCommand::PendingExecution { .. }
+            ))
+        ));
+        assert!(app.rotation_cache.is_empty());
+        assert!(
+            app.active_detached_viewer_context
+                .as_ref()
+                .expect("active owner")
+                .bundle
+                .rotation_cache
+                .is_empty(),
+            "activation return must not execute against the unmounted owner"
+        );
+
+        assert_eq!(
+            app.with_active_detached_viewer_context(|mounted| {
+                mounted.execute_pending_right_drag_command_in_mounted_context(&ctx)
+            }),
+            Some(true)
+        );
+        assert!(
+            app.rotation_cache.is_empty(),
+            "main context must remain untouched"
+        );
+        assert!(
+            app.active_detached_viewer_context
+                .as_ref()
+                .unwrap()
+                .bundle
+                .rotation_cache
+                .contains_key(&0),
+            "command must mutate the mounted detached owner"
+        );
+        assert!(app.detached_window_manager.activation_intent(31).is_none());
+    }
+
+    #[test]
+    fn closing_passive_window_discards_recognized_command_before_activation() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.detached_image_windows.push(paused_test_window(
+            &ctx,
+            41,
+            passive_right_drag_image_bundle(r"C:\pics\closing.jpg"),
+        ));
+        app.transition_detached_window_state(41, DetachedWindowState::Parked, "test");
+        app.queue_recognized_detached_right_drag_command(41, passive_rotate_command(), "test");
+
+        app.close_detached_image_windows_by_ids(&ctx, &[41], &[], "test_close", None);
+
+        assert!(app.detached_window_manager.runtime(41).is_none());
+        assert!(app.rotation_cache.is_empty());
+        assert!(!app.commit_pending_deferred_detached_window_activation(&ctx));
+    }
+
+    #[test]
+    fn pending_execution_window_mismatch_discards_without_running_command() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, r"C:\pics\mismatch.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.queue_recognized_detached_right_drag_command(51, passive_rotate_command(), "test");
+        let dispatch = app
+            .take_pending_deferred_detached_window_activation()
+            .expect("recognized dispatch");
+        assert!(
+            app.detached_window_manager
+                .mark_right_drag_pending_execution(51, dispatch.command.unwrap())
+        );
+        app.begin_active_detached_session(52, DetachedSource::Image);
+        app.detached_viewer_window_id = Some(52);
+
+        assert!(!app.execute_pending_right_drag_command_in_mounted_context(&ctx));
+        assert!(app.rotation_cache.is_empty());
+        assert!(app.detached_window_manager.activation_intent(51).is_none());
+    }
+
+    #[test]
+    fn descriptor_pending_execution_waits_for_fullscreen_state_then_discards_on_target_change() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.begin_active_detached_session(61, DetachedSource::Book);
+        app.detached_viewer_window_id = Some(61);
+        app.fullscreen_idx = None;
+        app.queue_recognized_detached_right_drag_command(61, passive_rotate_command(), "test");
+        let dispatch = app
+            .take_pending_deferred_detached_window_activation()
+            .expect("recognized descriptor dispatch");
+        assert!(
+            app.detached_window_manager
+                .mark_right_drag_pending_execution(61, dispatch.command.unwrap())
+        );
+
+        assert!(!app.execute_pending_right_drag_command_in_mounted_context(&ctx));
+        assert!(matches!(
+            app.detached_window_manager.activation_intent(61),
+            Some(DetachedActivationIntent::RightDrag(
+                PendingRightDragCommand::PendingExecution { .. }
+            ))
+        ));
+
+        app.items = vec![GridItem::Video(PathBuf::from(
+            r"C:\clips\changed-target.mp4",
+        ))];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.fullscreen_idx = Some(0);
+        assert!(!app.execute_pending_right_drag_command_in_mounted_context(&ctx));
+        assert!(app.detached_window_manager.activation_intent(61).is_none());
+        assert!(app.rotation_cache.is_empty());
     }
 
     #[test]
@@ -48079,6 +48478,7 @@ mod still_window_mode_key_tests {
             placement_update: None,
             pixels_per_point: 1.5,
             apply_initial_placement: false,
+            right_drag: None,
         });
 
         app.process_deferred_detached_image_window_events_for_test(&ctx);
@@ -48173,6 +48573,7 @@ mod still_window_mode_key_tests {
             placement_update: Some(default_candidate),
             pixels_per_point: 1.5,
             apply_initial_placement: false,
+            right_drag: None,
         });
 
         app.process_deferred_detached_image_window_events_for_test(&ctx);

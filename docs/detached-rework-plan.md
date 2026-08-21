@@ -348,7 +348,7 @@ R2b の残件 (純粋 reducer / 合法遷移制約 / 散在 pending・flag の t
 | 項目 | 状態 | 指示書 | メモ |
 | --- | --- | --- | --- |
 | §1.99 複数ウィンドウでの RAR / 7z / LZH open | **実装済み・検収合格 (21c3dc0d + fix1 d7e139d0)。実機確認待ち** | [stage-archive-open](detached-rework-stage-archive-open.md) | typed open plan に `ConvertibleArchiveCandidate` を追加し、直読み完了 / 変換完了 / 変換キャッシュ命中の 3 経路すべてを detached へ着地。着地結果は `Opened` / `Cancelled(reason)` / `Failed` の typed outcome で、stale と設定 OFF はトーストを出さずログのみ。App に `detached_grid_archive_open_request_seq: u64` を 1 つ追加した (既存 `bookmark_open_request_seq` と同型の単調 sequence。**憲法 3 が禁じる detached 用 bool / Option フラグではない**と双方で判断)。visibility 述語 / `show_viewport_*` builder / viewport ID / HWND registry / activation watcher / placement には触れていない |
-| §1.100 非アクティブ窓の右ドラッグ | **指示書作成済み・実装待ち** | [stage-passive-gesture](detached-rework-stage-passive-gesture.md) | 既存 `MouseGestureState` / `MouseFlickState` に owner を足し、deferred のイベントにポインタ列を載せ、`DetachedWindowRuntime` の `pending_deferred_activation: bool` を `Recognized → Activating → PendingExecution` の typed intent へ統合する |
+| §1.100 非アクティブ窓の右ドラッグ | **実装済み・自動テスト合格。実機確認待ち** | [stage-passive-gesture](detached-rework-stage-passive-gesture.md) | `MouseGestureState` / `MouseFlickState` は `RightDragOwner` を保持。deferred 静止画と `ParkedLive` は sequence 付きの同一 reducer を通り、成立コマンドは `DetachedWindowRuntime.activation_intent` の `Recognized → Activating → PendingExecution` を経て、`update_active_detached_viewer_context` の owner mount 中だけ実行する。通常クリックは同じ intent の `ActivateOnly` として従来動作を維持 |
 
 ## 10. 将来候補 (現行仕様では未採用)
 

@@ -136,12 +136,15 @@ pub(crate) use startup_ops::{
 #[cfg(windows)]
 pub(crate) use detached_window_manager::{
     DetachedActivationClickCandidate, DetachedActivationClickIntent,
-    DetachedActivationCloseHitTest, DetachedActivationRequest, DetachedActivationWatchDiagnostic,
-    DetachedActivationWatchSample, DetachedActivationWatchState, DetachedActivationWatchStepResult,
-    DetachedActivationWatchTarget, DetachedActivationWatchTargetRect, DetachedCloseRequest,
-    DetachedWindowHwndDiff, DetachedWindowManager, DetachedWindowRuntime, DetachedWindowState,
+    DetachedActivationCloseHitTest, DetachedActivationDispatch, DetachedActivationRequest,
+    DetachedActivationWatchDiagnostic, DetachedActivationWatchSample, DetachedActivationWatchState,
+    DetachedActivationWatchStepResult, DetachedActivationWatchTarget,
+    DetachedActivationWatchTargetRect, DetachedCloseRequest, DetachedWindowHwndDiff,
+    DetachedWindowManager, DetachedWindowRuntime, DetachedWindowState,
     MainFontAtlasResyncFrameSafety,
 };
+#[cfg(all(windows, test))]
+pub(crate) use detached_window_manager::{DetachedActivationIntent, PendingRightDragCommand};
 use folder_scan::is_miv_upscaled_derivative;
 #[cfg(test)]
 pub(crate) use folder_scan::scan_directory;
@@ -488,7 +491,61 @@ pub(crate) enum DeferredDetachedImageWindowEvent {
         placement_update: Option<crate::settings::DetachedViewerWindowPlacement>,
         pixels_per_point: f32,
         apply_initial_placement: bool,
+        right_drag: Option<DetachedRightDragEvent>,
     },
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DetachedRightDragCancelReason {
+    FocusLost,
+    ButtonStateLost,
+}
+
+#[cfg(windows)]
+impl DetachedRightDragCancelReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::FocusLost => "focus_lost",
+            Self::ButtonStateLost => "button_state_lost",
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DetachedRightDragEvent {
+    pub(crate) sequence: u64,
+    pub(crate) kind: DetachedRightDragEventKind,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum DetachedRightDragEventKind {
+    Input {
+        secondary_pressed: bool,
+        secondary_down: bool,
+        secondary_released: bool,
+        pointer_pos: Option<egui::Pos2>,
+    },
+    Cancel {
+        reason: DetachedRightDragCancelReason,
+    },
+}
+
+#[cfg(windows)]
+static DETACHED_RIGHT_DRAG_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(windows)]
+pub(crate) fn next_detached_right_drag_event_sequence() -> u64 {
+    DETACHED_RIGHT_DRAG_EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct DeferredDetachedRightDragCapture {
+    secondary_was_down: bool,
+    focused_was: bool,
 }
 
 #[cfg(windows)]
@@ -496,6 +553,7 @@ pub(crate) struct DeferredDetachedImageWindowShared {
     view: Mutex<DeferredDetachedImageWindowView>,
     events: Mutex<Vec<DeferredDetachedImageWindowEvent>>,
     first_callback_sent: AtomicBool,
+    right_drag_capture: Mutex<DeferredDetachedRightDragCapture>,
 }
 
 #[cfg(windows)]
@@ -505,6 +563,7 @@ impl DeferredDetachedImageWindowShared {
             view: Mutex::new(view),
             events: Mutex::new(Vec::new()),
             first_callback_sent: AtomicBool::new(false),
+            right_drag_capture: Mutex::new(DeferredDetachedRightDragCapture::default()),
         }
     }
 
@@ -535,6 +594,47 @@ impl DeferredDetachedImageWindowShared {
         } else {
             false
         }
+    }
+
+    pub(crate) fn capture_right_drag_event(
+        &self,
+        ctx: &egui::Context,
+        focused: bool,
+    ) -> Option<DetachedRightDragEvent> {
+        let (secondary_pressed, secondary_down, secondary_released, pointer_pos) = ctx.input(|i| {
+            (
+                i.pointer.secondary_pressed(),
+                i.pointer.secondary_down(),
+                i.pointer.secondary_released(),
+                i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()),
+            )
+        });
+        let mut capture = self.right_drag_capture.lock().ok()?;
+        let cancel_reason = if capture.focused_was && !focused {
+            Some(DetachedRightDragCancelReason::FocusLost)
+        } else if capture.secondary_was_down && !secondary_down && !secondary_released {
+            Some(DetachedRightDragCancelReason::ButtonStateLost)
+        } else {
+            None
+        };
+        capture.secondary_was_down = secondary_down;
+        capture.focused_was = focused;
+        let kind = if let Some(reason) = cancel_reason {
+            DetachedRightDragEventKind::Cancel { reason }
+        } else if secondary_pressed || secondary_down || secondary_released {
+            DetachedRightDragEventKind::Input {
+                secondary_pressed,
+                secondary_down,
+                secondary_released,
+                pointer_pos,
+            }
+        } else {
+            return None;
+        };
+        Some(DetachedRightDragEvent {
+            sequence: next_detached_right_drag_event_sequence(),
+            kind,
+        })
     }
 
     pub(crate) fn drain_events(&self) -> Vec<DeferredDetachedImageWindowEvent> {
@@ -582,6 +682,19 @@ impl DetachedImageWindowSnapshot {
     #[cfg(windows)]
     pub(crate) fn has_paused_bundle(&self) -> bool {
         self.paused_bundle.is_some()
+    }
+
+    pub(crate) fn right_drag_context(&self) -> crate::ring_shortcut::RightDragContext {
+        self.paused_bundle
+            .as_deref()
+            .and_then(|bundle| bundle.fullscreen_idx.and_then(|idx| bundle.items.get(idx)))
+            .map(|item| match item {
+                GridItem::Video(_) | GridItem::Audio(_) => {
+                    crate::ring_shortcut::RightDragContext::VideoFullscreen
+                }
+                _ => crate::ring_shortcut::RightDragContext::ImageFullscreen,
+            })
+            .unwrap_or(crate::ring_shortcut::RightDragContext::ImageFullscreen)
     }
 }
 
@@ -1100,6 +1213,68 @@ impl App {
              duplicate={was_pending} state={:?}",
             state
         ));
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn queue_recognized_detached_right_drag_command(
+        &mut self,
+        window_id: u64,
+        command: crate::ring_shortcut::RightDragCommand,
+        reason: &'static str,
+    ) -> bool {
+        if self.remote_session_blocks_local_control() {
+            self.log_detached_image_window_debug(format!(
+                "right_drag_command_dropped id={window_id} phase=recognized \
+                 reason=remote_session_blocks_local_control"
+            ));
+            return false;
+        }
+        let default_linked = self.detached_window_runtime_default_linked();
+        let (accepted, state) = self.detached_window_manager.queue_right_drag_command(
+            window_id,
+            command,
+            default_linked,
+        );
+        self.log_detached_image_window_debug(format!(
+            "right_drag_command_recognized id={window_id} reason={reason} \
+             accepted={accepted} state={state:?}"
+        ));
+        accepted
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn discard_detached_right_drag_command(
+        &mut self,
+        window_id: u64,
+        reason: &'static str,
+    ) -> bool {
+        let Some(pending) = self
+            .detached_window_manager
+            .discard_right_drag_command(window_id)
+        else {
+            return false;
+        };
+        self.log_detached_image_window_debug(format!(
+            "right_drag_command_dropped id={window_id} phase={pending:?} reason={reason}"
+        ));
+        true
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn cancel_detached_right_drag_owner(
+        &mut self,
+        window_id: u64,
+        reason: &'static str,
+    ) -> bool {
+        let owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(window_id);
+        let gesture_cancelled = self.cancel_right_drag_for_owner(owner);
+        let command_discarded = self.discard_detached_right_drag_command(window_id, reason);
+        if gesture_cancelled {
+            self.log_detached_image_window_debug(format!(
+                "right_drag_cancelled id={window_id} reason={reason}"
+            ));
+        }
+        gesture_cancelled || command_discarded
     }
 
     #[cfg(windows)]
@@ -1753,7 +1928,9 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn take_pending_deferred_detached_window_activation(&mut self) -> Option<u64> {
+    fn take_pending_deferred_detached_window_activation(
+        &mut self,
+    ) -> Option<DetachedActivationDispatch> {
         self.detached_window_manager
             .take_pending_deferred_activation()
     }
@@ -1763,9 +1940,10 @@ impl App {
         &mut self,
         ctx: &egui::Context,
     ) -> bool {
-        let Some(id) = self.take_pending_deferred_detached_window_activation() else {
+        let Some(dispatch) = self.take_pending_deferred_detached_window_activation() else {
             return false;
         };
+        let id = dispatch.window_id;
         let frame = self.frame_counter;
         self.log_detached_image_window_debug(format!(
             "deferred_activate_commit frame={frame} id={id} before_active_dispatch=true \
@@ -1774,6 +1952,34 @@ impl App {
             self.active_detached_viewer_context_present()
         ));
         if self.activate_detached_image_window_snapshot(ctx, id) {
+            if let Some(command) = dispatch.command {
+                if self.active_detached_window_id() == Some(id) {
+                    if self
+                        .detached_window_manager
+                        .mark_right_drag_pending_execution(id, command)
+                    {
+                        self.log_detached_image_window_debug(format!(
+                            "right_drag_command_pending_execution frame={frame} id={id}"
+                        ));
+                    } else {
+                        self.log_detached_image_window_debug(format!(
+                            "right_drag_command_dropped frame={frame} id={id} \
+                             phase=activating reason=illegal_activation_transition"
+                        ));
+                        self.discard_detached_right_drag_command(
+                            id,
+                            "illegal_activation_transition",
+                        );
+                    }
+                } else {
+                    self.log_detached_image_window_debug(format!(
+                        "right_drag_command_dropped frame={frame} id={id} \
+                         phase=activating reason=active_window_mismatch active_id={:?}",
+                        self.active_detached_window_id()
+                    ));
+                    self.discard_detached_right_drag_command(id, "active_window_mismatch");
+                }
+            }
             self.log_detached_image_window_debug(format!(
                 "deferred_activate_commit_succeeded frame={frame} id={id} \
                  passive_windows={} active_context={} session={:?}",
@@ -1783,6 +1989,7 @@ impl App {
             ));
             true
         } else {
+            self.discard_detached_right_drag_command(id, "activation_failed");
             self.log_detached_image_window_debug(format!(
                 "deferred_activate_commit_failed frame={frame} id={id} \
                  passive_windows={} active_context={}",
@@ -1793,13 +2000,95 @@ impl App {
         }
     }
 
+    /// Consume a passive right-drag command only while the owning viewer bundle is mounted.
+    /// `update_active_detached_viewer_context` is the sole caller and establishes that mount.
+    #[cfg(windows)]
+    fn execute_pending_right_drag_command_in_mounted_context(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> bool {
+        let active_id = self.active_detached_window_id();
+        for pending_id in self
+            .detached_window_manager
+            .pending_right_drag_execution_window_ids()
+        {
+            if Some(pending_id) != active_id {
+                self.discard_detached_right_drag_command(
+                    pending_id,
+                    "pending_execution_active_window_mismatch",
+                );
+            }
+        }
+        let Some(window_id) = active_id else {
+            return false;
+        };
+        if self.detached_viewer_window_id != Some(window_id) {
+            self.discard_detached_right_drag_command(
+                window_id,
+                "pending_execution_mounted_window_mismatch",
+            );
+            return false;
+        }
+        let Some(fs_idx) = self.fullscreen_idx else {
+            // Descriptor re-open is asynchronous. Keep PendingExecution until enumeration
+            // materializes a fullscreen target; this is state-based, not a time window.
+            return false;
+        };
+        let Some(command) = self
+            .detached_window_manager
+            .take_pending_right_drag_execution(window_id)
+        else {
+            return false;
+        };
+        let expected_context = command.context();
+        let mounted_context = self.current_right_drag_context();
+        if mounted_context != expected_context {
+            self.log_detached_image_window_debug(format!(
+                "right_drag_command_dropped id={window_id} phase=pending_execution \
+                 reason=viewer_context_changed expected={expected_context:?} \
+                 mounted={mounted_context:?} fs_idx={fs_idx}"
+            ));
+            return false;
+        }
+        self.log_detached_image_window_debug(format!(
+            "right_drag_command_execute id={window_id} fs_idx={fs_idx} \
+             mounted_window_id={:?}",
+            self.detached_viewer_window_id
+        ));
+        if let Some(nav) = self.execute_right_drag_command(ctx, command) {
+            self.mouse_ring_nav = Some(nav);
+        }
+        true
+    }
+
     pub(crate) fn remove_detached_window_runtime(
         &mut self,
         window_id: u64,
         reason: &'static str,
     ) -> Option<DetachedWindowRuntime> {
+        self.remove_detached_window_runtime_inner(window_id, reason, false)
+    }
+
+    #[cfg(windows)]
+    fn remove_detached_window_runtime_preserving_activation(
+        &mut self,
+        window_id: u64,
+        reason: &'static str,
+    ) -> Option<DetachedWindowRuntime> {
+        self.remove_detached_window_runtime_inner(window_id, reason, true)
+    }
+
+    fn remove_detached_window_runtime_inner(
+        &mut self,
+        window_id: u64,
+        reason: &'static str,
+        preserve_activation: bool,
+    ) -> Option<DetachedWindowRuntime> {
         self.discard_parked_native_video_pending_for_window(window_id, reason);
         self.cancel_media_navigation_pending_for_owner(Some(window_id), reason);
+        if !preserve_activation {
+            self.cancel_detached_right_drag_owner(window_id, reason);
+        }
         let runtime = self.detached_window_manager.remove(window_id);
         if let Some(runtime) = runtime.as_ref() {
             if let Some(placement) = runtime
@@ -39810,6 +40099,22 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn resume_active_detached_book_context_from_descriptor(
+        &mut self,
+        window_id: u64,
+        descriptor: ViewerContextDescriptor,
+        ctx: &egui::Context,
+    ) -> bool {
+        self.start_active_detached_book_context_with_start(
+            DetachedBookContextStart::Descriptor(descriptor),
+            ctx,
+            None,
+            None,
+            Some(window_id),
+        )
+    }
+
+    #[cfg(windows)]
     fn start_active_detached_book_context_from_scanned_folder(
         &mut self,
         path: PathBuf,
@@ -39821,6 +40126,7 @@ impl App {
             DetachedBookContextStart::ScannedFolder { path, scan },
             ctx,
             placement_seed,
+            None,
             None,
         )
     }
@@ -39838,6 +40144,7 @@ impl App {
             ctx,
             placement_seed,
             bookmark_pending,
+            None,
         )
     }
 
@@ -39848,6 +40155,7 @@ impl App {
         ctx: &egui::Context,
         placement_seed: Option<crate::settings::DetachedViewerWindowPlacement>,
         mut bookmark_pending: Option<crate::bookmark_browser::PendingBookOpen>,
+        resume_window_id: Option<u64>,
     ) -> bool {
         let descriptor = match &start {
             DetachedBookContextStart::Descriptor(descriptor) => descriptor.clone(),
@@ -39876,10 +40184,12 @@ impl App {
             context_serial,
             "start_active_detached_book_context",
         );
-        let window_id = self.allocate_detached_viewer_window_id();
+        let window_id =
+            resume_window_id.unwrap_or_else(|| self.allocate_detached_viewer_window_id());
         self.log_detached_image_window_debug(format!(
             "allocate_window_id reason=start_active_detached_book_context id={window_id} \
-             context_serial={context_serial} folder_nav_reuse_once={}",
+             resumed={} context_serial={context_serial} folder_nav_reuse_once={}",
+            resume_window_id.is_some(),
             self.detached_viewer_folder_nav_reuse_window_once
         ));
         self.detached_viewer_window_id = Some(window_id);
@@ -40551,8 +40861,23 @@ impl App {
             self.detached_image_windows.insert(pos, snapshot);
             return false;
         }
-        self.remove_detached_window_runtime(snapshot.id, "passive_activate_reopen_descriptor");
-        self.start_active_detached_book_context_from_descriptor(descriptor, ctx, None)
+        let preserved_activation_intent = self
+            .remove_detached_window_runtime_preserving_activation(
+                snapshot.id,
+                "passive_activate_reopen_descriptor",
+            )
+            .and_then(|runtime| runtime.activation_intent);
+        let resumed =
+            self.resume_active_detached_book_context_from_descriptor(snapshot.id, descriptor, ctx);
+        if let Some(intent) = preserved_activation_intent {
+            let default_linked = self.detached_window_runtime_default_linked();
+            self.detached_window_manager.restore_activation_intent(
+                snapshot.id,
+                intent,
+                default_linked,
+            );
+        }
+        resumed
     }
 
     #[cfg(windows)]
@@ -40715,6 +41040,8 @@ impl App {
                 app.poll_local_adjust_prefix_preview(ctx);
                 app.poll_local_adjust_lut_load(ctx);
                 app.poll_local_adjust_segmentation(ctx);
+
+                app.execute_pending_right_drag_command_in_mounted_context(ctx);
 
                 if app.active_detached_transition_outstanding() {
                     ctx.request_repaint_after(std::time::Duration::from_millis(16));

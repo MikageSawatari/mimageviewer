@@ -58,6 +58,17 @@ pub enum RightDragContext {
     EditMode,
 }
 
+/// The input surface that started a right-button drag.
+///
+/// This identity is orthogonal to [`RightDragContext`]: multiple detached
+/// windows can all use `ImageFullscreen`, but only one of them owns the live
+/// pointer sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RightDragOwner {
+    Root,
+    DetachedWindow(u64),
+}
+
 impl RightDragContext {
     pub fn all() -> &'static [Self] {
         const ALL: [RightDragContext; 4] = [
@@ -2541,6 +2552,7 @@ pub struct PickerListState {
 
 #[derive(Clone, Debug)]
 pub struct MouseGestureState {
+    pub owner: RightDragOwner,
     pub context: RightDragContext,
     pub start_time: Instant,
     pub start_pos: egui::Pos2,
@@ -2551,8 +2563,14 @@ pub struct MouseGestureState {
 }
 
 impl MouseGestureState {
-    pub fn new(context: RightDragContext, start_time: Instant, start_pos: egui::Pos2) -> Self {
+    pub fn new(
+        owner: RightDragOwner,
+        context: RightDragContext,
+        start_time: Instant,
+        start_pos: egui::Pos2,
+    ) -> Self {
         Self {
+            owner,
             context,
             start_time,
             start_pos,
@@ -2577,6 +2595,7 @@ impl MouseGestureState {
 }
 #[derive(Clone, Debug)]
 pub struct MouseFlickState {
+    pub owner: RightDragOwner,
     pub context: RingShortcutContext,
     pub start_time: Instant,
     pub start_pos: egui::Pos2,
@@ -2585,8 +2604,14 @@ pub struct MouseFlickState {
 }
 
 impl MouseFlickState {
-    pub fn new(context: RingShortcutContext, start_time: Instant, start_pos: egui::Pos2) -> Self {
+    pub fn new(
+        owner: RightDragOwner,
+        context: RingShortcutContext,
+        start_time: Instant,
+        start_pos: egui::Pos2,
+    ) -> Self {
         Self {
+            owner,
             context,
             start_time,
             start_pos,
@@ -2614,6 +2639,65 @@ pub enum MouseFlickOutcome {
     ShortTap,
     Cancelled,
     Fired,
+}
+
+/// A completed right-drag operation whose side effects may be delayed until
+/// the owning detached viewer context is mounted.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum RightDragCommand {
+    RingShortcut {
+        context: RingShortcutContext,
+        action: RingActionId,
+        direction: RingDirection,
+        source: &'static str,
+    },
+    MouseGesture {
+        context: RightDragContext,
+        action: RingActionId,
+        pattern_label: String,
+        show_result_toast: bool,
+    },
+    ViewerShortRightClick {
+        context: RightDragContext,
+        pos: egui::Pos2,
+    },
+}
+
+impl RightDragCommand {
+    pub(crate) fn context(&self) -> RightDragContext {
+        match self {
+            Self::RingShortcut { context, .. } => match context {
+                RingShortcutContext::Grid => RightDragContext::Grid,
+                RingShortcutContext::ImageFullscreen => RightDragContext::ImageFullscreen,
+                RingShortcutContext::VideoFullscreen => RightDragContext::VideoFullscreen,
+            },
+            Self::MouseGesture { context, .. } | Self::ViewerShortRightClick { context, .. } => {
+                *context
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RightDragRecognition {
+    pub(crate) outcome: MouseFlickOutcome,
+    pub(crate) command: Option<RightDragCommand>,
+}
+
+impl RightDragRecognition {
+    pub(crate) fn outcome(outcome: MouseFlickOutcome) -> Self {
+        Self {
+            outcome,
+            command: None,
+        }
+    }
+
+    pub(crate) fn command(command: RightDragCommand) -> Self {
+        Self {
+            outcome: MouseFlickOutcome::Fired,
+            command: Some(command),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3202,6 +3286,7 @@ mod tests {
     fn mouse_flick_static_guide_waits_until_long_press() {
         let pos = egui::pos2(10.0, 20.0);
         let flick = MouseFlickState::new(
+            RightDragOwner::Root,
             RingShortcutContext::ImageFullscreen,
             Instant::now() - mouse_flick_guide_delay() - Duration::from_millis(1),
             pos,
@@ -3209,14 +3294,19 @@ mod tests {
         assert!(!flick.guide_visible());
 
         let flick = MouseFlickState::new(
+            RightDragOwner::Root,
             RingShortcutContext::ImageFullscreen,
             Instant::now() - mouse_flick_menu_delay() - Duration::from_millis(1),
             pos,
         );
         assert!(flick.guide_visible());
 
-        let mut flick =
-            MouseFlickState::new(RingShortcutContext::ImageFullscreen, Instant::now(), pos);
+        let mut flick = MouseFlickState::new(
+            RightDragOwner::Root,
+            RingShortcutContext::ImageFullscreen,
+            Instant::now(),
+            pos,
+        );
         flick.armed = true;
         assert!(flick.guide_visible());
     }

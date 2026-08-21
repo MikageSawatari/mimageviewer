@@ -3137,6 +3137,7 @@ struct DetachedImageWindowEventBatch {
     activation_armed_updates: Vec<(u64, bool)>,
     initial_placement_applied_ids: Vec<u64>,
     placement_seed_reset_ids: Vec<u64>,
+    right_drag_events: Vec<(u64, crate::app::DetachedRightDragEvent)>,
 }
 
 /// チェックマーク円の半径
@@ -11180,6 +11181,7 @@ impl App {
                 placement_update,
                 pixels_per_point,
                 apply_initial_placement,
+                right_drag,
             } => {
                 let Some(window_pos) = self
                     .detached_image_windows
@@ -11281,8 +11283,145 @@ impl App {
                     batch.initial_placement_applied_ids.push(id);
                 }
                 batch.focus_updates.push((id, focused));
+                if let Some(event) = right_drag {
+                    batch.right_drag_events.push((id, event));
+                }
             }
         }
+    }
+
+    #[cfg(windows)]
+    fn apply_passive_detached_right_drag_event(
+        &mut self,
+        ctx: &egui::Context,
+        window_id: u64,
+        event: crate::app::DetachedRightDragEvent,
+    ) {
+        use crate::ring_shortcut::{
+            MouseFlickOutcome, RightDragCommand, RightDragMode, RightDragOwner,
+        };
+
+        let owner = RightDragOwner::DetachedWindow(window_id);
+        let Some(right_drag_context) = self
+            .detached_image_windows
+            .iter()
+            .find(|window| window.id == window_id)
+            .map(crate::app::DetachedImageWindowSnapshot::right_drag_context)
+        else {
+            self.cancel_detached_right_drag_owner(window_id, "right_drag_snapshot_missing");
+            return;
+        };
+        if self.remote_session_blocks_local_control() {
+            self.cancel_detached_right_drag_owner(window_id, "right_drag_remote_control");
+            return;
+        }
+
+        let crate::app::DetachedRightDragEvent { sequence, kind } = event;
+        let (secondary_pressed, secondary_down, secondary_released, pointer_pos) = match kind {
+            crate::app::DetachedRightDragEventKind::Cancel { reason } => {
+                self.cancel_detached_right_drag_owner(window_id, reason.as_str());
+                self.log_detached_image_window_debug(format!(
+                    "passive_right_drag_cancel id={window_id} sequence={sequence} reason={}",
+                    reason.as_str()
+                ));
+                return;
+            }
+            crate::app::DetachedRightDragEventKind::Input {
+                secondary_pressed,
+                secondary_down,
+                secondary_released,
+                pointer_pos,
+            } => (
+                secondary_pressed,
+                secondary_down,
+                secondary_released,
+                pointer_pos,
+            ),
+        };
+
+        if secondary_pressed && pointer_pos.is_some_and(|pos| pos.y <= TOP_BAR_HEIGHT) {
+            self.cancel_detached_right_drag_owner(window_id, "right_drag_passive_chrome");
+            return;
+        }
+
+        let mode = self
+            .settings
+            .ring_shortcuts
+            .right_drag_mode(right_drag_context);
+        if matches!(mode, RightDragMode::Disabled | RightDragMode::Unknown(_)) {
+            // Disabled keeps the established passive-window behavior: a right click is a
+            // no-op and must not activate the window.
+            self.cancel_detached_right_drag_owner(window_id, "right_drag_disabled");
+            return;
+        }
+
+        let fallback_pos = self.right_drag_pointer_pos(owner);
+        let Some(pos) = pointer_pos.or(fallback_pos) else {
+            if secondary_released {
+                self.cancel_detached_right_drag_owner(window_id, "right_drag_position_missing");
+            }
+            return;
+        };
+
+        let recognition = match mode {
+            RightDragMode::RingShortcut => {
+                let Some(ring_context) = right_drag_context.ring_context() else {
+                    self.cancel_detached_right_drag_owner(window_id, "right_drag_context_invalid");
+                    return;
+                };
+                if secondary_pressed {
+                    self.start_mouse_ring_flick(ctx, owner, ring_context, pos, None);
+                }
+                self.recognize_mouse_ring_flick_with_pos(
+                    ctx,
+                    owner,
+                    ring_context,
+                    pos,
+                    secondary_down,
+                    secondary_released,
+                )
+            }
+            RightDragMode::MouseGesture => {
+                if secondary_pressed {
+                    self.start_mouse_gesture(ctx, owner, right_drag_context, pos, None);
+                }
+                self.recognize_mouse_gesture_with_pos(
+                    ctx,
+                    owner,
+                    right_drag_context,
+                    pos,
+                    secondary_down,
+                    secondary_released,
+                )
+            }
+            RightDragMode::Disabled | RightDragMode::Unknown(_) => unreachable!(),
+        };
+        let outcome = recognition.outcome;
+        if let Some(command) = recognition.command {
+            self.queue_recognized_detached_right_drag_command(
+                window_id,
+                command,
+                "passive_right_drag_recognized",
+            );
+            ctx.request_repaint();
+        } else if outcome == MouseFlickOutcome::ShortTap {
+            // Enabled ring/gesture modes preserve the existing configurable short-click
+            // behavior, but only after activation and an owning-context mount.
+            self.queue_recognized_detached_right_drag_command(
+                window_id,
+                RightDragCommand::ViewerShortRightClick {
+                    context: right_drag_context,
+                    pos,
+                },
+                "passive_right_drag_short_tap",
+            );
+            ctx.request_repaint();
+        }
+        self.log_detached_image_window_debug(format!(
+            "passive_right_drag_sample id={window_id} sequence={sequence} \
+             pressed={secondary_pressed} down={secondary_down} released={secondary_released} \
+             outcome={outcome:?} mode={mode:?}"
+        ));
     }
 
     #[cfg(windows)]
@@ -11292,6 +11431,12 @@ impl App {
         mut batch: DetachedImageWindowEventBatch,
         defer_activations: bool,
     ) {
+        batch
+            .right_drag_events
+            .sort_by_key(|(_, event)| event.sequence);
+        for (id, event) in batch.right_drag_events.drain(..) {
+            self.apply_passive_detached_right_drag_event(ctx, id, event);
+        }
         for (id, placement) in batch.placements.drain(..) {
             self.set_detached_window_runtime_placement(id, placement, "passive_placement_update");
         }
@@ -11456,6 +11601,19 @@ impl App {
                 self.queue_deferred_detached_image_window_event(ctx, event, &mut batch);
             }
         }
+        self.apply_detached_image_window_event_batch(ctx, batch, true);
+    }
+
+    #[cfg(all(windows, test))]
+    pub(crate) fn process_passive_detached_right_drag_events_for_test(
+        &mut self,
+        ctx: &egui::Context,
+        events: Vec<(u64, crate::app::DetachedRightDragEvent)>,
+    ) {
+        let batch = DetachedImageWindowEventBatch {
+            right_drag_events: events,
+            ..Default::default()
+        };
         self.apply_detached_image_window_event_batch(ctx, batch, true);
     }
 
@@ -11659,6 +11817,7 @@ impl App {
                     }
                 }
                 let viewport_close_requested = vp_ctx.input(|i| i.viewport().close_requested());
+                let right_drag = shared.capture_right_drag_event(vp_ctx, focused);
                 let mut bar_close_requested = false;
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(egui::Color32::BLACK))
@@ -11681,8 +11840,8 @@ impl App {
                             &mut bar_close_requested,
                         );
                     });
-                // Passive deferred still windows are display-only. They contain no text input,
-                // so IME state remains owned by the root App pass.
+                // Passive deferred still windows carry only pointer samples back to the root;
+                // they contain no text input, so IME state remains owned by the root App pass.
                 shared.push_event(crate::app::DeferredDetachedImageWindowEvent::Frame {
                     id: view.id,
                     viewport_close_requested,
@@ -11691,8 +11850,13 @@ impl App {
                     placement_update,
                     pixels_per_point: ppp,
                     apply_initial_placement: view.apply_initial_placement,
+                    right_drag: right_drag.clone(),
                 });
-                if viewport_close_requested || bar_close_requested || placement_update.is_some() {
+                if viewport_close_requested
+                    || bar_close_requested
+                    || placement_update.is_some()
+                    || right_drag.is_some()
+                {
                     vp_ctx.request_repaint_of(egui::ViewportId::ROOT);
                 }
             });
@@ -11731,8 +11895,12 @@ impl App {
             let mut placement_update = None;
             let mut focused_now = false;
             let mut pixels_per_point = 1.0_f32;
-            let mut pointer_pressed = false;
-            let mut pointer_released = false;
+            let mut primary_pressed = false;
+            let mut primary_released = false;
+            let mut secondary_pressed = false;
+            let mut secondary_down = false;
+            let mut secondary_released = false;
+            let mut pointer_pos = None;
             let mut scroll_activation_candidate = false;
             let mut key_activation_candidate = false;
             let mut wheel_activation_candidate = false;
@@ -11783,14 +11951,18 @@ impl App {
                     viewport_close_requested = true;
                 }
                 (
-                    pointer_pressed,
-                    pointer_released,
+                    primary_pressed,
+                    primary_released,
+                    secondary_pressed,
+                    secondary_down,
+                    secondary_released,
+                    pointer_pos,
                     scroll_activation_candidate,
                     key_activation_candidate,
                     wheel_activation_candidate,
                 ) = vp_ctx.input(|i| {
-                    let pointer_pressed = i.pointer.any_pressed();
-                    let pointer_released = i.pointer.any_released();
+                    let primary_pressed = i.pointer.primary_pressed();
+                    let primary_released = i.pointer.primary_released();
                     let scroll = i.raw_scroll_delta != egui::Vec2::ZERO
                         || i.smooth_scroll_delta != egui::Vec2::ZERO;
                     let key = i
@@ -11801,7 +11973,17 @@ impl App {
                         .events
                         .iter()
                         .any(|event| matches!(event, egui::Event::MouseWheel { .. }));
-                    (pointer_pressed, pointer_released, scroll, key, wheel)
+                    (
+                        primary_pressed,
+                        primary_released,
+                        i.pointer.secondary_pressed(),
+                        i.pointer.secondary_down(),
+                        i.pointer.secondary_released(),
+                        i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()),
+                        scroll,
+                        key,
+                        wheel,
+                    )
                 });
 
                 egui::CentralPanel::default()
@@ -11837,6 +12019,36 @@ impl App {
                 hwnd_before.as_deref(),
             );
 
+            let right_drag_owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(window.id);
+            let right_drag_live = self.right_drag_pointer_pos(right_drag_owner).is_some();
+            let right_drag_kind = if right_drag_live && window.focused_last_frame && !focused_now {
+                Some(crate::app::DetachedRightDragEventKind::Cancel {
+                    reason: crate::app::DetachedRightDragCancelReason::FocusLost,
+                })
+            } else if right_drag_live && !secondary_down && !secondary_released {
+                Some(crate::app::DetachedRightDragEventKind::Cancel {
+                    reason: crate::app::DetachedRightDragCancelReason::ButtonStateLost,
+                })
+            } else if secondary_pressed || secondary_down || secondary_released {
+                Some(crate::app::DetachedRightDragEventKind::Input {
+                    secondary_pressed,
+                    secondary_down,
+                    secondary_released,
+                    pointer_pos,
+                })
+            } else {
+                None
+            };
+            if let Some(kind) = right_drag_kind {
+                render_batch.right_drag_events.push((
+                    window.id,
+                    crate::app::DetachedRightDragEvent {
+                        sequence: crate::app::next_detached_right_drag_event_sequence(),
+                        kind,
+                    },
+                ));
+            }
+
             if bar_close_requested {
                 render_batch.close_command_ids.push(window.id);
                 render_batch.close_ids.push(window.id);
@@ -11853,13 +12065,15 @@ impl App {
                 .find(|candidate| candidate.id == window.id)
                 .is_some_and(|candidate| candidate.has_paused_bundle());
             let focus_activation_raw = focused_now && !window.focused_last_frame;
-            let user_activation = pointer_released;
+            let user_activation = primary_released;
             let focus_edge = focused_now != window.focused_last_frame;
             if (viewport_close_requested
                 || bar_close_requested
                 || focus_edge
-                || pointer_pressed
-                || pointer_released
+                || primary_pressed
+                || primary_released
+                || secondary_pressed
+                || secondary_released
                 || scroll_activation_candidate
                 || key_activation_candidate
                 || wheel_activation_candidate)
@@ -11879,8 +12093,8 @@ impl App {
                     window.focused_last_frame,
                     focus_edge,
                     focus_activation_raw,
-                    pointer_pressed,
-                    pointer_released,
+                    primary_pressed,
+                    primary_released,
                     scroll_activation_candidate,
                     key_activation_candidate,
                     wheel_activation_candidate,
@@ -11915,8 +12129,8 @@ impl App {
                     window.activation_ready_frame,
                     self.frame_counter,
                     &mut activation_armed,
-                    pointer_pressed,
-                    pointer_released,
+                    primary_pressed,
+                    primary_released,
                 )
             {
                 self.log_detached_image_window_debug(format!(
@@ -22786,10 +23000,17 @@ impl App {
                     if secondary_in_overlay_chrome {
                         self.cancel_mouse_ring_flick();
                     } else if secondary_pressed {
-                        self.start_mouse_ring_flick(ctx, ring_context, secondary_pos, None);
+                        self.start_mouse_ring_flick(
+                            ctx,
+                            crate::ring_shortcut::RightDragOwner::Root,
+                            ring_context,
+                            secondary_pos,
+                            None,
+                        );
                     }
                     match self.update_mouse_ring_flick_with_pos(
                         ctx,
+                        crate::ring_shortcut::RightDragOwner::Root,
                         ring_context,
                         secondary_pos,
                         secondary_down,
@@ -22811,10 +23032,17 @@ impl App {
                     if secondary_in_overlay_chrome {
                         self.cancel_mouse_gesture();
                     } else if secondary_pressed {
-                        self.start_mouse_gesture(ctx, right_drag_context, secondary_pos, None);
+                        self.start_mouse_gesture(
+                            ctx,
+                            crate::ring_shortcut::RightDragOwner::Root,
+                            right_drag_context,
+                            secondary_pos,
+                            None,
+                        );
                     }
                     match self.update_mouse_gesture_with_pos(
                         ctx,
+                        crate::ring_shortcut::RightDragOwner::Root,
                         right_drag_context,
                         secondary_pos,
                         secondary_down,

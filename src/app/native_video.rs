@@ -4044,6 +4044,10 @@ impl App {
         {
             return;
         }
+        let right_drag_owner = self
+            .native_video_parked_live_input_window_id
+            .map(crate::ring_shortcut::RightDragOwner::DetachedWindow)
+            .unwrap_or(crate::ring_shortcut::RightDragOwner::Root);
         match event {
             crate::video::native_window::NativeVideoWindowEvent::CloseRequested { generation } => {
                 if !self.accept_native_video_close(fs_idx, generation, "window_close_requested") {
@@ -4064,6 +4068,7 @@ impl App {
                 if self.mouse_ring_flick.is_some() {
                     let _ = self.update_native_mouse_ring_flick(
                         ctx,
+                        right_drag_owner,
                         crate::ring_shortcut::RingShortcutContext::VideoFullscreen,
                         egui::pos2(mouse.x as f32, mouse.y as f32),
                         true,
@@ -4073,6 +4078,7 @@ impl App {
                 if self.mouse_gesture.is_some() {
                     let _ = self.update_native_mouse_gesture(
                         ctx,
+                        right_drag_owner,
                         crate::ring_shortcut::RightDragContext::VideoFullscreen,
                         egui::pos2(mouse.x as f32, mouse.y as f32),
                         true,
@@ -9564,8 +9570,16 @@ impl App {
         use crate::video::native_window::NativeVideoMouseButton;
 
         self.mark_native_video_hud_activity(ctx);
+        let right_drag_owner = self
+            .native_video_parked_live_input_window_id
+            .map(crate::ring_shortcut::RightDragOwner::DetachedWindow)
+            .unwrap_or(crate::ring_shortcut::RightDragOwner::Root);
         if event.button == NativeVideoMouseButton::Right && !event.double_click {
             let pos = egui::pos2(event.x as f32, event.y as f32);
+            let right_drag_mode = self
+                .settings
+                .ring_shortcuts
+                .right_drag_mode(crate::ring_shortcut::RightDragContext::VideoFullscreen);
             if self.fs_context_menu_idx.is_some() {
                 // The presenter receives native input behind the egui menu. Consume both
                 // press and release: letting the press through starts a ring/gesture whose
@@ -9581,29 +9595,32 @@ impl App {
             }
             if event.down {
                 self.native_video_last_move_client = Some((event.x, event.y));
-                match self
-                    .settings
-                    .ring_shortcuts
-                    .right_drag_mode(crate::ring_shortcut::RightDragContext::VideoFullscreen)
-                {
+                match right_drag_mode {
                     crate::ring_shortcut::RightDragMode::RingShortcut => self
                         .start_mouse_ring_flick(
                             ctx,
+                            right_drag_owner,
                             crate::ring_shortcut::RingShortcutContext::VideoFullscreen,
                             pos,
                             None,
                         ),
                     crate::ring_shortcut::RightDragMode::MouseGesture => self.start_mouse_gesture(
                         ctx,
+                        right_drag_owner,
                         crate::ring_shortcut::RightDragContext::VideoFullscreen,
                         pos,
                         None,
                     ),
                     crate::ring_shortcut::RightDragMode::Disabled
                     | crate::ring_shortcut::RightDragMode::Unknown(_) => {
-                        self.native_video_secondary_press_start =
-                            Some((std::time::Instant::now(), pos));
-                        ctx.request_repaint_after(std::time::Duration::from_millis(400));
+                        if right_drag_owner == crate::ring_shortcut::RightDragOwner::Root {
+                            self.native_video_secondary_press_start =
+                                Some((std::time::Instant::now(), pos));
+                            ctx.request_repaint_after(std::time::Duration::from_millis(400));
+                        } else {
+                            // Disabled right-drag keeps passive right-click as a no-op.
+                            self.native_video_secondary_press_start = None;
+                        }
                     }
                 }
                 return;
@@ -9611,6 +9628,7 @@ impl App {
             if self.mouse_ring_flick.is_some() {
                 let outcome = self.update_native_mouse_ring_flick(
                     ctx,
+                    right_drag_owner,
                     crate::ring_shortcut::RingShortcutContext::VideoFullscreen,
                     pos,
                     false,
@@ -9624,13 +9642,14 @@ impl App {
                     return;
                 }
                 if matches!(outcome, crate::ring_shortcut::MouseFlickOutcome::ShortTap) {
-                    self.handle_native_video_short_right_click(ctx, fs_idx, pos);
+                    self.handle_native_video_short_right_click(ctx, right_drag_owner, fs_idx, pos);
                     return;
                 }
             }
             if self.mouse_gesture.is_some() {
                 let outcome = self.update_native_mouse_gesture(
                     ctx,
+                    right_drag_owner,
                     crate::ring_shortcut::RightDragContext::VideoFullscreen,
                     pos,
                     false,
@@ -9644,7 +9663,7 @@ impl App {
                     return;
                 }
                 if matches!(outcome, crate::ring_shortcut::MouseFlickOutcome::ShortTap) {
-                    self.handle_native_video_short_right_click(ctx, fs_idx, pos);
+                    self.handle_native_video_short_right_click(ctx, right_drag_owner, fs_idx, pos);
                     return;
                 }
             }
@@ -9655,12 +9674,19 @@ impl App {
                         self.fs_context_menu_pos = pos;
                         ctx.request_repaint();
                     } else {
-                        self.handle_native_video_short_right_click(ctx, fs_idx, pos);
+                        self.handle_native_video_short_right_click(
+                            ctx,
+                            right_drag_owner,
+                            fs_idx,
+                            pos,
+                        );
                     }
                 }
                 return;
             }
-            self.handle_native_video_short_right_click(ctx, fs_idx, pos);
+            if right_drag_owner == crate::ring_shortcut::RightDragOwner::Root {
+                self.handle_native_video_short_right_click(ctx, right_drag_owner, fs_idx, pos);
+            }
             return;
         }
         if !event.double_click && event.down {
@@ -9792,9 +9818,22 @@ impl App {
     fn handle_native_video_short_right_click(
         &mut self,
         ctx: &egui::Context,
+        owner: crate::ring_shortcut::RightDragOwner,
         fs_idx: usize,
         pos: egui::Pos2,
     ) {
+        if let crate::ring_shortcut::RightDragOwner::DetachedWindow(window_id) = owner {
+            self.queue_recognized_detached_right_drag_command(
+                window_id,
+                crate::ring_shortcut::RightDragCommand::ViewerShortRightClick {
+                    context: crate::ring_shortcut::RightDragContext::VideoFullscreen,
+                    pos,
+                },
+                "passive_right_drag_short_tap",
+            );
+            ctx.request_repaint();
+            return;
+        }
         if self.apply_viewer_short_right_click_action(
             crate::ring_shortcut::RightDragContext::VideoFullscreen,
             Some(fs_idx),

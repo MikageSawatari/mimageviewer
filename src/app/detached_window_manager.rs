@@ -3,6 +3,8 @@ use std::collections::{HashMap, HashSet};
 use super::ActionSurface;
 #[cfg(not(test))]
 use super::App;
+#[cfg(windows)]
+use crate::ring_shortcut::RightDragCommand;
 
 #[cfg(windows)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +24,30 @@ pub(crate) enum DetachedWindowState {
     ParkedLive,
     Resuming,
     Closing,
+}
+
+/// Progress of a right-drag command recognized by a passive detached window.
+/// The command remains owned by that window until its viewer bundle is mounted.
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PendingRightDragCommand {
+    Recognized { command: RightDragCommand },
+    Activating { command: RightDragCommand },
+    PendingExecution { command: RightDragCommand },
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum DetachedActivationIntent {
+    ActivateOnly,
+    RightDrag(PendingRightDragCommand),
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DetachedActivationDispatch {
+    pub(crate) window_id: u64,
+    pub(crate) command: Option<RightDragCommand>,
 }
 
 #[cfg(windows)]
@@ -430,7 +456,7 @@ pub(crate) struct DetachedWindowRuntime {
     pub(crate) builder_placement_latch: Option<crate::settings::DetachedViewerWindowPlacement>,
     pub(crate) trim_bboxes: std::collections::HashMap<usize, DetachedTrimBBoxEntry>,
     pub(crate) linked: bool,
-    pub(crate) pending_deferred_activation: bool,
+    pub(crate) activation_intent: Option<DetachedActivationIntent>,
 }
 
 #[cfg(windows)]
@@ -444,7 +470,7 @@ impl DetachedWindowRuntime {
             builder_placement_latch: None,
             trim_bboxes: std::collections::HashMap::new(),
             linked,
-            pending_deferred_activation: false,
+            activation_intent: None,
         }
     }
 }
@@ -659,32 +685,169 @@ impl DetachedWindowManager {
         default_linked: bool,
     ) -> (bool, DetachedWindowState) {
         let runtime = self.entry_mut(window_id, default_linked);
-        let was_pending = runtime.pending_deferred_activation;
-        runtime.pending_deferred_activation = true;
+        let was_pending = runtime.activation_intent.is_some();
+        if runtime.activation_intent.is_none() {
+            runtime.activation_intent = Some(DetachedActivationIntent::ActivateOnly);
+        }
         (was_pending, runtime.state)
+    }
+
+    pub(super) fn queue_right_drag_command(
+        &mut self,
+        window_id: u64,
+        command: RightDragCommand,
+        default_linked: bool,
+    ) -> (bool, DetachedWindowState) {
+        let runtime = self.entry_mut(window_id, default_linked);
+        let accepted = !matches!(
+            runtime.activation_intent,
+            Some(DetachedActivationIntent::RightDrag(_))
+        );
+        if accepted {
+            runtime.activation_intent = Some(DetachedActivationIntent::RightDrag(
+                PendingRightDragCommand::Recognized { command },
+            ));
+        }
+        (accepted, runtime.state)
     }
 
     #[cfg(test)]
     pub(super) fn deferred_activation_pending(&self, window_id: u64) -> bool {
         self.runtime(window_id)
-            .is_some_and(|runtime| runtime.pending_deferred_activation)
+            .is_some_and(|runtime| runtime.activation_intent.is_some())
     }
 
-    pub(super) fn take_pending_deferred_activation(&mut self) -> Option<u64> {
+    #[cfg(test)]
+    pub(super) fn activation_intent(&self, window_id: u64) -> Option<&DetachedActivationIntent> {
+        self.runtime(window_id)
+            .and_then(|runtime| runtime.activation_intent.as_ref())
+    }
+
+    pub(super) fn take_pending_deferred_activation(
+        &mut self,
+    ) -> Option<DetachedActivationDispatch> {
         let mut ids = self
             .runtimes
             .iter()
             .filter(|(_, runtime)| {
-                runtime.pending_deferred_activation && runtime.state != DetachedWindowState::Closing
+                runtime.state != DetachedWindowState::Closing
+                    && matches!(
+                        runtime.activation_intent,
+                        Some(DetachedActivationIntent::ActivateOnly)
+                            | Some(DetachedActivationIntent::RightDrag(
+                                PendingRightDragCommand::Recognized { .. }
+                            ))
+                    )
             })
             .map(|(&id, _)| id)
             .collect::<Vec<_>>();
         ids.sort_unstable();
         let id = ids.into_iter().next()?;
-        if let Some(runtime) = self.runtimes.get_mut(&id) {
-            runtime.pending_deferred_activation = false;
+        let runtime = self.runtimes.get_mut(&id)?;
+        let command = match runtime.activation_intent.take()? {
+            DetachedActivationIntent::ActivateOnly => None,
+            DetachedActivationIntent::RightDrag(PendingRightDragCommand::Recognized {
+                command,
+            }) => {
+                runtime.activation_intent = Some(DetachedActivationIntent::RightDrag(
+                    PendingRightDragCommand::Activating {
+                        command: command.clone(),
+                    },
+                ));
+                Some(command)
+            }
+            other => {
+                runtime.activation_intent = Some(other);
+                return None;
+            }
+        };
+        Some(DetachedActivationDispatch {
+            window_id: id,
+            command,
+        })
+    }
+
+    pub(super) fn mark_right_drag_pending_execution(
+        &mut self,
+        window_id: u64,
+        command: RightDragCommand,
+    ) -> bool {
+        let Some(runtime) = self.runtimes.get_mut(&window_id) else {
+            return false;
+        };
+        let Some(pending) = runtime.activation_intent.take() else {
+            return false;
+        };
+        match pending {
+            DetachedActivationIntent::RightDrag(PendingRightDragCommand::Activating {
+                command: activating,
+            }) if activating == command => {
+                runtime.activation_intent = Some(DetachedActivationIntent::RightDrag(
+                    PendingRightDragCommand::PendingExecution { command },
+                ));
+                true
+            }
+            other => {
+                runtime.activation_intent = Some(other);
+                false
+            }
         }
-        Some(id)
+    }
+
+    pub(super) fn restore_activation_intent(
+        &mut self,
+        window_id: u64,
+        intent: DetachedActivationIntent,
+        default_linked: bool,
+    ) {
+        self.entry_mut(window_id, default_linked).activation_intent = Some(intent);
+    }
+
+    pub(super) fn take_pending_right_drag_execution(
+        &mut self,
+        window_id: u64,
+    ) -> Option<RightDragCommand> {
+        let runtime = self.runtimes.get_mut(&window_id)?;
+        let pending = runtime.activation_intent.take()?;
+        match pending {
+            DetachedActivationIntent::RightDrag(PendingRightDragCommand::PendingExecution {
+                command,
+            }) => Some(command),
+            other => {
+                runtime.activation_intent = Some(other);
+                None
+            }
+        }
+    }
+
+    pub(super) fn pending_right_drag_execution_window_ids(&self) -> Vec<u64> {
+        self.runtimes
+            .iter()
+            .filter_map(|(&id, runtime)| {
+                matches!(
+                    runtime.activation_intent,
+                    Some(DetachedActivationIntent::RightDrag(
+                        PendingRightDragCommand::PendingExecution { .. }
+                    ))
+                )
+                .then_some(id)
+            })
+            .collect()
+    }
+
+    pub(super) fn discard_right_drag_command(
+        &mut self,
+        window_id: u64,
+    ) -> Option<PendingRightDragCommand> {
+        let runtime = self.runtimes.get_mut(&window_id)?;
+        let pending = runtime.activation_intent.take()?;
+        match pending {
+            DetachedActivationIntent::RightDrag(command) => Some(command),
+            other => {
+                runtime.activation_intent = Some(other);
+                None
+            }
+        }
     }
 
     pub(super) fn remove(&mut self, window_id: u64) -> Option<DetachedWindowRuntime> {
@@ -778,6 +941,67 @@ impl DetachedWindowManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn short_click_command() -> RightDragCommand {
+        RightDragCommand::ViewerShortRightClick {
+            context: crate::ring_shortcut::RightDragContext::ImageFullscreen,
+            pos: egui::pos2(12.0, 34.0),
+        }
+    }
+
+    #[test]
+    fn activate_only_intent_keeps_plain_deferred_activation_behavior() {
+        let mut manager = DetachedWindowManager::new();
+        assert_eq!(manager.queue_deferred_activation(7, false).0, false);
+        assert!(matches!(
+            manager.activation_intent(7),
+            Some(DetachedActivationIntent::ActivateOnly)
+        ));
+
+        let dispatch = manager
+            .take_pending_deferred_activation()
+            .expect("plain activation dispatch");
+        assert_eq!(dispatch.window_id, 7);
+        assert!(dispatch.command.is_none());
+        assert!(manager.activation_intent(7).is_none());
+    }
+
+    #[test]
+    fn right_drag_intent_enforces_recognized_activating_pending_execution_order() {
+        let mut manager = DetachedWindowManager::new();
+        let command = short_click_command();
+        assert!(
+            manager
+                .queue_right_drag_command(9, command.clone(), false)
+                .0
+        );
+        assert!(matches!(
+            manager.activation_intent(9),
+            Some(DetachedActivationIntent::RightDrag(
+                PendingRightDragCommand::Recognized { .. }
+            ))
+        ));
+
+        let dispatch = manager
+            .take_pending_deferred_activation()
+            .expect("recognized dispatch");
+        assert_eq!(dispatch.command, Some(command.clone()));
+        assert!(matches!(
+            manager.activation_intent(9),
+            Some(DetachedActivationIntent::RightDrag(
+                PendingRightDragCommand::Activating { .. }
+            ))
+        ));
+        assert!(manager.mark_right_drag_pending_execution(9, command.clone()));
+        assert!(matches!(
+            manager.activation_intent(9),
+            Some(DetachedActivationIntent::RightDrag(
+                PendingRightDragCommand::PendingExecution { .. }
+            ))
+        ));
+        assert_eq!(manager.take_pending_right_drag_execution(9), Some(command));
+        assert!(manager.activation_intent(9).is_none());
+    }
 
     #[test]
     fn detached_input_surface_prefers_foreground_then_last_touched() {

@@ -12762,12 +12762,14 @@ impl App {
             match mode {
                 crate::ring_shortcut::RightDragMode::RingShortcut => self.start_mouse_ring_flick(
                     ctx,
+                    crate::ring_shortcut::RightDragOwner::Root,
                     crate::ring_shortcut::RingShortcutContext::Grid,
                     pos,
                     Some(idx),
                 ),
                 crate::ring_shortcut::RightDragMode::MouseGesture => self.start_mouse_gesture(
                     ctx,
+                    crate::ring_shortcut::RightDragOwner::Root,
                     crate::ring_shortcut::RightDragContext::Grid,
                     pos,
                     Some(idx),
@@ -13311,12 +13313,14 @@ impl App {
             {
                 crate::ring_shortcut::RightDragMode::RingShortcut => self.start_mouse_ring_flick(
                     ctx,
+                    crate::ring_shortcut::RightDragOwner::Root,
                     crate::ring_shortcut::RingShortcutContext::Grid,
                     pos,
                     None,
                 ),
                 crate::ring_shortcut::RightDragMode::MouseGesture => self.start_mouse_gesture(
                     ctx,
+                    crate::ring_shortcut::RightDragOwner::Root,
                     crate::ring_shortcut::RightDragContext::Grid,
                     pos,
                     None,
@@ -13333,7 +13337,11 @@ impl App {
             self.cancel_mouse_gesture();
             return;
         }
-        match self.update_mouse_ring_flick(ctx, crate::ring_shortcut::RingShortcutContext::Grid) {
+        match self.update_mouse_ring_flick(
+            ctx,
+            crate::ring_shortcut::RightDragOwner::Root,
+            crate::ring_shortcut::RingShortcutContext::Grid,
+        ) {
             crate::ring_shortcut::MouseFlickOutcome::ShortTap => {
                 let target_idx = self.mouse_ring_grid_target_idx.take();
                 self.open_grid_right_drag_short_tap_menu(ctx, target_idx);
@@ -13342,7 +13350,11 @@ impl App {
             | crate::ring_shortcut::MouseFlickOutcome::Fired
             | crate::ring_shortcut::MouseFlickOutcome::None => {}
         }
-        match self.update_mouse_gesture(ctx, crate::ring_shortcut::RightDragContext::Grid) {
+        match self.update_mouse_gesture(
+            ctx,
+            crate::ring_shortcut::RightDragOwner::Root,
+            crate::ring_shortcut::RightDragContext::Grid,
+        ) {
             crate::ring_shortcut::MouseFlickOutcome::ShortTap => {
                 let target_idx = self.mouse_gesture_grid_target_idx.take();
                 self.open_grid_right_drag_short_tap_menu(ctx, target_idx);
