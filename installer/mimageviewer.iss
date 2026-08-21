@@ -2,7 +2,7 @@
 ; Build: "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\mimageviewer.iss
 
 #define MyAppName "mImageViewer"
-#define MyAppVersion "3.1.2"
+#define MyAppVersion "3.1.3"
 #define MyAppPublisher "Mikage Sawatari"
 #define MyAppURL "https://mikage.to/mimageviewer/"
 #define MyAppExeName "mimageviewer.exe"

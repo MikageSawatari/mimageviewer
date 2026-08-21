@@ -27,22 +27,27 @@
 
 ## 3. 同型の複製を片方だけ直さない
 
-[ui_fullscreen.rs:7057](../../src/ui_fullscreen.rs:7057) の `zip_cursor_image_px`
+[ui_fullscreen.rs:7059](../../src/ui_fullscreen.rs:7059) の `zip_cursor_image_px`
 (連結表示 / 見開き合成) は `z_cursor_image_px` の**逐語的な複製**である。
 **1 つの helper に寄せる。**
+
+描画側は既にそうなっている: `zip_aim_frame_rect` ([ui_fullscreen.rs:7144](../../src/ui_fullscreen.rs:7144))
+は `displayed_image_transform::z_aim_frame_rect` へ委譲するだけの薄い関数である。
+**写像側も同じ形にする** (委譲にするか、呼び出し元を直接 `z_cursor_image_px` へ向けて
+`zip_cursor_image_px` を消すか。後者の方が関数が 1 つ減る)。
 
 呼び出し元は 2 箇所で、**どちらも view rect を手元に持っている**ので引数追加は容易:
 
 - [displayed_image_transform.rs:571](../../src/displayed_image_transform.rs:571) —
   `input.image.viewport_rect` がすぐ上にある
-- [ui_fullscreen.rs:7240](../../src/ui_fullscreen.rs:7240) — `image_rect` がそれ
+- [ui_fullscreen.rs:7242](../../src/ui_fullscreen.rs:7242) — `image_rect` がそれ
 
 ## 4. テスト
 
 既存の 2 本は前提が変わるので更新する:
 
 - `zip_cursor_image_px_maps_band_to_image_and_clamps`
-  ([ui_fullscreen.rs:43166](../../src/ui_fullscreen.rs:43166))
+  ([ui_fullscreen.rs:43710](../../src/ui_fullscreen.rs:43710))
 - `zip_pan_band_reaches_image_edge_before_top_hover_zone`
 
 後者が守っている**「上部ホバー帯へ入る前に画像上端へ届く」性質は新しい写像でも維持する**ことを
@@ -67,7 +72,7 @@
 
 ## 5.5 実機確認用のテスト画像
 
-`C:	mp\miv-zaim-test-20260820\` に 7 枚生成済み (2026-08-20)。
+`C:\tmp\miv-zaim-test-20260820\` に 7 枚生成済み (2026-08-20)。
 
 | ファイル | 寸法 | 比 | 用途 |
 | --- | --- | ---: | --- |

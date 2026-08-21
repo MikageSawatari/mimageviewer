@@ -5,6 +5,9 @@ use crate::settings::FullscreenFitMode;
 
 const EPSILON: f32 = 1.0e-6;
 const PHYSICAL_SCALE_INTEGER_EPSILON: f32 = 1.0e-4;
+/// A cursor mapping span smaller than one logical point cannot provide a stable pair of distinct
+/// pointer positions. Fall back to the full pan band before either axis becomes sub-point thin.
+const MIN_Z_AIM_MAPPING_SPAN_POINTS: f32 = 1.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct FullscreenFitScaleLimits {
@@ -532,6 +535,76 @@ pub(crate) struct ZTransformInput {
     pub(crate) pan_band: egui::Rect,
 }
 
+/// Screen-space basis shared by Z cursor mapping and aim-frame drawing.
+///
+/// Resolve this once per Z transform with the caller's actual draw scale. Keeping that content
+/// rect and its cursor-mapping intersection in one value prevents the two consumers from deriving
+/// different geometry; `content_fit` may exceed contain for spread Width/Height/Original modes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ZAimBasis {
+    view_rect: egui::Rect,
+    content_rect: egui::Rect,
+    cursor_mapping_rect: egui::Rect,
+    content_fit: f32,
+}
+
+impl ZAimBasis {
+    pub(crate) fn resolve(
+        view_rect: egui::Rect,
+        pan_band: egui::Rect,
+        content_size: egui::Vec2,
+        content_fit: f32,
+    ) -> Self {
+        if !rect_is_valid(view_rect)
+            || !size_is_valid(content_size)
+            || !content_fit.is_finite()
+            || content_fit <= 0.0
+        {
+            return Self {
+                view_rect,
+                content_rect: view_rect,
+                cursor_mapping_rect: pan_band,
+                content_fit: 1.0,
+            };
+        }
+
+        let content_half_size = content_size * (content_fit * 0.5);
+        let content_rect = egui::Rect::from_min_max(
+            view_rect.center() - content_half_size,
+            view_rect.center() + content_half_size,
+        );
+        let intersection = content_rect.intersect(pan_band);
+        let cursor_mapping_rect = if rect_is_valid(intersection)
+            && intersection.width() >= MIN_Z_AIM_MAPPING_SPAN_POINTS
+            && intersection.height() >= MIN_Z_AIM_MAPPING_SPAN_POINTS
+        {
+            intersection
+        } else {
+            pan_band
+        };
+
+        Self {
+            view_rect,
+            content_rect,
+            cursor_mapping_rect,
+            content_fit,
+        }
+    }
+
+    pub(crate) fn content_rect(self) -> egui::Rect {
+        self.content_rect
+    }
+
+    pub(crate) fn content_fit(self) -> f32 {
+        self.content_fit
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cursor_mapping_rect(self) -> egui::Rect {
+        self.cursor_mapping_rect
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ResolvedZTransform {
     pub(crate) transform: DisplayedImageTransform,
@@ -567,8 +640,13 @@ impl ResolvedZTransform {
             1.0
         };
         let factor = input.factor.clamp(factor_min, 16.0);
-        let cursor_image =
-            z_cursor_image_px(input.pan_band, content_min, content_size, input.cursor);
+        let aim_basis = ZAimBasis::resolve(
+            input.image.viewport_rect,
+            input.pan_band,
+            content_size,
+            contain,
+        );
+        let cursor_image = z_cursor_image_px(&aim_basis, content_min, content_size, input.cursor);
         let (zoom_pan, full_image_zoom, aim_frame) = if input.active {
             let (zoom_full, pan_full) = z_cover_zoom_pan(
                 view,
@@ -596,7 +674,7 @@ impl ResolvedZTransform {
                 None,
                 1.0,
                 Some(z_aim_frame_rect(
-                    input.image.viewport_rect,
+                    &aim_basis,
                     content_min,
                     content_size,
                     factor,
@@ -798,12 +876,15 @@ fn rotated_rect_aabb(rect: egui::Rect, center: egui::Pos2, theta: f32) -> egui::
     egui::Rect::from_min_max(min, max)
 }
 
-fn z_cursor_image_px(
-    band: egui::Rect,
+/// Map a screen cursor through the content-rect/pan-band intersection resolved in `ZAimBasis`.
+/// The same basis must be passed to `z_aim_frame_rect` when drawing the corresponding frame.
+pub(crate) fn z_cursor_image_px(
+    basis: &ZAimBasis,
     content_min: egui::Vec2,
     content_size: egui::Vec2,
     cursor: egui::Pos2,
 ) -> egui::Vec2 {
+    let band = basis.cursor_mapping_rect;
     let nx = ((cursor.x - band.left()) / band.width().max(1.0)).clamp(0.0, 1.0);
     let ny = ((cursor.y - band.top()) / band.height().max(1.0)).clamp(0.0, 1.0);
     content_min + egui::vec2(nx * content_size.x, ny * content_size.y)
@@ -881,19 +962,23 @@ pub(crate) fn z_bbox_zoom_pan_from_full(
 }
 
 pub(crate) fn z_aim_frame_rect(
-    view_rect: egui::Rect,
+    basis: &ZAimBasis,
     content_min: egui::Vec2,
     content_size: egui::Vec2,
     factor: f32,
     cursor: egui::Vec2,
 ) -> egui::Rect {
     if !size_is_valid(content_size) {
-        return view_rect;
+        return basis.content_rect;
     }
-    let fit = (view_rect.width() / content_size.x).min(view_rect.height() / content_size.y);
-    let content_rect = egui::Rect::from_center_size(view_rect.center(), content_size * fit);
-    let (visible, center) =
-        z_visible_source(view_rect.size(), content_size, factor, cursor - content_min);
+    let content_rect = basis.content_rect;
+    let fit = basis.content_fit;
+    let (visible, center) = z_visible_source(
+        basis.view_rect.size(),
+        content_size,
+        factor,
+        cursor - content_min,
+    );
     egui::Rect::from_min_size(
         egui::pos2(
             content_rect.left() + (center.x - visible.x * 0.5) * fit,
@@ -1390,6 +1475,40 @@ mod tests {
         let loupe_source = transform.screen_to_source(screen);
         close(source.x, loupe_source.x);
         close(source.y, loupe_source.y);
+    }
+
+    #[test]
+    fn z_aim_shared_basis_covers_trimmed_and_rotated_content() {
+        let trim = egui::Rect::from_min_max(egui::pos2(0.25, 0.0), egui::pos2(0.75, 1.0));
+        for (rotation, content_bbox) in [(Rotation::None, Some(trim)), (Rotation::Cw90, None)] {
+            let base = input(FullscreenFitMode::Page, rotation, content_bbox);
+            let display_size = rotated_size(base.texture_size, rotation);
+            let bbox = effective_bbox(rotation, 0.0, content_bbox);
+            let content_size = bbox
+                .map(|bbox| {
+                    egui::vec2(
+                        (bbox.width() * display_size.x).max(1.0),
+                        (bbox.height() * display_size.y).max(1.0),
+                    )
+                })
+                .unwrap_or(display_size);
+            let pan_band = base.viewport_rect.shrink2(egui::vec2(0.0, 60.0));
+            let content_fit = (base.viewport_rect.width() / content_size.x)
+                .min(base.viewport_rect.height() / content_size.y);
+            let basis = ZAimBasis::resolve(base.viewport_rect, pan_band, content_size, content_fit);
+            let cursor = basis.cursor_mapping_rect().left_center();
+            let resolved = ResolvedZTransform::resolve(ZTransformInput {
+                image: base,
+                active: false,
+                factor: 2.0,
+                cursor,
+                pan_band,
+            })
+            .unwrap();
+            let frame = resolved.aim_frame.unwrap();
+
+            close(frame.left(), basis.content_rect().left());
+        }
     }
 
     #[test]

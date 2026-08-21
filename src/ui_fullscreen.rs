@@ -34,8 +34,8 @@ use crate::app::{
 use crate::displayed_image_transform::{
     DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
     FullscreenPageLayout, FullscreenPageLayoutKind, ResolvedDisplayPlacement, ResolvedZTransform,
-    ZTransformInput, physical_pixel_scale, physical_scale_is_near_integer,
-    quantize_points_to_physical_pixels,
+    ZAimBasis, ZTransformInput, physical_pixel_scale, physical_scale_is_near_integer,
+    quantize_points_to_physical_pixels, z_cursor_image_px,
 };
 use crate::fs_animation::{AnimationPlayback, FsCacheEntry};
 use crate::gpu_lanczos::FullscreenPaintResource;
@@ -7051,23 +7051,6 @@ fn analysis_image_rect(full_rect: egui::Rect) -> egui::Rect {
     )
 }
 
-/// カーソルを「パン操作帯 (`band`)」基準で、パン対象のコンテンツ領域
-/// (`content_min`..`content_min + content_size`、画像ピクセル) へ写す。`band` は画面から
-/// ホバーバー領域 (上下) を差し引いた矩形で、**カーソルが band の端に達した時点でコンテンツ
-/// 領域の端まで到達**する (= 上下のホバー領域に入る前に端まで見られる。実機 FB 2026-06-21)。
-/// 表示トリム時は content をトリム後 bbox にすることで切り落とした余白へパンしない。通常は
-/// content = (0, display_size)。照準枠とズーム中パンで同じ写像を使い、両者の表示範囲を一致させる。
-fn zip_cursor_image_px(
-    band: egui::Rect,
-    content_min: egui::Vec2,
-    content_size: egui::Vec2,
-    cursor: egui::Pos2,
-) -> egui::Vec2 {
-    let nx = ((cursor.x - band.left()) / band.width().max(1.0)).clamp(0.0, 1.0);
-    let ny = ((cursor.y - band.top()) / band.height().max(1.0)).clamp(0.0, 1.0);
-    content_min + egui::vec2(nx * content_size.x, ny * content_size.y)
-}
-
 /// コンテンツ領域 (`content_size`) を cover する倍率 × `factor` で、画面に映る範囲サイズ (画像
 /// ピクセル) と、その中心 (コンテンツ領域内へ clamp 済み・`content_min` 相対) を返す。
 /// 照準枠・ズームパンの共通土台。
@@ -7143,14 +7126,14 @@ fn zip_bbox_zoom_pan_from_full(
 /// トリムが無いとき (`content_min = 0`, `content_size = display_size`) は従来の全体表示と一致する。
 #[cfg(test)]
 fn zip_aim_frame_rect(
-    view_rect: egui::Rect,
+    aim_basis: &ZAimBasis,
     content_min: egui::Vec2,
     content_size: egui::Vec2,
     factor: f32,
     cursor_img: egui::Vec2,
 ) -> egui::Rect {
     crate::displayed_image_transform::z_aim_frame_rect(
-        view_rect,
+        aim_basis,
         content_min,
         content_size,
         factor,
@@ -7162,7 +7145,7 @@ fn zip_aim_frame_rect(
 /// 見開き既定 ≈ 単ページ幅 1.2 倍)、余白が出ないよう cover で下限を取る。`draw_fs_spread` の
 /// `zoom_pan` 用に (zoom = total/fit_scale, pan) を返す。`vis` / `center` は照準枠用。
 /// `view` = 見開き描画領域サイズ、`composite` = 合成ページサイズ (左右幅合計 × 高さ)、
-/// `cursor_comp` = composite px のカーソル位置 (`zip_cursor_image_px` で band 写像済み)。
+/// `cursor_comp` = composite px のカーソル位置 (共通 Z aim basis で写像済み)。
 fn zip_spread_zoom_pan(
     view: egui::Vec2,
     composite: egui::Vec2,
@@ -7240,7 +7223,8 @@ fn resolve_spread_zip_zoom(
         1.0
     };
     let factor = factor.clamp(factor_min, 16.0);
-    let cursor_comp = zip_cursor_image_px(pan_band, egui::Vec2::ZERO, composite, cursor);
+    let aim_basis = ZAimBasis::resolve(image_rect, pan_band, composite, fit_scale);
+    let cursor_comp = z_cursor_image_px(&aim_basis, egui::Vec2::ZERO, composite, cursor);
     let (zoom, pan, vis, center_comp) = zip_spread_zoom_pan(
         image_rect.size(),
         composite,
@@ -7256,12 +7240,15 @@ fn resolve_spread_zip_zoom(
             factor,
         }
     } else {
-        let comp_disp_min = image_rect.center() - composite * (fit_scale * 0.5);
-        let frame_min = comp_disp_min
-            + egui::vec2(center_comp.x - vis.x / 2.0, center_comp.y - vis.y / 2.0) * fit_scale;
+        let frame_min = aim_basis.content_rect().min
+            + egui::vec2(center_comp.x - vis.x / 2.0, center_comp.y - vis.y / 2.0)
+                * aim_basis.content_fit();
         SpreadZipZoomResult {
             zoom_pan: None,
-            aim_frame: Some(egui::Rect::from_min_size(frame_min, vis * fit_scale)),
+            aim_frame: Some(egui::Rect::from_min_size(
+                frame_min,
+                vis * aim_basis.content_fit(),
+            )),
             factor,
         }
     }
@@ -41466,11 +41453,15 @@ mod tests {
     ) -> (f32, egui::Vec2) {
         zip_cover_zoom_pan(view, image, egui::Vec2::ZERO, image, factor, cursor)
     }
-    fn tz_aim(view: egui::Rect, image: egui::Vec2, factor: f32, cursor: egui::Vec2) -> egui::Rect {
-        zip_aim_frame_rect(view, egui::Vec2::ZERO, image, factor, cursor)
+    fn tz_basis(view: egui::Rect, band: egui::Rect, image: egui::Vec2) -> ZAimBasis {
+        let content_fit = (view.width() / image.x).min(view.height() / image.y);
+        ZAimBasis::resolve(view, band, image, content_fit)
     }
-    fn tz_cursor(band: egui::Rect, image: egui::Vec2, cursor: egui::Pos2) -> egui::Vec2 {
-        zip_cursor_image_px(band, egui::Vec2::ZERO, image, cursor)
+    fn tz_aim(basis: &ZAimBasis, image: egui::Vec2, factor: f32, cursor: egui::Vec2) -> egui::Rect {
+        zip_aim_frame_rect(basis, egui::Vec2::ZERO, image, factor, cursor)
+    }
+    fn tz_cursor(basis: &ZAimBasis, image: egui::Vec2, cursor: egui::Pos2) -> egui::Vec2 {
+        z_cursor_image_px(basis, egui::Vec2::ZERO, image, cursor)
     }
 
     // ファイル名スタックのフラット読書中に Shift+↓↑ が「スタックジャンプ」ではなく通常ページ
@@ -43936,19 +43927,26 @@ mod tests {
 
     #[test]
     fn zip_cursor_image_px_maps_band_to_image_and_clamps() {
-        // band (パン操作帯) の端でちょうど画像の端へ到達する写像。
-        let band = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, 300.0));
+        let view = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, 300.0));
+        // content_rect と pan band の交差端で画像端へ到達する写像。
+        let band = egui::Rect::from_min_max(egui::pos2(0.0, 20.0), egui::pos2(300.0, 280.0));
         let image = egui::vec2(400.0, 200.0);
-        // band 中央 → 画像中央。
-        let c = tz_cursor(band, image, band.center());
+        let basis = tz_basis(view, band, image);
+        let mapping_rect = basis.cursor_mapping_rect();
+        // 交差矩形の中央は画像中央へ写る。
+        assert_rect_close(
+            mapping_rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 75.0), egui::pos2(300.0, 225.0)),
+        );
+        let c = tz_cursor(&basis, image, mapping_rect.center());
         assert!((c.x - 200.0).abs() < 0.01 && (c.y - 100.0).abs() < 0.01);
-        // band 上端 (y=0) → 画像 y=0、band 下端 (y=300) → 画像 y=200。
-        let top = tz_cursor(band, image, egui::pos2(150.0, 0.0));
+        // 交差矩形の上下端は画像の上下端へ写る。
+        let top = tz_cursor(&basis, image, mapping_rect.center_top());
         assert!((top.y - 0.0).abs() < 0.01, "band 上端で画像上端");
-        let bottom = tz_cursor(band, image, egui::pos2(150.0, 300.0));
+        let bottom = tz_cursor(&basis, image, mapping_rect.center_bottom());
         assert!((bottom.y - 200.0).abs() < 0.01, "band 下端で画像下端");
-        // band 外 (-50,-50) → [0,image] へ clamp。
-        let outside = tz_cursor(band, image, egui::pos2(-50.0, -50.0));
+        // 交差矩形外は [0,image] へ clamp する。
+        let outside = tz_cursor(&basis, image, egui::pos2(-50.0, -50.0));
         assert!(outside.x >= 0.0 && outside.y >= 0.0);
     }
 
@@ -43963,12 +43961,90 @@ mod tests {
             egui::pos2(image_rect.left(), image_rect.top() + top_m),
             egui::pos2(image_rect.right(), image_rect.bottom() - bottom_m),
         );
+        let basis = tz_basis(image_rect, band, image);
+        assert!(basis.cursor_mapping_rect().top() >= top_m);
         // カーソルが上部ホバー帯の下端 (y=top_m) に来た時点で画像上端へ到達している。
-        let at_band_top = tz_cursor(band, image, egui::pos2(150.0, top_m));
+        let at_band_top = tz_cursor(&basis, image, egui::pos2(150.0, top_m));
         assert!((at_band_top.y - 0.0).abs() < 0.01);
         // カーソルが上部ホバー帯内 (y < top_m) でも画像上端で saturate (それ以上戻らない)。
-        let inside_hover = tz_cursor(band, image, egui::pos2(150.0, top_m * 0.5));
+        let inside_hover = tz_cursor(&basis, image, egui::pos2(150.0, top_m * 0.5));
         assert!((inside_hover.y - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn z_aim_portrait_uses_drawn_left_edge_for_cursor_mapping() {
+        let view = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 300.0));
+        let band = egui::Rect::from_min_max(egui::pos2(0.0, 40.0), egui::pos2(600.0, 260.0));
+        let image = egui::vec2(100.0, 300.0);
+        let basis = tz_basis(view, band, image);
+        let content_rect = basis.content_rect();
+
+        assert_rect_close(basis.cursor_mapping_rect(), content_rect.intersect(band));
+        let left = tz_cursor(&basis, image, content_rect.left_center());
+        assert!((left.x - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn z_aim_panorama_uses_content_rect_for_both_axes() {
+        let view = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 600.0));
+        let band = egui::Rect::from_min_max(egui::pos2(0.0, 80.0), egui::pos2(300.0, 520.0));
+        let image = egui::vec2(1200.0, 200.0);
+        let basis = tz_basis(view, band, image);
+        let content_rect = basis.content_rect();
+
+        assert_rect_close(basis.cursor_mapping_rect(), content_rect);
+        let top = tz_cursor(&basis, image, content_rect.center_top());
+        let bottom = tz_cursor(&basis, image, content_rect.center_bottom());
+        assert!((top.y - 0.0).abs() < 0.01);
+        assert!((bottom.y - image.y).abs() < 0.01);
+    }
+
+    #[test]
+    fn z_aim_no_margin_keeps_pan_band_mapping() {
+        let view = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 200.0));
+        let band = egui::Rect::from_min_max(egui::pos2(0.0, 20.0), egui::pos2(400.0, 180.0));
+        let image = egui::vec2(800.0, 400.0);
+        let basis = tz_basis(view, band, image);
+
+        assert_rect_close(basis.content_rect(), view);
+        assert_rect_close(basis.cursor_mapping_rect(), band);
+        let mapped = tz_cursor(&basis, image, egui::pos2(100.0, 60.0));
+        assert!((mapped.x - 200.0).abs() < 0.01);
+        assert!((mapped.y - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn z_aim_degenerate_intersection_falls_back_to_pan_band() {
+        let view = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
+
+        let thin_image = egui::vec2(1000.0, 1.0);
+        let thin_band = egui::Rect::from_min_max(egui::pos2(0.0, 20.0), egui::pos2(100.0, 80.0));
+        let thin_basis = tz_basis(view, thin_band, thin_image);
+        assert_rect_close(thin_basis.cursor_mapping_rect(), thin_band);
+        let thin_top = tz_cursor(&thin_basis, thin_image, thin_band.center_top());
+        let thin_bottom = tz_cursor(&thin_basis, thin_image, thin_band.center_bottom());
+        assert!((thin_top.y - 0.0).abs() < 0.01);
+        assert!((thin_bottom.y - thin_image.y).abs() < 0.01);
+
+        let empty_image = egui::vec2(1000.0, 10.0);
+        let empty_band = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 10.0));
+        let empty_basis = tz_basis(view, empty_band, empty_image);
+        assert_rect_close(empty_basis.cursor_mapping_rect(), empty_band);
+        let empty_mid = tz_cursor(&empty_basis, empty_image, empty_band.center());
+        assert!((empty_mid.y - empty_image.y * 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn z_aim_mapping_and_frame_share_one_resolved_basis() {
+        let view = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 300.0));
+        let band = egui::Rect::from_min_max(egui::pos2(0.0, 40.0), egui::pos2(600.0, 260.0));
+        let image = egui::vec2(100.0, 300.0);
+        let basis = tz_basis(view, band, image);
+        let cursor_image = tz_cursor(&basis, image, basis.cursor_mapping_rect().left_center());
+        let frame = tz_aim(&basis, image, 2.0, cursor_image);
+
+        assert!((cursor_image.x - 0.0).abs() < 0.01);
+        assert!((frame.left() - basis.content_rect().left()).abs() < 0.01);
     }
 
     #[test]
@@ -43980,8 +44056,9 @@ mod tests {
         let factor = 2.0;
         // contain 上端付近を指す (レターボックスでズレやすい点)。
         let cursor = egui::pos2(150.0, 80.0);
-        let cursor_img = tz_cursor(view_rect, image, cursor);
-        let frame = tz_aim(view_rect, image, factor, cursor_img);
+        let basis = tz_basis(view_rect, view_rect, image);
+        let cursor_img = tz_cursor(&basis, image, cursor);
+        let frame = tz_aim(&basis, image, factor, cursor_img);
         let (zoom, pan) = tz_pan(view_rect.size(), image, factor, cursor_img);
         // ズーム時、枠の画像範囲が画面いっぱい (view_rect) に写ることを検算する。
         // contain fit と total scale。
@@ -44016,8 +44093,9 @@ mod tests {
         let image = egui::vec2(400.0, 200.0);
         // contain fit = 0.75。表示画像 = 300x150、中央 (y:75..225)。中央を指す。
         let cursor_img = egui::vec2(200.0, 100.0);
-        let f1 = tz_aim(view, image, 1.0, cursor_img);
-        let f2 = tz_aim(view, image, 2.0, cursor_img);
+        let basis = tz_basis(view, view, image);
+        let f1 = tz_aim(&basis, image, 1.0, cursor_img);
+        let f2 = tz_aim(&basis, image, 2.0, cursor_img);
         assert!(
             f2.width() < f1.width() && f2.height() < f1.height(),
             "factor が大きいほど枠は小さい"
@@ -44060,7 +44138,9 @@ mod tests {
             "オーバービューはトリム後コンテンツ基準 (全体画像より狭い)"
         );
 
-        let frame = zip_aim_frame_rect(view, content_min, content_size, factor, cursor_img);
+        let content_fit = (view.width() / content_size.x).min(view.height() / content_size.y);
+        let basis = ZAimBasis::resolve(view, view, content_size, content_fit);
+        let frame = zip_aim_frame_rect(&basis, content_min, content_size, factor, cursor_img);
         // 枠はコンテンツ表示矩形の中に収まる (余白側へはみ出さない)。
         assert!(
             frame.left() >= content_disp.left() - 0.5
@@ -44976,6 +45056,84 @@ mod tests {
     }
 
     #[test]
+    fn spread_zip_aim_uses_non_contain_draw_scale() {
+        let image_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 300.0));
+        let pan_band = egui::Rect::from_min_max(egui::pos2(0.0, 40.0), egui::pos2(600.0, 260.0));
+        let fit_size = egui::vec2(400.0, 800.0);
+        let spread_gap = 4.0;
+        let fit_scale = 1.0;
+        let composite = egui::vec2(fit_size.x + spread_gap / fit_scale, fit_size.y);
+        let contain = (image_rect.width() / composite.x).min(image_rect.height() / composite.y);
+        assert!(fit_scale > contain);
+
+        let drawn_half_size = composite * (fit_scale * 0.5);
+        let drawn_rect = egui::Rect::from_min_max(
+            image_rect.center() - drawn_half_size,
+            image_rect.center() + drawn_half_size,
+        );
+        let cursor = drawn_rect.intersect(pan_band).left_top();
+        let factor = 1.0;
+        let result = resolve_spread_zip_zoom(
+            image_rect, pan_band, cursor, fit_size, spread_gap, fit_scale, factor, false,
+        );
+        let (_, _, visible, _) = zip_spread_zoom_pan(
+            image_rect.size(),
+            composite,
+            fit_size.x * 0.5,
+            factor,
+            fit_scale,
+            egui::Vec2::ZERO,
+        );
+
+        assert_rect_close(
+            result.aim_frame.unwrap(),
+            egui::Rect::from_min_size(drawn_rect.min, visible * fit_scale),
+        );
+    }
+
+    #[test]
+    fn spread_page_fit_aim_frame_matches_legacy_formula_bit_for_bit() {
+        fn rect_bits(rect: egui::Rect) -> [u32; 4] {
+            [
+                rect.left().to_bits(),
+                rect.top().to_bits(),
+                rect.right().to_bits(),
+                rect.bottom().to_bits(),
+            ]
+        }
+
+        let image_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        let pan_band = egui::Rect::from_min_max(egui::pos2(0.0, 80.0), egui::pos2(1920.0, 1000.0));
+        let fit_size = egui::vec2(1600.0, 1200.0);
+        let spread_gap = 4.0;
+        let fit_scale =
+            ((image_rect.width() - spread_gap) / fit_size.x).min(image_rect.height() / fit_size.y);
+        let composite = egui::vec2(fit_size.x + spread_gap / fit_scale, fit_size.y);
+        let factor = 1.25;
+        let cursor = image_rect.center();
+        let result = resolve_spread_zip_zoom(
+            image_rect, pan_band, cursor, fit_size, spread_gap, fit_scale, factor, false,
+        );
+
+        let (_, _, visible, center) = zip_spread_zoom_pan(
+            image_rect.size(),
+            composite,
+            fit_size.x * 0.5,
+            factor,
+            fit_scale,
+            composite * 0.5,
+        );
+        let legacy_min = image_rect.center() - composite * (fit_scale * 0.5)
+            + egui::vec2(center.x - visible.x * 0.5, center.y - visible.y * 0.5) * fit_scale;
+        let legacy_frame = egui::Rect::from_min_size(legacy_min, visible * fit_scale);
+
+        assert_eq!(
+            rect_bits(result.aim_frame.unwrap()),
+            rect_bits(legacy_frame)
+        );
+    }
+
+    #[test]
     fn spread_zip_zoom_for_non_original_fit_keeps_matched_geometry_zoom_and_pan() {
         let full_bbox = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
         let image_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
@@ -45006,7 +45164,7 @@ mod tests {
         assert_f32_close(result.factor, 1.25);
         assert_f32_close(zoom, 3.921_568_6);
         assert_f32_close(pan.x, 1047.843_1);
-        assert_f32_close(pan.y, 871.088_87);
+        assert_f32_close(pan.y, 871.764_65);
     }
 
     #[test]
