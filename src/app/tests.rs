@@ -32598,6 +32598,11 @@ mod still_window_mode_key_tests {
         let ctx = egui::Context::default();
         let idx = push_image(&mut app, r"C:\pics\mismatch.jpg");
         app.fullscreen_idx = Some(idx);
+        app.detached_image_windows.push(paused_test_window(
+            &ctx,
+            51,
+            passive_right_drag_image_bundle(r"C:\pics\detached-mismatch.jpg"),
+        ));
         app.queue_recognized_detached_right_drag_command(51, passive_rotate_command(), "test");
         let dispatch = app
             .take_pending_deferred_detached_window_activation()
@@ -32618,10 +32623,27 @@ mod still_window_mode_key_tests {
     fn descriptor_pending_execution_waits_for_fullscreen_state_then_discards_on_target_change() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
+        let recognized_idx = push_image(&mut app, r"C:\pics\recognized-target.jpg");
+        app.fullscreen_idx = Some(recognized_idx);
+        let recognized_stamp = app
+            .viewer_sync_stamp_for_idx(recognized_idx)
+            .expect("recognized viewer stamp");
+        let mut descriptor_snapshot = paused_test_window(
+            &ctx,
+            61,
+            passive_right_drag_image_bundle(r"C:\pics\recognized-target.jpg"),
+        );
+        descriptor_snapshot.paused_bundle = None;
+        descriptor_snapshot.reopen_descriptor = Some(ViewerContextDescriptor::BookFolder {
+            path: PathBuf::from(r"C:\pics"),
+        });
+        descriptor_snapshot.reopen_sync_stamp = Some(recognized_stamp);
+        app.detached_image_windows.push(descriptor_snapshot);
+        app.queue_recognized_detached_right_drag_command(61, passive_rotate_command(), "test");
+
         app.begin_active_detached_session(61, DetachedSource::Book);
         app.detached_viewer_window_id = Some(61);
         app.fullscreen_idx = None;
-        app.queue_recognized_detached_right_drag_command(61, passive_rotate_command(), "test");
         let dispatch = app
             .take_pending_deferred_detached_window_activation()
             .expect("recognized descriptor dispatch");
@@ -32638,13 +32660,19 @@ mod still_window_mode_key_tests {
             ))
         ));
 
-        app.items = vec![GridItem::Video(PathBuf::from(
-            r"C:\clips\changed-target.mp4",
+        app.items_generation = app.items_generation.saturating_add(1);
+        app.items = vec![GridItem::Image(PathBuf::from(
+            r"C:\pics\changed-target.jpg",
         ))];
         app.thumbnails = vec![ThumbnailState::Pending];
         app.image_metas = vec![None];
         app.visible_indices = vec![0];
         app.fullscreen_idx = Some(0);
+        assert_eq!(
+            app.current_right_drag_context(),
+            crate::ring_shortcut::RightDragContext::ImageFullscreen,
+            "the replacement must keep the same context kind"
+        );
         assert!(!app.execute_pending_right_drag_command_in_mounted_context(&ctx));
         assert!(app.detached_window_manager.activation_intent(61).is_none());
         assert!(app.rotation_cache.is_empty());

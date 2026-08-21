@@ -140,7 +140,7 @@ pub(crate) use detached_window_manager::{
     DetachedActivationWatchDiagnostic, DetachedActivationWatchSample, DetachedActivationWatchState,
     DetachedActivationWatchStepResult, DetachedActivationWatchTarget,
     DetachedActivationWatchTargetRect, DetachedCloseRequest, DetachedWindowHwndDiff,
-    DetachedWindowManager, DetachedWindowRuntime, DetachedWindowState,
+    DetachedWindowManager, DetachedWindowRuntime, DetachedWindowState, IdentifiedRightDragCommand,
     MainFontAtlasResyncFrameSafety,
 };
 #[cfg(all(windows, test))]
@@ -395,6 +395,13 @@ pub(crate) struct ViewerSyncStamp {
     idx: usize,
     item_key: String,
     items_generation: u64,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DetachedRightDragViewerIdentity {
+    ItemsGeneration(u64),
+    ReopenSyncStamp(ViewerSyncStamp),
 }
 
 // フィールド型 (ViewerContextDescriptor / ViewerContextBundle) が cfg(windows) の
@@ -695,6 +702,17 @@ impl DetachedImageWindowSnapshot {
                 _ => crate::ring_shortcut::RightDragContext::ImageFullscreen,
             })
             .unwrap_or(crate::ring_shortcut::RightDragContext::ImageFullscreen)
+    }
+
+    pub(crate) fn right_drag_viewer_identity(&self) -> Option<DetachedRightDragViewerIdentity> {
+        self.paused_bundle
+            .as_deref()
+            .map(|bundle| DetachedRightDragViewerIdentity::ItemsGeneration(bundle.items_generation))
+            .or_else(|| {
+                self.reopen_sync_stamp
+                    .clone()
+                    .map(DetachedRightDragViewerIdentity::ReopenSyncStamp)
+            })
     }
 }
 
@@ -1229,10 +1247,25 @@ impl App {
             ));
             return false;
         }
+        let Some(viewer_identity) = self
+            .detached_image_windows
+            .iter()
+            .find(|window| window.id == window_id)
+            .and_then(DetachedImageWindowSnapshot::right_drag_viewer_identity)
+        else {
+            self.log_detached_image_window_debug(format!(
+                "right_drag_command_dropped id={window_id} phase=recognized \
+                 reason=viewer_identity_unavailable"
+            ));
+            return false;
+        };
         let default_linked = self.detached_window_runtime_default_linked();
         let (accepted, state) = self.detached_window_manager.queue_right_drag_command(
             window_id,
-            command,
+            IdentifiedRightDragCommand {
+                command,
+                viewer_identity,
+            },
             default_linked,
         );
         self.log_detached_image_window_debug(format!(
@@ -2034,12 +2067,30 @@ impl App {
             // materializes a fullscreen target; this is state-based, not a time window.
             return false;
         };
-        let Some(command) = self
+        let Some(identified_command) = self
             .detached_window_manager
             .take_pending_right_drag_execution(window_id)
         else {
             return false;
         };
+        let identity_matches = match &identified_command.viewer_identity {
+            DetachedRightDragViewerIdentity::ItemsGeneration(expected) => {
+                self.items_generation == *expected
+            }
+            DetachedRightDragViewerIdentity::ReopenSyncStamp(expected) => {
+                self.resolve_viewer_sync_stamp_idx(expected) == Some(fs_idx)
+            }
+        };
+        if !identity_matches {
+            self.log_detached_image_window_debug(format!(
+                "right_drag_command_dropped id={window_id} phase=pending_execution \
+                 reason=viewer_identity_changed expected={:?} \
+                 mounted_items_generation={} fs_idx={fs_idx}",
+                identified_command.viewer_identity, self.items_generation
+            ));
+            return false;
+        }
+        let command = identified_command.command;
         let expected_context = command.context();
         let mounted_context = self.current_right_drag_context();
         if mounted_context != expected_context {

@@ -4,6 +4,8 @@ use super::ActionSurface;
 #[cfg(not(test))]
 use super::App;
 #[cfg(windows)]
+use super::DetachedRightDragViewerIdentity;
+#[cfg(windows)]
 use crate::ring_shortcut::RightDragCommand;
 
 #[cfg(windows)]
@@ -30,10 +32,17 @@ pub(crate) enum DetachedWindowState {
 /// The command remains owned by that window until its viewer bundle is mounted.
 #[cfg(windows)]
 #[derive(Clone, Debug, PartialEq)]
+pub(crate) struct IdentifiedRightDragCommand {
+    pub(crate) command: RightDragCommand,
+    pub(crate) viewer_identity: DetachedRightDragViewerIdentity,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PendingRightDragCommand {
-    Recognized { command: RightDragCommand },
-    Activating { command: RightDragCommand },
-    PendingExecution { command: RightDragCommand },
+    Recognized { command: IdentifiedRightDragCommand },
+    Activating { command: IdentifiedRightDragCommand },
+    PendingExecution { command: IdentifiedRightDragCommand },
 }
 
 #[cfg(windows)]
@@ -47,7 +56,7 @@ pub(crate) enum DetachedActivationIntent {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DetachedActivationDispatch {
     pub(crate) window_id: u64,
-    pub(crate) command: Option<RightDragCommand>,
+    pub(crate) command: Option<IdentifiedRightDragCommand>,
 }
 
 #[cfg(windows)]
@@ -695,7 +704,7 @@ impl DetachedWindowManager {
     pub(super) fn queue_right_drag_command(
         &mut self,
         window_id: u64,
-        command: RightDragCommand,
+        command: IdentifiedRightDragCommand,
         default_linked: bool,
     ) -> (bool, DetachedWindowState) {
         let runtime = self.entry_mut(window_id, default_linked);
@@ -770,7 +779,7 @@ impl DetachedWindowManager {
     pub(super) fn mark_right_drag_pending_execution(
         &mut self,
         window_id: u64,
-        command: RightDragCommand,
+        command: IdentifiedRightDragCommand,
     ) -> bool {
         let Some(runtime) = self.runtimes.get_mut(&window_id) else {
             return false;
@@ -806,7 +815,7 @@ impl DetachedWindowManager {
     pub(super) fn take_pending_right_drag_execution(
         &mut self,
         window_id: u64,
-    ) -> Option<RightDragCommand> {
+    ) -> Option<IdentifiedRightDragCommand> {
         let runtime = self.runtimes.get_mut(&window_id)?;
         let pending = runtime.activation_intent.take()?;
         match pending {
@@ -949,6 +958,13 @@ mod tests {
         }
     }
 
+    fn identified(command: RightDragCommand) -> IdentifiedRightDragCommand {
+        IdentifiedRightDragCommand {
+            command,
+            viewer_identity: DetachedRightDragViewerIdentity::ItemsGeneration(17),
+        }
+    }
+
     #[test]
     fn activate_only_intent_keeps_plain_deferred_activation_behavior() {
         let mut manager = DetachedWindowManager::new();
@@ -969,7 +985,7 @@ mod tests {
     #[test]
     fn right_drag_intent_enforces_recognized_activating_pending_execution_order() {
         let mut manager = DetachedWindowManager::new();
-        let command = short_click_command();
+        let command = identified(short_click_command());
         assert!(
             manager
                 .queue_right_drag_command(9, command.clone(), false)
