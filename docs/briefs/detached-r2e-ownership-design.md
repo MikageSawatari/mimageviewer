@@ -187,7 +187,56 @@ Codex レビューで、**どちらも registry の完成を待つ必要が無�
 
 ---
 
-## 6. 聞きたいこと (第 2 版)
+## 6. 第 2 版に残った BLOCKER (第 3 版で解く)
+
+Codex 第 2 版レビュー (2026-08-21) の結果。**§4 のステージ分割ごと作り直す必要がある。**
+
+1. **所有の transaction が無い。** `extract_mounted_viewer_context` が生の bundle を返す時点で、
+   「マウントされていない bundle は必ず registry が持つ」という §2 の不変条件が破れる。
+   `start_active_detached_book_context_with_start` は
+   「main を抜く → App 上で detached を組む → detached を抜く → main を恒久復帰」
+   ([app.rs:39778](../../src/app.rs:39778) → [39832](../../src/app.rs:39832) →
+   [39885](../../src/app.rs:39885) → [39886](../../src/app.rs:39886)) という形で、
+   `with_viewer_context` (常に元へ戻す契約) では表せない。
+   **`begin_build(reserved_id)` → `commit_and_restore_previous` の transaction が要る**。
+   `Vacant` / `Building` は transaction の内部状態にし、生 bundle を返す API にしない。
+   さらに 2 つの正当な遷移に API が無い:
+   - main をマウントしたまま 2 個目の bundle を作る `split_current_context_preserving_main_grid`
+     ([app.rs:40949](../../src/app.rs:40949)) → **atomic な fork / insert_unmounted** が要る
+   - 終端削除は drop 前に中身を読む必要がある (bookmark 照合 [app.rs:40523](../../src/app.rs:40523)、
+     media teardown [app.rs:38725](../../src/app.rs:38725))。「アンマウント後に slot を消す」では足りない
+2. **window_id → ViewerContextId の対応表が設計に無い。** 今は active holder も parked snapshot も
+   bundle しか持たず ([app.rs:1866](../../src/app.rs:1866) / [app.rs:402](../../src/app.rs:402))、
+   `ActiveDetachedSession` と `DetachedWindowRuntime` は window_id しか持たない。
+   アクティブ化は window_id から始まる ([app.rs:40065](../../src/app.rs:40065)) ので、
+   対応表が無いと slot を選べない。**window_id からは推論できない** (再オープンで再利用されるため、
+   [app.rs:37568](../../src/app.rs:37568))。どこに置くかを設計で決めること。
+3. **R2e-1 / R2e-2 の切り方はコンパイルできない。** 消費側が `active.bundle` や各
+   `paused_bundle` を直接触っている ([app.rs:27609](../../src/app.rs:27609) /
+   [app.rs:40523](../../src/app.rs:40523) / [app.rs:38725](../../src/app.rs:38725)) ので、
+   R2e-1 で保管フィールドを消すと同時に移行するしかない。
+   **正しい分割**: ①registry の状態機械と build transaction を production の保管を切らずに定義・テスト →
+   ②保管・active/parked の owner 参照・生プリミティブ・終端 teardown・直接消費者を**一括で**切替 →
+   ③残った手書き巡回の単純化 → ④非同期の要求 identity 変換 (`items_generation` は残す)。
+   **完了確認は grep ではなくコンパイラ + AST allowlist**: 生成 / exhaustive destructure /
+   生の抽出 / 所有を動かす `mem::swap` を registry モジュール private にし、
+   `syn` ベースの CI 監査でモジュール外の `ViewerContextBundle` 生成・返却・保管を弾く。
+4. **§1.3 の「Building には identity が無い」は誤り。** context serial は load 開始前に払い出され
+   ([app.rs:39793](../../src/app.rs:39793))、window_id もその直後に確定する
+   ([app.rs:39798](../../src/app.rs:39798))。正しくは **「identity は予約済みだが未 commit」**。
+   build transaction は予約済み `ViewerContextId` を保持すること。
+
+その他の訂正: 非テストの `swap_viewer_context_bundle` 呼び出しは 52 ではなく **50**。
+§1.1 の保管一覧は、終端 close が生 bundle を返す ([app.rs:37853](../../src/app.rs:37853))、
+media teardown が `Vec<Box<ViewerContextBundle>>` を持つ ([app.rs:38739](../../src/app.rs:38739))
+といった一時所有を含めると網羅ではない。
+
+**Codex の推奨作業順**: §1.99 → §1.100 → R2e (再設計後)。前 2 件は registry 非依存であることに
+Codex も同意した。ただし両方とも §11 のリワーク外合意プロセスで記録すること。
+
+---
+
+## 7. 第 2 版で聞いたこと (回答済み)
 
 1. §2 の phase / slots / stack で、§1.3 と §1.4 の状態を**過不足なく**表現できているか。
    まだ表現できない現行の正当な状態が残っていないか。
