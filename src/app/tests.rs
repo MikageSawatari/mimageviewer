@@ -31584,7 +31584,7 @@ mod fullscreen_main_focus_guard_tests {
 
 #[cfg(all(test, windows))]
 mod still_window_mode_key_tests {
-    use super::phase_c_support::setup_app;
+    use super::phase_c_support::{AppTestEnv, setup_app};
     use super::*;
     use crate::settings::ThumbAspect;
 
@@ -35096,6 +35096,403 @@ mod still_window_mode_key_tests {
             None,
             "terminal close before viewport creation must remove the window runtime"
         );
+    }
+
+    fn install_convertible_archive_main_grid(
+        app: &mut AppTestEnv,
+        source: PathBuf,
+        format: ArchiveFormat,
+    ) -> (PathBuf, u64) {
+        let main_folder = app.tmp.path().join("main-grid");
+        std::fs::create_dir_all(&main_folder).unwrap();
+        app.current_folder = Some(main_folder.clone());
+        app.address = main_folder.to_string_lossy().to_string();
+        app.items = vec![GridItem::ConvertibleArchive {
+            path: source,
+            format,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.search_filter = Some(std::collections::HashSet::from([0]));
+        app.show_search_bar = true;
+        app.selected = Some(0);
+        app.scroll_offset_y = 219.0;
+        app.settings.detached_viewer_open_images_in_window = true;
+        (main_folder, app.items_generation)
+    }
+
+    fn assert_convertible_archive_main_grid_unchanged(
+        app: &App,
+        main_folder: &Path,
+        source: &Path,
+        items_generation: u64,
+    ) {
+        assert_eq!(app.current_folder.as_deref(), Some(main_folder));
+        assert_eq!(app.items_generation, items_generation);
+        assert!(matches!(
+            app.items.as_slice(),
+            [GridItem::ConvertibleArchive { path, .. }]
+                if crate::folder_tree::path_eq(path, source)
+        ));
+        assert_eq!(app.visible_indices, vec![0]);
+        assert_eq!(
+            app.search_filter,
+            Some(std::collections::HashSet::from([0]))
+        );
+        assert!(app.show_search_bar);
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.scroll_offset_y, 219.0);
+    }
+
+    fn install_detached_grid_archive_completion(
+        app: &mut App,
+        source: PathBuf,
+        format: ArchiveFormat,
+        pending_direct_nav: Option<PathBuf>,
+        pending_nav: Option<PathBuf>,
+    ) -> (
+        crate::app::DetachedGridArchiveOpenRequestOwner,
+        mpsc::Sender<crate::ui_dialogs::archive_convert::ArchiveConvertMsg>,
+        Arc<AtomicBool>,
+    ) {
+        app.detached_grid_archive_open_request_seq = app
+            .detached_grid_archive_open_request_seq
+            .checked_add(1)
+            .unwrap();
+        let owner = crate::app::DetachedGridArchiveOpenRequestOwner {
+            request_id: app.detached_grid_archive_open_request_seq,
+            source_path: source.clone(),
+        };
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            src_path: source,
+            input_seq: app.input_seq,
+            format,
+            password: None,
+            password_input: String::new(),
+            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+            cancel: Arc::clone(&cancel),
+            rx,
+            pending_nav,
+            pending_direct_nav,
+            allow_direct_read: format == ArchiveFormat::Rar,
+            fallback_cached_zip: None,
+            completion: crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::DetachedGridArchive(
+                owner.clone(),
+            ),
+            pending_sibling_output: None,
+            nav_history_rollback: None,
+            auto_fullscreen: true,
+            deferred_fullscreen: None,
+            suppress_confirm: false,
+            suppress_confirm_next_time: false,
+        });
+        (owner, tx, cancel)
+    }
+
+    fn assert_detached_archive_backing(app: &App, source: &Path, backing_archive: &Path) {
+        let active = app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("archive completion must create a detached reader context");
+        assert_eq!(
+            active.bundle.archive_source_override.as_deref(),
+            Some(source)
+        );
+        assert_eq!(
+            active.bundle.current_folder.as_deref(),
+            Some(backing_archive)
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn convertible_archive_grid_open_uses_candidate_plan_without_mutating_main_grid() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("candidate.7z");
+        std::fs::write(&source, b"7z fixture").unwrap();
+        let (main_folder, items_generation) =
+            install_convertible_archive_main_grid(&mut app, source.clone(), ArchiveFormat::SevenZ);
+
+        assert!(matches!(
+            app.detached_grid_item_open_plan(0, false),
+            Some(DetachedGridItemOpenPlan::ConvertibleArchiveCandidate { path })
+                if path == source
+        ));
+        assert!(
+            app.open_grid_item_in_detached_book_context_with_auto_fullscreen(
+                &egui::Context::default(),
+                0,
+                false,
+            )
+        );
+
+        assert_convertible_archive_main_grid_unchanged(
+            &app,
+            &main_folder,
+            &source,
+            items_generation,
+        );
+        let state = app
+            .archive_convert
+            .as_ref()
+            .expect("candidate must retain main-owned probe state");
+        assert!(matches!(
+            &state.completion,
+            crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::DetachedGridArchive(owner)
+                if owner.source_path == source
+        ));
+        assert_eq!(
+            state.auto_fullscreen,
+            app.settings.effective_auto_fullscreen_zip_pdf()
+        );
+        assert!(app.active_detached_viewer_context.is_none());
+        state.cancel.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_grid_archive_direct_read_completion_opens_detached_without_main_navigation() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("selected.part2.rar");
+        let backing = app.tmp.path().join("resolved.part1.rar");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&backing, b"backing").unwrap();
+        let (main_folder, items_generation) =
+            install_convertible_archive_main_grid(&mut app, source.clone(), ArchiveFormat::Rar);
+        let (_owner, _tx, _cancel) = install_detached_grid_archive_completion(
+            &mut app,
+            source.clone(),
+            ArchiveFormat::Rar,
+            Some(backing.clone()),
+            None,
+        );
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_archive_convert_dialog(ctx);
+        });
+
+        assert!(app.archive_convert.is_none());
+        assert_convertible_archive_main_grid_unchanged(
+            &app,
+            &main_folder,
+            &source,
+            items_generation,
+        );
+        assert_detached_archive_backing(&app, &source, &backing);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_grid_archive_conversion_completion_opens_detached_without_main_navigation() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("converted.7z");
+        let backing = app.tmp.path().join("converted-cache.zip");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&backing, b"cache").unwrap();
+        let (main_folder, items_generation) =
+            install_convertible_archive_main_grid(&mut app, source.clone(), ArchiveFormat::SevenZ);
+        let (_owner, _tx, _cancel) = install_detached_grid_archive_completion(
+            &mut app,
+            source.clone(),
+            ArchiveFormat::SevenZ,
+            None,
+            Some(backing.clone()),
+        );
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_archive_convert_dialog(ctx);
+        });
+
+        assert!(app.archive_convert.is_none());
+        assert_convertible_archive_main_grid_unchanged(
+            &app,
+            &main_folder,
+            &source,
+            items_generation,
+        );
+        assert_detached_archive_backing(&app, &source, &backing);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_grid_archive_cache_hit_opens_detached_without_main_navigation() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("cached.7z");
+        let backing = app.tmp.path().join("cached.zip");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&backing, b"cache").unwrap();
+        let metadata = std::fs::metadata(&source).unwrap();
+        app.archive_cache_db
+            .as_ref()
+            .unwrap()
+            .record(
+                &source,
+                crate::ui_helpers::mtime_secs(&metadata),
+                metadata.len() as i64,
+                ArchiveFormat::SevenZ,
+                &backing,
+                std::fs::metadata(&backing).unwrap().len() as i64,
+                1,
+                false,
+            )
+            .unwrap();
+        let (main_folder, items_generation) =
+            install_convertible_archive_main_grid(&mut app, source.clone(), ArchiveFormat::SevenZ);
+
+        assert!(
+            app.open_grid_item_in_detached_book_context_with_auto_fullscreen(
+                &egui::Context::default(),
+                0,
+                false,
+            )
+        );
+
+        assert!(app.archive_convert.is_none());
+        assert_convertible_archive_main_grid_unchanged(
+            &app,
+            &main_folder,
+            &source,
+            items_generation,
+        );
+        assert_detached_archive_backing(&app, &source, &backing);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn normal_navigation_explicitly_cancels_stale_detached_grid_archive_request() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("stale.7z");
+        std::fs::write(&source, b"source").unwrap();
+        let (_main_folder, _items_generation) =
+            install_convertible_archive_main_grid(&mut app, source.clone(), ArchiveFormat::SevenZ);
+        let (owner, _tx, cancel) = install_detached_grid_archive_completion(
+            &mut app,
+            source,
+            ArchiveFormat::SevenZ,
+            None,
+            None,
+        );
+        let destination = app.tmp.path().join("normal-destination");
+        std::fs::create_dir_all(&destination).unwrap();
+
+        app.load_folder(destination.clone());
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.archive_convert.is_none());
+        assert!(!app.detached_grid_archive_open_owner_is_current(&owner));
+        assert_eq!(app.current_folder, Some(destination));
+        assert!(app.active_detached_viewer_context.is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_grid_archive_worker_cancellation_invalidates_request_without_main_navigation() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("cancelled.7z");
+        std::fs::write(&source, b"source").unwrap();
+        let (main_folder, items_generation) =
+            install_convertible_archive_main_grid(&mut app, source.clone(), ArchiveFormat::SevenZ);
+        let (owner, tx, _cancel) = install_detached_grid_archive_completion(
+            &mut app,
+            source.clone(),
+            ArchiveFormat::SevenZ,
+            None,
+            None,
+        );
+        tx.send(
+            crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Err(
+                crate::archive_converter::ConvertError::Cancelled,
+            )),
+        )
+        .unwrap();
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_archive_convert_dialog(ctx);
+        });
+
+        assert!(app.archive_convert.is_none());
+        assert!(!app.detached_grid_archive_open_owner_is_current(&owner));
+        assert_convertible_archive_main_grid_unchanged(
+            &app,
+            &main_folder,
+            &source,
+            items_generation,
+        );
+        assert!(app.active_detached_viewer_context.is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn full_feature_convertible_archive_cache_hit_keeps_main_navigation_behavior() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("legacy.7z");
+        let backing = app.tmp.path().join("legacy-cache.zip");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&backing, b"cache").unwrap();
+        let metadata = std::fs::metadata(&source).unwrap();
+        app.archive_cache_db
+            .as_ref()
+            .unwrap()
+            .record(
+                &source,
+                crate::ui_helpers::mtime_secs(&metadata),
+                metadata.len() as i64,
+                ArchiveFormat::SevenZ,
+                &backing,
+                std::fs::metadata(&backing).unwrap().len() as i64,
+                1,
+                false,
+            )
+            .unwrap();
+        install_convertible_archive_main_grid(&mut app, source.clone(), ArchiveFormat::SevenZ);
+        app.settings.detached_viewer_open_images_in_window = false;
+
+        assert!(app.detached_grid_item_open_plan(0, false).is_none());
+        assert_eq!(
+            app.load_folder_or_convert_archive_with_auto_fullscreen(source.clone(), false),
+            FolderOpenOutcome::Loaded
+        );
+
+        assert_eq!(app.current_folder.as_deref(), Some(backing.as_path()));
+        assert_eq!(
+            app.archive_source_override.as_deref(),
+            Some(source.as_path())
+        );
+        assert!(app.active_detached_viewer_context.is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_grid_archive_candidate_does_not_change_zip_pdf_descriptor_plans() {
+        let mut app = setup_app();
+        app.settings.detached_viewer_open_images_in_window = true;
+        let zip = app.tmp.path().join("control.zip");
+        let pdf = app.tmp.path().join("control.pdf");
+
+        app.items = vec![GridItem::ZipFile(zip.clone())];
+        assert!(matches!(
+            app.detached_grid_item_open_plan(0, true),
+            Some(DetachedGridItemOpenPlan::Descriptor(ViewerContextDescriptor::Zip {
+                path,
+                entry_name: None,
+                archive_source_override: None,
+            })) if path == zip
+        ));
+
+        app.items = vec![GridItem::PdfFile(pdf.clone())];
+        assert!(matches!(
+            app.detached_grid_item_open_plan(0, true),
+            Some(DetachedGridItemOpenPlan::Descriptor(ViewerContextDescriptor::Pdf {
+                path,
+                page_num: None,
+            })) if path == pdf
+        ));
     }
 
     #[test]

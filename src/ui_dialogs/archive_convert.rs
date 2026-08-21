@@ -41,12 +41,13 @@ pub(crate) enum ArchiveConvertMsg {
 
 /// What may happen after this archive state reaches a readable backing archive.
 ///
-/// Bookmark carries the same request owner used by path resolution. Keeping this as one typed
-/// policy prevents a conversion result from falling back to unowned navigation.
+/// Bookmark and detached-grid variants carry the same request owner used at dispatch. Keeping
+/// this as one typed policy prevents a conversion result from falling back to unowned navigation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ArchiveConvertCompletionPolicy {
     Navigation,
     Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner),
+    DetachedGridArchive(crate::app::DetachedGridArchiveOpenRequestOwner),
     SiblingZip,
 }
 
@@ -60,7 +61,16 @@ impl ArchiveConvertCompletionPolicy {
     ) -> Option<&crate::bookmark_browser::BookmarkOpenRequestOwner> {
         match self {
             Self::Bookmark(owner) => Some(owner),
-            Self::Navigation | Self::SiblingZip => None,
+            Self::Navigation | Self::DetachedGridArchive(_) | Self::SiblingZip => None,
+        }
+    }
+
+    pub(crate) fn detached_grid_archive_owner(
+        &self,
+    ) -> Option<&crate::app::DetachedGridArchiveOpenRequestOwner> {
+        match self {
+            Self::DetachedGridArchive(owner) => Some(owner),
+            Self::Navigation | Self::Bookmark(_) | Self::SiblingZip => None,
         }
     }
 
@@ -68,7 +78,7 @@ impl ArchiveConvertCompletionPolicy {
         match self {
             Self::Navigation => Some(crate::app::OpenRequestOwner::Navigation),
             Self::Bookmark(owner) => Some(crate::app::OpenRequestOwner::Bookmark(owner.clone())),
-            Self::SiblingZip => None,
+            Self::DetachedGridArchive(_) | Self::SiblingZip => None,
         }
     }
 }
@@ -294,6 +304,15 @@ impl App {
         auto_fullscreen: bool,
         owner: crate::app::OpenRequestOwner,
     ) -> bool {
+        if let crate::app::OpenRequestOwner::DetachedGridArchive(detached_owner) = &owner {
+            crate::logger::log(format!(
+                "[detached-grid-archive] reject main cache navigation id={} source={} cache={}",
+                detached_owner.request_id,
+                src.display(),
+                cached_zip.display()
+            ));
+            return false;
+        }
         if let crate::app::OpenRequestOwner::Bookmark(bookmark_owner) = &owner
             && !self.bookmark_open_owner_is_current(bookmark_owner)
         {
@@ -409,6 +428,9 @@ impl App {
                 crate::app::OpenRequestOwner::Bookmark(owner) => {
                     ArchiveConvertCompletionPolicy::Bookmark(owner)
                 }
+                crate::app::OpenRequestOwner::DetachedGridArchive(owner) => {
+                    ArchiveConvertCompletionPolicy::DetachedGridArchive(owner)
+                }
             },
             pending_sibling_output: None,
             nav_history_rollback: None,
@@ -463,6 +485,9 @@ impl App {
                 }
                 crate::app::OpenRequestOwner::Bookmark(owner) => {
                     ArchiveConvertCompletionPolicy::Bookmark(owner)
+                }
+                crate::app::OpenRequestOwner::DetachedGridArchive(owner) => {
+                    ArchiveConvertCompletionPolicy::DetachedGridArchive(owner)
                 }
             },
             pending_sibling_output: None,
@@ -632,6 +657,7 @@ impl App {
         let Some(mut state) = self.archive_convert.take() else {
             return false;
         };
+        let detached_owner = state.completion.detached_grid_archive_owner().cloned();
         state.cancel.store(true, Ordering::Relaxed);
         let had_deferred = state.deferred_fullscreen.take().is_some();
         crate::logger::log(format!(
@@ -639,10 +665,27 @@ impl App {
             state.src_path.display()
         ));
         drop(state);
+        if let Some(owner) = detached_owner.as_ref() {
+            self.invalidate_detached_grid_archive_open_owner(owner);
+        }
         if had_deferred {
             self.release_fs_nav_lock();
         }
         true
+    }
+
+    pub(crate) fn cancel_detached_grid_archive_open_for_replacement(
+        &mut self,
+        reason: &'static str,
+    ) -> bool {
+        if !self
+            .archive_convert
+            .as_ref()
+            .is_some_and(|state| state.completion.detached_grid_archive_owner().is_some())
+        {
+            return false;
+        }
+        self.cancel_archive_convert_for_navigation(reason)
     }
 
     fn discard_stale_archive_bookmark_request(&mut self) -> bool {
@@ -699,6 +742,23 @@ impl App {
                     input_seq,
                     &[],
                 );
+            }
+            if let ArchiveConvertCompletionPolicy::DetachedGridArchive(owner) = &completion {
+                #[cfg(windows)]
+                let opened =
+                    self.open_converted_grid_archive_in_detached_context(ctx, src.clone(), owner);
+                #[cfg(not(windows))]
+                let opened = false;
+                if deferred.is_some() {
+                    self.release_fs_nav_lock();
+                }
+                if !opened {
+                    self.fail_detached_grid_archive_open(
+                        owner,
+                        "archive_detached_direct_open_failed",
+                    );
+                }
+                return;
             }
             if let ArchiveConvertCompletionPolicy::Bookmark(owner) = &completion {
                 if !self.bookmark_open_owner_is_current(owner) {
@@ -861,6 +921,26 @@ impl App {
                     .as_ref()
                     .and_then(|s| s.nav_history_rollback.clone());
                 self.archive_convert = None;
+                if let ArchiveConvertCompletionPolicy::DetachedGridArchive(owner) = &completion {
+                    #[cfg(windows)]
+                    let opened = self.open_converted_grid_archive_in_detached_context(
+                        ctx,
+                        nav.clone(),
+                        owner,
+                    );
+                    #[cfg(not(windows))]
+                    let opened = false;
+                    if deferred_fullscreen.is_some() {
+                        self.release_fs_nav_lock();
+                    }
+                    if !opened {
+                        self.fail_detached_grid_archive_open(
+                            owner,
+                            "archive_detached_converted_open_failed",
+                        );
+                    }
+                    return;
+                }
                 #[cfg(windows)]
                 if let ArchiveConvertCompletionPolicy::Bookmark(owner) = &completion {
                     if let Some(opened) =
@@ -1253,6 +1333,11 @@ impl App {
                 .as_ref()
                 .and_then(|state| state.completion.bookmark_owner())
                 .cloned();
+            let detached_owner = self
+                .archive_convert
+                .as_ref()
+                .and_then(|state| state.completion.detached_grid_archive_owner())
+                .cloned();
             let had_deferred_fullscreen = self
                 .archive_convert
                 .as_mut()
@@ -1261,6 +1346,9 @@ impl App {
             self.archive_convert = None;
             if let Some(owner) = bookmark_owner {
                 self.cancel_bookmark_open_request(owner.request_id, "archive_dialog_closed");
+            }
+            if let Some(owner) = detached_owner.as_ref() {
+                self.cancel_detached_grid_archive_open_owner(owner, "archive_dialog_closed");
             }
             if let Some(snapshot) = nav_history_rollback {
                 self.restore_folder_nav_history(snapshot);
@@ -1347,10 +1435,17 @@ impl App {
                     let nav_history_rollback = state.nav_history_rollback.clone();
                     let had_deferred = state.deferred_fullscreen.is_some();
                     let bookmark_owner = state.completion.bookmark_owner().cloned();
+                    let detached_owner = state.completion.detached_grid_archive_owner().cloned();
                     self.archive_convert = None;
                     if let Some(owner) = bookmark_owner {
                         self.cancel_bookmark_open_request(
                             owner.request_id,
+                            "archive_conversion_cancelled",
+                        );
+                    }
+                    if let Some(owner) = detached_owner.as_ref() {
+                        self.cancel_detached_grid_archive_open_owner(
+                            owner,
                             "archive_conversion_cancelled",
                         );
                     }

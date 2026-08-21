@@ -307,13 +307,22 @@ fn item_belongs_to_detached_physical_scope(item: &GridItem, scope: &Path) -> boo
 
 /// Ownership of a visible folder/container load.
 ///
-/// Normal navigation supersedes pending opens. Bookmark-owned internal transitions (for
-/// example source 7z -> cached ZIP) retain the same request and may load only while that owner
-/// is still current.
+/// Normal navigation supersedes pending opens. Typed bookmark and detached-grid internal
+/// transitions (for example source 7z -> cached ZIP) retain the same request and may complete
+/// only while that owner is still current.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DetachedGridArchiveOpenRequestOwner {
+    pub(crate) request_id: u64,
+    /// The path selected in the main grid. A multi-volume RAR probe may resolve a different
+    /// backing volume, but the detached reader must retain this user-facing identity.
+    pub(crate) source_path: PathBuf,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OpenRequestOwner {
     Navigation,
     Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner),
+    DetachedGridArchive(DetachedGridArchiveOpenRequestOwner),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1854,10 +1863,15 @@ enum DetachedBookContextStart {
 }
 
 #[cfg(windows)]
+#[derive(Debug, PartialEq, Eq)]
 enum DetachedGridItemOpenPlan {
     /// The directory has not been enumerated yet, so it must remain main-owned until
     /// the worker proves that it is an image book.
     FolderCandidate { path: PathBuf },
+    /// Direct reading versus cache conversion is unknown until the archive probe completes.
+    /// The request remains main-owned until a readable backing archive is selected, then creates
+    /// a new detached context without publishing a main-grid navigation.
+    ConvertibleArchiveCandidate { path: PathBuf },
     /// ZIP/PDF and explicit leaf sources already have an unambiguous detached owner.
     Descriptor(ViewerContextDescriptor),
 }
@@ -10781,6 +10795,9 @@ pub struct App {
     pub(crate) bookmark_view_sort: crate::bookmark_browser::BookmarkViewSort,
     /// process 内で bookmark open request を一意にする単調増加 sequence。
     pub(crate) bookmark_open_request_seq: u64,
+    /// Main-grid convertible archive opens carry this request identity through probe/conversion.
+    /// It is also advanced when the current request is cancelled, making late completions stale.
+    pub(crate) detached_grid_archive_open_request_seq: u64,
     pub(crate) bookmark_open_pending: Option<crate::bookmark_browser::PendingBookmarkOpen>,
     /// ブックマークから既存 items の relative page を開く1回だけの loader trust root。
     /// `open_fullscreen` が同期的に fs / metadata worker へ snapshot した直後に破棄する。
@@ -13601,6 +13618,7 @@ impl App {
             reading_history_book_kind_filter: crate::bookmark_browser::BookKindFilter::default(),
             bookmark_view_sort: crate::bookmark_browser::BookmarkViewSort::default(),
             bookmark_open_request_seq: 0,
+            detached_grid_archive_open_request_seq: 0,
             bookmark_open_pending: None,
             bookmark_relative_page_open_once: None,
             bookmark_view_state: None,
@@ -18418,7 +18436,25 @@ impl App {
                 // A direct navigation owns the next visible location. If an earlier startup,
                 // activation, or bookmark path is still resolving, dispose that request before
                 // the worker can overwrite this navigation with a late completion.
-                self.cancel_archive_convert_for_navigation_to(path, "normal_navigation");
+                let detached_owner = self
+                    .archive_convert
+                    .as_ref()
+                    .and_then(|state| state.completion.detached_grid_archive_owner())
+                    .cloned();
+                let cancel_reason = detached_owner
+                    .as_ref()
+                    .map(|_| "detached_grid_archive_owner_stale_normal_navigation")
+                    .unwrap_or("normal_navigation");
+                if self.cancel_archive_convert_for_navigation_to(path, cancel_reason)
+                    && let Some(owner) = detached_owner
+                {
+                    crate::logger::log(format!(
+                        "[detached-grid-archive] request stale id={} reason=normal_navigation source={} destination={}",
+                        owner.request_id,
+                        owner.source_path.display(),
+                        path.display()
+                    ));
+                }
                 self.cancel_unresolved_open_for_navigation();
                 self.cancel_conflicting_bookmark_open_for_navigation(path);
                 true
@@ -18431,6 +18467,39 @@ impl App {
                         path.display()
                     ));
                     self.pending_auto_fs_open = false;
+                    return false;
+                }
+                true
+            }
+            OpenRequestOwner::DetachedGridArchive(detached_owner) => {
+                if !self.detached_grid_archive_open_owner_is_current(detached_owner) {
+                    crate::logger::log(format!(
+                        "[detached-grid-archive] reject stale visible load id={} path={}",
+                        detached_owner.request_id,
+                        path.display()
+                    ));
+                    self.pending_auto_fs_open = false;
+                    return false;
+                }
+                let current_detached_request_id = self
+                    .archive_convert
+                    .as_ref()
+                    .and_then(|state| state.completion.detached_grid_archive_owner())
+                    .map(|current| current.request_id);
+                if current_detached_request_id
+                    .is_some_and(|current| current != detached_owner.request_id)
+                {
+                    self.cancel_archive_convert_for_navigation(
+                        "detached_grid_archive_request_replaced",
+                    );
+                } else if self.archive_convert.is_some()
+                    && current_detached_request_id != Some(detached_owner.request_id)
+                {
+                    crate::logger::log(format!(
+                        "[detached-grid-archive] reject request id={} reason=archive_transition_busy source={}",
+                        detached_owner.request_id,
+                        detached_owner.source_path.display()
+                    ));
                     return false;
                 }
                 true
@@ -39921,8 +39990,68 @@ impl App {
             }
             return Some(DetachedGridItemOpenPlan::FolderCandidate { path: path.clone() });
         }
+        if let Some(GridItem::ConvertibleArchive { path, .. }) = self.items.get(idx) {
+            return Some(DetachedGridItemOpenPlan::ConvertibleArchiveCandidate {
+                path: path.clone(),
+            });
+        }
         self.detached_book_context_descriptor_for_grid_item(idx, auto_fullscreen)
             .map(DetachedGridItemOpenPlan::Descriptor)
+    }
+
+    fn next_detached_grid_archive_open_owner(
+        &mut self,
+        source_path: PathBuf,
+    ) -> DetachedGridArchiveOpenRequestOwner {
+        self.detached_grid_archive_open_request_seq = self
+            .detached_grid_archive_open_request_seq
+            .checked_add(1)
+            .expect("detached grid archive open request sequence exhausted");
+        DetachedGridArchiveOpenRequestOwner {
+            request_id: self.detached_grid_archive_open_request_seq,
+            source_path,
+        }
+    }
+
+    pub(crate) fn detached_grid_archive_open_owner_is_current(
+        &self,
+        owner: &DetachedGridArchiveOpenRequestOwner,
+    ) -> bool {
+        owner.request_id == self.detached_grid_archive_open_request_seq
+    }
+
+    pub(crate) fn invalidate_detached_grid_archive_open_owner(
+        &mut self,
+        owner: &DetachedGridArchiveOpenRequestOwner,
+    ) {
+        if self.detached_grid_archive_open_owner_is_current(owner) {
+            self.detached_grid_archive_open_request_seq = self
+                .detached_grid_archive_open_request_seq
+                .checked_add(1)
+                .expect("detached grid archive open request sequence exhausted");
+        }
+    }
+
+    pub(crate) fn cancel_detached_grid_archive_open_owner(
+        &mut self,
+        owner: &DetachedGridArchiveOpenRequestOwner,
+        reason: &'static str,
+    ) {
+        self.invalidate_detached_grid_archive_open_owner(owner);
+        crate::logger::log(format!(
+            "[detached-grid-archive] request cancelled id={} reason={reason} source={}",
+            owner.request_id,
+            owner.source_path.display()
+        ));
+    }
+
+    pub(crate) fn fail_detached_grid_archive_open(
+        &mut self,
+        owner: &DetachedGridArchiveOpenRequestOwner,
+        reason: &'static str,
+    ) {
+        self.cancel_detached_grid_archive_open_owner(owner, reason);
+        self.show_feedback_toast("\u{30a2}\u{30fc}\u{30ab}\u{30a4}\u{30d6}\u{3092}\u{5225}\u{30a6}\u{30a3}\u{30f3}\u{30c9}\u{30a6}\u{3067}\u{958b}\u{3051}\u{307e}\u{305b}\u{3093}\u{3067}\u{3057}\u{305f}\u{3002}\u{3082}\u{3046}\u{4e00}\u{5ea6}\u{304a}\u{8a66}\u{3057}\u{304f}\u{3060}\u{3055}\u{3044}".to_string());
     }
 
     #[cfg(windows)]
@@ -39961,15 +40090,82 @@ impl App {
 
         let descriptor = match plan {
             DetachedGridItemOpenPlan::Descriptor(descriptor) => {
+                self.cancel_detached_grid_archive_open_for_replacement(
+                    "detached_grid_archive_replaced_by_descriptor",
+                );
                 self.maybe_suppress_rating_filter_for_opened_container(idx);
                 self.maybe_suppress_facet_filter_for_opened_container(idx);
                 descriptor
             }
             DetachedGridItemOpenPlan::FolderCandidate { path } => {
+                self.cancel_detached_grid_archive_open_for_replacement(
+                    "detached_grid_archive_replaced_by_folder_candidate",
+                );
                 // Classification is main-owned. No session/runtime or detached bundle exists
                 // until the completed scan proves this is an image book; mixed folders fall
                 // back through the normal main navigation arbitration.
                 self.start_grid_folder_candidate_open(path);
+                ctx.request_repaint();
+                return true;
+            }
+            DetachedGridItemOpenPlan::ConvertibleArchiveCandidate { path } => {
+                let owner = self.next_detached_grid_archive_open_owner(path.clone());
+                let open_owner = OpenRequestOwner::DetachedGridArchive(owner.clone());
+                let auto_fullscreen = self.settings.effective_auto_fullscreen_zip_pdf();
+                let format = path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .and_then(crate::archive_converter::ArchiveFormat::from_extension);
+
+                if self.settings.archive_file_handling_ignores_convertible() {
+                    let _ = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                        path,
+                        auto_fullscreen,
+                        open_owner,
+                    );
+                    self.cancel_detached_grid_archive_open_owner(
+                        &owner,
+                        "archive_handling_ignored",
+                    );
+                    ctx.request_repaint();
+                    return true;
+                }
+
+                // Non-RAR cache hits are already classified, so they can create the detached
+                // context synchronously. RAR still probes first because a valid direct-read path
+                // takes precedence over its conversion cache.
+                if format != Some(crate::archive_converter::ArchiveFormat::Rar)
+                    && let Some(cached_zip) = self.try_archive_cache_lookup(&path)
+                {
+                    if !self.claim_open_request_owner(&path, &open_owner) {
+                        self.fail_detached_grid_archive_open(
+                            &owner,
+                            "archive_cache_owner_claim_failed",
+                        );
+                        return true;
+                    }
+                    if !self
+                        .open_converted_grid_archive_in_detached_context(ctx, cached_zip, &owner)
+                    {
+                        self.fail_detached_grid_archive_open(
+                            &owner,
+                            "archive_detached_cache_open_failed",
+                        );
+                    }
+                    return true;
+                }
+
+                let outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                    path,
+                    auto_fullscreen,
+                    open_owner,
+                );
+                if matches!(outcome, FolderOpenOutcome::Ignored) {
+                    self.fail_detached_grid_archive_open(
+                        &owner,
+                        "archive_detached_request_start_failed",
+                    );
+                }
                 ctx.request_repaint();
                 return true;
             }
@@ -39984,6 +40180,45 @@ impl App {
         let placement_seed = had_active_detached
             .then(|| self.offset_detached_image_window_placement(base_placement));
         self.start_active_detached_book_context_from_descriptor(descriptor, ctx, placement_seed)
+    }
+
+    /// Complete a main-grid convertible archive request in a newly-created detached reader. The
+    /// main viewer bundle remains mounted throughout probe/conversion and is never navigated to
+    /// either the source archive or its cache ZIP.
+    #[cfg(windows)]
+    pub(crate) fn open_converted_grid_archive_in_detached_context(
+        &mut self,
+        ctx: &egui::Context,
+        backing_archive: PathBuf,
+        owner: &DetachedGridArchiveOpenRequestOwner,
+    ) -> bool {
+        if !self.settings.detached_viewer_open_images_in_window
+            || !self.detached_grid_archive_open_owner_is_current(owner)
+        {
+            return false;
+        }
+        let base_placement = self.active_detached_viewer_current_placement();
+        let had_active_detached =
+            self.active_detached_viewer_context.is_some() || self.viewer_session_is_detached();
+        if !self.park_and_close_current_active_detached_viewer(ctx) {
+            return false;
+        }
+        let placement_seed = had_active_detached
+            .then(|| self.offset_detached_image_window_placement(base_placement));
+        let descriptor = ViewerContextDescriptor::Zip {
+            path: backing_archive,
+            entry_name: None,
+            archive_source_override: Some(owner.source_path.clone()),
+        };
+        let opened = self.start_active_detached_book_context_from_descriptor(
+            descriptor,
+            ctx,
+            placement_seed,
+        );
+        if opened {
+            self.invalidate_detached_grid_archive_open_owner(owner);
+        }
+        opened
     }
 
     /// Finish an OtherArchive bookmark open after direct-read probing or conversion selected the
