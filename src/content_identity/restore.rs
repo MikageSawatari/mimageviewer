@@ -1,4 +1,4 @@
-//! A3a: 内容 identity が一致した物理ファイル間の永続 edit state copy。
+//! A3a/A3b: 内容 identity が一致した物理ファイル間の永続 edit state copy。
 //!
 //! このモジュールは worker から呼べる同期処理だけを持ち、`App` / egui / UI thread の
 //! state を要求しない。UI 所有の sidecar / presence / cache は report を A3b が適用する。
@@ -28,60 +28,131 @@ pub(crate) struct RestorePresence {
     pub(crate) comics: BTreeSet<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct ContentRestoreReport {
+    pub(crate) requested_restores: usize,
+    pub(crate) requested_declines: usize,
     pub(crate) rows: usize,
+    pub(crate) database_opens: usize,
     pub(crate) errors: Vec<String>,
     pub(crate) sidecar_mirrors: Vec<RestoreSidecarMirror>,
+    pub(crate) sidecar_bases: Vec<crate::sidecar::SidecarFile>,
     pub(crate) presence: RestorePresence,
-    pub(crate) ledger_entry: Option<LedgerEntry>,
+    pub(crate) ledger_entries: Vec<LedgerEntry>,
 }
 
-/// A3b が worker から呼ぶ復元入口。A2 の候補と選択された復元元だけを受け取り、
-/// UI state に触れずに shared STORES copy と target ledger 昇格を完了する。
-pub(crate) fn restore_candidate_at(
+#[derive(Clone, Debug)]
+pub(crate) struct SelectedRestore {
+    pub(crate) candidate: RestoreCandidate,
+    pub(crate) source: RestoreSourceCandidate,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeclinedRestore {
+    pub(crate) full_hash: String,
+    pub(crate) target_key: String,
+}
+
+/// A3b worker の batch 入口。全候補の mapping を先に集約し、shared STORES と
+/// runtime update の各 DB は候補数にかかわらず 1 回ずつだけ開く。
+pub(crate) fn restore_candidates_at(
     data_dir: &Path,
-    candidate: &RestoreCandidate,
-    source: &RestoreSourceCandidate,
+    selected: &[SelectedRestore],
+    declined: &[DeclinedRestore],
+    load_sidecar_bases: bool,
 ) -> ContentRestoreReport {
-    let mappings = restore_copy_mappings(data_dir, candidate, source);
+    let mappings = selected
+        .iter()
+        .flat_map(|selection| {
+            restore_copy_mappings(data_dir, &selection.candidate, &selection.source)
+        })
+        .collect::<Vec<_>>();
     let copied = crate::rename_key_migration::copy_stores_at(data_dir, &mappings);
     let mut report = ContentRestoreReport {
+        requested_restores: selected.len(),
+        requested_declines: declined.len(),
         rows: copied.rows,
+        database_opens: copied.database_opens,
         errors: copied.errors,
         ..ContentRestoreReport::default()
     };
 
-    match mark_restored_origin_at(data_dir, candidate, source) {
-        Ok((entry, changed)) => {
-            report.rows += usize::from(changed);
-            report.ledger_entry = Some(entry);
-        }
-        Err(error) => report.errors.push(format!("content_identity: {error}")),
-    }
+    apply_batch_ledger_updates(data_dir, selected, declined, &mut report);
 
-    match load_restore_runtime_updates(data_dir, candidate, source) {
-        Ok((sidecar_mirrors, presence)) => {
+    match load_restore_runtime_updates(data_dir, selected) {
+        Ok((sidecar_mirrors, presence, database_opens)) => {
+            report.database_opens += database_opens;
             report.sidecar_mirrors = sidecar_mirrors;
             report.presence = presence;
+            if load_sidecar_bases {
+                report.sidecar_bases = load_restore_sidecar_bases(&report.sidecar_mirrors);
+            }
         }
         Err(error) => report.errors.push(format!("sidecar mirror: {error}")),
     }
     report
 }
 
-/// `(full_hash, target_key)` の恒久辞退記録。A3a は API だけを提供し、操作の判断は A3b が行う。
-pub(crate) fn record_restore_declined_at(
+fn load_restore_sidecar_bases(
+    mirrors: &[RestoreSidecarMirror],
+) -> Vec<crate::sidecar::SidecarFile> {
+    mirrors
+        .iter()
+        .map(|mirror| mirror.folder.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|folder| crate::sidecar::SidecarFile::load(&folder))
+        .collect()
+}
+
+fn apply_batch_ledger_updates(
     data_dir: &Path,
-    full_hash: &str,
-    target_key: &str,
+    selected: &[SelectedRestore],
+    declined: &[DeclinedRestore],
+    report: &mut ContentRestoreReport,
+) {
+    if selected.is_empty() && declined.is_empty() {
+        return;
+    }
+    report.database_opens += 1;
+    let db = match ContentIdentityDb::open_at(&data_dir.join("content_identity.db")) {
+        Ok(db) => db,
+        Err(error) => {
+            report.errors.push(format!("content_identity: {error}"));
+            return;
+        }
+    };
+    for selection in selected {
+        match mark_restored_origin(&db, &selection.candidate, &selection.source) {
+            Ok((entry, changed)) => {
+                report.rows += usize::from(changed);
+                report.ledger_entries.push(entry);
+            }
+            Err(error) => report.errors.push(format!(
+                "content_identity target={}: {error}",
+                selection.candidate.target_path.display()
+            )),
+        }
+    }
+    for refusal in declined {
+        match record_restore_declined(&db, refusal) {
+            Ok(changed) => report.rows += usize::from(changed),
+            Err(error) => report.errors.push(format!(
+                "content_identity target={}: {error}",
+                refusal.target_key
+            )),
+        }
+    }
+}
+
+fn record_restore_declined(
+    db: &ContentIdentityDb,
+    refusal: &DeclinedRestore,
 ) -> Result<bool, String> {
-    let db = ContentIdentityDb::open_at(&data_dir.join("content_identity.db"))
-        .map_err(|error| error.to_string())?;
     db.conn
         .execute(
             "INSERT OR IGNORE INTO restore_declined(full_hash, target_key) VALUES (?1, ?2)",
-            rusqlite::params![full_hash, target_key],
+            rusqlite::params![refusal.full_hash, refusal.target_key],
         )
         .map(|rows| rows > 0)
         .map_err(|error| error.to_string())
@@ -107,13 +178,11 @@ fn restore_copy_mappings(
     mappings
 }
 
-fn mark_restored_origin_at(
-    data_dir: &Path,
+fn mark_restored_origin(
+    db: &ContentIdentityDb,
     candidate: &RestoreCandidate,
     source: &RestoreSourceCandidate,
 ) -> Result<(LedgerEntry, bool), String> {
-    let db = ContentIdentityDb::open_at(&data_dir.join("content_identity.db"))
-        .map_err(|error| error.to_string())?;
     let source_entry = db
         .ledger_entry(&source.file_key)?
         .ok_or_else(|| format!("source ledger row is missing: {}", source.file_key))?;
@@ -219,10 +288,10 @@ fn query_family_rows(
     selected_columns: &str,
     families: &[DestinationEditFamily],
     mut visit: impl FnMut(&rusqlite::Row<'_>) -> Result<(), String>,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let path = data_dir.join(file);
     if !path.exists() || families.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let conn = rusqlite::Connection::open(&path).map_err(|error| error.to_string())?;
     conn.busy_timeout(std::time::Duration::from_secs(5))
@@ -245,7 +314,7 @@ fn query_family_rows(
             visit(row)?;
         }
     }
-    Ok(())
+    Ok(1)
 }
 
 fn sidecar_mask_from_row(
@@ -280,13 +349,18 @@ fn sidecar_mask_from_row(
 
 fn load_restore_runtime_updates(
     data_dir: &Path,
-    candidate: &RestoreCandidate,
-    source: &RestoreSourceCandidate,
-) -> Result<(Vec<RestoreSidecarMirror>, RestorePresence), String> {
-    let families = destination_edit_families(data_dir, candidate, source);
+    selected: &[SelectedRestore],
+) -> Result<(Vec<RestoreSidecarMirror>, RestorePresence, usize), String> {
+    let families = selected
+        .iter()
+        .flat_map(|selection| {
+            destination_edit_families(data_dir, &selection.candidate, &selection.source)
+        })
+        .collect::<Vec<_>>();
+    let mut database_opens = 0;
     let mut states = BTreeMap::<String, crate::sidecar::SidecarEntry>::new();
 
-    query_family_rows(
+    database_opens += query_family_rows(
         data_dir,
         "adjustment.db",
         "page_params",
@@ -301,7 +375,7 @@ fn load_restore_runtime_updates(
             Ok(())
         },
     )?;
-    query_family_rows(
+    database_opens += query_family_rows(
         data_dir,
         "mask.db",
         "masks",
@@ -314,7 +388,7 @@ fn load_restore_runtime_updates(
             Ok(())
         },
     )?;
-    query_family_rows(
+    database_opens += query_family_rows(
         data_dir,
         "conceal.db",
         "conceal_entries",
@@ -327,7 +401,7 @@ fn load_restore_runtime_updates(
             Ok(())
         },
     )?;
-    query_family_rows(
+    database_opens += query_family_rows(
         data_dir,
         "local_adjust.db",
         "local_adjust_pages",
@@ -342,7 +416,7 @@ fn load_restore_runtime_updates(
             Ok(())
         },
     )?;
-    query_family_rows(
+    database_opens += query_family_rows(
         data_dir,
         "export_crop.db",
         "export_crop_pages",
@@ -366,7 +440,7 @@ fn load_restore_runtime_updates(
             Ok(())
         },
     )?;
-    query_family_rows(
+    database_opens += query_family_rows(
         data_dir,
         "comic.db",
         "comic_entries",
@@ -416,7 +490,7 @@ fn load_restore_runtime_updates(
             });
         }
     }
-    Ok((mirrors, presence))
+    Ok((mirrors, presence, database_opens))
 }
 
 fn sidecar_coords_for_key(
@@ -493,6 +567,121 @@ mod tests {
                 )
                 .unwrap();
         }
+    }
+
+    fn create_all_unique_store_schemas(data_dir: &Path) {
+        for descriptor in crate::rename_key_migration::STORES
+            .iter()
+            .filter(|descriptor| descriptor.unique && descriptor.file != "content_identity.db")
+        {
+            let connection = rusqlite::Connection::open(data_dir.join(descriptor.file)).unwrap();
+            let sql = match descriptor.table {
+                "ratings" => {
+                    "CREATE TABLE IF NOT EXISTS ratings (
+                    path TEXT PRIMARY KEY, source_path TEXT)"
+                }
+                "page_params" => {
+                    "CREATE TABLE IF NOT EXISTS page_params (
+                    page_path TEXT PRIMARY KEY, params_json TEXT NOT NULL)"
+                }
+                "masks" => {
+                    "CREATE TABLE IF NOT EXISTS masks (
+                    path TEXT PRIMARY KEY, mask_data BLOB, width INTEGER,
+                    height INTEGER, vectors TEXT)"
+                }
+                "conceal_entries" => {
+                    "CREATE TABLE IF NOT EXISTS conceal_entries (
+                    page_path TEXT PRIMARY KEY, bitmap_data BLOB, bitmap_w INTEGER,
+                    bitmap_h INTEGER, shapes TEXT)"
+                }
+                "local_adjust_pages" => {
+                    "CREATE TABLE IF NOT EXISTS local_adjust_pages (
+                    page_path TEXT PRIMARY KEY, layers_json TEXT NOT NULL)"
+                }
+                "comic_entries" => {
+                    "CREATE TABLE IF NOT EXISTS comic_entries (
+                    page_path TEXT PRIMARY KEY, doc_json TEXT NOT NULL)"
+                }
+                "export_crop_pages" => {
+                    "CREATE TABLE IF NOT EXISTS export_crop_pages (
+                    page_path TEXT PRIMARY KEY, min_x REAL, min_y REAL, max_x REAL,
+                    max_y REAL, aspect_mode TEXT, source_width INTEGER,
+                    source_height INTEGER)"
+                }
+                "reading_history" => {
+                    "CREATE TABLE IF NOT EXISTS reading_history (
+                    key TEXT PRIMARY KEY, path TEXT NOT NULL)"
+                }
+                _ => {
+                    let sql = format!(
+                        "CREATE TABLE IF NOT EXISTS {} ({} TEXT PRIMARY KEY)",
+                        descriptor.table, descriptor.column
+                    );
+                    connection.execute_batch(&sql).unwrap();
+                    continue;
+                }
+            };
+            connection.execute_batch(sql).unwrap();
+        }
+    }
+
+    fn measure_batch_database_opens(candidate_count: usize) -> usize {
+        let data = tempfile::tempdir().unwrap();
+        create_all_unique_store_schemas(data.path());
+        let db = ContentIdentityDb::open_at(&data.path().join("content_identity.db")).unwrap();
+        let mut selected = Vec::new();
+        for index in 0..candidate_count {
+            let source_path = data.path().join(format!("origin-{index}.png"));
+            let target_path = data.path().join(format!("target-{index}.png"));
+            std::fs::write(&target_path, b"same").unwrap();
+            let metadata = std::fs::metadata(&target_path).unwrap();
+            let source_key = crate::path_key::normalize_keep_drive(&source_path);
+            let target_key = crate::path_key::normalize_keep_drive(&target_path);
+            let full_hash = format!("full-{index}");
+            db.upsert(
+                &ContentIdentitySource::new(&source_path, ContentKind::Image),
+                &RecordedFileState {
+                    file_key: source_key.clone(),
+                    size: metadata.len(),
+                    hashed_mtime: 1,
+                },
+                &format!("head-{index}"),
+                &full_hash,
+                10,
+                ObservationRole::RestorableContent,
+            )
+            .unwrap();
+            db.upsert(
+                &ContentIdentitySource::new(&target_path, ContentKind::Image),
+                &RecordedFileState {
+                    file_key: target_key.clone(),
+                    size: metadata.len(),
+                    hashed_mtime: metadata_mtime(&metadata).unwrap(),
+                },
+                &format!("head-{index}"),
+                &full_hash,
+                0,
+                ObservationRole::DetectionCache,
+            )
+            .unwrap();
+            let (candidate, source) =
+                candidate(source_path, target_path, ContentKind::Image, &full_hash);
+            selected.push(SelectedRestore { candidate, source });
+        }
+        drop(db);
+        let report = restore_candidates_at(data.path(), &selected, &[], true);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.ledger_entries.len(), candidate_count);
+        report.database_opens
+    }
+
+    #[test]
+    fn batch_restore_database_opens_are_constant_for_one_and_hundred_candidates() {
+        let one = measure_batch_database_opens(1);
+        let hundred = measure_batch_database_opens(100);
+
+        assert_eq!(one, 28, "21 store copy + 1 origin batch + 6 runtime reads");
+        assert_eq!(hundred, one, "DB open 回数を候補数に比例させない");
     }
 
     #[test]
@@ -645,9 +834,14 @@ mod tests {
 
         let (candidate, source) =
             candidate(source_path, target_path.clone(), ContentKind::Image, "full");
-        let report = restore_candidate_at(data.path(), &candidate, &source);
+        let report = restore_candidates_at(
+            data.path(),
+            &[SelectedRestore { candidate, source }],
+            &[],
+            true,
+        );
         assert!(report.errors.is_empty(), "{:?}", report.errors);
-        let ledger = report.ledger_entry.as_ref().unwrap();
+        let ledger = report.ledger_entries.first().unwrap();
         assert_eq!(ledger.file_key, target_key);
         assert_eq!(ledger.last_edit_at, 123);
         assert!(ledger.has_restorable_content);
@@ -662,6 +856,15 @@ mod tests {
             .load_index(&std::sync::atomic::AtomicBool::new(false))
             .unwrap()
             .unwrap();
+        assert!(
+            stage0_target(
+                &index,
+                ContentIdentitySource::new(&target_path, ContentKind::Image),
+                size,
+            )
+            .is_none(),
+            "復元済み target は同じフォルダを開き直しても再提案しない"
+        );
         let third = stage0_target(
             &index,
             ContentIdentitySource::new(data.path().join("third.png"), ContentKind::Image),
@@ -677,6 +880,11 @@ mod tests {
 
         assert!(report.presence.adjusted.contains(&target_key));
         assert_eq!(report.sidecar_mirrors.len(), 1);
+        assert_eq!(report.sidecar_bases.len(), 1);
+        assert_eq!(
+            report.sidecar_bases[0].folder(),
+            target_path.parent().unwrap()
+        );
         let mirror = &report.sidecar_mirrors[0];
         assert_eq!(mirror.folder, target_path.parent().unwrap());
         assert_eq!(mirror.rel_key, "target.png");
@@ -700,8 +908,14 @@ mod tests {
     #[test]
     fn restore_declined_writer_is_idempotent_and_matches_a2_reader() {
         let data = tempfile::tempdir().unwrap();
-        assert!(record_restore_declined_at(data.path(), "full", "c:/target.png").unwrap());
-        assert!(!record_restore_declined_at(data.path(), "full", "c:/target.png").unwrap());
+        let refusal = DeclinedRestore {
+            full_hash: "full".to_string(),
+            target_key: "c:/target.png".to_string(),
+        };
+        let first = restore_candidates_at(data.path(), &[], std::slice::from_ref(&refusal), true);
+        let second = restore_candidates_at(data.path(), &[], &[refusal], true);
+        assert_eq!(first.rows, 1);
+        assert_eq!(second.rows, 0);
         let db = ContentIdentityDb::open_at(&data.path().join("content_identity.db")).unwrap();
         assert!(db.restore_was_declined("full", "c:/target.png").unwrap());
     }

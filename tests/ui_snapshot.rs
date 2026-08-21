@@ -1040,3 +1040,68 @@ fn changelog_markdown_dark() {
         },
     );
 }
+
+#[test]
+fn content_restore_prompt_light() {
+    use mimageviewer::ui_dialogs::content_restore::{
+        ContentRestoreUiRow, ContentRestoreUiSource, render_content_restore_contents,
+    };
+
+    let mut rows = vec![
+        ContentRestoreUiRow {
+            file_name: "IMG_0421.jpg".to_string(),
+            selected: true,
+            source_index: 0,
+            sources: vec![ContentRestoreUiSource {
+                path: r"D:\photo\2025\IMG_0421.jpg".to_string(),
+                source_exists: false,
+            }],
+        },
+        ContentRestoreUiRow {
+            file_name: "chapter03.cbz".to_string(),
+            selected: true,
+            source_index: 0,
+            sources: vec![
+                ContentRestoreUiSource {
+                    path: r"D:\manga\chapter03.cbz".to_string(),
+                    source_exists: true,
+                },
+                ContentRestoreUiSource {
+                    path: r"E:\archive\chapter03.cbz".to_string(),
+                    source_exists: true,
+                },
+            ],
+        },
+        ContentRestoreUiRow {
+            file_name: "scan.pdf".to_string(),
+            selected: false,
+            source_index: 0,
+            sources: vec![ContentRestoreUiSource {
+                path: r"E:\old\scan.pdf".to_string(),
+                source_exists: true,
+            }],
+        },
+    ];
+    let mut dont_ask_again = false;
+    let mut fonts_ready = false;
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(860.0, 520.0))
+        .build(move |ctx| {
+            mimageviewer::os_theme::apply_resolved(
+                ctx,
+                mimageviewer::os_theme::ResolvedTheme::Light,
+            );
+            if !fonts_ready {
+                install_app_fonts(ctx);
+                fonts_ready = true;
+                ctx.request_repaint();
+                return;
+            }
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.set_width(820.0);
+                let _ = render_content_restore_contents(ui, &mut rows, &mut dont_ask_again);
+            });
+        });
+    harness.run();
+    harness.snapshot("content_restore_prompt_light");
+}

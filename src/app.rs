@@ -101,9 +101,7 @@ fn thumbnail_keep_bounds_for_count(
 mod cache_ops;
 mod color_filter;
 mod content_identity_detection;
-// A3a は A3b 用の適用境界だけを先に置くため、現段階では production caller がない。
-#[allow(dead_code)]
-mod content_identity_restore;
+pub(crate) mod content_identity_restore;
 #[cfg(windows)]
 mod detached_window_manager;
 mod facet_name_filter;
@@ -9704,8 +9702,10 @@ pub struct App {
     pub(crate) content_identity_updates_before_load: Vec<crate::content_identity::LedgerEntry>,
     pub(crate) content_identity_detection_pending:
         Option<crate::content_identity::ContentIdentityDetectionPending>,
-    /// A3 が非モーダル画面へ渡すまで保持する、現在の物理フォルダだけの候補。
-    pub(crate) content_restore_candidates: Vec<crate::content_identity::RestoreCandidate>,
+    /// 現在の物理フォルダだけが所有する、候補・選択・復元元をまとめた確認状態。
+    pub(crate) content_restore_prompt: Option<content_identity_restore::ContentRestorePrompt>,
+    pub(crate) content_identity_restore_pending:
+        Option<content_identity_restore::ContentIdentityRestorePending>,
     pub(crate) content_identity_fallback_io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
     /// 表示パイプライン入力の世代番号。
     ///
@@ -13265,7 +13265,8 @@ impl App {
             content_identity_index_loaded,
             content_identity_updates_before_load: Vec::new(),
             content_identity_detection_pending: None,
-            content_restore_candidates: Vec::new(),
+            content_restore_prompt: None,
+            content_identity_restore_pending: None,
             content_identity_fallback_io_sem,
             input_generation: std::collections::HashMap::new(),
             fs_pending: ItemsGenerationMap::with_discard("fs_pending", cancel_fs_pending_value),
@@ -15452,6 +15453,7 @@ impl App {
             self.smart_folder_rule_draft.is_some() => "smart_folder_rule_draft",
             self.show_tag_editor => "tag_editor",
             self.show_tag_apply => "tag_apply",
+            self.content_restore_window_visible() => "content_restore",
             self.fullscreen_tag_picker_open => "fullscreen_tag_picker",
             // The top bar's overflow panel is deliberately absent. It is a menu, not a dialog:
             // it asks nothing and has nothing to confirm, and its siblings in the same bar - the
@@ -66174,6 +66176,7 @@ impl eframe::App for App {
 
         self.poll_edit_preview_cache(ctx);
         self.poll_content_identity_detection(ctx);
+        self.poll_content_identity_restore(ctx);
         self.reconcile_pinned_adjustment_refreshes();
         self.poll_smart_folder_metadata_refresh(ctx);
         self.poll_thumbnails(ctx, ThumbnailConsumptionPolicy::Grid);
@@ -66844,6 +66847,7 @@ impl eframe::App for App {
         self.show_smart_folder_editor_dialog(ctx);
         self.show_tag_editor_dialog(ctx);
         self.show_tag_apply_dialog(ctx);
+        self.show_content_restore_dialog(ctx);
         self.show_fav_add_dialog_window(ctx);
         let open_folder_nav = self.show_open_folder_dialog_window(ctx);
         self.show_subfolder_expansion_dialog_window(ctx);

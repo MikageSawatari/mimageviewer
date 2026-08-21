@@ -3056,6 +3056,40 @@ fn content_identity_setting_off_does_not_start_detection_worker() {
 }
 
 #[test]
+fn content_restore_prompt_is_held_without_blocking_input_during_fullscreen() {
+    let mut app = setup_app_for_test();
+    app.settings.first_setup_completed = true;
+    app.set_content_restore_candidates(vec![crate::content_identity::RestoreCandidate {
+        target_key: "c:/copied/target.png".to_string(),
+        target_path: std::path::PathBuf::from("C:/copied/target.png"),
+        target_kind: crate::content_identity::ContentKind::Image,
+        full_hash: "full".to_string(),
+        sources: vec![crate::content_identity::RestoreSourceCandidate {
+            file_key: "c:/original/source.png".to_string(),
+            path: std::path::PathBuf::from("C:/original/source.png"),
+            kind: crate::content_identity::ContentKind::Image,
+            last_edit_at: 10,
+            source_exists: true,
+        }],
+    }]);
+
+    assert!(app.content_restore_window_visible());
+    assert_eq!(app.modal_dialog_block_reason(), Some("content_restore"));
+
+    app.fullscreen_idx = Some(0);
+    assert!(!app.content_restore_window_visible());
+    assert_ne!(app.modal_dialog_block_reason(), Some("content_restore"));
+    assert!(
+        app.content_restore_prompt.is_some(),
+        "候補は一覧へ戻るまで保持"
+    );
+
+    app.fullscreen_idx = None;
+    assert!(app.content_restore_window_visible());
+    assert_eq!(app.modal_dialog_block_reason(), Some("content_restore"));
+}
+
+#[test]
 fn content_identity_folder_switch_cancels_worker_and_stale_result_is_not_applied() {
     let mut app = setup_app_for_test();
     let current_folder = app.tmp.path().join("current");
@@ -3091,27 +3125,30 @@ fn content_identity_folder_switch_cancels_worker_and_stale_result_is_not_applied
         crate::content_identity::ContentIdentityDetectionPending::for_test(Some(stale));
     app.content_identity_detection_pending = Some(pending);
     app.poll_content_identity_detection(&egui::Context::default());
-    assert!(
-        app.content_restore_candidates.is_empty(),
-        "旧候補を適用しない"
-    );
+    assert!(app.content_restore_prompt.is_none(), "旧候補を適用しない");
 
     let (pending, cancel) =
         crate::content_identity::ContentIdentityDetectionPending::for_test(None);
     app.content_identity_detection_pending = Some(pending);
-    app.content_restore_candidates = vec![crate::content_identity::RestoreCandidate {
+    app.set_content_restore_candidates(vec![crate::content_identity::RestoreCandidate {
         target_key: "pending".to_string(),
         target_path: current_folder.join("pending.png"),
         target_kind: crate::content_identity::ContentKind::Image,
         full_hash: "pending-full".to_string(),
-        sources: Vec::new(),
-    }];
+        sources: vec![crate::content_identity::RestoreSourceCandidate {
+            file_key: "origin".to_string(),
+            path: old_folder.join("origin.png"),
+            kind: crate::content_identity::ContentKind::Image,
+            last_edit_at: 1,
+            source_exists: false,
+        }],
+    }]);
 
     app.install_new_items(Vec::new(), Vec::new());
 
     assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
     assert!(app.content_identity_detection_pending.is_none());
-    assert!(app.content_restore_candidates.is_empty());
+    assert!(app.content_restore_prompt.is_none());
 }
 
 /// `clamp_dynamic_for_gpu` は 8192 以内の画像には触れず、超えるときだけ

@@ -49,7 +49,7 @@ impl App {
         if let Some(pending) = self.content_identity_detection_pending.take() {
             pending.cancel();
         }
-        self.content_restore_candidates.clear();
+        self.clear_content_restore_prompt();
     }
 
     /// 通常フォルダ scan が現在 path へ公開した marker と、最上位 surface の両方を使う。
@@ -158,7 +158,7 @@ impl App {
                     self.content_identity_index.upsert(update);
                 }
                 self.log_content_restore_candidates(&result.candidates);
-                self.content_restore_candidates = result.candidates;
+                self.set_content_restore_candidates(result.candidates);
                 if crate::perf::is_enabled() {
                     crate::perf::event(
                         "content_identity",
@@ -167,7 +167,12 @@ impl App {
                         self.input_seq,
                         &[(
                             "candidates",
-                            serde_json::Value::from(self.content_restore_candidates.len()),
+                            serde_json::Value::from(
+                                self.content_restore_prompt
+                                    .as_ref()
+                                    .map(|prompt| prompt.len())
+                                    .unwrap_or(0),
+                            ),
                         )],
                     );
                 }

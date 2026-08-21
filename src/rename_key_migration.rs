@@ -265,7 +265,6 @@ pub(crate) struct StoreDescriptor {
     pub(crate) rename_generic: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl StoreDescriptor {
     /// このストア自身が宣言する規則で物理 path を永続キーへ正規化する。
     /// copy / rename / purge の呼び出し側がキー方式を推測しないための単一境界。
@@ -463,7 +462,6 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
 /// `Exact` はコンテナ / 実画像自身、`VirtualPrefix` は ZIP entry / PDF page の
 /// `<base>::...` family。正規化はこの型を作る側ではなく、各 [`StoreDescriptor`] が行う。
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum StoreCopyPathMapping {
     Exact {
         old_path: PathBuf,
@@ -475,7 +473,6 @@ pub(crate) enum StoreCopyPathMapping {
     },
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl StoreCopyPathMapping {
     pub(crate) fn exact(old_path: impl Into<PathBuf>, new_path: impl Into<PathBuf>) -> Self {
         Self::Exact {
@@ -496,14 +493,13 @@ impl StoreCopyPathMapping {
 }
 
 #[derive(Debug, Default)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct StoreCopyReport {
     pub(crate) rows: usize,
+    pub(crate) database_opens: usize,
     pub(crate) errors: Vec<String>,
 }
 
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 enum NormalizedStoreCopyMapping {
     Exact {
         old_key: String,
@@ -521,7 +517,6 @@ enum NormalizedStoreCopyMapping {
 ///
 /// `unique=false` は path 以外の PK 再採番が必要なストアを表すため v1 では対象外。
 /// DB 行は `INSERT OR IGNORE` で複製し、コピー先にある行を常に優先する。
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn copy_stores_at(
     data_dir: &Path,
     mappings: &[StoreCopyPathMapping],
@@ -963,7 +958,6 @@ fn move_prefix(
     Ok(changed)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn copy_store(
     db_path: &Path,
     descriptor: StoreDescriptor,
@@ -973,6 +967,7 @@ fn copy_store(
     if !db_path.exists() {
         return;
     }
+    report.database_opens += 1;
     let result = copy_store_transaction(db_path, descriptor, mappings);
     match result {
         Ok(rows) => report.rows += rows,
@@ -983,7 +978,6 @@ fn copy_store(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn copy_store_transaction(
     db_path: &Path,
     descriptor: StoreDescriptor,
@@ -1010,7 +1004,6 @@ fn copy_store_transaction(
     Ok(changed)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn copy_store_mapping(
     tx: &rusqlite::Transaction<'_>,
     descriptor: StoreDescriptor,
@@ -1058,7 +1051,6 @@ fn copy_store_mapping(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn table_columns(
     tx: &rusqlite::Transaction<'_>,
     table: &str,
@@ -1070,7 +1062,6 @@ fn table_columns(
 
 /// exact キーの複製。全列を `PRAGMA table_info` 由来の順序で選び、キー列だけ
 /// destination へ差し替える。destination conflict は `INSERT OR IGNORE` で温存する。
-#[cfg_attr(not(test), allow(dead_code))]
 fn copy_exact(
     tx: &rusqlite::Transaction<'_>,
     table: &str,
@@ -1105,7 +1096,6 @@ fn copy_exact(
 
 /// prefix キーを `substr` 等値で列挙し、suffix を保って 1 キーずつ複製する。
 /// SQLite の `substr` length は文字数なので byte length ではなく `chars().count()` を渡す。
-#[cfg_attr(not(test), allow(dead_code))]
 fn copy_prefix(
     tx: &rusqlite::Transaction<'_>,
     table: &str,
@@ -1144,7 +1134,6 @@ fn copy_prefix(
     Ok(changed)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn update_copied_rating_source_paths(
     tx: &rusqlite::Transaction<'_>,
     mapping: &NormalizedStoreCopyMapping,
