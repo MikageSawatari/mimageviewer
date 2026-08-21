@@ -25,23 +25,43 @@ pub(crate) const ERROR_TEXT_SIZE: f32 = 13.0;
 ///
 /// px の 2 本は 0.1 刻み / 小数 1 桁、割合は 1 刻み / 整数表示に固定する。egui の
 /// 自動桁数へ任せると、刻みより細かい桁が出て 3 本の見た目が不揃いになる。
+/// 戻り値は 5 択ボタン 2 行を確保した矩形。
 pub(crate) fn draw_bucket_region_controls(
     ui: &mut egui::Ui,
     region: &mut crate::mask_db::BucketRegion,
     leak_stop: &mut f32,
     outset: &mut f32,
     gap_tolerance: &mut f32,
-) {
+) -> egui::Rect {
     use crate::mask_db::BucketRegion;
 
     ui.label("塗る範囲");
-    ui.horizontal_wrapped(|ui| {
-        ui.selectable_value(region, BucketRegion::Whole, "全体");
-        ui.selectable_value(region, BucketRegion::Connected, "隣接のみ");
-        ui.selectable_value(region, BucketRegion::Rect, "長方形");
-        ui.selectable_value(region, BucketRegion::Ellipse, "楕円");
-        ui.selectable_value(region, BucketRegion::Circle, "円");
-    });
+    // ScrollArea の content Ui は、先に幅広い widget が置かれると max_rect が表示幅より
+    // 広がる。horizontal_wrapped は clip_rect ではなく、その max_rect 由来の
+    // available_size_before_wrap を折返し境界にするため、パネル外まで 1 行になり得る。
+    // 表示中の幅を上限に明示した 2 行へ固定し、パネル幅が異なる 3 系統で同じ規則を使う。
+    let visible_width = (ui.clip_rect().right() - ui.cursor().left()).max(0.0);
+    let controls_width = ui.available_width().min(visible_width).max(1.0);
+    let first_row = draw_bucket_region_row(
+        ui,
+        controls_width,
+        &[
+            (BucketRegion::Whole, "全体"),
+            (BucketRegion::Connected, "隣接のみ"),
+        ],
+        region,
+    );
+    let second_row = draw_bucket_region_row(
+        ui,
+        controls_width,
+        &[
+            (BucketRegion::Rect, "長方形"),
+            (BucketRegion::Ellipse, "楕円"),
+            (BucketRegion::Circle, "円"),
+        ],
+        region,
+    );
+    let region_controls_rect = first_row.union(second_row);
     if region.uses_leak_stop() {
         ui.add(
             egui::Slider::new(leak_stop, 0.0..=16.0)
@@ -70,6 +90,41 @@ pub(crate) fn draw_bucket_region_controls(
             "図形の中に混ざってよい別色の割合です。文字の抜けは埋め、大きな隙間は埋めません。0 で穴埋めなし。",
         );
     }
+    region_controls_rect
+}
+
+fn draw_bucket_region_row(
+    ui: &mut egui::Ui,
+    row_width: f32,
+    choices: &[(crate::mask_db::BucketRegion, &str)],
+    region: &mut crate::mask_db::BucketRegion,
+) -> egui::Rect {
+    const BUTTON_HEIGHT: f32 = 24.0;
+    const BUTTON_GAP: f32 = 4.0;
+    let gap_total = BUTTON_GAP * choices.len().saturating_sub(1) as f32;
+    let button_width = ((row_width - gap_total) / choices.len().max(1) as f32).max(1.0);
+    ui.allocate_ui_with_layout(
+        egui::vec2(row_width, BUTTON_HEIGHT),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = BUTTON_GAP;
+            for &(value, label) in choices {
+                if crate::ui_fullscreen::draw_icons::panel_toggle_button(
+                    ui,
+                    label,
+                    *region == value,
+                    Some(egui::vec2(button_width, BUTTON_HEIGHT)),
+                    None,
+                )
+                .clicked()
+                {
+                    *region = value;
+                }
+            }
+        },
+    )
+    .response
+    .rect
 }
 
 pub(crate) fn bucket_shape_fit_failed_message(
@@ -1690,6 +1745,53 @@ pub fn draw_centered_elided_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bucket_region_controls_stay_inside_a_200px_visible_ui() {
+        let ctx = egui::Context::default();
+        let mut controls_rect = egui::Rect::NOTHING;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 500.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        let visible_rect = egui::Rect::from_min_size(
+                            ui.cursor().left_top(),
+                            egui::vec2(200.0, 400.0),
+                        );
+                        // ScrollArea の content Ui は、先行 widget が幅を広げると表示範囲より
+                        // 大きい max_rect を持ちうる。clip はパネル幅のままという実機条件を再現する。
+                        let wide_rect = egui::Rect::from_min_size(
+                            visible_rect.min,
+                            egui::vec2(800.0, visible_rect.height()),
+                        );
+                        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(wide_rect));
+                        child.set_clip_rect(visible_rect);
+                        let mut region = crate::mask_db::BucketRegion::Connected;
+                        controls_rect = draw_bucket_region_controls(
+                            &mut child,
+                            &mut region,
+                            &mut 0.0,
+                            &mut 1.0,
+                            &mut 10.0,
+                        );
+                    });
+            },
+        );
+
+        assert!(
+            controls_rect.width() <= 200.0 + 0.5,
+            "controls width={} exceeds the visible panel width",
+            controls_rect.width()
+        );
+    }
 
     #[test]
     fn processing_size_messages_share_the_ai_wording() {

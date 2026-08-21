@@ -1,7 +1,7 @@
 //! 連結ビットマップ領域の内側へ、クリック位置を含む単純な図形を当てはめる純関数。
 //!
 //! 長方形は原寸の seed 断面から通路を追跡する。楕円は縮小マスクで候補を絞り、
-//! 原寸マスクを走査するのは確定した候補の 1 回だけにする。
+//! 原寸では確定候補と円の基準候補だけを比較する。
 //! 座標は画像 pixel 座標で、各 pixel の中心は `(x + 0.5, y + 0.5)` とする。
 
 use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
@@ -796,87 +796,106 @@ pub fn fit_ellipse(
     }
     let filled = fill_internal_holes(region, w, h, opt.max_hole_area_ratio);
     let bounds = region_bounds(&filled, w, h)?;
+    // 円は楕円の軸比 1 候補なので、楕円モードでも原寸の円候補を比較基準にする。
+    // 縮小マスク上の面積順位は sampling の丸めで原寸と逆転し得るため、粗探索に
+    // ratio=1 を含めるだけでは「楕円が円より小さくならない」ことを保証できない。
+    let circle_candidate = largest_ellipse_at_transform(&filled, w, h, bounds, seed, 0.0, 1.0)?;
 
     let candidate = if circle {
-        largest_ellipse_at_transform(&filled, w, h, bounds, seed, 0.0, 1.0)?
+        circle_candidate
     } else {
-        let coarse = make_scaled_region(&filled, w, bounds, seed);
-        let coarse_bounds = region_bounds(&coarse.mask, coarse.w, coarse.h)?;
-        let ratios = [1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 6.0];
-        let mut best = None;
-        for ratio in ratios {
-            let angle_steps = if ratio == 1.0 { 1 } else { 12 };
-            for step in 0..angle_steps {
-                let angle = f64::from(step) * 15.0_f64.to_radians();
-                if let Some(candidate) = largest_ellipse_at_transform(
-                    &coarse.mask,
-                    coarse.w,
-                    coarse.h,
-                    coarse_bounds,
-                    coarse.seed,
-                    angle,
-                    ratio,
-                ) && ellipse_candidate_is_better(candidate, best)
-                {
-                    best = Some(candidate);
+        let ellipse_candidate = (|| {
+            let coarse = make_scaled_region(&filled, w, bounds, seed);
+            let coarse_bounds = region_bounds(&coarse.mask, coarse.w, coarse.h)?;
+            let ratios = [1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 6.0];
+            let mut best = None;
+            for ratio in ratios {
+                let angle_steps = if ratio == 1.0 { 1 } else { 12 };
+                for step in 0..angle_steps {
+                    let angle = f64::from(step) * 15.0_f64.to_radians();
+                    if let Some(candidate) = largest_ellipse_at_transform(
+                        &coarse.mask,
+                        coarse.w,
+                        coarse.h,
+                        coarse_bounds,
+                        coarse.seed,
+                        angle,
+                        ratio,
+                    ) && ellipse_candidate_is_better(candidate, best)
+                    {
+                        best = Some(candidate);
+                    }
                 }
             }
-        }
-        let coarse_best = best?;
+            let coarse_best = best?;
 
-        // 軸比と角度は縮小マスク上でのみ細分化する。原寸の距離計算は最良組 1 回。
-        let mut refined = Some(coarse_best);
-        // 粗い候補の中間を 0.1 刻みで埋める。比率に比例した刻みにすると 2 と 3 の
-        // どちらを起点にしたかで 2.5 を飛び越すため、通常域は固定刻みにする。
-        let ratio_step = if coarse_best.ratio >= 5.0 { 0.2 } else { 0.1 };
-        for angle_step in -15..=15 {
-            let angle = coarse_best.rotation_rad + f64::from(angle_step) * 1.0_f64.to_radians();
-            for ratio_step_idx in -5..=5 {
-                let ratio = (coarse_best.ratio + f64::from(ratio_step_idx) * ratio_step).max(1.0);
-                if let Some(candidate) = largest_ellipse_at_transform(
-                    &coarse.mask,
-                    coarse.w,
-                    coarse.h,
-                    coarse_bounds,
-                    coarse.seed,
-                    angle,
-                    ratio,
-                ) && ellipse_candidate_is_better(candidate, refined)
-                {
-                    refined = Some(candidate);
+            // 軸比と角度は縮小マスク上でのみ細分化する。原寸の距離計算は最良組 1 回。
+            let mut refined = Some(coarse_best);
+            // 粗い候補の中間を 0.1 刻みで埋める。比率に比例した刻みにすると 2 と 3 の
+            // どちらを起点にしたかで 2.5 を飛び越すため、通常域は固定刻みにする。
+            let ratio_step = if coarse_best.ratio >= 5.0 { 0.2 } else { 0.1 };
+            for angle_step in -15..=15 {
+                let angle = coarse_best.rotation_rad + f64::from(angle_step) * 1.0_f64.to_radians();
+                for ratio_step_idx in -5..=5 {
+                    let ratio =
+                        (coarse_best.ratio + f64::from(ratio_step_idx) * ratio_step).max(1.0);
+                    if let Some(candidate) = largest_ellipse_at_transform(
+                        &coarse.mask,
+                        coarse.w,
+                        coarse.h,
+                        coarse_bounds,
+                        coarse.seed,
+                        angle,
+                        ratio,
+                    ) && ellipse_candidate_is_better(candidate, refined)
+                    {
+                        refined = Some(candidate);
+                    }
                 }
             }
-        }
-        let first_refined = refined?;
-        let mut refined = Some(first_refined);
-        for angle_step in -2..=2 {
-            let angle = first_refined.rotation_rad + f64::from(angle_step) * 0.25_f64.to_radians();
-            for ratio_step_idx in -5..=5 {
-                let ratio = (first_refined.ratio + f64::from(ratio_step_idx) * 0.02).max(1.0);
-                if let Some(candidate) = largest_ellipse_at_transform(
-                    &coarse.mask,
-                    coarse.w,
-                    coarse.h,
-                    coarse_bounds,
-                    coarse.seed,
-                    angle,
-                    ratio,
-                ) && ellipse_candidate_is_better(candidate, refined)
-                {
-                    refined = Some(candidate);
+            let first_refined = refined?;
+            let mut refined = Some(first_refined);
+            for angle_step in -2..=2 {
+                let angle =
+                    first_refined.rotation_rad + f64::from(angle_step) * 0.25_f64.to_radians();
+                for ratio_step_idx in -5..=5 {
+                    let ratio = (first_refined.ratio + f64::from(ratio_step_idx) * 0.02).max(1.0);
+                    if let Some(candidate) = largest_ellipse_at_transform(
+                        &coarse.mask,
+                        coarse.w,
+                        coarse.h,
+                        coarse_bounds,
+                        coarse.seed,
+                        angle,
+                        ratio,
+                    ) && ellipse_candidate_is_better(candidate, refined)
+                    {
+                        refined = Some(candidate);
+                    }
                 }
             }
+            let refined = refined?;
+            if (refined.ratio - 1.0).abs() <= 1.0e-9 {
+                Some(circle_candidate)
+            } else {
+                largest_ellipse_at_transform(
+                    &filled,
+                    w,
+                    h,
+                    bounds,
+                    seed,
+                    refined.rotation_rad,
+                    refined.ratio,
+                )
+            }
+        })();
+        if let Some(ellipse_candidate) = ellipse_candidate
+            && ellipse_candidate_is_better(ellipse_candidate, Some(circle_candidate))
+        {
+            ellipse_candidate
+        } else {
+            circle_candidate
         }
-        let refined = refined?;
-        largest_ellipse_at_transform(
-            &filled,
-            w,
-            h,
-            bounds,
-            seed,
-            refined.rotation_rad,
-            refined.ratio,
-        )?
     };
 
     if candidate.major < MIN_SHAPE_RADIUS || candidate.minor < MIN_SHAPE_RADIUS {
@@ -1310,6 +1329,51 @@ mod tests {
         assert_close(center.1, 110.0, 2.0);
         assert!((rx / 60.0 - 1.0).abs() <= 0.03, "rx={rx}");
         assert!((ry / 60.0 - 1.0).abs() <= 0.03, "ry={ry}");
+        assert_eq!(rotation_rad, 0.0);
+    }
+
+    #[test]
+    fn ellipse_never_loses_to_circle_at_the_same_seed_and_keeps_the_small_circle() {
+        let (w, h) = (800, 440);
+        let circle_center = (120.0, 200.0);
+        let mut region = raster_ellipse(w, h, circle_center, 60.0, 60.0, 0.0);
+        // 小円の中心から 120px 先まで細い首を通して 460x280 の塊へ接続する。
+        for y in 178..222 {
+            region[y * w + 180..y * w + 240].fill(true);
+        }
+        for y in 60..340 {
+            region[y * w + 240..y * w + 700].fill(true);
+        }
+        let seed = (150, 200);
+
+        let Some(FittedShape::Ellipse {
+            center: circle_fit_center,
+            rx: circle_rx,
+            ry: circle_ry,
+            ..
+        }) = fit_ellipse(&region, w, h, seed, FitOptions::default(), true)
+        else {
+            panic!("circle mode should fit the clicked circle");
+        };
+        let Some(FittedShape::Ellipse {
+            center: ellipse_center,
+            rx: ellipse_rx,
+            ry: ellipse_ry,
+            rotation_rad,
+        }) = fit_ellipse(&region, w, h, seed, FitOptions::default(), false)
+        else {
+            panic!("ellipse mode should fit at least the circle candidate");
+        };
+        let circle_area = PI * f64::from(circle_rx) * f64::from(circle_ry);
+        let ellipse_area = PI * f64::from(ellipse_rx) * f64::from(ellipse_ry);
+        assert!(
+            ellipse_area + 1.0e-3 >= circle_area,
+            "ellipse area {ellipse_area} must not be smaller than circle area {circle_area}; circle={circle_fit_center:?}/{circle_rx}/{circle_ry}, ellipse={ellipse_center:?}/{ellipse_rx}/{ellipse_ry}"
+        );
+        assert_close(ellipse_center.0, circle_center.0 as f32, 3.0);
+        assert_close(ellipse_center.1, circle_center.1 as f32, 3.0);
+        assert!((ellipse_rx / 60.0 - 1.0).abs() <= 0.08, "rx={ellipse_rx}");
+        assert!((ellipse_ry / 60.0 - 1.0).abs() <= 0.08, "ry={ellipse_ry}");
         assert_eq!(rotation_rad, 0.0);
     }
 
