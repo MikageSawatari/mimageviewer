@@ -745,19 +745,20 @@ impl App {
             }
             if let ArchiveConvertCompletionPolicy::DetachedGridArchive(owner) = &completion {
                 #[cfg(windows)]
-                let opened =
+                let outcome =
                     self.open_converted_grid_archive_in_detached_context(ctx, src.clone(), owner);
                 #[cfg(not(windows))]
-                let opened = false;
+                let outcome = crate::app::DetachedGridArchiveOpenOutcome::Cancelled(
+                    "archive_detached_not_supported",
+                );
                 if deferred.is_some() {
                     self.release_fs_nav_lock();
                 }
-                if !opened {
-                    self.fail_detached_grid_archive_open(
-                        owner,
-                        "archive_detached_direct_open_failed",
-                    );
-                }
+                self.finish_detached_grid_archive_open(
+                    owner,
+                    outcome,
+                    "archive_detached_direct_open_failed",
+                );
                 return;
             }
             if let ArchiveConvertCompletionPolicy::Bookmark(owner) = &completion {
@@ -923,22 +924,23 @@ impl App {
                 self.archive_convert = None;
                 if let ArchiveConvertCompletionPolicy::DetachedGridArchive(owner) = &completion {
                     #[cfg(windows)]
-                    let opened = self.open_converted_grid_archive_in_detached_context(
+                    let outcome = self.open_converted_grid_archive_in_detached_context(
                         ctx,
                         nav.clone(),
                         owner,
                     );
                     #[cfg(not(windows))]
-                    let opened = false;
+                    let outcome = crate::app::DetachedGridArchiveOpenOutcome::Cancelled(
+                        "archive_detached_not_supported",
+                    );
                     if deferred_fullscreen.is_some() {
                         self.release_fs_nav_lock();
                     }
-                    if !opened {
-                        self.fail_detached_grid_archive_open(
-                            owner,
-                            "archive_detached_converted_open_failed",
-                        );
-                    }
+                    self.finish_detached_grid_archive_open(
+                        owner,
+                        outcome,
+                        "archive_detached_converted_open_failed",
+                    );
                     return;
                 }
                 #[cfg(windows)]
@@ -961,12 +963,32 @@ impl App {
                         return;
                     }
                 }
+                // DetachedGridArchive is consumed above, and SiblingZip owns
+                // `pending_sibling_output` rather than `pending_nav`. Keep this defensive guard
+                // non-panicking so moving either earlier return cannot accidentally turn a
+                // non-navigation completion into a UI-thread panic.
+                let Some(open_owner) = completion.open_owner() else {
+                    if deferred_fullscreen.is_some() {
+                        self.release_fs_nav_lock();
+                    }
+                    match &completion {
+                        ArchiveConvertCompletionPolicy::DetachedGridArchive(owner) => self
+                            .cancel_detached_grid_archive_open_owner(
+                                owner,
+                                "archive_detached_pending_navigation_policy_rejected",
+                            ),
+                        ArchiveConvertCompletionPolicy::SiblingZip => crate::logger::log(
+                            "archive conversion: sibling completion rejected pending navigation"
+                                .to_string(),
+                        ),
+                        ArchiveConvertCompletionPolicy::Navigation
+                        | ArchiveConvertCompletionPolicy::Bookmark(_) => {}
+                    }
+                    return;
+                };
                 if auto_fs {
                     self.pending_auto_fs_open = true;
                 }
-                let open_owner = completion
-                    .open_owner()
-                    .expect("pending cache navigation must have an open policy");
                 if let Some(source) = src.as_deref() {
                     self.authorize_smart_folder_session_alias(source, &nav);
                 }

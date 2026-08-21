@@ -4055,6 +4055,51 @@ mod startup_open_path_resolve_tests {
     }
 
     #[test]
+    fn detached_grid_archive_claim_supersedes_slow_bookmark_resolve() {
+        let mut app = setup_app();
+        let request_id = crate::bookmark_browser::BookmarkOpenRequestId(12);
+        let bookmark_target = app.tmp.path().join("bookmark.7z");
+        let bookmark_owner = arm_archive_bookmark(
+            &mut app,
+            request_id,
+            bookmark_target.clone(),
+            std::time::Instant::now(),
+        );
+        let (tx, cancel) = install_bookmark_resolver(
+            &mut app,
+            request_id,
+            bookmark_owner.target.clone(),
+            bookmark_target,
+        );
+        let source = app.tmp.path().join("grid-open.7z");
+        app.detached_grid_archive_open_request_seq += 1;
+        let detached_owner = crate::app::DetachedGridArchiveOpenRequestOwner {
+            request_id: app.detached_grid_archive_open_request_seq,
+            source_path: source.clone(),
+        };
+
+        assert!(app.claim_open_request_owner(
+            &source,
+            &crate::app::OpenRequestOwner::DetachedGridArchive(detached_owner)
+        ));
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.startup_open_path_resolve_pending.is_none());
+        assert!(app.bookmark_open_pending.is_none());
+        assert!(app.bookmark_view_state.is_none());
+        assert!(
+            tx.send(StartupOpenPathResolveResult {
+                requested: PathBuf::from("bookmark.7z"),
+                resolved: None,
+                bookmark_relative_page_openable: None,
+                elapsed_ms: 1.0,
+            })
+            .is_err(),
+            "late bookmark completion receiver must be gone"
+        );
+    }
+
+    #[test]
     fn activation_replaces_slow_bookmark_request_as_one_lifecycle() {
         let mut app = setup_app();
         let request_id = crate::bookmark_browser::BookmarkOpenRequestId(11);
@@ -35316,6 +35361,84 @@ mod still_window_mode_key_tests {
             items_generation,
         );
         assert_detached_archive_backing(&app, &source, &backing);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_grid_archive_direct_completion_after_mode_disable_is_silently_cancelled() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("mode-disabled.rar");
+        let backing = app.tmp.path().join("mode-disabled-backing.rar");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&backing, b"backing").unwrap();
+        let (main_folder, items_generation) =
+            install_convertible_archive_main_grid(&mut app, source.clone(), ArchiveFormat::Rar);
+        let (owner, _tx, _cancel) = install_detached_grid_archive_completion(
+            &mut app,
+            source.clone(),
+            ArchiveFormat::Rar,
+            Some(backing),
+            None,
+        );
+        app.settings.detached_viewer_open_images_in_window = false;
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_archive_convert_dialog(ctx);
+        });
+
+        assert!(app.archive_convert.is_none());
+        assert!(!app.detached_grid_archive_open_owner_is_current(&owner));
+        assert_convertible_archive_main_grid_unchanged(
+            &app,
+            &main_folder,
+            &source,
+            items_generation,
+        );
+        assert!(app.active_detached_viewer_context.is_none());
+        assert!(
+            app.fs_feedback_toast.is_none(),
+            "a mode change makes this completion inapplicable, not failed"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn stale_detached_grid_archive_conversion_completion_is_silently_cancelled() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("stale-completion.7z");
+        let backing = app.tmp.path().join("stale-completion.zip");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&backing, b"backing").unwrap();
+        let (main_folder, items_generation) =
+            install_convertible_archive_main_grid(&mut app, source.clone(), ArchiveFormat::SevenZ);
+        let (owner, _tx, _cancel) = install_detached_grid_archive_completion(
+            &mut app,
+            source.clone(),
+            ArchiveFormat::SevenZ,
+            None,
+            Some(backing),
+        );
+        app.detached_grid_archive_open_request_seq += 1;
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_archive_convert_dialog(ctx);
+        });
+
+        assert!(app.archive_convert.is_none());
+        assert!(!app.detached_grid_archive_open_owner_is_current(&owner));
+        assert_convertible_archive_main_grid_unchanged(
+            &app,
+            &main_folder,
+            &source,
+            items_generation,
+        );
+        assert!(app.active_detached_viewer_context.is_none());
+        assert!(
+            app.fs_feedback_toast.is_none(),
+            "a stale completion must be discarded without an error toast"
+        );
     }
 
     #[test]

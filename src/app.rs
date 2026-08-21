@@ -318,6 +318,13 @@ pub(crate) struct DetachedGridArchiveOpenRequestOwner {
     pub(crate) source_path: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DetachedGridArchiveOpenOutcome {
+    Opened,
+    Cancelled(&'static str),
+    Failed,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OpenRequestOwner {
     Navigation,
@@ -18481,6 +18488,11 @@ impl App {
                     self.pending_auto_fs_open = false;
                     return false;
                 }
+                // A grid double-click/Enter is an explicit open. Dispose any older unresolved
+                // startup or bookmark owner before its late completion can navigate the main
+                // surface after this request has committed to a detached destination.
+                self.cancel_unresolved_open_for_navigation();
+                self.cancel_conflicting_bookmark_open_for_navigation(path);
                 let current_detached_request_id = self
                     .archive_convert
                     .as_ref()
@@ -40051,7 +40063,26 @@ impl App {
         reason: &'static str,
     ) {
         self.cancel_detached_grid_archive_open_owner(owner, reason);
-        self.show_feedback_toast("\u{30a2}\u{30fc}\u{30ab}\u{30a4}\u{30d6}\u{3092}\u{5225}\u{30a6}\u{30a3}\u{30f3}\u{30c9}\u{30a6}\u{3067}\u{958b}\u{3051}\u{307e}\u{305b}\u{3093}\u{3067}\u{3057}\u{305f}\u{3002}\u{3082}\u{3046}\u{4e00}\u{5ea6}\u{304a}\u{8a66}\u{3057}\u{304f}\u{3060}\u{3055}\u{3044}".to_string());
+        self.show_feedback_toast(
+            "アーカイブを別ウィンドウで開けませんでした。もう一度お試しください".to_string(),
+        );
+    }
+
+    pub(crate) fn finish_detached_grid_archive_open(
+        &mut self,
+        owner: &DetachedGridArchiveOpenRequestOwner,
+        outcome: DetachedGridArchiveOpenOutcome,
+        failure_reason: &'static str,
+    ) {
+        match outcome {
+            DetachedGridArchiveOpenOutcome::Opened => {}
+            DetachedGridArchiveOpenOutcome::Cancelled(reason) => {
+                self.cancel_detached_grid_archive_open_owner(owner, reason);
+            }
+            DetachedGridArchiveOpenOutcome::Failed => {
+                self.fail_detached_grid_archive_open(owner, failure_reason);
+            }
+        }
     }
 
     #[cfg(windows)]
@@ -40144,14 +40175,13 @@ impl App {
                         );
                         return true;
                     }
-                    if !self
-                        .open_converted_grid_archive_in_detached_context(ctx, cached_zip, &owner)
-                    {
-                        self.fail_detached_grid_archive_open(
-                            &owner,
-                            "archive_detached_cache_open_failed",
-                        );
-                    }
+                    let outcome = self
+                        .open_converted_grid_archive_in_detached_context(ctx, cached_zip, &owner);
+                    self.finish_detached_grid_archive_open(
+                        &owner,
+                        outcome,
+                        "archive_detached_cache_open_failed",
+                    );
                     return true;
                 }
 
@@ -40191,17 +40221,18 @@ impl App {
         ctx: &egui::Context,
         backing_archive: PathBuf,
         owner: &DetachedGridArchiveOpenRequestOwner,
-    ) -> bool {
-        if !self.settings.detached_viewer_open_images_in_window
-            || !self.detached_grid_archive_open_owner_is_current(owner)
-        {
-            return false;
+    ) -> DetachedGridArchiveOpenOutcome {
+        if !self.settings.detached_viewer_open_images_in_window {
+            return DetachedGridArchiveOpenOutcome::Cancelled("archive_detached_mode_disabled");
+        }
+        if !self.detached_grid_archive_open_owner_is_current(owner) {
+            return DetachedGridArchiveOpenOutcome::Cancelled("archive_detached_completion_stale");
         }
         let base_placement = self.active_detached_viewer_current_placement();
         let had_active_detached =
             self.active_detached_viewer_context.is_some() || self.viewer_session_is_detached();
         if !self.park_and_close_current_active_detached_viewer(ctx) {
-            return false;
+            return DetachedGridArchiveOpenOutcome::Failed;
         }
         let placement_seed = had_active_detached
             .then(|| self.offset_detached_image_window_placement(base_placement));
@@ -40217,8 +40248,10 @@ impl App {
         );
         if opened {
             self.invalidate_detached_grid_archive_open_owner(owner);
+            DetachedGridArchiveOpenOutcome::Opened
+        } else {
+            DetachedGridArchiveOpenOutcome::Failed
         }
-        opened
     }
 
     /// Finish an OtherArchive bookmark open after direct-read probing or conversion selected the
