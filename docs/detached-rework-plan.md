@@ -313,6 +313,43 @@ identity tuple を `activate_independent_detached` で同時設定する。
 Windows 実機で確認済み。次は表示中 `App` の session 化か `MediaWindowSession` のどちらへ
 進むかを判断する。
 
+### 9.5 R2 残件の再定義と、依存する 2 件の先行実施 (2026-08-21)
+
+R2b の残件 (純粋 reducer / 合法遷移制約 / 散在 pending・flag の typed 集約) と、それに依存すると
+記録されていた backlog §1.99 / §1.100 に着手した。**設計を 2 周レビューした結果、作業順を
+§1.99 → §1.100 → R2e (所有の型化) に変更した** (利用者判断 2026-08-21)。
+
+**所有の型化 (R2e) の設計は 2 版とも落とせず、第 3 版が要る。**
+正本は [briefs/detached-r2e-ownership-design.md](briefs/detached-r2e-ownership-design.md)。
+第 1 版 (単一スカラーで「今マウントされている所有者」を表す) は、次を表現できずに破棄した。
+
+- **Vacant**: `take_current_viewer_context_bundle` は App に**空 bundle** を残す (`src/app.rs:16067`)
+- **Building**: 新しい detached context は App のフィールド上で組み立てられる
+  (`src/app.rs:39778` → `39885`)。identity は**予約済みだが未 commit** (serial は `39793` で払い出し済み)
+- **押しのけられた bundle はスタックローカルにあり `self` から到達できない** (`src/app.rs:16103`)
+- **owner に window_id は使えない**。フォルダ再オープンで意図的に再利用される (`src/app.rs:37568`)
+
+第 2 版 (phase + slot map + 復元スタック) にも BLOCKER が 4 件残っている (同書 §6)。
+所有の transaction が無い / `window_id → ViewerContextId` の対応表が無い /
+ステージ分割がコンパイルできない切り方になっている / 「組み立て中は identity が無い」が誤り。
+**R2e に着手する前に第 3 版を書くこと。**
+
+**§1.99 / §1.100 は R2e の完成に依存しない** (ClaudeCode / Codex 双方で確認)。
+
+- §1.99 が必要とするのは既存 context の所有者ではなく「この要求のために新しい detached context を
+  作る」型付きの宛先意図で、ブックマーク経路 (`src/app.rs:39993`) が同型で先行実装されている。
+- §1.100 のコマンドは**アクティブ化 commit 後の既存マウント境界の中**で実行するので、
+  マウントされていない context へ適用する必要が無い。
+  ⚠ ただし `activate_detached_image_window_snapshot` は **Main をマウントしたまま return する**
+  (`src/app.rs:40130`〜`40142`)。detached owner が実際にマウントされるのは同じ pass の後段
+  `update_active_detached_viewer_context` (`src/app.rs:40380`、root の呼び出し順は
+  `src/app.rs:66256` → `66258`)。**アクティブ化から戻った直後に実行すると Main に当たる。**
+
+| 項目 | 状態 | 指示書 | メモ |
+| --- | --- | --- | --- |
+| §1.99 複数ウィンドウでの RAR / 7z / LZH open | **実装済み・検収合格 (21c3dc0d + fix1 d7e139d0)。実機確認待ち** | [stage-archive-open](detached-rework-stage-archive-open.md) | typed open plan に `ConvertibleArchiveCandidate` を追加し、直読み完了 / 変換完了 / 変換キャッシュ命中の 3 経路すべてを detached へ着地。着地結果は `Opened` / `Cancelled(reason)` / `Failed` の typed outcome で、stale と設定 OFF はトーストを出さずログのみ。App に `detached_grid_archive_open_request_seq: u64` を 1 つ追加した (既存 `bookmark_open_request_seq` と同型の単調 sequence。**憲法 3 が禁じる detached 用 bool / Option フラグではない**と双方で判断)。visibility 述語 / `show_viewport_*` builder / viewport ID / HWND registry / activation watcher / placement には触れていない |
+| §1.100 非アクティブ窓の右ドラッグ | **指示書作成済み・実装待ち** | [stage-passive-gesture](detached-rework-stage-passive-gesture.md) | 既存 `MouseGestureState` / `MouseFlickState` に owner を足し、deferred のイベントにポインタ列を載せ、`DetachedWindowRuntime` の `pending_deferred_activation: bool` を `Recognized → Activating → PendingExecution` の typed intent へ統合する |
+
 ## 10. 将来候補 (現行仕様では未採用)
 
 - **pin の再導入**: CUT 前の linked/pin 意味論は戻さない。必要なら、既存窓を
