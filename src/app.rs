@@ -5684,6 +5684,13 @@ pub(crate) struct MaskDirtyRect {
     pub y1: usize,
 }
 
+/// 図形バケツが退化して成立しなかったときだけ表示する、診断用の一時 overlay。
+pub(crate) struct BucketRegionFlash {
+    pub(crate) fs_idx: usize,
+    pub(crate) texture: egui::TextureHandle,
+    pub(crate) started_at: f64,
+}
+
 impl MaskDirtyRect {
     pub(crate) fn new(x0: usize, y0: usize, x1: usize, y1: usize) -> Option<Self> {
         (x0 < x1 && y0 < y1).then_some(Self { x0, y0, x1, y1 })
@@ -11504,10 +11511,14 @@ pub struct App {
     pub(crate) local_adjust_edge_snap_radius: f32,
     /// 補正レイヤー境界筆の開始色からの許容差。
     pub(crate) local_adjust_edge_brush_tolerance: f32,
-    /// 補正レイヤーバケツで seed と連結する領域だけを対象にする。
-    pub(crate) local_adjust_bucket_connected: bool,
+    /// 補正レイヤーバケツの塗る範囲。
+    pub(crate) local_adjust_bucket_region: crate::mask_db::BucketRegion,
     /// バケツの漏れ止め半径 (px)。0 で無効。
     pub(crate) local_adjust_bucket_leak_stop: f32,
+    /// 補正レイヤーバケツの図形を外側へ広げる量 (px)。
+    pub(crate) local_adjust_bucket_outset: f32,
+    /// 補正レイヤーバケツで埋める個々の隙間の上限 (%)。
+    pub(crate) local_adjust_bucket_gap_tolerance: f32,
     /// 補正レイヤー境界筆で塗り領域に接する境界線も含める。
     pub(crate) local_adjust_edge_brush_include_boundary: bool,
     /// Ctrl 境界表示用の縮小 texture cache。
@@ -11890,6 +11901,8 @@ pub struct App {
     /// 最後/最初の項目でさらに進もう/戻ろうとしたとき、または Ctrl+↑↓ で
     /// 画像・動画のあるフォルダが skip_limit 以内に見つからなかったときに表示する。
     pub(crate) fs_boundary_hint: Option<crate::ui_fullscreen::FsBoundaryHint>,
+    /// 3 系統の図形バケツで共有する、整形前 region の一時表示。
+    pub(crate) bucket_region_flash: Option<BucketRegionFlash>,
 
     // ── 消しゴム (Erase) モード ───────────────────────────────────
     /// E キーで切り替える消しゴムモード
@@ -11912,8 +11925,12 @@ pub struct App {
     pub(crate) erase_bucket_tolerance: f32,
     /// バケツの漏れ止め半径 (px)。0 で無効。細い通路と小さな隙間からの漏れを止める。
     pub(crate) erase_bucket_leak_stop: f32,
-    /// バケツツールで seed と連結する領域だけを対象にする。
-    pub(crate) erase_bucket_connected: bool,
+    /// バケツツールの塗る範囲。
+    pub(crate) erase_bucket_region: crate::mask_db::BucketRegion,
+    /// バケツの図形を外側へ広げる量 (px)。
+    pub(crate) erase_bucket_outset: f32,
+    /// バケツで埋める個々の隙間の上限 (%)。
+    pub(crate) erase_bucket_gap_tolerance: f32,
     /// 囲みツールのポイント列 (画像ピクセル座標)
     pub(crate) erase_lasso_points: Vec<(f32, f32)>,
     /// 縦線/横線ツールのドラッグ開始点 (画像ピクセル座標)
@@ -11935,6 +11952,8 @@ pub struct App {
     pub(crate) mask_db: Option<crate::mask_db::MaskDb>,
     /// 消しゴムの Undo スタック (マスク/ベクタ両方のスナップショット、最大 20 エントリ)
     pub(crate) erase_undo_stack: std::collections::VecDeque<EraseSnapshot>,
+    /// 消しゴムの Redo スタック。要素型と上限は Undo と同じ。
+    pub(crate) erase_redo_stack: std::collections::VecDeque<EraseSnapshot>,
     /// メタ操作 (レーティング / タグ / 画像補正) の Undo/Redo スタック。フォルダ移動・
     /// フルスクリーン遷移・フルスクリーン中のページ移動・消しゴムモード遷移でクリアされる。
     pub(crate) meta_undo: crate::undo_stack::UndoStack,
@@ -12030,8 +12049,12 @@ pub struct App {
     pub(crate) conceal_bucket_tolerance: f32,
     /// バケツの漏れ止め半径 (px)。0 で無効。
     pub(crate) conceal_bucket_leak_stop: f32,
-    /// バケツツールで seed と連結する領域だけを対象にする。
-    pub(crate) conceal_bucket_connected: bool,
+    /// バケツツールの塗る範囲。
+    pub(crate) conceal_bucket_region: crate::mask_db::BucketRegion,
+    /// バケツの図形を外側へ広げる量 (px)。
+    pub(crate) conceal_bucket_outset: f32,
+    /// バケツで埋める個々の隙間の上限 (%)。
+    pub(crate) conceal_bucket_gap_tolerance: f32,
     /// 現在ページのマスクビットマップ (1bit/pixel、`erase_mask` と同じ表現)。
     pub(crate) conceal_mask: Option<Vec<bool>>,
     /// マスク対象の画像サイズ [width, height]。
@@ -12053,6 +12076,8 @@ pub struct App {
     pub(crate) conceal_db: Option<crate::conceal_db::ConcealDb>,
     /// 隠蔽加工 Undo スタック (Phase 2 で活性化、`ConcealSnapshot` で mask + shapes をまとめて記録)。
     pub(crate) conceal_undo_stack: std::collections::VecDeque<ConcealSnapshot>,
+    /// 隠蔽加工 Redo スタック。要素型と上限は Undo と同じ。
+    pub(crate) conceal_redo_stack: std::collections::VecDeque<ConcealSnapshot>,
     /// Undo スタック throttle 用 (キーリピート連打抑制)。
     pub(crate) conceal_last_undo_at: Option<std::time::Instant>,
     /// Select ツールでのハンドルドラッグ状態 (Phase 2)。
@@ -13893,8 +13918,10 @@ impl App {
             local_adjust_boundary_gap_px: 2.0,
             local_adjust_edge_snap_radius: 16.0,
             local_adjust_edge_brush_tolerance: 48.0,
-            local_adjust_bucket_connected: true,
+            local_adjust_bucket_region: crate::mask_db::BucketRegion::Connected,
             local_adjust_bucket_leak_stop: 0.0,
+            local_adjust_bucket_outset: 1.0,
+            local_adjust_bucket_gap_tolerance: 10.0,
             local_adjust_edge_brush_include_boundary: false,
             local_adjust_edge_preview_cache: None,
             local_adjust_mask_lasso_points: Vec::new(),
@@ -14009,6 +14036,7 @@ impl App {
             editing_addon_install_state: None,
             editing_addon_declined_session: false,
             fs_boundary_hint: None,
+            bucket_region_flash: None,
 
             // 消しゴムモード
             erase_mode: false,
@@ -14021,7 +14049,9 @@ impl App {
             erase_brush_radius: 0.0, // enter_erase_mode で設定
             erase_bucket_tolerance: 48.0,
             erase_bucket_leak_stop: 0.0,
-            erase_bucket_connected: true,
+            erase_bucket_region: crate::mask_db::BucketRegion::Connected,
+            erase_bucket_outset: 1.0,
+            erase_bucket_gap_tolerance: 10.0,
             erase_lasso_points: Vec::new(),
             erase_line_start: None,
             erase_line_end: None,
@@ -14032,6 +14062,7 @@ impl App {
             mask_db,
             conceal_db,
             erase_undo_stack: std::collections::VecDeque::new(),
+            erase_redo_stack: std::collections::VecDeque::new(),
             meta_undo: crate::undo_stack::UndoStack::new(),
             adjustment_drag_session: None,
             adjustment_standard_drag_session: None,
@@ -14057,7 +14088,9 @@ impl App {
             conceal_paint_mode: true,
             conceal_bucket_tolerance: 48.0,
             conceal_bucket_leak_stop: 0.0,
-            conceal_bucket_connected: true,
+            conceal_bucket_region: crate::mask_db::BucketRegion::Connected,
+            conceal_bucket_outset: 1.0,
+            conceal_bucket_gap_tolerance: 10.0,
             conceal_mask: None,
             conceal_mask_size: [0, 0],
             conceal_mask_texture: None,
@@ -14066,6 +14099,7 @@ impl App {
             conceal_selected_shape: None,
             conceal_base_cache: std::collections::HashMap::new(),
             conceal_undo_stack: std::collections::VecDeque::new(),
+            conceal_redo_stack: std::collections::VecDeque::new(),
             conceal_last_undo_at: None,
             conceal_drag: None,
             conceal_last_paint_pos: None,
@@ -55209,6 +55243,7 @@ impl App {
         self.conceal_mask_texture = None;
         self.conceal_mask_texture_dirty_rect = None;
         self.conceal_undo_stack.clear();
+        self.conceal_redo_stack.clear();
         self.conceal_last_undo_at = None;
         self.clear_conceal_caches(idx);
         let ms = t0.elapsed().as_secs_f64() * 1000.0;

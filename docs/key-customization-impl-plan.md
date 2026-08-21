@@ -71,8 +71,9 @@
   ただし右ドラッグ、ゲームパッド X リング、戻る / 進むボタンは
   `Settings.ring_shortcuts` 側で限定カスタマイズする。戻る / 進むボタンは
   グリッド / 画像フルスクリーン / 動画フルスクリーンごとに単体アクションを割り当てる。
-  Shift / Alt + ホイールのカスタマイズは、グリッド / 画像 / 動画でルーティング差が大きいため
-  将来の別フェーズにする。
+  Shift / Alt + ホイールの一般カスタマイズは、グリッド / 画像 / 動画でルーティング差が大きいため
+  将来の別フェーズにする。編集モードの筆系ツールでキャンバス上だけ有効な Shift+ホイールは、
+  この一般設計を再開せず、マスク筆半径の固定入力として扱う。
 - **入力パターンは 3 種、差し替え方向は固定** (design doc §8.6):
   - **Press** (通常キー押下、M=ルーペ・ロックトグル含む): キー↔通常キー / 修飾↔修飾 自由
   - **Modifier-hold** (Shift ルーペ): 修飾↔修飾のみ
@@ -585,8 +586,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   `ToggleDetachedViewerMode` は例外的に native 動画転送対象へ含める。
 
 ### Erase (Ph3) ★
-- EraseConfirm `E`,`Esc` / EraseConfirmPolygon `Enter` / EraseUndo `Ctrl+Z` /
-  EraseDeleteShape `Delete`
+- EraseConfirm `E`,`Esc` / EraseConfirmPolygon `Enter` / EraseRedo `Ctrl+Y`,`Ctrl+Shift+Z` /
+  EraseUndo `Ctrl+Z` / EraseDeleteShape `Delete`
 - EraseToolSelect `S` / Brush `B` / Bucket `K` / Lasso `L` / Polygon `P` / VLine `V` / HLine `H` /
   Line `I` / Rect `R` / Ellipse `O`
 - ErasePaintMode `D` / EraseEraseMode `F`
@@ -594,8 +595,9 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - EraseSwallowNumbers `0`..`9` は旧スロット誤動作防止の no-op 消費なので固定。
 
 ### Conceal (Ph3) ★
-- ConcealExit `Ctrl+M`,`Esc` / ConcealConfirm `Enter` / ConcealUndo `Ctrl+Z` /
-  ConcealDelete `Delete`
+- ConcealExit `Ctrl+M`,`Esc` / ConcealConfirmPolygon `Enter` /
+  ConcealRedo `Ctrl+Y`,`Ctrl+Shift+Z` / ConcealUndo `Ctrl+Z` /
+  ConcealDeleteShape `Delete`
 - ConcealTypeCycle `T` / ConcealPixelGrid `G` / ConcealPreset1..4 `1`..`4` /
   ConcealPaintMode `D` / ConcealEraseMode `F`
 - ConcealToolSelect/Brush/Bucket/Lasso/Polygon/Line/VLine/HLine/Rect/Ellipse
@@ -620,7 +622,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 
 ### 固定・対象外として明示するもの
 - Gamepad: `src/app/gamepad_input.rs` の閲覧専用ボタン/軸入力。
-- Mouse: 通常ホイール、Ctrl+ホイール、クリック、D&D、右クリックメニューは固定。
+- Mouse: 通常ホイール、Ctrl+ホイール、編集キャンバス上の筆系ツールに限定した Shift+ホイール、クリック、D&D、右クリックメニューは固定。
   右ドラッグ、戻る/進むは `Settings.ring_shortcuts` で限定カスタマイズ。
 - Clipboard/delete files: `Event::Copy` / `Event::Cut`、Win32 クリップボード paste、
   ファイル削除ワーカー起動。

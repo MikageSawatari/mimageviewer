@@ -814,6 +814,7 @@ struct RemotePreparedComposite {
 #[derive(Clone)]
 struct RemoteEditSnapshot {
     erase: Option<crate::edit_source::MaskSnapshot>,
+    erase_mono_tolerance: u8,
     local_adjust: Option<Vec<local_adjust_core::LocalAdjustmentLayer>>,
     conceal: Option<crate::edit_source::MaskSnapshot>,
     conceal_preset: crate::conceal::ConcealPreset,
@@ -2139,8 +2140,10 @@ impl ContainerEngine {
             }
         };
         let conceal_preset = settings.conceal_preset.clone();
+        let erase_mono_tolerance = settings.erase_inpaint_mono_tolerance;
         let fingerprint = remote_edit_fingerprint(
             erase.as_ref(),
+            erase_mono_tolerance,
             local_adjust.as_ref(),
             conceal.as_ref(),
             &conceal_preset,
@@ -2149,12 +2152,14 @@ impl ContainerEngine {
         )?;
         let pre_ai_fingerprint = remote_pre_ai_edit_fingerprint(
             erase.as_ref(),
+            erase_mono_tolerance,
             local_adjust.as_ref(),
             conceal.as_ref(),
             &conceal_preset,
         )?;
         Ok(RemoteEditSnapshot {
             erase,
+            erase_mono_tolerance,
             local_adjust,
             conceal,
             conceal_preset,
@@ -2188,6 +2193,7 @@ impl ContainerEngine {
                     mask,
                     runtime: inpaint_runtime,
                     manager: inpaint_manager,
+                    mono_tolerance: edits.erase_mono_tolerance,
                     log_prefix: "remote page".to_string(),
                 })
             }
@@ -5675,6 +5681,7 @@ fn load_conceal_snapshot(
 
 fn remote_edit_fingerprint(
     erase: Option<&crate::edit_source::MaskSnapshot>,
+    erase_mono_tolerance: u8,
     local_adjust: Option<&Vec<local_adjust_core::LocalAdjustmentLayer>>,
     conceal: Option<&crate::edit_source::MaskSnapshot>,
     conceal_preset: &crate::conceal::ConcealPreset,
@@ -5688,6 +5695,9 @@ fn remote_edit_fingerprint(
         b"erase",
         &erase.map(|mask| (&mask.bitmap, &mask.shapes, mask.size)),
     )?;
+    if erase.is_some() {
+        hash_remote_edit_value(&mut digest, b"erase-mono-tolerance", &erase_mono_tolerance)?;
+    }
     hash_remote_edit_value(&mut digest, b"local", &local_adjust)?;
     hash_remote_edit_value(
         &mut digest,
@@ -5704,6 +5714,7 @@ fn remote_edit_fingerprint(
 
 fn remote_pre_ai_edit_fingerprint(
     erase: Option<&crate::edit_source::MaskSnapshot>,
+    erase_mono_tolerance: u8,
     local_adjust: Option<&Vec<local_adjust_core::LocalAdjustmentLayer>>,
     conceal: Option<&crate::edit_source::MaskSnapshot>,
     conceal_preset: &crate::conceal::ConcealPreset,
@@ -5715,6 +5726,9 @@ fn remote_pre_ai_edit_fingerprint(
         b"erase",
         &erase.map(|mask| (&mask.bitmap, &mask.shapes, mask.size)),
     )?;
+    if erase.is_some() {
+        hash_remote_edit_value(&mut digest, b"erase-mono-tolerance", &erase_mono_tolerance)?;
+    }
     hash_remote_edit_value(&mut digest, b"local", &local_adjust)?;
     hash_remote_edit_value(
         &mut digest,
@@ -8501,6 +8515,7 @@ mod tests {
                 lut_entry: None,
                 edits: RemoteEditSnapshot {
                     erase: None,
+                    erase_mono_tolerance: render_settings.erase_inpaint_mono_tolerance,
                     local_adjust: None,
                     conceal: None,
                     conceal_preset: render_settings.conceal_preset.clone(),
@@ -8669,6 +8684,26 @@ mod tests {
     }
 
     #[test]
+    fn remote_edit_fingerprint_includes_erase_tone_tolerance_only_for_erase() {
+        let erase = crate::edit_source::MaskSnapshot {
+            bitmap: vec![true],
+            shapes: Vec::new(),
+            size: [1, 1],
+        };
+        let preset = crate::conceal::ConcealPreset::default();
+        let with_low =
+            remote_edit_fingerprint(Some(&erase), 1, None, None, &preset, &[], None).unwrap();
+        let with_high =
+            remote_edit_fingerprint(Some(&erase), 64, None, None, &preset, &[], None).unwrap();
+        assert_ne!(with_low, with_high);
+
+        let without_low = remote_edit_fingerprint(None, 1, None, None, &preset, &[], None).unwrap();
+        let without_high =
+            remote_edit_fingerprint(None, 64, None, None, &preset, &[], None).unwrap();
+        assert_eq!(without_low, without_high);
+    }
+
+    #[test]
     fn compiled_book_remote_adjustment_uses_identity_until_a_page_override_exists() {
         let identity = RemoteAdjustmentIdentity {
             page_key: "compiled-page".to_owned(),
@@ -8703,6 +8738,7 @@ mod tests {
                 source,
                 RemoteEditSnapshot {
                     erase: None,
+                    erase_mono_tolerance: crate::settings::default_erase_inpaint_mono_tolerance(),
                     local_adjust: None,
                     conceal: Some(crate::edit_source::MaskSnapshot {
                         bitmap: vec![true, false],

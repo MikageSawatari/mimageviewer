@@ -328,6 +328,7 @@ impl App {
         // (例: 別ページからの再入場で同 idx のテクスチャが残ると bad cross-talk)。
         self.erase_base_tex_cache.clear();
         self.erase_undo_stack.clear();
+        self.erase_redo_stack.clear();
         self.erase_last_undo_at = None;
         self.erase_shapes.clear();
         self.erase_selected_shape = None;
@@ -397,6 +398,7 @@ impl App {
         self.erase_preview_active = false;
         self.erase_base_tex_cache.clear();
         self.erase_undo_stack.clear();
+        self.erase_redo_stack.clear();
         // **Preview cache を破棄** (Codex P1 R4 #1)。preview 完了が遅延して届く
         // ケースで `fs_cache` を汚染しないよう、pending preview job も cancel する。
         if let Some(idx) = restore_idx {
@@ -475,15 +477,44 @@ impl App {
 
     // ── Undo / Slot ────────────────────────────────────────────────
 
+    fn current_erase_snapshot(&self) -> Option<EraseSnapshot> {
+        Some(EraseSnapshot {
+            mask: self.erase_mask.as_ref()?.clone(),
+            shapes: self.erase_shapes.clone(),
+        })
+    }
+
+    fn push_erase_undo_snapshot(&mut self, snapshot: EraseSnapshot) {
+        self.erase_undo_stack.push_back(snapshot);
+        while self.erase_undo_stack.len() > UNDO_MAX {
+            self.erase_undo_stack.pop_front();
+        }
+    }
+
+    fn push_erase_redo_snapshot(&mut self, snapshot: EraseSnapshot) {
+        self.erase_redo_stack.push_back(snapshot);
+        while self.erase_redo_stack.len() > UNDO_MAX {
+            self.erase_redo_stack.pop_front();
+        }
+    }
+
+    fn restore_erase_snapshot(&mut self, snapshot: EraseSnapshot) {
+        self.erase_mask = Some(snapshot.mask);
+        self.erase_shapes = snapshot.shapes;
+        self.erase_selected_shape = None;
+        self.erase_drag = None;
+        self.erase_mask_texture = None;
+        // mask 復元 → preview cache 破棄。
+        if let Some(fs_idx) = self.fullscreen_idx {
+            self.clear_erase_preview(fs_idx);
+        }
+    }
+
     pub(crate) fn push_undo_snapshot(&mut self) {
-        if let Some(mask) = &self.erase_mask {
-            self.erase_undo_stack.push_back(EraseSnapshot {
-                mask: mask.clone(),
-                shapes: self.erase_shapes.clone(),
-            });
-            while self.erase_undo_stack.len() > UNDO_MAX {
-                self.erase_undo_stack.pop_front();
-            }
+        if let Some(snapshot) = self.current_erase_snapshot() {
+            // 新しい編集の共通入口。Undo/Redo の履歴移動は専用 helper を使う。
+            self.erase_redo_stack.clear();
+            self.push_erase_undo_snapshot(snapshot);
             self.erase_last_undo_at = Some(std::time::Instant::now());
         }
     }
@@ -501,20 +532,35 @@ impl App {
     }
 
     pub(crate) fn undo_erase(&mut self) -> bool {
-        if let Some(prev) = self.erase_undo_stack.pop_back() {
-            self.erase_mask = Some(prev.mask);
-            self.erase_shapes = prev.shapes;
-            self.erase_selected_shape = None;
-            self.erase_drag = None;
-            self.erase_mask_texture = None;
-            // mask 復元 → preview cache 破棄。
-            if let Some(fs_idx) = self.fullscreen_idx {
-                self.clear_erase_preview(fs_idx);
-            }
-            true
-        } else {
-            false
+        if self.erase_undo_stack.is_empty() {
+            return false;
         }
+        let Some(current) = self.current_erase_snapshot() else {
+            return false;
+        };
+        let Some(prev) = self.erase_undo_stack.pop_back() else {
+            return false;
+        };
+        self.push_erase_redo_snapshot(current);
+        self.restore_erase_snapshot(prev);
+        self.erase_last_undo_at = None;
+        true
+    }
+
+    pub(crate) fn redo_erase(&mut self) -> bool {
+        if self.erase_redo_stack.is_empty() {
+            return false;
+        }
+        let Some(current) = self.current_erase_snapshot() else {
+            return false;
+        };
+        let Some(next) = self.erase_redo_stack.pop_back() else {
+            return false;
+        };
+        self.push_erase_undo_snapshot(current);
+        self.restore_erase_snapshot(next);
+        self.erase_last_undo_at = None;
+        true
     }
 
     /// 現在のマスク (ビットマップ + ベクタ) をスロットに保存する。
@@ -623,6 +669,17 @@ impl App {
             self.paint_polygon(&pts, self.erase_paint_mode);
             self.show_feedback_toast("[多角形を確定]".to_string());
             return action;
+        }
+
+        // Redo は Ctrl+Shift+Z → Ctrl+Y → Ctrl+Z (Undo) の順に consume する。
+        // Undo を先にすると Ctrl+Shift+Z が Undo 側へ流れ得る。
+        let redo = self.keymap.consume_action(ctx, KeyAction::EraseRedo);
+        if redo {
+            if self.redo_erase() {
+                self.show_feedback_toast("[やり直す]".to_string());
+            } else {
+                self.show_feedback_toast("[履歴なし]".to_string());
+            }
         }
 
         // Ctrl+Z: Undo
@@ -1000,7 +1057,13 @@ impl App {
         );
     }
 
-    fn apply_erase_bucket(&mut self, fs_idx: usize, seed_x: usize, seed_y: usize) {
+    fn apply_erase_bucket(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        seed_x: usize,
+        seed_y: usize,
+    ) {
         let Some(source) = self.erase_base_cache.get(&fs_idx).cloned() else {
             self.show_feedback_toast(
                 "バケツに使う画像を準備中です。少し待ってからもう一度クリックしてください。"
@@ -1032,9 +1095,11 @@ impl App {
             seed_y,
             crate::mask_db::BucketFill {
                 tolerance: self.erase_bucket_tolerance.round().clamp(0.0, 255.0) as u8,
-                connected: self.erase_bucket_connected,
+                region: self.erase_bucket_region,
                 value: self.erase_paint_mode,
                 leak_stop: self.erase_bucket_leak_stop.max(0.0),
+                outset: self.erase_bucket_outset.max(0.0),
+                gap_tolerance: self.erase_bucket_gap_tolerance.clamp(0.0, 50.0),
             },
         );
         match outcome {
@@ -1043,6 +1108,15 @@ impl App {
                 self.show_feedback_toast(
                     "漏れ止めより細い場所です。漏れ止めを小さくしてください。".to_string(),
                 );
+                return;
+            }
+            crate::mask_db::BucketFillOutcome::ShapeFitFailed(preview) => {
+                self.start_bucket_region_flash(ctx, fs_idx, preview);
+                if let Some(message) =
+                    crate::ui_helpers::bucket_shape_fit_failed_message(self.erase_bucket_region)
+                {
+                    self.show_feedback_toast(message.to_string());
+                }
                 return;
             }
             crate::mask_db::BucketFillOutcome::NoChange
@@ -1518,6 +1592,7 @@ impl App {
             {
                 if let Some(fs_idx) = self.fullscreen_idx {
                     self.apply_erase_bucket(
+                        ctx,
                         fs_idx,
                         img_pos.0.floor() as usize,
                         img_pos.1.floor() as usize,
@@ -1850,6 +1925,7 @@ impl App {
                 transform.paint_texture(&painter, tex.id(), egui::Color32::WHITE);
             }
         }
+        self.draw_bucket_region_flash(ui, ctx, transform);
 
         // ドラッグ中のプレビュー
         self.draw_tool_preview(ui, transform);
@@ -2151,6 +2227,7 @@ impl App {
         let mut close_clicked = false;
         let mut switch_to: Option<usize> = None;
         let mut mask_delete_clicked = false;
+        let mut persist_inpaint_tone_tolerance = false;
 
         egui::Area::new(egui::Id::new("erase_tool_panel"))
             .fixed_pos(panel_pos)
@@ -2285,6 +2362,27 @@ impl App {
                         // padding (~10*2) - 中央 gap (4) を 2 で割って、片側 ~78px。
                         let btn_w = ((PANEL_W - 20.0 - 4.0) / 2.0).max(60.0);
                         let btn_size = egui::vec2(btn_w, 24.0);
+
+                        ui.label(
+                            egui::RichText::new("AI補完")
+                                .color(egui::Color32::from_gray(200)),
+                        );
+                        let tone_tolerance_response = ui
+                            .add(
+                                egui::Slider::new(
+                                    &mut self.settings.erase_inpaint_mono_tolerance,
+                                    1..=64,
+                                )
+                                .text("色調の許容")
+                                .step_by(1.0),
+                            )
+                            .on_hover_text(
+                                "画像の色が 1 本の線に乗っているとみなす許容量です。値を上げるほど、色味の散った画像でも補完結果を画像の色調に合わせます。",
+                            );
+                        persist_inpaint_tone_tolerance |= tone_tolerance_response.drag_stopped()
+                            || (tone_tolerance_response.changed()
+                                && !tone_tolerance_response.dragged());
+                        ui.separator();
 
                         // ── 見開きペアの左/右切替 (見開きから入った場合のみ) ──
                         if let Some((left_idx, right_idx)) =
@@ -2448,6 +2546,20 @@ impl App {
                             .wrap(),
                         );
 
+                        // ── ツール固有設定 ──
+                        // 設定を持たないツールでは区切りも見出しも出さない。
+                        let settings_tool_name = match self.erase_tool {
+                            EraseTool::Brush => Some("筆"),
+                            EraseTool::Bucket => Some("バケツ"),
+                            EraseTool::Line => Some("直線"),
+                            _ => None,
+                        };
+                        crate::ui_helpers::draw_tool_settings_heading(
+                            ui,
+                            settings_tool_name,
+                            egui::Color32::from_gray(200),
+                        );
+
                         // ── ブラシ半径 / 直線太さ スライダー ──
                         if self.erase_tool == EraseTool::Brush {
                             let max_r =
@@ -2468,18 +2580,13 @@ impl App {
                                 .text("色差の許容値")
                                 .step_by(1.0),
                             );
-                            ui.checkbox(&mut self.erase_bucket_connected, "隣接のみ");
-                            if self.erase_bucket_connected {
-                                ui.add(
-                                    egui::Slider::new(
-                                        &mut self.erase_bucket_leak_stop,
-                                        0.0..=16.0
-                                    )
-                                    .text("漏れ止め")
-                                    .step_by(0.1),
-                                )
-                                .on_hover_text("細い線や小さな隙間から塗りが漏れるのを防ぎます。0 で無効。");
-                            }
+                            crate::ui_helpers::draw_bucket_region_controls(
+                                ui,
+                                &mut self.erase_bucket_region,
+                                &mut self.erase_bucket_leak_stop,
+                                &mut self.erase_bucket_outset,
+                                &mut self.erase_bucket_gap_tolerance,
+                            );
                             ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(
@@ -2573,7 +2680,8 @@ impl App {
                             S:選択/ハンドル微調整\n\
                             Shift/Alt+ハンドル:拘束/中心固定\n\
                             多角形:始点クリック/右クリック/Enterで確定 Escで取消\n\
-                            Ctrl+Z:戻す  Del:選択削除";
+                            Ctrl+Z:戻す  Ctrl+Y/Ctrl+Shift+Z:やり直す\n\
+                            Del:選択削除";
                                         ui.add(
                                             egui::Label::new(
                                                 egui::RichText::new(help)
@@ -2594,6 +2702,17 @@ impl App {
             }); // Area::show
 
         // ── closure 外でディスパッチ (& mut self の借用衝突を避ける) ──
+        if persist_inpaint_tone_tolerance {
+            self.settings.erase_inpaint_mono_tolerance =
+                self.settings.erase_inpaint_mono_tolerance.clamp(1, 64);
+            self.settings.save();
+            // 既存の補完結果と、その下流で合成済みの補正・隠蔽・final cache を
+            // 新しい判定値で再生成する。進行中の補完も古い設定の結果なので破棄する。
+            if let Some(service) = &self.edit_preview_cache {
+                service.clear();
+            }
+            self.bump_all_input_generations();
+        }
         // プレビューボタンの **押下 transition** (false → true) を検出して、
         // MI-GAN inpaint を **保存なしで** 投入する。これにより、新規に shape を
         // 描いた直後にプレビュー押下するだけで現在のマスク全体に対する inpaint
@@ -3035,6 +3154,8 @@ impl App {
         let (progress_tx, progress_rx) = mpsc::channel::<EraseInpaintProgress>();
         let ctx_clone = ctx.clone();
         let local_ai_activity = self.local_ai_activity_lease();
+        let mono_tone_axis =
+            inpaint_mono_tone_axis(&original, self.settings.erase_inpaint_mono_tolerance);
 
         let spawn_result = std::thread::Builder::new()
             .name("erase-inpaint".to_string())
@@ -3047,6 +3168,7 @@ impl App {
                     &composite,
                     w,
                     h,
+                    mono_tone_axis,
                     &cancel_for_thread,
                     log_prefix,
                     Some(&progress_tx),
@@ -3344,6 +3466,7 @@ pub(crate) fn erase_from_saved_mask(
     base: &egui::ColorImage,
     bitmap: &[bool],
     shapes: &[crate::mask_db::Shape],
+    mono_tolerance: u8,
     cancel: &Arc<AtomicBool>,
     log_prefix: &str,
 ) -> Result<InpaintOutcome, String> {
@@ -3365,8 +3488,18 @@ pub(crate) fn erase_from_saved_mask(
     }
     let flattened = black_flatten_if_transparent(base);
     let input = flattened.as_ref().unwrap_or(base);
+    let mono_tone_axis = inpaint_mono_tone_axis(input, mono_tolerance);
     Ok(crate::edit_source::run_inpaint_pure(
-        runtime, manager, input, &composite, w, h, cancel, log_prefix, None,
+        runtime,
+        manager,
+        input,
+        &composite,
+        w,
+        h,
+        mono_tone_axis,
+        cancel,
+        log_prefix,
+        None,
     ))
 }
 
@@ -3381,6 +3514,46 @@ const INPAINT_STAGE_DEPTH: u32 = 48;
 /// マスク周囲から MI-GAN 入力へ含める既知画素の目安。
 const INPAINT_CONTEXT_PAD: usize = MIGAN_SIZE / 4;
 
+pub(crate) fn inpaint_mono_tone_axis(
+    original: &egui::ColorImage,
+    tolerance: u8,
+) -> Option<crate::colorize::MonoToneAxis> {
+    crate::colorize::mono_tone_axis(original).filter(|summary| {
+        crate::colorize::is_near_monochrome_residual(summary.p95_residual, tolerance)
+    })
+}
+
+fn match_migan_rgb_to_tone(rgb: [f32; 3], tone: crate::colorize::MonoToneAxis) -> [f32; 3] {
+    const REC709: [f32; 3] = [0.2126, 0.7152, 0.0722];
+
+    let mut axis = tone.axis;
+    let mut axis_luma = axis[0] * REC709[0] + axis[1] * REC709[1] + axis[2] * REC709[2];
+    if axis_luma.abs() <= 1e-6 {
+        return rgb;
+    }
+    if axis_luma < 0.0 {
+        axis = [-axis[0], -axis[1], -axis[2]];
+        axis_luma = -axis_luma;
+    }
+
+    let target_luma = rgb[0] * REC709[0] + rgb[1] * REC709[1] + rgb[2] * REC709[2];
+    let mean_luma = tone.mean[0] * REC709[0] + tone.mean[1] * REC709[1] + tone.mean[2] * REC709[2];
+    let t = (target_luma - mean_luma) / axis_luma;
+    [
+        (tone.mean[0] + axis[0] * t).clamp(0.0, 255.0),
+        (tone.mean[1] + axis[1] * t).clamp(0.0, 255.0),
+        (tone.mean[2] + axis[2] * t).clamp(0.0, 255.0),
+    ]
+}
+
+fn match_migan_rgb_to_tone_if_needed(
+    rgb: [f32; 3],
+    tone: Option<crate::colorize::MonoToneAxis>,
+) -> [f32; 3] {
+    tone.map(|tone| match_migan_rgb_to_tone(rgb, tone))
+        .unwrap_or(rgb)
+}
+
 /// MI-GAN による段階的タイル inpainting。
 ///
 /// 実在する既知画素に近い領域から 48px ずつ内側へ確定する。各段では
@@ -3392,6 +3565,7 @@ pub(crate) fn inpaint_migan(
     mask: &[bool],
     w: usize,
     h: usize,
+    mono_tone_axis: Option<crate::colorize::MonoToneAxis>,
     cancel: &Arc<std::sync::atomic::AtomicBool>,
     progress_tx: Option<&mpsc::Sender<EraseInpaintProgress>>,
 ) -> Result<egui::ColorImage, crate::ai::AiError> {
@@ -3441,6 +3615,7 @@ pub(crate) fn inpaint_migan(
             &commit,
             w,
             h,
+            mono_tone_axis,
             cancel,
             pass_index + 1,
             pass_count,
@@ -3465,6 +3640,7 @@ pub(crate) fn inpaint_migan(
             &remaining,
             w,
             h,
+            mono_tone_axis,
             cancel,
             finite_passes + 1,
             finite_passes + 1,
@@ -3484,6 +3660,7 @@ fn inpaint_migan_single_pass(
     commit_mask: &[bool],
     w: usize,
     h: usize,
+    mono_tone_axis: Option<crate::colorize::MonoToneAxis>,
     cancel: &Arc<std::sync::atomic::AtomicBool>,
     pass_index: usize,
     pass_count: usize,
@@ -3702,9 +3879,11 @@ fn inpaint_migan_single_pass(
             if wt <= f32::EPSILON {
                 continue;
             }
-            let r = (accum_r[ri] / wt).clamp(0.0, 255.0) as u8;
-            let g = (accum_g[ri] / wt).clamp(0.0, 255.0) as u8;
-            let b = (accum_b[ri] / wt).clamp(0.0, 255.0) as u8;
+            let inferred = [accum_r[ri] / wt, accum_g[ri] / wt, accum_b[ri] / wt];
+            let [r, g, b] = match_migan_rgb_to_tone_if_needed(inferred, mono_tone_axis);
+            let r = r.clamp(0.0, 255.0) as u8;
+            let g = g.clamp(0.0, 255.0) as u8;
+            let b = b.clamp(0.0, 255.0) as u8;
             // 元画素の alpha を保持する。from_rgb は alpha=255 固定なので、透過 PNG の
             // マスク域が不透明化し diffusion fallback (alpha 保持) と非一貫になる
             // (v1.0.0 安定性レビュー P3-8)。MI-GAN は RGB 出力なので alpha は元画像由来。
@@ -4136,6 +4315,82 @@ pub(crate) fn draw_dashed_circle(painter: &egui::Painter, center: egui::Pos2, ra
 mod book_erase_tests {
     use super::*;
 
+    fn erase_test_shape(revision: usize) -> Shape {
+        Shape::Rect {
+            op: ShapeOp::Add,
+            center: (revision as f32, 10.0),
+            half_w: 4.0,
+            half_h: 3.0,
+            rotation_rad: 0.0,
+        }
+    }
+
+    #[test]
+    fn erase_edit_undo_redo_restores_mask_and_shapes() {
+        let mut app = crate::app::setup_app_for_test();
+        app.erase_mask = Some(vec![false, false]);
+        app.erase_shapes.clear();
+
+        app.push_undo_snapshot();
+        app.erase_mask = Some(vec![true, false]);
+        app.erase_shapes = vec![erase_test_shape(1)];
+
+        assert!(app.undo_erase());
+        assert_eq!(app.erase_mask.as_deref(), Some([false, false].as_slice()));
+        assert!(app.erase_shapes.is_empty());
+        assert!(app.redo_erase());
+        assert_eq!(app.erase_mask.as_deref(), Some([true, false].as_slice()));
+        assert_eq!(app.erase_shapes, vec![erase_test_shape(1)]);
+    }
+
+    #[test]
+    fn erase_new_edit_after_undo_discards_redo() {
+        let mut app = crate::app::setup_app_for_test();
+        app.erase_mask = Some(vec![false]);
+        app.erase_shapes.clear();
+        app.push_undo_snapshot();
+        app.erase_mask = Some(vec![true]);
+        app.erase_shapes = vec![erase_test_shape(1)];
+        assert!(app.undo_erase());
+
+        app.push_undo_snapshot();
+        app.erase_mask = Some(vec![false]);
+        app.erase_shapes = vec![erase_test_shape(2)];
+
+        assert!(!app.redo_erase());
+        assert_eq!(app.erase_mask.as_deref(), Some([false].as_slice()));
+        assert_eq!(app.erase_shapes, vec![erase_test_shape(2)]);
+    }
+
+    #[test]
+    fn erase_undo_redo_limit_stays_bounded_and_symmetric() {
+        let mut app = crate::app::setup_app_for_test();
+        app.erase_mask = Some(vec![false]);
+        app.erase_shapes = vec![erase_test_shape(0)];
+        let final_revision = UNDO_MAX + 5;
+        for revision in 1..=final_revision {
+            app.push_undo_snapshot();
+            app.erase_mask = Some(vec![revision % 2 == 1]);
+            app.erase_shapes = vec![erase_test_shape(revision)];
+        }
+
+        assert_eq!(app.erase_undo_stack.len(), UNDO_MAX);
+        assert_eq!(
+            (0..=UNDO_MAX).filter(|_| app.undo_erase()).count(),
+            UNDO_MAX
+        );
+        assert_eq!(app.erase_redo_stack.len(), UNDO_MAX);
+        assert_eq!(
+            (0..=UNDO_MAX).filter(|_| app.redo_erase()).count(),
+            UNDO_MAX
+        );
+        assert_eq!(
+            app.erase_mask.as_deref(),
+            Some([final_revision % 2 == 1].as_slice())
+        );
+        assert_eq!(app.erase_shapes, vec![erase_test_shape(final_revision)]);
+    }
+
     #[test]
     fn erase_bucket_tool_maps_to_bucket_key_action() {
         assert_eq!(
@@ -4280,6 +4535,89 @@ mod book_erase_tests {
         assert_eq!(input[[0, 1, 0, 0]], 0.0);
     }
 
+    fn rec709_luma(rgb: [f32; 3]) -> f32 {
+        rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722
+    }
+
+    fn tone_source(pixel: impl Fn(usize) -> egui::Color32) -> egui::ColorImage {
+        egui::ColorImage::new([256, 1], (0..256).map(pixel).collect())
+    }
+
+    #[test]
+    fn gray_source_removes_inference_color_without_changing_luma() {
+        let source = tone_source(|index| egui::Color32::from_gray(index as u8));
+        let tone = inpaint_mono_tone_axis(&source, 12).expect("grayscale has a stable tone axis");
+        let inferred = [220.0, 45.0, 150.0];
+
+        let matched = match_migan_rgb_to_tone_if_needed(inferred, Some(tone));
+        assert!((matched[0] - matched[1]).abs() < 1e-3);
+        assert!((matched[1] - matched[2]).abs() < 1e-3);
+        assert!((rec709_luma(matched) - rec709_luma(inferred)).abs() < 1e-3);
+        let channels = matched.map(|channel| channel as u8);
+        assert_eq!(channels[0], channels[1]);
+        assert_eq!(channels[1], channels[2]);
+    }
+
+    #[test]
+    fn sepia_source_keeps_inference_luma_on_the_source_tone_line() {
+        let source = tone_source(|index| {
+            let v = index.min(220) as f32;
+            egui::Color32::from_rgb(v as u8, (v * 0.82) as u8, (v * 0.58) as u8)
+        });
+        let tone = inpaint_mono_tone_axis(&source, 12).expect("sepia ramp has a stable tone axis");
+        let inferred = [210.0, 55.0, 135.0];
+
+        let matched = match_migan_rgb_to_tone_if_needed(inferred, Some(tone));
+        assert!((rec709_luma(matched) - rec709_luma(inferred)).abs() < 1e-3);
+        let d = [
+            matched[0] - tone.mean[0],
+            matched[1] - tone.mean[1],
+            matched[2] - tone.mean[2],
+        ];
+        let projection = d[0] * tone.axis[0] + d[1] * tone.axis[1] + d[2] * tone.axis[2];
+        let residual_sq =
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] - projection * projection).max(0.0);
+        assert!(residual_sq.sqrt() < 0.05);
+    }
+
+    #[test]
+    fn colorful_source_leaves_inference_color_unchanged() {
+        let source = egui::ColorImage::new(
+            [64, 64],
+            (0..64 * 64)
+                .map(|index| match (index / 16 + index % 64 / 16) % 4 {
+                    0 => egui::Color32::RED,
+                    1 => egui::Color32::GREEN,
+                    2 => egui::Color32::BLUE,
+                    _ => egui::Color32::YELLOW,
+                })
+                .collect(),
+        );
+        let inferred = [220.0, 45.0, 150.0];
+        let tone = inpaint_mono_tone_axis(&source, 12);
+
+        assert!(tone.is_none());
+        assert_eq!(match_migan_rgb_to_tone_if_needed(inferred, tone), inferred);
+    }
+
+    #[test]
+    fn tiny_source_without_axis_leaves_inference_color_unchanged() {
+        let source = egui::ColorImage::new(
+            [2, 2],
+            vec![
+                egui::Color32::RED,
+                egui::Color32::GREEN,
+                egui::Color32::BLUE,
+                egui::Color32::WHITE,
+            ],
+        );
+        let inferred = [220.0, 45.0, 150.0];
+        let tone = inpaint_mono_tone_axis(&source, 64);
+
+        assert!(tone.is_none());
+        assert_eq!(match_migan_rgb_to_tone_if_needed(inferred, tone), inferred);
+    }
+
     #[test]
     fn saved_mask_without_runtime_uses_deterministic_diffusion_fallback() {
         let base = egui::ColorImage::new(
@@ -4299,6 +4637,7 @@ mod book_erase_tests {
             &base,
             &[false, true, false],
             &[],
+            crate::settings::default_erase_inpaint_mono_tolerance(),
             &cancel,
             "book-test",
         )

@@ -108,7 +108,7 @@ use crate::vector_edit::{HoverTarget, hit_test, cursor_icon_for, draw_handles, a
 | `LineKind` enum (Vert / Horiz / Diag) | `mask_db.rs` | Line variant 内で使用、ツールパレット統一に伴い共有 |
 | `rasterize_shape_into` 関数 (新規) | `mask_db.rs` | Shape variant ごとのラスタライズ (Line/Rect=多角形、Ellipse=楕円方程式) |
 | `scanline_fill_polygon` 関数 | `mask_db.rs` (既存) | 筆 / 囲み / Line / Rect 共通の多角形塗り |
-| `flood_fill_bitmap_mask` 関数 | `mask_db.rs` | バケツの連結 / 非連結塗りを消しゴム・隠蔽加工と共有 |
+| `flood_fill_bitmap_mask` 関数 | `mask_db.rs` | バケツの全体 / 連結塗り、確定領域のはみ出し拡張、隙間の許容を含む長方形 / 楕円 / 円への整形を消しゴム・隠蔽加工・補正レイヤーで共有 |
 | `scanline_fill_ellipse` 関数 (新規) | `mask_db.rs` | Ellipse variant 専用 (~50 行) |
 | `vector_edit.rs` (新規モジュール) | 新規 | ハンドル操作・カーソル選択・ドラッグ状態機械 (両ツール共通) |
 
@@ -152,7 +152,10 @@ conceal_line_width: f32,
 
 // バケツ設定 (App のセッション内保持。settings.db のスキーマは変更しない)
 conceal_bucket_tolerance: f32,
-conceal_bucket_connected: bool,
+conceal_bucket_region: BucketRegion, // Whole / Connected / Rect / Ellipse / Circle
+conceal_bucket_leak_stop: f32,
+conceal_bucket_outset: f32,
+conceal_bucket_gap_tolerance: f32, // 0..=50%、既定 10
 
 // 隠蔽パラメータ (グローバル、settings.db の settings_kv に永続化)
 conceal_type: ConcealType,                  // Mosaic / WhiteFill / BlackFill / Blur
@@ -187,7 +190,7 @@ conceal_pages: HashSet<usize>,
 **設計判断: すべてのパラメータ (隠蔽タイプ、タイル倍率、不透明度、ぼかし半径、
 境界モード等) は「グローバル設定」**。ページ個別にはしない。これで「ツールの好み」と
 「ページごとのマスク内容」が分離される。複数の好みを保持したいときはプリセット 4 スロット
-を使う (§8.3)。バケツの色差許容値と「隣接のみ」は編集セッションの操作値として
+を使う (§8.3)。バケツの色差許容値、塗る範囲、漏れ止め、はみ出し、隙間の許容は編集セッションの操作値として
 `App` にだけ保持し、`settings.db` やプリセットには追加しない。
 
 ```rust
@@ -217,7 +220,8 @@ enum BlurMode { AsMask, ExtendByRadius, InsideOnly }     // ぼかし専用
 | `1` / `2` / `3` / `4` | パラメータプリセット 1〜4 を適用 |
 | `T` | 隠蔽タイプを順次切替 (Mosaic → WhiteFill → BlackFill → Blur → Mosaic …) |
 | Ctrl+wheel | (Mosaic 時) タイル倍率 ±0.25x / (Blur 時) ぼかし半径 ±5px / (Fill 時) 不透明度 ±5% |
-| `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / Redo (マスク編集のみ) |
+| Shift+wheel | 筆選択中かつキャンバス上で筆半径を比例変更 (1 ノッチ約 1.1 倍、最低 1px)。パネル上と筆以外では消費しない |
+| `Ctrl+Z` / `Ctrl+Y` / `Ctrl+Shift+Z` | Undo / Redo (マスク編集のみ) |
 | 矢印 / Ctrl+矢印 | マスク平行移動 (1px / 10px、消しゴムと同じ) |
 | `[` / `]` / Ctrl+`[` / Ctrl+`]` | マスク回転 ±0.1° / ±1° (消しゴムと同じ) |
 
@@ -322,7 +326,7 @@ enum BlurMode { AsMask, ExtendByRadius, InsideOnly }     // ぼかし専用
 | --- | --- | --- | --- |
 | 選択 | S | ベクタ本体を hit test、ハンドルドラッグで編集 (`vector_edit.rs` 参照) | `Shape` 編集 |
 | 筆 | B | 半径 `brush_radius`、ストロークで `scanline_fill_polygon` ラスタライズ | ビットマップ |
-| バケツ | K | 画像クリック時に 1 回だけ、開始色との許容差で連結領域または画像全体の近似色を描画 / 消去 | ビットマップ |
+| バケツ | K | 画像クリック時に 1 回だけ、開始色との許容差で全体 / 連結領域を描画 / 消去。長方形はクリック位置の断面幅を保って連結領域内を両方向へ追い、楕円 / 円はクリック位置を含む最大の内接図形へ整形 | ビットマップ |
 | 囲み | L | ポリゴン → `scanline_fill_polygon` | ビットマップ |
 | 多角形 | P | クリックで頂点追加、始点付近 / 右クリック / Enter で確定して `scanline_fill_polygon` | ビットマップ |
 | 直線 | I | `Shape::Line { p0, p1, thickness }`、両端ドラッグで端点編集 | `Shape` vec |
@@ -330,6 +334,39 @@ enum BlurMode { AsMask, ExtendByRadius, InsideOnly }     // ぼかし専用
 | 横線 | H | `Shape::Line { kind: Horiz, .. }`、生成時に横に拘束 | `Shape` vec |
 | 矩形 | R | `Shape::Rect { center, half_w, half_h, rotation_rad }`、corner→corner ドラッグで作成 | `Shape` vec |
 | 楕円 | O | `Shape::Ellipse { center, rx, ry, rotation_rad }`、内接 bbox ドラッグで作成 | `Shape` vec |
+
+筆の半径はパネルスライダーに加え、筆選択中のキャンバス上で Shift+ホイールにより変更できる。
+消しゴム / 隠蔽加工 / 補正レイヤーで同じ比例刻みを使い、各スライダー範囲へクランプする。
+筆以外のツールやパネル上ではホイールを消費せず、既存のズーム / スクロールへ残す。
+
+バケツの「塗る範囲」は **全体 / 隣接のみ / 長方形 / 楕円 / 円** の排他 5 択。
+長方形 / 楕円 / 円は、漏れ止めを含む「隣接のみ」と同じ領域を求める。前景の 4 近傍に対応して
+背景の外部接続は 8 近傍で判定し、外部に接続しない背景を成分ごとに数える。「隙間の許容」
+(0..=50%、既定 10%) 以下の成分だけを文字などの小さな穴として埋める。0% では穴を埋めない。
+長方形は縮小画像を使わず、原寸の seed を通る断面を 0.5 度刻みで測る。最短の向きを基本の
+幅方向候補とし、seed が角寄りで斜めの短い断面が生じる場合に備えて角度幅の局所最小も候補に
+残す。seed の両側の壁までを固定幅にして長軸方向へ追跡し、T 字や交差のように横へ開く
+区間が幅程度より短ければ通過する一方、幅より外側への接続が幅程度以上続けば広い接続先の手前で
+止める。候補間では追跡できた長方形の面積が最大のものを選ぶ。楕円 / 円は従来どおり、クリック
+位置を含み領域内に収まる最大面積の図形を選ぶ。楕円モードは同じクリック位置の円も原寸で候補に
+含め、円モードより小さい面積を返さない。重なった図形はクリックした側を選び、複数候補が
+成立する場合は面積が大きい方を選ぶ。**意図した挙動 (2026-08-21 利用者判断)** として、楕円 / 円は
+「クリック位置を含む・region 内に収まる・面積最大」を優先するため、細い部分で接続した先に広い
+region があると楕円がそこまで伸びる場合がある。長方形のような通路追跡で止める仕様にはせず、
+範囲を狭めたい場合は「隙間の許容」と「色差の許容値」を下げる (両方 0 で意図どおりになることを確認済み)。
+半幅 / 半径が 2px 未満になる退化時だけマスクを変更せず、整形前の選択範囲を
+黄色で約 1 秒表示して漏れ止めまたは色差許容値の見直しを案内する。「はみ出し」は全 5 モードで
+0〜8px (既定 1.0px) を共有する。図形 3 モードでは確定後の図形の半径を広げ、全体 / 隣接のみでは
+漏れ止めまで含めて決めた領域からのユークリッド距離が指定値以下の画素を、色差条件で制限せず
+描画 / 消去対象へ加える。適用順は「領域決定 → はみ出し → マスク書き込み」とする。
+「隙間の許容」は図形 3 モードだけで表示する。
+これらは消しゴム / 隠蔽加工 / 補正レイヤーで
+共通とする。
+
+マニュアルのバケツ設定比較図 `fig-bucket-*.webp` は、決定的な合成画像へ本体の
+`mask_db::flood_fill_bitmap_mask` を適用する `src/bin/gen_bucket_figures.rs` で生成する。
+バケツの挙動を変更した場合は `cargo run --release --features dev-tools --bin gen_bucket_figures`
+で 7 点を再生成し、各パネルの差とクリック位置を目視確認してからマニュアルへ反映する。
 
 ベクタオブジェクト編集の挙動 (ハンドル方式、Ctrl/Shift/Alt 修飾子) は消しゴムと完全一致。
 選択ツール中は未選択 Shape も編集用アウトラインで表示し、`Add` と `Subtract` を色分けする。
@@ -1102,19 +1139,20 @@ pub fn save_image_with_metadata(
 
 ```rust
 struct ConcealSnapshot {
-    bitmap: Vec<bool>,
-    bitmap_size: [usize; 2],
-    vectors: Vec<LineObject>,
+    mask: Vec<bool>,
+    shapes: Vec<Shape>,
 }
 ```
 
-**マスク (bitmap + vectors) のみが Undo 対象**。パラメータ変更・タイプ切替・プリセット
+**マスク (bitmap + Shape) のみが Undo / Redo 対象**。パラメータ変更・タイプ切替・プリセット
 適用は Undo 対象外 (§8.3 参照)。
 
-- ストローク開始時に push、`conceal_last_undo_at` で 100ms 以内の重複 push を抑制
-- `Ctrl+Z` で pop_back → 現在のマスクに復元 → redo stack に push
-- `Ctrl+Shift+Z` で redo stack から pop
-- モード入退場 / フォルダ切替 / fullscreen idx 移動で stack クリア (消しゴムと同じ境界)
+- 新しい編集の開始時に現在状態を undo stack へ push し、redo stack をクリアする。
+  キーリピート操作は `conceal_last_undo_at` で 500ms 以内の重複 push を抑制する
+- `Ctrl+Z` は復元前の現在状態を redo stack へ積んでから、undo stack の末尾を復元する
+- `Ctrl+Y` / `Ctrl+Shift+Z` は復元前の現在状態を undo stack へ積んでから、redo stack の末尾を復元する
+- 両 stack とも最大 20 件。モード入場成功時 / 退場時 / 編集ページ切替時に両方をクリアする。
+  編集中の画像解像度が変わってマスクをリスケールした場合も、旧寸法の履歴を両方クリアする
 
 **タイル倍率と境界モードは Undo 対象外** (グローバル設定なので)。
 画像補正 (色系) の Undo は既存の `meta_undo` が処理 → 影響なし。
@@ -1232,7 +1270,7 @@ CLAUDE.md の「コード修正時のドキュメント同時更新」ルール�
 - 加工パラメータ (タイプ、タイルモード、不透明度、ぼかし半径、境界モード等) は
   **グローバル設定** (`settings.db` の `settings_kv` に永続化、ページ間共有)。複数の好みを保持したい
   ときは **パラメータプリセット 4 スロット** (`1`〜`4` キーで適用)
-- バケツの色差許容値と「隣接のみ」は `App` のセッション内保持とし、設定 DB のスキーマは変えない
+- バケツの色差許容値、塗る範囲、漏れ止め、はみ出し、隙間の許容は `App` のセッション内保持とし、設定 DB のスキーマは変えない
 - マスクは **ページ個別** に保存 (`conceal.db` + サイドカー)
 - マスク用 2 スロット (`__slot_1` / `__slot_2`) で差分画像生成をサポート
 - **特定の投稿サイト名・基準名・基準への適合判定を UI / ドキュメント / ヘルプ文に書かない**。

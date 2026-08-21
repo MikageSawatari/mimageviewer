@@ -5198,6 +5198,9 @@ pub(super) fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
     );
     ui.add_space(8.0);
 
+    ui.separator();
+    ui.add_space(8.0);
+
     // 検出 GPU の表示
     let vendor_label = match state.gpu_vendor {
         Some(GpuVendor::Nvidia) => "NVIDIA (TensorRT 利用可能)",

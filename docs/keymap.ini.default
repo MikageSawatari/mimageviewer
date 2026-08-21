@@ -496,6 +496,8 @@
 [Erase] ; 消しゴムモード
 # EraseConfirm = E ; 消しゴム処理を実行して終了する
 # EraseConfirmPolygon = Enter ; 消しゴム多角形を確定する
+# EraseRedo.1 = Ctrl+Y ; 消しゴム編集をやり直す
+# EraseRedo.2 = Ctrl+Shift+Z ; 消しゴム編集をやり直す
 # EraseUndo = Ctrl+Z ; 消しゴム編集を元に戻す
 # EraseDeleteShape = Delete ; 選択中の消しゴム図形を削除する
 # EraseToolSelect = S ; 選択ツールに切り替える
@@ -515,6 +517,8 @@
 [Conceal] ; 隠蔽加工モード
 # ConcealExit = Ctrl+M ; 隠蔽加工モードを終了する
 # ConcealConfirmPolygon = Enter ; 隠蔽加工の多角形を確定する
+# ConcealRedo.1 = Ctrl+Y ; 隠蔽加工編集をやり直す
+# ConcealRedo.2 = Ctrl+Shift+Z ; 隠蔽加工編集をやり直す
 # ConcealUndo = Ctrl+Z ; 隠蔽加工編集を元に戻す
 # ConcealDeleteShape = Delete ; 選択中の隠蔽図形を削除する
 # ConcealPixelGrid = G ; ピクセルグリッド表示を切り替える

@@ -173,6 +173,7 @@ mod seek_ruler;
 pub mod settings;
 pub mod settings_db;
 pub mod settings_restore;
+pub mod shape_fit;
 pub mod shell_file_ops;
 pub mod sidecar;
 pub mod single_instance;
