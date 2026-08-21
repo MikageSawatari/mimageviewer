@@ -408,7 +408,22 @@ HUD コマンドをアクティブ化へ変換し、**それ以外の利用者�
 - ⚠ §9.6 の指示書は native オーバーレイ組み立ての 2 箇所を「Root 限定のまま」としていたが、
   **本ステージで所有者引数を取る形へ変更した**。右クリックメニュー抑止の 2 箇所
   (`src/app/gamepad_input.rs:1399` / `:1419`) は**引き続き Root 限定**。
-- コミット: c71d8c08。実機確認待ち。
+- コミット: c71d8c08 + fix1 4c5260a2。実機確認待ち。
+- **fix1 (実機ログで確定した退行)**: 再生中の動画ウィンドウで右ドラッグ状態の **producer が 2 つ**になっていた。
+  native presenter がドラッグを開始する一方、presenter の裏にいる egui の ParkedLive 経路は
+  右ボタンを一度も見ないため `right_drag_live && !secondary_down` を満たし、
+  `Cancel { ButtonStateLost }` を発行して native が始めたドラッグを殺していた。
+  `right_drag_pointer_pos` (`src/app/gamepad_input.rs:1161`) は**所有者でしか絞っておらず、
+  どちらの producer が持っているかを区別しない**のが原因。
+  - 実機ログの証拠 (`MIV_DETACHED_WINDOW_DEBUG=1`、2026-08-21): 記録された right_drag イベント
+    10 行が**すべて** `reason=button_state_lost` のキャンセル (5 試行 sequence 0〜4)。
+    一方 `parked-live passive event ignored ... MouseButton` は **0 件**で、
+    allow-list は正しく右ボタンを通していた。
+  - 修正: `egui_owns_right_drag` (`src/ui_fullscreen.rs:11911`) を**唯一の所有判定**として
+    1 回だけ評価し、ガイドと入力の両方に使う。所有していない側はキャンセルも入力も発行しない。
+    イベント種別の決定は自由関数 `parked_live_egui_right_drag_event_kind`
+    (`src/ui_fullscreen.rs:3144`) へ切り出してテストで固定した。
+    **ガイドと入力で所有者判定を分けないこと。分けるとこのクラスのバグが再発する。**
 
 ## 10. 将来候補 (現行仕様では未採用)
 
