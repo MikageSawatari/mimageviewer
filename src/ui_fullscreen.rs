@@ -11422,7 +11422,12 @@ impl App {
             .right_drag_events
             .sort_by_key(|(_, event)| event.sequence);
         for (id, event) in batch.right_drag_events.drain(..) {
+            let owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(id);
+            let was_live = self.right_drag_pointer_pos(owner).is_some();
             self.apply_passive_detached_right_drag_event(ctx, id, event);
+            if was_live || self.right_drag_pointer_pos(owner).is_some() {
+                ctx.request_repaint_of(Self::detached_image_window_viewport_id(id));
+            }
         }
         for (id, placement) in batch.placements.drain(..) {
             self.set_detached_window_runtime_placement(id, placement, "passive_placement_update");
@@ -11724,6 +11729,7 @@ impl App {
 
         for window in &deferred_windows {
             let viewport_id = Self::detached_image_window_viewport_id(window.id);
+            let right_drag_owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(window.id);
             if !self.deferred_detached_window_registration_allowed(
                 window.id,
                 &mut unconfirmed_deferred_registered,
@@ -11736,6 +11742,7 @@ impl App {
                 ));
                 continue;
             }
+            self.request_detached_right_drag_guide_repaint(ctx, right_drag_owner, viewport_id);
             let apply_initial_placement = !window.initial_placement_applied;
             let window_placement =
                 self.ensure_detached_window_runtime_placement(window.id, "deferred_passive_seed");
@@ -11757,7 +11764,7 @@ impl App {
                 self.settings.ui_scale_factor,
             )
             .with_visible(self.window_visible);
-            let view = crate::app::DeferredDetachedImageWindowView::from_snapshot(
+            let view = self.deferred_detached_image_window_view(
                 window,
                 window_placement,
                 apply_initial_placement,
@@ -11826,6 +11833,9 @@ impl App {
                             &view,
                             &mut bar_close_requested,
                         );
+                        if let Some(guide) = view.right_drag_guide.as_ref() {
+                            crate::app::draw_right_drag_guide(ui.painter(), full_rect, guide);
+                        }
                     });
                 // Passive deferred still windows carry only pointer samples back to the root;
                 // they contain no text input, so IME state remains owned by the root App pass.
@@ -11854,6 +11864,8 @@ impl App {
 
         for window in parked_live_windows {
             let viewport_id = Self::detached_image_window_viewport_id(window.id);
+            let right_drag_owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(window.id);
+            self.request_detached_right_drag_guide_repaint(ctx, right_drag_owner, viewport_id);
             let apply_initial_placement = !window.initial_placement_applied;
             let window_placement =
                 self.ensure_detached_window_runtime_placement(window.id, "passive_render_seed");
@@ -11899,7 +11911,10 @@ impl App {
                 &window,
                 window_placement,
                 apply_initial_placement,
+                None,
             );
+            let right_drag_guide =
+                self.right_drag_guide_for_owner(right_drag_owner, window.right_drag_context());
             let ui_scale = self.settings.ui_scale_factor;
             ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx, _class| {
                 let (outer_rect, inner_rect, minimized, maximized, focused, ppp) =
@@ -11994,6 +12009,9 @@ impl App {
                                 &view,
                                 &mut bar_close_requested,
                             );
+                        }
+                        if let Some(guide) = right_drag_guide.as_ref() {
+                            crate::app::draw_right_drag_guide(ui.painter(), full_rect, guide);
                         }
                     });
                 self.show_remote_session_dialog(vp_ctx);

@@ -32294,6 +32294,207 @@ mod still_window_mode_key_tests {
         bundle
     }
 
+    fn visible_gesture_state(
+        owner: crate::ring_shortcut::RightDragOwner,
+    ) -> crate::ring_shortcut::MouseGestureState {
+        let pos = egui::pos2(80.0, 120.0);
+        let mut state = crate::ring_shortcut::MouseGestureState::new(
+            owner,
+            crate::ring_shortcut::RightDragContext::ImageFullscreen,
+            std::time::Instant::now(),
+            pos,
+        );
+        state.pattern = vec![crate::ring_shortcut::MouseGestureDirection::Right];
+        state.armed = true;
+        state.current_pos = egui::pos2(140.0, 120.0);
+        state
+    }
+
+    fn visible_ring_state(
+        owner: crate::ring_shortcut::RightDragOwner,
+    ) -> crate::ring_shortcut::MouseFlickState {
+        let pos = egui::pos2(80.0, 120.0);
+        let mut state = crate::ring_shortcut::MouseFlickState::new(
+            owner,
+            crate::ring_shortcut::RingShortcutContext::ImageFullscreen,
+            std::time::Instant::now(),
+            pos,
+        );
+        state.armed = true;
+        state.current_pos = egui::pos2(160.0, 120.0);
+        state
+    }
+
+    #[test]
+    fn right_drag_guide_contents_match_for_root_and_detached_owner() {
+        let mut app = setup_app();
+        let context = crate::ring_shortcut::RightDragContext::ImageFullscreen;
+        let root = crate::ring_shortcut::RightDragOwner::Root;
+        let detached = crate::ring_shortcut::RightDragOwner::DetachedWindow(71);
+
+        app.settings
+            .ring_shortcuts
+            .set_right_drag_mode(context, crate::ring_shortcut::RightDragMode::MouseGesture);
+        app.mouse_gesture = Some(visible_gesture_state(root));
+        let root_gesture = app
+            .right_drag_guide_for_owner(root, context)
+            .expect("root gesture guide");
+        app.mouse_gesture = Some(visible_gesture_state(detached));
+        let detached_gesture = app
+            .right_drag_guide_for_owner(detached, context)
+            .expect("detached gesture guide");
+        assert_eq!(root_gesture, detached_gesture);
+
+        app.mouse_gesture = None;
+        app.settings
+            .ring_shortcuts
+            .set_right_drag_mode(context, crate::ring_shortcut::RightDragMode::RingShortcut);
+        app.mouse_ring_flick = Some(visible_ring_state(root));
+        let root_ring = app
+            .right_drag_guide_for_owner(root, context)
+            .expect("root ring guide");
+        assert!(matches!(
+            &root_ring,
+            RightDragGuide::Ring { slot_labels, .. }
+                if slot_labels.len() == crate::ring_shortcut::RING_SHORTCUT_SLOT_COUNT
+        ));
+        app.mouse_ring_flick = Some(visible_ring_state(detached));
+        let detached_ring = app
+            .right_drag_guide_for_owner(detached, context)
+            .expect("detached ring guide");
+        assert_eq!(root_ring, detached_ring);
+    }
+
+    #[test]
+    fn right_drag_guide_builder_applies_all_suppression_conditions() {
+        let mut app = setup_app();
+        let context = crate::ring_shortcut::RightDragContext::ImageFullscreen;
+        let owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(72);
+
+        app.settings
+            .ring_shortcuts
+            .set_right_drag_mode(context, crate::ring_shortcut::RightDragMode::MouseGesture);
+        app.mouse_gesture = Some(visible_gesture_state(owner));
+        assert!(app.right_drag_guide_for_owner(owner, context).is_some());
+
+        app.settings
+            .ring_shortcuts
+            .set_right_drag_mode(context, crate::ring_shortcut::RightDragMode::Disabled);
+        assert!(app.right_drag_guide_for_owner(owner, context).is_none());
+
+        app.settings
+            .ring_shortcuts
+            .set_right_drag_mode(context, crate::ring_shortcut::RightDragMode::MouseGesture);
+        app.settings.ring_shortcuts.mouse_gesture_help_visible = false;
+        assert!(app.right_drag_guide_for_owner(owner, context).is_none());
+        app.settings.ring_shortcuts.mouse_gesture_help_visible = true;
+
+        let picker =
+            app.build_ring_picker_state(crate::ring_shortcut::RingShortcutContext::ImageFullscreen);
+        app.ring_picker = Some(picker);
+        assert!(app.right_drag_guide_for_owner(owner, context).is_none());
+        app.ring_picker = None;
+
+        let other_context = crate::ring_shortcut::RightDragContext::VideoFullscreen;
+        app.settings.ring_shortcuts.set_right_drag_mode(
+            other_context,
+            crate::ring_shortcut::RightDragMode::MouseGesture,
+        );
+        assert!(
+            app.right_drag_guide_for_owner(owner, other_context)
+                .is_none()
+        );
+
+        app.mouse_gesture = Some(crate::ring_shortcut::MouseGestureState::new(
+            owner,
+            context,
+            std::time::Instant::now(),
+            egui::pos2(80.0, 120.0),
+        ));
+        assert!(app.right_drag_guide_for_owner(owner, context).is_none());
+
+        app.mouse_gesture = None;
+        app.settings
+            .ring_shortcuts
+            .set_right_drag_mode(context, crate::ring_shortcut::RightDragMode::RingShortcut);
+        app.mouse_ring_flick = Some(visible_ring_state(owner));
+        assert!(app.right_drag_guide_for_owner(owner, context).is_some());
+
+        app.settings.ring_shortcuts.mouse_ring_help_visible = false;
+        assert!(app.right_drag_guide_for_owner(owner, context).is_none());
+        app.settings.ring_shortcuts.mouse_ring_help_visible = true;
+
+        app.mouse_ring_flick = Some(crate::ring_shortcut::MouseFlickState::new(
+            owner,
+            crate::ring_shortcut::RingShortcutContext::ImageFullscreen,
+            std::time::Instant::now(),
+            egui::pos2(80.0, 120.0),
+        ));
+        assert!(app.right_drag_guide_for_owner(owner, context).is_none());
+
+        let mut mismatched_ring = visible_ring_state(owner);
+        mismatched_ring.context = crate::ring_shortcut::RingShortcutContext::VideoFullscreen;
+        app.mouse_ring_flick = Some(mismatched_ring);
+        assert!(app.right_drag_guide_for_owner(owner, context).is_none());
+    }
+
+    #[test]
+    fn deferred_right_drag_guide_is_attached_only_to_owning_window_dto() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let owner_id = 73;
+        let other_id = 74;
+        let owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(owner_id);
+        let context = crate::ring_shortcut::RightDragContext::ImageFullscreen;
+        app.settings
+            .ring_shortcuts
+            .set_right_drag_mode(context, crate::ring_shortcut::RightDragMode::MouseGesture);
+        app.mouse_gesture = Some(visible_gesture_state(owner));
+        let owner_window = paused_test_window(
+            &ctx,
+            owner_id,
+            passive_right_drag_image_bundle(r"C:\pics\guide-owner.jpg"),
+        );
+        let other_window = paused_test_window(
+            &ctx,
+            other_id,
+            passive_right_drag_image_bundle(r"C:\pics\guide-other.jpg"),
+        );
+        let placement = app.detached_viewer_window_placement();
+
+        let owner_view = app.deferred_detached_image_window_view(&owner_window, placement, false);
+        let other_view = app.deferred_detached_image_window_view(&other_window, placement, false);
+
+        assert!(owner_view.right_drag_guide.is_some());
+        assert!(other_view.right_drag_guide.is_none());
+    }
+
+    #[test]
+    fn right_drag_guide_clears_after_release_and_cancel() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(75);
+        let context = crate::ring_shortcut::RightDragContext::ImageFullscreen;
+        let pos = egui::pos2(160.0, 120.0);
+        app.settings
+            .ring_shortcuts
+            .set_right_drag_mode(context, crate::ring_shortcut::RightDragMode::MouseGesture);
+        app.mouse_gesture = Some(visible_gesture_state(owner));
+        assert!(app.right_drag_guide_for_owner(owner, context).is_some());
+
+        app.recognize_mouse_gesture_with_pos(&ctx, owner, context, pos, false, true);
+        assert!(app.right_drag_guide_for_owner(owner, context).is_none());
+
+        app.settings
+            .ring_shortcuts
+            .set_right_drag_mode(context, crate::ring_shortcut::RightDragMode::RingShortcut);
+        app.mouse_ring_flick = Some(visible_ring_state(owner));
+        assert!(app.right_drag_guide_for_owner(owner, context).is_some());
+
+        assert!(app.cancel_detached_right_drag_owner(75, "test_cancel"));
+        assert!(app.right_drag_guide_for_owner(owner, context).is_none());
+    }
+
     fn passive_rotate_command() -> crate::ring_shortcut::RightDragCommand {
         crate::ring_shortcut::RightDragCommand::RingShortcut {
             context: crate::ring_shortcut::RingShortcutContext::ImageFullscreen,
@@ -48496,6 +48697,7 @@ mod still_window_mode_key_tests {
             &app.detached_image_windows[0],
             placement,
             false,
+            None,
         );
         let shared = app.deferred_detached_image_window_shared(view);
         shared.push_event(DeferredDetachedImageWindowEvent::Frame {
@@ -48591,6 +48793,7 @@ mod still_window_mode_key_tests {
             &app.detached_image_windows[0],
             previous,
             false,
+            None,
         );
         let shared = app.deferred_detached_image_window_shared(view);
         shared.push_event(DeferredDetachedImageWindowEvent::Frame {

@@ -300,6 +300,199 @@ fn right_drag_press_suppresses_context_menu(
         || pointer_pos.is_some_and(|pos| pos.distance(start_pos) >= MOUSE_FLICK_MOVE_THRESHOLD_PX)
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RightDragGuideRow {
+    pub(crate) label: String,
+    pub(crate) value: String,
+}
+
+/// The complete, owner-independent content of a visible right-drag guide.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum RightDragGuide {
+    Gesture {
+        current_pattern: String,
+        rows: Vec<RightDragGuideRow>,
+        selected_row: Option<usize>,
+        short_click_hint: String,
+    },
+    Ring {
+        center: egui::Pos2,
+        selected: Option<RingDirection>,
+        slot_labels: Vec<String>,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum RightDragGuideKind {
+    Gesture,
+    Ring,
+}
+
+pub(crate) fn draw_right_drag_guide(
+    painter: &egui::Painter,
+    full_rect: egui::Rect,
+    guide: &RightDragGuide,
+) {
+    match guide {
+        RightDragGuide::Gesture { .. } => draw_mouse_gesture_guide(painter, full_rect, guide),
+        RightDragGuide::Ring {
+            center,
+            selected,
+            slot_labels,
+        } => {
+            let radius = ring_guide_radius_for_rect(full_rect);
+            draw_ring_guide_donut(painter, *center, radius, *selected, |direction| {
+                slot_labels
+                    .get(direction.slot_index())
+                    .map(String::as_str)
+                    .unwrap_or_default()
+            });
+        }
+    }
+}
+
+fn draw_mouse_gesture_guide(
+    painter: &egui::Painter,
+    full_rect: egui::Rect,
+    guide: &RightDragGuide,
+) {
+    let RightDragGuide::Gesture {
+        current_pattern,
+        rows,
+        selected_row,
+        short_click_hint,
+    } = guide
+    else {
+        return;
+    };
+    let margin = 16.0;
+    let usable_w = (full_rect.width() - margin * 2.0).max(120.0);
+    let usable_h = (full_rect.height() - margin * 2.0).max(120.0);
+    let row_h = 32.0;
+    let panel_w = (full_rect.width() * 0.60).clamp(340.0, 560.0).min(usable_w);
+    let panel_h = (96.0 + row_h * rows.len().max(1) as f32).min(usable_h);
+    let rect = egui::Rect::from_center_size(full_rect.center(), egui::vec2(panel_w, panel_h));
+    draw_mouse_gesture_guide_frame(painter, rect, current_pattern, short_click_hint);
+    draw_mouse_gesture_guide_rows(painter, rect, panel_h, row_h, rows, *selected_row);
+}
+
+fn draw_mouse_gesture_guide_frame(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    current_pattern: &str,
+    short_click_hint: &str,
+) {
+    painter.rect_filled(rect, 8.0, egui::Color32::from_black_alpha(220));
+    painter.rect_stroke(
+        rect,
+        8.0,
+        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        rect.min + egui::vec2(14.0, 14.0),
+        egui::Align2::LEFT_TOP,
+        format!("マウスジェスチャ / 入力中: {current_pattern}"),
+        egui::FontId::proportional(17.0),
+        egui::Color32::WHITE,
+    );
+    painter.text(
+        egui::pos2(rect.min.x + 14.0, rect.max.y - 20.0),
+        egui::Align2::LEFT_CENTER,
+        format!("右ドラッグで軌跡を入力、離すと実行 / {short_click_hint}"),
+        egui::FontId::proportional(12.0),
+        egui::Color32::from_gray(190),
+    );
+}
+
+fn draw_mouse_gesture_guide_rows(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    panel_h: f32,
+    row_h: f32,
+    rows: &[RightDragGuideRow],
+    selected_row: Option<usize>,
+) {
+    let row_left = rect.min.x + 14.0;
+    let row_right = rect.max.x - 14.0;
+    let mut y = rect.min.y + 46.0;
+    if rows.is_empty() {
+        painter.text(
+            egui::pos2(row_left + 10.0, y + row_h * 0.5),
+            egui::Align2::LEFT_CENTER,
+            "未登録",
+            egui::FontId::proportional(14.5),
+            egui::Color32::from_gray(205),
+        );
+        painter.text(
+            egui::pos2(row_right - 10.0, y + row_h * 0.5),
+            egui::Align2::RIGHT_CENTER,
+            "操作カスタマイズで追加",
+            egui::FontId::proportional(14.5),
+            egui::Color32::from_gray(230),
+        );
+        return;
+    }
+    let visible_rows = (((panel_h - 96.0).max(row_h) / row_h).floor() as usize)
+        .max(1)
+        .min(rows.len().max(1));
+    let focus_row = selected_row.unwrap_or(0);
+    let start = focus_row
+        .saturating_sub(visible_rows / 2)
+        .min(rows.len().saturating_sub(visible_rows));
+    let end = (start + visible_rows).min(rows.len());
+    for (idx, row) in rows.iter().enumerate().take(end).skip(start) {
+        draw_mouse_gesture_guide_row(
+            painter,
+            row_left,
+            row_right,
+            y,
+            row_h,
+            row,
+            selected_row == Some(idx),
+        );
+        y += row_h;
+    }
+}
+
+fn draw_mouse_gesture_guide_row(
+    painter: &egui::Painter,
+    row_left: f32,
+    row_right: f32,
+    y: f32,
+    row_h: f32,
+    row: &RightDragGuideRow,
+    selected: bool,
+) {
+    let row_rect = egui::Rect::from_min_size(
+        egui::pos2(row_left, y),
+        egui::vec2((row_right - row_left).max(1.0), row_h),
+    );
+    painter.rect_filled(
+        row_rect,
+        5.0,
+        if selected {
+            egui::Color32::from_rgb(56, 94, 138)
+        } else {
+            egui::Color32::TRANSPARENT
+        },
+    );
+    painter.text(
+        egui::pos2(row_rect.min.x + 10.0, row_rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        &row.label,
+        egui::FontId::proportional(14.5),
+        egui::Color32::from_white_alpha(if selected { 245 } else { 205 }),
+    );
+    painter.text(
+        egui::pos2(row_rect.max.x - 10.0, row_rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        &row.value,
+        egui::FontId::proportional(14.5),
+        egui::Color32::WHITE,
+    );
+}
+
 impl App {
     pub(crate) fn draw_gamepad_ring_overlay(
         &self,
@@ -396,38 +589,18 @@ impl App {
         full_rect: egui::Rect,
         surface_context: RingShortcutContext,
     ) {
-        if !self
-            .settings
-            .ring_shortcuts
-            .mouse_ring_enabled(surface_context)
-            || !self.settings.ring_shortcuts.mouse_ring_help_visible
-            || self.ring_picker.is_some()
-        {
-            return;
-        }
-        let Some(flick) = self.mouse_ring_flick.as_ref() else {
-            return;
+        let right_drag_context = match surface_context {
+            RingShortcutContext::Grid => RightDragContext::Grid,
+            RingShortcutContext::ImageFullscreen => RightDragContext::ImageFullscreen,
+            RingShortcutContext::VideoFullscreen => RightDragContext::VideoFullscreen,
         };
-        if flick.owner != RightDragOwner::Root || flick.context != surface_context {
-            return;
-        }
-        if !flick.guide_visible() {
-            return;
-        }
-
-        let context = flick.context;
-        let selected = mouse_flick_direction(flick);
-        let radius = ring_guide_radius_for_rect(full_rect);
-        let center = flick.start_pos;
-        let painter = ui.painter();
-        let slots = &self.settings.ring_shortcuts.profile(context).slots;
-        draw_ring_guide_donut(painter, center, radius, selected, |direction| {
-            slots
-                .get(direction.slot_index())
-                .cloned()
-                .unwrap_or_default()
-                .label_for_context(context)
-        });
+        self.draw_right_drag_guide_overlay(
+            ui,
+            full_rect,
+            RightDragOwner::Root,
+            right_drag_context,
+            RightDragGuideKind::Ring,
+        );
     }
 
     pub(crate) fn current_right_drag_context(&self) -> RightDragContext {
@@ -450,135 +623,121 @@ impl App {
         full_rect: egui::Rect,
         surface_context: RightDragContext,
     ) {
-        if self
+        self.draw_right_drag_guide_overlay(
+            ui,
+            full_rect,
+            RightDragOwner::Root,
+            surface_context,
+            RightDragGuideKind::Gesture,
+        );
+    }
+
+    fn draw_right_drag_guide_overlay(
+        &self,
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        owner: RightDragOwner,
+        surface_context: RightDragContext,
+        kind: RightDragGuideKind,
+    ) {
+        let Some(guide) = self.right_drag_guide_for_owner(owner, surface_context) else {
+            return;
+        };
+        if !matches!(
+            (&guide, kind),
+            (RightDragGuide::Gesture { .. }, RightDragGuideKind::Gesture)
+                | (RightDragGuide::Ring { .. }, RightDragGuideKind::Ring)
+        ) {
+            return;
+        }
+        draw_right_drag_guide(ui.painter(), full_rect, &guide);
+    }
+
+    pub(crate) fn right_drag_guide_for_owner(
+        &self,
+        owner: RightDragOwner,
+        surface_context: RightDragContext,
+    ) -> Option<RightDragGuide> {
+        if self.ring_picker.is_some() {
+            return None;
+        }
+        match self
             .settings
             .ring_shortcuts
             .right_drag_mode(surface_context)
-            != RightDragMode::MouseGesture
-            || !self.settings.ring_shortcuts.mouse_gesture_help_visible
-            || self.ring_picker.is_some()
         {
-            return;
-        }
-        let Some(gesture) = self.mouse_gesture.as_ref() else {
-            return;
-        };
-        if gesture.owner != RightDragOwner::Root
-            || gesture.context != surface_context
-            || !gesture.guide_visible()
-        {
-            return;
-        }
-        let profile = self
-            .settings
-            .ring_shortcuts
-            .mouse_gesture_profile(surface_context);
-        let painter = ui.painter();
-        let margin = 16.0;
-        let usable_w = (full_rect.width() - margin * 2.0).max(120.0);
-        let usable_h = (full_rect.height() - margin * 2.0).max(120.0);
-        let row_h = 32.0;
-        let rows = profile.bindings.len().max(1);
-        let panel_w = (full_rect.width() * 0.60).clamp(340.0, 560.0).min(usable_w);
-        let panel_h = (96.0 + row_h * rows as f32).min(usable_h);
-        let rect = egui::Rect::from_center_size(full_rect.center(), egui::vec2(panel_w, panel_h));
-        painter.rect_filled(rect, 8.0, egui::Color32::from_black_alpha(220));
-        painter.rect_stroke(
-            rect,
-            8.0,
-            egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90)),
-            egui::StrokeKind::Inside,
-        );
-        let current = if gesture.pattern.is_empty() {
-            "-".to_string()
-        } else {
-            format_mouse_gesture_pattern(&gesture.pattern)
-        };
-        painter.text(
-            rect.min + egui::vec2(14.0, 14.0),
-            egui::Align2::LEFT_TOP,
-            format!("マウスジェスチャ / 入力中: {current}"),
-            egui::FontId::proportional(17.0),
-            egui::Color32::WHITE,
-        );
-        let row_left = rect.min.x + 14.0;
-        let row_right = rect.max.x - 14.0;
-        let mut y = rect.min.y + 46.0;
-        let action_context = surface_context.gesture_action_context();
-        let selected_row = profile.binding_index_for_pattern(&gesture.pattern);
-        if profile.bindings.is_empty() {
-            painter.text(
-                egui::pos2(row_left + 10.0, y + row_h * 0.5),
-                egui::Align2::LEFT_CENTER,
-                "未登録",
-                egui::FontId::proportional(14.5),
-                egui::Color32::from_gray(205),
-            );
-            painter.text(
-                egui::pos2(row_right - 10.0, y + row_h * 0.5),
-                egui::Align2::RIGHT_CENTER,
-                "操作カスタマイズで追加",
-                egui::FontId::proportional(14.5),
-                egui::Color32::from_gray(230),
-            );
-        } else {
-            let available_h = (panel_h - 96.0).max(row_h);
-            let visible_rows = ((available_h / row_h).floor() as usize)
-                .max(1)
-                .min(profile.bindings.len().max(1));
-            let focus_row = selected_row.unwrap_or(0);
-            let start = focus_row
-                .saturating_sub(visible_rows / 2)
-                .min(profile.bindings.len().saturating_sub(visible_rows));
-            let end = (start + visible_rows).min(profile.bindings.len());
-            for (idx, binding) in profile.bindings.iter().enumerate().take(end).skip(start) {
-                let selected = selected_row == Some(idx);
-                let row_rect = egui::Rect::from_min_size(
-                    egui::pos2(row_left, y),
-                    egui::vec2((row_right - row_left).max(1.0), row_h),
-                );
-                painter.rect_filled(
-                    row_rect,
-                    5.0,
-                    if selected {
-                        egui::Color32::from_rgb(56, 94, 138)
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    },
-                );
-                let pattern = format_mouse_gesture_pattern(&binding.pattern);
-                let label = binding.action.label_for_context(action_context);
-                painter.text(
-                    egui::pos2(row_rect.min.x + 10.0, row_rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    pattern,
-                    egui::FontId::proportional(14.5),
-                    egui::Color32::from_white_alpha(if selected { 245 } else { 205 }),
-                );
-                painter.text(
-                    egui::pos2(row_rect.max.x - 10.0, row_rect.center().y),
-                    egui::Align2::RIGHT_CENTER,
-                    label,
-                    egui::FontId::proportional(14.5),
-                    egui::Color32::WHITE,
-                );
-                y += row_h;
-            }
-        }
-        painter.text(
-            egui::pos2(rect.min.x + 14.0, rect.max.y - 20.0),
-            egui::Align2::LEFT_CENTER,
-            format!(
-                "右ドラッグで軌跡を入力、離すと実行 / {}",
-                self.settings
+            RightDragMode::MouseGesture => {
+                if !self.settings.ring_shortcuts.mouse_gesture_help_visible {
+                    return None;
+                }
+                let gesture = self.mouse_gesture.as_ref()?;
+                if gesture.owner != owner
+                    || gesture.context != surface_context
+                    || !gesture.guide_visible()
+                {
+                    return None;
+                }
+                let profile = self
+                    .settings
                     .ring_shortcuts
-                    .viewer_short_right_click_action(surface_context)
-                    .map(|action| action.guide_hint())
-                    .unwrap_or("短押しは従来操作")
-            ),
-            egui::FontId::proportional(12.0),
-            egui::Color32::from_gray(190),
-        );
+                    .mouse_gesture_profile(surface_context);
+                let action_context = surface_context.gesture_action_context();
+                Some(RightDragGuide::Gesture {
+                    current_pattern: if gesture.pattern.is_empty() {
+                        "-".to_string()
+                    } else {
+                        format_mouse_gesture_pattern(&gesture.pattern)
+                    },
+                    rows: profile
+                        .bindings
+                        .iter()
+                        .map(|binding| RightDragGuideRow {
+                            label: format_mouse_gesture_pattern(&binding.pattern),
+                            value: binding.action.label_for_context(action_context).to_string(),
+                        })
+                        .collect(),
+                    selected_row: profile.binding_index_for_pattern(&gesture.pattern),
+                    short_click_hint: self
+                        .settings
+                        .ring_shortcuts
+                        .viewer_short_right_click_action(surface_context)
+                        .map(|action| action.guide_hint())
+                        .unwrap_or("短押しは従来操作")
+                        .to_string(),
+                })
+            }
+            RightDragMode::RingShortcut => {
+                let ring_context = surface_context.ring_context()?;
+                if !self
+                    .settings
+                    .ring_shortcuts
+                    .mouse_ring_enabled(ring_context)
+                    || !self.settings.ring_shortcuts.mouse_ring_help_visible
+                {
+                    return None;
+                }
+                let flick = self.mouse_ring_flick.as_ref()?;
+                if flick.owner != owner || flick.context != ring_context || !flick.guide_visible() {
+                    return None;
+                }
+                let slots = &self.settings.ring_shortcuts.profile(ring_context).slots;
+                Some(RightDragGuide::Ring {
+                    center: flick.start_pos,
+                    selected: mouse_flick_direction(flick),
+                    slot_labels: (0..crate::ring_shortcut::RING_SHORTCUT_SLOT_COUNT)
+                        .map(|slot_index| {
+                            slots
+                                .get(slot_index)
+                                .cloned()
+                                .unwrap_or_default()
+                                .label_for_context(ring_context)
+                                .to_string()
+                        })
+                        .collect(),
+                })
+            }
+            RightDragMode::Disabled | RightDragMode::Unknown(_) => None,
+        }
     }
     pub(crate) fn start_mouse_ring_flick(
         &mut self,
@@ -1010,6 +1169,51 @@ impl App {
                     .filter(|gesture| gesture.owner == owner)
                     .map(|gesture| gesture.current_pos)
             })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn request_detached_right_drag_guide_repaint(
+        &self,
+        ctx: &egui::Context,
+        owner: RightDragOwner,
+        viewport_id: egui::ViewportId,
+    ) -> bool {
+        let next_repaint = if let Some(flick) = self
+            .mouse_ring_flick
+            .as_ref()
+            .filter(|flick| flick.owner == owner)
+        {
+            let elapsed = flick.elapsed();
+            if elapsed < mouse_flick_guide_delay() {
+                Some(mouse_flick_guide_delay() - elapsed)
+            } else if !flick.armed && elapsed < mouse_flick_menu_delay() {
+                Some(mouse_flick_menu_delay() - elapsed)
+            } else if flick.armed {
+                Some(GAMEPAD_REPAINT_INTERVAL)
+            } else {
+                None
+            }
+        } else if let Some(gesture) = self
+            .mouse_gesture
+            .as_ref()
+            .filter(|gesture| gesture.owner == owner)
+        {
+            let elapsed = gesture.elapsed();
+            if elapsed < mouse_flick_guide_delay() {
+                Some(mouse_flick_guide_delay() - elapsed)
+            } else if !gesture.armed && elapsed < mouse_flick_menu_delay() {
+                Some(mouse_flick_menu_delay() - elapsed)
+            } else {
+                Some(GAMEPAD_REPAINT_INTERVAL)
+            }
+        } else {
+            return false;
+        };
+        ctx.request_repaint_of(viewport_id);
+        if let Some(duration) = next_repaint {
+            ctx.request_repaint_after_for(duration, viewport_id);
+        }
+        true
     }
 
     fn request_mouse_gesture_repaint(&self, ctx: &egui::Context) {

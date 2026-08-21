@@ -106,6 +106,7 @@ mod facet_name_filter;
 pub(crate) mod folder_scan;
 pub(crate) use folder_scan::OmittedFolderEntryCounts;
 mod gamepad_input;
+pub(crate) use gamepad_input::{RightDragGuide, draw_right_drag_guide};
 mod grid_paint;
 pub(crate) mod metadata_import_refresh;
 mod metadata_ops;
@@ -459,6 +460,7 @@ pub(crate) struct DeferredDetachedImageWindowView {
     pub(crate) frozen_continuous_pages: Vec<DetachedImageWindowFrozenPage>,
     pub(crate) placement: crate::settings::DetachedViewerWindowPlacement,
     pub(crate) apply_initial_placement: bool,
+    pub(crate) right_drag_guide: Option<RightDragGuide>,
 }
 
 #[cfg(windows)]
@@ -467,6 +469,7 @@ impl DeferredDetachedImageWindowView {
         window: &DetachedImageWindowSnapshot,
         placement: crate::settings::DetachedViewerWindowPlacement,
         apply_initial_placement: bool,
+        right_drag_guide: Option<RightDragGuide>,
     ) -> Self {
         Self {
             id: window.id,
@@ -480,6 +483,7 @@ impl DeferredDetachedImageWindowView {
             frozen_continuous_pages: window.frozen_continuous_pages.clone(),
             placement,
             apply_initial_placement,
+            right_drag_guide,
         }
     }
 }
@@ -39654,6 +39658,23 @@ impl App {
             *activation_armed = false;
         }
         should_activate
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn deferred_detached_image_window_view(
+        &self,
+        window: &DetachedImageWindowSnapshot,
+        placement: crate::settings::DetachedViewerWindowPlacement,
+        apply_initial_placement: bool,
+    ) -> DeferredDetachedImageWindowView {
+        let owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(window.id);
+        let right_drag_guide = self.right_drag_guide_for_owner(owner, window.right_drag_context());
+        DeferredDetachedImageWindowView::from_snapshot(
+            window,
+            placement,
+            apply_initial_placement,
+            right_drag_guide,
+        )
     }
 
     #[cfg(windows)]
