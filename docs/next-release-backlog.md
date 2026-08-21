@@ -1,4 +1,4 @@
-# 次リリース検討バックログ
+﻿# 次リリース検討バックログ
 
 このファイルは、まだ着手していない作業候補だけを置く恒久バックログ。
 完了した項目はコミット履歴・リリースノート・個別設計メモに任せ、このファイルからは削除する。
@@ -703,9 +703,23 @@
   [854](../src/ui_dialogs/archive_convert.rs:854))。
 - **「RAR を ZIP と同じ descriptor に足す」では直らない。** RAR は非ソリッド・入れ子なしだけが
   直読みで、それ以外は変換対象という分岐がある ([virtual-folders.md:116](virtual-folders.md))。
-- **正しい修正**: 非同期完了に「detached grid 要求の window / request owner」を**型として持たせ**、
-  完了後に detached session の handoff へ入れる。detached open 経路に触れるので §2 / §11 の手順が要る。
-  **visibility 述語や `show_viewport_*` builder の変更は不要と見込まれる。**
+- **正しい修正 (2026-08-21 に具体化)**: 完了時点では detached 窓も bundle もまだ存在しないので、
+  「既存 context の所有者」ではなく **「この要求のために新しい detached context を作る」という
+  型付きの宛先意図**を非同期完了へ持たせる。**同型の実装が既にある**:
+  ブックマーク経路は `OpenRequestOwner::Bookmark(owner)` →
+  `ArchiveConvertCompletionPolicy::Bookmark(owner)` ([archive_convert.rs:47](../src/ui_dialogs/archive_convert.rs:47))
+  を持ち、直読み完了と変換完了の両方から
+  `open_converted_bookmark_in_detached_context` ([app.rs:39993](../src/app.rs:39993)) へ着地して
+  `ViewerContextDescriptor::Zip { path: 実体, archive_source_override: 元アーカイブ }` で
+  **新しい detached context を作る**。グリッドからの `ConvertibleArchive` 開きにも、
+  `DetachedGridItemOpenPlan::FolderCandidate` ([app.rs:1857](../src/app.rs:1857)) と同じ形で
+  candidate variant と着地関数を用意する。
+  入口は既に共通化されているので、ダブルクリック ([ui_main.rs:13017](../src/ui_main.rs:13017)) と
+  Enter ([app.rs:34249](../src/app.rs:34249)) の両方が同じ gate を通る。
+  **visibility 述語や `show_viewport_*` builder の変更は不要。**
+  変換キャッシュ命中時の同期経路 (`open_archive_via_cache_owned`) も同じ宛先意図を通す。
+- **R2e (viewer context registry) には依存しない** (正本:
+  [detached-r2e-ownership-design.md](briefs/detached-r2e-ownership-design.md) §5)。
 - 規模 / 優先度: Medium / P1。次版修正候補。
 
 ### 1.100 複数の画像ウィンドウを開くと、先に開いたウィンドウでマウスジェスチャが効かなくなる — 専用スレ >>270
@@ -726,22 +740,41 @@
 - 回帰確認: 3 枚以上の独立ウィンドウを開き、前後のウィンドウを交互にアクティブ化して同じ
   ジェスチャが発火する。最新ウィンドウを閉じても先行ウィンドウで継続し、メイングリッドと
   native 動画のジェスチャを壊さない。
-- **根本原因 (2026-08-21 特定、v3.1.3 では未修正)。これは R2 そのもの**:
+- **根本原因 (2026-08-21 特定・訂正、v3.1.3 では未修正)。これは R2 そのもの**:
+  - **非アクティブな静止画ウィンドウ上の右ドラッグは、アクティブ化もせずジェスチャ状態機械にも
+    届かない完全な no-op である。** 非アクティブな静止画窓は `show_viewport_deferred` で描かれ、
+    コールバックが root pass へ報告するのは描画 / focus / close 要求 / placement だけで、
+    ポインタ入力を一切拾っていない ([ui_fullscreen.rs:11622](../src/ui_fullscreen.rs:11622)、
+    [ui_fullscreen.rs:11175](../src/ui_fullscreen.rs:11175))。アクティブ化を担う OS watcher は
+    **`VK_LBUTTON` しかサンプルしない** ([detached_window_manager.rs:326](../src/app/detached_window_manager.rs:326))。
+    左クリックでアクティブ化した後ならジェスチャは効く (§4.5 の「アクティブにすれば動く」と一致)
   - `MouseGestureState` が持つ識別情報は表示種別だけで、**window ID / viewport ID / session ID を
     持たない** ([ring_shortcut.rs:53](../src/ring_shortcut.rs:53))。状態は
     `ViewerContextBundle` ではなく **App に 1 個だけ**ある ([app.rs:10005](../src/app.rs:10005))。
-    発火時に owner を再解決せず、その時点で mount されている context へ適用する
-  - **非アクティブな窓が集める pointer 情報は `any_pressed` / `any_released` だけ**で、
-    右ドラッグの座標列は状態機械に届かない ([ui_fullscreen.rs:11684](../src/ui_fullscreen.rs:11684))
-  - **アクティブ化は press ではなく release で起きる** ([app.rs:39217](../src/app.rs:39217))。
-    この挙動は既存テストで意図的に固定されている ([app/tests.rs:32554](../src/app/tests.rs:32554))
-  - したがって**非アクティブな窓で始めた最初の右ドラッグは構造上必ず失われる**。
-    リングショートカットと短い右クリックも同じ入力分岐を共有する
+    発火時に owner を再解決せず、その時点で mount されている context へ適用する。
+    複数の画像ウィンドウはどれも `RightDragContext::ImageFullscreen` なので区別できない
   - `last_input_surface` は `MainWindow` / `Viewer` の二択で全 viewer window を区別しない
     ([detached_window_manager.rs:452](../src/app/detached_window_manager.rs:452))
-- **R2 (`DetachedWindowRuntime` + 状態の集約) を待つ。** ジェスチャ状態を window 所有にするのは
-  R2 の守備範囲であり、App 側に識別子を足す小修正は憲法 3 に抵触する。
-- 規模 / 優先度: Medium / P1。**R2 待ち** (単独では直せない)。
+  - **訂正**: 当初「非アクティブな窓が集める pointer 情報は `any_pressed` / `any_released` だけ」
+    「アクティブ化は press ではなく release で起きるので最初の右ドラッグが失われる」と記録したが、
+    これが当てはまるのは `show_viewport_immediate` で描く `ParkedLive` の**動画 / 音声窓だけ**
+    ([ui_fullscreen.rs:11785](../src/ui_fullscreen.rs:11785)、[app.rs:39217](../src/app.rs:39217))。
+    静止画窓はそこへも到達しない
+- **利用者決定 (2026-08-21)**: 「ジェスチャを認識し、ジェスチャされた場合は自動でアクティブ化した
+  上で、ジェスチャコマンドを実行する」。**両方のウィンドウが見えている以上、ジェスチャが受理される
+  のが期待動作**という判断。右押下だけでアクティブ化する案 (1 回目のドラッグを消費する / 単なる
+  右クリックで窓が前面化する) は採らない。
+- 必要なもの (3 つ、いずれも R2 の守備範囲):
+  1. 非アクティブ窓のポインタ列を、その窓の identity 付きで root pass へ届ける
+     (`DeferredDetachedImageWindowEvent` は既に window id を持つ)
+  2. ジェスチャ状態を **window 所有**にする (= R2b 残件の「散在 state の typed 集約」)
+  3. 成立時に「アクティブ化 → コマンド実行」を**型付きの順序**として表す (guard / 遅延ではなく)
+- **R2 (`DetachedWindowRuntime` + 状態の集約) の一部として実施する。** ジェスチャ状態を window
+  所有にするのは R2 の守備範囲であり、App 側に識別子を足す小修正は憲法 3 に抵触する。
+  一方、コマンドはアクティブ化**後**に実行するので、マウントされていない context へ適用する必要は
+  無く、**R2e (viewer context registry) の完成には依存しない**
+  (正本: [detached-r2e-ownership-design.md](briefs/detached-r2e-ownership-design.md) §5)。
+- 規模 / 優先度: Medium / P1。
 
 ### 1.101 動画の上部 HUD / 下部シークバーを個別に固定表示できるようにする — 専用スレ >>271
 
@@ -1600,10 +1633,10 @@
 
 ### 4.5 非アクティブなウィンドウでは右クリックのリングが効かない — 利用者報告
 
-- ⚠ **§1.100 と同一症状の可能性が高い** (別セッションが同日に登録、手元でも再現済みとある)。
-  本項が持つ追加事実は「**アクティブにすれば動く**」= 非アクティブ窓でのみ効かない、という点と、
-  「App グローバル状態が塞いでいる」という仮説を**反証して取り下げた**記録。
-  **統合するなら §1.100 側へ寄せ、本項のこの 2 点を移すこと。**
+- ⚠ **§1.100 と同一症状であることが 2026-08-21 に確定した** (同じ 1 つの原因)。
+  本項が持っていた追加事実 2 点 (「**アクティブにすれば動く**」= 非アクティブ窓でのみ効かない /
+  「App グローバル状態が塞いでいる」仮説の**反証**) は §1.100 へ移した。
+  **修正・仕様判断はすべて §1.100 側で行う。本項は経緯の記録として残す。**
 
 - 出典: 2026-08-20 の利用者報告。複数ウィンドウ表示中、**新しいウィンドウを開くと前のウィンドウで
   リングが効かない**。追加確認で「**アクティブにすれば動く**」= 非アクティブ窓では効かない、と判明。
