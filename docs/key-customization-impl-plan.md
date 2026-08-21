@@ -585,8 +585,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   `ToggleDetachedViewerMode` は例外的に native 動画転送対象へ含める。
 
 ### Erase (Ph3) ★
-- EraseConfirm `E`,`Esc` / EraseConfirmPolygon `Enter` / EraseUndo `Ctrl+Z` /
-  EraseDeleteShape `Delete`
+- EraseConfirm `E`,`Esc` / EraseConfirmPolygon `Enter` / EraseRedo `Ctrl+Y`,`Ctrl+Shift+Z` /
+  EraseUndo `Ctrl+Z` / EraseDeleteShape `Delete`
 - EraseToolSelect `S` / Brush `B` / Bucket `K` / Lasso `L` / Polygon `P` / VLine `V` / HLine `H` /
   Line `I` / Rect `R` / Ellipse `O`
 - ErasePaintMode `D` / EraseEraseMode `F`
@@ -594,8 +594,9 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - EraseSwallowNumbers `0`..`9` は旧スロット誤動作防止の no-op 消費なので固定。
 
 ### Conceal (Ph3) ★
-- ConcealExit `Ctrl+M`,`Esc` / ConcealConfirm `Enter` / ConcealUndo `Ctrl+Z` /
-  ConcealDelete `Delete`
+- ConcealExit `Ctrl+M`,`Esc` / ConcealConfirmPolygon `Enter` /
+  ConcealRedo `Ctrl+Y`,`Ctrl+Shift+Z` / ConcealUndo `Ctrl+Z` /
+  ConcealDeleteShape `Delete`
 - ConcealTypeCycle `T` / ConcealPixelGrid `G` / ConcealPreset1..4 `1`..`4` /
   ConcealPaintMode `D` / ConcealEraseMode `F`
 - ConcealToolSelect/Brush/Bucket/Lasso/Polygon/Line/VLine/HLine/Rect/Ellipse

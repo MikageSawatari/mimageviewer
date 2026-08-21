@@ -517,6 +517,7 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 | <kbd>Shift</kbd>+ハンドル | 端点角度・回転角をスナップ、矩形/楕円の角リサイズを等比化 |
 | <kbd>Alt</kbd>+ハンドル | 矩形/楕円を中心固定でリサイズ |
 | <kbd>Ctrl</kbd>+<kbd>Z</kbd> | マスク編集 Undo |
+| <kbd>Ctrl</kbd>+<kbd>Y</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> | マスク編集 Redo |
 | <kbd>Del</kbd> | 選択中オブジェクトを削除 |
 
 ## 隠蔽加工モード
@@ -548,6 +549,7 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 | <kbd>Alt</kbd>+ハンドル | 矩形/楕円を中心固定でリサイズ |
 | <kbd>Enter</kbd> | 多角形マスクの頂点列を確定。Action: `ConcealConfirmPolygon` |
 | <kbd>Ctrl</kbd>+<kbd>Z</kbd> | マスク編集 Undo |
+| <kbd>Ctrl</kbd>+<kbd>Y</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> | マスク編集 Redo |
 | <kbd>Del</kbd> | 選択中オブジェクトを削除 |
 
 ## 補正レイヤーモード

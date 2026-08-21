@@ -328,6 +328,7 @@ impl App {
         // (例: 別ページからの再入場で同 idx のテクスチャが残ると bad cross-talk)。
         self.erase_base_tex_cache.clear();
         self.erase_undo_stack.clear();
+        self.erase_redo_stack.clear();
         self.erase_last_undo_at = None;
         self.erase_shapes.clear();
         self.erase_selected_shape = None;
@@ -397,6 +398,7 @@ impl App {
         self.erase_preview_active = false;
         self.erase_base_tex_cache.clear();
         self.erase_undo_stack.clear();
+        self.erase_redo_stack.clear();
         // **Preview cache を破棄** (Codex P1 R4 #1)。preview 完了が遅延して届く
         // ケースで `fs_cache` を汚染しないよう、pending preview job も cancel する。
         if let Some(idx) = restore_idx {
@@ -475,15 +477,44 @@ impl App {
 
     // ── Undo / Slot ────────────────────────────────────────────────
 
+    fn current_erase_snapshot(&self) -> Option<EraseSnapshot> {
+        Some(EraseSnapshot {
+            mask: self.erase_mask.as_ref()?.clone(),
+            shapes: self.erase_shapes.clone(),
+        })
+    }
+
+    fn push_erase_undo_snapshot(&mut self, snapshot: EraseSnapshot) {
+        self.erase_undo_stack.push_back(snapshot);
+        while self.erase_undo_stack.len() > UNDO_MAX {
+            self.erase_undo_stack.pop_front();
+        }
+    }
+
+    fn push_erase_redo_snapshot(&mut self, snapshot: EraseSnapshot) {
+        self.erase_redo_stack.push_back(snapshot);
+        while self.erase_redo_stack.len() > UNDO_MAX {
+            self.erase_redo_stack.pop_front();
+        }
+    }
+
+    fn restore_erase_snapshot(&mut self, snapshot: EraseSnapshot) {
+        self.erase_mask = Some(snapshot.mask);
+        self.erase_shapes = snapshot.shapes;
+        self.erase_selected_shape = None;
+        self.erase_drag = None;
+        self.erase_mask_texture = None;
+        // mask 復元 → preview cache 破棄。
+        if let Some(fs_idx) = self.fullscreen_idx {
+            self.clear_erase_preview(fs_idx);
+        }
+    }
+
     pub(crate) fn push_undo_snapshot(&mut self) {
-        if let Some(mask) = &self.erase_mask {
-            self.erase_undo_stack.push_back(EraseSnapshot {
-                mask: mask.clone(),
-                shapes: self.erase_shapes.clone(),
-            });
-            while self.erase_undo_stack.len() > UNDO_MAX {
-                self.erase_undo_stack.pop_front();
-            }
+        if let Some(snapshot) = self.current_erase_snapshot() {
+            // 新しい編集の共通入口。Undo/Redo の履歴移動は専用 helper を使う。
+            self.erase_redo_stack.clear();
+            self.push_erase_undo_snapshot(snapshot);
             self.erase_last_undo_at = Some(std::time::Instant::now());
         }
     }
@@ -501,20 +532,35 @@ impl App {
     }
 
     pub(crate) fn undo_erase(&mut self) -> bool {
-        if let Some(prev) = self.erase_undo_stack.pop_back() {
-            self.erase_mask = Some(prev.mask);
-            self.erase_shapes = prev.shapes;
-            self.erase_selected_shape = None;
-            self.erase_drag = None;
-            self.erase_mask_texture = None;
-            // mask 復元 → preview cache 破棄。
-            if let Some(fs_idx) = self.fullscreen_idx {
-                self.clear_erase_preview(fs_idx);
-            }
-            true
-        } else {
-            false
+        if self.erase_undo_stack.is_empty() {
+            return false;
         }
+        let Some(current) = self.current_erase_snapshot() else {
+            return false;
+        };
+        let Some(prev) = self.erase_undo_stack.pop_back() else {
+            return false;
+        };
+        self.push_erase_redo_snapshot(current);
+        self.restore_erase_snapshot(prev);
+        self.erase_last_undo_at = None;
+        true
+    }
+
+    pub(crate) fn redo_erase(&mut self) -> bool {
+        if self.erase_redo_stack.is_empty() {
+            return false;
+        }
+        let Some(current) = self.current_erase_snapshot() else {
+            return false;
+        };
+        let Some(next) = self.erase_redo_stack.pop_back() else {
+            return false;
+        };
+        self.push_erase_undo_snapshot(current);
+        self.restore_erase_snapshot(next);
+        self.erase_last_undo_at = None;
+        true
     }
 
     /// 現在のマスク (ビットマップ + ベクタ) をスロットに保存する。
@@ -623,6 +669,17 @@ impl App {
             self.paint_polygon(&pts, self.erase_paint_mode);
             self.show_feedback_toast("[多角形を確定]".to_string());
             return action;
+        }
+
+        // Redo は Ctrl+Shift+Z → Ctrl+Y → Ctrl+Z (Undo) の順に consume する。
+        // Undo を先にすると Ctrl+Shift+Z が Undo 側へ流れ得る。
+        let redo = self.keymap.consume_action(ctx, KeyAction::EraseRedo);
+        if redo {
+            if self.redo_erase() {
+                self.show_feedback_toast("[やり直す]".to_string());
+            } else {
+                self.show_feedback_toast("[履歴なし]".to_string());
+            }
         }
 
         // Ctrl+Z: Undo
@@ -2609,7 +2666,8 @@ impl App {
                             S:選択/ハンドル微調整\n\
                             Shift/Alt+ハンドル:拘束/中心固定\n\
                             多角形:始点クリック/右クリック/Enterで確定 Escで取消\n\
-                            Ctrl+Z:戻す  Del:選択削除";
+                            Ctrl+Z:戻す  Ctrl+Y/Ctrl+Shift+Z:やり直す\n\
+                            Del:選択削除";
                                         ui.add(
                                             egui::Label::new(
                                                 egui::RichText::new(help)
@@ -4242,6 +4300,82 @@ pub(crate) fn draw_dashed_circle(painter: &egui::Painter, center: egui::Pos2, ra
 #[cfg(test)]
 mod book_erase_tests {
     use super::*;
+
+    fn erase_test_shape(revision: usize) -> Shape {
+        Shape::Rect {
+            op: ShapeOp::Add,
+            center: (revision as f32, 10.0),
+            half_w: 4.0,
+            half_h: 3.0,
+            rotation_rad: 0.0,
+        }
+    }
+
+    #[test]
+    fn erase_edit_undo_redo_restores_mask_and_shapes() {
+        let mut app = crate::app::setup_app_for_test();
+        app.erase_mask = Some(vec![false, false]);
+        app.erase_shapes.clear();
+
+        app.push_undo_snapshot();
+        app.erase_mask = Some(vec![true, false]);
+        app.erase_shapes = vec![erase_test_shape(1)];
+
+        assert!(app.undo_erase());
+        assert_eq!(app.erase_mask.as_deref(), Some([false, false].as_slice()));
+        assert!(app.erase_shapes.is_empty());
+        assert!(app.redo_erase());
+        assert_eq!(app.erase_mask.as_deref(), Some([true, false].as_slice()));
+        assert_eq!(app.erase_shapes, vec![erase_test_shape(1)]);
+    }
+
+    #[test]
+    fn erase_new_edit_after_undo_discards_redo() {
+        let mut app = crate::app::setup_app_for_test();
+        app.erase_mask = Some(vec![false]);
+        app.erase_shapes.clear();
+        app.push_undo_snapshot();
+        app.erase_mask = Some(vec![true]);
+        app.erase_shapes = vec![erase_test_shape(1)];
+        assert!(app.undo_erase());
+
+        app.push_undo_snapshot();
+        app.erase_mask = Some(vec![false]);
+        app.erase_shapes = vec![erase_test_shape(2)];
+
+        assert!(!app.redo_erase());
+        assert_eq!(app.erase_mask.as_deref(), Some([false].as_slice()));
+        assert_eq!(app.erase_shapes, vec![erase_test_shape(2)]);
+    }
+
+    #[test]
+    fn erase_undo_redo_limit_stays_bounded_and_symmetric() {
+        let mut app = crate::app::setup_app_for_test();
+        app.erase_mask = Some(vec![false]);
+        app.erase_shapes = vec![erase_test_shape(0)];
+        let final_revision = UNDO_MAX + 5;
+        for revision in 1..=final_revision {
+            app.push_undo_snapshot();
+            app.erase_mask = Some(vec![revision % 2 == 1]);
+            app.erase_shapes = vec![erase_test_shape(revision)];
+        }
+
+        assert_eq!(app.erase_undo_stack.len(), UNDO_MAX);
+        assert_eq!(
+            (0..=UNDO_MAX).filter(|_| app.undo_erase()).count(),
+            UNDO_MAX
+        );
+        assert_eq!(app.erase_redo_stack.len(), UNDO_MAX);
+        assert_eq!(
+            (0..=UNDO_MAX).filter(|_| app.redo_erase()).count(),
+            UNDO_MAX
+        );
+        assert_eq!(
+            app.erase_mask.as_deref(),
+            Some([final_revision % 2 == 1].as_slice())
+        );
+        assert_eq!(app.erase_shapes, vec![erase_test_shape(final_revision)]);
+    }
 
     #[test]
     fn erase_bucket_tool_maps_to_bucket_key_action() {

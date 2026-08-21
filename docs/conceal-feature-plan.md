@@ -220,7 +220,7 @@ enum BlurMode { AsMask, ExtendByRadius, InsideOnly }     // ぼかし専用
 | `1` / `2` / `3` / `4` | パラメータプリセット 1〜4 を適用 |
 | `T` | 隠蔽タイプを順次切替 (Mosaic → WhiteFill → BlackFill → Blur → Mosaic …) |
 | Ctrl+wheel | (Mosaic 時) タイル倍率 ±0.25x / (Blur 時) ぼかし半径 ±5px / (Fill 時) 不透明度 ±5% |
-| `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / Redo (マスク編集のみ) |
+| `Ctrl+Z` / `Ctrl+Y` / `Ctrl+Shift+Z` | Undo / Redo (マスク編集のみ) |
 | 矢印 / Ctrl+矢印 | マスク平行移動 (1px / 10px、消しゴムと同じ) |
 | `[` / `]` / Ctrl+`[` / Ctrl+`]` | マスク回転 ±0.1° / ±1° (消しゴムと同じ) |
 
@@ -1121,19 +1121,20 @@ pub fn save_image_with_metadata(
 
 ```rust
 struct ConcealSnapshot {
-    bitmap: Vec<bool>,
-    bitmap_size: [usize; 2],
-    vectors: Vec<LineObject>,
+    mask: Vec<bool>,
+    shapes: Vec<Shape>,
 }
 ```
 
-**マスク (bitmap + vectors) のみが Undo 対象**。パラメータ変更・タイプ切替・プリセット
+**マスク (bitmap + Shape) のみが Undo / Redo 対象**。パラメータ変更・タイプ切替・プリセット
 適用は Undo 対象外 (§8.3 参照)。
 
-- ストローク開始時に push、`conceal_last_undo_at` で 100ms 以内の重複 push を抑制
-- `Ctrl+Z` で pop_back → 現在のマスクに復元 → redo stack に push
-- `Ctrl+Shift+Z` で redo stack から pop
-- モード入退場 / フォルダ切替 / fullscreen idx 移動で stack クリア (消しゴムと同じ境界)
+- 新しい編集の開始時に現在状態を undo stack へ push し、redo stack をクリアする。
+  キーリピート操作は `conceal_last_undo_at` で 500ms 以内の重複 push を抑制する
+- `Ctrl+Z` は復元前の現在状態を redo stack へ積んでから、undo stack の末尾を復元する
+- `Ctrl+Y` / `Ctrl+Shift+Z` は復元前の現在状態を undo stack へ積んでから、redo stack の末尾を復元する
+- 両 stack とも最大 20 件。モード入場成功時 / 退場時 / 編集ページ切替時に両方をクリアする。
+  編集中の画像解像度が変わってマスクをリスケールした場合も、旧寸法の履歴を両方クリアする
 
 **タイル倍率と境界モードは Undo 対象外** (グローバル設定なので)。
 画像補正 (色系) の Undo は既存の `meta_undo` が処理 → 影響なし。

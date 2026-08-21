@@ -11914,6 +11914,8 @@ pub struct App {
     pub(crate) mask_db: Option<crate::mask_db::MaskDb>,
     /// 消しゴムの Undo スタック (マスク/ベクタ両方のスナップショット、最大 20 エントリ)
     pub(crate) erase_undo_stack: std::collections::VecDeque<EraseSnapshot>,
+    /// 消しゴムの Redo スタック。要素型と上限は Undo と同じ。
+    pub(crate) erase_redo_stack: std::collections::VecDeque<EraseSnapshot>,
     /// メタ操作 (レーティング / タグ / 画像補正) の Undo/Redo スタック。フォルダ移動・
     /// フルスクリーン遷移・フルスクリーン中のページ移動・消しゴムモード遷移でクリアされる。
     pub(crate) meta_undo: crate::undo_stack::UndoStack,
@@ -12036,6 +12038,8 @@ pub struct App {
     pub(crate) conceal_db: Option<crate::conceal_db::ConcealDb>,
     /// 隠蔽加工 Undo スタック (Phase 2 で活性化、`ConcealSnapshot` で mask + shapes をまとめて記録)。
     pub(crate) conceal_undo_stack: std::collections::VecDeque<ConcealSnapshot>,
+    /// 隠蔽加工 Redo スタック。要素型と上限は Undo と同じ。
+    pub(crate) conceal_redo_stack: std::collections::VecDeque<ConcealSnapshot>,
     /// Undo スタック throttle 用 (キーリピート連打抑制)。
     pub(crate) conceal_last_undo_at: Option<std::time::Instant>,
     /// Select ツールでのハンドルドラッグ状態 (Phase 2)。
@@ -13998,6 +14002,7 @@ impl App {
             mask_db,
             conceal_db,
             erase_undo_stack: std::collections::VecDeque::new(),
+            erase_redo_stack: std::collections::VecDeque::new(),
             meta_undo: crate::undo_stack::UndoStack::new(),
             adjustment_drag_session: None,
             adjustment_standard_drag_session: None,
@@ -14034,6 +14039,7 @@ impl App {
             conceal_selected_shape: None,
             conceal_base_cache: std::collections::HashMap::new(),
             conceal_undo_stack: std::collections::VecDeque::new(),
+            conceal_redo_stack: std::collections::VecDeque::new(),
             conceal_last_undo_at: None,
             conceal_drag: None,
             conceal_last_paint_pos: None,
@@ -55022,6 +55028,7 @@ impl App {
         self.conceal_mask_texture = None;
         self.conceal_mask_texture_dirty_rect = None;
         self.conceal_undo_stack.clear();
+        self.conceal_redo_stack.clear();
         self.conceal_last_undo_at = None;
         self.clear_conceal_caches(idx);
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
