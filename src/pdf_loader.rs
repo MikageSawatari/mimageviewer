@@ -25,7 +25,7 @@
 //! PDFium DLL は exe 内に埋め込まれており、初回アクセス時に
 //! `%APPDATA%/mimageviewer/pdfium.dll` に展開される。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -3273,6 +3273,7 @@ pub enum CanonicalPdfPage {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PdfPageEntry {
     pub page_num: u32,
     pub mtime: i64,
@@ -3722,29 +3723,267 @@ pub fn render_page_async(
     (cancel, rx)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PdfEnumerateKey {
+    normalized_path: String,
+    password: Option<String>,
+}
+
+impl PdfEnumerateKey {
+    fn new(pdf_path: &Path, password: Option<&str>) -> Self {
+        Self {
+            normalized_path: crate::path_key::normalize_keep_drive(pdf_path),
+            password: password.map(String::from),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PdfEnumerateRequestId(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PdfEnumerateWaiterId(u64);
+
+struct PdfEnumerateRunning {
+    request_id: PdfEnumerateRequestId,
+    source_cancel: Arc<AtomicBool>,
+    waiters: HashMap<PdfEnumerateWaiterId, mpsc::Sender<std::io::Result<Vec<PdfPageEntry>>>>,
+}
+
+struct PdfEnumerateCoordinatorState {
+    next_request_id: u64,
+    next_waiter_id: u64,
+    running: HashMap<PdfEnumerateKey, PdfEnumerateRunning>,
+}
+
+impl Default for PdfEnumerateCoordinatorState {
+    fn default() -> Self {
+        Self {
+            next_request_id: 1,
+            next_waiter_id: 1,
+            running: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PdfEnumerateStartReason {
+    NoRunningRequest,
+    PreviousRequestCancelled,
+}
+
+struct PdfEnumerateStart {
+    request_id: PdfEnumerateRequestId,
+    source_cancel: Arc<AtomicBool>,
+    reason: PdfEnumerateStartReason,
+}
+
+enum PdfEnumerateAdmission {
+    JoinedRunning,
+    Start(PdfEnumerateStart),
+}
+
+/// UI ナビゲーション用 enumerate の実行中 request と待ち手を一元管理する。
+///
+/// 同じ `(path, password)` の request が cancel されず実行中なら、待ち手だけを追加する。
+/// 時間窓や完了結果 cache は持たず、完了時には entry 自体を取り除く。
+#[derive(Default)]
+struct PdfEnumerateCoordinator {
+    state: Mutex<PdfEnumerateCoordinatorState>,
+}
+
+impl PdfEnumerateCoordinator {
+    fn subscribe(
+        self: &Arc<Self>,
+        key: PdfEnumerateKey,
+    ) -> (PdfEnumerateHandle, PdfEnumerateAdmission) {
+        let (tx, rx) = mpsc::channel();
+        let waiter_cancel = Arc::new(AtomicBool::new(false));
+        let mut retired_waiters = Vec::new();
+
+        let (request_id, waiter_id, admission) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let waiter_id = PdfEnumerateWaiterId(state.next_waiter_id);
+            state.next_waiter_id = state.next_waiter_id.wrapping_add(1).max(1);
+
+            if let Some(running) = state.running.get_mut(&key)
+                && !running.source_cancel.load(Ordering::Relaxed)
+            {
+                let request_id = running.request_id;
+                running.waiters.insert(waiter_id, tx);
+                (request_id, waiter_id, PdfEnumerateAdmission::JoinedRunning)
+            } else {
+                let reason = if let Some(cancelled) = state.running.remove(&key) {
+                    debug_assert!(cancelled.source_cancel.load(Ordering::Relaxed));
+                    retired_waiters.extend(cancelled.waiters.into_values());
+                    PdfEnumerateStartReason::PreviousRequestCancelled
+                } else {
+                    PdfEnumerateStartReason::NoRunningRequest
+                };
+                let request_id = PdfEnumerateRequestId(state.next_request_id);
+                state.next_request_id = state.next_request_id.wrapping_add(1).max(1);
+                let source_cancel = Arc::new(AtomicBool::new(false));
+                let mut waiters = HashMap::new();
+                waiters.insert(waiter_id, tx);
+                state.running.insert(
+                    key.clone(),
+                    PdfEnumerateRunning {
+                        request_id,
+                        source_cancel: Arc::clone(&source_cancel),
+                        waiters,
+                    },
+                );
+                (
+                    request_id,
+                    waiter_id,
+                    PdfEnumerateAdmission::Start(PdfEnumerateStart {
+                        request_id,
+                        source_cancel,
+                        reason,
+                    }),
+                )
+            }
+        };
+
+        // cancel 済み entry の待ち手は新 request へ暗黙合流させない。
+        for sender in retired_waiters {
+            let _ = sender.send(Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "coalesced PDF enumerate source was already cancelled",
+            )));
+        }
+
+        let handle = PdfEnumerateHandle {
+            cancel: waiter_cancel,
+            rx,
+            lease: PdfEnumerateWaiterLease {
+                coordinator: Arc::clone(self),
+                key,
+                request_id,
+                waiter_id,
+                active: AtomicBool::new(true),
+            },
+        };
+        (handle, admission)
+    }
+
+    fn complete(
+        &self,
+        key: &PdfEnumerateKey,
+        request_id: PdfEnumerateRequestId,
+        result: std::io::Result<Vec<PdfPageEntry>>,
+    ) {
+        let waiters = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state
+                .running
+                .get(key)
+                .is_some_and(|running| running.request_id == request_id)
+            {
+                state
+                    .running
+                    .remove(key)
+                    .map(|running| running.waiters.into_values().collect::<Vec<_>>())
+                    .unwrap_or_default()
+            } else {
+                // cancel 後に旧 request が完了しても、同じ key の新 request へ誤配信しない。
+                Vec::new()
+            }
+        };
+
+        for sender in waiters {
+            let cloned = match &result {
+                Ok(pages) => Ok(pages.clone()),
+                Err(error) => Err(std::io::Error::new(error.kind(), error.to_string())),
+            };
+            let _ = sender.send(cloned);
+        }
+    }
+
+    fn cancel_waiter(
+        &self,
+        key: &PdfEnumerateKey,
+        request_id: PdfEnumerateRequestId,
+        waiter_id: PdfEnumerateWaiterId,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let remove_request = if let Some(running) = state.running.get_mut(key) {
+            if running.request_id != request_id {
+                return;
+            }
+            running.waiters.remove(&waiter_id);
+            if running.waiters.is_empty() {
+                // 最後の waiter 除去と source cancel を同じ lock 内の状態遷移にする。
+                running.source_cancel.store(true, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if remove_request {
+            state.running.remove(key);
+        }
+    }
+}
+
+static PDF_ENUMERATE_COORDINATOR: OnceLock<Arc<PdfEnumerateCoordinator>> = OnceLock::new();
+
+fn pdf_enumerate_coordinator() -> &'static Arc<PdfEnumerateCoordinator> {
+    PDF_ENUMERATE_COORDINATOR.get_or_init(|| Arc::new(PdfEnumerateCoordinator::default()))
+}
+
+struct PdfEnumerateWaiterLease {
+    coordinator: Arc<PdfEnumerateCoordinator>,
+    key: PdfEnumerateKey,
+    request_id: PdfEnumerateRequestId,
+    waiter_id: PdfEnumerateWaiterId,
+    active: AtomicBool,
+}
+
+impl PdfEnumerateWaiterLease {
+    fn cancel(&self) {
+        if self.active.swap(false, Ordering::AcqRel) {
+            self.coordinator
+                .cancel_waiter(&self.key, self.request_id, self.waiter_id);
+        }
+    }
+}
+
 /// UI ナビゲーション経路の PDF ページ列挙ハンドル。
 ///
-/// 呼び出し側 (App) は `pdf_enumerate_pending` にこれを保管し、次のナビに入る前に
-/// `cancel()` を呼ぶか、単に置き換えれば `Drop` で自動キャンセルされる。
-/// pool dispatcher は pop 時に cancel を確認して IPC 前にジョブを捨てるので、
-/// 古い enumerate が PDFium 実行時間を消費してキューを詰まらせるのを防げる。
+/// 各 caller が個別のハンドルと receiver を所有する。同じ実行中 request に合流していても、
+/// このハンドルだけを `cancel()` / drop でき、最後の待ち手が離れた時だけ source request を
+/// cancel する。
 pub struct PdfEnumerateHandle {
+    /// この待ち手だけの cancel 状態。App の stale-result guard でも参照する。
     pub cancel: Arc<AtomicBool>,
     pub rx: mpsc::Receiver<std::io::Result<Vec<PdfPageEntry>>>,
+    lease: PdfEnumerateWaiterLease,
 }
 
 impl PdfEnumerateHandle {
-    /// 明示キャンセル。pool dispatcher が pop 時に確認して早期破棄する。
+    /// この待ち手だけを明示キャンセルする。全待ち手が離れた場合だけ source へ伝搬する。
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
+        self.lease.cancel();
     }
 }
 
 impl Drop for PdfEnumerateHandle {
     fn drop(&mut self) {
-        // 置き換えで drop される場合、古いジョブが pool で in-flight にならないよう
-        // 必ずキャンセルする (SearchHandle と同じパターン)。
         self.cancel.store(true, Ordering::Relaxed);
+        self.lease.cancel();
     }
 }
 
@@ -3756,24 +3995,47 @@ impl Drop for PdfEnumerateHandle {
 ///    待たず、呼び出し元へ直ちにハンドルを返す。
 /// 2. **multi-process pool + `JobPriority::Critical`** — Normal priority のキャッシュ作成等を
 ///    押しのけて先に処理する。
-/// 3. **cancel token をジョブに添える** — 旧ハンドルを drop すると `PdfEnumerateHandle::Drop`
-///    が cancel を立て、pool dispatcher が pop 時に IPC 前で捨てる。古いジョブが PDFium
-///    時間を消費してキューを詰まらせない。
+/// 3. **実行中 request を `(path, password)` で共有する** — 同じ PDF の再オープンは既存の
+///    PDFium 処理へ待ち手として合流する。時間窓や完了結果 cache は使わない。
+/// 4. **待ち手単位の cancel** — 各 `PdfEnumerateHandle` は個別に離脱でき、最後の待ち手が
+///    離れた時だけ pool request の cancel token を立てる。
 pub fn enumerate_pages_async(pdf_path: &Path, password: Option<&str>) -> PdfEnumerateHandle {
-    let cancel = Arc::new(AtomicBool::new(false));
+    let key = PdfEnumerateKey::new(pdf_path, password);
+    let coordinator = Arc::clone(pdf_enumerate_coordinator());
+    let (handle, admission) = coordinator.subscribe(key.clone());
+    let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
+    let PdfEnumerateAdmission::Start(start) = admission else {
+        if crate::perf::is_enabled() {
+            crate::perf::event("pdf", "enumerate_join", Some(&perf_key), 0, &[]);
+        }
+        return handle;
+    };
+
     if crate::perf::is_enabled() {
-        let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
-        crate::perf::event("pdf", "enumerate_send", Some(&perf_key), 0, &[]);
+        let reason = match start.reason {
+            PdfEnumerateStartReason::NoRunningRequest => "no_running_request",
+            PdfEnumerateStartReason::PreviousRequestCancelled => "previous_request_cancelled",
+        };
+        crate::perf::event(
+            "pdf",
+            "enumerate_send",
+            Some(&perf_key),
+            0,
+            &[("reason", serde_json::Value::from(reason))],
+        );
     }
 
-    let (tx, rx) = mpsc::channel();
-    let tx_w = tx.clone();
     let req = encode_enumerate_request(pdf_path, password);
-    let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
-    let cancel_w = Arc::clone(&cancel);
+    let request_id = start.request_id;
+    let source_cancel = start.source_cancel;
+    let coordinator_w = Arc::clone(&coordinator);
+    let key_w = key.clone();
     if let Err(e) = std::thread::Builder::new()
         .name("pdf-enumerate-nav".into())
         .spawn(move || {
+            if source_cancel.load(Ordering::Relaxed) {
+                return;
+            }
             // 初期化は初回だけ設定数 (最大 10) の readiness 待ちを含むため、必ずこの
             // UI 外スレッドから開始する。
             let pool = get_pool();
@@ -3781,7 +4043,7 @@ pub fn enumerate_pages_async(pdf_path: &Path, password: Option<&str>) -> PdfEnum
             // (UI nav の即時応答 UX を優先、harvest は不要)
             let resp = pool.execute(
                 &req,
-                Some(&cancel_w),
+                Some(&source_cancel),
                 JobPriority::Critical,
                 Some(perf_key),
                 0,
@@ -3789,16 +4051,20 @@ pub fn enumerate_pages_async(pdf_path: &Path, password: Option<&str>) -> PdfEnum
             );
             let result =
                 resp.and_then(|response| PdfWorkerPool::parse_enumerate_response(&response.bytes));
-            let _ = tx_w.send(result);
+            coordinator_w.complete(&key_w, request_id, result);
         })
     {
         crate::logger::log(format!("pdf-enumerate-nav: spawn failed: {e}"));
-        let _ = tx.send(Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("failed to start PDF page enumeration thread: {e}"),
-        )));
+        coordinator.complete(
+            &key,
+            request_id,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("failed to start PDF page enumeration thread: {e}"),
+            )),
+        );
     }
-    PdfEnumerateHandle { cancel, rx }
+    handle
 }
 
 // -----------------------------------------------------------------------
@@ -3900,6 +4166,168 @@ mod tests {
     use super::*;
 
     static CONFIGURED_POOL_SIZE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn enumerate_test_key(path: &str, password: Option<&str>) -> PdfEnumerateKey {
+        PdfEnumerateKey::new(Path::new(path), password)
+    }
+
+    fn enumerate_test_pages() -> Vec<PdfPageEntry> {
+        vec![
+            PdfPageEntry {
+                page_num: 0,
+                mtime: 10,
+                file_size: 200,
+            },
+            PdfPageEntry {
+                page_num: 1,
+                mtime: 10,
+                file_size: 200,
+            },
+        ]
+    }
+
+    fn expect_enumerate_start(admission: PdfEnumerateAdmission) -> PdfEnumerateStart {
+        match admission {
+            PdfEnumerateAdmission::Start(start) => start,
+            PdfEnumerateAdmission::JoinedRunning => panic!("expected a new enumerate request"),
+        }
+    }
+
+    #[test]
+    fn enumerate_coalesces_same_key_into_one_request_and_broadcasts_result() {
+        let coordinator = Arc::new(PdfEnumerateCoordinator::default());
+        let key = enumerate_test_key(r"C:\Books\same.pdf", Some("secret"));
+        let (first, first_admission) = coordinator.subscribe(key.clone());
+        let start = expect_enumerate_start(first_admission);
+        let mut pool_request_count = 1;
+
+        let (second, second_admission) = coordinator.subscribe(key.clone());
+        if matches!(&second_admission, PdfEnumerateAdmission::Start(_)) {
+            pool_request_count += 1;
+        }
+        assert!(matches!(
+            second_admission,
+            PdfEnumerateAdmission::JoinedRunning
+        ));
+        assert_eq!(pool_request_count, 1);
+
+        let expected = enumerate_test_pages();
+        coordinator.complete(&key, start.request_id, Ok(expected.clone()));
+        assert_eq!(first.rx.recv().unwrap().unwrap(), expected);
+        assert_eq!(second.rx.recv().unwrap().unwrap(), expected);
+    }
+
+    #[test]
+    fn enumerate_dropping_one_waiter_keeps_source_and_other_result_alive() {
+        let coordinator = Arc::new(PdfEnumerateCoordinator::default());
+        let key = enumerate_test_key("same.pdf", None);
+        let (first, first_admission) = coordinator.subscribe(key.clone());
+        let start = expect_enumerate_start(first_admission);
+        let (second, second_admission) = coordinator.subscribe(key.clone());
+        assert!(matches!(
+            second_admission,
+            PdfEnumerateAdmission::JoinedRunning
+        ));
+
+        drop(first);
+        assert!(!start.source_cancel.load(Ordering::Relaxed));
+
+        let expected = enumerate_test_pages();
+        coordinator.complete(&key, start.request_id, Ok(expected.clone()));
+        assert_eq!(second.rx.recv().unwrap().unwrap(), expected);
+    }
+
+    #[test]
+    fn enumerate_cancels_source_only_after_all_waiters_drop() {
+        let coordinator = Arc::new(PdfEnumerateCoordinator::default());
+        let key = enumerate_test_key("same.pdf", None);
+        let (first, first_admission) = coordinator.subscribe(key.clone());
+        let start = expect_enumerate_start(first_admission);
+        let (second, second_admission) = coordinator.subscribe(key.clone());
+        assert!(matches!(
+            second_admission,
+            PdfEnumerateAdmission::JoinedRunning
+        ));
+
+        drop(first);
+        assert!(!start.source_cancel.load(Ordering::Relaxed));
+        drop(second);
+        assert!(start.source_cancel.load(Ordering::Relaxed));
+        assert!(!coordinator.state.lock().unwrap().running.contains_key(&key));
+    }
+
+    #[test]
+    fn enumerate_explicit_cancel_only_removes_that_waiter() {
+        let coordinator = Arc::new(PdfEnumerateCoordinator::default());
+        let key = enumerate_test_key("same.pdf", None);
+        let (first, first_admission) = coordinator.subscribe(key.clone());
+        let start = expect_enumerate_start(first_admission);
+        let (second, second_admission) = coordinator.subscribe(key.clone());
+        assert!(matches!(
+            second_admission,
+            PdfEnumerateAdmission::JoinedRunning
+        ));
+
+        first.cancel();
+        assert!(first.cancel.load(Ordering::Relaxed));
+        assert!(!start.source_cancel.load(Ordering::Relaxed));
+
+        let expected = enumerate_test_pages();
+        coordinator.complete(&key, start.request_id, Ok(expected.clone()));
+        assert_eq!(second.rx.recv().unwrap().unwrap(), expected);
+    }
+
+    #[test]
+    fn enumerate_uses_password_as_part_of_coalescing_key() {
+        let coordinator = Arc::new(PdfEnumerateCoordinator::default());
+        let first_key = enumerate_test_key("same.pdf", Some("first"));
+        let second_key = enumerate_test_key("same.pdf", Some("second"));
+        let (_first, first_admission) = coordinator.subscribe(first_key);
+        let (_second, second_admission) = coordinator.subscribe(second_key);
+
+        assert!(matches!(first_admission, PdfEnumerateAdmission::Start(_)));
+        assert!(matches!(second_admission, PdfEnumerateAdmission::Start(_)));
+    }
+
+    #[test]
+    fn enumerate_cancelled_running_request_is_replaced_explicitly() {
+        let coordinator = Arc::new(PdfEnumerateCoordinator::default());
+        let key = enumerate_test_key("same.pdf", None);
+        let (first, first_admission) = coordinator.subscribe(key.clone());
+        let first_start = expect_enumerate_start(first_admission);
+        first_start.source_cancel.store(true, Ordering::Relaxed);
+
+        let (second, second_admission) = coordinator.subscribe(key.clone());
+        let second_start = expect_enumerate_start(second_admission);
+        assert_eq!(
+            second_start.reason,
+            PdfEnumerateStartReason::PreviousRequestCancelled
+        );
+        assert_ne!(first_start.request_id, second_start.request_id);
+        assert_eq!(
+            first.rx.recv().unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+
+        // 旧 request の late completion は新 request の待ち手へ配らない。
+        coordinator.complete(
+            &key,
+            first_start.request_id,
+            Ok(vec![PdfPageEntry {
+                page_num: 99,
+                mtime: 0,
+                file_size: 0,
+            }]),
+        );
+        assert!(matches!(
+            second.rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        let expected = enumerate_test_pages();
+        coordinator.complete(&key, second_start.request_id, Ok(expected.clone()));
+        assert_eq!(second.rx.recv().unwrap().unwrap(), expected);
+    }
 
     fn document_cache_key(
         path: &str,

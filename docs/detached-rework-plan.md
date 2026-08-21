@@ -328,6 +328,73 @@ Windows 実機で確認済み。次は表示中 `App` の session 化か `MediaW
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-08-20 keep-alive backstop の所有権 (ClaudeCode / Codex 双方が構造的修正と合意):**
+`render_active_detached_viewport_backstop` ([ui_fullscreen.rs](../src/ui_fullscreen.rs) 12740 付近) が
+**mount の外**で走り、**App にマウントされている別 context の状態から detached window の内容を
+組み立てていた**。題の index は `self.fullscreen_idx.unwrap_or(0)`、題そのものは `self.items[..]`、
+live texture も `self.fullscreen_idx` と App 上の cache から解決していた。
+
+- **実機ログの証拠** (利用者、2026-08-20)。動画ウィンドウ (session 6, hwnd 0x3c1a2c) の 1 フレーム:
+
+  ```
+  frame=25216 source=keepalive_backstop session=Some(6) hwnd=0x3c1a2c
+    fs_idx=0 items_gen=4 items_len=785 main_fs_idx=None
+    computed="（成）だれにもいえないコト…pdf - mimageviewer"   ← PDF の名前
+    os="【東方Full Flavor】Petaverse….mp4 - mimageviewer"
+  frame=25217 source=active_render session=Some(6) hwnd=0x3c1a2c
+    fs_idx=59 items_gen=8 items_len=167
+    computed="【東方Full Flavor】Super Rabbit….mp4 - mimageviewer"   ← 正しい
+  ```
+
+  利用者の再現条件とも一致する: **他のウィンドウがアクティブな間は backstop だけが描くので
+  題が別 context のものになり、動画ウィンドウを再びアクティブにすると `active_render` に戻って直る。**
+- **変更**: backstop も所有 bundle を通してから組み立てる。**3 分岐**にした:
+  bundle が `Some` なら mount して実行 / `None` かつ active session が alive なら
+  **App が既に所有者なのでそのまま実行** / owner の bundle が本当に消失しているなら sibling を描かない。
+  **`None` に「mount 中で take 済み」と「別 bundle を持たない直マウント経路」の 2 つの正規な意味が
+  ある**ことは Codex のフェーズ 1 指摘で判明した。無条件に mount helper で包む当初案は誤りだった。
+- **採らなかった案**: 題と `resolve_fs_display_tex` だけを bundle 直接参照へ変える案。holdover の
+  一方向ラッチ、processed / edit / conceal / local-adjust / animation cache、thumbnail 判定、
+  generation 付き描画資源を取りこぼし、同種の漏れを再生産する (双方合意)。
+- **費用**: `alive_wanted` / frame marker / first-host の判定は mount の**前**に評価するので、
+  **backstop が実際に必要なフレームだけ** mount/unmount が 1 往復増える。
+- **憲法チェック**: 3 抵触なし (既存の `Option` と mount helper だけで振り分け、新しい state を
+  足さない) / 5 抵触なし (alive session・frame marker・HWND registry・既存 content state で判定し、
+  時間窓を使わない) / 7 範囲内 / 8 既存 104 本を維持。
+- **今回あえて直していない**: `fullscreen_idx=None` のとき題が item 0 へ fallback する
+  ([ui_fullscreen.rs](../src/ui_fullscreen.rs) 12791)。今回の cross-context 問題とは別件であり、
+  同時に触ると範囲が混ざる (憲法 7、Codex の指摘)。
+- **リワーク側への申し送り**: 分類は BA-5 / K1 の「複数描画入口・複数 context」seam。今回は
+  **現行 K0 の入口を owner-correct にする限定修正**であって K1 (単一描画入口) を完成させるものではない。
+  K1 を設計するとき、backstop がこの 3 分岐で何を必要としていたかを出発点にできる。
+
+**2026-08-20 サムネイル結果の所有権 (ClaudeCode / Codex 双方が構造的修正と合意):**
+mount 中の active detached context がサムネイル worker の結果を
+`drain_thumb_results_discard` で読み捨てていた ([app.rs](../src/app.rs) 40392 付近)。
+根拠は「detached はグリッドを描かないので表示する場が無い」だったが、**その後に入った
+pass-through rendition (ページ送り連打時の代役表示) が、グリッドではなくフルスクリーン側で
+サムネイルを消費する**ようになったため、前提が失効していた。
+
+- **実測** (利用者実機、2026-08-20): `passthrough_unavailable` が **12,773 回** (理由はすべて
+  `thumbnail_not_loaded`)、代役を要求した sequence が **2,424 個**、実際に代役で描いた回数は
+  **0 回**。`page_turn_decision` の paint mode は 100% `materialized`。
+  **別ウィンドウでは連打の軽量化が一度も成立していなかった。**
+- **変更**: 捨てるのをやめ、**所有 context 自身の `poll_thumbnails` に処理させる**。
+  producer と consumer の間に guard / retry / 時間窓を足すのではなく、結果を持ち主の
+  既存 reducer へ戻す変更なので、所有境界での構造的修正である。
+- **同時に決めたこと**: グリッドを描かない context では **keep 外 Video を強制テクスチャ化しない**、
+  **auto-aspect を回さない**。`poll_thumbnails` は Video を keep 範囲外でも常にテクスチャ化し、
+  末尾で `maybe_apply_auto_aspect` を呼ぶが、どちらもグリッド用の政策であり、代役のためだけに
+  poll する context には消費者が居ない (代役が要求する `thumb_pixels` は Image / ZipImage /
+  PdfPage のみ保持で、Video は対象外)。区別は**呼び出し時の型付き consumption policy** で行い、
+  **App に新しい bool / Option を足していない** (憲法 3)。
+- **憲法チェック**: 3 抵触なし (App state を増やさない) / 5 抵触なし (判断材料は channel 受信・
+  generation・index・keep_set であって時間ではない) / 7 範囲内 (panorama、一般の auto-aspect、
+  他の detached lifecycle 不具合は触れていない) / 8 既存 104 本を維持。
+- **リワーク側への申し送り**: 「グリッドを描く context」と「代役のためだけに poll する context」の
+  区別は、R2 で `DetachedWindowRuntime` に状態を集約するときに **consumption policy として
+  型に載せ直せる**。現在は呼び出し時引数なので、状態化する場合はここを起点にすること。
+
 **2026-08-02 利用者仕様変更により撤回:** remote video は fullscreen player / native presenter を
 使わず、streaming UI state が headless player を所有する構造へ変更した。このため増分 13 の
 `FullscreenEguiMediaSurface::RemoteStreaming`、owner-scoped presenter hide、専用 snapshot を削除し、

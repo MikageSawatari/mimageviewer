@@ -2039,6 +2039,30 @@ fn metadata_import_context_path_is_affected(
         .is_some_and(|parent| crate::path_key::normalize_keep_drive(parent) == root)
 }
 
+/// Defines which thumbnail side effects the caller will actually consume.
+///
+/// This is a call-site policy rather than viewer state: the mounted context still owns and
+/// applies its own channel results, while callers that do not draw a grid can opt out of
+/// grid-only work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThumbnailConsumptionPolicy {
+    /// A thumbnail grid consumes textures for every video and drives automatic cell aspect.
+    Grid,
+    /// A fullscreen-only context consumes image pixels for pass-through renditions, but has no
+    /// grid that could consume forced out-of-range video textures or automatic cell-aspect work.
+    PassthroughRendition,
+}
+
+impl ThumbnailConsumptionPolicy {
+    fn keeps_out_of_range_video_texture(self) -> bool {
+        matches!(self, Self::Grid)
+    }
+
+    fn drives_auto_aspect(self) -> bool {
+        matches!(self, Self::Grid)
+    }
+}
+
 struct FolderPinLookupTarget {
     path: PathBuf,
     /// `ZipDir` cellのliteral keyからDB保存先のeffective keyへのalias。
@@ -16106,7 +16130,7 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn with_active_detached_viewer_context<R>(
+    pub(crate) fn with_active_detached_viewer_context<R>(
         &mut self,
         f: impl FnOnce(&mut Self) -> R,
     ) -> Option<R> {
@@ -16122,17 +16146,6 @@ impl App {
             Ok(value) => Some(value),
             Err(payload) => std::panic::resume_unwind(payload),
         }
-    }
-
-    /// 現在マウント中のコンテキストの thumb 結果チャネル (`self.rx`) を読み捨てる。
-    /// グリッドを描かない detached context 用 (review-v2.3.0 P2-9): channel を bundle 化した
-    /// ことで、detached context のロードが spawn した worker の結果 (ZIP 内動画サムネ等) は
-    /// その context の rx に届くが、poll_thumbnails を回さないため放置するとバッファが
-    /// 溜まり続ける。表示予定が無いので捨てる。detached での panorama 高解像度アップグレード
-    /// も同 channel 経由だが、これは bundle 化前から detached では機能していない経路
-    /// (main mount 中の poll で世代不一致 drop) なので挙動退行にはならない。
-    fn drain_thumb_results_discard(&mut self) {
-        while self.rx.try_recv().is_ok() {}
     }
 
     pub(crate) fn effective_folder(&self) -> Option<PathBuf> {
@@ -22188,10 +22201,17 @@ impl App {
         self.cancel_token.store(true, Ordering::Relaxed);
         self.wake_all_workers();
 
-        // 旧 pending を drop すると `PdfEnumerateHandle::Drop` が cancel を立て、
-        // pool dispatcher は pop 時に IPC 前で古いジョブを捨てる。
+        // 同じ PDF の再 open では、旧 handle を新しい waiter の登録まで保持する。
+        // 先に drop すると一瞬だけ全 waiter が 0 になり、合流すべき source request を
+        // cancel してしまう。別 path は従来どおりここで直ちに cancel する。
         // ZIP 側 pending も一緒に捨てる (ZIP → PDF 遷移時の取り残し防止、Codex P2)。
-        self.pdf_enumerate_pending = None;
+        let mut previous_pdf_enumerate = self.pdf_enumerate_pending.take();
+        if previous_pdf_enumerate
+            .as_ref()
+            .is_some_and(|(path, _, _)| !crate::path_key::eq_keep_drive(path, &pdf_path))
+        {
+            previous_pdf_enumerate = None;
+        }
         self.zip_enumerate_pending = None;
         // 直前の cache-hit の placeholder 情報はクリア (= 新規 nav の出発点)。
         self.pdf_placeholder_count = None;
@@ -22221,6 +22241,13 @@ impl App {
         let password: Option<String> = saved_password
             .clone()
             .or_else(|| self.pdf_current_password.clone());
+        if previous_pdf_enumerate
+            .as_ref()
+            .is_some_and(|(_, previous_password, _)| previous_password != &password)
+        {
+            // 同じ path でも password が違えば別 request。旧 source はここで cancel する。
+            previous_pdf_enumerate = None;
+        }
 
         // パスワードチェックも非同期化したいが、ダイアログ表示のフローが複雑になるため
         // ここでは簡易判定: 保存済みパスワードがなければ非同期で check_password を含めて
@@ -22243,6 +22270,9 @@ impl App {
         // ── 非同期でページ列挙をリクエスト (検証 + cache 更新) ──
         let handle = crate::pdf_loader::enumerate_pages_async(&pdf_path, password.as_deref());
         self.pdf_enumerate_pending = Some((pdf_path.clone(), password, handle));
+        // 同じ key なら新 handle が既に waiter として登録済みなので、ここで旧 handle を
+        // drop しても source request は継続する。
+        drop(previous_pdf_enumerate);
         if placeholder_built.is_some() {
             // 検証用に覚えておく: 一致なら grid 再構築 skip、不一致なら再構築する。
             self.pdf_placeholder_count = placeholder_built;
@@ -31807,7 +31837,7 @@ impl App {
         });
     }
 
-    fn poll_thumbnails(&mut self, ctx: &egui::Context) {
+    fn poll_thumbnails(&mut self, ctx: &egui::Context, consumption: ThumbnailConsumptionPolicy) {
         // 1 フレームあたりのテクスチャ生成数を制限する。
         // load_texture は GPU テクスチャアップロードを伴い、1 枚 0.5-2 ms かかる。
         // キャッシュヒット時にワーカー全員が一気に結果を返すと 1 フレームで
@@ -31945,14 +31975,13 @@ impl App {
                 continue;
             }
 
-            // 動画は「最初に作った動画サムネは以後ずっと保持する」設計 —
-            // update_keep_range_and_requests は Video を Evicted 化しないし
-            // make_load_request も Video に None を返すため、一度 Evicted に
-            // 落とすと再リクエストされず永遠に復帰しない。下の分岐で keep_range
-            // 外でも常に in_range 扱いにすることで、out-of-range 受信でも
-            // 必ずテクスチャ化する。
+            // グリッド側の Video は「最初に作ったサムネを以後ずっと保持する」従来設計。
+            // update_keep_range_and_requests は Video を Evicted 化せず、make_load_request も
+            // Video に None を返すため、Grid policy だけは keep 外の結果も必ずテクスチャ化する。
+            // fullscreen-only context はグリッド消費者を持たないので、この強制保持を行わない。
             let is_video = matches!(self.items.get(i), Some(GridItem::Video(_)));
-            let treat_as_in_range = in_keep_range || is_video;
+            let treat_as_in_range =
+                in_keep_range || (is_video && consumption.keeps_out_of_range_video_texture());
 
             match color_image_opt {
                 Some(color_image) => {
@@ -32035,10 +32064,10 @@ impl App {
                             self.page_dims_cache
                                 .record_layout(self.items_generation, i, dims);
                         }
-                        // auto_aspect: 新規 Loaded のタイミングで比率サンプルを記録。
+                        // auto_aspect: グリッド消費者だけが新規 Loaded の比率を記録。
                         // source_dims が None なら ColorImage の (w, h) を fallback として使う
                         // (動画 Shell サムネ / 旧 cache 由来などで source_dims が無いケース)。
-                        if self.settings.thumb_aspect_auto {
+                        if consumption.drives_auto_aspect() && self.settings.thumb_aspect_auto {
                             let ratio = match layout_dims.or(source_dims) {
                                 Some((sw, sh)) if sw > 0 => sh as f32 / sw as f32,
                                 _ if w > 0 => h as f32 / w as f32,
@@ -32170,12 +32199,15 @@ impl App {
             // resync 完了後に backlog を確実に処理させる (surface 復帰フレームで再走)。
             ctx.request_repaint();
         }
-        // auto_aspect: 新規 Loaded で samples が増えた可能性があるので切替判定。
+        // auto_aspect: グリッド消費者では新規 Loaded で samples が増えた可能性があるので
+        // 切替判定する。fullscreen-only context はセルも scroll persistence も消費しない。
         // 6 段ゲート (mode / switches_done / input idle / min_samples / streak / cooldown) は
-        // maybe_apply_auto_aspect 内部で行う。received==0 でも streak の時間ベース継続を
-        // 評価する必要があるので無条件に呼ぶ (内部の早期 return が安価)。
+        // maybe_apply_auto_aspect 内部で行う。Grid policy では received==0 でも streak の
+        // 時間ベース継続を評価する必要があるので呼ぶ (内部の早期 return が安価)。
         // 通常の poll 経路は streak 連勝を要求するので immediate=false。
-        self.maybe_apply_auto_aspect(false);
+        if consumption.drives_auto_aspect() {
+            self.maybe_apply_auto_aspect(false);
+        }
     }
 
     pub(crate) fn set_details_hover_thumbnail_idx(&mut self, idx: Option<usize>) {
@@ -40419,11 +40451,12 @@ impl App {
                 app.poll_pdf_enumerate();
                 app.poll_zip_enumerate();
                 app.poll_prefetch(ctx);
-                // per-context 化した thumb channel の掃除 (review-v2.3.0 P2-9): detached
-                // context はグリッドを描かず poll_thumbnails を回さないので、ZIP 内動画の
-                // サムネ抽出などが送ってきた結果を放置すると自分の rx に溜まり続ける。
-                // 表示する場が無いので読み捨てる (サムネ状態は Pending のまま = 従来挙動)。
-                app.drain_thumb_results_discard();
+                // Thumbnail results belong to the context whose worker generation and rx
+                // produced them. Consume them while that detached owner is mounted so image
+                // pixels can become pass-through renditions without leaking state into the main
+                // sibling. This context has no grid, so its call-site policy skips grid-only
+                // out-of-range Video retention and auto-aspect side effects.
+                app.poll_thumbnails(ctx, ThumbnailConsumptionPolicy::PassthroughRendition);
                 // main の thumbnail/prefetch 結果回収後と同じ位置で、mounted owner の nav lock を poll する。
                 app.poll_fs_nav_lock(ctx);
                 if app.current_viewer_context_contains_video() {
@@ -42257,7 +42290,9 @@ impl App {
             self.items_generation,
             self.items.len(),
             self.fullscreen_idx,
-            self.active_detached_viewer_context.is_some(),
+            // `with_active_detached_viewer_context` takes the context out for the span it is
+            // mounted, so `is_none()` is what means App state currently *is* the viewer's.
+            self.active_detached_viewer_context.is_none(),
             self.active_detached_session
                 .map(|session| session.window_id),
         ));
@@ -65941,7 +65976,7 @@ impl eframe::App for App {
         self.poll_edit_preview_cache(ctx);
         self.reconcile_pinned_adjustment_refreshes();
         self.poll_smart_folder_metadata_refresh(ctx);
-        self.poll_thumbnails(ctx);
+        self.poll_thumbnails(ctx, ThumbnailConsumptionPolicy::Grid);
         self.reconcile_edit_preview_refreshes(ctx);
         // poll_thumbnails の直後にロック解除判定を入れる (= サムネ Loaded が
         // 立った同フレームで holdover を捨てて新画面に切り替える)。

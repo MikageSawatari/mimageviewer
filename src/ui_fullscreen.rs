@@ -12884,6 +12884,35 @@ impl App {
             ));
             return;
         }
+
+        // The backstop is called after the normal active renderer has returned, so the active
+        // detached owner is normally parked in `active_detached_viewer_context`. Mount the whole
+        // bundle before resolving the title, display texture, holdover latch, adjustments, or
+        // generation-scoped paint resources. Looking those up on the main sibling would combine
+        // an active detached session/viewport with another context's indexed state.
+        //
+        // `None` also has a legitimate meaning: callers already inside
+        // `with_active_detached_viewer_context` have the owner mounted directly on `App`. The
+        // alive/session checks above are the strongest existing distinction from a genuinely
+        // missing owner; do not add another detached sentinel merely for this hand-off.
+        if self.active_detached_viewer_context_present() {
+            let _ = self.with_active_detached_viewer_context(|app| {
+                app.render_active_detached_viewport_backstop_mounted(ctx, viewport_id);
+            });
+        } else {
+            self.render_active_detached_viewport_backstop_mounted(ctx, viewport_id);
+        }
+    }
+
+    /// Draw the keep-alive backstop while the active detached viewer context owns `App`'s
+    /// viewer fields. Session/runtime fields remain App-global and were validated by the caller
+    /// before any bundle mount, so frames handled by the normal renderer do not pay for a swap.
+    #[cfg(windows)]
+    fn render_active_detached_viewport_backstop_mounted(
+        &mut self,
+        ctx: &egui::Context,
+        viewport_id: egui::ViewportId,
+    ) {
         // 既存の detached 描画と同じ builder を使う (decorations/transparent/taskbar が変わると
         // egui が窓を作り直すため)。host が生存している既存窓なら geometry は触らない。stale/未捕捉
         // のときは placement を seed して、egui 再生成時の既定サイズ 822x656 フラッシュを防ぐ

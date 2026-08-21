@@ -308,10 +308,15 @@ PDF は **非同期**で開く:
 
 ```
 1. 即座に items = [] で画面を更新
-2. 別スレッド内で PDF worker pool を遅延初期化し、enumerate 要求を投げる
-3. pdf_enumerate_pending に受信チャネルを保持
+2. `PdfEnumerateCoordinator` で同じ `(path, password)` の実行中 enumerate を確認する
+   - cancel されていなければ新しい pool 要求を作らず waiter として合流
+   - cancel 済み、または key が異なる場合は明示的に新規要求を開始
+   - 時間窓と完了結果 cache は使わない
+3. waiter ごとの `PdfEnumerateHandle` を pdf_enumerate_pending に保持
+   - 各 handle は個別に drop / cancel できる
+   - 全 waiter が離れた時だけ元の pool 要求を cancel
 4. 毎フレーム poll_pdf_enumerate() で結果チェック
-5. 成功: GridItem::PdfPage を pages 分だけ追加
+5. 完了結果を全 waiter へ配信。成功: GridItem::PdfPage を pages 分だけ追加
    パスワード必要: ダイアログを出して再試行
 ```
 
