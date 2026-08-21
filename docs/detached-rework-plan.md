@@ -372,7 +372,7 @@ R2b の残件 (純粋 reducer / 合法遷移制約 / 散在 pending・flag の t
   `request_detached_right_drag_guide_repaint` が要求し、終了 / cancel のフレームで
   消去用に 1 回出す。**判定は所有者と状態で行い、時間窓では行っていない** (憲法 5)。
   ガイド出現遅延 (`mouse_flick_menu_delay`) は既存の UX 仕様で、その時刻に描き直すだけ。
-- コミット: d2c19796。実機確認待ち。
+- コミット: d2c19796。**実機確認済み 2026-08-21**。
 
 ### 9.7 再生中の動画ウィンドウの右ドラッグ (2026-08-21)
 
@@ -408,7 +408,7 @@ HUD コマンドをアクティブ化へ変換し、**それ以外の利用者�
 - ⚠ §9.6 の指示書は native オーバーレイ組み立ての 2 箇所を「Root 限定のまま」としていたが、
   **本ステージで所有者引数を取る形へ変更した**。右クリックメニュー抑止の 2 箇所
   (`src/app/gamepad_input.rs:1399` / `:1419`) は**引き続き Root 限定**。
-- コミット: c71d8c08 + fix1 4c5260a2。実機確認待ち。
+- コミット: c71d8c08 + fix1 4c5260a2 + fix2 12f60c97。**実機確認済み 2026-08-21** (リング / ジェスチャとも動作)。
 - **fix1 (実機ログで確定した退行)**: 再生中の動画ウィンドウで右ドラッグ状態の **producer が 2 つ**になっていた。
   native presenter がドラッグを開始する一方、presenter の裏にいる egui の ParkedLive 経路は
   右ボタンを一度も見ないため `right_drag_live && !secondary_down` を満たし、
@@ -424,6 +424,20 @@ HUD コマンドをアクティブ化へ変換し、**それ以外の利用者�
     イベント種別の決定は自由関数 `parked_live_egui_right_drag_event_kind`
     (`src/ui_fullscreen.rs:3144`) へ切り出してテストで固定した。
     **ガイドと入力で所有者判定を分けないこと。分けるとこのクラスのバグが再発する。**
+- **fix2 (実機ログで確定した 2 件目)**: 成立したコマンドが `phase=recognized
+  reason=viewer_identity_unavailable` で捨てられていた (5 試行すべて)。
+  `right_drag_viewer_identity` は `snapshot.paused_bundle` から `items_generation` を読むが、
+  `poll_parked_live_detached_windows` はポーリングの間 **bundle を snapshot から take して
+  App にマウントする**。native のジェスチャが成立するのはその区間の中なので、
+  読みに行った瞬間だけ `paused_bundle` が `None` だった (メディア snapshot には
+  `reopen_sync_stamp` も無くフォールバックも効かない)。
+  - 修正: その窓の bundle がマウント中かどうかを事実で判定し、マウント中なら
+    マウント中の `items_generation` を identity にする (`src/app.rs:1249`)。
+    判定材料の `native_video_parked_live_input_window_id` は**マウント区間の内側でしか立たない**
+    (`src/app.rs:39556`〜`39564`)。identity 検査の強度は変えていない。
+  - ⚠ **これは parked-live 経路にしか無い facts に依存した暫定解であり、一般解ではない。**
+    R2e 第 3 版で「この window の bundle は今どこにあるか」を一級の問い合わせにすること
+    (材料は [briefs/detached-r2e-ownership-design.md](briefs/detached-r2e-ownership-design.md) §6.5)。
 
 ## 10. 将来候補 (現行仕様では未採用)
 

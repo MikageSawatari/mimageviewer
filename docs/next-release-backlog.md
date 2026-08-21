@@ -777,7 +777,8 @@
   一方、コマンドはアクティブ化**後**に実行するので、マウントされていない context へ適用する必要は
   無く、**R2e (viewer context registry) の完成には依存しない**
   (正本: [detached-r2e-ownership-design.md](briefs/detached-r2e-ownership-design.md) §5)。
-- **状態 (2026-08-21)**: 実装済み・検収合格 (`8db282e3`)。**実機確認待ち**。
+- **状態 (2026-08-21)**: 実装済み・検収合格・**実機確認済み**。静止画 (`8db282e3` + `5b83df3f`)、
+  ガイド表示 (`d2c19796`)、動画 ParkedLive (`c71d8c08` + `4c5260a2` + `12f60c97`) のすべてで動作確認済み。
   指示書は [detached-rework-stage-passive-gesture.md](detached-rework-stage-passive-gesture.md)、
   進捗記録は [detached-rework-plan.md](detached-rework-plan.md) §9.5。
   **実機で確認が取れて出荷するまで本項は消さない** (根本原因・利用者決定・訂正履歴の正本)。
