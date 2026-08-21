@@ -374,6 +374,42 @@ R2b の残件 (純粋 reducer / 合法遷移制約 / 散在 pending・flag の t
   ガイド出現遅延 (`mouse_flick_menu_delay`) は既存の UX 仕様で、その時刻に描き直すだけ。
 - コミット: d2c19796。実機確認待ち。
 
+### 9.7 再生中の動画ウィンドウの右ドラッグ (2026-08-21)
+
+§9.6 を実機確認した利用者から「動画は右クリックが反応しない」と報告があった。
+**これは退行ではなく §6-3 の live-park 仕様そのもの**で、実機ログに明示的な記録がある:
+
+```
+[native-video] parked-live passive event ignored: idx=59 window_id=9 event=Window(MouseMove(...))
+```
+
+`handle_native_video_output_event` (`src/app/native_video.rs:3583` 付近) は
+`native_video_parked_live_input_window_id` が `Some` のとき、左ボタンを「クリックで復帰」へ、
+HUD コマンドをアクティブ化へ変換し、**それ以外の利用者入力をすべて捨てる**。
+
+**利用者決定 (2026-08-21): 静止画と揃える。ガイドも出す。**
+指示書は [stage-passive-gesture-video](detached-rework-stage-passive-gesture-video.md)。
+
+- **入力**: allow-list に足したのは **右ボタンの非ダブルクリック down / up** (右ドラッグ有効時のみ) と、
+  **その窓を所有者とするジェスチャ / リングが進行中の間の `MouseMove`** だけ
+  (`src/app/native_video.rs:3496` 付近)。キー / ホイール / Touch / IME / seek / 音量 / 速度 /
+  中ボタンは従来どおり遮断。左ボタンのクリック復帰と HUD 変換も不変。
+  `RightDragMode::Disabled` では右ボタンも通さない。
+  **進行中判定は状態 (owner + context 一致) だけで行い、時間窓を使っていない。**
+- **ガイド**: 動画は native presenter (別 HWND) が映像を描き、egui のビューポートはその裏にいるため
+  §9.6 の egui ガイドは見えない。**native presenter のオーバーレイへ流す。**
+  `set_native_video_*_overlay` は `fullscreen_idx` / `fs_cache` から player を引くので、
+  **その窓の bundle がマウントされている区間でしか正しい presenter を指せない**。
+  組み立てと push は `poll_parked_live_detached_windows` のマウント区間内で行う
+  (`src/app.rs:39547`)。`None` も必ず push して残留を消す。
+- **排他**: egui 側は music view (presenter hidden) のときだけガイドを組み立て
+  (`src/ui_fullscreen.rs:11918`)、native 側は music view のとき両オーバーレイを `None` にする
+  (`src/app/gamepad_input.rs:4245`)。構造として二重に出ない。
+- ⚠ §9.6 の指示書は native オーバーレイ組み立ての 2 箇所を「Root 限定のまま」としていたが、
+  **本ステージで所有者引数を取る形へ変更した**。右クリックメニュー抑止の 2 箇所
+  (`src/app/gamepad_input.rs:1399` / `:1419`) は**引き続き Root 限定**。
+- コミット: c71d8c08。実機確認待ち。
+
 ## 10. 将来候補 (現行仕様では未採用)
 
 - **pin の再導入**: CUT 前の linked/pin 意味論は戻さない。必要なら、既存窓を
