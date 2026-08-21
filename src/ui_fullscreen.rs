@@ -3140,6 +3140,40 @@ struct DetachedImageWindowEventBatch {
     right_drag_events: Vec<(u64, crate::app::DetachedRightDragEvent)>,
 }
 
+#[cfg(windows)]
+fn parked_live_egui_right_drag_event_kind(
+    egui_owns_right_drag: bool,
+    right_drag_live: bool,
+    focused_last_frame: bool,
+    focused_now: bool,
+    secondary_pressed: bool,
+    secondary_down: bool,
+    secondary_released: bool,
+    pointer_pos: Option<egui::Pos2>,
+) -> Option<crate::app::DetachedRightDragEventKind> {
+    if !egui_owns_right_drag {
+        return None;
+    }
+    if right_drag_live && focused_last_frame && !focused_now {
+        Some(crate::app::DetachedRightDragEventKind::Cancel {
+            reason: crate::app::DetachedRightDragCancelReason::FocusLost,
+        })
+    } else if right_drag_live && !secondary_down && !secondary_released {
+        Some(crate::app::DetachedRightDragEventKind::Cancel {
+            reason: crate::app::DetachedRightDragCancelReason::ButtonStateLost,
+        })
+    } else if secondary_pressed || secondary_down || secondary_released {
+        Some(crate::app::DetachedRightDragEventKind::Input {
+            secondary_pressed,
+            secondary_down,
+            secondary_released,
+            pointer_pos,
+        })
+    } else {
+        None
+    }
+}
+
 /// チェックマーク円の半径
 const CHECKMARK_RADIUS: f32 = 18.0;
 /// 透過画像背景の市松 1 タイルサイズ (px)
@@ -11871,6 +11905,10 @@ impl App {
                 self.ensure_detached_window_runtime_placement(window.id, "passive_render_seed");
             let parked_live_music_info =
                 self.parked_live_music_window_info_for_window_id(window.id);
+            // Music views hide the presenter, so egui owns both the guide and right-drag input.
+            // Visible video leaves both with the native presenter. Keep this as their one shared
+            // ownership decision so the viewport behind the presenter cannot cancel its drag.
+            let egui_owns_right_drag = parked_live_music_info.is_some();
             if apply_initial_placement {
                 self.log_detached_viewport_placement_event(
                     "passive_parked_live",
@@ -11913,11 +11951,11 @@ impl App {
                 apply_initial_placement,
                 None,
             );
-            // The egui guide owns only audio / hidden-presenter music views. Visible video is
-            // covered by the native presenter guide refreshed during the mounted ParkedLive poll.
-            let right_drag_guide = parked_live_music_info.as_ref().and_then(|_| {
-                self.right_drag_guide_for_owner(right_drag_owner, window.right_drag_context())
-            });
+            let right_drag_guide = egui_owns_right_drag
+                .then(|| {
+                    self.right_drag_guide_for_owner(right_drag_owner, window.right_drag_context())
+                })
+                .flatten();
             let ui_scale = self.settings.ui_scale_factor;
             ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx, _class| {
                 let (outer_rect, inner_rect, minimized, maximized, focused, ppp) =
@@ -12027,26 +12065,18 @@ impl App {
                 hwnd_before.as_deref(),
             );
 
-            let right_drag_owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(window.id);
-            let right_drag_live = self.right_drag_pointer_pos(right_drag_owner).is_some();
-            let right_drag_kind = if right_drag_live && window.focused_last_frame && !focused_now {
-                Some(crate::app::DetachedRightDragEventKind::Cancel {
-                    reason: crate::app::DetachedRightDragCancelReason::FocusLost,
-                })
-            } else if right_drag_live && !secondary_down && !secondary_released {
-                Some(crate::app::DetachedRightDragEventKind::Cancel {
-                    reason: crate::app::DetachedRightDragCancelReason::ButtonStateLost,
-                })
-            } else if secondary_pressed || secondary_down || secondary_released {
-                Some(crate::app::DetachedRightDragEventKind::Input {
-                    secondary_pressed,
-                    secondary_down,
-                    secondary_released,
-                    pointer_pos,
-                })
-            } else {
-                None
-            };
+            let right_drag_live =
+                egui_owns_right_drag && self.right_drag_pointer_pos(right_drag_owner).is_some();
+            let right_drag_kind = parked_live_egui_right_drag_event_kind(
+                egui_owns_right_drag,
+                right_drag_live,
+                window.focused_last_frame,
+                focused_now,
+                secondary_pressed,
+                secondary_down,
+                secondary_released,
+                pointer_pos,
+            );
             if let Some(kind) = right_drag_kind {
                 render_batch.right_drag_events.push((
                     window.id,
@@ -34874,6 +34904,66 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parked_live_visible_presenter_emits_no_egui_right_drag_events() {
+        let potential_events = [
+            parked_live_egui_right_drag_event_kind(
+                false, true, true, false, false, false, false, None,
+            ),
+            parked_live_egui_right_drag_event_kind(
+                false, true, true, true, false, false, false, None,
+            ),
+            parked_live_egui_right_drag_event_kind(
+                false,
+                false,
+                true,
+                true,
+                true,
+                true,
+                false,
+                Some(egui::pos2(120.0, 80.0)),
+            ),
+        ];
+
+        assert!(
+            potential_events.into_iter().all(|event| event.is_none()),
+            "native-presenter ownership must suppress egui focus-loss, button-loss, and input events"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parked_live_music_view_keeps_egui_right_drag_events() {
+        let pos = egui::pos2(120.0, 80.0);
+        assert_eq!(
+            parked_live_egui_right_drag_event_kind(
+                true,
+                false,
+                true,
+                true,
+                true,
+                true,
+                false,
+                Some(pos),
+            ),
+            Some(crate::app::DetachedRightDragEventKind::Input {
+                secondary_pressed: true,
+                secondary_down: true,
+                secondary_released: false,
+                pointer_pos: Some(pos),
+            })
+        );
+        assert_eq!(
+            parked_live_egui_right_drag_event_kind(
+                true, true, true, true, false, false, false, None,
+            ),
+            Some(crate::app::DetachedRightDragEventKind::Cancel {
+                reason: crate::app::DetachedRightDragCancelReason::ButtonStateLost,
+            })
+        );
     }
 
     fn setup_zoom_cursor_app() -> crate::app::AppTestEnvForTest {
