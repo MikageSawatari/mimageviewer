@@ -44078,7 +44078,7 @@ mod still_window_mode_key_tests {
         app.current_folder = Some(cache_zip.clone());
         app.archive_source_override = Some(source_zip);
         app.items = vec![GridItem::ZipImage {
-            zip_path: cache_zip,
+            zip_path: cache_zip.clone(),
             entry_name: "bookB/p1.jpg".to_string(),
         }];
         app.thumbnails = vec![ThumbnailState::Pending];
@@ -44087,7 +44087,7 @@ mod still_window_mode_key_tests {
 
         // ZIP 内 DFS の最後の本にいる状態。Ctrl+↓ は ZIP ツリー内では進めず、
         // 呼び出し側の通常フォルダ DFS へフォールバックする。
-        let mut nav = test_zip_nav(&["bookA/p1.jpg", "bookB/p1.jpg"]);
+        let mut nav = test_zip_nav_for(cache_zip, &["bookA/p1.jpg", "bookB/p1.jpg"]);
         nav.enter("bookB/");
         app.zip_nav = Some(nav);
 
@@ -44151,14 +44151,34 @@ mod still_window_mode_key_tests {
         let tmp = app.tmp.path().to_path_buf();
         let fixture = setup_converted_archive_nav_fixture(&mut app, &tmp);
 
-        app.pending_folder_nav_mode = FolderNavMode::Fullscreen;
-        app.pending_folder_nav_steps = 1;
-        app.chain_folder_nav_if_pending();
+        app.chain_folder_nav_if_pending(1, FolderNavMode::Fullscreen);
         let result = wait_folder_nav_result(&mut app);
 
         assert_eq!(result.path.as_ref(), Some(&fixture.expected_next));
         assert_ne!(result.path.as_ref(), Some(&fixture.cache_wrong_next));
         assert!(result.hit_image_folder);
+    }
+
+    #[test]
+    fn load_zip_as_folder_clears_stale_override_when_switching_zip() {
+        let mut app = setup_app();
+        let tmp = app.tmp.path().to_path_buf();
+        let source_zip = tmp.join("library").join("01-source.zip");
+        let cache_zip = tmp.join("cache").join("01-cache.zip");
+        let next_zip = tmp.join("library").join("02-next.zip");
+        write_nav_test_zip(&source_zip);
+        write_nav_test_zip(&cache_zip);
+        write_nav_test_zip(&next_zip);
+
+        app.current_folder = Some(cache_zip.clone());
+        app.archive_source_override = Some(source_zip);
+        app.load_zip_as_folder(next_zip.clone());
+
+        assert_eq!(app.current_folder.as_ref(), Some(&next_zip));
+        assert!(
+            app.archive_source_override.is_none(),
+            "別ZIPへ遷移した時点で古い source override を破棄しないと Ctrl+上下が古い元アーカイブを起点にする"
+        );
     }
 
     #[test]
@@ -44174,13 +44194,10 @@ mod still_window_mode_key_tests {
                 mtime: 0,
             }],
             has_foreign_archives: true,
+            legacy_renames: Vec::new(),
         };
 
-        app.finalize_zip_enumerate(
-            zip_path.clone(),
-            crate::settings::SortOrder::FileName,
-            Ok(enumeration),
-        );
+        app.finalize_zip_enumerate(zip_path.clone(), 0, Ok(enumeration));
 
         let state = app
             .archive_convert
