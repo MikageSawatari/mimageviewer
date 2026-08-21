@@ -692,6 +692,20 @@
     §2 に従い、症状パッチでないことを ClaudeCode / Codex の双方で確認し、同書 §11 に記録する。
 - 回帰確認: 複数ウィンドウモードで RAR / CBR / ZIP / PDF を順に開いてもメイングリッドが不変で、
   各独立ウィンドウには正しいページが表示される。フル機能ウィンドウの従来の一覧遷移は壊さない。
+- **根本原因 (2026-08-21 特定、v3.1.3 では未修正)**: ZIP / PDF はダブルクリック・Enter・
+  ゲームパッドのどの入口でも共通の detached 振り分け ([ui_main.rs:13017](../src/ui_main.rs:13017)、
+  [app.rs:34249](../src/app.rs:34249)) を先に通るが、**typed open plan が本コンテナとして認識するのは
+  PDF / ZIP だけで、`ConvertibleArchive` である RAR / CBR は対象外**
+  ([app.rs:37317](../src/app.rs:37317))。RAR は振り分けを素通りして通常ナビゲーションへ落ち、
+  所有者が `OpenRequestOwner::Navigation` に固定される ([app.rs:18298](../src/app.rs:18298))。
+  RAR は同期的に ZIP として開けず、直読み可否を App-global で probe した**後**に
+  メイン一覧へ遷移する ([archive_convert.rs:675](../src/ui_dialogs/archive_convert.rs:675) /
+  [854](../src/ui_dialogs/archive_convert.rs:854))。
+- **「RAR を ZIP と同じ descriptor に足す」では直らない。** RAR は非ソリッド・入れ子なしだけが
+  直読みで、それ以外は変換対象という分岐がある ([virtual-folders.md:116](virtual-folders.md))。
+- **正しい修正**: 非同期完了に「detached grid 要求の window / request owner」を**型として持たせ**、
+  完了後に detached session の handoff へ入れる。detached open 経路に触れるので §2 / §11 の手順が要る。
+  **visibility 述語や `show_viewport_*` builder の変更は不要と見込まれる。**
 - 規模 / 優先度: Medium / P1。次版修正候補。
 
 ### 1.100 複数の画像ウィンドウを開くと、先に開いたウィンドウでマウスジェスチャが効かなくなる — 専用スレ >>270
@@ -712,7 +726,22 @@
 - 回帰確認: 3 枚以上の独立ウィンドウを開き、前後のウィンドウを交互にアクティブ化して同じ
   ジェスチャが発火する。最新ウィンドウを閉じても先行ウィンドウで継続し、メイングリッドと
   native 動画のジェスチャを壊さない。
-- 規模 / 優先度: Medium / P1。次版修正候補。
+- **根本原因 (2026-08-21 特定、v3.1.3 では未修正)。これは R2 そのもの**:
+  - `MouseGestureState` が持つ識別情報は表示種別だけで、**window ID / viewport ID / session ID を
+    持たない** ([ring_shortcut.rs:53](../src/ring_shortcut.rs:53))。状態は
+    `ViewerContextBundle` ではなく **App に 1 個だけ**ある ([app.rs:10005](../src/app.rs:10005))。
+    発火時に owner を再解決せず、その時点で mount されている context へ適用する
+  - **非アクティブな窓が集める pointer 情報は `any_pressed` / `any_released` だけ**で、
+    右ドラッグの座標列は状態機械に届かない ([ui_fullscreen.rs:11684](../src/ui_fullscreen.rs:11684))
+  - **アクティブ化は press ではなく release で起きる** ([app.rs:39217](../src/app.rs:39217))。
+    この挙動は既存テストで意図的に固定されている ([app/tests.rs:32554](../src/app/tests.rs:32554))
+  - したがって**非アクティブな窓で始めた最初の右ドラッグは構造上必ず失われる**。
+    リングショートカットと短い右クリックも同じ入力分岐を共有する
+  - `last_input_surface` は `MainWindow` / `Viewer` の二択で全 viewer window を区別しない
+    ([detached_window_manager.rs:452](../src/app/detached_window_manager.rs:452))
+- **R2 (`DetachedWindowRuntime` + 状態の集約) を待つ。** ジェスチャ状態を window 所有にするのは
+  R2 の守備範囲であり、App 側に識別子を足す小修正は憲法 3 に抵触する。
+- 規模 / 優先度: Medium / P1。**R2 待ち** (単独では直せない)。
 
 ### 1.101 動画の上部 HUD / 下部シークバーを個別に固定表示できるようにする — 専用スレ >>271
 
