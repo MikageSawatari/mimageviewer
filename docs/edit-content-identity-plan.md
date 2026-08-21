@@ -5,7 +5,7 @@ OS 側 (エクスプローラー等) でファイルを移動・コピーする�
 本機能は **ファイル内容のハッシュ**を identity として編集内容を再結合し、
 利用者に確認したうえで新しい場所へ複製する。
 
-- 状態: **設計確定 / A1 (台帳と記録)・A2 (検出) 実装済み、A3 未実装** (2026-08-21)
+- 状態: **設計確定 / A1 (台帳と記録)・A2 (検出)・A3a (コピーエンジン) 実装済み、A3b (確認 UI) 未実装** (2026-08-21)
 - 関連: [preset-and-adjustment.md §9](preset-and-adjustment.md) (フォルダ側サイドカー)、
   [src/rename_key_migration.rs](../src/rename_key_migration.rs) (アプリ内リネーム移行)、
   [src/metadata_transfer.rs](../src/metadata_transfer.rs) (明示的なメタ情報書き出し / 取り込み)
@@ -21,7 +21,7 @@ OS 側 (エクスプローラー等) でファイルを移動・コピーする�
 | 層 | 実体 | 効く場面 | 効かない場面 |
 | --- | --- | --- | --- |
 | フォルダ側サイドカー `mimageviewer.dat` | [src/sidecar.rs](../src/sidecar.rs)、既定 ON | **フォルダごと**の移動 / コピー (相対キー) | 単体ファイルのコピー、フォルダ外への移動 |
-| リネーム移行 | [src/rename_key_migration.rs](../src/rename_key_migration.rs) | **アプリ内**リネーム (21 ストア一括) | アプリ外のリネーム / 移動 (モジュール冒頭に「将来課題」と明記済み) |
+| リネーム移行 | [src/rename_key_migration.rs](../src/rename_key_migration.rs) | **アプリ内**リネーム (現行 `STORES` 22 descriptor) | アプリ外のリネーム / 移動 (モジュール冒頭に「将来課題」と明記済み) |
 | ポータブルメタ情報 | [src/metadata_transfer.rs](../src/metadata_transfer.rs) | 明示的な書き出し / 取り込み | 自動ではない。照合も **パス + size/mtime** で内容ハッシュではない |
 
 さらに調査で判明した点として、**サイドカーがミラーするのは
@@ -46,6 +46,11 @@ OS 側 (エクスプローラー等) でファイルを移動・コピーする�
   id 再採番が要る (Phase 2)
 - **ZIP エントリ単位の内容一致** (ZIP から展開したばら画像 ↔ ZIP 内エントリ): Phase 2
 - **PDF ページ単位の内容一致**: 対応するバイト同一性が無いため原理的に不可 (容器一致で足りる)
+- **PDF パスワード**: リネーム移行 (`rename_key_migration::run_at` の step 2) は
+  DPAPI 保存済みパスワードを新キーへ移すが、**復元では移さない** (A3a 実装時に確認、2026-08-21)。
+  リネームは同じファイルなので移さないと開けなくなるが、復元は**別のパスにある別ファイル**で、
+  §2 の復元範囲 (編集・表示状態・★・タグ) にパスワードは入っていない。資格情報を利用者の
+  明示操作なしに増やさない側に倒す。コピー先は初回オープン時に 1 回入力してもらう
 
 ---
 
@@ -257,7 +262,7 @@ metadata_transfer は 2 と 4 が同時に存在するとエラーにする (imp
 - `App::copy_book_page_edit_key` ([src/app.rs:30612](../src/app.rs:30612)) — 型付き 8 ストア横断コピー。
   ただし **App のハンドル経由 = UI スレッド前提**で worker から呼べない。
 - `rename_key_migration::migrate_store` — **DB ファイルを直接開く worker 実装**で、
-  `STORES` 表 (21 ストア) を網羅。
+  `STORES` 表 (A1 の `edit_origin` 追加後は 22 descriptor) を網羅。
 
 復元は worker で走るので、**`rename_key_migration` (または同じ `STORES` を共有する兄弟モジュール)
 に `copy_store` / `copy_exact` / `copy_prefix` を足すのが構造的に正しい**。同じ表を使うので、
@@ -289,6 +294,20 @@ INSERT OR IGNORE INTO t (c1, c2, ...) SELECT ?new, c2, ... FROM t WHERE c1 = ?ol
    `clear_tags_cache()` — `finish_book_page_edit_mapping`
    ([src/app.rs:30752](../src/app.rs:30752)) と同じ後始末を再利用する。
 4. 復元先にも `edit_origin` 行を作る (以後そのファイルが新たなコピー元になり得る)。
+
+**A3a 実装メモ (2026-08-21)**:
+
+- `restore_candidate_at(data_dir, candidate, source)` は App / egui に依存せず、worker または
+  テストから直接呼べる。物理 path の exact / `::` prefix と、変換アーカイブの予測 cache
+  path の exact / `::` prefix をまとめて処理する。
+- copy は同じ `STORES` を走査し、`unique: true` の 21 descriptor を対象にする。
+  現行 22 descriptor のうち `unique: false` の `video_bookmarks` だけは id 再採番が必要なため
+  v1 対象外。正規化は各 descriptor の `normalization` から決める。
+- worker report は DB copy 後の destination 状態から sidecar mirror と 5 種類の presence 差分を
+  作る。A3b は既存 App owner へそれを適用し、`finish_book_page_edit_mapping` と同じ cache
+  invalidation を呼ぶ。sidecar の同期 flush は増やさない。
+- target の `edit_origin` は `has_restorable_content = 1` へ昇格し、A2 の次回 index で復元元に
+  なる。`restore_declined` の `INSERT OR IGNORE` API は用意するが、A3a 自身は記録しない。
 
 ---
 
@@ -324,7 +343,8 @@ Phase 1 は 1 回の差分にすると大きすぎてレビューが効かない
 | --- | --- | --- | --- |
 | **A1 台帳と記録** | `content_identity.db` (§3.2)、3 段照合のハッシュ計算 (§3.1)、編集確定点からの記録 worker (§3.3)、`STORES` への `file_key` 追加 | 新規モジュール + 編集保存経路のフック | 編集すると台帳に 1 行増える。`(file_key, size, hashed_mtime)` が同じなら再計算しない。**UI は何も変わらない** |
 | **A2 検出** | 起動時の台帳ロード、フォルダ読み込み完了時の段 0 照合、`GlobalIoSemaphore` Low の検出 worker、設定 1 個 (§7) | フォルダ走査完了フック + 新規 worker + 環境設定 | 候補が mpsc で UI へ届く (ログで確認)。**まだウィンドウは出さない**。設定 OFF で worker が起動しない |
-| **A3 復元** | `STORES` 駆動の `copy_store` / `copy_exact` / `copy_prefix` (§8.1)、変換アーカイブの 4 面キー (§4)、非モーダル復元ウィンドウ (§6)、`restore_declined`、復元後の後始末 (§8.2) | `rename_key_migration` の兄弟 + 新規ダイアログ | §9 のテストが全部通る |
+| **A3a コピーエンジン** | `STORES` 駆動の `copy_store` / `copy_exact` / `copy_prefix` (§8.1)、変換アーカイブの 4 面キー (§4)、`restore_declined` 書き込み API、復元後の後始末境界 (§8.2) | `rename_key_migration` の copy sibling + `content_identity/restore.rs` | App / egui 非依存の入口をテストだけから駆動し、21 unique descriptor・4 面・後始末 report を検証する。**UI は何も変わらない** |
+| **A3b 復元 UI** | 非モーダル復元ウィンドウ (§6)、A2 候補との配線、選択に応じた復元 / `restore_declined`、A3a report の App owner への適用 | 新規ダイアログ + A2 poll 配線 | §9 の UI / lifecycle を含む残りのテストが全部通る |
 
 **A2 実装時の確定事項 (2026-08-21)**:
 

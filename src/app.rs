@@ -101,6 +101,9 @@ fn thumbnail_keep_bounds_for_count(
 mod cache_ops;
 mod color_filter;
 mod content_identity_detection;
+// A3a は A3b 用の適用境界だけを先に置くため、現段階では production caller がない。
+#[allow(dead_code)]
+mod content_identity_restore;
 #[cfg(windows)]
 mod detached_window_manager;
 mod facet_name_filter;

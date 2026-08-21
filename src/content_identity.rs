@@ -15,6 +15,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 
+#[cfg_attr(not(test), allow(dead_code))]
+mod restore;
+
+// A3a はテストからだけ駆動し、A3b が直後にこの入口を配線する。
+#[allow(unused_imports)]
+pub(crate) use restore::{
+    ContentRestoreReport, RestorePresence, RestoreSidecarMirror, record_restore_declined_at,
+    restore_candidate_at,
+};
+
 const HEAD_HASH_BYTES: u64 = 64 * 1024;
 const HASH_CHUNK_BYTES: usize = 256 * 1024;
 
