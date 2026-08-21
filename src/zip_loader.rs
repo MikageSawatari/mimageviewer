@@ -1222,4 +1222,54 @@ mod tests {
         let d3 = enumerate_image_entries_detailed(&z3).unwrap();
         assert!(!d3.has_foreign_archives);
     }
+
+    #[test]
+    fn enumerate_detects_foreign_archives_deep_inside_nested_zip_tree() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // outer.zip
+        //   shelf/vol01.zip
+        //     pages/p01.jpg
+        //     extras/raw.rar      (中身はゴミでよい。検出は拡張子ベース)
+        //     extras/deep.7z
+        //   shelf/vol02.zip
+        //     pages/p02.jpg
+        let vol01_path = dir.path().join("vol01_src.zip");
+        write_test_zip(
+            &vol01_path,
+            &[
+                ("pages/p01.jpg", b"P1"),
+                ("extras/raw.rar", b"not a rar"),
+                ("extras/deep.7z", b"not a 7z"),
+            ],
+        );
+        let vol02_path = dir.path().join("vol02_src.zip");
+        write_test_zip(&vol02_path, &[("pages/p02.jpg", b"P2")]);
+        let vol01_bytes = std::fs::read(&vol01_path).unwrap();
+        let vol02_bytes = std::fs::read(&vol02_path).unwrap();
+        let outer = dir.path().join("mixed_tree.zip");
+        write_test_zip(
+            &outer,
+            &[
+                ("shelf/vol01.zip", &vol01_bytes),
+                ("shelf/vol02.zip", &vol02_bytes),
+                ("cover.jpg", b"COVER"),
+            ],
+        );
+
+        let d = enumerate_image_entries_detailed(&outer).unwrap();
+        assert!(
+            d.has_foreign_archives,
+            "ネスト ZIP のさらに下にある RAR/7z でも変換提案フラグを立てる"
+        );
+        let names: Vec<_> = d.entries.iter().map(|e| e.entry_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "shelf/vol01.zip/pages/p01.jpg",
+                "shelf/vol02.zip/pages/p02.jpg",
+                "cover.jpg",
+            ]
+        );
+    }
 }

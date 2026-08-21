@@ -44035,6 +44035,169 @@ mod still_window_mode_key_tests {
         );
     }
 
+    fn write_nav_test_zip(path: &std::path::Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let file = std::fs::File::create(path).unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        let opts: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zw.start_file("page.jpg", opts).unwrap();
+        std::io::Write::write_all(&mut zw, b"page").unwrap();
+        zw.finish().unwrap();
+    }
+
+    struct ConvertedArchiveNavFixture {
+        expected_next: std::path::PathBuf,
+        cache_wrong_next: std::path::PathBuf,
+    }
+
+    fn setup_converted_archive_nav_fixture(
+        app: &mut App,
+        tmp: &std::path::Path,
+    ) -> ConvertedArchiveNavFixture {
+        use crate::grid_item::GridItem;
+
+        let source_dir = tmp.join("library");
+        let cache_dir = tmp.join("archive-cache-like");
+        let source_zip = source_dir.join("01-source.zip");
+        let expected_next = source_dir.join("02-next");
+        let cache_zip = cache_dir.join("01-cache.zip");
+        let cache_wrong_next = cache_dir.join("02-cache-next");
+
+        write_nav_test_zip(&source_zip);
+        write_nav_test_zip(&cache_zip);
+        std::fs::create_dir_all(&expected_next).unwrap();
+        std::fs::write(expected_next.join("p.jpg"), b"expected").unwrap();
+        std::fs::create_dir_all(&cache_wrong_next).unwrap();
+        std::fs::write(cache_wrong_next.join("p.jpg"), b"wrong").unwrap();
+
+        app.settings.sort_order = crate::settings::SortOrder::FileName;
+        app.settings.folder_skip_limit = 8;
+        app.current_folder = Some(cache_zip.clone());
+        app.archive_source_override = Some(source_zip);
+        app.items = vec![GridItem::ZipImage {
+            zip_path: cache_zip,
+            entry_name: "bookB/p1.jpg".to_string(),
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.fullscreen_idx = Some(0);
+
+        // ZIP 内 DFS の最後の本にいる状態。Ctrl+↓ は ZIP ツリー内では進めず、
+        // 呼び出し側の通常フォルダ DFS へフォールバックする。
+        let mut nav = test_zip_nav(&["bookA/p1.jpg", "bookB/p1.jpg"]);
+        nav.enter("bookB/");
+        app.zip_nav = Some(nav);
+
+        ConvertedArchiveNavFixture {
+            expected_next,
+            cache_wrong_next,
+        }
+    }
+
+    fn wait_folder_nav_result(app: &mut App) -> FolderNavResult {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(result) = app.poll_folder_nav() {
+                return result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "folder nav worker did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn fullscreen_ctrl_nav_exits_converted_zip_from_source_path() {
+        let mut app = setup_app();
+        let tmp = app.tmp.path().to_path_buf();
+        let fixture = setup_converted_archive_nav_fixture(&mut app, &tmp);
+        let ctx = egui::Context::default();
+
+        app.handle_fullscreen_ctrl_nav_context(&ctx, 0, true, false);
+        let result = wait_folder_nav_result(&mut app);
+
+        assert_eq!(result.path.as_ref(), Some(&fixture.expected_next));
+        assert_ne!(
+            result.path.as_ref(),
+            Some(&fixture.cache_wrong_next),
+            "変換キャッシュ ZIP の物理パスを起点にすると archive_cache 側へ逸れる"
+        );
+        assert!(result.hit_image_folder);
+    }
+
+    #[test]
+    fn fullscreen_sibling_nav_exits_converted_zip_from_source_path() {
+        let mut app = setup_app();
+        let tmp = app.tmp.path().to_path_buf();
+        let fixture = setup_converted_archive_nav_fixture(&mut app, &tmp);
+        let ctx = egui::Context::default();
+
+        app.handle_fullscreen_sibling_nav_context(&ctx, 0, true, false);
+        let result = wait_folder_nav_result(&mut app);
+
+        assert_eq!(result.path.as_ref(), Some(&fixture.expected_next));
+        assert_ne!(result.path.as_ref(), Some(&fixture.cache_wrong_next));
+        assert!(result.hit_image_folder);
+    }
+
+    #[test]
+    fn pending_ctrl_nav_steps_use_source_path_after_converted_zip_landing() {
+        let mut app = setup_app();
+        let tmp = app.tmp.path().to_path_buf();
+        let fixture = setup_converted_archive_nav_fixture(&mut app, &tmp);
+
+        app.pending_folder_nav_mode = FolderNavMode::Fullscreen;
+        app.pending_folder_nav_steps = 1;
+        app.chain_folder_nav_if_pending();
+        let result = wait_folder_nav_result(&mut app);
+
+        assert_eq!(result.path.as_ref(), Some(&fixture.expected_next));
+        assert_ne!(result.path.as_ref(), Some(&fixture.cache_wrong_next));
+        assert!(result.hit_image_folder);
+    }
+
+    #[test]
+    fn zip_foreign_archive_offer_targets_whole_outer_zip() {
+        let mut app = setup_app();
+        let zip_path = app.tmp.path().join("outer.zip");
+        write_nav_test_zip(&zip_path);
+
+        let enumeration = crate::zip_loader::ZipEnumeration {
+            entries: vec![crate::zip_loader::ZipImageEntry {
+                entry_name: "native.zip/p01.jpg".to_string(),
+                uncompressed_size: 1,
+                mtime: 0,
+            }],
+            has_foreign_archives: true,
+        };
+
+        app.finalize_zip_enumerate(
+            zip_path.clone(),
+            crate::settings::SortOrder::FileName,
+            Ok(enumeration),
+        );
+
+        let state = app
+            .archive_convert
+            .as_ref()
+            .expect("foreign archive flag should offer ZIP expansion");
+        assert_eq!(state.src_path, zip_path);
+        assert_eq!(state.format, ArchiveFormat::Zip);
+        assert!(
+            app.archive_source_override.is_none(),
+            "提案時点ではまだキャッシュへ振り替えず、変換承認後に外側ZIP全体を置換する"
+        );
+        assert!(
+            app.zip_nav.is_some(),
+            "キャンセルしても通常ZIPツリー閲覧は継続できる"
+        );
+    }
+
     #[test]
     #[cfg(windows)]
     fn native_video_hud_dimmed_only_during_parked_live_poll() {

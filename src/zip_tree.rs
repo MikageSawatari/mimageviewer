@@ -870,6 +870,68 @@ mod tests {
     }
 
     #[test]
+    fn materialize_mixed_archive_segments_preserves_full_dir_prefixes() {
+        let t = tree(&[
+            "pack/native.zip/ch01/p01.jpg",
+            "pack/native.zip/ch02/p01.jpg",
+            "pack/foreign.rar/extras/p02.jpg",
+            "pack/foreign.7z/p03.jpg",
+            "loose_folder/p04.jpg",
+        ]);
+
+        let (items, _) = t.materialize_level(&s(&["pack"]), SortOrder::FileName);
+        let dirs: Vec<_> = items
+            .iter()
+            .filter_map(|it| match it {
+                GridItem::ZipDir {
+                    dir_prefix,
+                    is_archive,
+                    representative,
+                    ..
+                } => Some((dir_prefix.as_str(), *is_archive, representative.as_deref())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dirs,
+            vec![
+                ("pack/foreign.7z/", true, Some("pack/foreign.7z/p03.jpg")),
+                (
+                    "pack/foreign.rar/",
+                    true,
+                    Some("pack/foreign.rar/extras/p02.jpg")
+                ),
+                (
+                    "pack/native.zip/",
+                    true,
+                    Some("pack/native.zip/ch01/p01.jpg")
+                ),
+            ]
+        );
+
+        let (items, _) = t.materialize_level(&s(&["pack", "native.zip"]), SortOrder::FileName);
+        let nested_dirs: Vec<_> = items
+            .iter()
+            .filter_map(|it| match it {
+                GridItem::ZipDir {
+                    dir_prefix,
+                    is_archive,
+                    ..
+                } => Some((dir_prefix.as_str(), *is_archive)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            nested_dirs,
+            vec![
+                ("pack/native.zip/ch01/", false),
+                ("pack/native.zip/ch02/", false),
+            ],
+            "子ZIP内の通常フォルダは親ZIP名を含むフルprefixで表示する"
+        );
+    }
+
+    #[test]
     fn materialize_representative_sort_aware() {
         // 列挙順は [b, a] だが FileName sort では代表は a.jpg。
         let t = tree(&["book/b.jpg", "book/a.jpg"]);
