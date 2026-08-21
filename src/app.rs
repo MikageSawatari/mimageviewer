@@ -100,6 +100,7 @@ fn thumbnail_keep_bounds_for_count(
 
 mod cache_ops;
 mod color_filter;
+mod content_identity_detection;
 #[cfg(windows)]
 mod detached_window_manager;
 mod facet_name_filter;
@@ -9686,6 +9687,16 @@ pub struct App {
     /// 編集・表示状態・★・タグの commit 後に、対象の物理ファイルを ledger worker へ渡す。
     /// この handle 自体は I/O を行わず、全ファイル読み出しは worker 側に閉じる。
     pub(crate) content_identity_recorder: Option<crate::content_identity::ContentIdentityRecorder>,
+    pub(crate) content_identity_index_load_pending:
+        Option<crate::content_identity::ContentIdentityIndexLoadPending>,
+    pub(crate) content_identity_index: crate::content_identity::ContentIdentityIndex,
+    pub(crate) content_identity_index_loaded: bool,
+    pub(crate) content_identity_updates_before_load: Vec<crate::content_identity::LedgerEntry>,
+    pub(crate) content_identity_detection_pending:
+        Option<crate::content_identity::ContentIdentityDetectionPending>,
+    /// A3 が非モーダル画面へ渡すまで保持する、現在の物理フォルダだけの候補。
+    pub(crate) content_restore_candidates: Vec<crate::content_identity::RestoreCandidate>,
+    pub(crate) content_identity_fallback_io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
     /// 表示パイプライン入力の世代番号。
     ///
     /// raw decode / AI / 補正など、消しゴム確定結果の入力になるレイヤが変わるたび
@@ -12917,6 +12928,18 @@ impl App {
         crate::perf::emit_ms("startup", "db_open_view_trim", 0, t);
         // DB open / schema 作成も含めて worker 内で行う。ここでは thread spawn のみ。
         let content_identity_recorder = crate::content_identity::ContentIdentityRecorder::spawn();
+        // A2 の全件索引は検出設定が ON のときだけ別 worker で読む。A1 recorder は
+        // この設定を参照せず、OFF 中も編集確定時の記録を継続する。
+        let content_identity_index_load_pending = settings
+            .edit_restore_prompt_enabled
+            .then(crate::content_identity::ContentIdentityIndexLoadPending::spawn)
+            .flatten();
+        let content_identity_index_loaded =
+            settings.edit_restore_prompt_enabled && content_identity_index_load_pending.is_none();
+        let content_identity_fallback_io_sem =
+            Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(
+                settings.indexer_speed_profile.io_permits().max(1),
+            ));
 
         let t = std::time::Instant::now();
         let book_resume_db = crate::book_resume_db::BookResumeDb::open().ok();
@@ -13209,6 +13232,13 @@ impl App {
             view_trim_save_pending: false,
             view_trim_db,
             content_identity_recorder,
+            content_identity_index_load_pending,
+            content_identity_index: crate::content_identity::ContentIdentityIndex::default(),
+            content_identity_index_loaded,
+            content_identity_updates_before_load: Vec::new(),
+            content_identity_detection_pending: None,
+            content_restore_candidates: Vec::new(),
+            content_identity_fallback_io_sem,
             input_generation: std::collections::HashMap::new(),
             fs_pending: ItemsGenerationMap::with_discard("fs_pending", cancel_fs_pending_value),
             fullscreen_pdf_promotion: FullscreenPdfPromotionState::default(),
@@ -24207,6 +24237,9 @@ impl App {
                 ],
             );
         }
+        if !detached_physical {
+            self.maybe_start_content_identity_detection();
+        }
     }
 
     fn set_items_generation(&mut self, items_generation: u64) {
@@ -24275,6 +24308,9 @@ impl App {
         refresh_container_metadata: bool,
     ) {
         debug_assert_eq!(items.len(), image_metas.len());
+        if !self.navigation_scope.is_detached_physical() {
+            self.cancel_content_identity_detection();
+        }
         self.persist_pending_view_trim_state();
         self.items = items;
         self.image_metas = image_metas;
@@ -66099,6 +66135,7 @@ impl eframe::App for App {
         let items_gen_pre_late = self.items_generation;
 
         self.poll_edit_preview_cache(ctx);
+        self.poll_content_identity_detection(ctx);
         self.reconcile_pinned_adjustment_refreshes();
         self.poll_smart_folder_metadata_refresh(ctx);
         self.poll_thumbnails(ctx, ThumbnailConsumptionPolicy::Grid);

@@ -1741,6 +1741,7 @@ impl App {
                     self.settings.edit_preview_cache_enabled,
                     self.settings.edit_preview_cache_max_bytes,
                 );
+                let old_edit_restore_prompt_enabled = self.settings.edit_restore_prompt_enabled;
 
                 // VST3 enable 状態 + チェーン構成の変化を検出してホットリロード。
                 let old_vst3_enabled = self.settings.vst3_enabled;
@@ -1778,6 +1779,7 @@ impl App {
                 // Settings に追加した場合はここにも追記が必要。
                 prepare_preferences_settings_for_commit(&mut state.settings, &mut self.settings);
                 self.settings = state.settings;
+                self.sync_content_identity_detection_setting(old_edit_restore_prompt_enabled);
                 if old_creative_luts != self.settings.creative_luts {
                     if self
                         .settings
@@ -2742,6 +2744,40 @@ mod tests {
             });
         harness.run();
         harness.snapshot("preferences_parallelism_pdf_count");
+    }
+
+    #[test]
+    fn preferences_folder_edit_restore_snapshot() {
+        use egui_kittest::Harness;
+
+        let mut state = PreferencesState::from_settings(
+            &crate::settings::Settings::default(),
+            None,
+            false,
+            0,
+            0,
+            0,
+        );
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(620.0, 520.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        page_folder(ui, &mut state);
+                    });
+                });
+            });
+        harness.run();
+        harness.snapshot("preferences_folder_edit_restore");
     }
 
     #[test]

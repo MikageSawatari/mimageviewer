@@ -392,6 +392,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["Ctrl", "フォルダ移動", "画像なし"]
     ),
     entry!(
+        "folder/edit-restore",
+        Folder,
+        "コピー・移動したファイルの編集内容を復元するか確認する",
+        ["編集内容", "復元", "コピー", "移動", "照合"]
+    ),
+    entry!(
         "folder/backup",
         Folder,
         "フォルダに補正・マスク設定のバックアップを保存する",

@@ -1751,6 +1751,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `network_data_dir_notice_dismissed_for` | Option\<String\> | None | ネットワーク上の data_dir に関する起動案内を「この保存先では今後表示しない」で抑止したパス。Windows の区切り・大文字小文字・通常 UNC / verbatim UNC の同値表記を正規化して比較し、別の保存先なら再案内する |
 | `pause_indexer_while_minimized` | bool | false | タスクトレイ常駐中にファイル監視 / インデックス更新を一時停止する。OFF でも常駐中は I/O 並列度を絞る |
 | `folder_thumb_depth` | u32 | 3 | フォルダ代表画像の探索最大階層数（0 で直接の子のみ） |
+| `edit_restore_prompt_enabled` | bool | true | 通常の物理フォルダを開いたとき、コピー・移動元と同じ内容のファイルを検出する。OFF では size のメモリ照合を含む検出経路を開始せず、照合目的のファイル読み取りも行わない。編集確定時の台帳記録は設定にかかわらず継続する |
 | `sidecar_backup_enabled` | bool | true | フォルダ直下に `mimageviewer.dat` (Hidden+System 属性の JSON) を作り、補正・消しゴムマスクの設定をバックアップする。フォルダ丸ごと別ドライブへ移動しても設定が保持される。OFF 時は読み書き両方スキップ |
 | `tag_sidecar_backup_enabled` | bool | false | タグをフォルダ直下の `mimageviewer.dat` にもバックアップする。`tags.db` が正本で、この設定は移動時復元用の opt-in。フォルダタグは対象外。OFF 時はタグバックアップの読み書きをスキップ |
 | `metadata_export_recursive` | bool | true | 明示メタ情報エクスポートでサブフォルダの中身も再帰走査する。ダイアログで最後に選んだ値を保存し、次回の初期値に使う |

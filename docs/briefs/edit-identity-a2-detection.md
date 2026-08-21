@@ -1,5 +1,7 @@
 # A2: コピー・移動先の検出 (編集内容の復元 Phase 1 の第 2 段)
 
+**実装済み (2026-08-21)。** A3 の復元 UI / コピー処理は未実装。
+
 **正本は [docs/edit-content-identity-plan.md](../edit-content-identity-plan.md)。**
 着手前に全文を読むこと。特に §3.1 (3 段照合)、§5 (検出フロー)、§7 (設定)、§10.1 (段の分け方)。
 A1 (台帳と記録) は実装済みで、`src/content_identity.rs` にある。
@@ -55,8 +57,11 @@ A1 (台帳と記録) は実装済みで、`src/content_identity.rs` にある。
 - 段 1 (先頭 64KB + size) → 段 2 (全体) の順。**段 1 が外れたら段 2 を読まない。**
   ハッシュ関数は A1 の `stage1_head_hash` / `stage2_full_hash` をそのまま使う。
   **新しいハッシュ実装を書かない。**
-- 結果は台帳へキャッシュし、**再訪時に再計算しない** (§5-3)。
-  つまり検出先のファイルも `edit_origin` に載る。**ここで A1 の trigger をどう使うかを
+- 結果は台帳へ `has_restorable_content = 0` の hash cache として記録し、
+  対象の stat 済み `(size, hashed_mtime)` が一致する再訪では保存済み
+  `head_hash` / `full_hash` を使って**ファイルを読まない** (§5-3)。
+  検出 cache 行は段 0 の復元元 index へ載せず、既存の
+  `has_restorable_content = 1` を下げない。**ここで A1 の trigger をどう使うかを
   決めて報告すること** — 検出は編集ではないので `last_edit_at` を進めてはならない。
 - 候補が複数ある場合 (同一内容が複数箇所で別々に編集されている) は
   **`last_edit_at` が新しいものを既定**にし、他も候補として持つ (§5)。

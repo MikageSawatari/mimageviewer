@@ -4163,6 +4163,11 @@ pub struct Settings {
     pub colorize_preset_slots: crate::colorize::ColorizePresetSlots,
 
     // ── フォルダ側サイドカー ───────────────────────────────────
+    /// 物理フォルダを開いたとき、内容が同じ既存ファイルの編集内容を復元する候補を探す。
+    /// OFF は検出だけを完全停止し、編集確定時の content identity 記録は止めない。
+    #[serde(default = "default_true")]
+    pub edit_restore_prompt_enabled: bool,
+
     /// 補正・消しゴムマスク設定をフォルダごとのサイドカーファイル
     /// (`mimageviewer.dat`、隠し+システム属性) にバックアップする。
     /// OFF 時は読み書き両方スキップ (既存の `.dat` は削除しない)。
@@ -5514,6 +5519,7 @@ impl Default for Settings {
             post_filter_global_preset_stash: PostFilterDowngradeStash::default(),
             post_filter_preset_slot_stashes: [PostFilterDowngradeStash::default(); 10],
             colorize_preset_slots: crate::colorize::ColorizePresetSlots::default(),
+            edit_restore_prompt_enabled: true,
             sidecar_backup_enabled: true,
             tag_sidecar_backup_enabled: false,
             metadata_export_recursive: true,
@@ -7592,6 +7598,13 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edit_restore_prompt_defaults_on_when_missing() {
+        assert!(Settings::default().edit_restore_prompt_enabled);
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert!(loaded.edit_restore_prompt_enabled);
+    }
 
     #[test]
     fn pdf_worker_count_defaults_and_clamps_supported_range() {

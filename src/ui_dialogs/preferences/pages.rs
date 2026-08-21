@@ -6831,6 +6831,20 @@ pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
         ui.add_space(12.0);
     });
+    anchored(ui, state, "folder/edit-restore", |ui, state| {
+        let s = &mut state.settings;
+        ui.checkbox(
+            &mut s.edit_restore_prompt_enabled,
+            "コピー・移動したファイルの編集内容を復元するか確認する",
+        );
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("OFF にすると照合のためのファイル読み取りを一切行いません")
+                .size(11.0)
+                .color(ui.visuals().weak_text_color()),
+        );
+        ui.add_space(12.0);
+    });
     anchored(ui, state, "folder/backup", |ui, state| {
         let s = &mut state.settings;
         ui.label(egui::RichText::new("設定のバックアップ").strong());

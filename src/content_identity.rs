@@ -4,7 +4,7 @@
 //! ファイル読み出し・SHA-256・SQLite はすべて専用 worker が行う。
 //! 新規ストアなので旧スキーマの migration は持たず、初回 open で正本スキーマを作る。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
@@ -24,6 +24,20 @@ pub(crate) enum ContentIdentityTrigger {
     Edit,
 }
 
+/// `edit_origin` への観測が復元可能な状態そのものか、検出時の hash cache だけかを表す。
+/// `ContentIdentityTrigger` は最終編集時刻を進めるかどうかの軸なので、混同しない。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObservationRole {
+    RestorableContent,
+    DetectionCache,
+}
+
+impl ObservationRole {
+    fn has_restorable_content(self) -> bool {
+        matches!(self, Self::RestorableContent)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ContentKind {
     Image,
@@ -39,6 +53,16 @@ impl ContentKind {
             Self::Zip => "zip",
             Self::Pdf => "pdf",
             Self::Convertible => "convertible",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "image" => Some(Self::Image),
+            "zip" => Some(Self::Zip),
+            "pdf" => Some(Self::Pdf),
+            "convertible" => Some(Self::Convertible),
+            _ => None,
         }
     }
 }
@@ -130,6 +154,135 @@ pub(crate) struct RecordedFileState {
     pub(crate) hashed_mtime: i64,
 }
 
+/// `edit_origin` のメモリ表現。A2 の段 0 はこの snapshot だけを参照し、
+/// ファイルや SQLite には触れない。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LedgerEntry {
+    pub(crate) file_key: String,
+    pub(crate) size: u64,
+    pub(crate) head_hash: String,
+    pub(crate) full_hash: Option<String>,
+    pub(crate) hashed_mtime: i64,
+    pub(crate) kind: ContentKind,
+    pub(crate) last_edit_at: i64,
+    pub(crate) has_restorable_content: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ContentIdentityIndex {
+    entries_by_size: BTreeMap<u64, Vec<LedgerEntry>>,
+    size_by_file_key: HashMap<String, u64>,
+}
+
+impl ContentIdentityIndex {
+    fn from_entries(entries: Vec<LedgerEntry>) -> Self {
+        let mut index = Self::default();
+        for entry in entries {
+            index.upsert(entry);
+        }
+        index
+    }
+
+    pub(crate) fn contains_file_key(&self, file_key: &str) -> bool {
+        self.size_by_file_key.contains_key(file_key)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.size_by_file_key.len()
+    }
+
+    pub(crate) fn entries_for_size(&self, size: u64) -> &[LedgerEntry] {
+        self.entries_by_size
+            .get(&size)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn upsert(&mut self, entry: LedgerEntry) {
+        // DB の flag は 0 -> 1 の単調遷移。遅れて届いた detection cache (0) が、
+        // 先に届いた A1 の復元元更新 (1) をメモリ索引から消してはならない。
+        if !entry.has_restorable_content {
+            return;
+        }
+        if let Some(old_size) = self.size_by_file_key.remove(&entry.file_key) {
+            let remove_bucket = if let Some(entries) = self.entries_by_size.get_mut(&old_size) {
+                entries.retain(|existing| existing.file_key != entry.file_key);
+                entries.is_empty()
+            } else {
+                false
+            };
+            if remove_bucket {
+                self.entries_by_size.remove(&old_size);
+            }
+        }
+        self.size_by_file_key
+            .insert(entry.file_key.clone(), entry.size);
+        self.entries_by_size
+            .entry(entry.size)
+            .or_default()
+            .push(entry);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DetectionTarget {
+    pub(crate) source: ContentIdentitySource,
+    pub(crate) file_key: String,
+    pub(crate) size: u64,
+    origins: Vec<LedgerEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RestoreSourceCandidate {
+    pub(crate) file_key: String,
+    pub(crate) path: PathBuf,
+    pub(crate) kind: ContentKind,
+    pub(crate) last_edit_at: i64,
+    pub(crate) source_exists: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RestoreCandidate {
+    pub(crate) target_key: String,
+    pub(crate) target_path: PathBuf,
+    pub(crate) target_kind: ContentKind,
+    pub(crate) full_hash: String,
+    pub(crate) sources: Vec<RestoreSourceCandidate>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DetectionResult {
+    pub(crate) items_generation: u64,
+    pub(crate) folder_key: String,
+    pub(crate) candidates: Vec<RestoreCandidate>,
+    pub(crate) ledger_updates: Vec<LedgerEntry>,
+}
+
+/// A2 段 0。呼び出し側は物理フォルダ一覧と既存編集なしを確認済みの item だけを渡す。
+/// この関数はメモリ上の size index を見るだけで、I/O は一切行わない。
+pub(crate) fn stage0_target(
+    index: &ContentIdentityIndex,
+    source: ContentIdentitySource,
+    size: u64,
+) -> Option<DetectionTarget> {
+    let file_key = crate::path_key::normalize_keep_drive(&source.path);
+    if index.contains_file_key(&file_key) {
+        return None;
+    }
+    let origins = index
+        .entries_for_size(size)
+        .iter()
+        .filter(|entry| entry.file_key != file_key)
+        .cloned()
+        .collect::<Vec<_>>();
+    (!origins.is_empty()).then_some(DetectionTarget {
+        source,
+        file_key,
+        size,
+        origins,
+    })
+}
+
 #[derive(Clone, Debug)]
 struct RecordRequest {
     source: ContentIdentitySource,
@@ -216,6 +369,7 @@ struct ContentIdentityDb {
 struct StoredRecord {
     state: RecordedFileState,
     last_edit_at: i64,
+    has_restorable_content: bool,
 }
 
 impl ContentIdentityDb {
@@ -239,7 +393,8 @@ impl ContentIdentityDb {
                  full_hash TEXT,
                  hashed_mtime INTEGER NOT NULL,
                  kind TEXT NOT NULL,
-                 last_edit_at INTEGER NOT NULL
+                 last_edit_at INTEGER NOT NULL,
+                 has_restorable_content INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS edit_origin_full ON edit_origin(full_hash);
              CREATE TABLE IF NOT EXISTS restore_declined (
@@ -254,7 +409,7 @@ impl ContentIdentityDb {
     fn recorded_state(&self, file_key: &str) -> Result<Option<StoredRecord>, String> {
         self.conn
             .query_row(
-                "SELECT file_key, size, hashed_mtime, last_edit_at
+                "SELECT file_key, size, hashed_mtime, last_edit_at, has_restorable_content
                    FROM edit_origin WHERE file_key = ?1",
                 [file_key],
                 |row| {
@@ -273,6 +428,7 @@ impl ContentIdentityDb {
                             hashed_mtime: row.get(2)?,
                         },
                         last_edit_at: row.get(3)?,
+                        has_restorable_content: row.get(4)?,
                     })
                 },
             )
@@ -280,15 +436,68 @@ impl ContentIdentityDb {
             .map_err(|error| error.to_string())
     }
 
-    fn touch_edit(
+    fn ledger_entry(&self, file_key: &str) -> Result<Option<LedgerEntry>, String> {
+        self.conn
+            .query_row(
+                "SELECT file_key, size, head_hash, full_hash, hashed_mtime, kind, last_edit_at,
+                        has_restorable_content
+                   FROM edit_origin WHERE file_key = ?1",
+                [file_key],
+                ledger_entry_from_row,
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    fn load_index(&self, cancel: &AtomicBool) -> Result<Option<ContentIdentityIndex>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT file_key, size, head_hash, full_hash, hashed_mtime, kind, last_edit_at,
+                        has_restorable_content
+                   FROM edit_origin
+                  WHERE has_restorable_content = 1",
+            )
+            .map_err(|error| error.to_string())?;
+        let mut rows = stmt.query([]).map_err(|error| error.to_string())?;
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            if cancel.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            entries.push(ledger_entry_from_row(row).map_err(|error| error.to_string())?);
+        }
+        if cancel.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        Ok(Some(ContentIdentityIndex::from_entries(entries)))
+    }
+
+    fn restore_was_declined(&self, full_hash: &str, target_key: &str) -> Result<bool, String> {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM restore_declined WHERE full_hash = ?1 AND target_key = ?2",
+                rusqlite::params![full_hash, target_key],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|value| value.is_some())
+            .map_err(|error| error.to_string())
+    }
+
+    fn mark_restorable(
         &self,
         file_key: &str,
         kind: ContentKind,
-        last_edit_at: i64,
+        last_edit_at: Option<i64>,
     ) -> Result<(), String> {
         self.conn
             .execute(
-                "UPDATE edit_origin SET kind = ?2, last_edit_at = ?3 WHERE file_key = ?1",
+                "UPDATE edit_origin
+                    SET kind = ?2,
+                        last_edit_at = COALESCE(?3, last_edit_at),
+                        has_restorable_content = 1
+                  WHERE file_key = ?1",
                 rusqlite::params![file_key, kind.as_str(), last_edit_at],
             )
             .map(|_| ())
@@ -302,21 +511,27 @@ impl ContentIdentityDb {
         head_hash: &str,
         full_hash: &str,
         last_edit_at: i64,
+        role: ObservationRole,
     ) -> Result<(), String> {
         let size = i64::try_from(state.size)
             .map_err(|_| "file size exceeds SQLite INTEGER".to_string())?;
         self.conn
             .execute(
                 "INSERT INTO edit_origin
-                     (file_key, size, head_hash, full_hash, hashed_mtime, kind, last_edit_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     (file_key, size, head_hash, full_hash, hashed_mtime, kind, last_edit_at,
+                      has_restorable_content)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(file_key) DO UPDATE SET
                      size = excluded.size,
                      head_hash = excluded.head_hash,
                      full_hash = excluded.full_hash,
                      hashed_mtime = excluded.hashed_mtime,
                      kind = excluded.kind,
-                     last_edit_at = excluded.last_edit_at",
+                     last_edit_at = excluded.last_edit_at,
+                     has_restorable_content = MAX(
+                         edit_origin.has_restorable_content,
+                         excluded.has_restorable_content
+                     )",
                 rusqlite::params![
                     state.file_key,
                     size,
@@ -325,6 +540,7 @@ impl ContentIdentityDb {
                     state.hashed_mtime,
                     source.kind.as_str(),
                     last_edit_at,
+                    role.has_restorable_content(),
                 ],
             )
             .map(|_| ())
@@ -332,8 +548,90 @@ impl ContentIdentityDb {
     }
 }
 
+fn ledger_entry_from_row(row: &rusqlite::Row<'_>) -> Result<LedgerEntry, rusqlite::Error> {
+    let size: i64 = row.get(1)?;
+    let size = u64::try_from(size).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })?;
+    let kind_value: String = row.get(5)?;
+    let kind = ContentKind::from_str(&kind_value).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            5,
+            rusqlite::types::Type::Text,
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown content identity kind: {kind_value}"),
+            )),
+        )
+    })?;
+    Ok(LedgerEntry {
+        file_key: row.get(0)?,
+        size,
+        head_hash: row.get(2)?,
+        full_hash: row.get(3)?,
+        hashed_mtime: row.get(4)?,
+        kind,
+        last_edit_at: row.get(6)?,
+        has_restorable_content: row.get(7)?,
+    })
+}
+
+pub(crate) struct ContentIdentityIndexLoadPending {
+    cancel: Arc<AtomicBool>,
+    rx: mpsc::Receiver<Result<ContentIdentityIndex, String>>,
+}
+
+impl ContentIdentityIndexLoadPending {
+    /// A2 の索引ロード。設定 OFF では呼び出し側がこの worker 自体を作らない。
+    pub(crate) fn spawn() -> Option<Self> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel();
+        match std::thread::Builder::new()
+            .name("content-identity-index-load".into())
+            .spawn(move || {
+                let result = ContentIdentityDb::open()
+                    .map_err(|error| error.to_string())
+                    .and_then(|db| db.load_index(&worker_cancel))
+                    .and_then(|index| index.ok_or_else(|| "cancelled".to_string()));
+                if !worker_cancel.load(Ordering::Acquire) {
+                    let _ = tx.send(result);
+                }
+            }) {
+            Ok(_) => Some(Self { cancel, rx }),
+            Err(error) => {
+                crate::logger::log(format!(
+                    "content_identity: index loader thread spawn failed: {error}"
+                ));
+                None
+            }
+        }
+    }
+
+    pub(crate) fn try_recv(
+        &self,
+    ) -> Result<Result<ContentIdentityIndex, String>, mpsc::TryRecvError> {
+        self.rx.try_recv()
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for ContentIdentityIndexLoadPending {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
 pub(crate) struct ContentIdentityRecorder {
     tx: Option<mpsc::Sender<RecordRequest>>,
+    update_rx: mpsc::Receiver<LedgerEntry>,
     handle: Option<std::thread::JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
 }
@@ -341,14 +639,16 @@ pub(crate) struct ContentIdentityRecorder {
 impl ContentIdentityRecorder {
     pub(crate) fn spawn() -> Option<Self> {
         let (tx, rx) = mpsc::channel::<RecordRequest>();
+        let (update_tx, update_rx) = mpsc::channel::<LedgerEntry>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown);
         match std::thread::Builder::new()
             .name("content-identity-recorder".into())
-            .spawn(move || run_worker(rx, worker_shutdown))
+            .spawn(move || run_worker(rx, update_tx, worker_shutdown))
         {
             Ok(handle) => Some(Self {
                 tx: Some(tx),
+                update_rx,
                 handle: Some(handle),
                 shutdown,
             }),
@@ -375,6 +675,10 @@ impl ContentIdentityRecorder {
             ));
         }
     }
+
+    pub(crate) fn drain_updates(&self) -> Vec<LedgerEntry> {
+        self.update_rx.try_iter().collect()
+    }
 }
 
 impl Drop for ContentIdentityRecorder {
@@ -389,7 +693,402 @@ impl Drop for ContentIdentityRecorder {
     }
 }
 
-fn run_worker(rx: mpsc::Receiver<RecordRequest>, shutdown: Arc<AtomicBool>) {
+pub(crate) struct ContentIdentityDetectionPending {
+    cancel: Arc<AtomicBool>,
+    rx: mpsc::Receiver<DetectionResult>,
+}
+
+impl ContentIdentityDetectionPending {
+    pub(crate) fn spawn(
+        targets: Vec<DetectionTarget>,
+        items_generation: u64,
+        folder_key: String,
+        input_seq: u64,
+        io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
+    ) -> Option<Self> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel();
+        let worker_folder_key = folder_key.clone();
+        let db_path = crate::data_dir::get().join("content_identity.db");
+        match std::thread::Builder::new()
+            .name("content-identity-detect".into())
+            .spawn(move || {
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "content_identity",
+                        "detect_begin",
+                        Some(&worker_folder_key),
+                        input_seq,
+                        &[("targets", serde_json::Value::from(targets.len()))],
+                    );
+                }
+                let started = std::time::Instant::now();
+                match run_detection_at(
+                    &db_path,
+                    targets,
+                    items_generation,
+                    worker_folder_key.clone(),
+                    &worker_cancel,
+                    &io_sem,
+                ) {
+                    Ok(Some(result)) => {
+                        if crate::perf::is_enabled() {
+                            crate::perf::event(
+                                "content_identity",
+                                "detect_end",
+                                Some(&worker_folder_key),
+                                input_seq,
+                                &[
+                                    (
+                                        "ms",
+                                        serde_json::Value::from(
+                                            started.elapsed().as_secs_f64() * 1000.0,
+                                        ),
+                                    ),
+                                    (
+                                        "candidates",
+                                        serde_json::Value::from(result.candidates.len()),
+                                    ),
+                                ],
+                            );
+                        }
+                        if !worker_cancel.load(Ordering::Acquire) {
+                            let _ = tx.send(result);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => crate::logger::log(format!(
+                        "content_identity: detection failed for {worker_folder_key}: {error}"
+                    )),
+                }
+            }) {
+            Ok(_) => Some(Self { cancel, rx }),
+            Err(error) => {
+                crate::logger::log(format!(
+                    "content_identity: detector thread spawn failed: {error}"
+                ));
+                None
+            }
+        }
+    }
+
+    pub(crate) fn try_recv(&self) -> Result<DetectionResult, mpsc::TryRecvError> {
+        self.rx.try_recv()
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(result: Option<DetectionResult>) -> (Self, Arc<AtomicBool>) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        if let Some(result) = result {
+            tx.send(result).unwrap();
+        }
+        (
+            Self {
+                cancel: Arc::clone(&cancel),
+                rx,
+            },
+            cancel,
+        )
+    }
+}
+
+impl Drop for ContentIdentityDetectionPending {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+struct CancellableReader<'a, R> {
+    inner: &'a mut R,
+    cancel: &'a AtomicBool,
+}
+
+fn match_target_content<R: Read + Seek>(
+    reader: &mut R,
+    size: u64,
+    origins: Vec<LedgerEntry>,
+    cancel: &AtomicBool,
+) -> Result<Option<(String, String, Vec<LedgerEntry>)>, String> {
+    let head_hash = {
+        let mut reader = CancellableReader {
+            inner: reader,
+            cancel,
+        };
+        match stage1_head_hash(&mut reader, size) {
+            Ok(hash) => hash,
+            Err(error)
+                if error.kind() == io::ErrorKind::Interrupted && cancel.load(Ordering::Acquire) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    };
+    if cancel.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    let head_matches = origins
+        .into_iter()
+        .filter(|origin| origin.head_hash == head_hash && origin.full_hash.is_some())
+        .collect::<Vec<_>>();
+    if head_matches.is_empty() {
+        return Ok(None);
+    }
+
+    reader.rewind().map_err(|error| error.to_string())?;
+    if cancel.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    let full_hash = {
+        let mut reader = CancellableReader {
+            inner: reader,
+            cancel,
+        };
+        match stage2_full_hash(&mut reader) {
+            Ok(hash) => hash,
+            Err(error)
+                if error.kind() == io::ErrorKind::Interrupted && cancel.load(Ordering::Acquire) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    };
+    if cancel.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    let matching = head_matches
+        .into_iter()
+        .filter(|origin| origin.full_hash.as_deref() == Some(full_hash.as_str()))
+        .collect::<Vec<_>>();
+    Ok(Some((head_hash, full_hash, matching)))
+}
+
+impl<R: Read> Read for CancellableReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.cancel.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "content identity detection cancelled",
+            ));
+        }
+        self.inner.read(buffer)
+    }
+}
+
+fn run_detection_at(
+    db_path: &Path,
+    targets: Vec<DetectionTarget>,
+    items_generation: u64,
+    folder_key: String,
+    cancel: &AtomicBool,
+    io_sem: &crate::io_semaphore::GlobalIoSemaphore,
+) -> Result<Option<DetectionResult>, String> {
+    if cancel.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    let db = {
+        let Some(_permit) =
+            io_sem.acquire_cancellable(crate::io_semaphore::IoPriority::Low, cancel)
+        else {
+            return Ok(None);
+        };
+        ContentIdentityDb::open_at(db_path).map_err(|error| error.to_string())?
+    };
+    let mut candidates = Vec::new();
+    let mut ledger_updates = Vec::new();
+    for target in targets {
+        if cancel.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let Some(_permit) =
+            io_sem.acquire_cancellable(crate::io_semaphore::IoPriority::Low, cancel)
+        else {
+            return Ok(None);
+        };
+        match detect_target(&db, target, cancel) {
+            Ok(Some((candidate, update))) => {
+                ledger_updates.push(update);
+                if let Some(candidate) = candidate {
+                    candidates.push(candidate);
+                }
+            }
+            Ok(None) => {}
+            Err(_error) if cancel.load(Ordering::Acquire) => return Ok(None),
+            Err(error) => {
+                crate::logger::log(format!("content_identity: candidate check failed: {error}"))
+            }
+        }
+    }
+    if cancel.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    Ok(Some(DetectionResult {
+        items_generation,
+        folder_key,
+        candidates,
+        ledger_updates,
+    }))
+}
+
+fn detect_target(
+    db: &ContentIdentityDb,
+    target: DetectionTarget,
+    cancel: &AtomicBool,
+) -> Result<Option<(Option<RestoreCandidate>, LedgerEntry)>, String> {
+    detect_target_with_opener(db, target, cancel, |path| {
+        File::open(path).map_err(|error| format!("open {}: {error}", path.display()))
+    })
+}
+
+fn detect_target_with_opener<R: Read + Seek>(
+    db: &ContentIdentityDb,
+    target: DetectionTarget,
+    cancel: &AtomicBool,
+    open: impl FnOnce(&Path) -> Result<R, String>,
+) -> Result<Option<(Option<RestoreCandidate>, LedgerEntry)>, String> {
+    if cancel.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    let before = std::fs::metadata(&target.source.path).map_err(|error| error.to_string())?;
+    if !before.is_file() || before.len() != target.size {
+        return Ok(None);
+    }
+    let hashed_mtime = metadata_mtime(&before)?;
+    if cancel.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    let state = RecordedFileState {
+        file_key: target.file_key.clone(),
+        size: target.size,
+        hashed_mtime,
+    };
+    let cached = db.ledger_entry(&target.file_key)?;
+    if cached
+        .as_ref()
+        .is_some_and(|entry| entry.has_restorable_content)
+    {
+        return Ok(None);
+    }
+
+    let (_head_hash, full_hash, mut matching, update) = if let Some(cached) =
+        cached.filter(|entry| {
+            entry.size == state.size
+                && entry.hashed_mtime == state.hashed_mtime
+                && entry.full_hash.is_some()
+        }) {
+        let full_hash = cached
+            .full_hash
+            .clone()
+            .expect("cache predicate checked full_hash");
+        let matching = matching_origins(&target.origins, &cached.head_hash, &full_hash);
+        (cached.head_hash.clone(), full_hash, matching, cached)
+    } else {
+        if cancel.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let mut file = open(&target.source.path)?;
+        let Some((head_hash, full_hash, matching)) =
+            match_target_content(&mut file, target.size, target.origins, cancel)?
+        else {
+            return Ok(None);
+        };
+        let after = std::fs::metadata(&target.source.path).map_err(|error| error.to_string())?;
+        if after.len() != target.size || metadata_mtime(&after)? != hashed_mtime {
+            return Err(format!(
+                "{} changed while hashing",
+                target.source.path.display()
+            ));
+        }
+        if cancel.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        record_observation_with_hasher(
+            db,
+            &target.source,
+            &state,
+            ContentIdentityTrigger::ViewingState,
+            ObservationRole::DetectionCache,
+            unix_time_millis(),
+            || Ok(Some((head_hash.clone(), full_hash.clone()))),
+        )?;
+        let update = db
+            .ledger_entry(&target.file_key)?
+            .ok_or_else(|| "detection cache row was not stored".to_string())?;
+        (head_hash, full_hash, matching, update)
+    };
+    if cancel.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    if matching.is_empty() {
+        return Ok(Some((None, update)));
+    }
+    sort_origins(&mut matching);
+
+    let declined = db.restore_was_declined(&full_hash, &target.file_key)?;
+    let candidate = if declined {
+        None
+    } else {
+        let mut sources = Vec::with_capacity(matching.len());
+        for origin in matching {
+            if cancel.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            let path = PathBuf::from(&origin.file_key);
+            let source_exists = path.try_exists().unwrap_or(false);
+            sources.push(RestoreSourceCandidate {
+                file_key: origin.file_key,
+                path,
+                kind: origin.kind,
+                last_edit_at: origin.last_edit_at,
+                source_exists,
+            });
+        }
+        Some(RestoreCandidate {
+            target_key: target.file_key,
+            target_path: target.source.path,
+            target_kind: target.source.kind,
+            full_hash,
+            sources,
+        })
+    };
+    Ok(Some((candidate, update)))
+}
+
+fn matching_origins(origins: &[LedgerEntry], head_hash: &str, full_hash: &str) -> Vec<LedgerEntry> {
+    origins
+        .iter()
+        .filter(|origin| {
+            origin.head_hash == head_hash && origin.full_hash.as_deref() == Some(full_hash)
+        })
+        .cloned()
+        .collect()
+}
+
+fn sort_origins(origins: &mut [LedgerEntry]) {
+    origins.sort_by(
+        |left, right| match (left.last_edit_at == 0, right.last_edit_at == 0) {
+            (false, true) => std::cmp::Ordering::Less,
+            (true, false) => std::cmp::Ordering::Greater,
+            _ => right
+                .last_edit_at
+                .cmp(&left.last_edit_at)
+                .then_with(|| left.file_key.cmp(&right.file_key)),
+        },
+    );
+}
+
+fn run_worker(
+    rx: mpsc::Receiver<RecordRequest>,
+    update_tx: mpsc::Sender<LedgerEntry>,
+    shutdown: Arc<AtomicBool>,
+) {
     let db = match ContentIdentityDb::open() {
         Ok(db) => db,
         Err(error) => {
@@ -411,11 +1110,17 @@ fn run_worker(rx: mpsc::Receiver<RecordRequest>, shutdown: Arc<AtomicBool>) {
         }
         let coalesced = coalesce_record_requests(queued);
         process_coalesced_requests(&coalesced, &shutdown, |request| {
-            if let Err(error) = record_source(&db, request, &shutdown) {
-                crate::logger::log(format!(
-                    "content_identity: recording failed for {}: {error}",
-                    request.source.path.display()
-                ));
+            match record_source(&db, request, &shutdown) {
+                Ok(Some(entry)) => {
+                    let _ = update_tx.send(entry);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    crate::logger::log(format!(
+                        "content_identity: recording failed for {}: {error}",
+                        request.source.path.display()
+                    ));
+                }
             }
         });
     }
@@ -463,7 +1168,7 @@ fn record_source(
     db: &ContentIdentityDb,
     request: &CoalescedRecordRequest,
     shutdown: &AtomicBool,
-) -> Result<(), String> {
+) -> Result<Option<LedgerEntry>, String> {
     let source = &request.source;
     let before = std::fs::metadata(&source.path).map_err(|error| error.to_string())?;
     if !before.is_file() {
@@ -479,6 +1184,7 @@ fn record_source(
         source,
         &state,
         request.trigger,
+        ObservationRole::RestorableContent,
         request.recorded_at,
         || {
             let mut file = File::open(&source.path).map_err(|error| error.to_string())?;
@@ -509,7 +1215,11 @@ fn record_source(
             }
             Ok(Some((head_hash, full_hash)))
         },
-    )
+    )?;
+    if shutdown.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    db.ledger_entry(&state.file_key)
 }
 
 fn record_observation_with_hasher(
@@ -517,6 +1227,7 @@ fn record_observation_with_hasher(
     source: &ContentIdentitySource,
     state: &RecordedFileState,
     trigger: ContentIdentityTrigger,
+    role: ObservationRole,
     last_edit_at: i64,
     hasher: impl FnOnce() -> Result<Option<(String, String)>, String>,
 ) -> Result<(), String> {
@@ -527,11 +1238,18 @@ fn record_observation_with_hasher(
         state.size,
         state.hashed_mtime,
     ) {
-        return match trigger {
-            ContentIdentityTrigger::Edit => {
-                db.touch_edit(&state.file_key, source.kind, last_edit_at)
+        return match (role, trigger) {
+            (ObservationRole::RestorableContent, ContentIdentityTrigger::Edit) => {
+                db.mark_restorable(&state.file_key, source.kind, Some(last_edit_at))
             }
-            ContentIdentityTrigger::ViewingState => Ok(()),
+            (ObservationRole::RestorableContent, ContentIdentityTrigger::ViewingState)
+                if !recorded
+                    .as_ref()
+                    .is_some_and(|recorded| recorded.has_restorable_content) =>
+            {
+                db.mark_restorable(&state.file_key, source.kind, None)
+            }
+            _ => Ok(()),
         };
     }
     let Some((head_hash, full_hash)) = hasher()? else {
@@ -544,7 +1262,14 @@ fn record_observation_with_hasher(
             .map(|recorded| recorded.last_edit_at)
             .unwrap_or(0),
     };
-    db.upsert(source, state, &head_hash, &full_hash, stored_last_edit_at)
+    db.upsert(
+        source,
+        state,
+        &head_hash,
+        &full_hash,
+        stored_last_edit_at,
+        role,
+    )
 }
 
 fn metadata_mtime(metadata: &std::fs::Metadata) -> Result<i64, String> {
@@ -569,7 +1294,26 @@ fn unix_time_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{Cursor, SeekFrom};
+
+    fn test_ledger_entry(
+        file_key: impl Into<String>,
+        size: u64,
+        head_hash: impl Into<String>,
+        full_hash: impl Into<String>,
+        last_edit_at: i64,
+    ) -> LedgerEntry {
+        LedgerEntry {
+            file_key: file_key.into(),
+            size,
+            head_hash: head_hash.into(),
+            full_hash: Some(full_hash.into()),
+            hashed_mtime: 1,
+            kind: ContentKind::Image,
+            last_edit_at,
+            has_restorable_content: true,
+        }
+    }
 
     #[test]
     fn stage_hashes_have_stable_sha256_vectors() {
@@ -606,6 +1350,532 @@ mod tests {
     }
 
     #[test]
+    fn stage0_size_mismatch_performs_zero_io_calls() {
+        let index = ContentIdentityIndex::from_entries(vec![test_ledger_entry(
+            "c:/origin.png",
+            10,
+            "head",
+            "full",
+            1,
+        )]);
+        let io_calls = std::cell::Cell::new(0);
+        let target = stage0_target(
+            &index,
+            ContentIdentitySource::new("c:/target.png", ContentKind::Image),
+            11,
+        );
+        if target.is_some() {
+            io_calls.set(io_calls.get() + 1);
+        }
+
+        assert!(target.is_none());
+        assert_eq!(io_calls.get(), 0, "段 0 不一致では worker I/O へ渡さない");
+    }
+
+    #[test]
+    fn stage0_excludes_the_same_file_key() {
+        let index = ContentIdentityIndex::from_entries(vec![test_ledger_entry(
+            "c:/images/same.png",
+            10,
+            "head",
+            "full",
+            1,
+        )]);
+
+        assert!(
+            stage0_target(
+                &index,
+                ContentIdentitySource::new("C:/images/same.png", ContentKind::Image),
+                10,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn late_detection_cache_update_does_not_remove_a_restorable_index_entry() {
+        let restorable = test_ledger_entry("c:/images/same.png", 10, "head", "full", 1);
+        let mut index = ContentIdentityIndex::from_entries(vec![restorable.clone()]);
+        let mut stale_cache_update = restorable;
+        stale_cache_update.has_restorable_content = false;
+        stale_cache_update.size = 20;
+
+        index.upsert(stale_cache_update);
+
+        assert!(index.contains_file_key("c:/images/same.png"));
+        assert_eq!(index.entries_for_size(10).len(), 1);
+        assert!(index.entries_for_size(20).is_empty());
+    }
+
+    #[test]
+    fn stage1_mismatch_does_not_seek_or_read_stage2() {
+        struct CountingCursor {
+            inner: Cursor<Vec<u8>>,
+            reads: usize,
+            bytes: usize,
+            seeks: usize,
+        }
+
+        impl Read for CountingCursor {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                let count = self.inner.read(buffer)?;
+                self.bytes += count;
+                Ok(count)
+            }
+        }
+
+        impl Seek for CountingCursor {
+            fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+                self.seeks += 1;
+                self.inner.seek(position)
+            }
+        }
+
+        let data = vec![7_u8; HEAD_HASH_BYTES as usize + 123];
+        let size = data.len() as u64;
+        let mut reader = CountingCursor {
+            inner: Cursor::new(data),
+            reads: 0,
+            bytes: 0,
+            seeks: 0,
+        };
+        let result = match_target_content(
+            &mut reader,
+            size,
+            vec![test_ledger_entry(
+                "c:/origin.png",
+                size,
+                "different-head",
+                "unused-full",
+                1,
+            )],
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert!(result.is_none());
+        assert_eq!(reader.seeks, 0, "段 2 のための rewind をしていない");
+        assert_eq!(reader.bytes, HEAD_HASH_BYTES as usize);
+    }
+
+    #[test]
+    fn detection_hashing_observes_cancellation_between_reads() {
+        struct CancelOnSecondRead<'a> {
+            inner: Cursor<Vec<u8>>,
+            cancel: &'a AtomicBool,
+            reads: usize,
+        }
+
+        impl Read for CancelOnSecondRead<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                let count = self.inner.read(buffer)?;
+                if self.reads == 2 {
+                    self.cancel.store(true, Ordering::Release);
+                }
+                Ok(count)
+            }
+        }
+
+        impl Seek for CancelOnSecondRead<'_> {
+            fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+                self.inner.seek(position)
+            }
+        }
+
+        let data = vec![9_u8; HASH_CHUNK_BYTES + 17];
+        let size = data.len() as u64;
+        let head_hash = stage1_head_hash(&mut Cursor::new(&data), size).unwrap();
+        let full_hash = stage2_full_hash(&mut Cursor::new(&data)).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut reader = CancelOnSecondRead {
+            inner: Cursor::new(data),
+            cancel: &cancel,
+            reads: 0,
+        };
+
+        let result = match_target_content(
+            &mut reader,
+            size,
+            vec![test_ledger_entry(
+                "c:/origin.png",
+                size,
+                head_hash,
+                full_hash,
+                1,
+            )],
+            &cancel,
+        )
+        .unwrap();
+
+        assert!(result.is_none());
+        assert_eq!(reader.reads, 2, "cancel 後は次の read を開始しない");
+    }
+
+    #[test]
+    fn restore_declined_is_filtered_after_full_hash_and_detection_cache_uses_zero_edit_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("content_identity.db");
+        let target_path = temp.path().join("target.png");
+        let bytes = vec![3_u8; HEAD_HASH_BYTES as usize + 7];
+        std::fs::write(&target_path, &bytes).unwrap();
+        let size = bytes.len() as u64;
+        let head_hash = stage1_head_hash(&mut Cursor::new(&bytes), size).unwrap();
+        let full_hash = stage2_full_hash(&mut Cursor::new(&bytes)).unwrap();
+        let target_key = crate::path_key::normalize_keep_drive(&target_path);
+        let origin_key = crate::path_key::normalize_keep_drive(&temp.path().join("origin.png"));
+        let origin = test_ledger_entry(&origin_key, size, &head_hash, &full_hash, 123);
+
+        {
+            let db = ContentIdentityDb::open_at(&db_path).unwrap();
+            db.upsert(
+                &ContentIdentitySource::new(&origin_key, ContentKind::Image),
+                &RecordedFileState {
+                    file_key: origin_key.clone(),
+                    size,
+                    hashed_mtime: 1,
+                },
+                &head_hash,
+                &full_hash,
+                123,
+                ObservationRole::RestorableContent,
+            )
+            .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO restore_declined(full_hash, target_key) VALUES (?1, ?2)",
+                    rusqlite::params![full_hash, target_key],
+                )
+                .unwrap();
+        }
+
+        let result = run_detection_at(
+            &db_path,
+            vec![DetectionTarget {
+                source: ContentIdentitySource::new(&target_path, ContentKind::Image),
+                file_key: target_key.clone(),
+                size,
+                origins: vec![origin],
+            }],
+            7,
+            crate::path_key::normalize_keep_drive(temp.path()),
+            &AtomicBool::new(false),
+            &crate::io_semaphore::GlobalIoSemaphore::new(1),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(result.candidates.is_empty(), "辞退済み候補は UI へ返さない");
+        assert_eq!(result.ledger_updates.len(), 1, "段 2 完了結果は cache する");
+        assert_eq!(result.ledger_updates[0].last_edit_at, 0);
+        assert!(!result.ledger_updates[0].has_restorable_content);
+        let db = ContentIdentityDb::open_at(&db_path).unwrap();
+        let cached = db.ledger_entry(&target_key).unwrap().unwrap();
+        assert_eq!(cached.last_edit_at, 0);
+        assert!(!cached.has_restorable_content);
+    }
+
+    #[test]
+    fn stage2_mismatch_is_cached_without_creating_a_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("content_identity.db");
+        let target_path = temp.path().join("target.png");
+        let mut origin_bytes = vec![5_u8; HEAD_HASH_BYTES as usize + 1];
+        let mut target_bytes = origin_bytes.clone();
+        *origin_bytes.last_mut().unwrap() = 6;
+        *target_bytes.last_mut().unwrap() = 7;
+        std::fs::write(&target_path, &target_bytes).unwrap();
+        let size = target_bytes.len() as u64;
+        let head_hash = stage1_head_hash(&mut Cursor::new(&origin_bytes), size).unwrap();
+        let origin_full_hash = stage2_full_hash(&mut Cursor::new(&origin_bytes)).unwrap();
+        let target_key = crate::path_key::normalize_keep_drive(&target_path);
+
+        let result = run_detection_at(
+            &db_path,
+            vec![DetectionTarget {
+                source: ContentIdentitySource::new(&target_path, ContentKind::Image),
+                file_key: target_key.clone(),
+                size,
+                origins: vec![test_ledger_entry(
+                    "c:/origin.png",
+                    size,
+                    head_hash,
+                    origin_full_hash,
+                    123,
+                )],
+            }],
+            8,
+            crate::path_key::normalize_keep_drive(temp.path()),
+            &AtomicBool::new(false),
+            &crate::io_semaphore::GlobalIoSemaphore::new(1),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(result.candidates.is_empty());
+        assert_eq!(
+            result.ledger_updates.len(),
+            1,
+            "段 2 の結果を再訪用に cache"
+        );
+        assert_eq!(result.ledger_updates[0].last_edit_at, 0);
+        assert!(!result.ledger_updates[0].has_restorable_content);
+        let db = ContentIdentityDb::open_at(&db_path).unwrap();
+        assert!(db.ledger_entry(&target_key).unwrap().is_some());
+    }
+
+    #[test]
+    fn detection_cache_does_not_suppress_second_visit_and_reuses_hashes_without_reading() {
+        struct CountingReader<'a> {
+            inner: Cursor<Vec<u8>>,
+            reads: &'a std::cell::Cell<usize>,
+        }
+
+        impl Read for CountingReader<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.reads.set(self.reads.get() + 1);
+                self.inner.read(buffer)
+            }
+        }
+
+        impl Seek for CountingReader<'_> {
+            fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+                self.inner.seek(position)
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let target_path = temp.path().join("target.png");
+        let bytes = vec![11_u8; HEAD_HASH_BYTES as usize + 17];
+        std::fs::write(&target_path, &bytes).unwrap();
+        let size = bytes.len() as u64;
+        let head_hash = stage1_head_hash(&mut Cursor::new(&bytes), size).unwrap();
+        let full_hash = stage2_full_hash(&mut Cursor::new(&bytes)).unwrap();
+        let origin_key = crate::path_key::normalize_keep_drive(&temp.path().join("origin.png"));
+        let target_key = crate::path_key::normalize_keep_drive(&target_path);
+        let origin = test_ledger_entry(&origin_key, size, &head_hash, &full_hash, 123);
+        let db = ContentIdentityDb::open_at(&temp.path().join("content_identity.db")).unwrap();
+        db.upsert(
+            &ContentIdentitySource::new(PathBuf::from(&origin_key), ContentKind::Image),
+            &RecordedFileState {
+                file_key: origin_key.clone(),
+                size,
+                hashed_mtime: 1,
+            },
+            &head_hash,
+            &full_hash,
+            123,
+            ObservationRole::RestorableContent,
+        )
+        .unwrap();
+
+        let target = DetectionTarget {
+            source: ContentIdentitySource::new(&target_path, ContentKind::Image),
+            file_key: target_key.clone(),
+            size,
+            origins: vec![origin.clone()],
+        };
+        let reads = std::cell::Cell::new(0);
+        let opens = std::cell::Cell::new(0);
+        let (first_candidate, cache_update) =
+            detect_target_with_opener(&db, target, &AtomicBool::new(false), |_| {
+                opens.set(opens.get() + 1);
+                Ok(CountingReader {
+                    inner: Cursor::new(bytes.clone()),
+                    reads: &reads,
+                })
+            })
+            .unwrap()
+            .unwrap();
+        assert!(first_candidate.is_some());
+        assert!(reads.get() > 0);
+        assert_eq!(opens.get(), 1);
+        assert!(!cache_update.has_restorable_content);
+        assert_eq!(cache_update.last_edit_at, 0);
+
+        let mut same_session_index = ContentIdentityIndex::from_entries(vec![origin]);
+        same_session_index.upsert(cache_update);
+        let second_target = stage0_target(
+            &same_session_index,
+            ContentIdentitySource::new(&target_path, ContentKind::Image),
+            size,
+        )
+        .expect("detection cache must not suppress the target in the same session");
+        let reads_after_first = reads.get();
+        let (second_candidate, second_update) =
+            detect_target_with_opener(&db, second_target, &AtomicBool::new(false), |_| {
+                opens.set(opens.get() + 1);
+                Ok(CountingReader {
+                    inner: Cursor::new(bytes.clone()),
+                    reads: &reads,
+                })
+            })
+            .unwrap()
+            .unwrap();
+        assert!(second_candidate.is_some());
+        assert_eq!(opens.get(), 1, "一致 cache があればファイルを開かない");
+        assert_eq!(
+            reads.get(),
+            reads_after_first,
+            "2 回目の検出はファイルを 1 byte も読まない"
+        );
+        assert!(!second_update.has_restorable_content);
+
+        let restarted_index = db.load_index(&AtomicBool::new(false)).unwrap().unwrap();
+        assert!(restarted_index.contains_file_key(&origin_key));
+        assert!(!restarted_index.contains_file_key(&target_key));
+        assert!(
+            stage0_target(
+                &restarted_index,
+                ContentIdentitySource::new(&target_path, ContentKind::Image),
+                size,
+            )
+            .is_some(),
+            "再起動後の index にも detection cache 行を載せない"
+        );
+    }
+
+    #[test]
+    fn a1_observations_promote_detection_cache_without_unwanted_rehash_or_timestamp() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = ContentIdentityDb::open_at(&temp.path().join("content_identity.db")).unwrap();
+        let source = ContentIdentitySource::new("C:/books/book.cbz", ContentKind::Zip);
+        let state = RecordedFileState {
+            file_key: "c:/books/book.cbz".to_string(),
+            size: 42,
+            hashed_mtime: 100,
+        };
+        db.upsert(
+            &source,
+            &state,
+            "head",
+            "full",
+            0,
+            ObservationRole::DetectionCache,
+        )
+        .unwrap();
+        assert!(
+            !db.ledger_entry(&state.file_key)
+                .unwrap()
+                .unwrap()
+                .has_restorable_content
+        );
+
+        record_observation_with_hasher(
+            &db,
+            &source,
+            &state,
+            ContentIdentityTrigger::ViewingState,
+            ObservationRole::RestorableContent,
+            999,
+            || panic!("同一 size/mtime の A1 昇格では再 hash しない"),
+        )
+        .unwrap();
+
+        let promoted = db.ledger_entry(&state.file_key).unwrap().unwrap();
+        assert!(promoted.has_restorable_content);
+        assert_eq!(
+            promoted.last_edit_at, 0,
+            "本の続きは復元元だが編集時刻を進めない"
+        );
+        assert!(
+            db.load_index(&AtomicBool::new(false))
+                .unwrap()
+                .unwrap()
+                .contains_file_key(&state.file_key)
+        );
+
+        let edit_source = ContentIdentitySource::new("C:/images/edited.png", ContentKind::Image);
+        let edit_state = RecordedFileState {
+            file_key: "c:/images/edited.png".to_string(),
+            ..state
+        };
+        db.upsert(
+            &edit_source,
+            &edit_state,
+            "head",
+            "full",
+            0,
+            ObservationRole::DetectionCache,
+        )
+        .unwrap();
+        record_observation_with_hasher(
+            &db,
+            &edit_source,
+            &edit_state,
+            ContentIdentityTrigger::Edit,
+            ObservationRole::RestorableContent,
+            777,
+            || panic!("同一 size/mtime の A1 昇格では再 hash しない"),
+        )
+        .unwrap();
+        let promoted_edit = db.ledger_entry(&edit_state.file_key).unwrap().unwrap();
+        assert!(promoted_edit.has_restorable_content);
+        assert_eq!(promoted_edit.last_edit_at, 777);
+    }
+
+    #[test]
+    fn detection_cache_update_never_downgrades_a_restorable_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = ContentIdentityDb::open_at(&temp.path().join("content_identity.db")).unwrap();
+        let source = ContentIdentitySource::new("C:/images/a.png", ContentKind::Image);
+        let old_state = RecordedFileState {
+            file_key: "c:/images/a.png".to_string(),
+            size: 42,
+            hashed_mtime: 100,
+        };
+        db.upsert(
+            &source,
+            &old_state,
+            "head-old",
+            "full-old",
+            123,
+            ObservationRole::RestorableContent,
+        )
+        .unwrap();
+        let changed_state = RecordedFileState {
+            hashed_mtime: 101,
+            ..old_state
+        };
+        record_observation_with_hasher(
+            &db,
+            &source,
+            &changed_state,
+            ContentIdentityTrigger::ViewingState,
+            ObservationRole::DetectionCache,
+            999,
+            || Ok(Some(("head-new".to_string(), "full-new".to_string()))),
+        )
+        .unwrap();
+
+        let entry = db.ledger_entry(&changed_state.file_key).unwrap().unwrap();
+        assert!(entry.has_restorable_content);
+        assert_eq!(entry.last_edit_at, 123);
+        assert_eq!(entry.full_hash.as_deref(), Some("full-new"));
+    }
+
+    #[test]
+    fn multiple_origins_sort_by_last_edit_with_unedited_last() {
+        let mut origins = vec![
+            test_ledger_entry("c:/zero.png", 1, "h", "f", 0),
+            test_ledger_entry("c:/old.png", 1, "h", "f", 10),
+            test_ledger_entry("c:/new.png", 1, "h", "f", 30),
+            test_ledger_entry("c:/middle.png", 1, "h", "f", 20),
+        ];
+
+        sort_origins(&mut origins);
+
+        assert_eq!(
+            origins
+                .iter()
+                .map(|origin| origin.last_edit_at)
+                .collect::<Vec<_>>(),
+            vec![30, 20, 10, 0]
+        );
+    }
+
+    #[test]
     fn rehash_decision_uses_key_size_and_mtime() {
         let recorded = RecordedFileState {
             file_key: "c:/images/a.png".to_string(),
@@ -634,8 +1904,15 @@ mod tests {
             size: 42,
             hashed_mtime: 100,
         };
-        db.upsert(&source, &original, "head-0", "full-0", 1)
-            .unwrap();
+        db.upsert(
+            &source,
+            &original,
+            "head-0",
+            "full-0",
+            1,
+            ObservationRole::RestorableContent,
+        )
+        .unwrap();
 
         let calls = std::cell::Cell::new(0);
         record_observation_with_hasher(
@@ -643,6 +1920,7 @@ mod tests {
             &source,
             &original,
             ContentIdentityTrigger::Edit,
+            ObservationRole::RestorableContent,
             2,
             || {
                 calls.set(calls.get() + 1);
@@ -661,6 +1939,7 @@ mod tests {
             &source,
             &changed_size,
             ContentIdentityTrigger::Edit,
+            ObservationRole::RestorableContent,
             3,
             || {
                 calls.set(calls.get() + 1);
@@ -679,6 +1958,7 @@ mod tests {
             &source,
             &changed_mtime,
             ContentIdentityTrigger::Edit,
+            ObservationRole::RestorableContent,
             4,
             || {
                 calls.set(calls.get() + 1);
@@ -699,13 +1979,22 @@ mod tests {
             size: 42,
             hashed_mtime: 100,
         };
-        db.upsert(&source, &state, "head", "full", 10).unwrap();
+        db.upsert(
+            &source,
+            &state,
+            "head",
+            "full",
+            10,
+            ObservationRole::RestorableContent,
+        )
+        .unwrap();
 
         record_observation_with_hasher(
             &db,
             &source,
             &state,
             ContentIdentityTrigger::ViewingState,
+            ObservationRole::RestorableContent,
             20,
             || panic!("unchanged viewing state must not hash"),
         )
@@ -723,6 +2012,7 @@ mod tests {
             &source,
             &state,
             ContentIdentityTrigger::Edit,
+            ObservationRole::RestorableContent,
             30,
             || panic!("unchanged edit must not hash"),
         )
@@ -746,7 +2036,15 @@ mod tests {
             size: 42,
             hashed_mtime: 100,
         };
-        db.upsert(&source, &state, "head", "full", 10).unwrap();
+        db.upsert(
+            &source,
+            &state,
+            "head",
+            "full",
+            10,
+            ObservationRole::RestorableContent,
+        )
+        .unwrap();
         let total_changes = || {
             db.conn
                 .query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
@@ -759,6 +2057,7 @@ mod tests {
             &source,
             &state,
             ContentIdentityTrigger::ViewingState,
+            ObservationRole::RestorableContent,
             20,
             || panic!("unchanged viewing state must not hash"),
         )
@@ -866,6 +2165,15 @@ mod tests {
         assert!(tables.iter().any(|name| name == "edit_origin"));
         assert!(tables.iter().any(|name| name == "edit_origin_full"));
         assert!(tables.iter().any(|name| name == "restore_declined"));
+        let columns = db
+            .conn
+            .prepare("PRAGMA table_info(edit_origin)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|name| name == "has_restorable_content"));
     }
 
     #[test]
@@ -923,9 +2231,11 @@ mod tests {
     #[test]
     fn failed_recorder_submission_does_not_propagate_to_edit_caller() {
         let (tx, rx) = mpsc::channel();
+        let (_update_tx, update_rx) = mpsc::channel();
         drop(rx);
         let recorder = ContentIdentityRecorder {
             tx: Some(tx),
+            update_rx,
             handle: None,
             shutdown: Arc::new(AtomicBool::new(false)),
         };

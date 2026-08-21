@@ -2967,6 +2967,153 @@ fn omitted_entries_are_exposed_only_for_the_normal_folder_surface() {
     assert_eq!(app.current_normal_folder_omitted_counts(), None);
 }
 
+#[test]
+fn content_identity_physical_listing_predicate_excludes_mixed_and_archive_surfaces() {
+    use crate::app::top_level_grid_view::{
+        SmartFolderViewState, TopLevelGridSurface, TopLevelSearchView,
+    };
+
+    let mut app = setup_app_for_test();
+    let folder = app.tmp.path().join("pictures");
+    app.current_folder = Some(folder.clone());
+    app.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
+        folder: folder.clone(),
+        counts: Default::default(),
+    });
+    app.top_level_grid_view
+        .replace_surface(TopLevelGridSurface::Folder);
+    app.items = vec![GridItem::Image(folder.join("page.png"))];
+    assert!(app.is_physical_folder_listing());
+
+    app.top_level_grid_view
+        .replace_surface(TopLevelGridSurface::Search(TopLevelSearchView::Global));
+    assert!(!app.is_physical_folder_listing(), "検索結果は対象外");
+    app.top_level_grid_view
+        .replace_surface(TopLevelGridSurface::SmartFolder(
+            SmartFolderViewState::root(uuid::Uuid::nil(), Vec::new()),
+        ));
+    assert!(
+        !app.is_physical_folder_listing(),
+        "スマートフォルダは対象外"
+    );
+
+    app.top_level_grid_view
+        .replace_surface(TopLevelGridSurface::Folder);
+    app.items = vec![GridItem::ZipImage {
+        zip_path: folder.join("book.zip"),
+        entry_name: "page.png".to_string(),
+    }];
+    assert!(!app.is_physical_folder_listing(), "ZIP 内一覧は対象外");
+    app.items = vec![GridItem::PdfPage {
+        pdf_path: folder.join("book.pdf"),
+        page_num: 0,
+        content_type: None,
+    }];
+    assert!(!app.is_physical_folder_listing(), "PDF 内一覧も対象外");
+
+    app.items = vec![GridItem::Image(folder.join("page.png"))];
+    app.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
+        folder: app.tmp.path().join("other"),
+        counts: Default::default(),
+    });
+    assert!(
+        !app.is_physical_folder_listing(),
+        "別 scan の marker は現在の一覧を物理フォルダと証明しない"
+    );
+}
+
+#[test]
+fn content_identity_setting_off_does_not_start_detection_worker() {
+    let mut app = setup_app_for_test();
+    let folder = app.tmp.path().join("pictures");
+    let target = folder.join("target.png");
+    app.settings.edit_restore_prompt_enabled = false;
+    app.content_identity_index_loaded = true;
+    app.content_identity_index
+        .upsert(crate::content_identity::LedgerEntry {
+            file_key: crate::path_key::normalize_keep_drive(&folder.join("origin.png")),
+            size: 42,
+            head_hash: "head".to_string(),
+            full_hash: Some("full".to_string()),
+            hashed_mtime: 1,
+            kind: crate::content_identity::ContentKind::Image,
+            last_edit_at: 10,
+            has_restorable_content: true,
+        });
+    app.current_folder = Some(folder.clone());
+    app.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
+        folder,
+        counts: Default::default(),
+    });
+    app.top_level_grid_view
+        .replace_surface(crate::app::top_level_grid_view::TopLevelGridSurface::Folder);
+    app.items = vec![GridItem::Image(target)];
+    app.image_metas = vec![Some((1, 42))];
+
+    app.maybe_start_content_identity_detection();
+
+    assert!(app.content_identity_detection_pending.is_none());
+}
+
+#[test]
+fn content_identity_folder_switch_cancels_worker_and_stale_result_is_not_applied() {
+    let mut app = setup_app_for_test();
+    let current_folder = app.tmp.path().join("current");
+    let old_folder = app.tmp.path().join("old");
+    app.settings.edit_restore_prompt_enabled = true;
+    app.content_identity_index_load_pending = None;
+    app.content_identity_index_loaded = true;
+    app.current_folder = Some(current_folder.clone());
+    app.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
+        folder: current_folder.clone(),
+        counts: Default::default(),
+    });
+    app.top_level_grid_view
+        .replace_surface(crate::app::top_level_grid_view::TopLevelGridSurface::Folder);
+    app.items = vec![GridItem::Image(current_folder.join("current.png"))];
+    app.image_metas = vec![Some((1, 1))];
+    app.items_generation = 9;
+
+    let stale = crate::content_identity::DetectionResult {
+        items_generation: 8,
+        folder_key: crate::path_key::normalize_keep_drive(&old_folder),
+        candidates: vec![crate::content_identity::RestoreCandidate {
+            target_key: "old-target".to_string(),
+            target_path: old_folder.join("target.png"),
+            target_kind: crate::content_identity::ContentKind::Image,
+            full_hash: "full".to_string(),
+            sources: Vec::new(),
+        }],
+        ledger_updates: Vec::new(),
+    };
+    assert!(!app.content_identity_detection_result_is_current(&stale));
+    let (pending, _cancel) =
+        crate::content_identity::ContentIdentityDetectionPending::for_test(Some(stale));
+    app.content_identity_detection_pending = Some(pending);
+    app.poll_content_identity_detection(&egui::Context::default());
+    assert!(
+        app.content_restore_candidates.is_empty(),
+        "旧候補を適用しない"
+    );
+
+    let (pending, cancel) =
+        crate::content_identity::ContentIdentityDetectionPending::for_test(None);
+    app.content_identity_detection_pending = Some(pending);
+    app.content_restore_candidates = vec![crate::content_identity::RestoreCandidate {
+        target_key: "pending".to_string(),
+        target_path: current_folder.join("pending.png"),
+        target_kind: crate::content_identity::ContentKind::Image,
+        full_hash: "pending-full".to_string(),
+        sources: Vec::new(),
+    }];
+
+    app.install_new_items(Vec::new(), Vec::new());
+
+    assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+    assert!(app.content_identity_detection_pending.is_none());
+    assert!(app.content_restore_candidates.is_empty());
+}
+
 /// `clamp_dynamic_for_gpu` は 8192 以内の画像には触れず、超えるときだけ
 /// 長辺 8192 にアスペクト比保持で縮小する。
 #[test]

@@ -1492,13 +1492,15 @@ mod tests {
                     full_hash TEXT,
                     hashed_mtime INTEGER NOT NULL,
                     kind TEXT NOT NULL,
-                    last_edit_at INTEGER NOT NULL)",
+                    last_edit_at INTEGER NOT NULL,
+                    has_restorable_content INTEGER NOT NULL)",
             )
             .unwrap();
             conn.execute(
                 "INSERT INTO edit_origin
-                    (file_key, size, head_hash, full_hash, hashed_mtime, kind, last_edit_at)
-                 VALUES (?1, 10, 'head', 'full', 20, 'image', 30)",
+                    (file_key, size, head_hash, full_hash, hashed_mtime, kind, last_edit_at,
+                     has_restorable_content)
+                 VALUES (?1, 10, 'head', 'full', 20, 'image', 30, 1)",
                 [&old_k],
             )
             .unwrap();
@@ -1577,14 +1579,18 @@ mod tests {
         assert_eq!(source_path, new_k, "source_path も新キー由来に更新される");
 
         let conn = open(dir.path(), "content_identity.db");
-        let (file_key, full_hash): (String, String) = conn
+        let (file_key, full_hash, has_restorable_content): (String, String, bool) = conn
             .query_row(
-                "SELECT file_key, full_hash FROM edit_origin WHERE file_key = ?1",
+                "SELECT file_key, full_hash, has_restorable_content
+                   FROM edit_origin WHERE file_key = ?1",
                 [&new_k],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!((file_key, full_hash), (new_k.clone(), "full".to_string()));
+        assert_eq!(
+            (file_key, full_hash, has_restorable_content),
+            (new_k.clone(), "full".to_string(), true)
+        );
 
         let conn = open(dir.path(), "tags.db");
         let tags: i64 = conn
