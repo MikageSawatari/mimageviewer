@@ -11913,8 +11913,11 @@ impl App {
                 apply_initial_placement,
                 None,
             );
-            let right_drag_guide =
-                self.right_drag_guide_for_owner(right_drag_owner, window.right_drag_context());
+            // The egui guide owns only audio / hidden-presenter music views. Visible video is
+            // covered by the native presenter guide refreshed during the mounted ParkedLive poll.
+            let right_drag_guide = parked_live_music_info.as_ref().and_then(|_| {
+                self.right_drag_guide_for_owner(right_drag_owner, window.right_drag_context())
+            });
             let ui_scale = self.settings.ui_scale_factor;
             ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx, _class| {
                 let (outer_rect, inner_rect, minimized, maximized, focused, ppp) =

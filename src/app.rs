@@ -39542,6 +39542,9 @@ impl App {
             self.poll_video(ctx);
             self.poll_bookmark_media_open(ctx);
             self.update_parked_live_audio_music_view_state(ctx);
+            // set_native_video_* resolves through fullscreen_idx/fs_cache, so build and push
+            // this owner's overlays before swapping its mounted bundle back out.
+            self.sync_parked_live_native_video_right_drag_overlays(ctx, id);
             self.native_video_parked_live_input_window_id = saved_input_window_id;
             self.swap_viewer_context_bundle(&mut bundle);
             if let Some(window) = self

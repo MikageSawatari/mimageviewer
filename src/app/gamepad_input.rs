@@ -1171,6 +1171,26 @@ impl App {
             })
     }
 
+    /// Whether an owner currently has a right-drag reducer for this surface.
+    ///
+    /// This is intentionally derived only from the typed gesture/ring state. In particular,
+    /// parked native-video input never uses an elapsed-time grace window to keep mouse moves
+    /// alive after the owning reducer has ended.
+    pub(crate) fn right_drag_in_progress_for_owner(
+        &self,
+        owner: RightDragOwner,
+        surface_context: RightDragContext,
+    ) -> bool {
+        self.mouse_gesture
+            .as_ref()
+            .is_some_and(|gesture| gesture.owner == owner && gesture.context == surface_context)
+            || surface_context.ring_context().is_some_and(|ring_context| {
+                self.mouse_ring_flick
+                    .as_ref()
+                    .is_some_and(|flick| flick.owner == owner && flick.context == ring_context)
+            })
+    }
+
     #[cfg(windows)]
     pub(crate) fn request_detached_right_drag_guide_repaint(
         &self,
@@ -3920,8 +3940,8 @@ impl App {
             let music_view = self
                 .fullscreen_idx
                 .is_some_and(|idx| self.fs_music_view_active(idx));
-            let overlay = (context == RingShortcutContext::VideoFullscreen && !music_view)
-                .then(|| self.native_video_ring_guide_overlay(context))
+            let overlay = (!music_view)
+                .then(|| self.native_video_ring_guide_overlay(RightDragOwner::Root, context))
                 .flatten();
             self.set_native_video_ring_guide_overlay(overlay);
             self.request_native_video_hud_repaint(ctx);
@@ -3949,12 +3969,12 @@ impl App {
             let music_view = self
                 .fullscreen_idx
                 .is_some_and(|idx| self.fs_music_view_active(idx));
-            if !self.settings.ring_shortcuts.mouse_gesture_help_visible || music_view {
+            if music_view {
                 self.set_native_video_ring_picker_overlay(None);
                 self.request_native_video_hud_repaint(ctx);
                 return;
             }
-            let overlay = self.native_video_mouse_gesture_overlay();
+            let overlay = self.native_video_mouse_gesture_overlay(RightDragOwner::Root);
             self.set_native_video_ring_picker_overlay(overlay);
             self.request_native_video_hud_repaint(ctx);
         }
@@ -3973,28 +3993,25 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn native_video_mouse_gesture_overlay(
+    pub(crate) fn native_video_mouse_gesture_overlay(
         &self,
+        owner: RightDragOwner,
     ) -> Option<crate::video::native_presenter::NativeOverlayRingPicker> {
-        let gesture = self.mouse_gesture.as_ref()?;
-        if gesture.owner != RightDragOwner::Root
-            || gesture.context != RightDragContext::VideoFullscreen
-            || !gesture.guide_visible()
-        {
+        let Some(RightDragGuide::Gesture {
+            current_pattern,
+            rows,
+            selected_row,
+            short_click_hint,
+        }) = self.right_drag_guide_for_owner(owner, RightDragContext::VideoFullscreen)
+        else {
             return None;
-        }
-        let profile = self
-            .settings
-            .ring_shortcuts
-            .mouse_gesture_profile(RightDragContext::VideoFullscreen);
-        let action_context = RightDragContext::VideoFullscreen.gesture_action_context();
-        let mut rows: Vec<_> = profile
-            .bindings
-            .iter()
+        };
+        let mut rows: Vec<_> = rows
+            .into_iter()
             .map(
-                |binding| crate::video::native_presenter::NativeOverlayRingPickerRow {
-                    label: format_mouse_gesture_pattern(&binding.pattern),
-                    value: binding.action.label_for_context(action_context).to_string(),
+                |row| crate::video::native_presenter::NativeOverlayRingPickerRow {
+                    label: row.label,
+                    value: row.value,
                 },
             )
             .collect();
@@ -4004,23 +4021,11 @@ impl App {
                 value: "環境設定で追加".to_string(),
             });
         }
-        let selected_row = profile.binding_index_for_pattern(&gesture.pattern);
-        let current = if gesture.pattern.is_empty() {
-            "-".to_string()
-        } else {
-            format_mouse_gesture_pattern(&gesture.pattern)
-        };
-        let short_tap_hint = self
-            .settings
-            .ring_shortcuts
-            .viewer_short_right_click_action(RightDragContext::VideoFullscreen)
-            .map(|action| action.guide_hint())
-            .unwrap_or("短押しは閉じる");
         Some(crate::video::native_presenter::NativeOverlayRingPicker {
-            title: format!("マウスジェスチャ / 入力中: {current}"),
+            title: format!("マウスジェスチャ / 入力中: {current_pattern}"),
             rows,
             selected_row,
-            footer: format!("右ドラッグで軌跡を入力、離すと実行 / {short_tap_hint}"),
+            footer: format!("右ドラッグで軌跡を入力、離すと実行 / {short_click_hint}"),
             drill: None,
         })
     }
@@ -4140,47 +4145,59 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn native_video_ring_guide_overlay(
+    pub(crate) fn native_video_ring_guide_overlay(
         &self,
+        owner: RightDragOwner,
         context: RingShortcutContext,
     ) -> Option<crate::video::native_presenter::NativeOverlayRingGuide> {
-        if context != RingShortcutContext::VideoFullscreen || self.ring_picker.is_some() {
+        if context != RingShortcutContext::VideoFullscreen {
             return None;
         }
-        let (selected, heading, detail, center_client_px) = if self.gamepad_state.west_ring_active()
-        {
-            let selected = self.gamepad_state.west_ring_direction();
-            let (heading, detail) = ring_guide_heading_detail(
-                &self.settings.ring_shortcuts.profile(context).slots,
-                context,
-                selected,
-                "X",
-                "方向なしで離すとピッカー",
-            );
-            (selected, heading, detail, None)
-        } else if self.settings.ring_shortcuts.mouse_ring_enabled(context) {
-            if !self.settings.ring_shortcuts.mouse_ring_help_visible {
-                return None;
-            }
-            let flick = self.mouse_ring_flick.as_ref()?;
-            if flick.owner != RightDragOwner::Root
-                || flick.context != context
-                || !flick.guide_visible()
-            {
-                return None;
-            }
-            let selected = mouse_flick_direction(flick);
-            let (heading, detail) = ring_guide_heading_detail(
-                &self.settings.ring_shortcuts.profile(context).slots,
-                context,
-                selected,
-                "右ドラッグ",
-                "中央で離すと取消",
-            );
-            (selected, heading, detail, Some(flick.start_pos))
-        } else {
-            return None;
-        };
+        let (selected, heading, detail, center_client_px, slot_labels) =
+            if owner == RightDragOwner::Root && self.gamepad_state.west_ring_active() {
+                if self.ring_picker.is_some() {
+                    return None;
+                }
+                let selected = self.gamepad_state.west_ring_direction();
+                let (heading, detail) = ring_guide_heading_detail(
+                    &self.settings.ring_shortcuts.profile(context).slots,
+                    context,
+                    selected,
+                    "X",
+                    "方向なしで離すとピッカー",
+                );
+                let slot_labels = self
+                    .settings
+                    .ring_shortcuts
+                    .profile(context)
+                    .slots
+                    .iter()
+                    .map(|action| action.label_for_context(context).to_string())
+                    .collect();
+                (selected, heading, detail, None, slot_labels)
+            } else {
+                let Some(RightDragGuide::Ring {
+                    center,
+                    selected,
+                    slot_labels,
+                }) = self.right_drag_guide_for_owner(owner, RightDragContext::VideoFullscreen)
+                else {
+                    return None;
+                };
+                let (heading, detail) = selected.map_or_else(
+                    || ("右ドラッグ".to_string(), "中央で離すと取消".to_string()),
+                    |direction| {
+                        (
+                            ring_direction_short_label(direction).to_string(),
+                            slot_labels
+                                .get(direction.slot_index())
+                                .cloned()
+                                .unwrap_or_default(),
+                        )
+                    },
+                );
+                (selected, heading, detail, Some(center), slot_labels)
+            };
         Some(crate::video::native_presenter::NativeOverlayRingGuide {
             heading,
             detail,
@@ -4188,22 +4205,55 @@ impl App {
             center_client_px,
             slots: RingDirection::all()
                 .iter()
-                .map(|&direction| {
-                    let action = self
-                        .settings
-                        .ring_shortcuts
-                        .profile(context)
-                        .slots
-                        .get(direction.slot_index())
-                        .cloned()
-                        .unwrap_or_default();
-                    crate::video::native_presenter::NativeOverlayRingGuideSlot {
+                .map(
+                    |&direction| crate::video::native_presenter::NativeOverlayRingGuideSlot {
                         short_label: ring_direction_short_label(direction).to_string(),
-                        action_label: action.label_for_context(context).to_string(),
-                    }
-                })
+                        action_label: slot_labels
+                            .get(direction.slot_index())
+                            .cloned()
+                            .unwrap_or_default(),
+                    },
+                )
                 .collect(),
         })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn native_video_right_drag_overlays_for_owner(
+        &self,
+        owner: RightDragOwner,
+    ) -> (
+        Option<crate::video::native_presenter::NativeOverlayRingPicker>,
+        Option<crate::video::native_presenter::NativeOverlayRingGuide>,
+    ) {
+        (
+            self.native_video_mouse_gesture_overlay(owner),
+            self.native_video_ring_guide_overlay(owner, RingShortcutContext::VideoFullscreen),
+        )
+    }
+
+    /// Refresh ParkedLive right-drag overlays while the owning viewer bundle is mounted.
+    #[cfg(windows)]
+    pub(crate) fn sync_parked_live_native_video_right_drag_overlays(
+        &mut self,
+        ctx: &egui::Context,
+        window_id: u64,
+    ) {
+        let music_view = self
+            .fullscreen_idx
+            .is_some_and(|idx| self.fs_music_view_active(idx));
+        let (gesture_overlay, ring_overlay) = if music_view {
+            // The presenter is hidden for the egui music view, which owns the guide instead.
+            (None, None)
+        } else {
+            self.native_video_right_drag_overlays_for_owner(RightDragOwner::DetachedWindow(
+                window_id,
+            ))
+        };
+        // Push None as well as Some so a completed/cancelled drag cannot leave a stale guide.
+        self.set_native_video_ring_picker_overlay(gesture_overlay);
+        self.set_native_video_ring_guide_overlay(ring_overlay);
+        self.request_native_video_hud_repaint(ctx);
     }
 
     fn commit_ring_picker(&mut self, ctx: &egui::Context) {

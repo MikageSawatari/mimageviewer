@@ -32325,6 +32325,39 @@ mod still_window_mode_key_tests {
         state
     }
 
+    #[cfg(windows)]
+    fn visible_video_gesture_state(
+        owner: crate::ring_shortcut::RightDragOwner,
+    ) -> crate::ring_shortcut::MouseGestureState {
+        let pos = egui::pos2(80.0, 120.0);
+        let mut state = crate::ring_shortcut::MouseGestureState::new(
+            owner,
+            crate::ring_shortcut::RightDragContext::VideoFullscreen,
+            std::time::Instant::now(),
+            pos,
+        );
+        state.pattern = vec![crate::ring_shortcut::MouseGestureDirection::Right];
+        state.armed = true;
+        state.current_pos = egui::pos2(140.0, 120.0);
+        state
+    }
+
+    #[cfg(windows)]
+    fn visible_video_ring_state(
+        owner: crate::ring_shortcut::RightDragOwner,
+    ) -> crate::ring_shortcut::MouseFlickState {
+        let pos = egui::pos2(80.0, 120.0);
+        let mut state = crate::ring_shortcut::MouseFlickState::new(
+            owner,
+            crate::ring_shortcut::RingShortcutContext::VideoFullscreen,
+            std::time::Instant::now(),
+            pos,
+        );
+        state.armed = true;
+        state.current_pos = egui::pos2(160.0, 120.0);
+        state
+    }
+
     #[test]
     fn right_drag_guide_contents_match_for_root_and_detached_owner() {
         let mut app = setup_app();
@@ -32493,6 +32526,86 @@ mod still_window_mode_key_tests {
 
         assert!(app.cancel_detached_right_drag_owner(75, "test_cancel"));
         assert!(app.right_drag_guide_for_owner(owner, context).is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_live_native_overlay_builders_reuse_owner_guide_conditions() {
+        let mut app = setup_app();
+        let owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(76);
+        let context = crate::ring_shortcut::RightDragContext::VideoFullscreen;
+
+        app.settings
+            .ring_shortcuts
+            .set_right_drag_mode(context, crate::ring_shortcut::RightDragMode::MouseGesture);
+        app.mouse_gesture = Some(visible_video_gesture_state(owner));
+        assert!(app.right_drag_guide_for_owner(owner, context).is_some());
+        assert!(app.native_video_mouse_gesture_overlay(owner).is_some());
+
+        app.settings.ring_shortcuts.mouse_gesture_help_visible = false;
+        assert!(app.right_drag_guide_for_owner(owner, context).is_none());
+        assert!(app.native_video_mouse_gesture_overlay(owner).is_none());
+        app.settings.ring_shortcuts.mouse_gesture_help_visible = true;
+
+        app.ring_picker = Some(
+            app.build_ring_picker_state(crate::ring_shortcut::RingShortcutContext::VideoFullscreen),
+        );
+        assert!(app.right_drag_guide_for_owner(owner, context).is_none());
+        assert!(app.native_video_mouse_gesture_overlay(owner).is_none());
+        app.ring_picker = None;
+
+        app.mouse_gesture = None;
+        app.settings
+            .ring_shortcuts
+            .set_right_drag_mode(context, crate::ring_shortcut::RightDragMode::RingShortcut);
+        app.mouse_ring_flick = Some(visible_video_ring_state(owner));
+        assert!(app.right_drag_guide_for_owner(owner, context).is_some());
+        assert!(
+            app.native_video_ring_guide_overlay(
+                owner,
+                crate::ring_shortcut::RingShortcutContext::VideoFullscreen,
+            )
+            .is_some()
+        );
+
+        app.settings.ring_shortcuts.mouse_ring_help_visible = false;
+        assert!(app.right_drag_guide_for_owner(owner, context).is_none());
+        assert!(
+            app.native_video_ring_guide_overlay(
+                owner,
+                crate::ring_shortcut::RingShortcutContext::VideoFullscreen,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_live_native_overlay_builder_clears_without_owner_gesture() {
+        let mut app = setup_app();
+        let owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(77);
+        let other_owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(78);
+        let context = crate::ring_shortcut::RightDragContext::VideoFullscreen;
+        app.settings
+            .ring_shortcuts
+            .set_right_drag_mode(context, crate::ring_shortcut::RightDragMode::MouseGesture);
+
+        let overlays = app.native_video_right_drag_overlays_for_owner(owner);
+        assert!(overlays.0.is_none() && overlays.1.is_none());
+
+        app.mouse_gesture = Some(visible_video_gesture_state(other_owner));
+        let overlays = app.native_video_right_drag_overlays_for_owner(owner);
+        assert!(overlays.0.is_none() && overlays.1.is_none());
+
+        app.mouse_gesture = Some(visible_video_gesture_state(owner));
+        assert!(
+            app.native_video_right_drag_overlays_for_owner(owner)
+                .0
+                .is_some()
+        );
+        assert!(app.cancel_right_drag_for_owner(owner));
+        let overlays = app.native_video_right_drag_overlays_for_owner(owner);
+        assert!(overlays.0.is_none() && overlays.1.is_none());
     }
 
     fn passive_rotate_command() -> crate::ring_shortcut::RightDragCommand {
@@ -45130,6 +45243,8 @@ mod still_window_mode_key_tests {
             NativeVideoMouseWheelEvent, NativeVideoWindowEvent as WinEv,
         };
 
+        let mut app = setup_app();
+        app.native_video_parked_live_input_window_id = Some(91);
         let key = NativeVideoKeyEvent {
             virtual_key: 0x28,
             scan_code: 0,
@@ -45160,21 +45275,23 @@ mod still_window_mode_key_tests {
             ..left_down
         };
 
-        assert!(!App::native_video_output_event_allowed_while_parked_live(
-            &Ev::Window(WinEv::KeyDown(key))
-        ));
-        assert!(!App::native_video_output_event_allowed_while_parked_live(
-            &Ev::Window(WinEv::MouseWheel(wheel))
-        ));
-        assert!(!App::native_video_output_event_allowed_while_parked_live(
-            &Ev::NavigateItem {
+        assert!(
+            !app.native_video_output_event_allowed_while_parked_live(&Ev::Window(WinEv::KeyDown(
+                key
+            )))
+        );
+        assert!(
+            !app.native_video_output_event_allowed_while_parked_live(&Ev::Window(
+                WinEv::MouseWheel(wheel)
+            ))
+        );
+        assert!(
+            !app.native_video_output_event_allowed_while_parked_live(&Ev::NavigateItem {
                 delta: 1,
                 via_wheel: true
-            }
-        ));
-        assert!(!App::native_video_output_event_allowed_while_parked_live(
-            &Ev::TogglePlay
-        ));
+            })
+        );
+        assert!(!app.native_video_output_event_allowed_while_parked_live(&Ev::TogglePlay));
         assert!(App::native_video_output_event_is_parked_live_left_button(
             &Ev::Window(WinEv::MouseButton(left_down)),
             true
@@ -45189,6 +45306,218 @@ mod still_window_mode_key_tests {
         assert!(!App::native_video_output_event_blocked_while_parked_live(
             &Ev::Window(WinEv::MouseButton(left_up))
         ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_live_native_right_drag_allow_list_is_narrow_and_state_based() {
+        use crate::ring_shortcut::{RightDragContext, RightDragMode, RightDragOwner};
+        use crate::video::NativeVideoOutputEvent as Ev;
+        use crate::video::native_window::{
+            NativeVideoKeyEvent, NativeVideoMouseButton, NativeVideoMouseButtonEvent,
+            NativeVideoMouseEvent, NativeVideoMouseWheelEvent, NativeVideoWindowEvent as WinEv,
+        };
+
+        let mut app = setup_app();
+        let window_id = 93;
+        let owner = RightDragOwner::DetachedWindow(window_id);
+        app.native_video_parked_live_input_window_id = Some(window_id);
+        app.settings.ring_shortcuts.set_right_drag_mode(
+            RightDragContext::VideoFullscreen,
+            RightDragMode::MouseGesture,
+        );
+
+        let right_down = NativeVideoMouseButtonEvent {
+            button: NativeVideoMouseButton::Right,
+            down: true,
+            double_click: false,
+            x: 40,
+            y: 50,
+            shift: false,
+            ctrl: false,
+        };
+        let right_up = NativeVideoMouseButtonEvent {
+            down: false,
+            ..right_down
+        };
+        let left_down = NativeVideoMouseButtonEvent {
+            button: NativeVideoMouseButton::Left,
+            ..right_down
+        };
+        let mouse_move = NativeVideoMouseEvent {
+            x: 60,
+            y: 70,
+            shift: false,
+            ctrl: false,
+        };
+        assert!(
+            app.native_video_output_event_allowed_while_parked_live(&Ev::Window(
+                WinEv::MouseButton(right_down)
+            ))
+        );
+        assert!(
+            app.native_video_output_event_allowed_while_parked_live(&Ev::Window(
+                WinEv::MouseButton(right_up)
+            ))
+        );
+        assert!(
+            !app.native_video_output_event_allowed_while_parked_live(&Ev::Window(
+                WinEv::MouseMove(mouse_move)
+            )),
+            "an unowned hover move must remain filtered"
+        );
+        assert!(
+            !app.native_video_output_event_allowed_while_parked_live(&Ev::Window(
+                WinEv::MouseButton(left_down)
+            )),
+            "left click remains on its dedicated activation path"
+        );
+
+        app.mouse_gesture = Some(crate::ring_shortcut::MouseGestureState::new(
+            owner,
+            RightDragContext::VideoFullscreen,
+            std::time::Instant::now() - std::time::Duration::from_secs(3600),
+            egui::pos2(40.0, 50.0),
+        ));
+        assert!(
+            app.native_video_output_event_allowed_while_parked_live(&Ev::Window(WinEv::MouseMove(
+                mouse_move
+            ))),
+            "the owning reducer, not its age, keeps drag moves enabled"
+        );
+        app.mouse_gesture = Some(crate::ring_shortcut::MouseGestureState::new(
+            RightDragOwner::DetachedWindow(window_id + 1),
+            RightDragContext::VideoFullscreen,
+            std::time::Instant::now(),
+            egui::pos2(40.0, 50.0),
+        ));
+        assert!(
+            !app.native_video_output_event_allowed_while_parked_live(&Ev::Window(
+                WinEv::MouseMove(mouse_move)
+            ))
+        );
+
+        app.mouse_gesture = None;
+        app.mouse_ring_flick = Some(crate::ring_shortcut::MouseFlickState::new(
+            owner,
+            crate::ring_shortcut::RingShortcutContext::VideoFullscreen,
+            std::time::Instant::now(),
+            egui::pos2(40.0, 50.0),
+        ));
+        assert!(
+            app.native_video_output_event_allowed_while_parked_live(&Ev::Window(WinEv::MouseMove(
+                mouse_move
+            )))
+        );
+
+        let key = NativeVideoKeyEvent {
+            virtual_key: 0x28,
+            scan_code: 0,
+            extended: false,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        };
+        let wheel = NativeVideoMouseWheelEvent {
+            delta: -120,
+            x: 60,
+            y: 70,
+            shift: false,
+            ctrl: false,
+        };
+        for event in [
+            Ev::Window(WinEv::KeyDown(key)),
+            Ev::Window(WinEv::MouseWheel(wheel)),
+            Ev::Seek { target_secs: 12.0 },
+            Ev::SetVolume {
+                volume: 0.5,
+                persist: true,
+            },
+            Ev::SetPlaybackSpeed { speed: 1.5 },
+            Ev::TogglePlay,
+        ] {
+            assert!(!app.native_video_output_event_allowed_while_parked_live(&event));
+        }
+
+        app.settings
+            .ring_shortcuts
+            .set_right_drag_mode(RightDragContext::VideoFullscreen, RightDragMode::Disabled);
+        for event in [
+            Ev::Window(WinEv::MouseButton(right_down)),
+            Ev::Window(WinEv::MouseButton(right_up)),
+            Ev::Window(WinEv::MouseMove(mouse_move)),
+        ] {
+            assert!(!app.native_video_output_event_allowed_while_parked_live(&event));
+            assert!(app.native_video_event_blocked_by_parked_live_filter(&event));
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parked_live_native_right_drag_enters_detached_window_owner_reducer() {
+        use crate::ring_shortcut::{RightDragContext, RightDragMode, RightDragOwner};
+        use crate::video::NativeVideoOutputEvent as Ev;
+        use crate::video::native_window::{
+            NativeVideoMouseButton, NativeVideoMouseButtonEvent, NativeVideoMouseEvent,
+            NativeVideoWindowEvent as WinEv,
+        };
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\parked-gesture.mp4");
+        let window_id = 94;
+        let owner = RightDragOwner::DetachedWindow(window_id);
+        app.fullscreen_idx = Some(video);
+        app.native_video_parked_live_input_window_id = Some(window_id);
+        app.settings.ring_shortcuts.set_right_drag_mode(
+            RightDragContext::VideoFullscreen,
+            RightDragMode::MouseGesture,
+        );
+
+        let right_down = NativeVideoMouseButtonEvent {
+            button: NativeVideoMouseButton::Right,
+            down: true,
+            double_click: false,
+            x: 400,
+            y: 300,
+            shift: false,
+            ctrl: false,
+        };
+        let down_event = Ev::Window(WinEv::MouseButton(right_down));
+        assert!(app.native_video_output_event_allowed_while_parked_live(&down_event));
+        app.handle_native_video_window_event(&ctx, video, WinEv::MouseButton(right_down));
+        assert!(app.mouse_gesture.as_ref().is_some_and(|gesture| {
+            gesture.owner == owner && gesture.context == RightDragContext::VideoFullscreen
+        }));
+
+        app.handle_native_video_window_event(
+            &ctx,
+            video,
+            WinEv::MouseMove(NativeVideoMouseEvent {
+                x: 480,
+                y: 300,
+                shift: false,
+                ctrl: false,
+            }),
+        );
+        assert_eq!(
+            app.mouse_gesture
+                .as_ref()
+                .map(|gesture| gesture.current_pos),
+            Some(egui::pos2(480.0, 300.0))
+        );
+
+        app.cancel_mouse_gesture();
+        app.settings.ring_shortcuts.set_right_drag_mode(
+            RightDragContext::VideoFullscreen,
+            RightDragMode::RingShortcut,
+        );
+        app.handle_native_video_window_event(&ctx, video, WinEv::MouseButton(right_down));
+        assert!(app.mouse_ring_flick.as_ref().is_some_and(|flick| {
+            flick.owner == owner
+                && flick.context == crate::ring_shortcut::RingShortcutContext::VideoFullscreen
+        }));
     }
 
     #[test]

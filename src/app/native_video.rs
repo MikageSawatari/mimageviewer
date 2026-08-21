@@ -3445,7 +3445,7 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn native_video_output_event_allowed_while_parked_live(
+    fn native_video_output_event_is_parked_live_maintenance(
         event: &crate::video::NativeVideoOutputEvent,
     ) -> bool {
         use crate::video::NativeVideoOutputEvent as Ev;
@@ -3455,8 +3455,8 @@ impl App {
             // Placement completion/failure is lifecycle bookkeeping from an in-flight presenter
             // operation, not user input. Dropping it can leave pending switch state stale.
             Ev::PlacementSwitched { .. } | Ev::PlacementSwitchFailed { .. } => true,
-            // Passive/ParkedLive windows must not react to keys, wheel, or mouse buttons. Geometry
-            // maintenance is harmless and keeps the presenter in sync if it reports DPI/rect data.
+            // Baseline maintenance excludes user input. The narrow owner-scoped right-drag
+            // exception is applied by native_video_output_event_allowed_while_parked_live below.
             Ev::Window(
                 WinEv::GeometryChanged { .. }
                 | WinEv::DpiChanged { .. }
@@ -3464,6 +3464,48 @@ impl App {
                 | WinEv::MouseLeave,
             ) => true,
             Ev::Window(_) => false,
+            _ => false,
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn native_video_output_event_allowed_while_parked_live(
+        &self,
+        event: &crate::video::NativeVideoOutputEvent,
+    ) -> bool {
+        use crate::ring_shortcut::{RightDragContext, RightDragMode, RightDragOwner};
+        use crate::video::NativeVideoOutputEvent as Ev;
+        use crate::video::native_window::{
+            NativeVideoMouseButton, NativeVideoWindowEvent as WinEv,
+        };
+
+        if Self::native_video_output_event_is_parked_live_maintenance(event) {
+            return true;
+        }
+        let Some(window_id) = self.native_video_parked_live_input_window_id else {
+            return false;
+        };
+        let right_drag_mode = self
+            .settings
+            .ring_shortcuts
+            .right_drag_mode(RightDragContext::VideoFullscreen);
+        let right_drag_enabled = matches!(
+            right_drag_mode,
+            RightDragMode::RingShortcut | RightDragMode::MouseGesture
+        );
+        match event {
+            Ev::Window(WinEv::MouseButton(button)) => {
+                right_drag_enabled
+                    && button.button == NativeVideoMouseButton::Right
+                    && !button.double_click
+            }
+            Ev::Window(WinEv::MouseMove(_)) => {
+                right_drag_enabled
+                    && self.right_drag_in_progress_for_owner(
+                        RightDragOwner::DetachedWindow(window_id),
+                        RightDragContext::VideoFullscreen,
+                    )
+            }
             _ => false,
         }
     }
@@ -3513,10 +3555,12 @@ impl App {
     }
 
     #[cfg(windows)]
+    /// Baseline ParkedLive input block used while remote control owns local input. The passive
+    /// right-drag exception is intentionally applied only by the owner-aware filter above.
     pub(crate) fn native_video_output_event_blocked_while_parked_live(
         event: &crate::video::NativeVideoOutputEvent,
     ) -> bool {
-        !Self::native_video_output_event_allowed_while_parked_live(event)
+        !Self::native_video_output_event_is_parked_live_maintenance(event)
             && !Self::native_video_output_event_is_parked_live_left_button(event, true)
             && !Self::native_video_output_event_is_parked_live_left_button(event, false)
     }
@@ -3549,7 +3593,9 @@ impl App {
         event: &crate::video::NativeVideoOutputEvent,
     ) -> bool {
         self.native_video_parked_live_input_window_id.is_some()
-            && Self::native_video_output_event_blocked_while_parked_live(event)
+            && !self.native_video_output_event_allowed_while_parked_live(event)
+            && !Self::native_video_output_event_is_parked_live_left_button(event, true)
+            && !Self::native_video_output_event_is_parked_live_left_button(event, false)
     }
 
     #[cfg(windows)]
