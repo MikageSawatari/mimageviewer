@@ -35,6 +35,23 @@ fn relation_label(source_exists: bool) -> &'static str {
     }
 }
 
+fn source_option_text(source: &ContentRestoreUiSource) -> String {
+    format!("{} ({})", source.path, relation_label(source.source_exists))
+}
+
+fn single_source_row_text(row: &ContentRestoreUiRow) -> Option<String> {
+    let [source] = row.sources.as_slice() else {
+        return None;
+    };
+    Some(format!("← {}", source_option_text(source)))
+}
+
+fn multiple_source_warning_text(rows: &[ContentRestoreUiRow]) -> Option<String> {
+    let count = rows.iter().filter(|row| row.sources.len() > 1).count();
+    (count > 0)
+        .then(|| format!("{count} 件、複数のコピー元があります。コピー元を選択してください。"))
+}
+
 fn resolve_window_action(
     open: bool,
     action: Option<ContentRestoreUiAction>,
@@ -64,6 +81,9 @@ fn render_content_restore_contents_with_list_height(
         rows.len()
     ));
     ui.label("編集内容 (補正・消しゴム・モザイク・注釈・トリミング・★・タグ) を複製しますか?");
+    if let Some(warning) = multiple_source_warning_text(rows) {
+        ui.label(egui::RichText::new(warning).color(ui.visuals().warn_fg_color));
+    }
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         if ui.button("すべて選ぶ").clicked() {
@@ -114,28 +134,24 @@ fn render_restore_rows(ui: &mut egui::Ui, rows: &mut [ContentRestoreUiRow]) {
         let Some(source) = row.sources.get(row.source_index) else {
             continue;
         };
-        let source_path = source.path.clone();
-        let source_exists = source.source_exists;
+        let selected_source_text = source_option_text(source);
+        let source_count = row.sources.len();
+        let single_source_text = single_source_row_text(row);
         ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut row.selected, &row.file_name);
-            ui.label(format!(
-                "← {} ({})",
-                source_path,
-                relation_label(source_exists)
-            ));
-            if row.sources.len() > 1 {
+            if let Some(single_source_text) = single_source_text {
+                // 単一候補は大多数を占めるため、A3b からの行表示を変えない。
+                ui.label(single_source_text);
+            } else {
+                ui.label(format!("← コピー元を選択 ({source_count} 件)"));
                 egui::ComboBox::from_id_salt(("content_restore_source", row_index))
-                    .selected_text(format!("他 {} 件の候補", row.sources.len() - 1))
+                    .selected_text(selected_source_text)
                     .show_ui(ui, |ui| {
                         for (source_index, source) in row.sources.iter().enumerate() {
                             ui.selectable_value(
                                 &mut row.source_index,
                                 source_index,
-                                format!(
-                                    "{} ({})",
-                                    source.path,
-                                    relation_label(source.source_exists)
-                                ),
+                                source_option_text(source),
                             );
                         }
                     });
@@ -245,6 +261,20 @@ mod tests {
         height
     }
 
+    fn row_with_source_count(source_count: usize) -> ContentRestoreUiRow {
+        ContentRestoreUiRow {
+            file_name: "target.png".to_string(),
+            selected: true,
+            source_index: 0,
+            sources: (0..source_count)
+                .map(|index| ContentRestoreUiSource {
+                    path: format!("C:/source/{index}.png"),
+                    source_exists: index % 2 == 0,
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn select_all_and_clear_all_cover_every_row() {
         let mut rows = rows();
@@ -253,6 +283,42 @@ mod tests {
 
         set_all_restore_rows_selected(&mut rows, false);
         assert!(rows.iter().all(|row| !row.selected));
+    }
+
+    #[test]
+    fn multiple_source_warning_is_hidden_for_the_single_source_case() {
+        assert_eq!(multiple_source_warning_text(&rows()), None);
+    }
+
+    #[test]
+    fn multiple_source_warning_counts_rows_instead_of_source_candidates() {
+        assert_eq!(
+            multiple_source_warning_text(&[
+                row_with_source_count(1),
+                row_with_source_count(4),
+                row_with_source_count(1),
+            ]),
+            Some("1 件、複数のコピー元があります。コピー元を選択してください。".to_string())
+        );
+        assert_eq!(
+            multiple_source_warning_text(&[
+                row_with_source_count(2),
+                row_with_source_count(5),
+                row_with_source_count(3),
+                row_with_source_count(1),
+            ]),
+            Some("3 件、複数のコピー元があります。コピー元を選択してください。".to_string())
+        );
+    }
+
+    #[test]
+    fn single_source_row_keeps_the_existing_text_and_has_no_selector_presentation() {
+        let row = row_with_source_count(1);
+        assert_eq!(
+            single_source_row_text(&row).as_deref(),
+            Some("← C:/source/0.png (コピー元は残っています)")
+        );
+        assert!(single_source_row_text(&row_with_source_count(2)).is_none());
     }
 
     #[test]

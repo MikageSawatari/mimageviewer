@@ -72,10 +72,11 @@ impl ContentRestorePrompt {
     ) -> Option<Self> {
         let mut retained = Vec::new();
         let mut ui_rows = Vec::new();
-        for candidate in candidates {
+        for mut candidate in candidates {
             if candidate.sources.is_empty() {
                 continue;
             }
+            crate::content_identity::sort_restore_sources(&mut candidate.sources);
             let file_name = candidate
                 .target_path
                 .file_name()
@@ -551,6 +552,39 @@ mod tests {
         assert!(selected[0].candidate.target_key.ends_with("/on.png"));
         assert_eq!(declined.len(), 1);
         assert!(declined[0].target_key.ends_with("/off.png"));
+    }
+
+    #[test]
+    fn choosing_another_source_changes_the_source_used_for_restore() {
+        let mut candidate = candidate("target");
+        candidate.sources = vec![
+            crate::content_identity::RestoreSourceCandidate {
+                file_key: "c:/original/z.png".to_string(),
+                path: PathBuf::from("C:/original/z.png"),
+                kind: crate::content_identity::ContentKind::Image,
+                last_edit_at: 0,
+                source_exists: false,
+            },
+            crate::content_identity::RestoreSourceCandidate {
+                file_key: "c:/original/a.png".to_string(),
+                path: PathBuf::from("C:/original/a.png"),
+                kind: crate::content_identity::ContentKind::Image,
+                last_edit_at: 0,
+                source_exists: true,
+            },
+        ];
+        let mut prompt = ContentRestorePrompt::from_candidates(vec![candidate]).unwrap();
+        assert_eq!(prompt.ui_rows[0].sources[0].path, "C:/original/a.png");
+        prompt.ui_rows[0].source_index = 1;
+
+        let decision = prompt.decide(ContentRestorePromptAction::Restore);
+        let ContentRestorePromptDecision::Restore { selected, .. } = decision else {
+            panic!("restore action must produce a batch");
+        };
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].source.file_key, "c:/original/z.png");
+        assert!(!selected[0].source.source_exists);
     }
 
     #[test]
