@@ -4069,7 +4069,7 @@ pub struct Settings {
     pub keymap: crate::keymap::KeymapSettings,
 
     // ── フォルダサムネイル ──────────────────────────────────────
-    /// フォルダの代表画像を選ぶ際のソート順（デフォルト: 番号順）
+    /// フォルダの代表画像を選ぶ際のソート順（デフォルト: ファイル名順）
     #[serde(default = "default_folder_thumb_sort")]
     pub folder_thumb_sort: SortOrder,
 
@@ -5089,7 +5089,7 @@ fn default_gpu_memory_percent() -> u32 {
     50
 }
 fn default_folder_thumb_sort() -> SortOrder {
-    SortOrder::Numeric
+    SortOrder::FileName
 }
 fn default_folder_thumb_depth() -> u32 {
     3
@@ -9494,6 +9494,7 @@ mod tests {
         assert_eq!(s.folder_skip_limit, 5);
         assert!(!s.show_hidden_files);
         assert_eq!(s.sort_order, SortOrder::FileName);
+        assert_eq!(s.folder_thumb_sort, SortOrder::FileName);
         assert_eq!(s.subfolder_expansion_order, SubfolderExpansionOrder::Flat);
         assert_eq!(
             s.subfolder_expansion_max_depth,

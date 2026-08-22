@@ -632,6 +632,14 @@ const TABLE: &[VersionHighlights] = &[
             body: "自宅の PC で mImageViewer を起動したままにしておくと、外出先のスマートフォンやタブレットのブラウザから同じライブラリを開けます。画像も漫画も動画も、手元へコピーせずそのまま見られます。既定ではオフで、使うには環境設定から有効にします。接続には Tailscale と PIN の両方が必要です。",
         }],
     },
+    VersionHighlights {
+        version: "3.2.0",
+        must_read: &[HighlightItem {
+            title: "フォルダの代表画像の選び方が変わります",
+            body: "フォルダタイルの代表画像を、一覧と同じファイル名順で選ぶように変更します。以前に番号順を選んでいた場合も、更新後に一度だけファイル名順へ変わります。番号順へ戻すには、環境設定 → フォルダ → 「代表画像の選択基準」で「番号順（区切り無視）」を選んでください。",
+        }],
+        highlights: &[],
+    },
 ];
 
 #[cfg(test)]
@@ -963,6 +971,25 @@ mod tests {
         assert!(entry.must_read[0].body.contains("1対1"));
         assert!(entry.must_read[0].body.contains("拡大縮小"));
         assert!(entry.must_read[1].body.contains("縮小時のなめらかさ"));
+    }
+
+    #[test]
+    fn embedded_table_contains_v3_2_0_folder_thumb_sort_notice() {
+        let entries = for_version("3.2.0", table());
+        assert_eq!(versions(&entries), ["3.2.0"]);
+        let entry = entries[0];
+        assert!(entry.highlights.is_empty());
+        let notice = entry
+            .must_read
+            .iter()
+            .find(|item| item.title.contains("代表画像"))
+            .expect("v3.2.0 must announce the folder thumbnail default change");
+        assert!(
+            notice
+                .body
+                .contains("環境設定 → フォルダ → 「代表画像の選択基準」")
+        );
+        assert!(notice.body.contains("番号順（区切り無視）"));
     }
 
     #[test]
