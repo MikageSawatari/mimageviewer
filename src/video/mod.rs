@@ -425,6 +425,73 @@ impl NativeVideoInitialVisibility {
 }
 
 #[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoScaleChangeOrigin {
+    Panel,
+    Key,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VideoScaleFallbackNotice {
+    DisplaySizeLimitExceeded {
+        requested_width: u32,
+        requested_height: u32,
+        max_dimension: u32,
+        max_pixels: u64,
+    },
+    Other,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VideoScaleFeedbackTransition {
+    Requested,
+    Committed {
+        filter: crate::settings::VideoScaleFilter,
+        fallback: Option<VideoScaleFallbackNotice>,
+    },
+    Rejected,
+}
+
+#[cfg(windows)]
+fn video_scale_feedback_toast(
+    origin: VideoScaleChangeOrigin,
+    transition: VideoScaleFeedbackTransition,
+) -> Option<String> {
+    if origin != VideoScaleChangeOrigin::Key {
+        return None;
+    }
+    match transition {
+        VideoScaleFeedbackTransition::Requested => None,
+        VideoScaleFeedbackTransition::Committed { filter, fallback } => {
+            let mut toast = format!("[T: {}]", filter.label());
+            match fallback {
+                Some(VideoScaleFallbackNotice::DisplaySizeLimitExceeded {
+                    requested_width,
+                    requested_height,
+                    max_dimension,
+                    max_pixels,
+                }) => {
+                    toast.push('\n');
+                    toast.push_str(&format!(
+                        "(解像度が高いため動画フィルタ処理無効: {requested_width}×{requested_height} は上限 長辺 {max_dimension}px 以下・総画素数 {max_pixels}px 以下の範囲外。「OS に任せる」で表示します)"
+                    ));
+                }
+                Some(VideoScaleFallbackNotice::Other) => {
+                    toast.push_str("\n(動画フィルタを適用できないため「OS に任せる」で表示します)");
+                }
+                None => {}
+            }
+            Some(toast)
+        }
+        VideoScaleFeedbackTransition::Rejected => {
+            Some("[T: 切り替えを適用できませんでした]".to_string())
+        }
+    }
+}
+
+#[cfg(windows)]
 #[derive(Clone, Debug)]
 pub enum NativeVideoOutputEvent {
     Window(native_window::NativeVideoWindowEvent),
@@ -538,10 +605,12 @@ pub enum NativeVideoOutputEvent {
         request_id: u64,
         filter: crate::settings::VideoScaleFilter,
         smoothing_percent: u32,
+        origin: VideoScaleChangeOrigin,
     },
     VideoScaleSettingsCommitted {
         filter: crate::settings::VideoScaleFilter,
         smoothing_percent: u32,
+        toast: Option<String>,
     },
     SetPlaybackSpeed {
         speed: f64,
@@ -787,11 +856,13 @@ enum NativeVideoOutputCommand {
         request_id: u64,
         filter: crate::settings::VideoScaleFilter,
         smoothing_percent: u32,
+        origin: VideoScaleChangeOrigin,
     },
     CommitVideoScaleSettings {
         request_id: u64,
         filter: crate::settings::VideoScaleFilter,
         smoothing_percent: u32,
+        origin: VideoScaleChangeOrigin,
     },
     SetMetadata {
         metadata: Option<native_presenter::NativeOverlayMetadata>,
@@ -1630,7 +1701,13 @@ impl NativeVideoOutput {
         &self,
         filter: crate::settings::VideoScaleFilter,
         smoothing_percent: u32,
+        origin: VideoScaleChangeOrigin,
     ) {
+        if let Some(toast) =
+            video_scale_feedback_toast(origin, VideoScaleFeedbackTransition::Requested)
+        {
+            self.show_toast(toast, false, None);
+        }
         let request_id = self
             .video_scale_request_id
             .fetch_add(1, Ordering::AcqRel)
@@ -1641,6 +1718,7 @@ impl NativeVideoOutput {
                 request_id,
                 filter,
                 smoothing_percent,
+                origin,
             });
         crate::video::native_window::post_wake(self.hwnd.load(Ordering::Acquire));
     }
@@ -1650,8 +1728,14 @@ impl NativeVideoOutput {
         request_id: u64,
         filter: crate::settings::VideoScaleFilter,
         smoothing_percent: u32,
+        origin: VideoScaleChangeOrigin,
     ) {
         if self.video_scale_request_id.load(Ordering::Acquire) != request_id {
+            if let Some(toast) =
+                video_scale_feedback_toast(origin, VideoScaleFeedbackTransition::Rejected)
+            {
+                self.show_toast(toast, false, None);
+            }
             return;
         }
         let _ = self
@@ -1660,6 +1744,7 @@ impl NativeVideoOutput {
                 request_id,
                 filter,
                 smoothing_percent,
+                origin,
             });
         crate::video::native_window::post_wake(self.hwnd.load(Ordering::Acquire));
     }
@@ -3574,6 +3659,7 @@ fn run_native_video_output(
                     request_id,
                     filter,
                     smoothing_percent,
+                    origin,
                 } => {
                     let smoothing_percent =
                         crate::settings::sanitize_downscale_smoothing_percent(smoothing_percent);
@@ -3591,21 +3677,39 @@ fn run_native_video_output(
                                     request_id,
                                     filter,
                                     smoothing_percent,
+                                    origin,
                                 },
                             ),
-                            Err(error) => crate::logger::log(format!(
-                                "[native-video] scale-filter preparation failed: {error}"
-                            )),
+                            Err(error) => {
+                                crate::logger::log(format!(
+                                    "[native-video] scale-filter preparation failed: {error}"
+                                ));
+                                if let Some(toast) = video_scale_feedback_toast(
+                                    origin,
+                                    VideoScaleFeedbackTransition::Rejected,
+                                ) {
+                                    presenter.show_overlay_toast(toast, false, None);
+                                }
+                            }
                         },
-                        None => crate::logger::log(
-                            "[native-video] scale-filter preparation ignored before first frame",
-                        ),
+                        None => {
+                            crate::logger::log(
+                                "[native-video] scale-filter preparation ignored before first frame",
+                            );
+                            if let Some(toast) = video_scale_feedback_toast(
+                                origin,
+                                VideoScaleFeedbackTransition::Rejected,
+                            ) {
+                                presenter.show_overlay_toast(toast, false, None);
+                            }
+                        }
                     }
                 }
                 NativeVideoOutputCommand::CommitVideoScaleSettings {
                     request_id,
                     filter,
                     smoothing_percent,
+                    origin,
                 } => {
                     let smoothing_percent =
                         crate::settings::sanitize_downscale_smoothing_percent(smoothing_percent);
@@ -3623,6 +3727,12 @@ fn run_native_video_output(
                         crate::logger::log(format!(
                             "[native-video] stale scale-filter commit discarded request_id={request_id}"
                         ));
+                        if let Some(toast) = video_scale_feedback_toast(
+                            origin,
+                            VideoScaleFeedbackTransition::Rejected,
+                        ) {
+                            presenter.show_overlay_toast(toast, false, None);
+                        }
                     } else {
                         cur_scale_filter = filter;
                         cur_downscale_smoothing_percent = smoothing_percent;
@@ -3644,12 +3754,20 @@ fn run_native_video_output(
                                 None => {}
                             }
                         }
+                        let toast = video_scale_feedback_toast(
+                            origin,
+                            VideoScaleFeedbackTransition::Committed {
+                                filter,
+                                fallback: presenter.video_scale_fallback_notice(),
+                            },
+                        );
                         send_native_output_event(
                             &ui_event_tx,
                             source.source_epoch,
                             NativeVideoOutputEvent::VideoScaleSettingsCommitted {
                                 filter,
                                 smoothing_percent,
+                                toast,
                             },
                         );
                     }
@@ -7486,9 +7604,10 @@ impl VideoPlayer {
         &self,
         filter: crate::settings::VideoScaleFilter,
         smoothing_percent: u32,
+        origin: VideoScaleChangeOrigin,
     ) {
         if let Some(output) = self.native_output.as_ref() {
-            output.prepare_video_scale_settings(filter, smoothing_percent);
+            output.prepare_video_scale_settings(filter, smoothing_percent, origin);
         }
     }
 
@@ -7498,9 +7617,10 @@ impl VideoPlayer {
         request_id: u64,
         filter: crate::settings::VideoScaleFilter,
         smoothing_percent: u32,
+        origin: VideoScaleChangeOrigin,
     ) {
         if let Some(output) = self.native_output.as_ref() {
-            output.commit_video_scale_settings(request_id, filter, smoothing_percent);
+            output.commit_video_scale_settings(request_id, filter, smoothing_percent, origin);
         }
     }
 
@@ -8666,6 +8786,76 @@ fn dummy_video_rx() -> crossbeam_channel::Receiver<VideoFrame> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn video_scale_key_feedback_waits_for_commit_and_panel_stays_silent() {
+        use super::{
+            VideoScaleChangeOrigin, VideoScaleFeedbackTransition, video_scale_feedback_toast,
+        };
+
+        assert_eq!(
+            video_scale_feedback_toast(
+                VideoScaleChangeOrigin::Key,
+                VideoScaleFeedbackTransition::Requested,
+            ),
+            None
+        );
+        assert_eq!(
+            video_scale_feedback_toast(
+                VideoScaleChangeOrigin::Panel,
+                VideoScaleFeedbackTransition::Committed {
+                    filter: crate::settings::VideoScaleFilter::Standard,
+                    fallback: None,
+                },
+            ),
+            None
+        );
+        assert_eq!(
+            video_scale_feedback_toast(
+                VideoScaleChangeOrigin::Key,
+                VideoScaleFeedbackTransition::Committed {
+                    filter: crate::settings::VideoScaleFilter::Standard,
+                    fallback: None,
+                },
+            ),
+            Some("[T: 標準（補間あり）]".to_string())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn video_scale_key_feedback_reports_fallback_and_rejected_commit() {
+        use super::{
+            VideoScaleChangeOrigin, VideoScaleFallbackNotice, VideoScaleFeedbackTransition,
+            video_scale_feedback_toast,
+        };
+
+        let fallback = video_scale_feedback_toast(
+            VideoScaleChangeOrigin::Key,
+            VideoScaleFeedbackTransition::Committed {
+                filter: crate::settings::VideoScaleFilter::Sharp,
+                fallback: Some(VideoScaleFallbackNotice::DisplaySizeLimitExceeded {
+                    requested_width: 7680,
+                    requested_height: 4320,
+                    max_dimension: 8192,
+                    max_pixels: 16_777_216,
+                }),
+            },
+        )
+        .expect("key commit feedback");
+        assert_eq!(
+            fallback,
+            "[T: シャープ拡大]\n(解像度が高いため動画フィルタ処理無効: 7680×4320 は上限 長辺 8192px 以下・総画素数 16777216px 以下の範囲外。「OS に任せる」で表示します)"
+        );
+        assert_eq!(
+            video_scale_feedback_toast(
+                VideoScaleChangeOrigin::Key,
+                VideoScaleFeedbackTransition::Rejected,
+            ),
+            Some("[T: 切り替えを適用できませんでした]".to_string())
+        );
+    }
+
     fn test_video_frame(epoch: u64, pts: f64) -> super::VideoFrame {
         super::VideoFrame {
             width: 1,

@@ -3993,25 +3993,33 @@ impl App {
                 filter,
                 smoothing_percent,
             } => {
-                self.request_native_video_scale_settings(fs_idx, filter, smoothing_percent);
+                self.request_native_video_scale_settings(
+                    fs_idx,
+                    filter,
+                    smoothing_percent,
+                    crate::video::VideoScaleChangeOrigin::Panel,
+                );
                 self.mark_native_video_hud_activity(ctx);
             }
             crate::video::NativeVideoOutputEvent::VideoScaleSettingsPrepared {
                 request_id,
                 filter,
                 smoothing_percent,
+                origin,
             } => {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     player.commit_native_video_scale_settings(
                         request_id,
                         filter,
                         smoothing_percent,
+                        origin,
                     );
                 }
             }
             crate::video::NativeVideoOutputEvent::VideoScaleSettingsCommitted {
                 filter,
                 smoothing_percent,
+                toast,
             } => {
                 let smoothing_percent =
                     crate::settings::sanitize_downscale_smoothing_percent(smoothing_percent);
@@ -4021,6 +4029,9 @@ impl App {
                     self.settings.video_scale_filter = filter;
                     self.settings.video_downscale_smoothing_percent = smoothing_percent;
                     self.settings.save();
+                }
+                if let Some(toast) = toast {
+                    self.show_native_video_overlay_toast(toast, false);
                 }
                 self.mark_native_video_hud_activity(ctx);
             }
@@ -7764,6 +7775,7 @@ impl App {
                     fs_idx,
                     filter,
                     self.settings.video_downscale_smoothing_percent,
+                    crate::video::VideoScaleChangeOrigin::Key,
                 );
                 NativeVideoKeyOutcome::Action(KeyAction::VideoScaleFilterNext)
             }
@@ -7814,11 +7826,12 @@ impl App {
         fs_idx: usize,
         filter: crate::settings::VideoScaleFilter,
         smoothing_percent: u32,
+        origin: crate::video::VideoScaleChangeOrigin,
     ) -> bool {
         let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
             return false;
         };
-        player.prepare_native_video_scale_settings(filter, smoothing_percent);
+        player.prepare_native_video_scale_settings(filter, smoothing_percent, origin);
         true
     }
 

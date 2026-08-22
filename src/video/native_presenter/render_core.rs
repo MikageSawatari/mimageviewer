@@ -37,6 +37,7 @@ use windows_numerics::Matrix3x2;
 
 use crate::settings::{FsSidePanelMode, VideoScaleFilter};
 use crate::ui_helpers::HoverTipExt;
+use crate::video::VideoScaleFallbackNotice;
 use crate::video::decoder::{VideoFrame, VideoFrameData};
 use crate::video::display_metadata::VideoOrientation;
 pub(crate) use crate::video::native_cursor::cursor_move_is_activity;
@@ -2815,6 +2816,29 @@ impl NativeRenderCore {
             ],
         );
         self.sync_overlay_video_scale_state();
+    }
+
+    pub(crate) fn video_scale_fallback_notice(&self) -> Option<VideoScaleFallbackNotice> {
+        let fallback = self.active_scale_fallback.as_ref()?;
+        if fallback.key.filter != self.selected_scale_filter
+            || fallback.key.smoothing_percent != self.downscale_smoothing_percent
+        {
+            return None;
+        }
+        Some(match &fallback.reason {
+            VideoScaleFallbackReason::DisplaySizeLimitExceeded {
+                requested_width,
+                requested_height,
+                max_dimension,
+                max_pixels,
+            } => VideoScaleFallbackNotice::DisplaySizeLimitExceeded {
+                requested_width: *requested_width,
+                requested_height: *requested_height,
+                max_dimension: *max_dimension,
+                max_pixels: *max_pixels,
+            },
+            _ => VideoScaleFallbackNotice::Other,
+        })
     }
     fn sync_overlay_video_scale_state(&mut self) {
         let outside_note = self.active_scale_fallback.as_ref().and_then(|fallback| {
