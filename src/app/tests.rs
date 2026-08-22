@@ -36316,6 +36316,7 @@ mod still_window_mode_key_tests {
         items_generation: u64,
     ) {
         assert_eq!(app.current_folder.as_deref(), Some(main_folder));
+        assert_eq!(app.address, main_folder.to_string_lossy());
         assert_eq!(app.items_generation, items_generation);
         assert!(matches!(
             app.items.as_slice(),
@@ -36394,6 +36395,120 @@ mod still_window_mode_key_tests {
         );
     }
 
+    fn complete_detached_archive_page_enumeration(
+        app: &mut App,
+        backing_archive: &Path,
+        entry_names: &[&str],
+    ) {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(crate::zip_loader::ZipEnumeration {
+            entries: entry_names
+                .iter()
+                .map(|entry_name| crate::zip_loader::ZipImageEntry {
+                    entry_name: (*entry_name).to_string(),
+                    uncompressed_size: 1,
+                    mtime: 1,
+                })
+                .collect(),
+            has_foreign_archives: false,
+            legacy_renames: Vec::new(),
+        }))
+        .unwrap();
+
+        app.with_active_detached_viewer_context(|mounted| {
+            let pending = mounted
+                .zip_enumerate_pending
+                .take()
+                .expect("detached archive landing must start page enumeration");
+            assert!(crate::folder_tree::path_eq(
+                &pending.zip_path,
+                backing_archive
+            ));
+            pending.cancel.store(true, Ordering::Relaxed);
+            mounted.zip_enumerate_pending = Some(ZipEnumeratePending {
+                zip_path: backing_archive.to_path_buf(),
+                input_seq: pending.input_seq,
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx,
+            });
+            mounted.poll_zip_enumerate();
+        })
+        .expect("detached archive context must remain active");
+    }
+
+    fn assert_detached_archive_pages(
+        app: &App,
+        backing_archive: &Path,
+        expected_entry_names: &[&str],
+    ) {
+        let active = app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("detached archive pages must retain their reader context");
+        let actual_entry_names = active
+            .bundle
+            .items
+            .iter()
+            .map(|item| match item {
+                GridItem::ZipImage {
+                    zip_path,
+                    entry_name,
+                } => {
+                    assert!(crate::folder_tree::path_eq(zip_path, backing_archive));
+                    entry_name.as_str()
+                }
+                _ => panic!("expected detached archive page"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual_entry_names, expected_entry_names);
+    }
+
+    fn complete_detached_pdf_page_enumeration(app: &mut App, pdf_path: &Path, page_count: u32) {
+        app.with_active_detached_viewer_context(|mounted| {
+            mounted.pdf_enumerate_pending = None;
+            mounted.fs_nav_after_pdf_enumerate = None;
+            mounted.start_loading_items(
+                pdf_path.to_path_buf(),
+                (0..page_count)
+                    .map(|page_num| GridItem::PdfPage {
+                        pdf_path: pdf_path.to_path_buf(),
+                        page_num,
+                        content_type: None,
+                    })
+                    .collect(),
+                vec![None; page_count as usize],
+                HashSet::new(),
+                Vec::new(),
+                None,
+            );
+        })
+        .expect("detached PDF context must remain active");
+    }
+
+    fn assert_detached_pdf_pages(app: &App, pdf_path: &Path, expected_pages: &[u32]) {
+        let active = app
+            .active_detached_viewer_context
+            .as_ref()
+            .expect("detached PDF pages must retain their reader context");
+        let actual_pages = active
+            .bundle
+            .items
+            .iter()
+            .map(|item| match item {
+                GridItem::PdfPage {
+                    pdf_path: actual_path,
+                    page_num,
+                    ..
+                } => {
+                    assert!(crate::folder_tree::path_eq(actual_path, pdf_path));
+                    *page_num
+                }
+                _ => panic!("expected detached PDF page"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual_pages, expected_pages);
+    }
+
     #[test]
     #[cfg(windows)]
     fn convertible_archive_grid_open_uses_candidate_plan_without_mutating_main_grid() {
@@ -36462,6 +36577,9 @@ mod still_window_mode_key_tests {
             app.show_archive_convert_dialog(ctx);
         });
 
+        let expected_pages = ["page-001.jpg", "page-002.png"];
+        complete_detached_archive_page_enumeration(&mut app, &backing, &expected_pages);
+
         assert!(app.archive_convert.is_none());
         assert_convertible_archive_main_grid_unchanged(
             &app,
@@ -36470,22 +36588,23 @@ mod still_window_mode_key_tests {
             items_generation,
         );
         assert_detached_archive_backing(&app, &source, &backing);
+        assert_detached_archive_pages(&app, &backing, &expected_pages);
     }
 
     #[test]
     #[cfg(windows)]
     fn detached_grid_archive_conversion_completion_opens_detached_without_main_navigation() {
         let mut app = setup_app();
-        let source = app.tmp.path().join("converted.7z");
+        let source = app.tmp.path().join("solid-or-nested.rar");
         let backing = app.tmp.path().join("converted-cache.zip");
         std::fs::write(&source, b"source").unwrap();
         std::fs::write(&backing, b"cache").unwrap();
         let (main_folder, items_generation) =
-            install_convertible_archive_main_grid(&mut app, source.clone(), ArchiveFormat::SevenZ);
+            install_convertible_archive_main_grid(&mut app, source.clone(), ArchiveFormat::Rar);
         let (_owner, _tx, _cancel) = install_detached_grid_archive_completion(
             &mut app,
             source.clone(),
-            ArchiveFormat::SevenZ,
+            ArchiveFormat::Rar,
             None,
             Some(backing.clone()),
         );
@@ -36495,6 +36614,9 @@ mod still_window_mode_key_tests {
             app.show_archive_convert_dialog(ctx);
         });
 
+        let expected_pages = ["cover.jpg", "page-002.webp"];
+        complete_detached_archive_page_enumeration(&mut app, &backing, &expected_pages);
+
         assert!(app.archive_convert.is_none());
         assert_convertible_archive_main_grid_unchanged(
             &app,
@@ -36503,6 +36625,7 @@ mod still_window_mode_key_tests {
             items_generation,
         );
         assert_detached_archive_backing(&app, &source, &backing);
+        assert_detached_archive_pages(&app, &backing, &expected_pages);
     }
 
     #[test]
@@ -36585,7 +36708,7 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn detached_grid_archive_cache_hit_opens_detached_without_main_navigation() {
+    fn detached_grid_archive_non_rar_cache_hit_opens_detached_without_main_navigation() {
         let mut app = setup_app();
         let source = app.tmp.path().join("cached.7z");
         let backing = app.tmp.path().join("cached.zip");
@@ -36617,6 +36740,9 @@ mod still_window_mode_key_tests {
             )
         );
 
+        let expected_pages = ["cached-cover.jpg", "cached-page-002.png"];
+        complete_detached_archive_page_enumeration(&mut app, &backing, &expected_pages);
+
         assert!(app.archive_convert.is_none());
         assert_convertible_archive_main_grid_unchanged(
             &app,
@@ -36625,6 +36751,86 @@ mod still_window_mode_key_tests {
             items_generation,
         );
         assert_detached_archive_backing(&app, &source, &backing);
+        assert_detached_archive_pages(&app, &backing, &expected_pages);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_grid_rar_conversion_cache_hit_opens_detached_after_probe() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("cached-solid.rar");
+        let backing = app.tmp.path().join("cached-solid.zip");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&backing, b"cache").unwrap();
+        let metadata = std::fs::metadata(&source).unwrap();
+        app.archive_cache_db
+            .as_ref()
+            .unwrap()
+            .record(
+                &source,
+                crate::ui_helpers::mtime_secs(&metadata),
+                metadata.len() as i64,
+                ArchiveFormat::Rar,
+                &backing,
+                std::fs::metadata(&backing).unwrap().len() as i64,
+                2,
+                false,
+            )
+            .unwrap();
+        let (main_folder, items_generation) =
+            install_convertible_archive_main_grid(&mut app, source.clone(), ArchiveFormat::Rar);
+
+        assert!(
+            app.open_grid_item_in_detached_book_context_with_auto_fullscreen(
+                &egui::Context::default(),
+                0,
+                false,
+            )
+        );
+
+        let (scan_tx, scan_rx) = mpsc::channel();
+        let state = app
+            .archive_convert
+            .as_mut()
+            .expect("RAR cache hit must still probe direct-read capability first");
+        assert_eq!(
+            state.fallback_cached_zip.as_deref(),
+            Some(backing.as_path())
+        );
+        state.cancel.store(true, Ordering::Relaxed);
+        state.cancel = Arc::new(AtomicBool::new(false));
+        state.rx = scan_rx;
+        scan_tx
+            .send(
+                crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ScanDone(Ok((
+                    crate::archive_converter::ArchiveImageSummary {
+                        image_count: 2,
+                        total_uncompressed_bytes: 2,
+                        nested_archive_count: 1,
+                    },
+                    false,
+                    source.clone(),
+                ))),
+            )
+            .unwrap();
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_archive_convert_dialog(ctx);
+        });
+
+        let expected_pages = ["cached-rar-cover.jpg", "cached-rar-page-002.png"];
+        complete_detached_archive_page_enumeration(&mut app, &backing, &expected_pages);
+
+        assert!(app.archive_convert.is_none());
+        assert_convertible_archive_main_grid_unchanged(
+            &app,
+            &main_folder,
+            &source,
+            items_generation,
+        );
+        assert_detached_archive_backing(&app, &source, &backing);
+        assert_detached_archive_pages(&app, &backing, &expected_pages);
     }
 
     #[test]
@@ -42008,7 +42214,12 @@ mod still_window_mode_key_tests {
         app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
         app.image_metas = vec![None, None];
         app.visible_indices = vec![0, 1];
+        app.search_filter = Some(HashSet::from([0]));
+        app.show_search_bar = true;
         app.selected = Some(0);
+        app.scroll_offset_y = 137.0;
+        let main_generation = app.items_generation;
+        let main_folder = app.current_folder.clone().unwrap();
 
         assert!(app.open_grid_container_in_detached_book_context(&ctx, 0));
 
@@ -42039,6 +42250,23 @@ mod still_window_mode_key_tests {
             "without a PDF meta placeholder the active context should wait for enumerate without replacing main"
         );
         assert!(active.bundle.fs_nav_after_pdf_enumerate.is_some());
+
+        let pdf_path = match &app.items[0] {
+            GridItem::PdfFile(path) => path.clone(),
+            _ => panic!("expected PDF control item"),
+        };
+        complete_detached_pdf_page_enumeration(&mut app, &pdf_path, 2);
+        assert_eq!(app.current_folder.as_deref(), Some(main_folder.as_path()));
+        assert_eq!(app.items_generation, main_generation);
+        assert!(matches!(
+            app.items.as_slice(),
+            [GridItem::PdfFile(_), GridItem::PdfFile(_)]
+        ));
+        assert_eq!(app.search_filter, Some(HashSet::from([0])));
+        assert!(app.show_search_bar);
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.scroll_offset_y, 137.0);
+        assert_detached_pdf_pages(&app, &pdf_path, &[0, 1]);
     }
 
     #[test]
@@ -42056,7 +42284,12 @@ mod still_window_mode_key_tests {
         app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
         app.image_metas = vec![None, None];
         app.visible_indices = vec![0, 1];
+        app.search_filter = Some(HashSet::from([1]));
+        app.show_search_bar = true;
         app.selected = Some(1);
+        app.scroll_offset_y = 173.0;
+        let main_generation = app.items_generation;
+        let main_folder = app.current_folder.clone().unwrap();
 
         assert!(app.open_grid_container_in_detached_book_context(&ctx, 1));
 
@@ -42088,6 +42321,24 @@ mod still_window_mode_key_tests {
         );
         assert!(active.bundle.items.is_empty());
         assert!(active.bundle.fs_nav_after_pdf_enumerate.is_some());
+
+        let zip_path = match &app.items[1] {
+            GridItem::ZipFile(path) => path.clone(),
+            _ => panic!("expected ZIP control item"),
+        };
+        let expected_pages = ["zip-cover.jpg", "zip-page-002.png"];
+        complete_detached_archive_page_enumeration(&mut app, &zip_path, &expected_pages);
+        assert_eq!(app.current_folder.as_deref(), Some(main_folder.as_path()));
+        assert_eq!(app.items_generation, main_generation);
+        assert!(matches!(
+            app.items.as_slice(),
+            [GridItem::ZipFile(_), GridItem::ZipFile(_)]
+        ));
+        assert_eq!(app.search_filter, Some(HashSet::from([1])));
+        assert!(app.show_search_bar);
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.scroll_offset_y, 173.0);
+        assert_detached_archive_pages(&app, &zip_path, &expected_pages);
     }
 
     #[test]
