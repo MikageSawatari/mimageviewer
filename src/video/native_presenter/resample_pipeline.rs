@@ -176,7 +176,6 @@ struct IntermediateTarget {
 
 pub(super) struct VideoResamplePipeline {
     vertex_shader: ID3D11VertexShader,
-    nis_vertex_shader: ID3D11VertexShader,
     horizontal_shader: ID3D11PixelShader,
     vertical_shader: ID3D11PixelShader,
     nearest_shader: ID3D11PixelShader,
@@ -192,10 +191,8 @@ impl VideoResamplePipeline {
         let horizontal_blob = compile_resample_shader("ps_horizontal", "ps_5_0")?;
         let vertical_blob = compile_resample_shader("ps_vertical", "ps_5_0")?;
         let nearest_blob = compile_resample_shader("ps_nearest", "ps_5_0")?;
-        let nis_vertex_blob = compile_shader_source(NIS_SHADER, "vs_main", "vs_5_0")?;
         let nis_blob = compile_shader_source(NIS_SHADER, "fs_nis", "ps_5_0")?;
         let mut vertex_shader = None;
-        let mut nis_vertex_shader = None;
         let mut horizontal_shader = None;
         let mut vertical_shader = None;
         let mut nearest_shader = None;
@@ -206,13 +203,6 @@ impl VideoResamplePipeline {
             device
                 .CreateVertexShader(blob_bytes(&vertex_blob), None, Some(&mut vertex_shader))
                 .map_err(|error| format!("CreateVertexShader resample: {error:?}"))?;
-            device
-                .CreateVertexShader(
-                    blob_bytes(&nis_vertex_blob),
-                    None,
-                    Some(&mut nis_vertex_shader),
-                )
-                .map_err(|error| format!("CreateVertexShader NIS: {error:?}"))?;
             device
                 .CreatePixelShader(
                     blob_bytes(&horizontal_blob),
@@ -251,8 +241,6 @@ impl VideoResamplePipeline {
         Ok(Self {
             vertex_shader: vertex_shader
                 .ok_or_else(|| "CreateVertexShader resample returned null".to_string())?,
-            nis_vertex_shader: nis_vertex_shader
-                .ok_or_else(|| "CreateVertexShader NIS returned null".to_string())?,
             horizontal_shader: horizontal_shader
                 .ok_or_else(|| "CreatePixelShader resample horizontal returned null".to_string())?,
             vertical_shader: vertical_shader
@@ -554,7 +542,11 @@ impl VideoResamplePipeline {
                         0,
                         0,
                     );
-                    context.VSSetShader(&self.nis_vertex_shader, None);
+                    // The Naga-generated WGSL vertex shader emits a WebGPU-wound
+                    // fullscreen triangle. D3D11's default rasterizer culls that
+                    // winding, so use the native D3D fullscreen vertex shader. NIS
+                    // only consumes SV_Position, making the two interfaces identical.
+                    context.VSSetShader(&self.vertex_shader, None);
                     context.PSSetConstantBuffers(1, Some(&[Some(self.nis_constants.clone())]));
                     context.PSSetShader(&self.nis_shader, None);
                 }
@@ -725,6 +717,32 @@ fn create_render_target<T: Interface>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::Graphics::Direct3D::{
+        D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0,
+    };
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG,
+        D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA,
+        D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+
+    fn test_texture_desc(width: u32, height: u32, bind_flags: u32) -> D3D11_TEXTURE2D_DESC {
+        D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: bind_flags,
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn resample_hlsl_compiles_for_shader_model_5() {
@@ -738,6 +756,136 @@ mod tests {
     fn nis_converter_output_compiles_for_shader_model_5() {
         compile_shader_source(NIS_SHADER, "vs_main", "vs_5_0").expect("NIS vertex shader");
         compile_shader_source(NIS_SHADER, "fs_nis", "ps_5_0").expect("NIS pixel shader");
+    }
+
+    #[test]
+    fn nis_draw_writes_target_with_default_d3d11_rasterizer() {
+        const SOURCE_WIDTH: u32 = 8;
+        const SOURCE_HEIGHT: u32 = 8;
+        const TARGET_WIDTH: u32 = 16;
+        const TARGET_HEIGHT: u32 = 16;
+
+        let mut base_device: Option<ID3D11Device> = None;
+        let mut context: Option<ID3D11DeviceContext> = None;
+        let mut feature_level = D3D_FEATURE_LEVEL::default();
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_WARP,
+                windows::Win32::Foundation::HMODULE::default(),
+                D3D11_CREATE_DEVICE_FLAG::default(),
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut base_device),
+                Some(&mut feature_level),
+                Some(&mut context),
+            )
+            .expect("create WARP D3D11 device");
+        }
+        assert_eq!(feature_level, D3D_FEATURE_LEVEL_11_0);
+        let device: ID3D11Device1 = base_device
+            .expect("D3D11 device")
+            .cast()
+            .expect("ID3D11Device1");
+        let context = context.expect("D3D11 immediate context");
+
+        let source_pixels = vec![
+            0xFF_u8;
+            (SOURCE_WIDTH * SOURCE_HEIGHT * 4)
+                .try_into()
+                .expect("source buffer length")
+        ];
+        let source_initial = D3D11_SUBRESOURCE_DATA {
+            pSysMem: source_pixels.as_ptr().cast(),
+            SysMemPitch: SOURCE_WIDTH * 4,
+            SysMemSlicePitch: SOURCE_WIDTH * SOURCE_HEIGHT * 4,
+        };
+        let mut source = None;
+        let source_desc = test_texture_desc(
+            SOURCE_WIDTH,
+            SOURCE_HEIGHT,
+            D3D11_BIND_SHADER_RESOURCE.0 as u32,
+        );
+        unsafe {
+            device
+                .CreateTexture2D(&source_desc, Some(&source_initial), Some(&mut source))
+                .expect("create NIS source texture");
+        }
+        let source = source.expect("NIS source texture");
+
+        let mut target = None;
+        let target_desc = test_texture_desc(
+            TARGET_WIDTH,
+            TARGET_HEIGHT,
+            D3D11_BIND_RENDER_TARGET.0 as u32,
+        );
+        unsafe {
+            device
+                .CreateTexture2D(&target_desc, None, Some(&mut target))
+                .expect("create NIS target texture");
+        }
+        let target = target.expect("NIS target texture");
+        let target_view = create_render_target(&device, &target).expect("NIS target view");
+        unsafe {
+            context.ClearRenderTargetView(&target_view, &[0.0, 0.0, 0.0, 1.0]);
+        }
+
+        let pipeline = VideoResamplePipeline::new(&device).expect("NIS pipeline");
+        pipeline
+            .draw(
+                &device,
+                &context,
+                &source,
+                &target,
+                SOURCE_WIDTH,
+                SOURCE_HEIGHT,
+                TARGET_WIDTH,
+                TARGET_HEIGHT,
+                VideoOrientation::IDENTITY,
+                VideoResampleMode::Nis,
+            )
+            .expect("draw NIS");
+
+        let mut staging = None;
+        let staging_desc = D3D11_TEXTURE2D_DESC {
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            ..test_texture_desc(TARGET_WIDTH, TARGET_HEIGHT, 0)
+        };
+        unsafe {
+            device
+                .CreateTexture2D(&staging_desc, None, Some(&mut staging))
+                .expect("create NIS staging texture");
+        }
+        let staging = staging.expect("NIS staging texture");
+        let target_resource: ID3D11Resource = target.cast().expect("target resource");
+        let staging_resource: ID3D11Resource = staging.cast().expect("staging resource");
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        let first_unwritten = unsafe {
+            context.CopyResource(&staging_resource, &target_resource);
+            context
+                .Map(&staging_resource, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .expect("map NIS target");
+            let mut first_unwritten = None;
+            'rows: for y in 0..TARGET_HEIGHT {
+                for x in 0..TARGET_WIDTH {
+                    let offset = (mapped.RowPitch * y + x * 4) as usize;
+                    let bytes = mapped.pData.cast::<u8>().add(offset);
+                    let sample = [*bytes, *bytes.add(1), *bytes.add(2), *bytes.add(3)];
+                    if sample.iter().any(|channel| *channel < 0xF0) {
+                        first_unwritten = Some((x, y, sample));
+                        break 'rows;
+                    }
+                }
+            }
+            context.Unmap(&staging_resource, 0);
+            first_unwritten
+        };
+        assert!(
+            first_unwritten.is_none(),
+            "NIS must overwrite the entire cleared target; first unwritten pixel was {first_unwritten:?}"
+        );
     }
 
     #[test]
