@@ -1032,26 +1032,50 @@ fn copy_store_transaction(
     db_path: &Path,
     descriptor: StoreDescriptor,
     mappings: &[NormalizedStoreCopyMapping],
-) -> Result<usize, rusqlite::Error> {
-    let mut conn = rusqlite::Connection::open(db_path)?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    let tx = conn.transaction()?;
-    let columns = table_columns(&tx, descriptor.table)?;
-    if !columns.iter().any(|column| column == descriptor.column) {
-        return Err(rusqlite::Error::InvalidColumnName(
-            descriptor.column.to_string(),
-        ));
-    }
-    let mut changed = 0usize;
-    for mapping in mappings {
-        let copied = copy_store_mapping(&tx, descriptor, &columns, mapping)?;
-        if copied > 0 && descriptor.table == "ratings" {
-            update_copied_rating_source_paths(&tx, mapping)?;
+) -> Result<usize, String> {
+    let cache_root = db_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("edit_preview_cache");
+    let mut destination_files = Vec::new();
+    let result = (|| -> Result<usize, String> {
+        let mut conn = rusqlite::Connection::open(db_path).map_err(|error| error.to_string())?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| error.to_string())?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let columns = table_columns(&tx, descriptor.table).map_err(|error| error.to_string())?;
+        if !columns.iter().any(|column| column == descriptor.column) {
+            return Err(
+                rusqlite::Error::InvalidColumnName(descriptor.column.to_string()).to_string(),
+            );
         }
-        changed += copied;
+        let mut changed = 0usize;
+        for mapping in mappings {
+            changed += copy_store_mapping(
+                &tx,
+                descriptor,
+                &columns,
+                mapping,
+                &cache_root,
+                &mut destination_files,
+            )?;
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(changed)
+    })();
+    if result.is_err() {
+        crate::edit_preview_cache::cleanup_restored_preview_copy_files(
+            &cache_root,
+            &destination_files,
+        );
     }
-    tx.commit()?;
-    Ok(changed)
+    result
+}
+
+#[derive(Default)]
+struct GenericCopyOutcome {
+    rows: usize,
+    copied_keys: Vec<(String, String)>,
 }
 
 fn copy_store_mapping(
@@ -1059,8 +1083,10 @@ fn copy_store_mapping(
     descriptor: StoreDescriptor,
     columns: &[String],
     mapping: &NormalizedStoreCopyMapping,
-) -> Result<usize, rusqlite::Error> {
-    match mapping {
+    cache_root: &Path,
+    destination_files: &mut Vec<PathBuf>,
+) -> Result<usize, String> {
+    let mut outcome = match mapping {
         NormalizedStoreCopyMapping::Exact {
             old_key,
             new_key,
@@ -1073,7 +1099,8 @@ fn copy_store_mapping(
                 columns,
                 old_key,
                 new_key,
-            )?;
+            )
+            .map_err(|error| error.to_string())?;
             if copied > 0 && !descriptor.rename_generic {
                 // 現在の non-generic descriptor は reading_history。`key` と並ぶ raw
                 // `path` も、コピーできた新行だけ destination path へ合わせる。
@@ -1083,9 +1110,16 @@ fn copy_store_mapping(
                         descriptor.table, descriptor.column
                     ),
                     rusqlite::params![new_path.to_string_lossy(), new_key],
-                )?;
+                )
+                .map_err(|error| error.to_string())?;
             }
-            Ok(copied)
+            GenericCopyOutcome {
+                rows: copied,
+                copied_keys: (copied > 0)
+                    .then(|| (old_key.clone(), new_key.clone()))
+                    .into_iter()
+                    .collect(),
+            }
         }
         NormalizedStoreCopyMapping::Prefix {
             old_prefix,
@@ -1097,8 +1131,33 @@ fn copy_store_mapping(
             columns,
             old_prefix,
             new_prefix,
-        ),
+        )
+        .map_err(|error| error.to_string())?,
+    };
+
+    if outcome.rows > 0 && descriptor.table == "ratings" {
+        update_copied_rating_source_paths(tx, mapping).map_err(|error| error.to_string())?;
     }
+    if descriptor.table == "edit_previews" {
+        let mut retained = outcome.rows;
+        for (source_key, destination_key) in outcome.copied_keys.drain(..) {
+            match crate::edit_preview_cache::fixup_restored_preview_copy(
+                tx,
+                cache_root,
+                &source_key,
+                &destination_key,
+            )? {
+                crate::edit_preview_cache::RestoredPreviewCopyFixup::Retained(paths) => {
+                    destination_files.extend(paths);
+                }
+                crate::edit_preview_cache::RestoredPreviewCopyFixup::Skipped => {
+                    retained = retained.saturating_sub(1);
+                }
+            }
+        }
+        return Ok(retained);
+    }
+    Ok(outcome.rows)
 }
 
 fn table_columns(
@@ -1153,9 +1212,9 @@ fn copy_prefix(
     columns: &[String],
     old_prefix: &str,
     new_prefix: &str,
-) -> Result<usize, rusqlite::Error> {
+) -> Result<GenericCopyOutcome, rusqlite::Error> {
     if old_prefix == new_prefix {
-        return Ok(0);
+        return Ok(GenericCopyOutcome::default());
     }
     let keys = {
         let mut statement = tx.prepare(&format!(
@@ -1167,21 +1226,19 @@ fn copy_prefix(
         )?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
-    let mut changed = 0usize;
+    let mut outcome = GenericCopyOutcome::default();
     for key in keys {
         let Some(suffix) = key.strip_prefix(old_prefix) else {
             continue;
         };
-        changed += copy_exact(
-            tx,
-            table,
-            col,
-            columns,
-            &key,
-            &format!("{new_prefix}{suffix}"),
-        )?;
+        let destination_key = format!("{new_prefix}{suffix}");
+        let copied = copy_exact(tx, table, col, columns, &key, &destination_key)?;
+        outcome.rows += copied;
+        if copied > 0 {
+            outcome.copied_keys.push((key, destination_key));
+        }
     }
-    Ok(changed)
+    Ok(outcome)
 }
 
 fn update_copied_rating_source_paths(
@@ -1286,6 +1343,7 @@ fn migrate_reading_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::path::PathBuf;
 
     fn open(dir: &Path, file: &str) -> rusqlite::Connection {
@@ -1303,10 +1361,55 @@ mod tests {
             .unwrap()
     }
 
+    fn insert_copy_test_edit_preview(
+        connection: &rusqlite::Connection,
+        data_dir: &Path,
+        key: &str,
+        payload: &str,
+    ) {
+        let key_hash = format!("{:x}", Sha256::digest(key.as_bytes()));
+        let content_hash = format!("{:x}", Sha256::digest(payload.as_bytes()));
+        let cache_dir = data_dir
+            .join("edit_preview_cache")
+            .join(&key_hash[..2])
+            .join(key_hash);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let cached_path = cache_dir.join(format!("{content_hash}.base.webp"));
+        std::fs::write(&cached_path, payload.as_bytes()).unwrap();
+        connection
+            .execute(
+                "INSERT INTO edit_previews
+                    (item_key, cached_path, annotation_layers_json, payload)
+                 VALUES (?1, ?2, '[]', ?3)",
+                rusqlite::params![key, cached_path.to_string_lossy(), payload],
+            )
+            .unwrap();
+    }
+
     fn setup_copy_store_rows(dir: &Path, old: &Path) {
         for descriptor in STORES {
             let connection = open(dir, descriptor.file);
             if descriptor.unique {
+                if descriptor.table == "edit_previews" {
+                    connection
+                        .execute_batch(
+                            "CREATE TABLE IF NOT EXISTS edit_previews (
+                                item_key TEXT PRIMARY KEY,
+                                cached_path TEXT NOT NULL,
+                                annotation_layers_json TEXT NOT NULL,
+                                payload TEXT
+                             )",
+                        )
+                        .unwrap();
+                    let old_key = descriptor.normalize_path(old);
+                    for (key, payload) in [
+                        (old_key.clone(), "exact"),
+                        (format!("{old_key}::ページ/001.jpg"), "prefix"),
+                    ] {
+                        insert_copy_test_edit_preview(&connection, dir, &key, payload);
+                    }
+                    continue;
+                }
                 let extras = if descriptor.table == "ratings" {
                     ", source_path TEXT"
                 } else if !descriptor.rename_generic {

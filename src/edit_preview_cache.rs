@@ -187,6 +187,15 @@ struct CachedAnnotationLayerRecord {
     bytes: u64,
 }
 
+/// Result of fixing up one row inserted by content-identity restore.
+///
+/// A retained row owns every returned path. `Skipped` means the copied row was removed because
+/// its source files were already incomplete or its persisted layout was invalid.
+pub(crate) enum RestoredPreviewCopyFixup {
+    Retained(Vec<PathBuf>),
+    Skipped,
+}
+
 struct EncodedAnnotationLayer {
     blend: CachedAnnotationBlend,
     webp: Vec<u8>,
@@ -446,7 +455,6 @@ impl EditPreviewCacheDb {
         if base_webp.is_empty() || annotation_layers.iter().any(|layer| layer.webp.is_empty()) {
             return Err("encoded preview was empty".to_string());
         }
-        let key_hash = format!("{:x}", Sha256::digest(item_key.as_bytes()));
         let mut content_hasher = Sha256::new();
         content_hasher.update(base_webp);
         for layer in annotation_layers {
@@ -457,7 +465,7 @@ impl EditPreviewCacheDb {
             content_hasher.update(&layer.webp);
         }
         let content_hash = format!("{:x}", content_hasher.finalize());
-        let dir = self.root.join(&key_hash[..2]).join(&key_hash);
+        let dir = cache_dir_for_item(&self.root, item_key);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let final_path = dir.join(format!("{content_hash}.base.webp"));
         write_cache_file(&final_path, base_webp)?;
@@ -717,6 +725,183 @@ impl EditPreviewCacheDb {
             })
             .unwrap_or(0)
             .max(0) as u64
+    }
+}
+
+/// Give a content-identity restore copy its own WebP files and rewrite the copied row to them.
+///
+/// This is deliberately a post-copy fixup: the generic SQLite copier remains schema-agnostic,
+/// while this cache module owns the persisted file-layout contract. The caller runs on the
+/// restore worker and keeps the SQLite transaction open across this operation.
+pub(crate) fn fixup_restored_preview_copy(
+    tx: &rusqlite::Transaction<'_>,
+    root: &Path,
+    source_key: &str,
+    destination_key: &str,
+) -> Result<RestoredPreviewCopyFixup, String> {
+    let source_row: Option<(String, String)> = tx
+        .query_row(
+            "SELECT cached_path, annotation_layers_json
+               FROM edit_previews WHERE item_key = ?1",
+            [source_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((cached_path, annotation_layers_json)) = source_row else {
+        delete_restored_preview_row(tx, destination_key)?;
+        return Ok(RestoredPreviewCopyFixup::Skipped);
+    };
+    let Ok(source_layers) =
+        serde_json::from_str::<Vec<CachedAnnotationLayerRecord>>(&annotation_layers_json)
+    else {
+        delete_restored_preview_row(tx, destination_key)?;
+        return Ok(RestoredPreviewCopyFixup::Skipped);
+    };
+    let Some((copies, destination_cached_path, destination_layers)) = restored_preview_copy_layout(
+        root,
+        source_key,
+        destination_key,
+        Path::new(&cached_path),
+        &source_layers,
+    ) else {
+        delete_restored_preview_row(tx, destination_key)?;
+        return Ok(RestoredPreviewCopyFixup::Skipped);
+    };
+
+    // Validate the complete source set before creating anything. An incomplete cache row is
+    // intentionally not restored: producing no destination row is safer than another dangling
+    // row that can only heal after the full image is viewed again.
+    if copies.iter().any(|(source, _)| {
+        std::fs::metadata(source)
+            .map(|metadata| !metadata.is_file() || metadata.len() == 0)
+            .unwrap_or(true)
+    }) {
+        delete_restored_preview_row(tx, destination_key)?;
+        return Ok(RestoredPreviewCopyFixup::Skipped);
+    }
+
+    let destination_dir = cache_dir_for_item(root, destination_key);
+    std::fs::create_dir_all(&destination_dir).map_err(|error| error.to_string())?;
+    let mut copied_paths = Vec::with_capacity(copies.len());
+    for (source, destination) in &copies {
+        if let Err(error) = std::fs::copy(source, destination) {
+            cleanup_restored_preview_copy_files(root, &copied_paths);
+            return Err(format!(
+                "copy {} -> {}: {error}",
+                source.display(),
+                destination.display()
+            ));
+        }
+        copied_paths.push(destination.clone());
+    }
+
+    let destination_layers_json = match serde_json::to_string(&destination_layers) {
+        Ok(json) => json,
+        Err(error) => {
+            cleanup_restored_preview_copy_files(root, &copied_paths);
+            return Err(error.to_string());
+        }
+    };
+    let updated = match tx.execute(
+        "UPDATE edit_previews
+            SET cached_path = ?1, annotation_layers_json = ?2
+          WHERE item_key = ?3 AND cached_path = ?4",
+        params![
+            destination_cached_path.to_string_lossy(),
+            destination_layers_json,
+            destination_key,
+            cached_path,
+        ],
+    ) {
+        Ok(updated) => updated,
+        Err(error) => {
+            cleanup_restored_preview_copy_files(root, &copied_paths);
+            return Err(error.to_string());
+        }
+    };
+    if updated != 1 {
+        cleanup_restored_preview_copy_files(root, &copied_paths);
+        return Err(format!(
+            "copied edit preview row changed before path fixup: {destination_key}"
+        ));
+    }
+    Ok(RestoredPreviewCopyFixup::Retained(copied_paths))
+}
+
+fn restored_preview_copy_layout(
+    root: &Path,
+    source_key: &str,
+    destination_key: &str,
+    cached_path: &Path,
+    source_layers: &[CachedAnnotationLayerRecord],
+) -> Option<(
+    Vec<(PathBuf, PathBuf)>,
+    PathBuf,
+    Vec<CachedAnnotationLayerRecord>,
+)> {
+    let source_dir = cache_dir_for_item(root, source_key);
+    let destination_dir = cache_dir_for_item(root, destination_key);
+    if cached_path.parent()? != source_dir {
+        return None;
+    }
+    let base_filename = cached_path.file_name()?.to_str()?;
+    let content_hash = base_filename.strip_suffix(".base.webp")?;
+    if content_hash.len() != 64
+        || !content_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    if cached_path != source_dir.join(format!("{content_hash}.base.webp")) {
+        return None;
+    }
+
+    let destination_cached_path = destination_dir.join(base_filename);
+    let mut copies = vec![(cached_path.to_path_buf(), destination_cached_path.clone())];
+    let mut destination_layers = Vec::with_capacity(source_layers.len());
+    for (index, layer) in source_layers.iter().enumerate() {
+        let kind = match layer.blend {
+            CachedAnnotationBlend::Normal => "normal",
+            CachedAnnotationBlend::Multiply => "multiply",
+        };
+        let filename = format!("{content_hash}.{index}.{kind}.webp");
+        let source_path = Path::new(&layer.path);
+        if source_path != source_dir.join(&filename) {
+            return None;
+        }
+        let destination_path = destination_dir.join(filename);
+        copies.push((source_path.to_path_buf(), destination_path.clone()));
+        destination_layers.push(CachedAnnotationLayerRecord {
+            blend: layer.blend,
+            path: destination_path.to_string_lossy().into_owned(),
+            bytes: layer.bytes,
+        });
+    }
+    Some((copies, destination_cached_path, destination_layers))
+}
+
+fn delete_restored_preview_row(
+    tx: &rusqlite::Transaction<'_>,
+    destination_key: &str,
+) -> Result<(), String> {
+    tx.execute(
+        "DELETE FROM edit_previews WHERE item_key = ?1",
+        [destination_key],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+fn cache_dir_for_item(root: &Path, item_key: &str) -> PathBuf {
+    let key_hash = format!("{:x}", Sha256::digest(item_key.as_bytes()));
+    root.join(&key_hash[..2]).join(key_hash)
+}
+
+pub(crate) fn cleanup_restored_preview_copy_files(root: &Path, paths: &[PathBuf]) {
+    for path in paths {
+        remove_file_and_empty_parents(root, path);
     }
 }
 
@@ -1191,6 +1376,41 @@ mod tests {
         (temp, db)
     }
 
+    fn preview_row_paths(db: &EditPreviewCacheDb, item_key: &str) -> Option<Vec<PathBuf>> {
+        let row: Option<(String, String)> = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT cached_path, annotation_layers_json
+                   FROM edit_previews WHERE item_key = ?1",
+                [item_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .unwrap();
+        row.map(|(cached_path, layers_json)| {
+            cache_paths(&cached_path, &layers_json)
+                .into_iter()
+                .map(PathBuf::from)
+                .collect()
+        })
+    }
+
+    fn save_preview_with_one_layer(db: &EditPreviewCacheDb, item_key: &str, seed: u8) {
+        let base = egui::ColorImage::filled(
+            [8, 4],
+            egui::Color32::from_rgb(seed, seed.wrapping_add(40), seed.wrapping_add(80)),
+        );
+        let layer = CachedAnnotationLayer {
+            blend: CachedAnnotationBlend::Multiply,
+            image: egui::ColorImage::filled([8, 4], egui::Color32::from_rgb(230, 180, 120)),
+        };
+        let (base_webp, layers) = encode_preview_components(&base, &[layer]).unwrap();
+        db.save_encoded(item_key, 10, 20, None, (8, 4), &base_webp, &layers)
+            .unwrap();
+    }
+
     fn red_transparent_edge() -> egui::ColorImage {
         egui::ColorImage::new([2, 1], vec![egui::Color32::RED, egui::Color32::TRANSPARENT])
     }
@@ -1213,6 +1433,114 @@ mod tests {
         let resized = resize_color_image_to_dims(red_transparent_edge(), (1, 1)).unwrap();
         assert_eq!(resized.size, [1, 1]);
         assert_half_transparent_red(resized.pixels[0]);
+    }
+
+    #[test]
+    fn content_restore_copies_owned_base_and_layer_and_invalidation_is_isolated() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("edit_preview_cache.db");
+        let db = EditPreviewCacheDb::open_at(&db_path).unwrap();
+        let pairs = [
+            (
+                temp.path().join("source-a.png"),
+                temp.path().join("destination-a.png"),
+            ),
+            (
+                temp.path().join("source-b.png"),
+                temp.path().join("destination-b.png"),
+            ),
+        ];
+        for (index, (source, _)) in pairs.iter().enumerate() {
+            save_preview_with_one_layer(
+                &db,
+                &crate::path_key::normalize_keep_drive(source),
+                40 + index as u8,
+            );
+        }
+        drop(db);
+
+        let mappings = pairs
+            .iter()
+            .map(|(source, destination)| {
+                crate::rename_key_migration::StoreCopyPathMapping::exact(source, destination)
+            })
+            .collect::<Vec<_>>();
+        let report = crate::rename_key_migration::copy_stores_at(temp.path(), &mappings);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.rows, 2);
+
+        let db = EditPreviewCacheDb::open_at(&db_path).unwrap();
+        let mut all_paths = Vec::new();
+        for (source, destination) in &pairs {
+            let source_key = crate::path_key::normalize_keep_drive(source);
+            let destination_key = crate::path_key::normalize_keep_drive(destination);
+            let source_paths = preview_row_paths(&db, &source_key).unwrap();
+            let destination_paths = preview_row_paths(&db, &destination_key).unwrap();
+            assert_eq!(source_paths.len(), 2, "base + one annotation layer");
+            assert_eq!(destination_paths.len(), 2, "base + one annotation layer");
+            let expected_dir = cache_dir_for_item(&db.root, &destination_key);
+            assert!(
+                destination_paths
+                    .iter()
+                    .all(|path| path.parent() == Some(expected_dir.as_path()))
+            );
+            for (source_path, destination_path) in source_paths.iter().zip(&destination_paths) {
+                assert_ne!(source_path, destination_path);
+                assert_eq!(
+                    source_path.file_name(),
+                    destination_path.file_name(),
+                    "content-hash filenames stay unchanged"
+                );
+                assert_eq!(
+                    std::fs::read(source_path).unwrap(),
+                    std::fs::read(destination_path).unwrap()
+                );
+            }
+            let loaded = db.load(&destination_key, 10, 20, 2048).unwrap();
+            assert_eq!(loaded.annotation_layers.len(), 1);
+            all_paths.push((source_key, destination_key, source_paths, destination_paths));
+        }
+
+        let (source_key, _, _, destination_paths) = &all_paths[0];
+        assert!(db.delete(source_key));
+        assert!(destination_paths.iter().all(|path| path.is_file()));
+
+        let (_, destination_key, source_paths, _) = &all_paths[1];
+        assert!(db.delete(destination_key));
+        assert!(source_paths.iter().all(|path| path.is_file()));
+    }
+
+    #[test]
+    fn content_restore_skips_source_row_with_missing_cache_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("edit_preview_cache.db");
+        let source = temp.path().join("source-missing.png");
+        let destination = temp.path().join("destination-missing.png");
+        let source_key = crate::path_key::normalize_keep_drive(&source);
+        let destination_key = crate::path_key::normalize_keep_drive(&destination);
+        let db = EditPreviewCacheDb::open_at(&db_path).unwrap();
+        save_preview_with_one_layer(&db, &source_key, 90);
+        let source_paths = preview_row_paths(&db, &source_key).unwrap();
+        std::fs::remove_file(&source_paths[1]).unwrap();
+        drop(db);
+
+        let report = crate::rename_key_migration::copy_stores_at(
+            temp.path(),
+            &[crate::rename_key_migration::StoreCopyPathMapping::exact(
+                &source,
+                &destination,
+            )],
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            report.rows, 0,
+            "skipped cache rows do not count as restored"
+        );
+
+        let db = EditPreviewCacheDb::open_at(&db_path).unwrap();
+        assert!(preview_row_paths(&db, &source_key).is_some());
+        assert!(preview_row_paths(&db, &destination_key).is_none());
+        assert!(!cache_dir_for_item(&db.root, &destination_key).exists());
     }
 
     #[test]

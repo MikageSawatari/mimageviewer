@@ -887,6 +887,11 @@ lossless 注釈 WebP に分けて編集プレビューキャッシュへ非同�
 掛けた後で注釈を合成し、fullscreen と同じ処理順にする。final AI / スマートシャープ /
 カラー化 / Creative LUT / post-filter は含めない。
 
+編集プレビューの各 DB row は、item key の SHA-256 directory にある下地 WebP と全注釈 layer WebP を
+単独所有する。内容 identity 復元で別 item key へ row を複製するときも WebP を新 directory へ複製し、
+row 内の path を付け替える。2 row が同じ WebP を共有してはならない。source files が不完全な row は
+復元先へ作らず、元画像を次に表示したときの通常再生成へ委ねる。
+
 Ctrl+E とキャプチャ保存は、補正レイヤーが有効なページでは `local_adjust_cache` が揃ってから
 実行する。表示中の暫定フォールバック画像をそのまま保存しない。
 

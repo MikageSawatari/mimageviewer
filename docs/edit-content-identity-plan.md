@@ -305,6 +305,16 @@ INSERT OR IGNORE INTO t (c1, c2, ...) SELECT ?new, c2, ... FROM t WHERE c1 = ?ol
 - **`rating.db` の `source_path` 列は導出値**。`migrate_store`
   ([src/rename_key_migration.rs:750](../src/rename_key_migration.rs:750)) と同じ再計算 UPDATE が
   copy 側にも要る。
+- **`edit_preview_cache.db` の `cached_path` と `annotation_layers_json[].path` は
+  row が所有する WebP の絶対パス**。generic copy の後、その mapping で実際に insert できた row
+  だけを per-store fixup へ渡す。下地 + 全注釈 layer が現行の source-key directory に揃っている
+  ことを先に確認し、同じ content-hash filename を destination-key directory へコピーしてから 2 列を
+  書き換える。source file が 1 つでも欠ける / layout が不正なら destination row を削除し、dangling row
+  を増やさない。destination conflict は generic `INSERT OR IGNORE` の結果に含まれないため触らない。
+  `copy_exact` 自体は store を知らないまま維持する。
+- `reading_history.path` は destination raw path なので、既存の non-generic descriptor fixup が exact
+  copy 後に書き換える。`edit_origin` の destination metadata は後段の `mark_restored_origin` が target
+  file を stat して昇格時に確定する。
 - **非一意テーブル (`video_bookmarks`)** は id 再採番が要るので v1 の対象外 (Phase 2)。
 - busy_timeout を付けて本体側の接続と共存する (rusqlite の既定は 5 秒。
   `journal_mode` 変更だけでは効かない点に注意)。
@@ -364,6 +374,9 @@ INSERT OR IGNORE INTO t (c1, c2, ...) SELECT ?new, c2, ... FROM t WHERE c1 = ?ol
 - 段 0 で size 不一致なら**ファイルを一切開かない**こと (I/O 呼び出し回数を数える)
 - 設定 OFF で検出 worker が起動しないこと
 - `rating.source_path` が新キー基準に再計算されること
+- edit preview の下地 + 注釈 layer が destination key directory に複製され、row の両 path 列が
+  destination files を指すこと。source / destination のどちらを invalidate しても他方の files が残ること
+- source WebP が 1 つでも欠ける edit preview は destination row を残さないこと
 
 ---
 
