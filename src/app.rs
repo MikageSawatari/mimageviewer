@@ -31564,6 +31564,13 @@ impl App {
 
     fn finish_book_page_edit_mapping(&mut self, op: &str, errors: Vec<String>) {
         self.clear_page_edit_state();
+        self.finish_book_page_edit_mapping_after_idx_refresh(op, errors);
+    }
+
+    /// idx-keyed page edit state を caller が clear / rehydrate 済みのときに使う共通終端。
+    /// content-identity restore は現在の物理フォルダを DB から rehydrate するため、
+    /// clear 固定の `finish_book_page_edit_mapping` ではなくこちらへ合流する。
+    fn finish_book_page_edit_mapping_after_idx_refresh(&mut self, op: &str, errors: Vec<String>) {
         self.rating_cache.clear();
         self.invalidate_rating_counts_cache();
         self.clear_tags_cache();

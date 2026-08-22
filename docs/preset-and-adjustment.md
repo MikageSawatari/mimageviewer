@@ -85,6 +85,9 @@ idx へ hydrate し直す。これをやらないと差し替え前 idx の補�
 ページ編集 overlay を出さない)。Ctrl+F (単一フォルダ構造フィルタ) は検索ではないので
 rehydrate 側。`clear_page_edit_state()` 単独は上記 idx-keyed セットの正準 clear で、
 `replace_search_view_items` (Ctrl+G 結果差し替え) からも呼ばれる。
+content-identity restore 完了時は `is_physical_folder_listing()` が true のときだけ、rename 完了と
+同じ `current_folder` prefix から同関数で rehydrate する。完了待ち中に検索・snapshot 等へ
+移った場合は clear のみに倒し、cross-folder view へ overlay を漏らさない。
 `adjustment_favorite_params: HashMap<Uuid, AdjustParams>` は **起動時に 1 回**
 (`App::hydrate_adjustment_favorite_params`) 全件ロードされ、
 `settings.favorites` に存在しない orphan 行は `prune_favorite_params` で掃除される。

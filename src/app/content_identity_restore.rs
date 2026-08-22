@@ -434,14 +434,73 @@ impl App {
     /// 復元完了後の idx-keyed edit state と rating / tag cache の共通 invalidation。
     /// A3b は worker report の sidecar / presence を適用した後にこの関数を呼ぶ。
     pub(crate) fn finish_content_identity_restore(&mut self, errors: Vec<String>) {
-        self.finish_book_page_edit_mapping("restore", errors);
+        // Detection / prompt は通常の物理フォルダ一覧だけで始まる。ただし restore worker の
+        // 完了までに view が変わる可能性もあるため、完了時にも同じ authoritative predicate で
+        // search / snapshot 等を除外する。prefix は rename 完了と同じく current_folder を使う。
+        if self.is_physical_folder_listing()
+            && let Some(folder) = self.current_folder.clone()
+        {
+            self.rehydrate_page_edit_state_for_current_items(&folder);
+        } else {
+            // 合成 view はページ編集 overlay を出さない既存契約を維持する。
+            self.clear_page_edit_state();
+        }
+        self.finish_book_page_edit_mapping_after_idx_refresh("restore", errors);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    fn set_physical_folder_listing(app: &mut App, folder: &Path) {
+        app.current_folder = Some(folder.to_path_buf());
+        app.normal_folder_omitted_entries = Some(crate::app::NormalFolderOmittedEntries {
+            folder: folder.to_path_buf(),
+            counts: Default::default(),
+        });
+        app.top_level_grid_view
+            .replace_surface(crate::app::top_level_grid_view::TopLevelGridSurface::Folder);
+    }
+
+    fn seed_restored_idx_page_edits(
+        app: &mut App,
+        target: &Path,
+    ) -> (String, crate::export_crop::CropSettings) {
+        let key = crate::path_key::normalize_keep_drive(target);
+        let layers = vec![local_adjust_core::LocalAdjustmentLayer::new(
+            "restored",
+            local_adjust_core::LocalMask::Full,
+            local_adjust_core::LocalEffect::None,
+        )];
+        app.local_adjust_db
+            .as_ref()
+            .unwrap()
+            .set_layers(&key, &layers)
+            .unwrap();
+        app.conceal_db
+            .as_ref()
+            .unwrap()
+            .set(&key, &[true], &[], 1, 1)
+            .unwrap();
+        let crop = crate::export_crop::CropSettings {
+            rect: crate::export_crop::CropRect {
+                min_x: 0.1,
+                min_y: 0.2,
+                max_x: 0.8,
+                max_y: 0.9,
+            },
+            aspect_mode: crate::export_crop::CropAspectMode::Free,
+            source_size: Some([100, 100]),
+        };
+        app.export_crop_db
+            .as_ref()
+            .unwrap()
+            .set(&key, crop)
+            .unwrap();
+        (key, crop)
+    }
 
     fn candidate(name: &str) -> crate::content_identity::RestoreCandidate {
         let target_path = PathBuf::from(format!("C:/copied/{name}.png"));
@@ -547,5 +606,75 @@ mod tests {
             entry.tags.as_deref(),
             Some(["#current".to_string()].as_slice())
         );
+    }
+
+    /// `edit_preview_close` の実ログで観測された退行: restore worker が DB へコピーした
+    /// conceal / local-adjust / export-crop は、フォルダ再読込なしで current idx に見えること。
+    #[test]
+    fn restore_completion_rehydrates_idx_page_edits_without_folder_reload() {
+        let mut app = crate::app::setup_app_for_test();
+        let folder = app.tmp.path().join("restored");
+        let target = folder.join("page.png");
+        app.items = vec![crate::grid_item::GridItem::Image(target.clone())];
+        set_physical_folder_listing(&mut app, &folder);
+        let (key, crop) = seed_restored_idx_page_edits(&mut app, &target);
+
+        // Worker は App の idx maps を通らず DB と path-keyed presence report を更新する。
+        let mut presence = crate::content_identity::RestorePresence::default();
+        presence.local_adjustments.insert(key.clone());
+        presence.conceals.insert(key);
+        app.apply_content_restore_presence(presence);
+        app.finish_content_identity_restore(Vec::new());
+
+        let has_source_edits = app.local_adjust_pages.contains(&0)
+            || app.mask_pages.contains(&0)
+            || app.conceal_pages.contains(&0);
+        let has_crop = app.export_crop_pages.contains(&0);
+        assert!(
+            has_source_edits,
+            "restore completion must make has_source_edits=true without a folder reload"
+        );
+        assert!(
+            app.local_adjust_pages.contains(&0),
+            "restored local adjustment presence must be idx-keyed immediately"
+        );
+        assert!(
+            app.conceal_pages.contains(&0),
+            "restored concealment presence must be idx-keyed immediately"
+        );
+        assert!(
+            has_crop,
+            "restore completion must make has_crop=true without a folder reload"
+        );
+        assert_eq!(app.export_crop_page_settings.get(&0), Some(&crop));
+        assert!(
+            app.local_adjust_page_layers.is_empty(),
+            "large local-adjust JSON remains lazy after rehydrate"
+        );
+    }
+
+    #[test]
+    fn restore_completion_does_not_rehydrate_search_view_overlays() {
+        let mut app = crate::app::setup_app_for_test();
+        let folder = app.tmp.path().join("restored");
+        let target = folder.join("page.png");
+        app.items = vec![crate::grid_item::GridItem::Image(target.clone())];
+        set_physical_folder_listing(&mut app, &folder);
+        seed_restored_idx_page_edits(&mut app, &target);
+        app.top_level_grid_view.replace_surface(
+            crate::app::top_level_grid_view::TopLevelGridSurface::Search(
+                crate::app::top_level_grid_view::TopLevelSearchView::Global,
+            ),
+        );
+        app.local_adjust_pages.insert(0);
+        app.conceal_pages.insert(0);
+        app.export_crop_pages.insert(0);
+
+        app.finish_content_identity_restore(Vec::new());
+
+        assert!(app.local_adjust_pages.is_empty());
+        assert!(app.conceal_pages.is_empty());
+        assert!(app.export_crop_pages.is_empty());
+        assert!(app.export_crop_page_settings.is_empty());
     }
 }

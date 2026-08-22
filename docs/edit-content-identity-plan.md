@@ -332,9 +332,12 @@ INSERT OR IGNORE INTO t (c1, c2, ...) SELECT ?new, c2, ... FROM t WHERE c1 = ?ol
    復元前の edit preview を保持する thumbnail だけを worker report の destination page key で
    未読 / 再要求へ戻す。特に `comic_docs` を全 clear せず、実際に復元された comic key だけを
    `remove` する。
-4. `clear_page_edit_state` / `rating_cache.clear()` / `invalidate_rating_counts_cache()` /
-   `clear_tags_cache()` — `finish_book_page_edit_mapping`
-   ([src/app.rs:30752](../src/app.rs:30752)) と同じ後始末を再利用する。
+4. 通常の物理フォルダ一覧がまだ current なら、rename 完了と同じ `current_folder` prefix から
+   `rehydrate_page_edit_state_for_current_items` を呼び、復元先の idx-keyed page edit state
+   (補正 / ローカル調整 / crop / 表示トリム / 消しゴム / 隠蔽 / 注釈 presence) をその場で再構築する。
+   完了待ちの間に検索・snapshot 等の合成 view へ移った場合は `is_physical_folder_listing()` が
+   false になるため `clear_page_edit_state` のみとし、overlay を出さない既存契約を維持する。
+   続けて `rating_cache.clear()` / `invalidate_rating_counts_cache()` / `clear_tags_cache()` を行う。
 5. 復元先にも `edit_origin` 行を作る (以後そのファイルが新たなコピー元になり得る)。
 
 **A3a / A3b 実装メモ (2026-08-21)**:
