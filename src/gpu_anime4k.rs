@@ -55,9 +55,6 @@ impl Anime4kVariant {
 }
 
 pub(crate) const STILL_IMAGE_ANIME4K_VARIANT: Anime4kVariant = Anime4kVariant::VeryLarge;
-/// B2 deliberately exposes one fixed video variant for hardware measurement.
-/// B3 replaces this constant with the measured budget selector.
-pub(crate) const VIDEO_ANIME4K_B2_VARIANT: Anime4kVariant = Anime4kVariant::VeryLarge;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Anime4kPassInput {

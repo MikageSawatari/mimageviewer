@@ -3781,6 +3781,109 @@ impl App {
             crate::video::NativeVideoOutputEvent::OverlayInputRouting(_) => {
                 debug_assert!(false, "routing snapshots are consumed by NativeVideoOutput");
             }
+            crate::video::NativeVideoOutputEvent::Anime4kAdapterReady(adapter) => {
+                self.native_video_anime4k_adapter = Some(adapter);
+                if self.settings.video_scale_filter == crate::settings::VideoScaleFilter::Anime {
+                    self.request_native_video_scale_settings(
+                        fs_idx,
+                        self.settings.video_scale_filter,
+                        self.settings.video_downscale_smoothing_percent,
+                        crate::video::VideoScaleChangeOrigin::Panel,
+                    );
+                }
+            }
+            crate::video::NativeVideoOutputEvent::Anime4kMeasurementProgress {
+                completed,
+                point,
+            } => {
+                crate::logger::log(format!(
+                    "[native-video] Anime4K measurement progress={}/{} variant={} source={}x{} gpu_us={}",
+                    completed,
+                    crate::video::anime4k_policy::VIDEO_ANIME4K_MEASUREMENT_TOTAL,
+                    point.variant.label(),
+                    point.source_width,
+                    point.source_height,
+                    point.gpu_time_us,
+                ));
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "native_presenter",
+                        "video_anime4k_measurement",
+                        None,
+                        0,
+                        &[
+                            ("completed", serde_json::Value::from(completed)),
+                            (
+                                "total",
+                                serde_json::Value::from(
+                                    crate::video::anime4k_policy::VIDEO_ANIME4K_MEASUREMENT_TOTAL,
+                                ),
+                            ),
+                            ("variant", serde_json::Value::from(point.variant.label())),
+                            ("source_width", serde_json::Value::from(point.source_width)),
+                            (
+                                "source_height",
+                                serde_json::Value::from(point.source_height),
+                            ),
+                            ("output_width", serde_json::Value::from(point.output_width)),
+                            (
+                                "output_height",
+                                serde_json::Value::from(point.output_height),
+                            ),
+                            ("gpu_time_us", serde_json::Value::from(point.gpu_time_us)),
+                        ],
+                    );
+                }
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    player.set_native_anime4k_state(
+                        self.settings.video_anime4k_budget,
+                        crate::video::native_presenter::NativeVideoAnime4kStatus::Measuring {
+                            completed,
+                            total: crate::video::anime4k_policy::VIDEO_ANIME4K_MEASUREMENT_TOTAL,
+                        },
+                    );
+                }
+            }
+            crate::video::NativeVideoOutputEvent::Anime4kMeasurementCompleted(result) => {
+                match result {
+                    Ok(cache) => {
+                        self.native_video_anime4k_adapter = Some(cache.adapter.clone());
+                        self.settings.video_anime4k_measurement = Some(cache);
+                        self.settings.save();
+                        if self.settings.video_scale_filter
+                            == crate::settings::VideoScaleFilter::Anime
+                        {
+                            self.request_native_video_scale_settings(
+                                fs_idx,
+                                self.settings.video_scale_filter,
+                                self.settings.video_downscale_smoothing_percent,
+                                crate::video::VideoScaleChangeOrigin::Panel,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        crate::logger::log(format!(
+                            "[native-video] Anime4K measurement failed: {error}"
+                        ));
+                        if self.settings.video_scale_filter
+                            == crate::settings::VideoScaleFilter::Anime
+                        {
+                            self.log_native_video_anime4k_fallback(
+                                crate::video::anime4k_policy::VideoAnime4kFallbackReason::MeasurementFailed,
+                            );
+                            if let Some(FsCacheEntry::Video { player, .. }) =
+                                self.fs_cache.get(&fs_idx)
+                            {
+                                player.set_native_anime4k_state(
+                                    self.settings.video_anime4k_budget,
+                                    crate::video::native_presenter::NativeVideoAnime4kStatus::Failed,
+                                );
+                            }
+                        }
+                    }
+                }
+                self.mark_native_video_hud_activity(ctx);
+            }
             crate::video::NativeVideoOutputEvent::Window(event) => {
                 self.handle_native_video_window_event(ctx, fs_idx, event);
             }
@@ -4001,10 +4104,39 @@ impl App {
                 );
                 self.mark_native_video_hud_activity(ctx);
             }
+            crate::video::NativeVideoOutputEvent::SetVideoAnime4kBudget { budget } => {
+                if self.settings.video_anime4k_budget != budget {
+                    self.settings.video_anime4k_budget = budget;
+                    self.settings.save();
+                }
+                if self.settings.video_scale_filter == crate::settings::VideoScaleFilter::Anime {
+                    self.request_native_video_scale_settings(
+                        fs_idx,
+                        self.settings.video_scale_filter,
+                        self.settings.video_downscale_smoothing_percent,
+                        crate::video::VideoScaleChangeOrigin::Panel,
+                    );
+                }
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::RemeasureVideoAnime4k => {
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    player.set_native_anime4k_state(
+                        self.settings.video_anime4k_budget,
+                        crate::video::native_presenter::NativeVideoAnime4kStatus::Measuring {
+                            completed: 0,
+                            total: crate::video::anime4k_policy::VIDEO_ANIME4K_MEASUREMENT_TOTAL,
+                        },
+                    );
+                    player.start_native_anime4k_measurement();
+                }
+                self.mark_native_video_hud_activity(ctx);
+            }
             crate::video::NativeVideoOutputEvent::VideoScaleSettingsPrepared {
                 request_id,
                 filter,
                 smoothing_percent,
+                anime4k_variant,
                 origin,
             } => {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
@@ -4012,6 +4144,7 @@ impl App {
                         request_id,
                         filter,
                         smoothing_percent,
+                        anime4k_variant,
                         origin,
                     );
                 }
@@ -4019,6 +4152,7 @@ impl App {
             crate::video::NativeVideoOutputEvent::VideoScaleSettingsCommitted {
                 filter,
                 smoothing_percent,
+                anime4k_variant: _,
                 toast,
             } => {
                 let smoothing_percent =
@@ -7763,6 +7897,23 @@ impl App {
                 hud_activity = false;
                 NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::ComparisonUnsupported)
             }
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoAnime4kRemeasure, &key) =>
+            {
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    player.set_native_anime4k_state(
+                        self.settings.video_anime4k_budget,
+                        crate::video::native_presenter::NativeVideoAnime4kStatus::Measuring {
+                            completed: 0,
+                            total: crate::video::anime4k_policy::VIDEO_ANIME4K_MEASUREMENT_TOTAL,
+                        },
+                    );
+                    player.start_native_anime4k_measurement();
+                }
+                NativeVideoKeyOutcome::Action(KeyAction::VideoAnime4kRemeasure)
+            }
             // T: cycle the native video's scaling method. The renderer persists the
             // setting only after dimension-dependent resources are ready.
             _ if !key.repeat
@@ -7821,7 +7972,7 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn request_native_video_scale_settings(
+    pub(crate) fn request_native_video_scale_settings(
         &self,
         fs_idx: usize,
         filter: crate::settings::VideoScaleFilter,
@@ -7831,8 +7982,159 @@ impl App {
         let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
             return false;
         };
-        player.prepare_native_video_scale_settings(filter, smoothing_percent, origin);
+        let anime4k_variant = if filter == crate::settings::VideoScaleFilter::Anime {
+            let (variant, status, should_measure) = self.native_video_anime4k_selection(player);
+            player.set_native_anime4k_state(self.settings.video_anime4k_budget, status);
+            if should_measure {
+                player.start_native_anime4k_measurement();
+            }
+            variant
+        } else {
+            None
+        };
+        player.prepare_native_video_scale_settings(
+            filter,
+            smoothing_percent,
+            anime4k_variant,
+            origin,
+        );
         true
+    }
+
+    #[cfg(windows)]
+    fn native_video_anime4k_selection(
+        &self,
+        player: &crate::video::VideoPlayer,
+    ) -> (
+        Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
+        crate::video::native_presenter::NativeVideoAnime4kStatus,
+        bool,
+    ) {
+        use crate::video::anime4k_policy::{VideoAnime4kSelection, select_video_anime4k_variant};
+        let Some(adapter) = self.native_video_anime4k_adapter.as_ref() else {
+            return (
+                None,
+                crate::video::native_presenter::NativeVideoAnime4kStatus::Waiting,
+                false,
+            );
+        };
+        let Some((width, height, fps)) = player.native_video_info_for_anime4k() else {
+            return (
+                None,
+                crate::video::native_presenter::NativeVideoAnime4kStatus::Waiting,
+                false,
+            );
+        };
+        let cache = self
+            .settings
+            .video_anime4k_measurement
+            .as_ref()
+            .filter(|cache| cache.is_valid_for(adapter));
+        let fixed = self.settings.video_anime4k_budget.fixed_variant().is_some();
+        if cache.is_none() && !fixed {
+            return (
+                None,
+                crate::video::native_presenter::NativeVideoAnime4kStatus::Measuring {
+                    completed: 0,
+                    total: crate::video::anime4k_policy::VIDEO_ANIME4K_MEASUREMENT_TOTAL,
+                },
+                true,
+            );
+        }
+        let measurements = cache.map(|cache| cache.points.as_slice()).unwrap_or(&[]);
+        let selection = select_video_anime4k_variant(
+            measurements,
+            self.settings.video_anime4k_budget,
+            u64::from(width).saturating_mul(u64::from(height)),
+            if fps.is_finite() && fps > 0.0 {
+                fps
+            } else {
+                30.0
+            },
+            adapter.anime4k_vram_budget_bytes(),
+        );
+        match selection {
+            VideoAnime4kSelection::Selected {
+                variant,
+                predicted_us,
+                budget_us,
+                required_vram_bytes,
+            } => {
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "native_presenter",
+                        "video_anime4k_variant_selected",
+                        None,
+                        0,
+                        &[
+                            ("variant", serde_json::Value::from(variant.label())),
+                            ("predicted_us", serde_json::Value::from(predicted_us)),
+                            (
+                                "budget_us",
+                                budget_us
+                                    .map(serde_json::Value::from)
+                                    .unwrap_or(serde_json::Value::Null),
+                            ),
+                            (
+                                "source_pixels",
+                                serde_json::Value::from(
+                                    u64::from(width).saturating_mul(u64::from(height)),
+                                ),
+                            ),
+                            ("fps", serde_json::Value::from(fps)),
+                            (
+                                "required_vram_bytes",
+                                serde_json::Value::from(required_vram_bytes),
+                            ),
+                        ],
+                    );
+                }
+                (
+                    Some(variant),
+                    crate::video::native_presenter::NativeVideoAnime4kStatus::Active {
+                        variant,
+                        predicted_us,
+                        budget_us,
+                    },
+                    false,
+                )
+            }
+            VideoAnime4kSelection::Fallback(reason) => {
+                self.log_native_video_anime4k_fallback(reason);
+                (
+                    None,
+                    crate::video::native_presenter::NativeVideoAnime4kStatus::Fallback(reason),
+                    false,
+                )
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn log_native_video_anime4k_fallback(
+        &self,
+        reason: crate::video::anime4k_policy::VideoAnime4kFallbackReason,
+    ) {
+        static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = COUNT
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        crate::logger::log(format!(
+            "[native-video] Anime4K fallback reason={} count={count}",
+            reason.perf_name()
+        ));
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "native_presenter",
+                "video_anime4k_fallback",
+                None,
+                0,
+                &[
+                    ("reason", serde_json::Value::from(reason.perf_name())),
+                    ("count", serde_json::Value::from(count)),
+                ],
+            );
+        }
     }
 
     #[cfg(windows)]
@@ -8053,6 +8355,7 @@ impl App {
             ),
             self.settings.video_scale_filter,
             self.settings.video_downscale_smoothing_percent,
+            self.settings.video_anime4k_budget,
             true, // audio_only (frameless present、Inc 6 ②-1)
         ) else {
             return;
@@ -8645,6 +8948,7 @@ impl App {
                 ),
                 self.settings.video_scale_filter,
                 self.settings.video_downscale_smoothing_percent,
+                self.settings.video_anime4k_budget,
                 false,
             )
         });

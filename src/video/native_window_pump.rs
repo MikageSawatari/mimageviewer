@@ -1527,6 +1527,8 @@ mod tests {
             video_grade: crate::creative_lut::VideoGradeSnapshot::default(),
             scale_filter: crate::settings::VideoScaleFilter::OsDefault,
             downscale_smoothing_percent: 0,
+            anime4k_variant: None,
+            anime4k_budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset::default(),
             editor_hwnds_snapshot: None,
             main_hwnd_for_raise: 0,
             hud_overlay_enabled: false,
@@ -1619,6 +1621,11 @@ mod tests {
                             ui_font: crate::settings::UiFontSettings::default(),
                             scale_filter: crate::settings::VideoScaleFilter::OsDefault,
                             downscale_smoothing_percent: 0,
+                            anime4k_variant: None,
+                            anime4k_budget:
+                                crate::video::anime4k_policy::VideoAnime4kBudgetPreset::default(),
+                            anime4k_status:
+                                crate::video::native_presenter::NativeVideoAnime4kStatus::Waiting,
                             health: render_health,
                             window_epoch: 1,
                         },

@@ -765,7 +765,12 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
 - 動画の拡大方法は、既定で拡大・縮小とも高品質補間する「標準（補間あり）」、従来表示の
   「OS に任せる」、拡大をくっきり補正する「シャープ拡大」、拡大時に画素を補間しない
   「ニアレスト（補間なし）」、線画・イラスト向けの「アニメ塗り拡大」から選べる。
-  アニメ塗り拡大は B2 の実機評価中は Anime4K VL 固定で、測定に基づくモデル選択を B3 で加える。
+  アニメ塗り拡大を初めて選ぶと再生を続けたまま端末の性能を6項目で測定し、動画のfpsに対する
+  予算と利用可能メモリから S / M / L / VL / UL を選ぶ。測定結果はGPU・ドライバが同じ間は
+  再利用し、左パネルに選択モデル・予測時間・予算、または測定進捗と標準表示への退避理由を出す。
+  品質の余裕は速度優先 / 標準 / 画質優先、または各モデル固定から選び、再測定を明示操作できる。
+  総画素数1920×1080を超える動画、最小モデルも時間・メモリ予算に入らない端末、測定失敗時は
+  標準拡大で表示する。同じ動画の再生中に負荷を監視して自動でモデルを上下させない。
   シャープ / ニアレスト / アニメ塗りも縮小時は標準と同じ高品質縮小を
   使い、「縮小時のなめらかさ」は静止画とは別に 0〜100%（10% 刻み、既定 0%）で保持する。
   選択場所は動画フルスクリーン左パネルの「画像補正」→「フィルタ」で、<kbd>T</kbd> は 5 方式を
@@ -1761,8 +1766,10 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `video_muted` | bool | false | HUD のミュートボタン / M キーで最後に選んだミュート状態。動画切替と次回起動へ引き継ぐ |
 | `video_hw_decode` | bool | true | Windows D3D11VA ハードウェアデコードを試みる。D3D11VA 非対応 codec は CPU デコード、D3D11VA 対応 codec の HW 経路失敗は再生エラー |
 | `video_deinterlace` | VideoDeinterlaceMode | Auto | 動画再生時のデインターレース（Off / Auto / On）。Auto は frame interlaced flag と stream field_order を参照し、Auto/On は FFmpeg bwdif を表示前に適用 |
-| `video_scale_filter` | VideoScaleFilter | Standard | 動画の拡大方法。OsDefault / Standard / Sharp / Nearest / Anime。Anime は B2 では実機評価用の Anime4K VL 固定で、予算に応じた variant 選択は B3 |
+| `video_scale_filter` | VideoScaleFilter | Standard | 動画の拡大方法。OsDefault / Standard / Sharp / Nearest / Anime |
 | `video_downscale_smoothing_percent` | u32 | 0 | 動画専用の「縮小時のなめらかさ」。0〜100・10刻みに正規化し、Lanczos3 の blur 1.00〜1.30 へ対応させる。静止画側の同名設定とは共有しない |
+| `video_anime4k_budget` | VideoAnime4kBudgetPreset | Standard | 動画のアニメ塗り拡大の品質余裕。Speed=フレーム間隔の20%、Standard=40%、Quality=60%、または S/M/L/VL/UL 固定 |
+| `video_anime4k_measurement` | Option<VideoAnime4kMeasurementCache> | None | S/L/UL×540p/1080pのGPU timestamp結果。adapter・driver情報が一致するときだけ再利用する |
 | `video_grid_open_starts_from_beginning` | bool | false | 位置復元マトリクス「動画 × 一覧から開く」の保存先 (v0.9.0 リリース済み bool を流用)。ON = 先頭から / OFF = 続きから。UI からは `video_open_resume` / `set_video_open_resume` 経由で ResumeMode として読み書き |
 | `video_nav_resume` | ResumeMode | Resume | 位置復元マトリクス「動画 × Ctrl+↑↓ 移動 (ホイール/キー含む)」。Resume=続きから / FromStart=先頭から |
 | `book_open_resume` | ResumeMode | Resume | 位置復元マトリクス「ZIP/PDF/対応アーカイブ/画像のみ通常フォルダ × 一覧から開く」。Resume=続き (保存済み読書位置) / FromStart=先頭ページ |

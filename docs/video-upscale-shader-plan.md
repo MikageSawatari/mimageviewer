@@ -1,6 +1,6 @@
 # 動画の拡大・縮小を mIV のシェーダで行う
 
-ステータス: **Phase A 実装済み / 実機画質・性能比較待ち**
+ステータス: **Phase A / Phase B 実装済み / Phase B 実機画質・再生安定性確認待ち**
 対象: [next-release-backlog.md](next-release-backlog.md) §1.47
 関連: [upscale-algorithm-selection.md](upscale-algorithm-selection.md) (静止画側の正本) /
 [video-architecture.md](video-architecture.md) / [display-pipeline.md](display-pipeline.md) /
@@ -178,9 +178,9 @@ VL 固有だった `INTERMEDIATE_COUNT` / `INPUT_BINDING_COUNT` と pass 番号�
 [test_convert_anime4k_glsl_to_wgsl.py](../scripts/test_convert_anime4k_glsl_to_wgsl.py) は、
 一般化した converter による VL 再生成結果と committed `gpu_anime4k.wgsl` の完全一致を
 golden test にし、5 変種すべての shader / topology も committed 生成物と比較する。
-HLSL 出力と native video presenter への接続は B2、計測と選択 policy は B3 で扱う。
+HLSL 出力と native video presenter への接続は B2、計測と選択 policy は B3 で実装した。
 
-### 4.3 HLSL 生成 (B2 実装済み、モデル選択は B3)
+### 4.3 HLSL 生成 (B2 / B3 実装済み)
 
 presenter は wgpu ではなく生の D3D11 なので WGSL はそのまま使えないが、**手書き移植は
 持たない**。[build.rs](../build.rs) が B1 で生成した S / M / L / VL / UL の WGSL を Naga の
@@ -208,8 +208,9 @@ bytecode にし、生成した variant table から `include_bytes!` する。`f
   フレーム全体 (`process_origin = 0`) とする。orientation は最終 resolve の inverse mapping で
   正規化し、追加の target-size copy は持たない
 
-B2 の動画選択値は実機評価用に **VL 固定**である。5 変種の bytecode は生成済みだが、再生時に
-どれを使うかは §5 の測定・予算選択を実装する B3 まで決めない。
+B3 では S / L / UL を GPU timestamp で測り、M / VL を演算量で内挿する。自動プリセットは
+フレーム時間予算と中間画像のメモリ予算をともに満たす最大モデルを選び、固定プリセットは
+メモリ・ソース上限だけを守って指定モデルを選ぶ。
 
 ---
 
@@ -237,25 +238,26 @@ B2 の動画選択値は実機評価用に **VL 固定**である。5 変種の 
 
 **モデル × ソースサイズの表を作る。**
 
-- サイズは **2 点**でよい (コストはソース画素数にほぼ線形)。例: 540p と 1080p。
-  3 点目は線形性の検証用として開発時のみ
+- サイズは **960×540 と 1920×1080 の 2 点**とする (コストはソース画素数にほぼ線形)。
+  出力はそれぞれ 1920×1080 と 3840×2160 とし、測定結果にも両寸法を記録する
 - **2160p は測らない**。VL で中間 1.13GB、UL で 1.59GB になり中級 GPU では確保できない。
   4K ソースを更に拡大する場面 (= 4K 超のディスプレイ) は稀で、Anime4K の値打ちも最小。
-  **測定上限を超えるソースは標準拡大へ落とす** — 静止画の `anime_upscale_source_limit` と
-  同じ規則にする
+  **総画素数が 1920×1080 を超えるソースは標準拡大へ落とす**。長辺だけの判定にしないため、
+  縦長・横長動画も同じメモリ上限になる
 - モデルは **S / L / UL の 3 つを実測し、M / VL は内挿**でよい (実測点に挟まれる)。
   組数は 3×2 = 6
 
 計測は `ID3D11Query` (`TIMESTAMP` + `TIMESTAMP_DISJOINT`) でアップスケールパスだけを測る。
 フレーム時間ではデコード・他アプリ・コンポジタが混ざる。
 
-**各組で最初の数フレームを捨て、次の 5〜7 フレームの中央値を採る。** 初回描画では
+**各組で最初の 3 回を捨て、次の 7 回の中央値を採る。** 初回描画では
 ドライバの最終コンパイル・テクスチャ初回タッチ・GPU クロックの立ち上がりが乗り、
 2〜3 倍悲観的に出る。しかもシェーダ本数が多い大きいモデルほどこの偏りが大きいので、
 **1 フレーム比較は大きいモデルを構造的に不利に判定する** (ノイズではなく系統誤差)。
 
-出力サイズにも依存する (`a + b×ソース画素 + c×出力画素`。1080p→4K で出力依存分が約 13%)。
-**測定時の出力サイズを記録**し、実表示サイズが大きく違う場合は線形補正するか再測定する。
+出力サイズにも依存するため、**測定時の出力サイズを記録**する。現実装は表示解像度の代表点
+(2倍拡大) で測り、ソース画素数に対して線形補間する。表示サイズを独立変数にした3変数回帰は、
+実機比較で代表点からの誤差が問題になった場合の拡張とする。
 
 ### 5.3 いつ測るか
 
@@ -268,18 +270,20 @@ B2 の動画選択値は実機評価用に **VL 固定**である。5 変種の 
 
 **測定中も再生を止めない。**
 
-- パイプライン生成は**ワーカースレッド** (`ID3D11Device` の生成系はフリースレッド。
-  `ID3D11DeviceContext` だけがスレッド非安全)
-- 計測はレンダースレッドで**フレーム間に 1 組ずつ**
+- 計測全体を**専用ワーカースレッド**へ置く。再生用とは別の `ID3D11Device` /
+  immediate context を同じ adapter 上に作り、GPU thread priority を最低値へ下げる
 - 計測は**オフスクリーン**で行い、画面には現在の選択を出し続ける。でないと測定中に
   S → L → UL と画質が階段状に変わるのが見える
+- 再生 render thread は query 完了を待たず、測定 worker の progress channel を非同期に読む。
+  再生位置・clock・decode queue は触らない
 - パネルに「測定中 (3/6)」を出す
 
 ### 5.4 キャッシュと無効化
 
 **測定結果は永続化する。** 起動のたびに測り直すのは煩わしい。
 
-- キーに **GPU アダプタ識別 + ドライバ版**を含める ([gpu_info.rs](../src/gpu_info.rs) に情報がある)
+- キーに **adapter LUID / vendor / device / subsystem / revision / driver version /
+  dedicated・shared memory / description** を含める
 - キーが一致しなければ破棄して再測定
 - 記録するのは「モデル × ソース画素数 → GPU 時間」と、測定時の出力サイズ
 
@@ -299,9 +303,15 @@ B2 の動画選択値は実機評価用に **VL 固定**である。5 変種の 
 | 画質優先 | 60% | 動画の再生に専念する前提で、最も高品質なモデルを選びます |
 | 固定 (S/M/L/VL/UL) | — | 測定せず指定したモデルを使います |
 
+20 / 40 / 60% を採用する。B3 開発機の GPU timestamp 中央値は
+540p→1080p が S=0.055ms / L=0.163ms / UL=0.462ms、1080p→4K が
+S=0.189ms / L=0.606ms / UL=2.213ms だった。高速な1台の絶対時間を閾値にはせず、
+標準40%で decode・compositor・一時的な競合へ60%を残す。速度優先はその余裕を80%へ、
+画質優先は40%へ振る。
+
 **% は UI に出さない。** 予算の余裕とは「他アプリが一時的に暴れたときの吸収代」なので、
-利用者にはその言葉で説明する。数値は実測後に調整する前提の暫定値である
-(デコードも同じ GPU を使うため、80% のような値は実質オーバーコミットになる)。
+利用者にはその言葉で説明する。デコードも同じ GPU を使うため、80% のような値は実質
+オーバーコミットになる。
 
 「固定」を残すのは、決定性を重視する使い方を壊さないため。実装コストはほぼゼロ。
 
@@ -316,7 +326,9 @@ B2 の動画選択値は実機評価用に **VL 固定**である。5 変種の 
 - 切り替えのたびにシェーダとテクスチャを作り直すので、§6 の不変条件を再生中に何度も破る
 
 負荷が変わった場合の回復手段は**再測定ボタン**である。サーマルスロットリングや電源プロファイル
-変更も同じ扱いにする。
+変更も同じ扱いにする。自動で再評価するのは新しい動画の source 寸法 / fps が確定した時だけで、
+同じ動画の再生中に負荷を監視して自動昇降格はしない。予算変更と再測定は利用者の明示操作なので、
+完了後に prepare / commit 境界で切り替える。
 
 ---
 
@@ -337,9 +349,9 @@ B2 の動画選択値は実機評価用に **VL 固定**である。5 変種の 
 具体的な要求:
 
 - Anime4K のシェーダはビルド時 `fxc` でバイトコード化 (§4.3)
-- 中間テクスチャは切替前に準備し、完成してから原子的に有効化する。B2 は Phase A と同じ
-  render-thread prepare / allocation-free commit 境界に VL の 17 枚を載せる。B3 の測定用
-  offscreen resource と複数 variant の準備は worker 化を含めて改めて設計する
+- 中間テクスチャは切替前に準備し、完成してから原子的に有効化する。B3 は Phase A と同じ
+  render-thread prepare / allocation-free commit 境界へ選択 variant を載せる。候補の全枚数を
+  prepare できた後だけ commit を発行し、成功時に旧 variant の中間画像を解放する
 - 一時停止中の切り替えも即反映する。既存の `SetVideoGrade` が持つ「Visible なら 1 回だけ
   再提示」の仕組みをそのまま使う (`FramePresentationState`)
 
@@ -349,9 +361,14 @@ Phase A の全シェーダは `NativeRenderCore` 作成時にコンパイルす�
 ときだけ App が commit command を publish し、commit と一時停止中の held frame 再提示には
 コンパイルも確保も残さない。prepare 後に
 geometry が変わった request は stale として破棄し、古い surface を接続しない。
-Anime4K は全 variant の pixel shader を build 時に bytecode 化し、B2 では VL の 18 shader object
-を `NativeRenderCore` 作成時に bytecode からロードする。設定 prepare は現在の source 寸法の
-17 intermediate を完成させ、commit は既存 resource の選択だけを行う。
+Anime4K は全 variant の pixel shader を build 時に bytecode 化し、B3 では全67 shader object
+を `NativeRenderCore` 作成時に bytecode からロードする。runtime compile はしない。
+同じ開発機の WARP 測定では VL 18本の runtime compile が713.8ms、VL bytecode loadが5.0ms、
+全5 variantのbytecode loadが16.8msだったため、shader objectは全variantを常備できる。
+設定 prepare は現在の source 寸法について選択 variant 1つ分の intermediate だけを完成させ、
+commit は既存 resource の選択だけを行う。1080p source の中間画像は S / M / L / VL / UL の順に
+約63 / 127 / 142 / 269 / 380 MiB で、同時保持しない。VRAM安全予算は adapter が報告する
+dedicated / shared memory の大きい方の25%とする。
 
 残る 1 つの避けられないコスト: 差し替え時の `WaitForCommitCompletion()` + `DwmFlush()` で
 レンダースレッドが最大 1 コンポジタ tick (8〜16ms) 止まる。切替の瞬間だけで、既に
@@ -367,8 +384,7 @@ Anime4K は全 variant の pixel shader を build 時に bytecode 化し、B2 �
 ([overlay_draw.rs](../src/video/native_presenter/overlay_draw.rs) の
 `NativeVideoAdjustmentTab::Filter`、現在は Creative LUT を置いている)。
 
-- 拡大方法 (OS に任せる / 標準 / ニアレスト / シャープ / アニメ塗り)。B2 のアニメ塗りは
-  実機評価用の VL 固定で、予算プリセットと variant 表示は B3 で追加する
+- 拡大方法 (OS に任せる / 標準 / ニアレスト / シャープ / アニメ塗り)
 - Anime4K を選んだときだけ、予算プリセットと**再測定ボタン**を同じ場所に出す
 - 現在選ばれているモデルと根拠 (`Anime4K L / 予測 6.2ms / 予算 16.7ms`) をその場に表示する
 - 測定中は「測定中 (3/6)」
@@ -380,9 +396,9 @@ Anime4K は全 variant の pixel shader を build 時に bytecode 化し、B2 �
 
 ### 7.2 制限に当たったときの表示
 
-ソースが測定上限を超えて標準拡大へ落ちる場合、静止画と同じ書式で選択肢の直下に出す:
+ソースが測定上限を超えて標準拡大へ落ちる場合、静止画と同じ helper の書式で選択肢の直下に出す:
 
-> （この動画は処理対象サイズ 長辺 8192px 以下・総画素数 16777216px 以下の範囲外なので実行されません）
+> （Anime4K は処理対象サイズ 総画素数 2073600px 以下の範囲外なので実行されません）
 
 `processing_size_outside_note_for` で静止画側と同じ書式を共有する。
 
@@ -390,8 +406,8 @@ Anime4K は全 variant の pixel shader を build 時に bytecode 化し、B2 �
 
 CLAUDE.md の方針どおり `KeyAction` に足す:
 
-- 動画の拡大方法の切り替え (静止画の `FsPostFilterUpscaleAnime` 等に対応するもの)
-- **アップスケール品質の再測定** (Phase B)
+- 動画の拡大方法の切り替え (`VideoScaleFilterNext`、既定 T)
+- **アップスケール品質の再測定** (`VideoAnime4kRemeasure`、既定割り当てなし)
 
 `ini_name()` / `context()` / `trigger()` / `default_chords()` / `ALL_ACTIONS` / 呼び出し側
 helper / [keymap.ini.default](keymap.ini.default) を揃える。
@@ -468,8 +484,7 @@ VRAM は §4.1 のとおり。detached で動画を 2 面同時再生するこ�
 | A-3 | 設定・UI・キー・計装・フォールバック | 300〜400 行 |
 | B-1 | Anime4K 実装の一般化 (コンバータ表駆動化、静止画側にも波及) | 1〜2 日 |
 | B-2 | **実装済み**: Naga HLSL + build-time bytecode + VL 固定 D3D11 多段パイプライン | 600〜800 行 |
-| B-3 | 測定機構 (GPU タイマ / ワーカー生成 / オフスクリーン / 永続キャッシュ) | 300〜400 行 |
-| B-4 | モデル選択 (純関数) + UI + 再測定アクション | 200〜300 行 |
+| B-3 | **実装済み**: GPU timestamp / offscreen worker / 永続キャッシュ / 純関数選択 / UI | 900〜1200 行 |
 
 Phase A で約 2 週間、Phase B で約 2 週間 (いずれも実機往復を含まない)。
 **Phase A は測定を待たずに着手してよい。**
@@ -515,13 +530,15 @@ DComp 任せに対する明確な利得で、コストがフレーム落ちを�
 しなかったのは、効果が拡大時に限られ、素材依存 (文字・線画では有利、フィルムグレインでは
 過処理に見える) で、静止画側の既定 `標準（補間あり）` と揃わないため。
 
-### 残る穴 — 性能によるフォールバックが無い
+### Phase A 方式の性能フォールバック判断
 
-サイズ上限によるフォールバックはあるが、**性能によるフォールバックは無い**。コストは出力
-解像度に比例するので、4K 画面 + 内蔵 GPU が最悪ケースになる。上表は 4090 での値であり、
-弱い GPU へ外挿すると拡大時の NIS は数 ms 級になり得る。既定を軽い `標準` にしたことで
-実害は出にくいが、Phase B (Anime4K) は §5 の実測とモデル選択が前提であり、その仕組みは
-Phase A の 4 方式にも後から効かせられる。
+Phase A の4方式には B3 の時間測定フォールバックを広げない。Anime4K は最小Sでも11層かつ
+source-resolution中間4枚を使い、モデルを下げる品質段階がある。一方 Phase A は1〜2 passで、
+標準はAnime4Kが予算外のときにも使う常時利用可能な退避先である。標準まで測定待ち・自動無効化
+にすると既定表示と退避先が同時に不安定になる。上の実測で表示解像度4Kでも追加中央値が
+0.14〜0.54ms、late drop 0だったことから、Phase A は既存の typed なサイズ・確保失敗
+fallbackと利用者が選べる「OS に任せる」を維持する。低速GPUで問題が観測された場合は、
+Anime4Kのsource画素モデルを流用せず、出力画素数を軸にした別測定として追加する。
 
 ### リリース時にやること
 
@@ -555,11 +572,24 @@ master 側の §1.101 改訂 2 は「バーの領域を確保して映像をそ�
 
 ---
 
+## 10.6 出荷方針 (2026-08-22、利用者判断)
+
+- **Phase A だけでは出さない。** 静止画側が既に Anime4K を持っているので、動画が「拡大は
+  対応したが Anime4K は無い」状態で出ると機能として半端に見える。Phase A + Anime4K を
+  1 つの改善としてまとめて出す。§3 の「Phase A と Phase B は別リリースに分ける」は
+  この判断で上書きされた。
+- **動画アップスケールは利用者要望ではない。** 急ぐ理由が無いので安定性を優先する。
+  検証に不安が残るなら、締切に合わせず次版へ送る。動画再生は既に安定して動いている
+  機能であり、要望されていない機能のためにそこへリスクを持ち込まない。
+- 当初は v3.2.0 (2026-08-23 予定) を狙ったが、間に合わなければ v3.3.0 とする。
+
+---
+
 ## 11. 未決事項
 
-- 予算プリセットの数値 (20/40/60%) — 実測後に決める
-- 測定に使うソースサイズの 2 点 (540p / 1080p か、720p / 1080p か)
-- 動画の測定上限 (長辺 1280 / 1920 / 無制限のどれを既定にするか)
+予算プリセットは20/40/60%、測定点は540p/1080p、測定上限は総画素数1920×1080、
+中間画像のVRAM予算は報告メモリの25%に確定した。残る未決事項:
+
 - 効果フィルタ (CRT / セピア等) を動画にも入れるか。入れる場合、色調 (grade) パスとの
   適用順序を決める必要がある。**Phase A / B の範囲外**とし、別途判断する
 - Anime4K の Restore / Denoise 段を将来入れるか (現状は Upscale x2 の 1 段のみ)

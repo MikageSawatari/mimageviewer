@@ -28,8 +28,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Dxgi::{
     DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
     DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, DXGI_SWAP_EFFECT_FLIP_DISCARD,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2, IDXGIKeyedMutex, IDXGIOutput,
-    IDXGISwapChain1, IDXGISwapChain2,
+    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIAdapter, IDXGIAdapter1, IDXGIDevice, IDXGIFactory2,
+    IDXGIKeyedMutex, IDXGIOutput, IDXGISwapChain1, IDXGISwapChain2,
 };
 use windows::Win32::System::Threading::WaitForSingleObject;
 use windows::core::Interface;
@@ -37,7 +37,6 @@ use windows_numerics::Matrix3x2;
 
 use crate::settings::{FsSidePanelMode, VideoScaleFilter};
 use crate::ui_helpers::HoverTipExt;
-use crate::video::VideoScaleFallbackNotice;
 use crate::video::decoder::{VideoFrame, VideoFrameData};
 use crate::video::display_metadata::VideoOrientation;
 pub(crate) use crate::video::native_cursor::cursor_move_is_activity;
@@ -47,6 +46,7 @@ use crate::video::native_window_host::{
     NativeWindowObservation,
 };
 use crate::video::window_host_contract::HostWindowTopology;
+use crate::video::{VideoAnime4kFallbackNotice, VideoScaleFallbackNotice};
 
 // 音楽ビュー (Inc 5c-A) がジャンプ/ブックマークパネル本体・一括登録ダイアログを共有するため
 // crate 内に公開する。動画専用の `pub(super)` ヘルパは従来どおり parent 限定のまま。
@@ -58,7 +58,8 @@ use self::grade_pipeline::VideoGradePipeline;
 #[path = "resample_pipeline.rs"]
 mod resample_pipeline;
 use self::resample_pipeline::{
-    VideoResampleMode, VideoResamplePipeline, VideoResamplePrepareError, select_video_resample_mode,
+    VideoResampleMode, VideoResamplePipeline, VideoResamplePrepareError,
+    measure_video_anime4k_on_adapter, select_video_resample_mode,
 };
 #[path = "surface_policy.rs"]
 mod surface_policy;
@@ -84,6 +85,42 @@ const TEXT_INPUT_FOCUS_CLAIM_MIN_INTERVAL: Duration = Duration::from_millis(500)
 /// `GeometryChanged` sample. Windows has no single reliable end edge across
 /// interactive, child, maximize, and programmatic resize routes.
 const VIDEO_RESIZE_SETTLE_INTERVAL: Duration = Duration::from_millis(150);
+
+#[derive(Debug)]
+pub enum NativeAnime4kMeasurementUpdate {
+    Progress {
+        completed: u32,
+        point: crate::video::anime4k_policy::VideoAnime4kMeasurementPoint,
+    },
+    Completed(Result<crate::video::anime4k_policy::VideoAnime4kMeasurementCache, String>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeVideoAnime4kStatus {
+    Waiting,
+    Measuring {
+        completed: u32,
+        total: u32,
+    },
+    Active {
+        variant: crate::video::anime4k_policy::VideoAnime4kVariant,
+        predicted_us: u64,
+        budget_us: Option<u64>,
+    },
+    Fallback(crate::video::anime4k_policy::VideoAnime4kFallbackReason),
+    Failed,
+}
+
+pub struct NativeAnime4kMeasurement {
+    pub updates: crossbeam_channel::Receiver<NativeAnime4kMeasurementUpdate>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for NativeAnime4kMeasurement {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+}
 
 /// 動画 HUD 2 段化リデザイン (Phase 3): 下 HUD を **シーク行 (上段) + コントロール行 (下段)**
 /// の 2 段に分割する。
@@ -154,6 +191,9 @@ pub struct NativeRenderConfig {
     /// Startup-selected video scaling owner.
     pub scale_filter: VideoScaleFilter,
     pub downscale_smoothing_percent: u32,
+    pub anime4k_variant: Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
+    pub anime4k_budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset,
+    pub anime4k_status: NativeVideoAnime4kStatus,
     pub(crate) health: Arc<crate::video::native_window_health::NativeWindowHealth>,
     pub(crate) window_epoch: u64,
 }
@@ -211,6 +251,9 @@ pub struct NativeRenderCore {
     resample_pipeline_error: Option<String>,
     selected_scale_filter: VideoScaleFilter,
     downscale_smoothing_percent: u32,
+    selected_anime4k_variant: Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
+    anime4k_budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset,
+    anime4k_status: NativeVideoAnime4kStatus,
     surface_content: VideoSurfaceContent,
     resize_settle: VideoResizeSettleState,
     prepared_video_surface: Option<PreparedVideoSurface>,
@@ -292,6 +335,7 @@ struct VideoScalePreparationSignature {
     grade_active: bool,
     filter: VideoScaleFilter,
     smoothing_percent: u32,
+    anime4k_variant: Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -355,6 +399,7 @@ struct DisplaySurfaceRequestKey {
     grade_active: bool,
     filter: VideoScaleFilter,
     smoothing_percent: u32,
+    anime4k_variant: Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
 }
 
 #[derive(Clone, Debug)]
@@ -566,6 +611,8 @@ struct NativeEguiOverlay {
     video_scale_filter: VideoScaleFilter,
     video_downscale_smoothing_percent: u32,
     video_scale_outside_note: Option<String>,
+    video_anime4k_budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset,
+    video_anime4k_status: NativeVideoAnime4kStatus,
     video_preset_slots: Arc<[Option<String>]>,
     creative_lut_choices: Arc<[crate::creative_lut::CreativeLutChoice]>,
     video_left_panel_tab: NativeVideoLeftPanelTab,
@@ -1545,6 +1592,10 @@ pub enum NativeOverlayCommand {
         filter: VideoScaleFilter,
         smoothing_percent: u32,
     },
+    SetVideoAnime4kBudget {
+        budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset,
+    },
+    RemeasureVideoAnime4k,
     SetPlaybackSpeed {
         speed: f64,
     },
@@ -1747,6 +1798,88 @@ fn hud_repaint_debug_enabled() -> bool {
 }
 
 impl NativeRenderCore {
+    pub fn anime4k_adapter_key(
+        &self,
+    ) -> Result<crate::video::anime4k_policy::VideoAnime4kAdapterKey, String> {
+        let (_, key) = self.anime4k_adapter_and_key()?;
+        Ok(key)
+    }
+
+    pub fn start_anime4k_measurement(&self) -> Result<NativeAnime4kMeasurement, String> {
+        let (adapter, key) = self.anime4k_adapter_and_key()?;
+        let (tx, updates) = crossbeam_channel::bounded(8);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        std::thread::Builder::new()
+            .name("video-anime4k-measure".to_string())
+            .spawn(move || {
+                let result = measure_video_anime4k_on_adapter(
+                    &adapter,
+                    &worker_cancel,
+                    |completed, point| {
+                        let _ =
+                            tx.send(NativeAnime4kMeasurementUpdate::Progress { completed, point });
+                    },
+                )
+                .map(|points| {
+                    crate::video::anime4k_policy::VideoAnime4kMeasurementCache {
+                        schema: crate::video::anime4k_policy::VIDEO_ANIME4K_MEASUREMENT_SCHEMA,
+                        adapter: key,
+                        points,
+                    }
+                });
+                let _ = tx.send(NativeAnime4kMeasurementUpdate::Completed(result));
+            })
+            .map_err(|error| format!("spawn Anime4K measurement worker: {error}"))?;
+        Ok(NativeAnime4kMeasurement { updates, cancel })
+    }
+
+    fn anime4k_adapter_and_key(
+        &self,
+    ) -> Result<
+        (
+            IDXGIAdapter,
+            crate::video::anime4k_policy::VideoAnime4kAdapterKey,
+        ),
+        String,
+    > {
+        let dxgi_device: IDXGIDevice = self
+            .d3d_device1
+            .cast()
+            .map_err(|error| format!("Anime4K adapter IDXGIDevice: {error:?}"))?;
+        let adapter = unsafe { dxgi_device.GetAdapter() }
+            .map_err(|error| format!("Anime4K adapter GetAdapter: {error:?}"))?;
+        let adapter1: IDXGIAdapter1 = adapter
+            .cast()
+            .map_err(|error| format!("Anime4K adapter IDXGIAdapter1: {error:?}"))?;
+        let desc = unsafe { adapter1.GetDesc1() }
+            .map_err(|error| format!("Anime4K adapter GetDesc1: {error:?}"))?;
+        let name_len = desc
+            .Description
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(desc.Description.len());
+        let description = String::from_utf16_lossy(&desc.Description[..name_len]);
+        let driver_version = unsafe { adapter.CheckInterfaceSupport(&ID3D11Device::IID) }
+            .map(|value| value as u64)
+            .unwrap_or(0);
+        Ok((
+            adapter,
+            crate::video::anime4k_policy::VideoAnime4kAdapterKey {
+                luid_low: desc.AdapterLuid.LowPart,
+                luid_high: desc.AdapterLuid.HighPart,
+                vendor_id: desc.VendorId,
+                device_id: desc.DeviceId,
+                subsystem_id: desc.SubSysId,
+                revision: desc.Revision,
+                driver_version,
+                dedicated_video_memory: desc.DedicatedVideoMemory as u64,
+                shared_system_memory: desc.SharedSystemMemory as u64,
+                description,
+            },
+        ))
+    }
+
     pub(crate) fn new(
         config: NativeRenderConfig,
     ) -> Result<(Self, HostWindowTopology, Vec<NativeWindowIntent>), String> {
@@ -2135,6 +2268,9 @@ impl NativeRenderCore {
                 downscale_smoothing_percent: crate::settings::sanitize_downscale_smoothing_percent(
                     config.downscale_smoothing_percent,
                 ),
+                selected_anime4k_variant: config.anime4k_variant,
+                anime4k_budget: config.anime4k_budget,
+                anime4k_status: config.anime4k_status,
                 surface_content: VideoSurfaceContent::LegacySource,
                 resize_settle: VideoResizeSettleState::Settled,
                 prepared_video_surface: None,
@@ -2370,6 +2506,7 @@ impl NativeRenderCore {
                         grade_active,
                         filter: self.selected_scale_filter,
                         smoothing_percent: self.downscale_smoothing_percent,
+                        anime4k_variant: self.selected_anime4k_variant,
                     };
                     if let Err(reason) = self.prepare_display_resources(
                         source_width,
@@ -2380,6 +2517,7 @@ impl NativeRenderCore {
                         grade_active,
                         self.selected_scale_filter,
                         self.downscale_smoothing_percent,
+                        self.selected_anime4k_variant,
                     ) {
                         self.record_scale_fallback(key, reason);
                         self.present_for_surface(
@@ -2454,6 +2592,7 @@ impl NativeRenderCore {
                     grade_active,
                     filter: self.selected_scale_filter,
                     smoothing_percent: self.downscale_smoothing_percent,
+                    anime4k_variant: self.selected_anime4k_variant,
                 };
                 self.record_scale_fallback(key, reason);
                 self.present_for_surface(
@@ -2479,6 +2618,7 @@ impl NativeRenderCore {
                     grade_active,
                     filter: self.selected_scale_filter,
                     smoothing_percent: self.downscale_smoothing_percent,
+                    anime4k_variant: self.selected_anime4k_variant,
                 };
                 if self
                     .active_scale_fallback
@@ -2504,6 +2644,7 @@ impl NativeRenderCore {
                     grade_active,
                     self.selected_scale_filter,
                     self.downscale_smoothing_percent,
+                    self.selected_anime4k_variant,
                 ) {
                     self.record_scale_fallback(key, reason);
                     self.present_for_surface(
@@ -2569,11 +2710,13 @@ impl NativeRenderCore {
         request_id: u64,
         filter: VideoScaleFilter,
         smoothing_percent: u32,
+        anime4k_variant: Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
     ) -> Result<(), String> {
         let signature = self.video_scale_preparation_signature(
             frame,
             filter,
             smoothing_percent,
+            anime4k_variant,
             Instant::now(),
         );
         self.prepared_video_scale_settings = None;
@@ -2627,6 +2770,7 @@ impl NativeRenderCore {
                     grade_active: signature.grade_active,
                     filter: signature.filter,
                     smoothing_percent,
+                    anime4k_variant: signature.anime4k_variant,
                 };
                 if let Err(reason) = self.prepare_display_resources(
                     signature.source_width,
@@ -2637,6 +2781,7 @@ impl NativeRenderCore {
                     signature.grade_active,
                     signature.filter,
                     smoothing_percent,
+                    signature.anime4k_variant,
                 ) {
                     self.record_scale_fallback(key, reason);
                     (
@@ -2672,6 +2817,7 @@ impl NativeRenderCore {
                     grade_active: signature.grade_active,
                     filter: signature.filter,
                     smoothing_percent,
+                    anime4k_variant: signature.anime4k_variant,
                 };
                 self.record_scale_fallback(key, reason);
                 (width, height, VideoSurfaceContent::LegacySource)
@@ -2696,6 +2842,7 @@ impl NativeRenderCore {
                 grade_active: signature.grade_active,
                 filter: signature.filter,
                 smoothing_percent,
+                anime4k_variant: signature.anime4k_variant,
             };
             if let Err(error) =
                 self.prepare_scale_target_surface(target_width, target_height, target_content)
@@ -2734,6 +2881,7 @@ impl NativeRenderCore {
         frame: &VideoFrame,
         filter: VideoScaleFilter,
         smoothing_percent: u32,
+        anime4k_variant: Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
         now: Instant,
     ) -> VideoScalePreparationSignature {
         VideoScalePreparationSignature {
@@ -2754,6 +2902,7 @@ impl NativeRenderCore {
             smoothing_percent: crate::settings::sanitize_downscale_smoothing_percent(
                 smoothing_percent,
             ),
+            anime4k_variant,
         }
     }
 
@@ -2763,11 +2912,13 @@ impl NativeRenderCore {
         request_id: u64,
         filter: VideoScaleFilter,
         smoothing_percent: u32,
+        anime4k_variant: Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
     ) -> bool {
         let signature = self.video_scale_preparation_signature(
             frame,
             filter,
             smoothing_percent,
+            anime4k_variant,
             Instant::now(),
         );
         if !prepared_video_scale_settings_matches(
@@ -2780,8 +2931,10 @@ impl NativeRenderCore {
             if self.active_scale_fallback.as_ref().is_some_and(|fallback| {
                 fallback.key.filter == filter
                     && fallback.key.smoothing_percent == signature.smoothing_percent
+                    && fallback.key.anime4k_variant == signature.anime4k_variant
                     && (self.selected_scale_filter != filter
-                        || self.downscale_smoothing_percent != signature.smoothing_percent)
+                        || self.downscale_smoothing_percent != signature.smoothing_percent
+                        || self.selected_anime4k_variant != signature.anime4k_variant)
             }) {
                 // The fallback belongs to the discarded candidate, not to the
                 // setting that remains published.
@@ -2791,19 +2944,28 @@ impl NativeRenderCore {
             return false;
         }
         self.prepared_video_scale_settings = None;
-        self.publish_video_scale_settings(filter, smoothing_percent);
+        self.publish_video_scale_settings(filter, smoothing_percent, anime4k_variant);
         true
     }
 
-    fn publish_video_scale_settings(&mut self, filter: VideoScaleFilter, smoothing_percent: u32) {
+    fn publish_video_scale_settings(
+        &mut self,
+        filter: VideoScaleFilter,
+        smoothing_percent: u32,
+        anime4k_variant: Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
+    ) {
         self.selected_scale_filter = filter;
         self.downscale_smoothing_percent =
             crate::settings::sanitize_downscale_smoothing_percent(smoothing_percent);
+        self.selected_anime4k_variant = anime4k_variant;
         crate::logger::log(format!(
-            "native-presenter: video scale filter selected={} ({}) smoothing_percent={}",
+            "native-presenter: video scale filter selected={} ({}) smoothing_percent={} anime4k_variant={}",
             filter.perf_name(),
             filter.label(),
-            self.downscale_smoothing_percent
+            self.downscale_smoothing_percent,
+            anime4k_variant
+                .map(|variant| variant.label())
+                .unwrap_or("none")
         ));
         log_event(
             "video_scale_filter_selected",
@@ -2814,37 +2976,62 @@ impl NativeRenderCore {
                     "downscale_smoothing_percent",
                     Value::from(self.downscale_smoothing_percent as i64),
                 ),
+                (
+                    "anime4k_variant",
+                    Value::from(
+                        anime4k_variant
+                            .map(|variant| variant.label())
+                            .unwrap_or("none"),
+                    ),
+                ),
             ],
         );
         self.sync_overlay_video_scale_state();
     }
 
     pub(crate) fn video_scale_fallback_notice(&self) -> Option<VideoScaleFallbackNotice> {
-        let fallback = self.active_scale_fallback.as_ref()?;
-        if fallback.key.filter != self.selected_scale_filter
-            || fallback.key.smoothing_percent != self.downscale_smoothing_percent
+        if let Some(fallback) = self.active_scale_fallback.as_ref().filter(|fallback| {
+            fallback.key.filter == self.selected_scale_filter
+                && fallback.key.smoothing_percent == self.downscale_smoothing_percent
+                && fallback.key.anime4k_variant == self.selected_anime4k_variant
+        }) {
+            return Some(match &fallback.reason {
+                VideoScaleFallbackReason::DisplaySizeLimitExceeded {
+                    requested_width,
+                    requested_height,
+                    max_dimension,
+                    max_pixels,
+                } => VideoScaleFallbackNotice::DisplaySizeLimitExceeded {
+                    requested_width: *requested_width,
+                    requested_height: *requested_height,
+                    max_dimension: *max_dimension,
+                    max_pixels: *max_pixels,
+                },
+                _ => VideoScaleFallbackNotice::Other,
+            });
+        }
+        if self.selected_scale_filter != VideoScaleFilter::Anime
+            || self.selected_anime4k_variant.is_some()
         {
             return None;
         }
-        Some(match &fallback.reason {
-            VideoScaleFallbackReason::DisplaySizeLimitExceeded {
-                requested_width,
-                requested_height,
-                max_dimension,
-                max_pixels,
-            } => VideoScaleFallbackNotice::DisplaySizeLimitExceeded {
-                requested_width: *requested_width,
-                requested_height: *requested_height,
-                max_dimension: *max_dimension,
-                max_pixels: *max_pixels,
+        Some(VideoScaleFallbackNotice::Anime4kStandard(
+            match self.anime4k_status {
+                NativeVideoAnime4kStatus::Waiting => VideoAnime4kFallbackNotice::Waiting,
+                NativeVideoAnime4kStatus::Measuring { .. } => VideoAnime4kFallbackNotice::Measuring,
+                NativeVideoAnime4kStatus::Fallback(reason) => {
+                    VideoAnime4kFallbackNotice::Fallback(reason)
+                }
+                NativeVideoAnime4kStatus::Failed => VideoAnime4kFallbackNotice::Failed,
+                NativeVideoAnime4kStatus::Active { .. } => return None,
             },
-            _ => VideoScaleFallbackNotice::Other,
-        })
+        ))
     }
     fn sync_overlay_video_scale_state(&mut self) {
         let outside_note = self.active_scale_fallback.as_ref().and_then(|fallback| {
             if fallback.key.filter != self.selected_scale_filter
                 || fallback.key.smoothing_percent != self.downscale_smoothing_percent
+                || fallback.key.anime4k_variant != self.selected_anime4k_variant
             {
                 return None;
             }
@@ -2870,7 +3057,30 @@ impl NativeRenderCore {
                 self.downscale_smoothing_percent,
                 outside_note,
             );
+            overlay.set_video_anime4k_state(self.anime4k_budget, self.anime4k_status.clone());
         }
+    }
+
+    pub fn set_overlay_video_anime4k_state(
+        &mut self,
+        budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset,
+        status: NativeVideoAnime4kStatus,
+    ) {
+        self.anime4k_budget = budget;
+        self.anime4k_status = status;
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_video_anime4k_state(budget, self.anime4k_status.clone());
+        }
+    }
+
+    pub fn reset_anime4k_for_source_change(&mut self) {
+        if self.selected_scale_filter != VideoScaleFilter::Anime {
+            return;
+        }
+        self.selected_anime4k_variant = None;
+        self.anime4k_status = NativeVideoAnime4kStatus::Waiting;
+        self.prepared_video_scale_settings = None;
+        self.sync_overlay_video_scale_state();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2956,6 +3166,7 @@ impl NativeRenderCore {
             target_width,
             target_height,
             self.downscale_smoothing_percent,
+            self.selected_anime4k_variant,
         )
     }
 
@@ -2969,6 +3180,7 @@ impl NativeRenderCore {
         grade_active: bool,
         filter: VideoScaleFilter,
         smoothing_percent: u32,
+        anime4k_variant: Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
     ) -> Result<(), VideoScaleFallbackReason> {
         let (source_axis_width, source_axis_height) = if orientation.swaps_axes() {
             (source_height, source_width)
@@ -2982,6 +3194,7 @@ impl NativeRenderCore {
             target_width,
             target_height,
             smoothing_percent,
+            anime4k_variant,
         )
         .expect("display-resolution surface always has a resample owner");
         let Some(pipeline) = self.resample_pipeline.as_mut() else {
@@ -5207,6 +5420,8 @@ impl NativeEguiOverlay {
             video_scale_filter: VideoScaleFilter::OsDefault,
             video_downscale_smoothing_percent: 0,
             video_scale_outside_note: None,
+            video_anime4k_budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset::default(),
+            video_anime4k_status: NativeVideoAnime4kStatus::Waiting,
             video_preset_slots: vec![None; 10].into(),
             creative_lut_choices: Arc::from([]),
             video_left_panel_tab: NativeVideoLeftPanelTab::Jump,
@@ -5992,6 +6207,19 @@ impl NativeEguiOverlay {
         self.video_scale_filter = filter;
         self.video_downscale_smoothing_percent = smoothing_percent;
         self.video_scale_outside_note = outside_note;
+        self.dirty = true;
+    }
+
+    fn set_video_anime4k_state(
+        &mut self,
+        budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset,
+        status: NativeVideoAnime4kStatus,
+    ) {
+        if self.video_anime4k_budget == budget && self.video_anime4k_status == status {
+            return;
+        }
+        self.video_anime4k_budget = budget;
+        self.video_anime4k_status = status;
         self.dirty = true;
     }
 
@@ -7400,6 +7628,8 @@ impl NativeEguiOverlay {
         let mut video_scale_filter = self.video_scale_filter;
         let mut video_downscale_smoothing_percent = self.video_downscale_smoothing_percent;
         let video_scale_outside_note = self.video_scale_outside_note.clone();
+        let mut video_anime4k_budget = self.video_anime4k_budget;
+        let video_anime4k_status = self.video_anime4k_status.clone();
         let video_preset_slots = self.video_preset_slots.clone();
         let mut video_left_panel_tab = self.video_left_panel_tab;
         let mut video_adjustment_tab = self.video_adjustment_tab;
@@ -7843,6 +8073,8 @@ impl NativeEguiOverlay {
                     &mut video_scale_filter,
                     &mut video_downscale_smoothing_percent,
                     video_scale_outside_note.as_deref(),
+                    &mut video_anime4k_budget,
+                    &video_anime4k_status,
                     &video_preset_slots,
                     &creative_lut_choices,
                     &mut commands,
@@ -9311,6 +9543,7 @@ impl NativeEguiOverlay {
         self.video_adjustments = video_adjustments;
         self.video_scale_filter = video_scale_filter;
         self.video_downscale_smoothing_percent = video_downscale_smoothing_percent;
+        self.video_anime4k_budget = video_anime4k_budget;
         self.shortcut_help_open = shortcut_help_open;
         if let Some(intent) = self.maybe_claim_text_input_focus() {
             window_intents.push(intent);
@@ -10058,6 +10291,7 @@ mod tests {
             grade_active: false,
             filter: crate::settings::VideoScaleFilter::Sharp,
             smoothing_percent: 30,
+            anime4k_variant: None,
         };
         let prepared = Some(PreparedVideoScaleSettings {
             request_id: 7,

@@ -4399,6 +4399,13 @@ pub struct Settings {
     /// 動画縮小時の Lanczos3 のなめらかさ。静止画側とは独立した設定。
     #[serde(default)]
     pub video_downscale_smoothing_percent: u32,
+    /// Anime4K の動画再生時間予算。静止画側の Anime4K 選択とは独立。
+    #[serde(default)]
+    pub video_anime4k_budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset,
+    /// 最後に測定した native presenter GPU の結果。adapter/driver が違えば使わない。
+    #[serde(default)]
+    pub video_anime4k_measurement:
+        Option<crate::video::anime4k_policy::VideoAnime4kMeasurementCache>,
     /// 全動画で共有する動画補正の保存スロット (10個)。
     #[serde(default)]
     pub video_preset_slots: crate::creative_lut::VideoPresetSlots,
@@ -5643,6 +5650,8 @@ impl Default for Settings {
             video_adjustments: crate::creative_lut::VideoAdjustments::default(),
             video_scale_filter: VideoScaleFilter::default(),
             video_downscale_smoothing_percent: DOWNSCALE_SMOOTHING_PERCENT_MIN,
+            video_anime4k_budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset::default(),
+            video_anime4k_measurement: None,
             video_preset_slots: crate::creative_lut::VideoPresetSlots::default(),
             video_resume_positions: std::collections::HashMap::new(),
             video_grid_open_starts_from_beginning: false,
@@ -7488,6 +7497,8 @@ impl Settings {
         self.video_adjustments = src.video_adjustments.clone();
         self.video_scale_filter = src.video_scale_filter;
         self.video_downscale_smoothing_percent = src.video_downscale_smoothing_percent;
+        self.video_anime4k_budget = src.video_anime4k_budget;
+        self.video_anime4k_measurement = src.video_anime4k_measurement.clone();
         self.video_preset_slots = src.video_preset_slots.clone();
         // ── キャッシュ系 (環境設定に出ていない項目) ──
         self.cache_videos_always = src.cache_videos_always;
@@ -8824,6 +8835,11 @@ mod tests {
     fn video_scale_filter_defaults_to_standard_and_roundtrips_choices() {
         let settings = Settings::default();
         assert_eq!(settings.video_scale_filter, VideoScaleFilter::Standard);
+        assert_eq!(
+            settings.video_anime4k_budget,
+            crate::video::anime4k_policy::VideoAnime4kBudgetPreset::Standard
+        );
+        assert!(settings.video_anime4k_measurement.is_none());
         for (filter, serialized) in [
             (VideoScaleFilter::Standard, "standard"),
             (VideoScaleFilter::Sharp, "sharp"),
@@ -8855,6 +8871,51 @@ mod tests {
                 VideoScaleFilter::Anime,
                 VideoScaleFilter::OsDefault,
             ]
+        );
+    }
+
+    #[test]
+    fn video_anime4k_budget_and_measurement_roundtrip() {
+        use crate::video::anime4k_policy::{
+            VIDEO_ANIME4K_MEASUREMENT_SCHEMA, VideoAnime4kAdapterKey, VideoAnime4kBudgetPreset,
+            VideoAnime4kMeasurementCache, VideoAnime4kMeasurementPoint, VideoAnime4kVariant,
+        };
+
+        let mut selected = Settings::default();
+        selected.video_anime4k_budget = VideoAnime4kBudgetPreset::Quality;
+        selected.video_anime4k_measurement = Some(VideoAnime4kMeasurementCache {
+            schema: VIDEO_ANIME4K_MEASUREMENT_SCHEMA,
+            adapter: VideoAnime4kAdapterKey {
+                luid_low: 1,
+                luid_high: 2,
+                vendor_id: 3,
+                device_id: 4,
+                subsystem_id: 5,
+                revision: 6,
+                driver_version: 7,
+                dedicated_video_memory: 8,
+                shared_system_memory: 9,
+                description: "test adapter".to_string(),
+            },
+            points: vec![VideoAnime4kMeasurementPoint {
+                variant: VideoAnime4kVariant::Small,
+                source_width: 960,
+                source_height: 540,
+                output_width: 1920,
+                output_height: 1080,
+                gpu_time_us: 123,
+            }],
+        });
+
+        let loaded: Settings =
+            serde_json::from_str(&serde_json::to_string(&selected).unwrap()).unwrap();
+        assert_eq!(
+            loaded.video_anime4k_budget,
+            VideoAnime4kBudgetPreset::Quality
+        );
+        assert_eq!(
+            loaded.video_anime4k_measurement,
+            selected.video_anime4k_measurement
         );
     }
 

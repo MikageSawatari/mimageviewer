@@ -73,12 +73,22 @@ Visible frame を commit 直後に 1 回再提示する。
 
 Anime4K は B1 が GLSL の `//!SAVE` / `//!BIND` から生成した variant topology と WGSL を正本にする。
 build 時に S / M / L / VL / UL の WGSL を Naga で HLSL へ変換し、Windows SDK FXC で全 pixel
-shader を SM5 bytecode 化する。runtime は B2 の評価段階では VL の 18 shader object だけを
-pipeline 作成時に bytecode からロードし、17 枚の source-resolution `RGBA16Float` intermediate
-を設定 prepare で確保する。各 pass の入力と順番は生成 topology 駆動で、vertex stage は
+shader を SM5 bytecode 化する。runtime は全67 shader object を pipeline 作成時に bytecode から
+ロードし、選択した1 variant 分だけ source-resolution `RGBA16Float` intermediate を設定
+prepare で確保する。候補の確保が全部成功した後だけ allocation-free commit し、旧 variant の
+中間画像を解放する。各 pass の入力と順番は生成 topology 駆動で、vertex stage は
 Naga 生成 `vs_main` ではなく NIS と同じ native D3D fullscreen vertex shader を使う。動画は
 whole frame 処理なので `process_origin = 0` とし、orientation は最終 resolve の inverse mapping
-で正規化する。VL 固定は実機測定用であり、出荷時の variant / frame budget 選択は B3 で決める。
+で正規化する。
+
+Anime4K を初めて選ぶと、同じ adapter の低優先度offscreen deviceを専用workerに作り、
+S / L / UL × 540p / 1080p の6点を GPU timestamp で測る。再生render threadは待たず、現在の
+標準表示と再生位置を維持する。結果は adapter LUID・driver version等と一緒に永続化し、
+一致するGPUだけで再利用する。M / VL は演算量で内挿し、動画fpsの20 / 40 / 60%予算、
+総画素数1920×1080以下、報告VRAMの25%以内を満たす最大variantを1動画につき選ぶ。
+同じ動画の再生中に負荷を監視して自動昇降格はせず、利用者の予算変更・再測定だけが再選択する。
+最小Sも時間またはVRAM予算に入らない場合や測定失敗時は、typed reasonをperfへ出して標準表示へ
+退避する。source切替では前動画のvariantを流用せず、次の寸法とfpsが確定するまで標準表示に戻す。
 
 resize 中は現在の surface を維持し、最後の geometry sample から 150ms 変化がない settled edge
 で 1 回だけ新寸法へ交換する。この区間は失敗 retry ではなく、終了通知を持たない複数種の Windows

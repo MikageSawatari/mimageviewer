@@ -12917,6 +12917,8 @@ pub struct App {
     /// 持ち上げた値。egui 側の fullscreen viewport は opt-in 期間中も alive なので、
     /// native HWND 作成後に短時間 z-order を補正する。
     pub(crate) native_video_front_synced_hwnd: u64,
+    pub(crate) native_video_anime4k_adapter:
+        Option<crate::video::anime4k_policy::VideoAnime4kAdapterKey>,
     #[cfg(windows)]
     /// Native HWND の z-order maintenance を間引くための最終 raise 時刻。
     /// PrintScreen / Snipping Tool などで foreground が外部へ移った後、mIV に
@@ -14661,6 +14663,7 @@ impl App {
             native_video_owner_synced_hwnd: 0,
             #[cfg(windows)]
             native_video_front_synced_hwnd: 0,
+            native_video_anime4k_adapter: None,
             #[cfg(windows)]
             vst_geometry_tracker: std::collections::HashMap::new(),
             #[cfg(windows)]
@@ -50913,6 +50916,7 @@ impl App {
                             ),
                             self.settings.video_scale_filter,
                             self.settings.video_downscale_smoothing_percent,
+                            self.settings.video_anime4k_budget,
                             // 動画経路: 常に映像フレームを持つ。
                             false,
                         )
@@ -65941,6 +65945,8 @@ impl App {
         #[cfg(windows)]
         let mut native_events: Vec<(usize, u64, crate::video::NativeVideoOutputEvent)> = Vec::new();
         let mut active_video_indices: Vec<usize> = Vec::new();
+        #[cfg(windows)]
+        let mut anime4k_info_ready_indices: Vec<usize> = Vec::new();
         // 連続再生 EOF の振り分け種別 (Inc 7):
         //   - AudioFile     = 純粋な音声ファイル (`GridItem::Audio`) → 次の音声へ。
         //   - VideoAudioMode = 音声モードにトグルした動画 (`video_audio_mode==Some(idx)`) →
@@ -65958,6 +65964,8 @@ impl App {
         let mut continuous_eof_events: Vec<(usize, u64, ContinuousEofKind)> = Vec::new();
         for (idx, entry) in self.fs_cache.iter_mut() {
             if let FsCacheEntry::Video { player, .. } = entry {
+                #[cfg(windows)]
+                let anime4k_info_was_ready = player.native_video_info_for_anime4k().is_some();
                 // 音声 (映像なし動画) は headless 再生。ループ/連続の判定材料が動画と違う
                 // (チャプター無し・ブックマークは music_bookmarks 正本)。native presenter は
                 // 持たないので set_native_* は no-op だが、判定だけ音声用に分岐する。
@@ -66025,6 +66033,10 @@ impl App {
                         Some(prev) => prev.min(d),
                         None => d,
                     });
+                }
+                #[cfg(windows)]
+                if !anime4k_info_was_ready && player.native_video_info_for_anime4k().is_some() {
+                    anime4k_info_ready_indices.push(*idx);
                 }
                 // prepare フェーズ中 (avformat_open_input / find_stream_info 実行中) は
                 // 毎フレーム bump して indexer の I/O を継続的に止める。`DEFAULT_QUIET_MS`
@@ -66136,6 +66148,17 @@ impl App {
             self.dsp_bridge
                 .set_existing_guis_owner_to_hwnd(native_owner_hwnd);
             self.native_video_owner_synced_hwnd = native_owner_hwnd;
+        }
+        #[cfg(windows)]
+        if self.settings.video_scale_filter == crate::settings::VideoScaleFilter::Anime {
+            for idx in anime4k_info_ready_indices {
+                self.request_native_video_scale_settings(
+                    idx,
+                    self.settings.video_scale_filter,
+                    self.settings.video_downscale_smoothing_percent,
+                    crate::video::VideoScaleChangeOrigin::Panel,
+                );
+            }
         }
         #[cfg(windows)]
         for (idx, epoch, event) in native_events {
@@ -70501,6 +70524,7 @@ fn native_video_presenter_config(
     video_grade: crate::creative_lut::VideoGradeSnapshot,
     scale_filter: crate::settings::VideoScaleFilter,
     downscale_smoothing_percent: u32,
+    anime4k_budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset,
     // 音声のみ native シェル (music Inc 6 ②) は true。present ループが frameless で回る
     // (§5.9 / Inc 6 ②-1)。動画経路は false。
     audio_only: bool,
@@ -70533,6 +70557,8 @@ fn native_video_presenter_config(
         video_grade,
         scale_filter,
         downscale_smoothing_percent,
+        anime4k_variant: None,
+        anime4k_budget,
         // in-main-window / detached では topmost な HUD overlay HWND を使わず、
         // presenter の DComp tree に egui overlay を載せる。fullscreen だけ
         // 従来どおり HUD HWND を有効化 (`MIV_HUD_OVERLAY=0` で off)。

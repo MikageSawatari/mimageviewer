@@ -7,19 +7,27 @@
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{
+    D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0,
     D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob, ID3DInclude,
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_BUFFER_DESC, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_VIEWPORT, ID3D11Buffer,
-    ID3D11Device1, ID3D11DeviceContext, ID3D11PixelShader, ID3D11RenderTargetView, ID3D11Resource,
-    ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
+    D3D11_BUFFER_DESC, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_QUERY_DATA_TIMESTAMP_DISJOINT,
+    D3D11_QUERY_DESC, D3D11_QUERY_TIMESTAMP, D3D11_QUERY_TIMESTAMP_DISJOINT, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_VIEWPORT, D3D11CreateDevice, ID3D11Buffer,
+    ID3D11Device1, ID3D11DeviceContext, ID3D11PixelShader, ID3D11Query, ID3D11RenderTargetView,
+    ID3D11Resource, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
+};
+use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice};
 use windows::core::{Interface, PCSTR};
 
-use crate::gpu_anime4k::{Anime4kPassInput, Anime4kVariant, VIDEO_ANIME4K_B2_VARIANT};
+use crate::gpu_anime4k::{Anime4kPassInput, Anime4kVariant};
 use crate::settings::VideoScaleFilter;
+use crate::video::anime4k_policy::VideoAnime4kMeasurementPoint;
+use crate::video::anime4k_policy::VideoAnime4kVariant;
 use crate::video::display_metadata::VideoOrientation;
 
 const NIS_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/video_nis.hlsl"));
@@ -162,7 +170,7 @@ pub(super) enum VideoResampleMode {
     Lanczos3 { smoothing_percent: u32 },
     Nis,
     Nearest,
-    Anime4k { variant: Anime4kVariant },
+    Anime4k { variant: VideoAnime4kVariant },
 }
 
 pub(super) fn select_video_resample_mode(
@@ -172,6 +180,7 @@ pub(super) fn select_video_resample_mode(
     target_width: u32,
     target_height: u32,
     smoothing_percent: u32,
+    anime4k_variant: Option<VideoAnime4kVariant>,
 ) -> Option<VideoResampleMode> {
     if filter == VideoScaleFilter::OsDefault {
         return None;
@@ -180,9 +189,9 @@ pub(super) fn select_video_resample_mode(
     Some(match (filter, downscaling) {
         (VideoScaleFilter::Sharp, false) => VideoResampleMode::Nis,
         (VideoScaleFilter::Nearest, false) => VideoResampleMode::Nearest,
-        (VideoScaleFilter::Anime, false) => VideoResampleMode::Anime4k {
-            variant: VIDEO_ANIME4K_B2_VARIANT,
-        },
+        (VideoScaleFilter::Anime, false) => anime4k_variant
+            .map(|variant| VideoResampleMode::Anime4k { variant })
+            .unwrap_or(VideoResampleMode::Lanczos3 { smoothing_percent }),
         _ => VideoResampleMode::Lanczos3 { smoothing_percent },
     })
 }
@@ -236,8 +245,18 @@ pub(super) struct VideoResamplePipeline {
     constants: ID3D11Buffer,
     nis_constants: ID3D11Buffer,
     intermediate: Option<IntermediateTarget>,
-    anime4k: Option<VideoAnime4kPipeline>,
-    anime4k_error: Option<String>,
+    anime4k: Vec<VideoAnime4kPipeline>,
+    anime4k_errors: Vec<(VideoAnime4kVariant, String)>,
+}
+
+fn gpu_anime4k_variant(variant: VideoAnime4kVariant) -> Anime4kVariant {
+    match variant {
+        VideoAnime4kVariant::Small => Anime4kVariant::Small,
+        VideoAnime4kVariant::Medium => Anime4kVariant::Medium,
+        VideoAnime4kVariant::Large => Anime4kVariant::Large,
+        VideoAnime4kVariant::VeryLarge => Anime4kVariant::VeryLarge,
+        VideoAnime4kVariant::UltraLarge => Anime4kVariant::UltraLarge,
+    }
 }
 
 impl VideoAnime4kPipeline {
@@ -442,17 +461,21 @@ impl VideoResamplePipeline {
         // Anime4K is optional within the resample pipeline so a device-specific
         // shader creation failure does not disable Standard/NIS/Nearest. The
         // retained typed error is surfaced if Anime is actually selected.
-        let (anime4k, anime4k_error) =
-            match VideoAnime4kPipeline::new(device, VIDEO_ANIME4K_B2_VARIANT) {
-                Ok(pipeline) => (Some(pipeline), None),
+        let mut anime4k = Vec::new();
+        let mut anime4k_errors = Vec::new();
+        for video_variant in VideoAnime4kVariant::ALL {
+            let variant = gpu_anime4k_variant(video_variant);
+            match VideoAnime4kPipeline::new(device, variant) {
+                Ok(pipeline) => anime4k.push(pipeline),
                 Err(error) => {
                     crate::logger::log(format!(
                         "native-presenter: Anime4K pipeline unavailable variant={} error={error}",
-                        VIDEO_ANIME4K_B2_VARIANT.label()
+                        variant.label()
                     ));
-                    (None, Some(error))
+                    anime4k_errors.push((video_variant, error));
                 }
-            };
+            }
+        }
         Ok(Self {
             vertex_shader: vertex_shader
                 .ok_or_else(|| "CreateVertexShader resample returned null".to_string())?,
@@ -470,7 +493,7 @@ impl VideoResamplePipeline {
                 .ok_or_else(|| "CreateBuffer NIS constants returned null".to_string())?,
             intermediate: None,
             anime4k,
-            anime4k_error,
+            anime4k_errors,
         })
     }
 
@@ -498,20 +521,29 @@ impl VideoResamplePipeline {
         mode: VideoResampleMode,
     ) -> Result<(), VideoResamplePrepareError> {
         if let VideoResampleMode::Anime4k { variant } = mode {
-            let Some(pipeline) = self
+            let gpu_variant = gpu_anime4k_variant(variant);
+            let Some(index) = self
                 .anime4k
-                .as_mut()
-                .filter(|value| value.variant == variant)
+                .iter()
+                .position(|value| value.variant == gpu_variant)
             else {
                 return Err(VideoResamplePrepareError::Anime4kPipelineUnavailable {
-                    variant,
+                    variant: gpu_variant,
                     error: self
-                        .anime4k_error
-                        .clone()
+                        .anime4k_errors
+                        .iter()
+                        .find(|(value, _)| *value == variant)
+                        .map(|(_, error)| error.clone())
                         .unwrap_or_else(|| "pipeline was not created for this variant".to_string()),
                 });
             };
-            return pipeline.prepare(device, source_width, source_height);
+            self.anime4k[index].prepare(device, source_width, source_height)?;
+            for (other_index, pipeline) in self.anime4k.iter_mut().enumerate() {
+                if other_index != index {
+                    pipeline.intermediates.clear();
+                }
+            }
+            return Ok(());
         }
         if !matches!(mode, VideoResampleMode::Lanczos3 { .. }) {
             return Ok(());
@@ -798,24 +830,29 @@ impl VideoResamplePipeline {
         target_width: u32,
         target_height: u32,
         orientation: VideoOrientation,
-        variant: Anime4kVariant,
+        variant: VideoAnime4kVariant,
     ) -> Result<(), String> {
+        let gpu_variant = gpu_anime4k_variant(variant);
         let pipeline = self
             .anime4k
-            .as_ref()
-            .filter(|value| value.variant == variant)
+            .iter()
+            .find(|value| value.variant == gpu_variant)
             .ok_or_else(|| {
                 format!(
                     "{} pipeline was not prepared: {}",
-                    variant.label(),
-                    self.anime4k_error.as_deref().unwrap_or("variant mismatch")
+                    gpu_variant.label(),
+                    self.anime4k_errors
+                        .iter()
+                        .find(|(value, _)| *value == variant)
+                        .map(|(_, error)| error.as_str())
+                        .unwrap_or("variant mismatch")
                 )
             })?;
-        if pipeline.intermediates.len() != variant.intermediate_count() {
+        if pipeline.intermediates.len() != gpu_variant.intermediate_count() {
             return Err(format!(
                 "{} intermediates were not prepared: expected={} actual={}",
-                variant.label(),
-                variant.intermediate_count(),
+                gpu_variant.label(),
+                gpu_variant.intermediate_count(),
                 pipeline.intermediates.len()
             ));
         }
@@ -826,7 +863,7 @@ impl VideoResamplePipeline {
         {
             return Err(format!(
                 "{} intermediates do not match source {}x{}",
-                variant.label(),
+                gpu_variant.label(),
                 source_width,
                 source_height
             ));
@@ -848,8 +885,8 @@ impl VideoResamplePipeline {
             target_height,
             orientation,
         );
-        let pass_inputs = variant.pass_inputs();
-        let input_binding_count = variant.input_binding_count();
+        let pass_inputs = gpu_variant.pass_inputs();
+        let input_binding_count = gpu_variant.input_binding_count();
         let unbound_views = vec![None; input_binding_count];
 
         unsafe {
@@ -883,7 +920,7 @@ impl VideoResamplePipeline {
             context.PSSetConstantBuffers(0, Some(&[Some(pipeline.convolution_constants.clone())]));
             context.RSSetViewports(Some(&[viewport(source_width, source_height)]));
 
-            for pass_index in 0..variant.intermediate_count() {
+            for pass_index in 0..gpu_variant.intermediate_count() {
                 let views = anime4k_pass_views(
                     pass_inputs[pass_index],
                     input_binding_count,
@@ -932,9 +969,9 @@ impl VideoResamplePipeline {
             .unwrap_or(0);
         lanczos.saturating_add(
             self.anime4k
-                .as_ref()
+                .iter()
                 .map(VideoAnime4kPipeline::intermediate_vram_bytes)
-                .unwrap_or(0),
+                .sum::<u64>(),
         )
     }
 }
@@ -1190,13 +1227,318 @@ fn create_render_target<T: Interface>(
     view.ok_or_else(|| "CreateRenderTargetView resample returned null".to_string())
 }
 
+pub(super) fn measure_video_anime4k_on_adapter(
+    adapter: &IDXGIAdapter,
+    cancel: &std::sync::atomic::AtomicBool,
+    mut progress: impl FnMut(u32, VideoAnime4kMeasurementPoint),
+) -> Result<Vec<VideoAnime4kMeasurementPoint>, String> {
+    use std::sync::atomic::Ordering;
+
+    let mut base_device = None;
+    let mut context = None;
+    let mut feature_level = D3D_FEATURE_LEVEL::default();
+    unsafe {
+        D3D11CreateDevice(
+            adapter,
+            D3D_DRIVER_TYPE_UNKNOWN,
+            windows::Win32::Foundation::HMODULE::default(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            Some(&[D3D_FEATURE_LEVEL_11_0]),
+            D3D11_SDK_VERSION,
+            Some(&mut base_device),
+            Some(&mut feature_level),
+            Some(&mut context),
+        )
+        .map_err(|error| format!("Anime4K measurement device: {error:?}"))?;
+    }
+    if feature_level.0 < D3D_FEATURE_LEVEL_11_0.0 {
+        return Err(format!(
+            "Anime4K measurement needs D3D feature level 11_0, got {:?}",
+            feature_level
+        ));
+    }
+    let device: ID3D11Device1 = base_device
+        .ok_or_else(|| "Anime4K measurement device returned null".to_string())?
+        .cast()
+        .map_err(|error| format!("Anime4K measurement ID3D11Device1: {error:?}"))?;
+    let context = context.ok_or_else(|| "Anime4K measurement context returned null".to_string())?;
+    if let Ok(dxgi_device) = device.cast::<IDXGIDevice>() {
+        unsafe {
+            // The playback presenter's device retains the default priority. The
+            // benchmark is intentionally background GPU work.
+            let _ = dxgi_device.SetGPUThreadPriority(-7);
+        }
+    }
+    let mut pipeline = VideoResamplePipeline::new(&device)?;
+    let cases = [(960, 540, 1920, 1080), (1920, 1080, 3840, 2160)];
+    let mut points = Vec::with_capacity(6);
+    for variant in VideoAnime4kVariant::MEASURED {
+        for (source_width, source_height, output_width, output_height) in cases {
+            if cancel.load(Ordering::Acquire) {
+                return Err("Anime4K measurement cancelled".to_string());
+            }
+            let measured = measure_video_anime4k_case(
+                &device,
+                &context,
+                &mut pipeline,
+                variant,
+                source_width,
+                source_height,
+                output_width,
+                output_height,
+                cancel,
+            );
+            let gpu_time_us = match measured {
+                Ok(value) => value,
+                Err(error) => {
+                    crate::logger::log(format!(
+                        "native-presenter: Anime4K measurement case failed variant={} source={}x{} output={}x{} error={error}",
+                        variant.label(),
+                        source_width,
+                        source_height,
+                        output_width,
+                        output_height
+                    ));
+                    if crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "native_presenter",
+                            "video_anime4k_measurement_case_failed",
+                            None,
+                            0,
+                            &[
+                                ("variant", serde_json::Value::from(variant.label())),
+                                ("source_width", serde_json::Value::from(source_width)),
+                                ("source_height", serde_json::Value::from(source_height)),
+                                ("reason", serde_json::Value::from(error.clone())),
+                            ],
+                        );
+                    }
+                    return Err(format!(
+                        "Anime4K {} measurement failed at {}x{}: {error}",
+                        variant.label(),
+                        source_width,
+                        source_height
+                    ));
+                }
+            };
+            let point = VideoAnime4kMeasurementPoint {
+                variant,
+                source_width,
+                source_height,
+                output_width,
+                output_height,
+                gpu_time_us,
+            };
+            points.push(point);
+            progress(points.len() as u32, point);
+        }
+    }
+    Ok(points)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn measure_video_anime4k_case(
+    device: &ID3D11Device1,
+    context: &ID3D11DeviceContext,
+    pipeline: &mut VideoResamplePipeline,
+    variant: VideoAnime4kVariant,
+    source_width: u32,
+    source_height: u32,
+    output_width: u32,
+    output_height: u32,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<u64, String> {
+    let source = create_measurement_texture(
+        device,
+        source_width,
+        source_height,
+        (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET).0 as u32,
+    )?;
+    let target = create_measurement_texture(
+        device,
+        output_width,
+        output_height,
+        D3D11_BIND_RENDER_TARGET.0 as u32,
+    )?;
+    let source_target = create_render_target(device, &source)?;
+    unsafe {
+        context.ClearRenderTargetView(&source_target, &[0.25, 0.5, 0.75, 1.0]);
+    }
+    let mode = VideoResampleMode::Anime4k { variant };
+    pipeline
+        .prepare(
+            device,
+            source_width,
+            source_height,
+            output_width,
+            VideoOrientation::IDENTITY,
+            mode,
+        )
+        .map_err(|error| match error {
+            VideoResamplePrepareError::IntermediateCreation(error) => error,
+            VideoResamplePrepareError::Anime4kPipelineUnavailable { variant, error } => {
+                format!("{} pipeline unavailable: {error}", variant.label())
+            }
+            VideoResamplePrepareError::Anime4kIntermediateCreationFailed {
+                variant,
+                pass_index,
+                width,
+                height,
+                error,
+            } => format!(
+                "{} pass {pass_index} intermediate {width}x{height}: {error}",
+                variant.label()
+            ),
+        })?;
+    for _ in 0..3 {
+        pipeline.draw(
+            device,
+            context,
+            &source,
+            &target,
+            source_width,
+            source_height,
+            output_width,
+            output_height,
+            VideoOrientation::IDENTITY,
+            mode,
+        )?;
+    }
+    unsafe { context.Flush() };
+
+    let disjoint = create_query(device, D3D11_QUERY_TIMESTAMP_DISJOINT)?;
+    let start = create_query(device, D3D11_QUERY_TIMESTAMP)?;
+    let end = create_query(device, D3D11_QUERY_TIMESTAMP)?;
+    let mut samples = Vec::with_capacity(7);
+    for _ in 0..7 {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("Anime4K measurement cancelled".to_string());
+        }
+        unsafe {
+            context.Begin(&disjoint);
+            context.End(&start);
+        }
+        pipeline.draw(
+            device,
+            context,
+            &source,
+            &target,
+            source_width,
+            source_height,
+            output_width,
+            output_height,
+            VideoOrientation::IDENTITY,
+            mode,
+        )?;
+        unsafe {
+            context.End(&end);
+            context.End(&disjoint);
+            context.Flush();
+        }
+        let start_tick: u64 = wait_query_data(context, &start, cancel)?;
+        let end_tick: u64 = wait_query_data(context, &end, cancel)?;
+        let timing: D3D11_QUERY_DATA_TIMESTAMP_DISJOINT =
+            wait_query_data(context, &disjoint, cancel)?;
+        if timing.Disjoint.as_bool() || timing.Frequency == 0 || end_tick < start_tick {
+            return Err("GPU timestamp interval was disjoint".to_string());
+        }
+        samples.push(
+            ((end_tick - start_tick) as f64 * 1_000_000.0 / timing.Frequency as f64)
+                .round()
+                .max(1.0) as u64,
+        );
+    }
+    samples.sort_unstable();
+    Ok(samples[samples.len() / 2])
+}
+
+fn create_measurement_texture(
+    device: &ID3D11Device1,
+    width: u32,
+    height: u32,
+    bind_flags: u32,
+) -> Result<ID3D11Texture2D, String> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: bind_flags,
+        ..Default::default()
+    };
+    let mut texture = None;
+    unsafe {
+        device
+            .CreateTexture2D(&desc, None, Some(&mut texture))
+            .map_err(|error| format!("CreateTexture2D Anime4K measurement: {error:?}"))?;
+    }
+    texture.ok_or_else(|| "CreateTexture2D Anime4K measurement returned null".to_string())
+}
+
+fn create_query(
+    device: &ID3D11Device1,
+    query_type: windows::Win32::Graphics::Direct3D11::D3D11_QUERY,
+) -> Result<ID3D11Query, String> {
+    let desc = D3D11_QUERY_DESC {
+        Query: query_type,
+        MiscFlags: 0,
+    };
+    let mut query = None;
+    unsafe {
+        device
+            .CreateQuery(&desc, Some(&mut query))
+            .map_err(|error| format!("CreateQuery Anime4K measurement: {error:?}"))?;
+    }
+    query.ok_or_else(|| "CreateQuery Anime4K measurement returned null".to_string())
+}
+
+fn wait_query_data<T: Copy + Default>(
+    context: &ID3D11DeviceContext,
+    query: &ID3D11Query,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<T, String> {
+    use windows::Win32::Foundation::{S_FALSE, S_OK};
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut value = T::default();
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("Anime4K measurement cancelled".to_string());
+        }
+        let status = unsafe {
+            (Interface::vtable(context).GetData)(
+                Interface::as_raw(context),
+                Interface::as_raw(query),
+                (&mut value as *mut T).cast(),
+                std::mem::size_of::<T>() as u32,
+                0,
+            )
+        };
+        if status == S_OK {
+            return Ok(value);
+        }
+        if status != S_FALSE {
+            return Err(format!("GetData Anime4K timestamp failed: {status:?}"));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("GPU timestamp did not complete within 10 seconds".to_string());
+        }
+        std::thread::yield_now();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     const ANIME4K_VL_HLSL: &[u8] =
         include_bytes!(concat!(env!("OUT_DIR"), "/video_anime4k_vl.hlsl"));
     use windows::Win32::Graphics::Direct3D::{
-        D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0,
+        D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0,
     };
     use windows::Win32::Graphics::Direct3D11::{
         D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG,
@@ -1390,7 +1732,7 @@ mod tests {
     fn anime4k_chain_writes_target_with_native_fullscreen_vertex_shader() {
         assert_resample_mode_writes_target(
             VideoResampleMode::Anime4k {
-                variant: VIDEO_ANIME4K_B2_VARIANT,
+                variant: VideoAnime4kVariant::VeryLarge,
             },
             "Anime4K VL",
         );
@@ -1399,17 +1741,25 @@ mod tests {
     #[test]
     fn shader_filter_modes_use_their_upscaler_and_lanczos_for_every_downscale() {
         assert_eq!(
-            select_video_resample_mode(VideoScaleFilter::Sharp, 1280, 720, 1920, 1080, 40),
+            select_video_resample_mode(VideoScaleFilter::Sharp, 1280, 720, 1920, 1080, 40, None),
             Some(VideoResampleMode::Nis)
         );
         assert_eq!(
-            select_video_resample_mode(VideoScaleFilter::Nearest, 1280, 720, 1920, 1080, 40),
+            select_video_resample_mode(VideoScaleFilter::Nearest, 1280, 720, 1920, 1080, 40, None),
             Some(VideoResampleMode::Nearest)
         );
         assert_eq!(
-            select_video_resample_mode(VideoScaleFilter::Anime, 1280, 720, 1920, 1080, 40),
+            select_video_resample_mode(
+                VideoScaleFilter::Anime,
+                1280,
+                720,
+                1920,
+                1080,
+                40,
+                Some(VideoAnime4kVariant::VeryLarge)
+            ),
             Some(VideoResampleMode::Anime4k {
-                variant: VIDEO_ANIME4K_B2_VARIANT
+                variant: VideoAnime4kVariant::VeryLarge
             })
         );
         for filter in [
@@ -1419,14 +1769,30 @@ mod tests {
             VideoScaleFilter::Anime,
         ] {
             assert_eq!(
-                select_video_resample_mode(filter, 3840, 2160, 1920, 1080, 40),
+                select_video_resample_mode(
+                    filter,
+                    3840,
+                    2160,
+                    1920,
+                    1080,
+                    40,
+                    Some(VideoAnime4kVariant::VeryLarge)
+                ),
                 Some(VideoResampleMode::Lanczos3 {
                     smoothing_percent: 40
                 })
             );
         }
         assert_eq!(
-            select_video_resample_mode(VideoScaleFilter::OsDefault, 1280, 720, 1920, 1080, 40),
+            select_video_resample_mode(
+                VideoScaleFilter::OsDefault,
+                1280,
+                720,
+                1920,
+                1080,
+                40,
+                None
+            ),
             None
         );
     }
@@ -1456,12 +1822,58 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual B3 GPU timestamp calibration on the active hardware adapter"]
+    fn measure_anime4k_variants_with_gpu_timestamps() {
+        let mut base_device = None;
+        let mut context = None;
+        let mut feature_level = D3D_FEATURE_LEVEL::default();
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                windows::Win32::Foundation::HMODULE::default(),
+                D3D11_CREATE_DEVICE_FLAG::default(),
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut base_device),
+                Some(&mut feature_level),
+                Some(&mut context),
+            )
+            .expect("create hardware D3D11 device");
+        }
+        assert_eq!(feature_level, D3D_FEATURE_LEVEL_11_0);
+        let device = base_device.expect("hardware D3D11 device");
+        let dxgi_device: IDXGIDevice = device.cast().expect("IDXGIDevice");
+        let adapter = unsafe { dxgi_device.GetAdapter() }.expect("hardware adapter");
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let points = measure_video_anime4k_on_adapter(&adapter, &cancel, |completed, point| {
+            eprintln!(
+                "Anime4K measurement {completed}/6 variant={} source={}x{} output={}x{} gpu_us={}",
+                point.variant.label(),
+                point.source_width,
+                point.source_height,
+                point.output_width,
+                point.output_height,
+                point.gpu_time_us
+            );
+        })
+        .expect("Anime4K GPU timestamp measurement");
+        assert_eq!(points.len(), 6);
+        assert!(
+            points
+                .iter()
+                .all(|point| point.gpu_time_us > 0 && point.gpu_time_us != u64::MAX)
+        );
+    }
+
+    #[test]
     #[ignore = "manual B3 cost measurement; compiles all 18 VL passes"]
     fn measure_anime4k_vl_runtime_compile_versus_bytecode_load() {
         let (device, _context) = warp_device();
         let compile_started = std::time::Instant::now();
-        let mut runtime_shaders = Vec::with_capacity(VIDEO_ANIME4K_B2_VARIANT.pass_inputs().len());
-        for pass_index in 0..VIDEO_ANIME4K_B2_VARIANT.intermediate_count() {
+        let variant = Anime4kVariant::VeryLarge;
+        let mut runtime_shaders = Vec::with_capacity(variant.pass_inputs().len());
+        for pass_index in 0..variant.intermediate_count() {
             let entry = format!("fs_anime4k_{pass_index}_");
             let blob = compile_shader_source(ANIME4K_VL_HLSL, &entry, "ps_5_0")
                 .unwrap_or_else(|error| panic!("compile {entry}: {error}"));
@@ -1491,12 +1903,20 @@ mod tests {
         let compile_ms = compile_started.elapsed().as_secs_f64() * 1000.0;
 
         let load_started = std::time::Instant::now();
-        let loaded = VideoAnime4kPipeline::new(&device, VIDEO_ANIME4K_B2_VARIANT)
-            .expect("load embedded Anime4K VL bytecode");
+        let loaded =
+            VideoAnime4kPipeline::new(&device, variant).expect("load embedded Anime4K VL bytecode");
         let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
         assert_eq!(runtime_shaders.len(), loaded.convolution_shaders.len() + 1);
+        let all_load_started = std::time::Instant::now();
+        let all_loaded = VideoAnime4kVariant::ALL
+            .into_iter()
+            .map(|variant| VideoAnime4kPipeline::new(&device, gpu_anime4k_variant(variant)))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("load embedded Anime4K bytecode for all variants");
+        let all_load_ms = all_load_started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(all_loaded.len(), VideoAnime4kVariant::ALL.len());
         println!(
-            "Anime4K VL pipeline: runtime_compile_ms={compile_ms:.3} bytecode_load_ms={load_ms:.3} shaders={}",
+            "Anime4K VL pipeline: runtime_compile_ms={compile_ms:.3} bytecode_load_ms={load_ms:.3} all_variant_bytecode_load_ms={all_load_ms:.3} shaders={}",
             runtime_shaders.len()
         );
     }

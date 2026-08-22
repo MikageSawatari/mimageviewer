@@ -626,6 +626,7 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 30 秒シーク (大きい) | Action: `VideoSeekBackLarge` / `VideoSeekForwardLarge` |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 1 フレーム戻る / 進む | Action: `VideoFrameStepBack` / `VideoFrameStepForward` |
 | <kbd>T</kbd> | 動画の拡大方法を OS に任せる → 標準（補間あり）→ ニアレスト（補間なし）→ シャープ拡大 → アニメ塗り拡大の順に切り替える | Action: `VideoScaleFilterNext`。一時停止中も現在フレームへ即時反映し、設定へ保存する。反映完了後に右上へ選択を表示し、表示サイズの上限で適用できない場合は「OS に任せる」で表示することも併記する |
+| 割り当てなし | 動画のアニメ塗り拡大の性能をもう一度測定する | Action: `VideoAnime4kRemeasure`。再生位置と現在表示を維持し、完了後だけモデルを再選択する |
 | <kbd>Ctrl</kbd>+<kbd>1</kbd>〜<kbd>9</kbd> / <kbd>Ctrl</kbd>+<kbd>0</kbd> | 動画補正保存スロット 1〜10 を読み込む | Action: `VideoAdjustSlot1..10`。通常数字とテンキー数字の両方を既定割り当てにする。映像が隠れた通常の音声モードでは無効、VST GUI で映像が見えている間は有効 |
 | <kbd>←</kbd> / <kbd>→</kbd> (タイル中) | タイルカーソルを前 / 次へ移動 | seek しない。現在位置より後の最初のタイルを時刻ラベル込みで強調表示 |
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd> (タイル中) | タイルカーソルを 1 行分移動 | 列数分だけ前 / 次へ移動 |
