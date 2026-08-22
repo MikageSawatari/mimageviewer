@@ -1135,6 +1135,36 @@ impl App {
         self.mouse_gesture_grid_target_idx = None;
     }
 
+    /// Cancels the right-drag reducer owned by `owner` on a primary-button press.
+    ///
+    /// This is only the fixed input trigger. The existing ring/gesture cancel
+    /// methods remain the cancellation mechanism and continue to own cleanup.
+    pub(crate) fn cancel_mouse_right_drag_on_primary_press(
+        &mut self,
+        owner: RightDragOwner,
+        primary_pressed: bool,
+    ) -> bool {
+        if !primary_pressed
+            || (!self
+                .mouse_ring_flick
+                .as_ref()
+                .is_some_and(|flick| flick.owner == owner)
+                && !self
+                    .mouse_gesture
+                    .as_ref()
+                    .is_some_and(|gesture| gesture.owner == owner))
+        {
+            return false;
+        }
+
+        // The still-held secondary button will release after this cancellation.
+        // Keep that release from becoming the ordinary short right-click path.
+        self.mouse_ring_suppress_context_menu_once = true;
+        self.cancel_mouse_ring_flick();
+        self.cancel_mouse_gesture();
+        true
+    }
+
     pub(crate) fn cancel_right_drag_for_owner(&mut self, owner: RightDragOwner) -> bool {
         let mut cancelled = false;
         if self

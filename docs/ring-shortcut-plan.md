@@ -57,6 +57,13 @@
 
 ### 4.1 マウス右ボタン (既存 `fs_secondary_press_start` を流用)
 
+- リング / マウスジェスチャの右ドラッグ中に左ボタンを押すと、その操作を取り消す。
+  active grid / viewer では取消に使った左ボタンを release まで同じ入力列として消費し、
+  グリッドの選択 / open、フルスクリーンのページ送り、動画の再生 / 一時停止へ流さない。
+  passive detached window では通常どおり release で窓を activate するが、viewer action には
+  再利用しない。右ボタン側の後続 release も短い右クリックとして再利用しない。右ドラッグ
+  state に従属する固定 mouse chord のため、`KeyAction` や新しい設定にはしない。
+
 [ui_fullscreen.rs](../src/ui_fullscreen.rs) には既にフルスクリーンで
 `短タップ / 長押し / 移動(20px)` を判定する仕組みがある。これを拡張する。
 

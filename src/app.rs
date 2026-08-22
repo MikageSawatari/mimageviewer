@@ -513,6 +513,7 @@ pub(crate) enum DeferredDetachedImageWindowEvent {
 pub(crate) enum DetachedRightDragCancelReason {
     FocusLost,
     ButtonStateLost,
+    PrimaryButtonPressed,
 }
 
 #[cfg(windows)]
@@ -521,6 +522,7 @@ impl DetachedRightDragCancelReason {
         match self {
             Self::FocusLost => "focus_lost",
             Self::ButtonStateLost => "button_state_lost",
+            Self::PrimaryButtonPressed => "primary_button_pressed",
         }
     }
 }
@@ -614,16 +616,21 @@ impl DeferredDetachedImageWindowShared {
         ctx: &egui::Context,
         focused: bool,
     ) -> Option<DetachedRightDragEvent> {
-        let (secondary_pressed, secondary_down, secondary_released, pointer_pos) = ctx.input(|i| {
-            (
-                i.pointer.secondary_pressed(),
-                i.pointer.secondary_down(),
-                i.pointer.secondary_released(),
-                i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()),
-            )
-        });
+        let (primary_pressed, secondary_pressed, secondary_down, secondary_released, pointer_pos) =
+            ctx.input(|i| {
+                (
+                    i.pointer.primary_pressed(),
+                    i.pointer.secondary_pressed(),
+                    i.pointer.secondary_down(),
+                    i.pointer.secondary_released(),
+                    i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()),
+                )
+            });
         let mut capture = self.right_drag_capture.lock().ok()?;
-        let cancel_reason = if capture.focused_was && !focused {
+        let right_drag_live = capture.secondary_was_down || secondary_pressed || secondary_down;
+        let cancel_reason = if primary_pressed && right_drag_live {
+            Some(DetachedRightDragCancelReason::PrimaryButtonPressed)
+        } else if capture.focused_was && !focused {
             Some(DetachedRightDragCancelReason::FocusLost)
         } else if capture.secondary_was_down && !secondary_down && !secondary_released {
             Some(DetachedRightDragCancelReason::ButtonStateLost)
@@ -10418,6 +10425,8 @@ pub struct App {
     pub(crate) mouse_gesture: Option<crate::ring_shortcut::MouseGestureState>,
     /// グリッドで右ジェスチャを開始したセル。背景開始なら None。
     pub(crate) mouse_gesture_grid_target_idx: Option<usize>,
+    /// 右ドラッグを左ボタンで取り消したとき、その primary press/release 全体をグリッドから隠す。
+    pub(crate) grid_right_drag_primary_suppression: crate::ui_main::GridRightDragPrimarySuppression,
     /// フリック成立 / 長押しメニュー後の release が従来右クリックメニューを再発火しないための抑止。
     pub(crate) mouse_ring_suppress_context_menu_once: bool,
     /// グリッドのリングアクションから発生したナビゲーションをフレーム後段に合流させる予約。
@@ -13788,6 +13797,7 @@ impl App {
             mouse_ring_grid_target_idx: None,
             mouse_gesture: None,
             mouse_gesture_grid_target_idx: None,
+            grid_right_drag_primary_suppression: Default::default(),
             mouse_ring_suppress_context_menu_once: false,
             mouse_ring_nav: None,
             show_mouse_nav_migration_prompt,

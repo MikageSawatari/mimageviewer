@@ -32609,6 +32609,33 @@ mod still_window_mode_key_tests {
         }
     }
 
+    #[cfg(windows)]
+    fn capture_deferred_pointer_button(
+        shared: &DeferredDetachedImageWindowShared,
+        ctx: &egui::Context,
+        pos: egui::Pos2,
+        button: egui::PointerButton,
+        pressed: bool,
+    ) -> Option<DetachedRightDragEvent> {
+        let mut captured = None;
+        let input = egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            captured = shared.capture_right_drag_event(ctx, true);
+        });
+        captured
+    }
+
     fn passive_right_drag_image_bundle(path: &str) -> ViewerContextBundle {
         let mut bundle = ViewerContextBundle::empty();
         bundle.items = vec![GridItem::Image(PathBuf::from(path))];
@@ -32826,6 +32853,55 @@ mod still_window_mode_key_tests {
 
         assert!(owner_view.right_drag_guide.is_some());
         assert!(other_view.right_drag_guide.is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn deferred_passive_callback_reports_primary_press_as_typed_cancel() {
+        let app = setup_app();
+        let ctx = egui::Context::default();
+        let pos = egui::pos2(120.0, 90.0);
+        let window = paused_test_window(
+            &ctx,
+            79,
+            passive_right_drag_image_bundle(r"C:\pics\deferred-primary-cancel.jpg"),
+        );
+        let view = app.deferred_detached_image_window_view(
+            &window,
+            app.detached_viewer_window_placement(),
+            false,
+        );
+        let shared = DeferredDetachedImageWindowShared::new(view);
+
+        assert!(matches!(
+            capture_deferred_pointer_button(
+                &shared,
+                &ctx,
+                pos,
+                egui::PointerButton::Secondary,
+                true,
+            )
+            .map(|event| event.kind),
+            Some(DetachedRightDragEventKind::Input {
+                secondary_pressed: true,
+                secondary_down: true,
+                secondary_released: false,
+                ..
+            })
+        ));
+        assert_eq!(
+            capture_deferred_pointer_button(
+                &shared,
+                &ctx,
+                pos,
+                egui::PointerButton::Primary,
+                true,
+            )
+            .map(|event| event.kind),
+            Some(DetachedRightDragEventKind::Cancel {
+                reason: DetachedRightDragCancelReason::PrimaryButtonPressed,
+            })
+        );
     }
 
     #[test]
@@ -33151,6 +33227,78 @@ mod still_window_mode_key_tests {
             app.detached_window_state(21),
             Some(DetachedWindowState::Parked)
         );
+    }
+
+    #[test]
+    fn passive_primary_cancel_ends_gesture_but_preserves_click_activation() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_id = 24;
+        let pos = egui::pos2(100.0, 100.0);
+        app.settings.ring_shortcuts.right_drag_image =
+            Some(crate::ring_shortcut::RightDragMode::MouseGesture);
+        app.detached_image_windows.push(paused_test_window(
+            &ctx,
+            window_id,
+            passive_right_drag_image_bundle(r"C:\pics\passive-primary-cancel.jpg"),
+        ));
+        app.transition_detached_window_state(window_id, DetachedWindowState::Parked, "test");
+
+        app.process_passive_detached_right_drag_events_for_test(
+            &ctx,
+            vec![(
+                window_id,
+                passive_right_drag_input(1, true, true, false, pos),
+            )],
+        );
+        assert_eq!(
+            app.mouse_gesture.as_ref().map(|state| state.owner),
+            Some(crate::ring_shortcut::RightDragOwner::DetachedWindow(
+                window_id
+            ))
+        );
+
+        app.process_passive_detached_right_drag_events_for_test(
+            &ctx,
+            vec![(
+                window_id,
+                DetachedRightDragEvent {
+                    sequence: 2,
+                    kind: DetachedRightDragEventKind::Cancel {
+                        reason: DetachedRightDragCancelReason::PrimaryButtonPressed,
+                    },
+                },
+            )],
+        );
+        assert!(app.mouse_gesture.is_none());
+        assert!(
+            app.detached_window_manager
+                .activation_intent(window_id)
+                .is_none(),
+            "cancel must not synthesize a selection/open command"
+        );
+
+        // The passive-window primary stream remains owned by normal Windows
+        // activation: cancellation must not suppress its release.
+        let mut activation_armed = false;
+        assert!(!App::detached_passive_window_update_activation(
+            true,
+            1,
+            1,
+            &mut activation_armed,
+            true,
+            false,
+        ));
+        assert!(activation_armed);
+        assert!(App::detached_passive_window_update_activation(
+            true,
+            1,
+            1,
+            &mut activation_armed,
+            false,
+            true,
+        ));
+        assert!(!activation_armed);
     }
 
     #[test]
@@ -46604,6 +46752,75 @@ mod still_window_mode_key_tests {
         );
         assert_eq!(app.native_video_parked_live_left_down_window_id, None);
         assert_eq!(app.native_video_parked_live_activation_requests, vec![91]);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn native_video_gesture_left_cancel_consumes_both_buttons_and_keeps_normal_left_click() {
+        use crate::video::native_window::{NativeVideoMouseButton, NativeVideoMouseButtonEvent};
+
+        fn button(button: NativeVideoMouseButton, down: bool) -> NativeVideoMouseButtonEvent {
+            NativeVideoMouseButtonEvent {
+                button,
+                down,
+                double_click: false,
+                x: 320,
+                y: 180,
+                shift: false,
+                ctrl: false,
+            }
+        }
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\right-drag-cancel.mp4");
+        app.fullscreen_idx = Some(video);
+        app.settings.ring_shortcuts.set_right_drag_mode(
+            crate::ring_shortcut::RightDragContext::VideoFullscreen,
+            crate::ring_shortcut::RightDragMode::MouseGesture,
+        );
+
+        app.handle_native_video_mouse_button(
+            &ctx,
+            video,
+            button(NativeVideoMouseButton::Right, true),
+        );
+        assert!(app.mouse_gesture.is_some());
+
+        app.handle_native_video_mouse_button(
+            &ctx,
+            video,
+            button(NativeVideoMouseButton::Left, true),
+        );
+        assert!(app.mouse_gesture.is_none());
+        assert!(app.native_video_pointer_down.is_none());
+
+        app.handle_native_video_mouse_button(
+            &ctx,
+            video,
+            button(NativeVideoMouseButton::Left, false),
+        );
+        assert!(app.native_video_pointer_down.is_none());
+        app.handle_native_video_mouse_button(
+            &ctx,
+            video,
+            button(NativeVideoMouseButton::Right, false),
+        );
+        assert_eq!(app.fullscreen_idx, Some(video));
+        assert!(!app.mouse_ring_suppress_context_menu_once);
+
+        app.handle_native_video_mouse_button(
+            &ctx,
+            video,
+            button(NativeVideoMouseButton::Left, true),
+        );
+        assert!(app.native_video_pointer_down.is_some());
+        app.handle_native_video_mouse_button(
+            &ctx,
+            video,
+            button(NativeVideoMouseButton::Left, false),
+        );
+        assert!(app.native_video_pointer_down.is_none());
     }
 
     #[test]

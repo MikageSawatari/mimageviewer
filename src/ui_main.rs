@@ -125,6 +125,33 @@ pub(crate) enum AddressBarNav {
     HistoryForward,
 }
 
+/// Owns the primary-button sequence spent cancelling a grid right-drag.
+///
+/// The cancel happens on press, but egui decides `clicked()` on release. Keeping
+/// the whole physical sequence here prevents that release from selecting or
+/// opening a cell. A lost release is closed by the observed button-up level, so
+/// this state never depends on a timeout or a future synthetic edge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum GridRightDragPrimarySuppression {
+    #[default]
+    Idle,
+    UntilRelease,
+}
+
+impl GridRightDragPrimarySuppression {
+    fn arm(&mut self) {
+        *self = Self::UntilRelease;
+    }
+
+    fn update(&mut self, primary_down: bool, primary_released: bool) -> bool {
+        let suppress = *self == Self::UntilRelease;
+        if suppress && (primary_released || !primary_down) {
+            *self = Self::Idle;
+        }
+        suppress
+    }
+}
+
 #[derive(Clone, Copy)]
 enum FavoriteButtonClick {
     None,
@@ -12701,6 +12728,24 @@ impl App {
             .begin_primary_click_frame(primary_clicked)
     }
 
+    fn begin_grid_right_drag_primary_frame(&mut self, ctx: &egui::Context) -> bool {
+        let (primary_pressed, primary_down, primary_released) = ctx.input(|input| {
+            (
+                input.pointer.primary_pressed(),
+                input.pointer.primary_down(),
+                input.pointer.primary_released(),
+            )
+        });
+        if self.cancel_mouse_right_drag_on_primary_press(
+            crate::ring_shortcut::RightDragOwner::Root,
+            primary_pressed,
+        ) {
+            self.grid_right_drag_primary_suppression.arm();
+        }
+        self.grid_right_drag_primary_suppression
+            .update(primary_down, primary_released)
+    }
+
     /// グリッドセルのクリック・ダブルクリック・右クリックを処理する。
     /// ダブルクリックでフォルダに入る場合はそのパスを返す。
     fn handle_cell_interaction(
@@ -12711,6 +12756,7 @@ impl App {
         idx: usize,
         overlay_layout: &crate::thumb_overlay_layout::ThumbnailOverlayLayout,
         touch_derived_pointer_activity: bool,
+        suppress_primary_pointer: bool,
         previous_grid_click_pairing: GridClickPairingState,
     ) -> Option<PathBuf> {
         // click_and_drag: clicked() / double_clicked() / secondary_clicked() は従来通り
@@ -12778,7 +12824,11 @@ impl App {
                 | crate::ring_shortcut::RightDragMode::Unknown(_) => {}
             }
         }
-        if response.clicked() || response.double_clicked() || response.secondary_clicked() {
+        let primary_clicked =
+            !suppress_primary_pointer && response.clicked_by(egui::PointerButton::Primary);
+        let primary_double_clicked =
+            !suppress_primary_pointer && response.double_clicked_by(egui::PointerButton::Primary);
+        if primary_clicked || primary_double_clicked || response.secondary_clicked() {
             self.folder_pane.set_focus_grid();
         }
         let tag_badge_target = self.grid_tag_badge_target(idx, overlay_layout);
@@ -12794,7 +12844,7 @@ impl App {
                     .on_hover_text(format!("{tag_name} をタグビューで探す"));
             }
         }
-        let badge_clicked = response.clicked()
+        let badge_clicked = primary_clicked
             && !ctx.input(|i| i.modifiers.ctrl || i.modifiers.shift)
             && tag_badge_target.as_ref().is_some_and(|(_, badge_rect)| {
                 response
@@ -12808,7 +12858,7 @@ impl App {
             grid_plain_click_clears_checks(self.settings.grid_click_selection_mode);
         let ctrl = ctx.input(|i| i.modifiers.ctrl);
         let shift = ctx.input(|i| i.modifiers.shift);
-        if response.clicked() && !badge_clicked {
+        if primary_clicked && !badge_clicked {
             let display_order = if ctrl || shift {
                 self.current_grid_order().to_vec()
             } else {
@@ -12835,7 +12885,7 @@ impl App {
         // We intentionally do not read egui's double/triple click count here; its triple count is
         // meaningful for text line selection but made a completed grid activation leak into the
         // next single click (backlog 2.6 / 2.9, measured 2026-08-19).
-        let paired_grid_click = response.clicked()
+        let paired_grid_click = primary_clicked
             && self.grid_click_pairing.register_cell_click(
                 previous_grid_click_pairing,
                 idx,
@@ -12844,7 +12894,7 @@ impl App {
                 ctx.options(|options| options.input_options.max_double_click_delay),
             );
         let activate = paired_grid_click
-            || (response.clicked()
+            || (primary_clicked
                 && grid_reclick_open_allowed(
                     selected_before_click,
                     no_other_cell_checked_before_click,
@@ -12857,7 +12907,8 @@ impl App {
         if activate {
             self.grid_click_pairing.end_activation();
         }
-        let drag_started = response.drag_started_by(egui::PointerButton::Primary);
+        let drag_started =
+            !suppress_primary_pointer && response.drag_started_by(egui::PointerButton::Primary);
         let native_drag_started = native_grid_drag_start_allowed(
             self.items_are_drive_list,
             self.native_drag_just_finished,
@@ -12880,8 +12931,8 @@ impl App {
                 ctx,
                 idx,
                 crate::grid_input_diagnostics::GridCellSignal {
-                    first_click: response.clicked(),
-                    double_clicked: response.double_clicked(),
+                    first_click: primary_clicked,
+                    double_clicked: primary_double_clicked,
                     time_since_last_click,
                     max_double_click_delay,
                     clicked_by_primary,
@@ -12906,14 +12957,13 @@ impl App {
         // Selection above stays available: what a dialog owns is what happens next, not the
         // cursor. The right-click branch has guarded on this predicate all along.
         if !self.grid_open_from_click_allowed() {
-            if trace_matches_idx || response.clicked() || response.double_clicked() || drag_started
-            {
+            if trace_matches_idx || primary_clicked || primary_double_clicked || drag_started {
                 let _dispatch = self.report_grid_cell_signal(
                     ctx,
                     idx,
                     crate::grid_input_diagnostics::GridCellSignal {
-                        first_click: response.clicked(),
-                        double_clicked: response.double_clicked(),
+                        first_click: primary_clicked,
+                        double_clicked: primary_double_clicked,
                         time_since_last_click,
                         max_double_click_delay,
                         clicked_by_primary,
@@ -12937,8 +12987,8 @@ impl App {
                 ctx,
                 idx,
                 crate::grid_input_diagnostics::GridCellSignal {
-                    first_click: response.clicked(),
-                    double_clicked: response.double_clicked(),
+                    first_click: primary_clicked,
+                    double_clicked: primary_double_clicked,
                     time_since_last_click,
                     max_double_click_delay,
                     clicked_by_primary,
@@ -12960,8 +13010,8 @@ impl App {
                 ctx,
                 idx,
                 crate::grid_input_diagnostics::GridCellSignal {
-                    first_click: response.clicked(),
-                    double_clicked: response.double_clicked(),
+                    first_click: primary_clicked,
+                    double_clicked: primary_double_clicked,
                     time_since_last_click,
                     max_double_click_delay,
                     clicked_by_primary,
@@ -12973,8 +13023,8 @@ impl App {
                 },
             )
         } else if activate
-            || response.clicked()
-            || response.double_clicked()
+            || primary_clicked
+            || primary_double_clicked
             || drag_started
             || (trace_matches_idx && ctx.input(|input| input.pointer.primary_released()))
         {
@@ -12982,7 +13032,7 @@ impl App {
                 crate::grid_input_diagnostics::GridActivationIgnoredReason::ReadingHistoryGuard
             } else if native_drag_started {
                 crate::grid_input_diagnostics::GridActivationIgnoredReason::NativeDragDrop
-            } else if response.clicked() {
+            } else if primary_clicked {
                 crate::grid_input_diagnostics::GridActivationIgnoredReason::SelectionOnly
             } else {
                 crate::grid_input_diagnostics::GridActivationIgnoredReason::ClickNotRecognized
@@ -12991,8 +13041,8 @@ impl App {
                 ctx,
                 idx,
                 crate::grid_input_diagnostics::GridCellSignal {
-                    first_click: response.clicked(),
-                    double_clicked: response.double_clicked(),
+                    first_click: primary_clicked,
+                    double_clicked: primary_double_clicked,
                     time_since_last_click,
                     max_double_click_delay,
                     clicked_by_primary,
@@ -13262,9 +13312,11 @@ impl App {
         ctx: &egui::Context,
         rect: egui::Rect,
         hit_cell: bool,
+        suppress_primary_pointer: bool,
     ) {
         if self.settings.grid_click_selection_mode.normalized() != GridClickSelectionMode::Explorer
             || hit_cell
+            || suppress_primary_pointer
             || self.any_dialog_open()
             || self.selection_info_bar_contains_pointer(ctx)
             || !ctx.input(|i| {
@@ -13408,6 +13460,7 @@ impl App {
         ctx: &egui::Context,
         scroll_to: bool,
         spread_pair_cursor_idx: Option<usize>,
+        suppress_primary_pointer: bool,
         previous_grid_click_pairing: GridClickPairingState,
     ) -> Option<PathBuf> {
         let horizontal_source_rect = ui.available_rect_before_wrap();
@@ -13460,12 +13513,16 @@ impl App {
         let mut egui_offset_y = self.scroll_offset_y;
         let mut hovered_preview: Option<(usize, egui::Rect)> = None;
         let mut vertical_scroll_debug = None;
-        let primary_click_pos = ctx.input(|i| {
-            i.pointer
-                .primary_clicked()
-                .then(|| i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()))
-                .flatten()
-        });
+        let primary_click_pos = (!suppress_primary_pointer)
+            .then(|| {
+                ctx.input(|i| {
+                    i.pointer
+                        .primary_clicked()
+                        .then(|| i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()))
+                        .flatten()
+                })
+            })
+            .flatten();
         let mut primary_click_hit_cell = false;
         let previous_scroll_style = ui.spacing().scroll;
         ui.spacing_mut().scroll = details_scroll_style;
@@ -13554,6 +13611,7 @@ impl App {
                                 idx,
                                 &no_thumbnail_overlays,
                                 false,
+                                suppress_primary_pointer,
                                 previous_grid_click_pairing,
                             ) {
                                 nav = Some(n);
@@ -13619,7 +13677,12 @@ impl App {
 
         self.start_grid_background_mouse_ring_flick_if_pressed(ctx, body_inner_rect);
         self.update_grid_mouse_ring_flick(ctx);
-        self.handle_grid_background_primary_click(ctx, body_inner_rect, primary_click_hit_cell);
+        self.handle_grid_background_primary_click(
+            ctx,
+            body_inner_rect,
+            primary_click_hit_cell,
+            suppress_primary_pointer,
+        );
 
         let bg_right_clicked = ui.rect_contains_pointer(body_inner_rect)
             && ctx.input(|i| i.pointer.secondary_clicked());
@@ -15174,11 +15237,13 @@ impl App {
 
         egui::CentralPanel::default()
             .show(ctx, |ui| -> Option<PathBuf> {
+                let suppress_primary_pointer = self.begin_grid_right_drag_primary_frame(ctx);
                 // Preserve the grid-owned pending click for this frame's cell check, while
                 // clearing App state up front so a primary click not accepted by any cell breaks
                 // the pair.
                 let previous_grid_click_pairing = self.begin_grid_primary_click_frame(
-                    ctx.input(|input| input.pointer.primary_clicked()),
+                    !suppress_primary_pointer
+                        && ctx.input(|input| input.pointer.primary_clicked()),
                 );
                 // Sole MainGrid driver. Embedded still fullscreen returns
                 // before render_grid, preventing a double feed on main ctx.
@@ -15239,7 +15304,12 @@ impl App {
                     // 空フォルダでも右クリックでフォルダ操作可能にする
                     self.start_grid_background_mouse_ring_flick_if_pressed(ctx, ui.max_rect());
                     self.update_grid_mouse_ring_flick(ctx);
-                    self.handle_grid_background_primary_click(ctx, ui.max_rect(), false);
+                    self.handle_grid_background_primary_click(
+                        ctx,
+                        ui.max_rect(),
+                        false,
+                        suppress_primary_pointer,
+                    );
                     if !self.items_are_bookmark_view
                         && ui.rect_contains_pointer(ui.max_rect())
                         && ctx.input(|i| i.pointer.secondary_clicked())
@@ -15303,7 +15373,12 @@ impl App {
                     self.finish_grid_pointer_trace(ctx);
                     self.start_grid_background_mouse_ring_flick_if_pressed(ctx, ui.max_rect());
                     self.update_grid_mouse_ring_flick(ctx);
-                    self.handle_grid_background_primary_click(ctx, ui.max_rect(), false);
+                    self.handle_grid_background_primary_click(
+                        ctx,
+                        ui.max_rect(),
+                        false,
+                        suppress_primary_pointer,
+                    );
                     if !self.items_are_bookmark_view
                         && ui.rect_contains_pointer(ui.max_rect())
                         && ctx.input(|i| i.pointer.secondary_clicked())
@@ -15360,6 +15435,7 @@ impl App {
                         ctx,
                         scroll_to,
                         spread_pair_cursor_idx,
+                        suppress_primary_pointer,
                         previous_grid_click_pairing,
                     );
                     self.begin_grid_background_pointer_trace(ctx, ui.max_rect());
@@ -15662,12 +15738,18 @@ impl App {
                 let display_scroll_offset_y = self.scroll_offset_y + fractional_drag_y;
 
                 let mut nav: Option<PathBuf> = None;
-                let primary_click_pos = ctx.input(|i| {
-                    i.pointer
-                        .primary_clicked()
-                        .then(|| i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()))
-                        .flatten()
-                });
+                let primary_click_pos = (!suppress_primary_pointer)
+                    .then(|| {
+                        ctx.input(|i| {
+                            i.pointer
+                                .primary_clicked()
+                                .then(|| {
+                                    i.pointer.interact_pos().or_else(|| i.pointer.latest_pos())
+                                })
+                                .flatten()
+                        })
+                    })
+                    .flatten();
                 let mut primary_click_hit_cell = false;
 
                 // egui にスクロールを管理させず、自前の offset を毎フレーム注入する。
@@ -15771,6 +15853,7 @@ impl App {
                                     idx,
                                     &overlay_layout,
                                     touch_derived_pointer_activity,
+                                    suppress_primary_pointer,
                                     previous_grid_click_pairing,
                                 ) {
                                     nav = Some(n);
@@ -15890,6 +15973,7 @@ impl App {
                     ctx,
                     scroll_output.inner_rect,
                     primary_click_hit_cell,
+                    suppress_primary_pointer,
                 );
                 let bg_right_clicked = ui.rect_contains_pointer(scroll_output.inner_rect)
                     && ctx.input(|i| i.pointer.secondary_clicked());
@@ -20949,10 +21033,29 @@ mod grid_reclick_open_tests {
             .build_state(
                 |ctx, state| {
                     egui::CentralPanel::default().show(ctx, |ui| {
+                        let suppress_primary_pointer =
+                            state.app.begin_grid_right_drag_primary_frame(ctx);
                         let previous_grid_click_pairing = state.app.begin_grid_primary_click_frame(
-                            ctx.input(|input| input.pointer.primary_clicked()),
+                            !suppress_primary_pointer
+                                && ctx.input(|input| input.pointer.primary_clicked()),
                         );
+                        let primary_click_pos = (!suppress_primary_pointer)
+                            .then(|| {
+                                ctx.input(|input| {
+                                    input.pointer.primary_clicked().then(|| {
+                                        input
+                                            .pointer
+                                            .interact_pos()
+                                            .or_else(|| input.pointer.latest_pos())
+                                    })
+                                })
+                            })
+                            .flatten()
+                            .flatten();
+                        let mut primary_click_hit_cell = false;
                         for idx in 0..state.app.items.len() {
+                            primary_click_hit_cell |=
+                                primary_click_pos.is_some_and(|pos| cell_rect(idx).contains(pos));
                             if state
                                 .app
                                 .handle_cell_interaction(
@@ -20962,6 +21065,7 @@ mod grid_reclick_open_tests {
                                     idx,
                                     &crate::thumb_overlay_layout::ThumbnailOverlayLayout::default(),
                                     state.touch_derived_pointer_activity,
+                                    suppress_primary_pointer,
                                     previous_grid_click_pairing,
                                 )
                                 .is_some()
@@ -20969,6 +21073,19 @@ mod grid_reclick_open_tests {
                                 state.activations += 1;
                             }
                         }
+                        state
+                            .app
+                            .start_grid_background_mouse_ring_flick_if_pressed(ctx, ui.max_rect());
+                        state.app.update_grid_mouse_ring_flick(ctx);
+                        state.app.handle_grid_background_primary_click(
+                            ctx,
+                            ui.max_rect(),
+                            primary_click_hit_cell,
+                            suppress_primary_pointer,
+                        );
+                        state
+                            .app
+                            .clear_mouse_ring_context_menu_suppression_if_idle(ctx);
                     });
                 },
                 state,
@@ -21007,6 +21124,22 @@ mod grid_reclick_open_tests {
             });
         }
         harness.run();
+    }
+
+    fn pointer_button(
+        harness: &mut Harness<'static, HandlerState>,
+        pos: egui::Pos2,
+        button: egui::PointerButton,
+        pressed: bool,
+    ) {
+        harness.hover_at(pos);
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
     }
 
     fn register_pairing_click(
@@ -21317,6 +21450,100 @@ mod grid_reclick_open_tests {
             assert_eq!(harness.state().app.selected, Some(0));
             assert_eq!(harness.state().activations, 0);
         }
+    }
+
+    #[test]
+    fn cell_ring_left_cancel_consumes_primary_press_and_release() {
+        let mut harness = handler_harness(
+            GridClickSelectionMode::Explorer,
+            true,
+            Some(1),
+            false,
+            false,
+        );
+        harness
+            .state_mut()
+            .app
+            .settings
+            .ring_shortcuts
+            .set_right_drag_mode(
+                crate::ring_shortcut::RightDragContext::Grid,
+                crate::ring_shortcut::RightDragMode::RingShortcut,
+            );
+        let pos = cell_rect(0).center();
+
+        pointer_button(&mut harness, pos, egui::PointerButton::Secondary, true);
+        assert!(harness.state().app.mouse_ring_flick.is_some());
+        assert_eq!(harness.state().app.mouse_ring_grid_target_idx, Some(0));
+
+        pointer_button(&mut harness, pos, egui::PointerButton::Primary, true);
+        assert!(harness.state().app.mouse_ring_flick.is_none());
+        assert_eq!(
+            harness.state().app.grid_right_drag_primary_suppression,
+            GridRightDragPrimarySuppression::UntilRelease
+        );
+        assert_eq!(harness.state().app.selected, Some(1));
+
+        pointer_button(&mut harness, pos, egui::PointerButton::Primary, false);
+        assert_eq!(
+            harness.state().app.grid_right_drag_primary_suppression,
+            GridRightDragPrimarySuppression::Idle
+        );
+        assert_eq!(harness.state().app.selected, Some(1));
+        assert_eq!(harness.state().activations, 0);
+
+        pointer_button(&mut harness, pos, egui::PointerButton::Secondary, false);
+        assert!(harness.state().app.context_menu_idx.is_none());
+    }
+
+    #[test]
+    fn background_gesture_left_cancel_does_not_clear_grid_selection() {
+        let mut harness = handler_harness(
+            GridClickSelectionMode::Explorer,
+            true,
+            Some(1),
+            false,
+            false,
+        );
+        harness.state_mut().app.checked = HashSet::from([1]);
+        harness
+            .state_mut()
+            .app
+            .settings
+            .ring_shortcuts
+            .set_right_drag_mode(
+                crate::ring_shortcut::RightDragContext::Grid,
+                crate::ring_shortcut::RightDragMode::MouseGesture,
+            );
+        let pos = egui::pos2(440.0, 170.0);
+
+        pointer_button(&mut harness, pos, egui::PointerButton::Secondary, true);
+        assert!(harness.state().app.mouse_gesture.is_some());
+        assert_eq!(harness.state().app.mouse_gesture_grid_target_idx, None);
+
+        pointer_button(&mut harness, pos, egui::PointerButton::Primary, true);
+        assert!(harness.state().app.mouse_gesture.is_none());
+        pointer_button(&mut harness, pos, egui::PointerButton::Primary, false);
+
+        assert_eq!(harness.state().app.selected, Some(1));
+        assert_eq!(harness.state().app.checked, HashSet::from([1]));
+        assert_eq!(harness.state().activations, 0);
+        pointer_button(&mut harness, pos, egui::PointerButton::Secondary, false);
+    }
+
+    #[test]
+    fn ordinary_left_click_without_right_drag_still_selects() {
+        let mut harness =
+            handler_harness(GridClickSelectionMode::Explorer, true, None, false, false);
+
+        click_cell(&mut harness, 2, egui::Modifiers::NONE);
+
+        assert_eq!(harness.state().app.selected, Some(2));
+        assert_eq!(harness.state().activations, 0);
+        assert_eq!(
+            harness.state().app.grid_right_drag_primary_suppression,
+            GridRightDragPrimarySuppression::Idle
+        );
     }
 }
 

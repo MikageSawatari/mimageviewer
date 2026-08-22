@@ -9642,6 +9642,11 @@ impl App {
             .unwrap_or(crate::ring_shortcut::RightDragOwner::Root);
         if event.button == NativeVideoMouseButton::Right && !event.double_click {
             let pos = egui::pos2(event.x as f32, event.y as f32);
+            if !event.down && self.mouse_ring_suppress_context_menu_once {
+                self.mouse_ring_suppress_context_menu_once = false;
+                self.native_video_secondary_press_start = None;
+                return;
+            }
             let right_drag_mode = self
                 .settings
                 .ring_shortcuts
@@ -9753,6 +9758,15 @@ impl App {
             if right_drag_owner == crate::ring_shortcut::RightDragOwner::Root {
                 self.handle_native_video_short_right_click(ctx, right_drag_owner, fs_idx, pos);
             }
+            return;
+        }
+        if event.button == NativeVideoMouseButton::Left
+            && !event.double_click
+            && self.cancel_mouse_right_drag_on_primary_press(right_drag_owner, event.down)
+        {
+            // Native clicks become actions only when a remembered down is paired
+            // with its up. Dropping the down here therefore consumes both halves.
+            self.native_video_pointer_down = None;
             return;
         }
         if !event.double_click && event.down {

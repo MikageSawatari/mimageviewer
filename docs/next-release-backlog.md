@@ -877,6 +877,12 @@
 
 ### 1.106 リングショートカット / マウスジェスチャを左クリックで取り消す — 利用者要望
 
+✅ 実装済み (2026-08-22)。グリッドセル / グリッド背景 / active viewer / passive detached
+viewer の 4 開始面で、進行中の右ドラッグを左ボタン press から既存 cancel helper へ流す。
+active 面では対応する左 release と右ボタンの後続 release を通常 click として再利用しない。
+passive detached は通常どおり release で窓を activate するが、選択 / open / viewer action には
+再利用しない。固定 mouse chord の理由は `keymap-spec.md` に記録した。
+
 - 出典: 利用者要望 (2026-08)。右ドラッグで開始した後にやめたいとき、取り消す手段がない。
   現状の回避は「リングは中央の円へ戻して離す」「ジェスチャは割り当てのない軌跡にする」。
   提案は**右ドラッグ中に左クリックを押すと取り消し**。

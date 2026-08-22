@@ -3181,6 +3181,7 @@ struct DetachedImageWindowEventBatch {
 fn parked_live_egui_right_drag_event_kind(
     egui_owns_right_drag: bool,
     right_drag_live: bool,
+    primary_pressed: bool,
     focused_last_frame: bool,
     focused_now: bool,
     secondary_pressed: bool,
@@ -3191,7 +3192,11 @@ fn parked_live_egui_right_drag_event_kind(
     if !egui_owns_right_drag {
         return None;
     }
-    if right_drag_live && focused_last_frame && !focused_now {
+    if right_drag_live && primary_pressed {
+        Some(crate::app::DetachedRightDragEventKind::Cancel {
+            reason: crate::app::DetachedRightDragCancelReason::PrimaryButtonPressed,
+        })
+    } else if right_drag_live && focused_last_frame && !focused_now {
         Some(crate::app::DetachedRightDragEventKind::Cancel {
             reason: crate::app::DetachedRightDragCancelReason::FocusLost,
         })
@@ -12170,6 +12175,7 @@ impl App {
             let right_drag_kind = parked_live_egui_right_drag_event_kind(
                 egui_owns_right_drag,
                 right_drag_live,
+                primary_pressed,
                 window.focused_last_frame,
                 focused_now,
                 secondary_pressed,
@@ -21807,8 +21813,19 @@ impl App {
         let touch_tap_zones = self.fs_touch_tap_zones_enabled();
         let mut close = false;
         const FOCUS_RESTORE_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
-        let (pointer_primary_down, primary_released) =
-            ctx.input(|i| (i.pointer.primary_down(), i.pointer.primary_released()));
+        let (primary_pressed, pointer_primary_down, primary_released) = ctx.input(|i| {
+            (
+                i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+                i.pointer.primary_released(),
+            )
+        });
+        if self.cancel_mouse_right_drag_on_primary_press(
+            crate::ring_shortcut::RightDragOwner::Root,
+            primary_pressed,
+        ) {
+            self.fs_primary_suppression.arm_pointer_stream();
+        }
         if let Some(t) = self.fs_focus_regained_at {
             if t.elapsed() >= FOCUS_RESTORE_GRACE {
                 self.fs_focus_regained_at = None;
@@ -35185,12 +35202,13 @@ mod tests {
     fn parked_live_visible_presenter_emits_no_egui_right_drag_events() {
         let potential_events = [
             parked_live_egui_right_drag_event_kind(
-                false, true, true, false, false, false, false, None,
+                false, true, true, true, false, false, false, false, None,
             ),
             parked_live_egui_right_drag_event_kind(
-                false, true, true, true, false, false, false, None,
+                false, true, false, true, true, false, false, false, None,
             ),
             parked_live_egui_right_drag_event_kind(
+                false,
                 false,
                 false,
                 true,
@@ -35216,6 +35234,7 @@ mod tests {
             parked_live_egui_right_drag_event_kind(
                 true,
                 false,
+                false,
                 true,
                 true,
                 true,
@@ -35232,10 +35251,23 @@ mod tests {
         );
         assert_eq!(
             parked_live_egui_right_drag_event_kind(
-                true, true, true, true, false, false, false, None,
+                true, true, false, true, true, false, false, false, None,
             ),
             Some(crate::app::DetachedRightDragEventKind::Cancel {
                 reason: crate::app::DetachedRightDragCancelReason::ButtonStateLost,
+            })
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parked_live_primary_press_reports_typed_right_drag_cancel() {
+        assert_eq!(
+            parked_live_egui_right_drag_event_kind(
+                true, true, true, true, true, false, true, false, None,
+            ),
+            Some(crate::app::DetachedRightDragEventKind::Cancel {
+                reason: crate::app::DetachedRightDragCancelReason::PrimaryButtonPressed,
             })
         );
     }
@@ -42719,6 +42751,143 @@ mod tests {
             FullscreenPrimarySuppression::Idle,
             "the mouse owner must end on primary release"
         );
+    }
+
+    #[test]
+    fn fullscreen_right_drag_left_cancel_consumes_release_and_keeps_normal_click() {
+        fn pointer(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
+            egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }
+        }
+
+        fn run_frame(
+            app: &mut crate::app::AppTestEnvForTest,
+            ctx: &egui::Context,
+            screen: egui::Rect,
+            state: &FsFrameState,
+            events: Vec<egui::Event>,
+        ) -> (FsPageNav, bool) {
+            app.frame_counter += 1;
+            let mut result = (FsPageNav::None, false);
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| {
+                            result =
+                                app.handle_fs_wheel_and_click(ui, ctx, screen, state, false, 0);
+                        });
+                },
+            );
+            result
+        }
+
+        let mut app = crate::app::setup_app_for_test();
+        for page in 0..3 {
+            app.items.push(GridItem::Image(PathBuf::from(format!(
+                "c:/test/right-drag-cancel-{page}.jpg"
+            ))));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.visible_indices = (0..app.items.len()).collect();
+        app.fullscreen_idx = Some(1);
+        app.settings.touch_still_chrome_learned = true;
+        app.settings.ring_shortcuts.set_right_drag_mode(
+            crate::ring_shortcut::RightDragContext::ImageFullscreen,
+            crate::ring_shortcut::RightDragMode::RingShortcut,
+        );
+        let state = FsFrameState {
+            is_video: false,
+            original_preview_active: false,
+            page_turn_decision: FsPageTurnDecision::normal(),
+            tex: None,
+            thumb_tex: None,
+            location_display: String::new(),
+            image_dims: None,
+            image_file_size: None,
+            image_downscaled: false,
+            is_loading: false,
+            vst3_waiting_for_video: false,
+            fs_load_failed: false,
+            pdf_content_type: None,
+        };
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let pos = egui::pos2(700.0, 300.0);
+
+        run_frame(&mut app, &ctx, screen, &state, Vec::new());
+        run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![
+                egui::Event::PointerMoved(pos),
+                pointer(pos, egui::PointerButton::Secondary, true),
+            ],
+        );
+        assert!(app.mouse_ring_flick.is_some());
+
+        let press_result = run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![pointer(pos, egui::PointerButton::Primary, true)],
+        );
+        assert_eq!(press_result, (FsPageNav::None, false));
+        assert!(app.mouse_ring_flick.is_none());
+        assert_eq!(
+            app.fs_primary_suppression,
+            FullscreenPrimarySuppression::PointerStream
+        );
+
+        let release_result = run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![pointer(pos, egui::PointerButton::Primary, false)],
+        );
+        assert_eq!(release_result, (FsPageNav::None, false));
+        assert_eq!(
+            app.fs_primary_suppression,
+            FullscreenPrimarySuppression::Idle
+        );
+        let right_release_result = run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![pointer(pos, egui::PointerButton::Secondary, false)],
+        );
+        assert_eq!(right_release_result, (FsPageNav::None, false));
+
+        let normal_press = run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![pointer(pos, egui::PointerButton::Primary, true)],
+        );
+        assert_eq!(normal_press, (FsPageNav::None, false));
+        let normal_release = run_frame(
+            &mut app,
+            &ctx,
+            screen,
+            &state,
+            vec![pointer(pos, egui::PointerButton::Primary, false)],
+        );
+        assert_eq!(normal_release, (FsPageNav::Delta(1), false));
     }
 
     #[test]
