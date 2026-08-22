@@ -2459,6 +2459,52 @@ impl NativeFrameOutputContext {
 }
 
 #[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VisibleVideoLoopAction {
+    ProcessFrames,
+    RefreshSettledResizeThenIdle,
+}
+
+#[cfg(any(windows, test))]
+fn visible_video_loop_action(
+    presenter_hidden: bool,
+    is_playing: bool,
+    is_seeking: bool,
+    waiting_for_first_frame: bool,
+) -> VisibleVideoLoopAction {
+    if !presenter_hidden && !is_playing && !is_seeking && !waiting_for_first_frame {
+        VisibleVideoLoopAction::RefreshSettledResizeThenIdle
+    } else {
+        VisibleVideoLoopAction::ProcessFrames
+    }
+}
+
+#[cfg(windows)]
+fn refresh_settled_resize_if_due(
+    presenter: &mut native_presenter::NativeRenderCore,
+    frame_output: &mut NativeFrameOutputContext,
+    sync_interval: u32,
+) {
+    if !presenter.take_settled_resize_refresh_due(std::time::Instant::now()) {
+        return;
+    }
+
+    let refresh = frame_output
+        .visible_frame()
+        .map(|frame| presenter.present(frame, sync_interval));
+    match refresh {
+        Some(Ok(outcome)) => {
+            debug_assert!(frame_output.mark_current_visible(outcome.copy_fence_value));
+            frame_output.retire_completed(presenter.copy_fence_completed_value());
+        }
+        Some(Err(error)) => crate::logger::log(format!(
+            "[native-video] settled resize refresh present failed: {error}"
+        )),
+        None => {}
+    }
+}
+
+#[cfg(any(windows, test))]
 fn video_grade_render_changed(
     previous: &crate::creative_lut::VideoGradeSnapshot,
     next: &crate::creative_lut::VideoGradeSnapshot,
@@ -4791,13 +4837,16 @@ fn run_native_video_output(
                 ],
             );
         }
-        if !presenter_hidden
-            && !source.clock.is_playing()
-            && !source.clock.is_seeking()
-            && !waiting_for_first_frame
+        if visible_video_loop_action(
+            presenter_hidden,
+            source.clock.is_playing(),
+            source.clock.is_seeking(),
+            waiting_for_first_frame,
+        ) == VisibleVideoLoopAction::RefreshSettledResizeThenIdle
         {
             source.last_present_wall = None;
             source.last_present_source_pts = None;
+            refresh_settled_resize_if_due(&mut presenter, &mut frame_output, config.sync_interval);
             // message 対応待機: 一時停止中でもリサイズ等のメッセージで即起床する。
             std::thread::sleep(Duration::from_millis(8));
             continue;
@@ -4864,27 +4913,10 @@ fn run_native_video_output(
             }
         }
 
-        // Active playback consumes the settled resize on its next decoded
-        // frame. While paused, re-present the one typed Visible frame exactly
-        // once so the display-resolution surface is replaced without waiting
-        // for playback to resume.
-        if latest_renderable.is_none()
-            && !presenter_hidden
-            && presenter.take_settled_resize_refresh_due(Instant::now())
-        {
-            let refresh = frame_output
-                .visible_frame()
-                .map(|frame| presenter.present(frame, config.sync_interval));
-            match refresh {
-                Some(Ok(outcome)) => {
-                    debug_assert!(frame_output.mark_current_visible(outcome.copy_fence_value));
-                    frame_output.retire_completed(presenter.copy_fence_completed_value());
-                }
-                Some(Err(error)) => crate::logger::log(format!(
-                    "[native-video] settled resize refresh present failed: {error}"
-                )),
-                None => {}
-            }
+        // A decoded frame naturally applies a settled resize through present().
+        // Otherwise, re-present the one typed Visible frame exactly once.
+        if latest_renderable.is_none() && !presenter_hidden {
+            refresh_settled_resize_if_due(&mut presenter, &mut frame_output, config.sync_interval);
         }
 
         if let Some(frame) = latest_renderable {
@@ -8679,6 +8711,29 @@ mod tests {
             super::NativePresenterVisibility::new(super::NativeVideoInitialVisibility::Visible);
         assert!(hidden.is_hidden());
         assert!(!visible.is_hidden());
+    }
+
+    #[test]
+    fn paused_visible_loop_refreshes_settled_resize_before_idling() {
+        use super::VisibleVideoLoopAction::{ProcessFrames, RefreshSettledResizeThenIdle};
+
+        assert_eq!(
+            super::visible_video_loop_action(false, false, false, false),
+            RefreshSettledResizeThenIdle
+        );
+
+        for state in [
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
+        ] {
+            assert_eq!(
+                super::visible_video_loop_action(state.0, state.1, state.2, state.3),
+                ProcessFrames,
+                "state={state:?}"
+            );
+        }
     }
 
     #[test]
