@@ -2,9 +2,10 @@
 //!
 //! UI 側は物理ファイル 1 件を channel へ渡すだけにし、metadata 取得・
 //! ファイル読み出し・SHA-256・SQLite はすべて専用 worker が行う。
-//! 新規ストアなので旧スキーマの migration は持たず、初回 open で正本スキーマを作る。
+//! schema 作成と upgrade は `PRAGMA user_version` を正本に 1 箇所で行い、
+//! 過去ビルドが作った台帳も open 時に現在形へ引き上げる。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
@@ -24,6 +25,7 @@ pub(crate) use restore::{
 
 const HEAD_HASH_BYTES: u64 = 64 * 1024;
 const HASH_CHUNK_BYTES: usize = 256 * 1024;
+const CONTENT_IDENTITY_SCHEMA_VERSION: i64 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ContentIdentityTrigger {
@@ -179,6 +181,7 @@ pub(crate) struct LedgerEntry {
 pub(crate) struct ContentIdentityIndex {
     entries_by_size: BTreeMap<u64, Vec<LedgerEntry>>,
     size_by_file_key: HashMap<String, u64>,
+    ledger_file_keys: HashSet<String>,
 }
 
 impl ContentIdentityIndex {
@@ -194,6 +197,12 @@ impl ContentIdentityIndex {
         self.size_by_file_key.contains_key(file_key)
     }
 
+    /// 復元元と detection hash cache の両方を含む、台帳上の全物理キー。
+    /// 段 0 は cache 行で抑止してはいけないため `contains_file_key` と分ける。
+    pub(crate) fn contains_ledger_file_key(&self, file_key: &str) -> bool {
+        self.ledger_file_keys.contains(file_key)
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.size_by_file_key.len()
     }
@@ -206,6 +215,7 @@ impl ContentIdentityIndex {
     }
 
     pub(crate) fn upsert(&mut self, entry: LedgerEntry) {
+        self.ledger_file_keys.insert(entry.file_key.clone());
         // DB の flag は 0 -> 1 の単調遷移。遅れて届いた detection cache (0) が、
         // 先に届いた A1 の復元元更新 (1) をメモリ索引から消してはならない。
         if !entry.has_restorable_content {
@@ -228,6 +238,28 @@ impl ContentIdentityIndex {
             .entry(entry.size)
             .or_default()
             .push(entry);
+    }
+}
+
+/// A2/A4 が参照する台帳の利用可否。schema/open 失敗を空索引へ潰さない。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ContentIdentityLedgerState {
+    Disabled,
+    Loading,
+    Ready,
+    Unusable(String),
+}
+
+impl ContentIdentityLedgerState {
+    pub(crate) fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    pub(crate) fn unusable_detail(&self) -> Option<&str> {
+        match self {
+            Self::Unusable(detail) => Some(detail),
+            Self::Disabled | Self::Loading | Self::Ready => None,
+        }
     }
 }
 
@@ -380,36 +412,24 @@ struct StoredRecord {
 }
 
 impl ContentIdentityDb {
-    fn open() -> Result<Self, rusqlite::Error> {
+    fn open() -> Result<Self, String> {
         Self::open_at(&crate::data_dir::get().join("content_identity.db"))
     }
 
-    fn open_at(path: &Path) -> Result<Self, rusqlite::Error> {
+    fn open_at(path: &Path) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let conn = rusqlite::Connection::open(path)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        let mut conn = rusqlite::Connection::open(path).map_err(|error| error.to_string())?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(|error| error.to_string())?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
-             CREATE TABLE IF NOT EXISTS edit_origin (
-                 file_key TEXT PRIMARY KEY,
-                 size INTEGER NOT NULL,
-                 head_hash TEXT NOT NULL,
-                 full_hash TEXT,
-                 hashed_mtime INTEGER NOT NULL,
-                 kind TEXT NOT NULL,
-                 last_edit_at INTEGER NOT NULL,
-                 has_restorable_content INTEGER NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS edit_origin_full ON edit_origin(full_hash);
-             CREATE TABLE IF NOT EXISTS restore_declined (
-                 full_hash TEXT NOT NULL,
-                 target_key TEXT NOT NULL,
-                 PRIMARY KEY(full_hash, target_key)
-             );",
-        )?;
+             ",
+        )
+        .map_err(|error| error.to_string())?;
+        ensure_content_identity_schema(&mut conn)?;
         Ok(Self { conn })
     }
 
@@ -462,8 +482,7 @@ impl ContentIdentityDb {
             .prepare(
                 "SELECT file_key, size, head_hash, full_hash, hashed_mtime, kind, last_edit_at,
                         has_restorable_content
-                   FROM edit_origin
-                  WHERE has_restorable_content = 1",
+                   FROM edit_origin",
             )
             .map_err(|error| error.to_string())?;
         let mut rows = stmt.query([]).map_err(|error| error.to_string())?;
@@ -555,6 +574,124 @@ impl ContentIdentityDb {
     }
 }
 
+/// 新規作成と過去 schema からの upgrade を担う唯一の入口。
+/// version 0 は A1 の unversioned schema、version 1 は現在 schema を表す。
+fn ensure_content_identity_schema(conn: &mut rusqlite::Connection) -> Result<(), String> {
+    let version = conn
+        .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+        .map_err(|error| format!("read PRAGMA user_version: {error}"))?;
+    if !(0..=CONTENT_IDENTITY_SCHEMA_VERSION).contains(&version) {
+        return Err(format!(
+            "unsupported content identity schema version {version} (current {})",
+            CONTENT_IDENTITY_SCHEMA_VERSION
+        ));
+    }
+
+    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    if version == 0 {
+        if !schema_object_exists(&transaction, "table", "edit_origin")? {
+            transaction
+                .execute_batch(
+                    "CREATE TABLE edit_origin (
+                         file_key TEXT PRIMARY KEY,
+                         size INTEGER NOT NULL,
+                         head_hash TEXT NOT NULL,
+                         full_hash TEXT,
+                         hashed_mtime INTEGER NOT NULL,
+                         kind TEXT NOT NULL,
+                         last_edit_at INTEGER NOT NULL,
+                         has_restorable_content INTEGER NOT NULL DEFAULT 1
+                     );",
+                )
+                .map_err(|error| format!("create edit_origin: {error}"))?;
+        } else if !table_columns(&transaction, "edit_origin")?.contains("has_restorable_content") {
+            transaction
+                .execute_batch(
+                    "ALTER TABLE edit_origin
+                         ADD COLUMN has_restorable_content INTEGER NOT NULL DEFAULT 1;",
+                )
+                .map_err(|error| format!("upgrade edit_origin to schema v1: {error}"))?;
+        }
+        transaction
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS edit_origin_full ON edit_origin(full_hash);
+                 CREATE TABLE IF NOT EXISTS restore_declined (
+                     full_hash TEXT NOT NULL,
+                     target_key TEXT NOT NULL,
+                     PRIMARY KEY(full_hash, target_key)
+                 );",
+            )
+            .map_err(|error| format!("complete content identity schema v1: {error}"))?;
+        transaction
+            .pragma_update(None, "user_version", CONTENT_IDENTITY_SCHEMA_VERSION)
+            .map_err(|error| format!("write PRAGMA user_version: {error}"))?;
+    }
+
+    validate_content_identity_schema(&transaction)?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn schema_object_exists(
+    conn: &rusqlite::Connection,
+    object_type: &str,
+    name: &str,
+) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2",
+        rusqlite::params![object_type, name],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|value| value.is_some())
+    .map_err(|error| error.to_string())
+}
+
+fn table_columns(conn: &rusqlite::Connection, table: &str) -> Result<HashSet<String>, String> {
+    let sql = format!("PRAGMA table_info({table})");
+    let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+    statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+fn validate_content_identity_schema(conn: &rusqlite::Connection) -> Result<(), String> {
+    for (table, expected) in [
+        (
+            "edit_origin",
+            &[
+                "file_key",
+                "size",
+                "head_hash",
+                "full_hash",
+                "hashed_mtime",
+                "kind",
+                "last_edit_at",
+                "has_restorable_content",
+            ][..],
+        ),
+        ("restore_declined", &["full_hash", "target_key"][..]),
+    ] {
+        let columns = table_columns(conn, table)?;
+        for column in expected {
+            if !columns.contains(*column) {
+                return Err(format!(
+                    "content identity schema v{} is missing {table}.{column}",
+                    CONTENT_IDENTITY_SCHEMA_VERSION
+                ));
+            }
+        }
+    }
+    if !schema_object_exists(conn, "index", "edit_origin_full")? {
+        return Err(format!(
+            "content identity schema v{} is missing edit_origin_full",
+            CONTENT_IDENTITY_SCHEMA_VERSION
+        ));
+    }
+    Ok(())
+}
+
 fn ledger_entry_from_row(row: &rusqlite::Row<'_>) -> Result<LedgerEntry, rusqlite::Error> {
     let size: i64 = row.get(1)?;
     let size = u64::try_from(size).map_err(|error| {
@@ -594,29 +731,22 @@ pub(crate) struct ContentIdentityIndexLoadPending {
 
 impl ContentIdentityIndexLoadPending {
     /// A2 の索引ロード。設定 OFF では呼び出し側がこの worker 自体を作らない。
-    pub(crate) fn spawn() -> Option<Self> {
+    pub(crate) fn spawn() -> Result<Self, String> {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
-        match std::thread::Builder::new()
+        std::thread::Builder::new()
             .name("content-identity-index-load".into())
             .spawn(move || {
                 let result = ContentIdentityDb::open()
-                    .map_err(|error| error.to_string())
                     .and_then(|db| db.load_index(&worker_cancel))
                     .and_then(|index| index.ok_or_else(|| "cancelled".to_string()));
                 if !worker_cancel.load(Ordering::Acquire) {
                     let _ = tx.send(result);
                 }
-            }) {
-            Ok(_) => Some(Self { cancel, rx }),
-            Err(error) => {
-                crate::logger::log(format!(
-                    "content_identity: index loader thread spawn failed: {error}"
-                ));
-                None
-            }
-        }
+            })
+            .map(|_| Self { cancel, rx })
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn try_recv(
@@ -628,6 +758,14 @@ impl ContentIdentityIndexLoadPending {
     pub(crate) fn cancel(&self) {
         self.cancel.store(true, Ordering::Release);
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(result: Result<ContentIdentityIndex, String>) -> Self {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        tx.send(result).unwrap();
+        Self { cancel, rx }
+    }
 }
 
 impl Drop for ContentIdentityIndexLoadPending {
@@ -638,6 +776,7 @@ impl Drop for ContentIdentityIndexLoadPending {
 
 pub(crate) struct ContentIdentityRecorder {
     tx: Option<mpsc::Sender<RecordRequest>>,
+    update_tx: mpsc::Sender<LedgerEntry>,
     update_rx: mpsc::Receiver<LedgerEntry>,
     handle: Option<std::thread::JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
@@ -647,14 +786,16 @@ impl ContentIdentityRecorder {
     pub(crate) fn spawn() -> Option<Self> {
         let (tx, rx) = mpsc::channel::<RecordRequest>();
         let (update_tx, update_rx) = mpsc::channel::<LedgerEntry>();
+        let worker_update_tx = update_tx.clone();
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown);
         match std::thread::Builder::new()
             .name("content-identity-recorder".into())
-            .spawn(move || run_worker(rx, update_tx, worker_shutdown))
+            .spawn(move || run_worker(rx, worker_update_tx, worker_shutdown))
         {
             Ok(handle) => Some(Self {
                 tx: Some(tx),
+                update_tx,
                 update_rx,
                 handle: Some(handle),
                 shutdown,
@@ -685,6 +826,10 @@ impl ContentIdentityRecorder {
 
     pub(crate) fn drain_updates(&self) -> Vec<LedgerEntry> {
         self.update_rx.try_iter().collect()
+    }
+
+    pub(crate) fn update_sender(&self) -> mpsc::Sender<LedgerEntry> {
+        self.update_tx.clone()
     }
 }
 
@@ -809,6 +954,194 @@ impl Drop for ContentIdentityDetectionPending {
     fn drop(&mut self) {
         self.cancel();
     }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BackfillResult {
+    pub(crate) ledger_updates: Vec<LedgerEntry>,
+    pub(crate) errors: usize,
+}
+
+/// A4 の folder-open backfill。現在フォルダの候補だけを Low priority で記録し、
+/// folder 切替では token を立てて metadata/hash の各境界で止める。
+pub(crate) struct ContentIdentityBackfillPending {
+    cancel: Arc<AtomicBool>,
+    rx: mpsc::Receiver<BackfillResult>,
+    #[cfg(test)]
+    requested_sources: usize,
+}
+
+impl ContentIdentityBackfillPending {
+    pub(crate) fn spawn(
+        sources: Vec<ContentIdentitySource>,
+        input_seq: u64,
+        folder_key: String,
+        io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
+        update_tx: Option<mpsc::Sender<LedgerEntry>>,
+    ) -> Option<Self> {
+        let requested_sources = sources.len();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel();
+        let db_path = crate::data_dir::get().join("content_identity.db");
+        match std::thread::Builder::new()
+            .name("content-identity-backfill".into())
+            .spawn(move || {
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "content_identity",
+                        "backfill_begin",
+                        Some(&folder_key),
+                        input_seq,
+                        &[("targets", serde_json::Value::from(requested_sources))],
+                    );
+                }
+                let started = std::time::Instant::now();
+                match run_backfill_at(
+                    &db_path,
+                    sources,
+                    &worker_cancel,
+                    &io_sem,
+                    update_tx.as_ref(),
+                ) {
+                    Ok(Some(result)) => {
+                        if crate::perf::is_enabled() {
+                            crate::perf::event(
+                                "content_identity",
+                                "backfill_end",
+                                Some(&folder_key),
+                                input_seq,
+                                &[
+                                    (
+                                        "ms",
+                                        serde_json::Value::from(
+                                            started.elapsed().as_secs_f64() * 1000.0,
+                                        ),
+                                    ),
+                                    (
+                                        "recorded",
+                                        serde_json::Value::from(result.ledger_updates.len()),
+                                    ),
+                                    ("errors", serde_json::Value::from(result.errors)),
+                                ],
+                            );
+                        }
+                        if !worker_cancel.load(Ordering::Acquire) {
+                            let _ = tx.send(result);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => crate::logger::log(format!(
+                        "content_identity: backfill failed for {folder_key}: {error}"
+                    )),
+                }
+            }) {
+            Ok(_) => Some(Self {
+                cancel,
+                rx,
+                #[cfg(test)]
+                requested_sources,
+            }),
+            Err(error) => {
+                crate::logger::log(format!(
+                    "content_identity: backfill thread spawn failed: {error}"
+                ));
+                None
+            }
+        }
+    }
+
+    pub(crate) fn try_recv(&self) -> Result<BackfillResult, mpsc::TryRecvError> {
+        self.rx.try_recv()
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn requested_sources(&self) -> usize {
+        self.requested_sources
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test() -> (Self, Arc<AtomicBool>) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_tx, rx) = mpsc::channel();
+        (
+            Self {
+                cancel: Arc::clone(&cancel),
+                rx,
+                #[cfg(test)]
+                requested_sources: 0,
+            },
+            cancel,
+        )
+    }
+}
+
+impl Drop for ContentIdentityBackfillPending {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+fn run_backfill_at(
+    db_path: &Path,
+    sources: Vec<ContentIdentitySource>,
+    cancel: &AtomicBool,
+    io_sem: &crate::io_semaphore::GlobalIoSemaphore,
+    update_tx: Option<&mpsc::Sender<LedgerEntry>>,
+) -> Result<Option<BackfillResult>, String> {
+    if cancel.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    let db = {
+        let Some(_permit) =
+            io_sem.acquire_cancellable(crate::io_semaphore::IoPriority::Low, cancel)
+        else {
+            return Ok(None);
+        };
+        ContentIdentityDb::open_at(db_path)?
+    };
+    let mut ledger_updates = Vec::new();
+    let mut errors = 0;
+    for source in sources {
+        if cancel.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let Some(_permit) =
+            io_sem.acquire_cancellable(crate::io_semaphore::IoPriority::Low, cancel)
+        else {
+            return Ok(None);
+        };
+        let request = CoalescedRecordRequest {
+            file_key: crate::path_key::normalize_keep_drive(&source.path),
+            source,
+            trigger: ContentIdentityTrigger::ViewingState,
+            recorded_at: 0,
+        };
+        match record_source(&db, &request, cancel) {
+            Ok(Some(entry)) => {
+                if let Some(update_tx) = update_tx {
+                    let _ = update_tx.send(entry.clone());
+                }
+                ledger_updates.push(entry);
+            }
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                errors += 1;
+                crate::logger::log(format!(
+                    "content_identity: backfill recording failed for {}: {error}",
+                    request.source.path.display()
+                ));
+            }
+        }
+    }
+    Ok(Some(BackfillResult {
+        ledger_updates,
+        errors,
+    }))
 }
 
 struct CancellableReader<'a, R> {
@@ -1733,6 +2066,10 @@ mod tests {
         assert!(restarted_index.contains_file_key(&origin_key));
         assert!(!restarted_index.contains_file_key(&target_key));
         assert!(
+            restarted_index.contains_ledger_file_key(&target_key),
+            "backfill の ledger 有無判定には detection cache 行も含める"
+        );
+        assert!(
             stage0_target(
                 &restarted_index,
                 ContentIdentitySource::new(&target_path, ContentKind::Image),
@@ -2157,10 +2494,150 @@ mod tests {
     }
 
     #[test]
+    fn opens_a1_database_and_upgrades_existing_rows_to_restorable() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("content_identity.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE edit_origin (
+                     file_key TEXT PRIMARY KEY,
+                     size INTEGER NOT NULL,
+                     head_hash TEXT NOT NULL,
+                     full_hash TEXT,
+                     hashed_mtime INTEGER NOT NULL,
+                     kind TEXT NOT NULL,
+                     last_edit_at INTEGER NOT NULL
+                 );
+                 CREATE INDEX edit_origin_full ON edit_origin(full_hash);
+                 CREATE TABLE restore_declined (
+                     full_hash TEXT NOT NULL,
+                     target_key TEXT NOT NULL,
+                     PRIMARY KEY(full_hash, target_key)
+                 );
+                 INSERT INTO edit_origin
+                     (file_key, size, head_hash, full_hash, hashed_mtime, kind, last_edit_at)
+                 VALUES ('c:/legacy.png', 42, 'head', 'full', 100, 'image', 123);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let db = ContentIdentityDb::open_at(&path).unwrap();
+        let version: i64 = db
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CONTENT_IDENTITY_SCHEMA_VERSION);
+        let migrated: i64 = db
+            .conn
+            .query_row(
+                "SELECT has_restorable_content FROM edit_origin WHERE file_key = 'c:/legacy.png'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrated, 1, "A1 の全行は実際の復元元だった");
+        assert!(
+            table_columns(&db.conn, "edit_origin")
+                .unwrap()
+                .contains("has_restorable_content")
+        );
+        drop(db);
+
+        let reopened = ContentIdentityDb::open_at(&path).unwrap();
+        let rows: i64 = reopened
+            .conn
+            .query_row("SELECT COUNT(*) FROM edit_origin", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "current schema open は冪等で行を壊さない");
+    }
+
+    #[test]
+    fn unsupported_schema_version_is_an_observable_open_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("content_identity.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "user_version", CONTENT_IDENTITY_SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(connection);
+
+        let error = match ContentIdentityDb::open_at(&path) {
+            Ok(_) => panic!("future schema must not become an empty usable ledger"),
+            Err(error) => error,
+        };
+        assert!(error.contains("unsupported content identity schema version"));
+    }
+
+    #[test]
+    fn folder_backfill_then_copy_detection_produces_restore_candidate_without_gui() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("content_identity.db");
+        let source_folder = temp.path().join("source");
+        let target_folder = temp.path().join("target");
+        std::fs::create_dir_all(&source_folder).unwrap();
+        std::fs::create_dir_all(&target_folder).unwrap();
+        let source_path = source_folder.join("edited.png");
+        let target_path = target_folder.join("copied.png");
+        let bytes = vec![19_u8; HEAD_HASH_BYTES as usize + 31];
+        std::fs::write(&source_path, &bytes).unwrap();
+        let cancel = AtomicBool::new(false);
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
+
+        let backfill = run_backfill_at(
+            &db_path,
+            vec![ContentIdentitySource::new(&source_path, ContentKind::Image)],
+            &cancel,
+            &io_sem,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(backfill.ledger_updates.len(), 1);
+        assert!(backfill.ledger_updates[0].has_restorable_content);
+        assert_eq!(
+            backfill.ledger_updates[0].last_edit_at, 0,
+            "既存編集の実時刻は不明なので ViewingState の 0 を維持する"
+        );
+
+        std::fs::copy(&source_path, &target_path).unwrap();
+        let db = ContentIdentityDb::open_at(&db_path).unwrap();
+        let index = db.load_index(&cancel).unwrap().unwrap();
+        let target = stage0_target(
+            &index,
+            ContentIdentitySource::new(&target_path, ContentKind::Image),
+            bytes.len() as u64,
+        )
+        .expect("backfilled source size must enqueue the copied target");
+        drop(db);
+
+        let detected = run_detection_at(
+            &db_path,
+            vec![target],
+            7,
+            crate::path_key::normalize_keep_drive(&target_folder),
+            &cancel,
+            &io_sem,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(detected.candidates.len(), 1);
+        assert_eq!(
+            detected.candidates[0].sources[0].file_key,
+            crate::path_key::normalize_keep_drive(&source_path)
+        );
+    }
+
+    #[test]
     fn schema_contains_both_a1_tables_and_full_hash_index() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("content_identity.db");
         let db = ContentIdentityDb::open_at(&path).unwrap();
+        let version: i64 = db
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CONTENT_IDENTITY_SCHEMA_VERSION);
         let tables = db
             .conn
             .prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'index')")
@@ -2238,10 +2715,11 @@ mod tests {
     #[test]
     fn failed_recorder_submission_does_not_propagate_to_edit_caller() {
         let (tx, rx) = mpsc::channel();
-        let (_update_tx, update_rx) = mpsc::channel();
+        let (update_tx, update_rx) = mpsc::channel();
         drop(rx);
         let recorder = ContentIdentityRecorder {
             tx: Some(tx),
+            update_tx,
             update_rx,
             handle: None,
             shutdown: Arc::new(AtomicBool::new(false)),

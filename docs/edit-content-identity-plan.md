@@ -5,7 +5,8 @@ OS 側 (エクスプローラー等) でファイルを移動・コピーする�
 本機能は **ファイル内容のハッシュ**を identity として編集内容を再結合し、
 利用者に確認したうえで新しい場所へ複製する。
 
-- 状態: **Phase 1 実装済み (A1 台帳と記録 / A2 検出 / A3a コピーエンジン / A3b 確認 UI)** (2026-08-21)
+- 状態: **Phase 1 + A4 実装済み** (A1 台帳と記録 / A2 検出 / A3a コピーエンジン /
+  A3b 確認 UI / A4 schema migration・folder-open backfill) (2026-08-22)
 - 関連: [preset-and-adjustment.md §9](preset-and-adjustment.md) (フォルダ側サイドカー)、
   [src/rename_key_migration.rs](../src/rename_key_migration.rs) (アプリ内リネーム移行)、
   [src/metadata_transfer.rs](../src/metadata_transfer.rs) (明示的なメタ情報書き出し / 取り込み)
@@ -111,8 +112,15 @@ CREATE TABLE restore_declined (
 > なので有効な復元元である。一方、A2 が照合済みファイルの hash を cache するだけの行は
 > `0` で作り、既存の `1` は変更しない。起動時の size index は `1` の行だけを載せる。
 > これにより hash cache 行が次回検出を抑止せず、A1 が後から同じ行を記録すれば再 hash なしで
-> `1` へ昇格する。`content_identity.db` は未リリースのため、この列は migration なしで
-> 正本スキーマへ直接追加する。
+> `1` へ昇格する。
+>
+> **A4 schema migration (2026-08-22)**: 未リリース store でも A1 build を実データで動かした
+> 開発環境には旧 schema が残るため、schema 作成と upgrade は 1 関数へ集約し、
+> `PRAGMA user_version` で管理する。unversioned A1 table に
+> `has_restorable_content` が無い場合は
+> `ALTER TABLE ... ADD COLUMN ... INTEGER NOT NULL DEFAULT 1` で上げる。A1 時代の行は検出 cache
+> ではなく全て実際の記録なので default `1` が正しい。期待 schema へ上げられない場合は空 index
+> として扱わず、台帳 state を `Unusable(detail)` にして検出 / backfill を開始せず利用者へ通知する。
 >
 > **`file_key` は path キーなので、[rename_key_migration.rs](../src/rename_key_migration.rs) の
 > `STORES` 表へ必ず追加すること。** この表はリネーム移行と削除 worker の hard purge が
@@ -127,6 +135,9 @@ CREATE TABLE restore_declined (
   ときに、台帳に無いものだけ裏でハッシュする」で自然に埋まる。開発機の実データで
   **編集を持つ物理ファイルは 921 件** (編集キー 1642 件 / jpg 466・png 395・pdf 30・zip 12) なので、
   通常利用の数セッションで完了する。
+- backfill は通常の物理フォルダを開いた時だけ、その一覧の presence 集合から物理ファイルを
+  容器単位で dedup して `ViewingState` として記録する。検出と同じ `GlobalIoSemaphore` Low priority、
+  folder 切替 cancel、chunk 間 cancel を使い、UI thread ではファイルも SQLite も読まない。
 - `(file_key, size, hashed_mtime)` が一致する限り再計算しない。
 
 ---
@@ -246,10 +257,15 @@ metadata_transfer は 2 と 4 が同時に存在するとエラーにする (imp
 ```
 
 - `Settings::edit_restore_prompt_enabled: bool` = **既定 true**
-- **OFF = 検出スキャンを完全停止** (段 0 の size 照合すらしない → I/O ゼロ)
+- **OFF = 検出スキャンと folder-open backfill を完全停止** (段 0 の size 照合や presence 選別も
+  開始しない → folder open 起因の matching / backfill I/O はゼロ)
 - **記録側 (編集保存時のハッシュ台帳への記録) は OFF でも継続する**。記録は編集した瞬間の
   1 ファイル 1 回だけで実質無コストであり、ここも止めると後で ON に戻したときに過去の編集を
   一切拾えなくなるため。設定文言も「確認する / しない」であって「記録しない」ではない。
+- **A4 での衝突解決**: backfill も記録ではあるが、編集確定に伴う記録と違って folder open を
+  起点に新しい file read を発生させる。このため OFF では backfill を止める。設定の補足文
+  「OFF にすると照合のためのファイル読み取りを一切行いません」から利用者が期待する挙動を優先し、
+  OFF 中も継続する「記録側」は、その場で利用者が確定した編集 / 表示状態の A1 記録だけを指す。
 
 ---
 

@@ -3027,8 +3027,9 @@ fn content_identity_setting_off_does_not_start_detection_worker() {
     let mut app = setup_app_for_test();
     let folder = app.tmp.path().join("pictures");
     let target = folder.join("target.png");
+    let target_key = crate::path_key::normalize_keep_drive(&target);
     app.settings.edit_restore_prompt_enabled = false;
-    app.content_identity_index_loaded = true;
+    app.content_identity_ledger_state = crate::content_identity::ContentIdentityLedgerState::Ready;
     app.content_identity_index
         .upsert(crate::content_identity::LedgerEntry {
             file_key: crate::path_key::normalize_keep_drive(&folder.join("origin.png")),
@@ -3049,10 +3050,142 @@ fn content_identity_setting_off_does_not_start_detection_worker() {
         .replace_surface(crate::app::top_level_grid_view::TopLevelGridSurface::Folder);
     app.items = vec![GridItem::Image(target)];
     app.image_metas = vec![Some((1, 42))];
+    app.adjusted_page_keys.insert(target_key);
 
     app.maybe_start_content_identity_detection();
 
     assert!(app.content_identity_detection_pending.is_none());
+    assert!(app.content_identity_backfill_pending.is_none());
+}
+
+#[test]
+fn content_identity_folder_open_backfills_only_missing_edited_physical_files() {
+    let mut app = setup_app_for_test();
+    let folder = app.tmp.path().join("pictures");
+    std::fs::create_dir_all(&folder).unwrap();
+    let missing = folder.join("missing.png");
+    let recorded = folder.join("recorded.png");
+    let plain = folder.join("plain.png");
+    for path in [&missing, &recorded, &plain] {
+        std::fs::write(path, b"image bytes").unwrap();
+    }
+    app.settings.edit_restore_prompt_enabled = true;
+    app.content_identity_index_load_pending = None;
+    app.content_identity_ledger_state = crate::content_identity::ContentIdentityLedgerState::Ready;
+    app.content_identity_index
+        .upsert(crate::content_identity::LedgerEntry {
+            file_key: crate::path_key::normalize_keep_drive(&recorded),
+            size: 11,
+            head_hash: "head".to_string(),
+            full_hash: Some("full".to_string()),
+            hashed_mtime: 1,
+            kind: crate::content_identity::ContentKind::Image,
+            last_edit_at: 0,
+            has_restorable_content: false,
+        });
+    app.adjusted_page_keys
+        .insert(crate::path_key::normalize_keep_drive(&missing));
+    app.mask_page_keys
+        .insert(crate::path_key::normalize_keep_drive(&recorded));
+    app.current_folder = Some(folder.clone());
+    app.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
+        folder,
+        counts: Default::default(),
+    });
+    app.top_level_grid_view
+        .replace_surface(crate::app::top_level_grid_view::TopLevelGridSurface::Folder);
+    app.items = vec![
+        GridItem::Image(missing),
+        GridItem::Image(recorded),
+        GridItem::Image(plain),
+    ];
+    app.image_metas = vec![None, Some((1, 11)), Some((1, 999))];
+
+    app.maybe_start_content_identity_detection();
+
+    let pending = app
+        .content_identity_backfill_pending
+        .as_ref()
+        .expect("台帳に無い編集済み item だけを backfill queue へ入れる");
+    assert_eq!(pending.requested_sources(), 1);
+    assert!(app.content_identity_detection_pending.is_none());
+}
+
+#[test]
+fn content_identity_backfill_deduplicates_zip_and_pdf_containers() {
+    let mut app = setup_app_for_test();
+    let folder = app.tmp.path().join("books");
+    std::fs::create_dir_all(&folder).unwrap();
+    let zip = folder.join("book.zip");
+    let pdf = folder.join("book.pdf");
+    std::fs::write(&zip, b"zip bytes").unwrap();
+    std::fs::write(&pdf, b"pdf bytes").unwrap();
+    app.settings.edit_restore_prompt_enabled = true;
+    app.content_identity_index_load_pending = None;
+    app.content_identity_ledger_state = crate::content_identity::ContentIdentityLedgerState::Ready;
+    app.adjusted_page_keys.insert(format!(
+        "{}::page.jpg",
+        crate::path_key::normalize_keep_drive(&zip)
+    ));
+    app.comic_page_keys.insert(format!(
+        "{}::page_1",
+        crate::path_key::normalize_keep_drive(&pdf)
+    ));
+    app.current_folder = Some(folder.clone());
+    app.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
+        folder,
+        counts: Default::default(),
+    });
+    app.top_level_grid_view
+        .replace_surface(crate::app::top_level_grid_view::TopLevelGridSurface::Folder);
+    app.items = vec![
+        GridItem::ZipFile(zip.clone()),
+        GridItem::ZipFile(zip),
+        GridItem::PdfFile(pdf.clone()),
+        GridItem::PdfFile(pdf),
+    ];
+    app.image_metas = vec![None; 4];
+
+    app.maybe_start_content_identity_detection();
+
+    assert_eq!(
+        app.content_identity_backfill_pending
+            .as_ref()
+            .unwrap()
+            .requested_sources(),
+        2,
+        "ZIP/PDF は page presence が複数あっても容器ごとに 1 回だけ記録する"
+    );
+}
+
+#[test]
+fn content_identity_index_failure_becomes_unusable_instead_of_empty_ready() {
+    let mut app = setup_app_for_test();
+    if let Some(pending) = app.content_identity_index_load_pending.take() {
+        pending.cancel();
+    }
+    app.settings.edit_restore_prompt_enabled = true;
+    app.content_identity_ledger_state =
+        crate::content_identity::ContentIdentityLedgerState::Loading;
+    app.content_identity_index_load_pending = Some(
+        crate::content_identity::ContentIdentityIndexLoadPending::for_test(Err(
+            "schema cannot be upgraded".to_string(),
+        )),
+    );
+
+    app.poll_content_identity_detection(&egui::Context::default());
+
+    assert_eq!(
+        app.content_identity_ledger_state.unusable_detail(),
+        Some("detection index load failed: schema cannot be upgraded")
+    );
+    assert!(app.content_identity_index_load_pending.is_none());
+    assert!(
+        app.fs_feedback_toast
+            .as_ref()
+            .is_some_and(|(text, _, _)| text.contains("復元を利用できません")),
+        "台帳 failure は log だけでなく利用者にも通知する"
+    );
 }
 
 #[test]
@@ -3096,7 +3229,7 @@ fn content_identity_folder_switch_cancels_worker_and_stale_result_is_not_applied
     let old_folder = app.tmp.path().join("old");
     app.settings.edit_restore_prompt_enabled = true;
     app.content_identity_index_load_pending = None;
-    app.content_identity_index_loaded = true;
+    app.content_identity_ledger_state = crate::content_identity::ContentIdentityLedgerState::Ready;
     app.current_folder = Some(current_folder.clone());
     app.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
         folder: current_folder.clone(),
@@ -3130,6 +3263,9 @@ fn content_identity_folder_switch_cancels_worker_and_stale_result_is_not_applied
     let (pending, cancel) =
         crate::content_identity::ContentIdentityDetectionPending::for_test(None);
     app.content_identity_detection_pending = Some(pending);
+    let (backfill, backfill_cancel) =
+        crate::content_identity::ContentIdentityBackfillPending::for_test();
+    app.content_identity_backfill_pending = Some(backfill);
     app.set_content_restore_candidates(vec![crate::content_identity::RestoreCandidate {
         target_key: "pending".to_string(),
         target_path: current_folder.join("pending.png"),
@@ -3147,7 +3283,9 @@ fn content_identity_folder_switch_cancels_worker_and_stale_result_is_not_applied
     app.install_new_items(Vec::new(), Vec::new());
 
     assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+    assert!(backfill_cancel.load(std::sync::atomic::Ordering::Acquire));
     assert!(app.content_identity_detection_pending.is_none());
+    assert!(app.content_identity_backfill_pending.is_none());
     assert!(app.content_restore_prompt.is_none());
 }
 

@@ -444,18 +444,27 @@ mod tests {
     fn dont_ask_again_disables_the_a2_setting_gate() {
         let mut app = crate::app::setup_app_for_test();
         app.settings.edit_restore_prompt_enabled = true;
-        app.content_identity_index_loaded = true;
+        app.content_identity_ledger_state =
+            crate::content_identity::ContentIdentityLedgerState::Ready;
         let (pending, cancel) =
             crate::content_identity::ContentIdentityDetectionPending::for_test(None);
         app.content_identity_detection_pending = Some(pending);
+        let (backfill, backfill_cancel) =
+            crate::content_identity::ContentIdentityBackfillPending::for_test();
+        app.content_identity_backfill_pending = Some(backfill);
         app.set_content_restore_candidates(vec![candidate("pending")]);
 
         assert!(app.apply_content_restore_disable_choice_to_runtime(true));
         assert!(!app.settings.edit_restore_prompt_enabled);
         assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+        assert!(backfill_cancel.load(std::sync::atomic::Ordering::Acquire));
         assert!(app.content_identity_detection_pending.is_none());
+        assert!(app.content_identity_backfill_pending.is_none());
         assert!(app.content_restore_prompt.is_none());
-        assert!(!app.content_identity_index_loaded);
+        assert_eq!(
+            app.content_identity_ledger_state,
+            crate::content_identity::ContentIdentityLedgerState::Disabled
+        );
         assert!(!app.apply_content_restore_disable_choice_to_runtime(true));
     }
 

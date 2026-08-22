@@ -10079,10 +10079,12 @@ pub struct App {
     pub(crate) content_identity_index_load_pending:
         Option<crate::content_identity::ContentIdentityIndexLoadPending>,
     pub(crate) content_identity_index: crate::content_identity::ContentIdentityIndex,
-    pub(crate) content_identity_index_loaded: bool,
+    pub(crate) content_identity_ledger_state: crate::content_identity::ContentIdentityLedgerState,
     pub(crate) content_identity_updates_before_load: Vec<crate::content_identity::LedgerEntry>,
     pub(crate) content_identity_detection_pending:
         Option<crate::content_identity::ContentIdentityDetectionPending>,
+    pub(crate) content_identity_backfill_pending:
+        Option<crate::content_identity::ContentIdentityBackfillPending>,
     /// 現在の物理フォルダだけが所有する、候補・選択・復元元をまとめた確認状態。
     pub(crate) content_restore_prompt: Option<content_identity_restore::ContentRestorePrompt>,
     pub(crate) content_identity_restore_pending:
@@ -13342,12 +13344,28 @@ impl App {
         let content_identity_recorder = crate::content_identity::ContentIdentityRecorder::spawn();
         // A2 の全件索引は検出設定が ON のときだけ別 worker で読む。A1 recorder は
         // この設定を参照せず、OFF 中も編集確定時の記録を継続する。
-        let content_identity_index_load_pending = settings
-            .edit_restore_prompt_enabled
-            .then(crate::content_identity::ContentIdentityIndexLoadPending::spawn)
-            .flatten();
-        let content_identity_index_loaded =
-            settings.edit_restore_prompt_enabled && content_identity_index_load_pending.is_none();
+        let (content_identity_index_load_pending, content_identity_ledger_state) =
+            if settings.edit_restore_prompt_enabled {
+                match crate::content_identity::ContentIdentityIndexLoadPending::spawn() {
+                    Ok(pending) => (
+                        Some(pending),
+                        crate::content_identity::ContentIdentityLedgerState::Loading,
+                    ),
+                    Err(error) => {
+                        let detail = format!("index loader thread spawn failed: {error}");
+                        crate::logger::log(format!("content_identity: {detail}"));
+                        (
+                            None,
+                            crate::content_identity::ContentIdentityLedgerState::Unusable(detail),
+                        )
+                    }
+                }
+            } else {
+                (
+                    None,
+                    crate::content_identity::ContentIdentityLedgerState::Disabled,
+                )
+            };
         let content_identity_fallback_io_sem =
             Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(
                 settings.indexer_speed_profile.io_permits().max(1),
@@ -13510,7 +13528,7 @@ impl App {
         let creative_lut_library =
             crate::creative_lut::CreativeLutLibrary::new(&settings.creative_luts);
 
-        let app = Self {
+        let mut app = Self {
             address: String::new(),
             current_folder: None,
             normal_folder_omitted_entries: None,
@@ -13646,9 +13664,10 @@ impl App {
             content_identity_recorder,
             content_identity_index_load_pending,
             content_identity_index: crate::content_identity::ContentIdentityIndex::default(),
-            content_identity_index_loaded,
+            content_identity_ledger_state,
             content_identity_updates_before_load: Vec::new(),
             content_identity_detection_pending: None,
+            content_identity_backfill_pending: None,
             content_restore_prompt: None,
             content_identity_restore_pending: None,
             content_identity_fallback_io_sem,
@@ -14716,6 +14735,16 @@ impl App {
                 .set_hud_raise_hook(std::sync::Arc::new(move || {
                     hud_raise_pending.store(true, std::sync::atomic::Ordering::Release);
                 }));
+        }
+
+        if app
+            .content_identity_ledger_state
+            .unusable_detail()
+            .is_some()
+        {
+            app.show_feedback_toast(
+                "コピー・移動したファイルの編集内容の復元を利用できません".to_string(),
+            );
         }
 
         app

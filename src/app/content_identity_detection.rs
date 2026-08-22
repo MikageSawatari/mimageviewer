@@ -5,24 +5,36 @@ use std::time::Duration;
 
 use super::{App, top_level_grid_view};
 use crate::content_identity::{
-    ContentIdentityDetectionPending, ContentIdentityIndex, ContentIdentityIndexLoadPending,
-    ContentIdentitySource, ContentKind, DetectionResult, RestoreCandidate,
+    ContentIdentityBackfillPending, ContentIdentityDetectionPending, ContentIdentityIndex,
+    ContentIdentityIndexLoadPending, ContentIdentityLedgerState, ContentIdentitySource,
+    ContentKind, DetectionResult, DetectionTarget, RestoreCandidate,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+#[derive(Default)]
+struct ContentIdentityFolderWork {
+    detection_targets: Vec<DetectionTarget>,
+    backfill_sources: Vec<ContentIdentitySource>,
+}
+
 impl App {
     pub(crate) fn start_content_identity_index_load(&mut self) {
         if !self.settings.edit_restore_prompt_enabled
-            || self.content_identity_index_loaded
+            || !matches!(
+                &self.content_identity_ledger_state,
+                ContentIdentityLedgerState::Disabled
+            )
             || self.content_identity_index_load_pending.is_some()
         {
             return;
         }
-        self.content_identity_index_load_pending = ContentIdentityIndexLoadPending::spawn();
-        if self.content_identity_index_load_pending.is_none() {
-            // spawn 失敗は自動 retry しない。設定を明示的に OFF→ON した場合だけ再試行する。
-            self.content_identity_index_loaded = true;
+        self.content_identity_ledger_state = ContentIdentityLedgerState::Loading;
+        match ContentIdentityIndexLoadPending::spawn() {
+            Ok(pending) => self.content_identity_index_load_pending = Some(pending),
+            Err(error) => self.mark_content_identity_ledger_unusable(format!(
+                "index loader thread spawn failed: {error}"
+            )),
         }
     }
 
@@ -37,16 +49,19 @@ impl App {
             }
             self.cancel_content_identity_detection();
             self.content_identity_index = ContentIdentityIndex::default();
-            self.content_identity_index_loaded = false;
+            self.content_identity_ledger_state = ContentIdentityLedgerState::Disabled;
             self.content_identity_updates_before_load.clear();
         } else {
-            self.content_identity_index_loaded = false;
+            self.content_identity_ledger_state = ContentIdentityLedgerState::Disabled;
             self.start_content_identity_index_load();
         }
     }
 
     pub(crate) fn cancel_content_identity_detection(&mut self) {
         if let Some(pending) = self.content_identity_detection_pending.take() {
+            pending.cancel();
+        }
+        if let Some(pending) = self.content_identity_backfill_pending.take() {
             pending.cancel();
         }
         self.clear_content_restore_prompt();
@@ -74,71 +89,124 @@ impl App {
     }
 
     pub(crate) fn maybe_start_content_identity_detection(&mut self) {
-        // OFF は最初の分岐にする。物理一覧判定も size index 参照も一切行わない。
+        // OFF は最初の分岐にする。物理一覧判定、size index、backfill 選別の
+        // いずれも行わず、folder-open 起因の file read を 0 にする。
         if !self.settings.edit_restore_prompt_enabled {
             return;
         }
-        if !self.content_identity_index_loaded || !self.is_physical_folder_listing() {
+        if !self.content_identity_ledger_state.is_ready() || !self.is_physical_folder_listing() {
             return;
         }
         let Some(folder) = self.current_folder.as_deref() else {
             return;
         };
         let folder_key = crate::path_key::normalize_keep_drive(folder);
-        let mut targets = Vec::new();
-        for (item, meta) in self.items.iter().zip(&self.image_metas) {
-            let Some((_, size)) = meta else {
-                continue;
-            };
-            let Ok(size) = u64::try_from(*size) else {
-                continue;
-            };
-            let Some(source) = ContentIdentitySource::for_grid_item(item, None, Some(folder))
-            else {
-                continue;
-            };
-            if self.content_identity_target_has_existing_edit(&source) {
-                continue;
-            }
-            if let Some(target) =
-                crate::content_identity::stage0_target(&self.content_identity_index, source, size)
-            {
-                targets.push(target);
-            }
-        }
-        if targets.is_empty() {
+        let work = self.collect_content_identity_folder_work(folder);
+        if work.detection_targets.is_empty() && work.backfill_sources.is_empty() {
             return;
-        }
-
-        if let Some(pending) = self.content_identity_detection_pending.take() {
-            pending.cancel();
         }
         let io_sem = self
             .indexer_manager
             .as_ref()
             .map(crate::indexer_manager::IndexerManager::io_sem)
             .unwrap_or_else(|| Arc::clone(&self.content_identity_fallback_io_sem));
-        if crate::perf::is_enabled() {
-            crate::perf::event(
-                "content_identity",
-                "detect_enqueue",
-                Some(&folder_key),
+
+        if !work.detection_targets.is_empty() {
+            if let Some(pending) = self.content_identity_detection_pending.take() {
+                pending.cancel();
+            }
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "content_identity",
+                    "detect_enqueue",
+                    Some(&folder_key),
+                    self.input_seq,
+                    &[(
+                        "targets",
+                        serde_json::Value::from(work.detection_targets.len()),
+                    )],
+                );
+            }
+            self.content_identity_detection_pending = ContentIdentityDetectionPending::spawn(
+                work.detection_targets,
+                self.items_generation,
+                folder_key.clone(),
                 self.input_seq,
-                &[("targets", serde_json::Value::from(targets.len()))],
+                Arc::clone(&io_sem),
             );
         }
-        self.content_identity_detection_pending = ContentIdentityDetectionPending::spawn(
-            targets,
-            self.items_generation,
-            folder_key,
-            self.input_seq,
-            io_sem,
-        );
+
+        if !work.backfill_sources.is_empty() {
+            if let Some(pending) = self.content_identity_backfill_pending.take() {
+                pending.cancel();
+            }
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "content_identity",
+                    "backfill_enqueue",
+                    Some(&folder_key),
+                    self.input_seq,
+                    &[(
+                        "targets",
+                        serde_json::Value::from(work.backfill_sources.len()),
+                    )],
+                );
+            }
+            let update_tx = self
+                .content_identity_recorder
+                .as_ref()
+                .map(crate::content_identity::ContentIdentityRecorder::update_sender);
+            self.content_identity_backfill_pending = ContentIdentityBackfillPending::spawn(
+                work.backfill_sources,
+                self.input_seq,
+                folder_key,
+                io_sem,
+                update_tx,
+            );
+        }
+    }
+
+    fn collect_content_identity_folder_work(
+        &self,
+        folder: &std::path::Path,
+    ) -> ContentIdentityFolderWork {
+        let mut work = ContentIdentityFolderWork::default();
+        let mut backfill_keys = BTreeSet::new();
+        for (item, meta) in self.items.iter().zip(&self.image_metas) {
+            let Some(source) = ContentIdentitySource::for_grid_item(item, None, Some(folder))
+            else {
+                continue;
+            };
+            if self.content_identity_target_has_existing_edit(&source) {
+                let file_key = crate::path_key::normalize_keep_drive(&source.path);
+                if !self
+                    .content_identity_index
+                    .contains_ledger_file_key(&file_key)
+                    && backfill_keys.insert(file_key)
+                {
+                    work.backfill_sources.push(source);
+                }
+                continue;
+            }
+            let Some((_, size)) = meta else {
+                continue;
+            };
+            let Ok(size) = u64::try_from(*size) else {
+                continue;
+            };
+            if let Some(target) =
+                crate::content_identity::stage0_target(&self.content_identity_index, source, size)
+            {
+                work.detection_targets.push(target);
+            }
+        }
+        work
     }
 
     pub(crate) fn poll_content_identity_detection(&mut self, ctx: &egui::Context) {
         self.poll_content_identity_record_updates();
         self.poll_content_identity_index_load(ctx);
+        self.poll_content_identity_backfill(ctx);
 
         let event = self
             .content_identity_detection_pending
@@ -185,6 +253,36 @@ impl App {
         }
     }
 
+    fn poll_content_identity_backfill(&mut self, ctx: &egui::Context) {
+        let event = self
+            .content_identity_backfill_pending
+            .as_ref()
+            .map(ContentIdentityBackfillPending::try_recv);
+        match event {
+            Some(Ok(result)) => {
+                self.content_identity_backfill_pending = None;
+                let recorded = result.ledger_updates.len();
+                if self.settings.edit_restore_prompt_enabled
+                    && self.content_identity_ledger_state.is_ready()
+                {
+                    for update in result.ledger_updates {
+                        self.content_identity_index.upsert(update);
+                    }
+                }
+                crate::logger::log(format!(
+                    "content_identity: backfill completed recorded={recorded} errors={}",
+                    result.errors
+                ));
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.content_identity_backfill_pending = None;
+                crate::logger::log("content_identity: backfill thread disconnected".to_string());
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) => ctx.request_repaint_after(POLL_INTERVAL),
+            None => {}
+        }
+    }
+
     fn poll_content_identity_record_updates(&mut self) {
         if !self.settings.edit_restore_prompt_enabled {
             return;
@@ -194,11 +292,14 @@ impl App {
             .as_ref()
             .map(|recorder| recorder.drain_updates())
             .unwrap_or_default();
-        if self.content_identity_index_loaded {
+        if self.content_identity_ledger_state.is_ready() {
             for update in updates {
                 self.content_identity_index.upsert(update);
             }
-        } else if self.content_identity_index_load_pending.is_some() {
+        } else if matches!(
+            &self.content_identity_ledger_state,
+            ContentIdentityLedgerState::Loading
+        ) {
             self.content_identity_updates_before_load.extend(updates);
         }
     }
@@ -219,25 +320,34 @@ impl App {
                     index.len()
                 ));
                 self.content_identity_index = index;
-                self.content_identity_index_loaded = true;
+                self.content_identity_ledger_state = ContentIdentityLedgerState::Ready;
                 self.maybe_start_content_identity_detection();
             }
             Some(Ok(Err(error))) => {
                 self.content_identity_index_load_pending = None;
-                self.content_identity_updates_before_load.clear();
-                self.content_identity_index_loaded = true;
-                crate::logger::log(format!(
-                    "content_identity: detection index load failed: {error}"
+                self.mark_content_identity_ledger_unusable(format!(
+                    "detection index load failed: {error}"
                 ));
             }
             Some(Err(mpsc::TryRecvError::Disconnected)) => {
                 self.content_identity_index_load_pending = None;
-                self.content_identity_updates_before_load.clear();
-                self.content_identity_index_loaded = true;
+                self.mark_content_identity_ledger_unusable(
+                    "detection index loader disconnected".to_string(),
+                );
             }
             Some(Err(mpsc::TryRecvError::Empty)) => ctx.request_repaint_after(POLL_INTERVAL),
             None => {}
         }
+    }
+
+    fn mark_content_identity_ledger_unusable(&mut self, detail: String) {
+        self.content_identity_index = ContentIdentityIndex::default();
+        self.content_identity_updates_before_load.clear();
+        self.content_identity_ledger_state = ContentIdentityLedgerState::Unusable(detail.clone());
+        crate::logger::log(format!("content_identity: ledger unusable: {detail}"));
+        self.show_feedback_toast(
+            "コピー・移動したファイルの編集内容の復元を利用できません".to_string(),
+        );
     }
 
     pub(crate) fn content_identity_detection_result_is_current(
@@ -245,6 +355,7 @@ impl App {
         result: &DetectionResult,
     ) -> bool {
         self.settings.edit_restore_prompt_enabled
+            && self.content_identity_ledger_state.is_ready()
             && self.items_generation == result.items_generation
             && self.is_physical_folder_listing()
             && self.current_folder.as_deref().is_some_and(|folder| {
