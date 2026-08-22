@@ -25,6 +25,36 @@ fn initial_scan_settled_gate_is_vacuously_ready_without_supervisors_and_emits_on
 }
 
 #[test]
+fn edit_preview_close_observes_a_materialized_generation_after_direct_entry_loss() {
+    let mut app = setup_app_for_test();
+    app.items = vec![GridItem::Image(PathBuf::from(
+        "C:/Pictures/annotated-page.jpg",
+    ))];
+    let edit_key = app.current_edit_result_key(0);
+
+    assert!(
+        !app.edit_result_generation_observed_downstream(edit_key),
+        "no downstream state means the missing edit result has no completion evidence"
+    );
+
+    app.final_ai_failed.insert(FinalAiKey {
+        edit_key,
+        color_ai_hash: 17,
+        bg: 0,
+    });
+    assert!(
+        app.edit_result_generation_observed_downstream(edit_key),
+        "a downstream state proves that the exact edit generation existed"
+    );
+
+    app.input_generation.insert(0, edit_key.source_gen + 1);
+    assert!(
+        !app.edit_result_generation_observed_downstream(app.current_edit_result_key(0)),
+        "evidence for an older generation must not classify a new generation as evicted"
+    );
+}
+
+#[test]
 fn initial_scan_settled_gate_waits_for_both_index_kinds() {
     let mut pending = true;
 
