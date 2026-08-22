@@ -558,17 +558,27 @@ src/video/
 分割) → Phase 3 (state machine 配線) → Phase 4 (薄い facade 化を最終形として固定) の
 順で導入された。
 
-`thumbnail.rs` の `ThumbnailWorker` は seek hover preview と左 jump panel
-(pin/bookmark/chapter) のサムネイル warmup で共有する。hover 側を最優先する条件は
-**「hover thumb が worker キャッシュにまだ無い (= worker が hover 用に busy)」のときだけ**
-で、すでに hover thumb がキャッシュ済みなら worker は idle 扱いで marker warmup を
-進める。旧版は `native_hover_thumbnail_target_secs` が `Some` であるだけで marker を
-suppress していたが、cursor が seek bar から hover サムネ自身に乗ったときの
-`hover_preview_target_secs` 固定 (`overlay_draw.rs` 側の挙動) で sticky 化し、新規
-bookmark のサムネ warmup が動画再 open まで永久に飢える事故 (2026-05-16 報告) があった
-ためフィルタを厳格化した。hover していない時も marker warmup は bucket 単位で短時間
-の再送を抑制し、毎フレーム同じ miss を投げて hover request を supersede し続ける状態を
-作らない。
+`thumbnail.rs` の `ThumbnailWorker` は seek hover preview、mIV Remote の seek preview、
+左 jump panel (pin/bookmark/chapter) のサムネイル warmup で共有する。API は
+`request_seek_thumbnail(target_secs, tolerance_secs)` / `nearest_seek_thumbnail(target_secs,
+tolerance_secs)` とし、許容値は worker global ではなく要求ごとに渡す。desktop hover は
+`max(設定値, duration / (bar_width_points * pixels_per_point))`、Remote はブラウザが送る
+物理 bar 幅で同じ式、marker warmup と永続化用 pin/bookmark は 0.0 を渡す。0.0 の cache
+lookup に限っては平均 frame rate から求めた 1 frame 幅を同一 frame 再利用として認めるが、
+backward seek の着地点を早期採用する許容は 0.0 のままなので marker の抽出精度を粗くしない。
+
+cache は実 frame PTS を整数 nanosecond key にした `BTreeMap` で、要求範囲を range 検索する。
+範囲内に過去側の frame があれば target に最も近い過去側を優先し、無ければ未来側を選ぶ。
+粗い Remote 結果が入っていても、狭い desktop / marker 要求の範囲外なら hit しない。同一の
+`(target, tolerance, lookup_tolerance)` は最初に解決した cache entry を記録し、後から精密な
+frame が追加されても表示中の 1 枚を差し替えない。native overlay は hit 判定とは別に直近画像を
+保持し、許容内の画像が無い間だけ「シーク中」を重ねる。
+
+hover / Remote の未充足要求は marker warmup より優先する。worker は pending / in-flight を
+一つの typed latest-wins state で所有し、完了または空結果を記録するため、marker 側に bucket や
+wall-clock retry state は持たない。backward seek 後の最初の frame が target 以前かつ要求許容内
+ならその場で採用し、範囲外なら従来どおり target まで decode する。最終 frame も lookup 許容内
+であることを確認し、要求以上に離れた画像は公開しない。
 worker は初回 cache miss で長寿命の補助デコーダを lazy-open する。動画設定で HW decode
 が有効な場合は FFmpeg-owned D3D11VA device を優先し、出力は既存の
 `prepare_frame_for_swscale` で CPU readback して RGBA サムネイルへ変換する。main player

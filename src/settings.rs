@@ -4292,6 +4292,9 @@ pub struct Settings {
     /// 動画再生速度。HUD の速度ボタンから変更され、動画切替 / アプリ再起動後も維持する。
     #[serde(default = "default_video_playback_speed")]
     pub video_playback_speed: f64,
+    /// シークバー上のプレビューで許容する表示位置との差 (秒)。
+    #[serde(default = "default_video_seek_thumbnail_tolerance_secs")]
+    pub video_seek_thumbnail_tolerance_secs: f64,
     /// 旧自動再生設定 (bool)。現在の再生開始挙動では参照せず、設定ファイル互換のため保持する。
     #[serde(default)]
     pub video_autoplay: bool,
@@ -4937,6 +4940,14 @@ fn default_video_playback_speed() -> f64 {
     1.0
 }
 
+pub const VIDEO_SEEK_THUMBNAIL_TOLERANCE_MIN_SECS: f64 = 0.0;
+pub const VIDEO_SEEK_THUMBNAIL_TOLERANCE_MAX_SECS: f64 = 30.0;
+pub const VIDEO_SEEK_THUMBNAIL_TOLERANCE_DEFAULT_SECS: f64 = 1.0;
+
+fn default_video_seek_thumbnail_tolerance_secs() -> f64 {
+    VIDEO_SEEK_THUMBNAIL_TOLERANCE_DEFAULT_SECS
+}
+
 /// グリッド列数の最小値
 pub const MIN_GRID_COLS: usize = 1;
 /// グリッド列数の最大値
@@ -5549,6 +5560,7 @@ impl Default for Settings {
             remote_video_hide_local_output: true,
             video_volume: default_video_volume(),
             video_playback_speed: default_video_playback_speed(),
+            video_seek_thumbnail_tolerance_secs: default_video_seek_thumbnail_tolerance_secs(),
             video_autoplay: false,
             video_autoplay_mode: VideoAutoplayMode::default(),
             video_loop: false,
@@ -6475,6 +6487,8 @@ impl Settings {
             settings.video_autoplay_mode == VideoAutoplayMode::OnlyFromGrid;
         let video_volume_before_sanitize = settings.video_volume;
         let video_playback_speed_before_sanitize = settings.video_playback_speed;
+        let video_seek_thumbnail_tolerance_before_sanitize =
+            settings.video_seek_thumbnail_tolerance_secs;
         let vst3_migrated = settings.migrate_vst3_legacy();
         let video_loop_migrated = settings.migrate_legacy_video_loop();
         let archive_file_handling_migrated = settings.migrate_legacy_archive_file_handling();
@@ -6529,6 +6543,9 @@ impl Settings {
             (settings.video_volume - video_volume_before_sanitize).abs() > 1.0e-9;
         let video_playback_speed_sanitized =
             (settings.video_playback_speed - video_playback_speed_before_sanitize).abs() > 1.0e-9;
+        let video_seek_thumbnail_tolerance_sanitized =
+            settings.video_seek_thumbnail_tolerance_secs.to_bits()
+                != video_seek_thumbnail_tolerance_before_sanitize.to_bits();
 
         // バージョン跨ぎの安全網 (#4) を SQLite 版に置換:
         // - 旧版は `settings.json` を `settings.json.preupgrade-v<old>` に std::fs::copy
@@ -6584,6 +6601,7 @@ impl Settings {
             || archive_file_handling_migrated
             || video_volume_sanitized
             || video_playback_speed_sanitized
+            || video_seek_thumbnail_tolerance_sanitized
             || mouse_nav_clean_install_defaulted
             || grid_click_selection_mode_migrated
             || legacy_keymap_import.changed
@@ -6957,6 +6975,15 @@ impl Settings {
         // 区別できない)。ここでは mode を source of truth として bool を導出する片方向のみ。
         self.video_loop = !matches!(self.video_loop_mode, VideoLoopMode::Off);
         self.video_volume = clamp_video_volume(self.video_volume);
+        self.video_seek_thumbnail_tolerance_secs =
+            if self.video_seek_thumbnail_tolerance_secs.is_finite() {
+                self.video_seek_thumbnail_tolerance_secs.clamp(
+                    VIDEO_SEEK_THUMBNAIL_TOLERANCE_MIN_SECS,
+                    VIDEO_SEEK_THUMBNAIL_TOLERANCE_MAX_SECS,
+                )
+            } else {
+                VIDEO_SEEK_THUMBNAIL_TOLERANCE_DEFAULT_SECS
+            };
         // 0 は SegmentRing が表現できず、極端な直接編集値はメモリを際限なく予約し得る。
         // 2 秒 x 300 本 (= 10 分) を設定値として許す上限にする。
         self.remote_video_segment_window = self.remote_video_segment_window.clamp(1, 300);
@@ -10437,6 +10464,29 @@ mod tests {
         s.video_playback_speed = f64::NAN;
         s.sanitize();
         assert_eq!(s.video_playback_speed, 1.0);
+    }
+
+    #[test]
+    fn sanitize_clamps_video_seek_thumbnail_tolerance() {
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.video_seek_thumbnail_tolerance_secs,
+            VIDEO_SEEK_THUMBNAIL_TOLERANCE_DEFAULT_SECS
+        );
+
+        settings.video_seek_thumbnail_tolerance_secs = 99.0;
+        settings.sanitize();
+        assert_eq!(
+            settings.video_seek_thumbnail_tolerance_secs,
+            VIDEO_SEEK_THUMBNAIL_TOLERANCE_MAX_SECS
+        );
+
+        settings.video_seek_thumbnail_tolerance_secs = f64::NAN;
+        settings.sanitize();
+        assert_eq!(
+            settings.video_seek_thumbnail_tolerance_secs,
+            VIDEO_SEEK_THUMBNAIL_TOLERANCE_DEFAULT_SECS
+        );
     }
 
     #[test]

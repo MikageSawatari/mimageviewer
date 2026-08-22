@@ -219,13 +219,9 @@ pub struct VideoPlayer {
     error: Option<String>,
     /// シーク先サムネ抽出ワーカー。Drop で停止する。
     thumb_worker: Option<ThumbnailWorker>,
-    /// Native jump panel の pin/bookmark/chapter サムネ warmup を bucket 単位で抑制する。
-    /// hover preview と同じ `ThumbnailWorker` を共有するため、marker 側の毎フレーム再要求が
-    /// hover 要求を上書きし続けないようにする。
-    marker_thumbnail_warmup_requests: Mutex<std::collections::HashMap<i64, std::time::Instant>>,
     /// Remote seek/drag preview currently requested by the browser. Marker warmup shares the
     /// thumbnail worker, so it must not replace an unsatisfied interactive remote request.
-    remote_seek_thumbnail_target_secs: Mutex<Option<f64>>,
+    remote_seek_thumbnail_request: Mutex<Option<SeekThumbnailRequest>>,
     /// 未来フレーム (pts > clock now) のキュー。channel から pull した順に末尾に push、
     /// front から `pts <= now + small_margin` のものを取り出して表示。FIFO 連続性を保つことで
     /// 高 fps コンテンツでも display が channel head の far-future にジャンプしない。
@@ -277,7 +273,7 @@ pub struct VideoPlayer {
     #[cfg(windows)]
     native_output: Option<NativeVideoOutput>,
     #[cfg(windows)]
-    native_hover_thumbnail_target_secs: Mutex<Option<f64>>,
+    native_hover_thumbnail_request: Mutex<Option<SeekThumbnailRequest>>,
     #[cfg(windows)]
     native_hover_thumbnail_sent_key: Mutex<Option<NativeHoverThumbnailKey>>,
     /// decoder thread / native presenter thread / UI と共有する動的状態。
@@ -300,6 +296,12 @@ struct NativeHoverThumbnailKey {
     width: u32,
     height: u32,
     rgba_ptr: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SeekThumbnailRequest {
+    target_secs: f64,
+    tolerance_secs: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -445,6 +447,8 @@ pub enum NativeVideoOutputEvent {
     },
     RequestSeekThumbnail {
         target_secs: f64,
+        bar_width_points: f64,
+        pixels_per_point: f64,
     },
     /// hover が外れて hover thumbnail 要求がもう不要 (T35)。
     ClearSeekThumbnail,
@@ -2657,9 +2661,15 @@ fn send_native_overlay_command(
             NativeVideoOutputEvent::NavigateItem { delta, via_wheel }
         }
         Command::TileColumnsDelta { delta } => NativeVideoOutputEvent::TileColumnsDelta { delta },
-        Command::RequestSeekThumbnail { target_secs } => {
-            NativeVideoOutputEvent::RequestSeekThumbnail { target_secs }
-        }
+        Command::RequestSeekThumbnail {
+            target_secs,
+            bar_width_points,
+            pixels_per_point,
+        } => NativeVideoOutputEvent::RequestSeekThumbnail {
+            target_secs,
+            bar_width_points,
+            pixels_per_point,
+        },
         Command::ClearSeekThumbnail => NativeVideoOutputEvent::ClearSeekThumbnail,
         Command::ToggleTileMode => NativeVideoOutputEvent::ToggleTileMode,
         Command::TogglePerfOverlay => NativeVideoOutputEvent::TogglePerfOverlay,
@@ -4141,11 +4151,17 @@ fn run_native_video_output(
                             }
                             crate::video::native_presenter::NativeOverlayCommand::RequestSeekThumbnail {
                                 target_secs,
+                                bar_width_points,
+                                pixels_per_point,
                             } => {
                                 send_native_output_event(
                                     &ui_event_tx,
                                     event_epoch,
-                                    NativeVideoOutputEvent::RequestSeekThumbnail { target_secs },
+                                    NativeVideoOutputEvent::RequestSeekThumbnail {
+                                        target_secs,
+                                        bar_width_points,
+                                        pixels_per_point,
+                                    },
                                 );
                             }
                             // T35: hover が外れた合図を player に伝える
@@ -5279,7 +5295,6 @@ fn run_native_video_output(
 pub(crate) const MAX_RENDER_QUEUE: usize = 24;
 const FRAME_STEP_NO_PENDING_SEQ: u64 = u64::MAX;
 const USER_SEEK_REISSUE_AFTER: std::time::Duration = std::time::Duration::from_millis(250);
-const MARKER_THUMBNAIL_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Debug, Default)]
 struct UserSeekCoalesceState {
@@ -5389,8 +5404,7 @@ impl VideoPlayer {
             info: None,
             error: None,
             thumb_worker: None,
-            marker_thumbnail_warmup_requests: Mutex::new(std::collections::HashMap::new()),
-            remote_seek_thumbnail_target_secs: Mutex::new(None),
+            remote_seek_thumbnail_request: Mutex::new(None),
             future_frames: std::collections::VecDeque::new(),
             pending_resume_secs: None,
             last_seen_seek_serial: 0,
@@ -5405,7 +5419,7 @@ impl VideoPlayer {
             #[cfg(windows)]
             native_output: None,
             #[cfg(windows)]
-            native_hover_thumbnail_target_secs: Mutex::new(None),
+            native_hover_thumbnail_request: Mutex::new(None),
             #[cfg(windows)]
             native_hover_thumbnail_sent_key: Mutex::new(None),
             #[cfg(windows)]
@@ -5602,8 +5616,7 @@ impl VideoPlayer {
                 info: None,
                 error: Some(format!("FFmpeg DLL のロードに失敗しました: {e}")),
                 thumb_worker: None,
-                marker_thumbnail_warmup_requests: Mutex::new(std::collections::HashMap::new()),
-                remote_seek_thumbnail_target_secs: Mutex::new(None),
+                remote_seek_thumbnail_request: Mutex::new(None),
                 future_frames: std::collections::VecDeque::new(),
                 pending_resume_secs: None,
                 last_seen_seek_serial: 0,
@@ -5620,7 +5633,7 @@ impl VideoPlayer {
                 #[cfg(windows)]
                 duration_secs_bits: Arc::new(AtomicU64::new(0.0_f64.to_bits())),
                 #[cfg(windows)]
-                native_hover_thumbnail_target_secs: Mutex::new(None),
+                native_hover_thumbnail_request: Mutex::new(None),
                 #[cfg(windows)]
                 native_hover_thumbnail_sent_key: Mutex::new(None),
                 #[cfg(windows)]
@@ -5854,8 +5867,7 @@ impl VideoPlayer {
             info: None,
             error: headless_init_error.or(native_init_error),
             thumb_worker,
-            marker_thumbnail_warmup_requests: Mutex::new(std::collections::HashMap::new()),
-            remote_seek_thumbnail_target_secs: Mutex::new(None),
+            remote_seek_thumbnail_request: Mutex::new(None),
             future_frames: std::collections::VecDeque::new(),
             pending_resume_secs: resume_secs,
             last_seen_seek_serial: 0,
@@ -5870,7 +5882,7 @@ impl VideoPlayer {
             #[cfg(windows)]
             native_output,
             #[cfg(windows)]
-            native_hover_thumbnail_target_secs: Mutex::new(None),
+            native_hover_thumbnail_request: Mutex::new(None),
             #[cfg(windows)]
             native_hover_thumbnail_sent_key: Mutex::new(None),
             #[cfg(windows)]
@@ -5960,13 +5972,20 @@ impl VideoPlayer {
         ));
     }
 
-    /// シークホバー位置のサムネを要求する。debounce はワーカー側 (drain) で実施。
-    pub fn request_seek_thumbnail(&self, target_secs: f64) {
-        if !target_secs.is_finite() || target_secs < 0.0 {
+    /// 指定位置のサムネイルを要求する。許容秒数は利用者ごとに必ず渡す。
+    pub fn request_seek_thumbnail(&self, target_secs: f64, tolerance_secs: f64) {
+        if !target_secs.is_finite()
+            || target_secs < 0.0
+            || !tolerance_secs.is_finite()
+            || tolerance_secs < 0.0
+        {
             return;
         }
         if let Some(w) = &self.thumb_worker {
-            w.request(target_secs);
+            let avg_fps = self.info.as_ref().map(|info| info.avg_fps).unwrap_or(0.0);
+            let lookup_tolerance_secs =
+                crate::video::thumbnail::cache_lookup_tolerance(tolerance_secs, avg_fps);
+            w.request(target_secs, tolerance_secs, lookup_tolerance_secs);
         }
     }
 
@@ -5974,10 +5993,9 @@ impl VideoPlayer {
     /// hover preview と worker を共有しているため、hover が **まだ満たされていない間** は
     /// marker 側から割り込まない (= 現在見ようとしているプレビューを最優先)。hover thumb
     /// がすでに worker キャッシュに入っていれば worker は idle なので、marker warmup を
-    /// 進めてよい。同じ bucket の miss は短時間は再送せず、毎フレームの上書きループを防ぐ。
+    /// 進めてよい。worker 自身が同一要求を一度だけ処理する。
     /// 戻り値 true は「この marker を処理対象にしたので、このフレームでは後続 marker を
-    /// 要求しない」という意味。実際に request を送った場合だけでなく、hover 未満足や retry
-    /// 抑制中も true を返す。
+    /// 要求しない」という意味。hover 未満足の場合も true を返す。
     pub fn request_marker_thumbnail_warmup(&self, target_secs: f64) -> bool {
         if !target_secs.is_finite() || target_secs < 0.0 {
             return false;
@@ -5992,66 +6010,60 @@ impl VideoPlayer {
         // — overlay_draw.rs の挙動) で sticky になり、新規 bookmark のサムネが
         // 動画再 open まで永久に warmup されない問題があった (2026-05-16 報告)。
         #[cfg(windows)]
-        if let Some(hover_target) = self
-            .native_hover_thumbnail_target_secs
+        if let Some(hover_request) = self
+            .native_hover_thumbnail_request
             .lock()
             .ok()
-            .and_then(|target| *target)
-            && self.nearest_seek_thumbnail(hover_target).is_none()
+            .and_then(|request| *request)
+            && self
+                .nearest_seek_thumbnail(hover_request.target_secs, hover_request.tolerance_secs)
+                .is_none()
         {
             return true;
         }
-        if let Some(remote_target) = self
-            .remote_seek_thumbnail_target_secs
+        if let Some(remote_request) = self
+            .remote_seek_thumbnail_request
             .lock()
             .ok()
-            .and_then(|target| *target)
-            && self.nearest_seek_thumbnail(remote_target).is_none()
+            .and_then(|request| *request)
+            && self
+                .nearest_seek_thumbnail(remote_request.target_secs, remote_request.tolerance_secs)
+                .is_none()
         {
             return true;
         }
-
-        let key = crate::video::thumbnail::bucket_key(target_secs);
-        let now = std::time::Instant::now();
-        {
-            let Ok(mut warmups) = self.marker_thumbnail_warmup_requests.lock() else {
-                return true;
-            };
-            if warmups
-                .get(&key)
-                .is_some_and(|last| now.duration_since(*last) < MARKER_THUMBNAIL_RETRY_AFTER)
-            {
-                return true;
-            }
-            warmups.insert(key, now);
-        }
-        self.request_seek_thumbnail(target_secs);
+        self.request_seek_thumbnail(target_secs, 0.0);
         true
     }
 
     #[cfg(windows)]
-    pub fn request_native_hover_thumbnail(&self, target_secs: f64) {
+    pub fn request_native_hover_thumbnail(&self, target_secs: f64, tolerance_secs: f64) {
         let target_secs = if target_secs.is_finite() {
             target_secs.max(0.0)
         } else {
             return;
         };
+        if !tolerance_secs.is_finite() || tolerance_secs < 0.0 {
+            return;
+        }
         // T35 (Codex R-VTT-005): hover request は seek bar の右端で
         // `duration * frac` を渡すことが多く、container duration ぴったりだと
         // 最終 video frame の PTS を超えてサムネ抽出が EOF まで走る。
         // `clamp_seek_target` で同じ `duration - 0.1` クランプを適用してから渡す
         // (= 再生 seek と同じ可達領域に正規化)。
         let target_secs = self.clamp_seek_target(target_secs);
-        self.request_seek_thumbnail(target_secs);
-        if let Ok(mut target) = self.native_hover_thumbnail_target_secs.lock() {
-            let old_bucket = target.map(crate::video::thumbnail::bucket_key);
-            let new_bucket = crate::video::thumbnail::bucket_key(target_secs);
-            if old_bucket != Some(new_bucket)
+        self.request_seek_thumbnail(target_secs, tolerance_secs);
+        if let Ok(mut request) = self.native_hover_thumbnail_request.lock() {
+            let next = SeekThumbnailRequest {
+                target_secs,
+                tolerance_secs,
+            };
+            if *request != Some(next)
                 && let Ok(mut sent) = self.native_hover_thumbnail_sent_key.lock()
             {
                 *sent = None;
             }
-            *target = Some(target_secs);
+            *request = Some(next);
         }
     }
 
@@ -6060,8 +6072,8 @@ impl VideoPlayer {
     /// 後続フレームでサムネ抽出を再要求し続けてしまう (= 永久リトライ)。
     #[cfg(windows)]
     pub fn clear_native_hover_thumbnail(&self) {
-        if let Ok(mut target) = self.native_hover_thumbnail_target_secs.lock() {
-            *target = None;
+        if let Ok(mut request) = self.native_hover_thumbnail_request.lock() {
+            *request = None;
         }
         if let Ok(mut sent) = self.native_hover_thumbnail_sent_key.lock() {
             *sent = None;
@@ -6071,30 +6083,48 @@ impl VideoPlayer {
         }
     }
 
-    /// 直近キャッシュから target_secs に最も近いサムネを取り出す。
-    pub fn nearest_seek_thumbnail(&self, target_secs: f64) -> Option<Thumbnail> {
+    /// 実時刻キャッシュを要求ごとの許容範囲で検索する。
+    pub fn nearest_seek_thumbnail(
+        &self,
+        target_secs: f64,
+        tolerance_secs: f64,
+    ) -> Option<Thumbnail> {
+        let avg_fps = self.info.as_ref().map(|info| info.avg_fps).unwrap_or(0.0);
+        let lookup_tolerance_secs =
+            crate::video::thumbnail::cache_lookup_tolerance(tolerance_secs, avg_fps);
         self.thumb_worker
             .as_ref()
-            .and_then(|w| w.nearest(target_secs))
+            .and_then(|worker| worker.nearest(target_secs, tolerance_secs, lookup_tolerance_secs))
     }
 
     /// Remote seek/drag preview uses the same independent latest-wins worker as native hover.
     /// This only schedules auxiliary decode work; stream readiness never waits for its result.
-    pub fn request_remote_seek_thumbnail(&self, target_secs: f64) -> Option<f64> {
-        if !target_secs.is_finite() || target_secs < 0.0 {
+    pub fn request_remote_seek_thumbnail(
+        &self,
+        target_secs: f64,
+        tolerance_secs: f64,
+    ) -> Option<f64> {
+        if !target_secs.is_finite()
+            || target_secs < 0.0
+            || !tolerance_secs.is_finite()
+            || tolerance_secs < 0.0
+        {
             return None;
         }
         let target_secs = self.clamp_seek_target(target_secs);
-        if let Ok(mut target) = self.remote_seek_thumbnail_target_secs.lock() {
-            *target = Some(target_secs);
+        if let Ok(mut request) = self.remote_seek_thumbnail_request.lock() {
+            *request = Some(SeekThumbnailRequest {
+                target_secs,
+                tolerance_secs,
+            });
         }
-        self.request_seek_thumbnail(target_secs);
+        self.request_seek_thumbnail(target_secs, tolerance_secs);
         Some(target_secs)
     }
 
     pub fn clear_remote_seek_thumbnail(&self) {
-        if let Ok(mut target) = self.remote_seek_thumbnail_target_secs.lock() {
-            *target = None;
+        if let Ok(mut request) = self.remote_seek_thumbnail_request.lock() {
+            *request = None;
         }
     }
 
@@ -8098,16 +8128,17 @@ impl VideoPlayer {
         let Some(output) = self.native_output.as_ref() else {
             return;
         };
-        let target_secs = self
-            .native_hover_thumbnail_target_secs
+        let request = self
+            .native_hover_thumbnail_request
             .lock()
             .ok()
-            .and_then(|target| *target);
-        let Some(target_secs) = target_secs else {
+            .and_then(|request| *request);
+        let Some(request) = request else {
             return;
         };
-        let Some(thumb) = self.nearest_seek_thumbnail(target_secs) else {
-            self.request_seek_thumbnail(target_secs);
+        let Some(thumb) = self.nearest_seek_thumbnail(request.target_secs, request.tolerance_secs)
+        else {
+            self.request_seek_thumbnail(request.target_secs, request.tolerance_secs);
             return;
         };
         let key = NativeHoverThumbnailKey {
@@ -8124,6 +8155,10 @@ impl VideoPlayer {
         }
         output.set_hover_thumbnail(Some(native_presenter::NativeOverlayThumbnail {
             target_secs: thumb.target_secs,
+            match_tolerance_secs: crate::video::thumbnail::cache_lookup_tolerance(
+                request.tolerance_secs,
+                self.info.as_ref().map(|info| info.avg_fps).unwrap_or(0.0),
+            ),
             width: thumb.width,
             height: thumb.height,
             rgba: thumb.rgba,

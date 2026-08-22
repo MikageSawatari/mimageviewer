@@ -641,6 +641,7 @@ pub struct NativeOverlayPerfSample {
 #[derive(Clone, Debug)]
 pub struct NativeOverlayThumbnail {
     pub target_secs: f64,
+    pub match_tolerance_secs: f64,
     pub width: u32,
     pub height: u32,
     pub rgba: Arc<Vec<u8>>,
@@ -1308,6 +1309,8 @@ pub enum NativeOverlayCommand {
     },
     RequestSeekThumbnail {
         target_secs: f64,
+        bar_width_points: f64,
+        pixels_per_point: f64,
     },
     /// hover が外れて seek thumbnail 要求がもう不要 (T35)。
     /// Player 側で `clear_native_hover_thumbnail` を呼んで pump の永久リトライを止める。
@@ -7574,7 +7577,7 @@ impl NativeEguiOverlay {
                                 // `compute_hud_regions` が region 計算で読む。
                                 last_drawn_preview_rect = Some(preview_rect);
                                 let request_due = last_thumbnail_request_secs
-                                    .map(|prev| (prev - target).abs() >= 0.25)
+                                    .map(|previous| (previous - target).abs() >= 0.25)
                                     .unwrap_or(true)
                                     || last_thumbnail_request_at
                                         .map(|last| last.elapsed() >= Duration::from_millis(250))
@@ -7584,6 +7587,8 @@ impl NativeEguiOverlay {
                                     last_thumbnail_request_at = Some(Instant::now());
                                     commands.push(NativeOverlayCommand::RequestSeekThumbnail {
                                         target_secs: target,
+                                        bar_width_points: bar_rect.width() as f64,
+                                        pixels_per_point: self.pixels_per_point as f64,
                                     });
                                 }
                                 // 動画 HUD 2 段化リデザイン (Phase 3): hover カーソル縦線は
@@ -7617,8 +7622,11 @@ impl NativeEguiOverlay {
                                 );
                                 let thumbnail_matches =
                                     hover_thumbnail.as_ref().is_some_and(|thumb| {
-                                        (thumb.target_secs - target).abs()
-                                            <= crate::video::thumbnail::SECONDS_PER_BUCKET * 2.0
+                                        crate::video::thumbnail::is_within_tolerance(
+                                            target,
+                                            thumb.target_secs,
+                                            thumb.match_tolerance_secs,
+                                        )
                                     });
                                 // スクラブ中はサムネ画像を消さずに直近の 1 枚を出し
                                 // 続ける。以前は target に合うサムネが無い間「黒地 +

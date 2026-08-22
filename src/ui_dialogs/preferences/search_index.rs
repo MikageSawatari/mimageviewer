@@ -724,6 +724,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["ボリューム", "volume", "dB"]
     ),
     entry!(
+        "video/seek-thumbnail-tolerance",
+        Video,
+        "シーク時のズレ許容 (秒)",
+        ["プレビュー", "サムネイル", "速度", "位置", "seek"]
+    ),
+    entry!(
         "video/remote-streaming",
         Video,
         "リモート端末への動画配信を有効にする",

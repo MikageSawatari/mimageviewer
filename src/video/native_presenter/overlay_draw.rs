@@ -5541,9 +5541,7 @@ pub(super) fn target_has_marker(
     duration_secs: f64,
     kind_matches: impl Fn(NativeOverlayTimelineMarkerKind) -> bool,
 ) -> bool {
-    let bucket_window = crate::video::thumbnail::SECONDS_PER_BUCKET * 1.5;
-    let visual_window = (duration_secs / 300.0).clamp(0.15, 1.5);
-    let tolerance = bucket_window.max(visual_window);
+    let tolerance = (duration_secs / 300.0).clamp(0.15, 1.5);
     markers.iter().any(|marker| {
         kind_matches(marker.kind) && (marker.pts_secs - target_secs).abs() <= tolerance
     })

@@ -755,6 +755,11 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
 - 動画のシークは target 前の keyframe を画面へ出さずに target まで preroll する。
   連続キー押しやシークバー操作は最新 target にまとめ、1 seek 世代が 150ms を超える
   遅いシークでは中央に「シーク中...」を表示する。
+- 動画シークバーのサムネイルプレビューは「シーク時のズレ許容 (秒)」を使う。desktop は
+  `max(設定値, 動画尺 / シークバー物理幅)`、mIV Remote は端末の物理バー幅から同じ実効値を
+  求める。許容内の既存画像があれば即表示し、無ければ新しく取得する。ジャンプパネル、ピン、
+  ブックマーク用サムネイルは常に 0.0 を渡し、同一 frame の再利用だけ認める。同じ位置で一度
+  表示した画像は後から差し替えず、画像とは別に許容内 hit の有無で「シーク中」を判定する。
 - アナモフィック動画 (NTSC DVD など SAR != 1:1 の動画) は表示比 (DAR) を補正して
   正しいアスペクトで表示する。タイルモードのセル比率も同じ DAR を反映する。
 - 動画タイルモード (S キー) の上部バーは通常再生時と同じ高さ・配色で、現在の動画の
@@ -1733,6 +1738,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `show_hidden_files` | bool | false | Hidden 属性のファイル / フォルダをグリッド一覧とフォルダツリーペインに表示する。Hidden + System 属性の保護された OS ファイルは設定に関係なく常に非表示。非 Windows では先頭 `.` を Hidden 相当として扱う |
 | `video_volume` | f64 | 1.0 | 動画再生時の既定音量（線形ゲイン。UI は -∞dB〜+18dB の dB フェーダー）。1.0 超は手動 boost として safety limiter 前で適用 |
 | `video_playback_speed` | f64 | 1.0 | 動画再生速度。HUD の速度ボタンから変更し、動画切替とアプリ再起動後も維持する。読み込み時は `0.25..=4.0` にクランプ |
+| `video_seek_thumbnail_tolerance_secs` | f64 | 1.0 | 動画シークバーのプレビューで許容する位置差。0.0〜30.0 秒にクランプ。desktop / Remote はバー 1 物理 px 相当の秒数との大きい方を使う |
 | `video_continuous_mode` | VideoContinuousMode | Off | 動画連続再生モード (Off / Continuous / ContinuousLoop)。ON の間は通常ループを無効化し、EOF で現在リスト内の次動画へ進む |
 | `video_start_muted` | bool | false | 起動時にセッション初期ミュートを true にする安全スイッチ。起動後の動画切替では `video_muted` / HUD の現在状態を優先する |
 | `video_muted` | bool | false | HUD のミュートボタン / M キーで最後に選んだミュート状態。動画切替と次回起動へ引き継ぐ |

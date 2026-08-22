@@ -21,7 +21,7 @@
 **解像度にほぼ比例していない**のが重要な手がかり。復号が支配的ならこの並びにはならないので、
 高速シークにしても効かない可能性がある。だから先に測る。
 
-## 2. 現状の実装 (調査済み、再調査不要)
+## 2. 計測前の実装 (historical baseline)
 
 すべて [src/video/thumbnail.rs](../src/video/thumbnail.rs)。
 
@@ -94,3 +94,21 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe -ArgumentList
 - 結果を [next-release-backlog.md](next-release-backlog.md) の該当項目へ書き戻す。
 - 高速シークを入れないと決めた場合も、**測った数字を残す** (次に同じ相談が来たときの根拠になる)。
 - 計測コードを master へ入れるかは、`perf::event` として恒久的に有用かで判断する。
+
+## 7. 計測結果と実装結果 (2026-08-20〜22)
+
+4K AV1 60fps・約108分・GOP約7秒で42回測定し、hover 待ちは p50 177ms / p90 575ms /
+最大1007msだった。67件の ready 要求では `av_seek_frame` が p50 0.2ms、queue が1〜2ms、
+decoder open は初回62msだけだった一方、keyframe から target までの decode は p50 53ms /
+p90 374ms / 最大923ms、21 / 212 / 343 frames だった。支配項は GOP 内 decode であり、解像度や
+storage 速度は一次要因ではない。
+
+実装は「シーク時のズレ許容 (秒)」1設定に決定した。既定1.0、範囲0.0〜30.0で、0.0は従来の
+精密動作。実測素材では1.0秒は元から速かった64%だけを短縮し、遅い尾を一件も短縮しないため、
+既定値は報告症状を解消しない。従来の表示が最大1秒ずれ得た挙動へ寄せるための意図的な既定で、
+速さを求める利用者は値をGOP長まで上げる。7秒以上なら全要求で着地keyframeを採用でき、試算は
+p50 41ms / p90 73ms / 最大83ms、最大ずれ5.69秒だった。
+
+現行実装の正本は [video-architecture.md](video-architecture.md) の `ThumbnailWorker` 節。
+実PTS `BTreeMap`、要求ごとの許容、desktop / marker / Remote の分離、backward seek着地後の
+採用判定、1要求1枚の固定をそこで定める。この文書の§2〜6は計測時点のbaselineとして残す。

@@ -1277,6 +1277,7 @@ impl ThumbnailClient {
         owner: &RemoteSessionIdentity,
         session: u64,
         position_secs: Option<f64>,
+        bar_width_px: Option<f64>,
     ) -> Result<IpcSuccess<VideoStreamThumbnailPayload>, ClientFailure> {
         self.video_request(
             |id| ClientMessage::VideoStreamThumbnail {
@@ -1284,6 +1285,7 @@ impl ThumbnailClient {
                 owner: owner.clone(),
                 session,
                 position_secs,
+                bar_width_px,
             },
             |message| match message {
                 ServerMessage::VideoStreamThumbnail { response, .. } => Some(response),

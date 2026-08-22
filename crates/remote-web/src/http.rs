@@ -1492,6 +1492,8 @@ struct VideoThumbnailBody {
     session: u64,
     #[serde(default)]
     position_secs: Option<f64>,
+    #[serde(default)]
+    bar_width_px: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -1635,11 +1637,25 @@ fn api_video_thumbnail(
             "thumbnail position_secs must be finite and non-negative",
         );
     }
+    if body.position_secs.is_some()
+        && !body
+            .bar_width_px
+            .is_some_and(|width| width.is_finite() && width > 0.0)
+    {
+        return video_request_error_response(
+            400,
+            "stream_bad_request",
+            "thumbnail bar_width_px must be finite and positive",
+        );
+    }
     state.session_activity.note(owner);
     let result = match state.ipc_admission.run(IpcClass::Stream, || {
-        state
-            .thumbnail_client
-            .video_stream_thumbnail(owner, body.session, body.position_secs)
+        state.thumbnail_client.video_stream_thumbnail(
+            owner,
+            body.session,
+            body.position_secs,
+            body.bar_width_px,
+        )
     }) {
         Ok(result) => result,
         Err(busy) => return video_admission_busy_response(busy),
@@ -5519,7 +5535,7 @@ mod tests {
             (
                 Method::Post,
                 "/api/video/thumbnail",
-                r#"{"session":1,"position_secs":12.5}"#,
+                r#"{"session":1,"position_secs":12.5,"bar_width_px":360}"#,
             ),
             (Method::Get, "/api/video/state?session=1", ""),
             (Method::Get, "/api/video/jumps?session=1", ""),

@@ -948,6 +948,7 @@ pub(crate) enum VideoStreamUiRequest {
     Thumbnail {
         session: u64,
         position_secs: Option<f64>,
+        bar_width_px: Option<f64>,
     },
     Stop {
         session: u64,

@@ -46419,7 +46419,11 @@ mod still_window_mode_key_tests {
         );
         assert!(
             !App::native_video_output_event_is_parked_live_hud_click_activation(
-                &Ev::RequestSeekThumbnail { target_secs: 12.0 }
+                &Ev::RequestSeekThumbnail {
+                    target_secs: 12.0,
+                    bar_width_points: 300.0,
+                    pixels_per_point: 2.0,
+                }
             )
         );
         assert!(

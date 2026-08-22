@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 50;
+pub const PROTOCOL_VERSION: u32 = 51;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -2193,6 +2193,7 @@ pub enum ClientMessage {
         owner: RemoteSessionIdentity,
         session: u64,
         position_secs: Option<f64>,
+        bar_width_px: Option<f64>,
     },
     VideoStreamJumpList {
         id: RequestId,
@@ -2673,8 +2674,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v50_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
-        assert_eq!(PROTOCOL_VERSION, 50);
+    fn protocol_v51_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
+        assert_eq!(PROTOCOL_VERSION, 51);
         let expected = ClientMessage::RemoteWebConnectionInfo {
             id: 10,
             info: RemoteWebConnectionInfo {
@@ -2849,8 +2850,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v50_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 50);
+    fn protocol_v51_remote_video_thumbnail_shape_round_trips() {
+        assert_eq!(PROTOCOL_VERSION, 51);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -2877,6 +2878,7 @@ mod tests {
                 owner: test_owner("test-client"),
                 session: 7,
                 position_secs: Some(42.5),
+                bar_width_px: Some(360.0),
             },
             ClientMessage::VideoStreamJumpList {
                 id: 54,

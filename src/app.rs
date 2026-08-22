@@ -8345,6 +8345,7 @@ impl VideoMarkerCachedThumbnail {
     ) -> crate::video::native_presenter::NativeOverlayThumbnail {
         crate::video::native_presenter::NativeOverlayThumbnail {
             target_secs: self.target_secs,
+            match_tolerance_secs: 0.0,
             width: self.width,
             height: self.height,
             rgba: Arc::clone(&self.rgba),

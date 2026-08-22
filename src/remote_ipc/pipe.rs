@@ -1356,11 +1356,13 @@ fn execute_video_stream_request(
             id,
             session: stream_session,
             position_secs,
+            bar_width_px,
             ..
         } => match session.submit_video_stream(
             VideoStreamUiRequest::Thumbnail {
                 session: stream_session,
                 position_secs,
+                bar_width_px,
             },
             operation,
         ) {

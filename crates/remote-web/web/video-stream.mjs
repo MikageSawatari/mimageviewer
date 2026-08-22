@@ -37,7 +37,6 @@ const PLAYLIST_RECOVERY_TIMEOUT_MS = 15000;
 const PLAYLIST_RECOVERY_BACKOFF_BASE_MS = 250;
 const PLAYLIST_RECOVERY_BACKOFF_MAX_MS = 2000;
 const SEEK_THUMBNAIL_POLL_MS = 120;
-const SEEK_THUMBNAIL_MATCH_TOLERANCE_SECS = 1.25;
 const VIDEO_LOOP_BOUNDARY_TOLERANCE_SECS = 0.020;
 const AUDIO_QUALITY_TRAFFIC = Object.freeze({
   minimum: "約 29 MB / 時",
@@ -654,8 +653,7 @@ export function videoUserErrorMessage(error, fallback = "動画を操作でき�
 }
 
 export class VideoSeekPreviewOwner {
-  constructor({ matchToleranceSecs = SEEK_THUMBNAIL_MATCH_TOLERANCE_SECS } = {}) {
-    this.matchToleranceSecs = Math.max(0, Number(matchToleranceSecs) || 0);
+  constructor() {
     this.revision = 0;
     this.state = { kind: "playback" };
   }
@@ -692,8 +690,7 @@ export class VideoSeekPreviewOwner {
     if (
       this.state.kind === "playback" ||
       request?.revision !== this.state.revision ||
-      !Number.isFinite(actual) ||
-      Math.abs(actual - this.state.targetSecs) > this.matchToleranceSecs
+      !Number.isFinite(actual)
     ) {
       return false;
     }
@@ -2916,7 +2913,6 @@ export class VideoStreamViewer {
   activateSeekPreview(request) {
     this.seekThumbnailAbort?.abort();
     this.seekThumbnailAbort = new AbortController();
-    this.clearSeekThumbnailObjectUrl();
     this.renderSeekPreview();
     this.updateProgress();
     if (!this.hasVideo) return request;
@@ -2949,6 +2945,10 @@ export class VideoStreamViewer {
         body: JSON.stringify({
           session: this.session,
           position_secs: request.targetSecs,
+          bar_width_px: Math.max(
+            1,
+            this.seekInput.getBoundingClientRect().width * (window.devicePixelRatio || 1)
+          ),
         }),
         signal: controller.signal,
       });
@@ -2969,7 +2969,11 @@ export class VideoStreamViewer {
         request,
         { actualPtsSecs, objectUrl, width, height }
       )) {
+        const previousObjectUrl = this.seekThumbnailObjectUrl;
         this.seekThumbnailObjectUrl = objectUrl;
+        if (previousObjectUrl && previousObjectUrl !== objectUrl) {
+          URL.revokeObjectURL(previousObjectUrl);
+        }
         this.renderSeekPreview();
         return;
       }
@@ -2992,8 +2996,12 @@ export class VideoStreamViewer {
       this.seekPreviewImage.hidden = false;
       this.seekPreviewLabel.textContent = `移動先 ${formatVideoTime(preview.actualPtsSecs)}`;
     } else {
-      this.seekPreviewImage.hidden = true;
-      this.seekPreviewImage.removeAttribute("src");
+      if (this.seekThumbnailObjectUrl) {
+        this.seekPreviewImage.hidden = false;
+      } else {
+        this.seekPreviewImage.hidden = true;
+        this.seekPreviewImage.removeAttribute("src");
+      }
       this.seekPreviewLabel.textContent = preview.label;
     }
   }

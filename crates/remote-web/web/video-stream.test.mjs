@@ -1144,7 +1144,7 @@ test("video seek pointer maps micro travel to an absolute tap and threshold trav
 });
 
 test("seek preview advances from seeking through decoded thumbnail to playback", () => {
-  const owner = new VideoSeekPreviewOwner({ matchToleranceSecs: 1 });
+  const owner = new VideoSeekPreviewOwner();
   const request = owner.request(42.5);
   assert.equal(owner.current().kind, "seeking");
 
@@ -1242,8 +1242,8 @@ test("playback is never held for a missing seek thumbnail", () => {
   assert.equal(owner.current().kind, "playback");
 });
 
-test("seek drag keeps only the latest thumbnail request and rejects stale or wrong PTS", () => {
-  const owner = new VideoSeekPreviewOwner({ matchToleranceSecs: 0.5 });
+test("seek drag keeps only the latest server-approved thumbnail request", () => {
+  const owner = new VideoSeekPreviewOwner();
   const stale = owner.request(10, "移動先を確認中");
   const latest = owner.request(35, "移動先を確認中");
 
@@ -1253,13 +1253,9 @@ test("seek drag keeps only the latest thumbnail request and rejects stale or wro
   }), false);
   assert.equal(owner.acceptThumbnail(latest, {
     actualPtsSecs: 32,
-    objectUrl: "blob:wrong-position",
-  }), false);
-  assert.equal(owner.acceptThumbnail(latest, {
-    actualPtsSecs: 35.033,
     objectUrl: "blob:latest",
   }), true);
-  assert.equal(owner.current().actualPtsSecs, 35.033);
+  assert.equal(owner.current().actualPtsSecs, 32);
 });
 
 const jsonResponse = (status, body) => new Response(JSON.stringify(body), {

@@ -3804,8 +3804,17 @@ impl App {
             crate::video::NativeVideoOutputEvent::TileColumnsDelta { delta } => {
                 self.adjust_native_video_tile_columns(ctx, fs_idx, delta);
             }
-            crate::video::NativeVideoOutputEvent::RequestSeekThumbnail { target_secs } => {
-                self.handle_native_video_request_seek_thumbnail(fs_idx, target_secs);
+            crate::video::NativeVideoOutputEvent::RequestSeekThumbnail {
+                target_secs,
+                bar_width_points,
+                pixels_per_point,
+            } => {
+                self.handle_native_video_request_seek_thumbnail(
+                    fs_idx,
+                    target_secs,
+                    bar_width_points,
+                    pixels_per_point,
+                );
             }
             crate::video::NativeVideoOutputEvent::ClearSeekThumbnail => {
                 // T35: hover が外れた。pump_native_hover_thumbnail の永久リトライを止める
@@ -5282,18 +5291,28 @@ impl App {
         &mut self,
         fs_idx: usize,
         target_secs: f64,
+        bar_width_points: f64,
+        pixels_per_point: f64,
     ) {
         if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
         let path = match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. })
-                if player.error().is_none()
-                    && player.info().is_some()
-                    && target_secs.is_finite() =>
+                if player.error().is_none() && target_secs.is_finite() =>
             {
+                let Some(info) = player.info() else {
+                    return;
+                };
                 let target_secs = target_secs.max(0.0);
-                player.request_native_hover_thumbnail(target_secs);
+                let tolerance_secs =
+                    crate::video::thumbnail::effective_tolerance_from_physical_pixels(
+                        self.settings.video_seek_thumbnail_tolerance_secs,
+                        info.duration_secs,
+                        bar_width_points,
+                        pixels_per_point,
+                    );
+                player.request_native_hover_thumbnail(target_secs, tolerance_secs);
                 Some(player.path().clone())
             }
             _ => None,
@@ -5443,9 +5462,10 @@ impl App {
                  save_target: MarkerThumbSaveTarget|
                  -> Option<crate::video::native_presenter::NativeOverlayThumbnail> {
                     if refresh_cached || cached.is_none() {
-                        if let Some(thumb) = player.nearest_seek_thumbnail(pts_secs) {
+                        if let Some(thumb) = player.nearest_seek_thumbnail(pts_secs, 0.0) {
                             let native = crate::video::native_presenter::NativeOverlayThumbnail {
                                 target_secs: thumb.target_secs,
+                                match_tolerance_secs: 0.0,
                                 width: thumb.width,
                                 height: thumb.height,
                                 rgba: thumb.rgba,
@@ -6923,8 +6943,8 @@ impl App {
                     let thumb = if preencoded_webp.is_some() {
                         None
                     } else {
-                        player.request_seek_thumbnail(pts);
-                        player.nearest_seek_thumbnail(pts)
+                        player.request_seek_thumbnail(pts, 0.0);
+                        player.nearest_seek_thumbnail(pts, 0.0)
                     };
                     Some((player.path().clone(), pts, thumb))
                 }
@@ -7050,9 +7070,9 @@ impl App {
         // request を drop していた場合の保険)。
         let thumb =
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&pending.fs_idx) {
-                let t = player.nearest_seek_thumbnail(pending.pts);
+                let t = player.nearest_seek_thumbnail(pending.pts, 0.0);
                 if t.is_none() {
-                    player.request_seek_thumbnail(pending.pts);
+                    player.request_seek_thumbnail(pending.pts, 0.0);
                     // worker が動くまで次フレームで repaint させる
                     ctx.request_repaint_after(std::time::Duration::from_millis(80));
                 }

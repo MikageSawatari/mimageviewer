@@ -445,9 +445,9 @@ HLS のライブウィンドウ (直近 60 秒) 内は `<video>` 上で完結す
 4. 新 generation は実時間 clock を待たず、ring 上限まで先行生成する
 
 シークバーのドラッグ開始から、中央表示は `シーク中` (ドラッグ中は `移動先を確認中`)
-→実際にデコードできた seek thumbnail→再生、の順で遷移する。thumbnail は既存
-`VideoPlayer` の latest-wins `ThumbnailWorker` を使い、応答の実 frame PTS が現在の要求位置に
-合う場合だけ表示する。新しいドラッグ位置は古い取得を中止して置き換える。`playing` が先に
+→実際に取得できた seek thumbnail→再生、の順で遷移する。thumbnail は既存
+`VideoPlayer` の latest-wins `ThumbnailWorker` を使い、端末のシークバー物理幅から求めた
+要求ごとの許容内に応答の実 frame PTS がある場合だけ表示する。新しいドラッグ位置は古い取得を中止して置き換える。`playing` が先に
 到着した場合は thumbnail を待たずに破棄し、配信 readiness や generation switch の条件には
 thumbnail を含めない。
 
@@ -503,7 +503,7 @@ thumbnail を含めない。
 | `POST /api/video/start` | `{fav, path, quality}` → `{session, generation, playlist, duration_secs, source_origin_secs, buffer_target_secs, codec, encoder, end_behavior}` |
 | `POST /api/video/control` | `{session, action: play\|pause\|volume\|quality}`。quality は端末の `position_secs` も送る |
 | `POST /api/video/seek` | `{session, position_secs}` → 新 `generation` と `playlist` |
-| `POST /api/video/thumbnail` | `{session, position_secs}`。実 frame PTS 付き WebP、生成中は 202、`null` は要求解除 |
+| `POST /api/video/thumbnail` | `{session, position_secs, bar_width_px}`。`bar_width_px` は端末の物理 px 幅。実 frame PTS 付き WebP、生成中は 202、`position_secs: null` は要求解除 |
 | `GET /api/video/state` | generation、source origin、生成済み/ring 範囲、尺、先読み目標、実効ビットレート、終端、再生 intent。実 playhead は返さない |
 | `POST /api/video/stop` | セッション終了。本体はストリーミングを止める |
 | `GET /stream/<session>/<gen>/index.m3u8` | CODECS を宣言する Master Playlist |
@@ -529,7 +529,7 @@ thumbnail を含めない。
   segmenter の typed `None` を保持して HTTP 503 または上限付き wait へ写像し、200 では
   必ず非空の init、または init と最初の media segment を参照できる playlist を返す
 
-### 6.2 IPC (動画 API v15、timeout v17、thumbnail v18、時計なし v19、終端 v20、VST 状態 v21、audio-only v39)
+### 6.2 IPC (動画 API v15、timeout v17、thumbnail v18、時計なし v19、終端 v20、VST 状態 v21、audio-only v39、seek preview 幅 v51)
 
 既存の長寿命 duplex 多重化接続 ([web-remote-plan.md](web-remote-plan.md) §9.5-9.6) に
 `ClientMessage` / `ServerMessage` の variant を追加する。**セグメントは pull 型**とし、
@@ -541,7 +541,7 @@ remote-web が HTTP 要求を受けた時に取りに行く。push 型の非同�
 | `VideoStreamStart { address, quality }` | `{ session, generation, duration_secs, source_origin_secs, buffer_target_secs, has_video, encoder, video_size, audio_processing, end_behavior }` |
 | `VideoStreamControl { session, action }` | `SessionStatus` |
 | `VideoStreamSeek { session, position_secs }` | `{ generation }` |
-| `VideoStreamThumbnail { session, position_secs }` | `Pending` / 実 frame PTS + WebP / `Cleared` |
+| `VideoStreamThumbnail { session, position_secs, bar_width_px }` | `Pending` / 実 frame PTS + WebP / `Cleared`。要求時は端末の物理 bar 幅を渡す |
 | `VideoStreamPlaylist { session, generation, kind }` | master / media m3u8 本文 |
 | `VideoStreamSegment { session, generation, index }` | セグメントのバイト列 / `NotFound` / `Gone` |
 | `VideoStreamState { session }` | generation/source origin、生成済み/ring 範囲、先読み目標、終端、再生 intent、バッファ/ビットレート実績、最新の `audio_processing` |
@@ -917,6 +917,15 @@ guard で、動画処理開始後の timeout 9 個には数えない。
   単独所有する。range `input` は AbortController で旧 request を捨て、常に最新位置だけを poll する
 - thumbnail の要求位置ではなく応答 header の実 frame PTS を照合・表示する。thumbnail 未到着でも
   `<video>` の `playing` を受けた時点で preview を終了し、通常再生を即座に前面へ戻す
+
+#### seek preview 許容値 (protocol v51、2026-08-22)
+
+- Web は range input の CSS 幅に `devicePixelRatio` を掛けた `bar_width_px` を HTTP / IPC へ渡す。
+  本体は動画尺とこの物理幅から 1 px 相当の秒数を求め、desktop と同じ設定値との大きい方を
+  `VideoPlayer` の要求ごとの許容として使う
+- cache key は実 frame PTS なので、Remote の粗い許容で作られた画像は desktop や marker の
+  狭い要求を満たさない。protocol v51 は `VideoStreamThumbnail` だけに optional
+  `bar_width_px` を加え、解除要求では `position_secs` / `bar_width_px` をともに null とする
 
 ---
 

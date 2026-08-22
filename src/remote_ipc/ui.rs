@@ -1528,7 +1528,8 @@ impl crate::app::App {
             VideoStreamUiRequest::Thumbnail {
                 session,
                 position_secs,
-            } => self.apply_remote_video_thumbnail(session, position_secs),
+                bar_width_px,
+            } => self.apply_remote_video_thumbnail(session, position_secs, bar_width_px),
             VideoStreamUiRequest::Stop { .. } => unreachable!("stop is handled before ownership"),
         };
         pending.complete(outcome);
@@ -1703,6 +1704,7 @@ impl crate::app::App {
         &mut self,
         session: u64,
         position_secs: Option<f64>,
+        bar_width_px: Option<f64>,
     ) -> VideoStreamUiOutcome {
         let Some(streaming) = self.take_remote_video_streaming() else {
             return video_stream_session_mismatch();
@@ -1713,14 +1715,33 @@ impl crate::app::App {
             return video_stream_session_mismatch();
         }
         let outcome = if let Some(position_secs) = position_secs {
+            let Some(bar_width_px) = bar_width_px else {
+                self.remote_session_ui.video_stream =
+                    Some(AppRemoteVideoStreamState::Streaming(streaming));
+                return video_stream_ui_failure("invalid remote thumbnail bar width".to_owned());
+            };
+            let duration_secs = streaming
+                .player
+                .info()
+                .map(|info| info.duration_secs)
+                .unwrap_or(0.0);
+            let tolerance_secs = crate::video::thumbnail::effective_tolerance_from_physical_pixels(
+                self.settings.video_seek_thumbnail_tolerance_secs,
+                duration_secs,
+                bar_width_px,
+                1.0,
+            );
             match streaming
                 .player
-                .request_remote_seek_thumbnail(position_secs)
+                .request_remote_seek_thumbnail(position_secs, tolerance_secs)
             {
-                Some(target_secs) => streaming.player.nearest_seek_thumbnail(target_secs).map_or(
-                    VideoStreamUiOutcome::ThumbnailPending,
-                    VideoStreamUiOutcome::ThumbnailReady,
-                ),
+                Some(target_secs) => streaming
+                    .player
+                    .nearest_seek_thumbnail(target_secs, tolerance_secs)
+                    .map_or(
+                        VideoStreamUiOutcome::ThumbnailPending,
+                        VideoStreamUiOutcome::ThumbnailReady,
+                    ),
                 None => video_stream_ui_failure("invalid remote thumbnail position".to_owned()),
             }
         } else {

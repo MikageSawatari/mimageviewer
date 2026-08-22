@@ -6093,6 +6093,30 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
             });
         });
 
+        ui.add_space(8.0);
+        anchored(ui, state, "video/seek-thumbnail-tolerance", |ui, state| {
+            let s = &mut state.settings;
+            ui.horizontal(|ui| {
+                ui.label("シーク時のズレ許容 (秒)");
+                ui.add(
+                    egui::DragValue::new(&mut s.video_seek_thumbnail_tolerance_secs)
+                        .range(
+                            crate::settings::VIDEO_SEEK_THUMBNAIL_TOLERANCE_MIN_SECS
+                                ..=crate::settings::VIDEO_SEEK_THUMBNAIL_TOLERANCE_MAX_SECS,
+                        )
+                        .speed(0.1)
+                        .fixed_decimals(1),
+                );
+            });
+            ui.label(
+                egui::RichText::new(
+                    "大きいほどシークバーのプレビューが早く表示されます。0.0 は位置の正確さを優先します。\n\
+                     大きめの値で構いません。迷ったら大きめにしてください。値を上げても、実際のズレはその動画で利用できる近い画像までに限られます。",
+                )
+                .small(),
+            );
+        });
+
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(8.0);
