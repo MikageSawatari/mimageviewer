@@ -454,6 +454,30 @@ keymap、prepare / commit 切替、typed fallback と基礎計装まで実装済
 
 ---
 
+## 10.5 master の §1.101 (上下バー固定) と共有する seam — マージ前に必ず解決する
+
+**表示矩形を決める場所が 2 つある。** Phase A は swap chain を表示矩形の物理ピクセル
+サイズにするため、[surface_policy.rs](../src/video/native_presenter/surface_policy.rs) の
+`decide_video_surface_size` が表示矩形を自前で求めている (VST の `compact` は viewport を
+縦横 1/2 にする形で `compute_video_visual_transform` 側の 1/4 領域規則を写している)。
+
+master 側の §1.101 改訂 2 は「バーの領域を確保して映像をその手前までフィットさせる」方針で、
+[briefs/video-hud-pinning.md](briefs/video-hud-pinning.md) §3.2 が
+`compute_video_visual_transform` の `(target_x, target_y, target_w, target_h)` を同じ seam として
+名指ししている。
+
+**片方だけをマージすると静かに壊れる。** バー領域の確保が `compute_video_visual_transform`
+側だけに入ると、映像は縮んだ矩形へフィットする一方、サーフェスはバー領域を含んだ大きさで
+作られる。シェーダが解決する解像度が実際の表示サイズとずれ、Phase A の利点が消える
+(無駄に大きく作って DComp が縮める)。テキスト競合は起きないので、マージだけでは気付けない。
+
+**解決方針**: フィット矩形の計算を 1 本の関数に切り出し、`compute_video_visual_transform` と
+`decide_video_surface_size` の両方がそれを読む。どちらのブランチで切り出すかは利用者判断
+(2026-08-22 時点で未決)。Phase A 側で先に切り出すと §1.101 の作業中の seam を外から動かす
+ことになるため、**master 側の §1.101 実装で切り出すのが安い**。
+
+---
+
 ## 11. 未決事項
 
 - 予算プリセットの数値 (20/40/60%) — 実測後に決める
