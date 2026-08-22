@@ -138,6 +138,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["表示順", "フォルダ", "画像", "動画", "アーカイブ"]
     ),
     entry!(
+        "thumbnail/video-indicator",
+        Thumbnail,
+        "動画サムネイルの目印",
+        ["再生アイコン", "左下バッジ", "非表示"]
+    ),
+    entry!(
         "thumbnail/idle-upgrade",
         Thumbnail,
         "アイドル時にキャッシュ由来のサムネイルを高画質化する",
@@ -561,8 +567,8 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     entry!(
         "spread/bar-gap",
         SpreadMode,
-        "固定バーと画像の間隔",
-        ["余白", "gap", "px"]
+        "固定バーと表示内容の間隔",
+        ["画像", "映像", "余白", "gap", "px"]
     ),
     entry!(
         "spread/page-number",
@@ -715,6 +721,19 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         Video,
         "デインターレース",
         ["インターレース", "横縞", "bwdif"]
+    ),
+    entry!(
+        "video/bar-visibility",
+        Video,
+        "再生画面のバー",
+        [
+            "上部情報バー",
+            "下部シークバー",
+            "固定表示",
+            "鍵",
+            "領域を確保",
+            "余白"
+        ]
     ),
     entry!("video/loop", Video, "ループ再生:", ["繰り返し", "loop"]),
     entry!(

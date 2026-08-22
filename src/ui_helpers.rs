@@ -1140,17 +1140,29 @@ pub fn draw_rating_stars(ui: &mut egui::Ui, current: u8) -> Option<u8> {
     result
 }
 
-/// Draw a pre-laid-out ZIP/PDF/converted-archive format badge.
+/// Background color for a typed format badge.
+///
+/// Keep this mapping independent from the displayed label: archive labels are extensible and the
+/// fixed video label is a media-type marker rather than an extension.
+pub fn format_badge_background(
+    kind: crate::thumb_overlay_layout::FormatBadgeKind,
+) -> egui::Color32 {
+    use crate::thumb_overlay_layout::FormatBadgeKind;
+    match kind {
+        FormatBadgeKind::Zip => egui::Color32::from_rgba_unmultiplied(30, 80, 160, 200),
+        FormatBadgeKind::Pdf => egui::Color32::from_rgba_unmultiplied(180, 30, 30, 200),
+        FormatBadgeKind::Archive => egui::Color32::from_rgba_unmultiplied(200, 110, 20, 200),
+        FormatBadgeKind::Video => egui::Color32::from_rgba_unmultiplied(20, 135, 145, 200),
+    }
+}
+
+/// Draw a pre-laid-out ZIP/PDF/converted-archive/video format badge.
 pub fn draw_overlay_format_badge(
     painter: &egui::Painter,
     placement: &crate::thumb_overlay_layout::BadgePlacement,
+    kind: crate::thumb_overlay_layout::FormatBadgeKind,
 ) {
-    let bg = match placement.text.as_str() {
-        "ZIP" => egui::Color32::from_rgba_unmultiplied(30, 80, 160, 200),
-        "PDF" => egui::Color32::from_rgba_unmultiplied(180, 30, 30, 200),
-        _ => egui::Color32::from_rgba_unmultiplied(200, 110, 20, 200),
-    };
-    painter.rect_filled(placement.rect, 3.0, bg);
+    painter.rect_filled(placement.rect, 3.0, format_badge_background(kind));
     draw_badge_text(painter, placement, egui::Color32::WHITE);
 }
 
@@ -1835,6 +1847,32 @@ pub fn draw_centered_elided_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_format_badge_colors_preserve_archives_and_distinguish_video() {
+        use crate::thumb_overlay_layout::FormatBadgeKind;
+
+        assert_eq!(
+            format_badge_background(FormatBadgeKind::Zip),
+            egui::Color32::from_rgba_unmultiplied(30, 80, 160, 200)
+        );
+        assert_eq!(
+            format_badge_background(FormatBadgeKind::Pdf),
+            egui::Color32::from_rgba_unmultiplied(180, 30, 30, 200)
+        );
+        assert_eq!(
+            format_badge_background(FormatBadgeKind::Archive),
+            egui::Color32::from_rgba_unmultiplied(200, 110, 20, 200)
+        );
+        assert_ne!(
+            format_badge_background(FormatBadgeKind::Video),
+            format_badge_background(FormatBadgeKind::Archive)
+        );
+        assert_eq!(
+            format_badge_background(FormatBadgeKind::Video),
+            egui::Color32::from_rgba_unmultiplied(20, 135, 145, 200)
+        );
+    }
 
     fn begin_wheel_pass(ctx: &egui::Context, modifiers: egui::Modifiers) {
         ctx.begin_pass(egui::RawInput {

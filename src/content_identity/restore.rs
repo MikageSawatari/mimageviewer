@@ -26,6 +26,10 @@ pub(crate) struct RestorePresence {
     pub(crate) conceals: BTreeSet<String>,
     pub(crate) local_adjustments: BTreeSet<String>,
     pub(crate) comics: BTreeSet<String>,
+    pub(crate) rotations: BTreeSet<String>,
+    /// Destination page keys with any restored sidecar-backed edit. The UI uses this union to
+    /// evict only thumbnails that may have materialized the pre-restore edit-preview state.
+    pub(crate) page_edits: BTreeSet<String>,
 }
 
 #[derive(Default)]
@@ -455,10 +459,28 @@ fn load_restore_runtime_updates(
             Ok(())
         },
     )?;
+    let mut rotations = BTreeSet::new();
+    database_opens += query_family_rows(
+        data_dir,
+        "rotation.db",
+        "rotations",
+        "path",
+        "angle",
+        &families,
+        |row| {
+            let key: String = row.get(0).map_err(|error| error.to_string())?;
+            rotations.insert(key);
+            Ok(())
+        },
+    )?;
 
-    let mut presence = RestorePresence::default();
+    let mut presence = RestorePresence {
+        rotations,
+        ..RestorePresence::default()
+    };
     let mut mirrors = Vec::new();
     for (key, entry) in states {
+        presence.page_edits.insert(key.clone());
         if entry.adjust.is_some() {
             presence.adjusted.insert(key.clone());
         }
@@ -527,6 +549,7 @@ mod tests {
     use crate::content_identity::{
         ContentIdentitySource, ObservationRole, RecordedFileState, stage0_target,
     };
+    use comic_core::{AnnotationObject, TextBlock};
 
     fn candidate(
         source_path: PathBuf,
@@ -608,6 +631,10 @@ mod tests {
                     max_y REAL, aspect_mode TEXT, source_width INTEGER,
                     source_height INTEGER)"
                 }
+                "rotations" => {
+                    "CREATE TABLE IF NOT EXISTS rotations (
+                    path TEXT PRIMARY KEY, angle INTEGER NOT NULL DEFAULT 0)"
+                }
                 "reading_history" => {
                     "CREATE TABLE IF NOT EXISTS reading_history (
                     key TEXT PRIMARY KEY, path TEXT NOT NULL)"
@@ -623,6 +650,17 @@ mod tests {
             };
             connection.execute_batch(sql).unwrap();
         }
+    }
+
+    fn sample_comic_objects() -> Vec<AnnotationObject> {
+        vec![AnnotationObject::new_text(
+            1,
+            (10.0, 20.0),
+            TextBlock {
+                text: "restored annotation".to_string(),
+                ..TextBlock::default()
+            },
+        )]
     }
 
     fn measure_batch_database_opens(candidate_count: usize) -> usize {
@@ -680,7 +718,7 @@ mod tests {
         let one = measure_batch_database_opens(1);
         let hundred = measure_batch_database_opens(100);
 
-        assert_eq!(one, 28, "21 store copy + 1 origin batch + 6 runtime reads");
+        assert_eq!(one, 29, "21 store copy + 1 origin batch + 7 runtime reads");
         assert_eq!(hundred, one, "DB open 回数を候補数に比例させない");
     }
 
@@ -902,6 +940,102 @@ mod tests {
                 .unwrap()
                 .join(crate::sidecar::SIDECAR_FILENAME)
                 .exists()
+        );
+    }
+
+    #[test]
+    fn restore_reloads_stale_empty_comic_doc_and_followup_save_preserves_row() {
+        let data = tempfile::tempdir().unwrap();
+        let source_path = data.path().join("origin.png");
+        let target_path = data.path().join("target.png");
+        std::fs::write(&source_path, b"same bytes").unwrap();
+        std::fs::write(&target_path, b"same bytes").unwrap();
+        let source_key = crate::path_key::normalize_keep_drive(&source_path);
+        let target_key = crate::path_key::normalize_keep_drive(&target_path);
+        let source_metadata = std::fs::metadata(&source_path).unwrap();
+        let target_metadata = std::fs::metadata(&target_path).unwrap();
+
+        let identity =
+            ContentIdentityDb::open_at(&data.path().join("content_identity.db")).unwrap();
+        identity
+            .upsert(
+                &ContentIdentitySource::new(&source_path, ContentKind::Image),
+                &RecordedFileState {
+                    file_key: source_key.clone(),
+                    size: source_metadata.len(),
+                    hashed_mtime: metadata_mtime(&source_metadata).unwrap(),
+                },
+                "head",
+                "full",
+                10,
+                ObservationRole::RestorableContent,
+            )
+            .unwrap();
+        identity
+            .upsert(
+                &ContentIdentitySource::new(&target_path, ContentKind::Image),
+                &RecordedFileState {
+                    file_key: target_key.clone(),
+                    size: target_metadata.len(),
+                    hashed_mtime: metadata_mtime(&target_metadata).unwrap(),
+                },
+                "head",
+                "full",
+                0,
+                ObservationRole::DetectionCache,
+            )
+            .unwrap();
+        drop(identity);
+
+        let objects = sample_comic_objects();
+        crate::comic_db::ComicDb::open_at(&data.path().join("comic.db"))
+            .unwrap()
+            .set(&source_key, &objects)
+            .unwrap();
+        crate::rotation_db::RotationDb::open_at(&data.path().join("rotation.db"))
+            .unwrap()
+            .set_key(&source_key, crate::rotation_db::Rotation::Cw90)
+            .unwrap();
+
+        let mut app = crate::app::setup_app_for_test();
+        app.comic_db =
+            Some(crate::comic_db::ComicDb::open_at(&data.path().join("comic.db")).unwrap());
+        app.rotation_db = Some(
+            crate::rotation_db::RotationDb::open_at(&data.path().join("rotation.db")).unwrap(),
+        );
+        app.items = vec![crate::grid_item::GridItem::Image(target_path.clone())];
+        app.comic_docs.insert(target_key.clone(), Vec::new());
+        app.rotation_cache
+            .insert(0, crate::rotation_db::Rotation::None);
+
+        let (candidate, source) = candidate(source_path, target_path, ContentKind::Image, "full");
+        let report = restore_candidates_at(
+            data.path(),
+            &[SelectedRestore { candidate, source }],
+            &[],
+            false,
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(app.comic_docs.get(&target_key), Some(&Vec::new()));
+        assert!(report.presence.comics.contains(&target_key));
+        assert!(report.presence.rotations.contains(&target_key));
+
+        app.apply_content_restore_presence(report.presence);
+        app.finish_content_identity_restore(report.errors);
+
+        assert!(
+            !app.comic_docs.contains_key(&target_key),
+            "restore completion must return the stale empty sentinel to the unread state"
+        );
+        app.ensure_comic_doc_loaded(&target_key);
+        let loaded = app.comic_docs.get(&target_key).cloned().unwrap();
+        assert_eq!(loaded, objects);
+        assert_eq!(app.get_rotation(0), crate::rotation_db::Rotation::Cw90);
+
+        app.save_comic_objects(0, &target_key, &loaded);
+        assert_eq!(
+            app.comic_db.as_ref().unwrap().get(&target_key),
+            Some(objects)
         );
     }
 

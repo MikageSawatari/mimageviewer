@@ -155,6 +155,8 @@ pub(crate) use folder_scan::{
     ScannedDir, materialize_local_folder_listing, scan_directory_with_convertible_archives,
     scan_directory_with_settings, signature_from_scan,
 };
+#[doc(hidden)]
+pub use grid_paint::draw_video_thumbnail_indicator_snapshot_fixture;
 pub(crate) use grid_paint::{
     draw_cell, draw_spread_pair_cursor, grid_tag_badge_hit_rect, layout_cell_overlays,
     primary_grid_tag_for_badge, tq_draw_preview,
@@ -6390,9 +6392,102 @@ pub(crate) struct EditResultEntry {
     pub(crate) texture: Option<egui::TextureHandle>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditPreviewCloseOutcome {
+    DeleteNoEdits,
+    DeleteEditResultNotResident {
+        /// A matching downstream cache, job, failure, or drop record proves that this exact edit
+        /// generation existed even though its direct `edit_result_cache` entry is no longer
+        /// resident. `false` means only that no such evidence remains; it does not prove that the
+        /// generation never completed.
+        edit_result_generation_observed: bool,
+    },
+    DeleteComicFontsUnavailable,
+    Save,
+}
+
+impl EditPreviewCloseOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DeleteNoEdits => "delete_no_edits",
+            Self::DeleteEditResultNotResident { .. } => "delete_edit_result_not_resident",
+            Self::DeleteComicFontsUnavailable => "delete_comic_fonts_unavailable",
+            Self::Save => "save",
+        }
+    }
+
+    fn edit_result_generation_observed(self) -> Option<bool> {
+        match self {
+            Self::DeleteNoEdits => None,
+            Self::DeleteEditResultNotResident {
+                edit_result_generation_observed,
+            } => Some(edit_result_generation_observed),
+            Self::DeleteComicFontsUnavailable | Self::Save => Some(true),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EditPreviewClosePageState {
+    has_source_edits: bool,
+    has_annotations: bool,
+    has_crop: bool,
+}
+
+struct EditPreviewCloseObservation {
+    outcome: EditPreviewCloseOutcome,
+    item_key: String,
+    page: EditPreviewClosePageState,
+}
+
+impl EditPreviewCloseObservation {
+    fn emit(&self, input_seq: u64) {
+        let generation_observed = self
+            .outcome
+            .edit_result_generation_observed()
+            .map_or_else(|| "n/a".to_string(), |observed| observed.to_string());
+        crate::logger::log(format!(
+            "edit_preview_close: outcome={} item_key={:?} has_source_edits={} \
+             has_annotations={} has_crop={} edit_result_generation_observed={}",
+            self.outcome.as_str(),
+            self.item_key,
+            self.page.has_source_edits,
+            self.page.has_annotations,
+            self.page.has_crop,
+            generation_observed,
+        ));
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "edit_preview",
+                "close_outcome",
+                Some(&self.item_key),
+                input_seq,
+                &[
+                    ("outcome", serde_json::Value::from(self.outcome.as_str())),
+                    (
+                        "has_source_edits",
+                        serde_json::Value::from(self.page.has_source_edits),
+                    ),
+                    (
+                        "has_annotations",
+                        serde_json::Value::from(self.page.has_annotations),
+                    ),
+                    ("has_crop", serde_json::Value::from(self.page.has_crop)),
+                    (
+                        "edit_result_generation_observed",
+                        self.outcome
+                            .edit_result_generation_observed()
+                            .map_or(serde_json::Value::Null, serde_json::Value::from),
+                    ),
+                ],
+            );
+        }
+    }
+}
+
 enum EditPreviewCloseUpdate {
     Save {
-        item_key: String,
+        observation: EditPreviewCloseObservation,
         source_mtime: i64,
         source_size: i64,
         source_container_path: Option<PathBuf>,
@@ -6401,7 +6496,7 @@ enum EditPreviewCloseUpdate {
         crop: Option<crate::export_crop::CropRect>,
     },
     DeleteIfPresent {
-        item_key: String,
+        observation: EditPreviewCloseObservation,
     },
 }
 
@@ -31474,6 +31569,13 @@ impl App {
 
     fn finish_book_page_edit_mapping(&mut self, op: &str, errors: Vec<String>) {
         self.clear_page_edit_state();
+        self.finish_book_page_edit_mapping_after_idx_refresh(op, errors);
+    }
+
+    /// idx-keyed page edit state を caller が clear / rehydrate 済みのときに使う共通終端。
+    /// content-identity restore は現在の物理フォルダを DB から rehydrate するため、
+    /// clear 固定の `finish_book_page_edit_mapping` ではなくこちらへ合流する。
+    fn finish_book_page_edit_mapping_after_idx_refresh(&mut self, op: &str, errors: Vec<String>) {
         self.rating_cache.clear();
         self.invalidate_rating_counts_cache();
         self.clear_tags_cache();
@@ -53965,6 +54067,45 @@ impl App {
         }
     }
 
+    /// Whether anything downstream proves that this exact edit generation was materialized.
+    ///
+    /// The direct `edit_result_cache` lookup has already missed when this is called. A matching
+    /// downstream value can only have been created from that edit result, so it distinguishes a
+    /// non-resident direct entry from a generation that may still be waiting for its source
+    /// layers. Absence is deliberately reported as absence of evidence, not as proof that the
+    /// generation never completed.
+    fn edit_result_generation_observed_downstream(&self, edit_key: EditResultKey) -> bool {
+        self.final_ai_cache
+            .keys()
+            .any(|key| key.edit_key == edit_key)
+            || self
+                .final_ai_pending
+                .keys()
+                .any(|key| key.edit_key == edit_key)
+            || self
+                .final_ai_failed
+                .iter()
+                .any(|key| key.edit_key == edit_key)
+            || self
+                .final_composite_cache
+                .keys()
+                .any(|key| key.edit_key == edit_key)
+            || self
+                .final_composite_cache
+                .dropped
+                .dropped_complete
+                .keys()
+                .any(|key| key.edit_key == edit_key)
+            || self
+                .final_effect_pending
+                .keys()
+                .any(|key| key.edit_key == edit_key)
+            || self
+                .colorize_mono_summary_cache
+                .values()
+                .any(|summary| summary.edit_key == edit_key)
+    }
+
     fn snapshot_edit_preview_close_update(&mut self, idx: usize) -> Option<EditPreviewCloseUpdate> {
         if !self.settings.edit_preview_cache_enabled || self.edit_preview_cache.is_none() {
             return None;
@@ -53991,15 +54132,36 @@ impl App {
             .filter(|objects| !objects.is_empty())
             .cloned();
         let has_annotations = annotation_objects.is_some();
+        let page = EditPreviewClosePageState {
+            has_source_edits,
+            has_annotations,
+            has_crop,
+        };
         if !has_source_edits && !has_annotations && !has_crop {
-            return Some(EditPreviewCloseUpdate::DeleteIfPresent { item_key });
+            return Some(EditPreviewCloseUpdate::DeleteIfPresent {
+                observation: EditPreviewCloseObservation {
+                    outcome: EditPreviewCloseOutcome::DeleteNoEdits,
+                    item_key,
+                    page,
+                },
+            });
         }
 
         let edit_key = self.current_edit_result_key(idx);
         let Some(entry) = self.edit_result_cache.get(&edit_key) else {
             // 最新世代がまだ完成していない場合、古いプレビューを表示する方が危険。
             // 今回は削除し、次に完成結果を表示して閉じた時に再生成する。
-            return Some(EditPreviewCloseUpdate::DeleteIfPresent { item_key });
+            let edit_result_generation_observed =
+                self.edit_result_generation_observed_downstream(edit_key);
+            return Some(EditPreviewCloseUpdate::DeleteIfPresent {
+                observation: EditPreviewCloseObservation {
+                    outcome: EditPreviewCloseOutcome::DeleteEditResultNotResident {
+                        edit_result_generation_observed,
+                    },
+                    item_key,
+                    page,
+                },
+            });
         };
         let pixels = Arc::clone(&entry.pixels);
         let crop = self.export_crop_rect_for_pixels(idx, pixels.size);
@@ -54008,7 +54170,13 @@ impl App {
             // navigation 境界で新しいフォント列挙やファイル読み込みを同期実行しない。
             let Some(fonts) = self.comic_fonts.clone() else {
                 // 注釈を欠いたプレビューで旧結果を上書きしない。
-                return Some(EditPreviewCloseUpdate::DeleteIfPresent { item_key });
+                return Some(EditPreviewCloseUpdate::DeleteIfPresent {
+                    observation: EditPreviewCloseObservation {
+                        outcome: EditPreviewCloseOutcome::DeleteComicFontsUnavailable,
+                        item_key,
+                        page,
+                    },
+                });
             };
             let (source_w, source_h) = self
                 .source_dims_for_idx(idx)
@@ -54026,7 +54194,11 @@ impl App {
             None
         };
         Some(EditPreviewCloseUpdate::Save {
-            item_key,
+            observation: EditPreviewCloseObservation {
+                outcome: EditPreviewCloseOutcome::Save,
+                item_key,
+                page,
+            },
             source_mtime,
             source_size,
             source_container_path,
@@ -54042,26 +54214,30 @@ impl App {
         };
         match update {
             EditPreviewCloseUpdate::Save {
-                item_key,
+                observation,
                 source_mtime,
                 source_size,
                 source_container_path,
                 pixels,
                 annotations,
                 crop,
-            } => service.save(
-                item_key,
-                source_mtime,
-                source_size,
-                source_container_path,
-                pixels,
-                annotations,
-                crop,
-                self.settings.edit_preview_cache_max_bytes.max(1_000_000),
-                self.edit_preview_repaint_ctx.clone(),
-            ),
-            EditPreviewCloseUpdate::DeleteIfPresent { item_key } => {
-                service.delete_if_present(item_key)
+            } => {
+                observation.emit(self.input_seq);
+                service.save(
+                    observation.item_key,
+                    source_mtime,
+                    source_size,
+                    source_container_path,
+                    pixels,
+                    annotations,
+                    crop,
+                    self.settings.edit_preview_cache_max_bytes.max(1_000_000),
+                    self.edit_preview_repaint_ctx.clone(),
+                )
+            }
+            EditPreviewCloseUpdate::DeleteIfPresent { observation } => {
+                observation.emit(self.input_seq);
+                service.delete_if_present(observation.item_key)
             }
         }
     }

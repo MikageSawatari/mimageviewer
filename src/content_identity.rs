@@ -1355,12 +1355,11 @@ fn detect_target_with_opener<R: Read + Seek>(
         return Ok(None);
     }
 
-    let (_head_hash, full_hash, mut matching, update) = if let Some(cached) =
-        cached.filter(|entry| {
-            entry.size == state.size
-                && entry.hashed_mtime == state.hashed_mtime
-                && entry.full_hash.is_some()
-        }) {
+    let (_head_hash, full_hash, matching, update) = if let Some(cached) = cached.filter(|entry| {
+        entry.size == state.size
+            && entry.hashed_mtime == state.hashed_mtime
+            && entry.full_hash.is_some()
+    }) {
         let full_hash = cached
             .full_hash
             .clone()
@@ -1407,8 +1406,6 @@ fn detect_target_with_opener<R: Read + Seek>(
     if matching.is_empty() {
         return Ok(Some((None, update)));
     }
-    sort_origins(&mut matching);
-
     let declined = db.restore_was_declined(&full_hash, &target.file_key)?;
     let candidate = if declined {
         None
@@ -1428,6 +1425,7 @@ fn detect_target_with_opener<R: Read + Seek>(
                 source_exists,
             });
         }
+        sort_restore_sources(&mut sources);
         Some(RestoreCandidate {
             target_key: target.file_key,
             target_path: target.source.path,
@@ -1449,17 +1447,13 @@ fn matching_origins(origins: &[LedgerEntry], head_hash: &str, full_hash: &str) -
         .collect()
 }
 
-fn sort_origins(origins: &mut [LedgerEntry]) {
-    origins.sort_by(
-        |left, right| match (left.last_edit_at == 0, right.last_edit_at == 0) {
-            (false, true) => std::cmp::Ordering::Less,
-            (true, false) => std::cmp::Ordering::Greater,
-            _ => right
-                .last_edit_at
-                .cmp(&left.last_edit_at)
-                .then_with(|| left.file_key.cmp(&right.file_key)),
-        },
-    );
+pub(crate) fn sort_restore_sources(sources: &mut [RestoreSourceCandidate]) {
+    sources.sort_by(|left, right| {
+        right
+            .last_edit_at
+            .cmp(&left.last_edit_at)
+            .then_with(|| left.file_key.cmp(&right.file_key))
+    });
 }
 
 fn run_worker(
@@ -2430,23 +2424,59 @@ mod tests {
         assert_eq!(entry.full_hash.as_deref(), Some("full-new"));
     }
 
+    fn restore_source(file_key: &str, last_edit_at: i64) -> RestoreSourceCandidate {
+        RestoreSourceCandidate {
+            file_key: file_key.to_string(),
+            path: PathBuf::from(file_key),
+            kind: ContentKind::Image,
+            last_edit_at,
+            source_exists: true,
+        }
+    }
+
     #[test]
-    fn multiple_origins_sort_by_last_edit_with_unedited_last() {
-        let mut origins = vec![
-            test_ledger_entry("c:/zero.png", 1, "h", "f", 0),
-            test_ledger_entry("c:/old.png", 1, "h", "f", 10),
-            test_ledger_entry("c:/new.png", 1, "h", "f", 30),
-            test_ledger_entry("c:/middle.png", 1, "h", "f", 20),
+    fn restore_sources_sort_by_last_edit_desc_then_file_key_asc() {
+        let mut sources = vec![
+            restore_source("c:/zero.png", 0),
+            restore_source("c:/same-z.png", 20),
+            restore_source("c:/old.png", 10),
+            restore_source("c:/same-a.png", 20),
+            restore_source("c:/new.png", 30),
         ];
 
-        sort_origins(&mut origins);
+        sort_restore_sources(&mut sources);
 
         assert_eq!(
-            origins
+            sources
                 .iter()
-                .map(|origin| origin.last_edit_at)
+                .map(|source| source.file_key.as_str())
                 .collect::<Vec<_>>(),
-            vec![30, 20, 10, 0]
+            vec![
+                "c:/new.png",
+                "c:/same-a.png",
+                "c:/same-z.png",
+                "c:/old.png",
+                "c:/zero.png",
+            ]
+        );
+    }
+
+    #[test]
+    fn all_zero_restore_sources_still_sort_stably_by_file_key() {
+        let mut sources = vec![
+            restore_source("c:/z.png", 0),
+            restore_source("c:/a.png", 0),
+            restore_source("c:/m.png", 0),
+        ];
+
+        sort_restore_sources(&mut sources);
+
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| source.file_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c:/a.png", "c:/m.png", "c:/z.png"]
         );
     }
 

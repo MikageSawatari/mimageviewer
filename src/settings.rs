@@ -540,6 +540,46 @@ impl GridClickSelectionMode {
 }
 
 // -----------------------------------------------------------------------
+// 動画サムネイルの目印
+// -----------------------------------------------------------------------
+
+/// サムネイル一覧で動画を示す目印の表示方法。
+///
+/// `Unknown` は将来版の値を旧版で読み込んだときの受け皿。設定の sanitize 時に、
+/// 既存動作の中央再生アイコンへ正規化する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum VideoThumbnailIndicator {
+    #[default]
+    PlayIcon,
+    BottomLeftBadge,
+    Hidden,
+    #[serde(other)]
+    Unknown,
+}
+
+impl VideoThumbnailIndicator {
+    pub fn label(self) -> &'static str {
+        match self.normalized() {
+            Self::PlayIcon => "再生アイコン",
+            Self::BottomLeftBadge => "左下バッジ",
+            Self::Hidden => "なし",
+            Self::Unknown => unreachable!("normalized video thumbnail indicator"),
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[Self::PlayIcon, Self::BottomLeftBadge, Self::Hidden]
+    }
+
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Unknown => Self::PlayIcon,
+            indicator => indicator,
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
 // 選択情報の表示方法
 // -----------------------------------------------------------------------
 
@@ -3472,6 +3512,9 @@ pub struct Settings {
     /// 同じ行は `sort_order` で混在ソートし、空行は表示時に読み飛ばす。
     #[serde(default)]
     pub grid_display_order: GridDisplayOrder,
+    /// 動画サムネイルを示す目印。既定は従来どおり中央の再生アイコン。
+    #[serde(default)]
+    pub video_thumbnail_indicator: VideoThumbnailIndicator,
     /// ファイル名 prefix スタック (v2.0.0) のグループ化区切り文字。既定 '_'。
     /// 例: '_' のとき "12345678_p0.jpg" は prefix "12345678" でまとまる
     /// (docs/filename-stack-plan.md)。スタックモードの ON/OFF 自体は transient で
@@ -3730,8 +3773,8 @@ pub struct Settings {
     /// ZIP/PDF 内ページなど仮想アイテムは従来の mIV メニューにフォールバックする。
     #[serde(default = "default_true")]
     pub use_native_shell_context_menu: bool,
-    /// mIV の事前判定でごみ箱へ移せる通常ファイルだけ、mIV 側の削除確認を省略する。
-    /// フォルダ / アーカイブコンテナと完全削除候補は常に確認を残す。
+    /// mIV の事前判定でごみ箱へ移せる対象は、種類に関係なく mIV 側の削除確認を省略する。
+    /// 完全削除候補は常に確認を残す。
     #[serde(default)]
     pub skip_recycle_bin_delete_confirmation: bool,
 
@@ -4130,7 +4173,7 @@ pub struct Settings {
     pub keymap: crate::keymap::KeymapSettings,
 
     // ── フォルダサムネイル ──────────────────────────────────────
-    /// フォルダの代表画像を選ぶ際のソート順（デフォルト: 番号順）
+    /// フォルダの代表画像を選ぶ際のソート順（デフォルト: ファイル名順）
     #[serde(default = "default_folder_thumb_sort")]
     pub folder_thumb_sort: SortOrder,
 
@@ -4360,6 +4403,12 @@ pub struct Settings {
     /// シークバー上のプレビューで許容する表示位置との差 (秒)。
     #[serde(default = "default_video_seek_thumbnail_tolerance_secs")]
     pub video_seek_thumbnail_tolerance_secs: f64,
+    /// native 動画プレゼンターの上部情報バーを常時表示し、映像領域から除外する。
+    #[serde(default)]
+    pub video_top_bar_locked: bool,
+    /// native 動画プレゼンターの下部シークバーを常時表示し、映像領域から除外する。
+    #[serde(default)]
+    pub video_seek_bar_locked: bool,
     /// 旧自動再生設定 (bool)。現在の再生開始挙動では参照せず、設定ファイル互換のため保持する。
     #[serde(default)]
     pub video_autoplay: bool,
@@ -5157,7 +5206,7 @@ fn default_gpu_memory_percent() -> u32 {
     50
 }
 fn default_folder_thumb_sort() -> SortOrder {
-    SortOrder::Numeric
+    SortOrder::FileName
 }
 fn default_folder_thumb_depth() -> u32 {
     3
@@ -5425,6 +5474,7 @@ impl Default for Settings {
             subfolder_expansion_filter_date_preset: None,
             subfolder_expansion_filter_size_preset: None,
             grid_display_order: GridDisplayOrder::default(),
+            video_thumbnail_indicator: VideoThumbnailIndicator::default(),
             thumb_px: default_thumb_px(),
             text_preview_scale: default_text_preview_scale(),
             text_smart_snap_enabled: true,
@@ -5640,6 +5690,8 @@ impl Default for Settings {
             video_volume: default_video_volume(),
             video_playback_speed: default_video_playback_speed(),
             video_seek_thumbnail_tolerance_secs: default_video_seek_thumbnail_tolerance_secs(),
+            video_top_bar_locked: false,
+            video_seek_bar_locked: false,
             video_autoplay: false,
             video_autoplay_mode: VideoAutoplayMode::default(),
             video_loop: false,
@@ -7046,7 +7098,7 @@ impl Settings {
         // 事実上機能しなくなる。上限を超える値は ZIP 中身検査込みの DFS が
         // 長時間走り UI 非応答を招くので、両側クランプする。
         self.folder_skip_limit = self.folder_skip_limit.clamp(1, 30);
-        self.erase_inpaint_mono_tolerance = self.erase_inpaint_mono_tolerance.clamp(1, 64);
+        self.erase_inpaint_mono_tolerance = self.erase_inpaint_mono_tolerance.clamp(0, 64);
         if self.video_autoplay_mode == VideoAutoplayMode::OnlyFromGrid {
             self.video_autoplay = false;
             self.video_autoplay_mode = VideoAutoplayMode::Off;
@@ -7260,6 +7312,7 @@ impl Settings {
             ToolbarFacetFilterItem::visible_order(&self.toolbar_facet_filter_items);
         self.facet_name_filter_width = self.facet_name_filter_width.normalized();
         self.grid_click_selection_mode = self.grid_click_selection_mode.normalized();
+        self.video_thumbnail_indicator = self.video_thumbnail_indicator.normalized();
         // grid_open_selected_item_on_click / grid_cursor_wrap は bool のため不正値を持たない。
         // 旧設定の欠落は serde default で false に補い、sanitize では読み込んだ ON/OFF を
         // そのまま維持する。
@@ -8512,6 +8565,55 @@ mod tests {
     }
 
     #[test]
+    fn video_thumbnail_indicator_defaults_to_the_existing_play_icon() {
+        assert_eq!(
+            Settings::default().video_thumbnail_indicator,
+            VideoThumbnailIndicator::PlayIcon
+        );
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            loaded.video_thumbnail_indicator,
+            VideoThumbnailIndicator::PlayIcon
+        );
+        assert_eq!(
+            VideoThumbnailIndicator::all(),
+            &[
+                VideoThumbnailIndicator::PlayIcon,
+                VideoThumbnailIndicator::BottomLeftBadge,
+                VideoThumbnailIndicator::Hidden,
+            ]
+        );
+    }
+
+    #[test]
+    fn video_thumbnail_indicator_normalizes_unknown_to_the_existing_default() {
+        let mut loaded: Settings =
+            serde_json::from_str(r#"{"video_thumbnail_indicator":"FutureIndicator"}"#).unwrap();
+        assert_eq!(
+            loaded.video_thumbnail_indicator,
+            VideoThumbnailIndicator::Unknown
+        );
+        loaded.sanitize();
+        assert_eq!(
+            loaded.video_thumbnail_indicator,
+            VideoThumbnailIndicator::PlayIcon
+        );
+    }
+
+    #[test]
+    fn video_bar_locks_default_off_independently() {
+        let defaults: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!defaults.video_top_bar_locked);
+        assert!(!defaults.video_seek_bar_locked);
+
+        let loaded: Settings =
+            serde_json::from_str(r#"{"video_top_bar_locked":true,"video_seek_bar_locked":false}"#)
+                .unwrap();
+        assert!(loaded.video_top_bar_locked);
+        assert!(!loaded.video_seek_bar_locked);
+    }
+
+    #[test]
     fn toolbar_facet_filter_items_dedup_unknown_but_preserve_empty() {
         let v: Vec<ToolbarFacetFilterItem> =
             serde_json::from_str(r#"["Ext","FutureFacet","Kind","Ext"]"#).unwrap();
@@ -9645,6 +9747,7 @@ mod tests {
         assert_eq!(s.folder_skip_limit, 5);
         assert!(!s.show_hidden_files);
         assert_eq!(s.sort_order, SortOrder::FileName);
+        assert_eq!(s.folder_thumb_sort, SortOrder::FileName);
         assert_eq!(s.subfolder_expansion_order, SubfolderExpansionOrder::Flat);
         assert_eq!(
             s.subfolder_expansion_max_depth,
@@ -10506,9 +10609,10 @@ mod tests {
     #[test]
     fn sanitize_clamps_erase_inpaint_mono_tolerance() {
         let mut settings = Settings::default();
+        // 0 は「色調合わせ無効」として保持する (下限は 1 ではない)。
         settings.erase_inpaint_mono_tolerance = 0;
         settings.sanitize();
-        assert_eq!(settings.erase_inpaint_mono_tolerance, 1);
+        assert_eq!(settings.erase_inpaint_mono_tolerance, 0);
 
         settings.erase_inpaint_mono_tolerance = u8::MAX;
         settings.sanitize();

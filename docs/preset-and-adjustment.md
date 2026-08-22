@@ -85,6 +85,9 @@ idx へ hydrate し直す。これをやらないと差し替え前 idx の補�
 ページ編集 overlay を出さない)。Ctrl+F (単一フォルダ構造フィルタ) は検索ではないので
 rehydrate 側。`clear_page_edit_state()` 単独は上記 idx-keyed セットの正準 clear で、
 `replace_search_view_items` (Ctrl+G 結果差し替え) からも呼ばれる。
+content-identity restore 完了時は `is_physical_folder_listing()` が true のときだけ、rename 完了と
+同じ `current_folder` prefix から同関数で rehydrate する。完了待ち中に検索・snapshot 等へ
+移った場合は clear のみに倒し、cross-folder view へ overlay を漏らさない。
 `adjustment_favorite_params: HashMap<Uuid, AdjustParams>` は **起動時に 1 回**
 (`App::hydrate_adjustment_favorite_params`) 全件ロードされ、
 `settings.favorites` に存在しない orphan 行は `prune_favorite_params` で掃除される。
@@ -886,6 +889,11 @@ idle まで遅延する。release 時は遅延をキャンセルして 1 回だ�
 lossless 注釈 WebP に分けて編集プレビューキャッシュへ非同期保存する。表示時は下地へだけ色調補正を
 掛けた後で注釈を合成し、fullscreen と同じ処理順にする。final AI / スマートシャープ /
 カラー化 / Creative LUT / post-filter は含めない。
+
+編集プレビューの各 DB row は、item key の SHA-256 directory にある下地 WebP と全注釈 layer WebP を
+単独所有する。内容 identity 復元で別 item key へ row を複製するときも WebP を新 directory へ複製し、
+row 内の path を付け替える。2 row が同じ WebP を共有してはならない。source files が不完全な row は
+復元先へ作らず、元画像を次に表示したときの通常再生成へ委ねる。
 
 Ctrl+E とキャプチャ保存は、補正レイヤーが有効なページでは `local_adjust_cache` が揃ってから
 実行する。表示中の暫定フォールバック画像をそのまま保存しない。

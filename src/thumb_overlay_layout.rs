@@ -75,9 +75,21 @@ impl EditBadgeKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FormatBadgeKind {
+    /// Native ZIP / CBZ container.
+    Zip,
+    /// PDF document.
+    Pdf,
+    /// Converted or nested RAR / 7z / LZH family.
+    Archive,
+    /// Video media marker, independent from the file extension label.
+    Video,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BottomContainerKind {
     Folder,
-    Format,
+    Format(FormatBadgeKind),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -411,11 +423,11 @@ pub fn layout_thumbnail_overlays(
     if let Some(container) = input.bottom_container {
         let style = match container.kind {
             BottomContainerKind::Folder => folder_badge_style(input.inner),
-            BottomContainerKind::Format => file_badge_style(input.inner),
+            BottomContainerKind::Format(_) => file_badge_style(input.inner),
         };
         let max_badge_width = match container.kind {
             BottomContainerKind::Folder => input.inner.width() * 0.80,
-            BottomContainerKind::Format => input.inner.width() - BOTTOM_LEFT_OFFSET * 2.0,
+            BottomContainerKind::Format(_) => input.inner.width() - BOTTOM_LEFT_OFFSET * 2.0,
         };
         let max_text_width = (max_badge_width - style.padding.left - style.padding.right).max(0.0);
         if let Some(text) = fit_text(container.label, None, max_text_width, &mut measure, style) {
@@ -607,7 +619,7 @@ mod tests {
                 },
                 tags: &tags,
                 bottom_container: Some(BottomContainerInput {
-                    kind: BottomContainerKind::Format,
+                    kind: BottomContainerKind::Format(FormatBadgeKind::Pdf),
                     label: "PDF",
                 }),
                 rating_text: Some("📁★★★★★"),

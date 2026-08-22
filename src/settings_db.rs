@@ -30,7 +30,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
@@ -40,6 +40,7 @@ use crate::settings::{
 };
 
 const SCHEMA_VERSION: &str = "1";
+const FOLDER_THUMB_SORT_DEFAULT_V2_META_KEY: &str = "folder_thumb_sort_default_v2";
 const REMOTE_LISTING_SETTINGS_SQL: &str = r#"SELECT key, value FROM settings_kv WHERE key IN (
     'sort_order', 'show_hidden_files', 'grid_display_order',
     'archive_file_handling', 'archive_convert_without_dialog',
@@ -569,6 +570,18 @@ impl SettingsDb {
     /// (= 起動後最初の `save_full` で無駄に DELETE+INSERT しないため)。
     pub fn load_into_settings(&self) -> Result<Settings, SettingsDbError> {
         let mut inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
+        // 既定値だけを揃える移行なので、書き込み失敗は設定ロード全体を失敗させない。
+        // transaction rollback により旧値のまま + marker 無しとなり、次の load で再試行する。
+        match migrate_folder_thumb_sort_default_v2(&inner.conn) {
+            Ok(true) => log_diag(
+                "settings_db: migrated folder thumbnail sort default from Numeric to FileName",
+            ),
+            Ok(false) => {}
+            Err(e) => log_diag(&format!(
+                "settings_db: folder thumbnail sort default migration failed; \
+                 continuing with stored settings and retrying on the next load: {e}"
+            )),
+        }
         let settings = build_settings_from_db(&inner.conn)?;
         inner.last_saved_vst3_chain_hash = Some(hash_vst3_plugins(&settings.vst3_plugins));
         inner.last_saved_vst3_slots_hash = Some(hash_vst3_chain_slots(&settings.vst3_chain_slots));
@@ -799,6 +812,13 @@ impl SettingsDb {
         tx.execute(
             "INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('bootstrap_complete', '1')",
             [],
+        )?;
+        // 新規 bootstrap は Settings の既定値 (FileName) をそのまま保存し、同じ
+        // transaction で「既定変更の適用済み」だけを記録する。既存 DB の値変更は
+        // load_into_settings 冒頭の migration が値と marker を原子的に書く。
+        tx.execute(
+            "INSERT OR IGNORE INTO schema_meta(key, value) VALUES (?1, '1')",
+            params![FOLDER_THUMB_SORT_DEFAULT_V2_META_KEY],
         )?;
         // app_version は DB を「開いた版」ではなく、設定内容を最後に正常保存した版を示す。
         // backup rotation はこの save より前に走るため、bak1 側には直前の保存版が残る。
@@ -1545,6 +1565,53 @@ fn extract_complex_fields(map: &mut Map<String, Value>) -> Map<String, Value> {
         }
     }
     taken
+}
+
+/// v3.2.0 でフォルダ代表画像の既定を一覧と同じ FileName へ揃える一度きりの移行。
+///
+/// `settings_kv` は全フィールドを常に保存するため、旧既定の Numeric と利用者が明示した
+/// Numeric を区別できない。marker が無い bootstrap 済み DB だけを一度 FileName にし、
+/// 値と marker を同じ transaction で commit する。marker があれば利用者の現在値を守る。
+fn migrate_folder_thumb_sort_default_v2(conn: &Connection) -> Result<bool, SettingsDbError> {
+    let tx = conn.unchecked_transaction()?;
+    let bootstrap_complete = tx
+        .query_row(
+            "SELECT 1 FROM schema_meta WHERE key = 'bootstrap_complete'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+    if !bootstrap_complete {
+        tx.commit()?;
+        return Ok(false);
+    }
+
+    let already_migrated = tx
+        .query_row(
+            "SELECT 1 FROM schema_meta WHERE key = ?1",
+            params![FOLDER_THUMB_SORT_DEFAULT_V2_META_KEY],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+    if already_migrated {
+        tx.commit()?;
+        return Ok(false);
+    }
+
+    let file_name = serde_json::to_string(&crate::settings::SortOrder::FileName)?;
+    tx.execute(
+        "INSERT INTO settings_kv(key, value) VALUES ('folder_thumb_sort', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![file_name],
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO schema_meta(key, value) VALUES (?1, '1')",
+        params![FOLDER_THUMB_SORT_DEFAULT_V2_META_KEY],
+    )?;
+    tx.commit()?;
+    Ok(true)
 }
 
 fn write_settings_kv(
@@ -2565,6 +2632,9 @@ pub fn migrate_from_settings_json(
     // - 旧 vst3_plugin_path/state が新 Vec に流れない
     // - 旧 video_loop=true が video_loop_mode に伝わらない
     crate::settings::apply_load_time_migrations(&mut loaded);
+    // JSON 時代から初めて SQLite へ移る利用者も既存利用者に含まれる。save_full が
+    // この値と folder_thumb_sort_default_v2 marker を同じ transaction で保存する。
+    loaded.folder_thumb_sort = crate::settings::SortOrder::FileName;
 
     // 新規 DB を bootstrap。family が見える環境では `create_new` が AlreadyBootstrapped を
     // 返すので、Phase 2 caller が migrate_from_settings_json を呼ぶ前に
@@ -3279,7 +3349,7 @@ impl Drop for DataDirOverrideGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{RecentApp, Settings, TagDef};
+    use crate::settings::{RecentApp, Settings, SortOrder, TagDef};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -3404,6 +3474,185 @@ mod tests {
         let aj = serde_json::to_value(a).unwrap();
         let bj = serde_json::to_value(&restored).unwrap();
         assert_eq!(aj, bj, "Settings did not round-trip via SQLite");
+    }
+
+    fn set_folder_thumb_sort_migration_state(
+        db: &SettingsDb,
+        sort: SortOrder,
+        marker_present: bool,
+    ) {
+        let inner = db.inner.lock().unwrap();
+        let raw = serde_json::to_string(&sort).unwrap();
+        inner
+            .conn
+            .execute(
+                "INSERT INTO settings_kv(key, value) VALUES ('folder_thumb_sort', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![raw],
+            )
+            .unwrap();
+        if marker_present {
+            inner
+                .conn
+                .execute(
+                    "INSERT OR IGNORE INTO schema_meta(key, value) VALUES (?1, '1')",
+                    params![FOLDER_THUMB_SORT_DEFAULT_V2_META_KEY],
+                )
+                .unwrap();
+        } else {
+            inner
+                .conn
+                .execute(
+                    "DELETE FROM schema_meta WHERE key = ?1",
+                    params![FOLDER_THUMB_SORT_DEFAULT_V2_META_KEY],
+                )
+                .unwrap();
+        }
+    }
+
+    fn folder_thumb_sort_migration_marker_present(db: &SettingsDb) -> bool {
+        let inner = db.inner.lock().unwrap();
+        inner
+            .conn
+            .query_row(
+                "SELECT 1 FROM schema_meta WHERE key = ?1",
+                params![FOLDER_THUMB_SORT_DEFAULT_V2_META_KEY],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap()
+            .is_some()
+    }
+
+    fn stored_folder_thumb_sort(db: &SettingsDb) -> SortOrder {
+        let inner = db.inner.lock().unwrap();
+        let raw: String = inner
+            .conn
+            .query_row(
+                "SELECT value FROM settings_kv WHERE key = 'folder_thumb_sort'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    #[test]
+    fn folder_thumb_sort_default_migration_updates_markerless_existing_db_atomically() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let mut settings = Settings::default();
+        settings.folder_thumb_sort = SortOrder::Numeric;
+        db.save_full(&settings).unwrap();
+        set_folder_thumb_sort_migration_state(&db, SortOrder::Numeric, false);
+        drop(db);
+
+        let db = SettingsDb::open(dir.path()).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+
+        assert_eq!(loaded.folder_thumb_sort, SortOrder::FileName);
+        assert_eq!(stored_folder_thumb_sort(&db), SortOrder::FileName);
+        assert!(folder_thumb_sort_migration_marker_present(&db));
+    }
+
+    #[test]
+    fn folder_thumb_sort_default_migration_preserves_marker_present_numeric_choice() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let mut settings = Settings::default();
+        settings.folder_thumb_sort = SortOrder::Numeric;
+        db.save_full(&settings).unwrap();
+        drop(db);
+
+        let db = SettingsDb::open(dir.path()).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+
+        assert_eq!(loaded.folder_thumb_sort, SortOrder::Numeric);
+        assert_eq!(stored_folder_thumb_sort(&db), SortOrder::Numeric);
+        assert!(folder_thumb_sort_migration_marker_present(&db));
+    }
+
+    #[test]
+    fn folder_thumb_sort_default_clean_bootstrap_stores_file_name_and_marker() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        db.save_full(&Settings::default()).unwrap();
+
+        assert_eq!(stored_folder_thumb_sort(&db), SortOrder::FileName);
+        assert!(folder_thumb_sort_migration_marker_present(&db));
+    }
+
+    #[test]
+    fn folder_thumb_sort_default_migration_is_idempotent_across_reopen() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let mut settings = Settings::default();
+        settings.folder_thumb_sort = SortOrder::Numeric;
+        db.save_full(&settings).unwrap();
+        set_folder_thumb_sort_migration_state(&db, SortOrder::Numeric, false);
+        drop(db);
+
+        let db = SettingsDb::open(dir.path()).unwrap();
+        assert_eq!(
+            db.load_into_settings().unwrap().folder_thumb_sort,
+            SortOrder::FileName
+        );
+        drop(db);
+        let db = SettingsDb::open(dir.path()).unwrap();
+        assert_eq!(
+            db.load_into_settings().unwrap().folder_thumb_sort,
+            SortOrder::FileName
+        );
+        assert!(folder_thumb_sort_migration_marker_present(&db));
+    }
+
+    #[test]
+    fn folder_thumb_sort_default_migration_failure_keeps_settings_and_retries_next_load() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let mut settings = Settings::default();
+        settings.grid_cols = 17;
+        settings.folder_thumb_sort = SortOrder::Numeric;
+        db.save_full(&settings).unwrap();
+        set_folder_thumb_sort_migration_state(&db, SortOrder::Numeric, false);
+        {
+            let inner = db.inner.lock().unwrap();
+            inner
+                .conn
+                .execute_batch(
+                    "CREATE TRIGGER fail_folder_thumb_sort_default_marker
+                     BEFORE INSERT ON schema_meta
+                     WHEN NEW.key = 'folder_thumb_sort_default_v2'
+                     BEGIN
+                         SELECT RAISE(ABORT, 'forced marker failure');
+                     END;",
+                )
+                .unwrap();
+        }
+
+        let loaded = db
+            .load_into_settings()
+            .expect("migration failure must not fail the settings load");
+
+        assert_eq!(loaded.grid_cols, 17, "other stored settings must survive");
+        assert_eq!(loaded.folder_thumb_sort, SortOrder::Numeric);
+        assert_eq!(stored_folder_thumb_sort(&db), SortOrder::Numeric);
+        assert!(!folder_thumb_sort_migration_marker_present(&db));
+
+        {
+            let inner = db.inner.lock().unwrap();
+            inner
+                .conn
+                .execute_batch("DROP TRIGGER fail_folder_thumb_sort_default_marker;")
+                .unwrap();
+        }
+        let retried = db
+            .load_into_settings()
+            .expect("the next load must retry the migration");
+        assert_eq!(retried.grid_cols, 17);
+        assert_eq!(retried.folder_thumb_sort, SortOrder::FileName);
+        assert_eq!(stored_folder_thumb_sort(&db), SortOrder::FileName);
+        assert!(folder_thumb_sort_migration_marker_present(&db));
     }
 
     #[test]
@@ -5016,6 +5265,7 @@ mod tests {
         let mut original = Settings::default();
         original.grid_cols = 9;
         original.thumb_quality = 77;
+        original.folder_thumb_sort = SortOrder::Numeric;
         original
             .favorites
             .push(FavoriteEntry::new("Pics".into(), PathBuf::from(r"C:\Pics")));
@@ -5030,12 +5280,15 @@ mod tests {
         // 値ベースで一致確認。
         assert_eq!(loaded.grid_cols, 9);
         assert_eq!(loaded.thumb_quality, 77);
+        assert_eq!(loaded.folder_thumb_sort, SortOrder::FileName);
         assert_eq!(loaded.favorites.len(), 1);
         assert_eq!(loaded.tags.len(), 1);
         // settings.db が物理的に存在し、再 open で同じ内容が出てくる。
         assert!(dir.join("settings.db").exists());
         let reloaded = db.load_into_settings().unwrap();
         assert_eq!(reloaded.grid_cols, 9);
+        assert_eq!(reloaded.folder_thumb_sort, SortOrder::FileName);
+        assert!(folder_thumb_sort_migration_marker_present(&db));
         // 旧 JSON ファイルは .migrated-<ts> にリネームされて消えている。
         assert!(!dir.join("settings.json").exists());
         assert!(!dir.join("settings.json.bak1").exists());

@@ -231,12 +231,13 @@ Implementation status:
   later chunks.
 - The optional `skip_recycle_bin_delete_confirmation` setting defaults off. It
   bypasses only mIV's existing confirmation when every pre-check result is
-  `DeleteConfirmKind::RecycleBin` and every target is a listed image, video, or
-  audio file. Folders and archive containers (ZIP/PDF/convertible archives)
-  keep the confirmation because the selected tile does not enumerate all
-  affected contents. Any `MayPermanent` or unresolvable target also keeps the
-  confirmation and its cancel-first selection. This does not change the
-  worker flags: `FOF_WANTNUKEWARNING` remains mandatory.
+  `DeleteConfirmKind::RecycleBin`, regardless of target type. Folders and
+  archive containers (ZIP/PDF/convertible archives) are included because the
+  operation remains recoverable from the recycle bin. The settings UI warns
+  that one tile can represent many unlisted files and that every contained file
+  moves without another prompt. Any `MayPermanent` target keeps the
+  confirmation and its cancel-first selection. This does not change the worker
+  flags: `FOF_WANTNUKEWARNING` remains mandatory.
 - Copy/move/drop replacement is still pending.
 
 Public API sketch:
@@ -653,8 +654,8 @@ Manual Windows tests:
 - Cancel copy/move from the Shell progress dialog.
 - Delete to recycle bin.
 - With confirmation skipping on, delete an ordinary local file and verify the
-  mIV confirmation is omitted; verify folders and archive containers still
-  show it.
+  mIV confirmation is omitted; verify folders and archive containers also skip
+  it when the pre-check remains recyclable.
 - Delete from network/removable/no-recycle targets and verify permanent-delete
   confirmation remains cancel-first and the Shell permanent-delete warning is
   still available.

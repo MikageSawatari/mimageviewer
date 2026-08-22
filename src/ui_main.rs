@@ -15842,6 +15842,7 @@ impl App {
                                     &tags,
                                     bookmark_time.as_deref(),
                                     self.items_are_drive_list,
+                                    self.settings.video_thumbnail_indicator,
                                 );
 
                                 primary_click_hit_cell |=
@@ -15913,6 +15914,7 @@ impl App {
                                     adjusted_tex,
                                     filter_match_count,
                                     self.items_are_drive_list,
+                                    self.settings.video_thumbnail_indicator,
                                 );
                                 // 小さい右下バッジに限らずセル全体をホバー領域にして
                                 // ★内訳 tooltip を出す。

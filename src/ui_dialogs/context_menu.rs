@@ -59,12 +59,6 @@ impl DeleteConfirmKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeleteTargetScope {
-    ListedFilesOnly,
-    IncludesUnlistedContents,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeleteConfirmSelection {
     Delete,
     Cancel,
@@ -87,7 +81,6 @@ struct DeleteConfirmModalResponse {
 struct DeleteConfirmContent {
     label: String,
     kind: DeleteConfirmKind,
-    target_scope: DeleteTargetScope,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,7 +296,6 @@ fn delete_confirm_label_for_targets(
     items: &[GridItem],
 ) -> DeleteConfirmContent {
     let kind = delete_confirm_kind_for_targets(targets);
-    let target_scope = delete_target_scope_for_targets(targets, items);
     let count = targets.len();
     let single_name = (count == 1).then(|| {
         targets[0]
@@ -332,43 +324,14 @@ fn delete_confirm_label_for_targets(
             label.push_str(&format!("\n・他 {remaining} 件"));
         }
     }
-    DeleteConfirmContent {
-        label,
-        kind,
-        target_scope,
-    }
-}
-
-fn delete_target_scope_for_targets(
-    targets: &[(usize, PathBuf)],
-    items: &[GridItem],
-) -> DeleteTargetScope {
-    let all_listed_files = targets.iter().all(|(idx, path)| {
-        matches!(
-            items.get(*idx),
-            Some(
-                GridItem::Image(item_path)
-                    | GridItem::Video(item_path)
-                    | GridItem::Audio(item_path)
-            ) if item_path == path
-        )
-    });
-    if all_listed_files {
-        DeleteTargetScope::ListedFilesOnly
-    } else {
-        // Folder / archive container tiles represent contents that the current listing does not
-        // enumerate. A missing or stale GridItem is also kept on the conservative path.
-        DeleteTargetScope::IncludesUnlistedContents
-    }
+    DeleteConfirmContent { label, kind }
 }
 
 fn should_skip_delete_confirmation(
     skip_recycle_bin_delete_confirmation: bool,
     content: &DeleteConfirmContent,
 ) -> bool {
-    skip_recycle_bin_delete_confirmation
-        && content.kind == DeleteConfirmKind::RecycleBin
-        && content.target_scope == DeleteTargetScope::ListedFilesOnly
+    skip_recycle_bin_delete_confirmation && content.kind == DeleteConfirmKind::RecycleBin
 }
 
 fn build_delete_confirm_label(
@@ -3028,34 +2991,24 @@ mod delete_confirm_tests {
         );
     }
 
-    fn delete_content(
-        kind: DeleteConfirmKind,
-        target_scope: DeleteTargetScope,
-    ) -> DeleteConfirmContent {
+    fn delete_content(kind: DeleteConfirmKind) -> DeleteConfirmContent {
         DeleteConfirmContent {
             label: String::new(),
             kind,
-            target_scope,
         }
     }
 
     #[test]
     fn ordinary_local_file_skips_confirmation_when_setting_is_on() {
-        let path = PathBuf::from(r"C:\pictures\photo.jpg");
-        let targets = vec![(0, path.clone())];
-        let scope = delete_target_scope_for_targets(&targets, &[GridItem::Image(path)]);
-        let content = delete_content(DeleteConfirmKind::RecycleBin, scope);
+        let content = delete_content(DeleteConfirmKind::RecycleBin);
 
-        assert_eq!(scope, DeleteTargetScope::ListedFilesOnly);
         assert!(should_skip_delete_confirmation(true, &content));
+        assert!(!should_skip_delete_confirmation(false, &content));
     }
 
     #[test]
     fn may_permanent_item_still_confirms_with_cancel_preselected() {
-        let content = delete_content(
-            DeleteConfirmKind::MayPermanent,
-            DeleteTargetScope::ListedFilesOnly,
-        );
+        let content = delete_content(DeleteConfirmKind::MayPermanent);
 
         assert!(!should_skip_delete_confirmation(true, &content));
         assert_eq!(
@@ -3071,7 +3024,7 @@ mod delete_confirm_tests {
             DeleteConfirmKind::MayPermanent,
             DeleteConfirmKind::RecycleBin,
         ]);
-        let content = delete_content(kind, DeleteTargetScope::ListedFilesOnly);
+        let content = delete_content(kind);
 
         assert_eq!(kind, DeleteConfirmKind::MayPermanent);
         assert!(!should_skip_delete_confirmation(true, &content));
@@ -3079,43 +3032,58 @@ mod delete_confirm_tests {
     }
 
     #[test]
-    fn folders_and_archive_containers_keep_confirmation_when_setting_is_on() {
+    fn folders_and_archive_containers_skip_confirmation_when_setting_is_on() {
         let items = vec![
             GridItem::Folder(PathBuf::from(r"C:\pictures\album")),
+            GridItem::ZipFile(PathBuf::from(r"C:\pictures\book.zip")),
             GridItem::ZipFile(PathBuf::from(r"C:\pictures\book.cbz")),
             GridItem::PdfFile(PathBuf::from(r"C:\pictures\book.pdf")),
             GridItem::ConvertibleArchive {
                 path: PathBuf::from(r"C:\pictures\book.rar"),
                 format: crate::archive_converter::ArchiveFormat::Rar,
             },
+            GridItem::ConvertibleArchive {
+                path: PathBuf::from(r"C:\pictures\book.cbr"),
+                format: crate::archive_converter::ArchiveFormat::Rar,
+            },
+            GridItem::ConvertibleArchive {
+                path: PathBuf::from(r"C:\pictures\book.7z"),
+                format: crate::archive_converter::ArchiveFormat::SevenZ,
+            },
+            GridItem::ConvertibleArchive {
+                path: PathBuf::from(r"C:\pictures\book.cb7"),
+                format: crate::archive_converter::ArchiveFormat::SevenZ,
+            },
+            GridItem::ConvertibleArchive {
+                path: PathBuf::from(r"C:\pictures\book.lzh"),
+                format: crate::archive_converter::ArchiveFormat::Lzh,
+            },
+            GridItem::ConvertibleArchive {
+                path: PathBuf::from(r"C:\pictures\book.lha"),
+                format: crate::archive_converter::ArchiveFormat::Lzh,
+            },
         ];
 
         for item in items {
-            let path = item
-                .drag_source_path()
-                .expect("container test item should have a real path")
-                .to_path_buf();
-            let scope = delete_target_scope_for_targets(&[(0, path)], &[item]);
-            let content = delete_content(DeleteConfirmKind::RecycleBin, scope);
-            assert_eq!(scope, DeleteTargetScope::IncludesUnlistedContents);
-            assert!(!should_skip_delete_confirmation(true, &content));
+            assert!(
+                item.drag_source_path().is_some(),
+                "container test item should have a real delete target"
+            );
+            let content = delete_content(DeleteConfirmKind::RecycleBin);
+            assert!(should_skip_delete_confirmation(true, &content));
+            assert!(!should_skip_delete_confirmation(false, &content));
         }
     }
 
     #[test]
-    fn disabled_setting_keeps_confirmation_for_every_kind_and_scope() {
+    fn disabled_setting_keeps_confirmation_for_every_delete_kind() {
         for kind in [
             DeleteConfirmKind::RecycleBin,
             DeleteConfirmKind::MayPermanent,
         ] {
-            for target_scope in [
-                DeleteTargetScope::ListedFilesOnly,
-                DeleteTargetScope::IncludesUnlistedContents,
-            ] {
-                let content = delete_content(kind, target_scope);
-                assert!(!should_skip_delete_confirmation(false, &content));
-                assert_eq!(content.kind.initial_selection(), kind.initial_selection());
-            }
+            let content = delete_content(kind);
+            assert!(!should_skip_delete_confirmation(false, &content));
+            assert_eq!(content.kind.initial_selection(), kind.initial_selection());
         }
     }
 

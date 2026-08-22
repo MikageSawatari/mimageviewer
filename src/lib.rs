@@ -10,6 +10,8 @@ pub mod adjustment;
 pub mod adjustment_db;
 pub mod ai;
 mod app;
+#[doc(hidden)]
+pub use app::draw_video_thumbnail_indicator_snapshot_fixture;
 pub mod archive_cache;
 pub mod archive_converter;
 pub mod audio_decode;
@@ -201,6 +203,10 @@ mod ui_analysis_panel;
 mod ui_conceal;
 mod ui_crop;
 pub mod ui_dialogs;
+#[doc(hidden)]
+pub use ui_dialogs::preferences::draw_video_bar_visibility_snapshot_fixture;
+#[doc(hidden)]
+pub use ui_dialogs::preferences::draw_video_thumbnail_indicator_settings_snapshot_fixture;
 mod ui_erase;
 mod ui_folder_pane;
 pub mod ui_font_catalog;

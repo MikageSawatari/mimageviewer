@@ -1,6 +1,8 @@
 use crate::settings::VideoScaleFilter;
 use crate::video::display_metadata::{VideoOrientation, display_dimensions};
 
+use super::{VideoVisualLayout, compute_video_visual_target_rect};
+
 pub(super) const VIDEO_DISPLAY_SURFACE_MAX_DIMENSION: u32 = 8192;
 pub(super) const VIDEO_DISPLAY_SURFACE_MAX_PIXELS: u64 = 4096 * 4096;
 
@@ -121,7 +123,7 @@ pub(super) struct VideoSurfaceSizeInput {
     pub orientation: VideoOrientation,
     pub viewport_width: u32,
     pub viewport_height: u32,
-    pub compact: bool,
+    pub layout: VideoVisualLayout,
     pub resizing: bool,
     pub current_surface_width: u32,
     pub current_surface_height: u32,
@@ -159,16 +161,8 @@ pub(super) fn decide_video_surface_size(input: VideoSurfaceSizeInput) -> VideoSu
         };
     }
 
-    let viewport_width = if input.compact {
-        (input.viewport_width.max(1) / 2).max(1)
-    } else {
-        input.viewport_width.max(1)
-    };
-    let viewport_height = if input.compact {
-        (input.viewport_height.max(1) / 2).max(1)
-    } else {
-        input.viewport_height.max(1)
-    };
+    let target_rect =
+        compute_video_visual_target_rect(input.viewport_width, input.viewport_height, input.layout);
     let (display_width, display_height) = display_dimensions(
         source_width,
         source_height,
@@ -176,8 +170,8 @@ pub(super) fn decide_video_surface_size(input: VideoSurfaceSizeInput) -> VideoSu
         input.sar_den,
         input.orientation,
     );
-    let display_scale = (f64::from(viewport_width) / display_width)
-        .min(f64::from(viewport_height) / display_height);
+    let display_scale = (f64::from(target_rect.width) / display_width)
+        .min(f64::from(target_rect.height) / display_height);
 
     // At physical 1:1 the existing source-sized copy and DComp geometry path is
     // both exact and cheaper than materializing an equivalent shader output.
@@ -233,6 +227,7 @@ pub(super) fn decide_video_surface_size(input: VideoSurfaceSizeInput) -> VideoSu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::video::native_presenter::render_core::{HUD_BOTTOM_HEIGHT, HUD_TOP_HEIGHT};
 
     fn input(filter: VideoScaleFilter) -> VideoSurfaceSizeInput {
         VideoSurfaceSizeInput {
@@ -244,7 +239,7 @@ mod tests {
             orientation: VideoOrientation::IDENTITY,
             viewport_width: 1280,
             viewport_height: 720,
-            compact: false,
+            layout: VideoVisualLayout::from(false),
             resizing: false,
             current_surface_width: 640,
             current_surface_height: 360,
@@ -344,6 +339,36 @@ mod tests {
                 height: 360,
             }
         );
+    }
+
+    #[test]
+    fn locked_bars_size_the_display_surface_to_the_reserved_target_rect() {
+        let pixels_per_point = 2.0;
+        let fixed_bar_gap_px = 5;
+        let top_reserved = (HUD_TOP_HEIGHT + fixed_bar_gap_px as f32) * pixels_per_point;
+        let bottom_reserved = (HUD_BOTTOM_HEIGHT + fixed_bar_gap_px as f32) * pixels_per_point;
+
+        for (top_bar_locked, seek_bar_locked, reserved_height) in [
+            (true, false, top_reserved),
+            (false, true, bottom_reserved),
+            (true, true, top_reserved + bottom_reserved),
+        ] {
+            let mut case = input(VideoScaleFilter::Standard);
+            case.layout = VideoVisualLayout {
+                compact: false,
+                pixels_per_point,
+                top_bar_locked,
+                seek_bar_locked,
+                fixed_bar_gap_px,
+            };
+            let VideoSurfaceSizeDecision::DisplayResolution { height, .. } =
+                decide_video_surface_size(case)
+            else {
+                panic!();
+            };
+
+            assert_eq!(height, case.viewport_height - reserved_height as u32);
+        }
     }
 
     #[test]

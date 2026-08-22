@@ -632,6 +632,53 @@ const TABLE: &[VersionHighlights] = &[
             body: "自宅の PC で mImageViewer を起動したままにしておくと、外出先のスマートフォンやタブレットのブラウザから同じライブラリを開けます。画像も漫画も動画も、手元へコピーせずそのまま見られます。既定ではオフで、使うには環境設定から有効にします。接続には Tailscale と PIN の両方が必要です。",
         }],
     },
+    VersionHighlights {
+        version: "3.2.0",
+        must_read: &[
+            HighlightItem {
+                title: "フォルダの代表画像の選び方が変わります",
+                body: "フォルダタイルの代表画像を、一覧と同じファイル名順で選ぶように変更します。以前に番号順を選んでいた場合も、更新後に一度だけファイル名順へ変わります。番号順へ戻すには、環境設定 → フォルダ → 「代表画像の選択基準」で「番号順（区切り無視）」を選んでください。",
+            },
+            HighlightItem {
+                title: "バケツで塗る範囲が既定で 1px 広がります",
+                body: "「全体」と「隣接のみ」で塗ったとき、境界に細い塗り残しが出ないよう、既定で 1px 外側まで塗るようになります。以前の塗り方に戻すには、バケツの「はみ出し」を 0 にしてください。",
+            },
+            HighlightItem {
+                title: "白黒・セピア原稿の消しゴム補完が既定で色を合わせます",
+                body: "白黒やセピアの原稿を消しゴムで補完したとき、補完した部分だけ色味が浮かないよう、補完結果を周囲の色調に合わせるようになります。以前の仕上がりに戻すには、消しゴムツールパネルの「色調の許容」を 0 にしてください（既定 12）。",
+            },
+        ],
+        highlights: &[
+            HighlightItem {
+                title: "コピー・移動したファイルの編集内容を引き継げます",
+                body: "エクスプローラーなどでコピー・移動したファイルを開くと、元のファイルに付けていた補正・消しゴム・モザイク・注釈・トリミング・★・タグを引き継ぐか確認します。コピー元が複数見つかったときは、どれから引き継ぐかを選べます。確認が不要なら、環境設定 → フォルダ で切ることもできます。",
+            },
+            HighlightItem {
+                title: "バケツで塗る範囲を選べます",
+                body: "全体 / 隣接のみ / 長方形 / 楕円 / 円 の 5 つから選べます。",
+            },
+            HighlightItem {
+                title: "動画の上部バーと下部シークバーを固定表示できます",
+                body: "環境設定 → 動画 の「再生画面のバー」で、上部と下部をそれぞれ固定表示にできます。固定したバーは映像に重ならず、映像はバーを除いた領域に収まります。各バー端の鍵アイコンからも切り替えられます。",
+            },
+            HighlightItem {
+                title: "動画サムネイルの目印を選べます",
+                body: "環境設定 → 表示 → サムネイル で、代表画像の中央に重ねる再生アイコンを、左下の小さなバッジへ替えるか、非表示にできます。",
+            },
+            HighlightItem {
+                title: "ごみ箱へ移すときの確認を省略できます",
+                body: "環境設定 → ファイル操作 で、ごみ箱へ移す削除の確認を省略できます。完全に削除される場合は、この設定に関わらず確認を表示します。",
+            },
+            HighlightItem {
+                title: "マスク編集をやり直せます",
+                body: "消しゴムやモザイクのマスク編集で、取り消した操作を Ctrl+Y / Ctrl+Shift+Z でやり直せます。",
+            },
+            HighlightItem {
+                title: "Shift+ホイールで筆の太さを変えられます",
+                body: "消しゴムやモザイクの筆を、画面の大きさに対する割合で太くしたり細くしたりできます。",
+            },
+        ],
+    },
 ];
 
 #[cfg(test)]
@@ -963,6 +1010,34 @@ mod tests {
         assert!(entry.must_read[0].body.contains("1対1"));
         assert!(entry.must_read[0].body.contains("拡大縮小"));
         assert!(entry.must_read[1].body.contains("縮小時のなめらかさ"));
+    }
+
+    #[test]
+    fn embedded_table_contains_v3_2_0_folder_thumb_sort_notice() {
+        let entries = for_version("3.2.0", table());
+        assert_eq!(versions(&entries), ["3.2.0"]);
+        let entry = entries[0];
+        // 既定が変わるものはすべて must_read にある (highlights へ落ちていない)。
+        for keyword in ["代表画像", "バケツ", "消しゴム"] {
+            assert!(
+                entry
+                    .must_read
+                    .iter()
+                    .any(|item| item.title.contains(keyword)),
+                "v3.2.0 must announce the changed default for {keyword}"
+            );
+        }
+        let notice = entry
+            .must_read
+            .iter()
+            .find(|item| item.title.contains("代表画像"))
+            .expect("v3.2.0 must announce the folder thumbnail default change");
+        assert!(
+            notice
+                .body
+                .contains("環境設定 → フォルダ → 「代表画像の選択基準」")
+        );
+        assert!(notice.body.contains("番号順（区切り無視）"));
     }
 
     #[test]

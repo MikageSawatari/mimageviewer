@@ -803,6 +803,12 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
   直前を seek target にして、target 以前の keyframe から decoder が直前 frame を選ぶ。
   前/次フレームボタンの長押しは、前回のフレームが画面へ
   反映された後に最短約 100ms 間隔で次の frame-step seek を発行する。
+- 動画の上部情報バーと下部シークバーは、環境設定の独立した checkbox で固定表示できる。
+  既定は両方 OFF。固定したバーの領域と共通余白を映像のフィット範囲から除外し、映像を
+  残りの領域へフィットする。上部だけを固定しても下部は固定されない。各バー端の鍵アイコンからも
+  固定 / 解除でき、解除後は従来の自動表示へ直ちに戻る。
+  自動表示では従来どおり、上下端へのマウス移動、タッチによる操作部の表示、
+  左右パネル表示に応じて必要なバーを表示する。固定解除後はその自動表示へ直ちに戻る。
 - 動画シークバーはトラック下側に秒 / 分 / 時間の目盛りを描き、幅に応じて許可系列から間引く。
   描画順は進捗塗り → 目盛り → chapter / bookmark / pin とし、既存マーカーを前面に保つ。
 - Windows のタスクバーで mIV アイコンを hover したときは、動画フルスクリーン中も
@@ -1005,6 +1011,8 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
 - **下部 HUD**: シークバー + 再生コントロール (頭出し / 再生・一時停止 / ループ / 連続再生 /
   前後ファイル / 前後ブックマーク / ミュート / 音量スライダー (dB) / 速度)。
   シークバーは動画と同じ時間目盛りをトラック下側へ描き、既存ブックマークマーカーを前面に保つ。
+  通常の音楽ビューでは上部・下部とも常時表示し、動画のバー表示設定は適用しない。
+  VST GUI のため native 表示面を共有する場合だけ、動画と同じ上下の表示設定を使う。
 
 #### 操作
 
@@ -1565,13 +1573,14 @@ mIV 独自項目はメニュー先頭に追加し、名前変更は mIV の入�
 バックグラウンド worker から `IFileOperation::DeleteItem` をチャンク単位で使い、
 通常はゴミ箱へ移動する。削除進捗は mIV 側のダイアログを使う。既定 OFF の
 `skip_recycle_bin_delete_confirmation` を ON にした場合だけ、mIV の事前判定が
-`DeleteConfirmKind::RecycleBin`、かつ対象が通常の画像 / 動画 / 音声ファイルだけなら mIV 側の
-削除確認を省略する。全対象がこの条件を満たすことを必要とし、1 件でも
-`DeleteConfirmKind::MayPermanent`、実フォルダ、ZIP / PDF / 変換対象アーカイブ、または
-対象 `GridItem` を安全に照合できない項目があれば従来どおり確認する。
+`DeleteConfirmKind::RecycleBin` なら対象種類に関係なく mIV 側の削除確認を省略する。実フォルダ、
+ZIP / PDF / 変換対象アーカイブも省略対象に含む。複数選択は全対象の判定を集約し、1 件でも
+`DeleteConfirmKind::MayPermanent` なら従来どおり確認する。
 `MayPermanent` の確認は初期選択をキャンセルにする。削除対象に実フォルダを含む確認では、一覧に
 表示していないファイルもフォルダ内に含まれる旨を件数なしの定型文で常に表示する。確認文の生成では
-ディレクトリ走査や metadata I/O を行わない。Shell の最終判断は mIV から確定できないため、
+ディレクトリ走査や metadata I/O を行わない。設定 UI では、フォルダ / アーカイブ内の全ファイルを
+確認せずごみ箱へ移すこと、1 タイルが一覧未表示の多数ファイルを含み得ること、ごみ箱から復元できる
+ことを説明する。Shell の最終判断は mIV から確定できないため、
 `IFileOperation` の `FOF_WANTNUKEWARNING` は設定に関係なく維持し、完全削除になる場合の Windows
 Shell 警告を抑止しない。
 mIV が削除成功を確認した path は、
@@ -1641,6 +1650,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `thumb_aspect_auto` | bool | false | サムネイル比率の自動選択モード。`true` のときフォルダ内画像の比率に応じてグリッドセル比率を自動で切り替える。フォルダおよび安定したブックマーク仮想一覧ごとの前回確定値は `auto_aspect_cache.db` に保存され、再訪時の初期比率に使われる。ブックマーク一覧は非同期再構築前の空一覧段階から前回値を復元し、毎回 `1:1` を経由しない。キャッシュ復元時は保存時の sample 数と同等以上の実測 sample が集まるまで、途中統計による上書きを抑制する。キャッシュ管理ダイアログの現在フォルダ削除 / 全削除 / 古いキャッシュ削除で、この判定結果も対応する範囲だけ削除される (詳細: [auto-thumb-aspect-plan.md](auto-thumb-aspect-plan.md))。 |
 | `selection_info_display_mode` | SelectionInfoDisplayMode | Tooltip | 一覧の選択情報をツールチップ / 下部情報バーのどこへ出すか。`Tooltip` / `BottomBar` / `Both` / `Hidden`。未知値は sanitize で `Tooltip` に正規化する。下部情報バーはグリッドの `CentralPanel` より先に「ヘッダ + カーソル位置の 1 行 + solid 横スクロールバー専用レーン」の高さを予約し、データ行は選択やアイテム操作を受け付けない。サムネイル表示時は常にセット A、詳細表示時は `details_selection_bar_mode` に従ってセット A / C / 非表示を選ぶ。A/C ともプレビュー列は自動除外し、その幅は空白として予約せず名前列へ移す。バーのヘッダは列幅ドラッグ、列境界ダブルクリックによる一覧全体を母集団にした best-fit、列順ドラッグ、編集対象に応じた右クリック列メニューを持つが、ソートは持たない。列順ドラッグはセット A 使用時に `details_column_order`、専用セット C 使用時に `details_selection_bar_column_order` だけを書き換え、バーに描かないプレビュー列の位置は保持する。詳細表示のバーのメニューでは A / C をその場で切り替えられる。実際に表示する遅延列だけ、ツールチップ設定に関係なく選択中の 1 件をバックグラウンドで読み込む |
 | `grid_click_selection_mode` | GridClickSelectionMode | Explorer | サムネイル / 詳細表示に共通のクリック選択方式。`Explorer` は通常クリックで単一選択、空白クリックで全解除、Ctrl で個別トグル、Shift でアンカーからの範囲へ置換する。`Check` は通常 / 空白クリックで既存チェックを維持し、Shift 範囲を追加する。v2.9.0 の重要な変更点が表示対象になる更新後初回だけ `Explorer` へ切り替え、以後ユーザーが `Check` へ戻した設定は上書きしない。新しい移行フラグは持たず、`previous_last_seen_version` と重要な変更点の選択結果から導出する。未知値は sanitize で `Check` に正規化する |
+| `video_thumbnail_indicator` | VideoThumbnailIndicator | PlayIcon | 動画サムネイルの目印。`PlayIcon` は従来どおり代表画像の中央へ再生アイコン、`BottomLeftBadge` は左下へ固定文言 `VIDEO` の青緑色バッジ、`Hidden` は目印なし。中央アイコンと左下バッジは同時表示しない。サムネイル生成中の「動画」表示と、音声セルの音楽アイコンには影響しない。未知値は sanitize で `PlayIcon` に正規化する |
 | `grid_open_selected_item_on_click` | bool | false | 選択方式を問わず、選択済み項目を修飾なしのマウスクリックでもう一度クリックしたとき、Enter / ダブルクリックと同じ open を実行する。エクスプローラー方式で他のチェック項目を消して 1 件へ畳むクリック、Ctrl / Shift 付きクリック、touch-derived pointer、ダイアログ中は対象外。チェック方式の通常クリックはチェックを変更しないため、他のチェック項目があっても開く。既定 OFF では再クリックは選択操作だけを行う |
 | `grid_cursor_wrap` | bool | false | サムネイル / 詳細表示の矢印キー相当のカーソル移動を端でループする。左右は一覧の先頭 / 末尾をつなぎ、上下は同じ列の先頭行 / 最終有効行をつなぐ。Home / End / PageUp / PageDown と、詳細表示でのゲームパッド左右ページ移動は対象外 |
 | `thumb_tooltip_show_filename` | bool | true | 選択情報にファイル名を表示するか |
@@ -1678,7 +1688,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `quick_folder_slots` | `[Option<PathBuf>; 2]` | `[None, None]` | フォルダバーの A/B クイックフォルダが最後に見た場所。実フォルダまたは ZIP / PDF / 変換済みアーカイブのコンテナパスだけを永続化し、A/B 別の戻る / 進むスタックはセッション中の `App` 状態として保持する |
 | `quick_folder_drive_current_dirs` | `[BTreeMap<String, PathBuf>; 2]` | 空 | A/B クイックフォルダごとに保持するドライブ別の最後の場所。キーは `"C:"` のような大文字ドライブ表記で、`GridSwitchDriveC..Z` はアクティブな A/B スロットの値を使う |
 | `use_native_shell_context_menu` | bool | true | 実ファイル / 実フォルダの右クリックで Windows Shell 標準メニューを使うかどうか。OFF のときや仮想項目では mIV 独自メニューを表示する。Ctrl+C/X/V は設定に関わらず Windows Shell の動作を使う |
-| `skip_recycle_bin_delete_confirmation` | bool | false | mIV の事前判定が `RecycleBin` で、対象が通常の画像 / 動画 / 音声ファイルだけのときに mIV 側の削除確認を省略する。`MayPermanent`、混在選択、実フォルダ、ZIP / PDF / 変換対象アーカイブ、対象照合不能時は確認を維持する。`FOF_WANTNUKEWARNING` には影響しない |
+| `skip_recycle_bin_delete_confirmation` | bool | false | mIV の事前判定が `RecycleBin` のとき、実フォルダと ZIP / PDF / 変換対象アーカイブを含め、対象種類に関係なく mIV 側の削除確認を省略する。複数選択は 1 件でも `MayPermanent` なら確認を維持し、キャンセルを初期選択にする。`FOF_WANTNUKEWARNING` には影響しない |
 | `ring_shortcuts` | RingShortcutSettings | default | リングショートカット設定。右ドラッグ mode (`right_drag_grid` / `right_drag_image` / `right_drag_video` / `right_drag_edit`) は未使用 / リング / ジェスチャを文脈別に保持し、`short_right_click_image` / `short_right_click_video` は画像 / 動画ビューアの短い右クリックを閉じる / 何もしない / メニュー表示から個別に選ぶ（既定は閉じる）。`select_grid_item_on_right_drag_start` はグリッドの有効な右ドラッグ開始セルを押下時点で選択するかを保持する（既定 false）。旧 `mouse_flick_enabled` は互換読み込み用のグローバルリングトグルとして残す。グリッド / 画像フルスクリーン / 動画フルスクリーンごとの 8 方向スロット、4 文脈ごとのマウスジェスチャ割り当て (`mouse_gestures_*`)、`mouse_buttons_grid` / `mouse_buttons_image` / `mouse_buttons_video` によるマウス戻る / 進む / ホイールクリックの個別割り当て、リング / ジェスチャのガイド表示設定、マウスジェスチャ実行後の通知表示設定 (`mouse_gesture_result_toast_visible`、既定 true)、移行ダイアログ表示済み状態、X ピッカー初回案内の表示済み状態を保持する。通知を OFF にしてもジェスチャのアクションと、そのアクション自身が出す結果・エラー表示は抑止しない。画像 / 動画フルスクリーンのマウスボタン候補では `C:\`〜`Z:\`、お気に入り、閲覧履歴、★一覧などの場所移動系を候補外にする。マウスジェスチャ追加 UI は実際の右ドラッグ軌跡を記録して方向列へ変換し、既存ジェスチャの再記録も同じ記録ダイアログで行う。ゲームパッド X リング/ピッカーは常時有効。旧 `gamepad_ring_enabled` / `mouse_back_forward_action` は migration 用、旧 Shift / Alt + ホイール設定は互換読み込み用にのみ残す |
 | `first_setup_completed` | bool | false | 初回セットアップダイアログ (テーマ / AI 機能 / ビューワモード) を完了したか |
 | `ui_theme` | UiTheme | System | メイン UI のテーマ（System / Light / Dark）。System は Windows のアプリ用色に追従 |
@@ -1705,7 +1715,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `fullscreen_top_bar_locked` | bool | false | 静止画フルスクリーンの上部情報バーを固定表示する。ON のときは上端のバー領域を画像フィット範囲から除外する |
 | `touch_still_chrome_learned` | bool | false | 静止画 / 本フルスクリーンの初回タッチ案内でクロームを一度表示したかを示す内部学習フラグ。利用者向け設定には出さない。既存 `settings.db` にキーが無い場合は `serde(default)` により false とし、schema family や既知 enum の解釈を変えない。未出荷の旧名 `touch_center_chrome_learned` は移行コードなしで置き換える |
 | `touch_video_chrome_learned` | bool | false | 動画の初回タッチ案内で HUD を一度表示したかを示す独立した内部学習フラグ。静止画 / 本の学習状態を共有しない。`settings_kv` の加法フィールド + `serde(default)` とし、キー欠落時も既存 DB をそのまま読み込む |
-| `fullscreen_fixed_bar_gap_px` | u32 | 0 | 固定表示中の上部情報バー / 下部ページシークバーと画像領域の間隔。上下共通で 0〜100px にクランプし、固定していないバーには適用しない |
+| `fullscreen_fixed_bar_gap_px` | u32 | 0 | 固定表示中の上部情報バー / 下部シークバーと画像・映像領域の間隔。静止画と動画、上下で共通。0〜100px にクランプし、固定していないバーには適用しない |
 | `fullscreen_seek_direction` | FullscreenSeekDirection | FollowReading | ページシークバーの左右方向。`FollowReading` は横の読み方向へ合わせ、`LeftToRight` は常に左端を先頭にする。シークバーのラベル・つまみ・塗り・バー上のクリック / ドラッグ解釈で同じ値を使う |
 | `fullscreen_horizontal_cursor_direction` | FullscreenHorizontalCursorDirection | FollowPage | 通常の左右カーソルキーによるページ移動の方向。`FollowPage` はページ表示 / 読み方向に合わせる従来動作、`FollowSeekBar` は `fullscreen_seek_direction` から求めたシークバーの実効方向に合わせる。横連結中の左右スクロールと、明示的な前 / 次・Shift / Ctrl+左右・PageUp / PageDown・画面端クリック・ホイールは対象外 |
 | `fullscreen_page_number_overlay` | bool | true | 静止画フルスクリーン右下に現在ページ / 総ページ数を常時表示する。下部ページシークバーの固定表示中は非表示 |
@@ -1761,6 +1771,8 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `video_volume` | f64 | 1.0 | 動画再生時の既定音量（線形ゲイン。UI は -∞dB〜+18dB の dB フェーダー）。1.0 超は手動 boost として safety limiter 前で適用 |
 | `video_playback_speed` | f64 | 1.0 | 動画再生速度。HUD の速度ボタンから変更し、動画切替とアプリ再起動後も維持する。読み込み時は `0.25..=4.0` にクランプ |
 | `video_seek_thumbnail_tolerance_secs` | f64 | 1.0 | 動画シークバーのプレビューで許容する位置差。0.0〜30.0 秒にクランプ。desktop / Remote はバー 1 物理 px 相当の秒数との大きい方を使う |
+| `video_top_bar_locked` | bool | false | 動画の上部情報バーを固定表示する。ON のときは上端のバー領域と共通余白を映像フィット範囲から除外する。静止画設定とは独立 |
+| `video_seek_bar_locked` | bool | false | 動画の下部シークバーを固定表示する。ON のときは下端のバー領域と共通余白を映像フィット範囲から除外する。上部・静止画設定とは独立 |
 | `video_continuous_mode` | VideoContinuousMode | Off | 動画連続再生モード (Off / Continuous / ContinuousLoop)。ON の間は通常ループを無効化し、EOF で現在リスト内の次動画へ進む |
 | `video_start_muted` | bool | false | 起動時にセッション初期ミュートを true にする安全スイッチ。起動後の動画切替では `video_muted` / HUD の現在状態を優先する |
 | `video_muted` | bool | false | HUD のミュートボタン / M キーで最後に選んだミュート状態。動画切替と次回起動へ引き継ぐ |
@@ -1782,6 +1794,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `minimize_to_tray_on_close` | bool | false | ON のとき [×] で終了せずタスクトレイに常駐する。通常 fullscreen / in-window / F12 別窓 / ParkedLive の viewport と native presenter は同じ identity のまま hidden にし、動画、動画→音声モード、単体音楽の running / paused / EOF transport state を変更しない。hidden presenter は decode queue を drain して最新 frame を保持し、復帰で viewport と presenter を visible に戻すため再生中ならそのまま映像が再開する。detached / switching session と typed placement request は維持し、復帰時の外部フォルダ変更でも context を退避してから一覧へ反映する。復帰の `ShowWindow` で main focus が一時的に戻っても session は閉じない。mounted context の非 media texture とアイドル GPU 動画プールは解放するが、detached active viewer cache、稼働中 decoder / presenter / GPU frame、VST3 プラグインチェーンは保持するため、常駐中も動画 decode の CPU/GPU/電力コストを負う |
 | `network_data_dir_notice_dismissed_for` | Option\<String\> | None | ネットワーク上の data_dir に関する起動案内を「この保存先では今後表示しない」で抑止したパス。Windows の区切り・大文字小文字・通常 UNC / verbatim UNC の同値表記を正規化して比較し、別の保存先なら再案内する |
 | `pause_indexer_while_minimized` | bool | false | タスクトレイ常駐中にファイル監視 / インデックス更新を一時停止する。OFF でも常駐中は I/O 並列度を絞る |
+| `folder_thumb_sort` | SortOrder | FileName | フォルダ代表画像の自動選定順。通常一覧の `sort_order` とは独立して設定できる。FileName / Numeric / DateAsc / DateDesc |
 | `folder_thumb_depth` | u32 | 3 | フォルダ代表画像の探索最大階層数（0 で直接の子のみ） |
 | `edit_restore_prompt_enabled` | bool | true | 通常の物理フォルダを開いたとき、コピー・移動元と同じ内容のファイルを検出する。OFF では size のメモリ照合を含む検出経路を開始せず、照合目的のファイル読み取りも行わない。編集確定時の台帳記録は設定にかかわらず継続する |
 | `sidecar_backup_enabled` | bool | true | フォルダ直下に `mimageviewer.dat` (Hidden+System 属性の JSON) を作り、補正・消しゴムマスクの設定をバックアップする。フォルダ丸ごと別ドライブへ移動しても設定が保持される。OFF 時は読み書き両方スキップ |
@@ -2006,7 +2019,10 @@ AI 生成メタデータが含まれる場合、**Negative Prompt は検索対�
   表示トリム、見開き、読書位置、★、タグを一括して複製する。復元先にすでにある内容は
   上書きしない。動画 / 音声と、ZIP / PDF 内の個別ページだけを取り出したファイルは対象外。
 - 各行は既定で選択済み。コピー元が残っているか、移動により無くなっているかを表示する。
-  同じ内容の候補が複数ある場合は、最後に編集したものを既定にして別候補も選べる。
+  同じ内容の候補が複数ある行があれば、該当行数をウィンドウ上部で知らせる。各行の
+  選択欄には候補数、現在選択中のコピー元パス、移動 / コピーの別を表示し、別候補へ
+  切り替えられる。候補は最終編集時刻の降順、同点ならコピー元キーの昇順で安定して並べ、
+  編集データ量は既定選択や並べ替えに使わない。単一候補だけの場合の表示は変えない。
   「すべて選ぶ」「すべて解除」で数百件をまとめて切り替えられる。
 - チェックを外して「復元する」を押した行は今後確認しない。「閉じる」と × は何も記録せず、
   同じフォルダを次に開くと再提示する。「次から確認しない」は環境設定

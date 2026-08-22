@@ -3203,7 +3203,7 @@ pub fn load_one_cached(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{CachePolicy, SortOrder};
+    use crate::settings::{CachePolicy, Settings, SortOrder};
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -3970,6 +3970,25 @@ mod tests {
         std::fs::write(&expected, b"not decoded").unwrap();
 
         let picked = resolve_folder_thumb_image(tmp.path(), SortOrder::Numeric, 1, None);
+
+        assert_eq!(resolved_image_path(picked), Some(expected));
+    }
+
+    #[test]
+    fn default_folder_thumb_sort_picks_cover_before_numbered_sibling() {
+        let tmp = TempDir::new().unwrap();
+        let expected = tmp.path().join("00表紙.jpg");
+        std::fs::write(&expected, b"not decoded").unwrap();
+        std::fs::write(tmp.path().join("00表紙2.jpg"), b"not decoded").unwrap();
+
+        let picked = resolve_folder_thumb_image_inner(
+            tmp.path(),
+            Settings::default().folder_thumb_sort,
+            0,
+            0,
+            None,
+            tmp.path(),
+        );
 
         assert_eq!(resolved_image_path(picked), Some(expected));
     }

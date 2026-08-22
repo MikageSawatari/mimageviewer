@@ -422,6 +422,13 @@ pub enum NativeVideoInitialVisibility {
 }
 
 #[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeVideoBar {
+    Top,
+    Seek,
+}
+
+#[cfg(any(windows, test))]
 impl NativeVideoInitialVisibility {
     fn is_visible(self) -> bool {
         matches!(self, Self::Visible)
@@ -577,6 +584,9 @@ pub enum NativeVideoOutputEvent {
     ToggleTileMode,
     TogglePerfOverlay,
     ToggleSidePanelMode,
+    ToggleBarLock {
+        bar: NativeVideoBar,
+    },
     ToggleClickInfoOpen,
     OpenTouchInfoPanel,
     DismissTouchSidePanels,
@@ -935,6 +945,11 @@ enum NativeVideoOutputCommand {
         mode: crate::settings::FsSidePanelMode,
         info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
     },
+    SetBarLockState {
+        top_locked: bool,
+        seek_locked: bool,
+        fixed_bar_gap_px: u32,
+    },
     ResetSidePanelSession,
     SetLoopEnabled {
         enabled: bool,
@@ -1187,7 +1202,7 @@ impl<F> FramePresentationState<F> {
 }
 
 #[cfg(windows)]
-const NATIVE_COMMAND_LATEST_SLOTS: usize = 30;
+const NATIVE_COMMAND_LATEST_SLOTS: usize = 31;
 
 #[cfg(windows)]
 fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usize> {
@@ -1222,6 +1237,7 @@ fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usiz
         NativeVideoOutputCommand::PrepareVideoScaleSettings { .. } => Some(27),
         NativeVideoOutputCommand::CommitVideoScaleSettings { .. } => Some(28),
         NativeVideoOutputCommand::SetAnime4kState { .. } => Some(29),
+        NativeVideoOutputCommand::SetBarLockState { .. } => Some(30),
         NativeVideoOutputCommand::ResetSidePanelSession
         | NativeVideoOutputCommand::StartAnime4kMeasurement
         | NativeVideoOutputCommand::ShowToast { .. }
@@ -1852,6 +1868,16 @@ impl NativeVideoOutput {
             .send(NativeVideoOutputCommand::SetSidePanelState {
                 mode,
                 info_panel_open,
+            });
+    }
+
+    fn set_bar_lock_state(&self, top_locked: bool, seek_locked: bool, fixed_bar_gap_px: u32) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetBarLockState {
+                top_locked,
+                seek_locked,
+                fixed_bar_gap_px,
             });
     }
 
@@ -2986,6 +3012,7 @@ fn send_native_overlay_command(
         Command::ToggleTileMode => NativeVideoOutputEvent::ToggleTileMode,
         Command::TogglePerfOverlay => NativeVideoOutputEvent::TogglePerfOverlay,
         Command::ToggleSidePanelMode => NativeVideoOutputEvent::ToggleSidePanelMode,
+        Command::ToggleBarLock { bar } => NativeVideoOutputEvent::ToggleBarLock { bar },
         Command::ToggleClickInfoOpen => NativeVideoOutputEvent::ToggleClickInfoOpen,
         Command::OpenTouchInfoPanel => NativeVideoOutputEvent::OpenTouchInfoPanel,
         Command::DismissTouchSidePanels => NativeVideoOutputEvent::DismissTouchSidePanels,
@@ -3970,6 +3997,21 @@ fn run_native_video_output(
                 } => {
                     presenter.set_overlay_side_panel_state(mode, info_panel_open);
                 }
+                NativeVideoOutputCommand::SetBarLockState {
+                    top_locked,
+                    seek_locked,
+                    fixed_bar_gap_px,
+                } => {
+                    if let Err(err) = presenter.set_overlay_bar_lock_state(
+                        top_locked,
+                        seek_locked,
+                        fixed_bar_gap_px,
+                    ) {
+                        crate::logger::log(format!(
+                            "[native-video] set fixed-bar transform failed: {err}"
+                        ));
+                    }
+                }
                 NativeVideoOutputCommand::ResetSidePanelSession => {
                     presenter.reset_overlay_side_panel_session();
                 }
@@ -4585,7 +4627,11 @@ fn run_native_video_output(
                     suggested_rect,
                 } => {
                     let ppp = (*dpi as f32 / 96.0).max(0.5);
-                    presenter.set_overlay_pixels_per_point(ppp);
+                    if let Err(err) = presenter.set_overlay_pixels_per_point(ppp) {
+                        crate::logger::log(format!(
+                            "[native-video] set DPI fixed-bar transform failed: {err}"
+                        ));
+                    }
                     let rect_w = (suggested_rect.right - suggested_rect.left).max(1) as u32;
                     let rect_h = (suggested_rect.bottom - suggested_rect.top).max(1) as u32;
                     match presenter.resize_overlay_surface_only(rect_w, rect_h) {
@@ -4743,6 +4789,13 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::ToggleSidePanelMode,
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::ToggleBarLock { bar } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::ToggleBarLock { bar },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ToggleClickInfoOpen => {
@@ -7885,6 +7938,18 @@ impl VideoPlayer {
     ) {
         if let Some(output) = self.native_output.as_ref() {
             output.set_side_panel_state(mode, info_panel_open);
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn set_native_bar_lock_state(
+        &self,
+        top_locked: bool,
+        seek_locked: bool,
+        fixed_bar_gap_px: u32,
+    ) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_bar_lock_state(top_locked, seek_locked, fixed_bar_gap_px);
         }
     }
 

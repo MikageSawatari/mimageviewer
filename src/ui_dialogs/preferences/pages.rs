@@ -586,9 +586,10 @@ pub(super) fn draw_recycle_bin_delete_confirmation_setting(
     );
     ui.label(
         egui::RichText::new(
-            "ファイルだけが対象のときに省略します。フォルダや ZIP / PDF / 対応アーカイブ、\
-             完全に削除される可能性がある場所では確認を表示します。Windows が完全削除の\
-             警告を表示する場合は、その警告も表示されます。",
+            "ON にすると、ごみ箱へ移せる項目は確認せずに移動を始めます。フォルダや ZIP / PDF /\
+             対応アーカイブを削除すると、中にあるすべてのファイルをごみ箱へ移します。1 つの項目に、\
+             一覧に表示されていない多数のファイルが含まれる場合があります。ごみ箱に残っている間は\
+             元に戻せます。完全に削除される可能性がある場合は、この設定が ON でも確認します。",
         )
         .weak(),
     );
@@ -639,6 +640,13 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
             }
             ui.small("アーカイブ類: ZIP / PDF / 対応アーカイブ");
         });
+    });
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
+    anchored(ui, state, "thumbnail/video-indicator", |ui, state| {
+        draw_video_thumbnail_indicator_settings(ui, &mut state.settings);
     });
 
     ui.add_space(12.0);
@@ -748,6 +756,30 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
             "閲覧履歴: 閲覧位置",
         );
     });
+}
+
+pub(super) fn draw_video_thumbnail_indicator_settings(
+    ui: &mut egui::Ui,
+    settings: &mut settings::Settings,
+) {
+    ui.label(egui::RichText::new("動画サムネイルの目印").strong());
+    ui.horizontal(|ui| {
+        ui.label("表示:");
+        egui::ComboBox::from_id_salt("video_thumbnail_indicator")
+            .selected_text(settings.video_thumbnail_indicator.label())
+            .show_ui(ui, |ui| {
+                for &indicator in crate::settings::VideoThumbnailIndicator::all() {
+                    ui.selectable_value(
+                        &mut settings.video_thumbnail_indicator,
+                        indicator,
+                        indicator.label(),
+                    );
+                }
+            });
+    });
+    ui.small(
+        "動画の代表画像に重ねる再生アイコンを、左下の小さなバッジへ替えるか、非表示にできます。音声の音楽アイコンには影響しません。",
+    );
 }
 
 pub(super) fn page_slideshow(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -6028,6 +6060,25 @@ pub(super) fn page_update_check(ui: &mut egui::Ui, state: &mut PreferencesState)
     });
 }
 
+pub(super) fn draw_video_bar_visibility_settings(
+    ui: &mut egui::Ui,
+    settings: &mut crate::settings::Settings,
+) {
+    ui.label(egui::RichText::new("再生画面のバー").strong());
+    ui.add_space(4.0);
+    ui.label("動画の上部と下部のバーをそれぞれ固定表示できます。");
+    ui.add_space(6.0);
+
+    ui.checkbox(&mut settings.video_top_bar_locked, "上部情報バーを固定表示");
+    ui.small("ON のときは再生画面上端に情報バー領域を確保し、映像をその下の領域にフィットします。上部情報バー端の鍵アイコンからも切り替えできます。");
+    ui.checkbox(
+        &mut settings.video_seek_bar_locked,
+        "下部シークバーを固定表示",
+    );
+    ui.small("ON のときは再生画面下端にシークバー領域を確保し、映像をその上の領域にフィットします。下部シークバー端の鍵アイコンからも切り替えできます。");
+    ui.small("固定バーと映像の間隔は、静止画フルスクリーンと共通の余白設定を使います。");
+}
+
 pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
     {
         anchored(ui, state, "video/hardware-decode", |ui, state| {
@@ -6068,6 +6119,11 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
             egui::RichText::new("自動: インターレースとしてデコードされたフレームだけ補正。切り替え後は次に開く動画から反映されます。")
                 .small(),
         );
+        });
+
+        ui.add_space(12.0);
+        anchored(ui, state, "video/bar-visibility", |ui, state| {
+            draw_video_bar_visibility_settings(ui, &mut state.settings);
         });
 
         ui.add_space(12.0);
@@ -7464,7 +7520,7 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     anchored(ui, state, "spread/bar-gap", |ui, state| {
         let s = &mut state.settings;
         ui.horizontal(|ui| {
-            ui.label("固定バーと画像の間隔");
+            ui.label("固定バーと表示内容の間隔");
             ui.add(
                 egui::DragValue::new(&mut s.fullscreen_fixed_bar_gap_px)
                     .range(0..=crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX)
@@ -7472,7 +7528,7 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                     .suffix(" px"),
             );
         });
-        ui.small("固定表示中の上部情報バーと下部ページシークバーに共通で適用します。0 px ではバーの直後まで画像領域として使います。");
+        ui.small("静止画と動画の固定表示中の上部情報バー / 下部シークバーに共通で適用します。0 px ではバーの直後まで画像・映像領域として使います。");
     });
     anchored(ui, state, "spread/page-number", |ui, state| {
         let s = &mut state.settings;

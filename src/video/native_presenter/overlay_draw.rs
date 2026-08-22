@@ -2238,6 +2238,57 @@ pub(super) fn draw_native_top_button(
     *x -= width + gap;
 }
 
+pub(super) fn draw_native_bar_lock_button(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    id: &'static str,
+    locked: bool,
+    tooltip: &'static str,
+    bar: crate::video::NativeVideoBar,
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
+    let resp = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
+    draw_overlay_button_bg(painter, rect, resp.hovered(), locked);
+    crate::ui_fullscreen::draw_icons::draw_seek_lock_icon(
+        painter,
+        rect.center(),
+        rect.width().min(rect.height()) * 0.28,
+        locked,
+    );
+    let resp = resp.hover_tip_dark(tooltip);
+    if resp.clicked() {
+        commands.push(NativeOverlayCommand::ToggleBarLock { bar });
+    }
+}
+
+pub(super) fn native_top_bar_lock_button_rect(overlay_width_points: f32) -> egui::Rect {
+    let button_size = 28.0;
+    let gap = 8.0;
+    let close_x = overlay_width_points - 12.0 - button_size;
+    egui::Rect::from_min_size(
+        egui::pos2(close_x - button_size - gap, 13.0),
+        egui::vec2(button_size, button_size),
+    )
+}
+
+pub(super) fn native_seek_bar_lock_button_rect(
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+) -> egui::Rect {
+    let button_size = 28.0;
+    let side_pad = 10.0;
+    let controls_top = (overlay_height_points - crate::video::native_presenter::HUD_BOTTOM_HEIGHT
+        + crate::video::native_presenter::HUD_SEEK_ROW_HEIGHT)
+        .max(0.0);
+    let y = controls_top
+        + (crate::video::native_presenter::HUD_CONTROLS_ROW_HEIGHT - button_size) * 0.5;
+    egui::Rect::from_min_size(
+        egui::pos2(overlay_width_points - side_pad - button_size, y),
+        egui::vec2(button_size, button_size),
+    )
+}
+
 fn draw_overlay_info_icon(painter: &egui::Painter, rect: egui::Rect, click_to_show: bool) {
     let c = rect.center();
     let r = rect.width().min(rect.height()) * 0.3;
@@ -3668,7 +3719,13 @@ pub(super) fn draw_native_normalize_progress(
 }
 
 pub(super) fn draw_top_bar_background(painter: &egui::Painter, overlay_width_points: f32) {
-    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(overlay_width_points, 54.0));
+    let rect = egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(
+            overlay_width_points,
+            crate::video::native_presenter::HUD_TOP_HEIGHT,
+        ),
+    );
     painter.rect_filled(
         rect,
         0.0,
@@ -3717,6 +3774,7 @@ pub(super) fn draw_native_top_bar(
     // 音楽ビュー上バーと同じ VST・フルスクリーン切替・閉じるだけにする。
     audio_only: bool,
     side_panel_mode: crate::settings::FsSidePanelMode,
+    top_bar_locked: bool,
     dimmed: bool,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
@@ -3724,8 +3782,13 @@ pub(super) fn draw_native_top_bar(
         .order(egui::Order::Foreground)
         .fixed_pos(egui::Pos2::ZERO)
         .show(ctx, |ui| {
-            let rect =
-                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(overlay_width_points, 54.0));
+            let rect = egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(
+                    overlay_width_points,
+                    crate::video::native_presenter::HUD_TOP_HEIGHT,
+                ),
+            );
             ui.set_min_size(rect.size());
             let painter = ui.painter().clone();
             draw_top_bar_background(&painter, overlay_width_points);
@@ -3791,6 +3854,22 @@ pub(super) fn draw_native_top_bar(
                 NativeOverlayCommand::CloseFullscreen,
                 commands,
             );
+            let lock_rect = native_top_bar_lock_button_rect(overlay_width_points);
+            draw_native_bar_lock_button(
+                ui,
+                &painter,
+                lock_rect,
+                "native_top_bar_lock",
+                top_bar_locked,
+                if top_bar_locked {
+                    "上部情報バー固定を解除"
+                } else {
+                    "上部情報バーを固定表示"
+                },
+                crate::video::NativeVideoBar::Top,
+                commands,
+            );
+            x -= btn_size + gap;
             draw_native_top_button(
                 ui,
                 &painter,
@@ -3925,8 +4004,13 @@ pub(super) fn draw_native_top_bar_tile(
         .order(egui::Order::Foreground)
         .fixed_pos(egui::Pos2::ZERO)
         .show(ctx, |ui| {
-            let rect =
-                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(overlay_width_points, 54.0));
+            let rect = egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(
+                    overlay_width_points,
+                    crate::video::native_presenter::HUD_TOP_HEIGHT,
+                ),
+            );
             ui.set_min_size(rect.size());
             let painter = ui.painter().clone();
             draw_top_bar_background(&painter, overlay_width_points);
@@ -4107,8 +4191,13 @@ pub(super) fn draw_native_navigation_preview(
         .order(egui::Order::Foreground)
         .fixed_pos(egui::Pos2::ZERO)
         .show(ctx, |ui| {
-            let rect =
-                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(overlay_width_points, 54.0));
+            let rect = egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(
+                    overlay_width_points,
+                    crate::video::native_presenter::HUD_TOP_HEIGHT,
+                ),
+            );
             ui.set_min_size(rect.size());
             let painter = ui.painter().clone();
             draw_top_bar_background(&painter, overlay_width_points);
@@ -6640,6 +6729,53 @@ pub(super) fn layout_truncated_to_width(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_bar_lock_button_click_emits_the_selected_toggle_command() {
+        use egui_kittest::Harness;
+        use std::sync::{Arc, Mutex};
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_ui = Arc::clone(&captured);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(80.0, 80.0))
+            .build(move |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let painter = ui.painter().clone();
+                    let mut commands = Vec::new();
+                    draw_native_bar_lock_button(
+                        ui,
+                        &painter,
+                        egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(28.0, 28.0)),
+                        "native_bar_lock_click_test",
+                        false,
+                        "シークバーを固定表示",
+                        crate::video::NativeVideoBar::Seek,
+                        &mut commands,
+                    );
+                    captured_for_ui.lock().unwrap().extend(commands);
+                });
+            });
+        harness.run();
+        let center = egui::pos2(24.0, 24.0);
+        harness.hover_at(center);
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: center,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.run();
+
+        assert!(captured.lock().unwrap().iter().any(|command| matches!(
+            command,
+            NativeOverlayCommand::ToggleBarLock {
+                bar: crate::video::NativeVideoBar::Seek
+            }
+        )));
+    }
 
     fn snapshot_video_adjustment_panel(
         name: &str,

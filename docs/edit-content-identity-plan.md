@@ -5,8 +5,14 @@ OS 側 (エクスプローラー等) でファイルを移動・コピーする�
 本機能は **ファイル内容のハッシュ**を identity として編集内容を再結合し、
 利用者に確認したうえで新しい場所へ複製する。
 
-- 状態: **Phase 1 + A4 実装済み** (A1 台帳と記録 / A2 検出 / A3a コピーエンジン /
-  A3b 確認 UI / A4 schema migration・folder-open backfill) (2026-08-22)
+- 状態: **Phase 1 実装済み・実機確認済み (2026-08-22)**。A1 台帳 / A2 検出 / A3a コピー / A3b 復元 UI に加え、実機で見つかった 5 件を修正済み
+- **未着手 (次にやること)**:
+  1. **A6 複数コピー元の選択 UI** — 正本 [briefs/edit-identity-a6-multi-source-choice.md](briefs/edit-identity-a6-multi-source-choice.md)。実機で 3 候補が全部 `last_edit_at = 0` で同点になり、
+     注釈を持つ原本が既定に選ばれなかった。backfill 由来の行は必ず 0 なので §5 の既定順は同点で機能しない
+  2. **アプリ内コピー / ページ移動の同じ穴** — `apply_book_page_edit_copies` も comic 行をコピー後に
+     共有後処理へ入るが、そこは `comic_docs` を失効しない。復元と同じ削除事故が起こり得る (A4 の調査で判明、未修正)
+  3. **注釈サムネイルの再起動後消失** — 復元経由の分は `edit_previews` のファイル所有修正で解消。
+     復元を通っていないファイルでも起きるかは未確認。`edit_preview_close:` の計装が理由を名指しする
 - 関連: [preset-and-adjustment.md §9](preset-and-adjustment.md) (フォルダ側サイドカー)、
   [src/rename_key_migration.rs](../src/rename_key_migration.rs) (アプリ内リネーム移行)、
   [src/metadata_transfer.rs](../src/metadata_transfer.rs) (明示的なメタ情報書き出し / 取り込み)
@@ -209,8 +215,10 @@ metadata_transfer は 2 と 4 が同時に存在するとエラーにする (imp
 5. 残りを mpsc で UI へ返し、復元ウィンドウを出す。
 
 - **フルスクリーン中は提示しない**。検出結果は保持し、一覧に戻ったときに出す。
-- 候補が複数ある (同一内容のファイルが複数箇所で別々に編集されている) 場合は
-  `last_edit_at` が新しいものを既定に、他を選べるようにする。
+- 候補が複数ある (同一内容のファイルが複数箇所で別々に編集されている) 場合は、
+  `last_edit_at` 降順 → `file_key` 昇順で並べる。`last_edit_at` がすべて 0 の backfill 行も
+  順序を安定させ、既定の先頭候補以外を利用者が選べるようにする。編集データ量は
+  既定選択にも並べ替えにも使わない。
 
 ---
 
@@ -224,10 +232,12 @@ metadata_transfer は 2 と 4 が同時に存在するとエラーにする (imp
 このフォルダに、以前編集したファイルと内容が同じファイルが 3 件あります。
 編集内容 (補正・消しゴム・モザイク・注釈・トリミング・★・タグ) を複製しますか?
 
+1 件、複数のコピー元があります。コピー元を選択してください。
+
   [すべて選ぶ] [すべて解除]
 
   ☑ IMG_0421.jpg   ← D:\photo\2025\IMG_0421.jpg (移動)
-  ☑ chapter03.cbz  ← D:\manga\chapter03.cbz (コピー元は残っています)   [他 2 件の候補 ▼]
+  ☑ chapter03.cbz  ← コピー元を選択 (3 件) [D:\manga\chapter03.cbz (コピー元は残っています) ▼]
   ☐ scan.pdf       ← E:\old\scan.pdf (コピー元は残っています)
 
   □ 次から確認しない (環境設定で元に戻せます)
@@ -241,6 +251,10 @@ metadata_transfer は 2 と 4 が同時に存在するとエラーにする (imp
 - **1 件ずつ聞かない**。フォルダ丸ごとコピーで数百件になるため、フォルダ単位の一括提示。
 - **[すべて選ぶ] / [すべて解除]** を必ず置く。
 - 移動 (元が消えている) とコピー (元が残っている) を行に明示する。既定チェックは両方 ON。
+- 複数のコピー元を持つ行が 1 つでもあれば、ウィンドウ上部に該当行数と選択を促す注意を
+  表示する。単一候補だけなら注意を出さず、従来の行表示も変えない。
+- 複数候補の行は候補数を明示し、選択欄自体に現在のコピー元パスと移動 / コピーの別を
+  表示する。候補を切り替えると、その行の実際の復元元も同じ選択へ切り替わる。
 - 復元範囲は一括 (項目別チェックボックスは持たない)。
 
 ### 6.2 「もう聞かない」の粒度 (決定)
@@ -305,6 +319,16 @@ INSERT OR IGNORE INTO t (c1, c2, ...) SELECT ?new, c2, ... FROM t WHERE c1 = ?ol
 - **`rating.db` の `source_path` 列は導出値**。`migrate_store`
   ([src/rename_key_migration.rs:750](../src/rename_key_migration.rs:750)) と同じ再計算 UPDATE が
   copy 側にも要る。
+- **`edit_preview_cache.db` の `cached_path` と `annotation_layers_json[].path` は
+  row が所有する WebP の絶対パス**。generic copy の後、その mapping で実際に insert できた row
+  だけを per-store fixup へ渡す。下地 + 全注釈 layer が現行の source-key directory に揃っている
+  ことを先に確認し、同じ content-hash filename を destination-key directory へコピーしてから 2 列を
+  書き換える。source file が 1 つでも欠ける / layout が不正なら destination row を削除し、dangling row
+  を増やさない。destination conflict は generic `INSERT OR IGNORE` の結果に含まれないため触らない。
+  `copy_exact` 自体は store を知らないまま維持する。
+- `reading_history.path` は destination raw path なので、既存の non-generic descriptor fixup が exact
+  copy 後に書き換える。`edit_origin` の destination metadata は後段の `mark_restored_origin` が target
+  file を stat して昇格時に確定する。
 - **非一意テーブル (`video_bookmarks`)** は id 再採番が要るので v1 の対象外 (Phase 2)。
 - busy_timeout を付けて本体側の接続と共存する (rusqlite の既定は 5 秒。
   `journal_mode` 変更だけでは効かない点に注意)。
@@ -315,11 +339,20 @@ INSERT OR IGNORE INTO t (c1, c2, ...) SELECT ?new, c2, ... FROM t WHERE c1 = ?ol
    (`App::with_sidecar_coords_mut`)。ここを抜かすと、そのフォルダを次に丸ごと移動したときに
    また失われる。
 2. **メモリ presence 集合の更新** (`adjusted_page_keys` / `mask_page_keys` / `conceal_page_keys` /
-   `local_adjust_page_keys` / `comic_page_keys`)。グリッドのバッジとスマートフォルダ集計が参照する。
-3. `clear_page_edit_state` / `rating_cache.clear()` / `invalidate_rating_counts_cache()` /
-   `clear_tags_cache()` — `finish_book_page_edit_mapping`
-   ([src/app.rs:30752](../src/app.rs:30752)) と同じ後始末を再利用する。
-4. 復元先にも `edit_origin` 行を作る (以後そのファイルが新たなコピー元になり得る)。
+   `local_adjust_page_keys` / `comic_page_keys` / `rotation_page_keys`)。グリッドのバッジと
+   スマートフォルダ集計が参照する。
+3. **復元先キーに materialize 済みの read-once cache を対象限定で失効する**。
+   `comic_docs` の空 `Vec` (DB の no-row を表す sentinel)、`rotation_cache` の `None`、
+   復元前の edit preview を保持する thumbnail だけを worker report の destination page key で
+   未読 / 再要求へ戻す。特に `comic_docs` を全 clear せず、実際に復元された comic key だけを
+   `remove` する。
+4. 通常の物理フォルダ一覧がまだ current なら、rename 完了と同じ `current_folder` prefix から
+   `rehydrate_page_edit_state_for_current_items` を呼び、復元先の idx-keyed page edit state
+   (補正 / ローカル調整 / crop / 表示トリム / 消しゴム / 隠蔽 / 注釈 presence) をその場で再構築する。
+   完了待ちの間に検索・snapshot 等の合成 view へ移った場合は `is_physical_folder_listing()` が
+   false になるため `clear_page_edit_state` のみとし、overlay を出さない既存契約を維持する。
+   続けて `rating_cache.clear()` / `invalidate_rating_counts_cache()` / `clear_tags_cache()` を行う。
+5. 復元先にも `edit_origin` 行を作る (以後そのファイルが新たなコピー元になり得る)。
 
 **A3a / A3b 実装メモ (2026-08-21)**:
 
@@ -331,8 +364,8 @@ INSERT OR IGNORE INTO t (c1, c2, ...) SELECT ?new, c2, ... FROM t WHERE c1 = ?ol
   v1 対象外。正規化は各 descriptor の `normalization` から決める。候補 1 件でも 100 件でも
   copy 対象 DB は 21 回だけ開き、`content_identity.db` の昇格 / 拒否記録と runtime state
   読み出しも候補単位では開き直さない。
-- worker report は DB copy 後の destination 状態から sidecar mirror と 5 種類の presence 差分を
-  作る。A3b の短命 worker 完了後、既存 App owner へそれを適用し、
+- worker report は DB copy 後の destination 状態から sidecar mirror、6 種類の presence 差分、
+  sidecar-backed edit key の和集合を作る。A3b の短命 worker 完了後、既存 App owner へそれを適用し、
   `finish_book_page_edit_mapping` と同じ cache invalidation を呼ぶ。sidecar の同期 flush は
   増やさない。
 - target の `edit_origin` は `has_restorable_content = 1` へ昇格し、A2 の次回 index で復元元に
@@ -358,6 +391,9 @@ INSERT OR IGNORE INTO t (c1, c2, ...) SELECT ?new, c2, ... FROM t WHERE c1 = ?ol
 - 段 0 で size 不一致なら**ファイルを一切開かない**こと (I/O 呼び出し回数を数える)
 - 設定 OFF で検出 worker が起動しないこと
 - `rating.source_path` が新キー基準に再計算されること
+- edit preview の下地 + 注釈 layer が destination key directory に複製され、row の両 path 列が
+  destination files を指すこと。source / destination のどちらを invalidate しても他方の files が残ること
+- source WebP が 1 つでも欠ける edit preview は destination row を残さないこと
 
 ---
 
