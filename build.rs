@@ -9,6 +9,9 @@ fn main() {
     // CARGO_CFG_TARGET_OS 環境変数で実行時判定する。
     let target_is_windows = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
 
+    // Native video NIS is compiled by D3D11 from this converter output at pipeline creation.
+    generate_video_nis_hlsl();
+
     // 先に vendor ファイルの存在チェックをして、cryptic な include_bytes! エラーに
     // 代わって復旧手順付きの明確なメッセージを出す。
     if target_is_windows {
@@ -71,6 +74,39 @@ fn main() {
             eprintln!("winresource compile error: {e}");
         }
     }
+}
+
+/// Convert the canonical WGSL NIS shader to Shader Model 5 HLSL.
+///
+/// `gpu_nis.wgsl` remains the single source for the NIS coefficients and algorithm.
+/// Native video consumes only this generated output; it does not carry a second hand port.
+fn generate_video_nis_hlsl() {
+    use naga::back::hlsl;
+    use naga::valid::{Capabilities, ValidationFlags, Validator};
+
+    const SOURCE_PATH: &str = "src/gpu_nis.wgsl";
+    println!("cargo:rerun-if-changed={SOURCE_PATH}");
+    let source = std::fs::read_to_string(SOURCE_PATH)
+        .unwrap_or_else(|error| panic!("read {SOURCE_PATH}: {error}"));
+    let module = naga::front::wgsl::parse_str(&source)
+        .unwrap_or_else(|error| panic!("parse {SOURCE_PATH}: {error}"));
+    let info = Validator::new(ValidationFlags::all(), Capabilities::all())
+        .validate(&module)
+        .unwrap_or_else(|error| panic!("validate {SOURCE_PATH}: {error}"));
+    let options = hlsl::Options {
+        shader_model: hlsl::ShaderModel::V5_0,
+        ..Default::default()
+    };
+    let pipeline_options = hlsl::PipelineOptions::default();
+    let mut output = String::new();
+    hlsl::Writer::new(&mut output, &options, &pipeline_options)
+        .write(&module, &info, None)
+        .unwrap_or_else(|error| panic!("convert {SOURCE_PATH} to HLSL: {error}"));
+
+    let out_dir = std::env::var_os("OUT_DIR").expect("OUT_DIR");
+    let output_path = std::path::PathBuf::from(out_dir).join("video_nis.hlsl");
+    std::fs::write(&output_path, output)
+        .unwrap_or_else(|error| panic!("write {}: {error}", output_path.display()));
 }
 
 /// 同梱 FFmpeg のビルド識別子を `MIV_FFMPEG_BUILD_ID` として埋め込む。

@@ -451,6 +451,9 @@ pub(super) fn draw_native_video_left_panel(
     panel_tab: &mut NativeVideoLeftPanelTab,
     adjustment_tab: &mut NativeVideoAdjustmentTab,
     adjustments: &mut crate::creative_lut::VideoAdjustments,
+    scale_filter: &mut crate::settings::VideoScaleFilter,
+    downscale_smoothing_percent: &mut u32,
+    scale_outside_note: Option<&str>,
     preset_slots: &[Option<String>],
     creative_luts: &[crate::creative_lut::CreativeLutChoice],
     commands: &mut Vec<NativeOverlayCommand>,
@@ -540,6 +543,9 @@ pub(super) fn draw_native_video_left_panel(
                     adjustment_tab,
                     preset_slots,
                     adjustments,
+                    scale_filter,
+                    downscale_smoothing_percent,
+                    scale_outside_note,
                     creative_luts,
                     commands,
                 ),
@@ -568,6 +574,9 @@ fn draw_native_video_adjustment_body(
     tab: &mut NativeVideoAdjustmentTab,
     preset_slots: &[Option<String>],
     adjustments: &mut crate::creative_lut::VideoAdjustments,
+    scale_filter: &mut crate::settings::VideoScaleFilter,
+    downscale_smoothing_percent: &mut u32,
+    scale_outside_note: Option<&str>,
     creative_luts: &[crate::creative_lut::CreativeLutChoice],
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
@@ -713,6 +722,57 @@ fn draw_native_video_adjustment_body(
                     );
                 }
                 NativeVideoAdjustmentTab::Filter => {
+                    ui.label(egui::RichText::new("動画の拡大方法").strong());
+                    let previous_filter = *scale_filter;
+                    egui::ComboBox::from_id_salt("native_video_scale_filter")
+                        .selected_text(scale_filter.label())
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            for filter in crate::settings::VideoScaleFilter::ALL {
+                                ui.selectable_value(scale_filter, filter, filter.label());
+                            }
+                        });
+                    if *scale_filter != previous_filter {
+                        commands.push(NativeOverlayCommand::RequestVideoScaleSettings {
+                            filter: *scale_filter,
+                            smoothing_percent: *downscale_smoothing_percent,
+                        });
+                    }
+
+                    if *scale_filter != crate::settings::VideoScaleFilter::OsDefault {
+                        ui.add_space(4.0);
+                        let response = ui.add(
+                            egui::Slider::new(
+                                downscale_smoothing_percent,
+                                crate::settings::DOWNSCALE_SMOOTHING_PERCENT_MIN
+                                    ..=crate::settings::DOWNSCALE_SMOOTHING_PERCENT_MAX,
+                            )
+                            .step_by(crate::settings::DOWNSCALE_SMOOTHING_PERCENT_STEP as f64)
+                            .suffix("%")
+                            .text("縮小時のなめらかさ"),
+                        );
+                        if response.changed() {
+                            *downscale_smoothing_percent =
+                                crate::settings::sanitize_downscale_smoothing_percent(
+                                    *downscale_smoothing_percent,
+                                );
+                            commands.push(NativeOverlayCommand::RequestVideoScaleSettings {
+                                filter: *scale_filter,
+                                smoothing_percent: *downscale_smoothing_percent,
+                            });
+                        }
+                    }
+                    if let Some(note) = scale_outside_note {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(note)
+                                .small()
+                                .color(egui::Color32::from_rgb(255, 190, 100)),
+                        );
+                    }
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(6.0);
                     ui.label(egui::RichText::new("Creative LUT").strong());
                     ui.label(
                         egui::RichText::new("環境設定 > 表示 > LUT で登録した .cube を適用")
@@ -6511,6 +6571,9 @@ mod tests {
         adjustment_tab: NativeVideoAdjustmentTab,
         mut adjustments: crate::creative_lut::VideoAdjustments,
         creative_luts: Vec<crate::creative_lut::CreativeLutChoice>,
+        initial_scale_filter: crate::settings::VideoScaleFilter,
+        initial_downscale_smoothing_percent: u32,
+        scale_outside_note: Option<String>,
     ) {
         use egui_kittest::Harness;
 
@@ -6522,6 +6585,8 @@ mod tests {
         let entries = Vec::new();
         let jump_texture_ids = HashMap::new();
         let preset_slots = vec![None; 10];
+        let mut scale_filter = initial_scale_filter;
+        let mut downscale_smoothing_percent = initial_downscale_smoothing_percent;
         let mut harness = Harness::builder()
             .with_size(egui::vec2(340.0, 650.0))
             .build(move |ctx| {
@@ -6546,6 +6611,9 @@ mod tests {
                     &mut panel_tab,
                     &mut adjustment_tab,
                     &mut adjustments,
+                    &mut scale_filter,
+                    &mut downscale_smoothing_percent,
+                    scale_outside_note.as_deref(),
                     &preset_slots,
                     &creative_luts,
                     &mut commands,
@@ -6568,6 +6636,9 @@ mod tests {
                 ..Default::default()
             },
             Vec::new(),
+            crate::settings::VideoScaleFilter::OsDefault,
+            0,
+            None,
         );
     }
 
@@ -6592,6 +6663,12 @@ mod tests {
                 loaded: true,
                 error: None,
             }],
+            crate::settings::VideoScaleFilter::Sharp,
+            35,
+            Some(crate::ui_helpers::processing_size_outside_note_for(
+                "動画",
+                "長辺 8192px 以下・総画素数 16777216px 以下",
+            )),
         );
     }
 

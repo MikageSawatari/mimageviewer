@@ -35,6 +35,9 @@ struct NisParams {
     source_size: vec2<u32>,
     source_origin: vec2<f32>,
     source_extent: vec2<f32>,
+    inverse_x: vec2<f32>,
+    inverse_y: vec2<f32>,
+    inverse_offset: vec2<f32>,
 };
 
 @group(0) @binding(0)
@@ -590,7 +593,12 @@ fn fs_nis(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     for (var row = 0u; row < 6u; row += 1u) {
         for (var col = 0u; col < 6u; col += 1u) {
             let offset = vec2<i32>(i32(col) - 2, i32(row) - 2);
-            let coord = clamp(source_floor + offset, vec2<i32>(0), maximum);
+            let oriented_coord = vec2<f32>(source_floor + offset);
+            let raw_position =
+                oriented_coord.x * params.inverse_x +
+                oriented_coord.y * params.inverse_y +
+                params.inverse_offset;
+            let coord = clamp(vec2<i32>(round(raw_position)), vec2<i32>(0), maximum);
             let index = row * 6u + col;
             pixels[index] = textureLoad(source_texture, coord, 0);
             luma[index] = get_y(pixels[index].rgb);

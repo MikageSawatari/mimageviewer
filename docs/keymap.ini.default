@@ -468,6 +468,7 @@
 # VideoPin = P ; 現在の再生位置を代表フレームとしてピン留めする
 # VideoPerfOverlay = F ; 動画の性能オーバーレイを切り替える
 # VideoTileMode = S ; 動画タイルモードを切り替える
+# VideoScaleFilterNext = T ; 動画の拡大方法を順に切り替える
 # VideoBookmark = B ; 現在の再生位置にブックマークを追加する
 # VideoCapture = Ctrl+S ; 現在の動画フレームをキャプチャ保存する
 # VideoAddToActiveBook = Ctrl+B ; 現在の動画フレームを追加先の本へ追加する

@@ -239,14 +239,20 @@ mod tests {
     }
 
     #[test]
-    fn standard_uses_the_display_resolution() {
-        assert_eq!(
-            decide_video_surface_size(input(VideoScaleFilter::Standard)),
-            VideoSurfaceSizeDecision::DisplayResolution {
-                width: 1280,
-                height: 720,
-            }
-        );
+    fn every_shader_filter_uses_the_display_resolution() {
+        for filter in [
+            VideoScaleFilter::Standard,
+            VideoScaleFilter::Sharp,
+            VideoScaleFilter::Nearest,
+        ] {
+            assert_eq!(
+                decide_video_surface_size(input(filter)),
+                VideoSurfaceSizeDecision::DisplayResolution {
+                    width: 1280,
+                    height: 720,
+                }
+            );
+        }
     }
 
     #[test]

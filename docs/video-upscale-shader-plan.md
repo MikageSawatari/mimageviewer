@@ -1,22 +1,22 @@
 # 動画の拡大・縮小を mIV のシェーダで行う
 
-ステータス: **Phase A Step 1 構造コア実装済み / Step 2 UI・追加フィルタ未実装**
+ステータス: **Phase A 実装済み / 実機画質・性能比較待ち**
 対象: [next-release-backlog.md](next-release-backlog.md) §1.47
 関連: [upscale-algorithm-selection.md](upscale-algorithm-selection.md) (静止画側の正本) /
 [video-architecture.md](video-architecture.md) / [display-pipeline.md](display-pipeline.md) /
 [dot-by-dot-and-downscale-plan.md](dot-by-dot-and-downscale-plan.md)
 
-2026-08-22 の Step 1 では `OS に任せる` と `標準` (Lanczos3) だけを renderer まで接続した。
-既定は実機比較前の挙動不変を優先して `OS に任せる` とし、設定値は永続化するが UI はまだ
-公開しない。`シャープ` / `ニアレスト`、左パネル、キー操作、利用者向け文書は Step 2 で行う。
+2026-08-22 に Phase A を実装した。`OS に任せる` / `標準` / `ニアレスト` / `シャープ` を
+動画左パネルとキー操作から切り替えられる。実機比較前の挙動不変を優先し、既定は
+`OS に任せる` のままとする。Anime4K、GPU 時間計測、モデル自動選択は Phase B で行う。
 
 静止画は v2.11.0 で縮小に GPU Lanczos、v2.12.0 で拡大に Lanczos3 / NIS / Anime4K を入れた。
-動画は**表示構造が違うため mIV のシェーダを一切通っておらず**、拡大縮小は DWM / DComp に
-任せたままになっている。本書はその構造を変える設計を定める。
+Phase A 導入前の動画は**表示構造が違うため mIV のシェーダを一切通っておらず**、拡大縮小を
+DWM / DComp に任せていた。本書は、その構造を変えた設計と残る Phase B を定める。
 
 ---
 
-## 1. 現状構造 — なぜ mIV のシェーダが通らないか
+## 1. 導入前の構造 — なぜ mIV のシェーダが通らなかったか
 
 ```
 デコード → ID3D11VideoProcessor で NV12→BGRA8 (動画解像度のまま)
@@ -79,7 +79,7 @@
 「シェーダで出した表示解像度サーフェス」も「リサイズ中の古いサーフェス」も**同じ式で正しい
 倍率が出る**。この関数は無改造でよい。
 
-Step 1 の実コードでは Lanczos pass が SAR と orientation を表示解像度サーフェスへ焼き込む。
+Phase A の実コードでは Lanczos pass が SAR と orientation を表示解像度サーフェスへ焼き込む。
 そのため関数本体は無変更のまま、表示解像度 content の呼び出しだけ 1/1・identity の幾何を
 渡す。リサイズ中の古い表示解像度サーフェスは同じ関数が現 viewport へ stretch し、最後の
 `GeometryChanged` から 150ms 新しい寸法 sample がないときだけ settled edge を 1 回発行する。
@@ -89,6 +89,17 @@ interactive / child / maximize / programmatic resize に共通する信頼でき
 主用途である全画面再生ではそもそもリサイズが起きないので、常用経路では差し替えが一度も
 発生しない。
 
+### 2.2.1 表示 surface の上限
+
+Phase A は長辺 8192px、総画素数 4096×4096 = 16,777,216px を上限とする。4K の表示矩形は
+入るが、8K UHD (7680×4320 = 33,177,600px) は `OS に任せる` へ fallback する。これは 3-buffer
+BGRA swap chain、Lanczos の中間 RT、grade RT、retired surface、共有 frame が同時に存在する際の
+VRAM spike と allocation failure を抑える保守的な固定 backstop であり、画質上の境界ではない。
+
+reported VRAM へ単純比例させない。Windows の adapter memory は共有・他 process 使用・budget 変動を
+含み、搭載量だけでは現在の安全な確保量にならない。将来広げるなら、現在の DXGI budget と既存
+mIV resource を計測し、固定 reserve と絶対上限を併用する policy を実機 telemetry で決める。
+Phase A では比較データがないため上限値を変更しない。
 ### 2.3 却下した案
 
 | 案 | 内容 | 却下理由 |
@@ -108,7 +119,7 @@ interactive / child / maximize / programmatic resize に共通する信頼でき
 
 | 項目 | 内容 |
 | --- | --- |
-| 標準 (既定) | 拡大・縮小とも Lanczos3。静止画の `PostFilter::None` と同じ考え方 |
+| 標準 | 拡大・縮小とも Lanczos3。静止画の `PostFilter::None` と同じ考え方 |
 | シャープ | 拡大に NVIDIA Image Scaling。縮小は Lanczos3 |
 | ニアレスト | 拡大 NEAREST、縮小 Lanczos3 (静止画と同じ規則) |
 | 物理等倍 | リサンプルせず元テクスチャを直接コピー。**今の `CopySubresourceRegion` がまさにそれ**なので、1.0 倍は現状動作を維持する |
@@ -165,7 +176,9 @@ Phase A の構造をそのまま使う。§4 以降が対象。
 ### 4.3 HLSL 生成
 
 presenter は wgpu ではなく生の D3D11 なので、WGSL はそのまま使えない。**移植ではなく
-コンバータの出力先追加**として扱う (元の GLSL は同じ)。
+コンバータの出力先追加**として扱う。Phase A の NIS は正本の `gpu_nis.wgsl` を Naga で
+ビルド時に HLSL へ変換し、手書き移植を持たない。Anime4K は将来、正本の GLSL から WGSL / HLSL
+を同じ変換系で生成する。
 
 踏むところ:
 
@@ -303,15 +316,18 @@ presenter は wgpu ではなく生の D3D11 なので、WGSL はそのまま使�
 
 具体的な要求:
 
-- シェーダはビルド時 `fxc` でバイトコード化 (§4.3)
-- 中間テクスチャは切替前にワーカーで確保し、完成してから原子的に有効化する
+- Anime4K のシェーダはビルド時 `fxc` でバイトコード化 (§4.3)
+- 中間テクスチャは切替前に準備し、完成してから原子的に有効化する。Phase B の大量の
+  Anime4K resource はワーカー生成を前提とする
 - 一時停止中の切り替えも即反映する。既存の `SetVideoGrade` が持つ「Visible なら 1 回だけ
   再提示」の仕組みをそのまま使う (`FramePresentationState`)
 
-Step 1 は runtime selector をまだ持たない。grade と Lanczos3 の全 HLSL は
-`NativeRenderCore` 作成時にコンパイルし、表示寸法依存の中間 texture は最初の Standard present
-前に確保する。Step 2 で runtime 切替を接続するときは、切替 command を publish する前に現在の
-source / target 寸法用 resource を準備し、この節の「切替の瞬間に確保しない」を維持すること。
+Phase A の全シェーダは `NativeRenderCore` 作成時にコンパイルする。切替は prepare / commit の
+2 段階で、D3D resource の owner である render thread 上の prepare が現在の source / target 寸法用の
+中間 texture と、必要なら visual 未接続の次 surface を作る。寸法を含む request signature が一致した
+ときだけ App が commit command を publish し、commit と一時停止中の held frame 再提示には
+コンパイルも確保も残さない。prepare 後に
+geometry が変わった request は stale として破棄し、古い surface を接続しない。
 
 残る 1 つの避けられないコスト: 差し替え時の `WaitForCommitCompletion()` + `DwmFlush()` で
 レンダースレッドが最大 1 コンポジタ tick (8〜16ms) 止まる。切替の瞬間だけで、既に
@@ -327,7 +343,7 @@ source / target 寸法用 resource を準備し、この節の「切替の瞬間
 ([overlay_draw.rs](../src/video/native_presenter/overlay_draw.rs) の
 `NativeVideoAdjustmentTab::Filter`、現在は Creative LUT を置いている)。
 
-- 拡大方法の選択肢 (OS に任せる / 標準 / ニアレスト / シャープ / アニメ塗り)
+- Phase A の拡大方法 (OS に任せる / 標準 / ニアレスト / シャープ)。アニメ塗りは Phase B で追加する
 - Anime4K を選んだときだけ、予算プリセットと**再測定ボタン**を同じ場所に出す
 - 現在選ばれているモデルと根拠 (`Anime4K L / 予測 6.2ms / 予算 16.7ms`) をその場に表示する
 - 測定中は「測定中 (3/6)」
@@ -341,16 +357,16 @@ source / target 寸法用 resource を準備し、この節の「切替の瞬間
 
 ソースが測定上限を超えて標準拡大へ落ちる場合、静止画と同じ書式で選択肢の直下に出す:
 
-> （この動画は処理対象サイズ 長辺 1920px 以下の範囲外なので実行されません）
+> （この動画は処理対象サイズ 長辺 8192px 以下・総画素数 16777216px 以下の範囲外なので実行されません）
 
-`processing_size_outside_note` をそのまま使う。
+`processing_size_outside_note_for` で静止画側と同じ書式を共有する。
 
 ### 7.3 キー操作
 
 CLAUDE.md の方針どおり `KeyAction` に足す:
 
 - 動画の拡大方法の切り替え (静止画の `FsPostFilterUpscaleAnime` 等に対応するもの)
-- **アップスケール品質の再測定**
+- **アップスケール品質の再測定** (Phase B)
 
 `ini_name()` / `context()` / `trigger()` / `default_chords()` / `ALL_ACTIONS` / 呼び出し側
 helper / [keymap.ini.default](keymap.ini.default) を揃える。
@@ -433,8 +449,8 @@ VRAM は §4.1 のとおり。detached で動画を 2 面同時再生するこ�
 Phase A で約 2 週間、Phase B で約 2 週間 (いずれも実機往復を含まない)。
 **Phase A は測定を待たずに着手してよい。**
 
-Step 1 完了範囲は A-1、A-2 の Lanczos3、A-3 の永続設定配線・typed fallback・基礎計装である。
-NIS / nearest と UI / keymap は dispatch の Step 2 へ分けた。
+Phase A の A-1〜A-3 は完了した。NIS / nearest、動画専用の縮小なめらかさ、左パネル、
+keymap、prepare / commit 切替、typed fallback と基礎計装まで実装済みである。
 
 ---
 

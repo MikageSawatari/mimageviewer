@@ -1762,7 +1762,7 @@ fn resample_region_params_uniform(
 }
 
 fn nis_params_uniform(device: &wgpu::Device, plan: NisUpscalePlan) -> wgpu::Buffer {
-    let mut bytes = [0_u8; 32];
+    let mut bytes = [0_u8; 56];
     bytes[..4].copy_from_slice(&plan.target_size[0].to_ne_bytes());
     bytes[4..8].copy_from_slice(&plan.target_size[1].to_ne_bytes());
     bytes[8..12].copy_from_slice(&plan.source_size[0].to_ne_bytes());
@@ -1770,6 +1770,9 @@ fn nis_params_uniform(device: &wgpu::Device, plan: NisUpscalePlan) -> wgpu::Buff
     for (offset, value) in plan.source_region_px.into_iter().enumerate() {
         let start = 16 + offset * 4;
         bytes[start..start + 4].copy_from_slice(&value.to_ne_bytes());
+    }
+    for (offset, value) in [1.0_f32, 0.0, 0.0, 1.0, 0.0, 0.0].into_iter().enumerate() {
+        bytes[32 + offset * 4..36 + offset * 4].copy_from_slice(&value.to_ne_bytes());
     }
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: None,

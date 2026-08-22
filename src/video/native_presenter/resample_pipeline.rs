@@ -18,8 +18,10 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC};
 use windows::core::{Interface, PCSTR};
 
+use crate::settings::VideoScaleFilter;
 use crate::video::display_metadata::VideoOrientation;
 
+const NIS_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/video_nis.hlsl"));
 const RESAMPLE_SHADER: &[u8] = br#"
 Texture2D<float4> source_tex : register(t0);
 
@@ -102,6 +104,18 @@ float4 ps_vertical(VsOut input) : SV_Target {
     }
     return abs(weight_sum) > 1.0e-6 ? accumulated / weight_sum : accumulated;
 }
+
+float4 ps_nearest(VsOut input) : SV_Target {
+    float2 oriented_position =
+        input.position.xy * axis_filter.xy / source_target.zw - 0.5;
+    float2 raw_position =
+        round(oriented_position.x) * inverse_axes.xy
+        + round(oriented_position.y) * inverse_axes.zw
+        + inverse_offset.xy;
+    int2 raw_max = int2(source_target.xy) - 1;
+    int2 raw_coord = clamp(int2(round(raw_position)), int2(0, 0), raw_max);
+    return source_tex.Load(int3(raw_coord, 0));
+}
 "#;
 
 #[repr(C)]
@@ -111,6 +125,45 @@ struct ResampleConstants {
     axis_filter: [f32; 4],
     inverse_axes: [f32; 4],
     inverse_offset: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NisConstants {
+    target_size: [u32; 2],
+    source_size: [u32; 2],
+    source_origin: [f32; 2],
+    source_extent: [f32; 2],
+    inverse_x: [f32; 2],
+    inverse_y: [f32; 2],
+    inverse_offset: [f32; 2],
+    _padding: [f32; 2],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum VideoResampleMode {
+    Lanczos3 { smoothing_percent: u32 },
+    Nis,
+    Nearest,
+}
+
+pub(super) fn select_video_resample_mode(
+    filter: VideoScaleFilter,
+    source_axis_width: u32,
+    source_axis_height: u32,
+    target_width: u32,
+    target_height: u32,
+    smoothing_percent: u32,
+) -> Option<VideoResampleMode> {
+    if filter == VideoScaleFilter::OsDefault {
+        return None;
+    }
+    let downscaling = target_width < source_axis_width || target_height < source_axis_height;
+    Some(match (filter, downscaling) {
+        (VideoScaleFilter::Sharp, false) => VideoResampleMode::Nis,
+        (VideoScaleFilter::Nearest, false) => VideoResampleMode::Nearest,
+        _ => VideoResampleMode::Lanczos3 { smoothing_percent },
+    })
 }
 
 struct IntermediateTarget {
@@ -123,25 +176,43 @@ struct IntermediateTarget {
 
 pub(super) struct VideoResamplePipeline {
     vertex_shader: ID3D11VertexShader,
+    nis_vertex_shader: ID3D11VertexShader,
     horizontal_shader: ID3D11PixelShader,
     vertical_shader: ID3D11PixelShader,
+    nearest_shader: ID3D11PixelShader,
+    nis_shader: ID3D11PixelShader,
     constants: ID3D11Buffer,
+    nis_constants: ID3D11Buffer,
     intermediate: Option<IntermediateTarget>,
 }
 
 impl VideoResamplePipeline {
     pub(super) fn new(device: &ID3D11Device1) -> Result<Self, String> {
-        let vertex_blob = compile_shader("vs_main", "vs_5_0")?;
-        let horizontal_blob = compile_shader("ps_horizontal", "ps_5_0")?;
-        let vertical_blob = compile_shader("ps_vertical", "ps_5_0")?;
+        let vertex_blob = compile_resample_shader("vs_main", "vs_5_0")?;
+        let horizontal_blob = compile_resample_shader("ps_horizontal", "ps_5_0")?;
+        let vertical_blob = compile_resample_shader("ps_vertical", "ps_5_0")?;
+        let nearest_blob = compile_resample_shader("ps_nearest", "ps_5_0")?;
+        let nis_vertex_blob = compile_shader_source(NIS_SHADER, "vs_main", "vs_5_0")?;
+        let nis_blob = compile_shader_source(NIS_SHADER, "fs_nis", "ps_5_0")?;
         let mut vertex_shader = None;
+        let mut nis_vertex_shader = None;
         let mut horizontal_shader = None;
         let mut vertical_shader = None;
+        let mut nearest_shader = None;
+        let mut nis_shader = None;
         let mut constants = None;
+        let mut nis_constants = None;
         unsafe {
             device
                 .CreateVertexShader(blob_bytes(&vertex_blob), None, Some(&mut vertex_shader))
                 .map_err(|error| format!("CreateVertexShader resample: {error:?}"))?;
+            device
+                .CreateVertexShader(
+                    blob_bytes(&nis_vertex_blob),
+                    None,
+                    Some(&mut nis_vertex_shader),
+                )
+                .map_err(|error| format!("CreateVertexShader NIS: {error:?}"))?;
             device
                 .CreatePixelShader(
                     blob_bytes(&horizontal_blob),
@@ -152,6 +223,12 @@ impl VideoResamplePipeline {
             device
                 .CreatePixelShader(blob_bytes(&vertical_blob), None, Some(&mut vertical_shader))
                 .map_err(|error| format!("CreatePixelShader resample vertical: {error:?}"))?;
+            device
+                .CreatePixelShader(blob_bytes(&nearest_blob), None, Some(&mut nearest_shader))
+                .map_err(|error| format!("CreatePixelShader nearest: {error:?}"))?;
+            device
+                .CreatePixelShader(blob_bytes(&nis_blob), None, Some(&mut nis_shader))
+                .map_err(|error| format!("CreatePixelShader NIS: {error:?}"))?;
             let constants_desc = D3D11_BUFFER_DESC {
                 ByteWidth: std::mem::size_of::<ResampleConstants>() as u32,
                 Usage: D3D11_USAGE_DEFAULT,
@@ -161,16 +238,33 @@ impl VideoResamplePipeline {
             device
                 .CreateBuffer(&constants_desc, None, Some(&mut constants))
                 .map_err(|error| format!("CreateBuffer resample constants: {error:?}"))?;
+            let nis_constants_desc = D3D11_BUFFER_DESC {
+                ByteWidth: std::mem::size_of::<NisConstants>() as u32,
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+                ..Default::default()
+            };
+            device
+                .CreateBuffer(&nis_constants_desc, None, Some(&mut nis_constants))
+                .map_err(|error| format!("CreateBuffer NIS constants: {error:?}"))?;
         }
         Ok(Self {
             vertex_shader: vertex_shader
                 .ok_or_else(|| "CreateVertexShader resample returned null".to_string())?,
+            nis_vertex_shader: nis_vertex_shader
+                .ok_or_else(|| "CreateVertexShader NIS returned null".to_string())?,
             horizontal_shader: horizontal_shader
                 .ok_or_else(|| "CreatePixelShader resample horizontal returned null".to_string())?,
             vertical_shader: vertical_shader
                 .ok_or_else(|| "CreatePixelShader resample vertical returned null".to_string())?,
+            nearest_shader: nearest_shader
+                .ok_or_else(|| "CreatePixelShader nearest returned null".to_string())?,
+            nis_shader: nis_shader
+                .ok_or_else(|| "CreatePixelShader NIS returned null".to_string())?,
             constants: constants
                 .ok_or_else(|| "CreateBuffer resample constants returned null".to_string())?,
+            nis_constants: nis_constants
+                .ok_or_else(|| "CreateBuffer NIS constants returned null".to_string())?,
             intermediate: None,
         })
     }
@@ -196,7 +290,11 @@ impl VideoResamplePipeline {
         source_height: u32,
         target_width: u32,
         orientation: VideoOrientation,
+        mode: VideoResampleMode,
     ) -> Result<(), String> {
+        if !matches!(mode, VideoResampleMode::Lanczos3 { .. }) {
+            return Ok(());
+        }
         let (width, height) =
             Self::intermediate_dimensions(source_width, source_height, target_width, orientation);
         if self
@@ -240,6 +338,7 @@ impl VideoResamplePipeline {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn draw(
         &self,
         device: &ID3D11Device1,
@@ -251,6 +350,49 @@ impl VideoResamplePipeline {
         target_width: u32,
         target_height: u32,
         orientation: VideoOrientation,
+        mode: VideoResampleMode,
+    ) -> Result<(), String> {
+        match mode {
+            VideoResampleMode::Lanczos3 { smoothing_percent } => self.draw_lanczos(
+                device,
+                context,
+                source,
+                target,
+                source_width,
+                source_height,
+                target_width,
+                target_height,
+                orientation,
+                smoothing_percent,
+            ),
+            VideoResampleMode::Nis | VideoResampleMode::Nearest => self.draw_single_pass(
+                device,
+                context,
+                source,
+                target,
+                source_width,
+                source_height,
+                target_width,
+                target_height,
+                orientation,
+                mode,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_lanczos(
+        &self,
+        device: &ID3D11Device1,
+        context: &ID3D11DeviceContext,
+        source: &ID3D11Texture2D,
+        target: &ID3D11Texture2D,
+        source_width: u32,
+        source_height: u32,
+        target_width: u32,
+        target_height: u32,
+        orientation: VideoOrientation,
+        smoothing_percent: u32,
     ) -> Result<(), String> {
         let (intermediate_width, intermediate_height) =
             Self::intermediate_dimensions(source_width, source_height, target_width, orientation);
@@ -266,6 +408,15 @@ impl VideoResamplePipeline {
         let mapping = inverse_orientation_mapping(source_width, source_height, orientation);
         let source_axis_x = mapping.source_axis_x as f32;
         let source_axis_y = mapping.source_axis_y as f32;
+        let blur_factor = crate::settings::downscale_smoothing_blur_factor(smoothing_percent);
+        let stretch = |source_axis: f32, target_axis: u32| {
+            let ratio = source_axis / target_axis.max(1) as f32;
+            if ratio > 1.0 {
+                ratio * blur_factor
+            } else {
+                1.0
+            }
+        };
         let constants = ResampleConstants {
             source_target: [
                 source_width.max(1) as f32,
@@ -276,8 +427,8 @@ impl VideoResamplePipeline {
             axis_filter: [
                 source_axis_x,
                 source_axis_y,
-                (source_axis_x / target_width.max(1) as f32).max(1.0),
-                (source_axis_y / target_height.max(1) as f32).max(1.0),
+                stretch(source_axis_x, target_width),
+                stretch(source_axis_y, target_height),
             ],
             inverse_axes: [
                 mapping.inverse_x[0],
@@ -315,6 +466,103 @@ impl VideoResamplePipeline {
             context.OMSetRenderTargets(None, None);
             context.PSSetShader(&self.vertical_shader, None);
             context.PSSetShaderResources(0, Some(&[Some(intermediate.shader_view.clone())]));
+            context.RSSetViewports(Some(&[viewport(target_width, target_height)]));
+            context.OMSetRenderTargets(Some(&[Some(target_view)]), None);
+            context.Draw(3, 0);
+
+            context.PSSetShaderResources(0, Some(&[None]));
+            context.OMSetRenderTargets(None, None);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_single_pass(
+        &self,
+        device: &ID3D11Device1,
+        context: &ID3D11DeviceContext,
+        source: &ID3D11Texture2D,
+        target: &ID3D11Texture2D,
+        source_width: u32,
+        source_height: u32,
+        target_width: u32,
+        target_height: u32,
+        orientation: VideoOrientation,
+        mode: VideoResampleMode,
+    ) -> Result<(), String> {
+        let source_view = create_shader_view(device, source)?;
+        let target_view = create_render_target(device, target)?;
+        let mapping = inverse_orientation_mapping(source_width, source_height, orientation);
+        let common_constants = ResampleConstants {
+            source_target: [
+                source_width.max(1) as f32,
+                source_height.max(1) as f32,
+                target_width.max(1) as f32,
+                target_height.max(1) as f32,
+            ],
+            axis_filter: [
+                mapping.source_axis_x as f32,
+                mapping.source_axis_y as f32,
+                1.0,
+                1.0,
+            ],
+            inverse_axes: [
+                mapping.inverse_x[0],
+                mapping.inverse_x[1],
+                mapping.inverse_y[0],
+                mapping.inverse_y[1],
+            ],
+            inverse_offset: [mapping.offset[0], mapping.offset[1], 0.0, 0.0],
+        };
+        let nis_constants = NisConstants {
+            target_size: [target_width.max(1), target_height.max(1)],
+            source_size: [source_width.max(1), source_height.max(1)],
+            source_origin: [0.0, 0.0],
+            source_extent: [mapping.source_axis_x as f32, mapping.source_axis_y as f32],
+            inverse_x: mapping.inverse_x,
+            inverse_y: mapping.inverse_y,
+            inverse_offset: mapping.offset,
+            _padding: [0.0, 0.0],
+        };
+
+        unsafe {
+            context.IASetInputLayout(None);
+            context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            context.RSSetState(None);
+            context.OMSetBlendState(None, None, u32::MAX);
+            context.OMSetDepthStencilState(None, 0);
+            match mode {
+                VideoResampleMode::Nearest => {
+                    context.UpdateSubresource(
+                        &self.constants,
+                        0,
+                        None,
+                        (&common_constants as *const ResampleConstants).cast(),
+                        0,
+                        0,
+                    );
+                    context.VSSetShader(&self.vertex_shader, None);
+                    context.PSSetConstantBuffers(0, Some(&[Some(self.constants.clone())]));
+                    context.PSSetShader(&self.nearest_shader, None);
+                }
+                VideoResampleMode::Nis => {
+                    context.UpdateSubresource(
+                        &self.nis_constants,
+                        0,
+                        None,
+                        (&nis_constants as *const NisConstants).cast(),
+                        0,
+                        0,
+                    );
+                    context.VSSetShader(&self.nis_vertex_shader, None);
+                    context.PSSetConstantBuffers(1, Some(&[Some(self.nis_constants.clone())]));
+                    context.PSSetShader(&self.nis_shader, None);
+                }
+                VideoResampleMode::Lanczos3 { .. } => {
+                    return Err("Lanczos3 entered the single-pass resampler".to_string());
+                }
+            }
+            context.PSSetShaderResources(0, Some(&[Some(source_view)]));
             context.RSSetViewports(Some(&[viewport(target_width, target_height)]));
             context.OMSetRenderTargets(Some(&[Some(target_view)]), None);
             context.Draw(3, 0);
@@ -391,15 +639,23 @@ fn viewport(width: u32, height: u32) -> D3D11_VIEWPORT {
     }
 }
 
-fn compile_shader(entry: &'static str, target: &'static str) -> Result<ID3DBlob, String> {
+fn compile_resample_shader(entry: &'static str, target: &'static str) -> Result<ID3DBlob, String> {
+    compile_shader_source(RESAMPLE_SHADER, entry, target)
+}
+
+fn compile_shader_source(
+    source: &[u8],
+    entry: &'static str,
+    target: &'static str,
+) -> Result<ID3DBlob, String> {
     let mut bytecode = None;
     let mut errors = None;
     let entry = std::ffi::CString::new(entry).expect("static shader entry");
     let target = std::ffi::CString::new(target).expect("static shader target");
     let result = unsafe {
         D3DCompile(
-            RESAMPLE_SHADER.as_ptr().cast(),
-            RESAMPLE_SHADER.len(),
+            source.as_ptr().cast(),
+            source.len(),
             PCSTR::null(),
             None,
             None::<&ID3DInclude>,
@@ -472,9 +728,44 @@ mod tests {
 
     #[test]
     fn resample_hlsl_compiles_for_shader_model_5() {
-        compile_shader("vs_main", "vs_5_0").expect("vertex shader");
-        compile_shader("ps_horizontal", "ps_5_0").expect("horizontal shader");
-        compile_shader("ps_vertical", "ps_5_0").expect("vertical shader");
+        compile_resample_shader("vs_main", "vs_5_0").expect("vertex shader");
+        compile_resample_shader("ps_horizontal", "ps_5_0").expect("horizontal shader");
+        compile_resample_shader("ps_vertical", "ps_5_0").expect("vertical shader");
+        compile_resample_shader("ps_nearest", "ps_5_0").expect("nearest shader");
+    }
+
+    #[test]
+    fn nis_converter_output_compiles_for_shader_model_5() {
+        compile_shader_source(NIS_SHADER, "vs_main", "vs_5_0").expect("NIS vertex shader");
+        compile_shader_source(NIS_SHADER, "fs_nis", "ps_5_0").expect("NIS pixel shader");
+    }
+
+    #[test]
+    fn phase_a_filter_modes_use_lanczos_for_every_downscale() {
+        assert_eq!(
+            select_video_resample_mode(VideoScaleFilter::Sharp, 1280, 720, 1920, 1080, 40),
+            Some(VideoResampleMode::Nis)
+        );
+        assert_eq!(
+            select_video_resample_mode(VideoScaleFilter::Nearest, 1280, 720, 1920, 1080, 40),
+            Some(VideoResampleMode::Nearest)
+        );
+        for filter in [
+            VideoScaleFilter::Standard,
+            VideoScaleFilter::Sharp,
+            VideoScaleFilter::Nearest,
+        ] {
+            assert_eq!(
+                select_video_resample_mode(filter, 3840, 2160, 1920, 1080, 40),
+                Some(VideoResampleMode::Lanczos3 {
+                    smoothing_percent: 40
+                })
+            );
+        }
+        assert_eq!(
+            select_video_resample_mode(VideoScaleFilter::OsDefault, 1280, 720, 1920, 1080, 40),
+            None
+        );
     }
 
     #[test]

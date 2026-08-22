@@ -388,6 +388,7 @@ egui_kittest = { version = "0.33", features = ["snapshot", "wgpu"] }
 
 [build-dependencies]
 winresource = "0.1"
+naga = { version = "27", features = ["wgsl-in", "hlsl-out"] }
 
 # 通常テストでは行番号付きバックトレースを保ちつつ、型情報を含む巨大な PDB を避ける。
 [profile.test]

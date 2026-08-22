@@ -45,6 +45,36 @@ NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終�
   decoder thread → video_tx → native-video-render が pull → 自前 swap chain に present
 ```
 
+### Native presenter の表示解像度 scaling
+
+`Settings::video_scale_filter` の既定 `OS に任せる` は、従来どおり source 解像度の video swap
+chain を DComp transform で拡大・縮小する。Phase A の 3 方式は映像表示矩形の物理 pixel 寸法で
+swap chain を持ち、SAR / orientation を含めて source から表示寸法へ resolve する。この場合の
+video visual transform は等倍 + 中央寄せだけになる。
+
+```
+decoder の BGRA frame
+  ├─ 補正なし ─────────────────────────────┐
+  └─ 色調 / Creative LUT → source 解像度 RT ┤
+                                               ├─ 物理 1:1 → 既存 direct copy
+                                               └─ 表示寸法へ resolve
+                                                   ├─ 標準: Lanczos3
+                                                   ├─ シャープ: 拡大 NIS / 縮小 Lanczos3
+                                                   └─ ニアレスト: 拡大 nearest / 縮小 Lanczos3
+```
+
+grade の identity path は source texture を resolve へ直接渡すので余分な copy を増やさない。
+縮小 Lanczos3 のなめらかさは静止画設定と分け、動画専用値を使う。Phase A の shader は render
+pipeline 作成時にすべて compile する。設定変更は prepare / commit の 2 段階で、現在の source /
+target 寸法用 intermediate texture と visual 未接続の次 surface を prepare した後、request と
+geometry が一致するときだけ allocation-free の commit を publish する。一時停止中は保持中の
+Visible frame を commit 直後に 1 回再提示する。
+
+resize 中は現在の surface を維持し、最後の geometry sample から 150ms 変化がない settled edge
+で 1 回だけ新寸法へ交換する。この区間は失敗 retry ではなく、終了通知を持たない複数種の Windows
+resize stream を一つの state transition に畳む境界である。表示寸法が長辺 8192px または総画素数
+16,777,216px を超える場合と、pipeline / intermediate / display swap chain / backbuffer の作成失敗は
+typed fallback として perf へ理由・累積件数を出し、その要求では legacy OS path を使う。
 Stage 4 (2026-07-29) 以降、HWND owner と GPU work は別 thread である。
 `native-video-window-pump` は全 placement の create/message dispatch/mutate/destroy と typed
 window-host reducer だけを所有し、GPU ack や render join を同期 wait しない。

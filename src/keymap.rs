@@ -1703,6 +1703,7 @@ pub enum KeyAction {
     VideoPin,
     VideoPerfOverlay,
     VideoTileMode,
+    VideoScaleFilterNext,
     VideoBookmark,
     VideoCapture,
     VideoAddToActiveBook,
@@ -2155,6 +2156,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::VideoPin,
     KeyAction::VideoPerfOverlay,
     KeyAction::VideoTileMode,
+    KeyAction::VideoScaleFilterNext,
     KeyAction::VideoBookmark,
     KeyAction::VideoCapture,
     KeyAction::VideoAddToActiveBook,
@@ -3678,6 +3680,7 @@ impl KeyAction {
             VideoPin => "VideoPin",
             VideoPerfOverlay => "VideoPerfOverlay",
             VideoTileMode => "VideoTileMode",
+            VideoScaleFilterNext => "VideoScaleFilterNext",
             VideoBookmark => "VideoBookmark",
             VideoCapture => "VideoCapture",
             VideoAddToActiveBook => "VideoAddToActiveBook",
@@ -4235,6 +4238,7 @@ impl KeyAction {
             VideoPin => "現在の再生位置を代表フレームとしてピン留めする",
             VideoPerfOverlay => "動画の性能オーバーレイを切り替える",
             VideoTileMode => "動画タイルモードを切り替える",
+            VideoScaleFilterNext => "動画の拡大方法を順に切り替える",
             VideoBookmark => "現在の再生位置にブックマークを追加する",
             VideoCapture => "現在の動画フレームをキャプチャ保存する",
             VideoAddToActiveBook => "現在の動画フレームを追加先の本へ追加する",
@@ -4657,6 +4661,7 @@ impl KeyAction {
             | VideoPin
             | VideoPerfOverlay
             | VideoTileMode
+            | VideoScaleFilterNext
             | VideoBookmark
             | VideoCapture
             | VideoAddToActiveBook
@@ -5061,6 +5066,7 @@ impl KeyAction {
             | VideoPin
             | VideoPerfOverlay
             | VideoTileMode
+            | VideoScaleFilterNext
             | VideoBookmark
             | VideoCapture
             | VideoAddToActiveBook
@@ -5506,6 +5512,7 @@ impl KeyAction {
             VideoPin => ChordList::one(Chord::key(P)),
             VideoPerfOverlay => ChordList::one(Chord::key(F)),
             VideoTileMode => ChordList::one(Chord::key(S)),
+            VideoScaleFilterNext => ChordList::one(Chord::key(T)),
             VideoBookmark => ChordList::one(Chord::key(B)),
             VideoCapture => ChordList::one(Chord::ctrl(S)),
             VideoAddToActiveBook => ChordList::one(Chord::ctrl(B)),

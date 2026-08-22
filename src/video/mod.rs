@@ -370,6 +370,8 @@ pub struct NativeVideoOutputConfig {
     pub video_grade: crate::creative_lut::VideoGradeSnapshot,
     /// Startup-selected native video scaling owner.
     pub scale_filter: crate::settings::VideoScaleFilter,
+    /// Video-only Lanczos3 downscale smoothness (0..=100, step 10).
+    pub downscale_smoothing_percent: u32,
     /// CP7: HUD raise の allowlist 判定 (`foreground_allows_hud_raise`) で参照する
     /// VST editor container HWND の snapshot。App が `dsp_bridge.editor_hwnds_snapshot()` を
     /// 渡す。`None` のとき HUD HWND を作っても raise 判定で常に false (= raise 起動しない)
@@ -527,6 +529,19 @@ pub enum NativeVideoOutputEvent {
     SetVideoAdjustments {
         adjustments: crate::creative_lut::VideoAdjustments,
         persist: bool,
+    },
+    RequestVideoScaleSettings {
+        filter: crate::settings::VideoScaleFilter,
+        smoothing_percent: u32,
+    },
+    VideoScaleSettingsPrepared {
+        request_id: u64,
+        filter: crate::settings::VideoScaleFilter,
+        smoothing_percent: u32,
+    },
+    VideoScaleSettingsCommitted {
+        filter: crate::settings::VideoScaleFilter,
+        smoothing_percent: u32,
     },
     SetPlaybackSpeed {
         speed: f64,
@@ -768,6 +783,16 @@ enum NativeVideoOutputCommand {
     SetVideoGrade {
         grade: crate::creative_lut::VideoGradeSnapshot,
     },
+    PrepareVideoScaleSettings {
+        request_id: u64,
+        filter: crate::settings::VideoScaleFilter,
+        smoothing_percent: u32,
+    },
+    CommitVideoScaleSettings {
+        request_id: u64,
+        filter: crate::settings::VideoScaleFilter,
+        smoothing_percent: u32,
+    },
     SetMetadata {
         metadata: Option<native_presenter::NativeOverlayMetadata>,
     },
@@ -997,7 +1022,15 @@ impl<F> FramePresentationState<F> {
     }
 
     fn should_represent_for_grade_change(&self, render_grade_changed: bool) -> bool {
-        render_grade_changed && matches!(self, Self::Visible { .. })
+        self.should_represent_for_visual_change(render_grade_changed)
+    }
+
+    fn should_represent_for_scale_change(&self, scale_changed: bool) -> bool {
+        self.should_represent_for_visual_change(scale_changed)
+    }
+
+    fn should_represent_for_visual_change(&self, changed: bool) -> bool {
+        changed && matches!(self, Self::Visible { .. })
     }
 
     fn is_hidden(&self) -> bool {
@@ -1019,7 +1052,7 @@ impl<F> FramePresentationState<F> {
 }
 
 #[cfg(windows)]
-const NATIVE_COMMAND_LATEST_SLOTS: usize = 27;
+const NATIVE_COMMAND_LATEST_SLOTS: usize = 29;
 
 #[cfg(windows)]
 fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usize> {
@@ -1051,6 +1084,8 @@ fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usiz
         NativeVideoOutputCommand::SetNormalizeOverlayState { .. } => Some(24),
         NativeVideoOutputCommand::RaiseHudToTop => Some(25),
         NativeVideoOutputCommand::RaisePresenterToFront => Some(26),
+        NativeVideoOutputCommand::PrepareVideoScaleSettings { .. } => Some(27),
+        NativeVideoOutputCommand::CommitVideoScaleSettings { .. } => Some(28),
         NativeVideoOutputCommand::ResetSidePanelSession
         | NativeVideoOutputCommand::ShowToast { .. }
         | NativeVideoOutputCommand::SwitchSource { .. }
@@ -1236,6 +1271,8 @@ pub(crate) struct NativeVideoOutput {
     /// `take/attach_native_output` で presenter と一緒に運ばれるため lifetime 正しい。
     #[allow(dead_code)]
     committed_generation: AtomicU64,
+    /// Monotonic identity for the two-phase video scaling prepare/commit handshake.
+    video_scale_request_id: AtomicU64,
     last_vst3_available: AtomicBool,
     last_checked: AtomicBool,
     last_text_contrast_strong: AtomicBool,
@@ -1325,6 +1362,7 @@ impl NativeVideoOutput {
             perf_overlay_visible: Arc::new(AtomicBool::new(false)),
             source_epoch: Arc::new(AtomicU64::new(0)),
             committed_generation: AtomicU64::new(0),
+            video_scale_request_id: AtomicU64::new(0),
             last_vst3_available: AtomicBool::new(false),
             last_checked: AtomicBool::new(false),
             last_text_contrast_strong: AtomicBool::new(false),
@@ -1470,6 +1508,7 @@ impl NativeVideoOutput {
             perf_overlay_visible,
             source_epoch,
             committed_generation: AtomicU64::new(0),
+            video_scale_request_id: AtomicU64::new(0),
             last_vst3_available: AtomicBool::new(initial_vst3_available),
             last_checked: AtomicBool::new(initial_checked),
             last_text_contrast_strong: AtomicBool::new(initial_text_contrast_strong),
@@ -1587,6 +1626,43 @@ impl NativeVideoOutput {
         crate::video::native_window::post_wake(self.hwnd.load(Ordering::Acquire));
     }
 
+    fn prepare_video_scale_settings(
+        &self,
+        filter: crate::settings::VideoScaleFilter,
+        smoothing_percent: u32,
+    ) {
+        let request_id = self
+            .video_scale_request_id
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::PrepareVideoScaleSettings {
+                request_id,
+                filter,
+                smoothing_percent,
+            });
+        crate::video::native_window::post_wake(self.hwnd.load(Ordering::Acquire));
+    }
+
+    fn commit_video_scale_settings(
+        &self,
+        request_id: u64,
+        filter: crate::settings::VideoScaleFilter,
+        smoothing_percent: u32,
+    ) {
+        if self.video_scale_request_id.load(Ordering::Acquire) != request_id {
+            return;
+        }
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::CommitVideoScaleSettings {
+                request_id,
+                filter,
+                smoothing_percent,
+            });
+        crate::video::native_window::post_wake(self.hwnd.load(Ordering::Acquire));
+    }
     fn set_metadata(&self, metadata: Option<native_presenter::NativeOverlayMetadata>) {
         let _ = self
             .command_tx
@@ -2384,6 +2460,11 @@ impl NativeFrameOutputContext {
             .should_represent_for_grade_change(render_grade_changed)
     }
 
+    fn should_represent_for_scale_change(&self, scale_changed: bool) -> bool {
+        self.presentation
+            .should_represent_for_scale_change(scale_changed)
+    }
+
     fn hide(&mut self) {
         self.presentation.hide();
     }
@@ -2780,6 +2861,13 @@ fn send_native_overlay_command(
             adjustments,
             persist,
         },
+        Command::RequestVideoScaleSettings {
+            filter,
+            smoothing_percent,
+        } => NativeVideoOutputEvent::RequestVideoScaleSettings {
+            filter,
+            smoothing_percent,
+        },
         Command::SetPlaybackSpeed { speed } => NativeVideoOutputEvent::SetPlaybackSpeed { speed },
         Command::CopyFrameToClipboard => NativeVideoOutputEvent::CopyFrameToClipboard,
         Command::FrameStep { direction } => NativeVideoOutputEvent::FrameStep { direction },
@@ -3071,6 +3159,7 @@ fn run_native_video_output(
                 text_contrast: config.text_contrast,
                 ui_font: config.ui_font.clone(),
                 scale_filter: config.scale_filter,
+                downscale_smoothing_percent: config.downscale_smoothing_percent,
                 health: Arc::clone(&health),
                 window_epoch: cur_generation,
             },
@@ -3118,6 +3207,8 @@ fn run_native_video_output(
     let mut cur_video_compact: Option<bool> = None;
     let mut cur_fallback_file_name = config.fallback_file_name.clone();
     let mut cur_video_grade = config.video_grade.clone();
+    let mut cur_scale_filter = config.scale_filter;
+    let mut cur_downscale_smoothing_percent = config.downscale_smoothing_percent;
     fn sync_hud_regions(
         window_pump: &native_window_pump::NativeWindowPumpRenderClient,
         epoch: u64,
@@ -3477,6 +3568,90 @@ fn run_native_video_output(
                         Err(error) => crate::logger::log(format!(
                             "[native-video] Creative LUT shader update failed: {error}"
                         )),
+                    }
+                }
+                NativeVideoOutputCommand::PrepareVideoScaleSettings {
+                    request_id,
+                    filter,
+                    smoothing_percent,
+                } => {
+                    let smoothing_percent =
+                        crate::settings::sanitize_downscale_smoothing_percent(smoothing_percent);
+                    match frame_output.frame() {
+                        Some(frame) => match presenter.prepare_video_scale_settings(
+                            frame,
+                            request_id,
+                            filter,
+                            smoothing_percent,
+                        ) {
+                            Ok(()) => send_native_output_event(
+                                &ui_event_tx,
+                                source.source_epoch,
+                                NativeVideoOutputEvent::VideoScaleSettingsPrepared {
+                                    request_id,
+                                    filter,
+                                    smoothing_percent,
+                                },
+                            ),
+                            Err(error) => crate::logger::log(format!(
+                                "[native-video] scale-filter preparation failed: {error}"
+                            )),
+                        },
+                        None => crate::logger::log(
+                            "[native-video] scale-filter preparation ignored before first frame",
+                        ),
+                    }
+                }
+                NativeVideoOutputCommand::CommitVideoScaleSettings {
+                    request_id,
+                    filter,
+                    smoothing_percent,
+                } => {
+                    let smoothing_percent =
+                        crate::settings::sanitize_downscale_smoothing_percent(smoothing_percent);
+                    let changed = cur_scale_filter != filter
+                        || cur_downscale_smoothing_percent != smoothing_percent;
+                    let committed = frame_output.frame().is_some_and(|frame| {
+                        presenter.commit_video_scale_settings(
+                            frame,
+                            request_id,
+                            filter,
+                            smoothing_percent,
+                        )
+                    });
+                    if !committed {
+                        crate::logger::log(format!(
+                            "[native-video] stale scale-filter commit discarded request_id={request_id}"
+                        ));
+                    } else {
+                        cur_scale_filter = filter;
+                        cur_downscale_smoothing_percent = smoothing_percent;
+                        if frame_output.should_represent_for_scale_change(changed) {
+                            let refresh = frame_output
+                                .visible_frame()
+                                .map(|frame| presenter.present(frame, config.sync_interval));
+                            match refresh {
+                                Some(Ok(outcome)) => {
+                                    debug_assert!(
+                                        frame_output.mark_current_visible(outcome.copy_fence_value)
+                                    );
+                                    frame_output
+                                        .retire_completed(presenter.copy_fence_completed_value());
+                                }
+                                Some(Err(error)) => crate::logger::log(format!(
+                                    "[native-video] scale-filter refresh present failed: {error}"
+                                )),
+                                None => {}
+                            }
+                        }
+                        send_native_output_event(
+                            &ui_event_tx,
+                            source.source_epoch,
+                            NativeVideoOutputEvent::VideoScaleSettingsCommitted {
+                                filter,
+                                smoothing_percent,
+                            },
+                        );
                     }
                 }
                 NativeVideoOutputCommand::SetMetadata { metadata } => {
@@ -3899,7 +4074,8 @@ fn run_native_video_output(
                                 ui_scale: cur_ui_scale,
                                 text_contrast: cur_text_contrast,
                                 ui_font: config.ui_font.clone(),
-                                scale_filter: config.scale_filter,
+                                scale_filter: cur_scale_filter,
+                                downscale_smoothing_percent: cur_downscale_smoothing_percent,
                                 health: Arc::clone(&health),
                                 window_epoch: candidate_epoch,
                             },
@@ -4453,6 +4629,19 @@ fn run_native_video_output(
                                     NativeVideoOutputEvent::SetVideoAdjustments {
                                         adjustments,
                                         persist,
+                                    },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::RequestVideoScaleSettings {
+                                filter,
+                                smoothing_percent,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::RequestVideoScaleSettings {
+                                        filter,
+                                        smoothing_percent,
                                     },
                                 );
                             }
@@ -7293,6 +7482,29 @@ impl VideoPlayer {
     }
 
     #[cfg(windows)]
+    pub fn prepare_native_video_scale_settings(
+        &self,
+        filter: crate::settings::VideoScaleFilter,
+        smoothing_percent: u32,
+    ) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.prepare_video_scale_settings(filter, smoothing_percent);
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn commit_native_video_scale_settings(
+        &self,
+        request_id: u64,
+        filter: crate::settings::VideoScaleFilter,
+        smoothing_percent: u32,
+    ) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.commit_video_scale_settings(request_id, filter, smoothing_percent);
+        }
+    }
+
+    #[cfg(windows)]
     pub fn set_native_metadata(&self, metadata: Option<native_presenter::NativeOverlayMetadata>) {
         if let Some(output) = self.native_output.as_ref() {
             output.set_metadata(metadata);
@@ -8778,6 +8990,19 @@ mod tests {
 
         let _ = state.replace_visible("visible", 3);
         assert!(state.should_represent_for_grade_change(true));
+    }
+
+    #[test]
+    fn paused_visible_frame_requests_immediate_scale_change_represent() {
+        let mut state = super::FramePresentationState::Empty;
+        assert!(!state.should_represent_for_scale_change(true));
+
+        assert!(state.replace_hidden("paused-hidden").is_none());
+        assert!(!state.should_represent_for_scale_change(true));
+
+        let _ = state.replace_visible("paused-visible", 17);
+        assert!(state.should_represent_for_scale_change(true));
+        assert!(!state.should_represent_for_scale_change(false));
     }
 
     #[test]

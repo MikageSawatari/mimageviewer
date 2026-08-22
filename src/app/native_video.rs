@@ -3765,6 +3765,9 @@ impl App {
                     | crate::video::NativeVideoOutputEvent::OpenTouchInfoPanel
                     | crate::video::NativeVideoOutputEvent::DismissTouchSidePanels
                     | crate::video::NativeVideoOutputEvent::SetVideoAdjustments { .. }
+                    | crate::video::NativeVideoOutputEvent::RequestVideoScaleSettings { .. }
+                    | crate::video::NativeVideoOutputEvent::VideoScaleSettingsPrepared { .. }
+                    | crate::video::NativeVideoOutputEvent::VideoScaleSettingsCommitted { .. }
             ) {
                 // fall through: NavigateItem は dispatch 続行
             } else {
@@ -3982,6 +3985,41 @@ impl App {
                 self.settings.video_adjustments = adjustments;
                 self.sync_native_video_grade();
                 if persist {
+                    self.settings.save();
+                }
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::RequestVideoScaleSettings {
+                filter,
+                smoothing_percent,
+            } => {
+                self.request_native_video_scale_settings(fs_idx, filter, smoothing_percent);
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::VideoScaleSettingsPrepared {
+                request_id,
+                filter,
+                smoothing_percent,
+            } => {
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    player.commit_native_video_scale_settings(
+                        request_id,
+                        filter,
+                        smoothing_percent,
+                    );
+                }
+            }
+            crate::video::NativeVideoOutputEvent::VideoScaleSettingsCommitted {
+                filter,
+                smoothing_percent,
+            } => {
+                let smoothing_percent =
+                    crate::settings::sanitize_downscale_smoothing_percent(smoothing_percent);
+                if self.settings.video_scale_filter != filter
+                    || self.settings.video_downscale_smoothing_percent != smoothing_percent
+                {
+                    self.settings.video_scale_filter = filter;
+                    self.settings.video_downscale_smoothing_percent = smoothing_percent;
                     self.settings.save();
                 }
                 self.mark_native_video_hud_activity(ctx);
@@ -7714,6 +7752,21 @@ impl App {
                 hud_activity = false;
                 NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::ComparisonUnsupported)
             }
+            // T: cycle the native video's scaling method. The renderer persists the
+            // setting only after dimension-dependent resources are ready.
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoScaleFilterNext, &key) =>
+            {
+                let filter = self.settings.video_scale_filter.next();
+                self.request_native_video_scale_settings(
+                    fs_idx,
+                    filter,
+                    self.settings.video_downscale_smoothing_percent,
+                );
+                NativeVideoKeyOutcome::Action(KeyAction::VideoScaleFilterNext)
+            }
             // S: tile mode toggle.
             _ if !key.repeat
                 && self
@@ -7753,6 +7806,20 @@ impl App {
             self.request_native_video_hud_repaint(ctx);
         }
         outcome
+    }
+
+    #[cfg(windows)]
+    fn request_native_video_scale_settings(
+        &self,
+        fs_idx: usize,
+        filter: crate::settings::VideoScaleFilter,
+        smoothing_percent: u32,
+    ) -> bool {
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
+            return false;
+        };
+        player.prepare_native_video_scale_settings(filter, smoothing_percent);
+        true
     }
 
     #[cfg(windows)]
@@ -7972,6 +8039,7 @@ impl App {
                 &self.settings.video_preset_slots,
             ),
             self.settings.video_scale_filter,
+            self.settings.video_downscale_smoothing_percent,
             true, // audio_only (frameless present、Inc 6 ②-1)
         ) else {
             return;
@@ -8563,6 +8631,7 @@ impl App {
                     &self.settings.video_preset_slots,
                 ),
                 self.settings.video_scale_filter,
+                self.settings.video_downscale_smoothing_percent,
                 false,
             )
         });
