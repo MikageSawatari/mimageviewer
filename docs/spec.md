@@ -1551,13 +1551,14 @@ mIV 独自項目はメニュー先頭に追加し、名前変更は mIV の入�
 バックグラウンド worker から `IFileOperation::DeleteItem` をチャンク単位で使い、
 通常はゴミ箱へ移動する。削除進捗は mIV 側のダイアログを使う。既定 OFF の
 `skip_recycle_bin_delete_confirmation` を ON にした場合だけ、mIV の事前判定が
-`DeleteConfirmKind::RecycleBin`、かつ対象が通常の画像 / 動画 / 音声ファイルだけなら mIV 側の
-削除確認を省略する。全対象がこの条件を満たすことを必要とし、1 件でも
-`DeleteConfirmKind::MayPermanent`、実フォルダ、ZIP / PDF / 変換対象アーカイブ、または
-対象 `GridItem` を安全に照合できない項目があれば従来どおり確認する。
+`DeleteConfirmKind::RecycleBin` なら対象種類に関係なく mIV 側の削除確認を省略する。実フォルダ、
+ZIP / PDF / 変換対象アーカイブも省略対象に含む。複数選択は全対象の判定を集約し、1 件でも
+`DeleteConfirmKind::MayPermanent` なら従来どおり確認する。
 `MayPermanent` の確認は初期選択をキャンセルにする。削除対象に実フォルダを含む確認では、一覧に
 表示していないファイルもフォルダ内に含まれる旨を件数なしの定型文で常に表示する。確認文の生成では
-ディレクトリ走査や metadata I/O を行わない。Shell の最終判断は mIV から確定できないため、
+ディレクトリ走査や metadata I/O を行わない。設定 UI では、フォルダ / アーカイブ内の全ファイルを
+確認せずごみ箱へ移すこと、1 タイルが一覧未表示の多数ファイルを含み得ること、ごみ箱から復元できる
+ことを説明する。Shell の最終判断は mIV から確定できないため、
 `IFileOperation` の `FOF_WANTNUKEWARNING` は設定に関係なく維持し、完全削除になる場合の Windows
 Shell 警告を抑止しない。
 mIV が削除成功を確認した path は、
@@ -1664,7 +1665,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `quick_folder_slots` | `[Option<PathBuf>; 2]` | `[None, None]` | フォルダバーの A/B クイックフォルダが最後に見た場所。実フォルダまたは ZIP / PDF / 変換済みアーカイブのコンテナパスだけを永続化し、A/B 別の戻る / 進むスタックはセッション中の `App` 状態として保持する |
 | `quick_folder_drive_current_dirs` | `[BTreeMap<String, PathBuf>; 2]` | 空 | A/B クイックフォルダごとに保持するドライブ別の最後の場所。キーは `"C:"` のような大文字ドライブ表記で、`GridSwitchDriveC..Z` はアクティブな A/B スロットの値を使う |
 | `use_native_shell_context_menu` | bool | true | 実ファイル / 実フォルダの右クリックで Windows Shell 標準メニューを使うかどうか。OFF のときや仮想項目では mIV 独自メニューを表示する。Ctrl+C/X/V は設定に関わらず Windows Shell の動作を使う |
-| `skip_recycle_bin_delete_confirmation` | bool | false | mIV の事前判定が `RecycleBin` で、対象が通常の画像 / 動画 / 音声ファイルだけのときに mIV 側の削除確認を省略する。`MayPermanent`、混在選択、実フォルダ、ZIP / PDF / 変換対象アーカイブ、対象照合不能時は確認を維持する。`FOF_WANTNUKEWARNING` には影響しない |
+| `skip_recycle_bin_delete_confirmation` | bool | false | mIV の事前判定が `RecycleBin` のとき、実フォルダと ZIP / PDF / 変換対象アーカイブを含め、対象種類に関係なく mIV 側の削除確認を省略する。複数選択は 1 件でも `MayPermanent` なら確認を維持し、キャンセルを初期選択にする。`FOF_WANTNUKEWARNING` には影響しない |
 | `ring_shortcuts` | RingShortcutSettings | default | リングショートカット設定。右ドラッグ mode (`right_drag_grid` / `right_drag_image` / `right_drag_video` / `right_drag_edit`) は未使用 / リング / ジェスチャを文脈別に保持し、`short_right_click_image` / `short_right_click_video` は画像 / 動画ビューアの短い右クリックを閉じる / 何もしない / メニュー表示から個別に選ぶ（既定は閉じる）。`select_grid_item_on_right_drag_start` はグリッドの有効な右ドラッグ開始セルを押下時点で選択するかを保持する（既定 false）。旧 `mouse_flick_enabled` は互換読み込み用のグローバルリングトグルとして残す。グリッド / 画像フルスクリーン / 動画フルスクリーンごとの 8 方向スロット、4 文脈ごとのマウスジェスチャ割り当て (`mouse_gestures_*`)、`mouse_buttons_grid` / `mouse_buttons_image` / `mouse_buttons_video` によるマウス戻る / 進む / ホイールクリックの個別割り当て、リング / ジェスチャのガイド表示設定、マウスジェスチャ実行後の通知表示設定 (`mouse_gesture_result_toast_visible`、既定 true)、移行ダイアログ表示済み状態、X ピッカー初回案内の表示済み状態を保持する。通知を OFF にしてもジェスチャのアクションと、そのアクション自身が出す結果・エラー表示は抑止しない。画像 / 動画フルスクリーンのマウスボタン候補では `C:\`〜`Z:\`、お気に入り、閲覧履歴、★一覧などの場所移動系を候補外にする。マウスジェスチャ追加 UI は実際の右ドラッグ軌跡を記録して方向列へ変換し、既存ジェスチャの再記録も同じ記録ダイアログで行う。ゲームパッド X リング/ピッカーは常時有効。旧 `gamepad_ring_enabled` / `mouse_back_forward_action` は migration 用、旧 Shift / Alt + ホイール設定は互換読み込み用にのみ残す |
 | `first_setup_completed` | bool | false | 初回セットアップダイアログ (テーマ / AI 機能 / ビューワモード) を完了したか |
 | `ui_theme` | UiTheme | System | メイン UI のテーマ（System / Light / Dark）。System は Windows のアプリ用色に追従 |
