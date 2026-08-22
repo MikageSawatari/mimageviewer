@@ -792,23 +792,25 @@
 
 ### 1.101 動画の上部 HUD / 下部シークバーを個別に固定表示できるようにする — 専用スレ >>271 ✅ 実装済み (2026-08-22)
 
-> 設定は `video_top_bar_visibility` / `video_seek_bar_visibility` (`VideoBarVisibilityMode { Hover, Pinned }`) の 2 つ。既定は両方 `Hover`。
+> 設定は動画専用 bool `video_top_bar_locked` / `video_seek_bar_locked` の 2 つ。既定は両方 `false`。
+> 静止画の `fullscreen_*_locked` は共有せず、余白だけ `fullscreen_fixed_bar_gap_px` を再利用する。
 > 固定状態は可視性純関数への**入力**として渡し、描画と HUD HWND の hit-test region は
 > `render_once` が算出した `top_bar_drawn_visible` / `bottom_hud_visible` の**同じ snapshot** を読む。
 > 上部の固定は下部へ漏らさない。tile grid / navigation preview 中は上下とも抑止する。
+> 固定バーは映像へ重ねず、`compute_video_visual_transform` の target からバー領域と余白を除外する。
+> compact は除外後の残り領域の右上 1/4 へ合成する。鍵アイコンは静止画のベクター描画を共有する。
 > 固定表示は external drag 中も維持し、touch latch 自体は変えない。
 > 音声専用設定は増やさず、通常の音楽ビューは従来どおり常時表示。
 > **実機確認は未実施。** 以下は着手前の記録。
 
 - 出典: 専用スレ >>271 (2026-08-20)。動画シークバーを常時表示したい要望。
 - 方針: 静止画と同じ考え方で、動画の上部 HUD と下部シークバーをそれぞれ独立して
-  固定 / 自動表示へ切り替えられるようにする。既定は現在の自動表示を維持する。
+  固定 / 自動表示へ切り替えられるようにする。動画専用設定とし、既定は現在の自動表示を維持する。
 - 実装先は native presenter の HUD overlay
   (`src/video/native_presenter/{render_core.rs,overlay_draw.rs}`) とし、旧 egui 動画 UI へだけ
-  設定を足さない。音声モードでも同じ下部固定状態を使うかは、既存の動画 / 音声 HUD 共有契約に
-  沿って実装時に確定する。
-- 固定中は映像との重なり、VST editor、タッチ操作、HUD HWND の hit-test region / z-order を
-  確認する。固定解除後は既存の自動表示へ戻ること。
+  設定を足さない。通常の音楽ビューは対象外とし、VST 用 audio-only native shell だけ動画設定を共有する。
+- 固定中は映像 target からバー領域を除外し、VST editor、タッチ操作、HUD HWND の hit-test region /
+  z-order を確認する。固定解除後は既存の自動表示へ戻ること。
 - 規模 / 優先度: Medium / P2。
 
 ### 1.102 YouTube 型の精密シーク用サムネイル列 — 専用スレ >>271 / >>277

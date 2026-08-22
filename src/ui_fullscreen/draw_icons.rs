@@ -483,7 +483,7 @@ pub(crate) fn draw_close_icon(painter: &egui::Painter, c: egui::Pos2, _r: f32) {
 }
 
 /// 下部ページシークバーの固定表示トグル用ロックアイコン。
-pub(super) fn draw_seek_lock_icon(painter: &egui::Painter, c: egui::Pos2, r: f32, locked: bool) {
+pub(crate) fn draw_seek_lock_icon(painter: &egui::Painter, c: egui::Pos2, r: f32, locked: bool) {
     let white = egui::Color32::WHITE;
     let stroke = egui::Stroke::new(1.7, white);
     let body = egui::Rect::from_center_size(

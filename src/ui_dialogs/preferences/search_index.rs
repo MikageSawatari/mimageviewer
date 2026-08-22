@@ -561,8 +561,8 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     entry!(
         "spread/bar-gap",
         SpreadMode,
-        "固定バーと画像の間隔",
-        ["余白", "gap", "px"]
+        "固定バーと表示内容の間隔",
+        ["画像", "映像", "余白", "gap", "px"]
     ),
     entry!(
         "spread/page-number",
@@ -723,9 +723,10 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         [
             "上部情報バー",
             "下部シークバー",
-            "自動表示",
             "固定表示",
-            "ピン留め"
+            "鍵",
+            "領域を確保",
+            "余白"
         ]
     ),
     entry!("video/loop", Video, "ループ再生:", ["繰り返し", "loop"]),

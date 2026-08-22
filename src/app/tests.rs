@@ -4,6 +4,33 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+#[cfg(windows)]
+#[test]
+fn native_video_bar_lock_commands_toggle_only_the_selected_setting() {
+    let mut settings = crate::settings::Settings::default();
+
+    assert!(super::native_video::toggle_native_video_bar_lock_setting(
+        &mut settings,
+        crate::video::NativeVideoBar::Top,
+    ));
+    assert!(settings.video_top_bar_locked);
+    assert!(!settings.video_seek_bar_locked);
+
+    assert!(super::native_video::toggle_native_video_bar_lock_setting(
+        &mut settings,
+        crate::video::NativeVideoBar::Seek,
+    ));
+    assert!(settings.video_top_bar_locked);
+    assert!(settings.video_seek_bar_locked);
+
+    assert!(!super::native_video::toggle_native_video_bar_lock_setting(
+        &mut settings,
+        crate::video::NativeVideoBar::Top,
+    ));
+    assert!(!settings.video_top_bar_locked);
+    assert!(settings.video_seek_bar_locked);
+}
+
 #[test]
 fn initial_scan_settled_gate_is_vacuously_ready_without_supervisors_and_emits_once() {
     let fts_all_idle = std::iter::empty::<bool>().all(|idle| idle);

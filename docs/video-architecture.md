@@ -175,19 +175,31 @@ callout は実際にクリックする UI なので、表示中の bar rect だ�
 ClickToShow の左右パネルには明示的な × を置き、callout 矢印は開状態で外向きへ反転する。
 VST3 パネル表示中は callout を描画せず、HUD region にも含めない。
 
-上部情報バーと下部シークバーの表示方法は、それぞれ独立した
-`VideoBarVisibilityMode { Hover, Pinned }` を Settings の正本として native presenter へ同期する。
-既定の `Hover` は従来の上下端 hover と touch chrome latch による自動表示を維持し、
-`Pinned` は各バーの可視性純関数へ入力として渡す。上部だけを固定しても下部は固定されず、
+上部情報バーと下部シークバーの固定状態は、動画専用の bool
+`video_top_bar_locked` / `video_seek_bar_locked` を Settings の正本として native presenter へ同期する。
+既定の `false` は従来の上下端 hover と touch chrome latch による自動表示を維持し、
+`true` は各バーの可視性純関数へ入力として渡す。上部だけを固定しても下部は固定されず、
 上端を実際に hover した場合と左右パネル表示中だけは、従来どおり下部も連動表示する。
-固定したバーは映像の上へ重ね、映像の fit / zoom / pan の描画領域は変更しない。
+静止画の `fullscreen_top_bar_locked` / `fullscreen_seek_bar_locked` とは設定を共有しない。
+
+固定したバーは映像へ重ねず、`compute_video_visual_transform` の target 矩形から上部 54pt / 下部
+64pt と `fullscreen_fixed_bar_gap_px` の共通余白を除外し、残った領域へ映像を letterbox fit する。
+論理 pt と余白は native overlay の pixels-per-point で物理 px に変換する。presenter HWND は monitor
+全域のままで縮めない。VST の compact と同時に有効な場合は、先に固定バーを除外し、その残りの
+右上 1/4 (幅・高さを各 1/2) を compact target にする。固定解除時は除外を取り消して従来の fit に戻す。
+
+各バーには固定状態を示す鍵ボタンを置く。鍵の形は静止画の
+`ui_fullscreen::draw_icons::draw_seek_lock_icon` を共有し、native 側で同じベクター形状を複製しない。
+クリックは typed overlay command で App へ戻し、対応する動画専用 bool だけを反転して `save()` した後、
+最新の固定状態と余白を presenter へ再同期する。
 
 上部・下部バーは `render_once` が算出した
 `top_bar_drawn_visible` / `bottom_hud_visible` を描画後の snapshot として保持し、
 `compute_hud_regions` は同じ値から HUD HWND の入力 region と z-order を組み立てる。
-上部の実描画状態と、上部 hover から下部への連動は tile / navigation preview の間は抑止する。
+上下の実描画状態と、上部 hover から下部への連動は tile / navigation preview の間は抑止する。
 hover / 固定状態を region 側で再計算しないため、描画されたバーだけが入力を受け、
-透明な上下端帯が VST editor の操作を奪う状態も作らない。固定表示は external drag 中も維持するが、
+鍵ボタンも同じ上下 bar region 内で入力を受ける。透明な上下端帯が VST editor の操作を奪う状態も
+作らない。固定表示は external drag 中も維持するが、
 `native_touch.chrome_latched()` 自体は変更しない。したがって固定解除後は、その時点の
 touch latch または hover 入力へ直ちに戻り、固定表示だけで左右の touch handle が開くことはない。
 

@@ -6035,39 +6035,17 @@ pub(super) fn draw_video_bar_visibility_settings(
 ) {
     ui.label(egui::RichText::new("再生画面のバー").strong());
     ui.add_space(4.0);
-    ui.label("上部と下部をそれぞれ自動表示または固定表示にできます。");
+    ui.label("動画の上部と下部のバーをそれぞれ固定表示できます。");
     ui.add_space(6.0);
 
-    ui.horizontal(|ui| {
-        ui.label("上部情報バー:");
-        egui::ComboBox::from_id_salt("video_top_bar_visibility")
-            .selected_text(settings.video_top_bar_visibility.label())
-            .show_ui(ui, |ui| {
-                for &mode in crate::settings::VideoBarVisibilityMode::all() {
-                    ui.selectable_value(&mut settings.video_top_bar_visibility, mode, mode.label());
-                }
-            });
-    });
-    ui.horizontal(|ui| {
-        ui.label("下部シークバー:");
-        egui::ComboBox::from_id_salt("video_seek_bar_visibility")
-            .selected_text(settings.video_seek_bar_visibility.label())
-            .show_ui(ui, |ui| {
-                for &mode in crate::settings::VideoBarVisibilityMode::all() {
-                    ui.selectable_value(
-                        &mut settings.video_seek_bar_visibility,
-                        mode,
-                        mode.label(),
-                    );
-                }
-            });
-    });
-    ui.label(
-        egui::RichText::new(
-            "固定表示したバーは映像の上に重なります。左右の情報パネル設定には影響しません。",
-        )
-        .small(),
+    ui.checkbox(&mut settings.video_top_bar_locked, "上部情報バーを固定表示");
+    ui.small("ON のときは再生画面上端に情報バー領域を確保し、映像をその下の領域にフィットします。上部情報バー端の鍵アイコンからも切り替えできます。");
+    ui.checkbox(
+        &mut settings.video_seek_bar_locked,
+        "下部シークバーを固定表示",
     );
+    ui.small("ON のときは再生画面下端にシークバー領域を確保し、映像をその上の領域にフィットします。下部シークバー端の鍵アイコンからも切り替えできます。");
+    ui.small("固定バーと映像の間隔は、静止画フルスクリーンと共通の余白設定を使います。");
 }
 
 pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -7511,7 +7489,7 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     anchored(ui, state, "spread/bar-gap", |ui, state| {
         let s = &mut state.settings;
         ui.horizontal(|ui| {
-            ui.label("固定バーと画像の間隔");
+            ui.label("固定バーと表示内容の間隔");
             ui.add(
                 egui::DragValue::new(&mut s.fullscreen_fixed_bar_gap_px)
                     .range(0..=crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX)
@@ -7519,7 +7497,7 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                     .suffix(" px"),
             );
         });
-        ui.small("固定表示中の上部情報バーと下部ページシークバーに共通で適用します。0 px ではバーの直後まで画像領域として使います。");
+        ui.small("静止画と動画の固定表示中の上部情報バー / 下部シークバーに共通で適用します。0 px ではバーの直後まで画像・映像領域として使います。");
     });
     anchored(ui, state, "spread/page-number", |ui, state| {
         let s = &mut state.settings;

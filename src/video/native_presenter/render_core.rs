@@ -35,7 +35,7 @@ use windows::Win32::System::Threading::WaitForSingleObject;
 use windows::core::Interface;
 use windows_numerics::Matrix3x2;
 
-use crate::settings::{FsSidePanelMode, VideoBarVisibilityMode};
+use crate::settings::FsSidePanelMode;
 use crate::ui_helpers::HoverTipExt;
 use crate::video::decoder::{VideoFrame, VideoFrameData};
 use crate::video::display_metadata::VideoOrientation;
@@ -83,6 +83,7 @@ const TEXT_INPUT_FOCUS_CLAIM_MIN_INTERVAL: Duration = Duration::from_millis(500)
 pub const HUD_SEEK_ROW_HEIGHT: f32 = 24.0;
 pub const HUD_CONTROLS_ROW_HEIGHT: f32 = 40.0;
 pub const HUD_BOTTOM_HEIGHT: f32 = HUD_SEEK_ROW_HEIGHT + HUD_CONTROLS_ROW_HEIGHT;
+pub const HUD_TOP_HEIGHT: f32 = 54.0;
 
 fn seek_status_visible_for_times(
     is_seeking: bool,
@@ -192,6 +193,9 @@ pub struct NativeRenderCore {
     pixel_probe_strict: bool,
     last_pixel_probe: Option<Instant>,
     video_compact: bool,
+    video_top_bar_locked: bool,
+    video_seek_bar_locked: bool,
+    fullscreen_fixed_bar_gap_px: u32,
     /// Sample aspect ratio (= pixel aspect ratio)。1/1 = 正方ピクセル (= 従来挙動)。
     /// アナモフィック動画 (NTSC DVD 等で SAR=97/80 など) で `update_video_visual_transform`
     /// の M11/M22 を anisotropic にして表示比を補正する。decoder の VideoInfo 経由で
@@ -430,9 +434,9 @@ struct NativeEguiOverlay {
     top_bar_visible: bool,
     right_panel_visible: bool,
     jump_panel_visible: bool,
-    /// App settings から同期される、上下バーそれぞれの表示モード。
-    top_bar_visibility_mode: VideoBarVisibilityMode,
-    seek_bar_visibility_mode: VideoBarVisibilityMode,
+    /// App settings から同期される、上下バーそれぞれの固定状態。
+    top_bar_locked: bool,
+    seek_bar_locked: bool,
     /// App settings から同期される、左右パネル共通の表示モード。
     side_panel_mode: FsSidePanelMode,
     /// 右情報パネルの明示 open owner。正本は App の current-file typed state。
@@ -478,7 +482,7 @@ struct NativeEguiOverlay {
 struct NativeBarVisibilitySnapshot {
     /// tile/navigation guard と side panel 連動まで通した、上部バーの実描画状態。
     top_bar_visible: bool,
-    /// 上端 hover 連動と下部自身の表示モードまで通した、下部バーの実描画状態。
+    /// 上端 hover 連動と下部自身の固定状態まで通した、下部バーの実描画状態。
     bottom_hud_visible: bool,
 }
 
@@ -1336,6 +1340,9 @@ pub enum NativeOverlayCommand {
     ToggleTileMode,
     TogglePerfOverlay,
     ToggleSidePanelMode,
+    ToggleBarLock {
+        bar: crate::video::NativeVideoBar,
+    },
     ToggleClickInfoOpen,
     OpenTouchInfoPanel,
     DismissTouchSidePanels,
@@ -1965,6 +1972,9 @@ impl NativeRenderCore {
                     .is_some(),
                 last_pixel_probe: None,
                 video_compact: false,
+                video_top_bar_locked: false,
+                video_seek_bar_locked: false,
+                fullscreen_fixed_bar_gap_px: 0,
                 sar_num: 1,
                 sar_den: 1,
                 orientation: VideoOrientation::IDENTITY,
@@ -2289,7 +2299,7 @@ impl NativeRenderCore {
             new_sar_num,
             new_sar_den,
             new_orientation,
-            self.video_compact,
+            self.video_visual_layout(),
         );
         let transform = Matrix3x2 {
             M11: m11,
@@ -2757,11 +2767,16 @@ impl NativeRenderCore {
     /// HUD HWND の `WM_DPICHANGED` を受けて overlay の OS ppp を更新する。
     /// `dirty = true` 化されるので次フレームの render で region 物理ピクセル換算が新 DPI 基準になる。
     /// 戻り値: 値が変わったかどうか。
-    pub fn set_overlay_pixels_per_point(&mut self, os_ppp: f32) -> bool {
-        self.egui_overlay
+    pub fn set_overlay_pixels_per_point(&mut self, os_ppp: f32) -> Result<bool, String> {
+        let changed = self
+            .egui_overlay
             .as_mut()
             .map(|o| o.set_os_pixels_per_point(os_ppp))
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if changed {
+            self.update_video_visual_transform(self.width, self.height)?;
+        }
+        Ok(changed)
     }
 
     pub(crate) fn set_window_observation(&mut self, observation: NativeWindowObservation) {
@@ -3139,14 +3154,27 @@ impl NativeRenderCore {
         }
     }
 
-    pub(crate) fn set_overlay_bar_visibility_modes(
+    pub(crate) fn set_overlay_bar_lock_state(
         &mut self,
-        top: VideoBarVisibilityMode,
-        bottom: VideoBarVisibilityMode,
-    ) {
+        top_locked: bool,
+        seek_locked: bool,
+        fixed_bar_gap_px: u32,
+    ) -> Result<(), String> {
+        let fixed_bar_gap_px =
+            fixed_bar_gap_px.min(crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX);
+        let layout_changed = self.video_top_bar_locked != top_locked
+            || self.video_seek_bar_locked != seek_locked
+            || self.fullscreen_fixed_bar_gap_px != fixed_bar_gap_px;
+        self.video_top_bar_locked = top_locked;
+        self.video_seek_bar_locked = seek_locked;
+        self.fullscreen_fixed_bar_gap_px = fixed_bar_gap_px;
         if let Some(overlay) = self.egui_overlay.as_mut() {
-            overlay.set_bar_visibility_modes(top, bottom);
+            overlay.set_bar_lock_state(top_locked, seek_locked);
         }
+        if layout_changed {
+            self.update_video_visual_transform(self.width, self.height)?;
+        }
+        Ok(())
     }
 
     /// Source swap で presenter-local な panel/touch session を閉じる。
@@ -3467,7 +3495,7 @@ impl NativeRenderCore {
             self.sar_num,
             self.sar_den,
             self.orientation,
-            self.video_compact,
+            self.video_visual_layout(),
         );
         let transform = Matrix3x2 {
             M11: m11,
@@ -3489,6 +3517,20 @@ impl NativeRenderCore {
                 .map_err(|e| format!("IDCompositionDevice::Commit video transform: {e:?}"))?;
         }
         Ok(())
+    }
+
+    fn video_visual_layout(&self) -> VideoVisualLayout {
+        VideoVisualLayout {
+            compact: self.video_compact,
+            pixels_per_point: self
+                .egui_overlay
+                .as_ref()
+                .map(|overlay| overlay.pixels_per_point)
+                .unwrap_or(1.0),
+            top_bar_locked: self.video_top_bar_locked,
+            seek_bar_locked: self.video_seek_bar_locked,
+            fixed_bar_gap_px: self.fullscreen_fixed_bar_gap_px,
+        }
     }
 
     fn pixel_probe_due(&mut self) -> bool {
@@ -4043,8 +4085,8 @@ impl NativeEguiOverlay {
             top_bar_visible: false,
             right_panel_visible: false,
             jump_panel_visible: false,
-            top_bar_visibility_mode: VideoBarVisibilityMode::Hover,
-            seek_bar_visibility_mode: VideoBarVisibilityMode::Hover,
+            top_bar_locked: false,
+            seek_bar_locked: false,
             side_panel_mode: FsSidePanelMode::Hover,
             info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
             left_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
@@ -4286,9 +4328,9 @@ impl NativeEguiOverlay {
         overlay_height_points: f32,
         external_drag_in_progress: bool,
         touch_chrome_latched: bool,
-        visibility_mode: VideoBarVisibilityMode,
+        locked: bool,
     ) -> bool {
-        if matches!(visibility_mode.normalized(), VideoBarVisibilityMode::Pinned) {
+        if locked {
             return true;
         }
         if touch_chrome_latched {
@@ -4305,9 +4347,9 @@ impl NativeEguiOverlay {
         currently_visible: bool,
         external_drag_in_progress: bool,
         touch_chrome_latched: bool,
-        visibility_mode: VideoBarVisibilityMode,
+        locked: bool,
     ) -> bool {
-        if matches!(visibility_mode.normalized(), VideoBarVisibilityMode::Pinned) {
+        if locked {
             return true;
         }
         if touch_chrome_latched {
@@ -4332,13 +4374,13 @@ impl NativeEguiOverlay {
     ) -> NativeBarVisibilitySnapshot {
         let regular_chrome_visible = !tile_overlay_visible && !navigation_preview_visible;
         NativeBarVisibilitySnapshot {
-            // 上部の実描画条件と同じ。Pinned / hover の元判定ではなく、tile/nav と
+            // 上部の実描画条件と同じ。固定 / hover の元判定ではなく、tile/nav と
             // side panel 連動まで通した最終値を region 用 snapshot にする。
             top_bar_visible: regular_chrome_visible && (top_bar_visible || side_panel_visible),
-            // 上部 Pinned は下部へ漏らさない。上端 hover と side panel による従来の
+            // 上部固定は下部へ漏らさない。上端 hover と side panel による従来の
             // 連動表示だけを tile/nav ガードの内側で下部へ伝える。
-            bottom_hud_visible: hud_visible
-                || (regular_chrome_visible && (side_panel_visible || top_bar_hover_visible)),
+            bottom_hud_visible: regular_chrome_visible
+                && (hud_visible || side_panel_visible || top_bar_hover_visible),
         }
     }
 
@@ -4851,20 +4893,14 @@ impl NativeEguiOverlay {
         self.dirty = true;
     }
 
-    fn set_bar_visibility_modes(
-        &mut self,
-        top: VideoBarVisibilityMode,
-        bottom: VideoBarVisibilityMode,
-    ) {
-        let top = top.normalized();
-        let bottom = bottom.normalized();
-        if self.top_bar_visibility_mode == top && self.seek_bar_visibility_mode == bottom {
+    fn set_bar_lock_state(&mut self, top_locked: bool, seek_locked: bool) {
+        if self.top_bar_locked == top_locked && self.seek_bar_locked == seek_locked {
             return;
         }
         // touch chrome latch は入力セッションの状態として独立させる。固定表示への変更で
         // latch を開閉すると、固定解除後の中央タップ状態や左右ハンドルまで変わってしまう。
-        self.top_bar_visibility_mode = top;
-        self.seek_bar_visibility_mode = bottom;
+        self.top_bar_locked = top_locked;
+        self.seek_bar_locked = seek_locked;
         self.dirty = true;
     }
 
@@ -5533,7 +5569,7 @@ impl NativeEguiOverlay {
                 left: 0,
                 top: 0,
                 right: width_px,
-                bottom: to_px(54.0).min(height_px),
+                bottom: to_px(HUD_TOP_HEIGHT).min(height_px),
             });
         }
 
@@ -5952,7 +5988,7 @@ impl NativeEguiOverlay {
             overlay_height_points,
             self.external_drag_in_progress,
             self.native_touch.chrome_latched(),
-            self.seek_bar_visibility_mode,
+            self.seek_bar_locked,
         )
     }
 
@@ -5962,7 +5998,7 @@ impl NativeEguiOverlay {
             self.top_bar_visible,
             self.external_drag_in_progress,
             self.native_touch.chrome_latched(),
-            self.top_bar_visibility_mode,
+            self.top_bar_locked,
         )
     }
 
@@ -5972,7 +6008,7 @@ impl NativeEguiOverlay {
             self.top_bar_visible,
             self.external_drag_in_progress,
             self.native_touch.chrome_latched(),
-            VideoBarVisibilityMode::Hover,
+            false,
         )
     }
 
@@ -6281,6 +6317,8 @@ impl NativeEguiOverlay {
         let ui_scale = self.ui_scale;
         let touch_first_run_help_visible = self.native_touch.first_run_help_visible();
         let side_panel_mode = self.side_panel_mode;
+        let top_bar_locked = self.top_bar_locked;
+        let seek_bar_locked = self.seek_bar_locked;
         let vst3_panel_visible = vst3_panel.as_ref().is_some_and(|panel| panel.visible);
         let hud_dimmed = self.hud_dimmed;
         let perf_latest = self.perf_latest;
@@ -6613,6 +6651,7 @@ impl NativeEguiOverlay {
                     vst3_panel_visible,
                     audio_only,
                     side_panel_mode,
+                    top_bar_locked,
                     hud_dimmed,
                     &mut commands,
                 );
@@ -6926,6 +6965,7 @@ impl NativeEguiOverlay {
                         let mute_w = btn_size;
                         let norm_w = btn_size;
                         let speed_w = btn_size * 1.55;
+                        let lock_w = btn_size;
                         let right_w_full = time_w
                             + gap
                             + speed_w
@@ -6937,7 +6977,9 @@ impl NativeEguiOverlay {
                             + vol_slider_w_full
                             + gap
                             + vol_label_w
-                            + limiter_indicator_w;
+                            + limiter_indicator_w
+                            + gap
+                            + lock_w;
                         let right_w_compact = time_w
                             + gap
                             + speed_w
@@ -6946,7 +6988,9 @@ impl NativeEguiOverlay {
                             + gap
                             + norm_w
                             + gap
-                            + vol_slider_w_narrow;
+                            + vol_slider_w_narrow
+                            + gap
+                            + lock_w;
                         // 左クラスター幅: 各ボタンを btn_size、ボタン間 gap、グループ境界に group_gap_extra
                         // 各 tier での想定幅 (= 左ボタン群、side_pad は別途加算)。
                         // 数値は下記のボタン描画ループと厳密一致させること。
@@ -7521,6 +7565,10 @@ impl NativeEguiOverlay {
                             egui::pos2(norm_rect.max.x + gap, center_y - 4.0),
                             egui::pos2(norm_rect.max.x + gap + vol_slider_w, center_y + 4.0),
                         );
+                        let seek_lock_rect = native_seek_bar_lock_button_rect(
+                            overlay_width_points,
+                            overlay_height_points,
+                        );
 
                         painter.rect_filled(bar_rect, 2.0, egui::Color32::from_gray(74));
                         if duration_secs > 0.0 {
@@ -8039,6 +8087,20 @@ impl NativeEguiOverlay {
                             );
                             limiter_resp.hover_tip_dark("出力リミッターが作動しました");
                         }
+                        draw_native_bar_lock_button(
+                            ui,
+                            painter,
+                            seek_lock_rect,
+                            "native_seek_bar_lock",
+                            seek_bar_locked,
+                            if seek_bar_locked {
+                                "シークバー固定を解除"
+                            } else {
+                                "シークバーを固定表示"
+                            },
+                            crate::video::NativeVideoBar::Seek,
+                            &mut commands,
+                        );
 
                         if cfg!(debug_assertions) {
                             let pointer = pointer_pos
@@ -8669,11 +8731,87 @@ fn log_event(kind: &str, fields: &[(&str, Value)]) {
     crate::perf::event("native_presenter", kind, None, 0, fields);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VideoVisualTargetRect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VideoVisualLayout {
+    compact: bool,
+    pixels_per_point: f32,
+    top_bar_locked: bool,
+    seek_bar_locked: bool,
+    fixed_bar_gap_px: u32,
+}
+
+impl From<bool> for VideoVisualLayout {
+    fn from(compact: bool) -> Self {
+        Self {
+            compact,
+            pixels_per_point: 1.0,
+            top_bar_locked: false,
+            seek_bar_locked: false,
+            fixed_bar_gap_px: 0,
+        }
+    }
+}
+
+fn compute_video_visual_target_rect(
+    win_w: u32,
+    win_h: u32,
+    layout: VideoVisualLayout,
+) -> VideoVisualTargetRect {
+    let win_w = win_w.max(1) as f32;
+    let win_h = win_h.max(1) as f32;
+    let ppp = if layout.pixels_per_point.is_finite() {
+        layout.pixels_per_point.max(0.01)
+    } else {
+        1.0
+    };
+    let gap_points = layout
+        .fixed_bar_gap_px
+        .min(crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX) as f32;
+    let top_reserved = if layout.top_bar_locked {
+        (HUD_TOP_HEIGHT + gap_points) * ppp
+    } else {
+        0.0
+    };
+    let bottom_reserved = if layout.seek_bar_locked {
+        (HUD_BOTTOM_HEIGHT + gap_points) * ppp
+    } else {
+        0.0
+    };
+    let content_top = top_reserved.min(win_h - 1.0);
+    let content_bottom = (win_h - bottom_reserved).max(content_top + 1.0).min(win_h);
+    let content_height = (content_bottom - content_top).max(1.0);
+
+    if layout.compact {
+        VideoVisualTargetRect {
+            x: win_w * 0.5,
+            y: content_top,
+            width: win_w * 0.5,
+            height: content_height * 0.5,
+        }
+    } else {
+        VideoVisualTargetRect {
+            x: 0.0,
+            y: content_top,
+            width: win_w,
+            height: content_height,
+        }
+    }
+}
+
 /// 動画 visual の DirectComposition transform 行列を SAR + display matrix 込みで計算する。
 ///
 /// `surface_w/h` は decoded frame の raw pixel サイズ (= swap chain backbuffer)。
 /// `win_w/h` はウィンドウサイズ。SAR は raw X 軸へ、orientation はその後の表示軸へ
-/// 適用する。`compact` は VST3 panel 表示時の 1/4 領域モード。
+/// 適用する。固定バーの領域を上下から除外した後、`compact` なら残った領域の
+/// 右上 1/4 へさらに絞り込む。
 ///
 /// 戻り値は `(M11, M12, M21, M22, M31, M32)`。orientation=0 では旧 SAR 実装と
 /// 完全に同じ値を返す。90/270 度では fit 対象の表示幅・高さを転置する。
@@ -8685,12 +8823,11 @@ fn compute_video_visual_transform(
     sar_num: u32,
     sar_den: u32,
     orientation: VideoOrientation,
-    compact: bool,
+    layout: impl Into<VideoVisualLayout>,
 ) -> (f32, f32, f32, f32, f32, f32) {
     let surface_w = surface_w.max(1) as f32;
     let surface_h = surface_h.max(1) as f32;
-    let win_w = win_w.max(1) as f32;
-    let win_h = win_h.max(1) as f32;
+    let layout = layout.into();
     let sar = (sar_num.max(1) as f32) / (sar_den.max(1) as f32);
     let corrected_w = surface_w * sar;
     let corrected_h = surface_h;
@@ -8701,11 +8838,9 @@ fn compute_video_visual_transform(
     let o22 = f32::from(o22);
     let display_w = o11.abs() * corrected_w + o21.abs() * corrected_h;
     let display_h = o12.abs() * corrected_w + o22.abs() * corrected_h;
-    let (target_x, target_y, target_w, target_h) = if compact {
-        (win_w * 0.5, 0.0, win_w * 0.5, win_h * 0.5)
-    } else {
-        (0.0, 0.0, win_w, win_h)
-    };
+    let target = compute_video_visual_target_rect(win_w, win_h, layout);
+    let (target_x, target_y, target_w, target_h) =
+        (target.x, target.y, target.width, target.height);
     // `display_w × display_h` を `target_w × target_h` に letterbox fit する scale。
     let scale = (target_w / display_w).min(target_h / display_h);
     // SAR は raw X 軸にだけ掛け、その後に orientation を合成する。
@@ -8849,21 +8984,24 @@ fn channel_delta(a: u8, b: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeBarVisibilitySnapshot, NativeEguiOverlay, NativeJumpPanelVisibilityInputs,
-        NativeOverlayInputRouting, NativePixelSample, NativeRightPanelVisibilityInputs,
-        NativeTouchPanelHandleInputs, VideoOrientation, compare_pixel_probe,
-        compute_video_visual_transform, configure_overlay_style, copy_cpu_rgba_to_swapchain_bgra,
-        cursor_move_is_activity, effective_overlay_pixels_per_point, egui_key_from_virtual_key,
-        metadata_clean_text, native_jump_panel_visible_from_inputs, native_panel_callout_hud_rects,
+        HUD_BOTTOM_HEIGHT, HUD_TOP_HEIGHT, NativeBarVisibilitySnapshot, NativeEguiOverlay,
+        NativeJumpPanelVisibilityInputs, NativeOverlayInputRouting, NativePixelSample,
+        NativeRightPanelVisibilityInputs, NativeTouchPanelHandleInputs, VideoOrientation,
+        VideoVisualLayout, VideoVisualTargetRect, compare_pixel_probe,
+        compute_video_visual_target_rect, compute_video_visual_transform, configure_overlay_style,
+        copy_cpu_rgba_to_swapchain_bgra, cursor_move_is_activity,
+        effective_overlay_pixels_per_point, egui_key_from_virtual_key, metadata_clean_text,
+        native_jump_panel_visible_from_inputs, native_panel_callout_hud_rects,
         native_right_panel_visible_from_inputs, native_touch_owned_panel_sides,
         native_touch_panel_handle_hud_rects,
         native_touch_panel_tap_command_dismisses_before_dispatch,
         native_video_fullscreen_shortcut_key, sample_cpu_rgba_pixel, should_claim_text_input_focus,
     };
-    use crate::settings::{FsSidePanelMode, VideoBarVisibilityMode};
+    use crate::settings::FsSidePanelMode;
     use crate::video::native_presenter::overlay_draw::{
         NATIVE_TOUCH_PANEL_HANDLE_WIDTH_PT, native_panel_callout_arrow_direction,
-        native_panel_callout_bar_rect, native_panel_top,
+        native_panel_callout_bar_rect, native_panel_top, native_seek_bar_lock_button_rect,
+        native_top_bar_lock_button_rect,
     };
     use crate::video::native_window::{
         NativeVideoKeyEvent, NativeVideoMouseButton, NativeVideoMouseButtonEvent,
@@ -9075,7 +9213,7 @@ mod tests {
                 720.0,
                 false,
                 false,
-                VideoBarVisibilityMode::Hover,
+                false,
             ),
             "raw hover near the bottom should show the dimmed HUD"
         );
@@ -9084,7 +9222,7 @@ mod tests {
             720.0,
             false,
             false,
-            VideoBarVisibilityMode::Hover,
+            false,
         ));
         assert!(
             !NativeEguiOverlay::native_hud_bottom_visible_from_hover(
@@ -9092,7 +9230,7 @@ mod tests {
                 720.0,
                 true,
                 false,
-                VideoBarVisibilityMode::Hover,
+                false,
             ),
             "external drag remains authoritative even for raw hover"
         );
@@ -9109,14 +9247,14 @@ mod tests {
             false,
             false,
             false,
-            VideoBarVisibilityMode::Hover,
+            false,
         ));
         assert!(!NativeEguiOverlay::native_hud_top_visible_from_hover(
             Some(egui::pos2(40.0, 80.0)),
             false,
             false,
             false,
-            VideoBarVisibilityMode::Hover,
+            false,
         ));
         assert!(
             NativeEguiOverlay::hud_dimmed_suppresses_overlay_pointer_event(
@@ -9144,73 +9282,45 @@ mod tests {
             720.0,
             false,
             false,
-            VideoBarVisibilityMode::Hover,
+            false,
         ));
     }
 
     #[test]
     fn touch_chrome_latch_reveals_bars_without_hover_and_preserves_hover_behavior() {
         assert!(NativeEguiOverlay::native_hud_bottom_visible_from_hover(
-            None,
-            720.0,
-            false,
-            true,
-            VideoBarVisibilityMode::Hover,
+            None, 720.0, false, true, false,
         ));
         assert!(NativeEguiOverlay::native_hud_top_visible_from_hover(
-            None,
-            false,
-            false,
-            true,
-            VideoBarVisibilityMode::Hover,
+            None, false, false, true, false,
         ));
         assert!(NativeEguiOverlay::native_hud_bottom_visible_from_hover(
             Some(egui::pos2(100.0, 650.0)),
             720.0,
             false,
             false,
-            VideoBarVisibilityMode::Hover,
+            false,
         ));
         assert!(!NativeEguiOverlay::native_hud_bottom_visible_from_hover(
             Some(egui::pos2(100.0, 100.0)),
             720.0,
             false,
             false,
-            VideoBarVisibilityMode::Hover,
+            false,
         ));
     }
 
     #[test]
-    fn pinned_video_bars_are_independent_inputs_to_visibility_functions() {
-        for &(top_mode, bottom_mode, expected_top, expected_bottom) in &[
-            (
-                VideoBarVisibilityMode::Hover,
-                VideoBarVisibilityMode::Hover,
-                false,
-                false,
-            ),
-            (
-                VideoBarVisibilityMode::Pinned,
-                VideoBarVisibilityMode::Hover,
-                true,
-                false,
-            ),
-            (
-                VideoBarVisibilityMode::Hover,
-                VideoBarVisibilityMode::Pinned,
-                false,
-                true,
-            ),
-            (
-                VideoBarVisibilityMode::Pinned,
-                VideoBarVisibilityMode::Pinned,
-                true,
-                true,
-            ),
+    fn locked_video_bars_are_independent_inputs_to_visibility_functions() {
+        for &(top_locked, seek_locked, expected_top, expected_bottom) in &[
+            (false, false, false, false),
+            (true, false, true, false),
+            (false, true, false, true),
+            (true, true, true, true),
         ] {
             assert_eq!(
                 NativeEguiOverlay::native_hud_top_visible_from_hover(
-                    None, false, false, false, top_mode,
+                    None, false, false, false, top_locked,
                 ),
                 expected_top
             );
@@ -9220,72 +9330,40 @@ mod tests {
                     720.0,
                     false,
                     false,
-                    bottom_mode,
+                    seek_locked,
                 ),
                 expected_bottom
             );
         }
 
         assert!(NativeEguiOverlay::native_hud_top_visible_from_hover(
-            None,
-            false,
-            true,
-            false,
-            VideoBarVisibilityMode::Pinned,
+            None, false, true, false, true,
         ));
         assert!(NativeEguiOverlay::native_hud_bottom_visible_from_hover(
-            None,
-            720.0,
-            true,
-            false,
-            VideoBarVisibilityMode::Pinned,
+            None, 720.0, true, false, true,
         ));
     }
 
     #[test]
-    fn unpinned_video_bars_return_to_existing_hover_and_touch_inputs() {
+    fn unlocked_video_bars_return_to_existing_hover_and_touch_inputs() {
         assert!(NativeEguiOverlay::native_hud_bottom_visible_from_hover(
-            None,
-            720.0,
-            false,
-            false,
-            VideoBarVisibilityMode::Pinned,
+            None, 720.0, false, false, true,
         ));
         assert!(!NativeEguiOverlay::native_hud_bottom_visible_from_hover(
-            None,
-            720.0,
-            false,
-            false,
-            VideoBarVisibilityMode::Hover,
+            None, 720.0, false, false, false,
         ));
         assert!(NativeEguiOverlay::native_hud_bottom_visible_from_hover(
-            None,
-            720.0,
-            false,
-            true,
-            VideoBarVisibilityMode::Hover,
+            None, 720.0, false, true, false,
         ));
 
         assert!(NativeEguiOverlay::native_hud_top_visible_from_hover(
-            None,
-            false,
-            false,
-            false,
-            VideoBarVisibilityMode::Pinned,
+            None, false, false, false, true,
         ));
         assert!(!NativeEguiOverlay::native_hud_top_visible_from_hover(
-            None,
-            false,
-            false,
-            false,
-            VideoBarVisibilityMode::Hover,
+            None, false, false, false, false,
         ));
         assert!(NativeEguiOverlay::native_hud_top_visible_from_hover(
-            None,
-            false,
-            false,
-            true,
-            VideoBarVisibilityMode::Hover,
+            None, false, false, true, false,
         ));
     }
 
@@ -9296,7 +9374,7 @@ mod tests {
             false,
             false,
             false,
-            VideoBarVisibilityMode::Hover,
+            false,
         );
         assert!(top_hover_visible);
 
@@ -9335,19 +9413,14 @@ mod tests {
     }
 
     #[test]
-    fn pinned_top_bar_does_not_publish_tile_or_navigation_region_snapshot() {
-        let pinned_top_visible = NativeEguiOverlay::native_hud_top_visible_from_hover(
-            None,
-            false,
-            false,
-            false,
-            VideoBarVisibilityMode::Pinned,
-        );
-        assert!(pinned_top_visible);
+    fn locked_bars_do_not_publish_tile_or_navigation_region_snapshots() {
+        let locked_top_visible =
+            NativeEguiOverlay::native_hud_top_visible_from_hover(None, false, false, false, true);
+        assert!(locked_top_visible);
 
         let unobstructed = NativeEguiOverlay::native_bar_visibility_snapshot(
             false,
-            pinned_top_visible,
+            locked_top_visible,
             false,
             false,
             false,
@@ -9359,13 +9432,13 @@ mod tests {
                 top_bar_visible: true,
                 bottom_hud_visible: false,
             },
-            "上部 Pinned は上部だけを描画し、下部へ固定状態を漏らさない"
+            "上部固定は上部だけを描画し、下部へ固定状態を漏らさない"
         );
 
         for &(tile_overlay_visible, navigation_preview_visible) in &[(true, false), (false, true)] {
             let guarded = NativeEguiOverlay::native_bar_visibility_snapshot(
                 false,
-                pinned_top_visible,
+                locked_top_visible,
                 false,
                 false,
                 tile_overlay_visible,
@@ -9375,6 +9448,20 @@ mod tests {
                 guarded,
                 NativeBarVisibilitySnapshot::default(),
                 "region が読む実描画 snapshot は tile/navigation 中に上端帯を公開しない"
+            );
+
+            let locked_bottom = NativeEguiOverlay::native_bar_visibility_snapshot(
+                true,
+                false,
+                false,
+                false,
+                tile_overlay_visible,
+                navigation_preview_visible,
+            );
+            assert_eq!(
+                locked_bottom,
+                NativeBarVisibilitySnapshot::default(),
+                "下部固定も tile/navigation 中は描画・region の双方で抑止する"
             );
         }
     }
@@ -9981,6 +10068,137 @@ mod tests {
         // SAR=0.5 → display_w=480, display_h=540, ratio M11/M22 = 0.5
         let ratio = m11 / m22;
         assert!((ratio - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn fixed_video_bars_reserve_target_rect_for_all_combinations_and_gap_bounds() {
+        let target = |top_bar_locked, seek_bar_locked, fixed_bar_gap_px| {
+            compute_video_visual_target_rect(
+                1920,
+                1080,
+                VideoVisualLayout {
+                    compact: false,
+                    pixels_per_point: 1.0,
+                    top_bar_locked,
+                    seek_bar_locked,
+                    fixed_bar_gap_px,
+                },
+            )
+        };
+
+        assert_eq!(
+            target(false, false, 0),
+            VideoVisualTargetRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            }
+        );
+        assert_eq!(
+            target(true, false, 0),
+            VideoVisualTargetRect {
+                x: 0.0,
+                y: HUD_TOP_HEIGHT,
+                width: 1920.0,
+                height: 1080.0 - HUD_TOP_HEIGHT,
+            }
+        );
+        assert_eq!(
+            target(false, true, 0),
+            VideoVisualTargetRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1920.0,
+                height: 1080.0 - HUD_BOTTOM_HEIGHT,
+            }
+        );
+        assert_eq!(
+            target(true, true, 0),
+            VideoVisualTargetRect {
+                x: 0.0,
+                y: HUD_TOP_HEIGHT,
+                width: 1920.0,
+                height: 1080.0 - HUD_TOP_HEIGHT - HUD_BOTTOM_HEIGHT,
+            }
+        );
+
+        let max_gap = crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX;
+        assert_eq!(
+            target(true, true, max_gap),
+            VideoVisualTargetRect {
+                x: 0.0,
+                y: HUD_TOP_HEIGHT + max_gap as f32,
+                width: 1920.0,
+                height: 1080.0 - HUD_TOP_HEIGHT - HUD_BOTTOM_HEIGHT - max_gap as f32 * 2.0,
+            }
+        );
+        assert_eq!(
+            target(true, true, max_gap + 900),
+            target(true, true, max_gap),
+            "余白は静止画と同じ上限で clamp する"
+        );
+    }
+
+    #[test]
+    fn compact_video_uses_the_upper_right_quarter_of_the_reserved_bar_target() {
+        let target = compute_video_visual_target_rect(
+            1920,
+            1080,
+            VideoVisualLayout {
+                compact: true,
+                pixels_per_point: 1.0,
+                top_bar_locked: true,
+                seek_bar_locked: true,
+                fixed_bar_gap_px: 10,
+            },
+        );
+        assert_eq!(
+            target,
+            VideoVisualTargetRect {
+                x: 960.0,
+                y: HUD_TOP_HEIGHT + 10.0,
+                width: 960.0,
+                height: (1080.0 - HUD_TOP_HEIGHT - HUD_BOTTOM_HEIGHT - 20.0) * 0.5,
+            }
+        );
+    }
+
+    #[test]
+    fn native_bar_lock_buttons_are_inside_the_same_snapshot_regions_as_their_bars() {
+        let width = 1280.0;
+        let height = 720.0;
+        let top_locked_visible =
+            NativeEguiOverlay::native_hud_top_visible_from_hover(None, false, false, false, true);
+        let seek_locked_visible = NativeEguiOverlay::native_hud_bottom_visible_from_hover(
+            None, height, false, false, true,
+        );
+        let snapshot = NativeEguiOverlay::native_bar_visibility_snapshot(
+            seek_locked_visible,
+            top_locked_visible,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            snapshot,
+            NativeBarVisibilitySnapshot {
+                top_bar_visible: true,
+                bottom_hud_visible: true,
+            }
+        );
+        let top_region =
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(width, HUD_TOP_HEIGHT));
+        let bottom_region = egui::Rect::from_min_max(
+            egui::pos2(0.0, height - HUD_BOTTOM_HEIGHT),
+            egui::pos2(width, height),
+        );
+        let top_lock = native_top_bar_lock_button_rect(width);
+        let seek_lock = native_seek_bar_lock_button_rect(width, height);
+
+        assert!(top_region.contains(top_lock.min) && top_region.contains(top_lock.max));
+        assert!(bottom_region.contains(seek_lock.min) && bottom_region.contains(seek_lock.max));
     }
 
     /// Compact mode (VST3 panel 表示時の 1/4 領域) でも SAR 補正が正しく適用される。

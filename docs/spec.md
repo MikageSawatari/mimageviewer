@@ -789,9 +789,10 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
   直前を seek target にして、target 以前の keyframe から decoder が直前 frame を選ぶ。
   前/次フレームボタンの長押しは、前回のフレームが画面へ
   反映された後に最短約 100ms 間隔で次の frame-step seek を発行する。
-- 動画の上部情報バーと下部シークバーは、環境設定でそれぞれ独立して「自動表示」
-  (既定) /「固定表示」を選べる。固定したバーは映像の上に重なり、映像のフィット・
-  ズーム・パン範囲は変えない。上部だけを固定しても下部は固定されない。
+- 動画の上部情報バーと下部シークバーは、環境設定の独立した checkbox で固定表示できる。
+  既定は両方 OFF。固定したバーの領域と共通余白を映像のフィット範囲から除外し、映像を
+  残りの領域へフィットする。上部だけを固定しても下部は固定されない。各バー端の鍵アイコンからも
+  固定 / 解除でき、解除後は従来の自動表示へ直ちに戻る。
   自動表示では従来どおり、上下端へのマウス移動、タッチによる操作部の表示、
   左右パネル表示に応じて必要なバーを表示する。固定解除後はその自動表示へ直ちに戻る。
 - 動画シークバーはトラック下側に秒 / 分 / 時間の目盛りを描き、幅に応じて許可系列から間引く。
@@ -1699,7 +1700,7 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `fullscreen_top_bar_locked` | bool | false | 静止画フルスクリーンの上部情報バーを固定表示する。ON のときは上端のバー領域を画像フィット範囲から除外する |
 | `touch_still_chrome_learned` | bool | false | 静止画 / 本フルスクリーンの初回タッチ案内でクロームを一度表示したかを示す内部学習フラグ。利用者向け設定には出さない。既存 `settings.db` にキーが無い場合は `serde(default)` により false とし、schema family や既知 enum の解釈を変えない。未出荷の旧名 `touch_center_chrome_learned` は移行コードなしで置き換える |
 | `touch_video_chrome_learned` | bool | false | 動画の初回タッチ案内で HUD を一度表示したかを示す独立した内部学習フラグ。静止画 / 本の学習状態を共有しない。`settings_kv` の加法フィールド + `serde(default)` とし、キー欠落時も既存 DB をそのまま読み込む |
-| `fullscreen_fixed_bar_gap_px` | u32 | 0 | 固定表示中の上部情報バー / 下部ページシークバーと画像領域の間隔。上下共通で 0〜100px にクランプし、固定していないバーには適用しない |
+| `fullscreen_fixed_bar_gap_px` | u32 | 0 | 固定表示中の上部情報バー / 下部シークバーと画像・映像領域の間隔。静止画と動画、上下で共通。0〜100px にクランプし、固定していないバーには適用しない |
 | `fullscreen_seek_direction` | FullscreenSeekDirection | FollowReading | ページシークバーの左右方向。`FollowReading` は横の読み方向へ合わせ、`LeftToRight` は常に左端を先頭にする。シークバーのラベル・つまみ・塗り・バー上のクリック / ドラッグ解釈で同じ値を使う |
 | `fullscreen_horizontal_cursor_direction` | FullscreenHorizontalCursorDirection | FollowPage | 通常の左右カーソルキーによるページ移動の方向。`FollowPage` はページ表示 / 読み方向に合わせる従来動作、`FollowSeekBar` は `fullscreen_seek_direction` から求めたシークバーの実効方向に合わせる。横連結中の左右スクロールと、明示的な前 / 次・Shift / Ctrl+左右・PageUp / PageDown・画面端クリック・ホイールは対象外 |
 | `fullscreen_page_number_overlay` | bool | true | 静止画フルスクリーン右下に現在ページ / 総ページ数を常時表示する。下部ページシークバーの固定表示中は非表示 |
@@ -1755,8 +1756,8 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `video_volume` | f64 | 1.0 | 動画再生時の既定音量（線形ゲイン。UI は -∞dB〜+18dB の dB フェーダー）。1.0 超は手動 boost として safety limiter 前で適用 |
 | `video_playback_speed` | f64 | 1.0 | 動画再生速度。HUD の速度ボタンから変更し、動画切替とアプリ再起動後も維持する。読み込み時は `0.25..=4.0` にクランプ |
 | `video_seek_thumbnail_tolerance_secs` | f64 | 1.0 | 動画シークバーのプレビューで許容する位置差。0.0〜30.0 秒にクランプ。desktop / Remote はバー 1 物理 px 相当の秒数との大きい方を使う |
-| `video_top_bar_visibility` | VideoBarVisibilityMode | Hover | 動画の上部情報バーの表示方法 (Hover=自動表示 / Pinned=固定表示) |
-| `video_seek_bar_visibility` | VideoBarVisibilityMode | Hover | 動画の下部シークバーの表示方法 (Hover=自動表示 / Pinned=固定表示)。上部とは独立 |
+| `video_top_bar_locked` | bool | false | 動画の上部情報バーを固定表示する。ON のときは上端のバー領域と共通余白を映像フィット範囲から除外する。静止画設定とは独立 |
+| `video_seek_bar_locked` | bool | false | 動画の下部シークバーを固定表示する。ON のときは下端のバー領域と共通余白を映像フィット範囲から除外する。上部・静止画設定とは独立 |
 | `video_continuous_mode` | VideoContinuousMode | Off | 動画連続再生モード (Off / Continuous / ContinuousLoop)。ON の間は通常ループを無効化し、EOF で現在リスト内の次動画へ進む |
 | `video_start_muted` | bool | false | 起動時にセッション初期ミュートを true にする安全スイッチ。起動後の動画切替では `video_muted` / HUD の現在状態を優先する |
 | `video_muted` | bool | false | HUD のミュートボタン / M キーで最後に選んだミュート状態。動画切替と次回起動へ引き継ぐ |
