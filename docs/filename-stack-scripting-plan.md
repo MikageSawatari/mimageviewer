@@ -59,7 +59,7 @@
     `max_operations` は 100M (100k の正当処理 ~数百万 op に対し十分・暴走は阻止)。
 - **設定**: `stack_script_enabled: bool` (既定 false、`#[serde(default)]`)。OFF=内蔵既定
   スクリプト / ON=ユーザー `stack_rules.rhai`。どちらもスクリプトで分類する (OFF が separator
-  だけだった旧挙動は廃止)。UI = 環境設定「フォルダ」ページ (スクリプトを開く / 既定に戻す /
+  だけだった旧挙動は廃止)。UI = 環境設定「フォルダ・ファイル」ページ (スクリプトを開く / 既定に戻す /
   ヘルプ)。スタックモードの ON/OFF 自体は v2.0.0 同様 transient。`stack_separator` は失敗時
   フォールバック専用。
 - **マニュアル**: 独立ページ `htdocs/mimageviewer/manual/stack.html` (既定動作 + カスタマイズ +

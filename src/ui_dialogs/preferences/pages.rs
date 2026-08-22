@@ -462,13 +462,6 @@ pub(super) fn page_explorer_integration(ui: &mut egui::Ui, state: &mut Preferenc
     });
     ui.add_space(10.0);
 
-    anchored(ui, state, "explorer/delete-confirmation", |ui, state| {
-        ui.label(egui::RichText::new("ファイルの削除").strong());
-        ui.add_space(4.0);
-        draw_recycle_bin_delete_confirmation_setting(ui, &mut state.settings);
-    });
-    ui.add_space(10.0);
-
     anchored(ui, state, "explorer/sendto", |ui, state| {
         ui.label(
             "Windows の「送る」メニューに mImageViewer を追加します。\n\
@@ -6951,6 +6944,12 @@ pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 .size(11.0)
                 .color(ui.visuals().weak_text_color()),
         );
+        ui.add_space(12.0);
+    });
+    anchored(ui, state, "folder/delete-confirmation", |ui, state| {
+        ui.label(egui::RichText::new("ファイルの削除").strong());
+        ui.add_space(4.0);
+        draw_recycle_bin_delete_confirmation_setting(ui, &mut state.settings);
         ui.add_space(12.0);
     });
     anchored(ui, state, "folder/backup", |ui, state| {

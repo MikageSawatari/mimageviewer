@@ -536,6 +536,31 @@ mod tests {
     }
 
     #[test]
+    fn escape_produces_the_same_close_decision_with_and_without_dont_ask_again() {
+        for disable_future_prompts in [false, true] {
+            let mut prompt = ContentRestorePrompt::from_candidates(vec![candidate("escape")])
+                .expect("candidate must create a prompt");
+            prompt.dont_ask_again = disable_future_prompts;
+            let close_decision = prompt.clone().decide(ContentRestorePromptAction::Close);
+            let escape_action =
+                crate::ui_dialogs::content_restore::resolve_content_restore_prompt_action(
+                    true, None,
+                )
+                .expect("Escape must resolve to an action");
+            let escape_decision = prompt.decide(escape_action);
+
+            for decision in [close_decision, escape_decision] {
+                assert!(matches!(
+                    decision,
+                    ContentRestorePromptDecision::Close {
+                        disable_future_prompts: actual
+                    } if actual == disable_future_prompts
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn restore_records_only_unchecked_rows_as_declined() {
         let mut prompt =
             ContentRestorePrompt::from_candidates(vec![candidate("off"), candidate("on")]).unwrap();

@@ -52,15 +52,23 @@ fn multiple_source_warning_text(rows: &[ContentRestoreUiRow]) -> Option<String> 
         .then(|| format!("{count} 件、複数のコピー元があります。コピー元を選択してください。"))
 }
 
-fn resolve_window_action(
-    open: bool,
+pub(crate) fn resolve_content_restore_prompt_action(
+    escape_pressed: bool,
     action: Option<ContentRestoreUiAction>,
-) -> Option<ContentRestoreUiAction> {
-    if open {
-        action
-    } else {
+) -> Option<crate::app::content_identity_restore::ContentRestorePromptAction> {
+    let action = if escape_pressed {
         Some(ContentRestoreUiAction::Close)
-    }
+    } else {
+        action
+    }?;
+    Some(match action {
+        ContentRestoreUiAction::Restore => {
+            crate::app::content_identity_restore::ContentRestorePromptAction::Restore
+        }
+        ContentRestoreUiAction::Close => {
+            crate::app::content_identity_restore::ContentRestorePromptAction::Close
+        }
+    })
 }
 
 pub fn render_content_restore_contents(
@@ -69,6 +77,22 @@ pub fn render_content_restore_contents(
     dont_ask_again: &mut bool,
 ) -> Option<ContentRestoreUiAction> {
     render_content_restore_contents_with_list_height(ui, rows, dont_ask_again).0
+}
+
+pub fn render_content_restore_modal(
+    ctx: &egui::Context,
+    rows: &mut [ContentRestoreUiRow],
+    dont_ask_again: &mut bool,
+) -> Option<ContentRestoreUiAction> {
+    let modal_width = (ctx.content_rect().width() - 80.0).clamp(420.0, 780.0);
+    egui::Modal::new(egui::Id::new("content_restore_modal"))
+        .show(ctx, |ui| {
+            ui.set_min_width(modal_width);
+            ui.heading("編集内容の復元");
+            ui.add_space(8.0);
+            render_content_restore_contents(ui, rows, dont_ask_again)
+        })
+        .inner
 }
 
 fn render_content_restore_contents_with_list_height(
@@ -166,36 +190,16 @@ impl crate::app::App {
         if !self.content_restore_window_visible() {
             return;
         }
-        let mut open = true;
-        let mut action = None;
-        let default_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
+        // Modal::should_close は Escape を直接消費するため使わない。IME 変換中の Escape を
+        // 奪わない共通 helper の結果を、mutable prompt borrow より先に確定する。
+        let escape_pressed = self.dialog_escape_pressed(ctx);
         let prompt = self
             .content_restore_prompt
             .as_mut()
             .expect("visibility predicate checked restore prompt");
-        egui::Window::new("編集内容の復元")
-            .id(egui::Id::new("content_restore_window"))
-            .default_pos(default_pos)
-            .default_width(780.0)
-            .resizable(true)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                action = render_content_restore_contents(
-                    ui,
-                    &mut prompt.ui_rows,
-                    &mut prompt.dont_ask_again,
-                );
-            });
-        action = resolve_window_action(open, action);
-        if let Some(action) = action {
-            let action = match action {
-                ContentRestoreUiAction::Restore => {
-                    crate::app::content_identity_restore::ContentRestorePromptAction::Restore
-                }
-                ContentRestoreUiAction::Close => {
-                    crate::app::content_identity_restore::ContentRestorePromptAction::Close
-                }
-            };
+        let action =
+            render_content_restore_modal(ctx, &mut prompt.ui_rows, &mut prompt.dont_ask_again);
+        if let Some(action) = resolve_content_restore_prompt_action(escape_pressed, action) {
             self.handle_content_restore_prompt_action(ctx, action);
         }
     }
@@ -322,14 +326,14 @@ mod tests {
     }
 
     #[test]
-    fn window_x_maps_to_the_same_close_action() {
+    fn escape_maps_to_close_and_overrides_a_restore_click() {
         assert_eq!(
-            resolve_window_action(false, None),
-            Some(ContentRestoreUiAction::Close)
+            resolve_content_restore_prompt_action(true, None),
+            Some(crate::app::content_identity_restore::ContentRestorePromptAction::Close)
         );
         assert_eq!(
-            resolve_window_action(false, Some(ContentRestoreUiAction::Restore)),
-            Some(ContentRestoreUiAction::Close)
+            resolve_content_restore_prompt_action(true, Some(ContentRestoreUiAction::Restore)),
+            Some(crate::app::content_identity_restore::ContentRestorePromptAction::Close)
         );
     }
 
