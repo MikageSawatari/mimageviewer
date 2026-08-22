@@ -28,6 +28,15 @@ pub fn draw_video_bar_visibility_snapshot_fixture(ui: &mut egui::Ui) {
     pages::draw_video_bar_visibility_settings(ui, &mut settings);
 }
 
+#[doc(hidden)]
+pub fn draw_video_thumbnail_indicator_settings_snapshot_fixture(ui: &mut egui::Ui) {
+    let mut settings = Settings {
+        video_thumbnail_indicator: crate::settings::VideoThumbnailIndicator::BottomLeftBadge,
+        ..Settings::default()
+    };
+    pages::draw_video_thumbnail_indicator_settings(ui, &mut settings);
+}
+
 fn pref_panel_scroll_style() -> egui::style::ScrollStyle {
     let mut scroll = egui::style::ScrollStyle::solid();
     scroll.bar_width = 10.0;

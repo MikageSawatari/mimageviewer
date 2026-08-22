@@ -138,6 +138,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["表示順", "フォルダ", "画像", "動画", "アーカイブ"]
     ),
     entry!(
+        "thumbnail/video-indicator",
+        Thumbnail,
+        "動画サムネイルの目印",
+        ["再生アイコン", "左下バッジ", "非表示"]
+    ),
+    entry!(
         "thumbnail/idle-upgrade",
         Thumbnail,
         "アイドル時にキャッシュ由来のサムネイルを高画質化する",

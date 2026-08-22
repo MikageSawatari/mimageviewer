@@ -540,6 +540,46 @@ impl GridClickSelectionMode {
 }
 
 // -----------------------------------------------------------------------
+// 動画サムネイルの目印
+// -----------------------------------------------------------------------
+
+/// サムネイル一覧で動画を示す目印の表示方法。
+///
+/// `Unknown` は将来版の値を旧版で読み込んだときの受け皿。設定の sanitize 時に、
+/// 既存動作の中央再生アイコンへ正規化する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum VideoThumbnailIndicator {
+    #[default]
+    PlayIcon,
+    BottomLeftBadge,
+    Hidden,
+    #[serde(other)]
+    Unknown,
+}
+
+impl VideoThumbnailIndicator {
+    pub fn label(self) -> &'static str {
+        match self.normalized() {
+            Self::PlayIcon => "再生アイコン",
+            Self::BottomLeftBadge => "左下バッジ",
+            Self::Hidden => "なし",
+            Self::Unknown => unreachable!("normalized video thumbnail indicator"),
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[Self::PlayIcon, Self::BottomLeftBadge, Self::Hidden]
+    }
+
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Unknown => Self::PlayIcon,
+            indicator => indicator,
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
 // 選択情報の表示方法
 // -----------------------------------------------------------------------
 
@@ -3411,6 +3451,9 @@ pub struct Settings {
     /// 同じ行は `sort_order` で混在ソートし、空行は表示時に読み飛ばす。
     #[serde(default)]
     pub grid_display_order: GridDisplayOrder,
+    /// 動画サムネイルを示す目印。既定は従来どおり中央の再生アイコン。
+    #[serde(default)]
+    pub video_thumbnail_indicator: VideoThumbnailIndicator,
     /// ファイル名 prefix スタック (v2.0.0) のグループ化区切り文字。既定 '_'。
     /// 例: '_' のとき "12345678_p0.jpg" は prefix "12345678" でまとまる
     /// (docs/filename-stack-plan.md)。スタックモードの ON/OFF 自体は transient で
@@ -5357,6 +5400,7 @@ impl Default for Settings {
             subfolder_expansion_filter_date_preset: None,
             subfolder_expansion_filter_size_preset: None,
             grid_display_order: GridDisplayOrder::default(),
+            video_thumbnail_indicator: VideoThumbnailIndicator::default(),
             thumb_px: default_thumb_px(),
             text_preview_scale: default_text_preview_scale(),
             text_smart_snap_enabled: true,
@@ -7188,6 +7232,7 @@ impl Settings {
             ToolbarFacetFilterItem::visible_order(&self.toolbar_facet_filter_items);
         self.facet_name_filter_width = self.facet_name_filter_width.normalized();
         self.grid_click_selection_mode = self.grid_click_selection_mode.normalized();
+        self.video_thumbnail_indicator = self.video_thumbnail_indicator.normalized();
         // grid_open_selected_item_on_click / grid_cursor_wrap は bool のため不正値を持たない。
         // 旧設定の欠落は serde default で false に補い、sanitize では読み込んだ ON/OFF を
         // そのまま維持する。
@@ -8433,6 +8478,42 @@ mod tests {
         );
         loaded.sanitize();
         assert_eq!(loaded.fullscreen_side_panel_mode, FsSidePanelMode::Hover);
+    }
+
+    #[test]
+    fn video_thumbnail_indicator_defaults_to_the_existing_play_icon() {
+        assert_eq!(
+            Settings::default().video_thumbnail_indicator,
+            VideoThumbnailIndicator::PlayIcon
+        );
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            loaded.video_thumbnail_indicator,
+            VideoThumbnailIndicator::PlayIcon
+        );
+        assert_eq!(
+            VideoThumbnailIndicator::all(),
+            &[
+                VideoThumbnailIndicator::PlayIcon,
+                VideoThumbnailIndicator::BottomLeftBadge,
+                VideoThumbnailIndicator::Hidden,
+            ]
+        );
+    }
+
+    #[test]
+    fn video_thumbnail_indicator_normalizes_unknown_to_the_existing_default() {
+        let mut loaded: Settings =
+            serde_json::from_str(r#"{"video_thumbnail_indicator":"FutureIndicator"}"#).unwrap();
+        assert_eq!(
+            loaded.video_thumbnail_indicator,
+            VideoThumbnailIndicator::Unknown
+        );
+        loaded.sanitize();
+        assert_eq!(
+            loaded.video_thumbnail_indicator,
+            VideoThumbnailIndicator::PlayIcon
+        );
     }
 
     #[test]

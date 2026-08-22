@@ -4,11 +4,14 @@ use eframe::egui;
 
 use super::{draw_rotated_image, drive_display_label, is_miv_upscaled_derivative};
 use crate::grid_item::{GridItem, ThumbnailState};
+use crate::settings::VideoThumbnailIndicator;
 use crate::thumb_overlay_layout::{
-    BottomContainerInput, BottomContainerKind, EditBadgeFlags, ThumbnailOverlayLayout,
-    ThumbnailOverlayLayoutInput, layout_thumbnail_overlays,
+    BottomContainerInput, BottomContainerKind, EditBadgeFlags, FormatBadgeKind,
+    ThumbnailOverlayLayout, ThumbnailOverlayLayoutInput, layout_thumbnail_overlays,
 };
 use crate::ui_helpers::draw_play_icon;
+
+const VIDEO_THUMBNAIL_BADGE_LABEL: &str = "動画";
 
 /// サムネイルテクスチャをアスペクト保持で中央配置して描画する（回転対応）。
 fn draw_thumb_texture(
@@ -133,10 +136,46 @@ pub(crate) struct BottomLeftContent<'a> {
     pub filename: Option<&'a str>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VideoThumbnailIndicatorParts {
+    pub play_icon: bool,
+    pub bottom_left_badge: bool,
+}
+
+/// Resolve the two mutually exclusive video-thumbnail indicator surfaces from one setting.
+/// Audio is deliberately outside this contract: its music icon is the cell content itself.
+pub(crate) fn video_thumbnail_indicator_parts(
+    item: &GridItem,
+    indicator: VideoThumbnailIndicator,
+) -> VideoThumbnailIndicatorParts {
+    if !matches!(item, GridItem::Video(_)) {
+        return VideoThumbnailIndicatorParts {
+            play_icon: false,
+            bottom_left_badge: false,
+        };
+    }
+    match indicator.normalized() {
+        VideoThumbnailIndicator::PlayIcon => VideoThumbnailIndicatorParts {
+            play_icon: true,
+            bottom_left_badge: false,
+        },
+        VideoThumbnailIndicator::BottomLeftBadge => VideoThumbnailIndicatorParts {
+            play_icon: false,
+            bottom_left_badge: true,
+        },
+        VideoThumbnailIndicator::Hidden => VideoThumbnailIndicatorParts {
+            play_icon: false,
+            bottom_left_badge: false,
+        },
+        VideoThumbnailIndicator::Unknown => unreachable!("normalized video thumbnail indicator"),
+    }
+}
+
 pub(crate) fn bottom_left_content<'a>(
     item: &GridItem,
     thumb: &ThumbnailState,
     item_name: &'a str,
+    video_indicator: VideoThumbnailIndicator,
 ) -> BottomLeftContent<'a> {
     let mut container_kind = None;
     let mut container_label = None;
@@ -150,30 +189,40 @@ pub(crate) fn bottom_left_content<'a>(
                 filename = Some(item_name);
             }
         }
-        GridItem::Video(_) | GridItem::Audio(_) => filename = Some(item_name),
+        GridItem::Video(_) => {
+            if video_thumbnail_indicator_parts(item, video_indicator).bottom_left_badge {
+                container_kind = Some(BottomContainerKind::Format(FormatBadgeKind::Video));
+                container_label = Some(VIDEO_THUMBNAIL_BADGE_LABEL);
+            }
+            filename = Some(item_name);
+        }
+        GridItem::Audio(_) => filename = Some(item_name),
         GridItem::ZipFile(_) => {
-            container_kind = Some(BottomContainerKind::Format);
+            container_kind = Some(BottomContainerKind::Format(FormatBadgeKind::Zip));
             container_label = Some("ZIP");
             filename = Some(item_name);
         }
         GridItem::PdfFile(_) => {
-            container_kind = Some(BottomContainerKind::Format);
+            container_kind = Some(BottomContainerKind::Format(FormatBadgeKind::Pdf));
             container_label = Some("PDF");
             filename = Some(item_name);
         }
         GridItem::ConvertibleArchive { format, .. } => {
-            container_kind = Some(BottomContainerKind::Format);
+            container_kind = Some(BottomContainerKind::Format(FormatBadgeKind::Archive));
             container_label = Some(format.label());
             filename = Some(item_name);
         }
         GridItem::ZipDir { is_archive, .. } if *is_archive => {
             let extension = item_name.rsplit('.').next().unwrap_or_default();
-            container_kind = Some(BottomContainerKind::Format);
-            container_label = Some(
+            let nested_format =
                 crate::archive_converter::ArchiveFormat::nested_from_extension(extension)
-                    .filter(|format| *format != crate::archive_converter::ArchiveFormat::Zip)
-                    .map_or("ZIP", |format| format.label()),
-            );
+                    .filter(|format| *format != crate::archive_converter::ArchiveFormat::Zip);
+            container_kind = Some(BottomContainerKind::Format(if nested_format.is_some() {
+                FormatBadgeKind::Archive
+            } else {
+                FormatBadgeKind::Zip
+            }));
+            container_label = Some(nested_format.map_or("ZIP", |format| format.label()));
             filename = Some(item_name);
         }
         GridItem::ZipDir { .. } => {
@@ -204,6 +253,7 @@ pub(crate) fn layout_cell_overlays(
     tags: &[String],
     bookmark_time: Option<&str>,
     is_drive_list: bool,
+    video_indicator: VideoThumbnailIndicator,
 ) -> ThumbnailOverlayLayout {
     let inner = rect.shrink(4.0);
     let item_name = match item {
@@ -234,7 +284,7 @@ pub(crate) fn layout_cell_overlays(
         container_kind: bottom_kind,
         container_label: bottom_label,
         filename,
-    } = bottom_left_content(item, thumb, &item_name);
+    } = bottom_left_content(item, thumb, &item_name, video_indicator);
 
     let rating_text = (1..=5).contains(&rating).then(|| {
         let stars = "★".repeat(rating as usize);
@@ -328,6 +378,7 @@ pub(crate) fn draw_cell(
     // コンテナセルに出す「フィルタ一致の子孫件数」。None ならバッジ非表示。
     filter_match_count: Option<u32>,
     is_drive_list: bool,
+    video_indicator: VideoThumbnailIndicator,
 ) {
     if !ui.is_rect_visible(rect) {
         return;
@@ -407,9 +458,10 @@ pub(crate) fn draw_cell(
                     painter.rect_filled(inner, 2.0, egui::Color32::from_gray(40));
                 }
             }
-            // 再生ボタンオーバーレイ（常時表示）
-            let r = (inner.width().min(inner.height()) * 0.18).max(10.0);
-            draw_play_icon(painter, inner.center(), r);
+            if video_thumbnail_indicator_parts(item, video_indicator).play_icon {
+                let r = (inner.width().min(inner.height()) * 0.18).max(10.0);
+                draw_play_icon(painter, inner.center(), r);
+            }
         }
         GridItem::Audio(_) => {
             // 音声は固定の音楽アイコン (波形サムネは生成しない、D2)。サムネ状態に依らず
@@ -704,8 +756,8 @@ pub(crate) fn draw_cell(
                 BottomContainerKind::Folder,
             ) => crate::ui_helpers::draw_overlay_folder_badge(painter, placement),
             crate::thumb_overlay_layout::BadgeKind::BottomContainer(
-                BottomContainerKind::Format,
-            ) => crate::ui_helpers::draw_overlay_format_badge(painter, placement),
+                BottomContainerKind::Format(kind),
+            ) => crate::ui_helpers::draw_overlay_format_badge(painter, placement, kind),
             _ => {}
         }
     }
@@ -857,10 +909,197 @@ pub(crate) fn tq_draw_preview(
     response
 }
 
+#[allow(clippy::too_many_arguments)]
+fn draw_video_indicator_snapshot_cell(
+    ui: &mut egui::Ui,
+    size: egui::Vec2,
+    label: &str,
+    item: &GridItem,
+    thumb: &ThumbnailState,
+    indicator: VideoThumbnailIndicator,
+    selected: bool,
+    rating: u8,
+    tags: &[String],
+) -> egui::Response {
+    ui.label(egui::RichText::new(label).small());
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let layout = layout_cell_overlays(
+        ui.painter(),
+        rect,
+        EditBadgeFlags::default(),
+        rating,
+        item,
+        thumb,
+        tags,
+        None,
+        false,
+        indicator,
+    );
+    draw_cell(
+        ui,
+        rect,
+        selected,
+        false,
+        false,
+        &layout,
+        item,
+        thumb,
+        crate::rotation_db::Rotation::None,
+        None,
+        None,
+        false,
+        indicator,
+    );
+    if let Some(tag_rect) = grid_tag_badge_hit_rect(&layout)
+        && response.hovered()
+        && ui
+            .ctx()
+            .input(|input| input.pointer.hover_pos())
+            .is_some_and(|pos| tag_rect.contains(pos))
+    {
+        response.clone().on_hover_text("#hover をタグビューで探す");
+    }
+    response
+}
+
+fn snapshot_thumbnail(ctx: &egui::Context, name: &str) -> ThumbnailState {
+    let size = [48, 27];
+    let mut pixels = Vec::with_capacity(size[0] * size[1]);
+    for y in 0..size[1] {
+        for x in 0..size[0] {
+            let color = if x < size[0] / 2 {
+                egui::Color32::from_rgb(58 + y as u8 * 2, 92, 128 + x as u8)
+            } else {
+                egui::Color32::from_rgb(134, 72 + y as u8 * 2, 76)
+            };
+            pixels.push(color);
+        }
+    }
+    ThumbnailState::Loaded {
+        tex: ctx.load_texture(
+            name,
+            egui::ColorImage::new(size, pixels),
+            Default::default(),
+        ),
+        from_cache: false,
+        from_edit_preview: false,
+        rendered_at_px: 128,
+        source_dims: Some((1920, 1080)),
+        layout_dims: None,
+    }
+}
+
+/// Snapshot fixture that routes every cell through the production grid layout and paint helpers.
+#[doc(hidden)]
+pub fn draw_video_thumbnail_indicator_snapshot_fixture(ui: &mut egui::Ui) {
+    use std::path::PathBuf;
+
+    ui.set_width(440.0);
+    ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
+    ui.heading("動画サムネイルの目印");
+    let loaded = snapshot_thumbnail(ui.ctx(), "video-indicator-snapshot");
+    let video = GridItem::Video(PathBuf::from("scene.mp4"));
+    let audio = GridItem::Audio(PathBuf::from("song.flac"));
+    let dense_tags = vec!["#hover".to_owned(), "旅行".to_owned()];
+
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            draw_video_indicator_snapshot_cell(
+                ui,
+                egui::vec2(132.0, 88.0),
+                "既定・代表画像あり",
+                &video,
+                &loaded,
+                VideoThumbnailIndicator::PlayIcon,
+                false,
+                0,
+                &[],
+            );
+        });
+        ui.vertical(|ui| {
+            draw_video_indicator_snapshot_cell(
+                ui,
+                egui::vec2(132.0, 88.0),
+                "既定・生成中",
+                &video,
+                &ThumbnailState::Pending,
+                VideoThumbnailIndicator::PlayIcon,
+                false,
+                0,
+                &[],
+            );
+        });
+        ui.vertical(|ui| {
+            draw_video_indicator_snapshot_cell(
+                ui,
+                egui::vec2(132.0, 88.0),
+                "なし・生成中",
+                &video,
+                &ThumbnailState::Pending,
+                VideoThumbnailIndicator::Hidden,
+                false,
+                0,
+                &[],
+            );
+        });
+    });
+
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            draw_video_indicator_snapshot_cell(
+                ui,
+                egui::vec2(238.0, 104.0),
+                "左下・選択・評価 / タグ",
+                &video,
+                &loaded,
+                VideoThumbnailIndicator::BottomLeftBadge,
+                true,
+                4,
+                &dense_tags,
+            );
+        });
+        ui.vertical(|ui| {
+            draw_video_indicator_snapshot_cell(
+                ui,
+                egui::vec2(160.0, 104.0),
+                "左下・狭いセル / hover",
+                &video,
+                &ThumbnailState::Pending,
+                VideoThumbnailIndicator::BottomLeftBadge,
+                false,
+                3,
+                &dense_tags,
+            );
+        });
+    });
+
+    ui.horizontal(|ui| {
+        for indicator in VideoThumbnailIndicator::all() {
+            ui.vertical(|ui| {
+                draw_video_indicator_snapshot_cell(
+                    ui,
+                    egui::vec2(132.0, 64.0),
+                    indicator.label(),
+                    &audio,
+                    &ThumbnailState::Pending,
+                    *indicator,
+                    false,
+                    0,
+                    &[],
+                );
+            });
+        }
+    });
+}
+
 #[cfg(test)]
 mod bottom_left_content_tests {
-    use super::{BottomContainerKind, bottom_left_content};
+    use super::{
+        BottomContainerKind, FormatBadgeKind, VIDEO_THUMBNAIL_BADGE_LABEL, bottom_left_content,
+        video_thumbnail_indicator_parts,
+    };
     use crate::grid_item::{GridItem, ThumbnailState};
+    use crate::settings::VideoThumbnailIndicator;
     use std::path::PathBuf;
 
     // 左下レーンのコンテナバッジ / ファイル名プレートの出し分け。レーン共通化 (§2.2) の前は
@@ -886,7 +1125,8 @@ mod bottom_left_content_tests {
     #[test]
     fn folder_shows_its_name_badge_once_the_thumbnail_is_loaded() {
         let folder = GridItem::Folder(PathBuf::from("c:/x"));
-        let content = bottom_left_content(&folder, &loaded(), "x");
+        let content =
+            bottom_left_content(&folder, &loaded(), "x", VideoThumbnailIndicator::PlayIcon);
         assert_eq!(content.container_kind, Some(BottomContainerKind::Folder));
         assert_eq!(content.container_label, Some("x"));
         assert_eq!(content.filename, None);
@@ -900,7 +1140,8 @@ mod bottom_left_content_tests {
             ("evicted", ThumbnailState::Evicted),
             ("failed", ThumbnailState::Failed),
         ] {
-            let content = bottom_left_content(&folder, &thumb, "x");
+            let content =
+                bottom_left_content(&folder, &thumb, "x", VideoThumbnailIndicator::PlayIcon);
             assert_eq!(content.container_kind, None, "{label}");
             assert_eq!(content.filename, Some("x"), "{label}");
         }
@@ -914,21 +1155,65 @@ mod bottom_left_content_tests {
             path: PathBuf::from("c:/x.7z"),
             format: crate::archive_converter::ArchiveFormat::SevenZ,
         };
-        for thumb in [
-            ThumbnailState::Pending,
-            ThumbnailState::Evicted,
-            ThumbnailState::Failed,
-        ] {
-            for (item, label) in [(&zip, "ZIP"), (&pdf, "PDF"), (&archive, "7z")] {
-                let content = bottom_left_content(item, &thumb, "x");
-                assert_eq!(
-                    content.container_kind,
-                    Some(BottomContainerKind::Format),
-                    "{label}"
-                );
-                assert_eq!(content.container_label, Some(label));
+        for indicator in VideoThumbnailIndicator::all() {
+            for thumb in [
+                ThumbnailState::Pending,
+                ThumbnailState::Evicted,
+                ThumbnailState::Failed,
+            ] {
+                for (item, label, kind) in [
+                    (&zip, "ZIP", FormatBadgeKind::Zip),
+                    (&pdf, "PDF", FormatBadgeKind::Pdf),
+                    (&archive, "7z", FormatBadgeKind::Archive),
+                ] {
+                    let content = bottom_left_content(item, &thumb, "x", *indicator);
+                    assert_eq!(
+                        content.container_kind,
+                        Some(BottomContainerKind::Format(kind)),
+                        "{label} / {indicator:?}"
+                    );
+                    assert_eq!(content.container_label, Some(label));
+                }
             }
         }
+    }
+
+    #[test]
+    fn nested_archive_badge_types_preserve_zip_blue_and_converted_archive_orange() {
+        let nested_zip = GridItem::ZipDir {
+            zip_path: PathBuf::from("c:/outer.zip"),
+            dir_prefix: "comic.cbz/".to_owned(),
+            is_archive: true,
+            representative: None,
+        };
+        let nested_rar = GridItem::ZipDir {
+            zip_path: PathBuf::from("c:/outer.zip"),
+            dir_prefix: "comic.rar/".to_owned(),
+            is_archive: true,
+            representative: None,
+        };
+        let zip = bottom_left_content(
+            &nested_zip,
+            &ThumbnailState::Pending,
+            "comic.cbz",
+            VideoThumbnailIndicator::Hidden,
+        );
+        let rar = bottom_left_content(
+            &nested_rar,
+            &ThumbnailState::Pending,
+            "comic.rar",
+            VideoThumbnailIndicator::Hidden,
+        );
+        assert_eq!(
+            zip.container_kind,
+            Some(BottomContainerKind::Format(FormatBadgeKind::Zip))
+        );
+        assert_eq!(zip.container_label, Some("ZIP"));
+        assert_eq!(
+            rar.container_kind,
+            Some(BottomContainerKind::Format(FormatBadgeKind::Archive))
+        );
+        assert_eq!(rar.container_label, Some("RAR"));
     }
 
     #[test]
@@ -944,13 +1229,78 @@ mod bottom_left_content_tests {
             content_type: None,
         };
         for item in [&image, &zip_image, &pdf_page] {
-            let content = bottom_left_content(item, &ThumbnailState::Pending, "x");
+            let content = bottom_left_content(
+                item,
+                &ThumbnailState::Pending,
+                "x",
+                VideoThumbnailIndicator::PlayIcon,
+            );
             assert_eq!(content.container_kind, None);
         }
-        // 動画・音声はコンテナではないが、ファイル名プレートは出る。
+        // 既定値では動画・音声ともコンテナバッジを持たず、ファイル名プレートは出る。
         let video = GridItem::Video(PathBuf::from("c:/x.mp4"));
-        let content = bottom_left_content(&video, &ThumbnailState::Pending, "x.mp4");
+        let content = bottom_left_content(
+            &video,
+            &ThumbnailState::Pending,
+            "x.mp4",
+            VideoThumbnailIndicator::default(),
+        );
         assert_eq!(content.container_kind, None);
         assert_eq!(content.filename, Some("x.mp4"));
+    }
+
+    #[test]
+    fn video_indicator_modes_are_mutually_exclusive_and_keep_the_existing_default() {
+        let video = GridItem::Video(PathBuf::from("c:/clip.mp4"));
+        for (indicator, play_icon, badge) in [
+            (VideoThumbnailIndicator::PlayIcon, true, false),
+            (VideoThumbnailIndicator::BottomLeftBadge, false, true),
+            (VideoThumbnailIndicator::Hidden, false, false),
+        ] {
+            let parts = video_thumbnail_indicator_parts(&video, indicator);
+            let content =
+                bottom_left_content(&video, &ThumbnailState::Pending, "clip.mp4", indicator);
+            assert_eq!(parts.play_icon, play_icon, "{indicator:?}");
+            assert_eq!(parts.bottom_left_badge, badge, "{indicator:?}");
+            assert!(!(parts.play_icon && parts.bottom_left_badge));
+            assert_eq!(content.container_kind.is_some(), badge, "{indicator:?}");
+            if badge {
+                assert_eq!(
+                    content.container_kind,
+                    Some(BottomContainerKind::Format(FormatBadgeKind::Video))
+                );
+                assert_eq!(content.container_label, Some(VIDEO_THUMBNAIL_BADGE_LABEL));
+            }
+        }
+
+        let default_parts =
+            video_thumbnail_indicator_parts(&video, VideoThumbnailIndicator::default());
+        assert!(default_parts.play_icon);
+        assert!(!default_parts.bottom_left_badge);
+    }
+
+    #[test]
+    fn audio_cell_contract_is_unchanged_for_every_video_indicator_mode() {
+        let audio = GridItem::Audio(PathBuf::from("c:/song.flac"));
+        let expected = bottom_left_content(
+            &audio,
+            &ThumbnailState::Pending,
+            "song.flac",
+            VideoThumbnailIndicator::PlayIcon,
+        );
+        for &indicator in VideoThumbnailIndicator::all() {
+            assert_eq!(
+                bottom_left_content(&audio, &ThumbnailState::Pending, "song.flac", indicator,),
+                expected,
+                "{indicator:?}"
+            );
+            assert_eq!(
+                video_thumbnail_indicator_parts(&audio, indicator),
+                super::VideoThumbnailIndicatorParts {
+                    play_icon: false,
+                    bottom_left_badge: false,
+                }
+            );
+        }
     }
 }

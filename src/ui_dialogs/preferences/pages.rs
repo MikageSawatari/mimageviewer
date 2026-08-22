@@ -645,6 +645,13 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(12.0);
     ui.separator();
     ui.add_space(8.0);
+    anchored(ui, state, "thumbnail/video-indicator", |ui, state| {
+        draw_video_thumbnail_indicator_settings(ui, &mut state.settings);
+    });
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
     anchored(ui, state, "thumbnail/idle-upgrade", |ui, state| {
         let s = &mut state.settings;
         ui.checkbox(
@@ -749,6 +756,30 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
             "閲覧履歴: 閲覧位置",
         );
     });
+}
+
+pub(super) fn draw_video_thumbnail_indicator_settings(
+    ui: &mut egui::Ui,
+    settings: &mut settings::Settings,
+) {
+    ui.label(egui::RichText::new("動画サムネイルの目印").strong());
+    ui.horizontal(|ui| {
+        ui.label("表示:");
+        egui::ComboBox::from_id_salt("video_thumbnail_indicator")
+            .selected_text(settings.video_thumbnail_indicator.label())
+            .show_ui(ui, |ui| {
+                for &indicator in crate::settings::VideoThumbnailIndicator::all() {
+                    ui.selectable_value(
+                        &mut settings.video_thumbnail_indicator,
+                        indicator,
+                        indicator.label(),
+                    );
+                }
+            });
+    });
+    ui.small(
+        "動画の代表画像に重ねる再生アイコンを、左下の小さなバッジへ替えるか、非表示にできます。音声の音楽アイコンには影響しません。",
+    );
 }
 
 pub(super) fn page_slideshow(ui: &mut egui::Ui, state: &mut PreferencesState) {

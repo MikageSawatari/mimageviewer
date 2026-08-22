@@ -233,6 +233,43 @@ fn fullscreen_prefetch_direction_dark() {
     );
 }
 
+fn snapshot_with_theme_at_size(
+    name: &str,
+    resolved: mimageviewer::os_theme::ResolvedTheme,
+    size: egui::Vec2,
+    hover_pos: Option<egui::Pos2>,
+    mut build_ui: impl FnMut(&mut egui::Ui),
+) {
+    let mut fonts_ready = false;
+    let mut harness = Harness::builder().with_size(size).build(move |ctx| {
+        mimageviewer::os_theme::apply_resolved_with_contrast(
+            ctx,
+            resolved,
+            mimageviewer::settings::TextContrast::Standard,
+        );
+        if !fonts_ready {
+            install_app_fonts(ctx);
+            fonts_ready = true;
+            ctx.request_repaint();
+            return;
+        }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                egui::Frame::central_panel(ui.style())
+                    .outer_margin(8.0)
+                    .inner_margin(0.0)
+                    .show(ui, |ui| build_ui(ui));
+            });
+    });
+    harness.run();
+    if let Some(pos) = hover_pos {
+        harness.hover_at(pos);
+        harness.run();
+    }
+    harness.snapshot(name);
+}
+
 #[test]
 fn fullscreen_page_wait_indicator_dark() {
     snapshot_with_theme(
@@ -251,6 +288,31 @@ fn preferences_video_bar_visibility_dark() {
             ui.set_width(440.0);
             mimageviewer::draw_video_bar_visibility_snapshot_fixture(ui);
         },
+    );
+}
+
+#[test]
+fn preferences_video_thumbnail_indicator_dark() {
+    snapshot_with_theme(
+        "preferences_video_thumbnail_indicator_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| {
+            ui.set_width(440.0);
+            mimageviewer::draw_video_thumbnail_indicator_settings_snapshot_fixture(ui);
+        },
+    );
+}
+
+#[test]
+fn video_thumbnail_indicator_modes_and_dense_badges_dark() {
+    snapshot_with_theme_at_size(
+        "video_thumbnail_indicator_modes_and_dense_badges_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(480.0, 420.0),
+        // The pointer is inside the narrow cell's top-left tag badge, exercising the real hover
+        // tooltip branch while the screenshot also covers its dense bottom-left badge stack.
+        Some(egui::pos2(274.0, 190.0)),
+        mimageviewer::draw_video_thumbnail_indicator_snapshot_fixture,
     );
 }
 
@@ -610,7 +672,7 @@ fn compact_file_format_badges_light() {
                 let empty_tags = Vec::new();
                 let filename = matches!(
                     kind,
-                    mimageviewer::thumb_overlay_layout::BottomContainerKind::Format
+                    mimageviewer::thumb_overlay_layout::BottomContainerKind::Format(_)
                 )
                 .then_some(name);
                 let layout = mimageviewer::thumb_overlay_layout::layout_thumbnail_overlays(
@@ -641,8 +703,14 @@ fn compact_file_format_badges_light() {
                     mimageviewer::thumb_overlay_layout::BottomContainerKind::Folder => {
                         mimageviewer::ui_helpers::draw_overlay_folder_badge(&painter, container);
                     }
-                    mimageviewer::thumb_overlay_layout::BottomContainerKind::Format => {
-                        mimageviewer::ui_helpers::draw_overlay_format_badge(&painter, container);
+                    mimageviewer::thumb_overlay_layout::BottomContainerKind::Format(
+                        format_kind,
+                    ) => {
+                        mimageviewer::ui_helpers::draw_overlay_format_badge(
+                            &painter,
+                            container,
+                            format_kind,
+                        );
                     }
                 }
                 if let Some(filename) = layout.bottom_left.filename.as_ref() {
@@ -671,7 +739,9 @@ fn compact_file_format_badges_light() {
                     "📦",
                     "comic-book-long-name.zip",
                     "ZIP",
-                    mimageviewer::thumb_overlay_layout::BottomContainerKind::Format,
+                    mimageviewer::thumb_overlay_layout::BottomContainerKind::Format(
+                        mimageviewer::thumb_overlay_layout::FormatBadgeKind::Zip,
+                    ),
                     None,
                 );
             });
@@ -681,7 +751,9 @@ fn compact_file_format_badges_light() {
                     "📄",
                     "document-long-name.pdf",
                     "PDF",
-                    mimageviewer::thumb_overlay_layout::BottomContainerKind::Format,
+                    mimageviewer::thumb_overlay_layout::BottomContainerKind::Format(
+                        mimageviewer::thumb_overlay_layout::FormatBadgeKind::Pdf,
+                    ),
                     Some("📁★★★★"),
                 );
                 draw_cell(
@@ -689,7 +761,9 @@ fn compact_file_format_badges_light() {
                     "🗜",
                     "archive-long-name.rar",
                     "RAR",
-                    mimageviewer::thumb_overlay_layout::BottomContainerKind::Format,
+                    mimageviewer::thumb_overlay_layout::BottomContainerKind::Format(
+                        mimageviewer::thumb_overlay_layout::FormatBadgeKind::Archive,
+                    ),
                     None,
                 );
             });

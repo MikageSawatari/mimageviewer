@@ -155,6 +155,8 @@ pub(crate) use folder_scan::{
     ScannedDir, materialize_local_folder_listing, scan_directory_with_convertible_archives,
     scan_directory_with_settings, signature_from_scan,
 };
+#[doc(hidden)]
+pub use grid_paint::draw_video_thumbnail_indicator_snapshot_fixture;
 pub(crate) use grid_paint::{
     draw_cell, draw_spread_pair_cursor, grid_tag_badge_hit_rect, layout_cell_overlays,
     primary_grid_tag_for_badge, tq_draw_preview,
