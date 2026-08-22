@@ -373,17 +373,62 @@ impl App {
         merge_content_restore_sidecars(&mut self.sidecars, mirrors, sidecar_bases);
     }
 
+    /// Worker が直接更新した destination page について、DB の miss まで materialize する
+    /// read-once cache だけを page key 単位で失効させる。idx-keyed page state と rating / tags
+    /// は後続の `finish_book_page_edit_mapping` が既存の ownership 境界で処理する。
+    fn invalidate_content_restore_destination_caches(
+        &mut self,
+        presence: &crate::content_identity::RestorePresence,
+    ) {
+        // `comic_docs` の空 Vec は「DB 読込済み・row なし」の sentinel。restore が作った row を
+        // 隠したまま保存すると ComicDb::set(empty) がその row を削除するため、実際に comic row
+        // がある destination key だけを未読へ戻す。
+        for key in &presence.comics {
+            self.comic_docs.remove(key);
+        }
+
+        // rotation_cache も Rotation::None を cache する。現在 items に materialize 済みの
+        // destination だけを外し、次の get_rotation で DB から再読込させる。
+        let rotation_indices = (0..self.items.len())
+            .filter(|&idx| {
+                self.rotation_key_for_idx(idx)
+                    .is_some_and(|key| presence.rotations.contains(&key))
+            })
+            .collect::<Vec<_>>();
+        for idx in rotation_indices {
+            self.rotation_cache.remove(&idx);
+        }
+
+        // edit_preview_cache.db も worker が App service の event を通らず更新する。すでに raw / old
+        // preview を materialize した destination thumbnail だけを通常の再要求経路へ戻す。
+        let thumbnail_indices = (0..self.items.len())
+            .filter(|&idx| {
+                self.page_path_key(idx)
+                    .is_some_and(|key| presence.page_edits.contains(&key))
+                    || self
+                        .thumb_edit_preview_keys
+                        .get(&idx)
+                        .is_some_and(|key| presence.page_edits.contains(key))
+            })
+            .collect::<Vec<_>>();
+        for idx in thumbnail_indices {
+            self.evict_thumbnail_for_reload(idx);
+        }
+    }
+
     /// グリッド badge / smart-folder 集計が参照する global page-key presence を増分反映する。
     pub(crate) fn apply_content_restore_presence(
         &mut self,
         presence: crate::content_identity::RestorePresence,
     ) {
+        self.invalidate_content_restore_destination_caches(&presence);
         self.adjusted_page_keys.extend(presence.adjusted);
         self.mask_page_keys.extend(presence.masks);
         self.conceal_page_keys.extend(presence.conceals);
         self.local_adjust_page_keys
             .extend(presence.local_adjustments);
         self.comic_page_keys.extend(presence.comics);
+        self.rotation_page_keys.extend(presence.rotations);
     }
 
     /// 復元完了後の idx-keyed edit state と rating / tag cache の共通 invalidation。

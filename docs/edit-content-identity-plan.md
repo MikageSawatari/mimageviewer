@@ -315,11 +315,17 @@ INSERT OR IGNORE INTO t (c1, c2, ...) SELECT ?new, c2, ... FROM t WHERE c1 = ?ol
    (`App::with_sidecar_coords_mut`)。ここを抜かすと、そのフォルダを次に丸ごと移動したときに
    また失われる。
 2. **メモリ presence 集合の更新** (`adjusted_page_keys` / `mask_page_keys` / `conceal_page_keys` /
-   `local_adjust_page_keys` / `comic_page_keys`)。グリッドのバッジとスマートフォルダ集計が参照する。
-3. `clear_page_edit_state` / `rating_cache.clear()` / `invalidate_rating_counts_cache()` /
+   `local_adjust_page_keys` / `comic_page_keys` / `rotation_page_keys`)。グリッドのバッジと
+   スマートフォルダ集計が参照する。
+3. **復元先キーに materialize 済みの read-once cache を対象限定で失効する**。
+   `comic_docs` の空 `Vec` (DB の no-row を表す sentinel)、`rotation_cache` の `None`、
+   復元前の edit preview を保持する thumbnail だけを worker report の destination page key で
+   未読 / 再要求へ戻す。特に `comic_docs` を全 clear せず、実際に復元された comic key だけを
+   `remove` する。
+4. `clear_page_edit_state` / `rating_cache.clear()` / `invalidate_rating_counts_cache()` /
    `clear_tags_cache()` — `finish_book_page_edit_mapping`
    ([src/app.rs:30752](../src/app.rs:30752)) と同じ後始末を再利用する。
-4. 復元先にも `edit_origin` 行を作る (以後そのファイルが新たなコピー元になり得る)。
+5. 復元先にも `edit_origin` 行を作る (以後そのファイルが新たなコピー元になり得る)。
 
 **A3a / A3b 実装メモ (2026-08-21)**:
 
@@ -331,8 +337,8 @@ INSERT OR IGNORE INTO t (c1, c2, ...) SELECT ?new, c2, ... FROM t WHERE c1 = ?ol
   v1 対象外。正規化は各 descriptor の `normalization` から決める。候補 1 件でも 100 件でも
   copy 対象 DB は 21 回だけ開き、`content_identity.db` の昇格 / 拒否記録と runtime state
   読み出しも候補単位では開き直さない。
-- worker report は DB copy 後の destination 状態から sidecar mirror と 5 種類の presence 差分を
-  作る。A3b の短命 worker 完了後、既存 App owner へそれを適用し、
+- worker report は DB copy 後の destination 状態から sidecar mirror、6 種類の presence 差分、
+  sidecar-backed edit key の和集合を作る。A3b の短命 worker 完了後、既存 App owner へそれを適用し、
   `finish_book_page_edit_mapping` と同じ cache invalidation を呼ぶ。sidecar の同期 flush は
   増やさない。
 - target の `edit_origin` は `has_restorable_content = 1` へ昇格し、A2 の次回 index で復元元に
