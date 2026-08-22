@@ -7020,7 +7020,7 @@ impl Settings {
         // 事実上機能しなくなる。上限を超える値は ZIP 中身検査込みの DFS が
         // 長時間走り UI 非応答を招くので、両側クランプする。
         self.folder_skip_limit = self.folder_skip_limit.clamp(1, 30);
-        self.erase_inpaint_mono_tolerance = self.erase_inpaint_mono_tolerance.clamp(1, 64);
+        self.erase_inpaint_mono_tolerance = self.erase_inpaint_mono_tolerance.clamp(0, 64);
         if self.video_autoplay_mode == VideoAutoplayMode::OnlyFromGrid {
             self.video_autoplay = false;
             self.video_autoplay_mode = VideoAutoplayMode::Off;
@@ -10437,9 +10437,10 @@ mod tests {
     #[test]
     fn sanitize_clamps_erase_inpaint_mono_tolerance() {
         let mut settings = Settings::default();
+        // 0 は「色調合わせ無効」として保持する (下限は 1 ではない)。
         settings.erase_inpaint_mono_tolerance = 0;
         settings.sanitize();
-        assert_eq!(settings.erase_inpaint_mono_tolerance, 1);
+        assert_eq!(settings.erase_inpaint_mono_tolerance, 0);
 
         settings.erase_inpaint_mono_tolerance = u8::MAX;
         settings.sanitize();

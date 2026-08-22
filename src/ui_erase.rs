@@ -2371,13 +2371,13 @@ impl App {
                             .add(
                                 egui::Slider::new(
                                     &mut self.settings.erase_inpaint_mono_tolerance,
-                                    1..=64,
+                                    0..=64,
                                 )
                                 .text("色調の許容")
                                 .step_by(1.0),
                             )
                             .on_hover_text(
-                                "画像の色が 1 本の線に乗っているとみなす許容量です。値を上げるほど、色味の散った画像でも補完結果を画像の色調に合わせます。",
+                                "画像の色が 1 本の線に乗っているとみなす許容量です。値を上げるほど、色味の散った画像でも補完結果を画像の色調に合わせます。0 で無効。",
                             );
                         persist_inpaint_tone_tolerance |= tone_tolerance_response.drag_stopped()
                             || (tone_tolerance_response.changed()
@@ -2704,7 +2704,7 @@ impl App {
         // ── closure 外でディスパッチ (& mut self の借用衝突を避ける) ──
         if persist_inpaint_tone_tolerance {
             self.settings.erase_inpaint_mono_tolerance =
-                self.settings.erase_inpaint_mono_tolerance.clamp(1, 64);
+                self.settings.erase_inpaint_mono_tolerance.clamp(0, 64);
             self.settings.save();
             // 既存の補完結果と、その下流で合成済みの補正・隠蔽・final cache を
             // 新しい判定値で再生成する。進行中の補完も古い設定の結果なので破棄する。
@@ -3518,6 +3518,13 @@ pub(crate) fn inpaint_mono_tone_axis(
     original: &egui::ColorImage,
     tolerance: u8,
 ) -> Option<crate::colorize::MonoToneAxis> {
+    // 0 = 色調合わせ無効。`is_near_monochrome_residual` は `p95_residual <= tolerance` なので、
+    // 0 をそのまま渡すと「残差ちょうど 0」= 純グレースケール原稿には適用されたままになり、
+    // 利用者から見て「切ったのに効いている」状態になる。ここで明示的に落とす。
+    // 判定式そのものは変えない (カラー化の `mono_tolerance` と共有しており、そちらは下限 1 のまま)。
+    if tolerance == 0 {
+        return None;
+    }
     crate::colorize::mono_tone_axis(original).filter(|summary| {
         crate::colorize::is_near_monochrome_residual(summary.p95_residual, tolerance)
     })
@@ -4314,6 +4321,27 @@ pub(crate) fn draw_dashed_circle(painter: &egui::Painter, center: egui::Pos2, ra
 #[cfg(test)]
 mod book_erase_tests {
     use super::*;
+
+    /// 純グレースケール原稿は残差ちょうど 0 なので、`is_near_monochrome_residual` に
+    /// 0 をそのまま渡すと通ってしまう。0 = 無効が「切ったのに効く」にならないこと。
+    #[test]
+    fn zero_tone_tolerance_disables_matching_even_on_pure_grayscale() {
+        let pixels: Vec<egui::Color32> = (0..16u32)
+            .map(|i| {
+                let v = (i * 16).min(255) as u8;
+                egui::Color32::from_rgb(v, v, v)
+            })
+            .collect();
+        let gray = egui::ColorImage::new([4, 4], pixels);
+        assert!(
+            inpaint_mono_tone_axis(&gray, 12).is_some(),
+            "既定値では純グレースケールに色調合わせが効く"
+        );
+        assert!(
+            inpaint_mono_tone_axis(&gray, 0).is_none(),
+            "0 は残差 0 の原稿でも色調合わせを行わない"
+        );
+    }
 
     fn erase_test_shape(revision: usize) -> Shape {
         Shape::Rect {
