@@ -6029,6 +6029,47 @@ pub(super) fn page_update_check(ui: &mut egui::Ui, state: &mut PreferencesState)
     });
 }
 
+pub(super) fn draw_video_bar_visibility_settings(
+    ui: &mut egui::Ui,
+    settings: &mut crate::settings::Settings,
+) {
+    ui.label(egui::RichText::new("再生画面のバー").strong());
+    ui.add_space(4.0);
+    ui.label("上部と下部をそれぞれ自動表示または固定表示にできます。");
+    ui.add_space(6.0);
+
+    ui.horizontal(|ui| {
+        ui.label("上部情報バー:");
+        egui::ComboBox::from_id_salt("video_top_bar_visibility")
+            .selected_text(settings.video_top_bar_visibility.label())
+            .show_ui(ui, |ui| {
+                for &mode in crate::settings::VideoBarVisibilityMode::all() {
+                    ui.selectable_value(&mut settings.video_top_bar_visibility, mode, mode.label());
+                }
+            });
+    });
+    ui.horizontal(|ui| {
+        ui.label("下部シークバー:");
+        egui::ComboBox::from_id_salt("video_seek_bar_visibility")
+            .selected_text(settings.video_seek_bar_visibility.label())
+            .show_ui(ui, |ui| {
+                for &mode in crate::settings::VideoBarVisibilityMode::all() {
+                    ui.selectable_value(
+                        &mut settings.video_seek_bar_visibility,
+                        mode,
+                        mode.label(),
+                    );
+                }
+            });
+    });
+    ui.label(
+        egui::RichText::new(
+            "固定表示したバーは映像の上に重なります。左右の情報パネル設定には影響しません。",
+        )
+        .small(),
+    );
+}
+
 pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
     {
         anchored(ui, state, "video/hardware-decode", |ui, state| {
@@ -6069,6 +6110,11 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
             egui::RichText::new("自動: インターレースとしてデコードされたフレームだけ補正。切り替え後は次に開く動画から反映されます。")
                 .small(),
         );
+        });
+
+        ui.add_space(12.0);
+        anchored(ui, state, "video/bar-visibility", |ui, state| {
+            draw_video_bar_visibility_settings(ui, &mut state.settings);
         });
 
         ui.add_space(12.0);

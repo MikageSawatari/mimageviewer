@@ -773,6 +773,10 @@ enum NativeVideoOutputCommand {
         mode: crate::settings::FsSidePanelMode,
         info_panel_open: crate::ui_helpers::MetadataPanelOpenState,
     },
+    SetBarVisibilityModes {
+        top: crate::settings::VideoBarVisibilityMode,
+        bottom: crate::settings::VideoBarVisibilityMode,
+    },
     ResetSidePanelSession,
     SetLoopEnabled {
         enabled: bool,
@@ -1017,7 +1021,7 @@ impl<F> FramePresentationState<F> {
 }
 
 #[cfg(windows)]
-const NATIVE_COMMAND_LATEST_SLOTS: usize = 27;
+const NATIVE_COMMAND_LATEST_SLOTS: usize = 28;
 
 #[cfg(windows)]
 fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usize> {
@@ -1049,6 +1053,7 @@ fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usiz
         NativeVideoOutputCommand::SetNormalizeOverlayState { .. } => Some(24),
         NativeVideoOutputCommand::RaiseHudToTop => Some(25),
         NativeVideoOutputCommand::RaisePresenterToFront => Some(26),
+        NativeVideoOutputCommand::SetBarVisibilityModes { .. } => Some(27),
         NativeVideoOutputCommand::ResetSidePanelSession
         | NativeVideoOutputCommand::ShowToast { .. }
         | NativeVideoOutputCommand::SwitchSource { .. }
@@ -1602,6 +1607,16 @@ impl NativeVideoOutput {
                 mode,
                 info_panel_open,
             });
+    }
+
+    fn set_bar_visibility_modes(
+        &self,
+        top: crate::settings::VideoBarVisibilityMode,
+        bottom: crate::settings::VideoBarVisibilityMode,
+    ) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetBarVisibilityModes { top, bottom });
     }
 
     fn reset_side_panel_session(&self) {
@@ -3428,6 +3443,9 @@ fn run_native_video_output(
                     info_panel_open,
                 } => {
                     presenter.set_overlay_side_panel_state(mode, info_panel_open);
+                }
+                NativeVideoOutputCommand::SetBarVisibilityModes { top, bottom } => {
+                    presenter.set_overlay_bar_visibility_modes(top, bottom);
                 }
                 NativeVideoOutputCommand::ResetSidePanelSession => {
                     presenter.reset_overlay_side_panel_session();
@@ -7238,6 +7256,17 @@ impl VideoPlayer {
     ) {
         if let Some(output) = self.native_output.as_ref() {
             output.set_side_panel_state(mode, info_panel_open);
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn set_native_bar_visibility_modes(
+        &self,
+        top: crate::settings::VideoBarVisibilityMode,
+        bottom: crate::settings::VideoBarVisibilityMode,
+    ) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_bar_visibility_modes(top, bottom);
         }
     }
 

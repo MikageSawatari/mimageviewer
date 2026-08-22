@@ -201,6 +201,8 @@ mod ui_analysis_panel;
 mod ui_conceal;
 mod ui_crop;
 pub mod ui_dialogs;
+#[doc(hidden)]
+pub use ui_dialogs::preferences::draw_video_bar_visibility_snapshot_fixture;
 mod ui_erase;
 mod ui_folder_pane;
 pub mod ui_font_catalog;

@@ -35,7 +35,7 @@ use windows::Win32::System::Threading::WaitForSingleObject;
 use windows::core::Interface;
 use windows_numerics::Matrix3x2;
 
-use crate::settings::FsSidePanelMode;
+use crate::settings::{FsSidePanelMode, VideoBarVisibilityMode};
 use crate::ui_helpers::HoverTipExt;
 use crate::video::decoder::{VideoFrame, VideoFrameData};
 use crate::video::display_metadata::VideoOrientation;
@@ -420,9 +420,19 @@ struct NativeEguiOverlay {
     ring_guide_overlay: Option<NativeOverlayRingGuide>,
     tile_textures: HashMap<usize, (u64, egui::TextureHandle)>,
     jump_textures: HashMap<usize, (u64, egui::TextureHandle)>,
+    /// 直前の render_once で実際に描画した上部バーの可視状態。
+    /// top_bar_visible は hover ヒステリシス用に残し、region はこの snapshot を参照する。
+    top_bar_drawn_visible: bool,
+    /// 直前の render_once で実際に描画した下部バーの可視状態。
+    /// HWND hit-test region は上下とも再判定せず、描画 snapshot を参照する。
+    bottom_hud_visible: bool,
+    /// 上部バーの hover ヒステリシス状態。region の入力には使わない。
     top_bar_visible: bool,
     right_panel_visible: bool,
     jump_panel_visible: bool,
+    /// App settings から同期される、上下バーそれぞれの表示モード。
+    top_bar_visibility_mode: VideoBarVisibilityMode,
+    seek_bar_visibility_mode: VideoBarVisibilityMode,
     /// App settings から同期される、左右パネル共通の表示モード。
     side_panel_mode: FsSidePanelMode,
     /// 右情報パネルの明示 open owner。正本は App の current-file typed state。
@@ -462,6 +472,14 @@ struct NativeEguiOverlay {
     // state, and input ownership do not live on the render thread.
     /// 音量ノーマライズ UI 状態 (App から `SetNormalizeOverlayState` で配信される)。
     normalize_state: crate::video::normalize_types::NormalizeOverlayState,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct NativeBarVisibilitySnapshot {
+    /// tile/navigation guard と side panel 連動まで通した、上部バーの実描画状態。
+    top_bar_visible: bool,
+    /// 上端 hover 連動と下部自身の表示モードまで通した、下部バーの実描画状態。
+    bottom_hud_visible: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3121,6 +3139,16 @@ impl NativeRenderCore {
         }
     }
 
+    pub(crate) fn set_overlay_bar_visibility_modes(
+        &mut self,
+        top: VideoBarVisibilityMode,
+        bottom: VideoBarVisibilityMode,
+    ) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_bar_visibility_modes(top, bottom);
+        }
+    }
+
     /// Source swap で presenter-local な panel/touch session を閉じる。
     /// 右状態は App が新ファイルの false を別 command で同期する。
     pub fn reset_overlay_source_session(&mut self) {
@@ -4010,9 +4038,13 @@ impl NativeEguiOverlay {
             ring_guide_overlay: None,
             tile_textures: HashMap::new(),
             jump_textures: HashMap::new(),
+            top_bar_drawn_visible: false,
+            bottom_hud_visible: false,
             top_bar_visible: false,
             right_panel_visible: false,
             jump_panel_visible: false,
+            top_bar_visibility_mode: VideoBarVisibilityMode::Hover,
+            seek_bar_visibility_mode: VideoBarVisibilityMode::Hover,
             side_panel_mode: FsSidePanelMode::Hover,
             info_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
             left_panel_open: crate::ui_helpers::MetadataPanelOpenState::Closed,
@@ -4254,7 +4286,11 @@ impl NativeEguiOverlay {
         overlay_height_points: f32,
         external_drag_in_progress: bool,
         touch_chrome_latched: bool,
+        visibility_mode: VideoBarVisibilityMode,
     ) -> bool {
+        if matches!(visibility_mode.normalized(), VideoBarVisibilityMode::Pinned) {
+            return true;
+        }
         if touch_chrome_latched {
             return true;
         }
@@ -4269,7 +4305,11 @@ impl NativeEguiOverlay {
         currently_visible: bool,
         external_drag_in_progress: bool,
         touch_chrome_latched: bool,
+        visibility_mode: VideoBarVisibilityMode,
     ) -> bool {
+        if matches!(visibility_mode.normalized(), VideoBarVisibilityMode::Pinned) {
+            return true;
+        }
         if touch_chrome_latched {
             return true;
         }
@@ -4280,6 +4320,26 @@ impl NativeEguiOverlay {
             let y_max = if currently_visible { 76.0 } else { 36.0 };
             pos.y <= y_max
         })
+    }
+
+    fn native_bar_visibility_snapshot(
+        hud_visible: bool,
+        top_bar_visible: bool,
+        top_bar_hover_visible: bool,
+        side_panel_visible: bool,
+        tile_overlay_visible: bool,
+        navigation_preview_visible: bool,
+    ) -> NativeBarVisibilitySnapshot {
+        let regular_chrome_visible = !tile_overlay_visible && !navigation_preview_visible;
+        NativeBarVisibilitySnapshot {
+            // 上部の実描画条件と同じ。Pinned / hover の元判定ではなく、tile/nav と
+            // side panel 連動まで通した最終値を region 用 snapshot にする。
+            top_bar_visible: regular_chrome_visible && (top_bar_visible || side_panel_visible),
+            // 上部 Pinned は下部へ漏らさない。上端 hover と side panel による従来の
+            // 連動表示だけを tile/nav ガードの内側で下部へ伝える。
+            bottom_hud_visible: hud_visible
+                || (regular_chrome_visible && (side_panel_visible || top_bar_hover_visible)),
+        }
     }
 
     fn dimmed_hover_chrome_visible(&self) -> bool {
@@ -4788,6 +4848,23 @@ impl NativeEguiOverlay {
             self.right_panel_hover_latched = false;
             self.jump_panel_hover_latched = false;
         }
+        self.dirty = true;
+    }
+
+    fn set_bar_visibility_modes(
+        &mut self,
+        top: VideoBarVisibilityMode,
+        bottom: VideoBarVisibilityMode,
+    ) {
+        let top = top.normalized();
+        let bottom = bottom.normalized();
+        if self.top_bar_visibility_mode == top && self.seek_bar_visibility_mode == bottom {
+            return;
+        }
+        // touch chrome latch は入力セッションの状態として独立させる。固定表示への変更で
+        // latch を開閉すると、固定解除後の中央タップ状態や左右ハンドルまで変わってしまう。
+        self.top_bar_visibility_mode = top;
+        self.seek_bar_visibility_mode = bottom;
         self.dirty = true;
     }
 
@@ -5404,20 +5481,15 @@ impl NativeEguiOverlay {
             }
         };
 
-        // 描画側の visibility 判定をローカルで再現 (`mod.rs:3084` 周辺の `render_once` と整合)。
+        // 描画側の visibility snapshot を使って region を組み立てる。
         // tile overlay 表示中は通常 HUD UI が非表示 (= tile grid モード) なので region も別系統。
         let tile_overlay_visible = self.tile_overlay.is_some();
         let navigation_preview_visible = self.navigation_preview.is_some();
-        let top_bar_visible_flag = self.top_bar_visible;
+        let top_bar_visible_flag = self.top_bar_drawn_visible;
         let right_panel_visible_flag = self.right_panel_visible();
         let jump_panel_visible_flag = self.jump_panel_visible();
         let (left_callout_visible, right_callout_visible) = self.side_panel_callout_visibility();
-        let side_panel_visible = !tile_overlay_visible
-            && !navigation_preview_visible
-            && (jump_panel_visible_flag || right_panel_visible_flag);
-        let panel_chrome_visible = !tile_overlay_visible
-            && !navigation_preview_visible
-            && (top_bar_visible_flag || side_panel_visible);
+        let panel_chrome_visible = top_bar_visible_flag;
         let raw_seek_status_visible = self.seek_status_visible
             && !tile_overlay_visible
             && !navigation_preview_visible
@@ -5427,11 +5499,13 @@ impl NativeEguiOverlay {
         let status_visible = !tile_overlay_visible
             && !navigation_preview_visible
             && (self.video_error.is_some() || !self.first_frame_presented || seek_status_visible);
-        // **bottom_hud_visible** は描画側 (`render_once`) と完全一致させる。
-        // CP5 旧版は `hud_visible()` 単独だったが、Codex CP5 P2 #1 で「top bar や
-        // side panel 表示中も bottom HUD が描かれるのに region に下端帯がないと
-        // クリックが奪われる」問題を指摘されたので panel_chrome_visible も含める。
-        let bottom_hud_visible = self.hud_visible() || panel_chrome_visible;
+        // **top_bar_visible_flag / bottom_hud_visible** は描画側 (render_once) と
+        // 完全一致させる。ここで hover / 固定 / tile/nav / panel 連動を再計算すると、
+        // 描画と HWND の hit-test region / z-order が食い違うため、直前に描画した
+        // 同じ snapshot だけを通す。
+        // CP5 旧版の不具合では、片側だけの判定により「描画されたバーがクリックを
+        // 受けない」状態になった。逆に region だけ true なら透明部分が入力を奪う。
+        let bottom_hud_visible = self.bottom_hud_visible;
 
         // 上 hover bar (= 実描画 54pt = overlay_draw:1546 と一致)。
         //
@@ -5878,6 +5952,7 @@ impl NativeEguiOverlay {
             overlay_height_points,
             self.external_drag_in_progress,
             self.native_touch.chrome_latched(),
+            self.seek_bar_visibility_mode,
         )
     }
 
@@ -5887,6 +5962,17 @@ impl NativeEguiOverlay {
             self.top_bar_visible,
             self.external_drag_in_progress,
             self.native_touch.chrome_latched(),
+            self.top_bar_visibility_mode,
+        )
+    }
+
+    fn top_bar_hover_visible(&self) -> bool {
+        Self::native_hud_top_visible_from_hover(
+            self.visibility_hover_pos(),
+            self.top_bar_visible,
+            self.external_drag_in_progress,
+            self.native_touch.chrome_latched(),
+            VideoBarVisibilityMode::Hover,
         )
     }
 
@@ -6201,6 +6287,7 @@ impl NativeEguiOverlay {
         let perf_history: Vec<_> = self.perf_history.iter().copied().collect();
         let hud_visible = self.hud_visible();
         let jump_panel_visible = self.jump_panel_visible();
+        let top_bar_hover_visible = self.top_bar_hover_visible();
         let top_bar_visible = self.top_bar_visible();
         let right_panel_visible = self.right_panel_visible();
         let tile_overlay_visible = tile_overlay.is_some();
@@ -6218,9 +6305,15 @@ impl NativeEguiOverlay {
         let side_panel_visible = !tile_overlay_visible
             && !navigation_preview_visible
             && (jump_panel_visible || right_panel_visible);
-        let panel_chrome_visible = !tile_overlay_visible
-            && !navigation_preview_visible
-            && (top_bar_visible || side_panel_visible);
+        let bar_visibility = Self::native_bar_visibility_snapshot(
+            hud_visible,
+            top_bar_visible,
+            top_bar_hover_visible,
+            side_panel_visible,
+            tile_overlay_visible,
+            navigation_preview_visible,
+        );
+        let panel_chrome_visible = bar_visibility.top_bar_visible;
         // normalize scanning 中は HUD/Toast が無くても progress UI を描く必要がある。
         let normalize_scanning = matches!(
             normalize_state_snap.ui_state,
@@ -6228,7 +6321,7 @@ impl NativeEguiOverlay {
         );
         let seek_status_visible = raw_seek_status_visible;
         let status_visible = video_error.is_some() || !first_frame_presented || seek_status_visible;
-        let bottom_hud_visible = hud_visible || panel_chrome_visible;
+        let bottom_hud_visible = bar_visibility.bottom_hud_visible;
         let perf_origin = egui::pos2(14.0, 14.0);
         // Codex 2周目 P1: normalize_scanning も overlay_visible / cursor_blocking_overlay_visible
         // に含める。さもないと HUD/Toast 等が出ていない状態で `if !overlay_visible { return; }`
@@ -8068,6 +8161,8 @@ impl NativeEguiOverlay {
         if let Some(intent) = self.maybe_claim_text_input_focus() {
             window_intents.push(intent);
         }
+        self.top_bar_drawn_visible = bar_visibility.top_bar_visible;
+        self.bottom_hud_visible = bar_visibility.bottom_hud_visible;
         self.top_bar_visible = top_bar_visible || side_panel_visible;
         self.right_panel_visible = right_panel_visible;
         self.jump_panel_visible = jump_panel_visible;
@@ -8754,18 +8849,18 @@ fn channel_delta(a: u8, b: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativeEguiOverlay, NativeJumpPanelVisibilityInputs, NativeOverlayInputRouting,
-        NativePixelSample, NativeRightPanelVisibilityInputs, NativeTouchPanelHandleInputs,
-        VideoOrientation, compare_pixel_probe, compute_video_visual_transform,
-        configure_overlay_style, copy_cpu_rgba_to_swapchain_bgra, cursor_move_is_activity,
-        effective_overlay_pixels_per_point, egui_key_from_virtual_key, metadata_clean_text,
-        native_jump_panel_visible_from_inputs, native_panel_callout_hud_rects,
+        NativeBarVisibilitySnapshot, NativeEguiOverlay, NativeJumpPanelVisibilityInputs,
+        NativeOverlayInputRouting, NativePixelSample, NativeRightPanelVisibilityInputs,
+        NativeTouchPanelHandleInputs, VideoOrientation, compare_pixel_probe,
+        compute_video_visual_transform, configure_overlay_style, copy_cpu_rgba_to_swapchain_bgra,
+        cursor_move_is_activity, effective_overlay_pixels_per_point, egui_key_from_virtual_key,
+        metadata_clean_text, native_jump_panel_visible_from_inputs, native_panel_callout_hud_rects,
         native_right_panel_visible_from_inputs, native_touch_owned_panel_sides,
         native_touch_panel_handle_hud_rects,
         native_touch_panel_tap_command_dismisses_before_dispatch,
         native_video_fullscreen_shortcut_key, sample_cpu_rgba_pixel, should_claim_text_input_focus,
     };
-    use crate::settings::FsSidePanelMode;
+    use crate::settings::{FsSidePanelMode, VideoBarVisibilityMode};
     use crate::video::native_presenter::overlay_draw::{
         NATIVE_TOUCH_PANEL_HANDLE_WIDTH_PT, native_panel_callout_arrow_direction,
         native_panel_callout_bar_rect, native_panel_top,
@@ -8980,6 +9075,7 @@ mod tests {
                 720.0,
                 false,
                 false,
+                VideoBarVisibilityMode::Hover,
             ),
             "raw hover near the bottom should show the dimmed HUD"
         );
@@ -8988,6 +9084,7 @@ mod tests {
             720.0,
             false,
             false,
+            VideoBarVisibilityMode::Hover,
         ));
         assert!(
             !NativeEguiOverlay::native_hud_bottom_visible_from_hover(
@@ -8995,6 +9092,7 @@ mod tests {
                 720.0,
                 true,
                 false,
+                VideoBarVisibilityMode::Hover,
             ),
             "external drag remains authoritative even for raw hover"
         );
@@ -9011,12 +9109,14 @@ mod tests {
             false,
             false,
             false,
+            VideoBarVisibilityMode::Hover,
         ));
         assert!(!NativeEguiOverlay::native_hud_top_visible_from_hover(
             Some(egui::pos2(40.0, 80.0)),
             false,
             false,
             false,
+            VideoBarVisibilityMode::Hover,
         ));
         assert!(
             NativeEguiOverlay::hud_dimmed_suppresses_overlay_pointer_event(
@@ -9044,29 +9144,239 @@ mod tests {
             720.0,
             false,
             false,
+            VideoBarVisibilityMode::Hover,
         ));
     }
 
     #[test]
     fn touch_chrome_latch_reveals_bars_without_hover_and_preserves_hover_behavior() {
         assert!(NativeEguiOverlay::native_hud_bottom_visible_from_hover(
-            None, 720.0, false, true,
+            None,
+            720.0,
+            false,
+            true,
+            VideoBarVisibilityMode::Hover,
         ));
         assert!(NativeEguiOverlay::native_hud_top_visible_from_hover(
-            None, false, false, true,
+            None,
+            false,
+            false,
+            true,
+            VideoBarVisibilityMode::Hover,
         ));
         assert!(NativeEguiOverlay::native_hud_bottom_visible_from_hover(
             Some(egui::pos2(100.0, 650.0)),
             720.0,
             false,
             false,
+            VideoBarVisibilityMode::Hover,
         ));
         assert!(!NativeEguiOverlay::native_hud_bottom_visible_from_hover(
             Some(egui::pos2(100.0, 100.0)),
             720.0,
             false,
             false,
+            VideoBarVisibilityMode::Hover,
         ));
+    }
+
+    #[test]
+    fn pinned_video_bars_are_independent_inputs_to_visibility_functions() {
+        for &(top_mode, bottom_mode, expected_top, expected_bottom) in &[
+            (
+                VideoBarVisibilityMode::Hover,
+                VideoBarVisibilityMode::Hover,
+                false,
+                false,
+            ),
+            (
+                VideoBarVisibilityMode::Pinned,
+                VideoBarVisibilityMode::Hover,
+                true,
+                false,
+            ),
+            (
+                VideoBarVisibilityMode::Hover,
+                VideoBarVisibilityMode::Pinned,
+                false,
+                true,
+            ),
+            (
+                VideoBarVisibilityMode::Pinned,
+                VideoBarVisibilityMode::Pinned,
+                true,
+                true,
+            ),
+        ] {
+            assert_eq!(
+                NativeEguiOverlay::native_hud_top_visible_from_hover(
+                    None, false, false, false, top_mode,
+                ),
+                expected_top
+            );
+            assert_eq!(
+                NativeEguiOverlay::native_hud_bottom_visible_from_hover(
+                    None,
+                    720.0,
+                    false,
+                    false,
+                    bottom_mode,
+                ),
+                expected_bottom
+            );
+        }
+
+        assert!(NativeEguiOverlay::native_hud_top_visible_from_hover(
+            None,
+            false,
+            true,
+            false,
+            VideoBarVisibilityMode::Pinned,
+        ));
+        assert!(NativeEguiOverlay::native_hud_bottom_visible_from_hover(
+            None,
+            720.0,
+            true,
+            false,
+            VideoBarVisibilityMode::Pinned,
+        ));
+    }
+
+    #[test]
+    fn unpinned_video_bars_return_to_existing_hover_and_touch_inputs() {
+        assert!(NativeEguiOverlay::native_hud_bottom_visible_from_hover(
+            None,
+            720.0,
+            false,
+            false,
+            VideoBarVisibilityMode::Pinned,
+        ));
+        assert!(!NativeEguiOverlay::native_hud_bottom_visible_from_hover(
+            None,
+            720.0,
+            false,
+            false,
+            VideoBarVisibilityMode::Hover,
+        ));
+        assert!(NativeEguiOverlay::native_hud_bottom_visible_from_hover(
+            None,
+            720.0,
+            false,
+            true,
+            VideoBarVisibilityMode::Hover,
+        ));
+
+        assert!(NativeEguiOverlay::native_hud_top_visible_from_hover(
+            None,
+            false,
+            false,
+            false,
+            VideoBarVisibilityMode::Pinned,
+        ));
+        assert!(!NativeEguiOverlay::native_hud_top_visible_from_hover(
+            None,
+            false,
+            false,
+            false,
+            VideoBarVisibilityMode::Hover,
+        ));
+        assert!(NativeEguiOverlay::native_hud_top_visible_from_hover(
+            None,
+            false,
+            false,
+            true,
+            VideoBarVisibilityMode::Hover,
+        ));
+    }
+
+    #[test]
+    fn tile_and_navigation_suppress_top_hover_chrome_snapshot() {
+        let top_hover_visible = NativeEguiOverlay::native_hud_top_visible_from_hover(
+            Some(egui::pos2(40.0, 20.0)),
+            false,
+            false,
+            false,
+            VideoBarVisibilityMode::Hover,
+        );
+        assert!(top_hover_visible);
+
+        let unobstructed = NativeEguiOverlay::native_bar_visibility_snapshot(
+            false,
+            top_hover_visible,
+            top_hover_visible,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            unobstructed,
+            NativeBarVisibilitySnapshot {
+                top_bar_visible: true,
+                bottom_hud_visible: true,
+            },
+            "既定 Hover では従来どおり上端 hover が上下バーを連動表示する"
+        );
+
+        for &(tile_overlay_visible, navigation_preview_visible) in &[(true, false), (false, true)] {
+            let guarded = NativeEguiOverlay::native_bar_visibility_snapshot(
+                false,
+                top_hover_visible,
+                top_hover_visible,
+                false,
+                tile_overlay_visible,
+                navigation_preview_visible,
+            );
+            assert_eq!(
+                guarded,
+                NativeBarVisibilitySnapshot::default(),
+                "tile/navigation 中の上端 hover は上下どちらの chrome にも漏らさない"
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_top_bar_does_not_publish_tile_or_navigation_region_snapshot() {
+        let pinned_top_visible = NativeEguiOverlay::native_hud_top_visible_from_hover(
+            None,
+            false,
+            false,
+            false,
+            VideoBarVisibilityMode::Pinned,
+        );
+        assert!(pinned_top_visible);
+
+        let unobstructed = NativeEguiOverlay::native_bar_visibility_snapshot(
+            false,
+            pinned_top_visible,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            unobstructed,
+            NativeBarVisibilitySnapshot {
+                top_bar_visible: true,
+                bottom_hud_visible: false,
+            },
+            "上部 Pinned は上部だけを描画し、下部へ固定状態を漏らさない"
+        );
+
+        for &(tile_overlay_visible, navigation_preview_visible) in &[(true, false), (false, true)] {
+            let guarded = NativeEguiOverlay::native_bar_visibility_snapshot(
+                false,
+                pinned_top_visible,
+                false,
+                false,
+                tile_overlay_visible,
+                navigation_preview_visible,
+            );
+            assert_eq!(
+                guarded,
+                NativeBarVisibilitySnapshot::default(),
+                "region が読む実描画 snapshot は tile/navigation 中に上端帯を公開しない"
+            );
+        }
     }
 
     #[test]

@@ -790,7 +790,15 @@
   **実機で確認が取れて出荷するまで本項は消さない** (根本原因・利用者決定・訂正履歴の正本)。
 - 規模 / 優先度: Medium / P1。
 
-### 1.101 動画の上部 HUD / 下部シークバーを個別に固定表示できるようにする — 専用スレ >>271
+### 1.101 動画の上部 HUD / 下部シークバーを個別に固定表示できるようにする — 専用スレ >>271 ✅ 実装済み (2026-08-22)
+
+> 設定は `video_top_bar_visibility` / `video_seek_bar_visibility` (`VideoBarVisibilityMode { Hover, Pinned }`) の 2 つ。既定は両方 `Hover`。
+> 固定状態は可視性純関数への**入力**として渡し、描画と HUD HWND の hit-test region は
+> `render_once` が算出した `top_bar_drawn_visible` / `bottom_hud_visible` の**同じ snapshot** を読む。
+> 上部の固定は下部へ漏らさない。tile grid / navigation preview 中は上下とも抑止する。
+> 固定表示は external drag 中も維持し、touch latch 自体は変えない。
+> 音声専用設定は増やさず、通常の音楽ビューは従来どおり常時表示。
+> **実機確認は未実施。** 以下は着手前の記録。
 
 - 出典: 専用スレ >>271 (2026-08-20)。動画シークバーを常時表示したい要望。
 - 方針: 静止画と同じ考え方で、動画の上部 HUD と下部シークバーをそれぞれ独立して

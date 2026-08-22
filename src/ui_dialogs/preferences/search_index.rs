@@ -716,6 +716,18 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         "デインターレース",
         ["インターレース", "横縞", "bwdif"]
     ),
+    entry!(
+        "video/bar-visibility",
+        Video,
+        "再生画面のバー",
+        [
+            "上部情報バー",
+            "下部シークバー",
+            "自動表示",
+            "固定表示",
+            "ピン留め"
+        ]
+    ),
     entry!("video/loop", Video, "ループ再生:", ["繰り返し", "loop"]),
     entry!(
         "video/start-muted",

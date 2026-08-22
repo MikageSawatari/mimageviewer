@@ -175,6 +175,27 @@ callout は実際にクリックする UI なので、表示中の bar rect だ�
 ClickToShow の左右パネルには明示的な × を置き、callout 矢印は開状態で外向きへ反転する。
 VST3 パネル表示中は callout を描画せず、HUD region にも含めない。
 
+上部情報バーと下部シークバーの表示方法は、それぞれ独立した
+`VideoBarVisibilityMode { Hover, Pinned }` を Settings の正本として native presenter へ同期する。
+既定の `Hover` は従来の上下端 hover と touch chrome latch による自動表示を維持し、
+`Pinned` は各バーの可視性純関数へ入力として渡す。上部だけを固定しても下部は固定されず、
+上端を実際に hover した場合と左右パネル表示中だけは、従来どおり下部も連動表示する。
+固定したバーは映像の上へ重ね、映像の fit / zoom / pan の描画領域は変更しない。
+
+上部・下部バーは `render_once` が算出した
+`top_bar_drawn_visible` / `bottom_hud_visible` を描画後の snapshot として保持し、
+`compute_hud_regions` は同じ値から HUD HWND の入力 region と z-order を組み立てる。
+上部の実描画状態と、上部 hover から下部への連動は tile / navigation preview の間は抑止する。
+hover / 固定状態を region 側で再計算しないため、描画されたバーだけが入力を受け、
+透明な上下端帯が VST editor の操作を奪う状態も作らない。固定表示は external drag 中も維持するが、
+`native_touch.chrome_latched()` 自体は変更しない。したがって固定解除後は、その時点の
+touch latch または hover 入力へ直ちに戻り、固定表示だけで左右の touch handle が開くことはない。
+
+通常の動画→音声モードは native presenter を隠し、音楽ビュー側の常時表示バーを使うため、
+この設定による見た目の変更はない。VST GUI の owner として audio-only native presenter を
+表示する場合だけは、共有している native overlay に動画と同じ上下設定を同期する。
+音声専用の重複設定は持たない。
+
 Phase 3 Step 3h では、native touch の session-only chrome latch 中だけ左右端へ 48pt 幅の
 パネルハンドルを追加した。ハンドルの描画 rect をそのまま `compute_hud_regions()` の interactive
 region に含めるため、OS hit-test が HUD HWND を選び、HUD-source stream は Phase 3 Step 1 の規約どおり

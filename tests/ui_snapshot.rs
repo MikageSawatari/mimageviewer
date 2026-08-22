@@ -243,6 +243,18 @@ fn fullscreen_page_wait_indicator_dark() {
 }
 
 #[test]
+fn preferences_video_bar_visibility_dark() {
+    snapshot_with_theme(
+        "preferences_video_bar_visibility_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| {
+            ui.set_width(440.0);
+            mimageviewer::draw_video_bar_visibility_snapshot_fixture(ui);
+        },
+    );
+}
+
+#[test]
 fn still_touch_panel_handles_latched_dark() {
     snapshot_with_theme(
         "still_touch_panel_handles_latched_dark",

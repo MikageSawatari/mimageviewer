@@ -5871,6 +5871,8 @@ impl App {
         let shortcut_help = self.cached_native_overlay_shortcut_help();
         let side_panel_mode = self.settings.fullscreen_side_panel_mode;
         let info_panel_open = self.fs_info_panel_open;
+        let top_bar_visibility = self.settings.video_top_bar_visibility;
+        let seek_bar_visibility = self.settings.video_seek_bar_visibility;
         let touch_video_chrome_learned = self.settings.touch_video_chrome_learned;
         // ★ レーティング (右パネル先頭。get_rating は &mut self なので player 借用より前に取る)。
         let rating = self.get_rating(fs_idx);
@@ -5964,6 +5966,7 @@ impl App {
         };
         player.set_native_metadata(Some(metadata));
         player.set_native_side_panel_state(side_panel_mode, info_panel_open);
+        player.set_native_bar_visibility_modes(top_bar_visibility, seek_bar_visibility);
     }
 
     #[cfg(windows)]
@@ -7987,6 +7990,9 @@ impl App {
                     fs_idx,
                     activated: false,
                 });
+                // audio-only VST shell も同じ native overlay を使うため、動画と同じ
+                // 上下バー表示モードを含む metadata/settings snapshot を直ちに同期する。
+                self.sync_native_video_metadata(fs_idx);
                 // presenter HWND publish → owner 登録 → tick で GUI 表示、と数フレームかかる。
                 // 一時停止中の音声はアイドルで repaint が止まるので、activation に到達するよう
                 // ここで明示的に起こす (tick も pending 中は継続 repaint する、Codex Medium)。

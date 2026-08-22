@@ -18,6 +18,16 @@ mod search_index;
 use self::pages::*;
 use self::search_index::{PrefSearchEntry, search_preferences};
 
+#[doc(hidden)]
+pub fn draw_video_bar_visibility_snapshot_fixture(ui: &mut egui::Ui) {
+    let mut settings = Settings {
+        video_top_bar_visibility: crate::settings::VideoBarVisibilityMode::Pinned,
+        video_seek_bar_visibility: crate::settings::VideoBarVisibilityMode::Hover,
+        ..Settings::default()
+    };
+    pages::draw_video_bar_visibility_settings(ui, &mut settings);
+}
+
 fn pref_panel_scroll_style() -> egui::style::ScrollStyle {
     let mut scroll = egui::style::ScrollStyle::solid();
     scroll.bar_width = 10.0;

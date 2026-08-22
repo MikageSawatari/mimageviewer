@@ -789,6 +789,11 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
   直前を seek target にして、target 以前の keyframe から decoder が直前 frame を選ぶ。
   前/次フレームボタンの長押しは、前回のフレームが画面へ
   反映された後に最短約 100ms 間隔で次の frame-step seek を発行する。
+- 動画の上部情報バーと下部シークバーは、環境設定でそれぞれ独立して「自動表示」
+  (既定) /「固定表示」を選べる。固定したバーは映像の上に重なり、映像のフィット・
+  ズーム・パン範囲は変えない。上部だけを固定しても下部は固定されない。
+  自動表示では従来どおり、上下端へのマウス移動、タッチによる操作部の表示、
+  左右パネル表示に応じて必要なバーを表示する。固定解除後はその自動表示へ直ちに戻る。
 - 動画シークバーはトラック下側に秒 / 分 / 時間の目盛りを描き、幅に応じて許可系列から間引く。
   描画順は進捗塗り → 目盛り → chapter / bookmark / pin とし、既存マーカーを前面に保つ。
 - Windows のタスクバーで mIV アイコンを hover したときは、動画フルスクリーン中も
@@ -991,6 +996,8 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
 - **下部 HUD**: シークバー + 再生コントロール (頭出し / 再生・一時停止 / ループ / 連続再生 /
   前後ファイル / 前後ブックマーク / ミュート / 音量スライダー (dB) / 速度)。
   シークバーは動画と同じ時間目盛りをトラック下側へ描き、既存ブックマークマーカーを前面に保つ。
+  通常の音楽ビューでは上部・下部とも常時表示し、動画のバー表示設定は適用しない。
+  VST GUI のため native 表示面を共有する場合だけ、動画と同じ上下の表示設定を使う。
 
 #### 操作
 
@@ -1748,6 +1755,8 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `video_volume` | f64 | 1.0 | 動画再生時の既定音量（線形ゲイン。UI は -∞dB〜+18dB の dB フェーダー）。1.0 超は手動 boost として safety limiter 前で適用 |
 | `video_playback_speed` | f64 | 1.0 | 動画再生速度。HUD の速度ボタンから変更し、動画切替とアプリ再起動後も維持する。読み込み時は `0.25..=4.0` にクランプ |
 | `video_seek_thumbnail_tolerance_secs` | f64 | 1.0 | 動画シークバーのプレビューで許容する位置差。0.0〜30.0 秒にクランプ。desktop / Remote はバー 1 物理 px 相当の秒数との大きい方を使う |
+| `video_top_bar_visibility` | VideoBarVisibilityMode | Hover | 動画の上部情報バーの表示方法 (Hover=自動表示 / Pinned=固定表示) |
+| `video_seek_bar_visibility` | VideoBarVisibilityMode | Hover | 動画の下部シークバーの表示方法 (Hover=自動表示 / Pinned=固定表示)。上部とは独立 |
 | `video_continuous_mode` | VideoContinuousMode | Off | 動画連続再生モード (Off / Continuous / ContinuousLoop)。ON の間は通常ループを無効化し、EOF で現在リスト内の次動画へ進む |
 | `video_start_muted` | bool | false | 起動時にセッション初期ミュートを true にする安全スイッチ。起動後の動画切替では `video_muted` / HUD の現在状態を優先する |
 | `video_muted` | bool | false | HUD のミュートボタン / M キーで最後に選んだミュート状態。動画切替と次回起動へ引き継ぐ |

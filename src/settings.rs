@@ -4299,6 +4299,13 @@ pub struct Settings {
     /// シークバー上のプレビューで許容する表示位置との差 (秒)。
     #[serde(default = "default_video_seek_thumbnail_tolerance_secs")]
     pub video_seek_thumbnail_tolerance_secs: f64,
+    /// native 動画プレゼンターの上部情報バーを自動表示するか固定表示するか。
+    /// 上下のバーは独立して設定でき、既定の Hover は従来動作を維持する。
+    #[serde(default)]
+    pub video_top_bar_visibility: VideoBarVisibilityMode,
+    /// native 動画プレゼンターの下部シークバーを自動表示するか固定表示するか。
+    #[serde(default)]
+    pub video_seek_bar_visibility: VideoBarVisibilityMode,
     /// 旧自動再生設定 (bool)。現在の再生開始挙動では参照せず、設定ファイル互換のため保持する。
     #[serde(default)]
     pub video_autoplay: bool,
@@ -4772,6 +4779,40 @@ impl SlideshowEndAction {
             Self::LoopFolder => "フォルダ内でループ",
             Self::NextFolder => "次のフォルダへ進む",
             Self::Stop => "最後で停止",
+        }
+    }
+}
+
+/// native 動画プレゼンターの上部情報バー / 下部シークバーの表示方法。
+///
+/// `Unknown` は将来版の値を旧版で読み込んだときの受け皿。sanitize 時に
+/// 既存動作の `Hover` へ正規化する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum VideoBarVisibilityMode {
+    #[default]
+    Hover,
+    Pinned,
+    #[serde(other)]
+    Unknown,
+}
+
+impl VideoBarVisibilityMode {
+    pub fn label(self) -> &'static str {
+        match self.normalized() {
+            Self::Hover => "自動表示",
+            Self::Pinned => "固定表示",
+            Self::Unknown => unreachable!(),
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[Self::Hover, Self::Pinned]
+    }
+
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Unknown => Self::Hover,
+            mode => mode,
         }
     }
 }
@@ -5566,6 +5607,8 @@ impl Default for Settings {
             video_volume: default_video_volume(),
             video_playback_speed: default_video_playback_speed(),
             video_seek_thumbnail_tolerance_secs: default_video_seek_thumbnail_tolerance_secs(),
+            video_top_bar_visibility: VideoBarVisibilityMode::default(),
+            video_seek_bar_visibility: VideoBarVisibilityMode::default(),
             video_autoplay: false,
             video_autoplay_mode: VideoAutoplayMode::default(),
             video_loop: false,
@@ -6980,6 +7023,8 @@ impl Settings {
         // 区別できない)。ここでは mode を source of truth として bool を導出する片方向のみ。
         self.video_loop = !matches!(self.video_loop_mode, VideoLoopMode::Off);
         self.video_volume = clamp_video_volume(self.video_volume);
+        self.video_top_bar_visibility = self.video_top_bar_visibility.normalized();
+        self.video_seek_bar_visibility = self.video_seek_bar_visibility.normalized();
         self.video_seek_thumbnail_tolerance_secs =
             if self.video_seek_thumbnail_tolerance_secs.is_finite() {
                 self.video_seek_thumbnail_tolerance_secs.clamp(
@@ -8425,6 +8470,50 @@ mod tests {
         );
         loaded.sanitize();
         assert_eq!(loaded.fullscreen_side_panel_mode, FsSidePanelMode::Hover);
+    }
+
+    #[test]
+    fn video_bar_visibility_modes_default_independently_and_normalize_unknown() {
+        let defaults: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            defaults.video_top_bar_visibility,
+            VideoBarVisibilityMode::Hover
+        );
+        assert_eq!(
+            defaults.video_seek_bar_visibility,
+            VideoBarVisibilityMode::Hover
+        );
+        assert_eq!(VideoBarVisibilityMode::Hover.label(), "自動表示");
+        assert_eq!(VideoBarVisibilityMode::Pinned.label(), "固定表示");
+        assert_eq!(
+            VideoBarVisibilityMode::all(),
+            &[
+                VideoBarVisibilityMode::Hover,
+                VideoBarVisibilityMode::Pinned
+            ]
+        );
+
+        let mut loaded: Settings = serde_json::from_str(
+            r#"{"video_top_bar_visibility":"Pinned","video_seek_bar_visibility":"FutureMode"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            loaded.video_top_bar_visibility,
+            VideoBarVisibilityMode::Pinned
+        );
+        assert_eq!(
+            loaded.video_seek_bar_visibility,
+            VideoBarVisibilityMode::Unknown
+        );
+        loaded.sanitize();
+        assert_eq!(
+            loaded.video_top_bar_visibility,
+            VideoBarVisibilityMode::Pinned
+        );
+        assert_eq!(
+            loaded.video_seek_bar_visibility,
+            VideoBarVisibilityMode::Hover
+        );
     }
 
     #[test]
