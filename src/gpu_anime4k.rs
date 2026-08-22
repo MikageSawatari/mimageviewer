@@ -358,6 +358,22 @@ fn params_uniform(
     input_size: [u32; 2],
     input_origin: [i32; 2],
 ) -> wgpu::Buffer {
+    let bytes = pack_params_uniform(plan, output_size, input_size, input_origin);
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("anime4k params"),
+        contents: &bytes,
+        usage: wgpu::BufferUsages::UNIFORM,
+    })
+}
+
+const PARAMS_UNIFORM_SIZE: usize = 96;
+
+fn pack_params_uniform(
+    plan: Anime4kPlan,
+    output_size: [u32; 2],
+    input_size: [u32; 2],
+    input_origin: [i32; 2],
+) -> [u8; PARAMS_UNIFORM_SIZE] {
     let mut bytes = [0_u8; 96];
     for (index, value) in output_size.into_iter().enumerate() {
         bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
@@ -398,11 +414,7 @@ fn params_uniform(
             bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
         }
     }
-    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("anime4k params"),
-        contents: &bytes,
-        usage: wgpu::BufferUsages::UNIFORM,
-    })
+    bytes
 }
 
 fn resolve_pass_views<'a>(
@@ -510,7 +522,14 @@ fn encode_pass(
 
 #[cfg(test)]
 mod tests {
-    use super::{Anime4kPassInput, Anime4kVariant, STILL_IMAGE_ANIME4K_VARIANT};
+    use super::{
+        Anime4kPassInput, Anime4kPlan, Anime4kVariant, PARAMS_UNIFORM_SIZE,
+        STILL_IMAGE_ANIME4K_VARIANT, pack_params_uniform,
+    };
+
+    fn assert_word(bytes: &[u8], offset: usize, expected: [u8; 4]) {
+        assert_eq!(&bytes[offset..offset + 4], &expected, "offset {offset}");
+    }
 
     #[test]
     fn generated_variant_topologies_are_complete_and_self_consistent() {
@@ -575,5 +594,49 @@ mod tests {
     #[test]
     fn still_image_path_remains_on_very_large() {
         assert_eq!(STILL_IMAGE_ANIME4K_VARIANT, Anime4kVariant::VeryLarge);
+    }
+
+    #[test]
+    fn still_image_uniform_layout_and_identity_orientation_are_pinned() {
+        let plan = Anime4kPlan {
+            source_size: [101, 202],
+            target_size: [303, 404],
+            process_origin: [5, 7],
+            process_size: [89, 144],
+            source_region_px: [11.5, 12.5, 13.5, 14.5],
+            texture_fetches: 0,
+        };
+        let bytes = pack_params_uniform(plan, [301, 401], [87, 143], [-2, 3]);
+
+        assert_eq!(PARAMS_UNIFORM_SIZE, 96);
+        assert_eq!(bytes.len(), 96);
+        for (offset, expected) in [
+            (0, 301_u32.to_ne_bytes()),
+            (4, 401_u32.to_ne_bytes()),
+            (8, 87_u32.to_ne_bytes()),
+            (12, 143_u32.to_ne_bytes()),
+            (16, (-2_i32).to_ne_bytes()),
+            (20, 3_i32.to_ne_bytes()),
+            (24, 5_i32.to_ne_bytes()),
+            (28, 7_i32.to_ne_bytes()),
+            (32, 101_u32.to_ne_bytes()),
+            (36, 202_u32.to_ne_bytes()),
+            (40, 89_u32.to_ne_bytes()),
+            (44, 144_u32.to_ne_bytes()),
+            (48, 11.5_f32.to_ne_bytes()),
+            (52, 12.5_f32.to_ne_bytes()),
+            (56, 13.5_f32.to_ne_bytes()),
+            (60, 14.5_f32.to_ne_bytes()),
+            (64, 1.0_f32.to_ne_bytes()),
+            (68, 0.0_f32.to_ne_bytes()),
+            (72, 0.0_f32.to_ne_bytes()),
+            (76, 1.0_f32.to_ne_bytes()),
+            (80, 0.0_f32.to_ne_bytes()),
+            (84, 0.0_f32.to_ne_bytes()),
+            (88, 0.0_f32.to_ne_bytes()),
+            (92, 0.0_f32.to_ne_bytes()),
+        ] {
+            assert_word(&bytes, offset, expected);
+        }
     }
 }
