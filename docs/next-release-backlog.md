@@ -1580,6 +1580,54 @@ passive detached は通常どおり release で窓を activate するが、選�
 - 規模 / 優先度: 中 / P2 (dispatcher の資源管理に手を入れるので、出荷直前には入れない)。
 - 関連: §2.15 (前面優先)、§2.13 (文書キャッシュ)。
 
+### 2.17 フォルダ代表サムネの既定ソートが一覧の既定と食い違う (番号順 vs ファイル名順) — 利用者報告
+
+- 出典: 2026-08-22。`00表紙.jpg` / `00表紙2.jpg` の 2 枚だけが入ったフォルダで、一覧の先頭は
+  `00表紙.jpg` なのに、フォルダタイルの代表サムネだけ `00表紙2.jpg` になるという報告。
+- **どちらも既定値のまま**で起きる (利用者が設定を変えたせいではない)。既定が 2 つに分かれている:
+
+  | 設定 | 既定 | 定義 |
+  | --- | --- | --- |
+  | 一覧の並び順 `sort_order` | ファイル名順 | [settings.rs:5388](../src/settings.rs:5388) (`SortOrder::default()` = `FileName`)、固定テスト [settings.rs:9564](../src/settings.rs:9564) |
+  | 代表画像の選択基準 `folder_thumb_sort` | 番号順（区切り無視） | [settings.rs:5126](../src/settings.rs:5126)。導入コミット `e6793dbb` (2026-04-12) から不変 |
+
+- 機構: 代表画像の自動選定は [thumb_loader.rs:2349](../src/thumb_loader.rs:2349)
+  `resolve_folder_thumb_image_inner`。**一覧の `sort_order` は見ず** `folder_thumb_sort` で
+  並べて先頭 1 枚を採る。実ログでも確認済み:
+  `resolve_folder_thumb_image: ... sort=Numeric depth=3 -> ...\00表紙2.jpg` /
+  保存キー `folderthumb:auto-v2:numeric:d3:...`。ピン (`folder_thumb_pins.db`) は無関係。
+- 番号順で反転する理由: `natural_sort_key` ([ui_helpers.rs:979](../src/ui_helpers.rs:979)) は
+  記号・空白を捨てて数字塊 / 文字塊に割るが、**拡張子も直前の文字塊に溶ける**。
+  - `00表紙.jpg` → `[数字0, "表紙jpg"]`
+  - `00表紙2.jpg` → `[数字0, "表紙", 数字2, "jpg"]`
+
+  2 要素目が `"表紙" < "表紙jpg"` (前方一致で短い方が小) なので、**数字が付いている方が勝つ**。
+  `cover.jpg` vs `cover2.jpg`、`a.jpg` vs `a10.jpg` も同型 (連番同士 `001` / `002` は期待どおり)。
+  ファイル名順 (Windows ソートキー) なら `00表紙.jpg` が先頭になる (`LCMapStringEx` の
+  ソートキー比較・`StrCmpLogicalW` の双方で確認)。
+- **直す方向 (利用者判断済み)**: 既定をファイル名順に合わせる。ただし `default_folder_thumb_sort`
+  を変えるだけでは**新規インストールにしか効かない**。[settings_db.rs:1550](../src/settings_db.rs:1550)
+  `write_settings_kv` が Settings の全フィールドを毎回書くので、既存利用者の `settings_kv` には
+  全員 `folder_thumb_sort = "Numeric"` が入っており、**「保存されている」= 「利用者が選んだ」とは
+  判別できない**。そこで更新時に一度だけ移行する:
+  1. `schema_meta` に一度きりのフラグ (例 `folder_thumb_sort_default_v2`) を置く。既存の
+     `bootstrap_complete` / `migrated_from_json_at` と同じ `INSERT OR IGNORE` の形で足せる。
+  2. フラグが無い既存 DB では、起動時に一度だけ `folder_thumb_sort` を `FileName` へ書き換えて
+     フラグを立てる。クリーンインストールは bootstrap 時にフラグだけ立て、値は触らない。
+  3. 副作用: 意図して「番号順」を選んでいた利用者も 1 回だけ戻る (上記のとおり区別できない)。
+     §5.0 経由で `version_highlights` の `must_read` に載せ、戻し方 (環境設定 → フォルダ →
+     「代表画像の選択基準」) を明示する。
+  4. 代表サムネのキャッシュキーにソート順が入る (`...:numeric:...` → `...:filename:...`) ので
+     選び直しは自動で走る。旧キーのエントリが残って容量だけ増えないかは実装時に確認する。
+  5. マニュアルの既定表記 ([settings.html:470](../htdocs/mimageviewer/manual/settings.html:470)) を
+     同時に更新する。
+- 実装前に決める枝: 「番号順の natural key から拡張子を除く」案でも
+  `[0,"表紙"] < [0,"表紙",2]` となり番号順のまま期待どおりになる。ただし `natural_sort_key` は
+  一覧ソート ([app/folder_scan.rs:132](../src/app/folder_scan.rs:132))、ファイル名スタック、
+  ZIP ツリー、スマートフォルダが共有しており、**番号順を選んでいる全一覧の並びが変わる**。
+  既定の食い違いを消すだけなら上の移行案の方が影響範囲が小さい。
+- 規模 / 優先度: 小 (既定値 + 一度きりの移行) / P2。
+
 ## 3. 補正 / AI
 
 ### 3.1 local-adjust layers の入場時同期 DB 読み
