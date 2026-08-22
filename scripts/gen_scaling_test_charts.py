@@ -187,6 +187,46 @@ def build_upscale(width=960, height=540):
     return pil
 
 
+# ------------------------------------------------------- filter discrimination
+
+
+def build_edge_chart(width=480, height=270):
+    """Small on purpose, so a 4K window magnifies it about eight times.
+
+    Where Lanczos3 and NIS actually part company is a single hard edge on an
+    otherwise empty field: Lanczos overshoots and lays a bright and a dark band
+    alongside the edge, NIS suppresses that while still steepening it.  Fine
+    busy patterns hide this rather than showing it, so this chart is mostly
+    empty space with a few big edges in it.
+    """
+    img = np.full((height, width), 235, np.uint8)
+
+    # Isolated straight edges: look beside the edge, not at it.
+    img[20:110, 24:104] = 20                      # vertical and horizontal
+    for i in range(90):                           # 45 degrees
+        img[20 + i, 130 + i : 210] = 20
+    for i in range(90):                           # ~20 degrees, the hardest case
+        img[20 + i, 240 + i // 3 : 330] = 20
+
+    pil = Image.fromarray(img, "L").convert("RGB")
+    draw = ImageDraw.Draw(pil)
+
+    # A curved hard edge: staircasing shows here rather than ringing.
+    draw.ellipse((350, 20, 456, 126), fill=(20, 20, 20))
+
+    # Contrast ladder: the weakest step that still rings tells you the strength.
+    for i, v in enumerate((20, 70, 120, 160)):
+        draw.rectangle((24 + i * 58, 140, 66 + i * 58, 196), fill=(v, v, v))
+
+    # Two big glyphs: the most familiar shape anyone can judge.
+    label(draw, (270, 130), "永A", size=76, fill=(20, 20, 20))
+
+    label(draw, (24, 208), "輪郭の脇の帯 / 曲線の階段 / 文字の縁を見る", size=17,
+          fill=(40, 40, 40))
+    label(draw, (24, 236), "480x270 -> 画面いっぱいで約 8 倍", size=15, fill=(90, 90, 90))
+    return pil
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out-dir", default=".")
@@ -195,6 +235,7 @@ def main():
     for name, chart in (
         ("chart_downscale_4k.png", build_downscale()),
         ("chart_upscale_540p.png", build_upscale()),
+        ("chart_edges_270p.png", build_edge_chart()),
     ):
         path = os.path.join(args.out_dir, name)
         chart.save(path)
