@@ -229,6 +229,14 @@ Implementation status:
   the target path disappeared after the Shell operation. A Shell-side abort is
   reported as failures for that chunk; only the mIV progress dialog cancel stops
   later chunks.
+- The optional `skip_recycle_bin_delete_confirmation` setting defaults off. It
+  bypasses only mIV's existing confirmation when every pre-check result is
+  `DeleteConfirmKind::RecycleBin` and every target is a listed image, video, or
+  audio file. Folders and archive containers (ZIP/PDF/convertible archives)
+  keep the confirmation because the selected tile does not enumerate all
+  affected contents. Any `MayPermanent` or unresolvable target also keeps the
+  confirmation and its cancel-first selection. This does not change the
+  worker flags: `FOF_WANTNUKEWARNING` remains mandatory.
 - Copy/move/drop replacement is still pending.
 
 Public API sketch:
@@ -644,8 +652,15 @@ Manual Windows tests:
 - Move from clipboard and verify source removal only after successful operation.
 - Cancel copy/move from the Shell progress dialog.
 - Delete to recycle bin.
+- With confirmation skipping on, delete an ordinary local file and verify the
+  mIV confirmation is omitted; verify folders and archive containers still
+  show it.
 - Delete from network/removable/no-recycle targets and verify permanent-delete
-  warning.
+  confirmation remains cancel-first and the Shell permanent-delete warning is
+  still available.
+- Mix recyclable and possibly permanent targets and verify the confirmation is
+  not skipped. Repeat the delete matrix with the setting off and verify the
+  previous behavior is unchanged.
 - Rename from Shell context menu.
 - Properties from Shell context menu.
 - Third-party Shell extensions such as archive tools.

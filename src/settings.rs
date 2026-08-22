@@ -3669,6 +3669,10 @@ pub struct Settings {
     /// ZIP/PDF 内ページなど仮想アイテムは従来の mIV メニューにフォールバックする。
     #[serde(default = "default_true")]
     pub use_native_shell_context_menu: bool,
+    /// mIV の事前判定でごみ箱へ移せる通常ファイルだけ、mIV 側の削除確認を省略する。
+    /// フォルダ / アーカイブコンテナと完全削除候補は常に確認を残す。
+    #[serde(default)]
+    pub skip_recycle_bin_delete_confirmation: bool,
 
     /// マウス右フリック / ゲームパッド X リングの割り当て。
     /// 入力処理とは独立した設定本体。未知 id や context 不一致は load sanitize で無効化する。
@@ -5480,6 +5484,7 @@ impl Default for Settings {
             show_location_downloads: true,
             show_location_drive_roots: true,
             use_native_shell_context_menu: true,
+            skip_recycle_bin_delete_confirmation: false,
             ring_shortcuts: crate::ring_shortcut::RingShortcutSettings::default(),
             rating_filter: default_rating_filter(),
             toolbar_cols_items: default_toolbar_cols_items(),
@@ -7634,6 +7639,19 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recycle_bin_delete_confirmation_skip_defaults_off_and_round_trips() {
+        assert!(!Settings::default().skip_recycle_bin_delete_confirmation);
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!loaded.skip_recycle_bin_delete_confirmation);
+
+        let mut settings = Settings::default();
+        settings.skip_recycle_bin_delete_confirmation = true;
+        let loaded: Settings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        assert!(loaded.skip_recycle_bin_delete_confirmation);
+    }
 
     #[test]
     fn edit_restore_prompt_defaults_on_when_missing() {

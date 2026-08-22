@@ -120,6 +120,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["コンテキストメニュー", "shell", "右クリック"]
     ),
     entry!(
+        "explorer/delete-confirmation",
+        ExplorerIntegration,
+        "ごみ箱へ移すときは削除前の確認を省略する",
+        ["削除", "確認", "ゴミ箱", "完全削除", "delete"]
+    ),
+    entry!(
         "explorer/sendto",
         ExplorerIntegration,
         "SendTo",

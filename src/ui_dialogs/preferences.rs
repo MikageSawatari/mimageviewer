@@ -2747,6 +2747,31 @@ mod tests {
     }
 
     #[test]
+    fn preferences_recycle_bin_delete_confirmation_snapshot() {
+        use egui_kittest::Harness;
+
+        let mut settings = crate::settings::Settings::default();
+        let mut fonts_ready = false;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(560.0, 230.0))
+            .build(move |ctx| {
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_width(ui.available_width());
+                    draw_recycle_bin_delete_confirmation_setting(ui, &mut settings);
+                });
+            });
+        harness.run();
+        harness.snapshot("preferences_recycle_bin_delete_confirmation");
+    }
+
+    #[test]
     fn preferences_folder_edit_restore_snapshot() {
         use egui_kittest::Harness;
 

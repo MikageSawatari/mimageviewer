@@ -462,6 +462,13 @@ pub(super) fn page_explorer_integration(ui: &mut egui::Ui, state: &mut Preferenc
     });
     ui.add_space(10.0);
 
+    anchored(ui, state, "explorer/delete-confirmation", |ui, state| {
+        ui.label(egui::RichText::new("ファイルの削除").strong());
+        ui.add_space(4.0);
+        draw_recycle_bin_delete_confirmation_setting(ui, &mut state.settings);
+    });
+    ui.add_space(10.0);
+
     anchored(ui, state, "explorer/sendto", |ui, state| {
         ui.label(
             "Windows の「送る」メニューに mImageViewer を追加します。\n\
@@ -567,6 +574,24 @@ pub(super) fn page_explorer_integration(ui: &mut egui::Ui, state: &mut Preferenc
             .weak(),
         );
     });
+}
+
+pub(super) fn draw_recycle_bin_delete_confirmation_setting(
+    ui: &mut egui::Ui,
+    settings: &mut crate::settings::Settings,
+) {
+    ui.checkbox(
+        &mut settings.skip_recycle_bin_delete_confirmation,
+        "ごみ箱へ移すときは削除前の確認を省略する",
+    );
+    ui.label(
+        egui::RichText::new(
+            "ファイルだけが対象のときに省略します。フォルダや ZIP / PDF / 対応アーカイブ、\
+             完全に削除される可能性がある場所では確認を表示します。Windows が完全削除の\
+             警告を表示する場合は、その警告も表示されます。",
+        )
+        .weak(),
+    );
 }
 
 fn refresh_send_to_status_if_needed(state: &mut PreferencesState) {

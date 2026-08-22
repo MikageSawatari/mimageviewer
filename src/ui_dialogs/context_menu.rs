@@ -42,12 +42,26 @@ enum DeleteConfirmKind {
 }
 
 impl DeleteConfirmKind {
+    fn aggregate(kinds: impl IntoIterator<Item = Self>) -> Self {
+        if kinds.into_iter().any(|kind| kind == Self::MayPermanent) {
+            Self::MayPermanent
+        } else {
+            Self::RecycleBin
+        }
+    }
+
     fn initial_selection(self) -> DeleteConfirmSelection {
         match self {
             Self::RecycleBin => DeleteConfirmSelection::Delete,
             Self::MayPermanent => DeleteConfirmSelection::Cancel,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteTargetScope {
+    ListedFilesOnly,
+    IncludesUnlistedContents,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +87,7 @@ struct DeleteConfirmModalResponse {
 struct DeleteConfirmContent {
     label: String,
     kind: DeleteConfirmKind,
+    target_scope: DeleteTargetScope,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,11 +302,8 @@ fn delete_confirm_label_for_targets(
     targets: &[(usize, PathBuf)],
     items: &[GridItem],
 ) -> DeleteConfirmContent {
-    let kind = if delete_targets_may_permanently_delete(targets) {
-        DeleteConfirmKind::MayPermanent
-    } else {
-        DeleteConfirmKind::RecycleBin
-    };
+    let kind = delete_confirm_kind_for_targets(targets);
+    let target_scope = delete_target_scope_for_targets(targets, items);
     let count = targets.len();
     let single_name = (count == 1).then(|| {
         targets[0]
@@ -320,7 +332,43 @@ fn delete_confirm_label_for_targets(
             label.push_str(&format!("\n・他 {remaining} 件"));
         }
     }
-    DeleteConfirmContent { label, kind }
+    DeleteConfirmContent {
+        label,
+        kind,
+        target_scope,
+    }
+}
+
+fn delete_target_scope_for_targets(
+    targets: &[(usize, PathBuf)],
+    items: &[GridItem],
+) -> DeleteTargetScope {
+    let all_listed_files = targets.iter().all(|(idx, path)| {
+        matches!(
+            items.get(*idx),
+            Some(
+                GridItem::Image(item_path)
+                    | GridItem::Video(item_path)
+                    | GridItem::Audio(item_path)
+            ) if item_path == path
+        )
+    });
+    if all_listed_files {
+        DeleteTargetScope::ListedFilesOnly
+    } else {
+        // Folder / archive container tiles represent contents that the current listing does not
+        // enumerate. A missing or stale GridItem is also kept on the conservative path.
+        DeleteTargetScope::IncludesUnlistedContents
+    }
+}
+
+fn should_skip_delete_confirmation(
+    skip_recycle_bin_delete_confirmation: bool,
+    content: &DeleteConfirmContent,
+) -> bool {
+    skip_recycle_bin_delete_confirmation
+        && content.kind == DeleteConfirmKind::RecycleBin
+        && content.target_scope == DeleteTargetScope::ListedFilesOnly
 }
 
 fn build_delete_confirm_label(
@@ -376,31 +424,35 @@ fn legacy_xmp_context_path(item: &GridItem) -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-fn delete_targets_may_permanently_delete(targets: &[(usize, PathBuf)]) -> bool {
+fn delete_confirm_kind_for_targets(targets: &[(usize, PathBuf)]) -> DeleteConfirmKind {
     let mut checked_roots: std::collections::HashMap<String, Option<u64>> =
         std::collections::HashMap::new();
-    for (_, path) in targets {
+    DeleteConfirmKind::aggregate(targets.iter().map(|(_, path)| {
         let Some(root) = windows_path_root_for_file_operation(path) else {
-            return true;
+            return DeleteConfirmKind::MayPermanent;
         };
-        if !checked_roots.contains_key(&root) {
-            if windows_root_may_permanently_delete(&root) {
-                return true;
+        let max_capacity_bytes = match checked_roots.entry(root.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                if windows_root_may_permanently_delete(&root) {
+                    return DeleteConfirmKind::MayPermanent;
+                }
+                *entry.insert(windows_recycle_bin_max_capacity_bytes(&root))
             }
-            checked_roots.insert(root.clone(), windows_recycle_bin_max_capacity_bytes(&root));
+        };
+        if max_capacity_bytes
+            .is_some_and(|capacity| windows_file_exceeds_recycle_bin_capacity(path, capacity))
+        {
+            DeleteConfirmKind::MayPermanent
+        } else {
+            DeleteConfirmKind::RecycleBin
         }
-        if let Some(Some(max_capacity_bytes)) = checked_roots.get(&root) {
-            if windows_file_exceeds_recycle_bin_capacity(path, *max_capacity_bytes) {
-                return true;
-            }
-        }
-    }
-    false
+    }))
 }
 
 #[cfg(not(windows))]
-fn delete_targets_may_permanently_delete(_targets: &[(usize, PathBuf)]) -> bool {
-    false
+fn delete_confirm_kind_for_targets(_targets: &[(usize, PathBuf)]) -> DeleteConfirmKind {
+    DeleteConfirmKind::RecycleBin
 }
 
 #[cfg(windows)]
@@ -2159,6 +2211,21 @@ impl crate::app::App {
 
         if self.delete_confirm_label.is_none() {
             let content = delete_confirm_label_for_targets(&self.delete_targets, &self.items);
+            if should_skip_delete_confirmation(
+                self.settings.skip_recycle_bin_delete_confirmation,
+                &content,
+            ) {
+                if let Some(paths) = apply_delete_confirm_action(
+                    DeleteConfirmAction::Delete,
+                    &mut self.show_delete_confirm,
+                    &mut self.delete_targets,
+                    &mut self.delete_confirm_label,
+                ) {
+                    // Shell の最終判断は worker 側に委ねる。FOF_WANTNUKEWARNING は維持する。
+                    self.start_delete_files(ctx, paths);
+                }
+                return;
+            }
             ctx.data_mut(|data| {
                 data.insert_temp(
                     egui::Id::new(DELETE_CONFIRM_SELECTION_ID),
@@ -2959,6 +3026,97 @@ mod delete_confirm_tests {
             None,
             "cross-folder checked results have no single Explorer folder"
         );
+    }
+
+    fn delete_content(
+        kind: DeleteConfirmKind,
+        target_scope: DeleteTargetScope,
+    ) -> DeleteConfirmContent {
+        DeleteConfirmContent {
+            label: String::new(),
+            kind,
+            target_scope,
+        }
+    }
+
+    #[test]
+    fn ordinary_local_file_skips_confirmation_when_setting_is_on() {
+        let path = PathBuf::from(r"C:\pictures\photo.jpg");
+        let targets = vec![(0, path.clone())];
+        let scope = delete_target_scope_for_targets(&targets, &[GridItem::Image(path)]);
+        let content = delete_content(DeleteConfirmKind::RecycleBin, scope);
+
+        assert_eq!(scope, DeleteTargetScope::ListedFilesOnly);
+        assert!(should_skip_delete_confirmation(true, &content));
+    }
+
+    #[test]
+    fn may_permanent_item_still_confirms_with_cancel_preselected() {
+        let content = delete_content(
+            DeleteConfirmKind::MayPermanent,
+            DeleteTargetScope::ListedFilesOnly,
+        );
+
+        assert!(!should_skip_delete_confirmation(true, &content));
+        assert_eq!(
+            content.kind.initial_selection(),
+            DeleteConfirmSelection::Cancel
+        );
+    }
+
+    #[test]
+    fn mixed_selection_uses_may_permanent_kind_and_does_not_skip() {
+        let kind = DeleteConfirmKind::aggregate([
+            DeleteConfirmKind::RecycleBin,
+            DeleteConfirmKind::MayPermanent,
+            DeleteConfirmKind::RecycleBin,
+        ]);
+        let content = delete_content(kind, DeleteTargetScope::ListedFilesOnly);
+
+        assert_eq!(kind, DeleteConfirmKind::MayPermanent);
+        assert!(!should_skip_delete_confirmation(true, &content));
+        assert_eq!(kind.initial_selection(), DeleteConfirmSelection::Cancel);
+    }
+
+    #[test]
+    fn folders_and_archive_containers_keep_confirmation_when_setting_is_on() {
+        let items = vec![
+            GridItem::Folder(PathBuf::from(r"C:\pictures\album")),
+            GridItem::ZipFile(PathBuf::from(r"C:\pictures\book.cbz")),
+            GridItem::PdfFile(PathBuf::from(r"C:\pictures\book.pdf")),
+            GridItem::ConvertibleArchive {
+                path: PathBuf::from(r"C:\pictures\book.rar"),
+                format: crate::archive_converter::ArchiveFormat::Rar,
+            },
+        ];
+
+        for item in items {
+            let path = item
+                .drag_source_path()
+                .expect("container test item should have a real path")
+                .to_path_buf();
+            let scope = delete_target_scope_for_targets(&[(0, path)], &[item]);
+            let content = delete_content(DeleteConfirmKind::RecycleBin, scope);
+            assert_eq!(scope, DeleteTargetScope::IncludesUnlistedContents);
+            assert!(!should_skip_delete_confirmation(true, &content));
+        }
+    }
+
+    #[test]
+    fn disabled_setting_keeps_confirmation_for_every_kind_and_scope() {
+        for kind in [
+            DeleteConfirmKind::RecycleBin,
+            DeleteConfirmKind::MayPermanent,
+        ] {
+            for target_scope in [
+                DeleteTargetScope::ListedFilesOnly,
+                DeleteTargetScope::IncludesUnlistedContents,
+            ] {
+                let content = delete_content(kind, target_scope);
+                assert!(!should_skip_delete_confirmation(false, &content));
+                assert_eq!(content.kind.initial_selection(), kind.initial_selection());
+            }
+        }
     }
 
     #[test]
