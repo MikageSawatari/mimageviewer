@@ -14,7 +14,7 @@ use wgpu::util::DeviceExt as _;
 
 use crate::{adjustment::PostFilter, displayed_image_transform::physical_scale_is_near_integer};
 use crate::{
-    gpu_anime4k::{Anime4kJob, Anime4kPlan, Anime4kResampler},
+    gpu_anime4k::{Anime4kJob, Anime4kPlan, Anime4kResampler, STILL_IMAGE_ANIME4K_VARIANT},
     settings::AnimeUpscaleSourceLimit,
 };
 
@@ -500,7 +500,9 @@ impl GpuLanczosCache {
         let job = match plan {
             LanczosWorkPlan::AnimeUpscale(plan) => self
                 .anime_resampler
-                .get_or_insert_with(|| Anime4kResampler::new(&render_state.device))
+                .get_or_insert_with(|| {
+                    Anime4kResampler::new(&render_state.device, STILL_IMAGE_ANIME4K_VARIANT)
+                })
                 .prepare_job(&render_state.device, source_texture, plan)
                 .map(LanczosWorkJob::AnimeUpscale),
             plan => {
@@ -2497,13 +2499,15 @@ mod tests {
         .validate(&pixel_aa_module)
         .unwrap();
 
-        let anime_module =
-            wgpu::naga::front::wgsl::parse_str(crate::gpu_anime4k::ANIME4K_SHADER).unwrap();
-        wgpu::naga::valid::Validator::new(
-            wgpu::naga::valid::ValidationFlags::all(),
-            wgpu::naga::valid::Capabilities::all(),
-        )
-        .validate(&anime_module)
-        .unwrap();
+        for variant in crate::gpu_anime4k::Anime4kVariant::ALL {
+            let anime_module = wgpu::naga::front::wgsl::parse_str(variant.shader())
+                .unwrap_or_else(|error| panic!("{variant:?} WGSL parse failed: {error}"));
+            wgpu::naga::valid::Validator::new(
+                wgpu::naga::valid::ValidationFlags::all(),
+                wgpu::naga::valid::Capabilities::all(),
+            )
+            .validate(&anime_module)
+            .unwrap_or_else(|error| panic!("{variant:?} WGSL validation failed: {error}"));
+        }
     }
 }

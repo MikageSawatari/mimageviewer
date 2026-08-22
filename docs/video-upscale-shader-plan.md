@@ -159,19 +159,26 @@ Phase A の構造をそのまま使う。§4 以降が対象。
 品質差は SSIM 平均順位で VL 2.79 / M 3.19 (14 候補中)。**両者の差より、両者と 3 位以下の
 差の方が大きい**。動いている絵ではこの差はさらに見えにくい。
 
-### 4.2 現行実装は VL 専用にハードコードされている
+### 4.2 変種トポロジーの生成 (B1 実装済み)
 
-変種を扱う前に一般化が要る。
+[convert_anime4k_glsl_to_wgsl.py](../scripts/convert_anime4k_glsl_to_wgsl.py) は
+S / M / L / VL / UL の各 GLSL について `//!SAVE` と `//!BIND` を解析し、次を一括生成する。
 
-- [gpu_anime4k.rs](../src/gpu_anime4k.rs): `INTERMEDIATE_COUNT = 17` / `INPUT_BINDING_COUNT = 14` /
-  各パスの入力配線が `pass < 2 なら source / pass < 14 ならペア / それ以外は 14 枚` という
-  VL の形そのまま
-- [convert_anime4k_glsl_to_wgsl.py](../scripts/convert_anime4k_glsl_to_wgsl.py):
-  `EXPECTED_SAVES` に VL の 17 個の名前を直書き
+- 変種ごとの WGSL。各ファイルは入力 GLSL の MIT ライセンスヘッダーを保持する
+- [gpu_anime4k_generated.rs](../src/gpu_anime4k_generated.rs) の変種別 const データ:
+  shader、最大入力 binding 数、各 convolution pass と最終 resolve pass の入力リスト
+- 入力リストは `Source` または「何番目の中間出力か」で表し、未知・未来の `//!BIND`、
+  重複 `//!SAVE`、未対応 resolve 形状は生成エラーにする
 
-コンバータは `//!BIND` を既に parse しているので、**パスごとの入力リストを const テーブルとして
-シェーダと一緒に生成させれば、Rust 側の配線ロジックは消える**。一度やれば S / M / L / UL は
-追加コストほぼゼロで増え、**静止画側にも同じ選択肢が生える** (現在は静止画も VL 一択)。
+[gpu_anime4k.rs](../src/gpu_anime4k.rs) は `Anime4kVariant` を値として受け取り、生成データから
+pipeline 数、中間 texture 数、bind group layout、pass ごとの texture view 配線を構築する。
+VL 固有だった `INTERMEDIATE_COUNT` / `INPUT_BINDING_COUNT` と pass 番号分岐は無くなった。
+静止画経路の選択値は引き続き VL 固定で、表示結果は変更しない。
+
+[test_convert_anime4k_glsl_to_wgsl.py](../scripts/test_convert_anime4k_glsl_to_wgsl.py) は、
+一般化した converter による VL 再生成結果と committed `gpu_anime4k.wgsl` の完全一致を
+golden test にし、5 変種すべての shader / topology も committed 生成物と比較する。
+HLSL 出力と native video presenter への接続は B2、計測と選択 policy は B3 で扱う。
 
 ### 4.3 HLSL 生成
 
