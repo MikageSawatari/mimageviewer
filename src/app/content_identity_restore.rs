@@ -311,6 +311,10 @@ impl App {
             Some(Ok(report)) => report,
             Some(Err(mpsc::TryRecvError::Disconnected)) => {
                 self.content_identity_restore_pending = None;
+                self.apply_content_identity_store_mutations(
+                    crate::rename_key_migration::StoreMutationEffects::
+                        for_content_identity_index_stale(),
+                );
                 crate::logger::log("content_identity: restore thread disconnected".to_string());
                 self.show_feedback_toast("編集内容の復元が中断されました".to_string());
                 return;
@@ -333,11 +337,16 @@ impl App {
             failures,
             report.database_opens
         ));
-        if self.settings.edit_restore_prompt_enabled {
-            for entry in report.ledger_entries {
-                self.content_identity_index.upsert(entry);
-            }
+        if restored != report.requested_restores {
+            // STORES copy が edit_origin の destination 行を commit した後、promotion だけが
+            // 失敗した部分成功では ledger_entries に増分通知が無い。件数不一致を曖昧な
+            // per-key 推測で埋めず、authoritative snapshot を引き直す。
+            self.apply_content_identity_store_mutations(
+                crate::rename_key_migration::StoreMutationEffects::for_content_identity_index_stale(
+                ),
+            );
         }
+        self.apply_content_identity_ledger_updates(report.ledger_entries);
         self.apply_content_restore_sidecar_mirrors(report.sidecar_mirrors, report.sidecar_bases);
         self.apply_content_restore_presence(report.presence);
         if report.requested_restores > 0 {

@@ -14,7 +14,9 @@ use std::sync::mpsc;
 use rusqlite::OpenFlags;
 use serde::{Deserialize, Serialize};
 
-use crate::rename_key_migration::{STORES, StoreDescriptor, StoreKeyNormalization};
+use crate::rename_key_migration::{
+    STORES, StoreDescriptor, StoreKeyNormalization, StoreMutationEffects,
+};
 
 const PHASE_SCANNING: u8 = 1;
 const PHASE_DELETING: u8 = 2;
@@ -37,6 +39,7 @@ pub(crate) struct DeletePurgeRetryReport {
     pub(crate) remaining: usize,
     pub(crate) rows: usize,
     pub(crate) errors: Vec<String>,
+    pub(crate) store_mutations: crate::rename_key_migration::StoreMutationEffects,
 }
 
 #[allow(dead_code)] // lib target では bin-only App poller が無い
@@ -93,6 +96,7 @@ pub struct DeleteReport {
     pub errors: Vec<String>,
     pub deleted_keys: Vec<String>,
     pub canceled: bool,
+    pub(crate) store_mutations: StoreMutationEffects,
 }
 
 impl DeleteReport {
@@ -248,6 +252,7 @@ fn retry_delete_purge_journal_at(data_dir: &Path) -> DeletePurgeRetryReport {
             &entry.pdf_paths,
         );
         report.rows += purge.rows;
+        report.store_mutations.merge(purge.store_mutations);
         if purge.errors.is_empty() {
             report.purged += 1;
             completed.push(entry.clone());
@@ -859,6 +864,7 @@ fn delete_descriptor<F>(
         ));
         return;
     }
+    report.store_mutations.record_completed(descriptor);
     for (key, rows, store) in committed {
         *deleted.entry(store).or_default() += rows;
         report.deleted_keys.push(key);

@@ -87,10 +87,47 @@ const PURGE_EXACT_BATCH_SIZE: usize = 500;
 pub struct RenameMigrationReport {
     pub rows: usize,
     pub errors: Vec<String>,
+    /// 共通 STORES の commit により、App 側の path-keyed snapshot を引き直す必要があるか。
+    pub(crate) store_mutations: StoreMutationEffects,
     /// worker が panic した (= 残りのストアを試行しないまま中断した) 場合 true。
     /// per-store エラー (全ストア試行済み・best-effort 確定) と違い、ジャーナルに残して
     /// 次回起動で冪等に再実行する (Sol 角度⑤検収)。
     pub panicked: bool,
+}
+
+/// worker が共通 [`STORES`] を直接更新した後、App-owned snapshot へ伝える失効情報。
+///
+/// `edit_origin` は追加・昇格を各 content-identity worker の増分通知で追える一方、rename / purge /
+/// orphan cleanup の削除・key rewrite は増分通知を持たない。descriptor commit の共通境界でこの
+/// effect を立て、UI 側は SQLite を触らず cancellable worker で authoritative snapshot を再読込する。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoreMutationEffects {
+    content_identity_index_stale: bool,
+}
+
+impl StoreMutationEffects {
+    pub(crate) fn for_content_identity_index_stale() -> Self {
+        Self {
+            content_identity_index_stale: true,
+        }
+    }
+
+    pub(crate) fn record_completed(&mut self, descriptor: &StoreDescriptor) {
+        if descriptor.file == "content_identity.db"
+            && descriptor.table == "edit_origin"
+            && descriptor.column == "file_key"
+        {
+            self.content_identity_index_stale = true;
+        }
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.content_identity_index_stale |= other.content_identity_index_stale;
+    }
+
+    pub(crate) fn content_identity_index_stale(self) -> bool {
+        self.content_identity_index_stale
+    }
 }
 
 /// 未完了移行のジャーナルファイル名 (data_dir 直下)。
@@ -569,6 +606,7 @@ pub fn run_at(data_dir: &Path, old_path: &Path, new_path: &Path) -> RenameMigrat
     let mut report = RenameMigrationReport {
         rows: 0,
         errors: Vec::new(),
+        store_mutations: StoreMutationEffects::default(),
         panicked: false,
     };
 
@@ -596,9 +634,7 @@ pub fn run_at(data_dir: &Path, old_path: &Path, new_path: &Path) -> RenameMigrat
         }
         migrate_store(
             &data_dir.join(descriptor.file),
-            descriptor.table,
-            descriptor.column,
-            descriptor.unique,
+            descriptor,
             old_key,
             new_key,
             &mut report,
@@ -646,6 +682,7 @@ pub(crate) struct PurgeReport {
     /// SQLite connection open を試みた回数。delete worker の perf 計装用。
     pub(crate) db_open_count: usize,
     pub(crate) errors: Vec<String>,
+    pub(crate) store_mutations: StoreMutationEffects,
 }
 
 /// `delete_worker` 専用。Shell が削除成功と確認した path だけを hard purge する。
@@ -824,7 +861,10 @@ fn purge_store(
         Ok(changed)
     })();
     match result {
-        Ok(rows) => report.rows += rows,
+        Ok(rows) => {
+            report.rows += rows;
+            report.store_mutations.record_completed(descriptor);
+        }
         Err(error) => report.errors.push(format!(
             "{}: {}.{}: {error}",
             descriptor.file, descriptor.table, descriptor.column
@@ -835,9 +875,7 @@ fn purge_store(
 /// 1 ストア分の移行: exact + `<old>/` prefix + `<old>::` prefix。
 fn migrate_store(
     db_path: &Path,
-    table: &str,
-    col: &str,
-    unique: bool,
+    descriptor: &StoreDescriptor,
     old_key: &str,
     new_key: &str,
     report: &mut RenameMigrationReport,
@@ -850,27 +888,34 @@ fn migrate_store(
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let tx = conn.transaction()?;
         let mut changed = 0usize;
-        changed += move_exact(&tx, table, col, unique, old_key, new_key)?;
+        changed += move_exact(
+            &tx,
+            descriptor.table,
+            descriptor.column,
+            descriptor.unique,
+            old_key,
+            new_key,
+        )?;
         changed += move_prefix(
             &tx,
-            table,
-            col,
-            unique,
+            descriptor.table,
+            descriptor.column,
+            descriptor.unique,
             &format!("{old_key}/"),
             &format!("{new_key}/"),
         )?;
         changed += move_prefix(
             &tx,
-            table,
-            col,
-            unique,
+            descriptor.table,
+            descriptor.column,
+            descriptor.unique,
             &format!("{old_key}::"),
             &format!("{new_key}::"),
         )?;
         // rating.db はキーから導出される source_path 列 (一覧ビューがコンテナを開くのに
         // 使う) も新キーに合わせる (`RatingDb::copy_entry_key` と同じ導出規則 =
         // "::" より前、無ければキー自身)。
-        if table == "ratings" && changed > 0 {
+        if descriptor.table == "ratings" && changed > 0 {
             tx.execute(
                 "UPDATE ratings SET source_path = CASE
                      WHEN instr(path, '::') > 0 THEN substr(path, 1, instr(path, '::') - 1)
@@ -892,10 +937,15 @@ fn migrate_store(
         Ok(changed)
     })();
     match result {
-        Ok(n) => report.rows += n,
+        Ok(n) => {
+            report.rows += n;
+            report.store_mutations.record_completed(descriptor);
+        }
         Err(e) => report.errors.push(format!(
-            "{}: {table}.{col}: {e}",
-            db_path.file_name().unwrap_or_default().to_string_lossy()
+            "{}: {}.{}: {e}",
+            db_path.file_name().unwrap_or_default().to_string_lossy(),
+            descriptor.table,
+            descriptor.column,
         )),
     }
 }

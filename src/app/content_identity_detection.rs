@@ -29,12 +29,65 @@ impl App {
         {
             return;
         }
+        self.spawn_content_identity_index_load();
+    }
+
+    fn spawn_content_identity_index_load(&mut self) {
         self.content_identity_ledger_state = ContentIdentityLedgerState::Loading;
-        match ContentIdentityIndexLoadPending::spawn() {
+        let io_sem = self
+            .indexer_manager
+            .as_ref()
+            .map(crate::indexer_manager::IndexerManager::io_sem)
+            .unwrap_or_else(|| Arc::clone(&self.content_identity_fallback_io_sem));
+        match ContentIdentityIndexLoadPending::spawn(io_sem) {
             Ok(pending) => self.content_identity_index_load_pending = Some(pending),
             Err(error) => self.mark_content_identity_ledger_unusable(format!(
                 "index loader thread spawn failed: {error}"
             )),
+        }
+    }
+
+    /// 共通 STORES worker が `edit_origin` の key rewrite / delete を commit した後、
+    /// 古い snapshot を stage 0 から即座に外し、authoritative ledger を worker で再読込する。
+    pub(crate) fn apply_content_identity_store_mutations(
+        &mut self,
+        effects: crate::rename_key_migration::StoreMutationEffects,
+    ) {
+        if !effects.content_identity_index_stale() || !self.settings.edit_restore_prompt_enabled {
+            return;
+        }
+        if let Some(pending) = self.content_identity_index_load_pending.take() {
+            pending.cancel();
+        }
+        self.cancel_content_identity_detection();
+
+        // mutation より前に commit 済みだった増分通知は、authoritative reload 後へ merge すると
+        // purge 済みの旧 key を復活させる。ここまでの通知は捨て、以後に届くものだけ Loading 中の
+        // queue へ積む。現在の DB 状態は新しい reload が全件回収する。
+        self.content_identity_updates_before_load.clear();
+        if let Some(recorder) = self.content_identity_recorder.as_ref() {
+            let _ = recorder.drain_updates();
+        }
+        crate::logger::log(
+            "content_identity: ledger index stale after shared store mutation; reloading"
+                .to_string(),
+        );
+        self.spawn_content_identity_index_load();
+    }
+
+    pub(crate) fn apply_content_identity_ledger_updates(
+        &mut self,
+        updates: impl IntoIterator<Item = crate::content_identity::LedgerEntry>,
+    ) {
+        if self.content_identity_ledger_state.is_ready() {
+            for update in updates {
+                self.content_identity_index.upsert(update);
+            }
+        } else if matches!(
+            &self.content_identity_ledger_state,
+            ContentIdentityLedgerState::Loading
+        ) {
+            self.content_identity_updates_before_load.extend(updates);
         }
     }
 
@@ -127,12 +180,17 @@ impl App {
                     )],
                 );
             }
+            let update_tx = self
+                .content_identity_recorder
+                .as_ref()
+                .map(crate::content_identity::ContentIdentityRecorder::update_sender);
             self.content_identity_detection_pending = ContentIdentityDetectionPending::spawn(
                 work.detection_targets,
                 self.items_generation,
                 folder_key.clone(),
                 self.input_seq,
                 Arc::clone(&io_sem),
+                update_tx,
             );
         }
 
@@ -222,9 +280,7 @@ impl App {
                     ));
                     return;
                 }
-                for update in result.ledger_updates {
-                    self.content_identity_index.upsert(update);
-                }
+                self.apply_content_identity_ledger_updates(result.ledger_updates);
                 self.log_content_restore_candidates(&result.candidates);
                 self.set_content_restore_candidates(result.candidates);
                 if crate::perf::is_enabled() {
@@ -262,13 +318,7 @@ impl App {
             Some(Ok(result)) => {
                 self.content_identity_backfill_pending = None;
                 let recorded = result.ledger_updates.len();
-                if self.settings.edit_restore_prompt_enabled
-                    && self.content_identity_ledger_state.is_ready()
-                {
-                    for update in result.ledger_updates {
-                        self.content_identity_index.upsert(update);
-                    }
-                }
+                self.apply_content_identity_ledger_updates(result.ledger_updates);
                 crate::logger::log(format!(
                     "content_identity: backfill completed recorded={recorded} errors={}",
                     result.errors
@@ -292,16 +342,7 @@ impl App {
             .as_ref()
             .map(|recorder| recorder.drain_updates())
             .unwrap_or_default();
-        if self.content_identity_ledger_state.is_ready() {
-            for update in updates {
-                self.content_identity_index.upsert(update);
-            }
-        } else if matches!(
-            &self.content_identity_ledger_state,
-            ContentIdentityLedgerState::Loading
-        ) {
-            self.content_identity_updates_before_load.extend(updates);
-        }
+        self.apply_content_identity_ledger_updates(updates);
     }
 
     fn poll_content_identity_index_load(&mut self, ctx: &egui::Context) {
@@ -312,6 +353,10 @@ impl App {
         match event {
             Some(Ok(Ok(mut index))) => {
                 self.content_identity_index_load_pending = None;
+                if let Some(recorder) = self.content_identity_recorder.as_ref() {
+                    self.content_identity_updates_before_load
+                        .extend(recorder.drain_updates());
+                }
                 for update in self.content_identity_updates_before_load.drain(..) {
                     index.upsert(update);
                 }

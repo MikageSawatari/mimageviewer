@@ -22,6 +22,9 @@ impl App {
                     CleanupTask::Delete => {
                         WorkerResult::Delete(crate::metadata_cleanup::DeleteReport {
                             errors: vec!["整理処理が予期せず終了しました".into()],
+                            store_mutations:
+                                crate::rename_key_migration::StoreMutationEffects::
+                                    for_content_identity_index_stale(),
                             ..Default::default()
                         })
                     }
@@ -57,6 +60,7 @@ impl App {
         &mut self,
         report: &crate::metadata_cleanup::DeleteReport,
     ) {
+        self.apply_content_identity_store_mutations(report.store_mutations);
         if report.deleted_keys.is_empty() {
             return;
         }

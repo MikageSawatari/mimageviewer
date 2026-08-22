@@ -23727,7 +23727,11 @@ mod favorite_adjustment_defaults_tests {
             purge_deferred: false,
         })
         .unwrap();
-        tx.send(DeleteMsg::Done { canceled: false }).unwrap();
+        tx.send(DeleteMsg::Done {
+            canceled: false,
+            store_mutations: Default::default(),
+        })
+        .unwrap();
         drop(tx);
 
         app.delete_pending = Some(DeletePending {
@@ -40627,6 +40631,7 @@ mod still_window_mode_key_tests {
         tx.send(crate::rename_key_migration::RenameMigrationReport {
             rows: 1,
             errors: Vec::new(),
+            store_mutations: Default::default(),
             panicked: false,
         })
         .unwrap();
@@ -40665,6 +40670,7 @@ mod still_window_mode_key_tests {
         tx.send(crate::rename_key_migration::RenameMigrationReport {
             rows: 1,
             errors: Vec::new(),
+            store_mutations: Default::default(),
             panicked: false,
         })
         .unwrap();
@@ -40730,6 +40736,7 @@ mod still_window_mode_key_tests {
         tx.send(crate::rename_key_migration::RenameMigrationReport {
             rows: 1,
             errors: Vec::new(),
+            store_mutations: Default::default(),
             panicked: false,
         })
         .unwrap();
@@ -40767,6 +40774,7 @@ mod still_window_mode_key_tests {
         tx.send(crate::rename_key_migration::RenameMigrationReport {
             rows: 0,
             errors: vec!["worker panicked".to_string()],
+            store_mutations: Default::default(),
             panicked: true,
         })
         .unwrap();

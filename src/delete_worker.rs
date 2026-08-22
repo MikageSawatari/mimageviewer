@@ -43,7 +43,10 @@ pub enum DeleteMsg {
         purge_deferred: bool,
     },
     /// 全バッチが終わった (キャンセル含む)。`canceled` が true ならユーザーが途中で止めた。
-    Done { canceled: bool },
+    Done {
+        canceled: bool,
+        store_mutations: crate::rename_key_migration::StoreMutationEffects,
+    },
 }
 
 /// UI スレッドが保持する worker ハンドル。
@@ -98,7 +101,10 @@ pub fn spawn(paths: Vec<PathBuf>, hwnd: Option<isize>) -> DeletePending {
             purged_pdf_password_paths: Vec::new(),
             purge_deferred: false,
         });
-        let _ = tx.send(DeleteMsg::Done { canceled: false });
+        let _ = tx.send(DeleteMsg::Done {
+            canceled: false,
+            store_mutations: Default::default(),
+        });
     }
 
     DeletePending {
@@ -240,10 +246,12 @@ fn run_worker_with_recycler<F, C, P, J>(
     pdf_paths_for_purge.sort();
     pdf_paths_for_purge.dedup();
     let mut purge_deferred = false;
+    let mut store_mutations = crate::rename_key_migration::StoreMutationEffects::default();
     if !succeeded_for_purge.is_empty() {
         let purge_started = std::time::Instant::now();
         let mut attempts = 1usize;
         let mut report = purge(&succeeded_for_purge, &pdf_paths_for_purge);
+        store_mutations.merge(report.store_mutations);
         let mut rows = report.rows;
         let mut db_open_count = report.db_open_count;
         for retry in 1..=3 {
@@ -252,6 +260,7 @@ fn run_worker_with_recycler<F, C, P, J>(
             }
             std::thread::sleep(std::time::Duration::from_millis(50 * retry));
             report = purge(&succeeded_for_purge, &pdf_paths_for_purge);
+            store_mutations.merge(report.store_mutations);
             attempts += 1;
             rows += report.rows;
             db_open_count += report.db_open_count;
@@ -312,6 +321,7 @@ fn run_worker_with_recycler<F, C, P, J>(
     if receiver_open {
         let _ = tx.send(DeleteMsg::Done {
             canceled: canceled || cancel.load(Ordering::Relaxed),
+            store_mutations,
         });
     }
 }
@@ -688,7 +698,7 @@ mod worker_tests {
 
     fn done_canceled(msg: &DeleteMsg) -> bool {
         match msg {
-            DeleteMsg::Done { canceled } => *canceled,
+            DeleteMsg::Done { canceled, .. } => *canceled,
             DeleteMsg::Batch { .. } => panic!("expected Done"),
         }
     }
@@ -1026,6 +1036,7 @@ mod worker_tests {
                     rows: 0,
                     db_open_count: 0,
                     errors: vec!["simulated database lock".into()],
+                    store_mutations: Default::default(),
                 }
             },
             |removed, pdf_paths| {

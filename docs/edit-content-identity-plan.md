@@ -125,6 +125,16 @@ CREATE TABLE restore_declined (
 > **`file_key` は path キーなので、[rename_key_migration.rs](../src/rename_key_migration.rs) の
 > `STORES` 表へ必ず追加すること。** この表はリネーム移行と削除 worker の hard purge が
 > 共有する正本で、追加を忘れるとアプリ内リネーム後に台帳だけ旧パスを指す。
+>
+> **メモリ索引は台帳の authoritative snapshot とし、削除 / key rewrite 後に増分推測しない**
+> (2026-08-22)。`STORES` descriptor の transaction 成功境界で
+> `content_identity.db / edit_origin.file_key` の mutation effect を立て、リネーム、hard purge、
+> purge journal 再試行、孤児メタデータ整理の完了 report から App の同じ入口へ返す。App は旧索引を
+> 段 0 から即時 gate して検出 / backfill を cancel し、`GlobalIoSemaphore` Low priority の
+> cancellable worker で台帳全件を再読込する。再読込中に commit した recorder / detection /
+> backfill / restore promotion の行は global update channel または完了 report で Loading queue に
+> 積み、全件 snapshot へ merge してから Ready に戻す。段 0 は引き続きメモリだけを参照し、
+> SQLite を開かない。
 
 ### 3.3 記録のタイミング
 

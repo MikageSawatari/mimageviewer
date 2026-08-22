@@ -731,14 +731,26 @@ pub(crate) struct ContentIdentityIndexLoadPending {
 
 impl ContentIdentityIndexLoadPending {
     /// A2 の索引ロード。設定 OFF では呼び出し側がこの worker 自体を作らない。
-    pub(crate) fn spawn() -> Result<Self, String> {
+    pub(crate) fn spawn(
+        io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
+    ) -> Result<Self, String> {
+        Self::spawn_at(crate::data_dir::get().join("content_identity.db"), io_sem)
+    }
+
+    fn spawn_at(
+        db_path: PathBuf,
+        io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
+    ) -> Result<Self, String> {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new()
             .name("content-identity-index-load".into())
             .spawn(move || {
-                let result = ContentIdentityDb::open()
+                let result = io_sem
+                    .acquire_cancellable(crate::io_semaphore::IoPriority::Low, &worker_cancel)
+                    .ok_or_else(|| "cancelled".to_string())
+                    .and_then(|_permit| ContentIdentityDb::open_at(&db_path))
                     .and_then(|db| db.load_index(&worker_cancel))
                     .and_then(|index| index.ok_or_else(|| "cancelled".to_string()));
                 if !worker_cancel.load(Ordering::Acquire) {
@@ -857,6 +869,7 @@ impl ContentIdentityDetectionPending {
         folder_key: String,
         input_seq: u64,
         io_sem: Arc<crate::io_semaphore::GlobalIoSemaphore>,
+        update_tx: Option<mpsc::Sender<LedgerEntry>>,
     ) -> Option<Self> {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
@@ -876,13 +889,14 @@ impl ContentIdentityDetectionPending {
                     );
                 }
                 let started = std::time::Instant::now();
-                match run_detection_at(
+                match run_detection_at_with_updates(
                     &db_path,
                     targets,
                     items_generation,
                     worker_folder_key.clone(),
                     &worker_cancel,
                     &io_sem,
+                    update_tx.as_ref(),
                 ) {
                     Ok(Some(result)) => {
                         if crate::perf::is_enabled() {
@@ -1222,6 +1236,7 @@ impl<R: Read> Read for CancellableReader<'_, R> {
     }
 }
 
+#[cfg(test)]
 fn run_detection_at(
     db_path: &Path,
     targets: Vec<DetectionTarget>,
@@ -1229,6 +1244,26 @@ fn run_detection_at(
     folder_key: String,
     cancel: &AtomicBool,
     io_sem: &crate::io_semaphore::GlobalIoSemaphore,
+) -> Result<Option<DetectionResult>, String> {
+    run_detection_at_with_updates(
+        db_path,
+        targets,
+        items_generation,
+        folder_key,
+        cancel,
+        io_sem,
+        None,
+    )
+}
+
+fn run_detection_at_with_updates(
+    db_path: &Path,
+    targets: Vec<DetectionTarget>,
+    items_generation: u64,
+    folder_key: String,
+    cancel: &AtomicBool,
+    io_sem: &crate::io_semaphore::GlobalIoSemaphore,
+    update_tx: Option<&mpsc::Sender<LedgerEntry>>,
 ) -> Result<Option<DetectionResult>, String> {
     if cancel.load(Ordering::Acquire) {
         return Ok(None);
@@ -1254,6 +1289,9 @@ fn run_detection_at(
         };
         match detect_target(&db, target, cancel) {
             Ok(Some((candidate, update))) => {
+                if let Some(update_tx) = update_tx {
+                    let _ = update_tx.send(update.clone());
+                }
                 ledger_updates.push(update);
                 if let Some(candidate) = candidate {
                     candidates.push(candidate);
@@ -1364,7 +1402,7 @@ fn detect_target_with_opener<R: Read + Seek>(
         (head_hash, full_hash, matching, update)
     };
     if cancel.load(Ordering::Acquire) {
-        return Ok(None);
+        return Ok(Some((None, update)));
     }
     if matching.is_empty() {
         return Ok(Some((None, update)));
@@ -1378,7 +1416,7 @@ fn detect_target_with_opener<R: Read + Seek>(
         let mut sources = Vec::with_capacity(matching.len());
         for origin in matching {
             if cancel.load(Ordering::Acquire) {
-                return Ok(None);
+                return Ok(Some((None, update)));
             }
             let path = PathBuf::from(&origin.file_key);
             let source_exists = path.try_exists().unwrap_or(false);
@@ -1655,6 +1693,18 @@ mod tests {
         }
     }
 
+    fn poll_test_index_reload(app: &mut crate::app::AppTestEnvForTest) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !app.content_identity_ledger_state.is_ready() {
+            app.poll_content_identity_detection(&egui::Context::default());
+            assert!(
+                std::time::Instant::now() < deadline,
+                "content identity index reload did not complete"
+            );
+            std::thread::yield_now();
+        }
+    }
+
     #[test]
     fn stage_hashes_have_stable_sha256_vectors() {
         let mut head = Cursor::new(b"abc");
@@ -1730,6 +1780,187 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn index_reload_is_background_low_priority_and_cancellable() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("content_identity.db");
+        drop(ContentIdentityDb::open_at(&db_path).unwrap());
+        let io_sem = Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(1));
+        let holder = io_sem.acquire(crate::io_semaphore::IoPriority::Normal);
+
+        let pending = ContentIdentityIndexLoadPending::spawn_at(db_path, Arc::clone(&io_sem))
+            .expect("spawn only; DB load must not run on the caller thread");
+        assert!(matches!(pending.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        pending.cancel();
+        drop(holder);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match pending.try_recv() {
+                Err(mpsc::TryRecvError::Disconnected) => break,
+                Err(mpsc::TryRecvError::Empty) => {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+                Ok(result) => panic!("canceled index load published a result: {result:?}"),
+            }
+        }
+        assert_eq!(
+            io_sem.stats().0,
+            1,
+            "canceled Low wait must not leak a permit"
+        );
+    }
+
+    #[test]
+    fn purge_reload_removes_restore_source_exclusion_and_copy_is_candidate_again() {
+        let mut app = crate::app::setup_app_for_test();
+        if let Some(pending) = app.content_identity_index_load_pending.take() {
+            pending.cancel();
+        }
+        app.settings.edit_restore_prompt_enabled = true;
+        let db_path = app.tmp.path().join("content_identity.db");
+        let origin_path = app.tmp.path().join("origin.png");
+        let copied_path = app.tmp.path().join("copied.png");
+        let bytes = vec![23_u8; HEAD_HASH_BYTES as usize + 9];
+        std::fs::write(&origin_path, &bytes).unwrap();
+        std::fs::write(&copied_path, &bytes).unwrap();
+        let size = bytes.len() as u64;
+        let head_hash = stage1_head_hash(&mut Cursor::new(&bytes), size).unwrap();
+        let full_hash = stage2_full_hash(&mut Cursor::new(&bytes)).unwrap();
+        let origin_key = crate::path_key::normalize_keep_drive(&origin_path);
+        let copied_key = crate::path_key::normalize_keep_drive(&copied_path);
+        let db = ContentIdentityDb::open_at(&db_path).unwrap();
+        for (path, key) in [(&origin_path, &origin_key), (&copied_path, &copied_key)] {
+            db.upsert(
+                &ContentIdentitySource::new(path, ContentKind::Image),
+                &RecordedFileState {
+                    file_key: key.clone(),
+                    size,
+                    hashed_mtime: 1,
+                },
+                &head_hash,
+                &full_hash,
+                10,
+                ObservationRole::RestorableContent,
+            )
+            .unwrap();
+        }
+        app.content_identity_index = db.load_index(&AtomicBool::new(false)).unwrap().unwrap();
+        app.content_identity_ledger_state = ContentIdentityLedgerState::Ready;
+        assert!(app.content_identity_index.contains_file_key(&copied_key));
+        drop(db);
+
+        let purge = crate::rename_key_migration::purge_removed_paths_at(
+            app.tmp.path(),
+            std::slice::from_ref(&copied_path),
+            &[],
+        );
+        assert!(purge.errors.is_empty(), "{:?}", purge.errors);
+        assert!(purge.store_mutations.content_identity_index_stale());
+        app.apply_content_identity_store_mutations(purge.store_mutations);
+        poll_test_index_reload(&mut app);
+
+        assert!(!app.content_identity_index.contains_file_key(&copied_key));
+        assert!(
+            stage0_target(
+                &app.content_identity_index,
+                ContentIdentitySource::new(&copied_path, ContentKind::Image),
+                size,
+            )
+            .is_some(),
+            "a copy recreated at the purged path must be eligible again"
+        );
+    }
+
+    #[test]
+    fn rename_reload_replaces_old_restore_source_key_with_new_key() {
+        let mut app = crate::app::setup_app_for_test();
+        if let Some(pending) = app.content_identity_index_load_pending.take() {
+            pending.cancel();
+        }
+        app.settings.edit_restore_prompt_enabled = true;
+        let old_path = app.tmp.path().join("old.png");
+        let new_path = app.tmp.path().join("new.png");
+        let old_key = crate::path_key::normalize_keep_drive(&old_path);
+        let new_key = crate::path_key::normalize_keep_drive(&new_path);
+        let db = ContentIdentityDb::open_at(&app.tmp.path().join("content_identity.db")).unwrap();
+        db.upsert(
+            &ContentIdentitySource::new(&old_path, ContentKind::Image),
+            &RecordedFileState {
+                file_key: old_key.clone(),
+                size: 42,
+                hashed_mtime: 1,
+            },
+            "head",
+            "full",
+            10,
+            ObservationRole::RestorableContent,
+        )
+        .unwrap();
+        app.content_identity_index = db.load_index(&AtomicBool::new(false)).unwrap().unwrap();
+        app.content_identity_ledger_state = ContentIdentityLedgerState::Ready;
+        drop(db);
+
+        let report = crate::rename_key_migration::run_at(app.tmp.path(), &old_path, &new_path);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.store_mutations.content_identity_index_stale());
+        app.apply_content_identity_store_mutations(report.store_mutations);
+        poll_test_index_reload(&mut app);
+
+        assert!(!app.content_identity_index.contains_file_key(&old_key));
+        assert!(app.content_identity_index.contains_file_key(&new_key));
+        assert!(
+            app.content_identity_index
+                .contains_ledger_file_key(&new_key)
+        );
+        assert!(
+            !app.content_identity_index
+                .contains_ledger_file_key(&old_key)
+        );
+    }
+
+    #[test]
+    fn stale_reload_cancels_folder_workers_and_drops_pre_mutation_updates() {
+        let mut app = crate::app::setup_app_for_test();
+        if let Some(pending) = app.content_identity_index_load_pending.take() {
+            pending.cancel();
+        }
+        app.settings.edit_restore_prompt_enabled = true;
+        app.content_identity_ledger_state = ContentIdentityLedgerState::Ready;
+        let (detection, detection_cancel) = ContentIdentityDetectionPending::for_test(None);
+        app.content_identity_detection_pending = Some(detection);
+        let (backfill, backfill_cancel) = ContentIdentityBackfillPending::for_test();
+        app.content_identity_backfill_pending = Some(backfill);
+        app.content_identity_updates_before_load
+            .push(test_ledger_entry(
+                "c:/deleted-before-reload.png",
+                1,
+                "head",
+                "full",
+                1,
+            ));
+        let descriptor = crate::rename_key_migration::STORES
+            .iter()
+            .find(|descriptor| descriptor.table == "edit_origin")
+            .unwrap();
+        let mut effects = crate::rename_key_migration::StoreMutationEffects::default();
+        effects.record_completed(descriptor);
+
+        app.apply_content_identity_store_mutations(effects);
+
+        assert!(detection_cancel.load(Ordering::Acquire));
+        assert!(backfill_cancel.load(Ordering::Acquire));
+        assert!(app.content_identity_detection_pending.is_none());
+        assert!(app.content_identity_backfill_pending.is_none());
+        assert!(app.content_identity_updates_before_load.is_empty());
+        assert!(matches!(
+            app.content_identity_ledger_state,
+            ContentIdentityLedgerState::Loading
+        ));
+        assert!(app.content_identity_index_load_pending.is_some());
     }
 
     #[test]

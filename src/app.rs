@@ -13340,13 +13340,19 @@ impl App {
         let t = std::time::Instant::now();
         let view_trim_db = crate::view_trim_db::ViewTrimDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_view_trim", 0, t);
+        let content_identity_fallback_io_sem =
+            Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(
+                settings.indexer_speed_profile.io_permits().max(1),
+            ));
         // DB open / schema 作成も含めて worker 内で行う。ここでは thread spawn のみ。
         let content_identity_recorder = crate::content_identity::ContentIdentityRecorder::spawn();
         // A2 の全件索引は検出設定が ON のときだけ別 worker で読む。A1 recorder は
         // この設定を参照せず、OFF 中も編集確定時の記録を継続する。
         let (content_identity_index_load_pending, content_identity_ledger_state) =
             if settings.edit_restore_prompt_enabled {
-                match crate::content_identity::ContentIdentityIndexLoadPending::spawn() {
+                match crate::content_identity::ContentIdentityIndexLoadPending::spawn(Arc::clone(
+                    &content_identity_fallback_io_sem,
+                )) {
                     Ok(pending) => (
                         Some(pending),
                         crate::content_identity::ContentIdentityLedgerState::Loading,
@@ -13366,11 +13372,6 @@ impl App {
                     crate::content_identity::ContentIdentityLedgerState::Disabled,
                 )
             };
-        let content_identity_fallback_io_sem =
-            Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(
-                settings.indexer_speed_profile.io_permits().max(1),
-            ));
-
         let t = std::time::Instant::now();
         let book_resume_db = crate::book_resume_db::BookResumeDb::open().ok();
         let book_resume_writer = if book_resume_db.is_some() {
@@ -28683,6 +28684,8 @@ impl App {
                     crate::rename_key_migration::RenameMigrationReport {
                         rows: 0,
                         errors: vec!["worker panicked".to_string()],
+                        store_mutations: crate::rename_key_migration::StoreMutationEffects::
+                            for_content_identity_index_stale(),
                         panicked: true,
                     }
                 });
@@ -28723,6 +28726,7 @@ impl App {
                         .rename_migration_in_flight
                         .take()
                         .expect("guarded above");
+                    self.apply_content_identity_store_mutations(report.store_mutations);
                     if report.panicked {
                         // panic = 残ストアを試行しないまま中断した可能性がある。per-store
                         // エラー (全ストア試行済み) と違って消し込まず、ジャーナルに残して
@@ -28801,6 +28805,10 @@ impl App {
                         .take()
                         .expect("guarded above");
                     crate::logger::log("[RENAME-MIG] worker disconnected".to_string());
+                    self.apply_content_identity_store_mutations(
+                        crate::rename_key_migration::StoreMutationEffects::
+                            for_content_identity_index_stale(),
+                    );
                     self.rename_migration_boot_retry
                         .push((job.old_path, job.new_path));
                     self.persist_rename_migration_journal();
@@ -28988,6 +28996,7 @@ impl App {
             match pending.rx.try_recv() {
                 Ok(report) => {
                     self.delete_purge_retry_pending = None;
+                    self.apply_content_identity_store_mutations(report.store_mutations);
                     crate::logger::log(format!(
                         "[delete-purge] retry done attempted={} purged={} rows={} remaining={} errors={}",
                         report.attempted,
@@ -29010,6 +29019,10 @@ impl App {
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.delete_purge_retry_pending = None;
+                    self.apply_content_identity_store_mutations(
+                        crate::rename_key_migration::StoreMutationEffects::
+                            for_content_identity_index_stale(),
+                    );
                     self.delete_purge_retry_needed = true;
                     self.delete_purge_retry_after =
                         Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
@@ -29094,6 +29107,7 @@ impl App {
         };
         let mut done = false;
         let mut canceled = false;
+        let mut store_mutations = crate::rename_key_migration::StoreMutationEffects::default();
         loop {
             match pending.rx.try_recv() {
                 Ok(crate::delete_worker::DeleteMsg::Batch {
@@ -29109,14 +29123,22 @@ impl App {
                         .extend(purged_pdf_password_paths);
                     pending.purge_deferred |= purge_deferred;
                 }
-                Ok(crate::delete_worker::DeleteMsg::Done { canceled: c }) => {
+                Ok(crate::delete_worker::DeleteMsg::Done {
+                    canceled: c,
+                    store_mutations: effects,
+                }) => {
                     done = true;
                     canceled = c;
+                    store_mutations.merge(effects);
                     break;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     done = true;
+                    store_mutations.merge(
+                        crate::rename_key_migration::StoreMutationEffects::
+                            for_content_identity_index_stale(),
+                    );
                     break;
                 }
             }
@@ -29127,6 +29149,7 @@ impl App {
         }
 
         let pending = self.delete_pending.take().expect("guarded above");
+        self.apply_content_identity_store_mutations(store_mutations);
         let succeeded = pending.succeeded;
         let purged_pdf_password_paths = pending.purged_pdf_password_paths;
         let failed_count = pending.failed.len();
