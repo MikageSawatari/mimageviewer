@@ -5,8 +5,14 @@ OS 側 (エクスプローラー等) でファイルを移動・コピーする�
 本機能は **ファイル内容のハッシュ**を identity として編集内容を再結合し、
 利用者に確認したうえで新しい場所へ複製する。
 
-- 状態: **Phase 1 + A4 実装済み** (A1 台帳と記録 / A2 検出 / A3a コピーエンジン /
-  A3b 確認 UI / A4 schema migration・folder-open backfill) (2026-08-22)
+- 状態: **Phase 1 実装済み・実機確認済み (2026-08-22)**。A1 台帳 / A2 検出 / A3a コピー / A3b 復元 UI に加え、実機で見つかった 5 件を修正済み
+- **未着手 (次にやること)**:
+  1. **A6 複数コピー元の選択 UI** — 正本 [briefs/edit-identity-a6-multi-source-choice.md](briefs/edit-identity-a6-multi-source-choice.md)。実機で 3 候補が全部 `last_edit_at = 0` で同点になり、
+     注釈を持つ原本が既定に選ばれなかった。backfill 由来の行は必ず 0 なので §5 の既定順は同点で機能しない
+  2. **アプリ内コピー / ページ移動の同じ穴** — `apply_book_page_edit_copies` も comic 行をコピー後に
+     共有後処理へ入るが、そこは `comic_docs` を失効しない。復元と同じ削除事故が起こり得る (A4 の調査で判明、未修正)
+  3. **注釈サムネイルの再起動後消失** — 復元経由の分は `edit_previews` のファイル所有修正で解消。
+     復元を通っていないファイルでも起きるかは未確認。`edit_preview_close:` の計装が理由を名指しする
 - 関連: [preset-and-adjustment.md §9](preset-and-adjustment.md) (フォルダ側サイドカー)、
   [src/rename_key_migration.rs](../src/rename_key_migration.rs) (アプリ内リネーム移行)、
   [src/metadata_transfer.rs](../src/metadata_transfer.rs) (明示的なメタ情報書き出し / 取り込み)
