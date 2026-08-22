@@ -3161,9 +3161,13 @@ impl AnimeUpscaleSourceLimit {
 #[serde(rename_all = "snake_case")]
 pub enum VideoScaleFilter {
     /// Keep the source-resolution swap chain and let DirectComposition scale it.
-    #[default]
     OsDefault,
     /// Resolve source pixels to the physical display rectangle with Lanczos3.
+    ///
+    /// The default since the reducing case was measured on hardware: a 4K video
+    /// in a smaller window moires under DirectComposition and does not here, at
+    /// a cost that dropped no frames.
+    #[default]
     Standard,
     /// NVIDIA Image Scaling while enlarging; Lanczos3 while reducing.
     Sharp,
@@ -8806,9 +8810,9 @@ mod tests {
     }
 
     #[test]
-    fn video_scale_filter_defaults_to_os_and_roundtrips_phase_a_choices() {
+    fn video_scale_filter_defaults_to_standard_and_roundtrips_phase_a_choices() {
         let settings = Settings::default();
-        assert_eq!(settings.video_scale_filter, VideoScaleFilter::OsDefault);
+        assert_eq!(settings.video_scale_filter, VideoScaleFilter::Standard);
         for (filter, serialized) in [
             (VideoScaleFilter::Standard, "standard"),
             (VideoScaleFilter::Sharp, "sharp"),

@@ -47,7 +47,7 @@ NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終�
 
 ### Native presenter の表示解像度 scaling
 
-`Settings::video_scale_filter` の既定 `OS に任せる` は、従来どおり source 解像度の video swap
+`Settings::video_scale_filter` の `OS に任せる` は、従来どおり source 解像度の video swap
 chain を DComp transform で拡大・縮小する。Phase A の 3 方式は映像表示矩形の物理 pixel 寸法で
 swap chain を持ち、SAR / orientation を含めて source から表示寸法へ resolve する。この場合の
 video visual transform は等倍 + 中央寄せだけになる。
