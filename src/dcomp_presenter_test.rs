@@ -151,6 +151,7 @@ pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
             ui_scale: 1.0,
             text_contrast: crate::settings::TextContrast::Standard,
             ui_font: crate::settings::UiFontSettings::default(),
+            scale_filter: crate::settings::VideoScaleFilter::OsDefault,
             health: crate::video::native_window_health::NativeWindowHealth::new_registered(),
             window_epoch: 0,
         })?;

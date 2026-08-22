@@ -7971,6 +7971,7 @@ impl App {
                 &self.settings.video_adjustments,
                 &self.settings.video_preset_slots,
             ),
+            self.settings.video_scale_filter,
             true, // audio_only (frameless present、Inc 6 ②-1)
         ) else {
             return;
@@ -8561,6 +8562,7 @@ impl App {
                     &self.settings.video_adjustments,
                     &self.settings.video_preset_slots,
                 ),
+                self.settings.video_scale_filter,
                 false,
             )
         });

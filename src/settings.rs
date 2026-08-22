@@ -3156,6 +3156,40 @@ impl AnimeUpscaleSourceLimit {
     }
 }
 
+/// Final scaling owner for native video presentation.
+///
+/// Step 1 intentionally exposes only the legacy DirectComposition path and the
+/// standard Lanczos3 path. The left-panel selector is added in Step 2; keeping
+/// this persisted now lets the renderer wiring and backward-compatible default
+/// land independently.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoScaleFilter {
+    /// Keep the source-resolution swap chain and let DirectComposition scale it.
+    #[default]
+    OsDefault,
+    /// Resolve source pixels to the physical display rectangle with Lanczos3.
+    Standard,
+}
+
+impl VideoScaleFilter {
+    pub const ALL_STEP1: [Self; 2] = [Self::OsDefault, Self::Standard];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::OsDefault => "OS に任せる",
+            Self::Standard => "標準",
+        }
+    }
+
+    pub const fn perf_name(self) -> &'static str {
+        match self {
+            Self::OsDefault => "os_default",
+            Self::Standard => "standard",
+        }
+    }
+}
+
 /// Carrier for post-filter variants that released builds cannot deserialize.
 ///
 /// Settings persistence writes only old variants into `AdjustParams::post_filter` and records
@@ -4332,6 +4366,10 @@ pub struct Settings {
     /// 入力色空間の変換ではなく、デコード後のプレビュー見た目だけを変更する。
     #[serde(default)]
     pub video_adjustments: crate::creative_lut::VideoAdjustments,
+    /// native presenter の動画拡大・縮小方法。Step 1 では UI をまだ公開せず、
+    /// renderer までの設定配線だけを先行させる。
+    #[serde(default)]
+    pub video_scale_filter: VideoScaleFilter,
     /// 全動画で共有する動画補正の保存スロット (10個)。
     #[serde(default)]
     pub video_preset_slots: crate::creative_lut::VideoPresetSlots,
@@ -5574,6 +5612,7 @@ impl Default for Settings {
             video_start_muted: false,
             video_muted: false,
             video_adjustments: crate::creative_lut::VideoAdjustments::default(),
+            video_scale_filter: VideoScaleFilter::default(),
             video_preset_slots: crate::creative_lut::VideoPresetSlots::default(),
             video_resume_positions: std::collections::HashMap::new(),
             video_grid_open_starts_from_beginning: false,
@@ -7415,6 +7454,7 @@ impl Settings {
         self.downscale_smoothing_percent = src.downscale_smoothing_percent;
         // ── 動画プレビュー補正 (native 動画左パネルでライブ編集) ──
         self.video_adjustments = src.video_adjustments.clone();
+        self.video_scale_filter = src.video_scale_filter;
         self.video_preset_slots = src.video_preset_slots.clone();
         // ── キャッシュ系 (環境設定に出ていない項目) ──
         self.cache_videos_always = src.cache_videos_always;
@@ -8744,6 +8784,23 @@ mod tests {
             ))
             .unwrap(),
             AnimeUpscaleSourceLimit::Unlimited
+        );
+    }
+
+    #[test]
+    fn video_scale_filter_defaults_to_os_and_roundtrips_standard() {
+        let settings = Settings::default();
+        assert_eq!(settings.video_scale_filter, VideoScaleFilter::OsDefault);
+        assert_eq!(
+            serde_json::to_value(VideoScaleFilter::Standard).unwrap(),
+            serde_json::Value::String("standard".to_owned())
+        );
+        assert_eq!(
+            serde_json::from_value::<VideoScaleFilter>(serde_json::Value::String(
+                "os_default".to_owned(),
+            ))
+            .unwrap(),
+            VideoScaleFilter::OsDefault
         );
     }
 

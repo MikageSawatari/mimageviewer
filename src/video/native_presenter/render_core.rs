@@ -35,7 +35,7 @@ use windows::Win32::System::Threading::WaitForSingleObject;
 use windows::core::Interface;
 use windows_numerics::Matrix3x2;
 
-use crate::settings::FsSidePanelMode;
+use crate::settings::{FsSidePanelMode, VideoScaleFilter};
 use crate::ui_helpers::HoverTipExt;
 use crate::video::decoder::{VideoFrame, VideoFrameData};
 use crate::video::display_metadata::VideoOrientation;
@@ -54,6 +54,15 @@ use super::overlay_draw::*;
 #[path = "grade_pipeline.rs"]
 mod grade_pipeline;
 use self::grade_pipeline::VideoGradePipeline;
+#[path = "resample_pipeline.rs"]
+mod resample_pipeline;
+use self::resample_pipeline::VideoResamplePipeline;
+#[path = "surface_policy.rs"]
+mod surface_policy;
+use self::surface_policy::{
+    VideoScaleFallbackReason, VideoSurfaceSizeDecision, VideoSurfaceSizeInput,
+    decide_video_surface_size,
+};
 
 /// `shared_texture_cache` (presenter 側 `OpenSharedResource1` キャッシュ) の上限。
 ///
@@ -68,6 +77,10 @@ const SEEK_STATUS_DELAY: Duration = Duration::from_millis(150);
 const SEEK_STATUS_MIN_VISIBLE: Duration = Duration::from_millis(300);
 const LIMITER_INDICATOR_VISIBLE: Duration = Duration::from_millis(500);
 const TEXT_INPUT_FOCUS_CLAIM_MIN_INTERVAL: Duration = Duration::from_millis(500);
+/// A geometry stream is considered settled after this long without a newer
+/// `GeometryChanged` sample. Windows has no single reliable end edge across
+/// interactive, child, maximize, and programmatic resize routes.
+const VIDEO_RESIZE_SETTLE_INTERVAL: Duration = Duration::from_millis(150);
 
 /// 動画 HUD 2 段化リデザイン (Phase 3): 下 HUD を **シーク行 (上段) + コントロール行 (下段)**
 /// の 2 段に分割する。
@@ -135,6 +148,8 @@ pub struct NativeRenderConfig {
     pub text_contrast: crate::settings::TextContrast,
     /// main UI と同じフォント指定と縦位置補正。
     pub ui_font: crate::settings::UiFontSettings,
+    /// Startup-selected video scaling owner. Step 1 has no runtime UI switch.
+    pub scale_filter: VideoScaleFilter,
     pub(crate) health: Arc<crate::video::native_window_health::NativeWindowHealth>,
     pub(crate) window_epoch: u64,
 }
@@ -187,7 +202,15 @@ pub struct NativeRenderCore {
     shared_texture_cache: Vec<((u64, u64), ID3D11Texture2D)>,
     cpu_upload_scratch: Vec<u8>,
     video_grade: crate::creative_lut::VideoGradeSnapshot,
-    grade_pipeline: Option<VideoGradePipeline>,
+    grade_pipeline: VideoGradePipeline,
+    resample_pipeline: Option<VideoResamplePipeline>,
+    resample_pipeline_error: Option<String>,
+    selected_scale_filter: VideoScaleFilter,
+    surface_content: VideoSurfaceContent,
+    resize_settle: VideoResizeSettleState,
+    active_scale_fallback: Option<ActiveVideoScaleFallback>,
+    scale_fallback_count: u64,
+    surface_swap_count: u64,
     pixel_probe_enabled: bool,
     pixel_probe_strict: bool,
     last_pixel_probe: Option<Instant>,
@@ -218,6 +241,78 @@ struct RetiredVideoSurface {
     _swap_chain: IDXGISwapChain1,
     waitable: HANDLE,
     _backbuffer: Option<ID3D11Texture2D>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VideoSurfaceContent {
+    LegacySource,
+    DisplayResolved,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum VideoResizeSettleState {
+    Settled,
+    Waiting { last_geometry_change: Instant },
+}
+
+impl VideoResizeSettleState {
+    fn is_resizing(self, now: Instant) -> bool {
+        matches!(
+            self,
+            Self::Waiting {
+                last_geometry_change
+            } if now.saturating_duration_since(last_geometry_change) < VIDEO_RESIZE_SETTLE_INTERVAL
+        )
+    }
+
+    fn refresh_due(self, now: Instant) -> bool {
+        matches!(
+            self,
+            Self::Waiting {
+                last_geometry_change
+            } if now.saturating_duration_since(last_geometry_change) >= VIDEO_RESIZE_SETTLE_INTERVAL
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DisplaySurfaceRequestKey {
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+    sar_num: u32,
+    sar_den: u32,
+    orientation: VideoOrientation,
+    grade_active: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveVideoScaleFallback {
+    key: DisplaySurfaceRequestKey,
+    reason: VideoScaleFallbackReason,
+}
+
+enum VideoSurfaceSwapError {
+    DisplayCreation(VideoScaleFallbackReason),
+    Other(String),
+}
+
+impl From<String> for VideoSurfaceSwapError {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl VideoSurfaceSwapError {
+    fn into_string(self) -> String {
+        match self {
+            Self::DisplayCreation(reason) => {
+                format!("display surface creation failed: {}", reason.detail())
+            }
+            Self::Other(error) => error,
+        }
+    }
 }
 
 impl Drop for RetiredVideoSurface {
@@ -1598,6 +1693,20 @@ impl NativeRenderCore {
             let d3d_context1: ID3D11DeviceContext1 = d3d_context
                 .cast()
                 .map_err(|e| format!("cast ID3D11DeviceContext1: {e:?}"))?;
+            // Compile every Step 1 shader while the render pipeline is created.
+            // A later filter selection never invokes D3DCompile.
+            let grade_pipeline = VideoGradePipeline::new(&d3d_device1)?;
+            let (resample_pipeline, resample_pipeline_error) = match VideoResamplePipeline::new(
+                &d3d_device1,
+            ) {
+                Ok(pipeline) => (Some(pipeline), None),
+                Err(error) => {
+                    crate::logger::log(format!(
+                        "native-presenter: standard video resample pipeline unavailable: {error}"
+                    ));
+                    (None, Some(error))
+                }
+            };
             let dxgi_device: IDXGIDevice = d3d_device
                 .cast()
                 .map_err(|e| format!("cast IDXGIDevice: {e:?}"))?;
@@ -1941,7 +2050,15 @@ impl NativeRenderCore {
                 shared_texture_cache: Vec::new(),
                 cpu_upload_scratch: Vec::new(),
                 video_grade: crate::creative_lut::VideoGradeSnapshot::default(),
-                grade_pipeline: None,
+                grade_pipeline,
+                resample_pipeline,
+                resample_pipeline_error,
+                selected_scale_filter: config.scale_filter,
+                surface_content: VideoSurfaceContent::LegacySource,
+                resize_settle: VideoResizeSettleState::Settled,
+                active_scale_fallback: None,
+                scale_fallback_count: 0,
+                surface_swap_count: 0,
                 pixel_probe_enabled: std::env::var_os("MIV_NATIVE_VIDEO_PIXEL_PROBE").is_some(),
                 pixel_probe_strict: std::env::var_os("MIV_NATIVE_VIDEO_PIXEL_PROBE_STRICT")
                     .is_some(),
@@ -1968,6 +2085,19 @@ impl NativeRenderCore {
                     ("latency", Value::from(1)),
                     ("test_overlay", Value::from(config.test_overlay)),
                     ("egui_overlay", Value::from(config.egui_overlay)),
+                    ("scale_filter", Value::from(config.scale_filter.perf_name())),
+                ],
+            );
+            crate::logger::log(format!(
+                "native-presenter: video scale filter selected={} ({})",
+                config.scale_filter.perf_name(),
+                config.scale_filter.label()
+            ));
+            log_event(
+                "video_scale_filter_selected",
+                &[
+                    ("scale_filter", Value::from(config.scale_filter.perf_name())),
+                    ("label", Value::from(config.scale_filter.label())),
                 ],
             );
             Ok((this, active_topology, startup_window_intents))
@@ -2032,6 +2162,13 @@ impl NativeRenderCore {
         // 全 inner resize 成功で初めて self.width/height を進める。
         self.width = width;
         self.height = height;
+        self.resize_settle = if self.selected_scale_filter == VideoScaleFilter::Standard {
+            VideoResizeSettleState::Waiting {
+                last_geometry_change: Instant::now(),
+            }
+        } else {
+            VideoResizeSettleState::Settled
+        };
         log_event(
             "resize",
             &[
@@ -2042,6 +2179,20 @@ impl NativeRenderCore {
             ],
         );
         Ok(window_intents)
+    }
+
+    /// True once the latest geometry event has remained unchanged for the
+    /// settle interval. The render loop uses this only to re-present the held
+    /// visible frame while paused; active playback naturally consumes it on the
+    /// next decoded frame.
+    pub(crate) fn take_settled_resize_refresh_due(&mut self, now: Instant) -> bool {
+        if !self.resize_settle.refresh_due(now) {
+            return false;
+        }
+        // Consume the edge before performing GPU work. A failure is logged by
+        // the caller and is not converted into an unbounded retry loop.
+        self.resize_settle = VideoResizeSettleState::Settled;
+        true
     }
 
     pub fn set_video_compact(&mut self, compact: bool) -> Result<(), String> {
@@ -2092,26 +2243,279 @@ impl NativeRenderCore {
         frame: &VideoFrame,
         sync_interval: u32,
     ) -> Result<NativePresentOutcome, String> {
-        let new_w = frame.width.max(1);
-        let new_h = frame.height.max(1);
+        let source_width = frame.width.max(1);
+        let source_height = frame.height.max(1);
         let new_sar_num = frame.sar_num.max(1);
         let new_sar_den = frame.sar_den.max(1);
         let new_orientation = frame.orientation;
-        let size_changed = self.surface_width != new_w || self.surface_height != new_h;
+        let now = Instant::now();
+        let grade_active = !self.video_grade.adjustments.is_identity();
+        let decision = decide_video_surface_size(VideoSurfaceSizeInput {
+            filter: self.selected_scale_filter,
+            source_width,
+            source_height,
+            sar_num: new_sar_num,
+            sar_den: new_sar_den,
+            orientation: new_orientation,
+            viewport_width: self.width,
+            viewport_height: self.height,
+            compact: self.video_compact,
+            resizing: self.resize_settle.is_resizing(now),
+            current_surface_width: self.surface_width,
+            current_surface_height: self.surface_height,
+            current_surface_is_display_resolved: matches!(
+                self.surface_content,
+                VideoSurfaceContent::DisplayResolved
+            ),
+        });
+        let kept_current_during_resize = matches!(
+            &decision,
+            VideoSurfaceSizeDecision::KeepCurrentDuringResize { .. }
+        );
 
-        if size_changed {
-            // 解像度変更: 新 swap chain を別途用意して原子的に差し替える。
+        let result = match decision {
+            VideoSurfaceSizeDecision::KeepCurrentDuringResize { .. } => {
+                let current_width = self.surface_width;
+                let current_height = self.surface_height;
+                let current_content = self.surface_content;
+                if matches!(current_content, VideoSurfaceContent::DisplayResolved) {
+                    let key = DisplaySurfaceRequestKey {
+                        source_width,
+                        source_height,
+                        target_width: current_width,
+                        target_height: current_height,
+                        sar_num: new_sar_num,
+                        sar_den: new_sar_den,
+                        orientation: new_orientation,
+                        grade_active,
+                    };
+                    if let Err(reason) = self.prepare_display_resources(
+                        source_width,
+                        source_height,
+                        current_width,
+                        new_orientation,
+                        grade_active,
+                    ) {
+                        self.record_scale_fallback(key, reason);
+                        self.present_for_surface(
+                            frame,
+                            sync_interval,
+                            source_width,
+                            source_height,
+                            VideoSurfaceContent::LegacySource,
+                            new_sar_num,
+                            new_sar_den,
+                            new_orientation,
+                        )
+                    } else {
+                        self.present_for_surface(
+                            frame,
+                            sync_interval,
+                            current_width,
+                            current_height,
+                            current_content,
+                            new_sar_num,
+                            new_sar_den,
+                            new_orientation,
+                        )
+                    }
+                } else {
+                    self.present_for_surface(
+                        frame,
+                        sync_interval,
+                        current_width,
+                        current_height,
+                        current_content,
+                        new_sar_num,
+                        new_sar_den,
+                        new_orientation,
+                    )
+                }
+            }
+            VideoSurfaceSizeDecision::LegacySource { width, height } => {
+                self.active_scale_fallback = None;
+                self.present_for_surface(
+                    frame,
+                    sync_interval,
+                    width,
+                    height,
+                    VideoSurfaceContent::LegacySource,
+                    new_sar_num,
+                    new_sar_den,
+                    new_orientation,
+                )
+            }
+            VideoSurfaceSizeDecision::FallbackToLegacy {
+                width,
+                height,
+                reason,
+            } => {
+                let (target_width, target_height) = match &reason {
+                    VideoScaleFallbackReason::DisplaySizeLimitExceeded {
+                        requested_width,
+                        requested_height,
+                        ..
+                    } => (*requested_width, *requested_height),
+                    _ => (width, height),
+                };
+                let key = DisplaySurfaceRequestKey {
+                    source_width,
+                    source_height,
+                    target_width,
+                    target_height,
+                    sar_num: new_sar_num,
+                    sar_den: new_sar_den,
+                    orientation: new_orientation,
+                    grade_active,
+                };
+                self.record_scale_fallback(key, reason);
+                self.present_for_surface(
+                    frame,
+                    sync_interval,
+                    width,
+                    height,
+                    VideoSurfaceContent::LegacySource,
+                    new_sar_num,
+                    new_sar_den,
+                    new_orientation,
+                )
+            }
+            VideoSurfaceSizeDecision::DisplayResolution { width, height } => {
+                let key = DisplaySurfaceRequestKey {
+                    source_width,
+                    source_height,
+                    target_width: width,
+                    target_height: height,
+                    sar_num: new_sar_num,
+                    sar_den: new_sar_den,
+                    orientation: new_orientation,
+                    grade_active,
+                };
+                if self
+                    .active_scale_fallback
+                    .as_ref()
+                    .is_some_and(|fallback| fallback.key == key)
+                {
+                    self.present_for_surface(
+                        frame,
+                        sync_interval,
+                        source_width,
+                        source_height,
+                        VideoSurfaceContent::LegacySource,
+                        new_sar_num,
+                        new_sar_den,
+                        new_orientation,
+                    )
+                } else if let Err(reason) = self.prepare_display_resources(
+                    source_width,
+                    source_height,
+                    width,
+                    new_orientation,
+                    grade_active,
+                ) {
+                    self.record_scale_fallback(key, reason);
+                    self.present_for_surface(
+                        frame,
+                        sync_interval,
+                        source_width,
+                        source_height,
+                        VideoSurfaceContent::LegacySource,
+                        new_sar_num,
+                        new_sar_den,
+                        new_orientation,
+                    )
+                } else {
+                    let display_result = self.present_for_surface_typed(
+                        frame,
+                        sync_interval,
+                        width,
+                        height,
+                        VideoSurfaceContent::DisplayResolved,
+                        new_sar_num,
+                        new_sar_den,
+                        new_orientation,
+                    );
+                    match display_result {
+                        Ok(outcome) => {
+                            self.active_scale_fallback = None;
+                            Ok(outcome)
+                        }
+                        Err(VideoSurfaceSwapError::DisplayCreation(reason)) => {
+                            self.record_scale_fallback(key, reason);
+                            self.present_for_surface(
+                                frame,
+                                sync_interval,
+                                source_width,
+                                source_height,
+                                VideoSurfaceContent::LegacySource,
+                                new_sar_num,
+                                new_sar_den,
+                                new_orientation,
+                            )
+                        }
+                        Err(VideoSurfaceSwapError::Other(error)) => Err(error),
+                    }
+                }
+            }
+        };
+        if result.is_ok() && !kept_current_during_resize {
+            self.resize_settle = VideoResizeSettleState::Settled;
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn present_for_surface(
+        &mut self,
+        frame: &VideoFrame,
+        sync_interval: u32,
+        width: u32,
+        height: u32,
+        content: VideoSurfaceContent,
+        new_sar_num: u32,
+        new_sar_den: u32,
+        new_orientation: VideoOrientation,
+    ) -> Result<NativePresentOutcome, String> {
+        self.present_for_surface_typed(
+            frame,
+            sync_interval,
+            width,
+            height,
+            content,
+            new_sar_num,
+            new_sar_den,
+            new_orientation,
+        )
+        .map_err(VideoSurfaceSwapError::into_string)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn present_for_surface_typed(
+        &mut self,
+        frame: &VideoFrame,
+        sync_interval: u32,
+        width: u32,
+        height: u32,
+        content: VideoSurfaceContent,
+        new_sar_num: u32,
+        new_sar_den: u32,
+        new_orientation: VideoOrientation,
+    ) -> Result<NativePresentOutcome, VideoSurfaceSwapError> {
+        let surface_changed = self.surface_width != width
+            || self.surface_height != height
+            || self.surface_content != content;
+        if surface_changed {
             self.present_with_surface_swap(
                 frame,
                 sync_interval,
-                new_w,
-                new_h,
+                width,
+                height,
+                content,
                 new_sar_num,
                 new_sar_den,
                 new_orientation,
             )
         } else {
-            // 解像度は不変。既存 swap chain をそのまま再利用する。
             self.present_reusing_surface(
                 frame,
                 sync_interval,
@@ -2119,7 +2523,102 @@ impl NativeRenderCore {
                 new_sar_den,
                 new_orientation,
             )
+            .map_err(VideoSurfaceSwapError::Other)
         }
+    }
+
+    fn prepare_display_resources(
+        &mut self,
+        source_width: u32,
+        source_height: u32,
+        target_width: u32,
+        orientation: VideoOrientation,
+        grade_active: bool,
+    ) -> Result<(), VideoScaleFallbackReason> {
+        let Some(pipeline) = self.resample_pipeline.as_mut() else {
+            return Err(VideoScaleFallbackReason::ResamplePipelineUnavailable {
+                error: self
+                    .resample_pipeline_error
+                    .clone()
+                    .unwrap_or_else(|| "pipeline was not created".to_string()),
+            });
+        };
+        let (intermediate_width, intermediate_height) =
+            VideoResamplePipeline::intermediate_dimensions(
+                source_width,
+                source_height,
+                target_width,
+                orientation,
+            );
+        pipeline
+            .prepare(
+                &self.d3d_device1,
+                source_width,
+                source_height,
+                target_width,
+                orientation,
+            )
+            .map_err(
+                |error| VideoScaleFallbackReason::ResampleIntermediateCreationFailed {
+                    width: intermediate_width,
+                    height: intermediate_height,
+                    error,
+                },
+            )?;
+        if grade_active {
+            self.grade_pipeline
+                .prepare_intermediate(&self.d3d_device1, source_width, source_height)
+                .map_err(
+                    |error| VideoScaleFallbackReason::GradeIntermediateCreationFailed {
+                        width: source_width,
+                        height: source_height,
+                        error,
+                    },
+                )?;
+        }
+        Ok(())
+    }
+
+    fn record_scale_fallback(
+        &mut self,
+        key: DisplaySurfaceRequestKey,
+        reason: VideoScaleFallbackReason,
+    ) {
+        if self
+            .active_scale_fallback
+            .as_ref()
+            .is_some_and(|active| active.key == key && active.reason == reason)
+        {
+            return;
+        }
+        self.scale_fallback_count = self.scale_fallback_count.saturating_add(1);
+        crate::logger::log(format!(
+            "native-presenter: video scale fallback filter={} reason={} count={} {}",
+            self.selected_scale_filter.perf_name(),
+            reason.code(),
+            self.scale_fallback_count,
+            reason.detail()
+        ));
+        log_event(
+            "video_scale_fallback",
+            &[
+                (
+                    "scale_filter",
+                    Value::from(self.selected_scale_filter.perf_name()),
+                ),
+                ("reason", Value::from(reason.code())),
+                ("reason_detail", Value::from(reason.detail())),
+                (
+                    "fallback_count",
+                    Value::from(self.scale_fallback_count as i64),
+                ),
+                ("source_width", Value::from(key.source_width as i64)),
+                ("source_height", Value::from(key.source_height as i64)),
+                ("target_width", Value::from(key.target_width as i64)),
+                ("target_height", Value::from(key.target_height as i64)),
+            ],
+        );
+        self.active_scale_fallback = Some(ActiveVideoScaleFallback { key, reason });
     }
 
     /// 解像度不変時の present。既存の `swap_chain` / `backbuffer` をそのまま使う。
@@ -2155,7 +2654,13 @@ impl NativeRenderCore {
             .backbuffer
             .clone()
             .ok_or_else(|| "native presenter backbuffer is not initialized".to_string())?;
-        let copy = self.copy_frame_into_backbuffer(frame, &backbuffer)?;
+        let copy = self.copy_frame_into_backbuffer(
+            frame,
+            &backbuffer,
+            self.surface_content,
+            self.surface_width,
+            self.surface_height,
+        )?;
         let copy_ms = copy_t0.elapsed().as_secs_f64() * 1000.0;
 
         let present_t0 = Instant::now();
@@ -2211,13 +2716,28 @@ impl NativeRenderCore {
         sync_interval: u32,
         new_w: u32,
         new_h: u32,
+        new_content: VideoSurfaceContent,
         new_sar_num: u32,
         new_sar_den: u32,
         new_orientation: VideoOrientation,
-    ) -> Result<NativePresentOutcome, String> {
+    ) -> Result<NativePresentOutcome, VideoSurfaceSwapError> {
         let geom_t0 = Instant::now();
         // 1. 新 swap chain + backbuffer を用意する。ここでは visual には繋がない。
-        let (new_swap_chain, new_waitable) = self.create_video_swap_chain(new_w, new_h)?;
+        let (new_swap_chain, new_waitable) =
+            self.create_video_swap_chain(new_w, new_h)
+                .map_err(|error| {
+                    if new_content == VideoSurfaceContent::DisplayResolved {
+                        VideoSurfaceSwapError::DisplayCreation(
+                            VideoScaleFallbackReason::DisplaySwapChainCreationFailed {
+                                width: new_w,
+                                height: new_h,
+                                error,
+                            },
+                        )
+                    } else {
+                        VideoSurfaceSwapError::Other(error)
+                    }
+                })?;
         // new_waitable は windows-rs HANDLE (Copy / Drop なし)。下の複数の `?` 早期
         // return で取り落とすと frame-latency waitable HANDLE が leak する (アダプタ
         // メモリ圧迫下の fast-swap で Present/Commit が一時失敗すると 1 個ずつ蓄積)。
@@ -2234,11 +2754,26 @@ impl NativeRenderCore {
             }
         }
         let mut new_waitable_guard = WaitableGuard(new_waitable);
-        let new_backbuffer = self.create_swap_chain_backbuffer(&new_swap_chain)?;
+        let new_backbuffer =
+            self.create_swap_chain_backbuffer(&new_swap_chain)
+                .map_err(|error| {
+                    if new_content == VideoSurfaceContent::DisplayResolved {
+                        VideoSurfaceSwapError::DisplayCreation(
+                            VideoScaleFallbackReason::DisplayBackbufferCreationFailed {
+                                width: new_w,
+                                height: new_h,
+                                error,
+                            },
+                        )
+                    } else {
+                        VideoSurfaceSwapError::Other(error)
+                    }
+                })?;
 
         // 2. 最初のフレームを新 backbuffer へコピーする。
         let copy_t0 = Instant::now();
-        let copy = self.copy_frame_into_backbuffer(frame, &new_backbuffer)?;
+        let copy =
+            self.copy_frame_into_backbuffer(frame, &new_backbuffer, new_content, new_w, new_h)?;
         let copy_ms = copy_t0.elapsed().as_secs_f64() * 1000.0;
 
         // 3. 新 swap chain を Present (= 新 swap chain は「正しいフレーム投入済み」状態)。
@@ -2263,14 +2798,16 @@ impl NativeRenderCore {
         //    「`surface_*` だけ新サイズに進み swap_chain は旧のまま」という不整合に陥り、
         //    次回以降の `present` が `present_reusing_surface` 経路へ誤って入って固着する
         //    (Codex P2)。`self.*` の更新は Commit 成功後 (手順 6) に一括で行う。
+        let (transform_sar_num, transform_sar_den, transform_orientation) =
+            transform_geometry_for_surface(new_content, new_sar_num, new_sar_den, new_orientation);
         let (m11, m12, m21, m22, offset_x, offset_y) = compute_video_visual_transform(
             new_w,
             new_h,
             self.width,
             self.height,
-            new_sar_num,
-            new_sar_den,
-            new_orientation,
+            transform_sar_num,
+            transform_sar_den,
+            transform_orientation,
             self.video_compact,
         );
         let transform = Matrix3x2 {
@@ -2306,6 +2843,8 @@ impl NativeRenderCore {
         self.orientation = new_orientation;
         self.surface_width = new_w;
         self.surface_height = new_h;
+        self.surface_content = new_content;
+        self.surface_swap_count = self.surface_swap_count.saturating_add(1);
         let old_swap_chain = std::mem::replace(&mut self.swap_chain, new_swap_chain);
         // guard を disarm して waitable の所有権を self.waitable へ移す (= guard の Drop は
         // 以後 no-op になり、二重 CloseHandle を防ぐ)。
@@ -2323,15 +2862,30 @@ impl NativeRenderCore {
 
         let geom_ms = geom_t0.elapsed().as_secs_f64() * 1000.0;
         crate::logger::log(format!(
-            "native-presenter: video surface swapped to {new_w}x{new_h} sar={}/{} \
-             orientation={:?} geom_ms={geom_ms:.2} commit_sync_ms={commit_sync_ms:.2}",
-            self.sar_num, self.sar_den, self.orientation
+            "native-presenter: video surface swapped to {new_w}x{new_h} content={new_content:?} \
+             sar={}/{} orientation={:?} count={} geom_ms={geom_ms:.2} commit_sync_ms={commit_sync_ms:.2}",
+            self.sar_num, self.sar_den, self.orientation, self.surface_swap_count
         ));
         log_event(
             "video_surface_swap",
             &[
                 ("surface_width", Value::from(new_w as i64)),
                 ("surface_height", Value::from(new_h as i64)),
+                (
+                    "surface_content",
+                    Value::from(match new_content {
+                        VideoSurfaceContent::LegacySource => "legacy_source",
+                        VideoSurfaceContent::DisplayResolved => "display_resolved",
+                    }),
+                ),
+                (
+                    "scale_filter",
+                    Value::from(self.selected_scale_filter.perf_name()),
+                ),
+                (
+                    "surface_swap_count",
+                    Value::from(self.surface_swap_count as i64),
+                ),
                 ("sar_num", Value::from(self.sar_num as i64)),
                 ("sar_den", Value::from(self.sar_den as i64)),
                 (
@@ -2347,6 +2901,8 @@ impl NativeRenderCore {
                 ),
             ],
         );
+        let (grade_intermediate_bytes, resample_intermediate_bytes) =
+            self.intermediate_vram_bytes();
         crate::gpu_info::emit_vram_trace(
             "video_surface_swap",
             "after_video_swap_chain_replace",
@@ -2360,6 +2916,14 @@ impl NativeRenderCore {
                 (
                     "shared_texture_cache_len",
                     Value::from(self.shared_texture_cache.len() as i64),
+                ),
+                (
+                    "grade_intermediate_bytes",
+                    Value::from(grade_intermediate_bytes),
+                ),
+                (
+                    "resample_intermediate_bytes",
+                    Value::from(resample_intermediate_bytes),
                 ),
             ],
         );
@@ -2463,6 +3027,9 @@ impl NativeRenderCore {
         &mut self,
         frame: &VideoFrame,
         backbuffer: &ID3D11Texture2D,
+        surface_content: VideoSurfaceContent,
+        target_width: u32,
+        target_height: u32,
     ) -> Result<FrameCopyMetrics, String> {
         let mut metrics = FrameCopyMetrics {
             path: "",
@@ -2479,9 +3046,10 @@ impl NativeRenderCore {
             copy_fence_value: 0,
         };
         let grade_active = !self.video_grade.adjustments.is_identity();
+        let resample_active = surface_content == VideoSurfaceContent::DisplayResolved;
         match &frame.data {
             VideoFrameData::Cpu(bytes) => {
-                let probe_this_frame = !grade_active && self.pixel_probe_due();
+                let probe_this_frame = !grade_active && !resample_active && self.pixel_probe_due();
                 let src_probe = if probe_this_frame {
                     Some(sample_cpu_rgba_pixel(
                         bytes,
@@ -2500,18 +3068,48 @@ impl NativeRenderCore {
                 )?;
                 unsafe {
                     let copy_call_t0 = Instant::now();
-                    if grade_active {
-                        let pipeline = self.grade_pipeline.as_mut().ok_or_else(|| {
-                            "video grade is active but shader pipeline is missing".to_string()
-                        })?;
-                        let source = pipeline.upload_cpu_source(
+                    if resample_active {
+                        let source = self.grade_pipeline.upload_cpu_source(
                             &self.d3d_device1,
                             &self.d3d_context,
                             &self.cpu_upload_scratch,
                             frame.width,
                             frame.height,
                         )?;
-                        pipeline.draw(
+                        let source = if grade_active {
+                            self.grade_pipeline.draw_to_intermediate(
+                                &self.d3d_device1,
+                                &self.d3d_context,
+                                &source,
+                                frame.width,
+                                frame.height,
+                            )?
+                        } else {
+                            source
+                        };
+                        self.resample_pipeline
+                            .as_ref()
+                            .ok_or_else(|| "video resample pipeline is missing".to_string())?
+                            .draw(
+                                &self.d3d_device1,
+                                &self.d3d_context,
+                                &source,
+                                backbuffer,
+                                frame.width,
+                                frame.height,
+                                target_width,
+                                target_height,
+                                frame.orientation,
+                            )?;
+                    } else if grade_active {
+                        let source = self.grade_pipeline.upload_cpu_source(
+                            &self.d3d_device1,
+                            &self.d3d_context,
+                            &self.cpu_upload_scratch,
+                            frame.width,
+                            frame.height,
+                        )?;
+                        self.grade_pipeline.draw(
                             &self.d3d_device1,
                             &self.d3d_context,
                             &source,
@@ -2550,7 +3148,11 @@ impl NativeRenderCore {
                         }
                     }
                 }
-                metrics.path = if grade_active {
+                metrics.path = if resample_active && grade_active {
+                    "cpu_upload_grade_resample_lanczos3"
+                } else if resample_active {
+                    "cpu_upload_resample_lanczos3"
+                } else if grade_active {
                     "cpu_upload_grade"
                 } else {
                     "cpu_upload"
@@ -2566,7 +3168,7 @@ impl NativeRenderCore {
                 metrics.shared_handle = gpu_frame.shared_handle.0 as usize as u64;
                 metrics.shared_texture_gen = gpu_frame.shared_texture_gen;
                 metrics.fence_value = gpu_frame.fence_value;
-                let probe_this_frame = !grade_active && self.pixel_probe_due();
+                let probe_this_frame = !grade_active && !resample_active && self.pixel_probe_due();
                 let fence = self.open_fence(gpu_frame.fence_gen, gpu_frame.fence_shared_handle)?;
                 let fence_t0 = Instant::now();
                 {
@@ -2602,11 +3204,34 @@ impl NativeRenderCore {
                 };
                 unsafe {
                     let copy_call_t0 = Instant::now();
-                    if grade_active {
-                        let pipeline = self.grade_pipeline.as_ref().ok_or_else(|| {
-                            "video grade is active but shader pipeline is missing".to_string()
-                        })?;
-                        pipeline.draw(
+                    if resample_active {
+                        let source = if grade_active {
+                            self.grade_pipeline.draw_to_intermediate(
+                                &self.d3d_device1,
+                                &self.d3d_context,
+                                &src,
+                                frame.width,
+                                frame.height,
+                            )?
+                        } else {
+                            src.clone()
+                        };
+                        self.resample_pipeline
+                            .as_ref()
+                            .ok_or_else(|| "video resample pipeline is missing".to_string())?
+                            .draw(
+                                &self.d3d_device1,
+                                &self.d3d_context,
+                                &source,
+                                backbuffer,
+                                frame.width,
+                                frame.height,
+                                target_width,
+                                target_height,
+                                frame.orientation,
+                            )?;
+                    } else if grade_active {
+                        self.grade_pipeline.draw(
                             &self.d3d_device1,
                             &self.d3d_context,
                             &src,
@@ -2661,7 +3286,11 @@ impl NativeRenderCore {
                         }
                     }
                 }
-                metrics.path = if grade_active {
+                metrics.path = if resample_active && grade_active {
+                    "d3d11_shared_grade_resample_lanczos3"
+                } else if resample_active {
+                    "d3d11_shared_resample_lanczos3"
+                } else if grade_active {
                     "d3d11_shared_grade"
                 } else {
                     "d3d11_shared"
@@ -2734,6 +3363,16 @@ impl NativeRenderCore {
 
     pub fn surface_size(&self) -> (u32, u32) {
         (self.surface_width, self.surface_height)
+    }
+
+    pub fn intermediate_vram_bytes(&self) -> (u64, u64) {
+        (
+            self.grade_pipeline.intermediate_vram_bytes(),
+            self.resample_pipeline
+                .as_ref()
+                .map(VideoResamplePipeline::intermediate_vram_bytes)
+                .unwrap_or(0),
+        )
     }
 
     /// HUD HWND の `WM_DPICHANGED` を受けて overlay の OS ppp を更新する。
@@ -3087,21 +3726,12 @@ impl NativeRenderCore {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.set_video_grade(&grade);
         }
-        if grade.adjustments.is_identity() {
-            self.video_grade = grade;
-            if let Some(pipeline) = self.grade_pipeline.as_mut() {
-                pipeline.update_grade(&self.d3d_device1, &self.d3d_context, &self.video_grade)?;
-            }
-            return Ok(());
-        }
-        if self.grade_pipeline.is_none() {
-            self.grade_pipeline = Some(VideoGradePipeline::new(&self.d3d_device1)?);
-        }
         self.video_grade = grade;
-        self.grade_pipeline
-            .as_mut()
-            .expect("created above")
-            .update_grade(&self.d3d_device1, &self.d3d_context, &self.video_grade)?;
+        self.grade_pipeline.update_grade(
+            &self.d3d_device1,
+            &self.d3d_context,
+            &self.video_grade,
+        )?;
         Ok(())
     }
 
@@ -3431,14 +4061,20 @@ impl NativeRenderCore {
     /// 前の値)。stale なサイズで transform を計算すると最大化/復元/ドラッグの追従が
     /// 1 ステップ遅れる (2026-05 修正)。
     fn update_video_visual_transform(&self, win_w: u32, win_h: u32) -> Result<(), String> {
+        let (sar_num, sar_den, orientation) = transform_geometry_for_surface(
+            self.surface_content,
+            self.sar_num,
+            self.sar_den,
+            self.orientation,
+        );
         let (m11, m12, m21, m22, offset_x, offset_y) = compute_video_visual_transform(
             self.surface_width,
             self.surface_height,
             win_w,
             win_h,
-            self.sar_num,
-            self.sar_den,
-            self.orientation,
+            sar_num,
+            sar_den,
+            orientation,
             self.video_compact,
         );
         let transform = Matrix3x2 {
@@ -8574,9 +9210,25 @@ fn log_event(kind: &str, fields: &[(&str, Value)]) {
     crate::perf::event("native_presenter", kind, None, 0, fields);
 }
 
+fn transform_geometry_for_surface(
+    content: VideoSurfaceContent,
+    sar_num: u32,
+    sar_den: u32,
+    orientation: VideoOrientation,
+) -> (u32, u32, VideoOrientation) {
+    match content {
+        VideoSurfaceContent::LegacySource => (sar_num, sar_den, orientation),
+        // The resample output already materializes SAR and orientation into the
+        // physical display rectangle. Reapplying either in DComp would distort
+        // or rotate the resolved pixels a second time.
+        VideoSurfaceContent::DisplayResolved => (1, 1, VideoOrientation::IDENTITY),
+    }
+}
+
 /// 動画 visual の DirectComposition transform 行列を SAR + display matrix 込みで計算する。
 ///
-/// `surface_w/h` は decoded frame の raw pixel サイズ (= swap chain backbuffer)。
+/// `surface_w/h` は現在の swap chain backbuffer サイズ。source-resolution surface なら
+/// decoded frame の raw pixel サイズ、display-resolution surface なら表示矩形の物理 px。
 /// `win_w/h` はウィンドウサイズ。SAR は raw X 軸へ、orientation はその後の表示軸へ
 /// 適用する。`compact` は VST3 panel 表示時の 1/4 領域モード。
 ///
@@ -9495,6 +10147,28 @@ mod tests {
         assert!((m11 - 2.0).abs() < 1e-6, "1920->3840 should be 2x");
         assert!(ox.abs() < 1e-3, "centered horizontally");
         assert!(oy.abs() < 1e-3, "centered vertically");
+    }
+
+    #[test]
+    fn compute_video_visual_transform_display_resolution_surface_is_position_only() {
+        // The shader has already resolved the frame to the 1600x900 physical
+        // display rectangle. DComp only centers that surface in the viewport.
+        let (m11, m12, m21, m22, ox, oy) = compute_video_visual_transform(
+            1600,
+            900,
+            1600,
+            1000,
+            1,
+            1,
+            VideoOrientation::IDENTITY,
+            false,
+        );
+        assert!((m11 - 1.0).abs() < f32::EPSILON);
+        assert!((m22 - 1.0).abs() < f32::EPSILON);
+        assert_eq!(m12, 0.0);
+        assert_eq!(m21, 0.0);
+        assert_eq!(ox, 0.0);
+        assert_eq!(oy, 50.0);
     }
 
     /// orientation=0 は回転対応前の SAR transform と完全に同じ値を返す。

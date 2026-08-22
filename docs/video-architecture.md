@@ -312,9 +312,15 @@ ID3D11Fence::Signal (共有 fence で blit 完了通知)
 NativeRenderCore (HWND owner の native-video-window-pump とは分離)
     ├─ ID3D11Device::OpenSharedHandle で受信 → ID3D11Texture2D
     ├─ KEYEDMUTEX 取得 + Fence Wait で同期
-    ├─ 補正なし: CopyResource → swap chain backbuffer
-    └─ 色調 / Creative LUT あり: D3D11 fullscreen shader → swap chain backbuffer
-         → Present (DComp visual tree 内)
+    ├─ OS に任せる / 物理等倍
+    │    ├─ 補正なし: CopySubresourceRegion → source 解像度 swap chain
+    │    └─ 色調 / Creative LUT: grade shader → source 解像度 swap chain
+    └─ 標準 (非等倍)
+         ├─ 補正なし: source texture を直接 resample 入力にする
+         └─ 色調 / Creative LUT: grade shader → source 解像度 BGRA8 中間 RT
+              → separable Lanczos3 (horizontal RGBA16F 中間 → vertical resolve)
+              → 表示矩形の物理 pixel サイズの swap chain
+              → Present (DComp は位置合わせ。リサイズ中だけ旧 surface を stretch)
 ```
 
 動画の Creative LUT は入力変換ではない。VideoProcessor が NV12 / P010 を SDR BGRA8 にした
@@ -324,9 +330,25 @@ D3D11 pixel shader を掛ける。したがってカメラ Log 素材の本来�
 
 `.cube` のファイル読み込みと parse は App の worker が担当し、render command には
 `Arc<CubeLutParams>` と表示用選択肢だけを渡す。render thread はファイル I/O を行わない。
-補正がすべて既定値なら shader pipeline は遅延生成も実行もせず従来の copy path を維持する。
-補正中は GPU decode の共有テクスチャを SRV として直接 sample し、CPU decode 時だけ再利用可能な
-BGRA8 texture へ upload して同じ shader を通す。LUT table は RGBA32F 3D texture として保持する。
+grade / Lanczos3 の shader object は presenter pipeline 作成時にまとめてコンパイルする。
+補正がすべて既定値なら grade pass と grade 中間 RT を使わず、OS 任せ / 物理等倍では従来の
+`CopySubresourceRegion` path を維持する。標準の非等倍だけ resample を実行し、補正中は grade
+出力を source 解像度の中間 RT に受けてから Lanczos3 へ渡す。CPU decode 時だけ再利用可能な
+BGRA8 source texture へ upload し、その後は GPU decode と同じ grade / resample pipeline を通る。
+LUT table は RGBA32F 3D texture として保持する。
+
+標準では swap chain を SAR / orientation 適用後の表示矩形へ直接解決するため、
+`compute_video_visual_transform` 本体は変更せず、display-resolved content だけ 1/1・identity
+として位置合わせする。window geometry の sample が続く間は現在の surface を DComp が stretch
+し、最後の寸法変更から 150ms 変化がなければ render thread が settled edge を 1 回だけ消費して
+surface を交換する。一時停止中は `FramePresentationState::Visible` の保持 frame を 1 回再提示する。
+
+表示 surface / 中間 RT を作れない場合は、要求 key ごとに typed reason
+(`display_size_limit_exceeded` / `resample_pipeline_unavailable` /
+`resample_intermediate_creation_failed` / `grade_intermediate_creation_failed` /
+`display_swap_chain_creation_failed` / `display_backbuffer_creation_failed`) を保持し、
+同じ失敗を毎 frame 再試行せず OS 任せへ戻す。理由と累積件数、選択 filter、surface 交換累積は
+perf event に出し、中間 RT の byte 数は VRAM trace に含める。
 
 #### 共有テクスチャ identity (`shared_texture_gen`) — handle 値再利用への防御
 
@@ -1478,6 +1500,8 @@ intent だけで host と接続する。
 | `native_presenter/render_core.rs` | D3D11/DXGI/DComp、swap chain、共有 texture/keyed mutex、動画 present、egui overlay state/input変換 | `NativeRenderConfig`, `NativeRenderCore`, `NativeEguiOverlay` |
 | `native_presenter/overlay_draw.rs` | overlay 描画関数群、panel 矩形計算、format helper、timeline marker/icon 描画 | `NativeOverlay*` 値型 |
 | `native_presenter/grade_pipeline.rs` | 色調補正 / Creative LUT shader pipeline | `VideoGradePipeline` |
+| `native_presenter/resample_pipeline.rs` | 表示 orientation と Lanczos3 の 2-pass resolve、RGBA16F 中間 RT | `VideoResamplePipeline` |
+| `native_presenter/surface_policy.rs` | filter / 表示倍率 / resize / 上限から surface size と typed fallback を決める純関数 | `VideoSurfaceSizeDecision`, `VideoScaleFallbackReason` |
 
 高頻度の mouse move、geometry/DPI、HUD raise、HUD visual/observation、App→render の HUD state は
 sequence 付き latest-value slot で coalesce する。wndproc の slot は atomic pointer swap、pump の

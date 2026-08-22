@@ -368,6 +368,8 @@ pub struct NativeVideoOutputConfig {
     pub ui_font: crate::settings::UiFontSettings,
     /// Viewer-wide tone controls and registered Creative LUT snapshot.
     pub video_grade: crate::creative_lut::VideoGradeSnapshot,
+    /// Startup-selected native video scaling owner.
+    pub scale_filter: crate::settings::VideoScaleFilter,
     /// CP7: HUD raise の allowlist 判定 (`foreground_allows_hud_raise`) で参照する
     /// VST editor container HWND の snapshot。App が `dsp_bridge.editor_hwnds_snapshot()` を
     /// 渡す。`None` のとき HUD HWND を作っても raise 判定で常に false (= raise 起動しない)
@@ -2486,6 +2488,8 @@ fn emit_native_vram_trace(
         return;
     }
     let (surface_width, surface_height) = presenter.surface_size();
+    let (grade_intermediate_bytes, resample_intermediate_bytes) =
+        presenter.intermediate_vram_bytes();
     crate::gpu_info::emit_vram_trace(
         kind,
         reason,
@@ -2521,6 +2525,14 @@ fn emit_native_vram_trace(
             (
                 "surface_height",
                 serde_json::Value::from(surface_height as i64),
+            ),
+            (
+                "grade_intermediate_bytes",
+                serde_json::Value::from(grade_intermediate_bytes),
+            ),
+            (
+                "resample_intermediate_bytes",
+                serde_json::Value::from(resample_intermediate_bytes),
             ),
         ],
     );
@@ -3012,6 +3024,7 @@ fn run_native_video_output(
                 ui_scale: config.ui_scale,
                 text_contrast: config.text_contrast,
                 ui_font: config.ui_font.clone(),
+                scale_filter: config.scale_filter,
                 health: Arc::clone(&health),
                 window_epoch: cur_generation,
             },
@@ -3840,6 +3853,7 @@ fn run_native_video_output(
                                 ui_scale: cur_ui_scale,
                                 text_contrast: cur_text_contrast,
                                 ui_font: config.ui_font.clone(),
+                                scale_filter: config.scale_filter,
                                 health: Arc::clone(&health),
                                 window_epoch: candidate_epoch,
                             },
@@ -4847,6 +4861,29 @@ fn run_native_video_output(
                     );
                     latest_renderable = Some(frame);
                 }
+            }
+        }
+
+        // Active playback consumes the settled resize on its next decoded
+        // frame. While paused, re-present the one typed Visible frame exactly
+        // once so the display-resolution surface is replaced without waiting
+        // for playback to resume.
+        if latest_renderable.is_none()
+            && !presenter_hidden
+            && presenter.take_settled_resize_refresh_due(Instant::now())
+        {
+            let refresh = frame_output
+                .visible_frame()
+                .map(|frame| presenter.present(frame, config.sync_interval));
+            match refresh {
+                Some(Ok(outcome)) => {
+                    debug_assert!(frame_output.mark_current_visible(outcome.copy_fence_value));
+                    frame_output.retire_completed(presenter.copy_fence_completed_value());
+                }
+                Some(Err(error)) => crate::logger::log(format!(
+                    "[native-video] settled resize refresh present failed: {error}"
+                )),
+                None => {}
             }
         }
 

@@ -50911,6 +50911,7 @@ impl App {
                                 &self.settings.video_adjustments,
                                 &self.settings.video_preset_slots,
                             ),
+                            self.settings.video_scale_filter,
                             // 動画経路: 常に映像フレームを持つ。
                             false,
                         )
@@ -70497,6 +70498,7 @@ fn native_video_presenter_config(
     >,
     main_hwnd_for_raise: u64,
     video_grade: crate::creative_lut::VideoGradeSnapshot,
+    scale_filter: crate::settings::VideoScaleFilter,
     // 音声のみ native シェル (music Inc 6 ②) は true。present ループが frameless で回る
     // (§5.9 / Inc 6 ②-1)。動画経路は false。
     audio_only: bool,
@@ -70527,6 +70529,7 @@ fn native_video_presenter_config(
         editor_hwnds_snapshot,
         main_hwnd_for_raise,
         video_grade,
+        scale_filter,
         // in-main-window / detached では topmost な HUD overlay HWND を使わず、
         // presenter の DComp tree に egui overlay を載せる。fullscreen だけ
         // 従来どおり HUD HWND を有効化 (`MIV_HUD_OVERLAY=0` で off)。

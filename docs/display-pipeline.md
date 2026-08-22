@@ -691,6 +691,16 @@ egui 音楽ビューも同じ mode と App runtime を使う。3 面とも Click
 presenter 有効時は `VideoPlayer` が `NativeVideoOutput` を持ち、動画フレームと
 egui overlay は専用 HWND 側で表示される。フルスクリーン viewport は黒い backdrop と
 focus/chrome 管理だけを担当する。
+
+native presenter の動画 scaling は `Settings::video_scale_filter` を正本にする。既定の
+`OS に任せる` は source 解像度 swap chain と DComp scaling を維持する。`標準` は
+SAR / orientation 適用後の映像表示矩形を物理 pixel 単位で fit し、GPU / CPU frame の双方を
+source 解像度の grade pass (補正時だけ中間 RT) から Lanczos3 の 2-pass resolve へ渡す。
+物理 1:1 は resample を通さず既存 copy path のままにする。window resize stream 中は現在の
+surface を DComp が stretch し、寸法 sample が 150ms 静止した edge で 1 回だけ交換するため、
+連続 resize ごとの swap chain 再作成は行わない。表示 surface 作成不能は typed reason を perf
+へ出して OS path へ戻し、同じ要求を frame ごとに再試行しない。
+
 Windows のタスクバー hover preview は main HWND を対象にするため、動画 fullscreen 中は
 `dwm_iconic_thumbnail.rs` が DWM iconic thumbnail/live preview を main HWND に供給する。
 フレーム抽出は worker thread 上の `video::screenshot::capture_frame` で粗く更新し、

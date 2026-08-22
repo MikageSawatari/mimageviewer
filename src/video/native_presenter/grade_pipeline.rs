@@ -10,8 +10,8 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob, ID3DInclude,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE, D3D11_BUFFER_DESC,
-    D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_SAMPLER_DESC, D3D11_SUBRESOURCE_DATA,
+    D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+    D3D11_BUFFER_DESC, D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_SAMPLER_DESC, D3D11_SUBRESOURCE_DATA,
     D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE2D_DESC, D3D11_TEXTURE3D_DESC, D3D11_USAGE_DEFAULT,
     D3D11_VIEWPORT, ID3D11Buffer, ID3D11Device1, ID3D11DeviceContext, ID3D11PixelShader,
     ID3D11Resource, ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11Texture3D,
@@ -99,6 +99,12 @@ struct CpuSource {
     view: ID3D11ShaderResourceView,
 }
 
+struct GradeIntermediate {
+    width: u32,
+    height: u32,
+    texture: ID3D11Texture2D,
+}
+
 pub(super) struct VideoGradePipeline {
     vertex_shader: ID3D11VertexShader,
     pixel_shader: ID3D11PixelShader,
@@ -108,6 +114,7 @@ pub(super) struct VideoGradePipeline {
     lut_view: Option<ID3D11ShaderResourceView>,
     lut_key: Option<(uuid::Uuid, usize)>,
     cpu_source: Option<CpuSource>,
+    grade_intermediate: Option<GradeIntermediate>,
 }
 
 impl VideoGradePipeline {
@@ -159,6 +166,7 @@ impl VideoGradePipeline {
             lut_view: None,
             lut_key: None,
             cpu_source: None,
+            grade_intermediate: None,
         })
     }
 
@@ -347,6 +355,76 @@ impl VideoGradePipeline {
             context.OMSetRenderTargets(None, None);
         }
         Ok(())
+    }
+
+    pub(super) fn prepare_intermediate(
+        &mut self,
+        device: &ID3D11Device1,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        let width = width.max(1);
+        let height = height.max(1);
+        if self
+            .grade_intermediate
+            .as_ref()
+            .is_some_and(|target| target.width == width && target.height == height)
+        {
+            return Ok(());
+        }
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET).0 as u32,
+            ..Default::default()
+        };
+        let mut texture = None;
+        unsafe {
+            device
+                .CreateTexture2D(&desc, None, Some(&mut texture))
+                .map_err(|error| format!("CreateTexture2D grade intermediate: {error:?}"))?;
+        }
+        self.grade_intermediate = Some(GradeIntermediate {
+            width,
+            height,
+            texture: texture
+                .ok_or_else(|| "CreateTexture2D grade intermediate returned null".to_string())?,
+        });
+        Ok(())
+    }
+
+    pub(super) fn draw_to_intermediate(
+        &self,
+        device: &ID3D11Device1,
+        context: &ID3D11DeviceContext,
+        source: &ID3D11Texture2D,
+        width: u32,
+        height: u32,
+    ) -> Result<ID3D11Texture2D, String> {
+        let target = self
+            .grade_intermediate
+            .as_ref()
+            .filter(|target| target.width == width && target.height == height)
+            .ok_or_else(|| "grade intermediate was not prepared".to_string())?
+            .texture
+            .clone();
+        self.draw(device, context, source, &target, width, height)?;
+        Ok(target)
+    }
+
+    pub(super) fn intermediate_vram_bytes(&self) -> u64 {
+        self.grade_intermediate
+            .as_ref()
+            .map(|target| u64::from(target.width) * u64::from(target.height) * 4)
+            .unwrap_or(0)
     }
 }
 

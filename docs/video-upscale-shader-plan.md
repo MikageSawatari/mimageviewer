@@ -1,10 +1,14 @@
 # 動画の拡大・縮小を mIV のシェーダで行う
 
-ステータス: **設計確定 / 未実装**
+ステータス: **Phase A Step 1 構造コア実装済み / Step 2 UI・追加フィルタ未実装**
 対象: [next-release-backlog.md](next-release-backlog.md) §1.47
 関連: [upscale-algorithm-selection.md](upscale-algorithm-selection.md) (静止画側の正本) /
 [video-architecture.md](video-architecture.md) / [display-pipeline.md](display-pipeline.md) /
 [dot-by-dot-and-downscale-plan.md](dot-by-dot-and-downscale-plan.md)
+
+2026-08-22 の Step 1 では `OS に任せる` と `標準` (Lanczos3) だけを renderer まで接続した。
+既定は実機比較前の挙動不変を優先して `OS に任せる` とし、設定値は永続化するが UI はまだ
+公開しない。`シャープ` / `ニアレスト`、左パネル、キー操作、利用者向け文書は Step 2 で行う。
 
 静止画は v2.11.0 で縮小に GPU Lanczos、v2.12.0 で拡大に Lanczos3 / NIS / Anime4K を入れた。
 動画は**表示構造が違うため mIV のシェーダを一切通っておらず**、拡大縮小は DWM / DComp に
@@ -74,6 +78,13 @@
 `compute_video_visual_transform` は**サーフェスサイズを引数に取る**ので、
 「シェーダで出した表示解像度サーフェス」も「リサイズ中の古いサーフェス」も**同じ式で正しい
 倍率が出る**。この関数は無改造でよい。
+
+Step 1 の実コードでは Lanczos pass が SAR と orientation を表示解像度サーフェスへ焼き込む。
+そのため関数本体は無変更のまま、表示解像度 content の呼び出しだけ 1/1・identity の幾何を
+渡す。リサイズ中の古い表示解像度サーフェスは同じ関数が現 viewport へ stretch し、最後の
+`GeometryChanged` から 150ms 新しい寸法 sample がないときだけ settled edge を 1 回発行する。
+interactive / child / maximize / programmatic resize に共通する信頼できる終了イベントがないためで、
+失敗を再試行する timer ではなく入力 stream の終端判定である。
 
 主用途である全画面再生ではそもそもリサイズが起きないので、常用経路では差し替えが一度も
 発生しない。
@@ -297,6 +308,11 @@ presenter は wgpu ではなく生の D3D11 なので、WGSL はそのまま使�
 - 一時停止中の切り替えも即反映する。既存の `SetVideoGrade` が持つ「Visible なら 1 回だけ
   再提示」の仕組みをそのまま使う (`FramePresentationState`)
 
+Step 1 は runtime selector をまだ持たない。grade と Lanczos3 の全 HLSL は
+`NativeRenderCore` 作成時にコンパイルし、表示寸法依存の中間 texture は最初の Standard present
+前に確保する。Step 2 で runtime 切替を接続するときは、切替 command を publish する前に現在の
+source / target 寸法用 resource を準備し、この節の「切替の瞬間に確保しない」を維持すること。
+
 残る 1 つの避けられないコスト: 差し替え時の `WaitForCommitCompletion()` + `DwmFlush()` で
 レンダースレッドが最大 1 コンポジタ tick (8〜16ms) 止まる。切替の瞬間だけで、既に
 `commit_sync_ms` としてログに出ている。
@@ -416,6 +432,9 @@ VRAM は §4.1 のとおり。detached で動画を 2 面同時再生するこ�
 
 Phase A で約 2 週間、Phase B で約 2 週間 (いずれも実機往復を含まない)。
 **Phase A は測定を待たずに着手してよい。**
+
+Step 1 完了範囲は A-1、A-2 の Lanczos3、A-3 の永続設定配線・typed fallback・基礎計装である。
+NIS / nearest と UI / keymap は dispatch の Step 2 へ分けた。
 
 ---
 
