@@ -1070,6 +1070,61 @@ enum NativeVideoOutputCommand {
     },
 }
 
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VideoScaleSettingsRequest {
+    request_id: u64,
+    filter: crate::settings::VideoScaleFilter,
+    smoothing_percent: u32,
+    anime4k_variant: Option<anime4k_policy::VideoAnime4kVariant>,
+    origin: VideoScaleChangeOrigin,
+}
+
+/// Source-bound owner for a scale request received before any frame exists.
+/// Replacing `Waiting` is the only supersession transition; source teardown
+/// clears it before a new source can become current.
+#[cfg(windows)]
+#[derive(Debug, Default)]
+enum DeferredVideoScaleRequest {
+    #[default]
+    Empty,
+    Waiting {
+        source_epoch: u64,
+        request: VideoScaleSettingsRequest,
+    },
+}
+
+#[cfg(windows)]
+impl DeferredVideoScaleRequest {
+    fn hold_until_first_frame(&mut self, source_epoch: u64, request: VideoScaleSettingsRequest) {
+        *self = Self::Waiting {
+            source_epoch,
+            request,
+        };
+    }
+
+    fn take_for_first_frame(&mut self, source_epoch: u64) -> Option<VideoScaleSettingsRequest> {
+        match std::mem::take(self) {
+            Self::Waiting {
+                source_epoch: pending_epoch,
+                request,
+            } if pending_epoch == source_epoch => Some(request),
+            Self::Empty | Self::Waiting { .. } => None,
+        }
+    }
+
+    fn drop_source(&mut self, source_epoch: u64) {
+        if let Self::Waiting {
+            source_epoch: pending_epoch,
+            ..
+        } = self
+        {
+            debug_assert_eq!(*pending_epoch, source_epoch);
+        }
+        *self = Self::Empty;
+    }
+}
+
 /// The native output context's single owner of the most recent frame.
 ///
 /// A successfully presented GPU frame is released back to reader key 1 by
@@ -2965,6 +3020,45 @@ fn send_native_output_event(
 }
 
 #[cfg(windows)]
+fn prepare_video_scale_request_for_frame(
+    presenter: &mut native_presenter::NativeRenderCore,
+    frame: &VideoFrame,
+    request: VideoScaleSettingsRequest,
+    source_epoch: u64,
+    ui_event_tx: &NativeOutputEventSender,
+) {
+    match presenter.prepare_video_scale_settings(
+        frame,
+        request.request_id,
+        request.filter,
+        request.smoothing_percent,
+        request.anime4k_variant,
+    ) {
+        Ok(()) => send_native_output_event(
+            ui_event_tx,
+            source_epoch,
+            NativeVideoOutputEvent::VideoScaleSettingsPrepared {
+                request_id: request.request_id,
+                filter: request.filter,
+                smoothing_percent: request.smoothing_percent,
+                anime4k_variant: request.anime4k_variant,
+                origin: request.origin,
+            },
+        ),
+        Err(error) => {
+            crate::logger::log(format!(
+                "[native-video] scale-filter preparation failed: {error}"
+            ));
+            if let Some(toast) =
+                video_scale_feedback_toast(request.origin, VideoScaleFeedbackTransition::Rejected)
+            {
+                presenter.show_overlay_toast(toast, false, None);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
 fn publish_native_overlay_input_routing(
     tx: &NativeOutputEventSender,
     source_epoch: u64,
@@ -3549,6 +3643,7 @@ fn run_native_video_output(
     // owner. `source.queue` remains an unpresented pacing queue and is never a
     // placement/grade fallback.
     let mut frame_output = NativeFrameOutputContext::new();
+    let mut deferred_video_scale_request = DeferredVideoScaleRequest::default();
     /// presenter 側 `source.queue` の最大長 (Codex 助言、2026-05-15)。旧コードは
     /// `video_rx.try_recv()` を空になるまで drain して queue に積み込んでいたため、
     /// 高負荷 / pool exhausted 時に queue が 23 まで肥大化 → present_retire / shared
@@ -3870,50 +3965,30 @@ fn run_native_video_output(
                     anime4k_variant,
                     origin,
                 } => {
-                    let smoothing_percent =
-                        crate::settings::sanitize_downscale_smoothing_percent(smoothing_percent);
-                    match frame_output.frame() {
-                        Some(frame) => match presenter.prepare_video_scale_settings(
-                            frame,
-                            request_id,
-                            filter,
+                    let request = VideoScaleSettingsRequest {
+                        request_id,
+                        filter,
+                        smoothing_percent: crate::settings::sanitize_downscale_smoothing_percent(
                             smoothing_percent,
-                            anime4k_variant,
-                        ) {
-                            Ok(()) => send_native_output_event(
-                                &ui_event_tx,
-                                source.source_epoch,
-                                NativeVideoOutputEvent::VideoScaleSettingsPrepared {
-                                    request_id,
-                                    filter,
-                                    smoothing_percent,
-                                    anime4k_variant,
-                                    origin,
-                                },
-                            ),
-                            Err(error) => {
-                                crate::logger::log(format!(
-                                    "[native-video] scale-filter preparation failed: {error}"
-                                ));
-                                if let Some(toast) = video_scale_feedback_toast(
-                                    origin,
-                                    VideoScaleFeedbackTransition::Rejected,
-                                ) {
-                                    presenter.show_overlay_toast(toast, false, None);
-                                }
-                            }
-                        },
-                        None => {
-                            crate::logger::log(
-                                "[native-video] scale-filter preparation ignored before first frame",
-                            );
-                            if let Some(toast) = video_scale_feedback_toast(
-                                origin,
-                                VideoScaleFeedbackTransition::Rejected,
-                            ) {
-                                presenter.show_overlay_toast(toast, false, None);
-                            }
-                        }
+                        ),
+                        anime4k_variant,
+                        origin,
+                    };
+                    if let Some(frame) = frame_output.frame() {
+                        prepare_video_scale_request_for_frame(
+                            &mut presenter,
+                            frame,
+                            request,
+                            source.source_epoch,
+                            &ui_event_tx,
+                        );
+                    } else {
+                        deferred_video_scale_request
+                            .hold_until_first_frame(source.source_epoch, request);
+                        crate::logger::log(format!(
+                            "[native-video] scale-filter preparation deferred until first frame request_id={request_id} source_epoch={}",
+                            source.source_epoch
+                        ));
                     }
                 }
                 NativeVideoOutputCommand::CommitVideoScaleSettings {
@@ -4203,6 +4278,7 @@ fn run_native_video_output(
                     // move to the disposal queue; Hidden frames return to producer-side
                     // recovery without becoming a fallback for the new source.
                     frame_output.clear_current();
+                    deferred_video_scale_request.drop_source(source.source_epoch);
                     if cur_scale_filter == crate::settings::VideoScaleFilter::Anime {
                         cur_anime4k_variant = None;
                         cur_anime4k_status =
@@ -5489,6 +5565,23 @@ fn run_native_video_output(
         // Otherwise, re-present the one typed Visible frame exactly once.
         if latest_renderable.is_none() && !presenter_hidden {
             refresh_settled_resize_if_due(&mut presenter, &mut frame_output, config.sync_interval);
+        }
+
+        if let Some(frame) = latest_renderable.as_ref()
+            && let Some(request) =
+                deferred_video_scale_request.take_for_first_frame(source.source_epoch)
+        {
+            crate::logger::log(format!(
+                "[native-video] applying deferred scale-filter preparation on first frame request_id={} source_epoch={}",
+                request.request_id, source.source_epoch
+            ));
+            prepare_video_scale_request_for_frame(
+                &mut presenter,
+                frame,
+                request,
+                source.source_epoch,
+                &ui_event_tx,
+            );
         }
 
         if let Some(frame) = latest_renderable {
@@ -9097,6 +9190,59 @@ fn dummy_video_rx() -> crossbeam_channel::Receiver<VideoFrame> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    fn video_scale_request(
+        request_id: u64,
+        filter: crate::settings::VideoScaleFilter,
+    ) -> super::VideoScaleSettingsRequest {
+        super::VideoScaleSettingsRequest {
+            request_id,
+            filter,
+            smoothing_percent: 25,
+            anime4k_variant: None,
+            origin: super::VideoScaleChangeOrigin::Key,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deferred_video_scale_request_applies_once_on_first_frame() {
+        let mut state = super::DeferredVideoScaleRequest::default();
+        let request = video_scale_request(7, crate::settings::VideoScaleFilter::Sharp);
+
+        state.hold_until_first_frame(11, request);
+
+        assert_eq!(state.take_for_first_frame(11), Some(request));
+        assert_eq!(state.take_for_first_frame(11), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn later_deferred_video_scale_request_supersedes_the_earlier_one() {
+        let mut state = super::DeferredVideoScaleRequest::default();
+        let earlier = video_scale_request(7, crate::settings::VideoScaleFilter::Sharp);
+        let later = video_scale_request(8, crate::settings::VideoScaleFilter::Nearest);
+
+        state.hold_until_first_frame(11, earlier);
+        state.hold_until_first_frame(11, later);
+
+        assert_eq!(state.take_for_first_frame(11), Some(later));
+        assert_eq!(state.take_for_first_frame(11), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deferred_video_scale_request_is_dropped_with_its_source() {
+        let mut state = super::DeferredVideoScaleRequest::default();
+        let request = video_scale_request(7, crate::settings::VideoScaleFilter::Anime);
+
+        state.hold_until_first_frame(11, request);
+        state.drop_source(11);
+
+        assert_eq!(state.take_for_first_frame(11), None);
+        assert_eq!(state.take_for_first_frame(12), None);
+    }
+
     #[cfg(windows)]
     #[test]
     fn video_scale_key_feedback_waits_for_commit_and_panel_stays_silent() {
