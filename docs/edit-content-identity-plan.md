@@ -224,7 +224,7 @@ metadata_transfer は 2 と 4 が同時に存在するとエラーにする (imp
 
 ## 6. UI
 
-### 6.1 復元ウィンドウ (非モーダル `egui::Window`)
+### 6.1 復元ウィンドウ (モーダル `egui::Modal`)
 
 ```
 編集内容の復元
@@ -245,9 +245,9 @@ metadata_transfer は 2 と 4 が同時に存在するとエラーにする (imp
                                          [復元する]  [閉じる]
 ```
 
-- **モーダルにしない**。検出はフォルダを開いた 1〜2 秒後に非同期で確定するので、
-  モーダルだと閲覧を中断させる。`common_modal_dialog_open` には登録し、背面グリッドへの
-  ホイール / キー漏れだけ止める (CLAUDE.md「ダイアログ (egui::Window)」)。
+- 背景を暗くする `egui::Modal` で中央に表示し、確認中は背面グリッドへのポインター、
+  ホイール、キー入力を止める。可視性と `modal_dialog_block_reason` は同じ
+  `content_restore_window_visible()` を使い、描画と入力抑止を分けない。
 - **1 件ずつ聞かない**。フォルダ丸ごとコピーで数百件になるため、フォルダ単位の一括提示。
 - **[すべて選ぶ] / [すべて解除]** を必ず置く。
 - 移動 (元が消えている) とコピー (元が残っている) を行に明示する。既定チェックは両方 ON。
@@ -266,14 +266,16 @@ metadata_transfer は 2 と 4 が同時に存在するとエラーにする (imp
 | `□ 次から確認しない` | **設定を OFF** (全体停止、§7) |
 
 - **「このフォルダ以下では聞かない」は作らない**。使わない利用者は全体 OFF で足りる、という判断。
-- [閉じる] と × は何も記録せず、同じフォルダを次に開いたときに再提示する。右クリックからの
+- [閉じる] と Esc は何も記録せず、同じフォルダを次に開いたときに再提示する。Esc は IME
+  変換中には反応せず、「次から確認しない」が ON なら [閉じる] と同じく全体設定を OFF にする。
+  右クリックからの
   手動再確認は Phase 2 とし、Phase 1 には置かない。
 
 ---
 
 ## 7. 設定
 
-環境設定 → フォルダ:
+環境設定 → フォルダ・ファイル:
 
 ```
 ☑ コピー・移動したファイルの編集内容を復元するか確認する
@@ -370,11 +372,11 @@ INSERT OR IGNORE INTO t (c1, c2, ...) SELECT ?new, c2, ... FROM t WHERE c1 = ?ol
   増やさない。
 - target の `edit_origin` は `has_restorable_content = 1` へ昇格し、A2 の次回 index で復元元に
   なる。チェックを外して [復元する] を押した行だけを `restore_declined` へ記録する。
-- 非モーダル `egui::Window` の可視性は
+- モーダル `egui::Modal` の可視性は
   `fullscreen_idx.is_none() && restore_pending.is_none() && prompt.is_some()` で一元化し、
   描画と背面入力 block の両方が同じ述語を使う。フルスクリーン中または先行 batch 完了待ちは
   候補を保持したまま false。
-- [閉じる] / × は候補を閉じるだけで、`restore_declined` も復元 request も作らない。
+- [閉じる] / Esc は候補を閉じるだけで、`restore_declined` も復元 request も作らない。
 
 ---
 
@@ -401,7 +403,7 @@ INSERT OR IGNORE INTO t (c1, c2, ...) SELECT ?new, c2, ... FROM t WHERE c1 = ?ol
 
 | Phase | 内容 |
 | --- | --- |
-| 1 | 台帳 DB + 記録 worker + 3 段照合 + 検出 worker + 非モーダル復元ウィンドウ + 設定 1 個 + `STORES` 駆動 `copy_store`。**画像 / ZIP / PDF / 変換アーカイブ (4 面キー) を最初から対象**、移動・コピー両方 |
+| 1 | 台帳 DB + 記録 worker + 3 段照合 + 検出 worker + モーダル復元ウィンドウ + 設定 1 個 + `STORES` 駆動 `copy_store`。**画像 / ZIP / PDF / 変換アーカイブ (4 面キー) を最初から対象**、移動・コピー両方 |
 | 2 | ZIP エントリ単位の内容ハッシュ (ZIP ↔ ばら画像の相互復元)、動画 / 音声のブックマーク (id 再採番)、右クリックからの手動再確認 |
 
 ### 10.1 Phase 1 の分割 (実装を出す単位)
@@ -414,7 +416,7 @@ Phase 1 は 1 回の差分にすると大きすぎてレビューが効かない
 | **A1 台帳と記録** | `content_identity.db` (§3.2)、3 段照合のハッシュ計算 (§3.1)、編集確定点からの記録 worker (§3.3)、`STORES` への `file_key` 追加 | 新規モジュール + 編集保存経路のフック | 編集すると台帳に 1 行増える。`(file_key, size, hashed_mtime)` が同じなら再計算しない。**UI は何も変わらない** |
 | **A2 検出** | 起動時の台帳ロード、フォルダ読み込み完了時の段 0 照合、`GlobalIoSemaphore` Low の検出 worker、設定 1 個 (§7) | フォルダ走査完了フック + 新規 worker + 環境設定 | 候補が mpsc で UI へ届く (ログで確認)。**まだウィンドウは出さない**。設定 OFF で worker が起動しない |
 | **A3a コピーエンジン** | `STORES` 駆動の `copy_store` / `copy_exact` / `copy_prefix` (§8.1)、変換アーカイブの 4 面キー (§4)、`restore_declined` 書き込み API、復元後の後始末境界 (§8.2) | `rename_key_migration` の copy sibling + `content_identity/restore.rs` | App / egui 非依存の入口をテストだけから駆動し、21 unique descriptor・4 面・後始末 report を検証する。**UI は何も変わらない** |
-| **A3b 復元 UI** | **実装済み**。非モーダル復元ウィンドウ (§6)、A2 候補との配線、batch 復元 / `restore_declined`、A3a report の App owner への適用 | `ui_dialogs/content_restore.rs` + A2 poll 配線 | §9 の UI / lifecycle、1 / 100 候補の DB open 計測、UI snapshot を含むテストが通る |
+| **A3b 復元 UI** | **実装済み**。モーダル復元ウィンドウ (§6)、A2 候補との配線、batch 復元 / `restore_declined`、A3a report の App owner への適用 | `ui_dialogs/content_restore.rs` + A2 poll 配線 | §9 の UI / lifecycle、1 / 100 候補の DB open 計測、UI snapshot を含むテストが通る |
 
 **A2 実装時の確定事項 (2026-08-21)**:
 

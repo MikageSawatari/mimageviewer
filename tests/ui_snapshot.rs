@@ -1130,7 +1130,7 @@ fn changelog_markdown_dark() {
 #[test]
 fn content_restore_prompt_light() {
     use mimageviewer::ui_dialogs::content_restore::{
-        ContentRestoreUiRow, ContentRestoreUiSource, render_content_restore_contents,
+        ContentRestoreUiRow, ContentRestoreUiSource, render_content_restore_modal,
     };
 
     let mut rows = vec![
@@ -1171,7 +1171,7 @@ fn content_restore_prompt_light() {
     let mut dont_ask_again = false;
     let mut fonts_ready = false;
     let mut harness = Harness::builder()
-        .with_size(egui::vec2(860.0, 520.0))
+        .with_size(egui::vec2(980.0, 600.0))
         .build(move |ctx| {
             mimageviewer::os_theme::apply_resolved(
                 ctx,
@@ -1184,9 +1184,17 @@ fn content_restore_prompt_light() {
                 return;
             }
             egui::CentralPanel::default().show(ctx, |ui| {
-                ui.set_width(820.0);
-                let _ = render_content_restore_contents(ui, &mut rows, &mut dont_ask_again);
+                ui.heading("画像一覧");
+                ui.label("モーダル表示中は背景の一覧を操作できません。");
+                ui.add_space(12.0);
+                for name in ["IMG_0421.jpg", "chapter03.cbz", "scan.pdf"] {
+                    ui.group(|ui| {
+                        ui.set_min_size(egui::vec2(180.0, 56.0));
+                        ui.label(name);
+                    });
+                }
             });
+            let _ = render_content_restore_modal(ctx, &mut rows, &mut dont_ask_again);
         });
     harness.run();
     harness.snapshot("content_restore_prompt_light");

@@ -120,12 +120,6 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["コンテキストメニュー", "shell", "右クリック"]
     ),
     entry!(
-        "explorer/delete-confirmation",
-        ExplorerIntegration,
-        "ごみ箱へ移すときは削除前の確認を省略する",
-        ["削除", "確認", "ゴミ箱", "完全削除", "delete"]
-    ),
-    entry!(
         "explorer/sendto",
         ExplorerIntegration,
         "SendTo",
@@ -408,6 +402,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         Folder,
         "コピー・移動したファイルの編集内容を復元するか確認する",
         ["編集内容", "復元", "コピー", "移動", "照合"]
+    ),
+    entry!(
+        "folder/delete-confirmation",
+        Folder,
+        "ごみ箱へ移すときは削除前の確認を省略する",
+        ["削除", "確認", "削除確認", "ゴミ箱", "完全削除", "delete"]
     ),
     entry!(
         "folder/backup",
@@ -1018,5 +1018,15 @@ mod tests {
                 .iter()
                 .any(|entry| entry.anchor == "spread/continuous-scroll")
         );
+    }
+
+    #[test]
+    fn recycle_bin_confirmation_search_opens_the_folder_file_page() {
+        let result = search_preferences("ごみ箱 削除確認", test_tree_position)
+            .into_iter()
+            .find(|entry| entry.anchor == "folder/delete-confirmation")
+            .expect("the moved recycle-bin setting must remain searchable");
+        assert_eq!(result.page, PreferencesPage::Folder);
+        assert_eq!(result.page.label(), "フォルダ・ファイル");
     }
 }

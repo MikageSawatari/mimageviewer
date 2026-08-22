@@ -197,7 +197,7 @@ impl PreferencesPage {
             Self::GpuMemory => "GPUメモリ",
             Self::AiBackend => "AI バックエンド",
             Self::Cache => "キャッシュ",
-            Self::Folder => "フォルダ",
+            Self::Folder => "フォルダ・ファイル",
             Self::Book => "製本",
             Self::DuplicateFiles => "同名ファイル",
             Self::ExifDisplay => "EXIF表示",
@@ -2804,7 +2804,7 @@ mod tests {
         );
         let mut fonts_ready = false;
         let mut harness = Harness::builder()
-            .with_size(egui::vec2(620.0, 520.0))
+            .with_size(egui::vec2(620.0, 680.0))
             .build(move |ctx| {
                 crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
                 if !fonts_ready {
