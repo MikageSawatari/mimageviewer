@@ -18,6 +18,7 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC};
 use windows::core::{Interface, PCSTR};
 
+use crate::gpu_anime4k::{Anime4kPassInput, Anime4kVariant, VIDEO_ANIME4K_B2_VARIANT};
 use crate::settings::VideoScaleFilter;
 use crate::video::display_metadata::VideoOrientation;
 
@@ -140,11 +141,28 @@ struct NisConstants {
     _padding: [f32; 2],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Anime4kConstants {
+    output_size: [u32; 2],
+    input_size: [u32; 2],
+    input_origin: [i32; 2],
+    process_origin: [i32; 2],
+    source_size: [u32; 2],
+    process_size: [u32; 2],
+    source_region: [f32; 4],
+    inverse_x: [f32; 2],
+    inverse_y: [f32; 2],
+    inverse_offset: [f32; 2],
+    _padding: [f32; 2],
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum VideoResampleMode {
     Lanczos3 { smoothing_percent: u32 },
     Nis,
     Nearest,
+    Anime4k { variant: Anime4kVariant },
 }
 
 pub(super) fn select_video_resample_mode(
@@ -162,6 +180,9 @@ pub(super) fn select_video_resample_mode(
     Some(match (filter, downscaling) {
         (VideoScaleFilter::Sharp, false) => VideoResampleMode::Nis,
         (VideoScaleFilter::Nearest, false) => VideoResampleMode::Nearest,
+        (VideoScaleFilter::Anime, false) => VideoResampleMode::Anime4k {
+            variant: VIDEO_ANIME4K_B2_VARIANT,
+        },
         _ => VideoResampleMode::Lanczos3 { smoothing_percent },
     })
 }
@@ -174,6 +195,38 @@ struct IntermediateTarget {
     render_target: ID3D11RenderTargetView,
 }
 
+struct VideoAnime4kBytecodeVariant {
+    variant: Anime4kVariant,
+    convolution: &'static [&'static [u8]],
+    resolve: &'static [u8],
+}
+
+include!(concat!(env!("OUT_DIR"), "/video_anime4k_bytecode.rs"));
+
+struct VideoAnime4kPipeline {
+    variant: Anime4kVariant,
+    convolution_shaders: Vec<ID3D11PixelShader>,
+    resolve_shader: ID3D11PixelShader,
+    convolution_constants: ID3D11Buffer,
+    resolve_constants: ID3D11Buffer,
+    intermediates: Vec<IntermediateTarget>,
+}
+
+pub(super) enum VideoResamplePrepareError {
+    IntermediateCreation(String),
+    Anime4kPipelineUnavailable {
+        variant: Anime4kVariant,
+        error: String,
+    },
+    Anime4kIntermediateCreationFailed {
+        variant: Anime4kVariant,
+        pass_index: usize,
+        width: u32,
+        height: u32,
+        error: String,
+    },
+}
+
 pub(super) struct VideoResamplePipeline {
     vertex_shader: ID3D11VertexShader,
     horizontal_shader: ID3D11PixelShader,
@@ -183,6 +236,154 @@ pub(super) struct VideoResamplePipeline {
     constants: ID3D11Buffer,
     nis_constants: ID3D11Buffer,
     intermediate: Option<IntermediateTarget>,
+    anime4k: Option<VideoAnime4kPipeline>,
+    anime4k_error: Option<String>,
+}
+
+impl VideoAnime4kPipeline {
+    fn new(device: &ID3D11Device1, variant: Anime4kVariant) -> Result<Self, String> {
+        let bytecode = VIDEO_ANIME4K_BYTECODE_VARIANTS
+            .iter()
+            .find(|data| data.variant == variant)
+            .ok_or_else(|| format!("embedded bytecode is missing for {}", variant.label()))?;
+        if bytecode.convolution.len() != variant.intermediate_count() {
+            return Err(format!(
+                "{} bytecode/topology mismatch: shaders={} intermediates={}",
+                variant.label(),
+                bytecode.convolution.len(),
+                variant.intermediate_count()
+            ));
+        }
+        if variant.pass_inputs().len() != bytecode.convolution.len() + 1 {
+            return Err(format!(
+                "{} bytecode/topology mismatch: passes={} bytecode={}",
+                variant.label(),
+                variant.pass_inputs().len(),
+                bytecode.convolution.len() + 1
+            ));
+        }
+
+        let load_started = std::time::Instant::now();
+        let mut convolution_shaders = Vec::with_capacity(bytecode.convolution.len());
+        for (pass_index, shader_bytecode) in bytecode.convolution.iter().enumerate() {
+            let mut shader = None;
+            unsafe {
+                device
+                    .CreatePixelShader(shader_bytecode, None, Some(&mut shader))
+                    .map_err(|error| {
+                        format!(
+                            "CreatePixelShader {} pass {pass_index}: {error:?}",
+                            variant.label()
+                        )
+                    })?;
+            }
+            convolution_shaders.push(shader.ok_or_else(|| {
+                format!(
+                    "CreatePixelShader {} pass {pass_index} returned null",
+                    variant.label()
+                )
+            })?);
+        }
+        let mut resolve_shader = None;
+        unsafe {
+            device
+                .CreatePixelShader(bytecode.resolve, None, Some(&mut resolve_shader))
+                .map_err(|error| {
+                    format!("CreatePixelShader {} resolve: {error:?}", variant.label())
+                })?;
+        }
+        let resolve_shader = resolve_shader.ok_or_else(|| {
+            format!(
+                "CreatePixelShader {} resolve returned null",
+                variant.label()
+            )
+        })?;
+        let convolution_constants = create_constant_buffer::<Anime4kConstants>(
+            device,
+            &format!("{} convolution constants", variant.label()),
+        )?;
+        let resolve_constants = create_constant_buffer::<Anime4kConstants>(
+            device,
+            &format!("{} resolve constants", variant.label()),
+        )?;
+        let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+        let bytecode_bytes = bytecode
+            .convolution
+            .iter()
+            .map(|bytes| bytes.len() as u64)
+            .sum::<u64>()
+            .saturating_add(bytecode.resolve.len() as u64);
+        crate::logger::log(format!(
+            "native-presenter: Anime4K bytecode loaded variant={} shaders={} bytes={} load_ms={load_ms:.3}",
+            variant.label(),
+            bytecode.convolution.len() + 1,
+            bytecode_bytes
+        ));
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "native_presenter",
+                "video_anime4k_bytecode_loaded",
+                None,
+                0,
+                &[
+                    ("variant", serde_json::Value::from(variant.label())),
+                    (
+                        "shader_count",
+                        serde_json::Value::from((bytecode.convolution.len() + 1) as i64),
+                    ),
+                    ("bytecode_bytes", serde_json::Value::from(bytecode_bytes)),
+                    ("load_ms", serde_json::Value::from(load_ms)),
+                ],
+            );
+        }
+        Ok(Self {
+            variant,
+            convolution_shaders,
+            resolve_shader,
+            convolution_constants,
+            resolve_constants,
+            intermediates: Vec::new(),
+        })
+    }
+
+    fn prepare(
+        &mut self,
+        device: &ID3D11Device1,
+        width: u32,
+        height: u32,
+    ) -> Result<(), VideoResamplePrepareError> {
+        let width = width.max(1);
+        let height = height.max(1);
+        if self.intermediates.len() == self.variant.intermediate_count()
+            && self
+                .intermediates
+                .iter()
+                .all(|target| target.width == width && target.height == height)
+        {
+            return Ok(());
+        }
+        let mut prepared = Vec::with_capacity(self.variant.intermediate_count());
+        for pass_index in 0..self.variant.intermediate_count() {
+            let target = create_intermediate_target(device, width, height).map_err(|error| {
+                VideoResamplePrepareError::Anime4kIntermediateCreationFailed {
+                    variant: self.variant,
+                    pass_index,
+                    width,
+                    height,
+                    error,
+                }
+            })?;
+            prepared.push(target);
+        }
+        self.intermediates = prepared;
+        Ok(())
+    }
+
+    fn intermediate_vram_bytes(&self) -> u64 {
+        self.intermediates.iter().fold(0_u64, |total, target| {
+            total.saturating_add(u64::from(target.width) * u64::from(target.height) * 8)
+        })
+    }
 }
 
 impl VideoResamplePipeline {
@@ -238,6 +439,20 @@ impl VideoResamplePipeline {
                 .CreateBuffer(&nis_constants_desc, None, Some(&mut nis_constants))
                 .map_err(|error| format!("CreateBuffer NIS constants: {error:?}"))?;
         }
+        // Anime4K is optional within the resample pipeline so a device-specific
+        // shader creation failure does not disable Standard/NIS/Nearest. The
+        // retained typed error is surfaced if Anime is actually selected.
+        let (anime4k, anime4k_error) =
+            match VideoAnime4kPipeline::new(device, VIDEO_ANIME4K_B2_VARIANT) {
+                Ok(pipeline) => (Some(pipeline), None),
+                Err(error) => {
+                    crate::logger::log(format!(
+                        "native-presenter: Anime4K pipeline unavailable variant={} error={error}",
+                        VIDEO_ANIME4K_B2_VARIANT.label()
+                    ));
+                    (None, Some(error))
+                }
+            };
         Ok(Self {
             vertex_shader: vertex_shader
                 .ok_or_else(|| "CreateVertexShader resample returned null".to_string())?,
@@ -254,6 +469,8 @@ impl VideoResamplePipeline {
             nis_constants: nis_constants
                 .ok_or_else(|| "CreateBuffer NIS constants returned null".to_string())?,
             intermediate: None,
+            anime4k,
+            anime4k_error,
         })
     }
 
@@ -279,7 +496,23 @@ impl VideoResamplePipeline {
         target_width: u32,
         orientation: VideoOrientation,
         mode: VideoResampleMode,
-    ) -> Result<(), String> {
+    ) -> Result<(), VideoResamplePrepareError> {
+        if let VideoResampleMode::Anime4k { variant } = mode {
+            let Some(pipeline) = self
+                .anime4k
+                .as_mut()
+                .filter(|value| value.variant == variant)
+            else {
+                return Err(VideoResamplePrepareError::Anime4kPipelineUnavailable {
+                    variant,
+                    error: self
+                        .anime4k_error
+                        .clone()
+                        .unwrap_or_else(|| "pipeline was not created for this variant".to_string()),
+                });
+            };
+            return pipeline.prepare(device, source_width, source_height);
+        }
         if !matches!(mode, VideoResampleMode::Lanczos3 { .. }) {
             return Ok(());
         }
@@ -292,37 +525,10 @@ impl VideoResamplePipeline {
         {
             return Ok(());
         }
-        let desc = D3D11_TEXTURE2D_DESC {
-            Width: width,
-            Height: height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET).0 as u32,
-            ..Default::default()
-        };
-        let mut texture = None;
-        unsafe {
-            device
-                .CreateTexture2D(&desc, None, Some(&mut texture))
-                .map_err(|error| format!("CreateTexture2D resample intermediate: {error:?}"))?;
-        }
-        let texture = texture
-            .ok_or_else(|| "CreateTexture2D resample intermediate returned null".to_string())?;
-        let shader_view = create_shader_view(device, &texture)?;
-        let render_target = create_render_target(device, &texture)?;
-        self.intermediate = Some(IntermediateTarget {
-            width,
-            height,
-            _texture: texture,
-            shader_view,
-            render_target,
-        });
+        self.intermediate = Some(
+            create_intermediate_target(device, width, height)
+                .map_err(VideoResamplePrepareError::IntermediateCreation)?,
+        );
         Ok(())
     }
 
@@ -364,6 +570,18 @@ impl VideoResamplePipeline {
                 target_height,
                 orientation,
                 mode,
+            ),
+            VideoResampleMode::Anime4k { variant } => self.draw_anime4k(
+                device,
+                context,
+                source,
+                target,
+                source_width,
+                source_height,
+                target_width,
+                target_height,
+                orientation,
+                variant,
             ),
         }
     }
@@ -553,6 +771,9 @@ impl VideoResamplePipeline {
                 VideoResampleMode::Lanczos3 { .. } => {
                     return Err("Lanczos3 entered the single-pass resampler".to_string());
                 }
+                VideoResampleMode::Anime4k { .. } => {
+                    return Err("Anime4K entered the single-pass resampler".to_string());
+                }
             }
             context.PSSetShaderResources(0, Some(&[Some(source_view)]));
             context.RSSetViewports(Some(&[viewport(target_width, target_height)]));
@@ -565,11 +786,156 @@ impl VideoResamplePipeline {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn draw_anime4k(
+        &self,
+        device: &ID3D11Device1,
+        context: &ID3D11DeviceContext,
+        source: &ID3D11Texture2D,
+        target: &ID3D11Texture2D,
+        source_width: u32,
+        source_height: u32,
+        target_width: u32,
+        target_height: u32,
+        orientation: VideoOrientation,
+        variant: Anime4kVariant,
+    ) -> Result<(), String> {
+        let pipeline = self
+            .anime4k
+            .as_ref()
+            .filter(|value| value.variant == variant)
+            .ok_or_else(|| {
+                format!(
+                    "{} pipeline was not prepared: {}",
+                    variant.label(),
+                    self.anime4k_error.as_deref().unwrap_or("variant mismatch")
+                )
+            })?;
+        if pipeline.intermediates.len() != variant.intermediate_count() {
+            return Err(format!(
+                "{} intermediates were not prepared: expected={} actual={}",
+                variant.label(),
+                variant.intermediate_count(),
+                pipeline.intermediates.len()
+            ));
+        }
+        if pipeline
+            .intermediates
+            .iter()
+            .any(|value| value.width != source_width || value.height != source_height)
+        {
+            return Err(format!(
+                "{} intermediates do not match source {}x{}",
+                variant.label(),
+                source_width,
+                source_height
+            ));
+        }
+
+        let source_view = create_shader_view(device, source)?;
+        let target_view = create_render_target(device, target)?;
+        let common = anime4k_video_constants(
+            source_width,
+            source_height,
+            source_width,
+            source_height,
+            orientation,
+        );
+        let resolve = anime4k_video_constants(
+            source_width,
+            source_height,
+            target_width,
+            target_height,
+            orientation,
+        );
+        let pass_inputs = variant.pass_inputs();
+        let input_binding_count = variant.input_binding_count();
+        let unbound_views = vec![None; input_binding_count];
+
+        unsafe {
+            context.UpdateSubresource(
+                &pipeline.convolution_constants,
+                0,
+                None,
+                (&common as *const Anime4kConstants).cast(),
+                0,
+                0,
+            );
+            context.UpdateSubresource(
+                &pipeline.resolve_constants,
+                0,
+                None,
+                (&resolve as *const Anime4kConstants).cast(),
+                0,
+                0,
+            );
+            context.IASetInputLayout(None);
+            context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            // Do not use the Naga-generated vs_main here. Its WebGPU winding is
+            // culled by D3D11's default rasterizer. This is the same production
+            // native fullscreen vertex shader used by the verified NIS path.
+            context.VSSetShader(&self.vertex_shader, None);
+            context.RSSetState(None);
+            context.OMSetBlendState(None, None, u32::MAX);
+            context.OMSetDepthStencilState(None, 0);
+            context.PSSetShaderResources(0, Some(&unbound_views));
+            context.OMSetRenderTargets(None, None);
+            context.PSSetConstantBuffers(0, Some(&[Some(pipeline.convolution_constants.clone())]));
+            context.RSSetViewports(Some(&[viewport(source_width, source_height)]));
+
+            for pass_index in 0..variant.intermediate_count() {
+                let views = anime4k_pass_views(
+                    pass_inputs[pass_index],
+                    input_binding_count,
+                    &source_view,
+                    &pipeline.intermediates,
+                )?;
+                context.PSSetShader(&pipeline.convolution_shaders[pass_index], None);
+                context.PSSetShaderResources(0, Some(&views));
+                context.OMSetRenderTargets(
+                    Some(&[Some(
+                        pipeline.intermediates[pass_index].render_target.clone(),
+                    )]),
+                    None,
+                );
+                context.Draw(3, 0);
+                context.PSSetShaderResources(0, Some(&unbound_views));
+                context.OMSetRenderTargets(None, None);
+            }
+
+            let views = anime4k_pass_views(
+                pass_inputs
+                    .last()
+                    .expect("generated Anime4K topology has a resolve pass"),
+                input_binding_count,
+                &source_view,
+                &pipeline.intermediates,
+            )?;
+            context.PSSetConstantBuffers(0, Some(&[Some(pipeline.resolve_constants.clone())]));
+            context.PSSetShader(&pipeline.resolve_shader, None);
+            context.PSSetShaderResources(0, Some(&views));
+            context.RSSetViewports(Some(&[viewport(target_width, target_height)]));
+            context.OMSetRenderTargets(Some(&[Some(target_view)]), None);
+            context.Draw(3, 0);
+
+            context.PSSetShaderResources(0, Some(&unbound_views));
+            context.OMSetRenderTargets(None, None);
+        }
+        Ok(())
+    }
+
     pub(super) fn intermediate_vram_bytes(&self) -> u64 {
-        self.intermediate
+        let lanczos = self
+            .intermediate
             .as_ref()
             .map(|target| u64::from(target.width) * u64::from(target.height) * 8)
-            .unwrap_or(0)
+            .unwrap_or(0);
+        lanczos.saturating_add(
+            self.anime4k
+                .as_ref()
+                .map(VideoAnime4kPipeline::intermediate_vram_bytes)
+                .unwrap_or(0),
+        )
     }
 }
 
@@ -620,6 +986,36 @@ fn inverse_orientation_mapping(
     }
 }
 
+fn anime4k_video_constants(
+    source_width: u32,
+    source_height: u32,
+    output_width: u32,
+    output_height: u32,
+    orientation: VideoOrientation,
+) -> Anime4kConstants {
+    let source_width = source_width.max(1);
+    let source_height = source_height.max(1);
+    let mapping = inverse_orientation_mapping(source_width, source_height, orientation);
+    Anime4kConstants {
+        output_size: [output_width.max(1), output_height.max(1)],
+        input_size: [source_width, source_height],
+        input_origin: [0, 0],
+        process_origin: [0, 0],
+        source_size: [source_width, source_height],
+        process_size: [source_width, source_height],
+        source_region: [
+            0.0,
+            0.0,
+            mapping.source_axis_x as f32,
+            mapping.source_axis_y as f32,
+        ],
+        inverse_x: mapping.inverse_x,
+        inverse_y: mapping.inverse_y,
+        inverse_offset: mapping.offset,
+        _padding: [0.0, 0.0],
+    }
+}
+
 fn viewport(width: u32, height: u32) -> D3D11_VIEWPORT {
     D3D11_VIEWPORT {
         TopLeftX: 0.0,
@@ -631,15 +1027,95 @@ fn viewport(width: u32, height: u32) -> D3D11_VIEWPORT {
     }
 }
 
+fn create_constant_buffer<T>(device: &ID3D11Device1, label: &str) -> Result<ID3D11Buffer, String> {
+    let desc = D3D11_BUFFER_DESC {
+        ByteWidth: std::mem::size_of::<T>() as u32,
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+        ..Default::default()
+    };
+    let mut buffer = None;
+    unsafe {
+        device
+            .CreateBuffer(&desc, None, Some(&mut buffer))
+            .map_err(|error| format!("CreateBuffer {label}: {error:?}"))?;
+    }
+    buffer.ok_or_else(|| format!("CreateBuffer {label} returned null"))
+}
+
+fn create_intermediate_target(
+    device: &ID3D11Device1,
+    width: u32,
+    height: u32,
+) -> Result<IntermediateTarget, String> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width.max(1),
+        Height: height.max(1),
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET).0 as u32,
+        ..Default::default()
+    };
+    let mut texture = None;
+    unsafe {
+        device
+            .CreateTexture2D(&desc, None, Some(&mut texture))
+            .map_err(|error| format!("CreateTexture2D resample intermediate: {error:?}"))?;
+    }
+    let texture =
+        texture.ok_or_else(|| "CreateTexture2D resample intermediate returned null".to_string())?;
+    let shader_view = create_shader_view(device, &texture)?;
+    let render_target = create_render_target(device, &texture)?;
+    Ok(IntermediateTarget {
+        width: width.max(1),
+        height: height.max(1),
+        _texture: texture,
+        shader_view,
+        render_target,
+    })
+}
+
+fn anime4k_pass_views(
+    inputs: &[Anime4kPassInput],
+    input_binding_count: usize,
+    source: &ID3D11ShaderResourceView,
+    intermediates: &[IntermediateTarget],
+) -> Result<Vec<Option<ID3D11ShaderResourceView>>, String> {
+    let selected = inputs
+        .iter()
+        .map(|input| match *input {
+            Anime4kPassInput::Source => Ok(source.clone()),
+            Anime4kPassInput::Intermediate(index) => intermediates
+                .get(index)
+                .map(|target| target.shader_view.clone())
+                .ok_or_else(|| format!("Anime4K input references missing intermediate {index}")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let fallback = selected
+        .first()
+        .ok_or_else(|| "Anime4K pass has no inputs".to_string())?;
+    if selected.len() > input_binding_count {
+        return Err(format!(
+            "Anime4K pass has {} inputs but only {input_binding_count} bindings",
+            selected.len()
+        ));
+    }
+    Ok((0..input_binding_count)
+        .map(|binding| Some(selected.get(binding).unwrap_or(fallback).clone()))
+        .collect())
+}
+
 fn compile_resample_shader(entry: &'static str, target: &'static str) -> Result<ID3DBlob, String> {
     compile_shader_source(RESAMPLE_SHADER, entry, target)
 }
 
-fn compile_shader_source(
-    source: &[u8],
-    entry: &'static str,
-    target: &'static str,
-) -> Result<ID3DBlob, String> {
+fn compile_shader_source(source: &[u8], entry: &str, target: &str) -> Result<ID3DBlob, String> {
     let mut bytecode = None;
     let mut errors = None;
     let entry = std::ffi::CString::new(entry).expect("static shader entry");
@@ -717,6 +1193,8 @@ fn create_render_target<T: Interface>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    const ANIME4K_VL_HLSL: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/video_anime4k_vl.hlsl"));
     use windows::Win32::Graphics::Direct3D::{
         D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0,
     };
@@ -744,27 +1222,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resample_hlsl_compiles_for_shader_model_5() {
-        compile_resample_shader("vs_main", "vs_5_0").expect("vertex shader");
-        compile_resample_shader("ps_horizontal", "ps_5_0").expect("horizontal shader");
-        compile_resample_shader("ps_vertical", "ps_5_0").expect("vertical shader");
-        compile_resample_shader("ps_nearest", "ps_5_0").expect("nearest shader");
-    }
-
-    #[test]
-    fn nis_converter_output_compiles_for_shader_model_5() {
-        compile_shader_source(NIS_SHADER, "vs_main", "vs_5_0").expect("NIS vertex shader");
-        compile_shader_source(NIS_SHADER, "fs_nis", "ps_5_0").expect("NIS pixel shader");
-    }
-
-    #[test]
-    fn nis_draw_writes_target_with_default_d3d11_rasterizer() {
-        const SOURCE_WIDTH: u32 = 8;
-        const SOURCE_HEIGHT: u32 = 8;
-        const TARGET_WIDTH: u32 = 16;
-        const TARGET_HEIGHT: u32 = 16;
-
+    fn warp_device() -> (ID3D11Device1, ID3D11DeviceContext) {
         let mut base_device: Option<ID3D11Device> = None;
         let mut context: Option<ID3D11DeviceContext> = None;
         let mut feature_level = D3D_FEATURE_LEVEL::default();
@@ -783,11 +1241,34 @@ mod tests {
             .expect("create WARP D3D11 device");
         }
         assert_eq!(feature_level, D3D_FEATURE_LEVEL_11_0);
-        let device: ID3D11Device1 = base_device
+        let device = base_device
             .expect("D3D11 device")
             .cast()
             .expect("ID3D11Device1");
-        let context = context.expect("D3D11 immediate context");
+        (device, context.expect("D3D11 immediate context"))
+    }
+
+    #[test]
+    fn resample_hlsl_compiles_for_shader_model_5() {
+        compile_resample_shader("vs_main", "vs_5_0").expect("vertex shader");
+        compile_resample_shader("ps_horizontal", "ps_5_0").expect("horizontal shader");
+        compile_resample_shader("ps_vertical", "ps_5_0").expect("vertical shader");
+        compile_resample_shader("ps_nearest", "ps_5_0").expect("nearest shader");
+    }
+
+    #[test]
+    fn nis_converter_output_compiles_for_shader_model_5() {
+        compile_shader_source(NIS_SHADER, "vs_main", "vs_5_0").expect("NIS vertex shader");
+        compile_shader_source(NIS_SHADER, "fs_nis", "ps_5_0").expect("NIS pixel shader");
+    }
+
+    fn assert_resample_mode_writes_target(mode: VideoResampleMode, label: &str) {
+        const SOURCE_WIDTH: u32 = 8;
+        const SOURCE_HEIGHT: u32 = 8;
+        const TARGET_WIDTH: u32 = 16;
+        const TARGET_HEIGHT: u32 = 16;
+
+        let (device, context) = warp_device();
 
         let source_pixels = vec![
             0xFF_u8;
@@ -809,9 +1290,9 @@ mod tests {
         unsafe {
             device
                 .CreateTexture2D(&source_desc, Some(&source_initial), Some(&mut source))
-                .expect("create NIS source texture");
+                .unwrap_or_else(|error| panic!("create {label} source texture: {error:?}"));
         }
-        let source = source.expect("NIS source texture");
+        let source = source.unwrap_or_else(|| panic!("{label} source texture"));
 
         let mut target = None;
         let target_desc = test_texture_desc(
@@ -822,15 +1303,27 @@ mod tests {
         unsafe {
             device
                 .CreateTexture2D(&target_desc, None, Some(&mut target))
-                .expect("create NIS target texture");
+                .unwrap_or_else(|error| panic!("create {label} target texture: {error:?}"));
         }
-        let target = target.expect("NIS target texture");
-        let target_view = create_render_target(&device, &target).expect("NIS target view");
+        let target = target.unwrap_or_else(|| panic!("{label} target texture"));
+        let target_view = create_render_target(&device, &target)
+            .unwrap_or_else(|error| panic!("{label} target view: {error}"));
         unsafe {
             context.ClearRenderTargetView(&target_view, &[0.0, 0.0, 0.0, 1.0]);
         }
 
-        let pipeline = VideoResamplePipeline::new(&device).expect("NIS pipeline");
+        let mut pipeline = VideoResamplePipeline::new(&device)
+            .unwrap_or_else(|error| panic!("{label} pipeline: {error}"));
+        pipeline
+            .prepare(
+                &device,
+                SOURCE_WIDTH,
+                SOURCE_HEIGHT,
+                TARGET_WIDTH,
+                VideoOrientation::IDENTITY,
+                mode,
+            )
+            .unwrap_or_else(|_| panic!("prepare {label}"));
         pipeline
             .draw(
                 &device,
@@ -842,9 +1335,9 @@ mod tests {
                 TARGET_WIDTH,
                 TARGET_HEIGHT,
                 VideoOrientation::IDENTITY,
-                VideoResampleMode::Nis,
+                mode,
             )
-            .expect("draw NIS");
+            .unwrap_or_else(|error| panic!("draw {label}: {error}"));
 
         let mut staging = None;
         let staging_desc = D3D11_TEXTURE2D_DESC {
@@ -856,9 +1349,9 @@ mod tests {
         unsafe {
             device
                 .CreateTexture2D(&staging_desc, None, Some(&mut staging))
-                .expect("create NIS staging texture");
+                .unwrap_or_else(|error| panic!("create {label} staging texture: {error:?}"));
         }
-        let staging = staging.expect("NIS staging texture");
+        let staging = staging.unwrap_or_else(|| panic!("{label} staging texture"));
         let target_resource: ID3D11Resource = target.cast().expect("target resource");
         let staging_resource: ID3D11Resource = staging.cast().expect("staging resource");
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
@@ -866,7 +1359,7 @@ mod tests {
             context.CopyResource(&staging_resource, &target_resource);
             context
                 .Map(&staging_resource, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-                .expect("map NIS target");
+                .unwrap_or_else(|error| panic!("map {label} target: {error:?}"));
             let mut first_unwritten = None;
             'rows: for y in 0..TARGET_HEIGHT {
                 for x in 0..TARGET_WIDTH {
@@ -884,12 +1377,27 @@ mod tests {
         };
         assert!(
             first_unwritten.is_none(),
-            "NIS must overwrite the entire cleared target; first unwritten pixel was {first_unwritten:?}"
+            "{label} must overwrite the entire cleared target; first unwritten pixel was {first_unwritten:?}"
         );
     }
 
     #[test]
-    fn phase_a_filter_modes_use_lanczos_for_every_downscale() {
+    fn nis_draw_writes_target_with_default_d3d11_rasterizer() {
+        assert_resample_mode_writes_target(VideoResampleMode::Nis, "NIS");
+    }
+
+    #[test]
+    fn anime4k_chain_writes_target_with_native_fullscreen_vertex_shader() {
+        assert_resample_mode_writes_target(
+            VideoResampleMode::Anime4k {
+                variant: VIDEO_ANIME4K_B2_VARIANT,
+            },
+            "Anime4K VL",
+        );
+    }
+
+    #[test]
+    fn shader_filter_modes_use_their_upscaler_and_lanczos_for_every_downscale() {
         assert_eq!(
             select_video_resample_mode(VideoScaleFilter::Sharp, 1280, 720, 1920, 1080, 40),
             Some(VideoResampleMode::Nis)
@@ -898,10 +1406,17 @@ mod tests {
             select_video_resample_mode(VideoScaleFilter::Nearest, 1280, 720, 1920, 1080, 40),
             Some(VideoResampleMode::Nearest)
         );
+        assert_eq!(
+            select_video_resample_mode(VideoScaleFilter::Anime, 1280, 720, 1920, 1080, 40),
+            Some(VideoResampleMode::Anime4k {
+                variant: VIDEO_ANIME4K_B2_VARIANT
+            })
+        );
         for filter in [
             VideoScaleFilter::Standard,
             VideoScaleFilter::Sharp,
             VideoScaleFilter::Nearest,
+            VideoScaleFilter::Anime,
         ] {
             assert_eq!(
                 select_video_resample_mode(filter, 3840, 2160, 1920, 1080, 40),
@@ -914,6 +1429,95 @@ mod tests {
             select_video_resample_mode(VideoScaleFilter::OsDefault, 1280, 720, 1920, 1080, 40),
             None
         );
+    }
+
+    #[test]
+    fn embedded_anime4k_bytecode_matches_every_generated_topology() {
+        for bytecode in VIDEO_ANIME4K_BYTECODE_VARIANTS {
+            assert_eq!(
+                bytecode.convolution.len(),
+                bytecode.variant.intermediate_count(),
+                "{}",
+                bytecode.variant.label()
+            );
+            assert_eq!(
+                bytecode.variant.pass_inputs().len(),
+                bytecode.convolution.len() + 1,
+                "{}",
+                bytecode.variant.label()
+            );
+            assert!(
+                bytecode.convolution.iter().all(|shader| !shader.is_empty()),
+                "{}",
+                bytecode.variant.label()
+            );
+            assert!(!bytecode.resolve.is_empty(), "{}", bytecode.variant.label());
+        }
+    }
+
+    #[test]
+    #[ignore = "manual B3 cost measurement; compiles all 18 VL passes"]
+    fn measure_anime4k_vl_runtime_compile_versus_bytecode_load() {
+        let (device, _context) = warp_device();
+        let compile_started = std::time::Instant::now();
+        let mut runtime_shaders = Vec::with_capacity(VIDEO_ANIME4K_B2_VARIANT.pass_inputs().len());
+        for pass_index in 0..VIDEO_ANIME4K_B2_VARIANT.intermediate_count() {
+            let entry = format!("fs_anime4k_{pass_index}_");
+            let blob = compile_shader_source(ANIME4K_VL_HLSL, &entry, "ps_5_0")
+                .unwrap_or_else(|error| panic!("compile {entry}: {error}"));
+            let mut shader = None;
+            unsafe {
+                device
+                    .CreatePixelShader(blob_bytes(&blob), None, Some(&mut shader))
+                    .unwrap_or_else(|error| panic!("create {entry}: {error:?}"));
+            }
+            runtime_shaders.push(shader.expect("runtime-compiled Anime4K shader"));
+        }
+        let resolve_blob = compile_shader_source(ANIME4K_VL_HLSL, "fs_anime4k_resolve", "ps_5_0")
+            .expect("compile Anime4K resolve");
+        let mut resolve_shader = None;
+        unsafe {
+            device
+                .CreatePixelShader(blob_bytes(&resolve_blob), None, Some(&mut resolve_shader))
+                .expect("create runtime-compiled Anime4K resolve");
+        }
+        runtime_shaders.push(resolve_shader.expect("runtime-compiled Anime4K resolve"));
+        let _runtime_convolution_constants =
+            create_constant_buffer::<Anime4kConstants>(&device, "runtime Anime4K convolution")
+                .expect("runtime Anime4K convolution constants");
+        let _runtime_resolve_constants =
+            create_constant_buffer::<Anime4kConstants>(&device, "runtime Anime4K resolve")
+                .expect("runtime Anime4K resolve constants");
+        let compile_ms = compile_started.elapsed().as_secs_f64() * 1000.0;
+
+        let load_started = std::time::Instant::now();
+        let loaded = VideoAnime4kPipeline::new(&device, VIDEO_ANIME4K_B2_VARIANT)
+            .expect("load embedded Anime4K VL bytecode");
+        let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(runtime_shaders.len(), loaded.convolution_shaders.len() + 1);
+        println!(
+            "Anime4K VL pipeline: runtime_compile_ms={compile_ms:.3} bytecode_load_ms={load_ms:.3} shaders={}",
+            runtime_shaders.len()
+        );
+    }
+
+    #[test]
+    fn anime4k_constant_layout_matches_generated_shader() {
+        assert_eq!(std::mem::size_of::<Anime4kConstants>(), 96);
+    }
+
+    #[test]
+    fn anime4k_resolve_maps_the_oriented_whole_frame_back_to_raw_texels() {
+        let constants =
+            anime4k_video_constants(1920, 1080, 2160, 3840, VideoOrientation::new(90, false));
+        assert_eq!(constants.output_size, [2160, 3840]);
+        assert_eq!(constants.source_size, [1920, 1080]);
+        assert_eq!(constants.process_origin, [0, 0]);
+        assert_eq!(constants.process_size, [1920, 1080]);
+        assert_eq!(constants.source_region, [0.0, 0.0, 1080.0, 1920.0]);
+        assert_eq!(constants.inverse_x, [0.0, -1.0]);
+        assert_eq!(constants.inverse_y, [1.0, 0.0]);
+        assert_eq!(constants.inverse_offset, [0.0, 1079.0]);
     }
 
     #[test]

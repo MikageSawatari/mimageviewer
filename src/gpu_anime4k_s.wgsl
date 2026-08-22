@@ -33,6 +33,10 @@ struct Anime4kParams {
     source_size: vec2<u32>,
     process_size: vec2<u32>,
     source_region: vec4<f32>,
+    inverse_x: vec2<f32>,
+    inverse_y: vec2<f32>,
+    inverse_offset: vec2<f32>,
+    _padding: vec2<f32>,
 }
 
 @group(0) @binding(0) var input_0: texture_2d<f32>;
@@ -219,9 +223,12 @@ fn bilinear_correction(position: vec2<f32>) -> vec3<f32> {
 @fragment
 fn fs_anime4k_resolve(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let target_position = position.xy;
-    let source_position = params.source_region.xy
+    let oriented_source_position = params.source_region.xy
         + target_position * params.source_region.zw / vec2<f32>(params.output_size)
         - vec2<f32>(0.5, 0.5);
+    let source_position = oriented_source_position.x * params.inverse_x
+        + oriented_source_position.y * params.inverse_y
+        + params.inverse_offset;
     let base = bilinear_source(source_position);
     let correction_position = 2.0 * (source_position + vec2<f32>(0.5, 0.5))
         - vec2<f32>(0.5, 0.5);

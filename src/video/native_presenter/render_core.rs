@@ -58,7 +58,7 @@ use self::grade_pipeline::VideoGradePipeline;
 #[path = "resample_pipeline.rs"]
 mod resample_pipeline;
 use self::resample_pipeline::{
-    VideoResampleMode, VideoResamplePipeline, select_video_resample_mode,
+    VideoResampleMode, VideoResamplePipeline, VideoResamplePrepareError, select_video_resample_mode,
 };
 #[path = "surface_policy.rs"]
 mod surface_policy;
@@ -1770,8 +1770,9 @@ impl NativeRenderCore {
             let d3d_context1: ID3D11DeviceContext1 = d3d_context
                 .cast()
                 .map_err(|e| format!("cast ID3D11DeviceContext1: {e:?}"))?;
-            // Compile every Phase A shader while the render pipeline is created.
-            // A later filter selection never invokes D3DCompile.
+            // Compile every small Phase A shader while the render pipeline is
+            // created. Anime4K pixel shaders are loaded here from build-time FXC
+            // bytecode. A later filter selection never invokes D3DCompile.
             let grade_pipeline = VideoGradePipeline::new(&d3d_device1)?;
             let (resample_pipeline, resample_pipeline_error) = match VideoResamplePipeline::new(
                 &d3d_device1,
@@ -3007,13 +3008,34 @@ impl NativeRenderCore {
                 orientation,
                 mode,
             )
-            .map_err(
-                |error| VideoScaleFallbackReason::ResampleIntermediateCreationFailed {
-                    width: intermediate_width,
-                    height: intermediate_height,
+            .map_err(|error| match error {
+                VideoResamplePrepareError::IntermediateCreation(error) => {
+                    VideoScaleFallbackReason::ResampleIntermediateCreationFailed {
+                        width: intermediate_width,
+                        height: intermediate_height,
+                        error,
+                    }
+                }
+                VideoResamplePrepareError::Anime4kPipelineUnavailable { variant, error } => {
+                    VideoScaleFallbackReason::Anime4kPipelineUnavailable {
+                        variant: variant.label(),
+                        error,
+                    }
+                }
+                VideoResamplePrepareError::Anime4kIntermediateCreationFailed {
+                    variant,
+                    pass_index,
+                    width,
+                    height,
+                    error,
+                } => VideoScaleFallbackReason::Anime4kIntermediateCreationFailed {
+                    variant: variant.label(),
+                    pass_index,
+                    width,
+                    height,
                     error,
                 },
-            )?;
+            })?;
         if grade_active {
             self.grade_pipeline
                 .prepare_intermediate(&self.d3d_device1, source_width, source_height)
@@ -3692,6 +3714,12 @@ impl NativeRenderCore {
                     (Some(VideoResampleMode::Nis), false) => "cpu_upload_resample_nis",
                     (Some(VideoResampleMode::Nearest), true) => "cpu_upload_grade_resample_nearest",
                     (Some(VideoResampleMode::Nearest), false) => "cpu_upload_resample_nearest",
+                    (Some(VideoResampleMode::Anime4k { .. }), true) => {
+                        "cpu_upload_grade_resample_anime4k"
+                    }
+                    (Some(VideoResampleMode::Anime4k { .. }), false) => {
+                        "cpu_upload_resample_anime4k"
+                    }
                     (None, true) => "cpu_upload_grade",
                     (None, false) => "cpu_upload",
                 };
@@ -3838,6 +3866,12 @@ impl NativeRenderCore {
                         "d3d11_shared_grade_resample_nearest"
                     }
                     (Some(VideoResampleMode::Nearest), false) => "d3d11_shared_resample_nearest",
+                    (Some(VideoResampleMode::Anime4k { .. }), true) => {
+                        "d3d11_shared_grade_resample_anime4k"
+                    }
+                    (Some(VideoResampleMode::Anime4k { .. }), false) => {
+                        "d3d11_shared_resample_anime4k"
+                    }
                     (None, true) => "d3d11_shared_grade",
                     (None, false) => "d3d11_shared",
                 };

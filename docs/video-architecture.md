@@ -48,7 +48,7 @@ NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終�
 ### Native presenter の表示解像度 scaling
 
 `Settings::video_scale_filter` の `OS に任せる` は、従来どおり source 解像度の video swap
-chain を DComp transform で拡大・縮小する。Phase A の 3 方式は映像表示矩形の物理 pixel 寸法で
+chain を DComp transform で拡大・縮小する。shader を使う 4 方式は映像表示矩形の物理 pixel 寸法で
 swap chain を持ち、SAR / orientation を含めて source から表示寸法へ resolve する。この場合の
 video visual transform は等倍 + 中央寄せだけになる。
 
@@ -60,7 +60,8 @@ decoder の BGRA frame
                                                └─ 表示寸法へ resolve
                                                    ├─ 標準: Lanczos3
                                                    ├─ シャープ: 拡大 NIS / 縮小 Lanczos3
-                                                   └─ ニアレスト: 拡大 nearest / 縮小 Lanczos3
+                                                   ├─ ニアレスト: 拡大 nearest / 縮小 Lanczos3
+                                                   └─ アニメ塗り: 拡大 Anime4K / 縮小 Lanczos3
 ```
 
 grade の identity path は source texture を resolve へ直接渡すので余分な copy を増やさない。
@@ -69,6 +70,15 @@ pipeline 作成時にすべて compile する。設定変更は prepare / commit
 target 寸法用 intermediate texture と visual 未接続の次 surface を prepare した後、request と
 geometry が一致するときだけ allocation-free の commit を publish する。一時停止中は保持中の
 Visible frame を commit 直後に 1 回再提示する。
+
+Anime4K は B1 が GLSL の `//!SAVE` / `//!BIND` から生成した variant topology と WGSL を正本にする。
+build 時に S / M / L / VL / UL の WGSL を Naga で HLSL へ変換し、Windows SDK FXC で全 pixel
+shader を SM5 bytecode 化する。runtime は B2 の評価段階では VL の 18 shader object だけを
+pipeline 作成時に bytecode からロードし、17 枚の source-resolution `RGBA16Float` intermediate
+を設定 prepare で確保する。各 pass の入力と順番は生成 topology 駆動で、vertex stage は
+Naga 生成 `vs_main` ではなく NIS と同じ native D3D fullscreen vertex shader を使う。動画は
+whole frame 処理なので `process_origin = 0` とし、orientation は最終 resolve の inverse mapping
+で正規化する。VL 固定は実機測定用であり、出荷時の variant / frame budget 選択は B3 で決める。
 
 resize 中は現在の surface を維持し、最後の geometry sample から 150ms 変化がない settled edge
 で 1 回だけ新寸法へ交換する。この区間は失敗 retry ではなく、終了通知を持たない複数種の Windows
@@ -1530,7 +1540,7 @@ intent だけで host と接続する。
 | `native_presenter/render_core.rs` | D3D11/DXGI/DComp、swap chain、共有 texture/keyed mutex、動画 present、egui overlay state/input変換 | `NativeRenderConfig`, `NativeRenderCore`, `NativeEguiOverlay` |
 | `native_presenter/overlay_draw.rs` | overlay 描画関数群、panel 矩形計算、format helper、timeline marker/icon 描画 | `NativeOverlay*` 値型 |
 | `native_presenter/grade_pipeline.rs` | 色調補正 / Creative LUT shader pipeline | `VideoGradePipeline` |
-| `native_presenter/resample_pipeline.rs` | 表示 orientation と Lanczos3 の 2-pass resolve、RGBA16F 中間 RT | `VideoResamplePipeline` |
+| `native_presenter/resample_pipeline.rs` | 表示 orientation、Lanczos3 / NIS / nearest、生成 topology 駆動 Anime4K multi-pass、RGBA16F 中間 RT | `VideoResamplePipeline` |
 | `native_presenter/surface_policy.rs` | filter / 表示倍率 / resize / 上限から surface size と typed fallback を決める純関数 | `VideoSurfaceSizeDecision`, `VideoScaleFallbackReason` |
 
 高頻度の mouse move、geometry/DPI、HUD raise、HUD visual/observation、App→render の HUD state は
@@ -2282,6 +2292,9 @@ Phase 2 で `handle_native_video_output_event` (= 入力イベント反映)、Ph
   SW decoder で再生する。`mimageviewer.log` に `GPU video device: failed
   (will fallback to CPU readback)` と出ているか、または `decoder` のログで
   `decode_path=sw` / `decode_path=hw_d3d11va` が期待通りか確認する。
+- WARP write-through: production `VideoResamplePipeline` で NIS と Anime4K VL の全 chain を描き、
+  default D3D11 rasterizer のまま target 全体が書き換わることを unit test で確認する。これにより
+  generated `vs_main` の winding を誤って再接続する回帰も検出する。
 - native presenter 起動失敗時の挙動: `GetMonitorInfoW` 失敗や thread 生成エラーが
   起きると `VideoPlayer.error` に日本語のエラー文言が入り、フルスクリーンに赤字で
   「動画を再生できません: ...」が表示される (= 旧 egui presenter フォールバックは無い)。

@@ -32,6 +32,22 @@ impl Anime4kVariant {
             .expect("generated Anime4K data for every variant")
     }
 
+    pub(crate) fn label(self) -> &'static str {
+        self.data().label
+    }
+
+    pub(crate) fn input_binding_count(self) -> usize {
+        self.data().input_binding_count
+    }
+
+    pub(crate) fn pass_inputs(self) -> &'static [&'static [Anime4kPassInput]] {
+        self.data().pass_inputs
+    }
+
+    pub(crate) fn intermediate_count(self) -> usize {
+        self.data().intermediate_count()
+    }
+
     #[cfg(test)]
     pub(crate) fn shader(self) -> &'static str {
         self.data().shader
@@ -39,9 +55,12 @@ impl Anime4kVariant {
 }
 
 pub(crate) const STILL_IMAGE_ANIME4K_VARIANT: Anime4kVariant = Anime4kVariant::VeryLarge;
+/// B2 deliberately exposes one fixed video variant for hardware measurement.
+/// B3 replaces this constant with the measured budget selector.
+pub(crate) const VIDEO_ANIME4K_B2_VARIANT: Anime4kVariant = Anime4kVariant::VeryLarge;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Anime4kPassInput {
+pub(crate) enum Anime4kPassInput {
     Source,
     Intermediate(usize),
 }
@@ -339,7 +358,7 @@ fn params_uniform(
     input_size: [u32; 2],
     input_origin: [i32; 2],
 ) -> wgpu::Buffer {
-    let mut bytes = [0_u8; 64];
+    let mut bytes = [0_u8; 96];
     for (index, value) in output_size.into_iter().enumerate() {
         bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
     }
@@ -364,6 +383,20 @@ fn params_uniform(
     for (index, value) in plan.source_region_px.into_iter().enumerate() {
         let offset = 48 + index * 4;
         bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+    }
+    // Still-image coordinates are already in source orientation. The same
+    // generated resolve shader is shared with native video, whose D3D path
+    // supplies the actual inverse orientation mapping here.
+    for (base, values) in [
+        (64, [1.0_f32, 0.0]),
+        (72, [0.0_f32, 1.0]),
+        (80, [0.0_f32, 0.0]),
+        (88, [0.0_f32, 0.0]),
+    ] {
+        for (index, value) in values.into_iter().enumerate() {
+            let offset = base + index * 4;
+            bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+        }
     }
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("anime4k params"),

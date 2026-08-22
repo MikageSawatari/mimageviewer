@@ -3173,10 +3173,18 @@ pub enum VideoScaleFilter {
     Sharp,
     /// Nearest-neighbour while enlarging; Lanczos3 while reducing.
     Nearest,
+    /// Anime4K CNN x2 while enlarging; Lanczos3 while reducing.
+    Anime,
 }
 
 impl VideoScaleFilter {
-    pub const ALL: [Self; 4] = [Self::OsDefault, Self::Standard, Self::Nearest, Self::Sharp];
+    pub const ALL: [Self; 5] = [
+        Self::OsDefault,
+        Self::Standard,
+        Self::Nearest,
+        Self::Sharp,
+        Self::Anime,
+    ];
 
     pub const fn label(self) -> &'static str {
         match self {
@@ -3184,6 +3192,7 @@ impl VideoScaleFilter {
             Self::Standard => "標準（補間あり）",
             Self::Sharp => "シャープ拡大",
             Self::Nearest => "ニアレスト（補間なし）",
+            Self::Anime => "アニメ塗り拡大",
         }
     }
 
@@ -3193,6 +3202,7 @@ impl VideoScaleFilter {
             Self::Standard => "standard",
             Self::Sharp => "sharp",
             Self::Nearest => "nearest",
+            Self::Anime => "anime",
         }
     }
 
@@ -3201,7 +3211,8 @@ impl VideoScaleFilter {
             Self::OsDefault => Self::Standard,
             Self::Standard => Self::Nearest,
             Self::Nearest => Self::Sharp,
-            Self::Sharp => Self::OsDefault,
+            Self::Sharp => Self::Anime,
+            Self::Anime => Self::OsDefault,
         }
     }
 }
@@ -8810,13 +8821,14 @@ mod tests {
     }
 
     #[test]
-    fn video_scale_filter_defaults_to_standard_and_roundtrips_phase_a_choices() {
+    fn video_scale_filter_defaults_to_standard_and_roundtrips_choices() {
         let settings = Settings::default();
         assert_eq!(settings.video_scale_filter, VideoScaleFilter::Standard);
         for (filter, serialized) in [
             (VideoScaleFilter::Standard, "standard"),
             (VideoScaleFilter::Sharp, "sharp"),
             (VideoScaleFilter::Nearest, "nearest"),
+            (VideoScaleFilter::Anime, "anime"),
         ] {
             assert_eq!(
                 serde_json::to_value(filter).unwrap(),
@@ -8833,6 +8845,16 @@ mod tests {
         assert_eq!(
             settings.video_downscale_smoothing_percent,
             DOWNSCALE_SMOOTHING_PERCENT_MIN
+        );
+        assert_eq!(
+            VideoScaleFilter::ALL.map(VideoScaleFilter::next),
+            [
+                VideoScaleFilter::Standard,
+                VideoScaleFilter::Nearest,
+                VideoScaleFilter::Sharp,
+                VideoScaleFilter::Anime,
+                VideoScaleFilter::OsDefault,
+            ]
         );
     }
 

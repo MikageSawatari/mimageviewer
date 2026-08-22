@@ -20,6 +20,17 @@ pub(super) enum VideoScaleFallbackReason {
         height: u32,
         error: String,
     },
+    Anime4kPipelineUnavailable {
+        variant: &'static str,
+        error: String,
+    },
+    Anime4kIntermediateCreationFailed {
+        variant: &'static str,
+        pass_index: usize,
+        width: u32,
+        height: u32,
+        error: String,
+    },
     GradeIntermediateCreationFailed {
         width: u32,
         height: u32,
@@ -45,6 +56,10 @@ impl VideoScaleFallbackReason {
             Self::ResampleIntermediateCreationFailed { .. } => {
                 "resample_intermediate_creation_failed"
             }
+            Self::Anime4kPipelineUnavailable { .. } => "anime4k_pipeline_unavailable",
+            Self::Anime4kIntermediateCreationFailed { .. } => {
+                "anime4k_intermediate_creation_failed"
+            }
             Self::GradeIntermediateCreationFailed { .. } => "grade_intermediate_creation_failed",
             Self::DisplaySwapChainCreationFailed { .. } => "display_swap_chain_creation_failed",
             Self::DisplayBackbufferCreationFailed { .. } => "display_backbuffer_creation_failed",
@@ -67,6 +82,16 @@ impl VideoScaleFallbackReason {
                 height,
                 error,
             } => format!("size={width}x{height} error={error}"),
+            Self::Anime4kPipelineUnavailable { variant, error } => {
+                format!("variant={variant} error={error}")
+            }
+            Self::Anime4kIntermediateCreationFailed {
+                variant,
+                pass_index,
+                width,
+                height,
+                error,
+            } => format!("variant={variant} pass={pass_index} size={width}x{height} error={error}"),
             Self::GradeIntermediateCreationFailed {
                 width,
                 height,
@@ -244,6 +269,7 @@ mod tests {
             VideoScaleFilter::Standard,
             VideoScaleFilter::Sharp,
             VideoScaleFilter::Nearest,
+            VideoScaleFilter::Anime,
         ] {
             assert_eq!(
                 decide_video_surface_size(input(filter)),
@@ -318,5 +344,25 @@ mod tests {
                 height: 360,
             }
         );
+    }
+
+    #[test]
+    fn anime4k_build_and_intermediate_failures_have_distinct_perf_codes() {
+        let unavailable = VideoScaleFallbackReason::Anime4kPipelineUnavailable {
+            variant: "Anime4K x2 VL",
+            error: "CreatePixelShader failed".to_string(),
+        };
+        assert_eq!(unavailable.code(), "anime4k_pipeline_unavailable");
+        assert!(unavailable.detail().contains("variant=Anime4K x2 VL"));
+
+        let allocation = VideoScaleFallbackReason::Anime4kIntermediateCreationFailed {
+            variant: "Anime4K x2 VL",
+            pass_index: 7,
+            width: 1920,
+            height: 1080,
+            error: "out of memory".to_string(),
+        };
+        assert_eq!(allocation.code(), "anime4k_intermediate_creation_failed");
+        assert!(allocation.detail().contains("pass=7 size=1920x1080"));
     }
 }

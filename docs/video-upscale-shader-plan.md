@@ -180,22 +180,36 @@ VL 固有だった `INTERMEDIATE_COUNT` / `INPUT_BINDING_COUNT` と pass 番号�
 golden test にし、5 変種すべての shader / topology も committed 生成物と比較する。
 HLSL 出力と native video presenter への接続は B2、計測と選択 policy は B3 で扱う。
 
-### 4.3 HLSL 生成
+### 4.3 HLSL 生成 (B2 実装済み、モデル選択は B3)
 
-presenter は wgpu ではなく生の D3D11 なので、WGSL はそのまま使えない。**移植ではなく
-コンバータの出力先追加**として扱う。Phase A の NIS は正本の `gpu_nis.wgsl` を Naga で
-ビルド時に HLSL へ変換し、手書き移植を持たない。Anime4K は将来、正本の GLSL から WGSL / HLSL
-を同じ変換系で生成する。
+presenter は wgpu ではなく生の D3D11 なので WGSL はそのまま使えないが、**手書き移植は
+持たない**。[build.rs](../build.rs) が B1 で生成した S / M / L / VL / UL の WGSL を Naga の
+HLSL backend へ通し、全 fragment entry point を Shader Model 5 HLSL へ変換する。Naga が
+行列の `mul()` 順と `textureLoad` の `Texture2D.Load` lowering を担うため、係数とアルゴリズムの
+正本は WGSL の一組だけである。
 
-踏むところ:
+Windows target の build では、変換した各 entry point を Windows SDK の `fxc` で `ps_5_0`
+bytecode にし、生成した variant table から `include_bytes!` する。`fxc` が無い場合は SDK の
+導入または `MIV_FXC_PATH` の設定を示して build を失敗させる。非 Windows target は HLSL
+生成まで行うが `fxc` を起動せず、Ubuntu CI を Windows SDK へ依存させない。
 
-- **行列の major 順**: WGSL の `mat4x4 * vec4` と HLSL の `mul()` で解釈が違う。係数を転置するか
-  `mul(v, m)` にするかを最初に決め、全パスで統一する
-- `textureLoad(tex, coord, 0)` → `tex.Load(int3(coord, 0))` + 座標クランプの自前実装
-- 静止画にある可視領域の切り出し (`RECEPTIVE_MARGIN` / `process_origin`) は**動画では常に
-  フレーム全体なので不要**
-- **シェーダはビルド時に `fxc` でバイトコード化して `include_bytes!` する**。実行時
-  `D3DCompile` は §6 の不変条件に反する
+実装上の注意:
+
+- VL は texture が `t0`〜`t13`、UL は `t0`〜`t14` まで必要になる。WGSL binding 番号を
+  uniform の HLSL register にもそのまま使うと VL が `b14` となり、SM5 pixel shader の
+  `b0`〜`b13` 上限を超える。texture と constant buffer は別 register 空間なので、Naga の
+  binding map で Anime4K params だけ `b0` へ割り当てる
+- bytecode 化するのは pixel shader だけ。全 pass の vertex shader は Phase A で実機確認した
+  native D3D fullscreen vertex shader を使う。Naga 生成 `vs_main` は WebGPU 向きの winding の
+  ため D3D11 default rasterizer に cull される
+- D3D11 側も B1 の生成 topology を読み、pass 数、中間 texture 数、各 `tN` の入力を決める。
+  VL 固有の pass 番号分岐は持たない
+- 静止画にある可視領域の切り出し (`RECEPTIVE_MARGIN` / `process_origin`) は、動画では常に
+  フレーム全体 (`process_origin = 0`) とする。orientation は最終 resolve の inverse mapping で
+  正規化し、追加の target-size copy は持たない
+
+B2 の動画選択値は実機評価用に **VL 固定**である。5 変種の bytecode は生成済みだが、再生時に
+どれを使うかは §5 の測定・予算選択を実装する B3 まで決めない。
 
 ---
 
@@ -316,16 +330,16 @@ presenter は wgpu ではなく生の D3D11 なので、WGSL はそのまま使�
 連続再生で解像度の違う動画へ移るたびに毎回走っている実績のある経路である。音声は別スレッド・
 別クロックなので影響を受けない。
 
-守らなかった場合に起きること: 現在の grade pipeline はレンダースレッドで**同期的に**
-`D3DCompile` している ([set_video_grade](../src/video/native_presenter/render_core.rs))。
-シェーダ 2 本ならまだしも、Anime4K UL は 25 本 + 中間テクスチャ 24 枚。同じ作りにすると
+守らなかった場合に起きること: Phase A の小さい shader は render pipeline 作成時に
+`D3DCompile` できるが、Anime4K UL は 25 pass + 中間 texture 24 枚である。同じ作りにすると
 **設定を触った瞬間に数百 ms〜秒単位で固まる**。
 
 具体的な要求:
 
 - Anime4K のシェーダはビルド時 `fxc` でバイトコード化 (§4.3)
-- 中間テクスチャは切替前に準備し、完成してから原子的に有効化する。Phase B の大量の
-  Anime4K resource はワーカー生成を前提とする
+- 中間テクスチャは切替前に準備し、完成してから原子的に有効化する。B2 は Phase A と同じ
+  render-thread prepare / allocation-free commit 境界に VL の 17 枚を載せる。B3 の測定用
+  offscreen resource と複数 variant の準備は worker 化を含めて改めて設計する
 - 一時停止中の切り替えも即反映する。既存の `SetVideoGrade` が持つ「Visible なら 1 回だけ
   再提示」の仕組みをそのまま使う (`FramePresentationState`)
 
@@ -335,6 +349,9 @@ Phase A の全シェーダは `NativeRenderCore` 作成時にコンパイルす�
 ときだけ App が commit command を publish し、commit と一時停止中の held frame 再提示には
 コンパイルも確保も残さない。prepare 後に
 geometry が変わった request は stale として破棄し、古い surface を接続しない。
+Anime4K は全 variant の pixel shader を build 時に bytecode 化し、B2 では VL の 18 shader object
+を `NativeRenderCore` 作成時に bytecode からロードする。設定 prepare は現在の source 寸法の
+17 intermediate を完成させ、commit は既存 resource の選択だけを行う。
 
 残る 1 つの避けられないコスト: 差し替え時の `WaitForCommitCompletion()` + `DwmFlush()` で
 レンダースレッドが最大 1 コンポジタ tick (8〜16ms) 止まる。切替の瞬間だけで、既に
@@ -350,7 +367,8 @@ geometry が変わった request は stale として破棄し、古い surface �
 ([overlay_draw.rs](../src/video/native_presenter/overlay_draw.rs) の
 `NativeVideoAdjustmentTab::Filter`、現在は Creative LUT を置いている)。
 
-- Phase A の拡大方法 (OS に任せる / 標準 / ニアレスト / シャープ)。アニメ塗りは Phase B で追加する
+- 拡大方法 (OS に任せる / 標準 / ニアレスト / シャープ / アニメ塗り)。B2 のアニメ塗りは
+  実機評価用の VL 固定で、予算プリセットと variant 表示は B3 で追加する
 - Anime4K を選んだときだけ、予算プリセットと**再測定ボタン**を同じ場所に出す
 - 現在選ばれているモデルと根拠 (`Anime4K L / 予測 6.2ms / 予算 16.7ms`) をその場に表示する
 - 測定中は「測定中 (3/6)」
@@ -449,7 +467,7 @@ VRAM は §4.1 のとおり。detached で動画を 2 面同時再生するこ�
 | A-2 | Lanczos3 / NIS / ニアレストの HLSL + 縮小 | 400〜600 行 |
 | A-3 | 設定・UI・キー・計装・フォールバック | 300〜400 行 |
 | B-1 | Anime4K 実装の一般化 (コンバータ表駆動化、静止画側にも波及) | 1〜2 日 |
-| B-2 | HLSL 生成 + D3D11 多段パイプライン | 600〜800 行 |
+| B-2 | **実装済み**: Naga HLSL + build-time bytecode + VL 固定 D3D11 多段パイプライン | 600〜800 行 |
 | B-3 | 測定機構 (GPU タイマ / ワーカー生成 / オフスクリーン / 永続キャッシュ) | 300〜400 行 |
 | B-4 | モデル選択 (純関数) + UI + 再測定アクション | 200〜300 行 |
 
