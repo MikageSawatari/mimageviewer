@@ -59,6 +59,7 @@ mod native_window_thread_spike;
 pub mod normalize_scanner;
 pub mod normalize_types;
 pub mod screenshot;
+mod seek_strip;
 pub(crate) mod stream;
 pub mod swscale_helpers;
 pub mod thumbnail;
