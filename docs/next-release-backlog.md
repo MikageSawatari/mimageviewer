@@ -1663,6 +1663,38 @@ passive detached は通常どおり release で窓を activate するが、選�
   既定の食い違いを消すだけなら上の移行案の方が影響範囲が小さい。
 - 規模 / 優先度: 小 (既定値 + 一度きりの移行) / P2。
 
+### 2.19 バックグラウンドインデクサの残り時間が「まだ出せない」と「壊れている」を区別できない — 利用者報告
+
+- 出典: 2026-08-23。お気に入り編集ダイアログの「🔄 バックグラウンドインデクサ」に残り時間が出ておらず、
+  機能を消したのか不具合かという問い合わせ。しばらく待つと `[残り 02:12 (215件/秒)]` が出た
+  (= スキャンから取込フェーズへ進んだ)。**現行仕様どおりの挙動で、退行ではない。**
+- 機構: 残り時間は「残件数 ÷ 直近レート」で出しているので、**全体件数 N が確定しているフェーズ**でしか
+  計算できない。
+
+  | フェーズ | 呼び出し | 残り時間 |
+  | --- | --- | --- |
+  | 削除 (n/N) / 取込 (n/N) | `set_msg_and_count` ([ingest_worker.rs:218](../src/ingest_worker.rs:218), [:253](../src/ingest_worker.rs:253), [name_bulk_indexer.rs:150](../src/name_bulk_indexer.rs:150)) | 出る |
+  | スキャン: `<dir>` (n 件) | `set` ([search_walker.rs:246](../src/search_walker.rs:246)) | 出ない |
+  | 取込待ち (writer 使用中) | `set` ([indexer_supervisor.rs:534](../src/indexer_supervisor.rs:534)) | 出ない |
+  | 名前索引の更新 / 更新スキャン | `set` ([name_index_supervisor.rs:386](../src/name_index_supervisor.rs:386), [:673](../src/name_index_supervisor.rs:673)) | 出ない |
+
+  counted フェーズに入った直後もサンプル 2 点かつ件数が進むまでは `remaining_secs=None`、
+  取込完了時は `clear_count()` で消える ([indexer_progress.rs](../src/indexer_progress.rs))。
+- 問題: 「まだ計算できない」「そもそも総数の概念がない」「壊れている」が**すべて同じ無表示**で、
+  利用者から区別できない。大きいフォルダ / HDD・NAS / 操作中で ActivityGate が walk を止めている
+  条件ではスキャンが数分続き、その間ずっと空欄のままになる。
+- 直す方向: 空欄をやめ、フェーズに応じた理由を出す (例: スキャン中 = `[件数集計中…]`、
+  counted 直後 = `[残り 計測中…]`、差分更新 = 表示しない)。
+  - **理由は型で持たせる。** 現状 UI は `eta: Option<EtaSnapshot>` の有無しか見ておらず、None の理由
+    (カウント未設定 / サンプル不足) を区別できない。`ProgressReporter` 側に理由を持たせ、UI はそれを
+    表示するだけにする。**メッセージ文字列の前方一致で "スキャン:" を判定するのはやらない**
+    (文言を変えた瞬間に静かに壊れる)。
+  - `aggregate_total_eta` ([favorites_editor.rs:938](../src/ui_dialogs/favorites_editor.rs:938)) は
+    「残り = max(各 remaining)、速度 = Σ(各 rate)」で集約している。理由付き None が混ざったときの
+    集約規則 (1 つでも計測中なら全体も計測中扱いにするか) を決める。
+  - タイトルバー側の ETA 表示 ([app.rs:10296](../src/app.rs:10296) のキャッシュ経由) も同じ扱いに揃える。
+- 規模 / 優先度: 小 (表示のみ。索引の動作自体は変えない) / P3。
+
 ## 3. 補正 / AI
 
 ### 3.1 local-adjust layers の入場時同期 DB 読み
