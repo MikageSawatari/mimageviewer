@@ -1695,6 +1695,62 @@ passive detached は通常どおり release で窓を activate するが、選�
   - タイトルバー側の ETA 表示 ([app.rs:10296](../src/app.rs:10296) のキャッシュ経由) も同じ扱いに揃える。
 - 規模 / 優先度: 小 (表示のみ。索引の動作自体は変えない) / P3。
 
+### 2.20 別ウィンドウで動画が切り替わると、静止画ウィンドウの画像が縦横比の狂った状態で固着する — 利用者報告
+
+> ⚠ detached viewer リワーク中の領域。**症状パッチを入れない** (CLAUDE.md 凍結ルール)。
+> 分類は **BA-7** (bundle 外の App-global 状態が別 context から汚染される)。
+> findings-12 D3 (book open が main context 経由で `auto_aspect` を汚し、メイングリッドが
+> アスペクトリフローした) と**同型**。
+
+- 出典: 2026-08-23。静止画をフルスクリーンで見ている最中に、別ウィンドウで動画が切り替わった
+  タイミングで、静止画が**圧縮されて縦横比の狂った状態**で表示された。**画像を開き直すと復帰**
+  (= 1 フレームのちらつきではなく、再解決まで残る状態)。
+- ログで確認できた事実 (`mimageviewer.log`、セッション経過 6284〜6296s):
+  - 独立した 2 つの viewer session が同時に開いていた。
+    session 31 = 静止画 (`g:\home\comfyui\...`、items_gen=24 / 300 件、表示中 idx=96 =
+    `mistblossom_gpt_4_6...png` **896x1152**)、session 4 = 動画 (`c:\home\youtube\...`、
+    items_gen=6 / 171 件)。
+  - **動画側の切り替えが App-global の `open_fullscreen` を通っている。**
+    `[6285.031s] === open_fullscreen: idx=2 ===` は利用者が静止画側で操作した記録ではなく、
+    動画ウィンドウの swap ([app.rs:44508](../src/app.rs:44508))。
+    9 秒間に 6 回 (6284.9 / 6285.8 / 6290.7 / 6291.7 / 6292.3 / 6293.0) 発生している。
+  - つまり静止画ウィンドウの描画中に、`fullscreen_idx` を含む App-global が動画ウィンドウの
+    都合で書き換えられていた。
+- **コード読みで確認できた構造** (この症状の原因と断定はしていない。候補の絞り込み):
+  - `DisplayedImageTransform::resolve` は `full_image_rect = display_size * total_scale` の
+    一様スケールなので、**この経路では縦横比は歪められない**
+    ([displayed_image_transform.rs:167](../src/displayed_image_transform.rs:167))。
+  - 歪みが表現できるのは `from_resolved_rect` だけ。呼び出し側が渡した矩形に対して
+    `scale_x` / `scale_y` を別々に出し、**食い違っていても平均して受け入れる**
+    ([displayed_image_transform.rs:183](../src/displayed_image_transform.rs:183))。
+  - この穴は認識されていて、`resolve_fs_transform_in_layout_rect` が「レイアウト矩形は枠に
+    すぎないので、実テクスチャから最終矩形を出し直す」ガードとして用意されている
+    ([ui_fullscreen.rs:4094](../src/ui_fullscreen.rs:4094) の doc comment が
+    "no caller can publish a non-uniform pixel scale" と明記)。
+  - **単ページ ([ui_fullscreen.rs:24707](../src/ui_fullscreen.rs:24707)) と連結読み
+    ([:29060](../src/ui_fullscreen.rs:29060)) はこのガードを通る。通っていない呼び出しが 2 つある**:
+
+    | 場所 | 渡している矩形 | 由来 |
+    | --- | --- | --- |
+    | 見開き左右 ([:10381](../src/ui_fullscreen.rs:10381) / [:10397](../src/ui_fullscreen.rs:10397)) | `rects.left_rect` / `right_rect` | `spread_layout_geometry(left_size, right_size, ...)` = **ページ寸法**。`texture_size` には実テクスチャを渡すので、両者の比が食い違えば歪む |
+    | detached の凍結スナップショット ([:10172](../src/ui_fullscreen.rs:10172)、`detached_continuous_frozen_pages_for_snapshot`) | `page.rect` | レイアウトが決めた矩形をそのまま渡している。直前に一様な `logical_scale` を計算しているのに、矩形側には反映していない |
+
+  - 後者は **detached ウィンドウが凍結描画に落ちるときの経路**で、「別ウィンドウ側の操作で
+    こちらが凍結スナップショットに切り替わる」という今回の状況と形が合う。**ただし利用者が
+    単ページ / 見開き / 連結読みのどれで見ていたかはログに出ていない** (`spread` / `連結` の
+    ログ出力が 1 件も無い) ので、経路は特定できていない。
+- **次にやること (直す前に)**: 無言で受け入れている所を鳴らす。
+  `from_resolved_rect` で `|scale_x - scale_y|` が閾値を超えたら、`page_idx` / `texture_size` /
+  渡された矩形 / session を添えてログに出す。**推測で直さない** — 上の 2 経路のどちらでもない
+  可能性が残っている。再現手順は「静止画ウィンドウを開いたまま、別ウィンドウで動画を数回
+  切り替える」で、利用者側では再現している。
+- **直す方向**: 特定できたら、`from_resolved_rect` の一様でない矩形を**受け入れずに拒否**するか、
+  全呼び出しを `resolve_fs_transform_in_layout_rect` 経由に寄せる。ガードが既に存在して
+  文書化までされているのに 2 経路が素通りしている状態を、分岐追加ではなく入口の一本化で閉じる。
+- 規模 / 優先度: 中 / P2 (表示の破綻だが開き直せば復帰する。凍結領域なので構造修正が前提)。
+- 関連: [docs/detached-rework-plan.md](detached-rework-plan.md) §2 (憲法) / BA-7、
+  findings-12 D3 (同型の App-global 汚染)。
+
 ## 3. 補正 / AI
 
 ### 3.1 local-adjust layers の入場時同期 DB 読み
