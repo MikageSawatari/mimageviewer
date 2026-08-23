@@ -2289,6 +2289,68 @@ pub(super) fn native_seek_bar_lock_button_rect(
     )
 }
 
+pub(super) fn native_seek_strip_selector_button_rect(
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+) -> egui::Rect {
+    let lock = native_seek_bar_lock_button_rect(overlay_width_points, overlay_height_points);
+    egui::Rect::from_min_size(
+        egui::pos2(lock.min.x - lock.width() - 8.0, lock.min.y),
+        lock.size(),
+    )
+}
+
+/// Fixed HUD film-strip icon. Keep this vector-only: symbol/emoji glyphs have repeatedly produced
+/// tofu with user-selectable UI fonts.
+pub(super) fn draw_seek_strip_film_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    color: egui::Color32,
+) {
+    let icon = egui::Rect::from_center_size(rect.center(), rect.size() * 0.62);
+    let stroke = egui::Stroke::new(1.5, color);
+    painter.rect_stroke(icon, 2.0, stroke, egui::StrokeKind::Inside);
+    let band_h = icon.height() * 0.24;
+    painter.line_segment(
+        [
+            egui::pos2(icon.min.x, icon.min.y + band_h),
+            egui::pos2(icon.max.x, icon.min.y + band_h),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(icon.min.x, icon.max.y - band_h),
+            egui::pos2(icon.max.x, icon.max.y - band_h),
+        ],
+        stroke,
+    );
+    for fraction in [0.20_f32, 0.50, 0.80] {
+        let x = egui::lerp(icon.x_range(), fraction);
+        let hole_size = egui::vec2(icon.width() * 0.11, band_h * 0.48);
+        painter.rect_filled(
+            egui::Rect::from_center_size(egui::pos2(x, icon.min.y + band_h * 0.5), hole_size),
+            0.5,
+            color,
+        );
+        painter.rect_filled(
+            egui::Rect::from_center_size(egui::pos2(x, icon.max.y - band_h * 0.5), hole_size),
+            0.5,
+            color,
+        );
+    }
+    for fraction in [1.0_f32 / 3.0, 2.0 / 3.0] {
+        let x = egui::lerp(icon.x_range(), fraction);
+        painter.line_segment(
+            [
+                egui::pos2(x, icon.min.y + band_h),
+                egui::pos2(x, icon.max.y - band_h),
+            ],
+            egui::Stroke::new(1.0, color),
+        );
+    }
+}
+
 fn draw_overlay_info_icon(painter: &egui::Painter, rect: egui::Rect, click_to_show: bool) {
     let c = rect.center();
     let r = rect.width().min(rect.height()) * 0.3;

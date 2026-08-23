@@ -11100,7 +11100,7 @@ pub struct App {
     #[cfg(windows)]
     pub(crate) video_tile_state: Option<crate::ui_video_tile::VideoTileState>,
     #[cfg(windows)]
-    video_seek_strip_state: native_video::VideoSeekStripState,
+    video_seek_strip_runtime: native_video::VideoSeekStripRuntime,
     #[cfg(windows)]
     pub(crate) video_tile_reopen_pending: bool,
     #[cfg(windows)]
@@ -14112,7 +14112,7 @@ impl App {
             #[cfg(windows)]
             video_tile_state: None,
             #[cfg(windows)]
-            video_seek_strip_state: native_video::VideoSeekStripState::Closed,
+            video_seek_strip_runtime: native_video::VideoSeekStripRuntime::Closed,
             #[cfg(windows)]
             video_tile_reopen_pending: false,
             #[cfg(windows)]

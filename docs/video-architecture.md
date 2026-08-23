@@ -717,18 +717,24 @@ thumbnail decoder を入れると動画→動画 fast-swap が恒常的に詰ま
 BLOB 読み出しと WebP→RGBA decode は `video-marker-thumbs` worker で行い、UI thread
 側は pin/bookmark の軽量メタ (pts/title) だけを同期取得する。
 
-動画シークストリップは `src/app/native_video.rs` の `VideoSeekStripState` が開閉と、型付きの
-`SeekStripCenter`、サムネイル軸、2 種類の worker を 1 session として所有する。サムネイルモードの
+動画シークストリップの persisted source of truth は
+`Settings.video_seek_strip_state` (`none / thumbnails / waveform`) ひとつで、開閉 bool と mode を
+分けない。`video_seek_strip_last_choice` は `none` から上ドラッグで復元する non-none 選択だけを
+明示的に所有する。App の `VideoSeekStripRuntime` は設定とは別に、型付きの `SeekStripCenter`、
+サムネイル軸、2 種類の worker を 1 session として所有する。サムネイルモードの
 `SeekStripThumbnailWorker` は索引の列挙、採用する場面の選択、SQLite/WebP 読み込み、未取得画像の
 抽出を UI thread の外で行う。要求は可視窓と進行方向 1 画面分の latest-wins で、取得済み画像は
-窓を動かしても再利用する。最小間隔の設定変更は全索引から採用列だけを作り直し、永続キャッシュは
-無効化しない。
+窓を動かしても再利用する。再生追従は可視窓の半分が先読み coverage 内にある間は新要求を出さず、
+coverage を外れたときだけ進行方向 1 画面を追加要求する。最小間隔の設定変更は全索引から採用列だけを
+作り直し、永続キャッシュは無効化しない。
 
 波形モードの `SeekStripWaveWorker` は既に完成済みの `TimelineAnalysis` が現在ファイルまたは
 音楽解析 LRU にあれば対象時間窓を切り出す。無ければ、動画ごとに 1 回だけ開く
-`AudioRangeDecoder` で既定 60 秒窓と 0.75 秒の pre-roll だけを 48kHz stereo PCM にし、
-出力物理幅から選んだ bin 幅で解析する。pre-roll bins は raster 前に捨て、全尺前提の beat grid は
-作らない。波形 raster の LRU は file identity、時間窓、bin 幅、物理幅をキーにしたメモリ内 8 件だけで、
+`AudioRangeDecoder` でまず可視 60 秒と 0.75 秒の pre-roll だけを 48kHz stereo PCM にして
+first-paint raster を返す。表示後は同じ中心の 180 秒 span / 3 倍物理幅を background で作る。
+両段は秒 / pixel と bin 幅が同一なので交換時に内容が動かない。pre-roll bins は raster 前に捨て、
+全尺前提の beat grid は作らない。波形 raster の LRU は file identity、時間窓、
+bin 幅、物理幅をキーにしたメモリ内 8 件だけで、
 永続 cache は持たない。audio stream が無い場合は通常の media property として typed status で保持し、
 decode / analysis failure とは分けて presenter payload へ渡す。閉じる、動画切替、fullscreen 終了では
 session owner が両 worker を
@@ -736,12 +742,22 @@ session owner が両 worker を
 
 App は毎 frame、所有権を持つ `NativeOverlaySeekStrip` payload を native presenter へ渡す。
 presenter は worker が作った RGBA だけを texture 化し、presenter thread では波形を再計算しない。
+60 秒 first-paint raster は同じ中心の 180 秒 upgrade が届くまで描き続ける。
+中心が 180 秒 span の中央 trigger band にある間は同じ texture の 60 秒 sub-rectangle を UV で
+ずらして描く。中心が trigger band を外れたときだけ replacement を要求し、pending span を latch に
+した hysteresis で境界往復時の発振を防ぐ。worker は replacement 完了まで shared raster を外さず、
+presenter も旧 texture を描き続けるため、解析中の blank frame / upload は生じない。
 波形 texture が無い終端状態では、音声なしと表示失敗をそれぞれ日本語の短い案内として帯内に描く。
 解析中は案内を出さない。
 サムネイルでは等幅セルの連続する小数位置、波形では 1 幅 60 秒の時間線形軸を使い、どちらも
-固定中央線を描く。モード切替では中央時刻を保ったまま軸だけを交換する。ドラッグ中は中心座標だけを
-更新し、release の 1 回だけ補間時刻へ精密 seek して再生状態を保つ。hover の単発 preview と tile
-overlay は排他的に扱う。
+固定中央線を描く。モード切替では中央時刻を保ったまま軸だけを交換する。ドラッグは press 時の
+中心と pointer を immutable origin とし、現在 pointer との差から毎 frame の中心と release 中心を
+同じ純関数で求める。release の 1 回だけ補間時刻へ精密 seek して必ず再生を始める。再生中は
+100ms cadence で
+playhead を中心へ戻し、ドラッグ中だけ追従を detach、release で再 attach する。HUD の vector
+film-strip button は上向き 3 項目 menu を開き、表示中は click shield と modal input routing で
+本編 / シークバーへの click・wheel fall-through を止める。hover の単発 preview と tile overlay は
+排他的に扱う。
 
 ### 各ファイルの責務
 

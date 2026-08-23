@@ -8,9 +8,10 @@ backlog [§1.102](next-release-backlog.md) (YouTube 型のサムネイル列) �
 
 作業ブランチ `video-strip` (worktree `C:\home\mimageviewer-video-strip`)。
 
-実装状況 (2026-08-23): Increment 1 (軸・窓・gesture の純ロジック) / Increment 2 (サムネイル抽出
+実装状況 (2026-08-24): Increment 1 (軸・窓・gesture の純ロジック) / Increment 2 (サムネイル抽出
 worker) / Increment 3 (App owner・設定・描画・入力・HUD region・tile と hover preview の排他、
-**実機確認済み**) / Increment 4 (波形モード・モード切替・`video_seek_strip_mode`) まで実装。
+**実機確認済み**) / Increment 4 (波形モード・モード切替) / Increment 5 (3 値の表示状態、
+フィルムアイコンの上向きメニュー、再生位置追従、180 秒波形ラスタのスクロール) まで実装。
 残りは §9 の未確定項目の実機調整と、MPEG-TS など `TimeGrid` 経路の実素材確認。
 
 確定した既定値: 開閉は `Shift+S` (`V` はレーン C の動画パノラマ用に空けた)、最小間隔 2.0 秒、
@@ -82,14 +83,16 @@ D3 の帰結として、横軸は時間線形ではない。波形モード (時
 要素で、`cell(i)` はその i 番目の時刻を指す。
 
 - セル `i` は `cell(i)` のキーフレームを表示し、幅は一定 `cell_w`。
-- ドラッグ `dx` → `center_index -= dx / cell_w`。**小数部はそのまま描画オフセットに使う** (D8)。
-  セル境界へスナップしない。`|` の裏でセルが連続に流れる。
+- ドラッグ開始時の中心 `press_center` と pointer 位置 `press_x` を固定し、各 frame の現在位置
+  `pointer_x` から `dx = pointer_x - press_x`、
+  `center_index = press_center - dx / cell_w` を求める。frame 間 delta は加算元に使わない。
+  **小数部はそのまま描画オフセットに使い** (D8)、セル境界へスナップしない。
+  `|` の裏でセルが pointer に追従して連続に流れる。
 - 中央 `|` の直下は `center_index` の位置。**選択時刻はセル内で線形補間する** (D10):
   `t = cell(i) + frac * (cell(i+1) - cell(i))` (`i = floor(center_index)`, `frac = fract`)。
-- **ドラッグ中は本編をシークしない。** 離した時点で 1 回だけ `t` へ精密シークする。
-  スクラブ中に本編が飛び回らないので、復号も UI も軽い。
-  - 離す前の再生状態は保つ (再生中だった → 再生を続ける / 一時停止中だった → 止めたまま)。
-    常に再生開始のほうが良ければ 1 行で変えられる (§9 U1)。
+- **ドラッグ中は本編をシークしない。** 離した時点で 1 回だけ `t` へ精密シークし、
+  一時停止中だった場合も再生を始める (D15)。スクラブ中に本編が飛び回らないので、
+  復号も UI も軽い。
 - ストリップに時刻ラベルを出さない (D9)。絵と補間時刻が最大 1 GOP ずれるが、**画面に矛盾する
   数字が出ない**ので破綻しない。時刻は直下のシークバーが示す。
 - 端では片側のセルが空になる。詰めない (中央 `|` の意味を保つ)。
@@ -228,11 +231,21 @@ enum StripAxis {
 前のラスタを捨てると、スクラブのたびに波形が一度消えてから出る。利用者が見たいのは
 **スクロール**であって再表示ではない。
 
-- ラスタは**表示幅より広い範囲**を作る (可視 span の 3 倍程度を中央に置く)。ドラッグ中は
-  その texture の**部分矩形をずらして描く**だけで、再解析しない。
-- 中央が解析済み範囲の端へ近づいたときだけ次の範囲を要求する (ヒステリシス)。
+- 初回はまず**可視 span と同じ 60 秒 / 可視幅と同じ物理画素幅**だけを要求し、旧実装と同じ
+  first-paint 費用で波形を出す。これが表示された直後、同じ中心の **3 倍 180 秒 / 3 倍画素幅**を
+  background で要求する。秒 / pixel が一致するので、完成時の texture 交換で内容は動かない。
+- 60 秒 raster は 180 秒 upgrade の完了まで表示し続ける。upgrade 要求を Working にしても
+  published raster を外さず、失敗時も 60 秒 raster を残す。初回 → upgrade の間に blank を挟まない。
+- 180 秒へ交換後、ドラッグ中はその texture の**60 秒分の部分矩形をずらして描く**だけで、
+  再解析も再 upload もしない。
+- 180 秒ラスタを中心 0 とすると、可視範囲が完全に収まる中心は -60〜+60 秒。さらに
+  15 秒の先行 margin を取り、中心が -45〜+45 秒を外れた時点で次の 180 秒を要求する。
+- replacement 待ち中は、その新 span に可視 60 秒が収まる限り要求を差し替えない。
+  これを境界のヒステリシス latch とし、往復操作で要求が発振しないようにする。
 - **新しいラスタが届くまで、古いラスタを描き続ける。** 空白を挟まない。可視範囲が解析済み
   範囲から完全に外れた場合だけ、やむを得ず空白になる。
+- 再生追従は 100ms 間隔で中心だけを更新する。1 倍速で連続再生すると新しい波形解析は
+  約 45 秒に 1 回であり、毎 frame の解析 / upload にはならない。
 
 `render_timeline_row_image` を「窓 = 1 行」として呼ぶ。
 
@@ -256,13 +269,13 @@ enum StripAxis {
 
 ストリップは native presenter のオーバーレイに描く。既存の**タイルオーバーレイと同じ経路**を使う。
 
-- App → presenter: `NativeOverlaySeekStrip { mode, axis_kind, cells, wave_image, center_index, ... }`
+- App → presenter: `NativeOverlaySeekStrip { center: SeekStripCenter, cells, wave_image, ... }`
   を毎フレーム渡す。テクスチャ化は `sync_tile_overlay_textures` と同じ形で presenter 側。
 - presenter → App: `NativeOverlayCommand` に追加する。
   - `OpenSeekStrip` / `CloseSeekStrip`
-  - `SetSeekStripMode { mode }`
-  - `RequestSeekStripWindow { center_index, count }`
-  - シーク自体は既存の `Seek { target_secs }` を使う。
+  - `SetSeekStripState { state }`
+  - `MoveSeekStrip { center }` / `CommitSeekStrip { center }`
+  - `RequestSeekStripWindow { center, visible_count, pixel_width, pixel_height }`
 
 ## 7. 入力とジェスチャ
 
@@ -289,10 +302,21 @@ enum SeekRowGesture {
 
 ### 開閉
 
-- 開く: 上ドラッグ (上記) / キー操作 (`KeyAction` を新設)。
-- 閉じる: ストリップからシーク行へ下ドラッグ / Esc / キー操作の再押下 / HUD 非表示 /
+- 3 値の正本は persisted `Settings.video_seek_strip_state` (`none / thumbnails / waveform`)。
+  runtime の session 有無と表示内容の mode を別々の状態にはしない。`Shift+S` の
+  `VideoSeekStrip` は `none → thumbnails → waveform → none` を巡回する (D12)。
+- 開く: 上ドラッグ (上記) / `Shift+S` / ロックアイコン左のベクター描画フィルムアイコン。
+  上ドラッグは明示保存した `video_seek_strip_last_choice` を復元するので、波形を閉じた利用者は
+  次も波形へ戻る。フィルムアイコンは上向きメニューで「なし」「サムネイルストリップ表示」
+  「音声波形ストリップ表示」を選ぶ (D13)。
+- 閉じる: ストリップからシーク行へ下ドラッグ / Esc / `Shift+S` で `none` へ到達 / HUD 非表示 /
   動画切替 / フルスクリーン終了 / タイルモード (`S`) 開始。
 - **クリックしてもストリップは閉じない** (シークして開いたまま)。続けて別の位置を探せる。
+- 再生中は 100ms cadence で再生位置へ追従する。ストリップ本体をドラッグすると追従から外れ、
+  離すとその時刻へ seek して再生を始めたうえで追従へ戻る。両 mode が同じ typed drag / commit
+  経路を通る (D14 / D15)。
+- 上向きメニュー表示中は全画面 click shield と modal input routing を有効にし、クリックや wheel を
+  本編・シークバーへ透過させない。
 
 ### タッチ
 
@@ -313,7 +337,6 @@ enum SeekRowGesture {
 
 | # | 論点 | 決め方 |
 | --- | --- | --- |
-| U1 | ドラッグを離したとき、一時停止中でも再生を始めるか | 既定は「離す前の状態を保つ」。実機で見て決める。1 行の差 |
 | U2 | `KeyframeIndex` と `TimeGrid` の判定式 | 索引エントリ数と尺から妥当性を見る。実素材 (MP4 / MKV / TS / WMV) で確認 |
 | U3 | ストリップの高さ・セル幅・枚数の既定 | 4K / FHD / ウィンドウ内再生で実機調整。11 枚前後を出発点にする |
 | U4 | ストリップ用サムネイルの抽出幅 (`tile_w`) | 320px を出発点。容量と見やすさで調整 |
@@ -340,6 +363,13 @@ enum SeekRowGesture {
 - `StripAxis` の選択 (索引あり / 無し / 不完全)。
 - 空セルの扱い (先頭 / 末尾)。
 - `SeekRowGesture` の決定 (上ドラッグ / 水平ドラッグ / 斜め / 閾値未満)。
+- 1 回のドラッグ中の pointer 位置列を press-time pointer から変換すると、中心が単調に進み、
+  release も最後の表示中心と一致すること。
+- persisted 3 値の cycle と、`none` から最後の non-none 選択を戻す規則。
+- 60 秒 first paint → 同じ中心・同じ秒 / pixel の 180 秒 upgrade と、Working 中の旧 raster 保持。
+- 180 秒 span の要求境界、15 秒 margin、replacement 待ちのヒステリシス。
+- 保持中の波形 texture から 60 秒の可視部分を切り出す UV / 部分 gap の算術。
+- 再生位置追従の 100ms rate limit、微小差の抑制、ドラッグ中の detach。
 
 ### ワーカー
 
@@ -409,6 +439,24 @@ enum SeekRowGesture {
    iPhone MOV では open だけで 576ms かかり、同じ処理が 188ms → 1146ms に化けた。
    デコーダは動画 1 本につき 1 回だけ開く (§4.3)。
 6. **GOP 長は素材で 6 倍以上違う** (0.50s 〜 4.17s)。これが §4.1.1 の stride を必要にした根拠。
+
+### Increment 5 review の二段 waveform 再測定 (2026-08-24)
+
+同じ probe で 60 秒 first paint / 180 秒 wide job を続けて測った。比較は同じ素材の同じ中央位置、
+SW decode の decode + analyze で、raster 時間は含まない。表は release build 後の最初の pass。
+
+| 素材 | 尺 | 60 秒 | 180 秒 | 倍率 |
+| --- | ---: | ---: | ---: | ---: |
+| MP4 / H.264 / 音楽 | 3.8 分 | 267.4ms | 587.9ms | 2.20x |
+| MKV / H.264 / 映画 | 14.8 分 | 293.0ms | 793.2ms | 2.71x |
+| MP4 / H.264 / 画面収録 | 3.6 分 | 535.4ms | 1214.8ms | 2.27x |
+
+first paint は **267〜535ms**、wide upgrade / replacement は **588〜1215ms**。直後の warm pass は
+60 秒が 173〜204ms、180 秒が 432〜484ms だった。したがって最大 1.21 秒の wide job は初回表示から
+外し、60 秒 raster を出した後だけ background で行う。連続 1 倍再生では約 45 秒に 1 wide job なので、
+最初の pass を保守的に使った worker 稼働時間は壁時計比で約 **1.3〜2.7%**、warm pass では
+**1.0〜1.1%**。upload は 60 秒 first paint の 1 回、同じ中心の 180 秒 upgrade の 1 回、その後は
+replacement ごとに約 45 秒で 1 回である。
 
 未取得: MPEG-TS (索引を持たない代表格) が手元に無く、`TimeGrid` 経路を実素材で確認できていない。
 HW デコード有効時の数字も未測定 (probe は SW のみ)。どちらも実装時に埋める。

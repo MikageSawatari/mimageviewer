@@ -4,6 +4,7 @@
 //! コンテナ索引を読む短い FFI 境界を除き、副作用を持たない値変換だけを所有する。
 
 use std::ops::RangeInclusive;
+use std::time::Duration;
 
 use eframe::egui::Pos2;
 use ffmpeg_the_third as ffmpeg;
@@ -348,6 +349,10 @@ impl CellRange {
     pub(crate) fn end(&self) -> usize {
         *self.0.end()
     }
+
+    pub(crate) fn contains_range(&self, other: &Self) -> bool {
+        self.start() <= other.start() && self.end() >= other.end()
+    }
 }
 
 /// 充填対象の窓と、直前の窓には含まれなかった範囲。
@@ -473,6 +478,22 @@ pub enum SeekStripCloseCause {
     Unavailable,
 }
 
+impl SeekStripCloseCause {
+    /// Explicit close operations clear the persisted 3-state selection. Resource-only lifecycle
+    /// boundaries keep it so the same strip can be restored for the next video session.
+    pub(crate) const fn clears_persisted_state(self) -> bool {
+        matches!(
+            self,
+            Self::Toggle
+                | Self::DownwardDrag
+                | Self::Escape
+                | Self::HudHidden
+                | Self::TileModeOpened
+                | Self::Unavailable
+        )
+    }
+}
+
 /// ストリップとタイル一覧の排他 surface。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum SeekStripSurface {
@@ -556,6 +577,23 @@ pub enum SeekStripCenter {
     Waveform { center_time_secs: f64 },
 }
 
+/// Immutable press-time snapshot for one seek-strip drag.
+///
+/// Pointer movement is always measured from this position. In particular, it must not be
+/// reconstructed from egui's per-frame drag delta, or dropped/repeated frames make the strip
+/// spring back toward the press-time centre.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SeekStripDragOrigin {
+    pub(crate) center: SeekStripCenter,
+    pub(crate) pointer: eframe::egui::Pos2,
+}
+
+impl SeekStripDragOrigin {
+    pub(crate) fn new(center: SeekStripCenter, pointer: eframe::egui::Pos2) -> Self {
+        Self { center, pointer }
+    }
+}
+
 impl SeekStripCenter {
     pub(crate) fn mode(self) -> crate::settings::VideoSeekStripMode {
         match self {
@@ -628,15 +666,43 @@ pub(crate) fn waveform_time_at_pointer(
     )
 }
 
+/// Resolve the current centre from one immutable press snapshot and the current pointer.
+///
+/// This is deliberately a pure mapping so live movement and release cannot disagree about how a
+/// drag accumulates.
+pub(crate) fn seek_strip_center_at_drag_pointer(
+    origin: SeekStripDragOrigin,
+    pointer: eframe::egui::Pos2,
+    thumbnail_cell_width: f32,
+    strip_width: f32,
+    waveform_span_secs: f64,
+) -> Option<SeekStripCenter> {
+    let total_delta_x = pointer.x - origin.pointer.x;
+    match origin.center {
+        SeekStripCenter::Thumbnails { center_index } => {
+            center_index_after_drag(center_index, total_delta_x, thumbnail_cell_width)
+                .map(|center_index| SeekStripCenter::Thumbnails { center_index })
+        }
+        SeekStripCenter::Waveform { center_time_secs } => waveform_center_after_drag(
+            center_time_secs,
+            total_delta_x,
+            strip_width,
+            waveform_span_secs,
+        )
+        .map(|center_time_secs| SeekStripCenter::Waveform { center_time_secs }),
+    }
+}
+
 /// ストリップ上で始めたドラッグが、下のシーク行へ戻って close する動きか。
 pub(crate) fn strip_drag_closes_downward(
-    drag_delta: eframe::egui::Vec2,
-    pointer_y: f32,
+    origin_pointer: eframe::egui::Pos2,
+    pointer: eframe::egui::Pos2,
     seek_row_top: f32,
 ) -> bool {
+    let drag_delta = pointer - origin_pointer;
     drag_delta.y > SEEK_ROW_GESTURE_THRESHOLD_POINTS
         && drag_delta.y > drag_delta.x.abs()
-        && pointer_y >= seek_row_top
+        && pointer.y >= seek_row_top
 }
 
 /// App がストリップの非同期結果を取り込むために次の repaint を予約すべき状態。
@@ -649,6 +715,41 @@ pub(crate) struct SeekStripRepaintContext {
 /// 可視セルが未決着か、ストリップ自身のドラッグが続いている間だけ polling する。
 pub(crate) fn seek_strip_needs_repaint(context: SeekStripRepaintContext) -> bool {
     context.visible_cells_pending || context.drag_active
+}
+
+/// Playback-follow cadence. This is fast enough to look continuous while avoiding an App-side
+/// axis conversion and presenter payload change on every decoded frame.
+pub(crate) const SEEK_STRIP_FOLLOW_INTERVAL: Duration = Duration::from_millis(100);
+const SEEK_STRIP_FOLLOW_MIN_DELTA_SECS: f64 = 0.040;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SeekStripFollowContext {
+    pub(crate) playing: bool,
+    pub(crate) drag_active: bool,
+    pub(crate) elapsed_since_recenter: Option<Duration>,
+    pub(crate) current_time_secs: Option<f64>,
+    pub(crate) playhead_time_secs: f64,
+}
+
+/// Return the playhead time that should become the new strip centre, or `None` when this frame is
+/// intentionally rate-limited/detached. The caller performs the mode-specific time→axis mapping.
+pub(crate) fn decide_follow_playhead_recenter(context: SeekStripFollowContext) -> Option<f64> {
+    if !context.playing
+        || context.drag_active
+        || !context.playhead_time_secs.is_finite()
+        || context
+            .elapsed_since_recenter
+            .is_some_and(|elapsed| elapsed < SEEK_STRIP_FOLLOW_INTERVAL)
+    {
+        return None;
+    }
+    let current_time_secs = context.current_time_secs?;
+    if !current_time_secs.is_finite()
+        || (context.playhead_time_secs - current_time_secs).abs() < SEEK_STRIP_FOLLOW_MIN_DELTA_SECS
+    {
+        return None;
+    }
+    Some(context.playhead_time_secs)
 }
 
 /// シーク行で開始した 1 ドラッグの決着状態。
@@ -889,6 +990,55 @@ mod tests {
     }
 
     #[test]
+    fn follow_playhead_is_rate_limited_and_drag_detaches_it() {
+        let base = SeekStripFollowContext {
+            playing: true,
+            drag_active: false,
+            elapsed_since_recenter: Some(SEEK_STRIP_FOLLOW_INTERVAL),
+            current_time_secs: Some(12.0),
+            playhead_time_secs: 12.5,
+        };
+        assert_eq!(decide_follow_playhead_recenter(base), Some(12.5));
+        assert_eq!(
+            decide_follow_playhead_recenter(SeekStripFollowContext {
+                elapsed_since_recenter: Some(SEEK_STRIP_FOLLOW_INTERVAL - Duration::from_millis(1),),
+                ..base
+            }),
+            None
+        );
+        assert_eq!(
+            decide_follow_playhead_recenter(SeekStripFollowContext {
+                drag_active: true,
+                ..base
+            }),
+            None
+        );
+        assert_eq!(
+            decide_follow_playhead_recenter(SeekStripFollowContext {
+                playing: false,
+                ..base
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn follow_playhead_skips_sub_display_motion_but_reacts_after_threshold() {
+        let context = |playhead_time_secs| SeekStripFollowContext {
+            playing: true,
+            drag_active: false,
+            elapsed_since_recenter: None,
+            current_time_secs: Some(20.0),
+            playhead_time_secs,
+        };
+        assert_eq!(decide_follow_playhead_recenter(context(20.039)), None);
+        assert_eq!(
+            decide_follow_playhead_recenter(context(20.041)),
+            Some(20.041)
+        );
+    }
+
+    #[test]
     fn small_upward_dominant_gesture_remains_undecided() {
         let mut gesture = SeekRowGesture::new(pos2(100.0, 100.0));
         assert_eq!(
@@ -1026,15 +1176,74 @@ mod tests {
         assert_close(center_index_after_drag(0.0, 300.0, 150.0), -2.0);
         assert_close(center_index_at_pointer(4.25, 400.0, 250.0, 150.0), 5.25);
         assert!(strip_drag_closes_downward(
-            eframe::egui::vec2(8.0, 28.0),
-            500.0,
+            eframe::egui::pos2(300.0, 472.0),
+            eframe::egui::pos2(308.0, 500.0),
             490.0
         ));
         assert!(!strip_drag_closes_downward(
-            eframe::egui::vec2(30.0, 28.0),
-            500.0,
+            eframe::egui::pos2(300.0, 472.0),
+            eframe::egui::pos2(330.0, 500.0),
             490.0
         ));
+    }
+
+    #[test]
+    fn one_drag_accumulates_from_press_and_advances_monotonically() {
+        let origin = SeekStripDragOrigin::new(
+            SeekStripCenter::Thumbnails { center_index: 10.0 },
+            eframe::egui::pos2(600.0, 100.0),
+        );
+        let centers = [590.0, 570.0, 535.0, 500.0].map(|pointer_x| {
+            let SeekStripCenter::Thumbnails { center_index } = seek_strip_center_at_drag_pointer(
+                origin,
+                eframe::egui::pos2(pointer_x, 100.0),
+                100.0,
+                1_000.0,
+                60.0,
+            )
+            .expect("finite drag") else {
+                panic!("thumbnail origin must stay on the thumbnail axis");
+            };
+            center_index
+        });
+        for (actual, expected) in centers.into_iter().zip([10.1, 10.3, 10.65, 11.0]) {
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
+        assert!(centers.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let release = seek_strip_center_at_drag_pointer(
+            origin,
+            eframe::egui::pos2(500.0, 100.0),
+            100.0,
+            1_000.0,
+            60.0,
+        );
+        assert_eq!(
+            release,
+            Some(SeekStripCenter::Thumbnails { center_index: 11.0 })
+        );
+
+        let waveform_origin = SeekStripDragOrigin::new(
+            SeekStripCenter::Waveform {
+                center_time_secs: 90.0,
+            },
+            eframe::egui::pos2(600.0, 100.0),
+        );
+        let waveform_centers = [590.0, 570.0, 535.0, 500.0].map(|pointer_x| {
+            let SeekStripCenter::Waveform { center_time_secs } = seek_strip_center_at_drag_pointer(
+                waveform_origin,
+                eframe::egui::pos2(pointer_x, 100.0),
+                100.0,
+                1_000.0,
+                60.0,
+            )
+            .expect("finite drag") else {
+                panic!("waveform origin must stay on the waveform axis");
+            };
+            center_time_secs
+        });
+        assert!(waveform_centers.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!((waveform_centers[3] - 96.0).abs() < 1.0e-6);
     }
 
     #[test]

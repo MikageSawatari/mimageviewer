@@ -4244,7 +4244,7 @@ impl KeyAction {
             VideoPin => "現在の再生位置を代表フレームとしてピン留めする",
             VideoPerfOverlay => "動画の性能オーバーレイを切り替える",
             VideoTileMode => "動画タイルモードを切り替える",
-            VideoSeekStrip => "動画のシークストリップを切り替える",
+            VideoSeekStrip => "動画のシークストリップ表示を切り替える",
             VideoScaleFilterNext => "動画の拡大方法を順に切り替える",
             VideoAnime4kRemeasure => "動画の Anime4K の性能をもう一度測定する",
             VideoBookmark => "現在の再生位置にブックマークを追加する",

@@ -4406,9 +4406,15 @@ pub struct Settings {
     /// シークストリップで採用する画像どうしの最小間隔 (秒)。0.0 は間引かない。
     #[serde(default = "default_video_seek_strip_min_interval_secs")]
     pub video_seek_strip_min_interval_secs: f64,
-    /// 動画シークストリップの表示内容。ストリップ内の切替を次回起動にも引き継ぐ。
+    /// 動画シークストリップの表示状態。開閉と表示内容をこの 3 値だけで表す。
     #[serde(default)]
-    pub video_seek_strip_mode: VideoSeekStripMode,
+    pub video_seek_strip_state: VideoSeekStripState,
+    /// `video_seek_strip_state=None` から上ドラッグで戻す、最後の表示内容。
+    ///
+    /// Increment 4 の `video_seek_strip_mode` は読み込み alias として引き継ぐ。これは表示中か
+    /// どうかを表す state ではなく、明示的な復元先だけを所有する。
+    #[serde(default, alias = "video_seek_strip_mode")]
+    pub video_seek_strip_last_choice: VideoSeekStripMode,
     /// native 動画プレゼンターの上部情報バーを常時表示し、映像領域から除外する。
     #[serde(default)]
     pub video_top_bar_locked: bool,
@@ -5085,7 +5091,7 @@ fn default_video_seek_thumbnail_tolerance_secs() -> f64 {
     VIDEO_SEEK_THUMBNAIL_TOLERANCE_DEFAULT_SECS
 }
 
-/// 動画シークストリップの表示モード。
+/// 動画シークストリップの表示内容 (`None` から戻すための非 empty 選択)。
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VideoSeekStripMode {
@@ -5099,6 +5105,62 @@ impl VideoSeekStripMode {
         match self {
             Self::Thumbnails => "場面",
             Self::Waveform => "波形",
+        }
+    }
+}
+
+/// 動画シークストリップの persisted source of truth。
+///
+/// 開閉 bool と表示 mode を別々に持たず、この 3 値だけを巡回・保存する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoSeekStripState {
+    #[default]
+    None,
+    Thumbnails,
+    Waveform,
+}
+
+impl VideoSeekStripState {
+    pub const fn cycle(self) -> Self {
+        match self {
+            Self::None => Self::Thumbnails,
+            Self::Thumbnails => Self::Waveform,
+            Self::Waveform => Self::None,
+        }
+    }
+
+    pub const fn mode(self) -> Option<VideoSeekStripMode> {
+        match self {
+            Self::None => None,
+            Self::Thumbnails => Some(VideoSeekStripMode::Thumbnails),
+            Self::Waveform => Some(VideoSeekStripMode::Waveform),
+        }
+    }
+
+    pub const fn from_mode(mode: VideoSeekStripMode) -> Self {
+        match mode {
+            VideoSeekStripMode::Thumbnails => Self::Thumbnails,
+            VideoSeekStripMode::Waveform => Self::Waveform,
+        }
+    }
+
+    pub const fn last_choice(self, previous: VideoSeekStripMode) -> VideoSeekStripMode {
+        match self.mode() {
+            Some(mode) => mode,
+            None => previous,
+        }
+    }
+
+    pub const fn restore(last_choice: VideoSeekStripMode) -> Self {
+        Self::from_mode(last_choice)
+    }
+
+    pub const fn menu_label(self) -> &'static str {
+        match self {
+            Self::None => "なし",
+            Self::Thumbnails => "サムネイルストリップ表示",
+            Self::Waveform => "音声波形ストリップ表示",
         }
     }
 }
@@ -5723,7 +5785,8 @@ impl Default for Settings {
             video_playback_speed: default_video_playback_speed(),
             video_seek_thumbnail_tolerance_secs: default_video_seek_thumbnail_tolerance_secs(),
             video_seek_strip_min_interval_secs: default_video_seek_strip_min_interval_secs(),
-            video_seek_strip_mode: VideoSeekStripMode::default(),
+            video_seek_strip_state: VideoSeekStripState::default(),
+            video_seek_strip_last_choice: VideoSeekStripMode::default(),
             video_top_bar_locked: false,
             video_seek_bar_locked: false,
             video_autoplay: false,
@@ -7168,6 +7231,9 @@ impl Settings {
             } else {
                 VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS
             };
+        self.video_seek_strip_last_choice = self
+            .video_seek_strip_state
+            .last_choice(self.video_seek_strip_last_choice);
         // 0 は SegmentRing が表現できず、極端な直接編集値はメモリを際限なく予約し得る。
         // 2 秒 x 300 本 (= 10 分) を設定値として許す上限にする。
         self.remote_video_segment_window = self.remote_video_segment_window.clamp(1, 300);
@@ -7827,20 +7893,85 @@ mod tests {
     use super::*;
 
     #[test]
-    fn video_seek_strip_mode_defaults_to_thumbnails_and_round_trips() {
+    fn video_seek_strip_state_defaults_closed_and_round_trips_with_explicit_last_choice() {
         assert_eq!(
-            Settings::default().video_seek_strip_mode,
+            Settings::default().video_seek_strip_state,
+            VideoSeekStripState::None
+        );
+        assert_eq!(
+            Settings::default().video_seek_strip_last_choice,
             VideoSeekStripMode::Thumbnails
         );
         let loaded: Settings = serde_json::from_str("{}").unwrap();
-        assert_eq!(loaded.video_seek_strip_mode, VideoSeekStripMode::Thumbnails);
+        assert_eq!(loaded.video_seek_strip_state, VideoSeekStripState::None);
+        assert_eq!(
+            loaded.video_seek_strip_last_choice,
+            VideoSeekStripMode::Thumbnails
+        );
 
         let mut settings = Settings::default();
-        settings.video_seek_strip_mode = VideoSeekStripMode::Waveform;
+        settings.video_seek_strip_state = VideoSeekStripState::Waveform;
+        settings.video_seek_strip_last_choice = VideoSeekStripMode::Waveform;
         let stored = serde_json::to_value(settings).unwrap();
-        assert_eq!(stored["video_seek_strip_mode"], "waveform");
+        assert_eq!(stored["video_seek_strip_state"], "waveform");
+        assert_eq!(stored["video_seek_strip_last_choice"], "waveform");
+        assert!(stored.get("video_seek_strip_mode").is_none());
         let loaded: Settings = serde_json::from_value(stored).unwrap();
-        assert_eq!(loaded.video_seek_strip_mode, VideoSeekStripMode::Waveform);
+        assert_eq!(loaded.video_seek_strip_state, VideoSeekStripState::Waveform);
+        assert_eq!(
+            loaded.video_seek_strip_last_choice,
+            VideoSeekStripMode::Waveform
+        );
+    }
+
+    #[test]
+    fn video_seek_strip_three_state_cycle_and_last_choice_restore_are_pure() {
+        assert_eq!(
+            VideoSeekStripState::None.cycle(),
+            VideoSeekStripState::Thumbnails
+        );
+        assert_eq!(
+            VideoSeekStripState::Thumbnails.cycle(),
+            VideoSeekStripState::Waveform
+        );
+        assert_eq!(
+            VideoSeekStripState::Waveform.cycle(),
+            VideoSeekStripState::None
+        );
+
+        let last = VideoSeekStripState::Waveform.last_choice(VideoSeekStripMode::Thumbnails);
+        assert_eq!(last, VideoSeekStripMode::Waveform);
+        assert_eq!(
+            VideoSeekStripState::None.last_choice(last),
+            VideoSeekStripMode::Waveform
+        );
+        assert_eq!(
+            VideoSeekStripState::restore(last),
+            VideoSeekStripState::Waveform
+        );
+    }
+
+    #[test]
+    fn increment_four_mode_migrates_to_last_choice_without_opening_the_strip() {
+        let loaded: Settings =
+            serde_json::from_str("{\"video_seek_strip_mode\":\"waveform\"}").unwrap();
+        assert_eq!(loaded.video_seek_strip_state, VideoSeekStripState::None);
+        assert_eq!(
+            loaded.video_seek_strip_last_choice,
+            VideoSeekStripMode::Waveform
+        );
+    }
+
+    #[test]
+    fn sanitize_keeps_active_seek_strip_state_as_the_explicit_restore_choice() {
+        let mut settings = Settings::default();
+        settings.video_seek_strip_state = VideoSeekStripState::Waveform;
+        settings.video_seek_strip_last_choice = VideoSeekStripMode::Thumbnails;
+        settings.sanitize();
+        assert_eq!(
+            settings.video_seek_strip_last_choice,
+            VideoSeekStripMode::Waveform
+        );
     }
 
     #[test]

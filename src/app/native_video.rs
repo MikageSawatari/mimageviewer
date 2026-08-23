@@ -22,25 +22,26 @@ pub(super) struct VideoSeekStripSession {
     completed_analysis: Option<crate::video::seek_strip_wave::CompletedTimelineAnalysis>,
     visible_count: usize,
     last_requested_center: Option<f64>,
+    thumbnail_request_coverage: Option<crate::video::seek_strip::CellRange>,
     wave_raster_size: Option<(usize, usize)>,
     last_wave_request: Option<crate::video::seek_strip_wave::WaveRequestSignature>,
+    pending_wave_span: Option<crate::video::seek_strip_wave::WaveSpan>,
     min_interval_secs: f64,
-    drag_playback: VideoSeekStripDragPlayback,
+    drag_state: VideoSeekStripDragState,
+    last_follow_recenter_at: Option<std::time::Instant>,
 }
 
 #[cfg(windows)]
 #[derive(Default)]
-enum VideoSeekStripDragPlayback {
+enum VideoSeekStripDragState {
     #[default]
     Idle,
-    Dragging {
-        was_playing: bool,
-    },
+    Dragging,
 }
 
 #[cfg(windows)]
 #[derive(Default)]
-pub(super) enum VideoSeekStripState {
+pub(super) enum VideoSeekStripRuntime {
     #[default]
     Closed,
     Open(Box<VideoSeekStripSession>),
@@ -3998,15 +3999,7 @@ impl App {
                 self.mark_native_video_hud_activity(ctx);
             }
             crate::video::NativeVideoOutputEvent::MoveSeekStrip { center } => {
-                let was_playing = self
-                    .fs_cache
-                    .get(&fs_idx)
-                    .and_then(|entry| match entry {
-                        FsCacheEntry::Video { player, .. } => Some(player.is_playing()),
-                        _ => None,
-                    })
-                    .unwrap_or(false);
-                if let VideoSeekStripState::Open(session) = &mut self.video_seek_strip_state
+                if let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime
                     && center.mode() == session.center.mode()
                     && center
                         .time_secs(match &session.axis {
@@ -4015,9 +4008,8 @@ impl App {
                         })
                         .is_some()
                 {
-                    if matches!(session.drag_playback, VideoSeekStripDragPlayback::Idle) {
-                        session.drag_playback =
-                            VideoSeekStripDragPlayback::Dragging { was_playing };
+                    if matches!(session.drag_state, VideoSeekStripDragState::Idle) {
+                        session.drag_state = VideoSeekStripDragState::Dragging;
                     }
                     session.center = center;
                     Self::request_video_seek_strip_window(session);
@@ -4025,8 +4017,8 @@ impl App {
                 }
             }
             crate::video::NativeVideoOutputEvent::CommitSeekStrip { center } => {
-                let (target_secs, drag_playing) = match &mut self.video_seek_strip_state {
-                    VideoSeekStripState::Open(session)
+                let target_secs = match &mut self.video_seek_strip_runtime {
+                    VideoSeekStripRuntime::Open(session)
                         if center.mode() == session.center.mode() =>
                     {
                         session.center = center;
@@ -4037,23 +4029,16 @@ impl App {
                                 | VideoSeekStripAxisState::Resolving { .. } => None,
                             })
                             .map(|target_secs| target_secs.clamp(0.0, session.duration_secs));
-                        let drag_playing = match std::mem::take(&mut session.drag_playback) {
-                            VideoSeekStripDragPlayback::Idle => None,
-                            VideoSeekStripDragPlayback::Dragging { was_playing } => {
-                                Some(was_playing)
-                            }
-                        };
-                        (target_secs, drag_playing)
+                        session.drag_state = VideoSeekStripDragState::Idle;
+                        session.last_follow_recenter_at = Some(std::time::Instant::now());
+                        target_secs
                     }
-                    _ => (None, None),
+                    _ => None,
                 };
                 if let Some(target_secs) = target_secs
                     && let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
                 {
-                    player.seek_with_play_state(
-                        target_secs,
-                        drag_playing.unwrap_or_else(|| player.is_playing()),
-                    );
+                    player.seek_with_play_state(target_secs, true);
                     self.mark_native_video_hud_activity(ctx);
                     self.apply_loop_mode_to_player(fs_idx);
                 }
@@ -4065,17 +4050,22 @@ impl App {
                 pixel_width,
                 pixel_height,
             } => {
-                if let VideoSeekStripState::Open(session) = &mut self.video_seek_strip_state {
+                if let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime {
                     if center.mode() == session.center.mode() {
                         session.center = center;
                     }
                     session.visible_count = visible_count.max(1);
-                    session.wave_raster_size = Some((pixel_width.max(1), pixel_height.max(1)));
+                    let raster_size = (pixel_width.max(1), pixel_height.max(1));
+                    if session.wave_raster_size != Some(raster_size) {
+                        session.wave_raster_size = Some(raster_size);
+                        session.last_wave_request = None;
+                        session.pending_wave_span = None;
+                    }
                     Self::request_video_seek_strip_window(session);
                 }
             }
-            crate::video::NativeVideoOutputEvent::SetSeekStripMode { mode } => {
-                if self.set_video_seek_strip_mode(fs_idx, mode) {
+            crate::video::NativeVideoOutputEvent::SetSeekStripState { state } => {
+                if self.set_video_seek_strip_state(fs_idx, state) {
                     self.mark_native_video_hud_activity(ctx);
                     self.sync_native_video_seek_strip(ctx, fs_idx);
                 }
@@ -6701,7 +6691,33 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn open_video_seek_strip(&mut self, fs_idx: usize) -> bool {
+        let state = crate::settings::VideoSeekStripState::restore(
+            self.settings.video_seek_strip_last_choice,
+        );
+        self.set_video_seek_strip_state(fs_idx, state)
+    }
+
+    #[cfg(windows)]
+    fn ensure_video_seek_strip_session(
+        &mut self,
+        fs_idx: usize,
+        mode: crate::settings::VideoSeekStripMode,
+    ) -> bool {
         const FALLBACK_MAX_CELLS: usize = 240;
+        if let VideoSeekStripRuntime::Open(session) = &self.video_seek_strip_runtime
+            && session.owner_fs_idx == fs_idx
+            && session.center.mode() == mode
+        {
+            return true;
+        }
+        if matches!(
+            self.video_seek_strip_runtime,
+            VideoSeekStripRuntime::Open(_)
+        ) {
+            self.stop_video_seek_strip_session(
+                crate::video::seek_strip::SeekStripCloseCause::VideoChanged,
+            );
+        }
         let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
             return false;
         };
@@ -6717,8 +6733,6 @@ impl App {
         };
         let current_surface = if self.video_tile_mode_active {
             crate::video::seek_strip::SeekStripSurface::Tile
-        } else if matches!(self.video_seek_strip_state, VideoSeekStripState::Open(_)) {
-            crate::video::seek_strip::SeekStripSurface::Strip
         } else {
             crate::video::seek_strip::SeekStripSurface::Neither
         };
@@ -6731,15 +6745,10 @@ impl App {
         if desired_surface != crate::video::seek_strip::SeekStripSurface::Strip {
             return false;
         }
-        if matches!(self.video_seek_strip_state, VideoSeekStripState::Open(_)) {
-            return true;
-        }
-
         let path = player.path().clone();
         let initial_time_secs = player.position();
         let duration_secs = info.duration_secs;
         let min_interval_secs = self.settings.video_seek_strip_min_interval_secs;
-        let mode = self.settings.video_seek_strip_mode;
         let meta = self.image_metas.get(fs_idx).copied().flatten();
         let completed_analysis = if mode == crate::settings::VideoSeekStripMode::Waveform {
             self.completed_music_analysis_for_seek_strip(&path, meta)
@@ -6775,27 +6784,50 @@ impl App {
                 )),
             ),
         };
-        self.video_seek_strip_state = VideoSeekStripState::Open(Box::new(VideoSeekStripSession {
-            owner_fs_idx: fs_idx,
-            video_path: path,
-            duration_secs,
-            center,
-            axis,
-            thumbnail_worker,
-            wave_worker,
-            completed_analysis,
-            visible_count: 9,
-            last_requested_center: None,
-            wave_raster_size: None,
-            last_wave_request: None,
-            min_interval_secs,
-            drag_playback: VideoSeekStripDragPlayback::Idle,
-        }));
+        self.video_seek_strip_runtime =
+            VideoSeekStripRuntime::Open(Box::new(VideoSeekStripSession {
+                owner_fs_idx: fs_idx,
+                video_path: path,
+                duration_secs,
+                center,
+                axis,
+                thumbnail_worker,
+                wave_worker,
+                completed_analysis,
+                visible_count: 9,
+                last_requested_center: None,
+                thumbnail_request_coverage: None,
+                wave_raster_size: None,
+                last_wave_request: None,
+                pending_wave_span: None,
+                min_interval_secs,
+                drag_state: VideoSeekStripDragState::Idle,
+                last_follow_recenter_at: None,
+            }));
         true
     }
 
     #[cfg(windows)]
     pub(crate) fn close_video_seek_strip(
+        &mut self,
+        cause: crate::video::seek_strip::SeekStripCloseCause,
+    ) -> bool {
+        let mut changed = false;
+        if cause.clears_persisted_state()
+            && self.settings.video_seek_strip_state != crate::settings::VideoSeekStripState::None
+        {
+            if let Some(mode) = self.settings.video_seek_strip_state.mode() {
+                self.settings.video_seek_strip_last_choice = mode;
+            }
+            self.settings.video_seek_strip_state = crate::settings::VideoSeekStripState::None;
+            self.settings.save();
+            changed = true;
+        }
+        self.stop_video_seek_strip_session(cause) || changed
+    }
+
+    #[cfg(windows)]
+    fn stop_video_seek_strip_session(
         &mut self,
         cause: crate::video::seek_strip::SeekStripCloseCause,
     ) -> bool {
@@ -6807,8 +6839,8 @@ impl App {
             desired_surface,
             crate::video::seek_strip::SeekStripSurface::Neither
         );
-        let previous = std::mem::take(&mut self.video_seek_strip_state);
-        let VideoSeekStripState::Open(session) = previous else {
+        let previous = std::mem::take(&mut self.video_seek_strip_runtime);
+        let VideoSeekStripRuntime::Open(session) = previous else {
             return false;
         };
         if let Some(worker) = session.thumbnail_worker.as_ref() {
@@ -6828,32 +6860,70 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn toggle_video_seek_strip(&mut self, fs_idx: usize) -> bool {
-        if matches!(self.video_seek_strip_state, VideoSeekStripState::Open(_)) {
-            debug_assert_eq!(
-                crate::video::seek_strip::decide_seek_strip_surface(
-                    crate::video::seek_strip::SeekStripSurface::Strip,
-                    crate::video::seek_strip::SeekStripSurfaceIntent::ToggleStrip {
-                        may_open: true,
-                    },
-                ),
-                crate::video::seek_strip::SeekStripSurface::Neither
-            );
-            self.close_video_seek_strip(crate::video::seek_strip::SeekStripCloseCause::Toggle);
-            false
-        } else {
-            self.open_video_seek_strip(fs_idx)
-        }
+        let next = self.settings.video_seek_strip_state.cycle();
+        self.set_video_seek_strip_state(fs_idx, next)
     }
 
     #[cfg(windows)]
-    fn set_video_seek_strip_mode(
+    fn set_video_seek_strip_state(
+        &mut self,
+        fs_idx: usize,
+        state: crate::settings::VideoSeekStripState,
+    ) -> bool {
+        let previous_state = self.settings.video_seek_strip_state;
+        if state == crate::settings::VideoSeekStripState::None {
+            self.settings.video_seek_strip_state = state;
+            if previous_state != state {
+                self.settings.save();
+            }
+            let stopped = self.stop_video_seek_strip_session(
+                crate::video::seek_strip::SeekStripCloseCause::Toggle,
+            );
+            return previous_state != state || stopped;
+        }
+
+        let Some(mode) = state.mode() else {
+            return false;
+        };
+        let runtime_matches = matches!(
+            &self.video_seek_strip_runtime,
+            VideoSeekStripRuntime::Open(session)
+                if session.owner_fs_idx == fs_idx && session.center.mode() == mode
+        );
+        let applied = if runtime_matches {
+            true
+        } else if matches!(
+            &self.video_seek_strip_runtime,
+            VideoSeekStripRuntime::Open(session) if session.owner_fs_idx == fs_idx
+        ) {
+            self.set_video_seek_strip_runtime_mode(fs_idx, mode)
+        } else {
+            self.ensure_video_seek_strip_session(fs_idx, mode)
+        };
+        if !applied {
+            return false;
+        }
+
+        let last_choice = state.last_choice(self.settings.video_seek_strip_last_choice);
+        let settings_changed =
+            previous_state != state || self.settings.video_seek_strip_last_choice != last_choice;
+        self.settings.video_seek_strip_state = state;
+        self.settings.video_seek_strip_last_choice = last_choice;
+        if settings_changed {
+            self.settings.save();
+        }
+        settings_changed || !runtime_matches
+    }
+
+    #[cfg(windows)]
+    fn set_video_seek_strip_runtime_mode(
         &mut self,
         fs_idx: usize,
         mode: crate::settings::VideoSeekStripMode,
     ) -> bool {
         const FALLBACK_MAX_CELLS: usize = 240;
-        let Some(session) = (match &self.video_seek_strip_state {
-            VideoSeekStripState::Open(session) if session.owner_fs_idx == fs_idx => Some(session),
+        let Some(session) = (match &self.video_seek_strip_runtime {
+            VideoSeekStripRuntime::Open(session) if session.owner_fs_idx == fs_idx => Some(session),
             _ => None,
         }) else {
             return false;
@@ -6906,7 +6976,7 @@ impl App {
             None
         };
 
-        let VideoSeekStripState::Open(session) = &mut self.video_seek_strip_state else {
+        let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime else {
             return false;
         };
         if let Some(worker) = new_thumbnail_worker {
@@ -6945,16 +7015,19 @@ impl App {
             }
         }
         session.last_requested_center = None;
+        session.thumbnail_request_coverage = None;
         session.last_wave_request = None;
+        session.pending_wave_span = None;
         Self::request_video_seek_strip_window(session);
-        self.settings.video_seek_strip_mode = mode;
-        self.settings.save();
         true
     }
 
     #[cfg(windows)]
     pub(crate) fn video_seek_strip_is_open(&self) -> bool {
-        matches!(self.video_seek_strip_state, VideoSeekStripState::Open(_))
+        matches!(
+            self.video_seek_strip_runtime,
+            VideoSeekStripRuntime::Open(_)
+        )
     }
 
     #[cfg(windows)]
@@ -6966,7 +7039,7 @@ impl App {
         if !target_secs.is_finite() {
             return false;
         }
-        let VideoSeekStripState::Open(session) = &mut self.video_seek_strip_state else {
+        let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime else {
             return false;
         };
         if session.owner_fs_idx != fs_idx {
@@ -6996,7 +7069,8 @@ impl App {
             }
         }
         Self::request_video_seek_strip_window(session);
-        session.drag_playback = VideoSeekStripDragPlayback::Idle;
+        session.drag_state = VideoSeekStripDragState::Idle;
+        session.last_follow_recenter_at = Some(std::time::Instant::now());
         true
     }
 
@@ -7012,33 +7086,102 @@ impl App {
                 };
                 let previous = session.last_requested_center;
                 let visible = session.visible_count.max(1);
-                let lookahead = match previous {
-                    Some(previous) if center_index > previous => {
-                        crate::video::seek_strip::StripLookahead::new(0, visible)
-                    }
-                    Some(previous) if center_index < previous => {
-                        crate::video::seek_strip::StripLookahead::new(visible, 0)
-                    }
-                    _ => crate::video::seek_strip::StripLookahead::new(
-                        visible / 2,
-                        visible - visible / 2,
+                let (trigger_lookahead, request_lookahead) = match previous {
+                    Some(previous) if center_index > previous => (
+                        crate::video::seek_strip::StripLookahead::new(0, visible / 2),
+                        crate::video::seek_strip::StripLookahead::new(0, visible),
                     ),
+                    Some(previous) if center_index < previous => (
+                        crate::video::seek_strip::StripLookahead::new(visible / 2, 0),
+                        crate::video::seek_strip::StripLookahead::new(visible, 0),
+                    ),
+                    _ => {
+                        let balanced = crate::video::seek_strip::StripLookahead::new(
+                            visible / 2,
+                            visible - visible / 2,
+                        );
+                        (balanced, balanced)
+                    }
                 };
+                let trigger = crate::video::seek_strip::compute_strip_window(
+                    center_index,
+                    visible,
+                    trigger_lookahead,
+                    axis.cell_count(),
+                    None,
+                );
+                if let (Some(coverage), Some(required)) =
+                    (&session.thumbnail_request_coverage, trigger.ready.as_ref())
+                    && coverage.contains_range(required)
+                {
+                    session.last_requested_center = Some(center_index);
+                    return;
+                }
+                let requested = crate::video::seek_strip::compute_strip_window(
+                    center_index,
+                    visible,
+                    request_lookahead,
+                    axis.cell_count(),
+                    None,
+                );
                 let _ = worker.request(
                     std::sync::Arc::clone(axis),
                     center_index,
                     visible,
-                    lookahead,
+                    request_lookahead,
                 );
                 session.last_requested_center = Some(center_index);
+                session.thumbnail_request_coverage = requested.ready;
             }
             crate::video::seek_strip::SeekStripCenter::Waveform { center_time_secs } => {
-                let Some((pixel_width, pixel_height)) = session.wave_raster_size else {
+                let Some((visible_pixel_width, pixel_height)) = session.wave_raster_size else {
                     return;
                 };
-                let Some(signature) = crate::video::seek_strip_wave::WaveRequestSignature::new(
+                let Some(worker) = session.wave_worker.as_ref() else {
+                    return;
+                };
+                let snapshot = worker.snapshot();
+                if let (Some(pending), Some(raster)) =
+                    (session.pending_wave_span, snapshot.raster.as_ref())
+                    && pending.matches_window(raster.window_start_secs, raster.window_end_secs)
+                {
+                    session.pending_wave_span = None;
+                }
+                if matches!(
+                    snapshot.status,
+                    crate::video::seek_strip_wave::WaveWorkerStatus::NoAudioTrack
+                        | crate::video::seek_strip_wave::WaveWorkerStatus::Failed(_)
+                        | crate::video::seek_strip_wave::WaveWorkerStatus::ThreadSpawnFailed(_)
+                        | crate::video::seek_strip_wave::WaveWorkerStatus::Cancelled
+                ) {
+                    return;
+                }
+                let wide_pixel_width = visible_pixel_width
+                    .saturating_mul(crate::video::seek_strip_wave::WAVEFORM_RASTER_SPAN_MULTIPLIER);
+                let displayed = snapshot
+                    .raster
+                    .as_ref()
+                    .filter(|raster| {
+                        let width = raster.width as usize;
+                        raster.height as usize == pixel_height
+                            && (width == visible_pixel_width || width == wide_pixel_width)
+                    })
+                    .map(|raster| crate::video::seek_strip_wave::WaveSpan {
+                        start_secs: raster.window_start_secs,
+                        end_secs: raster.window_end_secs,
+                    });
+                let Some(request) = crate::video::seek_strip_wave::decide_waveform_span_request(
                     center_time_secs,
+                    displayed,
+                    session.pending_wave_span,
+                ) else {
+                    return;
+                };
+                let pixel_width = request.pixel_width(visible_pixel_width);
+                let Some(signature) = crate::video::seek_strip_wave::WaveRequestSignature::new(
+                    request.span.center_secs(),
                     session.duration_secs,
+                    request.span.duration_secs(),
                     pixel_width,
                     pixel_height,
                 ) else {
@@ -7047,14 +7190,12 @@ impl App {
                 if session.last_wave_request == Some(signature) {
                     return;
                 }
-                let Some(worker) = session.wave_worker.as_ref() else {
-                    return;
-                };
                 if worker
                     .request(signature, session.completed_analysis.clone())
                     .is_some()
                 {
                     session.last_wave_request = Some(signature);
+                    session.pending_wave_span = Some(request.span);
                 }
             }
         }
@@ -7062,7 +7203,7 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn rebuild_video_seek_strip_adopted_list(&mut self) {
-        let VideoSeekStripState::Open(session) = &mut self.video_seek_strip_state else {
+        let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime else {
             return;
         };
         let new_minimum = self.settings.video_seek_strip_min_interval_secs;
@@ -7087,12 +7228,84 @@ impl App {
         }
         session.axis = VideoSeekStripAxisState::Ready(rebuilt);
         session.last_requested_center = None;
+        session.thumbnail_request_coverage = None;
         if matches!(
             session.center,
             crate::video::seek_strip::SeekStripCenter::Thumbnails { .. }
         ) {
             Self::request_video_seek_strip_window(session);
         }
+    }
+
+    #[cfg(windows)]
+    fn follow_video_seek_strip_playhead(&mut self, fs_idx: usize) -> bool {
+        let Some((playing, playhead_time_secs)) =
+            self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
+                FsCacheEntry::Video { player, .. } => {
+                    Some((player.is_playing(), player.position()))
+                }
+                _ => None,
+            })
+        else {
+            return false;
+        };
+        let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime else {
+            return false;
+        };
+        if session.owner_fs_idx != fs_idx {
+            return false;
+        }
+        let current_time_secs = match (&session.center, &session.axis) {
+            (
+                crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index },
+                VideoSeekStripAxisState::Ready(axis),
+            ) => axis.time_for_center_index(*center_index),
+            (
+                crate::video::seek_strip::SeekStripCenter::Thumbnails { .. },
+                VideoSeekStripAxisState::Resolving { initial_time_secs },
+            ) => Some(*initial_time_secs),
+            (crate::video::seek_strip::SeekStripCenter::Waveform { center_time_secs }, _) => {
+                Some(*center_time_secs)
+            }
+            _ => None,
+        };
+        let now = std::time::Instant::now();
+        let Some(target_secs) = crate::video::seek_strip::decide_follow_playhead_recenter(
+            crate::video::seek_strip::SeekStripFollowContext {
+                playing,
+                drag_active: matches!(session.drag_state, VideoSeekStripDragState::Dragging),
+                elapsed_since_recenter: session
+                    .last_follow_recenter_at
+                    .map(|last| now.saturating_duration_since(last)),
+                current_time_secs,
+                playhead_time_secs,
+            },
+        ) else {
+            return false;
+        };
+        let target_secs = target_secs.clamp(0.0, session.duration_secs);
+        match &mut session.center {
+            crate::video::seek_strip::SeekStripCenter::Waveform { center_time_secs } => {
+                *center_time_secs = target_secs;
+            }
+            crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index } => {
+                match &mut session.axis {
+                    VideoSeekStripAxisState::Ready(axis) => {
+                        let Some(next_center) = axis.center_index_for_time(target_secs) else {
+                            return false;
+                        };
+                        *center_index = next_center;
+                    }
+                    VideoSeekStripAxisState::Resolving { initial_time_secs } => {
+                        *initial_time_secs = target_secs;
+                    }
+                    VideoSeekStripAxisState::Dormant => return false,
+                }
+            }
+        }
+        session.last_follow_recenter_at = Some(now);
+        Self::request_video_seek_strip_window(session);
+        true
     }
 
     #[cfg(windows)]
@@ -7103,27 +7316,50 @@ impl App {
             }
             _ => None,
         });
+        if self.video_tile_mode_active {
+            self.close_video_seek_strip(
+                crate::video::seek_strip::SeekStripCloseCause::TileModeOpened,
+            );
+            return;
+        }
+        if self.video_audio_mode == Some(fs_idx) || current_path.is_none() {
+            self.stop_video_seek_strip_session(
+                crate::video::seek_strip::SeekStripCloseCause::VideoChanged,
+            );
+            return;
+        }
+        let Some(mode) = self.settings.video_seek_strip_state.mode() else {
+            self.stop_video_seek_strip_session(
+                crate::video::seek_strip::SeekStripCloseCause::Toggle,
+            );
+            return;
+        };
         let session_matches = matches!(
-            (&self.video_seek_strip_state, current_path.as_ref()),
-            (VideoSeekStripState::Open(session), Some(path)) if &session.video_path == path
+            (&self.video_seek_strip_runtime, current_path.as_ref()),
+            (VideoSeekStripRuntime::Open(session), Some(path))
+                if &session.video_path == path && session.center.mode() == mode
         );
-        if !session_matches || self.video_tile_mode_active || self.video_audio_mode == Some(fs_idx)
-        {
-            let cause = if self.video_tile_mode_active {
-                crate::video::seek_strip::SeekStripCloseCause::TileModeOpened
-            } else {
-                crate::video::seek_strip::SeekStripCloseCause::VideoChanged
-            };
-            self.close_video_seek_strip(cause);
+        if !session_matches && !self.ensure_video_seek_strip_session(fs_idx, mode) {
             return;
         }
 
+        self.follow_video_seek_strip_playhead(fs_idx);
         self.rebuild_video_seek_strip_adopted_list();
+        if let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime
+            && matches!(
+                session.center,
+                crate::video::seek_strip::SeekStripCenter::Waveform { .. }
+            )
+        {
+            // Poll the two-stage waveform transition even while paused. The first 60-second
+            // raster remains published while this schedules the same-centred 180-second upgrade.
+            Self::request_video_seek_strip_window(session);
+        }
         let mut axis_failure = None;
         let mut request_repaint = false;
-        let overlay = match &mut self.video_seek_strip_state {
-            VideoSeekStripState::Closed => None,
-            VideoSeekStripState::Open(session) => {
+        let overlay = match &mut self.video_seek_strip_runtime {
+            VideoSeekStripRuntime::Closed => None,
+            VideoSeekStripRuntime::Open(session) => {
                 let thumbnail_snapshot = session
                     .thumbnail_worker
                     .as_ref()
@@ -7248,8 +7484,8 @@ impl App {
                     crate::video::seek_strip::SeekStripRepaintContext {
                         visible_cells_pending,
                         drag_active: matches!(
-                            session.drag_playback,
-                            VideoSeekStripDragPlayback::Dragging { .. }
+                            session.drag_state,
+                            VideoSeekStripDragState::Dragging
                         ),
                     },
                 );
@@ -7272,8 +7508,18 @@ impl App {
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             player.set_native_seek_strip(overlay);
         }
+        let follow_tick_needed = matches!(
+            &self.video_seek_strip_runtime,
+            VideoSeekStripRuntime::Open(session)
+                if session.owner_fs_idx == fs_idx
+                    && matches!(session.drag_state, VideoSeekStripDragState::Idle)
+        ) && self.fs_cache.get(&fs_idx).is_some_and(
+            |entry| matches!(entry, FsCacheEntry::Video { player, .. } if player.is_playing()),
+        );
         if request_repaint {
             ctx.request_repaint_after(std::time::Duration::from_millis(80));
+        } else if follow_tick_needed {
+            ctx.request_repaint_after(crate::video::seek_strip::SEEK_STRIP_FOLLOW_INTERVAL);
         }
     }
 

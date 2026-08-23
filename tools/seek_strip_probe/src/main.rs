@@ -18,8 +18,8 @@ use ffmpeg_the_third as ffmpeg;
 
 /// ストリップの可視セル数の想定値 (§9 U3 の出発点)。
 const WINDOW_CELLS: usize = 11;
-/// 波形の窓幅 (秒)。ストリップ 1 画面ぶんの想定。
-const WAVE_WINDOW_SECS: f64 = 60.0;
+/// Increment 4 の可視幅と Increment 5 の 3 画面 raster 幅を同じ素材で比較する。
+const WAVE_WINDOW_SPANS_SECS: [f64; 2] = [60.0, 180.0];
 /// 波形窓の前置き。1 次フィルタの状態を整えるために復号して捨てる (§5.2)。
 const WAVE_PREROLL_SECS: f64 = 1.0;
 
@@ -165,18 +165,22 @@ fn probe_one(path: &Path) -> Result<(), String> {
     }
 
     // ── 3. 波形の窓解析 ────────────────────────────────────────────────────
-    match wave_window(path, duration_secs * 0.5) {
-        Ok(Some(r)) => println!(
-            "  [3] wave window {:.0}s: decode {:.1}ms + analyze {:.1}ms = {:.1}ms  ({} bins, {} frames)",
-            WAVE_WINDOW_SECS,
-            r.decode_ms,
-            r.analyze_ms,
-            r.decode_ms + r.analyze_ms,
-            r.bins,
-            r.frames
-        ),
-        Ok(None) => println!("  [3] wave: no audio stream"),
-        Err(e) => println!("  [3] wave: ERROR {e}"),
+    for span_secs in WAVE_WINDOW_SPANS_SECS {
+        match wave_window(path, duration_secs * 0.5, span_secs) {
+            Ok(Some(r)) => println!(
+                "  [3] wave window {span_secs:.0}s: decode {:.1}ms + analyze {:.1}ms = {:.1}ms  ({} bins, {} frames)",
+                r.decode_ms,
+                r.analyze_ms,
+                r.decode_ms + r.analyze_ms,
+                r.bins,
+                r.frames
+            ),
+            Ok(None) => {
+                println!("  [3] wave: no audio stream");
+                break;
+            }
+            Err(e) => println!("  [3] wave {span_secs:.0}s: ERROR {e}"),
+        }
     }
     Ok(())
 }
@@ -380,7 +384,11 @@ struct WaveResult {
 }
 
 /// 窓 ± pre-roll だけ音声を復号して bins を作る (§5.2 の骨格)。
-fn wave_window(path: &Path, center_secs: f64) -> Result<Option<WaveResult>, String> {
+fn wave_window(
+    path: &Path,
+    center_secs: f64,
+    window_secs: f64,
+) -> Result<Option<WaveResult>, String> {
     use ffmpeg::ffi::{AVSEEK_FLAG_BACKWARD, av_seek_frame};
     use ffmpeg::util::frame::audio::Audio;
 
@@ -401,9 +409,9 @@ fn wave_window(path: &Path, center_secs: f64) -> Result<Option<WaveResult>, Stri
         .map_err(|e| format!("codec ctx: {e}"))?;
     let mut decoder = ctx.decoder().audio().map_err(|e| format!("decoder: {e}"))?;
 
-    let window_start = (center_secs - WAVE_WINDOW_SECS * 0.5).max(0.0);
+    let window_start = (center_secs - window_secs * 0.5).max(0.0);
     let decode_start = (window_start - WAVE_PREROLL_SECS).max(0.0);
-    let window_end = window_start + WAVE_WINDOW_SECS;
+    let window_end = window_start + window_secs;
 
     // SAFETY: ictx は有効。stream_index=-1 は AV_TIME_BASE 単位。
     let seek_ok = unsafe {

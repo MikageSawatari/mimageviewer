@@ -468,7 +468,7 @@
 # VideoPin = P ; 現在の再生位置を代表フレームとしてピン留めする
 # VideoPerfOverlay = F ; 動画の性能オーバーレイを切り替える
 # VideoTileMode = S ; 動画タイルモードを切り替える
-# VideoSeekStrip = Shift+S ; 動画のシークストリップを切り替える
+# VideoSeekStrip = Shift+S ; 動画のシークストリップ表示を切り替える
 # VideoScaleFilterNext = T ; 動画の拡大方法を順に切り替える
 # VideoAnime4kRemeasure = none ; 動画の Anime4K の性能をもう一度測定する
 # VideoBookmark = B ; 現在の再生位置にブックマークを追加する
