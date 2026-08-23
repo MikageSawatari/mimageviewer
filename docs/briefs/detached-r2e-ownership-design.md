@@ -1125,9 +1125,11 @@ BLOCKER 3 の指摘どおり、**保管フィールドを消した瞬間に全�
   マウント中のものは**巡回に含まれない**。②-d の統一 mount transaction は
   「既にマウント済みなら swap せずそのまま `f` を実行する」(設計 §4.1) ので、
   巡回側にもマウント中の id が含まれると **`f` が 2 回走る**。
-  ②-pre で追加した「既にマウント中の parked context も処理される」テストは
-  **回数を数えていないので、この二重実行を捕まえない**
-  (Codex ②-pre 実装レビュー 2026-08-23)。②-d では**回数を数えるテスト**にすること。
+  ②-pre で追加した `all_context_clear_processes_a_paused_context_that_is_already_mounted` は
+  **どの context に対して何回走ったかを記録して `[mounted, active, sibling]` と完全一致で
+  検証している**ので、この二重実行を捕まえる (Codex ②-pre 実装レビューの指摘で、
+  「1 回以上」だけを見る形から強化したもの)。**②-d でこのテストを弱めないこと。**
+  統一 mount へ差し替えるときも、期待列が同じであることを保つ。
 - ⚠ **②-pre が holder 側に残した前置きフィルタを移すこと**:
   vst3 の pending 判定 ([app.rs:19839](../../src/app.rs:19839)) と rename 述語
   ([app.rs:28980](../../src/app.rs:28980)) は `paused_bundle` を直接見ている。
