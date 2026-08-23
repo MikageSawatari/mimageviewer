@@ -272,10 +272,11 @@ for window_id in window_ids {
    発行された `ContextSlot::PausedDetached { index }` が**元の vector index** であること。
 6. **mount に失敗しても `busy` / `complete` / `stale_context` が変わらない**こと。
 7. **parked context が既にマウントされている最中**に、変換後の「全 context 操作」を呼んでも
-   その context が処理されること (設計 §7 ②-pre の要求)。
-8. **テスト 3 は合成ループではなく、変換後の production 巡回を通すこと。**
-   VST3 の `consume` は差し替え可能なので、その中で先の id の窓を閉じ、
+   その context が処理されること (設計 §8 のテスト計画で②-pre に求めているもの)。
+8. **vector を変更するテストは、合成ループではなく変換後の production 巡回を通すこと。**
+   VST3 の `consume` は差し替え可能なので、その中で**まだ回っていない先の id の窓**を閉じ、
    **後続の生存 id が処理され続ける**ことを確認するのに使える。
+   (テスト 3 は「今マウント中の窓自体が閉じられた場合」で、こちらとは別のケース)
 
 ### 7.3 既存テストの活用
 
@@ -303,16 +304,26 @@ for window_id in window_ids {
 5. **手書き mount が 0 件**:
    ```bash
    grep -n "active_detached_viewer_context.take()" src/app.rs
-   # -> 16703 (helper 本体) + 変換しない 3 箇所 (38344 / 38583 / 42556) だけ
+   # -> with_active_detached_viewer_context (helper 本体)
+   #    + 変換しない 3 箇所 (park 38344 / 終端 close 38583 / media handoff の park 42556)
+   #    = 4 件
    grep -n "paused_bundle.take()" src/app.rs
-   # -> 変換しない 4 箇所 (39457 / 39830 / 40155 / 41048) だけ
+   # -> with_paused_detached_context (**新しい helper 本体も take する**)
+   #    + 変換しない 4 箇所 (teardown 39457 / parked-live poll 39830 /
+   #      activation 40155 / activation 41048)
+   #    = 5 件
    ```
    (行番号は変換で動くので、**件数と関数名**で確認すること)
-6. 完了報告に:
+6. **実機確認用バイナリを作る**: `.\scripts\build-dev.ps1`。
+   本ステージは production の挙動を変える (§3.1) ので、CLAUDE.md
+   「修正完了時の実機確認用バイナリ」の方針どおり、利用者が §9 の smoke を回せる状態にする。
+   **エージェントは起動しない。**
+7. 完了報告に:
    - 18 箇所それぞれの変換後の姿
    - §4.2 の 4 通りをどう適用したか (site ごと)
    - **§3.5 の suppression depth 到達確認**: `rg` の出力と、9 本それぞれの追跡結果
    - 完了条件 5 の grep の実際の出力
+   - `build-dev.ps1` の結果
 
 ## 9. 実機 smoke (利用者が実施)
 
