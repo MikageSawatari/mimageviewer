@@ -1,8 +1,61 @@
 use super::*;
 use crate::archive_converter::ArchiveFormat;
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+#[cfg(windows)]
+std::thread_local! {
+    static METADATA_BUSY_INITIAL_FOR_TEST: Cell<bool> = const { Cell::new(false) };
+    static METADATA_STALE_INITIAL_FOR_TEST: Cell<bool> = const { Cell::new(false) };
+    static CURRENT_EDIT_PREVIEW_CLEAR_TRACE: RefCell<Option<Vec<Option<PathBuf>>>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(windows)]
+pub(super) fn take_metadata_busy_initial_for_test() -> bool {
+    METADATA_BUSY_INITIAL_FOR_TEST.with(|initial| initial.replace(false))
+}
+
+#[cfg(windows)]
+fn set_metadata_busy_initial_for_test() {
+    METADATA_BUSY_INITIAL_FOR_TEST.with(|initial| initial.set(true));
+}
+
+#[cfg(windows)]
+pub(super) fn take_metadata_stale_initial_for_test() -> bool {
+    METADATA_STALE_INITIAL_FOR_TEST.with(|initial| initial.replace(false))
+}
+
+#[cfg(windows)]
+fn set_metadata_stale_initial_for_test() {
+    METADATA_STALE_INITIAL_FOR_TEST.with(|initial| initial.set(true));
+}
+
+#[cfg(windows)]
+fn begin_current_edit_preview_clear_trace() {
+    CURRENT_EDIT_PREVIEW_CLEAR_TRACE.with(|trace| *trace.borrow_mut() = Some(Vec::new()));
+}
+
+#[cfg(windows)]
+pub(super) fn record_current_edit_preview_clear_for_test(app: &App) {
+    CURRENT_EDIT_PREVIEW_CLEAR_TRACE.with(|trace| {
+        if let Some(trace) = trace.borrow_mut().as_mut() {
+            trace.push(app.current_folder.clone());
+        }
+    });
+}
+
+#[cfg(windows)]
+fn take_current_edit_preview_clear_trace() -> Vec<Option<PathBuf>> {
+    CURRENT_EDIT_PREVIEW_CLEAR_TRACE.with(|trace| {
+        trace
+            .borrow_mut()
+            .take()
+            .expect("edit-preview clear trace must be started")
+    })
+}
 
 #[cfg(windows)]
 #[test]
@@ -640,13 +693,19 @@ fn paused_detached_mount_drops_bundle_when_target_closes_inside_closure() {
     let mut app = phase_c_support::setup_app();
     let ctx = egui::Context::default();
     let window_id = 702;
+    let sibling_window_id = 703;
     let main_path = PathBuf::from(r"C:\main\page.jpg");
+    let sibling_path = PathBuf::from(r"C:\sibling\page.jpg");
     app.items = vec![GridItem::Image(main_path.clone())];
     app.detached_image_windows.push(paused_test_window(
         &ctx,
         window_id,
         ViewerContextBundle::empty(),
     ));
+    let mut sibling_bundle = ViewerContextBundle::empty();
+    sibling_bundle.items = vec![GridItem::Image(sibling_path.clone())];
+    app.detached_image_windows
+        .push(paused_test_window(&ctx, sibling_window_id, sibling_bundle));
 
     let result = app.with_paused_detached_context(window_id, |mounted| {
         mounted
@@ -660,6 +719,13 @@ fn paused_detached_mount_drops_bundle_when_target_closes_inside_closure() {
     assert!(
         app.with_paused_detached_context(window_id, |_| ())
             .is_none()
+    );
+    assert_eq!(
+        app.with_paused_detached_context(sibling_window_id, |mounted| {
+            mounted.items[0].drag_source_path().map(Path::to_path_buf)
+        }),
+        Some(Some(sibling_path)),
+        "closing the target must not restore its bundle over the shifted trailing sibling"
     );
 }
 
@@ -800,6 +866,12 @@ fn failed_context_mounts_do_not_change_busy_complete_or_stale_results() {
         !app.quiesce_metadata_transfer_context_writers(false)
             .expect("quiesce without tag DB release cannot fail")
     );
+    set_metadata_busy_initial_for_test();
+    assert!(
+        app.quiesce_metadata_transfer_context_writers(false)
+            .expect("quiesce without tag DB release cannot fail"),
+        "a failed mount must not turn an already-busy accumulator false"
+    );
 
     app.begin_metadata_import_terminal_refresh();
     assert!(
@@ -827,6 +899,30 @@ fn failed_context_mounts_do_not_change_busy_complete_or_stale_results() {
         },
     );
     assert!(!stale, "a missing bundle must not contribute staleness");
+    let result = crate::app::metadata_import_refresh::RefreshResult {
+        contexts: vec![metadata_context_result(
+            crate::app::metadata_import_refresh::ContextSlot::PausedDetached {
+                index: 0,
+                window_id,
+            },
+            app.items_generation,
+            5,
+        )],
+        page_snapshot: None,
+        errors: Vec::new(),
+    };
+    set_metadata_stale_initial_for_test();
+    let (_, stale) = app.apply_metadata_import_terminal_refresh(
+        result,
+        crate::metadata_transfer::ImportChangedSections {
+            ratings: true,
+            ..Default::default()
+        },
+    );
+    assert!(
+        stale,
+        "a failed mount must not turn an already-stale accumulator false"
+    );
 }
 
 #[test]
@@ -836,6 +932,10 @@ fn all_context_clear_processes_a_paused_context_that_is_already_mounted() {
     let ctx = egui::Context::default();
     let window_id = 750;
     let mut bundle = ViewerContextBundle::empty();
+    let mounted_folder = PathBuf::from(r"C:\mounted");
+    let active_folder = PathBuf::from(r"C:\active");
+    let sibling_folder = PathBuf::from(r"C:\sibling");
+    bundle.current_folder = Some(mounted_folder.clone());
     bundle.items = vec![GridItem::Image(PathBuf::from(r"C:\paused\preview.jpg"))];
     bundle.thumbnails = vec![ThumbnailState::Pending];
     bundle
@@ -843,6 +943,17 @@ fn all_context_clear_processes_a_paused_context_that_is_already_mounted() {
         .insert(0, "paused-preview".to_string());
     app.detached_image_windows
         .push(paused_test_window(&ctx, window_id, bundle));
+    let mut active_bundle = ViewerContextBundle::empty();
+    active_bundle.current_folder = Some(active_folder.clone());
+    app.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
+        bundle: active_bundle,
+    });
+    let sibling_window_id = 751;
+    let mut sibling_bundle = ViewerContextBundle::empty();
+    sibling_bundle.current_folder = Some(sibling_folder.clone());
+    app.detached_image_windows
+        .push(paused_test_window(&ctx, sibling_window_id, sibling_bundle));
+    begin_current_edit_preview_clear_trace();
 
     let cleared = app
         .with_paused_detached_context(window_id, |mounted| {
@@ -853,6 +964,15 @@ fn all_context_clear_processes_a_paused_context_that_is_already_mounted() {
         })
         .expect("outer paused mount must succeed");
     assert!(cleared, "the mounted current pass must perform the clear");
+    assert_eq!(
+        take_current_edit_preview_clear_trace(),
+        vec![
+            Some(mounted_folder),
+            Some(active_folder),
+            Some(sibling_folder)
+        ],
+        "the mounted, active, and remaining paused contexts must each be processed exactly once"
+    );
 
     assert_eq!(
         app.with_paused_detached_context(window_id, |mounted| {
@@ -927,6 +1047,60 @@ fn vst3_production_traversal_survives_removing_a_later_paused_window() {
             Some(None)
         );
     }
+}
+
+#[test]
+#[cfg(windows)]
+fn parked_vst3_consume_panic_restores_marker_bundle_and_main_projection() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let window_id = 770;
+    let previous_marker = Some(7_700);
+    let main_path = PathBuf::from(r"C:\main\page.jpg");
+    let parked_path = PathBuf::from(r"C:\parked\movie.mp4");
+    app.items = vec![GridItem::Image(main_path.clone())];
+    app.native_video_parked_live_input_window_id = previous_marker;
+
+    let mut parked = ViewerContextBundle::empty();
+    parked.items = vec![GridItem::Video(parked_path.clone())];
+    parked.fullscreen_idx = Some(0);
+    parked.vst3_deferred_media_open = Some(0);
+    parked.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+    parked.viewer_session.detached_window_id = Some(window_id);
+    app.detached_image_windows
+        .push(paused_test_window(&ctx, window_id, parked));
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        app.consume_deferred_vst3_media_open_in_all_contexts(|mounted, idx| {
+            assert_eq!(idx, 0);
+            assert_eq!(
+                mounted.native_video_parked_live_input_window_id,
+                Some(window_id)
+            );
+            assert_eq!(
+                mounted.items[0].drag_source_path(),
+                Some(parked_path.as_path())
+            );
+            panic!("injected parked VST3 consume panic");
+        });
+    }));
+
+    assert!(panic.is_err(), "the consume panic must still propagate");
+    assert_eq!(
+        app.native_video_parked_live_input_window_id, previous_marker,
+        "the caller-owned marker must be restored before the panic resumes"
+    );
+    assert_eq!(app.items[0].drag_source_path(), Some(main_path.as_path()));
+    assert_eq!(
+        app.with_paused_detached_context(window_id, |mounted| {
+            (
+                mounted.items[0].drag_source_path().map(Path::to_path_buf),
+                mounted.vst3_deferred_media_open,
+            )
+        }),
+        Some((Some(parked_path), None)),
+        "the mutated parked bundle must be back in its holder while main stays mounted"
+    );
 }
 
 #[test]

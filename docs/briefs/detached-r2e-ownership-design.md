@@ -1120,6 +1120,21 @@ BLOCKER 3 の指摘どおり、**保管フィールドを消した瞬間に全�
   | context の retire | `retire` が内部で `unbind_window` |
   | 既に detached な mounted context の promote ([app.rs:42734](../../src/app.rs:42734)) | 冪等な `bind_window` |
 - **A1 / A5 をここで有効化する** (保管フィールドが消えて初めて通る)。
+- ⚠ **「今マウント中の context」を二重に処理しないこと。** 現行の全 context 操作は
+  「まずマウント中のものを処理 → その後 holder / parked を巡回」という形で、
+  マウント中のものは**巡回に含まれない**。②-d の統一 mount transaction は
+  「既にマウント済みなら swap せずそのまま `f` を実行する」(設計 §4.1) ので、
+  巡回側にもマウント中の id が含まれると **`f` が 2 回走る**。
+  ②-pre で追加した「既にマウント中の parked context も処理される」テストは
+  **回数を数えていないので、この二重実行を捕まえない**
+  (Codex ②-pre 実装レビュー 2026-08-23)。②-d では**回数を数えるテスト**にすること。
+- ⚠ **②-pre が holder 側に残した前置きフィルタを移すこと**:
+  vst3 の pending 判定 ([app.rs:19839](../../src/app.rs:19839)) と rename 述語
+  ([app.rs:28980](../../src/app.rs:28980)) は `paused_bundle` を直接見ている。
+  保管が消えるので `ContextRef` 経由の述語へ移す。
+- ⚠ **VST3 の parked-live marker は呼び出し元所有のまま残す**が、
+  ②-pre で入れた panic 安全な復元 (catch_unwind → marker 復元 → resume_unwind) を
+  `residence()` へ置き換えるときに落とさないこと。
 - ⚠ **production 実行器には、①の failpoint sweep とは別の検査が要る。**
   ①の sweep は **op と op の境目**でしか panic を注入しないので、
   「op の内部で binding を早く公開し、正常終了までに戻す」実装を検出できない。

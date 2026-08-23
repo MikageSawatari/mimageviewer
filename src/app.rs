@@ -19871,10 +19871,15 @@ impl App {
             self.with_paused_detached_context(id, |app| {
                 let saved_input_window_id = app.native_video_parked_live_input_window_id;
                 app.native_video_parked_live_input_window_id = Some(id);
-                if let Some(idx) = app.take_mounted_deferred_vst3_media_open() {
-                    consume(app, idx);
-                }
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if let Some(idx) = app.take_mounted_deferred_vst3_media_open() {
+                        consume(app, idx);
+                    }
+                }));
                 app.native_video_parked_live_input_window_id = saved_input_window_id;
+                if let Err(payload) = result {
+                    std::panic::resume_unwind(payload);
+                }
             });
         }
     }
@@ -28229,6 +28234,10 @@ impl App {
         release_tag_db_for_import: bool,
     ) -> Result<bool, String> {
         let mut busy = self.quiesce_current_metadata_transfer_context_writers();
+        #[cfg(all(test, windows))]
+        {
+            busy |= tests::take_metadata_busy_initial_for_test();
+        }
         #[cfg(windows)]
         {
             if let Some(context_busy) = self.with_active_detached_viewer_context(|app| {
@@ -28367,6 +28376,10 @@ impl App {
             return (result.errors, true);
         }
         let mut stale_context = false;
+        #[cfg(all(test, windows))]
+        {
+            stale_context |= tests::take_metadata_stale_initial_for_test();
+        }
         if let Some(snapshot) = result.page_snapshot {
             self.replace_metadata_import_page_state_snapshot(snapshot);
         }
@@ -54273,6 +54286,8 @@ impl App {
     }
 
     fn clear_current_edit_preview_materializations(&mut self) {
+        #[cfg(all(test, windows))]
+        tests::record_current_edit_preview_clear_for_test(self);
         let mut invalidated: std::collections::HashSet<usize> =
             self.thumb_edit_preview_keys.keys().copied().collect();
         invalidated.extend(
