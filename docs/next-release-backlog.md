@@ -1797,6 +1797,33 @@ SimplySign のクラウド鍵セッションが切れていても通過する (�
 使い捨ての PE を 1 本実署名してから配布ビルドに入れば数秒で分かる。
 事前チェック自体をその形にする改善は §5.12。
 
+### 5.13 v3.2.0 の残り公開作業 (2026-08-23 時点)
+
+**出荷判断は済んでいる。**残りは公開手順のみ。手順の正本は CLAUDE.md「リリース手順チェックリスト」。
+
+済んでいるもの: Phase 0 (更新履歴・利用者承認済み) / Phase 1 (版番号・installer・製品ページ・
+`changelog.html` 再生成・`version_highlights`) / Phase 2 (PDFium 最新・FFmpeg 見送り判断・CI 緑) /
+全体テスト / 配布ビルドと署名。記録は §5.11。
+
+残り:
+
+1. **配布ビルドの最終版を検証** — `signtool verify /pa` で 3 種 (単体exe / setup.exe /
+   portable の exe) が `Valid` + RFC3161 であること、`dumpbin /dependents` に
+   `VCRUNTIME140.dll` / `MSVCP140.dll` が無いこと。
+2. **実機確認 (利用者)** — アイドル健全性 `static-foreground` / `static-background`、
+   T キー (別ウィンドウ動画 → メインで PDF → 動画へ戻って T)、キー割り当て一覧の
+   ラベル 2 件、ポータブル版 smoke (C 以外へ展開し `data\` が exe の隣、APPDATA 不変)。
+3. **§5.11 の記録を最終ビルドに合わせて更新。**
+4. **push** — `git push origin master` と `master:main` (**明示の指示が要る**)。
+5. **Vector 申請用 zip** — `mImageViewer_setup.exe` + `installer/readme.txt` を
+   `dist\mImageViewer_installer_v3.2.0.zip` へ `Compress-Archive`。
+6. **タグと Release** — `git tag v3.2.0` → push。Release body は README の v3.2.0 節
+   (7,135 バイト、8KB 上限内なのでそのまま使える)。**Assets 4 点**: 単体exe /
+   setup.exe / installer zip / portable zip。
+7. **リリース日** — README 見出しと製品ページ「最終更新」は **2026-08-23**。
+   日をまたぐ場合はこの 2 箇所を直し `gen-changelog-html.py` を再実行する。
+8. 公開後 = Phase 5 (mikage.to 反映 / Vector 申請 / 必要なら窓の杜・MS Store)。
+
 ### 5.12 署名の事前チェックが、鍵の使えなさを検出できない
 
 - 出典: v3.2.0 の配布ビルド (2026-08-23)。`Assert-MivSignReady` を通過したのに、
