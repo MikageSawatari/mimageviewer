@@ -1237,9 +1237,50 @@ passive detached は通常どおり release で窓を activate するが、選�
   `[detached-window-debug]` が `presentation` / `session` / `active_context` / `passive_windows` /
   `fullscreen_idx` を毎回出す ([app.rs:38773](../src/app.rs:38773))。**どの分岐で DetachedWindow に
   なっているかはこれで確定できる。** 再オープンの契機と併せて 1 回の再現で両方取れる。
+
+#### 追記 (2026-08-23): 最大化が再現条件、原因は placement の毎フレーム書き戻し
+
+`MIV_DETACHED_WINDOW_DEBUG=1` で取り直したログで確定した。**ポータブル版でも、別ウィンドウを
+タイトルバーで最大化すれば再現する。**
+
+- **訂正**: 前段の「キー入力の記録が無いまま再オープンしている」は**誤りだった**。`[key-debug]` を
+  出すと、open も close も**すべて実際の Enter 押下**である (`raw main down vk=0x0D` →
+  main 窓なら `pressed GridOpenSelected [Grid]`、detached 窓なら `consume FsClose [FsImage]`)。
+  非 debug ログの `[fs-key]` はフルスクリーン viewport が見たキーしか出さないので、main 窓の
+  Enter が「無い」ように見えていた。**出ていないログを根拠に推論していた。**
+- **新しい事実**: **最大化された別ウィンドウが表示されている間、placement 更新が毎フレーム走る。**
+  1 セッションで `runtime_placement reason=active_placement_update_maximized` が **82 回**、
+  そのすべてが `from == to` (中身が変わらない書き込み)。同数の
+  `placement_trace event=builder_no_position` が対になっている。**82 フレーム = 別ウィンドウが
+  開いていた全フレーム**で、1 フレームも休んでいない。
+- **構造**: maximized 分岐 ([app.rs:43782](../src/app.rs:43782)) は**実測した `outer_rect` を捨てて**
+  `detached_window_seed_placement()` (= restore 用の w/h) を書き、`maximized=true` だけ立てる。
+  実測 `rect=(-11,-11 3862x2110)` に対し placement は `w:2560, h:1369.33` のまま。
+  つまり `DetachedViewerWindowPlacement` 1 個に**「今のサイズ」と「元に戻したときのサイズ」が
+  同居**していて、最大化中は前者を記録する場所が無い。だから書き込みは**永久に収束しない**
+  (毎フレーム同じ値を書き直す)。終端状態が無いという意味で
+  v3.1.2 の `nav/archive_cache_peek` 退行と同型。
+- **Codex の §2.20 分析と根が同じ。** あちらは「snapshot bake が placement の w/h で画像矩形を
+  正規化するのに、passive draw は最大化 viewport の `full_rect` へ X/Y 独立で戻す」ことを
+  指摘している。**症状 (縦横比の圧縮 / ちらつき) は違うが、原因はどちらも「最大化中の placement が
+  実ジオメトリを表していない」こと**。片方だけ直しても、もう片方の入力は歪んだまま残る。
+- **解消方法** (A が本命、B は A の一部として自然に消える):
+  - **A. 現在ジオメトリと restore ジオメトリを別の場所に持つ。** maximized のとき実測 rect を
+    捨てない。restore 用 seed は maximize に入った時点の値として別に保持する。これで §2.20 の
+    bake / draw も同じ数字を見られるようになる。
+  - **B. 変化が無ければ書かない。** 現状 82/82 が no-op。A を入れれば「実測値が変わったときだけ
+    書く」が自然に成立する。**変化検出を後付けの guard として足すのではなく、A の帰結にする。**
+  - **C. font atlas resync の 5 フレーム再発行を、surface 復帰の観測に置き換える** (上記の直す方向 1)。
+    A/B と独立。close 後の破棄が 5 → 1 になる。
+- **検証の観測点**: 最大化した別ウィンドウを開いている間、①`runtime_placement` が毎フレーム出ない
+  こと ②`builder_no_position` が毎フレーム出ないこと ③close 後の `discard pass` が 1 回に
+  なること ④最大化 → 復元でウィンドウが元のサイズに戻ること (A で restore 値を壊していない証明)。
+
 - 規模 / 優先度: 中 / **P1** (常用操作で目に見える。ただし凍結領域なので構造修正が前提)。
-- 関連: §2.20 (同じ別ウィンドウ経路の表示破綻)、[docs/detached-rework-plan.md](detached-rework-plan.md)
-  の BA-5 / findings-12 D1 (font resync の discard パスが passive 窓を破棄した実害)。
+- 関連: §2.20 (**同じ根**。最大化中の placement が実ジオメトリを表していない)、
+  [docs/detached-rework-plan.md](detached-rework-plan.md) の BA-5 / findings-12 D1
+  (font resync の discard パスが passive 窓を破棄した実害) / findings-14
+  (毎フレーム seed による振動を `builder_placement_latch` で止めた前例)。
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 
