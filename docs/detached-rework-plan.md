@@ -527,6 +527,51 @@ HUD コマンドをアクティブ化へ変換し、**それ以外の利用者�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-08-23 手書き mount 18 箇所の helper 化 = R2e ステージ②-pre
+(ClaudeCode / Codex 双方が構造的修正と合意):**
+「bundle を holder から取り出す → App へ swap → 何かする → swap で戻す → holder へ戻す」
+という**所有権移動の定型が 17〜18 箇所に手書きコピーされている**。正しい版は既にあり
+([app.rs:16703](../src/app.rs:16703) `with_active_detached_viewer_context`、`catch_unwind` +
+`resume_unwind` で panic 安全)。②-pre は parked 用の対 `with_paused_detached_context(window_id, f)`
+を足し、**18 箇所** (active 9 / parked 9) を 2 本の helper へ寄せる。
+
+- **変換する 18 箇所**: active = [19808](../src/app.rs:19808) / [27885](../src/app.rs:27885) /
+  [27932](../src/app.rs:27932) / [28151](../src/app.rs:28151) / [28224](../src/app.rs:28224) /
+  [28374](../src/app.rs:28374) / [28994](../src/app.rs:28994) / [30422](../src/app.rs:30422) /
+  [54322](../src/app.rs:54322)、parked = [19844](../src/app.rs:19844) / [27892](../src/app.rs:27892) /
+  [27951](../src/app.rs:27951) / [28170](../src/app.rs:28170) / [28232](../src/app.rs:28232) /
+  [28398](../src/app.rs:28398) / [29017](../src/app.rs:29017) / [30430](../src/app.rs:30430) /
+  [54329](../src/app.rs:54329)。
+- **変換しない** (mount-and-restore ではない): park ([38344](../src/app.rs:38344) /
+  [42556](../src/app.rs:42556))、終端 close / teardown ([38583](../src/app.rs:38583) /
+  [39457](../src/app.rs:39457))、activation の恒久移動 ([40155](../src/app.rs:40155) /
+  [41048](../src/app.rs:41048))。parked-live poll ([39830](../src/app.rs:39830)) は
+  mount-and-restore だが close-after-poll と結合しているので**②-d へ送る**。
+- **挙動の差は 1 つだけ**: mount 中の closure が panic したとき、押しのけられた bundle が
+  drop されずに戻る。panic 自体は `resume_unwind` でそのまま伝播するので**何も握り潰さない**。
+  今日は drop → `Drop for ViewerContextBundle` ([app.rs:2743](../src/app.rs:2743)) で
+  その context の worker pool が cancel される。**既に致命的な事象の巻き添えが減るだけ**である。
+- **なぜ症状パッチではないか**: guard / delay / retry / 追加 repaint / 一括 reset /
+  silent fallback を 1 つも足さない。R2e が集約しようとしている primitive の複製を 18 個消す。
+  panic 安全は目的ではなく、**既に正しい形を使った結果**である。②-d では
+  「取り出せなかったので飛ばす」分岐も 1 箇所へ集まり、そこが `residence()` の match になる。
+- **Codex が付けた等価性の制約 2 件** (指示書に反映済み):
+  1. [28398](../src/app.rs:28398) の `window_index` + `window_id` の検証を維持すること。
+     window_id だけで引くと、index がずれた context に対して**今は捨てられている結果が
+     適用されてしまう**。identity の是正はステージ④の担当。
+  2. [19844](../src/app.rs:19844) の `native_video_parked_live_input_window_id` は
+     **mount 中の closure の内側**で立てること。
+- **helper に `native_video_parked_live_input_window_id` を入れない** (双方合意)。あれは
+  parked-live の入力 / メディア方針であって汎用の residence ではない。汎用化すると
+  metadata import や cache 保守の mount 中に入力フィルタ・HUD・activation・メディア所有権が
+  変わる。汎用化は②-d で `residence()` として行う。
+- 補足: active 側 helper は `detached_viewer_main_history_suppression_depth` を一時的に上げるが、
+  変換対象 9 本の本体からその読み手へ到達しないことを Codex が確認済み (追加の差は出ない)。
+- **憲法チェック**: 1 rect 捕捉に触れない / 2 recreate トリガを作らない / 3 App に新しい
+  bool・Option を足さない / 4 placement の保存先を作らない / 5 時間窓を使わない /
+  7 範囲は上の列挙どおり / 8 既存テストを削除・弱体化しない。
+- 指示書: [detached-rework-stage-r2e-2pre.md](detached-rework-stage-r2e-2pre.md)。
+
 **2026-08-20 keep-alive backstop の所有権 (ClaudeCode / Codex 双方が構造的修正と合意):**
 `render_active_detached_viewport_backstop` ([ui_fullscreen.rs](../src/ui_fullscreen.rs) 12740 付近) が
 **mount の外**で走り、**App にマウントされている別 context の状態から detached window の内容を
