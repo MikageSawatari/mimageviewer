@@ -262,14 +262,15 @@ enum Slot { AtRest(Box<ViewerContextBundle>), Retiring(Box<ViewerContextBundle>)
 
 | # | 不変条件 | 守り方 |
 | --- | --- | --- |
-| I1 | context の bundle は `slots` か投影のどちらか一方にだけ在る | 生 bundle を返す API が無い (§3.7) |
-| I2 | `window_of` と `context_of` は互いの逆写像 | 更新は `bind` / `unbind` の 2 本だけ (module private の共通実装) |
-| I3 | 1 つの窓に context は高々 1 つ | `bind` は別の生きた context に bound の窓を `Err` で拒否する。置換したければ先に `retire` |
+| I1 | context の bundle は `slots` / 投影 / **op 列実行中の transient (高々 1 個)** のいずれか 1 箇所にだけ在る | 生 bundle を返す API が無い (§3.7)。transient は op 列の内側だけに存在し、利用者コードから観測できない (ステージ①の `TableOp`) |
+| I1b | **投影が payload を持たない瞬間は存在しない** | 「取り出す」と「空を据える」を 1 つの op (`ReplaceProjectionWithFreshEmpty`) にする |
+| I2 | `window_of` と `context_of` は互いの逆写像 | 更新は `bind` / `unbind` / `transfer` の 3 本だけ (module private の共通実装)。`retire` は内部で `unbind` する |
+| I3 | 1 つの窓に context は高々 1 つ / 1 つの context は高々 1 つの窓 | `bind` は `WindowOwnedBy` / `ContextOwnedBy` を `Err` で返す。**生きた context 同士の窓の移動は `transfer` だけ**が行い、期待する `from` を照合する |
 | I4 | `main` は常に存在し、`slots` か投影のどちらかに在る | `promote` は新しい main を作ってから古い main を bind する |
 | I5 | `Building` 中は mount / retire を受け付けない。**binding は即時公開せず transaction に積む** (§4.2) | `Projection` の match で typed error を返す。binding は `Building` が保持する `pending_bind` |
 | I6 | `Retiring` 中の id は mount / bind できない | `Slot::Retiring` への遷移 |
 | I7 | 投影は毎 root pass の末尾で `Mounted` | 定義した継ぎ目での assert (時間窓ではない。憲法 5) |
-| I8 | binding は commit と同時にだけ公開される。panic unwind では 1 つも公開されない | `pending_bind` を commit 経路でのみ適用 |
+| I8 | binding は commit と同時にだけ公開される。**`Abort` でも panic unwind でも 1 つも公開されない** | `pending_bind` を commit 経路でのみ適用 |
 
 ⚠ I5 の「bind を受け付けない」を素直に読むと §4.2 の build と矛盾する
 (Codex 第 3 版レビュー第 1 巡 BLOCKER 1)。実際の build は **load を始める前に窓を確保し、
@@ -546,9 +547,14 @@ fn fork_mounted_context(&mut self, policy: ForkPolicy, reason: &'static str) -> 
 pub(crate) enum ForkPolicy {
     /// live-park。main grid が使う一覧 identity / worker 複合体は投影に残し、
     /// viewer の一時状態だけを新 context へ移す。
-    LiveMediaPark,
+    /// **`window_id` はマウント中の context が今持っている窓**で、fork の内側で
+    /// `transfer_window_binding` を実行する (§3.5)。分割と binding の移動を
+    /// 別々の呼び出しにすると、その隙間で fork 側の `viewer_session` と registry の
+    /// 逆引きが食い違う。
+    LiveMediaPark { window_id: u64 },
     /// materialize 済みの物理一覧から独立静止画窓を開く。LiveMediaPark に加えて
-    /// 表示・編集系 ~40 フィールドを複製する。
+    /// 表示・編集系 ~40 フィールドを複製する。窓は新規なので binding は呼び出し元が
+    /// `bind_window` で結ぶ。
     MaterializedStillOpen,
 }
 ```
@@ -571,10 +577,10 @@ fork した側 (`preserve_main_context = true`) では、捨てた bundle へ `m
 ⚠ これも**挙動同値性の検証項目**。ステージ②で「前置き判定と後置き判定が一致すること」を
 テストで固定してから入れ替える。一致しないケースが見つかったら、消さずに報告する。
 
-fork の直後の binding も呼び出し元が行う (窓を作るのは registry の責務ではない)。
-`LiveMediaPark` は**マウント中の context が持っていた窓を fork へ移す**ので
-`transfer_window_binding(window_id, from = mounted, to = forked)`、
-`MaterializedStillOpen` は新しい窓なので `bind_window`。§3.5 参照。
+窓を**作る**のは registry の責務ではない。ただし `LiveMediaPark` の
+`transfer_window_binding(window_id, from = mounted, to = forked)` だけは
+**fork が返る前に済ませる** (上の doc comment)。`MaterializedStillOpen` は新しい窓なので、
+呼び出し元が `bind_window` で結ぶ。§3.5 参照。
 現行 `route_materialized_physical_still_open_to_active_context` ([app.rs:42485](../../src/app.rs:42485)) が
 serial を `let (_context_serial, items_generation) = ...` ([app.rs:42514](../../src/app.rs:42514)) と
 **捨てている**のは、今 context に id を持たせる場所が無いからで、fork が id を返せば解消する。
@@ -599,6 +605,10 @@ fn close_and_retire_context<D>(
 /// `finish` の要らない版 (parked / media teardown)。
 fn retire_context<D>(&mut self, id, reason, digest) -> Result<D, MountError>;
 ```
+
+どちらも **`digest` を終えた後、drop の直前に `unbind_window` を内部で実行する**。
+これは 4 つ目の binding プリミティブではなく、retire の一部である
+(context が消えるのに `context_of` に残ると I2 が破れる)。
 
 **2 つの現行経路がそのまま乗る。**
 
@@ -710,9 +720,10 @@ fn with_viewer_context_ref<R>(&self, id: ViewerContextId, f: impl FnOnce(Context
 
 | 不変条件 | 型 | 借用 | 可視性 | 監査 | テスト |
 | --- | --- | --- | --- | --- | --- |
-| I1 bundle は slot か投影のどちらか一方 | ○ (生 bundle を返す API が無い) | — | ○ | ○ (A1/A4) | ○ |
+| I1 bundle は slot / 投影 / transient のいずれか 1 箇所 | ○ (生 bundle を返す API が無い) | — | ○ | ○ (A1/A4) | ○ |
+| I1b 投影が空になる瞬間が無い | ○ (`ReplaceProjectionWithFreshEmpty` が 1 動作) | — | ○ | — | ○ |
 | I2 window_of / context_of が逆写像 | — | — | ○ (private field) | — | ○ |
-| I3 1 窓 1 context | ○ (`bind` が Err) | — | — | — | ○ |
+| I3 1 窓 1 context / 1 context 1 窓 | ○ (`bind` が `WindowOwnedBy` / `ContextOwnedBy`、移動は `transfer` のみ) | — | — | — | ○ |
 | I4 main は常に存在 | ○ (`main: ViewerContextId` は非 Option) | — | — | — | ○ |
 | I5 / I6 Building / Retiring 中の禁止操作 | ○ (`MountError`) | — | — | — | ○ |
 | I7 root pass 末尾で Mounted | — | — | — | — | ○ (継ぎ目の assert) |
@@ -822,10 +833,15 @@ CI が落ちてレビューの可視点を作る**。第 2 版が `extract_mount
 **A2 のフィールド名リストが腐らない理由**: 監査が別に持つ定数ではなく、
 `ViewerContextBundle` の定義を syn でパースして得る。フィールドを足しても監査は自動で追随する。
 
-**A1 が拾えないもの (明記)**: 型エイリアス経由 (`type B = ViewerContextBundle;`) と、
-マクロ展開後にだけ現れる型位置。前者は A1 に「`ViewerContextBundle` への型エイリアス定義を
-registry 外で禁止」を含めて塞ぐ。後者は syn がトークン列しか見られないので**塞げない**。
-これは監査の既知の穴として書き残し、レビュー時の目視項目にする (無いことにしない)。
+**監査が塞げないもの (明記)**。syn はトークン列しか見られないので、次は**機械では塞げない**。
+既知の穴として書き残し、レビュー時の目視項目にする (無いことにしない)。
+
+- **マクロ展開後にだけ現れる型位置 / 呼び出し**
+- **ローカルの関数値エイリアス** (`let pull = std::mem::take::<Vec<_>>; pull(&mut app.items)`)
+- **別モジュール経由の再エクスポート**で `mem::take` 等に到達する経路
+- **意味的な到達可能性**。指紋が一致していても、中身が何を漏らしているかは分からない (§6.3 A4)
+
+型エイリアス (`type B = ViewerContextBundle;`) と use-rename は A1 が定義自体を禁じるので塞がる。
 
 **tests.rs の扱い**: 監査は tests.rs も対象にする (例外を作らない)。ただし現状
 `active_detached_viewer_context` 系の参照が 225 件あり、うち ~27 件は
@@ -874,20 +890,29 @@ BLOCKER 3 の指摘どおり、**保管フィールドを消した瞬間に全�
 - **そこで table はコールバックを持たず、「次に何をすべきか」を plan として返す。**
   payload の実移動は呼び出し側 (App 側の薄い実行器) が行うので、**借用が重ならない**。
 
+  ⚠ **投影は「空にする」ことができない** (Codex 第 3 版レビュー第 4 巡 BLOCKER)。
+  production の投影は App の 225 個の実フィールドであって `Option<P>` ではないので、
+  op と op の間に**存在しない状態を作れない**。現行の
+  `take_current_viewer_context_bundle` ([app.rs:16666](../../src/app.rs:16666)) も
+  「空 payload を作る → swap して古い payload を受け取る」の 1 動作である。
+  したがって「取り出す」と「空を据える」を別の op に割ってはならない。
+
   ```rust
   /// table が要求する payload 操作。実行器は **transient を高々 1 個**持ち、
   /// op を 1 つ実行するたびに table への借用は終わっている。
   enum TableOp {
-      /// 投影から payload を取り出して transient にする。
-      TakeProjection,
-      /// 空 payload を作って transient にする。
-      CreateEmpty,
+      /// 新しい空 payload を作って投影と交換し、元の投影を transient にする。
+      /// (production = `take_current_viewer_context_bundle` 相当の 1 動作)
+      ReplaceProjectionWithFreshEmpty,
       /// transient を id の slot へ預ける。
       DepositInto(ViewerContextId),
       /// id の slot から payload を取り出して transient にする。
       WithdrawFrom(ViewerContextId),
-      /// transient を投影へ据える。
-      InstallProjection,
+      /// transient を投影と交換し、押し出された空 payload を drop する。
+      /// (production = `swap_viewer_context_bundle(&mut previous)` 相当の 1 動作)
+      RestoreProjectionAndDropDisplacedEmpty,
+      /// transient を retire として畳む (worker cancel が走る)。abort / panic 用。
+      DropTransientAsRetired(ViewerContextId),
   }
 
   impl<P> ContextTable<P> {
@@ -895,23 +920,47 @@ BLOCKER 3 の指摘どおり、**保管フィールドを消した瞬間に全�
       /// slots は table が所有し続ける (実行器は別の store を持たない)。
       fn begin_build(&mut self, reserved: ViewerContextId) -> ArrayVec<TableOp, 4>;
       fn commit_build(&mut self) -> ArrayVec<TableOp, 4>;
+      fn abort_build(&mut self) -> ArrayVec<TableOp, 4>;
       // ...
   }
   ```
 
-  例: `begin_build` は
-  `[TakeProjection, DepositInto(previous), CreateEmpty, InstallProjection]`、
-  `commit_build` は
-  `[TakeProjection, DepositInto(reserved), WithdrawFrom(previous), InstallProjection]`。
+  op 列は現行の実行順とそのまま一致する。
+
+  ```text
+  begin   : ReplaceProjectionWithFreshEmpty            // app.rs:40545
+            DepositInto(previous)
+
+  commit  : ReplaceProjectionWithFreshEmpty            // app.rs:40654
+            DepositInto(reserved)
+            WithdrawFrom(previous)
+            RestoreProjectionAndDropDisplacedEmpty     // app.rs:40655
+
+  abort   : ReplaceProjectionWithFreshEmpty            // startup_ops.rs:652
+            DropTransientAsRetired(reserved)
+            WithdrawFrom(previous)
+            RestoreProjectionAndDropDisplacedEmpty     // startup_ops.rs:653
+  ```
+
+  押し出される空 payload の drop は no-op である
+  (`Drop for ViewerContextBundle` は誰も掴んでいない token を立てるだけ、
+  [app.rs:2751](../../src/app.rs:2751) のコメント)。
 
 - **I1 の補足**: payload の所在は「slot / 投影 / **実行中の実行器の transient 1 個**」の 3 択になる。
   transient は `residence()` から見えないが、**op 列の実行中に利用者コードは 1 行も走らない**
   ので観測されない。`f` が走るのは `begin` の op 列を実行し終えて `Projection::Building` が
-  確定した後、`commit` の op 列を始める前だけである。したがって
-  **transient が panic を跨いで残ることはない** (op の実行自体は payload の move だけで panic しない)。
+  確定した後、`commit` (または `abort`) の op 列を始める前だけである。
+- ⚠ **op が panic しないとは言えない**。production の
+  `ReplaceProjectionWithFreshEmpty` / `RestoreProjectionAndDropDisplacedEmpty` は
+  `swap_viewer_context_bundle` を通り、その前後で rating 同期と visible index の再構築が走る
+  ([app.rs:16175](../../src/app.rs:16175) / [:16654](../../src/app.rs:16654))。
+  したがって第 3 版が保証するのは **「投影が payload を持たない瞬間は存在しない」**ことと
+  **「abort / panic で binding を 1 つも公開しない」**ことであって、
+  「op 列の途中で panic しない」ではない。op 列の途中で panic した場合、transient は drop され
+  (worker cancel が走る) — これは**今日と同じ**挙動である。
 - ①のテストは **table 自身の slots** に対して op を実行する 20 行程度の実行器を持つ
   (production と同じ store。第 2 稿にあった「テスト用の別 `HashMap`」は撤回)。
-  これで「build の途中で投影が確かに新しい空 payload になっている」「`f` の panic で
+  これで「build の途中で投影が確かに新しい空 payload になっている」「`f` の abort / panic で
   直前の payload が投影へ戻る」まで確認できる。
   production の実行器は `swap_viewer_context_bundle` と `ViewerContextBundle::empty` を使う。
 - **ステージ②-d は、この実行器を production 側に 1 本書くだけで結線が済む**。
@@ -983,8 +1032,17 @@ BLOCKER 3 の指摘どおり、**保管フィールドを消した瞬間に全�
   `DetachedImageWindowSnapshot::paused_bundle` ([app.rs:433](../../src/app.rs:433)) を削除し、
   `App::viewer_contexts: ViewerContextRegistry` へ統合。
 - 生プリミティブ 4 種を 5 transaction へ (§4)。
-- window binding を、window_id を確定している箇所へ入れる
-  (build 経路は `reserve_window_binding_for_build`、activation 経路は `bind_window`)。
+- window binding を、window_id を確定している箇所へ入れる。対応は次のとおり
+  (Codex 第 4 巡で全経路を照合済み。4 つ目の形は無い):
+
+  | 現行経路 | 操作 |
+  | --- | --- |
+  | 新規 build / descriptor resume / materialized-still fork / 既存窓の再利用 | `bind_window` (build 経路は `reserve_window_binding_for_build` 経由) |
+  | always-new の park → 新しい窓を確保 ([app.rs:42579](../../src/app.rs:42579) → [:42794](../../src/app.rs:42794)) | `unbind_window` → `bind_window` |
+  | preserve-main の live-media fork ([app.rs:41878](../../src/app.rs:41878) / [:41889](../../src/app.rs:41889)) | `transfer_window_binding` (fork の内側) |
+  | pause / resume、active holder の live park ([app.rs:38342](../../src/app.rs:38342) / [:41047](../../src/app.rs:41047)) | binding は変わらない |
+  | context の retire | `retire` が内部で `unbind_window` |
+  | 既に detached な mounted context の promote ([app.rs:42734](../../src/app.rs:42734)) | 冪等な `bind_window` |
 - **A1 / A5 をここで有効化する** (保管フィールドが消えて初めて通る)。
 - **§6.5 の暫定回避策を撤去する** (これが②-d の完了条件の一部):
   - `right_drag_viewer_identity_for_window_id` の
