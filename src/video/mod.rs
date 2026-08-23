@@ -60,9 +60,8 @@ pub mod normalize_scanner;
 pub mod normalize_types;
 pub mod screenshot;
 pub(crate) mod seek_strip;
-// Increment 3 で VideoPlayer / presenter へ配線するまで、公開 API は意図的に未使用。
-#[allow(dead_code)]
 pub(crate) mod seek_strip_thumbs;
+pub(crate) mod seek_strip_wave;
 pub(crate) mod stream;
 pub mod swscale_helpers;
 pub mod thumbnail;
@@ -590,14 +589,19 @@ pub enum NativeVideoOutputEvent {
         cause: seek_strip::SeekStripCloseCause,
     },
     MoveSeekStrip {
-        center_index: f64,
+        center: seek_strip::SeekStripCenter,
     },
     CommitSeekStrip {
-        center_index: f64,
+        center: seek_strip::SeekStripCenter,
     },
     RequestSeekStripWindow {
-        center_index: f64,
+        center: seek_strip::SeekStripCenter,
         visible_count: usize,
+        pixel_width: usize,
+        pixel_height: usize,
+    },
+    SetSeekStripMode {
+        mode: crate::settings::VideoSeekStripMode,
     },
     ToggleTileMode,
     TogglePerfOverlay,
@@ -3492,19 +3496,20 @@ fn send_native_overlay_command(
         Command::ClearSeekThumbnail => NativeVideoOutputEvent::ClearSeekThumbnail,
         Command::OpenSeekStrip => NativeVideoOutputEvent::OpenSeekStrip,
         Command::CloseSeekStrip { cause } => NativeVideoOutputEvent::CloseSeekStrip { cause },
-        Command::MoveSeekStrip { center_index } => {
-            NativeVideoOutputEvent::MoveSeekStrip { center_index }
-        }
-        Command::CommitSeekStrip { center_index } => {
-            NativeVideoOutputEvent::CommitSeekStrip { center_index }
-        }
+        Command::MoveSeekStrip { center } => NativeVideoOutputEvent::MoveSeekStrip { center },
+        Command::CommitSeekStrip { center } => NativeVideoOutputEvent::CommitSeekStrip { center },
         Command::RequestSeekStripWindow {
-            center_index,
+            center,
             visible_count,
+            pixel_width,
+            pixel_height,
         } => NativeVideoOutputEvent::RequestSeekStripWindow {
-            center_index,
+            center,
             visible_count,
+            pixel_width,
+            pixel_height,
         },
+        Command::SetSeekStripMode { mode } => NativeVideoOutputEvent::SetSeekStripMode { mode },
         Command::ToggleTileMode => NativeVideoOutputEvent::ToggleTileMode,
         Command::TogglePerfOverlay => NativeVideoOutputEvent::TogglePerfOverlay,
         Command::ToggleSidePanelMode => NativeVideoOutputEvent::ToggleSidePanelMode,
@@ -5276,28 +5281,37 @@ fn run_native_video_output(
                                     NativeVideoOutputEvent::CloseSeekStrip { cause },
                                 );
                             }
-                            crate::video::native_presenter::NativeOverlayCommand::MoveSeekStrip { center_index } => {
+                            crate::video::native_presenter::NativeOverlayCommand::MoveSeekStrip { center } => {
                                 send_native_output_event(
                                     &ui_event_tx,
                                     event_epoch,
-                                    NativeVideoOutputEvent::MoveSeekStrip { center_index },
+                                    NativeVideoOutputEvent::MoveSeekStrip { center },
                                 );
                             }
-                            crate::video::native_presenter::NativeOverlayCommand::CommitSeekStrip { center_index } => {
+                            crate::video::native_presenter::NativeOverlayCommand::CommitSeekStrip { center } => {
                                 send_native_output_event(
                                     &ui_event_tx,
                                     event_epoch,
-                                    NativeVideoOutputEvent::CommitSeekStrip { center_index },
+                                    NativeVideoOutputEvent::CommitSeekStrip { center },
                                 );
                             }
-                            crate::video::native_presenter::NativeOverlayCommand::RequestSeekStripWindow { center_index, visible_count } => {
+                            crate::video::native_presenter::NativeOverlayCommand::RequestSeekStripWindow { center, visible_count, pixel_width, pixel_height } => {
                                 send_native_output_event(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::RequestSeekStripWindow {
-                                        center_index,
+                                        center,
                                         visible_count,
+                                        pixel_width,
+                                        pixel_height,
                                     },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::SetSeekStripMode { mode } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SetSeekStripMode { mode },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ToggleTileMode => {

@@ -234,6 +234,28 @@ pub fn analyze_stereo_timeline(
         .expect("never-abort analysis cannot return None")
 }
 
+/// Analyze only the waveform fields used by compact timeline surfaces.
+///
+/// This shares the same bin aggregation and low/mid one-pole filter state as
+/// the full timeline analyzer, but intentionally skips the full-timeline
+/// summary, chroma, novelty, and beat-grid passes. Callers that render no
+/// metrics lane do not consume those fields, and a beat grid is not meaningful
+/// for a decoded window that does not cover the whole file.
+pub fn analyze_stereo_waveform_cancellable(
+    stereo_samples: &[f32],
+    sample_rate: u32,
+    config: AnalysisConfig,
+    should_abort: &dyn Fn() -> bool,
+) -> Option<TimelineAnalysis> {
+    analyze_stereo_timeline_impl(
+        stereo_samples,
+        sample_rate,
+        config,
+        should_abort,
+        TimelineAnalysisPasses::WaveformOnly,
+    )
+}
+
 /// `analyze_stereo_timeline` の協調キャンセル版。`should_abort` を bin 集計ループと
 /// chroma FFT の窓ループで確認し、true になったら `None` を返して即座に抜ける。
 ///
@@ -246,6 +268,28 @@ pub fn analyze_stereo_timeline_cancellable(
     sample_rate: u32,
     config: AnalysisConfig,
     should_abort: &dyn Fn() -> bool,
+) -> Option<TimelineAnalysis> {
+    analyze_stereo_timeline_impl(
+        stereo_samples,
+        sample_rate,
+        config,
+        should_abort,
+        TimelineAnalysisPasses::Full,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum TimelineAnalysisPasses {
+    Full,
+    WaveformOnly,
+}
+
+fn analyze_stereo_timeline_impl(
+    stereo_samples: &[f32],
+    sample_rate: u32,
+    config: AnalysisConfig,
+    should_abort: &dyn Fn() -> bool,
+    passes: TimelineAnalysisPasses,
 ) -> Option<TimelineAnalysis> {
     let sample_rate = sample_rate.max(1);
     let frame_count = stereo_samples.len() / 2;
@@ -372,23 +416,27 @@ pub fn analyze_stereo_timeline_cancellable(
 
         frame_start = frame_end;
     }
-    if !apply_timeline_summary_metrics(&mut bins, config.bin_secs, should_abort) {
-        return None;
-    }
-    if !apply_chroma_metrics(
-        &mut bins,
-        stereo_samples,
-        sample_rate,
-        config.bin_secs,
-        should_abort,
-    ) {
-        return None;
-    }
-    if !apply_novelty_scores(&mut bins, config.bin_secs, should_abort) {
-        return None;
-    }
-
-    let beat_grid = estimate_simple_beat_grid(&bins, duration_secs, config.bin_secs, should_abort)?;
+    let beat_grid = match passes {
+        TimelineAnalysisPasses::Full => {
+            if !apply_timeline_summary_metrics(&mut bins, config.bin_secs, should_abort) {
+                return None;
+            }
+            if !apply_chroma_metrics(
+                &mut bins,
+                stereo_samples,
+                sample_rate,
+                config.bin_secs,
+                should_abort,
+            ) {
+                return None;
+            }
+            if !apply_novelty_scores(&mut bins, config.bin_secs, should_abort) {
+                return None;
+            }
+            estimate_simple_beat_grid(&bins, duration_secs, config.bin_secs, should_abort)?
+        }
+        TimelineAnalysisPasses::WaveformOnly => BeatGrid::empty(),
+    };
 
     Some(TimelineAnalysis::new(
         AudioStreamInfo {

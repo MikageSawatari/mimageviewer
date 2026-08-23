@@ -4406,6 +4406,9 @@ pub struct Settings {
     /// シークストリップで採用する画像どうしの最小間隔 (秒)。0.0 は間引かない。
     #[serde(default = "default_video_seek_strip_min_interval_secs")]
     pub video_seek_strip_min_interval_secs: f64,
+    /// 動画シークストリップの表示内容。ストリップ内の切替を次回起動にも引き継ぐ。
+    #[serde(default)]
+    pub video_seek_strip_mode: VideoSeekStripMode,
     /// native 動画プレゼンターの上部情報バーを常時表示し、映像領域から除外する。
     #[serde(default)]
     pub video_top_bar_locked: bool,
@@ -5082,6 +5085,24 @@ fn default_video_seek_thumbnail_tolerance_secs() -> f64 {
     VIDEO_SEEK_THUMBNAIL_TOLERANCE_DEFAULT_SECS
 }
 
+/// 動画シークストリップの表示モード。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoSeekStripMode {
+    #[default]
+    Thumbnails,
+    Waveform,
+}
+
+impl VideoSeekStripMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Thumbnails => "場面",
+            Self::Waveform => "波形",
+        }
+    }
+}
+
 fn default_video_seek_strip_min_interval_secs() -> f64 {
     VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS
 }
@@ -5702,6 +5723,7 @@ impl Default for Settings {
             video_playback_speed: default_video_playback_speed(),
             video_seek_thumbnail_tolerance_secs: default_video_seek_thumbnail_tolerance_secs(),
             video_seek_strip_min_interval_secs: default_video_seek_strip_min_interval_secs(),
+            video_seek_strip_mode: VideoSeekStripMode::default(),
             video_top_bar_locked: false,
             video_seek_bar_locked: false,
             video_autoplay: false,
@@ -7803,6 +7825,23 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_seek_strip_mode_defaults_to_thumbnails_and_round_trips() {
+        assert_eq!(
+            Settings::default().video_seek_strip_mode,
+            VideoSeekStripMode::Thumbnails
+        );
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(loaded.video_seek_strip_mode, VideoSeekStripMode::Thumbnails);
+
+        let mut settings = Settings::default();
+        settings.video_seek_strip_mode = VideoSeekStripMode::Waveform;
+        let stored = serde_json::to_value(settings).unwrap();
+        assert_eq!(stored["video_seek_strip_mode"], "waveform");
+        let loaded: Settings = serde_json::from_value(stored).unwrap();
+        assert_eq!(loaded.video_seek_strip_mode, VideoSeekStripMode::Waveform);
+    }
 
     #[test]
     fn recycle_bin_delete_confirmation_skip_defaults_off_and_round_trips() {

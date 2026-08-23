@@ -951,7 +951,7 @@ fn timeline_bins_for_raster(
 // ── row ラスタライズ (ピクセル描画、ワーカースレッドで実行) ──
 
 #[allow(clippy::too_many_arguments)]
-fn render_timeline_row_image(
+pub(crate) fn render_timeline_row_image(
     row_start: f64,
     row_secs: f64,
     bins: &[WaveformBin],
@@ -1014,9 +1014,21 @@ fn render_timeline_row_image(
         visible_bins.push(TimelineVisibleBin { index, x0, x1 });
     }
 
-    let rhythm_segments = build_timeline_rhythm_segments(bins, &visible_bins);
-    let bass_hints = build_bass_root_display_hints(bins, &visible_bins, &rhythm_segments);
-    let key_hints = build_key_display_hints(bins, &visible_bins, &rhythm_segments);
+    // A compact waveform surface has no metrics lane. Avoid doing the metric-only
+    // pitch/chroma voting in that case; the positive-height music-view path is
+    // intentionally unchanged so its raster snapshots remain identical.
+    let (bass_hints, key_hints) = if metrics_h == 0 {
+        (
+            vec![TimelinePitchHint::default(); visible_bins.len()],
+            vec![TimelineKeyHint::default(); visible_bins.len()],
+        )
+    } else {
+        let rhythm_segments = build_timeline_rhythm_segments(bins, &visible_bins);
+        (
+            build_bass_root_display_hints(bins, &visible_bins, &rhythm_segments),
+            build_key_display_hints(bins, &visible_bins, &rhythm_segments),
+        )
+    };
 
     for (visible_idx, visible) in visible_bins.iter().copied().enumerate() {
         let bin = &bins[visible.index];
@@ -1124,16 +1136,18 @@ fn render_timeline_row_image(
         waveform_h,
         egui::Color32::from_rgba_unmultiplied(74, 96, 120, 118),
     );
-    draw_rect_stroke_px(
-        &mut pixels,
-        width,
-        height,
-        0,
-        metrics_top,
-        width,
-        height,
-        egui::Color32::from_rgba_unmultiplied(74, 96, 120, 88),
-    );
+    if metrics_h > 0 {
+        draw_rect_stroke_px(
+            &mut pixels,
+            width,
+            height,
+            0,
+            metrics_top,
+            width,
+            height,
+            egui::Color32::from_rgba_unmultiplied(74, 96, 120, 88),
+        );
+    }
 
     (egui::ColorImage::new([width, height], pixels), drawn_bins)
 }

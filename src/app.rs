@@ -50622,6 +50622,41 @@ impl App {
         music_analysis_lru_get(&mut self.music_analysis_lru, key)
     }
 
+    /// Return only a completed full-file analysis for the seek strip.
+    ///
+    /// This is deliberately a lookup-only bridge. It never starts the music
+    /// analysis lifecycle, and partial progressive results are not eligible.
+    #[cfg(windows)]
+    fn completed_music_analysis_for_seek_strip(
+        &mut self,
+        path: &std::path::Path,
+        meta: Option<(i64, i64)>,
+    ) -> Option<crate::video::seek_strip_wave::CompletedTimelineAnalysis> {
+        let (mtime, size) = meta?;
+        if size <= 0 {
+            return None;
+        }
+        let identity =
+            crate::video::seek_strip_wave::WaveFileIdentity::from_known_meta(path, mtime, size);
+        if self.music_analysis_path.as_deref() == Some(path)
+            && self.music_analysis_pending.is_none()
+            && let Some(analysis) = self.music_analysis.as_ref()
+        {
+            return Some(crate::video::seek_strip_wave::CompletedTimelineAnalysis {
+                identity,
+                analysis: std::sync::Arc::clone(analysis),
+            });
+        }
+        let key = MusicAnalysisKey {
+            path: crate::adjustment_db::normalize_path(path),
+            size,
+            mtime,
+        };
+        self.music_analysis_lru_get(&key).map(|analysis| {
+            crate::video::seek_strip_wave::CompletedTimelineAnalysis { identity, analysis }
+        })
+    }
+
     /// 確定した解析結果を in-memory LRU に載せる。件数上限 + bin 総数予算で古いものから追い出す。
     /// 単曲が予算を超える場合は載せない (小さい有用エントリを追い出さないため、Codex P2)。
     fn music_analysis_lru_insert(

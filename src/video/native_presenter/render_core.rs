@@ -150,25 +150,48 @@ fn native_seek_strip_rect(width: f32, height: f32) -> egui::Rect {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_native_seek_strip(
     ctx: &egui::Context,
     overlay_size: egui::Vec2,
     strip: &NativeOverlaySeekStrip,
     texture_ids: &HashMap<usize, egui::TextureId>,
-    drag_origin_center: &mut Option<f64>,
-    last_window_request: &mut Option<(u64, usize)>,
+    wave_texture_id: Option<egui::TextureId>,
+    drag_origin_center: &mut Option<crate::video::seek_strip::SeekStripCenter>,
+    last_window_request: &mut Option<(u8, u64, usize, usize, usize)>,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
     let strip_rect = native_seek_strip_rect(overlay_size.x, overlay_size.y);
     let visible_count = ((strip_rect.width() / SEEK_STRIP_CELL_WIDTH).ceil() as usize)
         .saturating_add(2)
         .max(1);
-    let request_key = (strip.center_index.to_bits(), visible_count);
+    let pixels_per_point = ctx.pixels_per_point().clamp(1.0, 4.0);
+    let pixel_width = (strip_rect.width() * pixels_per_point).round().max(1.0) as usize;
+    let pixel_height = ((SEEK_STRIP_HEIGHT - 10.0) * pixels_per_point)
+        .round()
+        .max(1.0) as usize;
+    let (mode_key, center_bits) = match strip.center {
+        crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index } => {
+            (0, center_index.to_bits())
+        }
+        crate::video::seek_strip::SeekStripCenter::Waveform { center_time_secs } => {
+            (1, center_time_secs.to_bits())
+        }
+    };
+    let request_key = (
+        mode_key,
+        center_bits,
+        visible_count,
+        pixel_width,
+        pixel_height,
+    );
     if *last_window_request != Some(request_key) {
         *last_window_request = Some(request_key);
         commands.push(NativeOverlayCommand::RequestSeekStripWindow {
-            center_index: strip.center_index,
+            center: strip.center,
             visible_count,
+            pixel_width,
+            pixel_height,
         });
     }
 
@@ -186,47 +209,81 @@ fn draw_native_seek_strip(
             );
 
             let marker_x = local_rect.center().x;
-            let half_cells = local_rect.width() / (2.0 * SEEK_STRIP_CELL_WIDTH);
-            let first_index = (strip.center_index - f64::from(half_cells) - 1.0).floor() as isize;
-            let last_index = (strip.center_index + f64::from(half_cells) + 1.0).ceil() as isize;
-            for raw_index in first_index..=last_index {
-                let cell_center_x = marker_x
-                    + ((raw_index as f64 - strip.center_index) as f32) * SEEK_STRIP_CELL_WIDTH;
-                let cell_rect = egui::Rect::from_center_size(
-                    egui::pos2(cell_center_x, local_rect.center().y),
-                    egui::vec2(SEEK_STRIP_CELL_WIDTH - 4.0, SEEK_STRIP_HEIGHT - 10.0),
-                );
-                let in_axis = raw_index >= 0 && (raw_index as usize) < strip.cell_count;
-                let fill = if in_axis {
-                    egui::Color32::from_gray(24)
-                } else {
-                    egui::Color32::from_gray(10)
-                };
-                painter.rect_filled(cell_rect, 3.0, fill);
-                if in_axis {
-                    let index = raw_index as usize;
-                    if let Some(texture_id) = texture_ids.get(&index).copied()
-                        && let Some(cell) = strip.cells.iter().find(|cell| cell.index == index)
-                        && let Some(thumbnail) = cell.thumbnail.as_ref()
-                    {
-                        let fitted = fit_rect_in_rect(
-                            egui::vec2(thumbnail.width as f32, thumbnail.height as f32),
-                            cell_rect.shrink(2.0),
+            match strip.center {
+                crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index } => {
+                    let half_cells = local_rect.width() / (2.0 * SEEK_STRIP_CELL_WIDTH);
+                    let first_index = (center_index - f64::from(half_cells) - 1.0).floor() as isize;
+                    let last_index = (center_index + f64::from(half_cells) + 1.0).ceil() as isize;
+                    for raw_index in first_index..=last_index {
+                        let cell_center_x = marker_x
+                            + ((raw_index as f64 - center_index) as f32) * SEEK_STRIP_CELL_WIDTH;
+                        let cell_rect = egui::Rect::from_center_size(
+                            egui::pos2(cell_center_x, local_rect.center().y),
+                            egui::vec2(SEEK_STRIP_CELL_WIDTH - 4.0, SEEK_STRIP_HEIGHT - 10.0),
                         );
-                        painter.image(
-                            texture_id,
-                            fitted,
-                            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                            egui::Color32::WHITE,
+                        let in_axis = raw_index >= 0 && (raw_index as usize) < strip.cell_count;
+                        let fill = if in_axis {
+                            egui::Color32::from_gray(24)
+                        } else {
+                            egui::Color32::from_gray(10)
+                        };
+                        painter.rect_filled(cell_rect, 3.0, fill);
+                        if in_axis {
+                            let index = raw_index as usize;
+                            if let Some(texture_id) = texture_ids.get(&index).copied()
+                                && let Some(cell) =
+                                    strip.cells.iter().find(|cell| cell.index == index)
+                                && let Some(thumbnail) = cell.thumbnail.as_ref()
+                            {
+                                let fitted = fit_rect_in_rect(
+                                    egui::vec2(thumbnail.width as f32, thumbnail.height as f32),
+                                    cell_rect.shrink(2.0),
+                                );
+                                painter.image(
+                                    texture_id,
+                                    fitted,
+                                    egui::Rect::from_min_max(
+                                        egui::Pos2::ZERO,
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
+                                );
+                            }
+                        }
+                        painter.rect_stroke(
+                            cell_rect,
+                            3.0,
+                            egui::Stroke::new(1.0, egui::Color32::from_gray(88)),
+                            egui::StrokeKind::Inside,
                         );
                     }
                 }
-                painter.rect_stroke(
-                    cell_rect,
-                    3.0,
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(88)),
-                    egui::StrokeKind::Inside,
-                );
+                crate::video::seek_strip::SeekStripCenter::Waveform { .. } => {
+                    let wave_rect = local_rect.shrink2(egui::vec2(2.0, 5.0));
+                    painter.rect_filled(wave_rect, 3.0, egui::Color32::BLACK);
+                    if let Some(texture_id) = wave_texture_id {
+                        painter.image(
+                            texture_id,
+                            wave_rect,
+                            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    } else if let Some(notice) = strip.wave_notice {
+                        painter.text(
+                            egui::pos2((marker_x + wave_rect.max.x) * 0.5, wave_rect.center().y),
+                            egui::Align2::CENTER_CENTER,
+                            notice.label(),
+                            crate::ui_fonts::hud_text_font(14.0),
+                            egui::Color32::from_gray(210),
+                        );
+                    }
+                    painter.rect_stroke(
+                        wave_rect,
+                        3.0,
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(88)),
+                        egui::StrokeKind::Inside,
+                    );
+                }
             }
             painter.line_segment(
                 [
@@ -236,16 +293,29 @@ fn draw_native_seek_strip(
                 egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 92, 92)),
             );
 
+            let switch_button_size = egui::vec2(48.0, 24.0);
+            let switch_origin = local_rect.min + egui::vec2(8.0, 7.0);
+            let switch_group_rect = egui::Rect::from_min_size(
+                switch_origin,
+                egui::vec2(switch_button_size.x * 2.0, switch_button_size.y),
+            );
             let response = ui.interact(
                 local_rect,
                 egui::Id::new("native_video_seek_strip_drag"),
                 egui::Sense::click_and_drag(),
             );
+            let pointer_over_switch = response
+                .interact_pointer_pos()
+                .is_some_and(|pointer| switch_group_rect.contains(pointer));
             if response.hovered() || response.dragged() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                ui.ctx().set_cursor_icon(if pointer_over_switch {
+                    egui::CursorIcon::PointingHand
+                } else {
+                    egui::CursorIcon::ResizeHorizontal
+                });
             }
-            if response.drag_started() {
-                *drag_origin_center = Some(strip.center_index);
+            if response.drag_started() && !pointer_over_switch {
+                *drag_origin_center = Some(strip.center);
             }
             if response.dragged()
                 && let Some(pointer) = response.interact_pointer_pos()
@@ -259,37 +329,144 @@ fn draw_native_seek_strip(
                     commands.push(NativeOverlayCommand::CloseSeekStrip {
                         cause: crate::video::seek_strip::SeekStripCloseCause::DownwardDrag,
                     });
-                } else if let Some(origin) = *drag_origin_center
-                    && let Some(center_index) = crate::video::seek_strip::center_index_after_drag(
-                        origin,
-                        response.drag_delta().x,
-                        SEEK_STRIP_CELL_WIDTH,
-                    )
-                {
-                    commands.push(NativeOverlayCommand::MoveSeekStrip { center_index });
+                } else if let Some(origin) = *drag_origin_center {
+                    let center = match origin {
+                        crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index } => {
+                            crate::video::seek_strip::center_index_after_drag(
+                                center_index,
+                                response.drag_delta().x,
+                                SEEK_STRIP_CELL_WIDTH,
+                            )
+                            .map(|center_index| {
+                                crate::video::seek_strip::SeekStripCenter::Thumbnails {
+                                    center_index,
+                                }
+                            })
+                        }
+                        crate::video::seek_strip::SeekStripCenter::Waveform {
+                            center_time_secs,
+                        } => crate::video::seek_strip::waveform_center_after_drag(
+                            center_time_secs,
+                            response.drag_delta().x,
+                            local_rect.width(),
+                            crate::video::seek_strip_wave::DEFAULT_WAVEFORM_SPAN_SECS,
+                        )
+                        .map(|center_time_secs| {
+                            crate::video::seek_strip::SeekStripCenter::Waveform { center_time_secs }
+                        }),
+                    };
+                    if let Some(center) = center {
+                        commands.push(NativeOverlayCommand::MoveSeekStrip { center });
+                    }
                 }
             }
             if response.drag_stopped()
                 && let Some(origin) = drag_origin_center.take()
-                && let Some(center_index) = crate::video::seek_strip::center_index_after_drag(
-                    origin,
-                    response.drag_delta().x,
-                    SEEK_STRIP_CELL_WIDTH,
-                )
             {
-                commands.push(NativeOverlayCommand::CommitSeekStrip { center_index });
+                let center = match origin {
+                    crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index } => {
+                        crate::video::seek_strip::center_index_after_drag(
+                            center_index,
+                            response.drag_delta().x,
+                            SEEK_STRIP_CELL_WIDTH,
+                        )
+                        .map(|center_index| {
+                            crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index }
+                        })
+                    }
+                    crate::video::seek_strip::SeekStripCenter::Waveform { center_time_secs } => {
+                        crate::video::seek_strip::waveform_center_after_drag(
+                            center_time_secs,
+                            response.drag_delta().x,
+                            local_rect.width(),
+                            crate::video::seek_strip_wave::DEFAULT_WAVEFORM_SPAN_SECS,
+                        )
+                        .map(|center_time_secs| {
+                            crate::video::seek_strip::SeekStripCenter::Waveform { center_time_secs }
+                        })
+                    }
+                };
+                if let Some(center) = center {
+                    commands.push(NativeOverlayCommand::CommitSeekStrip { center });
+                }
             } else if response.clicked()
+                && !pointer_over_switch
                 && let Some(pointer) = response.interact_pointer_pos()
-                && let Some(center_index) = crate::video::seek_strip::center_index_at_pointer(
-                    strip.center_index,
-                    pointer.x,
-                    marker_x,
-                    SEEK_STRIP_CELL_WIDTH,
-                )
             {
-                commands.push(NativeOverlayCommand::CommitSeekStrip {
-                    center_index: center_index.round(),
-                });
+                let center = match strip.center {
+                    crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index } => {
+                        crate::video::seek_strip::center_index_at_pointer(
+                            center_index,
+                            pointer.x,
+                            marker_x,
+                            SEEK_STRIP_CELL_WIDTH,
+                        )
+                        .map(|center_index| {
+                            crate::video::seek_strip::SeekStripCenter::Thumbnails {
+                                center_index: center_index.round(),
+                            }
+                        })
+                    }
+                    crate::video::seek_strip::SeekStripCenter::Waveform { center_time_secs } => {
+                        crate::video::seek_strip::waveform_time_at_pointer(
+                            center_time_secs,
+                            pointer.x,
+                            marker_x,
+                            local_rect.width(),
+                            crate::video::seek_strip_wave::DEFAULT_WAVEFORM_SPAN_SECS,
+                        )
+                        .map(|center_time_secs| {
+                            crate::video::seek_strip::SeekStripCenter::Waveform { center_time_secs }
+                        })
+                    }
+                };
+                if let Some(center) = center {
+                    commands.push(NativeOverlayCommand::CommitSeekStrip { center });
+                }
+            }
+
+            for (index, mode) in [
+                crate::settings::VideoSeekStripMode::Thumbnails,
+                crate::settings::VideoSeekStripMode::Waveform,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let rect = egui::Rect::from_min_size(
+                    switch_origin + egui::vec2(index as f32 * switch_button_size.x, 0.0),
+                    switch_button_size,
+                );
+                let active = strip.center.mode() == mode;
+                let hovered = response
+                    .interact_pointer_pos()
+                    .is_some_and(|pointer| rect.contains(pointer));
+                painter.rect_filled(
+                    rect,
+                    3.0,
+                    if active {
+                        egui::Color32::from_rgb(76, 104, 134)
+                    } else if hovered {
+                        egui::Color32::from_gray(64)
+                    } else {
+                        egui::Color32::from_gray(38)
+                    },
+                );
+                painter.rect_stroke(
+                    rect,
+                    3.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(120)),
+                    egui::StrokeKind::Inside,
+                );
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    mode.label(),
+                    crate::ui_fonts::hud_text_font(12.0),
+                    egui::Color32::WHITE,
+                );
+                if response.clicked() && hovered && !active {
+                    commands.push(NativeOverlayCommand::SetSeekStripMode { mode });
+                }
             }
         });
 }
@@ -839,9 +1016,10 @@ struct NativeEguiOverlay {
     ring_guide_overlay: Option<NativeOverlayRingGuide>,
     tile_textures: HashMap<usize, (u64, egui::TextureHandle)>,
     seek_strip_textures: HashMap<usize, (u64, egui::TextureHandle)>,
+    seek_strip_wave_texture: Option<(u64, egui::TextureHandle)>,
     seek_row_gesture: Option<crate::video::seek_strip::SeekRowGesture>,
-    seek_strip_drag_origin_center: Option<f64>,
-    last_seek_strip_window_request: Option<(u64, usize)>,
+    seek_strip_drag_origin_center: Option<crate::video::seek_strip::SeekStripCenter>,
+    last_seek_strip_window_request: Option<(u8, u64, usize, usize, usize)>,
     jump_textures: HashMap<usize, (u64, egui::TextureHandle)>,
     /// 直前の render_once で実際に描画した上部バーの可視状態。
     /// top_bar_visible は hover ヒステリシス用に残し、region はこの snapshot を参照する。
@@ -1252,9 +1430,36 @@ pub struct NativeOverlaySeekStripCell {
 
 #[derive(Clone)]
 pub struct NativeOverlaySeekStrip {
-    pub center_index: f64,
+    pub center: crate::video::seek_strip::SeekStripCenter,
     pub cell_count: usize,
     pub cells: Vec<NativeOverlaySeekStripCell>,
+    pub wave_image: Option<NativeOverlaySeekStripWaveImage>,
+    pub wave_notice: Option<NativeOverlaySeekStripWaveNotice>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeOverlaySeekStripWaveNotice {
+    NoAudioTrack,
+    Failed,
+}
+
+impl NativeOverlaySeekStripWaveNotice {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NoAudioTrack => "この動画に音声はありません",
+            Self::Failed => "波形を表示できません",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct NativeOverlaySeekStripWaveImage {
+    pub window_start_secs: f64,
+    pub window_end_secs: f64,
+    pub bin_secs: f64,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Arc<Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -1775,14 +1980,19 @@ pub enum NativeOverlayCommand {
         cause: crate::video::seek_strip::SeekStripCloseCause,
     },
     MoveSeekStrip {
-        center_index: f64,
+        center: crate::video::seek_strip::SeekStripCenter,
     },
     CommitSeekStrip {
-        center_index: f64,
+        center: crate::video::seek_strip::SeekStripCenter,
     },
     RequestSeekStripWindow {
-        center_index: f64,
+        center: crate::video::seek_strip::SeekStripCenter,
         visible_count: usize,
+        pixel_width: usize,
+        pixel_height: usize,
+    },
+    SetSeekStripMode {
+        mode: crate::settings::VideoSeekStripMode,
     },
     ToggleTileMode,
     TogglePerfOverlay,
@@ -5822,6 +6032,7 @@ impl NativeEguiOverlay {
             ring_guide_overlay: None,
             tile_textures: HashMap::new(),
             seek_strip_textures: HashMap::new(),
+            seek_strip_wave_texture: None,
             seek_row_gesture: None,
             seek_strip_drag_origin_center: None,
             last_seek_strip_window_request: None,
@@ -6976,6 +7187,7 @@ impl NativeEguiOverlay {
         }
         if seek_strip.is_none() {
             self.seek_strip_textures.clear();
+            self.seek_strip_wave_texture = None;
             self.seek_strip_drag_origin_center = None;
             self.last_seek_strip_window_request = None;
         }
@@ -7112,8 +7324,45 @@ impl NativeEguiOverlay {
     fn sync_seek_strip_textures(&mut self) {
         let Some(strip) = self.seek_strip.as_ref() else {
             self.seek_strip_textures.clear();
+            self.seek_strip_wave_texture = None;
             return;
         };
+        if matches!(
+            strip.center,
+            crate::video::seek_strip::SeekStripCenter::Waveform { .. }
+        ) {
+            self.seek_strip_textures.clear();
+            let Some(wave) = strip.wave_image.as_ref() else {
+                self.seek_strip_wave_texture = None;
+                return;
+            };
+            let key = wave.window_start_secs.to_bits()
+                ^ wave.window_end_secs.to_bits().rotate_left(11)
+                ^ wave.bin_secs.to_bits().rotate_left(23)
+                ^ ((wave.width as u64) << 32)
+                ^ wave.height as u64;
+            if self
+                .seek_strip_wave_texture
+                .as_ref()
+                .is_some_and(|(cached_key, _)| *cached_key == key)
+            {
+                return;
+            }
+            let size = [wave.width as usize, wave.height as usize];
+            if size[0] == 0 || size[1] == 0 || wave.rgba.len() != size[0] * size[1] * 4 {
+                self.seek_strip_wave_texture = None;
+                return;
+            }
+            let image = egui::ColorImage::from_rgba_unmultiplied(size, wave.rgba.as_ref());
+            let texture = self.egui_ctx.load_texture(
+                "native_video_seek_strip:wave",
+                image,
+                egui::TextureOptions::LINEAR,
+            );
+            self.seek_strip_wave_texture = Some((key, texture));
+            return;
+        }
+        self.seek_strip_wave_texture = None;
         self.seek_strip_textures.retain(|index, _| {
             strip
                 .cells
@@ -8173,6 +8422,10 @@ impl NativeEguiOverlay {
             .iter()
             .map(|(index, (_, texture))| (*index, texture.id()))
             .collect();
+        let seek_strip_wave_texture_id = self
+            .seek_strip_wave_texture
+            .as_ref()
+            .map(|(_, texture)| texture.id());
         let jump_texture_ids: HashMap<usize, egui::TextureId> = self
             .jump_textures
             .iter()
@@ -8782,6 +9035,7 @@ impl NativeEguiOverlay {
                         egui::vec2(overlay_width_points, overlay_height_points),
                         strip,
                         &seek_strip_texture_ids,
+                        seek_strip_wave_texture_id,
                         &mut seek_strip_drag_origin_center,
                         &mut last_seek_strip_window_request,
                         &mut commands,

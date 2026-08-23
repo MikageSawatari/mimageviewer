@@ -545,6 +545,89 @@ pub(crate) fn center_index_at_pointer(
     center_index_after_drag(center_index, marker_x - pointer_x, cell_width)
 }
 
+/// Mode-specific coordinate carried across App/presenter boundaries.
+///
+/// Thumbnail mode is indexed by adopted cells, while waveform mode is
+/// time-linear. Keeping the coordinate typed prevents a mode switch or delayed
+/// presenter event from interpreting one axis as the other.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SeekStripCenter {
+    Thumbnails { center_index: f64 },
+    Waveform { center_time_secs: f64 },
+}
+
+impl SeekStripCenter {
+    pub(crate) fn mode(self) -> crate::settings::VideoSeekStripMode {
+        match self {
+            Self::Thumbnails { .. } => crate::settings::VideoSeekStripMode::Thumbnails,
+            Self::Waveform { .. } => crate::settings::VideoSeekStripMode::Waveform,
+        }
+    }
+
+    pub(crate) fn time_secs(self, axis: Option<&StripAxis>) -> Option<f64> {
+        match self {
+            Self::Thumbnails { center_index } => axis?.time_for_center_index(center_index),
+            Self::Waveform { center_time_secs } => {
+                center_time_secs.is_finite().then_some(center_time_secs)
+            }
+        }
+    }
+}
+
+/// Switch axes without changing the time under the fixed centre marker.
+pub(crate) fn switch_seek_strip_center(
+    current: SeekStripCenter,
+    target_mode: crate::settings::VideoSeekStripMode,
+    thumbnail_axis: Option<&StripAxis>,
+) -> Option<SeekStripCenter> {
+    if current.mode() == target_mode {
+        return Some(current);
+    }
+    let center_time_secs = current.time_secs(thumbnail_axis)?;
+    match target_mode {
+        crate::settings::VideoSeekStripMode::Thumbnails => Some(SeekStripCenter::Thumbnails {
+            center_index: thumbnail_axis?.center_index_for_time(center_time_secs)?,
+        }),
+        crate::settings::VideoSeekStripMode::Waveform => {
+            Some(SeekStripCenter::Waveform { center_time_secs })
+        }
+    }
+}
+
+/// Time-linear waveform drag: one full strip width always spans the supplied seconds.
+pub(crate) fn waveform_center_after_drag(
+    origin_center_secs: f64,
+    drag_delta_x: f32,
+    strip_width: f32,
+    span_secs: f64,
+) -> Option<f64> {
+    if !origin_center_secs.is_finite()
+        || !drag_delta_x.is_finite()
+        || !strip_width.is_finite()
+        || strip_width <= 0.0
+        || !span_secs.is_finite()
+        || span_secs <= 0.0
+    {
+        return None;
+    }
+    Some(origin_center_secs - f64::from(drag_delta_x / strip_width) * span_secs)
+}
+
+pub(crate) fn waveform_time_at_pointer(
+    center_time_secs: f64,
+    pointer_x: f32,
+    marker_x: f32,
+    strip_width: f32,
+    span_secs: f64,
+) -> Option<f64> {
+    waveform_center_after_drag(
+        center_time_secs,
+        marker_x - pointer_x,
+        strip_width,
+        span_secs,
+    )
+}
+
 /// ストリップ上で始めたドラッグが、下のシーク行へ戻って close する動きか。
 pub(crate) fn strip_drag_closes_downward(
     drag_delta: eframe::egui::Vec2,
@@ -952,6 +1035,36 @@ mod tests {
             500.0,
             490.0
         ));
+    }
+
+    #[test]
+    fn waveform_drag_is_time_linear_for_the_named_span() {
+        assert_close(waveform_center_after_drag(90.0, 300.0, 1_200.0, 60.0), 75.0);
+        assert_close(
+            waveform_time_at_pointer(90.0, 900.0, 600.0, 1_200.0, 60.0),
+            105.0,
+        );
+    }
+
+    #[test]
+    fn switching_modes_preserves_the_time_under_the_center_marker() {
+        let axis = keyframe_axis(&[0.0, 5.0, 20.0, 50.0], &[0, 1, 2, 3]);
+        let thumbnails = SeekStripCenter::Thumbnails { center_index: 1.5 };
+        let waveform = switch_seek_strip_center(
+            thumbnails,
+            crate::settings::VideoSeekStripMode::Waveform,
+            Some(&axis),
+        )
+        .unwrap();
+        assert_close(waveform.time_secs(None), 12.5);
+
+        let round_trip = switch_seek_strip_center(
+            waveform,
+            crate::settings::VideoSeekStripMode::Thumbnails,
+            Some(&axis),
+        )
+        .unwrap();
+        assert_close(round_trip.time_secs(Some(&axis)), 12.5);
     }
 
     #[test]
