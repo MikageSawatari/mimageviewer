@@ -247,7 +247,7 @@ pub(crate) struct ViewerContextRegistry {
     /// context → detached 窓。context の生存期間に従う。
     #[cfg(windows)]
     window_of: HashMap<ViewerContextId, u64>,
-    /// 窓 → context。`bind` / `unbind` だけが更新する派生 index。
+    /// 窓 → context。`bind` / `unbind` / `transfer` だけが更新する派生 index。
     #[cfg(windows)]
     context_of: HashMap<u64, ViewerContextId>,
     /// 次に払い出す serial。`highest_reserved_serial` は `next_serial - 1` (§3.2)。
@@ -266,7 +266,7 @@ enum Slot { AtRest(Box<ViewerContextBundle>), Retiring(Box<ViewerContextBundle>)
 | I1b | **投影が payload を持たない瞬間は存在しない** | 「取り出す」と「空を据える」を 1 つの op (`ReplaceProjectionWithFreshEmpty`) にする |
 | I2 | `window_of` と `context_of` は互いの逆写像 | 更新は `bind` / `unbind` / `transfer` の 3 本だけ (module private の共通実装)。`retire` は内部で `unbind` する |
 | I3 | 1 つの窓に context は高々 1 つ / 1 つの context は高々 1 つの窓 | `bind` は `WindowOwnedBy` / `ContextOwnedBy` を `Err` で返す。**生きた context 同士の窓の移動は `transfer` だけ**が行い、期待する `from` を照合する |
-| I4 | `main` は常に存在し、`slots` か投影のどちらかに在る | `promote` は新しい main を作ってから古い main を bind する |
+| I4 | `main` は常に存在し、`slots` / 投影 / **transient** のいずれかに在る (I1 と同じ 3 択。begin の途中と、abort の `WithdrawFrom(previous)` 後は transient に居る) | `promote` は新しい main を作ってから古い main を bind する |
 | I5 | `Building` 中は mount / retire を受け付けない。**binding は即時公開せず transaction に積む** (§4.2) | `Projection` の match で typed error を返す。binding は `Building` が保持する `pending_bind` |
 | I6 | `Retiring` 中の id は mount / bind できない | `Slot::Retiring` への遷移 |
 | I7 | 投影は毎 root pass の末尾で `Mounted` | 定義した継ぎ目での assert (時間窓ではない。憲法 5) |
@@ -724,7 +724,7 @@ fn with_viewer_context_ref<R>(&self, id: ViewerContextId, f: impl FnOnce(Context
 | I1b 投影が空になる瞬間が無い | ○ (`ReplaceProjectionWithFreshEmpty` が 1 動作) | — | ○ | — | ○ |
 | I2 window_of / context_of が逆写像 | — | — | ○ (private field) | — | ○ |
 | I3 1 窓 1 context / 1 context 1 窓 | ○ (`bind` が `WindowOwnedBy` / `ContextOwnedBy`、移動は `transfer` のみ) | — | — | — | ○ |
-| I4 main は常に存在 | ○ (`main: ViewerContextId` は非 Option) | — | — | — | ○ |
+| I4 main は常に存在 (所在は I1 と同じ 3 択) | ○ (`main: ViewerContextId` は非 Option) | — | — | — | ○ |
 | I5 / I6 Building / Retiring 中の禁止操作 | ○ (`MountError`) | — | — | — | ○ |
 | I7 root pass 末尾で Mounted | — | — | — | — | ○ (継ぎ目の assert) |
 | 所在を `is_none()` で答えない | ○ (`ContextResidence`) | — | ○ | ○ (A5) | ○ |
@@ -915,13 +915,27 @@ BLOCKER 3 の指摘どおり、**保管フィールドを消した瞬間に全�
       DropTransientAsRetired(ViewerContextId),
   }
 
+  ```
+
+- **protocol は plan → execute → finalize の 3 相**にする (Codex 第 3 版レビュー第 5 巡 BLOCKER)。
+  `plan_*` は **op 列を返すだけで `Projection` を進めず、`pending_bind` も公開しない**。
+  op 列を全部実行し終えてから `finish_*` を呼び、そこで初めて `Mounted` への遷移と
+  binding の公開が起きる。plan の時点で状態を進めると、**op の途中で panic したときに
+  I8 (binding は commit と同時にだけ公開) が破れる**。op は panic し得る (下記)。
+
+  ```rust
   impl<P> ContextTable<P> {
-      /// 状態を進め、呼び出し側が順に実行すべき op 列を返す。
-      /// slots は table が所有し続ける (実行器は別の store を持たない)。
-      fn begin_build(&mut self, reserved: ViewerContextId) -> ArrayVec<TableOp, 4>;
-      fn commit_build(&mut self) -> ArrayVec<TableOp, 4>;
-      fn abort_build(&mut self) -> ArrayVec<TableOp, 4>;
-      // ...
+      /// 実行すべき op 列を返す。状態は進めない。
+      fn plan_begin_build(&mut self, reserved: ViewerContextId) -> ArrayVec<TableOp, 2>;
+      fn plan_commit_build(&self) -> ArrayVec<TableOp, 4>;
+      fn plan_abort_build(&self) -> ArrayVec<TableOp, 6>;
+
+      /// op 列を全部実行し終えた後に呼ぶ。ここで初めて Projection と binding が動く。
+      fn finish_begin_build(&mut self);
+      /// `Mounted(previous)` へ遷移し、`pending_bind` を公開する。
+      fn finish_commit_build(&mut self) -> ViewerContextId;
+      /// `Mounted(previous)` へ遷移し、`pending_bind` を**捨てる**。
+      fn finish_abort_build(&mut self);
   }
   ```
 
@@ -937,14 +951,28 @@ BLOCKER 3 の指摘どおり、**保管フィールドを消した瞬間に全�
             RestoreProjectionAndDropDisplacedEmpty     // app.rs:40655
 
   abort   : ReplaceProjectionWithFreshEmpty            // startup_ops.rs:652
-            DropTransientAsRetired(reserved)
+            DepositInto(reserved)
             WithdrawFrom(previous)
             RestoreProjectionAndDropDisplacedEmpty     // startup_ops.rs:653
+            WithdrawFrom(reserved)
+            DropTransientAsRetired(reserved)           // startup_ops.rs:654 (return で drop)
   ```
+
+  ⚠ **abort の drop は「main を戻した後」である**
+  (Codex 第 3 版レビュー第 5 巡 BLOCKER。第 4 巡の助言はここを取り違えていた)。
+  現行の `let _failed_context = self.take_current_viewer_context_bundle();`
+  ([startup_ops.rs:652](../../src/app/startup_ops.rs:652)) は**名前付きの束縛**なので、
+  drop は `swap_viewer_context_bundle(&mut main_context)`
+  ([startup_ops.rs:653](../../src/app/startup_ops.rs:653)) より後、`return false`
+  ([startup_ops.rs:654](../../src/app/startup_ops.rs:654)) の時点で起きる。
+  drop は worker の cancel と condvar notify を伴う ([app.rs:2743](../../src/app.rs:2743)) ので、
+  順序を入れ替えると cancel の timing が変わる。transient を 1 個に保ったままこの順序を
+  再現するには、失敗した context をいったん slot へ預けて main を戻し、
+  **その後で取り出して畳む** 6 op が要る。
 
   押し出される空 payload の drop は no-op である
   (`Drop for ViewerContextBundle` は誰も掴んでいない token を立てるだけ、
-  [app.rs:2751](../../src/app.rs:2751) のコメント)。
+  [app.rs:2749](../../src/app.rs:2749) のコメント)。
 
 - **I1 の補足**: payload の所在は「slot / 投影 / **実行中の実行器の transient 1 個**」の 3 択になる。
   transient は `residence()` から見えないが、**op 列の実行中に利用者コードは 1 行も走らない**
@@ -956,13 +984,19 @@ BLOCKER 3 の指摘どおり、**保管フィールドを消した瞬間に全�
   ([app.rs:16175](../../src/app.rs:16175) / [:16654](../../src/app.rs:16654))。
   したがって第 3 版が保証するのは **「投影が payload を持たない瞬間は存在しない」**ことと
   **「abort / panic で binding を 1 つも公開しない」**ことであって、
-  「op 列の途中で panic しない」ではない。op 列の途中で panic した場合、transient は drop され
-  (worker cancel が走る) — これは**今日と同じ**挙動である。
+  「op 列の途中で panic しない」ではない。**後者を保証するのが plan / execute / finalize の
+  3 相分割**で、binding の公開は最後の `finish_*` にしか無いので、op の途中で panic すれば
+  binding は公開されないまま終わる。そのとき transient は drop され (worker cancel が走る) —
+  これは**今日と同じ**挙動である。
 - ①のテストは **table 自身の slots** に対して op を実行する 20 行程度の実行器を持つ
   (production と同じ store。第 2 稿にあった「テスト用の別 `HashMap`」は撤回)。
   これで「build の途中で投影が確かに新しい空 payload になっている」「`f` の abort / panic で
   直前の payload が投影へ戻る」まで確認できる。
   production の実行器は `swap_viewer_context_bundle` と `ViewerContextBundle::empty` を使う。
+- **op と finalize の間の全ての位置に failpoint を刺すテストを書く**。実行器に
+  「n 個目の op の後で panic する」テストフックを持たせ、begin / commit / abort それぞれで
+  n を全通り回して、**どこで落ちても binding が 1 つも公開されていない**ことを確認する
+  (I8)。3 相分割が効いているかを機械的に確かめる唯一の手段。
 - **ステージ②-d は、この実行器を production 側に 1 本書くだけで結線が済む**。
   結線の形が①の時点で確定しているので、②-d の設計判断が残らない。
 - ①の間このモジュールは production から呼ばれない。`#[allow(dead_code)]` に
