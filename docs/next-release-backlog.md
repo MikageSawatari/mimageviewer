@@ -1728,6 +1728,28 @@ passive detached は通常どおり release で窓を activate するが、選�
 v3.2.0 ぶんは [src/version_highlights.rs](../src/version_highlights.rs) の `TABLE` へ記載済み
 (必読 3 件 = 代表画像の既定 / バケツの塗り 1px / 消しゴムの色調合わせ、新機能 7 件)。
 
+### 5.11 v3.2.0 出荷前確認の記録 (2026-08-23)
+
+配布ビルド: `build-dist.ps1 -SkipRustTests` (同一ソースで全体テスト 6,958 件通過済み、署名 ON)。
+
+| 項目 | 結果 |
+| --- | --- |
+| Rust 全体テスト | ✅ 6,958 passed / 0 failed。`ui_snapshot` の間欠 AV は再実行で 40 件通過 |
+| コード署名 | ✅ 単体exe / setup.exe / portable の 3 種とも `Valid` + RFC3161 (Certum Timestamp 2026) |
+| CRT 静的リンク | ✅ `VCRUNTIME140.dll` / `MSVCP140.dll` 依存なし |
+| PDFium | ✅ 最新 (chromium/8009) |
+| FFmpeg | ⏸ 4 コミット新しい版あり (`n7.1.5-12-g1fdbca85aa` → `-16-g9a4bb2c579`)。**見送り** — 同じ 7.1.5 系で必要な修正が特定できておらず、更新すると LGPL 対応ソースの再掲と製品ページの手書き節の更新が伴うため |
+| idle health: static-foreground | ✅ PASS (完全 sleep、`matching_session_events: 1` で同一 session 確認済み) |
+| idle health: static-background | ✅ PASS (同上) |
+| idle health: tray-residency | ⚠ PASS だが**軽い条件のみ**。`evidence_floor_basis=last_load_folder_begin` が t=5.3 (起動時) のままで、**サムネイル読込中に閉じた状態では測っていない**。「閉じた後も処理が回り続ける」退行は未検証 |
+| idle health: video-pin-background | ⏭ 未実施 (waiver)。動画を代表画像に固定し、かつキャッシュから読み直される状態のフォルダが必要。アイドル高画質化の経路は本版で未変更 |
+| ポータブル版 smoke | ✅ 実機確認済み |
+| 「重要な変更点」表示 | ✅ `--whatsnew-from 3.1.3` で必読 3 + 新機能 7 の表示を確認 |
+| 機能の実機確認 | ✅ 復元モーダル / ESC、動画バー固定と鍵アイコン、設定の移動先 |
+| CI | ⚠ 最新実行は 08-21。本版の約 20 コミットは未検証。特に ubuntu の `cargo check` (`cfg(windows)` 漏れの番人) は未通過。tag push 時に走る |
+
+**見送り (実施不要と判断)**: 検索ベンチ回帰 (本版で検索未変更)、perf smoke (UI スレッドへ同期 I/O を追加していない。設定移行は起動時の SELECT 2 回のみ)。
+
 ### 5.1 ネイティブ依存
 
 | 対象 | 現状 / 次の確認 | 注意点 |
