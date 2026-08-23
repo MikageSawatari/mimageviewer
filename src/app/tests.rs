@@ -1438,12 +1438,13 @@ fn pdf_page_rating_getter_is_distinct_from_pdf_container_rating() {
     );
     app.current_folder = Some(pdf.clone());
     app.items = vec![GridItem::PdfPage {
-        pdf_path: pdf,
+        pdf_path: pdf.clone(),
         page_num: 0,
         content_type: None,
     }];
     app.image_metas = vec![None];
     app.thumbnails = vec![ThumbnailState::Pending];
+    app.fullscreen_idx = Some(0);
 
     let container_key = app.current_container_rating_key_and_source().unwrap().0;
     let page_key = app.rating_path_key(0).unwrap();
@@ -1453,9 +1454,124 @@ fn pdf_page_rating_getter_is_distinct_from_pdf_container_rating() {
         .unwrap()
         .set(&container_key, 4)
         .unwrap();
+    app.rating_db.as_ref().unwrap().set(&page_key, 2).unwrap();
 
-    assert_eq!(app.current_folder_rating(), 4);
-    assert_eq!(app.get_rating(0), 0);
+    assert_eq!(
+        app.current_metadata_panel_container_rating(),
+        Some(("PDF", 4)),
+        "PDF metadata panel must show the container rating row"
+    );
+    assert_eq!(app.get_rating(0), 2, "page row keeps its own rating");
+
+    // The metadata-panel click handler calls this setter. It must retain the PDF
+    // container kind and capture the same undo record as Shift+F*.
+    assert!(app.set_current_folder_rating(5).unwrap());
+    let row = app
+        .rating_db
+        .as_ref()
+        .unwrap()
+        .row_for_key(&container_key)
+        .unwrap()
+        .expect("PDF container rating row");
+    assert_eq!(row.stars, 5);
+    assert_eq!(row.kind, Some(crate::rating_db::RatingItemKind::PdfFile));
+    assert_eq!(
+        app.get_rating(0),
+        2,
+        "container click must not change the page"
+    );
+    match app.meta_undo.peek_undo().expect("container click undo") {
+        crate::undo_stack::UndoEntry::Rating { changes, .. } => {
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].path_key, container_key);
+            assert_eq!(changes[0].before, 4);
+            assert_eq!(changes[0].after, 5);
+            assert_eq!(
+                changes[0].meta.as_ref().map(|meta| meta.kind),
+                Some(crate::rating_db::RatingItemKind::PdfFile)
+            );
+        }
+        other => panic!("expected rating undo, got {other:?}"),
+    }
+}
+
+#[test]
+fn metadata_panel_plain_folder_container_rating_is_unchanged() {
+    let mut app = phase_c_support::setup_app();
+    let folder = app.tmp.path().join("plain-folder");
+    std::fs::create_dir_all(&folder).unwrap();
+    app.current_folder = Some(folder.clone());
+
+    let (key, source, meta) = app.current_container_rating_target().unwrap();
+    assert_eq!(key, crate::adjustment_db::normalize_path(&folder));
+    assert_eq!(source, folder);
+    assert_eq!(meta.kind, crate::rating_db::RatingItemKind::Folder);
+    app.rating_db.as_ref().unwrap().set(&key, 3).unwrap();
+
+    assert_eq!(
+        app.current_metadata_panel_container_rating(),
+        Some(("フォルダ", 3))
+    );
+}
+
+fn metadata_panel_test_zip_nav(zip_path: PathBuf, names: &[&str]) -> crate::zip_tree::ZipNavState {
+    let entries = names
+        .iter()
+        .map(|name| crate::zip_loader::ZipImageEntry {
+            entry_name: (*name).to_string(),
+            uncompressed_size: 0,
+            mtime: 0,
+        })
+        .collect();
+    let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(zip_path, entries));
+    crate::zip_tree::ZipNavState::new(tree)
+}
+
+#[test]
+fn metadata_panel_zip_root_and_subdirectory_read_composed_container_keys() {
+    let mut app = phase_c_support::setup_app();
+    let zip = PathBuf::from(r"C:\books\outer.zip");
+    app.current_folder = Some(zip.clone());
+    app.zip_nav = Some(metadata_panel_test_zip_nav(
+        zip.clone(),
+        &["book-a/page-1.jpg", "book-b/page-1.jpg"],
+    ));
+
+    let root_key = crate::adjustment_db::normalize_path(&zip);
+    app.rating_db.as_ref().unwrap().set(&root_key, 2).unwrap();
+    assert_eq!(
+        app.current_metadata_panel_container_rating(),
+        Some(("書庫", 2))
+    );
+
+    app.zip_nav.as_mut().unwrap().enter("book-a/");
+    app.current_folder_rating_cache = None;
+    let book_key = crate::adjustment_db::normalize_path(&zip.join("book-a"));
+    app.rating_db.as_ref().unwrap().set(&book_key, 5).unwrap();
+
+    let (resolved_key, source, meta) = app.current_container_rating_target().unwrap();
+    assert_eq!(resolved_key, book_key);
+    assert_eq!(source, zip);
+    assert_eq!(meta.kind, crate::rating_db::RatingItemKind::ZipDir);
+    assert_eq!(meta.dir_prefix.as_deref(), Some("book-a/"));
+    assert_eq!(
+        app.current_metadata_panel_container_rating(),
+        Some(("フォルダ", 5)),
+        "the subdirectory row must read the composed key, not re-normalize the ZIP source path"
+    );
+}
+
+#[test]
+fn metadata_panel_omits_container_row_for_global_search_and_synthetic_views() {
+    let mut app = phase_c_support::setup_app();
+    app.current_folder = Some(PathBuf::from(r"C:\pictures"));
+    app.global_search.active = true;
+    assert_eq!(app.current_metadata_panel_container_rating(), None);
+
+    app.global_search.active = false;
+    app.current_folder = Some(reading_history_synthetic_path());
+    app.current_folder_rating_cache = None;
+    assert_eq!(app.current_metadata_panel_container_rating(), None);
 }
 
 #[test]
