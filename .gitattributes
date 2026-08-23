@@ -11,4 +11,4 @@ crates/remote-web/web/vendor/hls.min.js binary
 
 # Apache は .htaccess をバイト列としてそのまま解釈するため、CRLF がディレクティブの
 # 引数に紛れ込んで原因の分かりにくい 500 を招く。core.autocrlf に関わらず LF を保つ。
-htdocs/.htaccess text eol=lf
+htdocs/mimageviewer/.htaccess text eol=lf

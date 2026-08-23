@@ -1,0 +1,21 @@
+# /mimageviewer/ 配下のホスト名を mikage.to (www なし) へ統一する。
+#
+# www.mikage.to と mikage.to は同じドキュメントルートを配信しているため、
+# 同一ページが両ホスト名で検索結果に出て評価が割れていた。
+# 2026-08 実測: /mimageviewer/ の表示回数 5,620 のうち 819 (14.6%) が www 側で、
+# manual/tut-cache.html は www 側 (84 表示) が非 www (46 表示) を上回っていた。
+# 各ページの canonical だけでは収束しなかったため 301 で明示する。
+#
+# ドキュメントルートではなくこの階層に置いている理由:
+#   - 実測した分裂は /mimageviewer/ 配下の話で、ここに置けば過不足なく解ける
+#   - ルート直下と他セクション (/radiation/ /juliamo/ など) は別リポジトリの
+#     管理なので、そちらの .htaccess やリダイレクト設定に干渉しない
+#
+# RewriteRule のパターンはこのディレクトリからの相対パスに当たるため、
+# 置換先には /mimageviewer/ を明示する。
+# mod_rewrite が無い環境で 500 にしないよう IfModule で囲む。
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteCond %{HTTP_HOST} ^www\.mikage\.to$ [NC]
+  RewriteRule ^(.*)$ https://mikage.to/mimageviewer/$1 [R=301,L]
+</IfModule>
