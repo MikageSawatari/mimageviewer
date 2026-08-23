@@ -5155,14 +5155,6 @@ impl VideoSeekStripState {
     pub const fn restore(last_choice: VideoSeekStripMode) -> Self {
         Self::from_mode(last_choice)
     }
-
-    pub const fn menu_label(self) -> &'static str {
-        match self {
-            Self::None => "なし",
-            Self::Thumbnails => "サムネイルストリップ表示",
-            Self::Waveform => "音声波形ストリップ表示",
-        }
-    }
 }
 
 fn default_video_seek_strip_min_interval_secs() -> f64 {

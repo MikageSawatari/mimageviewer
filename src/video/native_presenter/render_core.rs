@@ -157,7 +157,6 @@ fn draw_native_seek_strip(
     strip: &NativeOverlaySeekStrip,
     texture_ids: &HashMap<usize, egui::TextureId>,
     wave_texture_id: Option<egui::TextureId>,
-    input_blocked: bool,
     drag_origin: &mut Option<crate::video::seek_strip::SeekStripDragOrigin>,
     last_window_request: &mut Option<(u8, u64, usize, usize, usize)>,
     commands: &mut Vec<NativeOverlayCommand>,
@@ -310,33 +309,15 @@ fn draw_native_seek_strip(
                 egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 92, 92)),
             );
 
-            let switch_button_size = egui::vec2(48.0, 24.0);
-            let switch_origin = local_rect.min + egui::vec2(8.0, 7.0);
-            let switch_group_rect = egui::Rect::from_min_size(
-                switch_origin,
-                egui::vec2(switch_button_size.x * 2.0, switch_button_size.y),
-            );
             let response = ui.interact(
                 local_rect,
                 egui::Id::new("native_video_seek_strip_drag"),
-                if input_blocked {
-                    egui::Sense::hover()
-                } else {
-                    egui::Sense::click_and_drag()
-                },
+                egui::Sense::click_and_drag(),
             );
-            let pointer_over_switch = response
-                .interact_pointer_pos()
-                .is_some_and(|pointer| switch_group_rect.contains(pointer));
             if response.hovered() || response.dragged() {
-                ui.ctx().set_cursor_icon(if pointer_over_switch {
-                    egui::CursorIcon::PointingHand
-                } else {
-                    egui::CursorIcon::ResizeHorizontal
-                });
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
             }
             if response.drag_started()
-                && !pointer_over_switch
                 && let Some(pointer) = response.interact_pointer_pos()
             {
                 *drag_origin = Some(crate::video::seek_strip::SeekStripDragOrigin::new(
@@ -385,7 +366,6 @@ fn draw_native_seek_strip(
                     commands.push(NativeOverlayCommand::CommitSeekStrip { center });
                 }
             } else if response.clicked()
-                && !pointer_over_switch
                 && let Some(pointer) = response.interact_pointer_pos()
             {
                 let center = match strip.center {
@@ -419,66 +399,14 @@ fn draw_native_seek_strip(
                     commands.push(NativeOverlayCommand::CommitSeekStrip { center });
                 }
             }
-
-            for (index, mode) in [
-                crate::settings::VideoSeekStripMode::Thumbnails,
-                crate::settings::VideoSeekStripMode::Waveform,
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let rect = egui::Rect::from_min_size(
-                    switch_origin + egui::vec2(index as f32 * switch_button_size.x, 0.0),
-                    switch_button_size,
-                );
-                let active = strip.center.mode() == mode;
-                let hovered = response
-                    .interact_pointer_pos()
-                    .is_some_and(|pointer| rect.contains(pointer));
-                painter.rect_filled(
-                    rect,
-                    3.0,
-                    if active {
-                        egui::Color32::from_rgb(76, 104, 134)
-                    } else if hovered {
-                        egui::Color32::from_gray(64)
-                    } else {
-                        egui::Color32::from_gray(38)
-                    },
-                );
-                painter.rect_stroke(
-                    rect,
-                    3.0,
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(120)),
-                    egui::StrokeKind::Inside,
-                );
-                painter.text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    mode.label(),
-                    crate::ui_fonts::hud_text_font(12.0),
-                    egui::Color32::WHITE,
-                );
-                if !input_blocked && response.clicked() && hovered && !active {
-                    commands.push(NativeOverlayCommand::SetSeekStripState {
-                        state: crate::settings::VideoSeekStripState::from_mode(mode),
-                    });
-                }
-            }
         });
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_native_seek_strip_selector(
-    ctx: &egui::Context,
+fn draw_native_seek_strip_cycle_button(
     ui: &mut egui::Ui,
     painter: &egui::Painter,
     button_rect: egui::Rect,
-    overlay_size: egui::Vec2,
     state: crate::settings::VideoSeekStripState,
-    popup_open: &mut bool,
-    speed_popup_open: &mut bool,
-    popup_rect_out: &mut Option<egui::Rect>,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
     let response = ui.interact(
@@ -501,86 +429,24 @@ fn draw_native_seek_strip_selector(
             egui::Color32::from_rgb(150, 220, 255)
         },
     );
-    let response = response.hover_tip_dark("シークストリップ表示");
-    if response.clicked() {
-        *popup_open = !*popup_open;
-        if *popup_open {
-            *speed_popup_open = false;
+    if state == crate::settings::VideoSeekStripState::Waveform {
+        draw_seek_strip_waveform_note(painter, button_rect, egui::Color32::from_rgb(255, 220, 82));
+    }
+    let response = response.hover_tip_dark(match state {
+        crate::settings::VideoSeekStripState::None => {
+            "シークストリップ: オフ (クリックでサムネイル)"
         }
-    }
-    if !*popup_open {
-        return;
-    }
-
-    // A foreground click shield gives the pulldown menu modal pointer semantics without turning it
-    // into a modal window. Outside clicks only close this menu; they cannot seek/toggle playback.
-    let shield = egui::Area::new(egui::Id::new("native_video_seek_strip_popup_shield"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(egui::Pos2::ZERO)
-        .show(ctx, |ui| {
-            ui.set_min_size(overlay_size);
-            ui.interact(
-                egui::Rect::from_min_size(egui::Pos2::ZERO, overlay_size),
-                egui::Id::new("native_video_seek_strip_popup_shield_hit"),
-                egui::Sense::click_and_drag(),
-            )
-        })
-        .inner;
-
-    let popup_width = 238.0_f32.min((overlay_size.x - 16.0).max(180.0));
-    let row_height = 30.0;
-    let popup_height = row_height * 3.0 + 18.0;
-    let popup_x =
-        (button_rect.max.x - popup_width).clamp(8.0, (overlay_size.x - popup_width - 8.0).max(8.0));
-    let popup_y = (button_rect.min.y - popup_height - 6.0).max(8.0);
-    let mut selected = None;
-    let popup = egui::Area::new(egui::Id::new("native_video_seek_strip_popup"))
-        .order(egui::Order::Tooltip)
-        .fixed_pos(egui::pos2(popup_x, popup_y))
-        .show(ctx, |ui| {
-            crate::os_theme::apply_dark_ui(ui);
-            egui::Frame::new()
-                .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 232))
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(110)))
-                .corner_radius(egui::CornerRadius::same(4))
-                .inner_margin(egui::Margin::same(6))
-                .show(ui, |ui| {
-                    ui.set_min_width(popup_width - 12.0);
-                    for candidate in [
-                        crate::settings::VideoSeekStripState::None,
-                        crate::settings::VideoSeekStripState::Thumbnails,
-                        crate::settings::VideoSeekStripState::Waveform,
-                    ] {
-                        let (rect, response) = ui.allocate_exact_size(
-                            egui::vec2(popup_width - 12.0, row_height),
-                            egui::Sense::click(),
-                        );
-                        if response.hovered() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        }
-                        let visuals = ui
-                            .style()
-                            .interact_selectable(&response, candidate == state);
-                        ui.painter().rect_filled(rect, 3.0, visuals.weak_bg_fill);
-                        ui.painter().text(
-                            rect.left_center() + egui::vec2(8.0, 2.0),
-                            egui::Align2::LEFT_CENTER,
-                            candidate.menu_label(),
-                            crate::ui_fonts::hud_text_font(13.0),
-                            visuals.fg_stroke.color,
-                        );
-                        if response.clicked() {
-                            selected = Some(candidate);
-                        }
-                    }
-                });
+        crate::settings::VideoSeekStripState::Thumbnails => {
+            "シークストリップ: サムネイル (クリックで音声波形)"
+        }
+        crate::settings::VideoSeekStripState::Waveform => {
+            "シークストリップ: 音声波形 (クリックでオフ)"
+        }
+    });
+    if response.clicked() {
+        commands.push(NativeOverlayCommand::SetSeekStripState {
+            state: state.cycle(),
         });
-    *popup_rect_out = Some(popup.response.rect);
-    if let Some(state) = selected {
-        *popup_open = false;
-        commands.push(NativeOverlayCommand::SetSeekStripState { state });
-    } else if shield.clicked() {
-        *popup_open = false;
     }
 }
 
@@ -1018,7 +884,6 @@ struct NativeEguiOverlay {
     seek_status_visible_since: Option<Instant>,
     seek_status_visible: bool,
     video_speed_popup_open: bool,
-    seek_strip_popup_open: bool,
     frame_step_hold: Option<NativeFrameStepHold>,
     video_loop_enabled: bool,
     /// HUD ボタン表示用のループモード (= ユーザー設定の display_mode)。
@@ -1071,8 +936,6 @@ struct NativeEguiOverlay {
     /// SetWindowRgn 外に落ちて見えたり、click hit-test が不安定になったりする。
     /// `None` なら popup 非表示または未描画。
     last_drawn_speed_popup_rect: Option<egui::Rect>,
-    /// 直近 egui run で描画したシークストリップ選択 popup の actual rect。
-    last_drawn_seek_strip_popup_rect: Option<egui::Rect>,
     /// 直近 egui run で描画したブックマーク名編集ダイアログの actual rect。
     /// 中央モーダルだが、配置は `pos.y = (H - dialog_h) * 0.5` (dialog_h はレイアウト
     /// 用の過大見積もり) で、実コンテンツ高さとの差でダイアログ中心が画面中心より
@@ -6077,7 +5940,6 @@ impl NativeEguiOverlay {
             seek_status_visible_since: None,
             seek_status_visible: false,
             video_speed_popup_open: false,
-            seek_strip_popup_open: false,
             frame_step_hold: None,
             video_loop_enabled: false,
             video_loop_mode: crate::settings::VideoLoopMode::Off,
@@ -6110,7 +5972,6 @@ impl NativeEguiOverlay {
             last_emitted_vst3_panel_pos: None,
             last_drawn_toast_rect: None,
             last_drawn_speed_popup_rect: None,
-            last_drawn_seek_strip_popup_rect: None,
             last_drawn_bookmark_editor_rect: None,
             last_drawn_bulk_bookmark_dialog_rect: None,
             last_drawn_shortcut_help_rect: None,
@@ -7569,7 +7430,6 @@ impl NativeEguiOverlay {
             || self.video_is_seeking
             || self.seek_status_visible_since.is_some()
             || self.video_limiter_visible_until.is_some()
-            || self.seek_strip_popup_open
     }
 
     fn repaint_due(&self, now: Instant) -> bool {
@@ -7595,7 +7455,6 @@ impl NativeEguiOverlay {
                 || self.jump_panel_visible()
                 || self.vst3_panel_visible()
                 || self.video_speed_popup_open
-                || self.seek_strip_popup_open
                 || self.hover_preview_target_secs.is_some())
     }
 
@@ -7657,7 +7516,6 @@ impl NativeEguiOverlay {
         self.bulk_bookmark_dialog.is_some()
             || self.bookmark_title_edit.is_some()
             || self.shortcut_help_open
-            || self.seek_strip_popup_open
     }
 
     /// CP5: 現在表示中の overlay UI 要素の物理ピクセル RECT を集める。
@@ -7977,21 +7835,6 @@ impl NativeEguiOverlay {
             }
         }
 
-        if self.seek_strip_popup_open {
-            let rect = self.last_drawn_seek_strip_popup_rect.unwrap_or_else(|| {
-                let button = native_seek_strip_selector_button_rect(width_points, height_points);
-                let popup_size = egui::vec2(238.0_f32.min((width_points - 16.0).max(180.0)), 108.0);
-                let x = (button.max.x - popup_size.x)
-                    .clamp(8.0, (width_points - popup_size.x - 8.0).max(8.0));
-                let y = (button.min.y - popup_size.y - 6.0).max(8.0);
-                egui::Rect::from_min_size(egui::pos2(x, y), popup_size)
-            });
-            let rect_px = rect_to_px(rect.expand(4.0));
-            if rect_px.left < rect_px.right && rect_px.top < rect_px.bottom {
-                regions.push(rect_px);
-            }
-        }
-
         // Bookmark title editor: center modal。`draw_native_bookmark_title_editor` の
         // 実描画 rect (`last_drawn_bookmark_editor_rect`) をそのまま region にする。
         //
@@ -8268,7 +8111,10 @@ impl NativeEguiOverlay {
         }
         let overlay_width_points = self.width as f32 / self.pixels_per_point;
         let overlay_height_points = self.height as f32 / self.pixels_per_point;
-        let hover_bottom = native_panel_hover_bottom(overlay_height_points);
+        let seek_strip_visible = self.seek_strip.is_some()
+            && self.tile_overlay.is_none()
+            && self.navigation_preview.is_none();
+        let hover_bottom = native_panel_hover_bottom(overlay_height_points, seek_strip_visible);
         let trigger = crate::ui_helpers::panel_edge_trigger_px(overlay_width_points);
         let margin = crate::ui_helpers::panel_hover_sustain_px(overlay_width_points);
         let in_band = |p: egui::Pos2| p.y >= 0.0 && p.y <= hover_bottom;
@@ -8687,7 +8533,6 @@ impl NativeEguiOverlay {
         let mut last_thumbnail_request_at = self.last_thumbnail_request_at;
         let mut hover_preview_target_secs = self.hover_preview_target_secs;
         let mut video_speed_popup_open = self.video_speed_popup_open;
-        let mut seek_strip_popup_open = self.seek_strip_popup_open;
         let mut frame_step_hold = self.frame_step_hold;
         let mut seek_row_gesture = self.seek_row_gesture;
         let mut seek_strip_drag_origin = self.seek_strip_drag_origin;
@@ -8700,7 +8545,6 @@ impl NativeEguiOverlay {
         let mut last_drawn_vst3_panel_rect: Option<egui::Rect> = None;
         let mut last_drawn_toast_rect: Option<egui::Rect> = None;
         let mut last_drawn_speed_popup_rect: Option<egui::Rect> = None;
-        let mut last_drawn_seek_strip_popup_rect: Option<egui::Rect> = None;
         let mut last_drawn_bookmark_editor_rect: Option<egui::Rect> = None;
         let mut last_drawn_bulk_bookmark_dialog_rect: Option<egui::Rect> = None;
         let mut last_drawn_shortcut_help_rect: Option<egui::Rect> = None;
@@ -9166,9 +9010,6 @@ impl NativeEguiOverlay {
                     });
             }
 
-            if !bottom_hud_visible {
-                seek_strip_popup_open = false;
-            }
             if let Some(strip) = seek_strip.as_ref() {
                 if bottom_hud_visible {
                     draw_native_seek_strip(
@@ -9177,7 +9018,6 @@ impl NativeEguiOverlay {
                         strip,
                         &seek_strip_texture_ids,
                         seek_strip_wave_texture_id,
-                        seek_strip_popup_open,
                         &mut seek_strip_drag_origin,
                         &mut last_seek_strip_window_request,
                         &mut commands,
@@ -9924,11 +9764,7 @@ impl NativeEguiOverlay {
                         let seek_resp = ui.interact(
                             hit_rect,
                             egui::Id::new("native_video_seek_hit"),
-                            if seek_strip_popup_open {
-                                egui::Sense::hover()
-                            } else {
-                                egui::Sense::click_and_drag()
-                            },
+                            egui::Sense::click_and_drag(),
                         );
                         if seek_resp.hovered() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
@@ -10007,9 +9843,8 @@ impl NativeEguiOverlay {
                         // カーソル動線が seek_row (シーク行) を横切るため、hover preview
                         // (シーク先サムネ) を発火させない。popup を閉じれば次のフレームで
                         // 通常の hover detection に戻る。
-                        let suppress_hover_preview = video_speed_popup_open
-                            || seek_strip_popup_open
-                            || seek_strip_visible;
+                        let suppress_hover_preview =
+                            video_speed_popup_open || seek_strip_visible;
                         if duration_secs > 0.0 && !suppress_hover_preview {
                             if seek_resp.hovered()
                                 && let Some(pos) = pointer_pos
@@ -10453,16 +10288,11 @@ impl NativeEguiOverlay {
                                     )
                                 })
                                 .unwrap_or(crate::settings::VideoSeekStripState::None);
-                            draw_native_seek_strip_selector(
-                                ctx,
+                            draw_native_seek_strip_cycle_button(
                                 ui,
                                 painter,
                                 seek_strip_selector_rect,
-                                egui::vec2(overlay_width_points, overlay_height_points),
                                 seek_strip_state,
-                                &mut seek_strip_popup_open,
-                                &mut video_speed_popup_open,
-                                &mut last_drawn_seek_strip_popup_rect,
                                 &mut commands,
                             );
                         }
@@ -10586,14 +10416,12 @@ impl NativeEguiOverlay {
         self.last_emitted_vst3_panel_pos = last_emitted_vst3_panel_pos;
         self.last_drawn_toast_rect = last_drawn_toast_rect;
         self.last_drawn_speed_popup_rect = last_drawn_speed_popup_rect;
-        self.last_drawn_seek_strip_popup_rect = last_drawn_seek_strip_popup_rect;
         self.last_drawn_bookmark_editor_rect = last_drawn_bookmark_editor_rect;
         self.last_drawn_bulk_bookmark_dialog_rect = last_drawn_bulk_bookmark_dialog_rect;
         self.last_drawn_shortcut_help_rect = last_drawn_shortcut_help_rect;
         self.last_drawn_ring_picker_rect = last_drawn_ring_picker_rect;
         self.last_drawn_ring_guide_rect = last_drawn_ring_guide_rect;
         self.video_speed_popup_open = video_speed_popup_open;
-        self.seek_strip_popup_open = seek_strip_popup_open;
         self.frame_step_hold = frame_step_hold;
         self.seek_row_gesture = seek_row_gesture;
         self.seek_strip_drag_origin = seek_strip_drag_origin;

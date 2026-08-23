@@ -755,9 +755,10 @@ presenter も旧 texture を描き続けるため、解析中の blank frame / u
 同じ純関数で求める。release の 1 回だけ補間時刻へ精密 seek して必ず再生を始める。再生中は
 100ms cadence で
 playhead を中心へ戻し、ドラッグ中だけ追従を detach、release で再 attach する。HUD の vector
-film-strip button は上向き 3 項目 menu を開き、表示中は click shield と modal input routing で
-本編 / シークバーへの click・wheel fall-through を止める。hover の単発 preview と tile overlay は
-排他的に扱う。
+film-strip button は `none → thumbnails → waveform → none` を 1 クリック巡回し、OFF は非アクティブ、
+waveform はフィルム上の vector 音符で区別する。ストリップ本体にはモード切替 UI を置かず、全域を
+ドラッグ面にする。左右パネルの端 hover band はストリップ表示中だけ 104pt 上へ退避し、非表示時は
+従来の HUD 上端境界を保つ。hover の単発 preview と tile overlay は排他的に扱う。
 
 ### 各ファイルの責務
 

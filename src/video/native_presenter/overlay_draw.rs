@@ -2351,6 +2351,31 @@ pub(super) fn draw_seek_strip_film_icon(
     }
 }
 
+/// Waveform-state badge drawn over the fixed film-strip icon. Keep this vector-only so the
+/// button remains independent of symbol-font coverage.
+pub(super) fn draw_seek_strip_waveform_note(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    color: egui::Color32,
+) {
+    let scale = rect.width().min(rect.height()) * 0.28;
+    let head_radius = scale * 0.30;
+    let head = rect.center() + egui::vec2(scale * 0.35, scale * 0.45);
+    let stem_x = head.x + head_radius * 0.70;
+    let stem_top = egui::pos2(stem_x, head.y - scale * 1.35);
+    let stroke = egui::Stroke::new(1.7, color);
+
+    painter.circle_filled(head, head_radius, color);
+    painter.line_segment([egui::pos2(stem_x, head.y), stem_top], stroke);
+    painter.line_segment(
+        [
+            stem_top,
+            egui::pos2(stem_top.x + scale * 0.58, stem_top.y + scale * 0.48),
+        ],
+        stroke,
+    );
+}
+
 fn draw_overlay_info_icon(painter: &egui::Painter, rect: egui::Rect, click_to_show: bool) {
     let c = rect.center();
     let r = rect.width().min(rect.height()) * 0.3;
@@ -5676,10 +5701,19 @@ pub(super) fn native_panel_top() -> f32 {
     56.0
 }
 
-pub(super) fn native_panel_hover_bottom(overlay_height_points: f32) -> f32 {
-    // 動画 HUD 2 段化リデザイン (Phase 3): シーク HUD の上に 2pt の隙間を保つ。
-    // HUD_BOTTOM_HEIGHT + 2.0 で HUD top - 2pt = 隙間下端。
-    (overlay_height_points - (crate::video::native_presenter::HUD_BOTTOM_HEIGHT + 2.0))
+pub(super) fn native_panel_hover_bottom(
+    overlay_height_points: f32,
+    seek_strip_visible: bool,
+) -> f32 {
+    // シーク HUD または、その直上に表示中のシークストリップの上に 2pt の隙間を保つ。
+    // ストリップ非表示時は従来の HUD top - 2pt を変えない。
+    let strip_height = if seek_strip_visible {
+        crate::video::native_presenter::SEEK_STRIP_HEIGHT
+    } else {
+        0.0
+    };
+    (overlay_height_points
+        - (crate::video::native_presenter::HUD_BOTTOM_HEIGHT + strip_height + 2.0))
         .max(native_panel_top())
 }
 
@@ -7160,7 +7194,7 @@ mod tests {
         assert!(layout_truncated_to_width(&painter, "abc", font, color, 100.0, 0).is_none());
     }
 
-    /// jump / metadata 両パネルの底辺がホバー判定の底辺と一致し、シーク HUD
+    /// ストリップ非表示時は jump / metadata 両パネルの底辺がホバー判定の底辺と一致し、シーク HUD
     /// (top y = overlay_h - HUD_BOTTOM_HEIGHT) の上に 2pt の隙間が空くことを保証する
     /// 回帰テスト。上ホバーバー bottom y = 54 と panel top y = 56 の 2pt 隙間と対称になる前提。
     /// 動画 HUD 2 段化リデザイン (Phase 3) で HUD 高さが 46 → 64 に変わったので、
@@ -7171,13 +7205,29 @@ mod tests {
         let overlay_h = 1080.0_f32;
         let overlay_w = 1920.0_f32;
 
-        let hover_bottom = native_panel_hover_bottom(overlay_h);
+        let hover_bottom = native_panel_hover_bottom(overlay_h, false);
         let jump = native_jump_panel_rect(overlay_h);
         let meta = native_metadata_panel_rect(overlay_w, overlay_h);
 
         assert_eq!(hover_bottom, overlay_h - (HUD_BOTTOM_HEIGHT + 2.0));
         assert_eq!(jump.max.y, hover_bottom);
         assert_eq!(meta.max.y, hover_bottom);
+    }
+
+    #[test]
+    fn side_panel_hover_bottom_reserves_visible_seek_strip() {
+        use crate::video::native_presenter::{HUD_BOTTOM_HEIGHT, SEEK_STRIP_HEIGHT};
+        let overlay_h = 1080.0_f32;
+
+        let without_strip = native_panel_hover_bottom(overlay_h, false);
+        let with_strip = native_panel_hover_bottom(overlay_h, true);
+
+        assert_eq!(without_strip, overlay_h - (HUD_BOTTOM_HEIGHT + 2.0));
+        assert_eq!(
+            with_strip,
+            overlay_h - (HUD_BOTTOM_HEIGHT + SEEK_STRIP_HEIGHT + 2.0)
+        );
+        assert_eq!(without_strip - with_strip, SEEK_STRIP_HEIGHT);
     }
 
     #[test]
