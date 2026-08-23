@@ -1168,8 +1168,27 @@ passive detached は通常どおり release で窓を activate するが、選�
      それを作るのが §1.47。
   4. **UI 導線**: 投影方式の選択・視野角・リセットを動画 HUD から出す。§1.105 (動画の「…」) と
      関係する。
-- **自動判定は可能**。FFmpeg が `AV_SPHERICAL_EQUIRECTANGULAR` を出す
-  ([spherical.h](../vendor/ffmpeg/include/libavutil/spherical.h))。回転メタデータと同じ扱いにできる。
+- **自動判定は可能だが、それだけでは足りない**。FFmpeg は `AV_SPHERICAL_EQUIRECTANGULAR` を
+  出す ([spherical.h](../vendor/ffmpeg/include/libavutil/spherical.h))。回転メタデータと同じ扱いに
+  できる。ただし**実素材を集めて測った結果、次の 3 点が分かった** (2026-08-24、
+  テストセットは `H:\home\mimageviewer_old\testimage\360d\movie\`、同梱の README.md に実測表):
+  1. **実素材の大半は metadata を持たない。** Wikimedia から集めた実在の 360 動画 10 件のうち、
+     spherical metadata があったのは **2 件だけ**。WebM トランスコードが Matroska の Projection
+     要素を落とすため。→ **静止画側と同じ 2:1 アスペクト比のフォールバック
+     (`PanoramaTrigger::Hint` 相当) が必須**。metadata 判定だけで作ると、利用者の手元の多くの
+     ファイルで 360 ボタンが有効にならない。
+  2. **部分 FOV は別の enum になる。** `equi` の projection_bounds が非ゼロだと FFmpeg は
+     `AV_SPHERICAL_EQUIRECTANGULAR` ではなく **`AV_SPHERICAL_EQUIRECTANGULAR_TILE`** を返す。
+     これは静止画側の GPano `CroppedArea*` (Phase 1.5 の `PanoUvTransform`) に相当する。
+     **`EQUIRECTANGULAR` だけを見ると部分 FOV 素材を取りこぼす。**
+     `av_spherical_tile_bounds()` が 0.32 固定小数を画素へ直してくれるので、静止画側の
+     `PanoUvTransform::from_gpano` と同じ形へ落とせる。
+  3. **上下分割ステレオ (3D 360) が実在する。** 集めた中の 1 件が該当し、モノラル equirect と
+     して扱うと上下に同じ絵が 2 つ出る。`st3d` の stereo_mode を見て弾くか、片目だけ使うかを
+     決める必要がある。**静止画側にはこの分岐が無い。**
+- **テスト素材の作り方**: `ffmpeg` は MP4 出力へ spherical metadata を引き継がない (8.1 で
+  `-c copy` / 再エンコードとも確認) ため、上記フォルダに `make_spherical_mp4.py` を置いてある。
+  `st3d` / `sv3d` を自前で書き込み、全球と部分 FOV の MP4 を作れる (ffprobe で往復検証済み)。
 - 規模 / 優先度: Large / P3。**§1.47 待ち**。
 
 ### 1.113 動画シークバー近傍のストリップを「サムネイル列 ⇄ 音声波形」で切り替える — 利用者要望
