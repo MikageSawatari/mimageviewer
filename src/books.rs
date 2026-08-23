@@ -497,6 +497,15 @@ pub fn append_pages(
     book_name: String,
     sources: Vec<BookPageSource>,
 ) -> Result<BookOpResult, String> {
+    append_pages_at(crate::data_dir::get(), root, book_name, sources)
+}
+
+pub(crate) fn append_pages_at(
+    data_dir: PathBuf,
+    root: PathBuf,
+    book_name: String,
+    sources: Vec<BookPageSource>,
+) -> Result<BookOpResult, String> {
     if sources.is_empty() {
         return Err("追加するページがありません".to_string());
     }
@@ -521,9 +530,15 @@ pub fn append_pages(
     let mut edit_copies = Vec::new();
     let mut semantic_copies = Vec::new();
     let mut erase_fallback_pages = 0;
+    let mut restore_declines =
+        crate::content_identity::InternalByteCopyDeclineRecorder::new(&data_dir);
     for (offset, source) in sources.into_iter().enumerate() {
         let page_no = start + offset;
         let dest = destination_for_source(&folder, page_no, &source)?;
+        let byte_copy_source = match &source {
+            BookPageSource::File { src, .. } => Some(src.clone()),
+            _ => None,
+        };
         if let Some(copy) = source_edit_copy_path(&root, &folder, &source) {
             let mapping = BookPathMapping {
                 from: copy.path().to_path_buf(),
@@ -537,10 +552,23 @@ pub fn append_pages(
         if write_source(source, &dest)? {
             erase_fallback_pages += 1;
         }
+        if let Some(source_path) = byte_copy_source {
+            restore_declines.record(&source_path, &dest);
+        }
         if first_path.is_none() {
             first_path = Some(dest);
         }
     }
+    let restore_declines = restore_declines.finish();
+    crate::logger::log(format!(
+        "book append restore declines: requested={} recorded={} existing={} source_untracked={} source_hash_unavailable={} errors={}",
+        restore_declines.requested,
+        restore_declines.recorded,
+        restore_declines.already_recorded,
+        restore_declines.source_not_tracked,
+        restore_declines.source_hash_unavailable,
+        restore_declines.errors.len(),
+    ));
 
     Ok(BookOpResult::Append(BookAppendSummary {
         book_name,
@@ -2465,7 +2493,8 @@ mod tests {
         let page = source.join("0001_a.jpg");
         fs::write(&page, b"a").unwrap();
 
-        let result = append_pages(
+        let result = append_pages_at(
+            tmp.path().join("data"),
             root.clone(),
             "dst".to_string(),
             vec![BookPageSource::File {

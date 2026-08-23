@@ -16524,6 +16524,17 @@ mod favorite_adjustment_defaults_tests {
         let src = app.tmp.path().join("source.jpg");
         let root = app.tmp.path().join("books");
         std::fs::write(&src, b"not decoded, copied as-is").expect("write source bytes");
+        let source_key = crate::adjustment_db::normalize_path(&src);
+        app.rating_db
+            .as_ref()
+            .expect("rating db")
+            .set(&source_key, 4)
+            .expect("save source rating");
+        app.tags_db
+            .as_mut()
+            .expect("tags db")
+            .set_item_tags(&source_key, ["source-only"], "test")
+            .expect("save source tag");
         app.settings.book_root = Some(root.clone());
         app.settings.active_book_name = "target".to_string();
         app.items = vec![GridItem::Image(src)];
@@ -16544,6 +16555,18 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(
             std::fs::read(&outputs[0]).expect("read copied page"),
             b"not decoded, copied as-is"
+        );
+        let output_key = crate::adjustment_db::normalize_path(&outputs[0]);
+        assert_eq!(
+            app.rating_db.as_ref().expect("rating db").get(&output_key),
+            0
+        );
+        assert!(
+            app.tags_db
+                .as_ref()
+                .expect("tags db")
+                .get_item_tags(&output_key)
+                .is_empty()
         );
     }
 

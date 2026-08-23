@@ -31269,8 +31269,9 @@ impl App {
             return;
         }
         let root = self.book_root_path();
+        let data_dir = crate::data_dir::get();
         self.start_book_op(ctx, "book-append", move || {
-            crate::books::append_pages(root, book_name, sources)
+            crate::books::append_pages_at(data_dir, root, book_name, sources)
         });
     }
 

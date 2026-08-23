@@ -19,8 +19,8 @@ use sha2::{Digest, Sha256};
 mod restore;
 
 pub(crate) use restore::{
-    ContentRestoreReport, DeclinedRestore, RestorePresence, RestoreSidecarMirror, SelectedRestore,
-    restore_candidates_at,
+    ContentRestoreReport, DeclinedRestore, InternalByteCopyDeclineRecorder, RestorePresence,
+    RestoreSidecarMirror, SelectedRestore, restore_candidates_at,
 };
 
 const HEAD_HASH_BYTES: u64 = 64 * 1024;
@@ -1699,6 +1699,31 @@ mod tests {
         }
     }
 
+    fn detect_test_image_copy(
+        db_path: &Path,
+        index: &ContentIdentityIndex,
+        path: &Path,
+    ) -> Vec<RestoreCandidate> {
+        let size = std::fs::metadata(path).unwrap().len();
+        let target = stage0_target(
+            index,
+            ContentIdentitySource::new(path, ContentKind::Image),
+            size,
+        )
+        .expect("byte-identical test copy must reach content identity detection");
+        run_detection_at(
+            db_path,
+            vec![target],
+            1,
+            crate::path_key::normalize_keep_drive(path.parent().unwrap()),
+            &AtomicBool::new(false),
+            &crate::io_semaphore::GlobalIoSemaphore::new(1),
+        )
+        .unwrap()
+        .unwrap()
+        .candidates
+    }
+
     #[test]
     fn stage_hashes_have_stable_sha256_vectors() {
         let mut head = Cursor::new(b"abc");
@@ -2887,6 +2912,156 @@ mod tests {
             detected.candidates[0].sources[0].file_key,
             crate::path_key::normalize_keep_drive(&source_path)
         );
+    }
+
+    #[test]
+    fn book_byte_copy_is_declined_but_explorer_copy_in_same_book_is_detected() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let db_path = data_dir.join("content_identity.db");
+        let source_folder = temp.path().join("source");
+        let books_root = temp.path().join("books");
+        std::fs::create_dir_all(&source_folder).unwrap();
+        let source_path = source_folder.join("rated-only.jpg");
+        let bytes = vec![23_u8; HEAD_HASH_BYTES as usize + 47];
+        std::fs::write(&source_path, &bytes).unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
+        let backfill = run_backfill_at(
+            &db_path,
+            vec![ContentIdentitySource::new(&source_path, ContentKind::Image)],
+            &cancel,
+            &io_sem,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(backfill.ledger_updates.len(), 1);
+
+        let appended = crate::books::append_pages_at(
+            data_dir.clone(),
+            books_root.clone(),
+            "target".to_string(),
+            vec![crate::books::BookPageSource::File {
+                src: source_path.clone(),
+                original_name: "rated-only.jpg".to_string(),
+            }],
+        )
+        .unwrap();
+        let crate::books::BookOpResult::Append(summary) = appended else {
+            panic!("expected book append");
+        };
+        let book_copy = summary.first_path.unwrap();
+        assert_eq!(std::fs::read(&book_copy).unwrap(), bytes);
+
+        let db = ContentIdentityDb::open_at(&db_path).unwrap();
+        let index = db.load_index(&cancel).unwrap().unwrap();
+        let source_hash = db
+            .ledger_entry(&crate::path_key::normalize_keep_drive(&source_path))
+            .unwrap()
+            .unwrap()
+            .full_hash
+            .unwrap();
+        assert!(
+            db.restore_was_declined(
+                &source_hash,
+                &crate::path_key::normalize_keep_drive(&book_copy)
+            )
+            .unwrap()
+        );
+        drop(db);
+        assert!(
+            detect_test_image_copy(&db_path, &index, &book_copy).is_empty(),
+            "mIV-created book copy must not be offered for restore"
+        );
+
+        let explorer_copy = books_root.join("target").join("explorer-copy.jpg");
+        std::fs::copy(&source_path, &explorer_copy).unwrap();
+        let candidates = detect_test_image_copy(&db_path, &index, &explorer_copy);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "book location itself must not suppress an Explorer-created copy"
+        );
+        assert_eq!(
+            candidates[0].sources[0].file_key,
+            crate::path_key::normalize_keep_drive(&source_path)
+        );
+    }
+
+    #[test]
+    fn book_composited_page_does_not_create_a_restore_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let db_path = data_dir.join("content_identity.db");
+        let source_path = temp.path().join("edited.png");
+        let books_root = temp.path().join("books");
+        let mut image = image::RgbaImage::new(2, 1);
+        image.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        image.put_pixel(1, 0, image::Rgba([0, 0, 255, 255]));
+        image.save(&source_path).unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
+        run_backfill_at(
+            &db_path,
+            vec![ContentIdentitySource::new(&source_path, ContentKind::Image)],
+            &cancel,
+            &io_sem,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        let appended = crate::books::append_pages_at(
+            data_dir,
+            books_root,
+            "target".to_string(),
+            vec![crate::books::BookPageSource::Composited {
+                source: crate::books::CompositeSource::File { path: source_path },
+                basename: "edited.png".to_string(),
+                edits: crate::books::BakedEditSnapshot {
+                    params: crate::adjustment::AdjustParams::default(),
+                    rotation: crate::rotation_db::Rotation::Cw90,
+                    conceal: None,
+                    erase: None,
+                    local_adjust: None,
+                    comic: None,
+                    comic_source_dims: None,
+                    export_crop: None,
+                    crop_legacy_writeback: None,
+                    format: crate::capture::CaptureFormat::Png,
+                    jpeg_matte: crate::capture::JpegMatte::Black,
+                },
+            }],
+        )
+        .unwrap();
+        let crate::books::BookOpResult::Append(summary) = appended else {
+            panic!("expected book append");
+        };
+        let output = summary.first_path.unwrap();
+        let db = ContentIdentityDb::open_at(&db_path).unwrap();
+        let index = db.load_index(&cancel).unwrap().unwrap();
+        drop(db);
+        let output_size = std::fs::metadata(&output).unwrap().len();
+        if let Some(target) = stage0_target(
+            &index,
+            ContentIdentitySource::new(&output, ContentKind::Image),
+            output_size,
+        ) {
+            let result = run_detection_at(
+                &db_path,
+                vec![target],
+                2,
+                crate::path_key::normalize_keep_drive(output.parent().unwrap()),
+                &cancel,
+                &io_sem,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(result.candidates.is_empty());
+        }
     }
 
     #[test]

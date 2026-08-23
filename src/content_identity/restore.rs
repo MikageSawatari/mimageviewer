@@ -57,6 +57,90 @@ pub(crate) struct DeclinedRestore {
     pub(crate) target_key: String,
 }
 
+/// Worker-side seam for byte-identical copies created by mIV itself.
+/// It reuses only the source ledger full hash and never reads either file.
+/// Other in-app copy producers can use the same recorder later.
+pub(crate) struct InternalByteCopyDeclineRecorder {
+    db_path: PathBuf,
+    db: InternalByteCopyDeclineDb,
+    report: InternalByteCopyDeclineReport,
+}
+
+enum InternalByteCopyDeclineDb {
+    Unopened,
+    Ready(ContentIdentityDb),
+    Unavailable,
+}
+
+enum InternalByteCopyDeclineOutcome {
+    Recorded,
+    AlreadyRecorded,
+    SourceNotTracked,
+    SourceHashUnavailable,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct InternalByteCopyDeclineReport {
+    pub(crate) requested: usize,
+    pub(crate) recorded: usize,
+    pub(crate) already_recorded: usize,
+    pub(crate) source_not_tracked: usize,
+    pub(crate) source_hash_unavailable: usize,
+    pub(crate) errors: Vec<String>,
+}
+
+impl InternalByteCopyDeclineRecorder {
+    pub(crate) fn new(data_dir: &Path) -> Self {
+        Self {
+            db_path: data_dir.join("content_identity.db"),
+            db: InternalByteCopyDeclineDb::Unopened,
+            report: InternalByteCopyDeclineReport::default(),
+        }
+    }
+
+    pub(crate) fn record(&mut self, source_path: &Path, target_path: &Path) {
+        self.report.requested += 1;
+        if matches!(self.db, InternalByteCopyDeclineDb::Unopened) {
+            self.db = match ContentIdentityDb::open_at(&self.db_path) {
+                Ok(db) => InternalByteCopyDeclineDb::Ready(db),
+                Err(error) => {
+                    self.push_error(format!(
+                        "content_identity internal byte-copy DB open {}: {error}",
+                        self.db_path.display()
+                    ));
+                    InternalByteCopyDeclineDb::Unavailable
+                }
+            };
+        }
+        let InternalByteCopyDeclineDb::Ready(db) = &self.db else {
+            return;
+        };
+        let outcome = record_internal_byte_copy_decline(db, source_path, target_path);
+        match outcome {
+            Ok(InternalByteCopyDeclineOutcome::Recorded) => self.report.recorded += 1,
+            Ok(InternalByteCopyDeclineOutcome::AlreadyRecorded) => {
+                self.report.already_recorded += 1
+            }
+            Ok(InternalByteCopyDeclineOutcome::SourceNotTracked) => {
+                self.report.source_not_tracked += 1
+            }
+            Ok(InternalByteCopyDeclineOutcome::SourceHashUnavailable) => {
+                self.report.source_hash_unavailable += 1
+            }
+            Err(error) => self.push_error(error),
+        }
+    }
+
+    pub(crate) fn finish(self) -> InternalByteCopyDeclineReport {
+        self.report
+    }
+
+    fn push_error(&mut self, error: String) {
+        crate::logger::log(error.clone());
+        self.report.errors.push(error);
+    }
+}
+
 /// A3b worker の batch 入口。全候補の mapping を先に集約し、shared STORES と
 /// runtime update の各 DB は候補数にかかわらず 1 回ずつだけ開く。
 pub(crate) fn restore_candidates_at(
@@ -160,6 +244,44 @@ fn record_restore_declined(
         )
         .map(|rows| rows > 0)
         .map_err(|error| error.to_string())
+}
+
+fn record_internal_byte_copy_decline(
+    db: &ContentIdentityDb,
+    source_path: &Path,
+    target_path: &Path,
+) -> Result<InternalByteCopyDeclineOutcome, String> {
+    let source_key = crate::path_key::normalize_keep_drive(source_path);
+    let target_key = crate::path_key::normalize_keep_drive(target_path);
+    let Some(source) = db.ledger_entry(&source_key).map_err(|error| {
+        format!(
+            "content_identity internal byte-copy source={source_key} target={target_key}: {error}"
+        )
+    })?
+    else {
+        return Ok(InternalByteCopyDeclineOutcome::SourceNotTracked);
+    };
+    let Some(full_hash) = source.full_hash else {
+        return Ok(InternalByteCopyDeclineOutcome::SourceHashUnavailable);
+    };
+    let refusal = DeclinedRestore {
+        full_hash,
+        target_key,
+    };
+    record_restore_declined(db, &refusal)
+        .map(|changed| {
+            if changed {
+                InternalByteCopyDeclineOutcome::Recorded
+            } else {
+                InternalByteCopyDeclineOutcome::AlreadyRecorded
+            }
+        })
+        .map_err(|error| {
+            format!(
+                "content_identity internal byte-copy target={}: {error}",
+                refusal.target_key
+            )
+        })
 }
 
 fn restore_copy_mappings(
@@ -1052,5 +1174,72 @@ mod tests {
         assert_eq!(second.rows, 0);
         let db = ContentIdentityDb::open_at(&data.path().join("content_identity.db")).unwrap();
         assert!(db.restore_was_declined("full", "c:/target.png").unwrap());
+    }
+
+    #[test]
+    fn internal_byte_copy_recorder_reuses_ledger_hash_and_skips_unhashable_sources() {
+        let data = tempfile::tempdir().unwrap();
+        let source_path = data.path().join("source.png");
+        let target_path = data.path().join("target.png");
+        let pending_path = data.path().join("pending.png");
+        let pending_target = data.path().join("pending-target.png");
+        let missing_path = data.path().join("missing.png");
+        let missing_target = data.path().join("missing-target.png");
+        let source_key = crate::path_key::normalize_keep_drive(&source_path);
+        let pending_key = crate::path_key::normalize_keep_drive(&pending_path);
+
+        let db = ContentIdentityDb::open_at(&data.path().join("content_identity.db")).unwrap();
+        db.upsert(
+            &ContentIdentitySource::new(&source_path, ContentKind::Image),
+            &RecordedFileState {
+                file_key: source_key,
+                size: 10,
+                hashed_mtime: 1,
+            },
+            "head",
+            "ledger-full",
+            1,
+            ObservationRole::RestorableContent,
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO edit_origin
+                     (file_key, size, head_hash, full_hash, hashed_mtime, kind, last_edit_at,
+                      has_restorable_content)
+                 VALUES (?1, 10, 'head', NULL, 1, 'image', 1, 1)",
+                [&pending_key],
+            )
+            .unwrap();
+        drop(db);
+
+        let mut recorder = InternalByteCopyDeclineRecorder::new(data.path());
+        recorder.record(&source_path, &target_path);
+        recorder.record(&source_path, &target_path);
+        recorder.record(&pending_path, &pending_target);
+        recorder.record(&missing_path, &missing_target);
+        let report = recorder.finish();
+        assert_eq!(report.requested, 4);
+        assert_eq!(report.recorded, 1);
+        assert_eq!(report.already_recorded, 1);
+        assert_eq!(report.source_hash_unavailable, 1);
+        assert_eq!(report.source_not_tracked, 1);
+        assert!(report.errors.is_empty());
+
+        let db = ContentIdentityDb::open_at(&data.path().join("content_identity.db")).unwrap();
+        assert!(
+            db.restore_was_declined(
+                "ledger-full",
+                &crate::path_key::normalize_keep_drive(&target_path)
+            )
+            .unwrap()
+        );
+        assert!(
+            !db.restore_was_declined(
+                "ledger-full",
+                &crate::path_key::normalize_keep_drive(&pending_target)
+            )
+            .unwrap()
+        );
     }
 }
