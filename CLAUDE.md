@@ -636,12 +636,18 @@ UI 同期なら、worker 化・キャンセル・結果適用時の世代/idx �
 リモートの不具合を調べるとき、**推測する前にこのログを開くこと。**
 
 ```
-<remote-web の作業ディレクトリ>\remote-web-log.jsonl
+%APPDATA%\mimageviewer-remote\remote-web-log.jsonl
 ```
 
-既定は相対パス `remote-web-log.jsonl` (`crates/remote-web/src/config.rs`)。
-core が service を spawn するとき `--log` を渡していないので、**リポジトリ
-ルート直下**に出ることが多い (`--log <path>` で変更可)。JSON Lines 形式。
+**data_dir の兄弟ディレクトリ** `<data_dir>-remote` に出る
+(`data_dir::remote_service_log_dir`)。既定の data_dir なら上記のパス。
+ポータブル版なら `<exe_dir>\data-remote\`。`--log` は **remote 側で必須**引数で、
+パスは core が決めて渡す (`remote_ipc::service`)。JSON Lines 形式。
+
+> 以前ここには「既定は相対パスでリポジトリルート直下」と書いてあったが**誤り**。
+> 2026-08-23 の調査でリポジトリ root と `%APPDATA%\mimageviewer` を探しても
+> 見つからず時間を使った。`--log` 必須化で本体がパスを決める形に変わっている。
+
 16 MiB を超えるとローテーションし、現在ファイルと
 `remote-web-log.1.jsonl`〜`.4.jsonl` の計 5 世代を保持する (合計およそ 80 MiB)。
 本体の perf log と違い**起動時にはローテーションしない** — PIN 変更・serve 設定・
@@ -661,9 +667,10 @@ core が service を spawn するとき `--log` を渡していないので、**
 ### 読み方の例
 
 ```python
-import json, io, collections
+import json, io, os, collections
 c = collections.Counter()
-for line in io.open('remote-web-log.jsonl', encoding='utf-8'):
+p = os.path.join(os.environ['APPDATA'], 'mimageviewer-remote', 'remote-web-log.jsonl')
+for line in io.open(p, encoding='utf-8'):
     if not line.strip():
         continue
     events = ((json.loads(line).get('details') or {}).get('telemetry') or {}).get('events') or []
