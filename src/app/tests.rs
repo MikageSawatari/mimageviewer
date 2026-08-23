@@ -1271,6 +1271,193 @@ fn metadata_import_terminal_refresh_reaches_main_and_detached_context_for_same_b
     assert_eq!(detached.bundle.details_order, vec![0]);
 }
 
+#[cfg(windows)]
+#[test]
+fn stale_main_strands_fresh_parked_pdf_rating_memo() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let window_id = 780;
+    let pdf = PathBuf::from(
+        [
+            'C', ':', '\\', 'p', 'a', 'r', 'k', 'e', 'd', '.', 'p', 'd', 'f',
+        ]
+        .into_iter()
+        .collect::<String>(),
+    );
+    let mut parked = ViewerContextBundle::empty();
+    parked.current_folder = Some(pdf.clone());
+    parked.items = vec![GridItem::PdfPage {
+        pdf_path: pdf,
+        page_num: 0,
+        content_type: None,
+    }];
+    parked.image_metas = vec![None];
+    parked.thumbnails = vec![ThumbnailState::Pending];
+    parked.items_generation = 17;
+    parked.rating_cache = std::collections::HashMap::from([(0, 0)]);
+    parked.current_folder_rating_cache = Some(0);
+    app.detached_image_windows
+        .push(paused_test_window(&ctx, window_id, parked));
+
+    let stale_main_generation = app.items_generation;
+    app.items_generation = app.items_generation.wrapping_add(1);
+    let result = crate::app::metadata_import_refresh::RefreshResult {
+        contexts: vec![
+            metadata_context_result(
+                crate::app::metadata_import_refresh::ContextSlot::Main,
+                stale_main_generation,
+                4,
+            ),
+            metadata_context_result(
+                crate::app::metadata_import_refresh::ContextSlot::PausedDetached {
+                    index: 0,
+                    window_id,
+                },
+                17,
+                4,
+            ),
+        ],
+        page_snapshot: None,
+        errors: Vec::new(),
+    };
+    let (_, stale) = app.apply_metadata_import_terminal_refresh(
+        result,
+        crate::metadata_transfer::ImportChangedSections {
+            ratings: true,
+            ..Default::default()
+        },
+    );
+
+    assert!(stale);
+    assert_eq!(
+        app.with_paused_detached_context(window_id, |mounted| {
+            (
+                mounted.current_folder_rating_cache,
+                mounted.rating_cache.get(&0).copied(),
+            )
+        }),
+        Some((Some(0), Some(0)))
+    );
+
+    let retry = crate::app::metadata_import_refresh::RefreshResult {
+        contexts: vec![
+            metadata_context_result(
+                crate::app::metadata_import_refresh::ContextSlot::Main,
+                app.items_generation,
+                4,
+            ),
+            metadata_context_result(
+                crate::app::metadata_import_refresh::ContextSlot::PausedDetached {
+                    index: 0,
+                    window_id,
+                },
+                17,
+                4,
+            ),
+        ],
+        page_snapshot: None,
+        errors: Vec::new(),
+    };
+    let (_, retry_stale) = app.apply_metadata_import_terminal_refresh(
+        retry,
+        crate::metadata_transfer::ImportChangedSections {
+            ratings: true,
+            ..Default::default()
+        },
+    );
+    assert!(!retry_stale);
+    assert_eq!(
+        app.with_paused_detached_context(window_id, |mounted| {
+            mounted.current_folder_rating_cache
+        }),
+        Some(Some(4))
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn parked_pdf_metadata_request_includes_container_rating_key() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let root = PathBuf::from(
+        ['C', ':', '\\', 'P', 'i', 'c', 't', 'u', 'r', 'e', 's']
+            .into_iter()
+            .collect::<String>(),
+    );
+    let pdf = root.join(
+        ['p', 'a', 'r', 'k', 'e', 'd', '.', 'p', 'd', 'f']
+            .into_iter()
+            .collect::<String>(),
+    );
+    let window_id = 781;
+    let mut parked = ViewerContextBundle::empty();
+    parked.current_folder = Some(pdf.clone());
+    parked.items = (0..2)
+        .map(|page_num| GridItem::PdfPage {
+            pdf_path: pdf.clone(),
+            page_num,
+            content_type: None,
+        })
+        .collect();
+    parked.image_metas = vec![None; parked.items.len()];
+    parked.thumbnails = vec![ThumbnailState::Pending; parked.items.len()];
+    app.detached_image_windows
+        .push(paused_test_window(&ctx, window_id, parked));
+
+    app.begin_metadata_import_terminal_refresh();
+    while !app.advance_metadata_import_terminal_refresh(&root, false, false) {}
+    let requests = app.take_metadata_import_refresh_requests();
+    let request = requests
+        .iter()
+        .find(|request| {
+            matches!(
+                request.slot,
+                crate::app::metadata_import_refresh::ContextSlot::PausedDetached {
+                    index: 0,
+                    window_id: 781
+                }
+            )
+        })
+        .unwrap();
+
+    let expected_key = crate::adjustment_db::normalize_path(&pdf);
+    assert_eq!(
+        request.current_rating_key.as_deref(),
+        Some(expected_key.as_str())
+    );
+    assert_eq!(request.items.len(), 2);
+}
+
+#[test]
+fn pdf_page_rating_getter_is_distinct_from_pdf_container_rating() {
+    let mut app = phase_c_support::setup_app();
+    let pdf = PathBuf::from(
+        ['C', ':', '\\', 'b', 'o', 'o', 'k', '.', 'p', 'd', 'f']
+            .into_iter()
+            .collect::<String>(),
+    );
+    app.current_folder = Some(pdf.clone());
+    app.items = vec![GridItem::PdfPage {
+        pdf_path: pdf,
+        page_num: 0,
+        content_type: None,
+    }];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![ThumbnailState::Pending];
+
+    let container_key = app.current_container_rating_key_and_source().unwrap().0;
+    let page_key = app.rating_path_key(0).unwrap();
+    assert_ne!(container_key, page_key);
+    app.rating_db
+        .as_ref()
+        .unwrap()
+        .set(&container_key, 4)
+        .unwrap();
+
+    assert_eq!(app.current_folder_rating(), 4);
+    assert_eq!(app.get_rating(0), 0);
+}
+
 #[test]
 fn metadata_import_terminal_refresh_rejects_stale_items_generation() {
     let mut app = phase_c_support::setup_app();
