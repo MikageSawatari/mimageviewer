@@ -1813,13 +1813,13 @@ SimplySign のクラウド鍵セッション切れにより失敗 → 再ログ�
 | CRT 静的リンク | ✅ `VCRUNTIME140.dll` / `MSVCP140.dll` 依存なし |
 | PDFium | ✅ 最新 (chromium/8009) |
 | FFmpeg | ⏸ 4 コミット新しい版あり (`n7.1.5-12-g1fdbca85aa` → `-16-g9a4bb2c579`)。**見送り** — 同じ 7.1.5 系で必要な修正が特定できておらず、更新すると LGPL 対応ソースの再掲と製品ページの手書き節の更新が伴う |
-| idle health: static-foreground | ✅ PASS (完全 sleep、`matching_session_events: 1` で同一 session 確認済み) |
-| idle health: static-background | ✅ PASS (同上) |
+| idle health: static-foreground | ✅ PASS (完全 sleep、perf event 0 件 / CPU 1 コア比 0.0396。外部 sampler が同一 session を確認済み) |
+| idle health: static-background | ✅ PASS (完全 sleep、perf event 0 件 / CPU 1 コア比 0.0167) |
 | idle health: tray-residency | ⏭ 本ビルドでは未実施。マージ前ビルドでは PASS したが**軽い条件のみ** (`evidence_floor` が起動時のままで、サムネイル読込中に閉じた状態では測っていない) |
 | idle health: video-pin-background | ⏭ 未実施 (waiver)。動画を代表画像に固定し、かつキャッシュから読み直される状態のフォルダが必要 |
-| ポータブル版 smoke | ✅ 実機確認済み |
+| ポータブル版 smoke | ✅ 実機確認済み (`data\` が exe の隣、APPDATA 不変) |
 | 「重要な変更点」表示 | ✅ `--whatsnew-from 3.1.3` で**必読 4 + 新機能 8** を確認 |
-| 機能の実機確認 | ✅ 製本の復元抑止 (出ないこと + Explorer コピーでは出ること)、動画アップスケール、復元モーダル / ESC、動画バー固定、設定の移動先 |
+| 機能の実機確認 | ✅ 製本の復元抑止 (出ないこと + Explorer コピーでは出ること)、動画アップスケール、復元モーダル / ESC、動画バー固定、設定の移動先、**T キー** (別ウィンドウ動画 → メインで PDF → 動画へ戻って T)、**キー割り当て一覧のラベル 2 件** |
 
 **見送り (実施不要と判断)**: 検索ベンチ回帰 (本版で検索未変更)、perf smoke。
 
@@ -1831,7 +1831,7 @@ SimplySign のクラウド鍵セッションが切れていても通過する (�
 
 ### 5.13 v3.2.0 の残り公開作業 (2026-08-23 時点)
 
-**出荷判断は済んでいる。**残りは公開手順のみ。手順の正本は CLAUDE.md「リリース手順チェックリスト」。
+**出荷判断は済んでいる。出荷前確認は 2026-08-23 に全件完了した。**残りは公開手順のみ。手順の正本は CLAUDE.md「リリース手順チェックリスト」。
 
 済んでいるもの: Phase 0 (更新履歴・利用者承認済み) / Phase 1 (版番号・installer・製品ページ・
 `changelog.html` 再生成・`version_highlights`) / Phase 2 (PDFium 最新・FFmpeg 見送り判断・CI 緑) /
@@ -1839,13 +1839,10 @@ SimplySign のクラウド鍵セッションが切れていても通過する (�
 
 残り:
 
-1. **配布ビルドの最終版を検証** — `signtool verify /pa` で 3 種 (単体exe / setup.exe /
-   portable の exe) が `Valid` + RFC3161 であること、`dumpbin /dependents` に
-   `VCRUNTIME140.dll` / `MSVCP140.dll` が無いこと。
-2. **実機確認 (利用者)** — アイドル健全性 `static-foreground` / `static-background`、
-   T キー (別ウィンドウ動画 → メインで PDF → 動画へ戻って T)、キー割り当て一覧の
-   ラベル 2 件、ポータブル版 smoke (C 以外へ展開し `data\` が exe の隣、APPDATA 不変)。
-3. **§5.11 の記録を最終ビルドに合わせて更新。**
+1. ✅ **配布ビルドの最終版を検証** — 3 種とも `Valid` + RFC3161、CRT 静的。
+2. ✅ **実機確認 (利用者)** — アイドル健全性 2 シナリオ、T キー、キー割り当てラベル、
+   製本、ポータブル版 smoke すべて完了。
+3. ✅ **§5.11 の記録を最終ビルドに合わせて更新。**
 4. **push** — `git push origin master` と `master:main` (**明示の指示が要る**)。
 5. **Vector 申請用 zip** — `mImageViewer_setup.exe` + `installer/readme.txt` を
    `dist\mImageViewer_installer_v3.2.0.zip` へ `Compress-Archive`。
