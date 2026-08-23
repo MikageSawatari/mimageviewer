@@ -2247,6 +2247,7 @@ struct StillTopBarVisibilityInputs {
     fit_popup_open: bool,
     slideshow_popup_open: bool,
     rotation_popup_open: bool,
+    panorama_projection_popup_open: bool,
     overflow_panel_open: bool,
     view_trim_mode: bool,
     touch_chrome_latched: bool,
@@ -2260,6 +2261,7 @@ fn still_top_bar_visible_from_inputs(input: StillTopBarVisibilityInputs) -> bool
         || input.fit_popup_open
         || input.slideshow_popup_open
         || input.rotation_popup_open
+        || input.panorama_projection_popup_open
         || input.overflow_panel_open
         || input.view_trim_mode
         || input.touch_chrome_latched
@@ -2301,6 +2303,7 @@ struct StillTouchInputEnabledInputs {
     fit_popup_open: bool,
     slideshow_popup_open: bool,
     rotation_popup_open: bool,
+    panorama_projection_popup_open: bool,
     compare_wipe_active: bool,
     overlay_edit_active: bool,
     view_trim_active: bool,
@@ -2324,6 +2327,7 @@ fn still_touch_input_enabled(input: StillTouchInputEnabledInputs) -> bool {
         && !input.fit_popup_open
         && !input.slideshow_popup_open
         && !input.rotation_popup_open
+        && !input.panorama_projection_popup_open
         && !input.compare_wipe_active
         && !input.overlay_edit_active
         && !input.view_trim_active
@@ -14991,7 +14995,9 @@ impl App {
                                 .as_ref()
                                 .map(|pano| pano.projection)
                                 .unwrap_or(self.settings.panorama_projection);
-                            let mut panorama_projection_pressed = false;
+                            let mut panorama_projection_choice: Option<
+                                crate::panorama::PanoProjection,
+                            > = None;
                             let fit_mode = self.effective_fullscreen_fit_mode();
                             let fit_no_upscale = self.settings.fullscreen_fit_no_upscale;
                             let fit_no_downscale = self.settings.fullscreen_fit_no_downscale;
@@ -15032,6 +15038,8 @@ impl App {
                                     fit_popup_open: self.fit_popup_open,
                                     slideshow_popup_open: self.slideshow_popup_open,
                                     rotation_popup_open: fs_rotation_popup_open(ctx),
+                                    panorama_projection_popup_open: self
+                                        .panorama_projection_popup_open,
                                     overflow_panel_open: self.fs_overflow_panel_state.is_open(),
                                     view_trim_mode: self.view_trim_mode,
                                     touch_chrome_latched,
@@ -15085,7 +15093,8 @@ impl App {
                                 panorama_mode_active,
                                 &mut panorama_pressed,
                                 panorama_projection,
-                                &mut panorama_projection_pressed,
+                                &mut self.panorama_projection_popup_open,
+                                &mut panorama_projection_choice,
                                 &mut self.spread_mode,
                                 &mut self.reading_flow,
                                 &mut self.reading_direction,
@@ -15178,9 +15187,9 @@ impl App {
                             if panorama_pressed {
                                 self.toggle_panorama_mode(fs_idx);
                             }
-                            // 360 度パノラマビュー: 投影方式の順送り
-                            if panorama_projection_pressed {
-                                self.cycle_panorama_projection();
+                            // 360 度パノラマビュー: 一覧から選ばれた投影方式を適用
+                            if let Some(mode) = panorama_projection_choice {
+                                self.set_panorama_projection(mode);
                             }
                             // ウィンドウ / 全画面 切り替えボタンが押された。
                             #[cfg(windows)]
@@ -18106,7 +18115,10 @@ impl App {
             music_view_active,
             modal_open: self.any_modal_dialog_open_for_fullscreen_keys(),
             context_menu_open: self.fs_context_menu_idx.is_some(),
-            popup_open: self.spread_popup_open || self.fit_popup_open || self.slideshow_popup_open,
+            popup_open: self.spread_popup_open
+                || self.fit_popup_open
+                || self.slideshow_popup_open
+                || self.panorama_projection_popup_open,
             ime_active: target
                 .filter(|target| target.viewport == ctx.viewport_id())
                 .is_some_and(|_| self.ime_input_active(ctx)),
@@ -18162,6 +18174,7 @@ impl App {
             self.spread_popup_open
                 || self.fit_popup_open
                 || self.slideshow_popup_open
+                || self.panorama_projection_popup_open
                 || fs_rotation_popup_open(ctx),
         );
         let mut action = FsKeyAction {
@@ -22364,6 +22377,7 @@ impl App {
                     fit_popup_open: self.fit_popup_open,
                     slideshow_popup_open: self.slideshow_popup_open,
                     rotation_popup_open: fs_rotation_popup_open(ctx),
+                    panorama_projection_popup_open: self.panorama_projection_popup_open,
                     overflow_panel_open: self.fs_overflow_panel_state.is_open(),
                     view_trim_mode: self.view_trim_mode,
                     touch_chrome_latched,
@@ -22375,6 +22389,7 @@ impl App {
         let edit_popup_open = self.spread_popup_open
             || self.fit_popup_open
             || self.slideshow_popup_open
+            || self.panorama_projection_popup_open
             || fs_rotation_popup_open(ctx)
             || self.fs_overflow_panel_state.is_open();
         let cursor_on_edit_canvas = !state.is_video
@@ -22402,6 +22417,7 @@ impl App {
             fit_popup_open: self.fit_popup_open,
             slideshow_popup_open: self.slideshow_popup_open,
             rotation_popup_open: fs_rotation_popup_open(ctx),
+            panorama_projection_popup_open: self.panorama_projection_popup_open,
             compare_wipe_active,
             overlay_edit_active: self.is_overlay_edit_mode_active(),
             view_trim_active: self.view_trim_mode,
@@ -22730,6 +22746,7 @@ impl App {
             self.spread_popup_open
                 || self.fit_popup_open
                 || self.slideshow_popup_open
+                || self.panorama_projection_popup_open
                 || fs_rotation_popup_open(ctx),
         );
         #[cfg(windows)]
@@ -22783,7 +22800,10 @@ impl App {
                     cursor_in_panel_for_wheel,
                     in_video_tile,
                     modal_for_keys,
-                    self.spread_popup_open || self.fit_popup_open || self.slideshow_popup_open,
+                    self.spread_popup_open
+                        || self.fit_popup_open
+                        || self.slideshow_popup_open
+                        || self.panorama_projection_popup_open,
                     suppress_egui_wheel,
                     handle_wheel_here,
                     self.fs_zoom_aiming,
@@ -23069,6 +23089,7 @@ impl App {
                         let any_popup = self.spread_popup_open
                             || self.fit_popup_open
                             || self.slideshow_popup_open
+                            || self.panorama_projection_popup_open
                             || overflow_panel_dismissed
                             || fs_rotation_popup_open(ctx);
                         if !any_popup {
@@ -23168,7 +23189,10 @@ impl App {
         );
         // 旧 egui HUD は撤去済 (native presenter overlay が右クリックも独自処理)。
         // egui main window 側に右クリックを吸収すべき HUD 矩形は無い。
-        let popup_open = self.spread_popup_open || self.fit_popup_open || self.slideshow_popup_open;
+        let popup_open = self.spread_popup_open
+            || self.fit_popup_open
+            || self.slideshow_popup_open
+            || self.panorama_projection_popup_open;
         let right_drag_gate_reject = if state.is_video && !video_in_audio_mode {
             Some("native_video")
         } else if self.analysis_mode {
@@ -23275,6 +23299,7 @@ impl App {
             && !self.spread_popup_open
             && !self.fit_popup_open
             && !self.slideshow_popup_open
+            && !self.panorama_projection_popup_open
             && !fs_rotation_popup_open(ctx)
         {
             match right_drag_mode {
@@ -25432,6 +25457,7 @@ impl App {
         self.update_reading_direction_from_spread_mode(mode);
         self.spread_popup_open = false;
         self.slideshow_popup_open = false;
+        self.panorama_projection_popup_open = false;
         self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
         if !self.reading_flow.is_paged() {
             self.reset_continuous_reading_transform();
@@ -29230,6 +29256,7 @@ impl App {
             && !self.spread_popup_open
             && !self.fit_popup_open
             && !self.slideshow_popup_open
+            && !self.panorama_projection_popup_open
             && self.fs_context_menu_idx.is_none()
             && !self.any_dialog_open()
     }
@@ -29269,8 +29296,11 @@ impl App {
         panorama_pressed: &mut bool,
         // 360 モード中だけ出す投影方式ボタン (§13)。360 ボタンは ON 中に隠れる
         // (× が解除を兼ねる) ので、その空いた位置にこちらが出る。
+        // 一覧から選ばれた方式は `panorama_projection_choice` へ返す (押されたかの
+        // bool ではなく選択そのものを返すので、caller が「何が選ばれたか」を推測しない)。
         panorama_projection: crate::panorama::PanoProjection,
-        panorama_projection_pressed: &mut bool,
+        panorama_projection_popup_open: &mut bool,
+        panorama_projection_choice: &mut Option<crate::panorama::PanoProjection>,
         spread_mode: &mut SpreadMode,
         reading_flow: &mut ReadingFlow,
         reading_direction: &mut ReadingDirection,
@@ -29341,6 +29371,7 @@ impl App {
             fit_popup_open: *fit_popup_open,
             slideshow_popup_open: *slideshow_popup_open,
             rotation_popup_open: fs_rotation_popup_open(ctx),
+            panorama_projection_popup_open: *panorama_projection_popup_open,
             overflow_panel_open,
             view_trim_mode: *view_trim_mode,
             touch_chrome_latched,
@@ -29867,16 +29898,15 @@ impl App {
 
         // 投影方式ボタン (docs/panorama-360-view-plan.md §13):
         // 360 モード中だけ出す。360 ボタンは ON 中に隠れる (× が解除を兼ねる) ので、
-        // 位置を奪い合わない。押すたびに順送りし、名前はトーストで出る。
+        // 位置を奪い合わない。クリックで一覧を開き、そこから選ぶ (見開きボタンと同じ形)。
+        // 押すたびに順送りする形はやめた: 4 方式あり、今どれを見ているかが押す前に
+        // 分からないため (2026-08 利用者フィードバック)。順送りはキーだけに残す。
+        let mut projection_resp_rect = egui::Rect::NOTHING;
         if !is_video && panorama_active {
-            let next = panorama_projection.next();
-            let tooltip = keymap.first_chord_bracket_label(
+            let tooltip = keymap.chord_list_bracket_label(
                 &format!(
-                    "投影方式: {} ({})
-クリックで「{}」に切り替え",
-                    panorama_projection.label(),
-                    panorama_projection.description(),
-                    next.label()
+                    "投影方式: {}\nクリックで一覧から選択",
+                    panorama_projection.label()
                 ),
                 KeyAction::FsPanoramaProjection,
             );
@@ -29885,18 +29915,110 @@ impl App {
                 next_x,
                 bar_rect.min.y + BAR_BUTTON_MARGIN,
                 "fs_panorama_projection_btn",
-                |hovered| bar_button_bg(hovered, false),
-                false,
+                |hovered| bar_button_bg(hovered, *panorama_projection_popup_open),
+                *panorama_projection_popup_open,
                 |p, c, r| draw_panorama_projection_icon(p, c, r, panorama_projection),
             );
             let proj_resp = proj_resp.hover_tip_dark(tooltip);
+            projection_resp_rect = proj_resp.rect;
             if proj_resp.clicked() {
-                *panorama_projection_pressed = true;
+                *panorama_projection_popup_open = !*panorama_projection_popup_open;
             }
             if proj_resp.hovered() {
                 *page_nav = FsPageNav::None;
             }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+        } else if *panorama_projection_popup_open {
+            // 360 を抜けた / 動画へ切り替わった: 持ち主のボタンが消えるので一覧も閉じる。
+            *panorama_projection_popup_open = false;
+        }
+
+        if *panorama_projection_popup_open && !is_video && panorama_active {
+            let popup_w = 260.0_f32;
+            let row_h = 40.0_f32;
+            let popup_h = crate::panorama::PanoProjection::all().len() as f32 * row_h + 36.0;
+            let popup_rect = egui::Rect::from_min_size(
+                egui::pos2(projection_resp_rect.min.x, bar_rect.max.y + 4.0),
+                egui::vec2(popup_w, popup_h),
+            );
+            ui.painter().rect_filled(
+                popup_rect,
+                6.0,
+                egui::Color32::from_rgba_unmultiplied(30, 30, 30, 240),
+            );
+            ui.painter().rect_stroke(
+                popup_rect,
+                6.0,
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(100, 100, 100, 180),
+                ),
+                egui::StrokeKind::Outside,
+            );
+
+            let mut item_y = popup_rect.min.y + 4.0;
+            ui.painter().text(
+                egui::pos2(popup_rect.min.x + 12.0, item_y + 12.0),
+                egui::Align2::LEFT_CENTER,
+                "投影方式",
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_gray(150),
+            );
+            item_y += 28.0;
+            for &mode in crate::panorama::PanoProjection::all() {
+                let item_rect = egui::Rect::from_min_size(
+                    egui::pos2(popup_rect.min.x + 4.0, item_y),
+                    egui::vec2(popup_w - 8.0, row_h - 4.0),
+                );
+                let item_resp = ui.interact(
+                    item_rect,
+                    egui::Id::new(("fs_panorama_projection_item", mode.shader_code())),
+                    egui::Sense::click(),
+                );
+                let is_current = panorama_projection.normalized() == mode;
+                let bg = if is_current {
+                    egui::Color32::from_rgba_unmultiplied(80, 140, 220, 200)
+                } else if item_resp.hovered() {
+                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 200)
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                ui.painter().rect_filled(item_rect, 4.0, bg);
+
+                // アイコンは方式の半径写像そのものなので、一覧でも見比べられる。
+                let icon_center = egui::pos2(item_rect.min.x + 20.0, item_rect.center().y);
+                draw_panorama_projection_icon(ui.painter(), icon_center, 8.0, mode);
+
+                ui.painter().text(
+                    egui::pos2(item_rect.min.x + 44.0, item_rect.center().y - 7.0),
+                    egui::Align2::LEFT_CENTER,
+                    mode.label(),
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_gray(220),
+                );
+                ui.painter().text(
+                    egui::pos2(item_rect.min.x + 44.0, item_rect.center().y + 8.0),
+                    egui::Align2::LEFT_CENTER,
+                    mode.short_description(),
+                    egui::FontId::proportional(10.0),
+                    egui::Color32::from_gray(150),
+                );
+
+                if item_resp.clicked() {
+                    *panorama_projection_choice = Some(mode);
+                    *panorama_projection_popup_open = false;
+                }
+                item_y += row_h;
+            }
+
+            // ポップアップ外クリックで閉じる (見開きの一覧と同じ作法)。
+            if let Some(pos) = ctx.input(|i| i.pointer.press_origin())
+                && !popup_rect.contains(pos)
+                && !projection_resp_rect.contains(pos)
+                && ctx.input(|i| i.pointer.any_pressed())
+            {
+                *panorama_projection_popup_open = false;
+            }
         }
 
         // 360 度パノラマビューボタン (docs/panorama-360-view-plan.md §5.3 / §6.1):
@@ -36931,7 +37053,8 @@ mod tests {
                     let mut slideshow_end_action = SlideshowEndAction::default();
                     let mut rotation_choice = None;
                     let mut panorama_pressed = false;
-                    let mut panorama_projection_pressed = false;
+                    let mut panorama_projection_popup_open = false;
+                    let mut panorama_projection_choice = None;
                     let mut spread_mode = SpreadMode::Ltr;
                     let mut reading_flow = initial_reading_flow;
                     let mut reading_direction = ReadingDirection::Ltr;
@@ -36975,7 +37098,8 @@ mod tests {
                         false,
                         &mut panorama_pressed,
                         crate::panorama::PanoProjection::Perspective,
-                        &mut panorama_projection_pressed,
+                        &mut panorama_projection_popup_open,
+                        &mut panorama_projection_choice,
                         &mut spread_mode,
                         &mut reading_flow,
                         &mut reading_direction,
@@ -43643,6 +43767,62 @@ mod tests {
         }
     }
 
+    /// 投影方式の一覧は上バーのボタンから吊り下がる。バーが隠れると一覧の
+    /// 持ち主ごと消えるので、開いている間はバーを出したままにする
+    /// (見開き / フィット / スライドショーの一覧と同じ契約)。
+    #[test]
+    fn the_projection_list_keeps_the_top_bar_visible_like_other_popups() {
+        let hidden = StillTopBarVisibilityInputs {
+            locked: false,
+            hover_in_top: false,
+            side_panel_visible: false,
+            spread_popup_open: false,
+            fit_popup_open: false,
+            slideshow_popup_open: false,
+            rotation_popup_open: false,
+            panorama_projection_popup_open: false,
+            overflow_panel_open: false,
+            view_trim_mode: false,
+            touch_chrome_latched: false,
+        };
+        assert!(!still_top_bar_visible_from_inputs(hidden));
+        assert!(still_top_bar_visible_from_inputs(
+            StillTopBarVisibilityInputs {
+                panorama_projection_popup_open: true,
+                ..hidden
+            }
+        ));
+    }
+
+    /// 一覧を開いている間は、その下のキャンバスへタッチを通さない。
+    /// 通すと一覧の項目を選んだつもりの指が 360 の見回しドラッグになる。
+    #[test]
+    fn the_projection_list_blocks_canvas_touch_like_other_popups() {
+        let enabled = StillTouchInputEnabledInputs {
+            is_video: false,
+            is_music_view: false,
+            has_fullscreen_item: true,
+            dialog_open: false,
+            wants_keyboard_input: false,
+            ime_input_active: false,
+            context_menu_open: false,
+            spread_popup_open: false,
+            fit_popup_open: false,
+            slideshow_popup_open: false,
+            rotation_popup_open: false,
+            panorama_projection_popup_open: false,
+            compare_wipe_active: false,
+            overlay_edit_active: false,
+            view_trim_active: false,
+            zoom_active: false,
+        };
+        assert!(still_touch_input_enabled(enabled));
+        assert!(!still_touch_input_enabled(StillTouchInputEnabledInputs {
+            panorama_projection_popup_open: true,
+            ..enabled
+        }));
+    }
+
     #[test]
     fn still_side_panel_forces_top_bar_visible() {
         let hidden = StillTopBarVisibilityInputs {
@@ -43653,6 +43833,7 @@ mod tests {
             fit_popup_open: false,
             slideshow_popup_open: false,
             rotation_popup_open: false,
+            panorama_projection_popup_open: false,
             overflow_panel_open: false,
             view_trim_mode: false,
             touch_chrome_latched: false,
@@ -43892,6 +44073,7 @@ mod tests {
             fit_popup_open: false,
             slideshow_popup_open: false,
             rotation_popup_open: false,
+            panorama_projection_popup_open: false,
             compare_wipe_active: false,
             overlay_edit_active: false,
             view_trim_active: false,

@@ -27152,6 +27152,92 @@ mod pipeline_cache_refactor_tests {
         crate::key_input::clear_test_frame();
     }
 
+    /// 投影方式の一覧は上バーの投影ボタンから吊り下がり、そのボタンは 360 表示中しか
+    /// 出ない。360 を抜けたら一覧も畳む。残すと、持ち主のいない矩形がカーソル自動
+    /// 非表示・ホイール・タッチを抑止したままになる。
+    #[test]
+    fn leaving_panorama_mode_closes_the_projection_list() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/pano-projection-popup.jpg");
+        app.fullscreen_idx = Some(idx);
+        insert_pano_static_source(
+            &mut app,
+            &ctx,
+            idx,
+            "pano_projection_popup",
+            egui::Color32::BLACK,
+        );
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(
+            0.0,
+            0.0,
+            crate::panorama::PanoProjection::Perspective,
+        ));
+        app.panorama_projection_popup_open = true;
+
+        app.toggle_panorama_mode(idx);
+
+        assert!(app.panorama_state.is_none(), "360 を抜けたはず");
+        assert!(
+            !app.panorama_projection_popup_open,
+            "the projection list must not outlive the button that owns it"
+        );
+    }
+
+    /// 一覧から選ぶ経路と、キーの順送り経路は同じ適用処理へ合流する。
+    /// 別々に持つと、片方だけ画角の丸めや通知を落とす。
+    #[test]
+    fn choosing_and_cycling_the_projection_share_one_apply_path() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/pano-projection-apply.jpg");
+        app.fullscreen_idx = Some(idx);
+        insert_pano_static_source(
+            &mut app,
+            &ctx,
+            idx,
+            "pano_projection_apply",
+            egui::Color32::BLACK,
+        );
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(
+            0.0,
+            0.0,
+            crate::panorama::PanoProjection::Stereographic,
+        ));
+        // 立体射影でしか許されない広い画角にしておく。
+        app.panorama_state.as_mut().unwrap().fov_y = crate::panorama::FOV_MAX_WIDE;
+
+        // 一覧から透視を選ぶ = 画角も透視の上限まで丸める。
+        assert_eq!(
+            app.set_panorama_projection(crate::panorama::PanoProjection::Perspective),
+            Some(crate::panorama::PanoProjection::Perspective)
+        );
+        let pano = app.panorama_state.as_ref().unwrap();
+        assert_eq!(
+            pano.projection,
+            crate::panorama::PanoProjection::Perspective
+        );
+        assert!(pano.fov_y <= crate::panorama::FOV_MAX, "fov={}", pano.fov_y);
+
+        // キーの順送りも同じ適用処理を通る。
+        assert_eq!(
+            app.cycle_panorama_projection(),
+            Some(crate::panorama::PanoProjection::Stereographic)
+        );
+        assert_eq!(
+            app.panorama_state.as_ref().unwrap().projection,
+            crate::panorama::PanoProjection::Stereographic
+        );
+
+        // 360 が動いていなければどちらも何もしない。
+        app.panorama_state = None;
+        assert_eq!(app.cycle_panorama_projection(), None);
+        assert_eq!(
+            app.set_panorama_projection(crate::panorama::PanoProjection::Equidistant),
+            None
+        );
+    }
+
     #[test]
     fn edit_generation_clears_only_the_changed_page_edit_and_final_caches() {
         let ctx = egui::Context::default();

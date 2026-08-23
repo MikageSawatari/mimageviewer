@@ -11369,6 +11369,8 @@ pub struct App {
     pub(crate) fit_popup_open: bool,
     /// スライドショー設定ポップアップ表示中
     pub(crate) slideshow_popup_open: bool,
+    /// 360 度ビューの投影方式ポップアップ表示中。360 表示中しか開けない。
+    pub(crate) panorama_projection_popup_open: bool,
     /// 上バーの「…」から開く右上パネル。root / navigator submenu を単一状態で所有する。
     pub(crate) fs_overflow_panel_state: FsOverflowPanelState,
 
@@ -14204,6 +14206,7 @@ impl App {
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
             spread_popup_open: false,
+            panorama_projection_popup_open: false,
             fit_popup_open: false,
             slideshow_popup_open: false,
             fs_overflow_panel_state: FsOverflowPanelState::Closed,
@@ -24288,6 +24291,7 @@ impl App {
         self.spread_popup_open = false;
         self.fit_popup_open = false;
         self.slideshow_popup_open = false;
+        self.panorama_projection_popup_open = false;
         self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
         self.search_filter = None;
@@ -38487,6 +38491,7 @@ impl App {
         self.spread_popup_open = false;
         self.fit_popup_open = false;
         self.slideshow_popup_open = false;
+        self.panorama_projection_popup_open = false;
         // The same reason as in `close_fullscreen`: this is the other place that gives up the
         // fullscreen foreground, and a panel that only draws there must not outlive it.
         self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
@@ -52281,6 +52286,7 @@ impl App {
         self.spread_popup_open = false;
         self.fit_popup_open = false;
         self.slideshow_popup_open = false;
+        self.panorama_projection_popup_open = false;
         // The top bar's overflow panel belongs to this list for the same reason and was missing
         // from it: it is drawn only in fullscreen, and it holds the keyboard while it is open -
         // including the Esc that would close it. Leaving fullscreen by any other route (the
@@ -63698,11 +63704,22 @@ impl App {
     /// ここで overlay を明示破棄しないのは、pose を単一の型
     /// ([`crate::panorama::PanoPose`]) に閉じて stale 判定を 1 箇所に保つため。
     pub(crate) fn cycle_panorama_projection(&mut self) -> Option<crate::panorama::PanoProjection> {
+        let next = self.panorama_state.as_ref()?.projection.next();
+        self.set_panorama_projection(next)
+    }
+
+    /// 上バーの一覧から選ばれた投影方式を適用する。順送り
+    /// ([`Self::cycle_panorama_projection`]) もここへ合流するので、適用と通知の
+    /// 経路は 1 つだけになる。
+    pub(crate) fn set_panorama_projection(
+        &mut self,
+        projection: crate::panorama::PanoProjection,
+    ) -> Option<crate::panorama::PanoProjection> {
         let pano = self.panorama_state.as_mut()?;
-        let next = pano.cycle_projection();
+        let applied = pano.set_projection(projection);
         pano.sanitize();
-        self.show_feedback_toast(format!("投影方式: {}", next.label()));
-        Some(next)
+        self.show_feedback_toast(format!("投影方式: {}", applied.label()));
+        Some(applied)
     }
 
     /// 360 モード ON / OFF をトグル。fs_idx は対象画像 (検出 hint の初期視点取得用)。
@@ -63717,6 +63734,9 @@ impl App {
             // OFF: state と GPU リソースを drop (callback_resources からも除去、
             // Codex P2 第 18 ラウンド)。
             self.panorama_state = None;
+            // 投影ポップアップの持ち主 (上バーの投影ボタン) は 360 OFF で消えるので、
+            // 開いたまま残さない。残すとカーソル自動非表示やホイールの抑制が効き続ける。
+            self.panorama_projection_popup_open = false;
             self.clear_pano_upload();
             // **進行中の settle render と high-res worker を cancel** (Codex P2 第 8、
             // 2026-05): 360 OFF 中も worker が走り続けると、(a) ~2.15 GB の RGBA を

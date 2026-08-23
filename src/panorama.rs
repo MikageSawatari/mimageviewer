@@ -106,6 +106,18 @@ impl PanoProjection {
         }
     }
 
+    /// 一覧の 1 行に収まる短い説明。`description` を上バーの幅へ詰めたもので、
+    /// 同じく評価語ではなく写像の性質を書く。
+    pub fn short_description(self) -> &'static str {
+        match self.normalized() {
+            Self::Perspective => "直線が直線のまま写る / 最大 149 度",
+            Self::Stereographic => "周辺の伸びが最も穏やか / 最大 340 度",
+            Self::Equidistant => "中心からの距離が入射角に比例 / 最大 340 度",
+            Self::EquisolidAngle => "立体角が画面上の面積に比例 / 最大 340 度",
+            Self::Unknown => unreachable!(),
+        }
+    }
+
     /// 見え方の 1 行説明 (tooltip / 環境設定)。評価語ではなく写像の性質を書く。
     pub fn description(self) -> &'static str {
         match self.normalized() {
