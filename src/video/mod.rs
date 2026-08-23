@@ -60,6 +60,9 @@ pub mod normalize_scanner;
 pub mod normalize_types;
 pub mod screenshot;
 mod seek_strip;
+// Increment 3 で VideoPlayer / presenter へ配線するまで、公開 API は意図的に未使用。
+#[allow(dead_code)]
+mod seek_strip_thumbs;
 pub(crate) mod stream;
 pub mod swscale_helpers;
 pub mod thumbnail;
