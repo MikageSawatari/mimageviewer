@@ -276,13 +276,13 @@ fn finish_retire(&mut self);
 | --- | --- |
 | `plan_begin_build` | `Mounted(previous)` |
 | `plan_commit_build` / `plan_abort_build` | `Building { .. }` |
-| `plan_mount(id)` | `Mounted(current)`。`id` の residence が `Mounted` (再入 = 空 op 列) か `AtRest`。それ以外は `Err(MountError)` |
+| `plan_mount(id)` | **panic しない。失敗はすべて `Err(MountError)`**。投影が `Building` なら `Err(residence: Building)` (App が組み立て中なので何もマウントできない)。投影が `Mounted(current)` なら、`id` の residence が `Mounted` (再入 = 空 op 列) か `AtRest` のとき `Ok`、それ以外は `Err(その residence)` |
 | `plan_fork` | `Mounted(current)`。`LiveMediaPark { window_id }` は `window_of[current] == Some(window_id)` |
 | `plan_promote` | `Mounted(current)` かつ **`current == main`** |
 | `begin_retire(id)` | `id` の residence が `AtRest`。それ以外は `Err(MountError)` |
 | `plan_finish_retire(id)` | `slots[id] == Slot::Retiring` |
 | 各 `finish_*` | `pending` が対応する variant。違えば panic |
-| **すべての `plan_*` と `begin_retire`** | **`pending` が `None`**。既に transaction が進行中なら panic (前の op 列を実行し終えていない) |
+| **すべての `plan_*` と `begin_retire`** | **`pending` が `None`**。既に transaction が進行中なら panic (前の op 列を実行し終えていない)。⚠ この行は `pending` の話だけで、`plan_mount` / `begin_retire` の**対象 id の状態は panic ではなく `Err(MountError)`** で返す (設計 §4.1 の「`Option` を返さない」= 呼び出し元に理由を渡す) |
 | `retiring_slot_mut` | `pending` が `None` (digest は op 列の外) |
 
 op 列の中身 (設計 §7 ①の表と一致させること):

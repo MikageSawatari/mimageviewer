@@ -128,6 +128,7 @@ pub(crate) use subfolder_expansion::{
     SUBFOLDER_EXPANSION_FILTER_KINDS, SubfolderExpansionDepthChoice, SubfolderExpansionScanFilter,
 };
 pub(crate) mod top_level_grid_view;
+mod viewer_context_registry;
 #[cfg(windows)]
 mod viewer_session;
 mod vram_accounting;
