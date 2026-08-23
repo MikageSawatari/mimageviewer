@@ -1893,7 +1893,15 @@ passive detached は通常どおり release で窓を activate するが、選�
   全呼び出しを `resolve_fs_transform_in_layout_rect` 経由に寄せる。ガードが既に存在して
   文書化までされているのに 2 経路が素通りしている状態を、分岐追加ではなく入口の一本化で閉じる。
 - 規模 / 優先度: 中 / P2 (表示の破綻だが開き直せば復帰する。凍結領域なので構造修正が前提)。
-- 関連: [docs/detached-rework-plan.md](detached-rework-plan.md) §2 (憲法) / BA-7、
+- **2026-08-23 追記 — §1.115 と根が同じ。** 最大化された別ウィンドウが表示されている間、
+  placement 更新が**毎フレーム走り、82/82 が中身の変わらない書き込み**であることを
+  `MIV_DETACHED_WINDOW_DEBUG` のログで確認した。maximized 分岐が実測 rect を捨てて restore 用
+  seed の w/h を書き戻すため ([app.rs:43782](../src/app.rs:43782))、最大化中の placement は
+  実ジオメトリを表さない。**Codex がここで指摘した「bake は placement の w/h、draw は最大化
+  viewport の `full_rect`」というズレの供給源がこれ。** 直し方は §1.115 の案 A
+  (現在ジオメトリと restore ジオメトリを別に持つ) で、両方の入力が同時に正しくなる。
+- 関連: §1.115 (**同じ根**。最大化中のちらつき)、
+  [docs/detached-rework-plan.md](detached-rework-plan.md) §2 (憲法) / BA-7、
   findings-12 D3 (同型の App-global 汚染)。
 
 ## 3. 補正 / AI
