@@ -8,9 +8,13 @@ backlog [§1.102](next-release-backlog.md) (YouTube 型のサムネイル列) �
 
 作業ブランチ `video-strip` (worktree `C:\home\mimageviewer-video-strip`)。
 
-実装状況 (2026-08-23): Increment 1 の軸・窓・gesture 純ロジック、Increment 2 のサムネイル抽出
-worker に続き、Increment 3 で thumbnail mode の App owner、設定、描画、入力、HUD region、
-tile/hover preview との排他を接続した。mode 設定・mode button・waveform は Increment 4 まで置かない。
+実装状況 (2026-08-23): Increment 1 (軸・窓・gesture の純ロジック) / Increment 2 (サムネイル抽出
+worker) / Increment 3 (App owner・設定・描画・入力・HUD region・tile と hover preview の排他、
+**実機確認済み**) / Increment 4 (波形モード・モード切替・`video_seek_strip_mode`) まで実装。
+残りは §9 の未確定項目の実機調整と、MPEG-TS など `TimeGrid` 経路の実素材確認。
+
+確定した既定値: 開閉は `Shift+S` (`V` はレーン C の動画パノラマ用に空けた)、最小間隔 2.0 秒、
+抽出幅 320px、波形は 1 画面 60 秒、セル 152x104pt。
 
 ## 1. 何を作るか
 
