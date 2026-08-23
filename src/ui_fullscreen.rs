@@ -3165,6 +3165,35 @@ fn vertical_reading_trim_removable_positions(
 }
 
 /// バー内ボタンのサイズ
+/// 上バーのポップアップ内で、アイコン列の右にテキストを置き始める位置。
+const PANORAMA_PROJECTION_POPUP_TEXT_LEFT: f32 = 48.0;
+
+/// 上バーのポップアップ余白 (画面端との最小距離)。
+const BAR_POPUP_SCREEN_MARGIN: f32 = 8.0;
+
+/// 上バーのボタンから吊り下がるポップアップを画面内へ収める。
+///
+/// ボタンは右端から左へ並ぶので、**右寄りのボタンでは左寄せのままだと画面外へ出る**
+/// (360 表示中の投影ボタンは × / 鍵の隣で、実際に切れていた)。左上を動かすだけで、
+/// 大きさは変えない。画面より大きいポップアップは左上に貼り付けて、はみ出す側を
+/// 右下に寄せる (縮めると中身が読めなくなるため)。
+fn clamp_bar_popup_rect(
+    full_rect: egui::Rect,
+    anchor_x: f32,
+    top: f32,
+    size: egui::Vec2,
+) -> egui::Rect {
+    let margin = BAR_POPUP_SCREEN_MARGIN;
+    let min_x = full_rect.min.x + margin;
+    let max_x = full_rect.max.x - margin - size.x;
+    // 画面が狭くて収まらない場合は max_x < min_x になる。左端優先で貼る。
+    let x = anchor_x.min(max_x).max(min_x);
+    let min_y = full_rect.min.y + margin;
+    let max_y = full_rect.max.y - margin - size.y;
+    let y = top.min(max_y).max(min_y);
+    egui::Rect::from_min_size(egui::pos2(x, y), size)
+}
+
 pub(crate) const BAR_BUTTON_SIZE: f32 = 32.0;
 /// バー内ボタンの上下マージン
 pub(crate) const BAR_BUTTON_MARGIN: f32 = 6.0;
@@ -29934,13 +29963,37 @@ impl App {
         }
 
         if *panorama_projection_popup_open && !is_video && panorama_active {
-            let popup_w = 260.0_f32;
             let row_h = 40.0_f32;
-            let popup_h = crate::panorama::PanoProjection::all().len() as f32 * row_h + 36.0;
-            let popup_rect = egui::Rect::from_min_size(
-                egui::pos2(projection_resp_rect.min.x, bar_rect.max.y + 4.0),
-                egui::vec2(popup_w, popup_h),
+            let label_font = egui::FontId::proportional(13.0);
+            let desc_font = egui::FontId::proportional(10.0);
+            // 幅は**実測する**。方式名と説明の長さはフォントと UI 表示倍率
+            // (`Settings::ui_scale_factor`) で変わるので、固定値だと文字が枠から出る。
+            let text_left = PANORAMA_PROJECTION_POPUP_TEXT_LEFT;
+            let mut content_w = 0.0_f32;
+            for &mode in crate::panorama::PanoProjection::all() {
+                for (text, font) in [
+                    (mode.label(), &label_font),
+                    (mode.short_description(), &desc_font),
+                ] {
+                    let w = ui
+                        .painter()
+                        .layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::WHITE)
+                        .rect
+                        .width();
+                    content_w = content_w.max(w);
+                }
+            }
+            let popup_size = egui::vec2(
+                text_left + content_w + 16.0,
+                crate::panorama::PanoProjection::all().len() as f32 * row_h + 36.0,
             );
+            let popup_rect = clamp_bar_popup_rect(
+                full_rect,
+                projection_resp_rect.min.x,
+                bar_rect.max.y + 4.0,
+                popup_size,
+            );
+            let popup_w = popup_rect.width();
             ui.painter().rect_filled(
                 popup_rect,
                 6.0,
@@ -29990,17 +30043,23 @@ impl App {
                 draw_panorama_projection_icon(ui.painter(), icon_center, 8.0, mode);
 
                 ui.painter().text(
-                    egui::pos2(item_rect.min.x + 44.0, item_rect.center().y - 7.0),
+                    egui::pos2(
+                        item_rect.min.x + text_left - 4.0,
+                        item_rect.center().y - 7.0,
+                    ),
                     egui::Align2::LEFT_CENTER,
                     mode.label(),
-                    egui::FontId::proportional(13.0),
+                    label_font.clone(),
                     egui::Color32::from_gray(220),
                 );
                 ui.painter().text(
-                    egui::pos2(item_rect.min.x + 44.0, item_rect.center().y + 8.0),
+                    egui::pos2(
+                        item_rect.min.x + text_left - 4.0,
+                        item_rect.center().y + 8.0,
+                    ),
                     egui::Align2::LEFT_CENTER,
                     mode.short_description(),
-                    egui::FontId::proportional(10.0),
+                    desc_font.clone(),
                     egui::Color32::from_gray(150),
                 );
 
@@ -37032,9 +37091,19 @@ mod tests {
         is_spread_double: bool,
         initial_reading_flow: ReadingFlow,
     ) -> Vec<(egui::Id, f32)> {
+        fullscreen_top_bar_render_for_test(is_spread_double, initial_reading_flow, false).0
+    }
+
+    /// 上バーを 1 フレーム描いて、ボタン位置と (360 表示中なら) 投影一覧の項目矩形を返す。
+    fn fullscreen_top_bar_render_for_test(
+        is_spread_double: bool,
+        initial_reading_flow: ReadingFlow,
+        panorama_projection_list_open: bool,
+    ) -> (Vec<(egui::Id, f32)>, Vec<egui::Rect>) {
         let ctx = egui::Context::default();
         let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
         let mut positions = Vec::new();
+        let mut projection_items = Vec::new();
         let raw_input = egui::RawInput {
             screen_rect: Some(full_rect),
             ..Default::default()
@@ -37053,7 +37122,7 @@ mod tests {
                     let mut slideshow_end_action = SlideshowEndAction::default();
                     let mut rotation_choice = None;
                     let mut panorama_pressed = false;
-                    let mut panorama_projection_popup_open = false;
+                    let mut panorama_projection_popup_open = panorama_projection_list_open;
                     let mut panorama_projection_choice = None;
                     let mut spread_mode = SpreadMode::Ltr;
                     let mut reading_flow = initial_reading_flow;
@@ -37093,9 +37162,12 @@ mod tests {
                         &mut slideshow_end_action,
                         crate::rotation_db::Rotation::None,
                         &mut rotation_choice,
-                        None,
-                        false,
-                        false,
+                        // 投影一覧を出すシナリオでは 360 表示中として描く
+                        // (投影ボタンはそのときだけ現れる)。
+                        panorama_projection_list_open
+                            .then_some(crate::panorama::PanoramaTrigger::Auto),
+                        panorama_projection_list_open,
+                        panorama_projection_list_open,
                         &mut panorama_pressed,
                         crate::panorama::PanoProjection::Perspective,
                         &mut panorama_projection_popup_open,
@@ -37143,9 +37215,57 @@ mod tests {
                         .into_iter()
                         .map(|(id, rect)| (id, rect.min.x))
                         .collect();
+                    projection_items = crate::panorama::PanoProjection::all()
+                        .iter()
+                        .filter_map(|mode| {
+                            ctx.read_response(egui::Id::new((
+                                "fs_panorama_projection_item",
+                                mode.shader_code(),
+                            )))
+                            .map(|response| response.rect)
+                        })
+                        .collect();
                 });
         });
-        positions
+        (positions, projection_items)
+    }
+
+    /// 投影ボタンは × / 鍵の隣 (右端寄り) にあるので、そこから吊り下げる一覧が
+    /// 画面外へ出ていた (2026-08 利用者報告)。実際に上バーを描いて、一覧の各行が
+    /// 画面内に収まることを確かめる。純関数のクランプだけでなく、描画経路で見る。
+    #[test]
+    fn the_projection_list_rows_stay_inside_the_screen() {
+        let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
+        let (_, rows) = fullscreen_top_bar_render_for_test(false, ReadingFlow::Paged, true);
+        assert_eq!(
+            rows.len(),
+            crate::panorama::PanoProjection::all().len(),
+            "every projection must get a row"
+        );
+        for rect in &rows {
+            assert!(
+                full_rect.contains_rect(*rect),
+                "projection row {rect:?} escaped the screen {full_rect:?}"
+            );
+        }
+        // 行は縦に重ならずに並ぶ。
+        let mut sorted = rows.clone();
+        sorted.sort_by(|a, b| a.min.y.total_cmp(&b.min.y));
+        for pair in sorted.windows(2) {
+            assert!(
+                pair[0].max.y <= pair[1].min.y + 0.5,
+                "rows overlap: {:?} / {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    /// 360 表示中でなければ投影一覧は描かれない (ボタン自体が出ないため)。
+    #[test]
+    fn the_projection_list_is_absent_outside_panorama_mode() {
+        let (_, rows) = fullscreen_top_bar_render_for_test(false, ReadingFlow::Paged, false);
+        assert!(rows.is_empty());
     }
 
     #[test]
@@ -43765,6 +43885,45 @@ mod tests {
         ] {
             assert!(!still_side_panel_chrome_enabled(suppressed));
         }
+    }
+
+    /// 上バーのボタンは右端から左へ並ぶので、右寄りのボタンから吊り下げた一覧は
+    /// 左寄せのままだと画面外へ出る (投影ボタンは × / 鍵の隣で、実際に切れていた)。
+    #[test]
+    fn a_popup_hanging_off_a_right_edge_button_stays_on_screen() {
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let size = egui::vec2(260.0, 200.0);
+
+        // 右端から 3 ボタンぶんの位置 (= 360 表示中の投影ボタン相当)。
+        let anchor_x = full.max.x - 3.0 * (BAR_BUTTON_SIZE + BAR_BUTTON_GAP);
+        let clamped = clamp_bar_popup_rect(full, anchor_x, 40.0, size);
+        assert!(
+            clamped.max.x <= full.max.x,
+            "popup must not overflow: {clamped:?}"
+        );
+        assert_eq!(
+            clamped.size(),
+            size,
+            "clamping moves the popup, never resizes it"
+        );
+
+        // 十分に左のボタンでは、押した位置に素直に吊り下がる。
+        let left_anchor = full.min.x + 100.0;
+        let natural = clamp_bar_popup_rect(full, left_anchor, 40.0, size);
+        assert_eq!(natural.min.x, left_anchor);
+        assert_eq!(natural.min.y, 40.0);
+
+        // 画面より大きい一覧は左上へ貼る (縮めて読めなくしない)。
+        let narrow = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 120.0));
+        let overflowing = clamp_bar_popup_rect(narrow, 150.0, 40.0, size);
+        assert_eq!(
+            overflowing.min,
+            egui::pos2(
+                narrow.min.x + BAR_POPUP_SCREEN_MARGIN,
+                narrow.min.y + BAR_POPUP_SCREEN_MARGIN
+            )
+        );
+        assert_eq!(overflowing.size(), size);
     }
 
     /// 投影方式の一覧は上バーのボタンから吊り下がる。バーが隠れると一覧の
