@@ -375,8 +375,37 @@ Codex レビュー 6 巡で BLOCKER 0 に到達。**正本は同じファイル
 ステージ①の実装指示書は
 [detached-rework-stage-r2e-1.md](detached-rework-stage-r2e-1.md) (2026-08-23)。
 `ContextTable<P>` (payload ジェネリックの状態機械) を 1 モジュール追加するだけで、
-production は `mod` 宣言 1 行しか変わらない。**モジュール外への公開は 0 件**にする
+production は `mod` 宣言 1 行しか変わらない。**モジュール外への公開は 0 件**
 (②-e で入れる監査 A4 の allowlist が空から始まる)。実機 smoke 不要。
+
+**ステージ① 完了 (2026-08-23、実装 = Codex / 検収 = ClaudeCode)。**
+`src/app/viewer_context_registry.rs` (1,400 行弱) + `src/app.rs` の `mod` 宣言 1 行のみ。
+挙動不変 (誰からも呼ばれない)。registry テスト 22 本、ライブラリ全体 6224 本が緑、
+`cargo fmt --check` clean、公開項目 0、非 test cfg 0、既存テストファイルの差分ゼロ。
+
+検収で見つかった **BLOCKER 2 件** (いずれも修正済み。②以降で同じ罠を踏まないこと):
+
+1. **`main` が指す context を retire できてしまい I4 が回復不能に壊れた。**
+   fork → 別 context を mount → 旧 main が `AtRest` → `begin_retire(main)` が通る。
+   以後 `main()` は Retired な id を指し、mount も promote もできない。
+   → `RetireError::IsMain` で拒否する。**main は `promote` で置き換えるもので、破棄しない。**
+   「`main` が非 Option だから I4 は守られる」は**誤り**だった (名前が常にあることと、
+   指す先が存在することは別)。
+2. **op ベクタのテストが fork の policy を固定していなかった。**
+   `plan_fork(LiveMediaPark)` が `ForkProjectionIntoTransient(MaterializedStillOpen)` を
+   返す実装でも全テストが通った。②-d では policy が 225 フィールドの move / clone 分けを
+   決めるので、間違えると静かに壊れる。→ 両 policy の完全一致 assert + 派生 payload の検証。
+
+**②-d への申し送り**: ①の failpoint sweep は **op と op の境目**にしか panic を注入しない。
+op の内部で binding を早く公開して正常終了までに戻す実装は検出できない。production の
+`ReplaceProjectionWithFreshEmpty` / `RestoreProjectionAndDropDisplacedEmpty` は
+`swap_viewer_context_bundle` を通り、その中で rating 同期と visible index 再構築が走る
+= **op の内部で panic し得る**。②-d では swap の内側にも failpoint を刺すこと。
+
+次は **②-pre** (手書き mount 18 箇所の helper 化)。⚠ これは **production の挙動を変える**
+(手書き経路が panic 安全になり、panic 時に bundle が drop されなくなる) ので、
+着手前に §2 の適用範囲どおり ClaudeCode と Codex の双方で「症状パッチではなく構造的修正で
+ある」ことに合意し、§11 へ記録すること。
 
 **§1.99 / §1.100 は R2e の完成に依存しない** (ClaudeCode / Codex 双方で確認)。
 
