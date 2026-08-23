@@ -34091,6 +34091,8 @@ impl App {
         // Phase 5.5: S キーでタイルモード トグル (動画モード限定)。画像モードの
         // S (スライドショー) とは handle_video_input 先行 consume で分離する。
         let tile_key = self.keymap.consume_action(ctx, KeyAction::VideoTileMode);
+        #[cfg(windows)]
+        let seek_strip_key = self.keymap.consume_action(ctx, KeyAction::VideoSeekStrip);
         // F キーでフレームレート / Perf オーバーレイのトグル (動画モード限定)。
         // 以前 P を使っていたが、P は「現在フレームをピン留め」に再割り当てしたので
         // 移動した (F = Frames / FPS の mnemonic)。画像モードの F は未使用なので
@@ -34120,7 +34122,13 @@ impl App {
         // 横取りする。
         // (タイルモード = video_tile_* は native presenter 前提の Windows 専用機能)
         #[cfg(windows)]
-        let escape_for_tile = self.video_tile_mode_active
+        let escape_for_seek_strip = self.video_seek_strip_is_open()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        #[cfg(not(windows))]
+        let escape_for_seek_strip = false;
+        #[cfg(windows)]
+        let escape_for_tile = !escape_for_seek_strip
+            && self.video_tile_mode_active
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         #[cfg(not(windows))]
         let escape_for_tile = false;
@@ -34283,6 +34291,11 @@ impl App {
         }
         #[cfg(not(windows))]
         let _ = tile_key;
+        #[cfg(windows)]
+        if seek_strip_key {
+            self.toggle_video_seek_strip(fs_idx);
+            self.sync_native_video_seek_strip(ctx, fs_idx);
+        }
         if perf_key {
             self.video_perf_overlay_visible = !self.video_perf_overlay_visible;
             // perf overlay は native presenter が描画する。フラグを反転するだけでなく、
@@ -34390,9 +34403,12 @@ impl App {
                 }
             }
         }
-        // ESC は タイルモード中のみキャッチして close。フルスクリーン解脱は呼び出し側
-        // (handle_image_keys 後段) の通常 ESC で扱う。
-        if escape_for_tile {
+        // ESC はシークストリップ / タイルモード中だけ先にキャッチして close。
+        // フルスクリーン解脱は呼び出し側 (handle_image_keys 後段) の通常 ESC で扱う。
+        if escape_for_seek_strip {
+            #[cfg(windows)]
+            self.close_video_seek_strip(crate::video::seek_strip::SeekStripCloseCause::Escape);
+        } else if escape_for_tile {
             #[cfg(windows)]
             self.close_video_tile_mode();
         }

@@ -661,6 +661,8 @@ src/video/
 ├── gpu_renderer/           # decoder + presenter の D3D11 共有基盤、unsafe 境界
 ├── dsp/                    # chain 単位 VST3 bridge / GUI / scanner / extract
 ├── thumbnail.rs            # hover / marker thumbnail worker
+├── seek_strip.rs           # seek strip の軸・窓・gesture 純ロジック
+├── seek_strip_thumbs.rs    # seek strip の窓単位 thumbnail worker
 ├── tile_thumbnails.rs      # tile mode 一括 thumbnail worker
 ├── tile_thumb_cache.rs     # tile thumbnail SQLite/WebP cache
 ├── screenshot.rs           # 現在 frame の clipboard copy
@@ -713,6 +715,19 @@ thumbnail decoder を入れると動画→動画 fast-swap が恒常的に詰ま
 `FullscreenVideoMarkerCache` にデコード済み RGBA を載せて即表示する。DB の WebP
 BLOB 読み出しと WebP→RGBA decode は `video-marker-thumbs` worker で行い、UI thread
 側は pin/bookmark の軽量メタ (pts/title) だけを同期取得する。
+
+動画シークストリップは `src/app/native_video.rs` の `VideoSeekStripState` が開閉、
+`center_index`、解決済み `StripAxis`、`SeekStripThumbnailWorker` を 1 session として所有する。
+worker はストリップを初めて開いたときだけ起動し、索引の列挙、採用する場面の選択、
+SQLite/WebP 読み込み、未取得画像の抽出を UI thread の外で行う。要求は可視窓と進行方向 1 画面分の
+latest-wins で、取得済み画像は窓を動かしても再利用する。最小間隔の設定変更は全索引から採用列だけを
+作り直し、永続キャッシュは無効化しない。閉じる、動画切替、fullscreen 終了では session owner が
+`cancel()` して payload を外す。
+
+App は毎 frame、所有権を持つ `NativeOverlaySeekStrip` payload を native presenter へ渡す。
+presenter はタイル overlay と同じ境界で RGBA を texture 化し、シーク行の直上へ等幅セル、連続する
+小数位置、固定中央線、軸外の空セルを描く。ドラッグ中は App の `center_index` だけを更新し、release の
+1 回だけ補間時刻へ精密 seek する。hover の単発 preview と tile overlay は排他的に扱う。
 
 ### 各ファイルの責務
 

@@ -8,6 +8,10 @@ backlog [§1.102](next-release-backlog.md) (YouTube 型のサムネイル列) �
 
 作業ブランチ `video-strip` (worktree `C:\home\mimageviewer-video-strip`)。
 
+実装状況 (2026-08-23): Increment 1 の軸・窓・gesture 純ロジック、Increment 2 のサムネイル抽出
+worker に続き、Increment 3 で thumbnail mode の App owner、設定、描画、入力、HUD region、
+tile/hover preview との排他を接続した。mode 設定・mode button・waveform は Increment 4 まで置かない。
+
 ## 1. 何を作るか
 
 動画のシークバーから**上へドラッグしたときだけ開く帯 (ストリップ)**。中身は

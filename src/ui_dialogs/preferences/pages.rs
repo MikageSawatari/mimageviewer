@@ -6199,6 +6199,29 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
             );
         });
 
+        ui.add_space(8.0);
+        anchored(ui, state, "video/seek-strip-interval", |ui, state| {
+            let s = &mut state.settings;
+            ui.horizontal(|ui| {
+                ui.label("シークストリップの画像間隔 (秒)");
+                ui.add(
+                    egui::DragValue::new(&mut s.video_seek_strip_min_interval_secs)
+                        .range(
+                            crate::settings::VIDEO_SEEK_STRIP_MIN_INTERVAL_MIN_SECS
+                                ..=crate::settings::VIDEO_SEEK_STRIP_MIN_INTERVAL_MAX_SECS,
+                        )
+                        .speed(0.1)
+                        .fixed_decimals(1),
+                );
+            });
+            ui.label(
+                egui::RichText::new(
+                    "大きいほど、ストリップ 1 画面でより長い時間を見渡せるため、大まかな位置を探す用途に向きます。0.0 は利用できる画像を間引かずに表示します。",
+                )
+                .small(),
+            );
+        });
+
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(8.0);

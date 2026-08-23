@@ -4403,6 +4403,9 @@ pub struct Settings {
     /// シークバー上のプレビューで許容する表示位置との差 (秒)。
     #[serde(default = "default_video_seek_thumbnail_tolerance_secs")]
     pub video_seek_thumbnail_tolerance_secs: f64,
+    /// シークストリップで採用する画像どうしの最小間隔 (秒)。0.0 は間引かない。
+    #[serde(default = "default_video_seek_strip_min_interval_secs")]
+    pub video_seek_strip_min_interval_secs: f64,
     /// native 動画プレゼンターの上部情報バーを常時表示し、映像領域から除外する。
     #[serde(default)]
     pub video_top_bar_locked: bool,
@@ -5071,8 +5074,16 @@ pub const VIDEO_SEEK_THUMBNAIL_TOLERANCE_MIN_SECS: f64 = 0.0;
 pub const VIDEO_SEEK_THUMBNAIL_TOLERANCE_MAX_SECS: f64 = 30.0;
 pub const VIDEO_SEEK_THUMBNAIL_TOLERANCE_DEFAULT_SECS: f64 = 1.0;
 
+pub const VIDEO_SEEK_STRIP_MIN_INTERVAL_MIN_SECS: f64 = 0.0;
+pub const VIDEO_SEEK_STRIP_MIN_INTERVAL_MAX_SECS: f64 = 60.0;
+pub const VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS: f64 = 2.0;
+
 fn default_video_seek_thumbnail_tolerance_secs() -> f64 {
     VIDEO_SEEK_THUMBNAIL_TOLERANCE_DEFAULT_SECS
+}
+
+fn default_video_seek_strip_min_interval_secs() -> f64 {
+    VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS
 }
 
 /// グリッド列数の最小値
@@ -5690,6 +5701,7 @@ impl Default for Settings {
             video_volume: default_video_volume(),
             video_playback_speed: default_video_playback_speed(),
             video_seek_thumbnail_tolerance_secs: default_video_seek_thumbnail_tolerance_secs(),
+            video_seek_strip_min_interval_secs: default_video_seek_strip_min_interval_secs(),
             video_top_bar_locked: false,
             video_seek_bar_locked: false,
             video_autoplay: false,
@@ -6624,6 +6636,8 @@ impl Settings {
         let video_playback_speed_before_sanitize = settings.video_playback_speed;
         let video_seek_thumbnail_tolerance_before_sanitize =
             settings.video_seek_thumbnail_tolerance_secs;
+        let video_seek_strip_min_interval_before_sanitize =
+            settings.video_seek_strip_min_interval_secs;
         let vst3_migrated = settings.migrate_vst3_legacy();
         let video_loop_migrated = settings.migrate_legacy_video_loop();
         let archive_file_handling_migrated = settings.migrate_legacy_archive_file_handling();
@@ -6681,6 +6695,9 @@ impl Settings {
         let video_seek_thumbnail_tolerance_sanitized =
             settings.video_seek_thumbnail_tolerance_secs.to_bits()
                 != video_seek_thumbnail_tolerance_before_sanitize.to_bits();
+        let video_seek_strip_min_interval_sanitized =
+            settings.video_seek_strip_min_interval_secs.to_bits()
+                != video_seek_strip_min_interval_before_sanitize.to_bits();
 
         // バージョン跨ぎの安全網 (#4) を SQLite 版に置換:
         // - 旧版は `settings.json` を `settings.json.preupgrade-v<old>` に std::fs::copy
@@ -6737,6 +6754,7 @@ impl Settings {
             || video_volume_sanitized
             || video_playback_speed_sanitized
             || video_seek_thumbnail_tolerance_sanitized
+            || video_seek_strip_min_interval_sanitized
             || mouse_nav_clean_install_defaulted
             || grid_click_selection_mode_migrated
             || legacy_keymap_import.changed
@@ -7118,6 +7136,15 @@ impl Settings {
                 )
             } else {
                 VIDEO_SEEK_THUMBNAIL_TOLERANCE_DEFAULT_SECS
+            };
+        self.video_seek_strip_min_interval_secs =
+            if self.video_seek_strip_min_interval_secs.is_finite() {
+                self.video_seek_strip_min_interval_secs.clamp(
+                    VIDEO_SEEK_STRIP_MIN_INTERVAL_MIN_SECS,
+                    VIDEO_SEEK_STRIP_MIN_INTERVAL_MAX_SECS,
+                )
+            } else {
+                VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS
             };
         // 0 は SegmentRing が表現できず、極端な直接編集値はメモリを際限なく予約し得る。
         // 2 秒 x 300 本 (= 10 分) を設定値として許す上限にする。
@@ -10780,6 +10807,29 @@ mod tests {
         assert_eq!(
             settings.video_seek_thumbnail_tolerance_secs,
             VIDEO_SEEK_THUMBNAIL_TOLERANCE_DEFAULT_SECS
+        );
+    }
+
+    #[test]
+    fn sanitize_clamps_video_seek_strip_min_interval() {
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.video_seek_strip_min_interval_secs,
+            VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS
+        );
+
+        settings.video_seek_strip_min_interval_secs = 99.0;
+        settings.sanitize();
+        assert_eq!(
+            settings.video_seek_strip_min_interval_secs,
+            VIDEO_SEEK_STRIP_MIN_INTERVAL_MAX_SECS
+        );
+
+        settings.video_seek_strip_min_interval_secs = f64::NAN;
+        settings.sanitize();
+        assert_eq!(
+            settings.video_seek_strip_min_interval_secs,
+            VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS
         );
     }
 

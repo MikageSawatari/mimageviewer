@@ -129,6 +129,19 @@ impl StripAxis {
         }
         Some(lower_index as f64 + (time_secs - lower_time) / gap)
     }
+
+    /// 保持済みの全キーフレームはそのままに、採用リストだけを作り直す。
+    ///
+    /// 設定変更でサムネイルキャッシュを無効化しないための境界でもある。
+    pub(crate) fn with_minimum_gap(&self, min_gap_secs: f64) -> Self {
+        match self {
+            Self::KeyframeIndex { keyframes, .. } => Self::KeyframeIndex {
+                keyframes: keyframes.clone(),
+                adopted: thin_keyframes(keyframes, min_gap_secs),
+            },
+            Self::TimeGrid { .. } => self.clone(),
+        }
+    }
 }
 
 fn time_grid_cell_count(interval_secs: f64, duration_secs: f64) -> usize {
@@ -427,6 +440,134 @@ fn subtract_range(current: &CellRange, previous: &CellRange) -> Vec<CellRange> {
 
 const SEEK_ROW_GESTURE_THRESHOLD_POINTS: f32 = 24.0;
 
+/// ストリップを開けるかを決めるための、描画や App state に依存しない入力。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct SeekStripOpenContext {
+    pub(crate) has_video: bool,
+    pub(crate) duration_secs: f64,
+    pub(crate) tile_mode_open: bool,
+    pub(crate) audio_only: bool,
+    pub(crate) hud_dimmed: bool,
+}
+
+/// 現在の動画 surface でストリップを開いてよいか。
+pub(crate) fn seek_strip_may_open(context: SeekStripOpenContext) -> bool {
+    context.has_video
+        && context.duration_secs.is_finite()
+        && context.duration_secs > 0.0
+        && !context.tile_mode_open
+        && !context.audio_only
+        && !context.hud_dimmed
+}
+
+/// ストリップを閉じる lifecycle 境界。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeekStripCloseCause {
+    Toggle,
+    DownwardDrag,
+    Escape,
+    HudHidden,
+    VideoChanged,
+    FullscreenExit,
+    TileModeOpened,
+    Unavailable,
+}
+
+/// ストリップとタイル一覧の排他 surface。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SeekStripSurface {
+    #[default]
+    Neither,
+    Strip,
+    Tile,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SeekStripSurfaceIntent {
+    ToggleStrip { may_open: bool },
+    OpenStrip { may_open: bool },
+    CloseStrip(SeekStripCloseCause),
+    ToggleTile,
+}
+
+/// 2 つの動画探索 surface の排他とストリップの close 条件を 1 箇所で決める。
+pub(crate) fn decide_seek_strip_surface(
+    current: SeekStripSurface,
+    intent: SeekStripSurfaceIntent,
+) -> SeekStripSurface {
+    match intent {
+        SeekStripSurfaceIntent::ToggleStrip { may_open } => match current {
+            SeekStripSurface::Strip => SeekStripSurface::Neither,
+            SeekStripSurface::Neither if may_open => SeekStripSurface::Strip,
+            other => other,
+        },
+        SeekStripSurfaceIntent::OpenStrip { may_open } => match current {
+            SeekStripSurface::Neither if may_open => SeekStripSurface::Strip,
+            other => other,
+        },
+        SeekStripSurfaceIntent::CloseStrip(_) => match current {
+            SeekStripSurface::Strip => SeekStripSurface::Neither,
+            other => other,
+        },
+        SeekStripSurfaceIntent::ToggleTile => match current {
+            SeekStripSurface::Tile => SeekStripSurface::Neither,
+            SeekStripSurface::Neither | SeekStripSurface::Strip => SeekStripSurface::Tile,
+        },
+    }
+}
+
+/// ドラッグ開始時の中心と水平方向の総移動量から、新しい中心位置を求める。
+///
+/// 軸外へはクランプしない。描画側がその分を空セルとして残し、seek 時だけ軸が端へ
+/// クランプする。
+pub(crate) fn center_index_after_drag(
+    origin_center_index: f64,
+    drag_delta_x: f32,
+    cell_width: f32,
+) -> Option<f64> {
+    if !origin_center_index.is_finite()
+        || !drag_delta_x.is_finite()
+        || !cell_width.is_finite()
+        || cell_width <= 0.0
+    {
+        return None;
+    }
+    Some(origin_center_index - f64::from(drag_delta_x / cell_width))
+}
+
+/// ストリップ上の x 座標を、そのセル位置へ変換する。
+pub(crate) fn center_index_at_pointer(
+    center_index: f64,
+    pointer_x: f32,
+    marker_x: f32,
+    cell_width: f32,
+) -> Option<f64> {
+    center_index_after_drag(center_index, marker_x - pointer_x, cell_width)
+}
+
+/// ストリップ上で始めたドラッグが、下のシーク行へ戻って close する動きか。
+pub(crate) fn strip_drag_closes_downward(
+    drag_delta: eframe::egui::Vec2,
+    pointer_y: f32,
+    seek_row_top: f32,
+) -> bool {
+    drag_delta.y > SEEK_ROW_GESTURE_THRESHOLD_POINTS
+        && drag_delta.y > drag_delta.x.abs()
+        && pointer_y >= seek_row_top
+}
+
+/// App がストリップの非同期結果を取り込むために次の repaint を予約すべき状態。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SeekStripRepaintContext {
+    pub(crate) visible_cells_pending: bool,
+    pub(crate) drag_active: bool,
+}
+
+/// 可視セルが未決着か、ストリップ自身のドラッグが続いている間だけ polling する。
+pub(crate) fn seek_strip_needs_repaint(context: SeekStripRepaintContext) -> bool {
+    context.visible_cells_pending || context.drag_active
+}
+
 /// シーク行で開始した 1 ドラッグの決着状態。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum SeekRowGesture {
@@ -723,5 +864,119 @@ mod tests {
     fn downward_gesture_is_scrub() {
         let mut gesture = SeekRowGesture::new(pos2(100.0, 100.0));
         assert_eq!(gesture.update(pos2(100.0, 125.0)), SeekRowDecision::Scrub);
+    }
+
+    #[test]
+    fn open_policy_requires_a_ready_exclusive_video_surface() {
+        let ready = SeekStripOpenContext {
+            has_video: true,
+            duration_secs: 120.0,
+            tile_mode_open: false,
+            audio_only: false,
+            hud_dimmed: false,
+        };
+        assert!(seek_strip_may_open(ready));
+        assert!(!seek_strip_may_open(SeekStripOpenContext {
+            tile_mode_open: true,
+            ..ready
+        }));
+        assert!(!seek_strip_may_open(SeekStripOpenContext {
+            audio_only: true,
+            ..ready
+        }));
+        assert!(!seek_strip_may_open(SeekStripOpenContext {
+            hud_dimmed: true,
+            ..ready
+        }));
+        assert!(!seek_strip_may_open(SeekStripOpenContext {
+            duration_secs: 0.0,
+            ..ready
+        }));
+    }
+
+    #[test]
+    fn strip_and_tile_surface_transitions_are_mutually_exclusive() {
+        let opened = decide_seek_strip_surface(
+            SeekStripSurface::Neither,
+            SeekStripSurfaceIntent::OpenStrip { may_open: true },
+        );
+        assert_eq!(opened, SeekStripSurface::Strip);
+        assert_eq!(
+            decide_seek_strip_surface(opened, SeekStripSurfaceIntent::ToggleTile),
+            SeekStripSurface::Tile
+        );
+        assert_eq!(
+            decide_seek_strip_surface(
+                SeekStripSurface::Tile,
+                SeekStripSurfaceIntent::ToggleStrip { may_open: true },
+            ),
+            SeekStripSurface::Tile
+        );
+    }
+
+    #[test]
+    fn every_declared_close_cause_closes_an_open_strip() {
+        let causes = [
+            SeekStripCloseCause::Toggle,
+            SeekStripCloseCause::DownwardDrag,
+            SeekStripCloseCause::Escape,
+            SeekStripCloseCause::HudHidden,
+            SeekStripCloseCause::VideoChanged,
+            SeekStripCloseCause::FullscreenExit,
+            SeekStripCloseCause::TileModeOpened,
+            SeekStripCloseCause::Unavailable,
+        ];
+        for cause in causes {
+            assert_eq!(
+                decide_seek_strip_surface(
+                    SeekStripSurface::Strip,
+                    SeekStripSurfaceIntent::CloseStrip(cause),
+                ),
+                SeekStripSurface::Neither
+            );
+        }
+    }
+
+    #[test]
+    fn drag_mapping_is_continuous_and_leaves_axis_overscroll_unclamped() {
+        assert_close(center_index_after_drag(10.5, 75.0, 150.0), 10.0);
+        assert_close(center_index_after_drag(0.0, 300.0, 150.0), -2.0);
+        assert_close(center_index_at_pointer(4.25, 400.0, 250.0, 150.0), 5.25);
+        assert!(strip_drag_closes_downward(
+            eframe::egui::vec2(8.0, 28.0),
+            500.0,
+            490.0
+        ));
+        assert!(!strip_drag_closes_downward(
+            eframe::egui::vec2(30.0, 28.0),
+            500.0,
+            490.0
+        ));
+    }
+
+    #[test]
+    fn repaint_polling_stops_when_visible_cells_are_settled_and_drag_is_idle() {
+        assert!(!seek_strip_needs_repaint(SeekStripRepaintContext::default()));
+        assert!(seek_strip_needs_repaint(SeekStripRepaintContext {
+            visible_cells_pending: true,
+            drag_active: false,
+        }));
+        assert!(seek_strip_needs_repaint(SeekStripRepaintContext {
+            visible_cells_pending: false,
+            drag_active: true,
+        }));
+    }
+
+    #[test]
+    fn rebuilding_minimum_gap_preserves_full_index_and_changes_only_adoption() {
+        let axis = keyframe_axis(&[0.0, 1.0, 2.1, 4.5], &[0, 1, 2, 3]);
+        let rebuilt = axis.with_minimum_gap(2.0);
+        assert_eq!(
+            rebuilt,
+            StripAxis::KeyframeIndex {
+                keyframes: vec![0.0, 1.0, 2.1, 4.5],
+                adopted: vec![0, 2, 3],
+            }
+        );
     }
 }

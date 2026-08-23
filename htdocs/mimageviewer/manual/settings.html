@@ -861,6 +861,11 @@
             <td>大きいほど、シークバーで場面を探すときのプレビューが早く表示されます。0.0 は位置の正確さを優先します。大きめの値で構いません。迷ったら大きめにしてください。値を上げても、実際のズレはその動画で利用できる近い場面までに限られます。</td>
             <td>1.0</td>
           </tr>
+          <tr>
+            <td>シークストリップの画像間隔 (秒)</td>
+            <td>大きいほど、シークストリップ 1 画面でより長い時間を見渡せるため、大まかな位置を探す用途に向きます。0.0 は利用できる画像をすべて並べます。</td>
+            <td>2.0</td>
+          </tr>
         </tbody>
       </table>
     </div>
@@ -1162,7 +1167,7 @@
           <tr><td>PDF パスワード DB</td><td><code>%APPDATA%\mimageviewer\pdf_passwords.json</code></td><td>ファイル単位（A）</td></tr>
           <tr><td>コンテナ索引 (Ctrl+S)</td><td><code>%APPDATA%\mimageviewer\search_index.db</code></td><td>フォルダ単位（B）</td></tr>
           <tr><td>サムネイルキャッシュ</td><td><code>%APPDATA%\mimageviewer\cache\</code>（WebP 形式）</td><td>フォルダ単位（A）</td></tr>
-          <tr><td>動画タイル サムネ キャッシュ</td><td><code>%APPDATA%\mimageviewer\video_tile_thumbs.db</code>（動画のタイム ライン サムネ。<kbd>S</kbd> キーで開ける動画タイル モード用）</td><td>動画 ファイル単位（A）</td></tr>
+          <tr><td>動画の場面画像キャッシュ</td><td><code>%APPDATA%\mimageviewer\video_tile_thumbs.db</code>（<kbd>S</kbd> キーの動画タイルとシークストリップで使用。シークストリップは見た範囲の画像だけを保存）</td><td>動画 ファイル単位（A）</td></tr>
           <tr><td>変換済みアーカイブキャッシュ</td><td><code>%APPDATA%\mimageviewer\archive_cache\</code>（変換済み ZIP）+ <code>archive_cache.db</code>（マッピング）</td><td>ファイル単位（A）</td></tr>
           <tr><td>Susie プラグイン</td><td><code>%APPDATA%\mimageviewer\susie_plugins\</code>（<code>.spi</code> ファイル配置場所）</td><td>—</td></tr>
           <tr><td>ログ</td><td><code>%APPDATA%\mimageviewer\logs\</code>（動作ログ・エラーログ）</td><td>—</td></tr>

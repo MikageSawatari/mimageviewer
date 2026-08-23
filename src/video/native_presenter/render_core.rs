@@ -137,6 +137,162 @@ pub const HUD_SEEK_ROW_HEIGHT: f32 = 24.0;
 pub const HUD_CONTROLS_ROW_HEIGHT: f32 = 40.0;
 pub const HUD_BOTTOM_HEIGHT: f32 = HUD_SEEK_ROW_HEIGHT + HUD_CONTROLS_ROW_HEIGHT;
 pub const HUD_TOP_HEIGHT: f32 = 54.0;
+pub const SEEK_STRIP_HEIGHT: f32 = 104.0;
+pub const SEEK_STRIP_CELL_WIDTH: f32 = 152.0;
+
+fn native_seek_strip_rect(width: f32, height: f32) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(
+            0.0,
+            (height - HUD_BOTTOM_HEIGHT - SEEK_STRIP_HEIGHT).max(0.0),
+        ),
+        egui::vec2(width, SEEK_STRIP_HEIGHT.min(height.max(0.0))),
+    )
+}
+
+fn draw_native_seek_strip(
+    ctx: &egui::Context,
+    overlay_size: egui::Vec2,
+    strip: &NativeOverlaySeekStrip,
+    texture_ids: &HashMap<usize, egui::TextureId>,
+    drag_origin_center: &mut Option<f64>,
+    last_window_request: &mut Option<(u64, usize)>,
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
+    let strip_rect = native_seek_strip_rect(overlay_size.x, overlay_size.y);
+    let visible_count = ((strip_rect.width() / SEEK_STRIP_CELL_WIDTH).ceil() as usize)
+        .saturating_add(2)
+        .max(1);
+    let request_key = (strip.center_index.to_bits(), visible_count);
+    if *last_window_request != Some(request_key) {
+        *last_window_request = Some(request_key);
+        commands.push(NativeOverlayCommand::RequestSeekStripWindow {
+            center_index: strip.center_index,
+            visible_count,
+        });
+    }
+
+    egui::Area::new(egui::Id::new("native_video_seek_strip"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(strip_rect.min)
+        .show(ctx, |ui| {
+            ui.set_min_size(strip_rect.size());
+            let local_rect = ui.min_rect();
+            let painter = ui.painter();
+            painter.rect_filled(
+                local_rect,
+                0.0,
+                egui::Color32::from_rgba_premultiplied(0, 0, 0, 218),
+            );
+
+            let marker_x = local_rect.center().x;
+            let half_cells = local_rect.width() / (2.0 * SEEK_STRIP_CELL_WIDTH);
+            let first_index = (strip.center_index - f64::from(half_cells) - 1.0).floor() as isize;
+            let last_index = (strip.center_index + f64::from(half_cells) + 1.0).ceil() as isize;
+            for raw_index in first_index..=last_index {
+                let cell_center_x = marker_x
+                    + ((raw_index as f64 - strip.center_index) as f32) * SEEK_STRIP_CELL_WIDTH;
+                let cell_rect = egui::Rect::from_center_size(
+                    egui::pos2(cell_center_x, local_rect.center().y),
+                    egui::vec2(SEEK_STRIP_CELL_WIDTH - 4.0, SEEK_STRIP_HEIGHT - 10.0),
+                );
+                let in_axis = raw_index >= 0 && (raw_index as usize) < strip.cell_count;
+                let fill = if in_axis {
+                    egui::Color32::from_gray(24)
+                } else {
+                    egui::Color32::from_gray(10)
+                };
+                painter.rect_filled(cell_rect, 3.0, fill);
+                if in_axis {
+                    let index = raw_index as usize;
+                    if let Some(texture_id) = texture_ids.get(&index).copied()
+                        && let Some(cell) = strip.cells.iter().find(|cell| cell.index == index)
+                        && let Some(thumbnail) = cell.thumbnail.as_ref()
+                    {
+                        let fitted = fit_rect_in_rect(
+                            egui::vec2(thumbnail.width as f32, thumbnail.height as f32),
+                            cell_rect.shrink(2.0),
+                        );
+                        painter.image(
+                            texture_id,
+                            fitted,
+                            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                }
+                painter.rect_stroke(
+                    cell_rect,
+                    3.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(88)),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            painter.line_segment(
+                [
+                    egui::pos2(marker_x, local_rect.min.y + 3.0),
+                    egui::pos2(marker_x, local_rect.max.y - 3.0),
+                ],
+                egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 92, 92)),
+            );
+
+            let response = ui.interact(
+                local_rect,
+                egui::Id::new("native_video_seek_strip_drag"),
+                egui::Sense::click_and_drag(),
+            );
+            if response.hovered() || response.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            }
+            if response.drag_started() {
+                *drag_origin_center = Some(strip.center_index);
+            }
+            if response.dragged()
+                && let Some(pointer) = response.interact_pointer_pos()
+            {
+                if crate::video::seek_strip::strip_drag_closes_downward(
+                    response.drag_delta(),
+                    pointer.y,
+                    strip_rect.max.y,
+                ) {
+                    *drag_origin_center = None;
+                    commands.push(NativeOverlayCommand::CloseSeekStrip {
+                        cause: crate::video::seek_strip::SeekStripCloseCause::DownwardDrag,
+                    });
+                } else if let Some(origin) = *drag_origin_center
+                    && let Some(center_index) = crate::video::seek_strip::center_index_after_drag(
+                        origin,
+                        response.drag_delta().x,
+                        SEEK_STRIP_CELL_WIDTH,
+                    )
+                {
+                    commands.push(NativeOverlayCommand::MoveSeekStrip { center_index });
+                }
+            }
+            if response.drag_stopped()
+                && let Some(origin) = drag_origin_center.take()
+                && let Some(center_index) = crate::video::seek_strip::center_index_after_drag(
+                    origin,
+                    response.drag_delta().x,
+                    SEEK_STRIP_CELL_WIDTH,
+                )
+            {
+                commands.push(NativeOverlayCommand::CommitSeekStrip { center_index });
+            } else if response.clicked()
+                && let Some(pointer) = response.interact_pointer_pos()
+                && let Some(center_index) = crate::video::seek_strip::center_index_at_pointer(
+                    strip.center_index,
+                    pointer.x,
+                    marker_x,
+                    SEEK_STRIP_CELL_WIDTH,
+                )
+            {
+                commands.push(NativeOverlayCommand::CommitSeekStrip {
+                    center_index: center_index.round(),
+                });
+            }
+        });
+}
 
 fn seek_status_visible_for_times(
     is_seeking: bool,
@@ -678,9 +834,14 @@ struct NativeEguiOverlay {
     navigation_preview: Option<NativeOverlayNavigationPreview>,
     navigation_preview_texture: Option<(u64, egui::TextureHandle)>,
     tile_overlay: Option<NativeOverlayTileOverlay>,
+    seek_strip: Option<NativeOverlaySeekStrip>,
     ring_picker_overlay: Option<NativeOverlayRingPicker>,
     ring_guide_overlay: Option<NativeOverlayRingGuide>,
     tile_textures: HashMap<usize, (u64, egui::TextureHandle)>,
+    seek_strip_textures: HashMap<usize, (u64, egui::TextureHandle)>,
+    seek_row_gesture: Option<crate::video::seek_strip::SeekRowGesture>,
+    seek_strip_drag_origin_center: Option<f64>,
+    last_seek_strip_window_request: Option<(u64, usize)>,
     jump_textures: HashMap<usize, (u64, egui::TextureHandle)>,
     /// 直前の render_once で実際に描画した上部バーの可視状態。
     /// top_bar_visible は hover ヒステリシス用に残し、region はこの snapshot を参照する。
@@ -1080,6 +1241,20 @@ pub struct NativeOverlayTileThumbnail {
     pub width: u32,
     pub height: u32,
     pub rgba: Arc<Vec<u8>>,
+}
+
+#[derive(Clone)]
+pub struct NativeOverlaySeekStripCell {
+    pub index: usize,
+    pub target_secs: f64,
+    pub thumbnail: Option<NativeOverlayTileThumbnail>,
+}
+
+#[derive(Clone)]
+pub struct NativeOverlaySeekStrip {
+    pub center_index: f64,
+    pub cell_count: usize,
+    pub cells: Vec<NativeOverlaySeekStripCell>,
 }
 
 #[derive(Clone)]
@@ -1595,6 +1770,20 @@ pub enum NativeOverlayCommand {
     /// hover が外れて seek thumbnail 要求がもう不要 (T35)。
     /// Player 側で `clear_native_hover_thumbnail` を呼んで pump の永久リトライを止める。
     ClearSeekThumbnail,
+    OpenSeekStrip,
+    CloseSeekStrip {
+        cause: crate::video::seek_strip::SeekStripCloseCause,
+    },
+    MoveSeekStrip {
+        center_index: f64,
+    },
+    CommitSeekStrip {
+        center_index: f64,
+    },
+    RequestSeekStripWindow {
+        center_index: f64,
+        visible_count: usize,
+    },
     ToggleTileMode,
     TogglePerfOverlay,
     ToggleSidePanelMode,
@@ -4534,6 +4723,7 @@ impl NativeRenderCore {
         self.egui_overlay.as_ref().is_some_and(|overlay| {
             overlay.navigation_preview.is_some()
                 || overlay.tile_overlay.is_some()
+                || overlay.seek_strip.is_some()
                 || overlay.native_touch.first_run_help_visible()
         })
     }
@@ -4733,6 +4923,12 @@ impl NativeRenderCore {
     pub fn set_overlay_tile_overlay(&mut self, tile_overlay: Option<NativeOverlayTileOverlay>) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.set_tile_overlay(tile_overlay);
+        }
+    }
+
+    pub fn set_overlay_seek_strip(&mut self, seek_strip: Option<NativeOverlaySeekStrip>) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_seek_strip(seek_strip);
         }
     }
 
@@ -5621,9 +5817,14 @@ impl NativeEguiOverlay {
             navigation_preview: None,
             navigation_preview_texture: None,
             tile_overlay: None,
+            seek_strip: None,
             ring_picker_overlay: None,
             ring_guide_overlay: None,
             tile_textures: HashMap::new(),
+            seek_strip_textures: HashMap::new(),
+            seek_row_gesture: None,
+            seek_strip_drag_origin_center: None,
+            last_seek_strip_window_request: None,
             jump_textures: HashMap::new(),
             top_bar_drawn_visible: false,
             bottom_hud_visible: false,
@@ -5986,6 +6187,20 @@ impl NativeEguiOverlay {
                     && self.can_open_shortcut_help()
                 {
                     self.shortcut_help_open = true;
+                    self.dirty = true;
+                    return;
+                }
+                if matches!(event, NativeEvent::KeyDown(_))
+                    && !key.repeat
+                    && key.virtual_key == 0x1B
+                    && !self.text_input_active()
+                    && self.seek_strip.is_some()
+                {
+                    self.pending_overlay_commands
+                        .push(NativeOverlayCommand::CloseSeekStrip {
+                            cause: crate::video::seek_strip::SeekStripCloseCause::Escape,
+                        });
+                    self.side_panel_escape_consumed = true;
                     self.dirty = true;
                     return;
                 }
@@ -6755,6 +6970,19 @@ impl NativeEguiOverlay {
         self.dirty = true;
     }
 
+    fn set_seek_strip(&mut self, seek_strip: Option<NativeOverlaySeekStrip>) {
+        if self.seek_strip.is_none() && seek_strip.is_none() {
+            return;
+        }
+        if seek_strip.is_none() {
+            self.seek_strip_textures.clear();
+            self.seek_strip_drag_origin_center = None;
+            self.last_seek_strip_window_request = None;
+        }
+        self.seek_strip = seek_strip;
+        self.dirty = true;
+    }
+
     fn set_ring_picker_overlay(&mut self, picker: Option<NativeOverlayRingPicker>) {
         if self.ring_picker_overlay == picker {
             return;
@@ -6881,6 +7109,46 @@ impl NativeEguiOverlay {
         }
     }
 
+    fn sync_seek_strip_textures(&mut self) {
+        let Some(strip) = self.seek_strip.as_ref() else {
+            self.seek_strip_textures.clear();
+            return;
+        };
+        self.seek_strip_textures.retain(|index, _| {
+            strip
+                .cells
+                .iter()
+                .any(|cell| cell.index == *index && cell.thumbnail.is_some())
+        });
+        for cell in &strip.cells {
+            let Some(thumbnail) = cell.thumbnail.as_ref() else {
+                self.seek_strip_textures.remove(&cell.index);
+                continue;
+            };
+            let key = thumbnail.target_secs.to_bits()
+                ^ ((thumbnail.width as u64) << 32)
+                ^ thumbnail.height as u64;
+            if self
+                .seek_strip_textures
+                .get(&cell.index)
+                .is_some_and(|(cached_key, _)| *cached_key == key)
+            {
+                continue;
+            }
+            let size = [thumbnail.width as usize, thumbnail.height as usize];
+            if size[0] == 0 || size[1] == 0 || thumbnail.rgba.len() != size[0] * size[1] * 4 {
+                continue;
+            }
+            let image = egui::ColorImage::from_rgba_unmultiplied(size, thumbnail.rgba.as_ref());
+            let texture = self.egui_ctx.load_texture(
+                format!("native_video_seek_strip:{}", cell.index),
+                image,
+                egui::TextureOptions::LINEAR,
+            );
+            self.seek_strip_textures.insert(cell.index, (key, texture));
+        }
+    }
+
     fn sync_jump_entry_textures(&mut self) {
         self.jump_textures
             .retain(|idx, _| self.jump_entries.get(*idx).is_some());
@@ -6922,6 +7190,7 @@ impl NativeEguiOverlay {
             || self.perf_visible
             || self.navigation_preview.is_some()
             || self.tile_overlay.is_some()
+            || self.seek_strip.is_some()
             || self.hover_preview_target_secs.is_some()
             || self.frame_step_hold.is_some()
             || self.bookmark_title_edit.is_some()
@@ -7170,6 +7439,12 @@ impl NativeEguiOverlay {
                 right: width_px,
                 bottom: height_px,
             });
+        }
+        if bottom_hud_visible && self.seek_strip.is_some() && !tile_overlay_visible {
+            regions.push(rect_to_px(native_seek_strip_rect(
+                width_points,
+                height_points,
+            )));
         }
 
         // Center status (error / preparing / slow seek): `draw_native_center_status`
@@ -7695,6 +7970,7 @@ impl NativeEguiOverlay {
                     || self.video_speed_popup_open
                     || self.hover_preview_target_secs.is_some()
                     || self.tile_overlay.is_some()
+                    || self.seek_strip.is_some()
                     || self.navigation_preview.is_some(),
                 left_panel_open: self.left_panel_open.is_open(),
                 right_panel_open: self.info_panel_open.is_open(),
@@ -7712,6 +7988,7 @@ impl NativeEguiOverlay {
             || self.video_speed_popup_open
             || self.hover_preview_target_secs.is_some()
             || self.tile_overlay.is_some()
+            || self.seek_strip.is_some()
             || self.navigation_preview.is_some()
         {
             return (false, false);
@@ -7812,6 +8089,7 @@ impl NativeEguiOverlay {
         self.sync_hover_thumbnail_texture();
         self.sync_navigation_preview_texture();
         self.sync_tile_overlay_textures();
+        self.sync_seek_strip_textures();
         self.sync_jump_entry_textures();
         let ppp = self.pixels_per_point;
         let event_count = self.event_count;
@@ -7882,12 +8160,18 @@ impl NativeEguiOverlay {
         let vst3_panel = self.vst3_panel.clone();
         let mut last_emitted_vst3_panel_pos = self.last_emitted_vst3_panel_pos;
         let tile_overlay = self.tile_overlay.clone();
+        let seek_strip = self.seek_strip.clone();
         let ring_picker_overlay = self.ring_picker_overlay.clone();
         let ring_guide_overlay = self.ring_guide_overlay.clone();
         let tile_texture_ids: HashMap<usize, egui::TextureId> = self
             .tile_textures
             .iter()
             .map(|(idx, (_, texture))| (*idx, texture.id()))
+            .collect();
+        let seek_strip_texture_ids: HashMap<usize, egui::TextureId> = self
+            .seek_strip_textures
+            .iter()
+            .map(|(index, (_, texture))| (*index, texture.id()))
             .collect();
         let jump_texture_ids: HashMap<usize, egui::TextureId> = self
             .jump_textures
@@ -7912,6 +8196,7 @@ impl NativeEguiOverlay {
         let top_bar_visible = self.top_bar_visible();
         let right_panel_visible = self.right_panel_visible();
         let tile_overlay_visible = tile_overlay.is_some();
+        let seek_strip_visible = seek_strip.is_some() && !tile_overlay_visible;
         let navigation_preview_visible = navigation_preview.is_some();
         let raw_seek_status_visible = seek_status_active
             && !tile_overlay_visible
@@ -7949,6 +8234,7 @@ impl NativeEguiOverlay {
         // 早期 return に入って progress UI まで到達しない。
         let overlay_visible = navigation_preview_visible
             || tile_overlay_visible
+            || seek_strip_visible
             || bottom_hud_visible
             || panel_chrome_visible
             || perf_visible
@@ -7987,6 +8273,7 @@ impl NativeEguiOverlay {
             .unwrap_or(false);
         let cursor_blocking_status_visible = status_visible && !navigation_preview_visible;
         let cursor_blocking_overlay_visible = tile_overlay_visible
+            || seek_strip_visible
             || bottom_hud_visible
             || panel_chrome_visible
             || cursor_blocking_status_visible
@@ -8012,6 +8299,9 @@ impl NativeEguiOverlay {
         let mut hover_preview_target_secs = self.hover_preview_target_secs;
         let mut video_speed_popup_open = self.video_speed_popup_open;
         let mut frame_step_hold = self.frame_step_hold;
+        let mut seek_row_gesture = self.seek_row_gesture;
+        let mut seek_strip_drag_origin_center = self.seek_strip_drag_origin_center;
+        let mut last_seek_strip_window_request = self.last_seek_strip_window_request;
         // 実機修正 (2026-05-12 P1 #2): 実描画した preview_rect を記録して
         // `compute_hud_regions` に渡す (= region を draw rect と完全同期させる)。
         let mut last_drawn_preview_rect: Option<egui::Rect> = None;
@@ -8483,6 +8773,24 @@ impl NativeEguiOverlay {
                                 });
                             });
                     });
+            }
+
+            if let Some(strip) = seek_strip.as_ref() {
+                if bottom_hud_visible {
+                    draw_native_seek_strip(
+                        ctx,
+                        egui::vec2(overlay_width_points, overlay_height_points),
+                        strip,
+                        &seek_strip_texture_ids,
+                        &mut seek_strip_drag_origin_center,
+                        &mut last_seek_strip_window_request,
+                        &mut commands,
+                    );
+                } else {
+                    commands.push(NativeOverlayCommand::CloseSeekStrip {
+                        cause: crate::video::seek_strip::SeekStripCloseCause::HudHidden,
+                    });
+                }
             }
 
             if bottom_hud_visible {
@@ -9215,32 +9523,80 @@ impl NativeEguiOverlay {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                         }
                         if duration_secs > 0.0 {
-                            if (seek_resp.clicked() || seek_resp.dragged())
-                                && let Some(pos) = seek_resp.interact_pointer_pos()
-                            {
+                            let target_at = |pos: egui::Pos2| {
                                 let x = pos.x.clamp(bar_rect.min.x, bar_rect.max.x);
                                 let frac =
                                     ((x - bar_rect.min.x) / bar_rect.width()).clamp(0.0, 1.0);
-                                let target_secs = duration_secs * frac as f64;
-                                let should_emit = seek_resp.clicked()
-                                    || last_seek_target_secs
-                                        .map(|prev| (prev - target_secs).abs() >= 0.10)
-                                        .unwrap_or(true);
-                                if should_emit {
-                                    last_seek_target_secs = Some(target_secs);
-                                    commands.push(NativeOverlayCommand::Seek { target_secs });
+                                duration_secs * frac as f64
+                            };
+                            if seek_resp.drag_started()
+                                && let Some(origin) = seek_resp.interact_pointer_pos()
+                            {
+                                seek_row_gesture = Some(
+                                    crate::video::seek_strip::SeekRowGesture::new(origin),
+                                );
+                            }
+                            if seek_resp.clicked()
+                                && let Some(pos) = seek_resp.interact_pointer_pos()
+                            {
+                                let target_secs = target_at(pos);
+                                last_seek_target_secs = Some(target_secs);
+                                commands.push(NativeOverlayCommand::Seek { target_secs });
+                            } else if seek_resp.dragged()
+                                && let Some(pos) = seek_resp.interact_pointer_pos()
+                                && let Some(gesture) = seek_row_gesture.as_mut()
+                            {
+                                let was_open = matches!(
+                                    gesture,
+                                    crate::video::seek_strip::SeekRowGesture::OpenStrip { .. }
+                                );
+                                match gesture.update(pos) {
+                                    crate::video::seek_strip::SeekRowDecision::OpenStrip => {
+                                        if !seek_strip_visible && !was_open {
+                                            last_seek_target_secs = None;
+                                            commands.push(NativeOverlayCommand::OpenSeekStrip);
+                                        }
+                                    }
+                                    crate::video::seek_strip::SeekRowDecision::Scrub => {
+                                        let target_secs = target_at(pos);
+                                        let should_emit = last_seek_target_secs
+                                            .map(|previous| {
+                                                (previous - target_secs).abs() >= 0.10
+                                            })
+                                            .unwrap_or(true);
+                                        if should_emit {
+                                            last_seek_target_secs = Some(target_secs);
+                                            commands.push(NativeOverlayCommand::Seek {
+                                                target_secs,
+                                            });
+                                        }
+                                    }
+                                    crate::video::seek_strip::SeekRowDecision::Undecided => {}
                                 }
                             }
                             if seek_resp.drag_stopped() {
+                                if matches!(
+                                    seek_row_gesture,
+                                    Some(crate::video::seek_strip::SeekRowGesture::Undecided { .. })
+                                ) && let Some(pos) = seek_resp.interact_pointer_pos()
+                                {
+                                    commands.push(NativeOverlayCommand::Seek {
+                                        target_secs: target_at(pos),
+                                    });
+                                }
+                                seek_row_gesture = None;
                                 last_seek_target_secs = None;
                             }
+                        } else if seek_resp.drag_stopped() {
+                            seek_row_gesture = None;
+                            last_seek_target_secs = None;
                         }
                         // 動画 HUD 2 段化リデザイン (実機フィードバック反映 #2):
                         // 速度 popup が開いているときは、popup 内のアイテムを選びに行く
                         // カーソル動線が seek_row (シーク行) を横切るため、hover preview
                         // (シーク先サムネ) を発火させない。popup を閉じれば次のフレームで
                         // 通常の hover detection に戻る。
-                        let suppress_hover_preview = video_speed_popup_open;
+                        let suppress_hover_preview = video_speed_popup_open || seek_strip_visible;
                         if duration_secs > 0.0 && !suppress_hover_preview {
                             if seek_resp.hovered()
                                 && let Some(pos) = pointer_pos
@@ -9802,6 +10158,9 @@ impl NativeEguiOverlay {
         self.last_drawn_ring_guide_rect = last_drawn_ring_guide_rect;
         self.video_speed_popup_open = video_speed_popup_open;
         self.frame_step_hold = frame_step_hold;
+        self.seek_row_gesture = seek_row_gesture;
+        self.seek_strip_drag_origin_center = seek_strip_drag_origin_center;
+        self.last_seek_strip_window_request = last_seek_strip_window_request;
         self.bookmark_title_edit = bookmark_title_edit;
         self.bulk_bookmark_dialog = bulk_bookmark_dialog;
         self.video_left_panel_tab = video_left_panel_tab;

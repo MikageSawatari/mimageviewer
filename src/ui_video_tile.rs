@@ -66,6 +66,14 @@ impl App {
             self.close_video_tile_mode();
             return;
         }
+        debug_assert_eq!(
+            crate::video::seek_strip::decide_seek_strip_surface(
+                crate::video::seek_strip::SeekStripSurface::Strip,
+                crate::video::seek_strip::SeekStripSurfaceIntent::ToggleTile,
+            ),
+            crate::video::seek_strip::SeekStripSurface::Tile
+        );
+        self.close_video_seek_strip(crate::video::seek_strip::SeekStripCloseCause::TileModeOpened);
         self.video_tile_mode_active = true;
         self.video_tile_state = self.build_video_tile_state_for(fs_idx, screen_size);
         crate::logger::log(format!(
@@ -258,7 +266,7 @@ impl App {
     }
 }
 
-fn pick_interval(duration_secs: f64, max_tiles: usize) -> f64 {
+pub(crate) fn pick_interval(duration_secs: f64, max_tiles: usize) -> f64 {
     // 候補を昇順に試して、タイル数 (= ceil(duration / interval)) が max_tiles 以下に
     // 収まる **最初の** 値を採用 (= 一番細かい間隔)。
     for &c in INTERVAL_CANDIDATES_SECS {

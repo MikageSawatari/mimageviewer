@@ -11100,6 +11100,8 @@ pub struct App {
     #[cfg(windows)]
     pub(crate) video_tile_state: Option<crate::ui_video_tile::VideoTileState>,
     #[cfg(windows)]
+    video_seek_strip_state: native_video::VideoSeekStripState,
+    #[cfg(windows)]
     pub(crate) video_tile_reopen_pending: bool,
     #[cfg(windows)]
     pub(crate) video_tile_reopen_deadline: Option<std::time::Instant>,
@@ -14109,6 +14111,8 @@ impl App {
             video_tile_mode_active: false,
             #[cfg(windows)]
             video_tile_state: None,
+            #[cfg(windows)]
+            video_seek_strip_state: native_video::VideoSeekStripState::Closed,
             #[cfg(windows)]
             video_tile_reopen_pending: false,
             #[cfg(windows)]
@@ -52269,6 +52273,8 @@ impl App {
     /// `keep_fullscreen_viewport_alive` がこのフラグを見て Visible(false) を
     /// 送信し、その直後に false に落とす。ここで先に落とすと送信が抑止される。
     pub(crate) fn close_fullscreen(&mut self) {
+        #[cfg(windows)]
+        self.close_video_seek_strip(crate::video::seek_strip::SeekStripCloseCause::FullscreenExit);
         // teardown で fullscreen_idx / edit_result_cache を落とす前に、現在見えている
         // 最新の edit-result を snapshot。実際の encode / 保存は reset 系の DB 更新
         // command より後へ enqueue し、旧 preview の invalidate が後着しない順序にする。
@@ -66466,6 +66472,7 @@ impl App {
             self.sync_native_video_metadata(fs_idx);
             self.sync_native_video_timeline_markers(fs_idx);
             self.sync_native_video_tile_overlay(ctx, fs_idx);
+            self.sync_native_video_seek_strip(ctx, fs_idx);
             self.sync_native_video_vst3_available(fs_idx);
             self.sync_native_video_vst3_panel(fs_idx);
             // 音量ノーマライズの完了 poll + overlay 状態同期

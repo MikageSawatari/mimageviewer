@@ -755,6 +755,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["プレビュー", "サムネイル", "速度", "位置", "seek"]
     ),
     entry!(
+        "video/seek-strip-interval",
+        Video,
+        "シークストリップの画像間隔 (秒)",
+        ["動画", "サムネイル", "見渡す", "大まか", "seek"]
+    ),
+    entry!(
         "video/remote-streaming",
         Video,
         "リモート端末への動画配信を有効にする",

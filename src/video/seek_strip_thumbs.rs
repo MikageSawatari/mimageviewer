@@ -15,7 +15,10 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use ffmpeg_the_third as ffmpeg;
 
-use super::seek_strip::{CellRange, StripAxis, StripLookahead, compute_strip_window};
+use super::seek_strip::{
+    CellRange, StripAxis, StripAxisDecision, StripLookahead, compute_strip_window,
+    decide_strip_axis, enumerate_index_keyframes, thin_keyframes,
+};
 use super::tile_thumb_cache::TileThumbCache;
 
 /// ストリップ専用の永続キャッシュ行幅。
@@ -106,9 +109,18 @@ pub(crate) enum StripThumbnailWorkerStatus {
     ThreadSpawnFailed(String),
 }
 
+/// ワーカースレッド上で解決するストリップ軸。
+#[derive(Clone, Debug)]
+pub(crate) enum StripAxisResolution {
+    Resolving,
+    Ready(Arc<StripAxis>),
+    Failed(String),
+}
+
 /// UI がロックを保持せず参照できる現在スナップショット。
 #[derive(Clone, Debug)]
 pub(crate) struct StripThumbnailSnapshot {
+    pub(crate) axis: StripAxisResolution,
     pub(crate) cells: BTreeMap<StripCellId, StripThumbnailOutcome>,
     pub(crate) status: StripThumbnailWorkerStatus,
     pub(crate) latest_request_id: u64,
@@ -391,6 +403,7 @@ impl LatestWindowRequest {
 }
 
 struct SharedState {
+    axis: StripAxisResolution,
     cells: BTreeMap<StripCellId, StripThumbnailOutcome>,
     status: StripThumbnailWorkerStatus,
     latest_request_id: u64,
@@ -401,6 +414,7 @@ struct SharedState {
 impl SharedState {
     fn new() -> Self {
         Self {
+            axis: StripAxisResolution::Resolving,
             cells: BTreeMap::new(),
             status: StripThumbnailWorkerStatus::Running,
             latest_request_id: 0,
@@ -411,6 +425,7 @@ impl SharedState {
 
     fn snapshot(&self) -> StripThumbnailSnapshot {
         StripThumbnailSnapshot {
+            axis: self.axis.clone(),
             cells: self.cells.clone(),
             status: self.status.clone(),
             latest_request_id: self.latest_request_id,
@@ -446,13 +461,24 @@ pub(crate) struct SeekStripThumbnailWorker {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+struct SeekStripWorkerConfig {
+    path: PathBuf,
+    hw_decode: bool,
+    cache: Option<Arc<TileThumbCache>>,
+    duration_secs: f64,
+    min_gap_secs: f64,
+    fallback_interval_secs: f64,
+}
+
 impl SeekStripThumbnailWorker {
     /// ワーカーを起動する。DB と動画は生成したスレッド内でのみ触る。
     pub(crate) fn spawn(
         path: PathBuf,
         hw_decode: bool,
         cache: Option<Arc<TileThumbCache>>,
-        video_mtime: i64,
+        duration_secs: f64,
+        min_gap_secs: f64,
+        fallback_interval_secs: f64,
     ) -> Self {
         let (wake_tx, wake_rx) = bounded::<()>(1);
         let requests = Arc::new(Mutex::new(LatestWindowRequest::default()));
@@ -462,14 +488,19 @@ impl SeekStripThumbnailWorker {
         let worker_requests = Arc::clone(&requests);
         let worker_state = Arc::clone(&state);
         let worker_cancel = Arc::clone(&cancel);
+        let config = SeekStripWorkerConfig {
+            path,
+            hw_decode,
+            cache,
+            duration_secs,
+            min_gap_secs,
+            fallback_interval_secs,
+        };
         let thread_result = std::thread::Builder::new()
             .name("video-seek-strip-thumbs".into())
             .spawn(move || {
                 run_worker(
-                    path,
-                    hw_decode,
-                    cache,
-                    video_mtime,
+                    config,
                     wake_rx,
                     worker_requests,
                     worker_state,
@@ -479,8 +510,9 @@ impl SeekStripThumbnailWorker {
         let thread = match thread_result {
             Ok(handle) => Some(handle),
             Err(error) => {
-                lock_recover(&state).status =
-                    StripThumbnailWorkerStatus::ThreadSpawnFailed(error.to_string());
+                let mut shared = lock_recover(&state);
+                shared.status = StripThumbnailWorkerStatus::ThreadSpawnFailed(error.to_string());
+                shared.axis = StripAxisResolution::Failed(error.to_string());
                 None
             }
         };
@@ -623,16 +655,42 @@ impl WorkerRuntime {
 }
 
 fn run_worker(
-    path: PathBuf,
-    hw_decode: bool,
-    cache: Option<Arc<TileThumbCache>>,
-    video_mtime: i64,
+    config: SeekStripWorkerConfig,
     wake_rx: Receiver<()>,
     requests: Arc<Mutex<LatestWindowRequest>>,
     state: Arc<Mutex<SharedState>>,
     cancel: Arc<AtomicBool>,
 ) {
+    let SeekStripWorkerConfig {
+        path,
+        hw_decode,
+        cache,
+        duration_secs,
+        min_gap_secs,
+        fallback_interval_secs,
+    } = config;
     let mut runtime = WorkerRuntime::new();
+    let video_mtime = std::fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+
+    let axis = resolve_strip_axis(&path, duration_secs, min_gap_secs, fallback_interval_secs);
+    if cancel.load(Ordering::Acquire) {
+        lock_recover(&state).status = StripThumbnailWorkerStatus::Cancelled;
+        return;
+    }
+    match axis {
+        Ok(axis) => lock_recover(&state).axis = StripAxisResolution::Ready(Arc::new(axis)),
+        Err(error) => {
+            let mut shared = lock_recover(&state);
+            shared.status = StripThumbnailWorkerStatus::DecoderUnavailable(error.clone());
+            shared.axis = StripAxisResolution::Failed(error);
+            return;
+        }
+    }
 
     while !cancel.load(Ordering::Acquire) {
         let request = lock_recover(&requests).take();
@@ -670,6 +728,64 @@ fn run_worker(
 
     if cancel.load(Ordering::Acquire) {
         lock_recover(&state).status = StripThumbnailWorkerStatus::Cancelled;
+    }
+}
+
+fn fallback_strip_axis(
+    duration_secs: f64,
+    fallback_interval_secs: f64,
+) -> Result<StripAxis, String> {
+    if !duration_secs.is_finite() {
+        return Err("video duration is not finite".to_string());
+    }
+    if duration_secs <= 0.0 {
+        return Err("video duration is not positive".to_string());
+    }
+    if !fallback_interval_secs.is_finite() {
+        return Err("fallback strip interval is invalid".to_string());
+    }
+    if fallback_interval_secs <= 0.0 {
+        return Err("fallback strip interval is not positive".to_string());
+    }
+    Ok(StripAxis::TimeGrid {
+        interval_secs: fallback_interval_secs,
+        duration_secs,
+    })
+}
+
+fn resolve_strip_axis(
+    path: &Path,
+    duration_secs: f64,
+    min_gap_secs: f64,
+    fallback_interval_secs: f64,
+) -> Result<StripAxis, String> {
+    ffmpeg::init().map_err(|error| error.to_string())?;
+    let mut input = match ffmpeg::format::input(path) {
+        Ok(input) => input,
+        Err(_) => return fallback_strip_axis(duration_secs, fallback_interval_secs),
+    };
+    let (stream_index, time_base) = {
+        let Some(stream) = input.streams().best(ffmpeg::media::Type::Video) else {
+            return fallback_strip_axis(duration_secs, fallback_interval_secs);
+        };
+        (stream.index(), stream.time_base())
+    };
+    let Some(keyframes) = enumerate_index_keyframes(&mut input, stream_index, time_base) else {
+        return fallback_strip_axis(duration_secs, fallback_interval_secs);
+    };
+    let covered_secs = keyframes.last().copied().unwrap_or_default();
+    match decide_strip_axis(keyframes.len(), covered_secs, duration_secs) {
+        StripAxisDecision::KeyframeIndex => {
+            let adopted = thin_keyframes(&keyframes, min_gap_secs);
+            if adopted.is_empty() {
+                fallback_strip_axis(duration_secs, fallback_interval_secs)
+            } else {
+                Ok(StripAxis::KeyframeIndex { keyframes, adopted })
+            }
+        }
+        StripAxisDecision::TimeGrid(_) => {
+            fallback_strip_axis(duration_secs, fallback_interval_secs)
+        }
     }
 }
 

@@ -1761,6 +1761,9 @@ impl App {
                     self.settings.edit_preview_cache_max_bytes,
                 );
                 let old_edit_restore_prompt_enabled = self.settings.edit_restore_prompt_enabled;
+                #[cfg(windows)]
+                let old_video_seek_strip_min_interval_secs =
+                    self.settings.video_seek_strip_min_interval_secs;
 
                 // VST3 enable 状態 + チェーン構成の変化を検出してホットリロード。
                 let old_vst3_enabled = self.settings.vst3_enabled;
@@ -1798,6 +1801,12 @@ impl App {
                 // Settings に追加した場合はここにも追記が必要。
                 prepare_preferences_settings_for_commit(&mut state.settings, &mut self.settings);
                 self.settings = state.settings;
+                #[cfg(windows)]
+                if old_video_seek_strip_min_interval_secs.to_bits()
+                    != self.settings.video_seek_strip_min_interval_secs.to_bits()
+                {
+                    self.rebuild_video_seek_strip_adopted_list();
+                }
                 self.sync_content_identity_detection_setting(old_edit_restore_prompt_enabled);
                 if old_creative_luts != self.settings.creative_luts {
                     if self

@@ -59,10 +59,10 @@ mod native_window_thread_spike;
 pub mod normalize_scanner;
 pub mod normalize_types;
 pub mod screenshot;
-mod seek_strip;
+pub(crate) mod seek_strip;
 // Increment 3 で VideoPlayer / presenter へ配線するまで、公開 API は意図的に未使用。
 #[allow(dead_code)]
-mod seek_strip_thumbs;
+pub(crate) mod seek_strip_thumbs;
 pub(crate) mod stream;
 pub mod swscale_helpers;
 pub mod thumbnail;
@@ -585,6 +585,20 @@ pub enum NativeVideoOutputEvent {
     },
     /// hover が外れて hover thumbnail 要求がもう不要 (T35)。
     ClearSeekThumbnail,
+    OpenSeekStrip,
+    CloseSeekStrip {
+        cause: seek_strip::SeekStripCloseCause,
+    },
+    MoveSeekStrip {
+        center_index: f64,
+    },
+    CommitSeekStrip {
+        center_index: f64,
+    },
+    RequestSeekStripWindow {
+        center_index: f64,
+        visible_count: usize,
+    },
     ToggleTileMode,
     TogglePerfOverlay,
     ToggleSidePanelMode,
@@ -754,7 +768,11 @@ const OUTPUT_EVENT_LATEST_VST_PANEL_POS: usize = 2;
 #[cfg(windows)]
 const OUTPUT_EVENT_LATEST_OVERLAY_INPUT_ROUTING: usize = 3;
 #[cfg(windows)]
-const OUTPUT_EVENT_LATEST_SLOTS: usize = 4;
+const OUTPUT_EVENT_LATEST_SEEK_STRIP_MOVE: usize = 4;
+#[cfg(windows)]
+const OUTPUT_EVENT_LATEST_SEEK_STRIP_WINDOW: usize = 5;
+#[cfg(windows)]
+const OUTPUT_EVENT_LATEST_SLOTS: usize = 6;
 
 #[cfg(windows)]
 fn native_output_event_latest_slot(event: &NativeVideoOutputEvent) -> Option<usize> {
@@ -768,6 +786,10 @@ fn native_output_event_latest_slot(event: &NativeVideoOutputEvent) -> Option<usi
         NativeVideoOutputEvent::SetVst3PanelPos { .. } => Some(OUTPUT_EVENT_LATEST_VST_PANEL_POS),
         NativeVideoOutputEvent::OverlayInputRouting(_) => {
             Some(OUTPUT_EVENT_LATEST_OVERLAY_INPUT_ROUTING)
+        }
+        NativeVideoOutputEvent::MoveSeekStrip { .. } => Some(OUTPUT_EVENT_LATEST_SEEK_STRIP_MOVE),
+        NativeVideoOutputEvent::RequestSeekStripWindow { .. } => {
+            Some(OUTPUT_EVENT_LATEST_SEEK_STRIP_WINDOW)
         }
         _ => None,
     }
@@ -992,6 +1014,9 @@ enum NativeVideoOutputCommand {
     },
     SetTileOverlay {
         tile_overlay: Option<native_presenter::NativeOverlayTileOverlay>,
+    },
+    SetSeekStrip {
+        seek_strip: Option<native_presenter::NativeOverlaySeekStrip>,
     },
     SetRingPickerOverlay {
         overlay: Option<native_presenter::NativeOverlayRingPicker>,
@@ -1378,7 +1403,7 @@ impl<F> FramePresentationState<F> {
 }
 
 #[cfg(windows)]
-const NATIVE_COMMAND_LATEST_SLOTS: usize = 30;
+const NATIVE_COMMAND_LATEST_SLOTS: usize = 31;
 
 #[cfg(windows)]
 fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usize> {
@@ -1413,6 +1438,7 @@ fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usiz
         NativeVideoOutputCommand::RequestVideoScaleSettings { .. } => Some(27),
         NativeVideoOutputCommand::SetAnime4kState { .. } => Some(28),
         NativeVideoOutputCommand::SetBarLockState { .. } => Some(29),
+        NativeVideoOutputCommand::SetSeekStrip { .. } => Some(30),
         NativeVideoOutputCommand::ResetSidePanelSession
         | NativeVideoOutputCommand::StartAnime4kMeasurement
         | NativeVideoOutputCommand::ShowToast { .. }
@@ -2128,6 +2154,12 @@ impl NativeVideoOutput {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::SetTileOverlay { tile_overlay });
+    }
+
+    fn set_seek_strip(&self, seek_strip: Option<native_presenter::NativeOverlaySeekStrip>) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetSeekStrip { seek_strip });
     }
 
     fn set_ring_picker_overlay(&self, overlay: Option<native_presenter::NativeOverlayRingPicker>) {
@@ -3458,6 +3490,21 @@ fn send_native_overlay_command(
             pixels_per_point,
         },
         Command::ClearSeekThumbnail => NativeVideoOutputEvent::ClearSeekThumbnail,
+        Command::OpenSeekStrip => NativeVideoOutputEvent::OpenSeekStrip,
+        Command::CloseSeekStrip { cause } => NativeVideoOutputEvent::CloseSeekStrip { cause },
+        Command::MoveSeekStrip { center_index } => {
+            NativeVideoOutputEvent::MoveSeekStrip { center_index }
+        }
+        Command::CommitSeekStrip { center_index } => {
+            NativeVideoOutputEvent::CommitSeekStrip { center_index }
+        }
+        Command::RequestSeekStripWindow {
+            center_index,
+            visible_count,
+        } => NativeVideoOutputEvent::RequestSeekStripWindow {
+            center_index,
+            visible_count,
+        },
         Command::ToggleTileMode => NativeVideoOutputEvent::ToggleTileMode,
         Command::TogglePerfOverlay => NativeVideoOutputEvent::TogglePerfOverlay,
         Command::ToggleSidePanelMode => NativeVideoOutputEvent::ToggleSidePanelMode,
@@ -4471,6 +4518,9 @@ fn run_native_video_output(
                 NativeVideoOutputCommand::SetTileOverlay { tile_overlay } => {
                     presenter.set_overlay_tile_overlay(tile_overlay);
                 }
+                NativeVideoOutputCommand::SetSeekStrip { seek_strip } => {
+                    presenter.set_overlay_seek_strip(seek_strip);
+                }
                 NativeVideoOutputCommand::SetRingPickerOverlay { overlay } => {
                     presenter.set_overlay_ring_picker(overlay);
                 }
@@ -5210,6 +5260,44 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::ClearSeekThumbnail,
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::OpenSeekStrip => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::OpenSeekStrip,
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::CloseSeekStrip { cause } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::CloseSeekStrip { cause },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::MoveSeekStrip { center_index } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::MoveSeekStrip { center_index },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::CommitSeekStrip { center_index } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::CommitSeekStrip { center_index },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::RequestSeekStripWindow { center_index, visible_count } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::RequestSeekStripWindow {
+                                        center_index,
+                                        visible_count,
+                                    },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ToggleTileMode => {
@@ -7524,6 +7612,20 @@ impl VideoPlayer {
         ));
     }
 
+    /// シークストリップの確定用。シーク前の再生意図を保ったまま、coalescing を挟まず
+    /// 指定位置への 1 回の precise seek を発行する。
+    pub fn seek_with_play_state(&self, target_secs: f64, should_play: bool) {
+        self.clear_frame_step_target();
+        let clamped = self.clamp_seek_target(target_secs);
+        if should_play {
+            let mut state = self.user_seek_coalesce.lock().unwrap();
+            self.issue_user_seek_locked(&mut state, clamped);
+        } else {
+            // paused seek 専用遷移を使い、途中で Play 状態を作らず到着後も停止を維持する。
+            self.seek_paused_internal(clamped);
+        }
+    }
+
     /// mIV Remote の seek request は応答した generation と実際の decoder seek を
     /// 1 対 1 に対応させる。通常 UI の連打 coalescing を通すと、進行中 seek の後で
     /// serial が遅れて進み、HTTP に返した generation が即 stale になり得るため使わない。
@@ -8499,6 +8601,16 @@ impl VideoPlayer {
     ) {
         if let Some(output) = self.native_output.as_ref() {
             output.set_tile_overlay(tile_overlay);
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn set_native_seek_strip(
+        &self,
+        seek_strip: Option<native_presenter::NativeOverlaySeekStrip>,
+    ) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_seek_strip(seek_strip);
         }
     }
 
