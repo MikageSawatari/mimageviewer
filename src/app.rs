@@ -16714,6 +16714,41 @@ impl App {
         }
     }
 
+    /// `window_id` の parked bundle を mount して `f` を実行し、元へ戻す。
+    /// panic 時も bundle と押しのけた context を戻してから panic を伝播する。
+    ///
+    /// 対象の窓または bundle が無ければ `None` を返す。`f` の中で対象の窓が
+    /// 閉じられた場合は戻す先が無いため、unmount した bundle は drop する。
+    /// active helper と異なり main-history suppression depth は上げない。
+    /// `native_video_parked_live_input_window_id` にも触れない。
+    #[cfg(windows)]
+    fn with_paused_detached_context<R>(
+        &mut self,
+        window_id: u64,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Option<R> {
+        let window_index = self
+            .detached_image_windows
+            .iter()
+            .position(|window| window.id == window_id)?;
+        let window = &mut self.detached_image_windows[window_index];
+        let mut bundle = window.paused_bundle.take()?;
+        self.swap_viewer_context_bundle(&mut bundle);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.swap_viewer_context_bundle(&mut bundle);
+        if let Some(window) = self
+            .detached_image_windows
+            .iter_mut()
+            .find(|window| window.id == window_id)
+        {
+            window.paused_bundle = Some(bundle);
+        }
+        match result {
+            Ok(value) => Some(value),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
     pub(crate) fn effective_folder(&self) -> Option<PathBuf> {
         if self.items_are_drive_list {
             None
@@ -19805,13 +19840,12 @@ impl App {
             .active_detached_viewer_context
             .as_ref()
             .is_some_and(|active| active.bundle.vst3_deferred_media_open.is_some());
-        if active_has_pending && let Some(mut active) = self.active_detached_viewer_context.take() {
-            self.swap_viewer_context_bundle(&mut active.bundle);
-            if let Some(idx) = self.take_mounted_deferred_vst3_media_open() {
-                consume(self, idx);
-            }
-            self.swap_viewer_context_bundle(&mut active.bundle);
-            self.active_detached_viewer_context = Some(active);
+        if active_has_pending {
+            self.with_active_detached_viewer_context(|app| {
+                if let Some(idx) = app.take_mounted_deferred_vst3_media_open() {
+                    consume(app, idx);
+                }
+            });
         }
 
         self.consume_deferred_vst3_media_open_in_parked_contexts(&mut consume);
@@ -19834,31 +19868,14 @@ impl App {
             .map(|window| window.id)
             .collect();
         for id in ids {
-            let Some(pos) = self
-                .detached_image_windows
-                .iter()
-                .position(|window| window.id == id)
-            else {
-                continue;
-            };
-            let Some(mut bundle) = self.detached_image_windows[pos].paused_bundle.take() else {
-                continue;
-            };
-            self.swap_viewer_context_bundle(&mut bundle);
-            let saved_input_window_id = self.native_video_parked_live_input_window_id;
-            self.native_video_parked_live_input_window_id = Some(id);
-            if let Some(idx) = self.take_mounted_deferred_vst3_media_open() {
-                consume(self, idx);
-            }
-            self.native_video_parked_live_input_window_id = saved_input_window_id;
-            self.swap_viewer_context_bundle(&mut bundle);
-            if let Some(window) = self
-                .detached_image_windows
-                .iter_mut()
-                .find(|window| window.id == id)
-            {
-                window.paused_bundle = Some(bundle);
-            }
+            self.with_paused_detached_context(id, |app| {
+                let saved_input_window_id = app.native_video_parked_live_input_window_id;
+                app.native_video_parked_live_input_window_id = Some(id);
+                if let Some(idx) = app.take_mounted_deferred_vst3_media_open() {
+                    consume(app, idx);
+                }
+                app.native_video_parked_live_input_window_id = saved_input_window_id;
+            });
         }
     }
 
@@ -27882,21 +27899,18 @@ impl App {
         self.metadata_import_refresh_index = None;
         #[cfg(windows)]
         {
-            if let Some(mut active) = self.active_detached_viewer_context.take() {
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                self.metadata_import_refresh_index = None;
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                self.active_detached_viewer_context = Some(active);
-            }
-            for index in 0..self.detached_image_windows.len() {
-                let Some(mut bundle) = self.detached_image_windows[index].paused_bundle.take()
-                else {
-                    continue;
-                };
-                self.swap_viewer_context_bundle(&mut bundle);
-                self.metadata_import_refresh_index = None;
-                self.swap_viewer_context_bundle(&mut bundle);
-                self.detached_image_windows[index].paused_bundle = Some(bundle);
+            self.with_active_detached_viewer_context(|app| {
+                app.metadata_import_refresh_index = None;
+            });
+            let window_ids: Vec<u64> = self
+                .detached_image_windows
+                .iter()
+                .map(|window| window.id)
+                .collect();
+            for window_id in window_ids {
+                self.with_paused_detached_context(window_id, |app| {
+                    app.metadata_import_refresh_index = None;
+                });
             }
         }
     }
@@ -27926,44 +27940,45 @@ impl App {
         );
         #[cfg(windows)]
         {
-            if complete
-                && remaining > 0
-                && std::time::Instant::now() < deadline
-                && let Some(mut active) = self.active_detached_viewer_context.take()
-            {
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                complete = self.advance_current_metadata_import_terminal_index(
-                    import_root,
-                    recursive,
-                    collect_legacy_seed_paths,
-                    &mut remaining,
-                    deadline,
-                );
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                self.active_detached_viewer_context = Some(active);
-            }
-            if complete {
-                for index in 0..self.detached_image_windows.len() {
-                    if remaining == 0 || std::time::Instant::now() >= deadline {
-                        complete = false;
-                        break;
-                    }
-                    let Some(mut bundle) = self.detached_image_windows[index].paused_bundle.take()
-                    else {
-                        continue;
-                    };
-                    self.swap_viewer_context_bundle(&mut bundle);
-                    complete = self.advance_current_metadata_import_terminal_index(
+            if complete && remaining > 0 && std::time::Instant::now() < deadline {
+                if let Some(context_complete) = self.with_active_detached_viewer_context(|app| {
+                    app.advance_current_metadata_import_terminal_index(
                         import_root,
                         recursive,
                         collect_legacy_seed_paths,
                         &mut remaining,
                         deadline,
-                    );
-                    self.swap_viewer_context_bundle(&mut bundle);
-                    self.detached_image_windows[index].paused_bundle = Some(bundle);
-                    if !complete {
+                    )
+                }) {
+                    complete = context_complete;
+                }
+            }
+            if complete {
+                let window_ids: Vec<u64> = self
+                    .detached_image_windows
+                    .iter()
+                    .map(|window| window.id)
+                    .collect();
+                for window_id in window_ids {
+                    if remaining == 0 || std::time::Instant::now() >= deadline {
+                        complete = false;
                         break;
+                    }
+                    if let Some(context_complete) =
+                        self.with_paused_detached_context(window_id, |app| {
+                            app.advance_current_metadata_import_terminal_index(
+                                import_root,
+                                recursive,
+                                collect_legacy_seed_paths,
+                                &mut remaining,
+                                deadline,
+                            )
+                        })
+                    {
+                        complete = context_complete;
+                        if !complete {
+                            break;
+                        }
                     }
                 }
             }
@@ -28148,46 +28163,41 @@ impl App {
         }
         #[cfg(windows)]
         {
-            if let Some(mut active) = self.active_detached_viewer_context.take() {
-                let window_id = self.active_detached_window_id();
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                let spread_path = self.spread_container_key();
-                let old_folder_pin_keys = self.folder_pin_map.keys().cloned().collect();
+            let window_id = self.active_detached_window_id();
+            self.with_active_detached_viewer_context(|app| {
+                let spread_path = app.spread_container_key();
+                let old_folder_pin_keys = app.folder_pin_map.keys().cloned().collect();
                 if let Some(request) = take_current(
-                    &mut self.metadata_import_refresh_index,
+                    &mut app.metadata_import_refresh_index,
                     metadata_import_refresh::ContextSlot::ActiveDetached(window_id),
                     spread_path,
                     old_folder_pin_keys,
                 ) {
                     requests.push(request);
                 }
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                self.active_detached_viewer_context = Some(active);
-            }
-            for window_index in 0..self.detached_image_windows.len() {
-                let window_id = self.detached_image_windows[window_index].id;
-                let Some(mut bundle) = self.detached_image_windows[window_index]
-                    .paused_bundle
-                    .take()
-                else {
-                    continue;
-                };
-                self.swap_viewer_context_bundle(&mut bundle);
-                let spread_path = self.spread_container_key();
-                let old_folder_pin_keys = self.folder_pin_map.keys().cloned().collect();
-                if let Some(request) = take_current(
-                    &mut self.metadata_import_refresh_index,
-                    metadata_import_refresh::ContextSlot::PausedDetached {
-                        index: window_index,
-                        window_id,
-                    },
-                    spread_path,
-                    old_folder_pin_keys,
-                ) {
-                    requests.push(request);
-                }
-                self.swap_viewer_context_bundle(&mut bundle);
-                self.detached_image_windows[window_index].paused_bundle = Some(bundle);
+            });
+            let windows: Vec<(usize, u64)> = self
+                .detached_image_windows
+                .iter()
+                .enumerate()
+                .map(|(window_index, window)| (window_index, window.id))
+                .collect();
+            for (window_index, window_id) in windows {
+                self.with_paused_detached_context(window_id, |app| {
+                    let spread_path = app.spread_container_key();
+                    let old_folder_pin_keys = app.folder_pin_map.keys().cloned().collect();
+                    if let Some(request) = take_current(
+                        &mut app.metadata_import_refresh_index,
+                        metadata_import_refresh::ContextSlot::PausedDetached {
+                            index: window_index,
+                            window_id,
+                        },
+                        spread_path,
+                        old_folder_pin_keys,
+                    ) {
+                        requests.push(request);
+                    }
+                });
             }
         }
         requests
@@ -28221,23 +28231,22 @@ impl App {
         let mut busy = self.quiesce_current_metadata_transfer_context_writers();
         #[cfg(windows)]
         {
-            if let Some(mut active) = self.active_detached_viewer_context.take() {
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                busy |= self.quiesce_current_metadata_transfer_context_writers();
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                self.active_detached_viewer_context = Some(active);
+            if let Some(context_busy) = self.with_active_detached_viewer_context(|app| {
+                app.quiesce_current_metadata_transfer_context_writers()
+            }) {
+                busy |= context_busy;
             }
-            for window_index in 0..self.detached_image_windows.len() {
-                let Some(mut bundle) = self.detached_image_windows[window_index]
-                    .paused_bundle
-                    .take()
-                else {
-                    continue;
-                };
-                self.swap_viewer_context_bundle(&mut bundle);
-                busy |= self.quiesce_current_metadata_transfer_context_writers();
-                self.swap_viewer_context_bundle(&mut bundle);
-                self.detached_image_windows[window_index].paused_bundle = Some(bundle);
+            let window_ids: Vec<u64> = self
+                .detached_image_windows
+                .iter()
+                .map(|window| window.id)
+                .collect();
+            for window_id in window_ids {
+                if let Some(context_busy) = self.with_paused_detached_context(window_id, |app| {
+                    app.quiesce_current_metadata_transfer_context_writers()
+                }) {
+                    busy |= context_busy;
+                }
             }
         }
 
@@ -28371,12 +28380,10 @@ impl App {
                 metadata_import_refresh::ContextSlot::ActiveDetached(expected_window_id) => {
                     if self.active_detached_window_id() != expected_window_id {
                         stale_context = true;
-                    } else if let Some(mut active) = self.active_detached_viewer_context.take() {
-                        self.swap_viewer_context_bundle(&mut active.bundle);
-                        stale_context |=
-                            !self.apply_current_metadata_import_terminal_result(context, changed);
-                        self.swap_viewer_context_bundle(&mut active.bundle);
-                        self.active_detached_viewer_context = Some(active);
+                    } else if let Some(applied) = self.with_active_detached_viewer_context(|app| {
+                        app.apply_current_metadata_import_terminal_result(context, changed)
+                    }) {
+                        stale_context |= !applied;
                     }
                 }
                 #[cfg(windows)]
@@ -28384,26 +28391,18 @@ impl App {
                     index: window_index,
                     window_id,
                 } => {
-                    if self
-                        .detached_image_windows
-                        .get(window_index)
-                        .is_some_and(|window| window.id != window_id)
-                    {
-                        stale_context = true;
-                        continue;
-                    }
-                    if let Some(mut bundle) = self
-                        .detached_image_windows
-                        .get_mut(window_index)
-                        .and_then(|window| window.paused_bundle.take())
-                    {
-                        self.swap_viewer_context_bundle(&mut bundle);
-                        stale_context |=
-                            !self.apply_current_metadata_import_terminal_result(context, changed);
-                        self.swap_viewer_context_bundle(&mut bundle);
-                        if let Some(window) = self.detached_image_windows.get_mut(window_index) {
-                            window.paused_bundle = Some(bundle);
+                    match self.detached_image_windows.get(window_index) {
+                        Some(window) if window.id == window_id => {}
+                        Some(_) => {
+                            stale_context = true;
+                            continue;
                         }
+                        None => continue,
+                    }
+                    if let Some(applied) = self.with_paused_detached_context(window_id, |app| {
+                        app.apply_current_metadata_import_terminal_result(context, changed)
+                    }) {
+                        stale_context |= !applied;
                     }
                 }
                 #[cfg(not(windows))]
@@ -28991,36 +28990,26 @@ impl App {
                         || items_ref(&c.bundle.items)
                 });
             if active_matches {
-                if let Some(ctx_state) = self.active_detached_viewer_context.take() {
-                    let mut bundle = ctx_state.bundle;
-                    self.swap_viewer_context_bundle(&mut bundle);
-                    self.rehydrate_mounted_context_after_rename();
-                    self.swap_viewer_context_bundle(&mut bundle);
-                    self.active_detached_viewer_context =
-                        Some(ActiveDetachedViewerContext { bundle });
-                }
+                self.with_active_detached_viewer_context(|app| {
+                    app.rehydrate_mounted_context_after_rename();
+                });
             }
-            let idxs: Vec<usize> = self
+            let window_ids: Vec<u64> = self
                 .detached_image_windows
                 .iter()
-                .enumerate()
-                .filter(|(_, w)| {
-                    w.paused_bundle.as_deref().is_some_and(|b| {
+                .filter(|window| {
+                    window.paused_bundle.as_deref().is_some_and(|b| {
                         viewer_bundle_references_removed(b, &matches_key)
                             || folder_refs(b.current_folder.as_deref())
                             || items_ref(&b.items)
                     })
                 })
-                .map(|(i, _)| i)
+                .map(|window| window.id)
                 .collect();
-            for i in idxs {
-                let Some(mut bundle) = self.detached_image_windows[i].paused_bundle.take() else {
-                    continue;
-                };
-                self.swap_viewer_context_bundle(&mut bundle);
-                self.rehydrate_mounted_context_after_rename();
-                self.swap_viewer_context_bundle(&mut bundle);
-                self.detached_image_windows[i].paused_bundle = Some(bundle);
+            for window_id in window_ids {
+                self.with_paused_detached_context(window_id, |app| {
+                    app.rehydrate_mounted_context_after_rename();
+                });
             }
         }
     }
@@ -30419,23 +30408,18 @@ impl App {
         self.rebuild_visible_indices_preserving_facet_scope();
         #[cfg(windows)]
         {
-            if let Some(mut active) = self.active_detached_viewer_context.take() {
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                self.rebuild_visible_indices_preserving_facet_scope();
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                self.active_detached_viewer_context = Some(active);
-            }
-            for window_index in 0..self.detached_image_windows.len() {
-                let Some(mut bundle) = self.detached_image_windows[window_index]
-                    .paused_bundle
-                    .take()
-                else {
-                    continue;
-                };
-                self.swap_viewer_context_bundle(&mut bundle);
-                self.rebuild_visible_indices_preserving_facet_scope();
-                self.swap_viewer_context_bundle(&mut bundle);
-                self.detached_image_windows[window_index].paused_bundle = Some(bundle);
+            self.with_active_detached_viewer_context(|app| {
+                app.rebuild_visible_indices_preserving_facet_scope();
+            });
+            let window_ids: Vec<u64> = self
+                .detached_image_windows
+                .iter()
+                .map(|window| window.id)
+                .collect();
+            for window_id in window_ids {
+                self.with_paused_detached_context(window_id, |app| {
+                    app.rebuild_visible_indices_preserving_facet_scope();
+                });
             }
         }
     }
@@ -54319,21 +54303,18 @@ impl App {
         self.clear_current_edit_preview_materializations();
         #[cfg(windows)]
         {
-            if let Some(mut active) = self.active_detached_viewer_context.take() {
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                self.clear_current_edit_preview_materializations();
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                self.active_detached_viewer_context = Some(active);
-            }
-            for index in 0..self.detached_image_windows.len() {
-                let Some(mut bundle) = self.detached_image_windows[index].paused_bundle.take()
-                else {
-                    continue;
-                };
-                self.swap_viewer_context_bundle(&mut bundle);
-                self.clear_current_edit_preview_materializations();
-                self.swap_viewer_context_bundle(&mut bundle);
-                self.detached_image_windows[index].paused_bundle = Some(bundle);
+            self.with_active_detached_viewer_context(|app| {
+                app.clear_current_edit_preview_materializations();
+            });
+            let window_ids: Vec<u64> = self
+                .detached_image_windows
+                .iter()
+                .map(|window| window.id)
+                .collect();
+            for window_id in window_ids {
+                self.with_paused_detached_context(window_id, |app| {
+                    app.clear_current_edit_preview_materializations();
+                });
             }
         }
     }

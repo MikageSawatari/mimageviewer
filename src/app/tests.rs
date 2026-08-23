@@ -511,6 +511,424 @@ fn paused_test_window(
     }
 }
 
+#[cfg(windows)]
+fn metadata_context_result(
+    slot: crate::app::metadata_import_refresh::ContextSlot,
+    items_generation: u64,
+    rating: u8,
+) -> crate::app::metadata_import_refresh::ContextResult {
+    crate::app::metadata_import_refresh::ContextResult {
+        slot,
+        items_generation,
+        rating_cache: Some(std::collections::HashMap::from([(0, rating)])),
+        tags_cache: None,
+        current_rating: Some(rating),
+        page_state: None,
+        folder_pin_map: None,
+        folder_pin_reset_indices: None,
+        video_pin_blobs: None,
+        video_items: None,
+        container_state: None,
+        legacy_seed_paths: Vec::new(),
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn active_detached_mount_restores_both_contexts_and_depth_after_panic() {
+    let mut app = phase_c_support::setup_app();
+    let main_path = PathBuf::from(r"C:\main\page.jpg");
+    let detached_path = PathBuf::from(r"C:\detached\page.jpg");
+    app.items = vec![GridItem::Image(main_path.clone())];
+    app.detached_viewer_main_history_suppression_depth = 7;
+
+    let mut detached = ViewerContextBundle::empty();
+    detached.items = vec![GridItem::Image(detached_path.clone())];
+    app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle: detached });
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        app.with_active_detached_viewer_context(|mounted| {
+            assert_eq!(
+                mounted.items[0].drag_source_path(),
+                Some(detached_path.as_path())
+            );
+            assert_eq!(mounted.detached_viewer_main_history_suppression_depth, 8);
+            panic!("active mounted closure panic");
+        });
+    }));
+
+    assert!(panic.is_err(), "panic must still propagate");
+    assert_eq!(app.items[0].drag_source_path(), Some(main_path.as_path()));
+    assert_eq!(app.detached_viewer_main_history_suppression_depth, 7);
+    let restored_path = app
+        .with_active_detached_viewer_context(|mounted| {
+            mounted.items[0].drag_source_path().map(Path::to_path_buf)
+        })
+        .expect("active bundle must be restored after panic");
+    assert_eq!(restored_path, Some(detached_path));
+}
+
+#[test]
+#[cfg(windows)]
+fn paused_detached_mount_restores_both_contexts_after_panic() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let main_path = PathBuf::from(r"C:\main\page.jpg");
+    let paused_path = PathBuf::from(r"C:\paused\page.jpg");
+    let window_id = 700;
+    app.items = vec![GridItem::Image(main_path.clone())];
+    app.detached_viewer_main_history_suppression_depth = 5;
+
+    let mut paused = ViewerContextBundle::empty();
+    paused.items = vec![GridItem::Image(paused_path.clone())];
+    app.detached_image_windows
+        .push(paused_test_window(&ctx, window_id, paused));
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        app.with_paused_detached_context(window_id, |mounted| {
+            assert_eq!(
+                mounted.items[0].drag_source_path(),
+                Some(paused_path.as_path())
+            );
+            assert_eq!(mounted.detached_viewer_main_history_suppression_depth, 5);
+            panic!("paused mounted closure panic");
+        });
+    }));
+
+    assert!(panic.is_err(), "panic must still propagate");
+    assert_eq!(app.items[0].drag_source_path(), Some(main_path.as_path()));
+    assert_eq!(app.detached_viewer_main_history_suppression_depth, 5);
+    let restored_path = app
+        .with_paused_detached_context(window_id, |mounted| {
+            mounted.items[0].drag_source_path().map(Path::to_path_buf)
+        })
+        .expect("paused bundle must be restored after panic");
+    assert_eq!(restored_path, Some(paused_path));
+}
+
+#[test]
+#[cfg(windows)]
+fn paused_detached_mount_skips_missing_bundle_and_window() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let window_id = 701;
+    let mut window = paused_test_window(&ctx, window_id, ViewerContextBundle::empty());
+    window.paused_bundle = None;
+    app.detached_image_windows.push(window);
+    let calls = Cell::new(0);
+
+    assert_eq!(
+        app.with_paused_detached_context(window_id, |_| {
+            calls.set(calls.get() + 1);
+            1
+        }),
+        None
+    );
+    assert_eq!(
+        app.with_paused_detached_context(999_999, |_| {
+            calls.set(calls.get() + 1);
+            2
+        }),
+        None
+    );
+    assert_eq!(calls.get(), 0);
+}
+
+#[test]
+#[cfg(windows)]
+fn paused_detached_mount_drops_bundle_when_target_closes_inside_closure() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let window_id = 702;
+    let main_path = PathBuf::from(r"C:\main\page.jpg");
+    app.items = vec![GridItem::Image(main_path.clone())];
+    app.detached_image_windows.push(paused_test_window(
+        &ctx,
+        window_id,
+        ViewerContextBundle::empty(),
+    ));
+
+    let result = app.with_paused_detached_context(window_id, |mounted| {
+        mounted
+            .detached_image_windows
+            .retain(|window| window.id != window_id);
+        17
+    });
+
+    assert_eq!(result, Some(17));
+    assert_eq!(app.items[0].drag_source_path(), Some(main_path.as_path()));
+    assert!(
+        app.with_paused_detached_context(window_id, |_| ())
+            .is_none()
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn metadata_apply_preserves_paused_index_three_way_identity() {
+    let ctx = egui::Context::default();
+    let changed = crate::metadata_transfer::ImportChangedSections {
+        ratings: true,
+        ..Default::default()
+    };
+
+    let mut mismatched = phase_c_support::setup_app();
+    let mut bundle = ViewerContextBundle::empty();
+    bundle.items_generation = mismatched.items_generation;
+    bundle.rating_cache = std::collections::HashMap::from([(0, 2)]);
+    mismatched
+        .detached_image_windows
+        .push(paused_test_window(&ctx, 710, bundle));
+    let result = crate::app::metadata_import_refresh::RefreshResult {
+        contexts: vec![metadata_context_result(
+            crate::app::metadata_import_refresh::ContextSlot::PausedDetached {
+                index: 0,
+                window_id: 711,
+            },
+            mismatched.items_generation,
+            5,
+        )],
+        page_snapshot: None,
+        errors: Vec::new(),
+    };
+    let (_, stale) = mismatched.apply_metadata_import_terminal_refresh(result, changed);
+    assert!(stale, "same index with another id must be stale");
+    assert_eq!(
+        mismatched
+            .with_paused_detached_context(710, |mounted| { mounted.rating_cache.get(&0).copied() }),
+        Some(Some(2)),
+        "mismatched id must not apply the result"
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn metadata_apply_skips_shifted_window_when_original_index_is_out_of_range() {
+    let ctx = egui::Context::default();
+    let mut shifted = phase_c_support::setup_app();
+    shifted.detached_image_windows.push(paused_test_window(
+        &ctx,
+        719,
+        ViewerContextBundle::empty(),
+    ));
+    let mut shifted_bundle = ViewerContextBundle::empty();
+    shifted_bundle.items_generation = shifted.items_generation;
+    shifted_bundle.rating_cache = std::collections::HashMap::from([(0, 3)]);
+    shifted
+        .detached_image_windows
+        .push(paused_test_window(&ctx, 720, shifted_bundle));
+    shifted.detached_image_windows.remove(0);
+    let result = crate::app::metadata_import_refresh::RefreshResult {
+        contexts: vec![metadata_context_result(
+            crate::app::metadata_import_refresh::ContextSlot::PausedDetached {
+                index: 1,
+                window_id: 720,
+            },
+            shifted.items_generation,
+            5,
+        )],
+        page_snapshot: None,
+        errors: Vec::new(),
+    };
+    let (_, stale) = shifted.apply_metadata_import_terminal_refresh(
+        result,
+        crate::metadata_transfer::ImportChangedSections {
+            ratings: true,
+            ..Default::default()
+        },
+    );
+    assert!(
+        !stale,
+        "an original index that is now out of range must skip silently"
+    );
+    assert_eq!(
+        shifted
+            .with_paused_detached_context(720, |mounted| { mounted.rating_cache.get(&0).copied() }),
+        Some(Some(3)),
+        "id lookup must not apply a result whose original index is out of range"
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn metadata_request_preserves_paused_vector_index_across_bundleless_window() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let import_root = PathBuf::from(r"C:\Pictures");
+    app.current_folder = Some(PathBuf::from(r"C:\Other"));
+
+    let mut bundleless = paused_test_window(&ctx, 730, ViewerContextBundle::empty());
+    bundleless.paused_bundle = None;
+    app.detached_image_windows.push(bundleless);
+
+    let mut indexed = ViewerContextBundle::empty();
+    indexed.current_folder = Some(PathBuf::from(r"C:\Pictures\Child"));
+    indexed.items = vec![GridItem::Image(PathBuf::from(
+        r"C:\Pictures\Child\page.jpg",
+    ))];
+    indexed.image_metas = vec![None];
+    indexed.thumbnails = vec![ThumbnailState::Pending];
+    app.detached_image_windows
+        .push(paused_test_window(&ctx, 731, indexed));
+
+    app.begin_metadata_import_terminal_refresh();
+    while !app.advance_metadata_import_terminal_refresh(&import_root, false, false) {}
+    let requests = app.take_metadata_import_refresh_requests();
+
+    assert!(requests.iter().any(|request| {
+        matches!(
+            request.slot,
+            crate::app::metadata_import_refresh::ContextSlot::PausedDetached {
+                index: 1,
+                window_id: 731
+            }
+        )
+    }));
+}
+
+#[test]
+#[cfg(windows)]
+fn failed_context_mounts_do_not_change_busy_complete_or_stale_results() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let window_id = 740;
+    let mut bundleless = paused_test_window(&ctx, window_id, ViewerContextBundle::empty());
+    bundleless.paused_bundle = None;
+    app.detached_image_windows.push(bundleless);
+
+    assert!(
+        !app.quiesce_metadata_transfer_context_writers(false)
+            .expect("quiesce without tag DB release cannot fail")
+    );
+
+    app.begin_metadata_import_terminal_refresh();
+    assert!(
+        app.advance_metadata_import_terminal_refresh(Path::new(r"C:\unrelated"), false, false,),
+        "a missing bundle must not replace a completed traversal result"
+    );
+
+    let result = crate::app::metadata_import_refresh::RefreshResult {
+        contexts: vec![metadata_context_result(
+            crate::app::metadata_import_refresh::ContextSlot::PausedDetached {
+                index: 0,
+                window_id,
+            },
+            app.items_generation,
+            5,
+        )],
+        page_snapshot: None,
+        errors: Vec::new(),
+    };
+    let (_, stale) = app.apply_metadata_import_terminal_refresh(
+        result,
+        crate::metadata_transfer::ImportChangedSections {
+            ratings: true,
+            ..Default::default()
+        },
+    );
+    assert!(!stale, "a missing bundle must not contribute staleness");
+}
+
+#[test]
+#[cfg(windows)]
+fn all_context_clear_processes_a_paused_context_that_is_already_mounted() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let window_id = 750;
+    let mut bundle = ViewerContextBundle::empty();
+    bundle.items = vec![GridItem::Image(PathBuf::from(r"C:\paused\preview.jpg"))];
+    bundle.thumbnails = vec![ThumbnailState::Pending];
+    bundle
+        .thumb_edit_preview_keys
+        .insert(0, "paused-preview".to_string());
+    app.detached_image_windows
+        .push(paused_test_window(&ctx, window_id, bundle));
+
+    let cleared = app
+        .with_paused_detached_context(window_id, |mounted| {
+            assert!(!mounted.thumb_edit_preview_keys.is_empty());
+            mounted.clear_all_edit_preview_materializations();
+            mounted.thumb_edit_preview_keys.is_empty()
+                && matches!(mounted.thumbnails[0], ThumbnailState::Evicted)
+        })
+        .expect("outer paused mount must succeed");
+    assert!(cleared, "the mounted current pass must perform the clear");
+
+    assert_eq!(
+        app.with_paused_detached_context(window_id, |mounted| {
+            mounted.thumb_edit_preview_keys.is_empty()
+                && matches!(mounted.thumbnails[0], ThumbnailState::Evicted)
+        }),
+        Some(true)
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn vst3_production_traversal_survives_removing_a_later_paused_window() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let first_id = 760;
+    let removed_id = 761;
+    let last_id = 762;
+    let make_bundle = |window_id: u64| {
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = vec![GridItem::Video(PathBuf::from(format!(
+            r"C:\videos\{window_id}.mp4"
+        )))];
+        bundle.fullscreen_idx = Some(0);
+        bundle.vst3_deferred_media_open = Some(0);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.detached_window_id = Some(window_id);
+        bundle
+    };
+    for window_id in [first_id, removed_id, last_id] {
+        app.detached_image_windows.push(paused_test_window(
+            &ctx,
+            window_id,
+            make_bundle(window_id),
+        ));
+    }
+
+    let mut consumed = Vec::new();
+    app.consume_deferred_vst3_media_open_in_all_contexts(|mounted, idx| {
+        let window_id = mounted
+            .detached_viewer_window_id
+            .expect("parked VST3 callback must run in the owning context");
+        consumed.push((
+            window_id,
+            mounted.native_video_parked_live_input_window_id,
+            idx,
+        ));
+        if window_id == first_id {
+            mounted
+                .detached_image_windows
+                .retain(|window| window.id != removed_id);
+        }
+    });
+
+    assert_eq!(
+        consumed,
+        vec![(first_id, Some(first_id), 0), (last_id, Some(last_id), 0)],
+        "the removed id is skipped and the following surviving id is still consumed"
+    );
+    assert_eq!(
+        app.detached_image_windows
+            .iter()
+            .map(|window| window.id)
+            .collect::<Vec<_>>(),
+        vec![first_id, last_id]
+    );
+    for window_id in [first_id, last_id] {
+        assert_eq!(
+            app.with_paused_detached_context(window_id, |mounted| {
+                mounted.vst3_deferred_media_open
+            }),
+            Some(None)
+        );
+    }
+}
+
 #[test]
 fn settings_boot_problem_source_covers_all_save_suppressed_default_boots() {
     use crate::settings_db::BootSource;
