@@ -1899,15 +1899,18 @@ SimplySign のクラウド鍵セッションが切れていても通過する (�
 2. ✅ **実機確認 (利用者)** — アイドル健全性 2 シナリオ、T キー、キー割り当てラベル、
    製本、ポータブル版 smoke すべて完了。
 3. ✅ **§5.11 の記録を最終ビルドに合わせて更新。**
-4. **push** — `git push origin master` と `master:main` (**明示の指示が要る**)。
-5. **Vector 申請用 zip** — `mImageViewer_setup.exe` + `installer/readme.txt` を
-   `dist\mImageViewer_installer_v3.2.0.zip` へ `Compress-Archive`。
-6. **タグと Release** — `git tag v3.2.0` → push。Release body は README の v3.2.0 節
-   (7,135 バイト、8KB 上限内なのでそのまま使える)。**Assets 4 点**: 単体exe /
-   setup.exe / installer zip / portable zip。
-7. **リリース日** — README 見出しと製品ページ「最終更新」は **2026-08-23**。
-   日をまたぐ場合はこの 2 箇所を直し `gen-changelog-html.py` を再実行する。
-8. 公開後 = Phase 5 (mikage.to 反映 / Vector 申請 / 必要なら窓の杜・MS Store)。
+4. ✅ **push** — `master` と `master:main` を `09758b90` まで同期。
+5. ✅ **Vector 申請用 zip** — `dist\mImageViewer_installer_v3.2.0.zip` (setup.exe + readme.txt)。
+6. ✅ **タグと Release** — `v3.2.0` を公開。body は README の v3.2.0 節 (7,111 バイト)。
+   Assets 4 点とも `uploaded`。<https://github.com/MikageSawatari/mimageviewer/releases/tag/v3.2.0>
+7. ✅ **リリース日** — 2026-08-23 で README 見出し・製品ページとも一致。
+8. **残り = Phase 5 (利用者作業)**:
+   - mikage.to へ 3 成果物を配置し、製品ページのダウンロード欄・版表記・「最終更新」を更新。
+     **ポータブル版のリンク URL は版番号を含む**ので href も直す。
+     「Microsoft Store でも入手可能」バッジが残っていることも確認。
+   - Vector へ `mImageViewer_installer_v3.2.0.zip` を申請。
+   - 任意: 窓の杜、MS Store 更新 (毎リリース必須ではない)。
+9. **公開後の目視確認** — 別マシンで起動し、更新通知ダイアログの body が崩れずに出るか。
 
 ### 5.12 署名の事前チェックが、鍵の使えなさを検出できない
 
