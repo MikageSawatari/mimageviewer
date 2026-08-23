@@ -328,7 +328,7 @@ S=0.189ms / L=0.606ms / UL=2.213ms だった。高速な1台の絶対時間を�
 負荷が変わった場合の回復手段は**再測定ボタン**である。サーマルスロットリングや電源プロファイル
 変更も同じ扱いにする。自動で再評価するのは新しい動画の source 寸法 / fps が確定した時だけで、
 同じ動画の再生中に負荷を監視して自動昇降格はしない。予算変更と再測定は利用者の明示操作なので、
-完了後に prepare / commit 境界で切り替える。
+完了後に renderer-owned desired state を更新し、次の適用可能な frame で切り替える。
 
 ---
 
@@ -349,24 +349,35 @@ S=0.189ms / L=0.606ms / UL=2.213ms だった。高速な1台の絶対時間を�
 具体的な要求:
 
 - Anime4K のシェーダはビルド時 `fxc` でバイトコード化 (§4.3)
-- 中間テクスチャは切替前に準備し、完成してから原子的に有効化する。B3 は Phase A と同じ
-  render-thread prepare / allocation-free commit 境界へ選択 variant を載せる。候補の全枚数を
-  prepare できた後だけ commit を発行し、成功時に旧 variant の中間画像を解放する
+- 中間テクスチャは有効化前に準備し、完成してから原子的に選択を反映する。候補の全枚数を
+  prepare できた後だけ同じ render-thread unit で frame を present し、成功時に旧 variant の
+  中間画像を解放する
 - 一時停止中の切り替えも即反映する。既存の `SetVideoGrade` が持つ「Visible なら 1 回だけ
   再提示」の仕組みをそのまま使う (`FramePresentationState`)
 
-Phase A の全シェーダは `NativeRenderCore` 作成時にコンパイルする。切替は prepare / commit の
-2 段階で、D3D resource の owner である render thread 上の prepare が現在の source / target 寸法用の
-中間 texture と、必要なら visual 未接続の次 surface を作る。寸法を含む request signature が一致した
-ときだけ App が commit command を publish し、commit と一時停止中の held frame 再提示には
-コンパイルも確保も残さない。prepare 後に
-geometry が変わった request は stale として破棄し、古い surface を接続しない。
+Phase A の全シェーダは `NativeRenderCore` 作成時にコンパイルする。選択要求は renderer の
+`PresenterSourceState` が `SourceVideoScaleState` (`Idle / AwaitingFrame / Preparing / Prepared`)
+として1件だけ所有する。identity は `(source_epoch, request revision)` で、新しい要求は古い要求を
+置き換える。frame が無い間は `AwaitingFrame` に保持し、表示可能な frame が来た時点の source / target
+寸法で resource を prepare する。prepare、選択の適用、その frame の present は同じ render-thread
+unit で完結し、App を経由する `Prepared -> Commit` echo は置かない。設定が切り替わったと公表するのは
+resource が完成し、その選択での present が成功した後だけである。この成功通知を受けて App が設定を
+永続化し、キー操作由来なら toast を表示する。
+
+prepared signature が比較するのは source epoch / request revision、source frame geometry、そこから
+導いた target 寸法と content、filter、縮小なめらかさ、Anime4K variant、grade の resource 条件である。
+`current_surface_*` と `resizing` は適用自身が進める遷移状態なので identity に含めない。geometry が
+本当に変わった場合は prepared resource だけを無効化し、desired selection は `AwaitingFrame` に戻して
+その geometry event または次の frame で再評価する。`SwitchSource` は typed owner と subordinate な
+prepared resource を同時に破棄する。旧 source の request / success event は source-epoch gate でも
+棄却し、新 source へ設定や toast を漏らさない。`NoFrame / NoPrepared / RequestMismatch /
+SourceChanged / SignatureChanged { fields }` は typed reject reason として invariant 監視へ記録する。
 Anime4K は全 variant の pixel shader を build 時に bytecode 化し、B3 では全67 shader object
 を `NativeRenderCore` 作成時に bytecode からロードする。runtime compile はしない。
 同じ開発機の WARP 測定では VL 18本の runtime compile が713.8ms、VL bytecode loadが5.0ms、
 全5 variantのbytecode loadが16.8msだったため、shader objectは全variantを常備できる。
-設定 prepare は現在の source 寸法について選択 variant 1つ分の intermediate だけを完成させ、
-commit は既存 resource の選択だけを行う。1080p source の中間画像は S / M / L / VL / UL の順に
+設定の適用準備は現在の source 寸法について選択 variant 1つ分の intermediate だけを完成させ、
+成功 present で既存 resource の選択を公表する。1080p source の中間画像は S / M / L / VL / UL の順に
 約63 / 127 / 142 / 269 / 380 MiB で、同時保持しない。VRAM安全予算は adapter が報告する
 dedicated / shared memory の大きい方の25%とする。
 
@@ -490,7 +501,7 @@ Phase A で約 2 週間、Phase B で約 2 週間 (いずれも実機往復を�
 **Phase A は測定を待たずに着手してよい。**
 
 Phase A の A-1〜A-3 は完了した。NIS / nearest、動画専用の縮小なめらかさ、左パネル、
-keymap、prepare / commit 切替、typed fallback と基礎計装まで実装済みである。
+keymap、renderer-owned desired-state 切替、typed fallback と基礎計装まで実装済みである。
 
 ---
 

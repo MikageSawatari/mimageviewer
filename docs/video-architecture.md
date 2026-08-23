@@ -66,17 +66,27 @@ decoder の BGRA frame
 
 grade の identity path は source texture を resolve へ直接渡すので余分な copy を増やさない。
 縮小 Lanczos3 のなめらかさは静止画設定と分け、動画専用値を使う。Phase A の shader は render
-pipeline 作成時にすべて compile する。設定変更は prepare / commit の 2 段階で、現在の source /
-target 寸法用 intermediate texture と visual 未接続の次 surface を prepare した後、request と
-geometry が一致するときだけ allocation-free の commit を publish する。一時停止中は保持中の
-Visible frame を commit 直後に 1 回再提示する。
+pipeline 作成時にすべて compile する。設定変更は renderer の `PresenterSourceState` が
+`SourceVideoScaleState` (`Idle / AwaitingFrame / Preparing / Prepared`) として最新1件を所有する。
+identity は `(source_epoch, request revision)` で、frame が無ければ保持し、表示可能になった時点の
+source geometry と target 寸法で resource を準備する。準備、選択の適用、その frame の present は
+同じ render-thread unit で行い、成功後にだけ `VideoScaleSettingsCommitted` を App へ送る。App は
+その通知で永続化とキー toast を行う。一時停止中は保持中の Visible frame を同じ経路で1回再提示する。
+hidden presenter は present せず desired state を保持し、再表示時の held frame に適用する。
+
+prepared signature は source epoch / request revision、source frame geometry、導出済み target 寸法と
+content、filter、縮小なめらかさ、Anime4K variant、grade の resource 条件だけを比較する。適用自身が
+変える `current_surface_*` と resize 遷移状態は比較しない。geometry event は prepared resource を
+無効化して desired selection を保持し、新 geometry で再評価する。`SwitchSource` は source-owned
+state と presenter 側 prepared resource の両方を破棄し、command と App event の source-epoch gate
+も旧 source の request / 成功通知を棄却する。App を往復する `Prepared -> Commit` command は無い。
 
 Anime4K は B1 が GLSL の `//!SAVE` / `//!BIND` から生成した variant topology と WGSL を正本にする。
 build 時に S / M / L / VL / UL の WGSL を Naga で HLSL へ変換し、Windows SDK FXC で全 pixel
 shader を SM5 bytecode 化する。runtime は全67 shader object を pipeline 作成時に bytecode から
-ロードし、選択した1 variant 分だけ source-resolution `RGBA16Float` intermediate を設定
-prepare で確保する。候補の確保が全部成功した後だけ allocation-free commit し、旧 variant の
-中間画像を解放する。各 pass の入力と順番は生成 topology 駆動で、vertex stage は
+ロードし、選択した1 variant 分だけ source-resolution `RGBA16Float` intermediate を適用準備で
+確保する。候補の確保が全部成功し、その選択での present が成功した後だけ旧 variant の中間画像を
+解放する。各 pass の入力と順番は生成 topology 駆動で、vertex stage は
 Naga 生成 `vs_main` ではなく NIS と同じ native D3D fullscreen vertex shader を使う。動画は
 whole frame 処理なので `process_origin = 0` とし、orientation は最終 resolve の inverse mapping
 で正規化する。

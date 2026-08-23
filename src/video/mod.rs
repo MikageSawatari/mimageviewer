@@ -666,13 +666,6 @@ pub enum NativeVideoOutputEvent {
         budget: anime4k_policy::VideoAnime4kBudgetPreset,
     },
     RemeasureVideoAnime4k,
-    VideoScaleSettingsPrepared {
-        request_id: u64,
-        filter: crate::settings::VideoScaleFilter,
-        smoothing_percent: u32,
-        anime4k_variant: Option<anime4k_policy::VideoAnime4kVariant>,
-        origin: VideoScaleChangeOrigin,
-    },
     VideoScaleSettingsCommitted {
         filter: crate::settings::VideoScaleFilter,
         smoothing_percent: u32,
@@ -924,15 +917,8 @@ enum NativeVideoOutputCommand {
         budget: anime4k_policy::VideoAnime4kBudgetPreset,
         status: native_presenter::NativeVideoAnime4kStatus,
     },
-    PrepareVideoScaleSettings {
-        request_id: u64,
-        filter: crate::settings::VideoScaleFilter,
-        smoothing_percent: u32,
-        anime4k_variant: Option<anime4k_policy::VideoAnime4kVariant>,
-        origin: VideoScaleChangeOrigin,
-    },
-    CommitVideoScaleSettings {
-        request_id: u64,
+    RequestVideoScaleSettings {
+        identity: VideoScaleRequestIdentity,
         filter: crate::settings::VideoScaleFilter,
         smoothing_percent: u32,
         anime4k_variant: Option<anime4k_policy::VideoAnime4kVariant>,
@@ -1072,56 +1058,191 @@ enum NativeVideoOutputCommand {
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VideoScaleRequestIdentity {
+    source_epoch: u64,
+    revision: u64,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct VideoScaleSettingsRequest {
-    request_id: u64,
+    identity: VideoScaleRequestIdentity,
     filter: crate::settings::VideoScaleFilter,
     smoothing_percent: u32,
     anime4k_variant: Option<anime4k_policy::VideoAnime4kVariant>,
     origin: VideoScaleChangeOrigin,
 }
 
-/// Source-bound owner for a scale request received before any frame exists.
-/// Replacing `Waiting` is the only supersession transition; source teardown
-/// clears it before a new source can become current.
 #[cfg(windows)]
-#[derive(Debug, Default)]
-enum DeferredVideoScaleRequest {
-    #[default]
-    Empty,
-    Waiting {
-        source_epoch: u64,
-        request: VideoScaleSettingsRequest,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum VideoScaleApplyRejectReason {
+    NoFrame,
+    NoPrepared,
+    RequestMismatch {
+        prepared_revision: u64,
+        current_revision: u64,
+    },
+    SourceChanged {
+        prepared_source_epoch: u64,
+        current_source_epoch: u64,
+    },
+    SignatureChanged {
+        fields: Vec<&'static str>,
     },
 }
 
 #[cfg(windows)]
-impl DeferredVideoScaleRequest {
-    fn hold_until_first_frame(&mut self, source_epoch: u64, request: VideoScaleSettingsRequest) {
-        *self = Self::Waiting {
-            source_epoch,
-            request,
-        };
+impl VideoScaleApplyRejectReason {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::NoFrame => "no_frame",
+            Self::NoPrepared => "no_prepared",
+            Self::RequestMismatch { .. } => "request_mismatch",
+            Self::SourceChanged { .. } => "source_changed",
+            Self::SignatureChanged { .. } => "signature_changed",
+        }
+    }
+}
+
+/// The renderer source's single owner of an unapplied scale selection.
+/// Prepared D3D resources are subordinate to the `Prepared` state and are
+/// discarded whenever this owner is replaced or its source is torn down.
+#[cfg(windows)]
+#[derive(Debug, Default)]
+enum SourceVideoScaleState {
+    #[default]
+    Idle,
+    AwaitingFrame(VideoScaleSettingsRequest),
+    Preparing(VideoScaleSettingsRequest),
+    Prepared(VideoScaleSettingsRequest),
+}
+
+#[cfg(windows)]
+impl SourceVideoScaleState {
+    fn has_desired(&self) -> bool {
+        !matches!(self, Self::Idle)
     }
 
-    fn take_for_first_frame(&mut self, source_epoch: u64) -> Option<VideoScaleSettingsRequest> {
+    fn replace_desired(&mut self, request: VideoScaleSettingsRequest) {
+        *self = Self::AwaitingFrame(request);
+    }
+
+    fn begin_preparing(
+        &mut self,
+        source_epoch: u64,
+        frame_available: bool,
+    ) -> Result<Option<VideoScaleSettingsRequest>, VideoScaleApplyRejectReason> {
+        if !frame_available {
+            return Err(VideoScaleApplyRejectReason::NoFrame);
+        }
         match std::mem::take(self) {
-            Self::Waiting {
-                source_epoch: pending_epoch,
-                request,
-            } if pending_epoch == source_epoch => Some(request),
-            Self::Empty | Self::Waiting { .. } => None,
+            Self::Idle => Ok(None),
+            Self::AwaitingFrame(request) => {
+                if request.identity.source_epoch != source_epoch {
+                    return Err(VideoScaleApplyRejectReason::SourceChanged {
+                        prepared_source_epoch: request.identity.source_epoch,
+                        current_source_epoch: source_epoch,
+                    });
+                }
+                *self = Self::Preparing(request);
+                Ok(Some(request))
+            }
+            state @ (Self::Preparing(_) | Self::Prepared(_)) => {
+                *self = state;
+                Err(VideoScaleApplyRejectReason::NoPrepared)
+            }
         }
     }
 
-    fn drop_source(&mut self, source_epoch: u64) {
-        if let Self::Waiting {
-            source_epoch: pending_epoch,
-            ..
-        } = self
-        {
-            debug_assert_eq!(*pending_epoch, source_epoch);
+    fn mark_prepared(
+        &mut self,
+        identity: VideoScaleRequestIdentity,
+    ) -> Result<VideoScaleSettingsRequest, VideoScaleApplyRejectReason> {
+        let state = std::mem::take(self);
+        let request = match state {
+            Self::Preparing(request) => request,
+            other => {
+                *self = other;
+                return Err(VideoScaleApplyRejectReason::NoPrepared);
+            }
+        };
+        if request.identity.source_epoch != identity.source_epoch {
+            return Err(VideoScaleApplyRejectReason::SourceChanged {
+                prepared_source_epoch: request.identity.source_epoch,
+                current_source_epoch: identity.source_epoch,
+            });
         }
-        *self = Self::Empty;
+        if request.identity.revision != identity.revision {
+            return Err(VideoScaleApplyRejectReason::RequestMismatch {
+                prepared_revision: request.identity.revision,
+                current_revision: identity.revision,
+            });
+        }
+        *self = Self::Prepared(request);
+        Ok(request)
+    }
+
+    fn complete_prepared(
+        &mut self,
+        identity: VideoScaleRequestIdentity,
+    ) -> Result<VideoScaleSettingsRequest, VideoScaleApplyRejectReason> {
+        let state = std::mem::take(self);
+        let request = match state {
+            Self::Prepared(request) => request,
+            other => {
+                *self = other;
+                return Err(VideoScaleApplyRejectReason::NoPrepared);
+            }
+        };
+        if request.identity.source_epoch != identity.source_epoch {
+            return Err(VideoScaleApplyRejectReason::SourceChanged {
+                prepared_source_epoch: request.identity.source_epoch,
+                current_source_epoch: identity.source_epoch,
+            });
+        }
+        if request.identity.revision != identity.revision {
+            return Err(VideoScaleApplyRejectReason::RequestMismatch {
+                prepared_revision: request.identity.revision,
+                current_revision: identity.revision,
+            });
+        }
+        Ok(request)
+    }
+
+    fn discard_current(&mut self) -> Option<VideoScaleSettingsRequest> {
+        match std::mem::take(self) {
+            Self::Idle => None,
+            Self::AwaitingFrame(request) | Self::Preparing(request) | Self::Prepared(request) => {
+                Some(request)
+            }
+        }
+    }
+
+    fn restore_desired(&mut self, request: VideoScaleSettingsRequest) {
+        *self = Self::AwaitingFrame(request);
+    }
+
+    /// A geometry event invalidates only dimension-dependent preparation. The
+    /// user's desired selection remains owned by this source and is evaluated
+    /// again against the new frame/target signature.
+    fn invalidate_preparation_and_keep_desired(&mut self) -> bool {
+        let request = match std::mem::take(self) {
+            Self::Idle => return false,
+            Self::AwaitingFrame(request) | Self::Preparing(request) | Self::Prepared(request) => {
+                request
+            }
+        };
+        *self = Self::AwaitingFrame(request);
+        true
+    }
+
+    fn discard_source(&mut self, source_epoch: u64) {
+        if let Self::AwaitingFrame(request) | Self::Preparing(request) | Self::Prepared(request) =
+            self
+        {
+            debug_assert_eq!(request.identity.source_epoch, source_epoch);
+        }
+        *self = Self::Idle;
     }
 }
 
@@ -1230,10 +1351,6 @@ impl<F> FramePresentationState<F> {
         self.should_represent_for_visual_change(render_grade_changed)
     }
 
-    fn should_represent_for_scale_change(&self, scale_changed: bool) -> bool {
-        self.should_represent_for_visual_change(scale_changed)
-    }
-
     fn should_represent_for_visual_change(&self, changed: bool) -> bool {
         changed && matches!(self, Self::Visible { .. })
     }
@@ -1257,7 +1374,7 @@ impl<F> FramePresentationState<F> {
 }
 
 #[cfg(windows)]
-const NATIVE_COMMAND_LATEST_SLOTS: usize = 31;
+const NATIVE_COMMAND_LATEST_SLOTS: usize = 30;
 
 #[cfg(windows)]
 fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usize> {
@@ -1289,10 +1406,9 @@ fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usiz
         NativeVideoOutputCommand::SetNormalizeOverlayState { .. } => Some(24),
         NativeVideoOutputCommand::RaiseHudToTop => Some(25),
         NativeVideoOutputCommand::RaisePresenterToFront => Some(26),
-        NativeVideoOutputCommand::PrepareVideoScaleSettings { .. } => Some(27),
-        NativeVideoOutputCommand::CommitVideoScaleSettings { .. } => Some(28),
-        NativeVideoOutputCommand::SetAnime4kState { .. } => Some(29),
-        NativeVideoOutputCommand::SetBarLockState { .. } => Some(30),
+        NativeVideoOutputCommand::RequestVideoScaleSettings { .. } => Some(27),
+        NativeVideoOutputCommand::SetAnime4kState { .. } => Some(28),
+        NativeVideoOutputCommand::SetBarLockState { .. } => Some(29),
         NativeVideoOutputCommand::ResetSidePanelSession
         | NativeVideoOutputCommand::StartAnime4kMeasurement
         | NativeVideoOutputCommand::ShowToast { .. }
@@ -1400,6 +1516,7 @@ struct PresenterSourceState {
     /// 切り替えるときも同じ Arc を引き継ぎ、grafana 的な時系列が分断されないようにする。
     audio_diagnostics: Arc<crate::video::audio_diagnostics::AudioDiagnostics>,
     source_epoch: u64,
+    video_scale_state: SourceVideoScaleState,
     queue: std::collections::VecDeque<VideoFrame>,
     last_seen_serial: u64,
     first_frame_event_last_epoch: Option<u64>,
@@ -1437,6 +1554,7 @@ impl PresenterSourceState {
             duration_secs_bits: payload.duration_secs_bits,
             audio_diagnostics: payload.audio_diagnostics,
             source_epoch: payload.source_epoch,
+            video_scale_state: SourceVideoScaleState::default(),
             queue: std::collections::VecDeque::new(),
             last_seen_serial,
             first_frame_event_last_epoch: None,
@@ -1479,8 +1597,8 @@ pub(crate) struct NativeVideoOutput {
     /// `take/attach_native_output` で presenter と一緒に運ばれるため lifetime 正しい。
     #[allow(dead_code)]
     committed_generation: AtomicU64,
-    /// Monotonic identity for the two-phase video scaling prepare/commit handshake.
-    video_scale_request_id: AtomicU64,
+    /// Output-lifetime monotonic revision paired with the owning source epoch.
+    video_scale_request_revision: AtomicU64,
     last_vst3_available: AtomicBool,
     last_checked: AtomicBool,
     last_text_contrast_strong: AtomicBool,
@@ -1570,7 +1688,7 @@ impl NativeVideoOutput {
             perf_overlay_visible: Arc::new(AtomicBool::new(false)),
             source_epoch: Arc::new(AtomicU64::new(0)),
             committed_generation: AtomicU64::new(0),
-            video_scale_request_id: AtomicU64::new(0),
+            video_scale_request_revision: AtomicU64::new(0),
             last_vst3_available: AtomicBool::new(false),
             last_checked: AtomicBool::new(false),
             last_text_contrast_strong: AtomicBool::new(false),
@@ -1716,7 +1834,7 @@ impl NativeVideoOutput {
             perf_overlay_visible,
             source_epoch,
             committed_generation: AtomicU64::new(0),
-            video_scale_request_id: AtomicU64::new(0),
+            video_scale_request_revision: AtomicU64::new(0),
             last_vst3_available: AtomicBool::new(initial_vst3_available),
             last_checked: AtomicBool::new(initial_checked),
             last_text_contrast_strong: AtomicBool::new(initial_text_contrast_strong),
@@ -1852,7 +1970,7 @@ impl NativeVideoOutput {
         crate::video::native_window::post_wake(self.hwnd.load(Ordering::Acquire));
     }
 
-    fn prepare_video_scale_settings(
+    fn request_video_scale_settings(
         &self,
         filter: crate::settings::VideoScaleFilter,
         smoothing_percent: u32,
@@ -1864,42 +1982,18 @@ impl NativeVideoOutput {
         {
             self.show_toast(toast, false, None);
         }
-        let request_id = self
-            .video_scale_request_id
+        let revision = self
+            .video_scale_request_revision
             .fetch_add(1, Ordering::AcqRel)
             .saturating_add(1);
+        let identity = VideoScaleRequestIdentity {
+            source_epoch: self.source_epoch.load(Ordering::Acquire),
+            revision,
+        };
         let _ = self
             .command_tx
-            .send(NativeVideoOutputCommand::PrepareVideoScaleSettings {
-                request_id,
-                filter,
-                smoothing_percent,
-                anime4k_variant,
-                origin,
-            });
-        crate::video::native_window::post_wake(self.hwnd.load(Ordering::Acquire));
-    }
-
-    fn commit_video_scale_settings(
-        &self,
-        request_id: u64,
-        filter: crate::settings::VideoScaleFilter,
-        smoothing_percent: u32,
-        anime4k_variant: Option<anime4k_policy::VideoAnime4kVariant>,
-        origin: VideoScaleChangeOrigin,
-    ) {
-        if self.video_scale_request_id.load(Ordering::Acquire) != request_id {
-            if let Some(toast) =
-                video_scale_feedback_toast(origin, VideoScaleFeedbackTransition::Rejected)
-            {
-                self.show_toast(toast, false, None);
-            }
-            return;
-        }
-        let _ = self
-            .command_tx
-            .send(NativeVideoOutputCommand::CommitVideoScaleSettings {
-                request_id,
+            .send(NativeVideoOutputCommand::RequestVideoScaleSettings {
+                identity,
                 filter,
                 smoothing_percent,
                 anime4k_variant,
@@ -2714,11 +2808,6 @@ impl NativeFrameOutputContext {
             .should_represent_for_grade_change(render_grade_changed)
     }
 
-    fn should_represent_for_scale_change(&self, scale_changed: bool) -> bool {
-        self.presentation
-            .should_represent_for_scale_change(scale_changed)
-    }
-
     fn hide(&mut self) {
         self.presentation.hide();
     }
@@ -3020,42 +3109,304 @@ fn send_native_output_event(
 }
 
 #[cfg(windows)]
-fn prepare_video_scale_request_for_frame(
+enum DesiredVideoScalePresent {
+    None,
+    Presented {
+        request: VideoScaleSettingsRequest,
+        outcome: native_presenter::NativePresentOutcome,
+    },
+    Rejected,
+}
+
+#[cfg(windows)]
+fn begin_desired_video_scale_prepare(
     presenter: &mut native_presenter::NativeRenderCore,
+    state: &mut SourceVideoScaleState,
     frame: &VideoFrame,
-    request: VideoScaleSettingsRequest,
     source_epoch: u64,
-    ui_event_tx: &NativeOutputEventSender,
-) {
-    match presenter.prepare_video_scale_settings(
+) -> Result<Option<VideoScaleSettingsRequest>, VideoScaleApplyRejectReason> {
+    let Some(request) = state.begin_preparing(source_epoch, true)? else {
+        return Ok(None);
+    };
+    if let Err(error) = presenter.prepare_video_scale_settings(
         frame,
-        request.request_id,
+        request.identity,
         request.filter,
         request.smoothing_percent,
         request.anime4k_variant,
     ) {
-        Ok(()) => send_native_output_event(
-            ui_event_tx,
-            source_epoch,
-            NativeVideoOutputEvent::VideoScaleSettingsPrepared {
-                request_id: request.request_id,
-                filter: request.filter,
-                smoothing_percent: request.smoothing_percent,
-                anime4k_variant: request.anime4k_variant,
-                origin: request.origin,
-            },
-        ),
-        Err(error) => {
-            crate::logger::log(format!(
-                "[native-video] scale-filter preparation failed: {error}"
-            ));
-            if let Some(toast) =
-                video_scale_feedback_toast(request.origin, VideoScaleFeedbackTransition::Rejected)
-            {
-                presenter.show_overlay_toast(toast, false, None);
+        return finish_failed_video_scale_prepare(presenter, state, request, error);
+    }
+    if let Err(reason) = state.mark_prepared(request.identity) {
+        state.discard_current();
+        presenter.discard_prepared_video_scale_settings();
+        return Err(reason);
+    }
+    Ok(Some(request))
+}
+
+#[cfg(windows)]
+fn finish_failed_video_scale_prepare(
+    presenter: &mut native_presenter::NativeRenderCore,
+    state: &mut SourceVideoScaleState,
+    request: VideoScaleSettingsRequest,
+    error: String,
+) -> Result<Option<VideoScaleSettingsRequest>, VideoScaleApplyRejectReason> {
+    state.discard_current();
+    presenter.discard_prepared_video_scale_settings();
+    log_failed_video_scale_prepare(request, &error);
+    show_rejected_video_scale_toast(presenter, request.origin);
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn log_failed_video_scale_prepare(request: VideoScaleSettingsRequest, error: &str) {
+    crate::logger::log(format!(
+        "[native-video] scale-filter preparation failed source_epoch={} revision={} error={error}",
+        request.identity.source_epoch, request.identity.revision
+    ));
+}
+
+#[cfg(windows)]
+fn show_rejected_video_scale_toast(
+    presenter: &mut native_presenter::NativeRenderCore,
+    origin: VideoScaleChangeOrigin,
+) {
+    if let Some(toast) = video_scale_feedback_toast(origin, VideoScaleFeedbackTransition::Rejected)
+    {
+        presenter.show_overlay_toast(toast, false, None);
+    }
+}
+
+#[cfg(windows)]
+fn present_desired_video_scale_for_frame(
+    presenter: &mut native_presenter::NativeRenderCore,
+    state: &mut SourceVideoScaleState,
+    frame: &VideoFrame,
+    source_epoch: u64,
+    sync_interval: u32,
+) -> DesiredVideoScalePresent {
+    let request = match begin_desired_video_scale_prepare(presenter, state, frame, source_epoch) {
+        Ok(Some(request)) => request,
+        Ok(None) => return DesiredVideoScalePresent::None,
+        Err(reason) => {
+            log_video_scale_apply_reject(None, &reason);
+            return DesiredVideoScalePresent::Rejected;
+        }
+    };
+    finish_desired_video_scale_present(presenter, state, frame, request, sync_interval)
+}
+
+#[cfg(windows)]
+fn finish_desired_video_scale_present(
+    presenter: &mut native_presenter::NativeRenderCore,
+    state: &mut SourceVideoScaleState,
+    frame: &VideoFrame,
+    request: VideoScaleSettingsRequest,
+    sync_interval: u32,
+) -> DesiredVideoScalePresent {
+    match presenter.present_prepared_video_scale_settings(
+        frame,
+        sync_interval,
+        request.identity,
+        request.filter,
+        request.smoothing_percent,
+        request.anime4k_variant,
+    ) {
+        Ok(outcome) => {
+            let completed = state
+                .complete_prepared(request.identity)
+                .expect("prepared scale request must remain source-owned through present");
+            DesiredVideoScalePresent::Presented {
+                request: completed,
+                outcome,
             }
         }
+        Err(error) => finish_rejected_video_scale_present(presenter, state, request, error),
     }
+}
+
+#[cfg(windows)]
+fn finish_rejected_video_scale_present(
+    presenter: &mut native_presenter::NativeRenderCore,
+    state: &mut SourceVideoScaleState,
+    request: VideoScaleSettingsRequest,
+    error: native_presenter::VideoScalePreparedPresentError,
+) -> DesiredVideoScalePresent {
+    match error {
+        native_presenter::VideoScalePreparedPresentError::Rejected(reason) => {
+            let completed = state.complete_prepared(request.identity).unwrap_or(request);
+            if matches!(reason, VideoScaleApplyRejectReason::SignatureChanged { .. }) {
+                state.restore_desired(completed);
+            } else if matches!(
+                reason,
+                VideoScaleApplyRejectReason::NoPrepared
+                    | VideoScaleApplyRejectReason::RequestMismatch { .. }
+            ) {
+                show_rejected_video_scale_toast(presenter, request.origin);
+            }
+            log_video_scale_apply_reject(Some(request.identity), &reason);
+        }
+        native_presenter::VideoScalePreparedPresentError::Present(error) => {
+            state.discard_current();
+            crate::logger::log(format!(
+                "[native-video] scale-filter present failed source_epoch={} revision={} error={error}",
+                request.identity.source_epoch, request.identity.revision
+            ));
+            show_rejected_video_scale_toast(presenter, request.origin);
+        }
+    }
+    DesiredVideoScalePresent::Rejected
+}
+
+#[cfg(windows)]
+fn log_video_scale_apply_reject(
+    identity: Option<VideoScaleRequestIdentity>,
+    reason: &VideoScaleApplyRejectReason,
+) {
+    let identity = identity
+        .map(|identity| {
+            format!(
+                "source_epoch={} revision={}",
+                identity.source_epoch, identity.revision
+            )
+        })
+        .unwrap_or_else(|| "source_epoch=unknown revision=unknown".to_string());
+    crate::logger::log(format!(
+        "[native-video] scale-filter apply rejected {identity} reason={} detail={reason:?}",
+        reason.code()
+    ));
+    if crate::perf::is_enabled() {
+        let changed_fields = match reason {
+            VideoScaleApplyRejectReason::SignatureChanged { fields } => fields.join(","),
+            _ => String::new(),
+        };
+        crate::perf::event(
+            "native_presenter",
+            "video_scale_apply_rejected",
+            None,
+            0,
+            &[
+                ("identity", serde_json::Value::from(identity)),
+                ("reason", serde_json::Value::from(reason.code())),
+                ("signature_fields", serde_json::Value::from(changed_fields)),
+            ],
+        );
+    }
+}
+
+#[cfg(windows)]
+fn publish_video_scale_settings_committed(
+    presenter: &native_presenter::NativeRenderCore,
+    ui_event_tx: &NativeOutputEventSender,
+    source_epoch: u64,
+    request: VideoScaleSettingsRequest,
+) {
+    let toast = video_scale_feedback_toast(
+        request.origin,
+        VideoScaleFeedbackTransition::Committed {
+            filter: request.filter,
+            fallback: presenter.video_scale_fallback_notice(),
+        },
+    );
+    send_native_output_event(
+        ui_event_tx,
+        source_epoch,
+        NativeVideoOutputEvent::VideoScaleSettingsCommitted {
+            filter: request.filter,
+            smoothing_percent: request.smoothing_percent,
+            anime4k_variant: request.anime4k_variant,
+            toast,
+        },
+    );
+}
+
+#[cfg(windows)]
+fn handle_video_scale_request_command(
+    presenter: &mut native_presenter::NativeRenderCore,
+    source: &mut PresenterSourceState,
+    request: VideoScaleSettingsRequest,
+) -> bool {
+    if request.identity.source_epoch != source.source_epoch {
+        log_video_scale_apply_reject(
+            Some(request.identity),
+            &VideoScaleApplyRejectReason::SourceChanged {
+                prepared_source_epoch: request.identity.source_epoch,
+                current_source_epoch: source.source_epoch,
+            },
+        );
+        return false;
+    }
+    presenter.discard_prepared_video_scale_settings();
+    source.video_scale_state.replace_desired(request);
+    true
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn apply_desired_video_scale_to_held_frame(
+    presenter: &mut native_presenter::NativeRenderCore,
+    source: &mut PresenterSourceState,
+    frame_output: &mut NativeFrameOutputContext,
+    sync_interval: u32,
+    ui_event_tx: &NativeOutputEventSender,
+    cur_filter: &mut crate::settings::VideoScaleFilter,
+    cur_smoothing: &mut u32,
+    cur_variant: &mut Option<anime4k_policy::VideoAnime4kVariant>,
+    keep_hidden_after_present: bool,
+) {
+    if !source.video_scale_state.has_desired() {
+        return;
+    }
+    let Some(frame) = frame_output.frame() else {
+        crate::logger::log(format!(
+            "[native-video] scale-filter awaiting displayable frame source_epoch={} reason={}",
+            source.source_epoch,
+            VideoScaleApplyRejectReason::NoFrame.code()
+        ));
+        return;
+    };
+    let was_hidden = frame_output.is_hidden();
+    let result = present_desired_video_scale_for_frame(
+        presenter,
+        &mut source.video_scale_state,
+        frame,
+        source.source_epoch,
+        sync_interval,
+    );
+    if let DesiredVideoScalePresent::Presented { request, outcome } = result {
+        debug_assert!(frame_output.mark_current_visible(outcome.copy_fence_value));
+        if was_hidden && keep_hidden_after_present {
+            frame_output.hide();
+        }
+        frame_output.retire_completed(presenter.copy_fence_completed_value());
+        finish_video_scale_commit(
+            presenter,
+            ui_event_tx,
+            source.source_epoch,
+            request,
+            cur_filter,
+            cur_smoothing,
+            cur_variant,
+        );
+    }
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn finish_video_scale_commit(
+    presenter: &native_presenter::NativeRenderCore,
+    ui_event_tx: &NativeOutputEventSender,
+    source_epoch: u64,
+    request: VideoScaleSettingsRequest,
+    cur_filter: &mut crate::settings::VideoScaleFilter,
+    cur_smoothing: &mut u32,
+    cur_variant: &mut Option<anime4k_policy::VideoAnime4kVariant>,
+) {
+    *cur_filter = request.filter;
+    *cur_smoothing = request.smoothing_percent;
+    *cur_variant = request.anime4k_variant;
+    publish_video_scale_settings_committed(presenter, ui_event_tx, source_epoch, request);
 }
 
 #[cfg(windows)]
@@ -3643,7 +3994,6 @@ fn run_native_video_output(
     // owner. `source.queue` remains an unpresented pacing queue and is never a
     // placement/grade fallback.
     let mut frame_output = NativeFrameOutputContext::new();
-    let mut deferred_video_scale_request = DeferredVideoScaleRequest::default();
     /// presenter 側 `source.queue` の最大長 (Codex 助言、2026-05-15)。旧コードは
     /// `video_rx.try_recv()` を空になるまで drain して queue に積み込んでいたため、
     /// 高負荷 / pool exhausted 時に queue が 23 まで肥大化 → present_retire / shared
@@ -3890,6 +4240,7 @@ fn run_native_video_output(
         }
         let perf_visible = perf_overlay_visible.load(Ordering::Acquire);
         let perf_visibility_changed = presenter.set_overlay_perf_visible(perf_visible);
+        let mut desired_scale_apply_due = false;
         for command in command_rx.drain() {
             match command {
                 NativeVideoOutputCommand::SetHoverThumbnail { thumbnail } => {
@@ -3909,9 +4260,19 @@ fn run_native_video_output(
                     cur_video_grade = grade;
                     match presenter.set_video_grade(cur_video_grade.clone()) {
                         Ok(()) => {
-                            // A grade command is the only paused-state refresh trigger.
+                            if render_grade_changed
+                                && source
+                                    .video_scale_state
+                                    .invalidate_preparation_and_keep_desired()
+                            {
+                                presenter.discard_prepared_video_scale_settings();
+                                desired_scale_apply_due = true;
+                            }
+                            // Grade has its own paused-state refresh. Scaling selections
+                            // use the source-owned desired-state present path below.
                             // Empty, Hidden, and render-equivalent snapshots stay idle.
                             if frame_output.should_represent_for_grade_change(render_grade_changed)
+                                && !source.video_scale_state.has_desired()
                             {
                                 let refresh = frame_output
                                     .visible_frame()
@@ -3958,15 +4319,15 @@ fn run_native_video_output(
                     cur_anime4k_status = status.clone();
                     presenter.set_overlay_video_anime4k_state(budget, status);
                 }
-                NativeVideoOutputCommand::PrepareVideoScaleSettings {
-                    request_id,
+                NativeVideoOutputCommand::RequestVideoScaleSettings {
+                    identity,
                     filter,
                     smoothing_percent,
                     anime4k_variant,
                     origin,
                 } => {
                     let request = VideoScaleSettingsRequest {
-                        request_id,
+                        identity,
                         filter,
                         smoothing_percent: crate::settings::sanitize_downscale_smoothing_percent(
                             smoothing_percent,
@@ -3974,94 +4335,8 @@ fn run_native_video_output(
                         anime4k_variant,
                         origin,
                     };
-                    if let Some(frame) = frame_output.frame() {
-                        prepare_video_scale_request_for_frame(
-                            &mut presenter,
-                            frame,
-                            request,
-                            source.source_epoch,
-                            &ui_event_tx,
-                        );
-                    } else {
-                        deferred_video_scale_request
-                            .hold_until_first_frame(source.source_epoch, request);
-                        crate::logger::log(format!(
-                            "[native-video] scale-filter preparation deferred until first frame request_id={request_id} source_epoch={}",
-                            source.source_epoch
-                        ));
-                    }
-                }
-                NativeVideoOutputCommand::CommitVideoScaleSettings {
-                    request_id,
-                    filter,
-                    smoothing_percent,
-                    anime4k_variant,
-                    origin,
-                } => {
-                    let smoothing_percent =
-                        crate::settings::sanitize_downscale_smoothing_percent(smoothing_percent);
-                    let changed = cur_scale_filter != filter
-                        || cur_downscale_smoothing_percent != smoothing_percent
-                        || cur_anime4k_variant != anime4k_variant;
-                    let committed = frame_output.frame().is_some_and(|frame| {
-                        presenter.commit_video_scale_settings(
-                            frame,
-                            request_id,
-                            filter,
-                            smoothing_percent,
-                            anime4k_variant,
-                        )
-                    });
-                    if !committed {
-                        crate::logger::log(format!(
-                            "[native-video] stale scale-filter commit discarded request_id={request_id}"
-                        ));
-                        if let Some(toast) = video_scale_feedback_toast(
-                            origin,
-                            VideoScaleFeedbackTransition::Rejected,
-                        ) {
-                            presenter.show_overlay_toast(toast, false, None);
-                        }
-                    } else {
-                        cur_scale_filter = filter;
-                        cur_downscale_smoothing_percent = smoothing_percent;
-                        cur_anime4k_variant = anime4k_variant;
-                        if frame_output.should_represent_for_scale_change(changed) {
-                            let refresh = frame_output
-                                .visible_frame()
-                                .map(|frame| presenter.present(frame, config.sync_interval));
-                            match refresh {
-                                Some(Ok(outcome)) => {
-                                    debug_assert!(
-                                        frame_output.mark_current_visible(outcome.copy_fence_value)
-                                    );
-                                    frame_output
-                                        .retire_completed(presenter.copy_fence_completed_value());
-                                }
-                                Some(Err(error)) => crate::logger::log(format!(
-                                    "[native-video] scale-filter refresh present failed: {error}"
-                                )),
-                                None => {}
-                            }
-                        }
-                        let toast = video_scale_feedback_toast(
-                            origin,
-                            VideoScaleFeedbackTransition::Committed {
-                                filter,
-                                fallback: presenter.video_scale_fallback_notice(),
-                            },
-                        );
-                        send_native_output_event(
-                            &ui_event_tx,
-                            source.source_epoch,
-                            NativeVideoOutputEvent::VideoScaleSettingsCommitted {
-                                filter,
-                                smoothing_percent,
-                                anime4k_variant,
-                                toast,
-                            },
-                        );
-                    }
+                    desired_scale_apply_due |=
+                        handle_video_scale_request_command(&mut presenter, &mut source, request);
                 }
                 NativeVideoOutputCommand::SetMetadata { metadata } => {
                     presenter.set_overlay_metadata(metadata);
@@ -4085,6 +4360,12 @@ fn run_native_video_output(
                         crate::logger::log(format!(
                             "[native-video] set fixed-bar transform failed: {err}"
                         ));
+                    } else if source
+                        .video_scale_state
+                        .invalidate_preparation_and_keep_desired()
+                    {
+                        presenter.discard_prepared_video_scale_settings();
+                        desired_scale_apply_due = true;
                     }
                 }
                 NativeVideoOutputCommand::ResetSidePanelSession => {
@@ -4124,6 +4405,12 @@ fn run_native_video_output(
                         crate::logger::log(format!(
                             "[native-video] set compact transform failed: {err}"
                         ));
+                    } else if source
+                        .video_scale_state
+                        .invalidate_preparation_and_keep_desired()
+                    {
+                        presenter.discard_prepared_video_scale_settings();
+                        desired_scale_apply_due = true;
                     }
                 }
                 NativeVideoOutputCommand::SetVideoGeometry {
@@ -4136,6 +4423,12 @@ fn run_native_video_output(
                         crate::logger::log(format!(
                             "[native-video] set display geometry failed: {err}"
                         ));
+                    } else if source
+                        .video_scale_state
+                        .invalidate_preparation_and_keep_desired()
+                    {
+                        presenter.discard_prepared_video_scale_settings();
+                        desired_scale_apply_due = true;
                     }
                 }
                 NativeVideoOutputCommand::SetVst3Panel { panel } => {
@@ -4206,6 +4499,19 @@ fn run_native_video_output(
                         // フレームを 1 回 present してから再表示する。これで音声モード中に
                         // seek していても正しい位置の映像で復帰し、hide 前の古いフレームが
                         // 一瞬見える flash を防ぐ。present は通常経路と同じ retire 管理を通す。
+                        if frame_output.is_hidden() && source.video_scale_state.has_desired() {
+                            apply_desired_video_scale_to_held_frame(
+                                &mut presenter,
+                                &mut source,
+                                &mut frame_output,
+                                config.sync_interval,
+                                &ui_event_tx,
+                                &mut cur_scale_filter,
+                                &mut cur_downscale_smoothing_percent,
+                                &mut cur_anime4k_variant,
+                                false,
+                            );
+                        }
                         let hidden_present = if frame_output.is_hidden() {
                             frame_output.frame().map(|frame| {
                                 (
@@ -4278,7 +4584,8 @@ fn run_native_video_output(
                     // move to the disposal queue; Hidden frames return to producer-side
                     // recovery without becoming a fallback for the new source.
                     frame_output.clear_current();
-                    deferred_video_scale_request.drop_source(source.source_epoch);
+                    source.video_scale_state.discard_source(source.source_epoch);
+                    presenter.discard_prepared_video_scale_settings();
                     if cur_scale_filter == crate::settings::VideoScaleFilter::Anime {
                         cur_anime4k_variant = None;
                         cur_anime4k_status =
@@ -4398,21 +4705,43 @@ fn run_native_video_output(
                         let (new_width, new_height) =
                             wait_for_native_window_resize(&window_pump, cur_generation, &cancel)?;
                         match presenter.resize(new_width, new_height) {
-                            Ok(intents) => window_pump.publish_visual(
-                                native_window_pump::NativeWindowVisualUpdate {
-                                    epoch: cur_generation,
-                                    window_intents: intents,
-                                    hud_regions: None,
-                                    toast_active: presenter.overlay_toast_active(),
-                                    fullscreen_overlay_active: false,
-                                    debug_description: None,
-                                },
-                            ),
+                            Ok(intents) => {
+                                window_pump.publish_visual(
+                                    native_window_pump::NativeWindowVisualUpdate {
+                                        epoch: cur_generation,
+                                        window_intents: intents,
+                                        hud_regions: None,
+                                        toast_active: presenter.overlay_toast_active(),
+                                        fullscreen_overlay_active: false,
+                                        debug_description: None,
+                                    },
+                                );
+                                if source
+                                    .video_scale_state
+                                    .invalidate_preparation_and_keep_desired()
+                                {
+                                    presenter.discard_prepared_video_scale_settings();
+                                    desired_scale_apply_due = true;
+                                }
+                            }
                             Err(err) => crate::logger::log(format!(
                                 "[native-video] same placement resize failed: {err}"
                             )),
                         }
                         if visible && presenter_visibility.is_hidden() {
+                            if frame_output.is_hidden() && source.video_scale_state.has_desired() {
+                                apply_desired_video_scale_to_held_frame(
+                                    &mut presenter,
+                                    &mut source,
+                                    &mut frame_output,
+                                    config.sync_interval,
+                                    &ui_event_tx,
+                                    &mut cur_scale_filter,
+                                    &mut cur_downscale_smoothing_percent,
+                                    &mut cur_anime4k_variant,
+                                    false,
+                                );
+                            }
                             let hidden_present = if frame_output.is_hidden() {
                                 frame_output
                                     .frame()
@@ -4627,6 +4956,13 @@ fn run_native_video_output(
                     )?;
                     let old_presenter = std::mem::replace(&mut presenter, new_presenter);
                     old_presenter.detach();
+                    if source
+                        .video_scale_state
+                        .invalidate_preparation_and_keep_desired()
+                    {
+                        presenter.discard_prepared_video_scale_settings();
+                        desired_scale_apply_due = true;
+                    }
                     frame_output.invalidate_retire_fence_prefix(old_retire_len);
                     cur_generation = candidate_epoch;
                     cur_placement = placement;
@@ -4692,7 +5028,14 @@ fn run_native_video_output(
                             toast_active: presenter.overlay_toast_active(),
                             fullscreen_overlay_active: false,
                             debug_description: None,
-                        })
+                        });
+                        if source
+                            .video_scale_state
+                            .invalidate_preparation_and_keep_desired()
+                        {
+                            presenter.discard_prepared_video_scale_settings();
+                            desired_scale_apply_due = true;
+                        }
                     }
                     Err(err) => crate::logger::log(format!(
                         "[native-video] GeometryChanged resize_to({w}x{h}) failed: {err}"
@@ -4707,6 +5050,12 @@ fn run_native_video_output(
                         crate::logger::log(format!(
                             "[native-video] set DPI fixed-bar transform failed: {err}"
                         ));
+                    } else if source
+                        .video_scale_state
+                        .invalidate_preparation_and_keep_desired()
+                    {
+                        presenter.discard_prepared_video_scale_settings();
+                        desired_scale_apply_due = true;
                     }
                     let rect_w = (suggested_rect.right - suggested_rect.left).max(1) as u32;
                     let rect_h = (suggested_rect.bottom - suggested_rect.top).max(1) as u32;
@@ -4731,6 +5080,19 @@ fn run_native_video_output(
         }
 
         let presenter_hidden = presenter_visibility.is_hidden();
+        if desired_scale_apply_due && !presenter_hidden {
+            apply_desired_video_scale_to_held_frame(
+                &mut presenter,
+                &mut source,
+                &mut frame_output,
+                config.sync_interval,
+                &ui_event_tx,
+                &mut cur_scale_filter,
+                &mut cur_downscale_smoothing_percent,
+                &mut cur_anime4k_variant,
+                false,
+            );
+        }
         if presenter_hidden {
             publish_native_overlay_input_routing(
                 &ui_event_tx,
@@ -5567,21 +5929,30 @@ fn run_native_video_output(
             refresh_settled_resize_if_due(&mut presenter, &mut frame_output, config.sync_interval);
         }
 
-        if let Some(frame) = latest_renderable.as_ref()
-            && let Some(request) =
-                deferred_video_scale_request.take_for_first_frame(source.source_epoch)
-        {
-            crate::logger::log(format!(
-                "[native-video] applying deferred scale-filter preparation on first frame request_id={} source_epoch={}",
-                request.request_id, source.source_epoch
-            ));
-            prepare_video_scale_request_for_frame(
+        let mut desired_scale_present = None;
+        if !presenter_hidden && let Some(frame) = latest_renderable.as_ref() {
+            let scale_present_t0 = Instant::now();
+            match present_desired_video_scale_for_frame(
                 &mut presenter,
+                &mut source.video_scale_state,
                 frame,
-                request,
                 source.source_epoch,
-                &ui_event_tx,
-            );
+                config.sync_interval,
+            ) {
+                DesiredVideoScalePresent::Presented { request, outcome } => {
+                    finish_video_scale_commit(
+                        &presenter,
+                        &ui_event_tx,
+                        source.source_epoch,
+                        request,
+                        &mut cur_scale_filter,
+                        &mut cur_downscale_smoothing_percent,
+                        &mut cur_anime4k_variant,
+                    );
+                    desired_scale_present = Some((outcome, scale_present_t0));
+                }
+                DesiredVideoScalePresent::None | DesiredVideoScalePresent::Rejected => {}
+            }
         }
 
         if let Some(frame) = latest_renderable {
@@ -5640,8 +6011,14 @@ fn run_native_video_output(
                 frame_output.hold_hidden(frame);
                 continue;
             }
-            let present_t0 = Instant::now();
-            match presenter.present(&frame, config.sync_interval) {
+            let (present_result, present_t0) = match desired_scale_present {
+                Some((outcome, started)) => (Ok(outcome), started),
+                None => {
+                    let started = Instant::now();
+                    (presenter.present(&frame, config.sync_interval), started)
+                }
+            };
+            match present_result {
                 Ok(outcome) => {
                     let total_ms = present_t0.elapsed().as_secs_f64() * 1000.0;
                     let late_ms = ((source.clock.now_secs() - pts) * 1000.0).max(0.0);
@@ -7984,7 +8361,7 @@ impl VideoPlayer {
     }
 
     #[cfg(windows)]
-    pub fn prepare_native_video_scale_settings(
+    pub fn request_native_video_scale_settings(
         &self,
         filter: crate::settings::VideoScaleFilter,
         smoothing_percent: u32,
@@ -7992,27 +8369,7 @@ impl VideoPlayer {
         origin: VideoScaleChangeOrigin,
     ) {
         if let Some(output) = self.native_output.as_ref() {
-            output.prepare_video_scale_settings(filter, smoothing_percent, anime4k_variant, origin);
-        }
-    }
-
-    #[cfg(windows)]
-    pub fn commit_native_video_scale_settings(
-        &self,
-        request_id: u64,
-        filter: crate::settings::VideoScaleFilter,
-        smoothing_percent: u32,
-        anime4k_variant: Option<anime4k_policy::VideoAnime4kVariant>,
-        origin: VideoScaleChangeOrigin,
-    ) {
-        if let Some(output) = self.native_output.as_ref() {
-            output.commit_video_scale_settings(
-                request_id,
-                filter,
-                smoothing_percent,
-                anime4k_variant,
-                origin,
-            );
+            output.request_video_scale_settings(filter, smoothing_percent, anime4k_variant, origin);
         }
     }
 
@@ -9192,11 +9549,14 @@ fn dummy_video_rx() -> crossbeam_channel::Receiver<VideoFrame> {
 mod tests {
     #[cfg(windows)]
     fn video_scale_request(
-        request_id: u64,
+        revision: u64,
         filter: crate::settings::VideoScaleFilter,
     ) -> super::VideoScaleSettingsRequest {
         super::VideoScaleSettingsRequest {
-            request_id,
+            identity: super::VideoScaleRequestIdentity {
+                source_epoch: 11,
+                revision,
+            },
             filter,
             smoothing_percent: 25,
             anime4k_variant: None,
@@ -9206,41 +9566,85 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn deferred_video_scale_request_applies_once_on_first_frame() {
-        let mut state = super::DeferredVideoScaleRequest::default();
+    fn desired_video_scale_request_applies_once_on_first_displayable_frame() {
+        let mut state = super::SourceVideoScaleState::default();
         let request = video_scale_request(7, crate::settings::VideoScaleFilter::Sharp);
 
-        state.hold_until_first_frame(11, request);
-
-        assert_eq!(state.take_for_first_frame(11), Some(request));
-        assert_eq!(state.take_for_first_frame(11), None);
+        state.replace_desired(request);
+        assert_eq!(
+            state.begin_preparing(11, false),
+            Err(super::VideoScaleApplyRejectReason::NoFrame)
+        );
+        assert_eq!(state.begin_preparing(11, true), Ok(Some(request)));
+        assert_eq!(state.mark_prepared(request.identity), Ok(request));
+        assert_eq!(state.complete_prepared(request.identity), Ok(request));
+        assert_eq!(state.begin_preparing(11, true), Ok(None));
     }
 
     #[cfg(windows)]
     #[test]
-    fn later_deferred_video_scale_request_supersedes_the_earlier_one() {
-        let mut state = super::DeferredVideoScaleRequest::default();
+    fn later_desired_video_scale_request_supersedes_the_earlier_one() {
+        let mut state = super::SourceVideoScaleState::default();
         let earlier = video_scale_request(7, crate::settings::VideoScaleFilter::Sharp);
         let later = video_scale_request(8, crate::settings::VideoScaleFilter::Nearest);
 
-        state.hold_until_first_frame(11, earlier);
-        state.hold_until_first_frame(11, later);
+        state.replace_desired(earlier);
+        state.replace_desired(later);
 
-        assert_eq!(state.take_for_first_frame(11), Some(later));
-        assert_eq!(state.take_for_first_frame(11), None);
+        assert_eq!(state.begin_preparing(11, true), Ok(Some(later)));
+        assert_eq!(state.mark_prepared(later.identity), Ok(later));
+        assert_eq!(state.complete_prepared(later.identity), Ok(later));
+        assert_eq!(state.begin_preparing(11, true), Ok(None));
     }
 
     #[cfg(windows)]
     #[test]
-    fn deferred_video_scale_request_is_dropped_with_its_source() {
-        let mut state = super::DeferredVideoScaleRequest::default();
+    fn prepared_video_scale_request_is_dropped_with_its_source() {
+        let mut state = super::SourceVideoScaleState::default();
         let request = video_scale_request(7, crate::settings::VideoScaleFilter::Anime);
 
-        state.hold_until_first_frame(11, request);
-        state.drop_source(11);
+        state.replace_desired(request);
+        state.discard_source(11);
+        assert_eq!(state.begin_preparing(12, true), Ok(None));
 
-        assert_eq!(state.take_for_first_frame(11), None);
-        assert_eq!(state.take_for_first_frame(12), None);
+        state.replace_desired(request);
+        assert_eq!(state.begin_preparing(11, true), Ok(Some(request)));
+        assert_eq!(state.mark_prepared(request.identity), Ok(request));
+        state.discard_source(11);
+
+        assert_eq!(
+            state.complete_prepared(request.identity),
+            Err(super::VideoScaleApplyRejectReason::NoPrepared)
+        );
+        assert_eq!(state.begin_preparing(12, true), Ok(None));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn geometry_change_invalidates_preparation_but_keeps_the_desired_selection() {
+        let mut state = super::SourceVideoScaleState::default();
+        let request = video_scale_request(8, crate::settings::VideoScaleFilter::Nearest);
+
+        state.replace_desired(request);
+        assert_eq!(state.begin_preparing(11, true), Ok(Some(request)));
+        assert_eq!(state.mark_prepared(request.identity), Ok(request));
+
+        assert!(state.invalidate_preparation_and_keep_desired());
+        assert_eq!(state.begin_preparing(11, true), Ok(Some(request)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn publishing_a_request_only_enters_awaiting_frame_state() {
+        let mut state = super::SourceVideoScaleState::default();
+        let request = video_scale_request(9, crate::settings::VideoScaleFilter::Standard);
+
+        state.replace_desired(request);
+
+        assert!(matches!(
+            state,
+            super::SourceVideoScaleState::AwaitingFrame(value) if value == request
+        ));
     }
 
     #[cfg(windows)]
@@ -9671,19 +10075,6 @@ mod tests {
 
         let _ = state.replace_visible("visible", 3);
         assert!(state.should_represent_for_grade_change(true));
-    }
-
-    #[test]
-    fn paused_visible_frame_requests_immediate_scale_change_represent() {
-        let mut state = super::FramePresentationState::Empty;
-        assert!(!state.should_represent_for_scale_change(true));
-
-        assert!(state.replace_hidden("paused-hidden").is_none());
-        assert!(!state.should_represent_for_scale_change(true));
-
-        let _ = state.replace_visible("paused-visible", 17);
-        assert!(state.should_represent_for_scale_change(true));
-        assert!(!state.should_represent_for_scale_change(false));
     }
 
     #[test]

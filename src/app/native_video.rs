@@ -3779,9 +3779,6 @@ impl App {
                     | crate::video::NativeVideoOutputEvent::OpenTouchInfoPanel
                     | crate::video::NativeVideoOutputEvent::DismissTouchSidePanels
                     | crate::video::NativeVideoOutputEvent::SetVideoAdjustments { .. }
-                    | crate::video::NativeVideoOutputEvent::RequestVideoScaleSettings { .. }
-                    | crate::video::NativeVideoOutputEvent::VideoScaleSettingsPrepared { .. }
-                    | crate::video::NativeVideoOutputEvent::VideoScaleSettingsCommitted { .. }
             ) {
                 // fall through: NavigateItem は dispatch 続行
             } else {
@@ -4160,23 +4157,6 @@ impl App {
                     player.start_native_anime4k_measurement();
                 }
                 self.mark_native_video_hud_activity(ctx);
-            }
-            crate::video::NativeVideoOutputEvent::VideoScaleSettingsPrepared {
-                request_id,
-                filter,
-                smoothing_percent,
-                anime4k_variant,
-                origin,
-            } => {
-                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                    player.commit_native_video_scale_settings(
-                        request_id,
-                        filter,
-                        smoothing_percent,
-                        anime4k_variant,
-                        origin,
-                    );
-                }
             }
             crate::video::NativeVideoOutputEvent::VideoScaleSettingsCommitted {
                 filter,
@@ -7947,8 +7927,8 @@ impl App {
                 }
                 NativeVideoKeyOutcome::Action(KeyAction::VideoAnime4kRemeasure)
             }
-            // T: cycle the native video's scaling method. The renderer persists the
-            // setting only after dimension-dependent resources are ready.
+            // T: cycle the native video's scaling method. The App persists only after
+            // the renderer reports a successful present with the new selection.
             _ if !key.repeat
                 && self
                     .keymap
@@ -8025,7 +8005,7 @@ impl App {
         } else {
             None
         };
-        player.prepare_native_video_scale_settings(
+        player.request_native_video_scale_settings(
             filter,
             smoothing_percent,
             anime4k_variant,

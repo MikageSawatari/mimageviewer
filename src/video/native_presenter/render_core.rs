@@ -329,13 +329,9 @@ struct VideoScalePreparationSignature {
     sar_num: u32,
     sar_den: u32,
     orientation: VideoOrientation,
-    viewport_width: u32,
-    viewport_height: u32,
-    layout: VideoVisualLayout,
-    resizing: bool,
-    current_surface_width: u32,
-    current_surface_height: u32,
-    current_surface_content: VideoSurfaceContent,
+    target_width: u32,
+    target_height: u32,
+    target_content: VideoSurfaceContent,
     grade_active: bool,
     filter: VideoScaleFilter,
     smoothing_percent: u32,
@@ -344,19 +340,66 @@ struct VideoScalePreparationSignature {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PreparedVideoScaleSettings {
-    request_id: u64,
+    identity: crate::video::VideoScaleRequestIdentity,
     signature: VideoScalePreparationSignature,
 }
-fn prepared_video_scale_settings_matches(
+
+fn video_scale_signature_changed_fields(
+    prepared: VideoScalePreparationSignature,
+    current: VideoScalePreparationSignature,
+) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    macro_rules! changed {
+        ($field:ident) => {
+            if prepared.$field != current.$field {
+                fields.push(stringify!($field));
+            }
+        };
+    }
+    changed!(source_width);
+    changed!(source_height);
+    changed!(sar_num);
+    changed!(sar_den);
+    changed!(orientation);
+    changed!(target_width);
+    changed!(target_height);
+    changed!(target_content);
+    changed!(grade_active);
+    changed!(filter);
+    changed!(smoothing_percent);
+    changed!(anime4k_variant);
+    fields
+}
+
+fn validate_prepared_video_scale_settings(
     prepared: Option<PreparedVideoScaleSettings>,
-    request_id: u64,
+    identity: crate::video::VideoScaleRequestIdentity,
     signature: VideoScalePreparationSignature,
-) -> bool {
-    prepared
-        == Some(PreparedVideoScaleSettings {
-            request_id,
-            signature,
-        })
+) -> Result<(), crate::video::VideoScaleApplyRejectReason> {
+    let prepared = prepared.ok_or(crate::video::VideoScaleApplyRejectReason::NoPrepared)?;
+    if prepared.identity.source_epoch != identity.source_epoch {
+        return Err(crate::video::VideoScaleApplyRejectReason::SourceChanged {
+            prepared_source_epoch: prepared.identity.source_epoch,
+            current_source_epoch: identity.source_epoch,
+        });
+    }
+    if prepared.identity.revision != identity.revision {
+        return Err(crate::video::VideoScaleApplyRejectReason::RequestMismatch {
+            prepared_revision: prepared.identity.revision,
+            current_revision: identity.revision,
+        });
+    }
+    let fields = video_scale_signature_changed_fields(prepared.signature, signature);
+    if !fields.is_empty() {
+        return Err(crate::video::VideoScaleApplyRejectReason::SignatureChanged { fields });
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub(crate) enum VideoScalePreparedPresentError {
+    Rejected(crate::video::VideoScaleApplyRejectReason),
+    Present(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2729,18 +2772,18 @@ impl NativeRenderCore {
         result
     }
 
-    /// Prepare every dimension-dependent resource for a scaling change without
-    /// publishing the new setting. Typed failures are cached as an explicit
-    /// legacy-path fallback for the subsequent commit/present.
-    pub fn prepare_video_scale_settings(
+    /// Prepare every dimension-dependent resource for a desired scaling
+    /// selection without publishing it. Typed failures are cached as an
+    /// explicit legacy-path fallback for the same-unit present.
+    pub(crate) fn prepare_video_scale_settings(
         &mut self,
         frame: &VideoFrame,
-        request_id: u64,
+        identity: crate::video::VideoScaleRequestIdentity,
         filter: VideoScaleFilter,
         smoothing_percent: u32,
         anime4k_variant: Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
     ) -> Result<(), String> {
-        let signature = self.video_scale_preparation_signature(
+        let (signature, decision_fallback) = self.video_scale_preparation_plan(
             frame,
             filter,
             smoothing_percent,
@@ -2749,138 +2792,83 @@ impl NativeRenderCore {
         );
         self.prepared_video_scale_settings = None;
 
-        let result = self.prepare_video_scale_resources(signature);
-        if result.is_ok() {
-            self.prepared_video_scale_settings = Some(PreparedVideoScaleSettings {
-                request_id,
-                signature,
-            });
-        } else {
-            self.prepared_video_surface = None;
-            self.sync_overlay_video_scale_state();
+        match self.prepare_video_scale_resources(signature, decision_fallback) {
+            Ok(signature) => {
+                self.prepared_video_scale_settings = Some(PreparedVideoScaleSettings {
+                    identity,
+                    signature,
+                });
+                Ok(())
+            }
+            Err(error) => {
+                self.prepared_video_surface = None;
+                self.discard_candidate_fallback(signature);
+                self.sync_overlay_video_scale_state();
+                Err(error)
+            }
         }
-        result
     }
 
     fn prepare_video_scale_resources(
         &mut self,
-        signature: VideoScalePreparationSignature,
-    ) -> Result<(), String> {
-        let decision = decide_video_surface_size(VideoSurfaceSizeInput {
-            filter: signature.filter,
-            source_width: signature.source_width,
-            source_height: signature.source_height,
-            sar_num: signature.sar_num,
-            sar_den: signature.sar_den,
-            orientation: signature.orientation,
-            viewport_width: signature.viewport_width,
-            viewport_height: signature.viewport_height,
-            layout: signature.layout,
-            resizing: signature.resizing,
-            current_surface_width: signature.current_surface_width,
-            current_surface_height: signature.current_surface_height,
-            current_surface_is_display_resolved: matches!(
-                signature.current_surface_content,
-                VideoSurfaceContent::DisplayResolved
-            ),
-        });
+        mut signature: VideoScalePreparationSignature,
+        decision_fallback: Option<VideoScaleFallbackReason>,
+    ) -> Result<VideoScalePreparationSignature, String> {
         let smoothing_percent = signature.smoothing_percent;
-        let (mut target_width, mut target_height, mut target_content) = match decision {
-            VideoSurfaceSizeDecision::DisplayResolution { width, height } => {
-                let key = DisplaySurfaceRequestKey {
-                    source_width: signature.source_width,
-                    source_height: signature.source_height,
-                    target_width: width,
-                    target_height: height,
-                    sar_num: signature.sar_num,
-                    sar_den: signature.sar_den,
-                    orientation: signature.orientation,
-                    grade_active: signature.grade_active,
-                    filter: signature.filter,
-                    smoothing_percent,
-                    anime4k_variant: signature.anime4k_variant,
-                };
-                if let Err(reason) = self.prepare_display_resources(
-                    signature.source_width,
-                    signature.source_height,
-                    width,
-                    height,
-                    signature.orientation,
-                    signature.grade_active,
-                    signature.filter,
-                    smoothing_percent,
-                    signature.anime4k_variant,
-                ) {
-                    self.record_scale_fallback(key, reason);
-                    (
-                        signature.source_width,
-                        signature.source_height,
-                        VideoSurfaceContent::LegacySource,
-                    )
-                } else {
-                    (width, height, VideoSurfaceContent::DisplayResolved)
-                }
-            }
-            VideoSurfaceSizeDecision::FallbackToLegacy {
-                width,
-                height,
-                reason,
-            } => {
-                let (requested_width, requested_height) = match &reason {
-                    VideoScaleFallbackReason::DisplaySizeLimitExceeded {
-                        requested_width,
-                        requested_height,
-                        ..
-                    } => (*requested_width, *requested_height),
-                    _ => (width, height),
-                };
-                let key = DisplaySurfaceRequestKey {
-                    source_width: signature.source_width,
-                    source_height: signature.source_height,
-                    target_width: requested_width,
-                    target_height: requested_height,
-                    sar_num: signature.sar_num,
-                    sar_den: signature.sar_den,
-                    orientation: signature.orientation,
-                    grade_active: signature.grade_active,
-                    filter: signature.filter,
-                    smoothing_percent,
-                    anime4k_variant: signature.anime4k_variant,
-                };
-                self.record_scale_fallback(key, reason);
-                (width, height, VideoSurfaceContent::LegacySource)
-            }
-            VideoSurfaceSizeDecision::LegacySource { width, height } => {
-                (width, height, VideoSurfaceContent::LegacySource)
-            }
-            VideoSurfaceSizeDecision::KeepCurrentDuringResize { width, height } => {
-                (width, height, signature.current_surface_content)
-            }
-        };
-
-        if target_content == VideoSurfaceContent::DisplayResolved {
-            let key = DisplaySurfaceRequestKey {
-                source_width: signature.source_width,
-                source_height: signature.source_height,
-                target_width,
-                target_height,
-                sar_num: signature.sar_num,
-                sar_den: signature.sar_den,
-                orientation: signature.orientation,
-                grade_active: signature.grade_active,
-                filter: signature.filter,
-                smoothing_percent,
-                anime4k_variant: signature.anime4k_variant,
+        if let Some(reason) = decision_fallback {
+            let (requested_width, requested_height) = match &reason {
+                VideoScaleFallbackReason::DisplaySizeLimitExceeded {
+                    requested_width,
+                    requested_height,
+                    ..
+                } => (*requested_width, *requested_height),
+                _ => (signature.target_width, signature.target_height),
             };
-            if let Err(error) =
-                self.prepare_scale_target_surface(target_width, target_height, target_content)
-            {
+            self.record_scale_fallback(
+                Self::video_scale_request_key(signature, requested_width, requested_height),
+                reason,
+            );
+        } else if signature.target_content == VideoSurfaceContent::DisplayResolved {
+            let key = Self::video_scale_request_key(
+                signature,
+                signature.target_width,
+                signature.target_height,
+            );
+            if let Err(reason) = self.prepare_display_resources(
+                signature.source_width,
+                signature.source_height,
+                signature.target_width,
+                signature.target_height,
+                signature.orientation,
+                signature.grade_active,
+                signature.filter,
+                smoothing_percent,
+                signature.anime4k_variant,
+            ) {
+                self.record_scale_fallback(key.clone(), reason);
+                signature.target_width = signature.source_width;
+                signature.target_height = signature.source_height;
+                signature.target_content = VideoSurfaceContent::LegacySource;
+            }
+        }
+
+        if signature.target_content == VideoSurfaceContent::DisplayResolved {
+            let key = Self::video_scale_request_key(
+                signature,
+                signature.target_width,
+                signature.target_height,
+            );
+            if let Err(error) = self.prepare_scale_target_surface(
+                signature.target_width,
+                signature.target_height,
+                signature.target_content,
+            ) {
                 match error {
                     VideoSurfaceSwapError::DisplayCreation(reason) => {
                         self.record_scale_fallback(key, reason);
-                        target_width = signature.source_width;
-                        target_height = signature.source_height;
-                        target_content = VideoSurfaceContent::LegacySource;
+                        signature.target_width = signature.source_width;
+                        signature.target_height = signature.source_height;
+                        signature.target_content = VideoSurfaceContent::LegacySource;
                     }
                     VideoSurfaceSwapError::Other(error) => return Err(error),
                 }
@@ -2896,27 +2884,39 @@ impl NativeRenderCore {
             }
         }
 
-        if target_content == VideoSurfaceContent::LegacySource {
-            self.prepare_scale_target_surface(target_width, target_height, target_content)
-                .map_err(VideoSurfaceSwapError::into_string)?;
+        if signature.target_content == VideoSurfaceContent::LegacySource {
+            self.prepare_scale_target_surface(
+                signature.target_width,
+                signature.target_height,
+                signature.target_content,
+            )
+            .map_err(VideoSurfaceSwapError::into_string)?;
         }
 
-        Ok(())
+        Ok(signature)
     }
 
-    fn video_scale_preparation_signature(
+    fn video_scale_preparation_plan(
         &self,
         frame: &VideoFrame,
         filter: VideoScaleFilter,
         smoothing_percent: u32,
         anime4k_variant: Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
         now: Instant,
-    ) -> VideoScalePreparationSignature {
-        VideoScalePreparationSignature {
-            source_width: frame.width.max(1),
-            source_height: frame.height.max(1),
-            sar_num: frame.sar_num.max(1),
-            sar_den: frame.sar_den.max(1),
+    ) -> (
+        VideoScalePreparationSignature,
+        Option<VideoScaleFallbackReason>,
+    ) {
+        let source_width = frame.width.max(1);
+        let source_height = frame.height.max(1);
+        let sar_num = frame.sar_num.max(1);
+        let sar_den = frame.sar_den.max(1);
+        let decision = decide_video_surface_size(VideoSurfaceSizeInput {
+            filter,
+            source_width,
+            source_height,
+            sar_num,
+            sar_den,
             orientation: frame.orientation,
             viewport_width: self.width,
             viewport_height: self.height,
@@ -2924,68 +2924,179 @@ impl NativeRenderCore {
             resizing: self.resize_settle.is_resizing(now),
             current_surface_width: self.surface_width,
             current_surface_height: self.surface_height,
-            current_surface_content: self.surface_content,
-            grade_active: !self.video_grade.adjustments.is_identity(),
-            filter,
-            smoothing_percent: crate::settings::sanitize_downscale_smoothing_percent(
-                smoothing_percent,
+            current_surface_is_display_resolved: matches!(
+                self.surface_content,
+                VideoSurfaceContent::DisplayResolved
             ),
-            anime4k_variant,
-        }
+        });
+        let (target_width, target_height, target_content, fallback) = match decision {
+            VideoSurfaceSizeDecision::DisplayResolution { width, height } => {
+                (width, height, VideoSurfaceContent::DisplayResolved, None)
+            }
+            VideoSurfaceSizeDecision::FallbackToLegacy {
+                width,
+                height,
+                reason,
+            } => (
+                width,
+                height,
+                VideoSurfaceContent::LegacySource,
+                Some(reason),
+            ),
+            VideoSurfaceSizeDecision::LegacySource { width, height } => {
+                (width, height, VideoSurfaceContent::LegacySource, None)
+            }
+            VideoSurfaceSizeDecision::KeepCurrentDuringResize { width, height } => {
+                (width, height, self.surface_content, None)
+            }
+        };
+        (
+            VideoScalePreparationSignature {
+                source_width,
+                source_height,
+                sar_num,
+                sar_den,
+                orientation: frame.orientation,
+                target_width,
+                target_height,
+                target_content,
+                grade_active: !self.video_grade.adjustments.is_identity(),
+                filter,
+                smoothing_percent: crate::settings::sanitize_downscale_smoothing_percent(
+                    smoothing_percent,
+                ),
+                anime4k_variant,
+            },
+            fallback,
+        )
     }
 
-    pub fn commit_video_scale_settings(
-        &mut self,
+    fn current_video_scale_preparation_signature(
+        &self,
         frame: &VideoFrame,
-        request_id: u64,
         filter: VideoScaleFilter,
         smoothing_percent: u32,
         anime4k_variant: Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
-    ) -> bool {
-        let signature = self.video_scale_preparation_signature(
+    ) -> VideoScalePreparationSignature {
+        let (mut signature, _) = self.video_scale_preparation_plan(
             frame,
             filter,
             smoothing_percent,
             anime4k_variant,
             Instant::now(),
         );
-        if !prepared_video_scale_settings_matches(
-            self.prepared_video_scale_settings,
-            request_id,
-            signature,
-        ) {
-            self.prepared_video_scale_settings = None;
-            self.prepared_video_surface = None;
-            if self.active_scale_fallback.as_ref().is_some_and(|fallback| {
-                fallback.key.filter == filter
-                    && fallback.key.smoothing_percent == signature.smoothing_percent
-                    && fallback.key.anime4k_variant == signature.anime4k_variant
-                    && (self.selected_scale_filter != filter
-                        || self.downscale_smoothing_percent != signature.smoothing_percent
-                        || self.selected_anime4k_variant != signature.anime4k_variant)
-            }) {
-                // The fallback belongs to the discarded candidate, not to the
-                // setting that remains published.
-                self.active_scale_fallback = None;
+        if signature.target_content == VideoSurfaceContent::DisplayResolved {
+            let key = Self::video_scale_request_key(
+                signature,
+                signature.target_width,
+                signature.target_height,
+            );
+            if self
+                .active_scale_fallback
+                .as_ref()
+                .is_some_and(|fallback| fallback.key == key)
+            {
+                signature.target_width = signature.source_width;
+                signature.target_height = signature.source_height;
+                signature.target_content = VideoSurfaceContent::LegacySource;
             }
-            self.sync_overlay_video_scale_state();
-            return false;
         }
-        self.prepared_video_scale_settings = None;
-        self.publish_video_scale_settings(filter, smoothing_percent, anime4k_variant);
-        true
+        signature
     }
 
-    fn publish_video_scale_settings(
+    fn video_scale_request_key(
+        signature: VideoScalePreparationSignature,
+        target_width: u32,
+        target_height: u32,
+    ) -> DisplaySurfaceRequestKey {
+        DisplaySurfaceRequestKey {
+            source_width: signature.source_width,
+            source_height: signature.source_height,
+            target_width,
+            target_height,
+            sar_num: signature.sar_num,
+            sar_den: signature.sar_den,
+            orientation: signature.orientation,
+            grade_active: signature.grade_active,
+            filter: signature.filter,
+            smoothing_percent: signature.smoothing_percent,
+            anime4k_variant: signature.anime4k_variant,
+        }
+    }
+
+    pub(crate) fn present_prepared_video_scale_settings(
         &mut self,
+        frame: &VideoFrame,
+        sync_interval: u32,
+        identity: crate::video::VideoScaleRequestIdentity,
         filter: VideoScaleFilter,
         smoothing_percent: u32,
         anime4k_variant: Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
-    ) {
+    ) -> Result<NativePresentOutcome, VideoScalePreparedPresentError> {
+        let signature = self.current_video_scale_preparation_signature(
+            frame,
+            filter,
+            smoothing_percent,
+            anime4k_variant,
+        );
+        if let Err(reason) = validate_prepared_video_scale_settings(
+            self.prepared_video_scale_settings,
+            identity,
+            signature,
+        ) {
+            self.discard_prepared_video_scale_settings();
+            return Err(VideoScalePreparedPresentError::Rejected(reason));
+        }
+        self.prepared_video_scale_settings = None;
+        let previous = (
+            self.selected_scale_filter,
+            self.downscale_smoothing_percent,
+            self.selected_anime4k_variant,
+        );
         self.selected_scale_filter = filter;
         self.downscale_smoothing_percent =
             crate::settings::sanitize_downscale_smoothing_percent(smoothing_percent);
         self.selected_anime4k_variant = anime4k_variant;
+        match self.present(frame, sync_interval) {
+            Ok(outcome) => {
+                self.record_video_scale_settings_selected();
+                Ok(outcome)
+            }
+            Err(error) => {
+                self.selected_scale_filter = previous.0;
+                self.downscale_smoothing_percent = previous.1;
+                self.selected_anime4k_variant = previous.2;
+                self.discard_candidate_fallback(signature);
+                self.sync_overlay_video_scale_state();
+                Err(VideoScalePreparedPresentError::Present(error))
+            }
+        }
+    }
+
+    pub(crate) fn discard_prepared_video_scale_settings(&mut self) {
+        if let Some(prepared) = self.prepared_video_scale_settings.take() {
+            self.discard_candidate_fallback(prepared.signature);
+        }
+        self.prepared_video_surface = None;
+        self.sync_overlay_video_scale_state();
+    }
+
+    fn discard_candidate_fallback(&mut self, signature: VideoScalePreparationSignature) {
+        if self.active_scale_fallback.as_ref().is_some_and(|fallback| {
+            fallback.key.filter == signature.filter
+                && fallback.key.smoothing_percent == signature.smoothing_percent
+                && fallback.key.anime4k_variant == signature.anime4k_variant
+                && (self.selected_scale_filter != signature.filter
+                    || self.downscale_smoothing_percent != signature.smoothing_percent
+                    || self.selected_anime4k_variant != signature.anime4k_variant)
+        }) {
+            self.active_scale_fallback = None;
+        }
+    }
+
+    fn record_video_scale_settings_selected(&mut self) {
+        let filter = self.selected_scale_filter;
+        let anime4k_variant = self.selected_anime4k_variant;
         crate::logger::log(format!(
             "native-presenter: video scale filter selected={} ({}) smoothing_percent={} anime4k_variant={}",
             filter.perf_name(),
@@ -10491,8 +10602,8 @@ mod tests {
         native_right_panel_visible_from_inputs, native_touch_owned_panel_sides,
         native_touch_panel_handle_hud_rects,
         native_touch_panel_tap_command_dismisses_before_dispatch,
-        native_video_fullscreen_shortcut_key, prepared_video_scale_settings_matches,
-        sample_cpu_rgba_pixel, should_claim_text_input_focus,
+        native_video_fullscreen_shortcut_key, sample_cpu_rgba_pixel, should_claim_text_input_focus,
+        validate_prepared_video_scale_settings, video_scale_signature_changed_fields,
     };
     use crate::settings::FsSidePanelMode;
     use crate::video::native_presenter::overlay_draw::{
@@ -10506,59 +10617,80 @@ mod tests {
     };
 
     #[test]
-    fn video_scale_commit_requires_the_same_prepared_request_and_geometry() {
+    fn first_present_transition_does_not_invalidate_the_prepared_scale_signature() {
         let signature = VideoScalePreparationSignature {
             source_width: 1920,
             source_height: 1080,
             sar_num: 1,
             sar_den: 1,
             orientation: VideoOrientation::IDENTITY,
-            viewport_width: 3840,
-            viewport_height: 2160,
-            layout: VideoVisualLayout::from(false),
-            resizing: false,
-            current_surface_width: 1920,
-            current_surface_height: 1080,
-            current_surface_content: VideoSurfaceContent::LegacySource,
+            target_width: 3840,
+            target_height: 2160,
+            target_content: VideoSurfaceContent::DisplayResolved,
             grade_active: false,
             filter: crate::settings::VideoScaleFilter::Sharp,
             smoothing_percent: 30,
             anime4k_variant: None,
         };
+        let identity = crate::video::VideoScaleRequestIdentity {
+            source_epoch: 11,
+            revision: 7,
+        };
         let prepared = Some(PreparedVideoScaleSettings {
-            request_id: 7,
+            identity,
             signature,
         });
-        assert!(prepared_video_scale_settings_matches(
-            prepared, 7, signature
-        ));
-        assert!(!prepared_video_scale_settings_matches(
-            prepared, 8, signature
-        ));
+        assert_eq!(
+            validate_prepared_video_scale_settings(prepared, identity, signature),
+            Ok(())
+        );
+        // The first present changes current_surface from LegacySource to
+        // DisplayResolved. Transition state is intentionally absent here, so
+        // that mutation cannot invalidate an otherwise identical resource key.
+        assert!(video_scale_signature_changed_fields(signature, signature).is_empty());
 
         let changed_geometry = VideoScalePreparationSignature {
-            viewport_width: 2560,
-            viewport_height: 1440,
+            target_width: 2560,
+            target_height: 1440,
             ..signature
         };
-        assert!(!prepared_video_scale_settings_matches(
-            prepared,
-            7,
-            changed_geometry
-        ));
+        assert_eq!(
+            validate_prepared_video_scale_settings(prepared, identity, changed_geometry),
+            Err(
+                crate::video::VideoScaleApplyRejectReason::SignatureChanged {
+                    fields: vec!["target_width", "target_height"],
+                }
+            )
+        );
 
-        let changed_layout = VideoScalePreparationSignature {
-            layout: VideoVisualLayout {
-                top_bar_locked: true,
-                ..signature.layout
-            },
-            ..signature
-        };
-        assert!(!prepared_video_scale_settings_matches(
-            prepared,
-            7,
-            changed_layout
-        ));
+        assert_eq!(
+            validate_prepared_video_scale_settings(
+                prepared,
+                crate::video::VideoScaleRequestIdentity {
+                    source_epoch: 12,
+                    revision: 7,
+                },
+                signature,
+            ),
+            Err(crate::video::VideoScaleApplyRejectReason::SourceChanged {
+                prepared_source_epoch: 11,
+                current_source_epoch: 12,
+            })
+        );
+        assert_eq!(
+            validate_prepared_video_scale_settings(
+                prepared,
+                crate::video::VideoScaleRequestIdentity {
+                    source_epoch: 11,
+                    revision: 8,
+                },
+                signature,
+            ),
+            Err(crate::video::VideoScaleApplyRejectReason::RequestMismatch {
+                prepared_revision: 7,
+                current_revision: 8,
+            })
+        );
     }
     fn key(virtual_key: u32) -> NativeVideoKeyEvent {
         NativeVideoKeyEvent {
