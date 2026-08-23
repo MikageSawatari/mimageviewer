@@ -34080,6 +34080,14 @@ impl App {
         let add_book_key = self
             .keymap
             .consume_action(ctx, KeyAction::VideoAddToActiveBook);
+        #[cfg(windows)]
+        let anime4k_remeasure_key = self
+            .keymap
+            .consume_action(ctx, KeyAction::VideoAnime4kRemeasure);
+        #[cfg(windows)]
+        let scale_filter_key = self
+            .keymap
+            .consume_action(ctx, KeyAction::VideoScaleFilterNext);
         // Phase 5.5: S キーでタイルモード トグル (動画モード限定)。画像モードの
         // S (スライドショー) とは handle_video_input 先行 consume で分離する。
         let tile_key = self.keymap.consume_action(ctx, KeyAction::VideoTileMode);
@@ -34149,6 +34157,31 @@ impl App {
         }
         if compare_x || compare_alt_c || compare_shift_c || compare_c {
             return;
+        }
+        #[cfg(windows)]
+        if anime4k_remeasure_key {
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                player.set_native_anime4k_state(
+                    self.settings.video_anime4k_budget,
+                    crate::video::native_presenter::NativeVideoAnime4kStatus::Measuring {
+                        completed: 0,
+                        total: crate::video::anime4k_policy::VIDEO_ANIME4K_MEASUREMENT_TOTAL,
+                    },
+                );
+                player.start_native_anime4k_measurement();
+            }
+            self.request_native_video_hud_repaint(ctx);
+        }
+        #[cfg(windows)]
+        if scale_filter_key {
+            let filter = self.settings.video_scale_filter.next();
+            self.request_native_video_scale_settings(
+                fs_idx,
+                filter,
+                self.settings.video_downscale_smoothing_percent,
+                crate::video::VideoScaleChangeOrigin::Key,
+            );
+            self.request_native_video_hud_repaint(ctx);
         }
 
         // 先に現在の音量だけ取り出す (player borrow を短く保つ)

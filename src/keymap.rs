@@ -8860,6 +8860,105 @@ mod tests {
         );
     }
 
+    fn directly_routed_video_actions(
+        source: &str,
+        marker: impl Fn(&str) -> Vec<String>,
+    ) -> std::collections::HashSet<KeyAction> {
+        let compact: String = source.chars().filter(|ch| !ch.is_whitespace()).collect();
+        KeyAction::all()
+            .iter()
+            .copied()
+            .filter(|action| action.context() == KeyContext::FsVideo)
+            .filter(|action| {
+                marker(action.ini_name())
+                    .iter()
+                    .any(|needle| compact.contains(needle))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn native_video_actions_have_an_egui_consume_route() {
+        let native_source = include_str!("app/native_video.rs");
+        let egui_source = include_str!("ui_fullscreen.rs");
+        let native_compact: String = native_source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        let egui_compact: String = egui_source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+
+        let mut native_actions = directly_routed_video_actions(native_source, |name| {
+            vec![format!("matches_vk_action(KeyAction::{name},&key)")]
+        });
+        let mut egui_actions = directly_routed_video_actions(egui_source, |name| {
+            vec![
+                format!("consume_action(ctx,KeyAction::{name})"),
+                format!("consume_action_no_repeat(ctx,KeyAction::{name})"),
+            ]
+        });
+
+        let native_slot_route = "VIDEO_ADJUST_SLOT_ACTIONS.iter().position(|action|self.keymap.matches_vk_action(*action,&key))";
+        assert!(
+            native_compact.contains(native_slot_route),
+            "native video adjustment-slot route changed; update this inventory test with it"
+        );
+        native_actions.extend(VIDEO_ADJUST_SLOT_ACTIONS);
+
+        let egui_slot_route = "VIDEO_ADJUST_SLOT_ACTIONS.iter().position(|action|self.keymap.consume_action_no_repeat(ctx,*action))";
+        assert!(
+            egui_compact.contains(egui_slot_route),
+            "egui video adjustment-slot route changed; update this inventory test with it"
+        );
+        egui_actions.extend(VIDEO_ADJUST_SLOT_ACTIONS);
+
+        let egui_file_navigation_route = "consume_first_action(ctx,FS_VIDEO_ACTIVE_SCOPES,&[KeyAction::VideoPrevFile,KeyAction::VideoNextFile],)";
+        assert!(
+            egui_compact.contains(egui_file_navigation_route),
+            "egui video file-navigation route changed; update this inventory test with it"
+        );
+        egui_actions.extend([KeyAction::VideoPrevFile, KeyAction::VideoNextFile]);
+
+        // Intentionally native-only actions belong here only with a reason explaining why the
+        // main-window egui path must not support them. There are currently none.
+        const INTENTIONAL_NATIVE_ONLY: &[(KeyAction, &str)] = &[];
+        let allowlisted: std::collections::HashSet<_> = INTENTIONAL_NATIVE_ONLY
+            .iter()
+            .map(|(action, reason)| {
+                assert!(
+                    !reason.trim().is_empty(),
+                    "{action:?} needs an allowlist reason"
+                );
+                *action
+            })
+            .collect();
+
+        let mut unexpected: Vec<_> = native_actions
+            .difference(&egui_actions)
+            .filter(|action| !allowlisted.contains(action))
+            .map(|action| action.ini_name())
+            .collect();
+        unexpected.sort_unstable();
+        assert!(
+            unexpected.is_empty(),
+            "FsVideo actions routed only by the native presenter: {unexpected:?}"
+        );
+
+        let mut stale_allowlist: Vec<_> = allowlisted
+            .difference(&native_actions)
+            .chain(allowlisted.intersection(&egui_actions))
+            .map(|action| action.ini_name())
+            .collect();
+        stale_allowlist.sort_unstable();
+        stale_allowlist.dedup();
+        assert!(
+            stale_allowlist.is_empty(),
+            "native-only allowlist entries now have no native route or gained an egui route: {stale_allowlist:?}"
+        );
+    }
+
     #[test]
     fn bucket_tool_actions_register_k_in_distinct_edit_contexts() {
         let cases = [

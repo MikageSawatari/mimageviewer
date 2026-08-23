@@ -1525,7 +1525,22 @@ fn contextual_assignment_labels(
     }
 }
 
+const COMPACT_OPERATION_LABEL_SUFFIXES: &[&str] = &[
+    // 「順に」の副詞だけを残さない。一般の「…にする」は簡潔なラベルとして残す。
+    "を順に切り替える",
+    "を切り替える",
+    "に切り替える",
+    "を表示する",
+    "を開始または終了する",
+    "を開始または確定する",
+    "する",
+];
+
 fn compact_operation_label(label: &str) -> String {
+    compact_operation_label_with_suffixes(label, COMPACT_OPERATION_LABEL_SUFFIXES)
+}
+
+fn compact_operation_label_with_suffixes(label: &str, suffixes: &[&str]) -> String {
     let mut compact = label
         .replace("選択中またはチェック済みの", "")
         .replace("選択中またはチェック済み画像の", "")
@@ -1548,14 +1563,7 @@ fn compact_operation_label(label: &str) -> String {
         .replace("選択中の項目を", "")
         .replace("選択中の", "")
         .replace("表示中の", "");
-    for suffix in [
-        "を切り替える",
-        "に切り替える",
-        "を表示する",
-        "を開始または終了する",
-        "を開始または確定する",
-        "する",
-    ] {
+    for suffix in suffixes {
         if compact.ends_with(suffix) {
             let len = compact.len() - suffix.len();
             compact.truncate(len);
@@ -8027,9 +8035,9 @@ mod tests {
         AI_SIZE_LIMIT_OPTIONS, KeyboardPickerCell, OperationAssignmentTab,
         OperationAssignmentTarget, PreferencesState, apply_command_editor,
         close_assignment_editors, command_action_matches_filter, command_key_labels_match_filter,
-        compact_key_action_label, compact_operation_label, keyboard_picker_cell_width,
-        keyboard_picker_label_width, keyboard_picker_main_rows, modifier_hold_editor_choice,
-        natural_operation_label_cmp, open_operation_assignment_editor,
+        compact_key_action_label, compact_operation_label, compact_operation_label_with_suffixes,
+        keyboard_picker_cell_width, keyboard_picker_label_width, keyboard_picker_main_rows,
+        modifier_hold_editor_choice, natural_operation_label_cmp, open_operation_assignment_editor,
         ring_bindings_for_key_action,
     };
     use crate::app::MAX_TEXTURE_DIM;
@@ -8073,6 +8081,45 @@ mod tests {
                 "サムネイル列数を2列に",
                 "サムネイル列数を9列に",
                 "サムネイル列数を10列に",
+            ]
+        );
+    }
+
+    #[test]
+    fn sequential_switch_compaction_changes_only_the_two_broken_labels() {
+        const LEGACY_SUFFIXES: &[&str] = &[
+            "を切り替える",
+            "に切り替える",
+            "を表示する",
+            "を開始または終了する",
+            "を開始または確定する",
+            "する",
+        ];
+
+        let changed: Vec<_> = KeyAction::all()
+            .iter()
+            .copied()
+            .filter_map(|action| {
+                let description = action.description();
+                let before = compact_operation_label_with_suffixes(description, LEGACY_SUFFIXES);
+                let after = compact_operation_label(description);
+                (before != after).then_some((action, before, after))
+            })
+            .collect();
+
+        assert_eq!(
+            changed,
+            vec![
+                (
+                    KeyAction::VideoLoop,
+                    "動画のループ方式を順".to_string(),
+                    "動画のループ方式".to_string(),
+                ),
+                (
+                    KeyAction::VideoScaleFilterNext,
+                    "動画の拡大方法を順".to_string(),
+                    "動画の拡大方法".to_string(),
+                ),
             ]
         );
     }
