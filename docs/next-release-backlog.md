@@ -1730,25 +1730,56 @@ v3.2.0 ぶんは [src/version_highlights.rs](../src/version_highlights.rs) の `
 
 ### 5.11 v3.2.0 出荷前確認の記録 (2026-08-23)
 
-配布ビルド: `build-dist.ps1 -SkipRustTests` (同一ソースで全体テスト 6,958 件通過済み、署名 ON)。
+**動画アップスケール (`video-upscale-shader`) をマージした後の最終ビルドに対する記録。**
+マージ前のビルドに対する旧記録はこれで置き換えた。
+
+配布ビルド: `build-dist.ps1` (全体テスト込み) → 署名の 1 本目で
+SimplySign のクラウド鍵セッション切れにより失敗 → 再ログイン後
+`build-dist.ps1 -SkipRustTests` で完走 (同一ソースでゲート通過済みのため但し書きに合致)。
 
 | 項目 | 結果 |
 | --- | --- |
-| Rust 全体テスト | ✅ 6,958 passed / 0 failed。`ui_snapshot` の間欠 AV は再実行で 40 件通過 |
-| コード署名 | ✅ 単体exe / setup.exe / portable の 3 種とも `Valid` + RFC3161 (Certum Timestamp 2026) |
+| Rust 全体テスト | ✅ 失敗 0 件 (`lib` 単体でも 6,200 passed)。**フルゲート中に mIV を操作すると `ui_fullscreen::tests` が 5 件落ちる**ので触らないこと |
+| CI (GitHub Actions) | ✅ 緑 (`f053625d`)。**`build.rs` の fxc 呼び出しが非 Windows で問題ないことを実証**。`native_presenter` が `#[cfg(windows)]` なので生成テーブルを `include!` する経路が Linux に無く、`find_fxc` も `Ok(None)` になる |
+| コード署名 | ✅ 単体exe / setup.exe / portable の 3 種とも `Valid` + RFC3161。内包 vendor PE (pdfium / onnxruntime / FFmpeg 6 本) も `Valid` |
 | CRT 静的リンク | ✅ `VCRUNTIME140.dll` / `MSVCP140.dll` 依存なし |
 | PDFium | ✅ 最新 (chromium/8009) |
-| FFmpeg | ⏸ 4 コミット新しい版あり (`n7.1.5-12-g1fdbca85aa` → `-16-g9a4bb2c579`)。**見送り** — 同じ 7.1.5 系で必要な修正が特定できておらず、更新すると LGPL 対応ソースの再掲と製品ページの手書き節の更新が伴うため |
+| FFmpeg | ⏸ 4 コミット新しい版あり (`n7.1.5-12-g1fdbca85aa` → `-16-g9a4bb2c579`)。**見送り** — 同じ 7.1.5 系で必要な修正が特定できておらず、更新すると LGPL 対応ソースの再掲と製品ページの手書き節の更新が伴う |
 | idle health: static-foreground | ✅ PASS (完全 sleep、`matching_session_events: 1` で同一 session 確認済み) |
 | idle health: static-background | ✅ PASS (同上) |
-| idle health: tray-residency | ⚠ PASS だが**軽い条件のみ**。`evidence_floor_basis=last_load_folder_begin` が t=5.3 (起動時) のままで、**サムネイル読込中に閉じた状態では測っていない**。「閉じた後も処理が回り続ける」退行は未検証 |
-| idle health: video-pin-background | ⏭ 未実施 (waiver)。動画を代表画像に固定し、かつキャッシュから読み直される状態のフォルダが必要。アイドル高画質化の経路は本版で未変更 |
+| idle health: tray-residency | ⏭ 本ビルドでは未実施。マージ前ビルドでは PASS したが**軽い条件のみ** (`evidence_floor` が起動時のままで、サムネイル読込中に閉じた状態では測っていない) |
+| idle health: video-pin-background | ⏭ 未実施 (waiver)。動画を代表画像に固定し、かつキャッシュから読み直される状態のフォルダが必要 |
 | ポータブル版 smoke | ✅ 実機確認済み |
-| 「重要な変更点」表示 | ✅ `--whatsnew-from 3.1.3` で必読 3 + 新機能 7 の表示を確認 |
-| 機能の実機確認 | ✅ 復元モーダル / ESC、動画バー固定と鍵アイコン、設定の移動先 |
-| CI | ⚠ 最新実行は 08-21。本版の約 20 コミットは未検証。特に ubuntu の `cargo check` (`cfg(windows)` 漏れの番人) は未通過。tag push 時に走る |
+| 「重要な変更点」表示 | ✅ `--whatsnew-from 3.1.3` で**必読 4 + 新機能 8** を確認 |
+| 機能の実機確認 | ✅ 製本の復元抑止 (出ないこと + Explorer コピーでは出ること)、動画アップスケール、復元モーダル / ESC、動画バー固定、設定の移動先 |
 
-**見送り (実施不要と判断)**: 検索ベンチ回帰 (本版で検索未変更)、perf smoke (UI スレッドへ同期 I/O を追加していない。設定移行は起動時の SELECT 2 回のみ)。
+**見送り (実施不要と判断)**: 検索ベンチ回帰 (本版で検索未変更)、perf smoke。
+
+**次回への申し送り**: `Assert-MivSignReady` は証明書ストアの存在確認だけなので、
+SimplySign のクラウド鍵セッションが切れていても通過する (証明書の公開情報だけが残り
+秘密鍵が外れるため)。**ビルド 40 分を消費してから署名で落ちる。**
+使い捨ての PE を 1 本実署名してから配布ビルドに入れば数秒で分かる。
+事前チェック自体をその形にする改善は §5.12。
+
+### 5.12 署名の事前チェックが、鍵の使えなさを検出できない
+
+- 出典: v3.2.0 の配布ビルド (2026-08-23)。`Assert-MivSignReady` を通過したのに、
+  実署名の 1 本目 (`vendor/pdfium/bin/pdfium.dll`) が
+  `SignTool Error: No certificates were found that met all the given criteria.` で失敗した。
+- 機構: SimplySign のクラウド鍵セッションが切れると、**証明書の公開情報は
+  `CurrentUser\My` に残ったまま秘密鍵だけが外れる**。`Assert-MivSignReady` は
+  証明書の存在を見るだけなので通過してしまう。
+- 実害: `build-dist.ps1` は clean からビルドしてから署名するので、
+  **40 分ビルドしてから落ちる**。しかも中途半端な成果物は残らないので、
+  丸ごとやり直しになる。
+- 直す方向: 事前チェックを「証明書が見えるか」から「**実際に署名できるか**」へ変える。
+  使い捨ての小さな PE を 1 本コピーして `Invoke-MivSign` し、成功したら消す。
+  数秒で済み、セッション切れならビルド前に分かる。
+  - 署名対象を汚さないよう、必ず一時ディレクトリのコピーに対して行う。
+  - タイムスタンプ取得でネットワークへ出るので、失敗理由を
+    「鍵が使えない」「TS サーバに届かない」で区別できると望ましい。
+- 回避策 (現状): 配布ビルドの前に手で 1 本署名してみる。
+- 規模 / 優先度: 小 / P2 (リリースのたびに 40 分を失うリスク)。
 
 ### 5.1 ネイティブ依存
 
