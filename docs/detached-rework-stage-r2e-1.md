@@ -121,11 +121,22 @@ enum BindError {
     NotBindable(ContextResidence),    // 対象 id が bind できる状態にない
 }
 
-/// mount / retire が失敗した理由。**`Option` を返さない** — 「できなかった」を
+/// mount が失敗した理由。**`Option` を返さない** — 「できなかった」を
 /// 無言で読み飛ばす今の `else { continue }` を再生産しないため (設計 §4.1)。
 struct MountError {
     id: ViewerContextId,
     residence: ContextResidence,
+}
+
+/// retire が失敗した理由。`MountError` では
+/// 「AtRest だが main なので retire 禁止」を表せないので別の型にする。
+enum RetireError {
+    /// App が組み立て中。何も retire できない。
+    Building,
+    /// その id は `AtRest` ではない。
+    NotAtRest(ContextResidence),
+    /// **`main` が指している context は retire できない。** 先に `promote` すること (I4)。
+    IsMain,
 }
 
 /// plan_* が積み、finish_* が消費する。**これが「op 列を実行中」の唯一の表現**で、
@@ -265,7 +276,7 @@ fn plan_promote(&mut self) -> Vec<TableOp>;                                     
 fn finish_promote(&mut self) -> ViewerContextId;   // 戻り値 = 退避された旧 main の id
 
 // retire
-fn begin_retire(&mut self, id: ViewerContextId) -> Result<(), MountError>;         // AtRest -> Retiring
+fn begin_retire(&mut self, id: ViewerContextId) -> Result<(), RetireError>;        // AtRest -> Retiring
 fn plan_finish_retire(&mut self, id: ViewerContextId) -> Vec<TableOp>;             // 2 op
 fn finish_retire(&mut self);
 ```
@@ -279,7 +290,7 @@ fn finish_retire(&mut self);
 | `plan_mount(id)` | **panic しない。失敗はすべて `Err(MountError)`**。投影が `Building` なら `Err(residence: Building)` (App が組み立て中なので何もマウントできない)。投影が `Mounted(current)` なら、`id` の residence が `Mounted` (再入 = 空 op 列) か `AtRest` のとき `Ok`、それ以外は `Err(その residence)` |
 | `plan_fork` | `Mounted(current)`。`LiveMediaPark { window_id }` は `window_of[current] == Some(window_id)` |
 | `plan_promote` | `Mounted(current)` かつ **`current == main`** |
-| `begin_retire(id)` | `id` の residence が `AtRest`。それ以外は `Err(MountError)` |
+| `begin_retire(id)` | `id` の residence が `AtRest` **かつ `id != main`**。投影が `Building` なら `Err(Building)`、`AtRest` でなければ `Err(NotAtRest(..))`、main なら `Err(IsMain)`。⚠ **main を retire できてしまうと I4 が回復不能に壊れる** (main() が Retired な id を指し、mount も promote もできなくなる) |
 | `plan_finish_retire(id)` | `slots[id] == Slot::Retiring` |
 | 各 `finish_*` | `pending` が対応する variant。違えば panic |
 | **すべての `plan_*` と `begin_retire`** | **`pending` が `None`**。既に transaction が進行中なら panic (前の op 列を実行し終えていない)。⚠ この行は `pending` の話だけで、`plan_mount` / `begin_retire` の**対象 id の状態は panic ではなく `Err(MountError)`** で返す (設計 §4.1 の「`Option` を返さない」= 呼び出し元に理由を渡す) |
@@ -463,6 +474,10 @@ doc comment にこの限界を書くこと (無いことにしない)。
 12. **retire**: `begin_retire` で `Retiring` になり、`retiring_slot_mut` で payload を読めて、
     `AtRest` の id では `retiring_slot_mut` が `None`。
     **`finish_retire` 後に `Retired` かつ binding が消えている**。
+12b. **main は retire できない (I4)**: fork → 別 context を mount → 旧 main は `AtRest`
+    になる。この状態で `begin_retire(main)` が `Err(RetireError::IsMain)` を返し、
+    **table が健全なまま**であること (main はまだ `AtRest` で `ids()` に居り、mount できる)。
+12c. **promote した後なら旧 main は普通に retire できる**。
 13. **retire は unbind が drop より先**: `Drop` から table を覗くことは
     (自己参照 / unsafe / 二重帳簿のどれかが要るので) しない。**実行トレース**で見る。
     `Rc<RefCell<Vec<Event>>>` を `TestPayload` に持たせ、
@@ -470,7 +485,12 @@ doc comment にこの限界を書くこと (無いことにしない)。
     `TestPayload::drop` が `Event::Drop(id)` を push する。
     **`Unbind` が `Drop` より先**であること、および `unbind` 直後に
     `window_of` / `context_of` から実際に消えていることを assert する。
-14. **fork**: `MaterializedStillOpen` は新 id が `AtRest` になり投影は不変、binding は動かない。
+14. **fork**: **両 policy とも op ベクタを丸ごと `assert_eq!` する**
+    (`LiveMediaPark { window_id }` を渡したのに
+    `ForkProjectionIntoTransient(MaterializedStillOpen)` を返す実装が全テストを通ってしまう。
+    ②-d では policy が 225 フィールドの move / clone 分けを決めるので、間違えると静かに壊れる)。
+    派生した payload が**実行器に渡された policy どおりに作られている**ことも確認する。
+    `MaterializedStillOpen` は新 id が `AtRest` になり投影は不変、binding は動かない。
     **`LiveMediaPark { window_id }` は `finish_fork` を抜けた時点で窓が fork 側へ移っており、
     元の context も生きている** (`residence(from) == Mounted`)。
     `window_of[current] != window_id` の状態で `plan_fork(LiveMediaPark)` は panic。
@@ -483,6 +503,10 @@ doc comment にこの限界を書くこと (無いことにしない)。
     `catch_unwind` + `AssertUnwindSafe` で受ける。
     ⚠ panic 後は `pending` が立ったままなので **問い合わせ API は assert で落ちる**。
     検証は `window_of` / `context_of` を**直接**見ること。
+    ⚠ **この sweep は op の「境目」しか見ない。** op の内部で早く binding を公開し、
+    正常終了までに戻す実装は検出できない。①の table は binding を finalizer でしか
+    触らないので現状は問題ないが、**②-d の production 実行器では
+    `swap_viewer_context_bundle` の内側にも failpoint が要る** (設計 §7 ②-d)。
 17. `ids()` が投影中のものを含み、順序が決定的 (id 昇順)。
 18. `residence()` が 6 状態すべてを返し分ける。
 

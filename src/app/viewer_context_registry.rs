@@ -67,6 +67,16 @@ struct MountError {
     residence: ContextResidence,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum RetireError {
+    /// App is mid-build; nothing can be retired.
+    Building,
+    /// The id is not at rest.
+    NotAtRest(ContextResidence),
+    /// The main context cannot be retired. Promote first.
+    IsMain,
+}
+
 enum PendingTransition {
     BeginBuild {
         reserved: ViewerContextId,
@@ -558,17 +568,17 @@ impl<P> ContextTable<P> {
         stashed
     }
 
-    fn begin_retire(&mut self, id: ViewerContextId) -> Result<(), MountError> {
+    fn begin_retire(&mut self, id: ViewerContextId) -> Result<(), RetireError> {
         assert!(self.pending.is_none());
         if matches!(self.projection, Projection::Building { .. }) {
-            return Err(MountError {
-                id,
-                residence: ContextResidence::Building,
-            });
+            return Err(RetireError::Building);
         }
         let residence = self.residence_core(id);
         if residence != ContextResidence::AtRest {
-            return Err(MountError { id, residence });
+            return Err(RetireError::NotAtRest(residence));
+        }
+        if id == self.main {
+            return Err(RetireError::IsMain);
         }
         let payload = match self.slots.remove(&id) {
             Some(Slot::AtRest(payload)) => payload,
@@ -930,6 +940,10 @@ mod tests {
                 residence: ContextResidence::Building,
             }
         );
+        assert_eq!(
+            building_table.begin_retire(reserved),
+            Err(RetireError::Building)
+        );
 
         let (mut retiring_table, mut retiring_projection) = harness(10);
         let retiring = fork_at_rest(
@@ -1099,6 +1113,51 @@ mod tests {
     }
 
     #[test]
+    fn retiring_at_rest_main_is_rejected_without_damaging_the_table() {
+        let (mut table, mut projection) = harness(1);
+        let main = table.main();
+        let forked = fork_at_rest(
+            &mut table,
+            &mut projection,
+            ForkPolicy::MaterializedStillOpen,
+        );
+
+        let ops = table.plan_mount(forked).unwrap();
+        execute_ops(&mut table, &mut projection, &ops);
+        table.finish_mount();
+
+        assert_eq!(table.residence(main), ContextResidence::AtRest);
+        assert_eq!(table.begin_retire(main), Err(RetireError::IsMain));
+        assert_eq!(table.main(), main);
+        assert_eq!(table.residence(main), ContextResidence::AtRest);
+        assert!(table.ids().contains(&main));
+
+        let ops = table.plan_mount(main).unwrap();
+        execute_ops(&mut table, &mut projection, &ops);
+        table.finish_mount();
+        assert_eq!(table.mounted_id(), Some(main));
+    }
+
+    #[test]
+    fn promoted_stashed_former_main_can_be_retired() {
+        let (mut table, mut projection) = harness(1);
+        let former_main = table.main();
+
+        let ops = table.plan_promote();
+        execute_ops(&mut table, &mut projection, &ops);
+        assert_eq!(table.finish_promote(), former_main);
+        assert_ne!(table.main(), former_main);
+
+        table.begin_retire(former_main).unwrap();
+        let ops = table.plan_finish_retire(former_main);
+        execute_ops(&mut table, &mut projection, &ops);
+        table.finish_retire();
+
+        assert_eq!(table.residence(former_main), ContextResidence::Retired);
+        assert!(!table.ids().contains(&former_main));
+    }
+
+    #[test]
     fn fork_policies_preserve_projection_and_live_park_transfers_inside_finish() {
         let (mut still_table, mut still_projection) = harness(3);
         let still_from = still_table.main();
@@ -1198,6 +1257,26 @@ mod tests {
         );
         execute_ops(&mut mount_table, &mut mount_projection, &fork_ops);
         mount_table.finish_fork();
+
+        let (mut live_fork_table, mut live_fork_projection) = harness(7);
+        let live_fork_from = live_fork_table.main();
+        let live_fork_policy = ForkPolicy::LiveMediaPark { window_id: 82 };
+        live_fork_table.bind_window(live_fork_from, 82).unwrap();
+        let (live_forked, live_fork_ops) = live_fork_table.plan_fork(live_fork_policy);
+        assert_eq!(
+            live_fork_ops,
+            vec![
+                TableOp::ForkProjectionIntoTransient(live_fork_policy),
+                TableOp::DepositInto(live_forked),
+            ]
+        );
+        execute_ops(
+            &mut live_fork_table,
+            &mut live_fork_projection,
+            &live_fork_ops,
+        );
+        assert_eq!(at_rest_payload(&live_fork_table, live_forked).tag, 1_007);
+        assert_eq!(live_fork_table.finish_fork(), live_forked);
 
         let mount_ops = mount_table.plan_mount(forked).unwrap();
         assert_eq!(

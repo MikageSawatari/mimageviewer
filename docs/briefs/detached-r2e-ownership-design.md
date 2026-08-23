@@ -266,7 +266,7 @@ enum Slot { AtRest(Box<ViewerContextBundle>), Retiring(Box<ViewerContextBundle>)
 | I1b | **投影が payload を持たない瞬間は存在しない** | 「取り出す」と「空を据える」を 1 つの op (`ReplaceProjectionWithFreshEmpty`) にする |
 | I2 | `window_of` と `context_of` は互いの逆写像 | 更新は `bind` / `unbind` / `transfer` の 3 本だけ (module private の共通実装)。`retire` は内部で `unbind` する |
 | I3 | 1 つの窓に context は高々 1 つ / 1 つの context は高々 1 つの窓 | `bind` は `WindowOwnedBy` / `ContextOwnedBy` を `Err` で返す。**生きた context 同士の窓の移動は `transfer` だけ**が行い、期待する `from` を照合する |
-| I4 | `main` は常に存在し、`slots` / 投影 / **transient** のいずれかに在る (I1 と同じ 3 択。begin の途中と、commit / abort の `WithdrawFrom(previous)` 後は transient に居る) | `promote` は新しい main を作ってから古い main を bind する |
+| I4 | `main` は常に存在し、`slots` / 投影 / **transient** のいずれかに在る (I1 と同じ 3 択。begin の途中と、commit / abort の `WithdrawFrom(previous)` 後は transient に居る) | `promote` は新しい main を作ってから古い main を bind する。**`retire` は `main` が指している context を拒否する** (先に `promote` して別の context を main にすること) |
 | I5 | `Building` 中は mount / retire を受け付けない。**binding は即時公開せず transaction に積む** (§4.2) | `Projection` の match で typed error を返す。binding は `Building` が保持する `pending_bind` |
 | I6 | `Retiring` 中の id は mount / bind できない | `Slot::Retiring` への遷移 |
 | I7 | 投影は毎 root pass の末尾で `Mounted` | 定義した継ぎ目での assert (時間窓ではない。憲法 5) |
@@ -1082,6 +1082,14 @@ BLOCKER 3 の指摘どおり、**保管フィールドを消した瞬間に全�
   | context の retire | `retire` が内部で `unbind_window` |
   | 既に detached な mounted context の promote ([app.rs:42734](../../src/app.rs:42734)) | 冪等な `bind_window` |
 - **A1 / A5 をここで有効化する** (保管フィールドが消えて初めて通る)。
+- ⚠ **production 実行器には、①の failpoint sweep とは別の検査が要る。**
+  ①の sweep は **op と op の境目**でしか panic を注入しないので、
+  「op の内部で binding を早く公開し、正常終了までに戻す」実装を検出できない。
+  production の `ReplaceProjectionWithFreshEmpty` /
+  `RestoreProjectionAndDropDisplacedEmpty` は `swap_viewer_context_bundle`
+  ([app.rs:16175](../../src/app.rs:16175)) を通り、その中で rating 同期と
+  visible index 再構築が走る = **op の内部で panic し得る**。
+  ②-d では swap の内側にも failpoint を刺し、I8 を確認すること。
 - **§6.5 の暫定回避策を撤去する** (これが②-d の完了条件の一部):
   - `right_drag_viewer_identity_for_window_id` の
     `native_video_parked_live_input_window_id == Some(window_id)` 分岐
