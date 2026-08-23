@@ -1173,6 +1173,57 @@ passive detached は通常どおり release で窓を activate するが、選�
     常時起動にすると、動画を開くたび全尺デコードが走る。
 - 規模 / 優先度: Medium / P3 (§1.102 と同時に設計する)。
 
+### 1.115 別ウィンドウ表示で静止画を開閉すると、フルスクリーンと一覧が何度も入れ替わってちらつく — 利用者報告
+
+> ⚠ detached viewer リワーク中の領域。**症状パッチ (delay / guard / 追加 repaint) を入れない**。
+> BA-5 (gap フレームで passive 窓が破棄される) と BA-7 の境界にまたがる。
+
+- 出典: 2026-08-23 (v3.2.0 公開後)。`g:\home\comfyui\202608-29_焼き肉レストラン` を開くと、
+  フルスクリーンと一覧の切り替えが激しくちらつく。**ポータブル版では同じ操作で起きない。**
+- **ポータブルで起きない理由は build flavor ではなく設定**。ポータブルは既定設定なので
+  フルスクリーンが別ウィンドウにならず、下の `detached_viewer_cleanup` 経路自体を通らない。
+  `portable` feature が変えるのは native 依存の解決先と data_dir だけで、この経路に分岐は無い。
+- **ログで確認できた事実** (`mimageviewer.log`、1 セッション 14 open / 10 cleanup):
+  1. 別ウィンドウのフルスクリーンを閉じるたびに
+     `[viewport] cleanup_visible_false: presentation=Some(DetachedWindow)` →
+     `[ui-fonts] schedule main font atlas resync: detached_viewer_cleanup` →
+     **連続 5 フレームの pass 破棄** (`discard pass for font atlas resync`、generation が
+     +1 ずつ、`egui_frame` は連番)。実測 3.503s→3.761s = **258ms 分の描画が捨てられる**。
+  2. この「cleanup 1 回 = discard 5 回」は **3 世代のログすべてで一定** (v3.1.3 期の
+     `mimageviewer.log.bak` も 4 cleanup / 20 discard)。**5 フレーム破棄そのものは v3.2.0 で
+     入ったものではない。**
+  3. close の約 0.55 秒後、**キー入力の記録が無いまま `=== open_fullscreen ===` が再発火**し、
+     別ウィンドウが**新しい HWND で作り直される** (3.341→3.903 / 37.311→37.927 /
+     38.528→39.086)。再オープンは毎回**discard 窓が終わった 0.14〜0.17 秒後**に来ており、
+     3 回とも同じ内部イベントからの一定オフセット。人が 2 度押ししたにしては揃いすぎている。
+  4. `keys=Enter:up,Enter:up,Enter:up,Enter:up` のように**同一フレームに同じキーイベントが
+     4 つ並ぶ行がある** (F12 も同様)。同じ入力が複数回配送されている。
+- **コードで確認できた構造**:
+  - `MAIN_FONT_ATLAS_RESYNC_REPEAT_FRAMES = 5` ([app.rs:392](../src/app.rs:392))。
+    発行側のコメントが理由を明記している ([app.rs:37598](../src/app.rs:37598)):
+    「close 直後の 1 フレームだけメインウィンドウの wgpu surface が消えて full upload が
+    捨てられる。**数フレーム再発行して、surface が戻ったフレームで確実に届かせる**」。
+    = **どのフレームで surface が戻るかを観測せず、時間窓で race を吸収している。**
+    5 フレームぶんの描画破棄はその代償で、別ウィンドウ経路ではそれが目に見える。
+  - `maybe_defer_for_main_font_atlas_resync` は 1 OS フレーム 1 発行にゲートされているので、
+    5 回は必ず**別々のフレーム**を消費する ([app.rs:37855](../src/app.rs:37855))。
+  - `should_defer_main_paint_for_font_atlas_resync(_reason) -> bool { true }`
+    ([app.rs:3130](../src/app.rs:3130)) は**引数を無視して常に true**。reason で絞る余地が
+    潰れている (縮退した経緯を先に読むこと)。
+- **直す方向**:
+  1. **surface が戻ったことを観測して 1 回だけ発行する。** 固定 5 フレームをやめる。
+     no-surface early return の地点で「full upload を捨てた」ことを型で記録し、次に surface が
+     ある フレームで 1 回だけ resync する。**時間窓で race を吸収しない** (この 5 フレーム窓は
+     v1.8.0 の黒サムネ修正で入ったもので、同じ形が別の症状で再発している)。
+  2. **再オープンの正体を先に確定させる。推測で直さない。** close 後に `open_fullscreen` を
+     呼んだ呼び出し元と契機 (replay されたキーか、遅延していた要求か) をログに出す。
+     事実 3 と 4 から「discard 窓中に同じキーが複数回配送され、main 側が Enter を
+     もう一度 open として解釈している」が第一候補だが、**未確定**。
+  3. 1 と 2 は独立に進められる。1 だけでも破棄フレームが 5 → 1 になり、ちらつきの大半は消える。
+- 規模 / 優先度: 中 / **P1** (常用操作で目に見える。ただし凍結領域なので構造修正が前提)。
+- 関連: §2.20 (同じ別ウィンドウ経路の表示破綻)、[docs/detached-rework-plan.md](detached-rework-plan.md)
+  の BA-5 / findings-12 D1 (font resync の discard パスが passive 窓を破棄した実害)。
+
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断
@@ -1739,11 +1790,47 @@ passive detached は通常どおり release で窓を activate するが、選�
     こちらが凍結スナップショットに切り替わる」という今回の状況と形が合う。**ただし利用者が
     単ページ / 見開き / 連結読みのどれで見ていたかはログに出ていない** (`spread` / `連結` の
     ログ出力が 1 件も無い) ので、経路は特定できていない。
+- **Codex 追補 (2026-08-23、ClaudeCode 分析との差分)**:
+  - perf ログでは、静止画を開いた直後の `896x1152` final composite は
+    `scale_x=scale_y=1.188666`、Lanczos も `1597x2054` で、画像データ・texture・通常の
+    transform は縦横比を保っていた。6293.759s の開き直しも同じ cache の hit だけで直っており、
+    cache 内容の破損ではない。
+  - 時系列では、動画の実 source swap (6285.031s) より先に、ParkedLive 動画窓のクリック復帰が
+    6283.984s に queue されている。この復帰入口は、現在の静止画を
+    `park_and_close_current_active_detached_viewer_for_media_handoff` で passive snapshot にしてから
+    動画 bundle を active にする ([app.rs:40136](../src/app.rs:40136) →
+    [:40414](../src/app.rs:40414) → [:42678](../src/app.rs:42678))。したがって、利用者からは
+    「動画切替時」に見えても、歪んだ表示矩形が作られる候補時点は source swap より約 1 秒前の
+    **active still → passive snapshot handoff** である。
+  - この legacy still park は `build_active_detached_image_window_snapshot(None)` を呼ぶ
+    ([app.rs:42583](../src/app.rs:42583))。`ctx=None` なので `frozen_continuous_pages` は必ず空になり、
+    passive 描画は mode にかかわらず `window.image_rect_norm` の単画像 fallback を使う
+    ([app.rs:41752](../src/app.rs:41752)、[ui_fullscreen.rs:10641](../src/ui_fullscreen.rs:10641))。
+    今回の経路については、ClaudeCode 分析が未確定としていた見開き / 連結の
+    `from_resolved_rect` 候補より、この fallback の方が直接対応する。
+  - 静止画 host は 6282.159s に `rect=(-11,-11 3862x2110)` で登録されており、Windows の最大化
+    outer rect と整合する。一方、maximized の placement 更新は実測 client size ではなく
+    restore 用 seed の `w/h` を runtime に保持する ([app.rs:43781](../src/app.rs:43781))。
+    snapshot bake はその placement の `w/h` で画像矩形を fit して正規化する
+    ([app.rs:41689](../src/app.rs:41689)、[ui_fullscreen.rs:10242](../src/ui_fullscreen.rs:10242)) が、
+    passive draw は正規化矩形を現在の `full_rect` へ X/Y 独立で戻すだけで、保存済み
+    `image_dims` による contain / 一様 scale の再解決を行わない。restore 窓と最大化 viewport の
+    アスペクトが違えば、この最後の写像だけで texture が非一様に圧縮され得る。
+  - したがって、App-global `open_fullscreen` の書換えは handoff の起動条件ではあるが、それ自体が
+    passive 静止画の geometry を汚染した証拠はまだない。Codex の第一候補は **BA-7 の global
+    state 汚染ではなく、maximized 時の restore placement と live viewport を混ぜた snapshot
+    geometry ownership の不一致**。数値の最終確認には、既存案の `from_resolved_rect` 計装に加え、
+    snapshot bake の `placement/maximized/image_rect_norm` と passive draw の
+    `full_rect/復元後 image_rect/scale_x/scale_y` を同じ window/session id で記録する必要がある。
+    `from_resolved_rect` は bake 前の一様な矩形だけを見て正常終了し、その後の
+    `rect_from_normalized` で生じる歪みを捕捉できない可能性がある。
 - **次にやること (直す前に)**: 無言で受け入れている所を鳴らす。
   `from_resolved_rect` で `|scale_x - scale_y|` が閾値を超えたら、`page_idx` / `texture_size` /
-  渡された矩形 / session を添えてログに出す。**推測で直さない** — 上の 2 経路のどちらでもない
-  可能性が残っている。再現手順は「静止画ウィンドウを開いたまま、別ウィンドウで動画を数回
-  切り替える」で、利用者側では再現している。
+  渡された矩形 / session を添えてログに出す。加えて active still → passive snapshot では、bake
+  時の `placement/maximized/image_rect_norm` と draw 時の `full_rect/image_rect/scale_x/scale_y` を
+  同じ window/session id で記録する。**推測で直さない** — 上の候補のどれでもない可能性が残って
+  いる。再現手順は「静止画ウィンドウを開いたまま、別ウィンドウで動画を数回切り替える」で、
+  利用者側では再現している。
 - **直す方向**: 特定できたら、`from_resolved_rect` の一様でない矩形を**受け入れずに拒否**するか、
   全呼び出しを `resolve_fs_transform_in_layout_rect` 経由に寄せる。ガードが既に存在して
   文書化までされているのに 2 経路が素通りしている状態を、分岐追加ではなく入口の一本化で閉じる。
