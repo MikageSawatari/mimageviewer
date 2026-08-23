@@ -293,7 +293,7 @@ fn finish_retire(&mut self);
 | `begin_retire(id)` | `id` の residence が `AtRest` **かつ `id != main`**。投影が `Building` なら `Err(Building)`、`AtRest` でなければ `Err(NotAtRest(..))`、main なら `Err(IsMain)`。⚠ **main を retire できてしまうと I4 が回復不能に壊れる** (main() が Retired な id を指し、mount も promote もできなくなる) |
 | `plan_finish_retire(id)` | `slots[id] == Slot::Retiring` |
 | 各 `finish_*` | `pending` が対応する variant。違えば panic |
-| **すべての `plan_*` と `begin_retire`** | **`pending` が `None`**。既に transaction が進行中なら panic (前の op 列を実行し終えていない)。⚠ この行は `pending` の話だけで、`plan_mount` / `begin_retire` の**対象 id の状態は panic ではなく `Err(MountError)`** で返す (設計 §4.1 の「`Option` を返さない」= 呼び出し元に理由を渡す) |
+| **すべての `plan_*` と `begin_retire`** | **`pending` が `None`**。既に transaction が進行中なら panic (前の op 列を実行し終えていない)。⚠ この行は `pending` の話だけで、**対象 id の状態は panic ではなく `Err`** で返す (`plan_mount` は `MountError`、`begin_retire` は `RetireError`。設計 §4.1 の「`Option` を返さない」= 呼び出し元に理由を渡す) |
 | `retiring_slot_mut` | `pending` が `None` (digest は op 列の外) |
 
 op 列の中身 (設計 §7 ①の表と一致させること):

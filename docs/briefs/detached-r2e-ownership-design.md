@@ -266,7 +266,7 @@ enum Slot { AtRest(Box<ViewerContextBundle>), Retiring(Box<ViewerContextBundle>)
 | I1b | **投影が payload を持たない瞬間は存在しない** | 「取り出す」と「空を据える」を 1 つの op (`ReplaceProjectionWithFreshEmpty`) にする |
 | I2 | `window_of` と `context_of` は互いの逆写像 | 更新は `bind` / `unbind` / `transfer` の 3 本だけ (module private の共通実装)。`retire` は内部で `unbind` する |
 | I3 | 1 つの窓に context は高々 1 つ / 1 つの context は高々 1 つの窓 | `bind` は `WindowOwnedBy` / `ContextOwnedBy` を `Err` で返す。**生きた context 同士の窓の移動は `transfer` だけ**が行い、期待する `from` を照合する |
-| I4 | `main` は常に存在し、`slots` / 投影 / **transient** のいずれかに在る (I1 と同じ 3 択。begin の途中と、commit / abort の `WithdrawFrom(previous)` 後は transient に居る) | `promote` は新しい main を作ってから古い main を bind する。**`retire` は `main` が指している context を拒否する** (先に `promote` して別の context を main にすること) |
+| I4 | `main` は常に存在し、`slots` / 投影 / **transient** のいずれかに在る (I1 と同じ 3 択。begin の途中と、commit / abort の `WithdrawFrom(previous)` 後は transient に居る) | `promote` は新しい main を作ってから古い main を bind する。**`retire` は `main` が指している context を `RetireError::IsMain` で拒否する** (先に `promote` して別の context を main にすること)。`main` が非 Option であることだけでは守れない |
 | I5 | `Building` 中は mount / retire を受け付けない。**binding は即時公開せず transaction に積む** (§4.2) | `Projection` の match で typed error を返す。binding は `Building` が保持する `pending_bind` |
 | I6 | `Retiring` 中の id は mount / bind できない | `Slot::Retiring` への遷移 |
 | I7 | 投影は毎 root pass の末尾で `Mounted` | 定義した継ぎ目での assert (時間窓ではない。憲法 5) |
@@ -600,15 +600,39 @@ fn close_and_retire_context<D>(
     reason: &'static str,
     finish: impl FnOnce(&mut Self),
     digest: impl FnOnce(ContextMut<'_>) -> D,
-) -> Result<D, MountError>;
+) -> Result<D, RetireContextError>;
 
 /// `finish` の要らない版 (parked / media teardown)。
-fn retire_context<D>(&mut self, id, reason, digest) -> Result<D, MountError>;
+fn retire_context<D>(&mut self, id, reason, digest) -> Result<D, RetireError>;
+
+/// retire できない理由。**`MountError` では表せない**
+/// (「`AtRest` だが `main` なので retire 禁止」は状態は合法・操作が不正)。
+pub(crate) enum RetireError {
+    /// App が組み立て中。何も retire できない。
+    Building,
+    /// その id は `AtRest` ではない。
+    NotAtRest(ContextResidence),
+    /// **`main` が指している context は retire できない。** 先に `promote` すること (I4)。
+    IsMain,
+}
+
+/// `close_and_retire_context` は **マウント段と retire 段の両方で失敗し得る**ので、
+/// どちらで落ちたかを潰さずに返す。`IsMain` を `MountError` へ丸めない。
+pub(crate) enum RetireContextError {
+    Mount(MountError),
+    Retire(RetireError),
+}
 ```
 
 どちらも **`digest` を終えた後、drop の直前に `unbind_window` を内部で実行する**。
 これは 4 つ目の binding プリミティブではなく、retire の一部である
 (context が消えるのに `context_of` に残ると I2 が破れる)。
+
+⚠ **`main` が指している context は retire できない** (I4)。main を畳みたいときは
+`promote` で別の context を main にしてから retire する。ステージ①の実装レビューで、
+「fork → 別 context を mount → 旧 main が `AtRest`」の順で **main を retire できてしまい、
+`main()` が Retired な id を指したまま mount も promote もできなくなる**経路が見つかった
+(2026-08-23)。`RetireError::IsMain` はその再発防止である。
 
 **2 つの現行経路がそのまま乗る。**
 
@@ -724,7 +748,7 @@ fn with_viewer_context_ref<R>(&self, id: ViewerContextId, f: impl FnOnce(Context
 | I1b 投影が空になる瞬間が無い | ○ (`ReplaceProjectionWithFreshEmpty` が 1 動作) | — | ○ | — | ○ |
 | I2 window_of / context_of が逆写像 | — | — | ○ (private field) | — | ○ |
 | I3 1 窓 1 context / 1 context 1 窓 | ○ (`bind` が `WindowOwnedBy` / `ContextOwnedBy`、移動は `transfer` のみ) | — | — | — | ○ |
-| I4 main は常に存在 (所在は I1 と同じ 3 択) | ○ (`main: ViewerContextId` は非 Option) | — | — | — | ○ |
+| I4 main は常に存在 (所在は I1 と同じ 3 択) | ○ (`main` が非 Option **かつ `retire` が `IsMain` を返す**。⚠ 非 Option だけでは足りない — ①のレビューで main を retire できる経路が実在した) | — | — | — | ○ |
 | I5 / I6 Building / Retiring 中の禁止操作 | ○ (`MountError`) | — | — | — | ○ |
 | I7 root pass 末尾で Mounted | — | — | — | — | ○ (継ぎ目の assert) |
 | 所在を `is_none()` で答えない | ○ (`ContextResidence`) | — | ○ | ○ (A5) | ○ |
