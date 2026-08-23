@@ -1220,6 +1220,23 @@ passive detached は通常どおり release で窓を activate するが、選�
      事実 3 と 4 から「discard 窓中に同じキーが複数回配送され、main 側が Enter を
      もう一度 open として解釈している」が第一候補だが、**未確定**。
   3. 1 と 2 は独立に進められる。1 だけでも破棄フレームが 5 → 1 になり、ちらつきの大半は消える。
+- **再現条件は「設定」ではなく「実行時の状態」** (2026-08-23 追記、利用者の settings.db を読んで確認):
+  報告者の永続設定は `detached_viewer_enabled=false` / `detached_viewer_open_images_in_window=false` /
+  `fullfeature_media_window=true` / `video_in_window_mode=true`。**静止画を別ウィンドウで開く設定は
+  どれも OFF** なのに、ログでは静止画 open のたびに `presentation=Some(DetachedWindow)` になっている。
+  `requested_viewer_presentation_for_open` ([app.rs:43006](../src/app.rs:43006)) の 4 分岐のうち、
+  永続設定によるもの (`detached_viewer_enabled` / `effective_media_in_media_window`= メディア限定) は
+  すべて偽なので、**残る実行時分岐**しかない:
+  `viewer_session_is_detached() && detached_viewer_independent_active` か、F12 が立てる一度きりの
+  `detached_viewer_open_next_still_detached_once` ([app.rs:41528](../src/app.rs:41528))。
+  → **環境設定を合わせても再現しない。F12 で作った独立 detached セッションが閉じても残っている状態が要る。**
+  利用者がポータブルで同手順を試すと、閉じた後の再オープンで detached が維持されず
+  `non_detached_viewer_presentation()` へ落ちた (= `video_in_window_mode=true` なので MainWindow)。
+  **同じ操作で detached セッションの寿命が 2 環境で違う**こと自体が、この不具合と同じ所有権の問題。
+- **次の観測**: `MIV_DETACHED_WINDOW_DEBUG=1` で起動すると `[ui-fonts][diag]` /
+  `[detached-window-debug]` が `presentation` / `session` / `active_context` / `passive_windows` /
+  `fullscreen_idx` を毎回出す ([app.rs:38773](../src/app.rs:38773))。**どの分岐で DetachedWindow に
+  なっているかはこれで確定できる。** 再オープンの契機と併せて 1 回の再現で両方取れる。
 - 規模 / 優先度: 中 / **P1** (常用操作で目に見える。ただし凍結領域なので構造修正が前提)。
 - 関連: §2.20 (同じ別ウィンドウ経路の表示破綻)、[docs/detached-rework-plan.md](detached-rework-plan.md)
   の BA-5 / findings-12 D1 (font resync の discard パスが passive 窓を破棄した実害)。
