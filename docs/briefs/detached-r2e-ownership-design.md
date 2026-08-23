@@ -1,275 +1,936 @@
-﻿# R2e 設計 — viewer context の所有を型にする (第 2 版)
+﻿# R2e 設計 — viewer context の所有を型にする (第 3 版)
 
-対象: detached リワーク R2 の残件のうち「window ごとの所有を型にする」部分。
-正本プラン: `docs/detached-rework-plan.md` (§2 憲法 / §4 R2 / §9.1 現況 / §11)。
-依存するバグ: `docs/next-release-backlog.md` §1.99 / §1.100。
+対象: detached リワーク R2 の残件のうち「context の所有を型にする」部分。
+正本プラン: `docs/detached-rework-plan.md` (§2 憲法 / §4 R2 / §9.1 現況 / §9.5 / §11)。
+第 1 版は BLOCKER 5 件、第 2 版は 4 件で破棄。本書は第 3 版で、**まだ実装指示書ではない**。
 
-第 1 版は Codex レビューで **BLOCKER 5 件** を受けて破棄した。指摘はすべて実コードで裏が取れた。
-本書はその指摘を取り込んだ第 2 版で、まだ実装指示書ではない。
+行番号はすべて **2026-08-23 時点の master** で確認したもの。第 2 版の行番号は既に腐っていたので、
+本書は全件を取り直している (付録 B に一覧)。
 
 ---
 
-## 1. 事実 (コードで確認済み)
+## 0. 第 3 版が第 2 版から変えたこと
 
-`ViewerContextBundle` (`src/app.rs:2073`〜`2348`、フィールド約 220) は viewer context の状態を
-まとめた入れ物。ただし**全部ではない**: ジェスチャ状態 (`src/app.rs:10010`)、音楽解析 /
-タイムライン (`src/app.rs:11684`) は意図的に App-global のまま。
+| # | 第 2 版 | 第 3 版 | 由来 |
+| --- | --- | --- | --- |
+| 1 | `MountPhase { Mounted / Vacant / Building }` — App の投影側だけを表す | **所在 (`ContextResidence`) を一級の問い合わせにする**。投影は registry の内部状態へ降格 | §6.5 / BLOCKER 1 |
+| 2 | `extract_mounted_viewer_context() -> ViewerContextBundle` | **生 bundle を返す API を 1 つも置かない**。build / fork / mount / retire / promote の 5 transaction だけ | BLOCKER 1 |
+| 3 | 保管先は `slots` + 「押しのけられた bundle」 | **保管先は slots だけ**。`active_detached_viewer_context` と `paused_bundle` の 2 箇所を 1 箇所へ統合し、active か parked かは `DetachedWindowRuntime.state` だけが持つ | 本書 §1.5 |
+| 4 | `ViewerContextId::{ Main, Detached(serial) }` | **`Main` 変種を廃止**。`Main` は identity ではなく binding (役割)。promote 経路が「main の bundle が detached になる」ので、`Main` を identity にすると id を改名する羽目になる | 本書 §3.1 (今回新たに判明) |
+| 5 | window 対応表なし | **registry が `window_of` / `context_of` を所有**し、`bind` / `rebind` / `unbind` の順序制約を型で強制 | BLOCKER 2 |
+| 6 | 「Building には identity が無い」 | **予約済みだが未 commit**。`begin` で serial を先に払い出す | BLOCKER 4 |
+| 7 | R2e-1 で保管を切り、R2e-2 で消費側 (コンパイルできない) | **①抽象データ構造 → ②-pre helper 化 → ②一括切替 → ③巡回 → ④非同期 identity**。①は production を 1 行も切らない | BLOCKER 3 |
+| 8 | 完了確認は「プリミティブが registry 経由」 | **第一の門は Rust の可視性**。型を registry モジュールへ移してフィールドを module-private にすると、生成 / destructure / 生 swap がモジュール外で**言語仕様として書けなくなる**。syn 監査は可視性で表せない残り 4 種だけを見る | BLOCKER 3 |
 
-### 1.1 マウントされていない bundle の置き場
+---
 
-| 置き場所 | 何の bundle か | 宣言 |
+## 1. 一つの説明 — 4 件の失敗は同じ形
+
+### 1.1 4 件
+
+| # | どこ | 単一値が答えていた 2 つの問い | 症状 |
+| --- | --- | --- | --- |
+| 1 | `active_detached_viewer_context.is_none()` (keep-alive backstop、§11 2026-08-20) | 「所有者が居ない」/「所有者は今マウント中」 | 別 context の題と texture で描画 |
+| 2 | `right_drag_pointer_pos(owner)` ([gamepad_input.rs:1189](../../src/app/gamepad_input.rs:1189)) | 「誰の操作か」/「どの producer が供給しているか」 | egui 側が native 側の開始したドラッグを `ButtonStateLost` で cancel |
+| 3 | `snapshot.paused_bundle.is_none()` ([app.rs:706](../../src/app.rs:706)) | 「bundle が無い」/「parked-live poll がマウント中」 | 成立コマンドが `viewer_identity_unavailable` で捨てられる |
+| 4 | `DetachedViewerWindowPlacement` (レーン A-0、97d1ee98) | 「現在のジオメトリ」/「復元用のジオメトリ」 | 最大化中に placement を毎フレーム書き戻し、82/82 フレームで同一内容。収束しない |
+
+4 件目はレーン A-0 の成果で、R2e とは別の値だが**同じ形**である。
+
+さらに、同じ形が**もう 1 箇所、機能の判定に載っている**ことを今回確認した。
+
+> `should_promote_active_detached_video_for_main_context_change`
+> ([app.rs:42720](../../src/app.rs:42720)) は `self.active_detached_viewer_context.is_none()`
+> **かつ** `viewer_session_is_detached_or_switching()` で「detached context が holder ではなく App へ
+> 直接マウントされている」を表している。ここでの `is_none()` は「居ない」ではなく
+> 「ここではない場所に居る」であり、main のフォルダ移動時に再生中メディアを畳まないという
+> 実機の挙動がこの読み替えの上に載っている。
+
+### 1.2 共通形
+
+> **1 個の保管場所の「値の有無」で、identity 以外の軸 (所在 / 駆動者 / 時制) を答えている。**
+
+`Option<T>` の `None` は「その場所に無い」しか言えない。ところが実際の問いは
+「**どこに** あるか」であり、候補地が 2 つ以上ある。候補地の 1 つを覗いて空だったことは、
+残りの候補地について何も言わない。placement (4 件目) も同型で、1 個の struct が
+「今の値」と「戻すべき値」という 2 つの時制を持ち、最大化中は前者を書く場所が無い。
+
+### 1.3 3 つの規則
+
+- **規則 A (所在)**: 所在は保管フィールドの `Option` で答えない。**所有者に問い合わせて、
+  取り得る所在をすべて列挙した enum を返させる。** 候補地が複数ある限り `is_none()` は嘘をつく。
+- **規則 B (駆動者)**: 「誰の状態か (owner)」と「誰が今それを動かしているか (producer)」は
+  別の軸。**両方を鍵に含める。** owner だけで絞ると、別 producer の cancel が刺さる。
+- **規則 C (時制)**: 「現在値」と「復元値」を 1 個の値に同居させない。片方を書く場所が無くなる
+  局面 (最大化・全画面) が必ず来て、書き込みが収束しなくなる。
+
+### 1.4 どの規則を、どこで実装するか
+
+**過剰主張を避けるために切り分けを明示する。R2e が直すのは規則 A だけである。**
+
+| 規則 | 対象 | どこで直すか |
 | --- | --- | --- |
-| `App::active_detached_viewer_context` | アクティブな独立 detached 窓の context (最大 1) | `src/app.rs:9602` |
-| `App::detached_image_windows[i].paused_bundle` | park 済み各窓の context | `src/app.rs:402` |
-| **スタックローカル** | mount 中に押しのけられた bundle | `src/app.rs:16103` ほか |
+| A (所在) | §1.1 の #1 / #3 と、上の promote 判定 | **本書 (R2e)**。候補地を 1 つに統合し、`ContextResidence` を一級の問い合わせにする |
+| B (駆動者) | #2 | **R2f (R2b 残件)**。`RightDragOwner` を `(owner, producer)` にする。registry とは独立 |
+| C (時制) | #4 | **レーン A-0**。placement を「現在ジオメトリ」と「復元ジオメトリ」に分ける |
 
-3 つ目が第 1 版で見落としていたもの。`with_active_detached_viewer_context` の実行中、
-**押しのけられた main bundle は関数のローカル変数 `active.bundle` にあり `self` から到達できない**。
-`active_detached_viewer_context` フィールド自体は `None` になっている。
+3 件が「同じ説明で覆えるか」への答えは、**診断は 1 つ、修理は 3 箇所**である。
+3 件全部を R2e に持ち込むと、また範囲が破裂して落ちる。
 
-### 1.2 所有権を動かすプリミティブは swap だけではない
+### 1.5 なぜ「候補地を 1 つに統合する」が効くのか
 
-- `swap_viewer_context_bundle` (`src/app.rs:15576`) — 非テスト呼び出し 52 か所
-- `take_current_viewer_context_bundle` (`src/app.rs:16067`) — **App に空 bundle を残す**
-- `split_current_context_preserving_main_grid` (`src/app.rs:40949`) — main と viewer に分割
-- フィールドへの直接代入 (`src/app.rs:41563` / `40919`)
+規則 A の実装は 2 段ある。
 
-したがって「raw swap 呼び出しが grep 0 件」は所有の一元化を証明しない。
-
-### 1.3 App が「有効な context をマウントしていない」時間がある
-
-- **Vacant**: `pause_current_active_detached_viewer_context` は detached を mount
-  (`src/app.rs:37630`) → `take_current_viewer_context_bundle` (`src/app.rs:37671`) で抜き取り、
-  main を戻す (`src/app.rs:37678`) までの間、App のビューアフィールドは**空 bundle**。
-- **Building**: `start_active_detached_book_context_with_start` は main を抜き
-  (`src/app.rs:39778`)、**App のフィールド上で新しい detached context を組み立て**、
-  最後に捕獲する (`src/app.rs:39885`)。この間、マウント中の context には**まだ identity が無い**。
-
-### 1.4 context identity ≠ window identity
-
-`active_detached_viewer_context` へ bundle を入れる時点では window_id が未確定な経路がある
-(`src/app.rs:41563` → `open_fullscreen` が `41569` で identity を割り当てる)。
-既存の `metadata_import_refresh::ContextSlot` も `ActiveDetached(Option<u64>)` を許している
-(`src/app/metadata_import_refresh.rs:61`)。さらに **window_id はフォルダ再オープンで意図的に再利用**
-される (`src/app.rs:37568`) ので、window_id は非同期完了の stamp にならない。
-
-一方、context には既に serial がある: `allocate_detached_viewer_context_generation`
-(`src/app.rs:37368`) が `context_serial` と一意な `items_generation` を払い出している。
-
-### 1.5 既存の「所有者っぽい型」は同義ではない
-
-`FolderOpenScanPurpose` (走査目的) / `ArchiveConvertCompletionPolicy` (完了後の振る舞い) /
-`BookmarkOpenRequestOwner` (要求 identity と復帰先) / `OpenRequestOwner` (nav vs bookmark の裁定) は
-**別々の次元**を表している。context 所有者の型はこれらを置き換えるものではなく、直交して足すもの。
+1. **候補地を減らす**: 今、1 個の context は活性化 / park のたびに
+   `App::active_detached_viewer_context` ([app.rs:10095](../../src/app.rs:10095)) と
+   `DetachedImageWindowSnapshot::paused_bundle` ([app.rs:433](../../src/app.rs:433)) の
+   **2 つの保管フィールドを往復する**。だから「どちらを見るか」の分岐が全消費者に生える。
+   → **slot は 1 種類にする。active か parked かは `DetachedWindowRuntime.state` だけが持つ。**
+2. **残った 2 状態 (slot にある / 今マウント中) を型で返す**。マウント中の実体は App の
+   フィールドそのものなので、これは保管フィールドを覗いても永久に分からない。
+   → `ContextResidence` と、mounted / at-rest を同じ形で読む `ContextRef`。
 
 ---
 
-## 2. 第 2 版の型
+## 2. 4 つの軸に分解する
 
-`src/app/viewer_context_registry.rs` (新設) に置く。`DetachedWindowManager` には置かない
-(あちらの責務は detached window runtime / HWND / activation で、context identity は別境界)。
+| 軸 | 問い | 現行の表現 | 第 3 版の表現 |
+| --- | --- | --- | --- |
+| identity | どの context か | `items_generation` (stamp) / 暗黙の「holder に入っている方」 | `ViewerContextId` (bundle 単位に払い出す serial) |
+| residence | その context のバイト列が今どこにあるか | `Option` 2 個の有無の組み合わせ | `ContextResidence` (registry が答える) |
+| projection | App の 224 フィールドが今どの context を写しているか | 暗黙 | registry の `Projection` (private) |
+| binding | どの窓 / どの役割に結び付いているか | 「その snapshot が bundle を持っている」という**包含関係** | `window_of` / `context_of` / `main` (registry 所有) |
+| driver | 今その状態を誰が動かしているか | `RightDragOwner` のみ | **R2f の範囲** (本書では扱わない) |
+
+`ViewerContextBundle` ([app.rs:2465](../../src/app.rs:2465)、224 フィールド) が context の状態を
+まとめた入れ物であること、ジェスチャ状態と音楽解析は意図的に App-global のままであることは
+第 2 版から変わらない。
+
+---
+
+## 3. 型
+
+置き場所は `src/app/viewer_context_registry.rs` (新設)。`DetachedWindowManager` には置かない
+(あちらの責務は window runtime / HWND / activation で、context identity は別境界)。
+先例は [`src/app/viewer_session.rs`](../../src/app/viewer_session.rs) — 「per-context 状態の一部を
+別モジュールへ出し、交換境界を 1 本にする」を既にやっている。本書はそれを 1 段上でやる。
+
+### 3.1 `ViewerContextId` — `Main` 変種を作らない
 
 ```rust
-/// viewer context の identity。OS ウィンドウとは独立。
-/// `Detached` の値は `allocate_detached_viewer_context_generation` が払い出す context serial。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum ViewerContextId {
-    Main,
-    Detached(u64),
-}
+/// context の identity。bundle 1 個に 1 個。OS ウィンドウとも「main かどうか」とも独立。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct ViewerContextId(u64);
+```
 
-/// App のビューア投影が今どうなっているか。
+**第 2 版の `ViewerContextId::Main` は採れない。** 理由は今回確認した promote 経路である。
+
+`promote_active_detached_video_for_main_context_change` ([app.rs:42734](../../src/app.rs:42734)) は、
+**今マウントされている context をそのまま detached の active context にし、投影を空にする**
+(`take_current_viewer_context_bundle` [app.rs:42741](../../src/app.rs:42741) →
+`active_detached_viewer_context = Some(..)` [app.rs:42753](../../src/app.rs:42753))。
+呼び出し元 ([app.rs:17110](../../src/app.rs:17110) 他 3 箇所) はその空投影へ新しい main を読み込む。
+
+つまり **「main」は context の属性ではなく、その時点でどの context が main 窓の一覧を担っているかという
+binding** である。identity にすると、promote のたびに `Main` → `Detached(n)` の**改名**が要る。
+改名した id は非同期の相関鍵として使えない (第 1 版が window_id で踏んだのと同じ罠)。
+
+したがって registry が `main: ViewerContextId` を binding として持つ (§3.4)。
+`metadata_import_refresh::ContextSlot::Main`
+([metadata_import_refresh.rs:63](../../src/app/metadata_import_refresh.rs:63)) は
+`registry.main()` の解決結果へ写す (ステージ④)。
+
+**`items_generation` との関係**: detached の generation は
+`BASE(1<<63) | serial<<32` ([app.rs:394](../../src/app.rs:394) / [:38094](../../src/app.rs:38094)) なので
+serial を復元できるが、**復元を機構として使わない**。promote された context は main 由来の
+generation を持ったまま detached になる (今日の挙動) ので、encoding は identity の代用にならない。
+`items_generation` は BLOCKER 3 の指示どおり **staleness stamp として据え置き**、
+`ViewerContextId` は要求に明示的に載せる (ステージ④)。encoding からの復元は
+detached id に限った `debug_assert` の相互チェックにだけ使う。
+
+### 3.2 `ContextResidence` — 要求 7 の一級の問い合わせ
+
+```rust
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MountPhase {
-    /// 既知の context がマウントされている。
-    Mounted(ViewerContextId),
-    /// 明示的な抜き取りで空になっている (take 後、戻すまで)。
-    Vacant,
-    /// App のフィールド上で新しい context を組み立てている最中。identity は commit 時に付く。
+pub(crate) enum ContextResidence {
+    /// App の 224 フィールドがこの context を写している。`self.<field>` で直接読み書きできる。
+    Mounted,
+    /// registry の slot にある。`with_viewer_context` でマウントできる。
+    AtRest,
+    /// `build_viewer_context` の実行中。id は予約済みで未 commit。slot にはまだ無い。
     Building,
-}
-
-pub(crate) struct ViewerContextRegistry {
-    phase: MountPhase,
-    /// マウントされていない bundle。**押しのけられた bundle もここに入る** (スタックローカルにしない)。
-    slots: HashMap<ViewerContextId, Box<ViewerContextBundle>>,
-    /// mount の LIFO 復元スタック。panic 時もここから戻す。
-    stack: Vec<ViewerContextId>,
+    /// `close_and_retire_context` の digest 実行中。読めるが、マウントも bind もできない。
+    Retiring,
+    /// commit されたことがあり、その後 retire (または build abort) された。
+    /// 遅れて届いた非同期結果はここで**静かに**捨ててよい。
+    Retired,
+    /// 一度も commit されていない id。**バグの疑い**。捨てる前にログを出す。
+    Unknown,
 }
 ```
 
-第 1 版との差:
+`Retired` と `Unknown` を分ける理由: 遅延結果の破棄が正常なのか退行なのかを、捨てる側が
+判定できるようにするため (無言の fallback を作らないという憲法の要請)。
+判定は `id.serial() <= highest_committed_serial` の O(1) 比較で足り、集合を持たなくてよい。
 
-1. スカラー 1 個 → **phase (3 状態) + slots + stack**。Vacant / Building / ネストを表現できる。
-2. 押しのけた bundle を registry が持つので、**cross-owner ネストが成立する**
-   (detached をマウント中に `Main` を引ける)。panic で main の bundle が drop されて
-   worker が cancel される事故 (`ViewerContextBundle::drop` `src/app.rs:2351`) も起きない。
-3. owner は window_id ではなく **context serial**。window_id 再利用の影響を受けない。
+窓から引く場合:
 
-## 3. API
+```rust
+/// 窓に紐づく context と、その所在。窓が未 bind なら None。
+fn locate_window_context(&self, window_id: u64) -> Option<(ViewerContextId, ContextResidence)>;
+```
+
+これが **§6.5 の #1 / #3 と §1.1 の promote 判定を、同じ 1 本で置き換える**。
+
+### 3.3 `Projection` — 要求 6
+
+```rust
+/// App の 224 フィールドが今何を写しているか。registry モジュール private。
+enum Projection {
+    Mounted(ViewerContextId),
+    /// 予約済み・未 commit の context を組み立てている。`previous` は commit / abort 時に戻す先。
+    Building { reserved: ViewerContextId, previous: ViewerContextId },
+}
+```
+
+第 2 版の `Vacant` は**消える**。`Vacant` は「投影に空 bundle が載っている」という実装の
+中間状態にすぎず、transaction の中にしか存在しない。外から観測できない状態を型に出すと、
+それを見に来る消費者が生えて第 2 版の失敗を繰り返す。
+`promote` の「投影を空にして呼び出し元が新しい main を読む」形も、専用 transaction (§4.5) に
+することで `Vacant` を露出せずに表せる。
+
+`Building` は「identity が無い」ではなく「**予約済みだが未 commit**」(BLOCKER 4)。
+`begin` が最初に serial を払い出し、`items_generation` を投影へ焼いてから本体へ入る。
+組み立て中に開始された worker は、その時点で予約済み identity の generation を持つ。
+
+### 3.4 `ViewerContextRegistry`
+
+```rust
+pub(crate) struct ViewerContextRegistry {
+    projection: Projection,
+    /// マウントされていない context。**保管先はここだけ。**
+    #[cfg(windows)]
+    slots: HashMap<ViewerContextId, Slot>,
+    /// main 窓の一覧を担う context (§3.1)。
+    main: ViewerContextId,
+    /// context → detached 窓。context の生存期間に従う。
+    #[cfg(windows)]
+    window_of: HashMap<ViewerContextId, u64>,
+    /// 窓 → context。`bind` / `rebind` / `unbind` だけが更新する派生 index。
+    #[cfg(windows)]
+    context_of: HashMap<u64, ViewerContextId>,
+    next_serial: u64,
+    highest_committed_serial: u64,
+}
+
+/// slot の中身。`Retiring` は digest 実行中の一時状態。
+enum Slot { AtRest(Box<ViewerContextBundle>), Retiring(Box<ViewerContextBundle>) }
+```
+
+**不変条件**
+
+| # | 不変条件 | 守り方 |
+| --- | --- | --- |
+| I1 | context の bundle は `slots` か投影のどちらか一方にだけ在る | 生 bundle を返す API が無い (§3.7) |
+| I2 | `window_of` と `context_of` は互いの逆写像 | 更新は `bind` / `rebind` / `unbind` の 3 本だけ (module private の共通実装) |
+| I3 | 1 つの窓に context は高々 1 つ | `bind` は既に bound の窓を拒否し、`rebind` だけが置換できる |
+| I4 | `main` は常に存在し、`slots` か投影のどちらかに在る | `promote` は新しい main を作ってから古い main を bind する |
+| I5 | `Building` 中は mount / bind / retire を受け付けない | `Projection` の match で typed error を返す |
+| I6 | `Retiring` 中の id は mount / bind できない | `Slot::Retiring` への遷移 |
+| I7 | 投影は毎 root pass の末尾で `Mounted` | 定義した継ぎ目での assert (時間窓ではない。憲法 5) |
+
+### 3.5 `window_id → ViewerContextId` をどこに置くか — 要求 4
+
+**決定: registry が所有する。`DetachedWindowRuntime` にも `DetachedImageWindowSnapshot` にも置かない。**
+
+根拠:
+
+1. **binding の寿命は context の寿命であって窓の寿命ではない。** folder-nav の reopen は
+   `ensure_detached_viewer_window_id` ([app.rs:38277](../../src/app.rs:38277)、再利用は :38292〜) が
+   **意図的に window_id を再利用**する。理由はコード中のコメントに明記されている: detached の
+   `fullscreen_viewport_id` は window_id 由来なので、毎回新しい id を振ると egui が OS 窓を
+   破棄→再生成し、既定サイズ 822x656 の小窓がカスケードする。
+   → **reopen は「同じ窓・新しい context」**。窓側に context を持たせると、context 差し替えの
+   たびに runtime を書き換えることになり、所有者が 2 つになる (BA-6 と同じ形)。
+2. **main には窓が無い。** runtime 側に持たせると main だけ表現できず、また分岐が生える。
+3. **activation は window_id から始まる** ([app.rs:41013](../../src/app.rs:41013)) が、
+   registry が逆引き index を持てば O(1) で足りる。runtime に持たせる理由にならない。
+4. 憲法 3 に抵触しない: App に新しい `bool` / `Option` を足すのではなく、**既存の 2 つの保管
+   フィールドを 1 つの typed owner に畳む**方向である (憲法 3 が指している「R2 で導入する
+   state owner へ足す」そのもの)。
+
+**再利用の安全性は順序制約で担保する。**
+
+```rust
+/// 未 bind の窓へ context を結ぶ。既に bound なら Err。
+fn bind_window(&mut self, id: ViewerContextId, window_id: u64) -> Result<(), BindError>;
+
+/// 窓の context を差し替え、**押し出された旧 context の id を返す**。
+/// 戻り値は `#[must_use]`。呼び出し元は retire するか別の窓へ bind し直す義務を負う。
+#[must_use]
+fn rebind_window(&mut self, window_id: u64, id: ViewerContextId) -> Option<ViewerContextId>;
+
+fn unbind_window(&mut self, window_id: u64) -> Option<ViewerContextId>;
+```
+
+「窓は残す・context は捨てる」という reopen の意味が、`rebind_window` の戻り値を
+`#[must_use]` で受け取ることによって**コンパイラに残る**。今は暗黙の上書きである。
+
+`DetachedImageWindowSnapshot` は bundle を手放し、**park 中に描くための凍結表示データと
+`id` だけ**になる ([app.rs:415](../../src/app.rs:415)〜)。これは責務として正しい分離で、
+`can_activate()` / `has_paused_bundle()` / `right_drag_context()` / `right_drag_viewer_identity()`
+([app.rs:697](../../src/app.rs:697)〜[:730](../../src/app.rs:730)) は registry への問い合わせになる。
+
+### 3.6 `ContextRef` / `ContextMut` — mounted も at-rest も同じ形で読む
+
+```rust
+/// 1 つの context への読み取り。マウント中なら App のフィールド、そうでなければ slot を読む。
+/// 呼び出し側はどちらか知らなくてよい。
+pub(crate) struct ContextRef<'a> { /* private: Mounted(&App) | AtRest(&ViewerContextBundle) */ }
+
+impl ContextRef<'_> {
+    pub(crate) fn id(&self) -> ViewerContextId;
+    pub(crate) fn items_generation(&self) -> u64;
+    pub(crate) fn fullscreen_idx(&self) -> Option<usize>;
+    pub(crate) fn item_at(&self, idx: usize) -> Option<&GridItem>;
+    pub(crate) fn current_folder(&self) -> Option<&Path>;
+    // ... 外から実際に読まれている ~26 種だけ (付録 B-3)
+}
+```
+
+これが効く具体例: 今は**同じ述語が bundle 版と App 版で二重定義**されている。
+
+- `viewer_context_bundle_contains_video(&ViewerContextBundle)` ([app.rs:39104](../../src/app.rs:39104))
+- `current_viewer_context_contains_video(&self)` ([app.rs:39197](../../src/app.rs:39197))
+
+本文はほぼ同一で、片方だけ直せば静かに乖離する。`ContextRef` 版 1 本に畳める。
+同型の bundle 引数ヘルパーは非テストで 12 本ある (付録 B-4)。
+
+`ContextMut<'_>` は retire の digest 専用 (§4.4)。
+
+### 3.7 生 bundle を渡す境界は 1 つも作らない — 要求 1
+
+registry の公開面に、次のシグネチャを**置かない**。これは §6.3 の監査 allowlist にも反映する。
+
+- `-> ViewerContextBundle` / `-> Box<ViewerContextBundle>` / `-> Option<Box<ViewerContextBundle>>`
+- `-> &mut ViewerContextBundle` / `-> &mut Box<ViewerContextBundle>`
+- `-> &mut HashMap<ViewerContextId, Slot>` (slot map の貸し出し)
+
+第 2 版の `extract_mounted_viewer_context()` はここに該当したため、I1 が最初から破れていた。
+
+---
+
+## 4. API — 5 つの transaction
+
+context の所有を動かす操作は、次の 5 種**しかない**。それ以外の形は書けない (§6.1)。
+
+| transaction | 現行の対応 | 所有の動き |
+| --- | --- | --- |
+| **mount** | `with_active_detached_viewer_context` ([app.rs:16698](../../src/app.rs:16698)) と手書き 18 箇所 | slot → 投影 → slot (必ず戻る) |
+| **build** | `start_active_detached_book_context_with_start` ([app.rs:40530](../../src/app.rs:40530)) | 投影を新 context にして組み立て、slot へ入れ、直前を戻す |
+| **fork** | `split_current_context_preserving_main_grid` ([app.rs:41922](../../src/app.rs:41922)) | 投影を保ったまま 2 個目を作り、slot へ入れる |
+| **retire** | `take_and_close_...` ([app.rs:38577](../../src/app.rs:38577)) / `teardown_paused_media_bundles_for_window_ids` ([app.rs:39424](../../src/app.rs:39424)) | 読んでから drop。外へは出さない |
+| **promote** | `promote_active_detached_video_for_main_context_change` ([app.rs:42734](../../src/app.rs:42734)) | 投影中の context を slot へ退避し、新しい空 context を投影にする |
+
+### 4.1 mount
 
 ```rust
 /// id の context をマウントして f を実行し、必ず元へ戻す (panic 時も)。
-/// すでにマウント済みなら swap せずそのまま実行する。
-/// slot に無ければ None を返し f を呼ばない。
-fn with_viewer_context<R>(&mut self, id: ViewerContextId, f: impl FnOnce(&mut Self) -> R) -> Option<R>;
+/// 既にマウント中ならそのまま f を実行する (再入は swap しない)。
+fn with_viewer_context<R>(&mut self, id: ViewerContextId, f: impl FnOnce(&mut Self) -> R)
+    -> Result<R, MountError>;
 
-/// 現在 bundle を持っている全 id (マウント中のものを含む)。
-fn viewer_context_ids(&self) -> Vec<ViewerContextId>;
-
-/// 上記を順にマウントして呼ぶ。「main + active + 全 parked」の手書きループを置き換える。
-fn for_each_viewer_context(&mut self, f: impl FnMut(&mut Self, ViewerContextId));
-
-/// マウント中の context を抜き取り、phase を Vacant にする。
-fn extract_mounted_viewer_context(&mut self) -> ViewerContextBundle;
-
-/// Vacant / Building の App 投影を、指定 id の context として確定する。
-fn commit_mounted_viewer_context(&mut self, id: ViewerContextId);
+/// 窓から引く版。activation 経路 (window_id 始まり) 用。
+fn with_window_viewer_context<R>(&mut self, window_id: u64, f: impl FnOnce(&mut Self) -> R)
+    -> Result<R, MountError>;
 ```
 
-`f` の中で自分自身の owner を削除する経路 (terminal close、`src/app.rs:40523`) は、
-**現行どおり「マウント中に判定 → アンマウント後に slot を消す」**を規約として明文化する。
-`with_viewer_context` の中から slot を消してはならない (テストで固定する)。
+`MountError` は `ContextResidence` を持つ (`Building` / `Retiring` / `Retired` / `Unknown`)。
+**`Option` を返さない**のは、「マウントできなかった」を無言で読み飛ばす今の
+`else { continue }` を再生産しないため (付録 B-2 に 6 箇所)。
 
----
+panic 安全は既存 `with_active_detached_viewer_context` と同じ `catch_unwind` +
+`resume_unwind` で担保する。**今の手書き 18 箇所にはこれが無く、panic すると押しのけられた
+bundle が drop され、`Drop for ViewerContextBundle` ([app.rs:2743](../../src/app.rs:2743)) が
+その context の worker を cancel する。**
 
-## 4. ステージ分割 (Codex の助言を採用)
+### 4.2 build — 要求 1 / 要求 6
 
-第 1 版の「1 ステージで 52 か所 + プリミティブ + 非同期消費者」は広すぎた。
+```rust
+/// 新しい context を投影上で組み立てる。id は begin で予約済み。
+/// f が Commit を返せば slot へ入れ、直前の context を投影へ戻す。
+/// Abort / panic なら組み立て中の投影を retire 扱いで畳み、直前を戻す。
+fn build_viewer_context(
+    &mut self,
+    reason: &'static str,
+    f: impl FnOnce(&mut Self, ViewerContextId) -> BuildOutcome,
+) -> Option<ViewerContextId>;
 
-| ステージ | 内容 | 挙動 |
+pub(crate) enum BuildOutcome { Commit, Abort(&'static str) }
+```
+
+**token 型にせず closure にする理由**: token (`BuildTxn`) が registry を借りると、本体で
+`&mut App` を使えない。token を値にすると未 commit のまま落ちる経路を `Drop` で救えない
+(`Drop` から App へ戻れない)。現行の build 経路は**すべて 1 関数の中で完結している**ので
+closure で足りる。既存 `with_detached_viewer_main_history_suppressed`
+([app.rs:16682](../../src/app.rs:16682)) と同じ形。
+
+**現行 `start_active_detached_book_context_with_start` との対応**:
+
+| 現行 | 行 | 第 3 版 |
 | --- | --- | --- |
-| **R2e-1** | registry / phase / stack / unwind 復元 の導入と、**プリミティブ 4 種** (swap / take / split / 直接代入) を registry 経由へ。Vacant / Building / ネスト / panic 復元のテスト | 不変 |
-| **R2e-2** | 巡回・消費側 (約 52 か所) を `with_viewer_context` / `for_each_viewer_context` へ移す | 不変 |
-| **R2e-3** | 非同期消費者を移す。`metadata_import_refresh::ContextSlot` → `ViewerContextId` を最初に | 不変 |
-| **R2f** | 純粋 reducer + 合法遷移制約 + 散在 pending / flag の typed 集約 (R2b 残件) | 変わる |
+| `let mut main_context = self.take_current_viewer_context_bundle();` | 40545 | `begin` の中 (slot へ退避)。スタックローカルに出さない |
+| `self.navigation_scope = DetachedPhysical;` ほか | 40548〜40559 | `f` の中 (投影への通常の書き込み) |
+| `let context_serial = self.assign_next_detached_viewer_context_generation();` | 40560 | **`begin` の先頭へ前倒し。** `f` は `reserved` を受け取る |
+| `reset_active_detached_viewport_runtime_for_new_window(context_serial, ..)` | 40561 | `f` の中 (`reserved` を渡す) |
+| `let window_id = ... allocate_detached_viewer_window_id()` | 40565 | `f` の中。直後に `bind_window(reserved, window_id)` |
+| 各 `load_*` / `start_*` | 40598〜40634 | `f` の中 |
+| `let active_context = self.take_current_viewer_context_bundle();` | 40654 | `commit` の中 |
+| `self.swap_viewer_context_bundle(&mut main_context);` | 40655 | `commit` の中 (slot から復帰) |
+| `self.active_detached_viewer_context = Some(..)` | 40656 | 消える (slot が保管先) |
+
+⚠ **前倒しの挙動同値性は主張ではなく検証項目**。40546〜40559 の間に `items_generation` を
+読む処理が無いことは目視で確認したが (`navigation_scope` 代入 / `begin_page_wait` /
+`bookmark_view_state` 代入 / `bookmark_open_pending` 代入のみ)、ステージ②のレビューで
+コード読みとテストの両方で確認する。同値でなければ、前倒しをやめて `begin` に
+「serial 払い出しを遅らせる」変種を足す (その場合 `Building` の予約 id が遅れて決まるので、
+BLOCKER 4 の要求を満たすために `reserved` を `f` の途中で確定させる形にする)。
+
+**abort の規約**: `Abort` / panic では、組み立て途中の投影を `retire` と同じ経路で畳む
+(worker cancel が走る)。`reserved` は `Retired` になるので、遅れて届いた結果は静かに
+捨てられる。abort は理由をログに出す (無言 fallback を作らない)。
+
+### 4.3 fork — 要求 2
+
+```rust
+/// 投影 (= マウント中の context) を保ったまま、2 個目の context を作って slot へ入れる。
+/// 生 bundle は返らない。返るのは id だけ。
+fn fork_mounted_context(&mut self, policy: ForkPolicy, reason: &'static str) -> ViewerContextId;
+
+pub(crate) enum ForkPolicy {
+    /// live-park。main grid が使う一覧 identity / worker 複合体は投影に残し、
+    /// viewer の一時状態だけを新 context へ移す。
+    LiveMediaPark,
+    /// materialize 済みの物理一覧から独立静止画窓を開く。LiveMediaPark に加えて
+    /// 表示・編集系 ~40 フィールドを複製する。
+    MaterializedStillOpen,
+}
+```
+
+現行の 3 分類マクロ (`duplicate_for_parked!` / `move_to_parked!` / `keep_in_main!`,
+[app.rs:41924](../../src/app.rs:41924)〜) はそのまま registry モジュールへ移す。
+**224 フィールドの exhaustive destructure がフィールド追加時にコンパイルエラーになる性質は
+維持する** (今の設計の一番良い部分で、壊してはいけない)。
+
+**「fork してから条件を見て捨てる」を前置き判定へ直す。**
+現行 `park_current_viewer_context_as_live_media_inner` ([app.rs:41868](../../src/app.rs:41868)) は
+fork した後に `viewer_context_bundle_contains_video(&parked_bundle)` を見て、偽なら捨てる。
+fork した側 (`preserve_main_context = true`) では、捨てた bundle へ `move_to_parked!` で移した
+状態がそのまま失われる。判定材料 (`fullscreen_idx` / `items` / `fs_cache` /
+`vst3_deferred_media_open`) は**分割前の投影にすべて揃っている**ので、fork の前に
+`current_viewer_context_contains_video()` ([app.rs:39197](../../src/app.rs:39197)) で判定できる。
+呼び出し元 `park_detached_session_for_stack_aggregation` ([app.rs:41854](../../src/app.rs:41854)) は
+既にそうしている。
+
+⚠ これも**挙動同値性の検証項目**。ステージ②で「前置き判定と後置き判定が一致すること」を
+テストで固定してから入れ替える。一致しないケースが見つかったら、消さずに報告する。
+
+fork の直後に `bind_window` するのは呼び出し元 (窓を作るのは registry の責務ではない)。
+現行 `route_materialized_physical_still_open_to_active_context` ([app.rs:42485](../../src/app.rs:42485)) が
+serial を `let (_context_serial, items_generation) = ...` ([app.rs:42514](../../src/app.rs:42514)) と
+**捨てている**のは、今 context に id を持たせる場所が無いからで、fork が id を返せば解消する。
+
+### 4.4 retire — 要求 3
+
+```rust
+/// 終端削除。bundle はこの関数の中で drop され、外へは出ない。
+///
+/// - `finish`: **その context をマウントした状態**で走る終了処理
+///   (viewport への Close 送信 / `close_fullscreen`)。
+/// - `digest`: アンマウント後、drop の直前に中身から所有値を作る。
+///   `ContextMut` なので、drop 前に畳んでおきたいフィールドの片付けもここで行う。
+fn close_and_retire_context<D>(
+    &mut self,
+    id: ViewerContextId,
+    reason: &'static str,
+    finish: impl FnOnce(&mut Self),
+    digest: impl FnOnce(ContextMut<'_>) -> D,
+) -> Result<D, MountError>;
+
+/// `finish` の要らない版 (parked / media teardown)。
+fn retire_context<D>(&mut self, id, reason, digest) -> Result<D, MountError>;
+```
+
+**2 つの現行経路がそのまま乗る。**
+
+*(a) ブックマーク照合* ([app.rs:41497](../../src/app.rs:41497)〜[:41509](../../src/app.rs:41509))
+
+```
+現行: take_and_close_...() が生 bundle を返す
+      → reconcile_closed_bookmark_detached_context(&closed) が
+        bookmark_view_state / selected / items[idx] / archive_source_override /
+        current_folder を読み、main をマウントした状態で load_folder... まで実行する
+      → closed が drop
+第3版: let summary = self.close_and_retire_context(id, reason,
+           |app| { /* viewport Close + close_fullscreen */ },
+           ClosedBookmarkSummary::read)?;
+       self.reconcile_closed_bookmark_detached_context(&summary);   // main がマウントされた状態
+```
+
+`ClosedBookmarkSummary` は所有値だけを持つ小さな struct。**借用衝突が起きない**のがこの形の要点で、
+`&mut App` と bundle の同時借用を避けるために生 bundle を外へ出す必要がなくなる。
+第 2 版が「アンマウント後に slot を消す」で足りないと言われたのは、この読みが drop の前に
+必要だからである。
+
+*(b) メディア teardown* ([app.rs:39424](../../src/app.rs:39424))
+
+```
+現行: dropped_bundles: Vec<Box<ViewerContextBundle>> を作り、plan を計算し、
+      save/cleanup し、normalize_* を clear してから drop
+第3版: let plans: Vec<_> = ids.iter()
+           .filter_map(|&id| self.retire_context(id, reason, |mut cx| {
+               let plan = viewer_context_media_teardown_plan(cx.as_ref());
+               cx.clear_normalize_state();
+               plan
+           }).ok())
+           .collect();
+       self.save_viewer_context_media_teardown_resumes(&plans);
+       self.cleanup_viewer_context_media_teardown_globals(&plans, reason);
+```
+
+**生存側を見る読みも registry が答える。**
+`closing_parked_windows_own_native_video_mode_switch` ([app.rs:39396](../../src/app.rs:39396)) は今、
+「マウント中」「active holder」「parked 群」の **3 経路**を別々に見ている
+(`current_viewer_context_contains_video` / `active_detached_viewer_context_contains_video` /
+`detached_image_windows` の走査)。第 3 版では 1 本になる。
+
+```rust
+let others_have_video = self.any_viewer_context(|id, cx|
+    !closing.contains(&id) && cx.contains_video());
+```
+
+### 4.5 promote
+
+```rust
+/// 投影中の context を slot へ退避し、新しい空 context を投影にする。
+/// 戻り値は退避された側の id (呼び出し元が bind_window する)。
+#[must_use]
+fn stash_mounted_and_start_fresh(&mut self, reason: &'static str) -> ViewerContextId;
+```
+
+`promote_active_detached_video_for_main_context_change` はこれを呼び、返った id を
+`bind_window(id, window_id)` し、新しい投影 (= 新しい main) を `registry.main` にする。
+**`Vacant` を型に出さずに済む**のはこの transaction があるからである。
+
+### 4.6 巡回
+
+```rust
+/// 現在 context を持っている全 id (マウント中のものを含む)。
+fn viewer_context_ids(&self) -> Vec<ViewerContextId>;
+
+/// 順にマウントして f を呼ぶ。マウントできない id は typed reason 付きでスキップし、ログを出す。
+fn for_each_viewer_context(&mut self, reason: &'static str, f: impl FnMut(&mut Self, ViewerContextId));
+
+/// マウントせずに読むだけの走査 (mounted / at-rest を同じ形で見る)。
+fn any_viewer_context(&self, f: impl FnMut(ViewerContextId, ContextRef<'_>) -> bool) -> bool;
+fn with_viewer_context_ref<R>(&self, id: ViewerContextId, f: impl FnOnce(ContextRef<'_>) -> R) -> Option<R>;
+```
+
+置き換え対象 (ステージ③): [app.rs:30417](../../src/app.rs:30417) `rebuild_all_viewer_context_visible_indices` /
+[app.rs:54317](../../src/app.rs:54317) `clear_all_edit_preview_materializations` /
+[app.rs:19795](../../src/app.rs:19795) `consume_deferred_vst3_media_open_in_all_contexts` /
+[app.rs:28993](../../src/app.rs:28993) rename 後の rehydrate。
+
+**非 Windows**: `for_each_viewer_context` / `any_viewer_context` / `with_viewer_context_ref` /
+`residence` は cfg 中立にし、非 Windows では投影 1 個だけを回す。これで呼び出し側から
+`#[cfg(windows)]` ブロックが消え、ubuntu の `cargo check` ジョブ (CLAUDE.md リリース手順 Phase 2) が
+そのまま番人になる。slot / binding / detached transaction は `#[cfg(windows)]`
+(`ViewerContextBundle` 自体が `#[cfg(windows)]` のため)。
 
 ---
 
-## 5. 2 つのバグが必要とするもの (再評価)
+## 5. 不変条件を何が守るか
 
-Codex レビューで、**どちらも registry の完成を待つ必要が無い**ことが分かった。
-
-### §1.99 (複数ウィンドウで RAR を開くとメイングリッドも書庫一覧になる)
-
-必要なのは既存 context の所有者ではなく、**「要求 X のために新しい detached context を作る」という
-型付きの宛先意図**。完了時点では detached 窓も bundle もまだ存在しないので、
-`with_viewer_context(Detached(..))` は解決できない (= 第 1 版の誤り)。
-
-正しい形は既にある: ブックマーク経路が `ArchiveConvertCompletionPolicy::Bookmark(owner)` を持ち、
-変換完了後に `open_converted_bookmark_in_detached_context` (`src/app.rs:39993`) が
-**新しい detached context を作って**着地する。グリッドからの ConvertibleArchive 開きにも
-同型の completion policy と着地関数を用意すればよい。**registry 非依存。**
-
-### §1.100 (非アクティブな別ウィンドウでジェスチャが効かない)
-
-**確定した事実 (第 1 版になかった)**: 非アクティブな静止画窓は `show_viewport_deferred` で描かれ、
-コールバックは描画 / focus / close / placement しか報告しない (`src/ui_fullscreen.rs:11622`,
-`:11175`)。アクティブ化を担う OS watcher は **`VK_LBUTTON` しかサンプルしない**
-(`src/app/detached_window_manager.rs:326`)。したがって**非アクティブな静止画窓上の右ドラッグは、
-アクティブ化もせずジェスチャ状態機械にも届かない完全な no-op**。バックログの現行記述
-「最初の右ドラッグが失われる」は `ParkedLive` の動画窓にだけ当てはまる。
-
-**利用者決定 (2026-08-21)**: 「ジェスチャを認識し、ジェスチャされた場合は自動でアクティブ化した
-上で、ジェスチャコマンドを実行する」。両方の窓が見えている以上、ジェスチャが受理されるのが期待動作。
-
-必要なもの:
-
-1. 非アクティブ窓のポインタ列を、その窓の identity 付きで root pass へ届ける
-   (deferred の event に足す。`DeferredDetachedImageWindowEvent` は既に window id を持つ)
-2. ジェスチャ状態を **window 所有**にする (現在は `App` に 1 個 `src/app.rs:10010`、
-   識別は `RightDragContext` だけなので複数の画像窓を区別できない)
-3. 成立時に「アクティブ化 → コマンド実行」を**型付きの順序**として表す (guard や遅延ではなく)
-
-コマンドはアクティブ化後に実行するので、**マウントされていない context へ適用する必要は無い**
-= registry 非依存。2 は R2b 残件の「散在 state の typed 集約」そのものなので、
-**`DetachedWindowRuntime` へ載せれば憲法 3 に抵触しない**。
+| 不変条件 | 型 | 借用 | 可視性 | 監査 | テスト |
+| --- | --- | --- | --- | --- | --- |
+| I1 bundle は slot か投影のどちらか一方 | ○ (生 bundle を返す API が無い) | — | ○ | ○ (A1/A4) | ○ |
+| I2 window_of / context_of が逆写像 | — | — | ○ (private field) | — | ○ |
+| I3 1 窓 1 context | ○ (`bind` が Err) | — | — | — | ○ |
+| I4 main は常に存在 | ○ (`main: ViewerContextId` は非 Option) | — | — | — | ○ |
+| I5 / I6 Building / Retiring 中の禁止操作 | ○ (`MountError`) | — | — | — | ○ |
+| I7 root pass 末尾で Mounted | — | — | — | — | ○ (継ぎ目の assert) |
+| 所在を `is_none()` で答えない | ○ (`ContextResidence`) | — | ○ | ○ (A5) | ○ |
+| 224 フィールドの取りこぼしが無い | ○ (exhaustive destructure) | — | — | — | コンパイルエラー |
+| mount が panic 安全 | — | ○ (`catch_unwind` を 1 箇所に集約) | ○ | ○ (A2) | ○ |
 
 ---
 
-## 6. 第 2 版に残った BLOCKER (第 3 版で解く)
+## 6. 完了確認 — コンパイラを第一の門にする
 
-Codex 第 2 版レビュー (2026-08-21) の結果。**§4 のステージ分割ごと作り直す必要がある。**
+BLOCKER 3 の「grep では不十分」への答えは 2 段構えである。
 
-1. **所有の transaction が無い。** `extract_mounted_viewer_context` が生の bundle を返す時点で、
-   「マウントされていない bundle は必ず registry が持つ」という §2 の不変条件が破れる。
-   `start_active_detached_book_context_with_start` は
-   「main を抜く → App 上で detached を組む → detached を抜く → main を恒久復帰」
-   ([app.rs:39778](../../src/app.rs:39778) → [39832](../../src/app.rs:39832) →
-   [39885](../../src/app.rs:39885) → [39886](../../src/app.rs:39886)) という形で、
-   `with_viewer_context` (常に元へ戻す契約) では表せない。
-   **`begin_build(reserved_id)` → `commit_and_restore_previous` の transaction が要る**。
-   `Vacant` / `Building` は transaction の内部状態にし、生 bundle を返す API にしない。
-   さらに 2 つの正当な遷移に API が無い:
-   - main をマウントしたまま 2 個目の bundle を作る `split_current_context_preserving_main_grid`
-     ([app.rs:40949](../../src/app.rs:40949)) → **atomic な fork / insert_unmounted** が要る
-   - 終端削除は drop 前に中身を読む必要がある (bookmark 照合 [app.rs:40523](../../src/app.rs:40523)、
-     media teardown [app.rs:38725](../../src/app.rs:38725))。「アンマウント後に slot を消す」では足りない
-2. **window_id → ViewerContextId の対応表が設計に無い。** 今は active holder も parked snapshot も
-   bundle しか持たず ([app.rs:1866](../../src/app.rs:1866) / [app.rs:402](../../src/app.rs:402))、
-   `ActiveDetachedSession` と `DetachedWindowRuntime` は window_id しか持たない。
-   アクティブ化は window_id から始まる ([app.rs:40065](../../src/app.rs:40065)) ので、
-   対応表が無いと slot を選べない。**window_id からは推論できない** (再オープンで再利用されるため、
-   [app.rs:37568](../../src/app.rs:37568))。どこに置くかを設計で決めること。
-3. **R2e-1 / R2e-2 の切り方はコンパイルできない。** 消費側が `active.bundle` や各
-   `paused_bundle` を直接触っている ([app.rs:27609](../../src/app.rs:27609) /
-   [app.rs:40523](../../src/app.rs:40523) / [app.rs:38725](../../src/app.rs:38725)) ので、
-   R2e-1 で保管フィールドを消すと同時に移行するしかない。
-   **正しい分割**: ①registry の状態機械と build transaction を production の保管を切らずに定義・テスト →
-   ②保管・active/parked の owner 参照・生プリミティブ・終端 teardown・直接消費者を**一括で**切替 →
-   ③残った手書き巡回の単純化 → ④非同期の要求 identity 変換 (`items_generation` は残す)。
-   **完了確認は grep ではなくコンパイラ + AST allowlist**: 生成 / exhaustive destructure /
-   生の抽出 / 所有を動かす `mem::swap` を registry モジュール private にし、
-   `syn` ベースの CI 監査でモジュール外の `ViewerContextBundle` 生成・返却・保管を弾く。
-4. **§1.3 の「Building には identity が無い」は誤り。** context serial は load 開始前に払い出され
-   ([app.rs:39793](../../src/app.rs:39793))、window_id もその直後に確定する
-   ([app.rs:39798](../../src/app.rs:39798))。正しくは **「identity は予約済みだが未 commit」**。
-   build transaction は予約済み `ViewerContextId` を保持すること。
+### 6.1 Rust の可視性だけで弾けるもの (監査コード不要)
 
-その他の訂正: 非テストの `swap_viewer_context_bundle` 呼び出しは 52 ではなく **50**。
-§1.1 の保管一覧は、終端 close が生 bundle を返す ([app.rs:37853](../../src/app.rs:37853))、
-media teardown が `Vec<Box<ViewerContextBundle>>` を持つ ([app.rs:38739](../../src/app.rs:38739))
-といった一時所有を含めると網羅ではない。
+`src/app/viewer_context_registry.rs` へ次を移し、**`ViewerContextBundle` の全フィールドを
+そのモジュール private にする**。
 
-**Codex の推奨作業順**: §1.99 → §1.100 → R2e (再設計後)。前 2 件は registry 非依存であることに
-Codex も同意した。ただし両方とも §11 のリワーク外合意プロセスで記録すること。
+- `struct ViewerContextBundle` (型自体は `pub(in crate::app)`、**フィールドは private**)
+- `impl Drop for ViewerContextBundle` / `empty()` / `set_items_generation()`
+- `swap_viewer_context_bundle`
+- fork の 3 分類 destructure (両 policy)
+- `ContextRef` / `ContextMut` と accessor 群
+- `ViewerContextRegistry` / `ViewerContextId` / `ContextResidence` / `Projection` / `Slot`
+
+Rust の可視性規則 (子モジュールは親の private を見られるが、親は子の private を見られない) により、
+**registry モジュールの外では次が言語仕様として書けなくなる**。lint も grep も要らない。
+
+| 書けなくなるもの | 理由 |
+| --- | --- |
+| `ViewerContextBundle { .. }` (struct literal) | private field |
+| `let ViewerContextBundle { a, b, .. } = x` (destructure) | private field |
+| `bundle.items` / `bundle.fs_cache` などの直接アクセス | private field |
+| `std::mem::swap(&mut self.items, &mut bundle.items)` | private field |
+| `ViewerContextBundle::empty()` | private fn |
+
+現在この 3 種は非テストで **3 箇所しかない** (destructure :16189 / `empty()` :16667 / fork :41939) ので、
+移設そのものは小さい。効くのは「**将来もう書けない**」という性質のほうである。
+
+**代償**: 外から読まれている ~26 フィールドに accessor が要る (付録 B-3)。
+`src/app/vram_accounting.rs:70` のような子モジュールからの読みも accessor 経由になる。
+
+### 6.2 可視性で弾けない残り
+
+| 残る穴 | 例 |
+| --- | --- |
+| 型名を使って**モジュール外に保管場所を作る** | `struct Foo { b: Option<Box<ViewerContextBundle>> }` — 型は nameable |
+| **App のフィールドを直接 `mem::swap`** して context を手で動かす | `mem::swap(&mut self.items, &mut stash)` — bundle 型を一切使わない |
+| registry モジュール**内部**の逸脱 | slot map を貸す accessor を足す |
+| **公開面が静かに育つ** | `pub(super) fn active_bundle_is_none()` のような所在述語が復活する |
+
+### 6.3 syn 監査が許可するもの / 弾くもの
+
+`tools/viewer_context_audit` (workspace member、`syn` の `full` + `visit` を使う source-only の bin)。
+vendor 資産を要らないので ubuntu CI でそのまま走る。
+
+| # | 規則 | 対象 | 弾く例 | 許可する例 |
+| --- | --- | --- | --- | --- |
+| **A1** | `ViewerContextBundle` が **型位置** (struct / enum のフィールド型、fn の引数・戻り値、`let` の型注釈、ジェネリック実引数、`impl` の対象) に出てよいのは registry モジュールだけ | `src/**/*.rs` 全部 (tests.rs 含む) | `Vec<Box<ViewerContextBundle>>` を関数の戻り値にする | doc comment / 文字列リテラル中の言及 |
+| **A2** | registry モジュール外で `mem::swap` / `mem::replace` / `mem::take` の実引数に `self.<F>` が現れてはならない。`F` は監査が **`ViewerContextBundle` の定義そのものを syn で読んで**得た 224 フィールド名 | `src/**/*.rs` | `mem::take(&mut self.fs_cache)` | 同名でも bundle に無いフィールド / registry 内部 |
+| **A3** | registry モジュール外で `ViewerContextBundle::` の関連関数呼び出しが無いこと | `src/**/*.rs` | `ViewerContextBundle::empty()` | — |
+| **A4** | registry モジュールの**公開面 (`pub` / `pub(crate)` / `pub(super)` / `pub(in ..)`) は allowlist と完全一致**。allowlist は名前 + 引数型 + 戻り値型の文字列で監査設定に列挙する | `viewer_context_registry.rs` | allowlist に無い `pub(super) fn` を足す / 既存関数の戻り値を `Box<ViewerContextBundle>` に変える | allowlist を**同じコミットで明示的に更新**する (= レビューが必ず入る) |
+| **A5** | 識別子 `paused_bundle` / `active_detached_viewer_context` が存在しないこと (ステージ②完了後) | `src/**/*.rs` | 復活 | — |
+| **A6** | `#[cfg(test)]` 以外から `viewer_context_registry::test_access::` を呼ばないこと | `src/**/*.rs` | production からの呼び出し | `#[cfg(test)]` 配下 |
+
+**A4 が監査の要**である。「所在を `bool` で答える関数を作るな」のような**意味**の規則は機械化できないが、
+「公開面は列挙されたものだけ」なら機械化できて、しかも**新しい所在述語を足そうとした瞬間に
+CI が落ちてレビューを強制する**。第 2 版が `extract_mounted_viewer_context` を通してしまったのは、
+公開面の増加を誰も止めなかったからである。
+
+**A2 のフィールド名リストが腐らない理由**: 監査が別に持つ定数ではなく、
+`ViewerContextBundle` の定義を syn でパースして得る。フィールドを足しても監査は自動で追随する。
+
+**A1 が拾えないもの (明記)**: 型エイリアス経由 (`type B = ViewerContextBundle;`) と、
+マクロ展開後にだけ現れる型位置。前者は A1 に「`ViewerContextBundle` への型エイリアス定義を
+registry 外で禁止」を含めて塞ぐ。後者は syn がトークン列しか見られないので**塞げない**。
+これは監査の既知の穴として書き残し、レビュー時の目視項目にする (無いことにしない)。
+
+**tests.rs の扱い**: 監査は tests.rs も対象にする (例外を作らない)。ただし現状
+`active_detached_viewer_context` 系の参照が 225 件あり、うち ~27 件は
+`is_none()` / `is_some()` による**所在の表明**なので `residence()` の assert へ素直に写る。
+残りのフィールド読みは `#[cfg(test)] pub(in crate::app) mod test_access` を registry に置き、
+**読み取りだけ**を露出する。書き込みと生成は test_access にも置かない。
+これは監査の抜け穴になり得るので A6 で `#[cfg(test)]` 外からの使用を禁じる。
+
+**走らせる場所**: `.git/hooks/pre-push` に 1 行追加 + `.github/workflows/ci.yml` に
+新ジョブ (ubuntu、`cargo run -p viewer-context-audit`)。CLAUDE.md の
+「開発中のビルド・テスト選択」に従い、通常の編集ループでは走らせない。
+workspace member を 1 つ増やすので、`test-full.ps1` の `--workspace` 対象に入る点は
+指示書で明示する (vendor 資産に依存しないことが条件)。
 
 ---
 
-## 6.5 実務で 3 回踏んだ同型の失敗 (2026-08-21、第 3 版の設計材料)
+## 7. ステージ分割 — 各段でコンパイルが通る状態
 
-§1.100 の実装中に、**同じ構造の失敗を 3 回**踏んだ。いずれも
-「`None` が『存在しない』ではなく『今は別の場所にある』を意味していた」ケースで、
-**R2e が解こうとしている問題そのもの**である。第 3 版はこの 3 件を説明できる形にすること。
+BLOCKER 3 の指摘どおり、**保管フィールドを消した瞬間に全消費者が壊れる**ので、
+「registry を入れる段」と「保管を切る段」は分けられない。分けられるのは**その前**である。
 
-| # | どこ | `None` / 単一値の誤読 | 症状 |
-| --- | --- | --- | --- |
-| 1 | `active_detached_viewer_context.is_none()` (§11 の keep-alive backstop) | 「所有者が居ない」ではなく「今マウント中」 | 別 context の題と texture で描画 |
-| 2 | `right_drag_pointer_pos(owner)` (`src/app/gamepad_input.rs:1161`) | 所有者でしか絞らず、**どの producer が持っているか**を区別しない | egui 側が native 側の開始したドラッグを `ButtonStateLost` でキャンセル |
-| 3 | `snapshot.paused_bundle.is_none()` (`src/app.rs:707` 付近) | 「bundle が無い」ではなく「parked-live poll がマウント中」 | 成立したコマンドが `viewer_identity_unavailable` で捨てられる |
+### ステージ① — registry の状態機械 (production を 1 行も切らない)
 
-**3 件に共通する要求**: ある識別子 (window / context / owner) を渡したら、
-**その bundle が今どこにあるか (parked / mounted / 別 producer が保持中) を型で返す**こと。
-第 2 版の `MountPhase` は App の投影側しか表しておらず、
-**「この window の bundle は今マウント中か」を問い合わせる API が無い**。
-第 3 版ではこれを一級の問い合わせにする (2 の producer 所有まで含めるかは設計判断)。
+- 新モジュール `src/app/viewer_context_registry.rs` を追加。**`ViewerContextBundle` はまだ移さない。**
+- 状態機械を **payload に対してジェネリック**に定義する:
 
-暫定の回避策として、3 は `native_video_parked_live_input_window_id`
-(`src/app.rs:1249`) を「その窓がマウント中である事実」として読んでいる。
-**これは parked-live 経路にしか無い facts なので、一般解にはならない。**
+  ```rust
+  struct ContextTable<P> {
+      projection: Projection,
+      slots: HashMap<ViewerContextId, SlotOf<P>>,
+      main: ViewerContextId,
+      window_of: HashMap<ViewerContextId, u64>,
+      context_of: HashMap<u64, ViewerContextId>,
+      next_serial: u64,
+      highest_committed_serial: u64,
+  }
+  ```
+
+  production はステージ②で `P = Box<ViewerContextBundle>` として実体化する。
+  **ジェネリックにすることが、①を production から切り離してコンパイルさせる仕掛け**である。
+  `ContextTable` は「bundle を投影へ swap する」実務を知らない。知っているのは
+  「どの id がどこに在るか」だけで、swap の実装はステージ②で外から注入する。
+- ①の間このモジュールは production から呼ばれない。`#[allow(dead_code)]` に
+  「ステージ②で結線する」というコメントを付ける。これは無言の死蔵ではなく、
+  BLOCKER 3 が禁じた「コンパイルできない分割」を避けるための明示的な段取りである。
+- **終了時にコンパイルが通る状態**: production は完全に現状のまま。
+  `cargo test -p mimageviewer --lib viewer_context_registry::` が通る。ubuntu の
+  `cargo check` も通る (cfg 依存が無い)。
+- **テスト** (`ContextTable<TestPayload>`):
+  build commit / build abort で previous が戻る / mount 再入 / `Building` 中の mount が Err /
+  `Retiring` 中の bind が Err / `bind` 二重が Err / `rebind` が旧 id を返す /
+  各状態の `residence()` / retire 後の id が `Retired`、未 commit の id が `Unknown` /
+  promote 後に main が入れ替わる / panic unwind で previous が戻る。
+
+### ステージ②-pre — 手書き mount の helper 化 (保管は変えない)
+
+- 既存 `with_active_detached_viewer_context` の対になる
+  `with_paused_detached_context(window_id, f)` を足し、**どちらも panic 安全**にする。
+- 手書きの `take → swap → 実行 → swap → 戻す` **18 箇所**を helper 呼び出しへ置換
+  (付録 B-2)。1 箇所ずつコミットできる。
+- **これは規模削減のためだけの段ではない**: 「取り出せなかった (= 今マウント中)」の分岐が
+  helper 1 箇所に集まるので、②で `residence()` へ差し替える差分が機械的になる。
+- ⚠ **挙動が変わる点が 1 つある**: 手書き 18 箇所は panic 安全でないので、helper 化すると
+  panic 時に bundle が drop されなくなる (= worker が cancel されなくなる)。
+  これは症状パッチではなく構造的修正だが、**憲法の適用範囲どおり ClaudeCode と Codex の
+  双方で「症状パッチではない」ことに合意し、`docs/detached-rework-plan.md` §11 に記録する**。
+- **終了時**: 挙動不変 (panic 経路を除く)。既存テスト 207 本が緑。
+
+### ステージ② — 一括切替 (1 コミット)
+
+これだけは分けられない。**コンパイラが作業リストを列挙してくれる**ので手探りにはならない。
+
+- `ViewerContextBundle` + `Drop` + `empty` + `set_items_generation` + `swap` + fork destructure を
+  registry モジュールへ移し、フィールドを module-private にする。
+- `App::active_detached_viewer_context` ([app.rs:10095](../../src/app.rs:10095)) と
+  `DetachedImageWindowSnapshot::paused_bundle` ([app.rs:433](../../src/app.rs:433)) を削除し、
+  `App::viewer_contexts: ViewerContextRegistry` へ統合。
+- 生プリミティブ 4 種を 5 transaction へ (§4)。
+- window binding を、window_id を確定している箇所へ入れる
+  ([app.rs:38292](../../src/app.rs:38292) の reuse 経路は `rebind_window` へ)。
+- 外部フィールド読み ~26 種を `ContextRef` accessor へ (付録 B-3)。
+- **§6.5 の暫定回避策を撤去する** (これが②の完了条件の一部):
+  - `right_drag_viewer_identity_for_window_id` の
+    `native_video_parked_live_input_window_id == Some(window_id)` 分岐
+    ([app.rs:1249](../../src/app.rs:1249)〜[:1264](../../src/app.rs:1264)) → `residence()` の match
+  - keep-alive backstop の 3 分岐 ([ui_fullscreen.rs:13126](../../src/ui_fullscreen.rs:13126)) → 同上。
+    「別の detached sentinel を足すな」というコード中のコメントに対する正解がこれである
+  - `should_promote_active_detached_video_for_main_context_change` の
+    `active_detached_viewer_context.is_none()` ([app.rs:42720](../../src/app.rs:42720)) → 同上
+- **終了時**: コンパイルが通り、既存 detached テスト 207 本が緑。**挙動不変**
+  (ステージ②-pre の panic 経路を除く)。
+- **規模** (②-pre 後に残る量、2026-08-23 実測): 非テストの `swap_viewer_context_bundle` 呼び出し 52、
+  `paused_bundle` 参照 104、`active_detached_viewer_context` 参照 158、tests.rs 側 273。
+  bundle 引数ヘルパー 12 本。install 17 箇所 / take 13 箇所。
+
+### ステージ③ — 巡回の単純化
+
+- 手書き巡回 4 箇所 (§4.6) を `for_each_viewer_context` / `any_viewer_context` へ。
+- bundle 版 / App 版で二重定義されている述語 (`contains_video` ほか) を `ContextRef` 版 1 本へ。
+- **終了時**: 挙動不変。個別にコンパイルが通るので複数コミットに割れる。
+
+### ステージ④ — 非同期要求の identity 変換
+
+- `metadata_import_refresh::ContextSlot`
+  ([metadata_import_refresh.rs:61](../../src/app/metadata_import_refresh.rs:61)) を
+  `ViewerContextId` へ。**`PausedDetached { index: usize }` の Vec index 依存が消える**。
+- 適用側 ([app.rs:28321](../../src/app.rs:28321)〜[:28405](../../src/app.rs:28405)) の
+  `take()` が `None` のときの silent skip を `residence()` の match へ。
+- `items_generation` は staleness stamp として据え置く (BLOCKER 3)。
+- **挙動が変わる**: 今日は index ずれ / マウント中で捨てていた結果が正しく届く。
+  → 実機 smoke 対象。テスト ([tests.rs:647](../../src/app/tests.rs:647) /
+  [:845](../../src/app/tests.rs:845) 付近) を id ベースへ。
+
+### R2f (別件)
+
+純粋 reducer + 合法遷移制約 + 散在 pending / flag の typed 集約 (R2b 残件)。
+§1.4 の規則 B (`RightDragOwner` に producer を含める) もここ。
 
 ---
 
-## 7. 第 2 版で聞いたこと (回答済み)
+## 8. テスト計画
 
-1. §2 の phase / slots / stack で、§1.3 と §1.4 の状態を**過不足なく**表現できているか。
-   まだ表現できない現行の正当な状態が残っていないか。
-2. `commit_mounted_viewer_context` の契約 (Building → Mounted) は、`src/app.rs:39778`〜`39885` の
-   実際の組み立て手順に**そのまま被せられるか**。途中で main を mount し直す経路は無いか。
-3. §4 のステージ分割の粒度と順序は妥当か。R2e-1 の完了条件を「プリミティブ 4 種が registry 経由」
-   とした場合、**それを機械的に確認する方法**は何が適切か (grep では不十分と指摘済み)。
-4. §5 の「2 つのバグは registry 非依存」という再評価に同意するか。
-   同意する場合、§1.99 / §1.100 を R2e-1 より**先に**着手してよいか
-   (どちらも新しい state は `DetachedWindowRuntime` / 既存 completion policy に載せる)。
-5. §1.100 の 3 要件で、`show_viewport_deferred` のコールバックからポインタ列を運ぶことに
-   構造的な障害はあるか (deferred は root pass と別 pass で走る)。
+| 段 | 追加するテスト |
+| --- | --- |
+| ① | §7 ①のリスト (状態機械の単体テスト、`ContextTable<TestPayload>`) |
+| ②-pre | helper 化した 18 箇所のうち、parked-live poll 中に走り得る経路で「マウント中の context がスキップされない」ことを 1 本 |
+| ② | build abort → 直前の context が復帰 / retire 後の遅延結果が `Retired` (`Unknown` ではない) / `bind` 二重が Err / `rebind` が旧 id を返す / mounted と at-rest を跨ぐ `any_viewer_context` / fork の前置き判定と後置き判定の一致 / promote 後に main が入れ替わり旧 main が窓へ bind される |
+| ③ | 巡回が「マウント中の 1 個 + slot の全部」を過不足なく回ること |
+| ④ | 窓の並び替え / 削除の後でも非同期結果が正しい context へ届くこと (今の index 依存では落ちるテスト) |
+
+既存 207 本は**削除も弱体化もしない** (憲法 8)。`is_none()` / `is_some()` による所在の表明は
+`residence()` の assert へ写すが、表明の内容は変えない。
+
+**実機 smoke**: 挙動が変わるのは②-pre の panic 経路と④だけなので、②までは
+smoke-matrix の通常セットで足りる。④は「メタ情報 import 中に別ウィンドウを開閉する」ケースを
+追加する。
+
+---
+
+## 9. 憲法チェック
+
+| 条 | 判定 |
+| --- | --- |
+| 1 rect 一致捕捉に条件を足さない | 触れない |
+| 2 geometry 由来の host_lost を recreate トリガにしない | 触れない |
+| 3 App に新しい detached 用 bool / Option を足さない | **足さない。逆に 2 個の保管 `Option` を 1 個の typed owner へ畳む。** 3 が指す「R2 で導入する state owner」がこれ |
+| 4 placement の新しい保存先を作らない | registry は placement を持たない。placement は runtime 所有のまま (レーン A-0 の担当) |
+| 5 時間窓で競合を吸収しない | `residence()` は事実。debounce / grace / settle を 1 つも導入しない。I7 の assert は「定義した継ぎ目での状態検査」であって時間窓ではない |
+| 6 実機で新症状が出てもその場でヒューリスティックを入れない | 設計段階では該当なし。②で挙動同値性が崩れたら報告して止まる |
+| 7 指示書に無いファイルを「ついでに」直さない | ②の触ってよい範囲は実装指示書 (`docs/detached-rework-stage-r2e-1.md` 以降) で列挙する |
+| 8 既存テストを削除・弱体化しない | §8 のとおり |
+
+---
+
+## 10. 未決事項 (Codex への質問)
+
+1. **§3.1 の `Main` 変種廃止**に同意するか。promote 経路 ([app.rs:42734](../../src/app.rs:42734)) が
+   「main の bundle が detached になる」ことを根拠にしているが、他に `Main` を identity として
+   扱っている経路が残っていないか。
+2. **§4.2 の serial 前倒し** (40560 → `begin` の先頭) は挙動不変か。40546〜40559 に
+   `items_generation` を読む処理が無いことを目視で確認したが、間接呼び出しで読む経路はないか。
+3. **§4.3 の fork 前置き判定**は後置き判定と同値か。
+   `viewer_context_bundle_contains_video` ([app.rs:39104](../../src/app.rs:39104)) が見る材料が
+   分割前の投影にすべて揃っている、という読みで正しいか。
+4. **§6.3 の A4 (公開面 allowlist)** は運用に耐えるか。allowlist の粒度 (名前だけ / 名前 + 型) は
+   どちらが良いか。
+5. **§6.3 の test_access** は監査の抜け穴として許容範囲か。tests.rs の 273 参照を
+   accessor へ全面移行する方が良いか。
+6. **§7 のステージ②を 1 コミットにする以外の分割**で、各段がコンパイルできるものはあるか。
+   ②-pre で 18 箇所を helper 化してもなお大きい。
+7. **§1.4 の切り分け** (規則 B = producer を R2f、規則 C = placement をレーン A-0) に同意するか。
+   R2e に持ち込むべきものが混ざっていないか。
+8. **§3.4 の I7** (root pass 末尾で `Projection::Mounted`) を assert する継ぎ目として、
+   どこが適切か。
+
+---
+
+## 付録 A: 第 1 版 / 第 2 版の BLOCKER (保存)
+
+第 3 版の各節が対応しているので、参照用に残す。
+
+### 第 1 版 (BLOCKER 5 件、単一スカラーで「今の所有者」を表す案)
+
+- `Vacant`: `take_current_viewer_context_bundle` は App に空 bundle を残す
+- `Building`: 新しい detached context は App のフィールド上で組み立てられる
+- 押しのけられた bundle がスタックローカルにあり `self` から到達できない
+- owner に window_id は使えない (フォルダ再オープンで再利用される)
+- 巡回・消費者の一括移行が 1 ステージに収まらない
+
+### 第 2 版 (BLOCKER 4 件、phase + slot map + 復元スタック案)
+
+1. **所有の transaction が無い。** `extract_mounted_viewer_context` が生の bundle を返す時点で
+   不変条件が破れる。`begin_build(reserved_id)` → `commit_and_restore_previous` が要る。
+   加えて (a) main をマウントしたまま 2 個目を作る atomic な fork / insert_unmounted、
+   (b) 終端削除は drop 前に中身を読む必要がある (bookmark 照合 / media teardown)。
+   → **第 3 版 §3.7 / §4.2 / §4.3 / §4.4**
+2. **window_id → ViewerContextId の対応表が無い。** アクティブ化は window_id から始まるので
+   対応表が無いと slot を選べない。window_id からは推論できない。
+   → **第 3 版 §3.5**
+3. **R2e-1 / R2e-2 の切り方はコンパイルできない。** 消費側が保管フィールドを直接触っているので、
+   保管を切ると同時に移行するしかない。完了確認は grep ではなくコンパイラ + AST allowlist。
+   → **第 3 版 §6 / §7**
+4. **「Building には identity が無い」は誤り。** 正しくは「予約済みだが未 commit」。
+   → **第 3 版 §3.3 / §4.2**
+
+### §6.5 実務で 3 回踏んだ同型の失敗
+
+→ **第 3 版 §1.1 / §1.4** (診断は 1 つ、修理は R2e / R2f / レーン A-0 の 3 箇所)。
+第 3 版で撤去する暫定回避策は §7 のステージ②に列挙した。
+
+---
+
+## 付録 B: 事実 (2026-08-23 の master でコード確認)
+
+### B-1 保管と所有権プリミティブ
+
+| | 場所 |
+| --- | --- |
+| `ViewerContextBundle` (224 フィールド、`#[cfg(windows)]`) | [app.rs:2465](../../src/app.rs:2465) |
+| `Drop for ViewerContextBundle` (worker cancel) | [app.rs:2743](../../src/app.rs:2743) |
+| `ViewerContextBundle::empty()` | [app.rs:2795](../../src/app.rs:2795) |
+| `swap_viewer_context_bundle` (destructure は :16189) | [app.rs:16175](../../src/app.rs:16175) |
+| `take_current_viewer_context_bundle` (空 bundle を残す) | [app.rs:16666](../../src/app.rs:16666) |
+| `with_active_detached_viewer_context` (唯一の panic 安全 mount) | [app.rs:16698](../../src/app.rs:16698) |
+| `split_current_context_preserving_main_grid` | [app.rs:41922](../../src/app.rs:41922) |
+| `split_materialized_physical_context_for_independent_still_open` | [app.rs:42421](../../src/app.rs:42421) |
+| `App::active_detached_viewer_context` | [app.rs:10095](../../src/app.rs:10095) |
+| `ActiveDetachedViewerContext` (bundle 1 フィールドだけ) | [app.rs:2258](../../src/app.rs:2258) |
+| `DetachedImageWindowSnapshot` / `paused_bundle` | [app.rs:415](../../src/app.rs:415) / [:433](../../src/app.rs:433) |
+| `DetachedWindowRuntime` (window_id / state / hwnd / placement / intent) | [detached_window_manager.rs:460](../../src/app/detached_window_manager.rs:460) |
+| `ViewerSession` (per-context 分離の先例) | [viewer_session.rs:9](../../src/app/viewer_session.rs:9) |
+
+件数 (非テスト): `swap_viewer_context_bundle` 呼び出し **52**、`paused_bundle` 参照 **104**、
+`active_detached_viewer_context` 参照 **158**、`with_active_detached_viewer_context` **12**。
+tests.rs 側は `active_detached_viewer_context` **225** / `paused_bundle` **48**。
+非テストの `ViewerContextBundle` 生成・destructure は **3 箇所だけ** (:16189 / :16667 / :41939)。
+
+### B-2 手書き mount (ステージ②-pre の対象、18 箇所)
+
+active holder 経由 9: [19807](../../src/app.rs:19807) / [27884](../../src/app.rs:27884) /
+[27931](../../src/app.rs:27931) / [28150](../../src/app.rs:28150) / [28223](../../src/app.rs:28223) /
+[28373](../../src/app.rs:28373) / [28993](../../src/app.rs:28993) / [30421](../../src/app.rs:30421) /
+[54321](../../src/app.rs:54321)
+
+paused_bundle 経由 9: [19843](../../src/app.rs:19843) / [27891](../../src/app.rs:27891) /
+[27950](../../src/app.rs:27950) / [28169](../../src/app.rs:28169) / [28231](../../src/app.rs:28231) /
+[28397](../../src/app.rs:28397) / [29016](../../src/app.rs:29016) / [30429](../../src/app.rs:30429) /
+[54328](../../src/app.rs:54328)
+
+うち **6 箇所は `else { continue }` で「取り出せなかった context」を無言で飛ばす**。
+到達可能性は経路ごとに異なるが、`None` が「無い」と「今は別の場所にある」を区別していない点は同じ。
+`consume_deferred_vst3_media_open_in_parked_contexts` ([app.rs:19819](../../src/app.rs:19819)) は
+その区別のために `native_video_parked_live_input_window_id` を自分で立てて回している。
+
+### B-3 registry モジュール外から読まれている bundle フィールド (accessor 化の対象)
+
+出現回数の多い順: `fullscreen_idx` (17) / `items` (15) / `fs_cache` (12) / `viewer_session` (8) /
+`tag_prewarm_pending` (4) / `pdf_password_request` (4) / `fs_pending` (4) / `video_audio_mode` (3) /
+`selected` (3) / `items_generation` (3) / `fs_open_intent_from_grid` (3) / `current_folder` (3) /
+`pending_return_to_parent` (2) / `pending_auto_fs_open` (2) / `pdf_prefetch_grace_until` (2) /
+`fs_lanczos_cache` (2) / `visible_indices` / `navigation_scope` / `normalize_ui_states` /
+`normalize_auto_scan_suppressed` / `vst3_deferred_media_open` / `native_video_in_window_active` /
+`music_bookmarks` / `music_bookmarks_loaded_for` / `top_level_grid_view` / `final_ai_pending`。
+
+`split_materialized_physical_context_for_independent_still_open` ([app.rs:42425](../../src/app.rs:42425)〜)
+が**書く** ~40 フィールドは accessor にしない。関数ごと `ForkPolicy::MaterializedStillOpen` として
+registry モジュールへ移す。
+
+### B-4 bundle を引数に取るヘルパー (非テスト 12 本)
+
+[9213](../../src/app.rs:9213) / [9255](../../src/app.rs:9255) / [9287](../../src/app.rs:9287) /
+[9331](../../src/app.rs:9331) / [9368](../../src/app.rs:9368) / [9403](../../src/app.rs:9403) /
+[9444](../../src/app.rs:9444) / [16175](../../src/app.rs:16175) / [39104](../../src/app.rs:39104) /
+[39125](../../src/app.rs:39125) / [39137](../../src/app.rs:39137) / [39312](../../src/app.rs:39312)
+
+`viewer_context_bundle_is_music_consumer` は free fn ([9255](../../src/app.rs:9255)) と
+`impl App` の関連関数 ([39312](../../src/app.rs:39312)) で**二重に定義**されている。
+`contains_video` は bundle 版 ([39104](../../src/app.rs:39104)) と App 版
+([39197](../../src/app.rs:39197)) で本文がほぼ同一。どちらも `ContextRef` 版 1 本に畳める。
+
+### B-5 identity の払い出し
+
+| | 場所 |
+| --- | --- |
+| `DETACHED_VIEWER_CONTEXT_GENERATION_BASE = 1<<63` / `STRIDE = 1<<32` | [app.rs:394](../../src/app.rs:394) / [:396](../../src/app.rs:396) |
+| `allocate_detached_viewer_context_generation` → `(serial, items_generation)` | [app.rs:38088](../../src/app.rs:38088) |
+| `assign_next_detached_viewer_context_generation` (投影へ焼く) | [app.rs:38100](../../src/app.rs:38100) |
+| `allocate_detached_viewer_window_id` | [app.rs:38107](../../src/app.rs:38107) |
+| `ensure_detached_viewer_window_id` (**folder-nav reopen で window_id を意図的に再利用**) | [app.rs:38277](../../src/app.rs:38277)、再利用は :38292〜 |
+| `bump_items_generation` (context 内で +1) | [app.rs:24873](../../src/app.rs:24873) |
+
+### B-6 非同期の要求 identity (ステージ④の対象)
+
+| | 場所 |
+| --- | --- |
+| `ContextSlot { Main, ActiveDetached(Option<u64>), PausedDetached { index, window_id } }` | [metadata_import_refresh.rs:61](../../src/app/metadata_import_refresh.rs:61) |
+| 要求の組み立て (main / active / parked を手書きで 3 経路) | [app.rs:28137](../../src/app.rs:28137)〜[:28190](../../src/app.rs:28190) |
+| 結果の適用 (`take()` が `None` なら無言で捨てる) | [app.rs:28321](../../src/app.rs:28321)〜[:28405](../../src/app.rs:28405) |
+
+`ActiveDetached(Option<u64>)` が `Option` なのは、「bundle を holder へ入れる時点で window_id が
+未確定な経路がある」ことの既存の証拠である (§3.5 の `bind_window` が `Option` を許す根拠)。
