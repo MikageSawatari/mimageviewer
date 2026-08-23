@@ -668,16 +668,30 @@ request が無ければ PDF パスワードダイアログの App-global state �
 ```
 現行: dropped_bundles: Vec<Box<ViewerContextBundle>> を作り、plan を計算し、
       save/cleanup し、normalize_* を clear してから drop
-第3版: let plans: Vec<_> = ids.iter()
-           .filter_map(|&id| self.retire_context(id, reason, |mut cx| {
+第3版: let mut plans = Vec::new();
+       for &id in ids {
+           match self.retire_context(id, reason, |mut cx| {
                let plan = viewer_context_media_teardown_plan(cx.as_ref());
                cx.clear_normalize_state();
                plan
-           }).ok())
-           .collect();
+           }) {
+               Ok(plan) => plans.push(plan),
+               // parked 窓の context が main であることは無い。起きたら binding の破綻。
+               Err(RetireError::IsMain) => unreachable!("parked window owned the main context"),
+               // 想定内だが黙って飛ばさない。理由を残す (憲法 5 / 設計 §4.1)。
+               Err(err) => self.log_detached_image_window_debug(format!(
+                   "media_teardown_skipped id={id:?} reason={reason} err={err:?}"
+               )),
+           }
+       }
        self.save_viewer_context_media_teardown_resumes(&plans);
        self.cleanup_viewer_context_media_teardown_globals(&plans, reason);
 ```
+
+⚠ **`.ok()` で潰さない。** typed error を導入した意味が消える。
+`IsMain` はこの経路では起き得ない (parked 窓が main を持つことは無い) ので
+`unreachable!` で早く落とし、`Building` / `NotAtRest` は**理由付きでログに残す**。
+「retire できなかった」を無言で読み飛ばすのは、§1.1 の `else { continue }` と同じ形である。
 
 ⚠ **teardown の前段 2 つを落とさない** (Codex 第 3 版レビュー P1)。上の疑似コードは
 `retire_context` のループだけを書いているが、現行は bundle を外す**前に**
@@ -749,7 +763,7 @@ fn with_viewer_context_ref<R>(&self, id: ViewerContextId, f: impl FnOnce(Context
 | I2 window_of / context_of が逆写像 | — | — | ○ (private field) | — | ○ |
 | I3 1 窓 1 context / 1 context 1 窓 | ○ (`bind` が `WindowOwnedBy` / `ContextOwnedBy`、移動は `transfer` のみ) | — | — | — | ○ |
 | I4 main は常に存在 (所在は I1 と同じ 3 択) | ○ (`main` が非 Option **かつ `retire` が `IsMain` を返す**。⚠ 非 Option だけでは足りない — ①のレビューで main を retire できる経路が実在した) | — | — | — | ○ |
-| I5 / I6 Building / Retiring 中の禁止操作 | ○ (`MountError`) | — | — | — | ○ |
+| I5 / I6 Building / Retiring 中の禁止操作 | ○ (拒否は経路ごとに型が違う: mount は `MountError`、retire は `RetireError::{Building, NotAtRest}`、bind は `BindError::NotBindable`。**どれも `Option` ではなく理由を返す**) | — | — | — | ○ |
 | I7 root pass 末尾で Mounted | — | — | — | — | ○ (継ぎ目の assert) |
 | 所在を `is_none()` で答えない | ○ (`ContextResidence`) | — | ○ | ○ (A5) | ○ |
 | 225 フィールドの取りこぼしが無い | ○ (exhaustive destructure) | — | — | — | コンパイルエラー |
