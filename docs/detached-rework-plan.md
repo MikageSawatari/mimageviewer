@@ -372,7 +372,11 @@ Codex レビュー 6 巡で BLOCKER 0 に到達。**正本は同じファイル
 - abort の drop は **main を戻した後** ([startup_ops.rs:652](../src/app/startup_ops.rs:652)〜654)。
 - `ViewerContextBundle` は **225 フィールド**。tests.rs 側の参照は 294 行。
 
-次: §6-3 のステージ①の実装指示書を `docs/detached-rework-stage-r2e-1.md` として起こす。
+ステージ①の実装指示書は
+[detached-rework-stage-r2e-1.md](detached-rework-stage-r2e-1.md) (2026-08-23)。
+`ContextTable<P>` (payload ジェネリックの状態機械) を 1 モジュール追加するだけで、
+production は `mod` 宣言 1 行しか変わらない。**モジュール外への公開は 0 件**にする
+(②-e で入れる監査 A4 の allowlist が空から始まる)。実機 smoke 不要。
 
 **§1.99 / §1.100 は R2e の完成に依存しない** (ClaudeCode / Codex 双方で確認)。
 
