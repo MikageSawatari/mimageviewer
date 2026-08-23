@@ -436,6 +436,21 @@ op の内部で binding を早く公開して正常終了までに戻す実装�
 それを捕まえるので、②-d で弱めないこと。ほかに、②-pre が holder 側に残した前置きフィルタ
 2 箇所 (vst3 の pending 判定 / rename 述語) を `ContextRef` 経由へ移すこと。
 
+**実機 smoke (2026-08-24) で挙がった 2 件** — どちらも②-pre の退行ではない
+(`release_viewer_surfaces_for_removed_paths` も `stale_before_apply` も
+`git diff 488e00f0..HEAD -- src/app.rs` に 1 行も出てこない):
+
+1. **ファイル名変更で開いていた PDF ウィンドウが閉じる → 仕様として確認済み (利用者判断 2026-08-24)。**
+   `poll_rename_pending` ([ui_dialogs/rename_item.rs:139](../src/ui_dialogs/rename_item.rs:139)) が
+   `release_viewer_surfaces_for_removed_paths(.., "rename_old_path")` を呼び、旧パスを表示している
+   viewer を active / parked とも閉じる ([app.rs:27709](../src/app.rs:27709))。
+   **新パスで開き直す形には変えない。** 動画では開き直しても再生が一度止まるので、
+   「移動されたら閉じる」方が動きとして自然、という判断。
+   ⚠ **将来これを「症状」と誤認して開き直しを実装しないこと。**
+2. **PDF のレーティングが import 後に右パネルへ反映されない** — 調査中。
+   ログの算術で「PDF context (209 items) は refresh に含まれていた = 要求は作られていた」
+   ところまでは確定しており、**失敗は apply 側**。②-pre とは独立の既存問題。
+
 次は **②-a** (終端経路を「所有値の digest」へ)。保管は変えないので挙動不変。
 
 **§1.99 / §1.100 は R2e の完成に依存しない** (ClaudeCode / Codex 双方で確認)。
