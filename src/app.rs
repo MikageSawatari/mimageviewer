@@ -62880,7 +62880,7 @@ impl App {
         let Some(pano_state) = self.panorama_state.as_ref() else {
             return;
         };
-        let pose = (pano_state.yaw, pano_state.pitch, pano_state.fov_y);
+        let pose = pano_state.pose();
         let cache_key = resolution.cache_key;
         let source_key = resolution.source_key.clone();
 
@@ -62992,7 +62992,7 @@ impl App {
         let Some(pano_state) = self.panorama_state.as_ref() else {
             return;
         };
-        let pose = (pano_state.yaw, pano_state.pitch, pano_state.fov_y);
+        let pose = pano_state.pose();
         let cache_key = resolution.cache_key;
         let source_key = resolution.source_key.clone();
 
@@ -63090,7 +63090,7 @@ impl App {
         &mut self,
         fs_idx: usize,
         resolution: &crate::panorama::PanoSourceResolution,
-        pose: (f32, f32, f32),
+        pose: crate::panorama::PanoPose,
     ) {
         let source_key = resolution.source_key.clone();
         let cache_key = resolution.cache_key;
@@ -63119,15 +63119,12 @@ impl App {
         let cancel_worker = Arc::clone(&cancel);
         let source_key_worker = source_key.clone();
         std::thread::spawn(move || {
-            let (yaw, pitch, fov_y) = pose;
             let out = crate::panorama::render_settle_overlay(
                 &src_rgba,
                 src_w,
                 src_h,
                 uv,
-                yaw,
-                pitch,
-                fov_y,
+                pose,
                 out_w,
                 out_h,
                 &policy,
@@ -63235,13 +63232,14 @@ impl App {
             refinement.settle_since = None;
         }
         crate::logger::log(format!(
-            "[Pano] settle overlay uploaded {}x{} for key={} pose=({:.3},{:.3},{:.3}) viewport={:?}",
+            "[Pano] settle overlay uploaded {}x{} for key={} pose=({:.3},{:.3},{:.3},{}) viewport={:?}",
             result.width,
             result.height,
             result.source_key,
-            result.pose.0,
-            result.pose.1,
-            result.pose.2,
+            result.pose.yaw,
+            result.pose.pitch,
+            result.pose.fov_y,
+            result.pose.projection.label(),
             result.viewport_size,
         ));
     }
@@ -63688,6 +63686,25 @@ impl App {
         }
     }
 
+    /// 360 ビューの投影方式を順送りする (`KeyAction::FsPanoramaProjection` / 上バーの
+    /// 投影ボタン)。360 モード中しか意味を持たないので、非アクティブなら `None`。
+    ///
+    /// **環境設定の既定値 (`Settings::panorama_projection`) は書き換えない**。ここは
+    /// 「今見ているこの 1 枚を別の写り方で見る」操作であって、既定の変更ではない。
+    /// 既定を変えたい利用者は環境設定から選ぶ。
+    ///
+    /// 方式が変わると settle overlay の pose 一致が崩れるので、次フレームの
+    /// `note_state` が自動で進行中 render を cancel し、静止 500ms 後に焼き直す。
+    /// ここで overlay を明示破棄しないのは、pose を単一の型
+    /// ([`crate::panorama::PanoPose`]) に閉じて stale 判定を 1 箇所に保つため。
+    pub(crate) fn cycle_panorama_projection(&mut self) -> Option<crate::panorama::PanoProjection> {
+        let pano = self.panorama_state.as_mut()?;
+        let next = pano.cycle_projection();
+        pano.sanitize();
+        self.show_feedback_toast(format!("投影方式: {}", next.label()));
+        Some(next)
+    }
+
     /// 360 モード ON / OFF をトグル。fs_idx は対象画像 (検出 hint の初期視点取得用)。
     ///
     /// ON 時の副作用 (360 モードは機能制限モードなので、衝突する状態を抑止する):
@@ -63715,7 +63732,11 @@ impl App {
         }
         // ON: GPano hint があれば初期視点に反映
         let (init_yaw, init_pitch) = self.panorama_initial_pose(fs_idx);
-        self.panorama_state = Some(crate::panorama::PanoramaState::new(init_yaw, init_pitch));
+        self.panorama_state = Some(crate::panorama::PanoramaState::new(
+            init_yaw,
+            init_pitch,
+            self.settings.panorama_projection,
+        ));
         // 衝突する機能を停止 (docs/panorama-360-view-plan.md フィードバック対応):
         // 360 中は上バーのみの機能制限モードになるので、他の panel / mode を OFF
         // しておく。これらは 360 OFF 後にユーザーが再度有効化できる。

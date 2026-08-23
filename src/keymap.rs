@@ -1578,6 +1578,7 @@ pub enum KeyAction {
     FsImageAnalysis,
     FsZoomMode,
     FsPanorama,
+    FsPanoramaProjection,
     FsNavigatorToggle,
     FsNavigatorHold,
     FsPixelGrid,
@@ -2032,6 +2033,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsImageAnalysis,
     KeyAction::FsZoomMode,
     KeyAction::FsPanorama,
+    KeyAction::FsPanoramaProjection,
     KeyAction::FsNavigatorToggle,
     KeyAction::FsNavigatorHold,
     KeyAction::FsPixelGrid,
@@ -3557,6 +3559,7 @@ impl KeyAction {
             FsImageAnalysis => "FsImageAnalysis",
             FsZoomMode => "FsZoomMode",
             FsPanorama => "FsPanorama",
+            FsPanoramaProjection => "FsPanoramaProjection",
             FsNavigatorToggle => "FsNavigatorToggle",
             FsNavigatorHold => "FsNavigatorHold",
             FsPixelGrid => "FsPixelGrid",
@@ -4116,6 +4119,7 @@ impl KeyAction {
             FsImageAnalysis => "画像分析モードを開く",
             FsZoomMode => "全画面ズームモード (押している間ズーム範囲を指定)",
             FsPanorama => "360度パノラマモードを切り替える",
+            FsPanoramaProjection => "360度パノラマの投影方式を切り替える",
             FsNavigatorToggle => "ナビゲータの表示を切り替える",
             FsNavigatorHold => "押している間だけナビゲータを表示する",
             FsPixelGrid => "ピクセルグリッド表示を切り替える",
@@ -4540,6 +4544,7 @@ impl KeyAction {
             | FsImageAnalysis
             | FsZoomMode
             | FsPanorama
+            | FsPanoramaProjection
             | FsNavigatorToggle
             | FsNavigatorHold
             | FsPixelGrid
@@ -4949,6 +4954,7 @@ impl KeyAction {
             | FsRotateCcw
             | FsImageAnalysis
             | FsPanorama
+            | FsPanoramaProjection
             | FsNavigatorToggle
             | FsPixelGrid
             | FsLoupeLockToggle
@@ -5391,6 +5397,7 @@ impl KeyAction {
             FsImageAnalysis => ChordList::one(Chord::shift(Z)),
             FsZoomMode => ChordList::one(Chord::key(Z)),
             FsPanorama => ChordList::one(Chord::key(V)),
+            FsPanoramaProjection => ChordList::one(Chord::shift(V)),
             FsNavigatorToggle => ChordList::one(Chord::alt(N)),
             FsNavigatorHold => ChordList::one(Chord::modifier(ModKind::Alt)),
             FsPixelGrid => ChordList::one(Chord::key(G)),

@@ -1004,11 +1004,16 @@ pub(crate) enum FsZoomOwner {
 ///
 /// 拡大 (`factor > 1`) は**視野を狭める**方向なので割る。ホイールの FOV 操作
 /// (`handle_panorama_wheel_if_active`) と同じ向き。
-fn panorama_touch_zoom_fov(fov_y: f32, factor: f32) -> Option<f32> {
+fn panorama_touch_zoom_fov(
+    fov_y: f32,
+    factor: f32,
+    projection: crate::panorama::PanoProjection,
+) -> Option<f32> {
     if !factor.is_finite() || factor <= 0.0 || !fov_y.is_finite() {
         return None;
     }
-    Some((fov_y / factor).clamp(crate::panorama::FOV_MIN, crate::panorama::FOV_MAX))
+    // 上限は投影方式ごとに違う (透視だけ 180° 手前で発散する)。
+    Some(projection.clamp_fov(fov_y / factor))
 }
 
 /// ピンチ中の 2 本指平行移動を yaw / pitch へ写す。
@@ -1032,21 +1037,23 @@ fn panorama_touch_pan_pose(
     ))
 }
 
-fn panorama_navigator_fov_from_height(selection_height: f32, content_height: f32) -> f32 {
+fn panorama_navigator_fov_from_height(
+    selection_height: f32,
+    content_height: f32,
+    projection: crate::panorama::PanoProjection,
+) -> f32 {
     let fov_y = selection_height.abs() / content_height.max(f32::EPSILON) * std::f32::consts::PI;
     if fov_y.is_finite() {
-        fov_y.clamp(crate::panorama::FOV_MIN, crate::panorama::FOV_MAX)
+        projection.clamp_fov(fov_y)
     } else {
-        crate::panorama::FOV_MAX
+        projection.fov_max()
     }
 }
 
 fn panorama_navigator_outline_segments(
     content_rect: egui::Rect,
     viewport_rect: egui::Rect,
-    yaw: f32,
-    pitch: f32,
-    fov_y: f32,
+    pose: crate::panorama::PanoPose,
 ) -> Vec<Vec<egui::Pos2>> {
     let aspect = if viewport_rect.height() > 0.0 {
         viewport_rect.width() / viewport_rect.height()
@@ -1054,9 +1061,10 @@ fn panorama_navigator_outline_segments(
         1.0
     };
     // Keep these derivations identical to `try_paint_panorama` and
-    // `panorama_wgpu`: aspect = viewport_w / viewport_h and
-    // tan_half = tan(fov_y / 2).
-    let tan_half = (fov_y.clamp(crate::panorama::FOV_MIN, crate::panorama::FOV_MAX) * 0.5).tan();
+    // `panorama_wgpu`: aspect = viewport_w / viewport_h and the projection
+    // map comes from the same `PanoProjection::map` the shader uniform uses.
+    let (yaw, pitch) = (pose.yaw, pose.pitch);
+    let map = pose.map();
     let samples = PANORAMA_NAVIGATOR_EDGE_SAMPLES;
     let mut ndc_points = Vec::with_capacity(samples * 4 + 1);
     for step in 0..=samples {
@@ -1080,8 +1088,20 @@ fn panorama_navigator_outline_segments(
     let mut current = Vec::new();
     let mut previous_u: Option<f32> = None;
     for (u_ndc, v_ndc) in ndc_points {
-        let (u, v) =
-            crate::panorama::ndc_to_equirect_uv(u_ndc, v_ndc, aspect, tan_half, yaw, pitch);
+        // A wide fisheye FOV puts the viewport corners outside the projection's
+        // domain. Those samples have no direction on the sphere, so end the run
+        // instead of drawing the outline through a made-up point.
+        let Some((u, v)) =
+            crate::panorama::ndc_to_equirect_uv(u_ndc, v_ndc, aspect, map, yaw, pitch)
+        else {
+            if current.len() >= 2 {
+                segments.push(std::mem::take(&mut current));
+            } else {
+                current.clear();
+            }
+            previous_u = None;
+            continue;
+        };
         // The equirect seam wraps from u=1 to u=0. Splitting adjacent samples
         // whose U jump exceeds half the texture prevents a false line across
         // the complete overview.
@@ -1114,9 +1134,7 @@ fn build_panorama_navigator_layout(
     host_rect: egui::Rect,
     requested_size: f32,
     corner: FullscreenNavigatorCorner,
-    yaw: f32,
-    pitch: f32,
-    fov_y: f32,
+    pose: crate::panorama::PanoPose,
 ) -> Option<PanoramaNavigatorLayout> {
     if !source_size.x.is_finite()
         || !source_size.y.is_finite()
@@ -1128,8 +1146,7 @@ fn build_panorama_navigator_layout(
     let (panel_rect, header_rect, canvas_rect) =
         fs_navigator_panel_rect(host_rect, requested_size, corner)?;
     let content_rect = fit_display_size_in_rect(canvas_rect, source_size);
-    let outline_segments =
-        panorama_navigator_outline_segments(content_rect, viewport_rect, yaw, pitch, fov_y);
+    let outline_segments = panorama_navigator_outline_segments(content_rect, viewport_rect, pose);
     // Unlike a flat page, even FOV_MAX cannot show the whole sphere at once.
     // Once the user enables the navigator, panorama mode therefore never
     // applies the flat layout's whole-image auto-hide rule.
@@ -6801,7 +6818,7 @@ impl App {
         let Some(pano) = self.panorama_state.as_mut() else {
             return false;
         };
-        let Some(fov_y) = panorama_touch_zoom_fov(pano.fov_y, factor) else {
+        let Some(fov_y) = panorama_touch_zoom_fov(pano.fov_y, factor, pano.projection) else {
             return false;
         };
         pano.fov_y = fov_y;
@@ -14967,6 +14984,14 @@ impl App {
                             // spread / 補正 / rotate / capture / VST / play / tile) は全て隠す。
                             let panorama_mode_active = panorama_active;
                             let mut panorama_pressed = false;
+                            // 投影方式は 360 セッションの state。OFF 中はボタン自体を
+                            // 出さないので、値は既定でよい。
+                            let panorama_projection = self
+                                .panorama_state
+                                .as_ref()
+                                .map(|pano| pano.projection)
+                                .unwrap_or(self.settings.panorama_projection);
+                            let mut panorama_projection_pressed = false;
                             let fit_mode = self.effective_fullscreen_fit_mode();
                             let fit_no_upscale = self.settings.fullscreen_fit_no_upscale;
                             let fit_no_downscale = self.settings.fullscreen_fit_no_downscale;
@@ -15059,6 +15084,8 @@ impl App {
                                 panorama_active,
                                 panorama_mode_active,
                                 &mut panorama_pressed,
+                                panorama_projection,
+                                &mut panorama_projection_pressed,
                                 &mut self.spread_mode,
                                 &mut self.reading_flow,
                                 &mut self.reading_direction,
@@ -15150,6 +15177,10 @@ impl App {
                             // 360 度パノラマビュー: トグル
                             if panorama_pressed {
                                 self.toggle_panorama_mode(fs_idx);
+                            }
+                            // 360 度パノラマビュー: 投影方式の順送り
+                            if panorama_projection_pressed {
+                                self.cycle_panorama_projection();
                             }
                             // ウィンドウ / 全画面 切り替えボタンが押された。
                             #[cfg(windows)]
@@ -19209,6 +19240,12 @@ impl App {
         // ここで奪っても消しゴム中は届かない (= mode-scoped 共存)。
         let key_v_panorama_raw =
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsPanorama);
+        // Shift+V: 360 度パノラマの投影方式を順送り。**360 モード中だけ意味がある**ので、
+        // OFF 中に押しても no-op (V と同じ「対象外なら黙って何もしない」慣例)。
+        let key_v_projection = !fs_music_view_active
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::FsPanoramaProjection);
         let key_n_navigator = !is_video_fs
             && !fs_music_view_active
             && self
@@ -19874,6 +19911,12 @@ impl App {
         // V: 360 度パノラマビューモード トグル。
         // 検出済み (= 360 ボタンが有効な状態) のときだけ反応する。非対応画像で
         // V を押しても no-op (= 一般的なキーマップ慣例)。
+        // Shift+V: 投影方式の順送り。トグルより先に処理して、同じフレームで 360 を
+        // 抜けた直後に方式まで動くことがないようにする。
+        if key_v_projection && self.is_panorama_mode_active(fs_idx) {
+            self.cycle_panorama_projection();
+            ctx.request_repaint();
+        }
         if key_v_panorama && !is_spread_double && self.detect_panorama(fs_idx).is_some() {
             self.toggle_panorama_mode(fs_idx);
         }
@@ -20681,9 +20724,7 @@ impl App {
             image_rect,
             self.settings.fullscreen_navigator_size,
             self.settings.fullscreen_navigator_corner,
-            pano.yaw,
-            pano.pitch,
-            pano.fov_y,
+            pano.pose(),
         )
     }
 
@@ -20956,9 +20997,15 @@ impl App {
                     let uv =
                         panorama_navigator_screen_to_uv(layout.content_rect, selection.center());
                     let (yaw, pitch) = panorama_navigator_uv_to_yaw_pitch(uv);
+                    let projection = self
+                        .panorama_state
+                        .as_ref()
+                        .map(|pano| pano.projection)
+                        .unwrap_or_default();
                     let fov_y = panorama_navigator_fov_from_height(
                         selection.height(),
                         layout.content_rect.height(),
+                        projection,
                     );
                     if let Some(pano) = self.panorama_state.as_mut() {
                         pano.yaw = yaw;
@@ -27271,8 +27318,8 @@ impl App {
         if let Some(pano) = self.panorama_state.as_mut() {
             // FOV = fov * exp(-wheel * 0.0015)。ホイール 1 ノッチ ≈ 50px で約 7% 変化。
             let factor = (-wheel_y * 0.0015).exp();
-            pano.fov_y =
-                (pano.fov_y * factor).clamp(crate::panorama::FOV_MIN, crate::panorama::FOV_MAX);
+            // 上限は投影方式ごとに違う。透視は約 149°、それ以外は約 340° まで引ける。
+            pano.fov_y = pano.projection.clamp_fov(pano.fov_y * factor);
             // pose が NaN / Inf に化けないことを保証 (Codex P2 第 5、2026-05)
             pano.sanitize();
             ctx.request_repaint();
@@ -27333,9 +27380,7 @@ impl App {
         let callback = crate::panorama_wgpu::PanoramaShaderCallback {
             source_key: resolution.source_key.clone(),
             cache_key: resolution.cache_key,
-            yaw: pano.yaw,
-            pitch: pano.pitch,
-            fov_y: pano.fov_y,
+            pose: pano.pose(),
             aspect,
             uv_transform,
             target_format,
@@ -27347,7 +27392,7 @@ impl App {
 
         // Phase 2a settle overlay (docs/panorama-360-view-plan.md §4.6.3 step 6/7)
         // 同フレ後段で 8K base の上にフェードイン alpha blend で描画。
-        let pose = (pano.yaw, pano.pitch, pano.fov_y);
+        let pose = pano.pose();
         let now_cache_key = resolution.cache_key;
         // 現フレの viewport ピクセルサイズ。settle render の出力 aspect 計算と stale check
         // に使う (Codex P1 第 2、2026-05)。
@@ -29222,6 +29267,10 @@ impl App {
         panorama_active: bool,
         panorama_mode_active: bool,
         panorama_pressed: &mut bool,
+        // 360 モード中だけ出す投影方式ボタン (§13)。360 ボタンは ON 中に隠れる
+        // (× が解除を兼ねる) ので、その空いた位置にこちらが出る。
+        panorama_projection: crate::panorama::PanoProjection,
+        panorama_projection_pressed: &mut bool,
         spread_mode: &mut SpreadMode,
         reading_flow: &mut ReadingFlow,
         reading_direction: &mut ReadingDirection,
@@ -29811,6 +29860,40 @@ impl App {
                 *side_panel_mode_pressed = true;
             }
             if info_resp.hovered() {
+                *page_nav = FsPageNav::None;
+            }
+            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+        }
+
+        // 投影方式ボタン (docs/panorama-360-view-plan.md §13):
+        // 360 モード中だけ出す。360 ボタンは ON 中に隠れる (× が解除を兼ねる) ので、
+        // 位置を奪い合わない。押すたびに順送りし、名前はトーストで出る。
+        if !is_video && panorama_active {
+            let next = panorama_projection.next();
+            let tooltip = keymap.first_chord_bracket_label(
+                &format!(
+                    "投影方式: {} ({})
+クリックで「{}」に切り替え",
+                    panorama_projection.label(),
+                    panorama_projection.description(),
+                    next.label()
+                ),
+                KeyAction::FsPanoramaProjection,
+            );
+            let proj_resp = draw_bar_button(
+                ui,
+                next_x,
+                bar_rect.min.y + BAR_BUTTON_MARGIN,
+                "fs_panorama_projection_btn",
+                |hovered| bar_button_bg(hovered, false),
+                false,
+                |p, c, r| draw_panorama_projection_icon(p, c, r, panorama_projection),
+            );
+            let proj_resp = proj_resp.hover_tip_dark(tooltip);
+            if proj_resp.clicked() {
+                *panorama_projection_pressed = true;
+            }
+            if proj_resp.hovered() {
                 *page_nav = FsPageNav::None;
             }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
@@ -36848,6 +36931,7 @@ mod tests {
                     let mut slideshow_end_action = SlideshowEndAction::default();
                     let mut rotation_choice = None;
                     let mut panorama_pressed = false;
+                    let mut panorama_projection_pressed = false;
                     let mut spread_mode = SpreadMode::Ltr;
                     let mut reading_flow = initial_reading_flow;
                     let mut reading_direction = ReadingDirection::Ltr;
@@ -36890,6 +36974,8 @@ mod tests {
                         false,
                         false,
                         &mut panorama_pressed,
+                        crate::panorama::PanoProjection::Perspective,
+                        &mut panorama_projection_pressed,
                         &mut spread_mode,
                         &mut reading_flow,
                         &mut reading_direction,
@@ -39558,24 +39644,32 @@ mod tests {
     fn a_pinch_narrows_the_panorama_field_of_view() {
         let start = (crate::panorama::FOV_MIN + crate::panorama::FOV_MAX) * 0.5;
 
-        let zoomed_in = panorama_touch_zoom_fov(start, 2.0).unwrap();
-        let zoomed_out = panorama_touch_zoom_fov(start, 0.5).unwrap();
+        let flat = crate::panorama::PanoProjection::Perspective;
+        let zoomed_in = panorama_touch_zoom_fov(start, 2.0, flat).unwrap();
+        let zoomed_out = panorama_touch_zoom_fov(start, 0.5, flat).unwrap();
         assert!(zoomed_in < start, "pinching out must narrow the view");
         assert!(zoomed_out > start, "pinching in must widen the view");
 
         // 端で止まること。止まらないと sanitize 前に発散する。
         assert_eq!(
-            panorama_touch_zoom_fov(start, 1e6).unwrap(),
+            panorama_touch_zoom_fov(start, 1e6, flat).unwrap(),
             crate::panorama::FOV_MIN
         );
         assert_eq!(
-            panorama_touch_zoom_fov(start, 1e-6).unwrap(),
+            panorama_touch_zoom_fov(start, 1e-6, flat).unwrap(),
             crate::panorama::FOV_MAX
         );
 
+        // 上限は投影方式ごとに違う。透視で止まる位置より広く引けること。
+        let fisheye = crate::panorama::PanoProjection::Stereographic;
+        assert_eq!(
+            panorama_touch_zoom_fov(start, 1e-6, fisheye).unwrap(),
+            crate::panorama::FOV_MAX_WIDE
+        );
+
         // 異常な倍率は姿勢へ触れない。
-        assert!(panorama_touch_zoom_fov(start, 0.0).is_none());
-        assert!(panorama_touch_zoom_fov(start, f32::NAN).is_none());
+        assert!(panorama_touch_zoom_fov(start, 0.0, flat).is_none());
+        assert!(panorama_touch_zoom_fov(start, f32::NAN, flat).is_none());
     }
 
     /// ピンチ中の平行移動は、1 本指ドラッグと同じ向き・同じ感度で回すこと。
@@ -40303,13 +40397,19 @@ mod tests {
     fn panorama_navigator_outline_splits_only_at_equirect_seam() {
         let content = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 200.0));
         let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
-        let away_from_seam = panorama_navigator_outline_segments(content, viewport, 0.0, 0.0, 0.8);
+        let pose = |yaw: f32| {
+            crate::panorama::PanoPose::new(
+                yaw,
+                0.0,
+                0.8,
+                crate::panorama::PanoProjection::Perspective,
+            )
+        };
+        let away_from_seam = panorama_navigator_outline_segments(content, viewport, pose(0.0));
         let across_seam = panorama_navigator_outline_segments(
             content,
             viewport,
-            std::f32::consts::PI - 0.05,
-            0.0,
-            0.8,
+            pose(std::f32::consts::PI - 0.05),
         );
 
         assert_eq!(away_from_seam.len(), 1);
@@ -40324,10 +40424,11 @@ mod tests {
             0.0,
             0.0,
             16.0 / 9.0,
-            (1.2_f32 * 0.5).tan(),
+            crate::panorama::PanoProjection::Perspective.map(1.2),
             expected_yaw,
             expected_pitch,
-        );
+        )
+        .expect("the view centre is always in domain");
         let (actual_yaw, actual_pitch) = panorama_navigator_uv_to_yaw_pitch(egui::pos2(u, v));
 
         assert!((actual_yaw - expected_yaw).abs() < 1.0e-4);
@@ -40337,15 +40438,16 @@ mod tests {
     #[test]
     fn panorama_navigator_selection_height_clamps_fov() {
         let content_height = 200.0;
+        let flat = crate::panorama::PanoProjection::Perspective;
         assert_eq!(
-            panorama_navigator_fov_from_height(0.0, content_height),
+            panorama_navigator_fov_from_height(0.0, content_height, flat),
             crate::panorama::FOV_MIN
         );
         assert_eq!(
-            panorama_navigator_fov_from_height(content_height, content_height),
+            panorama_navigator_fov_from_height(content_height, content_height, flat),
             crate::panorama::FOV_MAX
         );
-        let middle = panorama_navigator_fov_from_height(50.0, content_height);
+        let middle = panorama_navigator_fov_from_height(50.0, content_height, flat);
         assert!((crate::panorama::FOV_MIN..=crate::panorama::FOV_MAX).contains(&middle));
         assert!((middle - std::f32::consts::FRAC_PI_4).abs() < 1.0e-4);
     }
@@ -40359,9 +40461,12 @@ mod tests {
             host,
             260.0,
             FullscreenNavigatorCorner::BottomRight,
-            0.0,
-            0.0,
-            crate::panorama::FOV_MAX,
+            crate::panorama::PanoPose::new(
+                0.0,
+                0.0,
+                crate::panorama::FOV_MAX,
+                crate::panorama::PanoProjection::Perspective,
+            ),
         );
 
         assert!(layout.is_some());

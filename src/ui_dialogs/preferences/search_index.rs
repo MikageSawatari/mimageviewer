@@ -589,6 +589,23 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["ポインター", "非表示", "秒"]
     ),
     entry!(
+        "spread/panorama-projection",
+        SpreadMode,
+        "投影方式",
+        [
+            "360",
+            "パノラマ",
+            "魚眼",
+            "立体射影",
+            "等距離",
+            "等立体角",
+            "リトルプラネット",
+            "projection",
+            "panorama",
+            "fisheye"
+        ]
+    ),
+    entry!(
         "spread/page-jump",
         SpreadMode,
         "ページジャンプ量",

@@ -16,15 +16,237 @@
 pub const ASPECT_LOW: f32 = 1.95;
 pub const ASPECT_HIGH: f32 = 2.05;
 
-/// 360 ビューの FOV 範囲 (ラジアン)。約 11° 〜 150°。§3.3 / §5.2。
+/// 360 ビューの FOV 下限 (ラジアン、約 11°)。全投影方式で共通。§3.3 / §5.2。
 pub const FOV_MIN: f32 = 0.2;
+/// 透視投影の FOV 上限 (ラジアン、約 149°)。`r = f·tan θ` は 180° で発散するので、
+/// ここから先へは行けない。**この値は投影モード導入前と同一** (既定の見え方を変えない)。
 pub const FOV_MAX: f32 = 2.6;
+/// 非透視投影 (立体射影 / 等距離 / 等立体角) の FOV 上限 (ラジアン、約 340°)。
+/// 透視と違って 180° を超えても発散しないので、「引いた画角」をここまで許す。
+/// 360° ちょうどにしないのは、立体射影の `tan(fov/4)` が 360° で発散するため。
+pub const FOV_MAX_WIDE: f32 = 5.93;
 
-/// 初期 FOV (約 69°)。§5.1。
+/// 初期 FOV (約 69°)。§5.1。全投影方式の上限より小さいので、方式を切り替えても
+/// リセット後の画角は同じになる。
 pub const FOV_DEFAULT: f32 = 1.2;
 
 /// pitch のクランプ範囲。極を直視させない (asin 数値誤差で天井 / 床テクセルが暴れる)。
 pub const PITCH_LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.001;
+
+/// 360 ビューの投影方式 (§13)。
+///
+/// 半径 `r` と入射角 `θ` (光軸からの角度) の対応だけが違う。**視野角 `fov_y` の意味は
+/// 全方式で共通**で、「画面の上下端に写る点の入射角が `fov_y / 2`」と定義する。
+/// これにより方式を切り替えても画角スライダの読みが連続する。
+///
+/// | 方式 | 対応 | 逆変換 (`k = g(fov_y/2)`、`r` は画面上下端で 1) |
+/// | --- | --- | --- |
+/// | [`Perspective`](Self::Perspective) | `r = f·tan θ` | `θ = atan(r·k)`、`k = tan(fov/2)` |
+/// | [`Stereographic`](Self::Stereographic) | `r = 2f·tan(θ/2)` | `θ = 2·atan(r·k)`、`k = tan(fov/4)` |
+/// | [`Equidistant`](Self::Equidistant) | `r = f·θ` | `θ = r·k`、`k = fov/2` |
+/// | [`EquisolidAngle`](Self::EquisolidAngle) | `r = 2f·sin(θ/2)` | `θ = 2·asin(r·k)`、`k = sin(fov/4)` |
+///
+/// **この表は [`panorama_wgpu`](crate::panorama_wgpu) の WGSL と 1:1 で対応する**。
+/// 動画側 (backlog §1.112) の実行時 HLSL へもこの表のまま移す。分岐は
+/// [`ProjectionMap::theta`] の 1 箇所に閉じてあり、uniform には方式コード
+/// ([`Self::shader_code`]) だけを渡す。
+#[derive(
+    serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PanoProjection {
+    /// 透視投影 `r = f·tan θ`。既定。平面写真と同じ写り方で、180° へ近づくと発散する。
+    #[default]
+    Perspective,
+    /// 立体射影 `r = 2f·tan(θ/2)`。周辺の引き伸ばしが最も穏やか (リトルプラネット)。
+    Stereographic,
+    /// 等距離射影 `r = f·θ`。魚眼レンズの物理仕様としての標準表記。
+    Equidistant,
+    /// 等立体角射影 `r = 2f·sin(θ/2)`。立体角が画面上の面積に比例する。
+    EquisolidAngle,
+    #[serde(other)]
+    Unknown,
+}
+
+impl PanoProjection {
+    /// 未知の永続値 (将来版が追加した方式を旧版が読んだ場合) を既定へ寄せる。
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Unknown => Self::Perspective,
+            mode => mode,
+        }
+    }
+
+    /// UI に出す順序。`Unknown` は含めない。
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Perspective,
+            Self::Stereographic,
+            Self::Equidistant,
+            Self::EquisolidAngle,
+        ]
+    }
+
+    /// 切り替えボタン / キーで使う順送り。
+    pub fn next(self) -> Self {
+        let all = Self::all();
+        let cur = self.normalized();
+        let idx = all.iter().position(|&m| m == cur).unwrap_or(0);
+        all[(idx + 1) % all.len()]
+    }
+
+    /// UI 表示名。
+    pub fn label(self) -> &'static str {
+        match self.normalized() {
+            Self::Perspective => "透視投影",
+            Self::Stereographic => "立体射影",
+            Self::Equidistant => "等距離射影",
+            Self::EquisolidAngle => "等立体角射影",
+            Self::Unknown => unreachable!(),
+        }
+    }
+
+    /// 見え方の 1 行説明 (tooltip / 環境設定)。評価語ではなく写像の性質を書く。
+    pub fn description(self) -> &'static str {
+        match self.normalized() {
+            Self::Perspective => "直線が直線のまま写る。視野角は約 149 度まで",
+            Self::Stereographic => "周辺の引き伸ばしが最も穏やか。視野角は約 340 度まで",
+            Self::Equidistant => "画面中心からの距離が入射角に比例する。視野角は約 340 度まで",
+            Self::EquisolidAngle => "立体角が画面上の面積に比例する。視野角は約 340 度まで",
+            Self::Unknown => unreachable!(),
+        }
+    }
+
+    /// WGSL / HLSL の uniform に載せる方式コード。**値を変えるとシェーダ分岐が壊れる**
+    /// ので、シェーダ側の `PROJ_*` 定数と必ず一緒に変更する。
+    pub fn shader_code(self) -> u32 {
+        match self.normalized() {
+            Self::Perspective => 0,
+            Self::Stereographic => 1,
+            Self::Equidistant => 2,
+            Self::EquisolidAngle => 3,
+            Self::Unknown => unreachable!(),
+        }
+    }
+
+    /// この方式で許す FOV 上限 (ラジアン)。透視だけ 180° 手前で発散するため狭い。
+    pub fn fov_max(self) -> f32 {
+        match self.normalized() {
+            Self::Perspective => FOV_MAX,
+            Self::Stereographic | Self::Equidistant | Self::EquisolidAngle => FOV_MAX_WIDE,
+            Self::Unknown => unreachable!(),
+        }
+    }
+
+    /// `fov_y` を許容範囲へ丸める。方式を切り替えるときは必ずこれを通す
+    /// (立体射影で 300° まで広げた画角のまま透視へ戻すと発散するため)。
+    pub fn clamp_fov(self, fov_y: f32) -> f32 {
+        if fov_y.is_finite() {
+            fov_y.clamp(FOV_MIN, self.fov_max())
+        } else {
+            FOV_DEFAULT
+        }
+    }
+
+    /// 1 フレームぶんの写像 (`k = g(fov_y/2)`) を先に畳んでおく。
+    /// ピクセルごとのループでは [`ProjectionMap::theta`] だけを呼ぶ。
+    pub fn map(self, fov_y: f32) -> ProjectionMap {
+        let kind = self.normalized();
+        let half = self.clamp_fov(fov_y) * 0.5;
+        let k = match kind {
+            Self::Perspective => half.tan(),
+            Self::Stereographic => (half * 0.5).tan(),
+            Self::Equidistant => half,
+            Self::EquisolidAngle => (half * 0.5).sin(),
+            Self::Unknown => unreachable!(),
+        };
+        ProjectionMap { kind, k }
+    }
+}
+
+/// 1 フレーム固定の投影写像。`k` は「画面上下端 (`r = 1`) に写る入射角が `fov_y / 2`」
+/// を満たす係数で、[`PanoProjection::map`] が作る。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProjectionMap {
+    kind: PanoProjection,
+    k: f32,
+}
+
+impl ProjectionMap {
+    pub fn kind(self) -> PanoProjection {
+        self.kind
+    }
+
+    /// `k = g(fov_y / 2)`。シェーダの uniform へそのまま渡し、GPU 側で `tan` を
+    /// 引き直さないことで CPU settle overlay と幾何を一致させる。
+    pub fn coefficient(self) -> f32 {
+        self.k
+    }
+
+    /// 正規化半径 `r` (画面中心 = 0、上下端 = 1) に対応する入射角 `θ`。
+    ///
+    /// **`None` は「その画素が投影の定義域の外」**を意味する。透視と立体射影では
+    /// 有限の `r` が必ず `θ < π` に写るので `None` にならない。等距離と等立体角は
+    /// 広い画角で画面隅が `θ > π` (= 球の裏側より遠い) へ出るため、そこは魚眼の
+    /// イメージサークル外と同じく描かない。**シェーダ側も同じ判定を持つ**
+    /// (`panorama_wgpu` の `theta_valid`)。
+    #[inline]
+    pub fn theta(self, r: f32) -> Option<f32> {
+        if !r.is_finite() || r < 0.0 {
+            return None;
+        }
+        let arg = r * self.k;
+        match self.kind {
+            PanoProjection::Perspective => Some(arg.atan()),
+            PanoProjection::Stereographic => Some(2.0 * arg.atan()),
+            PanoProjection::Equidistant => {
+                if arg > std::f32::consts::PI {
+                    None
+                } else {
+                    Some(arg)
+                }
+            }
+            PanoProjection::EquisolidAngle => {
+                if arg > 1.0 {
+                    None
+                } else {
+                    Some(2.0 * arg.asin())
+                }
+            }
+            PanoProjection::Unknown => unreachable!(),
+        }
+    }
+}
+
+/// 360 ビューの視点 (yaw / pitch / fov_y / 投影方式)。
+///
+/// **settle overlay の stale 判定キーそのもの**。以前は `(f32, f32, f32)` タプルで
+/// 持っていたが、投影方式を足したときに比較へ入れ忘れると「方式を変えたのに古い
+/// 投影で焼いた overlay がそのまま残る」ため、1 つの型に閉じた。新しい視点要素を
+/// 足すときもこの構造体へ足せば、全ての比較経路が自動で追随する。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PanoPose {
+    pub yaw: f32,
+    pub pitch: f32,
+    pub fov_y: f32,
+    pub projection: PanoProjection,
+}
+
+impl PanoPose {
+    pub fn new(yaw: f32, pitch: f32, fov_y: f32, projection: PanoProjection) -> Self {
+        Self {
+            yaw,
+            pitch,
+            fov_y,
+            projection,
+        }
+    }
+
+    /// このフレームの投影写像。
+    pub fn map(self) -> ProjectionMap {
+        self.projection.map(self.fov_y)
+    }
+}
 
 /// `cache_key` の source_kind ビット (§4.1.2):
 /// - 0 = fs_cache
@@ -48,8 +270,13 @@ pub struct PanoramaState {
     pub yaw: f32,
     /// 緯度 (radians)。`[-PITCH_LIMIT, PITCH_LIMIT]`。
     pub pitch: f32,
-    /// 視野角 Y 方向 (radians)。`[FOV_MIN, FOV_MAX]`。
+    /// 視野角 Y 方向 (radians)。`[FOV_MIN, projection.fov_max()]`。
+    /// 上限は投影方式で変わる ([`PanoProjection::fov_max`])。
     pub fov_y: f32,
+    /// 投影方式。**セッション state であって画像の属性ではない**。開始値は
+    /// `Settings::panorama_projection`、閲覧中の切り替えはここだけを動かし、
+    /// 環境設定の既定値は書き換えない (1 枚だけ試す操作を永続化しない)。
+    pub projection: PanoProjection,
     /// マウス左ドラッグ中か。
     pub drag_active: bool,
     /// 直前のポインタ位置 (`drag_active=true` のとき有効)。
@@ -66,13 +293,14 @@ impl PanoramaState {
     /// 4 軸 stale guard の `(f32,f32,f32)==(f32,f32,f32)` 比較が **永久に false** に
     /// なり、settle overlay の upload が永久に却下されて高画質モードが固定で
     /// 「描画中…」と表示されたまま進まなくなる。
-    pub fn new(initial_yaw: f32, initial_pitch: f32) -> Self {
+    pub fn new(initial_yaw: f32, initial_pitch: f32, projection: PanoProjection) -> Self {
         let initial_yaw = sanitize_angle(initial_yaw, 0.0);
         let initial_pitch = sanitize_angle(initial_pitch, 0.0).clamp(-PITCH_LIMIT, PITCH_LIMIT);
         Self {
             yaw: initial_yaw,
             pitch: initial_pitch,
             fov_y: FOV_DEFAULT,
+            projection: projection.normalized(),
             drag_active: false,
             last_pointer: None,
             initial_yaw,
@@ -81,12 +309,35 @@ impl PanoramaState {
     }
 
     /// 初期視点にリセット (ダブルクリック / リセットボタン)。drag 状態は維持しない。
+    ///
+    /// **投影方式は戻さない**。リセットは「視点を初期向きへ」であって、見え方の
+    /// 選択をやめる操作ではない (`FOV_DEFAULT` は全方式の上限より小さいので、
+    /// どの方式でもそのまま入る)。
     pub fn reset(&mut self) {
         self.yaw = sanitize_angle(self.initial_yaw, 0.0);
         self.pitch = sanitize_angle(self.initial_pitch, 0.0).clamp(-PITCH_LIMIT, PITCH_LIMIT);
         self.fov_y = FOV_DEFAULT;
         self.drag_active = false;
         self.last_pointer = None;
+    }
+
+    /// 投影方式を順送りする (キー / 上バーのボタン)。切り替え後の方式で許されない
+    /// 画角は同時に丸める (立体射影の 300° から透視へ戻す経路が発散しないように)。
+    pub fn cycle_projection(&mut self) -> PanoProjection {
+        self.set_projection(self.projection.next())
+    }
+
+    /// 投影方式を明示指定する。画角の丸めは [`Self::cycle_projection`] と同じ。
+    pub fn set_projection(&mut self, projection: PanoProjection) -> PanoProjection {
+        let projection = projection.normalized();
+        self.projection = projection;
+        self.fov_y = projection.clamp_fov(self.fov_y);
+        projection
+    }
+
+    /// 現在の視点。settle overlay の stale 判定キーとして使う。
+    pub fn pose(&self) -> PanoPose {
+        PanoPose::new(self.yaw, self.pitch, self.fov_y, self.projection)
     }
 
     /// 入力ハンドラ (drag / wheel) 経由で yaw / pitch / fov_y が変更された後に
@@ -97,11 +348,8 @@ impl PanoramaState {
         self.yaw = sanitize_angle(self.yaw, self.initial_yaw);
         self.pitch =
             sanitize_angle(self.pitch, self.initial_pitch).clamp(-PITCH_LIMIT, PITCH_LIMIT);
-        self.fov_y = if self.fov_y.is_finite() {
-            self.fov_y.clamp(FOV_MIN, FOV_MAX)
-        } else {
-            FOV_DEFAULT
-        };
+        self.projection = self.projection.normalized();
+        self.fov_y = self.projection.clamp_fov(self.fov_y);
     }
 }
 
@@ -413,9 +661,9 @@ pub struct RenderingHandle {
     pub rx: std::sync::mpsc::Receiver<SettleRenderResult>,
     pub started_at: std::time::Instant,
     pub for_source_key: String,
-    /// render 開始時の pose snapshot (yaw, pitch, fov_y)。
+    /// render 開始時の pose snapshot。
     /// 結果到着時に `refinement.last_pose` と比較して stale 判定。
-    pub for_pose: (f32, f32, f32),
+    pub for_pose: PanoPose,
     /// render 開始時の cache_key snapshot。補正/AI 変更で cache_key が動いたら stale。
     pub for_cache_key: u64,
     /// render 開始時の viewport size snapshot (Codex P1 第 2、2026-05)。
@@ -427,7 +675,7 @@ pub struct RenderingHandle {
 #[derive(Clone)]
 pub struct SettleRenderResult {
     pub source_key: String,
-    pub pose: (f32, f32, f32),
+    pub pose: PanoPose,
     pub cache_key: u64,
     /// render 時の viewport size (= overlay の想定 viewport)。
     pub viewport_size: (u32, u32),
@@ -442,7 +690,7 @@ pub struct PanoramaRefinement {
     pub source_key: String,
     /// 静止検出のタイマー基準。pose が変わると `None` に戻し、500 ms 経過で起動。
     pub settle_since: Option<std::time::Instant>,
-    pub last_pose: (f32, f32, f32),
+    pub last_pose: PanoPose,
     /// 補正 / AI / source_kind の変化検出用 (§4.6.1)。
     pub last_cache_key: u64,
     /// 直近フレームの viewport size (= `image_rect` のピクセル寸法)。
@@ -454,7 +702,7 @@ pub struct PanoramaRefinement {
     /// 完成したオーバーレイの wgpu テクスチャ。`upload_settle_overlay` で挿入。
     /// `Box` で持つのは型を panorama.rs から隠したいだけ。
     pub overlay: Option<SettleOverlay>,
-    pub overlay_pose: Option<(f32, f32, f32)>,
+    pub overlay_pose: Option<PanoPose>,
     pub overlay_cache_key: Option<u64>,
     /// Overlay が想定する viewport サイズ。描画時に現 viewport と差があれば overlay
     /// を drop して再 settle に倒す。
@@ -471,7 +719,7 @@ pub struct PanoramaRefinement {
 }
 
 impl PanoramaRefinement {
-    pub fn new(source_key: String, pose: (f32, f32, f32), cache_key: u64) -> Self {
+    pub fn new(source_key: String, pose: PanoPose, cache_key: u64) -> Self {
         Self {
             source_key,
             settle_since: None,
@@ -497,7 +745,7 @@ impl PanoramaRefinement {
     /// 呼び出し側は現状 pose 変化だけ気にしている)。
     pub fn note_state(
         &mut self,
-        pose: (f32, f32, f32),
+        pose: PanoPose,
         cache_key: u64,
         viewport_size: Option<(u32, u32)>,
     ) -> bool {
@@ -532,7 +780,7 @@ impl PanoramaRefinement {
     /// その軸はスキップ (保守的に true 側に倒す)。
     pub fn overlay_ok_for(
         &self,
-        pose: (f32, f32, f32),
+        pose: PanoPose,
         cache_key: u64,
         viewport_size: Option<(u32, u32)>,
         target_format: Option<wgpu::TextureFormat>,
@@ -675,20 +923,33 @@ pub fn sample_bilinear_equirect(src: &[u8], w: u32, h: u32, u: f32, v: f32) -> [
 
 /// NDC (-1..1, Y 上向き) から equirect 球面 UV に変換 (WGSL シェーダと同じ式)。
 /// `uv_transform` は呼び出し側で適用 (= フル equirect 座標を返す)。
+///
+/// `map` は [`PanoProjection::map`] が作る 1 フレーム固定の投影写像。
+/// **`None` はその画素が投影の定義域外**であることを意味する
+/// ([`ProjectionMap::theta`] 参照)。呼び出し側は描画しない / 線を切る。
 #[inline]
 pub fn ndc_to_equirect_uv(
     u_ndc: f32,
     v_ndc: f32,
     aspect: f32,
-    tan_half: f32,
+    map: ProjectionMap,
     yaw: f32,
     pitch: f32,
-) -> (f32, f32) {
-    let dx = u_ndc * tan_half * aspect;
-    let dy = v_ndc * tan_half;
-    let dz: f32 = -1.0;
-    let inv_len = 1.0 / (dx * dx + dy * dy + dz * dz).sqrt();
-    let (cx, cy, cz) = (dx * inv_len, dy * inv_len, dz * inv_len);
+) -> Option<(f32, f32)> {
+    // 画面上下端を 1 とする正規化半径と、その方位。透視投影では
+    // `normalize(u*tan_half*aspect, v*tan_half, -1)` と恒等になる (§13)。
+    let px = u_ndc * aspect;
+    let py = v_ndc;
+    let r = (px * px + py * py).sqrt();
+    let theta = map.theta(r)?;
+    let (sin_t, cos_t) = (theta.sin(), theta.cos());
+    let (dir_x, dir_y) = if r > 1e-6 {
+        (px / r * sin_t, py / r * sin_t)
+    } else {
+        // 画面中心。θ ≈ 0 なので光軸そのもの。
+        (0.0, 0.0)
+    };
+    let (cx, cy, cz) = (dir_x, dir_y, -cos_t);
 
     // pitch (X 軸回転)
     let cp = pitch.cos();
@@ -709,7 +970,7 @@ pub fn ndc_to_equirect_uv(
     let inv_pi = 1.0 / std::f32::consts::PI;
     let u = lon * inv_two_pi + 0.5;
     let v = 0.5 - lat * inv_pi;
-    (u, v)
+    Some((u, v))
 }
 
 /// settle render 本体 (§3.6.3)。
@@ -725,9 +986,7 @@ pub fn render_settle_overlay(
     src_w: u32,
     src_h: u32,
     uv: PanoUvTransform,
-    yaw: f32,
-    pitch: f32,
-    fov_y: f32,
+    pose: PanoPose,
     out_w: u32,
     out_h: u32,
     policy: &PanoramaSettlePolicy,
@@ -748,7 +1007,8 @@ pub fn render_settle_overlay(
     }
 
     let aspect = out_w as f32 / out_h as f32;
-    let tan_half = (fov_y * 0.5).tan();
+    let (yaw, pitch) = (pose.yaw, pose.pitch);
+    let map = pose.map();
 
     // U Repeat / V ClampToEdge は WGSL 側と同じ「軸別 half-texel inset clamp」を
     // CPU 側でも適用 (フル equirect は wrap、crop ありなら inset clamp)。
@@ -767,8 +1027,16 @@ pub fn render_settle_overlay(
         let v_ndc = 1.0 - (y as f32 + 0.5) / out_h as f32 * 2.0;
         for x in 0..out_w as usize {
             let u_ndc = (x as f32 + 0.5) / out_w as f32 * 2.0 - 1.0;
-            let (sphere_u, sphere_v) =
-                ndc_to_equirect_uv(u_ndc, v_ndc, aspect, tan_half, yaw, pitch);
+            let Some((sphere_u, sphere_v)) =
+                ndc_to_equirect_uv(u_ndc, v_ndc, aspect, map, yaw, pitch)
+            else {
+                // 投影の定義域外 (魚眼のイメージサークル外)。**WGSL 側と同じく
+                // 不透明の黒**にする。overlay は base の上に alpha blend されるので、
+                // ここを透明にすると base の広角描画が透けて二重像になる。
+                let off = x * 4;
+                row[off..off + 4].copy_from_slice(&[0, 0, 0, 255]);
+                continue;
+            };
             // フル sphere → 画像テクスチャ座標
             let tex_u_raw = (sphere_u - uv.u_offset) / uv.u_scale;
             let tex_v_raw = (sphere_v - uv.v_offset) / uv.v_scale;
@@ -894,7 +1162,7 @@ mod tests {
 
     #[test]
     fn panorama_state_resets_to_initial() {
-        let mut s = PanoramaState::new(0.5, -0.2);
+        let mut s = PanoramaState::new(0.5, -0.2, PanoProjection::Perspective);
         s.yaw = 1.5;
         s.pitch = 0.3;
         s.fov_y = 0.5;
@@ -908,9 +1176,9 @@ mod tests {
 
     #[test]
     fn pitch_clamped_in_new() {
-        let s = PanoramaState::new(0.0, 100.0);
+        let s = PanoramaState::new(0.0, 100.0, PanoProjection::Perspective);
         assert!(s.pitch <= PITCH_LIMIT);
-        let s = PanoramaState::new(0.0, -100.0);
+        let s = PanoramaState::new(0.0, -100.0, PanoProjection::Perspective);
         assert!(s.pitch >= -PITCH_LIMIT);
     }
 
@@ -1134,9 +1402,214 @@ mod tests {
     fn ndc_to_equirect_uv_center_is_yaw_pitch() {
         // 中心ピクセル (NDC=(0,0)) + yaw=0, pitch=0 → (lon=0, lat=0)
         // → (u=0.5, v=0.5)
-        let (u, v) = ndc_to_equirect_uv(0.0, 0.0, 1.0, 1.0, 0.0, 0.0);
+        let map = PanoProjection::Perspective.map(FOV_DEFAULT);
+        let (u, v) = ndc_to_equirect_uv(0.0, 0.0, 1.0, map, 0.0, 0.0).expect("center is in domain");
         assert!((u - 0.5).abs() < 1e-4, "u={}", u);
         assert!((v - 0.5).abs() < 1e-4, "v={}", v);
+    }
+
+    // ---- 投影方式 (§13) ----
+
+    /// 投影モード導入前の式そのまま (このファイルの実装とは独立に書く)。
+    fn legacy_perspective_uv(
+        u_ndc: f32,
+        v_ndc: f32,
+        aspect: f32,
+        tan_half: f32,
+        yaw: f32,
+        pitch: f32,
+    ) -> (f32, f32) {
+        let dx = u_ndc * tan_half * aspect;
+        let dy = v_ndc * tan_half;
+        let dz: f32 = -1.0;
+        let inv_len = 1.0 / (dx * dx + dy * dy + dz * dz).sqrt();
+        let (cx, cy, cz) = (dx * inv_len, dy * inv_len, dz * inv_len);
+        let (cp, sp) = (pitch.cos(), pitch.sin());
+        let (p1x, p1y, p1z) = (cx, cp * cy - sp * cz, sp * cy + cp * cz);
+        let (cyw, syw) = (yaw.cos(), yaw.sin());
+        let wx = cyw * p1x + syw * p1z;
+        let wy = p1y;
+        let wz = -syw * p1x + cyw * p1z;
+        let lon = wx.atan2(-wz);
+        let lat = wy.clamp(-1.0, 1.0).asin();
+        (
+            lon / (2.0 * std::f32::consts::PI) + 0.5,
+            0.5 - lat / std::f32::consts::PI,
+        )
+    }
+
+    /// 透視投影の絵は投影モード導入前と変わってはならない。一般化した式が旧式
+    /// と恒等であることを、視野いっぱいの格子点で確かめる。
+    #[test]
+    fn the_perspective_mode_reproduces_the_formula_it_replaced() {
+        let aspect = 16.0 / 9.0;
+        let yaw = 0.7;
+        let pitch = -0.3;
+        for &fov_y in &[FOV_MIN, 0.6, FOV_DEFAULT, 2.0, FOV_MAX] {
+            let map = PanoProjection::Perspective.map(fov_y);
+            let tan_half = (fov_y * 0.5).tan();
+            for i in 0..=8 {
+                for j in 0..=8 {
+                    let u_ndc = -1.0 + i as f32 * 0.25;
+                    let v_ndc = -1.0 + j as f32 * 0.25;
+                    let (u, v) = ndc_to_equirect_uv(u_ndc, v_ndc, aspect, map, yaw, pitch)
+                        .expect("perspective never leaves its domain");
+                    let (lu, lv) =
+                        legacy_perspective_uv(u_ndc, v_ndc, aspect, tan_half, yaw, pitch);
+                    assert!(
+                        (u - lu).abs() < 2e-5 && (v - lv).abs() < 2e-5,
+                        "fov={fov_y} ndc=({u_ndc},{v_ndc}) new=({u},{v}) old=({lu},{lv})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `fov_y` の意味を全方式で共通にする契約: 画面上下端 (`r = 1`) の入射角が
+    /// ちょうど `fov_y / 2`。これが崩れると、方式を切り替えた瞬間に画角が飛ぶ。
+    #[test]
+    fn every_projection_puts_the_vertical_edge_at_half_the_field_of_view() {
+        for &mode in PanoProjection::all() {
+            for &fov_y in &[FOV_MIN, 0.5, FOV_DEFAULT, 2.0, FOV_MAX] {
+                let theta = mode
+                    .map(fov_y)
+                    .theta(1.0)
+                    .expect("the vertical edge is always inside the domain");
+                assert!(
+                    (theta - fov_y * 0.5).abs() < 1e-5,
+                    "{:?} fov={fov_y} theta={theta}",
+                    mode
+                );
+            }
+        }
+    }
+
+    /// 半径が増えれば入射角も増える (どの方式でも像が折り返さない)。
+    #[test]
+    fn the_incidence_angle_grows_with_the_image_radius() {
+        for &mode in PanoProjection::all() {
+            let map = mode.map(FOV_DEFAULT);
+            let mut previous = -1.0_f32;
+            for step in 0..=20 {
+                let r = step as f32 * 0.1;
+                let theta = map.theta(r).expect("FOV_DEFAULT stays inside every domain");
+                assert!(theta > previous, "{:?} r={r} theta={theta}", mode);
+                previous = theta;
+            }
+        }
+    }
+
+    /// 透視と立体射影は有限の半径が必ず 180 度未満へ写るので定義域外にならない。
+    /// 等距離と等立体角は広い画角で画面隅が定義域を出る (= 魚眼のイメージサークル外)。
+    #[test]
+    fn only_the_radial_fisheye_modes_report_a_domain_edge() {
+        // 16:9 の画面隅の正規化半径。
+        let corner = ((16.0_f32 / 9.0) * (16.0 / 9.0) + 1.0).sqrt();
+        for &mode in PanoProjection::all() {
+            let corner_theta = mode.map(mode.fov_max()).theta(corner);
+            match mode {
+                PanoProjection::Perspective | PanoProjection::Stereographic => {
+                    let theta = corner_theta.expect("must stay in domain at any radius");
+                    assert!(theta < std::f32::consts::PI, "{:?} theta={theta}", mode);
+                }
+                PanoProjection::Equidistant | PanoProjection::EquisolidAngle => {
+                    assert!(
+                        corner_theta.is_none(),
+                        "{:?} should leave its domain at the corner of a wide view",
+                        mode
+                    );
+                }
+                PanoProjection::Unknown => unreachable!(),
+            }
+            // 画角が狭ければどの方式も隅まで写る。
+            assert!(mode.map(FOV_DEFAULT).theta(corner).is_some(), "{:?}", mode);
+        }
+    }
+
+    /// 定義域外の画素は overlay と base で同じ扱いにする。CPU 側は不透明の黒を書く。
+    #[test]
+    fn the_settle_overlay_paints_pixels_outside_the_domain_black() {
+        let src = vec![200u8; 8 * 4 * 4];
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let out = render_settle_overlay(
+            &src,
+            8,
+            4,
+            PanoUvTransform::IDENTITY,
+            PanoPose::new(0.0, 0.0, FOV_MAX_WIDE, PanoProjection::EquisolidAngle),
+            32,
+            18,
+            &PanoramaSettlePolicy::EnabledFromRaw,
+            &cancel,
+        )
+        .expect("should produce output");
+        // 隅 (0,0) はイメージサークルの外、中央は内側。
+        assert_eq!(&out[0..4], &[0, 0, 0, 255]);
+        let mid = (9 * 32 + 16) * 4;
+        assert_ne!(&out[mid..mid + 4], &[0, 0, 0, 255]);
+    }
+
+    /// 立体射影で広げた画角のまま透視へ戻す経路。丸め忘れると発散する。
+    #[test]
+    fn switching_back_to_perspective_pulls_the_field_of_view_into_range() {
+        let mut s = PanoramaState::new(0.0, 0.0, PanoProjection::Stereographic);
+        s.fov_y = FOV_MAX_WIDE;
+        assert_eq!(
+            s.set_projection(PanoProjection::Perspective),
+            PanoProjection::Perspective
+        );
+        assert!(s.fov_y <= FOV_MAX, "fov={}", s.fov_y);
+        assert!(s.pose().map().theta(1.0).is_some_and(|t| t.is_finite()));
+    }
+
+    /// 順送りは全方式をちょうど 1 周する。
+    #[test]
+    fn cycling_the_projection_visits_every_mode_once() {
+        let mut seen = Vec::new();
+        let mut mode = PanoProjection::Perspective;
+        for _ in 0..PanoProjection::all().len() {
+            seen.push(mode);
+            mode = mode.next();
+        }
+        assert_eq!(mode, PanoProjection::Perspective, "cycle must close");
+        assert_eq!(seen, PanoProjection::all().to_vec());
+    }
+
+    /// 保存済み設定に未知の方式が入っていても既定へ寄せる。
+    #[test]
+    fn an_unknown_stored_projection_falls_back_to_perspective() {
+        assert_eq!(
+            PanoProjection::Unknown.normalized(),
+            PanoProjection::Perspective
+        );
+        assert_eq!(PanoProjection::Unknown.fov_max(), FOV_MAX);
+        assert_eq!(PanoProjection::Unknown.shader_code(), 0);
+        assert_eq!(
+            PanoProjection::Unknown.next(),
+            PanoProjection::Stereographic
+        );
+    }
+
+    /// シェーダ分岐の番号が重複しないこと。
+    #[test]
+    fn projection_shader_codes_are_unique() {
+        let mut codes: Vec<u32> = PanoProjection::all()
+            .iter()
+            .map(|m| m.shader_code())
+            .collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), PanoProjection::all().len());
+    }
+
+    /// pose は投影方式まで含めて比較される。ここが漏れると、方式を変えても
+    /// 古い投影で焼いた settle overlay が stale 判定を通ってしまう。
+    #[test]
+    fn the_pose_comparison_notices_a_projection_change() {
+        let a = PanoPose::new(0.1, 0.2, 1.0, PanoProjection::Perspective);
+        let b = PanoPose::new(0.1, 0.2, 1.0, PanoProjection::Stereographic);
+        assert_ne!(a, b);
+        assert_eq!(a, PanoPose::new(0.1, 0.2, 1.0, PanoProjection::Perspective));
     }
 
     // `render_settle_overlay(..., Disabled, ...)` は debug_assert で panic する設計
@@ -1155,9 +1628,7 @@ mod tests {
             8,
             4,
             PanoUvTransform::IDENTITY,
-            0.0,
-            0.0,
-            1.2,
+            PanoPose::new(0.0, 0.0, 1.2, PanoProjection::Perspective),
             16,
             8,
             &PanoramaSettlePolicy::EnabledFromRaw,
@@ -1180,9 +1651,7 @@ mod tests {
             4,
             2,
             PanoUvTransform::IDENTITY,
-            0.0,
-            0.0,
-            1.2,
+            PanoPose::new(0.0, 0.0, 1.2, PanoProjection::Perspective),
             8,
             4,
             &PanoramaSettlePolicy::EnabledFromRaw,
@@ -1211,7 +1680,7 @@ mod tests {
 
     #[test]
     fn panorama_state_sanitize_replaces_nan() {
-        let mut s = PanoramaState::new(0.0, 0.0);
+        let mut s = PanoramaState::new(0.0, 0.0, PanoProjection::Perspective);
         s.yaw = f32::NAN;
         s.pitch = f32::INFINITY;
         s.fov_y = f32::NEG_INFINITY;
@@ -1223,7 +1692,7 @@ mod tests {
 
     #[test]
     fn panorama_state_new_handles_nan_inputs() {
-        let s = PanoramaState::new(f32::NAN, f32::INFINITY);
+        let s = PanoramaState::new(f32::NAN, f32::INFINITY, PanoProjection::Perspective);
         assert!(s.yaw.is_finite());
         assert!(s.pitch.is_finite() && s.pitch.abs() <= PITCH_LIMIT);
         assert!(s.fov_y.is_finite());

@@ -27113,7 +27113,11 @@ mod pipeline_cache_refactor_tests {
                 "pano_edit_mode_raw",
                 egui::Color32::BLACK,
             );
-            app.panorama_state = Some(crate::panorama::PanoramaState::new(0.0, 0.0));
+            app.panorama_state = Some(crate::panorama::PanoramaState::new(
+                0.0,
+                0.0,
+                crate::panorama::PanoProjection::Perspective,
+            ));
 
             let ctrl = egui::Modifiers {
                 ctrl: ctrl_pressed,
@@ -42049,7 +42053,11 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_open_images_in_window = true;
         app.fullscreen_idx = Some(first);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.panorama_state = Some(crate::panorama::PanoramaState::new(0.5, -0.25));
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(
+            0.5,
+            -0.25,
+            crate::panorama::PanoProjection::Perspective,
+        ));
         app.pano_toast_shown_for_current_fs = true;
         app.analysis_mode = true;
         app.analysis_zoom = 2.0;
@@ -42086,7 +42094,11 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(first);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.panorama_state = Some(crate::panorama::PanoramaState::new(0.5, -0.25));
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(
+            0.5,
+            -0.25,
+            crate::panorama::PanoProjection::Perspective,
+        ));
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.fs_open_intent_from_grid = true;
@@ -43970,7 +43982,11 @@ mod still_window_mode_key_tests {
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
         app.detached_viewer_window_id = Some(42);
-        app.panorama_state = Some(crate::panorama::PanoramaState::new(1.0, -0.5));
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(
+            1.0,
+            -0.5,
+            crate::panorama::PanoProjection::Perspective,
+        ));
         app.pano_toast_shown_for_current_fs = true;
         app.analysis_mode = true;
         app.analysis_zoom = 2.5;
@@ -44119,7 +44135,11 @@ mod still_window_mode_key_tests {
     #[test]
     fn active_detached_context_uses_its_own_panorama_mode_state() {
         let mut app = setup_app();
-        app.panorama_state = Some(crate::panorama::PanoramaState::new(1.0, 0.0));
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(
+            1.0,
+            0.0,
+            crate::panorama::PanoProjection::Perspective,
+        ));
         app.pano_toast_shown_for_current_fs = true;
 
         let mut bundle = ViewerContextBundle::empty();
@@ -44136,7 +44156,11 @@ mod still_window_mode_key_tests {
                 !mounted.pano_toast_shown_for_current_fs,
                 "panorama guide state is also per fullscreen viewer context"
             );
-            mounted.panorama_state = Some(crate::panorama::PanoramaState::new(0.25, -0.1));
+            mounted.panorama_state = Some(crate::panorama::PanoramaState::new(
+                0.25,
+                -0.1,
+                crate::panorama::PanoProjection::Perspective,
+            ));
             mounted.pano_toast_shown_for_current_fs = true;
         });
 
