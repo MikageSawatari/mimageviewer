@@ -691,6 +691,23 @@ egui 音楽ビューも同じ mode と App runtime を使う。3 面とも Click
 presenter 有効時は `VideoPlayer` が `NativeVideoOutput` を持ち、動画フレームと
 egui overlay は専用 HWND 側で表示される。フルスクリーン viewport は黒い backdrop と
 focus/chrome 管理だけを担当する。
+
+native presenter の動画 scaling は `Settings::video_scale_filter` を正本にする。既定の
+`OS に任せる` は source 解像度 swap chain と DComp scaling を維持する。`標準` は拡大・縮小を
+Lanczos3、`シャープ` は拡大を NIS、`ニアレスト` は拡大を nearest で解決し、後二者も縮小時は
+Lanczos3 を使う。縮小の支持幅は静止画と別の `video_downscale_smoothing_percent` で調整する。
+SAR / orientation 適用後の映像表示矩形を物理 pixel 単位で fit し、GPU / CPU frame の双方を
+source 解像度の grade pass (補正時だけ中間 RT) から表示寸法へ渡す。物理 1:1 は resample を
+通さず既存 copy path のままにする。
+
+切替は prepare / commit に分け、prepare が現在寸法用の中間 resource と未接続の次 video surface
+を作った後、同じ request / source / viewport / resize state であることを照合して commit する。
+commit と一時停止中の held frame 再提示では compile / allocation を行わない。window resize stream
+中は現在の surface を DComp が stretch し、寸法 sample が 150ms 静止した edge で 1 回だけ交換する。
+表示 surface 作成不能は typed reason を perf へ出して OS path へ戻し、同じ要求を frame ごとに
+再試行しない。長辺 8192px または総画素数 16,777,216px を超える表示矩形はサイズ制限として同じ
+fallback に入り、左パネルの設定位置へ理由を表示する。
+
 Windows のタスクバー hover preview は main HWND を対象にするため、動画 fullscreen 中は
 `dwm_iconic_thumbnail.rs` が DWM iconic thumbnail/live preview を main HWND に供給する。
 フレーム抽出は worker thread 上の `video::screenshot::capture_frame` で粗く更新し、

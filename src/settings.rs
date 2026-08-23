@@ -3196,6 +3196,67 @@ impl AnimeUpscaleSourceLimit {
     }
 }
 
+/// Final scaling owner for native video presentation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoScaleFilter {
+    /// Keep the source-resolution swap chain and let DirectComposition scale it.
+    OsDefault,
+    /// Resolve source pixels to the physical display rectangle with Lanczos3.
+    ///
+    /// The default since the reducing case was measured on hardware: a 4K video
+    /// in a smaller window moires under DirectComposition and does not here, at
+    /// a cost that dropped no frames.
+    #[default]
+    Standard,
+    /// NVIDIA Image Scaling while enlarging; Lanczos3 while reducing.
+    Sharp,
+    /// Nearest-neighbour while enlarging; Lanczos3 while reducing.
+    Nearest,
+    /// Anime4K CNN x2 while enlarging; Lanczos3 while reducing.
+    Anime,
+}
+
+impl VideoScaleFilter {
+    pub const ALL: [Self; 5] = [
+        Self::OsDefault,
+        Self::Standard,
+        Self::Nearest,
+        Self::Sharp,
+        Self::Anime,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::OsDefault => "OS に任せる",
+            Self::Standard => "標準（補間あり）",
+            Self::Sharp => "シャープ拡大",
+            Self::Nearest => "ニアレスト（補間なし）",
+            Self::Anime => "アニメ塗り拡大",
+        }
+    }
+
+    pub const fn perf_name(self) -> &'static str {
+        match self {
+            Self::OsDefault => "os_default",
+            Self::Standard => "standard",
+            Self::Sharp => "sharp",
+            Self::Nearest => "nearest",
+            Self::Anime => "anime",
+        }
+    }
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::OsDefault => Self::Standard,
+            Self::Standard => Self::Nearest,
+            Self::Nearest => Self::Sharp,
+            Self::Sharp => Self::Anime,
+            Self::Anime => Self::OsDefault,
+        }
+    }
+}
+
 /// Carrier for post-filter variants that released builds cannot deserialize.
 ///
 /// Settings persistence writes only old variants into `AdjustParams::post_filter` and records
@@ -4381,6 +4442,19 @@ pub struct Settings {
     /// 入力色空間の変換ではなく、デコード後のプレビュー見た目だけを変更する。
     #[serde(default)]
     pub video_adjustments: crate::creative_lut::VideoAdjustments,
+    /// native presenter の動画拡大・縮小方法。
+    #[serde(default)]
+    pub video_scale_filter: VideoScaleFilter,
+    /// 動画縮小時の Lanczos3 のなめらかさ。静止画側とは独立した設定。
+    #[serde(default)]
+    pub video_downscale_smoothing_percent: u32,
+    /// Anime4K の動画再生時間予算。静止画側の Anime4K 選択とは独立。
+    #[serde(default)]
+    pub video_anime4k_budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset,
+    /// 最後に測定した native presenter GPU の結果。adapter/driver が違えば使わない。
+    #[serde(default)]
+    pub video_anime4k_measurement:
+        Option<crate::video::anime4k_policy::VideoAnime4kMeasurementCache>,
     /// 全動画で共有する動画補正の保存スロット (10個)。
     #[serde(default)]
     pub video_preset_slots: crate::creative_lut::VideoPresetSlots,
@@ -5626,6 +5700,10 @@ impl Default for Settings {
             video_start_muted: false,
             video_muted: false,
             video_adjustments: crate::creative_lut::VideoAdjustments::default(),
+            video_scale_filter: VideoScaleFilter::default(),
+            video_downscale_smoothing_percent: DOWNSCALE_SMOOTHING_PERCENT_MIN,
+            video_anime4k_budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset::default(),
+            video_anime4k_measurement: None,
             video_preset_slots: crate::creative_lut::VideoPresetSlots::default(),
             video_resume_positions: std::collections::HashMap::new(),
             video_grid_open_starts_from_beginning: false,
@@ -7122,6 +7200,8 @@ impl Settings {
             .clamp(10, 300);
         self.downscale_smoothing_percent =
             sanitize_downscale_smoothing_percent(self.downscale_smoothing_percent);
+        self.video_downscale_smoothing_percent =
+            sanitize_downscale_smoothing_percent(self.video_downscale_smoothing_percent);
         self.fullscreen_jump_percent = self
             .fullscreen_jump_percent
             .clamp(FULLSCREEN_JUMP_PERCENT_MIN, FULLSCREEN_JUMP_PERCENT_MAX);
@@ -7468,6 +7548,10 @@ impl Settings {
         self.downscale_smoothing_percent = src.downscale_smoothing_percent;
         // ── 動画プレビュー補正 (native 動画左パネルでライブ編集) ──
         self.video_adjustments = src.video_adjustments.clone();
+        self.video_scale_filter = src.video_scale_filter;
+        self.video_downscale_smoothing_percent = src.video_downscale_smoothing_percent;
+        self.video_anime4k_budget = src.video_anime4k_budget;
+        self.video_anime4k_measurement = src.video_anime4k_measurement.clone();
         self.video_preset_slots = src.video_preset_slots.clone();
         // ── キャッシュ系 (環境設定に出ていない項目) ──
         self.cache_videos_always = src.cache_videos_always;
@@ -8846,6 +8930,94 @@ mod tests {
             ))
             .unwrap(),
             AnimeUpscaleSourceLimit::Unlimited
+        );
+    }
+
+    #[test]
+    fn video_scale_filter_defaults_to_standard_and_roundtrips_choices() {
+        let settings = Settings::default();
+        assert_eq!(settings.video_scale_filter, VideoScaleFilter::Standard);
+        assert_eq!(
+            settings.video_anime4k_budget,
+            crate::video::anime4k_policy::VideoAnime4kBudgetPreset::Standard
+        );
+        assert!(settings.video_anime4k_measurement.is_none());
+        for (filter, serialized) in [
+            (VideoScaleFilter::Standard, "standard"),
+            (VideoScaleFilter::Sharp, "sharp"),
+            (VideoScaleFilter::Nearest, "nearest"),
+            (VideoScaleFilter::Anime, "anime"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(filter).unwrap(),
+                serde_json::Value::String(serialized.to_owned())
+            );
+        }
+        assert_eq!(
+            serde_json::from_value::<VideoScaleFilter>(serde_json::Value::String(
+                "os_default".to_owned(),
+            ))
+            .unwrap(),
+            VideoScaleFilter::OsDefault
+        );
+        assert_eq!(
+            settings.video_downscale_smoothing_percent,
+            DOWNSCALE_SMOOTHING_PERCENT_MIN
+        );
+        assert_eq!(
+            VideoScaleFilter::ALL.map(VideoScaleFilter::next),
+            [
+                VideoScaleFilter::Standard,
+                VideoScaleFilter::Nearest,
+                VideoScaleFilter::Sharp,
+                VideoScaleFilter::Anime,
+                VideoScaleFilter::OsDefault,
+            ]
+        );
+    }
+
+    #[test]
+    fn video_anime4k_budget_and_measurement_roundtrip() {
+        use crate::video::anime4k_policy::{
+            VIDEO_ANIME4K_MEASUREMENT_SCHEMA, VideoAnime4kAdapterKey, VideoAnime4kBudgetPreset,
+            VideoAnime4kMeasurementCache, VideoAnime4kMeasurementPoint, VideoAnime4kVariant,
+        };
+
+        let mut selected = Settings::default();
+        selected.video_anime4k_budget = VideoAnime4kBudgetPreset::Quality;
+        selected.video_anime4k_measurement = Some(VideoAnime4kMeasurementCache {
+            schema: VIDEO_ANIME4K_MEASUREMENT_SCHEMA,
+            adapter: VideoAnime4kAdapterKey {
+                luid_low: 1,
+                luid_high: 2,
+                vendor_id: 3,
+                device_id: 4,
+                subsystem_id: 5,
+                revision: 6,
+                driver_version: 7,
+                dedicated_video_memory: 8,
+                shared_system_memory: 9,
+                description: "test adapter".to_string(),
+            },
+            points: vec![VideoAnime4kMeasurementPoint {
+                variant: VideoAnime4kVariant::Small,
+                source_width: 960,
+                source_height: 540,
+                output_width: 1920,
+                output_height: 1080,
+                gpu_time_us: 123,
+            }],
+        });
+
+        let loaded: Settings =
+            serde_json::from_str(&serde_json::to_string(&selected).unwrap()).unwrap();
+        assert_eq!(
+            loaded.video_anime4k_budget,
+            VideoAnime4kBudgetPreset::Quality
+        );
+        assert_eq!(
+            loaded.video_anime4k_measurement,
+            selected.video_anime4k_measurement
         );
     }
 

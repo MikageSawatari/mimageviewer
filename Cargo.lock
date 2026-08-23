@@ -3951,6 +3951,7 @@ dependencies = [
  "lopdf",
  "mimageviewer-ipc",
  "music-core",
+ "naga",
  "ndarray",
  "notify",
  "opener",

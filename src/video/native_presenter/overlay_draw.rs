@@ -451,6 +451,11 @@ pub(super) fn draw_native_video_left_panel(
     panel_tab: &mut NativeVideoLeftPanelTab,
     adjustment_tab: &mut NativeVideoAdjustmentTab,
     adjustments: &mut crate::creative_lut::VideoAdjustments,
+    scale_filter: &mut crate::settings::VideoScaleFilter,
+    downscale_smoothing_percent: &mut u32,
+    scale_outside_note: Option<&str>,
+    anime4k_budget: &mut crate::video::anime4k_policy::VideoAnime4kBudgetPreset,
+    anime4k_status: &super::NativeVideoAnime4kStatus,
     preset_slots: &[Option<String>],
     creative_luts: &[crate::creative_lut::CreativeLutChoice],
     commands: &mut Vec<NativeOverlayCommand>,
@@ -540,6 +545,11 @@ pub(super) fn draw_native_video_left_panel(
                     adjustment_tab,
                     preset_slots,
                     adjustments,
+                    scale_filter,
+                    downscale_smoothing_percent,
+                    scale_outside_note,
+                    anime4k_budget,
+                    anime4k_status,
                     creative_luts,
                     commands,
                 ),
@@ -568,6 +578,11 @@ fn draw_native_video_adjustment_body(
     tab: &mut NativeVideoAdjustmentTab,
     preset_slots: &[Option<String>],
     adjustments: &mut crate::creative_lut::VideoAdjustments,
+    scale_filter: &mut crate::settings::VideoScaleFilter,
+    downscale_smoothing_percent: &mut u32,
+    scale_outside_note: Option<&str>,
+    anime4k_budget: &mut crate::video::anime4k_policy::VideoAnime4kBudgetPreset,
+    anime4k_status: &super::NativeVideoAnime4kStatus,
     creative_luts: &[crate::creative_lut::CreativeLutChoice],
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
@@ -713,6 +728,126 @@ fn draw_native_video_adjustment_body(
                     );
                 }
                 NativeVideoAdjustmentTab::Filter => {
+                    ui.label(egui::RichText::new("動画の拡大方法").strong());
+                    let previous_filter = *scale_filter;
+                    egui::ComboBox::from_id_salt("native_video_scale_filter")
+                        .selected_text(scale_filter.label())
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            for filter in crate::settings::VideoScaleFilter::ALL {
+                                ui.selectable_value(scale_filter, filter, filter.label());
+                            }
+                        });
+                    if *scale_filter != previous_filter {
+                        commands.push(NativeOverlayCommand::RequestVideoScaleSettings {
+                            filter: *scale_filter,
+                            smoothing_percent: *downscale_smoothing_percent,
+                        });
+                    }
+
+                    if *scale_filter == crate::settings::VideoScaleFilter::Anime {
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new("品質の余裕").strong());
+                        let previous_budget = *anime4k_budget;
+                        egui::ComboBox::from_id_salt("native_video_anime4k_budget")
+                            .selected_text(anime4k_budget.label())
+                            .width(ui.available_width())
+                            .show_ui(ui, |ui| {
+                                for budget in crate::video::anime4k_policy::VideoAnime4kBudgetPreset::ALL {
+                                    ui.selectable_value(anime4k_budget, budget, budget.label());
+                                }
+                            });
+                        if *anime4k_budget != previous_budget {
+                            commands.push(NativeOverlayCommand::SetVideoAnime4kBudget {
+                                budget: *anime4k_budget,
+                            });
+                        }
+                        ui.add_space(4.0);
+                        match anime4k_status {
+                            super::NativeVideoAnime4kStatus::Waiting => {
+                                ui.label("測定待ち / 現在は「標準」で表示");
+                            }
+                            super::NativeVideoAnime4kStatus::Measuring { completed, total } => {
+                                ui.label(format!("測定中 ({completed}/{total})"));
+                                ui.label(egui::RichText::new("測定中は現在の表示を維持します").small().weak());
+                            }
+                            super::NativeVideoAnime4kStatus::Active { variant, predicted_us, budget_us } => {
+                                let predicted_ms = *predicted_us as f64 / 1000.0;
+                                if let Some(budget_us) = budget_us {
+                                    ui.label(format!("Anime4K {} / 予測 {:.1}ms / 予算 {:.1}ms", variant.label(), predicted_ms, *budget_us as f64 / 1000.0));
+                                } else {
+                                    ui.label(format!("Anime4K {} / 固定", variant.label()));
+                                }
+                            }
+                            super::NativeVideoAnime4kStatus::Fallback(reason) => {
+                                match reason {
+                                    crate::video::anime4k_policy::VideoAnime4kFallbackReason::SourceTooLarge { max_pixels, .. } => {
+                                        ui.label(crate::ui_helpers::processing_size_outside_note_for("Anime4K", &format!("総画素数 {max_pixels}px 以下")));
+                                    }
+                                    crate::video::anime4k_policy::VideoAnime4kFallbackReason::MeasuredTooSlow { predicted_us, budget_us } => {
+                                        ui.label(format!("Anime4K S / 予測 {:.1}ms / 予算 {:.1}ms", *predicted_us as f64 / 1000.0, *budget_us as f64 / 1000.0));
+                                        ui.label("再生の余裕を確保するため「標準」で表示します");
+                                    }
+                                    crate::video::anime4k_policy::VideoAnime4kFallbackReason::InsufficientVideoMemory { .. } => {
+                                        ui.label("必要な余裕を確保できないため「標準」で表示します");
+                                    }
+                                    crate::video::anime4k_policy::VideoAnime4kFallbackReason::MeasurementUnavailable => {
+                                        ui.label("測定結果がないため「標準」で表示します");
+                                    }
+                                    crate::video::anime4k_policy::VideoAnime4kFallbackReason::MeasurementFailed => {
+                                        ui.label("測定できなかったため「標準」で表示します");
+                                    }
+                                }
+                            }
+                            super::NativeVideoAnime4kStatus::Failed => {
+                                ui.label("測定できなかったため「標準」で表示します");
+                            }
+                        }
+                        if ui
+                            .add_enabled(
+                                !matches!(anime4k_status, super::NativeVideoAnime4kStatus::Measuring { .. }),
+                                egui::Button::new("もう一度測定"),
+                            )
+                            .clicked()
+                        {
+                            commands.push(NativeOverlayCommand::RemeasureVideoAnime4k);
+                        }
+                    }
+
+                    if *scale_filter != crate::settings::VideoScaleFilter::OsDefault {
+                        ui.add_space(4.0);
+                        let response = ui.add(
+                            egui::Slider::new(
+                                downscale_smoothing_percent,
+                                crate::settings::DOWNSCALE_SMOOTHING_PERCENT_MIN
+                                    ..=crate::settings::DOWNSCALE_SMOOTHING_PERCENT_MAX,
+                            )
+                            .step_by(crate::settings::DOWNSCALE_SMOOTHING_PERCENT_STEP as f64)
+                            .suffix("%")
+                            .text("縮小時のなめらかさ"),
+                        );
+                        if response.changed() {
+                            *downscale_smoothing_percent =
+                                crate::settings::sanitize_downscale_smoothing_percent(
+                                    *downscale_smoothing_percent,
+                                );
+                            commands.push(NativeOverlayCommand::RequestVideoScaleSettings {
+                                filter: *scale_filter,
+                                smoothing_percent: *downscale_smoothing_percent,
+                            });
+                        }
+                    }
+                    if let Some(note) = scale_outside_note {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(note)
+                                .small()
+                                .color(egui::Color32::from_rgb(255, 190, 100)),
+                        );
+                    }
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(6.0);
                     ui.label(egui::RichText::new("Creative LUT").strong());
                     ui.label(
                         egui::RichText::new("環境設定 > 表示 > LUT で登録した .cube を適用")
@@ -6647,6 +6782,9 @@ mod tests {
         adjustment_tab: NativeVideoAdjustmentTab,
         mut adjustments: crate::creative_lut::VideoAdjustments,
         creative_luts: Vec<crate::creative_lut::CreativeLutChoice>,
+        initial_scale_filter: crate::settings::VideoScaleFilter,
+        initial_downscale_smoothing_percent: u32,
+        scale_outside_note: Option<String>,
     ) {
         use egui_kittest::Harness;
 
@@ -6658,6 +6796,14 @@ mod tests {
         let entries = Vec::new();
         let jump_texture_ids = HashMap::new();
         let preset_slots = vec![None; 10];
+        let mut scale_filter = initial_scale_filter;
+        let mut downscale_smoothing_percent = initial_downscale_smoothing_percent;
+        let mut anime4k_budget = crate::video::anime4k_policy::VideoAnime4kBudgetPreset::default();
+        let anime4k_status = crate::video::native_presenter::NativeVideoAnime4kStatus::Active {
+            variant: crate::video::anime4k_policy::VideoAnime4kVariant::Large,
+            predicted_us: 6_200,
+            budget_us: Some(16_700),
+        };
         let mut harness = Harness::builder()
             .with_size(egui::vec2(340.0, 650.0))
             .build(move |ctx| {
@@ -6682,6 +6828,11 @@ mod tests {
                     &mut panel_tab,
                     &mut adjustment_tab,
                     &mut adjustments,
+                    &mut scale_filter,
+                    &mut downscale_smoothing_percent,
+                    scale_outside_note.as_deref(),
+                    &mut anime4k_budget,
+                    &anime4k_status,
                     &preset_slots,
                     &creative_luts,
                     &mut commands,
@@ -6704,6 +6855,9 @@ mod tests {
                 ..Default::default()
             },
             Vec::new(),
+            crate::settings::VideoScaleFilter::OsDefault,
+            0,
+            None,
         );
     }
 
@@ -6728,6 +6882,25 @@ mod tests {
                 loaded: true,
                 error: None,
             }],
+            crate::settings::VideoScaleFilter::Sharp,
+            35,
+            Some(crate::ui_helpers::processing_size_outside_note_for(
+                "動画",
+                "長辺 8192px 以下・総画素数 16777216px 以下",
+            )),
+        );
+    }
+
+    #[test]
+    fn native_video_adjustment_anime4k_panel_snapshot() {
+        snapshot_video_adjustment_panel(
+            "native_video_adjustment_anime4k_panel",
+            NativeVideoAdjustmentTab::Filter,
+            crate::creative_lut::VideoAdjustments::default(),
+            Vec::new(),
+            crate::settings::VideoScaleFilter::Anime,
+            0,
+            None,
         );
     }
 

@@ -28,14 +28,14 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Dxgi::{
     DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
     DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, DXGI_SWAP_EFFECT_FLIP_DISCARD,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2, IDXGIKeyedMutex, IDXGIOutput,
-    IDXGISwapChain1, IDXGISwapChain2,
+    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIAdapter, IDXGIAdapter1, IDXGIDevice, IDXGIFactory2,
+    IDXGIKeyedMutex, IDXGIOutput, IDXGISwapChain1, IDXGISwapChain2,
 };
 use windows::Win32::System::Threading::WaitForSingleObject;
 use windows::core::Interface;
 use windows_numerics::Matrix3x2;
 
-use crate::settings::FsSidePanelMode;
+use crate::settings::{FsSidePanelMode, VideoScaleFilter};
 use crate::ui_helpers::HoverTipExt;
 use crate::video::decoder::{VideoFrame, VideoFrameData};
 use crate::video::display_metadata::VideoOrientation;
@@ -46,6 +46,7 @@ use crate::video::native_window_host::{
     NativeWindowObservation,
 };
 use crate::video::window_host_contract::HostWindowTopology;
+use crate::video::{VideoAnime4kFallbackNotice, VideoScaleFallbackNotice};
 
 // 音楽ビュー (Inc 5c-A) がジャンプ/ブックマークパネル本体・一括登録ダイアログを共有するため
 // crate 内に公開する。動画専用の `pub(super)` ヘルパは従来どおり parent 限定のまま。
@@ -54,6 +55,18 @@ use super::overlay_draw::*;
 #[path = "grade_pipeline.rs"]
 mod grade_pipeline;
 use self::grade_pipeline::VideoGradePipeline;
+#[path = "resample_pipeline.rs"]
+mod resample_pipeline;
+use self::resample_pipeline::{
+    VideoResampleMode, VideoResamplePipeline, VideoResamplePrepareError,
+    measure_video_anime4k_on_adapter, select_video_resample_mode,
+};
+#[path = "surface_policy.rs"]
+mod surface_policy;
+use self::surface_policy::{
+    VideoScaleFallbackReason, VideoSurfaceSizeDecision, VideoSurfaceSizeInput,
+    decide_video_surface_size,
+};
 
 /// `shared_texture_cache` (presenter 側 `OpenSharedResource1` キャッシュ) の上限。
 ///
@@ -68,6 +81,46 @@ const SEEK_STATUS_DELAY: Duration = Duration::from_millis(150);
 const SEEK_STATUS_MIN_VISIBLE: Duration = Duration::from_millis(300);
 const LIMITER_INDICATOR_VISIBLE: Duration = Duration::from_millis(500);
 const TEXT_INPUT_FOCUS_CLAIM_MIN_INTERVAL: Duration = Duration::from_millis(500);
+/// A geometry stream is considered settled after this long without a newer
+/// `GeometryChanged` sample. Windows has no single reliable end edge across
+/// interactive, child, maximize, and programmatic resize routes.
+const VIDEO_RESIZE_SETTLE_INTERVAL: Duration = Duration::from_millis(150);
+
+#[derive(Debug)]
+pub enum NativeAnime4kMeasurementUpdate {
+    Progress {
+        completed: u32,
+        point: crate::video::anime4k_policy::VideoAnime4kMeasurementPoint,
+    },
+    Completed(Result<crate::video::anime4k_policy::VideoAnime4kMeasurementCache, String>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeVideoAnime4kStatus {
+    Waiting,
+    Measuring {
+        completed: u32,
+        total: u32,
+    },
+    Active {
+        variant: crate::video::anime4k_policy::VideoAnime4kVariant,
+        predicted_us: u64,
+        budget_us: Option<u64>,
+    },
+    Fallback(crate::video::anime4k_policy::VideoAnime4kFallbackReason),
+    Failed,
+}
+
+pub struct NativeAnime4kMeasurement {
+    pub updates: crossbeam_channel::Receiver<NativeAnime4kMeasurementUpdate>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for NativeAnime4kMeasurement {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+}
 
 /// 動画 HUD 2 段化リデザイン (Phase 3): 下 HUD を **シーク行 (上段) + コントロール行 (下段)**
 /// の 2 段に分割する。
@@ -136,6 +189,12 @@ pub struct NativeRenderConfig {
     pub text_contrast: crate::settings::TextContrast,
     /// main UI と同じフォント指定と縦位置補正。
     pub ui_font: crate::settings::UiFontSettings,
+    /// Startup-selected video scaling owner.
+    pub scale_filter: VideoScaleFilter,
+    pub downscale_smoothing_percent: u32,
+    pub anime4k_variant: Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
+    pub anime4k_budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset,
+    pub anime4k_status: NativeVideoAnime4kStatus,
     pub(crate) health: Arc<crate::video::native_window_health::NativeWindowHealth>,
     pub(crate) window_epoch: u64,
 }
@@ -188,7 +247,21 @@ pub struct NativeRenderCore {
     shared_texture_cache: Vec<((u64, u64), ID3D11Texture2D)>,
     cpu_upload_scratch: Vec<u8>,
     video_grade: crate::creative_lut::VideoGradeSnapshot,
-    grade_pipeline: Option<VideoGradePipeline>,
+    grade_pipeline: VideoGradePipeline,
+    resample_pipeline: Option<VideoResamplePipeline>,
+    resample_pipeline_error: Option<String>,
+    selected_scale_filter: VideoScaleFilter,
+    downscale_smoothing_percent: u32,
+    selected_anime4k_variant: Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
+    anime4k_budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset,
+    anime4k_status: NativeVideoAnime4kStatus,
+    surface_content: VideoSurfaceContent,
+    resize_settle: VideoResizeSettleState,
+    prepared_video_surface: Option<PreparedVideoSurface>,
+    prepared_video_scale_settings: Option<PreparedVideoScaleSettings>,
+    active_scale_fallback: Option<ActiveVideoScaleFallback>,
+    scale_fallback_count: u64,
+    surface_swap_count: u64,
     pixel_probe_enabled: bool,
     pixel_probe_strict: bool,
     last_pixel_probe: Option<Instant>,
@@ -222,6 +295,186 @@ struct RetiredVideoSurface {
     _swap_chain: IDXGISwapChain1,
     waitable: HANDLE,
     _backbuffer: Option<ID3D11Texture2D>,
+}
+
+struct PreparedVideoSurface {
+    width: u32,
+    height: u32,
+    content: VideoSurfaceContent,
+    swap_chain: Option<IDXGISwapChain1>,
+    waitable: HANDLE,
+    backbuffer: Option<ID3D11Texture2D>,
+}
+
+impl PreparedVideoSurface {
+    fn matches(&self, width: u32, height: u32, content: VideoSurfaceContent) -> bool {
+        self.width == width && self.height == height && self.content == content
+    }
+}
+
+impl Drop for PreparedVideoSurface {
+    fn drop(&mut self) {
+        if !self.waitable.is_invalid() {
+            unsafe {
+                let _ = CloseHandle(self.waitable);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VideoScalePreparationSignature {
+    source_width: u32,
+    source_height: u32,
+    sar_num: u32,
+    sar_den: u32,
+    orientation: VideoOrientation,
+    target_width: u32,
+    target_height: u32,
+    target_content: VideoSurfaceContent,
+    grade_active: bool,
+    filter: VideoScaleFilter,
+    smoothing_percent: u32,
+    anime4k_variant: Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PreparedVideoScaleSettings {
+    identity: crate::video::VideoScaleRequestIdentity,
+    signature: VideoScalePreparationSignature,
+}
+
+fn video_scale_signature_changed_fields(
+    prepared: VideoScalePreparationSignature,
+    current: VideoScalePreparationSignature,
+) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    macro_rules! changed {
+        ($field:ident) => {
+            if prepared.$field != current.$field {
+                fields.push(stringify!($field));
+            }
+        };
+    }
+    changed!(source_width);
+    changed!(source_height);
+    changed!(sar_num);
+    changed!(sar_den);
+    changed!(orientation);
+    changed!(target_width);
+    changed!(target_height);
+    changed!(target_content);
+    changed!(grade_active);
+    changed!(filter);
+    changed!(smoothing_percent);
+    changed!(anime4k_variant);
+    fields
+}
+
+fn validate_prepared_video_scale_settings(
+    prepared: Option<PreparedVideoScaleSettings>,
+    identity: crate::video::VideoScaleRequestIdentity,
+    signature: VideoScalePreparationSignature,
+) -> Result<(), crate::video::VideoScaleApplyRejectReason> {
+    let prepared = prepared.ok_or(crate::video::VideoScaleApplyRejectReason::NoPrepared)?;
+    if prepared.identity.source_epoch != identity.source_epoch {
+        return Err(crate::video::VideoScaleApplyRejectReason::SourceChanged {
+            prepared_source_epoch: prepared.identity.source_epoch,
+            current_source_epoch: identity.source_epoch,
+        });
+    }
+    if prepared.identity.revision != identity.revision {
+        return Err(crate::video::VideoScaleApplyRejectReason::RequestMismatch {
+            prepared_revision: prepared.identity.revision,
+            current_revision: identity.revision,
+        });
+    }
+    let fields = video_scale_signature_changed_fields(prepared.signature, signature);
+    if !fields.is_empty() {
+        return Err(crate::video::VideoScaleApplyRejectReason::SignatureChanged { fields });
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub(crate) enum VideoScalePreparedPresentError {
+    Rejected(crate::video::VideoScaleApplyRejectReason),
+    Present(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VideoSurfaceContent {
+    LegacySource,
+    DisplayResolved,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum VideoResizeSettleState {
+    Settled,
+    Waiting { last_geometry_change: Instant },
+}
+
+impl VideoResizeSettleState {
+    fn is_resizing(self, now: Instant) -> bool {
+        matches!(
+            self,
+            Self::Waiting {
+                last_geometry_change
+            } if now.saturating_duration_since(last_geometry_change) < VIDEO_RESIZE_SETTLE_INTERVAL
+        )
+    }
+
+    fn refresh_due(self, now: Instant) -> bool {
+        matches!(
+            self,
+            Self::Waiting {
+                last_geometry_change
+            } if now.saturating_duration_since(last_geometry_change) >= VIDEO_RESIZE_SETTLE_INTERVAL
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DisplaySurfaceRequestKey {
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+    sar_num: u32,
+    sar_den: u32,
+    orientation: VideoOrientation,
+    grade_active: bool,
+    filter: VideoScaleFilter,
+    smoothing_percent: u32,
+    anime4k_variant: Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveVideoScaleFallback {
+    key: DisplaySurfaceRequestKey,
+    reason: VideoScaleFallbackReason,
+}
+
+enum VideoSurfaceSwapError {
+    DisplayCreation(VideoScaleFallbackReason),
+    Other(String),
+}
+
+impl From<String> for VideoSurfaceSwapError {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl VideoSurfaceSwapError {
+    fn into_string(self) -> String {
+        match self {
+            Self::DisplayCreation(reason) => {
+                format!("display surface creation failed: {}", reason.detail())
+            }
+            Self::Other(error) => error,
+        }
+    }
 }
 
 impl Drop for RetiredVideoSurface {
@@ -402,6 +655,11 @@ struct NativeEguiOverlay {
     timeline_markers: Vec<NativeOverlayTimelineMarker>,
     jump_entries: Vec<NativeOverlayJumpEntry>,
     video_adjustments: crate::creative_lut::VideoAdjustments,
+    video_scale_filter: VideoScaleFilter,
+    video_downscale_smoothing_percent: u32,
+    video_scale_outside_note: Option<String>,
+    video_anime4k_budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset,
+    video_anime4k_status: NativeVideoAnime4kStatus,
     video_preset_slots: Arc<[Option<String>]>,
     creative_lut_choices: Arc<[crate::creative_lut::CreativeLutChoice]>,
     video_left_panel_tab: NativeVideoLeftPanelTab,
@@ -1398,6 +1656,14 @@ pub enum NativeOverlayCommand {
         adjustments: crate::creative_lut::VideoAdjustments,
         persist: bool,
     },
+    RequestVideoScaleSettings {
+        filter: VideoScaleFilter,
+        smoothing_percent: u32,
+    },
+    SetVideoAnime4kBudget {
+        budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset,
+    },
+    RemeasureVideoAnime4k,
     SetPlaybackSpeed {
         speed: f64,
     },
@@ -1600,6 +1866,88 @@ fn hud_repaint_debug_enabled() -> bool {
 }
 
 impl NativeRenderCore {
+    pub fn anime4k_adapter_key(
+        &self,
+    ) -> Result<crate::video::anime4k_policy::VideoAnime4kAdapterKey, String> {
+        let (_, key) = self.anime4k_adapter_and_key()?;
+        Ok(key)
+    }
+
+    pub fn start_anime4k_measurement(&self) -> Result<NativeAnime4kMeasurement, String> {
+        let (adapter, key) = self.anime4k_adapter_and_key()?;
+        let (tx, updates) = crossbeam_channel::bounded(8);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        std::thread::Builder::new()
+            .name("video-anime4k-measure".to_string())
+            .spawn(move || {
+                let result = measure_video_anime4k_on_adapter(
+                    &adapter,
+                    &worker_cancel,
+                    |completed, point| {
+                        let _ =
+                            tx.send(NativeAnime4kMeasurementUpdate::Progress { completed, point });
+                    },
+                )
+                .map(|points| {
+                    crate::video::anime4k_policy::VideoAnime4kMeasurementCache {
+                        schema: crate::video::anime4k_policy::VIDEO_ANIME4K_MEASUREMENT_SCHEMA,
+                        adapter: key,
+                        points,
+                    }
+                });
+                let _ = tx.send(NativeAnime4kMeasurementUpdate::Completed(result));
+            })
+            .map_err(|error| format!("spawn Anime4K measurement worker: {error}"))?;
+        Ok(NativeAnime4kMeasurement { updates, cancel })
+    }
+
+    fn anime4k_adapter_and_key(
+        &self,
+    ) -> Result<
+        (
+            IDXGIAdapter,
+            crate::video::anime4k_policy::VideoAnime4kAdapterKey,
+        ),
+        String,
+    > {
+        let dxgi_device: IDXGIDevice = self
+            .d3d_device1
+            .cast()
+            .map_err(|error| format!("Anime4K adapter IDXGIDevice: {error:?}"))?;
+        let adapter = unsafe { dxgi_device.GetAdapter() }
+            .map_err(|error| format!("Anime4K adapter GetAdapter: {error:?}"))?;
+        let adapter1: IDXGIAdapter1 = adapter
+            .cast()
+            .map_err(|error| format!("Anime4K adapter IDXGIAdapter1: {error:?}"))?;
+        let desc = unsafe { adapter1.GetDesc1() }
+            .map_err(|error| format!("Anime4K adapter GetDesc1: {error:?}"))?;
+        let name_len = desc
+            .Description
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(desc.Description.len());
+        let description = String::from_utf16_lossy(&desc.Description[..name_len]);
+        let driver_version = unsafe { adapter.CheckInterfaceSupport(&ID3D11Device::IID) }
+            .map(|value| value as u64)
+            .unwrap_or(0);
+        Ok((
+            adapter,
+            crate::video::anime4k_policy::VideoAnime4kAdapterKey {
+                luid_low: desc.AdapterLuid.LowPart,
+                luid_high: desc.AdapterLuid.HighPart,
+                vendor_id: desc.VendorId,
+                device_id: desc.DeviceId,
+                subsystem_id: desc.SubSysId,
+                revision: desc.Revision,
+                driver_version,
+                dedicated_video_memory: desc.DedicatedVideoMemory as u64,
+                shared_system_memory: desc.SharedSystemMemory as u64,
+                description,
+            },
+        ))
+    }
+
     pub(crate) fn new(
         config: NativeRenderConfig,
     ) -> Result<(Self, HostWindowTopology, Vec<NativeWindowIntent>), String> {
@@ -1623,6 +1971,21 @@ impl NativeRenderCore {
             let d3d_context1: ID3D11DeviceContext1 = d3d_context
                 .cast()
                 .map_err(|e| format!("cast ID3D11DeviceContext1: {e:?}"))?;
+            // Compile every small Phase A shader while the render pipeline is
+            // created. Anime4K pixel shaders are loaded here from build-time FXC
+            // bytecode. A later filter selection never invokes D3DCompile.
+            let grade_pipeline = VideoGradePipeline::new(&d3d_device1)?;
+            let (resample_pipeline, resample_pipeline_error) = match VideoResamplePipeline::new(
+                &d3d_device1,
+            ) {
+                Ok(pipeline) => (Some(pipeline), None),
+                Err(error) => {
+                    crate::logger::log(format!(
+                        "native-presenter: standard video resample pipeline unavailable: {error}"
+                    ));
+                    (None, Some(error))
+                }
+            };
             let dxgi_device: IDXGIDevice = d3d_device
                 .cast()
                 .map_err(|e| format!("cast IDXGIDevice: {e:?}"))?;
@@ -1966,7 +2329,23 @@ impl NativeRenderCore {
                 shared_texture_cache: Vec::new(),
                 cpu_upload_scratch: Vec::new(),
                 video_grade: crate::creative_lut::VideoGradeSnapshot::default(),
-                grade_pipeline: None,
+                grade_pipeline,
+                resample_pipeline,
+                resample_pipeline_error,
+                selected_scale_filter: config.scale_filter,
+                downscale_smoothing_percent: crate::settings::sanitize_downscale_smoothing_percent(
+                    config.downscale_smoothing_percent,
+                ),
+                selected_anime4k_variant: config.anime4k_variant,
+                anime4k_budget: config.anime4k_budget,
+                anime4k_status: config.anime4k_status,
+                surface_content: VideoSurfaceContent::LegacySource,
+                resize_settle: VideoResizeSettleState::Settled,
+                prepared_video_surface: None,
+                prepared_video_scale_settings: None,
+                active_scale_fallback: None,
+                scale_fallback_count: 0,
+                surface_swap_count: 0,
                 pixel_probe_enabled: std::env::var_os("MIV_NATIVE_VIDEO_PIXEL_PROBE").is_some(),
                 pixel_probe_strict: std::env::var_os("MIV_NATIVE_VIDEO_PIXEL_PROBE_STRICT")
                     .is_some(),
@@ -1986,6 +2365,7 @@ impl NativeRenderCore {
                 retired_video_surfaces: VecDeque::new(),
             };
             this.recreate_backbuffer(true)?;
+            this.sync_overlay_video_scale_state();
             this.wait_for_initial_composition_ready();
             log_event(
                 "init",
@@ -1996,6 +2376,19 @@ impl NativeRenderCore {
                     ("latency", Value::from(1)),
                     ("test_overlay", Value::from(config.test_overlay)),
                     ("egui_overlay", Value::from(config.egui_overlay)),
+                    ("scale_filter", Value::from(config.scale_filter.perf_name())),
+                ],
+            );
+            crate::logger::log(format!(
+                "native-presenter: video scale filter selected={} ({})",
+                config.scale_filter.perf_name(),
+                config.scale_filter.label()
+            ));
+            log_event(
+                "video_scale_filter_selected",
+                &[
+                    ("scale_filter", Value::from(config.scale_filter.perf_name())),
+                    ("label", Value::from(config.scale_filter.label())),
                 ],
             );
             Ok((this, active_topology, startup_window_intents))
@@ -2060,6 +2453,9 @@ impl NativeRenderCore {
         // 全 inner resize 成功で初めて self.width/height を進める。
         self.width = width;
         self.height = height;
+        self.resize_settle = VideoResizeSettleState::Waiting {
+            last_geometry_change: Instant::now(),
+        };
         log_event(
             "resize",
             &[
@@ -2070,6 +2466,20 @@ impl NativeRenderCore {
             ],
         );
         Ok(window_intents)
+    }
+
+    /// True once the latest geometry event has remained unchanged for the
+    /// settle interval. The render loop uses this only to re-present the held
+    /// visible frame while paused; active playback naturally consumes it on the
+    /// next decoded frame.
+    pub(crate) fn take_settled_resize_refresh_due(&mut self, now: Instant) -> bool {
+        if !self.resize_settle.refresh_due(now) {
+            return false;
+        }
+        // Consume the edge before performing GPU work. A failure is logged by
+        // the caller and is not converted into an unbounded retry loop.
+        self.resize_settle = VideoResizeSettleState::Settled;
+        self.selected_scale_filter != VideoScaleFilter::OsDefault
     }
 
     pub fn set_video_compact(&mut self, compact: bool) -> Result<(), String> {
@@ -2120,26 +2530,750 @@ impl NativeRenderCore {
         frame: &VideoFrame,
         sync_interval: u32,
     ) -> Result<NativePresentOutcome, String> {
-        let new_w = frame.width.max(1);
-        let new_h = frame.height.max(1);
+        let source_width = frame.width.max(1);
+        let source_height = frame.height.max(1);
         let new_sar_num = frame.sar_num.max(1);
         let new_sar_den = frame.sar_den.max(1);
         let new_orientation = frame.orientation;
-        let size_changed = self.surface_width != new_w || self.surface_height != new_h;
+        let now = Instant::now();
+        let grade_active = !self.video_grade.adjustments.is_identity();
+        let decision = decide_video_surface_size(VideoSurfaceSizeInput {
+            filter: self.selected_scale_filter,
+            source_width,
+            source_height,
+            sar_num: new_sar_num,
+            sar_den: new_sar_den,
+            orientation: new_orientation,
+            viewport_width: self.width,
+            viewport_height: self.height,
+            layout: self.video_visual_layout(),
+            resizing: self.resize_settle.is_resizing(now),
+            current_surface_width: self.surface_width,
+            current_surface_height: self.surface_height,
+            current_surface_is_display_resolved: matches!(
+                self.surface_content,
+                VideoSurfaceContent::DisplayResolved
+            ),
+        });
+        let kept_current_during_resize = matches!(
+            &decision,
+            VideoSurfaceSizeDecision::KeepCurrentDuringResize { .. }
+        );
 
-        if size_changed {
-            // 解像度変更: 新 swap chain を別途用意して原子的に差し替える。
+        let result = match decision {
+            VideoSurfaceSizeDecision::KeepCurrentDuringResize { .. } => {
+                let current_width = self.surface_width;
+                let current_height = self.surface_height;
+                let current_content = self.surface_content;
+                if matches!(current_content, VideoSurfaceContent::DisplayResolved) {
+                    let key = DisplaySurfaceRequestKey {
+                        source_width,
+                        source_height,
+                        target_width: current_width,
+                        target_height: current_height,
+                        sar_num: new_sar_num,
+                        sar_den: new_sar_den,
+                        orientation: new_orientation,
+                        grade_active,
+                        filter: self.selected_scale_filter,
+                        smoothing_percent: self.downscale_smoothing_percent,
+                        anime4k_variant: self.selected_anime4k_variant,
+                    };
+                    if let Err(reason) = self.prepare_display_resources(
+                        source_width,
+                        source_height,
+                        current_width,
+                        current_height,
+                        new_orientation,
+                        grade_active,
+                        self.selected_scale_filter,
+                        self.downscale_smoothing_percent,
+                        self.selected_anime4k_variant,
+                    ) {
+                        self.record_scale_fallback(key, reason);
+                        self.present_for_surface(
+                            frame,
+                            sync_interval,
+                            source_width,
+                            source_height,
+                            VideoSurfaceContent::LegacySource,
+                            new_sar_num,
+                            new_sar_den,
+                            new_orientation,
+                        )
+                    } else {
+                        self.present_for_surface(
+                            frame,
+                            sync_interval,
+                            current_width,
+                            current_height,
+                            current_content,
+                            new_sar_num,
+                            new_sar_den,
+                            new_orientation,
+                        )
+                    }
+                } else {
+                    self.present_for_surface(
+                        frame,
+                        sync_interval,
+                        current_width,
+                        current_height,
+                        current_content,
+                        new_sar_num,
+                        new_sar_den,
+                        new_orientation,
+                    )
+                }
+            }
+            VideoSurfaceSizeDecision::LegacySource { width, height } => {
+                self.active_scale_fallback = None;
+                self.present_for_surface(
+                    frame,
+                    sync_interval,
+                    width,
+                    height,
+                    VideoSurfaceContent::LegacySource,
+                    new_sar_num,
+                    new_sar_den,
+                    new_orientation,
+                )
+            }
+            VideoSurfaceSizeDecision::FallbackToLegacy {
+                width,
+                height,
+                reason,
+            } => {
+                let (target_width, target_height) = match &reason {
+                    VideoScaleFallbackReason::DisplaySizeLimitExceeded {
+                        requested_width,
+                        requested_height,
+                        ..
+                    } => (*requested_width, *requested_height),
+                    _ => (width, height),
+                };
+                let key = DisplaySurfaceRequestKey {
+                    source_width,
+                    source_height,
+                    target_width,
+                    target_height,
+                    sar_num: new_sar_num,
+                    sar_den: new_sar_den,
+                    orientation: new_orientation,
+                    grade_active,
+                    filter: self.selected_scale_filter,
+                    smoothing_percent: self.downscale_smoothing_percent,
+                    anime4k_variant: self.selected_anime4k_variant,
+                };
+                self.record_scale_fallback(key, reason);
+                self.present_for_surface(
+                    frame,
+                    sync_interval,
+                    width,
+                    height,
+                    VideoSurfaceContent::LegacySource,
+                    new_sar_num,
+                    new_sar_den,
+                    new_orientation,
+                )
+            }
+            VideoSurfaceSizeDecision::DisplayResolution { width, height } => {
+                let key = DisplaySurfaceRequestKey {
+                    source_width,
+                    source_height,
+                    target_width: width,
+                    target_height: height,
+                    sar_num: new_sar_num,
+                    sar_den: new_sar_den,
+                    orientation: new_orientation,
+                    grade_active,
+                    filter: self.selected_scale_filter,
+                    smoothing_percent: self.downscale_smoothing_percent,
+                    anime4k_variant: self.selected_anime4k_variant,
+                };
+                if self
+                    .active_scale_fallback
+                    .as_ref()
+                    .is_some_and(|fallback| fallback.key == key)
+                {
+                    self.present_for_surface(
+                        frame,
+                        sync_interval,
+                        source_width,
+                        source_height,
+                        VideoSurfaceContent::LegacySource,
+                        new_sar_num,
+                        new_sar_den,
+                        new_orientation,
+                    )
+                } else if let Err(reason) = self.prepare_display_resources(
+                    source_width,
+                    source_height,
+                    width,
+                    height,
+                    new_orientation,
+                    grade_active,
+                    self.selected_scale_filter,
+                    self.downscale_smoothing_percent,
+                    self.selected_anime4k_variant,
+                ) {
+                    self.record_scale_fallback(key, reason);
+                    self.present_for_surface(
+                        frame,
+                        sync_interval,
+                        source_width,
+                        source_height,
+                        VideoSurfaceContent::LegacySource,
+                        new_sar_num,
+                        new_sar_den,
+                        new_orientation,
+                    )
+                } else {
+                    let display_result = self.present_for_surface_typed(
+                        frame,
+                        sync_interval,
+                        width,
+                        height,
+                        VideoSurfaceContent::DisplayResolved,
+                        new_sar_num,
+                        new_sar_den,
+                        new_orientation,
+                    );
+                    match display_result {
+                        Ok(outcome) => {
+                            self.active_scale_fallback = None;
+                            Ok(outcome)
+                        }
+                        Err(VideoSurfaceSwapError::DisplayCreation(reason)) => {
+                            self.record_scale_fallback(key, reason);
+                            self.present_for_surface(
+                                frame,
+                                sync_interval,
+                                source_width,
+                                source_height,
+                                VideoSurfaceContent::LegacySource,
+                                new_sar_num,
+                                new_sar_den,
+                                new_orientation,
+                            )
+                        }
+                        Err(VideoSurfaceSwapError::Other(error)) => Err(error),
+                    }
+                }
+            }
+        };
+        if result.is_ok()
+            && !kept_current_during_resize
+            && self.selected_scale_filter != VideoScaleFilter::OsDefault
+        {
+            self.resize_settle = VideoResizeSettleState::Settled;
+        }
+        self.sync_overlay_video_scale_state();
+        result
+    }
+
+    /// Prepare every dimension-dependent resource for a desired scaling
+    /// selection without publishing it. Typed failures are cached as an
+    /// explicit legacy-path fallback for the same-unit present.
+    pub(crate) fn prepare_video_scale_settings(
+        &mut self,
+        frame: &VideoFrame,
+        identity: crate::video::VideoScaleRequestIdentity,
+        filter: VideoScaleFilter,
+        smoothing_percent: u32,
+        anime4k_variant: Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
+    ) -> Result<(), String> {
+        let (signature, decision_fallback) = self.video_scale_preparation_plan(
+            frame,
+            filter,
+            smoothing_percent,
+            anime4k_variant,
+            Instant::now(),
+        );
+        self.prepared_video_scale_settings = None;
+
+        match self.prepare_video_scale_resources(signature, decision_fallback) {
+            Ok(signature) => {
+                self.prepared_video_scale_settings = Some(PreparedVideoScaleSettings {
+                    identity,
+                    signature,
+                });
+                Ok(())
+            }
+            Err(error) => {
+                self.prepared_video_surface = None;
+                self.discard_candidate_fallback(signature);
+                self.sync_overlay_video_scale_state();
+                Err(error)
+            }
+        }
+    }
+
+    fn prepare_video_scale_resources(
+        &mut self,
+        mut signature: VideoScalePreparationSignature,
+        decision_fallback: Option<VideoScaleFallbackReason>,
+    ) -> Result<VideoScalePreparationSignature, String> {
+        let smoothing_percent = signature.smoothing_percent;
+        if let Some(reason) = decision_fallback {
+            let (requested_width, requested_height) = match &reason {
+                VideoScaleFallbackReason::DisplaySizeLimitExceeded {
+                    requested_width,
+                    requested_height,
+                    ..
+                } => (*requested_width, *requested_height),
+                _ => (signature.target_width, signature.target_height),
+            };
+            self.record_scale_fallback(
+                Self::video_scale_request_key(signature, requested_width, requested_height),
+                reason,
+            );
+        } else if signature.target_content == VideoSurfaceContent::DisplayResolved {
+            let key = Self::video_scale_request_key(
+                signature,
+                signature.target_width,
+                signature.target_height,
+            );
+            if let Err(reason) = self.prepare_display_resources(
+                signature.source_width,
+                signature.source_height,
+                signature.target_width,
+                signature.target_height,
+                signature.orientation,
+                signature.grade_active,
+                signature.filter,
+                smoothing_percent,
+                signature.anime4k_variant,
+            ) {
+                self.record_scale_fallback(key.clone(), reason);
+                signature.target_width = signature.source_width;
+                signature.target_height = signature.source_height;
+                signature.target_content = VideoSurfaceContent::LegacySource;
+            }
+        }
+
+        if signature.target_content == VideoSurfaceContent::DisplayResolved {
+            let key = Self::video_scale_request_key(
+                signature,
+                signature.target_width,
+                signature.target_height,
+            );
+            if let Err(error) = self.prepare_scale_target_surface(
+                signature.target_width,
+                signature.target_height,
+                signature.target_content,
+            ) {
+                match error {
+                    VideoSurfaceSwapError::DisplayCreation(reason) => {
+                        self.record_scale_fallback(key, reason);
+                        signature.target_width = signature.source_width;
+                        signature.target_height = signature.source_height;
+                        signature.target_content = VideoSurfaceContent::LegacySource;
+                    }
+                    VideoSurfaceSwapError::Other(error) => return Err(error),
+                }
+            } else if self
+                .active_scale_fallback
+                .as_ref()
+                .is_some_and(|fallback| fallback.key == key)
+            {
+                // An explicit preparation is also the retry boundary for a
+                // transient allocation failure. Do not let the old typed
+                // fallback mask resources that are now fully ready.
+                self.active_scale_fallback = None;
+            }
+        }
+
+        if signature.target_content == VideoSurfaceContent::LegacySource {
+            self.prepare_scale_target_surface(
+                signature.target_width,
+                signature.target_height,
+                signature.target_content,
+            )
+            .map_err(VideoSurfaceSwapError::into_string)?;
+        }
+
+        Ok(signature)
+    }
+
+    fn video_scale_preparation_plan(
+        &self,
+        frame: &VideoFrame,
+        filter: VideoScaleFilter,
+        smoothing_percent: u32,
+        anime4k_variant: Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
+        now: Instant,
+    ) -> (
+        VideoScalePreparationSignature,
+        Option<VideoScaleFallbackReason>,
+    ) {
+        let source_width = frame.width.max(1);
+        let source_height = frame.height.max(1);
+        let sar_num = frame.sar_num.max(1);
+        let sar_den = frame.sar_den.max(1);
+        let decision = decide_video_surface_size(VideoSurfaceSizeInput {
+            filter,
+            source_width,
+            source_height,
+            sar_num,
+            sar_den,
+            orientation: frame.orientation,
+            viewport_width: self.width,
+            viewport_height: self.height,
+            layout: self.video_visual_layout(),
+            resizing: self.resize_settle.is_resizing(now),
+            current_surface_width: self.surface_width,
+            current_surface_height: self.surface_height,
+            current_surface_is_display_resolved: matches!(
+                self.surface_content,
+                VideoSurfaceContent::DisplayResolved
+            ),
+        });
+        let (target_width, target_height, target_content, fallback) = match decision {
+            VideoSurfaceSizeDecision::DisplayResolution { width, height } => {
+                (width, height, VideoSurfaceContent::DisplayResolved, None)
+            }
+            VideoSurfaceSizeDecision::FallbackToLegacy {
+                width,
+                height,
+                reason,
+            } => (
+                width,
+                height,
+                VideoSurfaceContent::LegacySource,
+                Some(reason),
+            ),
+            VideoSurfaceSizeDecision::LegacySource { width, height } => {
+                (width, height, VideoSurfaceContent::LegacySource, None)
+            }
+            VideoSurfaceSizeDecision::KeepCurrentDuringResize { width, height } => {
+                (width, height, self.surface_content, None)
+            }
+        };
+        (
+            VideoScalePreparationSignature {
+                source_width,
+                source_height,
+                sar_num,
+                sar_den,
+                orientation: frame.orientation,
+                target_width,
+                target_height,
+                target_content,
+                grade_active: !self.video_grade.adjustments.is_identity(),
+                filter,
+                smoothing_percent: crate::settings::sanitize_downscale_smoothing_percent(
+                    smoothing_percent,
+                ),
+                anime4k_variant,
+            },
+            fallback,
+        )
+    }
+
+    fn current_video_scale_preparation_signature(
+        &self,
+        frame: &VideoFrame,
+        filter: VideoScaleFilter,
+        smoothing_percent: u32,
+        anime4k_variant: Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
+    ) -> VideoScalePreparationSignature {
+        let (mut signature, _) = self.video_scale_preparation_plan(
+            frame,
+            filter,
+            smoothing_percent,
+            anime4k_variant,
+            Instant::now(),
+        );
+        if signature.target_content == VideoSurfaceContent::DisplayResolved {
+            let key = Self::video_scale_request_key(
+                signature,
+                signature.target_width,
+                signature.target_height,
+            );
+            if self
+                .active_scale_fallback
+                .as_ref()
+                .is_some_and(|fallback| fallback.key == key)
+            {
+                signature.target_width = signature.source_width;
+                signature.target_height = signature.source_height;
+                signature.target_content = VideoSurfaceContent::LegacySource;
+            }
+        }
+        signature
+    }
+
+    fn video_scale_request_key(
+        signature: VideoScalePreparationSignature,
+        target_width: u32,
+        target_height: u32,
+    ) -> DisplaySurfaceRequestKey {
+        DisplaySurfaceRequestKey {
+            source_width: signature.source_width,
+            source_height: signature.source_height,
+            target_width,
+            target_height,
+            sar_num: signature.sar_num,
+            sar_den: signature.sar_den,
+            orientation: signature.orientation,
+            grade_active: signature.grade_active,
+            filter: signature.filter,
+            smoothing_percent: signature.smoothing_percent,
+            anime4k_variant: signature.anime4k_variant,
+        }
+    }
+
+    pub(crate) fn present_prepared_video_scale_settings(
+        &mut self,
+        frame: &VideoFrame,
+        sync_interval: u32,
+        identity: crate::video::VideoScaleRequestIdentity,
+        filter: VideoScaleFilter,
+        smoothing_percent: u32,
+        anime4k_variant: Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
+    ) -> Result<NativePresentOutcome, VideoScalePreparedPresentError> {
+        let signature = self.current_video_scale_preparation_signature(
+            frame,
+            filter,
+            smoothing_percent,
+            anime4k_variant,
+        );
+        if let Err(reason) = validate_prepared_video_scale_settings(
+            self.prepared_video_scale_settings,
+            identity,
+            signature,
+        ) {
+            self.discard_prepared_video_scale_settings();
+            return Err(VideoScalePreparedPresentError::Rejected(reason));
+        }
+        self.prepared_video_scale_settings = None;
+        let previous = (
+            self.selected_scale_filter,
+            self.downscale_smoothing_percent,
+            self.selected_anime4k_variant,
+        );
+        self.selected_scale_filter = filter;
+        self.downscale_smoothing_percent =
+            crate::settings::sanitize_downscale_smoothing_percent(smoothing_percent);
+        self.selected_anime4k_variant = anime4k_variant;
+        match self.present(frame, sync_interval) {
+            Ok(outcome) => {
+                self.record_video_scale_settings_selected();
+                Ok(outcome)
+            }
+            Err(error) => {
+                self.selected_scale_filter = previous.0;
+                self.downscale_smoothing_percent = previous.1;
+                self.selected_anime4k_variant = previous.2;
+                self.discard_candidate_fallback(signature);
+                self.sync_overlay_video_scale_state();
+                Err(VideoScalePreparedPresentError::Present(error))
+            }
+        }
+    }
+
+    pub(crate) fn discard_prepared_video_scale_settings(&mut self) {
+        if let Some(prepared) = self.prepared_video_scale_settings.take() {
+            self.discard_candidate_fallback(prepared.signature);
+        }
+        self.prepared_video_surface = None;
+        self.sync_overlay_video_scale_state();
+    }
+
+    fn discard_candidate_fallback(&mut self, signature: VideoScalePreparationSignature) {
+        if self.active_scale_fallback.as_ref().is_some_and(|fallback| {
+            fallback.key.filter == signature.filter
+                && fallback.key.smoothing_percent == signature.smoothing_percent
+                && fallback.key.anime4k_variant == signature.anime4k_variant
+                && (self.selected_scale_filter != signature.filter
+                    || self.downscale_smoothing_percent != signature.smoothing_percent
+                    || self.selected_anime4k_variant != signature.anime4k_variant)
+        }) {
+            self.active_scale_fallback = None;
+        }
+    }
+
+    fn record_video_scale_settings_selected(&mut self) {
+        let filter = self.selected_scale_filter;
+        let anime4k_variant = self.selected_anime4k_variant;
+        crate::logger::log(format!(
+            "native-presenter: video scale filter selected={} ({}) smoothing_percent={} anime4k_variant={}",
+            filter.perf_name(),
+            filter.label(),
+            self.downscale_smoothing_percent,
+            anime4k_variant
+                .map(|variant| variant.label())
+                .unwrap_or("none")
+        ));
+        log_event(
+            "video_scale_filter_selected",
+            &[
+                ("scale_filter", Value::from(filter.perf_name())),
+                ("label", Value::from(filter.label())),
+                (
+                    "downscale_smoothing_percent",
+                    Value::from(self.downscale_smoothing_percent as i64),
+                ),
+                (
+                    "anime4k_variant",
+                    Value::from(
+                        anime4k_variant
+                            .map(|variant| variant.label())
+                            .unwrap_or("none"),
+                    ),
+                ),
+            ],
+        );
+        self.sync_overlay_video_scale_state();
+    }
+
+    pub(crate) fn video_scale_fallback_notice(&self) -> Option<VideoScaleFallbackNotice> {
+        if let Some(fallback) = self.active_scale_fallback.as_ref().filter(|fallback| {
+            fallback.key.filter == self.selected_scale_filter
+                && fallback.key.smoothing_percent == self.downscale_smoothing_percent
+                && fallback.key.anime4k_variant == self.selected_anime4k_variant
+        }) {
+            return Some(match &fallback.reason {
+                VideoScaleFallbackReason::DisplaySizeLimitExceeded {
+                    requested_width,
+                    requested_height,
+                    max_dimension,
+                    max_pixels,
+                } => VideoScaleFallbackNotice::DisplaySizeLimitExceeded {
+                    requested_width: *requested_width,
+                    requested_height: *requested_height,
+                    max_dimension: *max_dimension,
+                    max_pixels: *max_pixels,
+                },
+                _ => VideoScaleFallbackNotice::Other,
+            });
+        }
+        if self.selected_scale_filter != VideoScaleFilter::Anime
+            || self.selected_anime4k_variant.is_some()
+        {
+            return None;
+        }
+        Some(VideoScaleFallbackNotice::Anime4kStandard(
+            match self.anime4k_status {
+                NativeVideoAnime4kStatus::Waiting => VideoAnime4kFallbackNotice::Waiting,
+                NativeVideoAnime4kStatus::Measuring { .. } => VideoAnime4kFallbackNotice::Measuring,
+                NativeVideoAnime4kStatus::Fallback(reason) => {
+                    VideoAnime4kFallbackNotice::Fallback(reason)
+                }
+                NativeVideoAnime4kStatus::Failed => VideoAnime4kFallbackNotice::Failed,
+                NativeVideoAnime4kStatus::Active { .. } => return None,
+            },
+        ))
+    }
+    fn sync_overlay_video_scale_state(&mut self) {
+        let outside_note = self.active_scale_fallback.as_ref().and_then(|fallback| {
+            if fallback.key.filter != self.selected_scale_filter
+                || fallback.key.smoothing_percent != self.downscale_smoothing_percent
+                || fallback.key.anime4k_variant != self.selected_anime4k_variant
+            {
+                return None;
+            }
+            let VideoScaleFallbackReason::DisplaySizeLimitExceeded {
+                max_dimension,
+                max_pixels,
+                ..
+            } = &fallback.reason
+            else {
+                return None;
+            };
+            Some(crate::ui_helpers::processing_size_outside_note_for(
+                "動画",
+                &format!(
+                    "長辺 {}px 以下・総画素数 {}px 以下",
+                    max_dimension, max_pixels
+                ),
+            ))
+        });
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_video_scale_state(
+                self.selected_scale_filter,
+                self.downscale_smoothing_percent,
+                outside_note,
+            );
+            overlay.set_video_anime4k_state(self.anime4k_budget, self.anime4k_status.clone());
+        }
+    }
+
+    pub fn set_overlay_video_anime4k_state(
+        &mut self,
+        budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset,
+        status: NativeVideoAnime4kStatus,
+    ) {
+        self.anime4k_budget = budget;
+        self.anime4k_status = status;
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_video_anime4k_state(budget, self.anime4k_status.clone());
+        }
+    }
+
+    pub fn reset_anime4k_for_source_change(&mut self) {
+        if self.selected_scale_filter != VideoScaleFilter::Anime {
+            return;
+        }
+        self.selected_anime4k_variant = None;
+        self.anime4k_status = NativeVideoAnime4kStatus::Waiting;
+        self.prepared_video_scale_settings = None;
+        self.sync_overlay_video_scale_state();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn present_for_surface(
+        &mut self,
+        frame: &VideoFrame,
+        sync_interval: u32,
+        width: u32,
+        height: u32,
+        content: VideoSurfaceContent,
+        new_sar_num: u32,
+        new_sar_den: u32,
+        new_orientation: VideoOrientation,
+    ) -> Result<NativePresentOutcome, String> {
+        self.present_for_surface_typed(
+            frame,
+            sync_interval,
+            width,
+            height,
+            content,
+            new_sar_num,
+            new_sar_den,
+            new_orientation,
+        )
+        .map_err(VideoSurfaceSwapError::into_string)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn present_for_surface_typed(
+        &mut self,
+        frame: &VideoFrame,
+        sync_interval: u32,
+        width: u32,
+        height: u32,
+        content: VideoSurfaceContent,
+        new_sar_num: u32,
+        new_sar_den: u32,
+        new_orientation: VideoOrientation,
+    ) -> Result<NativePresentOutcome, VideoSurfaceSwapError> {
+        let surface_changed = self.surface_width != width
+            || self.surface_height != height
+            || self.surface_content != content;
+        if surface_changed {
             self.present_with_surface_swap(
                 frame,
                 sync_interval,
-                new_w,
-                new_h,
+                width,
+                height,
+                content,
                 new_sar_num,
                 new_sar_den,
                 new_orientation,
             )
         } else {
-            // 解像度は不変。既存 swap chain をそのまま再利用する。
             self.present_reusing_surface(
                 frame,
                 sync_interval,
@@ -2147,7 +3281,164 @@ impl NativeRenderCore {
                 new_sar_den,
                 new_orientation,
             )
+            .map_err(VideoSurfaceSwapError::Other)
         }
+    }
+
+    fn resample_mode(
+        &self,
+        source_width: u32,
+        source_height: u32,
+        target_width: u32,
+        target_height: u32,
+        orientation: VideoOrientation,
+    ) -> Option<VideoResampleMode> {
+        let (source_axis_width, source_axis_height) = if orientation.swaps_axes() {
+            (source_height, source_width)
+        } else {
+            (source_width, source_height)
+        };
+        select_video_resample_mode(
+            self.selected_scale_filter,
+            source_axis_width,
+            source_axis_height,
+            target_width,
+            target_height,
+            self.downscale_smoothing_percent,
+            self.selected_anime4k_variant,
+        )
+    }
+
+    fn prepare_display_resources(
+        &mut self,
+        source_width: u32,
+        source_height: u32,
+        target_width: u32,
+        target_height: u32,
+        orientation: VideoOrientation,
+        grade_active: bool,
+        filter: VideoScaleFilter,
+        smoothing_percent: u32,
+        anime4k_variant: Option<crate::video::anime4k_policy::VideoAnime4kVariant>,
+    ) -> Result<(), VideoScaleFallbackReason> {
+        let (source_axis_width, source_axis_height) = if orientation.swaps_axes() {
+            (source_height, source_width)
+        } else {
+            (source_width, source_height)
+        };
+        let mode = select_video_resample_mode(
+            filter,
+            source_axis_width,
+            source_axis_height,
+            target_width,
+            target_height,
+            smoothing_percent,
+            anime4k_variant,
+        )
+        .expect("display-resolution surface always has a resample owner");
+        let Some(pipeline) = self.resample_pipeline.as_mut() else {
+            return Err(VideoScaleFallbackReason::ResamplePipelineUnavailable {
+                error: self
+                    .resample_pipeline_error
+                    .clone()
+                    .unwrap_or_else(|| "pipeline was not created".to_string()),
+            });
+        };
+        let (intermediate_width, intermediate_height) =
+            VideoResamplePipeline::intermediate_dimensions(
+                source_width,
+                source_height,
+                target_width,
+                orientation,
+            );
+        pipeline
+            .prepare(
+                &self.d3d_device1,
+                source_width,
+                source_height,
+                target_width,
+                orientation,
+                mode,
+            )
+            .map_err(|error| match error {
+                VideoResamplePrepareError::IntermediateCreation(error) => {
+                    VideoScaleFallbackReason::ResampleIntermediateCreationFailed {
+                        width: intermediate_width,
+                        height: intermediate_height,
+                        error,
+                    }
+                }
+                VideoResamplePrepareError::Anime4kPipelineUnavailable { variant, error } => {
+                    VideoScaleFallbackReason::Anime4kPipelineUnavailable {
+                        variant: variant.label(),
+                        error,
+                    }
+                }
+                VideoResamplePrepareError::Anime4kIntermediateCreationFailed {
+                    variant,
+                    pass_index,
+                    width,
+                    height,
+                    error,
+                } => VideoScaleFallbackReason::Anime4kIntermediateCreationFailed {
+                    variant: variant.label(),
+                    pass_index,
+                    width,
+                    height,
+                    error,
+                },
+            })?;
+        if grade_active {
+            self.grade_pipeline
+                .prepare_intermediate(&self.d3d_device1, source_width, source_height)
+                .map_err(
+                    |error| VideoScaleFallbackReason::GradeIntermediateCreationFailed {
+                        width: source_width,
+                        height: source_height,
+                        error,
+                    },
+                )?;
+        }
+        Ok(())
+    }
+
+    fn record_scale_fallback(
+        &mut self,
+        key: DisplaySurfaceRequestKey,
+        reason: VideoScaleFallbackReason,
+    ) {
+        if self
+            .active_scale_fallback
+            .as_ref()
+            .is_some_and(|active| active.key == key && active.reason == reason)
+        {
+            return;
+        }
+        self.scale_fallback_count = self.scale_fallback_count.saturating_add(1);
+        crate::logger::log(format!(
+            "native-presenter: video scale fallback filter={} reason={} count={} {}",
+            key.filter.perf_name(),
+            reason.code(),
+            self.scale_fallback_count,
+            reason.detail()
+        ));
+        log_event(
+            "video_scale_fallback",
+            &[
+                ("scale_filter", Value::from(key.filter.perf_name())),
+                ("reason", Value::from(reason.code())),
+                ("reason_detail", Value::from(reason.detail())),
+                (
+                    "fallback_count",
+                    Value::from(self.scale_fallback_count as i64),
+                ),
+                ("source_width", Value::from(key.source_width as i64)),
+                ("source_height", Value::from(key.source_height as i64)),
+                ("target_width", Value::from(key.target_width as i64)),
+                ("target_height", Value::from(key.target_height as i64)),
+            ],
+        );
+        self.active_scale_fallback = Some(ActiveVideoScaleFallback { key, reason });
     }
 
     /// 解像度不変時の present。既存の `swap_chain` / `backbuffer` をそのまま使う。
@@ -2183,7 +3474,13 @@ impl NativeRenderCore {
             .backbuffer
             .clone()
             .ok_or_else(|| "native presenter backbuffer is not initialized".to_string())?;
-        let copy = self.copy_frame_into_backbuffer(frame, &backbuffer)?;
+        let copy = self.copy_frame_into_backbuffer(
+            frame,
+            &backbuffer,
+            self.surface_content,
+            self.surface_width,
+            self.surface_height,
+        )?;
         let copy_ms = copy_t0.elapsed().as_secs_f64() * 1000.0;
 
         let present_t0 = Instant::now();
@@ -2233,24 +3530,128 @@ impl NativeRenderCore {
     ///
     /// 旧 swap chain は `WaitForCommitCompletion` 後も即 drop せず `retired_video_surfaces`
     /// に数世代分残す (DComp/DWM がまだ旧 content を参照しうるため。Codex 助言)。
+    fn prepare_scale_target_surface(
+        &mut self,
+        width: u32,
+        height: u32,
+        content: VideoSurfaceContent,
+    ) -> Result<(), VideoSurfaceSwapError> {
+        if self.surface_width == width
+            && self.surface_height == height
+            && self.surface_content == content
+        {
+            self.prepared_video_surface = None;
+            return Ok(());
+        }
+        if self
+            .prepared_video_surface
+            .as_ref()
+            .is_some_and(|surface| surface.matches(width, height, content))
+        {
+            return Ok(());
+        }
+        self.prepared_video_surface =
+            Some(self.create_prepared_video_surface(width, height, content)?);
+        Ok(())
+    }
+
+    fn create_prepared_video_surface(
+        &self,
+        width: u32,
+        height: u32,
+        content: VideoSurfaceContent,
+    ) -> Result<PreparedVideoSurface, VideoSurfaceSwapError> {
+        let (swap_chain, waitable) =
+            self.create_video_swap_chain(width, height)
+                .map_err(|error| {
+                    if content == VideoSurfaceContent::DisplayResolved {
+                        VideoSurfaceSwapError::DisplayCreation(
+                            VideoScaleFallbackReason::DisplaySwapChainCreationFailed {
+                                width,
+                                height,
+                                error,
+                            },
+                        )
+                    } else {
+                        VideoSurfaceSwapError::Other(error)
+                    }
+                })?;
+        let mut surface = PreparedVideoSurface {
+            width,
+            height,
+            content,
+            swap_chain: Some(swap_chain),
+            waitable,
+            backbuffer: None,
+        };
+        let backbuffer = self
+            .create_swap_chain_backbuffer(
+                surface
+                    .swap_chain
+                    .as_ref()
+                    .expect("prepared video surface swap chain"),
+            )
+            .map_err(|error| {
+                if content == VideoSurfaceContent::DisplayResolved {
+                    VideoSurfaceSwapError::DisplayCreation(
+                        VideoScaleFallbackReason::DisplayBackbufferCreationFailed {
+                            width,
+                            height,
+                            error,
+                        },
+                    )
+                } else {
+                    VideoSurfaceSwapError::Other(error)
+                }
+            })?;
+        surface.backbuffer = Some(backbuffer);
+        Ok(surface)
+    }
+
+    fn take_or_create_video_surface(
+        &mut self,
+        width: u32,
+        height: u32,
+        content: VideoSurfaceContent,
+    ) -> Result<PreparedVideoSurface, VideoSurfaceSwapError> {
+        if self
+            .prepared_video_surface
+            .as_ref()
+            .is_some_and(|surface| surface.matches(width, height, content))
+        {
+            return Ok(self
+                .prepared_video_surface
+                .take()
+                .expect("matching prepared video surface"));
+        }
+        self.prepared_video_surface = None;
+        self.create_prepared_video_surface(width, height, content)
+    }
+
     fn present_with_surface_swap(
         &mut self,
         frame: &VideoFrame,
         sync_interval: u32,
         new_w: u32,
         new_h: u32,
+        new_content: VideoSurfaceContent,
         new_sar_num: u32,
         new_sar_den: u32,
         new_orientation: VideoOrientation,
-    ) -> Result<NativePresentOutcome, String> {
+    ) -> Result<NativePresentOutcome, VideoSurfaceSwapError> {
         let geom_t0 = Instant::now();
-        // 1. 新 swap chain + backbuffer を用意する。ここでは visual には繋がない。
-        let (new_swap_chain, new_waitable) = self.create_video_swap_chain(new_w, new_h)?;
-        // new_waitable は windows-rs HANDLE (Copy / Drop なし)。下の複数の `?` 早期
-        // return で取り落とすと frame-latency waitable HANDLE が leak する (アダプタ
-        // メモリ圧迫下の fast-swap で Present/Commit が一時失敗すると 1 個ずつ蓄積)。
-        // self.waitable へ移す手順 6 まで Drop で CloseHandle する guard で包む
-        // (v1.0.0 安定性レビュー P3-6)。
+        // 1. A filter switch consumes the unattached surface created by its
+        // prepare command. Other lifecycle swaps use the same constructor here.
+        let mut new_surface = self.take_or_create_video_surface(new_w, new_h, new_content)?;
+        let new_swap_chain = new_surface
+            .swap_chain
+            .take()
+            .expect("prepared video surface swap chain");
+        let new_backbuffer = new_surface
+            .backbuffer
+            .take()
+            .expect("prepared video surface backbuffer");
+
         struct WaitableGuard(HANDLE);
         impl Drop for WaitableGuard {
             fn drop(&mut self) {
@@ -2261,12 +3662,14 @@ impl NativeRenderCore {
                 }
             }
         }
-        let mut new_waitable_guard = WaitableGuard(new_waitable);
-        let new_backbuffer = self.create_swap_chain_backbuffer(&new_swap_chain)?;
-
+        let mut new_waitable_guard = WaitableGuard(std::mem::replace(
+            &mut new_surface.waitable,
+            HANDLE::default(),
+        ));
         // 2. 最初のフレームを新 backbuffer へコピーする。
         let copy_t0 = Instant::now();
-        let copy = self.copy_frame_into_backbuffer(frame, &new_backbuffer)?;
+        let copy =
+            self.copy_frame_into_backbuffer(frame, &new_backbuffer, new_content, new_w, new_h)?;
         let copy_ms = copy_t0.elapsed().as_secs_f64() * 1000.0;
 
         // 3. 新 swap chain を Present (= 新 swap chain は「正しいフレーム投入済み」状態)。
@@ -2291,14 +3694,16 @@ impl NativeRenderCore {
         //    「`surface_*` だけ新サイズに進み swap_chain は旧のまま」という不整合に陥り、
         //    次回以降の `present` が `present_reusing_surface` 経路へ誤って入って固着する
         //    (Codex P2)。`self.*` の更新は Commit 成功後 (手順 6) に一括で行う。
+        let (transform_sar_num, transform_sar_den, transform_orientation) =
+            transform_geometry_for_surface(new_content, new_sar_num, new_sar_den, new_orientation);
         let (m11, m12, m21, m22, offset_x, offset_y) = compute_video_visual_transform(
             new_w,
             new_h,
             self.width,
             self.height,
-            new_sar_num,
-            new_sar_den,
-            new_orientation,
+            transform_sar_num,
+            transform_sar_den,
+            transform_orientation,
             self.video_visual_layout(),
         );
         let transform = Matrix3x2 {
@@ -2334,6 +3739,8 @@ impl NativeRenderCore {
         self.orientation = new_orientation;
         self.surface_width = new_w;
         self.surface_height = new_h;
+        self.surface_content = new_content;
+        self.surface_swap_count = self.surface_swap_count.saturating_add(1);
         let old_swap_chain = std::mem::replace(&mut self.swap_chain, new_swap_chain);
         // guard を disarm して waitable の所有権を self.waitable へ移す (= guard の Drop は
         // 以後 no-op になり、二重 CloseHandle を防ぐ)。
@@ -2351,15 +3758,30 @@ impl NativeRenderCore {
 
         let geom_ms = geom_t0.elapsed().as_secs_f64() * 1000.0;
         crate::logger::log(format!(
-            "native-presenter: video surface swapped to {new_w}x{new_h} sar={}/{} \
-             orientation={:?} geom_ms={geom_ms:.2} commit_sync_ms={commit_sync_ms:.2}",
-            self.sar_num, self.sar_den, self.orientation
+            "native-presenter: video surface swapped to {new_w}x{new_h} content={new_content:?} \
+             sar={}/{} orientation={:?} count={} geom_ms={geom_ms:.2} commit_sync_ms={commit_sync_ms:.2}",
+            self.sar_num, self.sar_den, self.orientation, self.surface_swap_count
         ));
         log_event(
             "video_surface_swap",
             &[
                 ("surface_width", Value::from(new_w as i64)),
                 ("surface_height", Value::from(new_h as i64)),
+                (
+                    "surface_content",
+                    Value::from(match new_content {
+                        VideoSurfaceContent::LegacySource => "legacy_source",
+                        VideoSurfaceContent::DisplayResolved => "display_resolved",
+                    }),
+                ),
+                (
+                    "scale_filter",
+                    Value::from(self.selected_scale_filter.perf_name()),
+                ),
+                (
+                    "surface_swap_count",
+                    Value::from(self.surface_swap_count as i64),
+                ),
                 ("sar_num", Value::from(self.sar_num as i64)),
                 ("sar_den", Value::from(self.sar_den as i64)),
                 (
@@ -2375,6 +3797,8 @@ impl NativeRenderCore {
                 ),
             ],
         );
+        let (grade_intermediate_bytes, resample_intermediate_bytes) =
+            self.intermediate_vram_bytes();
         crate::gpu_info::emit_vram_trace(
             "video_surface_swap",
             "after_video_swap_chain_replace",
@@ -2388,6 +3812,14 @@ impl NativeRenderCore {
                 (
                     "shared_texture_cache_len",
                     Value::from(self.shared_texture_cache.len() as i64),
+                ),
+                (
+                    "grade_intermediate_bytes",
+                    Value::from(grade_intermediate_bytes),
+                ),
+                (
+                    "resample_intermediate_bytes",
+                    Value::from(resample_intermediate_bytes),
                 ),
             ],
         );
@@ -2491,6 +3923,9 @@ impl NativeRenderCore {
         &mut self,
         frame: &VideoFrame,
         backbuffer: &ID3D11Texture2D,
+        surface_content: VideoSurfaceContent,
+        target_width: u32,
+        target_height: u32,
     ) -> Result<FrameCopyMetrics, String> {
         let mut metrics = FrameCopyMetrics {
             path: "",
@@ -2507,9 +3942,20 @@ impl NativeRenderCore {
             copy_fence_value: 0,
         };
         let grade_active = !self.video_grade.adjustments.is_identity();
+        let resample_active = surface_content == VideoSurfaceContent::DisplayResolved;
+        let resample_mode = resample_active.then(|| {
+            self.resample_mode(
+                frame.width,
+                frame.height,
+                target_width,
+                target_height,
+                frame.orientation,
+            )
+            .expect("display-resolution surface always has a resample owner")
+        });
         match &frame.data {
             VideoFrameData::Cpu(bytes) => {
-                let probe_this_frame = !grade_active && self.pixel_probe_due();
+                let probe_this_frame = !grade_active && !resample_active && self.pixel_probe_due();
                 let src_probe = if probe_this_frame {
                     Some(sample_cpu_rgba_pixel(
                         bytes,
@@ -2528,18 +3974,49 @@ impl NativeRenderCore {
                 )?;
                 unsafe {
                     let copy_call_t0 = Instant::now();
-                    if grade_active {
-                        let pipeline = self.grade_pipeline.as_mut().ok_or_else(|| {
-                            "video grade is active but shader pipeline is missing".to_string()
-                        })?;
-                        let source = pipeline.upload_cpu_source(
+                    if resample_active {
+                        let source = self.grade_pipeline.upload_cpu_source(
                             &self.d3d_device1,
                             &self.d3d_context,
                             &self.cpu_upload_scratch,
                             frame.width,
                             frame.height,
                         )?;
-                        pipeline.draw(
+                        let source = if grade_active {
+                            self.grade_pipeline.draw_to_intermediate(
+                                &self.d3d_device1,
+                                &self.d3d_context,
+                                &source,
+                                frame.width,
+                                frame.height,
+                            )?
+                        } else {
+                            source
+                        };
+                        self.resample_pipeline
+                            .as_ref()
+                            .ok_or_else(|| "video resample pipeline is missing".to_string())?
+                            .draw(
+                                &self.d3d_device1,
+                                &self.d3d_context,
+                                &source,
+                                backbuffer,
+                                frame.width,
+                                frame.height,
+                                target_width,
+                                target_height,
+                                frame.orientation,
+                                resample_mode.expect("display resample mode"),
+                            )?;
+                    } else if grade_active {
+                        let source = self.grade_pipeline.upload_cpu_source(
+                            &self.d3d_device1,
+                            &self.d3d_context,
+                            &self.cpu_upload_scratch,
+                            frame.width,
+                            frame.height,
+                        )?;
+                        self.grade_pipeline.draw(
                             &self.d3d_device1,
                             &self.d3d_context,
                             &source,
@@ -2578,10 +4055,25 @@ impl NativeRenderCore {
                         }
                     }
                 }
-                metrics.path = if grade_active {
-                    "cpu_upload_grade"
-                } else {
-                    "cpu_upload"
+                metrics.path = match (resample_mode, grade_active) {
+                    (Some(VideoResampleMode::Lanczos3 { .. }), true) => {
+                        "cpu_upload_grade_resample_lanczos3"
+                    }
+                    (Some(VideoResampleMode::Lanczos3 { .. }), false) => {
+                        "cpu_upload_resample_lanczos3"
+                    }
+                    (Some(VideoResampleMode::Nis), true) => "cpu_upload_grade_resample_nis",
+                    (Some(VideoResampleMode::Nis), false) => "cpu_upload_resample_nis",
+                    (Some(VideoResampleMode::Nearest), true) => "cpu_upload_grade_resample_nearest",
+                    (Some(VideoResampleMode::Nearest), false) => "cpu_upload_resample_nearest",
+                    (Some(VideoResampleMode::Anime4k { .. }), true) => {
+                        "cpu_upload_grade_resample_anime4k"
+                    }
+                    (Some(VideoResampleMode::Anime4k { .. }), false) => {
+                        "cpu_upload_resample_anime4k"
+                    }
+                    (None, true) => "cpu_upload_grade",
+                    (None, false) => "cpu_upload",
                 };
             }
             VideoFrameData::Gpu(gpu_frame) => {
@@ -2594,7 +4086,7 @@ impl NativeRenderCore {
                 metrics.shared_handle = gpu_frame.shared_handle.0 as usize as u64;
                 metrics.shared_texture_gen = gpu_frame.shared_texture_gen;
                 metrics.fence_value = gpu_frame.fence_value;
-                let probe_this_frame = !grade_active && self.pixel_probe_due();
+                let probe_this_frame = !grade_active && !resample_active && self.pixel_probe_due();
                 let fence = self.open_fence(gpu_frame.fence_gen, gpu_frame.fence_shared_handle)?;
                 let fence_t0 = Instant::now();
                 {
@@ -2630,11 +4122,35 @@ impl NativeRenderCore {
                 };
                 unsafe {
                     let copy_call_t0 = Instant::now();
-                    if grade_active {
-                        let pipeline = self.grade_pipeline.as_ref().ok_or_else(|| {
-                            "video grade is active but shader pipeline is missing".to_string()
-                        })?;
-                        pipeline.draw(
+                    if resample_active {
+                        let source = if grade_active {
+                            self.grade_pipeline.draw_to_intermediate(
+                                &self.d3d_device1,
+                                &self.d3d_context,
+                                &src,
+                                frame.width,
+                                frame.height,
+                            )?
+                        } else {
+                            src.clone()
+                        };
+                        self.resample_pipeline
+                            .as_ref()
+                            .ok_or_else(|| "video resample pipeline is missing".to_string())?
+                            .draw(
+                                &self.d3d_device1,
+                                &self.d3d_context,
+                                &source,
+                                backbuffer,
+                                frame.width,
+                                frame.height,
+                                target_width,
+                                target_height,
+                                frame.orientation,
+                                resample_mode.expect("display resample mode"),
+                            )?;
+                    } else if grade_active {
+                        self.grade_pipeline.draw(
                             &self.d3d_device1,
                             &self.d3d_context,
                             &src,
@@ -2689,10 +4205,27 @@ impl NativeRenderCore {
                         }
                     }
                 }
-                metrics.path = if grade_active {
-                    "d3d11_shared_grade"
-                } else {
-                    "d3d11_shared"
+                metrics.path = match (resample_mode, grade_active) {
+                    (Some(VideoResampleMode::Lanczos3 { .. }), true) => {
+                        "d3d11_shared_grade_resample_lanczos3"
+                    }
+                    (Some(VideoResampleMode::Lanczos3 { .. }), false) => {
+                        "d3d11_shared_resample_lanczos3"
+                    }
+                    (Some(VideoResampleMode::Nis), true) => "d3d11_shared_grade_resample_nis",
+                    (Some(VideoResampleMode::Nis), false) => "d3d11_shared_resample_nis",
+                    (Some(VideoResampleMode::Nearest), true) => {
+                        "d3d11_shared_grade_resample_nearest"
+                    }
+                    (Some(VideoResampleMode::Nearest), false) => "d3d11_shared_resample_nearest",
+                    (Some(VideoResampleMode::Anime4k { .. }), true) => {
+                        "d3d11_shared_grade_resample_anime4k"
+                    }
+                    (Some(VideoResampleMode::Anime4k { .. }), false) => {
+                        "d3d11_shared_resample_anime4k"
+                    }
+                    (None, true) => "d3d11_shared_grade",
+                    (None, false) => "d3d11_shared",
                 };
                 if let Some(guard) = keyed_mutex_guard {
                     guard.release_to_reader()?;
@@ -2762,6 +4295,16 @@ impl NativeRenderCore {
 
     pub fn surface_size(&self) -> (u32, u32) {
         (self.surface_width, self.surface_height)
+    }
+
+    pub fn intermediate_vram_bytes(&self) -> (u64, u64) {
+        (
+            self.grade_pipeline.intermediate_vram_bytes(),
+            self.resample_pipeline
+                .as_ref()
+                .map(VideoResamplePipeline::intermediate_vram_bytes)
+                .unwrap_or(0),
+        )
     }
 
     /// HUD HWND の `WM_DPICHANGED` を受けて overlay の OS ppp を更新する。
@@ -3120,21 +4663,12 @@ impl NativeRenderCore {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.set_video_grade(&grade);
         }
-        if grade.adjustments.is_identity() {
-            self.video_grade = grade;
-            if let Some(pipeline) = self.grade_pipeline.as_mut() {
-                pipeline.update_grade(&self.d3d_device1, &self.d3d_context, &self.video_grade)?;
-            }
-            return Ok(());
-        }
-        if self.grade_pipeline.is_none() {
-            self.grade_pipeline = Some(VideoGradePipeline::new(&self.d3d_device1)?);
-        }
         self.video_grade = grade;
-        self.grade_pipeline
-            .as_mut()
-            .expect("created above")
-            .update_grade(&self.d3d_device1, &self.d3d_context, &self.video_grade)?;
+        self.grade_pipeline.update_grade(
+            &self.d3d_device1,
+            &self.d3d_context,
+            &self.video_grade,
+        )?;
         Ok(())
     }
 
@@ -3487,14 +5021,20 @@ impl NativeRenderCore {
     /// 前の値)。stale なサイズで transform を計算すると最大化/復元/ドラッグの追従が
     /// 1 ステップ遅れる (2026-05 修正)。
     fn update_video_visual_transform(&self, win_w: u32, win_h: u32) -> Result<(), String> {
+        let (sar_num, sar_den, orientation) = transform_geometry_for_surface(
+            self.surface_content,
+            self.sar_num,
+            self.sar_den,
+            self.orientation,
+        );
         let (m11, m12, m21, m22, offset_x, offset_y) = compute_video_visual_transform(
             self.surface_width,
             self.surface_height,
             win_w,
             win_h,
-            self.sar_num,
-            self.sar_den,
-            self.orientation,
+            sar_num,
+            sar_den,
+            orientation,
             self.video_visual_layout(),
         );
         let transform = Matrix3x2 {
@@ -4058,6 +5598,11 @@ impl NativeEguiOverlay {
             timeline_markers: Vec::new(),
             jump_entries: Vec::new(),
             video_adjustments: crate::creative_lut::VideoAdjustments::default(),
+            video_scale_filter: VideoScaleFilter::OsDefault,
+            video_downscale_smoothing_percent: 0,
+            video_scale_outside_note: None,
+            video_anime4k_budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset::default(),
+            video_anime4k_status: NativeVideoAnime4kStatus::Waiting,
             video_preset_slots: vec![None; 10].into(),
             creative_lut_choices: Arc::from([]),
             video_left_panel_tab: NativeVideoLeftPanelTab::Jump,
@@ -4855,6 +6400,39 @@ impl NativeEguiOverlay {
         self.video_adjustments = grade.adjustments.clone();
         self.video_preset_slots = grade.slots.clone();
         self.creative_lut_choices = grade.choices.clone();
+        self.dirty = true;
+    }
+
+    fn set_video_scale_state(
+        &mut self,
+        filter: VideoScaleFilter,
+        smoothing_percent: u32,
+        outside_note: Option<String>,
+    ) {
+        let smoothing_percent =
+            crate::settings::sanitize_downscale_smoothing_percent(smoothing_percent);
+        if self.video_scale_filter == filter
+            && self.video_downscale_smoothing_percent == smoothing_percent
+            && self.video_scale_outside_note == outside_note
+        {
+            return;
+        }
+        self.video_scale_filter = filter;
+        self.video_downscale_smoothing_percent = smoothing_percent;
+        self.video_scale_outside_note = outside_note;
+        self.dirty = true;
+    }
+
+    fn set_video_anime4k_state(
+        &mut self,
+        budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset,
+        status: NativeVideoAnime4kStatus,
+    ) {
+        if self.video_anime4k_budget == budget && self.video_anime4k_status == status {
+            return;
+        }
+        self.video_anime4k_budget = budget;
+        self.video_anime4k_status = status;
         self.dirty = true;
     }
 
@@ -6280,6 +7858,11 @@ impl NativeEguiOverlay {
         let jump_entries = self.jump_entries.clone();
         let creative_lut_choices = self.creative_lut_choices.clone();
         let mut video_adjustments = self.video_adjustments.clone();
+        let mut video_scale_filter = self.video_scale_filter;
+        let mut video_downscale_smoothing_percent = self.video_downscale_smoothing_percent;
+        let video_scale_outside_note = self.video_scale_outside_note.clone();
+        let mut video_anime4k_budget = self.video_anime4k_budget;
+        let video_anime4k_status = self.video_anime4k_status.clone();
         let video_preset_slots = self.video_preset_slots.clone();
         let mut video_left_panel_tab = self.video_left_panel_tab;
         let mut video_adjustment_tab = self.video_adjustment_tab;
@@ -6730,6 +8313,11 @@ impl NativeEguiOverlay {
                     &mut video_left_panel_tab,
                     &mut video_adjustment_tab,
                     &mut video_adjustments,
+                    &mut video_scale_filter,
+                    &mut video_downscale_smoothing_percent,
+                    video_scale_outside_note.as_deref(),
+                    &mut video_anime4k_budget,
+                    &video_anime4k_status,
                     &video_preset_slots,
                     &creative_lut_choices,
                     &mut commands,
@@ -8219,6 +9807,9 @@ impl NativeEguiOverlay {
         self.video_left_panel_tab = video_left_panel_tab;
         self.video_adjustment_tab = video_adjustment_tab;
         self.video_adjustments = video_adjustments;
+        self.video_scale_filter = video_scale_filter;
+        self.video_downscale_smoothing_percent = video_downscale_smoothing_percent;
+        self.video_anime4k_budget = video_anime4k_budget;
         self.shortcut_help_open = shortcut_help_open;
         if let Some(intent) = self.maybe_claim_text_input_focus() {
             window_intents.push(intent);
@@ -8731,21 +10322,36 @@ fn log_event(kind: &str, fields: &[(&str, Value)]) {
     crate::perf::event("native_presenter", kind, None, 0, fields);
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct VideoVisualTargetRect {
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+fn transform_geometry_for_surface(
+    content: VideoSurfaceContent,
+    sar_num: u32,
+    sar_den: u32,
+    orientation: VideoOrientation,
+) -> (u32, u32, VideoOrientation) {
+    match content {
+        VideoSurfaceContent::LegacySource => (sar_num, sar_den, orientation),
+        // The resample output already materializes SAR and orientation into the
+        // physical display rectangle. Reapplying either in DComp would distort
+        // or rotate the resolved pixels a second time.
+        VideoSurfaceContent::DisplayResolved => (1, 1, VideoOrientation::IDENTITY),
+    }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct VideoVisualLayout {
-    compact: bool,
-    pixels_per_point: f32,
-    top_bar_locked: bool,
-    seek_bar_locked: bool,
-    fixed_bar_gap_px: u32,
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct VideoVisualTargetRect {
+    pub(super) x: f32,
+    pub(super) y: f32,
+    pub(super) width: f32,
+    pub(super) height: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct VideoVisualLayout {
+    pub(super) compact: bool,
+    pub(super) pixels_per_point: f32,
+    pub(super) top_bar_locked: bool,
+    pub(super) seek_bar_locked: bool,
+    pub(super) fixed_bar_gap_px: u32,
 }
 
 impl From<bool> for VideoVisualLayout {
@@ -8760,7 +10366,7 @@ impl From<bool> for VideoVisualLayout {
     }
 }
 
-fn compute_video_visual_target_rect(
+pub(super) fn compute_video_visual_target_rect(
     win_w: u32,
     win_h: u32,
     layout: VideoVisualLayout,
@@ -8808,7 +10414,8 @@ fn compute_video_visual_target_rect(
 
 /// 動画 visual の DirectComposition transform 行列を SAR + display matrix 込みで計算する。
 ///
-/// `surface_w/h` は decoded frame の raw pixel サイズ (= swap chain backbuffer)。
+/// `surface_w/h` は現在の swap chain backbuffer サイズ。source-resolution surface なら
+/// decoded frame の raw pixel サイズ、display-resolution surface なら表示矩形の物理 px。
 /// `win_w/h` はウィンドウサイズ。SAR は raw X 軸へ、orientation はその後の表示軸へ
 /// 適用する。固定バーの領域を上下から除外した後、`compact` なら残った領域の
 /// 右上 1/4 へさらに絞り込む。
@@ -8986,16 +10593,17 @@ mod tests {
     use super::{
         HUD_BOTTOM_HEIGHT, HUD_TOP_HEIGHT, NativeBarVisibilitySnapshot, NativeEguiOverlay,
         NativeJumpPanelVisibilityInputs, NativeOverlayInputRouting, NativePixelSample,
-        NativeRightPanelVisibilityInputs, NativeTouchPanelHandleInputs, VideoOrientation,
-        VideoVisualLayout, VideoVisualTargetRect, compare_pixel_probe,
-        compute_video_visual_target_rect, compute_video_visual_transform, configure_overlay_style,
-        copy_cpu_rgba_to_swapchain_bgra, cursor_move_is_activity,
-        effective_overlay_pixels_per_point, egui_key_from_virtual_key, metadata_clean_text,
-        native_jump_panel_visible_from_inputs, native_panel_callout_hud_rects,
+        NativeRightPanelVisibilityInputs, NativeTouchPanelHandleInputs, PreparedVideoScaleSettings,
+        VideoOrientation, VideoScalePreparationSignature, VideoSurfaceContent, VideoVisualLayout,
+        VideoVisualTargetRect, compare_pixel_probe, compute_video_visual_target_rect,
+        compute_video_visual_transform, configure_overlay_style, copy_cpu_rgba_to_swapchain_bgra,
+        cursor_move_is_activity, effective_overlay_pixels_per_point, egui_key_from_virtual_key,
+        metadata_clean_text, native_jump_panel_visible_from_inputs, native_panel_callout_hud_rects,
         native_right_panel_visible_from_inputs, native_touch_owned_panel_sides,
         native_touch_panel_handle_hud_rects,
         native_touch_panel_tap_command_dismisses_before_dispatch,
         native_video_fullscreen_shortcut_key, sample_cpu_rgba_pixel, should_claim_text_input_focus,
+        validate_prepared_video_scale_settings, video_scale_signature_changed_fields,
     };
     use crate::settings::FsSidePanelMode;
     use crate::video::native_presenter::overlay_draw::{
@@ -9008,6 +10616,82 @@ mod tests {
         NativeVideoMouseEvent, NativeVideoMouseWheelEvent, NativeVideoWindowEvent,
     };
 
+    #[test]
+    fn first_present_transition_does_not_invalidate_the_prepared_scale_signature() {
+        let signature = VideoScalePreparationSignature {
+            source_width: 1920,
+            source_height: 1080,
+            sar_num: 1,
+            sar_den: 1,
+            orientation: VideoOrientation::IDENTITY,
+            target_width: 3840,
+            target_height: 2160,
+            target_content: VideoSurfaceContent::DisplayResolved,
+            grade_active: false,
+            filter: crate::settings::VideoScaleFilter::Sharp,
+            smoothing_percent: 30,
+            anime4k_variant: None,
+        };
+        let identity = crate::video::VideoScaleRequestIdentity {
+            source_epoch: 11,
+            revision: 7,
+        };
+        let prepared = Some(PreparedVideoScaleSettings {
+            identity,
+            signature,
+        });
+        assert_eq!(
+            validate_prepared_video_scale_settings(prepared, identity, signature),
+            Ok(())
+        );
+        // The first present changes current_surface from LegacySource to
+        // DisplayResolved. Transition state is intentionally absent here, so
+        // that mutation cannot invalidate an otherwise identical resource key.
+        assert!(video_scale_signature_changed_fields(signature, signature).is_empty());
+
+        let changed_geometry = VideoScalePreparationSignature {
+            target_width: 2560,
+            target_height: 1440,
+            ..signature
+        };
+        assert_eq!(
+            validate_prepared_video_scale_settings(prepared, identity, changed_geometry),
+            Err(
+                crate::video::VideoScaleApplyRejectReason::SignatureChanged {
+                    fields: vec!["target_width", "target_height"],
+                }
+            )
+        );
+
+        assert_eq!(
+            validate_prepared_video_scale_settings(
+                prepared,
+                crate::video::VideoScaleRequestIdentity {
+                    source_epoch: 12,
+                    revision: 7,
+                },
+                signature,
+            ),
+            Err(crate::video::VideoScaleApplyRejectReason::SourceChanged {
+                prepared_source_epoch: 11,
+                current_source_epoch: 12,
+            })
+        );
+        assert_eq!(
+            validate_prepared_video_scale_settings(
+                prepared,
+                crate::video::VideoScaleRequestIdentity {
+                    source_epoch: 11,
+                    revision: 8,
+                },
+                signature,
+            ),
+            Err(crate::video::VideoScaleApplyRejectReason::RequestMismatch {
+                prepared_revision: 7,
+                current_revision: 8,
+            })
+        );
+    }
     fn key(virtual_key: u32) -> NativeVideoKeyEvent {
         NativeVideoKeyEvent {
             virtual_key,
@@ -9892,6 +11576,35 @@ mod tests {
         assert!((m11 - 2.0).abs() < 1e-6, "1920->3840 should be 2x");
         assert!(ox.abs() < 1e-3, "centered horizontally");
         assert!(oy.abs() < 1e-3, "centered vertically");
+    }
+
+    #[test]
+    fn compute_video_visual_transform_display_resolution_surface_is_position_only() {
+        // The shader has already resolved the frame to the 1600x900 physical
+        // display rectangle above the locked top bar. DComp only positions that
+        // surface inside the same reserved target rect used by surface policy.
+        let (m11, m12, m21, m22, ox, oy) = compute_video_visual_transform(
+            1600,
+            900,
+            1600,
+            900 + HUD_TOP_HEIGHT as u32,
+            1,
+            1,
+            VideoOrientation::IDENTITY,
+            VideoVisualLayout {
+                compact: false,
+                pixels_per_point: 1.0,
+                top_bar_locked: true,
+                seek_bar_locked: false,
+                fixed_bar_gap_px: 0,
+            },
+        );
+        assert!((m11 - 1.0).abs() < f32::EPSILON);
+        assert!((m22 - 1.0).abs() < f32::EPSILON);
+        assert_eq!(m12, 0.0);
+        assert_eq!(m21, 0.0);
+        assert_eq!(ox, 0.0);
+        assert_eq!(oy, HUD_TOP_HEIGHT);
     }
 
     /// orientation=0 は回転対応前の SAR transform と完全に同じ値を返す。

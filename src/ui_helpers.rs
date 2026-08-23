@@ -233,7 +233,11 @@ pub(crate) fn bucket_shape_fit_failed_message(
 }
 
 pub(crate) fn processing_size_outside_note(bound: &str) -> String {
-    format!("（この画像は処理対象サイズ {bound}の範囲外なので実行されません）")
+    processing_size_outside_note_for("画像", bound)
+}
+
+pub(crate) fn processing_size_outside_note_for(subject: &str, bound: &str) -> String {
+    format!("（この{subject}は処理対象サイズ {bound}の範囲外なので実行されません）")
 }
 
 pub(crate) fn processing_size_disabled_toast_line(

@@ -45,6 +45,66 @@ NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終�
   decoder thread → video_tx → native-video-render が pull → 自前 swap chain に present
 ```
 
+### Native presenter の表示解像度 scaling
+
+`Settings::video_scale_filter` の `OS に任せる` は、従来どおり source 解像度の video swap
+chain を DComp transform で拡大・縮小する。shader を使う 4 方式は映像表示矩形の物理 pixel 寸法で
+swap chain を持ち、SAR / orientation を含めて source から表示寸法へ resolve する。この場合の
+video visual transform は等倍 + 中央寄せだけになる。
+
+```
+decoder の BGRA frame
+  ├─ 補正なし ─────────────────────────────┐
+  └─ 色調 / Creative LUT → source 解像度 RT ┤
+                                               ├─ 物理 1:1 → 既存 direct copy
+                                               └─ 表示寸法へ resolve
+                                                   ├─ 標準: Lanczos3
+                                                   ├─ シャープ: 拡大 NIS / 縮小 Lanczos3
+                                                   ├─ ニアレスト: 拡大 nearest / 縮小 Lanczos3
+                                                   └─ アニメ塗り: 拡大 Anime4K / 縮小 Lanczos3
+```
+
+grade の identity path は source texture を resolve へ直接渡すので余分な copy を増やさない。
+縮小 Lanczos3 のなめらかさは静止画設定と分け、動画専用値を使う。Phase A の shader は render
+pipeline 作成時にすべて compile する。設定変更は renderer の `PresenterSourceState` が
+`SourceVideoScaleState` (`Idle / AwaitingFrame / Preparing / Prepared`) として最新1件を所有する。
+identity は `(source_epoch, request revision)` で、frame が無ければ保持し、表示可能になった時点の
+source geometry と target 寸法で resource を準備する。準備、選択の適用、その frame の present は
+同じ render-thread unit で行い、成功後にだけ `VideoScaleSettingsCommitted` を App へ送る。App は
+その通知で永続化とキー toast を行う。一時停止中は保持中の Visible frame を同じ経路で1回再提示する。
+hidden presenter は present せず desired state を保持し、再表示時の held frame に適用する。
+
+prepared signature は source epoch / request revision、source frame geometry、導出済み target 寸法と
+content、filter、縮小なめらかさ、Anime4K variant、grade の resource 条件だけを比較する。適用自身が
+変える `current_surface_*` と resize 遷移状態は比較しない。geometry event は prepared resource を
+無効化して desired selection を保持し、新 geometry で再評価する。`SwitchSource` は source-owned
+state と presenter 側 prepared resource の両方を破棄し、command と App event の source-epoch gate
+も旧 source の request / 成功通知を棄却する。App を往復する `Prepared -> Commit` command は無い。
+
+Anime4K は B1 が GLSL の `//!SAVE` / `//!BIND` から生成した variant topology と WGSL を正本にする。
+build 時に S / M / L / VL / UL の WGSL を Naga で HLSL へ変換し、Windows SDK FXC で全 pixel
+shader を SM5 bytecode 化する。runtime は全67 shader object を pipeline 作成時に bytecode から
+ロードし、選択した1 variant 分だけ source-resolution `RGBA16Float` intermediate を適用準備で
+確保する。候補の確保が全部成功し、その選択での present が成功した後だけ旧 variant の中間画像を
+解放する。各 pass の入力と順番は生成 topology 駆動で、vertex stage は
+Naga 生成 `vs_main` ではなく NIS と同じ native D3D fullscreen vertex shader を使う。動画は
+whole frame 処理なので `process_origin = 0` とし、orientation は最終 resolve の inverse mapping
+で正規化する。
+
+Anime4K を初めて選ぶと、同じ adapter の低優先度offscreen deviceを専用workerに作り、
+S / L / UL × 540p / 1080p の6点を GPU timestamp で測る。再生render threadは待たず、現在の
+標準表示と再生位置を維持する。結果は adapter LUID・driver version等と一緒に永続化し、
+一致するGPUだけで再利用する。M / VL は演算量で内挿し、動画fpsの20 / 40 / 60%予算、
+総画素数1920×1080以下、報告VRAMの25%以内を満たす最大variantを1動画につき選ぶ。
+同じ動画の再生中に負荷を監視して自動昇降格はせず、利用者の予算変更・再測定だけが再選択する。
+最小Sも時間またはVRAM予算に入らない場合や測定失敗時は、typed reasonをperfへ出して標準表示へ
+退避する。source切替では前動画のvariantを流用せず、次の寸法とfpsが確定するまで標準表示に戻す。
+
+resize 中は現在の surface を維持し、最後の geometry sample から 150ms 変化がない settled edge
+で 1 回だけ新寸法へ交換する。この区間は失敗 retry ではなく、終了通知を持たない複数種の Windows
+resize stream を一つの state transition に畳む境界である。表示寸法が長辺 8192px または総画素数
+16,777,216px を超える場合と、pipeline / intermediate / display swap chain / backbuffer の作成失敗は
+typed fallback として perf へ理由・累積件数を出し、その要求では legacy OS path を使う。
 Stage 4 (2026-07-29) 以降、HWND owner と GPU work は別 thread である。
 `native-video-window-pump` は全 placement の create/message dispatch/mutate/destroy と typed
 window-host reducer だけを所有し、GPU ack や render join を同期 wait しない。
@@ -345,9 +405,15 @@ ID3D11Fence::Signal (共有 fence で blit 完了通知)
 NativeRenderCore (HWND owner の native-video-window-pump とは分離)
     ├─ ID3D11Device::OpenSharedHandle で受信 → ID3D11Texture2D
     ├─ KEYEDMUTEX 取得 + Fence Wait で同期
-    ├─ 補正なし: CopyResource → swap chain backbuffer
-    └─ 色調 / Creative LUT あり: D3D11 fullscreen shader → swap chain backbuffer
-         → Present (DComp visual tree 内)
+    ├─ OS に任せる / 物理等倍
+    │    ├─ 補正なし: CopySubresourceRegion → source 解像度 swap chain
+    │    └─ 色調 / Creative LUT: grade shader → source 解像度 swap chain
+    └─ 標準 (非等倍)
+         ├─ 補正なし: source texture を直接 resample 入力にする
+         └─ 色調 / Creative LUT: grade shader → source 解像度 BGRA8 中間 RT
+              → separable Lanczos3 (horizontal RGBA16F 中間 → vertical resolve)
+              → 表示矩形の物理 pixel サイズの swap chain
+              → Present (DComp は位置合わせ。リサイズ中だけ旧 surface を stretch)
 ```
 
 動画の Creative LUT は入力変換ではない。VideoProcessor が NV12 / P010 を SDR BGRA8 にした
@@ -357,9 +423,25 @@ D3D11 pixel shader を掛ける。したがってカメラ Log 素材の本来�
 
 `.cube` のファイル読み込みと parse は App の worker が担当し、render command には
 `Arc<CubeLutParams>` と表示用選択肢だけを渡す。render thread はファイル I/O を行わない。
-補正がすべて既定値なら shader pipeline は遅延生成も実行もせず従来の copy path を維持する。
-補正中は GPU decode の共有テクスチャを SRV として直接 sample し、CPU decode 時だけ再利用可能な
-BGRA8 texture へ upload して同じ shader を通す。LUT table は RGBA32F 3D texture として保持する。
+grade / Lanczos3 の shader object は presenter pipeline 作成時にまとめてコンパイルする。
+補正がすべて既定値なら grade pass と grade 中間 RT を使わず、OS 任せ / 物理等倍では従来の
+`CopySubresourceRegion` path を維持する。標準の非等倍だけ resample を実行し、補正中は grade
+出力を source 解像度の中間 RT に受けてから Lanczos3 へ渡す。CPU decode 時だけ再利用可能な
+BGRA8 source texture へ upload し、その後は GPU decode と同じ grade / resample pipeline を通る。
+LUT table は RGBA32F 3D texture として保持する。
+
+標準では swap chain を SAR / orientation 適用後の表示矩形へ直接解決するため、
+`compute_video_visual_transform` 本体は変更せず、display-resolved content だけ 1/1・identity
+として位置合わせする。window geometry の sample が続く間は現在の surface を DComp が stretch
+し、最後の寸法変更から 150ms 変化がなければ render thread が settled edge を 1 回だけ消費して
+surface を交換する。一時停止中は `FramePresentationState::Visible` の保持 frame を 1 回再提示する。
+
+表示 surface / 中間 RT を作れない場合は、要求 key ごとに typed reason
+(`display_size_limit_exceeded` / `resample_pipeline_unavailable` /
+`resample_intermediate_creation_failed` / `grade_intermediate_creation_failed` /
+`display_swap_chain_creation_failed` / `display_backbuffer_creation_failed`) を保持し、
+同じ失敗を毎 frame 再試行せず OS 任せへ戻す。理由と累積件数、選択 filter、surface 交換累積は
+perf event に出し、中間 RT の byte 数は VRAM trace に含める。
 
 #### 共有テクスチャ identity (`shared_texture_gen`) — handle 値再利用への防御
 
@@ -1511,6 +1593,8 @@ intent だけで host と接続する。
 | `native_presenter/render_core.rs` | D3D11/DXGI/DComp、swap chain、共有 texture/keyed mutex、動画 present、egui overlay state/input変換 | `NativeRenderConfig`, `NativeRenderCore`, `NativeEguiOverlay` |
 | `native_presenter/overlay_draw.rs` | overlay 描画関数群、panel 矩形計算、format helper、timeline marker/icon 描画 | `NativeOverlay*` 値型 |
 | `native_presenter/grade_pipeline.rs` | 色調補正 / Creative LUT shader pipeline | `VideoGradePipeline` |
+| `native_presenter/resample_pipeline.rs` | 表示 orientation、Lanczos3 / NIS / nearest、生成 topology 駆動 Anime4K multi-pass、RGBA16F 中間 RT | `VideoResamplePipeline` |
+| `native_presenter/surface_policy.rs` | filter / 表示倍率 / resize / 上限から surface size と typed fallback を決める純関数 | `VideoSurfaceSizeDecision`, `VideoScaleFallbackReason` |
 
 高頻度の mouse move、geometry/DPI、HUD raise、HUD visual/observation、App→render の HUD state は
 sequence 付き latest-value slot で coalesce する。wndproc の slot は atomic pointer swap、pump の
@@ -2261,6 +2345,9 @@ Phase 2 で `handle_native_video_output_event` (= 入力イベント反映)、Ph
   SW decoder で再生する。`mimageviewer.log` に `GPU video device: failed
   (will fallback to CPU readback)` と出ているか、または `decoder` のログで
   `decode_path=sw` / `decode_path=hw_d3d11va` が期待通りか確認する。
+- WARP write-through: production `VideoResamplePipeline` で NIS と Anime4K VL の全 chain を描き、
+  default D3D11 rasterizer のまま target 全体が書き換わることを unit test で確認する。これにより
+  generated `vs_main` の winding を誤って再接続する回帰も検出する。
 - native presenter 起動失敗時の挙動: `GetMonitorInfoW` 失敗や thread 生成エラーが
   起きると `VideoPlayer.error` に日本語のエラー文言が入り、フルスクリーンに赤字で
   「動画を再生できません: ...」が表示される (= 旧 egui presenter フォールバックは無い)。

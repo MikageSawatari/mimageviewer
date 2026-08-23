@@ -14,7 +14,7 @@ use wgpu::util::DeviceExt as _;
 
 use crate::{adjustment::PostFilter, displayed_image_transform::physical_scale_is_near_integer};
 use crate::{
-    gpu_anime4k::{Anime4kJob, Anime4kPlan, Anime4kResampler},
+    gpu_anime4k::{Anime4kJob, Anime4kPlan, Anime4kResampler, STILL_IMAGE_ANIME4K_VARIANT},
     settings::AnimeUpscaleSourceLimit,
 };
 
@@ -500,7 +500,9 @@ impl GpuLanczosCache {
         let job = match plan {
             LanczosWorkPlan::AnimeUpscale(plan) => self
                 .anime_resampler
-                .get_or_insert_with(|| Anime4kResampler::new(&render_state.device))
+                .get_or_insert_with(|| {
+                    Anime4kResampler::new(&render_state.device, STILL_IMAGE_ANIME4K_VARIANT)
+                })
                 .prepare_job(&render_state.device, source_texture, plan)
                 .map(LanczosWorkJob::AnimeUpscale),
             plan => {
@@ -1762,7 +1764,7 @@ fn resample_region_params_uniform(
 }
 
 fn nis_params_uniform(device: &wgpu::Device, plan: NisUpscalePlan) -> wgpu::Buffer {
-    let mut bytes = [0_u8; 32];
+    let mut bytes = [0_u8; 56];
     bytes[..4].copy_from_slice(&plan.target_size[0].to_ne_bytes());
     bytes[4..8].copy_from_slice(&plan.target_size[1].to_ne_bytes());
     bytes[8..12].copy_from_slice(&plan.source_size[0].to_ne_bytes());
@@ -1770,6 +1772,9 @@ fn nis_params_uniform(device: &wgpu::Device, plan: NisUpscalePlan) -> wgpu::Buff
     for (offset, value) in plan.source_region_px.into_iter().enumerate() {
         let start = 16 + offset * 4;
         bytes[start..start + 4].copy_from_slice(&value.to_ne_bytes());
+    }
+    for (offset, value) in [1.0_f32, 0.0, 0.0, 1.0, 0.0, 0.0].into_iter().enumerate() {
+        bytes[32 + offset * 4..36 + offset * 4].copy_from_slice(&value.to_ne_bytes());
     }
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: None,
@@ -2494,13 +2499,15 @@ mod tests {
         .validate(&pixel_aa_module)
         .unwrap();
 
-        let anime_module =
-            wgpu::naga::front::wgsl::parse_str(crate::gpu_anime4k::ANIME4K_SHADER).unwrap();
-        wgpu::naga::valid::Validator::new(
-            wgpu::naga::valid::ValidationFlags::all(),
-            wgpu::naga::valid::Capabilities::all(),
-        )
-        .validate(&anime_module)
-        .unwrap();
+        for variant in crate::gpu_anime4k::Anime4kVariant::ALL {
+            let anime_module = wgpu::naga::front::wgsl::parse_str(variant.shader())
+                .unwrap_or_else(|error| panic!("{variant:?} WGSL parse failed: {error}"));
+            wgpu::naga::valid::Validator::new(
+                wgpu::naga::valid::ValidationFlags::all(),
+                wgpu::naga::valid::Capabilities::all(),
+            )
+            .validate(&anime_module)
+            .unwrap_or_else(|error| panic!("{variant:?} WGSL validation failed: {error}"));
+        }
     }
 }

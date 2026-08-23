@@ -151,6 +151,11 @@ pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
             ui_scale: 1.0,
             text_contrast: crate::settings::TextContrast::Standard,
             ui_font: crate::settings::UiFontSettings::default(),
+            scale_filter: crate::settings::VideoScaleFilter::OsDefault,
+            downscale_smoothing_percent: 0,
+            anime4k_variant: None,
+            anime4k_budget: crate::video::anime4k_policy::VideoAnime4kBudgetPreset::default(),
+            anime4k_status: crate::video::native_presenter::NativeVideoAnime4kStatus::Waiting,
             health: crate::video::native_window_health::NativeWindowHealth::new_registered(),
             window_epoch: 0,
         })?;

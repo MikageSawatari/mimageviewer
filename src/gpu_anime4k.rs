@@ -1,13 +1,87 @@
-//! Anime-style visible-region GPU upscaling generated from Anime4K x2 VL.
+//! Anime-style visible-region GPU upscaling generated from Anime4K x2 variants.
 
 use std::borrow::Cow;
 
 use wgpu::util::DeviceExt as _;
 
-pub(crate) const ANIME4K_SHADER: &str = include_str!("gpu_anime4k.wgsl");
-const INTERMEDIATE_COUNT: usize = 17;
-const INPUT_BINDING_COUNT: usize = 14;
 const RECEPTIVE_MARGIN: i64 = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Anime4kVariant {
+    Small,
+    Medium,
+    Large,
+    VeryLarge,
+    UltraLarge,
+}
+
+impl Anime4kVariant {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Small,
+        Self::Medium,
+        Self::Large,
+        Self::VeryLarge,
+        Self::UltraLarge,
+    ];
+
+    fn data(self) -> &'static Anime4kVariantData {
+        GENERATED_ANIME4K_VARIANTS
+            .iter()
+            .find(|data| data.variant == self)
+            .expect("generated Anime4K data for every variant")
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        self.data().label
+    }
+
+    pub(crate) fn input_binding_count(self) -> usize {
+        self.data().input_binding_count
+    }
+
+    pub(crate) fn pass_inputs(self) -> &'static [&'static [Anime4kPassInput]] {
+        self.data().pass_inputs
+    }
+
+    pub(crate) fn intermediate_count(self) -> usize {
+        self.data().intermediate_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shader(self) -> &'static str {
+        self.data().shader
+    }
+}
+
+pub(crate) const STILL_IMAGE_ANIME4K_VARIANT: Anime4kVariant = Anime4kVariant::VeryLarge;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Anime4kPassInput {
+    Source,
+    Intermediate(usize),
+}
+
+#[derive(Debug)]
+struct Anime4kVariantData {
+    variant: Anime4kVariant,
+    label: &'static str,
+    shader: &'static str,
+    input_binding_count: usize,
+    /// Convolution pass inputs followed by the final resolve pass inputs.
+    pass_inputs: &'static [&'static [Anime4kPassInput]],
+}
+
+impl Anime4kVariantData {
+    fn intermediate_count(&self) -> usize {
+        self.pass_inputs
+            .len()
+            .checked_sub(1)
+            .expect("generated Anime4K topology includes a resolve pass")
+    }
+}
+
+include!("gpu_anime4k_generated.rs");
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Anime4kPlan {
@@ -60,14 +134,16 @@ impl Anime4kPlan {
 }
 
 pub(crate) struct Anime4kResampler {
+    variant_data: &'static Anime4kVariantData,
     bind_group_layout: wgpu::BindGroupLayout,
     convolution_pipelines: Vec<wgpu::RenderPipeline>,
     resolve_pipeline: wgpu::RenderPipeline,
 }
 
 impl Anime4kResampler {
-    pub(crate) fn new(device: &wgpu::Device) -> Self {
-        let mut entries = (0..INPUT_BINDING_COUNT)
+    pub(crate) fn new(device: &wgpu::Device, variant: Anime4kVariant) -> Self {
+        let variant_data = variant.data();
+        let mut entries = (0..variant_data.input_binding_count)
             .map(|binding| wgpu::BindGroupLayoutEntry {
                 binding: binding as u32,
                 visibility: wgpu::ShaderStages::FRAGMENT,
@@ -80,7 +156,7 @@ impl Anime4kResampler {
             })
             .collect::<Vec<_>>();
         entries.push(wgpu::BindGroupLayoutEntry {
-            binding: INPUT_BINDING_COUNT as u32,
+            binding: variant_data.input_binding_count as u32,
             visibility: wgpu::ShaderStages::FRAGMENT,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
@@ -99,10 +175,10 @@ impl Anime4kResampler {
             push_constant_ranges: &[],
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("generated Anime4K x2 VL"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(ANIME4K_SHADER)),
+            label: Some(variant_data.label),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(variant_data.shader)),
         });
-        let convolution_pipelines = (0..INTERMEDIATE_COUNT)
+        let convolution_pipelines = (0..variant_data.intermediate_count())
             .map(|index| {
                 create_pipeline(
                     device,
@@ -121,6 +197,7 @@ impl Anime4kResampler {
             wgpu::TextureFormat::Rgba8Unorm,
         );
         Self {
+            variant_data,
             bind_group_layout,
             convolution_pipelines,
             resolve_pipeline,
@@ -143,7 +220,8 @@ impl Anime4kResampler {
             mip_level_count: Some(1),
             ..Default::default()
         });
-        let intermediate_textures = (0..INTERMEDIATE_COUNT)
+        let intermediate_count = self.variant_data.intermediate_count();
+        let intermediate_textures = (0..intermediate_count)
             .map(|_| {
                 create_target_texture(device, plan.process_size, wgpu::TextureFormat::Rgba16Float)
             })
@@ -167,17 +245,13 @@ impl Anime4kResampler {
         let resolve_uniform =
             params_uniform(device, plan, plan.target_size, plan.source_size, [0, 0]);
 
-        let mut bind_groups = Vec::with_capacity(INTERMEDIATE_COUNT + 1);
-        for pass in 0..INTERMEDIATE_COUNT {
-            let views = if pass < 2 {
-                vec![&source_view]
-            } else if pass < 14 {
-                let first = ((pass - 2) / 2) * 2;
-                vec![&intermediate_views[first], &intermediate_views[first + 1]]
-            } else {
-                intermediate_views[..14].iter().collect()
-            };
-            let uniform = if pass < 2 {
+        let mut bind_groups = Vec::with_capacity(self.variant_data.pass_inputs.len());
+        for inputs in &self.variant_data.pass_inputs[..intermediate_count] {
+            let views = resolve_pass_views(inputs, &source_view, &intermediate_views);
+            let uniform = if inputs
+                .iter()
+                .all(|input| *input == Anime4kPassInput::Source)
+            {
                 &source_uniform
             } else {
                 &intermediate_uniform
@@ -185,19 +259,24 @@ impl Anime4kResampler {
             bind_groups.push(create_bind_group(
                 device,
                 &self.bind_group_layout,
+                self.variant_data.input_binding_count,
                 &views,
                 uniform,
             ));
         }
+        let resolve_views = resolve_pass_views(
+            self.variant_data
+                .pass_inputs
+                .last()
+                .expect("generated Anime4K resolve inputs"),
+            &source_view,
+            &intermediate_views,
+        );
         bind_groups.push(create_bind_group(
             device,
             &self.bind_group_layout,
-            &[
-                &source_view,
-                &intermediate_views[14],
-                &intermediate_views[15],
-                &intermediate_views[16],
-            ],
+            self.variant_data.input_binding_count,
+            &resolve_views,
             &resolve_uniform,
         ));
         Ok(Anime4kJob {
@@ -211,7 +290,8 @@ impl Anime4kResampler {
     }
 
     pub(crate) fn encode(&self, encoder: &mut wgpu::CommandEncoder, job: &Anime4kJob) {
-        for pass in 0..INTERMEDIATE_COUNT {
+        let intermediate_count = self.variant_data.intermediate_count();
+        for pass in 0..intermediate_count {
             encode_pass(
                 encoder,
                 &job.intermediate_views[pass],
@@ -223,7 +303,7 @@ impl Anime4kResampler {
             encoder,
             &job.output_view,
             &self.resolve_pipeline,
-            &job.bind_groups[INTERMEDIATE_COUNT],
+            &job.bind_groups[intermediate_count],
         );
     }
 }
@@ -275,7 +355,23 @@ fn params_uniform(
     input_size: [u32; 2],
     input_origin: [i32; 2],
 ) -> wgpu::Buffer {
-    let mut bytes = [0_u8; 64];
+    let bytes = pack_params_uniform(plan, output_size, input_size, input_origin);
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("anime4k params"),
+        contents: &bytes,
+        usage: wgpu::BufferUsages::UNIFORM,
+    })
+}
+
+const PARAMS_UNIFORM_SIZE: usize = 96;
+
+fn pack_params_uniform(
+    plan: Anime4kPlan,
+    output_size: [u32; 2],
+    input_size: [u32; 2],
+    input_origin: [i32; 2],
+) -> [u8; PARAMS_UNIFORM_SIZE] {
+    let mut bytes = [0_u8; 96];
     for (index, value) in output_size.into_iter().enumerate() {
         bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
     }
@@ -301,21 +397,48 @@ fn params_uniform(
         let offset = 48 + index * 4;
         bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
     }
-    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("anime4k params"),
-        contents: &bytes,
-        usage: wgpu::BufferUsages::UNIFORM,
-    })
+    // Still-image coordinates are already in source orientation. The same
+    // generated resolve shader is shared with native video, whose D3D path
+    // supplies the actual inverse orientation mapping here.
+    for (base, values) in [
+        (64, [1.0_f32, 0.0]),
+        (72, [0.0_f32, 1.0]),
+        (80, [0.0_f32, 0.0]),
+        (88, [0.0_f32, 0.0]),
+    ] {
+        for (index, value) in values.into_iter().enumerate() {
+            let offset = base + index * 4;
+            bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+    }
+    bytes
+}
+
+fn resolve_pass_views<'a>(
+    inputs: &[Anime4kPassInput],
+    source_view: &'a wgpu::TextureView,
+    intermediate_views: &'a [wgpu::TextureView],
+) -> Vec<&'a wgpu::TextureView> {
+    inputs
+        .iter()
+        .map(|input| match *input {
+            Anime4kPassInput::Source => source_view,
+            Anime4kPassInput::Intermediate(index) => intermediate_views
+                .get(index)
+                .expect("generated Anime4K input references an earlier pass"),
+        })
+        .collect()
 }
 
 fn create_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
+    input_binding_count: usize,
     views: &[&wgpu::TextureView],
     uniform: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     let fallback = views[0];
-    let mut entries = (0..INPUT_BINDING_COUNT)
+    let mut entries = (0..input_binding_count)
         .map(|binding| wgpu::BindGroupEntry {
             binding: binding as u32,
             resource: wgpu::BindingResource::TextureView(
@@ -324,7 +447,7 @@ fn create_bind_group(
         })
         .collect::<Vec<_>>();
     entries.push(wgpu::BindGroupEntry {
-        binding: INPUT_BINDING_COUNT as u32,
+        binding: input_binding_count as u32,
         resource: uniform.as_entire_binding(),
     });
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -392,4 +515,125 @@ fn encode_pass(
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, bind_group, &[]);
     pass.draw(0..3, 0..1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Anime4kPassInput, Anime4kPlan, Anime4kVariant, PARAMS_UNIFORM_SIZE,
+        STILL_IMAGE_ANIME4K_VARIANT, pack_params_uniform,
+    };
+
+    fn assert_word(bytes: &[u8], offset: usize, expected: [u8; 4]) {
+        assert_eq!(&bytes[offset..offset + 4], &expected, "offset {offset}");
+    }
+
+    #[test]
+    fn generated_variant_topologies_are_complete_and_self_consistent() {
+        let expected = [
+            (Anime4kVariant::Small, 5, 2, 1),
+            (Anime4kVariant::Medium, 9, 7, 1),
+            (Anime4kVariant::Large, 10, 4, 3),
+            (Anime4kVariant::VeryLarge, 18, 14, 3),
+            (Anime4kVariant::UltraLarge, 25, 15, 3),
+        ];
+        assert_eq!(Anime4kVariant::ALL.len(), expected.len());
+
+        for (variant, pass_count, binding_count, correction_count) in expected {
+            let data = variant.data();
+            assert_eq!(data.variant, variant);
+            assert_eq!(data.pass_inputs.len(), pass_count, "{variant:?}");
+            assert_eq!(data.input_binding_count, binding_count, "{variant:?}");
+            assert_eq!(
+                data.pass_inputs.iter().map(|inputs| inputs.len()).max(),
+                Some(binding_count),
+                "{variant:?}"
+            );
+            assert!(data.shader.starts_with("// MIT License"), "{variant:?}");
+            assert!(
+                data.shader.contains(&format!(
+                    "Anime4K_Upscale_CNN_x2_{}.glsl",
+                    &data.label[11..]
+                )),
+                "{variant:?}"
+            );
+
+            for (pass, inputs) in data.pass_inputs[..data.intermediate_count()]
+                .iter()
+                .enumerate()
+            {
+                assert!(!inputs.is_empty(), "{variant:?} pass {pass}");
+                let source_only = inputs
+                    .iter()
+                    .all(|input| *input == Anime4kPassInput::Source);
+                let intermediates_only = inputs.iter().all(|input| {
+                    matches!(
+                        input,
+                        Anime4kPassInput::Intermediate(index) if *index < pass
+                    )
+                });
+                assert!(source_only || intermediates_only, "{variant:?} pass {pass}");
+            }
+
+            let resolve = data.pass_inputs.last().unwrap();
+            assert_eq!(resolve.first(), Some(&Anime4kPassInput::Source));
+            assert_eq!(resolve.len() - 1, correction_count, "{variant:?}");
+            assert!(resolve[1..].iter().all(|input| {
+                matches!(
+                    input,
+                    Anime4kPassInput::Intermediate(index)
+                        if *index < data.intermediate_count()
+                )
+            }));
+        }
+    }
+
+    #[test]
+    fn still_image_path_remains_on_very_large() {
+        assert_eq!(STILL_IMAGE_ANIME4K_VARIANT, Anime4kVariant::VeryLarge);
+    }
+
+    #[test]
+    fn still_image_uniform_layout_and_identity_orientation_are_pinned() {
+        let plan = Anime4kPlan {
+            source_size: [101, 202],
+            target_size: [303, 404],
+            process_origin: [5, 7],
+            process_size: [89, 144],
+            source_region_px: [11.5, 12.5, 13.5, 14.5],
+            texture_fetches: 0,
+        };
+        let bytes = pack_params_uniform(plan, [301, 401], [87, 143], [-2, 3]);
+
+        assert_eq!(PARAMS_UNIFORM_SIZE, 96);
+        assert_eq!(bytes.len(), 96);
+        for (offset, expected) in [
+            (0, 301_u32.to_ne_bytes()),
+            (4, 401_u32.to_ne_bytes()),
+            (8, 87_u32.to_ne_bytes()),
+            (12, 143_u32.to_ne_bytes()),
+            (16, (-2_i32).to_ne_bytes()),
+            (20, 3_i32.to_ne_bytes()),
+            (24, 5_i32.to_ne_bytes()),
+            (28, 7_i32.to_ne_bytes()),
+            (32, 101_u32.to_ne_bytes()),
+            (36, 202_u32.to_ne_bytes()),
+            (40, 89_u32.to_ne_bytes()),
+            (44, 144_u32.to_ne_bytes()),
+            (48, 11.5_f32.to_ne_bytes()),
+            (52, 12.5_f32.to_ne_bytes()),
+            (56, 13.5_f32.to_ne_bytes()),
+            (60, 14.5_f32.to_ne_bytes()),
+            (64, 1.0_f32.to_ne_bytes()),
+            (68, 0.0_f32.to_ne_bytes()),
+            (72, 0.0_f32.to_ne_bytes()),
+            (76, 1.0_f32.to_ne_bytes()),
+            (80, 0.0_f32.to_ne_bytes()),
+            (84, 0.0_f32.to_ne_bytes()),
+            (88, 0.0_f32.to_ne_bytes()),
+            (92, 0.0_f32.to_ne_bytes()),
+        ] {
+            assert_word(&bytes, offset, expected);
+        }
+    }
 }
