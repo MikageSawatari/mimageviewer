@@ -222,34 +222,28 @@ fn draw_native_seek_strip(
                             egui::pos2(cell_center_x, local_rect.center().y),
                             egui::vec2(SEEK_STRIP_CELL_WIDTH - 4.0, SEEK_STRIP_HEIGHT - 10.0),
                         );
-                        let in_axis = raw_index >= 0 && (raw_index as usize) < strip.cell_count;
-                        let fill = if in_axis {
-                            egui::Color32::from_gray(24)
-                        } else {
-                            egui::Color32::from_gray(10)
-                        };
-                        painter.rect_filled(cell_rect, 3.0, fill);
-                        if in_axis {
-                            let index = raw_index as usize;
-                            if let Some(texture_id) = texture_ids.get(&index).copied()
-                                && let Some(cell) =
-                                    strip.cells.iter().find(|cell| cell.index == index)
-                                && let Some(thumbnail) = cell.thumbnail.as_ref()
-                            {
-                                let fitted = fit_rect_in_rect(
-                                    egui::vec2(thumbnail.width as f32, thumbnail.height as f32),
-                                    cell_rect.shrink(2.0),
-                                );
-                                painter.image(
-                                    texture_id,
-                                    fitted,
-                                    egui::Rect::from_min_max(
-                                        egui::Pos2::ZERO,
-                                        egui::pos2(1.0, 1.0),
-                                    ),
-                                    egui::Color32::WHITE,
-                                );
-                            }
+                        // 動画の範囲外には枠も背景も描かない。空のセルを枠付きで置くと、
+                        // 「まだ出ていないサムネイル」と区別が付かず、黒い絵があるように見える
+                        // (実機フィードバック 2026-08-24)。軸の内側で未取得のセルだけ枠を出す。
+                        if raw_index < 0 || (raw_index as usize) >= strip.cell_count {
+                            continue;
+                        }
+                        let index = raw_index as usize;
+                        painter.rect_filled(cell_rect, 3.0, egui::Color32::from_gray(24));
+                        if let Some(texture_id) = texture_ids.get(&index).copied()
+                            && let Some(cell) = strip.cells.iter().find(|cell| cell.index == index)
+                            && let Some(thumbnail) = cell.thumbnail.as_ref()
+                        {
+                            let fitted = fit_rect_in_rect(
+                                egui::vec2(thumbnail.width as f32, thumbnail.height as f32),
+                                cell_rect.shrink(2.0),
+                            );
+                            painter.image(
+                                texture_id,
+                                fitted,
+                                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                                egui::Color32::WHITE,
+                            );
                         }
                         painter.rect_stroke(
                             cell_rect,
