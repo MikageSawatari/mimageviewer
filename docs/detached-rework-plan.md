@@ -402,10 +402,41 @@ op の内部で binding を早く公開して正常終了までに戻す実装�
 `swap_viewer_context_bundle` を通り、その中で rating 同期と visible index 再構築が走る
 = **op の内部で panic し得る**。②-d では swap の内側にも failpoint を刺すこと。
 
-次は **②-pre** (手書き mount 18 箇所の helper 化)。⚠ これは **production の挙動を変える**
-(手書き経路が panic 安全になり、panic 時に bundle が drop されなくなる) ので、
-着手前に §2 の適用範囲どおり ClaudeCode と Codex の双方で「症状パッチではなく構造的修正で
-ある」ことに合意し、§11 へ記録すること。
+**ステージ②-pre 完了 (2026-08-24、実装 = Codex / 検収 = ClaudeCode)。実機 smoke 待ち。**
+指示書 [detached-rework-stage-r2e-2pre.md](detached-rework-stage-r2e-2pre.md)、
+憲法 §2 の合意は §11 の 2026-08-23 の項。手書き mount 18 箇所 (active 9 / parked 9) を
+`with_active_detached_viewer_context` と新設 `with_paused_detached_context` の 2 本へ集約。
+`src/app.rs` は正味 19 行減、`src/app/tests.rs` は 592 行追加・**削除ゼロ**、
+ライブラリ全体 6235 本が緑。mount inventory は active take 4 件 / parked take 5 件
+(= helper 2 本 + 変換しない 7 箇所) で手書きは 0。
+
+検収で見つかった **P1 1 件** (修正済み):
+
+- **parked-live の入力 marker が panic でリークした。** VST3 の deferred consume は
+  marker を立てて実行し**後で**戻していたので、consume が panic すると helper が投影と
+  bundle を復元する一方 marker は `Some(id)` のまま残り、**「main がマウント中なのに
+  marker は parked 窓を指す」**という旧コードには作れない状態になった
+  (旧コードは panic 時に parked 投影をマウントしたまま落ちるので両者は一致していた)。
+  → 呼び出し元側で `catch_unwind` → marker 復元 → `resume_unwind`。
+  **helper は marker 非関与のまま** (§11 の合意どおり)。
+
+**「落ちないテスト」を 4 件強化した**(いずれもこのステージ特有の誤実装を通してしまう形だった):
+
+- 窓が closure 内で閉じられるテストに**後続の兄弟窓**を足した (無いと、id ではなく
+  保存した index で戻す誤実装が通る)
+- 累積値の不変テストを **true 始まり**にした (false 始まりだと「代入で累積を潰す」誤りを検出できない)
+- 「既にマウント中の context も処理される」を、**どの context に何回走ったかの列を完全一致で
+  検証**する形にした (「1 回以上」だと parked ループを丸ごと飛ばす実装も二重実行も通る)
+- panic 経路そのもののテストが無かったので追加した
+
+**②-d への申し送り** (設計 §7 ②-d に記録):
+現行の全 context 操作は「マウント中を先に処理 → その後 parked を巡回」で、マウント中のものは
+巡回に含まれない。②-d の統一 mount は「既にマウント済みなら swap せず `f` を実行」するので、
+**巡回側にマウント中の id が含まれると `f` が 2 回走る**。上の exactly-once テストが
+それを捕まえるので、②-d で弱めないこと。ほかに、②-pre が holder 側に残した前置きフィルタ
+2 箇所 (vst3 の pending 判定 / rename 述語) を `ContextRef` 経由へ移すこと。
+
+次は **②-a** (終端経路を「所有値の digest」へ)。保管は変えないので挙動不変。
 
 **§1.99 / §1.100 は R2e の完成に依存しない** (ClaudeCode / Codex 双方で確認)。
 
