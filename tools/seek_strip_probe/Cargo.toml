@@ -1,0 +1,10 @@
+[package]
+name = "seek_strip_probe"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+ffmpeg-the-third = { version = "3", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling"] }
+music-core = { path = "../../crates/music-core" }

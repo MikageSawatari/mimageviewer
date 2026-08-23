@@ -13,6 +13,7 @@ members = [
     "tools/local_adjust_lab",
     "tools/comic_lab",
     "tools/music_lab",
+    "tools/seek_strip_probe",
 ]
 exclude = ["crates/unrar-patched", "vendor/eframe", "vendor/egui-wgpu"]
 
