@@ -60,11 +60,13 @@
 ```powershell
 git worktree add C:\home\mimageviewer-video-strip -b video-strip
 
-# vendor は junction ではなく実体コピー (合計 ~325MB)。eframe / egui-wgpu は
-# Cargo.toml の [patch.crates-io] が相対パスで参照するので必須
+# vendor は junction ではなく実体コピー (合計 ~325MB)。
+# eframe / egui-wgpu は **git 追跡下**なので worktree の checkout に既にある。
+# ここへ入れて上書きすると、改行だけ違う 29 ファイルが M になるのでコピーしない
+# (入れてしまった場合は `git checkout -- vendor/eframe vendor/egui-wgpu` で戻す)。
 $src = "C:\home\mimageviewer\vendor"; $dst = "C:\home\mimageviewer-video-strip\vendor"
 New-Item -ItemType Directory -Force $dst | Out-Null
-foreach ($n in @("eframe","egui-wgpu","ffmpeg","pdfium","ort","susie-worker","vst3-host","models","twemoji")) {
+foreach ($n in @("ffmpeg","pdfium","ort","susie-worker","vst3-host","models","twemoji")) {
   robocopy "$src\$n" "$dst\$n" /E /XD target /NFL /NDL /NJH /NJS | Out-Null
 }
 ```
