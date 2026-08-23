@@ -332,7 +332,47 @@ R2b の残件 (純粋 reducer / 合法遷移制約 / 散在 pending・flag の t
 第 2 版 (phase + slot map + 復元スタック) にも BLOCKER が 4 件残っている (同書 §6)。
 所有の transaction が無い / `window_id → ViewerContextId` の対応表が無い /
 ステージ分割がコンパイルできない切り方になっている / 「組み立て中は identity が無い」が誤り。
-**R2e に着手する前に第 3 版を書くこと。**
+
+**第 3 版を書いた (2026-08-23、branch `r2e-ownership`、worktree `C:\home\mimageviewer-r2e`)。
+Codex レビュー 6 巡で BLOCKER 0 に到達。**正本は同じファイル
+[briefs/detached-r2e-ownership-design.md](briefs/detached-r2e-ownership-design.md)。要点:
+
+- 診断は 1 つ ——「1 個の保管場所の値の有無で、identity 以外の軸 (所在 / 駆動者 / 時制) を
+  答えている」。**修理は 3 箇所に分かれる**: 所在 = R2e、右ドラッグの producer = R2f、
+  placement の現在/復元ジオメトリ = レーン A-0 (§1.4)。R2e に 3 件全部を持ち込まない。
+- 保管を 1 箇所に統合する。`active_detached_viewer_context` と `paused_bundle` の往復を
+  registry の slot 1 種類にし、active か parked かは `DetachedWindowRuntime.state` だけが持つ。
+- `ViewerContextId` に `Main` 変種を置かない (`Main` は identity ではなく binding)。
+- 所有を動かす操作は mount / build / fork / retire / promote の 5 transaction だけ。
+  生 bundle を返す API を 1 つも置かない。
+- binding は registry 所有で `bind` / `unbind` / `transfer` の 3 本。build 中の binding は
+  予約として積み、commit と同時にだけ公開する。
+- 完了確認の第一の門は **Rust の可視性** (型を registry モジュールへ移してフィールドを private に
+  すると、生成 / destructure / 生 swap がモジュール外で書けなくなる)。syn 監査 (A1〜A7) は
+  可視性で表せない残りだけを見る。塞げない穴 (マクロ展開 / ローカル関数エイリアス /
+  別モジュール再エクスポート / 意味的到達可能性) は明記した。
+- ステージは ① 抽象データ構造 → ②-pre 手書き mount の helper 化 → ②-a 終端 digest →
+  ②-b 型の移設 → ②-c accessor と監査 → **②-d 保管・binding・transaction の一括切替 (1 コミット)**
+  → ②-e 完全 private と allowlist → ③ 巡回 → ④ 非同期 identity。各段の終了時に
+  コンパイルが通る状態を明記した。
+
+レビューで訂正した事実 (実装時に踏まないこと):
+
+- **folder-nav reopen (Ctrl+↑↓) は「同じ窓・同じ context・新しいフォルダ」**。
+  `close_fullscreen_for_folder_nav_reopen` ([app.rs:52211](../src/app.rs:52211)) は
+  マウント中の context を保つ。window_id 再利用は ViewportId を安定させるためで、
+  context の差し替えではない。
+- **生きた context 同士で窓が移る経路は実在する**: live-media fork
+  ([app.rs:41868](../src/app.rs:41868))。`transfer_window_binding` が要る。
+- **build transaction は 2 本ある**: `start_active_detached_book_context_with_start` と
+  `open_bookmark_media_in_detached_context` ([startup_ops.rs:608](../src/app/startup_ops.rs:608))。
+  後者には正常な失敗経路があるので `BuildOutcome::Abort` が要る。
+- **App の投影は空にできない** (225 個の実フィールドで `Option` ではない)。
+  「取り出す」と「空を据える」は 1 動作。
+- abort の drop は **main を戻した後** ([startup_ops.rs:652](../src/app/startup_ops.rs:652)〜654)。
+- `ViewerContextBundle` は **225 フィールド**。tests.rs 側の参照は 294 行。
+
+次: §6-3 のステージ①の実装指示書を `docs/detached-rework-stage-r2e-1.md` として起こす。
 
 **§1.99 / §1.100 は R2e の完成に依存しない** (ClaudeCode / Codex 双方で確認)。
 

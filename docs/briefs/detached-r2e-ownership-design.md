@@ -266,7 +266,7 @@ enum Slot { AtRest(Box<ViewerContextBundle>), Retiring(Box<ViewerContextBundle>)
 | I1b | **投影が payload を持たない瞬間は存在しない** | 「取り出す」と「空を据える」を 1 つの op (`ReplaceProjectionWithFreshEmpty`) にする |
 | I2 | `window_of` と `context_of` は互いの逆写像 | 更新は `bind` / `unbind` / `transfer` の 3 本だけ (module private の共通実装)。`retire` は内部で `unbind` する |
 | I3 | 1 つの窓に context は高々 1 つ / 1 つの context は高々 1 つの窓 | `bind` は `WindowOwnedBy` / `ContextOwnedBy` を `Err` で返す。**生きた context 同士の窓の移動は `transfer` だけ**が行い、期待する `from` を照合する |
-| I4 | `main` は常に存在し、`slots` / 投影 / **transient** のいずれかに在る (I1 と同じ 3 択。begin の途中と、abort の `WithdrawFrom(previous)` 後は transient に居る) | `promote` は新しい main を作ってから古い main を bind する |
+| I4 | `main` は常に存在し、`slots` / 投影 / **transient** のいずれかに在る (I1 と同じ 3 択。begin の途中と、commit / abort の `WithdrawFrom(previous)` 後は transient に居る) | `promote` は新しい main を作ってから古い main を bind する |
 | I5 | `Building` 中は mount / retire を受け付けない。**binding は即時公開せず transaction に積む** (§4.2) | `Projection` の match で typed error を返す。binding は `Building` が保持する `pending_bind` |
 | I6 | `Retiring` 中の id は mount / bind できない | `Slot::Retiring` への遷移 |
 | I7 | 投影は毎 root pass の末尾で `Mounted` | 定義した継ぎ目での assert (時間窓ではない。憲法 5) |
@@ -986,8 +986,12 @@ BLOCKER 3 の指摘どおり、**保管フィールドを消した瞬間に全�
   **「abort / panic で binding を 1 つも公開しない」**ことであって、
   「op 列の途中で panic しない」ではない。**後者を保証するのが plan / execute / finalize の
   3 相分割**で、binding の公開は最後の `finish_*` にしか無いので、op の途中で panic すれば
-  binding は公開されないまま終わる。そのとき transient は drop され (worker cancel が走る) —
-  これは**今日と同じ**挙動である。
+  binding は公開されないまま終わる。
+  ⚠ **op panic の後始末は「今日と同じ」ではない**。transient が**中身を持っていれば** drop され
+  worker が cancel されるが、`DepositInto(reserved)` の**後**で落ちた場合、組み立て済み context は
+  既に slot に居て transient は空なので、その場では cancel されない (今日の
+  `let active_context = ...` [app.rs:40654](../../src/app.rs:40654) は局所変数なので必ず落ちる)。
+  **R2e は op panic の完全なロールバックを保証しない。** 保証するのは I1b と I8 の 2 つだけである。
 - ①のテストは **table 自身の slots** に対して op を実行する 20 行程度の実行器を持つ
   (production と同じ store。第 2 稿にあった「テスト用の別 `HashMap`」は撤回)。
   これで「build の途中で投影が確かに新しい空 payload になっている」「`f` の abort / panic で
