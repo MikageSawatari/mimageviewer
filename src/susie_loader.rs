@@ -208,6 +208,9 @@ struct Job {
     /// 診断ログ用ヒント (拡張子 or "(bytes:<filename>)")。リクエストペイロードを
     /// パースし直さずに済ませるための軽量メタ。
     hint: String,
+    /// この要求が指す対象の識別子。ワーカーを落とした対象を覚えて二度と投げないために使う。
+    /// 実ファイルは正規化パス、ZIP 内画像は「エントリ名#バイト長」。
+    subject: String,
     /// 可視セルのデコード要求は true。プールキュー先頭に push される。
     /// false (通常) は末尾に push される。スクロール中に画面外へ出た残存ジョブが
     /// キュー前方に居座って新しい可視セルを待たせる現象を回避する。
@@ -231,6 +234,10 @@ struct JobQueue {
     priority_jobs: std::collections::VecDeque<Job>,
     regular_jobs: std::collections::VecDeque<Job>,
     shutdown: bool,
+    /// 最後のスロットが閉じた。以降 enqueue しても誰も pop しないので、
+    /// ロックの中でこれを見て即座に断る。`is_ready()` の外側チェックだけでは、
+    /// 見てから積むまでの間に最後のスロットが閉じた要求が宙に浮く。
+    workers_gone: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -248,6 +255,8 @@ pub struct SusieWorkerPool {
     /// 拡張子の集合 (小文字)。全プラグインの対応拡張子を合算したもの。
     extensions: HashSet<String>,
     dispatcher_threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// このセッションでワーカーを落とした対象。二度目からは投げずに即失敗させる。
+    crashers: Arc<Mutex<HashSet<String>>>,
 }
 
 impl SusieWorkerPool {
@@ -277,6 +286,7 @@ impl SusieWorkerPool {
                 priority_jobs: std::collections::VecDeque::new(),
                 regular_jobs: std::collections::VecDeque::new(),
                 shutdown: false,
+                workers_gone: false,
             }),
             Condvar::new(),
         ));
@@ -286,6 +296,7 @@ impl SusieWorkerPool {
         let mut dispatcher_threads = Vec::with_capacity(pool_size);
         let mut worker_count = 0usize;
         let live_workers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let crashers: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
         for i in 0..pool_size {
             match spawn_worker_and_handshake(&exe, &plugin_dir) {
@@ -310,10 +321,19 @@ impl SusieWorkerPool {
                     let slot_exe = exe.clone();
                     let slot_plugin_dir = plugin_dir.clone();
                     let slot_live = Arc::clone(&live_workers);
+                    let slot_crashers = Arc::clone(&crashers);
                     let handle = std::thread::Builder::new()
                         .name(format!("susie-pool-{i}"))
                         .spawn(move || {
-                            run_worker_slot(i, q, slot_exe, slot_plugin_dir, (child, io), slot_live)
+                            run_worker_slot(
+                                i,
+                                q,
+                                slot_exe,
+                                slot_plugin_dir,
+                                (child, io),
+                                slot_live,
+                                slot_crashers,
+                            )
                         })
                         .expect("susie: failed to spawn dispatcher thread");
                     dispatcher_threads.push(handle);
@@ -342,6 +362,7 @@ impl SusieWorkerPool {
             plugins: plugins_merged,
             extensions,
             dispatcher_threads: Mutex::new(dispatcher_threads),
+            crashers,
         }
     }
 
@@ -352,6 +373,19 @@ impl SusieWorkerPool {
     /// 生きているワーカースロット数。診断表示と、全滅の判定に使う。
     pub fn live_worker_count(&self) -> usize {
         self.live_workers.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// この対象は既にワーカーを落としているか。
+    fn subject_killed_a_worker(&self, subject: &str) -> bool {
+        self.crashers
+            .lock()
+            .map(|set| set.contains(subject))
+            .unwrap_or(false)
+    }
+
+    /// このセッションでワーカーを落とした対象の数 (診断表示用)。
+    pub fn crashing_subject_count(&self) -> usize {
+        self.crashers.lock().map(|set| set.len()).unwrap_or(0)
     }
 
     pub fn plugins(&self) -> &[PluginInfo] {
@@ -374,9 +408,20 @@ impl SusieWorkerPool {
         &self,
         request: &[u8],
         hint: &str,
+        subject: &str,
         priority: bool,
         cancel: Option<&Arc<AtomicBool>>,
     ) -> std::io::Result<Vec<u8>> {
+        // 一度ワーカーを落とした対象は投げ直さない。失敗したデコードはサムネイルとして
+        // 残らないので、同じフォルダを開くたびに同じ画像が投げられ、そのたびにワーカーが
+        // 死ぬ。再起動が追いつく間は読めるが、プロセスを作り直し続けることになる。
+        // 記憶はプールの生存期間だけで、アプリを起動し直せば忘れる。
+        if self.subject_killed_a_worker(subject) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "susie: this file crashed a plugin earlier in this session",
+            ));
+        }
         // 生存スロットを見る。全滅した状態で enqueue すると、誰も pop しない
         // キューに積まれて要求が宙に浮く。
         if self.live_worker_count() == 0 {
@@ -392,11 +437,20 @@ impl SusieWorkerPool {
             cancel: cancel.cloned(),
             enqueued_at: std::time::Instant::now(),
             hint: hint.to_string(),
+            subject: subject.to_string(),
             priority,
         };
         {
             let (mtx, cv) = &*self.queue;
             let mut q = mtx.lock().unwrap();
+            // 上の live_worker_count() を見てからここへ来るまでに最後のスロットが
+            // 閉じることがある。積むのと同じロックの中で確かめる。
+            if q.workers_gone || q.shutdown {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "susie: no workers available",
+                ));
+            }
             // priority ジョブは priority 用キューの末尾、regular は regular 用キューの
             // 末尾に積む。dispatcher は priority を先に pop するので、priority 同士は
             // FIFO、regular より常に先。これで app 側が決めた読み込み順を壊さない。
@@ -438,6 +492,7 @@ fn empty_pool() -> SusieWorkerPool {
                 priority_jobs: std::collections::VecDeque::new(),
                 regular_jobs: std::collections::VecDeque::new(),
                 shutdown: false,
+                workers_gone: false,
             }),
             Condvar::new(),
         )),
@@ -445,6 +500,7 @@ fn empty_pool() -> SusieWorkerPool {
         plugins: Vec::new(),
         extensions: HashSet::new(),
         dispatcher_threads: Mutex::new(Vec::new()),
+        crashers: Arc::new(Mutex::new(HashSet::new())),
     }
 }
 
@@ -692,7 +748,8 @@ pub fn decode_file(
         .and_then(|e| e.to_str())
         .unwrap_or("?")
         .to_ascii_lowercase();
-    let resp = pool.execute(&req, &hint, priority, cancel.as_ref())?;
+    let subject = crate::path_key::normalize_keep_drive(path);
+    let resp = pool.execute(&req, &hint, &subject, priority, cancel.as_ref())?;
     parse_decode_response(&resp)
 }
 
@@ -716,7 +773,10 @@ pub fn decode_bytes(
         .and_then(|e| e.to_str())
         .unwrap_or("?")
         .to_ascii_lowercase();
-    let resp = pool.execute(&req, &hint, priority, cancel.as_ref())?;
+    // ZIP 内画像はパスを持たないので、エントリ名とバイト長で識別する。
+    // 名前だけだと別の書庫の同名エントリまで巻き添えにする。
+    let subject = format!("{filename_hint}#{}", bytes.len());
+    let resp = pool.execute(&req, &hint, &subject, priority, cancel.as_ref())?;
     parse_decode_response(&resp)
 }
 
@@ -824,7 +884,19 @@ enum DispatcherExit {
     /// プール終了。スロットも畳む。
     Shutdown,
     /// ワーカープロセスが応答しなくなった。スロットは再起動を試みる。
-    WorkerLost { reason: String },
+    ///
+    /// `served` は**このワーカーが落ちるまでに返した応答数**。1 件でも返していれば
+    /// そのワーカーは正常に働けていたので、再起動回数を数え直す。累積で数えると、
+    /// たまに落ちるプラグインでも使い続けるうちに必ず枯渇する。
+    WorkerLost { reason: String, served: u64 },
+}
+
+/// ワーカーが落ちた後の再起動回数。**1 件でも応答を返せていたワーカーは働けていた**
+/// ので数え直す。累積で数えると、たまに落ちるプラグインでも使い続けるうちに必ず上限へ
+/// 達し、Susie が丸ごと死ぬ (実機で 3 スロットとも枯渇した)。上限が意味を持つのは
+/// 「起動しても働けないまま落ちる」場合だけである。
+fn restart_count_after_loss(current: usize, served: u64) -> usize {
+    if served > 0 { 0 } else { current }
 }
 
 /// ワーカーが落ちたと判断できる transport error か。
@@ -852,6 +924,7 @@ fn run_worker_slot(
     plugin_dir: PathBuf,
     initial: (Child, WorkerIo),
     live_workers: Arc<std::sync::atomic::AtomicUsize>,
+    crashers: Arc<Mutex<HashSet<String>>>,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -894,10 +967,13 @@ fn run_worker_slot(
             continue;
         };
 
-        match run_dispatcher(worker_id, Arc::clone(&queue), child, io) {
+        match run_dispatcher(worker_id, Arc::clone(&queue), child, io, &crashers) {
             DispatcherExit::Shutdown => break,
-            DispatcherExit::WorkerLost { reason } => {
-                crate::logger::log(format!("susie: worker {worker_id} lost ({reason})"));
+            DispatcherExit::WorkerLost { reason, served } => {
+                crate::logger::log(format!(
+                    "susie: worker {worker_id} lost after {served} reply/replies ({reason})"
+                ));
+                restarts = restart_count_after_loss(restarts, served);
                 // current は None のまま次の周回へ。そこで作り直す。
             }
         }
@@ -907,6 +983,43 @@ fn run_worker_slot(
     crate::logger::log(format!(
         "susie: worker {worker_id} slot closed; {remaining} worker slot(s) left"
     ));
+    if remaining == 0 {
+        // 最後の一本。積まれたままの要求を誰も拾えないので、待たせ続けずに返す。
+        // これが無いと呼び出し側は応答を永久に待ち、UI は「読込中」で固まる。
+        let drained = fail_pending_jobs_no_workers(&queue);
+        if drained > 0 {
+            crate::logger::log(format!(
+                "susie: no workers left; failed {drained} pending request(s)"
+            ));
+        }
+    }
+}
+
+/// 全スロットが閉じたときに、キューに残った要求へエラーを返す。
+/// 以降の enqueue も `workers_gone` で断る。判定と排出を同じロックの中で行うので、
+/// 「空きを見てから積む」間に閉じた要求も取りこぼさない。
+fn fail_pending_jobs_no_workers(queue: &Arc<(Mutex<JobQueue>, Condvar)>) -> usize {
+    let (mtx, cv) = &**queue;
+    let mut drained = 0usize;
+    if let Ok(mut q) = mtx.lock() {
+        q.workers_gone = true;
+        let pending: Vec<Job> = q
+            .priority_jobs
+            .drain(..)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .chain(q.regular_jobs.drain(..))
+            .collect();
+        for job in pending {
+            let _ = job.reply.send(Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "susie: no workers available",
+            )));
+            drained += 1;
+        }
+    }
+    cv.notify_all();
+    drained
 }
 
 fn run_dispatcher(
@@ -914,6 +1027,7 @@ fn run_dispatcher(
     queue: Arc<(Mutex<JobQueue>, Condvar)>,
     mut child: Child,
     mut io: WorkerIo,
+    crashers: &Mutex<HashSet<String>>,
 ) -> DispatcherExit {
     let pid = child.id();
     // 環境変数 MIV_SUSIE_PERF_LOG=1 で 1 ジョブごとの計測ログを出す。
@@ -921,6 +1035,8 @@ fn run_dispatcher(
     let perf_log = std::env::var("MIV_SUSIE_PERF_LOG")
         .ok()
         .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    // このワーカーが返した応答数。落ちたときに「働けていたか」を伝えるために数える。
+    let mut served: u64 = 0;
 
     loop {
         let job = {
@@ -989,12 +1105,26 @@ fn run_dispatcher(
             Err(e) if is_worker_lost(e) => Some(format!("{e}")),
             _ => None,
         };
+        let subject = job.subject.clone();
+        if lost.is_none() {
+            served += 1;
+        }
         let _ = job.reply.send(result);
         if let Some(reason) = lost {
+            // この対象がワーカーを落とした。次からは投げずに即失敗させる。
+            // 記録しないと、同じフォルダを開くたびに同じ画像でワーカーが死に続ける
+            // (失敗したデコードはサムネイルとして残らないので毎回投げられる)。
+            if let Ok(mut set) = crashers.lock() {
+                if set.insert(subject.clone()) {
+                    crate::logger::log(format!(
+                        "susie: {subject} crashed a plugin; it will not be sent again this session"
+                    ));
+                }
+            }
             // 既に死んでいる想定だが、handle を確実に閉じる。
             let _ = child.kill();
             let _ = child.wait();
-            return DispatcherExit::WorkerLost { reason };
+            return DispatcherExit::WorkerLost { reason, served };
         }
     }
 }
@@ -1183,6 +1313,87 @@ mod tests {
                 "{kind:?} must not restart a worker that is still answering"
             );
         }
+    }
+
+    /// 1 件でも返せたワーカーが落ちたら、再起動回数は数え直す。数え続けると、
+    /// たまに落ちるプラグインでも使い続けるうちに必ず枯渇する (実機で 3 スロットとも
+    /// 上限に達して Susie が丸ごと死んだ)。上限が働くのは「起動しても何も返せないまま
+    /// 落ちる」場合だけでよい。
+    #[test]
+    fn a_worker_that_answered_before_dying_does_not_count_toward_the_limit() {
+        assert_eq!(restart_count_after_loss(3, 1), 0);
+        assert_eq!(restart_count_after_loss(MAX_WORKER_RESTARTS, 42), 0);
+        // 何も返せずに落ちたときだけ、回数を持ち越す。
+        assert_eq!(restart_count_after_loss(3, 0), 3);
+        assert_eq!(restart_count_after_loss(0, 0), 0);
+    }
+
+    /// 全スロットが閉じたら、積まれたままの要求へエラーを返す。返さないと呼び出し側は
+    /// 応答を永久に待ち、UI は「読込中」で固まる (実機で確認)。
+    #[test]
+    fn the_last_slot_closing_fails_whatever_is_still_queued() {
+        let queue = Arc::new((
+            Mutex::new(JobQueue {
+                priority_jobs: std::collections::VecDeque::new(),
+                regular_jobs: std::collections::VecDeque::new(),
+                shutdown: false,
+                workers_gone: false,
+            }),
+            Condvar::new(),
+        ));
+        let mut receivers = Vec::new();
+        for priority in [true, false, false] {
+            let (tx, rx) = mpsc::channel();
+            receivers.push(rx);
+            let job = Job {
+                request: vec![1, 2, 3],
+                reply: tx,
+                cancel: None,
+                enqueued_at: std::time::Instant::now(),
+                hint: "test".to_string(),
+                subject: format!("test-{priority}"),
+                priority,
+            };
+            let mut q = queue.0.lock().unwrap();
+            if priority {
+                q.priority_jobs.push_back(job);
+            } else {
+                q.regular_jobs.push_back(job);
+            }
+        }
+
+        assert_eq!(fail_pending_jobs_no_workers(&queue), 3);
+        for rx in receivers {
+            let answer = rx.try_recv().expect("every queued job must be answered");
+            assert!(answer.is_err(), "a queued job must not be left waiting");
+        }
+
+        let q = queue.0.lock().unwrap();
+        assert!(
+            q.workers_gone,
+            "later requests must be refused rather than queued"
+        );
+        assert!(q.priority_jobs.is_empty() && q.regular_jobs.is_empty());
+    }
+
+    /// 一度ワーカーを落とした対象は、二度目から投げずに即失敗させる。失敗した
+    /// デコードはサムネイルとして残らないので、記録しないと同じフォルダを開くたびに
+    /// 同じ画像が投げられ、そのたびにワーカーが死ぬ (実機で確認)。
+    #[test]
+    fn a_subject_that_killed_a_worker_is_not_sent_again() {
+        let pool = empty_pool();
+        assert!(!pool.subject_killed_a_worker("c:/books/bad.pi"));
+        assert_eq!(pool.crashing_subject_count(), 0);
+
+        pool.crashers
+            .lock()
+            .unwrap()
+            .insert("c:/books/bad.pi".to_string());
+
+        assert!(pool.subject_killed_a_worker("c:/books/bad.pi"));
+        assert_eq!(pool.crashing_subject_count(), 1);
+        // 別の対象は巻き添えにしない。
+        assert!(!pool.subject_killed_a_worker("c:/books/good.pi"));
     }
 
     /// 作り直しの間隔は回数に比例して伸び、上限で止まる。crash loop が CPU を
