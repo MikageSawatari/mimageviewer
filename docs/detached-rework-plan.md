@@ -625,7 +625,7 @@ helper 3 本が `impl Into<ContextRef<'a>>` を取り、`From<&ViewerContextBund
 `become_independent_detached_viewer` / `retarget_bookmark_media_open` /
 `split_materialized_physical_context_for_detached_scope` (fork + 絞り込みを 1 本に)。
 
-## ⚠ 未決 (利用者判断): 「独立 detached viewer にする」3 経路のフラグ集合が違う
+## 「独立 detached viewer にする」3 経路のフラグ集合が違う — 調査済み・不具合なし
 
 **②-c1b では意図的に揃えなかった** (揃えると 2 経路の挙動が変わるため)。
 名前だけ分けて集合はそのまま保ってある。
@@ -648,7 +648,44 @@ helper 3 本が `impl Into<ContextRef<'a>>` を取り、`From<&ViewerContextBund
 
 **非対称を意図的だと述べたコミットメッセージもコメントも無い。** 3 経路が別々の時期に
 別々のリストとして育ち、`d3b56c15` は目の前の症状に対応する 1 つだけを足した形に見える。
-ただしライフサイクルが違うので差が正当な可能性も残る。**この段では判断しない。**
+
+### 決着 (2026-08-25、Codex Sol に read-only で調査依頼 → 主要 3 点を自分で照合)
+
+**不具合は無い。差は「どこで消すか」の違いであって「消さない」ではない。**
+
+| 経路 | park 時 | activate 時 | 結果 |
+| --- | --- | --- | --- |
+| passive → active | `pause_background_work_keep_current_frame` が `pending_auto_fs_open` / `pending_return_to_parent` を消す ([viewer_context_registry.rs:1489](../src/app/viewer_context_registry.rs:1489)、呼び出しは [app.rs:37447](../src/app.rs:37447)) | 残り 2 つ | **4 つとも false** |
+| ParkedLive → active | **消さない** (メディアを生かしたまま park するので `pause_background_work_...` を通らない) | 4 つとも | **4 つとも false** |
+| promote | — (mounted context をそのまま取る) | 3 つ | `pdf_prefetch_grace_until` だけ残る |
+
+promote が残す 1 つは**観測できない**。理由 3 つとも確認済み:
+① grace が `Some` になるのは **PDF 仮想フォルダを開いたときだけ** ([app.rs:22495](../src/app.rs:22495) / [:22546](../src/app.rs:22546))、
+② promote は現在のフルスクリーン項目が **video / audio のときしか走らない** ([app.rs:41156](../src/app.rs:41156))、
+③ 消費側 `update_keep_range_and_requests` を呼ぶ `update_thumbnail_frame_bookkeeping` の
+production 呼び出しは [app.rs:65555](../src/app.rs:65555) **1 箇所だけ**で、detached bundle を
+マウントしている `update_active_detached_viewer_context` ([app.rs:65862](../src/app.rs:65862)) より
+**前**に走る。マウント中の値は誰も読まない。
+そもそも grace は絶対時刻 100ms の期限で、読まれれば期限切れとして clear される。
+
+**したがって挙動は変えない。** 3 経路の集合は現状のまま正しい。
+
+### ここから出た②-d への申し送り 3 件
+
+1. **「active detached になる context は 4 つの one-shot がすべて false」という不変条件が、
+   経路によって別の場所で維持されている** (park 時 / activate 時)。これは R2e が畳もうとしている
+   「1 つの不変条件を 2 箇所が分担する」形そのもの。②-d の mount / activate transaction が
+   1 箇所で持てば、**挙動を変えずに** 3 経路が同じ集合になる。今やると挙動変更になるのでやらない。
+2. **active detached 側の `pending_return_to_parent` 消費が、フィールドの documented semantics と
+   違う。** 定義 ([app.rs:16034](../src/app.rs:16034)) は「親のファイル一覧へ戻るナビを解決して流す」
+   だが、active detached の消費は `mem::take` して `close_fullscreen()` するだけ
+   ([app.rs:40478](../src/app.rs:40478))。R2e 由来ではないが、別途見る価値がある。
+3. **caller 側の所有権**: `pending_auto_fs_open` は container dispatcher が走る前に立つことがあり
+   ([app.rs:17962](../src/app.rs:17962))、ZIP dispatch は消費 ([app.rs:20917](../src/app.rs:20917)) より
+   前に promote を試みる ([app.rs:20871](../src/app.rs:20871))。通常の grid 経路は新しい intent を
+   立てる前に旧 context を park する ([ui_main.rs:13082](../src/ui_main.rs:13082)) が、
+   起動引数 / 外部 / 変換アーカイブ経路までは確認できていない。**promote が現に消しているので
+   今のリスクは無い**が、これは 3 つの activate メソッドでは決着しない caller 側の問題。
 
 ## その他
 
