@@ -25139,15 +25139,6 @@ impl App {
         let mut pin_archive_dependencies: std::collections::HashMap<String, Vec<usize>> =
             std::collections::HashMap::new();
         for idx in 0..self.items.len() {
-            // 一時計装 (§1.121): コンテナタイルだけを観測する。判定順は元のままで、
-            // どの条件で脱落したかを型のある key として残すだけ。
-            let probe_generation = self.items_generation;
-            let probe_subject = self.items.get(idx).and_then(pin_probe_subject);
-            let probe = |key: &str, detail: &str| {
-                if let Some(subject) = probe_subject.as_deref() {
-                    log_pin_root_probe(probe_generation, Some(idx), subject, key, detail);
-                }
-            };
             // pin-root の発見は、そのタイルが今どう描かれているかとは無関係な事実に
             // 基づく。以前はサムネイルが `Pending | Evicted` で未 requested のものだけを
             // 見ていたが、`Loaded` と `Failed` は終端状態なので、いったんそこへ落ちた
@@ -25159,7 +25150,6 @@ impl App {
             // root ごとに解決結果を覚える `converted_archive_pin_root_states` が持つ。
             // 解決済みの root はここで DB も cascade も引き直さない。
             if !candidate_indices.contains(&idx) {
-                probe("out_of_scope", "");
                 continue;
             }
             let Some(target) = self
@@ -25169,10 +25159,6 @@ impl App {
             else {
                 continue;
             };
-            probe(
-                "admitted",
-                pin_probe_thumbnail_label(self.thumbnails.get(idx)),
-            );
             let root_key = crate::path_key::normalize_keep_drive(&target.path);
             let root_state = self
                 .converted_archive_pin_root_states
@@ -25458,36 +25444,12 @@ impl App {
             // Block 中も旧 batch の queued 候補を止めるため、admission とは独立して
             // latest scope を共有する。新 worker の起動だけを prefetch gate で抑える。
             pending.update_desired_indices(candidate_indices);
-        } else {
-            // 一時計装 (§1.121): worker を起動しなかったフレームの理由も 1 度だけ残す。
-            // 起動条件そのものは変えていない (Allow のときだけ start)。
-            match decision {
-                PrefetchDecision::Allow { reason } => {
-                    log_pin_root_probe(
-                        self.items_generation,
-                        None,
-                        "gate",
-                        "allow",
-                        &format!("{reason:?}"),
-                    );
-                    self.start_converted_archive_cache_paths_refresh(
-                        candidate_indices,
-                        visible_range,
-                        keep_range,
-                    );
-                }
-                PrefetchDecision::Block { reason } => {
-                    let (key, detail) = match reason {
-                        crate::app::prefetch_policy::BlockReason::ScrollNotIdle { elapsed_ms } => {
-                            ("block_scroll_not_idle", format!("elapsed_ms={elapsed_ms}"))
-                        }
-                        crate::app::prefetch_policy::BlockReason::VisibleStillLoading {
-                            pending,
-                        } => ("block_visible_still_loading", format!("pending={pending}")),
-                    };
-                    log_pin_root_probe(self.items_generation, None, "gate", key, &detail);
-                }
-            }
+        } else if matches!(decision, PrefetchDecision::Allow { .. }) {
+            self.start_converted_archive_cache_paths_refresh(
+                candidate_indices,
+                visible_range,
+                keep_range,
+            );
         }
     }
 
@@ -69108,72 +69070,6 @@ fn folder_pin_load_path(
         .map(Path::to_path_buf)
 }
 
-// ── 一時計装: RAR 代表サムネイルの pin-root discovery (next-release-backlog §1.121) ──
-//
-// 親フォルダのタイルが RAR の代表サムネ指定を反映しない不具合で、pin-root の発見が
-// どの条件で脱落しているかを 1 回の再現で確定させるための観測。無言の早期 return に
-// 理由を型で残すのが目的で、挙動は一切変えない。**原因が確定したら撤去する。**
-
-/// pin を持ち得る item (コンテナ) だけを観測対象にする。画像 / 動画タイルは
-/// `folder_pin_lookup_target_for_item` が必ず None を返すので記録しない。
-fn pin_probe_subject(item: &GridItem) -> Option<String> {
-    let short = |path: &Path| {
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .map(str::to_owned)
-            .unwrap_or_else(|| path.display().to_string())
-    };
-    match item {
-        GridItem::Folder(path) => Some(format!("folder:{}", short(path))),
-        GridItem::ZipFile(path) => Some(format!("zip:{}", short(path))),
-        GridItem::PdfFile(path) => Some(format!("pdf:{}", short(path))),
-        GridItem::ConvertibleArchive { path, .. } => Some(format!("archive:{}", short(path))),
-        GridItem::ZipDir {
-            zip_path,
-            dir_prefix,
-            ..
-        } => Some(format!("zipdir:{}/{dir_prefix}", short(zip_path))),
-        _ => None,
-    }
-}
-
-fn pin_probe_thumbnail_label(state: Option<&ThumbnailState>) -> &'static str {
-    match state {
-        None => "none",
-        Some(ThumbnailState::Pending) => "pending",
-        Some(ThumbnailState::Loaded { .. }) => "loaded",
-        Some(ThumbnailState::Failed) => "failed",
-        Some(ThumbnailState::Evicted) => "evicted",
-    }
-}
-
-/// 同じ `(items_generation, idx, subject, key)` は 1 度しか出さない。毎フレーム走る
-/// ループから呼ぶため、これが無いとログが洪水になる。
-fn log_pin_root_probe(generation: u64, idx: Option<usize>, subject: &str, key: &str, detail: &str) {
-    static SEEN: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashSet<(u64, Option<usize>, String, String)>>,
-    > = std::sync::OnceLock::new();
-    let seen = SEEN.get_or_init(Default::default);
-    {
-        let mut guard = match seen.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        // 長時間の閲覧でも上限を持たせる。消えても観測が 1 回増えるだけで害はない。
-        if guard.len() > 8192 {
-            guard.clear();
-        }
-        if !guard.insert((generation, idx, subject.to_owned(), key.to_owned())) {
-            return;
-        }
-    }
-    let idx_label = idx.map_or_else(|| "-".to_owned(), |i| i.to_string());
-    let sep = if detail.is_empty() { "" } else { " " };
-    crate::logger::log(format!(
-        "[pin-probe] gen={generation} idx={idx_label} {subject} {key}{sep}{detail}"
-    ));
-}
-
 impl App {
     /// サムネイル cache key に full-path を使うべきコンテキストか。
     ///
@@ -70230,12 +70126,6 @@ fn apply_folder_thumb_pin(
 ) -> LoadRequest {
     let container_key = crate::path_key::normalize_keep_drive(container);
     let Some(source) = pin_map.get(&container_key) else {
-        // 一時計装 (§1.121): pin 行が無いのは通常経路でもあるが、「ピンを付けたはずの
-        // container で引けていない」を区別できるように残す。pin が 1 つも無い環境では
-        // 出さない。container ごとに 1 度だけ。
-        if !pin_map.is_empty() {
-            log_pin_root_probe(0, None, &format!("apply:{container_key}"), "no_pin_row", "");
-        }
         return base_req;
     };
     // container / source の不整合を弾く (Codex Phase B P2 指摘)。
@@ -70393,16 +70283,6 @@ fn apply_folder_thumb_pin(
     } else {
         resolved.abs_path.clone()
     };
-
-    // 一時計装 (§1.121): ピンが実際に適用された request まで到達したことを残す。
-    // ここが出るのに絵が変わらなければ、原因は下流 (cache key / worker / texture) にある。
-    log_pin_root_probe(
-        0,
-        None,
-        &format!("apply:{container_key}"),
-        "applied",
-        &format!("kind={:?} path={}", resolved.kind, request_path.display()),
-    );
 
     let (edit_preview_key, edit_preview_validate_container) = pinned_edit_preview_target(
         resolved.kind,

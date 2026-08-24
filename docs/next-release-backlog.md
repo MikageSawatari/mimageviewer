@@ -1417,6 +1417,38 @@ passive detached は通常どおり release で窓を activate するが、選�
   無限消費せず persistent notice になることを統合テストする。
 - 規模 / 優先度: Medium (3〜7日) / P2。利用者のプラグイン名・画像・ログが得られれば優先度を再判断する。
 
+### 1.121 RAR を代表サムネにしても親フォルダのタイルに出ない — 専用スレ >>302 ✅ 修正済み (2026-08-24、実機確認済み)
+
+- 出典: 専用スレ >>302。RAR があるフォルダで RAR を `P` で代表サムネに指定し、親フォルダへ移動すると
+  そのサムネイルが出ない。利用者の切り分けでは v3.1.0 は正常、v3.1.1 で発生。
+- **原因 (計装を入れて 1 回の再現で確定)**。`archive cache unavailable → base_req` と
+  `thumb_not_eligible failed` が同じ 1 秒の中に並んで記録された:
+  - pin の解決自体は成功していた (cascade → `ArchiveFirstImage` → `dummy-book-002.rar`、pinned_key も正しい)。
+    捨てていたのは `converted_archive_cache_paths` に対象 RAR が載っていなかったため。
+  - 載らなかったのは、pin-root の収集 ([app.rs:25141](../src/app.rs:25141)) が
+    `candidate && !requested && (Pending | Evicted)` を要求していたから。
+    **`Loaded` と `Failed` は終端状態で、そこへ落ちたコンテナの pin は二度と解決されない。**
+  - **中身がアーカイブだけのフォルダは自動選定が代表画像を選べず (アーカイブを展開しない仕様)、
+    必ず `Failed` になる。**そのため出口のないループになっていた:
+    ピンが捨てられる → 自動選定が走る → 失敗する → `Failed` → 発見されない → ピンが捨てられる。
+  - `Loaded` は反対側から同じ穴に落ちる (画像が 1 枚混ざったフォルダはその画像を描いたまま固定)。
+  - 初めて成立させたのは `bc4adbdd` (v3.1.2、prefetch gate と admission 制限の追加)。
+    `0f346e20` は下流を整備しただけで、見つからない root は救えない。
+- **v3.1.1 の境界は未確定のまま**。v3.1.0..v3.1.1 で `folder_thumb_pins.rs` / `thumb_loader.rs` /
+  `rar_loader.rs` / `zip_loader.rs` は blob が同一、`app.rs` の 3 コミットもこの経路に差分が無い
+  (ClaudeCode と Codex が独立に確認)。現行の原因は上記で閉じているので、修正には支障しない。
+- **修正**: pin-root の発見条件から**サムネイルの状態と進行中要求を外した**。ピンの有無は、
+  そのタイルが今どう描かれているかとは無関係な事実である。コストを抑える役目は可視範囲の
+  絞り込み (`candidate_indices`) と root ごとの解決結果の記憶
+  (`converted_archive_pin_root_states`) が引き継ぐ。解決済みの root は DB も cascade も引き直さない。
+- **回帰テスト**: タイルを終端状態にしてから collector を回す 2 本
+  (`converted_archive_pin_root_is_found_when_the_folder_tile_already_failed` /
+  `..._while_the_folder_tile_is_requested`)。既存の archive-through-folder-pin テストは
+  `start_converted_archive_cache_paths_refresh` を直接呼ぶため、描画済みのタイルを一度も見ておらず
+  この退行を捕まえられなかった。
+- 教訓: **無言の早期 return に理由を型で残してから直した**。事前の推定は
+  ClaudeCode / Codex とも `already_requested` か `Loaded` で、**どちらも外れていた** (実際は `Failed`)。
+
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断
