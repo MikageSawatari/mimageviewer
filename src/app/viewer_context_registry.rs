@@ -1,12 +1,14 @@
 // Stage ②-d wires this state machine to the production viewer-context payload.
-#![allow(dead_code)]
 
+use super::*;
 use std::collections::HashMap;
 
 /// A payload's identity, independent of its window and of the current main binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[allow(dead_code)]
 struct ViewerContextId(u64);
 
+#[allow(dead_code)]
 impl ViewerContextId {
     fn serial(self) -> u64 {
         self.0
@@ -14,6 +16,7 @@ impl ViewerContextId {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 enum ContextResidence {
     Mounted,
     AtRest,
@@ -23,6 +26,7 @@ enum ContextResidence {
     Unknown,
 }
 
+#[allow(dead_code)]
 enum Projection {
     Mounted(ViewerContextId),
     Building {
@@ -32,18 +36,21 @@ enum Projection {
     },
 }
 
+#[allow(dead_code)]
 enum Slot<P> {
     AtRest(P),
     Retiring(P),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 enum ForkPolicy {
     LiveMediaPark { window_id: u64 },
     MaterializedStillOpen,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 enum TableOp {
     ReplaceProjectionWithFreshEmpty,
     ForkProjectionIntoTransient(ForkPolicy),
@@ -54,6 +61,7 @@ enum TableOp {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 enum BindError {
     WindowOwnedBy(ViewerContextId),
     ContextOwnedBy(u64),
@@ -62,12 +70,14 @@ enum BindError {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 struct MountError {
     id: ViewerContextId,
     residence: ContextResidence,
 }
 
 #[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 enum RetireError {
     /// App is mid-build; nothing can be retired.
     Building,
@@ -77,6 +87,7 @@ enum RetireError {
     IsMain,
 }
 
+#[allow(dead_code)]
 enum PendingTransition {
     BeginBuild {
         reserved: ViewerContextId,
@@ -115,6 +126,7 @@ enum PendingTransition {
 /// rollback: a payload already deposited in a slot can remain there. The protocol guarantees only
 /// that replacement keeps a payload in the projection at every instant (I1b), and that bindings are
 /// not published before a successful finalizer (I8).
+#[allow(dead_code)]
 struct ContextTable<P> {
     projection: Projection,
     slots: HashMap<ViewerContextId, Slot<P>>,
@@ -125,6 +137,7 @@ struct ContextTable<P> {
     pending: Option<PendingTransition>,
 }
 
+#[allow(dead_code)]
 impl<P> ContextTable<P> {
     fn new() -> Self {
         let main = ViewerContextId(1);
@@ -625,6 +638,1642 @@ impl<P> ContextTable<P> {
             Some(Slot::Retiring(payload)) => Some(payload),
             Some(Slot::AtRest(_)) | None => None,
         }
+    }
+}
+
+// --- Production ViewerContextBundle ownership primitives (stage ②-b) ---
+
+#[cfg(windows)]
+pub(in crate::app) struct ViewerContextBundle {
+    pub(in crate::app) address: String,
+    pub(in crate::app) current_folder: Option<PathBuf>,
+    pub(in crate::app) navigation_scope: ViewerNavigationScope,
+    pub(in crate::app) archive_source_override: Option<PathBuf>,
+    pub(in crate::app) zip_nav: Option<crate::zip_tree::ZipNavState>,
+    pub(in crate::app) stack_mode_requested: bool,
+    pub(in crate::app) stack_view: Option<crate::filename_stack::StackView>,
+    pub(in crate::app) stack_showing_flat: bool,
+    pub(in crate::app) stack_active_rule: Option<String>,
+    pub(in crate::app) stack_script_error: Option<String>,
+    pub(in crate::app) stack_toggle_select_path: Option<PathBuf>,
+    pub(in crate::app) items: Vec<GridItem>,
+    pub(in crate::app) items_generation: u64,
+    pub(in crate::app) visible_indices: Vec<usize>,
+    /// `items` と同じ添字の正規化済み basename と、その worker lifecycle。
+    /// query / tokens / debounce は App 全体で同じ絞り込み条件を使うため swap しないが、
+    /// 導出 cache は generation 空間を共有しない viewer context と一緒に所有する。
+    /// failed generation も別 context の同値 generation の build を抑止しないようここに含める。
+    pub(in crate::app) facet_name_cache: Vec<Box<str>>,
+    pub(in crate::app) facet_name_cache_generation: Option<u64>,
+    pub(in crate::app) facet_name_cache_pending: Option<facet_name_filter::FacetNameCachePending>,
+    pub(in crate::app) facet_name_cache_failed_generation: Option<u64>,
+    pub(in crate::app) thumbnails: Vec<ThumbnailState>,
+    pub(in crate::app) image_metas: Vec<Option<(i64, i64)>>,
+    pub(in crate::app) video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
+    pub(in crate::app) auto_aspect: crate::auto_aspect::AutoAspectState,
+    pub(in crate::app) selected: Option<usize>,
+    pub(in crate::app) grid_click_selection_anchor: Option<GridClickSelectionAnchor>,
+    pub(in crate::app) scroll_offset_y: f32,
+    pub(in crate::app) scroll_to_selected: bool,
+    pub(in crate::app) pending_grid_scroll: Option<GridScrollIntent>,
+    pub(in crate::app) requested: std::collections::HashMap<usize, bool>,
+    pub(in crate::app) idle_upgrade_cache_bypass_ineligible: std::collections::HashSet<usize>,
+    pub(in crate::app) keep_range: (usize, usize),
+    pub(in crate::app) keep_set: std::collections::HashSet<usize>,
+    pub(in crate::app) thumbnail_eviction_generation: Option<u64>,
+    pub(in crate::app) details_thumb_suppression_applied: bool,
+    pub(in crate::app) details_hover_thumb_idx: Option<usize>,
+    pub(in crate::app) details_hover_thumb_viewport_open: bool,
+    pub(in crate::app) texture_backlog: Vec<crate::thumb_loader::ThumbMsg>,
+    pub(in crate::app) details_order: Vec<usize>,
+    pub(in crate::app) details_order_revision: u64,
+    pub(in crate::app) details_cell_content_revisions: DetailsCellContentRevisions,
+    pub(in crate::app) details_tag_prewarm_indices: Vec<usize>,
+    pub(in crate::app) details_lazy_meta: std::collections::HashMap<String, DetailsLazyMeta>,
+    pub(in crate::app) details_meta_pending: Option<DetailsMetaPending>,
+    pub(in crate::app) details_lazy_visible_revision: u64,
+    pub(in crate::app) details_image_dims_state: LazyColumnState,
+    pub(in crate::app) metadata_cache:
+        std::collections::HashMap<String, Option<crate::png_metadata::AiMetadata>>,
+    pub(in crate::app) exif_cache:
+        std::collections::HashMap<String, Option<crate::exif_reader::ExifInfo>>,
+    pub(in crate::app) xmp_cache:
+        std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
+    pub(in crate::app) xmp_panorama_info:
+        std::collections::HashMap<String, Option<crate::xmp_reader::XmpPanoramaInfo>>,
+    pub(in crate::app) metadata_pending: Option<MetadataLoadPending>,
+    /// 一覧ごとの tags.db 表示キャッシュ。detached context の実フォルダ load が
+    /// main 一覧のタグを消さないよう、item 列と同じ ownership で交換する。
+    pub(in crate::app) tags_cache: std::collections::HashMap<String, Vec<String>>,
+    pub(in crate::app) tag_prewarm_pending: Option<crate::tag_prewarm::TagPrewarmPending>,
+    pub(in crate::app) tag_prewarm_queued: std::collections::HashSet<usize>,
+    pub(in crate::app) tag_legacy_seed_pending:
+        Option<crate::tag_legacy_seed_worker::LegacySeedPending>,
+    pub(in crate::app) pending_finalize: std::collections::HashSet<usize>,
+    // ── per-context ロード複合体 (review-v2.3.0 P2-8/P2-9) ──
+    // thumb channel (tx/rx)・cancel_token・ワーカーキュー 2 本は `start_loading_items` が
+    // ロードごとに作り直す「現用セット」で、コンテキストに属する。bundle に含めないと
+    // (a) detached book context の load_zip/pdf_as_folder が main の cancel_token を flip し、
+    //     main の動画サムネ抽出 (再リクエスト経路なし) を恒久停止させる (P2-9)、
+    // (b) channel/token が global なせいで bundle 済み bookkeeping (requested 等) が swap 後に
+    //     信用できず、swap のたびに clear → 毎フレーム再エンキュー → サムネ重複デコード
+    //     churn になる (P2-8)。
+    pub(in crate::app) tx: mpsc::Sender<ThumbMsg>,
+    pub(in crate::app) rx: mpsc::Receiver<ThumbMsg>,
+    pub(in crate::app) cancel_token: Arc<AtomicBool>,
+    pub(in crate::app) reload_queue: Option<Arc<NotifyQueue>>,
+    pub(in crate::app) heavy_io_queue: Option<Arc<NotifyQueue>>,
+    // worker が out-of-keep skip / 優先度計算に読む共有 atomic も per-context にする。
+    // global のままだと (a) detached ロードの初期化 (0,0 store) が main の keep range を
+    // 一瞬潰して可視サムネの skip churn を起こし、(b) detached の queue 項目が以後
+    // main の keep range で gate され続ける (review-v2.3.0 hunt P3)。
+    pub(in crate::app) scroll_hint: Arc<AtomicUsize>,
+    pub(in crate::app) visible_end_shared: Arc<AtomicUsize>,
+    pub(in crate::app) keep_start_shared: Arc<AtomicUsize>,
+    pub(in crate::app) keep_end_shared: Arc<AtomicUsize>,
+    pub(in crate::app) last_vis_range: (usize, usize),
+    pub(in crate::app) vis_settle_at: Option<std::time::Instant>,
+    pub(in crate::app) vis_first_logged: bool,
+    pub(in crate::app) vis_all_logged: bool,
+    pub(in crate::app) folder_nav_pending: Option<FolderNavPending>,
+    pub(in crate::app) folder_pane_open_pending: Option<FolderPaneOpenPending>,
+    pub(in crate::app) pending_folder_nav_steps: i32,
+    pub(in crate::app) pending_folder_nav_mode: FolderNavMode,
+    pub(in crate::app) search_filter: Option<std::collections::HashSet<usize>>,
+    pub(in crate::app) search_filter_origin_folder: Option<PathBuf>,
+    pub(in crate::app) checked: std::collections::HashSet<usize>,
+    pub(in crate::app) rotation_cache:
+        std::collections::HashMap<usize, crate::rotation_db::Rotation>,
+    pub(in crate::app) page_dims_cache: crate::page_dims::PageDimsCache,
+    pub(in crate::app) rating_cache: std::collections::HashMap<usize, u8>,
+    /// App-global な path rating 更新をこの context の idx cache へ反映済みの世代。
+    pub(in crate::app) rating_session_write_seen_generation: u64,
+    pub(in crate::app) metadata_import_refresh_index: Option<MetadataImportRefreshIndex>,
+    pub(in crate::app) current_folder_rating_cache: Option<u8>,
+    pub(in crate::app) current_folder_last_mtime: Option<std::time::SystemTime>,
+    pub(in crate::app) current_folder_signature: Option<u64>,
+    pub(in crate::app) folder_pin_map:
+        std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    pub(in crate::app) converted_archive_cache_paths:
+        std::collections::HashMap<String, ConvertedArchiveSourceState>,
+    pub(in crate::app) converted_archive_pin_root_states:
+        std::collections::HashMap<String, ConvertedArchivePinRootState>,
+    pub(in crate::app) converted_archive_cache_paths_pending:
+        Option<ConvertedArchiveCachePathsPending>,
+    pub(in crate::app) current_color_cache_map: Option<
+        Arc<std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>>,
+    >,
+    pub(in crate::app) current_color_catalog: Option<Arc<crate::catalog::CatalogDb>>,
+    /// VST3 startup load 完了まで start_fs_load を保留している、この context の media idx。
+    pub(in crate::app) vst3_deferred_media_open: Option<usize>,
+    pub(in crate::app) fullscreen_idx: Option<usize>,
+    pub(in crate::app) viewer_session: ViewerSession,
+    pub(in crate::app) native_video_in_window_active: bool,
+    pub(in crate::app) video_audio_mode: Option<usize>,
+    pub(in crate::app) video_audio_vst: Option<VideoAudioVstState>,
+    pub(in crate::app) video_audio_mode_entry_target: Option<(
+        crate::video::NativeVideoPlacement,
+        windows::Win32::Foundation::RECT,
+        u64,
+    )>,
+    pub(in crate::app) video_audio_exit_pending: Option<VideoAudioExitPending>,
+    pub(in crate::app) panorama_state: Option<crate::panorama::PanoramaState>,
+    pub(in crate::app) pano_toast_shown_for_current_fs: bool,
+    pub(in crate::app) analysis_mode: bool,
+    pub(in crate::app) analysis_hover_color: Option<[u8; 4]>,
+    pub(in crate::app) analysis_pinned_color: Option<[u8; 4]>,
+    pub(in crate::app) analysis_grayscale: bool,
+    pub(in crate::app) analysis_mosaic_grid: bool,
+    pub(in crate::app) analysis_filter_mag: u8,
+    pub(in crate::app) analysis_guide_drag: Option<(egui::Pos2, egui::Pos2, u8)>,
+    pub(in crate::app) view_trim_mode: bool,
+    pub(in crate::app) view_trim_apply_mode: crate::view_trim::ViewTrimApplyMode,
+    pub(in crate::app) view_trim_page_apply_root_idx: Option<usize>,
+    pub(in crate::app) view_trim_page_spread_separate: bool,
+    pub(in crate::app) view_trim_book_settings: crate::view_trim::ViewTrimBookSettings,
+    pub(in crate::app) view_trim_page_overrides:
+        std::collections::HashMap<usize, crate::view_trim::ViewTrimPageOverride>,
+    pub(in crate::app) view_trim_dirty_page_overrides: std::collections::HashSet<usize>,
+    pub(in crate::app) view_trim_save_pending: bool,
+    pub(in crate::app) fs_cache: ItemsGenerationMap<FsCacheEntry>,
+    pub(in crate::app) fs_lanczos_cache: crate::gpu_lanczos::GpuLanczosCache,
+    pub(in crate::app) fs_margin_bbox_cache:
+        std::collections::HashMap<usize, (u64, usize, Option<egui::Rect>)>,
+    pub(in crate::app) input_generation: std::collections::HashMap<usize, u64>,
+    pub(in crate::app) fs_pending: ItemsGenerationMap<FsPendingValue>,
+    pub(in crate::app) fullscreen_pdf_promotion: FullscreenPdfPromotionState,
+    /// この viewer context の実描画先から得た PDF 初回レンダターゲット。
+    pub(in crate::app) fs_pdf_display_target: Option<crate::pdf_loader::PdfDisplayTarget>,
+    pub(in crate::app) fs_early_dims: ItemsGenerationMap<[usize; 2]>,
+    pub(in crate::app) fs_upload_backlog: FsUploadBacklog,
+    pub(in crate::app) top_level_grid_view: top_level_grid_view::TopLevelGridView,
+    pub(in crate::app) items_are_global_search_view: bool,
+    pub(in crate::app) items_are_tag_view: bool,
+    pub(in crate::app) items_are_reading_history_view: bool,
+    pub(in crate::app) items_are_bookmark_view: bool,
+    pub(in crate::app) items_are_rating_view: bool,
+    pub(in crate::app) items_are_subfolder_expansion_view: bool,
+    pub(in crate::app) items_are_smart_folder_view: bool,
+    pub(in crate::app) items_are_drive_list: bool,
+    pub(in crate::app) reading_history_return_from: Option<PathBuf>,
+    pub(in crate::app) bookmark_view_state: Option<BookmarkViewState>,
+    pub(in crate::app) bookmark_open_pending: Option<crate::bookmark_browser::PendingBookmarkOpen>,
+    pub(in crate::app) fs_open_intent_from_grid: bool,
+    pub(in crate::app) pending_detached_video_host_switch: Option<DetachedVideoHostSwitchPending>,
+    pub(in crate::app) fs_zoom: f32,
+    pub(in crate::app) fs_pan: egui::Vec2,
+    pub(in crate::app) fs_zoom_active: bool,
+    pub(in crate::app) fs_zoom_aiming: bool,
+    pub(in crate::app) fs_zoom_factor: f32,
+    pub(in crate::app) fs_zoom_pdf_rerender_idx: Option<usize>,
+    pub(in crate::app) fs_zoom_pdf_rerender_zoom: f32,
+    pub(in crate::app) fs_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
+    pub(in crate::app) fs_vertical_scroll: f32,
+    pub(in crate::app) fs_seek_drag_active: bool,
+    pub(in crate::app) fs_seek_overlay_visible: bool,
+    pub(in crate::app) fs_vertical_cache_keep_set: std::collections::HashSet<usize>,
+    pub(in crate::app) continuous_page_transitions:
+        std::collections::HashMap<usize, ContinuousPageTransition>,
+    pub(in crate::app) fs_free_rotation: f32,
+    pub(in crate::app) fs_rotation_drag_start: Option<(egui::Pos2, f32)>,
+    pub(in crate::app) analysis_zoom: f32,
+    pub(in crate::app) analysis_pan: egui::Vec2,
+    pub(in crate::app) analysis_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
+    pub(in crate::app) analysis_overlay_cache: Option<(
+        egui::TextureHandle,
+        u8,
+        Option<[u8; 4]>,
+        f32,
+        egui::Vec2,
+        usize,
+    )>,
+    pub(in crate::app) analysis_hist_cache:
+        Option<(f32, egui::Vec2, usize, [u32; 360], [u32; 256], [u32; 256])>,
+    pub(in crate::app) analysis_sv_cache: Option<(f32, egui::Vec2, usize, egui::TextureHandle)>,
+    pub(in crate::app) spread_mode: crate::settings::SpreadMode,
+    pub(in crate::app) spread_shift_anchor_idx: Option<usize>,
+    pub(in crate::app) reading_flow: crate::settings::ReadingFlow,
+    pub(in crate::app) reading_direction: crate::settings::ReadingDirection,
+    pub(in crate::app) slideshow_playing: bool,
+    pub(in crate::app) slideshow_next_at: std::time::Instant,
+    pub(in crate::app) slideshow_anchor_idx: Option<usize>,
+    pub(in crate::app) continuous_reading_scroll_transition:
+        Option<ContinuousReadingScrollTransition>,
+    pub(in crate::app) slideshow_scroll_range_cache: Option<(usize, f32, f32)>,
+    pub(in crate::app) pdf_password_request: Option<PdfPasswordRequest>,
+    pub(in crate::app) pdf_current_password: Option<String>,
+    pub(in crate::app) pdf_password_pending_save: Option<(PathBuf, String)>,
+    pub(in crate::app) pdf_enumerate_pending: Option<(
+        PathBuf,
+        Option<String>,
+        crate::pdf_loader::PdfEnumerateHandle,
+    )>,
+    pub(in crate::app) zip_enumerate_pending: Option<ZipEnumeratePending>,
+    pub(in crate::app) fs_nav_after_pdf_enumerate: Option<DeferredFsReopen>,
+    pub(in crate::app) pending_auto_fs_open: bool,
+    pub(in crate::app) pending_return_to_parent: bool,
+    pub(in crate::app) pdf_placeholder_count: Option<u32>,
+    pub(in crate::app) cached_nav_indices: Option<Vec<usize>>,
+    pub(in crate::app) cached_fs_seek_info: Option<(usize, crate::ui_fullscreen::FsSeekInfo)>,
+    pub(in crate::app) fs_nav_locked_gen: Option<u64>,
+    pub(in crate::app) fs_nav_dropped_block_signature: Option<String>,
+    pub(in crate::app) fs_nav_dropped_block_count: u32,
+    pub(in crate::app) fs_load_skip_signature: Option<String>,
+    pub(in crate::app) fs_holdover_tex: Option<FsHoldover>,
+    pub(in crate::app) fs_boundary_hint: Option<crate::ui_fullscreen::FsBoundaryHint>,
+    pub(in crate::app) virtual_folder_writeback: Option<VirtualFolderWriteback>,
+    pub(in crate::app) pdf_prefetch_grace_until: Option<std::time::Instant>,
+    pub(in crate::app) thumb_pixels:
+        std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
+    pub(in crate::app) thumb_edit_preview_layers: std::collections::HashMap<
+        usize,
+        std::sync::Arc<Vec<crate::edit_preview_cache::CachedAnnotationLayer>>,
+    >,
+    pub(in crate::app) thumb_edit_preview_keys: std::collections::HashMap<usize, String>,
+    pub(in crate::app) thumb_adjust_tex: std::collections::HashMap<usize, egui::TextureHandle>,
+    pub(in crate::app) passthrough_rendition_cache: PassthroughRenditionCache,
+    pub(in crate::app) adjustment_page_params:
+        std::collections::HashMap<usize, crate::adjustment::AdjustParams>,
+    pub(in crate::app) local_adjust_page_layers:
+        std::collections::HashMap<usize, Vec<local_adjust_core::LocalAdjustmentLayer>>,
+    pub(in crate::app) local_adjust_pages: std::collections::HashSet<usize>,
+    pub(in crate::app) local_adjust_selected_layers: std::collections::HashMap<usize, usize>,
+    pub(in crate::app) local_adjust_generation: std::collections::HashMap<usize, u64>,
+    pub(in crate::app) local_adjust_cache:
+        std::collections::HashMap<LocalAdjustResultKey, LocalAdjustCacheEntry>,
+    pub(in crate::app) local_adjust_pending:
+        std::collections::HashMap<usize, LocalAdjustRenderPending>,
+    pub(in crate::app) export_crop_page_settings:
+        std::collections::HashMap<usize, crate::export_crop::CropSettings>,
+    pub(in crate::app) export_crop_pages: std::collections::HashSet<usize>,
+    pub(in crate::app) mask_pages: std::collections::HashSet<usize>,
+    pub(in crate::app) comic_pages: std::collections::HashSet<usize>,
+    pub(in crate::app) conceal_pages: std::collections::HashSet<usize>,
+    pub(in crate::app) erase_mask_generation: std::collections::HashMap<usize, u64>,
+    pub(in crate::app) conceal_mask_generation: std::collections::HashMap<usize, u64>,
+    pub(in crate::app) edit_result_cache: std::collections::HashMap<EditResultKey, EditResultEntry>,
+    pub(in crate::app) final_ai_cache: std::collections::HashMap<FinalAiKey, FinalAiEntry>,
+    pub(in crate::app) final_ai_pending: std::collections::HashMap<FinalAiKey, FinalAiPending>,
+    pub(in crate::app) final_ai_failed: std::collections::HashSet<FinalAiKey>,
+    pub(in crate::app) final_composite_cache: FinalCompositeCache,
+    pub(in crate::app) final_effect_pending:
+        std::collections::HashMap<FinalCompositeKey, FinalEffectPending>,
+    pub(in crate::app) adjustment_cache: std::collections::HashMap<usize, FsCacheEntry>,
+    pub(in crate::app) erase_result_cache:
+        std::collections::HashMap<EraseResultKey, EraseResultCacheEntry>,
+    pub(in crate::app) erase_preview_cache:
+        std::collections::HashMap<usize, ErasePreviewCacheEntry>,
+    pub(in crate::app) erase_base_cache:
+        std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
+    pub(in crate::app) conceal_base_cache:
+        std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
+    pub(in crate::app) conceal_cache: std::collections::HashMap<usize, ConcealCacheEntry>,
+    pub(in crate::app) comic_cache: std::collections::HashMap<usize, ComicCacheEntry>,
+    pub(in crate::app) comic_bake_pending: std::collections::HashMap<usize, ComicBakePending>,
+    pub(in crate::app) erase_inpaint_pending: std::collections::HashMap<
+        crate::ui_erase::EraseInpaintPendingKey,
+        crate::ui_erase::EraseInpaintPending,
+    >,
+    pub(in crate::app) ai_classify_cache:
+        std::collections::HashMap<usize, crate::ai::ImageCategory>,
+    pub(in crate::app) normalize_ui_states:
+        std::collections::HashMap<usize, crate::video::normalize_types::NormalizeUiState>,
+    pub(in crate::app) normalize_auto_scan_suppressed: std::collections::HashSet<usize>,
+    pub(in crate::app) music_bookmarks: Vec<crate::video_bookmarks::VideoBookmarkMeta>,
+    pub(in crate::app) music_bookmarks_loaded_for: Option<PathBuf>,
+    pub(in crate::app) last_loop_pos: std::collections::HashMap<usize, (f64, u64)>,
+}
+
+#[cfg(windows)]
+impl Drop for ViewerContextBundle {
+    /// bundle 化したロード複合体 (review-v2.3.0 P2-8/P2-9) の後始末。detached 窓の close /
+    /// モード切替の一括 clear / 新メディアによる parked 窓の強制 close では bundle ごと
+    /// 破棄されるが、この context の worker pool (通常 5〜14 スレッド) は cancel が立たないと
+    /// queue の condvar 待ちで永久残留する (窓の開閉のたびに 1 プールずつ蓄積するスレッド
+    /// リーク、review-v2.3.0 hunt P2)。cancel を立てて両キューを notify すれば worker は
+    /// 起床 → cancel 検知 → 退出する。swap は参照パターンの destructure なので Drop と
+    /// 両立し、空 bundle (`empty()`) の drop は誰も掴んでいない token を立てるだけの no-op。
+    fn drop(&mut self) {
+        self.cancel_token
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(q) = &self.reload_queue {
+            q.1.notify_all();
+        }
+        if let Some(q) = &self.heavy_io_queue {
+            q.1.notify_all();
+        }
+        if let Some(pending) = self.tag_prewarm_pending.as_ref() {
+            pending.cancel();
+        }
+        if let Some(pending) = self.tag_legacy_seed_pending.as_ref() {
+            pending.cancel();
+        }
+        if let Some(pending) = self.metadata_pending.as_ref() {
+            pending.cancel();
+        }
+        if let Some(pending) = self.converted_archive_cache_paths_pending.as_ref() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        if let Some(pending) = self.folder_nav_pending.as_ref() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        if let Some(pending) = self.folder_pane_open_pending.as_ref() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        for pending in self.final_effect_pending.values() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl ViewerContextBundle {
+    pub(in crate::app) fn set_items_generation(&mut self, items_generation: u64) {
+        self.items_generation = items_generation;
+        self.fs_cache.set_items_generation(items_generation);
+        self.fs_pending.set_items_generation(items_generation);
+        self.fs_early_dims.set_items_generation(items_generation);
+        self.fs_upload_backlog
+            .set_items_generation(items_generation);
+    }
+
+    pub(in crate::app) fn empty() -> Self {
+        // per-context ロード複合体: 空コンテキストは「誰も繋がっていない」fresh channel と
+        // token を持つ (App::new と同じ初期状態。この tx を掴む worker は存在しないので
+        // rx は常に Empty を返す)。
+        let (tx, rx) = mpsc::channel();
+        Self {
+            address: String::new(),
+            current_folder: None,
+            navigation_scope: ViewerNavigationScope::Main,
+            archive_source_override: None,
+            zip_nav: None,
+            stack_mode_requested: false,
+            stack_view: None,
+            stack_showing_flat: false,
+            stack_active_rule: None,
+            stack_script_error: None,
+            stack_toggle_select_path: None,
+            items: Vec::new(),
+            items_generation: 0,
+            visible_indices: Vec::new(),
+            facet_name_cache: Vec::new(),
+            facet_name_cache_generation: None,
+            facet_name_cache_pending: None,
+            facet_name_cache_failed_generation: None,
+            thumbnails: Vec::new(),
+            image_metas: Vec::new(),
+            video_thumb_overrides: std::collections::HashMap::new(),
+            auto_aspect: crate::auto_aspect::AutoAspectState::default(),
+            selected: None,
+            grid_click_selection_anchor: None,
+            scroll_offset_y: 0.0,
+            scroll_to_selected: false,
+            pending_grid_scroll: None,
+            requested: std::collections::HashMap::new(),
+            idle_upgrade_cache_bypass_ineligible: std::collections::HashSet::new(),
+            keep_range: (0, 0),
+            keep_set: std::collections::HashSet::new(),
+            thumbnail_eviction_generation: None,
+            details_thumb_suppression_applied: false,
+            details_hover_thumb_idx: None,
+            details_hover_thumb_viewport_open: false,
+            texture_backlog: Vec::new(),
+            details_order: Vec::new(),
+            details_order_revision: 0,
+            details_cell_content_revisions: DetailsCellContentRevisions::default(),
+            details_tag_prewarm_indices: Vec::new(),
+            details_lazy_meta: std::collections::HashMap::new(),
+            details_meta_pending: None,
+            details_lazy_visible_revision: 0,
+            details_image_dims_state: LazyColumnState::Disabled,
+            metadata_cache: std::collections::HashMap::new(),
+            exif_cache: std::collections::HashMap::new(),
+            xmp_cache: std::collections::HashMap::new(),
+            xmp_panorama_info: std::collections::HashMap::new(),
+            metadata_pending: None,
+            tags_cache: std::collections::HashMap::new(),
+            tag_prewarm_pending: None,
+            tag_prewarm_queued: std::collections::HashSet::new(),
+            tag_legacy_seed_pending: None,
+            pending_finalize: std::collections::HashSet::new(),
+            tx,
+            rx,
+            cancel_token: Arc::new(AtomicBool::new(false)),
+            reload_queue: None,
+            heavy_io_queue: None,
+            scroll_hint: Arc::new(AtomicUsize::new(0)),
+            visible_end_shared: Arc::new(AtomicUsize::new(0)),
+            keep_start_shared: Arc::new(AtomicUsize::new(0)),
+            keep_end_shared: Arc::new(AtomicUsize::new(0)),
+            last_vis_range: (0, 0),
+            vis_settle_at: None,
+            vis_first_logged: false,
+            vis_all_logged: false,
+            folder_nav_pending: None,
+            folder_pane_open_pending: None,
+            pending_folder_nav_steps: 0,
+            pending_folder_nav_mode: FolderNavMode::Grid,
+            search_filter: None,
+            search_filter_origin_folder: None,
+            checked: std::collections::HashSet::new(),
+            rotation_cache: std::collections::HashMap::new(),
+            page_dims_cache: crate::page_dims::PageDimsCache::default(),
+            rating_cache: std::collections::HashMap::new(),
+            rating_session_write_seen_generation: 0,
+            metadata_import_refresh_index: None,
+            current_folder_rating_cache: None,
+            current_folder_last_mtime: None,
+            current_folder_signature: None,
+            folder_pin_map: std::collections::HashMap::new(),
+            converted_archive_cache_paths: std::collections::HashMap::new(),
+            converted_archive_pin_root_states: std::collections::HashMap::new(),
+            converted_archive_cache_paths_pending: None,
+            current_color_cache_map: None,
+            current_color_catalog: None,
+            vst3_deferred_media_open: None,
+            fullscreen_idx: None,
+            viewer_session: ViewerSession::default(),
+            native_video_in_window_active: false,
+            video_audio_mode: None,
+            video_audio_vst: None,
+            video_audio_mode_entry_target: None,
+            video_audio_exit_pending: None,
+            panorama_state: None,
+            pano_toast_shown_for_current_fs: false,
+            analysis_mode: false,
+            analysis_hover_color: None,
+            analysis_pinned_color: None,
+            analysis_grayscale: false,
+            analysis_mosaic_grid: false,
+            analysis_filter_mag: 0,
+            analysis_guide_drag: None,
+            view_trim_mode: false,
+            view_trim_apply_mode: crate::view_trim::ViewTrimApplyMode::default(),
+            view_trim_page_apply_root_idx: None,
+            view_trim_page_spread_separate: false,
+            view_trim_book_settings: crate::view_trim::ViewTrimBookSettings::default(),
+            view_trim_page_overrides: std::collections::HashMap::new(),
+            view_trim_dirty_page_overrides: std::collections::HashSet::new(),
+            view_trim_save_pending: false,
+            fs_cache: ItemsGenerationMap::new("fs_cache"),
+            fs_lanczos_cache: crate::gpu_lanczos::GpuLanczosCache::default(),
+            fs_margin_bbox_cache: std::collections::HashMap::new(),
+            input_generation: std::collections::HashMap::new(),
+            fs_pending: ItemsGenerationMap::with_discard("fs_pending", cancel_fs_pending_value),
+            fullscreen_pdf_promotion: FullscreenPdfPromotionState::default(),
+            fs_pdf_display_target: None,
+            fs_early_dims: ItemsGenerationMap::new("fs_early_dims"),
+            fs_upload_backlog: FsUploadBacklog::new("fs_upload_backlog", fs_upload_backlog_idx),
+            top_level_grid_view: top_level_grid_view::TopLevelGridView::default(),
+            items_are_global_search_view: false,
+            items_are_tag_view: false,
+            items_are_reading_history_view: false,
+            items_are_bookmark_view: false,
+            items_are_rating_view: false,
+            items_are_subfolder_expansion_view: false,
+            items_are_smart_folder_view: false,
+            items_are_drive_list: false,
+            reading_history_return_from: None,
+            bookmark_view_state: None,
+            bookmark_open_pending: None,
+            fs_open_intent_from_grid: false,
+            pending_detached_video_host_switch: None,
+            fs_zoom: 1.0,
+            fs_pan: egui::Vec2::ZERO,
+            fs_zoom_active: false,
+            fs_zoom_aiming: false,
+            fs_zoom_factor: 1.0,
+            fs_zoom_pdf_rerender_idx: None,
+            fs_zoom_pdf_rerender_zoom: 1.0,
+            fs_pan_drag_start: None,
+            fs_vertical_scroll: 0.0,
+            fs_seek_drag_active: false,
+            fs_seek_overlay_visible: false,
+            fs_vertical_cache_keep_set: std::collections::HashSet::new(),
+            continuous_page_transitions: std::collections::HashMap::new(),
+            fs_free_rotation: 0.0,
+            fs_rotation_drag_start: None,
+            analysis_zoom: 1.0,
+            analysis_pan: egui::Vec2::ZERO,
+            analysis_pan_drag_start: None,
+            analysis_overlay_cache: None,
+            analysis_hist_cache: None,
+            analysis_sv_cache: None,
+            spread_mode: crate::settings::SpreadMode::default(),
+            spread_shift_anchor_idx: None,
+            reading_flow: crate::settings::ReadingFlow::default(),
+            reading_direction: crate::settings::ReadingDirection::default(),
+            slideshow_playing: false,
+            slideshow_next_at: std::time::Instant::now(),
+            slideshow_anchor_idx: None,
+            continuous_reading_scroll_transition: None,
+            slideshow_scroll_range_cache: None,
+            pdf_password_request: None,
+            pdf_current_password: None,
+            pdf_password_pending_save: None,
+            pdf_enumerate_pending: None,
+            zip_enumerate_pending: None,
+            fs_nav_after_pdf_enumerate: None,
+            pending_auto_fs_open: false,
+            pending_return_to_parent: false,
+            pdf_placeholder_count: None,
+            cached_nav_indices: None,
+            cached_fs_seek_info: None,
+            fs_nav_locked_gen: None,
+            fs_nav_dropped_block_signature: None,
+            fs_nav_dropped_block_count: 0,
+            fs_load_skip_signature: None,
+            fs_holdover_tex: None,
+            fs_boundary_hint: None,
+            virtual_folder_writeback: None,
+            pdf_prefetch_grace_until: None,
+            thumb_pixels: std::collections::HashMap::new(),
+            thumb_edit_preview_layers: std::collections::HashMap::new(),
+            thumb_edit_preview_keys: std::collections::HashMap::new(),
+            thumb_adjust_tex: std::collections::HashMap::new(),
+            passthrough_rendition_cache: PassthroughRenditionCache::default(),
+            adjustment_page_params: std::collections::HashMap::new(),
+            local_adjust_page_layers: std::collections::HashMap::new(),
+            local_adjust_pages: std::collections::HashSet::new(),
+            local_adjust_selected_layers: std::collections::HashMap::new(),
+            local_adjust_generation: std::collections::HashMap::new(),
+            local_adjust_cache: std::collections::HashMap::new(),
+            local_adjust_pending: std::collections::HashMap::new(),
+            export_crop_page_settings: std::collections::HashMap::new(),
+            export_crop_pages: std::collections::HashSet::new(),
+            mask_pages: std::collections::HashSet::new(),
+            comic_pages: std::collections::HashSet::new(),
+            conceal_pages: std::collections::HashSet::new(),
+            erase_mask_generation: std::collections::HashMap::new(),
+            conceal_mask_generation: std::collections::HashMap::new(),
+            edit_result_cache: std::collections::HashMap::new(),
+            final_ai_cache: std::collections::HashMap::new(),
+            final_ai_pending: std::collections::HashMap::new(),
+            final_ai_failed: std::collections::HashSet::new(),
+            final_composite_cache: FinalCompositeCache::default(),
+            final_effect_pending: std::collections::HashMap::new(),
+            adjustment_cache: std::collections::HashMap::new(),
+            erase_result_cache: std::collections::HashMap::new(),
+            erase_preview_cache: std::collections::HashMap::new(),
+            erase_base_cache: std::collections::HashMap::new(),
+            conceal_base_cache: std::collections::HashMap::new(),
+            conceal_cache: std::collections::HashMap::new(),
+            comic_cache: std::collections::HashMap::new(),
+            comic_bake_pending: std::collections::HashMap::new(),
+            erase_inpaint_pending: std::collections::HashMap::new(),
+            ai_classify_cache: std::collections::HashMap::new(),
+            normalize_ui_states: std::collections::HashMap::new(),
+            normalize_auto_scan_suppressed: std::collections::HashSet::new(),
+            music_bookmarks: Vec::new(),
+            music_bookmarks_loaded_for: None,
+            last_loop_pos: std::collections::HashMap::new(),
+        }
+    }
+
+    pub(in crate::app) fn pause_background_work_keep_current_frame(&mut self) {
+        self.slideshow_playing = false;
+        self.continuous_reading_scroll_transition = None;
+        self.slideshow_scroll_range_cache = None;
+        self.fs_seek_drag_active = false;
+        self.fs_seek_overlay_visible = false;
+        self.pending_auto_fs_open = false;
+        self.pending_return_to_parent = false;
+        self.fs_nav_after_pdf_enumerate = None;
+        self.fs_nav_locked_gen = None;
+        self.fs_holdover_tex = None;
+        // The dedup describes the sequence that was just discarded, so the next block has to be
+        // reported afresh rather than mistaken for a continuation of this one.
+        self.fs_nav_dropped_block_signature = None;
+        self.fs_nav_dropped_block_count = 0;
+        self.continuous_page_transitions.clear();
+        self.pdf_enumerate_pending = None;
+        self.zip_enumerate_pending = None;
+        if let Some(pending) = self.folder_nav_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        if let Some(pending) = self.folder_pane_open_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        self.pending_folder_nav_steps = 0;
+        self.pending_folder_nav_mode = FolderNavMode::Grid;
+        for (_, pending) in self.fs_pending.drain() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        self.texture_backlog.clear();
+        for pending in self.final_ai_pending.values() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        self.final_ai_pending.clear();
+        for (_, pending) in self.local_adjust_pending.drain() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        for (_, pending) in self.comic_bake_pending.drain() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        for (_, pending) in self.erase_inpaint_pending.drain() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+impl App {
+    #[cfg(windows)]
+    pub(in crate::app) fn swap_viewer_context_bundle(&mut self, bundle: &mut ViewerContextBundle) {
+        // path-keyed DB 更新は context-global。退避する側も復元する側も、idx-keyed cache を
+        // その時点の最新世代へ揃えてから ownership を渡す。この関数はnavigationではなく
+        // ownership交換のプリミティブなので、同期に伴う表示再構築でApp-globalなfacet
+        // scope / suppressionを変更してはならない。
+        if self.sync_current_context_rating_session_writes() {
+            self.rebuild_visible_indices_preserving_facet_scope();
+        }
+        macro_rules! swap_field {
+            ($field:ident) => {
+                std::mem::swap(&mut self.$field, $field);
+            };
+        }
+
+        let ViewerContextBundle {
+            address,
+            current_folder,
+            navigation_scope,
+            archive_source_override,
+            zip_nav,
+            stack_mode_requested,
+            stack_view,
+            stack_showing_flat,
+            stack_active_rule,
+            stack_script_error,
+            stack_toggle_select_path,
+            items,
+            items_generation,
+            visible_indices,
+            facet_name_cache,
+            facet_name_cache_generation,
+            facet_name_cache_pending,
+            facet_name_cache_failed_generation,
+            thumbnails,
+            image_metas,
+            video_thumb_overrides,
+            auto_aspect,
+            selected,
+            grid_click_selection_anchor,
+            scroll_offset_y,
+            scroll_to_selected,
+            pending_grid_scroll,
+            requested,
+            idle_upgrade_cache_bypass_ineligible,
+            keep_range,
+            keep_set,
+            thumbnail_eviction_generation,
+            details_thumb_suppression_applied,
+            details_hover_thumb_idx,
+            details_hover_thumb_viewport_open,
+            texture_backlog,
+            details_order,
+            details_order_revision,
+            details_cell_content_revisions,
+            details_tag_prewarm_indices,
+            details_lazy_meta,
+            details_meta_pending,
+            details_lazy_visible_revision,
+            details_image_dims_state,
+            metadata_cache,
+            exif_cache,
+            xmp_cache,
+            xmp_panorama_info,
+            metadata_pending,
+            tags_cache,
+            tag_prewarm_pending,
+            tag_prewarm_queued,
+            tag_legacy_seed_pending,
+            pending_finalize,
+            tx,
+            rx,
+            cancel_token,
+            reload_queue,
+            heavy_io_queue,
+            scroll_hint,
+            visible_end_shared,
+            keep_start_shared,
+            keep_end_shared,
+            last_vis_range,
+            vis_settle_at,
+            vis_first_logged,
+            vis_all_logged,
+            folder_nav_pending,
+            folder_pane_open_pending,
+            pending_folder_nav_steps,
+            pending_folder_nav_mode,
+            search_filter,
+            search_filter_origin_folder,
+            checked,
+            rotation_cache,
+            page_dims_cache,
+            rating_cache,
+            rating_session_write_seen_generation,
+            metadata_import_refresh_index,
+            current_folder_rating_cache,
+            current_folder_last_mtime,
+            current_folder_signature,
+            folder_pin_map,
+            converted_archive_cache_paths,
+            converted_archive_pin_root_states,
+            converted_archive_cache_paths_pending,
+            current_color_cache_map,
+            current_color_catalog,
+            vst3_deferred_media_open,
+            fullscreen_idx,
+            viewer_session,
+            native_video_in_window_active,
+            video_audio_mode,
+            video_audio_vst,
+            video_audio_mode_entry_target,
+            video_audio_exit_pending,
+            panorama_state,
+            pano_toast_shown_for_current_fs,
+            analysis_mode,
+            analysis_hover_color,
+            analysis_pinned_color,
+            analysis_grayscale,
+            analysis_mosaic_grid,
+            analysis_filter_mag,
+            analysis_guide_drag,
+            view_trim_mode,
+            view_trim_apply_mode,
+            view_trim_page_apply_root_idx,
+            view_trim_page_spread_separate,
+            view_trim_book_settings,
+            view_trim_page_overrides,
+            view_trim_dirty_page_overrides,
+            view_trim_save_pending,
+            fs_cache,
+            fs_lanczos_cache,
+            fs_margin_bbox_cache,
+            input_generation,
+            fs_pending,
+            fullscreen_pdf_promotion,
+            fs_pdf_display_target,
+            fs_early_dims,
+            fs_upload_backlog,
+            top_level_grid_view,
+            items_are_global_search_view,
+            items_are_tag_view,
+            items_are_reading_history_view,
+            items_are_bookmark_view,
+            items_are_rating_view,
+            items_are_subfolder_expansion_view,
+            items_are_smart_folder_view,
+            items_are_drive_list,
+            reading_history_return_from,
+            bookmark_view_state,
+            bookmark_open_pending,
+            fs_open_intent_from_grid,
+            pending_detached_video_host_switch,
+            fs_zoom,
+            fs_pan,
+            fs_zoom_active,
+            fs_zoom_aiming,
+            fs_zoom_factor,
+            fs_zoom_pdf_rerender_idx,
+            fs_zoom_pdf_rerender_zoom,
+            fs_pan_drag_start,
+            fs_vertical_scroll,
+            fs_seek_drag_active,
+            fs_seek_overlay_visible,
+            fs_vertical_cache_keep_set,
+            continuous_page_transitions,
+            fs_free_rotation,
+            fs_rotation_drag_start,
+            analysis_zoom,
+            analysis_pan,
+            analysis_pan_drag_start,
+            analysis_overlay_cache,
+            analysis_hist_cache,
+            analysis_sv_cache,
+            spread_mode,
+            spread_shift_anchor_idx,
+            reading_flow,
+            reading_direction,
+            slideshow_playing,
+            slideshow_next_at,
+            slideshow_anchor_idx,
+            continuous_reading_scroll_transition,
+            slideshow_scroll_range_cache,
+            pdf_password_request,
+            pdf_current_password,
+            pdf_password_pending_save,
+            pdf_enumerate_pending,
+            zip_enumerate_pending,
+            fs_nav_after_pdf_enumerate,
+            pending_auto_fs_open,
+            pending_return_to_parent,
+            pdf_placeholder_count,
+            cached_nav_indices,
+            cached_fs_seek_info,
+            fs_nav_locked_gen,
+            fs_nav_dropped_block_signature,
+            fs_nav_dropped_block_count,
+            fs_load_skip_signature,
+            fs_holdover_tex,
+            fs_boundary_hint,
+            virtual_folder_writeback,
+            pdf_prefetch_grace_until,
+            thumb_pixels,
+            thumb_edit_preview_layers,
+            thumb_edit_preview_keys,
+            thumb_adjust_tex,
+            passthrough_rendition_cache,
+            adjustment_page_params,
+            local_adjust_page_layers,
+            local_adjust_pages,
+            local_adjust_selected_layers,
+            local_adjust_generation,
+            local_adjust_cache,
+            local_adjust_pending,
+            export_crop_page_settings,
+            export_crop_pages,
+            mask_pages,
+            comic_pages,
+            conceal_pages,
+            erase_mask_generation,
+            conceal_mask_generation,
+            edit_result_cache,
+            final_ai_cache,
+            final_ai_pending,
+            final_ai_failed,
+            final_composite_cache,
+            final_effect_pending,
+            adjustment_cache,
+            erase_result_cache,
+            erase_preview_cache,
+            erase_base_cache,
+            conceal_base_cache,
+            conceal_cache,
+            comic_cache,
+            comic_bake_pending,
+            erase_inpaint_pending,
+            ai_classify_cache,
+            normalize_ui_states,
+            normalize_auto_scan_suppressed,
+            music_bookmarks,
+            music_bookmarks_loaded_for,
+            last_loop_pos,
+        } = bundle;
+
+        swap_field!(address);
+        swap_field!(current_folder);
+        swap_field!(navigation_scope);
+        swap_field!(archive_source_override);
+        swap_field!(zip_nav);
+        swap_field!(stack_mode_requested);
+        swap_field!(stack_view);
+        swap_field!(stack_showing_flat);
+        swap_field!(stack_active_rule);
+        swap_field!(stack_script_error);
+        swap_field!(stack_toggle_select_path);
+        swap_field!(items);
+        swap_field!(items_generation);
+        swap_field!(visible_indices);
+        swap_field!(facet_name_cache);
+        swap_field!(facet_name_cache_generation);
+        swap_field!(facet_name_cache_pending);
+        swap_field!(facet_name_cache_failed_generation);
+        swap_field!(thumbnails);
+        swap_field!(image_metas);
+        swap_field!(video_thumb_overrides);
+        swap_field!(auto_aspect);
+        swap_field!(selected);
+        swap_field!(grid_click_selection_anchor);
+        swap_field!(scroll_offset_y);
+        swap_field!(scroll_to_selected);
+        swap_field!(pending_grid_scroll);
+        swap_field!(requested);
+        swap_field!(idle_upgrade_cache_bypass_ineligible);
+        swap_field!(keep_range);
+        swap_field!(keep_set);
+        swap_field!(thumbnail_eviction_generation);
+        swap_field!(details_thumb_suppression_applied);
+        swap_field!(details_hover_thumb_idx);
+        swap_field!(details_hover_thumb_viewport_open);
+        swap_field!(texture_backlog);
+        swap_field!(details_order);
+        swap_field!(details_order_revision);
+        swap_field!(details_cell_content_revisions);
+        swap_field!(details_tag_prewarm_indices);
+        swap_field!(details_lazy_meta);
+        swap_field!(details_meta_pending);
+        swap_field!(details_lazy_visible_revision);
+        swap_field!(details_image_dims_state);
+        swap_field!(metadata_cache);
+        swap_field!(exif_cache);
+        swap_field!(xmp_cache);
+        swap_field!(xmp_panorama_info);
+        swap_field!(metadata_pending);
+        swap_field!(tags_cache);
+        swap_field!(tag_prewarm_pending);
+        swap_field!(tag_prewarm_queued);
+        swap_field!(tag_legacy_seed_pending);
+        swap_field!(pending_finalize);
+        // per-context ロード複合体 (review-v2.3.0 P2-8/P2-9)。channel/token/キューが
+        // コンテキストと一緒に移動するので、requested / pending_finalize の bookkeeping は
+        // swap 後もそのまま信用できる (末尾の clear は不要になった)。
+        swap_field!(tx);
+        swap_field!(rx);
+        swap_field!(cancel_token);
+        swap_field!(reload_queue);
+        swap_field!(heavy_io_queue);
+        swap_field!(scroll_hint);
+        swap_field!(visible_end_shared);
+        swap_field!(keep_start_shared);
+        swap_field!(keep_end_shared);
+        swap_field!(last_vis_range);
+        swap_field!(vis_settle_at);
+        swap_field!(vis_first_logged);
+        swap_field!(vis_all_logged);
+        swap_field!(folder_nav_pending);
+        swap_field!(folder_pane_open_pending);
+        swap_field!(pending_folder_nav_steps);
+        swap_field!(pending_folder_nav_mode);
+        swap_field!(search_filter);
+        swap_field!(search_filter_origin_folder);
+        swap_field!(checked);
+        swap_field!(rotation_cache);
+        swap_field!(page_dims_cache);
+        swap_field!(rating_cache);
+        swap_field!(rating_session_write_seen_generation);
+        swap_field!(metadata_import_refresh_index);
+        swap_field!(current_folder_rating_cache);
+        swap_field!(current_folder_last_mtime);
+        swap_field!(current_folder_signature);
+        swap_field!(folder_pin_map);
+        swap_field!(converted_archive_cache_paths);
+        swap_field!(converted_archive_pin_root_states);
+        swap_field!(converted_archive_cache_paths_pending);
+        swap_field!(current_color_cache_map);
+        swap_field!(current_color_catalog);
+        // VST3 deferred open は fullscreen_idx / items と同じ context ownership。
+        // (review-v2.3.0 追補 BA-7: vst3 deferred)
+        swap_field!(vst3_deferred_media_open);
+        swap_field!(fullscreen_idx);
+        viewer_session.swap_with_mounted(
+            &mut self.viewer_presentation,
+            &mut self.last_viewer_sync_stamp,
+            &mut self.detached_viewer_independent_active,
+            &mut self.detached_viewer_open_next_still_detached_once,
+            &mut self.detached_viewer_window_id,
+        );
+        swap_field!(native_video_in_window_active);
+        swap_field!(video_audio_mode);
+        swap_field!(video_audio_vst);
+        swap_field!(video_audio_mode_entry_target);
+        swap_field!(video_audio_exit_pending);
+        swap_field!(panorama_state);
+        swap_field!(pano_toast_shown_for_current_fs);
+        swap_field!(analysis_mode);
+        swap_field!(analysis_hover_color);
+        swap_field!(analysis_pinned_color);
+        swap_field!(analysis_grayscale);
+        swap_field!(analysis_mosaic_grid);
+        swap_field!(analysis_filter_mag);
+        swap_field!(analysis_guide_drag);
+        swap_field!(view_trim_mode);
+        swap_field!(view_trim_apply_mode);
+        swap_field!(view_trim_page_apply_root_idx);
+        swap_field!(view_trim_page_spread_separate);
+        swap_field!(view_trim_book_settings);
+        swap_field!(view_trim_page_overrides);
+        swap_field!(view_trim_dirty_page_overrides);
+        swap_field!(view_trim_save_pending);
+        swap_field!(fs_cache);
+        swap_field!(fs_lanczos_cache);
+        swap_field!(fs_margin_bbox_cache);
+        swap_field!(input_generation);
+        swap_field!(fs_pending);
+        swap_field!(fullscreen_pdf_promotion);
+        swap_field!(fs_pdf_display_target);
+        swap_field!(fs_early_dims);
+        swap_field!(fs_upload_backlog);
+        swap_field!(top_level_grid_view);
+        swap_field!(items_are_global_search_view);
+        swap_field!(items_are_tag_view);
+        swap_field!(items_are_reading_history_view);
+        swap_field!(items_are_bookmark_view);
+        swap_field!(items_are_rating_view);
+        swap_field!(items_are_subfolder_expansion_view);
+        swap_field!(items_are_smart_folder_view);
+        swap_field!(items_are_drive_list);
+        swap_field!(reading_history_return_from);
+        swap_field!(bookmark_view_state);
+        swap_field!(bookmark_open_pending);
+        swap_field!(fs_open_intent_from_grid);
+        swap_field!(pending_detached_video_host_switch);
+        swap_field!(fs_zoom);
+        swap_field!(fs_pan);
+        swap_field!(fs_zoom_active);
+        swap_field!(fs_zoom_aiming);
+        swap_field!(fs_zoom_factor);
+        swap_field!(fs_zoom_pdf_rerender_idx);
+        swap_field!(fs_zoom_pdf_rerender_zoom);
+        swap_field!(fs_pan_drag_start);
+        swap_field!(fs_vertical_scroll);
+        swap_field!(fs_seek_drag_active);
+        swap_field!(fs_seek_overlay_visible);
+        swap_field!(fs_vertical_cache_keep_set);
+        swap_field!(continuous_page_transitions);
+        swap_field!(fs_free_rotation);
+        swap_field!(fs_rotation_drag_start);
+        swap_field!(analysis_zoom);
+        swap_field!(analysis_pan);
+        swap_field!(analysis_pan_drag_start);
+        swap_field!(analysis_overlay_cache);
+        swap_field!(analysis_hist_cache);
+        swap_field!(analysis_sv_cache);
+        swap_field!(spread_mode);
+        swap_field!(spread_shift_anchor_idx);
+        swap_field!(reading_flow);
+        swap_field!(reading_direction);
+        swap_field!(slideshow_playing);
+        swap_field!(slideshow_next_at);
+        swap_field!(slideshow_anchor_idx);
+        swap_field!(continuous_reading_scroll_transition);
+        swap_field!(slideshow_scroll_range_cache);
+        swap_field!(pdf_password_request);
+        swap_field!(pdf_current_password);
+        swap_field!(pdf_password_pending_save);
+        swap_field!(pdf_enumerate_pending);
+        swap_field!(zip_enumerate_pending);
+        swap_field!(fs_nav_after_pdf_enumerate);
+        swap_field!(pending_auto_fs_open);
+        swap_field!(pending_return_to_parent);
+        swap_field!(pdf_placeholder_count);
+        swap_field!(cached_nav_indices);
+        swap_field!(cached_fs_seek_info);
+        swap_field!(fs_nav_locked_gen);
+        swap_field!(fs_nav_dropped_block_signature);
+        swap_field!(fs_nav_dropped_block_count);
+        swap_field!(fs_load_skip_signature);
+        swap_field!(fs_holdover_tex);
+        swap_field!(fs_boundary_hint);
+        swap_field!(virtual_folder_writeback);
+        swap_field!(pdf_prefetch_grace_until);
+        swap_field!(thumb_pixels);
+        swap_field!(thumb_edit_preview_layers);
+        swap_field!(thumb_edit_preview_keys);
+        swap_field!(thumb_adjust_tex);
+        swap_field!(passthrough_rendition_cache);
+        swap_field!(adjustment_page_params);
+        swap_field!(local_adjust_page_layers);
+        swap_field!(local_adjust_pages);
+        swap_field!(local_adjust_selected_layers);
+        swap_field!(local_adjust_generation);
+        swap_field!(local_adjust_cache);
+        swap_field!(local_adjust_pending);
+        swap_field!(export_crop_page_settings);
+        swap_field!(export_crop_pages);
+        swap_field!(mask_pages);
+        swap_field!(comic_pages);
+        swap_field!(conceal_pages);
+        swap_field!(erase_mask_generation);
+        swap_field!(conceal_mask_generation);
+        swap_field!(edit_result_cache);
+        swap_field!(final_ai_cache);
+        swap_field!(final_ai_pending);
+        swap_field!(final_ai_failed);
+        swap_field!(final_composite_cache);
+        swap_field!(final_effect_pending);
+        swap_field!(adjustment_cache);
+        swap_field!(erase_result_cache);
+        swap_field!(erase_preview_cache);
+        swap_field!(erase_base_cache);
+        swap_field!(conceal_base_cache);
+        swap_field!(conceal_cache);
+        swap_field!(comic_cache);
+        swap_field!(comic_bake_pending);
+        swap_field!(erase_inpaint_pending);
+        swap_field!(ai_classify_cache);
+        swap_field!(normalize_ui_states);
+        swap_field!(normalize_auto_scan_suppressed);
+        swap_field!(music_bookmarks);
+        swap_field!(music_bookmarks_loaded_for);
+        swap_field!(last_loop_pos);
+
+        // 旧実装はここで requested / pending_finalize を無条件 clear していた (worker queue が
+        // App-global で、swap 後の bookkeeping を信用できなかったため)。detached 窓が 1 枚でも
+        // あると mount/unmount + parked poll の swap が毎フレーム走るので、main の bookkeeping が
+        // 毎フレーム消え、Pending サムネがフレームごとに重複エンキュー/重複デコードされる
+        // churn になっていた (review-v2.3.0 P2-8)。channel/token/キューを bundle 化した現在は
+        // bookkeeping がコンテキストと一緒に移動するため clear 不要。
+        if self.sync_current_context_rating_session_writes() {
+            self.rebuild_visible_indices_preserving_facet_scope();
+        }
+    }
+
+    /// legacy/unbundled viewer 用に、現在 context を main と独立 viewer に分割する。
+    ///
+    /// main grid が使う一覧 identity / worker 複合体は main に残し、viewer の一時状態だけを
+    /// 戻り値へ移す。ParkedLive media と、通常画像を grid から always-new detached viewer
+    /// として開く境界の両方がこの primitive を使う。
+    ///
+    /// `ViewerContextBundle` の全 field を destructure して 3 分類するため、field 追加時は
+    /// コンパイルエラーになり、空 bundle + allowlist 方式の状態喪失を再発させない。
+    /// (review-v2.3.0 追補4: live-park main 文脈保持)
+    #[cfg(windows)]
+    pub(in crate::app) fn split_current_context_preserving_main_grid(
+        &mut self,
+    ) -> Box<ViewerContextBundle> {
+        macro_rules! duplicate_for_parked {
+            ($($field:ident),+ $(,)?) => {
+                $(*$field = self.$field.clone();)+
+            };
+        }
+        macro_rules! move_to_parked {
+            ($($field:ident),+ $(,)?) => {
+                $(std::mem::swap(&mut self.$field, $field);)+
+            };
+        }
+        macro_rules! keep_in_main {
+            ($($field:ident),+ $(,)?) => {
+                $(let _ = $field;)+
+            };
+        }
+
+        let mut parked = Box::new(ViewerContextBundle::empty());
+        let ViewerContextBundle {
+            address,
+            current_folder,
+            navigation_scope,
+            archive_source_override,
+            zip_nav,
+            stack_mode_requested,
+            stack_view,
+            stack_showing_flat,
+            stack_active_rule,
+            stack_script_error,
+            stack_toggle_select_path,
+            items,
+            items_generation,
+            visible_indices,
+            facet_name_cache,
+            facet_name_cache_generation,
+            facet_name_cache_pending,
+            facet_name_cache_failed_generation,
+            thumbnails,
+            image_metas,
+            video_thumb_overrides,
+            auto_aspect,
+            selected,
+            grid_click_selection_anchor,
+            scroll_offset_y,
+            scroll_to_selected,
+            pending_grid_scroll,
+            requested,
+            metadata_import_refresh_index,
+            idle_upgrade_cache_bypass_ineligible,
+            keep_range,
+            keep_set,
+            thumbnail_eviction_generation,
+            details_thumb_suppression_applied,
+            details_hover_thumb_idx,
+            details_hover_thumb_viewport_open,
+            texture_backlog,
+            details_order,
+            details_order_revision,
+            details_cell_content_revisions,
+            details_tag_prewarm_indices,
+            details_lazy_meta,
+            details_meta_pending,
+            details_lazy_visible_revision,
+            details_image_dims_state,
+            metadata_cache,
+            exif_cache,
+            xmp_cache,
+            xmp_panorama_info,
+            metadata_pending,
+            tags_cache,
+            tag_prewarm_pending,
+            tag_prewarm_queued,
+            tag_legacy_seed_pending,
+            pending_finalize,
+            tx,
+            rx,
+            cancel_token,
+            reload_queue,
+            heavy_io_queue,
+            scroll_hint,
+            visible_end_shared,
+            keep_start_shared,
+            keep_end_shared,
+            last_vis_range,
+            vis_settle_at,
+            vis_first_logged,
+            vis_all_logged,
+            folder_nav_pending,
+            folder_pane_open_pending,
+            pending_folder_nav_steps,
+            pending_folder_nav_mode,
+            search_filter,
+            search_filter_origin_folder,
+            checked,
+            rotation_cache,
+            page_dims_cache,
+            rating_cache,
+            rating_session_write_seen_generation,
+            current_folder_rating_cache,
+            current_folder_last_mtime,
+            current_folder_signature,
+            folder_pin_map,
+            converted_archive_cache_paths,
+            converted_archive_pin_root_states,
+            converted_archive_cache_paths_pending,
+            current_color_cache_map,
+            current_color_catalog,
+            vst3_deferred_media_open,
+            fullscreen_idx,
+            viewer_session,
+            native_video_in_window_active,
+            video_audio_mode,
+            video_audio_vst,
+            video_audio_mode_entry_target,
+            video_audio_exit_pending,
+            panorama_state,
+            pano_toast_shown_for_current_fs,
+            analysis_mode,
+            analysis_hover_color,
+            analysis_pinned_color,
+            analysis_grayscale,
+            analysis_mosaic_grid,
+            analysis_filter_mag,
+            analysis_guide_drag,
+            view_trim_mode,
+            view_trim_apply_mode,
+            view_trim_page_apply_root_idx,
+            view_trim_page_spread_separate,
+            view_trim_book_settings,
+            view_trim_page_overrides,
+            view_trim_dirty_page_overrides,
+            view_trim_save_pending,
+            fs_cache,
+            fs_lanczos_cache,
+            fs_margin_bbox_cache,
+            input_generation,
+            fs_pending,
+            fullscreen_pdf_promotion,
+            fs_pdf_display_target,
+            fs_early_dims,
+            fs_upload_backlog,
+            top_level_grid_view,
+            items_are_global_search_view,
+            items_are_tag_view,
+            items_are_reading_history_view,
+            items_are_bookmark_view,
+            items_are_rating_view,
+            items_are_subfolder_expansion_view,
+            items_are_smart_folder_view,
+            items_are_drive_list,
+            reading_history_return_from,
+            bookmark_view_state,
+            bookmark_open_pending,
+            fs_open_intent_from_grid,
+            pending_detached_video_host_switch,
+            fs_zoom,
+            fs_pan,
+            fs_zoom_active,
+            fs_zoom_aiming,
+            fs_zoom_factor,
+            fs_zoom_pdf_rerender_idx,
+            fs_zoom_pdf_rerender_zoom,
+            fs_pan_drag_start,
+            fs_vertical_scroll,
+            fs_seek_drag_active,
+            fs_seek_overlay_visible,
+            fs_vertical_cache_keep_set,
+            continuous_page_transitions,
+            fs_free_rotation,
+            fs_rotation_drag_start,
+            analysis_zoom,
+            analysis_pan,
+            analysis_pan_drag_start,
+            analysis_overlay_cache,
+            analysis_hist_cache,
+            analysis_sv_cache,
+            spread_mode,
+            spread_shift_anchor_idx,
+            reading_flow,
+            reading_direction,
+            slideshow_playing,
+            slideshow_next_at,
+            slideshow_anchor_idx,
+            continuous_reading_scroll_transition,
+            slideshow_scroll_range_cache,
+            pdf_enumerate_pending,
+            zip_enumerate_pending,
+            fs_nav_after_pdf_enumerate,
+            pdf_password_request,
+            pdf_current_password,
+            pdf_password_pending_save,
+            pending_auto_fs_open,
+            pending_return_to_parent,
+            pdf_placeholder_count,
+            cached_nav_indices,
+            cached_fs_seek_info,
+            fs_nav_locked_gen,
+            fs_nav_dropped_block_signature,
+            fs_nav_dropped_block_count,
+            fs_load_skip_signature,
+            fs_holdover_tex,
+            fs_boundary_hint,
+            virtual_folder_writeback,
+            pdf_prefetch_grace_until,
+            thumb_pixels,
+            thumb_edit_preview_layers,
+            thumb_edit_preview_keys,
+            thumb_adjust_tex,
+            passthrough_rendition_cache,
+            adjustment_page_params,
+            local_adjust_page_layers,
+            local_adjust_pages,
+            local_adjust_selected_layers,
+            local_adjust_generation,
+            local_adjust_cache,
+            local_adjust_pending,
+            export_crop_page_settings,
+            export_crop_pages,
+            mask_pages,
+            comic_pages,
+            conceal_pages,
+            erase_mask_generation,
+            conceal_mask_generation,
+            edit_result_cache,
+            final_ai_cache,
+            final_ai_pending,
+            final_ai_failed,
+            final_composite_cache,
+            final_effect_pending,
+            adjustment_cache,
+            erase_result_cache,
+            erase_preview_cache,
+            erase_base_cache,
+            conceal_base_cache,
+            conceal_cache,
+            comic_cache,
+            comic_bake_pending,
+            erase_inpaint_pending,
+            ai_classify_cache,
+            normalize_ui_states,
+            normalize_auto_scan_suppressed,
+            music_bookmarks,
+            music_bookmarks_loaded_for,
+            last_loop_pos,
+        } = parked.as_mut();
+
+        // EOF 連続再生 / 前後ファイル移動が参照する一覧 identity は parked にも複製する。
+        duplicate_for_parked!(
+            address,
+            current_folder,
+            archive_source_override,
+            zip_nav,
+            stack_mode_requested,
+            stack_view,
+            stack_showing_flat,
+            stack_active_rule,
+            stack_script_error,
+            stack_toggle_select_path,
+            items,
+            items_generation,
+            visible_indices,
+            facet_name_cache,
+            facet_name_cache_generation,
+            facet_name_cache_failed_generation,
+            thumbnails,
+            image_metas,
+            auto_aspect,
+            selected,
+            grid_click_selection_anchor,
+            scroll_offset_y,
+            scroll_to_selected,
+            pending_grid_scroll,
+            keep_range,
+            keep_set,
+            thumbnail_eviction_generation,
+            details_order,
+            details_order_revision,
+            details_cell_content_revisions,
+            search_filter,
+            search_filter_origin_folder,
+            checked,
+            rotation_cache,
+            page_dims_cache,
+            rating_cache,
+            rating_session_write_seen_generation,
+            current_folder_rating_cache,
+            tags_cache,
+            current_folder_last_mtime,
+            current_folder_signature,
+            top_level_grid_view,
+            items_are_global_search_view,
+            items_are_tag_view,
+            items_are_reading_history_view,
+            items_are_bookmark_view,
+            items_are_rating_view,
+            items_are_subfolder_expansion_view,
+            items_are_smart_folder_view,
+            items_are_drive_list,
+            reading_history_return_from,
+            bookmark_view_state,
+        );
+
+        // 再生中 player / pending と fullscreen viewer の一時 UI だけを parked 所有へ移す。
+        move_to_parked!(
+            vst3_deferred_media_open,
+            fullscreen_idx,
+            native_video_in_window_active,
+            video_audio_mode,
+            video_audio_vst,
+            video_audio_mode_entry_target,
+            video_audio_exit_pending,
+            panorama_state,
+            pano_toast_shown_for_current_fs,
+            analysis_mode,
+            analysis_hover_color,
+            analysis_pinned_color,
+            analysis_grayscale,
+            analysis_mosaic_grid,
+            analysis_filter_mag,
+            analysis_guide_drag,
+            fs_cache,
+            fs_lanczos_cache,
+            fs_margin_bbox_cache,
+            input_generation,
+            fs_pending,
+            fullscreen_pdf_promotion,
+            fs_pdf_display_target,
+            fs_early_dims,
+            fs_upload_backlog,
+            fs_open_intent_from_grid,
+            pending_detached_video_host_switch,
+            fs_zoom,
+            fs_pan,
+            fs_zoom_active,
+            fs_zoom_aiming,
+            fs_zoom_factor,
+            fs_zoom_pdf_rerender_idx,
+            fs_zoom_pdf_rerender_zoom,
+            fs_pan_drag_start,
+            fs_vertical_scroll,
+            fs_seek_drag_active,
+            fs_seek_overlay_visible,
+            fs_vertical_cache_keep_set,
+            continuous_page_transitions,
+            fs_free_rotation,
+            fs_rotation_drag_start,
+            analysis_zoom,
+            analysis_pan,
+            analysis_pan_drag_start,
+            analysis_overlay_cache,
+            analysis_hist_cache,
+            analysis_sv_cache,
+            slideshow_playing,
+            slideshow_next_at,
+            slideshow_anchor_idx,
+            continuous_reading_scroll_transition,
+            slideshow_scroll_range_cache,
+            cached_fs_seek_info,
+            fs_nav_locked_gen,
+            fs_nav_dropped_block_signature,
+            fs_nav_dropped_block_count,
+            fs_load_skip_signature,
+            fs_holdover_tex,
+            fs_boundary_hint,
+            pdf_password_request,
+            pdf_current_password,
+            pdf_password_pending_save,
+            normalize_ui_states,
+            normalize_auto_scan_suppressed,
+            music_bookmarks,
+            music_bookmarks_loaded_for,
+            last_loop_pos,
+            bookmark_open_pending,
+        );
+
+        viewer_session.swap_with_mounted(
+            &mut self.viewer_presentation,
+            &mut self.last_viewer_sync_stamp,
+            &mut self.detached_viewer_independent_active,
+            &mut self.detached_viewer_open_next_still_detached_once,
+            &mut self.detached_viewer_window_id,
+        );
+
+        // グリッド worker / 詳細列 / タグ prewarm / 編集・見開き・view-trim / folder-nav は
+        // main が原本を保持する。parked メディア窓はこれらを駆動しないので empty のままでよい。
+        keep_in_main!(
+            navigation_scope,
+            // 新しい parked context は複製済み items/cache の独立 owner になる。進行中の
+            // receiver だけは複製できないため、元の main context に残す。
+            facet_name_cache_pending,
+            requested,
+            metadata_import_refresh_index,
+            idle_upgrade_cache_bypass_ineligible,
+            details_thumb_suppression_applied,
+            details_hover_thumb_idx,
+            details_hover_thumb_viewport_open,
+            texture_backlog,
+            details_tag_prewarm_indices,
+            details_lazy_meta,
+            details_meta_pending,
+            details_lazy_visible_revision,
+            details_image_dims_state,
+            video_thumb_overrides,
+            metadata_cache,
+            exif_cache,
+            xmp_cache,
+            xmp_panorama_info,
+            metadata_pending,
+            tag_prewarm_pending,
+            tag_prewarm_queued,
+            tag_legacy_seed_pending,
+            pending_finalize,
+            tx,
+            rx,
+            cancel_token,
+            reload_queue,
+            heavy_io_queue,
+            scroll_hint,
+            visible_end_shared,
+            keep_start_shared,
+            keep_end_shared,
+            last_vis_range,
+            vis_settle_at,
+            vis_first_logged,
+            vis_all_logged,
+            folder_nav_pending,
+            folder_pane_open_pending,
+            pending_folder_nav_steps,
+            pending_folder_nav_mode,
+            folder_pin_map,
+            converted_archive_cache_paths,
+            converted_archive_pin_root_states,
+            converted_archive_cache_paths_pending,
+            current_color_cache_map,
+            current_color_catalog,
+            view_trim_mode,
+            view_trim_apply_mode,
+            view_trim_page_apply_root_idx,
+            view_trim_page_spread_separate,
+            view_trim_book_settings,
+            view_trim_page_overrides,
+            view_trim_dirty_page_overrides,
+            view_trim_save_pending,
+            spread_mode,
+            spread_shift_anchor_idx,
+            reading_flow,
+            reading_direction,
+            pdf_enumerate_pending,
+            zip_enumerate_pending,
+            fs_nav_after_pdf_enumerate,
+            pending_auto_fs_open,
+            pending_return_to_parent,
+            pdf_placeholder_count,
+            cached_nav_indices,
+            virtual_folder_writeback,
+            pdf_prefetch_grace_until,
+            thumb_pixels,
+            thumb_edit_preview_layers,
+            thumb_edit_preview_keys,
+            thumb_adjust_tex,
+            passthrough_rendition_cache,
+            adjustment_page_params,
+            local_adjust_page_layers,
+            local_adjust_pages,
+            local_adjust_selected_layers,
+            local_adjust_generation,
+            local_adjust_cache,
+            local_adjust_pending,
+            export_crop_page_settings,
+            export_crop_pages,
+            mask_pages,
+            comic_pages,
+            conceal_pages,
+            erase_mask_generation,
+            conceal_mask_generation,
+            edit_result_cache,
+            final_ai_cache,
+            final_ai_pending,
+            final_ai_failed,
+            final_composite_cache,
+            final_effect_pending,
+            adjustment_cache,
+            erase_result_cache,
+            erase_preview_cache,
+            erase_base_cache,
+            conceal_base_cache,
+            conceal_cache,
+            comic_cache,
+            comic_bake_pending,
+            erase_inpaint_pending,
+            ai_classify_cache,
+        );
+        parked
     }
 }
 
