@@ -1180,7 +1180,9 @@ passive detached は通常どおり release で窓を activate するが、選�
 
 - 出典: 2026-08-23 (v3.2.0 公開後)。`g:\home\comfyui\202608-29_焼き肉レストラン` を開くと、
   フルスクリーンと一覧の切り替えが激しくちらつく。**ポータブル版では同じ操作で起きない。**
-- **ポータブルで起きない理由は build flavor ではなく設定**。ポータブルは既定設定なので
+  これは初回比較時の観測で、その後タイトルバーから detached 窓を最大化するとポータブル版でも再現した
+  (下記「最大化後の追試」で訂正)。
+- **初回推定 (最大化後の追試で訂正)**: ポータブルで起きない理由は build flavor ではなく設定。ポータブルは既定設定なので
   フルスクリーンが別ウィンドウにならず、下の `detached_viewer_cleanup` 経路自体を通らない。
   `portable` feature が変えるのは native 依存の解決先と data_dir だけで、この経路に分岐は無い。
 - **ログで確認できた事実** (`mimageviewer.log`、1 セッション 14 open / 10 cleanup):
@@ -1220,7 +1222,8 @@ passive detached は通常どおり release で窓を activate するが、選�
      事実 3 と 4 から「discard 窓中に同じキーが複数回配送され、main 側が Enter を
      もう一度 open として解釈している」が第一候補だが、**未確定**。
   3. 1 と 2 は独立に進められる。1 だけでも破棄フレームが 5 → 1 になり、ちらつきの大半は消える。
-- **再現条件は「設定」ではなく「実行時の状態」** (2026-08-23 追記、利用者の settings.db を読んで確認):
+- **初回推定 (最大化後の追試で訂正): 再現条件は「設定」ではなく「実行時の状態」**
+  (2026-08-23 追記、利用者の settings.db を読んで確認):
   報告者の永続設定は `detached_viewer_enabled=false` / `detached_viewer_open_images_in_window=false` /
   `fullfeature_media_window=true` / `video_in_window_mode=true`。**静止画を別ウィンドウで開く設定は
   どれも OFF** なのに、ログでは静止画 open のたびに `presentation=Some(DetachedWindow)` になっている。
@@ -1233,10 +1236,61 @@ passive detached は通常どおり release で窓を activate するが、選�
   利用者がポータブルで同手順を試すと、閉じた後の再オープンで detached が維持されず
   `non_detached_viewer_presentation()` へ落ちた (= `video_in_window_mode=true` なので MainWindow)。
   **同じ操作で detached セッションの寿命が 2 環境で違う**こと自体が、この不具合と同じ所有権の問題。
-- **次の観測**: `MIV_DETACHED_WINDOW_DEBUG=1` で起動すると `[ui-fonts][diag]` /
+- **追加観測の指定 (実施済み)**: `MIV_DETACHED_WINDOW_DEBUG=1` で起動すると `[ui-fonts][diag]` /
   `[detached-window-debug]` が `presentation` / `session` / `active_context` / `passive_windows` /
   `fullscreen_idx` を毎回出す ([app.rs:38773](../src/app.rs:38773))。**どの分岐で DetachedWindow に
   なっているかはこれで確定できる。** 再オープンの契機と併せて 1 回の再現で両方取れる。
+- **最大化後の追試と訂正 (2026-08-23、Codex、ポータブル v3.2.0、
+  `MIV_DETACHED_WINDOW_DEBUG=1`)**:
+  1. **再現を可視化する条件はタイトルバーの最大化状態**。最初の通常サイズ open は
+     `rect=(110,110 1462x1136)` / `window_id=20` / **16.1ms**。その窓をタイトルバーで最大化して
+     close すると、settings.db は
+     `detached_viewer_window_placement.maximized=true` を保存し、次の open は
+     `rect=(-11,-11 3862x2110)` / `window_id=21` / **157.7ms**、その次も別 HWND の
+     `window_id=22` / **147.6ms** になった。通常サイズの約 10 倍を UI thread の
+     `pre_grid` で費やしている。builder が保存 placement の `maximized` を新 viewport へ適用する
+     ([ui_fullscreen.rs:17331](../src/ui_fullscreen.rs:17331)) ためで、portable feature や F11 の
+     borderless fullscreen は必要条件ではない。
+  2. **1 close ごとに HWND / viewport identity を捨て、次の open で作り直している。** ログは毎回
+     `cleanup_visible_false ... recreate=true` の後に host を clear し、generation を進める
+     ([ui_fullscreen.rs:13083](../src/ui_fullscreen.rs:13083),
+     [ui_fullscreen.rs:13111](../src/ui_fullscreen.rs:13111))。そのため最大化した新しい全面 HWND の
+     生成・surface 初期化が、一覧との切替時にそのまま見える。
+  3. close 後は既報どおり **5 回の font-atlas resync discard** が必ず走った。今回の 3 回は
+     157〜161 = 229ms、162〜166 = 240ms、167〜171 = 231ms。つまり最大化 host の
+     148〜158ms の再生成に加え、一覧側も約 0.23 秒を固定回数の race 吸収に使っている。
+     **画像 decode は 10〜11msで完了しており主因ではない。**
+  4. 上記「内部イベントによる自動再オープン」「同一 Enter の 4 重配送」は今回のログで訂正する。
+     open 時の `input_seq` は 59 → 61 → 63。viewer の Enter close が 1 回 increment
+     ([ui_fullscreen.rs:14144](../src/ui_fullscreen.rs:14144)) し、一覧の Enter open がさらに 1 回
+     increment してから `open_fullscreen` を呼ぶ
+     ([app.rs:35015](../src/app.rs:35015)) 契約と一致する。`[fs-key]` は fullscreen context の
+     生存中しか一覧側 Enter を記録しないため、「キー行が無い」ことは内部 open の証拠にならない。
+     4 個並んだのは `Enter:up` のみで、close/open を発火する `down` の重複は無かった。
+- **確定した原因**: 最大化そのものは増幅条件で、根は次の 2 つの時間窓 / lifecycle 不整合。
+  1. 明示 close が linked detached host を terminal teardown し、次の明示 open が保存済み
+     `maximized=true` の全面 HWND / surface を同期的に新規作成する。
+  2. teardown 後の main surface 復帰を観測せず、固定 5 フレームの discard で font atlas の
+     full upload を再送する。結果として、利用者が Enter で viewer と一覧を往復するたび、
+     「全面 host の作り直し」と「一覧側の 5 pass 破棄」が交互に露出する。
+- **構造的な解消方針 (実装前に detached R4 / ゲート C で方式を確定する)**:
+  1. font atlas は固定 5 回再送を廃止し、main surface の no-surface / acquire / present と
+     full-upload 完了を既存 owner の typed state で acknowledgment する。surface が使える最初の
+     1 pass だけ resync し、delay / retry / 追加 repaint で吸収しない。
+  2. linked detached の content close と OS host lifetime を分離し、`DetachedWindowManager` が
+     hidden host の再利用可否を所有する。再利用できる方式なら同じ `window_id` / HWND を
+     hidden → content remount → visible と遷移させる。egui の制約で terminal teardown が必須なら、
+     新 maximized host は HWND 作成・placement 適用・surface/content-ready acknowledgment が揃うまで
+     hidden のまま保持し、`Visible(true)` を 1 回だけ発行する。App-level bool / Option、rect heuristic、
+     固定待ち時間は追加しない。
+  3. `maximized=false` への強制リセット、最大化 placement の保存停止、windowed 強制は機能劣化なので
+     修正に使わない。タイトルバー最大化と F11 borderless は別状態のまま維持する。
+- **回帰条件**: 保存 placement が `maximized=true` の linked 静止画窓で Enter close/open を反復し、
+  (a) 1 操作につき visibility 遷移が 1 回、(b) 再利用方式なら `window_id` / HWND が不変、teardown
+  方式なら ready 前に visible にならない、(c) main font atlas が surface acknowledgment 後の 1 回だけ
+  full upload、(d)通常サイズ・F11・folder-nav reopen・always-new / passive / ParkedLive の所有権を
+  変えないことを state-transition test + debug log smoke で固定する。実装時は
+  [detached-rework-plan.md §11](detached-rework-plan.md#11-リワーク外の変更ログ) に合意と変更境界を記録する。
 
 #### 追記 (2026-08-23): 最大化が再現条件、原因は placement の毎フレーム書き戻し
 
@@ -1275,6 +1329,31 @@ passive detached は通常どおり release で窓を activate するが、選�
 - **検証の観測点**: 最大化した別ウィンドウを開いている間、①`runtime_placement` が毎フレーム出ない
   こと ②`builder_no_position` が毎フレーム出ないこと ③close 後の `discard pass` が 1 回に
   なること ④最大化 → 復元でウィンドウが元のサイズに戻ること (A で restore 値を壊していない証明)。
+
+#### Codex クロスチェック: 2 つの欠陥を同一原因として扱わない
+
+ClaudeCode の追加ログと Codex の portable / normal ログを併記して source まで照合した結果、
+**最大化が再現を可視化する条件**、**open / close は実入力**、**placement が毎フレーム同値更新される**
+という観測は一致した。ただし、ちらつきへの因果は次のように分ける。
+
+- `active_placement_update_maximized` の `from == to` は runtime manager 内の
+  `runtime.placement = Some(placement)` であり
+  ([detached_window_manager.rs:538](../src/app/detached_window_manager.rs:538))、viewport command、
+  generation 更新、visibility 更新、repaint 要求を発行しない。ログの `builder_no_position` も
+  `apply_placement=false`、すなわち生存中の窓へ position / maximize を再適用していない。
+- settings への永続化は毎フレームではなく、runtime を remove する close 境界で 1 回だけ行う
+  ([app.rs:2174](../src/app.rs:2174))。したがって「82 回の同値更新」だけから
+  **ウィンドウが82回再表示された**、または**それがちらつきの直接原因**とは結論できない。
+- 一方、画面遷移と一対一に対応する事実は、各 close の `recreate=true` + 5 discard と、各 open の
+  **新 `window_id` / 新 HWND / 113〜177ms の最大化 host 生成**である。よって §1.115 の直接原因は
+  上記「確定した原因」の lifecycle + surface acknowledgment 欠如とする。
+- 現在 geometry と restore geometry を1値に混在させる placement model は、§2.20 の座標破綻、
+  不要な runtime 書き戻し、将来の placement command 振動を招く**独立した構造欠陥**であり、
+  ClaudeCode の A/B は同じ R4 設計で直す価値がある。ただし A/B だけ適用しても close ごとの
+  host 再生成と 5 discard が残る限り、§1.115 の完了条件は満たさない。
+- 実装レビューでは (1) placement A/B のみで HWND 再生成 / discard が残るケース、
+  (2) lifecycle + surface acknowledgment 修正で最大化 placement を維持するケースを分けて測り、
+  「ログ量が減った」ことを「ちらつきが直った」ことの代用にしない。
 
 - 規模 / 優先度: 中 / **P1** (常用操作で目に見える。ただし凍結領域なので構造修正が前提)。
 - 関連: §2.20 (**同じ根**。最大化中の placement が実ジオメトリを表していない)、
