@@ -27282,18 +27282,12 @@ impl App {
         }
         #[cfg(windows)]
         {
-            if let Some(active) = self.active_detached_viewer_context.as_mut()
-                && !ContextRef::at_rest(&active.bundle).items().is_empty()
-                && !ContextRef::at_rest(&active.bundle).tag_prewarm_pending_present()
-            {
-                active.bundle.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
+            if let Some(active) = self.active_detached_viewer_context.as_mut() {
+                active.bundle.ensure_tag_prewarm_started();
             }
             for window in &mut self.detached_image_windows {
-                if let Some(bundle) = window.paused_bundle.as_mut()
-                    && !ContextRef::at_rest(bundle).items().is_empty()
-                    && !ContextRef::at_rest(bundle).tag_prewarm_pending_present()
-                {
-                    bundle.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
+                if let Some(bundle) = window.paused_bundle.as_mut() {
+                    bundle.ensure_tag_prewarm_started();
                 }
             }
         }
@@ -38492,8 +38486,7 @@ impl App {
             if window_ids.contains(&window.id) {
                 if let Some(mut bundle) = window.paused_bundle.take() {
                     let plan = viewer_context_media_teardown_plan(ContextRef::at_rest(&bundle));
-                    bundle.normalize_ui_states.clear();
-                    bundle.normalize_auto_scan_suppressed.clear();
+                    bundle.clear_normalize_state();
                     drop(bundle);
                     plans.push(plan);
                 }
@@ -39206,11 +39199,7 @@ impl App {
             return false;
         }
 
-        paused_bundle.activate_independent_detached_session(id);
-        paused_bundle.fs_open_intent_from_grid = false;
-        paused_bundle.pending_auto_fs_open = false;
-        paused_bundle.pending_return_to_parent = false;
-        paused_bundle.pdf_prefetch_grace_until = None;
+        paused_bundle.activate_parked_live_as_independent_detached(id);
 
         // ParkedLive owner の pending は active context の通常 poll へ引き継ぐ。
         // owner を残すと parked poll が二度と来ず、timeout 判定も含めて永久停止する。
@@ -40101,9 +40090,7 @@ impl App {
                 self.detached_image_windows.insert(pos, snapshot);
                 return false;
             }
-            paused_bundle.activate_independent_detached_session(snapshot.id);
-            paused_bundle.fs_open_intent_from_grid = false;
-            paused_bundle.pdf_prefetch_grace_until = None;
+            paused_bundle.activate_passive_as_independent_detached(snapshot.id);
             self.adopt_active_detached_viewport_runtime_from_passive("resume_paused_bundle");
             // keep-alive: passive→active 再開 = セッション再開 (§3.7 set)。open_fullscreen を
             // 通らない経路なのでここで明示的に session を立てる。
@@ -40979,25 +40966,11 @@ impl App {
 
         let (_context_serial, items_generation) =
             self.allocate_detached_viewer_context_generation();
-        let mut bundle = self.split_materialized_physical_context_for_independent_still_open();
-        bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
-        bundle.set_items_generation(items_generation);
-        bundle.address = physical_context.display().to_string();
-        bundle.current_folder = Some(physical_context.clone());
-        bundle.visible_indices = ContextRef::at_rest(&bundle)
-            .items()
-            .iter()
-            .enumerate()
-            .filter_map(|(item_idx, item)| {
-                item_belongs_to_detached_physical_scope(item, &physical_context).then_some(item_idx)
-            })
-            .collect();
-        bundle.top_level_grid_view = top_level_grid_view::TopLevelGridView::default();
-        bundle.details_thumb_suppression_applied = false;
-        bundle.clear_details_order();
-        bundle.cached_nav_indices = None;
-        bundle.cached_fs_seek_info = None;
-        bundle.selected = Some(idx);
+        let bundle = self.split_materialized_physical_context_for_detached_scope(
+            &physical_context,
+            idx,
+            items_generation,
+        );
 
         self.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle: *bundle });
         self.log_detached_image_window_debug(format!(
@@ -41207,14 +41180,7 @@ impl App {
         };
         let window_id = self.ensure_detached_viewer_window_id();
         let mut bundle = self.take_current_viewer_context_bundle();
-        bundle.selected = Some(idx);
-        bundle.fullscreen_idx = Some(idx);
-        bundle.native_video_in_window_active = false;
-        bundle.activate_independent_detached_session(window_id);
-        bundle.viewer_session.last_sync_stamp = None;
-        bundle.fs_open_intent_from_grid = false;
-        bundle.pending_auto_fs_open = false;
-        bundle.pending_return_to_parent = false;
+        bundle.become_independent_detached_viewer(window_id, idx);
         self.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
         self.update_detached_window_runtime_flags(
             window_id,

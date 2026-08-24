@@ -1071,13 +1071,6 @@ impl<'a> ContextRef<'a> {
         }
     }
 
-    pub(in crate::app) fn tag_prewarm_pending_present(self) -> bool {
-        match self.source {
-            ContextRefSource::Mounted(app) => app.tag_prewarm_pending.is_some(),
-            ContextRefSource::AtRest(bundle) => bundle.tag_prewarm_pending.is_some(),
-        }
-    }
-
     pub(in crate::app) fn selected(self) -> Option<usize> {
         match self.source {
             ContextRefSource::Mounted(app) => app.selected,
@@ -1190,12 +1183,41 @@ impl ViewerContextBundle {
             .set_items_generation(items_generation);
     }
 
-    pub(in crate::app) fn adopt_bookmark_media_open_pending(
+    pub(in crate::app) fn retarget_bookmark_media_open(
         &mut self,
         pending: crate::bookmark_browser::PendingMediaOpen,
+        target: crate::bookmark_browser::BookmarkViewReturnTarget,
     ) {
         self.bookmark_open_pending =
             Some(crate::bookmark_browser::PendingBookmarkOpen::Media(pending));
+        self.bookmark_view_state = Some(BookmarkViewState::Detached { target });
+    }
+
+    pub(in crate::app) fn ensure_tag_prewarm_started(&mut self) -> bool {
+        if self.items.is_empty() || self.tag_prewarm_pending.is_some() {
+            return false;
+        }
+        self.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
+        true
+    }
+
+    pub(in crate::app) fn clear_normalize_state(&mut self) {
+        self.normalize_ui_states.clear();
+        self.normalize_auto_scan_suppressed.clear();
+    }
+
+    pub(in crate::app) fn activate_parked_live_as_independent_detached(&mut self, window_id: u64) {
+        self.viewer_session.activate_independent_detached(window_id);
+        self.fs_open_intent_from_grid = false;
+        self.pending_auto_fs_open = false;
+        self.pending_return_to_parent = false;
+        self.pdf_prefetch_grace_until = None;
+    }
+
+    pub(in crate::app) fn activate_passive_as_independent_detached(&mut self, window_id: u64) {
+        self.viewer_session.activate_independent_detached(window_id);
+        self.fs_open_intent_from_grid = false;
+        self.pdf_prefetch_grace_until = None;
     }
 
     pub(in crate::app) fn activate_independent_detached_session(&mut self, window_id: u64) {
@@ -1209,8 +1231,19 @@ impl ViewerContextBundle {
             .sum()
     }
 
-    pub(in crate::app) fn clear_details_order(&mut self) {
-        self.details_order.clear();
+    pub(in crate::app) fn become_independent_detached_viewer(
+        &mut self,
+        window_id: u64,
+        idx: usize,
+    ) {
+        self.selected = Some(idx);
+        self.fullscreen_idx = Some(idx);
+        self.native_video_in_window_active = false;
+        self.viewer_session.activate_independent_detached(window_id);
+        self.viewer_session.last_sync_stamp = None;
+        self.fs_open_intent_from_grid = false;
+        self.pending_auto_fs_open = false;
+        self.pending_return_to_parent = false;
     }
 
     pub(in crate::app) fn empty() -> Self {
@@ -2496,8 +2529,11 @@ impl App {
     /// detached read model を作る。通常の grid leaf open は descriptor 経路で非同期列挙するため、
     /// この snapshot 経路は folder / ZIP / PDF の列挙完了後に限る。
     #[cfg(windows)]
-    pub(in crate::app) fn split_materialized_physical_context_for_independent_still_open(
+    pub(in crate::app) fn split_materialized_physical_context_for_detached_scope(
         &mut self,
+        physical_context: &Path,
+        idx: usize,
+        items_generation: u64,
     ) -> Box<ViewerContextBundle> {
         let mut detached = self.split_current_context_preserving_main_grid();
 
@@ -2533,6 +2569,25 @@ impl App {
         detached.erase_base_cache = self.erase_base_cache.clone();
         detached.conceal_base_cache = self.conceal_base_cache.clone();
         detached.ai_classify_cache = self.ai_classify_cache.clone();
+
+        detached.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        detached.set_items_generation(items_generation);
+        detached.address = physical_context.display().to_string();
+        detached.current_folder = Some(physical_context.to_path_buf());
+        detached.visible_indices = detached
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(item_idx, item)| {
+                item_belongs_to_detached_physical_scope(item, physical_context).then_some(item_idx)
+            })
+            .collect();
+        detached.top_level_grid_view = top_level_grid_view::TopLevelGridView::default();
+        detached.details_thumb_suppression_applied = false;
+        detached.details_order.clear();
+        detached.cached_nav_indices = None;
+        detached.cached_fs_seek_info = None;
+        detached.selected = Some(idx);
 
         detached
     }
