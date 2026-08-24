@@ -25139,13 +25139,17 @@ impl App {
         let mut pin_archive_dependencies: std::collections::HashMap<String, Vec<usize>> =
             std::collections::HashMap::new();
         for idx in 0..self.items.len() {
-            if !candidate_indices.contains(&idx)
-                || self.requested.contains_key(&idx)
-                || !matches!(
-                    self.thumbnails.get(idx),
-                    Some(ThumbnailState::Pending | ThumbnailState::Evicted)
-                )
-            {
+            // pin-root の発見は、そのタイルが今どう描かれているかとは無関係な事実に
+            // 基づく。以前はサムネイルが `Pending | Evicted` で未 requested のものだけを
+            // 見ていたが、`Loaded` と `Failed` は終端状態なので、いったんそこへ落ちた
+            // コンテナの pin は二度と解決されなかった。中身がアーカイブだけのフォルダは
+            // 自動選定が代表画像を選べず必ず `Failed` になるため、代表サムネの指定が
+            // 永久に反映されない自己強化ループになる (§1.121)。
+            //
+            // コストを抑える役目は、可視範囲の絞り込み (`candidate_indices`) と、
+            // root ごとに解決結果を覚える `converted_archive_pin_root_states` が持つ。
+            // 解決済みの root はここで DB も cascade も引き直さない。
+            if !candidate_indices.contains(&idx) {
                 continue;
             }
             let Some(target) = self
