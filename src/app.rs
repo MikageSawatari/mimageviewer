@@ -28447,6 +28447,108 @@ impl App {
         (result.errors, stale_context)
     }
 
+    fn refresh_folder_pin_thumbnail_materializations(&mut self, indices: &[usize]) {
+        let use_full_path_keys = self.use_full_path_cache_keys();
+        let mut pin_prefixes = std::collections::HashSet::new();
+        let mut retained_pin_keys = std::collections::HashSet::new();
+        for &index in indices {
+            let Some(item) = self.items.get(index) else {
+                continue;
+            };
+            let item_meta = self.image_metas.get(index).copied().flatten();
+            let keys = folder_thumb_existing_keys_for(
+                item,
+                item_meta,
+                &self.folder_pin_map,
+                self.folder_thumb_pin_db.as_deref(),
+                Some(self.settings.folder_thumb_sort),
+                self.settings.folder_thumb_depth,
+                use_full_path_keys,
+            );
+            if let Some(base_key) = keys.first() {
+                pin_prefixes.insert(
+                    [base_key.as_str(), crate::thumb_loader::CACHE_KEY_PIN_SUFFIX].concat(),
+                );
+            }
+            retained_pin_keys.extend(keys.into_iter().skip(1));
+        }
+
+        for &index in indices {
+            self.evict_thumbnail_for_reload(index);
+        }
+
+        let Some(cache_map) = self.current_color_cache_map.clone() else {
+            return;
+        };
+        let Some(catalog) = self.current_color_catalog.clone() else {
+            return;
+        };
+        let stale_pin_keys = cache_map
+            .read()
+            .ok()
+            .map(|map| {
+                map.keys()
+                    .filter(|key| {
+                        pin_prefixes.iter().any(|prefix| key.starts_with(prefix))
+                            && !retained_pin_keys.contains(*key)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for key in stale_pin_keys {
+            match catalog.delete_one(&key) {
+                Ok(()) => {
+                    if let Ok(mut map) = cache_map.write() {
+                        map.remove(&key);
+                    }
+                }
+                Err(error) => crate::logger::log(format!(
+                    "metadata pin refresh: stale catalog delete failed: {error} ({key})"
+                )),
+            }
+        }
+        self.seed_folder_video_pin_thumbs(&cache_map, Some(&catalog));
+    }
+
+    fn restart_thumbnail_workers_after_metadata_pin_refresh(&mut self) {
+        if self.reload_queue.is_none() && self.heavy_io_queue.is_none() {
+            return;
+        }
+        let Some(cache_map) = self.current_color_cache_map.clone() else {
+            return;
+        };
+
+        self.cancel_token.store(true, Ordering::Relaxed);
+        self.wake_all_workers();
+
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let reload_queue: Arc<NotifyQueue> = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        let heavy_io_queue: Arc<NotifyQueue> = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+
+        self.tx = tx.clone();
+        self.rx = rx;
+        self.cancel_token = Arc::clone(&cancel);
+        self.reload_queue = Some(Arc::clone(&reload_queue));
+        self.heavy_io_queue = Some(Arc::clone(&heavy_io_queue));
+        self.requested.clear();
+        self.pending_finalize.clear();
+        self.texture_backlog.clear();
+        self.cache_gen_total = 0;
+        self.cache_gen_done = Arc::new(AtomicUsize::new(0));
+
+        self.spawn_thumbnail_workers(
+            &tx,
+            cancel,
+            reload_queue,
+            heavy_io_queue,
+            cache_map,
+            self.current_color_catalog.clone(),
+            self.folder_thumb_pin_db.clone(),
+        );
+    }
+
     fn apply_current_metadata_import_terminal_result(
         &mut self,
         mut result: metadata_import_refresh::ContextResult,
@@ -28546,34 +28648,27 @@ impl App {
             self.view_trim_page_apply_root_idx = None;
             self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
         }
-        let folder_thumbnails_changed = result
-            .folder_pin_reset_indices
-            .as_ref()
-            .is_some_and(|indices| !indices.is_empty());
+        let folder_pin_reset_indices = result.folder_pin_reset_indices.take().unwrap_or_default();
         if let Some(folder_pins) = result.folder_pin_map.take() {
             self.invalidate_converted_archive_pin_root_states();
             self.folder_pin_map = folder_pins;
         }
-        if let Some(indices) = result.folder_pin_reset_indices.take() {
-            for index in indices {
-                if let Some(thumbnail) = self.thumbnails.get_mut(index) {
-                    *thumbnail = ThumbnailState::Pending;
-                }
-                self.requested.remove(&index);
-                self.pending_finalize.remove(&index);
-            }
+        if !folder_pin_reset_indices.is_empty() {
+            self.refresh_folder_pin_thumbnail_materializations(&folder_pin_reset_indices);
         }
-        if let (Some(video_items), Some(pin_blobs)) =
-            (result.video_items.take(), result.video_pin_blobs.take())
-            && !video_items.is_empty()
-        {
-            for (index, _, _) in &video_items {
-                if let Some(thumbnail) = self.thumbnails.get_mut(*index) {
-                    *thumbnail = ThumbnailState::Pending;
+        let video_refresh = match (result.video_items.take(), result.video_pin_blobs.take()) {
+            (Some(video_items), Some(pin_blobs)) if !video_items.is_empty() => {
+                for (index, _, _) in &video_items {
+                    self.evict_thumbnail_for_reload(*index);
                 }
-                self.requested.remove(index);
-                self.pending_finalize.remove(index);
+                Some((video_items, pin_blobs))
             }
+            _ => None,
+        };
+        if !folder_pin_reset_indices.is_empty() || video_refresh.is_some() {
+            self.restart_thumbnail_workers_after_metadata_pin_refresh();
+        }
+        if let Some((video_items, pin_blobs)) = video_refresh {
             self.spawn_video_thread(
                 self.tx.clone(),
                 Arc::clone(&self.cancel_token),
@@ -28582,16 +28677,6 @@ impl App {
                 pin_blobs,
             );
         }
-        // folder pin自体、またはそのleafとなるvideo pinの変更時はcontextを一度だけ
-        // 再materializeし、catalogへseed済みの代表WebPも更新・削除する。
-        if folder_thumbnails_changed {
-            self.folder_thumb_pin_dirty = true;
-            // dirty flag自体はApp-globalなので、detached/parked bundleをswap backする前に
-            // 現在mount中のcontextで消費する。video pinをleafに持つ代表サムネの
-            // catalog seed更新・削除も、通常ロードと同じ経路でcontextごとに一度だけ行う。
-            self.consume_folder_thumb_pin_dirty();
-        }
-
         if changed.book_bookmarks {
             self.current_book_bookmarks.clear();
             self.current_book_bookmarks_key = None;

@@ -462,8 +462,12 @@ UIはitems generationとdetached window identityが一致する完成cacheだけ
 無効化し、全体page badge集合もworker生成snapshotへ置換する。folder pinのlookup identityは
 通常ロードと共通化し、current folder / 現在のZIP本 / ZipDirのliteral-effective aliasを含める。
 cache swap後のvisible/facet/details/selection再計算と代表サムネ再materializeは各contextをmount
-している間に行う。video pinは現DBにWebPがない項目も再生成対象へ含め、削除を通常フレーム抽出へ
-戻す。終端refreshはimport本体と別のcancel tokenを持ち、App終了時はDB chunk間で中断する。
+している間に行う。pin refreshは通常ナビゲーションの`load_folder`を通さず、影響thumbnailだけを
+evictし、不要になった`#pin:` catalog行の削除とvideo pin WebPのseedを同じcontextで行う。古いpin
+snapshotを持つin-flight結果はcontext所有のthumbnail worker channel / queueを交換して到達不能にし、
+items generation・fullscreen・media sessionを変更しない。video pinは現DBにWebPがない項目も再生成
+対象へ含め、削除を通常フレーム抽出へ戻す。終端refreshはimport本体と別のcancel tokenを持ち、
+App終了時はDB chunk間で中断する。
 page state import時は永続edit preview cacheの破棄完了を非同期ACKで待ち、main / active detached /
 paused detachedのmaterialized previewを失効させる。各contextではimport前後のどちらかに編集が
 あるthumbnailも再要求するため、編集削除後の旧WebPを残さない。

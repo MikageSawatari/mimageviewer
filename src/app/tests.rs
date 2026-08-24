@@ -588,6 +588,164 @@ fn metadata_context_result(
 
 #[test]
 #[cfg(windows)]
+fn metadata_folder_pin_refresh_does_not_navigate_or_close_detached_viewers() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let temp = tempfile::TempDir::new().unwrap();
+    let folder = temp.path().to_path_buf();
+    std::fs::create_dir_all(folder.join("child")).unwrap();
+
+    app.current_folder = Some(folder.clone());
+    app.items = vec![GridItem::Folder(folder.join("child"))];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    let pin_base_key = folder_thumb_existing_keys_for(
+        &app.items[0],
+        None,
+        &std::collections::HashMap::new(),
+        app.folder_thumb_pin_db.as_deref(),
+        Some(app.settings.folder_thumb_sort),
+        app.settings.folder_thumb_depth,
+        app.use_full_path_cache_keys(),
+    )
+    .into_iter()
+    .next()
+    .unwrap();
+    let stale_pin_key = [
+        pin_base_key.as_str(),
+        crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
+        "obsolete",
+    ]
+    .concat();
+    let catalog = std::sync::Arc::new(
+        crate::catalog::CatalogDb::open(&temp.path().join("cache"), &folder).unwrap(),
+    );
+    catalog
+        .save(&stale_pin_key, 1, 1, 1, 1, None, b"x")
+        .unwrap();
+    let cache_map =
+        std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::from([(
+            stale_pin_key.clone(),
+            crate::catalog::CacheEntry {
+                mtime: 1,
+                file_size: 1,
+                jpeg_data: vec![0],
+                source_dims: None,
+                layout_dims: None,
+            },
+        )])));
+    app.current_color_cache_map = Some(std::sync::Arc::clone(&cache_map));
+    app.current_color_catalog = Some(std::sync::Arc::clone(&catalog));
+    app.reload_queue = Some(std::sync::Arc::new((
+        std::sync::Mutex::new(Vec::new()),
+        std::sync::Condvar::new(),
+    )));
+    app.heavy_io_queue = Some(std::sync::Arc::new((
+        std::sync::Mutex::new(Vec::new()),
+        std::sync::Condvar::new(),
+    )));
+    let previous_cancel = std::sync::Arc::clone(&app.cancel_token);
+    let main_generation = app.items_generation;
+
+    let active_window_id = 789;
+    let active_generation = (1_u64 << 63) | (5_u64 << 32);
+    app.begin_active_detached_session(active_window_id, DetachedSource::Image);
+    let mut active = ViewerContextBundle::empty();
+    active.current_folder = Some(folder.clone());
+    active.items = vec![
+        GridItem::Image(folder.join("active.png")),
+        GridItem::Folder(folder.join("child")),
+    ];
+    active.image_metas = vec![None; 2];
+    active.thumbnails = vec![ThumbnailState::Pending; 2];
+    active.fullscreen_idx = Some(0);
+    active.items_generation = active_generation;
+    active.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+    active.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+    active.viewer_session.independent_active = true;
+    active.viewer_session.detached_window_id = Some(active_window_id);
+    app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle: active });
+
+    let window_id = 790;
+    let parked_generation = (1_u64 << 63) | (6_u64 << 32);
+    let mut parked = ViewerContextBundle::empty();
+    parked.current_folder = Some(folder.clone());
+    parked.items = vec![GridItem::Video(folder.join("parked.mp4"))];
+    parked.image_metas = vec![None];
+    parked.thumbnails = vec![ThumbnailState::Pending];
+    parked.fullscreen_idx = Some(0);
+    parked.items_generation = parked_generation;
+    parked.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+    parked.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+    parked.viewer_session.detached_window_id = Some(window_id);
+    app.detached_image_windows
+        .push(paused_test_window(&ctx, window_id, parked));
+
+    let mut main = metadata_context_result(
+        crate::app::metadata_import_refresh::ContextSlot::Main,
+        main_generation,
+        0,
+    );
+    main.rating_cache = None;
+    main.current_rating = None;
+    main.folder_pin_map = Some(Default::default());
+    main.folder_pin_reset_indices = Some(vec![0]);
+    let mut active = metadata_context_result(
+        crate::app::metadata_import_refresh::ContextSlot::ActiveDetached(Some(active_window_id)),
+        active_generation,
+        0,
+    );
+    active.rating_cache = None;
+    active.current_rating = None;
+    active.folder_pin_map = Some(Default::default());
+    active.folder_pin_reset_indices = Some(vec![1]);
+    let mut paused = metadata_context_result(
+        crate::app::metadata_import_refresh::ContextSlot::PausedDetached {
+            index: 0,
+            window_id,
+        },
+        parked_generation,
+        0,
+    );
+    paused.rating_cache = None;
+    paused.current_rating = None;
+    paused.folder_pin_map = Some(Default::default());
+    paused.folder_pin_reset_indices = Some(vec![0]);
+
+    let (errors, stale) = app.apply_metadata_import_terminal_refresh(
+        crate::app::metadata_import_refresh::RefreshResult {
+            contexts: vec![main, active, paused],
+            page_snapshot: None,
+            errors: Vec::new(),
+        },
+        crate::metadata_transfer::ImportChangedSections {
+            thumbnail_pins: true,
+            ..Default::default()
+        },
+    );
+
+    assert!(errors.is_empty());
+    assert!(!stale);
+    assert_eq!(app.items_generation, main_generation);
+    assert!(previous_cancel.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(!app.cancel_token.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(!std::sync::Arc::ptr_eq(&previous_cancel, &app.cancel_token));
+    assert!(!cache_map.read().unwrap().contains_key(&stale_pin_key));
+    assert!(catalog.load_one(&stale_pin_key).unwrap().is_none());
+    let active = app.active_detached_viewer_context.as_ref().unwrap();
+    assert_eq!(active.bundle.items_generation, active_generation);
+    assert_eq!(active.bundle.fullscreen_idx, Some(0));
+    assert_eq!(app.active_detached_window_id(), Some(active_window_id));
+    let parked = app.detached_image_windows[0]
+        .paused_bundle
+        .as_ref()
+        .unwrap();
+    assert_eq!(parked.items_generation, parked_generation);
+    assert_eq!(parked.fullscreen_idx, Some(0));
+}
+
+#[test]
+#[cfg(windows)]
 fn active_detached_mount_restores_both_contexts_and_depth_after_panic() {
     let mut app = phase_c_support::setup_app();
     let main_path = PathBuf::from(r"C:\main\page.jpg");
