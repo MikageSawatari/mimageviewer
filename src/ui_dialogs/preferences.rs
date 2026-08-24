@@ -1764,6 +1764,9 @@ impl App {
                 #[cfg(windows)]
                 let old_video_seek_strip_min_interval_secs =
                     self.settings.video_seek_strip_min_interval_secs;
+                #[cfg(windows)]
+                let old_video_seek_strip_waveform_span_secs =
+                    self.settings.video_seek_strip_waveform_span_secs;
 
                 // VST3 enable 状態 + チェーン構成の変化を検出してホットリロード。
                 let old_vst3_enabled = self.settings.vst3_enabled;
@@ -1806,6 +1809,12 @@ impl App {
                     != self.settings.video_seek_strip_min_interval_secs.to_bits()
                 {
                     self.rebuild_video_seek_strip_adopted_list();
+                }
+                #[cfg(windows)]
+                if old_video_seek_strip_waveform_span_secs.to_bits()
+                    != self.settings.video_seek_strip_waveform_span_secs.to_bits()
+                {
+                    self.rebuild_video_seek_strip_waveform_span();
                 }
                 self.sync_content_identity_detection_setting(old_edit_restore_prompt_enabled);
                 if old_creative_luts != self.settings.creative_luts {

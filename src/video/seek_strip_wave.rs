@@ -3,9 +3,9 @@
 //! The worker owns one lazy-opened audio range decoder for the current video.
 //! It first reuses a completed full TimelineAnalysis when the file identity
 //! matches; otherwise it decodes the requested span plus pre-roll. The first request is one visible
-//! screen, followed by a same-scale three-screen upgrade. Rasterization also runs here, and only
-//! RGBA plus its time coverage crosses to the App and native presenter. The cache is
-//! process-memory-only by design.
+//! screen, followed by a same-scale wider upgrade. Rasterization also runs here, and only RGBA plus
+//! its time coverage crosses to the App and native presenter. The cache is process-memory-only by
+//! design.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -17,14 +17,16 @@ use crossbeam_channel::{Sender, bounded};
 use music_core::{AnalysisConfig, TimelineAnalysis, WaveformBin};
 
 /// One strip width in waveform mode.
-pub(crate) const DEFAULT_WAVEFORM_SPAN_SECS: f64 = 60.0;
-/// One analyzed/rasterized texture spans three visible strip widths. The presenter scrolls by
-/// selecting a sub-rectangle; moving inside this coverage does not analyze or upload again.
-pub(crate) const WAVEFORM_RASTER_SPAN_MULTIPLIER: usize = 3;
-pub(crate) const WAVEFORM_RASTER_SPAN_SECS: f64 =
-    DEFAULT_WAVEFORM_SPAN_SECS * WAVEFORM_RASTER_SPAN_MULTIPLIER as f64;
-/// Start a replacement while this much analyzed time still remains beyond the visible edge.
-const WAVEFORM_REQUEST_MARGIN_SECS: f64 = DEFAULT_WAVEFORM_SPAN_SECS * 0.25;
+#[cfg(test)]
+pub(crate) const DEFAULT_WAVEFORM_SPAN_SECS: f64 =
+    crate::settings::VIDEO_SEEK_STRIP_WAVEFORM_SPAN_DEFAULT_SECS;
+/// Keep three visible screens while that remains modest, but never decode more than one hour for
+/// the retained background raster. At the 30-minute preference maximum this is a 2x raster, which
+/// still leaves 15 minutes of coverage on each side without starting a 90-minute decode.
+const WAVEFORM_RETAINED_SPAN_MULTIPLIER: f64 = 3.0;
+pub(crate) const MAX_WAVEFORM_RETAINED_SPAN_SECS: f64 = 3600.0;
+/// Start a replacement while one quarter of a visible screen remains beyond the visible edge.
+const WAVEFORM_REQUEST_MARGIN_RATIO: f64 = 0.25;
 /// Filter warm-up decoded before the visible window and discarded afterwards.
 pub(crate) const WAVEFORM_PRE_ROLL_SECS: f64 = 0.75;
 const MIN_WAVEFORM_BIN_SECS: f64 = 0.010;
@@ -141,28 +143,41 @@ pub(crate) struct WaveSpanRequest {
 }
 
 impl WaveSpanRequest {
-    fn first_paint(center_time_secs: f64) -> Option<Self> {
+    fn first_paint(center_time_secs: f64, visible_span_secs: f64) -> Option<Self> {
         Some(Self {
-            span: WaveSpan::centered(center_time_secs, DEFAULT_WAVEFORM_SPAN_SECS)?,
+            span: WaveSpan::centered(center_time_secs, visible_span_secs)?,
             stage: WaveRequestStage::FirstPaint,
         })
     }
 
-    fn wide(center_time_secs: f64) -> Option<Self> {
+    fn wide(center_time_secs: f64, visible_span_secs: f64) -> Option<Self> {
         Some(Self {
-            span: WaveSpan::centered(center_time_secs, WAVEFORM_RASTER_SPAN_SECS)?,
+            span: WaveSpan::centered(
+                center_time_secs,
+                waveform_retained_span_secs(visible_span_secs)?,
+            )?,
             stage: WaveRequestStage::Wide,
         })
     }
 
-    pub(crate) fn pixel_width(self, visible_pixel_width: usize) -> usize {
-        match self.stage {
-            WaveRequestStage::FirstPaint => visible_pixel_width,
-            WaveRequestStage::Wide => {
-                visible_pixel_width.saturating_mul(WAVEFORM_RASTER_SPAN_MULTIPLIER)
-            }
+    pub(crate) fn pixel_width(self, visible_pixel_width: usize, visible_span_secs: f64) -> usize {
+        if visible_pixel_width == 0 || !visible_span_secs.is_finite() || visible_span_secs <= 0.0 {
+            return 0;
         }
+        let ratio = (self.span.duration_secs() / visible_span_secs).max(1.0);
+        ((visible_pixel_width as f64 * ratio).round() as usize).max(visible_pixel_width)
     }
+}
+
+pub(crate) fn waveform_retained_span_secs(visible_span_secs: f64) -> Option<f64> {
+    if !visible_span_secs.is_finite() || visible_span_secs <= 0.0 {
+        return None;
+    }
+    Some(
+        (visible_span_secs * WAVEFORM_RETAINED_SPAN_MULTIPLIER)
+            .min(MAX_WAVEFORM_RETAINED_SPAN_SECS)
+            .max(visible_span_secs),
+    )
 }
 
 /// Choose the visible-first request, its same-centred wide upgrade, and later edge replacements.
@@ -172,49 +187,62 @@ impl WaveSpanRequest {
 /// exists, its full-coverage band is the hysteresis latch used by steady scrolling.
 pub(crate) fn decide_waveform_span_request(
     center_time_secs: f64,
+    visible_span_secs: f64,
     displayed: Option<WaveSpan>,
     pending: Option<WaveSpan>,
 ) -> Option<WaveSpanRequest> {
-    if !center_time_secs.is_finite() {
+    if !center_time_secs.is_finite() || !visible_span_secs.is_finite() || visible_span_secs <= 0.0 {
         return None;
     }
-    let visible = WaveSpan::centered(center_time_secs, DEFAULT_WAVEFORM_SPAN_SECS)?;
+    let visible = WaveSpan::centered(center_time_secs, visible_span_secs)?;
+    let retained_span_secs = waveform_retained_span_secs(visible_span_secs)?;
     if let Some(pending) = pending {
-        if pending.has_duration(DEFAULT_WAVEFORM_SPAN_SECS) {
+        if pending.has_duration(visible_span_secs) {
             return if pending.overlaps(visible) {
                 None
             } else {
-                WaveSpanRequest::first_paint(center_time_secs)
+                WaveSpanRequest::first_paint(center_time_secs, visible_span_secs)
             };
         }
-        if pending.contains_visible_center(center_time_secs, DEFAULT_WAVEFORM_SPAN_SECS) {
+        if !pending.has_duration(retained_span_secs) {
+            return WaveSpanRequest::first_paint(center_time_secs, visible_span_secs);
+        }
+        if pending.contains_visible_center(center_time_secs, visible_span_secs) {
             return None;
         }
-        return if displayed.is_some_and(|span| span.overlaps(visible)) {
-            WaveSpanRequest::wide(center_time_secs)
+        return if displayed.is_some_and(|span| {
+            (span.has_duration(visible_span_secs) || span.has_duration(retained_span_secs))
+                && span.overlaps(visible)
+        }) {
+            WaveSpanRequest::wide(center_time_secs, visible_span_secs)
         } else {
-            WaveSpanRequest::first_paint(center_time_secs)
+            WaveSpanRequest::first_paint(center_time_secs, visible_span_secs)
         };
     }
 
     let Some(displayed) = displayed else {
-        return WaveSpanRequest::first_paint(center_time_secs);
+        return WaveSpanRequest::first_paint(center_time_secs, visible_span_secs);
     };
-    if displayed.has_duration(DEFAULT_WAVEFORM_SPAN_SECS) {
+    if displayed.has_duration(visible_span_secs) {
         return if displayed.overlaps(visible) {
-            WaveSpanRequest::wide(displayed.center_secs())
+            WaveSpanRequest::wide(displayed.center_secs(), visible_span_secs)
         } else {
-            WaveSpanRequest::first_paint(center_time_secs)
+            WaveSpanRequest::first_paint(center_time_secs, visible_span_secs)
         };
+    }
+    if !displayed.has_duration(retained_span_secs) {
+        // A preference change can leave the previous image on screen as a holdover. It is not
+        // request coverage for the new scale, so rebuild the new first paint immediately.
+        return WaveSpanRequest::first_paint(center_time_secs, visible_span_secs);
     }
     if displayed.contains_center_with_margin(
         center_time_secs,
-        DEFAULT_WAVEFORM_SPAN_SECS,
-        WAVEFORM_REQUEST_MARGIN_SECS,
+        visible_span_secs,
+        visible_span_secs * WAVEFORM_REQUEST_MARGIN_RATIO,
     ) {
         return None;
     }
-    WaveSpanRequest::wide(center_time_secs)
+    WaveSpanRequest::wide(center_time_secs, visible_span_secs)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -230,26 +258,29 @@ pub(crate) struct WaveTextureSlice {
 /// `None` is the unavoidable full gap after a jump beyond all analyzed coverage.
 pub(crate) fn waveform_texture_slice(
     center_time_secs: f64,
+    visible_span_secs: f64,
     raster_start_secs: f64,
     raster_end_secs: f64,
 ) -> Option<WaveTextureSlice> {
     if !center_time_secs.is_finite()
+        || !visible_span_secs.is_finite()
+        || visible_span_secs <= 0.0
         || !raster_start_secs.is_finite()
         || !raster_end_secs.is_finite()
         || raster_end_secs <= raster_start_secs
     {
         return None;
     }
-    let visible_start = center_time_secs - DEFAULT_WAVEFORM_SPAN_SECS * 0.5;
-    let visible_end = visible_start + DEFAULT_WAVEFORM_SPAN_SECS;
+    let visible_start = center_time_secs - visible_span_secs * 0.5;
+    let visible_end = visible_start + visible_span_secs;
     let overlap_start = visible_start.max(raster_start_secs);
     let overlap_end = visible_end.min(raster_end_secs);
     if overlap_end <= overlap_start {
         return None;
     }
     Some(WaveTextureSlice {
-        destination_start: ((overlap_start - visible_start) / DEFAULT_WAVEFORM_SPAN_SECS) as f32,
-        destination_end: ((overlap_end - visible_start) / DEFAULT_WAVEFORM_SPAN_SECS) as f32,
+        destination_start: ((overlap_start - visible_start) / visible_span_secs) as f32,
+        destination_end: ((overlap_end - visible_start) / visible_span_secs) as f32,
         texture_start: ((overlap_start - raster_start_secs) / (raster_end_secs - raster_start_secs))
             as f32,
         texture_end: ((overlap_end - raster_start_secs) / (raster_end_secs - raster_start_secs))
@@ -380,6 +411,7 @@ pub(crate) struct WaveRequestSignature {
     center_bits: u64,
     duration_bits: u64,
     span_bits: u64,
+    visible_span_bits: u64,
     pixel_width: usize,
     pixel_height: usize,
 }
@@ -389,6 +421,7 @@ impl WaveRequestSignature {
         center_time_secs: f64,
         duration_secs: f64,
         span_secs: f64,
+        visible_span_secs: f64,
         pixel_width: usize,
         pixel_height: usize,
     ) -> Option<Self> {
@@ -397,6 +430,8 @@ impl WaveRequestSignature {
             || duration_secs <= 0.0
             || !span_secs.is_finite()
             || span_secs <= 0.0
+            || !visible_span_secs.is_finite()
+            || visible_span_secs <= 0.0
             || pixel_width == 0
             || pixel_height == 0
         {
@@ -406,6 +441,7 @@ impl WaveRequestSignature {
             center_bits: center_time_secs.to_bits(),
             duration_bits: duration_secs.to_bits(),
             span_bits: span_secs.to_bits(),
+            visible_span_bits: visible_span_secs.to_bits(),
             pixel_width,
             pixel_height,
         })
@@ -422,6 +458,10 @@ impl WaveRequestSignature {
     fn span_secs(self) -> f64 {
         f64::from_bits(self.span_bits)
     }
+
+    fn visible_span_secs(self) -> f64 {
+        f64::from_bits(self.visible_span_bits)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -430,6 +470,7 @@ struct WaveRasterKey {
     window_start_micros: i64,
     window_end_micros: i64,
     bin_micros: u64,
+    visible_span_micros: u64,
     pixel_width: usize,
     pixel_height: usize,
 }
@@ -439,6 +480,7 @@ impl WaveRasterKey {
         identity: WaveFileIdentity,
         window: WaveWindow,
         bin_secs: f64,
+        visible_span_secs: f64,
         pixel_width: usize,
         pixel_height: usize,
     ) -> Self {
@@ -447,6 +489,7 @@ impl WaveRasterKey {
             window_start_micros: (window.start_secs * 1_000_000.0).round() as i64,
             window_end_micros: (window.end_secs * 1_000_000.0).round() as i64,
             bin_micros: (bin_secs * 1_000_000.0).round().max(1.0) as u64,
+            visible_span_micros: (visible_span_secs * 1_000_000.0).round().max(1.0) as u64,
             pixel_width,
             pixel_height,
         }
@@ -457,6 +500,7 @@ impl WaveRasterKey {
 pub(crate) struct WaveRaster {
     pub(crate) window_start_secs: f64,
     pub(crate) window_end_secs: f64,
+    pub(crate) visible_span_secs: f64,
     pub(crate) bin_secs: f64,
     pub(crate) width: u32,
     pub(crate) height: u32,
@@ -711,6 +755,7 @@ fn process_wave_request(
         identity.clone(),
         window,
         bin_secs,
+        signature.visible_span_secs(),
         signature.pixel_width,
         signature.pixel_height,
     );
@@ -724,6 +769,7 @@ fn process_wave_request(
             total_t0.elapsed(),
             bin_secs,
             signature.span_secs(),
+            signature.visible_span_secs(),
             signature.pixel_width,
         );
         return;
@@ -831,6 +877,7 @@ fn process_wave_request(
     let raster = Arc::new(WaveRaster {
         window_start_secs: window.start_secs,
         window_end_secs: window.end_secs,
+        visible_span_secs: signature.visible_span_secs(),
         bin_secs,
         width: signature.pixel_width as u32,
         height: signature.pixel_height as u32,
@@ -846,6 +893,7 @@ fn process_wave_request(
         total_t0.elapsed(),
         bin_secs,
         signature.span_secs(),
+        signature.visible_span_secs(),
         signature.pixel_width,
     );
 }
@@ -902,7 +950,8 @@ fn emit_wave_perf(
     raster: Duration,
     total: Duration,
     bin_secs: f64,
-    span_secs: f64,
+    raster_span_secs: f64,
+    visible_span_secs: f64,
     pixel_width: usize,
 ) {
     if crate::perf::is_enabled() {
@@ -930,7 +979,14 @@ fn emit_wave_perf(
                     serde_json::Value::from(total.as_secs_f64() * 1000.0),
                 ),
                 ("bin_secs", serde_json::Value::from(bin_secs)),
-                ("span_secs", serde_json::Value::from(span_secs)),
+                (
+                    "raster_span_secs",
+                    serde_json::Value::from(raster_span_secs),
+                ),
+                (
+                    "visible_span_secs",
+                    serde_json::Value::from(visible_span_secs),
+                ),
                 ("pixel_width", serde_json::Value::from(pixel_width as u64)),
             ],
         );
@@ -940,6 +996,66 @@ fn emit_wave_perf(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "manual real-media first-paint measurement"]
+    fn measure_app_worker_first_paint_from_env() {
+        let path = std::env::var_os("MIV_WAVE_BENCH_PATH")
+            .map(PathBuf::from)
+            .expect("set MIV_WAVE_BENCH_PATH to a real video");
+        let duration_secs: f64 = std::env::var("MIV_WAVE_BENCH_DURATION_SECS")
+            .expect("set MIV_WAVE_BENCH_DURATION_SECS")
+            .parse()
+            .expect("duration must be seconds");
+        let log_path = std::env::var_os("MIV_WAVE_BENCH_LOG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("miv-wave-first-paint.jsonl"));
+        crate::perf::init_with_path(true, None, Some(log_path));
+
+        const PIXEL_WIDTH: usize = 1920;
+        const PIXEL_HEIGHT: usize = 94;
+        let center_time_secs = duration_secs * 0.5;
+        for visible_span_secs in [60.0, 600.0, 1800.0] {
+            let worker = SeekStripWaveWorker::spawn(path.clone());
+            let signature = WaveRequestSignature::new(
+                center_time_secs,
+                duration_secs,
+                visible_span_secs,
+                visible_span_secs,
+                PIXEL_WIDTH,
+                PIXEL_HEIGHT,
+            )
+            .expect("valid request");
+            let started = Instant::now();
+            worker.request(signature, None).expect("worker request");
+            loop {
+                let snapshot = worker.snapshot();
+                match snapshot.status {
+                    WaveWorkerStatus::Idle if snapshot.raster.is_some() => {
+                        let raster = snapshot.raster.unwrap();
+                        println!(
+                            "first-paint span={visible_span_secs:.0}s total_ms={:.1} bin_secs={:.3} bins_at_most={}",
+                            started.elapsed().as_secs_f64() * 1000.0,
+                            raster.bin_secs,
+                            (visible_span_secs / raster.bin_secs).ceil() as usize,
+                        );
+                        break;
+                    }
+                    WaveWorkerStatus::NoAudioTrack => panic!("no audio track"),
+                    WaveWorkerStatus::Failed(error)
+                    | WaveWorkerStatus::ThreadSpawnFailed(error) => panic!("{error}"),
+                    WaveWorkerStatus::Cancelled => panic!("worker cancelled"),
+                    WaveWorkerStatus::Idle | WaveWorkerStatus::Working => {}
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(60),
+                    "first paint timed out"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        crate::perf::flush();
+    }
 
     fn bin(start: f64, duration: f64) -> WaveformBin {
         WaveformBin {
@@ -959,6 +1075,7 @@ mod tests {
             window_start_micros: 0,
             window_end_micros: 1,
             bin_micros: 1,
+            visible_span_micros: 1,
             pixel_width: 1,
             pixel_height: 1,
         }
@@ -968,6 +1085,7 @@ mod tests {
         Arc::new(WaveRaster {
             window_start_secs: 0.0,
             window_end_secs: 1.0,
+            visible_span_secs: DEFAULT_WAVEFORM_SPAN_SECS,
             bin_secs: 0.1,
             width: 1,
             height: 1,
@@ -985,37 +1103,54 @@ mod tests {
 
     #[test]
     fn first_paint_is_visible_then_upgrades_wide_at_the_same_center_and_scale() {
-        assert_eq!(WAVEFORM_RASTER_SPAN_SECS, DEFAULT_WAVEFORM_SPAN_SECS * 3.0);
-        let first = decide_waveform_span_request(100.0, None, None).unwrap();
+        let visible_span_secs = DEFAULT_WAVEFORM_SPAN_SECS;
+        assert_eq!(
+            waveform_retained_span_secs(visible_span_secs),
+            Some(visible_span_secs * 3.0)
+        );
+        let first = decide_waveform_span_request(100.0, visible_span_secs, None, None).unwrap();
         assert_eq!(first.stage, WaveRequestStage::FirstPaint);
         assert_eq!(first.span, WaveSpan::centered(100.0, 60.0).unwrap());
-        assert_eq!(first.pixel_width(1_000), 1_000);
+        assert_eq!(first.pixel_width(1_000, visible_span_secs), 1_000);
 
         // Small follow-playhead movement must not cancel and restart the fast first paint.
         assert_eq!(
-            decide_waveform_span_request(100.1, None, Some(first.span)),
+            decide_waveform_span_request(100.1, visible_span_secs, None, Some(first.span)),
             None
         );
 
-        let upgrade = decide_waveform_span_request(100.1, Some(first.span), None).unwrap();
+        let upgrade =
+            decide_waveform_span_request(100.1, visible_span_secs, Some(first.span), None).unwrap();
         assert_eq!(upgrade.stage, WaveRequestStage::Wide);
         assert_eq!(upgrade.span.center_secs(), first.span.center_secs());
         assert_eq!(upgrade.span.duration_secs(), 180.0);
-        assert_eq!(upgrade.pixel_width(1_000), 3_000);
+        assert_eq!(upgrade.pixel_width(1_000, visible_span_secs), 3_000);
         assert_eq!(
-            waveform_bin_secs(first.span.duration_secs(), first.pixel_width(1_000)),
-            waveform_bin_secs(upgrade.span.duration_secs(), upgrade.pixel_width(1_000))
+            waveform_bin_secs(
+                first.span.duration_secs(),
+                first.pixel_width(1_000, visible_span_secs)
+            ),
+            waveform_bin_secs(
+                upgrade.span.duration_secs(),
+                upgrade.pixel_width(1_000, visible_span_secs)
+            )
         );
     }
 
     #[test]
     fn wide_raster_requests_at_hysteresis_boundary() {
-        let displayed = WaveSpan::centered(100.0, WAVEFORM_RASTER_SPAN_SECS).unwrap();
+        let visible_span_secs = DEFAULT_WAVEFORM_SPAN_SECS;
+        let displayed = WaveSpan::centered(
+            100.0,
+            waveform_retained_span_secs(visible_span_secs).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
-            decide_waveform_span_request(55.0, Some(displayed), None),
+            decide_waveform_span_request(55.0, visible_span_secs, Some(displayed), None),
             None
         );
-        let replacement = decide_waveform_span_request(54.999, Some(displayed), None).unwrap();
+        let replacement =
+            decide_waveform_span_request(54.999, visible_span_secs, Some(displayed), None).unwrap();
         assert_eq!(replacement.stage, WaveRequestStage::Wide);
         assert!((replacement.span.duration_secs() - 180.0).abs() < 1.0e-9);
         assert!(replacement.span.matches_window(
@@ -1026,12 +1161,52 @@ mod tests {
         // The in-flight replacement is the latch: returning across the old trigger does not
         // replace the request while its full visible range would cover the new centre.
         assert_eq!(
-            decide_waveform_span_request(60.0, Some(displayed), Some(replacement.span)),
+            decide_waveform_span_request(
+                60.0,
+                visible_span_secs,
+                Some(displayed),
+                Some(replacement.span)
+            ),
             None
         );
         assert!(
-            decide_waveform_span_request(145.0, Some(displayed), Some(replacement.span)).is_some()
+            decide_waveform_span_request(
+                145.0,
+                visible_span_secs,
+                Some(displayed),
+                Some(replacement.span)
+            )
+            .is_some()
         );
+    }
+
+    #[test]
+    fn thirty_minute_view_caps_retained_decode_at_one_hour_with_hysteresis() {
+        let visible_span_secs = 1800.0;
+        assert_eq!(
+            waveform_retained_span_secs(visible_span_secs),
+            Some(MAX_WAVEFORM_RETAINED_SPAN_SECS)
+        );
+        let displayed = WaveSpan::centered(4_000.0, MAX_WAVEFORM_RETAINED_SPAN_SECS).unwrap();
+        assert_eq!(
+            decide_waveform_span_request(4_450.0, visible_span_secs, Some(displayed), None),
+            None
+        );
+        let replacement =
+            decide_waveform_span_request(4_450.001, visible_span_secs, Some(displayed), None)
+                .unwrap();
+        assert_eq!(replacement.stage, WaveRequestStage::Wide);
+        assert_eq!(replacement.span.duration_secs(), 3600.0);
+        assert_eq!(replacement.pixel_width(1_920, visible_span_secs), 3_840);
+    }
+
+    #[test]
+    fn changed_visible_span_treats_old_raster_only_as_a_display_holdover() {
+        let old_retained = WaveSpan::centered(1000.0, 180.0).unwrap();
+        let request =
+            decide_waveform_span_request(1000.0, 600.0, Some(old_retained), None).unwrap();
+        assert_eq!(request.stage, WaveRequestStage::FirstPaint);
+        assert_eq!(request.span.duration_secs(), 600.0);
     }
 
     #[test]
@@ -1055,20 +1230,20 @@ mod tests {
 
     #[test]
     fn retained_wave_texture_scrolls_by_uv_and_only_gaps_after_a_jump() {
-        let centered = waveform_texture_slice(100.0, 10.0, 190.0).unwrap();
+        let centered = waveform_texture_slice(100.0, 60.0, 10.0, 190.0).unwrap();
         assert!((centered.destination_start - 0.0).abs() < f32::EPSILON);
         assert!((centered.destination_end - 1.0).abs() < f32::EPSILON);
         assert!((centered.texture_start - (1.0 / 3.0)).abs() < 1.0e-6);
         assert!((centered.texture_end - (2.0 / 3.0)).abs() < 1.0e-6);
 
-        let scrolled = waveform_texture_slice(130.0, 10.0, 190.0).unwrap();
+        let scrolled = waveform_texture_slice(130.0, 60.0, 10.0, 190.0).unwrap();
         assert!((scrolled.texture_start - 0.5).abs() < 1.0e-6);
         assert!((scrolled.texture_end - (5.0 / 6.0)).abs() < 1.0e-6);
 
-        let partial = waveform_texture_slice(200.0, 10.0, 190.0).unwrap();
+        let partial = waveform_texture_slice(200.0, 60.0, 10.0, 190.0).unwrap();
         assert!((partial.destination_start - 0.0).abs() < f32::EPSILON);
         assert!((partial.destination_end - (1.0 / 3.0)).abs() < 1.0e-6);
-        assert_eq!(waveform_texture_slice(221.0, 10.0, 190.0), None);
+        assert_eq!(waveform_texture_slice(221.0, 60.0, 10.0, 190.0), None);
     }
 
     #[test]
@@ -1108,6 +1283,16 @@ mod tests {
         assert_eq!(waveform_bin_secs(60.0, 4_000), 0.015);
         assert_eq!(waveform_bin_secs(1.0, 4_000), MIN_WAVEFORM_BIN_SECS);
         assert_eq!(waveform_bin_secs(60.0, 0), MIN_WAVEFORM_BIN_SECS);
+        for visible_span_secs in [60.0, 600.0, 1800.0] {
+            let visible_width = 1_920;
+            let retained_span_secs = waveform_retained_span_secs(visible_span_secs).unwrap();
+            let retained = WaveSpanRequest::wide(0.0, visible_span_secs).unwrap();
+            let retained_width = retained.pixel_width(visible_width, visible_span_secs);
+            let visible_bin_secs = waveform_bin_secs(visible_span_secs, visible_width);
+            let retained_bin_secs = waveform_bin_secs(retained_span_secs, retained_width);
+            assert_eq!(visible_bin_secs, retained_bin_secs);
+            assert!((visible_span_secs / visible_bin_secs).ceil() as usize <= visible_width);
+        }
     }
 
     #[test]

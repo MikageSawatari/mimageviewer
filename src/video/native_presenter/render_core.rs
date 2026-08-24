@@ -159,7 +159,7 @@ fn draw_native_seek_strip(
     texture_ids: &HashMap<usize, egui::TextureId>,
     wave_texture_id: Option<egui::TextureId>,
     drag_origin: &mut Option<crate::video::seek_strip::SeekStripDragOrigin>,
-    last_window_request: &mut Option<(u8, u64, usize, usize, usize)>,
+    last_window_request: &mut Option<(u8, u64, u64, usize, usize, usize)>,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
     let strip_rect = native_seek_strip_rect(overlay_size.x, overlay_size.y);
@@ -171,17 +171,20 @@ fn draw_native_seek_strip(
     let pixel_height = ((SEEK_STRIP_HEIGHT - 10.0) * pixels_per_point)
         .round()
         .max(1.0) as usize;
-    let (mode_key, center_bits) = match strip.center {
+    let (mode_key, center_bits, waveform_span_bits) = match strip.center {
         crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index } => {
-            (0, center_index.to_bits())
+            (0, center_index.to_bits(), 0)
         }
-        crate::video::seek_strip::SeekStripCenter::Waveform { center_time_secs } => {
-            (1, center_time_secs.to_bits())
-        }
+        crate::video::seek_strip::SeekStripCenter::Waveform { center_time_secs } => (
+            1,
+            center_time_secs.to_bits(),
+            strip.waveform_span_secs.to_bits(),
+        ),
     };
     let request_key = (
         mode_key,
         center_bits,
+        waveform_span_bits,
         visible_count,
         pixel_width,
         pixel_height,
@@ -305,6 +308,7 @@ fn draw_native_seek_strip(
                     {
                         if let Some(slice) = crate::video::seek_strip_wave::waveform_texture_slice(
                             center_time_secs,
+                            strip.waveform_span_secs,
                             wave_image.window_start_secs,
                             wave_image.window_end_secs,
                         ) {
@@ -395,7 +399,7 @@ fn draw_native_seek_strip(
                         pointer,
                         SEEK_STRIP_CELL_WIDTH,
                         local_rect.width(),
-                        crate::video::seek_strip_wave::DEFAULT_WAVEFORM_SPAN_SECS,
+                        strip.waveform_span_secs,
                     );
                     if let Some(center) = center {
                         commands.push(NativeOverlayCommand::MoveSeekStrip { center });
@@ -411,7 +415,7 @@ fn draw_native_seek_strip(
                     pointer,
                     SEEK_STRIP_CELL_WIDTH,
                     local_rect.width(),
-                    crate::video::seek_strip_wave::DEFAULT_WAVEFORM_SPAN_SECS,
+                    strip.waveform_span_secs,
                 );
                 if let Some(center) = center {
                     commands.push(NativeOverlayCommand::CommitSeekStrip { center });
@@ -440,7 +444,7 @@ fn draw_native_seek_strip(
                             pointer.x,
                             marker_x,
                             local_rect.width(),
-                            crate::video::seek_strip_wave::DEFAULT_WAVEFORM_SPAN_SECS,
+                            strip.waveform_span_secs,
                         )
                         .map(|center_time_secs| {
                             crate::video::seek_strip::SeekStripCenter::Waveform { center_time_secs }
@@ -459,43 +463,54 @@ fn draw_native_seek_strip_cycle_button(
     painter: &egui::Painter,
     button_rect: egui::Rect,
     state: crate::settings::VideoSeekStripState,
+    enabled: bool,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
     let response = ui.interact(
         button_rect,
         egui::Id::new("native_video_seek_strip_selector"),
-        egui::Sense::click(),
+        if enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
     );
     draw_overlay_button_bg(
         painter,
         button_rect,
-        response.hovered(),
-        state != crate::settings::VideoSeekStripState::None,
+        response.hovered() && enabled,
+        enabled && state != crate::settings::VideoSeekStripState::None,
     );
     draw_seek_strip_film_icon(
         painter,
         button_rect,
-        if state == crate::settings::VideoSeekStripState::None {
+        if !enabled {
+            egui::Color32::from_gray(105)
+        } else if state == crate::settings::VideoSeekStripState::None {
             egui::Color32::from_gray(210)
         } else {
             egui::Color32::from_rgb(150, 220, 255)
         },
     );
-    if state == crate::settings::VideoSeekStripState::Waveform {
+    if enabled && state == crate::settings::VideoSeekStripState::Waveform {
         draw_seek_strip_waveform_note(painter, button_rect, egui::Color32::from_rgb(255, 220, 82));
     }
-    let response = response.hover_tip_dark(match state {
-        crate::settings::VideoSeekStripState::None => {
-            "シークストリップ: オフ (クリックでサムネイル)"
-        }
-        crate::settings::VideoSeekStripState::Thumbnails => {
-            "シークストリップ: サムネイル (クリックで音声波形)"
-        }
-        crate::settings::VideoSeekStripState::Waveform => {
-            "シークストリップ: 音声波形 (クリックでオフ)"
+    let response = response.hover_tip_dark(if !enabled {
+        "長さの情報がない動画では使えません"
+    } else {
+        match state {
+            crate::settings::VideoSeekStripState::None => {
+                "シークストリップ: オフ (クリックでサムネイル)"
+            }
+            crate::settings::VideoSeekStripState::Thumbnails => {
+                "シークストリップ: サムネイル (クリックで音声波形)"
+            }
+            crate::settings::VideoSeekStripState::Waveform => {
+                "シークストリップ: 音声波形 (クリックでオフ)"
+            }
         }
     });
-    if response.clicked() {
+    if enabled && response.clicked() {
         commands.push(NativeOverlayCommand::SetSeekStripState {
             state: state.cycle(),
         });
@@ -1050,7 +1065,7 @@ struct NativeEguiOverlay {
     seek_strip_wave_texture: Option<(u64, egui::TextureHandle)>,
     seek_row_gesture: Option<crate::video::seek_strip::SeekRowGesture>,
     seek_strip_drag_origin: Option<crate::video::seek_strip::SeekStripDragOrigin>,
-    last_seek_strip_window_request: Option<(u8, u64, usize, usize, usize)>,
+    last_seek_strip_window_request: Option<(u8, u64, u64, usize, usize, usize)>,
     jump_textures: HashMap<usize, (u64, egui::TextureHandle)>,
     /// 直前の render_once で実際に描画した上部バーの可視状態。
     /// top_bar_visible は hover ヒステリシス用に残し、region はこの snapshot を参照する。
@@ -1474,6 +1489,7 @@ pub struct NativeOverlaySeekStrip {
     pub thumbnail_notice: Option<NativeOverlaySeekStripThumbnailNotice>,
     pub wave_image: Option<NativeOverlaySeekStripWaveImage>,
     pub wave_notice: Option<NativeOverlaySeekStripWaveNotice>,
+    pub waveform_span_secs: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8417,6 +8433,8 @@ impl NativeEguiOverlay {
         let touch_panel_handles_visible = touch_panel_handle_rects.iter().any(Option::is_some);
         let position_secs = self.video_position_secs;
         let duration_secs = self.video_duration_secs;
+        let position_controls_available =
+            crate::video::seek_strip::video_position_controls_available(duration_secs);
         // P10-2: now-playing バナー (現在再生中のチャプター/ブックマーク) は左パネル
         // 表示中だけ出す。`jump_panel_visible()` は pointer hover で決まるため、
         // closure 内で再計算するのではなく、ここで bool として取って move する。
@@ -9791,7 +9809,7 @@ impl NativeEguiOverlay {
                         );
 
                         painter.rect_filled(bar_rect, 2.0, egui::Color32::from_gray(74));
-                        if duration_secs > 0.0 {
+                        if position_controls_available {
                             let progress = (position_secs / duration_secs).clamp(0.0, 1.0) as f32;
                             let filled = egui::Rect::from_min_max(
                                 bar_rect.min,
@@ -9832,7 +9850,7 @@ impl NativeEguiOverlay {
                                 ),
                             );
                         }
-                        if duration_secs > 0.0 {
+                        if position_controls_available {
                             for marker in &timeline_markers {
                                 draw_timeline_marker(painter, bar_rect, duration_secs, *marker);
                             }
@@ -9841,12 +9859,16 @@ impl NativeEguiOverlay {
                         let seek_resp = ui.interact(
                             hit_rect,
                             egui::Id::new("native_video_seek_hit"),
-                            egui::Sense::click_and_drag(),
+                            if position_controls_available {
+                                egui::Sense::click_and_drag()
+                            } else {
+                                egui::Sense::hover()
+                            },
                         );
-                        if seek_resp.hovered() {
+                        if position_controls_available && seek_resp.hovered() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                         }
-                        if duration_secs > 0.0 {
+                        if position_controls_available {
                             let target_at = |pos: egui::Pos2| {
                                 let x = pos.x.clamp(bar_rect.min.x, bar_rect.max.x);
                                 let frac =
@@ -9911,7 +9933,7 @@ impl NativeEguiOverlay {
                                 seek_row_gesture = None;
                                 last_seek_target_secs = None;
                             }
-                        } else if seek_resp.drag_stopped() {
+                        } else {
                             seek_row_gesture = None;
                             last_seek_target_secs = None;
                         }
@@ -9922,7 +9944,7 @@ impl NativeEguiOverlay {
                         // 通常の hover detection に戻る。
                         let suppress_hover_preview =
                             video_speed_popup_open || seek_strip_visible;
-                        if duration_secs > 0.0 && !suppress_hover_preview {
+                        if position_controls_available && !suppress_hover_preview {
                             if seek_resp.hovered()
                                 && let Some(pos) = pointer_pos
                             {
@@ -9934,7 +9956,7 @@ impl NativeEguiOverlay {
                         } else {
                             hover_preview_target_secs = None;
                         }
-                        if duration_secs > 0.0
+                        if position_controls_available
                             && let Some(target) = hover_preview_target_secs
                         {
                             let frac = (target / duration_secs).clamp(0.0, 1.0) as f32;
@@ -10370,6 +10392,7 @@ impl NativeEguiOverlay {
                                 painter,
                                 seek_strip_selector_rect,
                                 seek_strip_state,
+                                position_controls_available,
                                 &mut commands,
                             );
                         }
@@ -11337,6 +11360,7 @@ mod tests {
             thumbnail_notice: None,
             wave_image: None,
             wave_notice: None,
+            waveform_span_secs: crate::video::seek_strip_wave::DEFAULT_WAVEFORM_SPAN_SECS,
         };
         let mut drag_origin = None;
         let mut last_window_request = None;

@@ -457,11 +457,25 @@ pub(crate) struct SeekStripOpenContext {
     pub(crate) hud_dimmed: bool,
 }
 
+pub(crate) const UNKNOWN_VIDEO_DURATION_NOTICE: &str = "この動画には長さの情報がないため、シークバーとシークストリップは使えません。動画の再生はできます。";
+
+/// シーク位置を全体尺へ対応付けられる動画か。
+pub(crate) fn video_position_controls_available(duration_secs: f64) -> bool {
+    duration_secs.is_finite() && duration_secs > 0.0
+}
+
+pub(crate) fn video_position_controls_notice(
+    has_video: bool,
+    duration_secs: f64,
+) -> Option<&'static str> {
+    (has_video && !video_position_controls_available(duration_secs))
+        .then_some(UNKNOWN_VIDEO_DURATION_NOTICE)
+}
+
 /// 現在の動画 surface でストリップを開いてよいか。
 pub(crate) fn seek_strip_may_open(context: SeekStripOpenContext) -> bool {
     context.has_video
-        && context.duration_secs.is_finite()
-        && context.duration_secs > 0.0
+        && video_position_controls_available(context.duration_secs)
         && !context.tile_mode_open
         && !context.audio_only
         && !context.hud_dimmed
@@ -1156,6 +1170,16 @@ mod tests {
             duration_secs: 0.0,
             ..ready
         }));
+        assert!(!seek_strip_may_open(SeekStripOpenContext {
+            duration_secs: f64::INFINITY,
+            ..ready
+        }));
+        assert_eq!(
+            video_position_controls_notice(true, 0.0),
+            Some(UNKNOWN_VIDEO_DURATION_NOTICE)
+        );
+        assert_eq!(video_position_controls_notice(true, 120.0), None);
+        assert_eq!(video_position_controls_notice(false, 0.0), None);
     }
 
     #[test]

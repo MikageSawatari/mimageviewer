@@ -740,8 +740,11 @@ coverage を外れたときだけ進行方向 1 画面を追加要求する。�
 
 波形モードの `SeekStripWaveWorker` は既に完成済みの `TimelineAnalysis` が現在ファイルまたは
 音楽解析 LRU にあれば対象時間窓を切り出す。無ければ、動画ごとに 1 回だけ開く
-`AudioRangeDecoder` でまず可視 60 秒と 0.75 秒の pre-roll だけを 48kHz stereo PCM にして
-first-paint raster を返す。表示後は同じ中心の 180 秒 span / 3 倍物理幅を background で作る。
+`AudioRangeDecoder` でまず設定された可視 span (30〜1800 秒、既定 60 秒) と 0.75 秒の pre-roll
+だけを 48kHz stereo PCM にして first-paint raster を返す。表示後は同じ中心の保持 span を
+background で作る。保持 span は通常 3 倍だが 3600 秒で上限とし、30 分表示では 60 分 / 2 倍
+物理幅に抑える。両側 15 分の coverage と中央 ±7.5 分の hysteresis trigger band は残る一方、
+90 分の音声 decode は発生しない。
 両段は秒 / pixel と bin 幅が同一なので交換時に内容が動かない。pre-roll bins は raster 前に捨て、
 全尺前提の beat grid は作らない。波形 raster の LRU は file identity、時間窓、
 bin 幅、物理幅をキーにしたメモリ内 8 件だけで、
@@ -752,8 +755,8 @@ session owner が両 worker を
 
 App は毎 frame、所有権を持つ `NativeOverlaySeekStrip` payload を native presenter へ渡す。
 presenter は worker が作った RGBA だけを texture 化し、presenter thread では波形を再計算しない。
-60 秒 first-paint raster は同じ中心の 180 秒 upgrade が届くまで描き続ける。
-中心が 180 秒 span の中央 trigger band にある間は同じ texture の 60 秒 sub-rectangle を UV で
+可視 first-paint raster は同じ中心の保持用 upgrade が届くまで描き続ける。
+中心が保持 span の中央 trigger band にある間は同じ texture の可視 span sub-rectangle を UV で
 ずらして描く。中心が trigger band を外れたときだけ replacement を要求し、pending span を latch に
 した hysteresis で境界往復時の発振を防ぐ。worker は replacement 完了まで shared raster を外さず、
 presenter も旧 texture を描き続けるため、解析中の blank frame / upload は生じない。
@@ -765,7 +768,11 @@ presenter も旧 texture を描き続けるため、解析中の blank frame / u
 繰り返さず、列全体を 1 個の案内へ置き換える。この判定は `KeyframeIndex / TimeGrid` を区別しない。
 軸解決そのものの失敗、worker thread spawn failure、cancel は既存の open / close lifecycle が扱い、
 presenter payload の案内状態にはしない。
-サムネイルでは等幅セルの連続する小数位置、波形では 1 幅 60 秒の時間線形軸を使い、どちらも
+波形 span の設定変更時は、旧 worker を cancel/drop して保持 raster と LRU を request coverage から
+外す一方、現在の raster の Arc とその旧可視 span を display-only holdover として session に残す。
+新 first paint が publish された frame で raster と可視 span を一緒に交換するため、再構築中に blank
+や一時的な誤スケールを挟まない。
+サムネイルでは等幅セルの連続する小数位置、波形では設定された時間幅の時間線形軸を使い、どちらも
 固定中央線を描く。サムネイルの整数位置 `i` はセル `i` の左端であり、セルは `[i, i+1)` を
 占める。したがって中央線のセル内位置は `cell(i)` から `cell(i+1)` までの進み具合を表す。
 描画、pointer hit test、可視窓計算はすべてこの左端基準を使う。モード切替では中央時刻を
@@ -782,6 +789,11 @@ waveform はフィルム上の vector 音符で区別する。ストリップ本
 presenter-owned `visibility_hover_pos()` を位置正本にする。HUD / presenter の別 HWND 間を
 移動中に egui hover が一時的に消えても、native hover がストリップ内なら横 resize cursor を維持し、
 native hover が外れた frame でだけ Arrow へ戻す。
+
+動画 info の `duration_secs` が finite な正数でない場合は、再生自体を失敗扱いにせず、info を 1 回
+受信する ownership boundary で「長さ情報がないためシークバーとシークストリップは使えないが、再生は
+できる」と native presenter toast へ 1 回だけ送る。同じ pure predicate を strip session の open gate と
+presenter のシーク行 / フィルムボタンに使い、キー操作も設定状態を変更しない no-op にする。
 
 ### 各ファイルの責務
 

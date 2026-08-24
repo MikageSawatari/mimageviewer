@@ -18,8 +18,8 @@ use ffmpeg_the_third as ffmpeg;
 
 /// ストリップの可視セル数の想定値 (§9 U3 の出発点)。
 const WINDOW_CELLS: usize = 11;
-/// Increment 4 の可視幅と Increment 5 の 3 画面 raster 幅を同じ素材で比較する。
-const WAVE_WINDOW_SPANS_SECS: [f64; 2] = [60.0, 180.0];
+/// 可視幅 / 3 画面 raster 幅に加え、利用者が要望した 10 分・30 分の密度も同じ素材で測る。
+const WAVE_WINDOW_SPANS_SECS: [f64; 4] = [60.0, 180.0, 600.0, 1800.0];
 /// 波形窓の前置き。1 次フィルタの状態を整えるために復号して捨てる (§5.2)。
 const WAVE_PREROLL_SECS: f64 = 1.0;
 

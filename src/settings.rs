@@ -4406,6 +4406,9 @@ pub struct Settings {
     /// シークストリップで採用する画像どうしの最小間隔 (秒)。0.0 は間引かない。
     #[serde(default = "default_video_seek_strip_min_interval_secs")]
     pub video_seek_strip_min_interval_secs: f64,
+    /// 動画シークストリップの音声波形で、1 画面に表示する時間 (秒)。
+    #[serde(default = "default_video_seek_strip_waveform_span_secs")]
+    pub video_seek_strip_waveform_span_secs: f64,
     /// 動画シークストリップの表示状態。開閉と表示内容をこの 3 値だけで表す。
     #[serde(default)]
     pub video_seek_strip_state: VideoSeekStripState,
@@ -5087,6 +5090,10 @@ pub const VIDEO_SEEK_STRIP_MIN_INTERVAL_MIN_SECS: f64 = 0.0;
 pub const VIDEO_SEEK_STRIP_MIN_INTERVAL_MAX_SECS: f64 = 60.0;
 pub const VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS: f64 = 2.0;
 
+pub const VIDEO_SEEK_STRIP_WAVEFORM_SPAN_MIN_SECS: f64 = 30.0;
+pub const VIDEO_SEEK_STRIP_WAVEFORM_SPAN_MAX_SECS: f64 = 1800.0;
+pub const VIDEO_SEEK_STRIP_WAVEFORM_SPAN_DEFAULT_SECS: f64 = 60.0;
+
 fn default_video_seek_thumbnail_tolerance_secs() -> f64 {
     VIDEO_SEEK_THUMBNAIL_TOLERANCE_DEFAULT_SECS
 }
@@ -5166,6 +5173,10 @@ impl VideoSeekStripState {
 
 fn default_video_seek_strip_min_interval_secs() -> f64 {
     VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS
+}
+
+fn default_video_seek_strip_waveform_span_secs() -> f64 {
+    VIDEO_SEEK_STRIP_WAVEFORM_SPAN_DEFAULT_SECS
 }
 
 /// グリッド列数の最小値
@@ -5784,6 +5795,7 @@ impl Default for Settings {
             video_playback_speed: default_video_playback_speed(),
             video_seek_thumbnail_tolerance_secs: default_video_seek_thumbnail_tolerance_secs(),
             video_seek_strip_min_interval_secs: default_video_seek_strip_min_interval_secs(),
+            video_seek_strip_waveform_span_secs: default_video_seek_strip_waveform_span_secs(),
             video_seek_strip_state: VideoSeekStripState::default(),
             video_seek_strip_last_choice: VideoSeekStripMode::default(),
             video_top_bar_locked: false,
@@ -6722,6 +6734,8 @@ impl Settings {
             settings.video_seek_thumbnail_tolerance_secs;
         let video_seek_strip_min_interval_before_sanitize =
             settings.video_seek_strip_min_interval_secs;
+        let video_seek_strip_waveform_span_before_sanitize =
+            settings.video_seek_strip_waveform_span_secs;
         let vst3_migrated = settings.migrate_vst3_legacy();
         let video_loop_migrated = settings.migrate_legacy_video_loop();
         let archive_file_handling_migrated = settings.migrate_legacy_archive_file_handling();
@@ -6782,6 +6796,9 @@ impl Settings {
         let video_seek_strip_min_interval_sanitized =
             settings.video_seek_strip_min_interval_secs.to_bits()
                 != video_seek_strip_min_interval_before_sanitize.to_bits();
+        let video_seek_strip_waveform_span_sanitized =
+            settings.video_seek_strip_waveform_span_secs.to_bits()
+                != video_seek_strip_waveform_span_before_sanitize.to_bits();
 
         // バージョン跨ぎの安全網 (#4) を SQLite 版に置換:
         // - 旧版は `settings.json` を `settings.json.preupgrade-v<old>` に std::fs::copy
@@ -6839,6 +6856,7 @@ impl Settings {
             || video_playback_speed_sanitized
             || video_seek_thumbnail_tolerance_sanitized
             || video_seek_strip_min_interval_sanitized
+            || video_seek_strip_waveform_span_sanitized
             || mouse_nav_clean_install_defaulted
             || grid_click_selection_mode_migrated
             || legacy_keymap_import.changed
@@ -7229,6 +7247,15 @@ impl Settings {
                 )
             } else {
                 VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS
+            };
+        self.video_seek_strip_waveform_span_secs =
+            if self.video_seek_strip_waveform_span_secs.is_finite() {
+                self.video_seek_strip_waveform_span_secs.clamp(
+                    VIDEO_SEEK_STRIP_WAVEFORM_SPAN_MIN_SECS,
+                    VIDEO_SEEK_STRIP_WAVEFORM_SPAN_MAX_SECS,
+                )
+            } else {
+                VIDEO_SEEK_STRIP_WAVEFORM_SPAN_DEFAULT_SECS
             };
         self.video_seek_strip_last_choice = self
             .video_seek_strip_state
@@ -11011,6 +11038,35 @@ mod tests {
         assert_eq!(
             settings.video_seek_strip_min_interval_secs,
             VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS
+        );
+    }
+
+    #[test]
+    fn waveform_span_defaults_and_sanitizes_to_the_preference_range() {
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            loaded.video_seek_strip_waveform_span_secs,
+            VIDEO_SEEK_STRIP_WAVEFORM_SPAN_DEFAULT_SECS
+        );
+
+        let mut settings = Settings::default();
+        settings.video_seek_strip_waveform_span_secs = 10.0;
+        settings.sanitize();
+        assert_eq!(
+            settings.video_seek_strip_waveform_span_secs,
+            VIDEO_SEEK_STRIP_WAVEFORM_SPAN_MIN_SECS
+        );
+        settings.video_seek_strip_waveform_span_secs = 9_999.0;
+        settings.sanitize();
+        assert_eq!(
+            settings.video_seek_strip_waveform_span_secs,
+            VIDEO_SEEK_STRIP_WAVEFORM_SPAN_MAX_SECS
+        );
+        settings.video_seek_strip_waveform_span_secs = f64::NAN;
+        settings.sanitize();
+        assert_eq!(
+            settings.video_seek_strip_waveform_span_secs,
+            VIDEO_SEEK_STRIP_WAVEFORM_SPAN_DEFAULT_SECS
         );
     }
 

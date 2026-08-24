@@ -6222,6 +6222,29 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
             );
         });
 
+        ui.add_space(8.0);
+        anchored(ui, state, "video/seek-strip-waveform-span", |ui, state| {
+            let s = &mut state.settings;
+            ui.horizontal(|ui| {
+                ui.label("音声波形で見渡す範囲 (秒)");
+                ui.add(
+                    egui::DragValue::new(&mut s.video_seek_strip_waveform_span_secs)
+                        .range(
+                            crate::settings::VIDEO_SEEK_STRIP_WAVEFORM_SPAN_MIN_SECS
+                                ..=crate::settings::VIDEO_SEEK_STRIP_WAVEFORM_SPAN_MAX_SECS,
+                        )
+                        .speed(10.0)
+                        .fixed_decimals(0),
+                );
+            });
+            ui.label(
+                egui::RichText::new(
+                    "大きいほど、音声波形で動画の長い範囲を一度に見渡せます。初めて表示するまでの時間は長くなります。",
+                )
+                .small(),
+            );
+        });
+
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(8.0);

@@ -27,6 +27,10 @@ pub(super) struct VideoSeekStripSession {
     wave_raster_size: Option<(usize, usize)>,
     last_wave_request: Option<crate::video::seek_strip_wave::WaveRequestSignature>,
     pending_wave_span: Option<crate::video::seek_strip_wave::WaveSpan>,
+    waveform_span_secs: f64,
+    /// Preference rebuilds detach the old retained raster from request coverage, but keep this
+    /// published image until the new worker atomically supplies its first paint.
+    wave_holdover: Option<std::sync::Arc<crate::video::seek_strip_wave::WaveRaster>>,
     min_interval_secs: f64,
     drag_state: VideoSeekStripDragState,
     last_follow_recenter_at: Option<std::time::Instant>,
@@ -46,6 +50,28 @@ pub(super) enum VideoSeekStripRuntime {
     #[default]
     Closed,
     Open(Box<VideoSeekStripSession>),
+}
+
+#[cfg(windows)]
+fn requested_video_seek_strip_state(
+    action: KeyAction,
+    current: crate::settings::VideoSeekStripState,
+    last_choice: crate::settings::VideoSeekStripMode,
+    position_controls_available: bool,
+) -> Option<crate::settings::VideoSeekStripState> {
+    if !position_controls_available {
+        return None;
+    }
+    match action {
+        KeyAction::VideoSeekStripCycle => Some(current.cycle()),
+        KeyAction::VideoSeekStripToggle => Some(current.toggle(last_choice)),
+        KeyAction::VideoSeekStripNone => Some(crate::settings::VideoSeekStripState::None),
+        KeyAction::VideoSeekStripThumbnails => {
+            Some(crate::settings::VideoSeekStripState::Thumbnails)
+        }
+        KeyAction::VideoSeekStripWaveform => Some(crate::settings::VideoSeekStripState::Waveform),
+        _ => None,
+    }
 }
 
 #[cfg(windows)]
@@ -6801,6 +6827,8 @@ impl App {
                 wave_raster_size: None,
                 last_wave_request: None,
                 pending_wave_span: None,
+                waveform_span_secs: self.settings.video_seek_strip_waveform_span_secs,
+                wave_holdover: None,
                 min_interval_secs,
                 drag_state: VideoSeekStripDragState::Idle,
                 last_follow_recenter_at: None,
@@ -6866,16 +6894,27 @@ impl App {
         action: KeyAction,
     ) -> bool {
         debug_assert!(VIDEO_SEEK_STRIP_ACTIONS.contains(&action));
+        let position_controls_available = self
+            .fs_cache
+            .get(&fs_idx)
+            .and_then(|entry| match entry {
+                FsCacheEntry::Video { player, .. } => player.info(),
+                _ => None,
+            })
+            .is_some_and(|info| {
+                crate::video::seek_strip::video_position_controls_available(info.duration_secs)
+            });
         let current = self.settings.video_seek_strip_state;
-        let next = match action {
-            KeyAction::VideoSeekStripCycle => current.cycle(),
-            KeyAction::VideoSeekStripToggle => {
-                current.toggle(self.settings.video_seek_strip_last_choice)
-            }
-            KeyAction::VideoSeekStripNone => crate::settings::VideoSeekStripState::None,
-            KeyAction::VideoSeekStripThumbnails => crate::settings::VideoSeekStripState::Thumbnails,
-            KeyAction::VideoSeekStripWaveform => crate::settings::VideoSeekStripState::Waveform,
-            _ => return false,
+        // Cycle/toggle/direct-state shortcuts must be the same no-op as the disabled film button
+        // and unavailable upward drag. In particular, do not rewrite the remembered state merely
+        // because the current video has no usable duration.
+        let Some(next) = requested_video_seek_strip_state(
+            action,
+            current,
+            self.settings.video_seek_strip_last_choice,
+            position_controls_available,
+        ) else {
+            return false;
         };
         self.set_video_seek_strip_state(fs_idx, next)
     }
@@ -7034,6 +7073,7 @@ impl App {
         session.thumbnail_request_coverage = None;
         session.last_wave_request = None;
         session.pending_wave_span = None;
+        session.wave_holdover = None;
         Self::request_video_seek_strip_window(session);
         true
     }
@@ -7172,15 +7212,12 @@ impl App {
                 ) {
                     return;
                 }
-                let wide_pixel_width = visible_pixel_width
-                    .saturating_mul(crate::video::seek_strip_wave::WAVEFORM_RASTER_SPAN_MULTIPLIER);
                 let displayed = snapshot
                     .raster
                     .as_ref()
                     .filter(|raster| {
                         let width = raster.width as usize;
-                        raster.height as usize == pixel_height
-                            && (width == visible_pixel_width || width == wide_pixel_width)
+                        raster.height as usize == pixel_height && width >= visible_pixel_width
                     })
                     .map(|raster| crate::video::seek_strip_wave::WaveSpan {
                         start_secs: raster.window_start_secs,
@@ -7188,16 +7225,19 @@ impl App {
                     });
                 let Some(request) = crate::video::seek_strip_wave::decide_waveform_span_request(
                     center_time_secs,
+                    session.waveform_span_secs,
                     displayed,
                     session.pending_wave_span,
                 ) else {
                     return;
                 };
-                let pixel_width = request.pixel_width(visible_pixel_width);
+                let pixel_width =
+                    request.pixel_width(visible_pixel_width, session.waveform_span_secs);
                 let Some(signature) = crate::video::seek_strip_wave::WaveRequestSignature::new(
                     request.span.center_secs(),
                     session.duration_secs,
                     request.span.duration_secs(),
+                    session.waveform_span_secs,
                     pixel_width,
                     pixel_height,
                 ) else {
@@ -7251,6 +7291,42 @@ impl App {
         ) {
             Self::request_video_seek_strip_window(session);
         }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn rebuild_video_seek_strip_waveform_span(&mut self) {
+        let VideoSeekStripRuntime::Open(session) = &mut self.video_seek_strip_runtime else {
+            return;
+        };
+        let new_span_secs = self.settings.video_seek_strip_waveform_span_secs;
+        if session.waveform_span_secs.to_bits() == new_span_secs.to_bits() {
+            return;
+        }
+        session.waveform_span_secs = new_span_secs;
+        session.last_wave_request = None;
+        session.pending_wave_span = None;
+        if !matches!(
+            session.center,
+            crate::video::seek_strip::SeekStripCenter::Waveform { .. }
+        ) {
+            return;
+        }
+
+        let previous_raster = session
+            .wave_worker
+            .as_ref()
+            .and_then(|worker| worker.snapshot().raster)
+            .or_else(|| session.wave_holdover.take());
+        if let Some(worker) = session.wave_worker.as_ref() {
+            worker.cancel();
+        }
+        // A fresh worker drops both the old retained raster and its in-memory LRU. The Arc copied
+        // above is display-only and cannot satisfy coverage for the new preference.
+        session.wave_worker = Some(crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+            session.video_path.clone(),
+        ));
+        session.wave_holdover = previous_raster;
+        Self::request_video_seek_strip_window(session);
     }
 
     #[cfg(windows)]
@@ -7416,6 +7492,7 @@ impl App {
                 let mut thumbnail_notice = None;
                 let mut wave_image = None;
                 let mut wave_notice = None;
+                let mut waveform_span_secs = session.waveform_span_secs;
                 let (cell_count, cells) = match session.center {
                     crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index } => {
                         if let VideoSeekStripAxisState::Ready(axis) = &session.axis {
@@ -7509,7 +7586,14 @@ impl App {
                                 }
                                 _ => None,
                             };
-                            wave_image = snapshot.raster.map(|raster| {
+                            if snapshot.raster.is_some() {
+                                session.wave_holdover = None;
+                            }
+                            let displayed_raster =
+                                snapshot.raster.or_else(|| session.wave_holdover.clone());
+                            if let Some(raster) = displayed_raster {
+                                waveform_span_secs = raster.visible_span_secs;
+                                wave_image = Some(
                                 crate::video::native_presenter::NativeOverlaySeekStripWaveImage {
                                     window_start_secs: raster.window_start_secs,
                                     window_end_secs: raster.window_end_secs,
@@ -7517,8 +7601,9 @@ impl App {
                                     width: raster.width,
                                     height: raster.height,
                                     rgba: std::sync::Arc::clone(&raster.rgba),
-                                }
-                            });
+                                },
+                                );
+                            }
                         }
                         (0, Vec::new())
                     }
@@ -7539,6 +7624,7 @@ impl App {
                     thumbnail_notice,
                     wave_image,
                     wave_notice,
+                    waveform_span_secs,
                 })
             }
         };
@@ -11697,6 +11783,29 @@ mod native_video_key_observation_tests {
                 VideoAudioEnterOutcome::Entered,
             ),
             "[video-audio] enter result source=native_key fs_idx=9 outcome=entered"
+        );
+    }
+
+    #[test]
+    fn unknown_duration_makes_every_seek_strip_key_action_a_state_preserving_no_op() {
+        let current = crate::settings::VideoSeekStripState::Waveform;
+        let last_choice = crate::settings::VideoSeekStripMode::Waveform;
+        for action in VIDEO_SEEK_STRIP_ACTIONS {
+            assert_eq!(
+                requested_video_seek_strip_state(action, current, last_choice, false),
+                None,
+                "{action:?} must not change the remembered strip state"
+            );
+        }
+
+        assert_eq!(
+            requested_video_seek_strip_state(
+                KeyAction::VideoSeekStripThumbnails,
+                current,
+                last_choice,
+                true,
+            ),
+            Some(crate::settings::VideoSeekStripState::Thumbnails)
         );
     }
 }

@@ -14,11 +14,12 @@ worker) / Increment 3 (App owner・設定・描画・入力・HUD region・tile 
 フィルムアイコン、再生位置追従、180 秒波形ラスタのスクロール) / Increment 6 (フィルムボタンの
 1 クリック巡回、ストリップ内切替の撤去、左右パネルのホバー帯境界修正) / Increment 10
 (cursor とセルの左端基準を実機確認) / Increment 11 (pending / ready / failed のセル表示と、
-補助 decoder を開けない場合の strip 全体 notice) まで実装。
+補助 decoder を開けない場合の strip 全体 notice) / Increment 12 (長さ情報のない動画の案内と
+操作抑止、波形可視 span 設定、無 blank 再構築、長尺 first-paint 実測) まで実装。
 残りは §9 の未確定項目の実機調整と、MPEG-TS など `TimeGrid` 経路の実素材確認。
 
 確定した既定値: 開閉は `Shift+S` (`V` はレーン C の動画パノラマ用に空けた)、最小間隔 2.0 秒、
-抽出幅 320px、波形は 1 画面 60 秒、セル 152x104pt。
+抽出幅 320px、波形は 1 画面 60 秒 (30〜1800 秒で設定可能)、セル 152x104pt。
 
 ## 1. 何を作るか
 
@@ -80,6 +81,15 @@ D3 の帰結として、横軸は時間線形ではない。波形モード (時
 「サムネイルを表示できません」という 1 個の notice に置き換える。`ThreadSpawnFailed` は軸失敗、
 `Cancelled` は close / 切替 lifecycle として既存経路で処理し、画面へ重ねて出さない。
 この判定は軸種別に依存しないため、未実機確認の `TimeGrid` も同じ failure surface を通る。
+
+**D18 (Increment 12、2026-08-25)**: `duration_secs` が finite な正数でない動画は再生可能なまま、
+シークバーとシークストリップだけを unavailable とする。動画 info を open ごとに 1 回受け取る地点で
+理由を日本語 toast にし、フィルムボタン、上ドラッグ、cycle / toggle / 3 直接状態キーはいずれも
+設定状態を変更しない no-op にする。未対応形式とは扱わない。
+
+**D19 (Increment 12、2026-08-25)**: 波形の可視 span は 30〜1800 秒、既定 60 秒の preference とする。
+first paint は可視 span だけ。保持 raster は通常 3 倍だが最大 3600 秒へ制限し、1800 秒設定では
+3600 秒 / 2 倍物理幅とする。90 分 decode を避けながら両側 15 分の coverage を残す。
 
 ## 3. 実現手段 (調査で確定した前提)
 
@@ -248,21 +258,23 @@ enum StripAxis {
 前のラスタを捨てると、スクラブのたびに波形が一度消えてから出る。利用者が見たいのは
 **スクロール**であって再表示ではない。
 
-- 初回はまず**可視 span と同じ 60 秒 / 可視幅と同じ物理画素幅**だけを要求し、旧実装と同じ
-  first-paint 費用で波形を出す。これが表示された直後、同じ中心の **3 倍 180 秒 / 3 倍画素幅**を
-  background で要求する。秒 / pixel が一致するので、完成時の texture 交換で内容は動かない。
-- 60 秒 raster は 180 秒 upgrade の完了まで表示し続ける。upgrade 要求を Working にしても
-  published raster を外さず、失敗時も 60 秒 raster を残す。初回 → upgrade の間に blank を挟まない。
-- 180 秒へ交換後、ドラッグ中はその texture の**60 秒分の部分矩形をずらして描く**だけで、
+- 初回はまず**設定された可視 span / 可視幅と同じ物理画素幅**だけを要求して first paint を出す。
+  これが表示された直後、同じ中心の保持 span を background で要求する。保持 span は通常 3 倍、
+  最大 3600 秒で、物理幅も同じ比率にする。秒 / pixel が一致するので texture 交換で内容は動かない。
+- first-paint raster は保持用 upgrade の完了まで表示し続ける。upgrade 要求を Working にしても
+  published raster を外さず、失敗時も first paint を残す。初回 → upgrade の間に blank を挟まない。
+- 保持用へ交換後、ドラッグ中はその texture の**可視 span 分の部分矩形をずらして描く**だけで、
   再解析も再 upload もしない。
-- 180 秒ラスタを中心 0 とすると、可視範囲が完全に収まる中心は -60〜+60 秒。さらに
-  15 秒の先行 margin を取り、中心が -45〜+45 秒を外れた時点で次の 180 秒を要求する。
-- replacement 待ち中は、その新 span に可視 60 秒が収まる限り要求を差し替えない。
+- replacement の先行 margin は可視 span の 25%。60 秒 / 保持 180 秒なら従来どおり中心が
+  ±45 秒を外れた時点、1800 秒 / 保持 3600 秒なら ±450 秒を外れた時点で次を要求する。
+- replacement 待ち中は、その新 span に可視範囲が収まる限り要求を差し替えない。
   これを境界のヒステリシス latch とし、往復操作で要求が発振しないようにする。
 - **新しいラスタが届くまで、古いラスタを描き続ける。** 空白を挟まない。可視範囲が解析済み
   範囲から完全に外れた場合だけ、やむを得ず空白になる。
-- 再生追従は 100ms 間隔で中心だけを更新する。1 倍速で連続再生すると新しい波形解析は
-  約 45 秒に 1 回であり、毎 frame の解析 / upload にはならない。
+- preference 変更時は旧 worker と LRU を捨て、旧 raster の Arc と旧可視 span だけを display-only
+  holdover にする。新 first paint 到着時に画像と span を同じ frame で交換し、blank / 誤スケールを
+  挟まない。
+- 再生追従は 100ms 間隔で中心だけを更新する。毎 frame の解析 / upload にはならない。
 
 `render_timeline_row_image` を「窓 = 1 行」として呼ぶ。
 
@@ -386,9 +398,10 @@ enum SeekRowGesture {
 - 1 回のドラッグ中の pointer 位置列を press-time pointer から変換すると、中心が単調に進み、
   release も最後の表示中心と一致すること。
 - persisted 3 値の cycle と、`none` から最後の non-none 選択を戻す規則。
-- 60 秒 first paint → 同じ中心・同じ秒 / pixel の 180 秒 upgrade と、Working 中の旧 raster 保持。
-- 180 秒 span の要求境界、15 秒 margin、replacement 待ちのヒステリシス。
-- 保持中の波形 texture から 60 秒の可視部分を切り出す UV / 部分 gap の算術。
+- 設定可視 span の first paint → 同じ中心・同じ秒 / pixel の保持用 upgrade と、Working 中の旧 raster 保持。
+- 60 / 600 / 1800 秒の保持 span と要求境界、25% margin、replacement 待ちのヒステリシス。
+- 保持中の波形 texture から設定可視 span の部分を切り出す UV / 部分 gap の算術。
+- preference 変更時に旧 raster が request coverage にならず、新 first paint まで display holdover になること。
 - 再生位置追従の 100ms rate limit、微小差の抑制、ドラッグ中の detach。
 - サムネイルセルの `pending / ready / failed` 判定と、最新要求の index-level failure の反映。
 - 軸解決後の `DecoderUnavailable` だけが strip 全体 notice へ置き換わり、軸失敗 / thread spawn
@@ -480,6 +493,26 @@ first paint は **267〜535ms**、wide upgrade / replacement は **588〜1215ms*
 最初の pass を保守的に使った worker 稼働時間は壁時計比で約 **1.3〜2.7%**、warm pass では
 **1.0〜1.1%**。upload は 60 秒 first paint の 1 回、同じ中心の 180 秒 upgrade の 1 回、その後は
 replacement ごとに約 45 秒で 1 回である。
+
+### Increment 12 のアプリ経路 first-paint 実測 (2026-08-25)
+
+`SeekStripWaveWorker` に presenter と同じ可視 raster 要求 (1920x94px、完成済み全尺解析なし) を送り、
+`dev-runtime` 最適化プロファイルで request から raster publish までを測った。span ごとに新 worker を
+作り、decoder / LRU の再利用は含めない。内部の `video_strip/wave_window` 計装値も同時に採取した。
+
+| 素材 | span | first paint | decode | analyze | raster | bin_secs | 最大 bins |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| MP4 / AAC / 1時間51分 | 60s | 158.8ms | 108.3ms | 15.6ms | 1.8ms | 0.032s | 1875 |
+| MP4 / AAC / 1時間51分 | 600s | 1117.8ms | 896.2ms | 180.7ms | 1.8ms | 0.313s | 1917 |
+| MP4 / AAC / 1時間51分 | 1800s | 3092.8ms | 2566.0ms | 476.2ms | 1.8ms | 0.938s | 1919 |
+| WMV / WMA / 1時間3分 | 60s | 651.9ms | 627.2ms | 12.8ms | 1.0ms | 0.032s | 1875 |
+| WMV / WMA / 1時間3分 | 600s | 817.9ms | 682.7ms | 122.7ms | 0.8ms | 0.313s | 1917 |
+| WMV / WMA / 1時間3分 | 1800s | 2200.4ms | 1788.1ms | 384.8ms | 1.2ms | 0.938s | 1919 |
+
+`bin_secs = ceil_ms(span / 1920px)` により span を 30 倍にしても bins は 1875→1919 の範囲で、
+出力密度と raster 費用は一定だった。解析は PCM 全体を 1 回走査するため完全な定数時間ではないが、
+1800 秒でも 385〜476ms に収まり、総時間の 16〜18% である。主費用は実音声の decode
+(1788〜2566ms、総時間の約 81〜83%) で、利用者 probe の見立てどおり decode が長尺時の床になる。
 
 未取得: MPEG-TS (索引を持たない代表格) が手元に無く、`TimeGrid` 経路を実素材で確認できていない。
 HW デコード有効時の数字も未測定 (probe は SW のみ)。どちらも実装時に埋める。

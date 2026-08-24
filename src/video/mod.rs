@@ -8707,6 +8707,15 @@ impl VideoPlayer {
                         #[cfg(windows)]
                         self.duration_secs_bits
                             .store(info.duration_secs.to_bits(), Ordering::Release);
+                        #[cfg(windows)]
+                        if let Some(notice) = seek_strip::video_position_controls_notice(
+                            info.has_video,
+                            info.duration_secs,
+                        ) {
+                            // info_rx は動画を開くごとに 1 回だけ取り込まれる。ここを通知の
+                            // 所有境界にして、毎 frame やストリップ操作では繰り返さない。
+                            self.show_native_overlay_toast(notice.to_string(), true, None);
+                        }
                         // SAR (= sample aspect ratio) を native presenter に伝える。
                         // anamorphic 動画 (NTSC DVD など) で表示比を補正するために
                         // 1 度だけ送る。SAR=1:1 の動画では従来通りの isotropic 表示。
