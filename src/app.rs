@@ -48736,8 +48736,21 @@ impl App {
     /// レーティング対象外アイテムの場合は何もしない。
     /// フォルダ / ZIP / PDF ファイル本体も対象 (コンテナレーティング)。
     pub(crate) fn set_rating(&mut self, idx: usize, stars: u8) -> bool {
+        let stars = stars.min(5);
+        let before = self.rating_cache.get(&idx).copied().unwrap_or(0);
         match self.set_rating_result(idx, stars) {
-            Ok(changed) => changed,
+            Ok(true) => {
+                if before != stars {
+                    let summary = if stars == 0 {
+                        "★解除".to_string()
+                    } else {
+                        format!("★{stars}")
+                    };
+                    self.capture_rating_undo(vec![(idx, before, stars)], summary);
+                }
+                true
+            }
+            Ok(false) => false,
             Err(error) => {
                 self.report_rating_write_error(&error);
                 false

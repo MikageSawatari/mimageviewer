@@ -1653,6 +1653,180 @@ fn pdf_page_rating_getter_is_distinct_from_pdf_container_rating() {
     }
 }
 
+fn press_ctrl_z_for_metadata_test(app: &mut App) {
+    let ctx = egui::Context::default();
+    let modifiers = egui::Modifiers::CTRL;
+    ctx.begin_pass(egui::RawInput {
+        modifiers,
+        events: vec![egui::Event::Key {
+            key: egui::Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }],
+        ..Default::default()
+    });
+    app.keyboard_owner_for_pass(&ctx);
+    app.handle_meta_undo_keys(&ctx);
+    let _ = ctx.end_pass();
+}
+
+#[test]
+fn metadata_panel_page_star_records_undo_and_ctrl_z_restores_previous_rating() {
+    let mut app = phase_c_support::setup_app();
+    let pdf = app.tmp.path().join("panel-book.pdf");
+    app.current_folder = Some(pdf.clone());
+    app.items = vec![GridItem::PdfPage {
+        pdf_path: pdf,
+        page_num: 0,
+        content_type: None,
+    }];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.fullscreen_idx = Some(0);
+
+    let page_key = app.rating_path_key(0).unwrap();
+    app.rating_db.as_ref().unwrap().set(&page_key, 2).unwrap();
+    app.rating_cache.insert(0, 2);
+
+    // draw_metadata_panel_inner dispatches a page-star click through this setter.
+    assert!(app.set_rating(0, 5));
+    assert_eq!(app.meta_undo.undo_len(), 1);
+    match app.meta_undo.peek_undo().expect("page-star undo") {
+        crate::undo_stack::UndoEntry::Rating { changes, summary } => {
+            assert_eq!(summary, "★5");
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].path_key, page_key);
+            assert_eq!((changes[0].before, changes[0].after), (2, 5));
+        }
+        other => panic!("expected rating undo, got {other:?}"),
+    }
+
+    press_ctrl_z_for_metadata_test(&mut app);
+
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&page_key), 2);
+    assert_eq!(app.rating_cache.get(&0), Some(&2));
+    assert_eq!(app.meta_undo.undo_len(), 0);
+    assert_eq!(app.meta_undo.redo_len(), 1);
+}
+
+#[test]
+fn viewer_rating_noop_does_not_record_undo() {
+    let mut app = phase_c_support::setup_app();
+    let path = app.tmp.path().join("already-rated.jpg");
+    app.items = vec![GridItem::Image(path)];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    let key = app.rating_path_key(0).unwrap();
+    app.rating_db.as_ref().unwrap().set(&key, 3).unwrap();
+    app.rating_cache.insert(0, 3);
+
+    assert!(app.set_rating(0, 3));
+
+    assert_eq!(app.meta_undo.undo_len(), 0);
+    assert_eq!(app.meta_undo.redo_len(), 0);
+
+    assert!(app.set_rating(0, 0));
+    match app.meta_undo.peek_undo().expect("rating-clear undo") {
+        crate::undo_stack::UndoEntry::Rating { changes, summary } => {
+            assert_eq!(summary, "★解除");
+            assert_eq!(changes.len(), 1);
+            assert_eq!((changes[0].before, changes[0].after), (3, 0));
+        }
+        other => panic!("expected rating undo, got {other:?}"),
+    }
+}
+
+#[test]
+fn grid_selection_rating_records_one_batched_undo_entry() {
+    let mut app = phase_c_support::setup_app();
+    let path_a = app.tmp.path().join("grid-a.jpg");
+    let path_b = app.tmp.path().join("grid-b.jpg");
+    app.items = vec![GridItem::Image(path_a), GridItem::Image(path_b)];
+    app.image_metas = vec![None, None];
+    app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
+    app.visible_indices = vec![0, 1];
+    app.selected = Some(0);
+    app.checked.extend([0, 1]);
+    for (idx, stars) in [(0, 1), (1, 2)] {
+        let key = app.rating_path_key(idx).unwrap();
+        app.rating_db.as_ref().unwrap().set(&key, stars).unwrap();
+        app.rating_cache.insert(idx, stars);
+    }
+
+    app.apply_rating_to_selection(4);
+
+    assert_eq!(app.meta_undo.undo_len(), 1);
+    match app.meta_undo.peek_undo().expect("batched grid undo") {
+        crate::undo_stack::UndoEntry::Rating { changes, summary } => {
+            assert_eq!(summary, "★4 を 2 件に付与");
+            assert_eq!(changes.len(), 2);
+            let mut transitions = changes
+                .iter()
+                .map(|change| (change.before, change.after))
+                .collect::<Vec<_>>();
+            transitions.sort_unstable();
+            assert_eq!(transitions, vec![(1, 4), (2, 4)]);
+        }
+        other => panic!("expected rating undo, got {other:?}"),
+    }
+}
+
+#[test]
+fn metadata_panel_container_and_page_stars_record_isolated_undo_entries() {
+    let mut app = phase_c_support::setup_app();
+    let pdf = app.tmp.path().join("two-rating-rows.pdf");
+    app.current_folder = Some(pdf.clone());
+    app.items = vec![GridItem::PdfPage {
+        pdf_path: pdf,
+        page_num: 0,
+        content_type: None,
+    }];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.fullscreen_idx = Some(0);
+
+    let container_key = app.current_container_rating_key_and_source().unwrap().0;
+    let page_key = app.rating_path_key(0).unwrap();
+    app.rating_db
+        .as_ref()
+        .unwrap()
+        .set(&container_key, 4)
+        .unwrap();
+    app.current_folder_rating_cache = Some(4);
+    app.rating_db.as_ref().unwrap().set(&page_key, 2).unwrap();
+    app.rating_cache.insert(0, 2);
+
+    assert!(app.set_current_folder_rating(5).unwrap());
+    assert!(app.set_rating(0, 3));
+    assert_eq!(app.meta_undo.undo_len(), 2);
+    match app.meta_undo.peek_undo().expect("page undo") {
+        crate::undo_stack::UndoEntry::Rating { changes, .. } => {
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].path_key, page_key);
+        }
+        other => panic!("expected rating undo, got {other:?}"),
+    }
+
+    app.apply_meta_undo();
+
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&page_key), 2);
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&container_key), 5);
+    match app.meta_undo.peek_undo().expect("container undo") {
+        crate::undo_stack::UndoEntry::Rating { changes, .. } => {
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].path_key, container_key);
+        }
+        other => panic!("expected rating undo, got {other:?}"),
+    }
+
+    app.apply_meta_undo();
+
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&page_key), 2);
+    assert_eq!(app.rating_db.as_ref().unwrap().get(&container_key), 4);
+}
+
 #[test]
 fn metadata_panel_plain_folder_container_rating_is_unchanged() {
     let mut app = phase_c_support::setup_app();
@@ -57888,6 +58062,7 @@ mod rating_write_failure_tests {
         assert_eq!(app.rating_cache.get(&0), Some(&2));
         assert_eq!(app.rating_session_write_generation, generation);
         assert!(!app.rating_session_writes.contains_key(&key));
+        assert_eq!(app.meta_undo.undo_len(), 0);
         assert!(app.fs_feedback_toast.as_ref().is_some_and(|toast| {
             toast.0.contains("レーティングを保存できませんでした")
                 && toast.0.contains("DB を利用できません")
@@ -58020,7 +58195,7 @@ mod rating_write_failure_tests {
 
         // A successful live preview already writes 4. Finalization writes the
         // same value again but must derive one original->durable transition.
-        assert!(app.set_rating(0, 4));
+        assert!(app.set_rating_result(0, 4).unwrap());
         let (records, container) = app.finalize_live_picker_ratings(&picker);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].path_key, key);

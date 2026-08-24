@@ -8152,17 +8152,8 @@ impl App {
 
     #[cfg(windows)]
     fn apply_native_video_rating_key(&mut self, fs_idx: usize, stars: u8) {
-        let before = self.rating_cache.get(&fs_idx).copied().unwrap_or(0);
         if !self.set_rating(fs_idx, stars) {
             return;
-        }
-        if before != stars {
-            let summary = if stars == 0 {
-                "★解除".to_string()
-            } else {
-                format!("★{stars}")
-            };
-            self.capture_rating_undo(vec![(fs_idx, before, stars)], summary);
         }
         self.rebuild_visible_indices();
         if stars == 0 {
