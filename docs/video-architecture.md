@@ -759,6 +759,10 @@ film-strip button は `none → thumbnails → waveform → none` を 1 クリ�
 waveform はフィルム上の vector 音符で区別する。ストリップ本体にはモード切替 UI を置かず、全域を
 ドラッグ面にする。左右パネルの端 hover band はストリップ表示中だけ 104pt 上へ退避し、非表示時は
 従来の HUD 上端境界を保つ。hover の単発 preview と tile overlay は排他的に扱う。
+ストリップ上の cursor ownership は egui の `pointer_hover_pos` ではなく、HUD 可視性が使う
+presenter-owned `visibility_hover_pos()` を位置正本にする。HUD / presenter の別 HWND 間を
+移動中に egui hover が一時的に消えても、native hover がストリップ内なら横 resize cursor を維持し、
+native hover が外れた frame でだけ Arrow へ戻す。
 
 ### 各ファイルの責務
 

@@ -154,6 +154,7 @@ fn native_seek_strip_rect(width: f32, height: f32) -> egui::Rect {
 fn draw_native_seek_strip(
     ctx: &egui::Context,
     overlay_size: egui::Vec2,
+    cursor_hover_pos: Option<egui::Pos2>,
     strip: &NativeOverlaySeekStrip,
     texture_ids: &HashMap<usize, egui::TextureId>,
     wave_texture_id: Option<egui::TextureId>,
@@ -314,14 +315,12 @@ fn draw_native_seek_strip(
                 egui::Id::new("native_video_seek_strip_drag"),
                 egui::Sense::click_and_drag(),
             );
-            // `Response` の hover 判定は前回パスのレイヤーヒットテストに依存する。
-            // Area が描画されポインターが矩形内にあるフレームでも、Foreground
-            // レイヤーの登録が追いつくまでは false になり得るため、カーソルの所有は
-            // このストリップ自身の幾何で表す。ドラッグ中は矩形外でも維持する。
-            let pointer_inside = ui
-                .ctx()
-                .pointer_hover_pos()
-                .is_some_and(|pointer| strip_rect.contains(pointer));
+            // `Response` の hover と egui の `pointer_hover_pos` は、HUD / presenter
+            // HWND 間の input handoff 中に一時的に失われ得る。HUD 可視性と同じ
+            // presenter-owned native hover snapshot をストリップの矩形へ当て、可視性と
+            // cursor ownership の位置正本を揃える。ドラッグ中は矩形外でも維持する。
+            let pointer_inside =
+                cursor_hover_pos.is_some_and(|pointer| strip_rect.contains(pointer));
             if pointer_inside || response.dragged() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
             }
@@ -1046,7 +1045,8 @@ struct NativeEguiOverlay {
     /// VST 入力が奪われないようにする)。
     external_drag_in_progress: bool,
     /// parked/dimmed HUD では egui への pointer 配送を止めるが、HUD の fade in/out は
-    /// raw cursor hover に追従させる。`pointer_pos` は egui 入力、こちらは可視性判定専用。
+    /// raw cursor hover に追従させる。`pointer_pos` は egui 入力、こちらは可視性と
+    /// cursor ownership 判定専用。
     raw_hover_pos: Option<egui::Pos2>,
     pending_overlay_commands: Vec<NativeOverlayCommand>,
     last_volume_target: Option<f64>,
@@ -8333,6 +8333,7 @@ impl NativeEguiOverlay {
         let ppp = self.pixels_per_point;
         let event_count = self.event_count;
         let pointer_pos = self.pointer_pos;
+        let visibility_hover_pos = self.visibility_hover_pos();
         // 左右パネルの端ホバー開閉ラッチをフレーム先頭で更新する (実機 FB 2026-07)。以降の
         // jump_panel_visible() / right_panel_visible() はこのラッチを読む。
         self.update_side_panel_hover_latches();
@@ -9023,6 +9024,7 @@ impl NativeEguiOverlay {
                     draw_native_seek_strip(
                         ctx,
                         egui::vec2(overlay_width_points, overlay_height_points),
+                        visibility_hover_pos,
                         strip,
                         &seek_strip_texture_ids,
                         seek_strip_wave_texture_id,
@@ -11250,7 +11252,7 @@ mod tests {
     };
 
     #[test]
-    fn seek_strip_claims_resize_cursor_while_layer_hit_test_warms_up() {
+    fn seek_strip_cursor_follows_presenter_hover_when_egui_hover_drops() {
         let ctx = egui::Context::default();
         let overlay_size = egui::vec2(1280.0, 720.0);
         let pointer = egui::pos2(640.0, 600.0);
@@ -11264,6 +11266,8 @@ mod tests {
         let mut drag_origin = None;
         let mut last_window_request = None;
 
+        let presenter_hover_positions = [Some(pointer), Some(pointer), Some(pointer), None];
+        let mut egui_hover_positions = Vec::new();
         let mut cursor_icons = Vec::new();
         for frame in 0..4 {
             let mut commands = Vec::new();
@@ -11273,7 +11277,7 @@ mod tests {
                     time: Some(frame as f64 / 60.0),
                     events: match frame {
                         0 => vec![egui::Event::PointerMoved(pointer)],
-                        3 => vec![egui::Event::PointerGone],
+                        2 => vec![egui::Event::PointerGone],
                         _ => Vec::new(),
                     },
                     ..Default::default()
@@ -11282,6 +11286,7 @@ mod tests {
                     draw_native_seek_strip(
                         ctx,
                         overlay_size,
+                        presenter_hover_positions[frame],
                         &strip,
                         &std::collections::HashMap::new(),
                         None,
@@ -11297,9 +11302,15 @@ mod tests {
                         });
                 },
             );
+            let egui_hover = ctx.pointer_hover_pos();
+            egui_hover_positions.push(egui_hover);
             cursor_icons.push(output.platform_output.cursor_icon);
         }
 
+        assert_eq!(
+            egui_hover_positions,
+            vec![Some(pointer), Some(pointer), None, None]
+        );
         assert_eq!(
             cursor_icons,
             vec![
@@ -11308,7 +11319,7 @@ mod tests {
                 egui::CursorIcon::ResizeHorizontal,
                 egui::CursorIcon::Default,
             ],
-            "the strip must claim its cursor during layer warm-up, but not after PointerGone"
+            "presenter hover must own the strip cursor until the native position leaves"
         );
     }
 
