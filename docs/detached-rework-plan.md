@@ -474,11 +474,50 @@ op の内部で binding を早く公開して正常終了までに戻す実装�
 という R2e と同じ形の構造問題。3 の教訓は②-d に効く: **所有権を動かす経路を、別の目的で
 呼び直さない。**
 
-次は **②-a** (終端経路を「所有値の digest」へ)。保管は変えないので挙動不変。
-指示書は [detached-rework-stage-r2e-2a.md](detached-rework-stage-r2e-2a.md)。
-対象は 2 本だけ — ブックマーク照合 (`take_and_close_current_active_detached_viewer_context`
-が生 bundle を返している) と メディア teardown (`Vec<Box<ViewerContextBundle>>` を渡している)。
-残る所有プリミティブ 3 本は fork / 取り出しで**終端ではない**ので②-d まで残る。
+**ステージ②-a も完了** (2026-08-24、`3c435070`、指示書
+[detached-rework-stage-r2e-2a.md](detached-rework-stage-r2e-2a.md))。
+終端 2 本 — ブックマーク照合と メディア teardown — が生 bundle を外へ出さなくなった。
+`ClosedBookmarkSummary` が reconcile の読む 4 値 + PDF パスワードの bool を運び、
+teardown は窓ごとに plan → normalize clear → drop してから App-global の後始末をする。
+**保管も挙動も変えていない。** lib テスト 6251 件緑。
+
+指示書で「推測せず確かめろ」と書いた 2 点の結論:
+
+- **PDF パスワードの畳みが `detached_viewport_finalized` 側に無いのは意図的。**
+  両分岐とも `should_drop` の内側にあり、`should_drop` は
+  `active_detached_transition_outstanding()` が偽であることを要求する。この述語は
+  **detached bundle をマウントした状態で評価される**うえ `pdf_password_request.is_some()` を
+  含むので、そこへ来る context は request を持ち得ない。畳みが効くのは gate の無い
+  明示 close 経路 (`close_current_active_detached_viewer_context`) の方である。
+- **teardown plan の入力は context を跨がない。** よって 2 窓目の plan を 1 窓目の drop 後に
+  作っても値は同じ。加えて、App-global の後始末より前に走るようになった
+  `normalize_ui_states` / `normalize_auto_scan_suppressed` の clear は
+  **`Copy` の素データで `Drop` を持たない**ため観測不能で、後始末側は plans と main 自身の
+  state しか読まない (`cancel_viewer_context_teardown_normalize` /
+  `clear_music_state_after_viewer_context_teardown` を確認済み)。
+
+⚠ **検収で 1 件差し戻した。指示書の要求が間違っていた。**
+指示書に「追加テストは現行コードで必ず落ちること」と書いたが、**この段は挙動不変なので
+挙動テストは原理的に落ちない**。実装側はそれを `include_str!("../app.rs").contains(...)` の
+**ソース文字列 assertion 3 本**で満たしていた。これは (1) 完了判定を grep でやらないという
+設計 §6 に反し、(2) 目的の文字列が消えた瞬間から永久に真になって何も守らなくなり、
+(3) ②-b / ②-d で当の関数が移動すると腐る。3 本とも削除し、うち 1 本が守っていた
+「窓が bundle を持たないとき」のテストは**混在ケース** (bundle 無しの窓を先頭に置く) へ
+書き直した。
+
+**挙動不変の段では「旧コードで落ちること」ではなく「間違った新コードで落ちること」を
+要求する。** 今回はそれを mutation で実証した:
+
+| 変異 | 落ちたテスト |
+| --- | --- |
+| bundle が無い窓で `continue` せず `break` する | `media_teardown_skips_a_bundleless_window_without_abandoning_the_rest` (新規) |
+| tile-companion / mode-switch の判定を take の後に動かす | `parked_close_clears_bundle_owned_tile_companion_without_pending` (既存) |
+
+2 つ目は、§3.3 の「判定をループより前から動かすな」を**既存テストが既に守っていた**ことの
+確認でもある。
+
+次は **②-b** (型の移設。`ViewerContextBundle` + `Drop` + `empty` + `swap` + fork destructure を
+registry モジュールへ。フィールドは一時的に `pub(in crate::app)` のまま)。挙動不変。
 
 ### R2e の作業環境 (新しいセッションが最初に読むもの)
 
