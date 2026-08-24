@@ -1402,6 +1402,27 @@ ClaudeCode の追加ログと Codex の portable / normal ログを併記して 
   - 設定 round-trip と起動状態 resolver の unit test に加え、複数モニター / 異なる DPI /
     トレイ終了で restore rect と最大化状態を手動確認する。
 - 規模 / 優先度: Small (0.5〜1.5日程度) / P2。コード量より Windows / DPI 実機確認が主なリスク。
+- **実装済み (2026-08-25、実機確認待ち)**:
+  - `Settings.startup_window_state` (`Normal` 既定 / `Maximized` / `RememberLast`) と、
+    終了時の最大化 flag `Settings.window_maximized` を追加。flag は復元矩形
+    (`window_pos` / `window_size`) と**別フィールド**にして、最大化を解いたときの
+    戻り先を残す (detached 側 §1.115 と同じ根を作らない)。
+  - `resolve_startup_maximized` で起動状態を決め、`ViewportBuilder::with_maximized` へ渡す。
+    初回フレームで `ViewportCommand::Maximized` を送る形にすると通常サイズが一度見えて
+    ちらつくため、生成時に指定する。`--window-size` は設定より優先して通常ウィンドウ。
+  - `pending_initial_size` の mixed-DPI 補正は、最大化起動では**最大化が解けるまで保留**する
+    (`deferred_initial_size_ready`)。egui が「最大化ではない」と明示報告した最初のフレームで
+    1 回だけ流し、そこで復元矩形を矯正する。報告が無い `None` を「最大化ではない」と
+    読まないこと自体が条件。
+  - 追跡側 (`tracked_window_maximized`) は最小化中と報告欠落時に直前の状態を保つ。
+    Windows は最小化中の `GetWindowPlacement().showCmd` を `SW_SHOWMINIMIZED` にするため、
+    素直に読むと最大化して最小化しただけで flag が落ちる。
+  - 環境設定のページ名を「起動時に開く場所」→「起動時の動作」に変更し、同ページへ
+    「起動時のウィンドウ状態」節と検索索引エントリを追加。
+  - unit test: 起動状態 resolver / 設定 round-trip / 未知値の既定落ち / 環境設定 OK が
+    選択を巻き戻さないこと / 補正の保留条件 / 最小化中の追跡 / 保存が復元矩形を触らないこと。
+  - **残: 複数モニター・異なる DPI・トレイ終了での実機確認**。
+  - 未決: 既定を `Normal` (現行互換) にしてある。`RememberLast` を既定にするかは要判断。
 
 ### 1.117 外部ツール連携を設定画面へ出し、引数・複数選択へ拡張する — 外部SNSでの移行検討者の指摘
 

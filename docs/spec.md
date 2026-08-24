@@ -1831,7 +1831,9 @@ Ctrl+C / Ctrl+X / Ctrl+V は `use_native_shell_context_menu` の設定に関わ�
 | `menu_layout` | MenuLayoutSettings | 空 (=既定順) | トップメニューと固定メニュー項目の表示順 / 表示 ON/OFF を stable name で保存するフィールド。固定 leaf 項目と空 top menu の表示 ON/OFF、top menu の表示順、固定 leaf 項目のメニュー内表示順を描画へ接続し、環境設定「表示 → メニュー構成」から編集できる。登録済み一覧などの動的ブロックは既存位置を基準に表示する。「設定 → 環境設定…」は設定入口を失わないよう非表示指定を無視する。欠落時や空設定は既定メニュー構成として扱う |
 | `keymap` | KeymapSettings | 空 (=既定割り当て) | キーボード操作の上書き設定。設定メニュー「操作カスタマイズ…」から編集し、Action 名と最大 3 つのキー名を保存する。空ならコード上の既定を使い、空の上書きは割り当て解除を表す。旧 `keymap.ini` は初回起動時だけ取り込んで退避する |
 | `rating_filter` | `[bool; 6]` | `[true; 6]` | レーティングフィルタ（index 0=未評価, 1〜5=★の数）。全 true ならフィルタなし |
-| `window_pos` / `window_size` | Option | None | ウィンドウ位置・サイズ（自動保存） |
+| `window_pos` / `window_size` | Option | None | 通常ウィンドウの位置・サイズ（自動保存）。最大化中は更新しないので、最大化を解いたときに戻る矩形として残る |
+| `window_maximized` | bool | false | 前回終了時（トレイ退避を含む）に最大化していたか（自動保存）。復元矩形を潰さないよう `window_pos` / `window_size` とは別に持つ |
+| `startup_window_state` | StartupWindowState | Normal | 起動時のウィンドウ状態。`Normal`=常に通常ウィンドウ、`Maximized`=常に最大化、`RememberLast`=前回終了時が最大化なら最大化。位置・サイズはどの選択でも復元する。`--window-size` 指定時はこの設定より優先して通常ウィンドウで起動する |
 
 ### 8.5 メタデータ・検索設定（v0.3 追加）
 

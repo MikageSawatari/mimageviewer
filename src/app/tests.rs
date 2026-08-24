@@ -57421,3 +57421,62 @@ fn the_overflow_button_closes_the_panel_it_opened() {
         "a second press must close it"
     );
 }
+
+/// 起動時のウィンドウ状態 (§1.116)。最大化で起動したときに、初回フレームの
+/// mixed-DPI 補正が最大化を打ち消さないことを固定する。
+#[test]
+fn the_startup_size_correction_waits_while_the_window_is_maximized() {
+    use crate::app::deferred_initial_size_ready;
+
+    // 通常起動は従来どおり初回フレームで補正する。egui がまだ viewport を報告して
+    // いなくても待たない (待つと補正が永久に届かない環境がある)。
+    assert!(deferred_initial_size_ready(false, None));
+    assert!(deferred_initial_size_ready(false, Some(false)));
+
+    // 最大化起動では、報告が無い間は保留する。None を「最大化ではない」と読むと
+    // 初回フレームで InnerSize を送ってしまい、最大化が解けてしまう。
+    assert!(!deferred_initial_size_ready(true, None));
+    assert!(!deferred_initial_size_ready(true, Some(true)));
+
+    // 最大化が解けたと明示的に報告されたフレームで、はじめて補正を流す。
+    assert!(deferred_initial_size_ready(true, Some(false)));
+}
+
+/// 最小化中の maximized は当てにならないので、最後に見えていた状態を保つ。
+#[test]
+fn minimizing_does_not_erase_the_remembered_maximized_state() {
+    use crate::app::tracked_window_maximized;
+
+    // 見えている間はそのまま追従する。
+    assert!(tracked_window_maximized(false, false, Some(true)));
+    assert!(!tracked_window_maximized(true, false, Some(false)));
+
+    // 最小化中は、報告値がどちらでも直前の状態を保つ。最大化したまま最小化して
+    // 終了しても「最大化で終了した」と記録される。
+    assert!(tracked_window_maximized(true, true, Some(false)));
+    assert!(!tracked_window_maximized(false, true, Some(true)));
+
+    // 報告が無いのは「最大化ではない」証拠ではない。ここを false と読むと、
+    // 報告が来ない環境で「前回終了時の状態」が毎回 flag を落として効かなくなる。
+    assert!(tracked_window_maximized(true, false, None));
+    assert!(!tracked_window_maximized(false, false, None));
+}
+
+/// 最大化 flag と復元矩形は別々に保存される。1 つに畳み込むと、最大化して終了した
+/// 次の起動で「解いたときに戻る先」を失う (detached 側の §1.115 と同じ根)。
+#[test]
+fn the_exit_maximized_flag_is_saved_without_touching_the_restore_rect() {
+    let mut app = phase_c_support::setup_app();
+    // 最大化中は矩形の追跡が止まるので、settings 側には最大化する前の通常矩形が残る。
+    app.settings.window_pos = Some([100.0, 60.0]);
+    app.settings.window_size = Some([1440.0, 900.0]);
+    app.last_outer_rect = None;
+    app.last_inner_size = None;
+    app.last_window_maximized = true;
+
+    app.persist_window_state_and_flush();
+
+    assert!(app.settings.window_maximized);
+    assert_eq!(app.settings.window_pos, Some([100.0, 60.0]));
+    assert_eq!(app.settings.window_size, Some([1440.0, 900.0]));
+}

@@ -14,8 +14,8 @@ use crate::settings::{
     self, AiFeatureMode, ArchiveFileHandling, CachePolicy, FullscreenFitMode,
     FullscreenHorizontalCursorDirection, FullscreenJumpMode, FullscreenSeekDirection,
     GridItemDisplayKind, Parallelism, ReadingDirection, ReadingFlow, SortOrder, SpreadMode,
-    StartupFolderMode, TextContrast, UI_FONT_VERTICAL_ADJUST_MAX, UI_FONT_VERTICAL_ADJUST_MIN,
-    UiFontSelection, UiTheme,
+    StartupFolderMode, StartupWindowState, TextContrast, UI_FONT_VERTICAL_ADJUST_MAX,
+    UI_FONT_VERTICAL_ADJUST_MIN, UiFontSelection, UiTheme,
 };
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
@@ -366,7 +366,7 @@ pub(super) fn page_font(ui: &mut egui::Ui, state: &mut PreferencesState) {
     }
 }
 
-pub(super) fn page_startup_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
+pub(super) fn page_startup(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "startup/mode", |ui, state| {
         ui.label(egui::RichText::new("起動時に開く場所").strong());
         ui.add_space(4.0);
@@ -442,6 +442,40 @@ pub(super) fn page_startup_folder(ui: &mut egui::Ui, state: &mut PreferencesStat
         )
         .weak(),
     );
+    });
+
+    ui.add_space(14.0);
+    ui.separator();
+    ui.add_space(10.0);
+
+    anchored(ui, state, "startup/window-state", |ui, state| {
+        ui.label(egui::RichText::new("起動時のウィンドウ状態").strong());
+        ui.add_space(4.0);
+
+        ui.radio_value(
+            &mut state.settings.startup_window_state,
+            StartupWindowState::Normal,
+            StartupWindowState::Normal.label(),
+        );
+        ui.radio_value(
+            &mut state.settings.startup_window_state,
+            StartupWindowState::RememberLast,
+            StartupWindowState::RememberLast.label(),
+        );
+        ui.radio_value(
+            &mut state.settings.startup_window_state,
+            StartupWindowState::Maximized,
+            StartupWindowState::Maximized.label(),
+        );
+
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(
+                "ウィンドウの位置とサイズは、どの選択でも前回終了時のものを復元します。
+                 最大化を解いたときは、その位置とサイズに戻ります。",
+            )
+            .weak(),
+        );
     });
 }
 

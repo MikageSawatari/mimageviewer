@@ -1138,11 +1138,26 @@ pub fn run() -> eframe::Result {
     let icon = Arc::new(load_icon());
     emit_startup("load_icon", Some(t));
 
+    // 起動時の最大化。`--window-size` はスクリーンショット用に厳密なサイズを要求する
+    // 経路なので、設定より優先して常に通常ウィンドウで起動する。
+    let start_maximized = parse_window_size_arg().is_none()
+        && crate::settings::resolve_startup_maximized(
+            saved.startup_window_state,
+            saved.window_maximized,
+        );
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("mimageviewer")
         .with_inner_size(size)
         .with_min_inner_size(MIN_INNER_SIZE)
         .with_icon(icon);
+
+    // 最大化はウィンドウ生成の時点で指定する。初回フレームで
+    // `ViewportCommand::Maximized` を送る形にすると、通常サイズのウィンドウが一度
+    // 見えてから最大化するので、起動のたびにちらつく。
+    if start_maximized {
+        viewport = viewport.with_maximized(true);
+    }
 
     // --window-size 指定時は位置を画面左上寄りに固定（保存済み位置は無視）
     if parse_window_size_arg().is_some() {
@@ -1340,6 +1355,12 @@ pub fn run() -> eframe::Result {
             // (egui#4918 / winit#923 対策)。ViewportBuilder 段階では
             // マルチモニタ DPI 混在時にサイズが壊れるケースがある。
             app.pending_initial_size = Some(size);
+            // 最大化起動では、この補正は最大化が解けるまで保留される
+            // (`App::apply_deferred_initial_size`)。
+            app.created_maximized = start_maximized;
+            // 追跡値の初期値は「こちらが要求した状態」。egui からの報告を待つ間に
+            // 終了しても、要求した状態がそのまま保存される。
+            app.last_window_maximized = start_maximized;
             #[cfg(all(feature = "test-script", windows))]
             if let Some(path) = test_script_path.clone() {
                 app.prepare_test_script_run();
