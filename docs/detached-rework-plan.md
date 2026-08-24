@@ -475,6 +475,10 @@ op の内部で binding を早く公開して正常終了までに戻す実装�
 呼び直さない。**
 
 次は **②-a** (終端経路を「所有値の digest」へ)。保管は変えないので挙動不変。
+指示書は [detached-rework-stage-r2e-2a.md](detached-rework-stage-r2e-2a.md)。
+対象は 2 本だけ — ブックマーク照合 (`take_and_close_current_active_detached_viewer_context`
+が生 bundle を返している) と メディア teardown (`Vec<Box<ViewerContextBundle>>` を渡している)。
+残る所有プリミティブ 3 本は fork / 取り出しで**終端ではない**ので②-d まで残る。
 
 ### R2e の作業環境 (新しいセッションが最初に読むもの)
 
