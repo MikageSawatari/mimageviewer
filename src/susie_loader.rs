@@ -214,6 +214,14 @@ struct Job {
     priority: bool,
 }
 
+/// 1 スロットが作り直しを試みる上限。プラグインが必ず落ちる画像を掴んだ場合、
+/// 無限に作り直しても同じなので打ち切る。
+const MAX_WORKER_RESTARTS: usize = 5;
+
+/// 作り直しの間隔 (回数に比例して伸ばす)。crash loop が CPU を焼き切らないための
+/// 間隔であって、競合を時間で隠すためのものではない。
+const WORKER_RESTART_BACKOFF_MS: u64 = 200;
+
 struct JobQueue {
     /// 可視セル等の優先ジョブ。dispatcher はこちらを先に pop する。
     /// 2 本に分けて FIFO(priority) → FIFO(regular) の順で処理することで、
@@ -231,7 +239,10 @@ struct JobQueue {
 
 pub struct SusieWorkerPool {
     queue: Arc<(Mutex<JobQueue>, Condvar)>,
-    worker_count: usize,
+    /// **生きているスロット数**。ワーカーが落ちて作り直せなくなるとここが減る。
+    /// 起動時の本数で固定していたときは、全滅しても `is_ready()` が真を返し続け、
+    /// 要求が誰にも拾われないまま失敗していた。
+    live_workers: Arc<std::sync::atomic::AtomicUsize>,
     /// ロード済みプラグイン (全ワーカーで共通、handshake 応答をマージ済み)
     plugins: Vec<PluginInfo>,
     /// 拡張子の集合 (小文字)。全プラグインの対応拡張子を合算したもの。
@@ -274,6 +285,7 @@ impl SusieWorkerPool {
         let mut extensions: HashSet<String> = HashSet::new();
         let mut dispatcher_threads = Vec::with_capacity(pool_size);
         let mut worker_count = 0usize;
+        let live_workers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         for i in 0..pool_size {
             match spawn_worker_and_handshake(&exe, &plugin_dir) {
@@ -295,9 +307,14 @@ impl SusieWorkerPool {
                     }
                     worker_count += 1;
                     let q = Arc::clone(&queue);
+                    let slot_exe = exe.clone();
+                    let slot_plugin_dir = plugin_dir.clone();
+                    let slot_live = Arc::clone(&live_workers);
                     let handle = std::thread::Builder::new()
                         .name(format!("susie-pool-{i}"))
-                        .spawn(move || run_dispatcher(i, q, child, io))
+                        .spawn(move || {
+                            run_worker_slot(i, q, slot_exe, slot_plugin_dir, (child, io), slot_live)
+                        })
                         .expect("susie: failed to spawn dispatcher thread");
                     dispatcher_threads.push(handle);
                 }
@@ -317,9 +334,11 @@ impl SusieWorkerPool {
             ));
         }
 
+        live_workers.store(worker_count, std::sync::atomic::Ordering::Relaxed);
+
         SusieWorkerPool {
             queue,
-            worker_count,
+            live_workers,
             plugins: plugins_merged,
             extensions,
             dispatcher_threads: Mutex::new(dispatcher_threads),
@@ -327,7 +346,12 @@ impl SusieWorkerPool {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.worker_count > 0
+        self.live_workers.load(std::sync::atomic::Ordering::Relaxed) > 0
+    }
+
+    /// 生きているワーカースロット数。診断表示と、全滅の判定に使う。
+    pub fn live_worker_count(&self) -> usize {
+        self.live_workers.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn plugins(&self) -> &[PluginInfo] {
@@ -353,7 +377,9 @@ impl SusieWorkerPool {
         priority: bool,
         cancel: Option<&Arc<AtomicBool>>,
     ) -> std::io::Result<Vec<u8>> {
-        if self.worker_count == 0 {
+        // 生存スロットを見る。全滅した状態で enqueue すると、誰も pop しない
+        // キューに積まれて要求が宙に浮く。
+        if self.live_worker_count() == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "susie: no workers available",
@@ -415,7 +441,7 @@ fn empty_pool() -> SusieWorkerPool {
             }),
             Condvar::new(),
         )),
-        worker_count: 0,
+        live_workers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         plugins: Vec::new(),
         extensions: HashSet::new(),
         dispatcher_threads: Mutex::new(Vec::new()),
@@ -788,12 +814,107 @@ fn spawn_worker_and_handshake(
     Ok((child, io, plugins))
 }
 
+/// dispatcher の loop が終わった理由。
+///
+/// 以前は理由を持たず、`shutdown` でしか抜けなかった。ワーカーが落ちても loop は
+/// 回り続け、**死んだ pipe を持つ dispatcher が共有キューから後続を取り続けた**。
+/// しかも失敗は即座に返るので、生きているワーカーより速く job を吸う。
+#[derive(Debug)]
+enum DispatcherExit {
+    /// プール終了。スロットも畳む。
+    Shutdown,
+    /// ワーカープロセスが応答しなくなった。スロットは再起動を試みる。
+    WorkerLost { reason: String },
+}
+
+/// ワーカーが落ちたと判断できる transport error か。
+///
+/// プロトコル違反 (`InvalidData`) は含めない。それはワーカーが生きたまま壊れた
+/// 応答を返した場合で、再起動しても同じ結果になる。
+fn is_worker_lost(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+    )
+}
+
+/// 1 スロットの生涯。ワーカーが落ちたら backoff を挟んで作り直し、同じキューへ戻す。
+///
+/// **クラッシュを起こした要求は再送しない。** 同じ不正画像で crash loop になるためで、
+/// その 1 件はエラーとして返し、後続のためだけにワーカーを補充する。
+fn run_worker_slot(
+    worker_id: usize,
+    queue: Arc<(Mutex<JobQueue>, Condvar)>,
+    exe: PathBuf,
+    plugin_dir: PathBuf,
+    initial: (Child, WorkerIo),
+    live_workers: Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::sync::atomic::Ordering;
+
+    let mut current = Some(initial);
+    let mut restarts = 0usize;
+
+    loop {
+        let Some((child, io)) = current.take() else {
+            // ワーカーが居ない状態。上限まで作り直しを試みる。
+            if restarts >= MAX_WORKER_RESTARTS {
+                crate::logger::log(format!(
+                    "susie: worker {worker_id} reached the restart limit ({MAX_WORKER_RESTARTS})"
+                ));
+                break;
+            }
+            restarts += 1;
+            // 落ちた直後に作り直しても同じ画像でまた落ちることがある。時間で競合を
+            // 隠すためではなく、crash loop が CPU を焼き切らないための間隔。
+            std::thread::sleep(std::time::Duration::from_millis(
+                WORKER_RESTART_BACKOFF_MS * restarts as u64,
+            ));
+            if queue.0.lock().map(|q| q.shutdown).unwrap_or(true) {
+                break;
+            }
+            match spawn_worker_and_handshake(&exe, &plugin_dir) {
+                Ok((child, io, plugins)) => {
+                    crate::logger::log(format!(
+                        "susie: worker {worker_id} restarted (pid={}, plugins={}, attempt {restarts})",
+                        child.id(),
+                        plugins.len()
+                    ));
+                    current = Some((child, io));
+                }
+                Err(e) => {
+                    crate::logger::log(format!(
+                        "susie: worker {worker_id} restart {restarts} failed: {e}"
+                    ));
+                }
+            }
+            continue;
+        };
+
+        match run_dispatcher(worker_id, Arc::clone(&queue), child, io) {
+            DispatcherExit::Shutdown => break,
+            DispatcherExit::WorkerLost { reason } => {
+                crate::logger::log(format!("susie: worker {worker_id} lost ({reason})"));
+                // current は None のまま次の周回へ。そこで作り直す。
+            }
+        }
+    }
+
+    let remaining = live_workers.fetch_sub(1, Ordering::Relaxed) - 1;
+    crate::logger::log(format!(
+        "susie: worker {worker_id} slot closed; {remaining} worker slot(s) left"
+    ));
+}
+
 fn run_dispatcher(
     worker_id: usize,
     queue: Arc<(Mutex<JobQueue>, Condvar)>,
     mut child: Child,
     mut io: WorkerIo,
-) {
+) -> DispatcherExit {
     let pid = child.id();
     // 環境変数 MIV_SUSIE_PERF_LOG=1 で 1 ジョブごとの計測ログを出す。
     // (常時 ON だと数千枚のサムネイル一括ロード時にログが膨大になるため非推奨)
@@ -820,7 +941,14 @@ fn run_dispatcher(
                 q = cv.wait(q).unwrap();
             }
         };
-        let Some(job) = job else { break };
+        let Some(job) = job else {
+            crate::logger::log(format!(
+                "susie: worker {worker_id} shutting down (pid={pid})"
+            ));
+            let _ = write_msg(&mut io.stdin, &[MSG_SHUTDOWN]);
+            let _ = child.wait();
+            return DispatcherExit::Shutdown;
+        };
 
         let cancelled = job
             .cancel
@@ -853,14 +981,22 @@ fn run_dispatcher(
             ));
         }
 
+        // ワーカーが応答しなくなったら、この 1 件はエラーで返して loop を抜ける。
+        // **要求は再送しない** — 同じ画像でまた落ちるなら crash loop になる。
+        // 抜けずに回り続けると、死んだ pipe を持つこの dispatcher が共有キューから
+        // 後続を取り続け、しかも失敗が即座に返るぶん生きたワーカーより速く吸ってしまう。
+        let lost = match &result {
+            Err(e) if is_worker_lost(e) => Some(format!("{e}")),
+            _ => None,
+        };
         let _ = job.reply.send(result);
+        if let Some(reason) = lost {
+            // 既に死んでいる想定だが、handle を確実に閉じる。
+            let _ = child.kill();
+            let _ = child.wait();
+            return DispatcherExit::WorkerLost { reason };
+        }
     }
-
-    crate::logger::log(format!(
-        "susie: worker {worker_id} shutting down (pid={pid})"
-    ));
-    let _ = write_msg(&mut io.stdin, &[MSG_SHUTDOWN]);
-    let _ = child.wait();
 }
 
 fn send_recv(io: &mut WorkerIo, request: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -1012,4 +1148,54 @@ fn parse_decode_response(data: &[u8]) -> std::io::Result<image::DynamicImage> {
         )
     })?;
     Ok(image::DynamicImage::ImageRgba8(img))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ワーカーが落ちたと判断してよいのは transport が切れたときだけ。
+    /// プロトコル違反や画像側のエラーで作り直すと、同じ結果を繰り返す。
+    #[test]
+    fn only_a_broken_transport_counts_as_a_lost_worker() {
+        use std::io::{Error, ErrorKind};
+
+        for kind in [
+            ErrorKind::UnexpectedEof,
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionReset,
+        ] {
+            assert!(
+                is_worker_lost(&Error::new(kind, "gone")),
+                "{kind:?} should be treated as a lost worker"
+            );
+        }
+
+        for kind in [
+            ErrorKind::InvalidData,
+            ErrorKind::NotFound,
+            ErrorKind::PermissionDenied,
+            ErrorKind::Other,
+        ] {
+            assert!(
+                !is_worker_lost(&Error::new(kind, "still alive")),
+                "{kind:?} must not restart a worker that is still answering"
+            );
+        }
+    }
+
+    /// 作り直しの間隔は回数に比例して伸び、上限で止まる。crash loop が CPU を
+    /// 焼き切らないための間隔なので、0 にはしない。
+    #[test]
+    fn the_restart_backoff_grows_and_is_bounded() {
+        let delays: Vec<u64> = (1..=MAX_WORKER_RESTARTS)
+            .map(|attempt| WORKER_RESTART_BACKOFF_MS * attempt as u64)
+            .collect();
+        assert_eq!(delays.len(), MAX_WORKER_RESTARTS);
+        assert!(delays.iter().all(|&d| d > 0));
+        assert!(delays.windows(2).all(|w| w[1] > w[0]));
+        // 上限まで使い切っても、待ち時間の合計が体感を壊すほど長くならないこと。
+        assert!(delays.iter().sum::<u64>() < 5_000);
+    }
 }
