@@ -945,6 +945,199 @@ pub(in crate::app) struct ViewerContextBundle {
 }
 
 #[cfg(windows)]
+#[derive(Clone, Copy)]
+enum ContextRefSource<'a> {
+    Mounted(&'a App),
+    AtRest(&'a ViewerContextBundle),
+}
+
+/// 1 つの context への読み取り。マウント中なら App のミラーフィールド、
+/// そうでなければ bundle を読む。呼び出し側はどちらか知らなくてよい。
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+pub(in crate::app) struct ContextRef<'a> {
+    source: ContextRefSource<'a>,
+}
+
+#[cfg(windows)]
+impl<'a> ContextRef<'a> {
+    pub(in crate::app) fn mounted(app: &'a App) -> Self {
+        Self {
+            source: ContextRefSource::Mounted(app),
+        }
+    }
+
+    pub(in crate::app) fn at_rest(bundle: &'a ViewerContextBundle) -> Self {
+        Self {
+            source: ContextRefSource::AtRest(bundle),
+        }
+    }
+
+    pub(in crate::app) fn fullscreen_idx(self) -> Option<usize> {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.fullscreen_idx,
+            ContextRefSource::AtRest(bundle) => bundle.fullscreen_idx,
+        }
+    }
+
+    pub(in crate::app) fn items(self) -> &'a [GridItem] {
+        match self.source {
+            ContextRefSource::Mounted(app) => &app.items,
+            ContextRefSource::AtRest(bundle) => &bundle.items,
+        }
+    }
+
+    pub(in crate::app) fn fs_cache(self) -> &'a ItemsGenerationMap<FsCacheEntry> {
+        match self.source {
+            ContextRefSource::Mounted(app) => &app.fs_cache,
+            ContextRefSource::AtRest(bundle) => &bundle.fs_cache,
+        }
+    }
+
+    pub(in crate::app) fn viewer_session_last_sync_stamp(self) -> Option<&'a ViewerSyncStamp> {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.last_viewer_sync_stamp.as_ref(),
+            ContextRefSource::AtRest(bundle) => bundle.viewer_session.last_sync_stamp.as_ref(),
+        }
+    }
+
+    pub(in crate::app) fn viewer_session_detached_window_id(self) -> Option<u64> {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.detached_viewer_window_id,
+            ContextRefSource::AtRest(bundle) => bundle.viewer_session.detached_window_id,
+        }
+    }
+
+    pub(in crate::app) fn viewer_session_independent_active(self) -> bool {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.detached_viewer_independent_active,
+            ContextRefSource::AtRest(bundle) => bundle.viewer_session.independent_active,
+        }
+    }
+
+    pub(in crate::app) fn pdf_password_request(self) -> Option<&'a PdfPasswordRequest> {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.pdf_password_request.as_ref(),
+            ContextRefSource::AtRest(bundle) => bundle.pdf_password_request.as_ref(),
+        }
+    }
+
+    pub(in crate::app) fn current_folder(self) -> Option<&'a Path> {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.current_folder.as_deref(),
+            ContextRefSource::AtRest(bundle) => bundle.current_folder.as_deref(),
+        }
+    }
+
+    pub(in crate::app) fn fs_pending_len(self) -> usize {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.fs_pending.len(),
+            ContextRefSource::AtRest(bundle) => bundle.fs_pending.len(),
+        }
+    }
+
+    pub(in crate::app) fn items_generation(self) -> u64 {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.items_generation,
+            ContextRefSource::AtRest(bundle) => bundle.items_generation,
+        }
+    }
+
+    pub(in crate::app) fn video_audio_mode(self) -> Option<usize> {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.video_audio_mode,
+            ContextRefSource::AtRest(bundle) => bundle.video_audio_mode,
+        }
+    }
+
+    pub(in crate::app) fn video_audio_vst(self) -> Option<&'a VideoAudioVstState> {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.video_audio_vst.as_ref(),
+            ContextRefSource::AtRest(bundle) => bundle.video_audio_vst.as_ref(),
+        }
+    }
+
+    pub(in crate::app) fn vst3_deferred_media_open(self) -> Option<usize> {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.vst3_deferred_media_open,
+            ContextRefSource::AtRest(bundle) => bundle.vst3_deferred_media_open,
+        }
+    }
+
+    pub(in crate::app) fn fs_lanczos_cache(self) -> &'a crate::gpu_lanczos::GpuLanczosCache {
+        match self.source {
+            ContextRefSource::Mounted(app) => &app.fs_lanczos_cache,
+            ContextRefSource::AtRest(bundle) => &bundle.fs_lanczos_cache,
+        }
+    }
+
+    pub(in crate::app) fn tag_prewarm_pending_present(self) -> bool {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.tag_prewarm_pending.is_some(),
+            ContextRefSource::AtRest(bundle) => bundle.tag_prewarm_pending.is_some(),
+        }
+    }
+
+    pub(in crate::app) fn selected(self) -> Option<usize> {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.selected,
+            ContextRefSource::AtRest(bundle) => bundle.selected,
+        }
+    }
+
+    pub(in crate::app) fn bookmark_view_state(self) -> Option<&'a BookmarkViewState> {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.bookmark_view_state.as_ref(),
+            ContextRefSource::AtRest(bundle) => bundle.bookmark_view_state.as_ref(),
+        }
+    }
+
+    pub(in crate::app) fn archive_source_override(self) -> Option<&'a Path> {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.archive_source_override.as_deref(),
+            ContextRefSource::AtRest(bundle) => bundle.archive_source_override.as_deref(),
+        }
+    }
+
+    pub(in crate::app) fn music_bookmarks(self) -> &'a [crate::video_bookmarks::VideoBookmarkMeta] {
+        match self.source {
+            ContextRefSource::Mounted(app) => &app.music_bookmarks,
+            ContextRefSource::AtRest(bundle) => &bundle.music_bookmarks,
+        }
+    }
+
+    pub(in crate::app) fn music_bookmarks_loaded(self) -> bool {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.music_bookmarks_loaded_for.is_some(),
+            ContextRefSource::AtRest(bundle) => bundle.music_bookmarks_loaded_for.is_some(),
+        }
+    }
+
+    pub(in crate::app) fn normalize_ui_state(
+        self,
+        idx: usize,
+    ) -> Option<crate::video::normalize_types::NormalizeUiState> {
+        match self.source {
+            ContextRefSource::Mounted(app) => app.normalize_ui_states.get(&idx).copied(),
+            ContextRefSource::AtRest(bundle) => bundle.normalize_ui_states.get(&idx).copied(),
+        }
+    }
+
+    pub(in crate::app) fn final_ai_pending_job_id(self, key: &FinalAiKey) -> Option<u64> {
+        match self.source {
+            ContextRefSource::Mounted(app) => {
+                app.final_ai_pending.get(key).map(|pending| pending.job_id)
+            }
+            ContextRefSource::AtRest(bundle) => bundle
+                .final_ai_pending
+                .get(key)
+                .map(|pending| pending.job_id),
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+#[cfg(windows)]
 impl Drop for ViewerContextBundle {
     /// bundle 化したロード複合体 (review-v2.3.0 P2-8/P2-9) の後始末。detached 窓の close /
     /// モード切替の一括 clear / 新メディアによる parked 窓の強制 close では bundle ごと
@@ -995,6 +1188,29 @@ impl ViewerContextBundle {
         self.fs_early_dims.set_items_generation(items_generation);
         self.fs_upload_backlog
             .set_items_generation(items_generation);
+    }
+
+    pub(in crate::app) fn adopt_bookmark_media_open_pending(
+        &mut self,
+        pending: crate::bookmark_browser::PendingMediaOpen,
+    ) {
+        self.bookmark_open_pending =
+            Some(crate::bookmark_browser::PendingBookmarkOpen::Media(pending));
+    }
+
+    pub(in crate::app) fn activate_independent_detached_session(&mut self, window_id: u64) {
+        self.viewer_session.activate_independent_detached(window_id);
+    }
+
+    pub(in crate::app) fn pause_animations_for_remote_session(&mut self) -> usize {
+        self.fs_cache
+            .values_mut()
+            .map(|entry| usize::from(entry.pause_animation()))
+            .sum()
+    }
+
+    pub(in crate::app) fn clear_details_order(&mut self) {
+        self.details_order.clear();
     }
 
     pub(in crate::app) fn empty() -> Self {
@@ -2274,6 +2490,51 @@ impl App {
             ai_classify_cache,
         );
         parked
+    }
+
+    /// 完全な物理一覧を既に materialize 済みの main context から、auto-fullscreen の
+    /// detached read model を作る。通常の grid leaf open は descriptor 経路で非同期列挙するため、
+    /// この snapshot 経路は folder / ZIP / PDF の列挙完了後に限る。
+    #[cfg(windows)]
+    pub(in crate::app) fn split_materialized_physical_context_for_independent_still_open(
+        &mut self,
+    ) -> Box<ViewerContextBundle> {
+        let mut detached = self.split_current_context_preserving_main_grid();
+
+        detached.view_trim_mode = self.view_trim_mode;
+        detached.view_trim_apply_mode = self.view_trim_apply_mode;
+        detached.view_trim_page_apply_root_idx = self.view_trim_page_apply_root_idx;
+        detached.view_trim_page_spread_separate = self.view_trim_page_spread_separate;
+        detached.view_trim_book_settings = self.view_trim_book_settings.clone();
+        detached.view_trim_page_overrides = self.view_trim_page_overrides.clone();
+        detached.spread_mode = self.spread_mode;
+        detached.spread_shift_anchor_idx = self.spread_shift_anchor_idx;
+        detached.reading_flow = self.reading_flow;
+        detached.reading_direction = self.reading_direction;
+
+        detached.thumb_pixels = self.thumb_pixels.clone();
+        detached.thumb_edit_preview_layers = self.thumb_edit_preview_layers.clone();
+        detached.thumb_edit_preview_keys = self.thumb_edit_preview_keys.clone();
+        detached.thumb_adjust_tex = self.thumb_adjust_tex.clone();
+        detached.adjustment_page_params = self.adjustment_page_params.clone();
+        detached.local_adjust_page_layers = self.local_adjust_page_layers.clone();
+        detached.local_adjust_pages = self.local_adjust_pages.clone();
+        detached.local_adjust_selected_layers = self.local_adjust_selected_layers.clone();
+        detached.local_adjust_generation = self.local_adjust_generation.clone();
+        detached.export_crop_page_settings = self.export_crop_page_settings.clone();
+        detached.export_crop_pages = self.export_crop_pages.clone();
+        detached.mask_pages = self.mask_pages.clone();
+        detached.comic_pages = self.comic_pages.clone();
+        detached.conceal_pages = self.conceal_pages.clone();
+        detached.erase_mask_generation = self.erase_mask_generation.clone();
+        detached.conceal_mask_generation = self.conceal_mask_generation.clone();
+        detached.final_ai_cache = self.final_ai_cache.clone();
+        detached.final_ai_failed = self.final_ai_failed.clone();
+        detached.erase_base_cache = self.erase_base_cache.clone();
+        detached.conceal_base_cache = self.conceal_base_cache.clone();
+        detached.ai_classify_cache = self.ai_classify_cache.clone();
+
+        detached
     }
 }
 

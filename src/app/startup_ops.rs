@@ -587,8 +587,7 @@ impl App {
                     Some(crate::bookmark_browser::PendingBookmarkOpen::Media(pending));
                 return false;
             };
-            active.bundle.bookmark_open_pending =
-                Some(crate::bookmark_browser::PendingBookmarkOpen::Media(pending));
+            active.bundle.adopt_bookmark_media_open_pending(pending);
             active.bundle.bookmark_view_state = Some(BookmarkViewState::Detached { target });
             crate::logger::log(format!(
                 "[bookmark-open] reuse detached media context path={}",

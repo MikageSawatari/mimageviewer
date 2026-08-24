@@ -12713,7 +12713,7 @@ fn closed_bookmark_summary_read_folds_all_terminal_values() {
         path: PathBuf::from(r"C:\Books\protected.pdf"),
     });
 
-    let summary = super::ClosedBookmarkSummary::read(&closed);
+    let summary = super::ClosedBookmarkSummary::read(ContextRef::at_rest(&closed));
 
     assert_eq!(summary.bookmark_target, Some(target.clone()));
     assert_eq!(summary.selected_media_path, Some(media_path));
@@ -12723,7 +12723,7 @@ fn closed_bookmark_summary_read_folds_all_terminal_values() {
     closed.selected = Some(0);
     closed.archive_source_override = None;
     closed.pdf_password_request = None;
-    let image_summary = super::ClosedBookmarkSummary::read(&closed);
+    let image_summary = super::ClosedBookmarkSummary::read(ContextRef::at_rest(&closed));
     assert_eq!(image_summary.bookmark_target, Some(target));
     assert_eq!(image_summary.selected_media_path, None);
     assert_eq!(image_summary.destination, Some(current_folder));
@@ -12747,7 +12747,7 @@ fn detached_bookmark_book_close_restores_main_grid_even_after_page_navigation() 
     });
     closed.current_folder = Some(PathBuf::from(r"C:\Books\another-volume.pdf"));
 
-    let summary = super::ClosedBookmarkSummary::read(&closed);
+    let summary = super::ClosedBookmarkSummary::read(ContextRef::at_rest(&closed));
     app.reconcile_closed_bookmark_detached_context(&summary);
 
     assert!(app.items_are_bookmark_view);
@@ -42933,7 +42933,7 @@ mod still_window_mode_key_tests {
                 load_seq: 0,
             },
         );
-        let plan = viewer_context_media_teardown_plan(&bundle);
+        let plan = viewer_context_media_teardown_plan(ContextRef::at_rest(&bundle));
         assert_eq!(plan.resume_updates[0].position, 55.0);
     }
 
@@ -43019,7 +43019,7 @@ mod still_window_mode_key_tests {
             },
         );
         let key = crate::adjustment_db::normalize_path(&path);
-        let plan = viewer_context_media_teardown_plan(&bundle);
+        let plan = viewer_context_media_teardown_plan(ContextRef::at_rest(&bundle));
         assert_eq!(plan.resume_updates.len(), 1);
         assert!(plan.resume_updates[0].at_eof);
         assert_eq!(plan.resume_updates[0].duration, 0.0);
@@ -48482,7 +48482,7 @@ mod still_window_mode_key_tests {
             .as_ref()
             .expect("same media should be activated");
         assert!(viewer_context_bundle_displays_media_path(
-            &active.bundle,
+            ContextRef::at_rest(&active.bundle),
             std::path::Path::new(r"C:\clips\same.mp4")
         ));
         let owner = app

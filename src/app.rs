@@ -130,7 +130,7 @@ pub(crate) use subfolder_expansion::{
 pub(crate) mod top_level_grid_view;
 mod viewer_context_registry;
 #[cfg(windows)]
-use viewer_context_registry::ViewerContextBundle;
+use viewer_context_registry::{ContextRef, ViewerContextBundle};
 #[cfg(windows)]
 mod viewer_session;
 mod vram_accounting;
@@ -712,7 +712,12 @@ impl DetachedImageWindowSnapshot {
     pub(crate) fn right_drag_context(&self) -> crate::ring_shortcut::RightDragContext {
         self.paused_bundle
             .as_deref()
-            .and_then(|bundle| bundle.fullscreen_idx.and_then(|idx| bundle.items.get(idx)))
+            .and_then(|bundle| {
+                let context = ContextRef::at_rest(bundle);
+                context
+                    .fullscreen_idx()
+                    .and_then(|idx| context.items().get(idx))
+            })
             .map(|item| match item {
                 GridItem::Video(_) | GridItem::Audio(_) => {
                     crate::ring_shortcut::RightDragContext::VideoFullscreen
@@ -725,7 +730,11 @@ impl DetachedImageWindowSnapshot {
     pub(crate) fn right_drag_viewer_identity(&self) -> Option<DetachedRightDragViewerIdentity> {
         self.paused_bundle
             .as_deref()
-            .map(|bundle| DetachedRightDragViewerIdentity::ItemsGeneration(bundle.items_generation))
+            .map(|bundle| {
+                DetachedRightDragViewerIdentity::ItemsGeneration(
+                    ContextRef::at_rest(bundle).items_generation(),
+                )
+            })
             .or_else(|| {
                 self.reopen_sync_stamp
                     .clone()
@@ -1146,14 +1155,15 @@ impl App {
             .iter()
             .find(|window| window.id == window_id)
             .and_then(|window| window.paused_bundle.as_deref())
-            .filter(|bundle| Self::viewer_context_bundle_contains_video(bundle))
+            .filter(|bundle| Self::viewer_context_contains_video(ContextRef::at_rest(bundle)))
             .map(|bundle| {
-                let video_cache_entries = bundle
-                    .fs_cache
+                let context = ContextRef::at_rest(bundle);
+                let video_cache_entries = context
+                    .fs_cache()
                     .values()
                     .filter(|entry| matches!(entry, FsCacheEntry::Video { .. }))
                     .count();
-                (bundle.fullscreen_idx, video_cache_entries)
+                (context.fullscreen_idx(), video_cache_entries)
             });
         let previous_state = self.detached_window_state(window_id);
         let default_linked = self.detached_window_runtime_default_linked();
@@ -2397,25 +2407,24 @@ struct ClosedBookmarkSummary {
 
 #[cfg(windows)]
 impl ClosedBookmarkSummary {
-    fn read(bundle: &ViewerContextBundle) -> Self {
-        let selected_media_path = bundle.selected.and_then(|idx| {
-            bundle.items.get(idx).and_then(|item| match item {
+    fn read(context: ContextRef<'_>) -> Self {
+        let selected_media_path = context.selected().and_then(|idx| {
+            context.items().get(idx).and_then(|item| match item {
                 GridItem::Video(path) | GridItem::Audio(path) => Some(path.clone()),
                 _ => None,
             })
         });
         Self {
-            bookmark_target: bundle
-                .bookmark_view_state
-                .as_ref()
+            bookmark_target: context
+                .bookmark_view_state()
                 .and_then(BookmarkViewState::target)
                 .cloned(),
             selected_media_path,
-            destination: bundle
-                .archive_source_override
-                .clone()
-                .or_else(|| bundle.current_folder.clone()),
-            had_pdf_password_request: bundle.pdf_password_request.is_some(),
+            destination: context
+                .archive_source_override()
+                .or_else(|| context.current_folder())
+                .map(Path::to_path_buf),
+            had_pdf_password_request: context.pdf_password_request().is_some(),
         }
     }
 }
@@ -8640,25 +8649,24 @@ fn migrate_key_map_for_rename<V>(
 /// fs_cache 内の VideoPlayer (再生中 handle)。含まれるだけのアイテムは対象外。
 #[cfg(windows)]
 fn viewer_bundle_references_removed(
-    bundle: &ViewerContextBundle,
+    context: ContextRef<'_>,
     matches_key: &dyn Fn(&str) -> bool,
 ) -> bool {
-    if bundle
-        .fullscreen_idx
-        .and_then(|idx| bundle.items.get(idx))
+    if context
+        .fullscreen_idx()
+        .and_then(|idx| context.items().get(idx))
         .and_then(|item| item.drag_source_path())
         .is_some_and(|p| matches_key(&crate::adjustment_db::normalize_path(p)))
     {
         return true;
     }
-    if bundle
-        .current_folder
-        .as_deref()
+    if context
+        .current_folder()
         .is_some_and(|folder| matches_key(&crate::adjustment_db::normalize_path(folder)))
     {
         return true;
     }
-    bundle.fs_cache.values().any(|entry| {
+    context.fs_cache().values().any(|entry| {
         matches!(entry, FsCacheEntry::Video { player, .. }
             if matches_key(&crate::adjustment_db::normalize_path(player.path())))
     })
@@ -8682,15 +8690,14 @@ struct ViewerContextMediaTeardownPlan {
 }
 
 #[cfg(windows)]
-fn viewer_context_bundle_is_music_consumer(bundle: &ViewerContextBundle) -> bool {
-    let Some(idx) = bundle.fullscreen_idx else {
+fn viewer_context_is_music_consumer(context: ContextRef<'_>) -> bool {
+    let Some(idx) = context.fullscreen_idx() else {
         return false;
     };
-    matches!(bundle.items.get(idx), Some(GridItem::Audio(_)))
-        || (bundle.video_audio_mode == Some(idx)
-            && !bundle
-                .video_audio_vst
-                .as_ref()
+    matches!(context.items().get(idx), Some(GridItem::Audio(_)))
+        || (context.video_audio_mode() == Some(idx)
+            && !context
+                .video_audio_vst()
                 .is_some_and(|state| state.fs_idx == idx))
 }
 
@@ -8713,11 +8720,9 @@ fn video_resume_position_for_save(
 }
 
 #[cfg(windows)]
-fn viewer_context_media_teardown_plan(
-    bundle: &ViewerContextBundle,
-) -> ViewerContextMediaTeardownPlan {
+fn viewer_context_media_teardown_plan(context: ContextRef<'_>) -> ViewerContextMediaTeardownPlan {
     let mut plan = ViewerContextMediaTeardownPlan {
-        music_consumer: viewer_context_bundle_is_music_consumer(bundle),
+        music_consumer: viewer_context_is_music_consumer(context),
         ..Default::default()
     };
     let mut push_media_path = |path: &std::path::Path| {
@@ -8729,20 +8734,22 @@ fn viewer_context_media_teardown_plan(
             plan.media_paths.push(path.to_path_buf());
         }
     };
-    if let Some(item) = bundle.fullscreen_idx.and_then(|idx| bundle.items.get(idx)) {
+    if let Some(item) = context
+        .fullscreen_idx()
+        .and_then(|idx| context.items().get(idx))
+    {
         match item {
             GridItem::Video(path) | GridItem::Audio(path) => push_media_path(path),
             _ => {}
         }
     }
-    for (idx, entry) in &bundle.fs_cache {
+    for (idx, entry) in context.fs_cache() {
         if let FsCacheEntry::Video { player, .. } = entry {
             let path = player.path().clone();
             push_media_path(&path);
-            let audio_mode_without_vst = bundle.video_audio_mode == Some(*idx)
-                && !bundle
-                    .video_audio_vst
-                    .as_ref()
+            let audio_mode_without_vst = context.video_audio_mode() == Some(*idx)
+                && !context
+                    .video_audio_vst()
                     .is_some_and(|state| state.fs_idx == *idx);
             plan.resume_updates.push(MediaResumeUpdate {
                 key: crate::adjustment_db::normalize_path(&path),
@@ -8758,17 +8765,17 @@ fn viewer_context_media_teardown_plan(
 
 #[cfg(windows)]
 fn sync_viewer_context_bundle_presenters_for_tray(
-    bundle: &ViewerContextBundle,
+    context: ContextRef<'_>,
     app_visible: bool,
 ) -> usize {
     let mut routed = 0;
-    let music_consumer = viewer_context_bundle_is_music_consumer(bundle);
-    for (idx, entry) in &bundle.fs_cache {
+    let music_consumer = viewer_context_is_music_consumer(context);
+    for (idx, entry) in context.fs_cache() {
         let FsCacheEntry::Video { player, .. } = entry else {
             continue;
         };
         let presenter_visible =
-            app_visible && bundle.fullscreen_idx == Some(*idx) && !music_consumer;
+            app_visible && context.fullscreen_idx() == Some(*idx) && !music_consumer;
         player.set_native_window_visible(presenter_visible);
         routed += 1;
     }
@@ -8795,13 +8802,13 @@ fn player_needs_resident_media_updates(
 
 #[cfg(windows)]
 fn viewer_context_bundle_needs_resident_media_updates(
-    bundle: &ViewerContextBundle,
+    context: ContextRef<'_>,
     continuous_mode: crate::video::VideoContinuousMode,
     continuous_last_eof: Option<(usize, u64)>,
 ) -> bool {
-    bundle
-        .fullscreen_idx
-        .and_then(|idx| bundle.fs_cache.get(&idx).map(|entry| (idx, entry)))
+    context
+        .fullscreen_idx()
+        .and_then(|idx| context.fs_cache().get(&idx).map(|entry| (idx, entry)))
         .is_some_and(|(idx, entry)| {
             matches!(entry, FsCacheEntry::Video { player, .. }
             if player_needs_resident_media_updates(
@@ -8830,8 +8837,8 @@ fn pause_current_media_player_for_remote_session(
 }
 
 #[cfg(windows)]
-fn pause_viewer_context_bundle_media_for_remote_session(bundle: &ViewerContextBundle) -> bool {
-    pause_current_media_player_for_remote_session(bundle.fullscreen_idx, &bundle.fs_cache)
+fn pause_viewer_context_bundle_media_for_remote_session(context: ContextRef<'_>) -> bool {
+    pause_current_media_player_for_remote_session(context.fullscreen_idx(), context.fs_cache())
 }
 
 #[cfg(windows)]
@@ -8871,29 +8878,27 @@ fn grid_item_media_path(item: &GridItem) -> Option<&std::path::Path> {
 
 #[cfg(windows)]
 fn viewer_context_bundle_displays_media_path(
-    bundle: &ViewerContextBundle,
+    context: ContextRef<'_>,
     target: &std::path::Path,
 ) -> bool {
-    let Some(idx) = bundle.fullscreen_idx else {
+    let Some(idx) = context.fullscreen_idx() else {
         return false;
     };
     let player_matches = matches!(
-        bundle.fs_cache.get(&idx),
+        context.fs_cache().get(&idx),
         Some(FsCacheEntry::Video { player, .. })
             if crate::folder_tree::path_eq(player.path(), target)
     );
-    let item_matches = bundle
-        .items
+    let item_matches = context
+        .items()
         .get(idx)
         .and_then(grid_item_media_path)
         .is_some_and(|path| crate::folder_tree::path_eq(path, target));
     let normalized_target = crate::adjustment_db::normalize_path(target);
     player_matches
         || item_matches
-        || bundle
-            .viewer_session
-            .last_sync_stamp
-            .as_ref()
+        || context
+            .viewer_session_last_sync_stamp()
             .is_some_and(|stamp| stamp.item_key == normalized_target)
 }
 
@@ -8930,10 +8935,9 @@ fn detached_window_references_removed(
             return true;
         }
     }
-    window
-        .paused_bundle
-        .as_deref()
-        .is_some_and(|bundle| viewer_bundle_references_removed(bundle, matches_key))
+    window.paused_bundle.as_deref().is_some_and(|bundle| {
+        viewer_bundle_references_removed(ContextRef::at_rest(bundle), matches_key)
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18775,10 +18779,14 @@ impl App {
             consume(self, idx);
         }
 
-        let active_has_pending = self
-            .active_detached_viewer_context
-            .as_ref()
-            .is_some_and(|active| active.bundle.vst3_deferred_media_open.is_some());
+        let active_has_pending =
+            self.active_detached_viewer_context
+                .as_ref()
+                .is_some_and(|active| {
+                    ContextRef::at_rest(&active.bundle)
+                        .vst3_deferred_media_open()
+                        .is_some()
+                });
         if active_has_pending {
             self.with_active_detached_viewer_context(|app| {
                 if let Some(idx) = app.take_mounted_deferred_vst3_media_open() {
@@ -18799,10 +18807,11 @@ impl App {
             .detached_image_windows
             .iter()
             .filter(|window| {
-                window
-                    .paused_bundle
-                    .as_deref()
-                    .is_some_and(|bundle| bundle.vst3_deferred_media_open.is_some())
+                window.paused_bundle.as_deref().is_some_and(|bundle| {
+                    ContextRef::at_rest(bundle)
+                        .vst3_deferred_media_open()
+                        .is_some()
+                })
             })
             .map(|window| window.id)
             .collect();
@@ -22365,7 +22374,7 @@ impl App {
         if let Some(path) = self
             .active_detached_viewer_context
             .as_ref()
-            .and_then(|active| active.bundle.pdf_password_request.as_ref())
+            .and_then(|active| ContextRef::at_rest(&active.bundle).pdf_password_request())
             .map(|request| request.path.clone())
         {
             return Some(path);
@@ -22384,7 +22393,11 @@ impl App {
             return self
                 .active_detached_viewer_context
                 .as_ref()
-                .is_some_and(|active| active.bundle.pdf_password_request.is_some());
+                .is_some_and(|active| {
+                    ContextRef::at_rest(&active.bundle)
+                        .pdf_password_request()
+                        .is_some()
+                });
         }
         #[cfg(not(windows))]
         false
@@ -22413,7 +22426,11 @@ impl App {
         if self
             .active_detached_viewer_context
             .as_ref()
-            .is_some_and(|active| active.bundle.pdf_password_request.is_some())
+            .is_some_and(|active| {
+                ContextRef::at_rest(&active.bundle)
+                    .pdf_password_request()
+                    .is_some()
+            })
         {
             return self
                 .with_active_detached_viewer_context(|app| {
@@ -22440,7 +22457,11 @@ impl App {
         if self
             .active_detached_viewer_context
             .as_ref()
-            .is_some_and(|active| active.bundle.pdf_password_request.is_some())
+            .is_some_and(|active| {
+                ContextRef::at_rest(&active.bundle)
+                    .pdf_password_request()
+                    .is_some()
+            })
         {
             return self
                 .with_active_detached_viewer_context(|app| {
@@ -26642,7 +26663,9 @@ impl App {
             let active_matches = self
                 .active_detached_viewer_context
                 .as_ref()
-                .is_some_and(|c| viewer_bundle_references_removed(&c.bundle, &matches_key));
+                .is_some_and(|c| {
+                    viewer_bundle_references_removed(ContextRef::at_rest(&c.bundle), &matches_key)
+                });
             if active_matches {
                 crate::logger::log(format!(
                     "[removed-path] close active detached reason={reason}"
@@ -27260,15 +27283,15 @@ impl App {
         #[cfg(windows)]
         {
             if let Some(active) = self.active_detached_viewer_context.as_mut()
-                && !active.bundle.items.is_empty()
-                && active.bundle.tag_prewarm_pending.is_none()
+                && !ContextRef::at_rest(&active.bundle).items().is_empty()
+                && !ContextRef::at_rest(&active.bundle).tag_prewarm_pending_present()
             {
                 active.bundle.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
             }
             for window in &mut self.detached_image_windows {
                 if let Some(bundle) = window.paused_bundle.as_mut()
-                    && !bundle.items.is_empty()
-                    && bundle.tag_prewarm_pending.is_none()
+                    && !ContextRef::at_rest(bundle).items().is_empty()
+                    && !ContextRef::at_rest(bundle).tag_prewarm_pending_present()
                 {
                     bundle.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
                 }
@@ -27292,7 +27315,8 @@ impl App {
                         .active_detached_viewer_context
                         .as_ref()
                         .is_some_and(|active| {
-                            active.bundle.items_generation != context.items_generation
+                            ContextRef::at_rest(&active.bundle).items_generation()
+                                != context.items_generation
                         })
             }
             #[cfg(windows)]
@@ -27305,7 +27329,8 @@ impl App {
                 .is_some_and(|window| {
                     window.id != window_id
                         || window.paused_bundle.as_ref().is_some_and(|bundle| {
-                            bundle.items_generation != context.items_generation
+                            ContextRef::at_rest(bundle).items_generation()
+                                != context.items_generation
                         })
                 }),
             #[cfg(not(windows))]
@@ -28022,9 +28047,10 @@ impl App {
                 .active_detached_viewer_context
                 .as_ref()
                 .is_some_and(|c| {
-                    viewer_bundle_references_removed(&c.bundle, &matches_key)
-                        || folder_refs(c.bundle.current_folder.as_deref())
-                        || items_ref(&c.bundle.items)
+                    let context = ContextRef::at_rest(&c.bundle);
+                    viewer_bundle_references_removed(context, &matches_key)
+                        || folder_refs(context.current_folder())
+                        || items_ref(context.items())
                 });
             if active_matches {
                 self.with_active_detached_viewer_context(|app| {
@@ -28036,9 +28062,10 @@ impl App {
                 .iter()
                 .filter(|window| {
                     window.paused_bundle.as_deref().is_some_and(|b| {
-                        viewer_bundle_references_removed(b, &matches_key)
-                            || folder_refs(b.current_folder.as_deref())
-                            || items_ref(&b.items)
+                        let context = ContextRef::at_rest(b);
+                        viewer_bundle_references_removed(context, &matches_key)
+                            || folder_refs(context.current_folder())
+                            || items_ref(context.items())
                     })
                 })
                 .map(|window| window.id)
@@ -37366,15 +37393,16 @@ impl App {
             return false;
         };
 
+        let active_context = ContextRef::at_rest(&active.bundle);
         self.log_detached_image_window_debug(format!(
             "pause_active_context_begin bundle_window_id={:?} bundle_fs_idx={:?} \
              bundle_independent={} bundle_pending={} bundle_cache={} \
              bundle_passive_windows={}",
-            active.bundle.viewer_session.detached_window_id,
-            active.bundle.fullscreen_idx,
-            active.bundle.viewer_session.independent_active,
-            active.bundle.fs_pending.len(),
-            active.bundle.fs_cache.len(),
+            active_context.viewer_session_detached_window_id(),
+            active_context.fullscreen_idx(),
+            active_context.viewer_session_independent_active(),
+            active_context.fs_pending_len(),
+            active_context.fs_cache().len(),
             self.detached_image_windows.len()
         ));
         self.swap_viewer_context_bundle(&mut active.bundle);
@@ -37419,12 +37447,14 @@ impl App {
         let snapshot_frozen_pages = snapshot.frozen_continuous_pages.len();
         let snapshot_image_dims = snapshot.image_dims;
         let mut paused_bundle = self.take_current_viewer_context_bundle();
-        let paused_pending_before = paused_bundle.fs_pending.len();
-        let paused_cache_before = paused_bundle.fs_cache.len();
-        let paused_fs_idx = paused_bundle.fullscreen_idx;
+        let paused_context = ContextRef::at_rest(&paused_bundle);
+        let paused_pending_before = paused_context.fs_pending_len();
+        let paused_cache_before = paused_context.fs_cache().len();
+        let paused_fs_idx = paused_context.fullscreen_idx();
         paused_bundle.pause_background_work_keep_current_frame();
-        let paused_pending_after = paused_bundle.fs_pending.len();
-        let paused_cache_after = paused_bundle.fs_cache.len();
+        let paused_context = ContextRef::at_rest(&paused_bundle);
+        let paused_pending_after = paused_context.fs_pending_len();
+        let paused_cache_after = paused_context.fs_cache().len();
         self.swap_viewer_context_bundle(&mut active.bundle);
         if keep_paused_bundle {
             snapshot.paused_bundle = Some(Box::new(paused_bundle));
@@ -37617,7 +37647,7 @@ impl App {
         let closed_context = self.take_current_viewer_context_bundle();
         self.swap_viewer_context_bundle(&mut active.bundle);
         self.finish_active_detached_session_close(reason);
-        let summary = ClosedBookmarkSummary::read(&closed_context);
+        let summary = ClosedBookmarkSummary::read(ContextRef::at_rest(&closed_context));
         drop(closed_context);
         // PDF password dialog の UI state 自体は App-global だが、request owner は bundle。
         // viewport 作成前の terminal close で owner を捨てた後に orphan dialog を残さない。
@@ -37671,10 +37701,12 @@ impl App {
         ));
         crate::dwm_transitions::disable_transitions_for_thread_windows();
 
-        let active_context_window_id = self
-            .active_detached_viewer_context
-            .as_ref()
-            .and_then(|active| active.bundle.viewer_session.detached_window_id);
+        let active_context_window_id =
+            self.active_detached_viewer_context
+                .as_ref()
+                .and_then(|active| {
+                    ContextRef::at_rest(&active.bundle).viewer_session_detached_window_id()
+                });
         if let Some(window_id) = active_context_window_id {
             ctx.send_viewport_cmd_to(
                 Self::detached_image_window_viewport_id(window_id),
@@ -38125,32 +38157,35 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn viewer_context_bundle_contains_video(bundle: &ViewerContextBundle) -> bool {
-        let active_item_is_video = bundle
-            .fullscreen_idx
-            .and_then(|idx| bundle.items.get(idx))
+    fn viewer_context_contains_video(context: ContextRef<'_>) -> bool {
+        let active_item_is_video = context
+            .fullscreen_idx()
+            .and_then(|idx| context.items().get(idx))
             .is_some_and(|item| matches!(item, GridItem::Video(_)));
-        let deferred_item_is_media = bundle.vst3_deferred_media_open.is_some_and(|idx| {
-            bundle.fullscreen_idx == Some(idx)
+        let deferred_item_is_media = context.vst3_deferred_media_open().is_some_and(|idx| {
+            context.fullscreen_idx() == Some(idx)
                 && matches!(
-                    bundle.items.get(idx),
+                    context.items().get(idx),
                     Some(GridItem::Video(_) | GridItem::Audio(_))
                 )
         });
         active_item_is_video
             || deferred_item_is_media
-            || bundle
-                .fs_cache
+            || context
+                .fs_cache()
                 .values()
                 .any(|entry| matches!(entry, FsCacheEntry::Video { .. }))
     }
 
     #[cfg(windows)]
-    fn viewer_context_bundle_detached_source(bundle: &ViewerContextBundle) -> DetachedSource {
-        match bundle.fullscreen_idx.and_then(|idx| bundle.items.get(idx)) {
+    fn viewer_context_bundle_detached_source(context: ContextRef<'_>) -> DetachedSource {
+        match context
+            .fullscreen_idx()
+            .and_then(|idx| context.items().get(idx))
+        {
             Some(GridItem::Audio(_)) => DetachedSource::Audio,
             Some(GridItem::Video(_)) => DetachedSource::Video,
-            _ if Self::viewer_context_bundle_contains_video(bundle) => DetachedSource::Video,
+            _ if Self::viewer_context_contains_video(context) => DetachedSource::Video,
             _ => DetachedSource::Book,
         }
     }
@@ -38158,20 +38193,17 @@ impl App {
     #[cfg(windows)]
     fn viewer_context_bundle_music_window_info(
         &self,
-        bundle: &ViewerContextBundle,
+        context: ContextRef<'_>,
     ) -> Option<ParkedLiveMusicWindowInfo> {
-        let idx = bundle.fullscreen_idx?;
-        let item = bundle.items.get(idx)?;
-        let video_audio_mode = bundle.video_audio_mode == Some(idx)
-            && !bundle
-                .video_audio_vst
-                .as_ref()
-                .is_some_and(|s| s.fs_idx == idx);
-        if !Self::viewer_context_bundle_is_music_consumer(bundle) {
+        let idx = context.fullscreen_idx()?;
+        let item = context.items().get(idx)?;
+        let video_audio_mode = context.video_audio_mode() == Some(idx)
+            && !context.video_audio_vst().is_some_and(|s| s.fs_idx == idx);
+        if !viewer_context_is_music_consumer(context) {
             return None;
         }
         let (position_secs, duration_secs, playing, title, volume, muted) =
-            match bundle.fs_cache.get(&idx) {
+            match context.fs_cache().get(&idx) {
                 Some(FsCacheEntry::Video { player, .. }) => (
                     player.position().max(0.0),
                     player.duration().max(0.0),
@@ -38186,7 +38218,11 @@ impl App {
                 ),
                 _ => (0.0, 0.0, false, item.name().to_string(), 1.0, false),
             };
-        let bookmark_secs: Vec<f64> = bundle.music_bookmarks.iter().map(|b| b.pts_secs).collect();
+        let bookmark_secs: Vec<f64> = context
+            .music_bookmarks()
+            .iter()
+            .map(|b| b.pts_secs)
+            .collect();
         Some(ParkedLiveMusicWindowInfo {
             fs_idx: idx,
             title,
@@ -38200,13 +38236,9 @@ impl App {
             loop_mode: self.settings.video_loop_mode,
             continuous_mode: self.video_continuous_mode,
             row_secs: self.music_timeline_row_secs,
-            normalize_ui_state: bundle
-                .normalize_ui_states
-                .get(&idx)
-                .copied()
-                .unwrap_or_default(),
+            normalize_ui_state: context.normalize_ui_state(idx).unwrap_or_default(),
             bookmark_secs,
-            bookmarks_loaded: bundle.music_bookmarks_loaded_for.is_some(),
+            bookmarks_loaded: context.music_bookmarks_loaded(),
         })
     }
 
@@ -38214,28 +38246,14 @@ impl App {
     pub(crate) fn active_detached_viewer_context_contains_video(&self) -> bool {
         self.active_detached_viewer_context
             .as_ref()
-            .is_some_and(|active| Self::viewer_context_bundle_contains_video(&active.bundle))
+            .is_some_and(|active| {
+                Self::viewer_context_contains_video(ContextRef::at_rest(&active.bundle))
+            })
     }
 
     #[cfg(windows)]
     pub(crate) fn current_viewer_context_contains_video(&self) -> bool {
-        let active_item_is_video = self
-            .fullscreen_idx
-            .and_then(|idx| self.items.get(idx))
-            .is_some_and(|item| matches!(item, GridItem::Video(_)));
-        let deferred_item_is_media = self.vst3_deferred_media_open.is_some_and(|idx| {
-            self.fullscreen_idx == Some(idx)
-                && matches!(
-                    self.items.get(idx),
-                    Some(GridItem::Video(_) | GridItem::Audio(_))
-                )
-        });
-        active_item_is_video
-            || deferred_item_is_media
-            || self
-                .fs_cache
-                .values()
-                .any(|entry| matches!(entry, FsCacheEntry::Video { .. }))
+        Self::viewer_context_contains_video(ContextRef::mounted(self))
     }
 
     #[cfg(windows)]
@@ -38257,7 +38275,9 @@ impl App {
             .iter()
             .find(|window| window.id == window_id)
             .and_then(|window| window.paused_bundle.as_deref())
-            .and_then(|bundle| self.viewer_context_bundle_music_window_info(bundle))
+            .and_then(|bundle| {
+                self.viewer_context_bundle_music_window_info(ContextRef::at_rest(bundle))
+            })
     }
 
     #[cfg(windows)]
@@ -38292,10 +38312,9 @@ impl App {
             .iter()
             .filter(|window| {
                 self.detached_window_state_is_parked_live(window.id)
-                    && window
-                        .paused_bundle
-                        .as_deref()
-                        .is_some_and(Self::viewer_context_bundle_contains_video)
+                    && window.paused_bundle.as_deref().is_some_and(|bundle| {
+                        Self::viewer_context_contains_video(ContextRef::at_rest(bundle))
+                    })
             })
             .map(|window| window.id)
             .collect()
@@ -38305,10 +38324,9 @@ impl App {
     pub(crate) fn parked_live_media_window_exists(&self) -> bool {
         self.detached_image_windows.iter().any(|window| {
             self.detached_window_state_is_parked_live(window.id)
-                && window
-                    .paused_bundle
-                    .as_deref()
-                    .is_some_and(Self::viewer_context_bundle_contains_video)
+                && window.paused_bundle.as_deref().is_some_and(|bundle| {
+                    Self::viewer_context_contains_video(ContextRef::at_rest(bundle))
+                })
         })
     }
 
@@ -38320,21 +38338,16 @@ impl App {
         self.active_detached_viewer_context
             .as_ref()
             .is_some_and(|active| {
-                self.viewer_context_bundle_music_window_info(&active.bundle)
+                self.viewer_context_bundle_music_window_info(ContextRef::at_rest(&active.bundle))
                     .is_some()
             })
             || self.detached_image_windows.iter().any(|window| {
                 self.detached_window_state_is_parked_live(window.id)
                     && window.paused_bundle.as_deref().is_some_and(|bundle| {
-                        self.viewer_context_bundle_music_window_info(bundle)
+                        self.viewer_context_bundle_music_window_info(ContextRef::at_rest(bundle))
                             .is_some()
                     })
             })
-    }
-
-    #[cfg(windows)]
-    fn viewer_context_bundle_is_music_consumer(bundle: &ViewerContextBundle) -> bool {
-        viewer_context_bundle_is_music_consumer(bundle)
     }
 
     /// App-global な tile companion が、閉じる ParkedLive 窓のものかを判定する。
@@ -38379,9 +38392,10 @@ impl App {
             .find(|window| window.id == window_id)
             .and_then(|window| window.paused_bundle.as_deref())
             .and_then(|bundle| {
-                bundle
-                    .fullscreen_idx
-                    .and_then(|idx| bundle.items.get(idx))
+                let context = ContextRef::at_rest(bundle);
+                context
+                    .fullscreen_idx()
+                    .and_then(|idx| context.items().get(idx))
                     .and_then(|item| match item {
                         GridItem::Video(path) => Some(path.as_path()),
                         _ => None,
@@ -38398,9 +38412,10 @@ impl App {
         let another_parked_video_exists = self.detached_image_windows.iter().any(|window| {
             window.id != window_id
                 && window.paused_bundle.as_deref().is_some_and(|bundle| {
-                    bundle
-                        .fullscreen_idx
-                        .and_then(|idx| bundle.items.get(idx))
+                    let context = ContextRef::at_rest(bundle);
+                    context
+                        .fullscreen_idx()
+                        .and_then(|idx| context.items().get(idx))
                         .is_some_and(|item| matches!(item, GridItem::Video(_)))
                 })
         });
@@ -38426,18 +38441,16 @@ impl App {
         }
         let closing_has_video = self.detached_image_windows.iter().any(|window| {
             window_ids.contains(&window.id)
-                && window
-                    .paused_bundle
-                    .as_deref()
-                    .is_some_and(Self::viewer_context_bundle_contains_video)
+                && window.paused_bundle.as_deref().is_some_and(|bundle| {
+                    Self::viewer_context_contains_video(ContextRef::at_rest(bundle))
+                })
         });
         closing_has_video
             && !self.detached_image_windows.iter().any(|window| {
                 !window_ids.contains(&window.id)
-                    && window
-                        .paused_bundle
-                        .as_deref()
-                        .is_some_and(Self::viewer_context_bundle_contains_video)
+                    && window.paused_bundle.as_deref().is_some_and(|bundle| {
+                        Self::viewer_context_contains_video(ContextRef::at_rest(bundle))
+                    })
             })
     }
 
@@ -38478,7 +38491,7 @@ impl App {
         for window in &mut self.detached_image_windows {
             if window_ids.contains(&window.id) {
                 if let Some(mut bundle) = window.paused_bundle.take() {
-                    let plan = viewer_context_media_teardown_plan(&bundle);
+                    let plan = viewer_context_media_teardown_plan(ContextRef::at_rest(&bundle));
                     bundle.normalize_ui_states.clear();
                     bundle.normalize_auto_scan_suppressed.clear();
                     drop(bundle);
@@ -38556,14 +38569,22 @@ impl App {
             .active_detached_viewer_context
             .as_ref()
             .map(|active| {
-                sync_viewer_context_bundle_presenters_for_tray(&active.bundle, app_visible)
+                sync_viewer_context_bundle_presenters_for_tray(
+                    ContextRef::at_rest(&active.bundle),
+                    app_visible,
+                )
             })
             .unwrap_or(0);
         let parked = self
             .detached_image_windows
             .iter()
             .filter_map(|window| window.paused_bundle.as_deref())
-            .map(|bundle| sync_viewer_context_bundle_presenters_for_tray(bundle, app_visible))
+            .map(|bundle| {
+                sync_viewer_context_bundle_presenters_for_tray(
+                    ContextRef::at_rest(bundle),
+                    app_visible,
+                )
+            })
             .sum::<usize>();
         routed += active + parked;
         if let Some(pending) = self.native_video_source_swap_pending.as_ref() {
@@ -38610,7 +38631,7 @@ impl App {
             .as_ref()
             .is_some_and(|active| {
                 viewer_context_bundle_needs_resident_media_updates(
-                    &active.bundle,
+                    ContextRef::at_rest(&active.bundle),
                     self.video_continuous_mode,
                     self.video_continuous_last_eof,
                 )
@@ -38621,7 +38642,7 @@ impl App {
             .filter_map(|window| window.paused_bundle.as_deref())
             .any(|bundle| {
                 viewer_context_bundle_needs_resident_media_updates(
-                    bundle,
+                    ContextRef::at_rest(bundle),
                     self.video_continuous_mode,
                     self.video_continuous_last_eof,
                 )
@@ -38663,7 +38684,7 @@ impl App {
                 .as_ref()
                 .map(|active| {
                     usize::from(pause_viewer_context_bundle_media_for_remote_session(
-                        &active.bundle,
+                        ContextRef::at_rest(&active.bundle),
                     ))
                 })
                 .unwrap_or(0);
@@ -38672,7 +38693,9 @@ impl App {
                 .iter()
                 .filter_map(|window| window.paused_bundle.as_deref())
                 .map(|bundle| {
-                    usize::from(pause_viewer_context_bundle_media_for_remote_session(bundle))
+                    usize::from(pause_viewer_context_bundle_media_for_remote_session(
+                        ContextRef::at_rest(bundle),
+                    ))
                 })
                 .sum::<usize>();
         }
@@ -38689,23 +38712,14 @@ impl App {
         #[cfg(windows)]
         {
             if let Some(active) = self.active_detached_viewer_context.as_mut() {
-                animations_paused += active
-                    .bundle
-                    .fs_cache
-                    .values_mut()
-                    .map(|entry| usize::from(entry.pause_animation()))
-                    .sum::<usize>();
+                animations_paused += active.bundle.pause_animations_for_remote_session();
             }
             for bundle in self
                 .detached_image_windows
                 .iter_mut()
                 .filter_map(|window| window.paused_bundle.as_deref_mut())
             {
-                animations_paused += bundle
-                    .fs_cache
-                    .values_mut()
-                    .map(|entry| usize::from(entry.pause_animation()))
-                    .sum::<usize>();
+                animations_paused += bundle.pause_animations_for_remote_session();
             }
 
             // EOF から既に始まった source swap も既存の owner-scoped cancel 入口で止める。
@@ -38742,13 +38756,15 @@ impl App {
     pub(crate) fn save_detached_video_resume_positions_for_exit(&mut self) {
         let mut plans = Vec::new();
         if let Some(active) = self.active_detached_viewer_context.as_ref() {
-            plans.push(viewer_context_media_teardown_plan(&active.bundle));
+            plans.push(viewer_context_media_teardown_plan(ContextRef::at_rest(
+                &active.bundle,
+            )));
         }
         plans.extend(
             self.detached_image_windows
                 .iter()
                 .filter_map(|window| window.paused_bundle.as_deref())
-                .map(viewer_context_media_teardown_plan),
+                .map(|bundle| viewer_context_media_teardown_plan(ContextRef::at_rest(bundle))),
         );
         self.save_viewer_context_media_teardown_resumes(&plans);
     }
@@ -38840,14 +38856,15 @@ impl App {
             let Some(mut bundle) = self.detached_image_windows[pos].paused_bundle.take() else {
                 continue;
             };
-            if !Self::viewer_context_bundle_contains_video(&bundle) {
+            if !Self::viewer_context_contains_video(ContextRef::at_rest(&bundle)) {
                 self.detached_image_windows[pos].paused_bundle = Some(bundle);
                 continue;
             }
             if Self::detached_image_window_debug_enabled() && self.frame_counter % 600 == 0 {
                 self.log_detached_image_window_debug(format!(
                     "parked_live_poll_begin frame={} id={id} bundle_fs_idx={:?}",
-                    self.frame_counter, bundle.fullscreen_idx
+                    self.frame_counter,
+                    ContextRef::at_rest(&bundle).fullscreen_idx()
                 ));
             }
             self.swap_viewer_context_bundle(&mut bundle);
@@ -38899,15 +38916,16 @@ impl App {
             .iter()
             .filter_map(|window| {
                 let bundle = window.paused_bundle.as_deref()?;
-                if !Self::viewer_context_bundle_contains_video(bundle) {
+                if !Self::viewer_context_contains_video(ContextRef::at_rest(bundle)) {
                     return None;
                 }
                 let state = self.detached_window_state(window.id);
                 if state == Some(DetachedWindowState::ParkedLive) {
                     return None;
                 }
-                let video_cache_entries = bundle
-                    .fs_cache
+                let context = ContextRef::at_rest(bundle);
+                let video_cache_entries = context
+                    .fs_cache()
                     .values()
                     .filter(|entry| matches!(entry, FsCacheEntry::Video { .. }))
                     .count();
@@ -38916,7 +38934,7 @@ impl App {
                      video_cache_entries={video_cache_entries}",
                     window.id,
                     self.detached_window_hwnd_raw_for_window_id(window.id),
-                    bundle.fullscreen_idx
+                    context.fullscreen_idx()
                 ))
             })
             .collect::<Vec<_>>();
@@ -39129,7 +39147,7 @@ impl App {
         if !self.detached_image_windows[pos]
             .paused_bundle
             .as_deref()
-            .is_some_and(Self::viewer_context_bundle_contains_video)
+            .is_some_and(|bundle| Self::viewer_context_contains_video(ContextRef::at_rest(bundle)))
         {
             self.log_detached_image_window_debug(format!(
                 "parked_live_activate_aborted id={id} reason=no_video_bundle"
@@ -39174,7 +39192,7 @@ impl App {
             self.detached_image_windows.insert(pos, snapshot);
             return false;
         };
-        if !Self::viewer_context_bundle_contains_video(&paused_bundle) {
+        if !Self::viewer_context_contains_video(ContextRef::at_rest(&paused_bundle)) {
             self.log_detached_image_window_debug(format!(
                 "parked_live_activate_aborted id={id} reason=bundle_not_video_after_remove"
             ));
@@ -39188,9 +39206,7 @@ impl App {
             return false;
         }
 
-        paused_bundle
-            .viewer_session
-            .activate_independent_detached(id);
+        paused_bundle.activate_independent_detached_session(id);
         paused_bundle.fs_open_intent_from_grid = false;
         paused_bundle.pending_auto_fs_open = false;
         paused_bundle.pending_return_to_parent = false;
@@ -39209,7 +39225,8 @@ impl App {
         );
         self.adopt_active_detached_viewport_runtime_from_passive("resume_parked_live_media");
         self.last_active_detached_window_id = Some(id);
-        let source = Self::viewer_context_bundle_detached_source(&paused_bundle);
+        let source =
+            Self::viewer_context_bundle_detached_source(ContextRef::at_rest(&paused_bundle));
         self.begin_active_detached_session(id, source);
         self.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
             bundle: *paused_bundle,
@@ -40056,16 +40073,17 @@ impl App {
         self.clear_fullscreen_feedback_for_viewer_switch();
 
         if let Some(mut paused_bundle) = snapshot.paused_bundle.take() {
+            let paused_context = ContextRef::at_rest(&paused_bundle);
             self.log_detached_image_window_debug(format!(
                 "passive_activate_resume_paused_bundle id={} bundle_window_id={:?} \
                  bundle_fs_idx={:?} bundle_independent={} \
                  bundle_pending={} bundle_cache={} snapshot_title={:?}",
                 snapshot.id,
-                paused_bundle.viewer_session.detached_window_id,
-                paused_bundle.fullscreen_idx,
-                paused_bundle.viewer_session.independent_active,
-                paused_bundle.fs_pending.len(),
-                paused_bundle.fs_cache.len(),
+                paused_context.viewer_session_detached_window_id(),
+                paused_context.fullscreen_idx(),
+                paused_context.viewer_session_independent_active(),
+                paused_context.fs_pending_len(),
+                paused_context.fs_cache().len(),
                 snapshot.title
             ));
             self.ensure_detached_window_runtime_placement(snapshot.id, "resume_paused_bundle");
@@ -40083,16 +40101,15 @@ impl App {
                 self.detached_image_windows.insert(pos, snapshot);
                 return false;
             }
-            paused_bundle
-                .viewer_session
-                .activate_independent_detached(snapshot.id);
+            paused_bundle.activate_independent_detached_session(snapshot.id);
             paused_bundle.fs_open_intent_from_grid = false;
             paused_bundle.pdf_prefetch_grace_until = None;
             self.adopt_active_detached_viewport_runtime_from_passive("resume_paused_bundle");
             // keep-alive: passive→active 再開 = セッション再開 (§3.7 set)。open_fullscreen を
             // 通らない経路なのでここで明示的に session を立てる。
             self.last_active_detached_window_id = Some(snapshot.id);
-            let source = Self::viewer_context_bundle_detached_source(&paused_bundle);
+            let source =
+                Self::viewer_context_bundle_detached_source(ContextRef::at_rest(&paused_bundle));
             self.begin_active_detached_session(snapshot.id, source);
             self.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
                 bundle: *paused_bundle,
@@ -40495,7 +40512,7 @@ impl App {
         if should_drop {
             let closed = if detached_viewport_finalized {
                 self.active_detached_viewer_context.take().map(|active| {
-                    let summary = ClosedBookmarkSummary::read(&active.bundle);
+                    let summary = ClosedBookmarkSummary::read(ContextRef::at_rest(&active.bundle));
                     drop(active.bundle);
                     summary
                 })
@@ -40881,15 +40898,13 @@ impl App {
         } else {
             Box::new(self.take_current_viewer_context_bundle())
         };
-        if !Self::viewer_context_bundle_contains_video(&parked_bundle) {
+        if !Self::viewer_context_contains_video(ContextRef::at_rest(&parked_bundle)) {
             if !preserve_main_context {
                 self.swap_viewer_context_bundle(&mut parked_bundle);
             }
             return false;
         }
-        parked_bundle
-            .viewer_session
-            .activate_independent_detached(snapshot_id);
+        parked_bundle.activate_independent_detached_session(snapshot_id);
         snapshot.paused_bundle = Some(parked_bundle);
         self.detached_image_windows.push(snapshot);
         // mounted/active owner の pending を ParkedLive window へ焼き直す。別 parked window の
@@ -40908,51 +40923,6 @@ impl App {
             self.detached_image_windows.len()
         ));
         true
-    }
-
-    /// 完全な物理一覧を既に materialize 済みの main context から、auto-fullscreen の
-    /// detached read model を作る。通常の grid leaf open は descriptor 経路で非同期列挙するため、
-    /// この snapshot 経路は folder / ZIP / PDF の列挙完了後に限る。
-    #[cfg(windows)]
-    fn split_materialized_physical_context_for_independent_still_open(
-        &mut self,
-    ) -> Box<ViewerContextBundle> {
-        let mut detached = self.split_current_context_preserving_main_grid();
-
-        detached.view_trim_mode = self.view_trim_mode;
-        detached.view_trim_apply_mode = self.view_trim_apply_mode;
-        detached.view_trim_page_apply_root_idx = self.view_trim_page_apply_root_idx;
-        detached.view_trim_page_spread_separate = self.view_trim_page_spread_separate;
-        detached.view_trim_book_settings = self.view_trim_book_settings.clone();
-        detached.view_trim_page_overrides = self.view_trim_page_overrides.clone();
-        detached.spread_mode = self.spread_mode;
-        detached.spread_shift_anchor_idx = self.spread_shift_anchor_idx;
-        detached.reading_flow = self.reading_flow;
-        detached.reading_direction = self.reading_direction;
-
-        detached.thumb_pixels = self.thumb_pixels.clone();
-        detached.thumb_edit_preview_layers = self.thumb_edit_preview_layers.clone();
-        detached.thumb_edit_preview_keys = self.thumb_edit_preview_keys.clone();
-        detached.thumb_adjust_tex = self.thumb_adjust_tex.clone();
-        detached.adjustment_page_params = self.adjustment_page_params.clone();
-        detached.local_adjust_page_layers = self.local_adjust_page_layers.clone();
-        detached.local_adjust_pages = self.local_adjust_pages.clone();
-        detached.local_adjust_selected_layers = self.local_adjust_selected_layers.clone();
-        detached.local_adjust_generation = self.local_adjust_generation.clone();
-        detached.export_crop_page_settings = self.export_crop_page_settings.clone();
-        detached.export_crop_pages = self.export_crop_pages.clone();
-        detached.mask_pages = self.mask_pages.clone();
-        detached.comic_pages = self.comic_pages.clone();
-        detached.conceal_pages = self.conceal_pages.clone();
-        detached.erase_mask_generation = self.erase_mask_generation.clone();
-        detached.conceal_mask_generation = self.conceal_mask_generation.clone();
-        detached.final_ai_cache = self.final_ai_cache.clone();
-        detached.final_ai_failed = self.final_ai_failed.clone();
-        detached.erase_base_cache = self.erase_base_cache.clone();
-        detached.conceal_base_cache = self.conceal_base_cache.clone();
-        detached.ai_classify_cache = self.ai_classify_cache.clone();
-
-        detached
     }
 
     #[cfg(windows)]
@@ -41014,8 +40984,8 @@ impl App {
         bundle.set_items_generation(items_generation);
         bundle.address = physical_context.display().to_string();
         bundle.current_folder = Some(physical_context.clone());
-        bundle.visible_indices = bundle
-            .items
+        bundle.visible_indices = ContextRef::at_rest(&bundle)
+            .items()
             .iter()
             .enumerate()
             .filter_map(|(item_idx, item)| {
@@ -41024,7 +40994,7 @@ impl App {
             .collect();
         bundle.top_level_grid_view = top_level_grid_view::TopLevelGridView::default();
         bundle.details_thumb_suppression_applied = false;
-        bundle.details_order.clear();
+        bundle.clear_details_order();
         bundle.cached_nav_indices = None;
         bundle.cached_fs_seek_info = None;
         bundle.selected = Some(idx);
@@ -41051,11 +41021,12 @@ impl App {
         let Some(mut active) = self.active_detached_viewer_context.take() else {
             return false;
         };
-        if !Self::viewer_context_bundle_contains_video(&active.bundle) {
+        if !Self::viewer_context_contains_video(ContextRef::at_rest(&active.bundle)) {
             self.active_detached_viewer_context = Some(active);
             return false;
         }
-        let parked_window_id = active.bundle.viewer_session.detached_window_id;
+        let parked_window_id =
+            ContextRef::at_rest(&active.bundle).viewer_session_detached_window_id();
         self.swap_viewer_context_bundle(&mut active.bundle);
         let parked = self.park_current_viewer_context_as_live_media_inner(ctx, reason, false);
         self.swap_viewer_context_bundle(&mut active.bundle);
@@ -41239,9 +41210,7 @@ impl App {
         bundle.selected = Some(idx);
         bundle.fullscreen_idx = Some(idx);
         bundle.native_video_in_window_active = false;
-        bundle
-            .viewer_session
-            .activate_independent_detached(window_id);
+        bundle.activate_independent_detached_session(window_id);
         bundle.viewer_session.last_sync_stamp = None;
         bundle.fs_open_intent_from_grid = false;
         bundle.pending_auto_fs_open = false;
@@ -42460,22 +42429,26 @@ impl App {
         let Some(active) = self.active_detached_viewer_context.as_ref() else {
             return false;
         };
-        if !viewer_context_bundle_displays_media_path(&active.bundle, target_path) {
+        if !viewer_context_bundle_displays_media_path(
+            ContextRef::at_rest(&active.bundle),
+            target_path,
+        ) {
             return false;
         }
-        let Some(idx) = active.bundle.fullscreen_idx else {
+        let context = ContextRef::at_rest(&active.bundle);
+        let Some(idx) = context.fullscreen_idx() else {
             return false;
         };
-        let window_id = active.bundle.viewer_session.detached_window_id.or_else(|| {
+        let window_id = context.viewer_session_detached_window_id().or_else(|| {
             self.active_detached_session
                 .map(|session| session.window_id)
         });
-        let presenter_player = match active.bundle.fs_cache.get(&idx) {
+        let presenter_player = match context.fs_cache().get(&idx) {
             Some(FsCacheEntry::Video { player, .. }) => Some(player.as_ref()),
             _ => None,
         };
-        let presenter_target = matches!(active.bundle.items.get(idx), Some(GridItem::Video(_)))
-            && !Self::viewer_context_bundle_is_music_consumer(&active.bundle)
+        let presenter_target = matches!(context.items().get(idx), Some(GridItem::Video(_)))
+            && !viewer_context_is_music_consumer(context)
             && presenter_player.is_some();
         if let Some(player) = presenter_player.filter(|_| presenter_target) {
             player.request_presenter_raise();
@@ -42546,7 +42519,10 @@ impl App {
         let parked_id = self.detached_image_windows.iter().find_map(|window| {
             (self.detached_window_state_is_parked_live(window.id)
                 && window.paused_bundle.as_deref().is_some_and(|bundle| {
-                    viewer_context_bundle_displays_media_path(bundle, &target_path)
+                    viewer_context_bundle_displays_media_path(
+                        ContextRef::at_rest(bundle),
+                        &target_path,
+                    )
                 }))
             .then_some(window.id)
         });
@@ -58467,11 +58443,8 @@ impl App {
         #[cfg(windows)]
         {
             if let Some(active) = self.active_detached_viewer_context.as_ref() {
-                return active
-                    .bundle
-                    .final_ai_pending
-                    .get(&key)
-                    .is_some_and(|pending| pending.job_id == job_id);
+                return ContextRef::at_rest(&active.bundle).final_ai_pending_job_id(&key)
+                    == Some(job_id);
             }
         }
         let _ = (key, job_id);
