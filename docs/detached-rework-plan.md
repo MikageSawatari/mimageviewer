@@ -476,6 +476,26 @@ op の内部で binding を早く公開して正常終了までに戻す実装�
 
 次は **②-a** (終端経路を「所有値の digest」へ)。保管は変えないので挙動不変。
 
+### R2e の作業環境 (新しいセッションが最初に読むもの)
+
+- **worktree**: `C:\home\mimageviewer-r2e` / branch `r2e-ownership`。
+  master の作業ツリー (`C:\home\mimageviewer`) ではない。
+- **master へのマージは全ステージ完了後にまとめて行う** (利用者判断 2026-08-24)。
+  途中でマージしない。**master 側では別のバグ修正が進行中なので、時期は利用者が決める**
+  (こちらから merge を提案しない)。差分は docs + `src/` のみで、他レーンとは衝突していない。
+- **vendor は実体コピー済み** (junction 禁止。`ffmpeg` / `pdfium` / `ort` / `susie-worker` /
+  `vst3-host` / `models` / `twemoji`)。`eframe` / `egui-wgpu` は git 追跡下なので触らない。
+  worktree を作り直す場合は
+  [briefs/session-lane-b-video-strip.md](briefs/session-lane-b-video-strip.md) §5 の robocopy 手順。
+- **`cargo test` は PowerShell から実行する。** bash 経由の `PATH` 追加では
+  FFmpeg DLL が解決されず `STATUS_DLL_NOT_FOUND` になる。DLL は
+  `target\debug` と `target\debug\deps` へコピー済み (worktree を作り直したら再度必要)。
+- **Git for Windows の `grep.exe` は Codex の制限付きトークン下で
+  `CreateFileMapping ... Win32 error 5` で落ちる。** Codex には `rg` / `Select-String` を使わせる。
+- **実機確認バイナリ**: `.\scripts\build-dev.ps1` → `target\dev-runtime\mimageviewer-core.exe`。
+  引数なしでは実利用中の `%APPDATA%\mimageviewer` を使うので、**エージェントは起動しない**。
+- **Codex は 1 worktree に 1 本だけ**走らせる (同時実行すると変更が混ざる)。
+
 **§1.99 / §1.100 は R2e の完成に依存しない** (ClaudeCode / Codex 双方で確認)。
 
 - §1.99 が必要とするのは既存 context の所有者ではなく「この要求のために新しい detached context を
