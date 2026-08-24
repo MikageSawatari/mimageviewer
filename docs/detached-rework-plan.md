@@ -516,8 +516,29 @@ teardown は窓ごとに plan → normalize clear → drop してから App-glob
 2 つ目は、§3.3 の「判定をループより前から動かすな」を**既存テストが既に守っていた**ことの
 確認でもある。
 
-次は **②-b** (型の移設。`ViewerContextBundle` + `Drop` + `empty` + `swap` + fork destructure を
-registry モジュールへ。フィールドは一時的に `pub(in crate::app)` のまま)。挙動不変。
+**ステージ②-b も完了** (2026-08-24、`fd121be3`、指示書
+[detached-rework-stage-r2e-2b.md](detached-rework-stage-r2e-2b.md))。
+`ViewerContextBundle` (225 フィールド) / `Drop` / `impl` 3 メソッド /
+`swap_viewer_context_bundle` / `split_current_context_preserving_main_grid` の 5 ブロック
+1602 行が `src/app/viewer_context_registry.rs` へ移った。**純粋な移設**で、5 ブロックの
+SHA-256 が可視性接頭辞を除いて一致することを実装側が確認している。
+lib テスト 6251 件緑 (件数不変)、`src/app/tests.rs` は無変更。
+
+- **実効可視性は変わっていない。** 移設前は app.rs 内の private = `app` とその子孫から見える。
+  移設後は `pub(in crate::app)` = 同じ範囲。**広げていない**ことを検収で確認済み
+  (移設領域に `pub` / `pub(crate)` が 1 つも無い)。
+- 素直に移すと壊れる 2 点を指示書で先に潰した:
+  **①`impl App` のメソッドの private は「`impl` を書いたモジュール」の private** なので、
+  移設した 2 プリミティブには `pub(in crate::app)` が要る。
+  **②`#![allow(dead_code)]` はファイル全体に効く**ので、そのままだと production 型にもかかり
+  未使用フィールドの検出が止まる。stage ① の非テスト 13 項目への個別付与に置き換えた
+  (②-d で registry が本番に繋がったら全部外す)。
+- ②-e で弾けるようになるのはこの移設の結果である。今はまだフィールドが
+  `pub(in crate::app)` なので**何も弾けていない**。
+
+次は **②-c** (accessor 移行 + 監査ツール導入)。外部フィールド読み ~26 種を `ContextRef`
+accessor へ寄せ、`tools/viewer_context_audit` を足して **A2 / A3 / A7 だけ**有効化する。
+A1 / A5 は保管フィールドが残っている間は必ず落ちるので②-d。挙動不変。
 
 ### R2e の作業環境 (新しいセッションが最初に読むもの)
 
