@@ -759,6 +759,12 @@ presenter は worker が作った RGBA だけを texture 化し、presenter thre
 presenter も旧 texture を描き続けるため、解析中の blank frame / upload は生じない。
 波形 texture が無い終端状態では、音声なしと表示失敗をそれぞれ日本語の短い案内として帯内に描く。
 解析中は案内を出さない。
+サムネイルは worker の settled outcome と最新要求の index-level failure から、各セルを
+`pending / ready / failed` の 3 値へ純粋に決める。`pending` だけを空の枠として残し、`failed` は
+セル内の短い日本語案内で区別する。軸解決後に補助 decoder を開けない terminal state はセルごとに
+繰り返さず、列全体を 1 個の案内へ置き換える。この判定は `KeyframeIndex / TimeGrid` を区別しない。
+軸解決そのものの失敗、worker thread spawn failure、cancel は既存の open / close lifecycle が扱い、
+presenter payload の案内状態にはしない。
 サムネイルでは等幅セルの連続する小数位置、波形では 1 幅 60 秒の時間線形軸を使い、どちらも
 固定中央線を描く。サムネイルの整数位置 `i` はセル `i` の左端であり、セルは `[i, i+1)` を
 占める。したがって中央線のセル内位置は `cell(i)` から `cell(i+1)` までの進み具合を表す。

@@ -507,7 +507,6 @@ pub(crate) enum SeekStripSurface {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SeekStripSurfaceIntent {
-    ToggleStrip { may_open: bool },
     OpenStrip { may_open: bool },
     CloseStrip(SeekStripCloseCause),
     ToggleTile,
@@ -519,11 +518,6 @@ pub(crate) fn decide_seek_strip_surface(
     intent: SeekStripSurfaceIntent,
 ) -> SeekStripSurface {
     match intent {
-        SeekStripSurfaceIntent::ToggleStrip { may_open } => match current {
-            SeekStripSurface::Strip => SeekStripSurface::Neither,
-            SeekStripSurface::Neither if may_open => SeekStripSurface::Strip,
-            other => other,
-        },
         SeekStripSurfaceIntent::OpenStrip { may_open } => match current {
             SeekStripSurface::Neither if may_open => SeekStripSurface::Strip,
             other => other,
@@ -1178,7 +1172,7 @@ mod tests {
         assert_eq!(
             decide_seek_strip_surface(
                 SeekStripSurface::Tile,
-                SeekStripSurfaceIntent::ToggleStrip { may_open: true },
+                SeekStripSurfaceIntent::OpenStrip { may_open: true },
             ),
             SeekStripSurface::Tile
         );

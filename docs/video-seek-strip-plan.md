@@ -8,11 +8,13 @@ backlog [§1.102](next-release-backlog.md) (YouTube 型のサムネイル列) �
 
 作業ブランチ `video-strip` (worktree `C:\home\mimageviewer-video-strip`)。
 
-実装状況 (2026-08-24): Increment 1 (軸・窓・gesture の純ロジック) / Increment 2 (サムネイル抽出
+実装状況 (2026-08-25): Increment 1 (軸・窓・gesture の純ロジック) / Increment 2 (サムネイル抽出
 worker) / Increment 3 (App owner・設定・描画・入力・HUD region・tile と hover preview の排他、
 **実機確認済み**) / Increment 4 (波形モード・モード切替) / Increment 5 (3 値の表示状態、
 フィルムアイコン、再生位置追従、180 秒波形ラスタのスクロール) / Increment 6 (フィルムボタンの
-1 クリック巡回、ストリップ内切替の撤去、左右パネルのホバー帯境界修正) まで実装。
+1 クリック巡回、ストリップ内切替の撤去、左右パネルのホバー帯境界修正) / Increment 10
+(cursor とセルの左端基準を実機確認) / Increment 11 (pending / ready / failed のセル表示と、
+補助 decoder を開けない場合の strip 全体 notice) まで実装。
 残りは §9 の未確定項目の実機調整と、MPEG-TS など `TimeGrid` 経路の実素材確認。
 
 確定した既定値: 開閉は `Shift+S` (`V` はレーン C の動画パノラマ用に空けた)、最小間隔 2.0 秒、
@@ -71,6 +73,13 @@ D15 は「離す前の再生状態を保つ」という当初の既定を置き�
 D3 の帰結として、横軸は時間線形ではない。波形モード (時間線形) とは軸の意味が変わる。
 **モードを切り替えると同じ x が別の時刻を指す**ことは承知のうえで採用した。両モードとも
 中央 `|` の時刻は一致するので、切替時に中央は動かない。
+
+**D17 (Increment 11、2026-08-25)**: サムネイルセルの表示状態を `pending / ready / failed` の
+3 値で扱う。`pending` は従来どおり空の枠、セル単位の terminal failure は枠内に
+「表示できません」と出す。軸解決後に補助 decoder を開けず列全体が使えない場合だけ、セル列を
+「サムネイルを表示できません」という 1 個の notice に置き換える。`ThreadSpawnFailed` は軸失敗、
+`Cancelled` は close / 切替 lifecycle として既存経路で処理し、画面へ重ねて出さない。
+この判定は軸種別に依存しないため、未実機確認の `TimeGrid` も同じ failure surface を通る。
 
 ## 3. 実現手段 (調査で確定した前提)
 
@@ -381,6 +390,9 @@ enum SeekRowGesture {
 - 180 秒 span の要求境界、15 秒 margin、replacement 待ちのヒステリシス。
 - 保持中の波形 texture から 60 秒の可視部分を切り出す UV / 部分 gap の算術。
 - 再生位置追従の 100ms rate limit、微小差の抑制、ドラッグ中の detach。
+- サムネイルセルの `pending / ready / failed` 判定と、最新要求の index-level failure の反映。
+- 軸解決後の `DecoderUnavailable` だけが strip 全体 notice へ置き換わり、軸失敗 / thread spawn
+  failure / cancel は置き換えないこと。
 
 ### ワーカー
 

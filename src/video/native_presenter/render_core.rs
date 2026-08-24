@@ -212,56 +212,89 @@ fn draw_native_seek_strip(
             let marker_x = local_rect.center().x;
             match strip.center {
                 crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index } => {
-                    let half_cells = local_rect.width() / (2.0 * SEEK_STRIP_CELL_WIDTH);
-                    // D16: cell i spans the continuous index interval [i, i + 1), so its
-                    // left edge—not its center—is aligned with keyframe i.
-                    let first_index = (center_index - f64::from(half_cells)).floor() as isize;
-                    let last_index = ((center_index + f64::from(half_cells)).ceil() - 1.0) as isize;
-                    for raw_index in first_index..=last_index {
-                        let Some(cell_left_x) = crate::video::seek_strip::x_for_center_index(
-                            raw_index as f64,
-                            center_index,
-                            marker_x,
-                            SEEK_STRIP_CELL_WIDTH,
-                        ) else {
-                            continue;
-                        };
-                        let cell_rect = egui::Rect::from_center_size(
-                            egui::pos2(
-                                cell_left_x + SEEK_STRIP_CELL_WIDTH * 0.5,
-                                local_rect.center().y,
-                            ),
-                            egui::vec2(SEEK_STRIP_CELL_WIDTH - 4.0, SEEK_STRIP_HEIGHT - 10.0),
+                    if let Some(notice) = strip.thumbnail_notice {
+                        painter.text(
+                            egui::pos2((marker_x + local_rect.max.x) * 0.5, local_rect.center().y),
+                            egui::Align2::CENTER_CENTER,
+                            notice.label(),
+                            crate::ui_fonts::hud_text_font(14.0),
+                            egui::Color32::from_gray(210),
                         );
-                        // 動画の範囲外には枠も背景も描かない。空のセルを枠付きで置くと、
-                        // 「まだ出ていないサムネイル」と区別が付かず、黒い絵があるように見える
-                        // (実機フィードバック 2026-08-24)。軸の内側で未取得のセルだけ枠を出す。
-                        if raw_index < 0 || (raw_index as usize) >= strip.cell_count {
-                            continue;
-                        }
-                        let index = raw_index as usize;
-                        painter.rect_filled(cell_rect, 3.0, egui::Color32::from_gray(24));
-                        if let Some(texture_id) = texture_ids.get(&index).copied()
-                            && let Some(cell) = strip.cells.iter().find(|cell| cell.index == index)
-                            && let Some(thumbnail) = cell.thumbnail.as_ref()
-                        {
-                            let fitted = fit_rect_in_rect(
-                                egui::vec2(thumbnail.width as f32, thumbnail.height as f32),
-                                cell_rect.shrink(2.0),
+                    } else {
+                        let half_cells = local_rect.width() / (2.0 * SEEK_STRIP_CELL_WIDTH);
+                        // D16: cell i spans the continuous index interval [i, i + 1), so its
+                        // left edge—not its center—is aligned with keyframe i.
+                        let first_index = (center_index - f64::from(half_cells)).floor() as isize;
+                        let last_index =
+                            ((center_index + f64::from(half_cells)).ceil() - 1.0) as isize;
+                        for raw_index in first_index..=last_index {
+                            let Some(cell_left_x) = crate::video::seek_strip::x_for_center_index(
+                                raw_index as f64,
+                                center_index,
+                                marker_x,
+                                SEEK_STRIP_CELL_WIDTH,
+                            ) else {
+                                continue;
+                            };
+                            let cell_rect = egui::Rect::from_center_size(
+                                egui::pos2(
+                                    cell_left_x + SEEK_STRIP_CELL_WIDTH * 0.5,
+                                    local_rect.center().y,
+                                ),
+                                egui::vec2(SEEK_STRIP_CELL_WIDTH - 4.0, SEEK_STRIP_HEIGHT - 10.0),
                             );
-                            painter.image(
-                                texture_id,
-                                fitted,
-                                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                                egui::Color32::WHITE,
+                            // 動画の範囲外には枠も背景も描かない。空のセルを枠付きで置くと、
+                            // 「まだ出ていないサムネイル」と区別が付かず、黒い絵があるように見える
+                            // (実機フィードバック 2026-08-24)。軸の内側で pending のセルだけ枠を出す。
+                            if raw_index < 0 || (raw_index as usize) >= strip.cell_count {
+                                continue;
+                            }
+                            let index = raw_index as usize;
+                            painter.rect_filled(cell_rect, 3.0, egui::Color32::from_gray(24));
+                            match strip
+                                .cells
+                                .iter()
+                                .find(|cell| cell.index == index)
+                                .map(|cell| &cell.content)
+                            {
+                                Some(NativeOverlaySeekStripCellContent::Ready(thumbnail)) => {
+                                    if let Some(texture_id) = texture_ids.get(&index).copied() {
+                                        let fitted = fit_rect_in_rect(
+                                            egui::vec2(
+                                                thumbnail.width as f32,
+                                                thumbnail.height as f32,
+                                            ),
+                                            cell_rect.shrink(2.0),
+                                        );
+                                        painter.image(
+                                            texture_id,
+                                            fitted,
+                                            egui::Rect::from_min_max(
+                                                egui::Pos2::ZERO,
+                                                egui::pos2(1.0, 1.0),
+                                            ),
+                                            egui::Color32::WHITE,
+                                        );
+                                    }
+                                }
+                                Some(NativeOverlaySeekStripCellContent::Failed) => {
+                                    painter.text(
+                                        cell_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        "表示できません",
+                                        crate::ui_fonts::hud_text_font(13.0),
+                                        egui::Color32::from_gray(190),
+                                    );
+                                }
+                                Some(NativeOverlaySeekStripCellContent::Pending) | None => {}
+                            }
+                            painter.rect_stroke(
+                                cell_rect,
+                                3.0,
+                                egui::Stroke::new(1.0, egui::Color32::from_gray(88)),
+                                egui::StrokeKind::Inside,
                             );
                         }
-                        painter.rect_stroke(
-                            cell_rect,
-                            3.0,
-                            egui::Stroke::new(1.0, egui::Color32::from_gray(88)),
-                            egui::StrokeKind::Inside,
-                        );
                     }
                 }
                 crate::video::seek_strip::SeekStripCenter::Waveform { center_time_secs } => {
@@ -1423,8 +1456,14 @@ pub struct NativeOverlayTileThumbnail {
 #[derive(Clone)]
 pub struct NativeOverlaySeekStripCell {
     pub index: usize,
-    pub target_secs: f64,
-    pub thumbnail: Option<NativeOverlayTileThumbnail>,
+    pub content: NativeOverlaySeekStripCellContent,
+}
+
+#[derive(Clone)]
+pub enum NativeOverlaySeekStripCellContent {
+    Pending,
+    Ready(NativeOverlayTileThumbnail),
+    Failed,
 }
 
 #[derive(Clone)]
@@ -1432,8 +1471,22 @@ pub struct NativeOverlaySeekStrip {
     pub center: crate::video::seek_strip::SeekStripCenter,
     pub cell_count: usize,
     pub cells: Vec<NativeOverlaySeekStripCell>,
+    pub thumbnail_notice: Option<NativeOverlaySeekStripThumbnailNotice>,
     pub wave_image: Option<NativeOverlaySeekStripWaveImage>,
     pub wave_notice: Option<NativeOverlaySeekStripWaveNotice>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeOverlaySeekStripThumbnailNotice {
+    Unavailable,
+}
+
+impl NativeOverlaySeekStripThumbnailNotice {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unavailable => "サムネイルを表示できません",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7363,13 +7416,13 @@ impl NativeEguiOverlay {
         }
         self.seek_strip_wave_texture = None;
         self.seek_strip_textures.retain(|index, _| {
-            strip
-                .cells
-                .iter()
-                .any(|cell| cell.index == *index && cell.thumbnail.is_some())
+            strip.cells.iter().any(|cell| {
+                cell.index == *index
+                    && matches!(&cell.content, NativeOverlaySeekStripCellContent::Ready(_))
+            })
         });
         for cell in &strip.cells {
-            let Some(thumbnail) = cell.thumbnail.as_ref() else {
+            let NativeOverlaySeekStripCellContent::Ready(thumbnail) = &cell.content else {
                 self.seek_strip_textures.remove(&cell.index);
                 continue;
             };
@@ -11281,6 +11334,7 @@ mod tests {
             center: crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index: 0.0 },
             cell_count: 1,
             cells: Vec::new(),
+            thumbnail_notice: None,
             wave_image: None,
             wave_notice: None,
         };

@@ -55,21 +55,10 @@ fn timestamp_ms(secs: f64) -> Option<i64> {
     (millis.is_finite() && millis <= i64::MAX as f64).then(|| millis.round() as i64)
 }
 
-/// サムネイルの PTS がどの情報から確定したか。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StripThumbnailTimestampSource {
-    FramePts,
-    PersistentCache,
-    /// PTS を持たない旧形式向け。要求セルの時刻を明示的な代替値として使った。
-    RequestedTimeFallback,
-}
-
 /// 1 セル分の抽出済み画像。
 #[derive(Clone, Debug)]
 pub(crate) struct StripThumbnail {
     pub(crate) target_secs: f64,
-    pub(crate) actual_pts_secs: f64,
-    pub(crate) timestamp_source: StripThumbnailTimestampSource,
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) rgba: Arc<Vec<u8>>,
@@ -97,7 +86,29 @@ impl StripThumbnailFailure {
 #[derive(Clone, Debug)]
 pub(crate) enum StripThumbnailOutcome {
     Ready(StripThumbnail),
-    Failed(StripThumbnailFailure),
+    Failed,
+}
+
+/// UI へ渡す前に確定する、1 セルの表示状態。
+///
+/// `None` はまだ worker が決着させていない pending であり、失敗と同一視しない。
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum StripThumbnailCellState<'a> {
+    Pending,
+    Ready(&'a StripThumbnail),
+    Failed,
+}
+
+pub(crate) fn decide_strip_thumbnail_cell_state<'a>(
+    outcome: Option<&'a StripThumbnailOutcome>,
+    latest_request_failure: Option<&StripThumbnailFailure>,
+) -> StripThumbnailCellState<'a> {
+    match outcome {
+        Some(StripThumbnailOutcome::Ready(thumbnail)) => StripThumbnailCellState::Ready(thumbnail),
+        Some(StripThumbnailOutcome::Failed) => StripThumbnailCellState::Failed,
+        None if latest_request_failure.is_some() => StripThumbnailCellState::Failed,
+        None => StripThumbnailCellState::Pending,
+    }
 }
 
 /// ワーカースレッド全体の状態。
@@ -107,6 +118,24 @@ pub(crate) enum StripThumbnailWorkerStatus {
     DecoderUnavailable(String),
     Cancelled,
     ThreadSpawnFailed(String),
+}
+
+/// セル列を描くか、strip 全体の terminal notice へ置き換えるか。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StripThumbnailDisplayScope {
+    Cells,
+    StripUnavailable,
+}
+
+pub(crate) fn decide_strip_thumbnail_display_scope(
+    axis_resolved: bool,
+    status: &StripThumbnailWorkerStatus,
+) -> StripThumbnailDisplayScope {
+    if axis_resolved && matches!(status, StripThumbnailWorkerStatus::DecoderUnavailable(_)) {
+        StripThumbnailDisplayScope::StripUnavailable
+    } else {
+        StripThumbnailDisplayScope::Cells
+    }
 }
 
 /// ワーカースレッド上で解決するストリップ軸。
@@ -123,7 +152,6 @@ pub(crate) struct StripThumbnailSnapshot {
     pub(crate) axis: StripAxisResolution,
     pub(crate) cells: BTreeMap<StripCellId, StripThumbnailOutcome>,
     pub(crate) status: StripThumbnailWorkerStatus,
-    pub(crate) latest_request_id: u64,
     pub(crate) latest_request_failures: Vec<(usize, StripThumbnailFailure)>,
 }
 
@@ -131,6 +159,19 @@ impl StripThumbnailSnapshot {
     pub(crate) fn outcome_for_secs(&self, target_secs: f64) -> Option<&StripThumbnailOutcome> {
         let id = StripCellId::from_secs(target_secs)?;
         self.cells.get(&id)
+    }
+
+    pub(crate) fn latest_failure_for_index(&self, index: usize) -> Option<&StripThumbnailFailure> {
+        self.latest_request_failures
+            .iter()
+            .find_map(|(failed_index, failure)| (*failed_index == index).then_some(failure))
+    }
+
+    pub(crate) fn display_scope(&self) -> StripThumbnailDisplayScope {
+        decide_strip_thumbnail_display_scope(
+            matches!(&self.axis, StripAxisResolution::Ready(_)),
+            &self.status,
+        )
     }
 }
 
@@ -406,7 +447,6 @@ struct SharedState {
     axis: StripAxisResolution,
     cells: BTreeMap<StripCellId, StripThumbnailOutcome>,
     status: StripThumbnailWorkerStatus,
-    latest_request_id: u64,
     latest_request_failures: Vec<(usize, StripThumbnailFailure)>,
     fill_wait_emitted_request_id: Option<u64>,
 }
@@ -417,7 +457,6 @@ impl SharedState {
             axis: StripAxisResolution::Resolving,
             cells: BTreeMap::new(),
             status: StripThumbnailWorkerStatus::Running,
-            latest_request_id: 0,
             latest_request_failures: Vec::new(),
             fill_wait_emitted_request_id: None,
         }
@@ -428,7 +467,6 @@ impl SharedState {
             axis: self.axis.clone(),
             cells: self.cells.clone(),
             status: self.status.clone(),
-            latest_request_id: self.latest_request_id,
             latest_request_failures: self.latest_request_failures.clone(),
         }
     }
@@ -803,7 +841,6 @@ fn process_window_request(
 ) {
     {
         let mut shared = lock_recover(state);
-        shared.latest_request_id = request.id;
         shared.latest_request_failures.clear();
         shared.fill_wait_emitted_request_id = None;
     }
@@ -1017,8 +1054,6 @@ fn load_cached_cells(
         };
         let thumbnail = StripThumbnail {
             target_secs: cell.target_secs,
-            actual_pts_secs: cell.target_secs,
-            timestamp_source: StripThumbnailTimestampSource::PersistentCache,
             width,
             height,
             rgba: Arc::new(rgba),
@@ -1041,10 +1076,12 @@ fn publish_failure(
     cell: &PlannedStripCell,
     failure: StripThumbnailFailure,
 ) {
-    lock_recover(state)
-        .cells
-        .entry(cell.id)
-        .or_insert(StripThumbnailOutcome::Failed(failure));
+    let mut shared = lock_recover(state);
+    if shared.cells.contains_key(&cell.id) {
+        return;
+    }
+    shared.cells.insert(cell.id, StripThumbnailOutcome::Failed);
+    shared.latest_request_failures.push((cell.index, failure));
 }
 
 fn all_visible_ready(work: &StripWindowWork, state: &Mutex<SharedState>) -> bool {
@@ -1424,81 +1461,58 @@ impl SeekStripDecoder {
         let scaler = &mut self.scaler;
         let scaler_src_fmt = &mut self.scaler_src_fmt;
         let mut cursor = 0usize;
-        let mut last_frame: Option<(Video, f64, StripThumbnailTimestampSource)> = None;
+        let mut last_frame: Option<(Video, f64)> = None;
         let mut first_demux_error: Option<String> = None;
         let mut first_decode_error: Option<String> = None;
         let mut decoded_frames = 0usize;
         let mut published_cells = 0usize;
         let mut transform_elapsed = Duration::ZERO;
 
-        let mut publish_frame_for = |frame: &Video,
-                                     actual_pts_secs: f64,
-                                     timestamp_source: StripThumbnailTimestampSource,
-                                     cells: &[PlannedStripCell]|
-         -> Result<(), StripThumbnailFailure> {
-            if cells.is_empty() {
-                return Ok(());
-            }
-            let transform_t0 = Instant::now();
-            let image = convert_keyframe(frame, geometry, scaler, scaler_src_fmt)
-                .map_err(StripThumbnailFailure::ConvertFailed)?;
-            transform_elapsed += transform_t0.elapsed();
-            for cell in cells {
-                let decoded = DecodedCell {
-                    cell: cell.clone(),
-                    thumbnail: StripThumbnail {
-                        target_secs: cell.target_secs,
-                        actual_pts_secs,
-                        timestamp_source,
-                        width: image.width,
-                        height: image.height,
-                        rgba: Arc::clone(&image.rgba),
-                    },
-                };
-                publish(decoded);
-                published_cells += 1;
-            }
-            Ok(())
-        };
+        let mut publish_frame_for =
+            |frame: &Video, cells: &[PlannedStripCell]| -> Result<(), StripThumbnailFailure> {
+                if cells.is_empty() {
+                    return Ok(());
+                }
+                let transform_t0 = Instant::now();
+                let image = convert_keyframe(frame, geometry, scaler, scaler_src_fmt)
+                    .map_err(StripThumbnailFailure::ConvertFailed)?;
+                transform_elapsed += transform_t0.elapsed();
+                for cell in cells {
+                    let decoded = DecodedCell {
+                        cell: cell.clone(),
+                        thumbnail: StripThumbnail {
+                            target_secs: cell.target_secs,
+                            width: image.width,
+                            height: image.height,
+                            rgba: Arc::clone(&image.rgba),
+                        },
+                    };
+                    publish(decoded);
+                    published_cells += 1;
+                }
+                Ok(())
+            };
 
         let mut accept_frame = |frame: Video| -> Result<bool, StripThumbnailFailure> {
             decoded_frames += 1;
             let Some(current_cell) = run.cells.get(cursor) else {
                 return Ok(true);
             };
-            let (pts_secs, timestamp_source) =
-                match crate::video::decoder::video_frame_timestamp(&frame) {
-                    Some(pts) => (
-                        pts as f64 * tb_num / tb_den,
-                        StripThumbnailTimestampSource::FramePts,
-                    ),
-                    None => {
-                        crate::logger::log(format!(
-                            "video-seek-strip-thumbs frame PTS missing; using requested time: {}",
-                            current_cell.target_secs
-                        ));
-                        (
-                            current_cell.target_secs,
-                            StripThumbnailTimestampSource::RequestedTimeFallback,
-                        )
-                    }
-                };
+            let Some(pts) = crate::video::decoder::video_frame_timestamp(&frame) else {
+                crate::logger::log(format!(
+                    "video-seek-strip-thumbs frame PTS missing; using requested time: {}",
+                    current_cell.target_secs
+                ));
+                publish_frame_for(&frame, &run.cells[cursor..cursor + 1])?;
+                cursor += 1;
+                last_frame = None;
+                return Ok(cursor >= run.cells.len());
+            };
+            let pts_secs = pts as f64 * tb_num / tb_den;
             if !pts_secs.is_finite() || pts_secs < 0.0 {
                 return Err(StripThumbnailFailure::DecodeFailed(
                     "decoded keyframe has invalid PTS".to_string(),
                 ));
-            }
-
-            if timestamp_source == StripThumbnailTimestampSource::RequestedTimeFallback {
-                publish_frame_for(
-                    &frame,
-                    pts_secs,
-                    timestamp_source,
-                    &run.cells[cursor..cursor + 1],
-                )?;
-                cursor += 1;
-                last_frame = None;
-                return Ok(cursor >= run.cells.len());
             }
 
             // TimeGrid の先頭は backward seek で着地した直前キーフレームそのもの。
@@ -1507,18 +1521,13 @@ impl SeekStripDecoder {
                 && !current_cell.exact_keyframe
                 && pts_secs <= current_cell.target_secs + FRAME_PTS_MATCH_EPSILON_SECS
             {
-                publish_frame_for(
-                    &frame,
-                    pts_secs,
-                    timestamp_source,
-                    &run.cells[cursor..cursor + 1],
-                )?;
+                publish_frame_for(&frame, &run.cells[cursor..cursor + 1])?;
                 cursor += 1;
-                last_frame = Some((frame, pts_secs, timestamp_source));
+                last_frame = Some((frame, pts_secs));
                 return Ok(cursor >= run.cells.len());
             }
 
-            if let Some((previous, previous_pts, previous_source)) = last_frame.as_ref() {
+            if let Some((previous, previous_pts)) = last_frame.as_ref() {
                 let start = cursor;
                 while let Some(cell) = run.cells.get(cursor) {
                     if cell.target_secs >= pts_secs - FRAME_PTS_MATCH_EPSILON_SECS {
@@ -1529,12 +1538,7 @@ impl SeekStripDecoder {
                     }
                     cursor += 1;
                 }
-                publish_frame_for(
-                    previous,
-                    *previous_pts,
-                    *previous_source,
-                    &run.cells[start..cursor],
-                )?;
+                publish_frame_for(previous, &run.cells[start..cursor])?;
             }
 
             let exact_start = cursor;
@@ -1544,13 +1548,8 @@ impl SeekStripDecoder {
                 }
                 cursor += 1;
             }
-            publish_frame_for(
-                &frame,
-                pts_secs,
-                timestamp_source,
-                &run.cells[exact_start..cursor],
-            )?;
-            last_frame = Some((frame, pts_secs, timestamp_source));
+            publish_frame_for(&frame, &run.cells[exact_start..cursor])?;
+            last_frame = Some((frame, pts_secs));
             Ok(cursor >= run.cells.len())
         };
 
@@ -1627,7 +1626,7 @@ impl SeekStripDecoder {
 
         drop(accept_frame);
         if matches!(stop, RunStop::Complete) && cursor < run.cells.len() {
-            if let Some((frame, pts_secs, timestamp_source)) = last_frame.as_ref() {
+            if let Some((frame, pts_secs)) = last_frame.as_ref() {
                 let start = cursor;
                 while let Some(cell) = run.cells.get(cursor) {
                     if *pts_secs > cell.target_secs + FRAME_PTS_MATCH_EPSILON_SECS {
@@ -1635,12 +1634,7 @@ impl SeekStripDecoder {
                     }
                     cursor += 1;
                 }
-                if let Err(failure) = publish_frame_for(
-                    frame,
-                    *pts_secs,
-                    *timestamp_source,
-                    &run.cells[start..cursor],
-                ) {
+                if let Err(failure) = publish_frame_for(frame, &run.cells[start..cursor]) {
                     stop = RunStop::Failed(failure);
                 }
             }
@@ -1834,6 +1828,114 @@ mod tests {
         StripCellId::from_secs(secs).expect("test timestamp must be valid")
     }
 
+    fn thumbnail(target_secs: f64) -> StripThumbnail {
+        StripThumbnail {
+            target_secs,
+            width: 1,
+            height: 1,
+            rgba: Arc::new(vec![0, 0, 0, 255]),
+        }
+    }
+
+    #[test]
+    fn cell_display_state_distinguishes_pending_ready_and_failed() {
+        assert!(matches!(
+            decide_strip_thumbnail_cell_state(None, None),
+            StripThumbnailCellState::Pending
+        ));
+
+        let ready = StripThumbnailOutcome::Ready(thumbnail(3.0));
+        assert!(matches!(
+            decide_strip_thumbnail_cell_state(Some(&ready), None),
+            StripThumbnailCellState::Ready(thumbnail) if thumbnail.target_secs == 3.0
+        ));
+
+        let failed = StripThumbnailOutcome::Failed;
+        assert!(matches!(
+            decide_strip_thumbnail_cell_state(Some(&failed), None),
+            StripThumbnailCellState::Failed
+        ));
+        assert!(matches!(
+            decide_strip_thumbnail_cell_state(None, Some(&StripThumbnailFailure::InvalidCellTime)),
+            StripThumbnailCellState::Failed
+        ));
+    }
+
+    #[test]
+    fn only_decoder_unavailable_after_axis_resolution_replaces_the_cell_row() {
+        assert_eq!(
+            decide_strip_thumbnail_display_scope(
+                true,
+                &StripThumbnailWorkerStatus::DecoderUnavailable("open failed".into()),
+            ),
+            StripThumbnailDisplayScope::StripUnavailable
+        );
+        assert_eq!(
+            decide_strip_thumbnail_display_scope(
+                false,
+                &StripThumbnailWorkerStatus::DecoderUnavailable("axis failed".into()),
+            ),
+            StripThumbnailDisplayScope::Cells
+        );
+        for status in [
+            StripThumbnailWorkerStatus::Running,
+            StripThumbnailWorkerStatus::ThreadSpawnFailed("spawn failed".into()),
+            StripThumbnailWorkerStatus::Cancelled,
+        ] {
+            assert_eq!(
+                decide_strip_thumbnail_display_scope(true, &status),
+                StripThumbnailDisplayScope::Cells
+            );
+        }
+
+        for resolved_axis in [
+            Arc::new(axis(3)),
+            Arc::new(StripAxis::TimeGrid {
+                interval_secs: 2.0,
+                duration_secs: 30.0,
+            }),
+        ] {
+            let snapshot = StripThumbnailSnapshot {
+                axis: StripAxisResolution::Ready(resolved_axis),
+                cells: BTreeMap::new(),
+                status: StripThumbnailWorkerStatus::DecoderUnavailable("open failed".into()),
+                latest_request_failures: Vec::new(),
+            };
+            assert_eq!(
+                snapshot.display_scope(),
+                StripThumbnailDisplayScope::StripUnavailable
+            );
+        }
+    }
+
+    #[test]
+    fn settled_failure_keeps_state_and_current_request_reason_in_one_place_each() {
+        let axis = axis(3);
+        let work = plan(
+            &axis,
+            StripWindowSpec::new(1.0, 3, StripLookahead::default()),
+            &BTreeSet::new(),
+        );
+        let cell = work
+            .cache_lookup
+            .iter()
+            .find(|cell| cell.index == 1)
+            .expect("center cell must be planned");
+        let state = Mutex::new(SharedState::new());
+
+        publish_failure(&state, cell, StripThumbnailFailure::NoFrame);
+
+        let snapshot = lock_recover(&state).snapshot();
+        assert!(matches!(
+            snapshot.outcome_for_secs(cell.target_secs),
+            Some(StripThumbnailOutcome::Failed)
+        ));
+        assert_eq!(
+            snapshot.latest_failure_for_index(cell.index),
+            Some(&StripThumbnailFailure::NoFrame)
+        );
+    }
+
     #[test]
     fn window_plan_looks_up_only_missing_cells_center_outward() {
         let axis = axis(20);
@@ -1879,9 +1981,6 @@ mod tests {
                 cell: cell.clone(),
                 thumbnail: StripThumbnail {
                     target_secs: cell.target_secs,
-                    // edit list / DTS 索引を模し、要求時刻とは明確に異なる実 PTS にする。
-                    actual_pts_secs: cell.target_secs + 0.137,
-                    timestamp_source: StripThumbnailTimestampSource::FramePts,
                     width: 1,
                     height: 1,
                     rgba: Arc::new(vec![0, 0, 0, 255]),

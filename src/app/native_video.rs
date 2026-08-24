@@ -7413,52 +7413,79 @@ impl App {
                     }
                 }
                 let mut visible_cells_pending = false;
+                let mut thumbnail_notice = None;
                 let mut wave_image = None;
                 let mut wave_notice = None;
                 let (cell_count, cells) = match session.center {
                     crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index } => {
                         if let VideoSeekStripAxisState::Ready(axis) = &session.axis {
-                            let visible = crate::video::seek_strip::compute_strip_window(
-                                center_index,
-                                session.visible_count,
-                                crate::video::seek_strip::StripLookahead::default(),
-                                axis.cell_count(),
-                                None,
-                            );
-                            let mut cells = Vec::new();
-                            if let Some(range) = visible.ready {
-                                for index in range.start()..=range.end() {
-                                    let Some(target_secs) = axis.cell(index) else {
-                                        continue;
-                                    };
-                                    let outcome =
-                                        thumbnail_snapshot.as_ref().and_then(|snapshot| {
-                                            snapshot.outcome_for_secs(target_secs)
-                                        });
-                                    visible_cells_pending |= outcome.is_none();
-                                    let thumbnail = outcome.and_then(
-                                        |outcome| match outcome {
-                                            crate::video::seek_strip_thumbs::StripThumbnailOutcome::Ready(thumbnail) => {
-                                                Some(crate::video::native_presenter::NativeOverlayTileThumbnail {
-                                                    target_secs,
-                                                    width: thumbnail.width,
-                                                    height: thumbnail.height,
-                                                    rgba: std::sync::Arc::clone(&thumbnail.rgba),
-                                                })
+                            let display_scope = thumbnail_snapshot
+                                .as_ref()
+                                .map(|snapshot| snapshot.display_scope())
+                                .unwrap_or(
+                                    crate::video::seek_strip_thumbs::StripThumbnailDisplayScope::Cells,
+                                );
+                            if display_scope
+                                == crate::video::seek_strip_thumbs::StripThumbnailDisplayScope::StripUnavailable
+                            {
+                                thumbnail_notice = Some(
+                                    crate::video::native_presenter::NativeOverlaySeekStripThumbnailNotice::Unavailable,
+                                );
+                                (axis.cell_count(), Vec::new())
+                            } else {
+                                let visible = crate::video::seek_strip::compute_strip_window(
+                                    center_index,
+                                    session.visible_count,
+                                    crate::video::seek_strip::StripLookahead::default(),
+                                    axis.cell_count(),
+                                    None,
+                                );
+                                let mut cells = Vec::new();
+                                if let Some(range) = visible.ready {
+                                    for index in range.start()..=range.end() {
+                                        let target_secs = axis.cell(index);
+                                        let outcome = thumbnail_snapshot
+                                            .as_ref()
+                                            .and_then(|snapshot| target_secs.and_then(|target| {
+                                                snapshot.outcome_for_secs(target)
+                                            }));
+                                        let latest_failure = thumbnail_snapshot
+                                            .as_ref()
+                                            .and_then(|snapshot| {
+                                                snapshot.latest_failure_for_index(index)
+                                            });
+                                        let content = match crate::video::seek_strip_thumbs::decide_strip_thumbnail_cell_state(
+                                            outcome,
+                                            latest_failure,
+                                        ) {
+                                            crate::video::seek_strip_thumbs::StripThumbnailCellState::Pending => {
+                                                visible_cells_pending = true;
+                                                crate::video::native_presenter::NativeOverlaySeekStripCellContent::Pending
                                             }
-                                            crate::video::seek_strip_thumbs::StripThumbnailOutcome::Failed(_) => None,
-                                        },
-                                    );
-                                    cells.push(
-                                        crate::video::native_presenter::NativeOverlaySeekStripCell {
-                                            index,
-                                            target_secs,
-                                            thumbnail,
-                                        },
-                                    );
+                                            crate::video::seek_strip_thumbs::StripThumbnailCellState::Ready(thumbnail) => {
+                                                crate::video::native_presenter::NativeOverlaySeekStripCellContent::Ready(
+                                                    crate::video::native_presenter::NativeOverlayTileThumbnail {
+                                                        target_secs: thumbnail.target_secs,
+                                                        width: thumbnail.width,
+                                                        height: thumbnail.height,
+                                                        rgba: std::sync::Arc::clone(&thumbnail.rgba),
+                                                    },
+                                                )
+                                            }
+                                            crate::video::seek_strip_thumbs::StripThumbnailCellState::Failed => {
+                                                crate::video::native_presenter::NativeOverlaySeekStripCellContent::Failed
+                                            }
+                                        };
+                                        cells.push(
+                                            crate::video::native_presenter::NativeOverlaySeekStripCell {
+                                                index,
+                                                content,
+                                            },
+                                        );
+                                    }
                                 }
+                                (axis.cell_count(), cells)
                             }
-                            (axis.cell_count(), cells)
                         } else {
                             visible_cells_pending = true;
                             (0, Vec::new())
@@ -7509,6 +7536,7 @@ impl App {
                     center: session.center,
                     cell_count,
                     cells,
+                    thumbnail_notice,
                     wave_image,
                     wave_notice,
                 })
