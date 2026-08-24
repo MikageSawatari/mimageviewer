@@ -213,13 +213,24 @@ fn draw_native_seek_strip(
             match strip.center {
                 crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index } => {
                     let half_cells = local_rect.width() / (2.0 * SEEK_STRIP_CELL_WIDTH);
-                    let first_index = (center_index - f64::from(half_cells) - 1.0).floor() as isize;
-                    let last_index = (center_index + f64::from(half_cells) + 1.0).ceil() as isize;
+                    // D16: cell i spans the continuous index interval [i, i + 1), so its
+                    // left edge—not its center—is aligned with keyframe i.
+                    let first_index = (center_index - f64::from(half_cells)).floor() as isize;
+                    let last_index = ((center_index + f64::from(half_cells)).ceil() - 1.0) as isize;
                     for raw_index in first_index..=last_index {
-                        let cell_center_x = marker_x
-                            + ((raw_index as f64 - center_index) as f32) * SEEK_STRIP_CELL_WIDTH;
+                        let Some(cell_left_x) = crate::video::seek_strip::x_for_center_index(
+                            raw_index as f64,
+                            center_index,
+                            marker_x,
+                            SEEK_STRIP_CELL_WIDTH,
+                        ) else {
+                            continue;
+                        };
                         let cell_rect = egui::Rect::from_center_size(
-                            egui::pos2(cell_center_x, local_rect.center().y),
+                            egui::pos2(
+                                cell_left_x + SEEK_STRIP_CELL_WIDTH * 0.5,
+                                local_rect.center().y,
+                            ),
                             egui::vec2(SEEK_STRIP_CELL_WIDTH - 4.0, SEEK_STRIP_HEIGHT - 10.0),
                         );
                         // 動画の範囲外には枠も背景も描かない。空のセルを枠付きで置くと、
@@ -377,15 +388,16 @@ fn draw_native_seek_strip(
             {
                 let center = match strip.center {
                     crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index } => {
-                        crate::video::seek_strip::center_index_at_pointer(
+                        crate::video::seek_strip::cell_index_at_pointer(
                             center_index,
                             pointer.x,
                             marker_x,
                             SEEK_STRIP_CELL_WIDTH,
+                            strip.cell_count,
                         )
-                        .map(|center_index| {
+                        .map(|cell_index| {
                             crate::video::seek_strip::SeekStripCenter::Thumbnails {
-                                center_index: center_index.round(),
+                                center_index: cell_index as f64,
                             }
                         })
                     }
@@ -8587,6 +8599,7 @@ impl NativeEguiOverlay {
         // (変換の確定・取り消しをタグピッカーが奪わないため、静止画側 `dialog_*_pressed` と同方針)。
         let tag_picker_ime_active = self.ime_input_active();
         let tag_picker_enter_allowed = !tag_picker_ime_active;
+        let mut seek_strip_area_ran = false;
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             if !overlay_visible {
                 return;
@@ -9021,6 +9034,7 @@ impl NativeEguiOverlay {
 
             if let Some(strip) = seek_strip.as_ref() {
                 if bottom_hud_visible {
+                    seek_strip_area_ran = true;
                     draw_native_seek_strip(
                         ctx,
                         egui::vec2(overlay_width_points, overlay_height_points),
@@ -10371,6 +10385,13 @@ impl NativeEguiOverlay {
                 );
             }
         });
+        let egui_hover_pos = self.egui_ctx.pointer_hover_pos();
+        crate::video::cursor_debug::log(format_args!(
+            "layer=egui event=presenter_frame epoch={} strip_area_ran={seek_strip_area_ran} strip_present={} bottom_hud_visible={bottom_hud_visible} tile_overlay_visible={tile_overlay_visible} navigation_preview_visible={navigation_preview_visible} native_hover_points={visibility_hover_pos:?} egui_hover_points={egui_hover_pos:?} platform_cursor={:?}",
+            self.window_epoch,
+            seek_strip.is_some(),
+            full_output.platform_output.cursor_icon,
+        ));
         // presenter は本体とは別の egui Context を持つので、生成側もここで記録しないと
         // 「produced と applied が対になる」という台帳の読み方が presenter 分だけ崩れる
         // (Codex 2 周目指摘)。詳細: `egui_wgpu::atlas_diag`。

@@ -38,10 +38,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_POINTERCAPTURECHANGED,
     WM_POINTERDOWN, WM_POINTERENTER, WM_POINTERLEAVE, WM_POINTERUP, WM_POINTERUPDATE,
-    WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_WINDOWPOSCHANGED, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
-    WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
-    WS_POPUP, WS_VISIBLE,
+    WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_SYSCOMMAND,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN,
+    WM_XBUTTONUP, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP,
+    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::w;
 
@@ -1813,7 +1813,30 @@ unsafe extern "system" fn wnd_proc(
             let lparam = LPARAM(lparam.0 & !(ISC_SHOWUICOMPOSITIONWINDOW as isize));
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
+        // Keep this policy paired with the HUD `WM_SETCURSOR` branch in
+        // `native_window_host/hud_window.rs` (2026-06-06 decision). The pump-owned
+        // reducer is the only code that applies the presenter cursor. Calling
+        // `DefWindowProcW` here would restore the class arrow on every mouse move,
+        // overwriting both egui's non-arrow cursor and `SetCursor(None)` from auto-hide.
+        // Do not call `SetCursor` here either: returning handled preserves exactly the
+        // icon (including hidden) that the reducer last applied.
+        WM_SETCURSOR => {
+            let hit_test = signed_low_word(lparam.0);
+            let trigger_message = ((lparam.0 as u32 >> 16) & 0xffff) as u16;
+            let result = LRESULT(1);
+            super::cursor_debug::log(format_args!(
+                "layer=win32 event=WM_SETCURSOR window=presenter hwnd=0x{:016X} cursor_hwnd=0x{:016X} hit_test={hit_test} trigger_message=0x{trigger_message:04X} handler=explicit returned={}",
+                hwnd.0 as usize as u64, wparam.0 as u64, result.0,
+            ));
+            result
+        }
         WM_MOUSEMOVE => {
+            super::cursor_debug::log(format_args!(
+                "layer=win32 event=WM_MOUSEMOVE window=presenter hwnd=0x{:016X} client_px=({}, {})",
+                hwnd.0 as usize as u64,
+                signed_low_word(lparam.0),
+                signed_high_word(lparam.0),
+            ));
             if should_discard_promoted_touch_mouse(msg, NativeVideoWindowSource::Presenter) {
                 return LRESULT(0);
             }
@@ -2247,6 +2270,14 @@ mod tests {
             alt: false,
             repeat: false,
         })
+    }
+
+    #[test]
+    fn presenter_wndproc_handles_setcursor_without_defaulting_to_class_arrow() {
+        let trigger = ((WM_MOUSEMOVE as isize) << 16) | HTCLIENT as isize;
+        let result = unsafe { wnd_proc(HWND::default(), WM_SETCURSOR, WPARAM(0), LPARAM(trigger)) };
+
+        assert_eq!(result, LRESULT(1));
     }
 
     fn attach_span_sample_points(fields: &[(&'static str, serde_json::Value)]) -> Vec<String> {

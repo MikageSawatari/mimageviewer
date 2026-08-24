@@ -333,6 +333,16 @@ region 化は passive な source swap 表示なので、カーソルの auto-hid
   実行する。ownership を失ったら Arrow を書かず、VST のノブなど外部 window の `WM_SETCURSOR`
   に任せる。cursor ownership 判定には同期 hit-test を使わず、`WindowFromPoint` /
   `SendMessage` はこの経路へ導入しない。
+- presenter / HUD の `WM_SETCURSOR` は `LRESULT(1)` を返し、`DefWindowProcW` に流さない。
+  native video window 内では pump-owned reducer が適用した Arrow / resize / hidden をそのまま
+  維持し、window class cursor による上書きを許さない。handler 自身から `SetCursor` は呼ばないため、
+  auto-hide の `SetCursor(None)` も復帰させない。
+
+cursor ownership / icon の実機調査では `MIV_CURSOR_DEBUG=1` を付けて起動する。presenter / HUD の
+`WM_SETCURSOR` / `WM_MOUSEMOVE`、egui が frame ごとに生成した cursor、pump reducer の policy と
+実際の `SetCursor` 呼び出し結果が、process-wide sequence 付きの `[CURSOR-DEBUG]` 行として
+`%APPDATA%\mimageviewer\logs\mimageviewer.log` に出る。高頻度ログなので再現時だけ有効にする。
+この環境変数は `MIV_DETACHED_WINDOW_DEBUG=1` と同じ debug retention (256MB、4 世代) も有効にする。
 
 この事象は fullscreen 限定 (HUD HWND + `cursor_polling_tick` + 全画面 region 化が fullscreen にしか
 無い) なので、window モードでは元から再現しない。
@@ -750,7 +760,10 @@ presenter も旧 texture を描き続けるため、解析中の blank frame / u
 波形 texture が無い終端状態では、音声なしと表示失敗をそれぞれ日本語の短い案内として帯内に描く。
 解析中は案内を出さない。
 サムネイルでは等幅セルの連続する小数位置、波形では 1 幅 60 秒の時間線形軸を使い、どちらも
-固定中央線を描く。モード切替では中央時刻を保ったまま軸だけを交換する。ドラッグは press 時の
+固定中央線を描く。サムネイルの整数位置 `i` はセル `i` の左端であり、セルは `[i, i+1)` を
+占める。したがって中央線のセル内位置は `cell(i)` から `cell(i+1)` までの進み具合を表す。
+描画、pointer hit test、可視窓計算はすべてこの左端基準を使う。モード切替では中央時刻を
+保ったまま軸だけを交換する。ドラッグは press 時の
 中心と pointer を immutable origin とし、現在 pointer との差から毎 frame の中心と release 中心を
 同じ純関数で求める。release の 1 回だけ補間時刻へ精密 seek して必ず再生を始める。再生中は
 100ms cadence で

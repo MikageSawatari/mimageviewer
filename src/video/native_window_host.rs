@@ -629,11 +629,14 @@ impl NativeWindowHost {
         }
     }
 
-    pub(crate) fn apply_cursor_icon(&self, icon: NativeCursorIcon) {
+    /// Returns whether this call reached the Win32 `SetCursor` API. A non-hidden
+    /// icon can be skipped only when its shared system cursor fails to load.
+    pub(crate) fn apply_cursor_icon(&self, icon: NativeCursorIcon) -> bool {
         self.assert_owner_thread();
         match icon {
             NativeCursorIcon::Hidden => unsafe {
                 SetCursor(None);
+                true
             },
             icon => {
                 let cursor_id = match icon {
@@ -651,6 +654,9 @@ impl NativeWindowHost {
                     unsafe {
                         SetCursor(Some(cursor));
                     }
+                    true
+                } else {
+                    false
                 }
             }
         }

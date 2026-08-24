@@ -1253,9 +1253,16 @@ impl PumpRuntime {
                 auto_hide_allowed,
             } = *intent
             {
+                let applied_before = self.cursor.applied_icon();
                 let resolved =
                     self.cursor
                         .set_render_policy(icon, auto_hide_allowed, Instant::now());
+                super::cursor_debug::log(format_args!(
+                    "layer=pump event=set_render_policy epoch={} window={:?} icon={icon:?} auto_hide_allowed={auto_hide_allowed} applied_before={applied_before:?} returned={resolved:?} applied_after={:?}",
+                    epoch.0,
+                    self.cursor_routing.source(),
+                    self.cursor.applied_icon(),
+                ));
                 self.apply_cursor_icon(epoch, resolved);
             }
         }
@@ -1285,18 +1292,57 @@ impl PumpRuntime {
         epoch: WindowEpoch,
         icon: Option<super::native_window_host::NativeCursorIcon>,
     ) {
-        if cursor_input_epoch(self.state) != Some(epoch)
-            || !self.cursor.input_owned()
-            || self.cursor_routing.input_ownership()
-                != super::native_cursor::CursorInputOwnership::Owned
+        let active_epoch = cursor_input_epoch(self.state);
+        let input_owned = self.cursor.input_owned();
+        let routing_ownership = self.cursor_routing.input_ownership();
+        let window_source = self.cursor_routing.source();
+        let applied_icon = self.cursor.applied_icon();
+        let requested_icon = icon.or(applied_icon);
+        if active_epoch != Some(epoch)
+            || !input_owned
+            || routing_ownership != super::native_cursor::CursorInputOwnership::Owned
         {
+            super::cursor_debug::log(format_args!(
+                "layer=pump event=apply_cursor_icon epoch={} window={window_source:?} hwnd=0x0 asked={requested_icon:?} reducer_output={icon:?} applied_icon={applied_icon:?} outcome=skipped_gate active_epoch={:?} input_owned={input_owned} routing_ownership={routing_ownership:?}",
+                epoch.0,
+                active_epoch.map(|active| active.0),
+            ));
             return;
         }
-        if let Some(icon) = icon
-            && let Some(window) = self.hosts.get(&epoch)
-        {
-            window.apply_cursor_icon(icon);
-        }
+        let Some(icon) = icon else {
+            let outcome = if applied_icon.is_some() {
+                "skipped_applied_icon_match"
+            } else {
+                "skipped_no_resolved_icon"
+            };
+            super::cursor_debug::log(format_args!(
+                "layer=pump event=apply_cursor_icon epoch={} window={window_source:?} hwnd=0x0 asked={requested_icon:?} reducer_output=None applied_icon={applied_icon:?} outcome={outcome}",
+                epoch.0,
+            ));
+            return;
+        };
+        let Some(window) = self.hosts.get(&epoch) else {
+            super::cursor_debug::log(format_args!(
+                "layer=pump event=apply_cursor_icon epoch={} window={window_source:?} hwnd=0x0 asked={requested_icon:?} reducer_output=Some({icon:?}) applied_icon={applied_icon:?} outcome=skipped_no_host",
+                epoch.0,
+            ));
+            return;
+        };
+        let hwnd = match window_source {
+            Some(NativeVideoWindowSource::Presenter) => window.hwnd().0 as usize as u64,
+            Some(NativeVideoWindowSource::Hud) => window.hud_hwnd(),
+            None => 0,
+        };
+        let invoked = window.apply_cursor_icon(icon);
+        let outcome = if invoked {
+            "set_cursor_invoked"
+        } else {
+            "skipped_load_cursor_failed"
+        };
+        super::cursor_debug::log(format_args!(
+            "layer=pump event=apply_cursor_icon epoch={} window={window_source:?} hwnd=0x{hwnd:016X} asked={requested_icon:?} reducer_output=Some({icon:?}) applied_icon={applied_icon:?} outcome={outcome}",
+            epoch.0,
+        ));
     }
 
     fn record_cursor_health(&self, epoch: WindowEpoch) {

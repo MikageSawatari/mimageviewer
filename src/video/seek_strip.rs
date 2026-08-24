@@ -407,6 +407,8 @@ fn compute_ready_range(
     }
 
     let half_span = visible_cell_count as f64 / 2.0;
+    // D16: integer positions are cell *left edges*, so cell i occupies [i, i + 1).
+    // This is the same convention used by drawing and pointer hit testing.
     let visible_start = (center_index - half_span).floor();
     // 右端は排他的なので、境界に触れるだけの次セルは含めない。
     let visible_end = (center_index + half_span).ceil() - 1.0;
@@ -556,7 +558,7 @@ pub(crate) fn center_index_after_drag(
     Some(origin_center_index - f64::from(drag_delta_x / cell_width))
 }
 
-/// ストリップ上の x 座標を、そのセル位置へ変換する。
+/// ストリップ上の x 座標を、セル左端を整数とする連続位置へ変換する。
 pub(crate) fn center_index_at_pointer(
     center_index: f64,
     pointer_x: f32,
@@ -564,6 +566,41 @@ pub(crate) fn center_index_at_pointer(
     cell_width: f32,
 ) -> Option<f64> {
     center_index_after_drag(center_index, marker_x - pointer_x, cell_width)
+}
+
+/// セル左端の連続位置をストリップ上の x 座標へ変換する。
+///
+/// `center_index_at_pointer` の逆変換であり、D16 の描画と hit test が同じ座標規約を
+/// 共有するための正本。整数 `i` の戻り値はセル `i` の nominal left edge になる。
+pub(crate) fn x_for_center_index(
+    index_position: f64,
+    center_index: f64,
+    marker_x: f32,
+    cell_width: f32,
+) -> Option<f32> {
+    if !index_position.is_finite()
+        || !center_index.is_finite()
+        || !marker_x.is_finite()
+        || !cell_width.is_finite()
+        || cell_width <= 0.0
+    {
+        return None;
+    }
+    let x = f64::from(marker_x) + (index_position - center_index) * f64::from(cell_width);
+    x.is_finite().then_some(x as f32)
+}
+
+/// ポインタ直下にある実セルを D16 の左端基準で返す。
+pub(crate) fn cell_index_at_pointer(
+    center_index: f64,
+    pointer_x: f32,
+    marker_x: f32,
+    cell_width: f32,
+    cell_count: usize,
+) -> Option<usize> {
+    let index_position = center_index_at_pointer(center_index, pointer_x, marker_x, cell_width)?;
+    let index = index_position.floor();
+    (index >= 0.0 && index < cell_count as f64).then_some(index as usize)
 }
 
 /// Mode-specific coordinate carried across App/presenter boundaries.
@@ -1185,6 +1222,41 @@ mod tests {
             eframe::egui::pos2(330.0, 500.0),
             490.0
         ));
+    }
+
+    #[test]
+    fn left_aligned_cell_x_and_pointer_hit_test_round_trip() {
+        let center_index = 4.25;
+        let marker_x = 250.0;
+        let cell_width = 150.0;
+        let cell_count = 12;
+
+        for index in [0, 4, 5, 11] {
+            let left_x = x_for_center_index(index as f64, center_index, marker_x, cell_width)
+                .expect("finite cell left edge");
+            assert_close(
+                center_index_at_pointer(center_index, left_x, marker_x, cell_width),
+                index as f64,
+            );
+            assert_eq!(
+                cell_index_at_pointer(
+                    center_index,
+                    left_x + cell_width * 0.75,
+                    marker_x,
+                    cell_width,
+                    cell_count,
+                ),
+                Some(index),
+            );
+        }
+
+        let boundary_x =
+            x_for_center_index(5.0, center_index, marker_x, cell_width).expect("boundary");
+        assert_eq!(
+            cell_index_at_pointer(center_index, boundary_x, marker_x, cell_width, cell_count,),
+            Some(5),
+            "the exact boundary belongs to the cell that starts there",
+        );
     }
 
     #[test]

@@ -32,6 +32,8 @@ pub mod audio_stretch;
 pub mod avio_progress;
 pub mod clock;
 pub mod clockless_transcode;
+#[cfg(windows)]
+pub(crate) mod cursor_debug;
 pub mod decoder;
 pub mod display_metadata;
 #[cfg(windows)]

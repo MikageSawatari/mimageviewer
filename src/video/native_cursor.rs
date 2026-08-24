@@ -304,6 +304,10 @@ impl CursorAutoHideReducer {
         self.hidden
     }
 
+    pub(crate) fn applied_icon(self) -> Option<NativeCursorIcon> {
+        self.applied_icon
+    }
+
     pub(crate) fn last_activity(self) -> Option<Instant> {
         self.last_activity
     }
