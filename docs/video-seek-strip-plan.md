@@ -305,7 +305,10 @@ enum SeekRowGesture {
 
 - 3 値の正本は persisted `Settings.video_seek_strip_state` (`none / thumbnails / waveform`)。
   runtime の session 有無と表示内容の mode を別々の状態にはしない。`Shift+S` の
-  `VideoSeekStrip` は `none → thumbnails → waveform → none` を巡回する (D12)。
+  `VideoSeekStripCycle` は `none → thumbnails → waveform → none` を巡回する (D12)。
+  既定 chord なしの `VideoSeekStripToggle` は表示中なら閉じ、非表示なら上ドラッグと同じ
+  `video_seek_strip_last_choice` へ戻す。`VideoSeekStripNone` / `VideoSeekStripThumbnails` /
+  `VideoSeekStripWaveform` は指定状態へ直接移る。
 - 開く: 上ドラッグ (上記) / `Shift+S` / ロックアイコン左のベクター描画フィルムアイコン。
   上ドラッグは明示保存した `video_seek_strip_last_choice` を復元するので、波形を閉じた利用者は
   次も波形へ戻る。フィルムボタンは `Shift+S` と同じ 3 値を同じ順で 1 クリック巡回し、

@@ -314,7 +314,15 @@ fn draw_native_seek_strip(
                 egui::Id::new("native_video_seek_strip_drag"),
                 egui::Sense::click_and_drag(),
             );
-            if response.hovered() || response.dragged() {
+            // `Response` の hover 判定は前回パスのレイヤーヒットテストに依存する。
+            // Area が描画されポインターが矩形内にあるフレームでも、Foreground
+            // レイヤーの登録が追いつくまでは false になり得るため、カーソルの所有は
+            // このストリップ自身の幾何で表す。ドラッグ中は矩形外でも維持する。
+            let pointer_inside = ui
+                .ctx()
+                .pointer_hover_pos()
+                .is_some_and(|pointer| strip_rect.contains(pointer));
+            if pointer_inside || response.dragged() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
             }
             if response.drag_started()
@@ -11216,13 +11224,14 @@ fn channel_delta(a: u8, b: u8) -> u8 {
 mod tests {
     use super::{
         HUD_BOTTOM_HEIGHT, HUD_TOP_HEIGHT, NativeBarVisibilitySnapshot, NativeEguiOverlay,
-        NativeJumpPanelVisibilityInputs, NativeOverlayInputRouting, NativePixelSample,
-        NativeRightPanelVisibilityInputs, NativeTouchPanelHandleInputs, PreparedVideoScaleSettings,
-        VideoOrientation, VideoScalePreparationSignature, VideoSurfaceContent, VideoVisualLayout,
-        VideoVisualTargetRect, compare_pixel_probe, compute_video_visual_target_rect,
-        compute_video_visual_transform, configure_overlay_style, copy_cpu_rgba_to_swapchain_bgra,
-        cursor_move_is_activity, effective_overlay_pixels_per_point, egui_key_from_virtual_key,
-        metadata_clean_text, native_jump_panel_visible_from_inputs, native_panel_callout_hud_rects,
+        NativeJumpPanelVisibilityInputs, NativeOverlayInputRouting, NativeOverlaySeekStrip,
+        NativePixelSample, NativeRightPanelVisibilityInputs, NativeTouchPanelHandleInputs,
+        PreparedVideoScaleSettings, VideoOrientation, VideoScalePreparationSignature,
+        VideoSurfaceContent, VideoVisualLayout, VideoVisualTargetRect, compare_pixel_probe,
+        compute_video_visual_target_rect, compute_video_visual_transform, configure_overlay_style,
+        copy_cpu_rgba_to_swapchain_bgra, cursor_move_is_activity, draw_native_seek_strip,
+        effective_overlay_pixels_per_point, egui_key_from_virtual_key, metadata_clean_text,
+        native_jump_panel_visible_from_inputs, native_panel_callout_hud_rects,
         native_right_panel_visible_from_inputs, native_touch_owned_panel_sides,
         native_touch_panel_handle_hud_rects,
         native_touch_panel_tap_command_dismisses_before_dispatch,
@@ -11239,6 +11248,69 @@ mod tests {
         NativeVideoKeyEvent, NativeVideoMouseButton, NativeVideoMouseButtonEvent,
         NativeVideoMouseEvent, NativeVideoMouseWheelEvent, NativeVideoWindowEvent,
     };
+
+    #[test]
+    fn seek_strip_claims_resize_cursor_while_layer_hit_test_warms_up() {
+        let ctx = egui::Context::default();
+        let overlay_size = egui::vec2(1280.0, 720.0);
+        let pointer = egui::pos2(640.0, 600.0);
+        let strip = NativeOverlaySeekStrip {
+            center: crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index: 0.0 },
+            cell_count: 1,
+            cells: Vec::new(),
+            wave_image: None,
+            wave_notice: None,
+        };
+        let mut drag_origin = None;
+        let mut last_window_request = None;
+
+        let mut cursor_icons = Vec::new();
+        for frame in 0..4 {
+            let mut commands = Vec::new();
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, overlay_size)),
+                    time: Some(frame as f64 / 60.0),
+                    events: match frame {
+                        0 => vec![egui::Event::PointerMoved(pointer)],
+                        3 => vec![egui::Event::PointerGone],
+                        _ => Vec::new(),
+                    },
+                    ..Default::default()
+                },
+                |ctx| {
+                    draw_native_seek_strip(
+                        ctx,
+                        overlay_size,
+                        &strip,
+                        &std::collections::HashMap::new(),
+                        None,
+                        &mut drag_origin,
+                        &mut last_window_request,
+                        &mut commands,
+                    );
+                    egui::Area::new(egui::Id::new("native_video_seek_hud"))
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(egui::pos2(0.0, overlay_size.y - HUD_BOTTOM_HEIGHT))
+                        .show(ctx, |ui| {
+                            ui.set_min_size(egui::vec2(overlay_size.x, HUD_BOTTOM_HEIGHT));
+                        });
+                },
+            );
+            cursor_icons.push(output.platform_output.cursor_icon);
+        }
+
+        assert_eq!(
+            cursor_icons,
+            vec![
+                egui::CursorIcon::ResizeHorizontal,
+                egui::CursorIcon::ResizeHorizontal,
+                egui::CursorIcon::ResizeHorizontal,
+                egui::CursorIcon::Default,
+            ],
+            "the strip must claim its cursor during layer warm-up, but not after PointerGone"
+        );
+    }
 
     #[test]
     fn first_present_transition_does_not_invalidate_the_prepared_scale_signature() {

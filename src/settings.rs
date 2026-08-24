@@ -5155,6 +5155,13 @@ impl VideoSeekStripState {
     pub const fn restore(last_choice: VideoSeekStripMode) -> Self {
         Self::from_mode(last_choice)
     }
+
+    pub const fn toggle(self, last_choice: VideoSeekStripMode) -> Self {
+        match self {
+            Self::None => Self::restore(last_choice),
+            Self::Thumbnails | Self::Waveform => Self::None,
+        }
+    }
 }
 
 fn default_video_seek_strip_min_interval_secs() -> f64 {
@@ -7940,6 +7947,18 @@ mod tests {
         assert_eq!(
             VideoSeekStripState::restore(last),
             VideoSeekStripState::Waveform
+        );
+        assert_eq!(
+            VideoSeekStripState::None.toggle(last),
+            VideoSeekStripState::Waveform
+        );
+        assert_eq!(
+            VideoSeekStripState::Thumbnails.toggle(last),
+            VideoSeekStripState::None
+        );
+        assert_eq!(
+            VideoSeekStripState::Waveform.toggle(last),
+            VideoSeekStripState::None
         );
     }
 

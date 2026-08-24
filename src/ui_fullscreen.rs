@@ -46,7 +46,9 @@ use crate::keymap::{
     KeyTrigger, Keymap, ModKind, command_catalog, modifier_held_via_os,
 };
 #[cfg(windows)]
-use crate::keymap::{DiagnosticChordPressSnapshot, VIDEO_ADJUST_SLOT_ACTIONS};
+use crate::keymap::{
+    DiagnosticChordPressSnapshot, VIDEO_ADJUST_SLOT_ACTIONS, VIDEO_SEEK_STRIP_ACTIONS,
+};
 use crate::pdf_loader::PdfPageContentType;
 use crate::settings::{
     FULLSCREEN_NAVIGATOR_SIZE_MAX, FULLSCREEN_NAVIGATOR_SIZE_MIN, FullscreenFitMode,
@@ -34092,7 +34094,11 @@ impl App {
         // S (スライドショー) とは handle_video_input 先行 consume で分離する。
         let tile_key = self.keymap.consume_action(ctx, KeyAction::VideoTileMode);
         #[cfg(windows)]
-        let seek_strip_key = self.keymap.consume_action(ctx, KeyAction::VideoSeekStrip);
+        let seek_strip_action = self.keymap.consume_first_action(
+            ctx,
+            FS_VIDEO_ACTIVE_SCOPES,
+            &VIDEO_SEEK_STRIP_ACTIONS,
+        );
         // F キーでフレームレート / Perf オーバーレイのトグル (動画モード限定)。
         // 以前 P を使っていたが、P は「現在フレームをピン留め」に再割り当てしたので
         // 移動した (F = Frames / FPS の mnemonic)。画像モードの F は未使用なので
@@ -34292,8 +34298,8 @@ impl App {
         #[cfg(not(windows))]
         let _ = tile_key;
         #[cfg(windows)]
-        if seek_strip_key {
-            self.toggle_video_seek_strip(fs_idx);
+        if let Some(action) = seek_strip_action {
+            self.apply_video_seek_strip_action(fs_idx, action);
             self.sync_native_video_seek_strip(ctx, fs_idx);
         }
         if perf_key {

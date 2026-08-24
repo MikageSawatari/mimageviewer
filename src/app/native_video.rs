@@ -1,6 +1,7 @@
 use super::*;
 use crate::keymap::{
     CommandDisplayRow, CommandScope, FS_VIDEO_ACTIVE_SCOPES, KeyAction, VIDEO_ADJUST_SLOT_ACTIONS,
+    VIDEO_SEEK_STRIP_ACTIONS,
 };
 
 #[cfg(windows)]
@@ -6859,8 +6860,23 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn toggle_video_seek_strip(&mut self, fs_idx: usize) -> bool {
-        let next = self.settings.video_seek_strip_state.cycle();
+    pub(crate) fn apply_video_seek_strip_action(
+        &mut self,
+        fs_idx: usize,
+        action: KeyAction,
+    ) -> bool {
+        debug_assert!(VIDEO_SEEK_STRIP_ACTIONS.contains(&action));
+        let current = self.settings.video_seek_strip_state;
+        let next = match action {
+            KeyAction::VideoSeekStripCycle => current.cycle(),
+            KeyAction::VideoSeekStripToggle => {
+                current.toggle(self.settings.video_seek_strip_last_choice)
+            }
+            KeyAction::VideoSeekStripNone => crate::settings::VideoSeekStripState::None,
+            KeyAction::VideoSeekStripThumbnails => crate::settings::VideoSeekStripState::Thumbnails,
+            KeyAction::VideoSeekStripWaveform => crate::settings::VideoSeekStripState::Waveform,
+            _ => return false,
+        };
         self.set_video_seek_strip_state(fs_idx, next)
     }
 
@@ -8928,11 +8944,47 @@ impl App {
             _ if !key.repeat
                 && self
                     .keymap
-                    .matches_vk_action(KeyAction::VideoSeekStrip, &key) =>
+                    .matches_vk_action(KeyAction::VideoSeekStripCycle, &key) =>
             {
-                self.toggle_video_seek_strip(fs_idx);
+                self.apply_video_seek_strip_action(fs_idx, KeyAction::VideoSeekStripCycle);
                 self.sync_native_video_seek_strip(ctx, fs_idx);
-                NativeVideoKeyOutcome::Action(KeyAction::VideoSeekStrip)
+                NativeVideoKeyOutcome::Action(KeyAction::VideoSeekStripCycle)
+            }
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoSeekStripToggle, &key) =>
+            {
+                self.apply_video_seek_strip_action(fs_idx, KeyAction::VideoSeekStripToggle);
+                self.sync_native_video_seek_strip(ctx, fs_idx);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoSeekStripToggle)
+            }
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoSeekStripNone, &key) =>
+            {
+                self.apply_video_seek_strip_action(fs_idx, KeyAction::VideoSeekStripNone);
+                self.sync_native_video_seek_strip(ctx, fs_idx);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoSeekStripNone)
+            }
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoSeekStripThumbnails, &key) =>
+            {
+                self.apply_video_seek_strip_action(fs_idx, KeyAction::VideoSeekStripThumbnails);
+                self.sync_native_video_seek_strip(ctx, fs_idx);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoSeekStripThumbnails)
+            }
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::VideoSeekStripWaveform, &key) =>
+            {
+                self.apply_video_seek_strip_action(fs_idx, KeyAction::VideoSeekStripWaveform);
+                self.sync_native_video_seek_strip(ctx, fs_idx);
+                NativeVideoKeyOutcome::Action(KeyAction::VideoSeekStripWaveform)
             }
             // B: add video bookmark.
             _ if !key.repeat

@@ -468,7 +468,11 @@
 # VideoPin = P ; 現在の再生位置を代表フレームとしてピン留めする
 # VideoPerfOverlay = F ; 動画の性能オーバーレイを切り替える
 # VideoTileMode = S ; 動画タイルモードを切り替える
-# VideoSeekStrip = Shift+S ; 動画のシークストリップ表示を切り替える
+# VideoSeekStripCycle = Shift+S ; 動画のシークストリップをなし、サムネイル、音声波形の順に切り替える
+# VideoSeekStripToggle = none ; 動画のシークストリップを表示または非表示にする（表示時は前回の種類を復元）
+# VideoSeekStripNone = none ; 動画のシークストリップを非表示にする
+# VideoSeekStripThumbnails = none ; 動画のシークストリップをサムネイル表示にする
+# VideoSeekStripWaveform = none ; 動画のシークストリップを音声波形表示にする
 # VideoScaleFilterNext = T ; 動画の拡大方法を順に切り替える
 # VideoAnime4kRemeasure = none ; 動画の Anime4K の性能をもう一度測定する
 # VideoBookmark = B ; 現在の再生位置にブックマークを追加する

@@ -813,7 +813,10 @@ F12 は F11 のフルスクリーン / ウィンドウ内選択を変更せず�
   描画順は進捗塗り → 目盛り → chapter / bookmark / pin とし、既存マーカーを前面に保つ。
 - 動画シークストリップの保存状態は `Settings.video_seek_strip_state` の
   `none / thumbnails / waveform` の 3 値ひとつとし、開閉 bool と mode を分けない。
-  `VideoSeekStrip` (既定 `Shift+S`) は「なし → サムネイル → 波形 → なし」を巡回する。
+  `VideoSeekStripCycle` (既定 `Shift+S`) は「なし → サムネイル → 波形 → なし」を巡回する。
+  既定 chord なしの `VideoSeekStripToggle` は表示 / 非表示を切り替えて、再表示時は最後の
+  non-none 選択を復元する。`VideoSeekStripNone` / `VideoSeekStripThumbnails` /
+  `VideoSeekStripWaveform` は指定状態へ直接移る。
   シークバーから上へドラッグした場合は、明示保存した最後の non-none 選択へ戻す。
   下部ロックボタンの左にベクター描画のフィルムアイコンを置き、1 クリックで同じ順に巡回する。
   OFF は非アクティブ表示、波形はフィルム上にベクター描画の音符を重ねる。ストリップ本体は全域を

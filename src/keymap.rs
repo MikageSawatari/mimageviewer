@@ -1703,7 +1703,11 @@ pub enum KeyAction {
     VideoPin,
     VideoPerfOverlay,
     VideoTileMode,
-    VideoSeekStrip,
+    VideoSeekStripCycle,
+    VideoSeekStripToggle,
+    VideoSeekStripNone,
+    VideoSeekStripThumbnails,
+    VideoSeekStripWaveform,
     VideoScaleFilterNext,
     VideoAnime4kRemeasure,
     VideoBookmark,
@@ -1809,6 +1813,15 @@ pub const VIDEO_ADJUST_SLOT_ACTIONS: [KeyAction; 10] = [
     KeyAction::VideoAdjustSlot8,
     KeyAction::VideoAdjustSlot9,
     KeyAction::VideoAdjustSlot10,
+];
+
+/// Video seek-strip actions in input-dispatch priority order.
+pub const VIDEO_SEEK_STRIP_ACTIONS: [KeyAction; 5] = [
+    KeyAction::VideoSeekStripCycle,
+    KeyAction::VideoSeekStripToggle,
+    KeyAction::VideoSeekStripNone,
+    KeyAction::VideoSeekStripThumbnails,
+    KeyAction::VideoSeekStripWaveform,
 ];
 
 const ALL_ACTIONS: &[KeyAction] = &[
@@ -2158,7 +2171,11 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::VideoPin,
     KeyAction::VideoPerfOverlay,
     KeyAction::VideoTileMode,
-    KeyAction::VideoSeekStrip,
+    KeyAction::VideoSeekStripCycle,
+    KeyAction::VideoSeekStripToggle,
+    KeyAction::VideoSeekStripNone,
+    KeyAction::VideoSeekStripThumbnails,
+    KeyAction::VideoSeekStripWaveform,
     KeyAction::VideoScaleFilterNext,
     KeyAction::VideoAnime4kRemeasure,
     KeyAction::VideoBookmark,
@@ -3684,7 +3701,11 @@ impl KeyAction {
             VideoPin => "VideoPin",
             VideoPerfOverlay => "VideoPerfOverlay",
             VideoTileMode => "VideoTileMode",
-            VideoSeekStrip => "VideoSeekStrip",
+            VideoSeekStripCycle => "VideoSeekStripCycle",
+            VideoSeekStripToggle => "VideoSeekStripToggle",
+            VideoSeekStripNone => "VideoSeekStripNone",
+            VideoSeekStripThumbnails => "VideoSeekStripThumbnails",
+            VideoSeekStripWaveform => "VideoSeekStripWaveform",
             VideoScaleFilterNext => "VideoScaleFilterNext",
             VideoAnime4kRemeasure => "VideoAnime4kRemeasure",
             VideoBookmark => "VideoBookmark",
@@ -4244,7 +4265,15 @@ impl KeyAction {
             VideoPin => "現在の再生位置を代表フレームとしてピン留めする",
             VideoPerfOverlay => "動画の性能オーバーレイを切り替える",
             VideoTileMode => "動画タイルモードを切り替える",
-            VideoSeekStrip => "動画のシークストリップ表示を切り替える",
+            VideoSeekStripCycle => {
+                "動画のシークストリップをなし、サムネイル、音声波形の順に切り替える"
+            }
+            VideoSeekStripToggle => {
+                "動画のシークストリップを表示または非表示にする（表示時は前回の種類を復元）"
+            }
+            VideoSeekStripNone => "動画のシークストリップを非表示にする",
+            VideoSeekStripThumbnails => "動画のシークストリップをサムネイル表示にする",
+            VideoSeekStripWaveform => "動画のシークストリップを音声波形表示にする",
             VideoScaleFilterNext => "動画の拡大方法を順に切り替える",
             VideoAnime4kRemeasure => "動画の Anime4K の性能をもう一度測定する",
             VideoBookmark => "現在の再生位置にブックマークを追加する",
@@ -4669,7 +4698,11 @@ impl KeyAction {
             | VideoPin
             | VideoPerfOverlay
             | VideoTileMode
-            | VideoSeekStrip
+            | VideoSeekStripCycle
+            | VideoSeekStripToggle
+            | VideoSeekStripNone
+            | VideoSeekStripThumbnails
+            | VideoSeekStripWaveform
             | VideoScaleFilterNext
             | VideoAnime4kRemeasure
             | VideoBookmark
@@ -5076,7 +5109,11 @@ impl KeyAction {
             | VideoPin
             | VideoPerfOverlay
             | VideoTileMode
-            | VideoSeekStrip
+            | VideoSeekStripCycle
+            | VideoSeekStripToggle
+            | VideoSeekStripNone
+            | VideoSeekStripThumbnails
+            | VideoSeekStripWaveform
             | VideoScaleFilterNext
             | VideoAnime4kRemeasure
             | VideoBookmark
@@ -5524,7 +5561,11 @@ impl KeyAction {
             VideoPin => ChordList::one(Chord::key(P)),
             VideoPerfOverlay => ChordList::one(Chord::key(F)),
             VideoTileMode => ChordList::one(Chord::key(S)),
-            VideoSeekStrip => ChordList::one(Chord::shift(S)),
+            VideoSeekStripCycle => ChordList::one(Chord::shift(S)),
+            VideoSeekStripToggle
+            | VideoSeekStripNone
+            | VideoSeekStripThumbnails
+            | VideoSeekStripWaveform => ChordList::EMPTY,
             VideoScaleFilterNext => ChordList::one(Chord::key(T)),
             VideoAnime4kRemeasure => ChordList::EMPTY,
             VideoBookmark => ChordList::one(Chord::key(B)),
@@ -8921,6 +8962,14 @@ mod tests {
         );
         egui_actions.extend(VIDEO_ADJUST_SLOT_ACTIONS);
 
+        let egui_seek_strip_route =
+            "consume_first_action(ctx,FS_VIDEO_ACTIVE_SCOPES,&VIDEO_SEEK_STRIP_ACTIONS,)";
+        assert!(
+            egui_compact.contains(egui_seek_strip_route),
+            "egui video seek-strip route changed; update this inventory test with it"
+        );
+        egui_actions.extend(VIDEO_SEEK_STRIP_ACTIONS);
+
         let egui_file_navigation_route = "consume_first_action(ctx,FS_VIDEO_ACTIVE_SCOPES,&[KeyAction::VideoPrevFile,KeyAction::VideoNextFile],)";
         assert!(
             egui_compact.contains(egui_file_navigation_route),
@@ -9126,6 +9175,40 @@ mod tests {
                     chord.display_name()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn video_seek_strip_actions_have_the_expected_keymap_contract() {
+        assert_eq!(
+            VIDEO_SEEK_STRIP_ACTIONS,
+            [
+                KeyAction::VideoSeekStripCycle,
+                KeyAction::VideoSeekStripToggle,
+                KeyAction::VideoSeekStripNone,
+                KeyAction::VideoSeekStripThumbnails,
+                KeyAction::VideoSeekStripWaveform,
+            ]
+        );
+        for action in VIDEO_SEEK_STRIP_ACTIONS {
+            assert!(KeyAction::all().contains(&action));
+            assert_eq!(action.context(), KeyContext::FsVideo);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
+        }
+        assert_eq!(
+            KeyAction::VideoSeekStripCycle
+                .default_chords()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Chord::shift(KeyName::S)]
+        );
+        for action in VIDEO_SEEK_STRIP_ACTIONS.into_iter().skip(1) {
+            assert!(
+                action.default_chords().is_empty(),
+                "{} must not claim a scarce FsVideo default chord",
+                action.ini_name()
+            );
         }
     }
 

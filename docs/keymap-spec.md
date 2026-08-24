@@ -93,8 +93,11 @@ keymap 対象にする。`Esc` / 修飾なし矢印ナビゲーション、Ctrl+
 消して音声だけ聴くモードは、どちらも `[FsVideo]` のキーをそのまま流用する。映像 ↔ 音声の切り替えは
 `VideoToggleAudioMode` (既定 <kbd>Z</kbd>)。`VideoLoop` / `VideoBookmark` / `VideoMarkerPrev` /
 `VideoMarkerNext` は音楽ビューでは音楽のループ / ブックマーク / ブックマーク移動へ翻訳される。
-動画のシークストリップは `VideoSeekStrip` (既定 <kbd>Shift</kbd>+<kbd>S</kbd>) で
-「なし → サムネイル → 音声波形 → なし」の順に切り替える。
+動画のシークストリップは `VideoSeekStripCycle` (既定 <kbd>Shift</kbd>+<kbd>S</kbd>) で
+「なし → サムネイル → 音声波形 → なし」の順に切り替える。`VideoSeekStripToggle` は
+表示中なら閉じ、非表示なら上ドラッグと同じく最後に選んだサムネイル / 音声波形を復元する。
+`VideoSeekStripNone` / `VideoSeekStripThumbnails` / `VideoSeekStripWaveform` は指定状態へ直接移る。
+この追加 4 action に既定 chord はなく、ユーザーが `[FsVideo]` で任意に割り当てる。
 動画専用の `VideoTileMode` / `VideoCapture` / `VideoFrameStep` / `VideoPin` は音楽ビューでは無効
 (キャプチャパレット / コマ送り UI を出さない)。`VideoAdjustSlot1..10` も映像が隠れている通常の
 音声モードでは無効だが、VST GUI 表示で presenter が再表示され映像が見えている間は有効。
