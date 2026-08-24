@@ -44,11 +44,16 @@ enum Behavior {
 }
 
 /// 先頭行 (最大 64 バイト) を読んで挙動を決める。
+///
+/// **NUL も行の終わりとして扱う。** `IsSupported` に渡ってくるのは 2048 バイトの
+/// 固定バッファで、短いファイルでは残りが NUL 埋めになる。`trim_ascii` が削るのは
+/// ASCII 空白だけで NUL は残るため、これが無いと 5 バイトのファイルが
+/// `"MIVOK\0\0..."` として届き、どの挙動にも一致しない。
 fn behavior_from_bytes(bytes: &[u8]) -> Behavior {
     let head = &bytes[..bytes.len().min(64)];
     let line_end = head
         .iter()
-        .position(|&b| b == b'\r' || b == b'\n')
+        .position(|&b| b == b'\r' || b == b'\n' || b == 0)
         .unwrap_or(head.len());
     match head[..line_end].trim_ascii() {
         b"MIVOK" => Behavior::Ok,
@@ -257,6 +262,23 @@ mod tests {
     fn trailing_spaces_do_not_change_the_selection() {
         assert_eq!(behavior_from_bytes(b"MIVOK  \n"), Behavior::Ok);
         assert_eq!(behavior_from_bytes(b"  MIVCRASH\n"), Behavior::Crash);
+    }
+
+    /// `IsSupported` は 2048 バイトの固定バッファを渡してくるので、短いファイルは
+    /// NUL 埋めで届く。最初の実装はこれを見落として何も認識できず、プラグインが
+    /// ロードされていないように見えた。実際に渡ってくる形をそのまま試す。
+    #[test]
+    fn a_short_file_arrives_nul_padded_and_still_selects() {
+        let mut buffer = [0u8; 2048];
+        buffer[..5].copy_from_slice(b"MIVOK");
+        assert_eq!(behavior_from_bytes(&buffer), Behavior::Ok);
+
+        let mut buffer = [0u8; 2048];
+        buffer[..8].copy_from_slice(b"MIVCRASH");
+        assert_eq!(behavior_from_bytes(&buffer), Behavior::Crash);
+
+        // 中身が空のバッファは「対応しない」であって、どれかの挙動ではない。
+        assert_eq!(behavior_from_bytes(&[0u8; 2048]), Behavior::Unsupported);
     }
 
     /// 50% 判定は「同じ入力でも落ちたり落ちなかったりする」ことが要件なので、
