@@ -18,13 +18,20 @@
 # This script builds only the application core. It does not run the result or
 # touch the normal application data.
 #
+# When another worktree is building native code, this waits for it rather than
+# racing it into an MSB3191 failure. Pass -WaitForOtherBuildsMinutes 0 to skip.
+#
 # Usage:
 #   .\scripts\build-dev.ps1
 #   .\scripts\build-dev.ps1 -TestScript
+#   .\scripts\build-dev.ps1 -WaitForOtherBuildsMinutes 0
 
 [CmdletBinding()]
 param(
-    [switch] $TestScript
+    [switch] $TestScript,
+    # Wait this long for another worktree's native build to finish before
+    # starting. 0 disables the wait. See Wait-ForOtherNativeBuilds.
+    [int] $WaitForOtherBuildsMinutes = 30
 )
 
 $ErrorActionPreference = 'Stop'
@@ -115,8 +122,40 @@ function Copy-IfChanged {
     }
 }
 
+function Wait-ForOtherNativeBuilds {
+    # turbojpeg-sys drives cmake/MSBuild from the shared cargo registry copy of
+    # libjpeg-turbo. Two worktrees building it at once fail with MSB3191
+    # ("cannot create directory ... access is denied") on the .tlog directories,
+    # even though each worktree has its own target dir. Waiting is cheaper than
+    # the failed build: the C library is only rebuilt once per worktree.
+    #
+    # CMAKE_BUILD_PARALLEL_LEVEL does not help -- the cmake crate passes its own
+    # --parallel, so lowering it is ignored.
+    $waited = $false
+    $deadline = (Get-Date).AddMinutes($WaitForOtherBuildsMinutes)
+    while (@(Get-Process MSBuild -ErrorAction SilentlyContinue).Count -gt 0) {
+        if ((Get-Date) -gt $deadline) {
+            Write-Host ("[build-dev] still waiting after {0} min; building anyway" -f
+                $WaitForOtherBuildsMinutes)
+            return
+        }
+        if (-not $waited) {
+            Write-Host '[build-dev] another worktree is building native code; waiting for it'
+            $waited = $true
+        }
+        Start-Sleep -Seconds 20
+    }
+    if ($waited) {
+        Write-Host '[build-dev] other build finished; starting'
+    }
+}
+
 Push-Location $repoRoot
 try {
+    if ($WaitForOtherBuildsMinutes -gt 0) {
+        Wait-ForOtherNativeBuilds
+    }
+
     # Stop only the development-profile executables when they lock the output.
     Stop-StagedProcess -ExeName 'mimageviewer-core' -ExePath $coreExe -Label 'core'
     Stop-StagedProcess -ExeName 'mimageviewer-remote' -ExePath $remoteExe -Label 'remote service'

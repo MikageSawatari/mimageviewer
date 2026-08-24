@@ -63,8 +63,23 @@
 
 ## 6. 運用
 
-- worktree は `vendor/` を **実体コピー** (junction 禁止)。撤収は必ず
-  `scripts/safe-worktree-remove.ps1` 経由。
+- worktree は `vendor/` を **実体コピー** (junction 禁止)。`vendor/eframe` と
+  `vendor/egui-wgpu` は **git 追跡下**なのでコピーしない (改行だけ違う 29 ファイルが M になる)。
+  撤収は必ず `scripts/safe-worktree-remove.ps1` 経由。
+- **新しい worktree で `cargo test` を走らせる前に、FFmpeg DLL を `target\debug` へ置く。**
+  無いとテスト実行体が `STATUS_DLL_NOT_FOUND` (exit `-1073741515`) で即死し、テストが 1 件も
+  走らないまま落ちる。`Copy-Item vendor\ffmpeg\bin\*.dll target\debug\ -Force`。
+  `build-dev.ps1` が置くのは `target\dev-runtime` の方なので、これとは別に要る。
+- **レーンをまたいで native ビルドを同時に走らせない。** `turbojpeg-sys` の cmake は
+  共有 cargo registry の libjpeg-turbo から MSBuild を回すため、2 つの worktree が同時に
+  ビルドすると `.tlog` ディレクトリの作成で `MSB3191` (アクセス拒否) で落ちる。
+  target dir が別でも起きる。`CMAKE_BUILD_PARALLEL_LEVEL` を下げても効かない
+  (cmake クレートが自前の `--parallel` を渡すため)。
+  **`build-dev.ps1` は他の `MSBuild` が居たら空くまで待つ** (既定 30 分、
+  `-WaitForOtherBuildsMinutes 0` で無効化)。それ以外の経路で `cargo build` を打つときは
+  `Get-Process MSBuild` を先に見る。
+- テスト実行体が `0xC0000005` (アクセス違反) で落ちることがある。**間欠**で、同じコードが
+  次の実行で通る。2 回続けて同じ位置で落ちるなら別の話として扱う。
 - 共有作業ツリーでのコミットは pathspec commit (`git commit -- <自分のパス>`)。
 - 既存 worktree: `detached-rework` と `video-upscale-shader` は master へ取り込み済みで撤収候補。
   `seek-thumb-bench` は 2 コミット未マージ (シークサムネイルの計測計装) — **レーン B で
