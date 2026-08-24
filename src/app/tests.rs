@@ -12690,6 +12690,48 @@ fn detached_bookmark_image_folder_routes_without_replacing_main_bookmark_grid() 
 
 #[cfg(windows)]
 #[test]
+fn closed_bookmark_summary_read_folds_all_terminal_values() {
+    let target = crate::bookmark_browser::BookmarkViewReturnTarget::Book(PathBuf::from(
+        r"C:\Books\opened.pdf",
+    ));
+    let image_path = PathBuf::from(r"C:\Books\cover.jpg");
+    let media_path = PathBuf::from(r"C:\Books\track.flac");
+    let archive_source = PathBuf::from(r"C:\Books\source.zip");
+    let current_folder = PathBuf::from(r"C:\Books\expanded-cache");
+    let mut closed = super::ViewerContextBundle::empty();
+    closed.bookmark_view_state = Some(super::BookmarkViewState::Detached {
+        target: target.clone(),
+    });
+    closed.items = vec![
+        GridItem::Image(image_path),
+        GridItem::Audio(media_path.clone()),
+    ];
+    closed.selected = Some(1);
+    closed.archive_source_override = Some(archive_source.clone());
+    closed.current_folder = Some(current_folder.clone());
+    closed.pdf_password_request = Some(super::PdfPasswordRequest {
+        path: PathBuf::from(r"C:\Books\protected.pdf"),
+    });
+
+    let summary = super::ClosedBookmarkSummary::read(&closed);
+
+    assert_eq!(summary.bookmark_target, Some(target.clone()));
+    assert_eq!(summary.selected_media_path, Some(media_path));
+    assert_eq!(summary.destination, Some(archive_source));
+    assert!(summary.had_pdf_password_request);
+
+    closed.selected = Some(0);
+    closed.archive_source_override = None;
+    closed.pdf_password_request = None;
+    let image_summary = super::ClosedBookmarkSummary::read(&closed);
+    assert_eq!(image_summary.bookmark_target, Some(target));
+    assert_eq!(image_summary.selected_media_path, None);
+    assert_eq!(image_summary.destination, Some(current_folder));
+    assert!(!image_summary.had_pdf_password_request);
+}
+
+#[cfg(windows)]
+#[test]
 fn detached_bookmark_book_close_restores_main_grid_even_after_page_navigation() {
     let mut app = phase_c_support::setup_app();
     let container = PathBuf::from(r"C:\Books\volume.pdf");
@@ -12705,7 +12747,8 @@ fn detached_bookmark_book_close_restores_main_grid_even_after_page_navigation() 
     });
     closed.current_folder = Some(PathBuf::from(r"C:\Books\another-volume.pdf"));
 
-    app.reconcile_closed_bookmark_detached_context(&closed);
+    let summary = super::ClosedBookmarkSummary::read(&closed);
+    app.reconcile_closed_bookmark_detached_context(&summary);
 
     assert!(app.items_are_bookmark_view);
     assert!(matches!(
@@ -37709,6 +37752,63 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn detached_terminal_close_digest_clears_only_orphaned_pdf_dialog_state() {
+        for main_has_request in [false, true] {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            let window_id = if main_has_request { 504 } else { 503 };
+            let detached_pdf = PathBuf::from(r"C:\Books\detached-protected.pdf");
+            let main_pdf = PathBuf::from(r"C:\Books\main-protected.pdf");
+            let mut bundle = ViewerContextBundle::empty();
+            bundle.pdf_password_request = Some(PdfPasswordRequest { path: detached_pdf });
+            bundle
+                .viewer_session
+                .activate_independent_detached(window_id);
+            app.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+            app.begin_active_detached_session(window_id, DetachedSource::Book);
+            if main_has_request {
+                app.pdf_password_request = Some(PdfPasswordRequest {
+                    path: main_pdf.clone(),
+                });
+            }
+            app.show_pdf_password_dialog = true;
+            app.pdf_password_input = "entered-password".to_owned();
+            app.pdf_password_error = Some("wrong password".to_owned());
+            app.pdf_password_save = true;
+
+            let mut summary = None;
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                summary = app.take_and_close_current_active_detached_viewer_context(
+                    ctx,
+                    "test_pdf_terminal_close",
+                );
+            });
+            let summary = summary.expect("the detached context must be closed");
+
+            assert!(summary.had_pdf_password_request);
+            if main_has_request {
+                assert!(app.show_pdf_password_dialog);
+                assert_eq!(app.pdf_password_input, "entered-password");
+                assert_eq!(app.pdf_password_error.as_deref(), Some("wrong password"));
+                assert!(app.pdf_password_save);
+                assert_eq!(
+                    app.pdf_password_request
+                        .as_ref()
+                        .map(|request| request.path.as_path()),
+                    Some(main_pdf.as_path())
+                );
+            } else {
+                assert!(!app.show_pdf_password_dialog);
+                assert!(app.pdf_password_input.is_empty());
+                assert!(app.pdf_password_error.is_none());
+                assert!(!app.pdf_password_save);
+                assert!(app.pdf_password_request.is_none());
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn detached_terminal_before_viewport_finalizes_session_and_runtime() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -49110,6 +49210,137 @@ mod still_window_mode_key_tests {
         assert!(app.video_tile_reopen_deadline.is_some());
         assert_eq!(app.native_video_deferred_nav_delta, Some(-1));
         assert!(app.native_video_mode_switch.is_some());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn media_teardown_two_parked_bundles_saves_both_resumes_before_each_drop() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.video_tile_cache = None;
+        let first_path = PathBuf::from(r"C:\clips\teardown-first.mp4");
+        let second_path = PathBuf::from(r"C:\clips\teardown-second.mp4");
+
+        let make_bundle = |path: PathBuf, displayed_pts: f64| {
+            let mut bundle = ViewerContextBundle::empty();
+            bundle.items.push(GridItem::Video(path.clone()));
+            bundle.fullscreen_idx = Some(0);
+            let player = crate::video::VideoPlayer::disconnected_for_test(path, 120.0);
+            player.set_last_displayed_pts_for_test(displayed_pts);
+            bundle.fs_cache.insert(
+                0,
+                FsCacheEntry::Video {
+                    player: Box::new(player),
+                    load_seq: 0,
+                },
+            );
+            bundle
+        };
+        app.detached_image_windows.push(parked_bundle_snapshot(
+            &ctx,
+            611,
+            make_bundle(first_path.clone(), 21.0),
+        ));
+        app.detached_image_windows.push(parked_bundle_snapshot(
+            &ctx,
+            612,
+            make_bundle(second_path.clone(), 42.0),
+        ));
+
+        app.teardown_paused_media_bundles_for_window_ids(&[611, 612], "test_two_bundle_teardown");
+
+        assert_eq!(
+            app.settings
+                .video_resume_positions
+                .get(&crate::adjustment_db::normalize_path(&first_path)),
+            Some(&21.0)
+        );
+        assert_eq!(
+            app.settings
+                .video_resume_positions
+                .get(&crate::adjustment_db::normalize_path(&second_path)),
+            Some(&42.0)
+        );
+        assert!(
+            app.detached_image_windows
+                .iter()
+                .all(|window| window.paused_bundle.is_none())
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn media_teardown_preserves_mode_switch_when_surviving_parked_window_has_video() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let mut closing = ViewerContextBundle::empty();
+        closing
+            .items
+            .push(GridItem::Video(PathBuf::from(r"C:\clips\closing.mp4")));
+        closing.fullscreen_idx = Some(0);
+        let mut surviving = ViewerContextBundle::empty();
+        surviving
+            .items
+            .push(GridItem::Video(PathBuf::from(r"C:\clips\surviving.mp4")));
+        surviving.fullscreen_idx = Some(0);
+        app.detached_image_windows
+            .push(parked_bundle_snapshot(&ctx, 621, closing));
+        app.detached_image_windows
+            .push(parked_bundle_snapshot(&ctx, 622, surviving));
+        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
+            request_id: 621,
+            target_presentation: ViewerPresentation::DetachedWindow,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            announce_main_hint: false,
+        });
+
+        app.teardown_paused_media_bundles_for_window_ids(
+            &[621],
+            "test_surviving_video_mode_switch",
+        );
+
+        assert!(app.native_video_mode_switch.is_some());
+        assert!(app.detached_image_windows[0].paused_bundle.is_none());
+        assert!(app.detached_image_windows[1].paused_bundle.is_some());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn media_teardown_skips_a_bundleless_window_without_abandoning_the_rest() {
+        // 閉じる窓の先頭が bundle を持たない。ここで continue ではなく関数を抜けると、
+        // 後ろの窓の resume が保存されない。②-d では retire の Err を握り潰す形が同じ穴になる。
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.video_tile_cache = None;
+        let path = PathBuf::from(r"C:\clips\teardown-after-gap.mp4");
+        let mut empty_window = parked_bundle_snapshot(&ctx, 631, ViewerContextBundle::empty());
+        empty_window.paused_bundle = None;
+        app.detached_image_windows.push(empty_window);
+
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items.push(GridItem::Video(path.clone()));
+        bundle.fullscreen_idx = Some(0);
+        let player = crate::video::VideoPlayer::disconnected_for_test(path.clone(), 120.0);
+        player.set_last_displayed_pts_for_test(33.0);
+        bundle.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.detached_image_windows
+            .push(parked_bundle_snapshot(&ctx, 632, bundle));
+
+        app.teardown_paused_media_bundles_for_window_ids(&[631, 632], "test_bundleless_window");
+
+        assert_eq!(
+            app.settings
+                .video_resume_positions
+                .get(&crate::adjustment_db::normalize_path(&path)),
+            Some(&33.0)
+        );
+        assert!(app.detached_image_windows[1].paused_bundle.is_none());
     }
 
     #[test]

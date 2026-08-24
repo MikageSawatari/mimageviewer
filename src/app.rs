@@ -2380,6 +2380,44 @@ impl BookmarkViewState {
     }
 }
 
+/// 終端 close された context から、閉じた後に必要な所有値だけを取り出したもの。
+#[cfg(windows)]
+struct ClosedBookmarkSummary {
+    /// `bundle.bookmark_view_state.as_ref().and_then(BookmarkViewState::target).cloned()`。
+    bookmark_target: Option<crate::bookmark_browser::BookmarkViewReturnTarget>,
+    /// `selected` が指す item が `Video` / `Audio` のときだけ `Some`。
+    selected_media_path: Option<PathBuf>,
+    /// `archive_source_override` を優先し、無ければ `current_folder`。
+    destination: Option<PathBuf>,
+    /// `pdf_password_request.is_some()`。
+    had_pdf_password_request: bool,
+}
+
+#[cfg(windows)]
+impl ClosedBookmarkSummary {
+    fn read(bundle: &ViewerContextBundle) -> Self {
+        let selected_media_path = bundle.selected.and_then(|idx| {
+            bundle.items.get(idx).and_then(|item| match item {
+                GridItem::Video(path) | GridItem::Audio(path) => Some(path.clone()),
+                _ => None,
+            })
+        });
+        Self {
+            bookmark_target: bundle
+                .bookmark_view_state
+                .as_ref()
+                .and_then(BookmarkViewState::target)
+                .cloned(),
+            selected_media_path,
+            destination: bundle
+                .archive_source_override
+                .clone()
+                .or_else(|| bundle.current_folder.clone()),
+            had_pdf_password_request: bundle.pdf_password_request.is_some(),
+        }
+    }
+}
+
 /// このプロセスで path-keyed rating DB に適用した最新値。
 ///
 /// DB は main / detached / parked context で共有されるため、idx cache と違ってこの台帳は
@@ -38661,7 +38699,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         reason: &'static str,
-    ) -> Option<ViewerContextBundle> {
+    ) -> Option<ClosedBookmarkSummary> {
         let Some(mut active) = self.active_detached_viewer_context.take() else {
             return None;
         };
@@ -38678,15 +38716,17 @@ impl App {
         let closed_context = self.take_current_viewer_context_bundle();
         self.swap_viewer_context_bundle(&mut active.bundle);
         self.finish_active_detached_session_close(reason);
+        let summary = ClosedBookmarkSummary::read(&closed_context);
+        drop(closed_context);
         // PDF password dialog の UI state 自体は App-global だが、request owner は bundle。
         // viewport 作成前の terminal close で owner を捨てた後に orphan dialog を残さない。
-        if closed_context.pdf_password_request.is_some() && self.pdf_password_request.is_none() {
+        if summary.had_pdf_password_request && self.pdf_password_request.is_none() {
             self.show_pdf_password_dialog = false;
             self.pdf_password_input.clear();
             self.pdf_password_error = None;
             self.pdf_password_save = false;
         }
-        Some(closed_context)
+        Some(summary)
     }
 
     #[cfg(windows)]
@@ -39533,36 +39573,23 @@ impl App {
         if clears_mode_switch {
             self.native_video_mode_switch = None;
         }
-        let mut dropped_bundles = Vec::new();
+        let mut plans = Vec::new();
         for window in &mut self.detached_image_windows {
-            if window_ids.contains(&window.id)
-                && let Some(bundle) = window.paused_bundle.take()
-            {
-                dropped_bundles.push(bundle);
+            if window_ids.contains(&window.id) {
+                if let Some(mut bundle) = window.paused_bundle.take() {
+                    let plan = viewer_context_media_teardown_plan(&bundle);
+                    bundle.normalize_ui_states.clear();
+                    bundle.normalize_auto_scan_suppressed.clear();
+                    drop(bundle);
+                    plans.push(plan);
+                }
             }
         }
-        self.teardown_paused_media_bundles(dropped_bundles, reason);
-    }
-
-    #[cfg(windows)]
-    fn teardown_paused_media_bundles(
-        &mut self,
-        mut dropped_bundles: Vec<Box<ViewerContextBundle>>,
-        reason: &'static str,
-    ) {
-        if dropped_bundles.is_empty() {
+        if plans.is_empty() {
             return;
         }
-        let plans: Vec<ViewerContextMediaTeardownPlan> = dropped_bundles
-            .iter()
-            .map(|bundle| viewer_context_media_teardown_plan(bundle))
-            .collect();
         self.save_viewer_context_media_teardown_resumes(&plans);
         self.cleanup_viewer_context_media_teardown_globals(&plans, reason);
-        for bundle in &mut dropped_bundles {
-            bundle.normalize_ui_states.clear();
-            bundle.normalize_auto_scan_suppressed.clear();
-        }
     }
 
     #[cfg(windows)]
@@ -41342,7 +41369,7 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn reconcile_closed_bookmark_detached_context(&mut self, closed: &ViewerContextBundle) {
+    fn reconcile_closed_bookmark_detached_context(&mut self, closed: &ClosedBookmarkSummary) {
         let Some(BookmarkViewState::Opening {
             target: main_target,
             ..
@@ -41356,11 +41383,7 @@ impl App {
             return;
         }
 
-        let stayed_at_opened_bookmark = closed
-            .bookmark_view_state
-            .as_ref()
-            .and_then(BookmarkViewState::target)
-            == Some(&main_target);
+        let stayed_at_opened_bookmark = closed.bookmark_target.as_ref() == Some(&main_target);
         let keep_origin_grid = matches!(
             main_target,
             crate::bookmark_browser::BookmarkViewReturnTarget::Book(_)
@@ -41393,16 +41416,8 @@ impl App {
         // Ctrl+↑↓ や前後ファイル移動で対象を離れた場合は、従来仕様どおり viewer が最後に
         // 表示していた実フォルダへ main を移す。close_fullscreen は cursor を selected へ戻すため、
         // bundle の selected item を再選択すれば同じファイルを可視範囲へ戻せる。
-        let selected_media_path = closed.selected.and_then(|idx| {
-            closed.items.get(idx).and_then(|item| match item {
-                GridItem::Video(path) | GridItem::Audio(path) => Some(path.clone()),
-                _ => None,
-            })
-        });
-        let destination = closed
-            .archive_source_override
-            .clone()
-            .or_else(|| closed.current_folder.clone());
+        let selected_media_path = closed.selected_media_path.clone();
+        let destination = closed.destination.clone();
         self.clear_bookmark_view_return_state();
         let Some(destination) = destination else {
             return;
@@ -41578,9 +41593,11 @@ impl App {
 
         if should_drop {
             let closed = if detached_viewport_finalized {
-                self.active_detached_viewer_context
-                    .take()
-                    .map(|active| active.bundle)
+                self.active_detached_viewer_context.take().map(|active| {
+                    let summary = ClosedBookmarkSummary::read(&active.bundle);
+                    drop(active.bundle);
+                    summary
+                })
             } else {
                 self.take_and_close_current_active_detached_viewer_context(
                     ctx,
