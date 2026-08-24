@@ -608,8 +608,57 @@ helper 3 本が `impl Into<ContextRef<'a>>` を取り、`From<&ViewerContextBund
 
 ⚠ **W3 の非対称は②-c1b で結論を出す。** 意図的な部分解除か、同型経路の直し残しか。
 
-次は **②-c1b** (書き 27 箇所を名前の付いた操作へ)。その後 **②-c2** (`tools/viewer_context_audit`、
-A2 / A3 / A7 のみ。A1 / A5 は保管が残る間は必ず落ちるので②-d)。
+**ステージ②-c1b 完了** (2026-08-25、`2894926c`、指示書
+[detached-rework-stage-r2e-2c1b.md](detached-rework-stage-r2e-2c1b.md))。
+書き 27 箇所が registry モジュール内の名前付き操作になった。lib テスト 6251 件緑 (件数不変)。
+
+### 到達点: 非テストのビルドは 225 フィールド private で通る
+
+`ViewerContextBundle` の全 225 フィールドを private にして
+`cargo check -p mimageviewer --bin mimageviewer-core` が **E0616 ゼロ・exit 0**。
+設計 §6.1 が「モジュールの外では struct literal も destructure も `empty()` も
+言語仕様として書けなくなる」と言っている状態に、**非テスト面では既に到達している**。
+残るのは `src/app/tests.rs` からの直接アクセスだけで、それが②-e (`test_access`) の仕事。
+
+主な操作: `ensure_tag_prewarm_started` / `clear_normalize_state` (設計 §4.4 の命名) /
+`activate_parked_live_as_independent_detached` / `activate_passive_as_independent_detached` /
+`become_independent_detached_viewer` / `retarget_bookmark_media_open` /
+`split_materialized_physical_context_for_detached_scope` (fork + 絞り込みを 1 本に)。
+
+## ⚠ 未決 (利用者判断): 「独立 detached viewer にする」3 経路のフラグ集合が違う
+
+**②-c1b では意図的に揃えなかった** (揃えると 2 経路の挙動が変わるため)。
+名前だけ分けて集合はそのまま保ってある。
+
+| 経路 | `fs_open_intent_from_grid` | `pending_auto_fs_open` | `pending_return_to_parent` | `pdf_prefetch_grace_until` |
+| --- | --- | --- | --- | --- |
+| ParkedLive → active | ✓ | ✓ | ✓ | ✓ |
+| passive → active | ✓ | — | — | ✓ |
+| promote | ✓ | ✓ | ✓ | — |
+
+履歴 (実際に `git show` で確認済み):
+
+- `7ee84fdb` (2026-06-28) passive resume 新設 — `pdf_prefetch_grace_until` のみ
+- `5ba4d537` (2026-07-01) promote 新設 — 3 フラグ。`pdf_prefetch_grace_until` は当時既に
+  存在していたので、「フィールドが無かったから」ではない
+- `76f36d94` (2026-07-06) ParkedLive 経路 新設 — 4 フラグまとめて
+- `d3b56c15` (2026-07-06、`(detached-rework CUT) remove linked detached pin`) —
+  passive resume に `fs_open_intent_from_grid` **だけ**追加。**同じ diff の中に 4 フラグ版が
+  見えている状態で、残り 2 つは足していない**
+
+**非対称を意図的だと述べたコミットメッセージもコメントも無い。** 3 経路が別々の時期に
+別々のリストとして育ち、`d3b56c15` は目の前の症状に対応する 1 つだけを足した形に見える。
+ただしライフサイクルが違うので差が正当な可能性も残る。**この段では判断しない。**
+
+## その他
+
+- W1 (tag prewarm 起動) は **mounted 側に 3 コピー目がある** ([app.rs:27280](../src/app.rs:27280))。
+  `&mut` が要るので②-d の `ContextMut` 待ち。触っていない。
+- ②-c1 で `From<&ViewerContextBundle> for ContextRef` + `impl Into<ContextRef>` を
+  差し戻したのと同じ理由で、②-c1b でも引数でフラグ集合が変わる汎用操作は作っていない。
+
+次は **②-c2** (`tools/viewer_context_audit`、A2 / A3 / A7 のみ。A1 / A5 は保管が残る間は
+必ず落ちるので②-d)。
 
 ### R2e の作業環境 (新しいセッションが最初に読むもの)
 
