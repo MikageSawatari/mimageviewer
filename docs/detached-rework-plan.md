@@ -694,8 +694,59 @@ production 呼び出しは [app.rs:65555](../src/app.rs:65555) **1 箇所だけ*
 - ②-c1 で `From<&ViewerContextBundle> for ContextRef` + `impl Into<ContextRef>` を
   差し戻したのと同じ理由で、②-c1b でも引数でフラグ集合が変わる汎用操作は作っていない。
 
-次は **②-c2** (`tools/viewer_context_audit`、A2 / A3 / A7 のみ。A1 / A5 は保管が残る間は
-必ず落ちるので②-d)。
+**ステージ②-c2 完了** (2026-08-25、指示書
+[detached-rework-stage-r2e-2c2.md](detached-rework-stage-r2e-2c2.md))。
+`tools/viewer_context_audit` (workspace member、`syn` の source-only 解析、本体に非依存) が
+**A2 / A3 / A7** を実装。自身のテスト 23 件、CI に 3 つ目の軽量 job を追加
+(apt も FFmpeg ヘッダも要らない)。**`src/` は 1 行も変えていない。**
+
+### 規則を実測してから 2 点ずらした
+
+| 規則 | 設計のまま | 実測 | 採用した形 |
+| --- | --- | --- | --- |
+| A2 | swap/replace/take の実引数に 225 フィールド名 → 行単位 allowlist | **62 箇所・全部 false positive**。`mem::swap` は **0 件** | **A2a** = `mem::swap` に bundle フィールド (0 件) + **A2b** = 1 関数内の**異なる**フィールドが **3 つ以上** (5 件) |
+| A3 | `src/**/*.rs` 全部 | **110 箇所中 109 が `tests.rs` の `empty()`** | `#[cfg(test)]` と `tests.rs` を除外。②-e で `test_access` が入れば**コンパイラが弾く**ので監査は不要 |
+
+A2b の分離は 21 / 11 / 10 / 5 と **2 以下**で、閾値 3 に十分なマージンがある。
+allowlist の鍵は**行番号ではなくファイル + 関数名 + 理由** (`src/app.rs` は 4 万行あり
+行キーは即腐る)。**A7 は対象 (`App::viewer_contexts`) が②-d まで存在しない**ので、
+(a)〜(f) の 6 形すべてを fixture テストで覆ってある。「本番 0 件」を根拠にしない。
+
+## 監査が初回実行で見つけた本物: `activate_snapshot`
+
+**allowlist に入れず「既知の指摘」として記録した。R2e の範囲外なので直さない。**
+
+`activate_snapshot` ([src/app/snapshot_ops.rs:270](../src/app/snapshot_ops.rs:270)) は
+**per-context の 5 フィールド** (`items` / `thumbnails` / `visible_indices` /
+`scroll_offset_y` / `selected`) を `App::snapshot` へ `mem::replace` で退避する。
+
+**`App::snapshot` は `ViewerContextBundle` のフィールドではなく、
+`swap_viewer_context_bundle` で交換されない** (`swap_field!(snapshot)` は存在しない)。
+つまり **per-context の状態を App-global の枠が持っている** — R2e が畳もうとしている
+BA-7 系の形そのもの。
+
+書き戻す経路は 1 つだけ ([snapshot_ops.rs:539](../src/app/snapshot_ops.rs:539)) で、
+`current_folder == snap.origin` で守られている。`current_folder` 自体も per-context なので、
+context を切り替えた後は通常「snapshot を捨てて再読み込み」に倒れる。
+**ただし 2 つの context が同じフォルダを指していれば一致する** — main と同じフォルダで
+detached viewer を開いた状態がそれ。
+
+正しい修正は `snapshot` を per-context にすることだが、**挙動が変わる**ので別の段の仕事。
+②-d で registry が context を所有するようになっても、`snapshot` を bundle へ移す判断は
+別に要る。
+
+### 「既知の指摘」というカテゴリを足した理由
+
+allowlist に入れれば見えなくなり、違反のままなら CI が永久に赤い。どちらも良くない。
+既知の指摘は **毎回印字され / 実行は失敗させず / 検出されなくなったら失敗する**。
+最後の性質が要点で、誰かが黙って消したり規則が退行したりしたときに気づける
+(stale allowlist entry も同じ扱いで失敗する)。
+
+ついでに `ENABLE_ALLOWLIST` という const スイッチを `--no-allowlist` フラグに置き換えた。
+フリップして忘れられるうえ、false 側が誰も通らない死んだ枝になっていたため。
+
+次は **②-d** (保管・binding・transaction の一括切替)。**ここだけは分けられない**が、
+コンパイラが作業リストを列挙するので手探りにはならない。A1 / A5 もここで有効化する。
 
 ### R2e の作業環境 (新しいセッションが最初に読むもの)
 
