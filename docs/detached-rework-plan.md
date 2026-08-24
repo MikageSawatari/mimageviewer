@@ -536,9 +536,80 @@ lib テスト 6251 件緑 (件数不変)、`src/app/tests.rs` は無変更。
 - ②-e で弾けるようになるのはこの移設の結果である。今はまだフィールドが
   `pub(in crate::app)` なので**何も弾けていない**。
 
-次は **②-c** (accessor 移行 + 監査ツール導入)。外部フィールド読み ~26 種を `ContextRef`
-accessor へ寄せ、`tools/viewer_context_audit` を足して **A2 / A3 / A7 だけ**有効化する。
-A1 / A5 は保管フィールドが残っている間は必ず落ちるので②-d。挙動不変。
+**設計の②-c は 3 つに割った。** 「accessor 移行」と「監査ツール導入」は共有するものが無く、
+accessor 側も**読みと書きで性質が違う**ため。②-c1 (読み) / ②-c1b (書き) / ②-c2 (監査ツール)。
+
+**ステージ②-c1 完了** (2026-08-25、`2918e639`、指示書
+[detached-rework-stage-r2e-2c1.md](detached-rework-stage-r2e-2c1.md))。
+lib テスト 6251 件緑 (件数不変)。
+
+### 対象を数えた — 見積もりを使わなかった
+
+設計 B-3 の「~26 種」を使わず、**225 フィールドを一時的に private にして
+`cargo check -p mimageviewer --bin mimageviewer-core` を通した**。設計 §6.1 の完了判定は
+この性質そのものなので、ここで一度使って確かめた意味もある。
+
+| | 箇所 |
+| --- | --- |
+| 外部アクセス 合計 | 164 |
+| うち `split_materialized_physical_context_for_independent_still_open` の中 | 31 |
+| うち **書き** | 27 |
+| **読み (②-c1 の対象)** | **106** (21 フィールド) |
+
+⚠ **見積もりとの差より重要だったのは、27 箇所が書きだったこと。** 書きに場当たりで setter を
+生やすのは設計 §6.2 が名指しする「公開面が静かに育つ」に当たるので、②-c1b へ回した。
+
+### ②-c1 で分かったこと
+
+- **`ViewerSession` には mounted 側の実体が無い。** App は `last_viewer_sync_stamp` /
+  `detached_viewer_window_id` / `detached_viewer_independent_active` を**別々のミラー
+  フィールド**として持ち、`ViewerSession::swap_with_mounted` が対応付けている。よって
+  `ContextRef` からは `&ViewerSession` を返せず、**成分 3 つの accessor に分解**した。
+  「mounted 側は bundle の逐語ミラー」という素朴な前提が成り立たない実例。
+- `contains_video` の 2 本は **`self.` と `bundle.` の違いだけで一字一句同じ**だった。
+  3 経路が 1 本になった。`is_music_consumer` の片方は元から delegate だけの wrapper。
+
+### 検収で 1 件差し戻した — `impl Into<ContextRef>`
+
+helper 3 本が `impl Into<ContextRef<'a>>` を取り、`From<&ViewerContextBundle> for ContextRef`
+経由で `&bundle` をそのまま渡せる形になっていた。**`src/app/tests.rs` を無変更にする**という
+指示書の条件を満たすためだったが、
+① 生の `&ViewerContextBundle` が helper 境界を**暗黙に**越え続ける、
+② 設計 §6.3 の A4 が「ジェネリック境界と trait 実装は可視性だけ見る監査を素通りする」と
+名指ししている形そのもの、の 2 点で採らなかった。helper は `ContextRef<'_>` を直接取り、
+テスト 6 箇所が `ContextRef::at_rest(...)` と明示するようにした。
+**「テストを触らない」は「API の変化をテストで糊塗しない」ための代理条件**であって、
+読み口を明示するための 6 行の書き換えはそれに当たらない。
+
+### ⚠ 数が合っても中身は変わり得る
+
+完了判定を「private 化したとき残る E0616 がちょうど 27」としたが、**27 のまま中身が入れ替わって
+いた**。私の分類器が `bundle.viewer_session.activate_independent_detached(..)` のような
+「フィールド経由の mutating メソッド呼び出し」を読みと誤判定していたためで、実装側は
+それらに狭い名前付き操作を足し (`activate_independent_detached_session` /
+`pause_animations_for_remote_session` / `adopt_bookmark_media_open_pending`)、
+代わりに catalogue 済みだった `details_order.clear()` を `clear_details_order()` へ変えていた。
+差し引き 27 のまま。**リストを突き合わせるまで気づけなかった。数だけの門は弱い。**
+
+### ②-c1b の材料 (②-c1 完了後の実測、`2918e639`)
+
+残る 27 箇所。**この 4 本は既に②-c1 で名前付き操作になっている**ので、②-c1b は同じ形に揃える:
+`clear_details_order` / `activate_independent_detached_session` /
+`pause_animations_for_remote_session` / `adopt_bookmark_media_open_pending`。
+
+| # | 束 | 箇所 (`2918e639`) |
+| --- | --- | --- |
+| W1 | tag prewarm 起動 | app.rs:27289 / 27296 (同じ代入が 2 箇所) |
+| W2 | normalize state の破棄 | app.rs:38495 / 38496 (設計 §4.4 が `clear_normalize_state()` と命名済み) |
+| W3 | auto-open intent の解除 | app.rs:39210〜39213 (4 フラグ) / 40105〜40106 (**同じ 4 つのうち 2 つだけ**) |
+| W4 | detached physical への読み替え | app.rs:40983〜41000 (9 箇所。`details_order` は②-c1 で分離済みなので**畳み直すこと**) |
+| W5 | index を指し直す | app.rs:41210〜41217 (7 箇所。`viewer_session` への直接代入を含む) |
+| W6 | bookmark_view_state の設定 | startup_ops.rs:591 |
+
+⚠ **W3 の非対称は②-c1b で結論を出す。** 意図的な部分解除か、同型経路の直し残しか。
+
+次は **②-c1b** (書き 27 箇所を名前の付いた操作へ)。その後 **②-c2** (`tools/viewer_context_audit`、
+A2 / A3 / A7 のみ。A1 / A5 は保管が残る間は必ず落ちるので②-d)。
 
 ### R2e の作業環境 (新しいセッションが最初に読むもの)
 
