@@ -754,10 +754,33 @@ analyze / metadata 取得はすべて同じ cache を通り、要求ごとに st
 `(path, password, mtime, file_size)` が完全一致した場合だけ document を再利用する。stat 失敗では
 保持 document を閉じ、古い内容を返さない。cache は 1 件固定で、時間窓や context epoch 解放は持たない。
 
-一方、**起動成功後に PDF / Susie worker が想定外終了しても、現在は自動 respawn しない**。
+一方、**起動成功後に PDF worker が想定外終了しても、現在は自動 respawn しない**。
 dispatcher は stdin/stdout の切断をその要求の Err として返すだけで、worker 数も補充しない。
-したがって、この節は起動後の自己回復を保証しない。respawn を追加する場合は、in-flight request の
-再送可否、worker_count と lane cap の更新、終了・cancel との競合を別設計として扱う必要がある。
+したがって、この節は PDF 側の起動後の自己回復を保証しない。respawn を追加する場合は、in-flight
+request の再送可否、worker_count と lane cap の更新、終了・cancel との競合を別設計として扱う。
+
+**Susie worker は自己回復する** (§1.120、2026-08-25)。スロットごとに以下を持つ:
+
+- `DispatcherExit::WorkerLost` — transport が切れた dispatcher は**即座に退役**する。
+  死んだ pipe を持ったまま共有キューから後続を取り続けると、失敗が即座に返る分だけ
+  生きているワーカーより速く job を吸う。`InvalidData` は含めない (ワーカーは生きている)。
+- `run_worker_slot` が backoff (200ms × 試行回数、上限 5 回) で同じスロットを作り直す。
+  **再起動回数は連続失敗で数える** (`restart_count_after_loss`)。1 件でも応答を返せた
+  ワーカーは働けていたので数え直す。累積で数えると、たまに落ちるプラグインでも
+  使い続けるうちに必ず枯渇する。
+- **クラッシュを起こした要求は再送しない。** その 1 件はエラーで返し、後続のためだけに
+  補充する。落とした対象 (`crashers`) はプールの生存期間だけ記憶し、二度と投げない。
+  これが無いと同じフォルダを開くたびに同じ画像でワーカーが死に続ける。
+- 最後のスロットが閉じたら `fail_pending_jobs_no_workers` がキューを排出し、以降の
+  enqueue も**積むのと同じロックの中で**断る。これが無いと UI が「読込中」で固着する。
+- 諦めた理由は `SlotExit` として抜けた場所で確定させ、**最後のスロットが諦めたときだけ**
+  one-shot notice を発行する (`should_notify_workers_gone`)。終了・再読み込みで畳んだ
+  場合は出さない。枠が 1 つ減っただけでも出さない (残りが処理を続けられる間、利用者に
+  できることが無い)。
+- 集計 (`SusieWorkerHealth`) は起動できた枠数・生存枠数・作り直し回数・打ち切り数・
+  落とした対象数・最後の失敗理由を持ち、環境設定の診断パネルと notice の両方がここだけを
+  読む。**起動できなかった** (`WorkerSpawnFailed`) と**起動したが尽きた**
+  (`WorkersExhausted`) を区別するために起動時の枠数を残す。
 
 **Susie プラグインの並列実行に関する注意**: Susie 画像プラグインは 1990〜2000 年代の
 レガシー規格で、並列実行 (特にプロセス跨ぎ) を想定していないプラグインが稀にある。

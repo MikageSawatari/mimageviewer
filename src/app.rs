@@ -12377,6 +12377,9 @@ pub struct App {
     /// 引いたらここへ転写する。バナー UI で「再起動」/「閉じる」が押されるまで
     /// 残る (時間で消えない、ユーザーが認識する必要があるため)。
     pub(crate) trt_worker_notice: Option<crate::ai::runtime::WorkerNotice>,
+    /// Susie の読み込み枠が全部尽きたことを 1 回だけ知らせる notice。
+    /// 発行条件は `susie_loader::should_notify_workers_gone` が単独で所有する。
+    pub(crate) susie_worker_notice: Option<crate::susie_loader::SusieWorkerNotice>,
     /// セッション中に worker 死亡 → 自動再起動を試みた回数。
     /// `MAX_TRT_AUTO_RESTART_ATTEMPTS` 回まで silent に再 spawn して、それを超えたら
     /// バナーを出してユーザー操作を待つ (= TRT pack 自体の問題等で永久ループしない
@@ -14561,6 +14564,7 @@ impl App {
             source_swap_keep_audio_mode: false,
             pdf_worker_notice: None,
             trt_worker_notice: None,
+            susie_worker_notice: None,
             trt_auto_restart_attempts: 0,
             trt_spawn_restart_attempts: 0,
             trt_restart_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -67875,6 +67879,8 @@ impl eframe::App for App {
         // PDF pool の遅延初期化失敗 notice。poll は pool 自体を初期化しない。
         self.poll_pdf_worker_notice();
         self.show_pdf_worker_notice_dialog(ctx);
+        self.poll_susie_worker_notice();
+        self.show_susie_worker_notice_dialog(ctx);
         // Phase 3 Step 5: TRT ワーカー関連の通知バナー (起動失敗 / 推論中の死亡)。
         // poll で AiRuntime の通知キューを 1 回引き、show でバナー描画。
         self.poll_trt_worker_notice();

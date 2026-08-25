@@ -155,6 +155,79 @@ pub struct PluginInfo {
     pub extensions: Vec<String>,
 }
 
+/// ワーカーの健康状態の snapshot。診断パネルと通知の両方がここだけを読む。
+///
+/// 「一度も起動できなかった」と「起動したが尽きた」はどちらも `live_workers == 0`
+/// になるが、利用者に伝えるべきことが違う (前者は起動そのものの失敗、後者は
+/// 繰り返しのクラッシュ)。区別できるように起動時の数を残す。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SusieWorkerHealth {
+    /// handshake まで成功した枠の数。0 なら一度も起動できていない。
+    pub started_workers: usize,
+    /// 今生きている枠の数。
+    pub live_workers: usize,
+    /// 枠を作り直した回数の合計。
+    pub restarts: usize,
+    /// 作り直しの上限に達して諦めた枠の数。
+    pub gave_up_workers: usize,
+    /// このセッションでワーカーを落とした対象の数。
+    pub crashing_subjects: usize,
+    /// 直近の失敗理由。応答が途切れた理由か、作り直しに失敗した理由。
+    pub last_failure: Option<String>,
+}
+
+impl SusieWorkerHealth {
+    /// 起動には成功したのに、今は 1 枠も残っていない。
+    pub fn exhausted(&self) -> bool {
+        self.started_workers > 0 && self.live_workers == 0
+    }
+
+    /// 起動時より枠が減っている。まだ読めるが余力が落ちている状態。
+    pub fn degraded(&self) -> bool {
+        self.live_workers > 0 && self.live_workers < self.started_workers
+    }
+}
+
+/// スロットスレッドが書き込む集計。`SusieWorkerHealth` はここから作る。
+#[derive(Debug, Default)]
+struct HealthCounters {
+    started_workers: usize,
+    restarts: usize,
+    gave_up_workers: usize,
+    last_failure: Option<String>,
+}
+
+fn record_health(health: &Mutex<HealthCounters>, edit: impl FnOnce(&mut HealthCounters)) {
+    let mut guard = health
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    edit(&mut guard);
+}
+
+/// 3 つの持ち主 (集計 / 生存数 / 落とした対象) から snapshot を組む。
+/// **1 つの lock を持ったまま次を取らない**ように、順に読んで組み立てる。
+fn health_snapshot(
+    health: &Mutex<HealthCounters>,
+    live_workers: &std::sync::atomic::AtomicUsize,
+    crashers: &Mutex<HashSet<String>>,
+) -> SusieWorkerHealth {
+    let mut snapshot = {
+        let counters = health
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        SusieWorkerHealth {
+            started_workers: counters.started_workers,
+            restarts: counters.restarts,
+            gave_up_workers: counters.gave_up_workers,
+            last_failure: counters.last_failure.clone(),
+            ..SusieWorkerHealth::default()
+        }
+    };
+    snapshot.live_workers = live_workers.load(std::sync::atomic::Ordering::Relaxed);
+    snapshot.crashing_subjects = crashers.lock().map(|set| set.len()).unwrap_or(0);
+    snapshot
+}
+
 /// プラグインフォルダの既定パス `<data_dir>/susie_plugins`。
 /// 環境変数 `MIV_SUSIE_PLUGIN_DIR` で上書き可能 (テスト / 開発用)。
 pub fn plugin_dir() -> PathBuf {
@@ -257,6 +330,8 @@ pub struct SusieWorkerPool {
     dispatcher_threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// このセッションでワーカーを落とした対象。二度目からは投げずに即失敗させる。
     crashers: Arc<Mutex<HashSet<String>>>,
+    /// スロットの喪失・作り直しの集計。診断表示と通知の材料。
+    health: Arc<Mutex<HealthCounters>>,
 }
 
 impl SusieWorkerPool {
@@ -297,6 +372,7 @@ impl SusieWorkerPool {
         let mut worker_count = 0usize;
         let live_workers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let crashers: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let health: Arc<Mutex<HealthCounters>> = Arc::new(Mutex::new(HealthCounters::default()));
 
         for i in 0..pool_size {
             match spawn_worker_and_handshake(&exe, &plugin_dir) {
@@ -322,6 +398,10 @@ impl SusieWorkerPool {
                     let slot_plugin_dir = plugin_dir.clone();
                     let slot_live = Arc::clone(&live_workers);
                     let slot_crashers = Arc::clone(&crashers);
+                    let slot_health = Arc::clone(&health);
+                    // スレッドを起こす**前**に数える。起動直後に落ちたワーカーが先に
+                    // 減算すると、ループの後で `store` する形では 0 を下回って戻れない。
+                    live_workers.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let handle = std::thread::Builder::new()
                         .name(format!("susie-pool-{i}"))
                         .spawn(move || {
@@ -333,6 +413,7 @@ impl SusieWorkerPool {
                                 (child, io),
                                 slot_live,
                                 slot_crashers,
+                                slot_health,
                             )
                         })
                         .expect("susie: failed to spawn dispatcher thread");
@@ -354,7 +435,7 @@ impl SusieWorkerPool {
             ));
         }
 
-        live_workers.store(worker_count, std::sync::atomic::Ordering::Relaxed);
+        record_health(&health, |c| c.started_workers = worker_count);
 
         SusieWorkerPool {
             queue,
@@ -363,6 +444,7 @@ impl SusieWorkerPool {
             extensions,
             dispatcher_threads: Mutex::new(dispatcher_threads),
             crashers,
+            health,
         }
     }
 
@@ -386,6 +468,11 @@ impl SusieWorkerPool {
     /// このセッションでワーカーを落とした対象の数 (診断表示用)。
     pub fn crashing_subject_count(&self) -> usize {
         self.crashers.lock().map(|set| set.len()).unwrap_or(0)
+    }
+
+    /// 診断表示と通知が読む健康状態。
+    pub fn health(&self) -> SusieWorkerHealth {
+        health_snapshot(&self.health, &self.live_workers, &self.crashers)
     }
 
     pub fn plugins(&self) -> &[PluginInfo] {
@@ -501,6 +588,7 @@ fn empty_pool() -> SusieWorkerPool {
         extensions: HashSet::new(),
         dispatcher_threads: Mutex::new(Vec::new()),
         crashers: Arc::new(Mutex::new(HashSet::new())),
+        health: Arc::new(Mutex::new(HealthCounters::default())),
     }
 }
 
@@ -803,9 +891,17 @@ pub enum PoolStatus {
     /// 正常起動したがプラグインが 0 件
     ReadyButEmpty,
     /// 正常起動してプラグインもロード済み
-    ReadyWithPlugins { count: usize },
+    ReadyWithPlugins {
+        count: usize,
+        health: SusieWorkerHealth,
+    },
     /// ワーカー起動に失敗した (exe はあるが spawn/handshake 失敗)
     WorkerSpawnFailed,
+    /// 起動はできたが、繰り返しのクラッシュで作り直しの上限に達し、枠が尽きた。
+    ///
+    /// 以前はこれも `WorkerSpawnFailed` として出ていた。起動に失敗したと書かれるが
+    /// 実際には起動できており、利用者が確認すべきものが違う。
+    WorkersExhausted { health: SusieWorkerHealth },
 }
 
 /// UI から状態を問い合わせる。プール未初期化でも軽量に判定できる。
@@ -824,16 +920,62 @@ pub fn pool_status(enabled: bool) -> PoolStatus {
     }
     match try_get_pool() {
         None => PoolStatus::NotInitialized,
-        Some(pool) if pool.is_ready() => {
-            let n = pool.plugins().len();
-            if n == 0 {
-                PoolStatus::ReadyButEmpty
-            } else {
-                PoolStatus::ReadyWithPlugins { count: n }
-            }
-        }
-        Some(_) => PoolStatus::WorkerSpawnFailed,
+        Some(pool) => pool_status_from(pool.plugins().len(), pool.health()),
     }
+}
+
+/// プールが在るときの状態判定。プロセスを持たない純関数にして、
+/// 「起動できなかった」と「起動したが尽きた」の分岐をテストできるようにする。
+fn pool_status_from(plugin_count: usize, health: SusieWorkerHealth) -> PoolStatus {
+    if health.live_workers == 0 {
+        return if health.exhausted() {
+            PoolStatus::WorkersExhausted { health }
+        } else {
+            PoolStatus::WorkerSpawnFailed
+        };
+    }
+    if plugin_count == 0 {
+        PoolStatus::ReadyButEmpty
+    } else {
+        PoolStatus::ReadyWithPlugins {
+            count: plugin_count,
+            health,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 全滅の一度きりの通知
+// ─────────────────────────────────────────────────────────────────
+
+static SUSIE_WORKER_NOTICE: Mutex<Option<SusieWorkerNotice>> = Mutex::new(None);
+
+/// Susie 形式が読めなくなったことを UI へ 1 回だけ渡す typed notice。
+///
+/// 枠が 1 つ減っただけでは出さない。残りの枠が処理を続けられる間は利用者にできる
+/// ことが無く、伝えても雑音にしかならない。**最後の枠が諦めたときだけ**発行する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SusieWorkerNotice {
+    pub(crate) health: SusieWorkerHealth,
+    pub(crate) logs_dir: PathBuf,
+}
+
+fn publish_worker_notice_to(slot: &Mutex<Option<SusieWorkerNotice>>, notice: SusieWorkerNotice) {
+    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.is_none() {
+        *guard = Some(notice);
+    }
+}
+
+fn take_worker_notice_from(slot: &Mutex<Option<SusieWorkerNotice>>) -> Option<SusieWorkerNotice> {
+    slot.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+}
+
+/// App の update loop が poll する。取り出した notice は再送しない。
+pub(crate) fn take_worker_notice() -> Option<SusieWorkerNotice> {
+    take_worker_notice_from(&SUSIE_WORKER_NOTICE)
 }
 
 fn spawn_worker_and_handshake(
@@ -925,29 +1067,30 @@ fn run_worker_slot(
     initial: (Child, WorkerIo),
     live_workers: Arc<std::sync::atomic::AtomicUsize>,
     crashers: Arc<Mutex<HashSet<String>>>,
+    health: Arc<Mutex<HealthCounters>>,
 ) {
-    use std::sync::atomic::Ordering;
-
     let mut current = Some(initial);
     let mut restarts = 0usize;
 
-    loop {
+    let exit = loop {
         let Some((child, io)) = current.take() else {
             // ワーカーが居ない状態。上限まで作り直しを試みる。
             if restarts >= MAX_WORKER_RESTARTS {
                 crate::logger::log(format!(
                     "susie: worker {worker_id} reached the restart limit ({MAX_WORKER_RESTARTS})"
                 ));
-                break;
+                record_health(&health, |c| c.gave_up_workers += 1);
+                break SlotExit::GaveUp;
             }
             restarts += 1;
+            record_health(&health, |c| c.restarts += 1);
             // 落ちた直後に作り直しても同じ画像でまた落ちることがある。時間で競合を
             // 隠すためではなく、crash loop が CPU を焼き切らないための間隔。
             std::thread::sleep(std::time::Duration::from_millis(
                 WORKER_RESTART_BACKOFF_MS * restarts as u64,
             ));
             if queue.0.lock().map(|q| q.shutdown).unwrap_or(true) {
-                break;
+                break SlotExit::Shutdown;
             }
             match spawn_worker_and_handshake(&exe, &plugin_dir) {
                 Ok((child, io, plugins)) => {
@@ -962,37 +1105,99 @@ fn run_worker_slot(
                     crate::logger::log(format!(
                         "susie: worker {worker_id} restart {restarts} failed: {e}"
                     ));
+                    record_health(&health, |c| {
+                        c.last_failure = Some(format!("restart failed: {e}"))
+                    });
                 }
             }
             continue;
         };
 
         match run_dispatcher(worker_id, Arc::clone(&queue), child, io, &crashers) {
-            DispatcherExit::Shutdown => break,
+            DispatcherExit::Shutdown => break SlotExit::Shutdown,
             DispatcherExit::WorkerLost { reason, served } => {
                 crate::logger::log(format!(
                     "susie: worker {worker_id} lost after {served} reply/replies ({reason})"
                 ));
+                record_health(&health, |c| c.last_failure = Some(reason));
                 restarts = restart_count_after_loss(restarts, served);
                 // current は None のまま次の周回へ。そこで作り直す。
             }
         }
-    }
+    };
 
-    let remaining = live_workers.fetch_sub(1, Ordering::Relaxed) - 1;
+    finish_worker_slot(
+        worker_id,
+        exit,
+        &queue,
+        &live_workers,
+        &crashers,
+        &health,
+        &SUSIE_WORKER_NOTICE,
+    );
+}
+
+/// スロットが閉じるときの後始末。**プロセスを持たないのでテストから直接呼べる。**
+///
+/// 通知を出すかどうかの配線はここにしか無い。無言で出ない / 終了時に出る、のどちらも
+/// 実機でしか気付けない類の失敗なので、経路ごと確かめられる形にしてある。
+fn finish_worker_slot(
+    worker_id: usize,
+    exit: SlotExit,
+    queue: &Arc<(Mutex<JobQueue>, Condvar)>,
+    live_workers: &std::sync::atomic::AtomicUsize,
+    crashers: &Mutex<HashSet<String>>,
+    health: &Mutex<HealthCounters>,
+    notice_slot: &Mutex<Option<SusieWorkerNotice>>,
+) -> usize {
+    let remaining = live_workers.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
     crate::logger::log(format!(
-        "susie: worker {worker_id} slot closed; {remaining} worker slot(s) left"
+        "susie: worker {worker_id} slot closed ({exit:?}); {remaining} worker slot(s) left"
     ));
     if remaining == 0 {
         // 最後の一本。積まれたままの要求を誰も拾えないので、待たせ続けずに返す。
         // これが無いと呼び出し側は応答を永久に待ち、UI は「読込中」で固まる。
-        let drained = fail_pending_jobs_no_workers(&queue);
+        let drained = fail_pending_jobs_no_workers(queue);
         if drained > 0 {
             crate::logger::log(format!(
                 "susie: no workers left; failed {drained} pending request(s)"
             ));
         }
     }
+    if should_notify_workers_gone(exit, remaining) {
+        let snapshot = health_snapshot(health, live_workers, crashers);
+        crate::logger::log(format!(
+            "susie: no workers left after {} restart(s); notifying the user (started={}, crashers={})",
+            snapshot.restarts, snapshot.started_workers, snapshot.crashing_subjects
+        ));
+        publish_worker_notice_to(
+            notice_slot,
+            SusieWorkerNotice {
+                health: snapshot,
+                logs_dir: crate::data_dir::logs_dir(),
+            },
+        );
+    }
+    remaining
+}
+
+/// スロットが閉じた理由。**通知するかどうかがこれで決まる**ので、抜けた場所で
+/// 理由を確定させる。後からフラグを読み直すと、閉じてから読むまでの間に
+/// 終了要求が来た場合に「自分から畳んだ」と誤って読める。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotExit {
+    /// プール終了 (Drop / 再読み込み)。利用者に伝えることは無い。
+    Shutdown,
+    /// 作り直しの上限に達した。この枠はもう戻らない。
+    GaveUp,
+}
+
+/// 最後の枠が諦めたときだけ通知する。
+///
+/// 枠が 1 つ減っただけでは出さない。残りの枠が処理を続けられる間、利用者にできる
+/// ことは無い。終了・再読み込みで畳んだ場合も出さない。
+fn should_notify_workers_gone(exit: SlotExit, remaining: usize) -> bool {
+    remaining == 0 && matches!(exit, SlotExit::GaveUp)
 }
 
 /// 全スロットが閉じたときに、キューに残った要求へエラーを返す。
@@ -1408,5 +1613,192 @@ mod tests {
         assert!(delays.windows(2).all(|w| w[1] > w[0]));
         // 上限まで使い切っても、待ち時間の合計が体感を壊すほど長くならないこと。
         assert!(delays.iter().sum::<u64>() < 5_000);
+    }
+
+    /// 起動できなかった場合と、起動したのに尽きた場合を取り違えない。
+    ///
+    /// 以前はどちらも `WorkerSpawnFailed` になり、繰り返しクラッシュで枠を使い切った
+    /// 利用者に「起動またはハンドシェイクに失敗しました」と出ていた。実際には起動して
+    /// 動いていたので、確認すべきものが違う。
+    #[test]
+    fn a_pool_that_ran_and_then_died_is_not_reported_as_a_failed_start() {
+        let never_started = SusieWorkerHealth {
+            started_workers: 0,
+            live_workers: 0,
+            ..SusieWorkerHealth::default()
+        };
+        assert!(matches!(
+            pool_status_from(0, never_started),
+            PoolStatus::WorkerSpawnFailed
+        ));
+
+        let exhausted = SusieWorkerHealth {
+            started_workers: 3,
+            live_workers: 0,
+            restarts: 5,
+            gave_up_workers: 3,
+            ..SusieWorkerHealth::default()
+        };
+        assert!(matches!(
+            pool_status_from(2, exhausted),
+            PoolStatus::WorkersExhausted { .. }
+        ));
+    }
+
+    /// 生きている枠が 1 つでもあれば通常表示のまま。減っていることは診断側で示す。
+    #[test]
+    fn a_partly_lost_pool_still_reports_its_plugins() {
+        let degraded = SusieWorkerHealth {
+            started_workers: 3,
+            live_workers: 1,
+            restarts: 2,
+            ..SusieWorkerHealth::default()
+        };
+        assert!(degraded.degraded());
+        assert!(!degraded.exhausted());
+        match pool_status_from(4, degraded) {
+            PoolStatus::ReadyWithPlugins { count, health } => {
+                assert_eq!(count, 4);
+                assert_eq!(health.live_workers, 1);
+            }
+            other => panic!("unexpected status: {other:?}"),
+        }
+
+        let healthy = SusieWorkerHealth {
+            started_workers: 3,
+            live_workers: 3,
+            ..SusieWorkerHealth::default()
+        };
+        assert!(!healthy.degraded());
+        assert!(matches!(
+            pool_status_from(0, healthy),
+            PoolStatus::ReadyButEmpty
+        ));
+    }
+
+    /// 通知は「最後の枠が諦めたとき」だけ。枠が減っただけ、終了で畳んだだけでは出さない。
+    #[test]
+    fn only_the_last_slot_giving_up_notifies_the_user() {
+        assert!(should_notify_workers_gone(SlotExit::GaveUp, 0));
+        // まだ残っている枠が処理を続けられる。利用者にできることは無い。
+        assert!(!should_notify_workers_gone(SlotExit::GaveUp, 1));
+        // 終了 / 再読み込みで畳んだ場合。全部閉じるのが正常な経路である。
+        assert!(!should_notify_workers_gone(SlotExit::Shutdown, 0));
+        assert!(!should_notify_workers_gone(SlotExit::Shutdown, 2));
+    }
+
+    /// notice は 1 回だけ取り出せる。取り出した後に再送しない。
+    #[test]
+    fn the_workers_gone_notice_is_delivered_once() {
+        let slot: Mutex<Option<SusieWorkerNotice>> = Mutex::new(None);
+        let notice = SusieWorkerNotice {
+            health: SusieWorkerHealth {
+                started_workers: 3,
+                live_workers: 0,
+                restarts: 5,
+                gave_up_workers: 3,
+                crashing_subjects: 1,
+                last_failure: Some("broken pipe".to_string()),
+            },
+            logs_dir: PathBuf::from(r"C:\data\logs"),
+        };
+
+        publish_worker_notice_to(&slot, notice.clone());
+        // 後から届いた 2 通目で上書きしない。最初の理由の方が原因に近い。
+        publish_worker_notice_to(
+            &slot,
+            SusieWorkerNotice {
+                health: SusieWorkerHealth::default(),
+                logs_dir: PathBuf::from(r"C:\other"),
+            },
+        );
+
+        assert_eq!(take_worker_notice_from(&slot), Some(notice));
+        assert_eq!(take_worker_notice_from(&slot), None);
+    }
+
+    /// スロットが閉じるときの後始末を、理由と残り枠数の組み合わせごとに確かめる。
+    ///
+    /// 単体の述語 (`should_notify_workers_gone`) が正しくても、呼び出し側の配線を
+    /// 間違えれば通知は無言で出ない / 終了のたびに出る。そこを分けて確かめる。
+    fn drive_slot_close(exit: SlotExit, slots: usize) -> (usize, Option<SusieWorkerNotice>, bool) {
+        let pool = empty_pool();
+        record_health(&pool.health, |c| {
+            c.started_workers = slots;
+            c.restarts = 5;
+            c.last_failure = Some("unexpected end of file".to_string());
+        });
+        pool.live_workers
+            .store(slots, std::sync::atomic::Ordering::Relaxed);
+        let notice_slot: Mutex<Option<SusieWorkerNotice>> = Mutex::new(None);
+
+        let remaining = finish_worker_slot(
+            0,
+            exit,
+            &pool.queue,
+            &pool.live_workers,
+            &pool.crashers,
+            &pool.health,
+            &notice_slot,
+        );
+        let workers_gone = pool.queue.0.lock().unwrap().workers_gone;
+        (
+            remaining,
+            take_worker_notice_from(&notice_slot),
+            workers_gone,
+        )
+    }
+
+    #[test]
+    fn the_last_slot_giving_up_is_what_reaches_the_user() {
+        let (remaining, notice, workers_gone) = drive_slot_close(SlotExit::GaveUp, 1);
+        assert_eq!(remaining, 0);
+        assert!(workers_gone, "以降の enqueue を断る印が立っていない");
+        let notice = notice.expect("最後の枠が諦めたのに通知が出ていない");
+        assert_eq!(notice.health.started_workers, 1);
+        assert_eq!(notice.health.live_workers, 0);
+        assert_eq!(
+            notice.health.last_failure.as_deref(),
+            Some("unexpected end of file")
+        );
+    }
+
+    #[test]
+    fn closing_one_of_several_slots_says_nothing_to_the_user() {
+        let (remaining, notice, workers_gone) = drive_slot_close(SlotExit::GaveUp, 3);
+        assert_eq!(remaining, 2);
+        assert!(notice.is_none(), "まだ読めるのに通知が出ている");
+        assert!(!workers_gone, "まだ枠が残っているのにキューを閉じている");
+    }
+
+    /// 終了・再読み込みでは全部の枠が閉じる。これは正常な経路なので通知しない。
+    #[test]
+    fn shutting_down_closes_every_slot_without_telling_the_user() {
+        let (remaining, notice, workers_gone) = drive_slot_close(SlotExit::Shutdown, 1);
+        assert_eq!(remaining, 0);
+        assert!(notice.is_none(), "終了しただけで通知が出ている");
+        // 通知はしないが、積まれたままの要求は返す (待たせ続けない)。
+        assert!(workers_gone);
+    }
+
+    /// 起動した枠の数は集計へ記録され、snapshot から読める。
+    #[test]
+    fn the_health_snapshot_reads_from_all_three_owners() {
+        let pool = empty_pool();
+        record_health(&pool.health, |c| {
+            c.started_workers = 3;
+            c.restarts = 2;
+            c.last_failure = Some("broken pipe".to_string());
+        });
+        pool.live_workers
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        pool.crashers.lock().unwrap().insert("bad.pi".to_string());
+
+        let health = pool.health();
+        assert_eq!(health.started_workers, 3);
+        assert_eq!(health.live_workers, 1);
+        assert_eq!(health.restarts, 2);
+        assert_eq!(health.crashing_subjects, 1);
+        assert_eq!(health.last_failure.as_deref(), Some("broken pipe"));
     }
 }
