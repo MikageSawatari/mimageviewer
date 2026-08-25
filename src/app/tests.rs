@@ -6,7 +6,7 @@ use tempfile::TempDir;
 
 #[cfg(windows)]
 #[test]
-fn native_video_bar_lock_commands_toggle_only_the_selected_setting() {
+fn native_video_bar_lock_commands_preserve_the_bottom_lock_invariant() {
     let mut settings = crate::settings::Settings::default();
 
     assert!(super::native_video::toggle_native_video_bar_lock_setting(
@@ -29,6 +29,17 @@ fn native_video_bar_lock_commands_toggle_only_the_selected_setting() {
     ));
     assert!(!settings.video_top_bar_locked);
     assert!(settings.video_seek_bar_locked);
+
+    assert!(super::native_video::toggle_native_video_seek_strip_lock_setting(&mut settings));
+    assert!(settings.video_seek_bar_locked);
+    assert!(settings.video_seek_strip_locked);
+
+    assert!(!super::native_video::toggle_native_video_bar_lock_setting(
+        &mut settings,
+        crate::video::NativeVideoBar::Seek,
+    ));
+    assert!(!settings.video_seek_bar_locked);
+    assert!(!settings.video_seek_strip_locked);
 }
 
 #[test]

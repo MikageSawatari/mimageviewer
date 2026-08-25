@@ -23,6 +23,7 @@ pub fn draw_video_bar_visibility_snapshot_fixture(ui: &mut egui::Ui) {
     let mut settings = Settings {
         video_top_bar_locked: true,
         video_seek_bar_locked: false,
+        video_seek_strip_locked: false,
         ..Settings::default()
     };
     pages::draw_video_bar_visibility_settings(ui, &mut settings);

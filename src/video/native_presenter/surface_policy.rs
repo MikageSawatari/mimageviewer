@@ -348,17 +348,26 @@ mod tests {
         let top_reserved = (HUD_TOP_HEIGHT + fixed_bar_gap_px as f32) * pixels_per_point;
         let bottom_reserved = (HUD_BOTTOM_HEIGHT + fixed_bar_gap_px as f32) * pixels_per_point;
 
-        for (top_bar_locked, seek_bar_locked, reserved_height) in [
-            (true, false, top_reserved),
-            (false, true, bottom_reserved),
-            (true, true, top_reserved + bottom_reserved),
+        for (top_bar_locked, bottom_lock, reserved_height) in [
+            (true, crate::settings::VideoBottomLock::None, top_reserved),
+            (
+                false,
+                crate::settings::VideoBottomLock::BarOnly,
+                bottom_reserved,
+            ),
+            (
+                true,
+                crate::settings::VideoBottomLock::BarOnly,
+                top_reserved + bottom_reserved,
+            ),
         ] {
             let mut case = input(VideoScaleFilter::Standard);
             case.layout = VideoVisualLayout {
                 compact: false,
                 pixels_per_point,
                 top_bar_locked,
-                seek_bar_locked,
+                bottom_lock,
+                seek_strip_visible: false,
                 fixed_bar_gap_px,
             };
             let VideoSurfaceSizeDecision::DisplayResolution { height, .. } =

@@ -620,6 +620,7 @@ pub enum NativeVideoOutputEvent {
     ToggleBarLock {
         bar: NativeVideoBar,
     },
+    ToggleSeekStripLock,
     ToggleClickInfoOpen,
     OpenTouchInfoPanel,
     DismissTouchSidePanels,
@@ -974,7 +975,7 @@ enum NativeVideoOutputCommand {
     },
     SetBarLockState {
         top_locked: bool,
-        seek_locked: bool,
+        bottom_lock: crate::settings::VideoBottomLock,
         fixed_bar_gap_px: u32,
     },
     ResetSidePanelSession,
@@ -2066,12 +2067,17 @@ impl NativeVideoOutput {
             });
     }
 
-    fn set_bar_lock_state(&self, top_locked: bool, seek_locked: bool, fixed_bar_gap_px: u32) {
+    fn set_bar_lock_state(
+        &self,
+        top_locked: bool,
+        bottom_lock: crate::settings::VideoBottomLock,
+        fixed_bar_gap_px: u32,
+    ) {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::SetBarLockState {
                 top_locked,
-                seek_locked,
+                bottom_lock,
                 fixed_bar_gap_px,
             });
     }
@@ -3534,6 +3540,7 @@ fn send_native_overlay_command(
         Command::TogglePerfOverlay => NativeVideoOutputEvent::TogglePerfOverlay,
         Command::ToggleSidePanelMode => NativeVideoOutputEvent::ToggleSidePanelMode,
         Command::ToggleBarLock { bar } => NativeVideoOutputEvent::ToggleBarLock { bar },
+        Command::ToggleSeekStripLock => NativeVideoOutputEvent::ToggleSeekStripLock,
         Command::ToggleClickInfoOpen => NativeVideoOutputEvent::ToggleClickInfoOpen,
         Command::OpenTouchInfoPanel => NativeVideoOutputEvent::OpenTouchInfoPanel,
         Command::DismissTouchSidePanels => NativeVideoOutputEvent::DismissTouchSidePanels,
@@ -4425,12 +4432,12 @@ fn run_native_video_output(
                 }
                 NativeVideoOutputCommand::SetBarLockState {
                     top_locked,
-                    seek_locked,
+                    bottom_lock,
                     fixed_bar_gap_px,
                 } => {
                     if let Err(err) = presenter.set_overlay_bar_lock_state(
                         top_locked,
-                        seek_locked,
+                        bottom_lock,
                         fixed_bar_gap_px,
                     ) {
                         crate::logger::log(format!(
@@ -4546,9 +4553,21 @@ fn run_native_video_output(
                 NativeVideoOutputCommand::SetSeekStrip {
                     seek_strip,
                     material_availability,
-                } => {
-                    presenter.set_overlay_seek_strip(seek_strip, material_availability);
-                }
+                } => match presenter.set_overlay_seek_strip(seek_strip, material_availability) {
+                    Ok(true) => {
+                        if source
+                            .video_scale_state
+                            .invalidate_preparation_and_keep_desired()
+                        {
+                            presenter.discard_prepared_video_scale_settings();
+                            desired_scale_apply_due = true;
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(err) => crate::logger::log(format!(
+                        "[native-video] set seek-strip transform failed: {err}"
+                    )),
+                },
                 NativeVideoOutputCommand::SetRingPickerOverlay { overlay } => {
                     presenter.set_overlay_ring_picker(overlay);
                 }
@@ -4734,7 +4753,11 @@ fn run_native_video_output(
                     presenter.set_overlay_metadata(None);
                     presenter.set_overlay_timeline_markers(Vec::new());
                     presenter.set_overlay_jump_entries(Vec::new());
-                    presenter.reset_overlay_source_session();
+                    if let Err(err) = presenter.reset_overlay_source_session() {
+                        crate::logger::log(format!(
+                            "[native-video] reset seek-strip transform failed: {err}"
+                        ));
+                    }
                     // 前ソースの perf 履歴 (interval_ms / source_delta_ms / av_offset_ms)
                     // が残ったまま新ソースの最初のサンプルが入ると、median ベースの Y 軸が
                     // 古い fps を引きずって新サンプル蓄積後にガクッと切り替わる。新動画は
@@ -5370,6 +5393,13 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::ToggleBarLock { bar },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::ToggleSeekStripLock => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::ToggleSeekStripLock,
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ToggleClickInfoOpen => {
@@ -8551,11 +8581,11 @@ impl VideoPlayer {
     pub(crate) fn set_native_bar_lock_state(
         &self,
         top_locked: bool,
-        seek_locked: bool,
+        bottom_lock: crate::settings::VideoBottomLock,
         fixed_bar_gap_px: u32,
     ) {
         if let Some(output) = self.native_output.as_ref() {
-            output.set_bar_lock_state(top_locked, seek_locked, fixed_bar_gap_px);
+            output.set_bar_lock_state(top_locked, bottom_lock, fixed_bar_gap_px);
         }
     }
 

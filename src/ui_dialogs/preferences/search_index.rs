@@ -729,6 +729,7 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         [
             "上部情報バー",
             "下部シークバー",
+            "シークストリップ",
             "固定表示",
             "鍵",
             "領域を確保",

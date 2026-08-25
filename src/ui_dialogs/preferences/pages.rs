@@ -6067,16 +6067,30 @@ pub(super) fn draw_video_bar_visibility_settings(
 ) {
     ui.label(egui::RichText::new("再生画面のバー").strong());
     ui.add_space(4.0);
-    ui.label("動画の上部と下部のバーをそれぞれ固定表示できます。");
+    ui.label("動画の上部バーと、下部バー・シークストリップを固定表示できます。");
     ui.add_space(6.0);
 
     ui.checkbox(&mut settings.video_top_bar_locked, "上部情報バーを固定表示");
     ui.small("ON のときは再生画面上端に情報バー領域を確保し、映像をその下の領域にフィットします。上部情報バー端の鍵アイコンからも切り替えできます。");
-    ui.checkbox(
-        &mut settings.video_seek_bar_locked,
-        "下部シークバーを固定表示",
-    );
+    let mut bottom_lock = settings.video_bottom_lock();
+    let mut seek_bar_locked = bottom_lock.bar_locked();
+    if ui
+        .checkbox(&mut seek_bar_locked, "下部シークバーを固定表示")
+        .changed()
+    {
+        bottom_lock = bottom_lock.with_bar(seek_bar_locked);
+        settings.set_video_bottom_lock(bottom_lock);
+    }
     ui.small("ON のときは再生画面下端にシークバー領域を確保し、映像をその上の領域にフィットします。下部シークバー端の鍵アイコンからも切り替えできます。");
+    let mut seek_strip_locked = bottom_lock.strip_locked();
+    if ui
+        .checkbox(&mut seek_strip_locked, "シークストリップを固定表示")
+        .changed()
+    {
+        bottom_lock = bottom_lock.with_strip(seek_strip_locked);
+        settings.set_video_bottom_lock(bottom_lock);
+    }
+    ui.small("ON にすると下部シークバーも固定し、ストリップ表示中はその領域を映像から除外します。ストリップを閉じている間は領域を確保しません。");
     ui.small("固定バーと映像の間隔は、静止画フルスクリーンと共通の余白設定を使います。");
 }
 

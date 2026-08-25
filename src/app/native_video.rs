@@ -94,12 +94,28 @@ pub(super) fn toggle_native_video_bar_lock_setting(
     settings: &mut crate::settings::Settings,
     bar: crate::video::NativeVideoBar,
 ) -> bool {
-    let locked = match bar {
-        crate::video::NativeVideoBar::Top => &mut settings.video_top_bar_locked,
-        crate::video::NativeVideoBar::Seek => &mut settings.video_seek_bar_locked,
-    };
-    *locked = !*locked;
-    *locked
+    match bar {
+        crate::video::NativeVideoBar::Top => {
+            settings.video_top_bar_locked = !settings.video_top_bar_locked;
+            settings.video_top_bar_locked
+        }
+        crate::video::NativeVideoBar::Seek => {
+            let current = settings.video_bottom_lock();
+            let updated = current.with_bar(!current.bar_locked());
+            settings.set_video_bottom_lock(updated);
+            updated.bar_locked()
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(super) fn toggle_native_video_seek_strip_lock_setting(
+    settings: &mut crate::settings::Settings,
+) -> bool {
+    let current = settings.video_bottom_lock();
+    let updated = current.with_strip(!current.strip_locked());
+    settings.set_video_bottom_lock(updated);
+    updated.strip_locked()
 }
 
 #[cfg(windows)]
@@ -3847,6 +3863,7 @@ impl App {
                 crate::video::NativeVideoOutputEvent::NavigateItem { .. }
                     | crate::video::NativeVideoOutputEvent::ToggleSidePanelMode
                     | crate::video::NativeVideoOutputEvent::ToggleBarLock { .. }
+                    | crate::video::NativeVideoOutputEvent::ToggleSeekStripLock
                     | crate::video::NativeVideoOutputEvent::ToggleClickInfoOpen
                     | crate::video::NativeVideoOutputEvent::OpenTouchInfoPanel
                     | crate::video::NativeVideoOutputEvent::DismissTouchSidePanels
@@ -4127,6 +4144,20 @@ impl App {
                 self.sync_native_video_metadata(fs_idx);
                 self.show_native_video_overlay_toast(
                     format!("{label}: {}", if locked { "固定" } else { "自動表示" }),
+                    false,
+                );
+                self.mark_native_video_hud_activity(ctx);
+                ctx.request_repaint();
+            }
+            crate::video::NativeVideoOutputEvent::ToggleSeekStripLock => {
+                let locked = toggle_native_video_seek_strip_lock_setting(&mut self.settings);
+                self.settings.save();
+                self.sync_native_video_metadata(fs_idx);
+                self.show_native_video_overlay_toast(
+                    format!(
+                        "シークストリップ: {}",
+                        if locked { "固定" } else { "自動表示" }
+                    ),
                     false,
                 );
                 self.mark_native_video_hud_activity(ctx);
@@ -6226,7 +6257,7 @@ impl App {
         let side_panel_mode = self.settings.fullscreen_side_panel_mode;
         let info_panel_open = self.fs_info_panel_open;
         let top_bar_locked = self.settings.video_top_bar_locked;
-        let seek_bar_locked = self.settings.video_seek_bar_locked;
+        let bottom_lock = self.settings.video_bottom_lock();
         let fixed_bar_gap_px = self.settings.fullscreen_fixed_bar_gap_px;
         let touch_video_chrome_learned = self.settings.touch_video_chrome_learned;
         // ★ レーティング (右パネル先頭。get_rating は &mut self なので player 借用より前に取る)。
@@ -6321,7 +6352,7 @@ impl App {
         };
         player.set_native_metadata(Some(metadata));
         player.set_native_side_panel_state(side_panel_mode, info_panel_open);
-        player.set_native_bar_lock_state(top_bar_locked, seek_bar_locked, fixed_bar_gap_px);
+        player.set_native_bar_lock_state(top_bar_locked, bottom_lock, fixed_bar_gap_px);
     }
 
     #[cfg(windows)]
