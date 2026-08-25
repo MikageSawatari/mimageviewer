@@ -3158,13 +3158,17 @@ impl StartupFolderMode {
 #[derive(serde::Serialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StartupWindowState {
-    /// 常に通常ウィンドウで起動する。v3.2.0 までの振る舞いと同じなので既定。
+    /// 前回終了時が最大化だったなら最大化で起動する。Windows の一般的な挙動に合わせた既定。
+    ///
+    /// v3.2.0 から更新した利用者の設定にはこの field 自体が無く、最大化 flag も
+    /// 未記録 (= false) なので、更新直後の初回起動は通常ウィンドウのまま。次に
+    /// 最大化して終了したときから効き始める。
     #[default]
+    RememberLast,
+    /// 常に通常ウィンドウで起動する。v3.2.0 までの振る舞い。
     Normal,
     /// 常に最大化で起動する。
     Maximized,
-    /// 前回終了時が最大化だったなら最大化で起動する。
-    RememberLast,
 }
 
 impl<'de> serde::Deserialize<'de> for StartupWindowState {
@@ -3177,7 +3181,7 @@ impl<'de> serde::Deserialize<'de> for StartupWindowState {
             "normal" => Self::Normal,
             "maximized" => Self::Maximized,
             "remember_last" => Self::RememberLast,
-            _ => Self::Normal,
+            _ => Self::default(),
         })
     }
 }
@@ -3185,9 +3189,9 @@ impl<'de> serde::Deserialize<'de> for StartupWindowState {
 impl StartupWindowState {
     pub fn label(self) -> &'static str {
         match self {
+            Self::RememberLast => "前回終了時の状態",
             Self::Normal => "通常ウィンドウ",
             Self::Maximized => "最大化",
-            Self::RememberLast => "前回終了時の状態",
         }
     }
 }
@@ -9784,8 +9788,7 @@ mod tests {
 
     #[test]
     fn startup_maximized_follows_the_chosen_state() {
-        // 「通常」は前回が最大化でも最大化しない。既定なので、更新した利用者の
-        // 起動が勝手に変わらないことをここで固定する。
+        // 「通常」は前回が最大化でも最大化しない。
         assert!(!resolve_startup_maximized(StartupWindowState::Normal, true));
         assert!(!resolve_startup_maximized(
             StartupWindowState::Normal,
@@ -9800,7 +9803,7 @@ mod tests {
             StartupWindowState::Maximized,
             true
         ));
-        // 「前回終了時の状態」だけが保存済み flag を見る。
+        // 「前回終了時の状態」だけが保存済み flag を見る。これが既定。
         assert!(resolve_startup_maximized(
             StartupWindowState::RememberLast,
             true
@@ -9833,12 +9836,32 @@ mod tests {
     }
 
     #[test]
-    fn unknown_startup_window_state_falls_back_to_normal() {
+    fn unknown_startup_window_state_falls_back_to_the_default() {
         // 新しい選択肢を足した版で書いた設定を古い版が読む経路。既定へ落として
         // 起動できることを保証する。
         let loaded: Settings =
             serde_json::from_str(r#"{"startup_window_state":"tiled_to_the_left"}"#).unwrap();
-        assert_eq!(loaded.startup_window_state, StartupWindowState::Normal);
+        assert_eq!(
+            loaded.startup_window_state,
+            StartupWindowState::RememberLast
+        );
+    }
+
+    #[test]
+    fn updating_from_an_older_version_does_not_change_the_first_start() {
+        // v3.2.0 までの設定にはこの field も最大化 flag も無い。既定が
+        // 「前回終了時の状態」でも、記録が無い以上は通常ウィンドウで起動する。
+        // 更新直後に勝手に最大化しないことを固定する。
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            loaded.startup_window_state,
+            StartupWindowState::RememberLast
+        );
+        assert!(!loaded.window_maximized);
+        assert!(!resolve_startup_maximized(
+            loaded.startup_window_state,
+            loaded.window_maximized
+        ));
     }
 
     #[test]
@@ -9882,7 +9905,7 @@ mod tests {
         assert!(s.window_pos.is_none());
         assert!(s.window_size.is_none());
         assert!(!s.window_maximized);
-        assert_eq!(s.startup_window_state, StartupWindowState::Normal);
+        assert_eq!(s.startup_window_state, StartupWindowState::RememberLast);
         assert_eq!(s.prefetch_back, 4);
         assert_eq!(s.prefetch_forward, 12);
         assert_eq!(

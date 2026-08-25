@@ -454,13 +454,13 @@ pub(super) fn page_startup(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
         ui.radio_value(
             &mut state.settings.startup_window_state,
-            StartupWindowState::Normal,
-            StartupWindowState::Normal.label(),
+            StartupWindowState::RememberLast,
+            StartupWindowState::RememberLast.label(),
         );
         ui.radio_value(
             &mut state.settings.startup_window_state,
-            StartupWindowState::RememberLast,
-            StartupWindowState::RememberLast.label(),
+            StartupWindowState::Normal,
+            StartupWindowState::Normal.label(),
         );
         ui.radio_value(
             &mut state.settings.startup_window_state,
@@ -471,8 +471,7 @@ pub(super) fn page_startup(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new(
-                "ウィンドウの位置とサイズは、どの選択でも前回終了時のものを復元します。
-                 最大化を解いたときは、その位置とサイズに戻ります。",
+                "ウィンドウの位置とサイズは、どの選択でも前回終了時のものを復元します。\n最大化を解いたときは、その位置とサイズに戻ります。",
             )
             .weak(),
         );
