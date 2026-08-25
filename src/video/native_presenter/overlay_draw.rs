@@ -2260,35 +2260,6 @@ pub(super) fn draw_native_bar_lock_button(
     // 診断 (2026-08-25): 上の native click log と対で、egui が press を widget へ配ったかを見る。
     // ポインタが矩形の中にある間は毎フレーム出す。press が届かないとき、egui がそもそも
     // ポインタをこの widget の上だと思っていないのか、思っていて配らないのかを分ける。
-    let egui_hover = ui.ctx().pointer_hover_pos();
-    let pointer_in_rect = egui_hover.is_some_and(|p| rect.contains(p));
-    if pointer_in_rect || resp.is_pointer_button_down_on() || resp.clicked() {
-        // `contains_ptr=false` なのに `in_rect=true` だった。egui の hit test は
-        // **前 pass の widget 矩形**と clip で決まるので、残る候補は
-        // (a) clip で interact_rect が削られている (b) 前 pass にこの widget が居ない
-        // (c) 別の何かが pointer を握っている、の 3 つ。3 つとも出す。
-        // `read_response` は this_pass を先に見るので前 pass の証拠にならない。代わりに
-        // pass 番号 (間に別内容の pass が挟まっていないか)、Foreground の最前面 area
-        // (ストリップのクリックで area 順が入れ替わっていないか)、pointer が area 上と
-        // 見なされているかを出す。
-        let pass_nr = ui.ctx().cumulative_pass_nr();
-        let top_foreground = ui
-            .ctx()
-            .memory(|m| m.areas().top_layer_id(egui::Order::Foreground));
-        let pointer_over_area = ui.ctx().is_pointer_over_area();
-        crate::logger::log(format!(
-            "[strip-lock-diag] bar lock widget bar={bar:?} down_on={} clicked={}              hovered={} contains_ptr={} in_rect={pointer_in_rect}              egui_hover={egui_hover:?} top_layer={:?}              rect={rect:?} interact_rect={:?} clip={:?}              pass={pass_nr} top_fg={top_foreground:?} over_area={pointer_over_area}              using_pointer={} dragged_id={:?} locked={locked}",
-            resp.is_pointer_button_down_on(),
-            resp.clicked(),
-            resp.hovered(),
-            resp.contains_pointer(),
-            egui_hover.and_then(|p| ui.ctx().layer_id_at(p)),
-            resp.interact_rect,
-            ui.clip_rect(),
-            ui.ctx().is_using_pointer(),
-            ui.ctx().dragged_id(),
-        ));
-    }
     if resp.clicked() {
         commands.push(NativeOverlayCommand::ToggleBarLock { bar });
     }
@@ -3116,26 +3087,26 @@ pub(super) fn draw_native_center_status(
     body: Option<&str>,
     is_error: bool,
 ) {
+    // Passive status only. It must occupy just the box it draws: an `Area` registers a widget
+    // at its own rect even with `interactable(false)`, and egui's hit test discards any widget a
+    // front widget in another layer fully contains - so a full-screen passive Area makes every
+    // HUD button under it unclickable while it shows. Same defect as the toast; see
+    // `draw_native_toast`. `interactable(false)` stays: it also keeps the box itself from eating
+    // the right-click release that closes a broken video.
+    let rect = native_center_status_rect(
+        overlay_width_points,
+        overlay_height_points,
+        title,
+        body.is_some(),
+    );
     egui::Area::new(egui::Id::new("native_video_center_status"))
         .order(egui::Order::Foreground)
-        .fixed_pos(egui::Pos2::ZERO)
-        // Passive status only. Keeping the full-screen Area interactable makes
-        // broken-video error/preparing overlays consume right-click release
-        // events before the fullscreen close handler can see them.
+        .fixed_pos(rect.min)
         .interactable(false)
         .show(ctx, |ui| {
-            let full_rect = egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(overlay_width_points, overlay_height_points),
-            );
-            ui.set_min_size(full_rect.size());
-            let painter = ui.painter();
-            let rect = native_center_status_rect(
-                overlay_width_points,
-                overlay_height_points,
-                title,
-                body.is_some(),
-            );
+            ui.set_min_size(rect.size());
+            let painter = ui.painter().clone();
+            let painter = &painter;
             painter.rect_filled(
                 rect,
                 8.0,
@@ -3195,49 +3166,52 @@ pub(super) fn draw_native_toast(
     if alpha <= 0.0 {
         return None;
     }
-    let mut drawn_rect = None;
-    // interactable(false) でこの Area がクリックイベントを奪わないようにする。
-    // 旧: set_min_size で画面全体を Area として確保していたため、トースト表示中は
-    //     overlay の他のボタン (ループ / 再生 / etc.) クリックがこの Area に消費されていた。
+    // **この Area は自分が描く矩形ぶんだけを占める。画面全体にしない。**
+    // egui の `Area` は `interactable(false)` でも自分の矩形にウィジェットを 1 つ登録する
+    // (sense が click から hover に下がるだけ)。そして egui の hit test は「別レイヤーの
+    // 手前のウィジェットに完全に覆われたウィジェット」を捨てる。画面全体を占める受動的な
+    // Area があると、その下の HUD ボタンがトースト表示中ずっと hover もクリックもできなく
+    // なる (実機報告 2026-08-25: 固定トグルのトースト直後、下部バーの鍵が 1 回目のクリック
+    // で反応しない)。`interactable(false)` だけでは足りず、矩形も実描画に合わせる必要がある。
+    let full_rect = egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(overlay_width_points, overlay_height_points),
+    );
+    let font = egui::FontId::proportional(if toast.centered { 24.0 } else { 16.0 });
+    let galley = ctx.fonts_mut(|fonts| {
+        fonts.layout_no_wrap(toast.text.clone(), font.clone(), egui::Color32::WHITE)
+    });
+    let padding = if toast.centered {
+        egui::vec2(28.0, 18.0)
+    } else {
+        egui::vec2(16.0, 10.0)
+    };
+    let max_w = (overlay_width_points - 40.0).max(160.0);
+    let size = egui::vec2(
+        (galley.size().x + padding.x * 2.0).min(max_w),
+        galley.size().y + padding.y * 2.0,
+    );
+    let rect = if toast.centered {
+        // 中央 (full_rect.center().y) はレジューム picker の二重円
+        // (半径 56) と完全に被る。HUD top バー (上端 ~60px) と picker top
+        // (center_y - 56) の間に収めるため、上から 30% の位置に置く。
+        // 最小 80px は極端に低い窓 (= 30% が HUD バーに食い込む) 用の床。
+        let centered_y = (full_rect.min.y + full_rect.height() * 0.30).max(full_rect.min.y + 80.0);
+        egui::Rect::from_center_size(egui::pos2(full_rect.center().x, centered_y), size)
+    } else {
+        egui::Rect::from_min_size(
+            egui::pos2(full_rect.max.x - size.x - 20.0, full_rect.min.y + 62.0),
+            size,
+        )
+    };
+    let area_rect = rect.expand(4.0);
     egui::Area::new(egui::Id::new("native_video_toast"))
         .order(egui::Order::Foreground)
-        .fixed_pos(egui::Pos2::ZERO)
+        .fixed_pos(area_rect.min)
         .interactable(false)
         .show(ctx, |ui| {
-            let full_rect = egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(overlay_width_points, overlay_height_points),
-            );
-            ui.set_min_size(full_rect.size());
+            ui.set_min_size(area_rect.size());
             let painter = ui.painter();
-            let font = egui::FontId::proportional(if toast.centered { 24.0 } else { 16.0 });
-            let galley =
-                painter.layout_no_wrap(toast.text.clone(), font.clone(), egui::Color32::WHITE);
-            let padding = if toast.centered {
-                egui::vec2(28.0, 18.0)
-            } else {
-                egui::vec2(16.0, 10.0)
-            };
-            let max_w = (overlay_width_points - 40.0).max(160.0);
-            let size = egui::vec2(
-                (galley.size().x + padding.x * 2.0).min(max_w),
-                galley.size().y + padding.y * 2.0,
-            );
-            let rect = if toast.centered {
-                // 中央 (full_rect.center().y) はレジューム picker の二重円
-                // (半径 56) と完全に被る。HUD top バー (上端 ~60px) と picker top
-                // (center_y - 56) の間に収めるため、上から 30% の位置に置く。
-                // 最小 80px は極端に低い窓 (= 30% が HUD バーに食い込む) 用の床。
-                let centered_y =
-                    (full_rect.min.y + full_rect.height() * 0.30).max(full_rect.min.y + 80.0);
-                egui::Rect::from_center_size(egui::pos2(full_rect.center().x, centered_y), size)
-            } else {
-                egui::Rect::from_min_size(
-                    egui::pos2(full_rect.max.x - size.x - 20.0, full_rect.min.y + 62.0),
-                    size,
-                )
-            };
-            drawn_rect = Some(rect.expand(4.0));
             painter.rect_filled(
                 rect,
                 8.0,
@@ -3251,7 +3225,7 @@ pub(super) fn draw_native_toast(
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, (alpha * 255.0) as u8),
             );
         });
-    drawn_rect
+    Some(area_rect)
 }
 
 pub(super) fn native_ring_guide_overlay_rect(

@@ -4134,13 +4134,7 @@ impl App {
                 self.mark_native_video_hud_activity(ctx);
             }
             crate::video::NativeVideoOutputEvent::ToggleBarLock { bar } => {
-                // 診断 (2026-08-25): 遷移前後の 2 bool を出す。原因特定後に消す。
-                let before = self.settings.video_bottom_lock();
                 let locked = toggle_native_video_bar_lock_setting(&mut self.settings, bar);
-                crate::logger::log(format!(
-                    "[strip-lock-diag] app ToggleBarLock bar={bar:?} before={before:?} after={:?}",
-                    self.settings.video_bottom_lock(),
-                ));
                 let label = match bar {
                     crate::video::NativeVideoBar::Top => "上部情報バー",
                     crate::video::NativeVideoBar::Seek => "下部シークバー",

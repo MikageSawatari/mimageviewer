@@ -253,6 +253,16 @@ overlay / layout まで同期し、「バー非固定 + ストリップ固定」
 全域のままで縮めない。VST の compact と同時に有効な場合は、先に固定バーを除外し、その残りの
 右上 1/4 (幅・高さを各 1/2) を compact target にする。固定解除時は除外を取り消して従来の fit に戻す。
 
+**受動的な overlay の `Area` は、自分が描く矩形ぶんだけを占める。画面全体を確保しない。**
+egui の `Area` は `interactable(false)` でも自分の矩形にウィジェットを 1 つ登録し
+(sense が click から hover へ下がるだけ)、egui の hit test は「別レイヤーの手前のウィジェットに
+完全に覆われたウィジェット」を捨てる。そのため画面全体を占める受動的 Area があると、その下の
+HUD ボタンが表示中ずっと hover もクリックもできなくなる (実機報告 2026-08-25: 固定トグルの
+トースト直後、下部バーの鍵が 1 回目のクリックで反応しない)。`native_video_toast` と
+`native_video_center_status` はこの理由で実描画矩形へ縮めてある。`interactable(false)` だけでは
+足りない。タイル一覧・ナビゲーションプレビュー・音量ノーマライズ blocker は意図的に全画面を
+覆う面なので対象外。
+
 各バーとシークストリップには固定状態を示す鍵ボタンを置く。鍵の形は静止画の
 `ui_fullscreen::draw_icons::draw_seek_lock_icon` を共有し、native 側で同じベクター形状を複製しない。
 クリックは typed overlay command で App へ戻し、下部は `VideoBottomLock` の遷移で永続 bool を更新して

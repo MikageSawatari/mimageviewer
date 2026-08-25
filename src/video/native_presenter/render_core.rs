@@ -1360,6 +1360,18 @@ pub(super) struct NativeOverlayToast {
     linger: Duration,
 }
 
+#[cfg(test)]
+impl NativeOverlayToast {
+    fn for_test(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            started_at: Instant::now(),
+            centered: false,
+            linger: Duration::from_secs_f32(1.8),
+        }
+    }
+}
+
 pub struct NativePresentOutcome {
     pub path: &'static str,
     pub shared_handle: u64,
@@ -6835,31 +6847,6 @@ impl NativeEguiOverlay {
                     pressed: button.down,
                     modifiers,
                 });
-                // 診断 (2026-08-25): ストリップ固定中に下部バーの鍵が 1 回目のクリックで
-                // 反応しない、という報告の切り分け用。native がクリックを届けているのか、
-                // egui が widget へ配らないのか、App の遷移がおかしいのかを分けて見る。
-                // 原因を特定したら消す。
-                if matches!(egui_button, egui::PointerButton::Primary) {
-                    let ppp = self.pixels_per_point.max(f32::MIN_POSITIVE);
-                    let width_points = self.width as f32 / ppp;
-                    let height_points = self.height as f32 / ppp;
-                    let bar_lock = crate::video::native_presenter::overlay_draw::
-                        native_seek_bar_lock_button_rect(width_points, height_points);
-                    let strip_rect = native_seek_strip_rect(width_points, height_points);
-                    let strip_lock = native_seek_strip_lock_button_rect(strip_rect);
-                    crate::logger::log(format!(
-                        "[strip-lock-diag] native click down={} pos=({:.1},{:.1})                          in_bar_lock={} in_strip_lock={} in_strip={}                          bottom_hud_visible={} strip_some={} bottom_lock={:?}",
-                        button.down,
-                        pos.x,
-                        pos.y,
-                        bar_lock.contains(pos),
-                        strip_lock.contains(pos),
-                        strip_rect.contains(pos),
-                        self.bottom_hud_visible,
-                        self.seek_strip.is_some(),
-                        self.bottom_lock,
-                    ));
-                }
                 self.dirty = true;
             }
             NativeEvent::MouseWheel(wheel) => {
@@ -12071,6 +12058,136 @@ mod tests {
             run(true),
             1,
             "one click on the bottom HUD lock must still toggle it while the strip is showing"
+        );
+    }
+
+    /// Real-hardware report: while a toast was on screen, the first click on the bottom HUD's
+    /// lock did nothing and only the second one landed. Every egui `Area` registers a widget at
+    /// its own rect - `interactable(false)` only downgrades the sense to hover, it does not stop
+    /// the registration - and egui's hit test drops a widget that a front widget in another layer
+    /// fully contains. A passive overlay sized to the whole screen therefore swallows every HUD
+    /// button under it for as long as it shows.
+    #[test]
+    fn a_toast_does_not_swallow_clicks_on_the_hud_beneath_it() {
+        use egui_kittest::Harness;
+        use std::sync::{Arc, Mutex};
+
+        let overlay_size = egui::vec2(1242.7, 916.0);
+        let lock_rect =
+            crate::video::native_presenter::overlay_draw::native_seek_bar_lock_button_rect(
+                overlay_size.x,
+                overlay_size.y,
+            );
+        let pointer = lock_rect.center();
+
+        // Both passive overlays, so the pair is covered rather than only the one reported. The
+        // tile grid, the navigation preview and the normalize blocker are meant to cover the
+        // screen and are not in this list.
+        #[derive(Clone, Copy)]
+        enum Passive {
+            None,
+            Toast,
+            CenterStatus,
+        }
+
+        let clicks_with_overlay = |passive: Passive| {
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let captured_for_ui = Arc::clone(&captured);
+            let mut fonts_ready = false;
+            let mut harness = Harness::builder()
+                .with_size(overlay_size)
+                .with_pixels_per_point(1.5)
+                .build(move |ctx| {
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    let mut commands = Vec::new();
+                    egui::Area::new(egui::Id::new("native_video_seek_hud"))
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(egui::pos2(
+                            0.0,
+                            overlay_size.y - HUD_BOTTOM_HEIGHT,
+                        ))
+                        .show(ctx, |ui| {
+                            ui.set_min_size(egui::vec2(
+                                overlay_size.x,
+                                HUD_BOTTOM_HEIGHT,
+                            ));
+                            let painter = ui.painter().clone();
+                            crate::video::native_presenter::overlay_draw::draw_native_bar_lock_button(
+                                ui,
+                                &painter,
+                                lock_rect,
+                                "native_seek_bar_lock",
+                                true,
+                                "シークバー固定を解除",
+                                crate::video::NativeVideoBar::Seek,
+                                &mut commands,
+                            );
+                        });
+                    // Drawn after the HUD, so it is the frontmost Foreground area - exactly the
+                    // order the presenter produces right after a lock is toggled.
+                    match passive {
+                        Passive::None => {}
+                        Passive::Toast => {
+                            crate::video::native_presenter::overlay_draw::draw_native_toast(
+                                ctx,
+                                overlay_size.x,
+                                overlay_size.y,
+                                &super::NativeOverlayToast::for_test("下部シークバー: 固定"),
+                            );
+                        }
+                        Passive::CenterStatus => {
+                            crate::video::native_presenter::overlay_draw::draw_native_center_status(
+                                ctx,
+                                overlay_size.x,
+                                overlay_size.y,
+                                "読み込み中",
+                                None,
+                                false,
+                            );
+                        }
+                    }
+                    captured_for_ui.lock().unwrap().extend(commands);
+                });
+            harness.run();
+            harness.hover_at(pointer);
+            harness.run();
+            for pressed in [true, false] {
+                harness.event(egui::Event::PointerButton {
+                    pos: pointer,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            harness.run();
+            let commands = captured.lock().unwrap();
+            commands
+                .iter()
+                .filter(|command| {
+                    matches!(command, super::NativeOverlayCommand::ToggleBarLock { .. })
+                })
+                .count()
+        };
+
+        assert_eq!(
+            clicks_with_overlay(Passive::None),
+            1,
+            "sanity: the lock works with nothing over it"
+        );
+        assert_eq!(
+            clicks_with_overlay(Passive::Toast),
+            1,
+            "a toast must not eat the first click on the HUD button under it"
+        );
+        assert_eq!(
+            clicks_with_overlay(Passive::CenterStatus),
+            1,
+            "the centre status box must not eat it either"
         );
     }
 
