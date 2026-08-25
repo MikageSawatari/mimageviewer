@@ -1950,7 +1950,7 @@ COM cast と `VideoGradePipeline::new` / `VideoResamplePipeline::new` だけ。
   ダンプは `C:\Users\<user>\AppData\Local\CrashDumps\` に残る (今回は 59.6 GB)。
 - 規模 / 優先度: Small (B) / Medium (A)。**P2** — 通常操作 (タグ付け → フォルダ移動) で落ちた。
 
-### 1.124 F12 を連打すると実際の押下が破棄される ✅ 修正済み (2026-08-26、実機確認待ち)
+### 1.124 F12 を連打すると実際の押下が破棄される ✅ 修正済み (2026-08-26、実機確認済み)
 
 - 出典: 2026-08-25、§1.122 修正後の実機確認。別ウィンドウから F12 で main へ戻るとき、
   **連打すると最初の何回かが無反応**。**§1.122 とは別の既存不具合**。
@@ -2011,8 +2011,65 @@ rebuild 後に**新しい HWND が decode した**再配送は**現世代**で s
 該当部分を撤回した (一般原則は維持)。触った範囲と判断理由は
 [detached-rework-plan.md](detached-rework-plan.md) §11 に記録。
 
-- ⚠ **実機確認待ち**: 別ウィンドウから F12 連打で毎回反応すること、かつ二重トグル
-  (main へ一瞬フラッシュ→再分離) が起きないこと。
+- ✅ **実機確認済み (2026-08-26)**: F12 押下 15 回に対し切替 13 回・意図的な無視 2 回で、
+  取りこぼしゼロ・二重トグルゼロ。無視された 2 件はどちらも切替飛行中で、
+  `ignore F12 toggle while video placement switch is pending` として記録されていた
+  (= 意図した pending guard)。`ignore stale native F12 toggle` は 0 件。
+
+### 1.125 ★固定を押すと、開いている fullscreen が古い idx を指したままになる — 実機
+
+- 出典: 2026-08-26、別件 (per-context snapshot) の実機確認中に利用者が発見。
+  **動画を再生しながら ★固定 を押すと再生が止まり、
+  「読込中...」のまま固着する**。画面には `c:\home\youtube\movie\youtube` のような
+  **フォルダに見える path** が出ていた。
+- **既存の不具合**。`activate_snapshot` の最終変更は **2026-06-04** (`969ba68f`、★固定 UI 導入時)。
+  発見時のブランチは [snapshot_ops.rs](../src/app/snapshot_ops.rs) と
+  [ui_fullscreen.rs](../src/ui_fullscreen.rs) を 1 行も触っていない。
+
+#### 原因 — `activate_snapshot` が fullscreen を一切見ていない
+
+[snapshot_ops.rs](../src/app/snapshot_ops.rs) の `activate_snapshot` (165〜330 行) には
+`fullscreen_idx` / `fs_cache` / `close_fullscreen` への参照が **1 つも無い**。やっているのは:
+
+1. `items` を snapshot の部分集合へ**丸ごと差し替える**
+2. `bump_items_generation()` + `invalidate_idx_state_and_queues()`
+
+しかし **fullscreen ビューアは古い `fs_idx` を指したまま**なので:
+
+- `fs_idx` の先が**別のアイテム**になる。snapshot に含まれない / フォルダだった場合、
+  fullscreen はそれを読めず **「読込中...」で永久に止まる**
+- `fs_cache` は `ItemsGenerationMap<FsCacheEntry>`
+  ([viewer_context_registry.rs:845](../src/app/viewer_context_registry.rs:845)) なので、
+  generation を進めた時点で **開いていた動画エントリごと無効化**される → 再生が止まる
+
+**設計の穴はここだけ**: snapshot 側は fullscreen を知らないわけではなく、
+`snapshot_current_fullscreen_path()` ([snapshot_ops.rs:711](../src/app/snapshot_ops.rs:711)) を持ち、
+**snapshot が既に active な状態での fullscreen ナビ**はちゃんと扱っている。
+抜けているのは **「fullscreen を開いている最中に snapshot を activate した」場合の整合**だけ。
+
+`deactivate_snapshot` も同じ形で items を戻すので、**解除側にも同型の穴があるはず**。
+修正時は両方を列挙すること。
+
+#### 直し方は仕様判断 — 決めてから着手する
+
+| 案 | 挙動 | 考えどころ |
+| --- | --- | --- |
+| A | ★固定時に fullscreen を閉じる | 単純で確実。ただし見ていたものが消える |
+| B | 同じアイテムを新 idx へ追従させる | 一番自然。`snapshot_owner_entry` が既に path → entry 解決を持っている |
+| C | snapshot に含まれるなら B、含まれなければ閉じる | B の自然さを保ちつつ範囲外を定義できる |
+
+⚠ **「読込中のまま固着するなら timeout で閉じる」は症状パッチ**。idx が意味を失ったこと自体を扱う。
+⚠ 動画の再生停止だけを見て `fs_cache` を generation 無効化から外すのも不可。
+   無効化は「idx の意味が変わった」という正しい事実を表している。直すべきは **見ている側の追従**。
+
+#### 再現手順
+
+1. 動画を含むフォルダを開く
+2. 動画を fullscreen で再生する
+3. (一覧側に戻らずに) **★固定** を押す
+4. → 再生が止まり、「読込中...」のまま戻らない
+
+- 規模 \\ 優先度: Small〜Medium / **P2** (通常操作で到達し、固着する)。
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 
