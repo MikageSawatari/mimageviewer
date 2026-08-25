@@ -625,7 +625,7 @@ helper 3 本が `impl Into<ContextRef<'a>>` を取り、`From<&ViewerContextBund
 `become_independent_detached_viewer` / `retarget_bookmark_media_open` /
 `split_materialized_physical_context_for_detached_scope` (fork + 絞り込みを 1 本に)。
 
-**ステージ②-d 実装完了・実機 smoke 待ち (2026-08-25、未コミット。指示書
+**ステージ②-d 実装完了・実機 smoke 待ち (2026-08-25、`bf391e6a`。指示書
 [detached-rework-stage-r2e-2d.md](detached-rework-stage-r2e-2d.md))。**
 `App::active_detached_viewer_context` と `DetachedImageWindowSnapshot::paused_bundle` を削除し、
 production の唯一の保管先を `ViewerContextRegistry` の slot に切り替えた。registry は
@@ -650,6 +650,64 @@ live-media fork は binding を旧 main から新 context へ transfer する。
   always-new / reuse、PDF/ZIP の park・resume と folder-nav、video/audio の live park・resume と
   main context change promote、複数窓の順不同 close、右ドラッグ / keep-alive、tray / remote、
   native presenter の HWND / focus / z-order を確認する。
+
+### 検収 (ClaudeCode、2026-08-25)
+
+**テストが減っていないことを最優先で確認した** (この段は `src/app/tests.rs` が
+956 追加 / 1238 削除 = 差し引き 282 行減っているため)。
+
+- `src/app/tests.rs` の `#[test]` 数は **1399 → 1399 で不変**。消えた 6 つの識別子は
+  helper 3 つ (`paused_test_window` / `parked_bundle_snapshot` /
+  `passive_right_drag_image_bundle`) と、**改名された test 3 つ**だった:
+  `paused_detached_mount_skips_missing_bundle_and_window` →
+  `window_mount_rejects_unbound_snapshot_and_unknown_window`、
+  `paused_detached_mount_drops_bundle_when_target_closes_inside_closure` →
+  `window_mount_round_trips_context_when_snapshot_vector_changes_inside_closure`、
+  `exit_resume_harvest_reads_active_and_paused_bundles_without_dropping_them` →
+  `..._active_and_parked_contexts_without_dropping_them`。
+  行数減はテスト本体ではなく**セットアップの共通化** (直書き 4 行 →
+  `push_window_context_for_test` 1 行) による。
+  ⚠ 2 番目の改名は**意味も変わっている**: 窓の snapshot が消えても context は registry に
+  残るので drop されない。これは②-d の目的そのものであって退行ではない。
+- 保護指定した 2 本は健在。`all_context_clear_processes_a_paused_context_that_is_already_mounted`
+  の**完全一致列の assert は diff に現れない = 無変更**。差分は setup の移行のみ。
+- test helper と failpoint は**すべて `#[cfg(all(test, windows))]`** で、production に costs が無い。
+  failpoint は**本物の `swap_viewer_context_bundle` の内側** (rating 同期と
+  visible index 再構築の直後) に刺さっている。
+- 独立実行: `cargo fmt --check` 無出力 / `cargo run -p viewer_context_audit` exit 0 (既知の指摘
+  1 件のまま) / `cargo test -p viewer_context_audit` 25 件 / **`rg "active_detached_viewer_context|paused_bundle"
+  src/ -g "!viewer_context_registry.rs"` が 0 件** / `cargo test -p mimageviewer --lib` **6258 passed**。
+- registry モジュールの `#[test]` は 22 → 29 (+7)。lib 件数 6251 → 6258 と一致する。
+
+### 実機 smoke シナリオ (利用者へ)
+
+リポジトリルートから。**起動前にインストール版 / トレイ常駐版を終了すること**
+(single-instance mutex を共有する)。**引数なしでは実利用中の `%APPDATA%\mimageviewer` を
+使う**ので、設定・キャッシュ・ログを更新し得る。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+1. **always-new の静止画**: 「常に別ウィンドウで開く」ON。静止画 A を F12 → main へ戻る →
+   B を開く → A を再アクティブ化 → **B を A より先に閉じる**。
+   各窓が画像・選択・ズーム/パン・配置・フォーカス・右ドラッグの identity を保つか。
+2. **reuse の静止画**: always-new OFF。F12 で開き、Ctrl+↑↓ でフォルダ移動、閉じて開き直す。
+   **同じ OS ウィンドウ / サイズが再利用され、小窓のチラつきが出ない**か。
+3. **PDF / ZIP の本**: 別ウィンドウで開き、**非同期の列挙中とパスワード入力中**に park / resume。
+   ページ / フォルダ移動。空の viewport・別の本・パスワード状態の喪失が無いか。
+4. **動画 / 音声 + promote**: detached で再生 → main 側のフォルダ / お気に入り /
+   スマートフォルダを変更。**再生が promote をまたいで続き**、main の一覧は独立し、
+   再アクティブ化で同じセッションに戻るか。
+5. **VST3**: 4 を VST3 有効で。deferred media open コマンドも含める。
+   再生 / marker の所有 / VST GUI / pending コマンドが**正しい窓に付いたまま**か。
+6. **右ドラッグ (park 中 / keep-alive の隙間)**: parked な窓、または PDF/ZIP の keep-alive 中に
+   passive 右ドラッグ。**その窓だけに届き**、viewport が消えないか。
+7. **順不同 close + tray / remote**: 静止画 / PDF / 動画の窓を複数作り、**順不同で閉じる**。
+   トレイへの hide / 復帰、リモートセッションの pause / resume。兄弟窓が壊れないか。
+8. **マルチモニター / 混在 DPI**: detached 動画窓をモニター間で移動し、アクティブ化・
+   最小化 / 復元・VST GUI・close。native child HWND の配置・フォーカス・z-order・
+   presenter の連続性。
 
 ## 「独立 detached viewer にする」3 経路のフラグ集合が違う — 調査済み・不具合なし
 
