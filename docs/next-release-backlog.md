@@ -1545,6 +1545,9 @@ ClaudeCode の追加ログと Codex の portable / normal ログを併記して 
 - 規模 / 優先度: 通常ページ表示 Medium、縦連結まで含めて Medium〜Large (1〜2週間程度)。当初の
   logical page 全面対応 (2〜8週間想定) より範囲を大きく限定できる / P3。
 
+**実装プランは [page-split-plan.md](page-split-plan.md)** (当たりを付けた結果・範囲の根拠・
+次に触る場所)。以下は着手時の記録。
+
 #### 純ロジックだけ先行 (2026-08-25、[page_split.rs](../src/page_split.rs))
 
 配線はレーン A の `app.rs` 一括切替の後に回す
@@ -1566,8 +1569,20 @@ ClaudeCode の追加ログと Codex の portable / normal ログを併記して 
   `before.source_idx != after.source_idx` を組み立てると判定が散る)
 - 縦連結も同じステップ列を使う。「同じ texture 由来の 2 領域を縦に並べる」順序は
   ページ送りの順序と同じものなので、別の列を作らない
-- **`SpreadMode` への「横長分割 左→右 / 右→左」追加はまだ入れていない。** 何もしない
-  選択肢がプルダウンに出る半端な状態を避けるため、配線と同時に入れる。
+#### モードと per-viewer 状態まで (2026-08-25、レーン A マージ後)
+
+- `SpreadMode::SplitLtr` / `SplitRtl` を追加。**`all()` には入れていない**ので
+  プルダウンには出ない (選べるのに何も起きない状態を master へ置かない)。
+  見開きとは排他で、`is_spread` / `is_rtl` / `has_cover` はすべて偽のまま。
+- `App::fullscreen_page_slice` + bundle 側 + `swap_field!` を追加。**元ページと同じ
+  context 所有**にした。片方だけ App に置くと、context を切り替えたときに前の viewer の
+  左右が次の viewer に残る。`viewer_context_audit` は通過 (既知 1 件のみ)。
+- **範囲を「回転していないページ」に限定した。** 分割の crop は既存の自動表示トリムと
+  同じ `content_bbox` に乗るが、`fs_image_fit_bbox` は回転時にそれを捨てる。捨てられると
+  同じページが 2 回そのまま出る。型付き `SourceCrop` への作り替えは 215 箇所に及ぶので、
+  §1.119 とは別の改修として立てる (トリムが回転時に効かない問題も同時に直る)。
+  根拠と詳細は [page-split-plan.md](page-split-plan.md) §2。
+- **残り**: ページ送り (`FsPageNav::Split`)、描画、着地、`all()` への追加、マニュアル。
 
 ### 1.120 Susie 32bit ワーカー異常終了後の自己回復 — 外部SNSでの不具合言及 ✅ 実装済み (2026-08-25、実機確認済み)
 
