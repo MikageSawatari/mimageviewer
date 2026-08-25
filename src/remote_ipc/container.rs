@@ -6251,9 +6251,11 @@ fn remote_spread_mode(mode: crate::settings::SpreadMode) -> RemoteSpreadMode {
         crate::settings::SpreadMode::LtrCover => RemoteSpreadMode::LtrCover,
         crate::settings::SpreadMode::Rtl => RemoteSpreadMode::Rtl,
         crate::settings::SpreadMode::RtlCover => RemoteSpreadMode::RtlCover,
-        crate::settings::SpreadMode::Single | crate::settings::SpreadMode::Vertical => {
-            RemoteSpreadMode::Single
-        }
+        // 分割はリモート非対応 (§1.119 MVP 対象外)。元ページ表示を維持する。
+        crate::settings::SpreadMode::Single
+        | crate::settings::SpreadMode::Vertical
+        | crate::settings::SpreadMode::SplitLtr
+        | crate::settings::SpreadMode::SplitRtl => RemoteSpreadMode::Single,
     }
 }
 

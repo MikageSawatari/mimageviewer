@@ -1651,7 +1651,10 @@ fn spread_mode_key_action(mode: SpreadMode) -> Option<KeyAction> {
         SpreadMode::LtrCover => Some(KeyAction::FsSpreadLtrCover),
         SpreadMode::Rtl => Some(KeyAction::FsSpreadRtl),
         SpreadMode::RtlCover => Some(KeyAction::FsSpreadRtlCover),
-        SpreadMode::Vertical => None,
+        // 分割モードには既定キーを割り当てていない。1〜5 は既存の 5 モードで埋まっており、
+        // 空いた既定を作るために既存の割り当てを動かすのは、利用者の手癖を壊す方が損である。
+        // 上のバーのプルダウンから選ぶ。keymap で足したくなったらここへ `KeyAction` を追加する。
+        SpreadMode::Vertical | SpreadMode::SplitLtr | SpreadMode::SplitRtl => None,
     }
 }
 

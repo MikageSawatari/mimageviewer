@@ -61,6 +61,18 @@ pub enum SplitDirection {
 }
 
 impl SplitDirection {
+    /// 表示モードから分割の向きを取る。分割モードでなければ `None`。
+    ///
+    /// `SpreadMode::is_split` との食い違いは
+    /// `every_split_mode_names_a_direction` が固定する。
+    pub fn from_spread_mode(mode: crate::settings::SpreadMode) -> Option<Self> {
+        match mode {
+            crate::settings::SpreadMode::SplitLtr => Some(Self::LeftFirst),
+            crate::settings::SpreadMode::SplitRtl => Some(Self::RightFirst),
+            _ => None,
+        }
+    }
+
     /// このページで最初に見る側。しおり等から開いたときの着地先でもある。
     pub fn first(self) -> PageSlice {
         match self {
@@ -331,5 +343,65 @@ mod tests {
         assert!(!PageSlice::Full.is_half());
         assert!(PageSlice::Left.is_half());
         assert!(PageSlice::Right.is_half());
+    }
+
+    /// 分割モードだと名乗るモードは、必ず向きを答えられる。
+    ///
+    /// `SpreadMode::is_split` と `SplitDirection::from_spread_mode` が別々に書かれて
+    /// いるので、モードを増やしたときに片方だけ直すと**分割 ON なのに何も起きない**
+    /// 状態になる。そこを固定する。
+    #[test]
+    fn every_split_mode_names_a_direction() {
+        use crate::settings::SpreadMode;
+        // `all()` はプルダウンに出す並びなので、網羅の根拠には使わない。
+        let every_mode = [
+            SpreadMode::Single,
+            SpreadMode::Ltr,
+            SpreadMode::LtrCover,
+            SpreadMode::Rtl,
+            SpreadMode::RtlCover,
+            SpreadMode::Vertical,
+            SpreadMode::SplitLtr,
+            SpreadMode::SplitRtl,
+        ];
+        for mode in every_mode {
+            assert_eq!(
+                mode.is_split(),
+                SplitDirection::from_spread_mode(mode).is_some(),
+                "{mode:?} の is_split と from_spread_mode が食い違っている"
+            );
+        }
+        assert_eq!(
+            SplitDirection::from_spread_mode(SpreadMode::SplitLtr),
+            Some(SplitDirection::LeftFirst)
+        );
+        assert_eq!(
+            SplitDirection::from_spread_mode(SpreadMode::SplitRtl),
+            Some(SplitDirection::RightFirst)
+        );
+    }
+
+    /// 分割は見開きではない。見開き用の分岐へ紛れ込ませない。
+    #[test]
+    fn splitting_is_not_a_spread() {
+        use crate::settings::SpreadMode;
+        for mode in [SpreadMode::SplitLtr, SpreadMode::SplitRtl] {
+            assert!(!mode.is_spread(), "{mode:?}");
+            assert!(!mode.is_rtl(), "{mode:?}");
+            assert!(!mode.has_cover(), "{mode:?}");
+        }
+    }
+
+    /// 整数との往復で向きが失われない (DB へは整数で入る)。
+    #[test]
+    fn the_split_modes_survive_the_integer_round_trip() {
+        use crate::settings::SpreadMode;
+        for mode in [SpreadMode::SplitLtr, SpreadMode::SplitRtl] {
+            assert_eq!(SpreadMode::from_int(mode.to_int()), mode);
+        }
+        // 旧版が書いた値と衝突しない。
+        assert_eq!(SpreadMode::from_int(5), SpreadMode::Vertical);
+        // 知らない値は既定へ倒す (新版が書いた値を旧版が読んだときの経路)。
+        assert_eq!(SpreadMode::from_int(99), SpreadMode::Single);
     }
 }
