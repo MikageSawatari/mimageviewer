@@ -719,6 +719,12 @@ unsafe extern "system" fn native_exception_handler(
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
+        // ⚠ このハンドラはスレッド終了処理の内側でも、ヒープが壊れている状態でも走る。
+        // スレッド ID は `logger::current_thread_id_num` が TLS を経由しないので安全だが、
+        // **下の `format!` と `append_panic_log_entry` はヒープを使う**。一次例外が
+        // `RtlFreeHeap` から来た場合、その thread がヒープロックを握ったまま来ている可能性が
+        // あり、ここでの確保が再入で詰まり得る。残存リスクとして backlog §1.123 に記録済み
+        // (固定バッファ + 起動時に開いた handle へ書く形が本来の姿)。
         let tid = logger::current_thread_id_num()
             .map(|n| n.to_string())
             .unwrap_or_else(|| "?".to_owned());
