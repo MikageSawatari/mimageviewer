@@ -135,6 +135,20 @@ raw index entry まで、`TimeGrid` では 1 grid interval とし、隣の場面
 よう、時刻の大きさに応じた丸め guard を入れる。実際に短い GOP を threshold と同一視する定数幅の
 緩和は行わない。
 
+**D22 (実素材修正、2026-08-25)**: hmovie.mp4 は index 259 件、duration の 99.5% coverage、
+列挙順の逆行 0 件で、index timestamp 非単調という当初仮説には該当しなかった。失敗原因は
+AVDISCARD_NONKEY で H.264 の非 key frame を復号しない高速経路が、この素材の参照構造では
+decode_slice_header error / NoFrame になったことだった。通常素材では従来の keyframe-only
+経路を維持し、その経路が NoFrame / decode / convert failure を返したファイルだけ、成功済み
+セルを保持したまま software full-frame decoder を開き、対象 run の 1 つ前の raw index gap から
+pre-roll して再試行する。以後そのファイルでは同じ full-frame decoder を再利用する。これは
+健全な index を TimeGrid へ落とす axis fallback ではなく、keyframe packet が単独復号できない
+ファイル向けの decode strategy fallback である。
+
+axis resolver は raw index entry を sort する前の列挙順について monotonic / inversion count を
+診断へ残す。実際に逆行があれば sort で隠さず、理由 non_monotonic_index_timestamps を伴って
+TimeGrid を選ぶ。
+
 ## 3. 実現手段 (調査で確定した前提)
 
 | 手段 | 確認結果 |
@@ -492,6 +506,14 @@ enum SeekRowGesture {
   typed failure、実 decode path、software retry の trigger、実アプリと同じ fallback interval と
   raw / adopted spacing を出す。axis 判定だけを切り分ける場合は
   `MIV_STRIP_THUMB_PROBE_FORCE_INDEX=1` で列挙済み index を強制できる。
+- 全ライブラリの回帰確認は production の SeekStripThumbnailWorker と axis resolver を直接使う
+  seek_strip_batch を使う。
+  cargo run --profile dev-runtime --features dev-tools --bin seek_strip_batch -- folder...
+  で mIV 対応動画拡張子だけを再帰走査し、各ファイルの先頭 / 25% / 50% / 75% / 最終 full window
+  を検証する。--limit N、差分比較用 --json、SW 固定の --software を持つ。1 行 summary の後、
+  failed file だけ axis reason と全 cell time / outcome / failure reason を詳記し、failed cell または
+  scan error があれば非 0 で終了する。JSON には schema version と ready cell を含む全 cell time を
+  保存する。open 不可、video stream 無し、duration 不明は decode window を開始せず skip する。
 
 ### perf 計装
 

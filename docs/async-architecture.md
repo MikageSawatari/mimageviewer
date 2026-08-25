@@ -95,6 +95,10 @@ cancel する。Web 側も同時 2 件で、503
 foreground は前景待機者がいる間その共有通信を cancel しない。foreground 自身の cancel は
 共有 controller ではなく、その待機だけへ適用する。
 
+動画シークストリップ画像 worker は通常の keyframe-only 高速経路を維持し、NoFrame / decode /
+convert failure の素材だけ成功セルを維持したまま software full-frame + 1 raw index gap pre-roll へ
+file-local fallback する。close / 動画切替 / fullscreen 終了の cancel owner は変わらない。
+
 ## 2. スレッド間通信
 
 ### 2.1 共有アトミック

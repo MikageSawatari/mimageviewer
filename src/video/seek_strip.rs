@@ -179,8 +179,46 @@ pub(crate) enum StripAxisDecision {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TimeGridReason {
     TooFewEntries,
+    NonMonotonicTimestamps,
     InvalidCoverage,
     IncompleteCoverage,
+}
+
+/// Keyframe timestamps from the container index plus their enumeration-order health.
+///
+/// The keyframes field is sorted because axis math requires it, while monotonic and
+/// inversion_count preserve whether sorting changed the original index order. Silently
+/// sorting an index with backward jumps can make the axis disagree with packet decode order.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct EnumeratedIndexKeyframes {
+    pub(crate) keyframes: Vec<f64>,
+    pub(crate) monotonic: bool,
+    pub(crate) inversion_count: usize,
+}
+
+fn normalize_index_keyframes(mut keyframes: Vec<f64>) -> EnumeratedIndexKeyframes {
+    let inversion_count = keyframes
+        .windows(2)
+        .filter(|pair| pair[1] < pair[0])
+        .count();
+    keyframes.sort_by(f64::total_cmp);
+    EnumeratedIndexKeyframes {
+        keyframes,
+        monotonic: inversion_count == 0,
+        inversion_count,
+    }
+}
+
+/// Includes enumeration order in the decision whether the container index is usable.
+pub(crate) fn decide_enumerated_strip_axis(
+    index: &EnumeratedIndexKeyframes,
+    duration_secs: f64,
+) -> StripAxisDecision {
+    if !index.monotonic {
+        StripAxisDecision::TimeGrid(TimeGridReason::NonMonotonicTimestamps)
+    } else {
+        decide_strip_axis(&index.keyframes, duration_secs)
+    }
 }
 
 /// 索引エントリ数と末尾到達時刻から、使用する軸を決める。
@@ -248,9 +286,12 @@ pub(crate) fn enumerate_index_keyframes(
     input: &mut ffmpeg::format::context::Input,
     stream_index: usize,
     time_base: ffmpeg::Rational,
-) -> Option<Vec<f64>> {
+) -> Option<EnumeratedIndexKeyframes> {
     let cold = read_index_keyframes(input, stream_index, time_base);
-    if cold.as_ref().is_some_and(|entries| entries.len() >= 2) {
+    if cold
+        .as_ref()
+        .is_some_and(|entries| entries.keyframes.len() >= 2)
+    {
         return cold;
     }
 
@@ -281,7 +322,7 @@ fn read_index_keyframes(
     input: &mut ffmpeg::format::context::Input,
     stream_index: usize,
     time_base: ffmpeg::Rational,
-) -> Option<Vec<f64>> {
+) -> Option<EnumeratedIndexKeyframes> {
     use ffmpeg::ffi::{AV_NOPTS_VALUE, avformat_index_get_entries_count, avformat_index_get_entry};
 
     let numerator = time_base.numerator();
@@ -329,8 +370,7 @@ fn read_index_keyframes(
             }
         }
 
-        keyframes.sort_by(f64::total_cmp);
-        (!keyframes.is_empty()).then_some(keyframes)
+        (!keyframes.is_empty()).then(|| normalize_index_keyframes(keyframes))
     }
 }
 
@@ -999,6 +1039,18 @@ mod tests {
         assert_eq!(
             decide_strip_axis(&[0.0, f64::NAN], 100.0),
             StripAxisDecision::TimeGrid(TimeGridReason::InvalidCoverage)
+        );
+    }
+
+    #[test]
+    fn enumerated_axis_rejects_backward_index_timestamps_before_sort_can_hide_them() {
+        let index = normalize_index_keyframes(vec![0.0, 10.0, 5.0, 15.0]);
+        assert_eq!(index.keyframes, vec![0.0, 5.0, 10.0, 15.0]);
+        assert!(!index.monotonic);
+        assert_eq!(index.inversion_count, 1);
+        assert_eq!(
+            decide_enumerated_strip_axis(&index, 16.0),
+            StripAxisDecision::TimeGrid(TimeGridReason::NonMonotonicTimestamps)
         );
     }
 

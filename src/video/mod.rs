@@ -62,6 +62,8 @@ pub mod normalize_scanner;
 pub mod normalize_types;
 pub mod screenshot;
 pub(crate) mod seek_strip;
+#[cfg(feature = "dev-tools")]
+pub mod seek_strip_batch;
 pub(crate) mod seek_strip_thumbs;
 pub(crate) mod seek_strip_wave;
 pub(crate) mod stream;

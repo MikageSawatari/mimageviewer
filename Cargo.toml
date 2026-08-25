@@ -167,6 +167,13 @@ bench = false
 required-features = ["dev-tools"]
 
 [[bin]]
+name = "seek_strip_batch"
+path = "src/bin/seek_strip_batch.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
 name = "probe_birefnet"
 path = "src/bin/probe_birefnet.rs"
 test = false

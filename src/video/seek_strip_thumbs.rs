@@ -17,8 +17,8 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use ffmpeg_the_third as ffmpeg;
 
 use super::seek_strip::{
-    CellRange, StripAxis, StripAxisDecision, StripLookahead, compute_strip_window,
-    decide_strip_axis, enumerate_index_keyframes, thin_keyframes,
+    CellRange, StripAxis, StripAxisDecision, StripLookahead, TimeGridReason, compute_strip_window,
+    decide_enumerated_strip_axis, enumerate_index_keyframes, thin_keyframes,
 };
 use super::tile_thumb_cache::TileThumbCache;
 
@@ -128,7 +128,7 @@ pub(crate) enum StripThumbnailWorkerStatus {
 }
 
 /// 補助 decoder が実際に選んだ decode 経路。
-#[cfg(test)]
+#[cfg(any(test, feature = "dev-tools"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StripThumbnailDecodePath {
     HardwareD3d11va,
@@ -136,12 +136,13 @@ pub(crate) enum StripThumbnailDecodePath {
 }
 
 /// 実素材 probe と障害解析のために snapshot へ載せる decode 経路の履歴。
-#[cfg(test)]
+#[cfg(any(test, feature = "dev-tools"))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct StripThumbnailDecodeDiagnostics {
     pub(crate) initial_path: Option<StripThumbnailDecodePath>,
     pub(crate) current_path: Option<StripThumbnailDecodePath>,
     pub(crate) software_retry_failure: Option<StripThumbnailFailure>,
+    pub(crate) full_frame_retry_failure: Option<StripThumbnailFailure>,
 }
 
 /// セル列を描くか、strip 全体の terminal notice へ置き換えるか。
@@ -170,14 +171,52 @@ pub(crate) enum StripAxisResolution {
     Failed(String),
 }
 
+/// The production axis resolver's selected path and reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StripAxisResolutionReason {
+    UsableKeyframeIndex,
+    InputOpenFailed,
+    VideoStreamMissing,
+    IndexUnavailable,
+    TooFewIndexEntries,
+    NonMonotonicIndexTimestamps,
+    InvalidIndexCoverage,
+    IncompleteIndexCoverage,
+    NoAdoptedKeyframes,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct StripAxisDiagnostics {
+    pub(crate) reason: StripAxisResolutionReason,
+    pub(crate) index_timestamps_monotonic: Option<bool>,
+    pub(crate) index_inversion_count: usize,
+    pub(crate) keyframe_count: usize,
+    pub(crate) first_keyframe_secs: Option<f64>,
+    pub(crate) last_keyframe_secs: Option<f64>,
+}
+
+impl StripAxisDiagnostics {
+    fn without_index(reason: StripAxisResolutionReason) -> Self {
+        Self {
+            reason,
+            index_timestamps_monotonic: None,
+            index_inversion_count: 0,
+            keyframe_count: 0,
+            first_keyframe_secs: None,
+            last_keyframe_secs: None,
+        }
+    }
+}
+
 /// UI がロックを保持せず参照できる現在スナップショット。
 #[derive(Clone, Debug)]
 pub(crate) struct StripThumbnailSnapshot {
     pub(crate) axis: StripAxisResolution,
+    pub(crate) axis_diagnostics: Option<StripAxisDiagnostics>,
     pub(crate) cells: BTreeMap<StripCellId, StripThumbnailOutcome>,
     pub(crate) status: StripThumbnailWorkerStatus,
     pub(crate) latest_request_failures: Vec<(usize, StripThumbnailFailure)>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dev-tools"))]
     pub(crate) decode_diagnostics: StripThumbnailDecodeDiagnostics,
 }
 
@@ -201,7 +240,7 @@ impl StripThumbnailSnapshot {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "dev-tools"))]
 fn record_decoder_path(state: &Mutex<SharedState>, decoder: &SeekStripDecoder) {
     let path = if decoder.hw_decode_active() {
         StripThumbnailDecodePath::HardwareD3d11va
@@ -213,18 +252,29 @@ fn record_decoder_path(state: &Mutex<SharedState>, decoder: &SeekStripDecoder) {
     shared.decode_diagnostics.current_path = Some(path);
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "dev-tools")))]
 fn record_decoder_path(_state: &Mutex<SharedState>, _decoder: &SeekStripDecoder) {}
 
-#[cfg(test)]
+#[cfg(any(test, feature = "dev-tools"))]
 fn record_software_retry(state: &Mutex<SharedState>, failure: &StripThumbnailFailure) {
     lock_recover(state)
         .decode_diagnostics
         .software_retry_failure = Some(failure.clone());
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "dev-tools")))]
 fn record_software_retry(_state: &Mutex<SharedState>, _failure: &StripThumbnailFailure) {}
+
+#[cfg(any(test, feature = "dev-tools"))]
+fn record_full_frame_retry(state: &Mutex<SharedState>, failure: &StripThumbnailFailure) {
+    lock_recover(state)
+        .decode_diagnostics
+        .full_frame_retry_failure
+        .get_or_insert_with(|| failure.clone());
+}
+
+#[cfg(not(any(test, feature = "dev-tools")))]
+fn record_full_frame_retry(_state: &Mutex<SharedState>, _failure: &StripThumbnailFailure) {}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct StripWindowSpec {
@@ -672,10 +722,11 @@ impl LatestWindowRequest {
 
 struct SharedState {
     axis: StripAxisResolution,
+    axis_diagnostics: Option<StripAxisDiagnostics>,
     cells: BTreeMap<StripCellId, StripThumbnailOutcome>,
     status: StripThumbnailWorkerStatus,
     latest_request_failures: Vec<(usize, StripThumbnailFailure)>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dev-tools"))]
     decode_diagnostics: StripThumbnailDecodeDiagnostics,
     fill_wait_emitted_request_id: Option<u64>,
 }
@@ -684,10 +735,11 @@ impl SharedState {
     fn new() -> Self {
         Self {
             axis: StripAxisResolution::Resolving,
+            axis_diagnostics: None,
             cells: BTreeMap::new(),
             status: StripThumbnailWorkerStatus::Running,
             latest_request_failures: Vec::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dev-tools"))]
             decode_diagnostics: StripThumbnailDecodeDiagnostics::default(),
             fill_wait_emitted_request_id: None,
         }
@@ -696,10 +748,11 @@ impl SharedState {
     fn snapshot(&self) -> StripThumbnailSnapshot {
         StripThumbnailSnapshot {
             axis: self.axis.clone(),
+            axis_diagnostics: self.axis_diagnostics.clone(),
             cells: self.cells.clone(),
             status: self.status.clone(),
             latest_request_failures: self.latest_request_failures.clone(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dev-tools"))]
             decode_diagnostics: self.decode_diagnostics.clone(),
         }
     }
@@ -954,7 +1007,11 @@ fn run_worker(
         return;
     }
     match axis {
-        Ok(axis) => lock_recover(&state).axis = StripAxisResolution::Ready(Arc::new(axis)),
+        Ok(resolved) => {
+            let mut shared = lock_recover(&state);
+            shared.axis_diagnostics = Some(resolved.diagnostics);
+            shared.axis = StripAxisResolution::Ready(Arc::new(resolved.axis));
+        }
         Err(error) => {
             let mut shared = lock_recover(&state);
             shared.status = StripThumbnailWorkerStatus::DecoderUnavailable(error.clone());
@@ -1005,7 +1062,8 @@ fn run_worker(
 fn fallback_strip_axis(
     duration_secs: f64,
     fallback_interval_secs: f64,
-) -> Result<StripAxis, String> {
+    diagnostics: StripAxisDiagnostics,
+) -> Result<ResolvedStripAxis, String> {
     if !duration_secs.is_finite() {
         return Err("video duration is not finite".to_string());
     }
@@ -1018,10 +1076,18 @@ fn fallback_strip_axis(
     if fallback_interval_secs <= 0.0 {
         return Err("fallback strip interval is not positive".to_string());
     }
-    Ok(StripAxis::TimeGrid {
-        interval_secs: fallback_interval_secs,
-        duration_secs,
+    Ok(ResolvedStripAxis {
+        axis: StripAxis::TimeGrid {
+            interval_secs: fallback_interval_secs,
+            duration_secs,
+        },
+        diagnostics,
     })
+}
+
+struct ResolvedStripAxis {
+    axis: StripAxis,
+    diagnostics: StripAxisDiagnostics,
 }
 
 fn resolve_strip_axis(
@@ -1029,32 +1095,69 @@ fn resolve_strip_axis(
     duration_secs: f64,
     min_gap_secs: f64,
     fallback_interval_secs: f64,
-) -> Result<StripAxis, String> {
+) -> Result<ResolvedStripAxis, String> {
     ffmpeg::init().map_err(|error| error.to_string())?;
     let mut input = match ffmpeg::format::input(path) {
         Ok(input) => input,
-        Err(_) => return fallback_strip_axis(duration_secs, fallback_interval_secs),
+        Err(_) => {
+            return fallback_strip_axis(
+                duration_secs,
+                fallback_interval_secs,
+                StripAxisDiagnostics::without_index(StripAxisResolutionReason::InputOpenFailed),
+            );
+        }
     };
     let (stream_index, time_base) = {
         let Some(stream) = input.streams().best(ffmpeg::media::Type::Video) else {
-            return fallback_strip_axis(duration_secs, fallback_interval_secs);
+            return fallback_strip_axis(
+                duration_secs,
+                fallback_interval_secs,
+                StripAxisDiagnostics::without_index(StripAxisResolutionReason::VideoStreamMissing),
+            );
         };
         (stream.index(), stream.time_base())
     };
-    let Some(keyframes) = enumerate_index_keyframes(&mut input, stream_index, time_base) else {
-        return fallback_strip_axis(duration_secs, fallback_interval_secs);
+    let Some(index) = enumerate_index_keyframes(&mut input, stream_index, time_base) else {
+        return fallback_strip_axis(
+            duration_secs,
+            fallback_interval_secs,
+            StripAxisDiagnostics::without_index(StripAxisResolutionReason::IndexUnavailable),
+        );
     };
-    match decide_strip_axis(&keyframes, duration_secs) {
+    let mut diagnostics = StripAxisDiagnostics {
+        reason: StripAxisResolutionReason::UsableKeyframeIndex,
+        index_timestamps_monotonic: Some(index.monotonic),
+        index_inversion_count: index.inversion_count,
+        keyframe_count: index.keyframes.len(),
+        first_keyframe_secs: index.keyframes.first().copied(),
+        last_keyframe_secs: index.keyframes.last().copied(),
+    };
+    match decide_enumerated_strip_axis(&index, duration_secs) {
         StripAxisDecision::KeyframeIndex => {
+            let keyframes = index.keyframes;
             let adopted = thin_keyframes(&keyframes, min_gap_secs);
             if adopted.is_empty() {
-                fallback_strip_axis(duration_secs, fallback_interval_secs)
+                diagnostics.reason = StripAxisResolutionReason::NoAdoptedKeyframes;
+                fallback_strip_axis(duration_secs, fallback_interval_secs, diagnostics)
             } else {
-                Ok(StripAxis::KeyframeIndex { keyframes, adopted })
+                Ok(ResolvedStripAxis {
+                    axis: StripAxis::KeyframeIndex { keyframes, adopted },
+                    diagnostics,
+                })
             }
         }
-        StripAxisDecision::TimeGrid(_) => {
-            fallback_strip_axis(duration_secs, fallback_interval_secs)
+        StripAxisDecision::TimeGrid(reason) => {
+            diagnostics.reason = match reason {
+                TimeGridReason::TooFewEntries => StripAxisResolutionReason::TooFewIndexEntries,
+                TimeGridReason::NonMonotonicTimestamps => {
+                    StripAxisResolutionReason::NonMonotonicIndexTimestamps
+                }
+                TimeGridReason::InvalidCoverage => StripAxisResolutionReason::InvalidIndexCoverage,
+                TimeGridReason::IncompleteCoverage => {
+                    StripAxisResolutionReason::IncompleteIndexCoverage
+                }
+            };
+            fallback_strip_axis(duration_secs, fallback_interval_secs, diagnostics)
         }
     }
 }
@@ -1132,7 +1235,7 @@ fn process_window_request(
     let open_t0 = Instant::now();
     if runtime.decoder.is_none() && runtime.decoder_unavailable.is_none() {
         let use_hw = hw_decode && !runtime.hw_decode_failed;
-        match SeekStripDecoder::open(path, use_hw) {
+        match SeekStripDecoder::open(path, use_hw, StripDecodeMode::KeyframesOnly) {
             Ok(decoder) => {
                 record_decoder_path(state, &decoder);
                 runtime.decoder = Some(decoder);
@@ -1190,6 +1293,10 @@ fn process_window_request(
                 .decoder
                 .as_ref()
                 .is_some_and(SeekStripDecoder::hw_decode_active);
+            let decoder_was_keyframes_only = runtime
+                .decoder
+                .as_ref()
+                .is_some_and(SeekStripDecoder::keyframes_only);
             let result = {
                 let Some(decoder) = runtime.decoder.as_mut() else {
                     break;
@@ -1202,10 +1309,42 @@ fn process_window_request(
                 };
                 decoder.decode_run(&run, request.id, requests, cancel, &mut publish)
             };
+            let full_frame_retry = decoder_was_keyframes_only
+                .then(|| result.full_frame_retry_reason())
+                .flatten();
+            metrics.merge(result.metrics);
+            if let Some(failure) = full_frame_retry {
+                runtime.hw_decode_failed = true;
+                runtime.decoder = None;
+                record_full_frame_retry(state, &failure);
+                match SeekStripDecoder::open(path, false, StripDecodeMode::FullFrames) {
+                    Ok(decoder) => {
+                        record_decoder_path(state, &decoder);
+                        runtime.decoder = Some(decoder);
+                        retry_with_software = true;
+                    }
+                    Err(error) => {
+                        runtime.decoder_unavailable = Some(error.clone());
+                        lock_recover(state).status =
+                            StripThumbnailWorkerStatus::DecoderUnavailable(error.clone());
+                        for cell in &decode_cells {
+                            publish_failure(
+                                state,
+                                cell,
+                                StripThumbnailFailure::DecoderUnavailable(error.clone()),
+                            );
+                        }
+                    }
+                }
+                crate::logger::log(format!(
+                    "video-seek-strip-thumbs keyframe-only decode incomplete; retrying full-frame software decode with one-index-entry pre-roll: {:?}",
+                    failure
+                ));
+                break;
+            }
             for (cell, failure) in &result.cell_failures {
                 publish_failure(state, cell, failure.clone());
             }
-            metrics.merge(result.metrics);
             match result.stop {
                 RunStop::Complete => {}
                 RunStop::Cancelled => break,
@@ -1222,7 +1361,7 @@ fn process_window_request(
                     runtime.hw_decode_failed = true;
                     runtime.decoder = None;
                     record_software_retry(state, &failure);
-                    match SeekStripDecoder::open(path, false) {
+                    match SeekStripDecoder::open(path, false, StripDecodeMode::KeyframesOnly) {
                         Ok(decoder) => {
                             record_decoder_path(state, &decoder);
                             runtime.decoder = Some(decoder);
@@ -1533,6 +1672,13 @@ struct SeekStripDecoder {
     scaler: Option<ffmpeg::software::scaling::Context>,
     scaler_src_fmt: Option<ffmpeg::format::Pixel>,
     decoder: crate::video::decoder::AuxVideoDecoder,
+    mode: StripDecodeMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StripDecodeMode {
+    KeyframesOnly,
+    FullFrames,
 }
 
 #[derive(Clone, Copy)]
@@ -1547,7 +1693,7 @@ struct DecoderGeometry {
 }
 
 impl SeekStripDecoder {
-    fn open(path: &Path, hw_preferred: bool) -> Result<Self, String> {
+    fn open(path: &Path, hw_preferred: bool, mode: StripDecodeMode) -> Result<Self, String> {
         use ffmpeg::media::Type as MediaType;
 
         ffmpeg::init().map_err(|error| format!("ffmpeg init failed: {error}"))?;
@@ -1577,7 +1723,9 @@ impl SeekStripDecoder {
             hw_preferred,
             "video-seek-strip-thumbs",
         )?;
-        decoder.decoder_mut().skip_frame(ffmpeg::Discard::NonKey);
+        if mode == StripDecodeMode::KeyframesOnly {
+            decoder.decoder_mut().skip_frame(ffmpeg::Discard::NonKey);
+        }
         let src_w = decoder.width();
         let src_h = decoder.height();
         if src_w == 0 || src_h == 0 {
@@ -1633,6 +1781,7 @@ impl SeekStripDecoder {
             scaler: None,
             scaler_src_fmt: None,
             decoder,
+            mode,
         })
     }
 
@@ -1646,6 +1795,10 @@ impl SeekStripDecoder {
         } else {
             "sw"
         }
+    }
+
+    fn keyframes_only(&self) -> bool {
+        self.mode == StripDecodeMode::KeyframesOnly
     }
 
     fn decode_run(
@@ -1662,7 +1815,14 @@ impl SeekStripDecoder {
         let Some(first) = run.cells.first() else {
             return RunDecodeResult::complete();
         };
-        let Some(seek_pts) = secs_to_av_time_base(first.target_secs) else {
+        let seek_target_secs = if self.mode == StripDecodeMode::FullFrames {
+            first.target_secs
+                - first.frame_match_tolerance.before_secs
+                - FRAME_PTS_MATCH_EPSILON_SECS
+        } else {
+            first.target_secs
+        };
+        let Some(seek_pts) = secs_to_av_time_base(seek_target_secs) else {
             return RunDecodeResult::failed(StripThumbnailFailure::SeekFailed(
                 "target is outside AV_TIME_BASE range".to_string(),
             ));
@@ -2002,6 +2162,27 @@ impl RunDecodeResult {
             cell_failures: Vec::new(),
         }
     }
+
+    fn full_frame_retry_reason(&self) -> Option<StripThumbnailFailure> {
+        self.cell_failures
+            .iter()
+            .find_map(|(_, failure)| {
+                matches!(failure, StripThumbnailFailure::NoFrame).then(|| failure.clone())
+            })
+            .or_else(|| match &self.stop {
+                RunStop::Failed(failure)
+                    if matches!(
+                        failure,
+                        StripThumbnailFailure::DecodeFailed(_)
+                            | StripThumbnailFailure::ConvertFailed(_)
+                            | StripThumbnailFailure::NoFrame
+                    ) =>
+                {
+                    Some(failure.clone())
+                }
+                _ => None,
+            })
+    }
 }
 
 enum RunStop {
@@ -2199,6 +2380,7 @@ mod tests {
         ] {
             let snapshot = StripThumbnailSnapshot {
                 axis: StripAxisResolution::Ready(resolved_axis),
+                axis_diagnostics: None,
                 cells: BTreeMap::new(),
                 status: StripThumbnailWorkerStatus::DecoderUnavailable("open failed".into()),
                 latest_request_failures: Vec::new(),
@@ -2299,7 +2481,8 @@ mod tests {
                 (stream.index(), stream.time_base())
             };
             let keyframes = enumerate_index_keyframes(&mut indexed_input, stream_index, time_base)
-                .expect("probe video must expose an index");
+                .expect("probe video must expose an index")
+                .keyframes;
             let adopted = thin_keyframes(&keyframes, 2.0);
             Arc::new(StripAxis::KeyframeIndex { keyframes, adopted })
         } else {
@@ -2705,6 +2888,30 @@ mod tests {
             .map(|run| run.cells.iter().map(|cell| cell.index).collect())
             .collect();
         assert_eq!(shapes, vec![vec![6], vec![7], vec![5], vec![9], vec![2, 3]]);
+    }
+
+    #[test]
+    fn keyframe_only_no_frame_requests_full_frame_retry_but_seek_failure_does_not() {
+        let no_frame =
+            RunDecodeResult::failed(StripThumbnailFailure::NoFrame).full_frame_retry_reason();
+        assert_eq!(no_frame, Some(StripThumbnailFailure::NoFrame));
+
+        let decode = RunDecodeResult::failed(StripThumbnailFailure::DecodeFailed(
+            "broken reference chain".to_string(),
+        ))
+        .full_frame_retry_reason();
+        assert_eq!(
+            decode,
+            Some(StripThumbnailFailure::DecodeFailed(
+                "broken reference chain".to_string()
+            ))
+        );
+
+        let seek = RunDecodeResult::failed(StripThumbnailFailure::SeekFailed(
+            "outside stream".to_string(),
+        ))
+        .full_frame_retry_reason();
+        assert_eq!(seek, None);
     }
 
     #[test]

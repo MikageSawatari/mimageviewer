@@ -746,6 +746,12 @@ packet PTS との対応付け後に表示 frame を選ぶ。timestamp 不一致�
 cursor を進めるため、1 セルが同じ decode run の後続を stranded にしない。永続 cache key は
 decoded PTS ではなく要求した index/grid timestamp のまま保つ。末尾 cell のように片側の raw entry が
 無い endpoint は、存在する側の隣接 gap を両方向の上限に使う。
+index entry は axis 用に sort する前の列挙順も診断し、逆行が 1 件でもあれば
+non_monotonic_index_timestamps 理由の TimeGrid にする。keyframe-only decoder が
+NoFrame / decode / convert failure になった場合は index 軸を捨てず、成功済みセルを保持したまま
+software full-frame decoder へ file-local に切り替える。各 run は先頭セルの 1 raw index gap 前から
+pre-roll し、参照 frame を復号してから同じ DTS → packet PTS → bounded frame matching を行う。
+通常素材は従来の keyframe-only 高速経路だけを通る。
 
 波形モードの `SeekStripWaveWorker` は既に完成済みの `TimelineAnalysis` が現在ファイルまたは
 音楽解析 LRU にあれば対象時間窓を切り出す。無ければ、動画ごとに 1 回だけ開く
