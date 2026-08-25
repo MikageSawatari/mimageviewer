@@ -1545,6 +1545,30 @@ ClaudeCode の追加ログと Codex の portable / normal ログを併記して 
 - 規模 / 優先度: 通常ページ表示 Medium、縦連結まで含めて Medium〜Large (1〜2週間程度)。当初の
   logical page 全面対応 (2〜8週間想定) より範囲を大きく限定できる / P3。
 
+#### 純ロジックだけ先行 (2026-08-25、[page_split.rs](../src/page_split.rs))
+
+配線はレーン A の `app.rs` 一括切替の後に回す
+([next-cycle-work-lanes.md](next-cycle-work-lanes.md) §6.2)。待つ間に、共有ファイルを
+触らない部分だけ作った。単体テスト 9 本。
+
+- `PageSlice { Full, Left, Right }` + `uv_rect()` (50% 固定) + `is_half()`
+  (自動表示トリムを無効にする条件でもある)
+- `SplitDirection { LeftFirst, RightFirst }` の `first()` / `second()`
+- `PresentationStep { source_idx, slice }` — **元 index が正本**で、slice は表示だけ
+- `presentation_steps(nav, direction, is_split_idx)` — nav をステップ列へ広げる。
+  **既存の見開きユニット生成と同じ述語渡しの形**にした。回転を反映した縦横比と
+  「静止画か」は `is_landscape` / `is_spread_pairable_item` が既に持っているので、
+  ここで読み直さない。寸法が未取得の item は 1 ステップになり、届いた後に組み直される
+  (既存の見開きが `is_landscape` に対して持つ性質と同じ。分割のために読み込みを待たせない)
+- `landing_step` — しおり / 履歴 / 検索 / シークから**分割方向の最初の半分**へ着地
+- `step_forward` / `step_backward` → `StepMove::{WithinPage, ToAnotherPage, AtEnd}`。
+  同じ元ページ内の左右移動と別ページへの移動を**型で**区別する (呼び出し側で
+  `before.source_idx != after.source_idx` を組み立てると判定が散る)
+- 縦連結も同じステップ列を使う。「同じ texture 由来の 2 領域を縦に並べる」順序は
+  ページ送りの順序と同じものなので、別の列を作らない
+- **`SpreadMode` への「横長分割 左→右 / 右→左」追加はまだ入れていない。** 何もしない
+  選択肢がプルダウンに出る半端な状態を避けるため、配線と同時に入れる。
+
 ### 1.120 Susie 32bit ワーカー異常終了後の自己回復 — 外部SNSでの不具合言及 ✅ 実装済み (2026-08-25、実機確認済み)
 
 - 出典: 2026-08-24。mIV の Susie 中継 exe が繰り返しエラーで落ちるとの外部SNS投稿。
