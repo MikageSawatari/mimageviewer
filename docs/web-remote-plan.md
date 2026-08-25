@@ -2750,3 +2750,38 @@ session 再取得時の session cache epoch による HTTP cache 分離も従来
 remote 側の表示トリムは今のところ従来どおり回転中は無効のままでよい (端末側に逆変換を
 持たない、という §14.22 の理由は生きている)。ただし**分割の crop はトリムとは別の経路**で
 渡すこと。トリムの生成境界へ相乗りさせると、回転したページで分割が消える。
+
+### 15.4 サーバ側 — 実装済み (2026-08-26、`83f1d5a7`)
+
+- `RemoteSpreadMode` に `SplitLtr` / `SplitRtl`、`PageGroup` に `slice`、
+  `PROTOCOL_VERSION` 51 → 52。
+- group は**本体と同じステップ列**から作る (`build_remote_spread_page_groups` が
+  `page_split::presentation_steps` を呼ぶ)。並べ替えの規則を wire 用に書き直さない。
+- 分割 group は必ず 1 ページ (見開きと排他)。
+- **縦持ち強制は分割へ適用しない** (`resolve_spread_state`)。
+- テスト: `a_landscape_page_becomes_two_remote_groups` (同じ index の group が 2 つ、
+  左→右 / 右→左で左右の順序だけが変わる)。
+
+### 15.5 端末側 — 残り。**先に数えた読み手**
+
+位置の正本は `state.pageGroupIndex` で、**index 自体が左右を区別する** (段 1 と段 2)。
+したがって左右の状態を別に持つ必要はない。アドレスから index へ戻す所だけが左右を要る。
+
+| 場所 | 対応 |
+| --- | --- |
+| `setContainerPageGroups` | server の `slice` を group へ持ち越す |
+| `resolveReanchoredViewerPosition` → `pageGroupIndexForEntry` | **左右まで見る。**group 一覧が作り直された後に位置を戻す唯一の経路 |
+| `pageRenderContextForEntry` / grid から開く / 6058 / 6803 の `pageGroupIndexForEntry` | **そのままでよい。**「このページの最初の group」= 分割方向の最初の半分で、本体の着地規則と同じ |
+| `SpreadMode` 定数 + モード選択メニュー | 2 モードを追加。巡回 (`nextSpreadMode`) には**入れない** (本体の 1〜5 巡回と同じ扱い) |
+
+**描画は 3 か所で img のサイズを決めている** — `setLayout` (単ページ) /
+`refitVisibleContent` / decoded-unit の適用ループ。**本体側で同じ形を 2 回踏んでいる**
+(描き手が複数あり、1 か所を通し忘れた) ので、**1 つの helper に集約してから**手を入れる。
+
+切り抜きは DOM を組み替えず CSS で行う:
+
+- レイアウト入力の元幅を半分にする (分割 group のとき)
+- `object-fit: cover` + `object-position: left center` / `right center`
+
+box の縦横比が元画像のちょうど半分になるので `cover` は拡大せずぴったり収まる。追加の
+転送もサーバ側の切り出しも要らない。
