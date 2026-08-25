@@ -1028,7 +1028,23 @@ fn failure_text(failure: &StripThumbnailFailure) -> String {
         StripThumbnailFailure::DemuxFailed(error) => format!("demux failed: {error}"),
         StripThumbnailFailure::DecodeFailed(error) => format!("decode failed: {error}"),
         StripThumbnailFailure::ConvertFailed(error) => format!("conversion failed: {error}"),
-        StripThumbnailFailure::NoFrame => "no matching frame".to_string(),
+        StripThumbnailFailure::NoFrame(reason) => {
+            let last = reason
+                .last_frame_pts_ms
+                .map(|ms| format!("{:.3}", ms as f64 / 1000.0))
+                .unwrap_or_else(|| "none".to_string());
+            format!(
+                "no matching frame ({}, target={:.3}, last_frame={last}, tol=-{:.3}/+{:.3})",
+                if reason.at_end_of_stream {
+                    "end of stream"
+                } else {
+                    "mid stream"
+                },
+                reason.target_ms as f64 / 1000.0,
+                reason.tolerance_before_ms as f64 / 1000.0,
+                reason.tolerance_after_ms as f64 / 1000.0,
+            )
+        }
         StripThumbnailFailure::WindowTimedOut { timeout_secs } => {
             format!("thumbnail window timed out after {timeout_secs}s")
         }

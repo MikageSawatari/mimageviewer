@@ -83,8 +83,52 @@ pub(crate) enum StripThumbnailFailure {
     DemuxFailed(String),
     DecodeFailed(String),
     ConvertFailed(String),
-    NoFrame,
+    NoFrame(NoFrameReason),
     WindowTimedOut { timeout_secs: u64 },
+}
+
+/// なぜセルにフレームを割り当てられなかったか。
+///
+/// 実素材の sweep では `NoFrame` が最多の失敗理由で、しかも 87% が「最後のセルだけ」という
+/// 偏りを見せた。理由を単位バリアントのままにすると、どの判定で落ちたのかが後から分からない。
+/// ミリ秒整数で持つのは、この enum が `Eq` を要求されるため。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NoFrameReason {
+    /// stream の終端に達した後の最終割り当てで落ちたか。
+    pub(crate) at_end_of_stream: bool,
+    pub(crate) target_ms: i64,
+    /// 直近に復号できたフレームの PTS。1 枚も復号できなければ `None`。
+    pub(crate) last_frame_pts_ms: Option<i64>,
+    pub(crate) tolerance_before_ms: i64,
+    pub(crate) tolerance_after_ms: i64,
+}
+
+impl NoFrameReason {
+    fn unknown() -> Self {
+        Self {
+            at_end_of_stream: false,
+            target_ms: 0,
+            last_frame_pts_ms: None,
+            tolerance_before_ms: 0,
+            tolerance_after_ms: 0,
+        }
+    }
+
+    fn new(
+        at_end_of_stream: bool,
+        target_secs: f64,
+        last_frame_pts_secs: Option<f64>,
+        tolerance: FrameMatchTolerance,
+    ) -> Self {
+        let ms = |secs: f64| (secs * 1000.0).round() as i64;
+        Self {
+            at_end_of_stream,
+            target_ms: ms(target_secs),
+            last_frame_pts_ms: last_frame_pts_secs.filter(|v| v.is_finite()).map(ms),
+            tolerance_before_ms: ms(tolerance.before_secs),
+            tolerance_after_ms: ms(tolerance.after_secs),
+        }
+    }
 }
 
 impl StripThumbnailFailure {
@@ -100,7 +144,7 @@ impl StripThumbnailFailure {
             Self::DemuxFailed(_) => "読み取りに失敗",
             Self::DecodeFailed(_) => "復号に失敗",
             Self::ConvertFailed(_) => "画像変換に失敗",
-            Self::NoFrame => "フレームなし",
+            Self::NoFrame(_) => "フレームなし",
             Self::WindowTimedOut { .. } => "生成が時間切れです",
         }
     }
@@ -2065,7 +2109,18 @@ impl SeekStripDecoder {
             publish_frame_for(&frame, &following_cells)?;
             for index in matches.failed_indices {
                 if let Some(cell) = run.cells.get(index) {
-                    cell_failures.push((cell.clone(), StripThumbnailFailure::NoFrame));
+                    cell_failures.push((
+                        cell.clone(),
+                        StripThumbnailFailure::NoFrame(NoFrameReason::new(
+                            false,
+                            cell_presentation_target_secs(
+                                cell,
+                                &indexed_presentation_targets.borrow(),
+                            ),
+                            last_frame.as_ref().map(|(_, pts_secs)| *pts_secs),
+                            cell.frame_match_tolerance,
+                        )),
+                    ));
                 }
             }
             cursor = matches.next_cursor;
@@ -2203,7 +2258,15 @@ impl SeekStripDecoder {
                     ) {
                         ready_cells.push(cell.clone());
                     } else {
-                        cell_failures.push((cell.clone(), StripThumbnailFailure::NoFrame));
+                        cell_failures.push((
+                            cell.clone(),
+                            StripThumbnailFailure::NoFrame(NoFrameReason::new(
+                                true,
+                                target_secs,
+                                Some(*pts_secs),
+                                cell.frame_match_tolerance,
+                            )),
+                        ));
                     }
                     cursor += 1;
                 }
@@ -2219,7 +2282,22 @@ impl SeekStripDecoder {
             } else if let Some(error) = first_decode_error {
                 RunStop::Failed(StripThumbnailFailure::DecodeFailed(error))
             } else {
-                RunStop::Failed(StripThumbnailFailure::NoFrame)
+                RunStop::Failed(StripThumbnailFailure::NoFrame(
+                    run.cells
+                        .get(cursor)
+                        .map(|cell| {
+                            NoFrameReason::new(
+                                true,
+                                cell_presentation_target_secs(
+                                    cell,
+                                    &indexed_presentation_targets.borrow(),
+                                ),
+                                last_frame.as_ref().map(|(_, pts_secs)| *pts_secs),
+                                cell.frame_match_tolerance,
+                            )
+                        })
+                        .unwrap_or_else(NoFrameReason::unknown),
+                ))
             };
         }
 
@@ -2283,7 +2361,7 @@ impl RunDecodeResult {
         self.cell_failures
             .iter()
             .find_map(|(_, failure)| {
-                matches!(failure, StripThumbnailFailure::NoFrame).then(|| failure.clone())
+                matches!(failure, StripThumbnailFailure::NoFrame(_)).then(|| failure.clone())
             })
             .or_else(|| match &self.stop {
                 RunStop::Failed(failure)
@@ -2291,7 +2369,7 @@ impl RunDecodeResult {
                         failure,
                         StripThumbnailFailure::DecodeFailed(_)
                             | StripThumbnailFailure::ConvertFailed(_)
-                            | StripThumbnailFailure::NoFrame
+                            | StripThumbnailFailure::NoFrame(_)
                     ) =>
                 {
                     Some(failure.clone())
@@ -2449,10 +2527,11 @@ mod tests {
             StripThumbnailCellState::Ready(thumbnail) if thumbnail.target_secs == 3.0
         ));
 
-        let failed = StripThumbnailOutcome::Failed(StripThumbnailFailure::NoFrame);
+        let failed =
+            StripThumbnailOutcome::Failed(StripThumbnailFailure::NoFrame(NoFrameReason::unknown()));
         assert!(matches!(
             decide_strip_thumbnail_cell_state(Some(&failed), None),
-            StripThumbnailCellState::Failed(StripThumbnailFailure::NoFrame)
+            StripThumbnailCellState::Failed(StripThumbnailFailure::NoFrame(_))
         ));
         assert!(matches!(
             decide_strip_thumbnail_cell_state(None, Some(&StripThumbnailFailure::InvalidCellTime)),
@@ -2551,13 +2630,17 @@ mod tests {
             .expect("center cell must be planned");
         let state = Mutex::new(SharedState::new());
 
-        publish_failure(&state, cell, StripThumbnailFailure::NoFrame);
+        publish_failure(
+            &state,
+            cell,
+            StripThumbnailFailure::NoFrame(NoFrameReason::unknown()),
+        );
 
         let snapshot = lock_recover(&state).snapshot();
         assert!(matches!(
             snapshot.outcome_for_secs(cell.target_secs),
             Some(StripThumbnailOutcome::Failed(
-                StripThumbnailFailure::NoFrame
+                StripThumbnailFailure::NoFrame(_)
             ))
         ));
         assert_eq!(snapshot.latest_failure_for_index(cell.index), None);
@@ -3155,8 +3238,12 @@ mod tests {
     #[test]
     fn keyframe_only_no_frame_requests_full_frame_retry_but_seek_failure_does_not() {
         let no_frame =
-            RunDecodeResult::failed(StripThumbnailFailure::NoFrame).full_frame_retry_reason();
-        assert_eq!(no_frame, Some(StripThumbnailFailure::NoFrame));
+            RunDecodeResult::failed(StripThumbnailFailure::NoFrame(NoFrameReason::unknown()))
+                .full_frame_retry_reason();
+        assert_eq!(
+            no_frame,
+            Some(StripThumbnailFailure::NoFrame(NoFrameReason::unknown()))
+        );
 
         let decode = RunDecodeResult::failed(StripThumbnailFailure::DecodeFailed(
             "broken reference chain".to_string(),
