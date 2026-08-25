@@ -6,6 +6,7 @@
 //! メインプレイヤーの `GpuVideoDevice` / D3D ロックを共有せず、`LIVE_VIDEO_DECODE_THREADS`
 //! にも含めない。
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -27,6 +28,7 @@ use super::tile_thumb_cache::TileThumbCache;
 /// 抽出時の外接矩形は 320x320 とする。
 pub(crate) const STRIP_THUMB_EXTRACT_WIDTH: u32 = 320;
 const STRIP_THUMB_EXTRACT_HEIGHT: u32 = 320;
+/// Absorbs only rounding when FFmpeg index and packet timestamps are converted to seconds.
 const FRAME_PTS_MATCH_EPSILON_SECS: f64 = 0.005;
 
 /// セルが要求した時刻から作る、窓変更をまたいで安定したプロセス内キー。
@@ -120,6 +122,23 @@ pub(crate) enum StripThumbnailWorkerStatus {
     ThreadSpawnFailed(String),
 }
 
+/// 補助 decoder が実際に選んだ decode 経路。
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StripThumbnailDecodePath {
+    HardwareD3d11va,
+    Software,
+}
+
+/// 実素材 probe と障害解析のために snapshot へ載せる decode 経路の履歴。
+#[cfg(test)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StripThumbnailDecodeDiagnostics {
+    pub(crate) initial_path: Option<StripThumbnailDecodePath>,
+    pub(crate) current_path: Option<StripThumbnailDecodePath>,
+    pub(crate) software_retry_failure: Option<StripThumbnailFailure>,
+}
+
 /// セル列を描くか、strip 全体の terminal notice へ置き換えるか。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StripThumbnailDisplayScope {
@@ -153,6 +172,8 @@ pub(crate) struct StripThumbnailSnapshot {
     pub(crate) cells: BTreeMap<StripCellId, StripThumbnailOutcome>,
     pub(crate) status: StripThumbnailWorkerStatus,
     pub(crate) latest_request_failures: Vec<(usize, StripThumbnailFailure)>,
+    #[cfg(test)]
+    pub(crate) decode_diagnostics: StripThumbnailDecodeDiagnostics,
 }
 
 impl StripThumbnailSnapshot {
@@ -174,6 +195,31 @@ impl StripThumbnailSnapshot {
         )
     }
 }
+
+#[cfg(test)]
+fn record_decoder_path(state: &Mutex<SharedState>, decoder: &SeekStripDecoder) {
+    let path = if decoder.hw_decode_active() {
+        StripThumbnailDecodePath::HardwareD3d11va
+    } else {
+        StripThumbnailDecodePath::Software
+    };
+    let mut shared = lock_recover(state);
+    shared.decode_diagnostics.initial_path.get_or_insert(path);
+    shared.decode_diagnostics.current_path = Some(path);
+}
+
+#[cfg(not(test))]
+fn record_decoder_path(_state: &Mutex<SharedState>, _decoder: &SeekStripDecoder) {}
+
+#[cfg(test)]
+fn record_software_retry(state: &Mutex<SharedState>, failure: &StripThumbnailFailure) {
+    lock_recover(state)
+        .decode_diagnostics
+        .software_retry_failure = Some(failure.clone());
+}
+
+#[cfg(not(test))]
+fn record_software_retry(_state: &Mutex<SharedState>, _failure: &StripThumbnailFailure) {}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct StripWindowSpec {
@@ -204,6 +250,153 @@ pub(crate) struct PlannedStripCell {
     pub(crate) timestamp_ms: i64,
     pub(crate) visible: bool,
     pub(crate) exact_keyframe: bool,
+    /// Maximum timestamp-domain distance before and after this cell.
+    ///
+    /// An indexed cell stops at the adjacent raw index entry in each direction, so a
+    /// DTS-to-PTS mapping cannot cross into the neighboring indexed scene. A TimeGrid
+    /// cell uses one grid interval in both directions, avoiding arbitrarily stale frames.
+    pub(crate) frame_match_tolerance: FrameMatchTolerance,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct FrameMatchTolerance {
+    before_secs: f64,
+    after_secs: f64,
+}
+
+impl FrameMatchTolerance {
+    fn symmetric(secs: f64) -> Self {
+        Self {
+            before_secs: secs,
+            after_secs: secs,
+        }
+    }
+
+    fn permits_shift(self, shift_secs: f64) -> bool {
+        let tolerance = if shift_secs < 0.0 {
+            self.before_secs
+        } else {
+            self.after_secs
+        };
+        shift_secs.is_finite()
+            && tolerance.is_finite()
+            && tolerance >= 0.0
+            && shift_secs.abs() <= tolerance + FRAME_PTS_MATCH_EPSILON_SECS
+    }
+}
+
+fn frame_match_tolerance(axis: &StripAxis, index: usize) -> Option<FrameMatchTolerance> {
+    match axis {
+        StripAxis::KeyframeIndex { keyframes, adopted } => {
+            let raw_index = *adopted.get(index)?;
+            let target = *keyframes.get(raw_index)?;
+            let previous_gap = keyframes[..raw_index]
+                .iter()
+                .rev()
+                .map(|previous| target - *previous)
+                .find(|gap| gap.is_finite() && *gap > 0.0);
+            let next_gap = keyframes[raw_index.saturating_add(1)..]
+                .iter()
+                .map(|next| *next - target)
+                .find(|gap| gap.is_finite() && *gap > 0.0);
+            let fallback_gap = previous_gap
+                .or(next_gap)
+                .unwrap_or(FRAME_PTS_MATCH_EPSILON_SECS);
+            Some(FrameMatchTolerance {
+                before_secs: previous_gap
+                    .unwrap_or(fallback_gap)
+                    .max(FRAME_PTS_MATCH_EPSILON_SECS),
+                after_secs: next_gap
+                    .unwrap_or(fallback_gap)
+                    .max(FRAME_PTS_MATCH_EPSILON_SECS),
+            })
+        }
+        StripAxis::TimeGrid { interval_secs, .. } => {
+            Some(FrameMatchTolerance::symmetric(*interval_secs))
+        }
+    }
+}
+
+fn cell_presentation_target_secs(
+    cell: &PlannedStripCell,
+    indexed_presentation_targets: &BTreeMap<StripCellId, f64>,
+) -> f64 {
+    indexed_presentation_targets
+        .get(&cell.id)
+        .copied()
+        .unwrap_or(cell.target_secs)
+}
+
+fn indexed_packet_presentation_target_secs(
+    cell: &PlannedStripCell,
+    packet_dts_secs: f64,
+    packet_pts_secs: f64,
+) -> Option<f64> {
+    if !cell.exact_keyframe
+        || !packet_dts_secs.is_finite()
+        || !packet_pts_secs.is_finite()
+        || packet_pts_secs < 0.0
+        || (packet_dts_secs - cell.target_secs).abs() > FRAME_PTS_MATCH_EPSILON_SECS
+        || !cell
+            .frame_match_tolerance
+            .permits_shift(packet_pts_secs - cell.target_secs)
+    {
+        return None;
+    }
+    Some(packet_pts_secs)
+}
+
+fn is_preceding_frame_within_tolerance(
+    target_secs: f64,
+    frame_pts_secs: f64,
+    tolerance: FrameMatchTolerance,
+) -> bool {
+    target_secs.is_finite()
+        && frame_pts_secs.is_finite()
+        && tolerance.before_secs.is_finite()
+        && tolerance.before_secs >= 0.0
+        && frame_pts_secs <= target_secs + FRAME_PTS_MATCH_EPSILON_SECS
+        && target_secs - frame_pts_secs <= tolerance.before_secs + FRAME_PTS_MATCH_EPSILON_SECS
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PrecedingCellMatches {
+    ready_indices: Vec<usize>,
+    failed_indices: Vec<usize>,
+    next_cursor: usize,
+}
+
+fn match_cells_before_frame(
+    cells: &[PlannedStripCell],
+    cursor: usize,
+    previous_pts_secs: f64,
+    current_pts_secs: f64,
+    indexed_presentation_targets: &BTreeMap<StripCellId, f64>,
+) -> PrecedingCellMatches {
+    let mut next_cursor = cursor;
+    let mut ready_indices = Vec::new();
+    let mut failed_indices = Vec::new();
+    while let Some(cell) = cells.get(next_cursor) {
+        let target_secs = cell_presentation_target_secs(cell, indexed_presentation_targets);
+        if target_secs >= current_pts_secs - FRAME_PTS_MATCH_EPSILON_SECS {
+            break;
+        }
+        if is_preceding_frame_within_tolerance(
+            target_secs,
+            previous_pts_secs,
+            cell.frame_match_tolerance,
+        ) {
+            ready_indices.push(next_cursor);
+        } else {
+            failed_indices.push(next_cursor);
+        }
+        next_cursor += 1;
+    }
+    PrecedingCellMatches {
+        ready_indices,
+        failed_indices,
+        next_cursor,
+    }
 }
 
 /// 1 窓について UI 状態だけから決められる作業。
@@ -263,6 +456,10 @@ pub(crate) fn plan_strip_window_work(
                 invalid_cells.push(index);
                 continue;
             };
+            let Some(frame_match_tolerance) = frame_match_tolerance(axis, index) else {
+                invalid_cells.push(index);
+                continue;
+            };
             if visible && !visible_ids.contains(&id) {
                 visible_ids.push(id);
             }
@@ -276,6 +473,7 @@ pub(crate) fn plan_strip_window_work(
                 timestamp_ms,
                 visible,
                 exact_keyframe,
+                frame_match_tolerance,
             });
         }
     }
@@ -448,6 +646,8 @@ struct SharedState {
     cells: BTreeMap<StripCellId, StripThumbnailOutcome>,
     status: StripThumbnailWorkerStatus,
     latest_request_failures: Vec<(usize, StripThumbnailFailure)>,
+    #[cfg(test)]
+    decode_diagnostics: StripThumbnailDecodeDiagnostics,
     fill_wait_emitted_request_id: Option<u64>,
 }
 
@@ -458,6 +658,8 @@ impl SharedState {
             cells: BTreeMap::new(),
             status: StripThumbnailWorkerStatus::Running,
             latest_request_failures: Vec::new(),
+            #[cfg(test)]
+            decode_diagnostics: StripThumbnailDecodeDiagnostics::default(),
             fill_wait_emitted_request_id: None,
         }
     }
@@ -468,6 +670,8 @@ impl SharedState {
             cells: self.cells.clone(),
             status: self.status.clone(),
             latest_request_failures: self.latest_request_failures.clone(),
+            #[cfg(test)]
+            decode_diagnostics: self.decode_diagnostics.clone(),
         }
     }
 
@@ -901,7 +1105,10 @@ fn process_window_request(
     if runtime.decoder.is_none() && runtime.decoder_unavailable.is_none() {
         let use_hw = hw_decode && !runtime.hw_decode_failed;
         match SeekStripDecoder::open(path, use_hw) {
-            Ok(decoder) => runtime.decoder = Some(decoder),
+            Ok(decoder) => {
+                record_decoder_path(state, &decoder);
+                runtime.decoder = Some(decoder);
+            }
             Err(error) => {
                 runtime.decoder_unavailable = Some(error.clone());
                 lock_recover(state).status =
@@ -967,6 +1174,9 @@ fn process_window_request(
                 };
                 decoder.decode_run(&run, request.id, requests, cancel, &mut publish)
             };
+            for (cell, failure) in &result.cell_failures {
+                publish_failure(state, cell, failure.clone());
+            }
             metrics.merge(result.metrics);
             match result.stop {
                 RunStop::Complete => {}
@@ -983,8 +1193,10 @@ fn process_window_request(
                 {
                     runtime.hw_decode_failed = true;
                     runtime.decoder = None;
+                    record_software_retry(state, &failure);
                     match SeekStripDecoder::open(path, false) {
                         Ok(decoder) => {
+                            record_decoder_path(state, &decoder);
                             runtime.decoder = Some(decoder);
                             retry_with_software = true;
                         }
@@ -1448,6 +1660,7 @@ impl SeekStripDecoder {
                     total: run_t0.elapsed(),
                     ..RunDecodeMetrics::default()
                 },
+                cell_failures: Vec::new(),
             };
         }
 
@@ -1467,6 +1680,8 @@ impl SeekStripDecoder {
         let mut decoded_frames = 0usize;
         let mut published_cells = 0usize;
         let mut transform_elapsed = Duration::ZERO;
+        let indexed_presentation_targets = RefCell::new(BTreeMap::new());
+        let mut cell_failures = Vec::new();
 
         let mut publish_frame_for =
             |frame: &Video, cells: &[PlannedStripCell]| -> Result<(), StripThumbnailFailure> {
@@ -1521,29 +1736,47 @@ impl SeekStripDecoder {
                 && !current_cell.exact_keyframe
                 && pts_secs <= current_cell.target_secs + FRAME_PTS_MATCH_EPSILON_SECS
             {
-                publish_frame_for(&frame, &run.cells[cursor..cursor + 1])?;
+                if is_preceding_frame_within_tolerance(
+                    current_cell.target_secs,
+                    pts_secs,
+                    current_cell.frame_match_tolerance,
+                ) {
+                    publish_frame_for(&frame, &run.cells[cursor..cursor + 1])?;
+                } else {
+                    cell_failures.push((current_cell.clone(), StripThumbnailFailure::NoFrame));
+                }
                 cursor += 1;
                 last_frame = Some((frame, pts_secs));
                 return Ok(cursor >= run.cells.len());
             }
 
             if let Some((previous, previous_pts)) = last_frame.as_ref() {
-                let start = cursor;
-                while let Some(cell) = run.cells.get(cursor) {
-                    if cell.target_secs >= pts_secs - FRAME_PTS_MATCH_EPSILON_SECS {
-                        break;
+                let matches = match_cells_before_frame(
+                    &run.cells,
+                    cursor,
+                    *previous_pts,
+                    pts_secs,
+                    &indexed_presentation_targets.borrow(),
+                );
+                let ready_cells: Vec<_> = matches
+                    .ready_indices
+                    .iter()
+                    .filter_map(|index| run.cells.get(*index).cloned())
+                    .collect();
+                publish_frame_for(previous, &ready_cells)?;
+                for index in matches.failed_indices {
+                    if let Some(cell) = run.cells.get(index) {
+                        cell_failures.push((cell.clone(), StripThumbnailFailure::NoFrame));
                     }
-                    if *previous_pts > cell.target_secs + FRAME_PTS_MATCH_EPSILON_SECS {
-                        return Err(StripThumbnailFailure::NoFrame);
-                    }
-                    cursor += 1;
                 }
-                publish_frame_for(previous, &run.cells[start..cursor])?;
+                cursor = matches.next_cursor;
             }
 
             let exact_start = cursor;
             while let Some(cell) = run.cells.get(cursor) {
-                if (cell.target_secs - pts_secs).abs() > FRAME_PTS_MATCH_EPSILON_SECS {
+                let target_secs =
+                    cell_presentation_target_secs(cell, &indexed_presentation_targets.borrow());
+                if (target_secs - pts_secs).abs() > FRAME_PTS_MATCH_EPSILON_SECS {
                     break;
                 }
                 cursor += 1;
@@ -1573,6 +1806,26 @@ impl SeekStripDecoder {
             };
             if stream.index() != stream_idx {
                 continue;
+            }
+            if packet.is_key()
+                && let Some(packet_dts) = packet.dts().or_else(|| packet.pts())
+                && let Some(packet_pts) = packet.pts().or_else(|| packet.dts())
+            {
+                let packet_dts_secs = packet_dts as f64 * tb_num / tb_den;
+                let packet_pts_secs = packet_pts as f64 * tb_num / tb_den;
+                let mut targets = indexed_presentation_targets.borrow_mut();
+                for cell in run.cells.iter().filter(|cell| cell.exact_keyframe) {
+                    if targets.contains_key(&cell.id) {
+                        continue;
+                    }
+                    if let Some(target_secs) = indexed_packet_presentation_target_secs(
+                        cell,
+                        packet_dts_secs,
+                        packet_pts_secs,
+                    ) {
+                        targets.insert(cell.id, target_secs);
+                    }
+                }
             }
             if let Err(error) = decoder.decoder_mut().send_packet(&packet) {
                 if hw_active {
@@ -1627,14 +1880,22 @@ impl SeekStripDecoder {
         drop(accept_frame);
         if matches!(stop, RunStop::Complete) && cursor < run.cells.len() {
             if let Some((frame, pts_secs)) = last_frame.as_ref() {
-                let start = cursor;
+                let mut ready_cells = Vec::new();
                 while let Some(cell) = run.cells.get(cursor) {
-                    if *pts_secs > cell.target_secs + FRAME_PTS_MATCH_EPSILON_SECS {
-                        break;
+                    let target_secs =
+                        cell_presentation_target_secs(cell, &indexed_presentation_targets.borrow());
+                    if is_preceding_frame_within_tolerance(
+                        target_secs,
+                        *pts_secs,
+                        cell.frame_match_tolerance,
+                    ) {
+                        ready_cells.push(cell.clone());
+                    } else {
+                        cell_failures.push((cell.clone(), StripThumbnailFailure::NoFrame));
                     }
                     cursor += 1;
                 }
-                if let Err(failure) = publish_frame_for(frame, &run.cells[start..cursor]) {
+                if let Err(failure) = publish_frame_for(frame, &ready_cells) {
                     stop = RunStop::Failed(failure);
                 }
             }
@@ -1660,6 +1921,7 @@ impl SeekStripDecoder {
                 decoded_frames,
                 published_cells,
             },
+            cell_failures,
         }
     }
 }
@@ -1684,6 +1946,7 @@ struct RunDecodeMetrics {
 struct RunDecodeResult {
     stop: RunStop,
     metrics: RunDecodeMetrics,
+    cell_failures: Vec<(PlannedStripCell, StripThumbnailFailure)>,
 }
 
 impl RunDecodeResult {
@@ -1691,6 +1954,7 @@ impl RunDecodeResult {
         Self {
             stop: RunStop::Complete,
             metrics: RunDecodeMetrics::default(),
+            cell_failures: Vec::new(),
         }
     }
 
@@ -1698,6 +1962,7 @@ impl RunDecodeResult {
         Self {
             stop: RunStop::Failed(failure),
             metrics: RunDecodeMetrics::default(),
+            cell_failures: Vec::new(),
         }
     }
 }
@@ -1900,6 +2165,7 @@ mod tests {
                 cells: BTreeMap::new(),
                 status: StripThumbnailWorkerStatus::DecoderUnavailable("open failed".into()),
                 latest_request_failures: Vec::new(),
+                decode_diagnostics: StripThumbnailDecodeDiagnostics::default(),
             };
             assert_eq!(
                 snapshot.display_scope(),
@@ -1937,6 +2203,115 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual real-media strip-thumbnail worker diagnosis"]
+    fn probe_app_thumbnail_worker_window_from_env() {
+        let path = std::env::var_os("MIV_STRIP_THUMB_PROBE_PATH")
+            .map(PathBuf::from)
+            .expect("set MIV_STRIP_THUMB_PROBE_PATH to a real video");
+        ffmpeg::init().expect("FFmpeg must initialize");
+        let input = ffmpeg::format::input(&path).expect("probe video must open");
+        let duration_secs = input.duration() as f64 / ffmpeg::ffi::AV_TIME_BASE as f64;
+        assert!(
+            duration_secs.is_finite() && duration_secs > 0.0,
+            "probe video must have a positive duration"
+        );
+        let center_time_secs = std::env::var("MIV_STRIP_THUMB_PROBE_CENTER_SECS")
+            .ok()
+            .map(|value| value.parse().expect("probe center must be seconds"))
+            .unwrap_or(duration_secs * 0.5);
+        let visible_count = std::env::var("MIV_STRIP_THUMB_PROBE_VISIBLE_COUNT")
+            .ok()
+            .map(|value| value.parse().expect("visible count must be an integer"))
+            .unwrap_or(9usize);
+        let hw_decode = std::env::var("MIV_STRIP_THUMB_PROBE_HW")
+            .ok()
+            .map(|value| value != "0")
+            .unwrap_or(true);
+        let lookahead = StripLookahead::new(visible_count / 2, visible_count - visible_count / 2);
+        let worker = SeekStripThumbnailWorker::spawn(
+            path.clone(),
+            hw_decode,
+            None,
+            duration_secs,
+            2.0,
+            10.0,
+        );
+
+        let started = Instant::now();
+        let axis = loop {
+            match worker.snapshot().axis {
+                StripAxisResolution::Ready(axis) => break axis,
+                StripAxisResolution::Failed(error) => panic!("axis resolution failed: {error}"),
+                StripAxisResolution::Resolving => {}
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "axis resolution timed out"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let center_index = axis
+            .center_index_for_time(center_time_secs)
+            .expect("probe center must map onto the strip axis");
+        let spec = StripWindowSpec::new(center_index, visible_count, lookahead);
+        let work = plan_strip_window_work(&axis, spec, &BTreeSet::new());
+        worker
+            .request(Arc::clone(&axis), center_index, visible_count, lookahead)
+            .expect("worker request must be accepted");
+
+        let snapshot = loop {
+            let snapshot = worker.snapshot();
+            let all_settled = work
+                .cache_lookup
+                .iter()
+                .all(|cell| snapshot.cells.contains_key(&cell.id));
+            if all_settled
+                || matches!(
+                    snapshot.status,
+                    StripThumbnailWorkerStatus::DecoderUnavailable(_)
+                        | StripThumbnailWorkerStatus::Cancelled
+                        | StripThumbnailWorkerStatus::ThreadSpawnFailed(_)
+                )
+            {
+                break snapshot;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "thumbnail window timed out"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        println!(
+            "path={} duration_secs={duration_secs:.3} center_time_secs={center_time_secs:.3} center_index={center_index:.3} axis_cells={} status={:?}",
+            path.display(),
+            axis.cell_count(),
+            snapshot.status,
+        );
+        println!(
+            "decode initial={:?} current={:?} software_retry_failure={:?}",
+            snapshot.decode_diagnostics.initial_path,
+            snapshot.decode_diagnostics.current_path,
+            snapshot.decode_diagnostics.software_retry_failure,
+        );
+        let mut cells = work.cache_lookup.clone();
+        cells.sort_by_key(|cell| cell.index);
+        for cell in cells {
+            let outcome = match snapshot.cells.get(&cell.id) {
+                Some(StripThumbnailOutcome::Ready(_)) => "ready".to_string(),
+                Some(StripThumbnailOutcome::Failed) => {
+                    format!("failed {:?}", snapshot.latest_failure_for_index(cell.index))
+                }
+                None => "pending".to_string(),
+            };
+            println!(
+                "cell index={} target_secs={:.6} visible={} outcome={outcome}",
+                cell.index, cell.target_secs, cell.visible,
+            );
+        }
+    }
+
+    #[test]
     fn window_plan_looks_up_only_missing_cells_center_outward() {
         let axis = axis(20);
         let held = BTreeSet::from([id(5.0), id(7.0)]);
@@ -1949,6 +2324,90 @@ mod tests {
         assert_eq!(indices, vec![4, 6, 3, 2, 8, 1, 9]);
         assert!(work.cache_lookup.iter().all(|cell| cell.index != 5));
         assert!(work.cache_lookup.iter().all(|cell| cell.index != 7));
+    }
+
+    #[test]
+    fn indexed_packet_maps_dts_cell_to_b_frame_presentation_time_within_local_tolerance() {
+        let axis = StripAxis::KeyframeIndex {
+            keyframes: vec![10.0, 12.0, 20.0],
+            adopted: vec![0, 1, 2],
+        };
+        let work = plan(
+            &axis,
+            StripWindowSpec::new(1.0, 1, StripLookahead::default()),
+            &BTreeSet::new(),
+        );
+        let cell = work
+            .cache_lookup
+            .iter()
+            .find(|cell| cell.index == 1)
+            .expect("middle indexed cell must be planned");
+        assert_eq!(
+            cell.frame_match_tolerance,
+            FrameMatchTolerance {
+                before_secs: 2.0,
+                after_secs: 8.0,
+            }
+        );
+        assert_eq!(
+            indexed_packet_presentation_target_secs(cell, 12.0, 12.1),
+            Some(12.1)
+        );
+        assert_eq!(
+            indexed_packet_presentation_target_secs(cell, 12.0, 20.006),
+            None,
+            "a presentation timestamp beyond the following raw entry must be rejected"
+        );
+        assert_eq!(
+            indexed_packet_presentation_target_secs(cell, 12.006, 12.1),
+            None,
+            "an unrelated key packet must not be associated with the cell"
+        );
+
+        let tail = plan(
+            &axis,
+            StripWindowSpec::new(2.0, 1, StripLookahead::default()),
+            &BTreeSet::new(),
+        );
+        let tail_cell = tail
+            .cache_lookup
+            .iter()
+            .find(|cell| cell.index == 2)
+            .expect("tail indexed cell must be planned");
+        assert_eq!(
+            indexed_packet_presentation_target_secs(tail_cell, 20.0, 20.1),
+            Some(20.1),
+            "an endpoint uses its only adjacent raw gap in both directions"
+        );
+    }
+
+    #[test]
+    fn preceding_match_is_bounded_and_one_bad_cell_does_not_strand_the_next() {
+        let tolerance = FrameMatchTolerance::symmetric(1.0);
+        assert!(is_preceding_frame_within_tolerance(10.0, 9.0, tolerance));
+        assert!(!is_preceding_frame_within_tolerance(10.0, 8.994, tolerance));
+        assert!(!is_preceding_frame_within_tolerance(
+            10.0, 10.006, tolerance
+        ));
+
+        let axis = StripAxis::TimeGrid {
+            interval_secs: 2.0,
+            duration_secs: 8.0,
+        };
+        let work = plan(
+            &axis,
+            StripWindowSpec::new(1.0, 3, StripLookahead::default()),
+            &BTreeSet::new(),
+        );
+        let mut cells = work.cache_lookup;
+        cells.sort_by_key(|cell| cell.index);
+        let matches = match_cells_before_frame(&cells, 0, -3.0, 2.0, &BTreeMap::new());
+        assert_eq!(matches.ready_indices, Vec::<usize>::new());
+        assert_eq!(matches.failed_indices, vec![0]);
+        assert_eq!(
+            matches.next_cursor, 1,
+            "the next cell remains available for the current 2s frame"
+        );
     }
 
     #[test]

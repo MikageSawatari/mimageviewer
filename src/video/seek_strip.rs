@@ -185,7 +185,8 @@ pub(crate) enum TimeGridReason {
 
 /// 索引エントリ数と末尾到達時刻から、使用する軸を決める。
 ///
-/// `covered_secs` は最後の有効なキーフレーム PTS。索引の最後は動画末尾そのものには
+/// `covered_secs` は最後の有効なキーフレーム seek timestamp。MP4 などでは index entry が
+/// presentation PTS ではなく DTS のことがある。索引の最後は動画末尾そのものには
 /// ならないため、末尾の未被覆区間を一律ゼロには要求しない。§14 の実測では GOP が
 /// 0.50〜4.17 秒だったことから、平均間隔 3 個分を許容しつつ 5〜30 秒に制限する。
 /// さらに全尺の 80% 以上を必須にし、先頭付近だけの不完全な索引が少数エントリによって
@@ -216,7 +217,10 @@ pub(crate) fn decide_strip_axis(
     }
 }
 
-/// コンテナ索引からキーフレーム PTS を秒単位で列挙する。
+/// コンテナ索引からキーフレーム seek timestamp を秒単位で列挙する。
+///
+/// `AVIndexEntry.timestamp` は presentation PTS とは限らない。thumbnail worker は要求窓の
+/// key packet を復号するときに packet DTS と PTS を対応付け、frame PTS との照合はそちらで行う。
 ///
 /// 開いた直後の結果が 0〜1 件なら、Matroska / ASF の遅延索引を読み込ませる捨てシークを
 /// 1 回だけ行い、必ず数え直す。復号やパケット走査は行わない。

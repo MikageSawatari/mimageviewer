@@ -737,6 +737,12 @@ BLOB 読み出しと WebP→RGBA decode は `video-marker-thumbs` worker で行�
 窓を動かしても再利用する。再生追従は可視窓の半分が先読み coverage 内にある間は新要求を出さず、
 coverage を外れたときだけ進行方向 1 画面を追加要求する。最小間隔の設定変更は全索引から採用列だけを
 作り直し、永続キャッシュは無効化しない。
+索引セルの timestamp は seek domain であり、MP4 の `AVIndexEntry` では DTS のことがある。
+worker は窓内の同じ key packet の DTS と PTS を対応付けて presentation target を作り、decoded frame
+は bounded nearest-preceding で選ぶ。indexed cell の許容幅は前後それぞれ隣の raw index entry まで、
+`TimeGrid` は 1 grid interval までであり、隣の場面を越える古い frame は採らない。timestamp 不一致は
+該当セルだけを typed failure にして cursor を進めるため、1 セルが同じ decode run の後続を
+stranded にしない。永続 cache key は decoded PTS ではなく要求した index/grid timestamp のまま保つ。
 
 波形モードの `SeekStripWaveWorker` は既に完成済みの `TimelineAnalysis` が現在ファイルまたは
 音楽解析 LRU にあれば対象時間窓を切り出す。無ければ、動画ごとに 1 回だけ開く
