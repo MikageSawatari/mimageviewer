@@ -33400,6 +33400,7 @@ mod still_window_mode_key_tests {
         from_idx: usize,
         target_idx: usize,
         owner: Option<u64>,
+        open_owner_context_id: crate::app::viewer_context_registry::ViewerContextId,
     ) {
         let GridItem::Video(target_path) = &app.items[target_idx] else {
             unreachable!()
@@ -33420,7 +33421,7 @@ mod still_window_mode_key_tests {
             requested_at: now,
             deadline: now + std::time::Duration::from_secs(10),
             input_seq: 0,
-            parked_live_window_id: owner,
+            owner_context_id: open_owner_context_id,
         });
         app.native_video_fast_swap_pending = Some(NativeVideoFastSwapPending {
             target_idx,
@@ -37208,9 +37209,10 @@ mod still_window_mode_key_tests {
         let mut passive_bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
         passive_bundle.items = vec![GridItem::Image(temp.path().join("parked.jpg"))];
         passive_bundle.fullscreen_idx = Some(0);
-        passive_bundle
-            .viewer_session
-            .activate_independent_detached(77);
+        passive_bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        passive_bundle.viewer_session.independent_active = true;
+        passive_bundle.viewer_session.open_next_still_detached_once = false;
+        passive_bundle.viewer_session.detached_window_id = Some(77);
         app.push_window_context_for_test(&ctx, 77, passive_bundle);
 
         assert!(app.open_grid_container_in_detached_book_context(&ctx, a_virtual_idx));
@@ -37524,9 +37526,10 @@ mod still_window_mode_key_tests {
         let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
         bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
         bundle.pdf_password_request = Some(PdfPasswordRequest { path: pdf.clone() });
-        bundle
-            .viewer_session
-            .activate_independent_detached(window_id);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.independent_active = true;
+        bundle.viewer_session.open_next_still_detached_once = false;
+        bundle.viewer_session.detached_window_id = Some(window_id);
         app.install_active_context_for_test(bundle);
         app.begin_active_detached_session(window_id, DetachedSource::Book);
         app.show_pdf_password_dialog = true;
@@ -37586,9 +37589,10 @@ mod still_window_mode_key_tests {
             let main_pdf = PathBuf::from(r"C:\Books\main-protected.pdf");
             let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
             bundle.pdf_password_request = Some(PdfPasswordRequest { path: detached_pdf });
-            bundle
-                .viewer_session
-                .activate_independent_detached(window_id);
+            bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+            bundle.viewer_session.independent_active = true;
+            bundle.viewer_session.open_next_still_detached_once = false;
+            bundle.viewer_session.detached_window_id = Some(window_id);
             app.install_active_context_for_test(bundle);
             app.begin_active_detached_session(window_id, DetachedSource::Book);
             if main_has_request {
@@ -37638,9 +37642,10 @@ mod still_window_mode_key_tests {
         let window_id = 502;
         let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
         bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
-        bundle
-            .viewer_session
-            .activate_independent_detached(window_id);
+        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
+        bundle.viewer_session.independent_active = true;
+        bundle.viewer_session.open_next_still_detached_once = false;
+        bundle.viewer_session.detached_window_id = Some(window_id);
         app.install_active_context_for_test(bundle);
         app.begin_active_detached_session(window_id, DetachedSource::Book);
 
@@ -38897,14 +38902,14 @@ mod still_window_mode_key_tests {
 
         let pause_nav_cancel = Arc::new(AtomicBool::new(false));
         let pause_scan_cancel = Arc::new(AtomicBool::new(false));
-        let mut paused = crate::app::viewer_context_registry::ViewerContextBundle::empty();
+        let mut paused = setup_app();
         paused.navigation_scope = ViewerNavigationScope::DetachedPhysical;
         paused.folder_nav_pending = Some(nav_pending(Arc::clone(&pause_nav_cancel)));
         paused.folder_pane_open_pending = Some(scan_pending(Arc::clone(&pause_scan_cancel)));
         paused.pending_folder_nav_steps = 3;
         paused.pending_folder_nav_mode = FolderNavMode::Fullscreen;
 
-        paused.pause_background_work_keep_current_frame();
+        paused.pause_mounted_background_work_keep_current_frame();
 
         assert!(pause_nav_cancel.load(Ordering::Relaxed));
         assert!(pause_scan_cancel.load(Ordering::Relaxed));
@@ -41874,7 +41879,7 @@ mod still_window_mode_key_tests {
             requested_at: now,
             deadline: now + std::time::Duration::from_secs(10),
             input_seq: 0,
-            parked_live_window_id: None,
+            owner_context_id: app.projected_viewer_context_id(),
         });
         app.release_viewer_surfaces_for_removed_paths(
             &ctx,
@@ -48579,7 +48584,8 @@ mod still_window_mode_key_tests {
         push_image(&mut app, r"C:\pics\a.jpg");
         let from = push_video(&mut app, r"C:\clips\b.mp4");
         let target = push_video(&mut app, r"C:\clips\c.mp4");
-        install_all_native_pending_for_test(&mut app, from, target, None);
+        let open_owner = app.projected_viewer_context_id();
+        install_all_native_pending_for_test(&mut app, from, target, None, open_owner);
         app.video_continuous_last_eof = Some((target, 17));
         app.normalize_state = Some(normalize_scan_state_for_test(
             target,
@@ -48613,10 +48619,16 @@ mod still_window_mode_key_tests {
     #[cfg(windows)]
     fn remove_items_batch_does_not_shift_parked_native_pending_indices() {
         let mut app = setup_app();
+        let ctx = egui::Context::default();
         push_image(&mut app, r"C:\pics\a.jpg");
         let from = push_video(&mut app, r"C:\clips\b.mp4");
         let target = push_video(&mut app, r"C:\clips\c.mp4");
-        install_all_native_pending_for_test(&mut app, from, target, Some(7));
+        let mut parked = crate::app::viewer_context_registry::ViewerContextBundle::empty();
+        parked.items = app.items.clone();
+        parked.fullscreen_idx = Some(from);
+        let open_owner = app.push_window_context_for_test(&ctx, 7, parked);
+        app.transition_detached_window_state(7, DetachedWindowState::ParkedLive, "test_setup");
+        install_all_native_pending_for_test(&mut app, from, target, Some(7), open_owner);
 
         app.remove_items_batch(&[0]);
 
@@ -48646,7 +48658,6 @@ mod still_window_mode_key_tests {
         push_image(&mut app, r"C:\pics\a.jpg");
         let from = push_video(&mut app, r"C:\clips\b.mp4");
         let target = push_video(&mut app, r"C:\clips\c.mp4");
-        install_all_native_pending_for_test(&mut app, from, target, None);
         app.video_continuous_last_eof = Some((target, 23));
         app.normalize_state = Some(normalize_scan_state_for_test(
             target,
@@ -48655,7 +48666,8 @@ mod still_window_mode_key_tests {
         let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
         bundle.items = app.items.clone();
         bundle.fullscreen_idx = Some(from);
-        app.install_active_context_for_test(bundle);
+        let open_owner = app.install_active_context_for_test(bundle);
+        install_all_native_pending_for_test(&mut app, from, target, None, open_owner);
 
         app.remove_items_batch(&[0]);
 
@@ -48715,7 +48727,8 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let from = push_video(&mut app, r"C:\clips\b.mp4");
         let target = push_video(&mut app, r"C:\clips\c.mp4");
-        install_all_native_pending_for_test(&mut app, from, target, None);
+        let open_owner = app.projected_viewer_context_id();
+        install_all_native_pending_for_test(&mut app, from, target, None, open_owner);
         app.video_tile_mode_active = true;
         app.video_tile_reopen_pending = true;
         app.video_tile_reopen_deadline =
@@ -48749,6 +48762,64 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn deferred_detached_video_open_resumes_when_its_context_host_becomes_ready() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_id = 111;
+        let path = PathBuf::from(r"C:\clips\deferred-host.mp4");
+        let context_id =
+            app.build_active_context_for_test(Some(window_id), DetachedSource::Video, |detached| {
+                let idx = push_video(detached, path.to_str().unwrap());
+                detached.fullscreen_idx = Some(idx);
+
+                // This is the 2-d regression shape: enqueue while a parked-input mount marker is
+                // present, then restore the marker before the next frame. Context identity must
+                // remain the owner across that marker lifetime.
+                detached.native_video_parked_live_input_window_id = Some(window_id);
+                assert!(
+                    detached.defer_native_video_open_until_detached_host(
+                        idx, &path, false, None, false,
+                    )
+                );
+                detached.native_video_parked_live_input_window_id = None;
+            });
+        assert_eq!(
+            app.native_video_open_pending
+                .as_ref()
+                .map(|pending| pending.owner_context_id),
+            Some(context_id)
+        );
+
+        app.with_viewer_context(context_id, |detached| {
+            detached.poll_native_video_open_pending_with_readiness(
+                &ctx,
+                |_| false,
+                || 0,
+                |_, _| panic!("an unavailable host must not resume the open"),
+            );
+            let pending = detached.native_video_open_pending.as_ref().unwrap();
+            assert_eq!(pending.owner_context_id, context_id);
+            assert_eq!(pending.last_declined, Some("host_not_ready"));
+        })
+        .unwrap();
+
+        let mut resumed_idx = None;
+        app.with_viewer_context(context_id, |detached| {
+            assert_eq!(detached.native_video_parked_live_input_window_id, None);
+            detached.poll_native_video_open_pending_with_readiness(
+                &ctx,
+                |_| true,
+                || 0,
+                |_, idx| resumed_idx = Some(idx),
+            );
+            assert!(detached.native_video_open_pending.is_none());
+        })
+        .unwrap();
+        assert_eq!(resumed_idx, Some(0));
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn parked_native_open_host_timeout_closes_only_owner_window_after_poll() {
         // review-v2.3.0 追補6 R1-4: mounted main fullscreen を close せず、mount 中の
         // ParkedLive bundle を swap-back してから共通 teardown で owner 窓だけ閉じる。
@@ -48762,7 +48833,7 @@ mod still_window_mode_key_tests {
         bundle.fullscreen_idx = Some(0);
         bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
         bundle.viewer_session.detached_window_id = Some(108);
-        app.push_window_context_for_test(&ctx, 108, bundle);
+        let parked_context = app.push_window_context_for_test(&ctx, 108, bundle);
         app.transition_detached_window_state(108, DetachedWindowState::ParkedLive, "test_setup");
         let now = std::time::Instant::now();
         app.native_video_open_pending = Some(native_video::NativeVideoOpenPending {
@@ -48776,7 +48847,7 @@ mod still_window_mode_key_tests {
             requested_at: now - std::time::Duration::from_secs(11),
             deadline: now - std::time::Duration::from_millis(1),
             input_seq: 0,
-            parked_live_window_id: Some(108),
+            owner_context_id: parked_context,
         });
 
         app.poll_parked_live_detached_windows(&ctx);

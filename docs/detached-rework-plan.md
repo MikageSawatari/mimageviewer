@@ -651,6 +651,38 @@ live-media fork は binding を旧 main から新 context へ transfer する。
   main context change promote、複数窓の順不同 close、右ドラッグ / keep-alive、tray / remote、
   native presenter の HWND / focus / z-order を確認する。
 
+### ②-d 回帰修正と dead API 清算 (2026-08-25)
+
+detached 動画の host 準備前に作った `NativeVideoOpenPending` が再開しない回帰を修正した。
+pending は enqueue 時の `native_video_parked_live_input_window_id` を owner として持ち、poll は
+その値を現在の marker と比較していた。②-d で marker の set / restore が registry mount の
+closure 内へ移ったため、**同じ viewer context のままでも marker の寿命だけが先に終わる**。
+この場合 owner gate は deadline 判定と repaint 要求より前で return し、host が登録された後も
+pending が永久に残った。marker は入力 routing の一時 policy であって context identity ではない。
+
+修正後の regular-open pending は enqueue 時の `ViewerContextId` を持つ。App の投影が Building
+中でも予約済み ID を取得でき、AtRest / Mounted の移動や window binding の変化では owner を
+書き換えない。live-media fork で payload が新 context へ分岐する transaction だけが pending
+owner も同時に transfer する。poll は現在 App に投影された context ID と照合する。host 準備判定
+自体は従来どおり、登録済み HWND に対する `GetClientRect` の正サイズで成立する。
+
+回帰テストは marker がある状態で defer し、marker を復元した次 frame で host 未準備の待機を
+確認した後、同じ context を再 mount して host 準備済みにすると resume callback が実行され、
+pending が消えるところまで固定する。pending の生成だけを確認するテストではない。
+
+②-d が残した dead item 16 個 (warning group 11 件) も清算した。旧 bundle-side の bookmark retarget / tag prewarm /
+remote animation pause / detached activation / promote helper は、実際に
+`with_viewer_context` から呼ばれる mounted-side 実装へ置換済みだったため削除した。
+window binding の公開 transfer wrapper 2 本は、`finish_fork` が同じ `transfer_core` を ownership
+transaction 内で直接呼ぶため削除した。未使用の汎用巡回 helper、read accessor 2 本、
+`ContextMut` の未使用 ID も削除した。
+
+`ViewerContextBundle::pause_background_work_keep_current_frame` については、失われた挙動ではなかった。
+②-d の同じ差分が同内容の `App::pause_mounted_background_work_keep_current_frame` を追加し、
+`pause_current_active_viewer_context` の mount closure 内で snapshot 作成直後・AtRest へ戻す前に
+呼んでいる。final-AI cancellation を含む既存の実 park テストもこの経路を通る。したがって未使用の
+bundle 版は重複として削除し、その同等性テストは mounted-side 実装へ移した。
+
 ### 検収 (ClaudeCode、2026-08-25)
 
 **テストが減っていないことを最優先で確認した** (この段は `src/app/tests.rs` が

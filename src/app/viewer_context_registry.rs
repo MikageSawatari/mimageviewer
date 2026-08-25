@@ -161,6 +161,14 @@ impl<P> ContextTable<P> {
         }
     }
 
+    fn projected_id(&self) -> ViewerContextId {
+        assert!(self.pending.is_none());
+        match self.projection {
+            Projection::Mounted(id) => id,
+            Projection::Building { reserved, .. } => reserved,
+        }
+    }
+
     fn residence(&self, id: ViewerContextId) -> ContextResidence {
         assert!(self.pending.is_none());
         self.residence_core(id)
@@ -187,6 +195,11 @@ impl<P> ContextTable<P> {
             .map(|id| (id, self.residence_core(id)))
     }
 
+    fn window_for_context(&self, id: ViewerContextId) -> Option<u64> {
+        assert!(self.pending.is_none());
+        self.window_of.get(&id).copied()
+    }
+
     fn ids(&self) -> Vec<ViewerContextId> {
         assert!(self.pending.is_none());
         let mut ids = Vec::with_capacity(self.slots.len() + 1);
@@ -208,16 +221,6 @@ impl<P> ContextTable<P> {
     fn unbind_window(&mut self, window_id: u64) -> Option<ViewerContextId> {
         assert!(self.pending.is_none());
         self.unbind_window_core(window_id)
-    }
-
-    fn transfer_window_binding(
-        &mut self,
-        window_id: u64,
-        from: ViewerContextId,
-        to: ViewerContextId,
-    ) -> Result<(), BindError> {
-        assert!(self.pending.is_none());
-        self.transfer_core(window_id, from, to)
     }
 
     fn bind_core(&mut self, id: ViewerContextId, window_id: u64) -> Result<(), BindError> {
@@ -1030,13 +1033,6 @@ impl<'a> ContextRef<'a> {
         }
     }
 
-    pub(in crate::app) fn viewer_session_independent_active(self) -> bool {
-        match self.source {
-            ContextRefSource::Mounted(app) => app.detached_viewer_independent_active,
-            ContextRefSource::AtRest(bundle) => bundle.viewer_session.independent_active,
-        }
-    }
-
     pub(in crate::app) fn pdf_password_request(self) -> Option<&'a PdfPasswordRequest> {
         match self.source {
             ContextRefSource::Mounted(app) => app.pdf_password_request.as_ref(),
@@ -1048,13 +1044,6 @@ impl<'a> ContextRef<'a> {
         match self.source {
             ContextRefSource::Mounted(app) => app.current_folder.as_deref(),
             ContextRefSource::AtRest(bundle) => bundle.current_folder.as_deref(),
-        }
-    }
-
-    pub(in crate::app) fn fs_pending_len(self) -> usize {
-        match self.source {
-            ContextRefSource::Mounted(app) => app.fs_pending.len(),
-            ContextRefSource::AtRest(bundle) => bundle.fs_pending.len(),
         }
     }
 
@@ -1153,16 +1142,11 @@ impl<'a> ContextRef<'a> {
 
 #[cfg(windows)]
 pub(in crate::app) struct ContextMut<'a> {
-    id: ViewerContextId,
     bundle: &'a mut ViewerContextBundle,
 }
 
 #[cfg(windows)]
 impl ContextMut<'_> {
-    pub(in crate::app) fn id(&self) -> ViewerContextId {
-        self.id
-    }
-
     pub(in crate::app) fn as_ref(&self) -> ContextRef<'_> {
         ContextRef::at_rest(self.bundle)
     }
@@ -1226,67 +1210,9 @@ impl ViewerContextBundle {
             .set_items_generation(items_generation);
     }
 
-    pub(in crate::app) fn retarget_bookmark_media_open(
-        &mut self,
-        pending: crate::bookmark_browser::PendingMediaOpen,
-        target: crate::bookmark_browser::BookmarkViewReturnTarget,
-    ) {
-        self.bookmark_open_pending =
-            Some(crate::bookmark_browser::PendingBookmarkOpen::Media(pending));
-        self.bookmark_view_state = Some(BookmarkViewState::Detached { target });
-    }
-
-    pub(in crate::app) fn ensure_tag_prewarm_started(&mut self) -> bool {
-        if self.items.is_empty() || self.tag_prewarm_pending.is_some() {
-            return false;
-        }
-        self.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
-        true
-    }
-
     pub(in crate::app) fn clear_normalize_state(&mut self) {
         self.normalize_ui_states.clear();
         self.normalize_auto_scan_suppressed.clear();
-    }
-
-    pub(in crate::app) fn activate_parked_live_as_independent_detached(&mut self, window_id: u64) {
-        self.viewer_session.activate_independent_detached(window_id);
-        self.fs_open_intent_from_grid = false;
-        self.pending_auto_fs_open = false;
-        self.pending_return_to_parent = false;
-        self.pdf_prefetch_grace_until = None;
-    }
-
-    pub(in crate::app) fn activate_passive_as_independent_detached(&mut self, window_id: u64) {
-        self.viewer_session.activate_independent_detached(window_id);
-        self.fs_open_intent_from_grid = false;
-        self.pdf_prefetch_grace_until = None;
-    }
-
-    pub(in crate::app) fn activate_independent_detached_session(&mut self, window_id: u64) {
-        self.viewer_session.activate_independent_detached(window_id);
-    }
-
-    pub(in crate::app) fn pause_animations_for_remote_session(&mut self) -> usize {
-        self.fs_cache
-            .values_mut()
-            .map(|entry| usize::from(entry.pause_animation()))
-            .sum()
-    }
-
-    pub(in crate::app) fn become_independent_detached_viewer(
-        &mut self,
-        window_id: u64,
-        idx: usize,
-    ) {
-        self.selected = Some(idx);
-        self.fullscreen_idx = Some(idx);
-        self.native_video_in_window_active = false;
-        self.viewer_session.activate_independent_detached(window_id);
-        self.viewer_session.last_sync_stamp = None;
-        self.fs_open_intent_from_grid = false;
-        self.pending_auto_fs_open = false;
-        self.pending_return_to_parent = false;
     }
 
     pub(in crate::app) fn empty() -> Self {
@@ -1522,51 +1448,6 @@ impl ViewerContextBundle {
             last_loop_pos: std::collections::HashMap::new(),
         }
     }
-
-    pub(in crate::app) fn pause_background_work_keep_current_frame(&mut self) {
-        self.slideshow_playing = false;
-        self.continuous_reading_scroll_transition = None;
-        self.slideshow_scroll_range_cache = None;
-        self.fs_seek_drag_active = false;
-        self.fs_seek_overlay_visible = false;
-        self.pending_auto_fs_open = false;
-        self.pending_return_to_parent = false;
-        self.fs_nav_after_pdf_enumerate = None;
-        self.fs_nav_locked_gen = None;
-        self.fs_holdover_tex = None;
-        // The dedup describes the sequence that was just discarded, so the next block has to be
-        // reported afresh rather than mistaken for a continuation of this one.
-        self.fs_nav_dropped_block_signature = None;
-        self.fs_nav_dropped_block_count = 0;
-        self.continuous_page_transitions.clear();
-        self.pdf_enumerate_pending = None;
-        self.zip_enumerate_pending = None;
-        if let Some(pending) = self.folder_nav_pending.take() {
-            pending.cancel.store(true, Ordering::Relaxed);
-        }
-        if let Some(pending) = self.folder_pane_open_pending.take() {
-            pending.cancel.store(true, Ordering::Relaxed);
-        }
-        self.pending_folder_nav_steps = 0;
-        self.pending_folder_nav_mode = FolderNavMode::Grid;
-        for (_, pending) in self.fs_pending.drain() {
-            pending.cancel.store(true, Ordering::Relaxed);
-        }
-        self.texture_backlog.clear();
-        for pending in self.final_ai_pending.values() {
-            pending.cancel.store(true, Ordering::Relaxed);
-        }
-        self.final_ai_pending.clear();
-        for (_, pending) in self.local_adjust_pending.drain() {
-            pending.cancel.store(true, Ordering::Relaxed);
-        }
-        for (_, pending) in self.comic_bake_pending.drain() {
-            pending.cancel.store(true, Ordering::Relaxed);
-        }
-        for (_, pending) in self.erase_inpaint_pending.drain() {
-            pending.cancel.store(true, Ordering::Relaxed);
-        }
-    }
 }
 
 impl App {
@@ -1616,8 +1497,10 @@ impl App {
 
     #[cfg(windows)]
     pub(in crate::app) fn activate_mounted_as_independent_detached(&mut self, window_id: u64) {
+        self.viewer_presentation = ViewerPresentation::DetachedWindow;
         self.detached_viewer_window_id = Some(window_id);
         self.detached_viewer_independent_active = true;
+        self.detached_viewer_open_next_still_detached_once = false;
         self.last_viewer_sync_stamp = None;
         self.fs_open_intent_from_grid = false;
         self.pending_auto_fs_open = false;
@@ -2843,6 +2726,11 @@ impl App {
         self.viewer_contexts.table.mounted_id()
     }
 
+    /// Identity of the payload currently projected onto `App`, including a context being built.
+    pub(in crate::app) fn projected_viewer_context_id(&self) -> ViewerContextId {
+        self.viewer_contexts.table.projected_id()
+    }
+
     pub(in crate::app) fn viewer_context_residence(&self, id: ViewerContextId) -> ContextResidence {
         self.viewer_contexts.table.residence(id)
     }
@@ -2852,6 +2740,10 @@ impl App {
         window_id: u64,
     ) -> Option<(ViewerContextId, ContextResidence)> {
         self.viewer_contexts.table.locate_window_context(window_id)
+    }
+
+    pub(in crate::app) fn viewer_context_window(&self, id: ViewerContextId) -> Option<u64> {
+        self.viewer_contexts.table.window_for_context(id)
     }
 
     pub(in crate::app) fn viewer_context_ids(&self) -> Vec<ViewerContextId> {
@@ -2874,16 +2766,6 @@ impl App {
         }
     }
 
-    pub(in crate::app) fn any_viewer_context(
-        &self,
-        mut f: impl FnMut(ViewerContextId, ContextRef<'_>) -> bool,
-    ) -> bool {
-        self.viewer_context_ids().into_iter().any(|id| {
-            self.with_viewer_context_ref(id, |context| f(id, context))
-                .unwrap_or(false)
-        })
-    }
-
     pub(in crate::app) fn bind_window(
         &mut self,
         id: ViewerContextId,
@@ -2894,17 +2776,6 @@ impl App {
 
     pub(in crate::app) fn unbind_window(&mut self, window_id: u64) -> Option<ViewerContextId> {
         self.viewer_contexts.table.unbind_window(window_id)
-    }
-
-    pub(in crate::app) fn transfer_window_binding(
-        &mut self,
-        window_id: u64,
-        from: ViewerContextId,
-        to: ViewerContextId,
-    ) -> Result<(), BindError> {
-        self.viewer_contexts
-            .table
-            .transfer_window_binding(window_id, from, to)
     }
 
     pub(in crate::app) fn reserve_window_binding_for_build(&mut self, window_id: u64) {
@@ -3015,10 +2886,13 @@ impl App {
         &mut self,
         window_id: u64,
     ) -> ViewerContextId {
-        self.fork_mounted_context(
+        let source = self.projected_viewer_context_id();
+        let parked = self.fork_mounted_context(
             ForkPolicy::LiveMediaPark { window_id },
             ProductionForkSpec::LiveMedia,
-        )
+        );
+        self.transfer_native_video_open_pending_context(source, parked);
+        parked
     }
 
     pub(in crate::app) fn fork_materialized_still_context(
@@ -3047,10 +2921,7 @@ impl App {
         self.viewer_contexts.table.begin_retire(id)?;
         let value = {
             let payload = self.viewer_contexts.table.retiring_slot_mut(id).unwrap();
-            digest(ContextMut {
-                id,
-                bundle: payload,
-            })
+            digest(ContextMut { bundle: payload })
         };
         self.viewer_contexts.table.unbind_context_core(id);
         let ops = self.viewer_contexts.table.plan_finish_retire(id);
@@ -3426,6 +3297,33 @@ mod tests {
             Some(Slot::AtRest(payload)) => payload,
             Some(Slot::Retiring(_)) | None => panic!("context is not at rest"),
         }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn mounted_independent_activation_sets_the_complete_session_identity_tuple() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.detached_viewer_independent_active = false;
+        app.detached_viewer_open_next_still_detached_once = true;
+        app.detached_viewer_window_id = None;
+        app.last_viewer_sync_stamp = Some(ViewerSyncStamp {
+            idx: 1,
+            item_key: "stale".to_owned(),
+            items_generation: 10,
+        });
+
+        app.activate_mounted_as_independent_detached(37);
+
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        assert!(app.detached_viewer_independent_active);
+        assert!(!app.detached_viewer_open_next_still_detached_once);
+        assert_eq!(app.detached_viewer_window_id, Some(37));
+        assert_eq!(app.last_viewer_sync_stamp, None);
+        assert!(!app.fs_open_intent_from_grid);
+        assert!(!app.pending_auto_fs_open);
+        assert!(!app.pending_return_to_parent);
+        assert_eq!(app.pdf_prefetch_grace_until, None);
     }
 
     #[test]
@@ -3840,7 +3738,7 @@ mod tests {
         );
         table.bind_window(from, 20).unwrap();
 
-        table.transfer_window_binding(20, from, to).unwrap();
+        table.transfer_core(20, from, to).unwrap();
         assert_eq!(table.residence(from), ContextResidence::Mounted);
         assert_eq!(table.residence(to), ContextResidence::AtRest);
         assert_eq!(
@@ -3848,7 +3746,7 @@ mod tests {
             Some((to, ContextResidence::AtRest))
         );
         assert_eq!(
-            table.transfer_window_binding(20, from, from),
+            table.transfer_core(20, from, from),
             Err(BindError::WrongOrigin(Some(to)))
         );
     }

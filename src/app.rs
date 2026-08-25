@@ -25982,8 +25982,9 @@ impl App {
     /// idx-keyed ページ編集状態の正準リスト**。新しい idx-keyed ページ編集マップを足したら
     /// ここと `remove_items_batch` の shift 群の両方に追加すること。bundle 外の native pending
     /// (`native_video_source_swap_pending` / `native_video_open_pending` /
-    /// `native_video_fast_swap_pending` / `video_tile_swap_pending`) も owner=None の mounted 所有だけ
-    /// 同じ shift 群へ追加すること (review-v2.3.0 追補3: 角度A-1)。
+    /// `native_video_fast_swap_pending` / `video_tile_swap_pending`) も同じ shift 群へ追加すること。
+    /// regular open は `ViewerContextId`、残る 3 種は legacy owner=None が mounted 所有を表す
+    /// (review-v2.3.0 追補3: 角度A-1)。
     pub(crate) fn clear_page_edit_state(&mut self) {
         self.adjustment_page_params.clear();
         self.local_adjust_page_layers.clear();
@@ -26416,13 +26417,13 @@ impl App {
         #[cfg(windows)]
         {
             self.vst3_deferred_media_open = self.vst3_deferred_media_open.and_then(shift);
-            // owner=None は mounted と promoted active の二義。active bundle が存在する間は
-            // 4 pending の idx 空間も bundle 側なので main items の削除では shift しない。
-            // ParkedLive pending は owner=Some(window_id) の既存 gate で別途守られる。
+            // source/fast/tile の owner=None は mounted と promoted active の二義。active bundle が
+            // 存在する間は 3 pending の idx 空間も bundle 側なので main items の削除では shift
+            // しない。regular open は投影中の ViewerContextId との一致で判定できる。
             let shift_ownerless_native_pending = !self.active_viewer_context_contains_video();
-            // bundle 外の native pending 4 種も、現在 mount 中の context 所有 (owner=None)
-            // だけ main items の old→new idx へ追随させる。owner=Some(window_id) は ParkedLive
-            // bundle 内 items の idx 空間なので、main grid の削除では絶対に動かさない。
+            let projected_context = self.projected_viewer_context_id();
+            // bundle 外の native pending も、それぞれ現在投影中の context が所有するものだけ
+            // main items の old→new idx へ追随させる。別 context の idx 空間は動かさない。
             // (review-v2.3.0 追補3: 角度A-1)
             let discard_source_swap =
                 self.native_video_source_swap_pending
@@ -26462,15 +26463,12 @@ impl App {
                 .native_video_open_pending
                 .as_ref()
                 .is_some_and(|pending| {
-                    pending.parked_live_window_id.is_none()
-                        && shift_ownerless_native_pending
-                        && shift(pending.idx).is_none()
+                    pending.owner_context_id == projected_context && shift(pending.idx).is_none()
                 });
             if discard_open {
                 self.native_video_open_pending = None;
             } else if let Some(pending) = self.native_video_open_pending.as_mut()
-                && pending.parked_live_window_id.is_none()
-                && shift_ownerless_native_pending
+                && pending.owner_context_id == projected_context
             {
                 pending.idx = shift(pending.idx).expect("native open target removal handled above");
             }
@@ -26596,12 +26594,11 @@ impl App {
                         return false;
                     }
                     let vst_waiting = self.vst3_deferred_media_open == Some(idx);
-                    let native_waiting = !self.active_viewer_context_contains_video()
-                        && self
-                            .native_video_open_pending
+                    let native_waiting =
+                        self.native_video_open_pending
                             .as_ref()
                             .is_some_and(|pending| {
-                                pending.parked_live_window_id.is_none()
+                                pending.owner_context_id == self.projected_viewer_context_id()
                                     && pending.idx == idx
                                     && crate::folder_tree::path_eq(&pending.path, item_path)
                                     && matches_key(&crate::adjustment_db::normalize_path(
@@ -39193,8 +39190,8 @@ impl App {
             return false;
         };
 
-        // ParkedLive owner の pending は active context の通常 poll へ引き継ぐ。
-        // owner を残すと parked poll が二度と来ず、timeout 判定も含めて永久停止する。
+        // Window-scoped legacy pending は ParkedLive poll から active context の通常 poll へ
+        // 引き継ぐ。regular open は ViewerContextId owner のまま mount を追跡する。
         // (review-v2.3.0 追補2 BA-7: activation pending ownership)
         self.rebind_native_video_pending_owners(Some(id), None, "parked_live_activate_commit");
         self.detached_viewer_window_id = Some(id);
@@ -40886,8 +40883,9 @@ impl App {
         })
         .expect("freshly forked live-media context must be mountable");
         self.detached_image_windows.push(snapshot);
-        // mounted/active owner の pending を ParkedLive window へ焼き直す。別 parked window の
-        // owner は一致しないため変更しない (review-v2.3.0 追補2 BA-7)。
+        // Window-scoped legacy pending の mounted/active owner を ParkedLive window へ
+        // 焼き直す。regular open は fork transaction で ViewerContextId owner を移している。
+        // 別 parked window の owner は一致しないため変更しない (review-v2.3.0 追補2 BA-7)。
         self.rebind_native_video_pending_owners(None, Some(snapshot_id), "parked_live_park_commit");
         self.update_detached_window_runtime_flags(snapshot_id, false, reason);
         self.handoff_active_detached_viewport_to_passive(reason);
@@ -51108,7 +51106,12 @@ impl App {
                 || self
                     .native_video_open_pending
                     .as_ref()
-                    .is_some_and(|pending| pending.parked_live_window_id.is_some())
+                    .is_some_and(|pending| {
+                        pending.owner_context_id != self.viewer_context_main()
+                            || self
+                                .viewer_context_window(pending.owner_context_id)
+                                .is_some()
+                    })
                 || self
                     .native_video_fast_swap_pending
                     .as_ref()
@@ -51125,9 +51128,9 @@ impl App {
                 self.video_tile_swap_pending = None;
                 self.native_video_deferred_nav_delta = None;
             }
-            // App-global native pending は mounted context owner (None) だけ閉じる。
-            // Some(window_id) は別 ParkedLive context の presenter/open を所有しているため、
-            // main 画像の close から破棄しない (review-v2.3.0 追補2 BA-7)。
+            // App-global native pending は現在投影中の context が所有するものだけ閉じる。
+            // 別 context の pending は main 画像の close から破棄しない
+            // (review-v2.3.0 追補2 BA-7)。
             self.clear_mounted_native_video_pending();
         }
         self.reset_erase_mode();

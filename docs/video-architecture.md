@@ -1182,6 +1182,15 @@ HW decode 有効かつ `LIVE_VIDEO_DECODE_THREADS >= MAX_LIVE_VIDEO_DECODE_THREA
 open を再開する。新しい動画要求が来たら pending は最新 1 件に置き換える。ESC /
 fullscreen exit / items 差し替えで stale になった pending は破棄する。
 
+R2e ownership 以後、regular-open pending の owner は window ID や
+`native_video_parked_live_input_window_id` ではなく enqueue 時の `ViewerContextId` である。
+Building 中は予約済み context ID、通常の poll 中は App に投影中の context ID を使う。
+AtRest / Mounted、active / ParkedLive、window binding は別の軸なので、この pending owner を
+変更しない。live-media fork で payload 自体が新 context へ分岐するときだけ、同じ registry
+transaction 境界で owner を transfer する。detached host 待ちは owner context が投影された
+frame だけが進め、登録済み host HWND の client rect が正サイズになれば decoder gate と open
+再開へ進む。
+
 perf event:
 - `regular_open_deferred`: live decoder 上限で通常 open を保留
 - `regular_open_deferred_start`: 保留していた open を開始

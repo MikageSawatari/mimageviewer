@@ -606,9 +606,9 @@ pub(crate) struct NativeVideoOpenPending {
     pub(crate) requested_at: std::time::Instant,
     pub(crate) deadline: std::time::Instant,
     pub(crate) input_seq: u64,
-    /// ParkedLive mount 中に生成された pending の owner window id。
-    /// VST3 deferred open からも parked mount 中に到達するため mounted 専用ではない。
-    pub(crate) parked_live_window_id: Option<u64>,
+    /// Owner identity at enqueue time. Residence and window binding may change while the host is
+    /// being created, but the context identity does not.
+    pub(crate) owner_context_id: ViewerContextId,
     /// poll が直前に見送った理由。**毎フレーム同じ理由を出さないためだけの記憶**で、
     /// 判断には使わない。見送りが無言だと「開かないまま静かに止まった」が観測できない。
     pub(crate) last_declined: Option<&'static str>,
@@ -933,7 +933,7 @@ impl App {
             requested_at: now,
             deadline: now + std::time::Duration::from_secs(10),
             input_seq: self.input_seq,
-            parked_live_window_id: self.native_video_parked_live_input_window_id,
+            owner_context_id: self.projected_viewer_context_id(),
         });
         crate::logger::log(format!(
             "[native-video] defer regular open: idx={idx} live_video_decode_threads={live_decoders} max={max_live_video_decode_threads}"
@@ -981,7 +981,7 @@ impl App {
             requested_at: now,
             deadline: now + std::time::Duration::from_secs(10),
             input_seq: self.input_seq,
-            parked_live_window_id: self.native_video_parked_live_input_window_id,
+            owner_context_id: self.projected_viewer_context_id(),
         });
         crate::logger::log(format!(
             "[native-video] defer regular open until detached host is ready: idx={idx}"
@@ -1007,21 +1007,37 @@ impl App {
 
     #[cfg(windows)]
     pub(super) fn poll_native_video_open_pending(&mut self, ctx: &egui::Context) {
+        self.poll_native_video_open_pending_with_readiness(
+            ctx,
+            |app| app.detached_viewer_video_host_ready(),
+            || {
+                crate::video::decoder::LIVE_VIDEO_DECODE_THREADS
+                    .load(std::sync::atomic::Ordering::Acquire)
+            },
+            |app, idx| app.start_fs_load(idx),
+        );
+    }
+
+    #[cfg(windows)]
+    pub(in crate::app) fn poll_native_video_open_pending_with_readiness(
+        &mut self,
+        ctx: &egui::Context,
+        detached_host_ready: impl FnOnce(&Self) -> bool,
+        live_decoder_count: impl FnOnce() -> usize,
+        resume_open: impl FnOnce(&mut Self, usize),
+    ) {
         let Some(pending) = self.native_video_open_pending.as_ref() else {
             return;
         };
-        if !Self::parked_source_swap_poll_owner_matches(
-            pending.parked_live_window_id,
-            self.native_video_parked_live_input_window_id,
-        ) {
-            let pending_owner = pending.parked_live_window_id;
-            let current_owner = self.native_video_parked_live_input_window_id;
+        let current_owner = self.projected_viewer_context_id();
+        if pending.owner_context_id != current_owner {
+            let pending_owner = pending.owner_context_id;
             let declined_idx = pending.idx;
             self.log_native_video_open_pending_declined(
                 "owner_mismatch",
                 format!(
                     "idx={declined_idx} pending_owner={pending_owner:?} \
-                     current_owner={current_owner:?}"
+                     projected_owner={current_owner:?}"
                 ),
             );
             return;
@@ -1035,7 +1051,10 @@ impl App {
         let requested_at = pending.requested_at;
         let deadline = pending.deadline;
         let input_seq = pending.input_seq;
-        let parked_live_window_id = pending.parked_live_window_id;
+        let owner_context_id = pending.owner_context_id;
+        let parked_live_window_id = self
+            .viewer_context_window(owner_context_id)
+            .filter(|window_id| self.detached_window_state_is_parked_live(*window_id));
 
         let fullscreen_moved = self.fullscreen_idx != Some(idx);
         let item_changed = !matches!(self.items.get(idx), Some(GridItem::Video(p)) if p == &path);
@@ -1055,7 +1074,7 @@ impl App {
         }
 
         let now = std::time::Instant::now();
-        if wait_for_detached_host && !self.detached_viewer_video_host_ready() {
+        if wait_for_detached_host && !detached_host_ready(self) {
             if now >= deadline {
                 self.native_video_open_pending = None;
                 crate::logger::log(format!(
@@ -1093,8 +1112,7 @@ impl App {
         }
 
         let max_live_video_decode_threads = crate::video::decoder::MAX_LIVE_VIDEO_DECODE_THREADS;
-        let live_decoders = crate::video::decoder::LIVE_VIDEO_DECODE_THREADS
-            .load(std::sync::atomic::Ordering::Acquire);
+        let live_decoders = live_decoder_count();
         if live_decoders < max_live_video_decode_threads {
             self.native_video_open_pending = None;
             self.fs_open_intent_from_grid = from_grid;
@@ -1123,7 +1141,7 @@ impl App {
                     ],
                 );
             }
-            self.start_fs_load(idx);
+            resume_open(self, idx);
             ctx.request_repaint();
             return;
         }
@@ -1758,7 +1776,9 @@ impl App {
         }
     }
 
-    /// App-global pending の mounted/active と ParkedLive の ownership 遷移。
+    /// Window-scoped legacy pending の mounted/active と ParkedLive の ownership 遷移。
+    /// Regular-open pending は ViewerContextId を owner に持つため、この window rebinding の
+    /// 対象ではない。
     #[cfg(windows)]
     pub(crate) fn rebind_native_video_pending_owners(
         &mut self,
@@ -1767,13 +1787,6 @@ impl App {
         _reason: &'static str,
     ) {
         if let Some(pending) = self.native_video_source_swap_pending.as_mut() {
-            pending.parked_live_window_id = Self::pending_owner_after_context_transition(
-                pending.parked_live_window_id,
-                from_owner,
-                to_owner,
-            );
-        }
-        if let Some(pending) = self.native_video_open_pending.as_mut() {
             pending.parked_live_window_id = Self::pending_owner_after_context_transition(
                 pending.parked_live_window_id,
                 from_owner,
@@ -1800,6 +1813,21 @@ impl App {
                 from_owner,
                 to_owner,
             );
+        }
+    }
+
+    /// Transfer only the regular-open request whose viewer payload moved to a newly forked
+    /// context. Mount, park, and activation do not alter this identity.
+    #[cfg(windows)]
+    pub(crate) fn transfer_native_video_open_pending_context(
+        &mut self,
+        from: ViewerContextId,
+        to: ViewerContextId,
+    ) {
+        if let Some(pending) = self.native_video_open_pending.as_mut()
+            && pending.owner_context_id == from
+        {
+            pending.owner_context_id = to;
         }
     }
 
@@ -1849,10 +1877,13 @@ impl App {
         reason: &'static str,
     ) -> bool {
         let mut discarded = self.discard_parked_source_swap_pending_for_window(window_id, reason);
+        let open_owner = self
+            .locate_window_context(window_id)
+            .map(|(context_id, _)| context_id);
         if self
             .native_video_open_pending
             .as_ref()
-            .is_some_and(|pending| pending.parked_live_window_id == Some(window_id))
+            .is_some_and(|pending| open_owner == Some(pending.owner_context_id))
         {
             self.native_video_open_pending = None;
             discarded = true;
@@ -1884,6 +1915,14 @@ impl App {
     /// close_fullscreen が現在 mount 中の context に属する pending だけを破棄する。
     #[cfg(windows)]
     pub(crate) fn clear_mounted_native_video_pending(&mut self) {
+        let projected = self.projected_viewer_context_id();
+        if self
+            .native_video_open_pending
+            .as_ref()
+            .is_some_and(|pending| pending.owner_context_id == projected)
+        {
+            self.native_video_open_pending = None;
+        }
         // promoted active context は owner=None だが、main close 中は bundle が unmounted。
         // media 窓自身の close は active context を take + mount してからここへ来るため false。
         if self.active_viewer_context_contains_video() {
@@ -1896,13 +1935,6 @@ impl App {
             && let Some(pending) = self.native_video_source_swap_pending.take()
         {
             pending.native_output.set_navigation_preview(None);
-        }
-        if self
-            .native_video_open_pending
-            .as_ref()
-            .is_some_and(|pending| pending.parked_live_window_id.is_none())
-        {
-            self.native_video_open_pending = None;
         }
         if self
             .native_video_fast_swap_pending
