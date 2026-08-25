@@ -40959,11 +40959,58 @@ mod still_window_mode_key_tests {
         bundle.viewer_session.detached_window_id = Some(91);
         app.install_active_context_for_test(bundle);
 
-        assert!(app.active_viewer_context_contains_video());
+        assert!(app.other_active_viewer_context_contains_video());
         assert!(
             !app.should_poll_main_video_context(),
             "native video pending/events must be polled only while the detached video bundle is mounted"
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn mounted_detached_video_open_reaches_pending_poll_from_main_update_path() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_id = 95;
+        let path = PathBuf::from(r"C:\clips\mounted-pending.mp4");
+        let context_id =
+            app.build_active_context_for_test(Some(window_id), DetachedSource::Video, |detached| {
+                let idx = push_video(detached, path.to_str().unwrap());
+                detached.fullscreen_idx = Some(idx);
+                detached.native_video_parked_live_input_window_id = Some(window_id);
+                assert!(
+                    detached.defer_native_video_open_until_detached_host(
+                        idx, &path, false, None, false,
+                    )
+                );
+                detached.native_video_parked_live_input_window_id = None;
+            });
+
+        app.with_viewer_context(context_id, |detached| {
+            assert_eq!(
+                detached.viewer_context_residence(context_id),
+                ContextResidence::Mounted
+            );
+            assert_eq!(
+                detached
+                    .native_video_open_pending
+                    .as_ref()
+                    .and_then(|pending| pending.last_declined),
+                None
+            );
+
+            detached.poll_main_video_context(&ctx);
+
+            assert_eq!(
+                detached
+                    .native_video_open_pending
+                    .as_ref()
+                    .and_then(|pending| pending.last_declined),
+                Some("host_not_ready"),
+                "the production main-update route must reach the pending-open poll while the detached context is mounted"
+            );
+        })
+        .unwrap();
     }
 
     #[test]
@@ -40979,7 +41026,7 @@ mod still_window_mode_key_tests {
         bundle.viewer_session.detached_window_id = Some(92);
         app.install_active_context_for_test(bundle);
 
-        assert!(!app.active_viewer_context_contains_video());
+        assert!(!app.other_active_viewer_context_contains_video());
         assert!(
             app.should_poll_main_video_context(),
             "still detached contexts must not suppress unrelated main video polling"
@@ -47003,7 +47050,7 @@ mod still_window_mode_key_tests {
             app.park_current_viewer_context_as_live_media(&ctx, "test_linked_live_park_restore")
         );
         assert!(app.activate_detached_image_window_snapshot(&ctx, window_id));
-        assert!(app.active_viewer_context_contains_video());
+        assert!(app.other_active_viewer_context_contains_video());
         assert!(app.close_current_active_viewer_context(&ctx));
 
         assert_eq!(
@@ -47075,7 +47122,7 @@ mod still_window_mode_key_tests {
             app.detached_window_state(61),
             Some(DetachedWindowState::Active)
         );
-        assert!(app.active_viewer_context_contains_video());
+        assert!(app.other_active_viewer_context_contains_video());
         assert!(
             !app.detached_image_windows
                 .iter()
@@ -49578,7 +49625,7 @@ mod still_window_mode_key_tests {
         let pending = app.take_parked_live_activation_requests_after_passive_render();
         assert_eq!(pending, vec![82]);
         assert!(app.activate_detached_image_window_snapshot(&ctx, 82));
-        assert!(app.active_viewer_context_contains_video());
+        assert!(app.other_active_viewer_context_contains_video());
         assert!(
             !app.detached_image_windows
                 .iter()

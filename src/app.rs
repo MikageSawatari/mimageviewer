@@ -26349,8 +26349,8 @@ impl App {
             }
         }
         #[cfg(windows)]
-        let detached_media_owns_global_indices =
-            self.active_viewer_context_contains_video() || self.parked_live_media_window_exists();
+        let detached_media_owns_global_indices = self.other_active_viewer_context_contains_video()
+            || self.parked_live_media_window_exists();
         #[cfg(not(windows))]
         let detached_media_owns_global_indices = false;
         // active promoted は owner=None、ParkedLive は bundle mount 時だけ global EOF state を使う。
@@ -26420,7 +26420,7 @@ impl App {
             // source/fast/tile の owner=None は mounted と promoted active の二義。active bundle が
             // 存在する間は 3 pending の idx 空間も bundle 側なので main items の削除では shift
             // しない。regular open は投影中の ViewerContextId との一致で判定できる。
-            let shift_ownerless_native_pending = !self.active_viewer_context_contains_video();
+            let shift_ownerless_native_pending = !self.other_active_viewer_context_contains_video();
             let projected_context = self.projected_viewer_context_id();
             // bundle 外の native pending も、それぞれ現在投影中の context が所有するものだけ
             // main items の old→new idx へ追随させる。別 context の idx 空間は動かさない。
@@ -38244,10 +38244,15 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn active_viewer_context_contains_video(&self) -> bool {
+    /// Whether the active detached session that is not currently projected onto App contains
+    /// video. The mounted context is the current context and must be inspected through
+    /// current_viewer_context_contains_video instead.
+    pub(crate) fn other_active_viewer_context_contains_video(&self) -> bool {
         self.active_viewer_context_id().is_some_and(|id| {
-            self.with_viewer_context_ref(id, Self::viewer_context_contains_video)
-                .unwrap_or(false)
+            id != self.projected_viewer_context_id()
+                && self
+                    .with_viewer_context_ref(id, Self::viewer_context_contains_video)
+                    .unwrap_or(false)
         })
     }
 
@@ -38411,7 +38416,7 @@ impl App {
             return false;
         };
         if self.current_viewer_context_contains_video()
-            || self.active_viewer_context_contains_video()
+            || self.other_active_viewer_context_contains_video()
         {
             return false;
         }
@@ -38445,7 +38450,7 @@ impl App {
     fn closing_parked_windows_own_native_video_mode_switch(&self, window_ids: &[u64]) -> bool {
         if self.native_video_mode_switch.is_none()
             || self.current_viewer_context_contains_video()
-            || self.active_viewer_context_contains_video()
+            || self.other_active_viewer_context_contains_video()
         {
             return false;
         }
@@ -38948,7 +38953,32 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn should_poll_main_video_context(&self) -> bool {
-        !self.active_viewer_context_contains_video() && !self.parked_live_media_window_exists()
+        !self.other_active_viewer_context_contains_video()
+            && !self.parked_live_media_window_exists()
+    }
+
+    fn poll_main_video_context(&mut self, ctx: &egui::Context) {
+        let should_poll = {
+            #[cfg(windows)]
+            {
+                self.should_poll_main_video_context()
+            }
+            #[cfg(not(windows))]
+            {
+                true
+            }
+        };
+        if should_poll {
+            self.poll_video(ctx);
+        } else {
+            #[cfg(windows)]
+            if Self::detached_image_window_debug_enabled() && self.frame_counter % 60 == 0 {
+                self.log_detached_image_window_debug(format!(
+                    "main_poll_video_deferred_to_active_context frame={}",
+                    self.frame_counter
+                ));
+            }
+        }
     }
 
     #[cfg(windows)]
@@ -39370,7 +39400,7 @@ impl App {
         ctx: &egui::Context,
         preserve_fullfeature_linked_still: bool,
     ) -> bool {
-        if self.active_viewer_context_contains_video()
+        if self.other_active_viewer_context_contains_video()
             && self
                 .park_active_detached_context_as_live_media(ctx, "park_active_context_live_media")
         {
@@ -51097,7 +51127,7 @@ impl App {
         // Phase 5.5: タイルモードもフルスクリーン解除と同時に閉じる (Codex H2 反映)。
         #[cfg(windows)]
         {
-            let detached_pending_owner = self.active_viewer_context_contains_video()
+            let detached_pending_owner = self.other_active_viewer_context_contains_video()
                 || self.parked_live_media_window_exists()
                 || self
                     .native_video_source_swap_pending
@@ -63724,7 +63754,7 @@ impl App {
     fn cancel_media_navigation_pending_for_current_context(&mut self, reason: &'static str) {
         #[cfg(windows)]
         if self.current_media_navigation_owner().is_none()
-            && self.active_viewer_context_contains_video()
+            && self.other_active_viewer_context_contains_video()
         {
             // promoted active media は owner=None だが現在 App へ mount されていない。
             // main context の close/load から別 context の候補解決を破棄しない。
@@ -65681,27 +65711,7 @@ impl eframe::App for App {
         self.enqueue_visible_tag_prewarms();
 
         self.poll_prefetch(ctx);
-        let should_poll_main_video_context = {
-            #[cfg(windows)]
-            {
-                self.should_poll_main_video_context()
-            }
-            #[cfg(not(windows))]
-            {
-                true
-            }
-        };
-        if should_poll_main_video_context {
-            self.poll_video(ctx);
-        } else {
-            #[cfg(windows)]
-            if Self::detached_image_window_debug_enabled() && self.frame_counter % 60 == 0 {
-                self.log_detached_image_window_debug(format!(
-                    "main_poll_video_deferred_to_active_context frame={}",
-                    self.frame_counter
-                ));
-            }
-        }
+        self.poll_main_video_context(ctx);
         self.poll_ai_upscale(ctx);
         self.poll_final_ai(ctx);
         self.poll_erase_inpaint(ctx);

@@ -538,7 +538,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
     ) -> bool {
-        let active_media = self.active_viewer_context_contains_video();
+        let active_media = self.other_active_viewer_context_contains_video();
         let mounted_media =
             self.viewer_session_is_detached() && self.current_viewer_context_contains_video();
         if !active_media && !mounted_media {
