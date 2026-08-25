@@ -190,7 +190,18 @@ fn draw_native_seek_strip_lock_button(
             egui::Sense::click(),
         )
         .on_hover_cursor(egui::CursorIcon::PointingHand);
+    // 下部 HUD のボタンは暗い HUD 帯の上に乗るので `draw_overlay_button_bg` の
+    // 「非 hover は透明」で読める。ストリップのボタンはサムネイルのセルの上に乗るため、
+    // 透明のままだと明るい絵に埋もれる。常に暗い下敷きと薄い縁を敷いてから、
+    // hover / active の色を同じ helper で重ねる。
+    painter.rect_filled(lock_rect, 4.0, egui::Color32::from_black_alpha(170));
     draw_overlay_button_bg(painter, lock_rect, response.hovered(), strip_locked);
+    painter.rect_stroke(
+        lock_rect,
+        4.0,
+        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(46)),
+        egui::StrokeKind::Inside,
+    );
     crate::ui_fullscreen::draw_icons::draw_seek_lock_icon(
         painter,
         lock_rect.center(),
@@ -6824,6 +6835,31 @@ impl NativeEguiOverlay {
                     pressed: button.down,
                     modifiers,
                 });
+                // 診断 (2026-08-25): ストリップ固定中に下部バーの鍵が 1 回目のクリックで
+                // 反応しない、という報告の切り分け用。native がクリックを届けているのか、
+                // egui が widget へ配らないのか、App の遷移がおかしいのかを分けて見る。
+                // 原因を特定したら消す。
+                if matches!(egui_button, egui::PointerButton::Primary) {
+                    let ppp = self.pixels_per_point.max(f32::MIN_POSITIVE);
+                    let width_points = self.width as f32 / ppp;
+                    let height_points = self.height as f32 / ppp;
+                    let bar_lock = crate::video::native_presenter::overlay_draw::
+                        native_seek_bar_lock_button_rect(width_points, height_points);
+                    let strip_rect = native_seek_strip_rect(width_points, height_points);
+                    let strip_lock = native_seek_strip_lock_button_rect(strip_rect);
+                    crate::logger::log(format!(
+                        "[strip-lock-diag] native click down={} pos=({:.1},{:.1})                          in_bar_lock={} in_strip_lock={} in_strip={}                          bottom_hud_visible={} strip_some={} bottom_lock={:?}",
+                        button.down,
+                        pos.x,
+                        pos.y,
+                        bar_lock.contains(pos),
+                        strip_lock.contains(pos),
+                        strip_rect.contains(pos),
+                        self.bottom_hud_visible,
+                        self.seek_strip.is_some(),
+                        self.bottom_lock,
+                    ));
+                }
                 self.dirty = true;
             }
             NativeEvent::MouseWheel(wheel) => {
