@@ -745,8 +745,60 @@ allowlist に入れれば見えなくなり、違反のままなら CI が永久
 ついでに `ENABLE_ALLOWLIST` という const スイッチを `--no-allowlist` フラグに置き換えた。
 フリップして忘れられるうえ、false 側が誰も通らない死んだ枝になっていたため。
 
-次は **②-d** (保管・binding・transaction の一括切替)。**ここだけは分けられない**が、
-コンパイラが作業リストを列挙するので手探りにはならない。A1 / A5 もここで有効化する。
+**ステージ②-d-pre 完了** (2026-08-25、`7282fd01`、指示書
+[detached-rework-stage-r2e-2d-pre.md](detached-rework-stage-r2e-2d-pre.md))。
+lib テスト 6251 件緑 (件数不変)、監査 exit 0 (既知の指摘 1 件のまま)。
+
+### 設計に無い段を足した (保管は分けていない)
+
+設計 §7 は②-d を「ここだけは分けられない」とする。**保管についてはそのとおり**なので
+**保管は 1 コミットで切り替える**。分けたのは**読み方**である。実測 (非テスト):
+
+| | 箇所 |
+| --- | --- |
+| `.active_detached_viewer_context` のフィールドアクセス | 84 (うち存在検査 47 / 所有操作 23) |
+| `.paused_bundle` のフィールドアクセス | 42 (うち存在検査 4 / 所有操作 33) |
+
+**存在検査 51 箇所がこの rework の病因そのもの。** 設計 §1 の診断は
+「`None` は『ここに無い』であって決して『別の場所にある』ではない」で、`.is_some()` は
+その 2 つを混ぜたまま書ける形 = **どの問いなのかがコードに書かれていない**。
+保管を差し替える段で同時に問いを決めると、**命名の誤りが保管のバグに見える**。
+
+### 判断サイト 23 箇所の読み解き
+
+| 付けた名前 | 箇所 | 意味 |
+| --- | --- | --- |
+| `active_detached_context_is_at_rest()` | 13 | holder に context が在る (2 箇所は否定で使用。否定形の名前は作らない) |
+| `active_detached_context_exists()` | **5** | context が在る **または** session が detached。**同じ問いが 5 回書かれていた** |
+| `viewer_session_is_detached_or_switching()` | 3 | **生の OR / AND が冗長だった** (下記) |
+| `detached_viewer_host_owns_surface()` | 1 | presentation が detached、または holder に context |
+| `mounted_projection_owns_active_detached_session()` | 2 | §6.5 の暫定回避策。**撤去せず名前で言う** |
+
+**判断不能だったサイトは無し。**
+
+- **5 コピー**: `had_active_detached` の 3 行 (直前の `base_placement` 行を含む) が
+  4 箇所でバイト単位一致、5 つ目は改行だけ違う同じ問いだった。1 本に畳んだ。
+- **冗長だった 3 箇所**: `viewer_session_is_detached_or_switching()` は
+  **冒頭で holder に context があれば true を返す**ので、同じ検査を `||` で足すのも、
+  その否定に `&& is_none()` を足すのも**元から意味が無かった** (防御ではなく重複)。
+  非 Windows 側も元から `false` 固定で、挙動は変わらない。
+- **§6.5 stopgap 2 箇所**: `!is_at_rest()` に
+  `mounted_projection_owns_active_detached_session()` という名前を付け、
+  **「holder が空であることは mounted session の所有を証明しない」**とコメントに書いた。
+  撤去は②-d。
+- ログ引数 28 箇所は 1 つの診断入口 (`active_detached_context_debug_state()`) に通した。
+  **出力文字列は変えていない。**
+- ②-pre が holder 側に残した前置きフィルタ 2 つ (vst3 pending / rename 述語) は
+  `.as_deref().is_some_and(..)` の形で、この段の存在検査には含まれない。②-d で扱う。
+
+### ②-d に残っているもの
+
+- 所有操作 **56 箇所** (`as_ref` / `as_mut` / `take` / 代入、23 + 33)
+- 保管 2 つの削除と `App::viewer_contexts` への統合
+- 生プリミティブ 4 種 → 5 transaction (設計 §4)、window binding table
+- §6.5 の暫定回避策 3 種の撤去 (stopgap 2 箇所 + keep-alive backstop)
+- 監査 **A1 / A5** の有効化 (保管が消えて初めて通る)
+- swap の内側への failpoint (設計 §7 ②-d の I8 確認)
 
 ### R2e の作業環境 (新しいセッションが最初に読むもの)
 
