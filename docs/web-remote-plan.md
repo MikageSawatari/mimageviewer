@@ -2762,7 +2762,7 @@ remote 側の表示トリムは今のところ従来どおり回転中は無効�
 - テスト: `a_landscape_page_becomes_two_remote_groups` (同じ index の group が 2 つ、
   左→右 / 右→左で左右の順序だけが変わる)。
 
-### 15.5 端末側 — 残り。**先に数えた読み手**
+### 15.5 端末側 — 実装済み (2026-08-26、`03ced000`)。**先に数えた読み手**
 
 位置の正本は `state.pageGroupIndex` で、**index 自体が左右を区別する** (段 1 と段 2)。
 したがって左右の状態を別に持つ必要はない。アドレスから index へ戻す所だけが左右を要る。
@@ -2785,3 +2785,33 @@ remote 側の表示トリムは今のところ従来どおり回転中は無効�
 
 box の縦横比が元画像のちょうど半分になるので `cover` は拡大せずぴったり収まる。追加の
 転送もサーバ側の切り出しも要らない。
+
+#### 実装の結果
+
+**描き手は 1 つになった。**`ImageViewer.applyImageBox` だけが img の寸法・`object-fit` ・
+`object-position` を書く。`setLayout` / `refitVisibleContent` / spread 適用ループは全て
+そこを通る (`grep "style.width = "` が 1 件になることで確認できる)。
+
+配置の計算は `viewerSlicedSpreadLayout` に集約した。**box を決める寸法と、取り寄せる
+画像の寸法が違う**のがこの関数の存在理由で、見せるのは半分でも届くのは元ページ 1 枚
+まるごとなので、要求幅まで半分にすると実質 1/4 の解像度になる。半分用に幅を割って
+から要求幅だけ元へ戻し、上限は割る前の値で守る。
+
+いま見ている半分は **img の `dataset.pageSlice`** が持つ。`refitVisibleContent` は
+向きの変更やバー開閉のたびに走るが、そのとき group を知らない。補正プレビューの
+差し替え (`replacePageBlobs`) が `cssText` と dataset を写すので、この置き場所なら
+プレビュー後も半分が保たれる。
+
+`dataset.sourceWidth/Height` には**元ページのままの寸法**を入れる。半分にした寸法を
+持たせると `refitVisibleContent` が読み直したときにもう一度半分になる。
+
+`decodedPageUnitKey` は左右で**共有したままにした**。同じページ画像なので、左半分から
+右半分へ進むときに decode 済みの img をそのまま使い回せる。単ページ経路は再利用時にも
+`setLayout` を必ず通るので、`object-position` は新しい半分へ更新される。
+
+`/api/page` の URL は画質プリセットから幅を決めており配置に依存しないので、左右で
+同じ resource key になる。**追加の転送は無い。**
+
+テスト: `viewerSlicedSpreadLayout` の要求幅 (半分の box なのに元ページ幅を要求する)、
+上限のクランプ、`pageSliceObjectPosition`、分割モードが巡回に入らないこと、
+`pageGroupIndexIn` が左右まで見ること・指定した半分がもう無ければページ側へ戻ること。
