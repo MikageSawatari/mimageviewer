@@ -24,6 +24,8 @@ use super::seek_strip_thumbs::{
 
 const FALLBACK_MAX_CELLS: usize = 240;
 const DUPLICATE_SAMPLE_BYTES: usize = 8 * 1024;
+const FLAT_MAX_LUMINANCE_VARIANCE: f64 = 1.0;
+const FLAT_MAX_CHANNEL_RANGE: u8 = 4;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct SampledFileFingerprint {
@@ -141,7 +143,44 @@ pub struct AxisReport {
 #[serde(rename_all = "snake_case")]
 pub enum CellState {
     Ready,
+    Flat,
     Failed,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CellPixelStats {
+    /// Mean BT.709 luminance in the 0..=255 sample domain.
+    pub mean_luminance: f64,
+    /// Population variance of BT.709 luminance in squared sample values.
+    pub luminance_variance: f64,
+    /// Largest of the red, green, and blue channel ranges.
+    pub maximum_channel_range: u8,
+}
+
+impl CellPixelStats {
+    fn effectively_flat(&self) -> bool {
+        self.luminance_variance <= FLAT_MAX_LUMINANCE_VARIANCE
+            && self.maximum_channel_range <= FLAT_MAX_CHANNEL_RANGE
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct FlatCellCriterion {
+    pub luminance: String,
+    pub maximum_luminance_variance: f64,
+    pub maximum_channel_range: u8,
+    pub interpretation: String,
+}
+
+impl Default for FlatCellCriterion {
+    fn default() -> Self {
+        Self {
+            luminance: "BT.709: 0.2126 R + 0.7152 G + 0.0722 B, samples 0..255".to_string(),
+            maximum_luminance_variance: FLAT_MAX_LUMINANCE_VARIANCE,
+            maximum_channel_range: FLAT_MAX_CHANNEL_RANGE,
+            interpretation: "reported for review, not asserted as a defect; real fades, black frames, and flat title cards can match".to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -149,16 +188,18 @@ pub struct CellReport {
     pub index: usize,
     pub time_secs: f64,
     pub state: CellState,
+    pub pixels: Option<CellPixelStats>,
     pub failure: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct WindowReport {
     pub name: String,
-    pub requested_start_index: usize,
+    pub requested_center_index: f64,
     pub actual_start_index: usize,
     pub actual_end_index: usize,
     pub ready_count: usize,
+    pub flat_count: usize,
     pub failed_count: usize,
     pub elapsed_ms: f64,
     pub cells: Vec<CellReport>,
@@ -191,11 +232,16 @@ impl FileReport {
         self.windows.iter().map(|window| window.failed_count).sum()
     }
 
+    pub fn flat_cell_count(&self) -> usize {
+        self.windows.iter().map(|window| window.flat_count).sum()
+    }
+
     pub fn passed(&self) -> bool {
         self.skipped_reason.is_none()
             && self.unavailable_reason.is_none()
             && self.duplicate_of.is_none()
             && self.file_error.is_none()
+            && self.flat_cell_count() == 0
             && self.failed_cell_count() == 0
     }
 
@@ -213,6 +259,10 @@ impl FileReport {
 
     pub fn verification_failed(&self) -> bool {
         self.file_error.is_some() || self.failed_cell_count() > 0
+    }
+
+    pub fn flagged_for_review(&self) -> bool {
+        self.flat_cell_count() > 0
     }
 
     pub fn duplicate_of(path: &Path, matched_path: String) -> Self {
@@ -236,6 +286,7 @@ pub struct BatchReport {
     pub schema_version: u32,
     pub roots: Vec<String>,
     pub options: BatchOptions,
+    pub flat_cell_criterion: FlatCellCriterion,
     pub discovery_issues: Vec<DiscoveryIssue>,
     pub limit_reached: bool,
     pub files: Vec<FileReport>,
@@ -244,6 +295,8 @@ pub struct BatchReport {
     pub skipped_files: usize,
     pub unavailable_files: usize,
     pub duplicate_files: usize,
+    pub flat_files: usize,
+    pub flat_cells: usize,
     pub failed_cells: usize,
     pub elapsed_ms: f64,
 }
@@ -264,11 +317,17 @@ impl BatchReport {
         let skipped_files = files.iter().filter(|file| file.skipped()).count();
         let unavailable_files = files.iter().filter(|file| file.unavailable()).count();
         let duplicate_files = files.iter().filter(|file| file.duplicate()).count();
+        let flat_files = files
+            .iter()
+            .filter(|file| file.flagged_for_review())
+            .count();
+        let flat_cells = files.iter().map(FileReport::flat_cell_count).sum();
         let failed_cells = files.iter().map(FileReport::failed_cell_count).sum();
         Self {
-            schema_version: 2,
+            schema_version: 3,
             roots: roots.iter().map(|path| path_string(path)).collect(),
             options,
+            flat_cell_criterion: FlatCellCriterion::default(),
             discovery_issues: discovery.issues,
             limit_reached: discovery.limit_reached,
             files,
@@ -277,6 +336,8 @@ impl BatchReport {
             skipped_files,
             unavailable_files,
             duplicate_files,
+            flat_files,
+            flat_cells,
             failed_cells,
             elapsed_ms: elapsed.as_secs_f64() * 1000.0,
         }
@@ -507,12 +568,12 @@ pub fn verify_file(path: &Path, options: &BatchOptions) -> FileReport {
 
     let axis_report = build_axis_report(&axis, &diagnostics, duration_secs);
     let mut windows = Vec::new();
-    for (name, requested_start_index) in window_positions(&axis, options.visible_count) {
+    for (name, requested_center_index) in window_positions(&axis) {
         windows.push(run_window(
             &worker,
             &axis,
             name,
-            requested_start_index,
+            requested_center_index,
             options,
         ));
     }
@@ -738,45 +799,50 @@ fn percentile(sorted: &[f64], fraction: f64) -> f64 {
     sorted[index.min(sorted.len() - 1)]
 }
 
-fn window_positions(axis: &StripAxis, visible_count: usize) -> Vec<(String, usize)> {
-    let span = visible_count.max(1).min(axis.cell_count());
-    let last_start = axis.cell_count().saturating_sub(span);
+fn window_positions(axis: &StripAxis) -> Vec<(String, f64)> {
+    let last_index = axis.cell_count().saturating_sub(1) as f64;
     [
         ("index_0", 0.0),
         ("25_percent", 0.25),
         ("50_percent", 0.50),
         ("75_percent", 0.75),
-        ("last_full_window", 1.0),
+        ("final_cell", 1.0),
     ]
     .into_iter()
-    .map(|(name, fraction)| {
-        (
-            name.to_string(),
-            (last_start as f64 * fraction).round() as usize,
-        )
-    })
+    .map(|(name, fraction)| (name.to_string(), last_index * fraction))
     .collect()
 }
 
-fn run_window(
-    worker: &SeekStripThumbnailWorker,
-    axis: &Arc<StripAxis>,
-    name: String,
-    requested_start_index: usize,
-    options: &BatchOptions,
-) -> WindowReport {
-    let started = Instant::now();
-    let visible_count = options.visible_count.max(1).min(axis.cell_count());
-    let center_index = requested_start_index as f64 + visible_count as f64 / 2.0;
+fn verification_window_range(
+    axis: &StripAxis,
+    center_index: f64,
+    visible_count: usize,
+) -> std::ops::RangeInclusive<usize> {
     let range = compute_strip_window(
         center_index,
-        visible_count,
+        visible_count.max(1).min(axis.cell_count()),
         StripLookahead::default(),
         axis.cell_count(),
         None,
     )
     .ready
     .expect("a resolved non-empty axis must produce a visible range");
+    range.start()..=range.end()
+}
+
+fn run_window(
+    worker: &SeekStripThumbnailWorker,
+    axis: &Arc<StripAxis>,
+    name: String,
+    requested_center_index: f64,
+    options: &BatchOptions,
+) -> WindowReport {
+    let started = Instant::now();
+    let visible_count = options.visible_count.max(1).min(axis.cell_count());
+    let center_index = requested_center_index;
+    let range = verification_window_range(axis, center_index, visible_count);
+    let actual_start_index = *range.start();
+    let actual_end_index = *range.end();
     let request_result = worker.request(
         Arc::clone(axis),
         center_index,
@@ -790,7 +856,7 @@ fn run_window(
     } else {
         loop {
             let snapshot = worker.snapshot();
-            let settled = (range.start()..=range.end()).all(|index| {
+            let settled = (actual_start_index..=actual_end_index).all(|index| {
                 axis.cell(index)
                     .and_then(|time| snapshot.outcome_for_secs(time))
                     .is_some()
@@ -818,25 +884,41 @@ fn run_window(
     });
 
     let mut cells = Vec::new();
-    for index in range.start()..=range.end() {
+    for index in actual_start_index..=actual_end_index {
         let time_secs = axis.cell(index).unwrap_or(f64::NAN);
         match snapshot.outcome_for_secs(time_secs) {
-            Some(StripThumbnailOutcome::Ready(_)) => cells.push(CellReport {
-                index,
-                time_secs,
-                state: CellState::Ready,
-                failure: None,
-            }),
+            Some(StripThumbnailOutcome::Ready(thumbnail)) => match measure_cell_pixels(thumbnail) {
+                Ok(pixels) => cells.push(CellReport {
+                    index,
+                    time_secs,
+                    state: if pixels.effectively_flat() {
+                        CellState::Flat
+                    } else {
+                        CellState::Ready
+                    },
+                    pixels: Some(pixels),
+                    failure: None,
+                }),
+                Err(failure) => cells.push(CellReport {
+                    index,
+                    time_secs,
+                    state: CellState::Failed,
+                    pixels: None,
+                    failure: Some(format!("pixel measurement failed: {failure}")),
+                }),
+            },
             Some(StripThumbnailOutcome::Failed(failure)) => cells.push(CellReport {
                 index,
                 time_secs,
                 state: CellState::Failed,
+                pixels: None,
                 failure: Some(failure_text(failure)),
             }),
             None => cells.push(CellReport {
                 index,
                 time_secs,
                 state: CellState::Failed,
+                pixels: None,
                 failure: request_failure
                     .clone()
                     .or_else(|| timeout_failure.clone())
@@ -850,17 +932,74 @@ fn run_window(
         .iter()
         .filter(|cell| cell.state == CellState::Ready)
         .count();
-    let failed_count = cells.len() - ready_count;
+    let flat_count = cells
+        .iter()
+        .filter(|cell| cell.state == CellState::Flat)
+        .count();
+    let failed_count = cells
+        .iter()
+        .filter(|cell| cell.state == CellState::Failed)
+        .count();
     WindowReport {
         name,
-        requested_start_index,
-        actual_start_index: range.start(),
-        actual_end_index: range.end(),
+        requested_center_index,
+        actual_start_index,
+        actual_end_index,
         ready_count,
+        flat_count,
         failed_count,
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
         cells,
     }
+}
+
+fn measure_cell_pixels(
+    thumbnail: &super::seek_strip_thumbs::StripThumbnail,
+) -> Result<CellPixelStats, String> {
+    let pixel_count = (thumbnail.width as usize)
+        .checked_mul(thumbnail.height as usize)
+        .ok_or_else(|| "pixel count overflow".to_string())?;
+    let expected_len = pixel_count
+        .checked_mul(4)
+        .ok_or_else(|| "RGBA byte count overflow".to_string())?;
+    if pixel_count == 0 || thumbnail.rgba.len() != expected_len {
+        return Err(format!(
+            "expected {} RGBA bytes for {}x{}, got {}",
+            expected_len,
+            thumbnail.width,
+            thumbnail.height,
+            thumbnail.rgba.len()
+        ));
+    }
+
+    let mut luminance_sum = 0.0;
+    let mut luminance_squared_sum = 0.0;
+    let mut minimum = [u8::MAX; 3];
+    let mut maximum = [u8::MIN; 3];
+    for pixel in thumbnail.rgba.chunks_exact(4) {
+        let luminance = 0.2126 * f64::from(pixel[0])
+            + 0.7152 * f64::from(pixel[1])
+            + 0.0722 * f64::from(pixel[2]);
+        luminance_sum += luminance;
+        luminance_squared_sum += luminance * luminance;
+        for channel in 0..3 {
+            minimum[channel] = minimum[channel].min(pixel[channel]);
+            maximum[channel] = maximum[channel].max(pixel[channel]);
+        }
+    }
+    let sample_count = pixel_count as f64;
+    let mean_luminance = luminance_sum / sample_count;
+    let luminance_variance =
+        (luminance_squared_sum / sample_count - mean_luminance * mean_luminance).max(0.0);
+    let maximum_channel_range = (0..3)
+        .map(|channel| maximum[channel] - minimum[channel])
+        .max()
+        .unwrap_or_default();
+    Ok(CellPixelStats {
+        mean_luminance,
+        luminance_variance,
+        maximum_channel_range,
+    })
 }
 
 fn worker_status_failure(status: &StripThumbnailWorkerStatus) -> Option<String> {
@@ -923,16 +1062,43 @@ mod tests {
     }
 
     #[test]
-    fn window_positions_cover_first_quarters_and_last_full_window() {
+    fn window_positions_anchor_the_true_first_and_final_cells() {
         let axis = StripAxis::TimeGrid {
             interval_secs: 1.0,
             duration_secs: 100.0,
         };
-        let starts: Vec<_> = window_positions(&axis, 11)
+        let centers: Vec<_> = window_positions(&axis)
             .into_iter()
-            .map(|(_, start)| start)
+            .map(|(_, center)| center)
             .collect();
-        assert_eq!(starts, vec![0, 22, 45, 67, 89]);
+        assert_eq!(centers, vec![0.0, 24.75, 49.5, 74.25, 99.0]);
+
+        let first = verification_window_range(&axis, centers[0], 11);
+        let final_cells = verification_window_range(&axis, centers[4], 11);
+        assert_eq!(first.start(), &0);
+        assert_eq!(final_cells.end(), &(axis.cell_count() - 1));
+        assert!(final_cells.contains(&(axis.cell_count() - 4)));
+    }
+
+    #[test]
+    fn pixel_measurement_flags_only_effectively_flat_single_colour_cells() {
+        let flat = super::super::seek_strip_thumbs::StripThumbnail {
+            target_secs: 0.0,
+            width: 2,
+            height: 2,
+            rgba: Arc::new(vec![
+                16, 32, 48, 255, 16, 32, 48, 255, 16, 32, 48, 255, 16, 32, 48, 255,
+            ]),
+        };
+        let flat_stats = measure_cell_pixels(&flat).unwrap();
+        assert!(flat_stats.effectively_flat());
+        assert_eq!(flat_stats.maximum_channel_range, 0);
+
+        let detailed = super::super::seek_strip_thumbs::StripThumbnail {
+            rgba: Arc::new(vec![0, 0, 0, 255, 8, 0, 0, 255, 0, 8, 0, 255, 0, 0, 8, 255]),
+            ..flat
+        };
+        assert!(!measure_cell_pixels(&detailed).unwrap().effectively_flat());
     }
 
     #[test]

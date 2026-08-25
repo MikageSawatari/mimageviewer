@@ -2580,6 +2580,24 @@ mod tests {
             .ok()
             .map(|value| value.parse().expect("probe center must be seconds"))
             .unwrap_or(duration_secs * 0.5);
+        let center_sequence_secs = std::env::var("MIV_STRIP_THUMB_PROBE_CENTER_SEQUENCE_SECS")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|part| {
+                        part.trim()
+                            .parse::<f64>()
+                            .expect("probe center sequence must contain seconds")
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|sequence| !sequence.is_empty())
+            .unwrap_or_else(|| vec![center_time_secs]);
+        let request_delay_ms = std::env::var("MIV_STRIP_THUMB_PROBE_REQUEST_DELAY_MS")
+            .ok()
+            .map(|value| value.parse().expect("request delay must be milliseconds"))
+            .unwrap_or(0_u64);
         let visible_count = std::env::var("MIV_STRIP_THUMB_PROBE_VISIBLE_COUNT")
             .ok()
             .map(|value| value.parse().expect("visible count must be an integer"))
@@ -2588,14 +2606,19 @@ mod tests {
             .ok()
             .map(|value| value != "0")
             .unwrap_or(true);
-        let lookahead = StripLookahead::new(visible_count / 2, visible_count - visible_count / 2);
+        let minimum_gap_secs = std::env::var("MIV_STRIP_THUMB_PROBE_MIN_GAP_SECS")
+            .ok()
+            .map(|value| value.parse().expect("minimum gap must be seconds"))
+            .unwrap_or(crate::settings::VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS);
+        let balanced_lookahead =
+            StripLookahead::new(visible_count / 2, visible_count - visible_count / 2);
         let fallback_interval_secs = crate::ui_video_tile::pick_interval(duration_secs, 240);
         let worker = SeekStripThumbnailWorker::spawn(
             path.clone(),
             hw_decode,
             None,
             duration_secs,
-            2.0,
+            minimum_gap_secs,
             fallback_interval_secs,
         );
 
@@ -2628,19 +2651,83 @@ mod tests {
             let keyframes = enumerate_index_keyframes(&mut indexed_input, stream_index, time_base)
                 .expect("probe video must expose an index")
                 .keyframes;
-            let adopted = thin_keyframes(&keyframes, 2.0);
+            let adopted = thin_keyframes(&keyframes, minimum_gap_secs);
             Arc::new(StripAxis::KeyframeIndex { keyframes, adopted })
         } else {
             axis
         };
+        if let Some(warmup_center_secs) = std::env::var("MIV_STRIP_THUMB_PROBE_WARMUP_CENTER_SECS")
+            .ok()
+            .map(|value| value.parse::<f64>().expect("warmup center must be seconds"))
+        {
+            let warmup_center_index = axis
+                .center_index_for_time(warmup_center_secs)
+                .expect("probe warmup center must map onto the strip axis");
+            let warmup_work = plan_strip_window_work(
+                &axis,
+                StripWindowSpec::new(warmup_center_index, visible_count, balanced_lookahead),
+                &BTreeSet::new(),
+            );
+            worker
+                .request(
+                    Arc::clone(&axis),
+                    warmup_center_index,
+                    visible_count,
+                    balanced_lookahead,
+                )
+                .expect("worker warmup request must be accepted");
+            loop {
+                let snapshot = worker.snapshot();
+                if warmup_work
+                    .cache_lookup
+                    .iter()
+                    .all(|cell| snapshot.cells.contains_key(&cell.id))
+                {
+                    break;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(60),
+                    "thumbnail warmup timed out"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let center_time_secs = *center_sequence_secs
+            .last()
+            .expect("probe center sequence must not be empty");
         let center_index = axis
             .center_index_for_time(center_time_secs)
             .expect("probe center must map onto the strip axis");
-        let spec = StripWindowSpec::new(center_index, visible_count, lookahead);
+        let previous_center_index = center_sequence_secs
+            .iter()
+            .rev()
+            .nth(1)
+            .and_then(|center| axis.center_index_for_time(*center));
+        let final_lookahead = match previous_center_index {
+            Some(previous) if center_index > previous => StripLookahead::new(0, visible_count),
+            Some(previous) if center_index < previous => StripLookahead::new(visible_count, 0),
+            _ => balanced_lookahead,
+        };
+        let spec = StripWindowSpec::new(center_index, visible_count, final_lookahead);
         let work = plan_strip_window_work(&axis, spec, &BTreeSet::new());
-        worker
-            .request(Arc::clone(&axis), center_index, visible_count, lookahead)
-            .expect("worker request must be accepted");
+        let mut previous_center_index = None;
+        for (sequence_index, center_time_secs) in center_sequence_secs.iter().copied().enumerate() {
+            let center_index = axis
+                .center_index_for_time(center_time_secs)
+                .expect("probe sequence center must map onto the strip axis");
+            let lookahead = match previous_center_index {
+                Some(previous) if center_index > previous => StripLookahead::new(0, visible_count),
+                Some(previous) if center_index < previous => StripLookahead::new(visible_count, 0),
+                _ => balanced_lookahead,
+            };
+            worker
+                .request(Arc::clone(&axis), center_index, visible_count, lookahead)
+                .expect("worker request must be accepted");
+            previous_center_index = Some(center_index);
+            if sequence_index + 1 < center_sequence_secs.len() && request_delay_ms > 0 {
+                std::thread::sleep(Duration::from_millis(request_delay_ms));
+            }
+        }
 
         let snapshot = loop {
             let snapshot = worker.snapshot();
@@ -2701,7 +2788,37 @@ mod tests {
         cells.sort_by_key(|cell| cell.index);
         for cell in cells {
             let outcome = match snapshot.cells.get(&cell.id) {
-                Some(StripThumbnailOutcome::Ready(_)) => "ready".to_string(),
+                Some(StripThumbnailOutcome::Ready(thumbnail)) => {
+                    let mut minimum = [u8::MAX; 3];
+                    let mut maximum = [u8::MIN; 3];
+                    let mut alpha_minimum = u8::MAX;
+                    let mut alpha_maximum = u8::MIN;
+                    let mut sum = 0.0;
+                    let mut squared_sum = 0.0;
+                    for pixel in thumbnail.rgba.chunks_exact(4) {
+                        let luminance = 0.2126 * f64::from(pixel[0])
+                            + 0.7152 * f64::from(pixel[1])
+                            + 0.0722 * f64::from(pixel[2]);
+                        sum += luminance;
+                        squared_sum += luminance * luminance;
+                        for channel in 0..3 {
+                            minimum[channel] = minimum[channel].min(pixel[channel]);
+                            maximum[channel] = maximum[channel].max(pixel[channel]);
+                        }
+                        alpha_minimum = alpha_minimum.min(pixel[3]);
+                        alpha_maximum = alpha_maximum.max(pixel[3]);
+                    }
+                    let samples = (thumbnail.width as usize * thumbnail.height as usize) as f64;
+                    let mean = sum / samples;
+                    let variance = (squared_sum / samples - mean * mean).max(0.0);
+                    let maximum_channel_range = (0..3)
+                        .map(|channel| maximum[channel] - minimum[channel])
+                        .max()
+                        .unwrap_or_default();
+                    format!(
+                        "ready mean_luma={mean:.3} luma_variance={variance:.6} max_channel_range={maximum_channel_range} alpha={alpha_minimum}..={alpha_maximum}"
+                    )
+                }
                 Some(StripThumbnailOutcome::Failed(failure)) => {
                     format!("failed {failure:?}")
                 }

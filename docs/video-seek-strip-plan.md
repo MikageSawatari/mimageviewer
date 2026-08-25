@@ -586,20 +586,29 @@ enum SeekRowGesture {
 - 波形: pre-roll を捨てた bins が、全尺解析の同区間と一致すること (許容誤差内)。
 - 実素材の手動診断は ignored test `probe_app_thumbnail_worker_window_from_env` に
   `MIV_STRIP_THUMB_PROBE_PATH` を渡す。任意で `MIV_STRIP_THUMB_PROBE_CENTER_SECS`、
-  `MIV_STRIP_THUMB_PROBE_VISIBLE_COUNT`、`MIV_STRIP_THUMB_PROBE_HW=0|1` を指定し、各セルの
-  typed failure、実 decode path、software retry の trigger、実アプリと同じ fallback interval と
-  raw / adopted spacing を出す。axis 判定だけを切り分ける場合は
+  `MIV_STRIP_THUMB_PROBE_CENTER_SEQUENCE_SECS`、`MIV_STRIP_THUMB_PROBE_REQUEST_DELAY_MS`、
+  `MIV_STRIP_THUMB_PROBE_WARMUP_CENTER_SECS`、`MIV_STRIP_THUMB_PROBE_VISIBLE_COUNT`、
+  `MIV_STRIP_THUMB_PROBE_MIN_GAP_SECS`、`MIV_STRIP_THUMB_PROBE_HW=0|1` を指定し、各セルの
+  typed failure、実 decode path、software retry の trigger、実アプリと同じ方向付き lookahead、
+  fallback interval と raw / adopted spacing、および ready pixel の平均輝度・輝度分散・RGB channel
+  range・alpha range を出す。axis 判定だけを切り分ける場合は
   `MIV_STRIP_THUMB_PROBE_FORCE_INDEX=1` で列挙済み index を強制できる。
 - 全ライブラリの回帰確認は production の SeekStripThumbnailWorker と axis resolver を直接使う
   seek_strip_batch を使う。
   cargo run --profile dev-runtime --features dev-tools --bin seek_strip_batch -- folder...
-  で mIV 対応動画拡張子だけを再帰走査し、各ファイルの先頭 / 25% / 50% / 75% / 最終 full window
-  を検証する。--limit N、差分比較用 --json、SW 固定の --software を持つ。1 行 summary の後、
-  failed file だけ axis reason と全 cell time / outcome / failure reason を詳記し、failed cell または
-  scan error があれば非 0 で終了する。JSON には schema version と ready cell を含む全 cell time を
+  で mIV 対応動画拡張子だけを再帰走査する。0% / 25% / 50% / 75% / 100% のセルを中心に production
+  window を要求し、特に先頭セルと真の最終セルを同じ center 経路で検証する。--limit N、差分比較用
+  --json、SW 固定の --software を持つ。各 ready pixel は BT.709 luma (0..255) の平均・母分散と、
+  R/G/B 各 channel の最大 range を測る。輝度分散 <= 1.0 かつ最大 channel range <= 4 のセルは
+  `flat` として ready / failed から独立して報告する。この条件は単色に近い出力をレビュー対象へ
+  挙げるだけで、不具合とは断定しない。実際の黒フレーム、fade、単色 title card も一致し得る。
+  1 行 summary の後、failed / flat file は axis reason、全 cell time / outcome / failure reason / pixel
+  統計を詳記する。failed cell または scan error があれば非 0 で終了するが、flat だけでは失敗に
+  しない。JSON schema v3 には判定式と閾値、ready / flat cell を含む全 cell time と pixel 統計を
   保存する。open 不可、video stream 無し、duration 不明は decode window を開始せず `skip`、raw GOP
   上限超過は decoder unopened の `unavailable` とする。検査前に size + head/tail 8 KiB sample hash が
-  既検査 path と一致すれば `duplicate` と一致先 path を記録する。5 outcome は summary でも別集計する。
+  既検査 path と一致すれば `duplicate` と一致先 path を記録する。pass / flat / fail / skip /
+  unavailable / duplicate の 6 outcome は summary でも別集計する。
 
 ### perf 計装
 

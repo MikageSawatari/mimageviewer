@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use mimageviewer::video::seek_strip_batch::{
     AxisReport, BatchOptions, BatchReport, CellState, DuplicateDetector, FileReport,
-    discover_video_files, verify_file,
+    FlatCellCriterion, discover_video_files, verify_file,
 };
 
 struct Cli {
@@ -45,6 +45,7 @@ fn main() -> ExitCode {
                 ""
             }
         );
+        print_flat_criterion(&FlatCellCriterion::default());
         for issue in &discovery.issues {
             println!("SCAN-ERROR {}: {}", issue.path, issue.reason);
         }
@@ -82,15 +83,17 @@ fn main() -> ExitCode {
         }
         println!();
     } else {
-        print_failure_details(&report);
+        print_cell_findings(&report);
         println!(
-            "SUMMARY total={} pass={} fail={} unavailable={} skip={} duplicate={} failed_cells={} elapsed={:.1}s",
+            "SUMMARY total={} pass={} flat={} fail={} unavailable={} skip={} duplicate={} flat_cells={} failed_cells={} elapsed={:.1}s",
             report.files.len(),
             report.passed_files,
+            report.flat_files,
             report.failed_files,
             report.unavailable_files,
             report.skipped_files,
             report.duplicate_files,
+            report.flat_cells,
             report.failed_cells,
             report.elapsed_ms / 1000.0,
         );
@@ -233,20 +236,26 @@ fn print_file_summary(file: &FileReport) {
         );
         return;
     }
-    let state = if file.passed() { "PASS" } else { "FAIL" };
+    let state = if file.verification_failed() {
+        "FAIL"
+    } else if file.flagged_for_review() {
+        "FLAT"
+    } else {
+        "PASS"
+    };
     let windows = file
         .windows
         .iter()
         .map(|window| {
             format!(
-                "{}:{}/{}",
-                window.name, window.ready_count, window.failed_count
+                "{}:{}/{}/{}",
+                window.name, window.ready_count, window.flat_count, window.failed_count
             )
         })
         .collect::<Vec<_>>()
         .join(",");
     println!(
-        "{state} {} axis={} reason={} index={} coverage={} monotonic={} max_raw_gap={} adopted={} spacing={} decode={} windows=[{}]",
+        "{state} {} axis={} reason={} index={} coverage={} monotonic={} max_raw_gap={} adopted={} spacing={} decode={} windows=[ready/flat/failed {}]",
         file.path,
         axis.kind,
         axis.reason_code,
@@ -263,18 +272,19 @@ fn print_file_summary(file: &FileReport) {
     );
 }
 
-fn print_failure_details(report: &BatchReport) {
-    let failures: Vec<_> = report
+fn print_cell_findings(report: &BatchReport) {
+    let findings: Vec<_> = report
         .files
         .iter()
-        .filter(|file| file.verification_failed())
+        .filter(|file| file.verification_failed() || file.flagged_for_review())
         .collect();
-    if failures.is_empty() {
+    if findings.is_empty() {
         return;
     }
     println!();
-    println!("FAILURE DETAILS");
-    for file in failures {
+    println!("CELL FINDINGS");
+    print_flat_criterion(&report.flat_cell_criterion);
+    for file in findings {
         println!("{}", file.path);
         if let Some(axis) = &file.axis {
             println!(
@@ -297,25 +307,40 @@ fn print_failure_details(report: &BatchReport) {
         if let Some(error) = &file.file_error {
             println!("  file_error={error}");
         }
-        for window in file.windows.iter().filter(|window| window.failed_count > 0) {
+        for window in file
+            .windows
+            .iter()
+            .filter(|window| window.failed_count > 0 || window.flat_count > 0)
+        {
             println!(
-                "  window={} range={}..={} ready={} failed={}",
+                "  window={} center={:.3} range={}..={} ready={} flat={} failed={}",
                 window.name,
+                window.requested_center_index,
                 window.actual_start_index,
                 window.actual_end_index,
                 window.ready_count,
+                window.flat_count,
                 window.failed_count,
             );
             for cell in &window.cells {
                 println!(
-                    "    cell={} time={:.6}s state={}{}",
+                    "    cell={} time={:.6}s state={}{}{}",
                     cell.index,
                     cell.time_secs,
-                    if cell.state == CellState::Ready {
-                        "ready"
-                    } else {
-                        "failed"
+                    match cell.state {
+                        CellState::Ready => "ready",
+                        CellState::Flat => "flat",
+                        CellState::Failed => "failed",
                     },
+                    cell.pixels
+                        .as_ref()
+                        .map(|pixels| format!(
+                            " mean_luma={:.3} luma_variance={:.6} max_channel_range={}",
+                            pixels.mean_luminance,
+                            pixels.luminance_variance,
+                            pixels.maximum_channel_range,
+                        ))
+                        .unwrap_or_default(),
                     cell.failure
                         .as_deref()
                         .map(|failure| format!(" reason={failure}"))
@@ -324,6 +349,13 @@ fn print_failure_details(report: &BatchReport) {
             }
         }
     }
+}
+
+fn print_flat_criterion(criterion: &FlatCellCriterion) {
+    println!(
+        "FLAT-CELL RULE luminance={} variance<={:.3} max_rgb_channel_range<={} outcome=report-for-review (real fades, black frames, or flat title cards can match)",
+        criterion.luminance, criterion.maximum_luminance_variance, criterion.maximum_channel_range,
+    );
 }
 
 fn format_monotonic(axis: &AxisReport) -> &'static str {
