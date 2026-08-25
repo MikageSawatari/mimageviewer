@@ -1,5 +1,6 @@
 use proc_macro2::Span;
-use std::collections::{BTreeSet, HashMap};
+use quote::ToTokens;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fmt::{self, Write as _};
 use std::fs;
@@ -10,7 +11,7 @@ use syn::visit::{self, Visit};
 use syn::{
     Attribute, Expr, ExprAssign, ExprCall, ExprField, ExprMethodCall, ExprReference, FieldPat,
     File, ForeignItem, ImplItem, Item, ItemFn, Member, Pat, PatStruct, ReturnType, Signature,
-    TraitItem, Type, UseTree,
+    TraitItem, Type, UseTree, Visibility,
 };
 
 const REGISTRY_PATH: &str = "src/app/viewer_context_registry.rs";
@@ -22,7 +23,9 @@ enum Rule {
     A2a,
     A2b,
     A3,
+    A4,
     A5,
+    A6,
     A7a,
     A7b,
     A7c,
@@ -38,7 +41,9 @@ impl fmt::Display for Rule {
             Self::A2a => "A2a",
             Self::A2b => "A2b",
             Self::A3 => "A3",
+            Self::A4 => "A4",
             Self::A5 => "A5",
+            Self::A6 => "A6",
             Self::A7a => "A7(a)",
             Self::A7b => "A7(b)",
             Self::A7c => "A7(c)",
@@ -105,6 +110,75 @@ const ALLOWLIST_ENTRIES: &[AllowlistEntry] = &[
         rule: Rule::A2b,
         reason: "Takes, index-shifts, and immediately reassigns per-item maps after batch deletion; every value stays in the same mounted context and the temporary ownership exists only to transform keys in place.",
     },
+];
+
+// A4 excludes cfg(test)-gated API and freezes only the production registry surface below.
+// The ownership design named a viewer_context_registry::test_access namespace that was never
+// implemented. A6 is therefore deliberately defined against the implementation that exists:
+// cfg(test)-gated App methods/functions ending in _for_test, plus their call sites.
+const PUBLIC_API_ALLOWLIST: &[&str] = &[
+    "item struct pub (crate) struct ViewerContextId () ;",
+    "inherent fn    ViewerContextId ::  pub (in crate :: app) fn serial (self) -> u64",
+    "item enum pub (crate) enum ContextResidence { Mounted , AtRest , Building , Retiring , Retired , Unknown , }",
+    "item enum pub (in crate :: app) enum ForkPolicy { LiveMediaPark { window_id : u64 } , MaterializedStillOpen , }",
+    "item enum pub (in crate :: app) enum BindError { WindowOwnedBy (ViewerContextId) , ContextOwnedBy (u64) , WrongOrigin (Option < ViewerContextId >) , NotBindable (ContextResidence) , }",
+    "item struct pub (crate) struct MountError { pub (crate) id : ViewerContextId , pub (crate) residence : ContextResidence }",
+    "item enum pub (in crate :: app) enum RetireError { Building , NotAtRest (ContextResidence) , IsMain , }",
+    "item struct # [cfg (windows)] pub (in crate :: app) struct ViewerContextRegistry { }",
+    "inherent fn # [cfg (windows)]   ViewerContextRegistry ::  pub (in crate :: app) fn new () -> Self",
+    "item enum # [cfg (windows)] pub (in crate :: app) enum BuildOutcome { Commit , Abort (& 'static str) , }",
+    "item enum # [cfg (windows)] pub (in crate :: app) enum RetireContextError { Mount (MountError) , Retire (RetireError) , }",
+    "item struct # [cfg (windows)] pub (in crate :: app) struct ViewerContextBundle { }",
+    "item struct # [cfg (windows)] pub (in crate :: app) struct ContextRef < 'a > { }",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn mounted (app : & 'a App) -> Self",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn at_rest (bundle : & 'a ViewerContextBundle) -> Self",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn fullscreen_idx (self) -> Option < usize >",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn items (self) -> & 'a [GridItem]",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn fs_cache (self) -> & 'a ItemsGenerationMap < FsCacheEntry >",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn viewer_session_last_sync_stamp (self) -> Option < & 'a ViewerSyncStamp >",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn viewer_session_detached_window_id (self) -> Option < u64 >",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn pdf_password_request (self) -> Option < & 'a PdfPasswordRequest >",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn current_folder (self) -> Option < & 'a Path >",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn items_generation (self) -> u64",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn video_audio_mode (self) -> Option < usize >",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn video_audio_vst (self) -> Option < & 'a VideoAudioVstState >",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn vst3_deferred_media_open (self) -> Option < usize >",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn fs_lanczos_cache (self) -> & 'a crate :: gpu_lanczos :: GpuLanczosCache",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn selected (self) -> Option < usize >",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn bookmark_view_state (self) -> Option < & 'a BookmarkViewState >",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn archive_source_override (self) -> Option < & 'a Path >",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn music_bookmarks (self) -> & 'a [crate :: video_bookmarks :: VideoBookmarkMeta]",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn music_bookmarks_loaded (self) -> bool",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn normalize_ui_state (self , idx : usize ,) -> Option < crate :: video :: normalize_types :: NormalizeUiState >",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn final_ai_pending_job_id (self , key : & FinalAiKey) -> Option < u64 >",
+    "item struct # [cfg (windows)] pub (in crate :: app) struct ContextMut < 'a > { }",
+    "inherent fn # [cfg (windows)]   ContextMut < '_ > ::  pub (in crate :: app) fn as_ref (& self) -> ContextRef < '_ >",
+    "inherent fn # [cfg (windows)]   ContextMut < '_ > ::  pub (in crate :: app) fn clear_normalize_state (& mut self)",
+    "inherent fn    App :: # [cfg (windows)] pub (in crate :: app) fn pause_mounted_background_work_keep_current_frame (& mut self)",
+    "inherent fn    App :: # [cfg (windows)] pub (in crate :: app) fn activate_mounted_as_independent_detached (& mut self , window_id : u64)",
+    "inherent fn    App :: # [cfg (windows)] pub (in crate :: app) fn become_mounted_independent_detached_viewer (& mut self , window_id : u64 , idx : usize ,)",
+    "inherent fn    App :: # [cfg (windows)] pub (in crate :: app) fn swap_viewer_context_bundle (& mut self , bundle : & mut ViewerContextBundle)",
+    "inherent fn    App :: # [cfg (windows)] pub (in crate :: app) fn split_current_context_preserving_main_grid (& mut self ,) -> Box < ViewerContextBundle >",
+    "inherent fn    App :: # [cfg (windows)] pub (in crate :: app) fn split_materialized_physical_context_for_detached_scope (& mut self , physical_context : & Path , idx : usize , items_generation : u64 ,) -> Box < ViewerContextBundle >",
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_main (& self) -> ViewerContextId",
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn mounted_viewer_context_id (& self) -> Option < ViewerContextId >",
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn projected_viewer_context_id (& self) -> ViewerContextId",
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_residence (& self , id : ViewerContextId) -> ContextResidence",
+    "inherent fn # [cfg (windows)]   App ::  pub (crate) fn locate_window_context (& self , window_id : u64 ,) -> Option < (ViewerContextId , ContextResidence) >",
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_window (& self , id : ViewerContextId) -> Option < u64 >",
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_ids (& self) -> Vec < ViewerContextId >",
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn with_viewer_context_ref < R > (& self , id : ViewerContextId , f : impl FnOnce (ContextRef < '_ >) -> R ,) -> Option < R >",
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn bind_window (& mut self , id : ViewerContextId , window_id : u64 ,) -> Result < () , BindError >",
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn unbind_window (& mut self , window_id : u64) -> Option < ViewerContextId >",
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn reserve_window_binding_for_build (& mut self , window_id : u64)",
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn with_viewer_context < R > (& mut self , id : ViewerContextId , f : impl FnOnce (& mut Self) -> R ,) -> Result < R , MountError >",
+    "inherent fn # [cfg (windows)]   App ::  pub (crate) fn with_window_viewer_context < R > (& mut self , window_id : u64 , f : impl FnOnce (& mut Self) -> R ,) -> Result < R , MountError >",
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn build_viewer_context (& mut self , reason : & 'static str , f : impl FnOnce (& mut Self , ViewerContextId) -> BuildOutcome ,) -> Option < ViewerContextId >",
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn fork_mounted_live_media_context (& mut self , window_id : u64 ,) -> ViewerContextId",
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn fork_materialized_still_context (& mut self , physical_context : & Path , idx : usize ,) -> ViewerContextId",
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn retire_context < D > (& mut self , id : ViewerContextId , _reason : & 'static str , digest : impl FnOnce (ContextMut < '_ >) -> D ,) -> Result < D , RetireError >",
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn close_and_retire_context < D > (& mut self , id : ViewerContextId , reason : & 'static str , finish : impl FnOnce (& mut Self) , digest : impl FnOnce (ContextMut < '_ >) -> D ,) -> Result < D , RetireContextError >",
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn stash_mounted_and_start_fresh (& mut self , _reason : & 'static str ,) -> ViewerContextId",
 ];
 
 const KNOWN_FINDINGS: &[KnownFindingEntry] = &[KnownFindingEntry {
@@ -202,7 +276,7 @@ fn audit_repository(root: &Path, use_allowlist: bool) -> Result<AuditReport, Str
     collect_rust_files(&root.join("src"), &mut files)?;
     files.sort();
 
-    let mut violations = Vec::new();
+    let mut violations = audit_public_api(&registry_source, PUBLIC_API_ALLOWLIST)?;
     for path in files {
         let relative = relative_path(root, &path)?;
         let source = fs::read_to_string(&path)
@@ -212,6 +286,10 @@ fn audit_repository(root: &Path, use_allowlist: bool) -> Result<AuditReport, Str
             &source,
             &bundle_fields,
             relative == REGISTRY_PATH,
+        )?);
+        violations.extend(analyze_test_api(
+            &relative,
+            &source,
             relative == APP_TESTS_PATH,
         )?);
     }
@@ -404,7 +482,7 @@ fn render_report(report: AuditReport) -> CommandOutput {
         if report.violations.is_empty() {
             writeln!(
                 text,
-                "viewer context audit: {} known finding(s); no untracked violations",
+                "viewer context audit: rules A1/A2a/A2b/A3/A4/A5/A6/A7 enabled; {} known finding(s); no untracked violations",
                 report.known_findings.len()
             )
             .expect("writing to String cannot fail");
@@ -422,6 +500,430 @@ fn render_report(report: AuditReport) -> CommandOutput {
         exit_code: u8::from(!report.violations.is_empty()),
         text,
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ApiFingerprint {
+    text: String,
+    line: usize,
+}
+
+fn audit_public_api(source: &str, allowlist: &[&str]) -> Result<Vec<Violation>, String> {
+    let actual = extract_public_api_fingerprints(source)?;
+    let expected = allowlist
+        .iter()
+        .map(|fingerprint| (*fingerprint).to_owned())
+        .collect::<BTreeSet<_>>();
+    if expected.len() != allowlist.len() {
+        return Err("A4 public API allowlist contains duplicate fingerprints".into());
+    }
+
+    let actual_by_text = actual
+        .into_iter()
+        .map(|fingerprint| (fingerprint.text.clone(), fingerprint))
+        .collect::<BTreeMap<_, _>>();
+    let actual_text = actual_by_text.keys().cloned().collect::<BTreeSet<_>>();
+    let mut violations = Vec::new();
+    for unexpected in actual_text.difference(&expected) {
+        let fingerprint = &actual_by_text[unexpected];
+        violations.push(Violation {
+            rule: Rule::A4,
+            file: REGISTRY_PATH.to_owned(),
+            function: "<public-api>".into(),
+            line: fingerprint.line,
+            message: format!("unexpected public API fingerprint: {unexpected}"),
+        });
+    }
+    for missing in expected.difference(&actual_text) {
+        violations.push(Violation {
+            rule: Rule::A4,
+            file: REGISTRY_PATH.to_owned(),
+            function: "<public-api>".into(),
+            line: 1,
+            message: format!("allowlisted public API fingerprint is missing: {missing}"),
+        });
+    }
+    Ok(violations)
+}
+
+fn extract_public_api_fingerprints(source: &str) -> Result<Vec<ApiFingerprint>, String> {
+    let file = syn::parse_file(source)
+        .map_err(|error| format!("cannot parse {REGISTRY_PATH} for A4: {error}"))?;
+    let public_types = file
+        .items
+        .iter()
+        .filter_map(public_type_name)
+        .collect::<BTreeSet<_>>();
+    let mut fingerprints = Vec::new();
+
+    for item in &file.items {
+        if item_attributes(item).iter().any(cfg_implies_test_attribute) {
+            continue;
+        }
+        match item {
+            Item::Fn(item) if visibility_is_public(&item.vis) => {
+                fingerprints.push(ApiFingerprint {
+                    text: format!(
+                        "item fn {} {} {}",
+                        relevant_attributes(&item.attrs),
+                        token_string(&item.vis),
+                        token_string(&item.sig)
+                    ),
+                    line: item.sig.ident.span().start().line,
+                })
+            }
+            Item::Struct(item) if visibility_is_public(&item.vis) => {
+                let mut public = item.clone();
+                public.attrs.retain(is_api_attribute);
+                match &mut public.fields {
+                    syn::Fields::Named(fields) => {
+                        fields.named = fields
+                            .named
+                            .clone()
+                            .into_iter()
+                            .filter(|field| visibility_is_public(&field.vis))
+                            .map(|mut field| {
+                                field.attrs.retain(is_api_attribute);
+                                field
+                            })
+                            .collect();
+                    }
+                    syn::Fields::Unnamed(fields) => {
+                        fields.unnamed = fields
+                            .unnamed
+                            .clone()
+                            .into_iter()
+                            .filter(|field| visibility_is_public(&field.vis))
+                            .map(|mut field| {
+                                field.attrs.retain(is_api_attribute);
+                                field
+                            })
+                            .collect();
+                    }
+                    syn::Fields::Unit => {}
+                }
+                fingerprints.push(ApiFingerprint {
+                    text: format!("item struct {}", token_string(&public)),
+                    line: item.ident.span().start().line,
+                });
+            }
+            Item::Enum(item) if visibility_is_public(&item.vis) => {
+                let mut public = item.clone();
+                public.attrs.retain(is_api_attribute);
+                for variant in &mut public.variants {
+                    variant.attrs.retain(is_api_attribute);
+                    for field in &mut variant.fields {
+                        field.attrs.retain(is_api_attribute);
+                    }
+                }
+                fingerprints.push(ApiFingerprint {
+                    text: format!("item enum {}", token_string(&public)),
+                    line: item.ident.span().start().line,
+                });
+            }
+            Item::Union(item) if visibility_is_public(&item.vis) => {
+                let mut public = item.clone();
+                public.attrs.retain(is_api_attribute);
+                public.fields.named = public
+                    .fields
+                    .named
+                    .clone()
+                    .into_iter()
+                    .filter(|field| visibility_is_public(&field.vis))
+                    .map(|mut field| {
+                        field.attrs.retain(is_api_attribute);
+                        field
+                    })
+                    .collect();
+                fingerprints.push(ApiFingerprint {
+                    text: format!("item union {}", token_string(&public)),
+                    line: item.ident.span().start().line,
+                });
+            }
+            Item::Type(item) if visibility_is_public(&item.vis) => {
+                let mut public = item.clone();
+                public.attrs.retain(is_api_attribute);
+                fingerprints.push(ApiFingerprint {
+                    text: format!("item type {}", token_string(&public)),
+                    line: item.ident.span().start().line,
+                });
+            }
+            Item::TraitAlias(item) if visibility_is_public(&item.vis) => {
+                let mut public = item.clone();
+                public.attrs.retain(is_api_attribute);
+                fingerprints.push(ApiFingerprint {
+                    text: format!("item trait-alias {}", token_string(&public)),
+                    line: item.ident.span().start().line,
+                });
+            }
+            Item::Trait(item) if visibility_is_public(&item.vis) => {
+                let mut public = item.clone();
+                public.attrs.retain(is_api_attribute);
+                fingerprints.push(ApiFingerprint {
+                    text: format!("item trait {}", token_string(&public)),
+                    line: item.ident.span().start().line,
+                });
+            }
+            Item::Const(item) if visibility_is_public(&item.vis) => {
+                let mut public = item.clone();
+                public.attrs.retain(is_api_attribute);
+                fingerprints.push(ApiFingerprint {
+                    text: format!("item const {}", token_string(&public)),
+                    line: item.ident.span().start().line,
+                });
+            }
+            Item::Static(item) if visibility_is_public(&item.vis) => {
+                let mut public = item.clone();
+                public.attrs.retain(is_api_attribute);
+                fingerprints.push(ApiFingerprint {
+                    text: format!("item static {}", token_string(&public)),
+                    line: item.ident.span().start().line,
+                });
+            }
+            Item::Use(item) if visibility_is_public(&item.vis) => {
+                let mut public = item.clone();
+                public.attrs.retain(is_api_attribute);
+                fingerprints.push(ApiFingerprint {
+                    text: format!("item use {}", token_string(&public)),
+                    line: item.span().start().line,
+                });
+            }
+            Item::ExternCrate(item) if visibility_is_public(&item.vis) => {
+                let mut public = item.clone();
+                public.attrs.retain(is_api_attribute);
+                fingerprints.push(ApiFingerprint {
+                    text: format!("item extern-crate {}", token_string(&public)),
+                    line: item.ident.span().start().line,
+                });
+            }
+            Item::Mod(item) if visibility_is_public(&item.vis) => {
+                let mut public = item.clone();
+                public.attrs.retain(is_api_attribute);
+                fingerprints.push(ApiFingerprint {
+                    text: format!("item mod {}", token_string(&public)),
+                    line: item.ident.span().start().line,
+                });
+            }
+            Item::ForeignMod(item) => {
+                for foreign in &item.items {
+                    if foreign_item_visibility(foreign).is_some_and(visibility_is_public) {
+                        fingerprints.push(ApiFingerprint {
+                            text: format!(
+                                "foreign {} {}",
+                                relevant_attributes(foreign_item_attributes(foreign)),
+                                token_string(foreign)
+                            ),
+                            line: foreign.span().start().line,
+                        });
+                    }
+                }
+            }
+            Item::Macro(item)
+                if item
+                    .attrs
+                    .iter()
+                    .any(|attr| attr.path().is_ident("macro_export")) =>
+            {
+                let mut public = item.clone();
+                public.attrs.retain(is_api_attribute);
+                fingerprints.push(ApiFingerprint {
+                    text: format!("item macro {}", token_string(&public)),
+                    line: item.span().start().line,
+                });
+            }
+            Item::Impl(item) => {
+                collect_impl_api(item, &public_types, &mut fingerprints);
+            }
+            _ => {}
+        }
+    }
+    fingerprints.sort_by(|left, right| left.text.cmp(&right.text));
+    Ok(fingerprints)
+}
+
+fn public_type_name(item: &Item) -> Option<String> {
+    match item {
+        Item::Enum(item) if visibility_is_public(&item.vis) => Some(item.ident.to_string()),
+        Item::Struct(item) if visibility_is_public(&item.vis) => Some(item.ident.to_string()),
+        Item::Trait(item) if visibility_is_public(&item.vis) => Some(item.ident.to_string()),
+        Item::Type(item) if visibility_is_public(&item.vis) => Some(item.ident.to_string()),
+        Item::Union(item) if visibility_is_public(&item.vis) => Some(item.ident.to_string()),
+        _ => None,
+    }
+}
+
+fn collect_impl_api(
+    item: &syn::ItemImpl,
+    public_types: &BTreeSet<String>,
+    fingerprints: &mut Vec<ApiFingerprint>,
+) {
+    if item.attrs.iter().any(cfg_implies_test_attribute) {
+        return;
+    }
+    let self_type = token_string(&item.self_ty);
+    let impl_header = format!(
+        "{} {} {} {}",
+        relevant_attributes(&item.attrs),
+        item.unsafety.as_ref().map(token_string).unwrap_or_default(),
+        token_string(&item.generics),
+        self_type
+    );
+    if let Some((polarity, trait_path, _)) = &item.trait_ {
+        if type_mentions_public_name(&item.self_ty, public_types) {
+            let associated = item
+                .items
+                .iter()
+                .map(impl_item_api_tokens)
+                .collect::<Vec<_>>()
+                .join(" ; ");
+            fingerprints.push(ApiFingerprint {
+                text: format!(
+                    "trait impl {impl_header} {} {} {{ {associated} }}",
+                    polarity.as_ref().map(token_string).unwrap_or_default(),
+                    token_string(trait_path)
+                ),
+                line: item.impl_token.span.start().line,
+            });
+        }
+        return;
+    }
+
+    for associated in &item.items {
+        if impl_item_attributes(associated)
+            .iter()
+            .any(cfg_implies_test_attribute)
+        {
+            continue;
+        }
+        match associated {
+            ImplItem::Fn(method) if visibility_is_public(&method.vis) => {
+                fingerprints.push(ApiFingerprint {
+                    text: format!(
+                        "inherent fn {impl_header} :: {} {} {}",
+                        relevant_attributes(&method.attrs),
+                        token_string(&method.vis),
+                        token_string(&method.sig)
+                    ),
+                    line: method.sig.ident.span().start().line,
+                });
+            }
+            ImplItem::Const(value) if visibility_is_public(&value.vis) => {
+                let mut public = value.clone();
+                public.attrs.retain(is_api_attribute);
+                fingerprints.push(ApiFingerprint {
+                    text: format!("inherent const {impl_header} :: {}", token_string(&public)),
+                    line: value.ident.span().start().line,
+                });
+            }
+            ImplItem::Type(value) if visibility_is_public(&value.vis) => {
+                let mut public = value.clone();
+                public.attrs.retain(is_api_attribute);
+                fingerprints.push(ApiFingerprint {
+                    text: format!("inherent type {impl_header} :: {}", token_string(&public)),
+                    line: value.ident.span().start().line,
+                });
+            }
+            ImplItem::Macro(value)
+                if value
+                    .attrs
+                    .iter()
+                    .any(|attr| attr.path().is_ident("macro_export")) =>
+            {
+                let mut public = value.clone();
+                public.attrs.retain(is_api_attribute);
+                fingerprints.push(ApiFingerprint {
+                    text: format!("inherent macro {impl_header} :: {}", token_string(&public)),
+                    line: value.span().start().line,
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+fn impl_item_api_tokens(item: &ImplItem) -> String {
+    match item {
+        ImplItem::Fn(method) => format!(
+            "{} {} {}",
+            relevant_attributes(&method.attrs),
+            token_string(&method.vis),
+            token_string(&method.sig)
+        ),
+        ImplItem::Const(value) => {
+            let mut value = value.clone();
+            value.attrs.retain(is_api_attribute);
+            token_string(&value)
+        }
+        ImplItem::Type(value) => {
+            let mut value = value.clone();
+            value.attrs.retain(is_api_attribute);
+            token_string(&value)
+        }
+        ImplItem::Macro(value) => {
+            let mut value = value.clone();
+            value.attrs.retain(is_api_attribute);
+            token_string(&value)
+        }
+        ImplItem::Verbatim(tokens) => tokens.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn type_mentions_public_name(ty: &Type, public_types: &BTreeSet<String>) -> bool {
+    struct Finder<'a> {
+        public_types: &'a BTreeSet<String>,
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for Finder<'_> {
+        fn visit_path(&mut self, path: &'ast syn::Path) {
+            if path
+                .segments
+                .iter()
+                .any(|segment| self.public_types.contains(&segment.ident.to_string()))
+            {
+                self.found = true;
+            }
+            visit::visit_path(self, path);
+        }
+    }
+    let mut finder = Finder {
+        public_types,
+        found: false,
+    };
+    finder.visit_type(ty);
+    finder.found
+}
+
+fn visibility_is_public(visibility: &Visibility) -> bool {
+    !matches!(visibility, Visibility::Inherited)
+}
+
+fn foreign_item_visibility(item: &ForeignItem) -> Option<&Visibility> {
+    match item {
+        ForeignItem::Fn(item) => Some(&item.vis),
+        ForeignItem::Static(item) => Some(&item.vis),
+        ForeignItem::Type(item) => Some(&item.vis),
+        _ => None,
+    }
+}
+
+fn is_api_attribute(attribute: &Attribute) -> bool {
+    attribute.path().is_ident("cfg")
+        || attribute.path().is_ident("cfg_attr")
+        || attribute.path().is_ident("macro_export")
+}
+
+fn relevant_attributes(attributes: &[Attribute]) -> String {
+    attributes
+        .iter()
+        .filter(|attribute| is_api_attribute(attribute))
+        .map(token_string)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn token_string(tokens: &impl ToTokens) -> String {
+    tokens.to_token_stream().to_string()
 }
 
 fn extract_bundle_fields(source: &str) -> Result<BTreeSet<String>, String> {
@@ -586,7 +1088,6 @@ fn analyze_source(
     source: &str,
     bundle_fields: &BTreeSet<String>,
     is_registry: bool,
-    exclude_a3_file: bool,
 ) -> Result<Vec<Violation>, String> {
     let file = syn::parse_file(source).map_err(|error| format!("cannot parse {path}: {error}"))?;
     if is_registry {
@@ -597,7 +1098,6 @@ fn analyze_source(
         path,
         bundle_fields,
         imports,
-        exclude_a3_file,
         cfg_test_depth: 0,
         functions: Vec::new(),
         violations: Vec::new(),
@@ -609,6 +1109,160 @@ fn analyze_source(
         (left.line, left.rule, &left.function).cmp(&(right.line, right.rule, &right.function))
     });
     Ok(visitor.violations)
+}
+
+fn analyze_test_api(
+    path: &str,
+    source: &str,
+    test_module_file: bool,
+) -> Result<Vec<Violation>, String> {
+    let file =
+        syn::parse_file(source).map_err(|error| format!("cannot parse {path} for A6: {error}"))?;
+    let mut visitor = TestApiVisitor {
+        path,
+        cfg_test_depth: usize::from(test_module_file),
+        functions: Vec::new(),
+        violations: Vec::new(),
+    };
+    visitor.visit_file(&file);
+    Ok(visitor.violations)
+}
+
+struct TestApiVisitor<'a> {
+    path: &'a str,
+    cfg_test_depth: usize,
+    functions: Vec<String>,
+    violations: Vec<Violation>,
+}
+
+impl TestApiVisitor<'_> {
+    fn current_function(&self) -> String {
+        self.functions
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "<module>".into())
+    }
+
+    fn record(&mut self, span: Span, message: impl Into<String>) {
+        self.violations.push(Violation {
+            rule: Rule::A6,
+            file: self.path.to_owned(),
+            function: self.current_function(),
+            line: span.start().line,
+            message: message.into(),
+        });
+    }
+
+    fn check_definition(&mut self, signature: &Signature) {
+        if self.cfg_test_depth == 0 && signature.ident.to_string().ends_with("_for_test") {
+            self.record(
+                signature.ident.span(),
+                format!(
+                    "test-only definition {} is not guarded by cfg(test)",
+                    signature.ident
+                ),
+            );
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for TestApiVisitor<'_> {
+    fn visit_item(&mut self, node: &'ast Item) {
+        let is_test = item_attributes(node).iter().any(cfg_implies_test_attribute);
+        self.cfg_test_depth += usize::from(is_test);
+        visit::visit_item(self, node);
+        self.cfg_test_depth -= usize::from(is_test);
+    }
+
+    fn visit_impl_item(&mut self, node: &'ast ImplItem) {
+        let is_test = impl_item_attributes(node)
+            .iter()
+            .any(cfg_implies_test_attribute);
+        self.cfg_test_depth += usize::from(is_test);
+        visit::visit_impl_item(self, node);
+        self.cfg_test_depth -= usize::from(is_test);
+    }
+
+    fn visit_trait_item(&mut self, node: &'ast TraitItem) {
+        let is_test = trait_item_attributes(node)
+            .iter()
+            .any(cfg_implies_test_attribute);
+        self.cfg_test_depth += usize::from(is_test);
+        visit::visit_trait_item(self, node);
+        self.cfg_test_depth -= usize::from(is_test);
+    }
+
+    fn visit_foreign_item(&mut self, node: &'ast ForeignItem) {
+        let is_test = foreign_item_attributes(node)
+            .iter()
+            .any(cfg_implies_test_attribute);
+        self.cfg_test_depth += usize::from(is_test);
+        visit::visit_foreign_item(self, node);
+        self.cfg_test_depth -= usize::from(is_test);
+    }
+
+    fn visit_item_fn(&mut self, node: &'ast ItemFn) {
+        self.check_definition(&node.sig);
+        self.functions.push(node.sig.ident.to_string());
+        visit::visit_item_fn(self, node);
+        self.functions.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        self.check_definition(&node.sig);
+        self.functions.push(node.sig.ident.to_string());
+        visit::visit_impl_item_fn(self, node);
+        self.functions.pop();
+    }
+
+    fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
+        self.check_definition(&node.sig);
+        self.functions.push(node.sig.ident.to_string());
+        visit::visit_trait_item_fn(self, node);
+        self.functions.pop();
+    }
+
+    fn visit_foreign_item_fn(&mut self, node: &'ast syn::ForeignItemFn) {
+        self.check_definition(&node.sig);
+        visit::visit_foreign_item_fn(self, node);
+    }
+
+    fn visit_expr_call(&mut self, node: &'ast ExprCall) {
+        let call_is_test = node.attrs.iter().any(cfg_implies_test_attribute);
+        if self.cfg_test_depth == 0
+            && !call_is_test
+            && call_path(node)
+                .and_then(|path| path.segments.last())
+                .is_some_and(|segment| segment.ident.to_string().ends_with("_for_test"))
+        {
+            self.record(
+                node.span(),
+                "test-only function call appears outside cfg(test)",
+            );
+        }
+        visit::visit_expr_call(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+        let call_is_test = node.attrs.iter().any(cfg_implies_test_attribute);
+        if self.cfg_test_depth == 0
+            && !call_is_test
+            && node.method.to_string().ends_with("_for_test")
+        {
+            self.record(
+                node.method.span(),
+                "test-only method call appears outside cfg(test)",
+            );
+        }
+        visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_expr_block(&mut self, node: &'ast syn::ExprBlock) {
+        let is_test = node.attrs.iter().any(cfg_implies_test_attribute);
+        self.cfg_test_depth += usize::from(is_test);
+        visit::visit_expr_block(self, node);
+        self.cfg_test_depth -= usize::from(is_test);
+    }
 }
 
 #[derive(Default)]
@@ -634,7 +1288,6 @@ struct AuditVisitor<'a> {
     path: &'a str,
     bundle_fields: &'a BTreeSet<String>,
     imports: ImportNormalizer,
-    exclude_a3_file: bool,
     cfg_test_depth: usize,
     functions: Vec<FunctionFrame>,
     violations: Vec<Violation>,
@@ -810,14 +1463,16 @@ impl<'ast> Visit<'ast> for AuditVisitor<'_> {
     }
 
     fn visit_item(&mut self, node: &'ast Item) {
-        let is_test = item_attributes(node).iter().any(is_cfg_test_attribute);
+        let is_test = item_attributes(node).iter().any(cfg_implies_test_attribute);
         self.cfg_test_depth += usize::from(is_test);
         visit::visit_item(self, node);
         self.cfg_test_depth -= usize::from(is_test);
     }
 
     fn visit_impl_item(&mut self, node: &'ast ImplItem) {
-        let is_test = impl_item_attributes(node).iter().any(is_cfg_test_attribute);
+        let is_test = impl_item_attributes(node)
+            .iter()
+            .any(cfg_implies_test_attribute);
         self.cfg_test_depth += usize::from(is_test);
         visit::visit_impl_item(self, node);
         self.cfg_test_depth -= usize::from(is_test);
@@ -826,7 +1481,7 @@ impl<'ast> Visit<'ast> for AuditVisitor<'_> {
     fn visit_trait_item(&mut self, node: &'ast TraitItem) {
         let is_test = trait_item_attributes(node)
             .iter()
-            .any(is_cfg_test_attribute);
+            .any(cfg_implies_test_attribute);
         self.cfg_test_depth += usize::from(is_test);
         visit::visit_trait_item(self, node);
         self.cfg_test_depth -= usize::from(is_test);
@@ -835,7 +1490,7 @@ impl<'ast> Visit<'ast> for AuditVisitor<'_> {
     fn visit_foreign_item(&mut self, node: &'ast ForeignItem) {
         let is_test = foreign_item_attributes(node)
             .iter()
-            .any(is_cfg_test_attribute);
+            .any(cfg_implies_test_attribute);
         self.cfg_test_depth += usize::from(is_test);
         visit::visit_foreign_item(self, node);
         self.cfg_test_depth -= usize::from(is_test);
@@ -883,10 +1538,7 @@ impl<'ast> Visit<'ast> for AuditVisitor<'_> {
             }
         }
 
-        if !self.exclude_a3_file
-            && self.cfg_test_depth == 0
-            && call_path(node).is_some_and(is_bundle_associated_path)
-        {
+        if self.cfg_test_depth == 0 && call_path(node).is_some_and(is_bundle_associated_path) {
             self.record(
                 Rule::A3,
                 node.span(),
@@ -1121,13 +1773,33 @@ fn type_contains_ident(ty: &Type, expected: &str) -> bool {
     finder.found
 }
 
-fn is_cfg_test_attribute(attribute: &Attribute) -> bool {
+fn cfg_implies_test_attribute(attribute: &Attribute) -> bool {
     if !attribute.path().is_ident("cfg") {
         return false;
     }
     attribute
         .parse_args::<syn::Meta>()
-        .is_ok_and(|meta| matches!(meta, syn::Meta::Path(path) if path.is_ident("test")))
+        .is_ok_and(|meta| meta_implies_test(&meta))
+}
+
+fn meta_implies_test(meta: &syn::Meta) -> bool {
+    match meta {
+        syn::Meta::Path(path) => path.is_ident("test"),
+        syn::Meta::List(list) if list.path.is_ident("all") => {
+            parse_nested_meta(list).is_some_and(|nested| nested.iter().any(meta_implies_test))
+        }
+        syn::Meta::List(list) if list.path.is_ident("any") => parse_nested_meta(list)
+            .is_some_and(|nested| !nested.is_empty() && nested.iter().all(meta_implies_test)),
+        syn::Meta::List(_) | syn::Meta::NameValue(_) => false,
+    }
+}
+
+fn parse_nested_meta(list: &syn::MetaList) -> Option<Vec<syn::Meta>> {
+    use syn::parse::Parser as _;
+    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+        .parse2(list.tokens.clone())
+        .ok()
+        .map(|nested| nested.into_iter().collect())
 }
 
 fn item_attributes(item: &Item) -> &[Attribute] {
@@ -1197,7 +1869,15 @@ mod tests {
     }
 
     fn fixture(source: &str) -> Vec<Violation> {
-        analyze_source("src/fixture.rs", source, &bundle_fields(), false, false).unwrap()
+        analyze_source("src/fixture.rs", source, &bundle_fields(), false).unwrap()
+    }
+
+    fn api_allowlist(source: &str) -> Vec<String> {
+        extract_public_api_fingerprints(source)
+            .unwrap()
+            .into_iter()
+            .map(|fingerprint| fingerprint.text)
+            .collect()
     }
 
     fn has_rule(violations: &[Violation], rule: Rule) -> bool {
@@ -1246,6 +1926,90 @@ mod tests {
     fn field_extraction_fails_when_the_struct_is_missing() {
         let error = extract_bundle_fields("struct SomethingElse { items: Vec<u8> }").unwrap_err();
         assert!(error.contains("was not found"), "{error}");
+    }
+
+    #[test]
+    fn a4_accepts_the_exact_expected_surface() {
+        let source =
+            "pub(crate) struct Demo; impl Demo { pub(crate) fn run<T>(&self, value: T) {} }";
+        let allowlist = api_allowlist(source);
+        let refs = allowlist.iter().map(String::as_str).collect::<Vec<_>>();
+        assert!(audit_public_api(source, &refs).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a4_rejects_a_trait_impl_addition() {
+        let allowed = "pub(crate) struct Demo;";
+        let allowlist = api_allowlist(allowed);
+        let refs = allowlist.iter().map(String::as_str).collect::<Vec<_>>();
+        let changed = "pub(crate) struct Demo; impl Drop for Demo { fn drop(&mut self) {} }";
+        assert!(has_rule(
+            &audit_public_api(changed, &refs).unwrap(),
+            Rule::A4
+        ));
+    }
+
+    #[test]
+    fn a4_rejects_a_generic_bound_addition() {
+        let allowed =
+            "pub(crate) struct Demo; impl Demo { pub(crate) fn run<T>(&self, value: T) {} }";
+        let allowlist = api_allowlist(allowed);
+        let refs = allowlist.iter().map(String::as_str).collect::<Vec<_>>();
+        let changed =
+            "pub(crate) struct Demo; impl Demo { pub(crate) fn run<T: Clone>(&self, value: T) {} }";
+        assert!(has_rule(
+            &audit_public_api(changed, &refs).unwrap(),
+            Rule::A4
+        ));
+    }
+
+    #[test]
+    fn a4_rejects_visibility_broadening() {
+        let allowed = "pub(crate) struct Demo;";
+        let allowlist = api_allowlist(allowed);
+        let refs = allowlist.iter().map(String::as_str).collect::<Vec<_>>();
+        assert!(has_rule(
+            &audit_public_api("pub struct Demo;", &refs).unwrap(),
+            Rule::A4
+        ));
+    }
+
+    #[test]
+    fn a6_rejects_unguarded_test_definitions_and_calls() {
+        let source = r#"
+            impl App {
+                fn helper_for_test(&mut self) {}
+            }
+            fn production(app: &mut App) {
+                app.helper_for_test();
+                free_for_test();
+            }
+        "#;
+        let violations = analyze_test_api("src/fixture.rs", source, false).unwrap();
+        assert!(
+            violations
+                .iter()
+                .filter(|violation| violation.rule == Rule::A6)
+                .count()
+                >= 3,
+            "{violations:#?}"
+        );
+    }
+
+    #[test]
+    fn a6_accepts_the_existing_cfg_all_test_windows_app_impl_shape() {
+        let source = r#"
+            #[cfg(all(test, windows))]
+            impl App {
+                pub(in crate::app) fn helper_for_test(&mut self) {}
+            }
+            #[cfg(test)]
+            fn test_only(app: &mut App) {
+                app.helper_for_test();
+            }
+        "#;
+        let violations = analyze_test_api("src/fixture.rs", source, false).unwrap();
+        assert!(!has_rule(&violations, Rule::A6), "{violations:#?}");
     }
 
     #[test]
@@ -1359,7 +2123,7 @@ mod tests {
     }
 
     #[test]
-    fn a3_skips_items_nested_below_cfg_test_and_the_tests_file() {
+    fn a3_skips_items_nested_below_cfg_test_but_not_the_tests_file() {
         let cfg_source = r#"
             #[cfg(test)]
             impl Demo {
@@ -1374,19 +2138,9 @@ mod tests {
             "fn helper() { ViewerContextBundle::empty(); }",
             &bundle_fields(),
             false,
-            false,
         )
         .unwrap();
         assert!(has_rule(&ordinary, Rule::A3), "{ordinary:#?}");
-        let excluded = analyze_source(
-            "src/app/tests.rs",
-            "fn helper() { ViewerContextBundle::empty(); }",
-            &bundle_fields(),
-            false,
-            true,
-        )
-        .unwrap();
-        assert!(!has_rule(&excluded, Rule::A3), "{excluded:#?}");
     }
 
     #[test]
@@ -1554,7 +2308,7 @@ mod tests {
             assert!(has_rule(&outside, rule), "missing {rule}: {outside:#?}");
         }
 
-        let inside = analyze_source(REGISTRY_PATH, source, &bundle_fields(), true, false).unwrap();
+        let inside = analyze_source(REGISTRY_PATH, source, &bundle_fields(), true).unwrap();
         assert!(inside.is_empty(), "{inside:#?}");
     }
 

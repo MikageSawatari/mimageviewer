@@ -735,6 +735,30 @@ bundle 版は重複として削除し、その同等性テストは mounted-side
   backlog [next-release-backlog.md](next-release-backlog.md) **§1.116** に、
   共有出力プール枯渇のログ証拠付きで積んだ。
 
+### ステージ②-e 完了: bundle の言語境界と audit A4 / A6 (2026-08-25)
+
+`ViewerContextBundle` の 225 フィールドをすべて module private にし、`empty()` /
+`set_items_generation()` / `clear_normalize_state()` も registry module private にした。
+registry 外では struct literal、destructure、field access、`empty()` 呼び出しを Rust の可視性規則が
+拒否する。production / detached の挙動は変えていない。
+
+- `src/app/tests.rs` の bundle 構築 103 箇所と field write 約 230 箇所は、context を一時 mount して
+  `&mut App` を受け取る closure setup へ移した。読み取り assertion も mounted App 上で行う。
+  assertion マクロ数・期待値・message は変更していない。
+- bundle を引数／戻り値にする test helper は削除した。`build_window_context_for_test` は
+  `install_window_context_for_test` の closure 版後継であり、snapshot を追加しない at-rest window
+  context の構築に必要。test 専用 registry 入口は 14 → 9 に減った。
+- A3 の `tests.rs` 特例除外を削除した。A4 は production registry の正規化 API 指紋 62 件を
+  完全一致 allowlist とし、正確な可視性、generic / bound / where、public field / variant、
+  re-export、公開型への trait impl と関連型まで固定する。
+- A6 は設計が想定した未実装の `viewer_context_registry::test_access::` ではなく、実在する
+  `#[cfg(all(test, windows))] impl App` の `*_for_test` 定義と呼び出しを対象に再定義した。
+  `_for_test` 定義は `cfg(test)` を含む必要があり、呼び出しも test cfg 外では禁止する。
+  この差は audit allowlist コメントにも明記した。
+- 検証は library **6261 passed / 0 failed / 27 ignored** (検出総数 6288)、audit **31 passed**。
+  audit 実行は A1 / A2a / A2b / A3 / A4 / A5 / A6 / A7 が有効で、既知の
+  `activate_snapshot` 1 件のみ。library の dead-code warning は従来どおり **9 件**。
+
 ## ②-d の退行 1 件と、その調査でかかった 3 往復
 
 **症状**: detached で動画を開くと黒いウィンドウのまま再生が始まらない (両モード)。

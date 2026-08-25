@@ -7,4 +7,5 @@ publish = false
 
 [dependencies]
 proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
 syn = { version = "2", features = ["full", "visit", "extra-traits"] }

@@ -670,71 +670,67 @@ pub(in crate::app) enum RetireContextError {
 
 #[cfg(windows)]
 pub(in crate::app) struct ViewerContextBundle {
-    pub(in crate::app) address: String,
-    pub(in crate::app) current_folder: Option<PathBuf>,
-    pub(in crate::app) navigation_scope: ViewerNavigationScope,
-    pub(in crate::app) archive_source_override: Option<PathBuf>,
-    pub(in crate::app) zip_nav: Option<crate::zip_tree::ZipNavState>,
-    pub(in crate::app) stack_mode_requested: bool,
-    pub(in crate::app) stack_view: Option<crate::filename_stack::StackView>,
-    pub(in crate::app) stack_showing_flat: bool,
-    pub(in crate::app) stack_active_rule: Option<String>,
-    pub(in crate::app) stack_script_error: Option<String>,
-    pub(in crate::app) stack_toggle_select_path: Option<PathBuf>,
-    pub(in crate::app) items: Vec<GridItem>,
-    pub(in crate::app) items_generation: u64,
-    pub(in crate::app) visible_indices: Vec<usize>,
+    address: String,
+    current_folder: Option<PathBuf>,
+    navigation_scope: ViewerNavigationScope,
+    archive_source_override: Option<PathBuf>,
+    zip_nav: Option<crate::zip_tree::ZipNavState>,
+    stack_mode_requested: bool,
+    stack_view: Option<crate::filename_stack::StackView>,
+    stack_showing_flat: bool,
+    stack_active_rule: Option<String>,
+    stack_script_error: Option<String>,
+    stack_toggle_select_path: Option<PathBuf>,
+    items: Vec<GridItem>,
+    items_generation: u64,
+    visible_indices: Vec<usize>,
     /// `items` と同じ添字の正規化済み basename と、その worker lifecycle。
     /// query / tokens / debounce は App 全体で同じ絞り込み条件を使うため swap しないが、
     /// 導出 cache は generation 空間を共有しない viewer context と一緒に所有する。
     /// failed generation も別 context の同値 generation の build を抑止しないようここに含める。
-    pub(in crate::app) facet_name_cache: Vec<Box<str>>,
-    pub(in crate::app) facet_name_cache_generation: Option<u64>,
-    pub(in crate::app) facet_name_cache_pending: Option<facet_name_filter::FacetNameCachePending>,
-    pub(in crate::app) facet_name_cache_failed_generation: Option<u64>,
-    pub(in crate::app) thumbnails: Vec<ThumbnailState>,
-    pub(in crate::app) image_metas: Vec<Option<(i64, i64)>>,
-    pub(in crate::app) video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
-    pub(in crate::app) auto_aspect: crate::auto_aspect::AutoAspectState,
-    pub(in crate::app) selected: Option<usize>,
-    pub(in crate::app) grid_click_selection_anchor: Option<GridClickSelectionAnchor>,
-    pub(in crate::app) scroll_offset_y: f32,
-    pub(in crate::app) scroll_to_selected: bool,
-    pub(in crate::app) pending_grid_scroll: Option<GridScrollIntent>,
-    pub(in crate::app) requested: std::collections::HashMap<usize, bool>,
-    pub(in crate::app) idle_upgrade_cache_bypass_ineligible: std::collections::HashSet<usize>,
-    pub(in crate::app) keep_range: (usize, usize),
-    pub(in crate::app) keep_set: std::collections::HashSet<usize>,
-    pub(in crate::app) thumbnail_eviction_generation: Option<u64>,
-    pub(in crate::app) details_thumb_suppression_applied: bool,
-    pub(in crate::app) details_hover_thumb_idx: Option<usize>,
-    pub(in crate::app) details_hover_thumb_viewport_open: bool,
-    pub(in crate::app) texture_backlog: Vec<crate::thumb_loader::ThumbMsg>,
-    pub(in crate::app) details_order: Vec<usize>,
-    pub(in crate::app) details_order_revision: u64,
-    pub(in crate::app) details_cell_content_revisions: DetailsCellContentRevisions,
-    pub(in crate::app) details_tag_prewarm_indices: Vec<usize>,
-    pub(in crate::app) details_lazy_meta: std::collections::HashMap<String, DetailsLazyMeta>,
-    pub(in crate::app) details_meta_pending: Option<DetailsMetaPending>,
-    pub(in crate::app) details_lazy_visible_revision: u64,
-    pub(in crate::app) details_image_dims_state: LazyColumnState,
-    pub(in crate::app) metadata_cache:
-        std::collections::HashMap<String, Option<crate::png_metadata::AiMetadata>>,
-    pub(in crate::app) exif_cache:
-        std::collections::HashMap<String, Option<crate::exif_reader::ExifInfo>>,
-    pub(in crate::app) xmp_cache:
-        std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
-    pub(in crate::app) xmp_panorama_info:
+    facet_name_cache: Vec<Box<str>>,
+    facet_name_cache_generation: Option<u64>,
+    facet_name_cache_pending: Option<facet_name_filter::FacetNameCachePending>,
+    facet_name_cache_failed_generation: Option<u64>,
+    thumbnails: Vec<ThumbnailState>,
+    image_metas: Vec<Option<(i64, i64)>>,
+    video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
+    auto_aspect: crate::auto_aspect::AutoAspectState,
+    selected: Option<usize>,
+    grid_click_selection_anchor: Option<GridClickSelectionAnchor>,
+    scroll_offset_y: f32,
+    scroll_to_selected: bool,
+    pending_grid_scroll: Option<GridScrollIntent>,
+    requested: std::collections::HashMap<usize, bool>,
+    idle_upgrade_cache_bypass_ineligible: std::collections::HashSet<usize>,
+    keep_range: (usize, usize),
+    keep_set: std::collections::HashSet<usize>,
+    thumbnail_eviction_generation: Option<u64>,
+    details_thumb_suppression_applied: bool,
+    details_hover_thumb_idx: Option<usize>,
+    details_hover_thumb_viewport_open: bool,
+    texture_backlog: Vec<crate::thumb_loader::ThumbMsg>,
+    details_order: Vec<usize>,
+    details_order_revision: u64,
+    details_cell_content_revisions: DetailsCellContentRevisions,
+    details_tag_prewarm_indices: Vec<usize>,
+    details_lazy_meta: std::collections::HashMap<String, DetailsLazyMeta>,
+    details_meta_pending: Option<DetailsMetaPending>,
+    details_lazy_visible_revision: u64,
+    details_image_dims_state: LazyColumnState,
+    metadata_cache: std::collections::HashMap<String, Option<crate::png_metadata::AiMetadata>>,
+    exif_cache: std::collections::HashMap<String, Option<crate::exif_reader::ExifInfo>>,
+    xmp_cache: std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
+    xmp_panorama_info:
         std::collections::HashMap<String, Option<crate::xmp_reader::XmpPanoramaInfo>>,
-    pub(in crate::app) metadata_pending: Option<MetadataLoadPending>,
+    metadata_pending: Option<MetadataLoadPending>,
     /// 一覧ごとの tags.db 表示キャッシュ。detached context の実フォルダ load が
     /// main 一覧のタグを消さないよう、item 列と同じ ownership で交換する。
-    pub(in crate::app) tags_cache: std::collections::HashMap<String, Vec<String>>,
-    pub(in crate::app) tag_prewarm_pending: Option<crate::tag_prewarm::TagPrewarmPending>,
-    pub(in crate::app) tag_prewarm_queued: std::collections::HashSet<usize>,
-    pub(in crate::app) tag_legacy_seed_pending:
-        Option<crate::tag_legacy_seed_worker::LegacySeedPending>,
-    pub(in crate::app) pending_finalize: std::collections::HashSet<usize>,
+    tags_cache: std::collections::HashMap<String, Vec<String>>,
+    tag_prewarm_pending: Option<crate::tag_prewarm::TagPrewarmPending>,
+    tag_prewarm_queued: std::collections::HashSet<usize>,
+    tag_legacy_seed_pending: Option<crate::tag_legacy_seed_worker::LegacySeedPending>,
+    pending_finalize: std::collections::HashSet<usize>,
     // ── per-context ロード複合体 (review-v2.3.0 P2-8/P2-9) ──
     // thumb channel (tx/rx)・cancel_token・ワーカーキュー 2 本は `start_loading_items` が
     // ロードごとに作り直す「現用セット」で、コンテキストに属する。bundle に含めないと
@@ -743,128 +739,122 @@ pub(in crate::app) struct ViewerContextBundle {
     // (b) channel/token が global なせいで bundle 済み bookkeeping (requested 等) が swap 後に
     //     信用できず、swap のたびに clear → 毎フレーム再エンキュー → サムネ重複デコード
     //     churn になる (P2-8)。
-    pub(in crate::app) tx: mpsc::Sender<ThumbMsg>,
-    pub(in crate::app) rx: mpsc::Receiver<ThumbMsg>,
-    pub(in crate::app) cancel_token: Arc<AtomicBool>,
-    pub(in crate::app) reload_queue: Option<Arc<NotifyQueue>>,
-    pub(in crate::app) heavy_io_queue: Option<Arc<NotifyQueue>>,
+    tx: mpsc::Sender<ThumbMsg>,
+    rx: mpsc::Receiver<ThumbMsg>,
+    cancel_token: Arc<AtomicBool>,
+    reload_queue: Option<Arc<NotifyQueue>>,
+    heavy_io_queue: Option<Arc<NotifyQueue>>,
     // worker が out-of-keep skip / 優先度計算に読む共有 atomic も per-context にする。
     // global のままだと (a) detached ロードの初期化 (0,0 store) が main の keep range を
     // 一瞬潰して可視サムネの skip churn を起こし、(b) detached の queue 項目が以後
     // main の keep range で gate され続ける (review-v2.3.0 hunt P3)。
-    pub(in crate::app) scroll_hint: Arc<AtomicUsize>,
-    pub(in crate::app) visible_end_shared: Arc<AtomicUsize>,
-    pub(in crate::app) keep_start_shared: Arc<AtomicUsize>,
-    pub(in crate::app) keep_end_shared: Arc<AtomicUsize>,
-    pub(in crate::app) last_vis_range: (usize, usize),
-    pub(in crate::app) vis_settle_at: Option<std::time::Instant>,
-    pub(in crate::app) vis_first_logged: bool,
-    pub(in crate::app) vis_all_logged: bool,
-    pub(in crate::app) folder_nav_pending: Option<FolderNavPending>,
-    pub(in crate::app) folder_pane_open_pending: Option<FolderPaneOpenPending>,
-    pub(in crate::app) pending_folder_nav_steps: i32,
-    pub(in crate::app) pending_folder_nav_mode: FolderNavMode,
-    pub(in crate::app) search_filter: Option<std::collections::HashSet<usize>>,
-    pub(in crate::app) search_filter_origin_folder: Option<PathBuf>,
-    pub(in crate::app) checked: std::collections::HashSet<usize>,
-    pub(in crate::app) rotation_cache:
-        std::collections::HashMap<usize, crate::rotation_db::Rotation>,
-    pub(in crate::app) page_dims_cache: crate::page_dims::PageDimsCache,
-    pub(in crate::app) rating_cache: std::collections::HashMap<usize, u8>,
+    scroll_hint: Arc<AtomicUsize>,
+    visible_end_shared: Arc<AtomicUsize>,
+    keep_start_shared: Arc<AtomicUsize>,
+    keep_end_shared: Arc<AtomicUsize>,
+    last_vis_range: (usize, usize),
+    vis_settle_at: Option<std::time::Instant>,
+    vis_first_logged: bool,
+    vis_all_logged: bool,
+    folder_nav_pending: Option<FolderNavPending>,
+    folder_pane_open_pending: Option<FolderPaneOpenPending>,
+    pending_folder_nav_steps: i32,
+    pending_folder_nav_mode: FolderNavMode,
+    search_filter: Option<std::collections::HashSet<usize>>,
+    search_filter_origin_folder: Option<PathBuf>,
+    checked: std::collections::HashSet<usize>,
+    rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
+    page_dims_cache: crate::page_dims::PageDimsCache,
+    rating_cache: std::collections::HashMap<usize, u8>,
     /// App-global な path rating 更新をこの context の idx cache へ反映済みの世代。
-    pub(in crate::app) rating_session_write_seen_generation: u64,
-    pub(in crate::app) metadata_import_refresh_index: Option<MetadataImportRefreshIndex>,
-    pub(in crate::app) current_folder_rating_cache: Option<u8>,
-    pub(in crate::app) current_folder_last_mtime: Option<std::time::SystemTime>,
-    pub(in crate::app) current_folder_signature: Option<u64>,
-    pub(in crate::app) folder_pin_map:
-        std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
-    pub(in crate::app) converted_archive_cache_paths:
-        std::collections::HashMap<String, ConvertedArchiveSourceState>,
-    pub(in crate::app) converted_archive_pin_root_states:
+    rating_session_write_seen_generation: u64,
+    metadata_import_refresh_index: Option<MetadataImportRefreshIndex>,
+    current_folder_rating_cache: Option<u8>,
+    current_folder_last_mtime: Option<std::time::SystemTime>,
+    current_folder_signature: Option<u64>,
+    folder_pin_map: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    converted_archive_cache_paths: std::collections::HashMap<String, ConvertedArchiveSourceState>,
+    converted_archive_pin_root_states:
         std::collections::HashMap<String, ConvertedArchivePinRootState>,
-    pub(in crate::app) converted_archive_cache_paths_pending:
-        Option<ConvertedArchiveCachePathsPending>,
-    pub(in crate::app) current_color_cache_map: Option<
+    converted_archive_cache_paths_pending: Option<ConvertedArchiveCachePathsPending>,
+    current_color_cache_map: Option<
         Arc<std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>>,
     >,
-    pub(in crate::app) current_color_catalog: Option<Arc<crate::catalog::CatalogDb>>,
+    current_color_catalog: Option<Arc<crate::catalog::CatalogDb>>,
     /// VST3 startup load 完了まで start_fs_load を保留している、この context の media idx。
-    pub(in crate::app) vst3_deferred_media_open: Option<usize>,
-    pub(in crate::app) fullscreen_idx: Option<usize>,
-    pub(in crate::app) viewer_session: ViewerSession,
-    pub(in crate::app) native_video_in_window_active: bool,
-    pub(in crate::app) video_audio_mode: Option<usize>,
-    pub(in crate::app) video_audio_vst: Option<VideoAudioVstState>,
-    pub(in crate::app) video_audio_mode_entry_target: Option<(
+    vst3_deferred_media_open: Option<usize>,
+    fullscreen_idx: Option<usize>,
+    viewer_session: ViewerSession,
+    native_video_in_window_active: bool,
+    video_audio_mode: Option<usize>,
+    video_audio_vst: Option<VideoAudioVstState>,
+    video_audio_mode_entry_target: Option<(
         crate::video::NativeVideoPlacement,
         windows::Win32::Foundation::RECT,
         u64,
     )>,
-    pub(in crate::app) video_audio_exit_pending: Option<VideoAudioExitPending>,
-    pub(in crate::app) panorama_state: Option<crate::panorama::PanoramaState>,
-    pub(in crate::app) pano_toast_shown_for_current_fs: bool,
-    pub(in crate::app) analysis_mode: bool,
-    pub(in crate::app) analysis_hover_color: Option<[u8; 4]>,
-    pub(in crate::app) analysis_pinned_color: Option<[u8; 4]>,
-    pub(in crate::app) analysis_grayscale: bool,
-    pub(in crate::app) analysis_mosaic_grid: bool,
-    pub(in crate::app) analysis_filter_mag: u8,
-    pub(in crate::app) analysis_guide_drag: Option<(egui::Pos2, egui::Pos2, u8)>,
-    pub(in crate::app) view_trim_mode: bool,
-    pub(in crate::app) view_trim_apply_mode: crate::view_trim::ViewTrimApplyMode,
-    pub(in crate::app) view_trim_page_apply_root_idx: Option<usize>,
-    pub(in crate::app) view_trim_page_spread_separate: bool,
-    pub(in crate::app) view_trim_book_settings: crate::view_trim::ViewTrimBookSettings,
-    pub(in crate::app) view_trim_page_overrides:
+    video_audio_exit_pending: Option<VideoAudioExitPending>,
+    panorama_state: Option<crate::panorama::PanoramaState>,
+    pano_toast_shown_for_current_fs: bool,
+    analysis_mode: bool,
+    analysis_hover_color: Option<[u8; 4]>,
+    analysis_pinned_color: Option<[u8; 4]>,
+    analysis_grayscale: bool,
+    analysis_mosaic_grid: bool,
+    analysis_filter_mag: u8,
+    analysis_guide_drag: Option<(egui::Pos2, egui::Pos2, u8)>,
+    view_trim_mode: bool,
+    view_trim_apply_mode: crate::view_trim::ViewTrimApplyMode,
+    view_trim_page_apply_root_idx: Option<usize>,
+    view_trim_page_spread_separate: bool,
+    view_trim_book_settings: crate::view_trim::ViewTrimBookSettings,
+    view_trim_page_overrides:
         std::collections::HashMap<usize, crate::view_trim::ViewTrimPageOverride>,
-    pub(in crate::app) view_trim_dirty_page_overrides: std::collections::HashSet<usize>,
-    pub(in crate::app) view_trim_save_pending: bool,
-    pub(in crate::app) fs_cache: ItemsGenerationMap<FsCacheEntry>,
-    pub(in crate::app) fs_lanczos_cache: crate::gpu_lanczos::GpuLanczosCache,
-    pub(in crate::app) fs_margin_bbox_cache:
-        std::collections::HashMap<usize, (u64, usize, Option<egui::Rect>)>,
-    pub(in crate::app) input_generation: std::collections::HashMap<usize, u64>,
-    pub(in crate::app) fs_pending: ItemsGenerationMap<FsPendingValue>,
-    pub(in crate::app) fullscreen_pdf_promotion: FullscreenPdfPromotionState,
+    view_trim_dirty_page_overrides: std::collections::HashSet<usize>,
+    view_trim_save_pending: bool,
+    fs_cache: ItemsGenerationMap<FsCacheEntry>,
+    fs_lanczos_cache: crate::gpu_lanczos::GpuLanczosCache,
+    fs_margin_bbox_cache: std::collections::HashMap<usize, (u64, usize, Option<egui::Rect>)>,
+    input_generation: std::collections::HashMap<usize, u64>,
+    fs_pending: ItemsGenerationMap<FsPendingValue>,
+    fullscreen_pdf_promotion: FullscreenPdfPromotionState,
     /// この viewer context の実描画先から得た PDF 初回レンダターゲット。
-    pub(in crate::app) fs_pdf_display_target: Option<crate::pdf_loader::PdfDisplayTarget>,
-    pub(in crate::app) fs_early_dims: ItemsGenerationMap<[usize; 2]>,
-    pub(in crate::app) fs_upload_backlog: FsUploadBacklog,
-    pub(in crate::app) top_level_grid_view: top_level_grid_view::TopLevelGridView,
-    pub(in crate::app) items_are_global_search_view: bool,
-    pub(in crate::app) items_are_tag_view: bool,
-    pub(in crate::app) items_are_reading_history_view: bool,
-    pub(in crate::app) items_are_bookmark_view: bool,
-    pub(in crate::app) items_are_rating_view: bool,
-    pub(in crate::app) items_are_subfolder_expansion_view: bool,
-    pub(in crate::app) items_are_smart_folder_view: bool,
-    pub(in crate::app) items_are_drive_list: bool,
-    pub(in crate::app) reading_history_return_from: Option<PathBuf>,
-    pub(in crate::app) bookmark_view_state: Option<BookmarkViewState>,
-    pub(in crate::app) bookmark_open_pending: Option<crate::bookmark_browser::PendingBookmarkOpen>,
-    pub(in crate::app) fs_open_intent_from_grid: bool,
-    pub(in crate::app) pending_detached_video_host_switch: Option<DetachedVideoHostSwitchPending>,
-    pub(in crate::app) fs_zoom: f32,
-    pub(in crate::app) fs_pan: egui::Vec2,
-    pub(in crate::app) fs_zoom_active: bool,
-    pub(in crate::app) fs_zoom_aiming: bool,
-    pub(in crate::app) fs_zoom_factor: f32,
-    pub(in crate::app) fs_zoom_pdf_rerender_idx: Option<usize>,
-    pub(in crate::app) fs_zoom_pdf_rerender_zoom: f32,
-    pub(in crate::app) fs_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
-    pub(in crate::app) fs_vertical_scroll: f32,
-    pub(in crate::app) fs_seek_drag_active: bool,
-    pub(in crate::app) fs_seek_overlay_visible: bool,
-    pub(in crate::app) fs_vertical_cache_keep_set: std::collections::HashSet<usize>,
-    pub(in crate::app) continuous_page_transitions:
-        std::collections::HashMap<usize, ContinuousPageTransition>,
-    pub(in crate::app) fs_free_rotation: f32,
-    pub(in crate::app) fs_rotation_drag_start: Option<(egui::Pos2, f32)>,
-    pub(in crate::app) analysis_zoom: f32,
-    pub(in crate::app) analysis_pan: egui::Vec2,
-    pub(in crate::app) analysis_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
-    pub(in crate::app) analysis_overlay_cache: Option<(
+    fs_pdf_display_target: Option<crate::pdf_loader::PdfDisplayTarget>,
+    fs_early_dims: ItemsGenerationMap<[usize; 2]>,
+    fs_upload_backlog: FsUploadBacklog,
+    top_level_grid_view: top_level_grid_view::TopLevelGridView,
+    items_are_global_search_view: bool,
+    items_are_tag_view: bool,
+    items_are_reading_history_view: bool,
+    items_are_bookmark_view: bool,
+    items_are_rating_view: bool,
+    items_are_subfolder_expansion_view: bool,
+    items_are_smart_folder_view: bool,
+    items_are_drive_list: bool,
+    reading_history_return_from: Option<PathBuf>,
+    bookmark_view_state: Option<BookmarkViewState>,
+    bookmark_open_pending: Option<crate::bookmark_browser::PendingBookmarkOpen>,
+    fs_open_intent_from_grid: bool,
+    pending_detached_video_host_switch: Option<DetachedVideoHostSwitchPending>,
+    fs_zoom: f32,
+    fs_pan: egui::Vec2,
+    fs_zoom_active: bool,
+    fs_zoom_aiming: bool,
+    fs_zoom_factor: f32,
+    fs_zoom_pdf_rerender_idx: Option<usize>,
+    fs_zoom_pdf_rerender_zoom: f32,
+    fs_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
+    fs_vertical_scroll: f32,
+    fs_seek_drag_active: bool,
+    fs_seek_overlay_visible: bool,
+    fs_vertical_cache_keep_set: std::collections::HashSet<usize>,
+    continuous_page_transitions: std::collections::HashMap<usize, ContinuousPageTransition>,
+    fs_free_rotation: f32,
+    fs_rotation_drag_start: Option<(egui::Pos2, f32)>,
+    analysis_zoom: f32,
+    analysis_pan: egui::Vec2,
+    analysis_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
+    analysis_overlay_cache: Option<(
         egui::TextureHandle,
         u8,
         Option<[u8; 4]>,
@@ -872,101 +862,88 @@ pub(in crate::app) struct ViewerContextBundle {
         egui::Vec2,
         usize,
     )>,
-    pub(in crate::app) analysis_hist_cache:
-        Option<(f32, egui::Vec2, usize, [u32; 360], [u32; 256], [u32; 256])>,
-    pub(in crate::app) analysis_sv_cache: Option<(f32, egui::Vec2, usize, egui::TextureHandle)>,
-    pub(in crate::app) spread_mode: crate::settings::SpreadMode,
-    pub(in crate::app) spread_shift_anchor_idx: Option<usize>,
-    pub(in crate::app) reading_flow: crate::settings::ReadingFlow,
-    pub(in crate::app) reading_direction: crate::settings::ReadingDirection,
-    pub(in crate::app) slideshow_playing: bool,
-    pub(in crate::app) slideshow_next_at: std::time::Instant,
-    pub(in crate::app) slideshow_anchor_idx: Option<usize>,
-    pub(in crate::app) continuous_reading_scroll_transition:
-        Option<ContinuousReadingScrollTransition>,
-    pub(in crate::app) slideshow_scroll_range_cache: Option<(usize, f32, f32)>,
-    pub(in crate::app) pdf_password_request: Option<PdfPasswordRequest>,
-    pub(in crate::app) pdf_current_password: Option<String>,
-    pub(in crate::app) pdf_password_pending_save: Option<(PathBuf, String)>,
-    pub(in crate::app) pdf_enumerate_pending: Option<(
+    analysis_hist_cache: Option<(f32, egui::Vec2, usize, [u32; 360], [u32; 256], [u32; 256])>,
+    analysis_sv_cache: Option<(f32, egui::Vec2, usize, egui::TextureHandle)>,
+    spread_mode: crate::settings::SpreadMode,
+    spread_shift_anchor_idx: Option<usize>,
+    reading_flow: crate::settings::ReadingFlow,
+    reading_direction: crate::settings::ReadingDirection,
+    slideshow_playing: bool,
+    slideshow_next_at: std::time::Instant,
+    slideshow_anchor_idx: Option<usize>,
+    continuous_reading_scroll_transition: Option<ContinuousReadingScrollTransition>,
+    slideshow_scroll_range_cache: Option<(usize, f32, f32)>,
+    pdf_password_request: Option<PdfPasswordRequest>,
+    pdf_current_password: Option<String>,
+    pdf_password_pending_save: Option<(PathBuf, String)>,
+    pdf_enumerate_pending: Option<(
         PathBuf,
         Option<String>,
         crate::pdf_loader::PdfEnumerateHandle,
     )>,
-    pub(in crate::app) zip_enumerate_pending: Option<ZipEnumeratePending>,
-    pub(in crate::app) fs_nav_after_pdf_enumerate: Option<DeferredFsReopen>,
-    pub(in crate::app) pending_auto_fs_open: bool,
-    pub(in crate::app) pending_return_to_parent: bool,
-    pub(in crate::app) pdf_placeholder_count: Option<u32>,
-    pub(in crate::app) cached_nav_indices: Option<Vec<usize>>,
-    pub(in crate::app) cached_fs_seek_info: Option<(usize, crate::ui_fullscreen::FsSeekInfo)>,
-    pub(in crate::app) fs_nav_locked_gen: Option<u64>,
-    pub(in crate::app) fs_nav_dropped_block_signature: Option<String>,
-    pub(in crate::app) fs_nav_dropped_block_count: u32,
-    pub(in crate::app) fs_load_skip_signature: Option<String>,
-    pub(in crate::app) fs_holdover_tex: Option<FsHoldover>,
-    pub(in crate::app) fs_boundary_hint: Option<crate::ui_fullscreen::FsBoundaryHint>,
-    pub(in crate::app) virtual_folder_writeback: Option<VirtualFolderWriteback>,
-    pub(in crate::app) pdf_prefetch_grace_until: Option<std::time::Instant>,
-    pub(in crate::app) thumb_pixels:
-        std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
-    pub(in crate::app) thumb_edit_preview_layers: std::collections::HashMap<
+    zip_enumerate_pending: Option<ZipEnumeratePending>,
+    fs_nav_after_pdf_enumerate: Option<DeferredFsReopen>,
+    pending_auto_fs_open: bool,
+    pending_return_to_parent: bool,
+    pdf_placeholder_count: Option<u32>,
+    cached_nav_indices: Option<Vec<usize>>,
+    cached_fs_seek_info: Option<(usize, crate::ui_fullscreen::FsSeekInfo)>,
+    fs_nav_locked_gen: Option<u64>,
+    fs_nav_dropped_block_signature: Option<String>,
+    fs_nav_dropped_block_count: u32,
+    fs_load_skip_signature: Option<String>,
+    fs_holdover_tex: Option<FsHoldover>,
+    fs_boundary_hint: Option<crate::ui_fullscreen::FsBoundaryHint>,
+    virtual_folder_writeback: Option<VirtualFolderWriteback>,
+    pdf_prefetch_grace_until: Option<std::time::Instant>,
+    thumb_pixels: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
+    thumb_edit_preview_layers: std::collections::HashMap<
         usize,
         std::sync::Arc<Vec<crate::edit_preview_cache::CachedAnnotationLayer>>,
     >,
-    pub(in crate::app) thumb_edit_preview_keys: std::collections::HashMap<usize, String>,
-    pub(in crate::app) thumb_adjust_tex: std::collections::HashMap<usize, egui::TextureHandle>,
-    pub(in crate::app) passthrough_rendition_cache: PassthroughRenditionCache,
-    pub(in crate::app) adjustment_page_params:
-        std::collections::HashMap<usize, crate::adjustment::AdjustParams>,
-    pub(in crate::app) local_adjust_page_layers:
+    thumb_edit_preview_keys: std::collections::HashMap<usize, String>,
+    thumb_adjust_tex: std::collections::HashMap<usize, egui::TextureHandle>,
+    passthrough_rendition_cache: PassthroughRenditionCache,
+    adjustment_page_params: std::collections::HashMap<usize, crate::adjustment::AdjustParams>,
+    local_adjust_page_layers:
         std::collections::HashMap<usize, Vec<local_adjust_core::LocalAdjustmentLayer>>,
-    pub(in crate::app) local_adjust_pages: std::collections::HashSet<usize>,
-    pub(in crate::app) local_adjust_selected_layers: std::collections::HashMap<usize, usize>,
-    pub(in crate::app) local_adjust_generation: std::collections::HashMap<usize, u64>,
-    pub(in crate::app) local_adjust_cache:
-        std::collections::HashMap<LocalAdjustResultKey, LocalAdjustCacheEntry>,
-    pub(in crate::app) local_adjust_pending:
-        std::collections::HashMap<usize, LocalAdjustRenderPending>,
-    pub(in crate::app) export_crop_page_settings:
-        std::collections::HashMap<usize, crate::export_crop::CropSettings>,
-    pub(in crate::app) export_crop_pages: std::collections::HashSet<usize>,
-    pub(in crate::app) mask_pages: std::collections::HashSet<usize>,
-    pub(in crate::app) comic_pages: std::collections::HashSet<usize>,
-    pub(in crate::app) conceal_pages: std::collections::HashSet<usize>,
-    pub(in crate::app) erase_mask_generation: std::collections::HashMap<usize, u64>,
-    pub(in crate::app) conceal_mask_generation: std::collections::HashMap<usize, u64>,
-    pub(in crate::app) edit_result_cache: std::collections::HashMap<EditResultKey, EditResultEntry>,
-    pub(in crate::app) final_ai_cache: std::collections::HashMap<FinalAiKey, FinalAiEntry>,
-    pub(in crate::app) final_ai_pending: std::collections::HashMap<FinalAiKey, FinalAiPending>,
-    pub(in crate::app) final_ai_failed: std::collections::HashSet<FinalAiKey>,
-    pub(in crate::app) final_composite_cache: FinalCompositeCache,
-    pub(in crate::app) final_effect_pending:
-        std::collections::HashMap<FinalCompositeKey, FinalEffectPending>,
-    pub(in crate::app) adjustment_cache: std::collections::HashMap<usize, FsCacheEntry>,
-    pub(in crate::app) erase_result_cache:
-        std::collections::HashMap<EraseResultKey, EraseResultCacheEntry>,
-    pub(in crate::app) erase_preview_cache:
-        std::collections::HashMap<usize, ErasePreviewCacheEntry>,
-    pub(in crate::app) erase_base_cache:
-        std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
-    pub(in crate::app) conceal_base_cache:
-        std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
-    pub(in crate::app) conceal_cache: std::collections::HashMap<usize, ConcealCacheEntry>,
-    pub(in crate::app) comic_cache: std::collections::HashMap<usize, ComicCacheEntry>,
-    pub(in crate::app) comic_bake_pending: std::collections::HashMap<usize, ComicBakePending>,
-    pub(in crate::app) erase_inpaint_pending: std::collections::HashMap<
+    local_adjust_pages: std::collections::HashSet<usize>,
+    local_adjust_selected_layers: std::collections::HashMap<usize, usize>,
+    local_adjust_generation: std::collections::HashMap<usize, u64>,
+    local_adjust_cache: std::collections::HashMap<LocalAdjustResultKey, LocalAdjustCacheEntry>,
+    local_adjust_pending: std::collections::HashMap<usize, LocalAdjustRenderPending>,
+    export_crop_page_settings: std::collections::HashMap<usize, crate::export_crop::CropSettings>,
+    export_crop_pages: std::collections::HashSet<usize>,
+    mask_pages: std::collections::HashSet<usize>,
+    comic_pages: std::collections::HashSet<usize>,
+    conceal_pages: std::collections::HashSet<usize>,
+    erase_mask_generation: std::collections::HashMap<usize, u64>,
+    conceal_mask_generation: std::collections::HashMap<usize, u64>,
+    edit_result_cache: std::collections::HashMap<EditResultKey, EditResultEntry>,
+    final_ai_cache: std::collections::HashMap<FinalAiKey, FinalAiEntry>,
+    final_ai_pending: std::collections::HashMap<FinalAiKey, FinalAiPending>,
+    final_ai_failed: std::collections::HashSet<FinalAiKey>,
+    final_composite_cache: FinalCompositeCache,
+    final_effect_pending: std::collections::HashMap<FinalCompositeKey, FinalEffectPending>,
+    adjustment_cache: std::collections::HashMap<usize, FsCacheEntry>,
+    erase_result_cache: std::collections::HashMap<EraseResultKey, EraseResultCacheEntry>,
+    erase_preview_cache: std::collections::HashMap<usize, ErasePreviewCacheEntry>,
+    erase_base_cache: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
+    conceal_base_cache: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
+    conceal_cache: std::collections::HashMap<usize, ConcealCacheEntry>,
+    comic_cache: std::collections::HashMap<usize, ComicCacheEntry>,
+    comic_bake_pending: std::collections::HashMap<usize, ComicBakePending>,
+    erase_inpaint_pending: std::collections::HashMap<
         crate::ui_erase::EraseInpaintPendingKey,
         crate::ui_erase::EraseInpaintPending,
     >,
-    pub(in crate::app) ai_classify_cache:
-        std::collections::HashMap<usize, crate::ai::ImageCategory>,
-    pub(in crate::app) normalize_ui_states:
+    ai_classify_cache: std::collections::HashMap<usize, crate::ai::ImageCategory>,
+    normalize_ui_states:
         std::collections::HashMap<usize, crate::video::normalize_types::NormalizeUiState>,
-    pub(in crate::app) normalize_auto_scan_suppressed: std::collections::HashSet<usize>,
-    pub(in crate::app) music_bookmarks: Vec<crate::video_bookmarks::VideoBookmarkMeta>,
-    pub(in crate::app) music_bookmarks_loaded_for: Option<PathBuf>,
-    pub(in crate::app) last_loop_pos: std::collections::HashMap<usize, (f64, u64)>,
+    normalize_auto_scan_suppressed: std::collections::HashSet<usize>,
+    music_bookmarks: Vec<crate::video_bookmarks::VideoBookmarkMeta>,
+    music_bookmarks_loaded_for: Option<PathBuf>,
+    last_loop_pos: std::collections::HashMap<usize, (f64, u64)>,
 }
 
 #[cfg(windows)]
@@ -1201,7 +1178,7 @@ impl Drop for ViewerContextBundle {
 
 #[cfg(windows)]
 impl ViewerContextBundle {
-    pub(in crate::app) fn set_items_generation(&mut self, items_generation: u64) {
+    fn set_items_generation(&mut self, items_generation: u64) {
         self.items_generation = items_generation;
         self.fs_cache.set_items_generation(items_generation);
         self.fs_pending.set_items_generation(items_generation);
@@ -1210,12 +1187,12 @@ impl ViewerContextBundle {
             .set_items_generation(items_generation);
     }
 
-    pub(in crate::app) fn clear_normalize_state(&mut self) {
+    fn clear_normalize_state(&mut self) {
         self.normalize_ui_states.clear();
         self.normalize_auto_scan_suppressed.clear();
     }
 
-    pub(in crate::app) fn empty() -> Self {
+    fn empty() -> Self {
         // per-context ロード複合体: 空コンテキストは「誰も繋がっていない」fresh channel と
         // token を持つ (App::new と同じ初期状態。この tx を掴む worker は存在しないので
         // rx は常に Empty を返す)。
@@ -2954,18 +2931,6 @@ impl App {
 }
 
 #[cfg(all(test, windows))]
-pub(in crate::app) fn passive_right_drag_image_bundle_for_test(path: &str) -> ViewerContextBundle {
-    let mut bundle = ViewerContextBundle::empty();
-    bundle.items = vec![GridItem::Image(PathBuf::from(path))];
-    bundle.thumbnails = vec![ThumbnailState::Pending];
-    bundle.image_metas = vec![None];
-    bundle.visible_indices = vec![0];
-    bundle.selected = Some(0);
-    bundle.fullscreen_idx = Some(0);
-    bundle
-}
-
-#[cfg(all(test, windows))]
 impl App {
     pub(in crate::app) fn begin_mounted_detached_session_for_test(
         &mut self,
@@ -2990,30 +2955,23 @@ impl App {
         self.last_active_detached_window_id = Some(window_id);
     }
 
-    pub(in crate::app) fn install_window_context_for_test(
+    pub(in crate::app) fn build_window_context_for_test(
         &mut self,
-        bundle: ViewerContextBundle,
         window_id: u64,
+        configure: impl FnOnce(&mut Self),
     ) -> ViewerContextId {
-        assert!(self.viewer_contexts.table.pending.is_none());
-        assert!(matches!(
-            self.viewer_contexts.table.projection,
-            Projection::Mounted(_)
-        ));
-        let id = self.viewer_contexts.table.allocate_id();
-        self.viewer_contexts.table.deposit(id, Box::new(bundle));
-        self.viewer_contexts
-            .table
-            .bind_window(id, window_id)
-            .unwrap_or_else(|error| panic!("test context binding failed: {error:?}"));
-        id
+        self.build_viewer_context("test_build_window_context", |app, _reserved| {
+            configure(app);
+            app.reserve_window_binding_for_build(window_id);
+            BuildOutcome::Commit
+        })
+        .expect("test window viewer context build must commit")
     }
-
     pub(in crate::app) fn push_window_context_for_test(
         &mut self,
         ctx: &egui::Context,
         window_id: u64,
-        bundle: ViewerContextBundle,
+        configure: impl FnOnce(&mut Self),
     ) -> ViewerContextId {
         let texture = ctx.load_texture(
             format!("window_context_for_test_{window_id}"),
@@ -3039,31 +2997,8 @@ impl App {
             focused_last_frame: false,
             initial_placement_applied: true,
         };
-        let id = self.install_window_context_for_test(bundle, window_id);
+        let id = self.build_window_context_for_test(window_id, configure);
         self.detached_image_windows.push(snapshot);
-        id
-    }
-
-    pub(in crate::app) fn install_active_context_for_test(
-        &mut self,
-        mut bundle: ViewerContextBundle,
-    ) -> ViewerContextId {
-        let existing = self.active_detached_session;
-        let window_id = bundle
-            .viewer_session
-            .detached_window_id
-            .or(existing.map(|session| session.window_id))
-            .or(self.detached_viewer_window_id)
-            .unwrap_or_else(|| self.allocate_detached_viewer_window_id());
-        bundle.viewer_session.detached_window_id = Some(window_id);
-        let id = self.install_window_context_for_test(bundle, window_id);
-        if let Some(session) = existing {
-            self.active_detached_session = Some(ActiveDetachedSession {
-                window_id,
-                source: session.source,
-            });
-        }
-        self.last_active_detached_window_id = Some(window_id);
         id
     }
 
@@ -3092,29 +3027,6 @@ impl App {
         };
         self.retire_context(id, "test_remove_active_context", |_| ())
             .unwrap_or_else(|error| panic!("test active context retire failed: {error:?}"));
-    }
-
-    pub(in crate::app) fn active_context_bundle_for_test(&self) -> Option<&ViewerContextBundle> {
-        let id = self.active_viewer_context_id()?;
-        self.context_bundle_for_test(id)
-    }
-
-    pub(in crate::app) fn window_context_bundle_for_test(
-        &self,
-        window_id: u64,
-    ) -> Option<&ViewerContextBundle> {
-        let (id, _) = self.locate_window_context(window_id)?;
-        self.context_bundle_for_test(id)
-    }
-
-    fn context_bundle_for_test(&self, id: ViewerContextId) -> Option<&ViewerContextBundle> {
-        match self.viewer_contexts.table.residence(id) {
-            ContextResidence::AtRest => match self.viewer_contexts.table.slots.get(&id) {
-                Some(Slot::AtRest(bundle)) => Some(bundle),
-                _ => unreachable!(),
-            },
-            _ => None,
-        }
     }
 
     pub(in crate::app) fn stash_mounted_as_active_for_test(

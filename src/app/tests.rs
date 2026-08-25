@@ -6,8 +6,6 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 #[cfg(windows)]
-use crate::app::viewer_context_registry::passive_right_drag_image_bundle_for_test as passive_right_drag_image_bundle;
-
 #[cfg(windows)]
 std::thread_local! {
     static METADATA_BUSY_INITIAL_FOR_TEST: Cell<bool> = const { Cell::new(false) };
@@ -425,10 +423,10 @@ fn page_dims_cache_does_not_cross_equal_generation_viewer_bundles() {
     app.items_generation = 5;
     app.page_dims_cache.record(5, 0, (1800, 1100));
 
-    let mut detached = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-    detached.items_generation = 5;
-    detached.page_dims_cache.record(5, 0, (900, 1400));
-    app.install_active_context_for_test(detached);
+    app.build_active_context_for_test(None, DetachedSource::Image, |detached| {
+        detached.items_generation = 5;
+        detached.page_dims_cache.record(5, 0, (900, 1400));
+    });
 
     let detached_dims = app
         .with_active_viewer_context(|mounted| {
@@ -442,13 +440,10 @@ fn page_dims_cache_does_not_cross_equal_generation_viewer_bundles() {
         Some((1800, 1100)),
         "同じ generation 番号でも main と detached の寸法を混同してはならない"
     );
-    assert_eq!(
-        app.active_context_bundle_for_test()
-            .expect("detached bundle remains parked")
-            .page_dims_cache
-            .get(5, 0),
-        Some((900, 1400))
-    );
+    app.with_active_viewer_context(|detached| {
+        assert_eq!(detached.page_dims_cache.get(5, 0), Some((900, 1400)));
+    })
+    .expect("detached bundle remains parked");
 }
 
 fn single_folder_navigation_holdover(page_idx: usize, texture: egui::TextureHandle) -> FsHoldover {
@@ -645,36 +640,35 @@ fn metadata_folder_pin_refresh_does_not_navigate_or_close_detached_viewers() {
 
     let active_window_id = 789;
     let active_generation = (1_u64 << 63) | (5_u64 << 32);
-    app.begin_active_detached_session(active_window_id, DetachedSource::Image);
-    let mut active = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-    active.current_folder = Some(folder.clone());
-    active.items = vec![
-        GridItem::Image(folder.join("active.png")),
-        GridItem::Folder(folder.join("child")),
-    ];
-    active.image_metas = vec![None; 2];
-    active.thumbnails = vec![ThumbnailState::Pending; 2];
-    active.fullscreen_idx = Some(0);
-    active.items_generation = active_generation;
-    active.navigation_scope = ViewerNavigationScope::DetachedPhysical;
-    active.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-    active.viewer_session.independent_active = true;
-    active.viewer_session.detached_window_id = Some(active_window_id);
-    app.install_active_context_for_test(active);
+    app.build_active_context_for_test(Some(active_window_id), DetachedSource::Image, |active| {
+        active.current_folder = Some(folder.clone());
+        active.items = vec![
+            GridItem::Image(folder.join("active.png")),
+            GridItem::Folder(folder.join("child")),
+        ];
+        active.image_metas = vec![None; 2];
+        active.thumbnails = vec![ThumbnailState::Pending; 2];
+        active.fullscreen_idx = Some(0);
+        active.items_generation = active_generation;
+        active.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        active.viewer_presentation = ViewerPresentation::DetachedWindow;
+        active.detached_viewer_independent_active = true;
+        active.detached_viewer_window_id = Some(active_window_id);
+    });
 
     let window_id = 790;
     let parked_generation = (1_u64 << 63) | (6_u64 << 32);
-    let mut parked = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-    parked.current_folder = Some(folder.clone());
-    parked.items = vec![GridItem::Video(folder.join("parked.mp4"))];
-    parked.image_metas = vec![None];
-    parked.thumbnails = vec![ThumbnailState::Pending];
-    parked.fullscreen_idx = Some(0);
-    parked.items_generation = parked_generation;
-    parked.navigation_scope = ViewerNavigationScope::DetachedPhysical;
-    parked.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-    parked.viewer_session.detached_window_id = Some(window_id);
-    app.push_window_context_for_test(&ctx, window_id, parked);
+    app.push_window_context_for_test(&ctx, window_id, |parked| {
+        parked.current_folder = Some(folder.clone());
+        parked.items = vec![GridItem::Video(folder.join("parked.mp4"))];
+        parked.image_metas = vec![None];
+        parked.thumbnails = vec![ThumbnailState::Pending];
+        parked.fullscreen_idx = Some(0);
+        parked.items_generation = parked_generation;
+        parked.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        parked.viewer_presentation = ViewerPresentation::DetachedWindow;
+        parked.detached_viewer_window_id = Some(window_id);
+    });
 
     let mut main = metadata_context_result(
         crate::app::metadata_import_refresh::ContextSlot::Main,
@@ -727,13 +721,17 @@ fn metadata_folder_pin_refresh_does_not_navigate_or_close_detached_viewers() {
     assert!(!std::sync::Arc::ptr_eq(&previous_cancel, &app.cancel_token));
     assert!(!cache_map.read().unwrap().contains_key(&stale_pin_key));
     assert!(catalog.load_one(&stale_pin_key).unwrap().is_none());
-    let active = app.active_context_bundle_for_test().unwrap();
-    assert_eq!(active.items_generation, active_generation);
-    assert_eq!(active.fullscreen_idx, Some(0));
+    app.with_active_viewer_context(|active| {
+        assert_eq!(active.items_generation, active_generation);
+        assert_eq!(active.fullscreen_idx, Some(0));
+    })
+    .unwrap();
     assert_eq!(app.active_detached_window_id(), Some(active_window_id));
-    let parked = app.window_context_bundle_for_test(window_id).unwrap();
-    assert_eq!(parked.items_generation, parked_generation);
-    assert_eq!(parked.fullscreen_idx, Some(0));
+    app.with_window_viewer_context(window_id, |parked| {
+        assert_eq!(parked.items_generation, parked_generation);
+        assert_eq!(parked.fullscreen_idx, Some(0));
+    })
+    .unwrap();
 }
 
 #[test]
@@ -745,9 +743,9 @@ fn active_detached_mount_restores_both_contexts_and_depth_after_panic() {
     app.items = vec![GridItem::Image(main_path.clone())];
     app.detached_viewer_main_history_suppression_depth = 7;
 
-    let mut detached = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-    detached.items = vec![GridItem::Image(detached_path.clone())];
-    app.install_active_context_for_test(detached);
+    app.build_active_context_for_test(None, DetachedSource::Image, |detached| {
+        detached.items = vec![GridItem::Image(detached_path.clone())];
+    });
 
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         app.with_active_viewer_context(|mounted| {
@@ -782,9 +780,9 @@ fn paused_detached_mount_restores_both_contexts_after_panic() {
     app.items = vec![GridItem::Image(main_path.clone())];
     app.detached_viewer_main_history_suppression_depth = 5;
 
-    let mut paused = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-    paused.items = vec![GridItem::Image(paused_path.clone())];
-    app.push_window_context_for_test(&ctx, window_id, paused);
+    app.push_window_context_for_test(&ctx, window_id, |paused| {
+        paused.items = vec![GridItem::Image(paused_path.clone())];
+    });
 
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = app.with_window_viewer_context(window_id, |mounted| {
@@ -845,14 +843,10 @@ fn window_mount_round_trips_context_when_snapshot_vector_changes_inside_closure(
     let main_path = PathBuf::from(r"C:\main\page.jpg");
     let sibling_path = PathBuf::from(r"C:\sibling\page.jpg");
     app.items = vec![GridItem::Image(main_path.clone())];
-    app.push_window_context_for_test(
-        &ctx,
-        window_id,
-        crate::app::viewer_context_registry::ViewerContextBundle::empty(),
-    );
-    let mut sibling_bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-    sibling_bundle.items = vec![GridItem::Image(sibling_path.clone())];
-    app.push_window_context_for_test(&ctx, sibling_window_id, sibling_bundle);
+    app.push_window_context_for_test(&ctx, window_id, |_| {});
+    app.push_window_context_for_test(&ctx, sibling_window_id, |sibling| {
+        sibling.items = vec![GridItem::Image(sibling_path.clone())];
+    });
 
     let result = app.with_window_viewer_context(window_id, |mounted| {
         mounted
@@ -883,10 +877,11 @@ fn metadata_apply_preserves_paused_index_three_way_identity() {
     };
 
     let mut mismatched = phase_c_support::setup_app();
-    let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-    bundle.items_generation = mismatched.items_generation;
-    bundle.rating_cache = std::collections::HashMap::from([(0, 2)]);
-    mismatched.push_window_context_for_test(&ctx, 710, bundle);
+    let generation = mismatched.items_generation;
+    mismatched.push_window_context_for_test(&ctx, 710, |context| {
+        context.items_generation = generation;
+        context.rating_cache = std::collections::HashMap::from([(0, 2)]);
+    });
     let result = crate::app::metadata_import_refresh::RefreshResult {
         contexts: vec![metadata_context_result(
             crate::app::metadata_import_refresh::ContextSlot::PausedDetached {
@@ -914,15 +909,12 @@ fn metadata_apply_preserves_paused_index_three_way_identity() {
 fn metadata_apply_skips_shifted_window_when_original_index_is_out_of_range() {
     let ctx = egui::Context::default();
     let mut shifted = phase_c_support::setup_app();
-    shifted.push_window_context_for_test(
-        &ctx,
-        719,
-        crate::app::viewer_context_registry::ViewerContextBundle::empty(),
-    );
-    let mut shifted_bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-    shifted_bundle.items_generation = shifted.items_generation;
-    shifted_bundle.rating_cache = std::collections::HashMap::from([(0, 3)]);
-    shifted.push_window_context_for_test(&ctx, 720, shifted_bundle);
+    shifted.push_window_context_for_test(&ctx, 719, |_| {});
+    let generation = shifted.items_generation;
+    shifted.push_window_context_for_test(&ctx, 720, |context| {
+        context.items_generation = generation;
+        context.rating_cache = std::collections::HashMap::from([(0, 3)]);
+    });
     shifted.detached_image_windows.remove(0);
     let result = crate::app::metadata_import_refresh::RefreshResult {
         contexts: vec![metadata_context_result(
@@ -966,14 +958,14 @@ fn metadata_request_preserves_paused_vector_index_across_bundleless_window() {
     let bundleless = contextless_test_window(&ctx, 730);
     app.detached_image_windows.push(bundleless);
 
-    let mut indexed = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-    indexed.current_folder = Some(PathBuf::from(r"C:\Pictures\Child"));
-    indexed.items = vec![GridItem::Image(PathBuf::from(
-        r"C:\Pictures\Child\page.jpg",
-    ))];
-    indexed.image_metas = vec![None];
-    indexed.thumbnails = vec![ThumbnailState::Pending];
-    app.push_window_context_for_test(&ctx, 731, indexed);
+    app.push_window_context_for_test(&ctx, 731, |indexed| {
+        indexed.current_folder = Some(PathBuf::from(r"C:\Pictures\Child"));
+        indexed.items = vec![GridItem::Image(PathBuf::from(
+            r"C:\Pictures\Child\page.jpg",
+        ))];
+        indexed.image_metas = vec![None];
+        indexed.thumbnails = vec![ThumbnailState::Pending];
+    });
 
     app.begin_metadata_import_terminal_refresh();
     while !app.advance_metadata_import_terminal_refresh(&import_root, false, false) {}
@@ -1068,24 +1060,24 @@ fn all_context_clear_processes_a_paused_context_that_is_already_mounted() {
     let mut app = phase_c_support::setup_app();
     let ctx = egui::Context::default();
     let window_id = 750;
-    let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
     let mounted_folder = PathBuf::from(r"C:\mounted");
     let active_folder = PathBuf::from(r"C:\active");
     let sibling_folder = PathBuf::from(r"C:\sibling");
-    bundle.current_folder = Some(mounted_folder.clone());
-    bundle.items = vec![GridItem::Image(PathBuf::from(r"C:\paused\preview.jpg"))];
-    bundle.thumbnails = vec![ThumbnailState::Pending];
-    bundle
-        .thumb_edit_preview_keys
-        .insert(0, "paused-preview".to_string());
-    app.push_window_context_for_test(&ctx, window_id, bundle);
-    let mut active_bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-    active_bundle.current_folder = Some(active_folder.clone());
-    app.install_active_context_for_test(active_bundle);
+    app.push_window_context_for_test(&ctx, window_id, |context| {
+        context.current_folder = Some(mounted_folder.clone());
+        context.items = vec![GridItem::Image(PathBuf::from(r"C:\paused\preview.jpg"))];
+        context.thumbnails = vec![ThumbnailState::Pending];
+        context
+            .thumb_edit_preview_keys
+            .insert(0, "paused-preview".to_string());
+    });
+    app.build_active_context_for_test(None, DetachedSource::Image, |active| {
+        active.current_folder = Some(active_folder.clone());
+    });
     let sibling_window_id = 751;
-    let mut sibling_bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-    sibling_bundle.current_folder = Some(sibling_folder.clone());
-    app.push_window_context_for_test(&ctx, sibling_window_id, sibling_bundle);
+    app.push_window_context_for_test(&ctx, sibling_window_id, |sibling| {
+        sibling.current_folder = Some(sibling_folder.clone());
+    });
     begin_current_edit_preview_clear_trace();
 
     let cleared = app
@@ -1124,19 +1116,16 @@ fn vst3_production_traversal_survives_removing_a_later_paused_window() {
     let first_id = 760;
     let removed_id = 761;
     let last_id = 762;
-    let make_bundle = |window_id: u64| {
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = vec![GridItem::Video(PathBuf::from(format!(
-            r"C:\videos\{window_id}.mp4"
-        )))];
-        bundle.fullscreen_idx = Some(0);
-        bundle.vst3_deferred_media_open = Some(0);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.detached_window_id = Some(window_id);
-        bundle
-    };
     for window_id in [first_id, removed_id, last_id] {
-        app.push_window_context_for_test(&ctx, window_id, make_bundle(window_id));
+        app.push_window_context_for_test(&ctx, window_id, |context| {
+            context.items = vec![GridItem::Video(PathBuf::from(format!(
+                r"C:\videos\{window_id}.mp4"
+            )))];
+            context.fullscreen_idx = Some(0);
+            context.vst3_deferred_media_open = Some(0);
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_window_id = Some(window_id);
+        });
     }
 
     let mut consumed = Vec::new();
@@ -1190,13 +1179,13 @@ fn parked_vst3_consume_panic_restores_marker_bundle_and_main_projection() {
     app.items = vec![GridItem::Image(main_path.clone())];
     app.native_video_parked_live_input_window_id = previous_marker;
 
-    let mut parked = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-    parked.items = vec![GridItem::Video(parked_path.clone())];
-    parked.fullscreen_idx = Some(0);
-    parked.vst3_deferred_media_open = Some(0);
-    parked.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-    parked.viewer_session.detached_window_id = Some(window_id);
-    app.push_window_context_for_test(&ctx, window_id, parked);
+    app.push_window_context_for_test(&ctx, window_id, |parked| {
+        parked.items = vec![GridItem::Video(parked_path.clone())];
+        parked.fullscreen_idx = Some(0);
+        parked.vst3_deferred_media_open = Some(0);
+        parked.viewer_presentation = ViewerPresentation::DetachedWindow;
+        parked.detached_viewer_window_id = Some(window_id);
+    });
 
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         app.consume_deferred_vst3_media_open_in_all_contexts(|mounted, idx| {
@@ -1280,10 +1269,10 @@ fn metadata_import_terminal_index_build_is_split_and_compact() {
     app.thumbnails = (0..app.items.len())
         .map(|_| ThumbnailState::Pending)
         .collect();
-    let mut unrelated = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-    unrelated.current_folder = Some(PathBuf::from("C:/Other"));
-    unrelated.items = vec![GridItem::Image(PathBuf::from("C:/Other/keep.jpg"))];
-    app.install_active_context_for_test(unrelated);
+    app.build_active_context_for_test(None, DetachedSource::Image, |unrelated| {
+        unrelated.current_folder = Some(PathBuf::from("C:/Other"));
+        unrelated.items = vec![GridItem::Image(PathBuf::from("C:/Other/keep.jpg"))];
+    });
 
     app.begin_metadata_import_terminal_refresh();
     assert!(!app.advance_metadata_import_terminal_refresh(&root, false, true));
@@ -1336,14 +1325,20 @@ fn metadata_import_terminal_refresh_reaches_main_and_detached_context_for_same_b
     app.visible_indices.clear();
     app.details_order.clear();
 
-    let mut detached = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-    detached.items = app.items.clone();
-    detached.image_metas = vec![None];
-    detached.thumbnails = vec![ThumbnailState::Pending];
-    detached.rating_cache = std::collections::HashMap::from([(0, 2)]);
-    detached.visible_indices.clear();
-    detached.details_order.clear();
-    app.install_active_context_for_test(detached);
+    let detached_items = app.items.clone();
+    let detached_items_generation = app.items_generation;
+    let detached_window_id = app.allocate_detached_viewer_window_id();
+    app.build_window_context_for_test(detached_window_id, |detached| {
+        detached.items = detached_items;
+        detached.items_generation = detached_items_generation;
+        detached.image_metas = vec![None];
+        detached.thumbnails = vec![ThumbnailState::Pending];
+        detached.rating_cache = std::collections::HashMap::from([(0, 2)]);
+        detached.visible_indices.clear();
+        detached.details_order.clear();
+        detached.detached_viewer_window_id = Some(detached_window_id);
+    });
+    app.last_active_detached_window_id = Some(detached_window_id);
 
     let context = |slot| crate::app::metadata_import_refresh::ContextResult {
         slot,
@@ -1386,16 +1381,16 @@ fn metadata_import_terminal_refresh_reaches_main_and_detached_context_for_same_b
     );
     assert_eq!(app.visible_indices, vec![0]);
     assert_eq!(app.details_order, vec![0]);
-    let detached = app
-        .active_context_bundle_for_test()
-        .expect("detached context remains parked");
-    assert_eq!(detached.rating_cache.get(&0), Some(&5));
-    assert_eq!(
-        detached.tags_cache.get(&page_key),
-        Some(&vec!["imported".to_string()])
-    );
-    assert_eq!(detached.visible_indices, vec![0]);
-    assert_eq!(detached.details_order, vec![0]);
+    app.with_active_viewer_context(|detached| {
+        assert_eq!(detached.rating_cache.get(&0), Some(&5));
+        assert_eq!(
+            detached.tags_cache.get(&page_key),
+            Some(&vec!["imported".to_string()])
+        );
+        assert_eq!(detached.visible_indices, vec![0]);
+        assert_eq!(detached.details_order, vec![0]);
+    })
+    .expect("detached context remains parked");
 }
 
 #[cfg(windows)]
@@ -1411,19 +1406,19 @@ fn stale_main_strands_fresh_parked_pdf_rating_memo() {
         .into_iter()
         .collect::<String>(),
     );
-    let mut parked = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-    parked.current_folder = Some(pdf.clone());
-    parked.items = vec![GridItem::PdfPage {
-        pdf_path: pdf,
-        page_num: 0,
-        content_type: None,
-    }];
-    parked.image_metas = vec![None];
-    parked.thumbnails = vec![ThumbnailState::Pending];
-    parked.items_generation = 17;
-    parked.rating_cache = std::collections::HashMap::from([(0, 0)]);
-    parked.current_folder_rating_cache = Some(0);
-    app.push_window_context_for_test(&ctx, window_id, parked);
+    app.push_window_context_for_test(&ctx, window_id, |parked| {
+        parked.current_folder = Some(pdf.clone());
+        parked.items = vec![GridItem::PdfPage {
+            pdf_path: pdf,
+            page_num: 0,
+            content_type: None,
+        }];
+        parked.image_metas = vec![None];
+        parked.thumbnails = vec![ThumbnailState::Pending];
+        parked.items_generation = 17;
+        parked.rating_cache = std::collections::HashMap::from([(0, 0)]);
+        parked.current_folder_rating_cache = Some(0);
+    });
 
     let stale_main_generation = app.items_generation;
     app.items_generation = app.items_generation.wrapping_add(1);
@@ -1516,18 +1511,18 @@ fn parked_pdf_metadata_request_includes_container_rating_key() {
             .collect::<String>(),
     );
     let window_id = 781;
-    let mut parked = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-    parked.current_folder = Some(pdf.clone());
-    parked.items = (0..2)
-        .map(|page_num| GridItem::PdfPage {
-            pdf_path: pdf.clone(),
-            page_num,
-            content_type: None,
-        })
-        .collect();
-    parked.image_metas = vec![None; parked.items.len()];
-    parked.thumbnails = vec![ThumbnailState::Pending; parked.items.len()];
-    app.push_window_context_for_test(&ctx, window_id, parked);
+    app.push_window_context_for_test(&ctx, window_id, |parked| {
+        parked.current_folder = Some(pdf.clone());
+        parked.items = (0..2)
+            .map(|page_num| GridItem::PdfPage {
+                pdf_path: pdf.clone(),
+                page_num,
+                content_type: None,
+            })
+            .collect();
+        parked.image_metas = vec![None; parked.items.len()];
+        parked.thumbnails = vec![ThumbnailState::Pending; parked.items.len()];
+    });
 
     app.begin_metadata_import_terminal_refresh();
     while !app.advance_metadata_import_terminal_refresh(&root, false, false) {}
@@ -1926,33 +1921,39 @@ fn edit_preview_clear_reaches_main_active_and_paused_contexts() {
         source_dims: Some((1, 1)),
         layout_dims: None,
     };
-    let prepare_bundle = |path: &str| {
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
+    let prepare_context = |bundle: &mut App, path: &str| {
         bundle.items = vec![GridItem::Image(PathBuf::from(path))];
         bundle.thumbnails = vec![loaded()];
         bundle
             .thumb_edit_preview_keys
             .insert(0, format!("{path}::preview"));
-        bundle
     };
 
     app.items = vec![GridItem::Image(PathBuf::from(r"C:\Pictures\main.jpg"))];
     app.thumbnails = vec![loaded()];
     app.thumb_edit_preview_keys
         .insert(0, "main::preview".to_string());
-    app.install_active_context_for_test(prepare_bundle(r"C:\Pictures\active.jpg"));
-    app.push_window_context_for_test(&ctx, 91, prepare_bundle(r"C:\Pictures\paused.jpg"));
+    app.build_active_context_for_test(None, DetachedSource::Image, |active| {
+        prepare_context(active, r"C:\Pictures\active.jpg");
+    });
+    app.push_window_context_for_test(&ctx, 91, |paused| {
+        prepare_context(paused, r"C:\Pictures\paused.jpg");
+    });
 
     app.clear_all_edit_preview_materializations();
 
     assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
     assert!(app.thumb_edit_preview_keys.is_empty());
-    let active = app.active_context_bundle_for_test().unwrap();
-    assert!(matches!(active.thumbnails[0], ThumbnailState::Evicted));
-    assert!(active.thumb_edit_preview_keys.is_empty());
-    let paused = app.window_context_bundle_for_test(91).unwrap();
-    assert!(matches!(paused.thumbnails[0], ThumbnailState::Evicted));
-    assert!(paused.thumb_edit_preview_keys.is_empty());
+    app.with_active_viewer_context(|active| {
+        assert!(matches!(active.thumbnails[0], ThumbnailState::Evicted));
+        assert!(active.thumb_edit_preview_keys.is_empty());
+    })
+    .unwrap();
+    app.with_window_viewer_context(91, |paused| {
+        assert!(matches!(paused.thumbnails[0], ThumbnailState::Evicted));
+        assert!(paused.thumb_edit_preview_keys.is_empty());
+    })
+    .unwrap();
 }
 
 #[cfg(windows)]
@@ -1985,8 +1986,7 @@ fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_context_w
         .insert(FacetEditFlag::Tagged);
 
     let items_generation = app.items_generation;
-    let make_bundle = |folder: &str| {
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
+    let configure_context = |bundle: &mut App, folder: &str| {
         bundle.current_folder = Some(PathBuf::from(folder));
         bundle.items = items.clone();
         bundle.image_metas = vec![None; items.len()];
@@ -1994,10 +1994,16 @@ fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_context_w
         bundle.visible_indices = vec![0, 1];
         bundle.details_order = vec![0, 1];
         bundle.items_generation = items_generation;
-        bundle
     };
-    app.install_active_context_for_test(make_bundle(r"C:\Pictures\Child"));
-    app.push_window_context_for_test(&ctx, 73, make_bundle(r"C:\Pictures\Child\Paused"));
+    let active_window_id = app.allocate_detached_viewer_window_id();
+    app.build_window_context_for_test(active_window_id, |active| {
+        configure_context(active, r"C:\Pictures\Child");
+        active.detached_viewer_window_id = Some(active_window_id);
+    });
+    app.last_active_detached_window_id = Some(active_window_id);
+    app.push_window_context_for_test(&ctx, 73, |paused| {
+        configure_context(paused, r"C:\Pictures\Child\Paused");
+    });
 
     let context = |slot| crate::app::metadata_import_refresh::ContextResult {
         slot,
@@ -2076,20 +2082,24 @@ fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_context_w
         &app.tag_prewarm_pending,
         &app.tag_legacy_seed_pending,
     );
-    let active = app.active_context_bundle_for_test().unwrap();
-    assert_context(
-        &active.tags_cache,
-        &active.visible_indices,
-        &active.tag_prewarm_pending,
-        &active.tag_legacy_seed_pending,
-    );
-    let paused = app.window_context_bundle_for_test(73).unwrap();
-    assert_context(
-        &paused.tags_cache,
-        &paused.visible_indices,
-        &paused.tag_prewarm_pending,
-        &paused.tag_legacy_seed_pending,
-    );
+    app.with_active_viewer_context(|active| {
+        assert_context(
+            &active.tags_cache,
+            &active.visible_indices,
+            &active.tag_prewarm_pending,
+            &active.tag_legacy_seed_pending,
+        );
+    })
+    .unwrap();
+    app.with_window_viewer_context(73, |paused| {
+        assert_context(
+            &paused.tags_cache,
+            &paused.visible_indices,
+            &paused.tag_prewarm_pending,
+            &paused.tag_legacy_seed_pending,
+        );
+    })
+    .unwrap();
 }
 
 #[cfg(windows)]
@@ -2118,33 +2128,31 @@ fn bookmark_presence_rebuilds_main_active_and_paused_contexts() {
         Vec::new(),
     ));
 
-    let make_bundle = |folder: &str| {
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
+    let configure_context = |bundle: &mut App, folder: &str| {
         bundle.current_folder = Some(PathBuf::from(folder));
         bundle.items = items.clone();
         bundle.image_metas = vec![None; items.len()];
         bundle.thumbnails = vec![ThumbnailState::Pending; items.len()];
         bundle.visible_indices = vec![0, 1];
-        bundle
     };
-    app.install_active_context_for_test(make_bundle(r"C:\Media\Active"));
-    app.push_window_context_for_test(&ctx, 91, make_bundle(r"C:\Media\Active\Paused"));
+    app.build_active_context_for_test(None, DetachedSource::Image, |active| {
+        configure_context(active, r"C:\Media\Active");
+    });
+    app.push_window_context_for_test(&ctx, 91, |paused| {
+        configure_context(paused, r"C:\Media\Active\Paused");
+    });
 
     app.rebuild_all_viewer_context_visible_indices();
 
     assert_eq!(app.visible_indices, vec![0]);
-    assert_eq!(
-        app.active_context_bundle_for_test()
-            .unwrap()
-            .visible_indices,
-        vec![0]
-    );
-    assert_eq!(
-        app.window_context_bundle_for_test(91)
-            .unwrap()
-            .visible_indices,
-        vec![0]
-    );
+    app.with_active_viewer_context(|active| {
+        assert_eq!(active.visible_indices, vec![0]);
+    })
+    .unwrap();
+    app.with_window_viewer_context(91, |paused| {
+        assert_eq!(paused.visible_indices, vec![0]);
+    })
+    .unwrap();
     assert_eq!(
         app.facet_filter_scope,
         Some(main_scope),
@@ -2186,8 +2194,7 @@ fn metadata_transfer_quiesces_and_resumes_all_context_writer_handles() {
         Vec::new(),
     ));
 
-    let make_bundle = |name: &str, folder: &str| {
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
+    let configure_context = |bundle: &mut App, name: &str, folder: &str| {
         bundle.current_folder = Some(PathBuf::from(folder));
         bundle.items = items.clone();
         bundle.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
@@ -2195,14 +2202,13 @@ fn metadata_transfer_quiesces_and_resumes_all_context_writer_handles() {
             temp.path().join(name),
             Vec::new(),
         ));
-        bundle
     };
-    app.install_active_context_for_test(make_bundle("active", r"C:\Pictures\Child"));
-    app.push_window_context_for_test(
-        &ctx,
-        113,
-        make_bundle("paused", r"C:\Pictures\Child\Paused"),
-    );
+    app.build_active_context_for_test(None, DetachedSource::Image, |active| {
+        configure_context(active, "active", r"C:\Pictures\Child");
+    });
+    app.push_window_context_for_test(&ctx, 113, |paused| {
+        configure_context(paused, "paused", r"C:\Pictures\Child\Paused");
+    });
 
     // bundle退避後に別contextでratingが更新された状態を作る。quiesceの一時mountで
     // 各context cacheへ反映されるが、navigationではないのでfacet scopeは不変でなければならない。
@@ -2243,14 +2249,18 @@ fn metadata_transfer_quiesces_and_resumes_all_context_writer_handles() {
     assert_eq!(app.rating_cache.get(&0), Some(&4));
     assert!(app.tag_prewarm_pending.is_none());
     assert!(app.tag_legacy_seed_pending.is_none());
-    let active = app.active_context_bundle_for_test().unwrap();
-    assert_eq!(active.rating_cache.get(&0), Some(&4));
-    assert!(active.tag_prewarm_pending.is_none());
-    assert!(active.tag_legacy_seed_pending.is_none());
-    let paused = app.window_context_bundle_for_test(113).unwrap();
-    assert_eq!(paused.rating_cache.get(&0), Some(&4));
-    assert!(paused.tag_prewarm_pending.is_none());
-    assert!(paused.tag_legacy_seed_pending.is_none());
+    app.with_active_viewer_context(|active| {
+        assert_eq!(active.rating_cache.get(&0), Some(&4));
+        assert!(active.tag_prewarm_pending.is_none());
+        assert!(active.tag_legacy_seed_pending.is_none());
+    })
+    .unwrap();
+    app.with_window_viewer_context(113, |paused| {
+        assert_eq!(paused.rating_cache.get(&0), Some(&4));
+        assert!(paused.tag_prewarm_pending.is_none());
+        assert!(paused.tag_legacy_seed_pending.is_none());
+    })
+    .unwrap();
     assert_eq!(
         app.facet_filter_scope,
         Some(main_scope),
@@ -2304,18 +2314,14 @@ fn metadata_transfer_quiesces_and_resumes_all_context_writer_handles() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert!(app.tag_prewarm_pending.is_some());
-    assert!(
-        app.active_context_bundle_for_test()
-            .unwrap()
-            .tag_prewarm_pending
-            .is_some()
-    );
-    assert!(
-        app.window_context_bundle_for_test(113)
-            .unwrap()
-            .tag_prewarm_pending
-            .is_some()
-    );
+    app.with_active_viewer_context(|active| {
+        assert!(active.tag_prewarm_pending.is_some());
+    })
+    .unwrap();
+    app.with_window_viewer_context(113, |paused| {
+        assert!(paused.tag_prewarm_pending.is_some());
+    })
+    .unwrap();
 }
 
 #[test]
@@ -3328,28 +3334,33 @@ fn auto_fullscreen_image_only_folder_preserves_grid_intent_for_always_new_detach
         app.fullscreen_idx, None,
         "the auto-opened image viewer must not remain bundled with main"
     );
-    let active = app
-        .active_context_bundle_for_test()
+    let (active_window_id, active_grid_intent) = app
+        .with_active_viewer_context(|active| {
+            assert_eq!(active.fullscreen_idx, Some(0));
+            assert_eq!(
+                active.viewer_presentation,
+                ViewerPresentation::DetachedWindow
+            );
+            assert_eq!(
+                active.navigation_scope,
+                ViewerNavigationScope::DetachedPhysical
+            );
+            (
+                active.detached_viewer_window_id,
+                active.fs_open_intent_from_grid,
+            )
+        })
         .expect("the auto-opened image folder must own an active context");
-    assert_eq!(active.fullscreen_idx, Some(0));
-    assert_eq!(
-        active.viewer_session.presentation,
-        ViewerPresentation::DetachedWindow
-    );
-    assert_eq!(
-        active.navigation_scope,
-        ViewerNavigationScope::DetachedPhysical
-    );
     assert!(
         app.detached_viewer_focus_requested,
         "image-only folder auto fullscreen happens after enumeration, but it is still an explicit grid/open request and must focus the new detached window"
     );
     assert!(
-        active.viewer_session.detached_window_id.is_some(),
+        active_window_id.is_some(),
         "always-new detached image folders should allocate a detached viewport instead of treating the open as continuation navigation"
     );
     assert!(
-        !app.fs_open_intent_from_grid && !active.fs_open_intent_from_grid,
+        !app.fs_open_intent_from_grid && !active_grid_intent,
         "open_fullscreen consumes the restored grid intent"
     );
 }
@@ -9111,15 +9122,16 @@ mod phase_c_drill_nav_tests {
         app.rebuild_visible_indices();
         assert_eq!(app.visible_indices, vec![0]);
 
-        let mut detached = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        detached.items = vec![
-            GridItem::Image(PathBuf::from("c:/detached/other.jpg")),
-            GridItem::Image(PathBuf::from("c:/detached/alpha.jpg")),
-        ];
-        detached.thumbnails = vec![ThumbnailState::Pending; detached.items.len()];
-        detached.image_metas = vec![None; detached.items.len()];
-        detached.items_generation = app.items_generation;
-        app.install_active_context_for_test(detached);
+        let items_generation = app.items_generation;
+        app.build_active_context_for_test(None, crate::app::DetachedSource::Image, |detached| {
+            detached.items = vec![
+                GridItem::Image(PathBuf::from("c:/detached/other.jpg")),
+                GridItem::Image(PathBuf::from("c:/detached/alpha.jpg")),
+            ];
+            detached.thumbnails = vec![ThumbnailState::Pending; detached.items.len()];
+            detached.image_metas = vec![None; detached.items.len()];
+            detached.items_generation = items_generation;
+        });
 
         let (while_detached_cache_is_empty, after_detached_cache_is_ready) = app
             .with_active_viewer_context(|mounted| {
@@ -9153,12 +9165,10 @@ mod phase_c_drill_nav_tests {
             vec![0],
             "detached の cache 構築後も main bundle の cache を維持する"
         );
-        assert_eq!(
-            app.active_context_bundle_for_test()
-                .expect("detached bundle remains parked")
-                .facet_name_cache_generation,
-            Some(5)
-        );
+        app.with_active_viewer_context(|detached| {
+            assert_eq!(detached.facet_name_cache_generation, Some(5));
+        })
+        .expect("detached bundle remains parked");
     }
 
     #[test]
@@ -12257,30 +12267,29 @@ fn bookmark_open_pending_is_owned_by_viewer_context_bundle() {
         target: return_target.clone(),
         grid: return_grid.clone(),
     });
-    let mut other = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-
-    app.swap_viewer_context_bundle(&mut other);
+    let other = app.stash_mounted_and_start_fresh("test_bookmark_context_ownership");
     assert!(app.bookmark_open_pending.is_none());
     assert!(app.bookmark_view_state.is_none());
-    assert_eq!(
-        other
-            .bookmark_open_pending
-            .as_ref()
-            .and_then(crate::bookmark_browser::PendingBookmarkOpen::media)
-            .map(|pending| pending.path.as_path()),
-        Some(path.as_path())
-    );
-    assert_eq!(
-        other.bookmark_view_state,
-        Some(super::BookmarkViewState::Opening {
-            target: return_target,
-            grid: return_grid,
-        })
-    );
-
-    app.swap_viewer_context_bundle(&mut other);
-    assert!(app.bookmark_open_pending.is_some());
-    assert!(app.bookmark_view_state.is_some());
+    app.with_viewer_context(other, |other| {
+        assert_eq!(
+            other
+                .bookmark_open_pending
+                .as_ref()
+                .and_then(crate::bookmark_browser::PendingBookmarkOpen::media)
+                .map(|pending| pending.path.as_path()),
+            Some(path.as_path())
+        );
+        assert_eq!(
+            other.bookmark_view_state,
+            Some(super::BookmarkViewState::Opening {
+                target: return_target,
+                grid: return_grid,
+            })
+        );
+        assert!(other.bookmark_open_pending.is_some());
+        assert!(other.bookmark_view_state.is_some());
+    })
+    .unwrap();
 }
 
 #[test]
@@ -12434,30 +12443,30 @@ fn detached_bookmark_pdf_routes_without_replacing_main_bookmark_grid() {
         Some(super::BookmarkViewState::Opening { .. })
     ));
     assert!(app.bookmark_open_pending.is_none());
-    let active = app
-        .active_context_bundle_for_test()
-        .expect("PDF bookmark must own a detached reader context");
-    assert!(
-        active
-            .pdf_enumerate_pending
-            .as_ref()
-            .is_some_and(|(path, _, _)| crate::path_key::eq_keep_drive(path, &pdf))
-    );
-    assert!(matches!(
-        active.bookmark_view_state,
-        Some(super::BookmarkViewState::Detached {
-            target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(_)
-        })
-    ));
-    assert!(matches!(
-        active.bookmark_open_pending,
-        Some(crate::bookmark_browser::PendingBookmarkOpen::Book(
-            crate::bookmark_browser::PendingBookOpen {
-                stage: crate::bookmark_browser::PendingBookOpenStage::AwaitingPage { .. },
-                ..
-            }
-        ))
-    ));
+    app.with_active_viewer_context(|active| {
+        assert!(
+            active
+                .pdf_enumerate_pending
+                .as_ref()
+                .is_some_and(|(path, _, _)| crate::path_key::eq_keep_drive(path, &pdf))
+        );
+        assert!(matches!(
+            active.bookmark_view_state,
+            Some(super::BookmarkViewState::Detached {
+                target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(_)
+            })
+        ));
+        assert!(matches!(
+            active.bookmark_open_pending,
+            Some(crate::bookmark_browser::PendingBookmarkOpen::Book(
+                crate::bookmark_browser::PendingBookOpen {
+                    stage: crate::bookmark_browser::PendingBookOpenStage::AwaitingPage { .. },
+                    ..
+                }
+            ))
+        ));
+    })
+    .expect("PDF bookmark must own a detached reader context");
 }
 
 #[cfg(windows)]
@@ -12482,19 +12491,19 @@ fn detached_bookmark_zip_routes_enumeration_to_detached_context() {
         Some(true)
     );
     assert!(app.items_are_bookmark_view);
-    let active = app
-        .active_context_bundle_for_test()
-        .expect("ZIP bookmark must own a detached reader context");
-    assert!(
-        active
-            .zip_enumerate_pending
-            .as_ref()
-            .is_some_and(|pending| crate::path_key::eq_keep_drive(&pending.zip_path, &zip))
-    );
-    assert!(matches!(
-        active.bookmark_open_pending,
-        Some(crate::bookmark_browser::PendingBookmarkOpen::Book(_))
-    ));
+    app.with_active_viewer_context(|active| {
+        assert!(
+            active
+                .zip_enumerate_pending
+                .as_ref()
+                .is_some_and(|pending| crate::path_key::eq_keep_drive(&pending.zip_path, &zip))
+        );
+        assert!(matches!(
+            active.bookmark_open_pending,
+            Some(crate::bookmark_browser::PendingBookmarkOpen::Book(_))
+        ));
+    })
+    .expect("ZIP bookmark must own a detached reader context");
 }
 
 #[cfg(windows)]
@@ -12524,19 +12533,19 @@ fn converted_bookmark_archive_enters_the_same_detached_book_context() {
         Some(true)
     );
     assert!(app.items_are_bookmark_view);
-    let active = app
-        .active_context_bundle_for_test()
-        .expect("converted archive bookmark must own a detached reader context");
-    assert_eq!(
-        active.archive_source_override.as_deref(),
-        Some(source.as_path())
-    );
-    assert!(
-        active
-            .zip_enumerate_pending
-            .as_ref()
-            .is_some_and(|pending| crate::path_key::eq_keep_drive(&pending.zip_path, &backing))
-    );
+    app.with_active_viewer_context(|active| {
+        assert_eq!(
+            active.archive_source_override.as_deref(),
+            Some(source.as_path())
+        );
+        assert!(
+            active
+                .zip_enumerate_pending
+                .as_ref()
+                .is_some_and(|pending| crate::path_key::eq_keep_drive(&pending.zip_path, &backing))
+        );
+    })
+    .expect("converted archive bookmark must own a detached reader context");
 }
 
 #[cfg(windows)]
@@ -12565,12 +12574,14 @@ fn detached_bookmark_image_folder_routes_without_replacing_main_bookmark_grid() 
     assert!(app.items_are_bookmark_view);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        let materialized = app.active_context_bundle_for_test().is_some_and(|active| {
-            active.current_folder.as_deref() == Some(folder.as_path())
-                && active.items.iter().any(
-                    |item| matches!(item, GridItem::Image(path) if path.ends_with("page-001.jpg")),
-                )
-        });
+        let materialized = app
+            .with_active_viewer_context(|active| {
+                active.current_folder.as_deref() == Some(folder.as_path())
+                    && active.items.iter().any(|item| {
+                        matches!(item, GridItem::Image(path) if path.ends_with("page-001.jpg"))
+                    })
+            })
+            .unwrap_or(false);
         if materialized {
             break;
         }
@@ -12583,16 +12594,15 @@ fn detached_bookmark_image_folder_routes_without_replacing_main_bookmark_grid() 
         );
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
-    let active = app
-        .active_context_bundle_for_test()
-        .expect("image-folder bookmark must own a detached reader context");
-    assert_eq!(active.current_folder.as_deref(), Some(folder.as_path()));
-    assert!(
-        active
-            .items
-            .iter()
-            .any(|item| matches!(item, GridItem::Image(path) if path.ends_with("page-001.jpg")))
-    );
+    app.with_active_viewer_context(|active| {
+        assert_eq!(active.current_folder.as_deref(), Some(folder.as_path()));
+        assert!(
+            active.items.iter().any(
+                |item| matches!(item, GridItem::Image(path) if path.ends_with("page-001.jpg"))
+            )
+        );
+    })
+    .expect("image-folder bookmark must own a detached reader context");
 }
 
 #[cfg(windows)]
@@ -12605,7 +12615,7 @@ fn closed_bookmark_summary_read_folds_all_terminal_values() {
     let media_path = PathBuf::from(r"C:\Books\track.flac");
     let archive_source = PathBuf::from(r"C:\Books\source.zip");
     let current_folder = PathBuf::from(r"C:\Books\expanded-cache");
-    let mut closed = crate::app::viewer_context_registry::ViewerContextBundle::empty();
+    let mut closed = phase_c_support::setup_app();
     closed.bookmark_view_state = Some(super::BookmarkViewState::Detached {
         target: target.clone(),
     });
@@ -12620,7 +12630,7 @@ fn closed_bookmark_summary_read_folds_all_terminal_values() {
         path: PathBuf::from(r"C:\Books\protected.pdf"),
     });
 
-    let summary = super::ClosedBookmarkSummary::read(ContextRef::at_rest(&closed));
+    let summary = super::ClosedBookmarkSummary::read(ContextRef::mounted(&closed));
 
     assert_eq!(summary.bookmark_target, Some(target.clone()));
     assert_eq!(summary.selected_media_path, Some(media_path));
@@ -12630,7 +12640,7 @@ fn closed_bookmark_summary_read_folds_all_terminal_values() {
     closed.selected = Some(0);
     closed.archive_source_override = None;
     closed.pdf_password_request = None;
-    let image_summary = super::ClosedBookmarkSummary::read(ContextRef::at_rest(&closed));
+    let image_summary = super::ClosedBookmarkSummary::read(ContextRef::mounted(&closed));
     assert_eq!(image_summary.bookmark_target, Some(target));
     assert_eq!(image_summary.selected_media_path, None);
     assert_eq!(image_summary.destination, Some(current_folder));
@@ -12648,13 +12658,20 @@ fn detached_bookmark_book_close_restores_main_grid_even_after_page_navigation() 
         crate::book_bookmarks::BookContainerKind::Pdf,
         crate::book_bookmarks::PageIdentity::PdfPage(0),
     );
-    let mut closed = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-    closed.bookmark_view_state = Some(super::BookmarkViewState::Detached {
-        target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(container),
+    let closed_window_id = app.allocate_detached_viewer_window_id();
+    let closed_context_id = app.build_window_context_for_test(closed_window_id, |closed| {
+        closed.bookmark_view_state = Some(super::BookmarkViewState::Detached {
+            target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(container),
+        });
+        closed.current_folder = Some(PathBuf::from(r"C:\Books\another-volume.pdf"));
     });
-    closed.current_folder = Some(PathBuf::from(r"C:\Books\another-volume.pdf"));
-
-    let summary = super::ClosedBookmarkSummary::read(ContextRef::at_rest(&closed));
+    let summary = app
+        .with_window_viewer_context(closed_window_id, |closed| {
+            super::ClosedBookmarkSummary::read(ContextRef::mounted(closed))
+        })
+        .expect("closed detached context");
+    app.retire_context(closed_context_id, "test_closed_bookmark_summary", |_| ())
+        .expect("retire closed detached context");
     app.reconcile_closed_bookmark_detached_context(&summary);
 
     assert!(app.items_are_bookmark_view);
@@ -12801,31 +12818,31 @@ fn detached_bookmark_media_keeps_main_grid_and_closes_in_one_request() {
             Some(std::time::SystemTime::UNIX_EPOCH)
         );
         assert_eq!(app.current_folder_signature, Some(0xCAFE));
-        let active = app
-            .active_context_bundle_for_test()
-            .expect("media must be owned by detached context from the start");
-        assert!(
-            !active
-                .tags_cache
-                .values()
-                .flatten()
-                .any(|tag| tag == "#detached-cache-test")
-        );
-        assert_eq!(active.current_folder.as_deref(), Some(media_dir.as_path()));
-        assert!(matches!(
-            active.bookmark_view_state,
-            Some(super::BookmarkViewState::Detached { .. })
-        ));
-        assert_eq!(
-            active
-                .fullscreen_idx
-                .and_then(|idx| active.items.get(idx))
-                .and_then(|item| match item {
-                    GridItem::Video(path) | GridItem::Audio(path) => Some(path.as_path()),
-                    _ => None,
-                }),
-            Some(target.as_path())
-        );
+        app.with_active_viewer_context(|active| {
+            assert!(
+                !active
+                    .tags_cache
+                    .values()
+                    .flatten()
+                    .any(|tag| tag == "#detached-cache-test")
+            );
+            assert_eq!(active.current_folder.as_deref(), Some(media_dir.as_path()));
+            assert!(matches!(
+                active.bookmark_view_state,
+                Some(super::BookmarkViewState::Detached { .. })
+            ));
+            assert_eq!(
+                active
+                    .fullscreen_idx
+                    .and_then(|idx| active.items.get(idx))
+                    .and_then(|item| match item {
+                        GridItem::Video(path) | GridItem::Audio(path) => Some(path.as_path()),
+                        _ => None,
+                    }),
+                Some(target.as_path())
+            );
+        })
+        .expect("media must be owned by detached context from the start");
 
         app.with_active_viewer_context(|detached| {
             detached.handle_fullscreen_close_request();
@@ -12931,14 +12948,13 @@ fn fullfeature_bookmark_book_parks_active_bookmark_media_before_main_open() {
         },
     ));
 
-    let mut media_bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-    media_bundle.items = vec![GridItem::Video(video.clone())];
-    media_bundle.fullscreen_idx = Some(0);
-    media_bundle.viewer_session.presentation = super::ViewerPresentation::DetachedWindow;
-    media_bundle.viewer_session.detached_window_id = Some(window_id);
-    media_bundle.viewer_session.independent_active = true;
-    app.install_active_context_for_test(media_bundle);
-    app.begin_active_detached_session(window_id, super::DetachedSource::Video);
+    app.build_active_context_for_test(Some(window_id), super::DetachedSource::Video, |media| {
+        media.items = vec![GridItem::Video(video.clone())];
+        media.fullscreen_idx = Some(0);
+        media.viewer_presentation = super::ViewerPresentation::DetachedWindow;
+        media.detached_viewer_window_id = Some(window_id);
+        media.detached_viewer_independent_active = true;
+    });
 
     assert!(app.park_detached_media_before_fullfeature_bookmark_book_open(&ctx));
 
@@ -12968,11 +12984,11 @@ fn fullfeature_bookmark_book_parks_active_bookmark_media_before_main_open() {
         Some(super::DetachedWindowState::ParkedLive)
     );
     assert!(
-        app.window_context_bundle_for_test(window_id)
-            .is_some_and(|bundle| {
-                bundle.fullscreen_idx == Some(0)
-                    && matches!(bundle.items.first(), Some(GridItem::Video(path)) if path == &video)
-            })
+        app.with_window_viewer_context(window_id, |context| {
+            context.fullscreen_idx == Some(0)
+                && matches!(context.items.first(), Some(GridItem::Video(path)) if path == &video)
+        })
+        .is_ok_and(|matches| matches)
     );
 }
 
@@ -32477,21 +32493,23 @@ mod edit_materialize_worker_tests {
         let (pending, _) = ready_local_pending(request, image);
         app.local_adjust_pending.insert(idx, pending);
 
-        let mut owner = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        app.swap_viewer_context_bundle(&mut owner);
+        let owner = app.stash_mounted_and_start_fresh("test_materialize_result_owner");
         app.poll_local_adjust_render(&ctx);
         assert!(
             app.local_adjust_cache.is_empty(),
             "the active sibling context must not see the parked context's result"
         );
 
-        app.swap_viewer_context_bundle(&mut owner);
-        app.poll_local_adjust_render(&ctx);
-        assert!(
-            app.local_adjust_cache
-                .contains_key(&app.current_local_adjust_key(idx)),
-            "the result must remain pending until its owning context is active"
-        );
+        app.with_viewer_context(owner, |owner| {
+            owner.poll_local_adjust_render(&ctx);
+            assert!(
+                owner
+                    .local_adjust_cache
+                    .contains_key(&owner.current_local_adjust_key(idx)),
+                "the result must remain pending until its owning context is active"
+            );
+        })
+        .unwrap();
     }
 
     #[test]
@@ -32814,27 +32832,29 @@ mod native_video_rating_key_tests {
         app.items_are_bookmark_view = true;
         app.bookmark_browser_rows = vec![row.clone()];
 
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = vec![row.item.clone()];
-        bundle.thumbnails = vec![ThumbnailState::Pending];
-        bundle.visible_indices = vec![0];
-        bundle.rating_cache.insert(0, 4);
-        bundle.fullscreen_idx = Some(0);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.independent_active = true;
-        app.install_active_context_for_test(bundle);
+        app.build_active_context_for_test(None, DetachedSource::Image, |detached| {
+            detached.items = vec![row.item.clone()];
+            detached.thumbnails = vec![ThumbnailState::Pending];
+            detached.visible_indices = vec![0];
+            detached.rating_cache.insert(0, 4);
+            detached.fullscreen_idx = Some(0);
+            detached.viewer_presentation = ViewerPresentation::DetachedWindow;
+            detached.detached_viewer_independent_active = true;
+        });
 
         app.with_active_viewer_context(|detached| detached.set_rating(0, 2))
             .expect("detached context");
 
         assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 2);
         assert_eq!(app.rating_cache.get(&0), Some(&2));
-        assert_eq!(
-            app.active_context_bundle_for_test()
-                .and_then(|active| active.rating_cache.get(&0)),
-            Some(&2),
-            "both context-local caches must observe the shared path write"
-        );
+        app.with_active_viewer_context(|active| {
+            assert_eq!(
+                active.rating_cache.get(&0),
+                Some(&2),
+                "both context-local caches must observe the shared path write"
+            );
+        })
+        .expect("detached context");
         assert!(
             app.items_are_bookmark_view,
             "cache synchronization must not reinstall or leave the bookmark grid"
@@ -32882,12 +32902,12 @@ mod native_video_rating_key_tests {
                 .unwrap();
             app.rating_cache.insert(idx, 1);
 
-            let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-            bundle.current_folder = Some(target.clone());
-            bundle.current_folder_rating_cache = Some(1);
-            bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-            bundle.viewer_session.independent_active = true;
-            app.install_active_context_for_test(bundle);
+            app.build_active_context_for_test(None, DetachedSource::Image, |detached| {
+                detached.current_folder = Some(target.clone());
+                detached.current_folder_rating_cache = Some(1);
+                detached.viewer_presentation = ViewerPresentation::DetachedWindow;
+                detached.detached_viewer_independent_active = true;
+            });
 
             let stale_generation = app.rating_session_generation_for_key(&key);
             app.with_active_viewer_context(|detached| {
@@ -32936,15 +32956,15 @@ mod native_video_rating_key_tests {
             .set_user_rating(&key, 4, None)
             .unwrap();
 
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = vec![GridItem::Image(path.clone())];
-        bundle.thumbnails = vec![ThumbnailState::Pending];
-        bundle.visible_indices = vec![0];
-        bundle.rating_cache.insert(0, 4);
-        bundle.fullscreen_idx = Some(0);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.independent_active = true;
-        app.install_active_context_for_test(bundle);
+        app.build_active_context_for_test(None, DetachedSource::Image, |detached| {
+            detached.items = vec![GridItem::Image(path.clone())];
+            detached.thumbnails = vec![ThumbnailState::Pending];
+            detached.visible_indices = vec![0];
+            detached.rating_cache.insert(0, 4);
+            detached.fullscreen_idx = Some(0);
+            detached.viewer_presentation = ViewerPresentation::DetachedWindow;
+            detached.detached_viewer_independent_active = true;
+        });
 
         let pending_generation = app.rating_session_generation_for_key(&key);
         app.with_active_viewer_context(|detached| detached.set_rating(0, 0))
@@ -32959,11 +32979,10 @@ mod native_video_rating_key_tests {
 
         assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
         assert_eq!(app.rating_cache.get(&0), Some(&0));
-        assert_eq!(
-            app.active_context_bundle_for_test()
-                .and_then(|active| active.rating_cache.get(&0)),
-            Some(&0)
-        );
+        app.with_active_viewer_context(|active| {
+            assert_eq!(active.rating_cache.get(&0), Some(&0));
+        })
+        .expect("detached context");
     }
 
     #[test]
@@ -33291,13 +33310,14 @@ mod still_window_mode_key_tests {
             "test_image_placement",
         );
 
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(media);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.detached_window_id = Some(media_window_id);
-        bundle.viewer_session.independent_active = true;
-        app.push_window_context_for_test(ctx, media_window_id, bundle);
+        let items = app.items.clone();
+        app.push_window_context_for_test(ctx, media_window_id, |media_context| {
+            media_context.items = items;
+            media_context.fullscreen_idx = Some(media);
+            media_context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            media_context.detached_viewer_window_id = Some(media_window_id);
+            media_context.detached_viewer_independent_active = true;
+        });
         app.transition_detached_window_state(
             media_window_id,
             DetachedWindowState::ParkedLive,
@@ -33480,32 +33500,29 @@ mod still_window_mode_key_tests {
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         set_detached_host_for_test(&mut app, window_id, 0x4321, true);
-        app.begin_active_detached_session(window_id, DetachedSource::Image);
-
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
-        bundle.current_folder = Some(PathBuf::from(r"C:\books\second"));
-        bundle.items = vec![GridItem::Image(PathBuf::from(r"C:\books\second\p1.jpg"))];
-        bundle.thumbnails = vec![ThumbnailState::Pending];
-        bundle.image_metas = vec![None];
-        bundle.visible_indices = vec![0];
-        bundle.fullscreen_idx = Some(0);
-        // deferred reopen 完了直後: items が入れ替わって generation が進み、
-        // 新ページのデコード結果も確定している (Failed でも lock は解放されるべき)。
-        bundle.items_generation = 5;
-        bundle.fs_nav_locked_gen = Some(4);
-        bundle.fs_cache.insert(0, FsCacheEntry::Failed);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.independent_active = true;
-        bundle.viewer_session.detached_window_id = Some(window_id);
-        app.install_active_context_for_test(bundle);
+        app.build_active_context_for_test(Some(window_id), DetachedSource::Image, |context| {
+            context.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+            context.current_folder = Some(PathBuf::from(r"C:\books\second"));
+            context.items = vec![GridItem::Image(PathBuf::from(r"C:\books\second\p1.jpg"))];
+            context.thumbnails = vec![ThumbnailState::Pending];
+            context.image_metas = vec![None];
+            context.visible_indices = vec![0];
+            context.fullscreen_idx = Some(0);
+            // deferred reopen 完了直後: items が入れ替わって generation が進み、
+            // 新ページのデコード結果も確定している (Failed でも lock は解放されるべき)。
+            context.items_generation = 5;
+            context.fs_nav_locked_gen = Some(4);
+            context.fs_cache.insert(0, FsCacheEntry::Failed);
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_independent_active = true;
+            context.detached_viewer_window_id = Some(window_id);
+        });
 
         run_active_detached_frame_for_test(&mut app, &ctx);
 
         let locked = app
-            .active_context_bundle_for_test()
-            .expect("context stays mounted")
-            .fs_nav_locked_gen;
+            .with_active_viewer_context(|context| context.fs_nav_locked_gen)
+            .expect("context stays mounted");
         assert!(
             locked.is_none(),
             "the mounted detached bundle must poll and release its own Ctrl+arrow nav lock"
@@ -33521,11 +33538,6 @@ mod still_window_mode_key_tests {
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         set_detached_host_for_test(app, window_id, 0x4321, true);
-        app.begin_active_detached_session(window_id, DetachedSource::Image);
-
-        let viewport_id = app
-            .active_detached_session_viewport_id()
-            .expect("active detached session must own a viewport");
         app.build_active_context_for_test(Some(window_id), DetachedSource::Image, |app| {
             app.navigation_scope = ViewerNavigationScope::DetachedPhysical;
             app.current_folder = Some(PathBuf::from(r"C:\books\second.pdf"));
@@ -33535,6 +33547,9 @@ mod still_window_mode_key_tests {
             app.detached_viewer_window_id = Some(window_id);
             configure(app);
         });
+        let viewport_id = app
+            .active_detached_session_viewport_id()
+            .expect("active detached session must own a viewport");
         viewport_id
     }
 
@@ -33599,21 +33614,19 @@ mod still_window_mode_key_tests {
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         set_detached_host_for_test(&mut app, window_id, 0x4321, true);
-        app.begin_active_detached_session(window_id, DetachedSource::Image);
-
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
-        bundle.current_folder = Some(first.clone());
-        bundle.items = vec![GridItem::Image(first.join("a.jpg"))];
-        bundle.thumbnails = vec![ThumbnailState::Pending];
-        bundle.image_metas = vec![None];
-        bundle.visible_indices = vec![0];
-        bundle.fullscreen_idx = Some(0);
-        bundle.items_generation = 4;
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.independent_active = true;
-        bundle.viewer_session.detached_window_id = Some(window_id);
-        app.install_active_context_for_test(bundle);
+        app.build_active_context_for_test(Some(window_id), DetachedSource::Image, |context| {
+            context.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+            context.current_folder = Some(first.clone());
+            context.items = vec![GridItem::Image(first.join("a.jpg"))];
+            context.thumbnails = vec![ThumbnailState::Pending];
+            context.image_metas = vec![None];
+            context.visible_indices = vec![0];
+            context.fullscreen_idx = Some(0);
+            context.items_generation = 4;
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_independent_active = true;
+            context.detached_viewer_window_id = Some(window_id);
+        });
 
         app.with_active_viewer_context(|mounted| {
             mounted.handle_fullscreen_ctrl_nav_context(&ctx, 0, true, false);
@@ -33644,8 +33657,8 @@ mod still_window_mode_key_tests {
 
         run_active_detached_frame_for_test(&mut app, &ctx);
         assert!(
-            app.active_context_bundle_for_test()
-                .is_some_and(|active| active.fs_nav_locked_gen.is_none()),
+            app.with_active_viewer_context(|active| active.fs_nav_locked_gen.is_none())
+                .unwrap_or(false),
             "the completed navigation must release its context-owned lock"
         );
 
@@ -33688,18 +33701,18 @@ mod still_window_mode_key_tests {
 
         run_active_detached_frame_for_test(&mut app, &ctx);
 
-        let active = app
-            .active_context_bundle_for_test()
-            .expect("the deferred reopen owner must stay mounted");
-        assert_eq!(
-            active.fs_nav_locked_gen,
-            Some(4),
-            "a fullscreen_idx=None deferred reopen gap must retain the navigation lock"
-        );
-        assert!(
-            active.fs_holdover_tex.is_some(),
-            "the old frame must remain available until deferred reopen installs its target"
-        );
+        app.with_active_viewer_context(|active| {
+            assert_eq!(
+                active.fs_nav_locked_gen,
+                Some(4),
+                "a fullscreen_idx=None deferred reopen gap must retain the navigation lock"
+            );
+            assert!(
+                active.fs_holdover_tex.is_some(),
+                "the old frame must remain available until deferred reopen installs its target"
+            );
+        })
+        .expect("the deferred reopen owner must stay mounted");
     }
 
     fn thread_window_entry(
@@ -34046,14 +34059,12 @@ mod still_window_mode_key_tests {
             .ring_shortcuts
             .set_right_drag_mode(context, crate::ring_shortcut::RightDragMode::MouseGesture);
         app.mouse_gesture = Some(visible_gesture_state(owner));
-        app.install_window_context_for_test(
-            passive_right_drag_image_bundle(r"C:\pics\guide-owner.jpg"),
-            owner_id,
-        );
-        app.install_window_context_for_test(
-            passive_right_drag_image_bundle(r"C:\pics\guide-other.jpg"),
-            other_id,
-        );
+        app.build_window_context_for_test(owner_id, |owner| {
+            configure_passive_right_drag_image(owner, r"C:\pics\guide-owner.jpg");
+        });
+        app.build_window_context_for_test(other_id, |other| {
+            configure_passive_right_drag_image(other, r"C:\pics\guide-other.jpg");
+        });
         let owner_window = contextless_test_window(&ctx, owner_id);
         let other_window = contextless_test_window(&ctx, other_id);
         let placement = app.detached_viewer_window_placement();
@@ -34071,10 +34082,9 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let pos = egui::pos2(120.0, 90.0);
-        app.install_window_context_for_test(
-            passive_right_drag_image_bundle(r"C:\pics\deferred-primary-cancel.jpg"),
-            79,
-        );
+        app.build_window_context_for_test(79, |context| {
+            configure_passive_right_drag_image(context, r"C:\pics\deferred-primary-cancel.jpg");
+        });
         let window = contextless_test_window(&ctx, 79);
         let view = app.deferred_detached_image_window_view(
             &window,
@@ -34229,6 +34239,15 @@ mod still_window_mode_key_tests {
         }
     }
 
+    fn configure_passive_right_drag_image(context: &mut App, path: &str) {
+        context.items = vec![GridItem::Image(PathBuf::from(path))];
+        context.thumbnails = vec![ThumbnailState::Pending];
+        context.image_metas = vec![None];
+        context.visible_indices = vec![0];
+        context.selected = Some(0);
+        context.fullscreen_idx = Some(0);
+    }
+
     #[test]
     fn right_drag_owner_mismatch_preserves_root_and_detached_gestures_both_ways() {
         let mut app = setup_app();
@@ -34363,11 +34382,9 @@ mod still_window_mode_key_tests {
         app.settings.ring_shortcuts.right_drag_image =
             Some(crate::ring_shortcut::RightDragMode::MouseGesture);
         for id in [11, 12, 13] {
-            app.push_window_context_for_test(
-                &ctx,
-                id,
-                passive_right_drag_image_bundle(&format!(r"C:\pics\{id}.jpg")),
-            );
+            app.push_window_context_for_test(&ctx, id, |context| {
+                configure_passive_right_drag_image(context, &format!(r"C:\pics\{id}.jpg"));
+            });
             app.transition_detached_window_state(id, DetachedWindowState::Parked, "test");
         }
         let first_pos = egui::pos2(100.0, 100.0);
@@ -34417,11 +34434,9 @@ mod still_window_mode_key_tests {
         let ctx = egui::Context::default();
         app.settings.ring_shortcuts.right_drag_image =
             Some(crate::ring_shortcut::RightDragMode::Disabled);
-        app.push_window_context_for_test(
-            &ctx,
-            21,
-            passive_right_drag_image_bundle(r"C:\pics\disabled.jpg"),
-        );
+        app.push_window_context_for_test(&ctx, 21, |context| {
+            configure_passive_right_drag_image(context, r"C:\pics\disabled.jpg");
+        });
         app.transition_detached_window_state(21, DetachedWindowState::Parked, "test");
 
         app.process_passive_detached_right_drag_events_for_test(
@@ -34447,11 +34462,9 @@ mod still_window_mode_key_tests {
         let pos = egui::pos2(100.0, 100.0);
         app.settings.ring_shortcuts.right_drag_image =
             Some(crate::ring_shortcut::RightDragMode::MouseGesture);
-        app.push_window_context_for_test(
-            &ctx,
-            window_id,
-            passive_right_drag_image_bundle(r"C:\pics\passive-primary-cancel.jpg"),
-        );
+        app.push_window_context_for_test(&ctx, window_id, |context| {
+            configure_passive_right_drag_image(context, r"C:\pics\passive-primary-cancel.jpg");
+        });
         app.transition_detached_window_state(window_id, DetachedWindowState::Parked, "test");
 
         app.process_passive_detached_right_drag_events_for_test(
@@ -34517,9 +34530,10 @@ mod still_window_mode_key_tests {
         let ctx = egui::Context::default();
         let window_id = 22;
         let mounted_generation = 73;
-        let mut bundle = passive_right_drag_image_bundle(r"C:\pics\mounted-identity.jpg");
-        bundle.items_generation = mounted_generation;
-        app.push_window_context_for_test(&ctx, window_id, bundle);
+        app.push_window_context_for_test(&ctx, window_id, |context| {
+            configure_passive_right_drag_image(context, r"C:\pics\mounted-identity.jpg");
+            context.items_generation = mounted_generation;
+        });
         app.transition_detached_window_state(window_id, DetachedWindowState::ParkedLive, "test");
 
         app.with_window_viewer_context(window_id, |mounted| {
@@ -34548,10 +34562,11 @@ mod still_window_mode_key_tests {
         let ctx = egui::Context::default();
         let window_id = 23;
         let parked_generation = 91;
-        let mut bundle = passive_right_drag_image_bundle(r"C:\pics\parked-identity.jpg");
-        bundle.items_generation = parked_generation;
         app.items_generation = parked_generation + 1;
-        app.push_window_context_for_test(&ctx, window_id, bundle);
+        app.push_window_context_for_test(&ctx, window_id, |context| {
+            configure_passive_right_drag_image(context, r"C:\pics\parked-identity.jpg");
+            context.items_generation = parked_generation;
+        });
         app.transition_detached_window_state(window_id, DetachedWindowState::Parked, "test");
 
         assert!(app.queue_recognized_detached_right_drag_command(
@@ -34574,11 +34589,9 @@ mod still_window_mode_key_tests {
         let ctx = egui::Context::default();
         let main_idx = push_image(&mut app, r"C:\pics\main-owner-guard.jpg");
         app.fullscreen_idx = Some(main_idx);
-        app.push_window_context_for_test(
-            &ctx,
-            31,
-            passive_right_drag_image_bundle(r"C:\pics\detached-owner.jpg"),
-        );
+        app.push_window_context_for_test(&ctx, 31, |context| {
+            configure_passive_right_drag_image(context, r"C:\pics\detached-owner.jpg");
+        });
         app.transition_detached_window_state(31, DetachedWindowState::Parked, "test");
         app.queue_recognized_detached_right_drag_command(31, passive_rotate_command(), "test");
         assert!(matches!(
@@ -34596,13 +34609,13 @@ mod still_window_mode_key_tests {
             ))
         ));
         assert!(app.rotation_cache.is_empty());
-        assert!(
-            app.active_context_bundle_for_test()
-                .expect("active owner")
-                .rotation_cache
-                .is_empty(),
-            "activation return must not execute against the unmounted owner"
-        );
+        app.with_active_viewer_context(|active| {
+            assert!(
+                active.rotation_cache.is_empty(),
+                "activation return must not execute against the unmounted owner"
+            );
+        })
+        .expect("active owner");
 
         assert_eq!(
             app.with_active_viewer_context(|mounted| {
@@ -34614,13 +34627,13 @@ mod still_window_mode_key_tests {
             app.rotation_cache.is_empty(),
             "main context must remain untouched"
         );
-        assert!(
-            app.active_context_bundle_for_test()
-                .unwrap()
-                .rotation_cache
-                .contains_key(&0),
-            "command must mutate the mounted detached owner"
-        );
+        app.with_active_viewer_context(|active| {
+            assert!(
+                active.rotation_cache.contains_key(&0),
+                "command must mutate the mounted detached owner"
+            );
+        })
+        .unwrap();
         assert!(app.detached_window_manager.activation_intent(31).is_none());
     }
 
@@ -34628,11 +34641,9 @@ mod still_window_mode_key_tests {
     fn closing_passive_window_discards_recognized_command_before_activation() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
-        app.push_window_context_for_test(
-            &ctx,
-            41,
-            passive_right_drag_image_bundle(r"C:\pics\closing.jpg"),
-        );
+        app.push_window_context_for_test(&ctx, 41, |context| {
+            configure_passive_right_drag_image(context, r"C:\pics\closing.jpg");
+        });
         app.transition_detached_window_state(41, DetachedWindowState::Parked, "test");
         app.queue_recognized_detached_right_drag_command(41, passive_rotate_command(), "test");
 
@@ -34649,11 +34660,9 @@ mod still_window_mode_key_tests {
         let ctx = egui::Context::default();
         let idx = push_image(&mut app, r"C:\pics\mismatch.jpg");
         app.fullscreen_idx = Some(idx);
-        app.push_window_context_for_test(
-            &ctx,
-            51,
-            passive_right_drag_image_bundle(r"C:\pics\detached-mismatch.jpg"),
-        );
+        app.push_window_context_for_test(&ctx, 51, |context| {
+            configure_passive_right_drag_image(context, r"C:\pics\detached-mismatch.jpg");
+        });
         app.queue_recognized_detached_right_drag_command(51, passive_rotate_command(), "test");
         let dispatch = app
             .take_pending_deferred_detached_window_activation()
@@ -34802,12 +34811,13 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let video = push_video(&mut app, r"C:\clips\parked-live.mp4");
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(video);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.detached_window_id = Some(12);
-        app.push_window_context_for_test(&ctx, 12, bundle);
+        let items = app.items.clone();
+        app.push_window_context_for_test(&ctx, 12, move |context| {
+            context.items = items;
+            context.fullscreen_idx = Some(video);
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_window_id = Some(12);
+        });
         app.transition_detached_window_state(12, DetachedWindowState::ParkedLive, "test_setup");
         set_detached_host_for_test(&mut app, 12, 0x1200, false);
         app.main_hwnd = None;
@@ -35795,11 +35805,10 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(video);
         app.video_audio_mode = Some(video);
         assert!(app.promote_active_detached_video_for_main_context_change());
-        assert_eq!(
-            app.active_context_bundle_for_test()
-                .and_then(|active| active.video_audio_mode),
-            Some(video)
-        );
+        app.with_active_viewer_context(|active| {
+            assert_eq!(active.video_audio_mode, Some(video));
+        })
+        .expect("the promoted detached media context must remain active");
     }
 
     /// スタック集約の適用前退避 (2026-07-10 監査): unbundled detached メディア
@@ -37206,14 +37215,15 @@ mod still_window_mode_key_tests {
         app.pending_folder_nav_mode = FolderNavMode::SiblingFullscreen;
         app.settings.detached_viewer_open_images_in_window = true;
         let main_items_generation = app.items_generation;
-        let mut passive_bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        passive_bundle.items = vec![GridItem::Image(temp.path().join("parked.jpg"))];
-        passive_bundle.fullscreen_idx = Some(0);
-        passive_bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        passive_bundle.viewer_session.independent_active = true;
-        passive_bundle.viewer_session.open_next_still_detached_once = false;
-        passive_bundle.viewer_session.detached_window_id = Some(77);
-        app.push_window_context_for_test(&ctx, 77, passive_bundle);
+        let parked_path = temp.path().join("parked.jpg");
+        app.push_window_context_for_test(&ctx, 77, move |context| {
+            context.items = vec![GridItem::Image(parked_path)];
+            context.fullscreen_idx = Some(0);
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_independent_active = true;
+            context.detached_viewer_open_next_still_detached_once = false;
+            context.detached_viewer_window_id = Some(77);
+        });
 
         assert!(app.open_grid_container_in_detached_book_context(&ctx, a_virtual_idx));
 
@@ -37251,17 +37261,17 @@ mod still_window_mode_key_tests {
             "opening the active physical context must not close an existing passive viewer"
         );
 
-        let active = app
-            .active_context_bundle_for_test()
-            .expect("normal image open must create an active detached context");
-        assert!(
-            active.folder_pane_open_pending.is_some(),
-            "the complete physical folder scan must be owned by the detached bundle"
-        );
-        assert!(
-            active.items.is_empty(),
-            "the detached context must not clone the virtual c/a backing items while scanning"
-        );
+        app.with_active_viewer_context(|active| {
+            assert!(
+                active.folder_pane_open_pending.is_some(),
+                "the complete physical folder scan must be owned by the detached bundle"
+            );
+            assert!(
+                active.items.is_empty(),
+                "the detached context must not clone the virtual c/a backing items while scanning"
+            );
+        })
+        .expect("normal image open must create an active detached context");
 
         // 実 worker の速度に依存せず「次フレームでも scan 未完了」を再現する。直接 poll
         // ではなく production の update を通し、pending 自体が active context の生存条件に
@@ -37294,8 +37304,8 @@ mod still_window_mode_key_tests {
         });
         assert!(updated);
         assert!(
-            app.active_context_bundle_for_test()
-                .is_some_and(|active| active.folder_pane_open_pending.is_some()),
+            app.with_active_viewer_context(|active| active.folder_pane_open_pending.is_some())
+                .unwrap_or(false),
             "an unfinished image scan must keep the active detached context alive"
         );
         assert_eq!(
@@ -37317,8 +37327,8 @@ mod still_window_mode_key_tests {
                 updated = app.update_active_viewer_context(ctx);
             });
             let opened = app
-                .active_context_bundle_for_test()
-                .is_some_and(|active| active.fullscreen_idx.is_some());
+                .with_active_viewer_context(|active| active.fullscreen_idx.is_some())
+                .unwrap_or(false);
             if opened {
                 break;
             }
@@ -37421,8 +37431,8 @@ mod still_window_mode_key_tests {
             "Ctrl+Down in the active context must not close a sibling image window"
         );
         assert!(
-            app.active_context_bundle_for_test()
-                .is_some_and(|active| active.folder_nav_pending.is_some())
+            app.with_active_viewer_context(|active| active.folder_nav_pending.is_some())
+                .unwrap_or(false)
         );
     }
 
@@ -37523,23 +37533,24 @@ mod still_window_mode_key_tests {
         app.items_are_global_search_view = true;
 
         let window_id = 501;
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
-        bundle.pdf_password_request = Some(PdfPasswordRequest { path: pdf.clone() });
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.independent_active = true;
-        bundle.viewer_session.open_next_still_detached_once = false;
-        bundle.viewer_session.detached_window_id = Some(window_id);
-        app.install_active_context_for_test(bundle);
-        app.begin_active_detached_session(window_id, DetachedSource::Book);
+        let pdf_for_context = pdf.clone();
+        app.build_active_context_for_test(Some(window_id), DetachedSource::Book, move |context| {
+            context.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+            context.pdf_password_request = Some(PdfPasswordRequest {
+                path: pdf_for_context,
+            });
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_independent_active = true;
+            context.detached_viewer_open_next_still_detached_once = false;
+        });
         app.show_pdf_password_dialog = true;
 
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             app.update_active_viewer_context(ctx);
         });
         assert!(
-            app.active_context_bundle_for_test()
-                .is_some_and(|active| active.pdf_password_request.is_some()),
+            app.with_active_viewer_context(|active| active.pdf_password_request.is_some())
+                .unwrap_or(false),
             "a password request must keep the pre-viewport detached context alive"
         );
         assert_eq!(
@@ -37567,15 +37578,15 @@ mod still_window_mode_key_tests {
             app.pdf_enumerate_pending.is_none(),
             "the PDF enumerate worker must not be attached to main"
         );
-        let active = app
-            .active_context_bundle_for_test()
-            .expect("the detached password owner must remain active while retrying");
-        assert!(active.pdf_password_request.is_none());
-        assert!(
-            active.pdf_enumerate_pending.is_some(),
-            "password retry must resume enumeration in the detached bundle"
-        );
-        assert_eq!(active.pdf_current_password.as_deref(), Some("secret"));
+        app.with_active_viewer_context(|active| {
+            assert!(active.pdf_password_request.is_none());
+            assert!(
+                active.pdf_enumerate_pending.is_some(),
+                "password retry must resume enumeration in the detached bundle"
+            );
+            assert_eq!(active.pdf_current_password.as_deref(), Some("secret"));
+        })
+        .expect("the detached password owner must remain active while retrying");
     }
 
     #[test]
@@ -37587,14 +37598,16 @@ mod still_window_mode_key_tests {
             let window_id = if main_has_request { 504 } else { 503 };
             let detached_pdf = PathBuf::from(r"C:\Books\detached-protected.pdf");
             let main_pdf = PathBuf::from(r"C:\Books\main-protected.pdf");
-            let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-            bundle.pdf_password_request = Some(PdfPasswordRequest { path: detached_pdf });
-            bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-            bundle.viewer_session.independent_active = true;
-            bundle.viewer_session.open_next_still_detached_once = false;
-            bundle.viewer_session.detached_window_id = Some(window_id);
-            app.install_active_context_for_test(bundle);
-            app.begin_active_detached_session(window_id, DetachedSource::Book);
+            app.build_active_context_for_test(
+                Some(window_id),
+                DetachedSource::Book,
+                move |context| {
+                    context.pdf_password_request = Some(PdfPasswordRequest { path: detached_pdf });
+                    context.viewer_presentation = ViewerPresentation::DetachedWindow;
+                    context.detached_viewer_independent_active = true;
+                    context.detached_viewer_open_next_still_detached_once = false;
+                },
+            );
             if main_has_request {
                 app.pdf_password_request = Some(PdfPasswordRequest {
                     path: main_pdf.clone(),
@@ -37640,14 +37653,12 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let window_id = 502;
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.independent_active = true;
-        bundle.viewer_session.open_next_still_detached_once = false;
-        bundle.viewer_session.detached_window_id = Some(window_id);
-        app.install_active_context_for_test(bundle);
-        app.begin_active_detached_session(window_id, DetachedSource::Book);
+        app.build_active_context_for_test(Some(window_id), DetachedSource::Book, |context| {
+            context.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_independent_active = true;
+            context.detached_viewer_open_next_still_detached_once = false;
+        });
 
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             app.update_active_viewer_context(ctx);
@@ -37763,12 +37774,12 @@ mod still_window_mode_key_tests {
         (owner, tx, cancel)
     }
 
-    fn assert_detached_archive_backing(app: &App, source: &Path, backing_archive: &Path) {
-        let active = app
-            .active_context_bundle_for_test()
-            .expect("archive completion must create a detached reader context");
-        assert_eq!(active.archive_source_override.as_deref(), Some(source));
-        assert_eq!(active.current_folder.as_deref(), Some(backing_archive));
+    fn assert_detached_archive_backing(app: &mut App, source: &Path, backing_archive: &Path) {
+        app.with_active_viewer_context(|active| {
+            assert_eq!(active.archive_source_override.as_deref(), Some(source));
+            assert_eq!(active.current_folder.as_deref(), Some(backing_archive));
+        })
+        .expect("archive completion must create a detached reader context");
     }
 
     fn complete_detached_archive_page_enumeration(
@@ -37813,28 +37824,28 @@ mod still_window_mode_key_tests {
     }
 
     fn assert_detached_archive_pages(
-        app: &App,
+        app: &mut App,
         backing_archive: &Path,
         expected_entry_names: &[&str],
     ) {
-        let active = app
-            .active_context_bundle_for_test()
-            .expect("detached archive pages must retain their reader context");
-        let actual_entry_names = active
-            .items
-            .iter()
-            .map(|item| match item {
-                GridItem::ZipImage {
-                    zip_path,
-                    entry_name,
-                } => {
-                    assert!(crate::folder_tree::path_eq(zip_path, backing_archive));
-                    entry_name.as_str()
-                }
-                _ => panic!("expected detached archive page"),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(actual_entry_names, expected_entry_names);
+        app.with_active_viewer_context(|active| {
+            let actual_entry_names = active
+                .items
+                .iter()
+                .map(|item| match item {
+                    GridItem::ZipImage {
+                        zip_path,
+                        entry_name,
+                    } => {
+                        assert!(crate::folder_tree::path_eq(zip_path, backing_archive));
+                        entry_name.as_str()
+                    }
+                    _ => panic!("expected detached archive page"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual_entry_names, expected_entry_names);
+        })
+        .expect("detached archive pages must retain their reader context");
     }
 
     fn complete_detached_pdf_page_enumeration(app: &mut App, pdf_path: &Path, page_count: u32) {
@@ -37859,26 +37870,26 @@ mod still_window_mode_key_tests {
         .expect("detached PDF context must remain active");
     }
 
-    fn assert_detached_pdf_pages(app: &App, pdf_path: &Path, expected_pages: &[u32]) {
-        let active = app
-            .active_context_bundle_for_test()
-            .expect("detached PDF pages must retain their reader context");
-        let actual_pages = active
-            .items
-            .iter()
-            .map(|item| match item {
-                GridItem::PdfPage {
-                    pdf_path: actual_path,
-                    page_num,
-                    ..
-                } => {
-                    assert!(crate::folder_tree::path_eq(actual_path, pdf_path));
-                    *page_num
-                }
-                _ => panic!("expected detached PDF page"),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(actual_pages, expected_pages);
+    fn assert_detached_pdf_pages(app: &mut App, pdf_path: &Path, expected_pages: &[u32]) {
+        app.with_active_viewer_context(|active| {
+            let actual_pages = active
+                .items
+                .iter()
+                .map(|item| match item {
+                    GridItem::PdfPage {
+                        pdf_path: actual_path,
+                        page_num,
+                        ..
+                    } => {
+                        assert!(crate::folder_tree::path_eq(actual_path, pdf_path));
+                        *page_num
+                    }
+                    _ => panic!("expected detached PDF page"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual_pages, expected_pages);
+        })
+        .expect("detached PDF pages must retain their reader context");
     }
 
     #[test]
@@ -37959,8 +37970,8 @@ mod still_window_mode_key_tests {
             &source,
             items_generation,
         );
-        assert_detached_archive_backing(&app, &source, &backing);
-        assert_detached_archive_pages(&app, &backing, &expected_pages);
+        assert_detached_archive_backing(&mut app, &source, &backing);
+        assert_detached_archive_pages(&mut app, &backing, &expected_pages);
     }
 
     #[test]
@@ -37996,8 +38007,8 @@ mod still_window_mode_key_tests {
             &source,
             items_generation,
         );
-        assert_detached_archive_backing(&app, &source, &backing);
-        assert_detached_archive_pages(&app, &backing, &expected_pages);
+        assert_detached_archive_backing(&mut app, &source, &backing);
+        assert_detached_archive_pages(&mut app, &backing, &expected_pages);
     }
 
     #[test]
@@ -38122,8 +38133,8 @@ mod still_window_mode_key_tests {
             &source,
             items_generation,
         );
-        assert_detached_archive_backing(&app, &source, &backing);
-        assert_detached_archive_pages(&app, &backing, &expected_pages);
+        assert_detached_archive_backing(&mut app, &source, &backing);
+        assert_detached_archive_pages(&mut app, &backing, &expected_pages);
     }
 
     #[test]
@@ -38201,8 +38212,8 @@ mod still_window_mode_key_tests {
             &source,
             items_generation,
         );
-        assert_detached_archive_backing(&app, &source, &backing);
-        assert_detached_archive_pages(&app, &backing, &expected_pages);
+        assert_detached_archive_backing(&mut app, &source, &backing);
+        assert_detached_archive_pages(&mut app, &backing, &expected_pages);
     }
 
     #[test]
@@ -38424,22 +38435,22 @@ mod still_window_mode_key_tests {
         assert_eq!(app.visible_indices, vec![0]);
         assert_eq!(app.selected, Some(0));
         assert_eq!(app.scroll_offset_y, 246.0);
-        let active = app
-            .active_context_bundle_for_test()
-            .expect("the materialized image folder must stay in its detached context");
-        assert_eq!(active.current_folder, Some(child));
-        assert_eq!(active.fullscreen_idx, Some(0));
-        assert_eq!(
-            active
-                .items
-                .iter()
-                .filter_map(|item| match item {
-                    GridItem::Image(path) => Some(path.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>(),
-            vec![page_a, page_b]
-        );
+        app.with_active_viewer_context(|active| {
+            assert_eq!(active.current_folder, Some(child));
+            assert_eq!(active.fullscreen_idx, Some(0));
+            assert_eq!(
+                active
+                    .items
+                    .iter()
+                    .filter_map(|item| match item {
+                        GridItem::Image(path) => Some(path.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                vec![page_a, page_b]
+            );
+        })
+        .expect("the materialized image folder must stay in its detached context");
     }
 
     #[test]
@@ -38677,17 +38688,17 @@ mod still_window_mode_key_tests {
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             app.update_active_viewer_context(ctx);
         });
-        let active = app
-            .active_context_bundle_for_test()
-            .expect("case-only path differences must still open the requested image");
-        let fullscreen_item = active.fullscreen_idx.and_then(|idx| active.items.get(idx));
-        assert!(
-            matches!(
-                fullscreen_item,
-                Some(GridItem::Image(path)) if crate::folder_tree::path_eq(path, &actual)
-            ),
-            "the strict resolver must select the requested filesystem image"
-        );
+        app.with_active_viewer_context(|active| {
+            let fullscreen_item = active.fullscreen_idx.and_then(|idx| active.items.get(idx));
+            assert!(
+                matches!(
+                    fullscreen_item,
+                    Some(GridItem::Image(path)) if crate::folder_tree::path_eq(path, &actual)
+                ),
+                "the strict resolver must select the requested filesystem image"
+            );
+        })
+        .expect("case-only path differences must still open the requested image");
     }
 
     #[test]
@@ -38695,16 +38706,15 @@ mod still_window_mode_key_tests {
     fn mounted_active_detached_context_ctrl_nav_handler_consumes_without_folder_nav() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.current_folder = Some(PathBuf::from(r"C:\pinned"));
-        bundle.items = vec![GridItem::Image(PathBuf::from(r"C:\pinned\a.jpg"))];
-        bundle.thumbnails = vec![ThumbnailState::Pending];
-        bundle.visible_indices = vec![0];
-        bundle.fullscreen_idx = Some(0);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.independent_active = true;
-        bundle.viewer_session.detached_window_id = Some(11);
-        app.install_active_context_for_test(bundle);
+        app.build_active_context_for_test(Some(11), DetachedSource::Image, |context| {
+            context.current_folder = Some(PathBuf::from(r"C:\pinned"));
+            context.items = vec![GridItem::Image(PathBuf::from(r"C:\pinned\a.jpg"))];
+            context.thumbnails = vec![ThumbnailState::Pending];
+            context.visible_indices = vec![0];
+            context.fullscreen_idx = Some(0);
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_independent_active = true;
+        });
         app.pending_folder_nav_steps = -2;
         app.pending_folder_nav_mode = FolderNavMode::SiblingFullscreen;
         app.native_video_deferred_nav_delta = Some(-1);
@@ -38754,17 +38764,16 @@ mod still_window_mode_key_tests {
         app.native_video_deferred_nav_delta = Some(-1);
         app.show_search_bar = true;
 
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
-        bundle.current_folder = Some(first.clone());
-        bundle.items = vec![GridItem::Image(first.join("a.jpg"))];
-        bundle.thumbnails = vec![ThumbnailState::Pending];
-        bundle.visible_indices = vec![0];
-        bundle.fullscreen_idx = Some(0);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.independent_active = true;
-        bundle.viewer_session.detached_window_id = Some(12);
-        app.install_active_context_for_test(bundle);
+        app.build_active_context_for_test(Some(12), DetachedSource::Image, |context| {
+            context.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+            context.current_folder = Some(first.clone());
+            context.items = vec![GridItem::Image(first.join("a.jpg"))];
+            context.thumbnails = vec![ThumbnailState::Pending];
+            context.visible_indices = vec![0];
+            context.fullscreen_idx = Some(0);
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_independent_active = true;
+        });
 
         app.with_active_viewer_context(|mounted| {
             assert!(mounted.detached_physical_folder_nav_available());
@@ -38791,14 +38800,14 @@ mod still_window_mode_key_tests {
         assert_eq!(app.native_video_deferred_nav_delta, Some(-1));
         assert!(app.show_search_bar);
 
-        let active = app
-            .active_context_bundle_for_test()
-            .expect("detached context must be restored after mounting");
-        assert_eq!(
-            active.navigation_scope,
-            ViewerNavigationScope::DetachedPhysical
-        );
-        assert!(active.folder_nav_pending.is_some());
+        app.with_active_viewer_context(|active| {
+            assert_eq!(
+                active.navigation_scope,
+                ViewerNavigationScope::DetachedPhysical
+            );
+            assert!(active.folder_nav_pending.is_some());
+        })
+        .expect("detached context must be restored after mounting");
     }
 
     #[test]
@@ -38815,16 +38824,16 @@ mod still_window_mode_key_tests {
         app.search_filter = Some(std::collections::HashSet::from([0]));
         app.show_search_bar = true;
 
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
-        bundle.current_folder = Some(PathBuf::from(r"C:\detached"));
-        bundle.items = vec![
-            GridItem::Image(PathBuf::from(r"C:\detached\a.jpg")),
-            GridItem::Image(PathBuf::from(r"C:\detached\b.jpg")),
-        ];
-        bundle.thumbnails = vec![ThumbnailState::Pending; 2];
-        bundle.search_filter = Some(std::collections::HashSet::from([0]));
-        app.install_active_context_for_test(bundle);
+        app.build_active_context_for_test(None, DetachedSource::Image, |context| {
+            context.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+            context.current_folder = Some(PathBuf::from(r"C:\detached"));
+            context.items = vec![
+                GridItem::Image(PathBuf::from(r"C:\detached\a.jpg")),
+                GridItem::Image(PathBuf::from(r"C:\detached\b.jpg")),
+            ];
+            context.thumbnails = vec![ThumbnailState::Pending; 2];
+            context.search_filter = Some(std::collections::HashSet::from([0]));
+        });
 
         app.with_active_viewer_context(|mounted| {
             mounted.rebuild_visible_indices();
@@ -38920,11 +38929,12 @@ mod still_window_mode_key_tests {
 
         let drop_nav_cancel = Arc::new(AtomicBool::new(false));
         let drop_scan_cancel = Arc::new(AtomicBool::new(false));
-        let mut dropped = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        dropped.navigation_scope = ViewerNavigationScope::DetachedPhysical;
-        dropped.folder_nav_pending = Some(nav_pending(Arc::clone(&drop_nav_cancel)));
-        dropped.folder_pane_open_pending = Some(scan_pending(Arc::clone(&drop_scan_cancel)));
-        drop(dropped);
+        paused.build_active_context_for_test(None, DetachedSource::Image, |context| {
+            context.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+            context.folder_nav_pending = Some(nav_pending(Arc::clone(&drop_nav_cancel)));
+            context.folder_pane_open_pending = Some(scan_pending(Arc::clone(&drop_scan_cancel)));
+        });
+        paused.remove_active_context_for_test();
         assert!(drop_nav_cancel.load(Ordering::Relaxed));
         assert!(drop_scan_cancel.load(Ordering::Relaxed));
     }
@@ -38956,23 +38966,22 @@ mod still_window_mode_key_tests {
                 scanned: FolderNavScanResult::NotNeeded,
             })
             .unwrap();
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
-        bundle.current_folder = Some(PathBuf::from(r"C:\detached"));
-        bundle.items = vec![GridItem::Image(PathBuf::from(r"C:\detached\a.jpg"))];
-        bundle.thumbnails = vec![ThumbnailState::Pending];
-        bundle.visible_indices = vec![0];
-        bundle.fullscreen_idx = Some(0);
-        bundle.folder_nav_pending = Some(FolderNavPending {
-            cancel: Arc::clone(&detached_cancel),
-            rx: detached_rx,
-            forward: true,
-            mode: FolderNavMode::Fullscreen,
+        app.build_active_context_for_test(Some(13), DetachedSource::Image, |context| {
+            context.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+            context.current_folder = Some(PathBuf::from(r"C:\detached"));
+            context.items = vec![GridItem::Image(PathBuf::from(r"C:\detached\a.jpg"))];
+            context.thumbnails = vec![ThumbnailState::Pending];
+            context.visible_indices = vec![0];
+            context.fullscreen_idx = Some(0);
+            context.folder_nav_pending = Some(FolderNavPending {
+                cancel: Arc::clone(&detached_cancel),
+                rx: detached_rx,
+                forward: true,
+                mode: FolderNavMode::Fullscreen,
+            });
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_independent_active = true;
         });
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.independent_active = true;
-        bundle.viewer_session.detached_window_id = Some(13);
-        app.install_active_context_for_test(bundle);
 
         let mut updated = false;
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
@@ -38985,15 +38994,15 @@ mod still_window_mode_key_tests {
             "the main context's pending request must not be polled while the detached bundle is mounted"
         );
         assert!(!main_cancel.load(Ordering::Relaxed));
-        let active = app
-            .active_context_bundle_for_test()
-            .expect("a boundary result keeps the active viewer open");
-        assert!(active.folder_nav_pending.is_none());
-        assert!(!detached_cancel.load(Ordering::Relaxed));
-        assert!(matches!(
-            active.fs_boundary_hint,
-            Some(crate::ui_fullscreen::FsBoundaryHint::NoImageFolder { forward: true, .. })
-        ));
+        app.with_active_viewer_context(|active| {
+            assert!(active.folder_nav_pending.is_none());
+            assert!(!detached_cancel.load(Ordering::Relaxed));
+            assert!(matches!(
+                active.fs_boundary_hint,
+                Some(crate::ui_fullscreen::FsBoundaryHint::NoImageFolder { forward: true, .. })
+            ));
+        })
+        .expect("a boundary result keeps the active viewer open");
     }
 
     #[test]
@@ -39079,14 +39088,14 @@ mod still_window_mode_key_tests {
                 Some(DetachedWindowState::Active),
                 "frame {frame}: the runtime lifecycle must remain Active"
             );
-            let active = app
-                .active_context_bundle_for_test()
-                .expect("the transition bundle must remain mounted");
-            assert_eq!(
-                active.viewer_session.detached_window_id,
-                Some(window_id),
-                "frame {frame}: the bundle must retain the same window identity"
-            );
+            app.with_active_viewer_context(|active| {
+                assert_eq!(
+                    active.detached_viewer_window_id,
+                    Some(window_id),
+                    "frame {frame}: the bundle must retain the same window identity"
+                );
+            })
+            .expect("the transition bundle must remain mounted");
             assert!(app.fs_viewport_shown);
         }
     }
@@ -39102,20 +39111,18 @@ mod still_window_mode_key_tests {
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         set_detached_host_for_test(&mut app, window_id, 0x4321, true);
-        app.begin_active_detached_session(window_id, DetachedSource::Image);
 
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
-        bundle.current_folder = Some(PathBuf::from(r"C:\pics"));
-        bundle.items = vec![GridItem::Image(PathBuf::from(r"C:\pics\a.jpg"))];
-        bundle.thumbnails = vec![ThumbnailState::Pending];
-        bundle.image_metas = vec![None];
-        bundle.visible_indices = vec![0];
-        bundle.fullscreen_idx = Some(0);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.independent_active = true;
-        bundle.viewer_session.detached_window_id = Some(window_id);
-        app.install_active_context_for_test(bundle);
+        app.build_active_context_for_test(Some(window_id), DetachedSource::Image, |context| {
+            context.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+            context.current_folder = Some(PathBuf::from(r"C:\pics"));
+            context.items = vec![GridItem::Image(PathBuf::from(r"C:\pics\a.jpg"))];
+            context.thumbnails = vec![ThumbnailState::Pending];
+            context.image_metas = vec![None];
+            context.visible_indices = vec![0];
+            context.fullscreen_idx = Some(0);
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_independent_active = true;
+        });
 
         app.with_active_viewer_context(|mounted| {
             mounted.handle_fullscreen_close_request();
@@ -39265,20 +39272,20 @@ mod still_window_mode_key_tests {
                 .all(|state| matches!(state, ThumbnailState::Pending))
         );
 
-        let detached = &app
-            .active_context_bundle_for_test()
-            .expect("the detached transition must remain isolated from the preserved main context");
-        assert!(matches!(
-            detached.thumbnails[0],
-            ThumbnailState::Loaded { .. }
-        ));
-        assert_eq!(
-            detached.thumb_pixels.get(&0).map(|pixels| pixels.size),
-            Some([4, 6]),
-            "the owner context must retain CPU pixels for pass-through rendition"
-        );
-        assert!(detached.requested.is_empty());
-        assert!(detached.texture_backlog.is_empty());
+        app.with_active_viewer_context(|detached| {
+            assert!(matches!(
+                detached.thumbnails[0],
+                ThumbnailState::Loaded { .. }
+            ));
+            assert_eq!(
+                detached.thumb_pixels.get(&0).map(|pixels| pixels.size),
+                Some([4, 6]),
+                "the owner context must retain CPU pixels for pass-through rendition"
+            );
+            assert!(detached.requested.is_empty());
+            assert!(detached.texture_backlog.is_empty());
+        })
+        .expect("the detached transition must remain isolated from the preserved main context");
     }
 
     #[test]
@@ -39314,30 +39321,34 @@ mod still_window_mode_key_tests {
         });
 
         run_active_detached_frame_for_test(&mut app, &ctx);
-        let detached = &app.active_context_bundle_for_test().unwrap();
-        assert_eq!(
-            detached
-                .thumbnails
-                .iter()
-                .filter(|state| matches!(state, ThumbnailState::Loaded { .. }))
-                .count(),
-            8
-        );
-        assert_eq!(detached.texture_backlog.len(), 2);
-        assert_eq!(detached.thumb_pixels.len(), 8);
+        app.with_active_viewer_context(|detached| {
+            assert_eq!(
+                detached
+                    .thumbnails
+                    .iter()
+                    .filter(|state| matches!(state, ThumbnailState::Loaded { .. }))
+                    .count(),
+                8
+            );
+            assert_eq!(detached.texture_backlog.len(), 2);
+            assert_eq!(detached.thumb_pixels.len(), 8);
+        })
+        .unwrap();
 
         run_active_detached_frame_for_test(&mut app, &ctx);
-        let detached = &app.active_context_bundle_for_test().unwrap();
-        assert!(
-            detached
-                .thumbnails
-                .iter()
-                .all(|state| matches!(state, ThumbnailState::Loaded { .. })),
-            "the owner must drain its staged results on the next frame"
-        );
-        assert!(detached.texture_backlog.is_empty());
-        assert_eq!(detached.thumb_pixels.len(), item_count);
-        assert!(detached.requested.is_empty());
+        app.with_active_viewer_context(|detached| {
+            assert!(
+                detached
+                    .thumbnails
+                    .iter()
+                    .all(|state| matches!(state, ThumbnailState::Loaded { .. })),
+                "the owner must drain its staged results on the next frame"
+            );
+            assert!(detached.texture_backlog.is_empty());
+            assert_eq!(detached.thumb_pixels.len(), item_count);
+            assert!(detached.requested.is_empty());
+        })
+        .unwrap();
     }
 
     #[test]
@@ -39373,24 +39384,28 @@ mod still_window_mode_key_tests {
         assert!(app.main_font_atlas_resync_defers_texture_uploads());
 
         run_active_detached_frame_for_test(&mut app, &ctx);
-        let detached = &app.active_context_bundle_for_test().unwrap();
-        assert!(matches!(detached.thumbnails[0], ThumbnailState::Pending));
-        assert_eq!(detached.texture_backlog.len(), 1);
-        assert!(detached.thumb_pixels.is_empty());
+        app.with_active_viewer_context(|detached| {
+            assert!(matches!(detached.thumbnails[0], ThumbnailState::Pending));
+            assert_eq!(detached.texture_backlog.len(), 1);
+            assert!(detached.thumb_pixels.is_empty());
+        })
+        .unwrap();
 
         app.main_font_atlas_resync_pending = false;
         app.main_font_atlas_resync_repeats_left = 0;
         run_active_detached_frame_for_test(&mut app, &ctx);
-        let detached = &app.active_context_bundle_for_test().unwrap();
-        assert!(matches!(
-            detached.thumbnails[0],
-            ThumbnailState::Loaded { .. }
-        ));
-        assert!(detached.texture_backlog.is_empty());
-        assert_eq!(
-            detached.thumb_pixels.get(&0).map(|pixels| pixels.size),
-            Some([5, 7])
-        );
+        app.with_active_viewer_context(|detached| {
+            assert!(matches!(
+                detached.thumbnails[0],
+                ThumbnailState::Loaded { .. }
+            ));
+            assert!(detached.texture_backlog.is_empty());
+            assert_eq!(
+                detached.thumb_pixels.get(&0).map(|pixels| pixels.size),
+                Some([5, 7])
+            );
+        })
+        .unwrap();
     }
 
     #[test]
@@ -39418,10 +39433,12 @@ mod still_window_mode_key_tests {
         });
 
         run_active_detached_frame_for_test(&mut app, &ctx);
-        let detached = &app.active_context_bundle_for_test().unwrap();
-        assert!(matches!(detached.thumbnails[0], ThumbnailState::Evicted));
-        assert!(detached.texture_backlog.is_empty());
-        assert!(detached.thumb_pixels.is_empty());
+        app.with_active_viewer_context(|detached| {
+            assert!(matches!(detached.thumbnails[0], ThumbnailState::Evicted));
+            assert!(detached.texture_backlog.is_empty());
+            assert!(detached.thumb_pixels.is_empty());
+        })
+        .unwrap();
     }
 
     #[test]
@@ -39463,19 +39480,21 @@ mod still_window_mode_key_tests {
         });
 
         run_active_detached_frame_for_test(&mut app, &ctx);
-        let detached = &app.active_context_bundle_for_test().unwrap();
-        assert!(matches!(
-            detached.thumbnails[0],
-            ThumbnailState::Loaded { .. }
-        ));
-        assert_eq!(
-            detached.auto_aspect.samples.get(&0),
-            Some(&ThumbAspect::Portrait3x4.height_ratio()),
-            "fullscreen-only consumption must not record grid aspect samples"
-        );
-        assert_eq!(detached.auto_aspect.current, Some(ThumbAspect::Square));
-        assert_eq!(detached.auto_aspect.switches_done, 0);
-        assert_eq!(detached.scroll_offset_y, 250.0);
+        app.with_active_viewer_context(|detached| {
+            assert!(matches!(
+                detached.thumbnails[0],
+                ThumbnailState::Loaded { .. }
+            ));
+            assert_eq!(
+                detached.auto_aspect.samples.get(&0),
+                Some(&ThumbAspect::Portrait3x4.height_ratio()),
+                "fullscreen-only consumption must not record grid aspect samples"
+            );
+            assert_eq!(detached.auto_aspect.current, Some(ThumbAspect::Square));
+            assert_eq!(detached.auto_aspect.switches_done, 0);
+            assert_eq!(detached.scroll_offset_y, 250.0);
+        })
+        .unwrap();
     }
 
     #[test]
@@ -39567,8 +39586,8 @@ mod still_window_mode_key_tests {
             Some(DetachedWindowState::Active)
         );
         assert!(
-            app.active_context_bundle_for_test()
-                .is_some_and(|active| active.zip_enumerate_pending.is_some()),
+            app.with_active_viewer_context(|active| active.zip_enumerate_pending.is_some())
+                .unwrap_or(false),
             "ZIP enumerate pending must keep its owner bundle alive"
         );
         drop(zip_tx);
@@ -39606,8 +39625,8 @@ mod still_window_mode_key_tests {
             Some(DetachedWindowState::Active)
         );
         assert!(
-            app.active_context_bundle_for_test()
-                .is_some_and(|active| active.folder_pane_open_pending.is_some()),
+            app.with_active_viewer_context(|active| active.folder_pane_open_pending.is_some())
+                .unwrap_or(false),
             "folder scan pending must keep its owner bundle alive"
         );
         drop(scan_tx);
@@ -39638,8 +39657,8 @@ mod still_window_mode_key_tests {
             Some(DetachedWindowState::Active)
         );
         assert!(
-            app.active_context_bundle_for_test()
-                .is_some_and(|active| active.pdf_password_request.is_some()),
+            app.with_active_viewer_context(|active| active.pdf_password_request.is_some())
+                .unwrap_or(false),
             "PDF password request must keep its owner bundle alive"
         );
     }
@@ -39710,28 +39729,27 @@ mod still_window_mode_key_tests {
             })
             .unwrap();
         let pdf = PathBuf::from(r"C:\books\current.pdf");
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
-        bundle.current_folder = Some(pdf.clone());
-        bundle.items = vec![GridItem::PdfPage {
-            pdf_path: pdf,
-            page_num: 3,
-            content_type: None,
-        }];
-        bundle.thumbnails = vec![ThumbnailState::Pending];
-        bundle.image_metas = vec![None];
-        bundle.visible_indices = vec![0];
-        bundle.fullscreen_idx = Some(0);
-        bundle.folder_nav_pending = Some(FolderNavPending {
-            cancel,
-            rx: result_rx,
-            forward: true,
-            mode: FolderNavMode::Fullscreen,
+        app.build_active_context_for_test(Some(window_id), DetachedSource::Image, move |context| {
+            context.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+            context.current_folder = Some(pdf.clone());
+            context.items = vec![GridItem::PdfPage {
+                pdf_path: pdf,
+                page_num: 3,
+                content_type: None,
+            }];
+            context.thumbnails = vec![ThumbnailState::Pending];
+            context.image_metas = vec![None];
+            context.visible_indices = vec![0];
+            context.fullscreen_idx = Some(0);
+            context.folder_nav_pending = Some(FolderNavPending {
+                cancel,
+                rx: result_rx,
+                forward: true,
+                mode: FolderNavMode::Fullscreen,
+            });
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_independent_active = true;
         });
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.independent_active = true;
-        bundle.viewer_session.detached_window_id = Some(window_id);
-        app.install_active_context_for_test(bundle);
 
         run_active_detached_frame_for_test(&mut app, &ctx);
 
@@ -39742,14 +39760,14 @@ mod still_window_mode_key_tests {
         assert_eq!(app.active_detached_session_viewport_id(), Some(viewport_id));
         assert!(app.detached_window_runtime_placement(window_id).is_some());
         assert!(app.fs_viewport_shown);
-        let active = app
-            .active_context_bundle_for_test()
-            .expect("a folder-nav boundary must keep the current detached context");
-        assert_eq!(active.fullscreen_idx, Some(0));
-        assert!(matches!(
-            active.fs_boundary_hint,
-            Some(crate::ui_fullscreen::FsBoundaryHint::NoImageFolder { forward: true, .. })
-        ));
+        app.with_active_viewer_context(|active| {
+            assert_eq!(active.fullscreen_idx, Some(0));
+            assert!(matches!(
+                active.fs_boundary_hint,
+                Some(crate::ui_fullscreen::FsBoundaryHint::NoImageFolder { forward: true, .. })
+            ));
+        })
+        .expect("a folder-nav boundary must keep the current detached context");
     }
 
     #[test]
@@ -39884,10 +39902,10 @@ mod still_window_mode_key_tests {
 
         app.fullscreen_idx = None;
         app.viewer_presentation = ViewerPresentation::MainWindow;
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.fullscreen_idx = Some(0);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        app.install_active_context_for_test(bundle);
+        app.build_active_context_for_test(None, DetachedSource::Image, |context| {
+            context.fullscreen_idx = Some(0);
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+        });
         assert!(
             !app.main_window_should_draw_export_dialogs(),
             "active detached context export dialog is also owned by the detached viewport"
@@ -39957,16 +39975,16 @@ mod still_window_mode_key_tests {
             ViewerPresentation::DetachedWindow,
             "the main context must not keep owning the detached video presentation"
         );
-        let active = app
-            .active_context_bundle_for_test()
-            .expect("detached video should be preserved in an active detached context");
-        assert_eq!(active.fullscreen_idx, Some(first));
-        assert_eq!(active.viewer_session.detached_window_id, Some(window_id));
-        assert!(active.viewer_session.independent_active);
-        assert!(matches!(
-            active.items.get(first),
-            Some(GridItem::Video(path)) if path.ends_with("a.mp4")
-        ));
+        app.with_active_viewer_context(|active| {
+            assert_eq!(active.fullscreen_idx, Some(first));
+            assert_eq!(active.detached_viewer_window_id, Some(window_id));
+            assert!(active.detached_viewer_independent_active);
+            assert!(matches!(
+                active.items.get(first),
+                Some(GridItem::Video(path)) if path.ends_with("a.mp4")
+            ));
+        })
+        .expect("detached video should be preserved in an active detached context");
         let session = app
             .active_detached_session
             .expect("the detached video viewport should remain alive");
@@ -40013,15 +40031,15 @@ mod still_window_mode_key_tests {
 
         assert_eq!(app.current_folder.as_deref(), Some(next_folder.as_path()));
         assert_eq!(app.fullscreen_idx, None);
-        let active = app
-            .active_context_bundle_for_test()
-            .expect("linked detached video should be cut loose before main context closes");
-        assert_eq!(active.fullscreen_idx, Some(first));
-        assert_eq!(active.viewer_session.detached_window_id, Some(window_id));
-        assert!(
-            active.viewer_session.independent_active,
-            "after the main context changes, the preserved video must stop following main selection"
-        );
+        app.with_active_viewer_context(|active| {
+            assert_eq!(active.fullscreen_idx, Some(first));
+            assert_eq!(active.detached_viewer_window_id, Some(window_id));
+            assert!(
+                active.detached_viewer_independent_active,
+                "after the main context changes, the preserved video must stop following main selection"
+            );
+        })
+        .expect("linked detached video should be cut loose before main context closes");
         let session = app
             .active_detached_session
             .expect("the detached video viewport should remain alive");
@@ -40144,9 +40162,7 @@ mod still_window_mode_key_tests {
             "an idle hidden app with neither detached nor media ownership should suspend"
         );
 
-        app.install_active_context_for_test(
-            crate::app::viewer_context_registry::ViewerContextBundle::empty(),
-        );
+        app.build_active_context_for_test(None, DetachedSource::Image, |_| {});
         assert!(
             app.ui_heartbeat_should_stay_active_while_hidden(),
             "a live detached viewer must keep watchdog observation active"
@@ -40497,37 +40513,37 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(mounted);
         install_playing_test_media(&mut app, mounted, mounted_path.clone(), 17.5);
 
-        let mut active = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        active.items.push(GridItem::Video(active_path.clone()));
-        active.fullscreen_idx = Some(0);
-        active.viewer_session.detached_window_id = Some(200);
         let active_player =
             crate::video::VideoPlayer::disconnected_for_test(active_path.clone(), 51.0);
         active_player.set_playing(true);
-        active.fs_cache.insert(
-            0,
-            FsCacheEntry::Video {
-                player: Box::new(active_player),
-                load_seq: 0,
-            },
-        );
-        app.install_active_context_for_test(active);
-        app.begin_active_detached_session(200, DetachedSource::Video);
+        let active_path_for_context = active_path.clone();
+        app.build_active_context_for_test(Some(200), DetachedSource::Video, move |active| {
+            active.items.push(GridItem::Video(active_path_for_context));
+            active.fullscreen_idx = Some(0);
+            active.fs_cache.insert(
+                0,
+                FsCacheEntry::Video {
+                    player: Box::new(active_player),
+                    load_seq: 0,
+                },
+            );
+        });
 
-        let mut parked = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        parked.items.push(GridItem::Video(parked_path.clone()));
-        parked.fullscreen_idx = Some(0);
         let parked_player =
             crate::video::VideoPlayer::disconnected_for_test(parked_path.clone(), 63.0);
         parked_player.set_playing(true);
-        parked.fs_cache.insert(
-            0,
-            FsCacheEntry::Video {
-                player: Box::new(parked_player),
-                load_seq: 0,
-            },
-        );
-        app.push_window_context_for_test(&ctx, 201, parked);
+        let parked_path_for_context = parked_path.clone();
+        app.push_window_context_for_test(&ctx, 201, move |parked| {
+            parked.items.push(GridItem::Video(parked_path_for_context));
+            parked.fullscreen_idx = Some(0);
+            parked.fs_cache.insert(
+                0,
+                FsCacheEntry::Video {
+                    player: Box::new(parked_player),
+                    load_seq: 0,
+                },
+            );
+        });
         app.transition_detached_window_state(
             201,
             DetachedWindowState::ParkedLive,
@@ -40546,18 +40562,22 @@ mod still_window_mode_key_tests {
         app.poll_remote_session(&ctx);
 
         assert_test_media_paused_at(&app, mounted, 17.5);
-        let active = &app.active_context_bundle_for_test().unwrap();
-        let Some(FsCacheEntry::Video { player, .. }) = active.fs_cache.get(&0) else {
-            unreachable!();
-        };
-        assert!(!player.intent_playing());
-        assert_eq!(player.position(), 51.0);
-        let parked = app.window_context_bundle_for_test(201).unwrap();
-        let Some(FsCacheEntry::Video { player, .. }) = parked.fs_cache.get(&0) else {
-            unreachable!();
-        };
-        assert!(!player.intent_playing());
-        assert_eq!(player.position(), 63.0);
+        app.with_active_viewer_context(|active| {
+            let Some(FsCacheEntry::Video { player, .. }) = active.fs_cache.get(&0) else {
+                unreachable!();
+            };
+            assert!(!player.intent_playing());
+            assert_eq!(player.position(), 51.0);
+        })
+        .unwrap();
+        app.with_window_viewer_context(201, |parked| {
+            let Some(FsCacheEntry::Video { player, .. }) = parked.fs_cache.get(&0) else {
+                unreachable!();
+            };
+            assert!(!player.intent_playing());
+            assert_eq!(player.position(), 63.0);
+        })
+        .unwrap();
 
         for (path, position) in [
             (&mounted_path, 17.5),
@@ -40572,7 +40592,7 @@ mod still_window_mode_key_tests {
             );
         }
         assert!(app.active_viewer_context_id().is_some());
-        assert!(app.window_context_bundle_for_test(201).is_some());
+        assert!(app.locate_window_context(201).is_some());
         assert_eq!(
             app.detached_window_state(201),
             Some(DetachedWindowState::ParkedLive)
@@ -40628,49 +40648,55 @@ mod still_window_mode_key_tests {
         let active_path = PathBuf::from(r"C:\clips\tray-active.mp4");
         let parked_path = PathBuf::from(r"C:\clips\tray-parked.mp4");
 
-        let mut active = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        active.items.push(GridItem::Video(active_path.clone()));
-        active.fullscreen_idx = Some(0);
         let active_player =
             crate::video::VideoPlayer::disconnected_for_test(active_path.clone(), 51.0);
         active_player.set_playing(true);
-        active.fs_cache.insert(
-            0,
-            FsCacheEntry::Video {
-                player: Box::new(active_player),
-                load_seq: 0,
-            },
-        );
-        app.install_active_context_for_test(active);
+        let active_path_for_context = active_path.clone();
+        app.build_active_context_for_test(None, DetachedSource::Video, move |active| {
+            active.items.push(GridItem::Video(active_path_for_context));
+            active.fullscreen_idx = Some(0);
+            active.fs_cache.insert(
+                0,
+                FsCacheEntry::Video {
+                    player: Box::new(active_player),
+                    load_seq: 0,
+                },
+            );
+        });
 
-        let mut parked = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        parked.items.push(GridItem::Video(parked_path.clone()));
-        parked.fullscreen_idx = Some(0);
         let parked_player =
             crate::video::VideoPlayer::disconnected_for_test(parked_path.clone(), 63.0);
         parked_player.set_playing(true);
-        parked.fs_cache.insert(
-            0,
-            FsCacheEntry::Video {
-                player: Box::new(parked_player),
-                load_seq: 0,
-            },
-        );
-        app.push_window_context_for_test(&ctx, 201, parked);
+        let parked_path_for_context = parked_path.clone();
+        app.push_window_context_for_test(&ctx, 201, move |parked| {
+            parked.items.push(GridItem::Video(parked_path_for_context));
+            parked.fullscreen_idx = Some(0);
+            parked.fs_cache.insert(
+                0,
+                FsCacheEntry::Video {
+                    player: Box::new(parked_player),
+                    load_seq: 0,
+                },
+            );
+        });
 
         assert_eq!(app.prepare_media_session_for_tray_residency(), 2);
-        let active = &app.active_context_bundle_for_test().unwrap();
-        let Some(FsCacheEntry::Video { player, .. }) = active.fs_cache.get(&0) else {
-            unreachable!();
-        };
-        assert!(player.intent_playing());
-        assert_eq!(player.position(), 51.0);
-        let parked = app.window_context_bundle_for_test(201).unwrap();
-        let Some(FsCacheEntry::Video { player, .. }) = parked.fs_cache.get(&0) else {
-            unreachable!();
-        };
-        assert!(player.intent_playing());
-        assert_eq!(player.position(), 63.0);
+        app.with_active_viewer_context(|active| {
+            let Some(FsCacheEntry::Video { player, .. }) = active.fs_cache.get(&0) else {
+                unreachable!();
+            };
+            assert!(player.intent_playing());
+            assert_eq!(player.position(), 51.0);
+        })
+        .unwrap();
+        app.with_window_viewer_context(201, |parked| {
+            let Some(FsCacheEntry::Video { player, .. }) = parked.fs_cache.get(&0) else {
+                unreachable!();
+            };
+            assert!(player.intent_playing());
+            assert_eq!(player.position(), 63.0);
+        })
+        .unwrap();
         assert_eq!(
             app.settings
                 .video_resume_positions
@@ -40782,12 +40808,14 @@ mod still_window_mode_key_tests {
                 .iter()
                 .any(|item| matches!(item, GridItem::Image(path) if path == &added_path))
         );
-        let active = app.active_context_bundle_for_test().unwrap();
-        assert_eq!(active.fullscreen_idx, Some(video));
-        assert!(matches!(
-            active.fs_cache.get(&video),
-            Some(FsCacheEntry::Video { player, .. }) if player.path() == &video_path
-        ));
+        app.with_active_viewer_context(|active| {
+            assert_eq!(active.fullscreen_idx, Some(video));
+            assert!(matches!(
+                active.fs_cache.get(&video),
+                Some(FsCacheEntry::Video { player, .. }) if player.path() == &video_path
+            ));
+        })
+        .unwrap();
         assert!(app.native_video_mode_switch.is_some());
     }
 
@@ -40903,9 +40931,7 @@ mod still_window_mode_key_tests {
         let current = push_image(&mut app, r"C:\pics\main.jpg");
         app.fullscreen_idx = Some(current);
         app.viewer_presentation = ViewerPresentation::Fullscreen;
-        app.install_active_context_for_test(
-            crate::app::viewer_context_registry::ViewerContextBundle::empty(),
-        );
+        app.build_active_context_for_test(None, DetachedSource::Image, |_| {});
 
         assert!(
             app.viewer_session_is_detached_or_switching(),
@@ -40951,13 +40977,13 @@ mod still_window_mode_key_tests {
     fn active_detached_video_context_owns_video_polling() {
         let mut app = setup_app();
         let video = push_video(&mut app, r"C:\clips\detached.mp4");
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(video);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.independent_active = true;
-        bundle.viewer_session.detached_window_id = Some(91);
-        app.install_active_context_for_test(bundle);
+        let items = app.items.clone();
+        app.build_active_context_for_test(Some(91), DetachedSource::Video, move |context| {
+            context.items = items;
+            context.fullscreen_idx = Some(video);
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_independent_active = true;
+        });
 
         assert!(app.other_active_viewer_context_contains_video());
         assert!(
@@ -41018,13 +41044,13 @@ mod still_window_mode_key_tests {
     fn active_detached_still_context_does_not_steal_main_video_polling() {
         let mut app = setup_app();
         let image = push_image(&mut app, r"C:\pics\detached.jpg");
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(image);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.independent_active = true;
-        bundle.viewer_session.detached_window_id = Some(92);
-        app.install_active_context_for_test(bundle);
+        let items = app.items.clone();
+        app.build_active_context_for_test(Some(92), DetachedSource::Image, move |context| {
+            context.items = items;
+            context.fullscreen_idx = Some(image);
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_independent_active = true;
+        });
 
         assert!(!app.other_active_viewer_context_contains_video());
         assert!(
@@ -41046,27 +41072,30 @@ mod still_window_mode_key_tests {
         app.pending_finalize.insert(4);
         app.vst3_deferred_media_open = Some(5);
         let main_cancel = std::sync::Arc::clone(&app.cancel_token);
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        let bundle_cancel = std::sync::Arc::clone(&bundle.cancel_token);
-
-        app.swap_viewer_context_bundle(&mut bundle);
+        let context_id = app.stash_mounted_as_active_for_test(93);
+        let bundle_cancel = std::sync::Arc::clone(&app.cancel_token);
         // mount 中 (= 空コンテキスト側): main の bookkeeping は bundle に退避され、App 側は
         // 空 bookkeeping + 独立 token を持つ。
         assert!(app.requested.is_empty());
         assert_eq!(app.vst3_deferred_media_open, None);
-        assert_eq!(bundle.vst3_deferred_media_open, Some(5));
+        app.with_viewer_context(context_id, |mounted| {
+            assert_eq!(mounted.vst3_deferred_media_open, Some(5));
+        })
+        .unwrap();
         assert!(std::sync::Arc::ptr_eq(&app.cancel_token, &bundle_cancel));
         // mount 中のロードキャンセル (load_zip_as_folder 相当) は main の token を倒さない。
         app.cancel_token
             .store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(!main_cancel.load(std::sync::atomic::Ordering::Relaxed));
 
-        app.swap_viewer_context_bundle(&mut bundle);
         // unmount: main の bookkeeping が clear されずそのまま戻る (P2-8 の核心)。
-        assert!(app.requested.contains_key(&3));
-        assert!(app.pending_finalize.contains(&4));
-        assert_eq!(app.vst3_deferred_media_open, Some(5));
-        assert!(std::sync::Arc::ptr_eq(&app.cancel_token, &main_cancel));
+        app.with_viewer_context(context_id, |mounted| {
+            assert!(mounted.requested.contains_key(&3));
+            assert!(mounted.pending_finalize.contains(&4));
+            assert_eq!(mounted.vst3_deferred_media_open, Some(5));
+            assert!(std::sync::Arc::ptr_eq(&mounted.cancel_token, &main_cancel));
+        })
+        .unwrap();
     }
 
     #[test]
@@ -41128,10 +41157,12 @@ mod still_window_mode_key_tests {
                 .and_then(|pending| pending.parked_live_window_id),
             Some(88)
         );
-        let parked = app.window_context_bundle_for_test(88).unwrap();
-        assert!(parked.requested.is_empty());
-        assert!(parked.pending_finalize.is_empty());
-        assert!(parked.texture_backlog.is_empty());
+        app.with_window_viewer_context(88, |parked| {
+            assert!(parked.requested.is_empty());
+            assert!(parked.pending_finalize.is_empty());
+            assert!(parked.texture_backlog.is_empty());
+        })
+        .unwrap();
     }
 
     #[test]
@@ -41183,19 +41214,20 @@ mod still_window_mode_key_tests {
         );
 
         let parked_id = app.detached_image_windows[0].id;
-        let parked = app
-            .window_context_bundle_for_test(parked_id)
-            .expect("parked bundle");
-        assert_eq!(parked.items.len(), app.items.len());
-        assert!(matches!(
-            parked.fs_cache.get(&video),
-            Some(FsCacheEntry::Video { .. })
-        ));
-        assert!(parked.adjustment_page_params.is_empty());
-        assert!(parked.mask_pages.is_empty());
-        assert!(parked.local_adjust_pages.is_empty());
-        assert_eq!(parked.spread_mode, crate::settings::SpreadMode::Single);
-        assert!(parked.thumb_adjust_tex.is_empty());
+        let main_items_len = app.items.len();
+        app.with_window_viewer_context(parked_id, |parked| {
+            assert_eq!(parked.items.len(), main_items_len);
+            assert!(matches!(
+                parked.fs_cache.get(&video),
+                Some(FsCacheEntry::Video { .. })
+            ));
+            assert!(parked.adjustment_page_params.is_empty());
+            assert!(parked.mask_pages.is_empty());
+            assert!(parked.local_adjust_pages.is_empty());
+            assert_eq!(parked.spread_mode, crate::settings::SpreadMode::Single);
+            assert!(parked.thumb_adjust_tex.is_empty());
+        })
+        .expect("parked bundle");
     }
 
     #[test]
@@ -41225,14 +41257,14 @@ mod still_window_mode_key_tests {
 
         app.load_zip_as_folder(zip_path);
 
-        let active = app
-            .active_context_bundle_for_test()
-            .expect("media context must be promoted before ZIP clears main items");
-        assert_eq!(active.fullscreen_idx, Some(video));
-        assert!(matches!(
-            active.fs_cache.get(&video),
-            Some(FsCacheEntry::Video { .. })
-        ));
+        app.with_active_viewer_context(|active| {
+            assert_eq!(active.fullscreen_idx, Some(video));
+            assert!(matches!(
+                active.fs_cache.get(&video),
+                Some(FsCacheEntry::Video { .. })
+            ));
+        })
+        .expect("media context must be promoted before ZIP clears main items");
         assert!(app.fullscreen_idx.is_none());
     }
 
@@ -41253,15 +41285,15 @@ mod still_window_mode_key_tests {
         assert!(app.promote_active_detached_video_for_main_context_change());
         assert_eq!(app.vst3_deferred_media_open, None);
         assert_eq!(
-            app.active_context_bundle_for_test()
-                .and_then(|active| active.vst3_deferred_media_open),
+            app.with_active_viewer_context(|active| active.vst3_deferred_media_open)
+                .flatten(),
             Some(video)
         );
         assert!(app.park_active_detached_context_for_new_grid_open(&ctx, video));
         assert!(app.active_viewer_context_id().is_none());
         assert_eq!(
-            app.window_context_bundle_for_test(window_id)
-                .and_then(|bundle| bundle.vst3_deferred_media_open),
+            app.with_window_viewer_context(window_id, |bundle| bundle.vst3_deferred_media_open)
+                .unwrap(),
             Some(video)
         );
 
@@ -41276,11 +41308,11 @@ mod still_window_mode_key_tests {
         });
 
         assert_eq!(consumed, vec![(Some(window_id), Some(window_id), video)]);
-        let parked = app
-            .window_context_bundle_for_test(window_id)
-            .expect("parked bundle");
-        assert_eq!(parked.vst3_deferred_media_open, None);
-        assert!(parked.pending_auto_fs_open);
+        app.with_window_viewer_context(window_id, |parked| {
+            assert_eq!(parked.vst3_deferred_media_open, None);
+            assert!(parked.pending_auto_fs_open);
+        })
+        .expect("parked bundle");
     }
 
     #[test]
@@ -41290,19 +41322,19 @@ mod still_window_mode_key_tests {
         let first = push_image(&mut app, r"C:\pics\first.jpg");
         let second = push_image(&mut app, r"C:\pics\second.jpg");
         let video = push_video(&mut app, r"C:\clips\detached.mp4");
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(video);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.detached_window_id = Some(90);
-        bundle.vst3_deferred_media_open = Some(video);
-        app.install_active_context_for_test(bundle);
+        let items = app.items.clone();
+        app.build_active_context_for_test(Some(90), DetachedSource::Video, move |context| {
+            context.items = items;
+            context.fullscreen_idx = Some(video);
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.vst3_deferred_media_open = Some(video);
+        });
 
         app.fullscreen_idx = Some(first);
         app.prepare_viewer_presentation_close();
         assert_eq!(
-            app.active_context_bundle_for_test()
-                .and_then(|active| active.vst3_deferred_media_open),
+            app.with_active_viewer_context(|active| active.vst3_deferred_media_open)
+                .flatten(),
             Some(video)
         );
 
@@ -41310,8 +41342,8 @@ mod still_window_mode_key_tests {
         app.open_fullscreen(second, crate::app::HistoryTrigger::UserChosen);
         assert_eq!(app.vst3_deferred_media_open, None);
         assert_eq!(
-            app.active_context_bundle_for_test()
-                .and_then(|active| active.vst3_deferred_media_open),
+            app.with_active_viewer_context(|active| active.vst3_deferred_media_open)
+                .flatten(),
             Some(video),
             "main context open may clear only its own deferred request"
         );
@@ -41496,10 +41528,7 @@ mod still_window_mode_key_tests {
                 focused_last_frame: false,
                 initial_placement_applied: true,
             });
-        app.install_window_context_for_test(
-            crate::app::viewer_context_registry::ViewerContextBundle::empty(),
-            7,
-        );
+        app.build_window_context_for_test(7, |_| {});
         app.transition_detached_window_state(7, DetachedWindowState::ParkedLive, "test_setup");
         app.detached_viewer_window_id = Some(7);
         app.last_active_detached_window_id = Some(7);
@@ -41549,12 +41578,7 @@ mod still_window_mode_key_tests {
         app.begin_mounted_detached_session_for_test(70, DetachedSource::Image);
 
         // ParkedLive のメディア窓 (61)。
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(video);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.independent_active = true;
-        bundle.viewer_session.detached_window_id = Some(61);
+        let items = app.items.clone();
         let media_tex = ctx.load_texture(
             "parked_live_ghost_media",
             egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
@@ -41583,7 +41607,13 @@ mod still_window_mode_key_tests {
                 focused_last_frame: false,
                 initial_placement_applied: true,
             });
-        app.install_window_context_for_test(bundle, 61);
+        app.build_window_context_for_test(61, move |context| {
+            context.items = items;
+            context.fullscreen_idx = Some(video);
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_independent_active = true;
+            context.detached_viewer_window_id = Some(61);
+        });
         app.transition_detached_window_state(61, DetachedWindowState::ParkedLive, "test_setup");
 
         assert!(app.activate_detached_image_window_snapshot(&ctx, 61));
@@ -41770,12 +41800,7 @@ mod still_window_mode_key_tests {
         let video = push_video(&mut app, video_path);
         app.settings.detached_viewer_enabled = true;
 
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(video);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.independent_active = true;
-        bundle.viewer_session.detached_window_id = Some(61);
+        let items = app.items.clone();
         let media_tex = ctx.load_texture(
             "removed_path_media",
             egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
@@ -41804,7 +41829,13 @@ mod still_window_mode_key_tests {
                 focused_last_frame: false,
                 initial_placement_applied: true,
             });
-        app.install_window_context_for_test(bundle, 61);
+        app.build_window_context_for_test(61, move |context| {
+            context.items = items;
+            context.fullscreen_idx = Some(video);
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_independent_active = true;
+            context.detached_viewer_window_id = Some(61);
+        });
         app.transition_detached_window_state(61, DetachedWindowState::ParkedLive, "test_setup");
 
         let resume_key = crate::adjustment_db::normalize_path(std::path::Path::new(video_path));
@@ -42294,9 +42325,6 @@ mod still_window_mode_key_tests {
             egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
             egui::TextureOptions::LINEAR,
         );
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.current_folder = Some(std::path::PathBuf::from(r"D:\pics"));
-        bundle.local_adjust_pages.insert(0); // 移行前 DB 由来の stale presence
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 91,
@@ -42320,7 +42348,10 @@ mod still_window_mode_key_tests {
                 focused_last_frame: false,
                 initial_placement_applied: true,
             });
-        app.install_window_context_for_test(bundle, 91);
+        app.build_window_context_for_test(91, |context| {
+            context.current_folder = Some(std::path::PathBuf::from(r"D:\pics"));
+            context.local_adjust_pages.insert(0); // 移行前 DB 由来の stale presence
+        });
         app.transition_detached_window_state(91, DetachedWindowState::Parked, "test_setup");
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -42338,13 +42369,13 @@ mod still_window_mode_key_tests {
         .unwrap();
         app.poll_rename_migration_pending(&ctx);
 
-        let rehydrated = app
-            .window_context_bundle_for_test(91)
-            .expect("bundle は温存される");
-        assert!(
-            rehydrated.local_adjust_pages.is_empty(),
-            "改名アイテムの親フォルダを持つ parked bundle は再構築される (stale presence が消える)"
-        );
+        app.with_window_viewer_context(91, |rehydrated| {
+            assert!(
+                rehydrated.local_adjust_pages.is_empty(),
+                "改名アイテムの親フォルダを持つ parked bundle は再構築される (stale presence が消える)"
+            );
+        })
+        .expect("bundle は温存される");
     }
 
     #[test]
@@ -42533,14 +42564,13 @@ mod still_window_mode_key_tests {
         let video = push_video(&mut app, r"C:\clips\live2.mp4");
         let window_id = 53;
         app.settings.detached_viewer_enabled = true;
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(video);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.detached_window_id = Some(window_id);
-        bundle.viewer_session.independent_active = true;
-        app.install_active_context_for_test(bundle);
-        app.begin_active_detached_session(window_id, DetachedSource::Video);
+        let items = app.items.clone();
+        app.build_active_context_for_test(Some(window_id), DetachedSource::Video, move |context| {
+            context.items = items;
+            context.fullscreen_idx = Some(video);
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_independent_active = true;
+        });
         // main 側の stale コピー (実機の再現条件)。
         app.detached_viewer_window_id = Some(window_id);
         app.last_active_detached_window_id = Some(window_id);
@@ -42571,11 +42601,7 @@ mod still_window_mode_key_tests {
         let image = push_image(&mut app, r"C:\pics\a.jpg");
         let video = push_video(&mut app, r"C:\clips\b.mp4");
         let audio = push_audio(&mut app, r"C:\music\bgm.flac");
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(audio);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.detached_window_id = Some(95);
+        let items = app.items.clone();
         let tex = ctx.load_texture(
             "parked_live_music_clear_guard",
             egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
@@ -42604,7 +42630,12 @@ mod still_window_mode_key_tests {
                 focused_last_frame: false,
                 initial_placement_applied: true,
             });
-        app.install_window_context_for_test(bundle, 95);
+        app.build_window_context_for_test(95, move |context| {
+            context.items = items;
+            context.fullscreen_idx = Some(audio);
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_window_id = Some(95);
+        });
         app.transition_detached_window_state(95, DetachedWindowState::ParkedLive, "test_setup");
 
         assert!(app.detached_music_window_exists());
@@ -42633,12 +42664,12 @@ mod still_window_mode_key_tests {
         // main フォルダ移動後も Active のメディア窓が参照する global 状態を維持する。
         let mut app = setup_app();
         let audio = push_audio(&mut app, r"C:\music\bgm.flac");
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(audio);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.detached_window_id = Some(96);
-        app.install_active_context_for_test(bundle);
+        let items = app.items.clone();
+        app.build_active_context_for_test(Some(96), DetachedSource::Audio, move |context| {
+            context.items = items;
+            context.fullscreen_idx = Some(audio);
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+        });
         let path = std::path::PathBuf::from(r"C:\music\bgm.flac");
         app.music_analysis_path = Some(path.clone());
         app.music_pcm = Some(std::sync::Arc::new(
@@ -42754,20 +42785,26 @@ mod still_window_mode_key_tests {
         app.save_all_video_resume_positions();
         assert_eq!(app.settings.video_resume_positions.get(&key), Some(&40.0));
 
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(idx);
-        bundle.video_audio_mode = Some(idx);
+        let items = app.items.clone();
         let player = crate::video::VideoPlayer::disconnected_for_test(path, 55.0);
         player.set_last_displayed_pts_for_test(12.0);
-        bundle.fs_cache.insert(
-            idx,
-            FsCacheEntry::Video {
-                player: Box::new(player),
-                load_seq: 0,
-            },
-        );
-        let plan = viewer_context_media_teardown_plan(ContextRef::at_rest(&bundle));
+        app.build_active_context_for_test(None, DetachedSource::Video, move |context| {
+            context.items = items;
+            context.fullscreen_idx = Some(idx);
+            context.video_audio_mode = Some(idx);
+            context.fs_cache.insert(
+                idx,
+                FsCacheEntry::Video {
+                    player: Box::new(player),
+                    load_seq: 0,
+                },
+            );
+        });
+        let plan = app
+            .with_active_viewer_context(|context| {
+                viewer_context_media_teardown_plan(ContextRef::mounted(context))
+            })
+            .unwrap();
         assert_eq!(plan.resume_updates[0].position, 55.0);
     }
 
@@ -42780,39 +42817,41 @@ mod still_window_mode_key_tests {
         let active_path = PathBuf::from(r"C:\clips\active-exit.mp4");
         let parked_path = PathBuf::from(r"C:\clips\parked-exit.mp4");
 
-        let mut active_bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        active_bundle
-            .items
-            .push(GridItem::Video(active_path.clone()));
-        active_bundle.fullscreen_idx = Some(0);
-        active_bundle.fs_cache.insert(
-            0,
-            FsCacheEntry::Video {
-                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
-                    active_path.clone(),
-                    41.0,
-                )),
-                load_seq: 0,
-            },
-        );
-        app.install_active_context_for_test(active_bundle);
+        let active_path_for_context = active_path.clone();
+        app.build_active_context_for_test(None, DetachedSource::Video, move |active| {
+            active
+                .items
+                .push(GridItem::Video(active_path_for_context.clone()));
+            active.fullscreen_idx = Some(0);
+            active.fs_cache.insert(
+                0,
+                FsCacheEntry::Video {
+                    player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                        active_path_for_context,
+                        41.0,
+                    )),
+                    load_seq: 0,
+                },
+            );
+        });
 
-        let mut parked_bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        parked_bundle
-            .items
-            .push(GridItem::Video(parked_path.clone()));
-        parked_bundle.fullscreen_idx = Some(0);
-        parked_bundle.fs_cache.insert(
-            0,
-            FsCacheEntry::Video {
-                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
-                    parked_path.clone(),
-                    52.0,
-                )),
-                load_seq: 0,
-            },
-        );
-        app.push_window_context_for_test(&ctx, 106, parked_bundle);
+        let parked_path_for_context = parked_path.clone();
+        app.push_window_context_for_test(&ctx, 106, move |parked| {
+            parked
+                .items
+                .push(GridItem::Video(parked_path_for_context.clone()));
+            parked.fullscreen_idx = Some(0);
+            parked.fs_cache.insert(
+                0,
+                FsCacheEntry::Video {
+                    player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                        parked_path_for_context,
+                        52.0,
+                    )),
+                    load_seq: 0,
+                },
+            );
+        });
 
         app.save_detached_video_resume_positions_for_exit();
 
@@ -42829,28 +42868,35 @@ mod still_window_mode_key_tests {
             Some(&52.0)
         );
         assert!(app.active_viewer_context_id().is_some());
-        assert!(app.window_context_bundle_for_test(106).is_some());
+        assert!(app.locate_window_context(106).is_some());
     }
 
     #[test]
     #[cfg(windows)]
     fn teardown_plan_bakes_eof_and_removes_polluted_resume() {
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
         let path = PathBuf::from(r"C:\clips\teardown-eof.mpg");
-        let idx = bundle.items.len();
-        bundle.items.push(GridItem::Video(path.clone()));
-        bundle.fullscreen_idx = Some(idx);
+        let idx = 0;
         let player = crate::video::VideoPlayer::disconnected_for_test(path.clone(), 13.046);
         player.mark_eof_for_test(0.0);
-        bundle.fs_cache.insert(
-            idx,
-            FsCacheEntry::Video {
-                player: Box::new(player),
-                load_seq: 0,
-            },
-        );
+        let mut app = setup_app();
+        let path_for_context = path.clone();
+        app.build_active_context_for_test(None, DetachedSource::Video, move |context| {
+            context.items.push(GridItem::Video(path_for_context));
+            context.fullscreen_idx = Some(idx);
+            context.fs_cache.insert(
+                idx,
+                FsCacheEntry::Video {
+                    player: Box::new(player),
+                    load_seq: 0,
+                },
+            );
+        });
         let key = crate::adjustment_db::normalize_path(&path);
-        let plan = viewer_context_media_teardown_plan(ContextRef::at_rest(&bundle));
+        let plan = app
+            .with_active_viewer_context(|context| {
+                viewer_context_media_teardown_plan(ContextRef::mounted(context))
+            })
+            .unwrap();
         assert_eq!(plan.resume_updates.len(), 1);
         assert!(plan.resume_updates[0].at_eof);
         assert_eq!(plan.resume_updates[0].duration, 0.0);
@@ -42873,21 +42919,23 @@ mod still_window_mode_key_tests {
         let new_path = app.tmp.path().join("rename-new.mp4");
         std::fs::write(&old_path, b"test").unwrap();
         let video = push_video(&mut app, old_path.to_str().unwrap());
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(video);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.fs_cache.insert(
-            video,
-            FsCacheEntry::Video {
-                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
-                    old_path.clone(),
-                    37.5,
-                )),
-                load_seq: 0,
-            },
-        );
-        app.push_window_context_for_test(&ctx, 98, bundle);
+        let items = app.items.clone();
+        let old_path_for_context = old_path.clone();
+        app.push_window_context_for_test(&ctx, 98, move |context| {
+            context.items = items;
+            context.fullscreen_idx = Some(video);
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.fs_cache.insert(
+                video,
+                FsCacheEntry::Video {
+                    player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                        old_path_for_context,
+                        37.5,
+                    )),
+                    load_seq: 0,
+                },
+            );
+        });
         app.transition_detached_window_state(98, DetachedWindowState::ParkedLive, "test_setup");
         let old_key = crate::adjustment_db::normalize_path(&old_path);
         let new_key = crate::adjustment_db::normalize_path(&new_path);
@@ -42921,12 +42969,13 @@ mod still_window_mode_key_tests {
         let ctx = egui::Context::default();
         let path = PathBuf::from(r"C:\music\closing.flac");
         let audio = push_audio(&mut app, path.to_str().unwrap());
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(audio);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.detached_window_id = Some(97);
-        app.push_window_context_for_test(&ctx, 97, bundle);
+        let items = app.items.clone();
+        app.push_window_context_for_test(&ctx, 97, move |context| {
+            context.items = items;
+            context.fullscreen_idx = Some(audio);
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_window_id = Some(97);
+        });
         app.transition_detached_window_state(97, DetachedWindowState::ParkedLive, "test_setup");
         app.music_analysis_path = Some(path.clone());
         app.music_pcm = Some(std::sync::Arc::new(
@@ -42963,11 +43012,7 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let video = push_video(&mut app, r"C:\clips\parked.mp4");
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(video);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.detached_window_id = Some(93);
+        let items = app.items.clone();
         let tex = ctx.load_texture(
             "parked_live_poll_owner",
             egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
@@ -42996,7 +43041,12 @@ mod still_window_mode_key_tests {
                 focused_last_frame: false,
                 initial_placement_applied: true,
             });
-        app.install_window_context_for_test(bundle, 93);
+        app.build_window_context_for_test(93, move |context| {
+            context.items = items;
+            context.fullscreen_idx = Some(video);
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_window_id = Some(93);
+        });
         app.transition_detached_window_state(93, DetachedWindowState::ParkedLive, "test_setup");
 
         assert!(app.parked_live_media_window_exists());
@@ -43012,11 +43062,7 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let image = push_image(&mut app, r"C:\pics\parked.jpg");
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(image);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.detached_window_id = Some(94);
+        let items = app.items.clone();
         let tex = ctx.load_texture(
             "parked_live_still_poll_owner",
             egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
@@ -43045,7 +43091,12 @@ mod still_window_mode_key_tests {
                 focused_last_frame: false,
                 initial_placement_applied: true,
             });
-        app.install_window_context_for_test(bundle, 94);
+        app.build_window_context_for_test(94, move |context| {
+            context.items = items;
+            context.fullscreen_idx = Some(image);
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_window_id = Some(94);
+        });
         app.transition_detached_window_state(94, DetachedWindowState::ParkedLive, "test_setup");
 
         assert!(!app.parked_live_media_window_exists());
@@ -43156,18 +43207,23 @@ mod still_window_mode_key_tests {
             "the auto-opened image viewer must not remain bundled with main"
         );
         assert_eq!(app.selected, Some(0));
-        let active = app
-            .active_context_bundle_for_test()
+        let (active_window_id, active_grid_intent) = app
+            .with_active_viewer_context(|active| {
+                assert_eq!(active.fullscreen_idx, Some(0));
+                assert_eq!(
+                    active.viewer_presentation,
+                    ViewerPresentation::DetachedWindow
+                );
+                assert_eq!(
+                    active.navigation_scope,
+                    ViewerNavigationScope::DetachedPhysical
+                );
+                (
+                    active.detached_viewer_window_id,
+                    active.fs_open_intent_from_grid,
+                )
+            })
             .expect("the auto-opened image folder must own an active context");
-        assert_eq!(active.fullscreen_idx, Some(0));
-        assert_eq!(
-            active.viewer_session.presentation,
-            ViewerPresentation::DetachedWindow
-        );
-        assert_eq!(
-            active.navigation_scope,
-            ViewerNavigationScope::DetachedPhysical
-        );
         assert!(
             app.detached_viewer_focus_requested,
             "image-only folder auto-open is still an explicit grid open and should focus the newly active detached window"
@@ -43183,16 +43239,16 @@ mod still_window_mode_key_tests {
             "existing.jpg"
         );
         assert_ne!(
-            active.viewer_session.detached_window_id,
+            active_window_id,
             Some(41),
             "always-new auto-open must not reuse the previous detached viewport as continuation navigation"
         );
         assert!(
-            active.viewer_session.detached_window_id.is_some(),
+            active_window_id.is_some(),
             "a new active detached viewport should be allocated for the image-only folder"
         );
         assert!(
-            !app.fs_open_intent_from_grid && !active.fs_open_intent_from_grid,
+            !app.fs_open_intent_from_grid && !active_grid_intent,
             "open_fullscreen consumes the restored grid intent"
         );
     }
@@ -43444,26 +43500,26 @@ mod still_window_mode_key_tests {
         });
 
         assert_eq!(app.fullscreen_idx, None);
-        let active = app
-            .active_context_bundle_for_test()
-            .expect("an explicit detached PDF page open must own an active context");
-        assert_eq!(active.fullscreen_idx, Some(0));
-        assert_eq!(
-            active.viewer_session.presentation,
-            ViewerPresentation::DetachedWindow
-        );
-        assert_eq!(
-            active.navigation_scope,
-            ViewerNavigationScope::DetachedPhysical
-        );
-        assert!(
-            app.detached_viewer_focus_requested,
-            "explicit PDF auto-fullscreen should focus the detached viewer after async enumerate"
-        );
-        assert!(
-            active.viewer_session.independent_active,
-            "always-new image window mode must still make the PDF page detached session independent"
-        );
+        app.with_active_viewer_context(|active| {
+            assert_eq!(active.fullscreen_idx, Some(0));
+            assert_eq!(
+                active.viewer_presentation,
+                ViewerPresentation::DetachedWindow
+            );
+            assert_eq!(
+                active.navigation_scope,
+                ViewerNavigationScope::DetachedPhysical
+            );
+            assert!(
+                active.detached_viewer_focus_requested,
+                "explicit PDF auto-fullscreen should focus the detached viewer after async enumerate"
+            );
+            assert!(
+                active.detached_viewer_independent_active,
+                "always-new image window mode must still make the PDF page detached session independent"
+            );
+        })
+        .expect("an explicit detached PDF page open must own an active context");
     }
 
     #[test]
@@ -43563,11 +43619,13 @@ mod still_window_mode_key_tests {
                             app.fullscreen_idx, None,
                             "{book_label}: main context must remain on the page/container list"
                         );
-                        let active = app.active_context_bundle_for_test().unwrap();
-                        assert!(
-                            active.fs_nav_after_pdf_enumerate.is_some(),
-                            "{book_label}: detached book context should reopen the selected page inside its own bundle"
-                        );
+                        app.with_active_viewer_context(|active| {
+                            assert!(
+                                active.fs_nav_after_pdf_enumerate.is_some(),
+                                "{book_label}: detached book context should reopen the selected page inside its own bundle"
+                            );
+                        })
+                        .unwrap();
                     } else if effective_direct_open {
                         assert!(
                             app.active_viewer_context_id().is_none(),
@@ -43628,23 +43686,23 @@ mod still_window_mode_key_tests {
             app.pdf_enumerate_pending.is_none(),
             "main context must not own the detached PDF enumerate pending"
         );
-        let active = app
-            .active_context_bundle_for_test()
-            .expect("detached PDF open should create an active viewer context");
-        assert!(
-            active.pdf_enumerate_pending.is_some(),
-            "PDF enumerate pending must move into the active detached context"
-        );
         assert_eq!(app.items_generation, 0);
-        assert!(
-            active.items_generation & DETACHED_VIEWER_CONTEXT_GENERATION_BASE != 0,
-            "detached book context must use a generation range that main thumbnail polling cannot accept"
-        );
-        assert_eq!(
-            active.current_folder, None,
-            "without a PDF meta placeholder the active context should wait for enumerate without replacing main"
-        );
-        assert!(active.fs_nav_after_pdf_enumerate.is_some());
+        app.with_active_viewer_context(|active| {
+            assert!(
+                active.pdf_enumerate_pending.is_some(),
+                "PDF enumerate pending must move into the active detached context"
+            );
+            assert!(
+                active.items_generation & DETACHED_VIEWER_CONTEXT_GENERATION_BASE != 0,
+                "detached book context must use a generation range that main thumbnail polling cannot accept"
+            );
+            assert_eq!(
+                active.current_folder, None,
+                "without a PDF meta placeholder the active context should wait for enumerate without replacing main"
+            );
+            assert!(active.fs_nav_after_pdf_enumerate.is_some());
+        })
+        .expect("detached PDF open should create an active viewer context");
 
         let pdf_path = match &app.items[0] {
             GridItem::PdfFile(path) => path.clone(),
@@ -43661,7 +43719,7 @@ mod still_window_mode_key_tests {
         assert!(app.show_search_bar);
         assert_eq!(app.selected, Some(0));
         assert_eq!(app.scroll_offset_y, 137.0);
-        assert_detached_pdf_pages(&app, &pdf_path, &[0, 1]);
+        assert_detached_pdf_pages(&mut app, &pdf_path, &[0, 1]);
     }
 
     #[test]
@@ -43697,24 +43755,24 @@ mod still_window_mode_key_tests {
             app.zip_enumerate_pending.is_none(),
             "main context must not own the detached ZIP enumerate pending"
         );
-        let active = app
-            .active_context_bundle_for_test()
-            .expect("detached ZIP open should create an active viewer context");
-        assert!(
-            active.zip_enumerate_pending.is_some(),
-            "ZIP enumerate pending must move into the active detached context"
-        );
         assert_eq!(app.items_generation, 0);
-        assert!(
-            active.items_generation & DETACHED_VIEWER_CONTEXT_GENERATION_BASE != 0,
-            "detached book context must use a generation range that main thumbnail polling cannot accept"
-        );
-        assert_eq!(
-            active.current_folder,
-            Some(PathBuf::from(r"C:\books\b.zip"))
-        );
-        assert!(active.items.is_empty());
-        assert!(active.fs_nav_after_pdf_enumerate.is_some());
+        app.with_active_viewer_context(|active| {
+            assert!(
+                active.zip_enumerate_pending.is_some(),
+                "ZIP enumerate pending must move into the active detached context"
+            );
+            assert!(
+                active.items_generation & DETACHED_VIEWER_CONTEXT_GENERATION_BASE != 0,
+                "detached book context must use a generation range that main thumbnail polling cannot accept"
+            );
+            assert_eq!(
+                active.current_folder,
+                Some(PathBuf::from(r"C:\books\b.zip"))
+            );
+            assert!(active.items.is_empty());
+            assert!(active.fs_nav_after_pdf_enumerate.is_some());
+        })
+        .expect("detached ZIP open should create an active viewer context");
 
         let zip_path = match &app.items[1] {
             GridItem::ZipFile(path) => path.clone(),
@@ -43732,7 +43790,7 @@ mod still_window_mode_key_tests {
         assert!(app.show_search_bar);
         assert_eq!(app.selected, Some(1));
         assert_eq!(app.scroll_offset_y, 173.0);
-        assert_detached_archive_pages(&app, &zip_path, &expected_pages);
+        assert_detached_archive_pages(&mut app, &zip_path, &expected_pages);
     }
 
     #[test]
@@ -43759,9 +43817,7 @@ mod still_window_mode_key_tests {
             .back_stack
             .clone();
 
-        app.install_active_context_for_test(
-            crate::app::viewer_context_registry::ViewerContextBundle::empty(),
-        );
+        app.build_active_context_for_test(None, DetachedSource::Book, |_| {});
 
         let _ = app.with_active_viewer_context(|mounted| {
             mounted.current_folder = Some(parent.clone());
@@ -43803,10 +43859,10 @@ mod still_window_mode_key_tests {
             saved_nav_back,
             "detached viewer navigation must not push entries into the main quick-folder back stack"
         );
-        let active = app
-            .active_context_bundle_for_test()
-            .expect("detached context should remain mounted as inactive bundle");
-        assert_eq!(active.current_folder, Some(pdf));
+        app.with_active_viewer_context(|active| {
+            assert_eq!(active.current_folder, Some(pdf));
+        })
+        .expect("detached context should remain mounted as inactive bundle");
     }
 
     #[test]
@@ -43828,10 +43884,8 @@ mod still_window_mode_key_tests {
 
         assert!(app.open_grid_container_in_detached_book_context(&ctx, 0));
         let first_window_id = app
-            .active_context_bundle_for_test()
-            .unwrap()
-            .viewer_session
-            .detached_window_id
+            .with_active_viewer_context(|active| active.detached_viewer_window_id)
+            .flatten()
             .expect("first detached book context should have a window id");
         let first_placement = app
             .detached_window_runtime_placement(first_window_id)
@@ -43840,10 +43894,8 @@ mod still_window_mode_key_tests {
         app.selected = Some(1);
         assert!(app.open_grid_container_in_detached_book_context(&ctx, 1));
         let second_window_id = app
-            .active_context_bundle_for_test()
-            .unwrap()
-            .viewer_session
-            .detached_window_id
+            .with_active_viewer_context(|active| active.detached_viewer_window_id)
+            .flatten()
             .expect("second detached book context should have a window id");
 
         assert_ne!(
@@ -43904,13 +43956,15 @@ mod still_window_mode_key_tests {
         assert!(matches!(app.items[0], GridItem::PdfFile(_)));
         assert_eq!(app.fullscreen_idx, None);
 
-        let active = app.active_context_bundle_for_test().unwrap();
-        assert_eq!(active.fullscreen_idx, Some(0));
-        assert_eq!(
-            active.viewer_session.presentation,
-            ViewerPresentation::DetachedWindow
-        );
-        assert!(active.viewer_session.independent_active);
+        app.with_active_viewer_context(|active| {
+            assert_eq!(active.fullscreen_idx, Some(0));
+            assert_eq!(
+                active.viewer_presentation,
+                ViewerPresentation::DetachedWindow
+            );
+            assert!(active.detached_viewer_independent_active);
+        })
+        .unwrap();
     }
 
     #[test]
@@ -43960,8 +44014,8 @@ mod still_window_mode_key_tests {
             }) if path == &PathBuf::from(r"C:\books\a.pdf")
         ));
         assert!(
-            app.active_context_bundle_for_test()
-                .is_some_and(|active| active.pdf_enumerate_pending.is_some()),
+            app.with_active_viewer_context(|active| active.pdf_enumerate_pending.is_some())
+                .unwrap_or(false),
             "the second PDF should become the new active detached context"
         );
     }
@@ -44023,23 +44077,25 @@ mod still_window_mode_key_tests {
         assert!(app.detached_image_windows.is_empty());
         assert_eq!(app.current_folder, Some(PathBuf::from(r"C:\books")));
         assert!(matches!(app.items[0], GridItem::PdfFile(_)));
-        let active = app.active_context_bundle_for_test().unwrap();
-        assert!(
-            active.pdf_enumerate_pending.is_some(),
-            "reactivation should re-enumerate in the active detached context"
-        );
-        let deferred = active.fs_nav_after_pdf_enumerate.as_ref().unwrap();
-        assert!(matches!(
-            deferred.target,
-            DeferredFsTarget::Required(crate::snapshot::SnapshotTarget::PdfPage {
-                ref pdf_path,
-                page_num: 5
-            }) if pdf_path == &PathBuf::from(r"C:\books\a.pdf")
-        ));
-        assert!(
-            active.items_generation & DETACHED_VIEWER_CONTEXT_GENERATION_BASE != 0,
-            "reactivated active context must stay in the detached generation range"
-        );
+        app.with_active_viewer_context(|active| {
+            assert!(
+                active.pdf_enumerate_pending.is_some(),
+                "reactivation should re-enumerate in the active detached context"
+            );
+            let deferred = active.fs_nav_after_pdf_enumerate.as_ref().unwrap();
+            assert!(matches!(
+                deferred.target,
+                DeferredFsTarget::Required(crate::snapshot::SnapshotTarget::PdfPage {
+                    ref pdf_path,
+                    page_num: 5
+                }) if pdf_path == &PathBuf::from(r"C:\books\a.pdf")
+            ));
+            assert!(
+                active.items_generation & DETACHED_VIEWER_CONTEXT_GENERATION_BASE != 0,
+                "reactivated active context must stay in the detached generation range"
+            );
+        })
+        .unwrap();
     }
 
     #[test]
@@ -44138,15 +44194,17 @@ mod still_window_mode_key_tests {
                 page_num: Some(7)
             }) if path == &PathBuf::from(r"C:\books\b.pdf")
         ));
-        let active = app.active_context_bundle_for_test().unwrap();
-        let deferred = active.fs_nav_after_pdf_enumerate.as_ref().unwrap();
-        assert!(matches!(
-            deferred.target,
-            DeferredFsTarget::Required(crate::snapshot::SnapshotTarget::PdfPage {
-                ref pdf_path,
-                page_num: 5
-            }) if pdf_path == &PathBuf::from(r"C:\books\a.pdf")
-        ));
+        app.with_active_viewer_context(|active| {
+            let deferred = active.fs_nav_after_pdf_enumerate.as_ref().unwrap();
+            assert!(matches!(
+                deferred.target,
+                DeferredFsTarget::Required(crate::snapshot::SnapshotTarget::PdfPage {
+                    ref pdf_path,
+                    page_num: 5
+                }) if pdf_path == &PathBuf::from(r"C:\books\a.pdf")
+            ));
+        })
+        .unwrap();
     }
 
     #[test]
@@ -44233,8 +44291,10 @@ mod still_window_mode_key_tests {
             app.detached_image_windows[0].id, 20,
             "the previously active window should be paused, not closed"
         );
-        let active = app.active_context_bundle_for_test().unwrap();
-        assert_eq!(active.viewer_session.detached_window_id, Some(10));
+        app.with_active_viewer_context(|active| {
+            assert_eq!(active.detached_viewer_window_id, Some(10));
+        })
+        .unwrap();
         assert!(app.fs_viewport_shown);
         assert_eq!(
             app.fs_viewport_presentation,
@@ -44252,19 +44312,22 @@ mod still_window_mode_key_tests {
         assert!(!app.fs_viewport_recreate_after_hide);
         assert!(!app.detached_viewer_recreate_on_next_render);
         assert!(app.detached_viewer_focus_requested);
-        assert_eq!(
-            active.current_folder,
-            Some(PathBuf::from(r"C:\books\a.pdf"))
-        );
-        assert_eq!(active.fullscreen_idx, Some(0));
-        assert_eq!(active.fs_zoom, 2.25);
-        assert_eq!(active.fs_pan, egui::vec2(30.0, -12.0));
-        assert!(
-            active.pdf_enumerate_pending.is_none()
-                && active.zip_enumerate_pending.is_none()
-                && active.fs_nav_after_pdf_enumerate.is_none(),
-            "reactivating a paused bundle must not restart PDF/ZIP enumeration"
-        );
+        app.with_active_viewer_context(|active| {
+            assert_eq!(
+                active.current_folder,
+                Some(PathBuf::from(r"C:\books\a.pdf"))
+            );
+            assert_eq!(active.fullscreen_idx, Some(0));
+            assert_eq!(active.fs_zoom, 2.25);
+            assert_eq!(active.fs_pan, egui::vec2(30.0, -12.0));
+            assert!(
+                active.pdf_enumerate_pending.is_none()
+                    && active.zip_enumerate_pending.is_none()
+                    && active.fs_nav_after_pdf_enumerate.is_none(),
+                "reactivating a paused bundle must not restart PDF/ZIP enumeration"
+            );
+        })
+        .unwrap();
     }
 
     #[test]
@@ -44284,24 +44347,6 @@ mod still_window_mode_key_tests {
         }];
         app.thumbnails = vec![ThumbnailState::Pending];
         app.image_metas = vec![None];
-
-        let mut parked_context = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        parked_context.items = vec![GridItem::PdfPage {
-            pdf_path: PathBuf::from(r"C:\books\pinned.pdf"),
-            page_num: 1,
-            content_type: None,
-        }];
-        parked_context.thumbnails = vec![ThumbnailState::Pending];
-        parked_context.image_metas = vec![None];
-        parked_context.visible_indices = vec![0];
-        parked_context.selected = Some(0);
-        parked_context.fullscreen_idx = Some(0);
-        parked_context.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        parked_context.native_video_in_window_active = false;
-        parked_context.viewer_session.detached_window_id = Some(1);
-        parked_context.viewer_session.independent_active = true;
-        parked_context.current_folder = Some(PathBuf::from(r"C:\books\pinned.pdf"));
-        parked_context.address = r"C:\books\pinned.pdf".to_string();
 
         let texture = ctx.load_texture(
             "independent_pdf_passive",
@@ -44333,14 +44378,30 @@ mod still_window_mode_key_tests {
                 focused_last_frame: false,
                 initial_placement_applied: false,
             });
-        app.install_window_context_for_test(parked_context, 1);
+        app.build_window_context_for_test(1, |parked_context| {
+            parked_context.items = vec![GridItem::PdfPage {
+                pdf_path: PathBuf::from(r"C:\books\pinned.pdf"),
+                page_num: 1,
+                content_type: None,
+            }];
+            parked_context.thumbnails = vec![ThumbnailState::Pending];
+            parked_context.image_metas = vec![None];
+            parked_context.visible_indices = vec![0];
+            parked_context.selected = Some(0);
+            parked_context.fullscreen_idx = Some(0);
+            parked_context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            parked_context.native_video_in_window_active = false;
+            parked_context.detached_viewer_window_id = Some(1);
+            parked_context.detached_viewer_independent_active = true;
+            parked_context.current_folder = Some(PathBuf::from(r"C:\books\pinned.pdf"));
+            parked_context.address = r"C:\books\pinned.pdf".to_string();
+        });
 
         assert!(app.activate_detached_image_window_snapshot(&ctx, 1));
         assert!(app.native_video_in_window_active);
         assert!(
-            !app.active_context_bundle_for_test()
+            !app.with_active_viewer_context(|active| active.native_video_in_window_active)
                 .unwrap()
-                .native_video_in_window_active
         );
 
         app.with_active_viewer_context(|mounted| {
@@ -44450,22 +44511,20 @@ mod still_window_mode_key_tests {
         app.native_video_in_window_active = true;
 
         let window_id = 91;
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = vec![GridItem::PdfPage {
-            pdf_path: PathBuf::from(r"C:\books\pinned.pdf"),
-            page_num: 1,
-            content_type: None,
-        }];
-        bundle.thumbnails = vec![ThumbnailState::Pending];
-        bundle.image_metas = vec![None];
-        bundle.visible_indices = vec![0];
-        bundle.selected = Some(0);
-        bundle.fullscreen_idx = Some(0);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.detached_window_id = Some(window_id);
-        bundle.viewer_session.independent_active = true;
-        app.install_active_context_for_test(bundle);
-        app.begin_active_detached_session(window_id, DetachedSource::Book);
+        app.build_active_context_for_test(Some(window_id), DetachedSource::Book, |bundle| {
+            bundle.items = vec![GridItem::PdfPage {
+                pdf_path: PathBuf::from(r"C:\books\pinned.pdf"),
+                page_num: 1,
+                content_type: None,
+            }];
+            bundle.thumbnails = vec![ThumbnailState::Pending];
+            bundle.image_metas = vec![None];
+            bundle.visible_indices = vec![0];
+            bundle.selected = Some(0);
+            bundle.fullscreen_idx = Some(0);
+            bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+            bundle.detached_viewer_independent_active = true;
+        });
 
         app.open_fullscreen(second_main, crate::app::HistoryTrigger::UserChosen);
 
@@ -45034,8 +45093,10 @@ mod still_window_mode_key_tests {
             "pausing a detached context must cancel final AI workers instead of orphaning them"
         );
         let paused_id = app.detached_image_windows[0].id;
-        let paused = app.window_context_bundle_for_test(paused_id).unwrap();
-        assert!(paused.final_ai_pending.is_empty());
+        app.with_window_viewer_context(paused_id, |paused| {
+            assert!(paused.final_ai_pending.is_empty());
+        })
+        .unwrap();
     }
 
     #[test]
@@ -45062,10 +45123,11 @@ mod still_window_mode_key_tests {
         assert_eq!(app.detached_image_windows.len(), 1);
         let snapshot = &app.detached_image_windows[0];
         assert_eq!(snapshot.id, 10);
-        let paused = app
-            .window_context_bundle_for_test(snapshot.id)
-            .expect("pause should keep the viewer bundle");
-        assert!(paused.viewer_session.independent_active);
+        let snapshot_id = snapshot.id;
+        app.with_window_viewer_context(snapshot_id, |paused| {
+            assert!(paused.detached_viewer_independent_active);
+        })
+        .expect("pause should keep the viewer bundle");
         assert!(
             app.active_detached_session.is_none(),
             "active->passive handoff must end the active keep-alive session so cleanup does not hide the passive viewport"
@@ -45126,20 +45188,20 @@ mod still_window_mode_key_tests {
         assert!(!app.fs_loupe_locked);
         assert!(matches!(app.compare_view_mode, CompareViewMode::Off));
         let paused_id = app.detached_image_windows[0].id;
-        let paused = app
-            .window_context_bundle_for_test(paused_id)
-            .expect("pause should keep the viewer bundle");
-        assert!(
-            paused.panorama_state.is_none(),
-            "paused detached windows should freeze normal image display, not keep panorama mode active"
-        );
-        assert!(!paused.pano_toast_shown_for_current_fs);
-        assert!(!paused.analysis_mode);
-        assert_eq!(
-            paused.fs_zoom, 2.5,
-            "leaving analysis mode should preserve the analysis zoom as the normal display zoom"
-        );
-        assert_eq!(paused.fs_pan, egui::vec2(12.0, -8.0));
+        app.with_window_viewer_context(paused_id, |paused| {
+            assert!(
+                paused.panorama_state.is_none(),
+                "paused detached windows should freeze normal image display, not keep panorama mode active"
+            );
+            assert!(!paused.pano_toast_shown_for_current_fs);
+            assert!(!paused.analysis_mode);
+            assert_eq!(
+                paused.fs_zoom, 2.5,
+                "leaving analysis mode should preserve the analysis zoom as the normal display zoom"
+            );
+            assert_eq!(paused.fs_pan, egui::vec2(12.0, -8.0));
+        })
+        .expect("pause should keep the viewer bundle");
     }
 
     #[test]
@@ -45187,20 +45249,20 @@ mod still_window_mode_key_tests {
             color_ai_hash: 0,
             bg: 0,
         };
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        bundle.final_ai_pending.insert(
-            key,
-            FinalAiPending {
-                job_id: 99,
-                cancel,
-                retained_key: None,
-                retained_epoch: 0,
-                allow_retained_orphan: false,
-                cancel_on_drop: true,
-            },
-        );
-        app.install_active_context_for_test(bundle);
+        app.build_active_context_for_test(None, DetachedSource::Image, move |bundle| {
+            bundle.final_ai_pending.insert(
+                key,
+                FinalAiPending {
+                    job_id: 99,
+                    cancel,
+                    retained_key: None,
+                    retained_epoch: 0,
+                    allow_retained_orphan: false,
+                    cancel_on_drop: true,
+                },
+            );
+        });
         tx.send(FinalAiResult::Ready {
             job_id: 99,
             key,
@@ -45228,9 +45290,7 @@ mod still_window_mode_key_tests {
     #[test]
     fn active_detached_book_context_counts_as_detached_lifecycle() {
         let mut app = setup_app();
-        app.install_active_context_for_test(
-            crate::app::viewer_context_registry::ViewerContextBundle::empty(),
-        );
+        app.build_active_context_for_test(None, DetachedSource::Book, |_| {});
 
         assert!(app.viewer_session_is_detached_or_switching());
         assert!(!app.viewer_session_blocks_main_window());
@@ -45242,10 +45302,10 @@ mod still_window_mode_key_tests {
         app.panorama_state = Some(crate::panorama::PanoramaState::new(1.0, 0.0));
         app.pano_toast_shown_for_current_fs = true;
 
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.panorama_state = None;
-        bundle.pano_toast_shown_for_current_fs = false;
-        app.install_active_context_for_test(bundle);
+        app.build_active_context_for_test(None, DetachedSource::Image, |bundle| {
+            bundle.panorama_state = None;
+            bundle.pano_toast_shown_for_current_fs = false;
+        });
 
         let _ = app.with_active_viewer_context(|mounted| {
             assert!(
@@ -45260,12 +45320,14 @@ mod still_window_mode_key_tests {
             mounted.pano_toast_shown_for_current_fs = true;
         });
 
-        let active = app.active_context_bundle_for_test().unwrap();
-        assert!(
-            active.panorama_state.is_some(),
-            "panorama mode enabled in the detached window must be stored with that window"
-        );
-        assert!(active.pano_toast_shown_for_current_fs);
+        app.with_active_viewer_context(|active| {
+            assert!(
+                active.panorama_state.is_some(),
+                "panorama mode enabled in the detached window must be stored with that window"
+            );
+            assert!(active.pano_toast_shown_for_current_fs);
+        })
+        .unwrap();
     }
 
     #[test]
@@ -45276,12 +45338,12 @@ mod still_window_mode_key_tests {
         app.analysis_filter_mag = 5;
         app.analysis_pinned_color = Some([1, 2, 3, 255]);
 
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.analysis_mode = false;
-        bundle.analysis_grayscale = false;
-        bundle.analysis_filter_mag = 0;
-        bundle.analysis_pinned_color = None;
-        app.install_active_context_for_test(bundle);
+        app.build_active_context_for_test(None, DetachedSource::Image, |bundle| {
+            bundle.analysis_mode = false;
+            bundle.analysis_grayscale = false;
+            bundle.analysis_filter_mag = 0;
+            bundle.analysis_pinned_color = None;
+        });
 
         let _ = app.with_active_viewer_context(|mounted| {
             assert!(
@@ -45298,11 +45360,13 @@ mod still_window_mode_key_tests {
             mounted.analysis_pinned_color = Some([9, 8, 7, 255]);
         });
 
-        let active = app.active_context_bundle_for_test().unwrap();
-        assert!(active.analysis_mode);
-        assert!(active.analysis_grayscale);
-        assert_eq!(active.analysis_filter_mag, 10);
-        assert_eq!(active.analysis_pinned_color, Some([9, 8, 7, 255]));
+        app.with_active_viewer_context(|active| {
+            assert!(active.analysis_mode);
+            assert!(active.analysis_grayscale);
+            assert_eq!(active.analysis_filter_mag, 10);
+            assert_eq!(active.analysis_pinned_color, Some([9, 8, 7, 255]));
+        })
+        .unwrap();
         assert!(app.analysis_mode);
         assert_eq!(app.analysis_filter_mag, 5);
     }
@@ -46662,7 +46726,8 @@ mod still_window_mode_key_tests {
         assert_eq!(app.detached_image_windows.len(), 1);
         let parked = &app.detached_image_windows[0];
         assert_eq!(parked.id, window_id);
-        assert!(app.window_context_bundle_for_test(parked.id).is_some());
+        let parked_id = parked.id;
+        assert!(app.locate_window_context(parked_id).is_some());
         assert_eq!(
             app.detached_window_state(window_id),
             Some(DetachedWindowState::ParkedLive)
@@ -46676,17 +46741,17 @@ mod still_window_mode_key_tests {
             std::sync::Arc::ptr_eq(&app.cancel_token, &main_cancel),
             "park 後の main は元の cancel token を保持する"
         );
-        let parked_bundle = app
-            .window_context_bundle_for_test(parked.id)
-            .expect("bundle");
-        assert!(
-            parked_bundle.reload_queue.is_none() && parked_bundle.heavy_io_queue.is_none(),
-            "parked メディア窓は空のロード複合体を持つ"
-        );
-        assert!(
-            !std::sync::Arc::ptr_eq(&parked_bundle.cancel_token, &main_cancel),
-            "parked 側の cancel token は main と独立 (Drop が main のプールを巻き込まない)"
-        );
+        app.with_window_viewer_context(parked_id, |parked_bundle| {
+            assert!(
+                parked_bundle.reload_queue.is_none() && parked_bundle.heavy_io_queue.is_none(),
+                "parked メディア窓は空のロード複合体を持つ"
+            );
+            assert!(
+                !std::sync::Arc::ptr_eq(&parked_bundle.cancel_token, &main_cancel),
+                "parked 側の cancel token は main と独立 (Drop が main のプールを巻き込まない)"
+            );
+        })
+        .expect("bundle");
         assert!(
             !main_cancel.load(std::sync::atomic::Ordering::Relaxed),
             "park の過程で main のロードが cancel されない"
@@ -46699,11 +46764,7 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let audio = push_audio(&mut app, r"C:\music\parked.flac");
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(audio);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.detached_window_id = Some(62);
+        let items = app.items.clone();
 
         let texture = ctx.load_texture(
             "parked_live_audio",
@@ -46733,7 +46794,12 @@ mod still_window_mode_key_tests {
                 focused_last_frame: false,
                 initial_placement_applied: true,
             });
-        app.install_window_context_for_test(bundle, 62);
+        app.build_window_context_for_test(62, move |context| {
+            context.items = items;
+            context.fullscreen_idx = Some(audio);
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_window_id = Some(62);
+        });
         app.transition_detached_window_state(62, DetachedWindowState::ParkedLive, "test_setup");
 
         let info = app
@@ -46774,24 +46840,25 @@ mod still_window_mode_key_tests {
             .iter()
             .find(|window| window.id == window_id)
             .expect("parked media snapshot must remain");
-        let bundle = app
-            .window_context_bundle_for_test(parked.id)
-            .expect("parked media snapshot owns its context bundle");
-        assert_eq!(
-            bundle.video_audio_mode,
-            Some(video),
-            "video_audio_mode must move with the parked media bundle"
-        );
+        let parked_id = parked.id;
+        app.with_window_viewer_context(parked_id, |bundle| {
+            assert_eq!(
+                bundle.video_audio_mode,
+                Some(video),
+                "video_audio_mode must move with the parked media bundle"
+            );
+        })
+        .expect("parked media snapshot owns its context bundle");
 
         assert!(app.activate_detached_image_window_snapshot(&ctx, window_id));
-        let active = app
-            .active_context_bundle_for_test()
-            .expect("reactivated ParkedLive media owns an active context");
-        assert_eq!(
-            active.video_audio_mode,
-            Some(video),
-            "reactivation must keep video audio mode for the active detached context"
-        );
+        app.with_active_viewer_context(|active| {
+            assert_eq!(
+                active.video_audio_mode,
+                Some(video),
+                "reactivation must keep video audio mode for the active detached context"
+            );
+        })
+        .expect("reactivated ParkedLive media owns an active context");
     }
 
     #[test]
@@ -46839,12 +46906,7 @@ mod still_window_mode_key_tests {
         app.update_detached_window_runtime_flags(102, false, "test_setup");
 
         let live_audio = push_audio(&mut app, r"C:\music\live.flac");
-        let mut live_bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        live_bundle.items = app.items.clone();
-        live_bundle.fullscreen_idx = Some(live_audio);
-        live_bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        live_bundle.viewer_session.detached_window_id = Some(103);
-        live_bundle.viewer_session.independent_active = true;
+        let live_items = app.items.clone();
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 103,
@@ -46868,7 +46930,13 @@ mod still_window_mode_key_tests {
                 focused_last_frame: false,
                 initial_placement_applied: true,
             });
-        app.install_window_context_for_test(live_bundle, 103);
+        app.build_window_context_for_test(103, move |live| {
+            live.items = live_items;
+            live.fullscreen_idx = Some(live_audio);
+            live.viewer_presentation = ViewerPresentation::DetachedWindow;
+            live.detached_viewer_window_id = Some(103);
+            live.detached_viewer_independent_active = true;
+        });
         app.transition_detached_window_state(103, DetachedWindowState::ParkedLive, "test_setup");
         app.update_detached_window_runtime_flags(103, false, "test_setup");
 
@@ -46969,16 +47037,17 @@ mod still_window_mode_key_tests {
         assert_eq!(app.detached_image_windows.len(), 1);
         let parked = &app.detached_image_windows[0];
         assert_eq!(parked.id, window_id);
-        let bundle = app
-            .window_context_bundle_for_test(parked.id)
-            .expect("ParkedLive snapshot keeps its independent video bundle");
-        assert_eq!(bundle.fullscreen_idx, Some(video));
-        assert_eq!(bundle.current_folder, Some(PathBuf::from(r"C:\clips")));
-        assert_eq!(bundle.items.len(), 2);
-        assert!(
-            bundle.viewer_session.independent_active,
-            "legacy linked live-park must promote the video window to its own bundle"
-        );
+        let parked_id = parked.id;
+        app.with_window_viewer_context(parked_id, |bundle| {
+            assert_eq!(bundle.fullscreen_idx, Some(video));
+            assert_eq!(bundle.current_folder, Some(PathBuf::from(r"C:\clips")));
+            assert_eq!(bundle.items.len(), 2);
+            assert!(
+                bundle.detached_viewer_independent_active,
+                "legacy linked live-park must promote the video window to its own bundle"
+            );
+        })
+        .expect("ParkedLive snapshot keeps its independent video bundle");
 
         app.transition_detached_window_state(window_id, DetachedWindowState::Closing, "test_close");
         app.detached_image_windows.clear();
@@ -47073,13 +47142,7 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let video = push_video(&mut app, r"C:\clips\live.mp4");
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.address = "parked-live://sentinel".to_owned();
-        bundle.fullscreen_idx = Some(video);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.independent_active = true;
-        bundle.viewer_session.detached_window_id = Some(61);
+        let items = app.items.clone();
         let tex = ctx.load_texture(
             "parked_live_resume",
             egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
@@ -47108,7 +47171,14 @@ mod still_window_mode_key_tests {
                 focused_last_frame: false,
                 initial_placement_applied: true,
             });
-        app.install_window_context_for_test(bundle, 61);
+        app.build_window_context_for_test(61, move |context| {
+            context.items = items;
+            context.address = "parked-live://sentinel".to_owned();
+            context.fullscreen_idx = Some(video);
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_independent_active = true;
+            context.detached_viewer_window_id = Some(61);
+        });
         app.transition_detached_window_state(61, DetachedWindowState::ParkedLive, "test_setup");
 
         assert!(app.activate_detached_image_window_snapshot(&ctx, 61));
@@ -47129,12 +47199,12 @@ mod still_window_mode_key_tests {
                 .any(|window| window.id == 61),
             "ParkedLive restore must atomically remove the passive snapshot"
         );
-        let active = app
-            .active_context_bundle_for_test()
-            .expect("parked live bundle should become the active context");
-        assert_eq!(active.address, "parked-live://sentinel");
-        assert_eq!(active.viewer_session.detached_window_id, Some(61));
-        assert_eq!(active.fullscreen_idx, Some(video));
+        app.with_active_viewer_context(|active| {
+            assert_eq!(active.address, "parked-live://sentinel");
+            assert_eq!(active.detached_viewer_window_id, Some(61));
+            assert_eq!(active.fullscreen_idx, Some(video));
+        })
+        .expect("parked live bundle should become the active context");
         let wheel = Ev::Window(WinEv::MouseWheel(NativeVideoMouseWheelEvent {
             delta: -120,
             x: 10,
@@ -47356,12 +47426,7 @@ mod still_window_mode_key_tests {
         app.begin_mounted_detached_session_for_test(71, DetachedSource::Image);
         app.update_detached_window_runtime_flags(71, true, "test_linked_active");
 
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(video);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.detached_window_id = Some(72);
-        bundle.viewer_session.independent_active = true;
+        let items = app.items.clone();
         let texture = ctx.load_texture(
             "parked_live_closes_linked",
             egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
@@ -47390,7 +47455,13 @@ mod still_window_mode_key_tests {
                 focused_last_frame: false,
                 initial_placement_applied: true,
             });
-        app.install_window_context_for_test(bundle, 72);
+        app.build_window_context_for_test(72, move |context| {
+            context.items = items;
+            context.fullscreen_idx = Some(video);
+            context.viewer_presentation = ViewerPresentation::DetachedWindow;
+            context.detached_viewer_window_id = Some(72);
+            context.detached_viewer_independent_active = true;
+        });
         app.transition_detached_window_state(72, DetachedWindowState::ParkedLive, "test_setup");
         app.update_detached_window_runtime_flags(72, false, "test_setup");
 
@@ -48250,12 +48321,13 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let video = push_video(&mut app, r"C:\clips\same.mp4");
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(video);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.detached_window_id = Some(72);
-        app.push_window_context_for_test(&ctx, 72, bundle);
+        let items = app.items.clone();
+        app.push_window_context_for_test(&ctx, 72, move |bundle| {
+            bundle.items = items;
+            bundle.fullscreen_idx = Some(video);
+            bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+            bundle.detached_viewer_window_id = Some(72);
+        });
         app.transition_detached_window_state(72, DetachedWindowState::ParkedLive, "test_setup");
 
         app.native_video_source_swap_pending =
@@ -48264,13 +48336,13 @@ mod still_window_mode_key_tests {
 
         assert!(app.detached_image_windows.is_empty());
         assert!(app.detached_image_window_close_pending.is_empty());
-        let active = app
-            .active_context_bundle_for_test()
-            .expect("same media should be activated");
-        assert!(viewer_context_bundle_displays_media_path(
-            ContextRef::at_rest(&active),
-            std::path::Path::new(r"C:\clips\same.mp4")
-        ));
+        app.with_active_viewer_context(|active| {
+            assert!(viewer_context_bundle_displays_media_path(
+                ContextRef::mounted(active),
+                std::path::Path::new(r"C:\clips\same.mp4")
+            ));
+        })
+        .expect("same media should be activated");
         let owner = app
             .native_video_source_swap_pending
             .as_ref()
@@ -48379,12 +48451,13 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let video = push_video(&mut app, r"C:\clips\double-click-same.mp4");
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(video);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.detached_window_id = Some(74);
-        app.push_window_context_for_test(&ctx, 74, bundle);
+        let items = app.items.clone();
+        app.push_window_context_for_test(&ctx, 74, move |bundle| {
+            bundle.items = items;
+            bundle.fullscreen_idx = Some(video);
+            bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+            bundle.detached_viewer_window_id = Some(74);
+        });
         app.transition_detached_window_state(74, DetachedWindowState::ParkedLive, "test_setup");
         let input_seq_before = app.input_seq;
 
@@ -48405,12 +48478,12 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let video = push_video(&mut app, r"C:\clips\deferred-same.mp4");
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(video);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.detached_window_id = Some(73);
-        app.install_active_context_for_test(bundle);
+        let items = app.items.clone();
+        app.build_active_context_for_test(Some(73), DetachedSource::Video, move |bundle| {
+            bundle.items = items;
+            bundle.fullscreen_idx = Some(video);
+            bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        });
         app.native_video_front_recover_after_external_foreground = false;
         app.native_video_front_last_raise = Some(std::time::Instant::now());
 
@@ -48428,11 +48501,7 @@ mod still_window_mode_key_tests {
         let ctx = egui::Context::default();
         let old_video = push_video(&mut app, r"C:\clips\old.mp4");
         let new_video = push_video(&mut app, r"C:\clips\new.mp4");
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(old_video);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.detached_window_id = Some(71);
+        let items = app.items.clone();
         let tex = ctx.load_texture(
             "parked_live_close",
             egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
@@ -48461,7 +48530,12 @@ mod still_window_mode_key_tests {
                 focused_last_frame: false,
                 initial_placement_applied: true,
             });
-        app.install_window_context_for_test(bundle, 71);
+        app.build_window_context_for_test(71, move |bundle| {
+            bundle.items = items;
+            bundle.fullscreen_idx = Some(old_video);
+            bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+            bundle.detached_viewer_window_id = Some(71);
+        });
         app.transition_detached_window_state(71, DetachedWindowState::ParkedLive, "test_setup");
 
         assert!(
@@ -48482,11 +48556,7 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let video = push_video(&mut app, r"C:\clips\live.mp4");
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(video);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.detached_window_id = Some(81);
+        let items = app.items.clone();
         app.video_continuous_mode = crate::video::VideoContinuousMode::ContinuousLoop;
         let tex = ctx.load_texture(
             "parked_live_continuous",
@@ -48516,7 +48586,12 @@ mod still_window_mode_key_tests {
                 focused_last_frame: false,
                 initial_placement_applied: true,
             });
-        app.install_window_context_for_test(bundle, 81);
+        app.build_window_context_for_test(81, move |bundle| {
+            bundle.items = items;
+            bundle.fullscreen_idx = Some(video);
+            bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+            bundle.detached_viewer_window_id = Some(81);
+        });
         app.transition_detached_window_state(81, DetachedWindowState::ParkedLive, "test_setup");
 
         app.poll_parked_live_detached_windows(&ctx);
@@ -48670,10 +48745,11 @@ mod still_window_mode_key_tests {
         push_image(&mut app, r"C:\pics\a.jpg");
         let from = push_video(&mut app, r"C:\clips\b.mp4");
         let target = push_video(&mut app, r"C:\clips\c.mp4");
-        let mut parked = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        parked.items = app.items.clone();
-        parked.fullscreen_idx = Some(from);
-        let open_owner = app.push_window_context_for_test(&ctx, 7, parked);
+        let items = app.items.clone();
+        let open_owner = app.push_window_context_for_test(&ctx, 7, move |parked| {
+            parked.items = items;
+            parked.fullscreen_idx = Some(from);
+        });
         app.transition_detached_window_state(7, DetachedWindowState::ParkedLive, "test_setup");
         install_all_native_pending_for_test(&mut app, from, target, Some(7), open_owner);
 
@@ -48710,10 +48786,12 @@ mod still_window_mode_key_tests {
             target,
             PathBuf::from(r"C:\clips\c.mp4"),
         ));
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(from);
-        let open_owner = app.install_active_context_for_test(bundle);
+        let items = app.items.clone();
+        let open_owner =
+            app.build_active_context_for_test(None, DetachedSource::Video, move |bundle| {
+                bundle.items = items;
+                bundle.fullscreen_idx = Some(from);
+            });
         install_all_native_pending_for_test(&mut app, from, target, None, open_owner);
 
         app.remove_items_batch(&[0]);
@@ -48748,10 +48826,11 @@ mod still_window_mode_key_tests {
         let ctx = egui::Context::default();
         push_image(&mut app, r"C:\pics\a.jpg");
         let target = push_video(&mut app, r"C:\clips\parked.mp4");
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(target);
-        app.push_window_context_for_test(&ctx, 107, bundle);
+        let items = app.items.clone();
+        app.push_window_context_for_test(&ctx, 107, move |bundle| {
+            bundle.items = items;
+            bundle.fullscreen_idx = Some(target);
+        });
         app.transition_detached_window_state(107, DetachedWindowState::ParkedLive, "test_setup");
         app.video_continuous_last_eof = Some((target, 29));
         app.normalize_state = Some(normalize_scan_state_for_test(
@@ -48875,12 +48954,13 @@ mod still_window_mode_key_tests {
         let mounted = push_image(&mut app, r"C:\pics\mounted.jpg");
         app.fullscreen_idx = Some(mounted);
         let path = PathBuf::from(r"C:\clips\pending.mp4");
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items.push(GridItem::Video(path.clone()));
-        bundle.fullscreen_idx = Some(0);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.detached_window_id = Some(108);
-        let parked_context = app.push_window_context_for_test(&ctx, 108, bundle);
+        let path_for_context = path.clone();
+        let parked_context = app.push_window_context_for_test(&ctx, 108, move |bundle| {
+            bundle.items.push(GridItem::Video(path_for_context));
+            bundle.fullscreen_idx = Some(0);
+            bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+            bundle.detached_viewer_window_id = Some(108);
+        });
         app.transition_detached_window_state(108, DetachedWindowState::ParkedLive, "test_setup");
         let now = std::time::Instant::now();
         app.native_video_open_pending = Some(native_video::NativeVideoOpenPending {
@@ -48960,10 +49040,11 @@ mod still_window_mode_key_tests {
     fn main_close_preserves_promoted_active_source_swap_pending() {
         let mut app = setup_app();
         let video = push_video(&mut app, r"C:\clips\active-pending.mp4");
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(video);
-        app.install_active_context_for_test(bundle);
+        let items = app.items.clone();
+        app.build_active_context_for_test(None, DetachedSource::Video, move |bundle| {
+            bundle.items = items;
+            bundle.fullscreen_idx = Some(video);
+        });
         app.native_video_source_swap_pending =
             Some(source_swap_pending_for_test(&app, video, None));
 
@@ -48991,10 +49072,11 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let video = push_video(&mut app, r"C:\clips\closing-pending.mp4");
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(video);
-        app.push_window_context_for_test(&ctx, 7, bundle);
+        let items = app.items.clone();
+        app.push_window_context_for_test(&ctx, 7, move |bundle| {
+            bundle.items = items;
+            bundle.fullscreen_idx = Some(video);
+        });
         app.native_video_source_swap_pending =
             Some(source_swap_pending_for_test(&app, video, Some(7)));
 
@@ -49032,10 +49114,11 @@ mod still_window_mode_key_tests {
         let ctx = egui::Context::default();
         let parked_video = push_video(&mut app, r"C:\clips\parked.mp4");
         let mounted_video = push_video(&mut app, r"C:\clips\mounted.mp4");
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(parked_video);
-        app.push_window_context_for_test(&ctx, 8, bundle);
+        let items = app.items.clone();
+        app.push_window_context_for_test(&ctx, 8, move |bundle| {
+            bundle.items = items;
+            bundle.fullscreen_idx = Some(parked_video);
+        });
         app.transition_detached_window_state(8, DetachedWindowState::ParkedLive, "test_setup");
         app.fullscreen_idx = Some(mounted_video);
         app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
@@ -49069,23 +49152,23 @@ mod still_window_mode_key_tests {
         let first_path = PathBuf::from(r"C:\clips\teardown-first.mp4");
         let second_path = PathBuf::from(r"C:\clips\teardown-second.mp4");
 
-        let make_bundle = |path: PathBuf, displayed_pts: f64| {
-            let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-            bundle.items.push(GridItem::Video(path.clone()));
-            bundle.fullscreen_idx = Some(0);
-            let player = crate::video::VideoPlayer::disconnected_for_test(path, 120.0);
-            player.set_last_displayed_pts_for_test(displayed_pts);
-            bundle.fs_cache.insert(
-                0,
-                FsCacheEntry::Video {
-                    player: Box::new(player),
-                    load_seq: 0,
-                },
-            );
-            bundle
+        let make_context = |path: PathBuf, displayed_pts: f64| {
+            move |bundle: &mut App| {
+                bundle.items.push(GridItem::Video(path.clone()));
+                bundle.fullscreen_idx = Some(0);
+                let player = crate::video::VideoPlayer::disconnected_for_test(path, 120.0);
+                player.set_last_displayed_pts_for_test(displayed_pts);
+                bundle.fs_cache.insert(
+                    0,
+                    FsCacheEntry::Video {
+                        player: Box::new(player),
+                        load_seq: 0,
+                    },
+                );
+            }
         };
-        app.push_window_context_for_test(&ctx, 611, make_bundle(first_path.clone(), 21.0));
-        app.push_window_context_for_test(&ctx, 612, make_bundle(second_path.clone(), 42.0));
+        app.push_window_context_for_test(&ctx, 611, make_context(first_path.clone(), 21.0));
+        app.push_window_context_for_test(&ctx, 612, make_context(second_path.clone(), 42.0));
 
         app.teardown_paused_media_bundles_for_window_ids(&[611, 612], "test_two_bundle_teardown");
 
@@ -49113,18 +49196,18 @@ mod still_window_mode_key_tests {
     fn media_teardown_preserves_mode_switch_when_surviving_parked_window_has_video() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
-        let mut closing = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        closing
-            .items
-            .push(GridItem::Video(PathBuf::from(r"C:\clips\closing.mp4")));
-        closing.fullscreen_idx = Some(0);
-        let mut surviving = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        surviving
-            .items
-            .push(GridItem::Video(PathBuf::from(r"C:\clips\surviving.mp4")));
-        surviving.fullscreen_idx = Some(0);
-        app.push_window_context_for_test(&ctx, 621, closing);
-        app.push_window_context_for_test(&ctx, 622, surviving);
+        app.push_window_context_for_test(&ctx, 621, |closing| {
+            closing
+                .items
+                .push(GridItem::Video(PathBuf::from(r"C:\clips\closing.mp4")));
+            closing.fullscreen_idx = Some(0);
+        });
+        app.push_window_context_for_test(&ctx, 622, |surviving| {
+            surviving
+                .items
+                .push(GridItem::Video(PathBuf::from(r"C:\clips\surviving.mp4")));
+            surviving.fullscreen_idx = Some(0);
+        });
         app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
             request_id: 621,
             target_presentation: ViewerPresentation::DetachedWindow,
@@ -49160,19 +49243,20 @@ mod still_window_mode_key_tests {
         let empty_window = contextless_test_window(&ctx, 631);
         app.detached_image_windows.push(empty_window);
 
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items.push(GridItem::Video(path.clone()));
-        bundle.fullscreen_idx = Some(0);
         let player = crate::video::VideoPlayer::disconnected_for_test(path.clone(), 120.0);
         player.set_last_displayed_pts_for_test(33.0);
-        bundle.fs_cache.insert(
-            0,
-            FsCacheEntry::Video {
-                player: Box::new(player),
-                load_seq: 0,
-            },
-        );
-        app.push_window_context_for_test(&ctx, 632, bundle);
+        let path_for_context = path.clone();
+        app.push_window_context_for_test(&ctx, 632, move |bundle| {
+            bundle.items.push(GridItem::Video(path_for_context));
+            bundle.fullscreen_idx = Some(0);
+            bundle.fs_cache.insert(
+                0,
+                FsCacheEntry::Video {
+                    player: Box::new(player),
+                    load_seq: 0,
+                },
+            );
+        });
 
         app.teardown_paused_media_bundles_for_window_ids(&[631, 632], "test_bundleless_window");
 
@@ -49196,10 +49280,11 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let video = push_video(&mut app, r"C:\clips\parked-tile.mp4");
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(video);
-        app.push_window_context_for_test(&ctx, 9, bundle);
+        let items = app.items.clone();
+        app.push_window_context_for_test(&ctx, 9, move |bundle| {
+            bundle.items = items;
+            bundle.fullscreen_idx = Some(video);
+        });
         app.transition_detached_window_state(9, DetachedWindowState::ParkedLive, "test_setup");
         app.video_tile_mode_active = true;
         app.video_tile_reopen_pending = true;
@@ -49573,11 +49658,7 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let video = push_video(&mut app, r"C:\clips\live.mp4");
-        let mut bundle = crate::app::viewer_context_registry::ViewerContextBundle::empty();
-        bundle.items = app.items.clone();
-        bundle.fullscreen_idx = Some(video);
-        bundle.viewer_session.presentation = ViewerPresentation::DetachedWindow;
-        bundle.viewer_session.detached_window_id = Some(82);
+        let items = app.items.clone();
         let tex = ctx.load_texture(
             "parked_live_delayed_activation",
             egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
@@ -49606,7 +49687,12 @@ mod still_window_mode_key_tests {
                 focused_last_frame: false,
                 initial_placement_applied: true,
             });
-        app.install_window_context_for_test(bundle, 82);
+        app.build_window_context_for_test(82, move |bundle| {
+            bundle.items = items;
+            bundle.fullscreen_idx = Some(video);
+            bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+            bundle.detached_viewer_window_id = Some(82);
+        });
         app.transition_detached_window_state(82, DetachedWindowState::ParkedLive, "test_setup");
         app.native_video_parked_live_activation_requests.push(82);
 
@@ -49781,9 +49867,11 @@ mod still_window_mode_key_tests {
             assert!(!output_uses_texture(&rendered.1, main_texture));
             assert!(app.active_detached_viewport_rendered_this_frame());
             assert_eq!(app.fullscreen_idx, Some(main_idx));
-            let parked = &app.active_context_bundle_for_test().unwrap();
-            assert_eq!(parked.fullscreen_idx, Some(owner_idx));
-            assert_eq!(parked.conceal_cache[&owner_idx].texture.id(), owner_texture);
+            app.with_active_viewer_context(|parked| {
+                assert_eq!(parked.fullscreen_idx, Some(owner_idx));
+                assert_eq!(parked.conceal_cache[&owner_idx].texture.id(), owner_texture);
+            })
+            .unwrap();
         })
         .join()
         .unwrap();
