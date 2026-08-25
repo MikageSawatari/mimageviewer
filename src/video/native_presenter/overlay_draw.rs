@@ -2261,16 +2261,24 @@ pub(super) fn draw_native_bar_lock_button(
     // ポインタが矩形の中にある間は毎フレーム出す。press が届かないとき、egui がそもそも
     // ポインタをこの widget の上だと思っていないのか、思っていて配らないのかを分ける。
     let egui_hover = ui.ctx().pointer_hover_pos();
-    let egui_interact = ui.ctx().pointer_interact_pos();
     let pointer_in_rect = egui_hover.is_some_and(|p| rect.contains(p));
     if pointer_in_rect || resp.is_pointer_button_down_on() || resp.clicked() {
+        // `contains_ptr=false` なのに `in_rect=true` だった。egui の hit test は
+        // **前 pass の widget 矩形**と clip で決まるので、残る候補は
+        // (a) clip で interact_rect が削られている (b) 前 pass にこの widget が居ない
+        // (c) 別の何かが pointer を握っている、の 3 つ。3 つとも出す。
+        let prev_pass_response = ui.ctx().read_response(egui::Id::new(id)).is_some();
         crate::logger::log(format!(
-            "[strip-lock-diag] bar lock widget bar={bar:?} down_on={} clicked={}              hovered={} contains_ptr={} in_rect={pointer_in_rect}              egui_hover={egui_hover:?} egui_interact={egui_interact:?}              top_layer={:?} locked={locked}",
+            "[strip-lock-diag] bar lock widget bar={bar:?} down_on={} clicked={}              hovered={} contains_ptr={} in_rect={pointer_in_rect}              egui_hover={egui_hover:?} top_layer={:?}              rect={rect:?} interact_rect={:?} clip={:?}              prev_pass_response={prev_pass_response} using_pointer={} dragged_id={:?}              locked={locked}",
             resp.is_pointer_button_down_on(),
             resp.clicked(),
             resp.hovered(),
             resp.contains_pointer(),
             egui_hover.and_then(|p| ui.ctx().layer_id_at(p)),
+            resp.interact_rect,
+            ui.clip_rect(),
+            ui.ctx().is_using_pointer(),
+            ui.ctx().dragged_id(),
         ));
     }
     if resp.clicked() {

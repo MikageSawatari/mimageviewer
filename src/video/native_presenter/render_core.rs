@@ -11938,6 +11938,140 @@ mod tests {
         );
     }
 
+    /// Repro for the real-hardware report: with the strip on screen, the bottom HUD's lock
+    /// needed two clicks. The logs showed the widget reporting `contains_pointer=false` while
+    /// the pointer sat inside its rect, and the correlation across two sessions was exact -
+    /// suppressed whenever the strip was present, fine whenever it was not.
+    #[test]
+    fn the_bottom_hud_lock_is_clickable_while_the_strip_is_on_screen() {
+        use std::sync::{Arc, Mutex};
+
+        let overlay_size = egui::vec2(1280.0, 720.0);
+        let lock_rect =
+            crate::video::native_presenter::overlay_draw::native_seek_bar_lock_button_rect(
+                overlay_size.x,
+                overlay_size.y,
+            );
+        let pointer = lock_rect.center();
+
+        let run = |with_strip: bool| {
+            let captured: Arc<Mutex<Vec<super::NativeOverlayCommand>>> =
+                Arc::new(Mutex::new(Vec::new()));
+            let captured_for_ui = Arc::clone(&captured);
+            let drag_origin = Arc::new(Mutex::new(None));
+            let last_window_request = Arc::new(Mutex::new(None));
+            let mut fonts_ready = false;
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(overlay_size)
+                .build(move |ctx| {
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    let mut commands = Vec::new();
+                    if with_strip {
+                        let strip = NativeOverlaySeekStrip {
+                            center: crate::video::seek_strip::SeekStripCenter::Thumbnails {
+                                center_index: 4.0,
+                            },
+                            range_value_secs:
+                                crate::settings::VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS,
+                            cell_count: 32,
+                            cells: Vec::new(),
+                            thumbnail_notice: None,
+                            wave_image: None,
+                            wave_notice: None,
+                            waveform_span_secs:
+                                crate::video::seek_strip_wave::DEFAULT_WAVEFORM_SPAN_SECS,
+                        };
+                        draw_native_seek_strip(
+                            ctx,
+                            overlay_size,
+                            Some(pointer),
+                            true,
+                            &strip,
+                            false,
+                            &std::collections::HashMap::new(),
+                            None,
+                            &mut drag_origin.lock().unwrap(),
+                            &mut last_window_request.lock().unwrap(),
+                            &mut commands,
+                        );
+                    }
+                    egui::Area::new(egui::Id::new("native_video_seek_hud"))
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(egui::pos2(0.0, overlay_size.y - HUD_BOTTOM_HEIGHT))
+                        .show(ctx, |ui| {
+                            ui.set_min_size(egui::vec2(overlay_size.x, HUD_BOTTOM_HEIGHT));
+                            let painter = ui.painter().clone();
+                            crate::video::native_presenter::overlay_draw::
+                                draw_native_bar_lock_button(
+                                    ui,
+                                    &painter,
+                                    lock_rect,
+                                    "native_seek_bar_lock",
+                                    true,
+                                    "シークバー固定を解除",
+                                    crate::video::NativeVideoBar::Seek,
+                                    &mut commands,
+                                );
+                        });
+                    captured_for_ui.lock().unwrap().extend(commands);
+                });
+            harness.run();
+            // Reach the HUD lock the way the report did: click the strip's own lock first,
+            // then move down to the bar's lock and click once.
+            if with_strip {
+                let strip_lock = super::native_seek_strip_lock_button_rect(
+                    super::native_seek_strip_rect(overlay_size.x, overlay_size.y),
+                )
+                .center();
+                harness.hover_at(strip_lock);
+                harness.run();
+                for pressed in [true, false] {
+                    harness.event(egui::Event::PointerButton {
+                        pos: strip_lock,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                harness.run();
+            }
+            harness.hover_at(pointer);
+            harness.run();
+            for pressed in [true, false] {
+                harness.event(egui::Event::PointerButton {
+                    pos: pointer,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            harness.run();
+            let commands = captured.lock().unwrap();
+            commands
+                .iter()
+                .filter(|command| {
+                    matches!(command, super::NativeOverlayCommand::ToggleBarLock { .. })
+                })
+                .count()
+        };
+
+        assert_eq!(
+            run(false),
+            1,
+            "sanity: the lock works with no strip on screen"
+        );
+        assert_eq!(
+            run(true),
+            1,
+            "one click on the bottom HUD lock must still toggle it while the strip is showing"
+        );
+    }
+
     #[test]
     fn first_present_transition_does_not_invalidate_the_prepared_scale_signature() {
         let signature = VideoScalePreparationSignature {
