@@ -5245,9 +5245,11 @@ impl App {
         match pair {
             SpreadPair::Single => {
                 let rotation = self.get_rotation(idx);
-                let content_bbox = self.fs_page_content_bbox(idx, rotation, |app| {
-                    app.view_trim_single_content_bbox(idx)
-                });
+                let trim = rotation
+                    .is_none()
+                    .then(|| self.view_trim_single_content_bbox(idx))
+                    .flatten();
+                let content_bbox = self.fs_page_content_bbox(idx, rotation, trim);
                 let page =
                     self.capture_fs_display_unit_page(rendition_ctx, idx, rotation, content_bbox)?;
                 Some(FsDisplayUnitHoldover { pages: vec![page] })
@@ -6632,9 +6634,13 @@ impl App {
         // 回転ページは draw_fs_image 側で bbox を使わないので通常どおり全体を対象にする。
         // mut 借用 (view_trim_single_content_bbox) を bg_style の immutable 借用より前に済ませる。
         // 正規化 bbox は照準オーバービューの draw_fs_image にも渡す (= 余白を出さずトリム後を表示)。
-        let trim_bbox = self.fs_page_content_bbox(fs_idx, rotation, |app| {
-            app.view_trim_single_content_bbox(fs_idx)
-        });
+        // Z ズームの寄せ先を決めるので、ここでは分割も反映した矩形が要る
+        // (`draw_fs_image` の解決より前に倍率と中心を決めるため)。
+        let trim = rotation
+            .is_none()
+            .then(|| self.view_trim_single_content_bbox(fs_idx))
+            .flatten();
+        let trim_bbox = self.fs_page_content_bbox(fs_idx, rotation, trim);
         // パン操作帯: 上下のホバーバー (上部バー / 下部シークバー) 分を内側へ詰め、カーソルが
         // そこへ入る前にコンテンツ領域の上端・下端へ到達できるようにする (実機 FB 2026-06-21)。
         // 左右はズーム中にパネルを抑止するので全幅を使う。小画面で帯が潰れないよう高さ 25% で頭打ち。
@@ -9650,19 +9656,19 @@ impl App {
     /// `content_bbox` は 1 つしか渡せないので併用できない。左右の解釈をここ 1 か所に
     /// 集約し、描画・ナビゲータ・ルーペで別々に解かない。
     ///
-    /// 表示トリム側の「回転していたら使わない」は**そのまま残している**。回転ページの
-    /// トリムは見開きの左右そろえを表示空間で定義しており、回転を通した写像が要るため、
-    /// 分割とは別に扱う。
-    fn fs_page_content_bbox(
-        &mut self,
+    /// トリムをどう出すかは**呼び出し側の事情**なので、解決済みの値を受け取る。
+    /// 経路によって回転ページのトリムを落とす / 落とさないが違っており、ここで
+    /// 一律に決めると、分割と関係のない振る舞いを変えてしまう。
+    pub(crate) fn fs_page_content_bbox(
+        &self,
         idx: usize,
         rotation: crate::rotation_db::Rotation,
-        trim: impl FnOnce(&mut Self) -> Option<egui::Rect>,
+        trim: Option<egui::Rect>,
     ) -> Option<egui::Rect> {
-        if let Some(slice) = self.active_page_slice_for(idx) {
-            return Some(slice.source_bbox(rotation));
+        match self.active_page_slice_for(idx) {
+            Some(slice) => Some(slice.source_bbox(rotation)),
+            None => trim,
         }
-        rotation.is_none().then(|| trim(self)).flatten()
     }
 
     /// このページを今どちら側で見ているか。分割していなければ `None`。
@@ -24855,9 +24861,14 @@ impl App {
         pixel_grid_enabled: bool,
         fit_mode: FullscreenFitMode,
         fit_scale_limits: FullscreenFitScaleLimits,
-        // 余白カットフィット用の中身 bbox (正規化 0..1)。Some & rotation なしのとき適用。
+        // 余白カットフィット用の中身 bbox (正規化 0..1)。**表示トリムの値をそのまま渡す。**
+        // 分割中にどちらの半分を描くかは、この関数が自分で解決する (下記)。
         content_bbox: Option<egui::Rect>,
     ) -> Option<DisplayedImageTransform> {
+        // 分割中は分割の矩形が勝つ。**呼び出し側に解決させない。** 呼び出し側で
+        // 解決する形にしていたとき、3 か所あるうち通常表示の 1 か所を通し忘れ、
+        // ページ送りだけ半分ずつ進んで絵は全体のまま、という状態になった (実機で発覚)。
+        let content_bbox = self.fs_page_content_bbox(page_idx, rotation, content_bbox);
         let using_full_texture = tex.is_some();
         let thumb_resource = thumb_tex
             .cloned()

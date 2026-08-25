@@ -16229,6 +16229,47 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.spread_page_nav(1), FsPageNav::Target(3));
     }
 
+    /// 分割中に描画へ渡る部分矩形。**分割が表示トリムに勝ち、回転を通して写る。**
+    ///
+    /// 実機で「ページ送りは半分ずつ進むのに絵は全体のまま」になったのは、この解決を
+    /// 呼び出し側に任せていて 1 か所通し忘れたため。今は `draw_fs_image` が自分で
+    /// 解決するが、解決そのものの正しさはここで固定する。
+    #[test]
+    fn a_split_page_hands_the_half_to_the_painter_instead_of_the_trim() {
+        use crate::page_split::PageSlice;
+        use crate::rotation_db::Rotation;
+        use crate::settings::SpreadMode;
+
+        let trim = Some(egui::Rect::from_min_max(
+            egui::pos2(0.1, 0.1),
+            egui::pos2(0.9, 0.9),
+        ));
+        let mut app = setup_app();
+        app.fullscreen_idx = Some(4);
+
+        // 分割していないときはトリムがそのまま通る。
+        app.spread_mode = SpreadMode::Single;
+        app.fullscreen_page_slice = PageSlice::Full;
+        assert_eq!(app.fs_page_content_bbox(4, Rotation::None, trim), trim);
+
+        // 分割中はトリムではなく左右が渡る。
+        app.spread_mode = SpreadMode::SplitLtr;
+        app.fullscreen_page_slice = PageSlice::Left;
+        assert_eq!(
+            app.fs_page_content_bbox(4, Rotation::None, trim),
+            Some(PageSlice::Left.uv_rect())
+        );
+
+        // 回転していると「画面で見て左半分」は元画像の別の半分になる。
+        assert_eq!(
+            app.fs_page_content_bbox(4, Rotation::Cw90, trim),
+            Some(PageSlice::Left.source_bbox(Rotation::Cw90))
+        );
+
+        // 表示していない別ページには左右を持ち込まない。
+        assert_eq!(app.fs_page_content_bbox(7, Rotation::None, trim), trim);
+    }
+
     /// 横長分割のページ送り。**同じページの左右移動と、別ページへの移動を分けて返す。**
     #[test]
     fn splitting_walks_the_halves_before_moving_to_the_next_page() {
