@@ -225,11 +225,9 @@ pub(crate) fn decide_enumerated_strip_axis(
 ///
 /// `keyframes` は有効なキーフレーム seek timestamp の昇順列。MP4 などでは index entry が
 /// presentation PTS ではなく DTS のことがある。索引の最後は動画末尾そのものには
-/// ならないため、末尾の未被覆区間を一律ゼロには要求しない。平均間隔 3 個分に加え、
-/// 素材内で実際に観測した最大 GOP 1 個分までは通常の末尾区間として許容する。
-/// ただし従来どおり 5〜30 秒に制限する。
-/// さらに全尺の 80% 以上を必須にし、先頭付近だけの不完全な索引が少数エントリによって
-/// 偶然この許容へ入ることを防ぐ。
+/// ならない。索引 completeness の主判定は「最後のキーフレームが、素材内で観測した最大
+/// GOP 1 個分以内に末尾へ到達していること」とする。これは短尺・長 GOP 素材を percentage
+/// coverage で誤って拒否せず、途中で止まった partial index は大きな未索引 tail で拒否する。
 pub(crate) fn decide_strip_axis(keyframes: &[f64], duration_secs: f64) -> StripAxisDecision {
     if keyframes.len() < 2 {
         return StripAxisDecision::TimeGrid(TimeGridReason::TooFewEntries);
@@ -247,8 +245,6 @@ pub(crate) fn decide_strip_axis(keyframes: &[f64], duration_secs: f64) -> StripA
         return StripAxisDecision::KeyframeIndex;
     }
 
-    let mut gap_sum = 0.0;
-    let mut gap_count = 0usize;
     let mut observed_max_gap = 0.0_f64;
     for pair in keyframes.windows(2) {
         let gap = pair[1] - pair[0];
@@ -256,19 +252,20 @@ pub(crate) fn decide_strip_axis(keyframes: &[f64], duration_secs: f64) -> StripA
             return StripAxisDecision::TimeGrid(TimeGridReason::InvalidCoverage);
         }
         if gap > 0.0 {
-            gap_sum += gap;
-            gap_count += 1;
             observed_max_gap = observed_max_gap.max(gap);
         }
     }
-    if gap_count == 0 || !gap_sum.is_finite() {
+    if observed_max_gap <= 0.0 || !observed_max_gap.is_finite() {
         return StripAxisDecision::TimeGrid(TimeGridReason::InvalidCoverage);
     }
-    let mean_gap = gap_sum / gap_count as f64;
-    let allowed_tail = (mean_gap * 3.0).max(observed_max_gap).clamp(5.0, 30.0);
-    let covered_enough = covered_secs >= duration_secs * 0.8;
     let tail_secs = (duration_secs - covered_secs).max(0.0);
-    if covered_enough && tail_secs <= allowed_tail {
+    let comparison_scale = duration_secs
+        .abs()
+        .max(covered_secs.abs())
+        .max(observed_max_gap)
+        .max(1.0);
+    let rounding_guard = f64::EPSILON * comparison_scale * 8.0;
+    if tail_secs <= observed_max_gap + rounding_guard {
         StripAxisDecision::KeyframeIndex
     } else {
         StripAxisDecision::TimeGrid(TimeGridReason::IncompleteCoverage)
@@ -1082,6 +1079,28 @@ mod tests {
         assert!(
             adopted.windows(2).any(|pair| pair[1] - pair[0] >= 4),
             "the regression axis must include adopted cells several raw entries apart"
+        );
+    }
+
+    #[test]
+    fn axis_decision_accepts_complete_short_long_gop_index_below_eighty_percent() {
+        let keyframes = [0.0, 8.34, 16.68, 23.4];
+
+        assert_eq!(
+            decide_strip_axis(&keyframes, 30.1),
+            StripAxisDecision::KeyframeIndex,
+            "the 6.7s tail is within the observed 8.34s GOP"
+        );
+    }
+
+    #[test]
+    fn axis_decision_rejects_index_that_stops_one_third_of_the_way_in() {
+        let keyframes = [0.0, 8.34, 16.68, 23.4];
+
+        assert_eq!(
+            decide_strip_axis(&keyframes, 70.2),
+            StripAxisDecision::TimeGrid(TimeGridReason::IncompleteCoverage),
+            "the 46.8s unindexed tail is much longer than every observed GOP"
         );
     }
 

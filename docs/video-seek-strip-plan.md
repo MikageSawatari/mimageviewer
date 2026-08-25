@@ -124,16 +124,14 @@ raw index entry まで、`TimeGrid` では 1 grid interval とし、隣の場面
 `NoFrame` にする。1 セルの timestamp 不一致はそのセルだけを failed にし、同じ run の後続セルを
 巻き込まない。
 
-**D21 (実素材修正、2026-08-25)**: 末尾だけ index entry が無い MP4 で、97% を覆う有効な索引を
-全体ごと `TimeGrid` へ落とさない。平均 GOP 3 個分 (5〜30 秒) という従来の末尾許容に加え、
-**素材内で実際に観測した最大 raw GOP 1 個分**までは通常の末尾区間として `KeyframeIndex` を採る。
-全尺 80% 以上という coverage 下限と 30 秒上限は維持する。実素材
-`ヨスガノソラ_プロモーション.mp4` は末尾 7.63 秒だけ索引が無く、旧判定では 2 秒 `TimeGrid` の
-長 GOP 区間が 14/137 `NoFrame` になった。index を採る real worker 診断では raw 110 / adopted 76 の
-76/76 が ready。したがって D20 の raw-neighbour matching bound はこの素材の原因ではなく変更しない。
-また、最小間隔と GOP が数学上等しい境界は timestamp の浮動小数点変換誤差だけで採否が変わらない
-よう、時刻の大きさに応じた丸め guard を入れる。実際に短い GOP を threshold と同一視する定数幅の
-緩和は行わない。
+**D21 (実素材修正、2026-08-25)**: 索引 completeness の主判定は、**最後の keyframe から動画末尾
+までが、素材内で実際に観測した最大 raw GOP 1 個分以内であること**。percentage coverage の
+下限と平均 GOP 3 個分 / 5〜30 秒の別規則は重ねない。短尺・長 GOP 素材は完全な索引でも最後の
+keyframe が尺の 80% 未満になり得る一方、途中 1/3 で止まった partial index は未索引 tail が最大
+GOP を越えるので同じ主判定で拒否できる。境界比較には timestamp 変換の丸め誤差だけを吸収する
+guard を使う。`ヨスガノソラ_プロモーション.mp4` (末尾 7.63 秒) と jellyfish 4K HEVC 10-bit
+(raw 4 件、最大 GOP 8.34 秒、末尾 6.7 秒、coverage 78%) は `KeyframeIndex`、同じ 4 件が尺の
+1/3 で止まる fixture は `incomplete_index_coverage` の `TimeGrid` になる。
 
 **D22 (実素材修正、2026-08-25)**: hmovie.mp4 は index 259 件、duration の 99.5% coverage、
 列挙順の逆行 0 件で、index timestamp 非単調という当初仮説には該当しなかった。失敗原因は
@@ -144,6 +142,11 @@ decode_slice_header error / NoFrame になったことだった。通常素材�
 pre-roll して再試行する。以後そのファイルでは同じ full-frame decoder を再利用する。これは
 健全な index を TimeGrid へ落とす axis fallback ではなく、keyframe packet が単独復号できない
 ファイル向けの decode strategy fallback である。
+
+**D23 (batch follow-up、2026-08-25)**: サムネイル窓は 30 秒を上限とし、未決着セルを
+`WindowTimedOut { timeout_secs }` の typed failure へ確定する。failure reason は settled outcome が
+所有し、App は「生成が時間切れです」、batch は `thumbnail window timed out after 30s` として
+同じ failure surface から表示する。上限前の `pending` だけが空枠であり、上限後に無言の空枠を残さない。
 
 axis resolver は raw index entry を sort する前の列挙順について monotonic / inversion count を
 診断へ残す。実際に逆行があれば sort で隠さず、理由 non_monotonic_index_timestamps を伴って
@@ -235,9 +238,9 @@ enum StripAxis {
   **捨てシークを 1 回撃つと埋まる** (MKV 1→58、WebM 1→19、WMV 0→590、いずれも 0.1〜0.2ms)。
 - したがって列挙は「数える → 疎なら `av_seek_frame` を 1 回 → 数え直す」の 2 段にする。
   この捨てシークはストリップを開いた最初の 1 回だけで、以後は不要。
-- 2 段目でも全尺の 80% を覆えない、または未索引 tail が「平均 GOP 3 個分」と「観測最大 GOP
-  1 個分」の大きい方 (5〜30 秒) を越えるなら `TimeGrid`。通常の末尾 1 GOP は index 軸の
-  最終セルが担う (D21)。
+- 2 段目でも、最後の keyframe から末尾までが素材内で観測した最大 raw GOP 1 個分を越えるなら
+  `TimeGrid`。通常の末尾 1 GOP は index 軸の最終セルが担う。別の percentage floor は置かない
+  (D21)。
 - どちらも**見た目は等幅セル**なので、利用者には区別を見せない。ログと perf event には出す。
 - `TimeGrid` の interval はタイルモードと同じ `INTERVAL_CANDIDATES_SECS` から選ぶ
   ([ui_video_tile.rs](../src/ui_video_tile.rs) `pick_interval`)。
@@ -478,6 +481,8 @@ enum SeekRowGesture {
 - `center_index` ↔ 時刻の相互変換 (補間あり / なし)、端のクランプ。
 - 窓の算出 (可視枚数 + 先読み)、窓が動いたときの再利用範囲。
 - `StripAxis` の選択 (索引あり / 無し / 不完全)。
+- coverage 80% 未満でも末尾が観測最大 GOP 内の complete index と、同じ entry 列が尺の 1/3 で
+  止まる truly partial index。
 - 最小間隔と GOP が等しい浮動小数点境界、および adopted cell が複数 raw entry をまたぐ可変 GOP。
 - 空セルの扱い (先頭 / 末尾)。
 - `SeekRowGesture` の決定 (上ドラッグ / 水平ドラッグ / 斜め / 閾値未満)。
@@ -490,6 +495,8 @@ enum SeekRowGesture {
 - preference 変更時に旧 raster が request coverage にならず、新 first paint まで display holdover になること。
 - 再生位置追従の 100ms rate limit、微小差の抑制、ドラッグ中の detach。
 - サムネイルセルの `pending / ready / failed` 判定と、最新要求の index-level failure の反映。
+- サムネイル窓の 30 秒境界が pending セルを typed timeout failure へ確定し、UI / batch 用の理由を
+  失わないこと。
 - 軸解決後の `DecoderUnavailable` だけが strip 全体 notice へ置き換わり、軸失敗 / thread spawn
   failure / cancel は置き換えないこと。
 - index DTS → packet PTS の対応付け、nearest-preceding の境界内 / 境界外、1 セルの不一致が同じ

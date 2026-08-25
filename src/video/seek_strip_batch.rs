@@ -4,7 +4,7 @@
 //! SeekStripThumbnailWorker, uses the resolved StripAxis, and turns worker snapshots into
 //! stable text/JSON-friendly reports.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,9 +14,10 @@ use serde::Serialize;
 
 use super::seek_strip::{StripAxis, StripLookahead, compute_strip_window};
 use super::seek_strip_thumbs::{
-    SeekStripThumbnailWorker, StripAxisDiagnostics, StripAxisResolution, StripAxisResolutionReason,
-    StripThumbnailDecodeDiagnostics, StripThumbnailDecodePath, StripThumbnailFailure,
-    StripThumbnailOutcome, StripThumbnailWorkerStatus,
+    STRIP_THUMB_WINDOW_TIMEOUT_SECS, SeekStripThumbnailWorker, StripAxisDiagnostics,
+    StripAxisResolution, StripAxisResolutionReason, StripThumbnailDecodeDiagnostics,
+    StripThumbnailDecodePath, StripThumbnailFailure, StripThumbnailOutcome,
+    StripThumbnailWorkerStatus,
 };
 
 const FALLBACK_MAX_CELLS: usize = 240;
@@ -37,7 +38,7 @@ impl Default for BatchOptions {
             hardware_decode: true,
             minimum_gap_secs: crate::settings::VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS,
             axis_timeout_secs: 15,
-            window_timeout_secs: 30,
+            window_timeout_secs: STRIP_THUMB_WINDOW_TIMEOUT_SECS,
         }
     }
 }
@@ -387,7 +388,6 @@ pub fn verify_file(path: &Path, options: &BatchOptions) -> FileReport {
     };
 
     let axis_report = build_axis_report(&axis, &diagnostics, duration_secs);
-    let mut remembered_failures = BTreeMap::new();
     let mut windows = Vec::new();
     for (name, requested_start_index) in window_positions(&axis, options.visible_count) {
         windows.push(run_window(
@@ -396,7 +396,6 @@ pub fn verify_file(path: &Path, options: &BatchOptions) -> FileReport {
             name,
             requested_start_index,
             options,
-            &mut remembered_failures,
         ));
     }
     let decode = Some(build_decode_report(&worker.snapshot().decode_diagnostics));
@@ -608,7 +607,6 @@ fn run_window(
     name: String,
     requested_start_index: usize,
     options: &BatchOptions,
-    remembered_failures: &mut BTreeMap<usize, String>,
 ) -> WindowReport {
     let started = Instant::now();
     let visible_count = options.visible_count.max(1).min(axis.cell_count());
@@ -635,9 +633,6 @@ fn run_window(
     } else {
         loop {
             let snapshot = worker.snapshot();
-            for (index, failure) in &snapshot.latest_request_failures {
-                remembered_failures.insert(*index, failure_text(failure));
-            }
             let settled = (range.start()..=range.end()).all(|index| {
                 axis.cell(index)
                     .and_then(|time| snapshot.outcome_for_secs(time))
@@ -655,15 +650,15 @@ fn run_window(
         }
     };
 
-    for (index, failure) in &snapshot.latest_request_failures {
-        remembered_failures.insert(*index, failure_text(failure));
-    }
     let terminal_failure = worker_status_failure(&snapshot.status);
     let request_failure = request_result
         .err()
         .map(|error| format!("worker request failed: {error:?}"));
-    let timeout_failure =
-        timed_out.then(|| format!("window timed out after {}s", options.window_timeout_secs));
+    let timeout_failure = timed_out.then(|| {
+        failure_text(&StripThumbnailFailure::WindowTimedOut {
+            timeout_secs: options.window_timeout_secs,
+        })
+    });
 
     let mut cells = Vec::new();
     for index in range.start()..=range.end() {
@@ -675,16 +670,11 @@ fn run_window(
                 state: CellState::Ready,
                 failure: None,
             }),
-            Some(StripThumbnailOutcome::Failed) => cells.push(CellReport {
+            Some(StripThumbnailOutcome::Failed(failure)) => cells.push(CellReport {
                 index,
                 time_secs,
                 state: CellState::Failed,
-                failure: Some(
-                    remembered_failures
-                        .get(&index)
-                        .cloned()
-                        .unwrap_or_else(|| "worker reported failure without a reason".to_string()),
-                ),
+                failure: Some(failure_text(failure)),
             }),
             None => cells.push(CellReport {
                 index,
@@ -694,6 +684,7 @@ fn run_window(
                     .clone()
                     .or_else(|| timeout_failure.clone())
                     .or_else(|| terminal_failure.clone())
+                    .or_else(|| snapshot.latest_failure_for_index(index).map(failure_text))
                     .or_else(|| Some("worker stopped before settling the cell".to_string())),
             }),
         }
@@ -739,6 +730,9 @@ fn failure_text(failure: &StripThumbnailFailure) -> String {
         StripThumbnailFailure::DecodeFailed(error) => format!("decode failed: {error}"),
         StripThumbnailFailure::ConvertFailed(error) => format!("conversion failed: {error}"),
         StripThumbnailFailure::NoFrame => "no matching frame".to_string(),
+        StripThumbnailFailure::WindowTimedOut { timeout_secs } => {
+            format!("thumbnail window timed out after {timeout_secs}s")
+        }
     }
 }
 
@@ -758,6 +752,14 @@ mod tests {
         assert_eq!(stats.p90_secs, 4.0);
         assert_eq!(stats.maximum_secs, 4.0);
         assert!((stats.mean_secs - 3.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn window_timeout_failure_text_keeps_the_worker_reason() {
+        assert_eq!(
+            failure_text(&StripThumbnailFailure::WindowTimedOut { timeout_secs: 30 }),
+            "thumbnail window timed out after 30s"
+        );
     }
 
     #[test]

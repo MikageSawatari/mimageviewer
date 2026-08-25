@@ -30,6 +30,8 @@ pub(crate) const STRIP_THUMB_EXTRACT_WIDTH: u32 = 320;
 const STRIP_THUMB_EXTRACT_HEIGHT: u32 = 320;
 /// Absorbs only rounding when FFmpeg index and packet timestamps are converted to seconds.
 const FRAME_PTS_MATCH_EPSILON_SECS: f64 = 0.005;
+/// A requested window must settle to ready or a typed cell failure within this bound.
+pub(crate) const STRIP_THUMB_WINDOW_TIMEOUT_SECS: u64 = 30;
 
 /// セルが要求した時刻から作る、窓変更をまたいで安定したプロセス内キー。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -81,11 +83,25 @@ pub(crate) enum StripThumbnailFailure {
     DecodeFailed(String),
     ConvertFailed(String),
     NoFrame,
+    WindowTimedOut { timeout_secs: u64 },
 }
 
 impl StripThumbnailFailure {
     fn should_retry_in_software(&self) -> bool {
         matches!(self, Self::DecodeFailed(_) | Self::ConvertFailed(_))
+    }
+
+    pub(crate) fn user_label(&self) -> &'static str {
+        match self {
+            Self::InvalidCellTime => "時刻が不正です",
+            Self::DecoderUnavailable(_) => "デコーダーを開けません",
+            Self::SeekFailed(_) => "シークに失敗",
+            Self::DemuxFailed(_) => "読み取りに失敗",
+            Self::DecodeFailed(_) => "復号に失敗",
+            Self::ConvertFailed(_) => "画像変換に失敗",
+            Self::NoFrame => "フレームなし",
+            Self::WindowTimedOut { .. } => "生成が時間切れです",
+        }
     }
 }
 
@@ -93,7 +109,7 @@ impl StripThumbnailFailure {
 #[derive(Clone, Debug)]
 pub(crate) enum StripThumbnailOutcome {
     Ready(StripThumbnail),
-    Failed,
+    Failed(StripThumbnailFailure),
 }
 
 /// UI へ渡す前に確定する、1 セルの表示状態。
@@ -103,18 +119,20 @@ pub(crate) enum StripThumbnailOutcome {
 pub(crate) enum StripThumbnailCellState<'a> {
     Pending,
     Ready(&'a StripThumbnail),
-    Failed,
+    Failed(&'a StripThumbnailFailure),
 }
 
 pub(crate) fn decide_strip_thumbnail_cell_state<'a>(
     outcome: Option<&'a StripThumbnailOutcome>,
-    latest_request_failure: Option<&StripThumbnailFailure>,
+    latest_request_failure: Option<&'a StripThumbnailFailure>,
 ) -> StripThumbnailCellState<'a> {
     match outcome {
         Some(StripThumbnailOutcome::Ready(thumbnail)) => StripThumbnailCellState::Ready(thumbnail),
-        Some(StripThumbnailOutcome::Failed) => StripThumbnailCellState::Failed,
-        None if latest_request_failure.is_some() => StripThumbnailCellState::Failed,
-        None => StripThumbnailCellState::Pending,
+        Some(StripThumbnailOutcome::Failed(failure)) => StripThumbnailCellState::Failed(failure),
+        None => latest_request_failure.map_or(
+            StripThumbnailCellState::Pending,
+            StripThumbnailCellState::Failed,
+        ),
     }
 }
 
@@ -699,6 +717,18 @@ struct WindowRequest {
     requested_at: Instant,
 }
 
+fn window_timeout_failure(elapsed: Duration) -> Option<StripThumbnailFailure> {
+    (elapsed >= Duration::from_secs(STRIP_THUMB_WINDOW_TIMEOUT_SECS)).then_some(
+        StripThumbnailFailure::WindowTimedOut {
+            timeout_secs: STRIP_THUMB_WINDOW_TIMEOUT_SECS,
+        },
+    )
+}
+
+fn request_timeout_failure(request: &WindowRequest) -> Option<StripThumbnailFailure> {
+    window_timeout_failure(request.requested_at.elapsed())
+}
+
 #[derive(Default)]
 struct LatestWindowRequest {
     pending: Option<WindowRequest>,
@@ -1231,6 +1261,12 @@ fn process_window_request(
         );
         return;
     }
+    if let Some(failure) = request_timeout_failure(&request) {
+        for cell in &decode_cells {
+            publish_failure(state, cell, failure.clone());
+        }
+        return;
+    }
 
     let open_t0 = Instant::now();
     if runtime.decoder.is_none() && runtime.decoder_unavailable.is_none() {
@@ -1272,6 +1308,12 @@ fn process_window_request(
         }
         return;
     }
+    if let Some(failure) = request_timeout_failure(&request) {
+        for cell in &decode_cells {
+            publish_failure(state, cell, failure.clone());
+        }
+        return;
+    }
 
     let mut metrics = DecodeMetrics::default();
     let mut superseded = false;
@@ -1307,7 +1349,14 @@ fn process_window_request(
                     queue_deferred_cache_write(pending_writes, &decoded);
                     let _ = maybe_emit_fill_wait(path, &request, &work, requests, state);
                 };
-                decoder.decode_run(&run, request.id, requests, cancel, &mut publish)
+                decoder.decode_run(
+                    &run,
+                    request.id,
+                    request.requested_at,
+                    requests,
+                    cancel,
+                    &mut publish,
+                )
             };
             let full_frame_retry = decoder_was_keyframes_only
                 .then(|| result.full_frame_retry_reason())
@@ -1387,8 +1436,17 @@ fn process_window_request(
                     break;
                 }
                 RunStop::Failed(failure) => {
-                    for cell in &run.cells {
+                    let timed_out = matches!(failure, StripThumbnailFailure::WindowTimedOut { .. });
+                    let failed_cells = if timed_out {
+                        decode_cells.as_slice()
+                    } else {
+                        run.cells.as_slice()
+                    };
+                    for cell in failed_cells {
                         publish_failure(state, cell, failure.clone());
+                    }
+                    if timed_out {
+                        break;
                     }
                 }
             }
@@ -1459,8 +1517,9 @@ fn publish_failure(
     if shared.cells.contains_key(&cell.id) {
         return;
     }
-    shared.cells.insert(cell.id, StripThumbnailOutcome::Failed);
-    shared.latest_request_failures.push((cell.index, failure));
+    shared
+        .cells
+        .insert(cell.id, StripThumbnailOutcome::Failed(failure));
 }
 
 fn all_visible_ready(work: &StripWindowWork, state: &Mutex<SharedState>) -> bool {
@@ -1805,6 +1864,7 @@ impl SeekStripDecoder {
         &mut self,
         run: &StripDecodeRun,
         request_id: u64,
+        requested_at: Instant,
         requests: &Mutex<LatestWindowRequest>,
         cancel: &AtomicBool,
         publish: &mut impl FnMut(DecodedCell),
@@ -1815,6 +1875,9 @@ impl SeekStripDecoder {
         let Some(first) = run.cells.first() else {
             return RunDecodeResult::complete();
         };
+        if let Some(failure) = window_timeout_failure(requested_at.elapsed()) {
+            return RunDecodeResult::failed(failure);
+        }
         let seek_target_secs = if self.mode == StripDecodeMode::FullFrames {
             first.target_secs
                 - first.frame_match_tolerance.before_secs
@@ -1985,6 +2048,10 @@ impl SeekStripDecoder {
         let mut stop = RunStop::Complete;
         let mut run_completed = false;
         'packets: for item in input.packets() {
+            if let Some(failure) = window_timeout_failure(requested_at.elapsed()) {
+                stop = RunStop::Failed(failure);
+                break;
+            }
             if cancel.load(Ordering::Acquire) {
                 stop = RunStop::Cancelled;
                 break;
@@ -2034,6 +2101,10 @@ impl SeekStripDecoder {
                 continue;
             }
             loop {
+                if let Some(failure) = window_timeout_failure(requested_at.elapsed()) {
+                    stop = RunStop::Failed(failure);
+                    break 'packets;
+                }
                 let mut frame = Video::empty();
                 if decoder.decoder_mut().receive_frame(&mut frame).is_err() {
                     break;
@@ -2053,10 +2124,16 @@ impl SeekStripDecoder {
         }
 
         if matches!(stop, RunStop::Complete) && !run_completed {
-            if let Err(error) = decoder.decoder_mut().send_eof() {
+            if let Some(failure) = window_timeout_failure(requested_at.elapsed()) {
+                stop = RunStop::Failed(failure);
+            } else if let Err(error) = decoder.decoder_mut().send_eof() {
                 first_decode_error.get_or_insert_with(|| error.to_string());
             } else {
                 loop {
+                    if let Some(failure) = window_timeout_failure(requested_at.elapsed()) {
+                        stop = RunStop::Failed(failure);
+                        break;
+                    }
                     let mut frame = Video::empty();
                     if decoder.decoder_mut().receive_frame(&mut frame).is_err() {
                         break;
@@ -2333,14 +2410,41 @@ mod tests {
             StripThumbnailCellState::Ready(thumbnail) if thumbnail.target_secs == 3.0
         ));
 
-        let failed = StripThumbnailOutcome::Failed;
+        let failed = StripThumbnailOutcome::Failed(StripThumbnailFailure::NoFrame);
         assert!(matches!(
             decide_strip_thumbnail_cell_state(Some(&failed), None),
-            StripThumbnailCellState::Failed
+            StripThumbnailCellState::Failed(StripThumbnailFailure::NoFrame)
         ));
         assert!(matches!(
             decide_strip_thumbnail_cell_state(None, Some(&StripThumbnailFailure::InvalidCellTime)),
-            StripThumbnailCellState::Failed
+            StripThumbnailCellState::Failed(StripThumbnailFailure::InvalidCellTime)
+        ));
+    }
+
+    #[test]
+    fn window_timeout_is_terminal_at_the_bound_and_has_a_user_reason() {
+        assert_eq!(
+            window_timeout_failure(
+                Duration::from_secs(STRIP_THUMB_WINDOW_TIMEOUT_SECS) - Duration::from_nanos(1)
+            ),
+            None
+        );
+        let failure = window_timeout_failure(Duration::from_secs(STRIP_THUMB_WINDOW_TIMEOUT_SECS))
+            .expect("the exact window bound must settle pending cells");
+        assert_eq!(
+            failure,
+            StripThumbnailFailure::WindowTimedOut {
+                timeout_secs: STRIP_THUMB_WINDOW_TIMEOUT_SECS,
+            }
+        );
+        assert_eq!(failure.user_label(), "生成が時間切れです");
+
+        let outcome = StripThumbnailOutcome::Failed(failure);
+        assert!(matches!(
+            decide_strip_thumbnail_cell_state(Some(&outcome), None),
+            StripThumbnailCellState::Failed(StripThumbnailFailure::WindowTimedOut {
+                timeout_secs: STRIP_THUMB_WINDOW_TIMEOUT_SECS,
+            })
         ));
     }
 
@@ -2394,7 +2498,7 @@ mod tests {
     }
 
     #[test]
-    fn settled_failure_keeps_state_and_current_request_reason_in_one_place_each() {
+    fn settled_failure_retains_its_typed_reason_in_the_outcome() {
         let axis = axis(3);
         let work = plan(
             &axis,
@@ -2413,12 +2517,11 @@ mod tests {
         let snapshot = lock_recover(&state).snapshot();
         assert!(matches!(
             snapshot.outcome_for_secs(cell.target_secs),
-            Some(StripThumbnailOutcome::Failed)
+            Some(StripThumbnailOutcome::Failed(
+                StripThumbnailFailure::NoFrame
+            ))
         ));
-        assert_eq!(
-            snapshot.latest_failure_for_index(cell.index),
-            Some(&StripThumbnailFailure::NoFrame)
-        );
+        assert_eq!(snapshot.latest_failure_for_index(cell.index), None);
     }
 
     #[test]
@@ -2557,8 +2660,8 @@ mod tests {
         for cell in cells {
             let outcome = match snapshot.cells.get(&cell.id) {
                 Some(StripThumbnailOutcome::Ready(_)) => "ready".to_string(),
-                Some(StripThumbnailOutcome::Failed) => {
-                    format!("failed {:?}", snapshot.latest_failure_for_index(cell.index))
+                Some(StripThumbnailOutcome::Failed(failure)) => {
+                    format!("failed {failure:?}")
                 }
                 None => "pending".to_string(),
             };

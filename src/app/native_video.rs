@@ -7549,8 +7549,10 @@ impl App {
                                                     },
                                                 )
                                             }
-                                            crate::video::seek_strip_thumbs::StripThumbnailCellState::Failed => {
-                                                crate::video::native_presenter::NativeOverlaySeekStripCellContent::Failed
+                                            crate::video::seek_strip_thumbs::StripThumbnailCellState::Failed(failure) => {
+                                                crate::video::native_presenter::NativeOverlaySeekStripCellContent::Failed {
+                                                    reason: failure.user_label(),
+                                                }
                                             }
                                         };
                                         cells.push(

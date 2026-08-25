@@ -280,11 +280,11 @@ fn draw_native_seek_strip(
                                         );
                                     }
                                 }
-                                Some(NativeOverlaySeekStripCellContent::Failed) => {
+                                Some(NativeOverlaySeekStripCellContent::Failed { reason }) => {
                                     painter.text(
                                         cell_rect.center(),
                                         egui::Align2::CENTER_CENTER,
-                                        "表示できません",
+                                        reason,
                                         crate::ui_fonts::hud_text_font(13.0),
                                         egui::Color32::from_gray(190),
                                     );
@@ -1478,7 +1478,7 @@ pub struct NativeOverlaySeekStripCell {
 pub enum NativeOverlaySeekStripCellContent {
     Pending,
     Ready(NativeOverlayTileThumbnail),
-    Failed,
+    Failed { reason: &'static str },
 }
 
 #[derive(Clone)]
