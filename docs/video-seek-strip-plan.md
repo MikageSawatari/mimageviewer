@@ -24,6 +24,34 @@ MPEG-TS など `TimeGrid` 経路の実素材確認。
 確定した既定値: 開閉は `Shift+S` (`V` はレーン C の動画パノラマ用に空けた)、最小間隔 15 秒、
 抽出幅 320px、波形は 1 画面 3 分、セル 152x104pt。
 
+**未解決**: 特定素材で末尾 4 セルが黒いという利用者報告を再現できていない。HW / SW とも、
+独立した復号でも黒くならなかった。輝度・分散・channel range を記録するようにしたので再発時に掴める。
+
+### 次のセッションが最初にすること
+
+1. **第 2 段の一括検証の結果を集計する。** 出力は
+   `C:\home\miv-batch-runner\sweep-stage2.json` (`D:\home8` と `E:\share8`、
+   23,079 ファイル、2026-08-25 夜に開始)。走行中ならファイルが無いか途中まで。
+   **JSON は BOM 付きなので `encoding='utf-8-sig'` で読む。** 要約は top-level の
+   `passed_files` / `failed_files` / `skipped_files` / `failed_cells`、詳細は
+   `files[].windows[].cells[]` の `state` と `failure`。
+2. 出た失敗を直す。**実素材はここまで 6 件連続で別々の原因を出しており、着手前の見立ては
+   6 件中 1 件しか当たっていない。推測で直さず、`seek_strip_batch` の診断で理由を出してから直す。**
+   自前の簡易復号 (`tools/seek_strip_probe`) はアプリが失敗する素材で 2 回とも通っている。
+3. その後は D19 → D17 → §5.4。§5.4 の優先度は、利用者が波形 60 分以上の段を常用するかで決まる
+   (実測 60 分 3.1 秒 / 120 分 6.5 秒 / 180 分 8.2 秒)。
+
+### 検証ツール
+
+```powershell
+C:\home\miv-batch-runner\seek_strip_batch.exe --json <folder> [<folder>...]
+```
+
+`dev-tools` feature の bin (`src/bin/seek_strip_batch.rs`)。**アプリの実ワーカーと軸解決を駆動する。**
+永続キャッシュを使わない (`None`) ので利用者データを汚さず、キャッシュヒットが失敗を隠さない。
+pass / fail / unavailable / flat / duplicate を分けて数え、失敗があれば非ゼロ終了。
+**exe と FFmpeg DLL を worktree 外へ写しておくと、Codex のビルドと並行して回せる。**
+
 ## 1. 何を作るか
 
 動画のシークバーから**上へドラッグしたときだけ開く帯 (ストリップ)**。中身は
