@@ -720,7 +720,20 @@ bundle 版は重複として削除し、その同等性テストは mounted-side
 | 3 PDF を別ウィンドウで | **OK** |
 | 4 detached 動画の再生 | **OK** (下の退行を直した後) |
 | 7 複数ウィンドウで PDF / 動画を開閉 | **OK** |
-| 5 VST3 / 6 parked 右ドラッグ / 8 マルチモニター | 未実施 |
+| 5 VST3 | **OK** |
+| 6 parked 右ドラッグ (非アクティブ窓へのリング) | **OK** |
+| 8 マルチモニター (窓移動 / 最小化・復元) | **OK** |
+
+**②-d の実機 smoke は完了 (2026-08-25)。**
+
+- 8 の「VST GUI の開閉」は**確認対象外だった**。in-window モードは設計上 VST を対象外にしており、
+  フルスクリーン以外へ切り替える時点で VST GUI を自動的に隠す
+  ([native_video.rs](../src/app/native_video.rs) の placement 切替、
+  「in-window モードは VST を対象外にするため」のコメント)。利用者の観測どおりで正常。
+- smoke 中に F12 の placement 往復が遅いという指摘が出たが、**利用者が v3.2.0 と v3.0.0
+  ポータブルでも同じだと確認した既存の問題**。R2e は presenter 本体を 1 行も触っていない。
+  backlog [next-release-backlog.md](next-release-backlog.md) **§1.116** に、
+  共有出力プール枯渇のログ証拠付きで積んだ。
 
 ## ②-d の退行 1 件と、その調査でかかった 3 往復
 

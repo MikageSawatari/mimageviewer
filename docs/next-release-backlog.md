@@ -1,4 +1,4 @@
-﻿# 次リリース検討バックログ
+# 次リリース検討バックログ
 
 このファイルは、まだ着手していない作業候補だけを置く恒久バックログ。
 完了した項目はコミット履歴・リリースノート・個別設計メモに任せ、このファイルからは削除する。
@@ -1281,6 +1281,34 @@ passive detached は通常どおり release で窓を activate するが、選�
   [docs/detached-rework-plan.md](detached-rework-plan.md) の BA-5 / findings-12 D1
   (font resync の discard パスが passive 窓を破棄した実害) / findings-14
   (毎フレーム seed による振動を `builder_placement_latch` で止めた前例)。
+
+### 1.116 F12 で動画をメイン ⇄ 別ウィンドウへ往復させると重い — 実機確認中の指摘
+
+- 出典: R2e ②-d の実機 smoke 中の指摘 (2026-08-25)。動作はするが体感でかなり遅い。
+- **既存の問題であることは確認済み**: 利用者が **v3.2.0 と v3.0.0 ポータブル**でも同じだと
+  確認した。R2e ブランチ由来ではない。**presenter 本体
+  ([src/video/native_presenter/](../src/video/native_presenter/)) は R2e で 1 行も触っていない。**
+- 観測 (`%APPDATA%\mimageviewer\logs\mimageviewer.log`、placement 切替の前後):
+
+  ```
+  GPU path failed (resource pressure, consec=4), dropping frame:
+      GPU resource pressure: shared output pool exhausted waiting for free slot
+  fullscreen presenter summary: presented=129 fps=10.6 gpu=0 cpu=0
+      late_drop=88 max_late_ms=2187.7 max_interval_ms=2520.0
+  [demux] audio packet send waited 20-32ms queue_len_before=64/64   ← 連続
+  [SLOW FRAME] 43-54ms  pre_grid=42-52ms  (selection_info / facet は 1ms 未満)
+  ```
+
+- 読み方: **共有出力プールの枯渇**が起点に見える。placement 切替でサーフェスを作り直す間、
+  旧プールのスロットが解放されずに待たされ、presenter が 10 fps 台まで落ち、
+  late drop が 88 回、最大 2.2 秒遅れる。`[demux] audio packet send waited` が
+  `queue_len_before=64/64` で連続しているのは、consumer 側が引けていないことを示す。
+  UI スレッドの `pre_grid` 43-54ms も同じ窓に重なる。
+- 最初に見る所: placement 切替時のサーフェス再作成とプール返却の順序
+  ([src/video/native_presenter/](../src/video/native_presenter/))。
+  「新しいサーフェスを確保してから古いスロットを返す」形になっていないかを確認する。
+- ⚠ **guard / delay / retry で待ち時間を隠さない**。プール枯渇そのものを直す。
+- 規模 / 優先度: Medium / P2 (機能は動くが体感に直結する)。
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 
