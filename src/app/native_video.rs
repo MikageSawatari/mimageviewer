@@ -112,10 +112,9 @@ pub(super) fn toggle_native_video_bar_lock_setting(
 pub(super) fn toggle_native_video_seek_strip_lock_setting(
     settings: &mut crate::settings::Settings,
 ) -> bool {
-    let current = settings.video_bottom_lock();
-    let updated = current.with_strip(!current.strip_locked());
-    settings.set_video_bottom_lock(updated);
-    updated.strip_locked()
+    let locked = !settings.video_bottom_lock().strip_locked();
+    settings.set_video_seek_strip_locked(locked);
+    settings.video_bottom_lock().strip_locked()
 }
 
 #[cfg(windows)]
@@ -6891,15 +6890,24 @@ impl App {
         cause: crate::video::seek_strip::SeekStripCloseCause,
     ) -> bool {
         let mut changed = false;
-        if cause.clears_persisted_state()
+        let strip_locked = self.settings.video_bottom_lock().strip_locked();
+        // 固定は「常に見えている」意味なので、利用者が自分で閉じたなら固定も外す。
+        // そうしないと次の動画でまた開き、閉じた操作が無視されたように見える。
+        if strip_locked && cause.is_user_dismissal() {
+            self.settings.set_video_seek_strip_locked(false);
+            changed = true;
+        }
+        if cause.clears_persisted_state(strip_locked)
             && self.settings.video_seek_strip_state != crate::settings::VideoSeekStripState::None
         {
             if let Some(mode) = self.settings.video_seek_strip_state.mode() {
                 self.settings.video_seek_strip_last_choice = mode;
             }
             self.settings.video_seek_strip_state = crate::settings::VideoSeekStripState::None;
-            self.settings.save();
             changed = true;
+        }
+        if changed {
+            self.settings.save();
         }
         self.stop_video_seek_strip_session(cause) || changed
     }

@@ -6655,6 +6655,21 @@ impl Settings {
         self.video_seek_strip_locked = strip_locked;
     }
 
+    /// ストリップ固定を切り替える唯一の入口。
+    ///
+    /// 固定は「常に見えている」という意味なので、ON はバー固定に加えて**表示状態も**含意する。
+    /// 表示が「なし」のまま固定だけ立てると、利用者から見て何も起きない (実機報告 2026-08-25)。
+    /// 復元先は `video_seek_strip_last_choice`。OFF は表示状態を変えない (固定を外しただけで
+    /// 見えているストリップを畳まない)。
+    pub fn set_video_seek_strip_locked(&mut self, locked: bool) {
+        let lock = self.video_bottom_lock().with_strip(locked);
+        self.set_video_bottom_lock(lock);
+        if lock.strip_locked() && self.video_seek_strip_state == VideoSeekStripState::None {
+            self.video_seek_strip_state =
+                VideoSeekStripState::restore(self.video_seek_strip_last_choice);
+        }
+    }
+
     pub fn effective_auto_fullscreen_zip_pdf(&self) -> bool {
         self.detached_viewer_open_images_in_window || self.auto_fullscreen_zip_pdf
     }
@@ -8971,6 +8986,53 @@ mod tests {
         ] {
             assert_ne!(lock.to_settings(), (false, true));
         }
+    }
+
+    #[test]
+    fn locking_the_strip_also_shows_it_and_locks_the_bar() {
+        let mut settings = Settings {
+            video_seek_strip_state: VideoSeekStripState::None,
+            video_seek_strip_last_choice: VideoSeekStripMode::Waveform,
+            ..Settings::default()
+        };
+        settings.set_video_seek_strip_locked(true);
+        assert_eq!(settings.video_bottom_lock(), VideoBottomLock::BarAndStrip);
+        assert_eq!(
+            settings.video_seek_strip_state,
+            VideoSeekStripState::Waveform,
+            "固定は常に見えている意味なので、なしのまま固定だけ立てない"
+        );
+    }
+
+    #[test]
+    fn locking_the_strip_keeps_the_content_already_chosen() {
+        let mut settings = Settings {
+            video_seek_strip_state: VideoSeekStripState::Thumbnails,
+            video_seek_strip_last_choice: VideoSeekStripMode::Waveform,
+            ..Settings::default()
+        };
+        settings.set_video_seek_strip_locked(true);
+        assert_eq!(
+            settings.video_seek_strip_state,
+            VideoSeekStripState::Thumbnails,
+            "既に出ている内容を last_choice で置き換えない"
+        );
+    }
+
+    #[test]
+    fn unlocking_the_strip_leaves_it_on_screen() {
+        let mut settings = Settings {
+            video_seek_strip_state: VideoSeekStripState::Thumbnails,
+            ..Settings::default()
+        };
+        settings.set_video_seek_strip_locked(true);
+        settings.set_video_seek_strip_locked(false);
+        assert_eq!(settings.video_bottom_lock(), VideoBottomLock::BarOnly);
+        assert_eq!(
+            settings.video_seek_strip_state,
+            VideoSeekStripState::Thumbnails,
+            "固定を外しただけで、見えているストリップを畳まない"
+        );
     }
 
     #[test]

@@ -715,18 +715,27 @@ pub enum SeekStripCloseCause {
 }
 
 impl SeekStripCloseCause {
+    /// The user asked for the strip to go away, as opposed to something else taking the screen
+    /// or the material turning out to be unusable.
+    pub(crate) const fn is_user_dismissal(self) -> bool {
+        matches!(self, Self::Toggle | Self::DownwardDrag | Self::Escape)
+    }
+
     /// Explicit close operations clear the persisted 3-state selection. Resource-only lifecycle
     /// boundaries keep it so the same strip can be restored for the next video session.
-    pub(crate) const fn clears_persisted_state(self) -> bool {
-        matches!(
-            self,
-            Self::Toggle
-                | Self::DownwardDrag
-                | Self::Escape
-                | Self::HudHidden
-                | Self::TileModeOpened
-                | Self::Unavailable
-        )
+    ///
+    /// While the strip is pinned, a close the user did not ask for must not clear it either:
+    /// a video with no usable material, or a trip through the tile grid, would otherwise cancel
+    /// the pin for every video after it.
+    pub(crate) const fn clears_persisted_state(self, strip_locked: bool) -> bool {
+        if self.is_user_dismissal() {
+            return true;
+        }
+        !strip_locked
+            && matches!(
+                self,
+                Self::HudHidden | Self::TileModeOpened | Self::Unavailable
+            )
     }
 }
 

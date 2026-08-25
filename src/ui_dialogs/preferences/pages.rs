@@ -6087,10 +6087,9 @@ pub(super) fn draw_video_bar_visibility_settings(
         .checkbox(&mut seek_strip_locked, "シークストリップを固定表示")
         .changed()
     {
-        bottom_lock = bottom_lock.with_strip(seek_strip_locked);
-        settings.set_video_bottom_lock(bottom_lock);
+        settings.set_video_seek_strip_locked(seek_strip_locked);
     }
-    ui.small("ON にすると下部シークバーも固定し、ストリップ表示中はその領域を映像から除外します。ストリップを閉じている間は領域を確保しません。");
+    ui.small("ON にするとストリップを開いたままにし、下部シークバーも固定して、ストリップの領域を映像から除外します。ストリップ右上の鍵アイコンからも切り替えできます。");
     ui.small("固定バーと映像の間隔は、静止画フルスクリーンと共通の余白設定を使います。");
 }
 

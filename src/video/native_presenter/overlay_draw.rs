@@ -2258,11 +2258,19 @@ pub(super) fn draw_native_bar_lock_button(
     );
     let resp = resp.hover_tip_dark(tooltip);
     // 診断 (2026-08-25): 上の native click log と対で、egui が press を widget へ配ったかを見る。
-    if resp.is_pointer_button_down_on() || resp.clicked() {
+    // ポインタが矩形の中にある間は毎フレーム出す。press が届かないとき、egui がそもそも
+    // ポインタをこの widget の上だと思っていないのか、思っていて配らないのかを分ける。
+    let egui_hover = ui.ctx().pointer_hover_pos();
+    let egui_interact = ui.ctx().pointer_interact_pos();
+    let pointer_in_rect = egui_hover.is_some_and(|p| rect.contains(p));
+    if pointer_in_rect || resp.is_pointer_button_down_on() || resp.clicked() {
         crate::logger::log(format!(
-            "[strip-lock-diag] bar lock widget bar={bar:?} down_on={} clicked={} locked={locked}",
+            "[strip-lock-diag] bar lock widget bar={bar:?} down_on={} clicked={}              hovered={} contains_ptr={} in_rect={pointer_in_rect}              egui_hover={egui_hover:?} egui_interact={egui_interact:?}              top_layer={:?} locked={locked}",
             resp.is_pointer_button_down_on(),
             resp.clicked(),
+            resp.hovered(),
+            resp.contains_pointer(),
+            egui_hover.and_then(|p| ui.ctx().layer_id_at(p)),
         ));
     }
     if resp.clicked() {
