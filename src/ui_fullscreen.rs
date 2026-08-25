@@ -8149,17 +8149,57 @@ fn continuous_reading_drag_delta(
 /// live なフルサイズ cache、ロード済みサムネイル、退去後も残るページ寸法 cache の順で
 /// 参照する。一度も寸法が判明していないページだけは false（縦長）として扱うが、判明済みの
 /// 寸法はテクスチャ退去で失わないため、同じ items 世代で既知から未知へは後退しない。
-fn is_landscape(
+/// 分割するか、しないならその理由。
+///
+/// **無言で「割らない」を返さない。** 実機で「分割を選んだのにページがつながったまま」
+/// という報告が出たとき、原因が「寸法待ち」なのか「そもそも縦長」なのかが分からず、
+/// ログに何も残っていなかった (2026-08-25)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SplitDecision {
+    /// 分割する。判明した寸法を添える。
+    Split { w: u32, h: u32 },
+    /// 縦長なので分割しない。これは確定した答え。
+    NotLandscape { w: u32, h: u32 },
+    /// **まだ寸法が分からない**ので分割しない。一時的で、届けば割れる。
+    DimensionsUnknown,
+    /// 静止画ページではない (動画 / 音声 / フォルダ等)。
+    NotAStillPage,
+}
+
+impl SplitDecision {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Split { .. } => "split",
+            Self::NotLandscape { .. } => "not_landscape",
+            Self::DimensionsUnknown => "dimensions_unknown",
+            Self::NotAStillPage => "not_a_still_page",
+        }
+    }
+
+    fn dims(self) -> Option<(u32, u32)> {
+        match self {
+            Self::Split { w, h } | Self::NotLandscape { w, h } => Some((w, h)),
+            Self::DimensionsUnknown | Self::NotAStillPage => None,
+        }
+    }
+}
+
+/// 表示判断に使える寸法を優先順に探す。
+///
+/// **見つからないことがある** (まだ読み込んでいない / テクスチャが退去した)。
+/// 見開きのペアリングでは「分からない = 横長でない」で困らないが、分割では
+/// 「まだ分からないので割らない」と「縦長だから割らない」が別の意味を持つので、
+/// 判定と探索を分けてある。
+fn known_page_dims(
     idx: usize,
-    rotation: crate::rotation_db::Rotation,
     fs_cache: &ItemsGenerationMap<FsCacheEntry>,
     thumbnails: &[ThumbnailState],
     page_dims_cache: &crate::page_dims::PageDimsCache,
     items_generation: u64,
-) -> bool {
+) -> Option<(u32, u32)> {
     // フルサイズキャッシュから判定
-    if let Some((w, h)) = fs_cache.get(&idx).and_then(fs_cache_entry_page_dims) {
-        return crate::rotation_db::landscape_after_rotation(w, h, rotation);
+    if let Some(dims) = fs_cache.get(&idx).and_then(fs_cache_entry_page_dims) {
+        return Some(dims);
     }
     // サムネイルから判定
     if let Some(ThumbnailState::Loaded {
@@ -8169,18 +8209,27 @@ fn is_landscape(
         ..
     }) = thumbnails.get(idx)
     {
-        if let Some((w, h)) = (*layout_dims).or(*source_dims) {
-            return crate::rotation_db::landscape_after_rotation(w, h, rotation);
+        if let Some(dims) = (*layout_dims).or(*source_dims) {
+            return Some(dims);
         }
         let width = u32::try_from(tex.size()[0]).unwrap_or(u32::MAX);
         let height = u32::try_from(tex.size()[1]).unwrap_or(u32::MAX);
-        return crate::rotation_db::landscape_after_rotation(width, height, rotation);
+        return Some((width, height));
     }
     // live texture が退去済みでも、一度判明した同世代の寸法は忘れない。
-    if let Some((w, h)) = page_dims_cache.get(items_generation, idx) {
-        return crate::rotation_db::landscape_after_rotation(w, h, rotation);
-    }
-    false
+    page_dims_cache.get(items_generation, idx)
+}
+
+fn is_landscape(
+    idx: usize,
+    rotation: crate::rotation_db::Rotation,
+    fs_cache: &ItemsGenerationMap<FsCacheEntry>,
+    thumbnails: &[ThumbnailState],
+    page_dims_cache: &crate::page_dims::PageDimsCache,
+    items_generation: u64,
+) -> bool {
+    known_page_dims(idx, fs_cache, thumbnails, page_dims_cache, items_generation)
+        .is_some_and(|(w, h)| crate::rotation_db::landscape_after_rotation(w, h, rotation))
 }
 
 fn fs_cache_entry_page_dims(entry: &FsCacheEntry) -> Option<(u32, u32)> {
@@ -9649,15 +9698,33 @@ impl App {
         idx: usize,
         rotation: crate::rotation_db::Rotation,
     ) -> bool {
-        is_spread_pairable_item(self.items.get(idx))
-            && is_landscape(
-                idx,
-                rotation,
-                &self.fs_cache,
-                &self.thumbnails,
-                &self.page_dims_cache,
-                self.items_generation,
-            )
+        matches!(
+            self.split_decision(idx, rotation),
+            SplitDecision::Split { .. }
+        )
+    }
+
+    /// 分割するか / しないなら理由。**「まだ寸法が分からない」と「縦長だから」を分ける。**
+    ///
+    /// 混ぜると「たまに割れない」が観測できない。前者は一時的で、寸法が届けば割れる。
+    fn split_decision(&self, idx: usize, rotation: crate::rotation_db::Rotation) -> SplitDecision {
+        if !is_spread_pairable_item(self.items.get(idx)) {
+            return SplitDecision::NotAStillPage;
+        }
+        let Some((w, h)) = known_page_dims(
+            idx,
+            &self.fs_cache,
+            &self.thumbnails,
+            &self.page_dims_cache,
+            self.items_generation,
+        ) else {
+            return SplitDecision::DimensionsUnknown;
+        };
+        if crate::rotation_db::landscape_after_rotation(w, h, rotation) {
+            SplitDecision::Split { w, h }
+        } else {
+            SplitDecision::NotLandscape { w, h }
+        }
     }
 
     /// 表示中のページと分割モードから、左右の記憶を辻褄の合う値へ寄せる。
@@ -9666,18 +9733,47 @@ impl App {
     /// すべてに「左右を戻す」を足すと必ずどれか漏れる。**表示側で 1 か所そろえる。**
     /// 分割していないページや分割 OFF では `Full` に戻すので、記憶が居残らない。
     fn reconcile_fullscreen_page_slice(&mut self, fs_idx: usize) {
-        let splits = self.split_direction_now().map(|direction| {
-            let rotation = self.get_rotation(fs_idx);
-            (direction, self.page_splits_with_rotation(fs_idx, rotation))
-        });
-        match splits {
-            Some((direction, true)) => {
-                if !self.fullscreen_page_slice.is_half() {
-                    self.fullscreen_page_slice = direction.first();
-                }
+        let Some(direction) = self.split_direction_now() else {
+            self.fullscreen_page_slice = crate::page_split::PageSlice::Full;
+            self.note_split_decision(fs_idx, None);
+            return;
+        };
+        let rotation = self.get_rotation(fs_idx);
+        let decision = self.split_decision(fs_idx, rotation);
+        self.note_split_decision(fs_idx, Some(decision));
+        if matches!(decision, SplitDecision::Split { .. }) {
+            if !self.fullscreen_page_slice.is_half() {
+                self.fullscreen_page_slice = direction.first();
             }
-            _ => self.fullscreen_page_slice = crate::page_split::PageSlice::Full,
+        } else {
+            self.fullscreen_page_slice = crate::page_split::PageSlice::Full;
         }
+    }
+
+    /// 表示中ページの分割判断を、**変わったときだけ** 1 行残す。
+    ///
+    /// 毎フレーム出すとログが埋まるので、対象ページか理由が変わった瞬間だけ書く。
+    /// これがあると「分割を選んだのにつながったまま」の原因が、寸法待ちなのか
+    /// 縦長なのかを後から切り分けられる。
+    fn note_split_decision(&mut self, fs_idx: usize, decision: Option<SplitDecision>) {
+        let stamp = decision.map(|d| (fs_idx, d));
+        if self.last_split_decision == stamp {
+            return;
+        }
+        self.last_split_decision = stamp;
+        let Some(decision) = decision else {
+            return;
+        };
+        let dims = decision
+            .dims()
+            .map(|(w, h)| format!("{w}x{h}"))
+            .unwrap_or_else(|| "unknown".to_string());
+        crate::logger::log(format!(
+            "[split] idx={fs_idx} decision={} dims={dims} rotation={:?} mode={:?}",
+            decision.reason(),
+            self.get_rotation(fs_idx),
+            self.spread_mode
+        ));
     }
 
     /// このページへ渡す部分矩形。**分割中は分割が勝ち、表示トリムは使わない。**
