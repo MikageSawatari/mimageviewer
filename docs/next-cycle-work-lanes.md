@@ -82,8 +82,27 @@
   次の実行で通る。2 回続けて同じ位置で落ちるなら別の話として扱う。
 - 共有作業ツリーでのコミットは pathspec commit (`git commit -- <自分のパス>`)。
 - 既存 worktree: `detached-rework` と `video-upscale-shader` は master へ取り込み済みで撤収候補。
-  `seek-thumb-bench` は 2 コミット未マージ (シークサムネイルの計測計装) — **レーン B で
-  再利用価値があるので、master へ入れるかを B の着手時に判断する**。
+- **`seek-thumb-bench` の 2 コミットは、もう再利用の候補ではなく衝突要因** (2026-08-25 に確認)。
+  計装先の `render_core.rs` / `thumbnail.rs` はレーン B が大きく書き換えており
+  (`render_core.rs` だけで +874 行)、B は自前の計測手段
+  (`src/bin/seek_strip_batch.rs` + `tools/seek_strip_probe`) を既に作っている。
+  `scripts/analyze_seek_thumb.py` に取り出したいものが無ければ**撤収してよい**。
+  判断はレーン B 側で。撤収は `scripts/safe-worktree-remove.ps1` 経由。
+
+### レーン B の現況 (2026-08-25 夜)
+
+コンテキスト消尽により**新セッションへ引き継ぎ済み**。到達点は `video-strip` の `2d8b2401`
+(master から 13,286 行)。引き継ぎ内容は worktree 側の
+`docs/video-seek-strip-plan.md` が正本で、要点は:
+
+- 23,079 ファイルの一括検証を実行中 (出力 `C:\home\miv-batch-runner\sweep-stage2.json`)
+- 末尾 4 セルが黒いという利用者報告は**未再現**
+- 次は D19 → D17 → §5.4
+
+**master レーンから見た影響**: 触る場所は `src/video/` に閉じており
+`ui_fullscreen.rs` は 32 行なので、§1.119 の配線とはぶつからない。ただし B は
+一括検証で大量のディスク I/O を回すので、**こちらから重いビルドやフルテストを
+同時にぶつけない** (§6 の MSBuild 注意と同じ理由)。
 
 ## 6.1 レーン D (master 本体) の進捗 — 2026-08-25
 
