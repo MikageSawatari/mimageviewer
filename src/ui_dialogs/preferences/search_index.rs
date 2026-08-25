@@ -97,7 +97,7 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     ),
     entry!(
         "startup/mode",
-        StartupFolder,
+        Startup,
         "起動時に開く場所",
         [
             "起動フォルダ",
@@ -109,9 +109,22 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     ),
     entry!(
         "startup/specific-folder",
-        StartupFolder,
+        Startup,
         "指定フォルダ:",
         ["パス", "folder", "directory"]
+    ),
+    entry!(
+        "startup/window-state",
+        Startup,
+        "起動時のウィンドウ状態",
+        [
+            "最大化",
+            "ウィンドウサイズ",
+            "サイズ復元",
+            "位置",
+            "maximize",
+            "window"
+        ]
     ),
     entry!(
         "explorer/context-menu",

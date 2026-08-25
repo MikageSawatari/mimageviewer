@@ -1,0 +1,32 @@
+[package]
+name = "mimageviewer-susie-crash-plugin"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# 開発専用の Susie 画像プラグイン (`.spi`)。**配布物には入れない。**
+#
+# ワーカープロセスがプラグインのクラッシュから復帰できるかを実機で確かめるために
+# ある。入力ファイルの中身の先頭行で挙動を選ぶ (docs/susie-crash-plugin.md):
+#
+#   MIVOK     -> 8x8 の単色画像を正常に返す
+#   MIVCRASH  -> GetPicture の中でアクセス違反を起こす
+#   MIVHALF   -> 呼ばれるたび 50% の確率でアクセス違反を起こす
+#   MIVSUPPORTCRASH -> IsSupported の中で落ちる (より早い段階の死に方)
+#
+# 32bit ターゲットでのみビルドする (`.spi` は 32bit DLL):
+#   cargo build --release --target i686-pc-windows-msvc -p mimageviewer-susie-crash-plugin
+
+[lib]
+name = "mimageviewer_susie_crash_plugin"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+# `rlib` も出すのは、挙動選択の純ロジックを 64bit の `cargo test` で回すため。
+# プラグインとして使うのは `cdylib` の方だけ。
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+] }

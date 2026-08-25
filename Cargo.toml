@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/susie-worker",
+    "crates/susie-crash-plugin",
     "crates/launcher",
     "crates/local-adjust-core",
     "crates/comic-core",

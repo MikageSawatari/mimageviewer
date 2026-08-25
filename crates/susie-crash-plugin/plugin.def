@@ -1,0 +1,8 @@
+; Susie plugins are resolved by undecorated name (GetProcAddress("GetPicture")),
+; but __stdcall on 32-bit MSVC decorates them as _GetPicture@28. Without this
+; file the DLL loads and the worker rejects it as "GetPluginInfo not found".
+LIBRARY
+EXPORTS
+    GetPluginInfo
+    IsSupported
+    GetPicture

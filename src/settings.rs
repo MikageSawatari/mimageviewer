@@ -3147,6 +3147,66 @@ impl StartupFolderMode {
 }
 
 // -----------------------------------------------------------------------
+// StartupWindowState (起動時のウィンドウ状態)
+// -----------------------------------------------------------------------
+
+/// 起動直後にメインウィンドウを通常表示にするか最大化するか。
+///
+/// この選択は「最大化するか」だけを決める。通常ウィンドウの位置・サイズは
+/// どの値でも `window_pos` / `window_size` から復元する。最大化を解いたときに
+/// 戻る先がその矩形なので、両者を 1 つの値に同居させてはいけない (§1.116 / §1.115)。
+#[derive(serde::Serialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupWindowState {
+    /// 前回終了時が最大化だったなら最大化で起動する。Windows の一般的な挙動に合わせた既定。
+    ///
+    /// v3.2.0 から更新した利用者の設定にはこの field 自体が無く、最大化 flag も
+    /// 未記録 (= false) なので、更新直後の初回起動は通常ウィンドウのまま。次に
+    /// 最大化して終了したときから効き始める。
+    #[default]
+    RememberLast,
+    /// 常に通常ウィンドウで起動する。v3.2.0 までの振る舞い。
+    Normal,
+    /// 常に最大化で起動する。
+    Maximized,
+}
+
+impl<'de> serde::Deserialize<'de> for StartupWindowState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "normal" => Self::Normal,
+            "maximized" => Self::Maximized,
+            "remember_last" => Self::RememberLast,
+            _ => Self::default(),
+        })
+    }
+}
+
+impl StartupWindowState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RememberLast => "前回終了時の状態",
+            Self::Normal => "通常ウィンドウ",
+            Self::Maximized => "最大化",
+        }
+    }
+}
+
+/// 起動時に最大化するかを決める。`last_exit_maximized` は前回終了時の
+/// 最大化 flag (`Settings::window_maximized`)。
+pub fn resolve_startup_maximized(state: StartupWindowState, last_exit_maximized: bool) -> bool {
+    match state {
+        StartupWindowState::Normal => false,
+        StartupWindowState::Maximized => true,
+        StartupWindowState::RememberLast => last_exit_maximized,
+    }
+}
+
+// -----------------------------------------------------------------------
 // Settings
 // -----------------------------------------------------------------------
 
@@ -3466,12 +3526,21 @@ pub struct Settings {
     /// キーは `"C:"` のような大文字ドライブ表記。
     #[serde(default = "default_quick_folder_drive_current_dirs")]
     pub quick_folder_drive_current_dirs: [BTreeMap<String, PathBuf>; 2],
-    /// ウィンドウ左上座標 (outer rect)
+    /// 通常ウィンドウの左上座標 (outer rect)。最大化中は更新しないので、
+    /// 最大化を解いたときに戻る矩形として残る。
     #[serde(default)]
     pub window_pos: Option<[f32; 2]>,
-    /// ウィンドウサイズ (outer rect)
+    /// 通常ウィンドウのサイズ (inner rect)。`window_pos` と同じく最大化中は更新しない。
     #[serde(default)]
     pub window_size: Option<[f32; 2]>,
+    /// 前回終了時 (トレイ退避を含む) に最大化していたか。`window_pos` /
+    /// `window_size` とは**別に**持つ: 1 つの矩形へ最大化状態を畳み込むと、
+    /// 復元先が最大化サイズで潰れて戻れなくなる (detached 側の §1.115 と同じ根)。
+    #[serde(default)]
+    pub window_maximized: bool,
+    /// 起動時にメインウィンドウを最大化するか。既定は従来どおり通常ウィンドウ。
+    #[serde(default)]
+    pub startup_window_state: StartupWindowState,
     #[serde(default)]
     pub parallelism: Parallelism,
     /// PDF worker pool のプロセス数。変更は次回起動時に反映される。
@@ -5461,6 +5530,8 @@ impl Default for Settings {
             quick_folder_drive_current_dirs: default_quick_folder_drive_current_dirs(),
             window_pos: None,
             window_size: None,
+            window_maximized: false,
+            startup_window_state: StartupWindowState::default(),
             parallelism: Parallelism::default(),
             pdf_worker_count: default_pdf_worker_count(),
             prefetch_back: default_prefetch_back(),
@@ -7566,6 +7637,9 @@ impl Settings {
             std::mem::take(&mut src.quick_folder_drive_current_dirs);
         self.window_pos = src.window_pos;
         self.window_size = src.window_size;
+        // 最大化 flag は環境設定に出さない実行時状態。`startup_window_state` の方は
+        // 利用者が編集する設定なので、ここで live 値へ巻き戻してはいけない。
+        self.window_maximized = src.window_maximized;
         self.detached_viewer_enabled = src.detached_viewer_enabled;
         self.detached_viewer_window_placement = src.detached_viewer_window_placement;
         // ── お気に入り / スマートフォルダ / タグ (専用ダイアログで編集) ──
@@ -9713,6 +9787,102 @@ mod tests {
     }
 
     #[test]
+    fn startup_maximized_follows_the_chosen_state() {
+        // 「通常」は前回が最大化でも最大化しない。
+        assert!(!resolve_startup_maximized(StartupWindowState::Normal, true));
+        assert!(!resolve_startup_maximized(
+            StartupWindowState::Normal,
+            false
+        ));
+        // 「最大化」は前回の状態に関係なく最大化する。
+        assert!(resolve_startup_maximized(
+            StartupWindowState::Maximized,
+            false
+        ));
+        assert!(resolve_startup_maximized(
+            StartupWindowState::Maximized,
+            true
+        ));
+        // 「前回終了時の状態」だけが保存済み flag を見る。これが既定。
+        assert!(resolve_startup_maximized(
+            StartupWindowState::RememberLast,
+            true
+        ));
+        assert!(!resolve_startup_maximized(
+            StartupWindowState::RememberLast,
+            false
+        ));
+    }
+
+    #[test]
+    fn window_state_survives_a_settings_round_trip() {
+        let mut saved = Settings::default();
+        saved.startup_window_state = StartupWindowState::RememberLast;
+        saved.window_maximized = true;
+        saved.window_pos = Some([120.0, 80.0]);
+        saved.window_size = Some([1600.0, 900.0]);
+
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(
+            restored.startup_window_state,
+            StartupWindowState::RememberLast
+        );
+        assert!(restored.window_maximized);
+        // 最大化 flag は復元矩形を潰さない。最大化を解いたときの戻り先が要るので、
+        // 両者は別のフィールドとして往復する必要がある。
+        assert_eq!(restored.window_pos, Some([120.0, 80.0]));
+        assert_eq!(restored.window_size, Some([1600.0, 900.0]));
+    }
+
+    #[test]
+    fn unknown_startup_window_state_falls_back_to_the_default() {
+        // 新しい選択肢を足した版で書いた設定を古い版が読む経路。既定へ落として
+        // 起動できることを保証する。
+        let loaded: Settings =
+            serde_json::from_str(r#"{"startup_window_state":"tiled_to_the_left"}"#).unwrap();
+        assert_eq!(
+            loaded.startup_window_state,
+            StartupWindowState::RememberLast
+        );
+    }
+
+    #[test]
+    fn updating_from_an_older_version_does_not_change_the_first_start() {
+        // v3.2.0 までの設定にはこの field も最大化 flag も無い。既定が
+        // 「前回終了時の状態」でも、記録が無い以上は通常ウィンドウで起動する。
+        // 更新直後に勝手に最大化しないことを固定する。
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            loaded.startup_window_state,
+            StartupWindowState::RememberLast
+        );
+        assert!(!loaded.window_maximized);
+        assert!(!resolve_startup_maximized(
+            loaded.startup_window_state,
+            loaded.window_maximized
+        ));
+    }
+
+    #[test]
+    fn preferences_ok_keeps_the_edited_startup_window_state() {
+        // 環境設定 OK は編集済みコピーを live 値で上書きするが、対象は実行時状態だけ。
+        // 起動状態は利用者が今そこで選んだ設定なので巻き戻してはいけない。
+        let mut edited = Settings::default();
+        edited.startup_window_state = StartupWindowState::Maximized;
+        edited.window_maximized = false;
+
+        let mut live = Settings::default();
+        live.startup_window_state = StartupWindowState::Normal;
+        live.window_maximized = true;
+
+        edited.overwrite_non_preferences_from(&mut live);
+
+        assert_eq!(edited.startup_window_state, StartupWindowState::Maximized);
+        assert!(edited.window_maximized);
+    }
+
+    #[test]
     fn settings_default_values() {
         let s = Settings::default();
         assert_eq!(s.grid_cols, 4);
@@ -9734,6 +9904,8 @@ mod tests {
         );
         assert!(s.window_pos.is_none());
         assert!(s.window_size.is_none());
+        assert!(!s.window_maximized);
+        assert_eq!(s.startup_window_state, StartupWindowState::RememberLast);
         assert_eq!(s.prefetch_back, 4);
         assert_eq!(s.prefetch_forward, 12);
         assert_eq!(

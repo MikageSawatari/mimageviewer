@@ -19920,6 +19920,95 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    /// フォルダを、その中のアーカイブへ pin した状態を作る。
+    /// 返り値は (フォルダ, 元アーカイブ, 変換キャッシュ ZIP)。
+    fn setup_folder_pinned_to_archive(app: &mut AppTestEnv) -> (PathBuf, PathBuf, PathBuf) {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+
+        let folder = app.tmp.path().join("shelf");
+        std::fs::create_dir_all(&folder).unwrap();
+        let src = folder.join("book.7z");
+        let cached = app.tmp.path().join("book.zip");
+        std::fs::write(&src, b"archive").unwrap();
+        std::fs::write(&cached, b"PK\x03\x04").unwrap();
+        let src_meta = std::fs::metadata(&src).unwrap();
+        app.archive_cache_db
+            .as_ref()
+            .unwrap()
+            .record(
+                &src,
+                crate::ui_helpers::mtime_secs(&src_meta),
+                src_meta.len() as i64,
+                crate::archive_converter::ArchiveFormat::SevenZ,
+                &cached,
+                std::fs::metadata(&cached).unwrap().len() as i64,
+                1,
+                false,
+            )
+            .unwrap();
+        app.folder_thumb_pin_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &folder,
+                &FolderPinSource::File {
+                    rel: "book.7z".to_string(),
+                    kind: FileKind::ConvertibleArchive,
+                },
+            )
+            .unwrap();
+        install_folder_item_for_archive_pin_test(app, &folder);
+        (folder, src, cached)
+    }
+
+    /// 中身がアーカイブだけのフォルダは、自動選定が代表画像を選べずタイルが `Failed`
+    /// になる。以前の pin-root 収集は `Pending | Evicted` のタイルしか見なかったため、
+    /// そこへ落ちた時点で pin が二度と解決されず、「ピンが効かない → 自動選定も失敗 →
+    /// `Failed` → 発見されない」の自己強化ループになっていた (§1.121)。
+    ///
+    /// `Loaded` も同じ終端状態で、フォルダに画像が混ざっていて自動選定が成功した場合に
+    /// 同じ穴へ落ちる。ここでは作りやすい `Failed` で代表させる。
+    #[test]
+    fn converted_archive_pin_root_is_found_when_the_folder_tile_already_failed() {
+        let mut app = setup_app();
+        let (_folder, src, cached) = setup_folder_pinned_to_archive(&mut app);
+
+        app.thumbnails[0] = ThumbnailState::Failed;
+
+        start_archive_decisions_for_test(&mut app, 0..1);
+        poll_archive_decisions_for_test(&mut app);
+
+        assert_eq!(
+            app.converted_archive_cache_paths
+                .get(&crate::path_key::normalize_keep_drive(&src))
+                .and_then(crate::app::ConvertedArchiveSourceState::load_path),
+            Some(cached.as_path()),
+            "a failed folder tile must not hide its pinned archive from discovery"
+        );
+    }
+
+    /// 進行中の要求があるタイルも同じ理由で外していた。こちらは一時的な状態なので
+    /// 次のフレームで拾えることもあるが、拾えるかどうかをフレームの巡り合わせに
+    /// 委ねない。
+    #[test]
+    fn converted_archive_pin_root_is_found_while_the_folder_tile_is_requested() {
+        let mut app = setup_app();
+        let (_folder, src, cached) = setup_folder_pinned_to_archive(&mut app);
+
+        app.requested.insert(0, true);
+
+        start_archive_decisions_for_test(&mut app, 0..1);
+        poll_archive_decisions_for_test(&mut app);
+
+        assert_eq!(
+            app.converted_archive_cache_paths
+                .get(&crate::path_key::normalize_keep_drive(&src))
+                .and_then(crate::app::ConvertedArchiveSourceState::load_path),
+            Some(cached.as_path()),
+            "an in-flight thumbnail request must not hide its pinned archive from discovery"
+        );
+    }
+
     #[test]
     fn archive_cache_arrival_reloads_the_dependent_folder_pin_only_once() {
         use crate::folder_thumb_pins::{FileKind, FolderPinSource};
@@ -58717,4 +58806,63 @@ fn the_overflow_button_closes_the_panel_it_opened() {
         FsOverflowPanelState::Closed,
         "a second press must close it"
     );
+}
+
+/// 起動時のウィンドウ状態 (§1.116)。最大化で起動したときに、初回フレームの
+/// mixed-DPI 補正が最大化を打ち消さないことを固定する。
+#[test]
+fn the_startup_size_correction_waits_while_the_window_is_maximized() {
+    use crate::app::deferred_initial_size_ready;
+
+    // 通常起動は従来どおり初回フレームで補正する。egui がまだ viewport を報告して
+    // いなくても待たない (待つと補正が永久に届かない環境がある)。
+    assert!(deferred_initial_size_ready(false, None));
+    assert!(deferred_initial_size_ready(false, Some(false)));
+
+    // 最大化起動では、報告が無い間は保留する。None を「最大化ではない」と読むと
+    // 初回フレームで InnerSize を送ってしまい、最大化が解けてしまう。
+    assert!(!deferred_initial_size_ready(true, None));
+    assert!(!deferred_initial_size_ready(true, Some(true)));
+
+    // 最大化が解けたと明示的に報告されたフレームで、はじめて補正を流す。
+    assert!(deferred_initial_size_ready(true, Some(false)));
+}
+
+/// 最小化中の maximized は当てにならないので、最後に見えていた状態を保つ。
+#[test]
+fn minimizing_does_not_erase_the_remembered_maximized_state() {
+    use crate::app::tracked_window_maximized;
+
+    // 見えている間はそのまま追従する。
+    assert!(tracked_window_maximized(false, false, Some(true)));
+    assert!(!tracked_window_maximized(true, false, Some(false)));
+
+    // 最小化中は、報告値がどちらでも直前の状態を保つ。最大化したまま最小化して
+    // 終了しても「最大化で終了した」と記録される。
+    assert!(tracked_window_maximized(true, true, Some(false)));
+    assert!(!tracked_window_maximized(false, true, Some(true)));
+
+    // 報告が無いのは「最大化ではない」証拠ではない。ここを false と読むと、
+    // 報告が来ない環境で「前回終了時の状態」が毎回 flag を落として効かなくなる。
+    assert!(tracked_window_maximized(true, false, None));
+    assert!(!tracked_window_maximized(false, false, None));
+}
+
+/// 最大化 flag と復元矩形は別々に保存される。1 つに畳み込むと、最大化して終了した
+/// 次の起動で「解いたときに戻る先」を失う (detached 側の §1.115 と同じ根)。
+#[test]
+fn the_exit_maximized_flag_is_saved_without_touching_the_restore_rect() {
+    let mut app = phase_c_support::setup_app();
+    // 最大化中は矩形の追跡が止まるので、settings 側には最大化する前の通常矩形が残る。
+    app.settings.window_pos = Some([100.0, 60.0]);
+    app.settings.window_size = Some([1440.0, 900.0]);
+    app.last_outer_rect = None;
+    app.last_inner_size = None;
+    app.last_window_maximized = true;
+
+    app.persist_window_state_and_flush();
+
+    assert!(app.settings.window_maximized);
+    assert_eq!(app.settings.window_pos, Some([100.0, 60.0]));
+    assert_eq!(app.settings.window_size, Some([1440.0, 900.0]));
 }

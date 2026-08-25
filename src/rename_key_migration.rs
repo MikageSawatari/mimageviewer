@@ -33,6 +33,7 @@
 //! - **エクスプローラー等アプリ外でのリネーム**: このモジュールはアプリ内リネームの
 //!   成功ハンドラからしか呼ばれない (外部リネームの検知は将来課題)。
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -593,6 +594,95 @@ pub(crate) fn copy_stores_at(
         );
     }
     report
+}
+
+/// 復元して実際に何かが起きる key だけを返す。
+///
+/// 復元が運ぶのは `copy_stores_at` が `STORES` の unique 行を写すことが全てなので、
+/// 同じ表を同じ正規化で引けば「復元して何か起きるか」と同じ問いになる。行が 1 つも
+/// 無い key は、復元しても no-op にしかならない。
+///
+/// **読めなかった store がある key は「行がある」側へ倒す。** 台帳の復元元を黙って
+/// 捨てるより、余計な確認が 1 回出る方がはるかに軽い。
+///
+/// `file_keys` は台帳の `file_key` (正規化済みの path 文字列)。戻り値はその部分集合。
+pub(crate) fn ledger_keys_with_restorable_rows_at(
+    data_dir: &Path,
+    file_keys: &[String],
+) -> BTreeSet<String> {
+    let mut backed = BTreeSet::new();
+    if file_keys.is_empty() {
+        return backed;
+    }
+    for descriptor in STORES
+        .iter()
+        .copied()
+        .filter(|store| store.unique && store.file != crate::content_identity::LEDGER_DB_FILE)
+    {
+        let pending = file_keys
+            .iter()
+            .filter(|file_key| !backed.contains(*file_key))
+            .cloned()
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            break;
+        }
+        let db_path = data_dir.join(descriptor.file);
+        if !db_path.exists() {
+            continue;
+        }
+        match store_keys_with_rows(&db_path, descriptor, &pending) {
+            Ok(found) => backed.extend(found),
+            Err(error) => {
+                // 読めない store は「この key に行が無い」と言い切れない。全部残す。
+                crate::logger::log(format!(
+                    "content_identity: restorable probe unusable for {}: {error}",
+                    descriptor.file
+                ));
+                backed.extend(pending);
+            }
+        }
+    }
+    backed
+}
+
+/// 1 つの store に、指定 key 本体または `key::` 配下 (ZIP/PDF ページ) の行があるか。
+fn store_keys_with_rows(
+    db_path: &Path,
+    descriptor: StoreDescriptor,
+    file_keys: &[String],
+) -> Result<Vec<String>, String> {
+    let mut conn = rusqlite::Connection::open(db_path).map_err(|error| error.to_string())?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|error| error.to_string())?;
+    let conn = conn.transaction().map_err(|error| error.to_string())?;
+    let columns = table_columns(&conn, descriptor.table).map_err(|error| error.to_string())?;
+    if !columns.iter().any(|column| column == descriptor.column) {
+        return Err(rusqlite::Error::InvalidColumnName(descriptor.column.to_string()).to_string());
+    }
+    // 仮想ページのキーは `<container>::<entry>`。`LIKE` はパスに現れる `_` と `%` を
+    // ワイルドカードとして拾ってしまうので、半開区間で引く (`::` の次は `:;`)。
+    let sql = format!(
+        "SELECT 1 FROM {table} WHERE {column} = ?1 OR ({column} >= ?2 AND {column} < ?3) LIMIT 1",
+        table = descriptor.table,
+        column = descriptor.column,
+    );
+    let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+    let mut found = Vec::new();
+    for file_key in file_keys {
+        let store_key = descriptor.normalize_path(Path::new(file_key));
+        let exists = statement
+            .exists(rusqlite::params![
+                store_key,
+                format!("{store_key}::"),
+                format!("{store_key}:;"),
+            ])
+            .map_err(|error| error.to_string())?;
+        if exists {
+            found.push(file_key.clone());
+        }
+    }
+    Ok(found)
 }
 
 /// リネーム移行の本体 (worker スレッドで呼ぶ)。`old_path` は改名前 (もう存在しない)、
@@ -2664,6 +2754,79 @@ mod tests {
             std::fs::read(crate::xmp_writer::sidecar_path_for(&new2)).unwrap(),
             b"<new/>",
             "新側の既存サイドカーを上書きしない"
+        );
+    }
+
+    /// 復元元の実データ探索。復元が運ぶ `STORES` の行だけを数える。
+    #[test]
+    fn the_restorable_probe_counts_only_stores_the_restore_would_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path();
+        let edited = "c:/pictures/edited.png".to_string();
+        let untouched = "c:/pictures/untouched.png".to_string();
+        let keys = vec![edited.clone(), untouched.clone()];
+
+        // store が 1 つも無ければ、運ぶ行も無い。
+        assert!(ledger_keys_with_restorable_rows_at(data_dir, &keys).is_empty());
+
+        let rating = crate::rating_db::RatingDb::open_at(data_dir.join("rating.db")).unwrap();
+        rating.set(&edited, 4).unwrap();
+        drop(rating);
+
+        let backed = ledger_keys_with_restorable_rows_at(data_dir, &keys);
+        assert!(backed.contains(&edited));
+        assert!(
+            !backed.contains(&untouched),
+            "行の無い key を巻き込まない: {backed:?}"
+        );
+    }
+
+    /// ZIP / PDF のページは `<container>::<entry>` で保存される。コンテナ本体に行が
+    /// 無くても、中のページに編集があれば復元元として成立する。
+    #[test]
+    fn the_restorable_probe_sees_edits_stored_under_virtual_page_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path();
+        let container = "c:/books/scan.zip".to_string();
+        let rating = crate::rating_db::RatingDb::open_at(data_dir.join("rating.db")).unwrap();
+        rating.set(&format!("{container}::page03.jpg"), 5).unwrap();
+        drop(rating);
+
+        let backed = ledger_keys_with_restorable_rows_at(data_dir, &[container.clone()]);
+        assert!(backed.contains(&container));
+    }
+
+    /// `_` と `%` はパスに普通に現れる。`LIKE` で引くと別ファイルの行を自分のものと
+    /// 数えてしまい、消したはずの復元元が生き残る。
+    #[test]
+    fn the_restorable_probe_does_not_treat_path_characters_as_wildcards() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path();
+        let with_underscore = "c:/pictures/a_b.png".to_string();
+        let neighbour = "c:/pictures/axb.png".to_string();
+        let rating = crate::rating_db::RatingDb::open_at(data_dir.join("rating.db")).unwrap();
+        rating.set(&neighbour, 2).unwrap();
+        drop(rating);
+
+        let backed = ledger_keys_with_restorable_rows_at(data_dir, &[with_underscore.clone()]);
+        assert!(
+            backed.is_empty(),
+            "`_` をワイルドカードとして扱っている: {backed:?}"
+        );
+    }
+
+    /// 読めない store は「行が無い」の証拠にならない。復元元は残す。
+    #[test]
+    fn an_unreadable_store_keeps_the_origin_instead_of_dropping_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path();
+        let key = "c:/pictures/edited.png".to_string();
+        std::fs::write(data_dir.join("rating.db"), b"this is not a database").unwrap();
+
+        let backed = ledger_keys_with_restorable_rows_at(data_dir, &[key.clone()]);
+        assert!(
+            backed.contains(&key),
+            "読めない store があるときは安全側に倒す"
         );
     }
 }

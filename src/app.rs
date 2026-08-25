@@ -9370,6 +9370,10 @@ pub struct App {
     /// OS DPI only の論理 geometry に戻す。inner を優先することで、outer を inner として
     /// 再適用するタイトルバー分のサイズ縮小を防ぐ。
     pub(crate) last_inner_size: Option<[f32; 2]>,
+    /// ウィンドウ状態保存用：最後に確認した最大化 flag（最小化中は更新しない）。
+    /// `last_outer_rect` / `last_inner_size` とは独立に持つ。同じ値へ畳み込むと、
+    /// 最大化して終了した次の起動で「戻る先」を失う。
+    pub(crate) last_window_maximized: bool,
     /// 直近に `ViewportCommand::Title` で送信したタイトル文字列のキャッシュ。
     /// 毎フレーム無条件に send_viewport_cmd(Title(...)) すると、egui 内部の
     /// `request_repaint_of` が毎回発火して App::update が 60fps で回り続け、
@@ -9381,7 +9385,16 @@ pub struct App {
     /// 初回フレームで適用する inner_size（egui#4918 / winit#923 対策）。
     /// ViewportBuilder 段階では マルチモニタ DPI 混在時に サイズを誤って設定する
     /// ケースがあるため、DPI 確定後の初回フレームで再適用する。
+    ///
+    /// 最大化起動のときは**最大化が解けるまで保留する**。最大化中に InnerSize を
+    /// 送ると通常サイズへ戻ってしまい、利用者が選んだ起動状態を初回フレームで
+    /// 打ち消す。保留した値は最大化を解いた最初のフレームで 1 回だけ適用され、
+    /// mixed-DPI で壊れた復元矩形をそこで矯正する (§1.116)。
     pub(crate) pending_initial_size: Option<[f32; 2]>,
+    /// ウィンドウを最大化状態で作ったか (`ViewportBuilder::with_maximized`)。
+    /// `pending_initial_size` を保留すべきかの判断にだけ使う起動時の事実で、
+    /// 現在最大化されているかを表す `last_window_maximized` とは別物。
+    pub(crate) created_maximized: bool,
 
     /// キャッシュ生成進捗：新規デコードが必要だった画像の総数
     pub(crate) cache_gen_total: usize,
@@ -11815,6 +11828,9 @@ pub struct App {
     /// 引いたらここへ転写する。バナー UI で「再起動」/「閉じる」が押されるまで
     /// 残る (時間で消えない、ユーザーが認識する必要があるため)。
     pub(crate) trt_worker_notice: Option<crate::ai::runtime::WorkerNotice>,
+    /// Susie の読み込み枠が全部尽きたことを 1 回だけ知らせる notice。
+    /// 発行条件は `susie_loader::should_notify_workers_gone` が単独で所有する。
+    pub(crate) susie_worker_notice: Option<crate::susie_loader::SusieWorkerNotice>,
     /// セッション中に worker 死亡 → 自動再起動を試みた回数。
     /// `MAX_TRT_AUTO_RESTART_ATTEMPTS` 回まで silent に再 spawn して、それを超えたら
     /// バナーを出してユーザー操作を待つ (= TRT pack 自体の問題等で永久ループしない
@@ -13129,9 +13145,11 @@ impl App {
             pending_grid_scroll: None,
             last_outer_rect: None,
             last_inner_size: None,
+            last_window_maximized: false,
             last_window_title: None,
             last_pixels_per_point: 1.0,
             pending_initial_size: None,
+            created_maximized: false,
             cache_gen_total: 0,
             cache_gen_done: Arc::new(AtomicUsize::new(0)),
             image_metas: Vec::new(),
@@ -13996,6 +14014,7 @@ impl App {
             source_swap_keep_audio_mode: false,
             pdf_worker_notice: None,
             trt_worker_notice: None,
+            susie_worker_notice: None,
             trt_auto_restart_attempts: 0,
             trt_spawn_restart_attempts: 0,
             trt_restart_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -24088,13 +24107,17 @@ impl App {
         let mut pin_archive_dependencies: std::collections::HashMap<String, Vec<usize>> =
             std::collections::HashMap::new();
         for idx in 0..self.items.len() {
-            if !candidate_indices.contains(&idx)
-                || self.requested.contains_key(&idx)
-                || !matches!(
-                    self.thumbnails.get(idx),
-                    Some(ThumbnailState::Pending | ThumbnailState::Evicted)
-                )
-            {
+            // pin-root の発見は、そのタイルが今どう描かれているかとは無関係な事実に
+            // 基づく。以前はサムネイルが `Pending | Evicted` で未 requested のものだけを
+            // 見ていたが、`Loaded` と `Failed` は終端状態なので、いったんそこへ落ちた
+            // コンテナの pin は二度と解決されなかった。中身がアーカイブだけのフォルダは
+            // 自動選定が代表画像を選べず必ず `Failed` になるため、代表サムネの指定が
+            // 永久に反映されない自己強化ループになる (§1.121)。
+            //
+            // コストを抑える役目は、可視範囲の絞り込み (`candidate_indices`) と、
+            // root ごとに解決結果を覚える `converted_archive_pin_root_states` が持つ。
+            // 解決済みの root はここで DB も cascade も引き直さない。
+            if !candidate_indices.contains(&idx) {
                 continue;
             }
             let Some(target) = self
@@ -35948,18 +35971,50 @@ impl App {
         }
     }
 
+    /// 起動直後の InnerSize 補正 (egui#4918 / winit#923) を適用する。
+    ///
+    /// ViewportBuilder 段階ではマルチモニタ DPI 混在時に論理/物理ピクセルを取り違えて
+    /// 異常サイズのウィンドウが作られるので、DPI が確定してから意図したサイズを
+    /// 再適用して矯正する。通常起動なら初回フレームで終わる。
+    ///
+    /// 最大化起動のときは保留する。最大化中に InnerSize を送ると通常サイズへ戻り、
+    /// 利用者が選んだ起動状態を打ち消してしまうため。保留した値は最大化が解けた
+    /// 最初のフレームで 1 回だけ適用され、そこで復元矩形を矯正する。最大化のまま
+    /// 終了した場合は使われずに捨てられる (矯正すべき通常矩形が画面に無いので実害なし)。
+    fn apply_deferred_initial_size(&mut self, ctx: &egui::Context) {
+        let Some([w, h]) = self.pending_initial_size else {
+            return;
+        };
+        let (ppp, reported_maximized) = ctx.input(|i| (i.pixels_per_point, i.viewport().maximized));
+        if !deferred_initial_size_ready(self.created_maximized, reported_maximized) {
+            return;
+        }
+        self.pending_initial_size = None;
+        let viewport_size = egui::vec2(
+            crate::settings::window_geometry_to_viewport_points(w, self.settings.ui_scale_factor),
+            crate::settings::window_geometry_to_viewport_points(h, self.settings.ui_scale_factor),
+        );
+        crate::logger::log(format!(
+            "[viewport] deferred InnerSize apply: {w:.0}x{h:.0} ppp={ppp:.2} created_maximized={}",
+            self.created_maximized
+        ));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(viewport_size));
+    }
+
     /// ウィンドウ位置を記録する（最小化・最大化中は更新しない）。
     fn track_window_rect(&mut self, ctx: &egui::Context) {
-        let (outer_rect, inner_rect, pixels_per_point, minimized, maximized) = ctx.input(|i| {
-            let vp = i.viewport();
-            (
-                vp.outer_rect,
-                vp.inner_rect,
-                i.pixels_per_point,
-                vp.minimized.unwrap_or(false),
-                vp.maximized.unwrap_or(false),
-            )
-        });
+        let (outer_rect, inner_rect, pixels_per_point, minimized, reported_maximized) =
+            ctx.input(|i| {
+                let vp = i.viewport();
+                (
+                    vp.outer_rect,
+                    vp.inner_rect,
+                    i.pixels_per_point,
+                    vp.minimized.unwrap_or(false),
+                    vp.maximized,
+                )
+            });
+        let maximized = reported_maximized.unwrap_or(false);
 
         if outer_rect.is_none() && self.last_outer_rect.is_none() {
             crate::logger::log(format!(
@@ -35976,6 +36031,9 @@ impl App {
 
         let best_rect = outer_rect.or(inner_rect);
         self.last_pixels_per_point = pixels_per_point;
+
+        self.last_window_maximized =
+            tracked_window_maximized(self.last_window_maximized, minimized, reported_maximized);
 
         if !minimized && !maximized {
             if let Some(rect) = best_rect {
@@ -53136,6 +53194,8 @@ impl App {
     ///   (不明なら前回保存値を維持。outer に fallback すると titlebar 分だけ縮小する
     ///    問題が再発するので fallback しない)。
     /// - 位置は outer_rect から取る (`with_position` は outer 座標を受け取る)。
+    /// - 最大化 flag は矩形とは別のフィールドへ書く。矩形側は最大化中に更新されないので、
+    ///   「最大化で終了したが、解いたら元のサイズに戻る」を両方保てる。
     pub(crate) fn persist_window_state_and_flush(&mut self) {
         // スマートフォルダ管理画面は TextEdit 中の値をローカル draft に保持する。
         // 終了 / トレイ退避はダイアログ描画より先にこの経路へ来るため、Settings.save
@@ -53195,6 +53255,7 @@ impl App {
                 ));
             }
         }
+        self.settings.window_maximized = self.last_window_maximized;
         self.settings.save();
         self.flush_all_sidecars();
     }
@@ -65644,34 +65705,14 @@ impl eframe::App for App {
 
             // AI ランタイムを初期化
             self.ensure_ai_runtime();
-
-            // ViewportBuilder 段階では マルチモニタ DPI 混在時に
-            // 論理/物理ピクセルの取り違えで異常サイズのウィンドウが
-            // 生成されるケースがある (egui#4918 / winit#923)。
-            // DPI が確定した初回フレームで意図したサイズを再適用して矯正する。
-            if let Some([w, h]) = self.pending_initial_size.take() {
-                let ppp = ctx.input(|i| i.pixels_per_point);
-                let viewport_size = egui::vec2(
-                    crate::settings::window_geometry_to_viewport_points(
-                        w,
-                        self.settings.ui_scale_factor,
-                    ),
-                    crate::settings::window_geometry_to_viewport_points(
-                        h,
-                        self.settings.ui_scale_factor,
-                    ),
-                );
-                crate::logger::log(format!(
-                    "[viewport] deferred InnerSize apply: {w:.0}x{h:.0} ppp={ppp:.2}"
-                ));
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(viewport_size));
-            }
         }
 
         #[cfg(windows)]
         self.poll_activation_open_paths(ctx);
 
         self.poll_startup_open_path_resolve(ctx);
+
+        self.apply_deferred_initial_size(ctx);
 
         self.track_window_rect(ctx);
 
@@ -66381,6 +66422,8 @@ impl eframe::App for App {
         // PDF pool の遅延初期化失敗 notice。poll は pool 自体を初期化しない。
         self.poll_pdf_worker_notice();
         self.show_pdf_worker_notice_dialog(ctx);
+        self.poll_susie_worker_notice();
+        self.show_susie_worker_notice_dialog(ctx);
         // Phase 3 Step 5: TRT ワーカー関連の通知バナー (起動失敗 / 推論中の死亡)。
         // poll で AiRuntime の通知キューを 1 回引き、show でバナー描画。
         self.poll_trt_worker_notice();
@@ -68882,6 +68925,43 @@ fn apply_folder_thumb_pin(
         pinned_only: None,
         force_cache: false,
     }
+}
+
+/// 保存する最大化 flag を決める。
+///
+/// 最小化中に報告される maximized は当てにならない (Windows は WS_MINIMIZE を被せる)
+/// ので、最小化されている間は最後に見えていた状態をそのまま保つ。最小化したまま
+/// 終了しても、その前に最大化だったかどうかが残る。「最小化で終了したら次回も最小化」
+/// にはしない、という §1.116 の条件もこれで満たす。
+///
+/// 報告が無い (`None`) のは「最大化ではない」という証拠ではないので、これも直前の
+/// 状態を保つ。ここを `unwrap_or(false)` にすると、報告が来ない環境では最大化して
+/// 終了しても毎回 flag が落ち、「前回終了時の状態」が永久に効かなくなる。
+pub(crate) fn tracked_window_maximized(
+    previous: bool,
+    minimized: bool,
+    reported_maximized: Option<bool>,
+) -> bool {
+    if minimized {
+        previous
+    } else {
+        reported_maximized.unwrap_or(previous)
+    }
+}
+
+/// 起動直後の InnerSize 補正をこのフレームで送ってよいか。
+///
+/// 通常起動 (`created_maximized == false`) なら即座に送ってよい。最大化で起動した
+/// ときは、egui が「最大化ではない」と**明示的に**報告するまで保留する。報告がまだ
+/// 無い (`None`) 段階を「最大化ではない」と読むと、初回フレームで最大化を打ち消す。
+pub(crate) fn deferred_initial_size_ready(
+    created_maximized: bool,
+    reported_maximized: Option<bool>,
+) -> bool {
+    if !created_maximized {
+        return true;
+    }
+    reported_maximized == Some(false)
 }
 
 /// DynamicImage を egui::ColorImage に変換する (リサイズなし)。

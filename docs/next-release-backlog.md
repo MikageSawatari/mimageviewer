@@ -647,6 +647,51 @@
   既存編集の遡りは一括スキャンせず訪問時に少しずつ。
 - 規模 / 優先度: Medium / P2 (データ損失ではないが、編集した資産が黙って失われる体験は重い)。
 
+#### 追加項目: 取り消した編集が復元元として残り続ける ✅ 修正済み (2026-08-25)
+
+- 出典: Susie クラッシュ検証中に、編集していないはずのテストファイルで復元ダイアログが出た。
+- **索引側は正しい。** `ContentIdentityIndex::upsert` は `has_restorable_content == false` の
+  エントリを索引に入れない ([content_identity.rs:221](../src/content_identity.rs:221))。
+  「中身が同じだけ」で候補になることは設計上ない。
+- **記録側が実データと同期していない。** 台帳では 5 ファイルが
+  `has_restorable_content = 1` かつ `last_edit_at` が全て同一だったが、**編集データは
+  どのデータベースにも無かった** (`content_identity.db` 以外の全 DB を走査して 0 件)。
+- **経路**: 利用者が `Ctrl+Alt+1` (`FsAdjustSlotDefault1` = 補正プリセットスロットを標準設定へ
+  読み込む) を実行 → 編集として記録 → 対象が 8x8 単色画像で結果が標準値と変わらず、
+  保存時に破棄 (`edit_preview_close: outcome=delete_no_edits`) → **台帳の記録だけが残る**。
+- **構造**: `has_restorable_content` は 0 → 1 の単調遷移として実装されている
+  ([content_identity.rs:219](../src/content_identity.rs:219))。遅れて届いた detection cache が
+  先の復元元更新を消さないための設計だが、その結果**「編集を入れてすぐ取り消した」ファイルが
+  永久に復元元として残る**。テストデータが特殊だったから目立っただけで、通常の画像でも
+  「補正をかけて元に戻した」後に同内容のコピーを開けば同じことが起きる。
+- **修正 (2026-08-25)**: 記録側で flag を下げる経路は作らなかった。編集を取り消す経路は
+  `delete_mask_with_sidecar` / `remove_view_trim_page_override` / `remove_folder_thumb_pin` など
+  複数あり、そのどれもが「編集した」として同じ record を通る。全部を数え上げて `Absent` を
+  渡す形にすると、1 つ漏らしただけで**本物の復元元を消す**側に倒れる。
+  - 代わりに**読む側で確かめる**。復元が運ぶのは `copy_stores_at` が `STORES` の unique 行を
+    写すことが全てなので、そこに 1 行も無い復元元は選ばれても no-op にしかならない。
+    **候補から外しても失われるものは無い**、が根拠。
+    `rename_key_migration::ledger_keys_with_restorable_rows_at` が同じ表・同じ正規化で引く。
+  - 台帳自身 (`content_identity.db` / `edit_origin`) は `STORES` に載っているが**除外する**
+    (`content_identity::LEDGER_DB_FILE`)。台帳の行はこの問いの対象であって答えではない。
+    最初これを数えてしまい、常に「行がある」になって probe が効かなかった。
+  - 仮想ページの `<container>::<entry>` も見る。`LIKE` はパスに普通に現れる `_` / `%` を
+    ワイルドカードとして拾うので、半開区間 (`::` 〜 `:;`) で引く。
+  - **読めない store があった key は「行がある」側へ倒す**。余計な確認が 1 回出る方が、
+    復元元を黙って消すよりはるかに軽い。
+  - ついでに flag も下ろす (`clear_restorable_if_unchanged`)。単調遷移の例外はここだけで、
+    根拠は「遅れて届いた 0」ではなく「実データがもう無い」。probe 中に UI スレッドが
+    新しい編集を記録していたら `last_edit_at` の一致条件で弾かれる (compare-and-swap)。
+    既に台帳へ残ってしまった stale 行も、次に該当コピーを開いた時点で自動的に消える。
+  - probe は候補が出たときだけ走り (= full hash 一致が必要なので稀)、背景 I/O の枠内で行う。
+- **既存テストの fixture を直した**: `folder_backfill_then_copy_...` と
+  `book_byte_copy_is_declined_...` は、実データを 1 行も持たないファイルを backfill して
+  候補を期待していた。本番の backfill は編集済みファイルにしか走らないので、fixture 側に
+  実際の ★ 行を置いて production と同じ形にした (`rated-only.jpg` という名前が既に
+  そう主張していた)。
+- 再現データ: `C:\tmp\miv-susie-crash-test` (中身が同一の `MIVOK` ファイル 5 個)。
+- 規模 / 優先度: 小〜中 / P3 (実害は余計な確認ダイアログ。データは失われない)。
+
 ### 1.99 複数ウィンドウモードで RAR を開くとメイングリッドまで書庫一覧へ切り替わる — 専用スレ >>270 ✅ 実装済み (2026-08-22)
 
 > 実装は detached-rework の `21c3dc0d` / `d7e139d0` に入っており、2026-08-22 の master マージで
@@ -1180,7 +1225,9 @@ passive detached は通常どおり release で窓を activate するが、選�
 
 - 出典: 2026-08-23 (v3.2.0 公開後)。`g:\home\comfyui\202608-29_焼き肉レストラン` を開くと、
   フルスクリーンと一覧の切り替えが激しくちらつく。**ポータブル版では同じ操作で起きない。**
-- **ポータブルで起きない理由は build flavor ではなく設定**。ポータブルは既定設定なので
+  これは初回比較時の観測で、その後タイトルバーから detached 窓を最大化するとポータブル版でも再現した
+  (下記「最大化後の追試」で訂正)。
+- **初回推定 (最大化後の追試で訂正)**: ポータブルで起きない理由は build flavor ではなく設定。ポータブルは既定設定なので
   フルスクリーンが別ウィンドウにならず、下の `detached_viewer_cleanup` 経路自体を通らない。
   `portable` feature が変えるのは native 依存の解決先と data_dir だけで、この経路に分岐は無い。
 - **ログで確認できた事実** (`mimageviewer.log`、1 セッション 14 open / 10 cleanup):
@@ -1220,7 +1267,8 @@ passive detached は通常どおり release で窓を activate するが、選�
      事実 3 と 4 から「discard 窓中に同じキーが複数回配送され、main 側が Enter を
      もう一度 open として解釈している」が第一候補だが、**未確定**。
   3. 1 と 2 は独立に進められる。1 だけでも破棄フレームが 5 → 1 になり、ちらつきの大半は消える。
-- **再現条件は「設定」ではなく「実行時の状態」** (2026-08-23 追記、利用者の settings.db を読んで確認):
+- **初回推定 (最大化後の追試で訂正): 再現条件は「設定」ではなく「実行時の状態」**
+  (2026-08-23 追記、利用者の settings.db を読んで確認):
   報告者の永続設定は `detached_viewer_enabled=false` / `detached_viewer_open_images_in_window=false` /
   `fullfeature_media_window=true` / `video_in_window_mode=true`。**静止画を別ウィンドウで開く設定は
   どれも OFF** なのに、ログでは静止画 open のたびに `presentation=Some(DetachedWindow)` になっている。
@@ -1233,10 +1281,61 @@ passive detached は通常どおり release で窓を activate するが、選�
   利用者がポータブルで同手順を試すと、閉じた後の再オープンで detached が維持されず
   `non_detached_viewer_presentation()` へ落ちた (= `video_in_window_mode=true` なので MainWindow)。
   **同じ操作で detached セッションの寿命が 2 環境で違う**こと自体が、この不具合と同じ所有権の問題。
-- **次の観測**: `MIV_DETACHED_WINDOW_DEBUG=1` で起動すると `[ui-fonts][diag]` /
+- **追加観測の指定 (実施済み)**: `MIV_DETACHED_WINDOW_DEBUG=1` で起動すると `[ui-fonts][diag]` /
   `[detached-window-debug]` が `presentation` / `session` / `active_context` / `passive_windows` /
   `fullscreen_idx` を毎回出す ([app.rs:38773](../src/app.rs:38773))。**どの分岐で DetachedWindow に
   なっているかはこれで確定できる。** 再オープンの契機と併せて 1 回の再現で両方取れる。
+- **最大化後の追試と訂正 (2026-08-23、Codex、ポータブル v3.2.0、
+  `MIV_DETACHED_WINDOW_DEBUG=1`)**:
+  1. **再現を可視化する条件はタイトルバーの最大化状態**。最初の通常サイズ open は
+     `rect=(110,110 1462x1136)` / `window_id=20` / **16.1ms**。その窓をタイトルバーで最大化して
+     close すると、settings.db は
+     `detached_viewer_window_placement.maximized=true` を保存し、次の open は
+     `rect=(-11,-11 3862x2110)` / `window_id=21` / **157.7ms**、その次も別 HWND の
+     `window_id=22` / **147.6ms** になった。通常サイズの約 10 倍を UI thread の
+     `pre_grid` で費やしている。builder が保存 placement の `maximized` を新 viewport へ適用する
+     ([ui_fullscreen.rs:17331](../src/ui_fullscreen.rs:17331)) ためで、portable feature や F11 の
+     borderless fullscreen は必要条件ではない。
+  2. **1 close ごとに HWND / viewport identity を捨て、次の open で作り直している。** ログは毎回
+     `cleanup_visible_false ... recreate=true` の後に host を clear し、generation を進める
+     ([ui_fullscreen.rs:13083](../src/ui_fullscreen.rs:13083),
+     [ui_fullscreen.rs:13111](../src/ui_fullscreen.rs:13111))。そのため最大化した新しい全面 HWND の
+     生成・surface 初期化が、一覧との切替時にそのまま見える。
+  3. close 後は既報どおり **5 回の font-atlas resync discard** が必ず走った。今回の 3 回は
+     157〜161 = 229ms、162〜166 = 240ms、167〜171 = 231ms。つまり最大化 host の
+     148〜158ms の再生成に加え、一覧側も約 0.23 秒を固定回数の race 吸収に使っている。
+     **画像 decode は 10〜11msで完了しており主因ではない。**
+  4. 上記「内部イベントによる自動再オープン」「同一 Enter の 4 重配送」は今回のログで訂正する。
+     open 時の `input_seq` は 59 → 61 → 63。viewer の Enter close が 1 回 increment
+     ([ui_fullscreen.rs:14144](../src/ui_fullscreen.rs:14144)) し、一覧の Enter open がさらに 1 回
+     increment してから `open_fullscreen` を呼ぶ
+     ([app.rs:35015](../src/app.rs:35015)) 契約と一致する。`[fs-key]` は fullscreen context の
+     生存中しか一覧側 Enter を記録しないため、「キー行が無い」ことは内部 open の証拠にならない。
+     4 個並んだのは `Enter:up` のみで、close/open を発火する `down` の重複は無かった。
+- **確定した原因**: 最大化そのものは増幅条件で、根は次の 2 つの時間窓 / lifecycle 不整合。
+  1. 明示 close が linked detached host を terminal teardown し、次の明示 open が保存済み
+     `maximized=true` の全面 HWND / surface を同期的に新規作成する。
+  2. teardown 後の main surface 復帰を観測せず、固定 5 フレームの discard で font atlas の
+     full upload を再送する。結果として、利用者が Enter で viewer と一覧を往復するたび、
+     「全面 host の作り直し」と「一覧側の 5 pass 破棄」が交互に露出する。
+- **構造的な解消方針 (実装前に detached R4 / ゲート C で方式を確定する)**:
+  1. font atlas は固定 5 回再送を廃止し、main surface の no-surface / acquire / present と
+     full-upload 完了を既存 owner の typed state で acknowledgment する。surface が使える最初の
+     1 pass だけ resync し、delay / retry / 追加 repaint で吸収しない。
+  2. linked detached の content close と OS host lifetime を分離し、`DetachedWindowManager` が
+     hidden host の再利用可否を所有する。再利用できる方式なら同じ `window_id` / HWND を
+     hidden → content remount → visible と遷移させる。egui の制約で terminal teardown が必須なら、
+     新 maximized host は HWND 作成・placement 適用・surface/content-ready acknowledgment が揃うまで
+     hidden のまま保持し、`Visible(true)` を 1 回だけ発行する。App-level bool / Option、rect heuristic、
+     固定待ち時間は追加しない。
+  3. `maximized=false` への強制リセット、最大化 placement の保存停止、windowed 強制は機能劣化なので
+     修正に使わない。タイトルバー最大化と F11 borderless は別状態のまま維持する。
+- **回帰条件**: 保存 placement が `maximized=true` の linked 静止画窓で Enter close/open を反復し、
+  (a) 1 操作につき visibility 遷移が 1 回、(b) 再利用方式なら `window_id` / HWND が不変、teardown
+  方式なら ready 前に visible にならない、(c) main font atlas が surface acknowledgment 後の 1 回だけ
+  full upload、(d)通常サイズ・F11・folder-nav reopen・always-new / passive / ParkedLive の所有権を
+  変えないことを state-transition test + debug log smoke で固定する。実装時は
+  [detached-rework-plan.md §11](detached-rework-plan.md#11-リワーク外の変更ログ) に合意と変更境界を記録する。
 
 #### 追記 (2026-08-23): 最大化が再現条件、原因は placement の毎フレーム書き戻し
 
@@ -1276,13 +1375,376 @@ passive detached は通常どおり release で窓を activate するが、選�
   こと ②`builder_no_position` が毎フレーム出ないこと ③close 後の `discard pass` が 1 回に
   なること ④最大化 → 復元でウィンドウが元のサイズに戻ること (A で restore 値を壊していない証明)。
 
+#### Codex クロスチェック: 2 つの欠陥を同一原因として扱わない
+
+ClaudeCode の追加ログと Codex の portable / normal ログを併記して source まで照合した結果、
+**最大化が再現を可視化する条件**、**open / close は実入力**、**placement が毎フレーム同値更新される**
+という観測は一致した。ただし、ちらつきへの因果は次のように分ける。
+
+- `active_placement_update_maximized` の `from == to` は runtime manager 内の
+  `runtime.placement = Some(placement)` であり
+  ([detached_window_manager.rs:538](../src/app/detached_window_manager.rs:538))、viewport command、
+  generation 更新、visibility 更新、repaint 要求を発行しない。ログの `builder_no_position` も
+  `apply_placement=false`、すなわち生存中の窓へ position / maximize を再適用していない。
+- settings への永続化は毎フレームではなく、runtime を remove する close 境界で 1 回だけ行う
+  ([app.rs:2174](../src/app.rs:2174))。したがって「82 回の同値更新」だけから
+  **ウィンドウが82回再表示された**、または**それがちらつきの直接原因**とは結論できない。
+- 一方、画面遷移と一対一に対応する事実は、各 close の `recreate=true` + 5 discard と、各 open の
+  **新 `window_id` / 新 HWND / 113〜177ms の最大化 host 生成**である。よって §1.115 の直接原因は
+  上記「確定した原因」の lifecycle + surface acknowledgment 欠如とする。
+- 現在 geometry と restore geometry を1値に混在させる placement model は、§2.20 の座標破綻、
+  不要な runtime 書き戻し、将来の placement command 振動を招く**独立した構造欠陥**であり、
+  ClaudeCode の A/B は同じ R4 設計で直す価値がある。ただし A/B だけ適用しても close ごとの
+  host 再生成と 5 discard が残る限り、§1.115 の完了条件は満たさない。
+- 実装レビューでは (1) placement A/B のみで HWND 再生成 / discard が残るケース、
+  (2) lifecycle + surface acknowledgment 修正で最大化 placement を維持するケースを分けて測り、
+  「ログ量が減った」ことを「ちらつきが直った」ことの代用にしない。
+
 - 規模 / 優先度: 中 / **P1** (常用操作で目に見える。ただし凍結領域なので構造修正が前提)。
 - 関連: §2.20 (**同じ根**。最大化中の placement が実ジオメトリを表していない)、
   [docs/detached-rework-plan.md](detached-rework-plan.md) の BA-5 / findings-12 D1
   (font resync の discard パスが passive 窓を破棄した実害) / findings-14
   (毎フレーム seed による振動を `builder_placement_latch` で止めた前例)。
 
-### 1.116 F12 で動画をメイン ⇄ 別ウィンドウへ往復させると重い — 実機確認中の指摘
+### 1.116 メインウィンドウの起動状態を選べるようにする — 外部SNSでの移行検討者の指摘
+
+- 出典: 2026-08-24。ZipPla からの移行を検討している利用者が、終了時のウィンドウサイズ復元、
+  最大化状態の維持、最大化起動の設定が見つからないと外部SNSへ投稿した。直接受けた実装要望では
+  ないため、需要候補として記録する。
+- **現状の整理**: 通常ウィンドウの位置とクライアントサイズは既に `window_pos` / `window_size` へ
+  保存し、起動時に復元している ([lib.rs:1124](../src/lib.rs:1124),
+  [app.rs:54576](../src/app.rs:54576))。最大化中は restore 用の通常矩形を壊さないため
+  `track_window_rect` の更新対象外だが、**最大化して終了したという状態自体は保存していない**。
+  そのため「サイズ復元なし」ではなく、「次回も最大化」と「常に最大化で起動」が不足している。
+- 仕様候補: 環境設定へ `起動時のウィンドウ状態 = 前回の状態 / 通常 / 最大化` を追加する。
+  現行互換の既定値は `通常`。restore 用の通常位置・サイズと、終了時の最大化 flag を別々に持つ。
+  必要性があれば `--window-state normal|maximized|restore` も同じ resolver へ通す。
+- 実装条件:
+  - `pending_initial_size` の mixed-DPI 起動補正が、最大化適用後に通常サイズへ戻さない順序にする。
+  - 最小化終了は前回の有効な通常矩形を維持し、起動時に最小化は復元しない。
+  - 設定 round-trip と起動状態 resolver の unit test に加え、複数モニター / 異なる DPI /
+    トレイ終了で restore rect と最大化状態を手動確認する。
+- 規模 / 優先度: Small (0.5〜1.5日程度) / P2。コード量より Windows / DPI 実機確認が主なリスク。
+- **実装済み (2026-08-25、実機確認待ち)**:
+  - `Settings.startup_window_state` (`Normal` 既定 / `Maximized` / `RememberLast`) と、
+    終了時の最大化 flag `Settings.window_maximized` を追加。flag は復元矩形
+    (`window_pos` / `window_size`) と**別フィールド**にして、最大化を解いたときの
+    戻り先を残す (detached 側 §1.115 と同じ根を作らない)。
+  - `resolve_startup_maximized` で起動状態を決め、`ViewportBuilder::with_maximized` へ渡す。
+    初回フレームで `ViewportCommand::Maximized` を送る形にすると通常サイズが一度見えて
+    ちらつくため、生成時に指定する。`--window-size` は設定より優先して通常ウィンドウ。
+  - `pending_initial_size` の mixed-DPI 補正は、最大化起動では**最大化が解けるまで保留**する
+    (`deferred_initial_size_ready`)。egui が「最大化ではない」と明示報告した最初のフレームで
+    1 回だけ流し、そこで復元矩形を矯正する。報告が無い `None` を「最大化ではない」と
+    読まないこと自体が条件。
+  - 追跡側 (`tracked_window_maximized`) は最小化中と報告欠落時に直前の状態を保つ。
+    Windows は最小化中の `GetWindowPlacement().showCmd` を `SW_SHOWMINIMIZED` にするため、
+    素直に読むと最大化して最小化しただけで flag が落ちる。
+  - 環境設定のページ名を「起動時に開く場所」→「起動時の動作」に変更し、同ページへ
+    「起動時のウィンドウ状態」節と検索索引エントリを追加。
+  - unit test: 起動状態 resolver / 設定 round-trip / 未知値の既定落ち / 環境設定 OK が
+    選択を巻き戻さないこと / 補正の保留条件 / 最小化中の追跡 / 保存が復元矩形を触らないこと。
+  - **既定は `RememberLast`** (2026-08-25 利用者判断)。v3.2.0 以前の設定には field も
+    `window_maximized` も無いため、更新直後の初回起動は通常ウィンドウのまま。次に最大化して
+    終了したときから効き始めるので、更新した瞬間に驚かせない。
+  - 既定の変更なので `version_highlights.rs` へ `must_read` を追加済み。
+    **⚠ 版数は暫定 `"3.3.0"`。次のリリース版数を決めるときに合わせること** (リリース手順 Phase 1)。
+  - 実機確認済み (2026-08-25): 設定 UI / 検索、前回状態の復元と解除後のサイズ、別 DPI モニター、
+    最小化終了、トレイ終了、通常ウィンドウ。
+
+### 1.117 外部ツール連携を設定画面へ出し、引数・複数選択へ拡張する — 外部SNSでの移行検討者の指摘
+
+- 出典: 2026-08-24。移行元の ZipPla / NeeView にある外部ツール設定が mIV に無いとの外部SNS投稿。
+  直接受けた実装要望ではないが、既存機能の発見性不足と機能差の両方があるため候補として記録する。
+- **現状の整理**: 右クリックの「アプリケーションで開く…」から Windows 関連付けアプリと任意 exe を
+  追加・実行できる ([context_menu.rs:2037](../src/ui_dialogs/context_menu.rs:2037))。ただし登録場所が
+  コンテキストメニュー内だけで見つけにくく、実行は `exe + 物理ファイル1件` 固定
+  ([open_with.rs:142](../src/open_with.rs:142))。引数、作業フォルダー、複数選択、ZIP / PDF 内ページ、
+  任意ツールの直接キー割り当ては未対応。動画の <kbd>Shift+Enter</kbd> は OS 既定アプリを開く別経路。
+- 段階案:
+  1. 環境設定の「起動と連携」に外部ツール管理を追加し、既存の任意 exe 登録を改名・並べ替え・削除
+     できるようにする。操作カスタマイズにはまず動的 action を増やさず、「外部ツールを選んで開く」
+     という汎用 picker action を追加する。
+  2. `ExternalToolDefinition { id, name, executable, arguments, working_directory, selection_mode }` の
+     typed 定義へ移行し、`{file}` / `{folder}` / `{files}` 等の明示 placeholder と複数物理項目を扱う。
+  3. ZIP / PDF / 変換アーカイブ内ページを対象にする場合は、一時実体化、キャンセル、外部プロセスが
+     読み終えるまでの lifetime、終了後 cleanup を別 phase で設計する。
+- 安全性 / 応答性:
+  - コマンド文字列を `cmd /c` へ渡さず、exe と `OsString` 引数列を分離して `Command` を使う。
+  - ネットワーク上の exe / 作業フォルダー確認や仮想ページ抽出を UI スレッドで行わない。
+  - 起動失敗を黙って捨てず、ツール名と OS error を通知する。
+- 規模 / 優先度: 管理UIのみ Small〜Medium (1〜2日)、物理項目の引数・複数選択まで Medium
+  (3〜6日)、仮想ページ込み Large (追加1〜2週間) / P2。
+- **段階 3 まで一度に出す (2026-08-25、利用者判断)。** 段階 2 で切って出す案は採らない:
+  - 段階 2 までだと現状 (実ファイル 1 件を関連付けで開く) から用途があまり広がらない。
+  - **設定画面を一度出すと、それが互換の約束になる。** `selection_mode` と `{file}` の
+    意味は仮想ページが入ると変わるので、後から段階 3 を足すと「同じ設定なのに挙動が違う」
+    形になる。設定の形を決めるのは仮想ページまで見えてからにする。
+  - 出典は要望ではなく不満の声なので**優先度は高くない**。急いで段階を刻む理由が無い。
+
+### 1.118 任意の実ファイルを参照だけで束ねる「コレクション」 — 外部SNSでの移行検討者の指摘
+
+- 出典: 2026-08-24。ZipPla / NeeView からの移行に「仮想ディレクトリ」が不足するとの外部SNS投稿。
+  直接受けた要望ではなく、相手が期待する詳細操作は未確認。ZipPla の仮想フォルダや NeeView の
+  プレイリストに相当する、手動で選んだ分散ファイルの参照一覧を想定して候補化する。
+- **既存機能との差**:
+  - スマートフォルダは複数 root と条件から毎回結果を作るため、ZipPla の「スマートフォルダ」相当。
+  - 製本は追加時点のページを実ファイルとしてコピー / 焼き込みするため、元ファイルへの参照一覧ではない。
+  - 任意項目を手動登録し、元の場所に置いたまま1フォルダのように見せる機能は無い。
+- MVP 案:
+  - 内部名も ZIP / PDF の `virtual folder` と衝突させず、利用者向け名称を「コレクション」とする。
+  - `TopLevelGridSurface::Collection` を追加し、専用 DB worker が
+    `CollectionDefinition` / `CollectionEntry { id, collection_id, source_path, order }` を所有する。
+    設定 JSON の巨大配列や UI thread の同期存在確認にはしない。
+  - 対象はまず実フォルダ / 実ファイル / アーカイブ本体のみ。コレクション入れ子と ZIP / PDF 内の
+    仮想ページは対象外。追加、手動順序、コレクションから外す、元の場所を開くを提供する。
+  - 「コレクションから外す」と「元ファイルをごみ箱へ移す」を明確に別操作・別確認にする。
+- identity / lifecycle:
+  - mIV 内の rename / move は既存 path migration の同じ transaction から entry を更新する。
+  - OS 側で移動された項目は推測で別ファイルへ結び付けず、missing 表示と削除 / 再リンクを提供する。
+  - 外部から任意パス一覧を読み込む機能は、UNC への意図しないアクセスや他人由来リストの危険があるため
+    MVP に含めない。追加する場合は明示 import と確認を別途設計する。
+- 規模 / 優先度: 物理項目だけの MVP Medium〜Large (1〜2週間)、仮想ページ・移動追跡・完全な
+  D&D 管理まで Large (2〜4週間) / P3。着手前に利用者が期待する「仮想ディレクトリ」の操作例を確認する。
+
+### 1.119 横長画像1枚を左右の表示ステップへ分割して読む — 外部SNSでの移行検討者の指摘
+
+- 出典: 2026-08-24。ZipPla / NeeView からの移行に「見開き分割」が不足するとの外部SNS投稿。
+  NeeView の「横長ページを分割する」(横長画像を左右へ分けて順番に読む) に相当する機能を想定する。
+- **採用する簡略仕様 (2026-08-24)**: 分割した左右を永続的な論理ページにはしない。元の item index を
+  正本のまま維持し、フルスクリーン内だけで `PageSlice::Full | Left | Right` に相当する一時的な表示位置を
+  持つ。同じ texture の UV を左右半分へ crop し、1つの元ページを2回の表示ステップとして読む。
+- 設定 / 分割判定:
+  - 既存のページ構成プルダウンへ排他的な表示モードとして「横長分割 左→右」「横長分割 右→左」を
+    追加する。「1ページ表示 / 通常の見開き」と組み合わせる独立 bool にはせず、組み合わせ状態を増やさない。
+  - 保存済み回転を反映した後に横長となる静止画ページだけを 50% 位置で分割する。左→右は左半分から、
+    右→左は右半分から表示する。分割率の手動調整は MVP に含めない。
+  - 自動表示トリムは分割対象ページでは無効にする。分割の適用条件と UV crop は1つの resolver に集約し、
+    ページ送り、描画、ナビゲータ、ルーペ等で左右の解釈を重複させない。
+- 元ページ単位のまま維持する機能:
+  - ★、タグ、ブックマーク、読書位置、補正、注釈、切り取り等はすべて分割前の元ページへ記録する。
+    編集画面も分割前の画像全体で開き、左右別の編集データは持たない。
+  - サムネイルは分割前の画像を使う。ブックマーク、履歴、検索、シークバー等から再び開いた場合は、
+    選択した分割方向の最初の半分へ着地する。左右どちらを見ていたかは永続化しない。
+  - シークバーのページ数とノブ位置は元ページ単位のままとし、左右間の移動では変えない。スクラブ時も
+    対象ページの最初の半分へ着地する。表示中だけ「12ページ・左側」のように片側を示して混乱を避ける。
+- ナビゲーション / 連結読み:
+  - 通常のページ送りは `(source_idx, PageSlice)` の typed な一時状態を1か所で進める。分割状態を複数の
+    bool / `Option` へ分散させず、同じ元ページ内の左右移動と次の元ページへの移動を区別する。
+  - 縦連結では、分割対象ページを同じ texture 由来の2つの crop 領域として縦に並べる。幅フィットで
+    スクロール読みする用途を対象とする。横連結と通常の見開き表示には MVP では分割を適用しない。
+- **現状の構造差**: 現在の `SpreadDisplayUnit` は物理 item index だけを単位とし、ページ送り、通過表示、
+  表示確定も `fullscreen_idx` の変化を前提にする ([ui_fullscreen.rs:8169](../src/ui_fullscreen.rs:8169))。
+  元 index が同じ左右移動でも表示変更として扱う typed presentation step と、縦連結の layout-only な
+  2領域展開が必要。ただし seek / resume / bookmark / DB / サムネイルを論理ページ化する必要はない。
+- detached 制約: 別ウィンドウ経路へ到達する前に [detached-rework-plan.md](detached-rework-plan.md) §2 を読み、
+  owner 外へ分割状態を足す症状修正にしない。通常の本体フルスクリーンを先に完成させ、detached は R4 後に
+  同じ presentation step を所有できる場合だけ拡張する。Remote は MVP 対象外とし、元ページ表示を維持する。
+- 回帰条件: 左→右 / 右→左の往復、横長と縦長の混在、回転後の分割判定、先頭 / 末尾、キー長押し、
+  縦連結、シーク、編集画面への出入り、ブックマーク再表示で元 index と表示片の不変条件を固定する。
+- 規模 / 優先度: 通常ページ表示 Medium、縦連結まで含めて Medium〜Large (1〜2週間程度)。当初の
+  logical page 全面対応 (2〜8週間想定) より範囲を大きく限定できる / P3。
+
+#### 純ロジックだけ先行 (2026-08-25、[page_split.rs](../src/page_split.rs))
+
+配線はレーン A の `app.rs` 一括切替の後に回す
+([next-cycle-work-lanes.md](next-cycle-work-lanes.md) §6.2)。待つ間に、共有ファイルを
+触らない部分だけ作った。単体テスト 9 本。
+
+- `PageSlice { Full, Left, Right }` + `uv_rect()` (50% 固定) + `is_half()`
+  (自動表示トリムを無効にする条件でもある)
+- `SplitDirection { LeftFirst, RightFirst }` の `first()` / `second()`
+- `PresentationStep { source_idx, slice }` — **元 index が正本**で、slice は表示だけ
+- `presentation_steps(nav, direction, is_split_idx)` — nav をステップ列へ広げる。
+  **既存の見開きユニット生成と同じ述語渡しの形**にした。回転を反映した縦横比と
+  「静止画か」は `is_landscape` / `is_spread_pairable_item` が既に持っているので、
+  ここで読み直さない。寸法が未取得の item は 1 ステップになり、届いた後に組み直される
+  (既存の見開きが `is_landscape` に対して持つ性質と同じ。分割のために読み込みを待たせない)
+- `landing_step` — しおり / 履歴 / 検索 / シークから**分割方向の最初の半分**へ着地
+- `step_forward` / `step_backward` → `StepMove::{WithinPage, ToAnotherPage, AtEnd}`。
+  同じ元ページ内の左右移動と別ページへの移動を**型で**区別する (呼び出し側で
+  `before.source_idx != after.source_idx` を組み立てると判定が散る)
+- 縦連結も同じステップ列を使う。「同じ texture 由来の 2 領域を縦に並べる」順序は
+  ページ送りの順序と同じものなので、別の列を作らない
+- **`SpreadMode` への「横長分割 左→右 / 右→左」追加はまだ入れていない。** 何もしない
+  選択肢がプルダウンに出る半端な状態を避けるため、配線と同時に入れる。
+
+### 1.120 Susie 32bit ワーカー異常終了後の自己回復 — 外部SNSでの不具合言及 ✅ 実装済み (2026-08-25、実機確認済み)
+
+- 出典: 2026-08-24。mIV の Susie 中継 exe が繰り返しエラーで落ちるとの外部SNS投稿。
+  プラグイン名、対象画像、ログ、並列設定は不明で再現未確認。直接の報告ではないため、まず条件採取が必要。
+- **コード上確認できた問題**:
+  - Susie プラグインを32bit子プロセスへ隔離しているため、プラグインの access violation 等で本体まで
+    落ちない設計は維持されている。
+  - 起動成功後に worker が想定外終了しても自動 respawn しない
+    ([async-architecture.md:757](async-architecture.md#54-pdf-ワーカー--susie-ワーカーの想定外終了))。
+  - `run_dispatcher` は `send_recv` の transport error 後も loop を抜けないため、死んだ pipe の dispatcher が
+    共有 queue から後続 job を取り、エラーを返し続ける可能性がある
+    ([susie_loader.rs:794](../src/susie_loader.rs:794))。
+  - README の「プラグインクラッシュ時は自動再起動」という説明は現行実装と食い違う。実装を合わせるまで
+    説明を訂正するか、既知の問題として明示する。
+- 修正方向:
+  - worker slot ごとの generation と状態 (`Starting / Ready / Failed / Backoff / Shutdown`) を持つ
+    `SusieWorkerSupervisor` が child / dispatcher の lifetime と実効 worker 数を所有する。
+  - EOF / BrokenPipe 等の fatal transport error ではその dispatcher を即座に退役させ、残り queue を
+    奪わせない。回数上限と backoff を付けて同じ slot を再 handshake する。
+  - クラッシュを起こした in-flight request は自動再送しない。同じ不正画像 / プラグインで crash loop に
+    なるため、その item はエラーとして返し、後続 request のためだけに worker を補充する。
+  - 通常のプラグイン decode error と worker transport failure を型で分け、診断画面へ plugin / extension、
+    worker id、再起動回数、最終失敗理由を出す。並列実行 OFF で回避できる plugin-global race も案内する。
+- 回帰: handshake 後に意図的に exit するダミーワーカーで、in-flight 1件だけが失敗し、後続は再生成された
+  worker で成功すること、shutdown / cancel と respawn が競合しないこと、再起動上限後は queue を
+  無限消費せず persistent notice になることを統合テストする。
+- 規模 / 優先度: Medium (3〜7日) / P2。利用者のプラグイン名・画像・ログが得られれば優先度を再判断する。
+
+#### 実機で再現させた結果 (2026-08-25)
+
+検証手段が無かったので、**落ちるプラグインを自作した** ([susie-crash-plugin.md](susie-crash-plugin.md))。
+`C:\tmp\miv-susie-crash-test` の 8 ファイル (正常 5 / クラッシュ 3) を一覧で開いた結果:
+
+- **ワーカーはクラッシュのたびに 1 つずつ減り、再生成されない。** 起動時 3 本
+  (`susie: 3 workers ready`) が、クラッシュ 3 回で **0 本**になった。この間 mIV 自身は動作を続けている。
+- 枯渇後は Susie 形式が**一切読めない**。利用者からは「しばらく使っていたら Susie が全部読めなく
+  なった」に見える。**アプリを再起動するまで戻らない。**
+- 一覧の初回表示では 8 枚中 6 枚が成功した。生き残っているワーカーが処理できたためで、
+  **1 回のクラッシュで全滅するわけではない**。枯渇するまでは部分的にしか見えない。
+- 表示が残っていた 1 枚はサムネイルキャッシュ由来 (`state=DisplayReady(LiveCache)`) で、
+  キャッシュが切れると失敗に変わった。
+
+**この結果を受けて段階分けを変更する。** 当初案の「段階 1 = dispatcher の退役だけ、respawn は後」
+では**直らない**。dispatcher を退役させてもワーカーは減り続け、枯渇後の結末は同じである。
+respawn までを 1 つの修正として扱う:
+
+1. transport error でその dispatcher を退役させ、共有キューを吸わせない
+2. **backoff 付きで同じスロットを再起動する** (本命。これが無いと枯渇は止まらない)
+3. クラッシュを起こした要求は**再送しない** (同じ不正画像で crash loop になる)。その 1 件は
+   エラーで返し、後続のためだけにワーカーを補充する
+4. 再起動上限に達したら無言で諦めず、利用者へ通知する
+
+**副産物: フルスクリーンが Susie 拡張子を認識しない** (§2.21 として分離)。
+
+#### 実装 (2026-08-25、実機確認済み)
+
+`af6882e5` + `9ecbbec7`。4 つの欠陥を閉じた。**順に実機で確かめ、直すたびに次が現れた**ので、
+その経緯も残す。
+
+1. **dispatcher が終了理由を返す** (`DispatcherExit::{Shutdown, WorkerLost}`)。以前は
+   `shutdown` でしか抜けず、死んだ pipe を持つ dispatcher が共有キューから後続を取り続けた。
+   しかも失敗は即座に返るので、生きているワーカーより速く吸っていた。
+   落ちたと扱うのは transport が切れた場合だけで、`InvalidData` 等は含めない。
+2. **スロットが backoff 付きで作り直す** (`run_worker_slot`)。上限 5 回、200ms × 試行回数。
+   待つのは競合を時間で隠すためではなく、crash loop が CPU を焼き切らないため。
+3. **再起動回数は連続失敗で数える** (`restart_count_after_loss`)。累積で数えていたため、
+   実機では 3 スロットとも上限に達して Susie が丸ごと死んだ。1 件でも応答を返せた
+   ワーカーは働けていたので数え直す。上限が意味を持つのは「起動しても何も返せない」場合だけ。
+4. **最後のスロットが閉じたらキューを排出する** (`fail_pending_jobs_no_workers`)。
+   これが無いと積まれた要求に誰も答えず、UI が「読込中」で固着した (実機で確認)。
+   投入の可否は `is_ready()` の外側チェックではなく**積むのと同じロックの中**で見る。
+5. **ワーカーを落とした対象は二度と投げない** (`crashers`)。失敗したデコードはサムネイルに
+   残らないので、記録しないと**同じフォルダを開くたびに同じ画像でワーカーが死に続ける**。
+   これが 1〜4 だけでは止まらなかった殺し合いの原因。記憶はプールの生存期間だけで、
+   起動し直せば忘れる。実ファイルは正規化パス、書庫内は「エントリ名#バイト長」で識別する
+   (名前だけだと別書庫の同名エントリを巻き添えにする)。
+- `is_ready()` は起動時の本数ではなく**生存スロット数**を見る。全滅しても真を返していた。
+- 実機結果: 5 回死んで 5 回とも復帰、スロット喪失 0、上限到達 0。クラッシュする 3 ファイルは
+  各 1 回だけ記録され、残る 5 ファイルは何度開き直しても読める。
+- README とマニュアルの「自動再起動されます」は**実装が追いついた**形。マニュアルには
+  利用者から見える 2 点 (クラッシュした画像は再試行しない / 何度も落ちる場合は打ち切る) を追記。
+#### 通知と診断表示 (2026-08-25、実機確認済み)
+
+残っていた 2 点を閉じた。
+
+- **枠が尽きたことを利用者へ伝える**。`SusieWorkerNotice` を one-shot で発行し、
+  PDF の `PdfWorkerNotice` と同じ形 (毎 update poll → 閉じるまで残る Window) で出す。
+  - **発行条件を 1 か所に閉じた** (`should_notify_workers_gone`)。枠が 1 つ減っただけでは
+    出さない (残りが処理を続けられる間、利用者にできることが無い)。終了・再読み込みで
+    畳んだ場合も出さない。**最後の枠が諦めたときだけ**。
+  - そのために `run_worker_slot` は `SlotExit::{Shutdown, GaveUp}` を**抜けた場所で確定**
+    させる。閉じてからフラグを読み直すと、その間に終了要求が来た場合に「自分から畳んだ」と
+    誤って読める。
+  - 文面が案内するのは**アプリの再起動ではなく「⟳ プラグインを再読み込み」**。`reload()` は
+    プールを作り直すので再起動は要らず、案内すると開いている一覧と表示位置を捨てさせる。
+    再読み込みボタンを notice 側には置いていない (`reload` は同期でプロセスを 3 つ起こすため、
+    新しい UI スレッド同期経路を増やさない)。
+- **診断パネルに実績を出す** (`SusieWorkerHealth`)。起動できた枠数 / 生存枠数 / 作り直し回数 /
+  打ち切り数 / 落とした対象数 / 最後の失敗理由。0 の項目は出さない (実際に起きた項目が埋もれる)。
+  - **副産物の修正**: 枠を使い切った状態が `WorkerSpawnFailed` として出ていた。「起動または
+    ハンドシェイクに失敗しました」と書かれるが実際には起動しており、利用者が確認すべきものが
+    違う。`WorkersExhausted` を分けた。判定は純関数 `pool_status_from` に出してテストした
+    (`a_pool_that_ran_and_then_died_is_not_reported_as_a_failed_start`)。
+  - 正常時は何も出さない。復帰の履歴は「読めない画像があった」ときに辿るためのもので、
+    常時出す情報ではない。
+- **ついでに直した race**: `live_workers` はスロットスレッドを起こした**後**に
+  `store(worker_count)` していた。起動直後に落ちたワーカーが先に減算すると 0 を下回って
+  戻れない。スレッドを起こす前に `fetch_add` する形にした。
+- 変更ファイル: [susie_loader.rs](../src/susie_loader.rs) /
+  [ui_susie_diagnostic.rs](../src/ui_susie_diagnostic.rs) /
+  [ui_dialogs/susie_worker_notice.rs](../src/ui_dialogs/susie_worker_notice.rs) /
+  `app.rs` (4 行) / マニュアル (設定・FAQ) / [async-architecture.md](async-architecture.md) §5.4。
+  §5.4 は「Susie も respawn しない」と書いたままだったので、実装に合わせた。
+
+### 2.21 フルスクリーンが Susie プラグインの拡張子を画像として扱わない ✅ 見立ての誤りと判明 (2026-08-25)
+
+- 出典: 2026-08-25。クラッシュプラグインの検証中、サムネイルは Susie 経路を通るのに、
+  同じファイルをフルスクリーンで開くと
+  `fs load FAIL: The file extension `."miv-crashtest"` was not recognized as an image format`
+  で落ちた。ここから「フルスクリーンは Susie に到達していない」と記録した。
+- **この見立ては誤り。フルスクリーンは Susie に到達している。**
+  - 復号は `decode_canonical_image` の 1 本で、fallback は image → WIC → Susie
+    ([canonical_image_loader.rs](../src/canonical_image_loader.rs))。フルスクリーンの
+    呼び出し ([app.rs:51540](../src/app.rs:51540)) は `CanonicalDecodeOptions::fullscreen`
+    (= `susie_priority: true`) を渡していて、Susie 段を飛ばす分岐は無い。
+  - 実プラグイン (`ifpi.spi`) と実ファイル (`C165.PI`) で、製品と同じ入口を通して
+    640×400 を復号できることを統合テストで確認した
+    (`fullscreen_decode_entry_reaches_susie_for_a_plugin_only_extension`)。
+    既存の Susie 統合テストは `susie_loader::decode_file` を直接叩いていて
+    **この入口を一度も通っていなかった**ため、疑いを晴らせなかった。
+- **本当の問題は診断文だった**。連鎖が全部失敗したとき、返していたのは image クレートの
+  エラーだけ。未対応拡張子ではそれが「拡張子が画像として認識されない」になるため、
+  **WIC も Susie も試したあとの失敗なのに Susie を試していないように読める**。
+  Susie 側のエラーは `.map_err(|_| primary_error)` で捨てられていた。
+  - 修正: `CanonicalDecodeError::Decode` を `DecodeChainFailure { primary, susie_error }` に変え、
+    `Display` が「WIC も読めず、Susie は〈理由〉で失敗した」まで出すようにした。
+    「試したか」の bool は**持たない** (この型が作られるのは連鎖の最後だけで、常に true にしかならない)。
+  - 観測された失敗そのもの (クラッシュプラグイン検証中の decode 失敗) は §1.120 の
+    ワーカー枯渇と、修正で入れた「一度落とした対象は投げ直さない」記憶で説明が付く。
+    どちらも設計どおりで、新しい欠陥ではない。
+- 教訓: **エラー文の出所を確かめずに、そこから経路の有無を推定した**。最初の decoder の
+  エラーは連鎖について何も語らない。捨てられている失敗理由を先に拾うべきだった
+  (§1.121 と同じ教訓)。
+
+### 1.121 RAR を代表サムネにしても親フォルダのタイルに出ない — 専用スレ >>302 ✅ 修正済み (2026-08-24、実機確認済み)
+
+- 出典: 専用スレ >>302。RAR があるフォルダで RAR を `P` で代表サムネに指定し、親フォルダへ移動すると
+  そのサムネイルが出ない。利用者の切り分けでは v3.1.0 は正常、v3.1.1 で発生。
+- **原因 (計装を入れて 1 回の再現で確定)**。`archive cache unavailable → base_req` と
+  `thumb_not_eligible failed` が同じ 1 秒の中に並んで記録された:
+  - pin の解決自体は成功していた (cascade → `ArchiveFirstImage` → `dummy-book-002.rar`、pinned_key も正しい)。
+    捨てていたのは `converted_archive_cache_paths` に対象 RAR が載っていなかったため。
+  - 載らなかったのは、pin-root の収集 ([app.rs:25141](../src/app.rs:25141)) が
+    `candidate && !requested && (Pending | Evicted)` を要求していたから。
+    **`Loaded` と `Failed` は終端状態で、そこへ落ちたコンテナの pin は二度と解決されない。**
+  - **中身がアーカイブだけのフォルダは自動選定が代表画像を選べず (アーカイブを展開しない仕様)、
+    必ず `Failed` になる。**そのため出口のないループになっていた:
+    ピンが捨てられる → 自動選定が走る → 失敗する → `Failed` → 発見されない → ピンが捨てられる。
+  - `Loaded` は反対側から同じ穴に落ちる (画像が 1 枚混ざったフォルダはその画像を描いたまま固定)。
+  - 初めて成立させたのは `bc4adbdd` (v3.1.2、prefetch gate と admission 制限の追加)。
+    `0f346e20` は下流を整備しただけで、見つからない root は救えない。
+- **v3.1.1 の境界は未確定のまま**。v3.1.0..v3.1.1 で `folder_thumb_pins.rs` / `thumb_loader.rs` /
+  `rar_loader.rs` / `zip_loader.rs` は blob が同一、`app.rs` の 3 コミットもこの経路に差分が無い
+  (ClaudeCode と Codex が独立に確認)。現行の原因は上記で閉じているので、修正には支障しない。
+- **修正**: pin-root の発見条件から**サムネイルの状態と進行中要求を外した**。ピンの有無は、
+  そのタイルが今どう描かれているかとは無関係な事実である。コストを抑える役目は可視範囲の
+  絞り込み (`candidate_indices`) と root ごとの解決結果の記憶
+  (`converted_archive_pin_root_states`) が引き継ぐ。解決済みの root は DB も cascade も引き直さない。
+- **回帰テスト**: タイルを終端状態にしてから collector を回す 2 本
+  (`converted_archive_pin_root_is_found_when_the_folder_tile_already_failed` /
+  `..._while_the_folder_tile_is_requested`)。既存の archive-through-folder-pin テストは
+  `start_converted_archive_cache_paths_refresh` を直接呼ぶため、描画済みのタイルを一度も見ておらず
+  この退行を捕まえられなかった。
+- 教訓: **無言の早期 return に理由を型で残してから直した**。事前の推定は
+  ClaudeCode / Codex とも `already_requested` か `Loaded` で、**どちらも外れていた** (実際は `Failed`)。
+### 1.122 F12 で動画をメイン ⇄ 別ウィンドウへ往復させると重い — 実機確認中の指摘
 
 - 出典: R2e ②-d の実機 smoke 中の指摘 (2026-08-25)。動作はするが体感でかなり遅い。
 - **既存の問題であることは確認済み**: 利用者が **v3.2.0 と v3.0.0 ポータブル**でも同じだと
@@ -1497,7 +1959,8 @@ passive detached は通常どおり release で窓を activate するが、選�
 - 出典: 利用者報告 (2026-08-23、v3.2.0 出荷前の実機確認)。リモートで PDF を開いたとき、
   端末に「ページ表示グループの読み込みに失敗しました。」が出た。前後ページ移動で復帰。
 - **v3.2.0 の退行ではない。** この経路は `732420e3` (2026-07-31) 由来で v3.1.3 以前から出荷済み。
-- **サーバ側ログで確定** (`%APPDATA%\mimageviewer-remoteemote-web-log.jsonl`):
+- **サーバ側ログで確定** (`%APPDATA%\mimageviewer-remote
+emote-web-log.jsonl`):
 
   ```
   /api/page  status=500  page.ipc_status="miv_media_internal"

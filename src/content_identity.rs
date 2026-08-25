@@ -27,6 +27,11 @@ const HEAD_HASH_BYTES: u64 = 64 * 1024;
 const HASH_CHUNK_BYTES: usize = 256 * 1024;
 const CONTENT_IDENTITY_SCHEMA_VERSION: i64 = 1;
 
+/// 台帳そのもののファイル名。`STORES` にも載っている (復元先へ行を写すため) が、
+/// 「復元して何か起きるか」を数えるときは**除外する**。台帳の行はその問いの
+/// 対象であって答えではない。
+pub(crate) const LEDGER_DB_FILE: &str = "content_identity.db";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ContentIdentityTrigger {
     ViewingState,
@@ -527,6 +532,32 @@ impl ContentIdentityDb {
                 rusqlite::params![file_key, kind.as_str(), last_edit_at],
             )
             .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// 復元元 flag を下ろす。**store を全部読んで 1 行も無いと確認できたときだけ**呼ぶ。
+    ///
+    /// 通常の書き込みで flag は 0 -> 1 の単調遷移にしてある (遅れて届いた
+    /// detection cache の 0 が、先に届いた復元元更新の 1 を消さないため)。ここはその
+    /// 例外で、「実データがもう無い」という別の根拠に基づく明示的な取り消し。
+    ///
+    /// `last_edit_at` の一致を条件にして compare-and-swap にする。probe 中に UI
+    /// スレッドが新しい編集を記録していたら 0 行更新で終わり、その編集は残る。
+    fn clear_restorable_if_unchanged(
+        &self,
+        file_key: &str,
+        last_edit_at: i64,
+    ) -> Result<bool, String> {
+        self.conn
+            .execute(
+                "UPDATE edit_origin
+                    SET has_restorable_content = 0
+                  WHERE file_key = ?1
+                    AND last_edit_at = ?2
+                    AND has_restorable_content = 1",
+                rusqlite::params![file_key, last_edit_at],
+            )
+            .map(|rows| rows > 0)
             .map_err(|error| error.to_string())
     }
 
@@ -1307,12 +1338,78 @@ fn run_detection_at_with_updates(
     if cancel.load(Ordering::Acquire) {
         return Ok(None);
     }
+    let data_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
+    if !candidates.is_empty() {
+        // store を読むのでここも背景 I/O の枠に入れる。取れなければ候補はそのまま出す
+        // (余計な確認が 1 回出るだけで、復元できるものは失わない)。
+        if let Some(_permit) =
+            io_sem.acquire_cancellable(crate::io_semaphore::IoPriority::Low, cancel)
+        {
+            drop_sources_with_nothing_to_restore(&db, data_dir, &mut candidates);
+        }
+    }
     Ok(Some(DetectionResult {
         items_generation,
         folder_key,
         candidates,
         ledger_updates,
     }))
+}
+
+/// 中身がもう無い復元元を候補から外し、台帳の flag も下ろす。
+///
+/// 台帳の `has_restorable_content` は「編集した」という**操作**で立つ。編集を取り消した
+/// 経路 (マスク削除、trim override 削除、標準値と同じになった補正の破棄) も同じ record を
+/// 通るため、実データが 1 つも無い file_key が復元元として残り続ける。利用者からは
+/// 「何も編集していないファイルで復元ダイアログが出る」に見える (2026-08-25 報告)。
+///
+/// 復元が運ぶのは `copy_stores_at` が写す `STORES` の行だけなので、そこに 1 行も無い
+/// 復元元は選ばれても no-op にしかならない。**候補から外しても失われるものは無い。**
+/// ついでに flag を下ろして、次のフォルダ訪問で同じ probe を繰り返さないようにする。
+fn drop_sources_with_nothing_to_restore(
+    db: &ContentIdentityDb,
+    data_dir: &Path,
+    candidates: &mut Vec<RestoreCandidate>,
+) {
+    if candidates.is_empty() {
+        return;
+    }
+    let file_keys = candidates
+        .iter()
+        .flat_map(|candidate| candidate.sources.iter())
+        .map(|source| source.file_key.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let backed =
+        crate::rename_key_migration::ledger_keys_with_restorable_rows_at(data_dir, &file_keys);
+    if backed.len() == file_keys.len() {
+        return;
+    }
+    for file_key in file_keys.iter().filter(|key| !backed.contains(*key)) {
+        let cleared = db
+            .ledger_entry(file_key)
+            .map_err(|error| error.to_string())
+            .and_then(|entry| {
+                let entry = entry.ok_or_else(|| "ledger row vanished".to_string())?;
+                db.clear_restorable_if_unchanged(file_key, entry.last_edit_at)
+            });
+        match cleared {
+            Ok(true) => crate::logger::log(format!(
+                "content_identity: dropped empty restore origin {file_key}"
+            )),
+            Ok(false) => {}
+            Err(error) => crate::logger::log(format!(
+                "content_identity: could not clear empty origin {file_key}: {error}"
+            )),
+        }
+    }
+    for candidate in candidates.iter_mut() {
+        candidate
+            .sources
+            .retain(|source| backed.contains(&source.file_key));
+    }
+    candidates.retain(|candidate| !candidate.sources.is_empty());
 }
 
 fn detect_target(
@@ -1697,6 +1794,18 @@ mod tests {
             );
             std::thread::yield_now();
         }
+    }
+
+    /// 復元元として成立する最小の実データを置く。
+    ///
+    /// 台帳の行だけでは復元元にならない。復元が運ぶのは `STORES` の行なので、
+    /// 1 つも無い file_key は候補から外れる (2026-08-25 の「取り消した編集が復元元として
+    /// 残る」対応)。本番の backfill は編集済みファイルにしか走らないので、fixture 側も
+    /// 実データを持たせて production と同じ形にする。
+    fn give_test_file_restorable_content(data_dir: &Path, path: &Path) {
+        let db = crate::rating_db::RatingDb::open_at(data_dir.join("rating.db")).unwrap();
+        db.set(&crate::adjustment_db::normalize_path(path), 3)
+            .unwrap();
     }
 
     fn detect_test_image_copy(
@@ -2867,6 +2976,7 @@ mod tests {
         let target_path = target_folder.join("copied.png");
         let bytes = vec![19_u8; HEAD_HASH_BYTES as usize + 31];
         std::fs::write(&source_path, &bytes).unwrap();
+        give_test_file_restorable_content(temp.path(), &source_path);
         let cancel = AtomicBool::new(false);
         let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
 
@@ -2914,6 +3024,149 @@ mod tests {
         );
     }
 
+    /// 編集を入れてすぐ取り消したファイルは復元元にならない。
+    ///
+    /// 台帳の flag は「編集操作をした」で立ち、取り消し経路 (マスク削除、trim override
+    /// 削除、標準値と同じで破棄された補正) も同じ record を通る。その結果、実データが
+    /// 1 つも無い file_key が復元元として残り、中身が同じコピーを開くたびに
+    /// 「何も編集していないのに復元ダイアログが出る」ことになる (2026-08-25 報告)。
+    #[test]
+    fn an_origin_whose_edits_were_all_removed_stops_being_a_restore_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("content_identity.db");
+        let source_folder = temp.path().join("source");
+        let target_folder = temp.path().join("target");
+        std::fs::create_dir_all(&source_folder).unwrap();
+        std::fs::create_dir_all(&target_folder).unwrap();
+        let source_path = source_folder.join("edited-then-undone.png");
+        let target_path = target_folder.join("copied.png");
+        let bytes = vec![31_u8; HEAD_HASH_BYTES as usize + 13];
+        std::fs::write(&source_path, &bytes).unwrap();
+        let cancel = AtomicBool::new(false);
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
+
+        // 実データを一度置いて台帳に復元元として登録し、そのあと編集だけ取り消す。
+        // 台帳側は 0 -> 1 の単調遷移なので 1 のまま残る。
+        give_test_file_restorable_content(temp.path(), &source_path);
+        run_backfill_at(
+            &db_path,
+            vec![ContentIdentitySource::new(&source_path, ContentKind::Image)],
+            &cancel,
+            &io_sem,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let rating = crate::rating_db::RatingDb::open_at(temp.path().join("rating.db")).unwrap();
+        rating
+            .set(&crate::adjustment_db::normalize_path(&source_path), 0)
+            .unwrap();
+        drop(rating);
+        let source_key = crate::path_key::normalize_keep_drive(&source_path);
+        assert!(
+            ContentIdentityDb::open_at(&db_path)
+                .unwrap()
+                .ledger_entry(&source_key)
+                .unwrap()
+                .unwrap()
+                .has_restorable_content,
+            "台帳の flag は編集の取り消しでは下がらない (この test の前提)",
+        );
+
+        std::fs::copy(&source_path, &target_path).unwrap();
+        let db = ContentIdentityDb::open_at(&db_path).unwrap();
+        let index = db.load_index(&cancel).unwrap().unwrap();
+        let target = stage0_target(
+            &index,
+            ContentIdentitySource::new(&target_path, ContentKind::Image),
+            bytes.len() as u64,
+        )
+        .expect("size index still lists the stale origin");
+        drop(db);
+
+        let detected = run_detection_at(
+            &db_path,
+            vec![target],
+            3,
+            crate::path_key::normalize_keep_drive(&target_folder),
+            &cancel,
+            &io_sem,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            detected.candidates.is_empty(),
+            "運ぶ行が無い復元元でダイアログを出さない: {:?}",
+            detected.candidates,
+        );
+        assert!(
+            !ContentIdentityDb::open_at(&db_path)
+                .unwrap()
+                .ledger_entry(&source_key)
+                .unwrap()
+                .unwrap()
+                .has_restorable_content,
+            "同じ探索を毎回繰り返さないよう flag も下ろす",
+        );
+    }
+
+    /// 逆側。実データが残っている限り、候補から外さない。
+    #[test]
+    fn an_origin_that_still_has_edits_remains_a_restore_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("content_identity.db");
+        let source_folder = temp.path().join("source");
+        let target_folder = temp.path().join("target");
+        std::fs::create_dir_all(&source_folder).unwrap();
+        std::fs::create_dir_all(&target_folder).unwrap();
+        let source_path = source_folder.join("still-edited.png");
+        let target_path = target_folder.join("copied.png");
+        let bytes = vec![37_u8; HEAD_HASH_BYTES as usize + 17];
+        std::fs::write(&source_path, &bytes).unwrap();
+        let cancel = AtomicBool::new(false);
+        let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
+
+        give_test_file_restorable_content(temp.path(), &source_path);
+        run_backfill_at(
+            &db_path,
+            vec![ContentIdentitySource::new(&source_path, ContentKind::Image)],
+            &cancel,
+            &io_sem,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        std::fs::copy(&source_path, &target_path).unwrap();
+        let db = ContentIdentityDb::open_at(&db_path).unwrap();
+        let index = db.load_index(&cancel).unwrap().unwrap();
+        let target = stage0_target(
+            &index,
+            ContentIdentitySource::new(&target_path, ContentKind::Image),
+            bytes.len() as u64,
+        )
+        .unwrap();
+        drop(db);
+
+        let detected = run_detection_at(
+            &db_path,
+            vec![target],
+            4,
+            crate::path_key::normalize_keep_drive(&target_folder),
+            &cancel,
+            &io_sem,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(detected.candidates.len(), 1);
+        assert_eq!(
+            detected.candidates[0].sources[0].file_key,
+            crate::path_key::normalize_keep_drive(&source_path)
+        );
+    }
+
     #[test]
     fn book_byte_copy_is_declined_but_explorer_copy_in_same_book_is_detected() {
         let temp = tempfile::tempdir().unwrap();
@@ -2925,6 +3178,8 @@ mod tests {
         let source_path = source_folder.join("rated-only.jpg");
         let bytes = vec![23_u8; HEAD_HASH_BYTES as usize + 47];
         std::fs::write(&source_path, &bytes).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        give_test_file_restorable_content(&data_dir, &source_path);
 
         let cancel = AtomicBool::new(false);
         let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
