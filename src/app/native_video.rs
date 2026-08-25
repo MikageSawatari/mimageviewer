@@ -609,6 +609,9 @@ pub(crate) struct NativeVideoOpenPending {
     /// ParkedLive mount 中に生成された pending の owner window id。
     /// VST3 deferred open からも parked mount 中に到達するため mounted 専用ではない。
     pub(crate) parked_live_window_id: Option<u64>,
+    /// poll が直前に見送った理由。**毎フレーム同じ理由を出さないためだけの記憶**で、
+    /// 判断には使わない。見送りが無言だと「開かないまま静かに止まった」が観測できない。
+    pub(crate) last_declined: Option<&'static str>,
 }
 
 #[cfg(windows)]
@@ -920,6 +923,7 @@ impl App {
 
         let now = std::time::Instant::now();
         self.native_video_open_pending = Some(NativeVideoOpenPending {
+            last_declined: None,
             idx,
             path: path.to_path_buf(),
             from_grid,
@@ -967,6 +971,7 @@ impl App {
     ) -> bool {
         let now = std::time::Instant::now();
         self.native_video_open_pending = Some(NativeVideoOpenPending {
+            last_declined: None,
             idx,
             path: path.to_path_buf(),
             from_grid,
@@ -984,6 +989,22 @@ impl App {
         true
     }
 
+    /// 見送り理由を、**理由が変わったときだけ**記録する。毎フレーム出すとログが埋まり、
+    /// 出さないと「静かに止まった」が観測できない。判断には使わない記録専用の経路。
+    #[cfg(windows)]
+    fn log_native_video_open_pending_declined(&mut self, reason: &'static str, detail: String) {
+        let Some(pending) = self.native_video_open_pending.as_mut() else {
+            return;
+        };
+        if pending.last_declined == Some(reason) {
+            return;
+        }
+        pending.last_declined = Some(reason);
+        crate::logger::log(format!(
+            "[native-video] deferred regular open waiting: reason={reason} {detail}"
+        ));
+    }
+
     #[cfg(windows)]
     pub(super) fn poll_native_video_open_pending(&mut self, ctx: &egui::Context) {
         let Some(pending) = self.native_video_open_pending.as_ref() else {
@@ -993,6 +1014,16 @@ impl App {
             pending.parked_live_window_id,
             self.native_video_parked_live_input_window_id,
         ) {
+            let pending_owner = pending.parked_live_window_id;
+            let current_owner = self.native_video_parked_live_input_window_id;
+            let declined_idx = pending.idx;
+            self.log_native_video_open_pending_declined(
+                "owner_mismatch",
+                format!(
+                    "idx={declined_idx} pending_owner={pending_owner:?} \
+                     current_owner={current_owner:?}"
+                ),
+            );
             return;
         }
         let idx = pending.idx;
@@ -1006,10 +1037,19 @@ impl App {
         let input_seq = pending.input_seq;
         let parked_live_window_id = pending.parked_live_window_id;
 
-        if self.fullscreen_idx != Some(idx)
-            || !matches!(self.items.get(idx), Some(GridItem::Video(p)) if p == &path)
-            || self.fs_cache.contains_key(&idx)
-        {
+        let fullscreen_moved = self.fullscreen_idx != Some(idx);
+        let item_changed = !matches!(self.items.get(idx), Some(GridItem::Video(p)) if p == &path);
+        let already_cached = self.fs_cache.contains_key(&idx);
+        if fullscreen_moved || item_changed || already_cached {
+            // 破棄そのものは正常な経路 (別の項目へ移った / 既に開けた) だが、**どれが効いたのか**を
+            // 残さないと「黒いウィンドウのまま何も起きない」を後から説明できない。
+            crate::logger::log(format!(
+                "[native-video] drop deferred regular open: idx={idx} \
+                 fullscreen_moved={fullscreen_moved} item_changed={item_changed} \
+                 already_cached={already_cached} fullscreen_idx={:?} items_len={}",
+                self.fullscreen_idx,
+                self.items.len()
+            ));
             self.native_video_open_pending = None;
             return;
         }
@@ -1036,6 +1076,13 @@ impl App {
                 self.close_fullscreen();
                 ctx.request_repaint();
             } else {
+                self.log_native_video_open_pending_declined(
+                    "host_not_ready",
+                    format!(
+                        "idx={idx} remaining_ms={:.1}",
+                        deadline.saturating_duration_since(now).as_secs_f64() * 1000.0
+                    ),
+                );
                 ctx.request_repaint_after(
                     deadline
                         .saturating_duration_since(now)

@@ -33410,6 +33410,7 @@ mod still_window_mode_key_tests {
         source.from_idx = from_idx;
         app.native_video_source_swap_pending = Some(source);
         app.native_video_open_pending = Some(native_video::NativeVideoOpenPending {
+            last_declined: None,
             idx: target_idx,
             path: target_path.clone(),
             from_grid: false,
@@ -41863,6 +41864,7 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(video);
         let now = std::time::Instant::now();
         app.native_video_open_pending = Some(native_video::NativeVideoOpenPending {
+            last_declined: None,
             idx: video,
             path: video_path.clone(),
             from_grid: false,
@@ -48764,6 +48766,7 @@ mod still_window_mode_key_tests {
         app.transition_detached_window_state(108, DetachedWindowState::ParkedLive, "test_setup");
         let now = std::time::Instant::now();
         app.native_video_open_pending = Some(native_video::NativeVideoOpenPending {
+            last_declined: None,
             idx: 0,
             path,
             from_grid: false,
