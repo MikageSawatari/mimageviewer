@@ -3822,15 +3822,39 @@ struct VerticalReadingPage {
 struct ContinuousReadingUnitSpec {
     anchor_idx: usize,
     pages: Vec<usize>,
+    /// 分割中に、この段が元ページのどちら側か。分割していなければ `Full`。
+    ///
+    /// **同じ `anchor_idx` の段が 2 つ縦に並ぶ**ので、現在位置の照合は左右まで見る。
+    /// 元 index は正本のままなので、`contains_idx` はどちらの段にも真を返す
+    /// (テクスチャ・先読み・キャッシュは元ページ単位で足りる)。
+    slice: crate::page_split::PageSlice,
 }
 
 impl ContinuousReadingUnitSpec {
     fn pages(anchor_idx: usize, pages: Vec<usize>) -> Self {
-        Self { anchor_idx, pages }
+        Self {
+            anchor_idx,
+            pages,
+            slice: crate::page_split::PageSlice::Full,
+        }
+    }
+
+    /// 分割したページの片側だけを載せた段。
+    fn half(anchor_idx: usize, slice: crate::page_split::PageSlice) -> Self {
+        Self {
+            anchor_idx,
+            pages: vec![anchor_idx],
+            slice,
+        }
     }
 
     fn contains_idx(&self, idx: usize) -> bool {
         self.anchor_idx == idx || self.pages.contains(&idx)
+    }
+
+    /// 表示位置ちょうどの段か。左右まで一致するものだけ真。
+    fn is_step(&self, idx: usize, slice: crate::page_split::PageSlice) -> bool {
+        self.anchor_idx == idx && self.slice == slice
     }
 }
 
@@ -3839,7 +3863,12 @@ struct ContinuousReadingPageSize {
     idx: usize,
     width: f32,
     height: f32,
+    /// **元画像空間**の部分矩形。描画へはこのまま渡る。
     content_bbox: Option<egui::Rect>,
+    /// `content_bbox` を寸法計算へ使うための保存回転。`width` / `height` は回転後の
+    /// 寸法なので、両者を掛けるには矩形を表示空間へ写す必要がある
+    /// (詳細は [display-pipeline.md](../docs/display-pipeline.md) の座標系の節)。
+    rotation: crate::rotation_db::Rotation,
     logical_scale: f32,
 }
 
@@ -3850,12 +3879,17 @@ impl ContinuousReadingPageSize {
             width,
             height,
             content_bbox: None,
+            rotation: crate::rotation_db::Rotation::None,
             logical_scale: 1.0,
         }
     }
 
+    /// 寸法計算に使う**表示空間**の部分矩形。
     fn bbox(&self) -> egui::Rect {
         self.content_bbox
+            .map(|bbox| {
+                crate::displayed_image_transform::rotate_bbox_to_display(bbox, self.rotation)
+            })
             .unwrap_or_else(|| egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)))
     }
 
@@ -9598,16 +9632,11 @@ impl App {
     ///
     /// - 自由回転中は止める。`effective_bbox` がその間だけ部分矩形を降ろすので、
     ///   分割したまま描くと左右が同じ絵になる。保存しない一時値なので戻せば分割も戻る。
-    /// - 連結読み中は止める (MVP 対象外)。送りだけ分割して描画が全体のままだと同じ絵が 2 回出る。
+    ///
+    /// 連結読み中も分割する。同じステップ列から段を組むので、送りと並びが食い違わない。
     fn split_direction_now(&self) -> Option<crate::page_split::SplitDirection> {
         let direction = crate::page_split::SplitDirection::from_spread_mode(self.spread_mode)?;
         if self.fs_free_rotation.abs() > TRANSFORM_EPSILON {
-            return None;
-        }
-        if self
-            .fullscreen_idx
-            .is_some_and(|idx| self.continuous_reading_active_for_idx(idx))
-        {
             return None;
         }
         Some(direction)
@@ -25714,7 +25743,17 @@ impl App {
         let image_indices = build_image_reading_indices(&self.items, &display_order);
         let mut image_units = Vec::new();
 
-        if self.spread_mode.is_spread() {
+        if let Some(steps) = self.build_presentation_steps_for_nav(&image_indices) {
+            // 分割中は 1 つの元ページが 2 段になる。**並べる順序はページ送りと同じもの**
+            // なので、同じステップ列から作る (連結用に別の列を持たない)。
+            image_units.extend(steps.into_iter().map(|step| {
+                if step.slice.is_half() {
+                    ContinuousReadingUnitSpec::half(step.source_idx, step.slice)
+                } else {
+                    ContinuousReadingUnitSpec::pages(step.source_idx, vec![step.source_idx])
+                }
+            }));
+        } else if self.spread_mode.is_spread() {
             let spread_mode = self.spread_mode;
             image_units.extend(
                 self.build_spread_display_units_for_nav(&image_indices)
@@ -25735,7 +25774,13 @@ impl App {
             );
         }
 
-        let pos = image_units.iter().position(|unit| unit.contains_idx(idx))?;
+        // 同じ元ページの段が 2 つ並ぶので、まず左右まで一致する段を探す。
+        // 見つからない (分割していない / 見開きで idx が 2 ページ目) 場合だけ元 index で拾う。
+        let slice = self.fullscreen_page_slice;
+        let pos = image_units
+            .iter()
+            .position(|unit| unit.is_step(idx, slice))
+            .or_else(|| image_units.iter().position(|unit| unit.contains_idx(idx)))?;
         Some((image_units, pos))
     }
 
@@ -25816,7 +25861,10 @@ impl App {
             .map(|(screen_pos, idx)| {
                 let base = self.vertical_reading_base_size(idx, fallback, prefer_processed);
                 let rotation = self.get_rotation(idx);
-                let content_bbox = if rotation.is_none() {
+                let content_bbox = if unit.slice.is_half() {
+                    // 分割中は分割が勝つ (表示トリムとは併用しない)。
+                    Some(unit.slice.source_bbox(rotation))
+                } else if rotation.is_none() {
                     if let Some((left_bbox, right_bbox)) = paired_content_bboxes {
                         if screen_pos == 0 {
                             left_bbox
@@ -25841,6 +25889,7 @@ impl App {
                     width: base.x.max(1.0),
                     height: base.y.max(1.0),
                     content_bbox,
+                    rotation,
                     logical_scale: 1.0,
                 }
             })
@@ -47038,6 +47087,71 @@ mod tests {
     }
 
     #[test]
+    /// 連結読みの段は、**寸法計算では表示空間**の部分矩形を使う。
+    ///
+    /// `width` / `height` は回転後の寸法なのに `content_bbox` は元画像空間なので、
+    /// そのまま掛けると 90 度回転したページで縦横を取り違える。
+    #[test]
+    fn a_continuous_page_measures_its_crop_in_display_space() {
+        use crate::rotation_db::Rotation;
+
+        // 元画像の左半分。回転していなければ幅が半分。
+        let left_half = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(0.5, 1.0));
+        let upright = ContinuousReadingPageSize {
+            idx: 0,
+            width: 100.0,
+            height: 200.0,
+            content_bbox: Some(left_half),
+            rotation: Rotation::None,
+            logical_scale: 1.0,
+        };
+        assert!((upright.visible_width() - 50.0).abs() < 1e-3);
+        assert!((upright.visible_height() - 200.0).abs() < 1e-3);
+
+        // 同じ矩形でも 90 度回転して表示していれば、画面では**高さ**が半分になる。
+        let turned = ContinuousReadingPageSize {
+            rotation: Rotation::Cw90,
+            ..upright.clone()
+        };
+        assert!(
+            (turned.visible_width() - 100.0).abs() < 1e-3,
+            "{:?}",
+            turned.bbox()
+        );
+        assert!(
+            (turned.visible_height() - 100.0).abs() < 1e-3,
+            "{:?}",
+            turned.bbox()
+        );
+
+        // 部分矩形が無ければ回転にかかわらず全体。
+        let whole = ContinuousReadingPageSize::full(0, 100.0, 200.0);
+        assert!((whole.visible_width() - 100.0).abs() < 1e-3);
+        assert!((whole.visible_height() - 200.0).abs() < 1e-3);
+    }
+
+    /// 分割中は同じ元ページの段が 2 つ並ぶので、現在位置は左右まで見て選ぶ。
+    #[test]
+    fn a_split_page_needs_the_half_to_pick_its_row() {
+        use crate::page_split::PageSlice;
+
+        let left = ContinuousReadingUnitSpec::half(5, PageSlice::Left);
+        let right = ContinuousReadingUnitSpec::half(5, PageSlice::Right);
+
+        // 元 index はどちらの段にも属する (テクスチャと先読みは元ページ単位で足りる)。
+        assert!(left.contains_idx(5) && right.contains_idx(5));
+        // 左右まで見ればちょうど 1 つに決まる。
+        assert!(left.is_step(5, PageSlice::Left));
+        assert!(!left.is_step(5, PageSlice::Right));
+        assert!(right.is_step(5, PageSlice::Right));
+        assert!(!right.is_step(6, PageSlice::Right));
+
+        // 分割していない段は `Full` として一致する。
+        let whole = ContinuousReadingUnitSpec::pages(5, vec![5]);
+        assert!(whole.is_step(5, PageSlice::Full));
+        assert!(!whole.is_step(5, PageSlice::Left));
+    }
+
     fn continuous_single_page_rect_aligns_trimmed_content_inside_virtual_unit() {
         let unit_rect =
             egui::Rect::from_center_size(egui::pos2(100.0, 50.0), egui::vec2(80.0, 100.0));
@@ -47050,6 +47164,7 @@ mod tests {
                     egui::pos2(0.1, 0.0),
                     egui::pos2(0.9, 1.0),
                 )),
+                rotation: crate::rotation_db::Rotation::None,
                 logical_scale: 1.0,
             }],
             width: 80.0,
@@ -47082,6 +47197,7 @@ mod tests {
                     width: 100.0,
                     height: 120.0,
                     content_bbox: Some(left_bbox),
+                    rotation: crate::rotation_db::Rotation::None,
                     logical_scale: 1.0,
                 },
                 ContinuousReadingPageSize {
@@ -47089,6 +47205,7 @@ mod tests {
                     width: 100.0,
                     height: 120.0,
                     content_bbox: Some(right_bbox),
+                    rotation: crate::rotation_db::Rotation::None,
                     logical_scale: 1.0,
                 },
             ],
