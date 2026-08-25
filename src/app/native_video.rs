@@ -33,6 +33,13 @@ pub(super) struct VideoSeekStripSession {
     min_interval_secs: f64,
     drag_state: VideoSeekStripDragState,
     last_follow_recenter_at: Option<std::time::Instant>,
+    /// 可視セルが Pending のまま埋まらない状態が続いた開始時刻。埋まったら消す。
+    ///
+    /// `maybe_emit_fill_wait` は**全部 ready になったときだけ**出るので、「埋まらなかった」側は
+    /// 無言だった。実機で「末尾のセルが黒いまま」という報告が 2 度出たが、batch でも利用者の
+    /// 手元でも再現しない。次に出たときに証拠が残るよう、ここで一度だけ理由を出す。
+    visible_pending_since: Option<std::time::Instant>,
+    visible_pending_reported: bool,
 }
 
 #[cfg(windows)]
@@ -6874,6 +6881,8 @@ impl App {
                 min_interval_secs,
                 drag_state: VideoSeekStripDragState::Idle,
                 last_follow_recenter_at: None,
+                visible_pending_since: None,
+                visible_pending_reported: false,
             }));
         true
     }
@@ -7501,6 +7510,44 @@ impl App {
         true
     }
 
+    /// 可視セルが Pending のまま埋まらない状態を一度だけ報告する。
+    ///
+    /// 閾値を過ぎても埋まらなければ、どのセルがどの状態で止まっているかを 1 行出す。埋まれば
+    /// 状態を消すので、通常の読み込み中には何も出ない。再現しない「セルが黒いまま」の報告に
+    /// 対して、次に起きたときの証拠を残すのが目的。
+    #[cfg(windows)]
+    fn note_seek_strip_visible_pending(
+        session: &mut VideoSeekStripSession,
+        visible_cells_pending: bool,
+        worker_status: Option<&crate::video::seek_strip_thumbs::StripThumbnailWorkerStatus>,
+    ) -> Option<String> {
+        const STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(12);
+        if !visible_cells_pending {
+            session.visible_pending_since = None;
+            session.visible_pending_reported = false;
+            return None;
+        }
+        let started = *session
+            .visible_pending_since
+            .get_or_insert_with(std::time::Instant::now);
+        if session.visible_pending_reported || started.elapsed() < STALL_AFTER {
+            return None;
+        }
+        session.visible_pending_reported = true;
+        Some(format!(
+            "[video-seek-strip] visible cells still pending after {:.1}s: path={} center={:?}              axis={} worker_status={:?}",
+            started.elapsed().as_secs_f64(),
+            session.video_path.display(),
+            session.center,
+            match &session.axis {
+                VideoSeekStripAxisState::Resolving { .. } => "resolving".to_string(),
+                VideoSeekStripAxisState::Ready(axis) =>
+                    format!("ready/{} cells", axis.cell_count()),
+            },
+            worker_status,
+        ))
+    }
+
     #[cfg(windows)]
     pub(crate) fn sync_native_video_seek_strip(&mut self, ctx: &egui::Context, fs_idx: usize) {
         let current_path = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
@@ -7552,6 +7599,7 @@ impl App {
         let waveform_range_value_secs = self.settings.video_seek_strip_waveform_span_secs;
         let mut axis_failure = None;
         let mut axis_unavailable = None;
+        let mut stall_report: Option<String> = None;
         let mut axis_became_available = false;
         let mut request_repaint = false;
         let overlay = match &mut self.video_seek_strip_runtime {
@@ -7740,6 +7788,11 @@ impl App {
                         ),
                     },
                 );
+                stall_report = Self::note_seek_strip_visible_pending(
+                    session,
+                    visible_cells_pending,
+                    thumbnail_snapshot.as_ref().map(|snapshot| &snapshot.status),
+                );
                 Some(crate::video::native_presenter::NativeOverlaySeekStrip {
                     center: session.center,
                     axis: match &session.axis {
@@ -7762,6 +7815,9 @@ impl App {
                 })
             }
         };
+        if let Some(report) = stall_report {
+            crate::logger::log(report);
+        }
         if let Some(reason) = axis_unavailable {
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                 let unavailable =

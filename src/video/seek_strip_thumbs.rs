@@ -1175,9 +1175,25 @@ fn run_worker(
     }
 }
 
+/// 格子軸のセル間隔。**利用者の「画像間隔」設定を必ず尊重する。**
+///
+/// `fallback_interval_secs` は尺だけから決まる下限 (セル数が上限を超えないための値) で、
+/// `min_gap_secs` は利用者が選んだ最小間隔。**どちらも下限なので大きい方を採る。** 以前は
+/// 前者だけを使っていたため、索引が不完全で格子へ落ちた動画では設定が完全に無視され、
+/// 15 秒に設定しても 1 秒間隔のセルが並んでいた (実素材 172.7 秒の mp4 で 173 セル、
+/// 利用者報告 2026-08-26)。設定より細かい要求は上限保護のため通す。
+fn time_grid_interval_secs(fallback_interval_secs: f64, min_gap_secs: f64) -> f64 {
+    if min_gap_secs.is_finite() && min_gap_secs > 0.0 {
+        fallback_interval_secs.max(min_gap_secs)
+    } else {
+        fallback_interval_secs
+    }
+}
+
 fn fallback_strip_axis(
     duration_secs: f64,
     fallback_interval_secs: f64,
+    min_gap_secs: f64,
     diagnostics: StripAxisDiagnostics,
 ) -> Result<ResolvedStripAxisOutcome, String> {
     if !duration_secs.is_finite() {
@@ -1194,7 +1210,7 @@ fn fallback_strip_axis(
     }
     Ok(ResolvedStripAxisOutcome::Ready(ResolvedStripAxis {
         axis: StripAxis::TimeGrid {
-            interval_secs: fallback_interval_secs,
+            interval_secs: time_grid_interval_secs(fallback_interval_secs, min_gap_secs),
             duration_secs,
         },
         diagnostics,
@@ -1227,6 +1243,7 @@ fn resolve_strip_axis(
             return fallback_strip_axis(
                 duration_secs,
                 fallback_interval_secs,
+                min_gap_secs,
                 StripAxisDiagnostics::without_index(StripAxisResolutionReason::InputOpenFailed),
             );
         }
@@ -1236,6 +1253,7 @@ fn resolve_strip_axis(
             return fallback_strip_axis(
                 duration_secs,
                 fallback_interval_secs,
+                min_gap_secs,
                 StripAxisDiagnostics::without_index(StripAxisResolutionReason::VideoStreamMissing),
             );
         };
@@ -1245,6 +1263,7 @@ fn resolve_strip_axis(
         return fallback_strip_axis(
             duration_secs,
             fallback_interval_secs,
+            min_gap_secs,
             StripAxisDiagnostics::without_index(StripAxisResolutionReason::IndexUnavailable),
         );
     };
@@ -1269,7 +1288,12 @@ fn resolve_strip_axis(
             let adopted = thin_keyframes(&keyframes, min_gap_secs);
             if adopted.is_empty() {
                 diagnostics.reason = StripAxisResolutionReason::NoAdoptedKeyframes;
-                fallback_strip_axis(duration_secs, fallback_interval_secs, diagnostics)
+                fallback_strip_axis(
+                    duration_secs,
+                    fallback_interval_secs,
+                    min_gap_secs,
+                    diagnostics,
+                )
             } else {
                 Ok(ResolvedStripAxisOutcome::Ready(ResolvedStripAxis {
                     axis: StripAxis::KeyframeIndex { keyframes, adopted },
@@ -1295,7 +1319,12 @@ fn resolve_strip_axis(
                     StripAxisResolutionReason::IncompleteIndexCoverage
                 }
             };
-            fallback_strip_axis(duration_secs, fallback_interval_secs, diagnostics)
+            fallback_strip_axis(
+                duration_secs,
+                fallback_interval_secs,
+                min_gap_secs,
+                diagnostics,
+            )
         }
     }
 }
@@ -2526,6 +2555,25 @@ fn convert_keyframe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 実機報告 2026-08-26: 画像間隔を 15 秒にしても 1 秒間隔のセルが並ぶ動画があった。
+    /// 索引が不完全で格子軸へ落ちると、間隔が尺だけから決まり設定を見ていなかった。
+    /// 数値は報告された mp4 のもの (172.7 秒 → `pick_interval` が 1.0 を返す)。
+    #[test]
+    fn the_time_grid_never_ignores_the_chosen_interval() {
+        let from_duration = crate::ui_video_tile::pick_interval(172.733, 240);
+        assert_eq!(from_duration, 1.0, "前提: 尺だけなら 1 秒になる");
+        assert_eq!(
+            time_grid_interval_secs(from_duration, 15.0),
+            15.0,
+            "利用者が 15 秒を選んでいるなら 15 秒"
+        );
+        // 上限保護のための下限は残す: 設定がそれより細かくても、尺由来の値まで戻す。
+        assert_eq!(time_grid_interval_secs(30.0, 0.5), 30.0);
+        // 未設定 / 不正値は尺由来の値をそのまま使う。
+        assert_eq!(time_grid_interval_secs(2.0, 0.0), 2.0);
+        assert_eq!(time_grid_interval_secs(2.0, f64::NAN), 2.0);
+    }
 
     /// 実素材の数値そのもの (06jademarx04rocker.wmv): duration は 118.019 と申告されるが、
     /// 実際に復号できる最後のフレームは 116.866。格子はその差ぶんだけフレームの無い区間へ

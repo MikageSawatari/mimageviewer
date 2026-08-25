@@ -239,6 +239,23 @@ fn native_seek_preview_layout(
     }
 }
 
+/// 共有プレビューの目的時刻と、**画面上のどこを指していたか** をまとめて置き換える。
+///
+/// x を持たせるのは、プレビューを「指している物の上」に出すため。以前は時刻だけを共有し、
+/// x は毎回シークバー上の位置から引き直していた。ストリップはキーフレーム番号軸で再生位置
+/// 中心なので、シークバーの時間線形な x とは無関係になり、プレビューがポインタから離れた
+/// 場所に出ていた (利用者報告 2026-08-26「左端に寄ったり右にずれたり」)。
+///
+/// 2 つの `Option` が食い違わないよう、更新はこの関数だけが行う。
+fn set_seek_preview_target(
+    target_secs: &mut Option<f64>,
+    anchor_x: &mut Option<f32>,
+    value: Option<(f64, f32)>,
+) {
+    *target_secs = value.map(|(secs, _)| secs);
+    *anchor_x = value.map(|(_, x)| x);
+}
+
 fn native_seek_strip_preview_hover(
     strip: &NativeOverlaySeekStrip,
     strip_rect: egui::Rect,
@@ -1293,6 +1310,8 @@ struct NativeEguiOverlay {
     last_thumbnail_request_secs: Option<f64>,
     last_thumbnail_request_at: Option<Instant>,
     hover_preview_target_secs: Option<f64>,
+    /// `hover_preview_target_secs` を出した画面上の x。更新は `set_seek_preview_target` だけ。
+    hover_preview_anchor_x: Option<f32>,
     hover_preview_pinned: bool,
     /// 実機修正 (2026-05-12 P1 #2): 直近 egui run で描画した preview rect (= サムネイル枠)。
     /// `compute_hud_regions` が region 計算で参照する。region を cursor x 追従で再計算すると
@@ -6423,6 +6442,7 @@ impl NativeEguiOverlay {
             last_thumbnail_request_secs: None,
             last_thumbnail_request_at: None,
             hover_preview_target_secs: None,
+            hover_preview_anchor_x: None,
             hover_preview_pinned: false,
             last_drawn_preview_rect: None,
             last_drawn_vst3_panel_rect: None,
@@ -7660,6 +7680,7 @@ impl NativeEguiOverlay {
 
     fn clear_seek_preview(&mut self) {
         let had_target = self.hover_preview_target_secs.take().is_some();
+        self.hover_preview_anchor_x = None;
         let had_worker_request = self.last_thumbnail_request_secs.take().is_some();
         let had_request = had_target || had_worker_request;
         self.last_thumbnail_request_at = None;
@@ -9064,6 +9085,7 @@ impl NativeEguiOverlay {
         let mut last_thumbnail_request_secs = self.last_thumbnail_request_secs;
         let mut last_thumbnail_request_at = self.last_thumbnail_request_at;
         let mut hover_preview_target_secs = self.hover_preview_target_secs;
+        let mut hover_preview_anchor_x = self.hover_preview_anchor_x;
         let mut video_speed_popup_open = self.video_speed_popup_open;
         let mut frame_step_hold = self.frame_step_hold;
         let mut seek_row_gesture = self.seek_row_gesture;
@@ -9089,7 +9111,11 @@ impl NativeEguiOverlay {
             last_seek_target_secs = None;
             last_thumbnail_request_secs = None;
             last_thumbnail_request_at = None;
-            hover_preview_target_secs = None;
+            set_seek_preview_target(
+                &mut hover_preview_target_secs,
+                &mut hover_preview_anchor_x,
+                None,
+            );
             frame_step_hold = None;
         }
         let mut raw_input = egui::RawInput {
@@ -10393,18 +10419,35 @@ impl NativeEguiOverlay {
                         let strip_preview_active = if seek_preview_allowed {
                             match seek_strip_preview_hover {
                                 NativeSeekStripPreviewHover::Target(target) => {
-                                    hover_preview_target_secs =
-                                        Some(target.clamp(0.0, duration_secs));
+                                    // ストリップは自分が指されている x をそのまま渡す。
+                                    // 時刻からシークバー上の x を引き直すと、軸が違うので
+                                    // ポインタから離れた場所へ出る。
+                                    let anchor = pointer_pos
+                                        .map(|pos| pos.x)
+                                        .unwrap_or(overlay_width_points * 0.5);
+                                    set_seek_preview_target(
+                                        &mut hover_preview_target_secs,
+                                        &mut hover_preview_anchor_x,
+                                        Some((target.clamp(0.0, duration_secs), anchor)),
+                                    );
                                     true
                                 }
                                 NativeSeekStripPreviewHover::Suppress => {
-                                    hover_preview_target_secs = None;
+                                    set_seek_preview_target(
+                                        &mut hover_preview_target_secs,
+                                        &mut hover_preview_anchor_x,
+                                        None,
+                                    );
                                     false
                                 }
                                 NativeSeekStripPreviewHover::Outside => false,
                             }
                         } else {
-                            hover_preview_target_secs = None;
+                            set_seek_preview_target(
+                                &mut hover_preview_target_secs,
+                                &mut hover_preview_anchor_x,
+                                None,
+                            );
                             false
                         };
                         if seek_preview_allowed
@@ -10415,13 +10458,21 @@ impl NativeEguiOverlay {
                             let x = pos.x.clamp(bar_rect.min.x, bar_rect.max.x);
                             let frac =
                                 ((x - bar_rect.min.x) / bar_rect.width()).clamp(0.0, 1.0);
-                            hover_preview_target_secs = Some(duration_secs * frac as f64);
+                            set_seek_preview_target(
+                                &mut hover_preview_target_secs,
+                                &mut hover_preview_anchor_x,
+                                Some((duration_secs * frac as f64, x)),
+                            );
                         }
                         if position_controls_available
                             && let Some(target) = hover_preview_target_secs
                         {
-                            let frac = (target / duration_secs).clamp(0.0, 1.0) as f32;
-                            let x = bar_rect.min.x + bar_rect.width() * frac;
+                            // プレビューは「指している物の上」に出す。anchor が無い経路
+                            // (状態復元など) だけ、従来どおりシークバー上の位置へ落とす。
+                            let x = hover_preview_anchor_x.unwrap_or_else(|| {
+                                let frac = (target / duration_secs).clamp(0.0, 1.0) as f32;
+                                bar_rect.min.x + bar_rect.width() * frac
+                            });
                             let hover_preview_bookmarked = target_has_marker(
                                 &timeline_markers,
                                 target,
@@ -10463,7 +10514,11 @@ impl NativeEguiOverlay {
                                 && !strip_preview_active
                                 && !pointer_in_preview
                             {
-                                hover_preview_target_secs = None;
+                                set_seek_preview_target(
+                                    &mut hover_preview_target_secs,
+                                    &mut hover_preview_anchor_x,
+                                    None,
+                                );
                             } else {
                                 // 実機修正 (2026-05-12 P1 #2): 実描画 rect を記録。
                                 // `compute_hud_regions` が region 計算で読む。
@@ -10982,6 +11037,7 @@ impl NativeEguiOverlay {
         self.last_thumbnail_request_secs = last_thumbnail_request_secs;
         self.last_thumbnail_request_at = last_thumbnail_request_at;
         self.hover_preview_target_secs = hover_preview_target_secs;
+        self.hover_preview_anchor_x = hover_preview_anchor_x;
         self.last_drawn_preview_rect = last_drawn_preview_rect;
         self.last_drawn_vst3_panel_rect = last_drawn_vst3_panel_rect;
         self.last_emitted_vst3_panel_pos = last_emitted_vst3_panel_pos;
@@ -11952,6 +12008,42 @@ mod tests {
             short_strip.min.y - super::SEEK_PREVIEW_GAP
         );
         assert!(!short_layout.preview_rect.intersects(short_strip));
+    }
+
+    /// 実機報告 2026-08-26: ストリップを hover するとプレビューがポインタから離れた場所に出て、
+    /// 左端に寄ったり右へずれたりした。x を時刻からシークバー上の位置へ引き直していたため。
+    /// ストリップはキーフレーム番号軸で再生位置中心なので、その x は時間線形の x と一致しない。
+    #[test]
+    fn the_preview_follows_whichever_surface_the_pointer_is_over() {
+        let mut target = None;
+        let mut anchor = None;
+
+        // ストリップ: 指している x をそのまま使う。同じ時刻でもシークバー上の位置とは違う。
+        super::set_seek_preview_target(&mut target, &mut anchor, Some((250.0, 180.0)));
+        assert_eq!(target, Some(250.0));
+        assert_eq!(anchor, Some(180.0));
+
+        // シークバー: バー上で clamp した x を使う。
+        super::set_seek_preview_target(&mut target, &mut anchor, Some((250.0, 1500.0)));
+        assert_eq!(anchor, Some(1500.0));
+
+        // 片方だけ残らない。
+        super::set_seek_preview_target(&mut target, &mut anchor, None);
+        assert_eq!((target, anchor), (None, None));
+    }
+
+    #[test]
+    fn the_preview_is_centred_on_its_anchor() {
+        let overlay_width = 1920.0;
+        let hud_rect = egui::Rect::from_min_size(
+            egui::pos2(0.0, 1080.0 - HUD_BOTTOM_HEIGHT),
+            egui::vec2(overlay_width, HUD_BOTTOM_HEIGHT),
+        );
+        let left = super::native_seek_preview_layout(overlay_width, 400.0, hud_rect, None);
+        let right = super::native_seek_preview_layout(overlay_width, 1500.0, hud_rect, None);
+        assert_eq!(left.preview_rect.center().x, 400.0);
+        assert_eq!(right.preview_rect.center().x, 1500.0);
+        assert!(left.preview_rect.center().x < right.preview_rect.center().x);
     }
 
     #[test]
