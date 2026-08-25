@@ -458,7 +458,9 @@ archive member / nested container の identity は大小文字を区別せず、
 保持する。成功・キャンセル・部分成功の終端で変更sectionを1回だけ確定し、影響するmain /
 detached / parked contextの現在項目キーを3 ms / 2048項目のフレーム予算でcompact snapshot化する。
 専用refresh workerがrating / tag / page state / container state / pinをSQLiteからbatch取得し、
-UIはitems generationとdetached window identityが一致する完成cacheだけをswapする。不一致時は
+UIは要求構築時に焼き込んだViewerContextIdのresidenceがMounted / AtRestで、かつitems generationが
+一致する完成cacheだけをswapする。Retiredへの遅延結果は正常な破棄、Unknownはidentity不変条件違反として
+診断して破棄する。不一致時は
 モーダルを維持して再snapshot・再取得する。bookmark / media cacheは影響contextごとに1回だけ
 無効化し、全体page badge集合もworker生成snapshotへ置換する。folder pinのlookup identityは
 通常ロードと共通化し、current folder / 現在のZIP本 / ZipDirのliteral-effective aliasを含める。

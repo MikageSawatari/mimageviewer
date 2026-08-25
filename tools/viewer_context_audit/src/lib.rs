@@ -119,6 +119,7 @@ const ALLOWLIST_ENTRIES: &[AllowlistEntry] = &[
 const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "item struct pub (crate) struct ViewerContextId () ;",
     "inherent fn    ViewerContextId ::  pub (in crate :: app) fn serial (self) -> u64",
+    "inherent fn    ViewerContextId :: # [cfg (not (windows))] pub (in crate :: app) const fn single_context () -> Self",
     "item enum pub (crate) enum ContextResidence { Mounted , AtRest , Building , Retiring , Retired , Unknown , }",
     "item enum pub (in crate :: app) enum ForkPolicy { LiveMediaPark { window_id : u64 } , MaterializedStillOpen , }",
     "item enum pub (in crate :: app) enum BindError { WindowOwnedBy (ViewerContextId) , ContextOwnedBy (u64) , WrongOrigin (Option < ViewerContextId >) , NotBindable (ContextResidence) , }",

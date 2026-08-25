@@ -9,6 +9,16 @@ impl ViewerContextId {
     pub(in crate::app) fn serial(self) -> u64 {
         self.0
     }
+
+    #[cfg(not(windows))]
+    pub(in crate::app) const fn single_context() -> Self {
+        Self(0)
+    }
+
+    #[cfg(test)]
+    pub(in crate::app) const fn for_test(serial: u64) -> Self {
+        Self(serial)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

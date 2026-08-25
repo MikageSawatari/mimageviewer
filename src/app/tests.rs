@@ -10,6 +10,8 @@ use tempfile::TempDir;
 std::thread_local! {
     static METADATA_BUSY_INITIAL_FOR_TEST: Cell<bool> = const { Cell::new(false) };
     static METADATA_STALE_INITIAL_FOR_TEST: Cell<bool> = const { Cell::new(false) };
+    static METADATA_IMPORT_DROP_LOG_TRACE: RefCell<Option<Vec<String>>> =
+        const { RefCell::new(None) };
     static CURRENT_EDIT_PREVIEW_CLEAR_TRACE: RefCell<Option<Vec<Option<PathBuf>>>> =
         const { RefCell::new(None) };
 }
@@ -32,6 +34,30 @@ pub(super) fn take_metadata_stale_initial_for_test() -> bool {
 #[cfg(windows)]
 fn set_metadata_stale_initial_for_test() {
     METADATA_STALE_INITIAL_FOR_TEST.with(|initial| initial.set(true));
+}
+
+#[cfg(windows)]
+fn begin_metadata_import_drop_log_trace() {
+    METADATA_IMPORT_DROP_LOG_TRACE.with(|trace| *trace.borrow_mut() = Some(Vec::new()));
+}
+
+#[cfg(windows)]
+pub(super) fn record_metadata_import_drop_log_for_test(message: &str) {
+    METADATA_IMPORT_DROP_LOG_TRACE.with(|trace| {
+        if let Some(trace) = trace.borrow_mut().as_mut() {
+            trace.push(message.to_string());
+        }
+    });
+}
+
+#[cfg(windows)]
+fn take_metadata_import_drop_log_trace() -> Vec<String> {
+    METADATA_IMPORT_DROP_LOG_TRACE.with(|trace| {
+        trace
+            .borrow_mut()
+            .take()
+            .expect("metadata import drop-log trace must be started")
+    })
 }
 
 #[cfg(windows)]
@@ -557,12 +583,12 @@ fn contextless_test_window(ctx: &egui::Context, id: u64) -> DetachedImageWindowS
 
 #[cfg(windows)]
 fn metadata_context_result(
-    slot: crate::app::metadata_import_refresh::ContextSlot,
+    context_id: ViewerContextId,
     items_generation: u64,
     rating: u8,
 ) -> crate::app::metadata_import_refresh::ContextResult {
     crate::app::metadata_import_refresh::ContextResult {
-        slot,
+        context_id,
         items_generation,
         rating_cache: Some(std::collections::HashMap::from([(0, rating)])),
         tags_cache: None,
@@ -637,28 +663,33 @@ fn metadata_folder_pin_refresh_does_not_navigate_or_close_detached_viewers() {
     )));
     let previous_cancel = std::sync::Arc::clone(&app.cancel_token);
     let main_generation = app.items_generation;
+    let main_id = app.viewer_context_main();
 
     let active_window_id = 789;
     let active_generation = (1_u64 << 63) | (5_u64 << 32);
-    app.build_active_context_for_test(Some(active_window_id), DetachedSource::Image, |active| {
-        active.current_folder = Some(folder.clone());
-        active.items = vec![
-            GridItem::Image(folder.join("active.png")),
-            GridItem::Folder(folder.join("child")),
-        ];
-        active.image_metas = vec![None; 2];
-        active.thumbnails = vec![ThumbnailState::Pending; 2];
-        active.fullscreen_idx = Some(0);
-        active.items_generation = active_generation;
-        active.navigation_scope = ViewerNavigationScope::DetachedPhysical;
-        active.viewer_presentation = ViewerPresentation::DetachedWindow;
-        active.detached_viewer_independent_active = true;
-        active.detached_viewer_window_id = Some(active_window_id);
-    });
+    let active_id = app.build_active_context_for_test(
+        Some(active_window_id),
+        DetachedSource::Image,
+        |active| {
+            active.current_folder = Some(folder.clone());
+            active.items = vec![
+                GridItem::Image(folder.join("active.png")),
+                GridItem::Folder(folder.join("child")),
+            ];
+            active.image_metas = vec![None; 2];
+            active.thumbnails = vec![ThumbnailState::Pending; 2];
+            active.fullscreen_idx = Some(0);
+            active.items_generation = active_generation;
+            active.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+            active.viewer_presentation = ViewerPresentation::DetachedWindow;
+            active.detached_viewer_independent_active = true;
+            active.detached_viewer_window_id = Some(active_window_id);
+        },
+    );
 
     let window_id = 790;
     let parked_generation = (1_u64 << 63) | (6_u64 << 32);
-    app.push_window_context_for_test(&ctx, window_id, |parked| {
+    let parked_id = app.push_window_context_for_test(&ctx, window_id, |parked| {
         parked.current_folder = Some(folder.clone());
         parked.items = vec![GridItem::Video(folder.join("parked.mp4"))];
         parked.image_metas = vec![None];
@@ -670,32 +701,17 @@ fn metadata_folder_pin_refresh_does_not_navigate_or_close_detached_viewers() {
         parked.detached_viewer_window_id = Some(window_id);
     });
 
-    let mut main = metadata_context_result(
-        crate::app::metadata_import_refresh::ContextSlot::Main,
-        main_generation,
-        0,
-    );
+    let mut main = metadata_context_result(main_id, main_generation, 0);
     main.rating_cache = None;
     main.current_rating = None;
     main.folder_pin_map = Some(Default::default());
     main.folder_pin_reset_indices = Some(vec![0]);
-    let mut active = metadata_context_result(
-        crate::app::metadata_import_refresh::ContextSlot::ActiveDetached(Some(active_window_id)),
-        active_generation,
-        0,
-    );
+    let mut active = metadata_context_result(active_id, active_generation, 0);
     active.rating_cache = None;
     active.current_rating = None;
     active.folder_pin_map = Some(Default::default());
     active.folder_pin_reset_indices = Some(vec![1]);
-    let mut paused = metadata_context_result(
-        crate::app::metadata_import_refresh::ContextSlot::PausedDetached {
-            index: 0,
-            window_id,
-        },
-        parked_generation,
-        0,
-    );
+    let mut paused = metadata_context_result(parked_id, parked_generation, 0);
     paused.rating_cache = None;
     paused.current_rating = None;
     paused.folder_pin_map = Some(Default::default());
@@ -869,7 +885,7 @@ fn window_mount_round_trips_context_when_snapshot_vector_changes_inside_closure(
 
 #[test]
 #[cfg(windows)]
-fn metadata_apply_preserves_paused_index_three_way_identity() {
+fn metadata_apply_rejects_stale_generation_for_baked_context_identity() {
     let ctx = egui::Context::default();
     let changed = crate::metadata_transfer::ImportChangedSections {
         ratings: true,
@@ -878,50 +894,50 @@ fn metadata_apply_preserves_paused_index_three_way_identity() {
 
     let mut mismatched = phase_c_support::setup_app();
     let generation = mismatched.items_generation;
-    mismatched.push_window_context_for_test(&ctx, 710, |context| {
+    let context_id = mismatched.push_window_context_for_test(&ctx, 710, |context| {
         context.items_generation = generation;
         context.rating_cache = std::collections::HashMap::from([(0, 2)]);
     });
     let result = crate::app::metadata_import_refresh::RefreshResult {
         contexts: vec![metadata_context_result(
-            crate::app::metadata_import_refresh::ContextSlot::PausedDetached {
-                index: 0,
-                window_id: 711,
-            },
-            mismatched.items_generation,
+            context_id,
+            mismatched.items_generation.wrapping_add(1),
             5,
         )],
         page_snapshot: None,
         errors: Vec::new(),
     };
     let (_, stale) = mismatched.apply_metadata_import_terminal_refresh(result, changed);
-    assert!(stale, "same index with another id must be stale");
+    assert!(
+        stale,
+        "the baked identity still needs a current item generation"
+    );
     assert_eq!(
         mismatched
             .with_window_viewer_context(710, |mounted| { mounted.rating_cache.get(&0).copied() }),
         Ok(Some(2)),
-        "mismatched id must not apply the result"
+        "a stale generation must not apply to the correctly identified context"
     );
 }
 
 #[test]
 #[cfg(windows)]
-fn metadata_apply_skips_shifted_window_when_original_index_is_out_of_range() {
+fn metadata_apply_drops_retired_owner_without_touching_shifted_survivor() {
     let ctx = egui::Context::default();
     let mut shifted = phase_c_support::setup_app();
-    shifted.push_window_context_for_test(&ctx, 719, |_| {});
+    let retired_id = shifted.push_window_context_for_test(&ctx, 719, |_| {});
     let generation = shifted.items_generation;
     shifted.push_window_context_for_test(&ctx, 720, |context| {
         context.items_generation = generation;
         context.rating_cache = std::collections::HashMap::from([(0, 3)]);
     });
+    shifted
+        .close_and_retire_context(retired_id, "test_metadata_shifted_retire", |_| {}, |_| ())
+        .expect("the removed context must retire");
     shifted.detached_image_windows.remove(0);
     let result = crate::app::metadata_import_refresh::RefreshResult {
         contexts: vec![metadata_context_result(
-            crate::app::metadata_import_refresh::ContextSlot::PausedDetached {
-                index: 1,
-                window_id: 720,
-            },
+            retired_id,
             shifted.items_generation,
             5,
         )],
@@ -935,21 +951,158 @@ fn metadata_apply_skips_shifted_window_when_original_index_is_out_of_range() {
             ..Default::default()
         },
     );
-    assert!(
-        !stale,
-        "an original index that is now out of range must skip silently"
-    );
+    assert!(!stale, "a retired request owner is a normal terminal drop");
     assert_eq!(
         shifted
             .with_window_viewer_context(720, |mounted| { mounted.rating_cache.get(&0).copied() }),
         Ok(Some(3)),
-        "id lookup must not apply a result whose original index is out of range"
+        "a retired owner's result must not fall through to the shifted survivor"
     );
 }
 
 #[test]
 #[cfg(windows)]
-fn metadata_request_preserves_paused_vector_index_across_bundleless_window() {
+fn metadata_refresh_context_identity_survives_closing_an_earlier_window() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let import_root = PathBuf::from(r"C:\Pictures");
+    app.current_folder = Some(PathBuf::from(r"C:\Unrelated"));
+
+    let earlier_window_id = 721;
+    let target_window_id = 722;
+    let earlier_id = app.push_window_context_for_test(&ctx, earlier_window_id, |earlier| {
+        earlier.current_folder = Some(import_root.join("Earlier"));
+        earlier.items = vec![GridItem::Image(
+            import_root.join("Earlier").join("page.jpg"),
+        )];
+        earlier.image_metas = vec![None];
+        earlier.thumbnails = vec![ThumbnailState::Pending];
+    });
+    let target_context_id = app.push_window_context_for_test(&ctx, target_window_id, |target| {
+        target.current_folder = Some(import_root.join("Target"));
+        target.items = vec![GridItem::Image(import_root.join("Target").join("page.jpg"))];
+        target.image_metas = vec![None];
+        target.thumbnails = vec![ThumbnailState::Pending];
+        target.rating_cache = std::collections::HashMap::from([(0, 2)]);
+    });
+
+    app.begin_metadata_import_terminal_refresh();
+    while !app.advance_metadata_import_terminal_refresh(&import_root, false, false) {}
+    let request = app
+        .take_metadata_import_refresh_requests()
+        .into_iter()
+        .find(|request| request.context_id == target_context_id)
+        .expect("the target window must have a refresh request before the earlier close");
+
+    app.close_and_retire_context(
+        earlier_id,
+        "test_close_before_metadata_apply",
+        |_| {},
+        |_| (),
+    )
+    .expect("the earlier context must retire");
+    app.detached_image_windows
+        .retain(|window| window.id != earlier_window_id);
+
+    let result = crate::app::metadata_import_refresh::RefreshResult {
+        contexts: vec![metadata_context_result(
+            request.context_id,
+            request.items_generation,
+            5,
+        )],
+        page_snapshot: None,
+        errors: Vec::new(),
+    };
+    let (_, stale) = app.apply_metadata_import_terminal_refresh(
+        result,
+        crate::metadata_transfer::ImportChangedSections {
+            ratings: true,
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        !stale,
+        "the surviving context and item list are still current"
+    );
+    assert_eq!(
+        app.with_window_viewer_context(target_window_id, |target| {
+            target.rating_cache.get(&0).copied()
+        }),
+        Ok(Some(5)),
+        "closing a preceding window must not discard the surviving context's refresh"
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn metadata_refresh_context_identity_survives_main_promotion() {
+    let mut app = phase_c_support::setup_app();
+    let import_root = PathBuf::from(r"C:\Clips");
+    let video_path = import_root.join("movie.mp4");
+    let window_id = 723;
+    app.current_folder = Some(import_root.clone());
+    app.items = vec![GridItem::Video(video_path)];
+    app.image_metas = vec![None];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.rating_cache = std::collections::HashMap::from([(0, 2)]);
+    app.fullscreen_idx = Some(0);
+    app.selected = Some(0);
+    app.viewer_presentation = ViewerPresentation::DetachedWindow;
+    app.begin_mounted_detached_session_for_test(window_id, DetachedSource::Video);
+    let requested_context_id = app.viewer_context_main();
+
+    app.begin_metadata_import_terminal_refresh();
+    while !app.advance_metadata_import_terminal_refresh(&import_root, false, false) {}
+    let request = app
+        .take_metadata_import_refresh_requests()
+        .into_iter()
+        .find(|request| request.context_id == requested_context_id)
+        .expect("the context bound as main at request time must have a refresh request");
+
+    assert!(app.promote_active_detached_video_for_main_context_change());
+    let new_main_id = app.viewer_context_main();
+    assert_ne!(new_main_id, requested_context_id);
+    app.rating_cache = std::collections::HashMap::from([(0, 1)]);
+
+    let result = crate::app::metadata_import_refresh::RefreshResult {
+        contexts: vec![metadata_context_result(
+            request.context_id,
+            request.items_generation,
+            5,
+        )],
+        page_snapshot: None,
+        errors: Vec::new(),
+    };
+    let (_, stale) = app.apply_metadata_import_terminal_refresh(
+        result,
+        crate::metadata_transfer::ImportChangedSections {
+            ratings: true,
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        !stale,
+        "the requested context and item list are still current"
+    );
+    assert_eq!(
+        app.with_viewer_context(requested_context_id, |requested| {
+            requested.rating_cache.get(&0).copied()
+        }),
+        Ok(Some(5)),
+        "the result must follow the context that was main when the request was built"
+    );
+    assert_eq!(
+        app.rating_cache.get(&0),
+        Some(&1),
+        "the context newly bound as main must not receive the older request's result"
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn metadata_request_bakes_context_identity_across_bundleless_window() {
     let mut app = phase_c_support::setup_app();
     let ctx = egui::Context::default();
     let import_root = PathBuf::from(r"C:\Pictures");
@@ -958,7 +1111,7 @@ fn metadata_request_preserves_paused_vector_index_across_bundleless_window() {
     let bundleless = contextless_test_window(&ctx, 730);
     app.detached_image_windows.push(bundleless);
 
-    app.push_window_context_for_test(&ctx, 731, |indexed| {
+    let indexed_id = app.push_window_context_for_test(&ctx, 731, |indexed| {
         indexed.current_folder = Some(PathBuf::from(r"C:\Pictures\Child"));
         indexed.items = vec![GridItem::Image(PathBuf::from(
             r"C:\Pictures\Child\page.jpg",
@@ -971,15 +1124,11 @@ fn metadata_request_preserves_paused_vector_index_across_bundleless_window() {
     while !app.advance_metadata_import_terminal_refresh(&import_root, false, false) {}
     let requests = app.take_metadata_import_refresh_requests();
 
-    assert!(requests.iter().any(|request| {
-        matches!(
-            request.slot,
-            crate::app::metadata_import_refresh::ContextSlot::PausedDetached {
-                index: 1,
-                window_id: 731
-            }
-        )
-    }));
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.context_id == indexed_id)
+    );
 }
 
 #[test]
@@ -990,6 +1139,9 @@ fn failed_context_mounts_do_not_change_busy_complete_or_stale_results() {
     let window_id = 740;
     let bundleless = contextless_test_window(&ctx, window_id);
     app.detached_image_windows.push(bundleless);
+    let retired_id = app.build_window_context_for_test(741, |_| {});
+    app.close_and_retire_context(retired_id, "test_retired_metadata_owner", |_| {}, |_| ())
+        .expect("test metadata owner must retire");
 
     assert!(
         !app.quiesce_metadata_transfer_context_writers(false)
@@ -1009,14 +1161,7 @@ fn failed_context_mounts_do_not_change_busy_complete_or_stale_results() {
     );
 
     let result = crate::app::metadata_import_refresh::RefreshResult {
-        contexts: vec![metadata_context_result(
-            crate::app::metadata_import_refresh::ContextSlot::PausedDetached {
-                index: 0,
-                window_id,
-            },
-            app.items_generation,
-            5,
-        )],
+        contexts: vec![metadata_context_result(retired_id, app.items_generation, 5)],
         page_snapshot: None,
         errors: Vec::new(),
     };
@@ -1029,14 +1174,7 @@ fn failed_context_mounts_do_not_change_busy_complete_or_stale_results() {
     );
     assert!(!stale, "a missing bundle must not contribute staleness");
     let result = crate::app::metadata_import_refresh::RefreshResult {
-        contexts: vec![metadata_context_result(
-            crate::app::metadata_import_refresh::ContextSlot::PausedDetached {
-                index: 0,
-                window_id,
-            },
-            app.items_generation,
-            5,
-        )],
+        contexts: vec![metadata_context_result(retired_id, app.items_generation, 5)],
         page_snapshot: None,
         errors: Vec::new(),
     };
@@ -1051,6 +1189,69 @@ fn failed_context_mounts_do_not_change_busy_complete_or_stale_results() {
     assert!(
         stale,
         "a failed mount must not turn an already-stale accumulator false"
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn metadata_refresh_drops_retired_and_records_unknown_context_identity() {
+    let mut app = phase_c_support::setup_app();
+    app.rating_cache = std::collections::HashMap::from([(0, 2)]);
+    let retired_id = app.build_window_context_for_test(742, |_| {});
+    app.close_and_retire_context(retired_id, "test_retired_metadata_result", |_| {}, |_| ())
+        .expect("test metadata context must retire");
+    let unknown_id = ViewerContextId::for_test(u64::MAX);
+    assert_eq!(
+        app.viewer_context_residence(retired_id),
+        ContextResidence::Retired
+    );
+    assert_eq!(
+        app.viewer_context_residence(unknown_id),
+        ContextResidence::Unknown
+    );
+
+    let items_generation = app.items_generation;
+    begin_metadata_import_drop_log_trace();
+    let (errors, stale) = app.apply_metadata_import_terminal_refresh(
+        crate::app::metadata_import_refresh::RefreshResult {
+            contexts: vec![
+                metadata_context_result(retired_id, items_generation, 5),
+                metadata_context_result(unknown_id, items_generation, 5),
+            ],
+            page_snapshot: None,
+            errors: Vec::new(),
+        },
+        crate::metadata_transfer::ImportChangedSections {
+            ratings: true,
+            ..Default::default()
+        },
+    );
+    let log = take_metadata_import_drop_log_trace();
+
+    assert!(errors.is_empty());
+    assert!(
+        !stale,
+        "unavailable owner identities are terminal drops, not a retry request"
+    );
+    assert_eq!(
+        app.rating_cache.get(&0),
+        Some(&2),
+        "neither unavailable identity may fall back to the mounted projection"
+    );
+    assert_eq!(log.len(), 2);
+    assert!(
+        log.iter().any(|entry| {
+            entry.contains("residence=Retired")
+                && entry.contains("reason=context_retired")
+                && !entry.contains("severity=unexpected")
+        }),
+        "a retired owner is a normal late-result diagnostic"
+    );
+    assert!(
+        log.iter().any(|entry| {
+            entry.contains("residence=Unknown") && entry.contains("severity=unexpected")
+        }),
+        "an identity that was never allocated must be recorded as unexpected"
     );
 }
 
@@ -1324,11 +1525,12 @@ fn metadata_import_terminal_refresh_reaches_main_and_detached_context_for_same_b
     app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
     app.visible_indices.clear();
     app.details_order.clear();
+    let main_id = app.viewer_context_main();
 
     let detached_items = app.items.clone();
     let detached_items_generation = app.items_generation;
     let detached_window_id = app.allocate_detached_viewer_window_id();
-    app.build_window_context_for_test(detached_window_id, |detached| {
+    let detached_id = app.build_window_context_for_test(detached_window_id, |detached| {
         detached.items = detached_items;
         detached.items_generation = detached_items_generation;
         detached.image_metas = vec![None];
@@ -1340,8 +1542,8 @@ fn metadata_import_terminal_refresh_reaches_main_and_detached_context_for_same_b
     });
     app.last_active_detached_window_id = Some(detached_window_id);
 
-    let context = |slot| crate::app::metadata_import_refresh::ContextResult {
-        slot,
+    let context = |context_id| crate::app::metadata_import_refresh::ContextResult {
+        context_id,
         items_generation: app.items_generation,
         rating_cache: Some(std::collections::HashMap::from([(0, 5)])),
         tags_cache: Some(std::collections::HashMap::from([(
@@ -1358,10 +1560,7 @@ fn metadata_import_terminal_refresh_reaches_main_and_detached_context_for_same_b
         legacy_seed_paths: Vec::new(),
     };
     let result = crate::app::metadata_import_refresh::RefreshResult {
-        contexts: vec![
-            context(crate::app::metadata_import_refresh::ContextSlot::Main),
-            context(crate::app::metadata_import_refresh::ContextSlot::ActiveDetached(None)),
-        ],
+        contexts: vec![context(main_id), context(detached_id)],
         page_snapshot: None,
         errors: Vec::new(),
     };
@@ -1399,6 +1598,7 @@ fn stale_main_strands_fresh_parked_pdf_rating_memo() {
     let mut app = phase_c_support::setup_app();
     let ctx = egui::Context::default();
     let window_id = 780;
+    let main_id = app.viewer_context_main();
     let pdf = PathBuf::from(
         [
             'C', ':', '\\', 'p', 'a', 'r', 'k', 'e', 'd', '.', 'p', 'd', 'f',
@@ -1406,7 +1606,7 @@ fn stale_main_strands_fresh_parked_pdf_rating_memo() {
         .into_iter()
         .collect::<String>(),
     );
-    app.push_window_context_for_test(&ctx, window_id, |parked| {
+    let parked_id = app.push_window_context_for_test(&ctx, window_id, |parked| {
         parked.current_folder = Some(pdf.clone());
         parked.items = vec![GridItem::PdfPage {
             pdf_path: pdf,
@@ -1424,19 +1624,8 @@ fn stale_main_strands_fresh_parked_pdf_rating_memo() {
     app.items_generation = app.items_generation.wrapping_add(1);
     let result = crate::app::metadata_import_refresh::RefreshResult {
         contexts: vec![
-            metadata_context_result(
-                crate::app::metadata_import_refresh::ContextSlot::Main,
-                stale_main_generation,
-                4,
-            ),
-            metadata_context_result(
-                crate::app::metadata_import_refresh::ContextSlot::PausedDetached {
-                    index: 0,
-                    window_id,
-                },
-                17,
-                4,
-            ),
+            metadata_context_result(main_id, stale_main_generation, 4),
+            metadata_context_result(parked_id, 17, 4),
         ],
         page_snapshot: None,
         errors: Vec::new(),
@@ -1462,19 +1651,8 @@ fn stale_main_strands_fresh_parked_pdf_rating_memo() {
 
     let retry = crate::app::metadata_import_refresh::RefreshResult {
         contexts: vec![
-            metadata_context_result(
-                crate::app::metadata_import_refresh::ContextSlot::Main,
-                app.items_generation,
-                4,
-            ),
-            metadata_context_result(
-                crate::app::metadata_import_refresh::ContextSlot::PausedDetached {
-                    index: 0,
-                    window_id,
-                },
-                17,
-                4,
-            ),
+            metadata_context_result(main_id, app.items_generation, 4),
+            metadata_context_result(parked_id, 17, 4),
         ],
         page_snapshot: None,
         errors: Vec::new(),
@@ -1511,7 +1689,7 @@ fn parked_pdf_metadata_request_includes_container_rating_key() {
             .collect::<String>(),
     );
     let window_id = 781;
-    app.push_window_context_for_test(&ctx, window_id, |parked| {
+    let parked_id = app.push_window_context_for_test(&ctx, window_id, |parked| {
         parked.current_folder = Some(pdf.clone());
         parked.items = (0..2)
             .map(|page_num| GridItem::PdfPage {
@@ -1529,15 +1707,7 @@ fn parked_pdf_metadata_request_includes_container_rating_key() {
     let requests = app.take_metadata_import_refresh_requests();
     let request = requests
         .iter()
-        .find(|request| {
-            matches!(
-                request.slot,
-                crate::app::metadata_import_refresh::ContextSlot::PausedDetached {
-                    index: 0,
-                    window_id: 781
-                }
-            )
-        })
+        .find(|request| request.context_id == parked_id)
         .unwrap();
 
     let expected_key = crate::adjustment_db::normalize_path(&pdf);
@@ -1871,12 +2041,13 @@ fn metadata_panel_omits_container_row_for_global_search_and_synthetic_views() {
 #[test]
 fn metadata_import_terminal_refresh_rejects_stale_items_generation() {
     let mut app = phase_c_support::setup_app();
+    let main_id = app.viewer_context_main();
     app.rating_cache = std::collections::HashMap::from([(0, 2)]);
     let stale_generation = app.items_generation;
     app.items_generation = app.items_generation.wrapping_add(1);
     let result = crate::app::metadata_import_refresh::RefreshResult {
         contexts: vec![crate::app::metadata_import_refresh::ContextResult {
-            slot: crate::app::metadata_import_refresh::ContextSlot::Main,
+            context_id: main_id,
             items_generation: stale_generation,
             rating_cache: Some(std::collections::HashMap::from([(0, 5)])),
             tags_cache: None,
@@ -1985,6 +2156,7 @@ fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_context_w
         .edits
         .insert(FacetEditFlag::Tagged);
 
+    let main_id = app.viewer_context_main();
     let items_generation = app.items_generation;
     let configure_context = |bundle: &mut App, folder: &str| {
         bundle.current_folder = Some(PathBuf::from(folder));
@@ -1996,17 +2168,17 @@ fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_context_w
         bundle.items_generation = items_generation;
     };
     let active_window_id = app.allocate_detached_viewer_window_id();
-    app.build_window_context_for_test(active_window_id, |active| {
+    let active_id = app.build_window_context_for_test(active_window_id, |active| {
         configure_context(active, r"C:\Pictures\Child");
         active.detached_viewer_window_id = Some(active_window_id);
     });
     app.last_active_detached_window_id = Some(active_window_id);
-    app.push_window_context_for_test(&ctx, 73, |paused| {
+    let paused_id = app.push_window_context_for_test(&ctx, 73, |paused| {
         configure_context(paused, r"C:\Pictures\Child\Paused");
     });
 
-    let context = |slot| crate::app::metadata_import_refresh::ContextResult {
-        slot,
+    let context = |context_id| crate::app::metadata_import_refresh::ContextResult {
+        context_id,
         items_generation: app.items_generation,
         rating_cache: None,
         tags_cache: Some(std::collections::HashMap::from([
@@ -2023,16 +2195,7 @@ fn metadata_import_terminal_refresh_keeps_untagged_loaded_and_restarts_context_w
         legacy_seed_paths: vec![tagged_path.clone(), untagged_path.clone()],
     };
     let result = crate::app::metadata_import_refresh::RefreshResult {
-        contexts: vec![
-            context(crate::app::metadata_import_refresh::ContextSlot::Main),
-            context(crate::app::metadata_import_refresh::ContextSlot::ActiveDetached(None)),
-            context(
-                crate::app::metadata_import_refresh::ContextSlot::PausedDetached {
-                    index: 0,
-                    window_id: 73,
-                },
-            ),
-        ],
+        contexts: vec![context(main_id), context(active_id), context(paused_id)],
         page_snapshot: None,
         errors: Vec::new(),
     };

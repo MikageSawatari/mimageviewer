@@ -759,6 +759,27 @@ registry 外では struct literal、destructure、field access、`empty()` 呼�
   audit 実行は A1 / A2a / A2b / A3 / A4 / A5 / A6 / A7 が有効で、既知の
   `activate_snapshot` 1 件のみ。library の dead-code warning は従来どおり **9 件**。
 
+### ステージ④完了: metadata import refresh の context identity (2026-08-25)
+
+`metadata_import_refresh::ContextSlot` を廃止し、request / result が
+`ViewerContextId` を所有するようにした。main は場所を表す特別値ではなく、request 構築時の
+`registry.main()` を焼き込む。window context も Vec index / window id から適用時に引き直さず、
+要求時の同じ identity を worker 往復後まで保持する。`items_generation` は従来どおり別フィールドに
+残し、「どの context か」と「その items snapshot がまだ current か」を独立に照合する。
+
+- apply 前後は registry の `residence(ViewerContextId)` を正本にする。`Mounted` / `AtRest` だけが
+  適用可能、`Retired` は正常な遅延結果として debug 記録だけで破棄、`Unknown` は identity
+  不変条件違反を常時ログして破棄する。UI thread の同期 transaction 外から観測不能な
+  `Building` / `Retiring` も不変条件違反として診断し、guard / retry / delay は追加しない。
+- 変更前の HEAD で、先行 window close により後続 window の refresh が失われるテストと、
+  request / apply 間の main promote で別 context に結果が入るテストがともに失敗することを確認した。
+  修正後は両テストに retired / unknown の分岐テストを加えた 3 本が通る。
+- `ContextSlot` は `src/` で **0 件**。A4 は non-Windows の単一 context identity を構築する
+  `ViewerContextId::single_context()` の正確な指紋を同じ変更で allowlist へ追加した。
+- 検証は library **6313 passed / 0 failed / 27 ignored** (検出総数 6340)、audit **31 passed**。
+  library の dead-code warning は従来どおり **9 件**。実機 smoke はこの behavior change の
+  verification build で利用者確認待ち。
+
 ## ②-d の退行 1 件と、その調査でかかった 3 往復
 
 **症状**: detached で動画を開くと黒いウィンドウのまま再生が始まらない (両モード)。

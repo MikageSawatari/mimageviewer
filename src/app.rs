@@ -130,9 +130,10 @@ pub(crate) use subfolder_expansion::{
 pub(crate) mod top_level_grid_view;
 mod viewer_context_registry;
 #[cfg(windows)]
-use viewer_context_registry::{BuildOutcome, ContextRef, RetireError, ViewerContextRegistry};
+pub(crate) use viewer_context_registry::ContextResidence;
+pub(crate) use viewer_context_registry::ViewerContextId;
 #[cfg(windows)]
-pub(crate) use viewer_context_registry::{ContextResidence, ViewerContextId};
+use viewer_context_registry::{BuildOutcome, ContextRef, RetireError, ViewerContextRegistry};
 #[cfg(windows)]
 mod viewer_session;
 mod vram_accounting;
@@ -27113,13 +27114,13 @@ impl App {
     ) -> Vec<metadata_import_refresh::ContextRequest> {
         fn take_current(
             index: &mut Option<MetadataImportRefreshIndex>,
-            slot: metadata_import_refresh::ContextSlot,
+            context_id: ViewerContextId,
             spread_container_path: Option<PathBuf>,
             old_folder_pin_keys: std::collections::HashSet<String>,
         ) -> Option<metadata_import_refresh::ContextRequest> {
             let index = index.take()?;
             (index.complete && index.affected).then_some(metadata_import_refresh::ContextRequest {
-                slot,
+                context_id,
                 items_generation: index.items_generation,
                 items: index.items,
                 legacy_seed_paths: index.legacy_seed_paths,
@@ -27132,50 +27133,18 @@ impl App {
         }
 
         let mut requests = Vec::new();
-        let spread_path = self.spread_container_key();
-        let old_folder_pin_keys = self.folder_pin_map.keys().cloned().collect();
-        if let Some(request) = take_current(
-            &mut self.metadata_import_refresh_index,
-            metadata_import_refresh::ContextSlot::Main,
-            spread_path,
-            old_folder_pin_keys,
-        ) {
-            requests.push(request);
-        }
         #[cfg(windows)]
         {
-            let window_id = self.active_detached_window_id();
-            self.with_active_viewer_context(|app| {
-                let spread_path = app.spread_container_key();
-                let old_folder_pin_keys = app.folder_pin_map.keys().cloned().collect();
-                if let Some(request) = take_current(
-                    &mut app.metadata_import_refresh_index,
-                    metadata_import_refresh::ContextSlot::ActiveDetached(window_id),
-                    spread_path,
-                    old_folder_pin_keys,
-                ) {
-                    requests.push(request);
-                }
-            });
-            let windows: Vec<(usize, u64)> = self
-                .detached_image_windows
-                .iter()
-                .enumerate()
-                .map(|(window_index, window)| (window_index, window.id))
-                .collect();
-            for (window_index, window_id) in windows {
-                if self.locate_window_context(window_id).is_none() {
-                    continue;
-                }
-                if let Err(error) = self.with_window_viewer_context(window_id, |app| {
+            let main_id = self.viewer_context_main();
+            let mut context_ids = self.viewer_context_ids();
+            context_ids.sort_by_key(|id| (*id != main_id, id.serial()));
+            for context_id in context_ids {
+                if let Err(error) = self.with_viewer_context(context_id, |app| {
                     let spread_path = app.spread_container_key();
                     let old_folder_pin_keys = app.folder_pin_map.keys().cloned().collect();
                     if let Some(request) = take_current(
                         &mut app.metadata_import_refresh_index,
-                        metadata_import_refresh::ContextSlot::PausedDetached {
-                            index: window_index,
-                            window_id,
-                        },
+                        context_id,
                         spread_path,
                         old_folder_pin_keys,
                     ) {
@@ -27183,9 +27152,23 @@ impl App {
                     }
                 }) {
                     crate::logger::log(format!(
-                        "metadata_import_request_mount_failed window_id={window_id} error={error:?}"
+                        "metadata_import_request_mount_failed context_id={context_id:?} error={error:?}"
                     ));
                 }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let context_id = ViewerContextId::single_context();
+            let spread_path = self.spread_container_key();
+            let old_folder_pin_keys = self.folder_pin_map.keys().cloned().collect();
+            if let Some(request) = take_current(
+                &mut self.metadata_import_refresh_index,
+                context_id,
+                spread_path,
+                old_folder_pin_keys,
+            ) {
+                requests.push(request);
             }
         }
         requests
@@ -27328,45 +27311,47 @@ impl App {
         }
     }
 
+    #[cfg(windows)]
+    fn log_metadata_import_context_drop(context_id: ViewerContextId, residence: ContextResidence) {
+        let reason = match residence {
+            ContextResidence::Retired => "context_retired",
+            ContextResidence::Unknown => "unknown_identity severity=unexpected",
+            ContextResidence::Building | ContextResidence::Retiring => {
+                "ui_thread_transition_observed severity=unexpected"
+            }
+            ContextResidence::Mounted | ContextResidence::AtRest => return,
+        };
+        let message = format!(
+            "metadata_import_refresh_result_dropped context_id={context_id:?} residence={residence:?} reason={reason}"
+        );
+        #[cfg(all(test, windows))]
+        tests::record_metadata_import_drop_log_for_test(&message);
+        crate::logger::log(message);
+    }
+
     pub(crate) fn apply_metadata_import_terminal_refresh(
         &mut self,
         result: metadata_import_refresh::RefreshResult,
         changed: crate::metadata_transfer::ImportChangedSections,
     ) -> (Vec<String>, bool) {
-        let stale_before_apply = result.contexts.iter().any(|context| match context.slot {
-            metadata_import_refresh::ContextSlot::Main => {
-                context.items_generation != self.items_generation
-            }
-            #[cfg(windows)]
-            metadata_import_refresh::ContextSlot::ActiveDetached(expected_window_id) => {
-                self.active_detached_window_id() != expected_window_id
-                    || self.active_viewer_context_id().is_some_and(|id| {
-                        self.with_viewer_context_ref(id, |viewer| {
-                            viewer.items_generation() != context.items_generation
-                        })
-                        .unwrap_or(true)
+        #[cfg(windows)]
+        let stale_before_apply = result.contexts.iter().any(|context| {
+            match self.viewer_context_residence(context.context_id) {
+                ContextResidence::Mounted | ContextResidence::AtRest => self
+                    .with_viewer_context_ref(context.context_id, |viewer| {
+                        viewer.items_generation() != context.items_generation
                     })
+                    .expect("a live viewer context must be readable for metadata refresh"),
+                ContextResidence::Building
+                | ContextResidence::Retiring
+                | ContextResidence::Retired
+                | ContextResidence::Unknown => false,
             }
-            #[cfg(windows)]
-            metadata_import_refresh::ContextSlot::PausedDetached {
-                index: window_index,
-                window_id,
-            } => self
-                .detached_image_windows
-                .get(window_index)
-                .is_some_and(|window| {
-                    window.id != window_id
-                        || self
-                            .locate_window_context(window_id)
-                            .is_some_and(|(id, _)| {
-                                self.with_viewer_context_ref(id, |viewer| {
-                                    viewer.items_generation() != context.items_generation
-                                })
-                                .unwrap_or(true)
-                            })
-                }),
-            #[cfg(not(windows))]
-            _ => false,
+        });
+        #[cfg(not(windows))]
+        let stale_before_apply = result.contexts.iter().any(|context| {
+            context.context_id == ViewerContextId::single_context()
+                && context.items_generation != self.items_generation
         });
         if stale_before_apply {
             return (result.errors, true);
@@ -27380,51 +27365,42 @@ impl App {
             self.replace_metadata_import_page_state_snapshot(snapshot);
         }
         for context in result.contexts {
-            match context.slot {
-                metadata_import_refresh::ContextSlot::Main => {
+            #[cfg(windows)]
+            {
+                let context_id = context.context_id;
+                match self.viewer_context_residence(context_id) {
+                    ContextResidence::Mounted | ContextResidence::AtRest => {
+                        match self.with_viewer_context(context_id, |app| {
+                            app.apply_current_metadata_import_terminal_result(context, changed)
+                        }) {
+                            Ok(applied) => stale_context |= !applied,
+                            Err(error) => {
+                                crate::logger::log(format!(
+                                    "metadata_import_apply_mount_failed context_id={context_id:?} error={error:?}"
+                                ));
+                                stale_context = true;
+                            }
+                        }
+                    }
+                    residence @ (ContextResidence::Building
+                    | ContextResidence::Retiring
+                    | ContextResidence::Retired
+                    | ContextResidence::Unknown) => {
+                        Self::log_metadata_import_context_drop(context_id, residence);
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                if context.context_id == ViewerContextId::single_context() {
                     stale_context |=
                         !self.apply_current_metadata_import_terminal_result(context, changed);
+                } else {
+                    crate::logger::log(format!(
+                        "metadata_import_refresh_result_dropped context_id={:?} reason=unknown_identity severity=unexpected",
+                        context.context_id
+                    ));
                 }
-                #[cfg(windows)]
-                metadata_import_refresh::ContextSlot::ActiveDetached(expected_window_id) => {
-                    if self.active_detached_window_id() != expected_window_id {
-                        stale_context = true;
-                    } else if let Some(applied) = self.with_active_viewer_context(|app| {
-                        app.apply_current_metadata_import_terminal_result(context, changed)
-                    }) {
-                        stale_context |= !applied;
-                    }
-                }
-                #[cfg(windows)]
-                metadata_import_refresh::ContextSlot::PausedDetached {
-                    index: window_index,
-                    window_id,
-                } => {
-                    match self.detached_image_windows.get(window_index) {
-                        Some(window) if window.id == window_id => {}
-                        Some(_) => {
-                            stale_context = true;
-                            continue;
-                        }
-                        None => continue,
-                    }
-                    if self.locate_window_context(window_id).is_none() {
-                        continue;
-                    }
-                    match self.with_window_viewer_context(window_id, |app| {
-                        app.apply_current_metadata_import_terminal_result(context, changed)
-                    }) {
-                        Ok(applied) => stale_context |= !applied,
-                        Err(error) => {
-                            crate::logger::log(format!(
-                                "metadata_import_apply_mount_failed window_id={window_id} error={error:?}"
-                            ));
-                            stale_context = true;
-                        }
-                    }
-                }
-                #[cfg(not(windows))]
-                _ => {}
             }
         }
 
