@@ -5,6 +5,7 @@ import {
   GridViewportMemory,
   IMAGE_QUALITY_PRESETS,
   MAX_VIEWER_VISIBLE_PAGES,
+  PageSlice,
   ReadingDirection,
   SpreadMode,
   ViewerGesture,
@@ -46,6 +47,7 @@ import {
   pagePrefetchIndicatorSummary,
   pagePrefetchPlan,
   pagePrefetchWindow,
+  pageSliceObjectPosition,
   pageResourceAdmissionPlan,
   pageResourceCacheLimit,
   planSpreadIntent,
@@ -102,7 +104,7 @@ import {
   viewerSeekMediaPresentation,
   viewerSeekRelativeDragValue,
   viewerSeekState,
-  viewerSpreadLayout,
+  viewerSlicedSpreadLayout,
   viewerTransformTelemetry,
   viewerWheelCommand,
   visualViewportOffsetRecovery,
@@ -2840,6 +2842,8 @@ function dispatchCommand(requested, meta = {}) {
         [CommandName.SPREAD_LTR_COVER]: SpreadMode.LTR_COVER,
         [CommandName.SPREAD_RTL]: SpreadMode.RTL,
         [CommandName.SPREAD_RTL_COVER]: SpreadMode.RTL_COVER,
+        [CommandName.SPREAD_SPLIT_LTR]: SpreadMode.SPLIT_LTR,
+        [CommandName.SPREAD_SPLIT_RTL]: SpreadMode.SPLIT_RTL,
       };
       handled = requestSpreadMode(spreadModes[requested.name]);
     } else {
@@ -4253,6 +4257,7 @@ function setSinglePageGroups() {
   state.pageGroups = state.images.map((entry) => ({
     anchor: entry,
     entries: [entry],
+    slice: PageSlice.FULL,
   }));
   state.seekPageGroups = state.images.map((_, index) => [index]);
   reanchorViewerPageGroups(previousPosition);
@@ -4284,11 +4289,20 @@ function setContainerPageGroups(groups) {
         .filter(Boolean);
       const anchor = byAddress.get(addressIdentity(group.anchor));
       if (!anchor || entries.length !== (group.pages ?? []).length) return null;
-      return { anchor, entries };
+      // 分割中は同じ entries を持つ group が 2 つ並ぶ。左右はここから先、表示と位置
+      // 復元の両方が読む。知らない値が来たら分割なしとして扱う。
+      const slice = Object.values(PageSlice).includes(group.slice)
+        ? group.slice
+        : PageSlice.FULL;
+      return { anchor, entries, slice };
     })
     .filter(Boolean);
   if (!state.pageGroups.length && state.images.length) {
-    state.pageGroups = state.images.map((entry) => ({ anchor: entry, entries: [entry] }));
+    state.pageGroups = state.images.map((entry) => ({
+      anchor: entry,
+      entries: [entry],
+      slice: PageSlice.FULL,
+    }));
   }
   const imageIndexes = new Map(
     state.images.map((entry, index) => [entryIdentity(entry), index])
@@ -4301,11 +4315,29 @@ function setContainerPageGroups(groups) {
   reanchorViewerPageGroups(previousPosition);
 }
 
-function pageGroupIndexForEntry(entry) {
+/// このページを含む表示単位を探す規則。
+///
+/// **分割中は同じ entry を持つ group が 2 つある。**アドレスだけで解決すると必ず
+/// 先頭 (分割方向の最初の半分) へ吸われるので、いま見ている半分を保ちたい経路は
+/// `slice` まで渡すこと。渡さない経路は「そのページの最初の表示単位」= 本体の
+/// 着地規則と同じで正しい。
+///
+/// 分割をやめた直後など、指定した半分がもう無い場合は最初の表示単位へ戻す。
+export function pageGroupIndexIn(groups, entry, slice = null) {
   const identity = entryIdentity(entry);
-  return state.pageGroups.findIndex((group) =>
-    group.entries.some((page) => entryIdentity(page) === identity)
-  );
+  const contains = (group) =>
+    (group?.entries ?? []).some((page) => entryIdentity(page) === identity);
+  if (slice !== null) {
+    const exact = (groups ?? []).findIndex(
+      (group) => contains(group) && (group.slice ?? PageSlice.FULL) === slice
+    );
+    if (exact >= 0) return exact;
+  }
+  return (groups ?? []).findIndex(contains);
+}
+
+function pageGroupIndexForEntry(entry, slice = null) {
+  return pageGroupIndexIn(state.pageGroups, entry, slice);
 }
 
 function pageRenderContextForEntry(entry) {
@@ -4355,7 +4387,8 @@ function captureViewerPageGroupRequest(
     pageGroups: state.pageGroups,
     group,
     groupIndex,
-    groupIdentity: group.entries.map(entryIdentity).join("\n"),
+    groupIdentity: [group.slice ?? PageSlice.FULL, ...group.entries.map(entryIdentity)]
+      .join("\n"),
     contextIdentity: viewerPageContextIdentity(),
   };
 }
@@ -4460,7 +4493,10 @@ function resolveReanchoredViewerPosition(snapshot, viewer = state.viewer) {
   ) return null;
   const anchor = snapshot.group?.anchor;
   if (!anchor) return null;
-  const groupIndex = pageGroupIndexForEntry(anchor);
+  const groupIndex = pageGroupIndexForEntry(
+    anchor,
+    snapshot.group?.slice ?? PageSlice.FULL
+  );
   return groupIndex >= 0
     ? captureViewerPageGroupRequest(viewer, groupIndex)
     : null;
@@ -6483,9 +6519,10 @@ async function updateViewerImage(
       );
     }
     stage = "layout";
-    const layout = viewerSpreadLayout({
+    const layout = viewerSlicedSpreadLayout({
       mode: state.fitMode,
       pages: infos,
+      slice: group.slice,
       viewportWidth: viewer.stage.clientWidth || window.innerWidth,
       viewportHeight: viewer.stage.clientHeight || window.innerHeight,
       devicePixelRatio: window.devicePixelRatio || 1,
@@ -6527,6 +6564,7 @@ async function updateViewerImage(
       displayRequestId,
       decodedUnitKey: identity,
       positionSnapshot: loadRequest,
+      slice: group.slice,
     });
     if (result?.outcome !== ViewerGroupLoadOutcome.APPLIED) {
       pageDemandAdapter.releaseDisplay(displayRequestId);
@@ -6708,9 +6746,10 @@ async function schedulePageDecodeAhead(viewer) {
   const units = updateDecodedPageUnitWindow(groupIndexSnapshot);
   const plans = await Promise.all(units.map(async ({ group, key }) => {
     const infos = await Promise.all(group.entries.map(imageInfo));
-    const layout = viewerSpreadLayout({
+    const layout = viewerSlicedSpreadLayout({
       mode: fitModeSnapshot,
       pages: infos,
+      slice: group.slice,
       viewportWidth: viewer.stage.clientWidth || window.innerWidth,
       viewportHeight: viewer.stage.clientHeight || window.innerHeight,
       devicePixelRatio: window.devicePixelRatio || 1,
@@ -6804,9 +6843,10 @@ async function schedulePagePrefetch(viewer) {
       const targetGroup = state.pageGroups[groupIndex];
       if (!targetGroup) return null;
       const infos = await Promise.all(targetGroup.entries.map(imageInfo));
-      const layout = viewerSpreadLayout({
+      const layout = viewerSlicedSpreadLayout({
         mode: state.fitMode,
         pages: infos,
+        slice: targetGroup.slice,
         viewportWidth: viewer.stage.clientWidth || window.innerWidth,
         viewportHeight: viewer.stage.clientHeight || window.innerHeight,
         devicePixelRatio: window.devicePixelRatio || 1,
@@ -8138,6 +8178,8 @@ export function viewerMenuDefinitions({ hasContainer, barsVisible }) {
         [CommandName.SPREAD_LTR_COVER, "見開き 左→右 (表紙あり)", "3"],
         [CommandName.SPREAD_RTL, "見開き 右→左", "4"],
         [CommandName.SPREAD_RTL_COVER, "見開き 右→左 (表紙あり)", "5"],
+        [CommandName.SPREAD_SPLIT_LTR, "横長分割 左→右", "6"],
+        [CommandName.SPREAD_SPLIT_RTL, "横長分割 右→左", "7"],
       ],
     },
     position: {
@@ -12178,7 +12220,8 @@ export class ImageViewer {
           job.presentation,
           job.renderTrigger,
           job.displayRequestId,
-          job.decodedUnitKey
+          job.decodedUnitKey,
+          job.slice
         )
         : this.loadMeasuredImage(
           job.request,
@@ -12188,7 +12231,8 @@ export class ImageViewer {
           job.presentation,
           job.renderTrigger,
           job.displayRequestId,
-          job.decodedUnitKey
+          job.decodedUnitKey,
+          job.slice
         ),
       (job) => {
         pageDemandAdapter.releaseDisplay(job?.displayRequestId);
@@ -12267,6 +12311,7 @@ export class ImageViewer {
     displayRequestId = null,
     decodedUnitKey = null,
     positionSnapshot = null,
+    slice = PageSlice.FULL,
   }) {
     const resolvedSeekState = seekState ?? {
       visible: count > 1,
@@ -12294,6 +12339,7 @@ export class ImageViewer {
       renderTrigger,
       displayRequestId,
       decodedUnitKey,
+      slice,
     });
   }
 
@@ -12327,6 +12373,7 @@ export class ImageViewer {
     displayRequestId = null,
     decodedUnitKey = null,
     positionSnapshot = null,
+    slice = PageSlice.FULL,
   }) {
     if (pages.length === 1) {
       return this.load({
@@ -12343,6 +12390,7 @@ export class ImageViewer {
         displayRequestId,
         decodedUnitKey,
         positionSnapshot,
+        slice,
       });
     }
     const resolvedSeekState = seekState ?? {
@@ -12371,6 +12419,7 @@ export class ImageViewer {
       renderTrigger,
       displayRequestId,
       decodedUnitKey,
+      slice,
     });
   }
 
@@ -12494,17 +12543,41 @@ export class ImageViewer {
     });
   }
 
-  setLayout(fitMode, layout, info, image = this.image) {
-    this.fitMode = fitMode;
-    this.stage.dataset.fitMode = fitMode;
-    this.pageLayer.style.gap = "0px";
+  /// img 1 枚に配置と切り抜きを当てる**唯一の場所**。
+  ///
+  /// 左右分割は「同じページを 2 回、別の場所を見せる」ので、box の寸法だけ合わせて
+  /// 切り抜きを忘れると、拡大された同じ絵が 2 回出る。描き手を増やさないこと。
+  ///
+  /// `info` は**元ページのままの寸法**を渡す。半分にした寸法を持たせると、
+  /// `refitVisibleContent` が読み直したときにもう一度半分になる。
+  applyImageBox(image, layout, info, slice = PageSlice.FULL) {
     image.style.width = `${layout.cssWidth}px`;
     image.style.height = `${layout.cssHeight}px`;
     image.style.maxWidth = "none";
     image.style.maxHeight = "none";
+    if (info) {
+      image.dataset.sourceWidth = String(info.width);
+      image.dataset.sourceHeight = String(info.height);
+    }
+    image.dataset.pageSlice = slice;
+    const objectPosition = pageSliceObjectPosition(slice);
+    image.style.objectFit = objectPosition ? "cover" : "";
+    image.style.objectPosition = objectPosition ?? "";
+  }
+
+  /// この img がいま見せている半分。補正プレビューの差し替えでも保つ必要があるので、
+  /// 状態は img 自身 (dataset) が持つ。
+  imagePageSlice(image = this.images[0]) {
+    const slice = image?.dataset?.pageSlice;
+    return Object.values(PageSlice).includes(slice) ? slice : PageSlice.FULL;
+  }
+
+  setLayout(fitMode, layout, info, image = this.image, slice = PageSlice.FULL) {
+    this.fitMode = fitMode;
+    this.stage.dataset.fitMode = fitMode;
+    this.pageLayer.style.gap = "0px";
+    this.applyImageBox(image, layout, info, slice);
     this.setPageLayerSize(layout.cssWidth, layout.cssHeight);
-    image.dataset.sourceWidth = String(info.width);
-    image.dataset.sourceHeight = String(info.height);
     // 始点を決めるのは placeInitialStageScroll の役目。ここで 0 に戻すと、原寸の
     // 中央寄せを毎回打ち消す。
     this.placeInitialStageScroll();
@@ -12551,9 +12624,11 @@ export class ImageViewer {
       height: Number(image.dataset.sourceHeight) || image.naturalHeight,
     }));
     if (sources.some((source) => !(source.width > 0 && source.height > 0))) return false;
-    const layout = viewerSpreadLayout({
+    const slice = this.imagePageSlice();
+    const layout = viewerSlicedSpreadLayout({
       mode: fitMode,
       pages: sources,
+      slice,
       viewportWidth: this.stage.clientWidth || window.innerWidth,
       viewportHeight: this.stage.clientHeight || window.innerHeight,
       devicePixelRatio: window.devicePixelRatio || 1,
@@ -12564,11 +12639,7 @@ export class ImageViewer {
     this.pageLayer.style.gap = `${layout.gap}px`;
     this.setPageLayerSize(layout.cssWidth, layout.cssHeight);
     this.images.forEach((image, index) => {
-      const page = layout.pages[index];
-      image.style.width = `${page.cssWidth}px`;
-      image.style.height = `${page.cssHeight}px`;
-      image.style.maxWidth = "none";
-      image.style.maxHeight = "none";
+      this.applyImageBox(image, layout.pages[index], null, slice);
     });
     this.placeInitialStageScroll();
     if (resetTransform) {
@@ -12661,7 +12732,8 @@ export class ImageViewer {
     presentation,
     renderTrigger,
     displayRequestId,
-    decodedUnitKey
+    decodedUnitKey,
+    slice = PageSlice.FULL
   ) {
     const sequence = ++this.loadSequence;
     const requestKeys = request.cacheKey ? [request.cacheKey] : [];
@@ -12746,15 +12818,15 @@ export class ImageViewer {
           width: decodedImage.naturalWidth,
           height: decodedImage.naturalHeight,
         };
-        resolvedLayout = viewerImageLayout({
+        resolvedLayout = viewerSlicedSpreadLayout({
           mode: request.fitMode,
-          sourceWidth: actualInfo.width,
-          sourceHeight: actualInfo.height,
+          pages: [actualInfo],
+          slice,
           viewportWidth: this.stage.clientWidth || window.innerWidth,
           viewportHeight: this.stage.clientHeight || window.innerHeight,
           devicePixelRatio: request.dpr,
           maxRequestWidth: 8192,
-        });
+        }).pages[0];
         resolvedInfo = actualInfo;
         request.cssWidth = resolvedLayout.cssWidth;
         rememberMediaImageInfo(request, actualInfo);
@@ -12773,7 +12845,7 @@ export class ImageViewer {
       }
       phase = "apply";
       this.resetTransform();
-      this.setLayout(request.fitMode, resolvedLayout, resolvedInfo, decodedImage);
+      this.setLayout(request.fitMode, resolvedLayout, resolvedInfo, decodedImage, slice);
       decodedImage.style.transform = "none";
       const previousUrls = this.objectUrls.slice();
       this.pageLayer.replaceChildren(decodedImage);
@@ -12894,7 +12966,8 @@ export class ImageViewer {
     presentation,
     renderTrigger,
     displayRequestId,
-    decodedUnitKey
+    decodedUnitKey,
+    slice = PageSlice.FULL
   ) {
     const sequence = ++this.loadSequence;
     const requestKeys = pages.map(({ request }) => request.cacheKey).filter(Boolean);
@@ -12995,9 +13068,10 @@ export class ImageViewer {
       }
 
       phase = "apply";
-      const resolvedLayout = viewerSpreadLayout({
+      const resolvedLayout = viewerSlicedSpreadLayout({
         mode: fitMode,
         pages: decodedImages.map((decoded) => decoded.info),
+        slice,
         viewportWidth: this.stage.clientWidth || window.innerWidth,
         viewportHeight: this.stage.clientHeight || window.innerHeight,
         devicePixelRatio: window.devicePixelRatio || 1,
@@ -13010,13 +13084,8 @@ export class ImageViewer {
       this.setPageLayerSize(resolvedLayout.cssWidth, resolvedLayout.cssHeight);
       decodedImages.forEach((decoded, index) => {
         const layout = resolvedLayout.pages[index];
-        decoded.image.style.width = `${layout.cssWidth}px`;
-        decoded.image.style.height = `${layout.cssHeight}px`;
-        decoded.image.style.maxWidth = "none";
-        decoded.image.style.maxHeight = "none";
+        this.applyImageBox(decoded.image, layout, decoded.info, slice);
         decoded.image.style.transform = "none";
-        decoded.image.dataset.sourceWidth = String(decoded.info.width);
-        decoded.image.dataset.sourceHeight = String(decoded.info.height);
         pages[index].request.cssWidth = layout.cssWidth;
         rememberMediaImageInfo(pages[index].request, decoded.info);
       });

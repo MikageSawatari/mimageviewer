@@ -2,6 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  PageSlice,
+  pageSliceObjectPosition,
+  viewerSlicedSpreadLayout,
+  isSplitSpread,
   pinchTransformDecision,
   VIEWER_MAX_SCALE,
   VIEWER_MIN_SCALE,
@@ -3064,4 +3068,74 @@ test("document scroll counts as drift even when the visual viewport reports zero
     visualViewportOffsetRecovery({ offsetTop: 0.4, offsetLeft: 0, scrollX: 0, scrollY: 0, scale: 1 }),
     null
   );
+});
+
+test("showing half a page halves the box but still asks for the whole page", () => {
+  const viewport = { viewportWidth: 800, viewportHeight: 1200, devicePixelRatio: 2 };
+  const whole = viewerSlicedSpreadLayout({
+    mode: FitMode.PAGE,
+    pages: [{ width: 2000, height: 1400 }],
+    slice: PageSlice.FULL,
+    ...viewport,
+  });
+  const half = viewerSlicedSpreadLayout({
+    mode: FitMode.PAGE,
+    pages: [{ width: 2000, height: 1400 }],
+    slice: PageSlice.LEFT,
+    ...viewport,
+  });
+  // 半分は縦長になるので、全体フィットでは縦いっぱいまで使える。
+  assert.ok(half.pages[0].cssHeight > whole.pages[0].cssHeight);
+  assert.equal(
+    Math.round(half.pages[0].cssWidth * 2 / half.pages[0].cssHeight),
+    Math.round(2000 / 1400)
+  );
+  // **届くのは元ページ 1 枚まるごと。**box の幅で要求すると実質 1/4 の解像度になる。
+  assert.equal(
+    half.pages[0].requestWidth,
+    Math.ceil(half.pages[0].cssWidth * 2) * 2
+  );
+});
+
+test("the doubled request width still respects the cap", () => {
+  const half = viewerSlicedSpreadLayout({
+    mode: FitMode.ORIGINAL,
+    pages: [{ width: 40000, height: 1000 }],
+    slice: PageSlice.RIGHT,
+    viewportWidth: 800,
+    viewportHeight: 1200,
+    devicePixelRatio: 3,
+    maxRequestWidth: 8192,
+  });
+  assert.ok(half.pages[0].requestWidth <= 8192);
+});
+
+test("the crop is a CSS position, and only for a half", () => {
+  assert.equal(pageSliceObjectPosition(PageSlice.LEFT), "left center");
+  assert.equal(pageSliceObjectPosition(PageSlice.RIGHT), "right center");
+  assert.equal(pageSliceObjectPosition(PageSlice.FULL), null);
+  assert.equal(pageSliceObjectPosition(undefined), null);
+});
+
+test("split modes carry a reading direction but are not part of the cycle", () => {
+  assert.ok(isSplitSpread(SpreadMode.SPLIT_LTR));
+  assert.ok(isSplitSpread(SpreadMode.SPLIT_RTL));
+  assert.equal(isSplitSpread(SpreadMode.RTL), false);
+  assert.equal(
+    readingDirectionForSpreadMode(SpreadMode.SPLIT_RTL, ReadingDirection.LTR),
+    ReadingDirection.RTL
+  );
+  assert.equal(
+    readingDirectionForSpreadMode(SpreadMode.SPLIT_LTR, ReadingDirection.RTL),
+    ReadingDirection.LTR
+  );
+  // 巡回に入れない。入れると 1〜5 を回すつもりで分割へ落ちる。
+  const cycle = [];
+  let mode = SpreadMode.SINGLE;
+  for (let step = 0; step < 5; step += 1) {
+    cycle.push(mode);
+    mode = nextSpreadMode(mode);
+  }
+  assert.equal(cycle.some(isSplitSpread), false);
+  assert.equal(nextSpreadMode(SpreadMode.SPLIT_RTL), SpreadMode.SINGLE);
 });
