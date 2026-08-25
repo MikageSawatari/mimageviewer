@@ -55602,6 +55602,20 @@ impl App {
         self.retained_pdf_final_ai_matches_current(idx).is_some()
     }
 
+    /// retained composite だけで表示できるページの**元寸法**。
+    ///
+    /// このページは `fs_cache` を持たないまま表示できる ([`Self::fs_page_load_state`] の
+    /// doc 参照)。そのため寸法の収穫を `fs_cache` だけに頼ると「画面に出ているのに
+    /// 寸法が分からない」状態が起きる。実際、PDF を開き直して items 世代が変わった直後に
+    /// 横長分割が効かなくなる形で表面化した (2026-08-25、`[split] decision=dimensions_unknown`)。
+    pub(crate) fn retained_pdf_page_source_dims(&self, idx: usize) -> Option<(u32, u32)> {
+        let (_, edit_size) = self.retained_pdf_final_ai_matches_current(idx)?;
+        Some((
+            u32::try_from(edit_size[0]).ok()?,
+            u32::try_from(edit_size[1]).ok()?,
+        ))
+    }
+
     fn insert_retained_pdf_page_raster(
         &mut self,
         idx: usize,

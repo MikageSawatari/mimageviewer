@@ -382,7 +382,7 @@ fn spread_page_dims_survive_fs_cache_and_thumbnail_eviction() {
         ]
     );
 
-    app.harvest_page_dims_from_fs_cache();
+    app.harvest_page_dims();
     assert_eq!(
         app.page_dims_cache.get(app.items_generation, 0),
         Some((1800, 1100))
@@ -30142,6 +30142,49 @@ mod pipeline_cache_refactor_tests {
             .expect("PDF retained final key");
         assert!(app.insert_retained_pdf_final_ai(idx, retained_key, pixels));
         key
+    }
+
+    /// `fs_cache` を持たないまま表示できるページの寸法も収穫する。
+    ///
+    /// 実機で出た形をそのまま再現する: PDF を開き直して items 世代が変わると
+    /// `page_dims_cache` は失効し、retained composite から復元されたページは
+    /// `fs_cache` にもサムネイルにも載らない。供給源がゼロになり、横長分割が
+    /// 「寸法が分からない」を理由に効かなくなっていた
+    /// (2026-08-25、`[split] idx=0 decision=dimensions_unknown`)。
+    #[test]
+    fn a_page_restored_from_the_retained_composite_still_reports_its_size() {
+        let mut app = setup_app();
+        enable_pdf_final_ai_params(&mut app);
+
+        let idx = push_pdf_page(&mut app, r"D:\scan\20190503.pdf", 0);
+        let edit_size = [1512, 1921];
+        store_matching_pdf_final_ai(
+            &mut app,
+            idx,
+            edit_size,
+            Arc::new(egui::ColorImage::new(
+                [8, 8],
+                vec![egui::Color32::from_rgb(9, 9, 9); 64],
+            )),
+        );
+        app.fullscreen_idx = Some(idx);
+
+        // 開き直しと同じ条件: 世代が進み、live cache もサムネイルも無い。
+        app.items_generation += 1;
+        app.fs_cache.remove(&idx);
+        assert_eq!(
+            app.page_dims_cache.get(app.items_generation, idx),
+            None,
+            "fixture check: 世代更新で寸法の記憶は消えている"
+        );
+
+        app.harvest_page_dims();
+
+        assert_eq!(
+            app.page_dims_cache.get(app.items_generation, idx),
+            Some((1512, 1921)),
+            "画面に出せるページなのに寸法が分からないままになっている"
+        );
     }
 
     /// The reported failure, reproduced from the log that recorded it.

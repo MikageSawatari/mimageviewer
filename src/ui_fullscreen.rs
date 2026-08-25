@@ -9616,12 +9616,28 @@ pub fn draw_music_panel_reach_snapshot_fixture(
 impl App {
     /// live なフルスクリーン cache から、現在世代で判明済みのページ寸法を回収する。
     /// cache 自体は小さな先読み窓なので、フレーム冒頭に 1 回だけ走査する。
-    pub(crate) fn harvest_page_dims_from_fs_cache(&mut self) {
+    /// 表示できるページの寸法を `page_dims_cache` へ集める。
+    ///
+    /// **表示できる経路は 2 つある。** live な `fs_cache` と、`fs_cache` が無くても
+    /// 復元できる retained PDF composite。以前は前者しか収穫しておらず、後者だけで
+    /// 表示しているページは「画面に出ているのに寸法が分からない」ままだった。
+    /// 通常は他の判定がそれで困らないが、横長分割は寸法が要るので効かなくなる
+    /// (PDF を開き直して items 世代が変わると `page_dims_cache` も失効するため、
+    /// サムネイル未読込と重なると供給源がゼロになる)。
+    pub(crate) fn harvest_page_dims(&mut self) {
         let generation = self.items_generation;
         for (&idx, entry) in &self.fs_cache {
             if let Some(dims) = fs_cache_entry_page_dims(entry) {
                 self.page_dims_cache.record(generation, idx, dims);
             }
+        }
+        // retained composite は現在ページを表示するための経路なので、そのページだけ見る。
+        let retained = self.fullscreen_idx.and_then(|idx| {
+            self.retained_pdf_page_source_dims(idx)
+                .map(|dims| (idx, dims))
+        });
+        if let Some((idx, dims)) = retained {
+            self.page_dims_cache.record(generation, idx, dims);
         }
     }
 
@@ -13743,7 +13759,7 @@ impl App {
             return;
         };
 
-        self.harvest_page_dims_from_fs_cache();
+        self.harvest_page_dims();
         self.reconcile_fullscreen_page_slice(fs_idx);
 
         let page_turn_decision = self.fs_page_turn_decision_for_frame(ctx, fs_idx);
