@@ -15,7 +15,8 @@ worker) / Increment 3 (App owner・設定・描画・入力・HUD region・tile 
 1 クリック巡回、ストリップ内切替の撤去、左右パネルのホバー帯境界修正) / Increment 10
 (cursor とセルの左端基準を実機確認) / Increment 11 (pending / ready / failed のセル表示と、
 補助 decoder を開けない場合の strip 全体 notice) / Increment 12 (長さ情報のない動画の案内と
-操作抑止、波形可視 span 設定、無 blank 再構築、長尺 first-paint 実測) まで実装。
+操作抑止、波形可視 span 設定、無 blank 再構築、長尺 first-paint 実測) / stage-1 follow-up
+(raw GOP が疎すぎる素材の decode 前 unavailable 判定、batch の sampled duplicate skip) まで実装。
 残りは §9 の未確定項目の実機調整と、MPEG-TS など `TimeGrid` 経路の実素材確認。
 
 確定した既定値: 開閉は `Shift+S` (`V` はレーン C の動画パノラマ用に空けた)、最小間隔 2.0 秒、
@@ -148,6 +149,24 @@ pre-roll して再試行する。以後そのファイルでは同じ full-frame
 所有し、App は「生成が時間切れです」、batch は `thumbnail window timed out after 30s` として
 同じ failure surface から表示する。上限前の `pending` だけが空枠であり、上限後に無言の空枠を残さない。
 
+**D24 (stage-1 follow-up、2026-08-25)**: 完全な index でも最大 raw GOP が 15.0 秒を越える素材は、
+`KeyframeIndex / TimeGrid` のどちらにも進まず `Unavailable(KeyframesTooSparse)` とする。判定は index
+統計だけで行い、サムネイルと波形のどちらの decoder も開かない。stage-1 再走の unique な正常
+keyframe-index 1,164 件では最大 raw GOP の p99 / 最大が 10.43 秒で、15 秒は 44% の余裕を持つ
+(maximum adopted gap は p99 12.10 秒 / 最大 12.39 秒)。
+唯一の外れ値は 833.43 秒で、従来は 30 秒 timeout になった。初回 hardware window の elapsed / cell
+概算 p90 は adopted gap 4 秒以下で 33.5ms、4〜8 秒で 43.3ms、8〜10 秒で 19.8ms、10〜12.5 秒で
+23.3ms。4K HEVC は raw 8.34 秒で約 0.2 秒 / cell だった。しきい値は preference で間引いた adopted
+gap ではなく raw index gap に固定し、1 cell が高々 1 個の現実的な GOP という契約を守る。
+unavailable は既存の duration 不明と同じ open gate / 1 回 toast / disabled film button を使い、
+上ドラッグと全 strip KeyAction も設定を書き換えない no-op にする。
+
+**D25 (stage-1 follow-up、2026-08-25)**: batch は `(file size, SHA-256(head 8 KiB + tail 8 KiB))`
+が先に検査したファイルと一致するものを `duplicate` として decode せず、一致先 path を記録する。
+全ファイル hash や container / codec / GOP 構造による dedupe は行わない。前者は 3.2 TB の全読みを招き、
+後者は content-dependent decode defect を隠すためである。`pass / fail / unavailable / skip / duplicate`
+は別集計とし、意図的な unavailable と duplicate を defect や pass に混ぜない。
+
 axis resolver は raw index entry を sort する前の列挙順について monotonic / inversion count を
 診断へ残す。実際に逆行があれば sort で隠さず、理由 non_monotonic_index_timestamps を伴って
 TimeGrid を選ぶ。
@@ -229,6 +248,12 @@ enum StripAxis {
     /// 索引が無い / 不完全なコンテナ。等時間グリッドに落とし、絵は直前キーフレーム。
     TimeGrid { interval_secs: f64 },
 }
+
+enum StripAxisDecision {
+    KeyframeIndex,
+    TimeGrid(TimeGridReason),
+    Unavailable(StripAxisUnavailableReason),
+}
 ```
 
 **索引は「開いた直後」には埋まっていないコンテナがある** (§14 の実測)。
@@ -241,6 +266,9 @@ enum StripAxis {
 - 2 段目でも、最後の keyframe から末尾までが素材内で観測した最大 raw GOP 1 個分を越えるなら
   `TimeGrid`。通常の末尾 1 GOP は index 軸の最終セルが担う。別の percentage floor は置かない
   (D21)。
+- index が完全でも最大 raw GOP が 15.0 秒を越えるなら `Unavailable(KeyframesTooSparse)`。これは
+  fallback 軸ではなく「この素材では strip の 1 cell = 高々 1 GOP を安価に作れる」という前提が
+  成立しない結果であり、worker は decoder request loop へ入る前に終了する (D24)。
 - どちらも**見た目は等幅セル**なので、利用者には区別を見せない。ログと perf event には出す。
 - `TimeGrid` の interval はタイルモードと同じ `INTERVAL_CANDIDATES_SECS` から選ぶ
   ([ui_video_tile.rs](../src/ui_video_tile.rs) `pick_interval`)。
@@ -481,6 +509,7 @@ enum SeekRowGesture {
 - `center_index` ↔ 時刻の相互変換 (補間あり / なし)、端のクランプ。
 - 窓の算出 (可視枚数 + 先読み)、窓が動いたときの再利用範囲。
 - `StripAxis` の選択 (索引あり / 無し / 不完全)。
+- 完全な index の最大 raw GOP が 15.0 秒なら index 軸、境界を越えたら decode 前 unavailable。
 - coverage 80% 未満でも末尾が観測最大 GOP 内の complete index と、同じ entry 列が尺の 1/3 で
   止まる truly partial index。
 - 最小間隔と GOP が等しい浮動小数点境界、および adopted cell が複数 raw entry をまたぐ可変 GOP。
@@ -501,6 +530,8 @@ enum SeekRowGesture {
   failure / cancel は置き換えないこと。
 - index DTS → packet PTS の対応付け、nearest-preceding の境界内 / 境界外、1 セルの不一致が同じ
   run の後続セルを stranded にしないこと。
+- sampled duplicate detector が同じ size + head/tail を最初の path へ結び、同サイズでも sample が
+  異なるファイルは検査対象に残すこと。
 
 ### ワーカー
 
@@ -520,7 +551,9 @@ enum SeekRowGesture {
   を検証する。--limit N、差分比較用 --json、SW 固定の --software を持つ。1 行 summary の後、
   failed file だけ axis reason と全 cell time / outcome / failure reason を詳記し、failed cell または
   scan error があれば非 0 で終了する。JSON には schema version と ready cell を含む全 cell time を
-  保存する。open 不可、video stream 無し、duration 不明は decode window を開始せず skip する。
+  保存する。open 不可、video stream 無し、duration 不明は decode window を開始せず `skip`、raw GOP
+  上限超過は decoder unopened の `unavailable` とする。検査前に size + head/tail 8 KiB sample hash が
+  既検査 path と一致すれば `duplicate` と一致先 path を記録する。5 outcome は summary でも別集計する。
 
 ### perf 計装
 
@@ -623,5 +656,25 @@ replacement ごとに約 45 秒で 1 回である。
 1800 秒でも 385〜476ms に収まり、総時間の 16〜18% である。主費用は実音声の decode
 (1788〜2566ms、総時間の約 81〜83%) で、利用者 probe の見立てどおり decode が長尺時の床になる。
 
+### stage-1 sweep の GOP 上限測定 (2026-08-25)
+
+3 root、1,270 ファイルの production batch 結果は pass 1,247 / fail 1 / skip 22 で、axis は
+`KeyframeIndex` 1,167 / `TimeGrid` 81 だった。修正後の unique な正常 keyframe-index 1,164 件では
+maximum raw GOP が p50 8.34s / p90 10.00s / p95 10.00s / p99 10.43s、正常最大 10.43s
+(maximum adopted gap は p50 9.04s / p90 11.26s / p95 11.72s / p99 12.10s / 最大 12.39s)。
+唯一の旧 fail は index 13 件、
+coverage 100%、最大 raw GOP 833.43s で、775.8s / 836.9s の cell が 30 秒 timeout になった。
+15.0 秒上限は正常 raw 最大に 44% の余裕を残しつつ、この 1 件だけを decode 前に decline する。
+
+hardware D3D11VA で初回窓の elapsed / cell を adopted maximum gap ごとに集計した p90 は、4 秒以下
+33.5ms、4〜8 秒 43.3ms、8〜10 秒 19.8ms、10〜12.5 秒 23.3ms (file open と 11-cell run の
+共有費用を按分した概算)。別途 4K HEVC / raw 8.34s は約 0.2s / cell。正常群は 1 GOP の仕事量で
+収まる一方、833 秒 outlier は数分の前方復号になり、scrubber の間隔としても無意味なので D24 とした。
+
+修正後の同じ 1,270 ファイルは pass 1,245 / fail 0 / unavailable 1 / skip 22 / duplicate 2、
+failed cell 0、discovery issue 0。duplicate 2 件は旧 run で合計 620.7ms、10 window / 110 cell を
+検査していたため、その分を直接省けた。sample detector が全 1,270 ファイルで読んだのは最大
+20,481,101 bytes (19.53 MiB) で、対象 174.28 GiB の 0.011% 未満。旧 outlier の 30.0 秒 timeout も
+7.5ms の index-only unavailable 判定に変わった。
+
 未取得: MPEG-TS (索引を持たない代表格) が手元に無く、`TimeGrid` 経路を実素材で確認できていない。
-HW デコード有効時の数字も未測定 (probe は SW のみ)。どちらも実装時に埋める。

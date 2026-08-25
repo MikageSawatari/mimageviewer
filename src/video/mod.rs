@@ -211,6 +211,10 @@ pub struct VideoPlayer {
     /// f64::to_bits() / from_bits() で保持し、InfoReceived 時に一度更新する。
     #[cfg(windows)]
     duration_secs_bits: Arc<AtomicU64>,
+    /// Per-source strip preflight result. Unknown is optimistic until the index-only
+    /// worker resolves; an unavailable result then gates every input surface.
+    #[cfg(windows)]
+    seek_strip_material_availability: AtomicU8,
     /// decoder の video_tx try_send が Full で送信できず捨てた累積数。
     /// decoder thread と共有し、perf overlay では UI 側 dropped_past と色分けする。
     decoder_dropped_full_count: Arc<AtomicU64>,
@@ -1025,6 +1029,7 @@ enum NativeVideoOutputCommand {
     },
     SetSeekStrip {
         seek_strip: Option<native_presenter::NativeOverlaySeekStrip>,
+        material_availability: seek_strip::SeekStripMaterialAvailability,
     },
     SetRingPickerOverlay {
         overlay: Option<native_presenter::NativeOverlayRingPicker>,
@@ -2164,10 +2169,17 @@ impl NativeVideoOutput {
             .send(NativeVideoOutputCommand::SetTileOverlay { tile_overlay });
     }
 
-    fn set_seek_strip(&self, seek_strip: Option<native_presenter::NativeOverlaySeekStrip>) {
+    fn set_seek_strip(
+        &self,
+        seek_strip: Option<native_presenter::NativeOverlaySeekStrip>,
+        material_availability: seek_strip::SeekStripMaterialAvailability,
+    ) {
         let _ = self
             .command_tx
-            .send(NativeVideoOutputCommand::SetSeekStrip { seek_strip });
+            .send(NativeVideoOutputCommand::SetSeekStrip {
+                seek_strip,
+                material_availability,
+            });
     }
 
     fn set_ring_picker_overlay(&self, overlay: Option<native_presenter::NativeOverlayRingPicker>) {
@@ -4527,8 +4539,11 @@ fn run_native_video_output(
                 NativeVideoOutputCommand::SetTileOverlay { tile_overlay } => {
                     presenter.set_overlay_tile_overlay(tile_overlay);
                 }
-                NativeVideoOutputCommand::SetSeekStrip { seek_strip } => {
-                    presenter.set_overlay_seek_strip(seek_strip);
+                NativeVideoOutputCommand::SetSeekStrip {
+                    seek_strip,
+                    material_availability,
+                } => {
+                    presenter.set_overlay_seek_strip(seek_strip, material_availability);
                 }
                 NativeVideoOutputCommand::SetRingPickerOverlay { overlay } => {
                     presenter.set_overlay_ring_picker(overlay);
@@ -6616,6 +6631,8 @@ impl VideoPlayer {
             frame_step_issued_display_seq: AtomicU64::new(FRAME_STEP_NO_PENDING_SEQ),
             #[cfg(windows)]
             duration_secs_bits: Arc::new(AtomicU64::new(0.0_f64.to_bits())),
+            #[cfg(windows)]
+            seek_strip_material_availability: AtomicU8::new(0),
             decoder_dropped_full_count: Arc::new(AtomicU64::new(0)),
             ui_dropped_past_count: AtomicU64::new(0),
             cancel: Arc::new(AtomicBool::new(true)),
@@ -6853,6 +6870,8 @@ impl VideoPlayer {
                 native_output: None,
                 #[cfg(windows)]
                 duration_secs_bits: Arc::new(AtomicU64::new(0.0_f64.to_bits())),
+                #[cfg(windows)]
+                seek_strip_material_availability: AtomicU8::new(0),
                 #[cfg(windows)]
                 native_hover_thumbnail_request: Mutex::new(None),
                 #[cfg(windows)]
@@ -7102,6 +7121,8 @@ impl VideoPlayer {
             gpu_latest: None,
             #[cfg(windows)]
             native_output,
+            #[cfg(windows)]
+            seek_strip_material_availability: AtomicU8::new(0),
             #[cfg(windows)]
             native_hover_thumbnail_request: Mutex::new(None),
             #[cfg(windows)]
@@ -8628,8 +8649,27 @@ impl VideoPlayer {
         seek_strip: Option<native_presenter::NativeOverlaySeekStrip>,
     ) {
         if let Some(output) = self.native_output.as_ref() {
-            output.set_seek_strip(seek_strip);
+            output.set_seek_strip(seek_strip, self.seek_strip_material_availability());
         }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn seek_strip_material_availability(
+        &self,
+    ) -> seek_strip::SeekStripMaterialAvailability {
+        seek_strip::SeekStripMaterialAvailability::decode(
+            self.seek_strip_material_availability
+                .load(Ordering::Acquire),
+        )
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn set_seek_strip_material_availability(
+        &self,
+        availability: seek_strip::SeekStripMaterialAvailability,
+    ) {
+        self.seek_strip_material_availability
+            .store(availability.encode(), Ordering::Release);
     }
 
     #[cfg(windows)]

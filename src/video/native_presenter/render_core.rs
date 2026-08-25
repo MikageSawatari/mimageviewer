@@ -463,9 +463,10 @@ fn draw_native_seek_strip_cycle_button(
     painter: &egui::Painter,
     button_rect: egui::Rect,
     state: crate::settings::VideoSeekStripState,
-    enabled: bool,
+    unavailable_tooltip: Option<&'static str>,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
+    let enabled = unavailable_tooltip.is_none();
     let response = ui.interact(
         button_rect,
         egui::Id::new("native_video_seek_strip_selector"),
@@ -495,8 +496,8 @@ fn draw_native_seek_strip_cycle_button(
     if enabled && state == crate::settings::VideoSeekStripState::Waveform {
         draw_seek_strip_waveform_note(painter, button_rect, egui::Color32::from_rgb(255, 220, 82));
     }
-    let response = response.hover_tip_dark(if !enabled {
-        "長さの情報がない動画では使えません"
+    let response = response.hover_tip_dark(if let Some(reason) = unavailable_tooltip {
+        reason
     } else {
         match state {
             crate::settings::VideoSeekStripState::None => {
@@ -1058,6 +1059,7 @@ struct NativeEguiOverlay {
     navigation_preview_texture: Option<(u64, egui::TextureHandle)>,
     tile_overlay: Option<NativeOverlayTileOverlay>,
     seek_strip: Option<NativeOverlaySeekStrip>,
+    seek_strip_material_availability: crate::video::seek_strip::SeekStripMaterialAvailability,
     ring_picker_overlay: Option<NativeOverlayRingPicker>,
     ring_guide_overlay: Option<NativeOverlayRingGuide>,
     tile_textures: HashMap<usize, (u64, egui::TextureHandle)>,
@@ -5183,13 +5185,15 @@ impl NativeRenderCore {
     /// 右状態は App が新ファイルの false を別 command で同期する。
     pub fn reset_overlay_source_session(&mut self) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
-            overlay.reset_side_panel_session();
+            overlay.reset_source_session();
         }
     }
 
     /// Video/audio mode changes use the same session boundary as source swap.
     pub fn reset_overlay_side_panel_session(&mut self) {
-        self.reset_overlay_source_session();
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.reset_side_panel_session();
+        }
     }
 
     pub fn set_overlay_fallback_file_name(&mut self, file_name: String) {
@@ -5204,9 +5208,13 @@ impl NativeRenderCore {
         }
     }
 
-    pub fn set_overlay_seek_strip(&mut self, seek_strip: Option<NativeOverlaySeekStrip>) {
+    pub(crate) fn set_overlay_seek_strip(
+        &mut self,
+        seek_strip: Option<NativeOverlaySeekStrip>,
+        material_availability: crate::video::seek_strip::SeekStripMaterialAvailability,
+    ) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
-            overlay.set_seek_strip(seek_strip);
+            overlay.set_seek_strip(seek_strip, material_availability);
         }
     }
 
@@ -6096,6 +6104,8 @@ impl NativeEguiOverlay {
             navigation_preview_texture: None,
             tile_overlay: None,
             seek_strip: None,
+            seek_strip_material_availability:
+                crate::video::seek_strip::SeekStripMaterialAvailability::Unknown,
             ring_picker_overlay: None,
             ring_guide_overlay: None,
             tile_textures: HashMap::new(),
@@ -6992,6 +7002,14 @@ impl NativeEguiOverlay {
         }
     }
 
+    fn reset_source_session(&mut self) {
+        self.reset_side_panel_session();
+        self.set_seek_strip(
+            None,
+            crate::video::seek_strip::SeekStripMaterialAvailability::Unknown,
+        );
+    }
+
     fn set_fallback_file_name(&mut self, file_name: String) {
         let file_name = if file_name.trim().is_empty() {
             String::new()
@@ -7249,8 +7267,15 @@ impl NativeEguiOverlay {
         self.dirty = true;
     }
 
-    fn set_seek_strip(&mut self, seek_strip: Option<NativeOverlaySeekStrip>) {
-        if self.seek_strip.is_none() && seek_strip.is_none() {
+    fn set_seek_strip(
+        &mut self,
+        seek_strip: Option<NativeOverlaySeekStrip>,
+        material_availability: crate::video::seek_strip::SeekStripMaterialAvailability,
+    ) {
+        if self.seek_strip.is_none()
+            && seek_strip.is_none()
+            && self.seek_strip_material_availability == material_availability
+        {
             return;
         }
         if seek_strip.is_none() {
@@ -7260,6 +7285,7 @@ impl NativeEguiOverlay {
             self.last_seek_strip_window_request = None;
         }
         self.seek_strip = seek_strip;
+        self.seek_strip_material_availability = material_availability;
         self.dirty = true;
     }
 
@@ -8435,6 +8461,17 @@ impl NativeEguiOverlay {
         let duration_secs = self.video_duration_secs;
         let position_controls_available =
             crate::video::seek_strip::video_position_controls_available(duration_secs);
+        let seek_strip_unavailable_tooltip = if !position_controls_available {
+            Some("長さの情報がない動画では使えません")
+        } else {
+            match self.seek_strip_material_availability {
+                crate::video::seek_strip::SeekStripMaterialAvailability::Unavailable(reason) => {
+                    Some(reason.tooltip())
+                }
+                _ => None,
+            }
+        };
+        let seek_strip_material_available = seek_strip_unavailable_tooltip.is_none();
         // P10-2: now-playing バナー (現在再生中のチャプター/ブックマーク) は左パネル
         // 表示中だけ出す。`jump_panel_visible()` は pointer hover で決まるため、
         // closure 内で再計算するのではなく、ここで bool として取って move する。
@@ -9898,7 +9935,10 @@ impl NativeEguiOverlay {
                                 );
                                 match gesture.update(pos) {
                                     crate::video::seek_strip::SeekRowDecision::OpenStrip => {
-                                        if !seek_strip_visible && !was_open {
+                                        if seek_strip_material_available
+                                            && !seek_strip_visible
+                                            && !was_open
+                                        {
                                             last_seek_target_secs = None;
                                             commands.push(NativeOverlayCommand::OpenSeekStrip);
                                         }
@@ -10392,7 +10432,7 @@ impl NativeEguiOverlay {
                                 painter,
                                 seek_strip_selector_rect,
                                 seek_strip_state,
-                                position_controls_available,
+                                seek_strip_unavailable_tooltip,
                                 &mut commands,
                             );
                         }

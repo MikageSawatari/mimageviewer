@@ -17,8 +17,9 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use ffmpeg_the_third as ffmpeg;
 
 use super::seek_strip::{
-    CellRange, StripAxis, StripAxisDecision, StripLookahead, TimeGridReason, compute_strip_window,
-    decide_enumerated_strip_axis, enumerate_index_keyframes, thin_keyframes,
+    CellRange, StripAxis, StripAxisDecision, StripAxisUnavailableReason, StripLookahead,
+    TimeGridReason, compute_strip_window, decide_enumerated_strip_axis, enumerate_index_keyframes,
+    thin_keyframes,
 };
 use super::tile_thumb_cache::TileThumbCache;
 
@@ -140,6 +141,7 @@ pub(crate) fn decide_strip_thumbnail_cell_state<'a>(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum StripThumbnailWorkerStatus {
     Running,
+    MaterialUnavailable(StripAxisUnavailableReason),
     DecoderUnavailable(String),
     Cancelled,
     ThreadSpawnFailed(String),
@@ -186,6 +188,7 @@ pub(crate) fn decide_strip_thumbnail_display_scope(
 pub(crate) enum StripAxisResolution {
     Resolving,
     Ready(Arc<StripAxis>),
+    Unavailable(StripAxisUnavailableReason),
     Failed(String),
 }
 
@@ -200,6 +203,7 @@ pub(crate) enum StripAxisResolutionReason {
     NonMonotonicIndexTimestamps,
     InvalidIndexCoverage,
     IncompleteIndexCoverage,
+    SparseKeyframes,
     NoAdoptedKeyframes,
 }
 
@@ -211,6 +215,7 @@ pub(crate) struct StripAxisDiagnostics {
     pub(crate) keyframe_count: usize,
     pub(crate) first_keyframe_secs: Option<f64>,
     pub(crate) last_keyframe_secs: Option<f64>,
+    pub(crate) maximum_keyframe_gap_secs: Option<f64>,
 }
 
 impl StripAxisDiagnostics {
@@ -222,6 +227,7 @@ impl StripAxisDiagnostics {
             keyframe_count: 0,
             first_keyframe_secs: None,
             last_keyframe_secs: None,
+            maximum_keyframe_gap_secs: None,
         }
     }
 }
@@ -893,6 +899,7 @@ impl SeekStripThumbnailWorker {
             || matches!(
                 lock_recover(&self.state).status,
                 StripThumbnailWorkerStatus::Cancelled
+                    | StripThumbnailWorkerStatus::MaterialUnavailable(_)
                     | StripThumbnailWorkerStatus::ThreadSpawnFailed(_)
             )
         {
@@ -1037,10 +1044,20 @@ fn run_worker(
         return;
     }
     match axis {
-        Ok(resolved) => {
+        Ok(ResolvedStripAxisOutcome::Ready(resolved)) => {
             let mut shared = lock_recover(&state);
             shared.axis_diagnostics = Some(resolved.diagnostics);
             shared.axis = StripAxisResolution::Ready(Arc::new(resolved.axis));
+        }
+        Ok(ResolvedStripAxisOutcome::Unavailable {
+            reason,
+            diagnostics,
+        }) => {
+            let mut shared = lock_recover(&state);
+            shared.axis_diagnostics = Some(diagnostics);
+            shared.status = StripThumbnailWorkerStatus::MaterialUnavailable(reason);
+            shared.axis = StripAxisResolution::Unavailable(reason);
+            return;
         }
         Err(error) => {
             let mut shared = lock_recover(&state);
@@ -1093,7 +1110,7 @@ fn fallback_strip_axis(
     duration_secs: f64,
     fallback_interval_secs: f64,
     diagnostics: StripAxisDiagnostics,
-) -> Result<ResolvedStripAxis, String> {
+) -> Result<ResolvedStripAxisOutcome, String> {
     if !duration_secs.is_finite() {
         return Err("video duration is not finite".to_string());
     }
@@ -1106,13 +1123,13 @@ fn fallback_strip_axis(
     if fallback_interval_secs <= 0.0 {
         return Err("fallback strip interval is not positive".to_string());
     }
-    Ok(ResolvedStripAxis {
+    Ok(ResolvedStripAxisOutcome::Ready(ResolvedStripAxis {
         axis: StripAxis::TimeGrid {
             interval_secs: fallback_interval_secs,
             duration_secs,
         },
         diagnostics,
-    })
+    }))
 }
 
 struct ResolvedStripAxis {
@@ -1120,12 +1137,20 @@ struct ResolvedStripAxis {
     diagnostics: StripAxisDiagnostics,
 }
 
+enum ResolvedStripAxisOutcome {
+    Ready(ResolvedStripAxis),
+    Unavailable {
+        reason: StripAxisUnavailableReason,
+        diagnostics: StripAxisDiagnostics,
+    },
+}
+
 fn resolve_strip_axis(
     path: &Path,
     duration_secs: f64,
     min_gap_secs: f64,
     fallback_interval_secs: f64,
-) -> Result<ResolvedStripAxis, String> {
+) -> Result<ResolvedStripAxisOutcome, String> {
     ffmpeg::init().map_err(|error| error.to_string())?;
     let mut input = match ffmpeg::format::input(path) {
         Ok(input) => input,
@@ -1154,6 +1179,12 @@ fn resolve_strip_axis(
             StripAxisDiagnostics::without_index(StripAxisResolutionReason::IndexUnavailable),
         );
     };
+    let maximum_keyframe_gap_secs = index
+        .keyframes
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .filter(|gap| gap.is_finite() && *gap >= 0.0)
+        .max_by(f64::total_cmp);
     let mut diagnostics = StripAxisDiagnostics {
         reason: StripAxisResolutionReason::UsableKeyframeIndex,
         index_timestamps_monotonic: Some(index.monotonic),
@@ -1161,6 +1192,7 @@ fn resolve_strip_axis(
         keyframe_count: index.keyframes.len(),
         first_keyframe_secs: index.keyframes.first().copied(),
         last_keyframe_secs: index.keyframes.last().copied(),
+        maximum_keyframe_gap_secs,
     };
     match decide_enumerated_strip_axis(&index, duration_secs) {
         StripAxisDecision::KeyframeIndex => {
@@ -1170,11 +1202,18 @@ fn resolve_strip_axis(
                 diagnostics.reason = StripAxisResolutionReason::NoAdoptedKeyframes;
                 fallback_strip_axis(duration_secs, fallback_interval_secs, diagnostics)
             } else {
-                Ok(ResolvedStripAxis {
+                Ok(ResolvedStripAxisOutcome::Ready(ResolvedStripAxis {
                     axis: StripAxis::KeyframeIndex { keyframes, adopted },
                     diagnostics,
-                })
+                }))
             }
+        }
+        StripAxisDecision::Unavailable(reason) => {
+            diagnostics.reason = StripAxisResolutionReason::SparseKeyframes;
+            Ok(ResolvedStripAxisOutcome::Unavailable {
+                reason,
+                diagnostics,
+            })
         }
         StripAxisDecision::TimeGrid(reason) => {
             diagnostics.reason = match reason {
@@ -2565,6 +2604,9 @@ mod tests {
             match worker.snapshot().axis {
                 StripAxisResolution::Ready(axis) => break axis,
                 StripAxisResolution::Failed(error) => panic!("axis resolution failed: {error}"),
+                StripAxisResolution::Unavailable(reason) => {
+                    panic!("strip material unavailable: {reason:?}")
+                }
                 StripAxisResolution::Resolving => {}
             }
             assert!(

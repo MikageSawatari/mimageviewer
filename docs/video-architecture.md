@@ -753,6 +753,15 @@ software full-frame decoder へ file-local に切り替える。各 run は先�
 pre-roll し、参照 frame を復号してから同じ DTS → packet PTS → bounded frame matching を行う。
 通常素材は従来の keyframe-only 高速経路だけを通る。
 
+axis resolver は decode request より先に index 統計を確定する。complete index の最大 raw GOP が
+15.0 秒を越えた場合は `KeyframesTooSparse` の material unavailable とし、thumbnail decoder も
+waveform decoder も開かない。この preflight は waveform session でも同じ thumbnail worker の
+axis-only 前段を使う。結果は `VideoPlayer` が video-local な typed availability として所有し、App の
+session open、全 strip KeyAction、presenter の film button、シーク行の上ドラッグが同じ値を参照する。
+最初に判明した frame で既存の unavailable toast surfaceへ 1 回だけ理由を送り、strip の persisted
+3 値は `none` へ閉じる。presenter への `SetSeekStrip` command は payload と availability を同時に渡し、
+source session reset で `Unknown` へ戻すため、前ファイルの unavailable が次の動画へ漏れない。
+
 波形モードの `SeekStripWaveWorker` は既に完成済みの `TimelineAnalysis` が現在ファイルまたは
 音楽解析 LRU にあれば対象時間窓を切り出す。無ければ、動画ごとに 1 回だけ開く
 `AudioRangeDecoder` でまず設定された可視 span (30〜1800 秒、既定 60 秒) と 0.75 秒の pre-roll
@@ -811,6 +820,7 @@ native hover が外れた frame でだけ Arrow へ戻す。
 受信する ownership boundary で「長さ情報がないためシークバーとシークストリップは使えないが、再生は
 できる」と native presenter toast へ 1 回だけ送る。同じ pure predicate を strip session の open gate と
 presenter のシーク行 / フィルムボタンに使い、キー操作も設定状態を変更しない no-op にする。
+keyframe が疎すぎる material unavailable も同じ UI surface と入力 gate を使い、理由文だけを変える。
 
 ### 各ファイルの責務
 

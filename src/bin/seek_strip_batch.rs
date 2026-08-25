@@ -9,7 +9,8 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use mimageviewer::video::seek_strip_batch::{
-    AxisReport, BatchOptions, BatchReport, CellState, FileReport, discover_video_files, verify_file,
+    AxisReport, BatchOptions, BatchReport, CellState, DuplicateDetector, FileReport,
+    discover_video_files, verify_file,
 };
 
 struct Cli {
@@ -50,11 +51,22 @@ fn main() -> ExitCode {
     }
 
     let mut files = Vec::with_capacity(paths.len());
+    let mut duplicate_detector = DuplicateDetector::default();
     for (index, path) in paths.iter().enumerate() {
         if cli.json {
             eprintln!("[{}/{}] {}", index + 1, paths.len(), path.display());
         }
-        let report = verify_file(path, &cli.options);
+        let report = match duplicate_detector.check(path) {
+            Ok(Some(matched_path)) => FileReport::duplicate_of(path, matched_path),
+            Ok(None) => verify_file(path, &cli.options),
+            Err(error) => {
+                eprintln!(
+                    "DEDUPE-WARN {}: {error}; verifying normally",
+                    path.display()
+                );
+                verify_file(path, &cli.options)
+            }
+        };
         if !cli.json {
             print_file_summary(&report);
         }
@@ -72,11 +84,13 @@ fn main() -> ExitCode {
     } else {
         print_failure_details(&report);
         println!(
-            "SUMMARY total={} pass={} fail={} skip={} failed_cells={} elapsed={:.1}s",
+            "SUMMARY total={} pass={} fail={} unavailable={} skip={} duplicate={} failed_cells={} elapsed={:.1}s",
             report.files.len(),
             report.passed_files,
             report.failed_files,
+            report.unavailable_files,
             report.skipped_files,
+            report.duplicate_files,
             report.failed_cells,
             report.elapsed_ms / 1000.0,
         );
@@ -189,6 +203,10 @@ fn print_usage() {
 }
 
 fn print_file_summary(file: &FileReport) {
+    if let Some(matched_path) = &file.duplicate_of {
+        println!("DUPLICATE {} matched={matched_path}", file.path);
+        return;
+    }
     if let Some(reason) = &file.skipped_reason {
         println!("SKIP {} reason={reason}", file.path);
         return;
@@ -201,6 +219,20 @@ fn print_file_summary(file: &FileReport) {
         println!("FAIL {} axis=missing", file.path);
         return;
     };
+    if let Some(reason) = &file.unavailable_reason {
+        println!(
+            "UNAVAILABLE {} axis={} reason={} message={} index={} coverage={} max_raw_gap={} decode={}",
+            file.path,
+            axis.kind,
+            axis.reason_code,
+            reason,
+            axis.keyframe_count,
+            format_optional(axis.index_coverage_percent, 1),
+            format_seconds(axis.maximum_keyframe_gap_secs),
+            format_decode(file),
+        );
+        return;
+    }
     let state = if file.passed() { "PASS" } else { "FAIL" };
     let windows = file
         .windows
@@ -214,13 +246,14 @@ fn print_file_summary(file: &FileReport) {
         .collect::<Vec<_>>()
         .join(",");
     println!(
-        "{state} {} axis={} reason={} index={} coverage={} monotonic={} adopted={} spacing={} decode={} windows=[{}]",
+        "{state} {} axis={} reason={} index={} coverage={} monotonic={} max_raw_gap={} adopted={} spacing={} decode={} windows=[{}]",
         file.path,
         axis.kind,
         axis.reason_code,
         axis.keyframe_count,
         format_optional(axis.index_coverage_percent, 1),
         format_monotonic(axis),
+        format_seconds(axis.maximum_keyframe_gap_secs),
         axis.adopted_count
             .map(|count| count.to_string())
             .unwrap_or_else(|| "-".to_string()),
@@ -245,7 +278,7 @@ fn print_failure_details(report: &BatchReport) {
         println!("{}", file.path);
         if let Some(axis) = &file.axis {
             println!(
-                "  axis={} reason={} ({}) index={} coverage={} monotonic={} inversions={} adopted={} spacing={}",
+                "  axis={} reason={} ({}) index={} coverage={} monotonic={} inversions={} max_raw_gap={} adopted={} spacing={}",
                 axis.kind,
                 axis.reason_code,
                 axis.reason,
@@ -253,6 +286,7 @@ fn print_failure_details(report: &BatchReport) {
                 format_optional(axis.index_coverage_percent, 2),
                 format_monotonic(axis),
                 axis.index_inversion_count,
+                format_seconds(axis.maximum_keyframe_gap_secs),
                 axis.adopted_count
                     .map(|count| count.to_string())
                     .unwrap_or_else(|| "-".to_string()),
@@ -334,5 +368,11 @@ fn format_decode(file: &FileReport) -> String {
 fn format_optional(value: Option<f64>, precision: usize) -> String {
     value
         .map(|value| format!("{value:.precision$}%"))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn format_seconds(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.2}s"))
         .unwrap_or_else(|| "n/a".to_string())
 }

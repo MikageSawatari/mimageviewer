@@ -173,7 +173,69 @@ fn time_grid_cell_count(interval_secs: f64, duration_secs: f64) -> usize {
 pub(crate) enum StripAxisDecision {
     KeyframeIndex,
     TimeGrid(TimeGridReason),
+    Unavailable(StripAxisUnavailableReason),
 }
+
+/// Material-level reasons why neither seek-strip axis is useful enough to expose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StripAxisUnavailableReason {
+    KeyframesTooSparse,
+}
+
+impl StripAxisUnavailableReason {
+    pub(crate) const fn user_notice(self) -> &'static str {
+        match self {
+            Self::KeyframesTooSparse => "キーフレームが少ないためストリップを表示できません",
+        }
+    }
+
+    pub(crate) const fn tooltip(self) -> &'static str {
+        match self {
+            Self::KeyframesTooSparse => "キーフレームが少ない動画では使えません",
+        }
+    }
+}
+
+/// Per-video material preflight state shared by every strip entry point.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SeekStripMaterialAvailability {
+    #[default]
+    Unknown,
+    Available,
+    Unavailable(StripAxisUnavailableReason),
+}
+
+impl SeekStripMaterialAvailability {
+    pub(crate) const fn allows_open(self) -> bool {
+        !matches!(self, Self::Unavailable(_))
+    }
+
+    pub(crate) const fn encode(self) -> u8 {
+        match self {
+            Self::Unknown => 0,
+            Self::Available => 1,
+            Self::Unavailable(StripAxisUnavailableReason::KeyframesTooSparse) => 2,
+        }
+    }
+
+    pub(crate) const fn decode(value: u8) -> Self {
+        match value {
+            1 => Self::Available,
+            2 => Self::Unavailable(StripAxisUnavailableReason::KeyframesTooSparse),
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// A cell must never require more than one reasonably sized GOP to reconstruct.
+///
+/// The 2026-08-25 stage-1 rerun had 1,164 unique healthy keyframe-index files. Their raw
+/// maximum GOP was p99/max 10.43 s (adopted p99 12.10 s, max 12.39 s); the only declined
+/// file had a raw maximum GOP of 833.43 s and previously timed out while decoding. A 15 s
+/// raw-GOP ceiling therefore leaves 44% headroom over the measured healthy raw maximum
+/// while declining the material before any thumbnail or waveform decode starts. This is
+/// intentionally based on raw index gaps, not the user-configurable adopted spacing.
+pub(crate) const SEEK_STRIP_MAX_RAW_KEYFRAME_GAP_SECS: f64 = 15.0;
 
 /// 等時間グリッドを選んだ理由。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -266,7 +328,11 @@ pub(crate) fn decide_strip_axis(keyframes: &[f64], duration_secs: f64) -> StripA
         .max(1.0);
     let rounding_guard = f64::EPSILON * comparison_scale * 8.0;
     if tail_secs <= observed_max_gap + rounding_guard {
-        StripAxisDecision::KeyframeIndex
+        if observed_max_gap > SEEK_STRIP_MAX_RAW_KEYFRAME_GAP_SECS {
+            StripAxisDecision::Unavailable(StripAxisUnavailableReason::KeyframesTooSparse)
+        } else {
+            StripAxisDecision::KeyframeIndex
+        }
     } else {
         StripAxisDecision::TimeGrid(TimeGridReason::IncompleteCoverage)
     }
@@ -1090,6 +1156,18 @@ mod tests {
             decide_strip_axis(&keyframes, 30.1),
             StripAxisDecision::KeyframeIndex,
             "the 6.7s tail is within the observed 8.34s GOP"
+        );
+    }
+
+    #[test]
+    fn axis_decision_declines_sparse_material_before_axis_fallback() {
+        assert_eq!(
+            decide_strip_axis(&[0.0, 15.0, 30.0], 44.0),
+            StripAxisDecision::KeyframeIndex
+        );
+        assert_eq!(
+            decide_strip_axis(&[0.0, 15.001, 30.002], 44.0),
+            StripAxisDecision::Unavailable(StripAxisUnavailableReason::KeyframesTooSparse)
         );
     }
 

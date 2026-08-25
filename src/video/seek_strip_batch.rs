@@ -4,13 +4,15 @@
 //! SeekStripThumbnailWorker, uses the resolved StripAxis, and turns worker snapshots into
 //! stable text/JSON-friendly reports.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ffmpeg_the_third as ffmpeg;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use super::seek_strip::{StripAxis, StripLookahead, compute_strip_window};
 use super::seek_strip_thumbs::{
@@ -21,6 +23,58 @@ use super::seek_strip_thumbs::{
 };
 
 const FALLBACK_MAX_CELLS: usize = 240;
+const DUPLICATE_SAMPLE_BYTES: usize = 8 * 1024;
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct SampledFileFingerprint {
+    size_bytes: u64,
+    sample_sha256: [u8; 32],
+}
+
+/// Finds byte-identical candidates without turning a multi-terabyte sweep into a full read.
+///
+/// Each large file contributes only an 8 KiB head and 8 KiB tail sample, with file size kept in
+/// the key. This is deliberately content-based (not codec/GOP shape) so distinct streams still
+/// exercise the decoder. As requested for the sweep tool, a matching sample is treated as an
+/// identical duplicate; this is a fast sampled identity check, not a cryptographic whole-file
+/// proof.
+#[derive(Default)]
+pub struct DuplicateDetector {
+    seen: HashMap<SampledFileFingerprint, String>,
+}
+
+impl DuplicateDetector {
+    pub fn check(&mut self, path: &Path) -> std::io::Result<Option<String>> {
+        let fingerprint = sampled_file_fingerprint(path)?;
+        if let Some(matched_path) = self.seen.get(&fingerprint) {
+            return Ok(Some(matched_path.clone()));
+        }
+        self.seen.insert(fingerprint, path_string(path));
+        Ok(None)
+    }
+}
+
+fn sampled_file_fingerprint(path: &Path) -> std::io::Result<SampledFileFingerprint> {
+    let mut file = std::fs::File::open(path)?;
+    let size_bytes = file.metadata()?.len();
+    let mut hasher = Sha256::new();
+    let mut sample = vec![0_u8; DUPLICATE_SAMPLE_BYTES];
+    if size_bytes <= (DUPLICATE_SAMPLE_BYTES * 2) as u64 {
+        sample.clear();
+        file.read_to_end(&mut sample)?;
+        hasher.update(&sample);
+    } else {
+        file.read_exact(&mut sample)?;
+        hasher.update(&sample);
+        file.seek(std::io::SeekFrom::End(-(DUPLICATE_SAMPLE_BYTES as i64)))?;
+        file.read_exact(&mut sample)?;
+        hasher.update(&sample);
+    }
+    Ok(SampledFileFingerprint {
+        size_bytes,
+        sample_sha256: hasher.finalize().into(),
+    })
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct BatchOptions {
@@ -78,6 +132,7 @@ pub struct AxisReport {
     pub index_coverage_percent: Option<f64>,
     pub index_timestamps_monotonic: Option<bool>,
     pub index_inversion_count: usize,
+    pub maximum_keyframe_gap_secs: Option<f64>,
     pub adopted_count: Option<usize>,
     pub adopted_spacing: Option<SpacingStats>,
 }
@@ -126,6 +181,8 @@ pub struct FileReport {
     pub decode: Option<DecodeReport>,
     pub windows: Vec<WindowReport>,
     pub skipped_reason: Option<String>,
+    pub unavailable_reason: Option<String>,
+    pub duplicate_of: Option<String>,
     pub file_error: Option<String>,
 }
 
@@ -135,15 +192,42 @@ impl FileReport {
     }
 
     pub fn passed(&self) -> bool {
-        self.skipped_reason.is_none() && self.file_error.is_none() && self.failed_cell_count() == 0
+        self.skipped_reason.is_none()
+            && self.unavailable_reason.is_none()
+            && self.duplicate_of.is_none()
+            && self.file_error.is_none()
+            && self.failed_cell_count() == 0
     }
 
     pub fn skipped(&self) -> bool {
         self.skipped_reason.is_some()
     }
 
+    pub fn unavailable(&self) -> bool {
+        self.unavailable_reason.is_some()
+    }
+
+    pub fn duplicate(&self) -> bool {
+        self.duplicate_of.is_some()
+    }
+
     pub fn verification_failed(&self) -> bool {
         self.file_error.is_some() || self.failed_cell_count() > 0
+    }
+
+    pub fn duplicate_of(path: &Path, matched_path: String) -> Self {
+        Self {
+            path: path_string(path),
+            duration_secs: None,
+            elapsed_ms: 0.0,
+            axis: None,
+            decode: None,
+            windows: Vec::new(),
+            skipped_reason: None,
+            unavailable_reason: None,
+            duplicate_of: Some(matched_path),
+            file_error: None,
+        }
     }
 }
 
@@ -158,6 +242,8 @@ pub struct BatchReport {
     pub passed_files: usize,
     pub failed_files: usize,
     pub skipped_files: usize,
+    pub unavailable_files: usize,
+    pub duplicate_files: usize,
     pub failed_cells: usize,
     pub elapsed_ms: f64,
 }
@@ -176,9 +262,11 @@ impl BatchReport {
             .filter(|file| file.verification_failed())
             .count();
         let skipped_files = files.iter().filter(|file| file.skipped()).count();
+        let unavailable_files = files.iter().filter(|file| file.unavailable()).count();
+        let duplicate_files = files.iter().filter(|file| file.duplicate()).count();
         let failed_cells = files.iter().map(FileReport::failed_cell_count).sum();
         Self {
-            schema_version: 1,
+            schema_version: 2,
             roots: roots.iter().map(|path| path_string(path)).collect(),
             options,
             discovery_issues: discovery.issues,
@@ -187,6 +275,8 @@ impl BatchReport {
             passed_files,
             failed_files,
             skipped_files,
+            unavailable_files,
+            duplicate_files,
             failed_cells,
             elapsed_ms: elapsed.as_secs_f64() * 1000.0,
         }
@@ -334,6 +424,8 @@ pub fn verify_file(path: &Path, options: &BatchOptions) -> FileReport {
                 decode: None,
                 windows: Vec::new(),
                 skipped_reason: Some(reason),
+                unavailable_reason: None,
+                duplicate_of: None,
                 file_error: None,
             };
         }
@@ -369,6 +461,32 @@ pub fn verify_file(path: &Path, options: &BatchOptions) -> FileReport {
             StripAxisResolution::Failed(error) => {
                 worker.cancel();
                 return file_error_report(path_text, duration_secs, started, error);
+            }
+            StripAxisResolution::Unavailable(reason) => {
+                let Some(diagnostics) = snapshot.axis_diagnostics else {
+                    worker.cancel();
+                    return file_error_report(
+                        path_text,
+                        duration_secs,
+                        started,
+                        "axis declined material without diagnostics".to_string(),
+                    );
+                };
+                let axis = build_unavailable_axis_report(&diagnostics, duration_secs);
+                let decode = Some(build_decode_report(&snapshot.decode_diagnostics));
+                worker.cancel();
+                return FileReport {
+                    path: path_text,
+                    duration_secs: Some(duration_secs),
+                    elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+                    axis: Some(axis),
+                    decode,
+                    windows: Vec::new(),
+                    skipped_reason: None,
+                    unavailable_reason: Some(reason.user_notice().to_string()),
+                    duplicate_of: None,
+                    file_error: None,
+                };
             }
             StripAxisResolution::Resolving => {}
         }
@@ -409,6 +527,8 @@ pub fn verify_file(path: &Path, options: &BatchOptions) -> FileReport {
         decode,
         windows,
         skipped_reason: None,
+        unavailable_reason: None,
+        duplicate_of: None,
         file_error: None,
     }
 }
@@ -441,6 +561,8 @@ fn file_error_report(
         decode: None,
         windows: Vec::new(),
         skipped_reason: None,
+        unavailable_reason: None,
+        duplicate_of: None,
         file_error: Some(error),
     }
 }
@@ -483,8 +605,35 @@ fn build_axis_report(
             .map(|last| last / duration_secs * 100.0),
         index_timestamps_monotonic: diagnostics.index_timestamps_monotonic,
         index_inversion_count: diagnostics.index_inversion_count,
+        maximum_keyframe_gap_secs: diagnostics.maximum_keyframe_gap_secs,
         adopted_count,
         adopted_spacing,
+    }
+}
+
+fn build_unavailable_axis_report(
+    diagnostics: &StripAxisDiagnostics,
+    duration_secs: f64,
+) -> AxisReport {
+    let (reason_code, reason) = axis_reason(diagnostics);
+    AxisReport {
+        kind: "unavailable".to_string(),
+        reason_code,
+        reason,
+        cell_count: 0,
+        interval_secs: None,
+        keyframe_count: diagnostics.keyframe_count,
+        index_first_secs: diagnostics.first_keyframe_secs,
+        index_last_secs: diagnostics.last_keyframe_secs,
+        index_coverage_percent: diagnostics
+            .last_keyframe_secs
+            .filter(|_| duration_secs > 0.0)
+            .map(|last| last / duration_secs * 100.0),
+        index_timestamps_monotonic: diagnostics.index_timestamps_monotonic,
+        index_inversion_count: diagnostics.index_inversion_count,
+        maximum_keyframe_gap_secs: diagnostics.maximum_keyframe_gap_secs,
+        adopted_count: None,
+        adopted_spacing: None,
     }
 }
 
@@ -551,6 +700,14 @@ fn axis_reason(diagnostics: &StripAxisDiagnostics) -> (String, String) {
         StripAxisResolutionReason::NoAdoptedKeyframes => (
             "no_adopted_keyframes",
             "minimum-gap adoption produced no cells; using time grid".to_string(),
+        ),
+        StripAxisResolutionReason::SparseKeyframes => (
+            "sparse_keyframes",
+            format!(
+                "raw keyframe gap {:.2}s exceeds the {:.2}s strip limit",
+                diagnostics.maximum_keyframe_gap_secs.unwrap_or(f64::NAN),
+                super::seek_strip::SEEK_STRIP_MAX_RAW_KEYFRAME_GAP_SECS,
+            ),
         ),
     };
     (code.to_string(), text)
@@ -709,6 +866,9 @@ fn run_window(
 fn worker_status_failure(status: &StripThumbnailWorkerStatus) -> Option<String> {
     match status {
         StripThumbnailWorkerStatus::Running => None,
+        StripThumbnailWorkerStatus::MaterialUnavailable(reason) => {
+            Some(reason.user_notice().to_string())
+        }
         StripThumbnailWorkerStatus::DecoderUnavailable(error) => {
             Some(format!("decoder unavailable: {error}"))
         }
@@ -773,5 +933,38 @@ mod tests {
             .map(|(_, start)| start)
             .collect();
         assert_eq!(starts, vec![0, 22, 45, 67, 89]);
+    }
+
+    #[test]
+    fn duplicate_detector_reports_the_first_matching_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.mp4");
+        let duplicate = directory.path().join("duplicate.mp4");
+        let bytes = vec![0x5a; DUPLICATE_SAMPLE_BYTES * 3];
+        std::fs::write(&first, &bytes).unwrap();
+        std::fs::write(&duplicate, &bytes).unwrap();
+
+        let mut detector = DuplicateDetector::default();
+        assert_eq!(detector.check(&first).unwrap(), None);
+        assert_eq!(
+            detector.check(&duplicate).unwrap(),
+            Some(path_string(&first))
+        );
+    }
+
+    #[test]
+    fn duplicate_detector_keeps_same_size_files_with_different_samples() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.mp4");
+        let distinct = directory.path().join("distinct.mp4");
+        let first_bytes = vec![0x11; DUPLICATE_SAMPLE_BYTES * 3];
+        let mut distinct_bytes = first_bytes.clone();
+        distinct_bytes[0] = 0x22;
+        std::fs::write(&first, first_bytes).unwrap();
+        std::fs::write(&distinct, distinct_bytes).unwrap();
+
+        let mut detector = DuplicateDetector::default();
+        assert_eq!(detector.check(&first).unwrap(), None);
+        assert_eq!(detector.check(&distinct).unwrap(), None);
     }
 }
