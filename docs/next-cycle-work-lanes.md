@@ -82,12 +82,13 @@
   次の実行で通る。2 回続けて同じ位置で落ちるなら別の話として扱う。
 - 共有作業ツリーでのコミットは pathspec commit (`git commit -- <自分のパス>`)。
 - 既存 worktree: `detached-rework` と `video-upscale-shader` は master へ取り込み済みで撤収候補。
-- **`seek-thumb-bench` の 2 コミットは、もう再利用の候補ではなく衝突要因** (2026-08-25 に確認)。
-  計装先の `render_core.rs` / `thumbnail.rs` はレーン B が大きく書き換えており
+- **`seek-thumb-bench` worktree は撤収済み** (2026-08-25、利用者判断)。計装先の
+  `render_core.rs` / `thumbnail.rs` をレーン B が大きく書き換えており
   (`render_core.rs` だけで +874 行)、B は自前の計測手段
-  (`src/bin/seek_strip_batch.rs` + `tools/seek_strip_probe`) を既に作っている。
-  `scripts/analyze_seek_thumb.py` に取り出したいものが無ければ**撤収してよい**。
-  判断はレーン B 側で。撤収は `scripts/safe-worktree-remove.ps1` 経由。
+  (`src/bin/seek_strip_batch.rs` + `tools/seek_strip_probe`) を既に持っているため、
+  再利用の候補ではなく衝突要因になっていた。
+  **ブランチ `seek-thumb-bench` は残してある** (`4dc8a4ad`)。`analyze_seek_thumb.py` など
+  取り出したいものがあれば `git show` / `git checkout seek-thumb-bench -- <path>` で拾える。
 
 ### レーン B の現況 (2026-08-25 夜)
 
