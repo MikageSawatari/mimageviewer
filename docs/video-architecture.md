@@ -704,7 +704,7 @@ src/video/
 分割) → Phase 3 (state machine 配線) → Phase 4 (薄い facade 化を最終形として固定) の
 順で導入された。
 
-`thumbnail.rs` の `ThumbnailWorker` は seek hover preview、mIV Remote の seek preview、
+`thumbnail.rs` の `ThumbnailWorker` は seek bar / seek strip の共有 hover preview、mIV Remote の seek preview、
 左 jump panel (pin/bookmark/chapter) のサムネイル warmup で共有する。API は
 `request_seek_thumbnail(target_secs, tolerance_secs)` / `nearest_seek_thumbnail(target_secs,
 tolerance_secs)` とし、許容値は worker global ではなく要求ごとに渡す。desktop hover は
@@ -838,6 +838,20 @@ film-strip button は `none → thumbnails → waveform → none` を 1 クリ�
 waveform はフィルム上の vector 音符で区別する。ストリップ本体にはモード切替 UI を置かず、全域を
 ドラッグ面にする。左右パネルの端 hover band はストリップ表示中だけ 104pt 上へ退避し、非表示時は
 従来の HUD 上端境界を保つ。hover の単発 preview と tile overlay は排他的に扱う。
+
+**D17 の共有 1 枚プレビュー**: seek bar と seek strip は presenter-local な同じ preview target を
+更新し、`ThumbnailWorker` の latest-wins request、許容値計算、texture、描画出口を共有する。
+サムネイル mode は `cell_index_at_pointer` で実セル上を確認し、既存の連続セル位置から
+`StripAxis::time_for_center_index` へ渡す。波形 mode は `waveform_time_at_pointer` を使う。
+strip が `Some` の間は preview rect の下端を `native_seek_strip_rect().min.y - 14pt` に置き、
+短い viewport では 16:9 画像を縮めて strip と重ならない不変条件を優先する。strip が無ければ従来の
+下部 HUD 上端 - 14pt を基準にする。描画は既存の 64pt HUD `Area` から行い、全画面の受動 `Area` は
+作らない。`last_drawn_preview_rect` が実描画 rect を保持し、`compute_hud_regions` はその値をそのまま
+HUD HWND region へ入れるため、位置と入力 region は同じ snapshot に追従する。strip の鍵上では
+preview target を抑止し、drag 中は strip が pointer を所有する限り更新を続ける。tile / 音声 mode /
+長さ不明では出さず、source swap、strip close、mode switch では target と worker request を typed
+`ClearSeekThumbnail` 経路で閉じる。
+
 ストリップ上の cursor ownership は egui の `pointer_hover_pos` ではなく、HUD 可視性が使う
 presenter-owned `visibility_hover_pos()` を位置正本にする。HUD / presenter の別 HWND 間を
 移動中に egui hover が一時的に消えても、native hover がストリップ内なら横 resize cursor を維持し、

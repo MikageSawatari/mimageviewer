@@ -7742,6 +7742,16 @@ impl App {
                 );
                 Some(crate::video::native_presenter::NativeOverlaySeekStrip {
                     center: session.center,
+                    axis: match &session.axis {
+                        VideoSeekStripAxisState::Resolving { .. } => {
+                            crate::video::native_presenter::NativeOverlaySeekStripAxis::Resolving
+                        }
+                        VideoSeekStripAxisState::Ready(axis) => {
+                            crate::video::native_presenter::NativeOverlaySeekStripAxis::Ready(
+                                std::sync::Arc::clone(axis),
+                            )
+                        }
+                    },
                     range_value_secs,
                     cell_count,
                     cells,
