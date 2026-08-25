@@ -853,6 +853,18 @@ pub(in crate::app) struct ViewerContextBundle {
     fs_early_dims: ItemsGenerationMap<[usize; 2]>,
     fs_upload_backlog: FsUploadBacklog,
     top_level_grid_view: top_level_grid_view::TopLevelGridView,
+    /// snapshot 表示中に退避してある「元の一覧」。
+    ///
+    /// `activate_snapshot` は `items` / `thumbnails` / `visible_indices` /
+    /// `scroll_offset_y` / `selected` / `zip_nav` の **6 つとも本 bundle の field** を
+    /// ここへ退避する。したがって退避先も同じ context が所有していなければならない。
+    /// 直上の `top_level_grid_view` (= どの top-level surface を表示中か) と対であり、
+    /// **片方だけ per-context だと「表示は context ごと・取り消しは App 共有」**という
+    /// 所有境界の食い違いになる。実際、App-global だった頃は
+    /// ① 2 つ目の context が snapshot を張ると 1 つ目の退避を上書きして復元不能にし、
+    /// ② 両者が同じフォルダを指していると解除時に他 context の一覧を書き戻した
+    /// (監査 A2b の既知の指摘、docs/detached-rework-plan.md §9.5)。
+    snapshot: Option<crate::snapshot::SnapshotState>,
     items_are_global_search_view: bool,
     items_are_tag_view: bool,
     items_are_reading_history_view: bool,
@@ -1352,6 +1364,7 @@ impl ViewerContextBundle {
             fs_early_dims: ItemsGenerationMap::new("fs_early_dims"),
             fs_upload_backlog: FsUploadBacklog::new("fs_upload_backlog", fs_upload_backlog_idx),
             top_level_grid_view: top_level_grid_view::TopLevelGridView::default(),
+            snapshot: None,
             items_are_global_search_view: false,
             items_are_tag_view: false,
             items_are_reading_history_view: false,
@@ -1673,6 +1686,7 @@ impl App {
             fs_early_dims,
             fs_upload_backlog,
             top_level_grid_view,
+            snapshot,
             items_are_global_search_view,
             items_are_tag_view,
             items_are_reading_history_view,
@@ -1913,6 +1927,7 @@ impl App {
         swap_field!(fs_early_dims);
         swap_field!(fs_upload_backlog);
         swap_field!(top_level_grid_view);
+        swap_field!(snapshot);
         swap_field!(items_are_global_search_view);
         swap_field!(items_are_tag_view);
         swap_field!(items_are_reading_history_view);
@@ -2182,6 +2197,7 @@ impl App {
             fs_early_dims,
             fs_upload_backlog,
             top_level_grid_view,
+            snapshot,
             items_are_global_search_view,
             items_are_tag_view,
             items_are_reading_history_view,
@@ -2330,6 +2346,7 @@ impl App {
             current_folder_last_mtime,
             current_folder_signature,
             top_level_grid_view,
+            snapshot,
             items_are_global_search_view,
             items_are_tag_view,
             items_are_reading_history_view,
@@ -2594,6 +2611,12 @@ impl App {
             })
             .collect();
         detached.top_level_grid_view = top_level_grid_view::TopLevelGridView::default();
+        // 物理フォルダ scope の detached は「その 1 フォルダの一覧」として作り直すので、
+        // top-level surface と対で snapshot の退避も持ち込まない。呼び出し側は
+        // `is_snapshot_active()` で snapshot 中の source を既に弾いているが、
+        // **作成ポリシーとして明示**しておく (退避だけ相続して surface が Folder に
+        // 戻っていると、解除の行き先が無い state になる)。
+        detached.snapshot = None;
         detached.details_thumb_suppression_applied = false;
         detached.details_order.clear();
         detached.cached_nav_indices = None;

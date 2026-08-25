@@ -1131,6 +1131,133 @@ fn metadata_request_bakes_context_identity_across_bundleless_window() {
     );
 }
 
+/// snapshot の退避先は、退避される 6 フィールドと同じ context が持つ。
+///
+/// `App::snapshot` が App-global だった頃は、2 つ目の context が snapshot を張ると
+/// 1 つ目の退避を**上書きして復元不能**にしていた。
+#[cfg(windows)]
+fn snapshot_test_items(paths: &[&str]) -> Vec<GridItem> {
+    paths
+        .iter()
+        .map(|path| GridItem::Image(PathBuf::from(path)))
+        .collect()
+}
+
+#[cfg(windows)]
+fn seed_snapshot_context(app: &mut App, folder: &str, paths: &[&str]) {
+    app.items = snapshot_test_items(paths);
+    app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+    app.visible_indices = (0..app.items.len()).collect();
+    app.current_folder = Some(PathBuf::from(folder));
+    app.selected = Some(0);
+}
+
+#[cfg(windows)]
+fn snapshot_item_paths(app: &App) -> Vec<PathBuf> {
+    app.items
+        .iter()
+        .filter_map(|item| match item {
+            GridItem::Image(path) => Some(path.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+#[cfg(windows)]
+fn a_second_context_taking_a_snapshot_does_not_clobber_the_first_stash() {
+    let mut app = phase_c_support::setup_app();
+
+    seed_snapshot_context(
+        &mut app,
+        r"E:\alpha",
+        &[r"E:\alpha\a1.jpg", r"E:\alpha\a2.jpg"],
+    );
+    app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+    assert!(app.is_snapshot_active());
+
+    let other = app.build_window_context_for_test(901, |ctx| {
+        seed_snapshot_context(ctx, r"E:\beta", &[r"E:\beta\b1.jpg"]);
+    });
+    app.with_viewer_context(other, |ctx| {
+        assert!(
+            !ctx.is_snapshot_active(),
+            "a freshly built context must not inherit another context's snapshot"
+        );
+        ctx.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        assert!(ctx.is_snapshot_active());
+    })
+    .expect("second context must mount");
+
+    // 戻ってきた main の退避が生きていること。
+    assert!(app.is_snapshot_active());
+    assert_eq!(app.snapshot_origin(), Some(Path::new(r"E:\alpha")));
+    app.deactivate_snapshot();
+    assert_eq!(
+        snapshot_item_paths(&app),
+        vec![
+            PathBuf::from(r"E:\alpha\a1.jpg"),
+            PathBuf::from(r"E:\alpha\a2.jpg")
+        ],
+        "main must get its own items back, not the other context's"
+    );
+
+    // 相手側の snapshot も生きており、そちらの退避が戻ること。
+    app.with_viewer_context(other, |ctx| {
+        assert!(ctx.is_snapshot_active());
+        ctx.deactivate_snapshot();
+        assert_eq!(
+            snapshot_item_paths(ctx),
+            vec![PathBuf::from(r"E:\beta\b1.jpg")]
+        );
+    })
+    .expect("second context must mount again");
+}
+
+/// 両 context が**同じフォルダ**を指していても、一方の解除が
+/// 他方の一覧を書き戻さないこと。
+///
+/// 旧実装の復元側 guard は `current_folder == snapshot.origin` だけだったので、
+/// 同じフォルダを開いていると **一致してしまい他 context の退避を引き込んだ**。
+#[test]
+#[cfg(windows)]
+fn deactivating_does_not_restore_another_context_stash_for_the_same_folder() {
+    let mut app = phase_c_support::setup_app();
+
+    seed_snapshot_context(&mut app, r"E:\shared", &[r"E:\shared\main.jpg"]);
+    app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+
+    let other = app.build_window_context_for_test(902, |ctx| {
+        // 同じ origin、中身だけ違う。
+        seed_snapshot_context(ctx, r"E:\shared", &[r"E:\shared\other.jpg"]);
+    });
+    app.with_viewer_context(other, |ctx| {
+        ctx.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+    })
+    .expect("second context must mount");
+
+    assert_eq!(app.snapshot_origin(), Some(Path::new(r"E:\shared")));
+    app.deactivate_snapshot();
+    assert_eq!(
+        snapshot_item_paths(&app),
+        vec![PathBuf::from(r"E:\shared\main.jpg")],
+        "the same folder must not make one context restore the other's stash"
+    );
+
+    app.with_viewer_context(other, |ctx| {
+        assert!(
+            ctx.is_snapshot_active(),
+            "the other context's snapshot must survive a sibling deactivating"
+        );
+        ctx.deactivate_snapshot();
+        assert_eq!(
+            snapshot_item_paths(ctx),
+            vec![PathBuf::from(r"E:\shared\other.jpg")]
+        );
+    })
+    .expect("second context must mount again");
+}
+
 #[test]
 #[cfg(windows)]
 fn failed_context_mounts_do_not_change_busy_complete_or_stale_results() {

@@ -940,9 +940,10 @@ allowlist の鍵は**行番号ではなくファイル + 関数名 + 理由** (`
 行キーは即腐る)。**A7 は対象 (`App::viewer_contexts`) が②-d まで存在しない**ので、
 (a)〜(f) の 6 形すべてを fixture テストで覆ってある。「本番 0 件」を根拠にしない。
 
-## 監査が初回実行で見つけた本物: `activate_snapshot`
+## 監査が初回実行で見つけた本物: `activate_snapshot` ✅ 解決済み (2026-08-26)
 
-**allowlist に入れず「既知の指摘」として記録した。R2e の範囲外なので直さない。**
+**当初は allowlist に入れず「既知の指摘」として記録した (R2e の範囲外だったため)。
+後述の「R2e snapshot ownership follow-up」で解決し、KNOWN_FINDINGS は空になった。**
 
 `activate_snapshot` ([src/app/snapshot_ops.rs:270](../src/app/snapshot_ops.rs:270)) は
 **per-context の 5 フィールド** (`items` / `thumbnails` / `visible_indices` /
@@ -962,6 +963,8 @@ detached viewer を開いた状態がそれ。
 正しい修正は `snapshot` を per-context にすることだが、**挙動が変わる**ので別の段の仕事。
 ②-d で registry が context を所有するようになっても、`snapshot` を bundle へ移す判断は
 別に要る。
+
+→ **その段を 2026-08-26 に実施した。下の「R2e snapshot ownership follow-up」を参照。**
 
 ### 「既知の指摘」というカテゴリを足した理由
 
@@ -1059,6 +1062,70 @@ lib テスト 6251 件緑 (件数不変)、監査 exit 0 (既知の指摘 1 件�
 単体テストの仕事で、実機に回すのは**実機でしか出ないもの** (HWND / focus / 実 viewport /
 タイミング) に限る。
 
+### R2e snapshot ownership follow-up (2026-08-26 完了)
+
+R2e が保留した監査の既知の指摘 1 件を閉じた。**リワーク外の変更 (§11) ではなく、
+R2e の続きの独立ステージ**としてここに記録する (Codex の手続き判断)。
+
+**守るべき不変条件**: 表示中の `items` と、それを元へ戻す `SnapshotState` は
+**同じ `ViewerContextId` が所有する**。
+
+`activate_snapshot` は `items` / `thumbnails` / `visible_indices` / `scroll_offset_y` /
+`selected` / `zip_nav` の **6 つとも bundle field** を `App::snapshot` へ退避する。ところが
+`App::snapshot` だけが App-global で `swap_viewer_context_bundle` で交換されなかった。
+**表面の `top_level_grid_view` (どの top-level surface を表示中か) は既に per-context** なので、
+「表示は context ごと・取り消しは App 共有」という所有境界の食い違いになっていた。
+
+**入れたもの**: `snapshot` を `ViewerContextBundle` の field にした。bundle に field を
+足すと R2e の完了ゲートが働き、**3 箱所でコンパイルが止まって分類を迫られた**:
+`empty()` / swap の destructure / `split_current_context_preserving_main_grid` の destructure。
+park 時は `duplicate_for_parked!` (= `items` / `top_level_grid_view` と同クラス)、
+物理フォルダ scope の detached fork は `detached.snapshot = None` (隔壁の
+`top_level_grid_view` リセットと対)。
+
+**動かさなかった隣接フィールドと、その理由**:
+
+- `snapshot_internal_nav` — set → call → clear を同一同期スコープで行う再入フラグ。
+  ⚠ Codex の指摘で訂正: 「call tree に swap が絶対に無い」は強すぎる。`load_folder` の下流には
+  `start_loading_items_inner` → `promote_active_detached_video_for_main_context_change` という
+  transaction 経路がある。ただし現在の 2 入口は promotion の `fullscreen_idx` 条件を
+  満たさないので、正常実行で `true` のまま swap する経路は見つからない。
+- `snapshot_next_generation_id` — global のまま。
+  ⚠ **当初書いた根拠は誤りだった**。field の doc コメントは「stale な pending folder nav を
+  無視するため」と言うが、**`SnapshotState::generation_id` を読む production の consumer は
+  存在しない** (採番とテストだけ)。将来の ID allocator として global に残すのは妥当だが、
+  「global でなければならない」までは言えない。**doc コメントが実装より古い**。
+
+**監査の handshake (Codex の指摘で修正)**: `snapshot` を bundle へ移しても
+`activate_snapshot` は 6 field の `mem::replace` のままなので、**A2b は検出され続ける**。
+KNOWN_FINDINGS から削除するだけだと untracked violation になるので、
+**ALLOWLIST_ENTRIES へ意味を移した** (理由 = 退避先が context 所有になったこと)。
+KNOWN_FINDINGS は空になり、「既知の指摘が存在する前提」の監査テスト 1 本も直した
+(合成データ側の 3 本が描画・失敗条件を担っているので、実リストが空でも回帰は検知できる)。
+
+**挙動の変化** (Codex の列挙を採用):
+
+- A / B がそれぞれ独立した snapshot を持てる (旧: 2 つ目が 1 つ目の退避を上書き)
+- 同じフォルダでも他 context の退避を復元しなくなる
+- A だけ snapshot 中で B は通常、が可能になる (旧は badge / ナビ制限 / `is_snapshot_active()` に漏れた)
+- `build_viewer_context` の fresh context は snapshot inactive から始まる
+- `promote` では旧 context と一緒に stash され、fresh main へ漏れない
+- `retire` では所有 context と一緒に破棄される
+- 他 context の snapshot があるだけで materialized-still fork が阻止される現象が消える
+
+**回帰テスト** (どちらも `swap_field!(snapshot)` を取り除く変異で落ちることを確認済み):
+
+- `a_second_context_taking_a_snapshot_does_not_clobber_the_first_stash`
+- `deactivating_does_not_restore_another_context_stash_for_the_same_folder`
+  — 変異下で main の解除が他 context の `other.jpg` を書き戻し、**実バグをそのまま再現した**
+
+**残した確認事項** (Codex の指摘、本ステージでは未着手):
+`rating_filter_suppressed_at` と `favsearch_subfolder_restore` /
+`global_search_subfolder_restore` は App-global のまま snapshot lifecycle と結合している。
+前者は snapshot 解除が無条件に global suppression を解く。後者は dismiss/deactivate が
+global slot を `take()` するため、検索由来 snapshot を fork した場合に先に閉じた側が
+sibling の fallback restore を消費し得る。
+
 ### R2e の現況 (2026-08-25 時点、新しいセッションはここを最初に見る)
 
 **R2e は全段完了。** master へは②-e まで (`189803b5`) をファストフォワードで投入済み。
@@ -1079,11 +1146,16 @@ lib テスト 6251 件緑 (件数不変)、監査 exit 0 (既知の指摘 1 件�
 
 - **backlog §1.123** — スレッド終了中の heap 例外を、例外ハンドラ自身が二次クラッシュで
   握り潰す。**通常操作 (タグ付け → フォルダ移動) で落ちた実機クラッシュ。**
-  利用者は**次のリリースまでに直したい**意向。**次に着手するのはこれ。**
-- **backlog §1.122** — F12 の placement 往復が遅い (既存、共有出力プール枯渇)。
-- **監査の既知の指摘 1 件** — `activate_snapshot` が per-context の 5 フィールドを
-  App-global の `App::snapshot` に置いている (BA-7 系)。`snapshot` を per-context に
-  するのが正しい修正だが挙動が変わるので独立した段が要る。
+  利用者は**次のリリースまでに直したい**意向。(B) 二次 AV は解決済みで一次例外は観測待ち。
+  **未解決のまま残っている唯一の項目。**
+- **backlog §1.122** — F12 の placement 往復が遅い。✅ **主因は 2026-08-25 に解決**
+  (NIS シェーダの実行時コンパイル 2.1 秒。当初書いた「共有出力プール枯渇」は**誤診**で、
+  引用ログが別セッションのものだった)。残りは `publish` 289-424ms と `egui_overlay` 116-139ms。
+- **backlog §1.124** — F12 連打で本物の押下が捨てられる。✅ **2026-08-26 に解決** (廃れた
+  `GetAsyncKeyState` proxy の撤去)。憲法 §2 規則 5 の好例記述もこれで撤回した。
+- ~~**監査の既知の指摘 1 件**~~ — ✅ **2026-08-26 に解決**。`snapshot` を
+  `ViewerContextBundle` の field にした。上の「R2e snapshot ownership follow-up」を参照。
+  KNOWN_FINDINGS は空になった。
 
 ### R2e の作業環境 (新しいセッションが最初に読むもの)
 

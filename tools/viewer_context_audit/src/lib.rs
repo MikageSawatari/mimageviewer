@@ -110,6 +110,12 @@ const ALLOWLIST_ENTRIES: &[AllowlistEntry] = &[
         rule: Rule::A2b,
         reason: "Takes, index-shifts, and immediately reassigns per-item maps after batch deletion; every value stays in the same mounted context and the temporary ownership exists only to transform keys in place.",
     },
+    AllowlistEntry {
+        file: "src/app/snapshot_ops.rs",
+        function: "activate_snapshot",
+        rule: Rule::A2b,
+        reason: "Stashes six per-context grid fields into ViewerContextBundle::snapshot, which is itself a bundle field exchanged by swap_viewer_context_bundle. Every value stays inside the mounted context and is restored by deactivate_snapshot in that same context; nothing is transferred to another window or owner. This was a KNOWN_FINDINGS entry while App::snapshot was App-global.",
+    },
 ];
 
 // A4 excludes cfg(test)-gated API and freezes only the production registry surface below.
@@ -183,13 +189,19 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn stash_mounted_and_start_fresh (& mut self , _reason : & 'static str ,) -> ViewerContextId",
 ];
 
-const KNOWN_FINDINGS: &[KnownFindingEntry] = &[KnownFindingEntry {
-    file: "src/app/snapshot_ops.rs",
-    function: "activate_snapshot",
-    rule: Rule::A2b,
-    reason: "App::snapshot is not a ViewerContextBundle field and is not exchanged by swap_viewer_context_bundle. activate_snapshot moves five per-context fields into that App-global slot; deactivate_snapshot writes them back only when current_folder == snapshot.origin, so a context swap can discard the foreign snapshot or restore it into another context when both contexts share a folder.",
-    tracking: "docs/detached-rework-plan.md §9.5 (audit known finding: activate_snapshot)",
-}];
+/// Violations that are real, understood, and deliberately not fixed yet.
+///
+/// Empty is the healthy state. An entry is printed on every run, never fails the run, and
+/// **fails when it stops being detected** -- that last property is what catches a rule
+/// regressing or someone quietly deleting the offending code.
+///
+/// The one entry this list carried, `activate_snapshot`, was resolved by making
+/// `snapshot` a `ViewerContextBundle` field. Note the violation itself did **not**
+/// disappear: the function still moves six fields with `mem::replace`. What changed is
+/// that the destination is now context-owned, so the entry moved to `ALLOWLIST_ENTRIES`
+/// rather than being deleted (deleting it alone would have turned a tracked finding into
+/// an untracked violation).
+const KNOWN_FINDINGS: &[KnownFindingEntry] = &[];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CliOptions {
@@ -2415,7 +2427,7 @@ mod tests {
     }
 
     #[test]
-    fn no_allowlist_flag_reports_each_allowlisted_entry_and_keeps_known_findings_visible() {
+    fn no_allowlist_flag_reports_each_allowlisted_entry() {
         let options = parse_cli_args(["--no-allowlist"]).unwrap();
         assert!(!options.use_allowlist);
 
@@ -2456,6 +2468,10 @@ mod tests {
             assert!(output.text.contains(entry.file), "{}", output.text);
             assert!(output.text.contains(entry.function), "{}", output.text);
         }
-        assert!(output.text.contains("KNOWN FINDING"), "{}", output.text);
+        // 既知の指摘の描画・失敗条件は合成データの
+        // `known_finding_is_reported_without_failing_the_run` /
+        // `known_finding_that_stops_matching_is_a_named_error` が持っている。
+        // ここで実リストが空でないことを要求すると、**指摘を 1 件も抱えていない
+        // 健全な状態でテストが落ちる** (実際に `activate_snapshot` の解決で落ちた)。
     }
 }
