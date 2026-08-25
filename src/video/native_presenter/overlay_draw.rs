@@ -2257,6 +2257,14 @@ pub(super) fn draw_native_bar_lock_button(
         locked,
     );
     let resp = resp.hover_tip_dark(tooltip);
+    // 診断 (2026-08-25): 上の native click log と対で、egui が press を widget へ配ったかを見る。
+    if resp.is_pointer_button_down_on() || resp.clicked() {
+        crate::logger::log(format!(
+            "[strip-lock-diag] bar lock widget bar={bar:?} down_on={} clicked={} locked={locked}",
+            resp.is_pointer_button_down_on(),
+            resp.clicked(),
+        ));
+    }
     if resp.clicked() {
         commands.push(NativeOverlayCommand::ToggleBarLock { bar });
     }
