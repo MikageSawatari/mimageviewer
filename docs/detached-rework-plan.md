@@ -50,9 +50,17 @@ BA-1 (rect 一致による HWND 誤同定) × BA-6 (placement 三重所有) の�
    R2 より前のステージでどうしても必要なら、追加前に ClaudeCode に相談する。
 4. **placement (位置・サイズ) の新しい保存先・同期経路を作らない** (提案書 BA-6)。
    既定サイズ拒否のようなヒューリスティック防波堤も新設しない。
-5. **時間窓 (debounce / grace / settle ms) で競合を吸収しない**。stale F12 再配送を
-   `GetAsyncKeyState` の物理状態で棄却した実例のように、**事実 (OS 状態・世代・
-   イベント) で判定**する。時間窓は「頻度を下げるだけでループを消さない」。
+5. **時間窓 (debounce / grace / settle ms) で競合を吸収しない**。判定は、問うている事柄と
+   **同じ時間・所有境界の事実**で行う (世代、イベント生成時の情報、必要な場合の現在 OS 状態)。
+   `GetAsyncKeyState` が示す**処理時点の current level を、既に配送された離散 `KeyDown` の
+   fresh / stale identity の代用にしてはならない**。native F12 では、旧 HWND 由来 event を
+   per-window epoch / generation で、hold による repeat を `WM_KEYDOWN` の previous-key-state
+   (lParam bit 30) で判定し、App 側に追加の時間窓・物理 level proxy・generation guard を置かない。
+   時間窓は「頻度を下げるだけでループを消さない」。
+
+   > ⚠ **旧版はこの規則の好例として「stale F12 再配送を `GetAsyncKeyState` の物理状態で
+   > 棄却した実例」を挙げていたが、2026-08-26 に実機ログで反証されて撤回した**。
+   > その probe は本物の連打を stale と誤分類していた (backlog §1.124)。一般原則は維持される。
 6. **実機で新症状が出ても、その場でヒューリスティックを入れない**。症状を BA 番号
    (提案書 §2) に対応付けて報告し、どのステージで根治されるかを確認してから動く。
 7. **ステージの指示書に書かれていないファイル・機構を「ついでに」直さない**。
@@ -1216,6 +1224,47 @@ HUD コマンドをアクティブ化へ変換し、**それ以外の利用者�
 リワークのステージ外から detached 述語 / viewport 経路へ触れた変更をここに残す。
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
+
+**2026-08-26 廃れた proxy の削除 = backlog §1.124
+(ClaudeCode / Codex 双方が構造的修正と合意):**
+
+**触った範囲**: [src/app/native_video.rs](../src/app/native_video.rs) の F12 arm と
+`native_video_key_physically_down` / `NativeVideoKeyBlockReason::StaleDetachedToggle`、
+[src/video/mod.rs](../src/video/mod.rs) の window event drain の述語切り出し。
+
+**症状**: 別ウィンドウから F12 で main へ戻るとき、連打すると最初の何回かが無反応。
+実機ログに `ignore stale native F12 toggle: os_down=false` が 1 セッション 7 件、
+**切替完了の 390ms 後から 240〜300ms 間隔で 3 連続**。rebuild 直後に 1 回来る stale
+再配送ではなく、人間の連打そのものだった。
+
+**判断理由 (なぜ症状パッチではないか)**: 新しい状態・時間窓・分岐を**一つも足さない**。
+2026-07-01 に入った物理 probe は、当時存在しなかった識別子の**代用**だった。
+その識別子は **2026-07-30 の pump 分離** (`0cf4b6a9`) で入っている ——
+`NativeVideoWindowEventSink` は host window ごとに epoch を焼き付け、render 側が
+`window_event_belongs_to_generation` で落とす。つまり **古い代用判定を撤去して
+既存の所有境界に戻す修正**であり、追加ではなく削除である。
+
+F12 arm に届く `repeat=false` は、**現 HWND・現 epoch が生成した first-key-down** である:
+
+| 軸 | 何が落とすか |
+| --- | --- |
+| 旧 presenter 由来 | `window_event_belongs_to_generation` (host ごとの epoch) |
+| hold による auto-repeat | `WM_KEYDOWN` の previous-key-state (lParam bit 30) → 既存の `!key.repeat` |
+| 切替中の押下 | `switch_native_video_viewer_presentation` の pending guard |
+
+**Codex の提起で 1 点修正した**: 「旧世代 event は絶対に filter を通らない」は強すぎる。
+旧世代がまだ current の間に通過済みの event はあり得る。ただしそれは `PlacementSwitched`
+より前の sequence を持ち、bus は sequence 順に drain されるので、App は pending 中に処理して
+既存の early-return で落とす。
+
+**回帰テスト**: `window_event_is_accepted_only_for_the_current_presenter_generation`
+(述語を表で 3 通り、述語を `true` に変異させて落ちることを確認済み) と
+`native_video_f12_does_not_toggle_while_a_placement_switch_is_pending` (キー経路を通して
+pending guard を固定)。既存の `native_video_f12_toggles_detached_viewer_mode` は
+**probe 削除後に初めて意味を持つ** —— 旧コードでは `#[cfg(test)] { true }` で
+probe を迷回しており、**この退行を 2 ヶ月近く隠していた**。
+
+→ 憲法 §2 規則 5 の好例記述をこの実機ログで撤回した (一般原則は維持)。
 
 **2026-08-23 手書き mount 18 箇所の helper 化 = R2e ステージ②-pre
 (ClaudeCode / Codex 双方が構造的修正と合意):**

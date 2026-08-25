@@ -221,7 +221,6 @@ pub(crate) fn take_video_audio_enter_requests_for_test() -> Vec<(usize, VideoAud
 enum NativeVideoKeyBlockReason {
     MusicVstShell,
     NormalizeModal,
-    StaleDetachedToggle,
 }
 
 #[cfg(windows)]
@@ -230,7 +229,6 @@ impl NativeVideoKeyBlockReason {
         match self {
             Self::MusicVstShell => "music_vst_shell",
             Self::NormalizeModal => "normalize_modal",
-            Self::StaleDetachedToggle => "stale_detached_toggle",
         }
     }
 }
@@ -479,33 +477,6 @@ fn log_native_video_key_diagnostic(record: NativeVideoKeyDiagnosticRecord) {
         if let Some(batch) = batch {
             crate::logger::log(format_native_video_key_repeat_batch(&batch));
         }
-    }
-}
-
-/// native presenter が転送してきた KeyDown の virtual key が **いま物理的に押下中か**を
-/// OS に問い合わせる。placement 切替 (Plan B) で presenter を作り直すと、既に離された
-/// F12 の KeyDown が数百 ms 遅れて再配送され (`repeat=false` でも stale)、detached→main→
-/// detached の二重トグルになる。`repeat` フラグは信用できない (stale でも false) ため、
-/// GetAsyncKeyState の high bit で「今まだ押されているか」を見て stale 再配送を弾く。
-#[cfg(windows)]
-fn native_video_key_physically_down(
-    key: &crate::video::native_window::NativeVideoKeyEvent,
-) -> bool {
-    let physically_down = crate::key_input::physical_key_down(
-        crate::key_input::PhysicalKeySlot::new(key.virtual_key, key.extended),
-    );
-    // headless な単体テストは合成 KeyDown を送るので実際には物理キーが押されておらず、
-    // GetAsyncKeyState が常に false を返して F12 トグルが走らない。この OS 問い合わせは
-    // 実機の stale 再配送弾き専用なので、テスト時は「押されている」とみなして production
-    // 分岐 (実機でのみ意味を持つ) を迂回する。
-    #[cfg(test)]
-    {
-        let _ = physically_down;
-        true
-    }
-    #[cfg(not(test))]
-    {
-        physically_down
     }
 }
 
@@ -7652,22 +7623,20 @@ impl App {
                     .keymap
                     .matches_vk_action(KeyAction::ToggleDetachedViewerMode, &key) =>
             {
-                // placement 切替 (Plan B) で presenter を作り直すと、既に離された F12 の
-                // KeyDown が数百 ms 遅れて再配送され、直前のトグルを打ち消す
-                // (detached→main→detached、= main への一瞬フラッシュ + 再分離)。`repeat` は
-                // stale でも false なので信用せず、OS に「今まだ F12 が押されているか」を
-                // 問い合わせて、離された後の stale 再配送を弾く。実押下は KeyDown 到着時点で
-                // まだ物理的に down なので通る (Codex 助言)。
-                if !native_video_key_physically_down(&key) {
-                    crate::logger::log(format!(
-                        "[native-video] ignore stale native F12 toggle: os_down=false \
-                         presentation={:?} (rebuild re-delivery of a released key)",
-                        self.viewer_presentation
-                    ));
-                    return NativeVideoKeyOutcome::Blocked(
-                        NativeVideoKeyBlockReason::StaleDetachedToggle,
-                    );
-                }
+                // ここへ来る `repeat=false` は、**現 HWND・現 epoch が生成した
+                // first-key-down** である。stale 判定を App 側でやり直さないこと:
+                //
+                // - 旧 presenter 由来の event は、host ごとに epoch を焼き付けた envelope を
+                //   `window_event_belongs_to_generation` が落とす (src/video/mod.rs)。
+                // - 押しっぱなしで新 HWND に届く auto-repeat は `WM_KEYDOWN` の
+                //   previous-key-state (lParam bit 30) が立つので、上の `!key.repeat` が落とす。
+                // - 切替中に届いた押下は `switch_native_video_viewer_presentation` の
+                //   pending guard が落とす。
+                //
+                // 以前はここで `GetAsyncKeyState` に「今まだ押されているか」を聞いていた。
+                // 処理時点の押下レベルは、既に配送された離散 event の識別子にならない ——
+                // 早押しは stale 再配送と同じく false になり、**本物の連打が捨てられていた**
+                // (backlog §1.124)。
                 self.toggle_detached_viewer_mode();
                 hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::ToggleDetachedViewerMode)
@@ -10562,10 +10531,6 @@ mod native_video_key_observation_tests {
             (
                 NativeVideoKeyOutcome::Blocked(NativeVideoKeyBlockReason::NormalizeModal),
                 "blocked:normalize_modal",
-            ),
-            (
-                NativeVideoKeyOutcome::Blocked(NativeVideoKeyBlockReason::StaleDetachedToggle),
-                "blocked:stale_detached_toggle",
             ),
             (
                 NativeVideoKeyOutcome::Action(KeyAction::VideoPin),

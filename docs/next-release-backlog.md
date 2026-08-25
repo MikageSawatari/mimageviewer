@@ -1950,7 +1950,7 @@ COM cast と `VideoGradePipeline::new` / `VideoResamplePipeline::new` だけ。
   ダンプは `C:\Users\<user>\AppData\Local\CrashDumps\` に残る (今回は 59.6 GB)。
 - 規模 / 優先度: Small (B) / Medium (A)。**P2** — 通常操作 (タグ付け → フォルダ移動) で落ちた。
 
-### 1.124 F12 を連打すると実際の押下が破棄される — stale 判定が早押しの本物を弾いている
+### 1.124 F12 を連打すると実際の押下が破棄される ✅ 修正済み (2026-08-26、実機確認待ち)
 
 - 出典: 2026-08-25、§1.122 修正後の実機確認。別ウィンドウから F12 で main へ戻るとき、
   **連打すると最初の何回かが無反応**。**§1.122 とは別の既存不具合**。
@@ -1975,16 +1975,44 @@ COM cast と `VideoGradePipeline::new` / `VideoResamplePipeline::new` だけ。
   早押しと stale 再配送をこの検査では区別できない。
 - §1.122 で切替が速くなった分、連打しやすくなって顔を出しやすくなっている
   (利用者も「前からかもしれない」と報告)。
-- 直し方の形: **タイミングの代用判定をやめ、event の identity で判定する**。
-  同じ enum の `CloseRequested { generation }` はすでにその形で
-  (`accept_native_video_close` が generation を検査する)。`KeyDown` にも presenter
-  generation を乗せ、受け入れ済みの generation と不一致なら弾く。そうすれば
-  物理キー問い合わせは不要になる。
-- ⚠ **guard の閉値を緩める (例: 押下後 N ms は通す) のは同じ代用判定を延命させるだけ**。
-- ⚠ detached 述語に触れるので、着手前に
-  [detached-rework-plan.md](detached-rework-plan.md) §2 の手続き (構造修正であることの
-  ClaudeCode / Codex 双方の合意 + プランへの記録) を通すこと。
-- 規模 \\ 優先度: Small〜Medium / P3 (利用者は「仕様としても差し支えないレベル」と評価)。
+
+#### 修正 — 廃れた proxy を削除した (追加ではなく削除)
+
+当初は「`KeyDown` に presenter generation を乗せる」を提案したが、**Codex の指摘で撤回した**。
+rebuild 後に**新しい HWND が decode した**再配送は**現世代**で stamp されるので、generation では
+早押しと区別できない。generation は stale key の identity ではない。
+
+実際に入れたのは削除である。F12 arm に届く `repeat=false` は
+**現 HWND・現 epoch が生成した first-key-down** であり、probe に仕事が残っていない:
+
+| 軸 | 何が落とすか | 入った時期 |
+| --- | --- | --- |
+| 旧 presenter 由来 | `window_event_belongs_to_generation` (host ごとの epoch) | **2026-07-30** (`0cf4b6a9` pump 分離) |
+| hold による auto-repeat | `WM_KEYDOWN` の previous-key-state (lParam bit 30) → 既存の `!key.repeat` | 当初から |
+| 切替中の押下 | `switch_native_video_viewer_presentation` の pending guard | 当初から |
+
+物理 probe は **2026-07-01** 。つまり 1 行目の識別子が入る **1 ヶ月前**の代用判定で、
+その後撤去されずに残っていた。
+
+**削除したもの**: `native_video_key_physically_down` / その呼び出し /
+`NativeVideoKeyBlockReason::StaleDetachedToggle` / formatter の対応 case。
+基盤の `key_input::physical_key_down` は他に 3 箱所の本番利用があるので残す。
+
+**回帰テスト**:
+
+- `window_event_is_accepted_only_for_the_current_presenter_generation` — 述語を切り出して表で 3 通り。
+  述語を `true` に変異させて落ちることを確認済み (空振りでない)
+- `native_video_f12_does_not_toggle_while_a_placement_switch_is_pending` — キー経路を通して pending guard を固定
+- 既存の `native_video_f12_toggles_detached_viewer_mode` は **probe 削除後に初めて意味を持つ**。
+  旧コードは `#[cfg(test)] { true }` で probe を迷回しており、**この退行を 2 ヶ月近く隠していた**。
+  旧コードで落ちるテストは原理的に書けない (テストビルドでは常に true を返していたため)
+
+憲法 §2 規則 5 はこの probe を好例として名指ししていたので、実機ログで反証されたとして
+該当部分を撤回した (一般原則は維持)。触った範囲と判断理由は
+[detached-rework-plan.md](detached-rework-plan.md) §11 に記録。
+
+- ⚠ **実機確認待ち**: 別ウィンドウから F12 連打で毎回反応すること、かつ二重トグル
+  (main へ一瞬フラッシュ→再分離) が起きないこと。
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 

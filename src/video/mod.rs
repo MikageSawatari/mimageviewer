@@ -3620,6 +3620,25 @@ struct NativeWindowAttach {
     observation: crate::video::native_window_host::NativeWindowObservation,
 }
 
+/// この window event が、いま描画している presenter 世代のものか。
+///
+/// 各 host window の `NativeVideoWindowEventEnvelope` は、その window の epoch を
+/// **生成時に焼き付けて**いる (`NativeVideoWindowEventSink` は host ごとに作られる)。
+/// placement 切替で presenter を作り直すと世代が進むので、旧 window の wndproc が出した
+/// event はこの述語で落ちる。**キー入力の stale 判定はこの 1 か所が担っている** ——
+/// App 側は裸の `NativeVideoWindowEvent` を受け取るため、ここを通った後では
+/// 「どの世代の window が出したか」を問い直せない (backlog §1.124)。
+///
+/// 旧 `GetAsyncKeyState` による物理レベル問い合わせは、この述語が入る前 (2026-07-01) の
+/// 代用判定だった。処理時点の押下状態は、既に配送された離散 `KeyDown` の識別子にならない。
+#[cfg(windows)]
+fn window_event_belongs_to_generation(
+    envelope: &crate::video::native_window::NativeVideoWindowEventEnvelope,
+    cur_generation: u64,
+) -> bool {
+    envelope.epoch == cur_generation && envelope.generation == cur_generation
+}
+
 #[cfg(windows)]
 fn wait_for_native_window_attach(
     pump: &native_window_pump::NativeWindowPumpRenderClient,
@@ -5018,9 +5037,7 @@ fn run_native_video_output(
             window_pump
                 .drain_window_events()
                 .into_iter()
-                .filter(|envelope| {
-                    envelope.epoch == cur_generation && envelope.generation == cur_generation
-                })
+                .filter(|envelope| window_event_belongs_to_generation(envelope, cur_generation))
                 .map(|envelope| envelope.event),
         );
 
@@ -9563,6 +9580,50 @@ fn dummy_video_rx() -> crossbeam_channel::Receiver<VideoFrame> {
 
 #[cfg(test)]
 mod tests {
+    /// キー入力の stale 判定は、この述語 1 つが担っている。
+    ///
+    /// App 側は裸の `NativeVideoWindowEvent` を受け取るので、ここを通した後では
+    /// 「どの presenter 世代の window が出した event か」を問い直せない。以前は App 側で
+    /// `GetAsyncKeyState` を代用判定にしていたが、それは早押しの本物も落としていた
+    /// (backlog §1.124)。表で 3 通りを固定する。
+    #[cfg(windows)]
+    #[test]
+    fn window_event_is_accepted_only_for_the_current_presenter_generation() {
+        use crate::video::native_window::{
+            NativeVideoKeyEvent, NativeVideoWindowEvent, NativeVideoWindowEventEnvelope,
+            NativeVideoWindowSource,
+        };
+
+        let envelope = |epoch: u64, generation: u64| NativeVideoWindowEventEnvelope {
+            sequence: 0,
+            epoch,
+            generation,
+            source: NativeVideoWindowSource::Presenter,
+            event: NativeVideoWindowEvent::KeyDown(NativeVideoKeyEvent {
+                virtual_key: 0x7B,
+                scan_code: 0x58,
+                extended: false,
+                shift: false,
+                ctrl: false,
+                alt: false,
+                repeat: false,
+            }),
+        };
+
+        const CURRENT: u64 = 7;
+        for (epoch, generation, accepted, label) in [
+            (CURRENT, CURRENT, true, "current epoch and generation"),
+            (CURRENT - 1, CURRENT, false, "pre-rebuild window"),
+            (CURRENT, CURRENT - 1, false, "stale generation stamp"),
+        ] {
+            assert_eq!(
+                super::window_event_belongs_to_generation(&envelope(epoch, generation), CURRENT),
+                accepted,
+                "{label}"
+            );
+        }
+    }
+
     #[cfg(windows)]
     fn video_scale_request(
         revision: u64,

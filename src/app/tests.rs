@@ -33594,6 +33594,38 @@ mod native_video_rating_key_tests {
         );
     }
 
+    /// 切替中に届いた F12 は、キー経路から入っても二重トグルにならない。
+    ///
+    /// この窓は以前 `GetAsyncKeyState` の物理レベル問い合わせも塞いでいたが、それは
+    /// **早押しの本物も落とす**代用判定だったので撤去した (backlog §1.124)。落とす仕事は
+    /// pending guard が持っている。ここはキー経路を通してそれを固定する
+    /// (`detached_video_f12_does_not_retoggle_during_placement_switch` は
+    /// `toggle_detached_viewer_mode` を直接呼ぶので、arm 自体は通らない)。
+    #[test]
+    fn native_video_f12_does_not_toggle_while_a_placement_switch_is_pending() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_video(&mut app, PathBuf::from(r"C:\clips\movie.mp4"));
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.settings.detached_viewer_enabled = false;
+        app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
+            request_id: 7,
+            target_presentation: ViewerPresentation::Fullscreen,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            announce_main_hint: false,
+        });
+
+        app.handle_native_video_key_event(&ctx, idx, native_key(0x7B, false)); // F12
+
+        assert!(
+            !app.settings.detached_viewer_enabled,
+            "F12 arriving while a placement switch is in flight must not toggle again"
+        );
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        assert!(app.native_video_mode_switch.is_some());
+    }
+
     #[test]
     fn native_video_f12_repeat_is_ignored() {
         let mut app = setup_app();
