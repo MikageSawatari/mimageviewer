@@ -162,6 +162,10 @@ Split(crate::page_split::PresentationStep),
   キャッシュは元ページ単位のままでよいので、`contains_idx` はどちらの段にも真を返す。
 - 連結読みの描画は `draw_fs_spread_page` を通り、`draw_fs_image` の解決は通らない。
   段ごとの矩形がそのまま使われるので、**現在の左右で上書きされない**。
+- **スクロールで段が変わったら左右も採り直す** (`reanchor_continuous_reading_viewer` の
+  `new_slice`)。分割中は元 index が変わらないまま段だけが変わるので、ここを書かないと
+  次のフレームで現在位置が元の段へ解決され、スクロールが引き戻されて先へ進めなくなる。
+  引数で渡すので、呼び出し側は左右を決めずに済ませられない。
 - `ContinuousReadingPageSize` にも `content_bbox` と寸法の座標系のずれがあった
   (`width` / `height` は回転後、`content_bbox` は元画像空間)。`rotation` を持たせ、
   `bbox()` が表示空間へ写すようにした。§2 と同じ形の修正である。

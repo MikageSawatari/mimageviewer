@@ -26506,12 +26506,19 @@ impl App {
         )
     }
 
+    /// 連結読みのスクロールで現在の段が変わったときの再アンカー。
+    ///
+    /// `new_slice` は移った先の段の左右。**分割中は元 index が変わらないまま段だけが
+    /// 変わる**ので、これを書かないと次のフレームで現在位置が元の段に解決され、
+    /// スクロールが引き戻されて先へ進めなくなる (実機で発生)。
+    /// 分割していない段は `Full` を渡す。
     pub(crate) fn reanchor_continuous_reading_viewer(
         &mut self,
         ctx: &egui::Context,
         old_offsets: &[f32],
         new_pos: usize,
         new_idx: usize,
+        new_slice: crate::page_split::PageSlice,
         history_trigger: crate::app::HistoryTrigger,
     ) {
         if self.items.get(new_idx).is_none() {
@@ -26528,6 +26535,7 @@ impl App {
         self.fs_vertical_scroll =
             vertical_reading_reanchor_scroll(self.fs_vertical_scroll, old_offsets, new_pos);
         self.fullscreen_idx = Some(new_idx);
+        self.fullscreen_page_slice = new_slice;
         self.sync_main_selection_from_viewer_idx(new_idx);
         self.record_book_resume(new_idx);
         self.record_reading_history(new_idx, history_trigger);
@@ -26816,11 +26824,13 @@ impl App {
             && let Some(unit) = units.get(new_pos)
         {
             let new_idx = unit.anchor_idx;
+            let new_slice = unit.slice;
             self.reanchor_continuous_reading_viewer(
                 ctx,
                 &offsets,
                 new_pos,
                 new_idx,
+                new_slice,
                 history_trigger,
             );
         }

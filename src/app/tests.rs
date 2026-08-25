@@ -50666,6 +50666,7 @@ mod still_window_mode_key_tests {
             &[0.0, 100.0],
             1,
             second,
+            crate::page_split::PageSlice::Full,
             crate::app::HistoryTrigger::UserChosen,
         );
 
@@ -56143,6 +56144,56 @@ fn touch_owned_side_panels_close_on_file_change_and_fullscreen_exit() {
     assert!(!app.metadata_panel_click_shown());
 }
 
+/// 連結読みで段が変わったら、**元ページが同じでも**左右を採り直す。
+///
+/// 分割中は 1 つの元ページが 2 段になるので、段が変わっても `fullscreen_idx` は動かない。
+/// 左右を書かずにいると、次のフレームで現在位置が元の段に解決され、スクロールが
+/// 引き戻されて先へ進めなくなる (実機で発生、2026-08-25)。
+#[test]
+fn scrolling_into_the_other_half_adopts_that_half() {
+    use crate::page_split::PageSlice;
+
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let folder = PathBuf::from("C:/photos");
+    app.current_folder = Some(folder.clone());
+    app.items = vec![
+        GridItem::Image(folder.join("wide.jpg")),
+        GridItem::Image(folder.join("tall.jpg")),
+    ];
+    app.visible_indices = vec![0, 1];
+    app.fullscreen_idx = Some(0);
+    app.fullscreen_page_slice = PageSlice::Left;
+
+    // 同じ元ページの 2 段目へ。index は動かないが左右は変わる。
+    app.reanchor_continuous_reading_viewer(
+        &ctx,
+        &[0.0, 100.0, 200.0],
+        1,
+        0,
+        PageSlice::Right,
+        crate::app::HistoryTrigger::UserChosen,
+    );
+    assert_eq!(app.fullscreen_idx, Some(0), "元ページは変わらない");
+    assert_eq!(
+        app.fullscreen_page_slice,
+        PageSlice::Right,
+        "段が変わったのに左右が取り残されている"
+    );
+
+    // 分割していない段へ移ったら Full に戻る (左右の記憶が居残らない)。
+    app.reanchor_continuous_reading_viewer(
+        &ctx,
+        &[0.0, 100.0, 200.0],
+        2,
+        1,
+        PageSlice::Full,
+        crate::app::HistoryTrigger::UserChosen,
+    );
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert_eq!(app.fullscreen_page_slice, PageSlice::Full);
+}
+
 #[test]
 fn continuous_reanchor_history_trigger_controls_recording() {
     let mut app = phase_c_support::setup_app();
@@ -56162,6 +56213,7 @@ fn continuous_reanchor_history_trigger_controls_recording() {
         &[0.0, 100.0],
         1,
         1,
+        crate::page_split::PageSlice::Full,
         crate::app::HistoryTrigger::AutoAdvance,
     );
     assert!(
@@ -56174,6 +56226,7 @@ fn continuous_reanchor_history_trigger_controls_recording() {
         &[0.0, 100.0],
         0,
         0,
+        crate::page_split::PageSlice::Full,
         crate::app::HistoryTrigger::UserChosen,
     );
     assert_eq!(
@@ -56212,6 +56265,7 @@ fn continuous_reanchor_preserves_pointer_panels_and_page_trim_override() {
         &[0.0, 100.0],
         1,
         second,
+        crate::page_split::PageSlice::Full,
         crate::app::HistoryTrigger::UserChosen,
     );
 
@@ -56237,6 +56291,7 @@ fn continuous_reanchor_preserves_pointer_panels_and_page_trim_override() {
         &[0.0, 100.0],
         0,
         first,
+        crate::page_split::PageSlice::Full,
         crate::app::HistoryTrigger::UserChosen,
     );
     assert_eq!(
