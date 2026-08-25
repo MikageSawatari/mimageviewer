@@ -213,6 +213,20 @@ impl<P> ContextTable<P> {
         ids
     }
 
+    /// Every context except the one currently projected onto `App`.
+    ///
+    /// Traversals want "all the others", and asking that as `id != mounted_id()` is wrong
+    /// while a context is being built: `mounted_id` is `None` then, so the reserved id
+    /// survives the filter and the traversal tries to mount the payload it is already
+    /// standing on. That fails with `Building` and gets logged as an error instead of being
+    /// recognised as self.
+    fn other_ids(&self) -> Vec<ViewerContextId> {
+        let projected = self.projected_id();
+        let mut ids = self.ids();
+        ids.retain(|id| *id != projected);
+        ids
+    }
+
     fn bind_window(&mut self, id: ViewerContextId, window_id: u64) -> Result<(), BindError> {
         assert!(self.pending.is_none());
         self.bind_core(id, window_id)
@@ -2727,6 +2741,11 @@ impl App {
         self.viewer_contexts.table.ids()
     }
 
+    /// Every context except the one currently projected onto `App`. See `ContextTable::other_ids`.
+    pub(in crate::app) fn other_viewer_context_ids(&self) -> Vec<ViewerContextId> {
+        self.viewer_contexts.table.other_ids()
+    }
+
     pub(in crate::app) fn with_viewer_context_ref<R>(
         &self,
         id: ViewerContextId,
@@ -3439,6 +3458,20 @@ mod tests {
         assert!(app.viewer_contexts.table.window_of.is_empty());
         assert!(app.viewer_contexts.table.context_of.is_empty());
         recover_build_after_interior_failpoint(&mut app);
+    }
+
+    #[test]
+    fn other_ids_excludes_the_projected_context_while_building() {
+        let (mut table, mut projection) = harness(11);
+        let main = table.main();
+        let reserved = begin_build(&mut table, &mut projection);
+
+        // While building, `mounted_id` is None, so a filter written against it keeps the
+        // reserved id and the traversal walks into the payload it is already standing on.
+        assert_eq!(table.mounted_id(), None);
+        assert!(table.ids().contains(&reserved));
+        assert!(!table.other_ids().contains(&reserved));
+        assert_eq!(table.other_ids(), vec![main]);
     }
 
     #[test]

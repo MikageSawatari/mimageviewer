@@ -27316,12 +27316,7 @@ impl App {
         self.ensure_mounted_tag_prewarm_started();
         #[cfg(windows)]
         {
-            let mounted = self.mounted_viewer_context_id();
-            for id in self
-                .viewer_context_ids()
-                .into_iter()
-                .filter(|id| Some(*id) != mounted)
-            {
+            for id in self.other_viewer_context_ids() {
                 if let Err(error) = self.with_viewer_context(id, |app| {
                     app.ensure_mounted_tag_prewarm_started();
                 }) {
@@ -38640,11 +38635,9 @@ impl App {
             player.set_native_window_visible(presenter_visible);
             routed += 1;
         }
-        let mounted = self.mounted_viewer_context_id();
         routed += self
-            .viewer_context_ids()
+            .other_viewer_context_ids()
             .into_iter()
-            .filter(|id| Some(*id) != mounted)
             .map(|id| {
                 self.with_viewer_context_ref(id, |context| {
                     sync_viewer_context_bundle_presenters_for_tray(context, app_visible)
@@ -38691,18 +38684,15 @@ impl App {
                     self.video_continuous_last_eof,
                 ))
             });
-        let mounted_id = self.mounted_viewer_context_id();
-        let detached = self.viewer_context_ids().into_iter().any(|id| {
-            Some(id) != mounted_id
-                && self
-                    .with_viewer_context_ref(id, |context| {
-                        viewer_context_bundle_needs_resident_media_updates(
-                            context,
-                            self.video_continuous_mode,
-                            self.video_continuous_last_eof,
-                        )
-                    })
-                    .unwrap_or(false)
+        let detached = self.other_viewer_context_ids().into_iter().any(|id| {
+            self.with_viewer_context_ref(id, |context| {
+                viewer_context_bundle_needs_resident_media_updates(
+                    context,
+                    self.video_continuous_mode,
+                    self.video_continuous_last_eof,
+                )
+            })
+            .unwrap_or(false)
         });
         let eof_resolution = self
             .media_navigation_pending
@@ -38743,19 +38733,16 @@ impl App {
         ));
         #[cfg(windows)]
         {
-            let mounted = self.mounted_viewer_context_id();
             media_paused_count += self
-                .viewer_context_ids()
+                .other_viewer_context_ids()
                 .into_iter()
-                .filter_map(|id| {
-                    (Some(id) != mounted).then(|| {
-                        self.with_viewer_context_ref(id, |context| {
-                            usize::from(pause_viewer_context_bundle_media_for_remote_session(
-                                context,
-                            ))
-                        })
-                        .unwrap_or(0)
+                .map(|id| {
+                    self.with_viewer_context_ref(id, |context| {
+                        usize::from(pause_viewer_context_bundle_media_for_remote_session(
+                            context,
+                        ))
                     })
+                    .unwrap_or(0)
                 })
                 .sum::<usize>();
         }
@@ -38767,12 +38754,7 @@ impl App {
         let mut animations_paused = self.pause_mounted_animations_for_remote_session();
         #[cfg(windows)]
         {
-            let mounted = self.mounted_viewer_context_id();
-            for id in self
-                .viewer_context_ids()
-                .into_iter()
-                .filter(|id| Some(*id) != mounted)
-            {
+            for id in self.other_viewer_context_ids() {
                 match self.with_viewer_context(id, |app| {
                     app.pause_mounted_animations_for_remote_session()
                 }) {
@@ -38815,11 +38797,9 @@ impl App {
     /// (review-v2.3.0 追補6: R1-2 detached exit resume)
     #[cfg(windows)]
     pub(crate) fn save_detached_video_resume_positions_for_exit(&mut self) {
-        let mounted = self.mounted_viewer_context_id();
         let plans = self
-            .viewer_context_ids()
+            .other_viewer_context_ids()
             .into_iter()
-            .filter(|id| Some(*id) != mounted)
             .filter_map(|id| self.with_viewer_context_ref(id, viewer_context_media_teardown_plan))
             .collect::<Vec<_>>();
         self.save_viewer_context_media_teardown_resumes(&plans);

@@ -167,6 +167,7 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn # [cfg (windows)]   App ::  pub (crate) fn locate_window_context (& self , window_id : u64 ,) -> Option < (ViewerContextId , ContextResidence) >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_window (& self , id : ViewerContextId) -> Option < u64 >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn viewer_context_ids (& self) -> Vec < ViewerContextId >",
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn other_viewer_context_ids (& self) -> Vec < ViewerContextId >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn with_viewer_context_ref < R > (& self , id : ViewerContextId , f : impl FnOnce (ContextRef < '_ >) -> R ,) -> Option < R >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn bind_window (& mut self , id : ViewerContextId , window_id : u64 ,) -> Result < () , BindError >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn unbind_window (& mut self , window_id : u64) -> Option < ViewerContextId >",
