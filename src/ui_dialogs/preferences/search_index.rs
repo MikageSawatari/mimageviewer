@@ -757,13 +757,13 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     entry!(
         "video/seek-strip-interval",
         Video,
-        "シークストリップの画像間隔 (秒)",
+        "シークストリップの画像間隔",
         ["動画", "サムネイル", "見渡す", "大まか", "seek"]
     ),
     entry!(
         "video/seek-strip-waveform-span",
         Video,
-        "音声波形で見渡す範囲 (秒)",
+        "音声波形で見渡す範囲",
         ["動画", "波形", "音声", "見渡す", "長時間", "seek"]
     ),
     entry!(

@@ -611,6 +611,9 @@ pub enum NativeVideoOutputEvent {
     SetSeekStripState {
         state: crate::settings::VideoSeekStripState,
     },
+    StepSeekStripRange {
+        step: seek_strip::SeekStripRangeStep,
+    },
     ToggleTileMode,
     TogglePerfOverlay,
     ToggleSidePanelMode,
@@ -3526,6 +3529,7 @@ fn send_native_overlay_command(
             pixel_height,
         },
         Command::SetSeekStripState { state } => NativeVideoOutputEvent::SetSeekStripState { state },
+        Command::StepSeekStripRange { step } => NativeVideoOutputEvent::StepSeekStripRange { step },
         Command::ToggleTileMode => NativeVideoOutputEvent::ToggleTileMode,
         Command::TogglePerfOverlay => NativeVideoOutputEvent::TogglePerfOverlay,
         Command::ToggleSidePanelMode => NativeVideoOutputEvent::ToggleSidePanelMode,
@@ -5331,6 +5335,13 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::SetSeekStripState { state },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::StepSeekStripRange { step } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::StepSeekStripRange { step },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ToggleTileMode => {

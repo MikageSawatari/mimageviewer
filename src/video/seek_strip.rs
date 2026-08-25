@@ -237,6 +237,92 @@ impl SeekStripMaterialAvailability {
 /// intentionally based on raw index gaps, not the user-configurable adopted spacing.
 pub(crate) const SEEK_STRIP_MAX_RAW_KEYFRAME_GAP_SECS: f64 = 15.0;
 
+/// Persisted minimum-interval choices for the thumbnail strip, in seconds.
+pub(crate) const THUMBNAIL_RANGE_STEPS_SECS: &[f64] =
+    &[0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0];
+
+/// Persisted one-screen span choices for the waveform strip, in seconds.
+pub(crate) const WAVEFORM_RANGE_STEPS_SECS: &[f64] = &[
+    5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0, 7200.0, 10800.0,
+];
+
+/// One wheel event changes the strip range by exactly one adjacent ladder step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeekStripRangeStep {
+    Narrower,
+    Wider,
+}
+
+impl SeekStripRangeStep {
+    /// Positive wheel motion zooms in to a narrower range; negative motion zooms out.
+    pub(crate) fn from_wheel_delta(wheel_delta: f32) -> Option<Self> {
+        if !wheel_delta.is_finite() || wheel_delta == 0.0 {
+            return None;
+        }
+        Some(if wheel_delta > 0.0 {
+            Self::Narrower
+        } else {
+            Self::Wider
+        })
+    }
+}
+
+fn range_steps(mode: crate::settings::VideoSeekStripMode) -> &'static [f64] {
+    match mode {
+        crate::settings::VideoSeekStripMode::Thumbnails => THUMBNAIL_RANGE_STEPS_SECS,
+        crate::settings::VideoSeekStripMode::Waveform => WAVEFORM_RANGE_STEPS_SECS,
+    }
+}
+
+pub(crate) fn format_seek_strip_range_value(
+    mode: crate::settings::VideoSeekStripMode,
+    seconds: f64,
+) -> String {
+    if !seconds.is_finite() {
+        return "--".to_owned();
+    }
+    let whole_epsilon = f64::EPSILON * seconds.abs().max(1.0) * 8.0;
+    let (value, unit) = if mode == crate::settings::VideoSeekStripMode::Waveform
+        && seconds >= 60.0
+        && (seconds % 60.0).abs() <= whole_epsilon
+    {
+        (seconds / 60.0, " 分")
+    } else {
+        (seconds, " 秒")
+    };
+    let mut label = value.to_string();
+    label.push_str(unit);
+    label
+}
+
+/// Move a persisted strip range by one step.
+///
+/// Older versions allowed arbitrary values. An off-ladder value moves to the nearest ladder value
+/// strictly in the requested direction. Values outside the ladder clamp to its corresponding end.
+pub(crate) fn step_seek_strip_range(
+    mode: crate::settings::VideoSeekStripMode,
+    current_secs: f64,
+    step: SeekStripRangeStep,
+) -> Option<f64> {
+    if !current_secs.is_finite() {
+        return None;
+    }
+    let steps = range_steps(mode);
+    match step {
+        SeekStripRangeStep::Narrower => steps
+            .iter()
+            .rev()
+            .copied()
+            .find(|candidate| *candidate < current_secs)
+            .or_else(|| steps.first().copied()),
+        SeekStripRangeStep::Wider => steps
+            .iter()
+            .copied()
+            .find(|candidate| *candidate > current_secs)
+            .or_else(|| steps.last().copied()),
+    }
+}
+
 /// 等時間グリッドを選んだ理由。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TimeGridReason {
@@ -1208,6 +1294,131 @@ mod tests {
 
         let genuinely_short = [0.0, 2.0 - 1.0e-8, 4.0];
         assert_eq!(thin_keyframes(&genuinely_short, 2.0), vec![0, 2]);
+    }
+
+    #[test]
+    fn range_step_ladders_match_the_persisted_choices() {
+        assert_eq!(
+            THUMBNAIL_RANGE_STEPS_SECS,
+            &[0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0]
+        );
+        assert_eq!(
+            WAVEFORM_RANGE_STEPS_SECS,
+            &[
+                5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0, 7200.0,
+                10800.0,
+            ]
+        );
+        assert_eq!(
+            crate::settings::VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS,
+            15.0
+        );
+        assert_eq!(
+            crate::settings::VIDEO_SEEK_STRIP_WAVEFORM_SPAN_DEFAULT_SECS,
+            180.0
+        );
+    }
+
+    #[test]
+    fn wheel_direction_and_ladder_ends_are_stable() {
+        assert_eq!(
+            SeekStripRangeStep::from_wheel_delta(120.0),
+            Some(SeekStripRangeStep::Narrower)
+        );
+        assert_eq!(
+            SeekStripRangeStep::from_wheel_delta(-120.0),
+            Some(SeekStripRangeStep::Wider)
+        );
+        assert_eq!(SeekStripRangeStep::from_wheel_delta(0.0), None);
+
+        assert_eq!(
+            step_seek_strip_range(
+                crate::settings::VideoSeekStripMode::Thumbnails,
+                0.1,
+                SeekStripRangeStep::Narrower,
+            ),
+            Some(0.1)
+        );
+        assert_eq!(
+            step_seek_strip_range(
+                crate::settings::VideoSeekStripMode::Thumbnails,
+                60.0,
+                SeekStripRangeStep::Wider,
+            ),
+            Some(60.0)
+        );
+        assert_eq!(
+            step_seek_strip_range(
+                crate::settings::VideoSeekStripMode::Waveform,
+                5.0,
+                SeekStripRangeStep::Narrower,
+            ),
+            Some(5.0)
+        );
+        assert_eq!(
+            step_seek_strip_range(
+                crate::settings::VideoSeekStripMode::Waveform,
+                10_800.0,
+                SeekStripRangeStep::Wider,
+            ),
+            Some(10_800.0)
+        );
+    }
+
+    #[test]
+    fn old_off_ladder_range_moves_to_the_adjacent_step_in_wheel_direction() {
+        assert_eq!(
+            step_seek_strip_range(
+                crate::settings::VideoSeekStripMode::Thumbnails,
+                7.0,
+                SeekStripRangeStep::Narrower,
+            ),
+            Some(5.0)
+        );
+        assert_eq!(
+            step_seek_strip_range(
+                crate::settings::VideoSeekStripMode::Thumbnails,
+                7.0,
+                SeekStripRangeStep::Wider,
+            ),
+            Some(10.0)
+        );
+        assert_eq!(
+            step_seek_strip_range(
+                crate::settings::VideoSeekStripMode::Waveform,
+                45.0,
+                SeekStripRangeStep::Narrower,
+            ),
+            Some(30.0)
+        );
+        assert_eq!(
+            step_seek_strip_range(
+                crate::settings::VideoSeekStripMode::Waveform,
+                45.0,
+                SeekStripRangeStep::Wider,
+            ),
+            Some(60.0)
+        );
+    }
+
+    #[test]
+    fn compact_range_labels_use_seconds_then_whole_minutes() {
+        assert_eq!(
+            format_seek_strip_range_value(crate::settings::VideoSeekStripMode::Thumbnails, 0.1,),
+            "0.1 秒"
+        );
+        assert_eq!(
+            format_seek_strip_range_value(crate::settings::VideoSeekStripMode::Thumbnails, 15.0,),
+            "15 秒"
+        );
+        assert_eq!(
+            format_seek_strip_range_value(crate::settings::VideoSeekStripMode::Waveform, 180.0,),
+            "3 分"
+        );
+        assert_eq!(
+            format_seek_strip_range_value(crate::settings::VideoSeekStripMode::Waveform, 10_800.0,),
+            "180 分"
+        );
     }
 
     #[test]

@@ -150,11 +150,71 @@ fn native_seek_strip_rect(width: f32, height: f32) -> egui::Rect {
     )
 }
 
+fn immediate_native_wheel_command(
+    delta: i16,
+    ctrl: bool,
+    tile_overlay_visible: bool,
+    over_seek_strip: bool,
+    over_scroll_panel: bool,
+    modal_dialog_visible: bool,
+) -> Option<NativeOverlayCommand> {
+    if ctrl && tile_overlay_visible {
+        Some(NativeOverlayCommand::TileColumnsDelta {
+            delta: if delta > 0 { -1 } else { 1 },
+        })
+    } else if !ctrl && !over_seek_strip && !over_scroll_panel && !modal_dialog_visible {
+        Some(NativeOverlayCommand::NavigateItem {
+            delta: if delta < 0 { 1 } else { -1 },
+            via_wheel: true,
+        })
+    } else {
+        None
+    }
+}
+
+fn consume_seek_strip_wheel(
+    ctx: &egui::Context,
+    pointer_inside: bool,
+) -> Vec<crate::video::seek_strip::SeekStripRangeStep> {
+    if !pointer_inside {
+        return Vec::new();
+    }
+    let steps = ctx.input(|input| {
+        input
+            .events
+            .iter()
+            .filter_map(|event| {
+                let egui::Event::MouseWheel { delta, .. } = event else {
+                    return None;
+                };
+                let dominant_delta = if delta.y.abs() >= delta.x.abs() {
+                    delta.y
+                } else {
+                    delta.x
+                };
+                crate::video::seek_strip::SeekStripRangeStep::from_wheel_delta(dominant_delta)
+            })
+            .collect::<Vec<_>>()
+    });
+    if steps.is_empty() {
+        return steps;
+    }
+    ctx.input_mut(|input| {
+        input.raw_scroll_delta = egui::Vec2::ZERO;
+        input.smooth_scroll_delta = egui::Vec2::ZERO;
+        input
+            .events
+            .retain(|event| !matches!(event, egui::Event::MouseWheel { .. }));
+    });
+    steps
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_native_seek_strip(
     ctx: &egui::Context,
     overlay_size: egui::Vec2,
     cursor_hover_pos: Option<egui::Pos2>,
+    wheel_enabled: bool,
     strip: &NativeOverlaySeekStrip,
     texture_ids: &HashMap<usize, egui::TextureId>,
     wave_texture_id: Option<egui::TextureId>,
@@ -358,6 +418,32 @@ fn draw_native_seek_strip(
                 egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 92, 92)),
             );
 
+            let range_name = match strip.center.mode() {
+                crate::settings::VideoSeekStripMode::Thumbnails => "画像間隔",
+                crate::settings::VideoSeekStripMode::Waveform => "表示範囲",
+            };
+            let range_value = crate::video::seek_strip::format_seek_strip_range_value(
+                strip.center.mode(),
+                strip.range_value_secs,
+            );
+            let range_text = format!("{range_name} {range_value}");
+            let range_pos = local_rect.right_top() + egui::vec2(-7.0, 5.0);
+            let range_font = crate::ui_fonts::hud_text_font(11.0);
+            painter.text(
+                range_pos + egui::vec2(1.0, 1.0),
+                egui::Align2::RIGHT_TOP,
+                &range_text,
+                range_font.clone(),
+                egui::Color32::from_black_alpha(220),
+            );
+            painter.text(
+                range_pos,
+                egui::Align2::RIGHT_TOP,
+                range_text,
+                range_font,
+                egui::Color32::from_gray(232),
+            );
+
             let response = ui.interact(
                 local_rect,
                 egui::Id::new("native_video_seek_strip_drag"),
@@ -369,6 +455,9 @@ fn draw_native_seek_strip(
             // cursor ownership の位置正本を揃える。ドラッグ中は矩形外でも維持する。
             let pointer_inside =
                 cursor_hover_pos.is_some_and(|pointer| strip_rect.contains(pointer));
+            for step in consume_seek_strip_wheel(ui.ctx(), pointer_inside && wheel_enabled) {
+                commands.push(NativeOverlayCommand::StepSeekStripRange { step });
+            }
             if pointer_inside || response.dragged() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
             }
@@ -1486,6 +1575,9 @@ pub enum NativeOverlaySeekStripCellContent {
 #[derive(Clone)]
 pub struct NativeOverlaySeekStrip {
     pub center: crate::video::seek_strip::SeekStripCenter,
+    /// Persisted range shown in the fixed top-right label. This is deliberately separate from
+    /// `waveform_span_secs`, which can temporarily retain the old raster scale during a rebuild.
+    pub range_value_secs: f64,
     pub cell_count: usize,
     pub cells: Vec<NativeOverlaySeekStripCell>,
     pub thumbnail_notice: Option<NativeOverlaySeekStripThumbnailNotice>,
@@ -2063,6 +2155,9 @@ pub enum NativeOverlayCommand {
     },
     SetSeekStripState {
         state: crate::settings::VideoSeekStripState,
+    },
+    StepSeekStripRange {
+        step: crate::video::seek_strip::SeekStripRangeStep,
     },
     ToggleTileMode,
     TogglePerfOverlay,
@@ -6654,17 +6749,24 @@ impl NativeEguiOverlay {
                 let modal_dialog_visible = self.bulk_bookmark_dialog.is_some()
                     || self.bookmark_title_edit.is_some()
                     || self.shortcut_help_open;
-                if wheel.ctrl && self.tile_overlay.is_some() {
-                    self.pending_overlay_commands
-                        .push(NativeOverlayCommand::TileColumnsDelta {
-                            delta: if wheel.delta > 0 { -1 } else { 1 },
-                        });
-                } else if !wheel.ctrl && !over_scroll_panel && !modal_dialog_visible {
-                    self.pending_overlay_commands
-                        .push(NativeOverlayCommand::NavigateItem {
-                            delta: if wheel.delta < 0 { 1 } else { -1 },
-                            via_wheel: true,
-                        });
+                let pixels_per_point = self.pixels_per_point.max(f32::MIN_POSITIVE);
+                let over_seek_strip = self.bottom_hud_visible
+                    && self.seek_strip.is_some()
+                    && self.tile_overlay.is_none()
+                    && native_seek_strip_rect(
+                        self.width as f32 / pixels_per_point,
+                        self.height as f32 / pixels_per_point,
+                    )
+                    .contains(pos);
+                if let Some(command) = immediate_native_wheel_command(
+                    wheel.delta,
+                    wheel.ctrl,
+                    self.tile_overlay.is_some(),
+                    over_seek_strip,
+                    over_scroll_panel,
+                    modal_dialog_visible,
+                ) {
+                    self.pending_overlay_commands.push(command);
                 }
                 self.pending_events.push(egui::Event::PointerMoved(pos));
                 self.pending_events.push(egui::Event::MouseWheel {
@@ -7603,13 +7705,14 @@ impl NativeEguiOverlay {
         let text_input_active_before_events = self.text_input_active();
         let side_panel_escape_consumed = std::mem::take(&mut self.side_panel_escape_consumed);
         let (commands, window_intents) = self.render_once()?;
-        // overlay が wheel を NavigateItem / TileColumnsDelta に変換したフレームでは、
+        // overlay が wheel を navigation / tile columns / strip range command に変換したフレームでは、
         // 同じ raw wheel イベントを App へ二重転送しないよう routing に印を付ける。
         let consumed_wheel = commands.iter().any(|c| {
             matches!(
                 c,
                 NativeOverlayCommand::NavigateItem { .. }
                     | NativeOverlayCommand::TileColumnsDelta { .. }
+                    | NativeOverlayCommand::StepSeekStripRange { .. }
             )
         });
         let mut routing = self.input_routing();
@@ -9147,6 +9250,9 @@ impl NativeEguiOverlay {
                         ctx,
                         egui::vec2(overlay_width_points, overlay_height_points),
                         visibility_hover_pos,
+                        !bookmark_title_edit_visible
+                            && !bulk_bookmark_dialog_visible
+                            && !shortcut_help_open,
                         strip,
                         &seek_strip_texture_ids,
                         seek_strip_wave_texture_id,
@@ -11369,10 +11475,10 @@ mod tests {
         VideoSurfaceContent, VideoVisualLayout, VideoVisualTargetRect, compare_pixel_probe,
         compute_video_visual_target_rect, compute_video_visual_transform, configure_overlay_style,
         copy_cpu_rgba_to_swapchain_bgra, cursor_move_is_activity, draw_native_seek_strip,
-        effective_overlay_pixels_per_point, egui_key_from_virtual_key, metadata_clean_text,
-        native_jump_panel_visible_from_inputs, native_panel_callout_hud_rects,
-        native_right_panel_visible_from_inputs, native_touch_owned_panel_sides,
-        native_touch_panel_handle_hud_rects,
+        effective_overlay_pixels_per_point, egui_key_from_virtual_key,
+        immediate_native_wheel_command, metadata_clean_text, native_jump_panel_visible_from_inputs,
+        native_panel_callout_hud_rects, native_right_panel_visible_from_inputs,
+        native_touch_owned_panel_sides, native_touch_panel_handle_hud_rects,
         native_touch_panel_tap_command_dismisses_before_dispatch,
         native_video_fullscreen_shortcut_key, sample_cpu_rgba_pixel, should_claim_text_input_focus,
         validate_prepared_video_scale_settings, video_scale_signature_changed_fields,
@@ -11391,10 +11497,12 @@ mod tests {
     #[test]
     fn seek_strip_cursor_follows_presenter_hover_when_egui_hover_drops() {
         let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
         let overlay_size = egui::vec2(1280.0, 720.0);
         let pointer = egui::pos2(640.0, 600.0);
         let strip = NativeOverlaySeekStrip {
             center: crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index: 0.0 },
+            range_value_secs: crate::settings::VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS,
             cell_count: 1,
             cells: Vec::new(),
             thumbnail_notice: None,
@@ -11426,6 +11534,7 @@ mod tests {
                         ctx,
                         overlay_size,
                         presenter_hover_positions[frame],
+                        true,
                         &strip,
                         &std::collections::HashMap::new(),
                         None,
@@ -11459,6 +11568,78 @@ mod tests {
                 egui::CursorIcon::Default,
             ],
             "presenter hover must own the strip cursor until the native position leaves"
+        );
+    }
+
+    #[test]
+    fn seek_strip_wheel_is_consumed_and_becomes_one_range_step() {
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let overlay_size = egui::vec2(1280.0, 720.0);
+        let pointer = egui::pos2(640.0, 600.0);
+        let strip = NativeOverlaySeekStrip {
+            center: crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index: 0.0 },
+            range_value_secs: 15.0,
+            cell_count: 1,
+            cells: Vec::new(),
+            thumbnail_notice: None,
+            wave_image: None,
+            wave_notice: None,
+            waveform_span_secs: crate::video::seek_strip_wave::DEFAULT_WAVEFORM_SPAN_SECS,
+        };
+        let mut drag_origin = None;
+        let mut last_window_request = None;
+        let mut commands = Vec::new();
+        let mut wheel_remaining = true;
+        assert!(
+            immediate_native_wheel_command(120, false, false, true, false, false).is_none(),
+            "wheel over the strip must not enqueue navigation before egui handles it"
+        );
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, overlay_size)),
+                events: vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, 1.0),
+                    modifiers: egui::Modifiers::default(),
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                draw_native_seek_strip(
+                    ctx,
+                    overlay_size,
+                    Some(pointer),
+                    true,
+                    &strip,
+                    &std::collections::HashMap::new(),
+                    None,
+                    &mut drag_origin,
+                    &mut last_window_request,
+                    &mut commands,
+                );
+                wheel_remaining = ctx.input(|input| {
+                    input.raw_scroll_delta != egui::Vec2::ZERO
+                        || input.smooth_scroll_delta != egui::Vec2::ZERO
+                        || input
+                            .events
+                            .iter()
+                            .any(|event| matches!(event, egui::Event::MouseWheel { .. }))
+                });
+            },
+        );
+
+        assert!(!wheel_remaining);
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            super::NativeOverlayCommand::StepSeekStripRange {
+                step: crate::video::seek_strip::SeekStripRangeStep::Narrower
+            }
+        )));
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, super::NativeOverlayCommand::NavigateItem { .. }))
         );
     }
 

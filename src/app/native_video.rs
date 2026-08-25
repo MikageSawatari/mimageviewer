@@ -4095,6 +4095,12 @@ impl App {
                     self.sync_native_video_seek_strip(ctx, fs_idx);
                 }
             }
+            crate::video::NativeVideoOutputEvent::StepSeekStripRange { step } => {
+                if self.step_video_seek_strip_range(fs_idx, step) {
+                    self.mark_native_video_hud_activity(ctx);
+                    self.sync_native_video_seek_strip(ctx, fs_idx);
+                }
+            }
             crate::video::NativeVideoOutputEvent::ToggleTileMode => {
                 let screen = self.video_tile_layout_size(fs_idx, ctx);
                 self.toggle_video_tile_mode(fs_idx, screen);
@@ -6980,6 +6986,57 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn step_video_seek_strip_range(
+        &mut self,
+        fs_idx: usize,
+        step: crate::video::seek_strip::SeekStripRangeStep,
+    ) -> bool {
+        let VideoSeekStripRuntime::Open(session) = &self.video_seek_strip_runtime else {
+            return false;
+        };
+        if session.owner_fs_idx != fs_idx {
+            return false;
+        }
+        let mode = session.center.mode();
+        if self.settings.video_seek_strip_state.mode() != Some(mode) {
+            return false;
+        }
+        let current = match mode {
+            crate::settings::VideoSeekStripMode::Thumbnails => {
+                self.settings.video_seek_strip_min_interval_secs
+            }
+            crate::settings::VideoSeekStripMode::Waveform => {
+                self.settings.video_seek_strip_waveform_span_secs
+            }
+        };
+        let Some(next) = crate::video::seek_strip::step_seek_strip_range(mode, current, step)
+        else {
+            return false;
+        };
+        if next.to_bits() == current.to_bits() {
+            return false;
+        }
+        match mode {
+            crate::settings::VideoSeekStripMode::Thumbnails => {
+                self.settings.video_seek_strip_min_interval_secs = next;
+            }
+            crate::settings::VideoSeekStripMode::Waveform => {
+                self.settings.video_seek_strip_waveform_span_secs = next;
+            }
+        }
+        self.settings.save();
+        match mode {
+            crate::settings::VideoSeekStripMode::Thumbnails => {
+                self.rebuild_video_seek_strip_adopted_list();
+            }
+            crate::settings::VideoSeekStripMode::Waveform => {
+                self.rebuild_video_seek_strip_waveform_span();
+            }
+        }
+        true
+    }
+
+    #[cfg(windows)]
     fn set_video_seek_strip_runtime_mode(
         &mut self,
         fs_idx: usize,
@@ -7448,10 +7505,12 @@ impl App {
                 crate::video::seek_strip::SeekStripCenter::Waveform { .. }
             )
         {
-            // Poll the two-stage waveform transition even while paused. The first 60-second
-            // raster remains published while this schedules the same-centred 180-second upgrade.
+            // Poll the waveform transition even while paused. A visible-width first paint stays
+            // published while a wider retained raster is scheduled when this range has one.
             Self::request_video_seek_strip_window(session);
         }
+        let thumbnail_range_value_secs = self.settings.video_seek_strip_min_interval_secs;
+        let waveform_range_value_secs = self.settings.video_seek_strip_waveform_span_secs;
         let mut axis_failure = None;
         let mut axis_unavailable = None;
         let mut axis_became_available = false;
@@ -7512,6 +7571,10 @@ impl App {
                 let mut wave_image = None;
                 let mut wave_notice = None;
                 let mut waveform_span_secs = session.waveform_span_secs;
+                let range_value_secs = match session.center.mode() {
+                    crate::settings::VideoSeekStripMode::Thumbnails => thumbnail_range_value_secs,
+                    crate::settings::VideoSeekStripMode::Waveform => waveform_range_value_secs,
+                };
                 let (cell_count, cells) = match session.center {
                     crate::video::seek_strip::SeekStripCenter::Thumbnails { center_index } => {
                         if let VideoSeekStripAxisState::Ready(axis) = &session.axis {
@@ -7640,6 +7703,7 @@ impl App {
                 );
                 Some(crate::video::native_presenter::NativeOverlaySeekStrip {
                     center: session.center,
+                    range_value_secs,
                     cell_count,
                     cells,
                     thumbnail_notice,

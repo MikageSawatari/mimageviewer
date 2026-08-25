@@ -4403,7 +4403,7 @@ pub struct Settings {
     /// シークバー上のプレビューで許容する表示位置との差 (秒)。
     #[serde(default = "default_video_seek_thumbnail_tolerance_secs")]
     pub video_seek_thumbnail_tolerance_secs: f64,
-    /// シークストリップで採用する画像どうしの最小間隔 (秒)。0.0 は間引かない。
+    /// シークストリップで採用する画像どうしの最小間隔 (秒)。
     #[serde(default = "default_video_seek_strip_min_interval_secs")]
     pub video_seek_strip_min_interval_secs: f64,
     /// 動画シークストリップの音声波形で、1 画面に表示する時間 (秒)。
@@ -5086,13 +5086,13 @@ pub const VIDEO_SEEK_THUMBNAIL_TOLERANCE_MIN_SECS: f64 = 0.0;
 pub const VIDEO_SEEK_THUMBNAIL_TOLERANCE_MAX_SECS: f64 = 30.0;
 pub const VIDEO_SEEK_THUMBNAIL_TOLERANCE_DEFAULT_SECS: f64 = 1.0;
 
-pub const VIDEO_SEEK_STRIP_MIN_INTERVAL_MIN_SECS: f64 = 0.0;
+pub const VIDEO_SEEK_STRIP_MIN_INTERVAL_MIN_SECS: f64 = 0.1;
 pub const VIDEO_SEEK_STRIP_MIN_INTERVAL_MAX_SECS: f64 = 60.0;
-pub const VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS: f64 = 2.0;
+pub const VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS: f64 = 15.0;
 
-pub const VIDEO_SEEK_STRIP_WAVEFORM_SPAN_MIN_SECS: f64 = 30.0;
-pub const VIDEO_SEEK_STRIP_WAVEFORM_SPAN_MAX_SECS: f64 = 1800.0;
-pub const VIDEO_SEEK_STRIP_WAVEFORM_SPAN_DEFAULT_SECS: f64 = 60.0;
+pub const VIDEO_SEEK_STRIP_WAVEFORM_SPAN_MIN_SECS: f64 = 5.0;
+pub const VIDEO_SEEK_STRIP_WAVEFORM_SPAN_MAX_SECS: f64 = 10_800.0;
+pub const VIDEO_SEEK_STRIP_WAVEFORM_SPAN_DEFAULT_SECS: f64 = 180.0;
 
 fn default_video_seek_thumbnail_tolerance_secs() -> f64 {
     VIDEO_SEEK_THUMBNAIL_TOLERANCE_DEFAULT_SECS
@@ -11050,13 +11050,13 @@ mod tests {
         );
 
         let mut settings = Settings::default();
-        settings.video_seek_strip_waveform_span_secs = 10.0;
+        settings.video_seek_strip_waveform_span_secs = 1.0;
         settings.sanitize();
         assert_eq!(
             settings.video_seek_strip_waveform_span_secs,
             VIDEO_SEEK_STRIP_WAVEFORM_SPAN_MIN_SECS
         );
-        settings.video_seek_strip_waveform_span_secs = 9_999.0;
+        settings.video_seek_strip_waveform_span_secs = 99_999.0;
         settings.sanitize();
         assert_eq!(
             settings.video_seek_strip_waveform_span_secs,

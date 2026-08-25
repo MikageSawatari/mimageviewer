@@ -6203,20 +6203,28 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         anchored(ui, state, "video/seek-strip-interval", |ui, state| {
             let s = &mut state.settings;
             ui.horizontal(|ui| {
-                ui.label("シークストリップの画像間隔 (秒)");
-                ui.add(
-                    egui::DragValue::new(&mut s.video_seek_strip_min_interval_secs)
-                        .range(
-                            crate::settings::VIDEO_SEEK_STRIP_MIN_INTERVAL_MIN_SECS
-                                ..=crate::settings::VIDEO_SEEK_STRIP_MIN_INTERVAL_MAX_SECS,
-                        )
-                        .speed(0.1)
-                        .fixed_decimals(1),
-                );
+                ui.label("シークストリップの画像間隔");
+                egui::ComboBox::from_id_salt("video_seek_strip_min_interval")
+                    .selected_text(crate::video::seek_strip::format_seek_strip_range_value(
+                        crate::settings::VideoSeekStripMode::Thumbnails,
+                        s.video_seek_strip_min_interval_secs,
+                    ))
+                    .show_ui(ui, |ui| {
+                        for &step in crate::video::seek_strip::THUMBNAIL_RANGE_STEPS_SECS {
+                            ui.selectable_value(
+                                &mut s.video_seek_strip_min_interval_secs,
+                                step,
+                                crate::video::seek_strip::format_seek_strip_range_value(
+                                    crate::settings::VideoSeekStripMode::Thumbnails,
+                                    step,
+                                ),
+                            );
+                        }
+                    });
             });
             ui.label(
                 egui::RichText::new(
-                    "大きいほど、ストリップ 1 画面でより長い時間を見渡せるため、大まかな位置を探す用途に向きます。0.0 は利用できる画像を間引かずに表示します。",
+                    "大きいほど、ストリップ 1 画面でより長い時間を見渡せるため、大まかな位置を探す用途に向きます。",
                 )
                 .small(),
             );
@@ -6226,16 +6234,24 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         anchored(ui, state, "video/seek-strip-waveform-span", |ui, state| {
             let s = &mut state.settings;
             ui.horizontal(|ui| {
-                ui.label("音声波形で見渡す範囲 (秒)");
-                ui.add(
-                    egui::DragValue::new(&mut s.video_seek_strip_waveform_span_secs)
-                        .range(
-                            crate::settings::VIDEO_SEEK_STRIP_WAVEFORM_SPAN_MIN_SECS
-                                ..=crate::settings::VIDEO_SEEK_STRIP_WAVEFORM_SPAN_MAX_SECS,
-                        )
-                        .speed(10.0)
-                        .fixed_decimals(0),
-                );
+                ui.label("音声波形で見渡す範囲");
+                egui::ComboBox::from_id_salt("video_seek_strip_waveform_span")
+                    .selected_text(crate::video::seek_strip::format_seek_strip_range_value(
+                        crate::settings::VideoSeekStripMode::Waveform,
+                        s.video_seek_strip_waveform_span_secs,
+                    ))
+                    .show_ui(ui, |ui| {
+                        for &step in crate::video::seek_strip::WAVEFORM_RANGE_STEPS_SECS {
+                            ui.selectable_value(
+                                &mut s.video_seek_strip_waveform_span_secs,
+                                step,
+                                crate::video::seek_strip::format_seek_strip_range_value(
+                                    crate::settings::VideoSeekStripMode::Waveform,
+                                    step,
+                                ),
+                            );
+                        }
+                    });
             });
             ui.label(
                 egui::RichText::new(

@@ -736,7 +736,8 @@ BLOB 読み出しと WebP→RGBA decode は `video-marker-thumbs` worker で行�
 抽出を UI thread の外で行う。要求は可視窓と進行方向 1 画面分の latest-wins で、取得済み画像は
 窓を動かしても再利用する。再生追従は可視窓の半分が先読み coverage 内にある間は新要求を出さず、
 coverage を外れたときだけ進行方向 1 画面を追加要求する。最小間隔の設定変更は全索引から採用列だけを
-作り直し、永続キャッシュは無効化しない。
+作り直し、実 timestamp をキーにした永続キャッシュは無効化しない。最小間隔は
+0.1 / 0.2 / 0.5 / 1 / 2 / 5 / 10 / 15 / 30 / 60 秒 (既定 15 秒) の段階値とする。
 索引セルの timestamp は seek domain であり、MP4 の `AVIndexEntry` では DTS のことがある。
 worker は窓内の同じ key packet の DTS と PTS を対応付けて presentation target を作り、decoded frame
 は許容内の過去側を優先し、過去側が無い場合だけ未来側へ fallback する。indexed cell の許容幅は
@@ -764,11 +765,14 @@ source session reset で `Unknown` へ戻すため、前ファイルの unavaila
 
 波形モードの `SeekStripWaveWorker` は既に完成済みの `TimelineAnalysis` が現在ファイルまたは
 音楽解析 LRU にあれば対象時間窓を切り出す。無ければ、動画ごとに 1 回だけ開く
-`AudioRangeDecoder` でまず設定された可視 span (30〜1800 秒、既定 60 秒) と 0.75 秒の pre-roll
+`AudioRangeDecoder` でまず設定された可視 span (5 / 10 / 15 / 30 秒、1 / 2 / 5 / 10 / 15 /
+30 / 60 / 120 / 180 分、既定 3 分) と 0.75 秒の pre-roll
 だけを 48kHz stereo PCM にして first-paint raster を返す。表示後は同じ中心の保持 span を
 background で作る。保持 span は通常 3 倍だが 3600 秒で上限とし、30 分表示では 60 分 / 2 倍
 物理幅に抑える。両側 15 分の coverage と中央 ±7.5 分の hysteresis trigger band は残る一方、
-90 分の音声 decode は発生しない。
+90 分の音声 decode は発生しない。可視 span が 60 分以上なら保持 span は可視 span と同じになり、
+同幅の background upgrade は出さない。中心が可視幅の 25% を越えて動いたときだけ次の同幅 raster を
+要求する。粗い全尺ピーク列はまだ無く、60 / 120 / 180 分も現在位置中心の窓を 1 回デコードする。
 両段は秒 / pixel と bin 幅が同一なので交換時に内容が動かない。pre-roll bins は raster 前に捨て、
 全尺前提の beat grid は作らない。波形 raster の LRU は file identity、時間窓、
 bin 幅、物理幅をキーにしたメモリ内 8 件だけで、
@@ -798,6 +802,11 @@ presenter payload の案内状態にはしない。
 外す一方、現在の raster の Arc とその旧可視 span を display-only holdover として session に残す。
 新 first paint が publish された frame で raster と可視 span を一緒に交換するため、再構築中に blank
 や一時的な誤スケールを挟まない。
+strip 上の wheel は上回転を 1 段狭く、下回転を 1 段広くする typed command に変換し、該当する
+persisted range を即時保存する。旧版由来の段階外値は回した向きの直近段へ移す。native wheel の
+即時 item navigation は strip 矩形上で作らず、egui 側も MouseWheel event と scroll delta を消費する。
+背後の grid / item navigation へ再転送しない。右上の固定小文字は session の現在設定値を描き、
+波形再構築中の旧 raster scale とは別フィールドで運ぶ。
 サムネイルでは等幅セルの連続する小数位置、波形では設定された時間幅の時間線形軸を使い、どちらも
 固定中央線を描く。サムネイルの整数位置 `i` はセル `i` の左端であり、セルは `[i, i+1)` を
 占める。したがって中央線のセル内位置は `cell(i)` から `cell(i+1)` までの進み具合を表す。
