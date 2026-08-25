@@ -1772,6 +1772,52 @@ respawn までを 1 つの修正として扱う:
 - ⚠ **guard / delay / retry で待ち時間を隠さない**。プール枯渇そのものを直す。
 - 規模 / 優先度: Medium / P2 (機能は動くが体感に直結する)。
 
+### 1.123 スレッド終了中の heap 例外を、例外ハンドラ自身が二次クラッシュで握り潰す — 実機クラッシュ
+
+- 出典: 2026-08-25、R2e ステージ④の smoke 準備中。タグを付けて上のフォルダへ移動した直後に
+  `mimageviewer-core.exe` が **0xc0000005 で異常終了**。`panic.log` に記録なし
+  (= Rust panic ではない)。**R2e とは無関係の既存不具合**
+  ([logger.rs](../src/logger.rs) も [lib.rs](../src/lib.rs) の handler も
+  このブランチでは 1 行も変更していない)。
+- **WER のフルダンプから取得したスタック** (`cdb -z <dump> -c ".ecxr; kn"`)。下から読む:
+
+  ```
+  0b ntdll!RtlUserThreadStart
+  0a kernel32!BaseThreadInitThunk
+  09 ntdll!RtlExitUserThread          ← スレッドが終了処理に入っている
+  08 ntdll!LdrShutdownThread          ← DLL_THREAD_DETACH / TLS デストラクタ実行中
+  07 ntdll!LdrShutdownThread
+  06 ntdll!RtlFreeHeap+0x726          ← ここで一次例外が発生
+  05 ntdll!KiUserExceptionDispatcher
+  02 mimageviewer_core!mimageviewer::native_exception_handler+0xa0   ← 自前ハンドラが走る
+  01 mimageviewer_core!mimageviewer::logger::current_thread_id_num+0x19
+  00 mimageviewer_core!std::thread::current::current+0xf   ← 二次 AV (rcx=0)
+  ```
+
+- **問題は 2 つある。**
+
+  **(A) 一次例外**: スレッド終了中の `RtlFreeHeap` で例外。ヒープの不整合か、
+  TLS デストラクタ順序に依存した解放。直前のログは**フォルダ移動でワーカー 12 本を
+  停止して 12 本を起動**した箇所 (`w0 stopped` … `spawning 10 regular + 2 I/O workers`)。
+
+  **(B) 自前ハンドラが、その文脈で走れない**:
+  [lib.rs:693](../src/lib.rs:693) の `native_exception_handler` は
+  `logger::current_thread_id_num()` ([logger.rs:272](../src/logger.rs:272)) を呼び、
+  その中の `std::thread::current()` が **TLS 依存**である。
+  `LdrShutdownThread` 以降は TLS が破棄済みなので `rcx=0` を deref して二次 AV になる。
+  **ハンドラが自分で死ぬので `panic.log` に何も残らない。**
+
+- ⚠ **(B) を直しても (A) は直らない。だが (B) を直さないと (A) は永久に見えない。**
+  今は例外ハンドラが証拠ごと消している。**(B) を先に直す。**
+- (B) の直し方: 例外ハンドラの内側では **TLS に触れる API を使わない**。
+  スレッド ID は `std::thread::current().id()` ではなく **`GetCurrentThreadId()`** を使う。
+  ハンドラ経路が通るログ整形すべてを同じ基準で見直す (`format!` の allocator も
+  ヒープ破損時は危険なので、固定バッファ + `write!` が望ましい)。
+- (A) の手掛かり: 一次例外は `RtlFreeHeap` の中。`Application Verifier` の page heap か
+  `_NT_GLOBAL_FLAG` の heap tail checking を有効にして再現すると、壊した側が特定できる。
+  ダンプは `C:\Users\<user>\AppData\Local\CrashDumps\` に残る (今回は 59.6 GB)。
+- 規模 / 優先度: Small (B) / Medium (A)。**P2** — 通常操作 (タグ付け → フォルダ移動) で落ちた。
+
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断
