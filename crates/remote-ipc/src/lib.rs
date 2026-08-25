@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 51;
+pub const PROTOCOL_VERSION: u32 = 52;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -228,6 +228,9 @@ pub struct ContainerRequest {
 }
 
 /// Web へ公開するページ構成。旧 DB 互換用 `Vertical` は本体側で `Single` へ解決してから返す。
+///
+/// `SplitLtr` / `SplitRtl` は横長 1 ページを左右へ分けて 2 回の表示ステップとして読むモード。
+/// 見開きとは**排他**で、`is_rtl` には含めない (見開きのペア並び順とは別の概念)。
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteSpreadMode {
@@ -236,11 +239,39 @@ pub enum RemoteSpreadMode {
     LtrCover,
     Rtl,
     RtlCover,
+    SplitLtr,
+    SplitRtl,
 }
 
 impl RemoteSpreadMode {
     pub fn is_rtl(self) -> bool {
         matches!(self, Self::Rtl | Self::RtlCover)
+    }
+
+    /// 横長ページを左右へ分割して読むモードか。
+    pub fn is_split(self) -> bool {
+        matches!(self, Self::SplitLtr | Self::SplitRtl)
+    }
+}
+
+/// 分割したページの、どちら側を表示しているか。
+///
+/// **元ページのアドレスは変えない。** `PageGroup.anchor` は画像取得・履歴 URL・
+/// キャッシュの identity として使われており、そこへ半分を埋め込むと URL と転送まで
+/// 巻き込む。本体と同じく「元は正本、左右は表示だけ」に揃える。
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemotePageSlice {
+    #[default]
+    Full,
+    Left,
+    Right,
+}
+
+impl RemotePageSlice {
+    /// 半分だけを表示しているか。
+    pub fn is_half(self) -> bool {
+        matches!(self, Self::Left | Self::Right)
     }
 }
 
@@ -874,8 +905,14 @@ pub struct ContainerEntry {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct PageGroup {
     /// 読み順でこの表示単位の先頭になるページ。履歴 URL とグループ移動の identity。
+    ///
+    /// **分割中は同じ anchor の group が 2 つ並ぶ**ので、これ単体では表示単位を
+    /// 特定できない。位置の照合は `(anchor, slice)` の組で行うこと。
     pub anchor: RemoteAddress,
     pub pages: Vec<RemoteAddress>,
+    /// 分割中にこの表示単位が元ページのどちら側か。分割していなければ `Full`。
+    #[serde(default)]
+    pub slice: RemotePageSlice,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -2674,8 +2711,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v51_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
-        assert_eq!(PROTOCOL_VERSION, 51);
+    fn protocol_v52_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
+        assert_eq!(PROTOCOL_VERSION, 52);
         let expected = ClientMessage::RemoteWebConnectionInfo {
             id: 10,
             info: RemoteWebConnectionInfo {
@@ -2850,8 +2887,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v51_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 51);
+    fn protocol_v52_remote_video_thumbnail_shape_round_trips() {
+        assert_eq!(PROTOCOL_VERSION, 52);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -3005,6 +3042,7 @@ mod tests {
                 page_groups: vec![PageGroup {
                     anchor: page(0),
                     pages: vec![page(1), page(0)],
+                    slice: RemotePageSlice::Full,
                 }],
                 entry_limit: 1000,
                 truncated: false,
@@ -3334,6 +3372,7 @@ mod tests {
                 page_groups: vec![PageGroup {
                     anchor: page.clone(),
                     pages: vec![page],
+                    slice: RemotePageSlice::Full,
                 }],
                 entry_limit: 1000,
                 truncated: false,

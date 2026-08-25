@@ -4553,10 +4553,11 @@ impl ContainerEngine {
         );
         let groups = index_groups
             .into_iter()
-            .filter_map(|indices| {
+            .filter_map(|group| {
                 let container_address =
                     page_identity_from_resolved(resolved, &request.address.subresource);
-                let pages = indices
+                let pages = group
+                    .indices
                     .into_iter()
                     .filter_map(|index| grid_item_address(&container_address, items.get(index)?))
                     .collect::<Vec<_>>();
@@ -4565,7 +4566,11 @@ impl ContainerEngine {
                 } else {
                     pages.first().cloned()
                 }?;
-                Some(PageGroup { anchor, pages })
+                Some(PageGroup {
+                    anchor,
+                    pages,
+                    slice: crate::ui_fullscreen::remote_page_slice(group.slice),
+                })
             })
             .collect::<Vec<_>>();
         SpreadPayload {
@@ -6242,6 +6247,8 @@ pub(super) fn core_spread_mode(mode: RemoteSpreadMode) -> crate::settings::Sprea
         RemoteSpreadMode::LtrCover => crate::settings::SpreadMode::LtrCover,
         RemoteSpreadMode::Rtl => crate::settings::SpreadMode::Rtl,
         RemoteSpreadMode::RtlCover => crate::settings::SpreadMode::RtlCover,
+        RemoteSpreadMode::SplitLtr => crate::settings::SpreadMode::SplitLtr,
+        RemoteSpreadMode::SplitRtl => crate::settings::SpreadMode::SplitRtl,
     }
 }
 
@@ -6251,11 +6258,12 @@ fn remote_spread_mode(mode: crate::settings::SpreadMode) -> RemoteSpreadMode {
         crate::settings::SpreadMode::LtrCover => RemoteSpreadMode::LtrCover,
         crate::settings::SpreadMode::Rtl => RemoteSpreadMode::Rtl,
         crate::settings::SpreadMode::RtlCover => RemoteSpreadMode::RtlCover,
-        // 分割はリモート非対応 (§1.119 MVP 対象外)。元ページ表示を維持する。
-        crate::settings::SpreadMode::Single
-        | crate::settings::SpreadMode::Vertical
-        | crate::settings::SpreadMode::SplitLtr
-        | crate::settings::SpreadMode::SplitRtl => RemoteSpreadMode::Single,
+        crate::settings::SpreadMode::SplitLtr => RemoteSpreadMode::SplitLtr,
+        crate::settings::SpreadMode::SplitRtl => RemoteSpreadMode::SplitRtl,
+        // 旧 DB 互換の `Vertical` は本体側で Single へ解決してから返す。
+        crate::settings::SpreadMode::Single | crate::settings::SpreadMode::Vertical => {
+            RemoteSpreadMode::Single
+        }
     }
 }
 
@@ -6266,6 +6274,8 @@ fn remote_spread_mode_name(mode: RemoteSpreadMode) -> &'static str {
         RemoteSpreadMode::LtrCover => "ltr_cover",
         RemoteSpreadMode::Rtl => "rtl",
         RemoteSpreadMode::RtlCover => "rtl_cover",
+        RemoteSpreadMode::SplitLtr => "split_ltr",
+        RemoteSpreadMode::SplitRtl => "split_rtl",
     }
 }
 
@@ -6306,7 +6316,10 @@ pub(super) fn resolve_spread_state(
     ) {
         reading_direction = RemoteReadingDirection::Ltr;
     }
-    let effective = if force_single_page {
+    // 縦持ち強制は「1 画面に 2 ページ出さない」ための表示限定 Single。
+    // **分割は既にそれを達成している**ので重ねない。重ねると縦持ちで分割が消え、
+    // 分割が一番効く場面 (横長 scan をスマホで読む) で無効になる。
+    let effective = if force_single_page && !configured.is_split() {
         RemoteSpreadMode::Single
     } else {
         configured
@@ -6871,6 +6884,7 @@ mod tests {
             .map(|entry| PageGroup {
                 anchor: entry.address.clone(),
                 pages: vec![entry.address.clone()],
+                slice: mimageviewer_ipc::RemotePageSlice::Full,
             })
             .collect();
         ContainerPayload {
@@ -9445,7 +9459,10 @@ mod tests {
                 &items,
                 crate::settings::SpreadMode::LtrCover,
                 &portrait,
-            ),
+            )
+            .into_iter()
+            .map(|group| group.indices)
+            .collect::<Vec<_>>(),
             vec![vec![0], vec![1, 2], vec![3, 4]]
         );
 
@@ -9456,7 +9473,10 @@ mod tests {
                 &items,
                 crate::settings::SpreadMode::Ltr,
                 &with_landscape,
-            ),
+            )
+            .into_iter()
+            .map(|group| group.indices)
+            .collect::<Vec<_>>(),
             vec![vec![0, 1], vec![2], vec![3, 4]]
         );
         assert_eq!(
@@ -9464,7 +9484,10 @@ mod tests {
                 &items,
                 crate::settings::SpreadMode::Rtl,
                 &portrait,
-            ),
+            )
+            .into_iter()
+            .map(|group| group.indices)
+            .collect::<Vec<_>>(),
             vec![vec![1, 0], vec![3, 2], vec![4]]
         );
 
@@ -9482,7 +9505,10 @@ mod tests {
                 &items,
                 core_spread_mode(effective),
                 &portrait,
-            ),
+            )
+            .into_iter()
+            .map(|group| group.indices)
+            .collect::<Vec<_>>(),
             vec![vec![0], vec![1], vec![2], vec![3], vec![4]]
         );
     }

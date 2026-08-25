@@ -770,6 +770,7 @@ fn collection_spread_payload(
         .iter()
         .map(|entry| remote_entry_grid_item(entry.kind, PathBuf::from(&entry.path)))
         .collect::<Vec<_>>();
+    // Single は横長判定を使わない。見開きと分割はどちらも実寸法が要る。
     let landscape = if effective == RemoteSpreadMode::Single {
         vec![false; entries.len()]
     } else {
@@ -782,8 +783,9 @@ fn collection_spread_payload(
     );
     let groups = index_groups
         .into_iter()
-        .filter_map(|indices| {
-            let pages = indices
+        .filter_map(|group| {
+            let pages = group
+                .indices
                 .into_iter()
                 .filter_map(|index| entries.get(index))
                 .map(|entry| RemoteAddress::file(entry.path.clone()))
@@ -793,7 +795,11 @@ fn collection_spread_payload(
             } else {
                 pages.first().cloned()
             }?;
-            Some(PageGroup { anchor, pages })
+            Some(PageGroup {
+                anchor,
+                pages,
+                slice: crate::ui_fullscreen::remote_page_slice(group.slice),
+            })
         })
         .collect();
     CollectionSpreadPayload {

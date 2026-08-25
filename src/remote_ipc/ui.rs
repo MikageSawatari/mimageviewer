@@ -3714,6 +3714,8 @@ fn core_spread_mode(mode: RemoteSpreadMode) -> crate::settings::SpreadMode {
         RemoteSpreadMode::LtrCover => crate::settings::SpreadMode::LtrCover,
         RemoteSpreadMode::Rtl => crate::settings::SpreadMode::Rtl,
         RemoteSpreadMode::RtlCover => crate::settings::SpreadMode::RtlCover,
+        RemoteSpreadMode::SplitLtr => crate::settings::SpreadMode::SplitLtr,
+        RemoteSpreadMode::SplitRtl => crate::settings::SpreadMode::SplitRtl,
     }
 }
 

@@ -8395,15 +8395,50 @@ fn build_spread_display_units_with_predicates(
 /// ペア可能種別、表紙位相、横長ページ境界、RTL の左右反転を fullscreen と同じ
 /// `SpreadDisplayUnit::spread_pair` へ通す。`is_landscape` は一覧生成側が既存 catalog の
 /// source dimensions から解決し、未確定は fullscreen と同じく縦長扱いにする。
+/// リモートへ返す 1 つの表示単位。
+///
+/// **分割中は同じ index が 2 つの単位に現れる**ので、index だけでは識別子にならない
+/// (端末側の位置照合は `(anchor, slice)` の組で行う)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RemotePageGroupSpec {
+    pub(crate) indices: Vec<usize>,
+    pub(crate) slice: crate::page_split::PageSlice,
+}
+
+impl RemotePageGroupSpec {
+    fn whole(indices: Vec<usize>) -> Self {
+        Self {
+            indices,
+            slice: crate::page_split::PageSlice::Full,
+        }
+    }
+}
+
 pub(crate) fn build_remote_spread_page_groups(
     items: &[GridItem],
     spread_mode: SpreadMode,
     is_landscape: &[bool],
-) -> Vec<Vec<usize>> {
+) -> Vec<RemotePageGroupSpec> {
     let visible = (0..items.len()).collect::<Vec<_>>();
     let nav = build_image_reading_indices(items, &visible);
+    // 分割は本体と**同じステップ列**から作る。並べ替えの規則を 2 か所に持たない。
+    if let Some(direction) = crate::page_split::SplitDirection::from_spread_mode(spread_mode) {
+        return crate::page_split::presentation_steps(&nav, direction, |_, idx| {
+            is_spread_pairable_item(items.get(idx))
+                && is_landscape.get(idx).copied().unwrap_or(false)
+        })
+        .into_iter()
+        .map(|step| RemotePageGroupSpec {
+            indices: vec![step.source_idx],
+            slice: step.slice,
+        })
+        .collect();
+    }
     if !spread_mode.is_spread() {
-        return nav.into_iter().map(|idx| vec![idx]).collect();
+        return nav
+            .into_iter()
+            .map(|idx| RemotePageGroupSpec::whole(vec![idx]))
+            .collect();
     }
     build_spread_display_units_with_predicates(
         &nav,
@@ -8414,10 +8449,21 @@ pub(crate) fn build_remote_spread_page_groups(
     )
     .into_iter()
     .map(|unit| match unit.spread_pair(spread_mode) {
-        SpreadPair::Single => vec![unit.anchor_idx()],
-        SpreadPair::Double { left, right } => vec![left, right],
+        SpreadPair::Single => RemotePageGroupSpec::whole(vec![unit.anchor_idx()]),
+        SpreadPair::Double { left, right } => RemotePageGroupSpec::whole(vec![left, right]),
     })
     .collect()
+}
+
+/// 本体の左右を、リモートの protocol 型へ写す。
+pub(crate) fn remote_page_slice(
+    slice: crate::page_split::PageSlice,
+) -> mimageviewer_ipc::RemotePageSlice {
+    match slice {
+        crate::page_split::PageSlice::Full => mimageviewer_ipc::RemotePageSlice::Full,
+        crate::page_split::PageSlice::Left => mimageviewer_ipc::RemotePageSlice::Left,
+        crate::page_split::PageSlice::Right => mimageviewer_ipc::RemotePageSlice::Right,
+    }
 }
 
 fn append_spread_display_units_until(
@@ -45522,6 +45568,71 @@ mod tests {
         assert_spread_seek_units_cover_nav_and_endpoints(&nav, &units);
     }
 
+    /// リモートへ返す分割の表示単位。**同じ index の group が 2 つ並ぶ。**
+    ///
+    /// 端末側はこれを `(anchor, slice)` の組で照合する。index だけで解決すると
+    /// 必ず先頭へ吸われる (本体側で 2 回踏んだのと同じ形)。
+    #[test]
+    fn a_landscape_page_becomes_two_remote_groups() {
+        use crate::page_split::PageSlice;
+
+        let items = (0..3)
+            .map(|k| GridItem::Image(std::path::PathBuf::from(format!("p{k}.jpg"))))
+            .collect::<Vec<_>>();
+        let mut landscape = vec![false; items.len()];
+        landscape[1] = true;
+
+        let groups = build_remote_spread_page_groups(&items, SpreadMode::SplitLtr, &landscape);
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| (group.indices.clone(), group.slice))
+                .collect::<Vec<_>>(),
+            vec![
+                (vec![0], PageSlice::Full),
+                (vec![1], PageSlice::Left),
+                (vec![1], PageSlice::Right),
+                (vec![2], PageSlice::Full),
+            ]
+        );
+
+        // 右→左では左右の順序だけが変わる。元ページの順序は変わらない。
+        let rtl = build_remote_spread_page_groups(&items, SpreadMode::SplitRtl, &landscape);
+        assert_eq!(
+            rtl.iter().map(|group| group.slice).collect::<Vec<_>>(),
+            vec![
+                PageSlice::Full,
+                PageSlice::Right,
+                PageSlice::Left,
+                PageSlice::Full
+            ]
+        );
+        assert_eq!(
+            rtl.iter()
+                .map(|group| group.indices.clone())
+                .collect::<Vec<_>>(),
+            groups
+                .iter()
+                .map(|group| group.indices.clone())
+                .collect::<Vec<_>>()
+        );
+
+        // 分割は見開きではない。1 group に 2 ページを入れない。
+        assert!(groups.iter().all(|group| group.indices.len() == 1));
+    }
+
+    /// リモート group の index だけを取り出す。左右は分割モードの専用テストで確かめる。
+    fn remote_group_indices(
+        items: &[GridItem],
+        spread_mode: SpreadMode,
+        landscape: &[bool],
+    ) -> Vec<Vec<usize>> {
+        build_remote_spread_page_groups(items, spread_mode, landscape)
+            .into_iter()
+            .map(|group| group.indices)
+            .collect()
+    }
+
     fn spread_unit_summary(units: &[SpreadDisplayUnit]) -> Vec<(usize, Vec<usize>)> {
         units
             .iter()
@@ -45661,23 +45772,23 @@ mod tests {
         let landscape = [false, false, false, true, false, false, false];
 
         assert_eq!(
-            build_remote_spread_page_groups(&items, SpreadMode::Ltr, &landscape),
+            remote_group_indices(&items, SpreadMode::Ltr, &landscape),
             vec![vec![0, 1], vec![2], vec![3], vec![4, 5], vec![6]]
         );
         assert_eq!(
-            build_remote_spread_page_groups(&items, SpreadMode::LtrCover, &landscape),
+            remote_group_indices(&items, SpreadMode::LtrCover, &landscape),
             vec![vec![0], vec![1, 2], vec![3], vec![4, 5], vec![6]]
         );
         assert_eq!(
-            build_remote_spread_page_groups(&items, SpreadMode::Rtl, &landscape),
+            remote_group_indices(&items, SpreadMode::Rtl, &landscape),
             vec![vec![1, 0], vec![2], vec![3], vec![5, 4], vec![6]]
         );
         assert_eq!(
-            build_remote_spread_page_groups(&items, SpreadMode::RtlCover, &landscape),
+            remote_group_indices(&items, SpreadMode::RtlCover, &landscape),
             vec![vec![0], vec![2, 1], vec![3], vec![5, 4], vec![6]]
         );
         assert_eq!(
-            build_remote_spread_page_groups(&items, SpreadMode::Single, &landscape),
+            remote_group_indices(&items, SpreadMode::Single, &landscape),
             (0..7).map(|index| vec![index]).collect::<Vec<_>>()
         );
     }
