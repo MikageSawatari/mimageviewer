@@ -4797,6 +4797,10 @@ fn run_native_video_output(
                         continue;
                     }
 
+                    // F12 の main ⇄ 別ウィンドウ往復はこの分岐を通る。presenter を丸ごと
+                    // 作り直す間フレームを出せないので、体感遅延はこの区間の実時間そのもの。
+                    // どの段が支配的かを 1 切替につき 1 行残す (backlog §1.122)。
+                    let switch_t0 = std::time::Instant::now();
                     next_window_epoch = next_window_epoch.saturating_add(1);
                     let candidate_epoch = next_window_epoch;
                     cur_window_request = cur_window_request.saturating_add(1);
@@ -4816,6 +4820,8 @@ fn run_native_video_output(
                         candidate_epoch,
                         &cancel,
                     )?;
+                    let attach_ms = switch_t0.elapsed().as_secs_f64() * 1000.0;
+                    let core_t0 = std::time::Instant::now();
                     let new_presenter_result =
                         crate::video::native_presenter::NativeRenderCore::new(
                             crate::video::native_presenter::NativeRenderConfig {
@@ -4859,6 +4865,8 @@ fn run_native_video_output(
                                 continue;
                             }
                         };
+                    let core_new_ms = core_t0.elapsed().as_secs_f64() * 1000.0;
+                    let prepare_t0 = std::time::Instant::now();
                     let prepare_result = (|| -> Result<_, String> {
                         new_presenter.set_overlay_vst3_available(
                             cur_vst3_available && placement.is_fullscreen_borderless(),
@@ -4934,6 +4942,8 @@ fn run_native_video_output(
                             continue;
                         }
                     };
+                    let prepare_ms = prepare_t0.elapsed().as_secs_f64() * 1000.0;
+                    let publish_t0 = std::time::Instant::now();
                     sync_hud_regions(
                         &window_pump,
                         candidate_epoch,
@@ -4954,8 +4964,11 @@ fn run_native_video_output(
                         candidate_epoch,
                         &cancel,
                     )?;
+                    let publish_ms = publish_t0.elapsed().as_secs_f64() * 1000.0;
+                    let detach_t0 = std::time::Instant::now();
                     let old_presenter = std::mem::replace(&mut presenter, new_presenter);
                     old_presenter.detach();
+                    let detach_ms = detach_t0.elapsed().as_secs_f64() * 1000.0;
                     if source
                         .video_scale_state
                         .invalidate_preparation_and_keep_desired()
@@ -4977,13 +4990,16 @@ fn run_native_video_output(
                     last_native_mouse_at = None;
                     pointer_present_synthetic = false;
                     crate::logger::log(format!(
-                        "[native-video] placement switched placement={} {}x{} primed={} request={} generation={}",
+                        "[native-video] placement switched placement={} {}x{} primed={} request={} generation={} \
+                         total={:.1}ms (host_attach={attach_ms:.1} render_core_new={core_new_ms:.1} \
+                         prepare={prepare_ms:.1} publish={publish_ms:.1} detach_old={detach_ms:.1})",
                         placement.label(),
                         attach.width,
                         attach.height,
                         primed,
                         request_id,
                         cur_generation,
+                        switch_t0.elapsed().as_secs_f64() * 1000.0,
                     ));
                     send_native_output_event(
                         &ui_event_tx,

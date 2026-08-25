@@ -1957,6 +1957,9 @@ impl NativeRenderCore {
             crate::video::native_window_health::NativeRenderOperation::Attach,
             window_epoch,
         );
+        // placement 切替 (F12) はこの関数を丸ごと走らせる。どの段が支配的かを
+        // 1 切替につき 1 行だけ残す (backlog §1.122)。
+        let core_t0 = Instant::now();
         unsafe {
             let (d3d_device, d3d_context) = create_present_d3d11_device()?;
             let d3d_device1: ID3D11Device1 = d3d_device
@@ -1971,6 +1974,8 @@ impl NativeRenderCore {
             let d3d_context1: ID3D11DeviceContext1 = d3d_context
                 .cast()
                 .map_err(|e| format!("cast ID3D11DeviceContext1: {e:?}"))?;
+            let d3d_ms = core_t0.elapsed().as_secs_f64() * 1000.0;
+            let pipelines_t0 = Instant::now();
             // Compile every small Phase A shader while the render pipeline is
             // created. Anime4K pixel shaders are loaded here from build-time FXC
             // bytecode. A later filter selection never invokes D3DCompile.
@@ -1986,6 +1991,8 @@ impl NativeRenderCore {
                     (None, Some(error))
                 }
             };
+            let pipelines_ms = pipelines_t0.elapsed().as_secs_f64() * 1000.0;
+            let compositor_t0 = Instant::now();
             let dxgi_device: IDXGIDevice = d3d_device
                 .cast()
                 .map_err(|e| format!("cast IDXGIDevice: {e:?}"))?;
@@ -2092,6 +2099,9 @@ impl NativeRenderCore {
                     }
                 }
             }
+
+            let compositor_ms = compositor_t0.elapsed().as_secs_f64() * 1000.0;
+            let overlay_t0 = Instant::now();
 
             // CP4 + P2 #1 反映: egui overlay の attach は HUD 経路 → presenter フォールバック
             // 経路の 2 段階で試す。HUD 経路で `NativeEguiOverlay::new` が失敗したら、
@@ -2214,6 +2224,17 @@ impl NativeRenderCore {
                     }
                 }
             }
+
+            let overlay_ms = overlay_t0.elapsed().as_secs_f64() * 1000.0;
+            crate::logger::log(format!(
+                "native-presenter: render core created in {:.1}ms \
+                 (d3d11_device={d3d_ms:.1} shader_pipelines={pipelines_ms:.1} \
+                 swapchain_dcomp={compositor_ms:.1} egui_overlay={overlay_ms:.1}) \
+                 {}x{} epoch={window_epoch}",
+                core_t0.elapsed().as_secs_f64() * 1000.0,
+                config.width,
+                config.height,
+            ));
 
             // Route A — MPO ちらつき修正 (v0.9.2): 動画 visual の真上に完全透明な
             // 全画面カバー visual を常駐させる。presenter HWND の内容が「動画 swap
@@ -5459,6 +5480,10 @@ impl NativeEguiOverlay {
         health: Arc<crate::video::native_window_health::NativeWindowHealth>,
         window_epoch: u64,
     ) -> Result<Self, String> {
+        // 本関数は placement 切替 (F12 の main ⇄ 別ウィンドウ) のたびに丸ごと走る。
+        // wgpu instance / adapter / device と egui の font atlas を毎回作り直すので、
+        // 往復の体感遅延の主因になり得る。どこが支配的かを 1 行で残す (backlog §1.122)。
+        let overlay_t0 = Instant::now();
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::DX12,
             ..Default::default()
@@ -5470,17 +5495,22 @@ impl NativeEguiOverlay {
                 ))
                 .map_err(|e| format!("wgpu CompositionVisual surface: {e:?}"))?
         };
+        let instance_ms = overlay_t0.elapsed().as_secs_f64() * 1000.0;
+        let adapter_t0 = Instant::now();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
             compatible_surface: Some(&surface),
         }))
         .map_err(|e| format!("wgpu request_adapter for DComp overlay: {e:?}"))?;
+        let adapter_ms = adapter_t0.elapsed().as_secs_f64() * 1000.0;
+        let device_t0 = Instant::now();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("mIV native egui overlay"),
             ..Default::default()
         }))
         .map_err(|e| format!("wgpu request_device for DComp overlay: {e:?}"))?;
+        let device_ms = device_t0.elapsed().as_secs_f64() * 1000.0;
         let caps = surface.get_capabilities(&adapter);
         let format = choose_overlay_surface_format(&caps.formats)?;
         let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::AutoVsync) {
@@ -5499,15 +5529,28 @@ impl NativeEguiOverlay {
         } else {
             wgpu::CompositeAlphaMode::Auto
         };
+        let renderer_t0 = Instant::now();
         let renderer =
             egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
+        let renderer_ms = renderer_t0.elapsed().as_secs_f64() * 1000.0;
+        let ctx_t0 = Instant::now();
         let egui_ctx = egui::Context::default();
         crate::ime_focus::install_ime_input_policy(&egui_ctx);
         crate::egui_focus_policy::install_tab_shortcut_focus_policy(&egui_ctx);
         crate::double_click_time::configure_context(&egui_ctx);
         egui_ctx.options_mut(|options| options.zoom_with_keyboard = false);
+        let fonts_t0 = Instant::now();
         configure_overlay_fonts(&egui_ctx, &ui_font);
+        let fonts_ms = fonts_t0.elapsed().as_secs_f64() * 1000.0;
         configure_overlay_style(&egui_ctx, text_contrast);
+        let ctx_ms = ctx_t0.elapsed().as_secs_f64() * 1000.0;
+        crate::logger::log(format!(
+            "native-presenter: egui overlay created in {:.1}ms \
+             (wgpu_instance={instance_ms:.1} adapter={adapter_ms:.1} device={device_ms:.1} \
+             renderer={renderer_ms:.1} egui_ctx={ctx_ms:.1} of_which_fonts={fonts_ms:.1}) \
+             epoch={window_epoch}",
+            overlay_t0.elapsed().as_secs_f64() * 1000.0,
+        ));
         let ui_scale = crate::settings::normalize_ui_scale_factor(ui_scale);
         let pixels_per_point = effective_overlay_pixels_per_point(os_pixels_per_point, ui_scale);
         let this = Self {

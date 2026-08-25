@@ -81,9 +81,16 @@ content、filter、縮小なめらかさ、Anime4K variant、grade の resource 
 state と presenter 側 prepared resource の両方を破棄し、command と App event の source-epoch gate
 も旧 source の request / 成功通知を棄却する。App を往復する `Prepared -> Commit` command は無い。
 
-Anime4K は B1 が GLSL の `//!SAVE` / `//!BIND` から生成した variant topology と WGSL を正本にする。
-build 時に S / M / L / VL / UL の WGSL を Naga で HLSL へ変換し、Windows SDK FXC で全 pixel
-shader を SM5 bytecode 化する。runtime は全67 shader object を pipeline 作成時に bytecode から
+**presenter の shader は全部 build 時に SM5 bytecode 化する。** grade / resample (Lanczos3・
+nearest) の手書き HLSL は [src/video/native_presenter/shaders/](../src/video/native_presenter/shaders/)、
+NIS と Anime4K は WGSL を Naga で HLSL へ変換したものを、いずれも Windows SDK FXC で
+`.cso` にして `include_bytes!` する。runtime は `CreatePixelShader` に bytecode を渡すだけで、
+`D3DCompile` を呼ばない。render core は動画を開くたびと **placement 切替 (F12) のたび**に
+作り直されるので、runtime compile はそのまま体感遅延になる。NIS の pixel shader 1 本で
+実測 2.1 秒あり、F12 往復に約 4.5 秒を足していた (backlog §1.122)。runtime 側で
+`D3DCompile` を復活させないこと。
+
+Anime4K は B1 が GLSL の `//!SAVE` / `//!BIND` から生成した variant topology と WGSL を正本にする。runtime は全67 shader object を pipeline 作成時に bytecode から
 ロードし、選択した1 variant 分だけ source-resolution `RGBA16Float` intermediate を適用準備で
 確保する。候補の確保が全部成功し、その選択での present が成功した後だけ旧 variant の中間画像を
 解放する。各 pass の入力と順番は生成 topology 駆動で、vertex stage は

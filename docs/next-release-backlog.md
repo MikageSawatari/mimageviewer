@@ -1,4 +1,4 @@
-# 次リリース検討バックログ
+﻿# 次リリース検討バックログ
 
 このファイルは、まだ着手していない作業候補だけを置く恒久バックログ。
 完了した項目はコミット履歴・リリースノート・個別設計メモに任せ、このファイルからは削除する。
@@ -1783,33 +1783,117 @@ respawn までを 1 つの修正として扱う:
   この退行を捕まえられなかった。
 - 教訓: **無言の早期 return に理由を型で残してから直した**。事前の推定は
   ClaudeCode / Codex とも `already_requested` か `Loaded` で、**どちらも外れていた** (実際は `Failed`)。
-### 1.122 F12 で動画をメイン ⇄ 別ウィンドウへ往復させると重い — 実機確認中の指摘
+### 1.122 F12 で動画をメイン ⇄ 別ウィンドウへ往復させると重い
 
 - 出典: R2e ②-d の実機 smoke 中の指摘 (2026-08-25)。動作はするが体感でかなり遅い。
 - **既存の問題であることは確認済み**: 利用者が **v3.2.0 と v3.0.0 ポータブル**でも同じだと
   確認した。R2e ブランチ由来ではない。**presenter 本体
   ([src/video/native_presenter/](../src/video/native_presenter/)) は R2e で 1 行も触っていない。**
-- 観測 (`%APPDATA%\mimageviewer\logs\mimageviewer.log`、placement 切替の前後):
 
-  ```
-  GPU path failed (resource pressure, consec=4), dropping frame:
-      GPU resource pressure: shared output pool exhausted waiting for free slot
-  fullscreen presenter summary: presented=129 fps=10.6 gpu=0 cpu=0
-      late_drop=88 max_late_ms=2187.7 max_interval_ms=2520.0
-  [demux] audio packet send waited 20-32ms queue_len_before=64/64   ← 連続
-  [SLOW FRAME] 43-54ms  pre_grid=42-52ms  (selection_info / facet は 1ms 未満)
-  ```
+#### ⚠ 最初にここへ書いたログ根拠は誤りだった (2026-08-25 訂正)
 
-- 読み方: **共有出力プールの枯渇**が起点に見える。placement 切替でサーフェスを作り直す間、
-  旧プールのスロットが解放されずに待たされ、presenter が 10 fps 台まで落ち、
-  late drop が 88 回、最大 2.2 秒遅れる。`[demux] audio packet send waited` が
-  `queue_len_before=64/64` で連続しているのは、consumer 側が引けていないことを示す。
-  UI スレッドの `pre_grid` 43-54ms も同じ窓に重なる。
-- 最初に見る所: placement 切替時のサーフェス再作成とプール返却の順序
-  ([src/video/native_presenter/](../src/video/native_presenter/))。
-  「新しいサーフェスを確保してから古いスロットを返す」形になっていないかを確認する。
-- ⚠ **guard / delay / retry で待ち時間を隠さない**。プール枯渇そのものを直す。
-- 規模 / 優先度: Medium / P2 (機能は動くが体感に直結する)。
+当初この項目には `shared output pool exhausted` / `late_drop=88` / `[demux] audio packet
+send waited` / `[SLOW FRAME]` を根拠として並べていたが、**保存ログを読み直したところ
+別セッションのものだった**。
+
+- 引用元は `mimageviewer.log.bak1` で、**video-strip worktree の dev ビルド**
+  (`ffmpeg DLLs expected at C:\home\mimageviewer-video-strip\target\dev-runtime`) のログ。
+  **F12 の placement 切替は 1 度も含まれていない** (`switch placement request=` が 0 件)。
+- `shared output pool exhausted` は保存ログ全体で **1 回だけ**で、しかも
+  **動画の切替 (idx 41 → 42) の瞬間**。直後に旧 decode スレッドが exit しており、
+  source 切替時の一過性。F12 とは無関係。
+- `[demux] audio packet send waited 20-41ms queue_len_before=64/64` は、同じ区間の
+  presenter summary が `fps=59.1 late_drop=0` の**正常再生中に連続して出ている**。
+  音声キューが先読みで満杯なだけの通常の backpressure で、症状ではない。
+- **F12 往復を含むログは 1 つも残っていない** (該当セッションのログはローテーション済み)。
+
+つまり **§1.122 には現時点で計測根拠が無い**。プールを疑う理由も無くなった。
+
+#### 構造から分かっていること (コードを読んだ結果)
+
+placement 切替は [src/video/mod.rs](../src/video/mod.rs) の `SwitchPlacement` 分岐で処理され、
+**placement が変わる場合は presenter を丸ごと作り直す**。`NativeRenderCore::new`
+([render_core.rs](../src/video/native_presenter/render_core.rs)) が 1 往復ごとに作るもの:
+
+| 段 | 内容 |
+| --- | --- |
+| `d3d11_device` | `D3D11CreateDevice` で**新しい D3D11 デバイス**を作る |
+| `shader_pipelines` | `VideoGradePipeline::new` + `VideoResamplePipeline::new` (Anime4K 含む全 PS を生成) |
+| `swapchain_dcomp` | swapchain + `DCompositionCreateDevice` + visual ツリー + 背景 |
+| `egui_overlay` | `NativeEguiOverlay::new` — **wgpu instance / adapter / device (D3D12) を新規作成**し、 |
+| | `egui::Context` を作って `configure_fonts_with_settings` で**フォントを構成し直す** |
+
+再生スレッドはこの間フレームを出せないので、**体感遅延 = この区間の実時間**。
+「新しいサーフェスを確保してから古いスロットを返す」といった順序の問題ではなく、
+**デバイス級のリソースを往復ごとに作り直していること**が疑わしい。
+
+#### 原因 — 実行時の HLSL コンパイル (確定、修正済み)
+
+保存ログに、presenter を作るたびに同じ区間で **毎回 1.8〜2.5 秒**消えている証拠が 15 回分残っていた
+(`presenter D3D11 device created` → `Anime4K bytecode loaded` の差)。この間にあるのは
+COM cast と `VideoGradePipeline::new` / `VideoResamplePipeline::new` だけ。
+
+単体テストで 7 本の `D3DCompile` を個別に計った結果 (2026-08-25 実測):
+
+| shader | compile |
+| --- | --- |
+| grade `vs_main` | 2.1 ms |
+| grade `ps_main` | 8.0 ms |
+| resample `vs_main` | 1.6 ms |
+| resample `ps_horizontal` | 6.8 ms |
+| resample `ps_vertical` | 6.6 ms |
+| resample `ps_nearest` | 2.6 ms |
+| **NIS `fs_nis`** | **2138.1 ms** |
+| **合計** | **2155.8 ms** |
+
+**NIS の pixel shader 1 本だけで 2.1 秒**。これを `NativeRenderCore::new` の中で毎回
+コンパイルしていたので、**F12 片道 ≈ 2.2 秒 / 往復 ≈ 4.5 秒**の固定費用になっていた。
+同じコストは **動画を最初に開くときにも**払っている (ウィンドウが出るまでの待ち)。
+
+※ 当初疑ったプール枯渇は無関係だった。
+
+#### 修正
+
+**シェーダを全部ビルド時に FXC で DXBC 化する**。Anime4K は最初からこの経路
+(`build.rs` の `find_fxc` / `compile_hlsl_with_fxc`) なので、残りを揃えただけ。
+
+- 手書き HLSL を Rust の文字列リテラルから [src/video/native_presenter/shaders/](../src/video/native_presenter/shaders/)
+  の `.hlsl` へ出し、`build.rs` が FXC で `.cso` にする
+- NIS はすでに `build.rs` が WGSL → HLSL にしていたので、FXC 工程を足すだけ
+- 実行時は `CreatePixelShader` に `include_bytes!` した DXBC を渡すのみ。
+  production 経路から `D3DCompile` が消える (残るのは `#[cfg(test)]` の Anime4K GPU 実測テストのみ)
+- 「この HLSL はコンパイルできる」テストはビルドが保証するので削除し、
+  「実行時に渡す DXBC が実在するか」を見るテストに差し替えた
+  (副次効果: lib テストからも NIS の 2.1 秒が消える)
+
+検証は `nis_draw_writes_target_with_default_d3d11_rasterizer` と
+`anime4k_chain_writes_target_with_native_fullscreen_vertex_shader` (実 GPU で描画して出力を見る) が兼ねる。
+
+#### 残る段 (実機ログ待ち)
+
+計測用のログを 1 切替につき 1 行だけ入れてある:
+
+```
+[native-video] placement switched placement=... total=NNms
+    (host_attach=.. render_core_new=.. prepare=.. publish=.. detach_old=..)
+native-presenter: render core created in NNms
+    (d3d11_device=.. shader_pipelines=.. swapchain_dcomp=.. egui_overlay=..)
+native-presenter: egui overlay created in NNms
+    (wgpu_instance=.. adapter=.. device=.. renderer=.. egui_ctx=.. of_which_fonts=..)
+```
+
+`shader_pipelines` はこの修正で ≈ 0 になるはず。残りで大きいのはおそらく
+`egui_overlay` (**placement 切替のたびに wgpu instance / adapter / device を新規作成し、
+egui の font atlas を作り直している**) と `d3d11_device`。ここを直すなら
+presenter 間でデバイスを共有・再利用する形になるが、**まずは実機ログで残りの内訳を見る**。
+
+end-to-end は `[native-video] switch placement request=N` →
+`[native-video] PlacementSwitched request=N matched pending` のタイムスタンプ差で取れる。
+main → 別ウィンドウは host 生成待ちが挿さるので
+`resume deferred detached placement switch after NNms` も見る。
+
+- ⚠ **guard / delay / retry で待ち時間を隠さない。**
+- 規模 \\ 優先度: Medium / P2 (機能は動くが体感に直結する)。
 
 ### 1.123 スレッド終了中の heap 例外を、例外ハンドラ自身が二次クラッシュで握り潰す — 実機クラッシュ
 

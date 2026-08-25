@@ -5,10 +5,7 @@
 //! least one adjustment is active.
 
 use local_adjust_core::CubeLutParams;
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::{
-    D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob, ID3DInclude,
-};
+use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
     D3D11_BUFFER_DESC, D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_SAMPLER_DESC, D3D11_SUBRESOURCE_DATA,
@@ -20,67 +17,14 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_SAMPLE_DESC,
 };
-use windows::core::{Interface, PCSTR};
+use windows::core::Interface;
 
-const GRADE_SHADER: &[u8] = br#"
-Texture2D<float4> source_tex : register(t0);
-Texture3D<float4> lut_tex : register(t1);
-SamplerState linear_sampler : register(s0);
-
-cbuffer GradeConstants : register(b0) {
-    float4 tone0;       // brightness, contrast, gamma, saturation
-    float4 tone1;       // temperature, black point, white point, midtone
-    float4 domain_min;  // rgb, unused
-    float4 domain_inv;  // rgb, LUT strength
-    float4 lut_coord;   // scale, offset, enabled, unused
-};
-
-struct VsOut {
-    float4 position : SV_Position;
-    float2 uv : TEXCOORD0;
-};
-
-VsOut vs_main(uint vertex_id : SV_VertexID) {
-    VsOut output;
-    float2 uv = float2((vertex_id << 1) & 2, vertex_id & 2);
-    output.position = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
-    output.uv = uv;
-    return output;
-}
-
-float4 ps_main(VsOut input) : SV_Target {
-    float4 sampled = source_tex.SampleLevel(linear_sampler, input.uv, 0.0);
-    float3 color = sampled.rgb;
-
-    float range = max(tone1.z - tone1.y, 1.0 / 255.0);
-    color = pow(saturate((color - tone1.y) / range), 1.0 / max(tone1.w, 0.1));
-    color = pow(saturate(color), 1.0 / max(tone0.z, 0.2));
-
-    float contrast_factor =
-        (259.0 * (tone0.y + 255.0)) / (255.0 * (259.0 - tone0.y));
-    color = (contrast_factor * (color * 255.0 - 128.0)
-        + 128.0 + tone0.x * 2.55) / 255.0;
-
-    if (tone0.w <= -99.999) {
-        color = dot(color, float3(0.299, 0.587, 0.114)).xxx;
-    } else {
-        float lum = (max(color.r, max(color.g, color.b))
-            + min(color.r, min(color.g, color.b))) * 0.5;
-        color = lum.xxx + (color - lum.xxx) * (1.0 + tone0.w / 100.0);
-    }
-    color.r += tone1.x * 0.5 / 255.0;
-    color.b -= tone1.x * 0.5 / 255.0;
-    color = saturate(color);
-
-    if (lut_coord.z > 0.5) {
-        float3 normalized = saturate((color - domain_min.rgb) * domain_inv.rgb);
-        float3 coord = normalized * lut_coord.x + lut_coord.y;
-        float3 graded = lut_tex.SampleLevel(linear_sampler, coord, 0.0).rgb;
-        color = lerp(color, graded, domain_inv.w);
-    }
-    return float4(saturate(color), sampled.a);
-}
-"#;
+/// ビルド時に FXC で DXBC 化した grade シェーダ
+/// ([shaders/video_grade.hlsl](shaders/video_grade.hlsl)、`build.rs` の
+/// `compile_video_presenter_shaders`)。実行時 `D3DCompile` は placement 切替のたびに
+/// 走って体感遅延になっていたので使わない (backlog §1.122)。
+const GRADE_VS_MAIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/video_grade_vs_main.cso"));
+const GRADE_PS_MAIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/video_grade_ps_main.cso"));
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -119,10 +63,8 @@ pub(super) struct VideoGradePipeline {
 
 impl VideoGradePipeline {
     pub(super) fn new(device: &ID3D11Device1) -> Result<Self, String> {
-        let vertex_blob = compile_shader("vs_main", "vs_5_0")?;
-        let pixel_blob = compile_shader("ps_main", "ps_5_0")?;
-        let vertex_bytes = blob_bytes(&vertex_blob);
-        let pixel_bytes = blob_bytes(&pixel_blob);
+        let vertex_bytes = GRADE_VS_MAIN;
+        let pixel_bytes = GRADE_PS_MAIN;
         let mut vertex_shader = None;
         let mut pixel_shader = None;
         let mut sampler = None;
@@ -428,49 +370,6 @@ impl VideoGradePipeline {
     }
 }
 
-fn compile_shader(entry: &'static str, target: &'static str) -> Result<ID3DBlob, String> {
-    let mut bytecode = None;
-    let mut errors = None;
-    let entry = std::ffi::CString::new(entry).expect("static shader entry");
-    let target = std::ffi::CString::new(target).expect("static shader target");
-    let result = unsafe {
-        D3DCompile(
-            GRADE_SHADER.as_ptr().cast(),
-            GRADE_SHADER.len(),
-            PCSTR::null(),
-            None,
-            None::<&ID3DInclude>,
-            PCSTR(entry.as_ptr().cast()),
-            PCSTR(target.as_ptr().cast()),
-            0,
-            0,
-            &mut bytecode,
-            Some(&mut errors),
-        )
-    };
-    if let Err(error) = result {
-        let details = errors
-            .as_ref()
-            .map(blob_string)
-            .filter(|message| !message.trim().is_empty())
-            .unwrap_or_else(|| format!("{error:?}"));
-        return Err(format!("D3DCompile {entry:?}/{target:?}: {details}"));
-    }
-    bytecode.ok_or_else(|| "D3DCompile returned null bytecode".to_string())
-}
-
-fn blob_bytes(blob: &ID3DBlob) -> &[u8] {
-    unsafe {
-        std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
-    }
-}
-
-fn blob_string(blob: &ID3DBlob) -> String {
-    String::from_utf8_lossy(blob_bytes(blob))
-        .trim_end_matches('\0')
-        .to_string()
-}
-
 fn create_shader_view<T: Interface>(
     device: &ID3D11Device1,
     texture: &T,
@@ -528,9 +427,20 @@ fn create_lut_texture(
 mod tests {
     use super::*;
 
+    /// grade シェーダがビルド時に DXBC 化されていること。
+    ///
+    /// 以前はここで `D3DCompile` を呼んで「HLSL が通る」ことを確かめていたが、
+    /// コンパイルは `build.rs` の仕事になった (通らなければビルドが落ちる)。
+    /// 実行時にやることは `CreatePixelShader` に**中身のある DXBC** を渡すことだけなので、
+    /// 検査もそこに合わせる。
     #[test]
-    fn grade_hlsl_compiles_for_shader_model_5() {
-        compile_shader("vs_main", "vs_5_0").expect("vertex shader");
-        compile_shader("ps_main", "ps_5_0").expect("pixel shader");
+    fn grade_shaders_are_precompiled_dxbc() {
+        for (label, bytecode) in [("vs_main", GRADE_VS_MAIN), ("ps_main", GRADE_PS_MAIN)] {
+            assert!(
+                bytecode.len() > 4 && &bytecode[..4] == b"DXBC",
+                "{label} is not DXBC bytecode (len={})",
+                bytecode.len()
+            );
+        }
     }
 }
