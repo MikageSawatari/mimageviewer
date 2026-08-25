@@ -1783,7 +1783,7 @@ respawn までを 1 つの修正として扱う:
   この退行を捕まえられなかった。
 - 教訓: **無言の早期 return に理由を型で残してから直した**。事前の推定は
   ClaudeCode / Codex とも `already_requested` か `Loaded` で、**どちらも外れていた** (実際は `Failed`)。
-### 1.122 F12 で動画をメイン ⇄ 別ウィンドウへ往復させると重い
+### 1.122 F12 で動画をメイン ⇄ 別ウィンドウへ往復させると重い ✅ 主因は修正済み (2026-08-25、実機確認済み)
 
 - 出典: R2e ②-d の実機 smoke 中の指摘 (2026-08-25)。動作はするが体感でかなり遅い。
 - **既存の問題であることは確認済み**: 利用者が **v3.2.0 と v3.0.0 ポータブル**でも同じだと
@@ -1869,31 +1869,40 @@ COM cast と `VideoGradePipeline::new` / `VideoResamplePipeline::new` だけ。
 検証は `nis_draw_writes_target_with_default_d3d11_rasterizer` と
 `anime4k_chain_writes_target_with_native_fullscreen_vertex_shader` (実 GPU で描画して出力を見る) が兼ねる。
 
-#### 残る段 (実機ログ待ち)
+#### 実機確認済み (2026-08-25)。残りの内訳
 
-計測用のログを 1 切替につき 1 行だけ入れてある:
+`shader_pipelines` は **2156ms → 2.8〜5.7ms**。往復 **≈ 5.2 秒 → ≈ 0.95 秒**。
+利用者確認でも「速くなりました」。以下は実機ログの実測値:
 
-```
-[native-video] placement switched placement=... total=NNms
-    (host_attach=.. render_core_new=.. prepare=.. publish=.. detach_old=..)
-native-presenter: render core created in NNms
-    (d3d11_device=.. shader_pipelines=.. swapchain_dcomp=.. egui_overlay=..)
-native-presenter: egui overlay created in NNms
-    (wgpu_instance=.. adapter=.. device=.. renderer=.. egui_ctx=.. of_which_fonts=..)
-```
+| 段 | main → 別ウィンドウ | 別ウィンドウ → main |
+| --- | --- | --- |
+| **total** | **234〜252ms** | **590〜722ms** |
+| `host_attach` | 2〜10ms | 45〜48ms |
+| `render_core_new` | 166〜176ms | 184〜187ms |
+| `prepare` | 17〜26ms | 18〜19ms |
+| **`publish`** | 7〜10ms | **289〜424ms** |
+| `detach_old` | ≈ 5ms | ≈ 5ms |
 
-`shader_pipelines` はこの修正で ≈ 0 になるはず。残りで大きいのはおそらく
-`egui_overlay` (**placement 切替のたびに wgpu instance / adapter / device を新規作成し、
-egui の font atlas を作り直している**) と `d3d11_device`。ここを直すなら
-presenter 間でデバイスを共有・再利用する形になるが、**まずは実機ログで残りの内訳を見る**。
+`render_core_new` の内訳: `d3d11_device` 27〜31ms / `shader_pipelines` 2.8〜5.7ms /
+`swapchain_dcomp` 4〜5ms / **`egui_overlay` 116〜139ms**。
+`egui_overlay` の内訳: `wgpu_instance` 0.3〜0.7ms / `adapter` 1.7〜2.2ms /
+**`device` 64〜72ms** (wgpu `request_device`) / `renderer` 9.5〜11ms / `egui_ctx` 0.0ms。
 
-end-to-end は `[native-video] switch placement request=N` →
-`[native-video] PlacementSwitched request=N matched pending` のタイムスタンプ差で取れる。
-main → 別ウィンドウは host 生成待ちが挿さるので
-`resume deferred detached placement switch after NNms` も見る。
+⚠ **フォントは無関係だった** (`of_which_fonts=0.0`)。egui の font atlas は初回描画時に
+遅延構築されるので、`configure_fonts_with_settings` 自体は払っていない。
+事前に疑っていたので記録する — 測らなければここを直しに行っていた。
+
+**残りをやるなら優先順は:**
+
+1. **`publish` (289〜424ms、main へ戻る向きだけ)** — 往復の約 4 割。
+   `window_pump.target_ready` → `wait_for_native_window_published` の待ち。main 方向だけ
+   40 倍遅い理由を先に特定する (非対称なので原因があるはず)
+2. **`egui_overlay` (116〜139ms × 2)** — 切替のたびに wgpu device を新規作成している
+   (`request_device` 64〜72ms)。presenter 間で device を共有できるかを見る
+3. `d3d11_device` (27〜31ms × 2) — 同じく共有候補
 
 - ⚠ **guard / delay / retry で待ち時間を隠さない。**
-- 規模 \\ 優先度: Medium / P2 (機能は動くが体感に直結する)。
+- 規模 \\ 優先度: Medium / P3 (主因は取れた。残りは体感上実用域)。
 
 ### 1.123 スレッド終了中の heap 例外を、例外ハンドラ自身が二次クラッシュで握り潰す — 実機クラッシュ
 
@@ -1940,6 +1949,42 @@ main → 別ウィンドウは host 生成待ちが挿さるので
   `_NT_GLOBAL_FLAG` の heap tail checking を有効にして再現すると、壊した側が特定できる。
   ダンプは `C:\Users\<user>\AppData\Local\CrashDumps\` に残る (今回は 59.6 GB)。
 - 規模 / 優先度: Small (B) / Medium (A)。**P2** — 通常操作 (タグ付け → フォルダ移動) で落ちた。
+
+### 1.124 F12 を連打すると実際の押下が破棄される — stale 判定が早押しの本物を弾いている
+
+- 出典: 2026-08-25、§1.122 修正後の実機確認。別ウィンドウから F12 で main へ戻るとき、
+  **連打すると最初の何回かが無反応**。**§1.122 とは別の既存不具合**。
+- ログにそのまま残っている (`mimageviewer.log`):
+
+  ```
+  30.274  PlacementSwitched request=12 applied DetachedWindow generation=9   ← 切替完了
+  30.663  ignore stale native F12 toggle: os_down=false presentation=DetachedWindow
+  30.906  ignore stale native F12 toggle: os_down=false presentation=DetachedWindow
+  31.203  ignore stale native F12 toggle: os_down=false presentation=DetachedWindow
+  32.093  switch placement request=13 -> target=MainWindow                   ← 4 回目でやっと反応
+  ```
+
+  切替完了の **390ms 後から** 240〜300ms 間隔で 3 回。rebuild 直後に 1 回だけ来る
+  stale 再配送ではなく、**人間の連打そのもの**。1 セッションで 7 件、
+  うち 6 件が `presentation=DetachedWindow` (= 利用者の報告と一致)。
+- 原因: [native_video.rs](../src/app/native_video.rs) の F12 arm が
+  `native_video_key_physically_down()` で **「今この瞬間キーが物理的に押されているか」**を
+  `GetAsyncKeyState` に聞いている。これは「この event は rebuild の再配送か」の
+  **代用判定**でしかない。presenter の wndproc が WM_KEYDOWN を拾ってから App が
+  event を引くまでの遅延よりも押下時間が短いと、**本物の押下も同じく false になる**。
+  早押しと stale 再配送をこの検査では区別できない。
+- §1.122 で切替が速くなった分、連打しやすくなって顔を出しやすくなっている
+  (利用者も「前からかもしれない」と報告)。
+- 直し方の形: **タイミングの代用判定をやめ、event の identity で判定する**。
+  同じ enum の `CloseRequested { generation }` はすでにその形で
+  (`accept_native_video_close` が generation を検査する)。`KeyDown` にも presenter
+  generation を乗せ、受け入れ済みの generation と不一致なら弾く。そうすれば
+  物理キー問い合わせは不要になる。
+- ⚠ **guard の閉値を緩める (例: 押下後 N ms は通す) のは同じ代用判定を延命させるだけ**。
+- ⚠ detached 述語に触れるので、着手前に
+  [detached-rework-plan.md](detached-rework-plan.md) §2 の手続き (構造修正であることの
+  ClaudeCode / Codex 双方の合意 + プランへの記録) を通すこと。
+- 規模 \\ 優先度: Small〜Medium / P3 (利用者は「仕様としても差し支えないレベル」と評価)。
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 
