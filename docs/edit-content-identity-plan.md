@@ -124,6 +124,19 @@ CREATE TABLE restore_declined (
 > これにより hash cache 行が次回検出を抑止せず、A1 が後から同じ行を記録すれば再 hash なしで
 > `1` へ昇格する。
 >
+> **flag は「操作」で立ち、「実データ」で下りる (2026-08-25)**。`Edit` の record は編集を
+> 取り消す経路 (マスク削除 / trim override 削除 / 標準値と同じで破棄された補正) も通るため、
+> 実データが 1 行も無い file_key が復元元として残り、中身が同じコピーを開くたびに確認が出る。
+> 記録側で全ての取り消し経路を数え上げて `0` を書く形にはしない (1 つ漏らすと本物の復元元を
+> 消す)。代わりに、候補が出た時点で
+> [`rename_key_migration::ledger_keys_with_restorable_rows_at`](../src/rename_key_migration.rs) が
+> **復元が実際に運ぶ `STORES` の unique 行**を引き、1 行も無い復元元を候補から外して flag も
+> 下ろす (`clear_restorable_if_unchanged`、`last_edit_at` 一致の compare-and-swap)。
+> 運ぶ行が無い復元元は選ばれても no-op なので、外しても失われるものは無い。台帳自身
+> (`content_identity.db`) は `STORES` に載っているが**この数え上げからは除外する**
+> (`content_identity::LEDGER_DB_FILE`) — 台帳の行はこの問いの対象であって答えではない。
+> 仮想ページの `<container>::<entry>` も対象。読めない store があった key は「行がある」側へ倒す。
+>
 > **A4 schema migration (2026-08-22)**: 未リリース store でも A1 build を実データで動かした
 > 開発環境には旧 schema が残るため、schema 作成と upgrade は 1 関数へ集約し、
 > `PRAGMA user_version` で管理する。unversioned A1 table に
