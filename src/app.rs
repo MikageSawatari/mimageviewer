@@ -701,11 +701,11 @@ impl DetachedImageWindowSnapshot {
     pub(crate) fn can_activate(&self) -> bool {
         self.reopen_descriptor.is_some()
             || self.reopen_sync_stamp.is_some()
-            || self.paused_bundle.is_some()
+            || self.viewer_context_is_at_rest()
     }
 
     #[cfg(windows)]
-    pub(crate) fn has_paused_bundle(&self) -> bool {
+    pub(crate) fn viewer_context_is_at_rest(&self) -> bool {
         self.paused_bundle.is_some()
     }
 
@@ -2026,7 +2026,7 @@ impl App {
             "deferred_activate_commit frame={frame} id={id} before_active_dispatch=true \
              passive_windows={} active_context={}",
             self.detached_image_windows.len(),
-            self.active_detached_viewer_context_present()
+            self.active_detached_context_is_at_rest()
         ));
         if self.activate_detached_image_window_snapshot(ctx, id) {
             if let Some(command) = dispatch.command {
@@ -2061,7 +2061,7 @@ impl App {
                 "deferred_activate_commit_succeeded frame={frame} id={id} \
                  passive_windows={} active_context={} session={:?}",
                 self.detached_image_windows.len(),
-                self.active_detached_viewer_context_present(),
+                self.active_detached_context_is_at_rest(),
                 self.active_detached_session
             ));
             true
@@ -2071,7 +2071,7 @@ impl App {
                 "deferred_activate_commit_failed frame={frame} id={id} \
                  passive_windows={} active_context={}",
                 self.detached_image_windows.len(),
-                self.active_detached_viewer_context_present()
+                self.active_detached_context_is_at_rest()
             ));
             false
         }
@@ -34867,8 +34867,7 @@ impl App {
                 }
 
                 let base_placement = self.active_detached_viewer_current_placement();
-                let had_active_detached = self.active_detached_viewer_context.is_some()
-                    || self.viewer_session_is_detached();
+                let had_active_detached = self.active_detached_context_exists();
                 if !self.park_and_close_current_active_detached_viewer(ctx) {
                     return None;
                 }
@@ -36448,7 +36447,7 @@ impl App {
 
     pub(crate) fn viewer_session_is_detached_or_switching(&self) -> bool {
         #[cfg(windows)]
-        if self.active_detached_viewer_context.is_some() {
+        if self.active_detached_context_is_at_rest() {
             return true;
         }
         self.current_viewer_session_is_detached_or_switching()
@@ -36572,9 +36571,7 @@ impl App {
 
     #[cfg(windows)]
     fn active_detached_viewer_has_foreground(&self) -> bool {
-        if !self.viewer_session_is_detached_or_switching()
-            && self.active_detached_viewer_context.is_none()
-        {
+        if !self.viewer_session_is_detached_or_switching() {
             return false;
         }
         let Some(hwnd) = self.detached_viewer_host_hwnd_alive() else {
@@ -36624,7 +36621,7 @@ impl App {
                 self.main_font_atlas_resync_repeats_left,
                 self.detached_font_atlas_resync_should_wait(),
                 self.detached_cleanup_font_atlas_resync_is_safe(),
-                self.active_detached_viewer_context.is_some(),
+                self.active_detached_context_debug_state(),
                 self.active_detached_session,
                 self.fullscreen_idx,
                 self.viewer_presentation,
@@ -36662,7 +36659,7 @@ impl App {
                 self.pending_detached_cleanup_font_atlas_resync,
                 self.detached_font_atlas_resync_should_wait(),
                 self.detached_cleanup_font_atlas_resync_is_safe(),
-                self.active_detached_viewer_context.is_some(),
+                self.active_detached_context_debug_state(),
                 self.active_detached_session,
                 self.fullscreen_idx,
                 self.viewer_presentation,
@@ -36744,7 +36741,7 @@ impl App {
             safety.cloak_or_backdrop_active,
             safety.opening_count,
             safety.closing_count,
-            self.active_detached_viewer_context.is_some(),
+            self.active_detached_context_debug_state(),
             self.active_detached_session,
             self.fullscreen_idx,
             self.viewer_presentation,
@@ -36818,7 +36815,7 @@ impl App {
                     "font_resync_deferred_detached_alive active_context={} session={:?} \
                  fullscreen_idx={:?} presentation={:?} fs_shown={} passive_windows={} \
                  reason={reason} placement_pending={} cloak_or_backdrop={} opening={} closing={}",
-                    self.active_detached_viewer_context.is_some(),
+                    self.active_detached_context_debug_state(),
                     self.active_detached_session,
                     self.fullscreen_idx,
                     self.viewer_presentation,
@@ -36871,7 +36868,7 @@ impl App {
                     self.fs_viewport_presentation,
                     self.fs_viewport_shown,
                     self.detached_image_windows.len(),
-                    self.active_detached_viewer_context.is_some(),
+                    self.active_detached_context_debug_state(),
                     self.active_detached_session
                 ));
             }
@@ -37668,7 +37665,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
     ) -> bool {
-        let had_detached = self.active_detached_viewer_context.is_some()
+        let had_detached = self.active_detached_context_is_at_rest()
             || self.active_detached_session.is_some()
             || self.viewer_session_is_detached_or_switching()
             || self.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow)
@@ -37684,7 +37681,7 @@ impl App {
         self.log_detached_image_window_debug(format!(
             "mode_change_close_all begin active_context={} session={:?} fs_idx={:?} \
              presentation={:?} shown={} passive_windows={} runtimes={} pending_host_switch={}",
-            self.active_detached_viewer_context.is_some(),
+            self.active_detached_context_debug_state(),
             self.active_detached_session,
             self.fullscreen_idx,
             self.viewer_presentation,
@@ -37707,7 +37704,7 @@ impl App {
                 egui::ViewportCommand::Close,
             );
         }
-        if self.active_detached_viewer_context.is_some() {
+        if self.active_detached_context_is_at_rest() {
             let _ = self.close_current_active_detached_viewer_context(ctx);
         }
 
@@ -37808,7 +37805,7 @@ impl App {
         self.log_detached_image_window_debug(format!(
             "mode_change_close_all end active_context={} session={:?} fs_idx={:?} \
              presentation={:?} shown={} passive_windows={} runtimes={}",
-            self.active_detached_viewer_context.is_some(),
+            self.active_detached_context_debug_state(),
             self.active_detached_session,
             self.fullscreen_idx,
             self.viewer_presentation,
@@ -37863,7 +37860,7 @@ impl App {
                 || self.viewer_session_is_detached_or_switching()
                 || self.pending_detached_video_host_switch.is_some()
                 || self.native_video_mode_switch.is_some()
-                || self.active_detached_viewer_context.is_some()
+                || self.active_detached_context_is_at_rest()
                 || !self.detached_image_windows.is_empty())
     }
 
@@ -37883,7 +37880,7 @@ impl App {
             self.fs_viewport_shown,
             self.fs_viewport_presentation,
             self.active_detached_session,
-            self.active_detached_viewer_context.is_some(),
+            self.active_detached_context_debug_state(),
             self.detached_image_windows.len(),
             self.native_video_fullscreen_active_for_main_backdrop(),
             self.native_video_main_cloaked,
@@ -38146,8 +38143,31 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn active_detached_viewer_context_present(&self) -> bool {
+    pub(crate) fn active_detached_context_is_at_rest(&self) -> bool {
         self.active_detached_viewer_context.is_some()
+    }
+
+    #[cfg(windows)]
+    fn active_detached_context_exists(&self) -> bool {
+        self.active_detached_context_is_at_rest() || self.viewer_session_is_detached()
+    }
+
+    #[cfg(windows)]
+    fn mounted_projection_owns_active_detached_session(&self) -> bool {
+        // R2e-2d-pre only names this legacy residence stopgap. Stage 2-d replaces it with
+        // ContextResidence::Mounted; holder absence alone does not prove that a session exists.
+        !self.active_detached_context_is_at_rest()
+    }
+
+    #[cfg(windows)]
+    fn active_detached_context_debug_state(&self) -> bool {
+        self.active_detached_context_is_at_rest()
+    }
+
+    #[cfg(windows)]
+    fn detached_viewer_host_owns_surface(&self) -> bool {
+        matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow)
+            || self.active_detached_context_is_at_rest()
     }
 
     #[cfg(windows)]
@@ -39150,7 +39170,7 @@ impl App {
         self.ensure_detached_window_runtime_placement(id, "parked_live_activate_begin");
         self.log_detached_image_window_debug(format!(
             "parked_live_activate_begin id={id} pos={pos} active_context={} session={:?}",
-            self.active_detached_viewer_context.is_some(),
+            self.active_detached_context_debug_state(),
             self.active_detached_session
         ));
         self.clear_fullscreen_feedback_for_viewer_switch();
@@ -39314,10 +39334,10 @@ impl App {
             ));
             return;
         }
-        if self.active_detached_viewer_context.is_some() || self.fullscreen_idx.is_some() {
+        if self.active_detached_context_is_at_rest() || self.fullscreen_idx.is_some() {
             self.log_detached_image_window_debug(format!(
                 "main_focus_after_close_skipped reason={reason} active_context={} fs_idx={:?}",
-                self.active_detached_viewer_context.is_some(),
+                self.active_detached_context_debug_state(),
                 self.fullscreen_idx
             ));
             return;
@@ -39395,7 +39415,7 @@ impl App {
                 "park_current_active_detached result=parked_live_active_context passive_windows={} \
                  active_context={} session={:?}",
                 self.detached_image_windows.len(),
-                self.active_detached_viewer_context.is_some(),
+                self.active_detached_context_debug_state(),
                 self.active_detached_session
             ));
             return true;
@@ -39408,7 +39428,7 @@ impl App {
                 "park_current_active_detached result=parked_live_legacy passive_windows={} \
                  active_context={} session={:?}",
                 self.detached_image_windows.len(),
-                self.active_detached_viewer_context.is_some(),
+                self.active_detached_context_debug_state(),
                 self.active_detached_session
             ));
             return true;
@@ -39418,11 +39438,11 @@ impl App {
                 "park_current_active_detached result=paused passive_windows={} \
                  active_context={} session={:?}",
                 self.detached_image_windows.len(),
-                self.active_detached_viewer_context.is_some(),
+                self.active_detached_context_debug_state(),
                 self.active_detached_session
             ));
             return true;
-        } else if self.active_detached_viewer_context.is_some() {
+        } else if self.active_detached_context_is_at_rest() {
             self.log_detached_image_window_debug(
                 "park_current_active_detached result=close_active_context".to_string(),
             );
@@ -39480,7 +39500,7 @@ impl App {
             self.close_fullscreen();
             return true;
         }
-        self.active_detached_viewer_context.is_none()
+        !self.active_detached_context_is_at_rest()
     }
 
     #[cfg(windows)]
@@ -39907,8 +39927,7 @@ impl App {
         };
 
         let base_placement = self.active_detached_viewer_current_placement();
-        let had_active_detached =
-            self.active_detached_viewer_context.is_some() || self.viewer_session_is_detached();
+        let had_active_detached = self.active_detached_context_exists();
         if !self.park_and_close_current_active_detached_viewer(ctx) {
             return false;
         }
@@ -39934,8 +39953,7 @@ impl App {
             return DetachedGridArchiveOpenOutcome::Cancelled("archive_detached_completion_stale");
         }
         let base_placement = self.active_detached_viewer_current_placement();
-        let had_active_detached =
-            self.active_detached_viewer_context.is_some() || self.viewer_session_is_detached();
+        let had_active_detached = self.active_detached_context_exists();
         if !self.park_and_close_current_active_detached_viewer(ctx) {
             return DetachedGridArchiveOpenOutcome::Failed;
         }
@@ -40002,8 +40020,7 @@ impl App {
             }
         };
         let base_placement = self.active_detached_viewer_current_placement();
-        let had_active_detached =
-            self.active_detached_viewer_context.is_some() || self.viewer_session_is_detached();
+        let had_active_detached = self.active_detached_context_exists();
         if !self.park_and_close_current_active_detached_viewer(ctx) {
             self.bookmark_open_pending =
                 Some(crate::bookmark_browser::PendingBookmarkOpen::Book(pending));
@@ -40052,11 +40069,11 @@ impl App {
         self.log_detached_image_window_debug(format!(
             "passive_activate_begin id={id} pos={pos} has_paused_bundle={} \
              descriptor={} stamp={} passive_remaining={} active_context={} session={:?}",
-            snapshot.paused_bundle.is_some(),
+            snapshot.viewer_context_is_at_rest(),
             Self::detached_viewer_descriptor_debug_kind(&snapshot.reopen_descriptor),
             snapshot.reopen_sync_stamp.is_some(),
             self.detached_image_windows.len(),
-            self.active_detached_viewer_context.is_some(),
+            self.active_detached_context_debug_state(),
             self.active_detached_session
         ));
         self.clear_fullscreen_feedback_for_viewer_switch();
@@ -40181,7 +40198,7 @@ impl App {
                 "passive_activate_still_committed id={} active_context={} fs_idx={:?} \
                  independent={} session={:?}",
                 activate_window_id,
-                self.active_detached_viewer_context.is_some(),
+                self.active_detached_context_debug_state(),
                 self.fullscreen_idx,
                 self.detached_viewer_independent_active,
                 self.active_detached_session
@@ -40352,7 +40369,7 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn update_active_detached_viewer_context(&mut self, ctx: &egui::Context) -> bool {
-        if self.active_detached_viewer_context.is_none() {
+        if !self.active_detached_context_is_at_rest() {
             return false;
         }
 
@@ -40936,7 +40953,7 @@ impl App {
     /// materialized source が一致し、仮想 surface flag がすべて落ちた場合にだけ使う。
     #[cfg(windows)]
     fn route_materialized_physical_still_open_to_active_context(&mut self, idx: usize) -> bool {
-        if self.active_detached_viewer_context.is_some()
+        if self.active_detached_context_is_at_rest()
             || !matches!(self.navigation_scope, ViewerNavigationScope::Main)
             || self.detached_viewer_main_history_suppression_depth != 0
             || self.fullscreen_idx.is_some()
@@ -41105,7 +41122,7 @@ impl App {
                 self.fullscreen_idx,
                 self.viewer_session_is_detached(),
                 self.detached_viewer_independent_active,
-                self.active_detached_viewer_context.is_some(),
+                self.active_detached_context_debug_state(),
                 self.detached_viewer_window_id,
                 self.detached_image_windows.len(),
                 self.fs_nav_is_locked()
@@ -41123,7 +41140,7 @@ impl App {
             self.fullscreen_idx,
             self.detached_viewer_window_id,
             self.detached_image_windows.len(),
-            self.active_detached_viewer_context.is_some(),
+            self.active_detached_context_debug_state(),
             self.active_detached_session
         ));
         if parked {
@@ -41157,7 +41174,7 @@ impl App {
         let Some(idx) = self.fullscreen_idx else {
             return false;
         };
-        self.active_detached_viewer_context.is_none()
+        self.mounted_projection_owns_active_detached_session()
             // Tray residency keeps both committed detached sessions and an in-flight switch to
             // detached alive. A main-context refresh must use that same lifecycle predicate before
             // replacing `items`, otherwise `start_loading_items` falls through to
@@ -41290,7 +41307,7 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn detached_independent_session_blocks_folder_nav(&self) -> bool {
-        if self.active_detached_viewer_context.is_some() {
+        if self.active_detached_context_is_at_rest() {
             return true;
         }
         if self.detached_viewer_independent_session() {
@@ -41321,7 +41338,7 @@ impl App {
         if self.detached_viewer_independent_still_session() {
             return Some("独立した別ウィンドウでは、画像編集機能は利用できません");
         }
-        if self.active_detached_viewer_context.is_some() {
+        if self.active_detached_context_is_at_rest() {
             return Some("切り離した別ウィンドウでは、画像編集機能は利用できません");
         }
         None
@@ -41662,7 +41679,7 @@ impl App {
             self.fullscreen_idx,
             // `with_active_detached_viewer_context` takes the context out for the span it is
             // mounted, so `is_none()` is what means App state currently *is* the viewer's.
-            self.active_detached_viewer_context.is_none(),
+            !self.active_detached_context_debug_state(),
             self.active_detached_session
                 .map(|session| session.window_id),
         ));
@@ -42531,7 +42548,7 @@ impl App {
             "park_active_context_for_grid_open begin active_context={} session={:?} \
              fs_idx={:?} presentation={:?} window_id={:?} independent={} \
              passive_windows={}",
-            self.active_detached_viewer_context.is_some(),
+            self.active_detached_context_debug_state(),
             self.active_detached_session,
             self.fullscreen_idx,
             self.viewer_presentation,
@@ -42539,13 +42556,13 @@ impl App {
             self.detached_viewer_independent_active,
             self.detached_image_windows.len()
         ));
-        if self.active_detached_viewer_context.is_some() {
+        if self.active_detached_context_is_at_rest() {
             let ok = self.park_and_close_current_active_detached_viewer(ctx);
             self.log_detached_image_window_debug(format!(
                 "park_active_context_for_grid_open result={ok} passive_windows={} \
                  active_context={} session={:?}",
                 self.detached_image_windows.len(),
-                self.active_detached_viewer_context.is_some(),
+                self.active_detached_context_debug_state(),
                 self.active_detached_session
             ));
             return ok;
@@ -42675,7 +42692,7 @@ impl App {
             .enumerate()
             .filter_map(|(pos, window)| {
                 let runtime = self.detached_window_manager.runtime(window.id)?;
-                (window.paused_bundle.is_none()
+                (!window.viewer_context_is_at_rest()
                     && runtime.linked
                     && runtime.state == DetachedWindowState::Parked)
                     .then_some((pos, window.id))
@@ -42741,7 +42758,7 @@ impl App {
             self.settings.detached_viewer_open_images_in_window,
             self.detached_viewer_open_next_still_detached_once,
             self.fs_open_intent_from_grid,
-            self.active_detached_viewer_context.is_some(),
+            self.active_detached_context_debug_state(),
             self.active_detached_session,
             self.detached_viewer_window_id,
             self.detached_viewer_independent_active,
@@ -42755,7 +42772,7 @@ impl App {
             let id = self.ensure_detached_viewer_window_id();
             // keep-alive: detached を開いた = セッション開始 (§3.7 set)。book context が
             // あれば Book、なければ Image。folder-nav reopen でも同じ window_id で据え置く。
-            let source = if self.active_detached_viewer_context_present() {
+            let source = if self.active_detached_context_is_at_rest() {
                 DetachedSource::Book
             } else {
                 self.detached_source_for_idx(idx)
@@ -42769,7 +42786,8 @@ impl App {
             // これは **メイン context 側** の open であり、active detached session の所有者ではない。
             // その session を畳むと、独立 PDF などの別ウィンドウ context が main 側の
             // ページ切替に巻き込まれ、同じ ViewportId / bundle が混線する。
-            let owns_active_detached_session = self.active_detached_viewer_context.is_none();
+            let owns_active_detached_session =
+                self.mounted_projection_owns_active_detached_session();
             if owns_active_detached_session && self.active_detached_session.is_some() {
                 self.begin_active_detached_session_close("open_non_detached");
                 self.finish_active_detached_session_close("open_non_detached");
@@ -59154,7 +59172,7 @@ impl App {
             self.settings.detached_viewer_enabled,
             self.fullscreen_idx,
             self.viewer_presentation,
-            self.active_detached_viewer_context.is_some(),
+            self.active_detached_context_debug_state(),
             self.active_detached_session,
             self.detached_viewer_window_id,
             self.detached_viewer_independent_active,
@@ -59273,7 +59291,7 @@ impl App {
                 self.settings.detached_viewer_enabled,
                 self.fullscreen_idx,
                 self.viewer_presentation,
-                self.active_detached_viewer_context.is_some(),
+                self.active_detached_context_debug_state(),
                 self.active_detached_session,
                 self.detached_viewer_window_id,
                 self.detached_viewer_independent_active,

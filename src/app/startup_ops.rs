@@ -512,8 +512,7 @@ impl App {
             }
         };
         let base_placement = self.active_detached_viewer_current_placement();
-        let had_active_detached =
-            self.active_detached_viewer_context.is_some() || self.viewer_session_is_detached();
+        let had_active_detached = self.active_detached_context_exists();
         if !self.park_and_close_current_active_detached_viewer(ctx) {
             self.bookmark_open_pending =
                 Some(crate::bookmark_browser::PendingBookmarkOpen::Book(pending));

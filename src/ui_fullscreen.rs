@@ -11351,7 +11351,7 @@ impl App {
                         window.activation_armed,
                         window.activation_ready_frame,
                         self.frame_counter,
-                        window.has_paused_bundle(),
+                        window.viewer_context_is_at_rest(),
                         window.reopen_descriptor.is_some(),
                         window.reopen_sync_stamp.is_some()
                     ));
@@ -11644,14 +11644,14 @@ impl App {
                 self.log_detached_image_window_debug(format!(
                     "passive_activate_committed id={id} passive_windows={} active_context={}",
                     self.detached_image_windows.len(),
-                    self.active_detached_viewer_context_present()
+                    self.active_detached_context_is_at_rest()
                 ));
                 break;
             } else {
                 self.log_detached_image_window_debug(format!(
                     "passive_activate_failed id={id} passive_windows={} active_context={}",
                     self.detached_image_windows.len(),
-                    self.active_detached_viewer_context_present()
+                    self.active_detached_context_is_at_rest()
                 ));
             }
         }
@@ -11789,7 +11789,7 @@ impl App {
             self.log_detached_image_window_debug(format!(
                 "pending_close ids={pending_close_ids:?} passive_windows={} active_context={}",
                 self.detached_image_windows.len(),
-                self.active_detached_viewer_context_present()
+                self.active_detached_context_is_at_rest()
             ));
             crate::dwm_transitions::disable_transitions_for_thread_windows();
         }
@@ -11818,7 +11818,7 @@ impl App {
                     self.frame_counter,
                     window.id,
                     window.can_activate(),
-                    window.has_paused_bundle(),
+                    window.viewer_context_is_at_rest(),
                     window.reopen_descriptor.is_some(),
                     window.reopen_sync_stamp.is_some(),
                     window.texture.size_vec2().x,
@@ -12207,7 +12207,7 @@ impl App {
                 .detached_image_windows
                 .iter()
                 .find(|candidate| candidate.id == window.id)
-                .is_some_and(|candidate| candidate.has_paused_bundle());
+                .is_some_and(|candidate| candidate.viewer_context_is_at_rest());
             let focus_activation_raw = focused_now && !window.focused_last_frame;
             let user_activation = primary_released;
             let focus_edge = focused_now != window.focused_last_frame;
@@ -12281,7 +12281,7 @@ impl App {
                     "passive_activate_queued id={} via=pointer passive_windows={} active_context={}",
                     window.id,
                     self.detached_image_windows.len(),
-                    self.active_detached_viewer_context_present()
+                    self.active_detached_context_is_at_rest()
                 ));
                 render_batch.activate_ids.push(window.id);
             }
@@ -13153,7 +13153,7 @@ impl App {
         // `with_active_detached_viewer_context` have the owner mounted directly on `App`. The
         // alive/session checks above are the strongest existing distinction from a genuinely
         // missing owner; do not add another detached sentinel merely for this hand-off.
-        if self.active_detached_viewer_context_present() {
+        if self.active_detached_context_is_at_rest() {
             let _ = self.with_active_detached_viewer_context(|app| {
                 app.render_active_detached_viewport_backstop_mounted(ctx, viewport_id);
             });
@@ -19331,7 +19331,7 @@ impl App {
                     focused,
                     current_foreground_hwnd(),
                     self.detached_viewer_host_debug_state(),
-                    self.active_detached_viewer_context_present(),
+                    self.active_detached_context_is_at_rest(),
                     event_count,
                     key_pressed_count,
                     key_v_event,
