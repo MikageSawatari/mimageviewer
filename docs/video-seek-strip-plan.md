@@ -71,6 +71,8 @@ D15 は「離す前の再生状態を保つ」という当初の既定を置き�
 - 波形 (1 画面の範囲): 5 / 10 / 15 / 30 秒 / 1 / 2 / 5 / 10 / 15 / 30 / 60 / 120 / 180 分
 - ホイールは**永続設定を動かす** (右上表示と一致させ、次回起動でも保つ)。自由入力の
   スライダーは段階リストへ置き換える。
+- **既定はサムネイル 15 秒 / 波形 3 分** (利用者判断 2026-08-25)。「大まかに場面を把握したい」
+  用途が多いので、開いた瞬間から見渡せる側へ寄せる。
 - **波形の上の段は §5.4 を前提にする。** 窓ごとの復号は範囲に比例するので、実測から外挿すると
   60 分で 4〜9 秒、180 分で 8〜16 秒かかる。範囲が全尺へ近づくなら「窓ごとに復号」ではなく
   「全尺を 1 回復号して粗いピーク列を持つ」方が素直で、それが §5.4。音楽解析の progressive
@@ -114,11 +116,19 @@ D3 の帰結として、横軸は時間線形ではない。波形モード (時
 first paint は可視 span だけ。保持 raster は通常 3 倍だが最大 3600 秒へ制限し、1800 秒設定では
 3600 秒 / 2 倍物理幅とする。90 分 decode を避けながら両側 15 分の coverage を残す。
 
+**D20 (実素材修正、2026-08-25)**: `AVIndexEntry.timestamp` は presentation PTS とは限らず、
+MP4 では key packet の DTS であることがある。索引時刻を frame PTS と直接比較しない。窓の復号中に
+同じ key packet の DTS を索引セルへ対応付け、その packet PTS を presentation target にしてから、
+decoded frame は target の nearest-preceding を採る。許容幅は indexed cell では前後それぞれ隣の
+raw index entry まで、`TimeGrid` では 1 grid interval とし、隣の場面を越える古い frame は
+`NoFrame` にする。1 セルの timestamp 不一致はそのセルだけを failed にし、同じ run の後続セルを
+巻き込まない。
+
 ## 3. 実現手段 (調査で確定した前提)
 
 | 手段 | 確認結果 |
 | --- | --- |
-| キーフレーム列挙 | `avformat_index_get_entries_count` / `avformat_index_get_entry` / `avformat_index_get_entry_from_timestamp` が ffi に生成済み。MP4 / MOV / MKV / AVI など索引を持つコンテナは**復号なしで全キーフレーム PTS を即取得できる** |
+| キーフレーム列挙 | `avformat_index_get_entries_count` / `avformat_index_get_entry` / `avformat_index_get_entry_from_timestamp` が ffi に生成済み。MP4 / MOV / MKV / AVI など索引を持つコンテナは**復号なしで全キーフレーム seek timestamp を即取得できる**。これは presentation PTS とは限らず、MP4 では DTS のことがある (D20) |
 | キーフレームの高速復号 | `decoder.skip_frame(Discard::NonKey)` が安全 API にある。窓先頭へ 1 回シークし、非キーフレームを捨てながら前方復号すると、窓内のキーフレームをまとめて取れる |
 | サムネイルの永続キャッシュ | `video_tile_thumbs.db` が既に `(path, tile_w, timestamp_ms)` キー・mtime 無効化・batch lookup を持つ。**ストリップ専用の `tile_w` を決めれば同じ表に同居できる** |
 | 波形のラスタライズ | `render_timeline_row_image(row_start, row_secs, bins, ...)` が「ある時間窓を 1 本の帯に描く」関数そのもの。ストリップの 1 窓 = 1 行として呼べる |
@@ -157,7 +167,7 @@ first paint は可視 span だけ。保持 raster は通常 3 倍だが最大 36
 
 ```rust
 StripAxis::KeyframeIndex {
-    /// 索引から取れた全キーフレーム PTS。
+    /// 索引から取れた全キーフレーム seek timestamp (PTS とは限らない)。
     keyframes: Vec<f64>,
     /// 間引き後に採用した添字。セル i が表示するのは keyframes[adopted[i]]。
     adopted: Vec<usize>,
@@ -176,8 +186,8 @@ StripAxis::KeyframeIndex {
 - 間引いても **抽出はキーフレームのみ** (D4)、セルは等幅 (D3) のまま。変わるのは
   「どのキーフレームを拾うか」だけ。
 - 時刻の線形補間 (§4.1) は隣り合う**採用セル間**で行う。
-- **設定を変えてもサムネイルの永続キャッシュは無効化されない。** 採用列は常に実キーフレーム
-  PTS の部分集合で、キャッシュのキーは実 PTS (§4.5) なので、しきい値を上げ下げしても
+- **設定を変えてもサムネイルの永続キャッシュは無効化されない。** 採用列は常に実 index entry
+  timestamp の部分集合で、キャッシュのキーは要求した index timestamp (§4.5) なので、しきい値を上げ下げしても
   既に抽出した絵をそのまま引ける。設定変更時に作り直すのは採用列だけ。
 
 ### 4.2 キーフレーム列挙とフォールバック
@@ -186,7 +196,7 @@ StripAxis::KeyframeIndex {
 
 ```rust
 enum StripAxis {
-    /// コンテナ索引からキーフレーム PTS を全取得できた (案 I)。
+    /// コンテナ索引からキーフレーム seek timestamp を全取得できた (案 I)。
     KeyframeIndex { keyframes: Vec<f64>, adopted: Vec<usize> },
     /// 索引が無い / 不完全なコンテナ。等時間グリッドに落とし、絵は直前キーフレーム。
     TimeGrid { interval_secs: f64 },
@@ -220,6 +230,11 @@ enum StripAxis {
 - **既に復号済みのフレームは窓が変わっても捨てない** (プロセス内キャッシュへ入れる)。
 - 1 窓の充填は「窓先頭のキーフレームへ 1 回シーク → `skip_frame(NonKey)` で前方復号 →
   届いたキーフレームを順に公開」。1 枚ごとにシークし直さない。
+- `KeyframeIndex` の cell timestamp は seek/index domain (MP4 では DTS のことがある)。要求窓内の
+  key packet の DTS と PTS を対応付けて presentation target を作り、decoded frame はその target の
+  nearest-preceding を採る。許容幅は前後それぞれ隣の raw index entry までに制限する。
+- `TimeGrid` は従来どおり直前 frame を採るが、1 grid interval より古い frame は採らない。
+  timestamp 不一致で 1 セルが failed になっても cursor を進め、同じ run の後続セルを処理する。
 - 復号は本編と別の補助デコーダ (`thumbnail.rs` と同じく HW 優先 / 失敗時 SW フォールバック)。
   本編の D3D lock を奪わない。`LIVE_VIDEO_DECODE_THREADS` には数えない。
 - cancel: ストリップを閉じた / 動画が変わった / フルスクリーンを抜けた。
@@ -313,10 +328,24 @@ D7 の時点では「窓オンデマンドで即応するので要らない」�
 全尺級 (最大 180 分) になったため、この判断は覆る。** 範囲が全尺へ近づくと、窓ごとの復号は
 同じ音声を繰り返し復号することになり、範囲に比例して待たされる。
 
-30 分までは窓オンデマンドで実用範囲 (実測 first paint 3.1 秒)。それを超える段では、全尺を
-1 回だけ progressive に復号して粗いピーク列を作り、そこから任意の範囲を即座に描く。
-音楽解析の progressive 機構 (`MusicAnalysisMsg::Timeline` の partial) と同じ形で、
-**埋まりながら見える**ようにする。
+30 分までは窓オンデマンドで実用範囲 (実測 first paint 3.1 秒)。それを超える段では、粗いピーク列
+を作ってそこから任意の範囲を描く。
+
+**先頭から全尺を舐めない (利用者指摘 2026-08-25)。** 動画は 1GB を超えることがあり、HDD 上の
+ファイルを先頭から読み切るのは待ち時間が大きい。**現在位置を起点に、前後へ範囲を広げながら
+埋める。**
+
+- 解析済み区間を interval の集合 (coverage) として持ち、描画はその時点の coverage から行う。
+  未解析の範囲は「まだ解析していない」と分かる見せ方にし、空白と区別する。
+- 埋める順は中央から外側へ。見ている場所が最初に埋まり、そこしか見ないなら残りの費用を払わない。
+- 音楽解析の progressive 機構 (`MusicAnalysisMsg::Timeline` の partial) と同じく、
+  **埋まりながら見える**ようにする。
+
+**映像ストリームに `AVDISCARD_ALL` を立てる。** 音声だけが要るので、demuxer が映像パケットを
+選択対象から外せば、MP4 は sample table で次の音声サンプルへ直接飛べる。読む量が全体の数% に
+なり、1GB のファイルでも数十MB で済む (代わりに細かいシークが増えるので HDD ではそこが効く)。
+`ffmpeg-the-third` の安全 API に `set_discard` は無いため、索引列挙と同じく `AVStream.discard`
+を ffi 経由で立てる。**効果は実測して記録する** (立てた場合と立てない場合の読み出し時間)。
 
 - 解像度 100ms、`peak` / `rms` / 3 バンドを各 u8 で 5 バイト/bin → 2 時間で約 360KB。
 - 初回は窓オンデマンドで描きつつ、背景で全尺の粗ピークを作って保存する。
@@ -435,12 +464,18 @@ enum SeekRowGesture {
 - サムネイルセルの `pending / ready / failed` 判定と、最新要求の index-level failure の反映。
 - 軸解決後の `DecoderUnavailable` だけが strip 全体 notice へ置き換わり、軸失敗 / thread spawn
   failure / cancel は置き換えないこと。
+- index DTS → packet PTS の対応付け、nearest-preceding の境界内 / 境界外、1 セルの不一致が同じ
+  run の後続セルを stranded にしないこと。
 
 ### ワーカー
 
 - 最新勝ちで窓が差し替わっても、復号済みフレームを捨てないこと。
 - cancel (閉じる / 動画切替 / フルスクリーン終了) で確実に止まること。
 - 波形: pre-roll を捨てた bins が、全尺解析の同区間と一致すること (許容誤差内)。
+- 実素材の手動診断は ignored test `probe_app_thumbnail_worker_window_from_env` に
+  `MIV_STRIP_THUMB_PROBE_PATH` を渡す。任意で `MIV_STRIP_THUMB_PROBE_CENTER_SECS`、
+  `MIV_STRIP_THUMB_PROBE_VISIBLE_COUNT`、`MIV_STRIP_THUMB_PROBE_HW=0|1` を指定し、各セルの
+  typed failure、実 decode path、software retry の trigger を出す。
 
 ### perf 計装
 
