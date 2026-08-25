@@ -26466,7 +26466,7 @@ impl App {
                     pending.owner_context_id == projected_context && shift(pending.idx).is_none()
                 });
             if discard_open {
-                self.native_video_open_pending = None;
+                self.clear_native_video_open_pending("items_removed");
             } else if let Some(pending) = self.native_video_open_pending.as_mut()
                 && pending.owner_context_id == projected_context
             {

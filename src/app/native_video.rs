@@ -1005,6 +1005,19 @@ impl App {
         ));
     }
 
+    /// 保留中の regular open を破棄し、**理由を残す**。破棄そのものは正常な経路が複数あるが、
+    /// 無言だと「動画が始まらないまま黒いウィンドウが残った」ときにどれが効いたのか分からない。
+    #[cfg(windows)]
+    pub(crate) fn clear_native_video_open_pending(&mut self, reason: &'static str) {
+        let Some(pending) = self.native_video_open_pending.take() else {
+            return;
+        };
+        crate::logger::log(format!(
+            "[native-video] clear deferred regular open: reason={reason} idx={} owner={:?}",
+            pending.idx, pending.owner_context_id
+        ));
+    }
+
     #[cfg(windows)]
     pub(super) fn poll_native_video_open_pending(&mut self, ctx: &egui::Context) {
         self.poll_native_video_open_pending_with_readiness(
@@ -1557,7 +1570,7 @@ impl App {
             self.cleanup_normalize_state_for_fs_idx(from_idx);
             self.fs_cache.remove(&from_idx);
         }
-        self.native_video_open_pending = None;
+        self.clear_native_video_open_pending("source_swap_defer");
         if self.fullscreen_idx != Some(target_idx) {
             self.reset_fs_side_panel_runtime_for_file_change();
         }
@@ -1885,7 +1898,7 @@ impl App {
             .as_ref()
             .is_some_and(|pending| open_owner == Some(pending.owner_context_id))
         {
-            self.native_video_open_pending = None;
+            self.clear_native_video_open_pending("parked_window_discard");
             discarded = true;
         }
         let discarded_fast = self
@@ -1921,7 +1934,7 @@ impl App {
             .as_ref()
             .is_some_and(|pending| pending.owner_context_id == projected)
         {
-            self.native_video_open_pending = None;
+            self.clear_native_video_open_pending("close_fullscreen_mounted");
         }
         // promoted active context は owner=None だが、main close 中は bundle が unmounted。
         // media 窓自身の close は active context を take + mount してからここへ来るため false。
