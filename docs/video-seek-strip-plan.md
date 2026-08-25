@@ -124,6 +124,17 @@ raw index entry まで、`TimeGrid` では 1 grid interval とし、隣の場面
 `NoFrame` にする。1 セルの timestamp 不一致はそのセルだけを failed にし、同じ run の後続セルを
 巻き込まない。
 
+**D21 (実素材修正、2026-08-25)**: 末尾だけ index entry が無い MP4 で、97% を覆う有効な索引を
+全体ごと `TimeGrid` へ落とさない。平均 GOP 3 個分 (5〜30 秒) という従来の末尾許容に加え、
+**素材内で実際に観測した最大 raw GOP 1 個分**までは通常の末尾区間として `KeyframeIndex` を採る。
+全尺 80% 以上という coverage 下限と 30 秒上限は維持する。実素材
+`ヨスガノソラ_プロモーション.mp4` は末尾 7.63 秒だけ索引が無く、旧判定では 2 秒 `TimeGrid` の
+長 GOP 区間が 14/137 `NoFrame` になった。index を採る real worker 診断では raw 110 / adopted 76 の
+76/76 が ready。したがって D20 の raw-neighbour matching bound はこの素材の原因ではなく変更しない。
+また、最小間隔と GOP が数学上等しい境界は timestamp の浮動小数点変換誤差だけで採否が変わらない
+よう、時刻の大きさに応じた丸め guard を入れる。実際に短い GOP を threshold と同一視する定数幅の
+緩和は行わない。
+
 ## 3. 実現手段 (調査で確定した前提)
 
 | 手段 | 確認結果 |
@@ -210,7 +221,9 @@ enum StripAxis {
   **捨てシークを 1 回撃つと埋まる** (MKV 1→58、WebM 1→19、WMV 0→590、いずれも 0.1〜0.2ms)。
 - したがって列挙は「数える → 疎なら `av_seek_frame` を 1 回 → 数え直す」の 2 段にする。
   この捨てシークはストリップを開いた最初の 1 回だけで、以後は不要。
-- 2 段目でも尺を覆えなければ `TimeGrid`。判定式は §9 の U2 で確定する。
+- 2 段目でも全尺の 80% を覆えない、または未索引 tail が「平均 GOP 3 個分」と「観測最大 GOP
+  1 個分」の大きい方 (5〜30 秒) を越えるなら `TimeGrid`。通常の末尾 1 GOP は index 軸の
+  最終セルが担う (D21)。
 - どちらも**見た目は等幅セル**なので、利用者には区別を見せない。ログと perf event には出す。
 - `TimeGrid` の interval はタイルモードと同じ `INTERVAL_CANDIDATES_SECS` から選ぶ
   ([ui_video_tile.rs](../src/ui_video_tile.rs) `pick_interval`)。
@@ -451,6 +464,7 @@ enum SeekRowGesture {
 - `center_index` ↔ 時刻の相互変換 (補間あり / なし)、端のクランプ。
 - 窓の算出 (可視枚数 + 先読み)、窓が動いたときの再利用範囲。
 - `StripAxis` の選択 (索引あり / 無し / 不完全)。
+- 最小間隔と GOP が等しい浮動小数点境界、および adopted cell が複数 raw entry をまたぐ可変 GOP。
 - 空セルの扱い (先頭 / 末尾)。
 - `SeekRowGesture` の決定 (上ドラッグ / 水平ドラッグ / 斜め / 閾値未満)。
 - 1 回のドラッグ中の pointer 位置列を press-time pointer から変換すると、中心が単調に進み、
@@ -475,7 +489,9 @@ enum SeekRowGesture {
 - 実素材の手動診断は ignored test `probe_app_thumbnail_worker_window_from_env` に
   `MIV_STRIP_THUMB_PROBE_PATH` を渡す。任意で `MIV_STRIP_THUMB_PROBE_CENTER_SECS`、
   `MIV_STRIP_THUMB_PROBE_VISIBLE_COUNT`、`MIV_STRIP_THUMB_PROBE_HW=0|1` を指定し、各セルの
-  typed failure、実 decode path、software retry の trigger を出す。
+  typed failure、実 decode path、software retry の trigger、実アプリと同じ fallback interval と
+  raw / adopted spacing を出す。axis 判定だけを切り分ける場合は
+  `MIV_STRIP_THUMB_PROBE_FORCE_INDEX=1` で列挙済み index を強制できる。
 
 ### perf 計装
 

@@ -1044,8 +1044,7 @@ fn resolve_strip_axis(
     let Some(keyframes) = enumerate_index_keyframes(&mut input, stream_index, time_base) else {
         return fallback_strip_axis(duration_secs, fallback_interval_secs);
     };
-    let covered_secs = keyframes.last().copied().unwrap_or_default();
-    match decide_strip_axis(keyframes.len(), covered_secs, duration_secs) {
+    match decide_strip_axis(&keyframes, duration_secs) {
         StripAxisDecision::KeyframeIndex => {
             let adopted = thin_keyframes(&keyframes, min_gap_secs);
             if adopted.is_empty() {
@@ -2266,13 +2265,14 @@ mod tests {
             .map(|value| value != "0")
             .unwrap_or(true);
         let lookahead = StripLookahead::new(visible_count / 2, visible_count - visible_count / 2);
+        let fallback_interval_secs = crate::ui_video_tile::pick_interval(duration_secs, 240);
         let worker = SeekStripThumbnailWorker::spawn(
             path.clone(),
             hw_decode,
             None,
             duration_secs,
             2.0,
-            10.0,
+            fallback_interval_secs,
         );
 
         let started = Instant::now();
@@ -2287,6 +2287,23 @@ mod tests {
                 "axis resolution timed out"
             );
             std::thread::sleep(Duration::from_millis(5));
+        };
+        let axis = if std::env::var_os("MIV_STRIP_THUMB_PROBE_FORCE_INDEX").is_some() {
+            let mut indexed_input =
+                ffmpeg::format::input(&path).expect("probe video index must open");
+            let (stream_index, time_base) = {
+                let stream = indexed_input
+                    .streams()
+                    .best(ffmpeg::media::Type::Video)
+                    .expect("probe video must have a video stream");
+                (stream.index(), stream.time_base())
+            };
+            let keyframes = enumerate_index_keyframes(&mut indexed_input, stream_index, time_base)
+                .expect("probe video must expose an index");
+            let adopted = thin_keyframes(&keyframes, 2.0);
+            Arc::new(StripAxis::KeyframeIndex { keyframes, adopted })
+        } else {
+            axis
         };
         let center_index = axis
             .center_index_for_time(center_time_secs)
@@ -2334,6 +2351,24 @@ mod tests {
             snapshot.decode_diagnostics.current_path,
             snapshot.decode_diagnostics.software_retry_failure,
         );
+        match axis.as_ref() {
+            StripAxis::KeyframeIndex { keyframes, adopted } => {
+                let adopted_gaps: Vec<_> = adopted
+                    .windows(2)
+                    .map(|pair| (pair[0], pair[1], keyframes[pair[1]] - keyframes[pair[0]]))
+                    .collect();
+                println!(
+                    "axis=keyframe_index raw_count={} adopted_count={} adopted_gaps={adopted_gaps:?}",
+                    keyframes.len(),
+                    adopted.len(),
+                );
+            }
+            StripAxis::TimeGrid { interval_secs, .. } => {
+                println!(
+                    "axis=time_grid interval_secs={interval_secs:.6} fallback_interval_secs={fallback_interval_secs:.6}"
+                );
+            }
+        }
         let mut cells = work.cache_lookup.clone();
         cells.sort_by_key(|cell| cell.index);
         for cell in cells {

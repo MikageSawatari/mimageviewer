@@ -185,29 +185,49 @@ pub(crate) enum TimeGridReason {
 
 /// 索引エントリ数と末尾到達時刻から、使用する軸を決める。
 ///
-/// `covered_secs` は最後の有効なキーフレーム seek timestamp。MP4 などでは index entry が
+/// `keyframes` は有効なキーフレーム seek timestamp の昇順列。MP4 などでは index entry が
 /// presentation PTS ではなく DTS のことがある。索引の最後は動画末尾そのものには
-/// ならないため、末尾の未被覆区間を一律ゼロには要求しない。§14 の実測では GOP が
-/// 0.50〜4.17 秒だったことから、平均間隔 3 個分を許容しつつ 5〜30 秒に制限する。
+/// ならないため、末尾の未被覆区間を一律ゼロには要求しない。平均間隔 3 個分に加え、
+/// 素材内で実際に観測した最大 GOP 1 個分までは通常の末尾区間として許容する。
+/// ただし従来どおり 5〜30 秒に制限する。
 /// さらに全尺の 80% 以上を必須にし、先頭付近だけの不完全な索引が少数エントリによって
 /// 偶然この許容へ入ることを防ぐ。
-pub(crate) fn decide_strip_axis(
-    entry_count: usize,
-    covered_secs: f64,
-    duration_secs: f64,
-) -> StripAxisDecision {
-    if entry_count < 2 {
+pub(crate) fn decide_strip_axis(keyframes: &[f64], duration_secs: f64) -> StripAxisDecision {
+    if keyframes.len() < 2 {
         return StripAxisDecision::TimeGrid(TimeGridReason::TooFewEntries);
     }
-    if !covered_secs.is_finite() || covered_secs < 0.0 || !duration_secs.is_finite() {
+    let first_secs = keyframes[0];
+    let covered_secs = *keyframes.last().unwrap_or(&f64::NAN);
+    if !first_secs.is_finite()
+        || !covered_secs.is_finite()
+        || covered_secs < 0.0
+        || !duration_secs.is_finite()
+    {
         return StripAxisDecision::TimeGrid(TimeGridReason::InvalidCoverage);
     }
     if duration_secs <= 0.0 {
         return StripAxisDecision::KeyframeIndex;
     }
 
-    let mean_gap = covered_secs / (entry_count - 1) as f64;
-    let allowed_tail = (mean_gap * 3.0).clamp(5.0, 30.0);
+    let mut gap_sum = 0.0;
+    let mut gap_count = 0usize;
+    let mut observed_max_gap = 0.0_f64;
+    for pair in keyframes.windows(2) {
+        let gap = pair[1] - pair[0];
+        if !gap.is_finite() || gap < 0.0 {
+            return StripAxisDecision::TimeGrid(TimeGridReason::InvalidCoverage);
+        }
+        if gap > 0.0 {
+            gap_sum += gap;
+            gap_count += 1;
+            observed_max_gap = observed_max_gap.max(gap);
+        }
+    }
+    if gap_count == 0 || !gap_sum.is_finite() {
+        return StripAxisDecision::TimeGrid(TimeGridReason::InvalidCoverage);
+    }
+    let mean_gap = gap_sum / gap_count as f64;
+    let allowed_tail = (mean_gap * 3.0).max(observed_max_gap).clamp(5.0, 30.0);
     let covered_enough = covered_secs >= duration_secs * 0.8;
     let tail_secs = (duration_secs - covered_secs).max(0.0);
     if covered_enough && tail_secs <= allowed_tail {
@@ -329,7 +349,14 @@ pub(crate) fn thin_keyframes(keyframes: &[f64], min_gap_secs: f64) -> Vec<usize>
     adopted.push(0);
     let mut last_adopted = keyframes[0];
     for (index, &pts_secs) in keyframes.iter().enumerate().skip(1) {
-        if pts_secs >= last_adopted + min_gap_secs {
+        let gap_secs = pts_secs - last_adopted;
+        let comparison_scale = pts_secs
+            .abs()
+            .max(last_adopted.abs())
+            .max(min_gap_secs.abs())
+            .max(1.0);
+        let rounding_guard = f64::EPSILON * comparison_scale * 8.0;
+        if gap_secs.is_finite() && gap_secs >= min_gap_secs - rounding_guard {
             adopted.push(index);
             last_adopted = pts_secs;
         }
@@ -877,6 +904,15 @@ mod tests {
         CellRange(start..=end)
     }
 
+    fn evenly_spaced_keyframes(count: usize, covered_secs: f64) -> Vec<f64> {
+        if count < 2 {
+            return vec![covered_secs; count];
+        }
+        (0..count)
+            .map(|index| covered_secs * index as f64 / (count - 1) as f64)
+            .collect()
+    }
+
     #[test]
     fn keyframe_cells_handle_empty_and_single_element_axes() {
         let empty = keyframe_axis(&[], &[]);
@@ -945,23 +981,23 @@ mod tests {
     #[test]
     fn axis_decision_requires_entries_and_credible_coverage() {
         assert_eq!(
-            decide_strip_axis(0, 0.0, 100.0),
+            decide_strip_axis(&[], 100.0),
             StripAxisDecision::TimeGrid(TimeGridReason::TooFewEntries)
         );
         assert_eq!(
-            decide_strip_axis(1, 95.0, 100.0),
+            decide_strip_axis(&[95.0], 100.0),
             StripAxisDecision::TimeGrid(TimeGridReason::TooFewEntries)
         );
         assert_eq!(
-            decide_strip_axis(20, 98.0, 100.0),
+            decide_strip_axis(&evenly_spaced_keyframes(20, 98.0), 100.0),
             StripAxisDecision::KeyframeIndex
         );
         assert_eq!(
-            decide_strip_axis(20, 40.0, 100.0),
+            decide_strip_axis(&evenly_spaced_keyframes(20, 40.0), 100.0),
             StripAxisDecision::TimeGrid(TimeGridReason::IncompleteCoverage)
         );
         assert_eq!(
-            decide_strip_axis(20, f64::NAN, 100.0),
+            decide_strip_axis(&[0.0, f64::NAN], 100.0),
             StripAxisDecision::TimeGrid(TimeGridReason::InvalidCoverage)
         );
     }
@@ -969,8 +1005,31 @@ mod tests {
     #[test]
     fn unknown_duration_keeps_a_non_sparse_index() {
         assert_eq!(
-            decide_strip_axis(8, 14.0, 0.0),
+            decide_strip_axis(&evenly_spaced_keyframes(8, 14.0), 0.0),
             StripAxisDecision::KeyframeIndex
+        );
+    }
+
+    #[test]
+    fn axis_decision_allows_one_observed_variable_gop_at_the_unindexed_tail() {
+        let mut keyframes: Vec<f64> = (0..=40).map(|index| index as f64 * 0.5).collect();
+        keyframes.extend((0..=10).map(|index| 29.5 + index as f64 * 2.0));
+
+        assert_eq!(
+            decide_strip_axis(&keyframes, 57.5),
+            StripAxisDecision::KeyframeIndex,
+            "the 8s tail is shorter than the observed 9.5s GOP"
+        );
+        assert_eq!(
+            decide_strip_axis(&keyframes, 60.0),
+            StripAxisDecision::TimeGrid(TimeGridReason::IncompleteCoverage),
+            "a tail longer than every observed GOP remains incomplete"
+        );
+
+        let adopted = thin_keyframes(&keyframes, 2.0);
+        assert!(
+            adopted.windows(2).any(|pair| pair[1] - pair[0] >= 4),
+            "the regression axis must include adopted cells several raw entries apart"
         );
     }
 
@@ -990,6 +1049,16 @@ mod tests {
     fn thinning_uses_minimum_gap_for_variable_gop() {
         let keyframes = [0.0, 0.4, 0.9, 2.0, 2.1, 4.2, 7.0, 7.5];
         assert_eq!(thin_keyframes(&keyframes, 2.0), vec![0, 3, 5, 6]);
+    }
+
+    #[test]
+    fn thinning_treats_rounding_noise_at_the_exact_threshold_as_equal() {
+        let epsilon = f64::EPSILON;
+        let keyframes = [0.0, 2.0 - epsilon, 4.0 - epsilon * 2.0];
+        assert_eq!(thin_keyframes(&keyframes, 2.0), vec![0, 1, 2]);
+
+        let genuinely_short = [0.0, 2.0 - 1.0e-8, 4.0];
+        assert_eq!(thin_keyframes(&genuinely_short, 2.0), vec![0, 2]);
     }
 
     #[test]
