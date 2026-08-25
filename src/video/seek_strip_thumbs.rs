@@ -1471,10 +1471,16 @@ fn process_window_request(
                 .flatten();
             metrics.merge(result.metrics);
             if let Some(failure) = full_frame_retry {
-                runtime.hw_decode_failed = true;
                 runtime.decoder = None;
                 record_full_frame_retry(state, &failure);
-                match SeekStripDecoder::open(path, false, StripDecodeMode::FullFrames) {
+                // 復号モードとハードウェアは別々の軸。keyframe-only では stream の参照状態を
+                // 復元できない、というのがこの retry の理由なので、直すのは**モードだけ**。
+                // ハードウェア由来の失敗には下の software retry が別にある。
+                match SeekStripDecoder::open(
+                    path,
+                    hw_decode && !runtime.hw_decode_failed,
+                    StripDecodeMode::FullFrames,
+                ) {
                     Ok(decoder) => {
                         record_decoder_path(state, &decoder);
                         runtime.decoder = Some(decoder);
@@ -1494,7 +1500,7 @@ fn process_window_request(
                     }
                 }
                 crate::logger::log(format!(
-                    "video-seek-strip-thumbs keyframe-only decode incomplete; retrying full-frame software decode with one-index-entry pre-roll: {:?}",
+                    "video-seek-strip-thumbs keyframe-only decode incomplete; retrying full-frame decode with one-index-entry pre-roll: {:?}",
                     failure
                 ));
                 break;
@@ -1518,7 +1524,14 @@ fn process_window_request(
                     runtime.hw_decode_failed = true;
                     runtime.decoder = None;
                     record_software_retry(state, &failure);
-                    match SeekStripDecoder::open(path, false, StripDecodeMode::KeyframesOnly) {
+                    // software へ落とすときも復号モードは保つ。ここで keyframe-only へ戻すと、
+                    // full-frame まで進んだ run が振り出しに戻り、同じ retry をもう一往復する。
+                    let mode = if decoder_was_keyframes_only {
+                        StripDecodeMode::KeyframesOnly
+                    } else {
+                        StripDecodeMode::FullFrames
+                    };
+                    match SeekStripDecoder::open(path, false, mode) {
                         Ok(decoder) => {
                             record_decoder_path(state, &decoder);
                             runtime.decoder = Some(decoder);
