@@ -28,14 +28,39 @@ MPEG-TS など `TimeGrid` 経路の実素材確認。
 **未解決**: 特定素材で末尾 4 セルが黒いという利用者報告を再現できていない。HW / SW とも、
 独立した復号でも黒くならなかった。輝度・分散・channel range を記録するようにしたので再発時に掴める。
 
+### 第 2 段の一括検証の結果 (2026-08-25、22,811 ファイル / 4 時間 26 分)
+
+`D:\home8` + `E:\share8`。生データは `C:\home\miv-batch-runner\sweep-stage2.json`
+(BOM 付き。`encoding='utf-8-sig'` で読む)。
+
+| | 件数 |
+| --- | ---: |
+| 通過 | 16,692 |
+| 失敗 | 303 (失敗セル 985) |
+| 利用不可 (キーフレームが疎) | 546 |
+| skip (壊れて開けない) | 8 |
+
+判定対象に対する通過率 98.2%。失敗セルの理由は `no matching frame` 730 /
+`seek failed (av_seek_frame -1)` 180 / `decoder unavailable (decoder not found)` 75。
+
+- 軸別の失敗ファイル: `time_grid/incomplete_index_coverage` 241、`keyframe_index` 48、
+  `time_grid/too_few_index_entries` 12、`time_grid/index_unavailable` 2。
+- 拡張子別の失敗率: `.mpg` 4.4% / `.mkv` 1.6% / `.avi` 1.5% / `.wmv` 1.4% / `.mp4` 0.4%。
+  **古いコンテナに寄っている。**
+- **失敗した 303 件はすべて最終的に SW 復号へ落ちている** (HW のまま失敗したものはゼロ)。
+
+**次に手を付ける順の見立て** (いずれも実素材で診断してから直すこと):
+
+1. `decoder unavailable` — コーデックが無い素材。ストリップ以前に再生もできない可能性が高い。
+   キーフレームが疎な素材と同様、**ファイル単位で事前に断る**のが筋。セルごとに失敗を
+   並べる形にしない。
+2. `no matching frame` (最多) — `time_grid` の格子時刻に許容内のフレームが無い形が中心と
+   見られる。索引が**本当に**不完全な素材で、ヨスガノソラで直したのと同じ構図が残っている疑い。
+3. `seek failed` — 古い AVI / MPG に集中。索引が無い / 壊れている素材。
+
 ### 次のセッションが最初にすること
 
-1. **第 2 段の一括検証の結果を集計する。** 出力は
-   `C:\home\miv-batch-runner\sweep-stage2.json` (`D:\home8` と `E:\share8`、
-   23,079 ファイル、2026-08-25 夜に開始)。走行中ならファイルが無いか途中まで。
-   **JSON は BOM 付きなので `encoding='utf-8-sig'` で読む。** 要約は top-level の
-   `passed_files` / `failed_files` / `skipped_files` / `failed_cells`、詳細は
-   `files[].windows[].cells[]` の `state` と `failure`。
+1. **上の第 2 段の失敗 303 件に着手する** (集計済み、生データは JSON にある)。
 2. 出た失敗を直す。**実素材はここまで 6 件連続で別々の原因を出しており、着手前の見立ては
    6 件中 1 件しか当たっていない。推測で直さず、`seek_strip_batch` の診断で理由を出してから直す。**
    自前の簡易復号 (`tools/seek_strip_probe`) はアプリが失敗する素材で 2 回とも通っている。
