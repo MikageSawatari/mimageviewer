@@ -195,7 +195,7 @@ BA-1 (rect 一致による HWND 誤同定) × BA-6 (placement 三重所有) の�
 
 ## 9. 進捗記録
 
-### 9.1 現況 (唯一の進捗表、2026-07-26 コード確認)
+### 9.1 現況 (唯一の進捗表、2026-07-26 コード確認、R2e 分を 2026-08-25 に反映)
 
 この表だけを現行ステージ判定に使う。後続のコミット・検収記録は、各時点の実装履歴であり、
 現在の完了判定ではない。コードから実装を確認できた範囲を記載し、7 月 24〜26 日分を含む
@@ -206,7 +206,7 @@ BA-1 (rect 一致による HWND 誤同定) × BA-6 (placement 三重所有) の�
 | R0 | **完了** | geometry 非依存の生成前後 HWND registry 方式を採用済み |
 | R1 | **完了** | detached host HWND は registry 所有へ移行済み。キー入力 subclass の rect 探索は R1 の対象外として残り、BA-1 の後続課題 |
 | R2a | **完了** | `DetachedWindowRuntime` と manager を導入済み |
-| R2b | **部分完了** | Runtime routing と `ParkedLive` は実装済み。HWND 再生成・差分登録・watcher repair は `ParkedLive` を保持し、OS host 状態だけで live media state を降格させない。純粋 reducer、合法遷移制約、散在 pending/flag の typed state 集約は未完 |
+| R2b | **部分完了 (R2e で 1 軸閉じた)** | Runtime routing と `ParkedLive` は実装済み。HWND 再生成・差分登録・watcher repair は `ParkedLive` を保持し、OS host 状態だけで live media state を降格させない。**所有の型化 (R2e、2026-08-25 完了) で、bundle の保管場所は registry に一本化され、mount / build / fork / retire / promote の transaction でしか遷移できない**。残るのは **純粋 reducer** と、**所有以外の散在 pending / flag の typed 集約** |
 | R2c | **完了** | placement は runtime 所有、settings は seed |
 | R2d | **完了** | live-park と active 復帰の直列化を実装済み |
 | R3 | **実質完了** | active session の `window_id` を ViewportId 決定で最優先し、passive も window_id 由来 |
