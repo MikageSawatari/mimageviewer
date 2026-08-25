@@ -819,7 +819,10 @@ fn rotated_size(size: egui::Vec2, rotation: Rotation) -> egui::Vec2 {
 /// ためで、矩形自体は回転しても使える。空間を分けたので保存回転は扱える
 /// ([rotate_bbox_to_display])。自由回転は、傾けた矩形の外接が広がる分の拡大量を
 /// 解けないので従来どおり降ろす。
-fn effective_bbox(free_rotation_rad: f32, content_bbox: Option<egui::Rect>) -> Option<egui::Rect> {
+pub(crate) fn effective_bbox(
+    free_rotation_rad: f32,
+    content_bbox: Option<egui::Rect>,
+) -> Option<egui::Rect> {
     content_bbox.filter(|_| free_rotation_rad.abs() <= EPSILON)
 }
 
@@ -829,7 +832,7 @@ fn effective_bbox(free_rotation_rad: f32, content_bbox: Option<egui::Rect>) -> O
 /// 回転を知らない)。一方 `full_image_rect` と `display_size` は回転後の寸法なので、
 /// 描画位置と fit にはこちらを使う。UV は元画像空間のまま渡す。
 /// 写像は screen ↔ source と同じ [`forward_uv`] を使う (別の式を書かない)。
-fn rotate_bbox_to_display(bbox: egui::Rect, rotation: Rotation) -> egui::Rect {
+pub(crate) fn rotate_bbox_to_display(bbox: egui::Rect, rotation: Rotation) -> egui::Rect {
     let (ax, ay) = forward_uv(rotation, bbox.min.x, bbox.min.y);
     let (bx, by) = forward_uv(rotation, bbox.max.x, bbox.max.y);
     egui::Rect::from_min_max(

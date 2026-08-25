@@ -3927,14 +3927,6 @@ fn continuous_spread_fit_width(
     }
 }
 
-fn fs_image_fit_bbox(
-    rotation: crate::rotation_db::Rotation,
-    free_rotation_rad: f32,
-    content_bbox: Option<egui::Rect>,
-) -> Option<egui::Rect> {
-    content_bbox.filter(|_| rotation.is_none() && free_rotation_rad.abs() <= TRANSFORM_EPSILON)
-}
-
 fn fs_image_draw_rect_for_size(
     full_rect: egui::Rect,
     tex_size: egui::Vec2,
@@ -3962,14 +3954,25 @@ fn fs_image_draw_rect_for_size(
     .map(|transform| transform.full_image_rect)
 }
 
+/// 部分矩形を描画矩形と UV へ落とす。**座標系の扱いは
+/// [`DisplayedImageTransform`] と同じ**にする (描画位置は表示空間、UV は元画像空間)。
+///
+/// 以前はここに「回転していれば捨てる」規則の複製があった。呼び出し側が回転していない
+/// 枝の中だったので実害は出ていなかったが、同じ規則が 2 か所にあると片方だけ直る。
 fn fs_image_paint_rect_and_uv(
     img_rect: egui::Rect,
     rotation: crate::rotation_db::Rotation,
     free_rotation_rad: f32,
     content_bbox: Option<egui::Rect>,
 ) -> (egui::Rect, egui::Rect) {
-    match fs_image_fit_bbox(rotation, free_rotation_rad, content_bbox) {
-        Some(bbox) => (normalized_sub_rect(img_rect, bbox), bbox),
+    match crate::displayed_image_transform::effective_bbox(free_rotation_rad, content_bbox) {
+        Some(source_bbox) => (
+            normalized_sub_rect(
+                img_rect,
+                crate::displayed_image_transform::rotate_bbox_to_display(source_bbox, rotation),
+            ),
+            source_bbox,
+        ),
         None => (
             img_rect,
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
@@ -5242,11 +5245,9 @@ impl App {
         match pair {
             SpreadPair::Single => {
                 let rotation = self.get_rotation(idx);
-                let content_bbox = if rotation.is_none() {
-                    self.view_trim_single_content_bbox(idx)
-                } else {
-                    None
-                };
+                let content_bbox = self.fs_page_content_bbox(idx, rotation, |app| {
+                    app.view_trim_single_content_bbox(idx)
+                });
                 let page =
                     self.capture_fs_display_unit_page(rendition_ctx, idx, rotation, content_bbox)?;
                 Some(FsDisplayUnitHoldover { pages: vec![page] })
@@ -6631,10 +6632,9 @@ impl App {
         // 回転ページは draw_fs_image 側で bbox を使わないので通常どおり全体を対象にする。
         // mut 借用 (view_trim_single_content_bbox) を bg_style の immutable 借用より前に済ませる。
         // 正規化 bbox は照準オーバービューの draw_fs_image にも渡す (= 余白を出さずトリム後を表示)。
-        let trim_bbox = rotation
-            .is_none()
-            .then(|| self.view_trim_single_content_bbox(fs_idx))
-            .flatten();
+        let trim_bbox = self.fs_page_content_bbox(fs_idx, rotation, |app| {
+            app.view_trim_single_content_bbox(fs_idx)
+        });
         // パン操作帯: 上下のホバーバー (上部バー / 下部シークバー) 分を内側へ詰め、カーソルが
         // そこへ入る前にコンテンツ領域の上端・下端へ到達できるようにする (実機 FB 2026-06-21)。
         // 左右はズーム中にパネルを抑止するので全幅を使う。小画面で帯が潰れないよう高さ 25% で頭打ち。
@@ -9113,6 +9113,13 @@ pub(crate) enum FsPageNav {
     Target(usize),
     /// 見開き表示の先頭 / 末尾に、その入力 1 回で到達した。
     Boundary { at_end: bool },
+    /// 横長分割での移動先。**同じページの反対側も、別ページも同じ変種で表す**
+    /// (`PresentationStep` が元ページと左右の両方を持つ)。
+    ///
+    /// `Target(usize)` を `{ idx, slice }` へ広げなかったのは、見開きの「表示ユニットの
+    /// 先頭」と分割の「ページの片側」が別の概念で、既存の分岐とテストがその形に
+    /// 依存しているため。
+    Split(crate::page_split::PresentationStep),
 }
 
 impl FsPageNav {
@@ -9544,6 +9551,159 @@ impl App {
             &self.page_dims_cache,
             self.items_generation,
         )
+    }
+
+    /// 分割を織り込んだ表示ステップ列。分割モードでなければ `None`。
+    ///
+    /// 分割するのは「静止画」かつ「保存回転を反映して横長」のページ。**縦横比の判定は
+    /// 見開きのペアリングと同じ `is_landscape` を使う** (分割のために読み直さない)。
+    ///
+    /// 自由回転中はページ単位ではなく**分割そのものを止める**。自由回転は保存しない
+    /// App 全体の一時値で、`effective_bbox` がその間だけ部分矩形を降ろすため、
+    /// 分割したまま描くと左右が同じ絵になる。毎回組み直すので、戻せば分割も戻る。
+    fn build_presentation_steps_for_nav(
+        &mut self,
+        nav: &[usize],
+    ) -> Option<Vec<crate::page_split::PresentationStep>> {
+        let direction = self.split_direction_now()?;
+        // `get_rotations_for_indices` が mutable なのは DB 未読分を memoize するため。
+        // fs_cache / thumbnails の借用より先に nav 全体を取る (見開き側と同じ順序)。
+        let rotations = self.get_rotations_for_indices(nav);
+        let this = &*self;
+        Some(crate::page_split::presentation_steps(
+            nav,
+            direction,
+            |nav_pos, idx| {
+                this.page_splits_with_rotation(
+                    idx,
+                    rotations
+                        .get(nav_pos)
+                        .copied()
+                        .unwrap_or(crate::rotation_db::Rotation::None),
+                )
+            },
+        ))
+    }
+
+    /// いま分割が効いているか。効いていればその向き。
+    ///
+    /// **ページによらない条件だけ**をここで見る。ページごとの条件は
+    /// [`Self::page_splits_with_rotation`]。
+    ///
+    /// - 自由回転中は止める。`effective_bbox` がその間だけ部分矩形を降ろすので、
+    ///   分割したまま描くと左右が同じ絵になる。保存しない一時値なので戻せば分割も戻る。
+    /// - 連結読み中は止める (MVP 対象外)。送りだけ分割して描画が全体のままだと同じ絵が 2 回出る。
+    fn split_direction_now(&self) -> Option<crate::page_split::SplitDirection> {
+        let direction = crate::page_split::SplitDirection::from_spread_mode(self.spread_mode)?;
+        if self.fs_free_rotation.abs() > TRANSFORM_EPSILON {
+            return None;
+        }
+        if self
+            .fullscreen_idx
+            .is_some_and(|idx| self.continuous_reading_active_for_idx(idx))
+        {
+            return None;
+        }
+        Some(direction)
+    }
+
+    /// このページが分割対象か。**縦横比の判定は見開きのペアリングと同じ `is_landscape`**
+    /// を使う (分割のために読み直さない)。回転は呼び出し側が渡す。
+    fn page_splits_with_rotation(
+        &self,
+        idx: usize,
+        rotation: crate::rotation_db::Rotation,
+    ) -> bool {
+        is_spread_pairable_item(self.items.get(idx))
+            && is_landscape(
+                idx,
+                rotation,
+                &self.fs_cache,
+                &self.thumbnails,
+                &self.page_dims_cache,
+                self.items_generation,
+            )
+    }
+
+    /// 表示中のページと分割モードから、左右の記憶を辻褄の合う値へ寄せる。
+    ///
+    /// ページを開く入口 (一覧・しおり・検索・シークバー・履歴・Ctrl+↑↓) は多く、その
+    /// すべてに「左右を戻す」を足すと必ずどれか漏れる。**表示側で 1 か所そろえる。**
+    /// 分割していないページや分割 OFF では `Full` に戻すので、記憶が居残らない。
+    fn reconcile_fullscreen_page_slice(&mut self, fs_idx: usize) {
+        let splits = self.split_direction_now().map(|direction| {
+            let rotation = self.get_rotation(fs_idx);
+            (direction, self.page_splits_with_rotation(fs_idx, rotation))
+        });
+        match splits {
+            Some((direction, true)) => {
+                if !self.fullscreen_page_slice.is_half() {
+                    self.fullscreen_page_slice = direction.first();
+                }
+            }
+            _ => self.fullscreen_page_slice = crate::page_split::PageSlice::Full,
+        }
+    }
+
+    /// このページへ渡す部分矩形。**分割中は分割が勝ち、表示トリムは使わない。**
+    ///
+    /// `content_bbox` は 1 つしか渡せないので併用できない。左右の解釈をここ 1 か所に
+    /// 集約し、描画・ナビゲータ・ルーペで別々に解かない。
+    ///
+    /// 表示トリム側の「回転していたら使わない」は**そのまま残している**。回転ページの
+    /// トリムは見開きの左右そろえを表示空間で定義しており、回転を通した写像が要るため、
+    /// 分割とは別に扱う。
+    fn fs_page_content_bbox(
+        &mut self,
+        idx: usize,
+        rotation: crate::rotation_db::Rotation,
+        trim: impl FnOnce(&mut Self) -> Option<egui::Rect>,
+    ) -> Option<egui::Rect> {
+        if let Some(slice) = self.active_page_slice_for(idx) {
+            return Some(slice.source_bbox(rotation));
+        }
+        rotation.is_none().then(|| trim(self)).flatten()
+    }
+
+    /// このページを今どちら側で見ているか。分割していなければ `None`。
+    ///
+    /// 記憶している左右が今のページのものとは限らない (モードを切り替えた直後など) ので、
+    /// **表示中のページであること**も併せて確かめる。
+    fn active_page_slice_for(&self, idx: usize) -> Option<crate::page_split::PageSlice> {
+        (self.spread_mode.is_split()
+            && self.fullscreen_idx == Some(idx)
+            && self.fullscreen_page_slice.is_half())
+        .then_some(self.fullscreen_page_slice)
+    }
+
+    /// 分割中のページ送り。ステップ列の中を 1 つ動かす。
+    ///
+    /// 現在位置は `(fullscreen_idx, fullscreen_page_slice)` で引く。見つからないときは
+    /// 分割方向の最初の半分へ倒す —— 寸法が届いてステップ列が変わった直後など、
+    /// 記憶している左右が列に無いことがある。
+    fn split_page_nav(
+        &self,
+        steps: &[crate::page_split::PresentationStep],
+        fs_idx: usize,
+        dir: i32,
+    ) -> FsPageNav {
+        let at = steps
+            .iter()
+            .position(|step| step.source_idx == fs_idx && step.slice == self.fullscreen_page_slice)
+            .or_else(|| crate::page_split::landing_step(steps, fs_idx));
+        let Some(at) = at else {
+            return FsPageNav::Delta(dir);
+        };
+        let moved = if dir > 0 {
+            crate::page_split::step_forward(steps, at)
+        } else {
+            crate::page_split::step_backward(steps, at)
+        };
+        match moved {
+            crate::page_split::StepMove::AtEnd => FsPageNav::Boundary { at_end: dir > 0 },
+            crate::page_split::StepMove::WithinPage { to }
+            | crate::page_split::StepMove::ToAnotherPage { to } => FsPageNav::Split(to),
+        }
     }
 
     #[cfg(test)]
@@ -13453,6 +13613,7 @@ impl App {
         };
 
         self.harvest_page_dims_from_fs_cache();
+        self.reconcile_fullscreen_page_slice(fs_idx);
 
         let page_turn_decision = self.fs_page_turn_decision_for_frame(ctx, fs_idx);
         let stop_page_needs_load =
@@ -17519,7 +17680,7 @@ impl App {
         if dir == 0 {
             return FsPageNav::None;
         }
-        if !self.spread_mode.is_spread() {
+        if !self.spread_mode.is_spread() && !self.spread_mode.is_split() {
             return FsPageNav::Delta(base_delta);
         }
         let fs_idx = match self.fullscreen_idx {
@@ -17543,6 +17704,9 @@ impl App {
         let dir = base_delta.signum();
         if dir == 0 {
             return FsPageNav::None;
+        }
+        if let Some(steps) = self.build_presentation_steps_for_nav(nav) {
+            return self.split_page_nav(&steps, fs_idx, dir);
         }
         if !self.spread_mode.is_spread() {
             return FsPageNav::Delta(base_delta);
@@ -23406,7 +23570,9 @@ impl App {
             FsPageNav::Delta(delta) => {
                 crate::ui_helpers::adjacent_slideshow_idx(&self.items, &display_order, cur, delta)
             }
-            FsPageNav::None | FsPageNav::Boundary { .. } => None,
+            // スライドショーは分割を使わない (`is_spread()` が偽なので `Delta` へ行く)。
+            // 届かないが、届いたときに黙って先へ進まないよう塞いでおく。
+            FsPageNav::None | FsPageNav::Boundary { .. } | FsPageNav::Split(_) => None,
         };
         if let Some(idx) = next_idx {
             // フォルダ内の次の静止画系アイテムへ前進。
@@ -24332,6 +24498,33 @@ impl App {
                 if !self.fs_navigation_sequence_blocks_new_target() {
                     self.land_still_page_navigation_target(ctx, fs_idx, new_idx);
                 }
+            } else if let FsPageNav::Split(step) = page_nav {
+                if step.source_idx == fs_idx {
+                    // 同じページの反対側。テクスチャも読み込みも同じものなので、
+                    // ページ遷移の機構を通さない。通すと再読込と表示確定が余計に走る。
+                    self.fullscreen_page_slice = step.slice;
+                    self.update_fs_page_turn_burst_after_navigation(ctx, fs_idx, None);
+                    ctx.request_repaint();
+                } else if !self.fs_navigation_sequence_blocks_new_target() {
+                    let accept_rendition = self.update_fs_page_turn_burst_after_navigation(
+                        ctx,
+                        fs_idx,
+                        Some(step.source_idx),
+                    );
+                    if self.begin_fs_page_navigation_sequence(
+                        ctx,
+                        fs_idx,
+                        step.source_idx,
+                        accept_rendition,
+                    ) {
+                        self.land_still_page_navigation_target(ctx, fs_idx, step.source_idx);
+                    }
+                    // **着地できたときだけ**左右を確定する。遷移が断られた場合に
+                    // 左右だけ動くと、今見えているページの反対側が出る。
+                    if self.fullscreen_idx == Some(step.source_idx) {
+                        self.fullscreen_page_slice = step.slice;
+                    }
+                }
             } else if let FsPageNav::Target(new_idx) = page_nav {
                 let display_order = self.current_grid_order().to_vec();
                 let current_is_media = matches!(
@@ -24688,7 +24881,9 @@ impl App {
                         .flatten()
                 }
             };
-            let fit_bbox = fs_image_fit_bbox(rotation, free_rotation_rad, content_bbox);
+            // 「切り抜きが効いているか」だけを見る。clip の要否と pixel grid の可否に使う。
+            let fit_bbox =
+                crate::displayed_image_transform::effective_bbox(free_rotation_rad, content_bbox);
             let transform_input = DisplayedImageTransformInput {
                 page_idx,
                 viewport_rect: full_rect,

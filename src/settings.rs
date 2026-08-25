@@ -2782,6 +2782,8 @@ impl SpreadMode {
             Self::LtrCover,
             Self::Rtl,
             Self::RtlCover,
+            Self::SplitLtr,
+            Self::SplitRtl,
         ]
     }
 

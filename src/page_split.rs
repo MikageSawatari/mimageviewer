@@ -46,6 +46,23 @@ impl PageSlice {
     pub fn is_half(self) -> bool {
         matches!(self, Self::Left | Self::Right)
     }
+
+    /// **元画像空間**の部分矩形。`content_bbox` に渡すのはこちら。
+    ///
+    /// [`Self::uv_rect`] は「画面で見て左半分 / 右半分」なので**表示空間**である。
+    /// 保存回転があると両者は一致しない (90 度回転したページの画面左半分は、元画像では
+    /// 上半分)。写像は screen ↔ source と同じ `inverse_uv` を使う。
+    pub fn source_bbox(self, rotation: crate::rotation_db::Rotation) -> egui::Rect {
+        let display = self.uv_rect();
+        let (ax, ay) =
+            crate::displayed_image_transform::inverse_uv(rotation, display.min.x, display.min.y);
+        let (bx, by) =
+            crate::displayed_image_transform::inverse_uv(rotation, display.max.x, display.max.y);
+        egui::Rect::from_min_max(
+            egui::pos2(ax.min(bx), ay.min(by)),
+            egui::pos2(ax.max(bx), ay.max(by)),
+        )
+    }
 }
 
 /// 分割したページをどちら側から読むか。
@@ -141,14 +158,17 @@ impl StepMove {
 /// 偽を返してもらい 1 ステップになる — 寸法が届いた後にステップ列は組み直される。
 /// これは既存の見開きユニット生成が `is_landscape` に対して持つ性質と同じで、
 /// 分割のためだけに読み込みを待たせない。
+///
+/// 述語は既存の見開きユニット生成と同じ `(nav 内の位置, item index)` を受け取る。
+/// 保存回転が nav と同じ並びで返るので、位置が要る。
 pub fn presentation_steps(
     nav: &[usize],
     direction: SplitDirection,
-    mut is_split_idx: impl FnMut(usize) -> bool,
+    mut is_split_idx: impl FnMut(usize, usize) -> bool,
 ) -> Vec<PresentationStep> {
     let mut steps = Vec::with_capacity(nav.len());
-    for &idx in nav {
-        if is_split_idx(idx) {
+    for (nav_pos, &idx) in nav.iter().enumerate() {
+        if is_split_idx(nav_pos, idx) {
             steps.push(PresentationStep {
                 source_idx: idx,
                 slice: direction.first(),
@@ -201,7 +221,7 @@ mod tests {
     /// 分割対象がなければ、ステップ列は nav とそのまま 1 対 1 になる。
     #[test]
     fn pages_that_do_not_split_stay_one_step_each() {
-        let steps = presentation_steps(&[4, 7, 9], SplitDirection::LeftFirst, |_| false);
+        let steps = presentation_steps(&[4, 7, 9], SplitDirection::LeftFirst, |_, _| false);
         assert_eq!(
             steps,
             vec![
@@ -214,13 +234,13 @@ mod tests {
 
     #[test]
     fn a_split_page_is_read_from_the_side_the_direction_names() {
-        let ltr = presentation_steps(&[0], SplitDirection::LeftFirst, |_| true);
+        let ltr = presentation_steps(&[0], SplitDirection::LeftFirst, |_, _| true);
         assert_eq!(
             ltr.iter().map(|s| s.slice).collect::<Vec<_>>(),
             vec![PageSlice::Left, PageSlice::Right]
         );
 
-        let rtl = presentation_steps(&[0], SplitDirection::RightFirst, |_| true);
+        let rtl = presentation_steps(&[0], SplitDirection::RightFirst, |_, _| true);
         assert_eq!(
             rtl.iter().map(|s| s.slice).collect::<Vec<_>>(),
             vec![PageSlice::Right, PageSlice::Left]
@@ -234,7 +254,7 @@ mod tests {
     /// 横長と縦長が混ざったときに、分割したページだけが 2 ステップになる。
     #[test]
     fn only_the_landscape_pages_are_split() {
-        let steps = presentation_steps(&[0, 1, 2], SplitDirection::RightFirst, |idx| idx == 1);
+        let steps = presentation_steps(&[0, 1, 2], SplitDirection::RightFirst, |_, idx| idx == 1);
         assert_eq!(
             steps,
             vec![
@@ -254,13 +274,13 @@ mod tests {
 
     #[test]
     fn an_empty_navigation_has_no_steps() {
-        assert!(presentation_steps(&[], SplitDirection::LeftFirst, |_| true).is_empty());
+        assert!(presentation_steps(&[], SplitDirection::LeftFirst, |_, _| true).is_empty());
     }
 
     /// 開き直しは分割方向の最初の半分へ着地する。後ろの半分には着地しない。
     #[test]
     fn reopening_a_split_page_lands_on_its_first_half() {
-        let steps = presentation_steps(&[5, 6], SplitDirection::RightFirst, |_| true);
+        let steps = presentation_steps(&[5, 6], SplitDirection::RightFirst, |_, _| true);
         let at = landing_step(&steps, 6).expect("6 がステップ列に無い");
         assert_eq!(
             steps[at],
@@ -275,7 +295,7 @@ mod tests {
     /// 同じ元ページ内の左右移動と、次の元ページへの移動を区別する。
     #[test]
     fn moving_within_a_page_is_distinguished_from_moving_to_the_next_one() {
-        let steps = presentation_steps(&[0, 1], SplitDirection::LeftFirst, |idx| idx == 0);
+        let steps = presentation_steps(&[0, 1], SplitDirection::LeftFirst, |_, idx| idx == 0);
         // [0:Left, 0:Right, 1:Full]
         assert_eq!(
             step_forward(&steps, 0),
@@ -315,7 +335,7 @@ mod tests {
     /// 端では動かない。分割の途中で端に当たる形にはしない。
     #[test]
     fn both_ends_stop_instead_of_wrapping() {
-        let steps = presentation_steps(&[0], SplitDirection::LeftFirst, |_| true);
+        let steps = presentation_steps(&[0], SplitDirection::LeftFirst, |_, _| true);
         assert_eq!(step_backward(&steps, 0), StepMove::AtEnd);
         assert_eq!(step_forward(&steps, 1), StepMove::AtEnd);
         assert_eq!(step_forward(&steps, 99), StepMove::AtEnd);
@@ -379,6 +399,63 @@ mod tests {
             SplitDirection::from_spread_mode(SpreadMode::SplitRtl),
             Some(SplitDirection::RightFirst)
         );
+    }
+
+    /// 画面で見た左右が、回転に応じて元画像のどこになるか。
+    ///
+    /// ここを表示空間のまま渡すと、90 度回転したページで**左右ではなく上下**が切れる。
+    #[test]
+    fn the_halves_map_back_through_the_rotation() {
+        use crate::rotation_db::Rotation;
+        let left = PageSlice::Left;
+        // 無回転: 画面左 = 元画像の左。
+        assert_eq!(left.source_bbox(Rotation::None), left.uv_rect());
+        // 時計回り 90 度で表示している = 元画像の下半分が画面左に来る。
+        let mapped = left.source_bbox(Rotation::Cw90);
+        assert!((mapped.min.x - 0.0).abs() < 1e-5, "{mapped:?}");
+        assert!((mapped.max.x - 1.0).abs() < 1e-5, "{mapped:?}");
+        assert!((mapped.min.y - 0.5).abs() < 1e-5, "{mapped:?}");
+        assert!((mapped.max.y - 1.0).abs() < 1e-5, "{mapped:?}");
+        // 180 度なら左右が入れ替わる。
+        assert_eq!(
+            left.source_bbox(Rotation::Cw180),
+            PageSlice::Right.uv_rect()
+        );
+    }
+
+    /// どの回転でも、左右あわせて元画像をちょうど覆う。
+    #[test]
+    fn the_two_halves_still_tile_the_source_under_every_rotation() {
+        use crate::rotation_db::Rotation;
+        for rotation in [
+            Rotation::None,
+            Rotation::Cw90,
+            Rotation::Cw180,
+            Rotation::Cw270,
+        ] {
+            let a = PageSlice::Left.source_bbox(rotation);
+            let b = PageSlice::Right.source_bbox(rotation);
+            assert!((a.area() - 0.5).abs() < 1e-5, "{rotation:?} {a:?}");
+            assert!((b.area() - 0.5).abs() < 1e-5, "{rotation:?} {b:?}");
+            assert!(
+                !a.intersects(b) || a.intersect(b).area() < 1e-5,
+                "{rotation:?}"
+            );
+        }
+    }
+
+    /// 分割しないときは元画像全体。回転しても全体のまま。
+    #[test]
+    fn a_whole_page_stays_whole_under_rotation() {
+        use crate::rotation_db::Rotation;
+        for rotation in [Rotation::None, Rotation::Cw90, Rotation::Cw270] {
+            let full = PageSlice::Full.source_bbox(rotation);
+            assert!(
+                (full.min.x).abs() < 1e-5 && (full.min.y).abs() < 1e-5,
+                "{full:?}"
+            );
+            assert!((full.max.x - 1.0).abs() < 1e-5 && (full.max.y - 1.0).abs() < 1e-5);
+        }
     }
 
     /// 分割は見開きではない。見開き用の分岐へ紛れ込ませない。

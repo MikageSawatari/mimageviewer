@@ -8,10 +8,14 @@
 
 | | 状態 |
 | --- | --- |
-| [page_split.rs](../src/page_split.rs) | 分割の順序 (純ロジック)。単体テスト 12 本 |
-| `SpreadMode::SplitLtr` / `SplitRtl` | 追加済み。**`all()` に入れていない**ので UI には出ない |
-| `App::fullscreen_page_slice` + bundle + `swap_field!` | per-viewer 状態として追加済み |
-| ページ送り / 描画 / 着地 | **未実装。ここから** |
+| [page_split.rs](../src/page_split.rs) | 分割の順序と座標写像 (純ロジック)。単体テスト 15 本 |
+| `SpreadMode::SplitLtr` / `SplitRtl` | 追加済み。`all()` にも入れたのでメニューから選べる |
+| `App::fullscreen_page_slice` + bundle + `swap_field!` | per-viewer 状態 |
+| 回転したページの分割 | **対応済み** (§2) |
+| ページ送り (`FsPageNav::Split`) | 実装済み。App レベルのテスト 3 本 |
+| 描画 (`fs_page_content_bbox`) | 実装済み。分割中はトリムより分割が勝つ |
+| 着地 (`reconcile_fullscreen_page_slice`) | 実装済み。表示側で毎フレーム 1 か所そろえる |
+| 実機確認 | **未** |
 
 ## 2. 回転したページの分割 — 解決済み (2026-08-25)
 
@@ -53,8 +57,21 @@ UV 側は元々正しかった。
 
 **型の作り替えは不要だった。** `content_bbox` の型も 215 箇所も動かしていない。
 
-**副産物: 表示トリムが回転したページでも効くようになった。** これまでは無効で、利用者から
-見れば「回転すると自動トリムが外れる」状態だった。リリースノートに書く価値がある。
+**表示トリムは、まだ回転したページで効かない** (2026-08-25 訂正)。変換側で扱えるように
+なっただけで、**トリムを作る側に同じ規則の複製が残っている**:
+
+```rust
+let content_bbox = if rotation.is_none() { self.view_trim_single_content_bbox(idx) } else { None };
+```
+
+`capture_fs_display_unit_*` (単ページ / 見開き)、Z ズーム、連結読みの 4 か所。コメントには
+「回転ページは draw_fs_image 側で bbox を使わない**ので**」と、消費側の振る舞いを理由として
+書いてある —— 対になっていた片方だけが変わった状態である。
+
+**外すのは §1.119 とは別件**にする。見開きの `view_trim_spread_content_bboxes` は左右の
+余白そろえを**表示空間で**定義しており、180 度回転で左右が入れ替わるページに素直には
+適用できない。分割は自前の resolver (`fs_page_content_bbox`) から矩形を出すので、
+このガードの影響を受けない。
 
 旧テスト `fit_rotation_and_trim_share_paint_and_hit_geometry` は「回転時 UV は全体」を
 固定していた。**制限を仕様として固定していたテスト**なので、期待値を新しい不変条件
@@ -130,12 +147,18 @@ Split(crate::page_split::PresentationStep),
 - 分割位置の手動調整
 - 既定キー割り当て (1〜5 が埋まっているため。プルダウンから選ぶ)
 
-## 6. 完成の条件
+## 6. 残り
 
-`all()` に 2 モードを足すのは**ページ送りと描画が揃ってから**。選べるのに何も起きない
-状態を master に置かない。マニュアル ([fullscreen.html](../htdocs/mimageviewer/manual/fullscreen.html))
-と製品ページへの追記も同時に行う。
+- **実機確認**。回帰条件は backlog §1.119 に列挙済み (左→右 / 右→左の往復、横長と縦長の
+  混在、回転後の分割判定、先頭 / 末尾、キー長押し、縦連結、シーク、編集画面への出入り、
+  ブックマーク再表示)。
+- 製品ページ ([index.html](../htdocs/mimageviewer/index.html)) への追記。
+- リリース時の更新履歴。
 
-回帰条件は backlog §1.119 の「回帰条件」に列挙済み (左→右 / 右→左の往復、横長と縦長の
-混在、回転後の分割判定、先頭 / 末尾、キー長押し、縦連結、シーク、編集画面への出入り、
-ブックマーク再表示)。
+### 着地を 1 か所で解いている理由
+
+ページを開く入口は多い (一覧・しおり・検索・シークバー・履歴・<kbd>Ctrl</kbd>+↑↓・
+detached)。そのすべてに「左右を戻す」を足すと必ずどれか漏れ、**前のページの右半分を
+見ていた記憶が次のページに残る**。`reconcile_fullscreen_page_slice` が
+`render_fullscreen_viewport` の先頭で毎フレーム 1 回そろえるので、入口が増えても漏れない。
+分割していないページと分割 OFF では `Full` へ戻すため、記憶が居残ることもない。
