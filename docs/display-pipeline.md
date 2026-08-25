@@ -1061,6 +1061,27 @@ PNG エンコードとファイル I/O は `pipeline-debug-export` worker で行
 6. 物理ピクセル境界へ整列済みの paint rect / hit rect / UV / source↔screen 写像 / total scale
 ```
 
+### 部分矩形 (content bbox) の座標系 — 2026-08-25 に分離
+
+`content_bbox` は**元画像空間**の正規化矩形である。作っているのは
+`margin_fit::detect_content_bbox` で、**復号した画素をそのまま走査する**ので回転を知らない。
+一方 `full_image_rect` と `display_size` は回転後の寸法なので、**用途で座標系が分かれる**:
+
+| 用途 | 座標系 |
+| --- | --- |
+| UV (テクスチャのどこを読むか) | **元画像空間** — `content_bbox` をそのまま |
+| paint rect の切り出し、fit 倍率、`content_center` | **表示空間** — `rotate_bbox_to_display` で写す |
+
+写像は screen ↔ source と同じ `forward_uv` / `inverse_uv` を使う (別の式を書かない)。
+
+2026-08-25 まで `effective_bbox` は**回転していれば矩形を丸ごと捨てていた**。同じ矩形を
+fit では表示空間、UV では元画像空間として二重に扱っており、回転すると両立しなくなるための
+辻褄合わせだった。結果として表示トリムは回転したページで無効だった。空間を分けたので、
+保存回転 (0/90/180/270) では矩形が残る。
+
+**自由回転 (`fs_free_rotation`) 中は今も降ろす。** 傾いた矩形の外接が広がる分の拡大量を
+解けないため。自由回転は保存しない一時値なので、やめれば次の解決で戻る。
+
 `Original` (100% 原寸) と「拡大しない」「縮小しない」の 100% 基準は論理 1.0 倍ではなく
 `1.0 / pixels_per_point` とする。`pixels_per_point` は描画対象 viewport の `egui::Context`
 から取得し、main と DPI が異なり得る detached / frozen viewport では main の値を流用しない。

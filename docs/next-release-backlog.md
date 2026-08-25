@@ -1577,11 +1577,24 @@ ClaudeCode の追加ログと Codex の portable / normal ログを併記して 
 - `App::fullscreen_page_slice` + bundle 側 + `swap_field!` を追加。**元ページと同じ
   context 所有**にした。片方だけ App に置くと、context を切り替えたときに前の viewer の
   左右が次の viewer に残る。`viewer_context_audit` は通過 (既知 1 件のみ)。
-- **範囲を「回転していないページ」に限定した。** 分割の crop は既存の自動表示トリムと
-  同じ `content_bbox` に乗るが、`fs_image_fit_bbox` は回転時にそれを捨てる。捨てられると
-  同じページが 2 回そのまま出る。型付き `SourceCrop` への作り替えは 215 箇所に及ぶので、
-  §1.119 とは別の改修として立てる (トリムが回転時に効かない問題も同時に直る)。
-  根拠と詳細は [page-split-plan.md](page-split-plan.md) §2。
+- **回転したページも分割する** (利用者判断で最初のリリースに含める。回転したページだけ
+  分割されないのは、使う側からは不具合にしか見えず報告が来る)。
+  - 当初は「型付き `SourceCrop` へ作り替えるしかない (215 箇所)」と見立てたが、**外れ**。
+    実際の原因は `DisplayedImageTransform::resolve` が**同じ矩形を 2 つの座標系として
+    使っていた**こと (fit 倍率では回転後の `display_size` に掛け、UV では元画像空間の
+    まま渡す)。回転すると両立しないので丸ごと捨てていた。**UV 側は元々正しかった。**
+  - 修正は用途ごとに座標系を分けるだけだった。`rotate_bbox_to_display` を足し、fit と
+    paint rect は表示空間、UV は元画像空間にした。写像は screen ↔ source と同じ
+    `forward_uv` を使う。**`content_bbox` の型も 215 箇所も動かしていない。**
+  - `effective_bbox` が降ろすのは**自由回転中だけ**になった (傾いた矩形の外接が広がる分の
+    拡大量を解けないため)。自由回転は保存しない一時値なので、やめれば戻る。
+  - 旧テスト `fit_rotation_and_trim_share_paint_and_hit_geometry` は「回転時 UV は全体」を
+    固定していた。**制限を仕様として固定していたテスト**なので期待値を更新した。
+  - 詳細は [page-split-plan.md](page-split-plan.md) §2、正本は
+    [display-pipeline.md](display-pipeline.md)「部分矩形 (content bbox) の座標系」。
+- ⚠ **副産物: 自動表示トリムが回転したページでも効くようになった。** これまでは無効で、
+  利用者から見れば「回転すると自動トリムが外れる」状態だった。**リリース時の更新履歴に
+  書くこと** (分割とは別項目として)。
 - **残り**: ページ送り (`FsPageNav::Split`)、描画、着地、`all()` への追加、マニュアル。
 
 ### 1.120 Susie 32bit ワーカー異常終了後の自己回復 — 外部SNSでの不具合言及 ✅ 実装済み (2026-08-25、実機確認済み)
