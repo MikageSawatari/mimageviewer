@@ -482,6 +482,31 @@ fn is_preceding_frame_within_tolerance(
         && target_secs - frame_pts_secs <= tolerance.before_secs + FRAME_PTS_MATCH_EPSILON_SECS
 }
 
+/// stream の終端で残ったセルに、最後に復号できたフレームを充ててよいか。
+///
+/// 通常の許容幅に収まるならもちろん充てる。収まらなくても、**stream が本当に終わっていれば**
+/// 充てる: ファイルが申告する尺は実際の中身より長いことがあり (実素材の sweep では WMV で
+/// 1.15〜1.29 秒長く、失敗の 87% がこれ)、格子はフレームが 1 枚も無い区間へセルを置いてしまう。
+/// そのセルが表しているのは「動画の終わり」なので、動画の最後のフレームを出すのが正しい。
+///
+/// 前方向へは伸ばさない (`frame_pts_secs <= target_secs`)。目的時刻より後のフレームは通常の
+/// 経路が拾うので、ここで拾うと別の場面を持ってきてしまう。読み取り / 復号エラーで途切れた
+/// 場合は `stream_truly_ended` が false になり、従来どおり失敗のままにする。
+fn accepts_final_frame_at_end_of_stream(
+    target_secs: f64,
+    frame_pts_secs: f64,
+    tolerance: FrameMatchTolerance,
+    stream_truly_ended: bool,
+) -> bool {
+    if is_preceding_frame_within_tolerance(target_secs, frame_pts_secs, tolerance) {
+        return true;
+    }
+    stream_truly_ended
+        && target_secs.is_finite()
+        && frame_pts_secs.is_finite()
+        && frame_pts_secs <= target_secs
+}
+
 fn is_following_frame_within_tolerance(
     target_secs: f64,
     frame_pts_secs: f64,
@@ -2246,15 +2271,18 @@ impl SeekStripDecoder {
 
         drop(accept_frame);
         if matches!(stop, RunStop::Complete) && cursor < run.cells.len() {
+            // 読み取り / 復号エラーで途切れたのではなく、本当に stream の終端に達したか。
+            let stream_truly_ended = first_demux_error.is_none() && first_decode_error.is_none();
             if let Some((frame, pts_secs)) = last_frame.as_ref() {
                 let mut ready_cells = Vec::new();
                 while let Some(cell) = run.cells.get(cursor) {
                     let target_secs =
                         cell_presentation_target_secs(cell, &indexed_presentation_targets.borrow());
-                    if is_preceding_frame_within_tolerance(
+                    if accepts_final_frame_at_end_of_stream(
                         target_secs,
                         *pts_secs,
                         cell.frame_match_tolerance,
+                        stream_truly_ended,
                     ) {
                         ready_cells.push(cell.clone());
                     } else {
@@ -2485,6 +2513,43 @@ fn convert_keyframe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 実素材の数値そのもの (06jademarx04rocker.wmv): duration は 118.019 と申告されるが、
+    /// 実際に復号できる最後のフレームは 116.866。格子はその差ぶんだけフレームの無い区間へ
+    /// セルを置き、最終セル 118.000 は許容 1 格子をわずかに超えて外れていた。
+    #[test]
+    fn the_final_frame_fills_a_cell_the_declared_duration_invented() {
+        let tolerance = FrameMatchTolerance::symmetric(1.0);
+        let target_secs = 118.0;
+        let last_frame_secs = 116.866;
+
+        assert!(
+            !is_preceding_frame_within_tolerance(target_secs, last_frame_secs, tolerance),
+            "前提: 通常の許容幅では届かない"
+        );
+        assert!(
+            accepts_final_frame_at_end_of_stream(target_secs, last_frame_secs, tolerance, true),
+            "stream が終わっているなら、そのセルは動画の終わりなので最後のフレームを出す"
+        );
+        assert!(
+            !accepts_final_frame_at_end_of_stream(target_secs, last_frame_secs, tolerance, false),
+            "読み取り / 復号が途中で切れた場合は充てない"
+        );
+    }
+
+    #[test]
+    fn the_final_frame_never_stands_in_for_a_cell_before_it() {
+        let tolerance = FrameMatchTolerance::symmetric(1.0);
+        // 目的時刻より後ろのフレームは通常経路が拾う。ここで拾うと別の場面を持ってくる。
+        assert!(
+            !accepts_final_frame_at_end_of_stream(100.0, 104.0, tolerance, true),
+            "終端でも前方向へは伸ばさない"
+        );
+        assert!(
+            accepts_final_frame_at_end_of_stream(100.0, 99.5, tolerance, true),
+            "許容内はもとより通る"
+        );
+    }
 
     fn axis(count: usize) -> StripAxis {
         StripAxis::KeyframeIndex {
