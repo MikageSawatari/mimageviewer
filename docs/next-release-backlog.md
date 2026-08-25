@@ -2986,3 +2986,22 @@ SimplySign のクラウド鍵セッションが切れていても通過する (�
 | 詳細表示 / スマートフィルタ | `docs/details-view-and-filter-plan.md`, `CLAUDE.md` の UI / スクロール節 |
 | タグ / フルスクリーン右パネル / 動画 overlay | `docs/tag-catalog-redesign-plan.md`, `docs/display-pipeline.md`, `docs/video-architecture.md`, `docs/detached-viewer-implementation-plan.md` |
 | リリース / 依存更新 | `CLAUDE.md` のリリース手順、各 native 依存管理節 |
+
+### 1.124 見開き表示のまま Ctrl+G で補正レイヤーへ入ると、左右の切り替えもマスク編集も効かない — 実機報告
+
+- 出典: 2026-08-26、利用者報告。**見開き表示のページ**で <kbd>Ctrl</kbd>+<kbd>G</kbd> を押して
+  補正レイヤー画面へ入ると、左右ページの切り替えが動かず、マスク編集も含めて操作が
+  まったく効かなくなる。
+- **未調査。着手前に確認すること** (推測で直さない):
+  1. 補正レイヤー画面は「1 ページ 1 編集対象」を前提にしているはず。見開きで入ったとき
+     **編集対象がどちらのページに決まるのか**、あるいは決まらないまま入っているのかを
+     まず観測する。決まっていないなら、入口で単ページへ落とすのか、左右を選ばせるのかは
+     仕様判断になる。
+  2. 「すべて効かない」= 入力が別の所有者に吸われている可能性がある。キー・ポインタの
+     消費経路 (`consume_key` / キャンバス入力) を、見開きと単ページで比べる。
+  3. 同型の入口を数える。<kbd>Ctrl</kbd>+<kbd>G</kbd> だけでなく、メニュー・ツールバーから
+     補正レイヤーへ入る経路、連結読み中、横長分割中 (v3.3.0 で追加) でも同じか。
+     [CLAUDE.md](../CLAUDE.md) 「バグ修正の一般原則」に従い、再現した経路だけで終えない。
+- 関連ドキュメント: [local-adjustment-layer-v1.1.0-plan.md](local-adjustment-layer-v1.1.0-plan.md)、
+  [preset-and-adjustment.md](preset-and-adjustment.md)、[display-pipeline.md](display-pipeline.md)。
+- 規模 / 優先度: 未見積 / **v3.3.0 に含める** (利用者判断、2026-08-26)。

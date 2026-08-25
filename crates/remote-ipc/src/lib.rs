@@ -252,6 +252,33 @@ impl RemoteSpreadMode {
     pub fn is_split(self) -> bool {
         matches!(self, Self::SplitLtr | Self::SplitRtl)
     }
+
+    /// wire 上の名前。JSON も query 文字列もこの綴りを使う。
+    ///
+    /// **この enum の綴りを列挙する場所を他に作らないこと。**query 文字列側に同じ表を
+    /// 手で書いていたため、`SplitLtr` / `SplitRtl` を足したときに片方だけ古いままになり、
+    /// 端末からモードを選ぶと 400 が返って分割が一切効かなかった (2026-08-26)。
+    /// ここは網羅 match なので、variant を足せばコンパイルが止まる。
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Ltr => "ltr",
+            Self::LtrCover => "ltr_cover",
+            Self::Rtl => "rtl",
+            Self::RtlCover => "rtl_cover",
+            Self::SplitLtr => "split_ltr",
+            Self::SplitRtl => "split_rtl",
+        }
+    }
+
+    /// wire 上の名前から戻す。**表を持たず serde の derive をそのまま使う**ので、
+    /// variant を足しても解析側を直し忘れようがない。
+    pub fn from_wire_name(name: &str) -> Option<Self> {
+        use serde::de::IntoDeserializer;
+        let deserializer: serde::de::value::StrDeserializer<serde::de::value::Error> =
+            name.into_deserializer();
+        Self::deserialize(deserializer).ok()
+    }
 }
 
 /// 分割したページの、どちら側を表示しているか。
@@ -2708,6 +2735,40 @@ mod tests {
         let actual: ClientMessage =
             read_frame(&mut bytes.as_slice(), MAX_CONTROL_FRAME_BYTES).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    /// wire 上の綴りは JSON と query 文字列で同じでなければならない。
+    ///
+    /// **この 2 つを別々の表で書いていたのが実害の原因**なので、片方が動いていることでは
+    /// なく、**両方が同じ綴りに落ちること**を確かめる。
+    fn every_spread_mode_has_one_spelling_for_json_and_query() {
+        let modes = [
+            RemoteSpreadMode::Single,
+            RemoteSpreadMode::Ltr,
+            RemoteSpreadMode::LtrCover,
+            RemoteSpreadMode::Rtl,
+            RemoteSpreadMode::RtlCover,
+            RemoteSpreadMode::SplitLtr,
+            RemoteSpreadMode::SplitRtl,
+        ];
+        for mode in modes {
+            let json = serde_json::to_string(&mode).expect("serialize");
+            assert_eq!(
+                json,
+                format!("\"{}\"", mode.wire_name()),
+                "JSON と query 名が食い違っている: {mode:?}"
+            );
+            assert_eq!(
+                RemoteSpreadMode::from_wire_name(mode.wire_name()),
+                Some(mode),
+                "query 名から戻せない: {mode:?}"
+            );
+        }
+        // 綴りが重複していれば往復が壊れるので、重複していないことも上で保証される。
+        assert_eq!(RemoteSpreadMode::from_wire_name("vertical"), None);
+        assert_eq!(RemoteSpreadMode::from_wire_name(""), None);
+        assert_eq!(RemoteSpreadMode::from_wire_name("Single"), None);
     }
 
     #[test]

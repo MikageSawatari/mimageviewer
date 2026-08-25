@@ -886,14 +886,20 @@ fn cached_collection_landscape_flags(entries: &[RemoteEntry]) -> Vec<bool> {
             .and_then(|catalog| catalog.load_source_dims().ok())
             .unwrap_or_default();
         for (index, filename) in parent.images {
-            let dims = cached.get(&filename).and_then(|recorded| {
-                recorded.or_else(|| {
+            let dims = match cached.get(&filename) {
+                Some(recorded) => recorded.or_else(|| {
                     catalog
                         .as_ref()
                         .and_then(|catalog| catalog.load_one(&filename).ok().flatten())
                         .and_then(|entry| crate::catalog::decode_thumb_dims(&entry.jpeg_data))
-                })
-            });
+                }),
+                // カタログ行が 1 つも無い場合。コンテナ側と同じ読み取りを通す。
+                // ここを抜かすと、同じ本がフォルダから開けば分割され、レーティング一覧から
+                // 開けば分割されない、という食い違いになる。
+                None => super::container::page_dims_without_catalog(&GridItem::Image(
+                    PathBuf::from(&entries[index].path),
+                )),
+            };
             landscape[index] = dims.is_some_and(|(width, height)| {
                 let rotation = rotation_keys[index]
                     .as_ref()
@@ -1597,6 +1603,28 @@ mod tests {
             cached_collection_landscape_flags(&entries),
             [true, false, true]
         );
+    }
+
+    #[test]
+    /// **横断コレクションでも、カタログが無いフォルダの横長を見つける。**
+    ///
+    /// 横長判定はコンテナ側と横断コレクション側の 2 か所で作られる。片方だけ直すと、
+    /// 同じ本がフォルダから開けば分割され、レーティング一覧から開けば分割されない、
+    /// という食い違いになる。
+    fn collection_landscape_is_found_without_any_catalog() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let parent = data_dir.path().join("uncached");
+        std::fs::create_dir_all(&parent).unwrap();
+        let wide = parent.join("wide.png");
+        let tall = parent.join("tall.png");
+        image::RgbImage::new(300, 150).save(&wide).unwrap();
+        image::RgbImage::new(150, 300).save(&tall).unwrap();
+
+        let entries = vec![
+            test_remote_entry_kind(&wide, RemoteEntryKind::Image),
+            test_remote_entry_kind(&tall, RemoteEntryKind::Image),
+        ];
+        assert_eq!(cached_collection_landscape_flags(&entries), [true, false]);
     }
 
     #[test]

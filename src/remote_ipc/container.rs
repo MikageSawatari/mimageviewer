@@ -1940,6 +1940,36 @@ fn folder_thumb_aspect_height_ratio(settings: &crate::settings::Settings, folder
     f64::from(aspect.height_ratio())
 }
 
+/// カタログに行が無いページの寸法を、**ヘッダだけ読んで**求める。
+///
+/// サムネイルキャッシュ方針が既定の `Auto` だと、**速くて小さい画像が並ぶフォルダには
+/// カタログ行が 1 つも作られない**。横長判定をカタログだけに頼っていたため、その種の
+/// フォルダでは全ページが「横長ではない」と判定され、見開きの単独表示も横長分割も
+/// まったく効かなかった (2026-08-26 に利用者報告。分割を選んでも横長のまま)。
+///
+/// **表示の仕様がキャッシュ方針で変わってはいけない**ので、方針に依存しない読み取りを
+/// 置く。画素は読まない (`into_dimensions` はヘッダのみ)。
+///
+/// 横長判定を作る場所はコンテナと横断コレクションの 2 つある。**どちらもここを通すこと。**
+/// 片方だけ直すと、同じ本がフォルダから開けば分割され、レーティング一覧から開けば
+/// 分割されない、という食い違いになる。
+///
+/// ZIP / PDF ページはここでは補わない。書庫は 1 エントリごとに展開が要り、PDF ページ寸法は
+/// worker への往復が要るので、開くたびに全ページ分を払うわけにいかない。どちらも既定
+/// (`cache_zip_always` / `cache_pdf_always`) でカタログが作られるため実害はそれらを切った
+/// 場合に限られる。**黙って効かなくならないよう、寸法不明の件数はログへ残す。**
+pub(super) fn page_dims_without_catalog(item: &crate::grid_item::GridItem) -> Option<(u32, u32)> {
+    match item {
+        crate::grid_item::GridItem::Image(path) => image::ImageReader::open(path)
+            .ok()?
+            .with_guessed_format()
+            .ok()?
+            .into_dimensions()
+            .ok(),
+        _ => None,
+    }
+}
+
 impl ContainerEngine {
     #[cfg(test)]
     pub(super) fn new(settings: crate::settings::Settings) -> Self {
@@ -2428,8 +2458,8 @@ impl ContainerEngine {
                 "ok",
                 payload.entries.len(),
                 payload.page_groups.len(),
-                remote_spread_mode_name(payload.configured_spread_mode),
-                remote_spread_mode_name(payload.effective_spread_mode),
+                payload.configured_spread_mode.wire_name(),
+                payload.effective_spread_mode.wire_name(),
                 remote_reading_direction_name(payload.reading_direction),
             ),
             ContainerResponse::Error(_) => ("error", 0, 0, "none", "none", "none"),
@@ -4951,7 +4981,9 @@ impl ContainerEngine {
             .ok()
             .map(|db| db.get_many(rotation_keys.iter().filter_map(|key| key.as_deref())))
             .unwrap_or_default();
-        items
+        let mut pages = 0usize;
+        let mut unknown = 0usize;
+        let flags = items
             .iter()
             .zip(rotation_keys)
             .map(|(item, rotation_key)| {
@@ -4968,21 +5000,31 @@ impl ContainerEngine {
                     }
                     _ => None,
                 };
-                key.and_then(|key| {
-                    // A missing key means no catalog row at all. A present-but-empty value is a
-                    // row saved before the dimension columns existed, and only those are worth
-                    // paying for a thumbnail read to recover.
-                    let recorded = cached.get(&key)?;
-                    recorded.or_else(|| {
-                        catalog
-                            .as_ref()
-                            .and_then(|catalog| catalog.load_one(&key).ok().flatten())
-                            .and_then(|entry| crate::catalog::decode_thumb_dims(&entry.jpeg_data))
-                    })
-                })
+                if key.is_some() {
+                    pages += 1;
+                }
+                let dims = key.and_then(|key| {
+                    // A present-but-empty value is a row saved before the dimension columns
+                    // existed, and only those are worth paying for a thumbnail read to recover.
+                    match cached.get(&key) {
+                        Some(recorded) => recorded.or_else(|| {
+                            catalog
+                                .as_ref()
+                                .and_then(|catalog| catalog.load_one(&key).ok().flatten())
+                                .and_then(|entry| {
+                                    crate::catalog::decode_thumb_dims(&entry.jpeg_data)
+                                })
+                        }),
+                        // カタログ行が 1 つも無い場合。ヘッダだけ読んで補う。
+                        None => page_dims_without_catalog(item),
+                    }
+                });
+                if dims.is_none() {
+                    unknown += 1;
+                }
                 // Catalog dimensions are a layout/aspect space. PDF page-box values are valid
                 // here because only their ratio is observed; they are not an edit coordinate.
-                .is_some_and(|(width, height)| {
+                dims.is_some_and(|(width, height)| {
                     let rotation = rotation_key
                         .as_ref()
                         .and_then(|key| rotations.get(key))
@@ -4991,7 +5033,16 @@ impl ContainerEngine {
                     crate::rotation_db::landscape_after_rotation(width, height, rotation)
                 })
             })
-            .collect()
+            .collect();
+        // 寸法が分からないページは「横長ではない」として扱うしかないが、**黙って
+        // 見開き単独表示も横長分割も効かなくなる**。原因を推測から始めずに済むよう、
+        // 件数を残す。全ページ不明ならカタログもヘッダ読みも当たっていない。
+        if unknown > 0 {
+            crate::logger::log(format!(
+                "remote_ipc: page dims unknown pages={unknown}/{pages}                  (landscape detection is off for those pages)"
+            ));
+        }
+        flags
     }
 
     fn load_image(
@@ -6267,18 +6318,6 @@ fn remote_spread_mode(mode: crate::settings::SpreadMode) -> RemoteSpreadMode {
     }
 }
 
-fn remote_spread_mode_name(mode: RemoteSpreadMode) -> &'static str {
-    match mode {
-        RemoteSpreadMode::Single => "single",
-        RemoteSpreadMode::Ltr => "ltr",
-        RemoteSpreadMode::LtrCover => "ltr_cover",
-        RemoteSpreadMode::Rtl => "rtl",
-        RemoteSpreadMode::RtlCover => "rtl_cover",
-        RemoteSpreadMode::SplitLtr => "split_ltr",
-        RemoteSpreadMode::SplitRtl => "split_rtl",
-    }
-}
-
 fn remote_reading_direction(
     direction: crate::settings::ReadingDirection,
 ) -> RemoteReadingDirection {
@@ -7486,6 +7525,61 @@ mod tests {
     }
 
     #[test]
+    /// **キャッシュ方針で表示の仕様が変わってはいけない。**
+    ///
+    /// 既定の `Auto` 方針では、速くて小さい画像が並ぶフォルダにカタログ行が 1 つも
+    /// 作られない。カタログだけに頼っていたため横長判定が全ページ false になり、
+    /// 見開きの単独表示も横長分割も効かなかった (2026-08-26 の利用者報告)。
+    fn a_plain_image_file_reports_its_shape_without_any_catalog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let landscape = dir.path().join("wide.png");
+        image::RgbImage::new(120, 40)
+            .save(&landscape)
+            .expect("write landscape");
+        let portrait = dir.path().join("tall.png");
+        image::RgbImage::new(40, 120)
+            .save(&portrait)
+            .expect("write portrait");
+
+        assert_eq!(
+            page_dims_without_catalog(&crate::grid_item::GridItem::Image(landscape)),
+            Some((120, 40))
+        );
+        assert_eq!(
+            page_dims_without_catalog(&crate::grid_item::GridItem::Image(portrait)),
+            Some((40, 120))
+        );
+        // 存在しないファイルは「不明」。横長として扱わない。
+        assert_eq!(
+            page_dims_without_catalog(&crate::grid_item::GridItem::Image(
+                dir.path().join("missing.png")
+            )),
+            None
+        );
+    }
+
+    #[test]
+    /// ZIP / PDF ページはこの経路では補わない (書庫展開と worker 往復が要るため)。
+    /// **意図した範囲であることを固定する。**広げるときはここが落ちる。
+    fn archive_and_pdf_pages_still_depend_on_the_catalog() {
+        assert_eq!(
+            page_dims_without_catalog(&crate::grid_item::GridItem::ZipImage {
+                zip_path: std::path::PathBuf::from("book.zip"),
+                entry_name: "001.jpg".into(),
+            }),
+            None
+        );
+        assert_eq!(
+            page_dims_without_catalog(&crate::grid_item::GridItem::PdfPage {
+                pdf_path: std::path::PathBuf::from("book.pdf"),
+                page_num: 0,
+                content_type: None,
+            }),
+            None
+        );
+    }
+
+    #[test]
     fn cached_landscape_flags_apply_saved_pdf_page_rotation() {
         let data_dir = crate::data_dir::TestDataDirGuard::new();
         let pdf_path = data_dir.path().join("rotated.pdf");
@@ -7524,6 +7618,44 @@ mod tests {
         let engine = ContainerEngine::new(crate::settings::Settings::default());
         assert_eq!(
             engine.cached_landscape_flags(&pdf_path, &items),
+            [true, false]
+        );
+    }
+
+    #[test]
+    /// **カタログが 1 行も無いフォルダでも横長を見つける。**
+    ///
+    /// 既定のキャッシュ方針 `Auto` は、速くて小さい画像のフォルダにカタログを作らない。
+    /// カタログだけを見ていたため、その種のフォルダでは横長ページが 1 枚も見つからず、
+    /// 見開きの単独表示も横長分割も効かなかった (2026-08-26 の利用者報告)。
+    fn landscape_is_found_in_a_folder_that_has_no_catalog_at_all() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let folder = data_dir.path().join("book");
+        std::fs::create_dir_all(&folder).unwrap();
+        let wide = folder.join("001.png");
+        let tall = folder.join("002.png");
+        image::RgbImage::new(200, 100).save(&wide).unwrap();
+        image::RgbImage::new(100, 200).save(&tall).unwrap();
+        let items = vec![
+            crate::grid_item::GridItem::Image(wide),
+            crate::grid_item::GridItem::Image(tall),
+        ];
+
+        // カタログは作らない。この状態が既定方針での通常のフォルダである。
+        assert!(
+            crate::catalog::CatalogDb::open_existing_read_only(
+                &crate::catalog::default_cache_dir(),
+                &folder,
+            )
+            .ok()
+            .flatten()
+            .is_none(),
+            "この試験はカタログが無い状態を確かめるもの"
+        );
+
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        assert_eq!(
+            engine.cached_landscape_flags(&folder, &items),
             [true, false]
         );
     }
