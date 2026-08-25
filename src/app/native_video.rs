@@ -1686,7 +1686,7 @@ impl App {
             .is_some_and(|pending| {
                 pending.parked_live_window_id == self.native_video_parked_live_input_window_id
                     && (self.native_video_parked_live_input_window_id.is_some()
-                        || !self.active_detached_viewer_context_contains_video())
+                        || !self.active_viewer_context_contains_video())
             })
     }
 
@@ -1839,7 +1839,7 @@ impl App {
     pub(crate) fn clear_mounted_native_video_pending(&mut self) {
         // promoted active context は owner=None だが、main close 中は bundle が unmounted。
         // media 窓自身の close は active context を take + mount してからここへ来るため false。
-        if self.active_detached_viewer_context_contains_video() {
+        if self.active_viewer_context_contains_video() {
             return;
         }
         if self

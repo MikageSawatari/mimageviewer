@@ -25,11 +25,11 @@ use std::sync::Arc;
 use crate::adjustment::PostFilter;
 use crate::ai::ModelKind;
 use crate::app::{
-    App, FsDisplayUnitHoldover, FsDisplayUnitHoldoverPage, FsHoldover, FsNavigationDisplayTarget,
-    FsNavigationPresentation, FsNavigationSequence, FsNavigationSequenceTarget,
-    FsNavigationTargetPhase, FsOpenMaterialization, FsOverflowPanelState, FsPageLoadState,
-    FsPrefetchIndicator, FsPrefetchPageState, FsPrefetchSideDisplay, ViewerPresentation,
-    build_fs_prefetch_indicator,
+    App, ContextResidence, FsDisplayUnitHoldover, FsDisplayUnitHoldoverPage, FsHoldover,
+    FsNavigationDisplayTarget, FsNavigationPresentation, FsNavigationSequence,
+    FsNavigationSequenceTarget, FsNavigationTargetPhase, FsOpenMaterialization,
+    FsOverflowPanelState, FsPageLoadState, FsPrefetchIndicator, FsPrefetchPageState,
+    FsPrefetchSideDisplay, ViewerPresentation, build_fs_prefetch_indicator,
 };
 use crate::displayed_image_transform::{
     DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
@@ -11329,7 +11329,7 @@ impl App {
                 } else if viewport_close_requested {
                     batch.close_ids.push(id);
                 }
-                let can_activate = window.can_activate();
+                let can_activate = self.detached_window_can_activate(window.id);
                 let focus_activation_raw = focused && !window.focused_last_frame;
                 let focus_edge = focused != window.focused_last_frame;
                 if (viewport_close_requested || bar_close_requested || focus_edge)
@@ -11351,7 +11351,7 @@ impl App {
                         window.activation_armed,
                         window.activation_ready_frame,
                         self.frame_counter,
-                        window.viewer_context_is_at_rest(),
+                        self.detached_window_context_is_at_rest(window.id),
                         window.reopen_descriptor.is_some(),
                         window.reopen_sync_stamp.is_some()
                     ));
@@ -11432,7 +11432,7 @@ impl App {
             .detached_image_windows
             .iter()
             .find(|window| window.id == window_id)
-            .map(crate::app::DetachedImageWindowSnapshot::right_drag_context)
+            .map(|window| self.right_drag_context_for_window_id(window.id))
         else {
             self.cancel_detached_right_drag_owner(window_id, "right_drag_snapshot_missing");
             return;
@@ -11817,8 +11817,8 @@ impl App {
                  host={} title={:?}",
                     self.frame_counter,
                     window.id,
-                    window.can_activate(),
-                    window.viewer_context_is_at_rest(),
+                    self.detached_window_can_activate(window.id),
+                    self.detached_window_context_is_at_rest(window.id),
                     window.reopen_descriptor.is_some(),
                     window.reopen_sync_stamp.is_some(),
                     window.texture.size_vec2().x,
@@ -12058,7 +12058,10 @@ impl App {
             );
             let right_drag_guide = egui_owns_right_drag
                 .then(|| {
-                    self.right_drag_guide_for_owner(right_drag_owner, window.right_drag_context())
+                    self.right_drag_guide_for_owner(
+                        right_drag_owner,
+                        self.right_drag_context_for_window_id(window.id),
+                    )
                 })
                 .flatten();
             let ui_scale = self.settings.ui_scale_factor;
@@ -12199,15 +12202,14 @@ impl App {
             } else if viewport_close_requested {
                 render_batch.close_ids.push(window.id);
             }
-            let can_activate = self
-                .detached_image_windows
-                .iter()
-                .any(|candidate| candidate.id == window.id && candidate.can_activate());
+            let can_activate = self.detached_image_windows.iter().any(|candidate| {
+                candidate.id == window.id && self.detached_window_can_activate(candidate.id)
+            });
             let actual_has_bundle = self
                 .detached_image_windows
                 .iter()
                 .find(|candidate| candidate.id == window.id)
-                .is_some_and(|candidate| candidate.viewer_context_is_at_rest());
+                .is_some_and(|candidate| self.detached_window_context_is_at_rest(candidate.id));
             let focus_activation_raw = focused_now && !window.focused_last_frame;
             let user_activation = primary_released;
             let focus_edge = focused_now != window.focused_last_frame;
@@ -13143,22 +13145,29 @@ impl App {
             return;
         }
 
-        // The backstop is called after the normal active renderer has returned, so the active
-        // detached owner is normally parked in `active_detached_viewer_context`. Mount the whole
-        // bundle before resolving the title, display texture, holdover latch, adjustments, or
-        // generation-scoped paint resources. Looking those up on the main sibling would combine
-        // an active detached session/viewport with another context's indexed state.
-        //
-        // `None` also has a legitimate meaning: callers already inside
-        // `with_active_detached_viewer_context` have the owner mounted directly on `App`. The
-        // alive/session checks above are the strongest existing distinction from a genuinely
-        // missing owner; do not add another detached sentinel merely for this hand-off.
-        if self.active_detached_context_is_at_rest() {
-            let _ = self.with_active_detached_viewer_context(|app| {
-                app.render_active_detached_viewport_backstop_mounted(ctx, viewport_id);
-            });
-        } else {
-            self.render_active_detached_viewport_backstop_mounted(ctx, viewport_id);
+        // The binding table answers both ownership and residence for this viewport. Mounting an
+        // at-rest owner keeps all indexed state together; an already-mounted owner renders
+        // directly without a second pass.
+        let window_id = self
+            .active_detached_session
+            .expect("live detached viewport must have an active session")
+            .window_id;
+        match self.locate_window_context(window_id) {
+            Some((_, ContextResidence::AtRest)) => {
+                self.with_window_viewer_context(window_id, |app| {
+                    app.render_active_detached_viewport_backstop_mounted(ctx, viewport_id);
+                })
+                .expect("at-rest backstop owner must be mountable");
+            }
+            Some((_, ContextResidence::Mounted)) => {
+                self.render_active_detached_viewport_backstop_mounted(ctx, viewport_id);
+            }
+            Some((owner, residence)) => {
+                panic!(
+                    "active detached backstop window {window_id} belongs to {owner:?} in {residence:?}"
+                );
+            }
+            None => panic!("active detached backstop window {window_id} has no context binding"),
         }
     }
 

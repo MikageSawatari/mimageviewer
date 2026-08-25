@@ -538,7 +538,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
     ) -> bool {
-        let active_media = self.active_detached_viewer_context_contains_video();
+        let active_media = self.active_viewer_context_contains_video();
         let mounted_media =
             self.viewer_session_is_detached() && self.current_viewer_context_contains_video();
         if !active_media && !mounted_media {
@@ -581,12 +581,27 @@ impl App {
         // 同じ media window が既に生きている場合は、コンテキストを作り直さず seek だけ
         // 新しいブックマークへ差し替える。main 側の grid snapshot は今回のクリック時点の値。
         if self.raise_active_detached_media_for_grid_open(ctx, &pending.path) {
-            let Some(active) = self.active_detached_viewer_context.as_mut() else {
+            let Some(id) = self.active_viewer_context_id() else {
                 self.bookmark_open_pending =
                     Some(crate::bookmark_browser::PendingBookmarkOpen::Media(pending));
                 return false;
             };
-            active.bundle.retarget_bookmark_media_open(pending, target);
+            let mut request = Some((pending, target));
+            if let Err(error) = self.with_viewer_context(id, |app| {
+                let (pending, target) = request.take().unwrap();
+                app.bookmark_open_pending =
+                    Some(crate::bookmark_browser::PendingBookmarkOpen::Media(pending));
+                app.bookmark_view_state = Some(BookmarkViewState::Detached { target });
+            }) {
+                if let Some((pending, _)) = request {
+                    self.bookmark_open_pending =
+                        Some(crate::bookmark_browser::PendingBookmarkOpen::Media(pending));
+                }
+                crate::logger::log(format!(
+                    "[bookmark-open] retarget mount failed id={id:?} error={error:?}"
+                ));
+                return false;
+            }
             crate::logger::log(format!(
                 "[bookmark-open] reuse detached media context path={}",
                 requested.display()
@@ -602,60 +617,63 @@ impl App {
             return false;
         }
 
-        let mut main_context = self.take_current_viewer_context_bundle();
-        let context_serial = self.assign_next_detached_viewer_context_generation();
-        self.reset_active_detached_viewport_runtime_for_new_window(
-            context_serial,
-            "bookmark_media_detached_context",
-        );
-        self.bookmark_open_pending =
-            Some(crate::bookmark_browser::PendingBookmarkOpen::Media(pending));
-        self.bookmark_view_state = Some(BookmarkViewState::Detached { target });
-
-        let outcome = self.with_detached_viewer_main_history_suppressed(|app| {
-            let outcome = app.load_folder_or_convert_archive_with_auto_fullscreen(openable, true);
-            if select_requested_file && matches!(outcome, FolderOpenOutcome::Loaded) {
-                app.open_startup_file_if_visible(requested);
-            }
-            outcome
-        });
-        let opened_target = matches!(outcome, FolderOpenOutcome::Loaded)
-            && self
-                .fullscreen_idx
-                .and_then(|idx| self.items.get(idx))
-                .is_some_and(|item| match item {
-                    GridItem::Video(path) | GridItem::Audio(path) => {
-                        crate::path_key::eq_keep_drive(path, requested)
-                    }
-                    _ => false,
-                });
-
-        if !opened_target {
-            let session_window_id = self
-                .active_detached_session
-                .map(|session| session.window_id);
-            let closing_window_id = session_window_id.or(self.detached_viewer_window_id);
-            self.begin_active_detached_session_close("bookmark_media_detached_open_failed");
-            self.finish_active_detached_session_close("bookmark_media_detached_open_failed");
-            self.close_fullscreen();
-            if session_window_id.is_none()
-                && let Some(window_id) = closing_window_id
-            {
-                self.remove_detached_window_runtime(
-                    window_id,
-                    "bookmark_media_detached_open_failed",
+        let built =
+            self.build_viewer_context("bookmark_media_detached_context", |app, reserved| {
+                app.reset_active_detached_viewport_runtime_for_new_window(
+                    reserved.serial(),
+                    "bookmark_media_detached_context",
                 );
-            }
-            let _failed_context = self.take_current_viewer_context_bundle();
-            self.swap_viewer_context_bundle(&mut main_context);
+                app.bookmark_open_pending =
+                    Some(crate::bookmark_browser::PendingBookmarkOpen::Media(pending));
+                app.bookmark_view_state = Some(BookmarkViewState::Detached { target });
+
+                let outcome = app.with_detached_viewer_main_history_suppressed(|app| {
+                    let outcome =
+                        app.load_folder_or_convert_archive_with_auto_fullscreen(openable, true);
+                    if select_requested_file && matches!(outcome, FolderOpenOutcome::Loaded) {
+                        app.open_startup_file_if_visible(requested);
+                    }
+                    outcome
+                });
+                let opened_target = matches!(outcome, FolderOpenOutcome::Loaded)
+                    && app
+                        .fullscreen_idx
+                        .and_then(|idx| app.items.get(idx))
+                        .is_some_and(|item| match item {
+                            GridItem::Video(path) | GridItem::Audio(path) => {
+                                crate::path_key::eq_keep_drive(path, requested)
+                            }
+                            _ => false,
+                        });
+
+                if !opened_target {
+                    let session_window_id =
+                        app.active_detached_session.map(|session| session.window_id);
+                    let closing_window_id = session_window_id.or(app.detached_viewer_window_id);
+                    app.begin_active_detached_session_close("bookmark_media_detached_open_failed");
+                    app.finish_active_detached_session_close("bookmark_media_detached_open_failed");
+                    app.close_fullscreen();
+                    if session_window_id.is_none()
+                        && let Some(window_id) = closing_window_id
+                    {
+                        app.remove_detached_window_runtime(
+                            window_id,
+                            "bookmark_media_detached_open_failed",
+                        );
+                    }
+                    return BuildOutcome::Abort("target_not_opened");
+                }
+                let window_id = app
+                    .active_detached_session
+                    .map(|session| session.window_id)
+                    .or(app.detached_viewer_window_id)
+                    .expect("opened detached bookmark media must own a window");
+                app.reserve_window_binding_for_build(window_id);
+                BuildOutcome::Commit
+            });
+        if built.is_none() {
             return false;
         }
-
-        let active_context = self.take_current_viewer_context_bundle();
-        self.swap_viewer_context_bundle(&mut main_context);
-        self.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
-            bundle: active_context,
-        });
         crate::logger::log(format!(
             "[bookmark-open] detached media context started path={} main_bookmarks={}",
             requested.display(),

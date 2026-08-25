@@ -18,9 +18,11 @@ const APP_TESTS_PATH: &str = "src/app/tests.rs";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum Rule {
+    A1,
     A2a,
     A2b,
     A3,
+    A5,
     A7a,
     A7b,
     A7c,
@@ -32,9 +34,11 @@ enum Rule {
 impl fmt::Display for Rule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
+            Self::A1 => "A1",
             Self::A2a => "A2a",
             Self::A2b => "A2b",
             Self::A3 => "A3",
+            Self::A5 => "A5",
             Self::A7a => "A7(a)",
             Self::A7b => "A7(b)",
             Self::A7c => "A7(c)",
@@ -100,12 +104,6 @@ const ALLOWLIST_ENTRIES: &[AllowlistEntry] = &[
         function: "remove_items_batch",
         rule: Rule::A2b,
         reason: "Takes, index-shifts, and immediately reassigns per-item maps after batch deletion; every value stays in the same mounted context and the temporary ownership exists only to transform keys in place.",
-    },
-    AllowlistEntry {
-        file: "src/app.rs",
-        function: "take_current_viewer_context_bundle",
-        rule: Rule::A3,
-        reason: "This pre-registry extraction primitive creates the fresh empty projection required by the current swap boundary; stage 2-e removes the raw bundle construction when ownership transactions replace this helper.",
     },
 ];
 
@@ -723,9 +721,94 @@ impl AuditVisitor<'_> {
         self.visit_expr(expression);
         self.field_context = previous;
     }
+
+    fn type_contains_bundle(&self, ty: &Type) -> bool {
+        struct Finder<'a> {
+            imports: &'a ImportNormalizer,
+            found: bool,
+        }
+
+        impl<'ast> Visit<'ast> for Finder<'_> {
+            fn visit_path(&mut self, path: &'ast syn::Path) {
+                let segments: Vec<String> = path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect();
+                let direct = segments
+                    .iter()
+                    .any(|segment| segment == "ViewerContextBundle");
+                let imported = segments.first().is_some_and(|first| {
+                    self.imports.aliases.get(first).is_some_and(|canonical| {
+                        canonical
+                            .iter()
+                            .any(|segment| segment == "ViewerContextBundle")
+                    })
+                });
+                if direct || imported {
+                    self.found = true;
+                }
+                visit::visit_path(self, path);
+            }
+        }
+
+        let mut finder = Finder {
+            imports: &self.imports,
+            found: false,
+        };
+        finder.visit_type(ty);
+        finder.found
+    }
 }
 
 impl<'ast> Visit<'ast> for AuditVisitor<'_> {
+    fn visit_type(&mut self, node: &'ast Type) {
+        if self.type_contains_bundle(node) {
+            self.record(
+                Rule::A1,
+                node.span(),
+                "ViewerContextBundle appears in a type position outside the registry module",
+            );
+            return;
+        }
+        visit::visit_type(self, node);
+    }
+
+    fn visit_ident(&mut self, node: &'ast syn::Ident) {
+        if node == "paused_bundle" || node == "active_detached_viewer_context" {
+            self.record(
+                Rule::A5,
+                node.span(),
+                format!("forbidden legacy ownership identifier {node} remains"),
+            );
+        }
+        visit::visit_ident(self, node);
+    }
+
+    fn visit_member(&mut self, node: &'ast syn::Member) {
+        if let syn::Member::Named(ident) = node
+            && (ident == "paused_bundle" || ident == "active_detached_viewer_context")
+        {
+            self.record(
+                Rule::A5,
+                ident.span(),
+                format!("forbidden legacy ownership identifier {ident} remains"),
+            );
+        }
+        visit::visit_member(self, node);
+    }
+
+    fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+        if use_tree_mentions_bundle(&node.tree) {
+            self.record(
+                Rule::A1,
+                node.span(),
+                "ViewerContextBundle import, rename, or re-export is forbidden outside the registry module",
+            );
+        }
+        visit::visit_item_use(self, node);
+    }
+
     fn visit_item(&mut self, node: &'ast Item) {
         let is_test = item_attributes(node).iter().any(is_cfg_test_attribute);
         self.cfg_test_depth += usize::from(is_test);
@@ -863,6 +946,15 @@ impl<'ast> Visit<'ast> for AuditVisitor<'_> {
     }
 
     fn visit_expr_field(&mut self, node: &'ast ExprField) {
+        if let Member::Named(ident) = &node.member
+            && (ident == "paused_bundle" || ident == "active_detached_viewer_context")
+        {
+            self.record(
+                Rule::A5,
+                ident.span(),
+                format!("forbidden legacy ownership identifier {ident} remains"),
+            );
+        }
         if member_is(&node.member, "viewer_contexts")
             && matches!(self.field_context, FieldContext::Value)
         {
@@ -901,6 +993,18 @@ impl<'ast> Visit<'ast> for AuditVisitor<'_> {
             );
         }
         visit::visit_pat_struct(self, node);
+    }
+}
+
+fn use_tree_mentions_bundle(tree: &UseTree) -> bool {
+    match tree {
+        UseTree::Path(path) => {
+            path.ident == "ViewerContextBundle" || use_tree_mentions_bundle(&path.tree)
+        }
+        UseTree::Name(name) => name.ident == "ViewerContextBundle",
+        UseTree::Rename(rename) => rename.ident == "ViewerContextBundle",
+        UseTree::Glob(_) => false,
+        UseTree::Group(group) => group.items.iter().any(use_tree_mentions_bundle),
     }
 }
 
@@ -1286,6 +1390,56 @@ mod tests {
     }
 
     #[test]
+    fn a1_flags_type_positions_import_aliases_and_reexports_but_not_value_paths_or_text() {
+        for source in [
+            "struct Holder { bundle: Option<Box<ViewerContextBundle>> }",
+            "fn take(bundle: &mut ViewerContextBundle) {}",
+            "fn make() -> Vec<ViewerContextBundle> { todo!() }",
+            "fn local() { let value: ViewerContextBundle = todo!(); }",
+            "impl Demo<ViewerContextBundle> {}",
+            "type BundleAlias = ViewerContextBundle;",
+            "use crate::app::viewer_context_registry::ViewerContextBundle as BundleAlias;",
+            "pub use crate::app::viewer_context_registry::ViewerContextBundle;",
+        ] {
+            let violations = fixture(source);
+            assert!(has_rule(&violations, Rule::A1), "{source}: {violations:#?}");
+        }
+
+        for source in [
+            "fn value_path_only() { ViewerContextBundle::empty(); }",
+            r#"#[doc = "ViewerContextBundle"] fn documented() {}"#,
+            r#"const NAME: &str = "ViewerContextBundle";"#,
+        ] {
+            let violations = fixture(source);
+            assert!(
+                !has_rule(&violations, Rule::A1),
+                "{source}: {violations:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a5_flags_legacy_ownership_identifiers_but_not_text() {
+        for source in [
+            "fn bad(active_detached_viewer_context: usize) {}",
+            "fn bad(app: App) { app.paused_bundle.take(); }",
+        ] {
+            let violations = fixture(source);
+            assert!(has_rule(&violations, Rule::A5), "{source}: {violations:#?}");
+        }
+        for source in [
+            r#"#[doc = "paused_bundle"] fn documented() {}"#,
+            r#"const NAME: &str = "active_detached_viewer_context";"#,
+        ] {
+            let violations = fixture(source);
+            assert!(
+                !has_rule(&violations, Rule::A5),
+                "{source}: {violations:#?}"
+            );
+        }
+    }
+
+    #[test]
     fn a7_shape_a_mem_operation_target() {
         assert_flagged_and_clear(
             Rule::A7a,
@@ -1364,7 +1518,11 @@ mod tests {
     fn registry_module_suppresses_every_rule_after_the_same_source_rejects_elsewhere() {
         let source = r#"
             use std::mem::{swap, take};
-            fn all(app: &mut App) -> Option<ViewerContextRegistry> {
+            fn all(
+                app: &mut App,
+                bundle: &ViewerContextBundle,
+            ) -> Option<ViewerContextRegistry> {
+                let paused_bundle = bundle;
                 swap(&mut app.selected, &mut stash);
                 take(&mut app.items);
                 take(&mut app.thumbnails);
@@ -1381,9 +1539,11 @@ mod tests {
         "#;
         let outside = fixture(source);
         for rule in [
+            Rule::A1,
             Rule::A2a,
             Rule::A2b,
             Rule::A3,
+            Rule::A5,
             Rule::A7a,
             Rule::A7b,
             Rule::A7c,

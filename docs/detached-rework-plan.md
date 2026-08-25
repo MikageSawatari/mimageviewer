@@ -625,6 +625,32 @@ helper 3 本が `impl Into<ContextRef<'a>>` を取り、`From<&ViewerContextBund
 `become_independent_detached_viewer` / `retarget_bookmark_media_open` /
 `split_materialized_physical_context_for_detached_scope` (fork + 絞り込みを 1 本に)。
 
+**ステージ②-d 実装完了・実機 smoke 待ち (2026-08-25、未コミット。指示書
+[detached-rework-stage-r2e-2d.md](detached-rework-stage-r2e-2d.md))。**
+`App::active_detached_viewer_context` と `DetachedImageWindowSnapshot::paused_bundle` を削除し、
+production の唯一の保管先を `ViewerContextRegistry` の slot に切り替えた。registry は
+`ViewerContextId` / `ContextResidence`、window↔context の双方向 binding、mount / build / fork /
+retire / promote の 5 transaction を所有する。build の binding は commit まで公開せず、
+live-media fork は binding を旧 main から新 context へ transfer する。
+
+- §6.5 の 3 stopgap は `locate_window_context()` と `ContextResidence` の問い合わせへ置換した。
+  active / parked は保管場所ではなく `DetachedWindowRuntime.state` が引き続き表す。
+- 全 context 操作は mounted id を先に 1 回処理し、同じ id を registry 巡回から除外する。
+  `all_context_clear_processes_a_paused_context_that_is_already_mounted` の完全一致列は維持した。
+- VST3 と rename の前置きフィルタは `ContextRef` へ移した。VST3 consume の marker 復元は
+  呼び出し元の `catch_unwind` 境界に残した。
+- swap 内部 failpoint を production payload の build abort / panic unwind に対して追加し、
+  I8 (commit 前の binding 非公開) を確認した。`RetireError::IsMain` と
+  `highest_reserved_serial` による Retired / Unknown の区別も維持している。
+- 4 one-shot の解除は registry 内の activate 操作へ集約した。ただし mounted 側に
+  `ViewerSession` の逐語実体があるとは扱わず、App の 3 ミラーは従来どおり個別に復元する。
+- 監査 A1 / A5 を有効化した。A1 は bundle 型の registry 外流出、A5 は旧 2 識別子の復活を
+  fixture で検出する。production 監査は既知の `activate_snapshot` 1 件だけを維持している。
+- library は 6285 tests / exit 0、audit は 25 tests / exit 0。実機では F12 still の
+  always-new / reuse、PDF/ZIP の park・resume と folder-nav、video/audio の live park・resume と
+  main context change promote、複数窓の順不同 close、右ドラッグ / keep-alive、tray / remote、
+  native presenter の HWND / focus / z-order を確認する。
+
 ## 「独立 detached viewer にする」3 経路のフラグ集合が違う — 調査済み・不具合なし
 
 **②-c1b では意図的に揃えなかった** (揃えると 2 経路の挙動が変わるため)。

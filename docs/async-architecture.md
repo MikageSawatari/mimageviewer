@@ -272,7 +272,8 @@ Ctrl+↑↓ は複数の起点から発火し、DFS 完了時に異なる後処�
   `FolderPaneOpenPending`、`pending_folder_nav_steps`、`pending_folder_nav_mode`、
   `ViewerNavigationScope` を一式で所有する。main と
   `DetachedPhysical` の active independent 静止画窓は bundle swap で完全に分離され、
-  active detached の結果はその bundle を mount 中の
+  bundle は viewer context registry の slot だけに保管される。active detached の結果は
+  window binding から特定した context を registry transaction で mount 中の
   `update_active_detached_viewer_context` だけが poll / apply する。pause / Drop は
   cancel token を立て、遅延結果を sibling context へ持ち越さない。
 - 仮想一覧から通常画像を detached open するときは、親フォルダの `read_dir` / metadata scan を

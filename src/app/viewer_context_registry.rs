@@ -1,23 +1,18 @@
-// Stage ②-d wires this state machine to the production viewer-context payload.
-
 use super::*;
 use std::collections::HashMap;
 
 /// A payload's identity, independent of its window and of the current main binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[allow(dead_code)]
-struct ViewerContextId(u64);
+pub(crate) struct ViewerContextId(u64);
 
-#[allow(dead_code)]
 impl ViewerContextId {
-    fn serial(self) -> u64 {
+    pub(in crate::app) fn serial(self) -> u64 {
         self.0
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
-enum ContextResidence {
+pub(crate) enum ContextResidence {
     Mounted,
     AtRest,
     Building,
@@ -26,7 +21,6 @@ enum ContextResidence {
     Unknown,
 }
 
-#[allow(dead_code)]
 enum Projection {
     Mounted(ViewerContextId),
     Building {
@@ -36,21 +30,18 @@ enum Projection {
     },
 }
 
-#[allow(dead_code)]
 enum Slot<P> {
     AtRest(P),
     Retiring(P),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
-enum ForkPolicy {
+pub(in crate::app) enum ForkPolicy {
     LiveMediaPark { window_id: u64 },
     MaterializedStillOpen,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 enum TableOp {
     ReplaceProjectionWithFreshEmpty,
     ForkProjectionIntoTransient(ForkPolicy),
@@ -61,8 +52,7 @@ enum TableOp {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-#[allow(dead_code)]
-enum BindError {
+pub(in crate::app) enum BindError {
     WindowOwnedBy(ViewerContextId),
     ContextOwnedBy(u64),
     WrongOrigin(Option<ViewerContextId>),
@@ -70,15 +60,13 @@ enum BindError {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-#[allow(dead_code)]
-struct MountError {
-    id: ViewerContextId,
-    residence: ContextResidence,
+pub(crate) struct MountError {
+    pub(crate) id: ViewerContextId,
+    pub(crate) residence: ContextResidence,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-#[allow(dead_code)]
-enum RetireError {
+pub(in crate::app) enum RetireError {
     /// App is mid-build; nothing can be retired.
     Building,
     /// The id is not at rest.
@@ -87,7 +75,6 @@ enum RetireError {
     IsMain,
 }
 
-#[allow(dead_code)]
 enum PendingTransition {
     BeginBuild {
         reserved: ViewerContextId,
@@ -126,7 +113,6 @@ enum PendingTransition {
 /// rollback: a payload already deposited in a slot can remain there. The protocol guarantees only
 /// that replacement keeps a payload in the projection at every instant (I1b), and that bindings are
 /// not published before a successful finalizer (I8).
-#[allow(dead_code)]
 struct ContextTable<P> {
     projection: Projection,
     slots: HashMap<ViewerContextId, Slot<P>>,
@@ -137,17 +123,18 @@ struct ContextTable<P> {
     pending: Option<PendingTransition>,
 }
 
-#[allow(dead_code)]
 impl<P> ContextTable<P> {
     fn new() -> Self {
-        let main = ViewerContextId(1);
+        // Detached context serials historically start at one. Keep the initial projection at
+        // serial zero so the first reserved detached identity preserves that generation encoding.
+        let main = ViewerContextId(0);
         Self {
             projection: Projection::Mounted(main),
             slots: HashMap::new(),
             main,
             window_of: HashMap::new(),
             context_of: HashMap::new(),
-            next_serial: 2,
+            next_serial: 1,
             pending: None,
         }
     }
@@ -639,6 +626,41 @@ impl<P> ContextTable<P> {
             Some(Slot::AtRest(_)) | None => None,
         }
     }
+
+    fn at_rest(&self, id: ViewerContextId) -> Option<&P> {
+        assert!(self.pending.is_none());
+        match self.slots.get(&id) {
+            Some(Slot::AtRest(payload)) => Some(payload),
+            Some(Slot::Retiring(_)) | None => None,
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(in crate::app) struct ViewerContextRegistry {
+    table: ContextTable<Box<ViewerContextBundle>>,
+}
+
+#[cfg(windows)]
+impl ViewerContextRegistry {
+    pub(in crate::app) fn new() -> Self {
+        Self {
+            table: ContextTable::new(),
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(in crate::app) enum BuildOutcome {
+    Commit,
+    Abort(&'static str),
+}
+
+#[cfg(windows)]
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::app) enum RetireContextError {
+    Mount(MountError),
+    Retire(RetireError),
 }
 
 // --- Production ViewerContextBundle ownership primitives (stage ②-b) ---
@@ -1129,6 +1151,27 @@ impl<'a> ContextRef<'a> {
     }
 }
 
+#[cfg(windows)]
+pub(in crate::app) struct ContextMut<'a> {
+    id: ViewerContextId,
+    bundle: &'a mut ViewerContextBundle,
+}
+
+#[cfg(windows)]
+impl ContextMut<'_> {
+    pub(in crate::app) fn id(&self) -> ViewerContextId {
+        self.id
+    }
+
+    pub(in crate::app) fn as_ref(&self) -> ContextRef<'_> {
+        ContextRef::at_rest(self.bundle)
+    }
+
+    pub(in crate::app) fn clear_normalize_state(&mut self) {
+        self.bundle.clear_normalize_state();
+    }
+}
+
 #[cfg(all(test, windows))]
 #[cfg(windows)]
 impl Drop for ViewerContextBundle {
@@ -1528,6 +1571,73 @@ impl ViewerContextBundle {
 
 impl App {
     #[cfg(windows)]
+    pub(in crate::app) fn pause_mounted_background_work_keep_current_frame(&mut self) {
+        self.slideshow_playing = false;
+        self.continuous_reading_scroll_transition = None;
+        self.slideshow_scroll_range_cache = None;
+        self.fs_seek_drag_active = false;
+        self.fs_seek_overlay_visible = false;
+        self.pending_auto_fs_open = false;
+        self.pending_return_to_parent = false;
+        self.fs_nav_after_pdf_enumerate = None;
+        self.fs_nav_locked_gen = None;
+        self.fs_holdover_tex = None;
+        self.fs_nav_dropped_block_signature = None;
+        self.fs_nav_dropped_block_count = 0;
+        self.continuous_page_transitions.clear();
+        self.pdf_enumerate_pending = None;
+        self.zip_enumerate_pending = None;
+        if let Some(pending) = self.folder_nav_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        if let Some(pending) = self.folder_pane_open_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        self.pending_folder_nav_steps = 0;
+        self.pending_folder_nav_mode = FolderNavMode::Grid;
+        for (_, pending) in self.fs_pending.drain() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        self.texture_backlog.clear();
+        for pending in self.final_ai_pending.values() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        self.final_ai_pending.clear();
+        for (_, pending) in self.local_adjust_pending.drain() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        for (_, pending) in self.comic_bake_pending.drain() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        for (_, pending) in self.erase_inpaint_pending.drain() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(windows)]
+    pub(in crate::app) fn activate_mounted_as_independent_detached(&mut self, window_id: u64) {
+        self.detached_viewer_window_id = Some(window_id);
+        self.detached_viewer_independent_active = true;
+        self.last_viewer_sync_stamp = None;
+        self.fs_open_intent_from_grid = false;
+        self.pending_auto_fs_open = false;
+        self.pending_return_to_parent = false;
+        self.pdf_prefetch_grace_until = None;
+    }
+
+    #[cfg(windows)]
+    pub(in crate::app) fn become_mounted_independent_detached_viewer(
+        &mut self,
+        window_id: u64,
+        idx: usize,
+    ) {
+        self.selected = Some(idx);
+        self.fullscreen_idx = Some(idx);
+        self.native_video_in_window_active = false;
+        self.activate_mounted_as_independent_detached(window_id);
+    }
+
+    #[cfg(windows)]
     pub(in crate::app) fn swap_viewer_context_bundle(&mut self, bundle: &mut ViewerContextBundle) {
         // path-keyed DB 更新は context-global。退避する側も復元する側も、idx-keyed cache を
         // その時点の最新世代へ揃えてから ownership を渡す。この関数はnavigationではなく
@@ -1536,6 +1646,8 @@ impl App {
         if self.sync_current_context_rating_session_writes() {
             self.rebuild_visible_indices_preserving_facet_scope();
         }
+        #[cfg(test)]
+        panic_at_viewer_context_swap_interior_for_test();
         macro_rules! swap_field {
             ($field:ident) => {
                 std::mem::swap(&mut self.$field, $field);
@@ -2593,6 +2705,562 @@ impl App {
     }
 }
 
+#[cfg(all(test, windows))]
+std::thread_local! {
+    static VIEWER_CONTEXT_SWAP_INTERIOR_FAILPOINT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(test, windows))]
+fn arm_viewer_context_swap_interior_failpoint_for_test() {
+    VIEWER_CONTEXT_SWAP_INTERIOR_FAILPOINT.with(|armed| armed.set(true));
+}
+
+#[cfg(all(test, windows))]
+fn panic_at_viewer_context_swap_interior_for_test() {
+    VIEWER_CONTEXT_SWAP_INTERIOR_FAILPOINT.with(|armed| {
+        if armed.replace(false) {
+            panic!("viewer-context swap interior failpoint");
+        }
+    });
+}
+
+#[cfg(windows)]
+enum ProductionForkSpec {
+    LiveMedia,
+    MaterializedStill {
+        physical_context: PathBuf,
+        idx: usize,
+        items_generation: u64,
+    },
+}
+
+#[cfg(windows)]
+impl App {
+    fn execute_viewer_context_ops(
+        &mut self,
+        ops: Vec<TableOp>,
+        mut fork_spec: Option<ProductionForkSpec>,
+    ) {
+        let mut transient = None;
+        for op in ops {
+            self.execute_viewer_context_op(op, &mut transient, &mut fork_spec);
+        }
+        assert!(transient.is_none());
+    }
+
+    fn execute_viewer_context_op(
+        &mut self,
+        op: TableOp,
+        transient: &mut Option<Box<ViewerContextBundle>>,
+        fork_spec: &mut Option<ProductionForkSpec>,
+    ) {
+        match op {
+            TableOp::ReplaceProjectionWithFreshEmpty => {
+                assert!(transient.is_none());
+                let mut payload = Box::new(ViewerContextBundle::empty());
+                self.swap_viewer_context_bundle(&mut payload);
+                *transient = Some(payload);
+            }
+            TableOp::ForkProjectionIntoTransient(policy) => {
+                assert!(transient.is_none());
+                *transient = Some(self.fork_viewer_context_payload(policy, fork_spec));
+            }
+            other => self.execute_viewer_context_storage_op(other, transient),
+        }
+    }
+
+    fn execute_viewer_context_storage_op(
+        &mut self,
+        op: TableOp,
+        transient: &mut Option<Box<ViewerContextBundle>>,
+    ) {
+        match op {
+            TableOp::DepositInto(id) => {
+                self.viewer_contexts
+                    .table
+                    .deposit(id, transient.take().unwrap());
+            }
+            TableOp::WithdrawFrom(id) => {
+                assert!(transient.is_none());
+                *transient = Some(self.viewer_contexts.table.withdraw(id));
+            }
+            TableOp::RestoreProjectionAndDropDisplacedEmpty => {
+                let mut payload = transient.take().unwrap();
+                self.swap_viewer_context_bundle(&mut payload);
+                drop(payload);
+            }
+            TableOp::DropTransientAsRetired(_) => drop(transient.take().unwrap()),
+            _ => unreachable!(),
+        }
+    }
+
+    fn fork_viewer_context_payload(
+        &mut self,
+        policy: ForkPolicy,
+        spec: &mut Option<ProductionForkSpec>,
+    ) -> Box<ViewerContextBundle> {
+        match (policy, spec.take()) {
+            (ForkPolicy::LiveMediaPark { .. }, Some(ProductionForkSpec::LiveMedia)) => {
+                self.split_current_context_preserving_main_grid()
+            }
+            (_, Some(spec)) => self.fork_materialized_payload(spec),
+            _ => panic!("viewer-context fork plan was missing"),
+        }
+    }
+
+    fn fork_materialized_payload(&mut self, spec: ProductionForkSpec) -> Box<ViewerContextBundle> {
+        if let ProductionForkSpec::MaterializedStill {
+            physical_context,
+            idx,
+            items_generation,
+        } = spec
+        {
+            self.split_materialized_physical_context_for_detached_scope(
+                &physical_context,
+                idx,
+                items_generation,
+            )
+        } else {
+            panic!("viewer-context fork plan disagreed")
+        }
+    }
+
+    fn items_generation_for_viewer_context(id: ViewerContextId) -> u64 {
+        DETACHED_VIEWER_CONTEXT_GENERATION_BASE
+            | id.serial()
+                .wrapping_mul(DETACHED_VIEWER_CONTEXT_GENERATION_STRIDE)
+    }
+}
+
+#[cfg(windows)]
+impl App {
+    pub(in crate::app) fn viewer_context_main(&self) -> ViewerContextId {
+        self.viewer_contexts.table.main()
+    }
+
+    pub(in crate::app) fn mounted_viewer_context_id(&self) -> Option<ViewerContextId> {
+        self.viewer_contexts.table.mounted_id()
+    }
+
+    pub(in crate::app) fn viewer_context_residence(&self, id: ViewerContextId) -> ContextResidence {
+        self.viewer_contexts.table.residence(id)
+    }
+
+    pub(crate) fn locate_window_context(
+        &self,
+        window_id: u64,
+    ) -> Option<(ViewerContextId, ContextResidence)> {
+        self.viewer_contexts.table.locate_window_context(window_id)
+    }
+
+    pub(in crate::app) fn viewer_context_ids(&self) -> Vec<ViewerContextId> {
+        self.viewer_contexts.table.ids()
+    }
+
+    pub(in crate::app) fn with_viewer_context_ref<R>(
+        &self,
+        id: ViewerContextId,
+        f: impl FnOnce(ContextRef<'_>) -> R,
+    ) -> Option<R> {
+        match self.viewer_contexts.table.residence(id) {
+            ContextResidence::Mounted => Some(f(ContextRef::mounted(self))),
+            ContextResidence::AtRest => self
+                .viewer_contexts
+                .table
+                .at_rest(id)
+                .map(|payload| f(ContextRef::at_rest(payload))),
+            _ => None,
+        }
+    }
+
+    pub(in crate::app) fn any_viewer_context(
+        &self,
+        mut f: impl FnMut(ViewerContextId, ContextRef<'_>) -> bool,
+    ) -> bool {
+        self.viewer_context_ids().into_iter().any(|id| {
+            self.with_viewer_context_ref(id, |context| f(id, context))
+                .unwrap_or(false)
+        })
+    }
+
+    pub(in crate::app) fn bind_window(
+        &mut self,
+        id: ViewerContextId,
+        window_id: u64,
+    ) -> Result<(), BindError> {
+        self.viewer_contexts.table.bind_window(id, window_id)
+    }
+
+    pub(in crate::app) fn unbind_window(&mut self, window_id: u64) -> Option<ViewerContextId> {
+        self.viewer_contexts.table.unbind_window(window_id)
+    }
+
+    pub(in crate::app) fn transfer_window_binding(
+        &mut self,
+        window_id: u64,
+        from: ViewerContextId,
+        to: ViewerContextId,
+    ) -> Result<(), BindError> {
+        self.viewer_contexts
+            .table
+            .transfer_window_binding(window_id, from, to)
+    }
+
+    pub(in crate::app) fn reserve_window_binding_for_build(&mut self, window_id: u64) {
+        self.viewer_contexts
+            .table
+            .reserve_window_binding_for_build(window_id);
+    }
+
+    pub(in crate::app) fn with_viewer_context<R>(
+        &mut self,
+        id: ViewerContextId,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Result<R, MountError> {
+        let Some(original) = self.viewer_contexts.table.mounted_id() else {
+            return Err(MountError {
+                id,
+                residence: self.viewer_contexts.table.residence(id),
+            });
+        };
+        let ops = self.viewer_contexts.table.plan_mount(id)?;
+        self.execute_viewer_context_ops(ops, None);
+        self.viewer_contexts.table.finish_mount();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        let ops = self
+            .viewer_contexts
+            .table
+            .plan_mount(original)
+            .expect("mounted viewer-context owner disappeared");
+        self.execute_viewer_context_ops(ops, None);
+        self.viewer_contexts.table.finish_mount();
+        match result {
+            Ok(value) => Ok(value),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    pub(crate) fn with_window_viewer_context<R>(
+        &mut self,
+        window_id: u64,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Result<R, MountError> {
+        let (id, _) = self
+            .locate_window_context(window_id)
+            .unwrap_or_else(|| panic!("window {window_id} has no viewer-context binding"));
+        self.with_viewer_context(id, f)
+    }
+
+    pub(in crate::app) fn build_viewer_context(
+        &mut self,
+        reason: &'static str,
+        f: impl FnOnce(&mut Self, ViewerContextId) -> BuildOutcome,
+    ) -> Option<ViewerContextId> {
+        let (reserved, ops) = self.viewer_contexts.table.plan_begin_build();
+        self.execute_viewer_context_ops(ops, None);
+        self.viewer_contexts.table.finish_begin_build();
+        self.set_items_generation(Self::items_generation_for_viewer_context(reserved));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self, reserved)));
+        match result {
+            Ok(outcome) => self.finish_viewer_context_build(reserved, reason, outcome),
+            Err(payload) => {
+                self.abort_viewer_context_build();
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+
+    fn abort_viewer_context_build(&mut self) {
+        let ops = self.viewer_contexts.table.plan_abort_build();
+        self.execute_viewer_context_ops(ops, None);
+        self.viewer_contexts.table.finish_abort_build();
+    }
+
+    fn finish_viewer_context_build(
+        &mut self,
+        reserved: ViewerContextId,
+        reason: &'static str,
+        outcome: BuildOutcome,
+    ) -> Option<ViewerContextId> {
+        match outcome {
+            BuildOutcome::Commit => {
+                let ops = self.viewer_contexts.table.plan_commit_build();
+                self.execute_viewer_context_ops(ops, None);
+                Some(self.viewer_contexts.table.finish_commit_build())
+            }
+            BuildOutcome::Abort(abort_reason) => {
+                crate::logger::log(format!(
+                    "viewer_context_build_aborted id={reserved:?} reason={reason} abort={abort_reason}"
+                ));
+                self.abort_viewer_context_build();
+                None
+            }
+        }
+    }
+
+    fn fork_mounted_context(
+        &mut self,
+        policy: ForkPolicy,
+        spec: ProductionForkSpec,
+    ) -> ViewerContextId {
+        let (id, ops) = self.viewer_contexts.table.plan_fork(policy);
+        self.execute_viewer_context_ops(ops, Some(spec));
+        let finished = self.viewer_contexts.table.finish_fork();
+        assert_eq!(finished, id);
+        id
+    }
+
+    pub(in crate::app) fn fork_mounted_live_media_context(
+        &mut self,
+        window_id: u64,
+    ) -> ViewerContextId {
+        self.fork_mounted_context(
+            ForkPolicy::LiveMediaPark { window_id },
+            ProductionForkSpec::LiveMedia,
+        )
+    }
+
+    pub(in crate::app) fn fork_materialized_still_context(
+        &mut self,
+        physical_context: &Path,
+        idx: usize,
+    ) -> ViewerContextId {
+        let id = ViewerContextId(self.viewer_contexts.table.next_serial);
+        let items_generation = Self::items_generation_for_viewer_context(id);
+        self.fork_mounted_context(
+            ForkPolicy::MaterializedStillOpen,
+            ProductionForkSpec::MaterializedStill {
+                physical_context: physical_context.to_path_buf(),
+                idx,
+                items_generation,
+            },
+        )
+    }
+
+    pub(in crate::app) fn retire_context<D>(
+        &mut self,
+        id: ViewerContextId,
+        _reason: &'static str,
+        digest: impl FnOnce(ContextMut<'_>) -> D,
+    ) -> Result<D, RetireError> {
+        self.viewer_contexts.table.begin_retire(id)?;
+        let value = {
+            let payload = self.viewer_contexts.table.retiring_slot_mut(id).unwrap();
+            digest(ContextMut {
+                id,
+                bundle: payload,
+            })
+        };
+        self.viewer_contexts.table.unbind_context_core(id);
+        let ops = self.viewer_contexts.table.plan_finish_retire(id);
+        self.execute_viewer_context_ops(ops, None);
+        self.viewer_contexts.table.finish_retire();
+        Ok(value)
+    }
+
+    pub(in crate::app) fn close_and_retire_context<D>(
+        &mut self,
+        id: ViewerContextId,
+        reason: &'static str,
+        finish: impl FnOnce(&mut Self),
+        digest: impl FnOnce(ContextMut<'_>) -> D,
+    ) -> Result<D, RetireContextError> {
+        self.with_viewer_context(id, finish)
+            .map_err(RetireContextError::Mount)?;
+        self.retire_context(id, reason, digest)
+            .map_err(RetireContextError::Retire)
+    }
+
+    pub(in crate::app) fn stash_mounted_and_start_fresh(
+        &mut self,
+        _reason: &'static str,
+    ) -> ViewerContextId {
+        let ops = self.viewer_contexts.table.plan_promote();
+        self.execute_viewer_context_ops(ops, None);
+        self.viewer_contexts.table.finish_promote()
+    }
+}
+
+#[cfg(all(test, windows))]
+pub(in crate::app) fn passive_right_drag_image_bundle_for_test(path: &str) -> ViewerContextBundle {
+    let mut bundle = ViewerContextBundle::empty();
+    bundle.items = vec![GridItem::Image(PathBuf::from(path))];
+    bundle.thumbnails = vec![ThumbnailState::Pending];
+    bundle.image_metas = vec![None];
+    bundle.visible_indices = vec![0];
+    bundle.selected = Some(0);
+    bundle.fullscreen_idx = Some(0);
+    bundle
+}
+
+#[cfg(all(test, windows))]
+impl App {
+    pub(in crate::app) fn begin_mounted_detached_session_for_test(
+        &mut self,
+        window_id: u64,
+        source: DetachedSource,
+    ) {
+        let mounted = self
+            .mounted_viewer_context_id()
+            .expect("test mounted detached session requires a mounted context");
+        self.bind_window(mounted, window_id)
+            .unwrap_or_else(|error| panic!("test mounted session binding failed: {error:?}"));
+        self.detached_viewer_window_id = Some(window_id);
+        self.begin_active_detached_session(window_id, source);
+    }
+
+    pub(in crate::app) fn bind_mounted_context_for_test(&mut self, window_id: u64) {
+        let mounted = self
+            .mounted_viewer_context_id()
+            .expect("test window binding requires a mounted context");
+        self.bind_window(mounted, window_id)
+            .unwrap_or_else(|error| panic!("test mounted context binding failed: {error:?}"));
+        self.last_active_detached_window_id = Some(window_id);
+    }
+
+    pub(in crate::app) fn install_window_context_for_test(
+        &mut self,
+        bundle: ViewerContextBundle,
+        window_id: u64,
+    ) -> ViewerContextId {
+        assert!(self.viewer_contexts.table.pending.is_none());
+        assert!(matches!(
+            self.viewer_contexts.table.projection,
+            Projection::Mounted(_)
+        ));
+        let id = self.viewer_contexts.table.allocate_id();
+        self.viewer_contexts.table.deposit(id, Box::new(bundle));
+        self.viewer_contexts
+            .table
+            .bind_window(id, window_id)
+            .unwrap_or_else(|error| panic!("test context binding failed: {error:?}"));
+        id
+    }
+
+    pub(in crate::app) fn push_window_context_for_test(
+        &mut self,
+        ctx: &egui::Context,
+        window_id: u64,
+        bundle: ViewerContextBundle,
+    ) -> ViewerContextId {
+        let texture = ctx.load_texture(
+            format!("window_context_for_test_{window_id}"),
+            egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+            egui::TextureOptions::LINEAR,
+        );
+        let snapshot = DetachedImageWindowSnapshot {
+            id: window_id,
+            texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+            title: format!("paused-{window_id}"),
+            location_display: format!("paused-{window_id}"),
+            image_dims: None,
+            rotation: crate::rotation_db::Rotation::None,
+            zoom_pan: None,
+            free_rotation: 0.0,
+            image_rect_norm: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            image_content_bbox: None,
+            frozen_continuous_pages: Vec::new(),
+            reopen_descriptor: None,
+            reopen_sync_stamp: None,
+            activation_ready_frame: 0,
+            activation_armed: true,
+            focused_last_frame: false,
+            initial_placement_applied: true,
+        };
+        let id = self.install_window_context_for_test(bundle, window_id);
+        self.detached_image_windows.push(snapshot);
+        id
+    }
+
+    pub(in crate::app) fn install_active_context_for_test(
+        &mut self,
+        mut bundle: ViewerContextBundle,
+    ) -> ViewerContextId {
+        let existing = self.active_detached_session;
+        let window_id = bundle
+            .viewer_session
+            .detached_window_id
+            .or(existing.map(|session| session.window_id))
+            .or(self.detached_viewer_window_id)
+            .unwrap_or_else(|| self.allocate_detached_viewer_window_id());
+        bundle.viewer_session.detached_window_id = Some(window_id);
+        let id = self.install_window_context_for_test(bundle, window_id);
+        if let Some(session) = existing {
+            self.active_detached_session = Some(ActiveDetachedSession {
+                window_id,
+                source: session.source,
+            });
+        }
+        self.last_active_detached_window_id = Some(window_id);
+        id
+    }
+
+    pub(in crate::app) fn build_active_context_for_test(
+        &mut self,
+        window_id: Option<u64>,
+        source: DetachedSource,
+        configure: impl FnOnce(&mut Self),
+    ) -> ViewerContextId {
+        let window_id = window_id.unwrap_or_else(|| self.allocate_detached_viewer_window_id());
+        let id = self
+            .build_viewer_context("test_build_active_context", |app, _reserved| {
+                configure(app);
+                app.detached_viewer_window_id = Some(window_id);
+                app.reserve_window_binding_for_build(window_id);
+                BuildOutcome::Commit
+            })
+            .expect("test active viewer context build must commit");
+        self.begin_active_detached_session(window_id, source);
+        id
+    }
+
+    pub(in crate::app) fn remove_active_context_for_test(&mut self) {
+        let Some(id) = self.active_viewer_context_id() else {
+            return;
+        };
+        self.retire_context(id, "test_remove_active_context", |_| ())
+            .unwrap_or_else(|error| panic!("test active context retire failed: {error:?}"));
+    }
+
+    pub(in crate::app) fn active_context_bundle_for_test(&self) -> Option<&ViewerContextBundle> {
+        let id = self.active_viewer_context_id()?;
+        self.context_bundle_for_test(id)
+    }
+
+    pub(in crate::app) fn window_context_bundle_for_test(
+        &self,
+        window_id: u64,
+    ) -> Option<&ViewerContextBundle> {
+        let (id, _) = self.locate_window_context(window_id)?;
+        self.context_bundle_for_test(id)
+    }
+
+    fn context_bundle_for_test(&self, id: ViewerContextId) -> Option<&ViewerContextBundle> {
+        match self.viewer_contexts.table.residence(id) {
+            ContextResidence::AtRest => match self.viewer_contexts.table.slots.get(&id) {
+                Some(Slot::AtRest(bundle)) => Some(bundle),
+                _ => unreachable!(),
+            },
+            _ => None,
+        }
+    }
+
+    pub(in crate::app) fn stash_mounted_as_active_for_test(
+        &mut self,
+        window_id: u64,
+    ) -> ViewerContextId {
+        let id = self.stash_mounted_and_start_fresh("test_stash_mounted_as_active");
+        self.bind_window(id, window_id)
+            .unwrap_or_else(|error| panic!("test stashed context binding failed: {error:?}"));
+        self.active_detached_session = Some(ActiveDetachedSession {
+            window_id,
+            source: DetachedSource::Image,
+        });
+        id
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2758,6 +3426,209 @@ mod tests {
             Some(Slot::AtRest(payload)) => payload,
             Some(Slot::Retiring(_)) | None => panic!("context is not at rest"),
         }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn production_i1_i1b_mount_round_trip_is_panic_safe_and_never_loses_projection() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.address = "main".to_string();
+        let main = app.viewer_context_main();
+        let built = app
+            .build_viewer_context("production_i1_build", |app, reserved| {
+                assert_eq!(
+                    app.viewer_context_residence(reserved),
+                    ContextResidence::Building
+                );
+                assert_eq!(app.viewer_context_ids(), vec![main, reserved]);
+                app.address = "detached".to_string();
+                app.reserve_window_binding_for_build(701);
+                BuildOutcome::Commit
+            })
+            .unwrap();
+
+        assert_eq!(app.mounted_viewer_context_id(), Some(main));
+        assert_eq!(app.address, "main");
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = app.with_viewer_context(built, |app| {
+                assert_eq!(app.address, "detached");
+                panic!("production mount panic");
+            });
+        }));
+        assert!(panic.is_err());
+        assert_eq!(app.mounted_viewer_context_id(), Some(main));
+        assert_eq!(
+            app.viewer_context_residence(built),
+            ContextResidence::AtRest
+        );
+        assert_eq!(app.address, "main");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn production_i2_i3_window_bindings_are_a_bijection() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let first = app
+            .build_viewer_context("production_i2_first", |app, _| {
+                app.reserve_window_binding_for_build(702);
+                BuildOutcome::Commit
+            })
+            .unwrap();
+        let second = app
+            .build_viewer_context("production_i2_second", |_, _| BuildOutcome::Commit)
+            .unwrap();
+
+        assert_eq!(
+            app.bind_window(second, 702),
+            Err(BindError::WindowOwnedBy(first))
+        );
+        assert_eq!(
+            app.bind_window(first, 703),
+            Err(BindError::ContextOwnedBy(702))
+        );
+        assert_eq!(app.unbind_window(702), Some(first));
+        assert_eq!(app.bind_window(first, 703), Ok(()));
+        assert_eq!(
+            app.locate_window_context(703),
+            Some((first, ContextResidence::AtRest))
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn production_i4_main_is_rejected_while_at_rest() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let main = app.viewer_context_main();
+        let other = app
+            .build_viewer_context("production_i4_other", |_, _| BuildOutcome::Commit)
+            .unwrap();
+
+        app.with_viewer_context(other, |app| {
+            assert_eq!(app.viewer_context_residence(main), ContextResidence::AtRest);
+            assert_eq!(
+                app.retire_context(main, "production_i4_reject", |_| ()),
+                Err(RetireError::IsMain)
+            );
+        })
+        .unwrap();
+
+        assert_eq!(app.viewer_context_main(), main);
+        assert_eq!(app.mounted_viewer_context_id(), Some(main));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn production_i5_i6_building_and_retiring_reject_invalid_operations() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let aborted = app.build_viewer_context("production_i5_building", |app, reserved| {
+            assert_eq!(
+                app.bind_window(reserved, 704),
+                Err(BindError::NotBindable(ContextResidence::Building))
+            );
+            assert_eq!(
+                app.with_viewer_context(reserved, |_| ()),
+                Err(MountError {
+                    id: reserved,
+                    residence: ContextResidence::Building,
+                })
+            );
+            assert_eq!(
+                app.retire_context(reserved, "production_i5_retire", |_| ()),
+                Err(RetireError::Building)
+            );
+            BuildOutcome::Abort("expected")
+        });
+        assert_eq!(aborted, None);
+
+        let retiring = app
+            .build_viewer_context("production_i6_retiring", |_, _| BuildOutcome::Commit)
+            .unwrap();
+        app.viewer_contexts.table.begin_retire(retiring).unwrap();
+        assert_eq!(
+            app.bind_window(retiring, 705),
+            Err(BindError::NotBindable(ContextResidence::Retiring))
+        );
+        assert_eq!(
+            app.with_viewer_context(retiring, |_| ()),
+            Err(MountError {
+                id: retiring,
+                residence: ContextResidence::Retiring,
+            })
+        );
+        assert_eq!(
+            app.retire_context(retiring, "production_i6_repeat", |_| ()),
+            Err(RetireError::NotAtRest(ContextResidence::Retiring))
+        );
+        let ops = app.viewer_contexts.table.plan_finish_retire(retiring);
+        app.execute_viewer_context_ops(ops, None);
+        app.viewer_contexts.table.finish_retire();
+        assert_eq!(
+            app.mounted_viewer_context_id(),
+            Some(app.viewer_context_main())
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn production_i7_transactions_end_with_a_mounted_projection() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let built = app
+            .build_viewer_context("production_i7_build", |_, _| BuildOutcome::Commit)
+            .unwrap();
+        assert!(app.mounted_viewer_context_id().is_some());
+        app.with_viewer_context(built, |_| ()).unwrap();
+        assert!(app.mounted_viewer_context_id().is_some());
+        app.retire_context(built, "production_i7_retire", |_| ())
+            .unwrap();
+        assert!(app.mounted_viewer_context_id().is_some());
+        let stashed = app.stash_mounted_and_start_fresh("production_i7_promote");
+        assert_eq!(
+            app.viewer_context_residence(stashed),
+            ContextResidence::AtRest
+        );
+        assert_eq!(
+            app.mounted_viewer_context_id(),
+            Some(app.viewer_context_main())
+        );
+    }
+
+    fn recover_build_after_interior_failpoint(app: &mut App) {
+        app.viewer_contexts.table.pending = None;
+        app.abort_viewer_context_build();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn production_i8_abort_swap_panic_never_publishes_reserved_binding() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            app.build_viewer_context("production_i8_abort", |app, _| {
+                app.reserve_window_binding_for_build(706);
+                arm_viewer_context_swap_interior_failpoint_for_test();
+                BuildOutcome::Abort("inject_swap_panic")
+            });
+        }));
+        assert!(panic.is_err());
+        assert!(app.viewer_contexts.table.window_of.is_empty());
+        assert!(app.viewer_contexts.table.context_of.is_empty());
+        recover_build_after_interior_failpoint(&mut app);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn production_i8_unwind_swap_panic_never_publishes_reserved_binding() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            app.build_viewer_context("production_i8_unwind", |app, _| {
+                app.reserve_window_binding_for_build(707);
+                arm_viewer_context_swap_interior_failpoint_for_test();
+                panic!("build body panic");
+            });
+        }));
+        assert!(panic.is_err());
+        assert!(app.viewer_contexts.table.window_of.is_empty());
+        assert!(app.viewer_contexts.table.context_of.is_empty());
+        recover_build_after_interior_failpoint(&mut app);
     }
 
     #[test]

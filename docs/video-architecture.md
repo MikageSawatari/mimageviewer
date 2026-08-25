@@ -141,9 +141,10 @@ Esc / Enter と同じく `close_fullscreen()` で viewer session を終了する
 キー入力は App へ転送し、動画操作 / session close / F12 切替を同じ keymap 経路に通す。
 
 メインウィンドウでフォルダ移動や別フォルダ open が発生しても、表示中 detached 動画は
-`active_detached_viewer_context` に切り離して保持する。この状態では動画の `fs_cache` /
-`fullscreen_idx` / `items` は detached 側 bundle が正本になるため、`poll_video()` は
-その bundle を mount した `update_active_detached_viewer_context()` 内で走らせる。
+viewer context registry の window binding を保ったまま main から独立した context へ promote して
+保持する。この状態では動画の `fs_cache` / `fullscreen_idx` / `items` はその context が正本になるため、
+`poll_video()` は registry transaction で context を mount した
+`update_active_detached_viewer_context()` 内で走らせる。
 同時に main context 側の `poll_video()` は抑止し、native presenter のイベントや source
 swap pending を detached 動画ではない `fullscreen_idx` で処理しないようにする。
 
@@ -2087,7 +2088,8 @@ Enter / ダブルクリック等で次に開くまで再表示しない。
 main-window in-window active ではない。
 
 detached メディアを再生したままメイン一覧でフォルダ / お気に入りなどの context を切り替える場合、
-メディアは `active_detached_viewer_context` 側へ切り離して再生を維持する。切り離し後は
+メディアは viewer context registry の独立 context へ promote して再生を維持する。window binding は
+同じ context を指し続け、切り離し後は
 メイン一覧の選択変更に追従せず、メディア窓内の前後移動は切り離し時に保持していた同一一覧内だけを
 対象にする。`Ctrl+↑↓` / `Ctrl+PageUp/PageDown` のフォルダ横断は、静止画のピン /
 always-new 窓と同じく no-op として扱う。
