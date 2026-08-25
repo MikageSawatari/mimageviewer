@@ -22,6 +22,9 @@ pub(crate) enum StripAxis {
     /// `duration_secs` は有限個のセルと末尾クランプを定義するために軸自身が所有する。
     TimeGrid {
         interval_secs: f64,
+        /// 尺とセル数上限から決まる下限。**軸が自分で作り直せるように持つ。**
+        /// これが無いと、画像間隔を変えたときに格子は元の間隔しか知らず作り直せない。
+        fallback_interval_secs: f64,
         duration_secs: f64,
     },
 }
@@ -34,6 +37,7 @@ impl StripAxis {
             Self::TimeGrid {
                 interval_secs,
                 duration_secs,
+                ..
             } => time_grid_cell_count(*interval_secs, *duration_secs),
         }
     }
@@ -48,6 +52,7 @@ impl StripAxis {
             Self::TimeGrid {
                 interval_secs,
                 duration_secs,
+                ..
             } => {
                 let count = time_grid_cell_count(*interval_secs, *duration_secs);
                 if index >= count {
@@ -140,8 +145,30 @@ impl StripAxis {
                 keyframes: keyframes.clone(),
                 adopted: thin_keyframes(keyframes, min_gap_secs),
             },
-            Self::TimeGrid { .. } => self.clone(),
+            Self::TimeGrid {
+                fallback_interval_secs,
+                duration_secs,
+                ..
+            } => Self::TimeGrid {
+                interval_secs: time_grid_interval_secs(*fallback_interval_secs, min_gap_secs),
+                fallback_interval_secs: *fallback_interval_secs,
+                duration_secs: *duration_secs,
+            },
         }
+    }
+}
+
+/// 格子軸のセル間隔。**利用者の「画像間隔」設定を必ず尊重する。**
+///
+/// `fallback_interval_secs` は尺とセル数上限から決まる下限、`min_gap_secs` は利用者が選んだ
+/// 最小間隔。**どちらも下限なので大きい方を採る。** 以前は前者だけを使っていたため、索引が
+/// 不完全で格子へ落ちた動画では設定が無視され、15 秒に設定しても 1 秒間隔のセルが並んでいた
+/// (実素材 172.7 秒の mp4 で 173 セル、利用者報告 2026-08-26)。
+pub(crate) fn time_grid_interval_secs(fallback_interval_secs: f64, min_gap_secs: f64) -> f64 {
+    if min_gap_secs.is_finite() && min_gap_secs > 0.0 {
+        fallback_interval_secs.max(min_gap_secs)
+    } else {
+        fallback_interval_secs
     }
 }
 
@@ -1132,6 +1159,7 @@ mod tests {
     fn time_grid_stops_strictly_before_duration() {
         let axis = StripAxis::TimeGrid {
             interval_secs: 3.0,
+            fallback_interval_secs: 3.0,
             duration_secs: 10.0,
         };
         assert_eq!(axis.cell_count(), 4);
@@ -1141,6 +1169,7 @@ mod tests {
 
         let exact = StripAxis::TimeGrid {
             interval_secs: 3.0,
+            fallback_interval_secs: 3.0,
             duration_secs: 9.0,
         };
         assert_eq!(exact.cell_count(), 3);
@@ -1832,5 +1861,33 @@ mod tests {
                 adopted: vec![0, 2, 3],
             }
         );
+    }
+    /// 実機報告 2026-08-26: 画像間隔を変えてもストリップの一覧が変わらない動画があった。
+    /// 索引が不完全で格子軸へ落ちた場合、`with_minimum_gap` が格子には何もしていなかった。
+    /// 数値は報告された mp4 のもの (172.7 秒、尺由来の下限は 1 秒)。
+    #[test]
+    fn changing_the_interval_rebuilds_the_time_grid_too() {
+        let grid = StripAxis::TimeGrid {
+            interval_secs: 1.0,
+            fallback_interval_secs: 1.0,
+            duration_secs: 172.733,
+        };
+        assert_eq!(grid.cell_count(), 173);
+
+        let coarser = grid.with_minimum_gap(15.0);
+        assert_eq!(coarser.cell_count(), 12, "15 秒にしたら 12 セルになる");
+        assert_eq!(coarser.cell(1), Some(15.0));
+
+        // 元へ戻せる: 尺由来の下限は軸が保持しているので、細かい側へも作り直せる。
+        let back = coarser.with_minimum_gap(1.0);
+        assert_eq!(back.cell_count(), 173);
+
+        // 上限保護の下限は越えない。
+        let capped = StripAxis::TimeGrid {
+            interval_secs: 30.0,
+            fallback_interval_secs: 30.0,
+            duration_secs: 3600.0,
+        };
+        assert_eq!(capped.with_minimum_gap(0.5).cell_count(), 120);
     }
 }

@@ -11888,6 +11888,7 @@ mod tests {
             axis: super::NativeOverlaySeekStripAxis::Ready(std::sync::Arc::new(
                 crate::video::seek_strip::StripAxis::TimeGrid {
                     interval_secs: 15.0,
+                    fallback_interval_secs: 15.0,
                     duration_secs: 15.0,
                 },
             )),
@@ -12129,6 +12130,7 @@ mod tests {
                 axis: super::NativeOverlaySeekStripAxis::Ready(std::sync::Arc::new(
                     crate::video::seek_strip::StripAxis::TimeGrid {
                         interval_secs: 15.0,
+                        fallback_interval_secs: 15.0,
                         duration_secs: 15.0,
                     },
                 )),
@@ -12294,6 +12296,7 @@ mod tests {
                         axis: super::NativeOverlaySeekStripAxis::Ready(std::sync::Arc::new(
                             crate::video::seek_strip::StripAxis::TimeGrid {
                                 interval_secs: 15.0,
+                                fallback_interval_secs: 15.0,
                                 duration_secs: 480.0,
                             },
                         )),
@@ -12400,6 +12403,7 @@ mod tests {
                             axis: super::NativeOverlaySeekStripAxis::Ready(std::sync::Arc::new(
                                 crate::video::seek_strip::StripAxis::TimeGrid {
                                     interval_secs: 15.0,
+                                    fallback_interval_secs: 15.0,
                                     duration_secs: 480.0,
                                 },
                             )),

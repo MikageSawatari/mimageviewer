@@ -1175,21 +1175,6 @@ fn run_worker(
     }
 }
 
-/// 格子軸のセル間隔。**利用者の「画像間隔」設定を必ず尊重する。**
-///
-/// `fallback_interval_secs` は尺だけから決まる下限 (セル数が上限を超えないための値) で、
-/// `min_gap_secs` は利用者が選んだ最小間隔。**どちらも下限なので大きい方を採る。** 以前は
-/// 前者だけを使っていたため、索引が不完全で格子へ落ちた動画では設定が完全に無視され、
-/// 15 秒に設定しても 1 秒間隔のセルが並んでいた (実素材 172.7 秒の mp4 で 173 セル、
-/// 利用者報告 2026-08-26)。設定より細かい要求は上限保護のため通す。
-fn time_grid_interval_secs(fallback_interval_secs: f64, min_gap_secs: f64) -> f64 {
-    if min_gap_secs.is_finite() && min_gap_secs > 0.0 {
-        fallback_interval_secs.max(min_gap_secs)
-    } else {
-        fallback_interval_secs
-    }
-}
-
 fn fallback_strip_axis(
     duration_secs: f64,
     fallback_interval_secs: f64,
@@ -1210,7 +1195,11 @@ fn fallback_strip_axis(
     }
     Ok(ResolvedStripAxisOutcome::Ready(ResolvedStripAxis {
         axis: StripAxis::TimeGrid {
-            interval_secs: time_grid_interval_secs(fallback_interval_secs, min_gap_secs),
+            interval_secs: crate::video::seek_strip::time_grid_interval_secs(
+                fallback_interval_secs,
+                min_gap_secs,
+            ),
+            fallback_interval_secs,
             duration_secs,
         },
         diagnostics,
@@ -2564,15 +2553,24 @@ mod tests {
         let from_duration = crate::ui_video_tile::pick_interval(172.733, 240);
         assert_eq!(from_duration, 1.0, "前提: 尺だけなら 1 秒になる");
         assert_eq!(
-            time_grid_interval_secs(from_duration, 15.0),
+            crate::video::seek_strip::time_grid_interval_secs(from_duration, 15.0),
             15.0,
             "利用者が 15 秒を選んでいるなら 15 秒"
         );
         // 上限保護のための下限は残す: 設定がそれより細かくても、尺由来の値まで戻す。
-        assert_eq!(time_grid_interval_secs(30.0, 0.5), 30.0);
+        assert_eq!(
+            crate::video::seek_strip::time_grid_interval_secs(30.0, 0.5),
+            30.0
+        );
         // 未設定 / 不正値は尺由来の値をそのまま使う。
-        assert_eq!(time_grid_interval_secs(2.0, 0.0), 2.0);
-        assert_eq!(time_grid_interval_secs(2.0, f64::NAN), 2.0);
+        assert_eq!(
+            crate::video::seek_strip::time_grid_interval_secs(2.0, 0.0),
+            2.0
+        );
+        assert_eq!(
+            crate::video::seek_strip::time_grid_interval_secs(2.0, f64::NAN),
+            2.0
+        );
     }
 
     /// 実素材の数値そのもの (06jademarx04rocker.wmv): duration は 118.019 と申告されるが、
@@ -2723,6 +2721,7 @@ mod tests {
             Arc::new(axis(3)),
             Arc::new(StripAxis::TimeGrid {
                 interval_secs: 2.0,
+                fallback_interval_secs: 2.0,
                 duration_secs: 30.0,
             }),
         ] {
@@ -3184,6 +3183,7 @@ mod tests {
 
         let axis = StripAxis::TimeGrid {
             interval_secs: 2.0,
+            fallback_interval_secs: 2.0,
             duration_secs: 8.0,
         };
         let work = plan(
