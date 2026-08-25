@@ -37,7 +37,11 @@ pub(crate) struct StripCellId(u64);
 
 impl StripCellId {
     fn from_secs(secs: f64) -> Option<Self> {
-        (secs.is_finite() && secs >= 0.0).then(|| Self(secs.max(0.0).to_bits()))
+        if !secs.is_finite() {
+            return None;
+        }
+        let normalized = if secs == 0.0 { 0.0 } else { secs };
+        Some(Self(normalized.to_bits()))
     }
 
     fn timestamp_ms(self) -> Option<i64> {
@@ -50,11 +54,12 @@ impl StripCellId {
 }
 
 fn timestamp_ms(secs: f64) -> Option<i64> {
-    if !secs.is_finite() || secs < 0.0 {
+    if !secs.is_finite() {
         return None;
     }
     let millis = secs * 1000.0;
-    (millis.is_finite() && millis <= i64::MAX as f64).then(|| millis.round() as i64)
+    (millis.is_finite() && millis >= i64::MIN as f64 && millis <= i64::MAX as f64)
+        .then(|| millis.round() as i64)
 }
 
 /// 1 セル分の抽出済み画像。
@@ -359,9 +364,23 @@ fn is_preceding_frame_within_tolerance(
         && target_secs - frame_pts_secs <= tolerance.before_secs + FRAME_PTS_MATCH_EPSILON_SECS
 }
 
+fn is_following_frame_within_tolerance(
+    target_secs: f64,
+    frame_pts_secs: f64,
+    tolerance: FrameMatchTolerance,
+) -> bool {
+    target_secs.is_finite()
+        && frame_pts_secs.is_finite()
+        && tolerance.after_secs.is_finite()
+        && tolerance.after_secs >= 0.0
+        && frame_pts_secs >= target_secs - FRAME_PTS_MATCH_EPSILON_SECS
+        && frame_pts_secs - target_secs <= tolerance.after_secs + FRAME_PTS_MATCH_EPSILON_SECS
+}
+
 #[derive(Debug, PartialEq, Eq)]
-struct PrecedingCellMatches {
-    ready_indices: Vec<usize>,
+struct CellsBeforeFrameMatches {
+    preceding_indices: Vec<usize>,
+    following_indices: Vec<usize>,
     failed_indices: Vec<usize>,
     next_cursor: usize,
 }
@@ -369,31 +388,41 @@ struct PrecedingCellMatches {
 fn match_cells_before_frame(
     cells: &[PlannedStripCell],
     cursor: usize,
-    previous_pts_secs: f64,
+    previous_pts_secs: Option<f64>,
     current_pts_secs: f64,
     indexed_presentation_targets: &BTreeMap<StripCellId, f64>,
-) -> PrecedingCellMatches {
+) -> CellsBeforeFrameMatches {
     let mut next_cursor = cursor;
-    let mut ready_indices = Vec::new();
+    let mut preceding_indices = Vec::new();
+    let mut following_indices = Vec::new();
     let mut failed_indices = Vec::new();
     while let Some(cell) = cells.get(next_cursor) {
         let target_secs = cell_presentation_target_secs(cell, indexed_presentation_targets);
         if target_secs >= current_pts_secs - FRAME_PTS_MATCH_EPSILON_SECS {
             break;
         }
-        if is_preceding_frame_within_tolerance(
+        if previous_pts_secs.is_some_and(|previous_pts_secs| {
+            is_preceding_frame_within_tolerance(
+                target_secs,
+                previous_pts_secs,
+                cell.frame_match_tolerance,
+            )
+        }) {
+            preceding_indices.push(next_cursor);
+        } else if is_following_frame_within_tolerance(
             target_secs,
-            previous_pts_secs,
+            current_pts_secs,
             cell.frame_match_tolerance,
         ) {
-            ready_indices.push(next_cursor);
+            following_indices.push(next_cursor);
         } else {
             failed_indices.push(next_cursor);
         }
         next_cursor += 1;
     }
-    PrecedingCellMatches {
-        ready_indices,
+    CellsBeforeFrameMatches {
+        preceding_indices,
+        following_indices,
         failed_indices,
         next_cursor,
     }
@@ -1742,35 +1771,43 @@ impl SeekStripDecoder {
                     current_cell.frame_match_tolerance,
                 ) {
                     publish_frame_for(&frame, &run.cells[cursor..cursor + 1])?;
-                } else {
-                    cell_failures.push((current_cell.clone(), StripThumbnailFailure::NoFrame));
+                    cursor += 1;
+                    last_frame = Some((frame, pts_secs));
+                    return Ok(cursor >= run.cells.len());
                 }
-                cursor += 1;
+                // The landed frame is too old for this TimeGrid cell. Keep decoding so a
+                // bounded following frame can satisfy it instead.
                 last_frame = Some((frame, pts_secs));
-                return Ok(cursor >= run.cells.len());
+                return Ok(false);
             }
 
-            if let Some((previous, previous_pts)) = last_frame.as_ref() {
-                let matches = match_cells_before_frame(
-                    &run.cells,
-                    cursor,
-                    *previous_pts,
-                    pts_secs,
-                    &indexed_presentation_targets.borrow(),
-                );
-                let ready_cells: Vec<_> = matches
-                    .ready_indices
-                    .iter()
-                    .filter_map(|index| run.cells.get(*index).cloned())
-                    .collect();
-                publish_frame_for(previous, &ready_cells)?;
-                for index in matches.failed_indices {
-                    if let Some(cell) = run.cells.get(index) {
-                        cell_failures.push((cell.clone(), StripThumbnailFailure::NoFrame));
-                    }
-                }
-                cursor = matches.next_cursor;
+            let matches = match_cells_before_frame(
+                &run.cells,
+                cursor,
+                last_frame.as_ref().map(|(_, pts_secs)| *pts_secs),
+                pts_secs,
+                &indexed_presentation_targets.borrow(),
+            );
+            let preceding_cells: Vec<_> = matches
+                .preceding_indices
+                .iter()
+                .filter_map(|index| run.cells.get(*index).cloned())
+                .collect();
+            if let Some((previous, _)) = last_frame.as_ref() {
+                publish_frame_for(previous, &preceding_cells)?;
             }
+            let following_cells: Vec<_> = matches
+                .following_indices
+                .iter()
+                .filter_map(|index| run.cells.get(*index).cloned())
+                .collect();
+            publish_frame_for(&frame, &following_cells)?;
+            for index in matches.failed_indices {
+                if let Some(cell) = run.cells.get(index) {
+                    cell_failures.push((cell.clone(), StripThumbnailFailure::NoFrame));
+                }
+            }
+            cursor = matches.next_cursor;
 
             let exact_start = cursor;
             while let Some(cell) = run.cells.get(cursor) {
@@ -1927,11 +1964,12 @@ impl SeekStripDecoder {
 }
 
 fn secs_to_av_time_base(secs: f64) -> Option<i64> {
-    if !secs.is_finite() || secs < 0.0 {
+    if !secs.is_finite() {
         return None;
     }
     let value = secs * ffmpeg::ffi::AV_TIME_BASE as f64;
-    (value.is_finite() && value <= i64::MAX as f64).then(|| value.round() as i64)
+    (value.is_finite() && value >= i64::MIN as f64 && value <= i64::MAX as f64)
+        .then(|| value.round() as i64)
 }
 
 #[derive(Default)]
@@ -2283,9 +2321,11 @@ mod tests {
         };
 
         println!(
-            "path={} duration_secs={duration_secs:.3} center_time_secs={center_time_secs:.3} center_index={center_index:.3} axis_cells={} status={:?}",
+            "path={} duration_secs={duration_secs:.3} center_time_secs={center_time_secs:.3} center_index={center_index:.3} axis_cells={} first_axis_cell={:?} invalid_cells={:?} status={:?}",
             path.display(),
             axis.cell_count(),
+            axis.cell(0),
+            work.invalid_cells,
             snapshot.status,
         );
         println!(
@@ -2382,12 +2422,75 @@ mod tests {
     }
 
     #[test]
-    fn preceding_match_is_bounded_and_one_bad_cell_does_not_strand_the_next() {
+    fn leading_negative_dts_cell_is_planned_and_maps_to_its_first_presentation_pts() {
+        let first_dts_secs = -1001.0 / 24_000.0;
+        let axis = StripAxis::KeyframeIndex {
+            keyframes: vec![first_dts_secs, 7.632625],
+            adopted: vec![0, 1],
+        };
+        let work = plan(
+            &axis,
+            StripWindowSpec::new(0.0, 1, StripLookahead::default()),
+            &BTreeSet::new(),
+        );
+        assert!(work.invalid_cells.is_empty());
+        let cell = work
+            .cache_lookup
+            .iter()
+            .find(|cell| cell.index == 0)
+            .expect("signed leading index cell must be planned");
+        assert_eq!(cell.target_secs, first_dts_secs);
+        assert_eq!(cell.id.target_secs(), first_dts_secs);
+        assert_eq!(cell.timestamp_ms, -42);
+        assert_eq!(secs_to_av_time_base(first_dts_secs), Some(-41_708));
+        assert_eq!(
+            indexed_packet_presentation_target_secs(cell, first_dts_secs, 0.0),
+            Some(0.0),
+            "the first B-frame key packet must map its signed DTS cell to presentation time"
+        );
+    }
+
+    #[test]
+    fn first_cell_without_a_preceding_frame_falls_forward_within_its_local_gap() {
+        let axis = StripAxis::KeyframeIndex {
+            keyframes: vec![0.0, 2.0, 4.0],
+            adopted: vec![0, 1, 2],
+        };
+        let work = plan(
+            &axis,
+            StripWindowSpec::new(0.0, 1, StripLookahead::default()),
+            &BTreeSet::new(),
+        );
+        let cell = work
+            .cache_lookup
+            .iter()
+            .find(|cell| cell.index == 0)
+            .expect("cell 0 must be planned");
+        let cells = vec![cell.clone()];
+
+        let following = match_cells_before_frame(&cells, 0, None, 0.125, &BTreeMap::new());
+        assert_eq!(following.preceding_indices, Vec::<usize>::new());
+        assert_eq!(following.following_indices, vec![0]);
+        assert!(following.failed_indices.is_empty());
+        assert_eq!(following.next_cursor, 1);
+
+        let unrelated = match_cells_before_frame(&cells, 0, None, 2.006, &BTreeMap::new());
+        assert!(unrelated.preceding_indices.is_empty());
+        assert!(unrelated.following_indices.is_empty());
+        assert_eq!(unrelated.failed_indices, vec![0]);
+    }
+
+    #[test]
+    fn frame_matching_prefers_bounded_preceding_and_does_not_strand_a_later_cell() {
         let tolerance = FrameMatchTolerance::symmetric(1.0);
         assert!(is_preceding_frame_within_tolerance(10.0, 9.0, tolerance));
         assert!(!is_preceding_frame_within_tolerance(10.0, 8.994, tolerance));
         assert!(!is_preceding_frame_within_tolerance(
             10.0, 10.006, tolerance
+        ));
+        assert!(is_following_frame_within_tolerance(10.0, 11.0, tolerance));
+        assert!(!is_following_frame_within_tolerance(
+            10.0, 11.006, tolerance
         ));
 
         let axis = StripAxis::TimeGrid {
@@ -2401,13 +2504,64 @@ mod tests {
         );
         let mut cells = work.cache_lookup;
         cells.sort_by_key(|cell| cell.index);
-        let matches = match_cells_before_frame(&cells, 0, -3.0, 2.0, &BTreeMap::new());
-        assert_eq!(matches.ready_indices, Vec::<usize>::new());
+        cells[0].frame_match_tolerance = FrameMatchTolerance::symmetric(1.0);
+        let matches = match_cells_before_frame(&cells, 0, Some(-3.0), 2.0, &BTreeMap::new());
+        assert!(matches.preceding_indices.is_empty());
+        assert!(matches.following_indices.is_empty());
         assert_eq!(matches.failed_indices, vec![0]);
         assert_eq!(
             matches.next_cursor, 1,
             "the next cell remains available for the current 2s frame"
         );
+
+        let preceding = match_cells_before_frame(&cells, 0, Some(-0.5), 0.5, &BTreeMap::new());
+        assert_eq!(preceding.preceding_indices, vec![0]);
+        assert!(preceding.following_indices.is_empty());
+    }
+
+    #[test]
+    fn last_cell_uses_its_previous_raw_gap_when_there_is_no_following_keyframe() {
+        let axis = StripAxis::KeyframeIndex {
+            keyframes: vec![10.0, 12.0, 20.0],
+            adopted: vec![0, 1, 2],
+        };
+        let work = plan(
+            &axis,
+            StripWindowSpec::new(2.0, 1, StripLookahead::default()),
+            &BTreeSet::new(),
+        );
+        let tail = work
+            .cache_lookup
+            .iter()
+            .find(|cell| cell.index == 2)
+            .expect("last cell must be planned");
+        assert_eq!(
+            tail.frame_match_tolerance,
+            FrameMatchTolerance {
+                before_secs: 8.0,
+                after_secs: 8.0,
+            }
+        );
+        assert!(is_preceding_frame_within_tolerance(
+            20.0,
+            12.0,
+            tail.frame_match_tolerance
+        ));
+        assert!(!is_preceding_frame_within_tolerance(
+            20.0,
+            11.994,
+            tail.frame_match_tolerance
+        ));
+        assert!(is_following_frame_within_tolerance(
+            20.0,
+            28.0,
+            tail.frame_match_tolerance
+        ));
+        assert!(!is_following_frame_within_tolerance(
+            20.0,
+            28.006,
+            tail.frame_match_tolerance
+        ));
     }
 
     #[test]

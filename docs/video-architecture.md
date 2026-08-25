@@ -739,10 +739,13 @@ coverage を外れたときだけ進行方向 1 画面を追加要求する。�
 作り直し、永続キャッシュは無効化しない。
 索引セルの timestamp は seek domain であり、MP4 の `AVIndexEntry` では DTS のことがある。
 worker は窓内の同じ key packet の DTS と PTS を対応付けて presentation target を作り、decoded frame
-は bounded nearest-preceding で選ぶ。indexed cell の許容幅は前後それぞれ隣の raw index entry まで、
-`TimeGrid` は 1 grid interval までであり、隣の場面を越える古い frame は採らない。timestamp 不一致は
-該当セルだけを typed failure にして cursor を進めるため、1 セルが同じ decode run の後続を
-stranded にしない。永続 cache key は decoded PTS ではなく要求した index/grid timestamp のまま保つ。
+は許容内の過去側を優先し、過去側が無い場合だけ未来側へ fallback する。indexed cell の許容幅は
+前後それぞれ隣の raw index entry まで、`TimeGrid` は 1 grid interval までであり、隣の場面を越える
+frame は前後どちらからも採らない。先頭の raw DTS が負でも cell / cache identity として保持し、
+packet PTS との対応付け後に表示 frame を選ぶ。timestamp 不一致は該当セルだけを typed failure にして
+cursor を進めるため、1 セルが同じ decode run の後続を stranded にしない。永続 cache key は
+decoded PTS ではなく要求した index/grid timestamp のまま保つ。末尾 cell のように片側の raw entry が
+無い endpoint は、存在する側の隣接 gap を両方向の上限に使う。
 
 波形モードの `SeekStripWaveWorker` は既に完成済みの `TimelineAnalysis` が現在ファイルまたは
 音楽解析 LRU にあれば対象時間窓を切り出す。無ければ、動画ごとに 1 回だけ開く

@@ -139,17 +139,15 @@ fn probe_one(path: &Path) -> Result<(), String> {
     );
 
     // ── 2. 窓の充填 ────────────────────────────────────────────────────────
-    // 先頭 / 中央 / 後方の 3 か所で測る。先頭だけだと索引や I/O が暖まっていて楽をする。
+    // index 0 / 中央 / 後方の 3 か所で測る。先頭だけだと索引や I/O が暖まっていて楽をする。
     // 実装では補助デコーダを動画 1 本につき 1 回だけ開いて使い回すので、probe も同じにする。
     // ファイルオープンを毎窓に含めると、素材によって数百 ms の下駄を履いて判断を誤る。
     match open_window_filler(path, stream_idx) {
         Ok(mut filler) => {
-            for (label, frac) in [("head", 0.05_f64), ("mid", 0.5), ("tail", 0.85)] {
-                let start_idx = ((keyframes.len() as f64 * frac) as usize)
-                    .min(keyframes.len().saturating_sub(WINDOW_CELLS));
+            for (label, start_idx) in probe_window_starts(keyframes.len()) {
                 match filler.fill_window(tb_num, tb_den, &keyframes, start_idx) {
                     Ok(r) => println!(
-                        "  [2] window {label:>4} @{:>7.1}s: {:2} frames in {:6.1}ms  (seek {:.1}ms, first {:.1}ms, scale {:.1}ms)",
+                        "  [2] window {label:>4} index={start_idx:<5} @{:>7.1}s: {:2} frames in {:6.1}ms  (seek {:.1}ms, first {:.1}ms, scale {:.1}ms)",
                         keyframes[start_idx],
                         r.frames,
                         r.total_ms,
@@ -183,6 +181,17 @@ fn probe_one(path: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn probe_window_starts(keyframe_count: usize) -> [(&'static str, usize); 3] {
+    let max_start = keyframe_count.saturating_sub(WINDOW_CELLS);
+    let fractional_start =
+        |fraction: f64| ((keyframe_count as f64 * fraction) as usize).min(max_start);
+    [
+        ("head", 0),
+        ("mid", fractional_start(0.5)),
+        ("tail", fractional_start(0.85)),
+    ]
 }
 
 /// コンテナ索引からキーフレームの PTS (秒) を取り出す。復号もパケット読みもしない。
@@ -563,4 +572,21 @@ fn pct(sorted: &[f64], p: f64) -> f64 {
     }
     let k = (((sorted.len() - 1) as f64) * p).round() as usize;
     sorted[k.min(sorted.len() - 1)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_probe_always_starts_its_head_window_at_index_zero() {
+        assert_eq!(
+            probe_window_starts(100),
+            [("head", 0), ("mid", 50), ("tail", 85)]
+        );
+        assert_eq!(
+            probe_window_starts(5),
+            [("head", 0), ("mid", 0), ("tail", 0)]
+        );
+    }
 }
