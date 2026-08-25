@@ -9505,6 +9505,12 @@ pub struct App {
     // ── フルスクリーン表示・先読みキャッシュ ───────────────────────
     /// Some(idx) = フルスクリーン表示中（self.items のインデックス）
     pub(crate) fullscreen_idx: Option<usize>,
+    /// 分割表示中に、今どちら側を見ているか。分割していなければ `Full`。
+    ///
+    /// **元ページ (`fullscreen_idx`) と同じ context 所有**にする。片方だけ App 側に
+    /// 置くと、context を切り替えたときに前の viewer の左右が次の viewer へ残る。
+    /// 永続化はしない (開き直しは分割方向の最初の半分へ着地する)。
+    pub(crate) fullscreen_page_slice: crate::page_split::PageSlice,
     /// 現在の viewer session の実表示先。要求値ではなく、実際に採用した表示先を保持する。
     pub(crate) viewer_presentation: ViewerPresentation,
     /// detached viewer とメイン選択の同期済み対象。idx 単体ではなく items 世代と項目キーを持つ。
@@ -13181,6 +13187,7 @@ impl App {
             stats: Arc::new(Mutex::new(crate::stats::ThumbStats::new())),
             show_stats_dialog: false,
             fullscreen_idx: None,
+            fullscreen_page_slice: crate::page_split::PageSlice::Full,
             viewer_presentation: ViewerPresentation::Fullscreen,
             last_viewer_sync_stamp: None,
             #[cfg(windows)]

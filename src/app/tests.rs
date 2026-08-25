@@ -16392,6 +16392,231 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.spread_page_nav(1), FsPageNav::Target(3));
     }
 
+    /// 分割中に描画へ渡る部分矩形。**分割が表示トリムに勝ち、回転を通して写る。**
+    ///
+    /// 実機で「ページ送りは半分ずつ進むのに絵は全体のまま」になったのは、この解決を
+    /// 呼び出し側に任せていて 1 か所通し忘れたため。今は `draw_fs_image` が自分で
+    /// 解決するが、解決そのものの正しさはここで固定する。
+    #[test]
+    fn a_split_page_hands_the_half_to_the_painter_instead_of_the_trim() {
+        use crate::page_split::PageSlice;
+        use crate::rotation_db::Rotation;
+        use crate::settings::SpreadMode;
+
+        let trim = Some(egui::Rect::from_min_max(
+            egui::pos2(0.1, 0.1),
+            egui::pos2(0.9, 0.9),
+        ));
+        let mut app = setup_app();
+        app.fullscreen_idx = Some(4);
+
+        // 分割していないときはトリムがそのまま通る。
+        app.spread_mode = SpreadMode::Single;
+        app.fullscreen_page_slice = PageSlice::Full;
+        assert_eq!(app.fs_page_content_bbox(4, Rotation::None, trim), trim);
+
+        // 分割中はトリムではなく左右が渡る。
+        app.spread_mode = SpreadMode::SplitLtr;
+        app.fullscreen_page_slice = PageSlice::Left;
+        assert_eq!(
+            app.fs_page_content_bbox(4, Rotation::None, trim),
+            Some(PageSlice::Left.uv_rect())
+        );
+
+        // 回転していると「画面で見て左半分」は元画像の別の半分になる。
+        assert_eq!(
+            app.fs_page_content_bbox(4, Rotation::Cw90, trim),
+            Some(PageSlice::Left.source_bbox(Rotation::Cw90))
+        );
+
+        // 表示していない別ページには左右を持ち込まない。
+        assert_eq!(app.fs_page_content_bbox(7, Rotation::None, trim), trim);
+    }
+
+    /// 横長分割のページ送り。**同じページの左右移動と、別ページへの移動を分けて返す。**
+    #[test]
+    fn splitting_walks_the_halves_before_moving_to_the_next_page() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use crate::page_split::{PageSlice, PresentationStep};
+        use crate::settings::SpreadMode;
+        use crate::ui_fullscreen::FsPageNav;
+
+        fn loaded_thumb(
+            ctx: &egui::Context,
+            name: &str,
+            source_dims: (u32, u32),
+        ) -> ThumbnailState {
+            ThumbnailState::Loaded {
+                tex: ctx.load_texture(name, egui::ColorImage::example(), Default::default()),
+                from_cache: false,
+                from_edit_preview: false,
+                rendered_at_px: 1,
+                source_dims: Some(source_dims),
+                layout_dims: None,
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        // 0 = 縦長、1 = 横長 (分割対象)、2 = 縦長。
+        for k in 0..3 {
+            app.items
+                .push(GridItem::Image(std::path::PathBuf::from(format!(
+                    "c:/split/{k}.jpg"
+                ))));
+            let dims = if k == 1 { (1600, 900) } else { (900, 1600) };
+            app.thumbnails
+                .push(loaded_thumb(&ctx, &format!("split-nav-{k}"), dims));
+        }
+        app.visible_indices = (0..3).collect();
+        app.cached_nav_indices = None;
+        app.spread_mode = SpreadMode::SplitLtr;
+
+        // 縦長 -> 横長の左半分。
+        app.fullscreen_idx = Some(0);
+        app.fullscreen_page_slice = PageSlice::Full;
+        assert_eq!(
+            app.spread_page_nav(1),
+            FsPageNav::Split(PresentationStep {
+                source_idx: 1,
+                slice: PageSlice::Left
+            })
+        );
+
+        // 左半分 -> 右半分。**元ページは変わらない。**
+        app.fullscreen_idx = Some(1);
+        app.fullscreen_page_slice = PageSlice::Left;
+        assert_eq!(
+            app.spread_page_nav(1),
+            FsPageNav::Split(PresentationStep {
+                source_idx: 1,
+                slice: PageSlice::Right
+            })
+        );
+
+        // 右半分 -> 次のページ。
+        app.fullscreen_page_slice = PageSlice::Right;
+        assert_eq!(
+            app.spread_page_nav(1),
+            FsPageNav::Split(PresentationStep {
+                source_idx: 2,
+                slice: PageSlice::Full
+            })
+        );
+
+        // 戻るときは相手の**最後の**半分へ着地する (飛ばさない)。
+        app.fullscreen_idx = Some(2);
+        app.fullscreen_page_slice = PageSlice::Full;
+        assert_eq!(
+            app.spread_page_nav(-1),
+            FsPageNav::Split(PresentationStep {
+                source_idx: 1,
+                slice: PageSlice::Right
+            })
+        );
+    }
+
+    /// 右→左では右半分から読む。左右の順序だけが変わり、元ページの順序は変わらない。
+    #[test]
+    fn reading_right_to_left_starts_from_the_right_half() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use crate::page_split::{PageSlice, PresentationStep};
+        use crate::settings::SpreadMode;
+        use crate::ui_fullscreen::FsPageNav;
+
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        for k in 0..2 {
+            app.items
+                .push(GridItem::Image(std::path::PathBuf::from(format!(
+                    "c:/rtl/{k}.jpg"
+                ))));
+            app.thumbnails.push(ThumbnailState::Loaded {
+                tex: ctx.load_texture(
+                    &format!("split-rtl-{k}"),
+                    egui::ColorImage::example(),
+                    Default::default(),
+                ),
+                from_cache: false,
+                from_edit_preview: false,
+                rendered_at_px: 1,
+                source_dims: Some((1600, 900)),
+                layout_dims: None,
+            });
+        }
+        app.visible_indices = (0..2).collect();
+        app.cached_nav_indices = None;
+        app.spread_mode = SpreadMode::SplitRtl;
+
+        app.fullscreen_idx = Some(0);
+        app.fullscreen_page_slice = PageSlice::Right;
+        assert_eq!(
+            app.spread_page_nav(1),
+            FsPageNav::Split(PresentationStep {
+                source_idx: 0,
+                slice: PageSlice::Left
+            })
+        );
+
+        app.fullscreen_page_slice = PageSlice::Left;
+        assert_eq!(
+            app.spread_page_nav(1),
+            FsPageNav::Split(PresentationStep {
+                source_idx: 1,
+                slice: PageSlice::Right
+            })
+        );
+    }
+
+    /// 分割中に自由回転を始めると分割は止まる。**送りも描画も同時に止める**ので、
+    /// 左右が同じ絵になる状態を作らない。
+    #[test]
+    fn free_rotation_stops_the_split_instead_of_showing_the_same_half_twice() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use crate::page_split::PageSlice;
+        use crate::settings::SpreadMode;
+        use crate::ui_fullscreen::FsPageNav;
+
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        for k in 0..2 {
+            app.items
+                .push(GridItem::Image(std::path::PathBuf::from(format!(
+                    "c:/free/{k}.jpg"
+                ))));
+            app.thumbnails.push(ThumbnailState::Loaded {
+                tex: ctx.load_texture(
+                    &format!("split-free-{k}"),
+                    egui::ColorImage::example(),
+                    Default::default(),
+                ),
+                from_cache: false,
+                from_edit_preview: false,
+                rendered_at_px: 1,
+                source_dims: Some((1600, 900)),
+                layout_dims: None,
+            });
+        }
+        app.visible_indices = (0..2).collect();
+        app.cached_nav_indices = None;
+        app.spread_mode = SpreadMode::SplitLtr;
+        app.fullscreen_idx = Some(0);
+        app.fullscreen_page_slice = PageSlice::Left;
+
+        app.fs_free_rotation = 0.3;
+        assert_eq!(
+            app.spread_page_nav(1),
+            FsPageNav::Delta(1),
+            "自由回転中は分割せず、通常のページ送りに戻る"
+        );
+
+        app.fs_free_rotation = 0.0;
+        assert!(
+            matches!(app.spread_page_nav(1), FsPageNav::Split(_)),
+            "自由回転をやめたら分割へ戻る"
+        );
+    }
+
     #[test]
     fn spread_boundary_is_reported_on_first_input_without_moving_internal_page() {
         use crate::grid_item::{GridItem, ThumbnailState};

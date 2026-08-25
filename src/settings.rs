@@ -2668,6 +2668,9 @@ fn default_reading_history_limit() -> usize {
 /// - `Rtl`: 見開き 右→左（表紙なし）— [0,1] [2,3] ...
 /// - `RtlCover`: 見開き 右→左（表紙あり）— [0] [2,1] [4,3] ...
 /// - `Vertical`: 旧DB互換用。新規 UI では `ReadingFlow::Vertical` を使う。
+/// - `SplitLtr` / `SplitRtl`: 横長ページ 1 枚を左右へ分けて 2 回の表示ステップとして読む。
+///   見開きと**排他**にしてある。独立した bool にすると「見開き かつ 分割」のような
+///   組み合わせ状態が増え、どちらが有効かを各所で判定し直すことになる。
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Default)]
 pub enum SpreadMode {
     #[default]
@@ -2677,6 +2680,8 @@ pub enum SpreadMode {
     Rtl,
     RtlCover,
     Vertical,
+    SplitLtr,
+    SplitRtl,
 }
 
 impl SpreadMode {
@@ -2693,9 +2698,17 @@ impl SpreadMode {
         matches!(self, Self::Vertical)
     }
 
-    /// 右→左（RTL）モードか
+    /// 右→左（RTL）モードか。
+    ///
+    /// 見開きのペア並び順の判定に使う。**分割モードは含めない** — 分割の左右順は
+    /// `crate::page_split::SplitDirection` が持ち、見開きのペア順とは別の概念である。
     pub fn is_rtl(self) -> bool {
         matches!(self, Self::Rtl | Self::RtlCover)
+    }
+
+    /// 横長ページを左右へ分割して読むモードか。
+    pub fn is_split(self) -> bool {
+        matches!(self, Self::SplitLtr | Self::SplitRtl)
     }
 
     /// 表紙（1ページ目単独表示）ありか
@@ -2711,6 +2724,8 @@ impl SpreadMode {
             3 => Self::Rtl,
             4 => Self::RtlCover,
             5 => Self::Vertical,
+            6 => Self::SplitLtr,
+            7 => Self::SplitRtl,
             _ => Self::Single,
         }
     }
@@ -2742,6 +2757,8 @@ impl SpreadMode {
             Self::Rtl => 3,
             Self::RtlCover => 4,
             Self::Vertical => 5,
+            Self::SplitLtr => 6,
+            Self::SplitRtl => 7,
         }
     }
 
@@ -2753,6 +2770,8 @@ impl SpreadMode {
             Self::Rtl => "見開き 右→左",
             Self::RtlCover => "見開き 右→左（表紙あり）",
             Self::Vertical => "縦読み（旧）",
+            Self::SplitLtr => "横長分割 左→右",
+            Self::SplitRtl => "横長分割 右→左",
         }
     }
 
@@ -2763,6 +2782,8 @@ impl SpreadMode {
             Self::LtrCover,
             Self::Rtl,
             Self::RtlCover,
+            Self::SplitLtr,
+            Self::SplitRtl,
         ]
     }
 
@@ -2775,6 +2796,9 @@ impl SpreadMode {
             (Self::Ltr | Self::Rtl, ReadingDirection::Rtl) => Self::Rtl,
             (Self::LtrCover | Self::RtlCover, ReadingDirection::Ltr) => Self::LtrCover,
             (Self::LtrCover | Self::RtlCover, ReadingDirection::Rtl) => Self::RtlCover,
+            // 分割も読み順を持つので、読み方向の切替に追随させる。
+            (Self::SplitLtr | Self::SplitRtl, ReadingDirection::Ltr) => Self::SplitLtr,
+            (Self::SplitLtr | Self::SplitRtl, ReadingDirection::Rtl) => Self::SplitRtl,
             (mode, _) => mode,
         }
     }

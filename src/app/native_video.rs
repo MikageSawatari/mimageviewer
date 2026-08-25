@@ -9510,6 +9510,19 @@ impl App {
                 self.show_native_video_boundary_toast(ctx, at_end);
                 return;
             }
+            // 分割中の移動。ここに来るのは動画 / 音声を表示しているときで、動画は
+            // 分割されないので同じページ内の左右移動にはならない。念のため塞ぐ。
+            crate::ui_fullscreen::FsPageNav::Split(step) if step.source_idx == fs_idx => return,
+            crate::ui_fullscreen::FsPageNav::Split(step) => {
+                // 左右は着地側が決めるので、ここでは元ページまでの距離だけ見る。
+                crate::ui_fullscreen::navigable_delta_between(
+                    &self.items,
+                    &display_order,
+                    fs_idx,
+                    step.source_idx,
+                )
+                .unwrap_or(base_delta)
+            }
         };
         self.start_manual_media_navigation(
             ctx,

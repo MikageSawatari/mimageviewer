@@ -808,6 +808,12 @@ pub(in crate::app) struct ViewerContextBundle {
     /// VST3 startup load 完了まで start_fs_load を保留している、この context の media idx。
     vst3_deferred_media_open: Option<usize>,
     fullscreen_idx: Option<usize>,
+    /// 分割表示中に、今どちら側を見ているか。分割していなければ `Full`。
+    ///
+    /// **元ページ (`fullscreen_idx`) と同じ context 所有**にする。片方だけ App 側に
+    /// 置くと、context を切り替えたときに前の viewer の左右が次の viewer へ残る。
+    /// 永続化はしない (開き直しは分割方向の最初の半分へ着地する)。
+    fullscreen_page_slice: crate::page_split::PageSlice,
     viewer_session: ViewerSession,
     native_video_in_window_active: bool,
     video_audio_mode: Option<usize>,
@@ -1312,6 +1318,7 @@ impl ViewerContextBundle {
             current_color_catalog: None,
             vst3_deferred_media_open: None,
             fullscreen_idx: None,
+            fullscreen_page_slice: crate::page_split::PageSlice::Full,
             viewer_session: ViewerSession::default(),
             native_video_in_window_active: false,
             video_audio_mode: None,
@@ -1517,6 +1524,9 @@ impl App {
     ) {
         self.selected = Some(idx);
         self.fullscreen_idx = Some(idx);
+        // 新しく開くページは分割方向の最初の半分から。ここで残すと前のページの
+        // 「右半分を見ていた」が別のページへ引き継がれる。
+        self.fullscreen_page_slice = crate::page_split::PageSlice::Full;
         self.native_video_in_window_active = false;
         self.activate_mounted_as_independent_detached(window_id);
     }
@@ -1629,6 +1639,7 @@ impl App {
             current_color_catalog,
             vst3_deferred_media_open,
             fullscreen_idx,
+            fullscreen_page_slice,
             viewer_session,
             native_video_in_window_active,
             video_audio_mode,
@@ -1861,6 +1872,8 @@ impl App {
         // (review-v2.3.0 追補 BA-7: vst3 deferred)
         swap_field!(vst3_deferred_media_open);
         swap_field!(fullscreen_idx);
+        // 左右は元ページと同じ所有。片方だけ残すと別 viewer の半分が見える。
+        swap_field!(fullscreen_page_slice);
         viewer_session.swap_with_mounted(
             &mut self.viewer_presentation,
             &mut self.last_viewer_sync_stamp,
@@ -2135,6 +2148,7 @@ impl App {
             current_color_catalog,
             vst3_deferred_media_open,
             fullscreen_idx,
+            fullscreen_page_slice,
             viewer_session,
             native_video_in_window_active,
             video_audio_mode,
@@ -2332,6 +2346,7 @@ impl App {
         move_to_parked!(
             vst3_deferred_media_open,
             fullscreen_idx,
+            fullscreen_page_slice,
             native_video_in_window_active,
             video_audio_mode,
             video_audio_vst,
