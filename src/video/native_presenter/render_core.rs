@@ -11946,7 +11946,8 @@ mod tests {
     fn the_bottom_hud_lock_is_clickable_while_the_strip_is_on_screen() {
         use std::sync::{Arc, Mutex};
 
-        let overlay_size = egui::vec2(1280.0, 720.0);
+        // Geometry from the real-hardware log: fractional points size at 1.5x scale.
+        let overlay_size = egui::vec2(1242.7, 916.0);
         let lock_rect =
             crate::video::native_presenter::overlay_draw::native_seek_bar_lock_button_rect(
                 overlay_size.x,
@@ -11963,6 +11964,7 @@ mod tests {
             let mut fonts_ready = false;
             let mut harness = egui_kittest::Harness::builder()
                 .with_size(overlay_size)
+                .with_pixels_per_point(1.5)
                 .build(move |ctx| {
                     if !fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);

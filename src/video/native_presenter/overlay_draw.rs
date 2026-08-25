@@ -2267,9 +2267,17 @@ pub(super) fn draw_native_bar_lock_button(
         // **前 pass の widget 矩形**と clip で決まるので、残る候補は
         // (a) clip で interact_rect が削られている (b) 前 pass にこの widget が居ない
         // (c) 別の何かが pointer を握っている、の 3 つ。3 つとも出す。
-        let prev_pass_response = ui.ctx().read_response(egui::Id::new(id)).is_some();
+        // `read_response` は this_pass を先に見るので前 pass の証拠にならない。代わりに
+        // pass 番号 (間に別内容の pass が挟まっていないか)、Foreground の最前面 area
+        // (ストリップのクリックで area 順が入れ替わっていないか)、pointer が area 上と
+        // 見なされているかを出す。
+        let pass_nr = ui.ctx().cumulative_pass_nr();
+        let top_foreground = ui
+            .ctx()
+            .memory(|m| m.areas().top_layer_id(egui::Order::Foreground));
+        let pointer_over_area = ui.ctx().is_pointer_over_area();
         crate::logger::log(format!(
-            "[strip-lock-diag] bar lock widget bar={bar:?} down_on={} clicked={}              hovered={} contains_ptr={} in_rect={pointer_in_rect}              egui_hover={egui_hover:?} top_layer={:?}              rect={rect:?} interact_rect={:?} clip={:?}              prev_pass_response={prev_pass_response} using_pointer={} dragged_id={:?}              locked={locked}",
+            "[strip-lock-diag] bar lock widget bar={bar:?} down_on={} clicked={}              hovered={} contains_ptr={} in_rect={pointer_in_rect}              egui_hover={egui_hover:?} top_layer={:?}              rect={rect:?} interact_rect={:?} clip={:?}              pass={pass_nr} top_fg={top_foreground:?} over_area={pointer_over_area}              using_pointer={} dragged_id={:?} locked={locked}",
             resp.is_pointer_button_down_on(),
             resp.clicked(),
             resp.hovered(),
