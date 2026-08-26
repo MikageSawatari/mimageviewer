@@ -2197,7 +2197,7 @@ detached backstop、native window の focus / placement / epoch 処理は scope 
 ⚠ タスクマネージャーの CPU% では判別できない (どちらも 0% 表示)。
    判定には perf log のフレーム間隔を見ること。
 
-#### process-lifetime overlay GPU device epoch 共有を実装 (2026-08-26、実機確認待ち)
+#### process-lifetime overlay GPU device epoch 共有 ✅ (2026-08-26、実機確認済み)
 
 残り優先 2 として、[src/video/native_presenter/overlay_gpu.rs](../src/video/native_presenter/overlay_gpu.rs)
 に process-owned `OverlayGpuService` を追加した。`OnceLock` は device 直置きではなく、共有
@@ -2246,15 +2246,60 @@ successor 非干渉、configure / submission gate の排他を検証済み。実
 Win32 / DComp window が必要なため、2 overlay の同一 `wgpu::Device` identity は unit test 化していない。
 実機 F12 往復で `device_reused=true` と同一 generation を確認する。
 
+##### 実機測定結果 (2026-08-26)
+
+同じ解析ツールで 2 セッションを比べた (before = pump 修正後 / device 共有前)。
+**27 回の overlay 作成のうち 26 回が `reused=true`、全部 `generation=1`** —
+セッション中すっと device 1 つで回った。
+
+| span | before (6 switch) | after (8 switch) | |
+| --- | --- | --- | --- |
+| **switch total** | 231.8ms | **198.1ms** | −34 |
+| `render_core_new` | 159.1 | **105.0** | **−54** |
+| 　`egui_overlay` | 104〜113 | **42.0** | |
+| 　　`overlay_new` | (未分割) | **5.0** | |
+| 　　`overlay_first_render` | (未分割) | **37.2** | ← 今後の最大 |
+| 　`d3d11_device` | 21〜25 | 26.1 | 共有していない |
+| `detach_old` | 38.3 | **29.2** | −9 (`egui_overlay` 部分は 6.4) |
+| `publish` | 13.4 | 30.3 | **+17** |
+
+overlay 内訳は予測どおり: `wgpu_instance` / `surface` / `adapter` / `device` がすべて **0.0ms**。
+予測外の収穫として **`egui_wgpu::Renderer::new` も 8.4〜9.7ms → 1.1ms**
+(warm device で pipeline 作成が安い)。
+
+⚠ **`publish` が上がって利得の 1/3 を食っている**。方向別に分けると:
+
+| | before | after |
+| --- | --- | --- |
+| → detached | 7.7 / 11.7 / 13.4 | 12.8 / 13.5 / 10.4 (変化なし) |
+| → main | 40.5 / 18.6 / 13.3 | 57.3 / 43.6 / 48.4 / 51.4 / 17.0 |
+
+`publish` は全部 `wait` (= pump の `SetFocus` を main UI thread が処理するのを待つ)。
+→ main だけ遅い非対称は **元々あった** (18.6 vs 11.7) が、今回拡大したように見える。
+
+**ただし before n=3 / after n=5 で、before にも 40.5 の外れ値がある。
+この差を今回の変更に帰属させるにはサンプルが足りない**。仮説は 2 つあるがどちらも未検証:
+
+- `render_core_new` が 54ms 早くなった分、`SetFocus` が main UI thread の sleep/wake 位相の
+  別のところへ落ちるようになった (= 生産側を速くして消費側の遅延が露出した)
+- 今回のセッションは F12 往復だけでなく「動画を連続で開き直す」操作を含むので、
+  foreground / focus の状態が before と違う
+
+実機確認: F12 往復、連続での動画切替、再生中のリサイズ、別 DPI モニターへの移動、
+音声モード、VST GUI 開閉、初回 (`reused=false`) → F12 (`reused=true`) の HUD 表示を利用者が確認済み。
+
 #### 残りの優先順 (2026-08-26 時点)
 
 1. ~~**16ms pump のイベント駆動化 (Direction A)**~~ ✅ **実装・実機確認済み (2026-08-26)**。
    上の「Direction A 実装」節を参照。動画を開いている間の UI フレームが 121.7/秒 → 48.0/秒。
    残りの固定スピンは §1.130。
-2. ~~**`egui_overlay` の wgpu device 共有**~~ ✅ **実装済み、実機確認待ち (2026-08-26)**。
-   process-lifetime `OverlayGpuService` / compatible `DeviceEpoch` 共有と loss 世代を実装。
-   上の実装節と次回計測 span を参照。
-3. `d3d11_device` (27〜31ms × 2) — 同じく共有候補
+2. ~~**`egui_overlay` の wgpu device 共有**~~ ✅ **実装・実機確認済み (2026-08-26)**。
+   上の節を参照。switch total 231.8 → 198.1ms。
+3. ~~`d3d11_device` の共有~~ **見送り**。1 device に immediate context は 1 本しか作れず、
+   `Present` まで同じ submission owner に寄せる必要がある。この repo は共有 `GpuVideoDevice` で
+   immediate context 競合による hard-stuck を既に経験済みなので、26ms のために戻らない。
+4. **残りの最大は `overlay_first_render` (37.2ms)** — overlay ごとに新しい `egui::Context` を
+   作るので font atlas を毎回建て直している。次に見るならここか `publish` (`SetFocus`)。
 
 - ⚠ **guard / delay / retry で待ち時間を隠さない。**
 - 規模 \\ 優先度: Medium / P3 (主因は 2 段階とも取れた。残りは体感上実用域)。
