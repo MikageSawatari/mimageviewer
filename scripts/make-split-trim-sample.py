@@ -52,8 +52,9 @@ def page(width, height, margin, blocks):
         x1 = margin + (width - 2 * margin) * end
         draw.rectangle([x0, top, x1, bottom], fill=color)
         label(draw, (x0, top, x1, bottom), text, max(24, height // 12))
-    # A thin frame on the true page edge, so you can see where the margin ends.
-    draw.rectangle([0, 0, width - 1, height - 1], outline=(200, 200, 200))
+    # No frame on the page edge. A border line reads as content to the margin
+    # detector, so the whole page becomes the content box and nothing is trimmed
+    # -- which is exactly the feature this sample exists to exercise.
     return image
 
 

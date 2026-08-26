@@ -20513,7 +20513,8 @@ impl App {
         // 通常の左右キーによるページ移動だけは、ページ表示の綴じ方向かシークバーの
         // 実効方向かを設定で選べる。Ctrl/Shift+左右などの明示コマンドは従来どおり
         // ページ表示の綴じ方向を使い、この設定へ巻き込まない。
-        let page_rtl = self.spread_mode.is_rtl();
+        // 入力の左右は読み順で決める。ペア並び順 (`is_rtl`) は別の問い。
+        let page_rtl = self.spread_mode.advances_right_to_left();
         let seek_bar_rtl = self
             .settings
             .fullscreen_seek_direction
@@ -22918,8 +22919,10 @@ impl App {
                         // A recognized tap is an intentional discrete page turn,
                         // including in continuous reading. Use the same unit
                         // resolver as FsPageNext/FsPagePrev.
-                        let base =
-                            fullscreen_click_nav_delta_for_side(left, self.spread_mode.is_rtl());
+                        let base = fullscreen_click_nav_delta_for_side(
+                            left,
+                            self.spread_mode.advances_right_to_left(),
+                        );
                         page_nav = self.spread_page_nav(base);
                     }
                     crate::touch_input::TouchCommand::Zoom { factor, pivot } => {
@@ -23467,7 +23470,7 @@ impl App {
                                     let base = fullscreen_click_nav_base_delta(
                                         pos.x,
                                         full_rect.center().x,
-                                        self.spread_mode.is_rtl(),
+                                        self.spread_mode.advances_right_to_left(),
                                     );
                                     page_nav = self.spread_page_nav(base);
                                 }

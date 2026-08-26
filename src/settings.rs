@@ -2801,6 +2801,16 @@ impl SpreadMode {
         }
     }
 
+    /// **入力の左右を反転するか。**「右」が次ページ側になるモード。
+    ///
+    /// [`Self::is_rtl`] は**見開きのペア並び順**を表す別の問いで、横長分割を含まない。
+    /// 入力の左右まで `is_rtl` で決めていたため、横長分割 右→左 を選んでも矢印キーと
+    /// タップの左右が反転しなかった (2026-08-26 の実機報告。シークバーの向きは合っていた)。
+    /// 読み順は [`Self::reading_direction`] が正本なので、そこから導く。
+    pub fn advances_right_to_left(self) -> bool {
+        matches!(self.reading_direction(), Some(ReadingDirection::Rtl))
+    }
+
     /// 見開きの表紙有無を保ったまま横方向だけを差し替える。
     ///
     /// Single / 旧 Vertical は見開き構成ではないため、そのまま返す。
@@ -7915,7 +7925,24 @@ mod tests {
             );
             // 元へ戻る。
             assert_eq!(flipped.with_reading_direction(direction), mode, "{mode:?}");
+            // **入力の左右も同じ読み順から導く。**ペア並び順 (`is_rtl`) で決めていたため、
+            // 横長分割 右→左 で矢印キーが反転しなかった (2026-08-26 の実機報告)。
+            assert_eq!(
+                mode.advances_right_to_left(),
+                direction == ReadingDirection::Rtl,
+                "{mode:?}"
+            );
         }
+
+        // 読み順を持たないモードは反転しない (1ページ表示の従来動作を変えない)。
+        assert!(!SpreadMode::Single.advances_right_to_left());
+        // 見開き 右→左 は従来どおり反転し、横長分割 右→左 も同じになる。
+        assert!(SpreadMode::Rtl.advances_right_to_left());
+        assert!(SpreadMode::RtlCover.advances_right_to_left());
+        assert!(SpreadMode::SplitRtl.advances_right_to_left());
+        assert!(!SpreadMode::SplitLtr.advances_right_to_left());
+        // ペア並び順は分割を含まない。2 つの問いを取り違えない。
+        assert!(!SpreadMode::SplitRtl.is_rtl());
     }
 
     #[test]

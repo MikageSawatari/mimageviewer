@@ -433,8 +433,10 @@ impl App {
                         );
                         draw_touch_rows(
                             ui,
-                            help_context
-                                .touch_rows(self.spread_mode.is_rtl(), video_touch_available),
+                            help_context.touch_rows(
+                                self.spread_mode.advances_right_to_left(),
+                                video_touch_available,
+                            ),
                         );
                         draw_fixed_rows(ui, &self.keymap, help_context.fixed_rows());
                     });
