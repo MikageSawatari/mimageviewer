@@ -13624,7 +13624,11 @@ impl App {
                 viewport_id,
             )
         });
-        ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx, _class| {
+        // Separate our drawing from what eframe does around it (render + present of
+        // the child viewport), because only one of the two can be made cheaper.
+        let show_t0 = std::time::Instant::now();
+        let inner_ms = ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx, _class| {
+            let inner_t0 = std::time::Instant::now();
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                 .show(vp_ctx, |ui| {
@@ -13658,7 +13662,25 @@ impl App {
                         self.draw_fs_display_unit_holdover(ui, vp_ctx, image_rect, unit);
                     }
                 });
+            inner_t0.elapsed().as_secs_f64() * 1000.0
         });
+        let show_ms = show_t0.elapsed().as_secs_f64() * 1000.0;
+        if crate::perf::is_enabled() && show_ms >= 20.0 {
+            crate::perf::event(
+                "ui",
+                "detached_backstop_viewport_show",
+                None,
+                self.frame_counter as u64,
+                &[
+                    ("show_ms", serde_json::Value::from(show_ms)),
+                    ("inner_ui_ms", serde_json::Value::from(inner_ms)),
+                    (
+                        "eframe_ms",
+                        serde_json::Value::from((show_ms - inner_ms).max(0.0)),
+                    ),
+                ],
+            );
+        }
         if let Some(window_id) = backstop_window_id {
             self.register_detached_window_hwnd_after_show(
                 window_id,

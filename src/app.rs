@@ -66084,14 +66084,19 @@ impl eframe::App for App {
         if should_render_main_fullscreen_viewport {
             self.render_fullscreen_viewport(ctx);
         }
+        // This span is the whole of `pre_grid` while a video plays in a detached
+        // window (backlog 1.122). Name the call that owns it.
+        let t_main_fs_viewport = frame_t0.elapsed();
         #[cfg(windows)]
         self.render_detached_image_windows(ctx);
+        let t_detached_image_windows = frame_t0.elapsed();
         // keep-alive backstop (§3.2/§4 K0): ここまでの経路 (update_active_viewer_context
         // 内 / top-level の keep_alive + render_fullscreen) のどれも今フレーム detached viewport を
         // 描かなかった場合に、holdover で 1 回だけ描いて egui に OS ウィンドウを破棄させない。
         // 必ずアクティブ detached 描画経路すべての後 (= フルスクリーン区間末尾) で呼ぶ。
         #[cfg(windows)]
         self.render_active_detached_viewport_backstop(ctx);
+        let t_detached_backstop = frame_t0.elapsed();
         #[cfg(windows)]
         self.flush_pending_detached_cleanup_font_atlas_resync();
         let t_render_fullscreen_viewport = frame_t0.elapsed();
@@ -67334,6 +67339,32 @@ impl eframe::App for App {
                         serde_json::Value::from(
                             (t_render_fullscreen_viewport - t_keep_fullscreen_viewport)
                                 .as_secs_f64()
+                                * 1000.0,
+                        ),
+                    ),
+                    (
+                        "main_fs_viewport_ms",
+                        serde_json::Value::from(
+                            (t_main_fs_viewport - t_keep_fullscreen_viewport).as_secs_f64()
+                                * 1000.0,
+                        ),
+                    ),
+                    (
+                        "detached_image_windows_ms",
+                        serde_json::Value::from(
+                            (t_detached_image_windows - t_main_fs_viewport).as_secs_f64() * 1000.0,
+                        ),
+                    ),
+                    (
+                        "detached_backstop_ms",
+                        serde_json::Value::from(
+                            (t_detached_backstop - t_detached_image_windows).as_secs_f64() * 1000.0,
+                        ),
+                    ),
+                    (
+                        "font_atlas_resync_ms",
+                        serde_json::Value::from(
+                            (t_render_fullscreen_viewport - t_detached_backstop).as_secs_f64()
                                 * 1000.0,
                         ),
                     ),

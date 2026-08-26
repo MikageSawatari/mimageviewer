@@ -1951,6 +1951,34 @@ probe を render / pump 両スレッドに入れて F12 を 5 回切替えた。
 
 ⚠ `SetFocus` を遅延・省略・別スレッド化して待ちを隠すのは対策にしない。
 
+#### 41ms の正体は fullscreen viewport 区間 (2026-08-26、`--perf-log` 実測)
+
+`ui/slow_frame_breakdown` を 33 フレーム分読んだ。**全フレームで同じ形**:
+
+| 区間 | 実測 |
+| --- | --- |
+| `total_ms` | 40.6〜53.9 |
+| `pre_grid_ms` | 38.8〜51.6 |
+| **`render_fullscreen_viewport_ms`** | **35.9〜48.3** |
+| `keep_fullscreen_viewport_ms` | 0.0 |
+| `ensure_native_video_front_ms` | 0.0 |
+| `background_polls_ms` / `bars_ms` / `grid_ms` / `post_grid_ms` | 0.1〜1.4 |
+
+発生区間は `11.2〜13.6s` と `15.6〜16.3s` — **動画が別ウィンドウにある区間だけ**。
+
+`keep_fullscreen_viewport_ms = 0.0` なので、**本来の描画経路
+(`update_active_viewer_context` 内) はこの間一度も描いていない**。
+区間 ([app.rs:66084](../src/app.rs:66084)-) の内訳は次の 4 つ:
+
+1. `render_fullscreen_viewport` (今回はウィンドウ内動画モードなので走らないはず)
+2. `render_detached_image_windows` (受動的な静止画別窓。今回は無いはず)
+3. **`render_active_detached_viewport_backstop`** — keep-alive 経路
+   ([ui_fullscreen.rs:13484](../src/ui_fullscreen.rs:13484))。他の経路が描かなかった
+   フレームで 1 回描いて OS ウィンドウを破棄させないための backstop
+4. `flush_pending_detached_cleanup_font_atlas_resync`
+
+見立ては 3 だが**未確認**。次の測定で 4 分割する。
+
 #### 次の一手 — 41ms の `pre_grid` の中身
 
 `pg_top` には `selection_info:0.4ms` / `facet:0.3ms` しか出ておらず、**41ms の大半が
