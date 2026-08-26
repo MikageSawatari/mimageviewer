@@ -3930,3 +3930,84 @@ SimplySign のクラウド鍵セッションが切れていても通過する (�
   書き出す場合、**切替先で同じサイドカーを読む競合**をどう扱うかが設計の核。
 
 - 規模 / 優先度: 未見積 / P2 (実害が「数秒の無反応」なので体感は大きい)。
+
+#### 方針は決まっている (2026-08-26、利用者判断)
+
+**サイドカー機能は維持し、格納形式だけ変える。**削除は検討したうえで却下した。
+
+検討時に一度「サイドカーにはマスクが入っていないのでは」「フォーマットが用途に合って
+いないのでは」という見立てが出たが、**どちらもコードで否定された**。次に読む人が同じ道を
+辿らないよう、根拠を残す:
+
+| 種類 | サイドカー内の形式 | 415 item の合計 |
+| --- | --- | --- |
+| 消しゴム `mask` | **1bit/pixel + deflate + base64** (`SidecarMask`) | 0.2 MB |
+| 隠蔽 `conceal` | 同上 | 同程度 |
+| 補正レイヤー `local_adjust_layers` | `RasterVectorMask.alpha: Vec<f32>` を **JSON 数値配列のまま** | **164.6 MB** |
+
+3 種ともマスクは保存されており、「別プロファイルでも復元できる」という当初の意図は実装
+されている。**フォーマットの問題ではなく、補正レイヤーだけがメモリ上の構造体の serde を
+そのまま使っている**のが欠陥。消しゴム側が同じファイルで成立していることが、形式が用途に
+適している証拠になっている。
+
+削除しない理由: サイドカーが守っているのは**アプリ外でフォルダごと移動された**場合。
+[rename_key_migration.rs](../src/rename_key_migration.rs) は「対象外」節のとおり**アプリ内
+リネーム専用**で、そこは埋まらない。[metadata_transfer.rs](../src/metadata_transfer.rs) は
+別環境への復元を単体で担えるが**明示操作**なので、エクスポートしていない利用者は救えない。
+黙って重くなるのは悪いが、**黙ってデータが消えるほうがさらに悪い**。
+
+`tag_sidecar_backup_enabled` は既定 OFF で、タグは文字列なので容量問題とは無関係。今回を
+理由に一緒に削る根拠は無い。
+
+#### 着手順
+
+1. ~~**`RasterVectorMask` の格納形式を圧縮形式にする。**~~ → **完了 (2026-08-26)**
+2. ~~flush の worker 化~~ / **import の worker 化は残り** (下記)
+3. サイドカーが肥大したときに気づける仕組み (サイズをログか設定画面へ) — **未着手**
+
+#### 1 と 2 の結果 (2026-08-26)
+
+正本は [preset-and-adjustment.md](preset-and-adjustment.md) §9.3 / §9.3.2。
+
+- **格納形式**: 画素ごとの値を `"<tag>:<count>:<base64(deflate(bytes))>"` へ詰める
+  ([crates/local-adjust-core/src/mask_codec.rs](../crates/local-adjust-core/src/mask_codec.rs))。
+  `serde` のフィールド属性なので、レイヤー配列を持つ**全ストアが同時に**新形式になる
+  (`local_adjust.db` / `mimageviewer.dat` / 編集 bundle / メタデータ移送)。
+- **量子化は 8bit**。実データの alpha は 0.0 / 1.0 だけ (31.5M 値中 99.95% が 0) だったが、
+  `SubjectMask` はマッティングモデルの連続値なので 1bit にはしない。2 値データなら
+  deflate が潰すので容量差も出ない。
+- **`RasterVectorMask` だけではなかった**。同じ形の per-pixel 配列が `RasterMask.alpha` /
+  `SubjectMask.alpha` / `SubjectMask.source_alpha` / `RegionMask.labels` にもある。5 か所まとめて直した。
+- **`local_adjust.db` も同じ欠陥で、しかもサイドカーより大きかった** (959 MB / 82 行 /
+  最大 1 行 93 MB)。そのページを開くたびに UI スレッドで 93 MB の数値配列をパースしていた。
+  `local_adjust_db::repack_legacy_masks` が起動時 worker で移行 + VACUUM する。
+- **移行の実測** (利用者の実データのコピー):
+
+  | | 前 | 後 | 時間 |
+  | --- | --- | --- | --- |
+  | `local_adjust.db` | 959.0 MB | 2.7 MB | 5.2 s (worker、82 行走査 / 69 行書換 / 0 skip) |
+  | `mimageviewer.dat` (415 items) | 733.9 MB | 0.6 MB | 読み 0.8s / 書き 0.3s |
+
+- **flush は非同期化**。`SidecarWriter` (専用スレッド 1 本)。まだ届いていない内容は
+  pending に残り `SidecarFile::load` がディスクより先に見るので、フォルダ切替が
+  書き込み完了を待つ ack は不要になった。
+- **定期フラッシュは 5 秒 → 10 分**、判定は「dirty になった時刻」から。通常の保存契機は
+  「編集ツールを抜けた時 / フォルダ切替 / アプリ終了」で、定期はクラッシュ・電源断用の保険。
+  「編集ツールを抜けた」は `page_edit_tool_owns_canvas` の true → false から導くので、
+  ツールが増えても呼び出し側を足さなくてよい。
+
+#### 残り
+
+- **import (`SidecarFile::load` + `import_to_dbs`) は UI スレッドのまま。**移行後は
+  0.6 MB / 数 ms なので実害は消えたが、§4 チェックリスト違反ではある。ネットワーク
+  ドライブや巨大フォルダでは効く。
+- **移行の 1 回目だけ UI が止まる** (実測 0.8 秒 / フォルダ)。旧形式を読む経路が
+  同期なので。2 回目以降は無い。
+- **mtime fast-path に当たり続けるフォルダは移行されない**。実害は disk 容量だけ
+  (開かないので遅くもならない)。開けば slow-path に入って移行される。
+- `metadata_transfer` の `FORMAT_VERSION` は **上げていない**。上げると `!=` 比較なので
+  新版が既存の v7 エクスポートを一切読めなくなる。上げない場合の副作用は「新版で
+  書き出した bundle を旧版で import すると layers のパースで失敗する」だけで、
+  データが黙って壊れる経路は無い。
+- **VACUUM は `local_adjust.db` だけ**。他の DB (tags.db 213MB / fts_meta.db 365MB /
+  audio_analysis.db 1.5GB) の肥大は別問題で、未調査。

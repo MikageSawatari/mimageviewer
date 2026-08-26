@@ -811,7 +811,7 @@ pub(crate) fn purge_removed_paths_at(
 }
 
 fn purge_sidecar_backups(removed: &[PathBuf], report: &mut PurgeReport) {
-    purge_sidecar_backups_with_flush(removed, report, |sidecar| sidecar.flush());
+    purge_sidecar_backups_with_flush(removed, report, |sidecar| sidecar.flush_blocking());
 }
 
 fn purge_sidecar_backups_with_flush<F>(removed: &[PathBuf], report: &mut PurgeReport, mut flush: F)

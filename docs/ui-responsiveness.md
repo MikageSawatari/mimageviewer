@@ -524,18 +524,21 @@ v0.8.1 で Codex レビューが指摘したが、通常運用での体感影響
     通常閲覧・サムネイル処理のホットパスではない。ローカルでは 1ms 以下。
   - 直すなら `ArchiveConvertPhase::CheckingCache` を追加して worker で lookup、結果で
     cache 即開 / 変換確認へ分岐する形が素直。
-- **sidecar flush / import** — [src/app.rs `flush_idle_sidecars`, `flush_all_sidecars`](../src/app.rs) および `SidecarFile::load()` import 経路
-  - `flush_idle_sidecars` は通常 update から、`flush_all_sidecars` はフォルダ切替から呼ばれ、
-    いずれも `write` / `rename` / `remove_file` を UI スレッドで直接実行する。
-  - sidecar backup が有効 + 保存先がネットワーク/外付け + mask/adjust を大量に持つ JSON
-    では閲覧中・フォルダ切替時に数百 ms 停止した観測あり (コメント参照)。
-  - sidecar は optional backup で adjustment DB が authoritative なので現状は許容範囲だが、
-    v0.8.2 で snapshot → worker flush + import pending 化する。
-  - フォルダ切替経路 (`start_loading_items` → `flush_all_sidecars`) を worker 化するときは、
-    次フォルダの `load_folder` が旧 sidecar の flush 完了を待つ ack パスが要る点に注意。
+- **sidecar import** — [src/app.rs `import_sidecar_to_dbs`](../src/app.rs) から呼ぶ
+  `SidecarFile::load()` + `import_to_dbs()`
+  - フォルダ切替時に `read_to_string` + JSON パース + DB へのインポートを UI スレッドで走らせる。
+    mtime fast-path で通常は読まずに戻るが、外部更新後・移行後の 1 回は必ず読む。
+  - 実測 (2026-08-26、733.9MB の旧形式サイドカー) で読み 0.8 秒。**移行後は 0.6MB** なので
+    通常運用では問題にならない。worker 化は [next-release-backlog.md](next-release-backlog.md)
+    §1.126 の残り。
 
-どちらも Codex P3 (confidence 0.76-0.78)。§4 チェックリスト違反なので新しい同期 I/O を
+Codex P3 (confidence 0.76-0.78)。§4 チェックリスト違反なので新しい同期 I/O を
 足すときの悪例として参照してよい。
+
+**sidecar flush は 2026-08-26 に解決済み。**`SidecarWriter` (専用スレッド 1 本) へ
+内容を渡すだけになった。フォルダ切替が旧 flush の完了を待つ必要は無い —— まだ
+届いていない内容は writer の pending に残り、`SidecarFile::load` がディスクより先に
+そちらを見るため。詳細は [preset-and-adjustment.md](preset-and-adjustment.md) §9.3.2。
 
 ### フォルダオープン時の巨大 local_adjust JSON 読み (2026-06 解決済み)
 

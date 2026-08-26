@@ -96,7 +96,7 @@ fn write_sidecar(
         let raw = compress_mask(&mask);
         sc.set_mask(rel, SidecarMask::from_raw(&raw, &[], w, h));
     }
-    sc.flush();
+    sc.flush_blocking();
 }
 
 // ── テスト 1: フォルダ移動シナリオ (中心ケース) ───────────────────────
@@ -331,7 +331,7 @@ fn sidecar_flush_then_load_preserves_data() {
         sc.set_adjust("b.jpg", sample_params(-2.0));
         let raw = compress_mask(&sample_mask_8x8());
         sc.set_mask("a.jpg", SidecarMask::from_raw(&raw, &[], 8, 8));
-        sc.flush();
+        sc.flush_blocking();
     }
 
     // 再読み込み
@@ -358,12 +358,12 @@ fn flush_removes_dat_when_all_entries_cleared() {
     // 1 エントリ書いて flush → ファイルができる
     let mut sc = SidecarFile::new(folder.to_path_buf());
     sc.set_adjust("a.jpg", sample_params(1.0));
-    sc.flush();
+    sc.flush_blocking();
     assert!(path.exists());
 
     // 削除 → flush → ファイルが消える
     sc.remove_adjust("a.jpg");
-    sc.flush();
+    sc.flush_blocking();
     assert!(
         !path.exists(),
         "sidecar file must be removed when items empty"
@@ -378,11 +378,14 @@ fn flush_on_nonexistent_folder_does_not_panic() {
     let mut sc =
         SidecarFile::new("Z:/this/path/definitely/does/not/exist/__mimageviewer_test__".into());
     sc.set_adjust("a.jpg", sample_params(1.0));
-    sc.flush(); // 失敗するはずだが panic してはいけない
+    assert!(
+        !sc.flush_blocking(),
+        "a folder that cannot be written must report the failure, not claim success"
+    );
 
-    // 以降の flush はすべて no-op (disabled フラグ) になる
+    // 以降の flush はすべて no-op (writer が folder ごとに失敗を覚えている) になる
     sc.set_adjust("b.jpg", sample_params(2.0));
-    sc.flush();
+    sc.flush_blocking();
 }
 
 // ── テスト 10: サイドカー有 + DB 一部既存 (混合) ────────────────────
@@ -403,7 +406,7 @@ fn partial_overlap_imports_only_missing() {
         let mut sc = SidecarFile::new(folder.to_path_buf());
         sc.set_adjust("a.jpg", sample_params(1.0));
         sc.set_adjust("b.jpg", sample_params(2.0));
-        sc.flush();
+        sc.flush_blocking();
     }
 
     let loaded_sidecar = SidecarFile::load(folder);
@@ -458,7 +461,7 @@ fn flush_succeeds_and_file_readable_even_with_hidden_attrs() {
     {
         let mut sc = SidecarFile::new(folder.to_path_buf());
         sc.set_adjust("x.jpg", sample_params(1.5));
-        sc.flush();
+        sc.flush_blocking();
     }
 
     // 再読込
@@ -471,7 +474,7 @@ fn flush_succeeds_and_file_readable_even_with_hidden_attrs() {
     {
         let mut sc3 = SidecarFile::new(folder.to_path_buf());
         sc3.set_adjust("x.jpg", sample_params(2.71));
-        sc3.flush();
+        sc3.flush_blocking();
     }
     let sc4 = SidecarFile::load(folder);
     assert_eq!(
