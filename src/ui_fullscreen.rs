@@ -9862,11 +9862,31 @@ impl App {
     ///
     /// 記憶している左右が今のページのものとは限らない (モードを切り替えた直後など) ので、
     /// **表示中のページであること**も併せて確かめる。
+    ///
+    /// ページ全体を対象にする編集ツールが画面を持っている間は `None`。左右の記憶は消さない
+    /// ので、ツールを抜ければ元の半分へ戻る。
     fn active_page_slice_for(&self, idx: usize) -> Option<crate::page_split::PageSlice> {
         (self.spread_mode.is_split()
             && self.fullscreen_idx == Some(idx)
-            && self.fullscreen_page_slice.is_half())
+            && self.fullscreen_page_slice.is_half()
+            && !self.page_edit_tool_owns_canvas())
         .then_some(self.fullscreen_page_slice)
+    }
+
+    /// ページ全体を対象にする編集ツールが画面を持っているか。
+    ///
+    /// マスク・注釈・切り取り枠・補正レイヤーは**分割前の画像**へ記録されるので、これらの
+    /// ツールへ入ったら分割を掛けたままにしない (半分だけを見ながら全体に効く編集をすると、
+    /// 見えていない側を触れないまま保存することになる)。
+    ///
+    /// 分析モードとルーペは「見る」ための機能なので対象外。半分のまま見えてよい
+    /// (2026-08-26 の実機確認で、この 2 つは現状の見え方でよいと確認済み)。
+    fn page_edit_tool_owns_canvas(&self) -> bool {
+        self.erase_mode
+            || self.conceal_mode
+            || self.text_mode
+            || self.local_adjust_mode
+            || self.export_crop_mode
     }
 
     /// 分割中のページ送り。ステップ列の中を 1 つ動かす。
