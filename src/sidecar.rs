@@ -2034,17 +2034,23 @@ mod real_data_dry_run {
             "the copy should still be in the old form"
         );
 
+        // UI スレッドが払うのは queue_flush まで。ここが重いと非同期化の意味が薄れる。
+        let queue_at = std::time::Instant::now();
+        sidecar.queue_flush();
+        let queue_ms = queue_at.elapsed().as_secs_f64() * 1000.0;
+
         let write_at = std::time::Instant::now();
         assert!(sidecar.flush_blocking());
         let after = std::fs::metadata(folder.join(SIDECAR_FILENAME))
             .unwrap()
             .len();
         println!(
-            "{} items, {:.1}MB -> {:.1}MB, read {:.1}s, write {:.1}s",
+            "{} items, {:.1}MB -> {:.1}MB, read {:.1}s, queue {:.0}ms (UI thread), write {:.1}s",
             sidecar.items().len(),
             before as f64 / 1e6,
             after as f64 / 1e6,
             read_secs,
+            queue_ms,
             write_at.elapsed().as_secs_f64(),
         );
 
