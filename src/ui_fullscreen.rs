@@ -14115,6 +14115,12 @@ impl App {
         let mut fs_central_ms = 0.0_f64;
         let mut fs_vst_manager_ms = 0.0_f64;
         let mut fs_closure_ms = 0.0_f64;
+        // `outer_ms` (total - closure) is 39ms while a video plays in a detached
+        // window and our own drawing is 0.3ms. Say whether that is the work this
+        // function does before painting, or what eframe does to show the child
+        // viewport (backlog 1.122).
+        let fs_prep_ms;
+        let fs_body_ms;
         let fs_state_is_video = state.is_video;
         // 動画は native presenter が独立 HWND に描画するので、egui 側 viewport は
         // 黒 backdrop のみ。ここで GPU 経路かどうかを区別する必要は無い。
@@ -15824,6 +15830,8 @@ impl App {
                 self.fs_prev_foreground_hwnd = current_foreground_hwnd();
                 fs_closure_ms = closure_t0.elapsed().as_secs_f64() * 1000.0;
             };
+            fs_prep_ms = fs_viewport_t0.elapsed().as_secs_f64() * 1000.0;
+            let fs_body_t0 = std::time::Instant::now();
             if embedded {
                 // in-window 静止画: メインウィンドウの egui ctx に直接描画する。
                 render_fs_body(main_ctx, true);
@@ -15843,6 +15851,7 @@ impl App {
                 #[cfg(windows)]
                 self.mark_active_detached_viewport_rendered_if_matches(fs_id);
             }
+            fs_body_ms = fs_body_t0.elapsed().as_secs_f64() * 1000.0;
         }
         #[cfg(windows)]
         if let Some(window_id) = active_render_window_id {
@@ -15900,6 +15909,13 @@ impl App {
                     ("total_ms", serde_json::Value::from(fs_viewport_ms)),
                     ("outer_ms", serde_json::Value::from(fs_outer_ms)),
                     ("closure_ms", serde_json::Value::from(fs_closure_ms)),
+                    ("prep_ms", serde_json::Value::from(fs_prep_ms)),
+                    ("body_ms", serde_json::Value::from(fs_body_ms)),
+                    (
+                        "eframe_show_ms",
+                        serde_json::Value::from((fs_body_ms - fs_closure_ms).max(0.0)),
+                    ),
+                    ("embedded_paint", serde_json::Value::from(embedded)),
                     (
                         "closure_unaccounted_ms",
                         serde_json::Value::from(fs_closure_unaccounted_ms),
