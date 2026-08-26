@@ -1455,6 +1455,19 @@ pub(super) fn draw_spread_icon(painter: &egui::Painter, c: egui::Pos2, r: f32, m
             let rect = egui::Rect::from_center_size(c, egui::vec2(page_w, page_h));
             painter.rect_stroke(rect, 1.0, stroke, egui::StrokeKind::Outside);
         }
+        SpreadMode::SplitLtr | SpreadMode::SplitRtl => {
+            // 横長分割: 横長の 1 枚を中央で割る。見開きの「2 枚」と取り違えないよう、
+            // 外枠は 1 本で、内側の縦線だけで分かれていることを示す。
+            let rect = egui::Rect::from_center_size(c, egui::vec2(page_h, page_w * 1.1));
+            painter.rect_stroke(rect, 1.0, stroke, egui::StrokeKind::Outside);
+            painter.line_segment(
+                [
+                    egui::pos2(c.x, rect.min.y + 1.0),
+                    egui::pos2(c.x, rect.max.y - 1.0),
+                ],
+                stroke,
+            );
+        }
         SpreadMode::Ltr | SpreadMode::Rtl => {
             // 見開き（表紙なし）: 2枚の矩形
             let gap = r * 0.15;

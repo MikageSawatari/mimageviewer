@@ -733,6 +733,17 @@ impl WgpuWinitRunning<'_> {
             let Some(egui_winit) = egui_winit.as_mut() else {
                 return Ok(EventResult::Wait);
             };
+            // mIV (backlog 1.129): every viewport must report the SAME max_texture_side,
+            // because egui keeps one font atlas per Context and `Fonts::begin_pass` rebuilds
+            // it whenever that number changes -- re-parsing every registered font. This
+            // backend only ever snapshotted the value in `State::new`, so a viewport created
+            // before the render state existed kept `None` (egui then substitutes 2048) while
+            // the root reported 8192, and the two rebuilt the atlas at each other every
+            // frame. The glow backend already syncs this to every viewport each frame; do
+            // the same here.
+            if let Some(max_texture_side) = painter.max_texture_side() {
+                egui_winit.set_max_texture_side(max_texture_side);
+            }
             let mut raw_input = egui_winit.take_egui_input(window);
 
             integration.pre_update();
@@ -1128,6 +1139,10 @@ fn render_immediate_viewport(
         mut viewport_ui_cb,
     } = immediate_viewport;
 
+    // mIV probe (backlog 1.129): painting one immediate viewport costs a constant ~38ms of
+    // CPU regardless of its size or contents. Split this function so the stage that owns it
+    // is named rather than guessed.
+    let t_all = Instant::now();
     let input = {
         let SharedState {
             egui_ctx,
@@ -1156,6 +1171,11 @@ fn render_immediate_viewport(
         };
         egui_winit::update_viewport_info(&mut viewport.info, egui_ctx, window, false);
 
+        // mIV (backlog 1.129): keep this viewport's max_texture_side equal to the root's.
+        // See the note on the same call in `run_ui_and_paint`.
+        if let Some(max_texture_side) = painter.max_texture_side() {
+            egui_winit.set_max_texture_side(max_texture_side);
+        }
         let mut input = egui_winit.take_egui_input(window);
         input.viewports = viewports
             .iter()
@@ -1165,21 +1185,29 @@ fn render_immediate_viewport(
         input
     };
 
+    let input_max_tex = input.max_texture_side;
+    let input_ms = t_all.elapsed().as_secs_f64() * 1000.0;
     let egui_ctx = shared.borrow().egui_ctx.clone();
 
     // ------------------------------------------
 
     // Run the user code, which could re-entrantly call this function again (!).
     // Make sure no locks are held during this call.
+    let run_ms;
     let egui::FullOutput {
         platform_output,
         textures_delta,
         shapes,
         pixels_per_point,
         viewport_output,
-    } = egui_ctx.run(input, |ctx| {
-        viewport_ui_cb(ctx);
-    });
+    } = {
+        let t_run = Instant::now();
+        let output = egui_ctx.run(input, |ctx| {
+            viewport_ui_cb(ctx);
+        });
+        run_ms = t_run.elapsed().as_secs_f64() * 1000.0;
+        output
+    };
 
     // mIV: same ledger as the main path - an immediate viewport's `run` takes deltas out of the
     // shared texture manager too, including any the parent pass had accumulated so far.
@@ -1213,6 +1241,7 @@ fn render_immediate_viewport(
         return;
     };
 
+    let t_set_window = Instant::now();
     {
         profiling::scope!("set_window");
         if let Err(err) = pollster::block_on(painter.set_window(ids.this, Some(window.clone()))) {
@@ -1222,8 +1251,21 @@ fn render_immediate_viewport(
             );
         }
     }
+    let set_window_ms = t_set_window.elapsed().as_secs_f64() * 1000.0;
 
+    let t_tessellate = Instant::now();
     let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
+    let tessellate_ms = t_tessellate.elapsed().as_secs_f64() * 1000.0;
+    let delta_set = textures_delta.set.len();
+    let delta_free = textures_delta.free.len();
+    let delta_bytes: usize = textures_delta
+        .set
+        .iter()
+        .map(|(_, delta)| match &delta.image {
+            egui::ImageData::Color(image) => image.pixels.len() * 4,
+        })
+        .sum();
+    let t_paint = Instant::now();
     painter.paint_and_update_textures(
         ids.this,
         pixels_per_point,
@@ -1232,9 +1274,13 @@ fn render_immediate_viewport(
         &textures_delta,
         vec![],
     );
+    let paint_ms = t_paint.elapsed().as_secs_f64() * 1000.0;
 
+    let t_platform = Instant::now();
     egui_winit.handle_platform_output(window, platform_output);
+    let platform_ms = t_platform.elapsed().as_secs_f64() * 1000.0;
 
+    let t_viewport_out = Instant::now();
     handle_viewport_output(
         &egui_ctx,
         &viewport_output,
@@ -1242,6 +1288,24 @@ fn render_immediate_viewport(
         painter,
         viewport_from_window,
     );
+    let viewport_out_ms = t_viewport_out.elapsed().as_secs_f64() * 1000.0;
+
+    // mIV (backlog 1.129): a slow viewport paint that also carries a texture delta is the
+    // shape this bug had -- a whole font atlas re-uploaded every frame because two viewports
+    // disagreed on max_texture_side. Keep the line as the regression signal; a paint that
+    // uploads nothing stays silent.
+    let total_ms = t_all.elapsed().as_secs_f64() * 1000.0;
+    if total_ms >= 8.0 && delta_bytes > 0 {
+        egui_wgpu::atlas_diag::log_line(format!(
+            "[eframe] immediate_viewport id={} total={total_ms:.1}ms input={input_ms:.1} \
+             run={run_ms:.1} set_window={set_window_ms:.1} tessellate={tessellate_ms:.1} \
+             paint={paint_ms:.1} platform_out={platform_ms:.1} viewport_out={viewport_out_ms:.1} \
+             prims={} delta_set={delta_set} delta_free={delta_free} delta_bytes={delta_bytes} \
+             max_tex={input_max_tex:?}",
+            ids.this.0.value(),
+            clipped_primitives.len(),
+        ));
+    }
 }
 
 /// mIV: what egui's own texture manager believes is installed for the font atlas.

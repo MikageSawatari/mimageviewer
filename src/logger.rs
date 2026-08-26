@@ -14,6 +14,7 @@ const DEBUG_MAX_LOG_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_ROTATED_GENERATIONS: usize = 1;
 const DEBUG_ROTATED_GENERATIONS: usize = 4;
 const DEBUG_RETENTION_ENV_VARS: &[&str] = &[
+    "MIV_CURSOR_DEBUG",
     "MIV_DETACHED_WINDOW_DEBUG",
     "MIV_DETAILS_LAYOUT_DEBUG",
     "MIV_LOG_RETENTION_DEBUG",
@@ -265,15 +266,31 @@ pub fn flush() {
     }
 }
 
-/// 現在スレッドの ID から数字部分だけを取り出す。
-/// `ThreadId(N)` → `Some(N)`、パースできなければ `None`。
-/// `logger` と `perf` の両方から参照される共通ヘルパ。
+/// ログ行に添える現在スレッドの識別子。`logger` と `perf` の両方から参照される。
+///
+/// Windows では **OS の TID を使い、`std::thread::current()` を経由しない**。
+/// この関数は native 例外ハンドラからも呼ばれ、そのハンドラは
+/// **スレッド終了処理 (`LdrShutdownThread`) の内側でも走る**。そこでは TLS が既に
+/// 破棄されており、`std::thread::current()` は thread-local を読んで落ちる。
+/// 実際に `RtlFreeHeap` の一次例外を受けたハンドラがここで二次 AV を起こし、
+/// **panic.log に 1 行も残らないまま一次例外の情報を失った** (backlog §1.123)。
+/// `GetCurrentThreadId` は syscall だけで TLS に触れず、値はダンプや `cdb` の
+/// スレッド表示とも一致するので、事後解析にもそのまま使える。
 pub fn current_thread_id_num() -> Option<u64> {
-    let tid = format!("{:?}", std::thread::current().id());
-    tid.trim_start_matches("ThreadId(")
-        .trim_end_matches(')')
-        .parse::<u64>()
-        .ok()
+    #[cfg(windows)]
+    {
+        Some(u64::from(unsafe {
+            windows::Win32::System::Threading::GetCurrentThreadId()
+        }))
+    }
+    #[cfg(not(windows))]
+    {
+        let tid = format!("{:?}", std::thread::current().id());
+        tid.trim_start_matches("ThreadId(")
+            .trim_end_matches(')')
+            .parse::<u64>()
+            .ok()
+    }
 }
 
 #[cfg(test)]

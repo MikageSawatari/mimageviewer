@@ -2668,6 +2668,9 @@ fn default_reading_history_limit() -> usize {
 /// - `Rtl`: 見開き 右→左（表紙なし）— [0,1] [2,3] ...
 /// - `RtlCover`: 見開き 右→左（表紙あり）— [0] [2,1] [4,3] ...
 /// - `Vertical`: 旧DB互換用。新規 UI では `ReadingFlow::Vertical` を使う。
+/// - `SplitLtr` / `SplitRtl`: 横長ページ 1 枚を左右へ分けて 2 回の表示ステップとして読む。
+///   見開きと**排他**にしてある。独立した bool にすると「見開き かつ 分割」のような
+///   組み合わせ状態が増え、どちらが有効かを各所で判定し直すことになる。
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Default)]
 pub enum SpreadMode {
     #[default]
@@ -2677,6 +2680,8 @@ pub enum SpreadMode {
     Rtl,
     RtlCover,
     Vertical,
+    SplitLtr,
+    SplitRtl,
 }
 
 impl SpreadMode {
@@ -2693,9 +2698,17 @@ impl SpreadMode {
         matches!(self, Self::Vertical)
     }
 
-    /// 右→左（RTL）モードか
+    /// 右→左（RTL）モードか。
+    ///
+    /// 見開きのペア並び順の判定に使う。**分割モードは含めない** — 分割の左右順は
+    /// `crate::page_split::SplitDirection` が持ち、見開きのペア順とは別の概念である。
     pub fn is_rtl(self) -> bool {
         matches!(self, Self::Rtl | Self::RtlCover)
+    }
+
+    /// 横長ページを左右へ分割して読むモードか。
+    pub fn is_split(self) -> bool {
+        matches!(self, Self::SplitLtr | Self::SplitRtl)
     }
 
     /// 表紙（1ページ目単独表示）ありか
@@ -2711,6 +2724,8 @@ impl SpreadMode {
             3 => Self::Rtl,
             4 => Self::RtlCover,
             5 => Self::Vertical,
+            6 => Self::SplitLtr,
+            7 => Self::SplitRtl,
             _ => Self::Single,
         }
     }
@@ -2742,6 +2757,8 @@ impl SpreadMode {
             Self::Rtl => 3,
             Self::RtlCover => 4,
             Self::Vertical => 5,
+            Self::SplitLtr => 6,
+            Self::SplitRtl => 7,
         }
     }
 
@@ -2753,6 +2770,8 @@ impl SpreadMode {
             Self::Rtl => "見開き 右→左",
             Self::RtlCover => "見開き 右→左（表紙あり）",
             Self::Vertical => "縦読み（旧）",
+            Self::SplitLtr => "横長分割 左→右",
+            Self::SplitRtl => "横長分割 右→左",
         }
     }
 
@@ -2763,7 +2782,33 @@ impl SpreadMode {
             Self::LtrCover,
             Self::Rtl,
             Self::RtlCover,
+            Self::SplitLtr,
+            Self::SplitRtl,
         ]
+    }
+
+    /// このモードが持つ読み順。持たないモード (`Single` / 旧 `Vertical`) は `None`。
+    ///
+    /// [`Self::with_reading_direction`] の逆向き。**両方向をここに並べて置く。**片方だけに
+    /// variant を足すと、選んだモードと送り方向がずれる (2026-08-26: 横長分割を選んでも
+    /// 綴じ方向が付いてこず、左右の順序と分割の順序が食い違った)。網羅 match なので、
+    /// モードを足せばコンパイラが両方を要求する。
+    pub fn reading_direction(self) -> Option<ReadingDirection> {
+        match self {
+            Self::Ltr | Self::LtrCover | Self::SplitLtr => Some(ReadingDirection::Ltr),
+            Self::Rtl | Self::RtlCover | Self::SplitRtl => Some(ReadingDirection::Rtl),
+            Self::Single | Self::Vertical => None,
+        }
+    }
+
+    /// **入力の左右を反転するか。**「右」が次ページ側になるモード。
+    ///
+    /// [`Self::is_rtl`] は**見開きのペア並び順**を表す別の問いで、横長分割を含まない。
+    /// 入力の左右まで `is_rtl` で決めていたため、横長分割 右→左 を選んでも矢印キーと
+    /// タップの左右が反転しなかった (2026-08-26 の実機報告。シークバーの向きは合っていた)。
+    /// 読み順は [`Self::reading_direction`] が正本なので、そこから導く。
+    pub fn advances_right_to_left(self) -> bool {
+        matches!(self.reading_direction(), Some(ReadingDirection::Rtl))
     }
 
     /// 見開きの表紙有無を保ったまま横方向だけを差し替える。
@@ -2775,6 +2820,9 @@ impl SpreadMode {
             (Self::Ltr | Self::Rtl, ReadingDirection::Rtl) => Self::Rtl,
             (Self::LtrCover | Self::RtlCover, ReadingDirection::Ltr) => Self::LtrCover,
             (Self::LtrCover | Self::RtlCover, ReadingDirection::Rtl) => Self::RtlCover,
+            // 分割も読み順を持つので、読み方向の切替に追随させる。
+            (Self::SplitLtr | Self::SplitRtl, ReadingDirection::Ltr) => Self::SplitLtr,
+            (Self::SplitLtr | Self::SplitRtl, ReadingDirection::Rtl) => Self::SplitRtl,
             (mode, _) => mode,
         }
     }
@@ -3147,6 +3195,66 @@ impl StartupFolderMode {
 }
 
 // -----------------------------------------------------------------------
+// StartupWindowState (起動時のウィンドウ状態)
+// -----------------------------------------------------------------------
+
+/// 起動直後にメインウィンドウを通常表示にするか最大化するか。
+///
+/// この選択は「最大化するか」だけを決める。通常ウィンドウの位置・サイズは
+/// どの値でも `window_pos` / `window_size` から復元する。最大化を解いたときに
+/// 戻る先がその矩形なので、両者を 1 つの値に同居させてはいけない (§1.116 / §1.115)。
+#[derive(serde::Serialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupWindowState {
+    /// 前回終了時が最大化だったなら最大化で起動する。Windows の一般的な挙動に合わせた既定。
+    ///
+    /// v3.2.0 から更新した利用者の設定にはこの field 自体が無く、最大化 flag も
+    /// 未記録 (= false) なので、更新直後の初回起動は通常ウィンドウのまま。次に
+    /// 最大化して終了したときから効き始める。
+    #[default]
+    RememberLast,
+    /// 常に通常ウィンドウで起動する。v3.2.0 までの振る舞い。
+    Normal,
+    /// 常に最大化で起動する。
+    Maximized,
+}
+
+impl<'de> serde::Deserialize<'de> for StartupWindowState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "normal" => Self::Normal,
+            "maximized" => Self::Maximized,
+            "remember_last" => Self::RememberLast,
+            _ => Self::default(),
+        })
+    }
+}
+
+impl StartupWindowState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RememberLast => "前回終了時の状態",
+            Self::Normal => "通常ウィンドウ",
+            Self::Maximized => "最大化",
+        }
+    }
+}
+
+/// 起動時に最大化するかを決める。`last_exit_maximized` は前回終了時の
+/// 最大化 flag (`Settings::window_maximized`)。
+pub fn resolve_startup_maximized(state: StartupWindowState, last_exit_maximized: bool) -> bool {
+    match state {
+        StartupWindowState::Normal => false,
+        StartupWindowState::Maximized => true,
+        StartupWindowState::RememberLast => last_exit_maximized,
+    }
+}
+
+// -----------------------------------------------------------------------
 // Settings
 // -----------------------------------------------------------------------
 
@@ -3466,12 +3574,21 @@ pub struct Settings {
     /// キーは `"C:"` のような大文字ドライブ表記。
     #[serde(default = "default_quick_folder_drive_current_dirs")]
     pub quick_folder_drive_current_dirs: [BTreeMap<String, PathBuf>; 2],
-    /// ウィンドウ左上座標 (outer rect)
+    /// 通常ウィンドウの左上座標 (outer rect)。最大化中は更新しないので、
+    /// 最大化を解いたときに戻る矩形として残る。
     #[serde(default)]
     pub window_pos: Option<[f32; 2]>,
-    /// ウィンドウサイズ (outer rect)
+    /// 通常ウィンドウのサイズ (inner rect)。`window_pos` と同じく最大化中は更新しない。
     #[serde(default)]
     pub window_size: Option<[f32; 2]>,
+    /// 前回終了時 (トレイ退避を含む) に最大化していたか。`window_pos` /
+    /// `window_size` とは**別に**持つ: 1 つの矩形へ最大化状態を畳み込むと、
+    /// 復元先が最大化サイズで潰れて戻れなくなる (detached 側の §1.115 と同じ根)。
+    #[serde(default)]
+    pub window_maximized: bool,
+    /// 起動時にメインウィンドウを最大化するか。既定は従来どおり通常ウィンドウ。
+    #[serde(default)]
+    pub startup_window_state: StartupWindowState,
     #[serde(default)]
     pub parallelism: Parallelism,
     /// PDF worker pool のプロセス数。変更は次回起動時に反映される。
@@ -4408,12 +4525,31 @@ pub struct Settings {
     /// シークバー上のプレビューで許容する表示位置との差 (秒)。
     #[serde(default = "default_video_seek_thumbnail_tolerance_secs")]
     pub video_seek_thumbnail_tolerance_secs: f64,
+    /// シークストリップで採用する画像どうしの最小間隔 (秒)。
+    #[serde(default = "default_video_seek_strip_min_interval_secs")]
+    pub video_seek_strip_min_interval_secs: f64,
+    /// 動画シークストリップの音声波形で、1 画面に表示する時間 (秒)。
+    #[serde(default = "default_video_seek_strip_waveform_span_secs")]
+    pub video_seek_strip_waveform_span_secs: f64,
+    /// 動画シークストリップの表示状態。開閉と表示内容をこの 3 値だけで表す。
+    #[serde(default)]
+    pub video_seek_strip_state: VideoSeekStripState,
+    /// `video_seek_strip_state=None` から上ドラッグで戻す、最後の表示内容。
+    ///
+    /// Increment 4 の `video_seek_strip_mode` は読み込み alias として引き継ぐ。これは表示中か
+    /// どうかを表す state ではなく、明示的な復元先だけを所有する。
+    #[serde(default, alias = "video_seek_strip_mode")]
+    pub video_seek_strip_last_choice: VideoSeekStripMode,
     /// native 動画プレゼンターの上部情報バーを常時表示し、映像領域から除外する。
     #[serde(default)]
     pub video_top_bar_locked: bool,
     /// native 動画プレゼンターの下部シークバーを常時表示し、映像領域から除外する。
     #[serde(default)]
     pub video_seek_bar_locked: bool,
+    /// シークストリップが表示中なら、その領域も常時確保して映像から除外する。
+    /// 下部バー固定との到達可能な組み合わせは `VideoBottomLock` が所有する。
+    #[serde(default)]
+    pub video_seek_strip_locked: bool,
     /// 旧自動再生設定 (bool)。現在の再生開始挙動では参照せず、設定ファイル互換のため保持する。
     #[serde(default)]
     pub video_autoplay: bool,
@@ -5076,8 +5212,163 @@ pub const VIDEO_SEEK_THUMBNAIL_TOLERANCE_MIN_SECS: f64 = 0.0;
 pub const VIDEO_SEEK_THUMBNAIL_TOLERANCE_MAX_SECS: f64 = 30.0;
 pub const VIDEO_SEEK_THUMBNAIL_TOLERANCE_DEFAULT_SECS: f64 = 1.0;
 
+pub const VIDEO_SEEK_STRIP_MIN_INTERVAL_MIN_SECS: f64 = 0.1;
+pub const VIDEO_SEEK_STRIP_MIN_INTERVAL_MAX_SECS: f64 = 60.0;
+pub const VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS: f64 = 15.0;
+
+pub const VIDEO_SEEK_STRIP_WAVEFORM_SPAN_MIN_SECS: f64 = 5.0;
+pub const VIDEO_SEEK_STRIP_WAVEFORM_SPAN_MAX_SECS: f64 = 10_800.0;
+pub const VIDEO_SEEK_STRIP_WAVEFORM_SPAN_DEFAULT_SECS: f64 = 180.0;
+
 fn default_video_seek_thumbnail_tolerance_secs() -> f64 {
     VIDEO_SEEK_THUMBNAIL_TOLERANCE_DEFAULT_SECS
+}
+
+/// 動画下部の固定状態。
+///
+/// 到達できるのはこの 3 つだけで、「バー非固定 + ストリップ固定」は表現できない。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VideoBottomLock {
+    #[default]
+    None,
+    BarOnly,
+    BarAndStrip,
+}
+
+impl VideoBottomLock {
+    /// 永続化用の 2 つの bool から実行時の固定状態を復元する。
+    ///
+    /// `(false, true)` はストリップ固定の前提となるバー固定がない無効値なので、
+    /// バーだけを勝手に有効化せず `None` へ正規化する。
+    pub const fn from_settings(bar_locked: bool, strip_locked: bool) -> Self {
+        match (bar_locked, strip_locked) {
+            (true, true) => Self::BarAndStrip,
+            (true, false) => Self::BarOnly,
+            (false, _) => Self::None,
+        }
+    }
+
+    /// 実行時の固定状態を永続化用の 2 つの bool へ戻す。
+    pub const fn to_settings(self) -> (bool, bool) {
+        match self {
+            Self::None => (false, false),
+            Self::BarOnly => (true, false),
+            Self::BarAndStrip => (true, true),
+        }
+    }
+
+    /// 下部バー固定を変更する。バー固定を外すとストリップ固定も同時に外れる。
+    pub const fn with_bar(self, locked: bool) -> Self {
+        if !locked {
+            Self::None
+        } else {
+            match self {
+                Self::None | Self::BarOnly => Self::BarOnly,
+                Self::BarAndStrip => Self::BarAndStrip,
+            }
+        }
+    }
+
+    /// ストリップ固定を変更する。ストリップ固定を有効にするとバー固定も有効になる。
+    pub const fn with_strip(self, locked: bool) -> Self {
+        if locked {
+            Self::BarAndStrip
+        } else {
+            match self {
+                Self::BarAndStrip => Self::BarOnly,
+                Self::None | Self::BarOnly => self,
+            }
+        }
+    }
+
+    pub const fn bar_locked(self) -> bool {
+        matches!(self, Self::BarOnly | Self::BarAndStrip)
+    }
+
+    pub const fn strip_locked(self) -> bool {
+        matches!(self, Self::BarAndStrip)
+    }
+}
+
+/// 動画シークストリップの表示内容 (`None` から戻すための非 empty 選択)。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoSeekStripMode {
+    #[default]
+    Thumbnails,
+    Waveform,
+}
+
+impl VideoSeekStripMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Thumbnails => "場面",
+            Self::Waveform => "波形",
+        }
+    }
+}
+
+/// 動画シークストリップの persisted source of truth。
+///
+/// 開閉 bool と表示 mode を別々に持たず、この 3 値だけを巡回・保存する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoSeekStripState {
+    #[default]
+    None,
+    Thumbnails,
+    Waveform,
+}
+
+impl VideoSeekStripState {
+    pub const fn cycle(self) -> Self {
+        match self {
+            Self::None => Self::Thumbnails,
+            Self::Thumbnails => Self::Waveform,
+            Self::Waveform => Self::None,
+        }
+    }
+
+    pub const fn mode(self) -> Option<VideoSeekStripMode> {
+        match self {
+            Self::None => None,
+            Self::Thumbnails => Some(VideoSeekStripMode::Thumbnails),
+            Self::Waveform => Some(VideoSeekStripMode::Waveform),
+        }
+    }
+
+    pub const fn from_mode(mode: VideoSeekStripMode) -> Self {
+        match mode {
+            VideoSeekStripMode::Thumbnails => Self::Thumbnails,
+            VideoSeekStripMode::Waveform => Self::Waveform,
+        }
+    }
+
+    pub const fn last_choice(self, previous: VideoSeekStripMode) -> VideoSeekStripMode {
+        match self.mode() {
+            Some(mode) => mode,
+            None => previous,
+        }
+    }
+
+    pub const fn restore(last_choice: VideoSeekStripMode) -> Self {
+        Self::from_mode(last_choice)
+    }
+
+    pub const fn toggle(self, last_choice: VideoSeekStripMode) -> Self {
+        match self {
+            Self::None => Self::restore(last_choice),
+            Self::Thumbnails | Self::Waveform => Self::None,
+        }
+    }
+}
+
+fn default_video_seek_strip_min_interval_secs() -> f64 {
+    VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS
+}
+
+fn default_video_seek_strip_waveform_span_secs() -> f64 {
+    VIDEO_SEEK_STRIP_WAVEFORM_SPAN_DEFAULT_SECS
 }
 
 /// グリッド列数の最小値
@@ -5466,6 +5757,8 @@ impl Default for Settings {
             quick_folder_drive_current_dirs: default_quick_folder_drive_current_dirs(),
             window_pos: None,
             window_size: None,
+            window_maximized: false,
+            startup_window_state: StartupWindowState::default(),
             parallelism: Parallelism::default(),
             pdf_worker_count: default_pdf_worker_count(),
             prefetch_back: default_prefetch_back(),
@@ -5696,8 +5989,13 @@ impl Default for Settings {
             video_volume: default_video_volume(),
             video_playback_speed: default_video_playback_speed(),
             video_seek_thumbnail_tolerance_secs: default_video_seek_thumbnail_tolerance_secs(),
+            video_seek_strip_min_interval_secs: default_video_seek_strip_min_interval_secs(),
+            video_seek_strip_waveform_span_secs: default_video_seek_strip_waveform_span_secs(),
+            video_seek_strip_state: VideoSeekStripState::default(),
+            video_seek_strip_last_choice: VideoSeekStripMode::default(),
             video_top_bar_locked: false,
             video_seek_bar_locked: false,
+            video_seek_strip_locked: false,
             video_autoplay: false,
             video_autoplay_mode: VideoAutoplayMode::default(),
             video_loop: false,
@@ -6470,6 +6768,33 @@ pub struct SettingsLoadResult {
 }
 
 impl Settings {
+    /// 永続化用 bool から、到達可能な動画下部固定状態だけを復元する。
+    pub const fn video_bottom_lock(&self) -> VideoBottomLock {
+        VideoBottomLock::from_settings(self.video_seek_bar_locked, self.video_seek_strip_locked)
+    }
+
+    /// 動画下部の固定状態を唯一の遷移 owner から永続化用 bool へ反映する。
+    pub fn set_video_bottom_lock(&mut self, lock: VideoBottomLock) {
+        let (bar_locked, strip_locked) = lock.to_settings();
+        self.video_seek_bar_locked = bar_locked;
+        self.video_seek_strip_locked = strip_locked;
+    }
+
+    /// ストリップ固定を切り替える唯一の入口。
+    ///
+    /// 固定は「常に見えている」という意味なので、ON はバー固定に加えて**表示状態も**含意する。
+    /// 表示が「なし」のまま固定だけ立てると、利用者から見て何も起きない (実機報告 2026-08-25)。
+    /// 復元先は `video_seek_strip_last_choice`。OFF は表示状態を変えない (固定を外しただけで
+    /// 見えているストリップを畳まない)。
+    pub fn set_video_seek_strip_locked(&mut self, locked: bool) {
+        let lock = self.video_bottom_lock().with_strip(locked);
+        self.set_video_bottom_lock(lock);
+        if lock.strip_locked() && self.video_seek_strip_state == VideoSeekStripState::None {
+            self.video_seek_strip_state =
+                VideoSeekStripState::restore(self.video_seek_strip_last_choice);
+        }
+    }
+
     pub fn effective_auto_fullscreen_zip_pdf(&self) -> bool {
         self.detached_viewer_open_images_in_window || self.auto_fullscreen_zip_pdf
     }
@@ -6630,6 +6955,10 @@ impl Settings {
         let video_playback_speed_before_sanitize = settings.video_playback_speed;
         let video_seek_thumbnail_tolerance_before_sanitize =
             settings.video_seek_thumbnail_tolerance_secs;
+        let video_seek_strip_min_interval_before_sanitize =
+            settings.video_seek_strip_min_interval_secs;
+        let video_seek_strip_waveform_span_before_sanitize =
+            settings.video_seek_strip_waveform_span_secs;
         let vst3_migrated = settings.migrate_vst3_legacy();
         let video_loop_migrated = settings.migrate_legacy_video_loop();
         let archive_file_handling_migrated = settings.migrate_legacy_archive_file_handling();
@@ -6687,6 +7016,12 @@ impl Settings {
         let video_seek_thumbnail_tolerance_sanitized =
             settings.video_seek_thumbnail_tolerance_secs.to_bits()
                 != video_seek_thumbnail_tolerance_before_sanitize.to_bits();
+        let video_seek_strip_min_interval_sanitized =
+            settings.video_seek_strip_min_interval_secs.to_bits()
+                != video_seek_strip_min_interval_before_sanitize.to_bits();
+        let video_seek_strip_waveform_span_sanitized =
+            settings.video_seek_strip_waveform_span_secs.to_bits()
+                != video_seek_strip_waveform_span_before_sanitize.to_bits();
 
         // バージョン跨ぎの安全網 (#4) を SQLite 版に置換:
         // - 旧版は `settings.json` を `settings.json.preupgrade-v<old>` に std::fs::copy
@@ -6743,6 +7078,8 @@ impl Settings {
             || video_volume_sanitized
             || video_playback_speed_sanitized
             || video_seek_thumbnail_tolerance_sanitized
+            || video_seek_strip_min_interval_sanitized
+            || video_seek_strip_waveform_span_sanitized
             || mouse_nav_clean_install_defaulted
             || grid_click_selection_mode_migrated
             || legacy_keymap_import.changed
@@ -7125,6 +7462,27 @@ impl Settings {
             } else {
                 VIDEO_SEEK_THUMBNAIL_TOLERANCE_DEFAULT_SECS
             };
+        self.video_seek_strip_min_interval_secs =
+            if self.video_seek_strip_min_interval_secs.is_finite() {
+                self.video_seek_strip_min_interval_secs.clamp(
+                    VIDEO_SEEK_STRIP_MIN_INTERVAL_MIN_SECS,
+                    VIDEO_SEEK_STRIP_MIN_INTERVAL_MAX_SECS,
+                )
+            } else {
+                VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS
+            };
+        self.video_seek_strip_waveform_span_secs =
+            if self.video_seek_strip_waveform_span_secs.is_finite() {
+                self.video_seek_strip_waveform_span_secs.clamp(
+                    VIDEO_SEEK_STRIP_WAVEFORM_SPAN_MIN_SECS,
+                    VIDEO_SEEK_STRIP_WAVEFORM_SPAN_MAX_SECS,
+                )
+            } else {
+                VIDEO_SEEK_STRIP_WAVEFORM_SPAN_DEFAULT_SECS
+            };
+        self.video_seek_strip_last_choice = self
+            .video_seek_strip_state
+            .last_choice(self.video_seek_strip_last_choice);
         // 0 は SegmentRing が表現できず、極端な直接編集値はメモリを際限なく予約し得る。
         // 2 秒 x 300 本 (= 10 分) を設定値として許す上限にする。
         self.remote_video_segment_window = self.remote_video_segment_window.clamp(1, 300);
@@ -7573,6 +7931,9 @@ impl Settings {
             std::mem::take(&mut src.quick_folder_drive_current_dirs);
         self.window_pos = src.window_pos;
         self.window_size = src.window_size;
+        // 最大化 flag は環境設定に出さない実行時状態。`startup_window_state` の方は
+        // 利用者が編集する設定なので、ここで live 値へ巻き戻してはいけない。
+        self.window_maximized = src.window_maximized;
         self.detached_viewer_enabled = src.detached_viewer_enabled;
         self.detached_viewer_window_placement = src.detached_viewer_window_placement;
         // ── お気に入り / スマートフォルダ / タグ (専用ダイアログで編集) ──
@@ -7783,6 +8144,146 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **モードと読み順は互いの逆向きでなければならない。**
+    ///
+    /// 方向 → モードだけが分割を扱い、モード → 方向が素通りしていたため、横長分割を
+    /// 選んでも綴じ方向が付いてこず、**分割の左右とページ送りの左右が食い違った**
+    /// (2026-08-26 の実機報告)。片方に variant を足したらここが落ちる。
+    #[test]
+    fn a_spread_mode_and_its_reading_direction_stay_each_other_s_inverse() {
+        for &mode in SpreadMode::all() {
+            let Some(direction) = mode.reading_direction() else {
+                // 読み順を持たないモードは、方向を変えても動かない。
+                assert_eq!(mode.with_reading_direction(ReadingDirection::Ltr), mode);
+                assert_eq!(mode.with_reading_direction(ReadingDirection::Rtl), mode);
+                continue;
+            };
+            // 自分の方向を渡しても変わらない。
+            assert_eq!(mode.with_reading_direction(direction), mode, "{mode:?}");
+            // 反転させると相方になり、その相方は反転後の方向を返す。
+            let flipped = mode.with_reading_direction(direction.next());
+            assert_ne!(flipped, mode, "{mode:?}");
+            assert_eq!(
+                flipped.reading_direction(),
+                Some(direction.next()),
+                "{mode:?}"
+            );
+            // 元へ戻る。
+            assert_eq!(flipped.with_reading_direction(direction), mode, "{mode:?}");
+            // **入力の左右も同じ読み順から導く。**ペア並び順 (`is_rtl`) で決めていたため、
+            // 横長分割 右→左 で矢印キーが反転しなかった (2026-08-26 の実機報告)。
+            assert_eq!(
+                mode.advances_right_to_left(),
+                direction == ReadingDirection::Rtl,
+                "{mode:?}"
+            );
+        }
+
+        // 読み順を持たないモードは反転しない (1ページ表示の従来動作を変えない)。
+        assert!(!SpreadMode::Single.advances_right_to_left());
+        // 見開き 右→左 は従来どおり反転し、横長分割 右→左 も同じになる。
+        assert!(SpreadMode::Rtl.advances_right_to_left());
+        assert!(SpreadMode::RtlCover.advances_right_to_left());
+        assert!(SpreadMode::SplitRtl.advances_right_to_left());
+        assert!(!SpreadMode::SplitLtr.advances_right_to_left());
+        // ペア並び順は分割を含まない。2 つの問いを取り違えない。
+        assert!(!SpreadMode::SplitRtl.is_rtl());
+    }
+
+    #[test]
+    fn video_seek_strip_state_defaults_closed_and_round_trips_with_explicit_last_choice() {
+        assert_eq!(
+            Settings::default().video_seek_strip_state,
+            VideoSeekStripState::None
+        );
+        assert_eq!(
+            Settings::default().video_seek_strip_last_choice,
+            VideoSeekStripMode::Thumbnails
+        );
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(loaded.video_seek_strip_state, VideoSeekStripState::None);
+        assert_eq!(
+            loaded.video_seek_strip_last_choice,
+            VideoSeekStripMode::Thumbnails
+        );
+
+        let mut settings = Settings::default();
+        settings.video_seek_strip_state = VideoSeekStripState::Waveform;
+        settings.video_seek_strip_last_choice = VideoSeekStripMode::Waveform;
+        let stored = serde_json::to_value(settings).unwrap();
+        assert_eq!(stored["video_seek_strip_state"], "waveform");
+        assert_eq!(stored["video_seek_strip_last_choice"], "waveform");
+        assert!(stored.get("video_seek_strip_mode").is_none());
+        let loaded: Settings = serde_json::from_value(stored).unwrap();
+        assert_eq!(loaded.video_seek_strip_state, VideoSeekStripState::Waveform);
+        assert_eq!(
+            loaded.video_seek_strip_last_choice,
+            VideoSeekStripMode::Waveform
+        );
+    }
+
+    #[test]
+    fn video_seek_strip_three_state_cycle_and_last_choice_restore_are_pure() {
+        assert_eq!(
+            VideoSeekStripState::None.cycle(),
+            VideoSeekStripState::Thumbnails
+        );
+        assert_eq!(
+            VideoSeekStripState::Thumbnails.cycle(),
+            VideoSeekStripState::Waveform
+        );
+        assert_eq!(
+            VideoSeekStripState::Waveform.cycle(),
+            VideoSeekStripState::None
+        );
+
+        let last = VideoSeekStripState::Waveform.last_choice(VideoSeekStripMode::Thumbnails);
+        assert_eq!(last, VideoSeekStripMode::Waveform);
+        assert_eq!(
+            VideoSeekStripState::None.last_choice(last),
+            VideoSeekStripMode::Waveform
+        );
+        assert_eq!(
+            VideoSeekStripState::restore(last),
+            VideoSeekStripState::Waveform
+        );
+        assert_eq!(
+            VideoSeekStripState::None.toggle(last),
+            VideoSeekStripState::Waveform
+        );
+        assert_eq!(
+            VideoSeekStripState::Thumbnails.toggle(last),
+            VideoSeekStripState::None
+        );
+        assert_eq!(
+            VideoSeekStripState::Waveform.toggle(last),
+            VideoSeekStripState::None
+        );
+    }
+
+    #[test]
+    fn increment_four_mode_migrates_to_last_choice_without_opening_the_strip() {
+        let loaded: Settings =
+            serde_json::from_str("{\"video_seek_strip_mode\":\"waveform\"}").unwrap();
+        assert_eq!(loaded.video_seek_strip_state, VideoSeekStripState::None);
+        assert_eq!(
+            loaded.video_seek_strip_last_choice,
+            VideoSeekStripMode::Waveform
+        );
+    }
+
+    #[test]
+    fn sanitize_keeps_active_seek_strip_state_as_the_explicit_restore_choice() {
+        let mut settings = Settings::default();
+        settings.video_seek_strip_state = VideoSeekStripState::Waveform;
+        settings.video_seek_strip_last_choice = VideoSeekStripMode::Thumbnails;
+        settings.sanitize();
+        assert_eq!(
+            settings.video_seek_strip_last_choice,
+            VideoSeekStripMode::Waveform
+        );
+    }
 
     #[test]
     fn recycle_bin_delete_confirmation_skip_defaults_off_and_round_trips() {
@@ -8608,16 +9109,113 @@ mod tests {
     }
 
     #[test]
-    fn video_bar_locks_default_off_independently() {
+    fn video_bar_locks_default_off_and_bottom_lock_defaults_to_none() {
         let defaults: Settings = serde_json::from_str("{}").unwrap();
         assert!(!defaults.video_top_bar_locked);
         assert!(!defaults.video_seek_bar_locked);
+        assert!(!defaults.video_seek_strip_locked);
+        assert_eq!(defaults.video_bottom_lock(), VideoBottomLock::None);
 
         let loaded: Settings =
             serde_json::from_str(r#"{"video_top_bar_locked":true,"video_seek_bar_locked":false}"#)
                 .unwrap();
         assert!(loaded.video_top_bar_locked);
         assert!(!loaded.video_seek_bar_locked);
+        assert!(!loaded.video_seek_strip_locked);
+    }
+
+    #[test]
+    fn video_bottom_lock_with_strip_always_locks_the_bar() {
+        for lock in [
+            VideoBottomLock::None,
+            VideoBottomLock::BarOnly,
+            VideoBottomLock::BarAndStrip,
+        ] {
+            let updated = lock.with_strip(true);
+            assert_eq!(updated, VideoBottomLock::BarAndStrip);
+            assert!(updated.bar_locked());
+            assert!(updated.strip_locked());
+        }
+    }
+
+    #[test]
+    fn video_bottom_lock_unlocking_the_bar_always_unlocks_the_strip() {
+        for lock in [
+            VideoBottomLock::None,
+            VideoBottomLock::BarOnly,
+            VideoBottomLock::BarAndStrip,
+        ] {
+            let updated = lock.with_bar(false);
+            assert_eq!(updated, VideoBottomLock::None);
+            assert!(!updated.bar_locked());
+            assert!(!updated.strip_locked());
+        }
+    }
+
+    #[test]
+    fn video_bottom_lock_never_serializes_the_unreachable_bool_pair() {
+        for lock in [
+            VideoBottomLock::None,
+            VideoBottomLock::BarOnly,
+            VideoBottomLock::BarAndStrip,
+        ] {
+            assert_ne!(lock.to_settings(), (false, true));
+        }
+    }
+
+    #[test]
+    fn locking_the_strip_also_shows_it_and_locks_the_bar() {
+        let mut settings = Settings {
+            video_seek_strip_state: VideoSeekStripState::None,
+            video_seek_strip_last_choice: VideoSeekStripMode::Waveform,
+            ..Settings::default()
+        };
+        settings.set_video_seek_strip_locked(true);
+        assert_eq!(settings.video_bottom_lock(), VideoBottomLock::BarAndStrip);
+        assert_eq!(
+            settings.video_seek_strip_state,
+            VideoSeekStripState::Waveform,
+            "固定は常に見えている意味なので、なしのまま固定だけ立てない"
+        );
+    }
+
+    #[test]
+    fn locking_the_strip_keeps_the_content_already_chosen() {
+        let mut settings = Settings {
+            video_seek_strip_state: VideoSeekStripState::Thumbnails,
+            video_seek_strip_last_choice: VideoSeekStripMode::Waveform,
+            ..Settings::default()
+        };
+        settings.set_video_seek_strip_locked(true);
+        assert_eq!(
+            settings.video_seek_strip_state,
+            VideoSeekStripState::Thumbnails,
+            "既に出ている内容を last_choice で置き換えない"
+        );
+    }
+
+    #[test]
+    fn unlocking_the_strip_leaves_it_on_screen() {
+        let mut settings = Settings {
+            video_seek_strip_state: VideoSeekStripState::Thumbnails,
+            ..Settings::default()
+        };
+        settings.set_video_seek_strip_locked(true);
+        settings.set_video_seek_strip_locked(false);
+        assert_eq!(settings.video_bottom_lock(), VideoBottomLock::BarOnly);
+        assert_eq!(
+            settings.video_seek_strip_state,
+            VideoSeekStripState::Thumbnails,
+            "固定を外しただけで、見えているストリップを畳まない"
+        );
+    }
+
+    #[test]
+    fn video_bottom_lock_normalizes_strip_without_bar_to_none() {
+        assert_eq!(
+            VideoBottomLock::from_settings(false, true),
+            VideoBottomLock::None
+        );
     }
 
     #[test]
@@ -9720,6 +10318,102 @@ mod tests {
     }
 
     #[test]
+    fn startup_maximized_follows_the_chosen_state() {
+        // 「通常」は前回が最大化でも最大化しない。
+        assert!(!resolve_startup_maximized(StartupWindowState::Normal, true));
+        assert!(!resolve_startup_maximized(
+            StartupWindowState::Normal,
+            false
+        ));
+        // 「最大化」は前回の状態に関係なく最大化する。
+        assert!(resolve_startup_maximized(
+            StartupWindowState::Maximized,
+            false
+        ));
+        assert!(resolve_startup_maximized(
+            StartupWindowState::Maximized,
+            true
+        ));
+        // 「前回終了時の状態」だけが保存済み flag を見る。これが既定。
+        assert!(resolve_startup_maximized(
+            StartupWindowState::RememberLast,
+            true
+        ));
+        assert!(!resolve_startup_maximized(
+            StartupWindowState::RememberLast,
+            false
+        ));
+    }
+
+    #[test]
+    fn window_state_survives_a_settings_round_trip() {
+        let mut saved = Settings::default();
+        saved.startup_window_state = StartupWindowState::RememberLast;
+        saved.window_maximized = true;
+        saved.window_pos = Some([120.0, 80.0]);
+        saved.window_size = Some([1600.0, 900.0]);
+
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(
+            restored.startup_window_state,
+            StartupWindowState::RememberLast
+        );
+        assert!(restored.window_maximized);
+        // 最大化 flag は復元矩形を潰さない。最大化を解いたときの戻り先が要るので、
+        // 両者は別のフィールドとして往復する必要がある。
+        assert_eq!(restored.window_pos, Some([120.0, 80.0]));
+        assert_eq!(restored.window_size, Some([1600.0, 900.0]));
+    }
+
+    #[test]
+    fn unknown_startup_window_state_falls_back_to_the_default() {
+        // 新しい選択肢を足した版で書いた設定を古い版が読む経路。既定へ落として
+        // 起動できることを保証する。
+        let loaded: Settings =
+            serde_json::from_str(r#"{"startup_window_state":"tiled_to_the_left"}"#).unwrap();
+        assert_eq!(
+            loaded.startup_window_state,
+            StartupWindowState::RememberLast
+        );
+    }
+
+    #[test]
+    fn updating_from_an_older_version_does_not_change_the_first_start() {
+        // v3.2.0 までの設定にはこの field も最大化 flag も無い。既定が
+        // 「前回終了時の状態」でも、記録が無い以上は通常ウィンドウで起動する。
+        // 更新直後に勝手に最大化しないことを固定する。
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            loaded.startup_window_state,
+            StartupWindowState::RememberLast
+        );
+        assert!(!loaded.window_maximized);
+        assert!(!resolve_startup_maximized(
+            loaded.startup_window_state,
+            loaded.window_maximized
+        ));
+    }
+
+    #[test]
+    fn preferences_ok_keeps_the_edited_startup_window_state() {
+        // 環境設定 OK は編集済みコピーを live 値で上書きするが、対象は実行時状態だけ。
+        // 起動状態は利用者が今そこで選んだ設定なので巻き戻してはいけない。
+        let mut edited = Settings::default();
+        edited.startup_window_state = StartupWindowState::Maximized;
+        edited.window_maximized = false;
+
+        let mut live = Settings::default();
+        live.startup_window_state = StartupWindowState::Normal;
+        live.window_maximized = true;
+
+        edited.overwrite_non_preferences_from(&mut live);
+
+        assert_eq!(edited.startup_window_state, StartupWindowState::Maximized);
+        assert!(edited.window_maximized);
+    }
+
+    #[test]
     fn settings_default_values() {
         let s = Settings::default();
         assert_eq!(s.grid_cols, 4);
@@ -9741,6 +10435,8 @@ mod tests {
         );
         assert!(s.window_pos.is_none());
         assert!(s.window_size.is_none());
+        assert!(!s.window_maximized);
+        assert_eq!(s.startup_window_state, StartupWindowState::RememberLast);
         assert_eq!(s.prefetch_back, 4);
         assert_eq!(s.prefetch_forward, 12);
         assert_eq!(
@@ -10791,6 +11487,58 @@ mod tests {
         assert_eq!(
             settings.video_seek_thumbnail_tolerance_secs,
             VIDEO_SEEK_THUMBNAIL_TOLERANCE_DEFAULT_SECS
+        );
+    }
+
+    #[test]
+    fn sanitize_clamps_video_seek_strip_min_interval() {
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.video_seek_strip_min_interval_secs,
+            VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS
+        );
+
+        settings.video_seek_strip_min_interval_secs = 99.0;
+        settings.sanitize();
+        assert_eq!(
+            settings.video_seek_strip_min_interval_secs,
+            VIDEO_SEEK_STRIP_MIN_INTERVAL_MAX_SECS
+        );
+
+        settings.video_seek_strip_min_interval_secs = f64::NAN;
+        settings.sanitize();
+        assert_eq!(
+            settings.video_seek_strip_min_interval_secs,
+            VIDEO_SEEK_STRIP_MIN_INTERVAL_DEFAULT_SECS
+        );
+    }
+
+    #[test]
+    fn waveform_span_defaults_and_sanitizes_to_the_preference_range() {
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            loaded.video_seek_strip_waveform_span_secs,
+            VIDEO_SEEK_STRIP_WAVEFORM_SPAN_DEFAULT_SECS
+        );
+
+        let mut settings = Settings::default();
+        settings.video_seek_strip_waveform_span_secs = 1.0;
+        settings.sanitize();
+        assert_eq!(
+            settings.video_seek_strip_waveform_span_secs,
+            VIDEO_SEEK_STRIP_WAVEFORM_SPAN_MIN_SECS
+        );
+        settings.video_seek_strip_waveform_span_secs = 99_999.0;
+        settings.sanitize();
+        assert_eq!(
+            settings.video_seek_strip_waveform_span_secs,
+            VIDEO_SEEK_STRIP_WAVEFORM_SPAN_MAX_SECS
+        );
+        settings.video_seek_strip_waveform_span_secs = f64::NAN;
+        settings.sanitize();
+        assert_eq!(
+            settings.video_seek_strip_waveform_span_secs,
+            VIDEO_SEEK_STRIP_WAVEFORM_SPAN_DEFAULT_SECS
         );
     }
 

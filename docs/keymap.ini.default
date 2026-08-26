@@ -332,6 +332,10 @@
 # FsSpreadRtl.2 = Numpad4 ; 右開き見開き表示に切り替える
 # FsSpreadRtlCover.1 = 5 ; 右開き表紙単独の見開き表示に切り替える
 # FsSpreadRtlCover.2 = Numpad5 ; 右開き表紙単独の見開き表示に切り替える
+# FsSpreadSplitLtr.1 = 8 ; 横長ページを左半分から順に分割表示する
+# FsSpreadSplitLtr.2 = Numpad8 ; 横長ページを左半分から順に分割表示する
+# FsSpreadSplitRtl.1 = 9 ; 横長ページを右半分から順に分割表示する
+# FsSpreadSplitRtl.2 = Numpad9 ; 横長ページを右半分から順に分割表示する
 # FsReadingFlowCycle.1 = 6 ; ページ単位/縦連結/横連結を切り替える
 # FsReadingFlowCycle.2 = Numpad6 ; ページ単位/縦連結/横連結を切り替える
 # FsReadingDirectionToggle.1 = 7 ; 横方向の読み進み方向を切り替える
@@ -469,6 +473,11 @@
 # VideoPin = P ; 現在の再生位置を代表フレームとしてピン留めする
 # VideoPerfOverlay = F ; 動画の性能オーバーレイを切り替える
 # VideoTileMode = S ; 動画タイルモードを切り替える
+# VideoSeekStripCycle = Shift+S ; 動画のシークストリップをなし、サムネイル、音声波形の順に切り替える
+# VideoSeekStripToggle = none ; 動画のシークストリップを表示または非表示にする（表示時は前回の種類を復元）
+# VideoSeekStripNone = none ; 動画のシークストリップを非表示にする
+# VideoSeekStripThumbnails = none ; 動画のシークストリップをサムネイル表示にする
+# VideoSeekStripWaveform = none ; 動画のシークストリップを音声波形表示にする
 # VideoScaleFilterNext = T ; 動画の拡大方法を順に切り替える
 # VideoAnime4kRemeasure = none ; 動画の Anime4K の性能をもう一度測定する
 # VideoBookmark = B ; 現在の再生位置にブックマークを追加する

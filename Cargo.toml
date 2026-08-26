@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/susie-worker",
+    "crates/susie-crash-plugin",
     "crates/launcher",
     "crates/local-adjust-core",
     "crates/comic-core",
@@ -13,6 +14,8 @@ members = [
     "tools/local_adjust_lab",
     "tools/comic_lab",
     "tools/music_lab",
+    "tools/seek_strip_probe",
+    "tools/viewer_context_audit",
 ]
 exclude = ["crates/unrar-patched", "vendor/eframe", "vendor/egui-wgpu"]
 
@@ -166,6 +169,13 @@ bench = false
 required-features = ["dev-tools"]
 
 [[bin]]
+name = "seek_strip_batch"
+path = "src/bin/seek_strip_batch.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
 name = "probe_birefnet"
 path = "src/bin/probe_birefnet.rs"
 test = false
@@ -239,6 +249,7 @@ windows = { version = "0.61", features = [
     "Win32_System_IO",
     "Win32_System_Pipes",
     "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
     "Win32_System_LibraryLoader",
     "Win32_Security",
     "Win32_Graphics_Dwm",

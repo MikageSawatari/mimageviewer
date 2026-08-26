@@ -60,14 +60,29 @@
 ```powershell
 git worktree add C:\home\mimageviewer-video-strip -b video-strip
 
-# vendor は junction ではなく実体コピー (合計 ~325MB)。eframe / egui-wgpu は
-# Cargo.toml の [patch.crates-io] が相対パスで参照するので必須
+# vendor は junction ではなく実体コピー (合計 ~325MB)。
+# eframe / egui-wgpu は **git 追跡下**なので worktree の checkout に既にある。
+# ここへ入れて上書きすると、改行だけ違う 29 ファイルが M になるのでコピーしない
+# (入れてしまった場合は `git checkout -- vendor/eframe vendor/egui-wgpu` で戻す)。
 $src = "C:\home\mimageviewer\vendor"; $dst = "C:\home\mimageviewer-video-strip\vendor"
 New-Item -ItemType Directory -Force $dst | Out-Null
-foreach ($n in @("eframe","egui-wgpu","ffmpeg","pdfium","ort","susie-worker","vst3-host","models","twemoji")) {
+foreach ($n in @("ffmpeg","pdfium","ort","susie-worker","vst3-host","models","twemoji")) {
   robocopy "$src\$n" "$dst\$n" /E /XD target /NFL /NDL /NJH /NJS | Out-Null
 }
 ```
+
+```powershell
+# cargo test を走らせる前に FFmpeg DLL を target\debug へ置く。無いとテスト実行体が
+# STATUS_DLL_NOT_FOUND で即死し、テストが 1 件も走らないまま落ちる。
+# build-dev.ps1 が置くのは target\dev-runtime の方なので、これとは別に要る。
+New-Item -ItemType Directory -Force target\debug | Out-Null
+Copy-Item vendor\ffmpeg\bin\*.dll target\debug\ -Force
+```
+
+⚠ **他のレーンと native ビルドを同時に走らせない** (`turbojpeg-sys` の cmake が
+共有 registry から MSBuild を回すため `MSB3191` で落ちる)。`build-dev.ps1` は自動で待つが、
+それ以外の経路で `cargo build` を打つときは `Get-Process MSBuild` を先に見る。
+詳細は [next-cycle-work-lanes.md](../next-cycle-work-lanes.md) §6。
 
 撤収は必ず `.\scripts\safe-worktree-remove.ps1` 経由 (junction 事故防止)。
 

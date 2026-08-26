@@ -3714,6 +3714,8 @@ fn core_spread_mode(mode: RemoteSpreadMode) -> crate::settings::SpreadMode {
         RemoteSpreadMode::LtrCover => crate::settings::SpreadMode::LtrCover,
         RemoteSpreadMode::Rtl => crate::settings::SpreadMode::Rtl,
         RemoteSpreadMode::RtlCover => crate::settings::SpreadMode::RtlCover,
+        RemoteSpreadMode::SplitLtr => crate::settings::SpreadMode::SplitLtr,
+        RemoteSpreadMode::SplitRtl => crate::settings::SpreadMode::SplitRtl,
     }
 }
 
@@ -4584,6 +4586,47 @@ mod tests {
             let ui_key = remote_spread_key(&address).unwrap();
             assert_eq!(ui_key.exact, worker.logical, "path={path:?}");
         }
+    }
+
+    #[test]
+    /// **見開き設定は、本体が実際に開いた場所へ書かなければならない。**
+    ///
+    /// ZIP の中身が 1 つのフォルダにまとまっていると本体はその中へ降りる
+    /// (`collapse_redundant`)。要求したアドレス (書庫そのもの) と、本体が設定を引くときの
+    /// キー (書庫の中のフォルダ) は**別の行**になり、要求側へ書くと書いた行が二度と読まれない。
+    /// 2026-08-26 に実際に起きた: 書庫側の行が 1ページ表示、内側の行が横長分割のままで、
+    /// 端末からモードを変えられなくなった。端末は container 応答の `effective_address` を送ること。
+    fn a_collapsed_zip_directory_keys_differently_from_the_zip_itself() {
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("book.zip");
+        std::fs::write(&zip_path, b"zip").unwrap();
+        let path = zip_path.to_string_lossy().into_owned();
+
+        let requested = mimageviewer_ipc::RemoteAddress {
+            path: path.clone(),
+            subresource: RemoteSubresource::ZipDirectory {
+                prefix: String::new(),
+            },
+        };
+        let effective = mimageviewer_ipc::RemoteAddress {
+            path,
+            subresource: RemoteSubresource::ZipDirectory {
+                prefix: "inner/".to_owned(),
+            },
+        };
+
+        let requested_key = remote_spread_key(&requested).unwrap();
+        let effective_key = remote_spread_key(&effective).unwrap();
+        assert_ne!(
+            requested_key.exact, effective_key.exact,
+            "書庫そのものと中のフォルダは別の行"
+        );
+        // 内側は書庫側へ落ちられるが、逆は無い。だから内側へ書かないと読まれない。
+        assert_eq!(
+            effective_key.fallback.as_deref(),
+            Some(requested_key.exact.as_path())
+        );
+        assert!(requested_key.fallback.is_none());
     }
 
     #[test]

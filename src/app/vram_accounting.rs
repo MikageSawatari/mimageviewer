@@ -59,16 +59,15 @@ fn add_lanczos_cache(
 impl App {
     #[cfg(windows)]
     fn add_detached_lanczos_textures(&self, accountant: &mut VramAccountant) {
-        if let Some(active) = self.active_detached_viewer_context.as_ref() {
-            add_lanczos_cache(accountant, &active.bundle.fs_lanczos_cache, None);
+        for id in self.other_viewer_context_ids() {
+            let _ = self.with_viewer_context_ref(id, |context| {
+                add_lanczos_cache(accountant, context.fs_lanczos_cache(), None);
+            });
         }
         for window in &self.detached_image_windows {
             add_lanczos_resource(accountant, &window.texture);
             for page in &window.frozen_continuous_pages {
                 add_lanczos_resource(accountant, &page.texture);
-            }
-            if let Some(bundle) = window.paused_bundle.as_deref() {
-                add_lanczos_cache(accountant, &bundle.fs_lanczos_cache, None);
             }
         }
         for shared in self.deferred_detached_image_window_views.values() {

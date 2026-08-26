@@ -5,15 +5,440 @@
 //!
 //! 設計: [docs/star-lock-snapshot-design.md](../../docs/star-lock-snapshot-design.md)
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use crate::app::App;
+use crate::fs_animation::FsCacheEntry;
+use crate::grid_item::GridItem;
 use crate::snapshot::{
     FilterState, SnapshotEntry, SnapshotKey, SnapshotSourceLabel, SnapshotState, is_inside_fs,
     snapshot_entry_from_grid_item, snapshot_key_from_grid_item, snapshot_key_from_path,
 };
 
+/// An open viewer belongs to one concrete item identity while `App::items` is replaced.
+///
+/// `old_to_new` is deliberately built from exact [`SnapshotKey`] equality. It is not the
+/// owner-entry relation used by cross-container navigation: a `ZipImage` must never turn into
+/// its `ZipFile` container merely because both share a path prefix.
+struct SnapshotViewerIndexSwap {
+    old_fullscreen_idx: usize,
+    new_fullscreen_idx: usize,
+    old_to_new: HashMap<usize, usize>,
+    preserved_fs_entry: Option<FsCacheEntry>,
+    opened_media_path: Option<PathBuf>,
+    current_owns_global_media_indices: bool,
+    restart_marker_thumb_decode: Option<PathBuf>,
+    #[cfg(windows)]
+    last_sync_stamp_new_idx: Option<usize>,
+    #[cfg(windows)]
+    last_sync_stamp_existed: bool,
+}
+
 impl App {
+    #[cfg(windows)]
+    fn remap_snapshot_native_pending_indices(&mut self, old_to_new: &HashMap<usize, usize>) {
+        let remap = |idx: usize| old_to_new.get(&idx).copied();
+        let source_owned = self
+            .native_video_source_swap_pending
+            .as_ref()
+            .is_some_and(|pending| {
+                self.snapshot_current_context_owns_ownerless_native_pending(
+                    pending.parked_live_window_id,
+                )
+            });
+        if source_owned {
+            let discard = self
+                .native_video_source_swap_pending
+                .as_ref()
+                .is_some_and(|pending| {
+                    remap(pending.target_idx).is_none()
+                        || !remap(pending.target_idx).is_some_and(|new_idx| {
+                            self.items.get(new_idx).is_some_and(|item| {
+                                matches!(item, GridItem::Video(path)
+                                    if crate::folder_tree::path_eq(path, &pending.target_path))
+                            })
+                        })
+                });
+            if discard {
+                if let Some(pending) = self.native_video_source_swap_pending.take() {
+                    pending.native_output.set_navigation_preview(None);
+                    if pending.reason == "tile" {
+                        self.video_tile_state = None;
+                        self.video_tile_mode_active = false;
+                        self.video_tile_reopen_pending = false;
+                        self.video_tile_reopen_deadline = None;
+                        self.native_video_deferred_nav_delta = None;
+                    }
+                }
+            } else if let Some(pending) = self.native_video_source_swap_pending.as_mut() {
+                let new_target =
+                    remap(pending.target_idx).expect("source-swap target survival checked above");
+                // `from_idx` is provenance only. Preserve its exact source identity when it
+                // survives; otherwise collapse it onto the still-valid target.
+                pending.from_idx = remap(pending.from_idx).unwrap_or(new_target);
+                pending.target_idx = new_target;
+            }
+        }
+
+        let projected_context = self.projected_viewer_context_id();
+        let open_owned = self
+            .native_video_open_pending
+            .as_ref()
+            .is_some_and(|pending| pending.owner_context_id == projected_context);
+        if open_owned {
+            let discard = self
+                .native_video_open_pending
+                .as_ref()
+                .is_some_and(|pending| remap(pending.idx).is_none());
+            if discard {
+                self.clear_native_video_open_pending("snapshot_items_swap");
+            } else if let Some(pending) = self.native_video_open_pending.as_mut() {
+                pending.idx = remap(pending.idx).expect("native open survival checked above");
+            }
+        }
+
+        let fast_owned = self
+            .native_video_fast_swap_pending
+            .as_ref()
+            .is_some_and(|pending| {
+                self.snapshot_current_context_owns_ownerless_native_pending(
+                    pending.parked_live_window_id,
+                )
+            });
+        if fast_owned {
+            let discard = self
+                .native_video_fast_swap_pending
+                .as_ref()
+                .is_some_and(|pending| remap(pending.target_idx).is_none());
+            if discard {
+                self.native_video_fast_swap_pending = None;
+                self.native_video_deferred_nav_delta = None;
+            } else if let Some(pending) = self.native_video_fast_swap_pending.as_mut() {
+                pending.target_idx =
+                    remap(pending.target_idx).expect("fast-swap survival checked above");
+            }
+        }
+
+        let tile_owned = self
+            .video_tile_swap_pending
+            .as_ref()
+            .is_some_and(|pending| {
+                self.snapshot_current_context_owns_ownerless_native_pending(
+                    pending.parked_live_window_id,
+                )
+            });
+        if tile_owned {
+            let discard = self
+                .video_tile_swap_pending
+                .as_ref()
+                .is_some_and(|pending| remap(pending.target_idx).is_none());
+            if discard {
+                self.video_tile_swap_pending = None;
+                self.video_tile_state = None;
+                self.video_tile_mode_active = false;
+                self.video_tile_reopen_pending = false;
+                self.video_tile_reopen_deadline = None;
+                self.native_video_deferred_nav_delta = None;
+            } else if let Some(pending) = self.video_tile_swap_pending.as_mut() {
+                pending.target_idx =
+                    remap(pending.target_idx).expect("tile-swap survival checked above");
+            }
+        }
+    }
+
+    fn clear_snapshot_index_space_derived_state(&mut self) {
+        self.slideshow_scroll_range_cache = None;
+        self.cached_nav_indices = None;
+        self.cached_fs_seek_info = None;
+        self.fs_vertical_cache_keep_set.clear();
+        self.continuous_page_transitions.clear();
+        self.continuous_reading_scroll_transition = None;
+        self.analysis_overlay_cache = None;
+        self.analysis_hist_cache = None;
+        self.analysis_sv_cache = None;
+        self.fs_context_menu_idx = None;
+        self.adjust_scope_selection_idx = None;
+        self.cancel_mouse_ring_flick();
+        self.mouse_ring_grid_target_idx = None;
+        self.mouse_gesture_grid_target_idx = None;
+        self.mouse_ring_suppress_context_menu_once = false;
+    }
+
+    fn finish_snapshot_viewer_index_swap(&mut self, swap: Option<SnapshotViewerIndexSwap>) {
+        let Some(mut swap) = swap else {
+            self.clear_snapshot_index_space_derived_state();
+            return;
+        };
+        let remap = |idx: usize| swap.old_to_new.get(&idx).copied();
+
+        if let Some(entry) = swap.preserved_fs_entry.take() {
+            self.fs_cache.insert(swap.new_fullscreen_idx, entry);
+        }
+        self.fullscreen_idx = Some(swap.new_fullscreen_idx);
+        self.video_audio_mode = self.video_audio_mode.and_then(&remap);
+        self.video_audio_vst = self.video_audio_vst.take().and_then(|mut state| {
+            remap(state.fs_idx).map(|new_idx| {
+                state.fs_idx = new_idx;
+                state
+            })
+        });
+        self.normalize_ui_states = std::mem::take(&mut self.normalize_ui_states)
+            .into_iter()
+            .filter_map(|(idx, state)| remap(idx).map(|new_idx| (new_idx, state)))
+            .collect();
+        self.normalize_auto_scan_suppressed = self
+            .normalize_auto_scan_suppressed
+            .iter()
+            .filter_map(|&idx| remap(idx))
+            .collect();
+        self.last_loop_pos = std::mem::take(&mut self.last_loop_pos)
+            .into_iter()
+            .filter_map(|(idx, state)| remap(idx).map(|new_idx| (new_idx, state)))
+            .collect();
+
+        self.slideshow_anchor_idx = self.slideshow_anchor_idx.and_then(&remap);
+        self.spread_shift_anchor_idx = self.spread_shift_anchor_idx.and_then(&remap);
+        self.fs_zoom_pdf_rerender_idx = self.fs_zoom_pdf_rerender_idx.and_then(&remap);
+
+        self.finish_snapshot_platform_media_index_swap(&swap);
+        self.clear_snapshot_index_space_derived_state();
+    }
+
+    fn finish_snapshot_platform_media_index_swap(&mut self, swap: &SnapshotViewerIndexSwap) {
+        let remap = |idx: usize| swap.old_to_new.get(&idx).copied();
+        let opened_path_matches = |path: &Path| {
+            swap.opened_media_path
+                .as_deref()
+                .is_some_and(|opened| crate::folder_tree::path_eq(opened, path))
+        };
+
+        if swap.current_owns_global_media_indices {
+            if self
+                .video_continuous_last_eof
+                .is_some_and(|(idx, _)| idx == swap.old_fullscreen_idx)
+            {
+                self.video_continuous_last_eof = self
+                    .video_continuous_last_eof
+                    .and_then(|(idx, serial)| remap(idx).map(|new_idx| (new_idx, serial)));
+            }
+            if let Some(state) = self.normalize_state.as_mut()
+                && state.fs_idx == swap.old_fullscreen_idx
+                && opened_path_matches(&state.file_path)
+            {
+                state.fs_idx = swap.new_fullscreen_idx;
+            }
+            if let Some(cache) = self.fullscreen_video_marker_cache.as_mut()
+                && cache.fs_idx == swap.old_fullscreen_idx
+                && opened_path_matches(&cache.path)
+            {
+                cache.fs_idx = swap.new_fullscreen_idx;
+            }
+        }
+
+        if let Some(path) = swap.restart_marker_thumb_decode.clone() {
+            self.start_fullscreen_video_marker_thumb_decode(swap.new_fullscreen_idx, path);
+        }
+
+        #[cfg(windows)]
+        self.finish_snapshot_windows_media_index_swap(swap);
+    }
+
+    #[cfg(windows)]
+    fn finish_snapshot_windows_media_index_swap(&mut self, swap: &SnapshotViewerIndexSwap) {
+        let remap = |idx: usize| swap.old_to_new.get(&idx).copied();
+        self.video_audio_exit_pending =
+            self.video_audio_exit_pending.take().and_then(|mut state| {
+                remap(state.fs_idx).map(|new_idx| {
+                    state.fs_idx = new_idx;
+                    state
+                })
+            });
+        self.vst3_deferred_media_open = self.vst3_deferred_media_open.and_then(&remap);
+
+        if swap.current_owns_global_media_indices {
+            if let Some(shell) = self.music_vst_shell.as_mut()
+                && shell.fs_idx == swap.old_fullscreen_idx
+            {
+                shell.fs_idx = swap.new_fullscreen_idx;
+            }
+            if let Some(refresh) = self.pending_pin_thumb_refresh.as_mut()
+                && refresh.fs_idx == swap.old_fullscreen_idx
+                && swap
+                    .opened_media_path
+                    .as_deref()
+                    .is_some_and(|path| crate::folder_tree::path_eq(path, &refresh.path))
+            {
+                refresh.fs_idx = swap.new_fullscreen_idx;
+            }
+        }
+
+        if swap.last_sync_stamp_existed {
+            self.last_viewer_sync_stamp = swap
+                .last_sync_stamp_new_idx
+                .and_then(|idx| self.viewer_sync_stamp_for_idx(idx));
+        }
+        self.remap_snapshot_native_pending_indices(&swap.old_to_new);
+    }
+
+    /// Build the exact old-index to replacement-index relation for a wholesale items swap.
+    fn snapshot_exact_idx_map(
+        &self,
+        target_membership: &HashMap<SnapshotKey, usize>,
+    ) -> HashMap<usize, usize> {
+        self.items
+            .iter()
+            .enumerate()
+            .filter_map(|(old_idx, item)| {
+                snapshot_key_from_grid_item(item)
+                    .and_then(|key| target_membership.get(&key).copied())
+                    .map(|new_idx| (old_idx, new_idx))
+            })
+            .collect()
+    }
+
+    /// App-global media state belongs to the mounted context only when no unmounted media
+    /// context is currently consuming it. A ParkedLive bundle sets the explicit input owner
+    /// while mounted, whereas mounted main and promoted active both use `None`.
+    fn snapshot_current_context_owns_global_media_indices(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.native_video_parked_live_input_window_id.is_some()
+                || (!self.other_active_viewer_context_contains_video()
+                    && !self.parked_live_media_window_exists())
+        }
+        #[cfg(not(windows))]
+        {
+            true
+        }
+    }
+
+    #[cfg(windows)]
+    fn snapshot_current_context_owns_ownerless_native_pending(
+        &self,
+        owner_window_id: Option<u64>,
+    ) -> bool {
+        match owner_window_id {
+            Some(owner) => self.native_video_parked_live_input_window_id == Some(owner),
+            None => {
+                self.native_video_parked_live_input_window_id.is_none()
+                    && !self.other_active_viewer_context_contains_video()
+            }
+        }
+    }
+
+    /// Prepare preservation/cancellation while the old index space is still authoritative.
+    /// A miss closes through the normal lifecycle before callers replace `items`.
+    ///
+    /// **Every outcome is logged.** Whether the open reader followed its item or was closed
+    /// is the whole user-visible behaviour of this path, and in the multi-window mode a
+    /// close takes a whole window down. Without a line here the only evidence left is an
+    /// `items_len` that changed and a reader that vanished, which is what the 2026-08-26
+    /// report had to be reconstructed from (backlog §1.125).
+    fn prepare_snapshot_viewer_index_swap(
+        &mut self,
+        phase: &'static str,
+        target_membership: &HashMap<SnapshotKey, usize>,
+    ) -> Option<SnapshotViewerIndexSwap> {
+        self.cancel_media_navigation_pending_for_current_context("snapshot_items_swap");
+        self.cancel_pending_folder_nav();
+
+        let Some(old_fullscreen_idx) = self.fullscreen_idx else {
+            crate::logger::log(format!(
+                "[snapshot] {phase}: no open reader to reconcile (items={})",
+                self.items.len()
+            ));
+            return None;
+        };
+        let open_label = self
+            .items
+            .get(old_fullscreen_idx)
+            .map(crate::grid_item::GridItem::display_path)
+            .unwrap_or_else(|| "<out of range>".to_string());
+        let Some(open_key) = self
+            .items
+            .get(old_fullscreen_idx)
+            .and_then(snapshot_key_from_grid_item)
+        else {
+            crate::logger::log(format!(
+                "[snapshot] {phase}: closing reader, the open item has no snapshot key \
+                 old_idx={old_fullscreen_idx} item={open_label}"
+            ));
+            self.close_fullscreen();
+            return None;
+        };
+        let Some(&new_fullscreen_idx) = target_membership.get(&open_key) else {
+            crate::logger::log(format!(
+                "[snapshot] {phase}: closing reader, the open item is outside the new list \
+                 old_idx={old_fullscreen_idx} target_len={} item={open_label}",
+                target_membership.len()
+            ));
+            self.close_fullscreen();
+            return None;
+        };
+        crate::logger::log(format!(
+            "[snapshot] {phase}: reader follows its item \
+             old_idx={old_fullscreen_idx} -> new_idx={new_fullscreen_idx} \
+             target_len={} item={open_label}",
+            target_membership.len()
+        ));
+
+        let old_to_new = self.snapshot_exact_idx_map(target_membership);
+        let opened_media_path = self
+            .items
+            .get(old_fullscreen_idx)
+            .and_then(|item| match item {
+                GridItem::Video(path) | GridItem::Audio(path) => Some(path.clone()),
+                _ => None,
+            });
+        let current_owns_global_media_indices =
+            self.snapshot_current_context_owns_global_media_indices();
+
+        let restart_marker_thumb_decode = self
+            .fullscreen_video_marker_thumb_decode_pending
+            .as_ref()
+            .filter(|pending| {
+                current_owns_global_media_indices
+                    && pending.fs_idx == old_fullscreen_idx
+                    && opened_media_path
+                        .as_deref()
+                        .is_some_and(|path| crate::folder_tree::path_eq(path, &pending.path))
+            })
+            .map(|pending| pending.path.clone());
+        if restart_marker_thumb_decode.is_some() {
+            self.cancel_fullscreen_video_marker_thumb_decode();
+        }
+
+        #[cfg(windows)]
+        let (last_sync_stamp_existed, last_sync_stamp_new_idx) = self
+            .last_viewer_sync_stamp
+            .as_ref()
+            .map(|stamp| {
+                let current = stamp.items_generation == self.items_generation
+                    && stamp.idx == old_fullscreen_idx;
+                (current, current.then_some(new_fullscreen_idx))
+            })
+            .unwrap_or((false, None));
+
+        // `bump_items_generation` immediately discards old-generation entries, so ownership
+        // must leave the generation map before the caller bumps it.
+        let preserved_fs_entry = self.fs_cache.remove(&old_fullscreen_idx);
+
+        Some(SnapshotViewerIndexSwap {
+            old_fullscreen_idx,
+            new_fullscreen_idx,
+            old_to_new,
+            preserved_fs_entry,
+            opened_media_path,
+            current_owns_global_media_indices,
+            restart_marker_thumb_decode,
+            #[cfg(windows)]
+            last_sync_stamp_new_idx,
+            #[cfg(windows)]
+            last_sync_stamp_existed,
+        })
+    }
+
     /// snapshot active 中か。
     pub(crate) fn is_snapshot_active(&self) -> bool {
         self.snapshot.is_some()
@@ -153,6 +578,26 @@ impl App {
         }
     }
 
+    /// `items` の index space を直接交換する snapshot 経路用の Details invalidation。
+    ///
+    /// 遅延 metadata worker は idx と visible revision を snapshot しているため、受信側を
+    /// drop して cancel を立てる。viewport 由来の prewarm indices も旧 index space なので
+    /// 次の Details 描画で作り直すまで空にする。
+    fn invalidate_snapshot_details_index_state(&mut self) {
+        self.invalidate_details_meta_requirements();
+        self.details_tag_prewarm_indices.clear();
+    }
+
+    /// swap 後の `visible_indices` を canonical source として Details order を復元する。
+    fn rebuild_snapshot_details_index_state(&mut self) {
+        if self.settings.grid_view_mode == crate::settings::GridViewMode::Details {
+            self.rebuild_details_order();
+        } else {
+            self.details_order.clear();
+            self.details_order_revision = self.details_order_revision.wrapping_add(1);
+        }
+    }
+
     /// snapshot を activate する (= 現在の visible_indices を capture して固定)。
     ///
     /// 実装手順 (§4.5 mutual exclusion lifecycle):
@@ -203,6 +648,16 @@ impl App {
             .cloned()
             .collect();
         debug_assert_eq!(captured_items_grid.len(), captured_entries.len());
+        let captured_image_metas: Vec<Option<(i64, i64)>> = self
+            .visible_indices
+            .iter()
+            .filter_map(|&i| {
+                let item = self.items.get(i)?;
+                snapshot_key_from_grid_item(item)?;
+                Some(self.image_metas.get(i).copied().flatten())
+            })
+            .collect();
+        debug_assert_eq!(captured_image_metas.len(), captured_entries.len());
 
         let filter_at_capture = self.current_filter_state();
         let origin = self
@@ -244,6 +699,9 @@ impl App {
             membership.insert(entry.key.clone(), idx);
         }
 
+        // Preserve or close the open viewer while the old index space and player are alive.
+        let viewer_index_swap = self.prepare_snapshot_viewer_index_swap("activate", &membership);
+
         // Step 2: close search (= mutual exclusion)
         let search_was_active = self.close_searches_for_snapshot();
 
@@ -263,12 +721,14 @@ impl App {
                 .and_then(snapshot_key_from_grid_item)
                 .and_then(|key| membership.get(&key).copied())
         });
-        // list_view_items / list_view_thumbnails 用に clone を確保
+        // list_view_items / list_view_thumbnails / list_view_image_metas 用に clone を確保
         // (= BS で snapshot list 復帰した時に Pending リセットせず再利用するため)。
         let list_view_items = captured_items_grid.clone();
         let list_view_thumbnails = captured_thumbnails.clone();
+        let list_view_image_metas = captured_image_metas.clone();
         let saved_items = std::mem::replace(&mut self.items, captured_items_grid);
         let saved_thumbnails = std::mem::replace(&mut self.thumbnails, captured_thumbnails);
+        let saved_image_metas = std::mem::replace(&mut self.image_metas, captured_image_metas);
         let saved_visible_indices =
             std::mem::replace(&mut self.visible_indices, snapshot_visible_indices);
         let saved_scroll_offset_y = std::mem::replace(&mut self.scroll_offset_y, 0.0);
@@ -306,12 +766,14 @@ impl App {
             generation_id,
             saved_items,
             saved_thumbnails,
+            saved_image_metas,
             saved_visible_indices,
             saved_scroll_offset_y,
             saved_selected,
             saved_zip_nav,
             list_view_items,
             list_view_thumbnails,
+            list_view_image_metas,
             pre_snapshot_search_origin,
         });
         self.top_level_grid_view.begin(
@@ -324,6 +786,8 @@ impl App {
         // は thumbnails 自体は触らないので、上で入れ替えた captured_thumbnails は維持される。
         self.bump_items_generation();
         self.invalidate_idx_state_and_queues();
+        self.invalidate_snapshot_details_index_state();
+        self.finish_snapshot_viewer_index_swap(viewer_index_swap);
         // tags_cache は invalidate 対象外なので手動 clear (= 既存 clear は冗長になるが
         // 残しておく方が安全、二重 clear は no-op)
         self.clear_tags_cache();
@@ -356,6 +820,7 @@ impl App {
                 self.rehydrate_page_edit_state_for_current_items(&origin);
             }
         }
+        self.rebuild_snapshot_details_index_state();
 
         let msg = if search_was_active {
             format!("検索結果をスナップショットに固定しました ({n} 件)")
@@ -376,6 +841,12 @@ impl App {
     ) -> Option<super::top_level_grid_view::TopLevelGridRestore> {
         let snap = self.snapshot.take()?;
         let _ = self.restore_rating_filter_suppression();
+        // Canonical return_to がある間は fallback slot を consume しない。検索由来 snapshot
+        // を fork した sibling が、それぞれ自分の restore payload を保持できるようにする。
+        if let Some(return_to) = self.top_level_grid_view.take_return_to() {
+            self.show_feedback_toast("★固定を解除しました".into());
+            return Some(return_to);
+        }
         let at_origin = self.current_folder.as_ref().is_some_and(|path| {
             crate::snapshot::snapshot_key_from_path(path)
                 == crate::snapshot::snapshot_key_from_path(&snap.origin)
@@ -405,11 +876,7 @@ impl App {
         let rating_view_stars = self.view_return_rating_view_stars_for_path(path.as_deref());
         let fallback =
             self.view_return_context_from_parts(path, subfolder_restore, rating_view_stars);
-        Some(
-            self.top_level_grid_view
-                .take_return_to()
-                .unwrap_or(fallback),
-        )
+        Some(fallback)
     }
 
     /// snapshot を deactivate する (= 退避していた items 等を復元)。
@@ -509,6 +976,16 @@ impl App {
         }
         if at_origin {
             // origin のまま解除 → 元の items 復元 (= snapshot 元のフォルダに戻る)。
+            let restore_membership: HashMap<SnapshotKey, usize> = snap
+                .saved_items
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, item)| snapshot_key_from_grid_item(item).map(|key| (key, idx)))
+                .collect();
+            // Resolve the item actually open now; navigation may have changed it since capture.
+            let viewer_index_swap =
+                self.prepare_snapshot_viewer_index_swap("deactivate", &restore_membership);
+
             // snapshot 中に subset (= self.thumbnails) で thumbnail worker が
             // Pending → Loaded に進めたものを、path key 経由で saved 側に merge する。
             // これをしないと「snapshot 解除後に新生成サムネが消える」(ユーザー報告)。
@@ -538,6 +1015,7 @@ impl App {
             }
             self.items = snap.saved_items;
             self.thumbnails = merged_thumbnails;
+            self.image_metas = snap.saved_image_metas;
             self.visible_indices = snap.saved_visible_indices;
             self.scroll_offset_y = snap.saved_scroll_offset_y;
             self.selected = snap.saved_selected;
@@ -552,6 +1030,8 @@ impl App {
             // invalidate 後も保持される (= thumbnails 自体は invalidate 対象外)。
             self.bump_items_generation();
             self.invalidate_idx_state_and_queues();
+            self.invalidate_snapshot_details_index_state();
+            self.finish_snapshot_viewer_index_swap(viewer_index_swap);
             self.clear_tags_cache();
             // items を saved (元フォルダ) に戻したので、ページ編集状態も元 idx で hydrate
             // し直す (= activate の subset hydrate と対称、Codex P1)。snapshot 中に編集した分は
@@ -564,6 +1044,7 @@ impl App {
                 self.mark_color_filter_scope_dirty();
                 self.rebuild_visible_indices();
             }
+            self.rebuild_snapshot_details_index_state();
         } else {
             // child folder の中で解除 → 現在の items はそのまま、snapshot state だけ捨てる
             // visible_indices は filter / current_folder に対して再構築
@@ -591,7 +1072,7 @@ impl App {
         // list_view_items / list_view_thumbnails は activate_snapshot 時に保存した clone を
         // 使う (= reconstruct だと folder 代表サムネが Pending に戻って「フォルダアイコン」
         // 表示になるユーザー報告対応)。
-        let (snap_origin, list_items, list_thumbs, is_search_snapshot) = {
+        let (snap_origin, list_items, list_thumbs, list_image_metas, is_search_snapshot) = {
             let Some(snap) = self.snapshot.as_ref() else {
                 return false;
             };
@@ -599,6 +1080,7 @@ impl App {
                 snap.origin.clone(),
                 snap.list_view_items.clone(),
                 snap.list_view_thumbnails.clone(),
+                snap.list_view_image_metas.clone(),
                 // 検索 view 由来 snapshot は origin が cross-folder prefix なので rehydrate せず
                 // clear のみ (= activate と同じ判定。pre_snapshot_search_origin Some が search 由来)。
                 snap.pre_snapshot_search_origin.is_some(),
@@ -633,6 +1115,7 @@ impl App {
         // items 入れ替え (= 保存したサムネ付き state を復帰)
         self.items = list_items;
         self.thumbnails = list_thumbs;
+        self.image_metas = list_image_metas;
         self.visible_indices = (0..n).collect();
         self.current_folder = Some(snap_origin.clone());
         self.address = snap_origin.display().to_string();
@@ -643,6 +1126,7 @@ impl App {
         // items_generation bump + invalidate (= Codex P1-1)
         self.bump_items_generation();
         self.invalidate_idx_state_and_queues();
+        self.invalidate_snapshot_details_index_state();
         self.clear_tags_cache();
         // snapshot list (= subset) に戻したので、ページ編集状態も subset idx で合わせ直す
         // (= activate と同じ、Codex P1)。通常フォルダ由来は origin の DB から hydrate
@@ -657,6 +1141,7 @@ impl App {
             self.mark_color_filter_scope_dirty();
             self.rebuild_visible_indices();
         }
+        self.rebuild_snapshot_details_index_state();
         self.show_feedback_toast("★固定リストに戻りました".into());
         true
     }

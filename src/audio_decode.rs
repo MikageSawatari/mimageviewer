@@ -144,35 +144,64 @@ impl PartialEmitSchedule {
 struct AudioDecodeCtx {
     ictx: ffmpeg::format::context::Input,
     stream_index: usize,
+    stream_time_base: ffmpeg::Rational,
     decoder: ffmpeg::decoder::Audio,
     resampler: ResampleContext,
     in_rate: u32,
 }
 
+/// Long-lived range decoder used by the video seek-strip waveform worker.
+///
+/// The input and codec are opened once for the video. Each request seeks and
+/// flushes this decoder, then recreates only the lightweight resampler state.
+pub(crate) struct AudioRangeDecoder {
+    inner: AudioDecodeCtx,
+}
+
+/// Opening can fail because the file simply has no audio track, which is a
+/// normal media property for waveform callers and must not be flattened into
+/// an analysis failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AudioDecodeOpenError {
+    NoAudioTrack,
+    Failed(String),
+}
+
+impl std::fmt::Display for AudioDecodeOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoAudioTrack => f.write_str("音声ストリームが見つかりません"),
+            Self::Failed(error) => f.write_str(error),
+        }
+    }
+}
+
 /// 音声ファイルを開き、最良の音声ストリーム向けに decoder と 48kHz stereo f32 packed への
 /// resampler を構築する。レイアウト未指定 (古い WMA 等) は `normalize_layout` で差し替える。
-fn open_audio_decode(path: &Path) -> Result<AudioDecodeCtx, String> {
+fn open_audio_decode(path: &Path) -> Result<AudioDecodeCtx, AudioDecodeOpenError> {
     ensure_ffmpeg_init();
 
     let pb = path.to_path_buf();
-    let ictx = ffmpeg::format::input(&pb).map_err(|e| format!("format::input: {e}"))?;
+    let ictx = ffmpeg::format::input(&pb)
+        .map_err(|e| AudioDecodeOpenError::Failed(format!("format::input: {e}")))?;
 
     // 最良の音声ストリームを選ぶ。`stream.parameters()` は stream を借用するので、
     // codec context の構築まで stream スコープ内で済ませてから owned な context を取り出す。
-    let (stream_index, codec_ctx) = {
+    let (stream_index, stream_time_base, codec_ctx) = {
         let stream = ictx
             .streams()
             .best(ffmpeg::media::Type::Audio)
-            .ok_or_else(|| "音声ストリームが見つかりません".to_string())?;
+            .ok_or(AudioDecodeOpenError::NoAudioTrack)?;
         let idx = stream.index();
+        let time_base = stream.time_base();
         let ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
-            .map_err(|e| format!("codec context: {e}"))?;
-        (idx, ctx)
+            .map_err(|e| AudioDecodeOpenError::Failed(format!("codec context: {e}")))?;
+        (idx, time_base, ctx)
     };
     let decoder = codec_ctx
         .decoder()
         .audio()
-        .map_err(|e| format!("audio decoder open: {e}"))?;
+        .map_err(|e| AudioDecodeOpenError::Failed(format!("audio decoder open: {e}")))?;
 
     let in_fmt = decoder.format();
     let in_rate = decoder.rate();
@@ -188,15 +217,163 @@ fn open_audio_decode(path: &Path) -> Result<AudioDecodeCtx, String> {
         ffmpeg::ChannelLayout::STEREO,
         OUT_RATE,
     )
-    .map_err(|e| format!("swresample init: {e}"))?;
+    .map_err(|e| AudioDecodeOpenError::Failed(format!("swresample init: {e}")))?;
 
     Ok(AudioDecodeCtx {
         ictx,
         stream_index,
+        stream_time_base,
         decoder,
         resampler,
         in_rate,
     })
+}
+
+impl AudioRangeDecoder {
+    pub(crate) fn open(path: &Path) -> Result<Self, AudioDecodeOpenError> {
+        open_audio_decode(path).map(|inner| Self { inner })
+    }
+
+    /// Decode exactly the requested half-open time range to 48kHz stereo PCM.
+    ///
+    /// A backward seek may land before the requested start. The decoded PCM is
+    /// aligned back onto the requested global timeline and trimmed (or padded
+    /// for a late first timestamp), so bin boundaries remain stable between a
+    /// full-file analysis and a window analysis.
+    pub(crate) fn decode_range_to_stereo_f32(
+        &mut self,
+        start_secs: f64,
+        end_secs: f64,
+        should_abort: &dyn Fn() -> bool,
+    ) -> Result<DecodedAudio, String> {
+        if !start_secs.is_finite()
+            || !end_secs.is_finite()
+            || start_secs < 0.0
+            || end_secs <= start_secs
+        {
+            return Err("invalid audio decode range".to_string());
+        }
+        let seek_value = start_secs * ffmpeg::ffi::AV_TIME_BASE as f64;
+        if !seek_value.is_finite() || seek_value > i64::MAX as f64 {
+            return Err("audio decode range is too large".to_string());
+        }
+
+        let seek_result = unsafe {
+            ffmpeg::ffi::av_seek_frame(
+                self.inner.ictx.as_mut_ptr(),
+                -1,
+                seek_value.round() as i64,
+                ffmpeg::ffi::AVSEEK_FLAG_BACKWARD,
+            )
+        };
+        if seek_result < 0 {
+            return Err(format!("audio range seek failed: {seek_result}"));
+        }
+        self.inner.decoder.flush();
+        self.inner.resampler = analysis_resampler(&self.inner.decoder)?;
+
+        let tb_num = f64::from(self.inner.stream_time_base.numerator());
+        let tb_den = f64::from(self.inner.stream_time_base.denominator()).max(1.0);
+        let mut decoded = Vec::new();
+        let mut first_pts_secs = None;
+        let mut estimated_next_pts = None;
+        let mut frame = AudioFrame::empty();
+        let mut stopped_at_range_end = false;
+
+        'packets: for item in self.inner.ictx.packets() {
+            if should_abort() {
+                return Err("cancelled".to_string());
+            }
+            let (stream, packet) = item.map_err(|e| format!("demux: {e}"))?;
+            if stream.index() != self.inner.stream_index {
+                continue;
+            }
+            if self.inner.decoder.send_packet(&packet).is_err() {
+                continue;
+            }
+            while self.inner.decoder.receive_frame(&mut frame).is_ok() {
+                if should_abort() {
+                    return Err("cancelled".to_string());
+                }
+                let frame_pts = frame
+                    .timestamp()
+                    .map(|pts| pts as f64 * tb_num / tb_den)
+                    .filter(|pts| pts.is_finite())
+                    .or(estimated_next_pts)
+                    .unwrap_or(start_secs);
+                let frame_duration = frame.samples() as f64 / self.inner.in_rate.max(1) as f64;
+                estimated_next_pts = Some(frame_pts + frame_duration);
+                if frame_pts >= end_secs {
+                    stopped_at_range_end = true;
+                    break 'packets;
+                }
+                first_pts_secs.get_or_insert(frame_pts);
+                append_resampled(
+                    &mut self.inner.resampler,
+                    &mut frame,
+                    &mut decoded,
+                    self.inner.in_rate,
+                )?;
+                if frame_pts + frame_duration >= end_secs {
+                    stopped_at_range_end = true;
+                    break 'packets;
+                }
+            }
+        }
+
+        // Only a true demux EOF can safely drain codec/resampler tail state.
+        if !stopped_at_range_end {
+            let _ = self.inner.decoder.send_eof();
+            drain_decoder(
+                &mut self.inner.decoder,
+                &mut frame,
+                &mut self.inner.resampler,
+                &mut decoded,
+                self.inner.in_rate,
+            )?;
+            flush_resampler(&mut self.inner.resampler, &mut decoded)?;
+        }
+
+        if should_abort() {
+            return Err("cancelled".to_string());
+        }
+        let requested_frames = ((end_secs - start_secs) * OUT_RATE as f64).ceil().max(1.0) as usize;
+        let mut aligned = vec![0.0_f32; requested_frames.saturating_mul(OUT_CHANNELS)];
+        let decoded_frames = decoded.len() / OUT_CHANNELS;
+        let origin = first_pts_secs.unwrap_or(start_secs);
+        let source_start = ((start_secs - origin).max(0.0) * OUT_RATE as f64).round() as usize;
+        let target_start = ((origin - start_secs).max(0.0) * OUT_RATE as f64).round() as usize;
+        let copy_frames = decoded_frames
+            .saturating_sub(source_start)
+            .min(requested_frames.saturating_sub(target_start));
+        if copy_frames > 0 {
+            let source = source_start * OUT_CHANNELS;
+            let target = target_start * OUT_CHANNELS;
+            let count = copy_frames * OUT_CHANNELS;
+            aligned[target..target + count].copy_from_slice(&decoded[source..source + count]);
+        }
+
+        Ok(DecodedAudio {
+            info: AudioStreamInfo {
+                sample_rate: OUT_RATE,
+                channels: OUT_CHANNELS as u16,
+                duration_secs: requested_frames as f64 / OUT_RATE as f64,
+            },
+            stereo_samples: aligned,
+        })
+    }
+}
+
+fn analysis_resampler(decoder: &ffmpeg::decoder::Audio) -> Result<ResampleContext, String> {
+    ResampleContext::get2(
+        decoder.format(),
+        normalize_layout(decoder.ch_layout()),
+        decoder.rate(),
+        Sample::F32(SampleType::Packed),
+        ffmpeg::ChannelLayout::STEREO,
+        OUT_RATE,
+    )
+    .map_err(|e| format!("swresample init: {e}"))
 }
 
 /// 音声ファイルを全尺デコードして 48kHz interleaved stereo f32 PCM を返す。
@@ -231,10 +408,11 @@ pub fn decode_audio_file_to_stereo_f32_streaming(
     let AudioDecodeCtx {
         mut ictx,
         stream_index,
+        stream_time_base: _,
         mut decoder,
         mut resampler,
         in_rate,
-    } = open_audio_decode(path)?;
+    } = open_audio_decode(path).map_err(|error| error.to_string())?;
 
     let mut out: Vec<f32> = Vec::new();
     let mut frame = AudioFrame::empty();
@@ -304,10 +482,11 @@ pub fn decode_audio_file_progressive(
     let AudioDecodeCtx {
         mut ictx,
         stream_index,
+        stream_time_base: _,
         mut decoder,
         mut resampler,
         in_rate,
-    } = open_audio_decode(path)?;
+    } = open_audio_decode(path).map_err(|error| error.to_string())?;
 
     let mut frame = AudioFrame::empty();
     // drain した差分だけを載せる再利用スクラッチ (差分を on_delta へ渡すたび clear)。

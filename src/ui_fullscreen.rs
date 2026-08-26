@@ -25,11 +25,11 @@ use std::sync::Arc;
 use crate::adjustment::PostFilter;
 use crate::ai::ModelKind;
 use crate::app::{
-    App, FsDisplayUnitHoldover, FsDisplayUnitHoldoverPage, FsHoldover, FsNavigationDisplayTarget,
-    FsNavigationPresentation, FsNavigationSequence, FsNavigationSequenceTarget,
-    FsNavigationTargetPhase, FsOpenMaterialization, FsOverflowPanelState, FsPageLoadState,
-    FsPrefetchIndicator, FsPrefetchPageState, FsPrefetchSideDisplay, ViewerPresentation,
-    build_fs_prefetch_indicator,
+    App, ContextResidence, FsDisplayUnitHoldover, FsDisplayUnitHoldoverPage, FsHoldover,
+    FsNavigationDisplayTarget, FsNavigationPresentation, FsNavigationSequence,
+    FsNavigationSequenceTarget, FsNavigationTargetPhase, FsOpenMaterialization,
+    FsOverflowPanelState, FsPageLoadState, FsPrefetchIndicator, FsPrefetchPageState,
+    FsPrefetchSideDisplay, ViewerPresentation, build_fs_prefetch_indicator,
 };
 use crate::displayed_image_transform::{
     DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
@@ -46,7 +46,9 @@ use crate::keymap::{
     KeyTrigger, Keymap, ModKind, command_catalog, modifier_held_via_os,
 };
 #[cfg(windows)]
-use crate::keymap::{DiagnosticChordPressSnapshot, VIDEO_ADJUST_SLOT_ACTIONS};
+use crate::keymap::{
+    DiagnosticChordPressSnapshot, VIDEO_ADJUST_SLOT_ACTIONS, VIDEO_SEEK_STRIP_ACTIONS,
+};
 use crate::pdf_loader::PdfPageContentType;
 use crate::settings::{
     FULLSCREEN_NAVIGATOR_SIZE_MAX, FULLSCREEN_NAVIGATOR_SIZE_MIN, FullscreenFitMode,
@@ -1668,6 +1670,10 @@ fn spread_mode_key_action(mode: SpreadMode) -> Option<KeyAction> {
         SpreadMode::LtrCover => Some(KeyAction::FsSpreadLtrCover),
         SpreadMode::Rtl => Some(KeyAction::FsSpreadRtl),
         SpreadMode::RtlCover => Some(KeyAction::FsSpreadRtlCover),
+        // 分割は 8 / 9。1〜5 の見開きと 6 (連結) / 7 (綴じ方向) / 0 (フィット) の後ろに続く。
+        SpreadMode::SplitLtr => Some(KeyAction::FsSpreadSplitLtr),
+        SpreadMode::SplitRtl => Some(KeyAction::FsSpreadSplitRtl),
+        // 旧 DB 互換の `Vertical` は連結方式 (6) 側へ移したので、キーを持たない。
         SpreadMode::Vertical => None,
     }
 }
@@ -3869,15 +3875,39 @@ struct VerticalReadingPage {
 struct ContinuousReadingUnitSpec {
     anchor_idx: usize,
     pages: Vec<usize>,
+    /// 分割中に、この段が元ページのどちら側か。分割していなければ `Full`。
+    ///
+    /// **同じ `anchor_idx` の段が 2 つ縦に並ぶ**ので、現在位置の照合は左右まで見る。
+    /// 元 index は正本のままなので、`contains_idx` はどちらの段にも真を返す
+    /// (テクスチャ・先読み・キャッシュは元ページ単位で足りる)。
+    slice: crate::page_split::PageSlice,
 }
 
 impl ContinuousReadingUnitSpec {
     fn pages(anchor_idx: usize, pages: Vec<usize>) -> Self {
-        Self { anchor_idx, pages }
+        Self {
+            anchor_idx,
+            pages,
+            slice: crate::page_split::PageSlice::Full,
+        }
+    }
+
+    /// 分割したページの片側だけを載せた段。
+    fn half(anchor_idx: usize, slice: crate::page_split::PageSlice) -> Self {
+        Self {
+            anchor_idx,
+            pages: vec![anchor_idx],
+            slice,
+        }
     }
 
     fn contains_idx(&self, idx: usize) -> bool {
         self.anchor_idx == idx || self.pages.contains(&idx)
+    }
+
+    /// 表示位置ちょうどの段か。左右まで一致するものだけ真。
+    fn is_step(&self, idx: usize, slice: crate::page_split::PageSlice) -> bool {
+        self.anchor_idx == idx && self.slice == slice
     }
 }
 
@@ -3886,7 +3916,12 @@ struct ContinuousReadingPageSize {
     idx: usize,
     width: f32,
     height: f32,
+    /// **元画像空間**の部分矩形。描画へはこのまま渡る。
     content_bbox: Option<egui::Rect>,
+    /// `content_bbox` を寸法計算へ使うための保存回転。`width` / `height` は回転後の
+    /// 寸法なので、両者を掛けるには矩形を表示空間へ写す必要がある
+    /// (詳細は [display-pipeline.md](../docs/display-pipeline.md) の座標系の節)。
+    rotation: crate::rotation_db::Rotation,
     logical_scale: f32,
 }
 
@@ -3897,12 +3932,17 @@ impl ContinuousReadingPageSize {
             width,
             height,
             content_bbox: None,
+            rotation: crate::rotation_db::Rotation::None,
             logical_scale: 1.0,
         }
     }
 
+    /// 寸法計算に使う**表示空間**の部分矩形。
     fn bbox(&self) -> egui::Rect {
         self.content_bbox
+            .map(|bbox| {
+                crate::displayed_image_transform::rotate_bbox_to_display(bbox, self.rotation)
+            })
             .unwrap_or_else(|| egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)))
     }
 
@@ -3974,14 +4014,6 @@ fn continuous_spread_fit_width(
     }
 }
 
-fn fs_image_fit_bbox(
-    rotation: crate::rotation_db::Rotation,
-    free_rotation_rad: f32,
-    content_bbox: Option<egui::Rect>,
-) -> Option<egui::Rect> {
-    content_bbox.filter(|_| rotation.is_none() && free_rotation_rad.abs() <= TRANSFORM_EPSILON)
-}
-
 fn fs_image_draw_rect_for_size(
     full_rect: egui::Rect,
     tex_size: egui::Vec2,
@@ -4009,14 +4041,25 @@ fn fs_image_draw_rect_for_size(
     .map(|transform| transform.full_image_rect)
 }
 
+/// 部分矩形を描画矩形と UV へ落とす。**座標系の扱いは
+/// [`DisplayedImageTransform`] と同じ**にする (描画位置は表示空間、UV は元画像空間)。
+///
+/// 以前はここに「回転していれば捨てる」規則の複製があった。呼び出し側が回転していない
+/// 枝の中だったので実害は出ていなかったが、同じ規則が 2 か所にあると片方だけ直る。
 fn fs_image_paint_rect_and_uv(
     img_rect: egui::Rect,
     rotation: crate::rotation_db::Rotation,
     free_rotation_rad: f32,
     content_bbox: Option<egui::Rect>,
 ) -> (egui::Rect, egui::Rect) {
-    match fs_image_fit_bbox(rotation, free_rotation_rad, content_bbox) {
-        Some(bbox) => (normalized_sub_rect(img_rect, bbox), bbox),
+    match crate::displayed_image_transform::effective_bbox(free_rotation_rad, content_bbox) {
+        Some(source_bbox) => (
+            normalized_sub_rect(
+                img_rect,
+                crate::displayed_image_transform::rotate_bbox_to_display(source_bbox, rotation),
+            ),
+            source_bbox,
+        ),
         None => (
             img_rect,
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
@@ -5289,11 +5332,11 @@ impl App {
         match pair {
             SpreadPair::Single => {
                 let rotation = self.get_rotation(idx);
-                let content_bbox = if rotation.is_none() {
-                    self.view_trim_single_content_bbox(idx)
-                } else {
-                    None
-                };
+                let trim = rotation
+                    .is_none()
+                    .then(|| self.view_trim_single_content_bbox(idx))
+                    .flatten();
+                let content_bbox = self.fs_page_content_bbox(idx, rotation, trim);
                 let page =
                     self.capture_fs_display_unit_page(rendition_ctx, idx, rotation, content_bbox)?;
                 Some(FsDisplayUnitHoldover { pages: vec![page] })
@@ -6678,10 +6721,13 @@ impl App {
         // 回転ページは draw_fs_image 側で bbox を使わないので通常どおり全体を対象にする。
         // mut 借用 (view_trim_single_content_bbox) を bg_style の immutable 借用より前に済ませる。
         // 正規化 bbox は照準オーバービューの draw_fs_image にも渡す (= 余白を出さずトリム後を表示)。
-        let trim_bbox = rotation
+        // Z ズームの寄せ先を決めるので、ここでは分割も反映した矩形が要る
+        // (`draw_fs_image` の解決より前に倍率と中心を決めるため)。
+        let trim = rotation
             .is_none()
             .then(|| self.view_trim_single_content_bbox(fs_idx))
             .flatten();
+        let trim_bbox = self.fs_page_content_bbox(fs_idx, rotation, trim);
         // パン操作帯: 上下のホバーバー (上部バー / 下部シークバー) 分を内側へ詰め、カーソルが
         // そこへ入る前にコンテンツ領域の上端・下端へ到達できるようにする (実機 FB 2026-06-21)。
         // 左右はズーム中にパネルを抑止するので全幅を使う。小画面で帯が潰れないよう高さ 25% で頭打ち。
@@ -7661,6 +7707,15 @@ pub(crate) fn navigable_delta_between(
     (delta != 0).then_some(delta)
 }
 
+/// スライドショーが使う並びを試験から引くための入口。生成規則は本体と同じものを通す。
+#[cfg(test)]
+pub(crate) fn build_image_reading_indices_for_test(
+    items: &[GridItem],
+    visible_indices: &[usize],
+) -> Vec<usize> {
+    build_image_reading_indices(items, visible_indices)
+}
+
 fn build_image_reading_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize> {
     crate::ui_helpers::still_image_display_indices(items, visible_indices)
 }
@@ -8156,17 +8211,57 @@ fn continuous_reading_drag_delta(
 /// live なフルサイズ cache、ロード済みサムネイル、退去後も残るページ寸法 cache の順で
 /// 参照する。一度も寸法が判明していないページだけは false（縦長）として扱うが、判明済みの
 /// 寸法はテクスチャ退去で失わないため、同じ items 世代で既知から未知へは後退しない。
-fn is_landscape(
+/// 分割するか、しないならその理由。
+///
+/// **無言で「割らない」を返さない。** 実機で「分割を選んだのにページがつながったまま」
+/// という報告が出たとき、原因が「寸法待ち」なのか「そもそも縦長」なのかが分からず、
+/// ログに何も残っていなかった (2026-08-25)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SplitDecision {
+    /// 分割する。判明した寸法を添える。
+    Split { w: u32, h: u32 },
+    /// 縦長なので分割しない。これは確定した答え。
+    NotLandscape { w: u32, h: u32 },
+    /// **まだ寸法が分からない**ので分割しない。一時的で、届けば割れる。
+    DimensionsUnknown,
+    /// 静止画ページではない (動画 / 音声 / フォルダ等)。
+    NotAStillPage,
+}
+
+impl SplitDecision {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Split { .. } => "split",
+            Self::NotLandscape { .. } => "not_landscape",
+            Self::DimensionsUnknown => "dimensions_unknown",
+            Self::NotAStillPage => "not_a_still_page",
+        }
+    }
+
+    fn dims(self) -> Option<(u32, u32)> {
+        match self {
+            Self::Split { w, h } | Self::NotLandscape { w, h } => Some((w, h)),
+            Self::DimensionsUnknown | Self::NotAStillPage => None,
+        }
+    }
+}
+
+/// 表示判断に使える寸法を優先順に探す。
+///
+/// **見つからないことがある** (まだ読み込んでいない / テクスチャが退去した)。
+/// 見開きのペアリングでは「分からない = 横長でない」で困らないが、分割では
+/// 「まだ分からないので割らない」と「縦長だから割らない」が別の意味を持つので、
+/// 判定と探索を分けてある。
+fn known_page_dims(
     idx: usize,
-    rotation: crate::rotation_db::Rotation,
     fs_cache: &ItemsGenerationMap<FsCacheEntry>,
     thumbnails: &[ThumbnailState],
     page_dims_cache: &crate::page_dims::PageDimsCache,
     items_generation: u64,
-) -> bool {
+) -> Option<(u32, u32)> {
     // フルサイズキャッシュから判定
-    if let Some((w, h)) = fs_cache.get(&idx).and_then(fs_cache_entry_page_dims) {
-        return crate::rotation_db::landscape_after_rotation(w, h, rotation);
+    if let Some(dims) = fs_cache.get(&idx).and_then(fs_cache_entry_page_dims) {
+        return Some(dims);
     }
     // サムネイルから判定
     if let Some(ThumbnailState::Loaded {
@@ -8176,18 +8271,27 @@ fn is_landscape(
         ..
     }) = thumbnails.get(idx)
     {
-        if let Some((w, h)) = (*layout_dims).or(*source_dims) {
-            return crate::rotation_db::landscape_after_rotation(w, h, rotation);
+        if let Some(dims) = (*layout_dims).or(*source_dims) {
+            return Some(dims);
         }
         let width = u32::try_from(tex.size()[0]).unwrap_or(u32::MAX);
         let height = u32::try_from(tex.size()[1]).unwrap_or(u32::MAX);
-        return crate::rotation_db::landscape_after_rotation(width, height, rotation);
+        return Some((width, height));
     }
     // live texture が退去済みでも、一度判明した同世代の寸法は忘れない。
-    if let Some((w, h)) = page_dims_cache.get(items_generation, idx) {
-        return crate::rotation_db::landscape_after_rotation(w, h, rotation);
-    }
-    false
+    page_dims_cache.get(items_generation, idx)
+}
+
+fn is_landscape(
+    idx: usize,
+    rotation: crate::rotation_db::Rotation,
+    fs_cache: &ItemsGenerationMap<FsCacheEntry>,
+    thumbnails: &[ThumbnailState],
+    page_dims_cache: &crate::page_dims::PageDimsCache,
+    items_generation: u64,
+) -> bool {
+    known_page_dims(idx, fs_cache, thumbnails, page_dims_cache, items_generation)
+        .is_some_and(|(w, h)| crate::rotation_db::landscape_after_rotation(w, h, rotation))
 }
 
 fn fs_cache_entry_page_dims(entry: &FsCacheEntry) -> Option<(u32, u32)> {
@@ -8353,15 +8457,50 @@ fn build_spread_display_units_with_predicates(
 /// ペア可能種別、表紙位相、横長ページ境界、RTL の左右反転を fullscreen と同じ
 /// `SpreadDisplayUnit::spread_pair` へ通す。`is_landscape` は一覧生成側が既存 catalog の
 /// source dimensions から解決し、未確定は fullscreen と同じく縦長扱いにする。
+/// リモートへ返す 1 つの表示単位。
+///
+/// **分割中は同じ index が 2 つの単位に現れる**ので、index だけでは識別子にならない
+/// (端末側の位置照合は `(anchor, slice)` の組で行う)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RemotePageGroupSpec {
+    pub(crate) indices: Vec<usize>,
+    pub(crate) slice: crate::page_split::PageSlice,
+}
+
+impl RemotePageGroupSpec {
+    fn whole(indices: Vec<usize>) -> Self {
+        Self {
+            indices,
+            slice: crate::page_split::PageSlice::Full,
+        }
+    }
+}
+
 pub(crate) fn build_remote_spread_page_groups(
     items: &[GridItem],
     spread_mode: SpreadMode,
     is_landscape: &[bool],
-) -> Vec<Vec<usize>> {
+) -> Vec<RemotePageGroupSpec> {
     let visible = (0..items.len()).collect::<Vec<_>>();
     let nav = build_image_reading_indices(items, &visible);
+    // 分割は本体と**同じステップ列**から作る。並べ替えの規則を 2 か所に持たない。
+    if let Some(direction) = crate::page_split::SplitDirection::from_spread_mode(spread_mode) {
+        return crate::page_split::presentation_steps(&nav, direction, |_, idx| {
+            is_spread_pairable_item(items.get(idx))
+                && is_landscape.get(idx).copied().unwrap_or(false)
+        })
+        .into_iter()
+        .map(|step| RemotePageGroupSpec {
+            indices: vec![step.source_idx],
+            slice: step.slice,
+        })
+        .collect();
+    }
     if !spread_mode.is_spread() {
-        return nav.into_iter().map(|idx| vec![idx]).collect();
+        return nav
+            .into_iter()
+            .map(|idx| RemotePageGroupSpec::whole(vec![idx]))
+            .collect();
     }
     build_spread_display_units_with_predicates(
         &nav,
@@ -8372,10 +8511,21 @@ pub(crate) fn build_remote_spread_page_groups(
     )
     .into_iter()
     .map(|unit| match unit.spread_pair(spread_mode) {
-        SpreadPair::Single => vec![unit.anchor_idx()],
-        SpreadPair::Double { left, right } => vec![left, right],
+        SpreadPair::Single => RemotePageGroupSpec::whole(vec![unit.anchor_idx()]),
+        SpreadPair::Double { left, right } => RemotePageGroupSpec::whole(vec![left, right]),
     })
     .collect()
+}
+
+/// 本体の左右を、リモートの protocol 型へ写す。
+pub(crate) fn remote_page_slice(
+    slice: crate::page_split::PageSlice,
+) -> mimageviewer_ipc::RemotePageSlice {
+    match slice {
+        crate::page_split::PageSlice::Full => mimageviewer_ipc::RemotePageSlice::Full,
+        crate::page_split::PageSlice::Left => mimageviewer_ipc::RemotePageSlice::Left,
+        crate::page_split::PageSlice::Right => mimageviewer_ipc::RemotePageSlice::Right,
+    }
 }
 
 fn append_spread_display_units_until(
@@ -9160,6 +9310,13 @@ pub(crate) enum FsPageNav {
     Target(usize),
     /// 見開き表示の先頭 / 末尾に、その入力 1 回で到達した。
     Boundary { at_end: bool },
+    /// 横長分割での移動先。**同じページの反対側も、別ページも同じ変種で表す**
+    /// (`PresentationStep` が元ページと左右の両方を持つ)。
+    ///
+    /// `Target(usize)` を `{ idx, slice }` へ広げなかったのは、見開きの「表示ユニットの
+    /// 先頭」と分割の「ページの片側」が別の概念で、既存の分岐とテストがその形に
+    /// 依存しているため。
+    Split(crate::page_split::PresentationStep),
 }
 
 impl FsPageNav {
@@ -9567,12 +9724,28 @@ pub fn draw_music_panel_reach_snapshot_fixture(
 impl App {
     /// live なフルスクリーン cache から、現在世代で判明済みのページ寸法を回収する。
     /// cache 自体は小さな先読み窓なので、フレーム冒頭に 1 回だけ走査する。
-    pub(crate) fn harvest_page_dims_from_fs_cache(&mut self) {
+    /// 表示できるページの寸法を `page_dims_cache` へ集める。
+    ///
+    /// **表示できる経路は 2 つある。** live な `fs_cache` と、`fs_cache` が無くても
+    /// 復元できる retained PDF composite。以前は前者しか収穫しておらず、後者だけで
+    /// 表示しているページは「画面に出ているのに寸法が分からない」ままだった。
+    /// 通常は他の判定がそれで困らないが、横長分割は寸法が要るので効かなくなる
+    /// (PDF を開き直して items 世代が変わると `page_dims_cache` も失効するため、
+    /// サムネイル未読込と重なると供給源がゼロになる)。
+    pub(crate) fn harvest_page_dims(&mut self) {
         let generation = self.items_generation;
         for (&idx, entry) in &self.fs_cache {
             if let Some(dims) = fs_cache_entry_page_dims(entry) {
                 self.page_dims_cache.record(generation, idx, dims);
             }
+        }
+        // retained composite は現在ページを表示するための経路なので、そのページだけ見る。
+        let retained = self.fullscreen_idx.and_then(|idx| {
+            self.retained_pdf_page_source_dims(idx)
+                .map(|dims| (idx, dims))
+        });
+        if let Some((idx, dims)) = retained {
+            self.page_dims_cache.record(generation, idx, dims);
         }
     }
 
@@ -9591,6 +9764,221 @@ impl App {
             &self.page_dims_cache,
             self.items_generation,
         )
+    }
+
+    /// 分割を織り込んだ表示ステップ列。分割モードでなければ `None`。
+    ///
+    /// 分割するのは「静止画」かつ「保存回転を反映して横長」のページ。**縦横比の判定は
+    /// 見開きのペアリングと同じ `is_landscape` を使う** (分割のために読み直さない)。
+    ///
+    /// 自由回転中はページ単位ではなく**分割そのものを止める**。自由回転は保存しない
+    /// App 全体の一時値で、`effective_bbox` がその間だけ部分矩形を降ろすため、
+    /// 分割したまま描くと左右が同じ絵になる。毎回組み直すので、戻せば分割も戻る。
+    fn build_presentation_steps_for_nav(
+        &mut self,
+        nav: &[usize],
+    ) -> Option<Vec<crate::page_split::PresentationStep>> {
+        let direction = self.split_direction_now()?;
+        // `get_rotations_for_indices` が mutable なのは DB 未読分を memoize するため。
+        // fs_cache / thumbnails の借用より先に nav 全体を取る (見開き側と同じ順序)。
+        let rotations = self.get_rotations_for_indices(nav);
+        let this = &*self;
+        Some(crate::page_split::presentation_steps(
+            nav,
+            direction,
+            |nav_pos, idx| {
+                this.page_splits_with_rotation(
+                    idx,
+                    rotations
+                        .get(nav_pos)
+                        .copied()
+                        .unwrap_or(crate::rotation_db::Rotation::None),
+                )
+            },
+        ))
+    }
+
+    /// いま分割が効いているか。効いていればその向き。
+    ///
+    /// **ページによらない条件だけ**をここで見る。ページごとの条件は
+    /// [`Self::page_splits_with_rotation`]。
+    ///
+    /// - 自由回転中は止める。`effective_bbox` がその間だけ部分矩形を降ろすので、
+    ///   分割したまま描くと左右が同じ絵になる。保存しない一時値なので戻せば分割も戻る。
+    ///
+    /// 連結読み中も分割する。同じステップ列から段を組むので、送りと並びが食い違わない。
+    fn split_direction_now(&self) -> Option<crate::page_split::SplitDirection> {
+        let direction = crate::page_split::SplitDirection::from_spread_mode(self.spread_mode)?;
+        if self.fs_free_rotation.abs() > TRANSFORM_EPSILON {
+            return None;
+        }
+        Some(direction)
+    }
+
+    /// このページが分割対象か。**縦横比の判定は見開きのペアリングと同じ `is_landscape`**
+    /// を使う (分割のために読み直さない)。回転は呼び出し側が渡す。
+    fn page_splits_with_rotation(
+        &self,
+        idx: usize,
+        rotation: crate::rotation_db::Rotation,
+    ) -> bool {
+        matches!(
+            self.split_decision(idx, rotation),
+            SplitDecision::Split { .. }
+        )
+    }
+
+    /// 分割するか / しないなら理由。**「まだ寸法が分からない」と「縦長だから」を分ける。**
+    ///
+    /// 混ぜると「たまに割れない」が観測できない。前者は一時的で、寸法が届けば割れる。
+    fn split_decision(&self, idx: usize, rotation: crate::rotation_db::Rotation) -> SplitDecision {
+        if !is_spread_pairable_item(self.items.get(idx)) {
+            return SplitDecision::NotAStillPage;
+        }
+        let Some((w, h)) = known_page_dims(
+            idx,
+            &self.fs_cache,
+            &self.thumbnails,
+            &self.page_dims_cache,
+            self.items_generation,
+        ) else {
+            return SplitDecision::DimensionsUnknown;
+        };
+        if crate::rotation_db::landscape_after_rotation(w, h, rotation) {
+            SplitDecision::Split { w, h }
+        } else {
+            SplitDecision::NotLandscape { w, h }
+        }
+    }
+
+    /// 表示中のページと分割モードから、左右の記憶を辻褄の合う値へ寄せる。
+    ///
+    /// ページを開く入口 (一覧・しおり・検索・シークバー・履歴・Ctrl+↑↓) は多く、その
+    /// すべてに「左右を戻す」を足すと必ずどれか漏れる。**表示側で 1 か所そろえる。**
+    /// 分割していないページや分割 OFF では `Full` に戻すので、記憶が居残らない。
+    fn reconcile_fullscreen_page_slice(&mut self, fs_idx: usize) {
+        let Some(direction) = self.split_direction_now() else {
+            self.fullscreen_page_slice = crate::page_split::PageSlice::Full;
+            self.note_split_decision(fs_idx, None);
+            return;
+        };
+        let rotation = self.get_rotation(fs_idx);
+        let decision = self.split_decision(fs_idx, rotation);
+        self.note_split_decision(fs_idx, Some(decision));
+        if matches!(decision, SplitDecision::Split { .. }) {
+            if !self.fullscreen_page_slice.is_half() {
+                self.fullscreen_page_slice = direction.first();
+            }
+        } else {
+            self.fullscreen_page_slice = crate::page_split::PageSlice::Full;
+        }
+    }
+
+    /// 表示中ページの分割判断を、**変わったときだけ** 1 行残す。
+    ///
+    /// 毎フレーム出すとログが埋まるので、対象ページか理由が変わった瞬間だけ書く。
+    /// これがあると「分割を選んだのにつながったまま」の原因が、寸法待ちなのか
+    /// 縦長なのかを後から切り分けられる。
+    fn note_split_decision(&mut self, fs_idx: usize, decision: Option<SplitDecision>) {
+        let stamp = decision.map(|d| (fs_idx, d));
+        if self.last_split_decision == stamp {
+            return;
+        }
+        self.last_split_decision = stamp;
+        let Some(decision) = decision else {
+            return;
+        };
+        let dims = decision
+            .dims()
+            .map(|(w, h)| format!("{w}x{h}"))
+            .unwrap_or_else(|| "unknown".to_string());
+        crate::logger::log(format!(
+            "[split] idx={fs_idx} decision={} dims={dims} rotation={:?} mode={:?}",
+            decision.reason(),
+            self.get_rotation(fs_idx),
+            self.spread_mode
+        ));
+    }
+
+    /// このページへ渡す部分矩形。**分割中は分割が勝ち、表示トリムは使わない。**
+    ///
+    /// `content_bbox` は 1 つしか渡せないので併用できない。左右の解釈をここ 1 か所に
+    /// 集約し、描画・ナビゲータ・ルーペで別々に解かない。
+    ///
+    /// トリムをどう出すかは**呼び出し側の事情**なので、解決済みの値を受け取る。
+    /// 経路によって回転ページのトリムを落とす / 落とさないが違っており、ここで
+    /// 一律に決めると、分割と関係のない振る舞いを変えてしまう。
+    pub(crate) fn fs_page_content_bbox(
+        &self,
+        idx: usize,
+        rotation: crate::rotation_db::Rotation,
+        trim: Option<egui::Rect>,
+    ) -> Option<egui::Rect> {
+        match self.active_page_slice_for(idx) {
+            Some(slice) => Some(slice.source_bbox(rotation)),
+            None => trim,
+        }
+    }
+
+    /// このページを今どちら側で見ているか。分割していなければ `None`。
+    ///
+    /// 記憶している左右が今のページのものとは限らない (モードを切り替えた直後など) ので、
+    /// **表示中のページであること**も併せて確かめる。
+    ///
+    /// ページ全体を対象にする編集ツールが画面を持っている間は `None`。左右の記憶は消さない
+    /// ので、ツールを抜ければ元の半分へ戻る。
+    fn active_page_slice_for(&self, idx: usize) -> Option<crate::page_split::PageSlice> {
+        (self.spread_mode.is_split()
+            && self.fullscreen_idx == Some(idx)
+            && self.fullscreen_page_slice.is_half()
+            && !self.page_edit_tool_owns_canvas())
+        .then_some(self.fullscreen_page_slice)
+    }
+
+    /// ページ全体を対象にする編集ツールが画面を持っているか。
+    ///
+    /// マスク・注釈・切り取り枠・補正レイヤーは**分割前の画像**へ記録されるので、これらの
+    /// ツールへ入ったら分割を掛けたままにしない (半分だけを見ながら全体に効く編集をすると、
+    /// 見えていない側を触れないまま保存することになる)。
+    ///
+    /// 分析モードとルーペは「見る」ための機能なので対象外。半分のまま見えてよい
+    /// (2026-08-26 の実機確認で、この 2 つは現状の見え方でよいと確認済み)。
+    pub(crate) fn page_edit_tool_owns_canvas(&self) -> bool {
+        self.erase_mode
+            || self.conceal_mode
+            || self.text_mode
+            || self.local_adjust_mode
+            || self.export_crop_mode
+    }
+
+    /// 分割中のページ送り。ステップ列の中を 1 つ動かす。
+    ///
+    /// 現在位置は `(fullscreen_idx, fullscreen_page_slice)` で引く。見つからないときは
+    /// 分割方向の最初の半分へ倒す —— 寸法が届いてステップ列が変わった直後など、
+    /// 記憶している左右が列に無いことがある。
+    fn split_page_nav(
+        &self,
+        steps: &[crate::page_split::PresentationStep],
+        fs_idx: usize,
+        dir: i32,
+    ) -> FsPageNav {
+        let at = steps
+            .iter()
+            .position(|step| step.source_idx == fs_idx && step.slice == self.fullscreen_page_slice)
+            .or_else(|| crate::page_split::landing_step(steps, fs_idx));
+        let Some(at) = at else {
+            return FsPageNav::Delta(dir);
+        };
+        let moved = if dir > 0 {
+            crate::page_split::step_forward(steps, at)
+        } else {
+            crate::page_split::step_backward(steps, at)
+        };
+        match moved {
+            crate::page_split::StepMove::AtEnd => FsPageNav::Boundary { at_end: dir > 0 },
+            crate::page_split::StepMove::WithinPage { to }
+            | crate::page_split::StepMove::ToAnotherPage { to } => FsPageNav::Split(to),
+        }
     }
 
     #[cfg(test)]
@@ -10304,7 +10692,11 @@ impl App {
             egui::vec2(placement.w.max(1.0), placement.h.max(1.0)),
         );
         let image_rect = self.fullscreen_media_rect(full_rect, idx, false);
-        let content_bbox = self.view_trim_single_content_bbox(idx);
+        // **凍結ウィンドウも分割を通す。**非アクティブなウィンドウはこの snapshot から描くので、
+        // ここを通し忘れると、ウィンドウが非アクティブになった瞬間に半分が全体へ戻る
+        // (2026-08-26 の実機報告)。トリムの扱いは従来どおり (回転時の可否を変えない)。
+        let trim = self.view_trim_single_content_bbox(idx);
+        let content_bbox = self.fs_page_content_bbox(idx, rotation, trim);
         let draw_rect = fs_image_draw_rect_for_size(
             image_rect,
             texture_size,
@@ -11346,7 +11738,7 @@ impl App {
                     .any(|window| window.id == id)
                 {
                     let viewport_id = Self::detached_image_window_viewport_id(id);
-                    self.adopt_deferred_detached_window_hwnd_after_callback(id, viewport_id);
+                    self.adopt_deferred_detached_window_hwnd_after_callback(ctx, id, viewport_id);
                 }
             }
             crate::app::DeferredDetachedImageWindowEvent::Frame {
@@ -11368,7 +11760,7 @@ impl App {
                 };
                 if self.detached_window_hwnd_alive_for_window_id(id).is_none() {
                     let viewport_id = Self::detached_image_window_viewport_id(id);
-                    self.adopt_deferred_detached_window_hwnd_after_callback(id, viewport_id);
+                    self.adopt_deferred_detached_window_hwnd_after_callback(ctx, id, viewport_id);
                 }
                 let window = self.detached_image_windows[window_pos].clone();
                 let window_placement =
@@ -11379,7 +11771,7 @@ impl App {
                 } else if viewport_close_requested {
                     batch.close_ids.push(id);
                 }
-                let can_activate = window.can_activate();
+                let can_activate = self.detached_window_can_activate(window.id);
                 let focus_activation_raw = focused && !window.focused_last_frame;
                 let focus_edge = focused != window.focused_last_frame;
                 if (viewport_close_requested || bar_close_requested || focus_edge)
@@ -11401,7 +11793,7 @@ impl App {
                         window.activation_armed,
                         window.activation_ready_frame,
                         self.frame_counter,
-                        window.has_paused_bundle(),
+                        self.detached_window_context_is_at_rest(window.id),
                         window.reopen_descriptor.is_some(),
                         window.reopen_sync_stamp.is_some()
                     ));
@@ -11482,7 +11874,7 @@ impl App {
             .detached_image_windows
             .iter()
             .find(|window| window.id == window_id)
-            .map(crate::app::DetachedImageWindowSnapshot::right_drag_context)
+            .map(|window| self.right_drag_context_for_window_id(window.id))
         else {
             self.cancel_detached_right_drag_owner(window_id, "right_drag_snapshot_missing");
             return;
@@ -11694,14 +12086,14 @@ impl App {
                 self.log_detached_image_window_debug(format!(
                     "passive_activate_committed id={id} passive_windows={} active_context={}",
                     self.detached_image_windows.len(),
-                    self.active_detached_viewer_context_present()
+                    self.active_detached_context_is_at_rest()
                 ));
                 break;
             } else {
                 self.log_detached_image_window_debug(format!(
                     "passive_activate_failed id={id} passive_windows={} active_context={}",
                     self.detached_image_windows.len(),
-                    self.active_detached_viewer_context_present()
+                    self.active_detached_context_is_at_rest()
                 ));
             }
         }
@@ -11839,7 +12231,7 @@ impl App {
             self.log_detached_image_window_debug(format!(
                 "pending_close ids={pending_close_ids:?} passive_windows={} active_context={}",
                 self.detached_image_windows.len(),
-                self.active_detached_viewer_context_present()
+                self.active_detached_context_is_at_rest()
             ));
             crate::dwm_transitions::disable_transitions_for_thread_windows();
         }
@@ -11867,8 +12259,8 @@ impl App {
                  host={} title={:?}",
                     self.frame_counter,
                     window.id,
-                    window.can_activate(),
-                    window.has_paused_bundle(),
+                    self.detached_window_can_activate(window.id),
+                    self.detached_window_context_is_at_rest(window.id),
                     window.reopen_descriptor.is_some(),
                     window.reopen_sync_stamp.is_some(),
                     window.texture.size_vec2().x,
@@ -12108,7 +12500,10 @@ impl App {
             );
             let right_drag_guide = egui_owns_right_drag
                 .then(|| {
-                    self.right_drag_guide_for_owner(right_drag_owner, window.right_drag_context())
+                    self.right_drag_guide_for_owner(
+                        right_drag_owner,
+                        self.right_drag_context_for_window_id(window.id),
+                    )
                 })
                 .flatten();
             let ui_scale = self.settings.ui_scale_factor;
@@ -12214,6 +12609,7 @@ impl App {
             });
             #[cfg(windows)]
             self.register_detached_window_hwnd_after_show(
+                ctx,
                 window.id,
                 "passive",
                 viewport_id,
@@ -12249,15 +12645,14 @@ impl App {
             } else if viewport_close_requested {
                 render_batch.close_ids.push(window.id);
             }
-            let can_activate = self
-                .detached_image_windows
-                .iter()
-                .any(|candidate| candidate.id == window.id && candidate.can_activate());
+            let can_activate = self.detached_image_windows.iter().any(|candidate| {
+                candidate.id == window.id && self.detached_window_can_activate(candidate.id)
+            });
             let actual_has_bundle = self
                 .detached_image_windows
                 .iter()
                 .find(|candidate| candidate.id == window.id)
-                .is_some_and(|candidate| candidate.has_paused_bundle());
+                .is_some_and(|candidate| self.detached_window_context_is_at_rest(candidate.id));
             let focus_activation_raw = focused_now && !window.focused_last_frame;
             let user_activation = primary_released;
             let focus_edge = focused_now != window.focused_last_frame;
@@ -12331,7 +12726,7 @@ impl App {
                     "passive_activate_queued id={} via=pointer passive_windows={} active_context={}",
                     window.id,
                     self.detached_image_windows.len(),
-                    self.active_detached_viewer_context_present()
+                    self.active_detached_context_is_at_rest()
                 ));
                 render_batch.activate_ids.push(window.id);
             }
@@ -13066,6 +13461,7 @@ impl App {
             #[cfg(windows)]
             if let Some(window_id) = keep_alive_window_id {
                 self.register_detached_window_hwnd_after_show(
+                    ctx,
                     window_id,
                     "keep_alive_holdover",
                     fs_id,
@@ -13193,22 +13589,29 @@ impl App {
             return;
         }
 
-        // The backstop is called after the normal active renderer has returned, so the active
-        // detached owner is normally parked in `active_detached_viewer_context`. Mount the whole
-        // bundle before resolving the title, display texture, holdover latch, adjustments, or
-        // generation-scoped paint resources. Looking those up on the main sibling would combine
-        // an active detached session/viewport with another context's indexed state.
-        //
-        // `None` also has a legitimate meaning: callers already inside
-        // `with_active_detached_viewer_context` have the owner mounted directly on `App`. The
-        // alive/session checks above are the strongest existing distinction from a genuinely
-        // missing owner; do not add another detached sentinel merely for this hand-off.
-        if self.active_detached_viewer_context_present() {
-            let _ = self.with_active_detached_viewer_context(|app| {
-                app.render_active_detached_viewport_backstop_mounted(ctx, viewport_id);
-            });
-        } else {
-            self.render_active_detached_viewport_backstop_mounted(ctx, viewport_id);
+        // The binding table answers both ownership and residence for this viewport. Mounting an
+        // at-rest owner keeps all indexed state together; an already-mounted owner renders
+        // directly without a second pass.
+        let window_id = self
+            .active_detached_session
+            .expect("live detached viewport must have an active session")
+            .window_id;
+        match self.locate_window_context(window_id) {
+            Some((_, ContextResidence::AtRest)) => {
+                self.with_window_viewer_context(window_id, |app| {
+                    app.render_active_detached_viewport_backstop_mounted(ctx, viewport_id);
+                })
+                .expect("at-rest backstop owner must be mountable");
+            }
+            Some((_, ContextResidence::Mounted)) => {
+                self.render_active_detached_viewport_backstop_mounted(ctx, viewport_id);
+            }
+            Some((owner, residence)) => {
+                panic!(
+                    "active detached backstop window {window_id} belongs to {owner:?} in {residence:?}"
+                );
+            }
+            None => panic!("active detached backstop window {window_id} has no context binding"),
         }
     }
 
@@ -13309,7 +13712,11 @@ impl App {
                 viewport_id,
             )
         });
-        ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx, _class| {
+        // Separate our drawing from what eframe does around it (render + present of
+        // the child viewport), because only one of the two can be made cheaper.
+        let show_t0 = std::time::Instant::now();
+        let inner_ms = ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx, _class| {
+            let inner_t0 = std::time::Instant::now();
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                 .show(vp_ctx, |ui| {
@@ -13343,9 +13750,28 @@ impl App {
                         self.draw_fs_display_unit_holdover(ui, vp_ctx, image_rect, unit);
                     }
                 });
+            inner_t0.elapsed().as_secs_f64() * 1000.0
         });
+        let show_ms = show_t0.elapsed().as_secs_f64() * 1000.0;
+        if crate::perf::is_enabled() && show_ms >= 20.0 {
+            crate::perf::event(
+                "ui",
+                "detached_backstop_viewport_show",
+                None,
+                self.frame_counter as u64,
+                &[
+                    ("show_ms", serde_json::Value::from(show_ms)),
+                    ("inner_ui_ms", serde_json::Value::from(inner_ms)),
+                    (
+                        "eframe_ms",
+                        serde_json::Value::from((show_ms - inner_ms).max(0.0)),
+                    ),
+                ],
+            );
+        }
         if let Some(window_id) = backstop_window_id {
             self.register_detached_window_hwnd_after_show(
+                ctx,
                 window_id,
                 "keepalive_backstop",
                 viewport_id,
@@ -13475,6 +13901,26 @@ impl App {
         Some(self.ensure_fs_page_load(idx))
     }
 
+    /// Cycles this thread has actually executed. Dividing by wall time tells whether a
+    /// span burned CPU or waited: a busy span reports the machine's real clock rate, a
+    /// blocked one reports a small fraction of it (backlog 1.129).
+    #[cfg(windows)]
+    fn thread_cycles_now() -> u64 {
+        let mut cycles = 0u64;
+        unsafe {
+            let _ = windows::Win32::System::WindowsProgramming::QueryThreadCycleTime(
+                windows::Win32::System::Threading::GetCurrentThread(),
+                &mut cycles,
+            );
+        }
+        cycles
+    }
+
+    #[cfg(not(windows))]
+    fn thread_cycles_now() -> u64 {
+        0
+    }
+
     pub(crate) fn render_fullscreen_viewport(&mut self, ctx: &egui::Context) {
         let Some(fs_idx) = self.fullscreen_idx else {
             // in-window 静止画モードで PDF/ZIP enumerate defer 中:
@@ -13490,7 +13936,8 @@ impl App {
             return;
         };
 
-        self.harvest_page_dims_from_fs_cache();
+        self.harvest_page_dims();
+        self.reconcile_fullscreen_page_slice(fs_idx);
 
         let page_turn_decision = self.fs_page_turn_decision_for_frame(ctx, fs_idx);
         let stop_page_needs_load =
@@ -13777,6 +14224,24 @@ impl App {
         let mut fs_central_ms = 0.0_f64;
         let mut fs_vst_manager_ms = 0.0_f64;
         let mut fs_closure_ms = 0.0_f64;
+        // `outer_ms` (total - closure) is 39ms while a video plays in a detached
+        // window and our own drawing is 0.3ms. Say whether that is the work this
+        // function does before painting, or what eframe does to show the child
+        // viewport (backlog 1.122).
+        let fs_prep_ms;
+        let fs_body_ms;
+        let fs_body_cycles;
+        let mut fs_closure_cycles = 0u64;
+        // The 38ms is CPU, not a wait. egui keeps ONE font atlas per Context while two
+        // viewports can ask for different pixels_per_point; a full atlas rebuild would
+        // look exactly like this. Record what the atlas is doing on both sides, plus the
+        // viewport size, so a per-pixel cost is distinguishable (backlog 1.129).
+        let mut fs_vp_ppp = 0.0_f32;
+        let mut fs_vp_atlas = [0usize; 2];
+        let mut fs_vp_atlas_fill = 0.0_f32;
+        let mut fs_vp_galleys = 0usize;
+        let mut fs_vp_size = [0.0_f32; 2];
+        let mut fs_vp_max_tex = 0usize;
         let fs_state_is_video = state.is_video;
         // 動画は native presenter が独立 HWND に描画するので、egui 側 viewport は
         // 黒 backdrop のみ。ここで GPU 経路かどうかを区別する必要は無い。
@@ -13811,6 +14276,7 @@ impl App {
         {
             let mut render_fs_body = |ctx: &egui::Context, embedded: bool| {
                 let closure_t0 = std::time::Instant::now();
+                let closure_cycles_t0 = Self::thread_cycles_now();
                 let setup_t0 = std::time::Instant::now();
                 // フルスクリーンビューポート内のイベントで IME 状態を更新する
                 // (メインビューポートとは別のイベントキューなのでここで呼ぶ必要がある)。
@@ -15504,7 +15970,20 @@ impl App {
 
                 self.fs_prev_foreground_hwnd = current_foreground_hwnd();
                 fs_closure_ms = closure_t0.elapsed().as_secs_f64() * 1000.0;
+                fs_closure_cycles = Self::thread_cycles_now().saturating_sub(closure_cycles_t0);
+                fs_vp_ppp = ctx.pixels_per_point();
+                let vp_rect = ctx.viewport_rect();
+                fs_vp_size = [vp_rect.width(), vp_rect.height()];
+                fs_vp_max_tex = ctx.input(|i| i.max_texture_side);
+                ctx.fonts(|f| {
+                    fs_vp_atlas = f.font_image_size();
+                    fs_vp_atlas_fill = f.font_atlas_fill_ratio();
+                    fs_vp_galleys = f.num_galleys_in_cache();
+                });
             };
+            fs_prep_ms = fs_viewport_t0.elapsed().as_secs_f64() * 1000.0;
+            let fs_body_t0 = std::time::Instant::now();
+            let fs_body_cycles_t0 = Self::thread_cycles_now();
             if embedded {
                 // in-window 静止画: メインウィンドウの egui ctx に直接描画する。
                 render_fs_body(main_ctx, true);
@@ -15524,10 +16003,13 @@ impl App {
                 #[cfg(windows)]
                 self.mark_active_detached_viewport_rendered_if_matches(fs_id);
             }
+            fs_body_ms = fs_body_t0.elapsed().as_secs_f64() * 1000.0;
+            fs_body_cycles = Self::thread_cycles_now().saturating_sub(fs_body_cycles_t0);
         }
         #[cfg(windows)]
         if let Some(window_id) = active_render_window_id {
             self.register_detached_window_hwnd_after_show(
+                ctx,
                 window_id,
                 "active_render",
                 fs_id,
@@ -15581,6 +16063,55 @@ impl App {
                     ("total_ms", serde_json::Value::from(fs_viewport_ms)),
                     ("outer_ms", serde_json::Value::from(fs_outer_ms)),
                     ("closure_ms", serde_json::Value::from(fs_closure_ms)),
+                    ("prep_ms", serde_json::Value::from(fs_prep_ms)),
+                    ("body_cycles", serde_json::Value::from(fs_body_cycles)),
+                    ("vp_ppp", serde_json::Value::from(fs_vp_ppp)),
+                    ("vp_max_tex", serde_json::Value::from(fs_vp_max_tex as i64)),
+                    (
+                        "main_max_tex",
+                        serde_json::Value::from(main_ctx.input(|i| i.max_texture_side) as i64),
+                    ),
+                    (
+                        "main_ppp",
+                        serde_json::Value::from(main_ctx.pixels_per_point()),
+                    ),
+                    ("vp_w", serde_json::Value::from(fs_vp_size[0])),
+                    ("vp_h", serde_json::Value::from(fs_vp_size[1])),
+                    ("vp_atlas_w", serde_json::Value::from(fs_vp_atlas[0] as i64)),
+                    ("vp_atlas_h", serde_json::Value::from(fs_vp_atlas[1] as i64)),
+                    ("vp_atlas_fill", serde_json::Value::from(fs_vp_atlas_fill)),
+                    ("vp_galleys", serde_json::Value::from(fs_vp_galleys as i64)),
+                    (
+                        "main_atlas_fill",
+                        serde_json::Value::from(main_ctx.fonts(|f| f.font_atlas_fill_ratio())),
+                    ),
+                    (
+                        "main_galleys",
+                        serde_json::Value::from(main_ctx.fonts(|f| f.num_galleys_in_cache()) as i64),
+                    ),
+                    ("closure_cycles", serde_json::Value::from(fs_closure_cycles)),
+                    (
+                        "body_cycles_per_ms",
+                        serde_json::Value::from(if fs_body_ms > 0.0 {
+                            fs_body_cycles as f64 / fs_body_ms
+                        } else {
+                            0.0
+                        }),
+                    ),
+                    (
+                        "closure_cycles_per_ms",
+                        serde_json::Value::from(if fs_closure_ms > 0.0 {
+                            fs_closure_cycles as f64 / fs_closure_ms
+                        } else {
+                            0.0
+                        }),
+                    ),
+                    ("body_ms", serde_json::Value::from(fs_body_ms)),
+                    (
+                        "eframe_show_ms",
+                        serde_json::Value::from((fs_body_ms - fs_closure_ms).max(0.0)),
+                    ),
+                    ("embedded_paint", serde_json::Value::from(embedded)),
                     (
                         "closure_unaccounted_ms",
                         serde_json::Value::from(fs_closure_unaccounted_ms),
@@ -17576,7 +18107,7 @@ impl App {
         if dir == 0 {
             return FsPageNav::None;
         }
-        if !self.spread_mode.is_spread() {
+        if !self.spread_mode.is_spread() && !self.spread_mode.is_split() {
             return FsPageNav::Delta(base_delta);
         }
         let fs_idx = match self.fullscreen_idx {
@@ -17591,7 +18122,7 @@ impl App {
         self.spread_page_nav_for_indices(&nav, fs_idx, base_delta)
     }
 
-    fn spread_page_nav_for_indices(
+    pub(crate) fn spread_page_nav_for_indices(
         &mut self,
         nav: &[usize],
         fs_idx: usize,
@@ -17600,6 +18131,9 @@ impl App {
         let dir = base_delta.signum();
         if dir == 0 {
             return FsPageNav::None;
+        }
+        if let Some(steps) = self.build_presentation_steps_for_nav(nav) {
+            return self.split_page_nav(&steps, fs_idx, dir);
         }
         if !self.spread_mode.is_spread() {
             return FsPageNav::Delta(base_delta);
@@ -19410,7 +19944,7 @@ impl App {
                     focused,
                     current_foreground_hwnd(),
                     self.detached_viewer_host_debug_state(),
-                    self.active_detached_viewer_context_present(),
+                    self.active_detached_context_is_at_rest(),
                     event_count,
                     key_pressed_count,
                     key_v_event,
@@ -19448,17 +19982,7 @@ impl App {
         // レーティング 1〜5 / 解除 (既定: F1〜F6)
         let rating_key = self.keymap.consume_rating_action(ctx, false);
         if let Some(stars) = rating_key {
-            // Undo 用にフルスクリーン現在ページの before/after を 1 件分積む。
-            let before = self.rating_cache.get(&fs_idx).copied().unwrap_or(0);
             if self.set_rating(fs_idx, stars) {
-                if before != stars {
-                    let summary = if stars == 0 {
-                        "★解除".to_string()
-                    } else {
-                        format!("★{stars}")
-                    };
-                    self.capture_rating_undo(vec![(fs_idx, before, stars)], summary);
-                }
                 // レーティング変更でフィルタ境界を跨ぐ可能性があるので visible_indices 再計算。
                 self.rebuild_visible_indices();
                 if stars == 0 {
@@ -19568,6 +20092,10 @@ impl App {
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsSpreadRtl);
         let key_5 =
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsSpreadRtlCover);
+        let key_8 =
+            !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsSpreadSplitLtr);
+        let key_9 =
+            !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsSpreadSplitRtl);
         let key_6 = !fs_music_view_active
             && self
                 .keymap
@@ -19721,6 +20249,10 @@ impl App {
             Some(SpreadMode::Rtl)
         } else if key_5 {
             Some(SpreadMode::RtlCover)
+        } else if key_8 {
+            Some(SpreadMode::SplitLtr)
+        } else if key_9 {
+            Some(SpreadMode::SplitRtl)
         } else {
             None
         };
@@ -19736,8 +20268,12 @@ impl App {
                 3
             } else if key_4 {
                 4
-            } else {
+            } else if key_5 {
                 5
+            } else if key_8 {
+                8
+            } else {
+                9
             };
             self.show_feedback_toast(format!("[{}:{}]", key_num, mode.label()));
         }
@@ -20193,7 +20729,8 @@ impl App {
         // 通常の左右キーによるページ移動だけは、ページ表示の綴じ方向かシークバーの
         // 実効方向かを設定で選べる。Ctrl/Shift+左右などの明示コマンドは従来どおり
         // ページ表示の綴じ方向を使い、この設定へ巻き込まない。
-        let page_rtl = self.spread_mode.is_rtl();
+        // 入力の左右は読み順で決める。ペア並び順 (`is_rtl`) は別の問い。
+        let page_rtl = self.spread_mode.advances_right_to_left();
         let seek_bar_rtl = self
             .settings
             .fullscreen_seek_direction
@@ -22605,8 +23142,10 @@ impl App {
                         // A recognized tap is an intentional discrete page turn,
                         // including in continuous reading. Use the same unit
                         // resolver as FsPageNext/FsPagePrev.
-                        let base =
-                            fullscreen_click_nav_delta_for_side(left, self.spread_mode.is_rtl());
+                        let base = fullscreen_click_nav_delta_for_side(
+                            left,
+                            self.spread_mode.advances_right_to_left(),
+                        );
                         page_nav = self.spread_page_nav(base);
                     }
                     crate::touch_input::TouchCommand::Zoom { factor, pivot } => {
@@ -23159,7 +23698,7 @@ impl App {
                                     let base = fullscreen_click_nav_base_delta(
                                         pos.x,
                                         full_rect.center().x,
-                                        self.spread_mode.is_rtl(),
+                                        self.spread_mode.advances_right_to_left(),
                                     );
                                     page_nav = self.spread_page_nav(base);
                                 }
@@ -23494,14 +24033,28 @@ impl App {
     /// ループ / 次フォルダ / 停止する。
     fn advance_slideshow(&mut self, ctx: &egui::Context, cur: usize) {
         let display_order = self.current_grid_order().to_vec();
-        let slide_nav = if self.spread_mode.is_spread() {
+        // **自動送りは、読み手が自分で送るのと同じ歩幅にする。**分割を無視すると、
+        // スライドショーを始めた瞬間に分割が解除されて画面が大きく変わってしまう
+        // (2026-08-26 の実機判断)。
+        let slide_nav = if self.spread_mode.is_spread() || self.spread_mode.is_split() {
             let image_indices = build_image_reading_indices(&self.items, &display_order);
             self.spread_page_nav_for_indices(&image_indices, cur, 1)
         } else {
             FsPageNav::Delta(1)
         };
+        // 同じページの反対側はページ遷移ではない。テクスチャも読み込みも同じなので、
+        // 遷移の機構を通さずに左右だけ動かす (通常のページ送りと同じ扱い)。
+        if let FsPageNav::Split(step) = slide_nav
+            && step.source_idx == cur
+        {
+            self.fullscreen_page_slice = step.slice;
+            ctx.request_repaint();
+            return;
+        }
         let next_idx = match slide_nav {
             FsPageNav::Target(idx) => Some(idx),
+            // 別ページの半分へ。着地してから左右を確定する。
+            FsPageNav::Split(step) => Some(step.source_idx),
             FsPageNav::Delta(delta) => {
                 crate::ui_helpers::adjacent_slideshow_idx(&self.items, &display_order, cur, delta)
             }
@@ -23511,6 +24064,13 @@ impl App {
             // フォルダ内の次の静止画系アイテムへ前進。
             self.slideshow_anchor_idx = None;
             self.open_fullscreen_from_slideshow_navigation(ctx, idx);
+            // **着地できたときだけ**左右を確定する。断られた場合に左右だけ動くと、
+            // 今見えているページの反対側が出る (通常のページ送りと同じ約束)。
+            if let FsPageNav::Split(step) = slide_nav
+                && self.fullscreen_idx == Some(step.source_idx)
+            {
+                self.fullscreen_page_slice = step.slice;
+            }
             self.selected = Some(idx);
             self.scroll_to_selected = true;
             return;
@@ -24431,6 +24991,33 @@ impl App {
                 if !self.fs_navigation_sequence_blocks_new_target() {
                     self.land_still_page_navigation_target(ctx, fs_idx, new_idx);
                 }
+            } else if let FsPageNav::Split(step) = page_nav {
+                if step.source_idx == fs_idx {
+                    // 同じページの反対側。テクスチャも読み込みも同じものなので、
+                    // ページ遷移の機構を通さない。通すと再読込と表示確定が余計に走る。
+                    self.fullscreen_page_slice = step.slice;
+                    self.update_fs_page_turn_burst_after_navigation(ctx, fs_idx, None);
+                    ctx.request_repaint();
+                } else if !self.fs_navigation_sequence_blocks_new_target() {
+                    let accept_rendition = self.update_fs_page_turn_burst_after_navigation(
+                        ctx,
+                        fs_idx,
+                        Some(step.source_idx),
+                    );
+                    if self.begin_fs_page_navigation_sequence(
+                        ctx,
+                        fs_idx,
+                        step.source_idx,
+                        accept_rendition,
+                    ) {
+                        self.land_still_page_navigation_target(ctx, fs_idx, step.source_idx);
+                    }
+                    // **着地できたときだけ**左右を確定する。遷移が断られた場合に
+                    // 左右だけ動くと、今見えているページの反対側が出る。
+                    if self.fullscreen_idx == Some(step.source_idx) {
+                        self.fullscreen_page_slice = step.slice;
+                    }
+                }
             } else if let FsPageNav::Target(new_idx) = page_nav {
                 let display_order = self.current_grid_order().to_vec();
                 let current_is_media = matches!(
@@ -24761,9 +25348,14 @@ impl App {
         pixel_grid_enabled: bool,
         fit_mode: FullscreenFitMode,
         fit_scale_limits: FullscreenFitScaleLimits,
-        // 余白カットフィット用の中身 bbox (正規化 0..1)。Some & rotation なしのとき適用。
+        // 余白カットフィット用の中身 bbox (正規化 0..1)。**表示トリムの値をそのまま渡す。**
+        // 分割中にどちらの半分を描くかは、この関数が自分で解決する (下記)。
         content_bbox: Option<egui::Rect>,
     ) -> Option<DisplayedImageTransform> {
+        // 分割中は分割の矩形が勝つ。**呼び出し側に解決させない。** 呼び出し側で
+        // 解決する形にしていたとき、3 か所あるうち通常表示の 1 か所を通し忘れ、
+        // ページ送りだけ半分ずつ進んで絵は全体のまま、という状態になった (実機で発覚)。
+        let content_bbox = self.fs_page_content_bbox(page_idx, rotation, content_bbox);
         let using_full_texture = tex.is_some();
         let thumb_resource = thumb_tex
             .cloned()
@@ -24787,7 +25379,9 @@ impl App {
                         .flatten()
                 }
             };
-            let fit_bbox = fs_image_fit_bbox(rotation, free_rotation_rad, content_bbox);
+            // 「切り抜きが効いているか」だけを見る。clip の要否と pixel grid の可否に使う。
+            let fit_bbox =
+                crate::displayed_image_transform::effective_bbox(free_rotation_rad, content_bbox);
             let transform_input = DisplayedImageTransformInput {
                 page_idx,
                 viewport_rect: full_rect,
@@ -25524,10 +26118,8 @@ impl App {
     }
 
     pub(crate) fn update_reading_direction_from_spread_mode(&mut self, mode: SpreadMode) {
-        if mode.is_rtl() {
-            self.reading_direction = ReadingDirection::Rtl;
-        } else if matches!(mode, SpreadMode::Ltr | SpreadMode::LtrCover) {
-            self.reading_direction = ReadingDirection::Ltr;
+        if let Some(direction) = mode.reading_direction() {
+            self.reading_direction = direction;
         }
     }
 
@@ -25608,7 +26200,17 @@ impl App {
         let image_indices = build_image_reading_indices(&self.items, &display_order);
         let mut image_units = Vec::new();
 
-        if self.spread_mode.is_spread() {
+        if let Some(steps) = self.build_presentation_steps_for_nav(&image_indices) {
+            // 分割中は 1 つの元ページが 2 段になる。**並べる順序はページ送りと同じもの**
+            // なので、同じステップ列から作る (連結用に別の列を持たない)。
+            image_units.extend(steps.into_iter().map(|step| {
+                if step.slice.is_half() {
+                    ContinuousReadingUnitSpec::half(step.source_idx, step.slice)
+                } else {
+                    ContinuousReadingUnitSpec::pages(step.source_idx, vec![step.source_idx])
+                }
+            }));
+        } else if self.spread_mode.is_spread() {
             let spread_mode = self.spread_mode;
             image_units.extend(
                 self.build_spread_display_units_for_nav(&image_indices)
@@ -25629,7 +26231,13 @@ impl App {
             );
         }
 
-        let pos = image_units.iter().position(|unit| unit.contains_idx(idx))?;
+        // 同じ元ページの段が 2 つ並ぶので、まず左右まで一致する段を探す。
+        // 見つからない (分割していない / 見開きで idx が 2 ページ目) 場合だけ元 index で拾う。
+        let slice = self.fullscreen_page_slice;
+        let pos = image_units
+            .iter()
+            .position(|unit| unit.is_step(idx, slice))
+            .or_else(|| image_units.iter().position(|unit| unit.contains_idx(idx)))?;
         Some((image_units, pos))
     }
 
@@ -25710,7 +26318,10 @@ impl App {
             .map(|(screen_pos, idx)| {
                 let base = self.vertical_reading_base_size(idx, fallback, prefer_processed);
                 let rotation = self.get_rotation(idx);
-                let content_bbox = if rotation.is_none() {
+                let content_bbox = if unit.slice.is_half() {
+                    // 分割中は分割が勝つ (表示トリムとは併用しない)。
+                    Some(unit.slice.source_bbox(rotation))
+                } else if rotation.is_none() {
                     if let Some((left_bbox, right_bbox)) = paired_content_bboxes {
                         if screen_pos == 0 {
                             left_bbox
@@ -25735,6 +26346,7 @@ impl App {
                     width: base.x.max(1.0),
                     height: base.y.max(1.0),
                     content_bbox,
+                    rotation,
                     logical_scale: 1.0,
                 }
             })
@@ -26351,12 +26963,19 @@ impl App {
         )
     }
 
+    /// 連結読みのスクロールで現在の段が変わったときの再アンカー。
+    ///
+    /// `new_slice` は移った先の段の左右。**分割中は元 index が変わらないまま段だけが
+    /// 変わる**ので、これを書かないと次のフレームで現在位置が元の段に解決され、
+    /// スクロールが引き戻されて先へ進めなくなる (実機で発生)。
+    /// 分割していない段は `Full` を渡す。
     pub(crate) fn reanchor_continuous_reading_viewer(
         &mut self,
         ctx: &egui::Context,
         old_offsets: &[f32],
         new_pos: usize,
         new_idx: usize,
+        new_slice: crate::page_split::PageSlice,
         history_trigger: crate::app::HistoryTrigger,
     ) {
         if self.items.get(new_idx).is_none() {
@@ -26373,6 +26992,7 @@ impl App {
         self.fs_vertical_scroll =
             vertical_reading_reanchor_scroll(self.fs_vertical_scroll, old_offsets, new_pos);
         self.fullscreen_idx = Some(new_idx);
+        self.fullscreen_page_slice = new_slice;
         self.sync_main_selection_from_viewer_idx(new_idx);
         self.record_book_resume(new_idx);
         self.record_reading_history(new_idx, history_trigger);
@@ -26661,11 +27281,13 @@ impl App {
             && let Some(unit) = units.get(new_pos)
         {
             let new_idx = unit.anchor_idx;
+            let new_slice = unit.slice;
             self.reanchor_continuous_reading_viewer(
                 ctx,
                 &offsets,
                 new_pos,
                 new_idx,
+                new_slice,
                 history_trigger,
             );
         }
@@ -34355,6 +34977,12 @@ impl App {
         // Phase 5.5: S キーでタイルモード トグル (動画モード限定)。画像モードの
         // S (スライドショー) とは handle_video_input 先行 consume で分離する。
         let tile_key = self.keymap.consume_action(ctx, KeyAction::VideoTileMode);
+        #[cfg(windows)]
+        let seek_strip_action = self.keymap.consume_first_action(
+            ctx,
+            FS_VIDEO_ACTIVE_SCOPES,
+            &VIDEO_SEEK_STRIP_ACTIONS,
+        );
         // F キーでフレームレート / Perf オーバーレイのトグル (動画モード限定)。
         // 以前 P を使っていたが、P は「現在フレームをピン留め」に再割り当てしたので
         // 移動した (F = Frames / FPS の mnemonic)。画像モードの F は未使用なので
@@ -34384,7 +35012,13 @@ impl App {
         // 横取りする。
         // (タイルモード = video_tile_* は native presenter 前提の Windows 専用機能)
         #[cfg(windows)]
-        let escape_for_tile = self.video_tile_mode_active
+        let escape_for_seek_strip = self.video_seek_strip_is_open()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        #[cfg(not(windows))]
+        let escape_for_seek_strip = false;
+        #[cfg(windows)]
+        let escape_for_tile = !escape_for_seek_strip
+            && self.video_tile_mode_active
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         #[cfg(not(windows))]
         let escape_for_tile = false;
@@ -34547,6 +35181,11 @@ impl App {
         }
         #[cfg(not(windows))]
         let _ = tile_key;
+        #[cfg(windows)]
+        if let Some(action) = seek_strip_action {
+            self.apply_video_seek_strip_action(fs_idx, action);
+            self.sync_native_video_seek_strip(ctx, fs_idx);
+        }
         if perf_key {
             self.video_perf_overlay_visible = !self.video_perf_overlay_visible;
             // perf overlay は native presenter が描画する。フラグを反転するだけでなく、
@@ -34654,9 +35293,12 @@ impl App {
                 }
             }
         }
-        // ESC は タイルモード中のみキャッチして close。フルスクリーン解脱は呼び出し側
-        // (handle_image_keys 後段) の通常 ESC で扱う。
-        if escape_for_tile {
+        // ESC はシークストリップ / タイルモード中だけ先にキャッチして close。
+        // フルスクリーン解脱は呼び出し側 (handle_image_keys 後段) の通常 ESC で扱う。
+        if escape_for_seek_strip {
+            #[cfg(windows)]
+            self.close_video_seek_strip(crate::video::seek_strip::SeekStripCloseCause::Escape);
+        } else if escape_for_tile {
             #[cfg(windows)]
             self.close_video_tile_mode();
         }
@@ -45589,6 +46231,71 @@ mod tests {
         assert_spread_seek_units_cover_nav_and_endpoints(&nav, &units);
     }
 
+    /// リモートへ返す分割の表示単位。**同じ index の group が 2 つ並ぶ。**
+    ///
+    /// 端末側はこれを `(anchor, slice)` の組で照合する。index だけで解決すると
+    /// 必ず先頭へ吸われる (本体側で 2 回踏んだのと同じ形)。
+    #[test]
+    fn a_landscape_page_becomes_two_remote_groups() {
+        use crate::page_split::PageSlice;
+
+        let items = (0..3)
+            .map(|k| GridItem::Image(std::path::PathBuf::from(format!("p{k}.jpg"))))
+            .collect::<Vec<_>>();
+        let mut landscape = vec![false; items.len()];
+        landscape[1] = true;
+
+        let groups = build_remote_spread_page_groups(&items, SpreadMode::SplitLtr, &landscape);
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| (group.indices.clone(), group.slice))
+                .collect::<Vec<_>>(),
+            vec![
+                (vec![0], PageSlice::Full),
+                (vec![1], PageSlice::Left),
+                (vec![1], PageSlice::Right),
+                (vec![2], PageSlice::Full),
+            ]
+        );
+
+        // 右→左では左右の順序だけが変わる。元ページの順序は変わらない。
+        let rtl = build_remote_spread_page_groups(&items, SpreadMode::SplitRtl, &landscape);
+        assert_eq!(
+            rtl.iter().map(|group| group.slice).collect::<Vec<_>>(),
+            vec![
+                PageSlice::Full,
+                PageSlice::Right,
+                PageSlice::Left,
+                PageSlice::Full
+            ]
+        );
+        assert_eq!(
+            rtl.iter()
+                .map(|group| group.indices.clone())
+                .collect::<Vec<_>>(),
+            groups
+                .iter()
+                .map(|group| group.indices.clone())
+                .collect::<Vec<_>>()
+        );
+
+        // 分割は見開きではない。1 group に 2 ページを入れない。
+        assert!(groups.iter().all(|group| group.indices.len() == 1));
+    }
+
+    /// リモート group の index だけを取り出す。左右は分割モードの専用テストで確かめる。
+    fn remote_group_indices(
+        items: &[GridItem],
+        spread_mode: SpreadMode,
+        landscape: &[bool],
+    ) -> Vec<Vec<usize>> {
+        build_remote_spread_page_groups(items, spread_mode, landscape)
+            .into_iter()
+            .map(|group| group.indices)
+            .collect()
+    }
+
     fn spread_unit_summary(units: &[SpreadDisplayUnit]) -> Vec<(usize, Vec<usize>)> {
         units
             .iter()
@@ -45728,23 +46435,23 @@ mod tests {
         let landscape = [false, false, false, true, false, false, false];
 
         assert_eq!(
-            build_remote_spread_page_groups(&items, SpreadMode::Ltr, &landscape),
+            remote_group_indices(&items, SpreadMode::Ltr, &landscape),
             vec![vec![0, 1], vec![2], vec![3], vec![4, 5], vec![6]]
         );
         assert_eq!(
-            build_remote_spread_page_groups(&items, SpreadMode::LtrCover, &landscape),
+            remote_group_indices(&items, SpreadMode::LtrCover, &landscape),
             vec![vec![0], vec![1, 2], vec![3], vec![4, 5], vec![6]]
         );
         assert_eq!(
-            build_remote_spread_page_groups(&items, SpreadMode::Rtl, &landscape),
+            remote_group_indices(&items, SpreadMode::Rtl, &landscape),
             vec![vec![1, 0], vec![2], vec![3], vec![5, 4], vec![6]]
         );
         assert_eq!(
-            build_remote_spread_page_groups(&items, SpreadMode::RtlCover, &landscape),
+            remote_group_indices(&items, SpreadMode::RtlCover, &landscape),
             vec![vec![0], vec![2, 1], vec![3], vec![5, 4], vec![6]]
         );
         assert_eq!(
-            build_remote_spread_page_groups(&items, SpreadMode::Single, &landscape),
+            remote_group_indices(&items, SpreadMode::Single, &landscape),
             (0..7).map(|index| vec![index]).collect::<Vec<_>>()
         );
     }
@@ -47276,6 +47983,71 @@ mod tests {
     }
 
     #[test]
+    /// 連結読みの段は、**寸法計算では表示空間**の部分矩形を使う。
+    ///
+    /// `width` / `height` は回転後の寸法なのに `content_bbox` は元画像空間なので、
+    /// そのまま掛けると 90 度回転したページで縦横を取り違える。
+    #[test]
+    fn a_continuous_page_measures_its_crop_in_display_space() {
+        use crate::rotation_db::Rotation;
+
+        // 元画像の左半分。回転していなければ幅が半分。
+        let left_half = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(0.5, 1.0));
+        let upright = ContinuousReadingPageSize {
+            idx: 0,
+            width: 100.0,
+            height: 200.0,
+            content_bbox: Some(left_half),
+            rotation: Rotation::None,
+            logical_scale: 1.0,
+        };
+        assert!((upright.visible_width() - 50.0).abs() < 1e-3);
+        assert!((upright.visible_height() - 200.0).abs() < 1e-3);
+
+        // 同じ矩形でも 90 度回転して表示していれば、画面では**高さ**が半分になる。
+        let turned = ContinuousReadingPageSize {
+            rotation: Rotation::Cw90,
+            ..upright.clone()
+        };
+        assert!(
+            (turned.visible_width() - 100.0).abs() < 1e-3,
+            "{:?}",
+            turned.bbox()
+        );
+        assert!(
+            (turned.visible_height() - 100.0).abs() < 1e-3,
+            "{:?}",
+            turned.bbox()
+        );
+
+        // 部分矩形が無ければ回転にかかわらず全体。
+        let whole = ContinuousReadingPageSize::full(0, 100.0, 200.0);
+        assert!((whole.visible_width() - 100.0).abs() < 1e-3);
+        assert!((whole.visible_height() - 200.0).abs() < 1e-3);
+    }
+
+    /// 分割中は同じ元ページの段が 2 つ並ぶので、現在位置は左右まで見て選ぶ。
+    #[test]
+    fn a_split_page_needs_the_half_to_pick_its_row() {
+        use crate::page_split::PageSlice;
+
+        let left = ContinuousReadingUnitSpec::half(5, PageSlice::Left);
+        let right = ContinuousReadingUnitSpec::half(5, PageSlice::Right);
+
+        // 元 index はどちらの段にも属する (テクスチャと先読みは元ページ単位で足りる)。
+        assert!(left.contains_idx(5) && right.contains_idx(5));
+        // 左右まで見ればちょうど 1 つに決まる。
+        assert!(left.is_step(5, PageSlice::Left));
+        assert!(!left.is_step(5, PageSlice::Right));
+        assert!(right.is_step(5, PageSlice::Right));
+        assert!(!right.is_step(6, PageSlice::Right));
+
+        // 分割していない段は `Full` として一致する。
+        let whole = ContinuousReadingUnitSpec::pages(5, vec![5]);
+        assert!(whole.is_step(5, PageSlice::Full));
+        assert!(!whole.is_step(5, PageSlice::Left));
+    }
+
     fn continuous_single_page_rect_aligns_trimmed_content_inside_virtual_unit() {
         let unit_rect =
             egui::Rect::from_center_size(egui::pos2(100.0, 50.0), egui::vec2(80.0, 100.0));
@@ -47288,6 +48060,7 @@ mod tests {
                     egui::pos2(0.1, 0.0),
                     egui::pos2(0.9, 1.0),
                 )),
+                rotation: crate::rotation_db::Rotation::None,
                 logical_scale: 1.0,
             }],
             width: 80.0,
@@ -47320,6 +48093,7 @@ mod tests {
                     width: 100.0,
                     height: 120.0,
                     content_bbox: Some(left_bbox),
+                    rotation: crate::rotation_db::Rotation::None,
                     logical_scale: 1.0,
                 },
                 ContinuousReadingPageSize {
@@ -47327,6 +48101,7 @@ mod tests {
                     width: 100.0,
                     height: 120.0,
                     content_bbox: Some(right_bbox),
+                    rotation: crate::rotation_db::Rotation::None,
                     logical_scale: 1.0,
                 },
             ],

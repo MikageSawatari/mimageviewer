@@ -40,11 +40,13 @@
 | 本ブックマーク DB | `std::thread` (`book-bookmarks`) + mpsc | App-global 1 | `book_bookmarks.db` の追加 / コンテナ別一覧 / 全件一覧 / 削除 / path migration を直列処理する。製本 worker は最初のファイル変更前に、最終 path mapping と永続 temp 名・copy/move identity を含む filesystem plan を `Prepared` journal として保存する。`Applying` の step ごとに進捗を保存し、全 filesystem step 完了後の `FilesystemCommitted` だけ bookmark migration と journal 消去を同一 transaction で commit する。通常エラーは先に `RollingBack` を保存し、全 inverse step の成功を証明できた場合だけ journal を消す。起動時は `Prepared` を no-op 破棄し、`Applying` / `RollingBack` を実 filesystem 状態から冪等再開する。ただし同一プロセスで writer が生存中の job は active ownership registry で回復対象外にし、複数 service が実行中操作を crash 残存と誤認しない。DB busy / parse / I/O failure の entry と診断は消さず次回 retry に残す。UI は正規化前の表示値と identity を request で送り、result event からメモリ上の現在本一覧を更新する。SQLite open / schema 作成を含め UI スレッドでは行わない |
 | 横断ブックマーク一覧 | `std::thread` (`bookmark-browser-build` / `bookmark-browser-delete`) + mpsc | 一覧再読込または削除ごとに最大 1 | `video_bookmarks.db` と `book_bookmarks.db` を共通 read model にまとめ、登録日時順ソートと元コンテナ / ページの存在確認を行う。動画・音声の種別判定、保存済み WebP の decode、ZIP entry / PDF page の確認も worker 側。結果は通常の `App.items` グリッドと同順の sidecar row として install し、保存済み WebP も通常のフレーム当たり texture upload 上限を通す。削除 worker は DB 行だけを削除し、元メディアへ filesystem 操作を行わない。UI は在メモリの media / book subtype filter と通常 facet だけを評価する |
 | ブックマーク状態フィルタ | `std::thread` (`bookmark-presence-build`) + mpsc | 状態条件の初回使用または CRUD 後に最大 1 | 動画・音声 path、本 container / page identity の軽量集合だけを両 DB から読み、通常一覧へ渡す。行ごとのフィルタ判定は在メモリ。snapshot完了時はmain / active detached / paused detachedを順にmountし、各context所有の表示集合をDB I/Oなしで再計算する。スマートフォルダは既存 prepare worker 内で同じ snapshot を読み、UI スレッドから DB を開かない |
-| 明示メタ情報転送 | `std::thread` (`metadata-export` / `metadata-import-preview` / `metadata-import` / `metadata-import-refresh`) + mpsc + `AtomicBool` | 完全モーダル中にimport本体と終端refreshを直列で最大 1 | `mimageviewer.meta.miv` の再帰列挙、JSON / media-kind / file-size検証・原子的exportと、評価 / タグ / ブックマーク / 見開き / 表示トリム / 回転 / ページ編集 / サムネピンDBのimportをUI thread外で行う。変換archiveはsource containerとcache ZIP pageのaliasをportable identityへ変換する。列挙は`read_dir`を逐次消費し、メタ情報DBは一時scope表とpath indexで列挙済み項目だけを読む。開始前にpending view-trimをメモリsnapshotとしてworkerへ渡す。main / active detached / paused detachedのXMP rating readerは取消し、legacy tag seedは完了結果をcontextへ適用してから、既存metadata writer / rename migrationとともにdrainする。転送完了・開始失敗・待機cancel後はXMP readerを全contextへ再生成する。dirtyな`mimageviewer.dat`群とAppのTagsDb connectionも所有権ごとimport workerへ移してflush / journal-mode handoff / 再openを行い、いずれかのflush失敗時はDB更新を開始しない。importは15ストアをattached connectionへまとめ、256項目 / 実record 64 MiB / 500 msの外側transactionと項目SAVEPOINTを使う。target照合はファイル本体を読まず相対path / kind / sizeを使う。family削除はindex range seek、sidecar syncはfolder / section単位、file種別外storeはskipする。異常終了では現在batch、項目エラーでは当該SAVEPOINTだけをrollbackし、明示cancelでは現在batchもcommitする。DB更新中は既存UI cacheを変更しない。終端時だけ影響viewer contextの現在キー、folder-pin identity、legacy seed pathを3 ms / 2048項目ずつcompact snapshot化し、refresh workerがDBを一括再取得する。タグcacheは未タグキーも空Vecの読込済みsentinelとして含める。page-state importは永続edit-preview cacheのclear ACKを待ち、main / active detached / paused detachedへ失効を伝播し、旧/新編集状態の和に当たるmaterialized thumbnailを再要求する。UIは世代・window identity一致後、各contextをmount中にcache swapとvisible/facet/details/selection再計算、およびXMP rating hydration / legacy tag seed workerの再生成を行う。外部snapshotによる表示再計算はApp-globalなfacet scope / suppressionを同期せず、不一致ならモーダル中に再取得する。video pin削除も全対象動画の再生成として表現する。終端refreshはimport本体と別cancel tokenを持ち、終了・破棄時はcontext/DB chunk境界で中断して巨大な途中結果をworker側でdropする。本体と終端refreshの段階時間は常時logと任意の構造化perf logへ記録する |
+| 明示メタ情報転送 | `std::thread` (`metadata-export` / `metadata-import-preview` / `metadata-import` / `metadata-import-refresh`) + mpsc + `AtomicBool` | 完全モーダル中にimport本体と終端refreshを直列で最大 1 | `mimageviewer.meta.miv` の再帰列挙、JSON / media-kind / file-size検証・原子的exportと、評価 / タグ / ブックマーク / 見開き / 表示トリム / 回転 / ページ編集 / サムネピンDBのimportをUI thread外で行う。変換archiveはsource containerとcache ZIP pageのaliasをportable identityへ変換する。列挙は`read_dir`を逐次消費し、メタ情報DBは一時scope表とpath indexで列挙済み項目だけを読む。開始前にpending view-trimをメモリsnapshotとしてworkerへ渡す。main / active detached / paused detachedのXMP rating readerは取消し、legacy tag seedは完了結果をcontextへ適用してから、既存metadata writer / rename migrationとともにdrainする。転送完了・開始失敗・待機cancel後はXMP readerを全contextへ再生成する。dirtyな`mimageviewer.dat`群とAppのTagsDb connectionも所有権ごとimport workerへ移してflush / journal-mode handoff / 再openを行い、いずれかのflush失敗時はDB更新を開始しない。importは15ストアをattached connectionへまとめ、256項目 / 実record 64 MiB / 500 msの外側transactionと項目SAVEPOINTを使う。target照合はファイル本体を読まず相対path / kind / sizeを使う。family削除はindex range seek、sidecar syncはfolder / section単位、file種別外storeはskipする。異常終了では現在batch、項目エラーでは当該SAVEPOINTだけをrollbackし、明示cancelでは現在batchもcommitする。DB更新中は既存UI cacheを変更しない。終端時だけ影響viewer contextの現在キー、folder-pin identity、legacy seed pathを3 ms / 2048項目ずつcompact snapshot化し、refresh workerがDBを一括再取得する。タグcacheは未タグキーも空Vecの読込済みsentinelとして含める。page-state importは永続edit-preview cacheのclear ACKを待ち、main / active detached / paused detachedへ失効を伝播し、旧/新編集状態の和に当たるmaterialized thumbnailを再要求する。UIは要求構築時に焼き込んだViewerContextIdのresidenceがMounted / AtRestで、かつitems generation一致後、各contextをmount中にcache swapとvisible/facet/details/selection再計算、およびXMP rating hydration / legacy tag seed workerの再生成を行う。mainも適用時のbindingではなく要求時のregistry.main()をidentityとして保持する。Retiredへの遅延結果はdebug記録だけで破棄し、Unknown / Building / Retiringは不変条件違反として診断して破棄する。外部snapshotによる表示再計算はApp-globalなfacet scope / suppressionを同期せず、不一致ならモーダル中に再取得する。video pin削除も全対象動画の再生成として表現する。終端refreshはimport本体と別cancel tokenを持ち、終了・破棄時はcontext/DB chunk境界で中断して巨大な途中結果をworker側でdropする。本体と終端refreshの段階時間は常時logと任意の構造化perf logへ記録する |
 | テキスト注釈ベイク | `std::thread` (`comic-bake`) + mpsc | 閲覧時最大 2 | Ctrl+T 注釈を final composite 上へ焼き込む。閲覧時は stamp 画像の cache miss デコードも worker 側で行い、完了時に `comic_stamp_cache` へ merge する。編集中はライブ追従を優先し、プレビュー解像度で同期ベイクする |
 | 音声出力 warm-up | `std::thread` (`cpal-warmup`) | 起動時 1 本 | WASAPI の初回 audio session 確立をバックグラウンドで済ませる。小さな無音 cpal stream を短時間だけ開いて閉じ、初回動画 open の UI スレッド停止を避ける |
 | 動画サムネイル | `std::thread` | 1 | Windows Shell API を逐次呼び出し |
 | シークサムネイル | `std::thread` (`video-thumb`) | 動画 1 つにつき 1 本 | desktop / mIV Remote の seek hover preview と左 jump panel warmup のサムネイル抽出。要求ごとの許容値で実 PTS cache を range 検索し、backward seek の着地点が範囲内なら採用、範囲外なら target まで進める。pending / in-flight は typed latest-wins state が所有する。初回 cache miss で同じ動画ファイルを別 `Input` と長寿命の補助 video decoder で開く。HW decode 有効時は FFmpeg-owned D3D11VA を優先し、RGBA 生成は CPU readback + swscale。失敗時は worker 内で SW decode にフォールバックし、本編 fast-swap の `LIVE_VIDEO_DECODE_THREADS` には入れない |
+| 動画シークストリップ画像 | `std::thread` (`video-seek-strip-thumbs`) | 開いている strip session につき最大 1 本 | サムネイルモードの索引解決、窓の SQLite/WebP 読み込み、未取得画像の抽出を latest-wins で行う。動画ごとに補助 decoder を長寿命化し、閉じる・動画切替・fullscreen 終了で session owner が cancel する。窓は 30 秒で未決着セルを typed timeout failure に確定し、UI / batch が同じ理由を表示する |
+| 動画シークストリップ波形 | `std::thread` (`video-seek-strip-wave`) | 開いている strip session につき最大 1 本 | 完成済み全尺解析があれば設定した可視時間窓を切り出し、無ければ同じ動画を 1 回だけ開く範囲 audio decoder で可視窓 + 0.75 秒 pre-roll だけを解析する。可視幅は 5 秒〜180 分の段階値 (既定 3 分)。bin 幅は時間窓 / 物理画素幅から選び、180 分でも解析 bin 数を画素数程度に抑える。最初の可視 raster 後に通常 3 倍、最大 3600 秒の保持 raster を作るが、可視幅が 60 分以上なら同幅の第2段階要求は出さない。§5.4 の粗い全尺ピーク列は未実装で、長時間段も現状は可視窓を 1 回デコードする。beat grid は作らず、pre-roll bins を除いた後に worker 内で RGBA 化する。file identity / 窓 / bin 幅 / 物理幅のメモリ内 8 件 LRU だけを持ち、永続 cache は作らない。設定変更時は旧 worker と LRU を cancel/drop し、旧 raster の表示用 Arc だけを新 first paint 到着まで session が保持する。要求は latest-wins、presenter は RGBA texture upload だけを行う |
 | 動画タイルサムネイル | `std::thread` (`video-tile-thumbs`) | S タイルモード 1 セッションにつき 1 本 | タイル表示用に N 個の絶対 PTS を順番に抽出する。キャッシュ hit 済み slot は FFmpeg open 前に埋め、残りだけ別 `Input` + 補助 video decoder で処理する。HW decode 有効時はシークサムネイルと同じ FFmpeg-owned D3D11VA を優先し、RGBA 生成は CPU readback + swscale。HW 初期化 / decode 失敗時は worker 内で SW decode にフォールバックし、本編 fast-swap の `LIVE_VIDEO_DECODE_THREADS` には入れない |
 | 動画 demux | `std::thread` (`video-demux`、= `run_decoder` の本体) | 動画 1 つにつき 1 本 | FFmpeg `Input` の packet を `video_pkt_tx` (bounded=32) / `audio_pkt_tx` (bounded=64) へ振り分ける。packet channel は `Packet/Eof`、seek の `Flush` は各 bounded=8 の `video_ctl_tx` / `audio_ctl_tx` へ分離し、decode 側は control を優先受信する。seek 要求は demux thread が単独 pull。packet 送信待ち中の新 seek は旧 packet を捨てて loop に戻る。thread panic は `info_tx(Err)` + `DecoderEvent::Failed` に変換する |
 | 動画 video decode | `std::thread` (`video-decode`、= `run_video_decode`) | 動画 1 つにつき 1 本 | `VideoPacketMsg::{Packet,Eof}` と別 channel の `VideoControlMsg::Flush` を受け、HW (D3D11VA + GPU blit) / SW (readback + swscale) で frame を生成して `video_tx` (bounded=8) へ送る。PLAYING の Full は drop 可、Loading/Buffering/Seeking の Full は pending frame を保持して cancel/seek-aware retry。Paused/Eof は park。mIV Remote video tap は decoded PTS / seek / preroll 確定後かつ GPU/CPU 分岐前で、D3D11 frame だけ producer 上で即時 SW download、SW frame は shallow-ref し、SW-only bounded queue へ `try_send` する。queue 内の decoder HW surface 上限は容量に関係なく 0、同期処理中は 1。満杯時は readback / ref 作成前に drop を計上する。stream scale / H.264 encode は将来の session worker 側 `VideoStreamEncoder` が行い、未接続時は一切走らない |
@@ -92,6 +94,10 @@ cancel する。Web 側も同時 2 件で、503
 進行中 prefetch へ相乗りした場合、その active entry は前景待機者数を持ち、先読み計画や別の
 foreground は前景待機者がいる間その共有通信を cancel しない。foreground 自身の cancel は
 共有 controller ではなく、その待機だけへ適用する。
+
+動画シークストリップ画像 worker は通常の keyframe-only 高速経路を維持し、NoFrame / decode /
+convert failure の素材だけ成功セルを維持したまま software full-frame + 1 raw index gap pre-roll へ
+file-local fallback する。close / 動画切替 / fullscreen 終了の cancel owner は変わらない。
 
 ## 2. スレッド間通信
 
@@ -272,7 +278,8 @@ Ctrl+↑↓ は複数の起点から発火し、DFS 完了時に異なる後処�
   `FolderPaneOpenPending`、`pending_folder_nav_steps`、`pending_folder_nav_mode`、
   `ViewerNavigationScope` を一式で所有する。main と
   `DetachedPhysical` の active independent 静止画窓は bundle swap で完全に分離され、
-  active detached の結果はその bundle を mount 中の
+  bundle は viewer context registry の slot だけに保管される。active detached の結果は
+  window binding から特定した context を registry transaction で mount 中の
   `update_active_detached_viewer_context` だけが poll / apply する。pause / Drop は
   cancel token を立て、遅延結果を sibling context へ持ち越さない。
 - 仮想一覧から通常画像を detached open するときは、親フォルダの `read_dir` / metadata scan を
@@ -754,10 +761,33 @@ analyze / metadata 取得はすべて同じ cache を通り、要求ごとに st
 `(path, password, mtime, file_size)` が完全一致した場合だけ document を再利用する。stat 失敗では
 保持 document を閉じ、古い内容を返さない。cache は 1 件固定で、時間窓や context epoch 解放は持たない。
 
-一方、**起動成功後に PDF / Susie worker が想定外終了しても、現在は自動 respawn しない**。
+一方、**起動成功後に PDF worker が想定外終了しても、現在は自動 respawn しない**。
 dispatcher は stdin/stdout の切断をその要求の Err として返すだけで、worker 数も補充しない。
-したがって、この節は起動後の自己回復を保証しない。respawn を追加する場合は、in-flight request の
-再送可否、worker_count と lane cap の更新、終了・cancel との競合を別設計として扱う必要がある。
+したがって、この節は PDF 側の起動後の自己回復を保証しない。respawn を追加する場合は、in-flight
+request の再送可否、worker_count と lane cap の更新、終了・cancel との競合を別設計として扱う。
+
+**Susie worker は自己回復する** (§1.120、2026-08-25)。スロットごとに以下を持つ:
+
+- `DispatcherExit::WorkerLost` — transport が切れた dispatcher は**即座に退役**する。
+  死んだ pipe を持ったまま共有キューから後続を取り続けると、失敗が即座に返る分だけ
+  生きているワーカーより速く job を吸う。`InvalidData` は含めない (ワーカーは生きている)。
+- `run_worker_slot` が backoff (200ms × 試行回数、上限 5 回) で同じスロットを作り直す。
+  **再起動回数は連続失敗で数える** (`restart_count_after_loss`)。1 件でも応答を返せた
+  ワーカーは働けていたので数え直す。累積で数えると、たまに落ちるプラグインでも
+  使い続けるうちに必ず枯渇する。
+- **クラッシュを起こした要求は再送しない。** その 1 件はエラーで返し、後続のためだけに
+  補充する。落とした対象 (`crashers`) はプールの生存期間だけ記憶し、二度と投げない。
+  これが無いと同じフォルダを開くたびに同じ画像でワーカーが死に続ける。
+- 最後のスロットが閉じたら `fail_pending_jobs_no_workers` がキューを排出し、以降の
+  enqueue も**積むのと同じロックの中で**断る。これが無いと UI が「読込中」で固着する。
+- 諦めた理由は `SlotExit` として抜けた場所で確定させ、**最後のスロットが諦めたときだけ**
+  one-shot notice を発行する (`should_notify_workers_gone`)。終了・再読み込みで畳んだ
+  場合は出さない。枠が 1 つ減っただけでも出さない (残りが処理を続けられる間、利用者に
+  できることが無い)。
+- 集計 (`SusieWorkerHealth`) は起動できた枠数・生存枠数・作り直し回数・打ち切り数・
+  落とした対象数・最後の失敗理由を持ち、環境設定の診断パネルと notice の両方がここだけを
+  読む。**起動できなかった** (`WorkerSpawnFailed`) と**起動したが尽きた**
+  (`WorkersExhausted`) を区別するために起動時の枠数を残す。
 
 **Susie プラグインの並列実行に関する注意**: Susie 画像プラグインは 1990〜2000 年代の
 レガシー規格で、並列実行 (特にプロセス跨ぎ) を想定していないプラグインが稀にある。

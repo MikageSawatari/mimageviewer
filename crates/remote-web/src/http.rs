@@ -4173,15 +4173,13 @@ fn requested_width(query: &[(String, String)]) -> Result<u32, ()> {
     })
 }
 
+/// **綴りの表をここに持たない。**protocol 側の `from_wire_name` へ委ねる。
+/// 手書きの表を置いていたため、分割モードを足したときにここだけ古いままになり、
+/// 端末からモードを選ぶと 400 が返っていた (2026-08-26)。
 fn parse_spread_mode(query: &[(String, String)]) -> Result<Option<RemoteSpreadMode>, ()> {
     match query_value(query, "spread")? {
         None => Ok(None),
-        Some("single") => Ok(Some(RemoteSpreadMode::Single)),
-        Some("ltr") => Ok(Some(RemoteSpreadMode::Ltr)),
-        Some("ltr_cover") => Ok(Some(RemoteSpreadMode::LtrCover)),
-        Some("rtl") => Ok(Some(RemoteSpreadMode::Rtl)),
-        Some("rtl_cover") => Ok(Some(RemoteSpreadMode::RtlCover)),
-        Some(_) => Err(()),
+        Some(name) => RemoteSpreadMode::from_wire_name(name).map(Some).ok_or(()),
     }
 }
 
@@ -5011,6 +5009,16 @@ mod tests {
             Some(RemoteReadingDirection::Rtl)
         );
         assert!(parse_force_single_page(&query).unwrap());
+        // 分割モードも受け付ける。ここが protocol と別の表だったため、端末から選ぶと
+        // 400 が返って分割が一切効かなかった (2026-08-26)。
+        assert_eq!(
+            parse_spread_mode(&parse_query("spread=split_ltr").unwrap()).unwrap(),
+            Some(RemoteSpreadMode::SplitLtr)
+        );
+        assert_eq!(
+            parse_spread_mode(&parse_query("spread=split_rtl").unwrap()).unwrap(),
+            Some(RemoteSpreadMode::SplitRtl)
+        );
         assert!(parse_spread_mode(&parse_query("spread=vertical").unwrap()).is_err());
         assert!(parse_force_single_page(&parse_query("single=true").unwrap()).is_err());
         assert!(parse_reading_direction(&parse_query("direction=vertical").unwrap()).is_err());

@@ -2257,6 +2257,9 @@ pub(super) fn draw_native_bar_lock_button(
         locked,
     );
     let resp = resp.hover_tip_dark(tooltip);
+    // 診断 (2026-08-25): 上の native click log と対で、egui が press を widget へ配ったかを見る。
+    // ポインタが矩形の中にある間は毎フレーム出す。press が届かないとき、egui がそもそも
+    // ポインタをこの widget の上だと思っていないのか、思っていて配らないのかを分ける。
     if resp.clicked() {
         commands.push(NativeOverlayCommand::ToggleBarLock { bar });
     }
@@ -2287,6 +2290,93 @@ pub(super) fn native_seek_bar_lock_button_rect(
         egui::pos2(overlay_width_points - side_pad - button_size, y),
         egui::vec2(button_size, button_size),
     )
+}
+
+pub(super) fn native_seek_strip_selector_button_rect(
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+) -> egui::Rect {
+    let lock = native_seek_bar_lock_button_rect(overlay_width_points, overlay_height_points);
+    egui::Rect::from_min_size(
+        egui::pos2(lock.min.x - lock.width() - 8.0, lock.min.y),
+        lock.size(),
+    )
+}
+
+/// Fixed HUD film-strip icon. Keep this vector-only: symbol/emoji glyphs have repeatedly produced
+/// tofu with user-selectable UI fonts.
+pub(super) fn draw_seek_strip_film_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    color: egui::Color32,
+) {
+    let icon = egui::Rect::from_center_size(rect.center(), rect.size() * 0.62);
+    let stroke = egui::Stroke::new(1.5, color);
+    painter.rect_stroke(icon, 2.0, stroke, egui::StrokeKind::Inside);
+    let band_h = icon.height() * 0.24;
+    painter.line_segment(
+        [
+            egui::pos2(icon.min.x, icon.min.y + band_h),
+            egui::pos2(icon.max.x, icon.min.y + band_h),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(icon.min.x, icon.max.y - band_h),
+            egui::pos2(icon.max.x, icon.max.y - band_h),
+        ],
+        stroke,
+    );
+    for fraction in [0.20_f32, 0.50, 0.80] {
+        let x = egui::lerp(icon.x_range(), fraction);
+        let hole_size = egui::vec2(icon.width() * 0.11, band_h * 0.48);
+        painter.rect_filled(
+            egui::Rect::from_center_size(egui::pos2(x, icon.min.y + band_h * 0.5), hole_size),
+            0.5,
+            color,
+        );
+        painter.rect_filled(
+            egui::Rect::from_center_size(egui::pos2(x, icon.max.y - band_h * 0.5), hole_size),
+            0.5,
+            color,
+        );
+    }
+    for fraction in [1.0_f32 / 3.0, 2.0 / 3.0] {
+        let x = egui::lerp(icon.x_range(), fraction);
+        painter.line_segment(
+            [
+                egui::pos2(x, icon.min.y + band_h),
+                egui::pos2(x, icon.max.y - band_h),
+            ],
+            egui::Stroke::new(1.0, color),
+        );
+    }
+}
+
+/// Waveform-state badge drawn over the fixed film-strip icon. Keep this vector-only so the
+/// button remains independent of symbol-font coverage.
+pub(super) fn draw_seek_strip_waveform_note(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    color: egui::Color32,
+) {
+    let scale = rect.width().min(rect.height()) * 0.28;
+    let head_radius = scale * 0.30;
+    let head = rect.center() + egui::vec2(scale * 0.35, scale * 0.45);
+    let stem_x = head.x + head_radius * 0.70;
+    let stem_top = egui::pos2(stem_x, head.y - scale * 1.35);
+    let stroke = egui::Stroke::new(1.7, color);
+
+    painter.circle_filled(head, head_radius, color);
+    painter.line_segment([egui::pos2(stem_x, head.y), stem_top], stroke);
+    painter.line_segment(
+        [
+            stem_top,
+            egui::pos2(stem_top.x + scale * 0.58, stem_top.y + scale * 0.48),
+        ],
+        stroke,
+    );
 }
 
 fn draw_overlay_info_icon(painter: &egui::Painter, rect: egui::Rect, click_to_show: bool) {
@@ -2997,26 +3087,26 @@ pub(super) fn draw_native_center_status(
     body: Option<&str>,
     is_error: bool,
 ) {
+    // Passive status only. It must occupy just the box it draws: an `Area` registers a widget
+    // at its own rect even with `interactable(false)`, and egui's hit test discards any widget a
+    // front widget in another layer fully contains - so a full-screen passive Area makes every
+    // HUD button under it unclickable while it shows. Same defect as the toast; see
+    // `draw_native_toast`. `interactable(false)` stays: it also keeps the box itself from eating
+    // the right-click release that closes a broken video.
+    let rect = native_center_status_rect(
+        overlay_width_points,
+        overlay_height_points,
+        title,
+        body.is_some(),
+    );
     egui::Area::new(egui::Id::new("native_video_center_status"))
         .order(egui::Order::Foreground)
-        .fixed_pos(egui::Pos2::ZERO)
-        // Passive status only. Keeping the full-screen Area interactable makes
-        // broken-video error/preparing overlays consume right-click release
-        // events before the fullscreen close handler can see them.
+        .fixed_pos(rect.min)
         .interactable(false)
         .show(ctx, |ui| {
-            let full_rect = egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(overlay_width_points, overlay_height_points),
-            );
-            ui.set_min_size(full_rect.size());
-            let painter = ui.painter();
-            let rect = native_center_status_rect(
-                overlay_width_points,
-                overlay_height_points,
-                title,
-                body.is_some(),
-            );
+            ui.set_min_size(rect.size());
+            let painter = ui.painter().clone();
+            let painter = &painter;
             painter.rect_filled(
                 rect,
                 8.0,
@@ -3076,49 +3166,52 @@ pub(super) fn draw_native_toast(
     if alpha <= 0.0 {
         return None;
     }
-    let mut drawn_rect = None;
-    // interactable(false) でこの Area がクリックイベントを奪わないようにする。
-    // 旧: set_min_size で画面全体を Area として確保していたため、トースト表示中は
-    //     overlay の他のボタン (ループ / 再生 / etc.) クリックがこの Area に消費されていた。
+    // **この Area は自分が描く矩形ぶんだけを占める。画面全体にしない。**
+    // egui の `Area` は `interactable(false)` でも自分の矩形にウィジェットを 1 つ登録する
+    // (sense が click から hover に下がるだけ)。そして egui の hit test は「別レイヤーの
+    // 手前のウィジェットに完全に覆われたウィジェット」を捨てる。画面全体を占める受動的な
+    // Area があると、その下の HUD ボタンがトースト表示中ずっと hover もクリックもできなく
+    // なる (実機報告 2026-08-25: 固定トグルのトースト直後、下部バーの鍵が 1 回目のクリック
+    // で反応しない)。`interactable(false)` だけでは足りず、矩形も実描画に合わせる必要がある。
+    let full_rect = egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(overlay_width_points, overlay_height_points),
+    );
+    let font = egui::FontId::proportional(if toast.centered { 24.0 } else { 16.0 });
+    let galley = ctx.fonts_mut(|fonts| {
+        fonts.layout_no_wrap(toast.text.clone(), font.clone(), egui::Color32::WHITE)
+    });
+    let padding = if toast.centered {
+        egui::vec2(28.0, 18.0)
+    } else {
+        egui::vec2(16.0, 10.0)
+    };
+    let max_w = (overlay_width_points - 40.0).max(160.0);
+    let size = egui::vec2(
+        (galley.size().x + padding.x * 2.0).min(max_w),
+        galley.size().y + padding.y * 2.0,
+    );
+    let rect = if toast.centered {
+        // 中央 (full_rect.center().y) はレジューム picker の二重円
+        // (半径 56) と完全に被る。HUD top バー (上端 ~60px) と picker top
+        // (center_y - 56) の間に収めるため、上から 30% の位置に置く。
+        // 最小 80px は極端に低い窓 (= 30% が HUD バーに食い込む) 用の床。
+        let centered_y = (full_rect.min.y + full_rect.height() * 0.30).max(full_rect.min.y + 80.0);
+        egui::Rect::from_center_size(egui::pos2(full_rect.center().x, centered_y), size)
+    } else {
+        egui::Rect::from_min_size(
+            egui::pos2(full_rect.max.x - size.x - 20.0, full_rect.min.y + 62.0),
+            size,
+        )
+    };
+    let area_rect = rect.expand(4.0);
     egui::Area::new(egui::Id::new("native_video_toast"))
         .order(egui::Order::Foreground)
-        .fixed_pos(egui::Pos2::ZERO)
+        .fixed_pos(area_rect.min)
         .interactable(false)
         .show(ctx, |ui| {
-            let full_rect = egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(overlay_width_points, overlay_height_points),
-            );
-            ui.set_min_size(full_rect.size());
+            ui.set_min_size(area_rect.size());
             let painter = ui.painter();
-            let font = egui::FontId::proportional(if toast.centered { 24.0 } else { 16.0 });
-            let galley =
-                painter.layout_no_wrap(toast.text.clone(), font.clone(), egui::Color32::WHITE);
-            let padding = if toast.centered {
-                egui::vec2(28.0, 18.0)
-            } else {
-                egui::vec2(16.0, 10.0)
-            };
-            let max_w = (overlay_width_points - 40.0).max(160.0);
-            let size = egui::vec2(
-                (galley.size().x + padding.x * 2.0).min(max_w),
-                galley.size().y + padding.y * 2.0,
-            );
-            let rect = if toast.centered {
-                // 中央 (full_rect.center().y) はレジューム picker の二重円
-                // (半径 56) と完全に被る。HUD top バー (上端 ~60px) と picker top
-                // (center_y - 56) の間に収めるため、上から 30% の位置に置く。
-                // 最小 80px は極端に低い窓 (= 30% が HUD バーに食い込む) 用の床。
-                let centered_y =
-                    (full_rect.min.y + full_rect.height() * 0.30).max(full_rect.min.y + 80.0);
-                egui::Rect::from_center_size(egui::pos2(full_rect.center().x, centered_y), size)
-            } else {
-                egui::Rect::from_min_size(
-                    egui::pos2(full_rect.max.x - size.x - 20.0, full_rect.min.y + 62.0),
-                    size,
-                )
-            };
-            drawn_rect = Some(rect.expand(4.0));
             painter.rect_filled(
                 rect,
                 8.0,
@@ -3132,7 +3225,7 @@ pub(super) fn draw_native_toast(
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, (alpha * 255.0) as u8),
             );
         });
-    drawn_rect
+    Some(area_rect)
 }
 
 pub(super) fn native_ring_guide_overlay_rect(
@@ -5614,10 +5707,19 @@ pub(super) fn native_panel_top() -> f32 {
     56.0
 }
 
-pub(super) fn native_panel_hover_bottom(overlay_height_points: f32) -> f32 {
-    // 動画 HUD 2 段化リデザイン (Phase 3): シーク HUD の上に 2pt の隙間を保つ。
-    // HUD_BOTTOM_HEIGHT + 2.0 で HUD top - 2pt = 隙間下端。
-    (overlay_height_points - (crate::video::native_presenter::HUD_BOTTOM_HEIGHT + 2.0))
+pub(super) fn native_panel_hover_bottom(
+    overlay_height_points: f32,
+    seek_strip_visible: bool,
+) -> f32 {
+    // シーク HUD または、その直上に表示中のシークストリップの上に 2pt の隙間を保つ。
+    // ストリップ非表示時は従来の HUD top - 2pt を変えない。
+    let strip_height = if seek_strip_visible {
+        crate::video::native_presenter::SEEK_STRIP_HEIGHT
+    } else {
+        0.0
+    };
+    (overlay_height_points
+        - (crate::video::native_presenter::HUD_BOTTOM_HEIGHT + strip_height + 2.0))
         .max(native_panel_top())
 }
 
@@ -7098,7 +7200,7 @@ mod tests {
         assert!(layout_truncated_to_width(&painter, "abc", font, color, 100.0, 0).is_none());
     }
 
-    /// jump / metadata 両パネルの底辺がホバー判定の底辺と一致し、シーク HUD
+    /// ストリップ非表示時は jump / metadata 両パネルの底辺がホバー判定の底辺と一致し、シーク HUD
     /// (top y = overlay_h - HUD_BOTTOM_HEIGHT) の上に 2pt の隙間が空くことを保証する
     /// 回帰テスト。上ホバーバー bottom y = 54 と panel top y = 56 の 2pt 隙間と対称になる前提。
     /// 動画 HUD 2 段化リデザイン (Phase 3) で HUD 高さが 46 → 64 に変わったので、
@@ -7109,13 +7211,29 @@ mod tests {
         let overlay_h = 1080.0_f32;
         let overlay_w = 1920.0_f32;
 
-        let hover_bottom = native_panel_hover_bottom(overlay_h);
+        let hover_bottom = native_panel_hover_bottom(overlay_h, false);
         let jump = native_jump_panel_rect(overlay_h);
         let meta = native_metadata_panel_rect(overlay_w, overlay_h);
 
         assert_eq!(hover_bottom, overlay_h - (HUD_BOTTOM_HEIGHT + 2.0));
         assert_eq!(jump.max.y, hover_bottom);
         assert_eq!(meta.max.y, hover_bottom);
+    }
+
+    #[test]
+    fn side_panel_hover_bottom_reserves_visible_seek_strip() {
+        use crate::video::native_presenter::{HUD_BOTTOM_HEIGHT, SEEK_STRIP_HEIGHT};
+        let overlay_h = 1080.0_f32;
+
+        let without_strip = native_panel_hover_bottom(overlay_h, false);
+        let with_strip = native_panel_hover_bottom(overlay_h, true);
+
+        assert_eq!(without_strip, overlay_h - (HUD_BOTTOM_HEIGHT + 2.0));
+        assert_eq!(
+            with_strip,
+            overlay_h - (HUD_BOTTOM_HEIGHT + SEEK_STRIP_HEIGHT + 2.0)
+        );
+        assert_eq!(without_strip - with_strip, SEEK_STRIP_HEIGHT);
     }
 
     #[test]

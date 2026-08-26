@@ -1597,6 +1597,8 @@ pub enum KeyAction {
     FsSpreadLtrCover,
     FsSpreadRtl,
     FsSpreadRtlCover,
+    FsSpreadSplitLtr,
+    FsSpreadSplitRtl,
     FsReadingFlowCycle,
     FsReadingDirectionToggle,
     FsFitModeCycle,
@@ -1704,6 +1706,11 @@ pub enum KeyAction {
     VideoPin,
     VideoPerfOverlay,
     VideoTileMode,
+    VideoSeekStripCycle,
+    VideoSeekStripToggle,
+    VideoSeekStripNone,
+    VideoSeekStripThumbnails,
+    VideoSeekStripWaveform,
     VideoScaleFilterNext,
     VideoAnime4kRemeasure,
     VideoBookmark,
@@ -1809,6 +1816,15 @@ pub const VIDEO_ADJUST_SLOT_ACTIONS: [KeyAction; 10] = [
     KeyAction::VideoAdjustSlot8,
     KeyAction::VideoAdjustSlot9,
     KeyAction::VideoAdjustSlot10,
+];
+
+/// Video seek-strip actions in input-dispatch priority order.
+pub const VIDEO_SEEK_STRIP_ACTIONS: [KeyAction; 5] = [
+    KeyAction::VideoSeekStripCycle,
+    KeyAction::VideoSeekStripToggle,
+    KeyAction::VideoSeekStripNone,
+    KeyAction::VideoSeekStripThumbnails,
+    KeyAction::VideoSeekStripWaveform,
 ];
 
 const ALL_ACTIONS: &[KeyAction] = &[
@@ -2052,6 +2068,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsSpreadLtrCover,
     KeyAction::FsSpreadRtl,
     KeyAction::FsSpreadRtlCover,
+    KeyAction::FsSpreadSplitLtr,
+    KeyAction::FsSpreadSplitRtl,
     KeyAction::FsReadingFlowCycle,
     KeyAction::FsReadingDirectionToggle,
     KeyAction::FsFitModeCycle,
@@ -2159,6 +2177,11 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::VideoPin,
     KeyAction::VideoPerfOverlay,
     KeyAction::VideoTileMode,
+    KeyAction::VideoSeekStripCycle,
+    KeyAction::VideoSeekStripToggle,
+    KeyAction::VideoSeekStripNone,
+    KeyAction::VideoSeekStripThumbnails,
+    KeyAction::VideoSeekStripWaveform,
     KeyAction::VideoScaleFilterNext,
     KeyAction::VideoAnime4kRemeasure,
     KeyAction::VideoBookmark,
@@ -3578,6 +3601,8 @@ impl KeyAction {
             FsSpreadLtrCover => "FsSpreadLtrCover",
             FsSpreadRtl => "FsSpreadRtl",
             FsSpreadRtlCover => "FsSpreadRtlCover",
+            FsSpreadSplitLtr => "FsSpreadSplitLtr",
+            FsSpreadSplitRtl => "FsSpreadSplitRtl",
             FsReadingFlowCycle => "FsReadingFlowCycle",
             FsReadingDirectionToggle => "FsReadingDirectionToggle",
             FsFitModeCycle => "FsFitModeCycle",
@@ -3685,6 +3710,11 @@ impl KeyAction {
             VideoPin => "VideoPin",
             VideoPerfOverlay => "VideoPerfOverlay",
             VideoTileMode => "VideoTileMode",
+            VideoSeekStripCycle => "VideoSeekStripCycle",
+            VideoSeekStripToggle => "VideoSeekStripToggle",
+            VideoSeekStripNone => "VideoSeekStripNone",
+            VideoSeekStripThumbnails => "VideoSeekStripThumbnails",
+            VideoSeekStripWaveform => "VideoSeekStripWaveform",
             VideoScaleFilterNext => "VideoScaleFilterNext",
             VideoAnime4kRemeasure => "VideoAnime4kRemeasure",
             VideoBookmark => "VideoBookmark",
@@ -4138,6 +4168,8 @@ impl KeyAction {
             FsSpreadLtrCover => "左開き表紙単独の見開き表示に切り替える",
             FsSpreadRtl => "右開き見開き表示に切り替える",
             FsSpreadRtlCover => "右開き表紙単独の見開き表示に切り替える",
+            FsSpreadSplitLtr => "横長ページを左半分から順に分割表示する",
+            FsSpreadSplitRtl => "横長ページを右半分から順に分割表示する",
             FsReadingFlowCycle => "ページ単位/縦連結/横連結を切り替える",
             FsReadingDirectionToggle => "横方向の読み進み方向を切り替える",
             FsFitModeCycle => "ズーム/フィット方式を切り替える",
@@ -4245,6 +4277,15 @@ impl KeyAction {
             VideoPin => "現在の再生位置を代表フレームとしてピン留めする",
             VideoPerfOverlay => "動画の性能オーバーレイを切り替える",
             VideoTileMode => "動画タイルモードを切り替える",
+            VideoSeekStripCycle => {
+                "動画のシークストリップをなし、サムネイル、音声波形の順に切り替える"
+            }
+            VideoSeekStripToggle => {
+                "動画のシークストリップを表示または非表示にする（表示時は前回の種類を復元）"
+            }
+            VideoSeekStripNone => "動画のシークストリップを非表示にする",
+            VideoSeekStripThumbnails => "動画のシークストリップをサムネイル表示にする",
+            VideoSeekStripWaveform => "動画のシークストリップを音声波形表示にする",
             VideoScaleFilterNext => "動画の拡大方法を順に切り替える",
             VideoAnime4kRemeasure => "動画の Anime4K の性能をもう一度測定する",
             VideoBookmark => "現在の再生位置にブックマークを追加する",
@@ -4563,6 +4604,8 @@ impl KeyAction {
             | FsSpreadLtrCover
             | FsSpreadRtl
             | FsSpreadRtlCover
+            | FsSpreadSplitLtr
+            | FsSpreadSplitRtl
             | FsReadingFlowCycle
             | FsReadingDirectionToggle
             | FsFitModeCycle
@@ -4670,6 +4713,11 @@ impl KeyAction {
             | VideoPin
             | VideoPerfOverlay
             | VideoTileMode
+            | VideoSeekStripCycle
+            | VideoSeekStripToggle
+            | VideoSeekStripNone
+            | VideoSeekStripThumbnails
+            | VideoSeekStripWaveform
             | VideoScaleFilterNext
             | VideoAnime4kRemeasure
             | VideoBookmark
@@ -4970,6 +5018,8 @@ impl KeyAction {
             | FsSpreadLtrCover
             | FsSpreadRtl
             | FsSpreadRtlCover
+            | FsSpreadSplitLtr
+            | FsSpreadSplitRtl
             | FsReadingFlowCycle
             | FsReadingDirectionToggle
             | FsFitModeCycle
@@ -5077,6 +5127,11 @@ impl KeyAction {
             | VideoPin
             | VideoPerfOverlay
             | VideoTileMode
+            | VideoSeekStripCycle
+            | VideoSeekStripToggle
+            | VideoSeekStripNone
+            | VideoSeekStripThumbnails
+            | VideoSeekStripWaveform
             | VideoScaleFilterNext
             | VideoAnime4kRemeasure
             | VideoBookmark
@@ -5416,6 +5471,8 @@ impl KeyAction {
             FsSpreadLtrCover => digit_pair(Num3, Numpad3),
             FsSpreadRtl => digit_pair(Num4, Numpad4),
             FsSpreadRtlCover => digit_pair(Num5, Numpad5),
+            FsSpreadSplitLtr => digit_pair(Num8, Numpad8),
+            FsSpreadSplitRtl => digit_pair(Num9, Numpad9),
             FsReadingFlowCycle => digit_pair(Num6, Numpad6),
             FsReadingDirectionToggle => digit_pair(Num7, Numpad7),
             FsFitModeCycle => digit_pair(Num0, Numpad0),
@@ -5525,6 +5582,11 @@ impl KeyAction {
             VideoPin => ChordList::one(Chord::key(P)),
             VideoPerfOverlay => ChordList::one(Chord::key(F)),
             VideoTileMode => ChordList::one(Chord::key(S)),
+            VideoSeekStripCycle => ChordList::one(Chord::shift(S)),
+            VideoSeekStripToggle
+            | VideoSeekStripNone
+            | VideoSeekStripThumbnails
+            | VideoSeekStripWaveform => ChordList::EMPTY,
             VideoScaleFilterNext => ChordList::one(Chord::key(T)),
             VideoAnime4kRemeasure => ChordList::EMPTY,
             VideoBookmark => ChordList::one(Chord::key(B)),
@@ -8921,6 +8983,14 @@ mod tests {
         );
         egui_actions.extend(VIDEO_ADJUST_SLOT_ACTIONS);
 
+        let egui_seek_strip_route =
+            "consume_first_action(ctx,FS_VIDEO_ACTIVE_SCOPES,&VIDEO_SEEK_STRIP_ACTIONS,)";
+        assert!(
+            egui_compact.contains(egui_seek_strip_route),
+            "egui video seek-strip route changed; update this inventory test with it"
+        );
+        egui_actions.extend(VIDEO_SEEK_STRIP_ACTIONS);
+
         let egui_file_navigation_route = "consume_first_action(ctx,FS_VIDEO_ACTIVE_SCOPES,&[KeyAction::VideoPrevFile,KeyAction::VideoNextFile],)";
         assert!(
             egui_compact.contains(egui_file_navigation_route),
@@ -9126,6 +9196,40 @@ mod tests {
                     chord.display_name()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn video_seek_strip_actions_have_the_expected_keymap_contract() {
+        assert_eq!(
+            VIDEO_SEEK_STRIP_ACTIONS,
+            [
+                KeyAction::VideoSeekStripCycle,
+                KeyAction::VideoSeekStripToggle,
+                KeyAction::VideoSeekStripNone,
+                KeyAction::VideoSeekStripThumbnails,
+                KeyAction::VideoSeekStripWaveform,
+            ]
+        );
+        for action in VIDEO_SEEK_STRIP_ACTIONS {
+            assert!(KeyAction::all().contains(&action));
+            assert_eq!(action.context(), KeyContext::FsVideo);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
+        }
+        assert_eq!(
+            KeyAction::VideoSeekStripCycle
+                .default_chords()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Chord::shift(KeyName::S)]
+        );
+        for action in VIDEO_SEEK_STRIP_ACTIONS.into_iter().skip(1) {
+            assert!(
+                action.default_chords().is_empty(),
+                "{} must not claim a scarce FsVideo default chord",
+                action.ini_name()
+            );
         }
     }
 
@@ -12252,6 +12356,31 @@ mod tests {
             keymap.warnings()
         );
         assert!(keymap.overrides.is_empty());
+    }
+
+    /// `docs/keymap.ini.default` は生成物と一致していなければならない。
+    ///
+    /// 手で維持していたので、`KeyAction` を足したときに書き忘れると黙ってずれる
+    /// (利用者はこのファイルを既定キーの正本として読む)。`UPDATE_KEYMAP_DEFAULT=1` で
+    /// 書き直せる。
+    #[test]
+    fn the_checked_in_default_keymap_matches_what_the_app_writes() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs")
+            .join("keymap.ini.default");
+        let generated = Keymap::default_reference_ini();
+        if std::env::var("UPDATE_KEYMAP_DEFAULT").is_ok() {
+            std::fs::write(&path, generated.as_bytes()).expect("write default keymap");
+            return;
+        }
+        let checked_in = std::fs::read_to_string(&path).expect("read docs/keymap.ini.default");
+        // 改行だけの差は無視する (git の autocrlf で往復するため)。
+        let normalize = |text: &str| text.replace('\r', "");
+        assert_eq!(
+            normalize(&checked_in),
+            normalize(&generated),
+            "docs/keymap.ini.default が古い。UPDATE_KEYMAP_DEFAULT=1 cargo test で更新すること"
+        );
     }
 
     #[test]

@@ -967,7 +967,7 @@ fn network_data_dir_notice_dark() {
 // Susie 診断 UI (PoolStatus 各バリアントのレンダリング) のスナップショット
 // ---------------------------------------------------------------------------
 
-use mimageviewer::susie_loader::{PluginInfo, PoolStatus};
+use mimageviewer::susie_loader::{PluginInfo, PoolStatus, SusieWorkerHealth};
 use mimageviewer::ui_susie_diagnostic::render_diagnostic;
 use std::path::PathBuf;
 
@@ -1061,6 +1061,15 @@ fn ready_with_plugins_fixture() -> Vec<PluginInfo> {
     ]
 }
 
+/// 何も起きていない状態。復帰履歴は出ない。
+fn healthy_workers() -> SusieWorkerHealth {
+    SusieWorkerHealth {
+        started_workers: 3,
+        live_workers: 3,
+        ..SusieWorkerHealth::default()
+    }
+}
+
 #[test]
 fn susie_diagnostic_ready_with_plugins() {
     let plugins = ready_with_plugins_fixture();
@@ -1068,8 +1077,49 @@ fn susie_diagnostic_ready_with_plugins() {
         "susie_diagnostic_ready_with_plugins",
         PoolStatus::ReadyWithPlugins {
             count: plugins.len(),
+            health: healthy_workers(),
         },
         plugins,
+    );
+}
+
+/// クラッシュから復帰した後。プラグイン一覧の下に履歴が付く。
+#[test]
+fn susie_diagnostic_ready_after_recovery() {
+    let plugins = ready_with_plugins_fixture();
+    snapshot_diagnostic(
+        "susie_diagnostic_ready_after_recovery",
+        PoolStatus::ReadyWithPlugins {
+            count: plugins.len(),
+            health: SusieWorkerHealth {
+                started_workers: 3,
+                live_workers: 2,
+                restarts: 4,
+                gave_up_workers: 1,
+                crashing_subjects: 2,
+                last_failure: Some("unexpected end of file".to_string()),
+            },
+        },
+        plugins,
+    );
+}
+
+/// 枠を使い切った後。以前はこれが「起動に失敗しました」と表示されていた。
+#[test]
+fn susie_diagnostic_workers_exhausted() {
+    snapshot_diagnostic(
+        "susie_diagnostic_workers_exhausted",
+        PoolStatus::WorkersExhausted {
+            health: SusieWorkerHealth {
+                started_workers: 3,
+                live_workers: 0,
+                restarts: 15,
+                gave_up_workers: 3,
+                crashing_subjects: 3,
+                last_failure: Some("unexpected end of file".to_string()),
+            },
+        },
+        Vec::new(),
     );
 }
 
@@ -1082,6 +1132,7 @@ fn susie_diagnostic_ready_with_plugins_dark() {
         mimageviewer::os_theme::ResolvedTheme::Dark,
         PoolStatus::ReadyWithPlugins {
             count: plugins.len(),
+            health: healthy_workers(),
         },
         plugins,
     );
@@ -1125,6 +1176,76 @@ fn changelog_markdown_dark() {
             mimageviewer::changelog_markdown::render(ui, changelog_body_fixture());
         },
     );
+}
+
+/// 実データの長さの絶対パスが複数候補で並ぶ場合。コピー元セレクタは折り返さないので、
+/// ここが伸びるとモーダルがウィンドウの外へ出て、両端の文字が読めなくなる
+/// (2026-08-26 の実機報告)。既存の `content_restore_prompt_light` は短いパスしか
+/// 持っていなかったので、この形を通していなかった。
+#[test]
+fn content_restore_prompt_long_paths() {
+    use mimageviewer::ui_dialogs::content_restore::{
+        ContentRestoreUiRow, ContentRestoreUiSource, render_content_restore_modal,
+    };
+
+    let long_sources: Vec<ContentRestoreUiSource> = [
+        r"h:/home/mimageviewer_old/testimage/y/chatgpt image 2026-06-07 15_49_45 (2).png",
+        r"h:/home/mimageviewer_old/testimage/x2/y/chatgpt image 2026-06-07 15_49_45 (2).png",
+        r"h:/home/mimageviewer_old/testimage/xxx/chatgpt image 2026-06-07 15_49_45 (2).png",
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, path)| ContentRestoreUiSource {
+        path: path.to_string(),
+        source_exists: index % 2 == 0,
+    })
+    .collect();
+
+    let mut rows = vec![
+        ContentRestoreUiRow {
+            file_name: "chatgpt image 2026-06-07 15_49_45 (2).png".to_string(),
+            selected: true,
+            source_index: 0,
+            sources: long_sources,
+        },
+        ContentRestoreUiRow {
+            file_name: "avif_Mexico - コピー2.avif".to_string(),
+            selected: true,
+            source_index: 0,
+            sources: vec![ContentRestoreUiSource {
+                path: r"h:/home/mimageviewer_old/testimage/photo/avif_Mexico.avif".to_string(),
+                source_exists: true,
+            }],
+        },
+    ];
+    let mut dont_ask_again = false;
+    let mut fonts_ready = false;
+    const WINDOW_SIZE: egui::Vec2 = egui::vec2(980.0, 600.0);
+    let mut harness = Harness::builder().with_size(WINDOW_SIZE).build(move |ctx| {
+        mimageviewer::os_theme::apply_resolved(ctx, mimageviewer::os_theme::ResolvedTheme::Light);
+        if !fonts_ready {
+            install_app_fonts(ctx);
+            fonts_ready = true;
+            ctx.request_repaint();
+            return;
+        }
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("画像一覧");
+        });
+        let _ = render_content_restore_modal(ctx, &mut rows, &mut dont_ask_again);
+    });
+    harness.run();
+    let modal = harness
+        .ctx
+        .memory(|m| m.area_rect(egui::Id::new("content_restore_modal")))
+        .expect("the modal has to be on screen");
+    assert!(
+        modal.width() <= WINDOW_SIZE.x,
+        "モーダルがウィンドウ ({}px) からはみ出している: {}px",
+        WINDOW_SIZE.x,
+        modal.width()
+    );
+    harness.snapshot("content_restore_prompt_long_paths");
 }
 
 #[test]

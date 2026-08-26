@@ -30,7 +30,7 @@ use crate::app::{App, TextDrag, TextDragKind, TextMarquee, TextSmartGuides};
 use crate::comic_presets::{ShapeStylePreset, TextStylePreset, WindowStylePreset};
 use crate::displayed_image_transform::DisplayedImageTransform;
 use crate::keymap::{KeyAction, ModKind, modifier_held_via_os};
-use crate::ui_fullscreen::{FsKeyAction, SpreadPair};
+use crate::ui_fullscreen::FsKeyAction;
 use comic_core::{
     AnnotationKind, AnnotationObject, BubbleObject, BubbleShape, DecoKind, DecoPlacement,
     DecorationLayer, FillBlend, FillMode, FontSet, FrameStyle, IndicatorKind, InlineDir,
@@ -1976,26 +1976,27 @@ impl App {
         if !self.fullscreen_edit_mode_entry_allowed(fs_idx) {
             return;
         }
-        let spread_pair = match self.resolve_spread_pair(fs_idx) {
-            SpreadPair::Double { left, right } => Some((left, right)),
-            SpreadPair::Single => None,
-        };
-        let target_idx = spread_pair.map(|(l, _)| l).unwrap_or(fs_idx);
+        let (target_idx, pivot) = self.plan_page_edit_pivot(fs_idx);
 
         let Some(key) = self.page_path_key(target_idx) else {
             return;
         };
 
-        if let Some(pair) = spread_pair {
-            self.text_spread_ctx = Some(crate::app::EraseSpreadCtx {
-                saved_mode: self.spread_mode,
-                pair,
-            });
-            self.spread_mode = crate::settings::SpreadMode::Single;
-            self.fullscreen_idx = Some(target_idx);
-            self.fs_zoom = 1.0;
-            self.fs_pan = egui::Vec2::ZERO;
+        if let Some(pivot) = pivot {
+            self.text_spread_ctx = Some(pivot);
+            self.enter_page_edit_single_view(target_idx);
         }
+
+        // ページに紐づく作業物は、どの経路で入ってきても入場時に捨てる。見開きの
+        // 左右切り替えは退場を経由せずにページだけ変わるので、退場側だけで消していると
+        // 前のページの下地・しっぽ・埋め込み worker がそのまま残る。
+        if let Some(pending) = self.stamp_embed_pending.take() {
+            pending
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.comic_preview_base = None;
+        self.comic_tail_stash.clear();
 
         self.text_mode = true;
         self.text_selected = None;
@@ -2032,18 +2033,44 @@ impl App {
 
     /// テキスト編集モードを抜ける。作業セットを comic.db + サイドカーへ保存してから
     /// 状態をクリアし、見開きから入っていた場合は spread を復元する。
-    pub(crate) fn reset_text_mode(&mut self) {
-        let restore_idx = self.fullscreen_idx;
-        let was_text_mode = self.text_mode;
-
-        if was_text_mode {
-            if let Some(idx) = restore_idx {
-                if let Some(key) = self.page_path_key(idx) {
-                    let objs = self.comic_docs.get(&key).cloned().unwrap_or_default();
-                    self.save_comic_objects(idx, &key, &objs);
-                }
-            }
+    /// 見開きから入ったテキスト注釈で、編集対象を左右のもう一方へ移す。
+    ///
+    /// **退避 (`text_spread_ctx`) を消費しない。**退場処理を通すと退避が使い切られ、
+    /// 抜けたときに見開きへ戻れなくなる (2026-08-26 の実機報告: 右ページを選んで抜けると
+    /// 単ページのままになる)。消しゴムの [`Self::switch_erase_target_in_spread`] と同じ約束。
+    pub(crate) fn switch_text_target_in_spread(&mut self, new_idx: usize) {
+        if self.fullscreen_idx == Some(new_idx) {
+            return;
         }
+        self.commit_text_page();
+        self.enter_page_edit_single_view(new_idx);
+        // spread_mode は Single のままなので、enter 内のペア再判定は Single を返し、
+        // 退避はそのまま残る。
+        self.enter_text_mode(new_idx);
+    }
+
+    /// 現在ページの注釈を確定する。**モードは抜けないし、見開きの退避も触らない。**
+    ///
+    /// 見開きの左右切り替えは「ページだけ変わってツールは続く」ので、退場処理は使えない
+    /// (退場は退避を使い切って見開きへ戻してしまい、抜けたときに戻る先が消える)。
+    /// 消しゴムの `apply_inpaint_only` と同じ役割。
+    pub(crate) fn commit_text_page(&mut self) {
+        if !self.text_mode {
+            return;
+        }
+        let Some(idx) = self.fullscreen_idx else {
+            return;
+        };
+        let Some(key) = self.page_path_key(idx) else {
+            return;
+        };
+        let objs = self.comic_docs.get(&key).cloned().unwrap_or_default();
+        self.save_comic_objects(idx, &key, &objs);
+    }
+
+    pub(crate) fn reset_text_mode(&mut self) {
+        let was_text_mode = self.text_mode;
+        self.commit_text_page();
 
         self.text_mode = false;
         self.text_selected = None;
@@ -2081,12 +2108,8 @@ impl App {
         // しっぽ stash もクリア (ページ / モードをまたいで持ち越さない)。
         self.comic_tail_stash.clear();
 
-        if let Some(ctx) = self.text_spread_ctx.take() {
-            self.spread_mode = ctx.saved_mode;
-            self.fullscreen_idx = Some(ctx.pair.0);
-            self.fs_zoom = 1.0;
-            self.fs_pan = egui::Vec2::ZERO;
-        }
+        let pivot = self.text_spread_ctx.take();
+        self.leave_page_edit_single_view(pivot);
         crate::logger::log("text: reset mode".to_string());
     }
 
@@ -2958,6 +2981,10 @@ impl App {
             return;
         };
         let (sw, sh) = self.source_dims_for_idx(fs_idx).unwrap_or((1000.0, 1000.0));
+        // 見開きから入ったときのペア。倒した後の `resolve_spread_pair` は Single を返す。
+        let spread_lr = self.page_edit_spread_pair();
+        // クロージャから `self` を触れないので、押されたページを持ち帰って後で適用する。
+        let mut switch_target_to: Option<usize> = None;
         let font_key = crate::comic_overlay::COMIC_FONT_KEY.to_string();
 
         let panel_pos = egui::pos2(
@@ -3060,6 +3087,20 @@ impl App {
                                 },
                             );
                         });
+                        // 見開きから入っていると単ページへ倒してあるので、左右の
+                        // 切り替えは退避したペアから出す。これが無いと片方のページしか
+                        // 注釈できない (2026-08-26 の実機報告)。
+                        if let Some((left, right)) = spread_lr {
+                            ui.horizontal(|ui| {
+                                let is_left = fs_idx == left;
+                                if ui.selectable_label(is_left, "左ページ").clicked() {
+                                    switch_target_to = Some(left);
+                                }
+                                if ui.selectable_label(!is_left, "右ページ").clicked() {
+                                    switch_target_to = Some(right);
+                                }
+                            });
+                        }
                         ui.separator();
 
                         // ── プレビュー解像度 (R2 perf) ──。編集中だけ表示を 1/N に下げて合成 +
@@ -3431,6 +3472,12 @@ impl App {
         }
         if close {
             self.reset_text_mode();
+        }
+        // 左右ボタンで対象ページを切り替える。注釈はページごとなので、現在ページの
+        // 作業セットを確定してから入り直す (消しゴムの `switch_erase_target_in_spread`
+        // と同じ約束)。退避は触らないので、ボタンはトグルとして使い続けられる。
+        if let Some(new_idx) = switch_target_to {
+            self.switch_text_target_in_spread(new_idx);
         }
     }
 

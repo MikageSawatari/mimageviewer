@@ -67,12 +67,97 @@
 
 ## 6. 運用
 
-- worktree は `vendor/` を **実体コピー** (junction 禁止)。撤収は必ず
-  `scripts/safe-worktree-remove.ps1` 経由。
+- worktree は `vendor/` を **実体コピー** (junction 禁止)。`vendor/eframe` と
+  `vendor/egui-wgpu` は **git 追跡下**なのでコピーしない (改行だけ違う 29 ファイルが M になる)。
+  撤収は必ず `scripts/safe-worktree-remove.ps1` 経由。
+- **新しい worktree で `cargo test` を走らせる前に、FFmpeg DLL を `target\debug` へ置く。**
+  無いとテスト実行体が `STATUS_DLL_NOT_FOUND` (exit `-1073741515`) で即死し、テストが 1 件も
+  走らないまま落ちる。`Copy-Item vendor\ffmpeg\bin\*.dll target\debug\ -Force`。
+  `build-dev.ps1` が置くのは `target\dev-runtime` の方なので、これとは別に要る。
+- **レーンをまたいで native ビルドを同時に走らせない。** `turbojpeg-sys` の cmake は
+  共有 cargo registry の libjpeg-turbo から MSBuild を回すため、2 つの worktree が同時に
+  ビルドすると `.tlog` ディレクトリの作成で `MSB3191` (アクセス拒否) で落ちる。
+  target dir が別でも起きる。`CMAKE_BUILD_PARALLEL_LEVEL` を下げても効かない
+  (cmake クレートが自前の `--parallel` を渡すため)。
+  **`build-dev.ps1` は他の `MSBuild` が居たら空くまで待つ** (既定 30 分、
+  `-WaitForOtherBuildsMinutes 0` で無効化)。それ以外の経路で `cargo build` を打つときは
+  `Get-Process MSBuild` を先に見る。
+- テスト実行体が `0xC0000005` (アクセス違反) で落ちることがある。**間欠**で、同じコードが
+  次の実行で通る。2 回続けて同じ位置で落ちるなら別の話として扱う。
 - 共有作業ツリーでのコミットは pathspec commit (`git commit -- <自分のパス>`)。
 - 既存 worktree: `detached-rework` と `video-upscale-shader` は master へ取り込み済みで撤収候補。
-  `seek-thumb-bench` は 2 コミット未マージ (シークサムネイルの計測計装) — **レーン B で
-  再利用価値があるので、master へ入れるかを B の着手時に判断する**。
+- **`seek-thumb-bench` worktree は撤収済み** (2026-08-25、利用者判断)。計装先の
+  `render_core.rs` / `thumbnail.rs` をレーン B が大きく書き換えており
+  (`render_core.rs` だけで +874 行)、B は自前の計測手段
+  (`src/bin/seek_strip_batch.rs` + `tools/seek_strip_probe`) を既に持っているため、
+  再利用の候補ではなく衝突要因になっていた。
+  **ブランチ `seek-thumb-bench` は残してある** (`4dc8a4ad`)。`analyze_seek_thumb.py` など
+  取り出したいものがあれば `git show` / `git checkout seek-thumb-bench -- <path>` で拾える。
+
+### レーン B の現況 (2026-08-25 夜)
+
+コンテキスト消尽により**新セッションへ引き継ぎ済み**。到達点は `video-strip` の `2d8b2401`
+(master から 13,286 行)。引き継ぎ内容は worktree 側の
+`docs/video-seek-strip-plan.md` が正本で、要点は:
+
+- 23,079 ファイルの一括検証を実行中 (出力 `C:\home\miv-batch-runner\sweep-stage2.json`)
+- 末尾 4 セルが黒いという利用者報告は**未再現**
+- 次は D19 → D17 → §5.4
+
+**master レーンから見た影響**: 触る場所は `src/video/` に閉じており
+`ui_fullscreen.rs` は 32 行なので、§1.119 の配線とはぶつからない。ただし B は
+一括検証で大量のディスク I/O を回すので、**こちらから重いビルドやフルテストを
+同時にぶつけない** (§6 の MSBuild 注意と同じ理由)。
+
+## 6.1 レーン D (master 本体) の進捗 — 2026-08-25
+
+A〜C が別 worktree にいるので、master 作業ツリーは小さめのタスクに使っている。
+
+**完了 (すべて実機確認済み)**
+
+| 項目 | 内容 |
+| --- | --- |
+| §1.121 | RAR を代表サムネにしても親フォルダに出ない。pin-root の発見条件からタイルの状態を外した |
+| §1.120 | Susie ワーカーがクラッシュから戻らない。dispatcher の退役 / respawn / 連続失敗カウント / キュー排出 / **落とした対象の記憶** |
+| — | [susie-crash-plugin.md](susie-crash-plugin.md): 落ちる Susie プラグインを自作。**この経路は検証手段が無く、一度も確かめられていなかった** |
+| — | `build-dev.ps1` が他 worktree の native ビルドを待つ (§6 参照) |
+| — | worktree 3 本撤収 (`rar-pin` / `detached` / `video-upscale`)、数十 GB 解放 |
+
+**続き (2026-08-25 後半、すべて実機確認済み)**
+
+| 項目 | 内容 |
+| --- | --- |
+| §1.116 | 起動時のウィンドウ状態 (前回の状態 / 通常 / 最大化)。**既定は「前回終了時の状態」** |
+| §2.21 | **見立ての誤りと判明**。フルスクリーンは Susie に到達している。直したのは診断文の方 |
+| §1.95 追加 | 取り消した編集が復元元として残る。記録側ではなく**読む側**で実データを確かめる形に |
+| §1.120 残り | 打ち切りの利用者通知と診断表示。**§1.120 はこれで全部閉じた** |
+
+⚠ **§1.116 の「重要な変更点」エントリは版数が暫定 `"3.3.0"`**
+([version_highlights.rs](../src/version_highlights.rs))。次のリリース版数を決めるときに
+必ず合わせること (リリース手順 Phase 1)。既定を変えたので、この告知は必須。
+
+## 6.2 次に何をやるか (2026-08-25 の判断)
+
+**§1.119 (見開き分割) を次にやる。ただしレーン A が落ち着いてから。**
+
+- 衝突相手は **B でも C でもなく A**。§1.119 が要るのは「今どちらの半分を見ているか」という
+  ビューアごとの一時状態で、置き場所は `fullscreen_idx` の隣になる。A が今やっているのが
+  まさに `bundle.fullscreen_idx` → `context.fullscreen_idx()` の所有権移動なので、
+  **A が消そうとしている形の上に新しい兄弟フィールドを置く**ことになる。
+- B (`video-strip`) とは重なりゼロ。C (`panorama-projection`) とは `ui_fullscreen.rs` を
+  共有するが領域が別で、C が `SpreadDisplayUnit` 側に触れているのは `spread_popup_open` を
+  popup 判定の OR 列へ足しているだけ (2026-08-25 に diff で確認)。C は 08-24 から停止中。
+- 待つ間に進められる部分がある。**分割判定 (回転反映後に横長か) / UV crop / `(source_idx,
+  PageSlice)` を進める resolver は純ロジック**で、新規モジュール + 単体テストで完結し
+  共有ファイルを触らない。配線だけを A の cutover 後に回せる。
+
+**§1.117 (外部ツール連携) は段階 3 (ZIP/PDF 内ページの一時実体化) まで一度に出す。**
+段階 2 で設定画面を出すとそれが互換の約束になり、仮想ページが入ると `selection_mode` と
+`{file}` の意味が変わってしまうため。優先度は高くない (出典は要望ではなく不満の声)。
+根拠は [next-release-backlog.md](next-release-backlog.md) §1.117 に記録した。
+
+**§1.118 (コレクション) は別 worktree で検証しながら進める。** 順序付きの参照一覧は
+identity と lifecycle が本体で、rename / move 追従と missing 表示まで検証範囲が広い。
 
 ## 7. リリース区切り (暫定)
 

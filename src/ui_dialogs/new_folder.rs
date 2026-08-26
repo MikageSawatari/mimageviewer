@@ -92,11 +92,15 @@ impl App {
                     .as_ref()
                     .is_some_and(|current| crate::folder_tree::path_eq(current, &created.parent));
                 if current_matches_parent {
-                    self.select_after_load = created
-                        .path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .map(str::to_owned);
+                    // 作った物は mIV 自身が知っているので、名前ヒントではなく出力パスで頼む。
+                    // 現在のソート順では離れた位置に入るので、カーソルを移さないと
+                    // どれが増えたのか分からない (専用スレ >>305)。
+                    self.request_post_operation_selection(
+                        created.parent.clone(),
+                        crate::post_operation_selection::ExpectedOutputs::Known(vec![
+                            created.path.clone(),
+                        ]),
+                    );
                     self.pending_reload = true;
                 }
                 self.show_feedback_toast(format!(

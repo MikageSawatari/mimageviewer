@@ -1,4 +1,4 @@
-# 動画再生サブシステム アーキテクチャ
+﻿# 動画再生サブシステム アーキテクチャ
 
 mimageviewer の動画インライン再生機能の設計指針と内部構造をまとめる。
 NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終構成** を記述する。
@@ -81,9 +81,16 @@ content、filter、縮小なめらかさ、Anime4K variant、grade の resource 
 state と presenter 側 prepared resource の両方を破棄し、command と App event の source-epoch gate
 も旧 source の request / 成功通知を棄却する。App を往復する `Prepared -> Commit` command は無い。
 
-Anime4K は B1 が GLSL の `//!SAVE` / `//!BIND` から生成した variant topology と WGSL を正本にする。
-build 時に S / M / L / VL / UL の WGSL を Naga で HLSL へ変換し、Windows SDK FXC で全 pixel
-shader を SM5 bytecode 化する。runtime は全67 shader object を pipeline 作成時に bytecode から
+**presenter の shader は全部 build 時に SM5 bytecode 化する。** grade / resample (Lanczos3・
+nearest) の手書き HLSL は [src/video/native_presenter/shaders/](../src/video/native_presenter/shaders/)、
+NIS と Anime4K は WGSL を Naga で HLSL へ変換したものを、いずれも Windows SDK FXC で
+`.cso` にして `include_bytes!` する。runtime は `CreatePixelShader` に bytecode を渡すだけで、
+`D3DCompile` を呼ばない。render core は動画を開くたびと **placement 切替 (F12) のたび**に
+作り直されるので、runtime compile はそのまま体感遅延になる。NIS の pixel shader 1 本で
+実測 2.1 秒あり、F12 往復に約 4.5 秒を足していた (backlog §1.122)。runtime 側で
+`D3DCompile` を復活させないこと。
+
+Anime4K は B1 が GLSL の `//!SAVE` / `//!BIND` から生成した variant topology と WGSL を正本にする。runtime は全67 shader object を pipeline 作成時に bytecode から
 ロードし、選択した1 variant 分だけ source-resolution `RGBA16Float` intermediate を適用準備で
 確保する。候補の確保が全部成功し、その選択での present が成功した後だけ旧 variant の中間画像を
 解放する。各 pass の入力と順番は生成 topology 駆動で、vertex stage は
@@ -113,9 +120,54 @@ USER32 read/mutation は行わない。pump が採取する幾何 cursor 座標 
 source-stamped mouse ownership event と、render が返す focus / IME / cursor policy intent だけで
 接続する。cursor auto-hide の状態と `SetCursor` 書き込みは pump が所有する。
 
-`VideoPlayer::tick(_ctx)` は再生制御 / repaint hint / ホバーサムネイル要求のみ扱う。
-フレームの実体描画は native presenter 内のスレッドが行うため、`tick` で受け取る
-`egui::Context` は実質未使用 (互換のため引数だけ残してある)。
+native egui overlay の wgpu stack は [overlay_gpu.rs](../src/video/native_presenter/overlay_gpu.rs) の
+process-owned `OverlayGpuService` が所有する。`OnceLock` が保持するのは device そのものではなく、
+共有 `Instance` と replaceable な `DeviceEpoch` cache を持つ service である。
+
+```
+OverlayGpuService (process lifetime)
+├─ wgpu::Instance
+└─ Mutex<Vec<Arc<DeviceEpoch>>>
+   └─ generation / Adapter / Device / Queue / RwLock gate / loss latch
+
+NativeEguiOverlay (window lifetime)
+└─ Surface / egui_wgpu::Renderer / egui::Context / DComp visual・target lease / UI state
+```
+
+overlay 作成は共有 Instance から対象 DComp visual の Surface を先に作り、loss 未確定かつ
+`Adapter::is_surface_supported` が true の epoch を再利用する。無ければその Surface を
+`compatible_surface` にして Adapter / Device / Queue を 1 組作る。通常は epoch 1 個で、
+複数 GPU の genuinely incompatible な Surface または device loss 後だけ後続 epoch が増える。
+cache の強参照は最後の presenter が閉じても維持し、Surface / Renderer / Context だけを窓と一緒に
+破棄する。動画 present 用 D3D11 device と immediate context は従来どおり presenter ごとであり、
+この service へ統合しない。
+
+gate の理由は「動画を同時に複数再生するから」**ではない**。mIV の生きているメディア session は常に 1 つで
+([`close_parked_live_media_windows_for_new_media`](../src/app.rs))、F12 placement switch も新旧 presenter を
+同じ `native-video-render` thread 上で直列に扱う。重なり得るのは **teardown** だけで、
+`Drop for NativeVideoOutput` が render thread の join を待たず別 thread へ逃すため、
+旧 render thread の submit と新 thread の configure が重なり得る。overlay ごとに Device を
+持っていた頃は無害だったが、共有したことで初めて問題になる。このため epoch の RwLock gate は
+`Surface::configure` 全体を write lock、`update_texture` から `update_buffers`、
+`get_current_texture`、`queue.submit`、`SurfaceTexture::present` までを read lock にする。
+`egui::Context::run`、texture delta を作る font atlas の CPU 処理、tessellation は gate 外。
+実際に競合するかは perf の `gate_wait_ms` で見る (通常は 0ms 近傍のはず)。
+
+Device 作成直後に device-lost callback を登録する。callback は自 epoch generation と一致する
+一方向 latch を立てるだけで、wgpu 呼び出し、再作成、retry、ログを行わない。新しい overlay は
+latched epoch を選ばず fresh epoch を作る。既存 overlay は dead epoch を持ち続け、次の draw で
+terminal error を返して従来どおり presenter を停止する。`SurfaceError::Lost / Outdated / Timeout`
+は surface / swapchain 条件として epoch を invalidate せず、`Other` も callback latch が立った場合だけ
+device loss と診断する。旧 generation の遅い callback は successor の latch と一致しない。
+
+`VideoPlayer::tick(ctx)` は再生制御 / 意味的 deadline / ホバーサムネイル要求を扱う。
+フレームの実体描画は native presenter 内のスレッドが行うため、native 経路では
+フレームレート cadence を返さない。`ctx` は player ごとの `VideoUiWake` に一度結び、
+decoder / audio / native-window / thumbnail worker が状態を publish したとき
+`request_repaint_of(ViewportId::ROOT)` で UI を起こすために使う。時間でしか決まらない処理は
+stuck seek (1200ms)、EOF drain (観測残量の消費時刻 + quiet 48ms)、既知の再生末尾、
+user seek coalesce (250ms)、open 進捗 HUD (50ms) の最短 one-shot だけを返す。
+準備済み・一時停止中の native 動画は periodic repaint を返さない。
 
 ### NativeVideoPlacement と detached viewer
 
@@ -141,9 +193,10 @@ Esc / Enter と同じく `close_fullscreen()` で viewer session を終了する
 キー入力は App へ転送し、動画操作 / session close / F12 切替を同じ keymap 経路に通す。
 
 メインウィンドウでフォルダ移動や別フォルダ open が発生しても、表示中 detached 動画は
-`active_detached_viewer_context` に切り離して保持する。この状態では動画の `fs_cache` /
-`fullscreen_idx` / `items` は detached 側 bundle が正本になるため、`poll_video()` は
-その bundle を mount した `update_active_detached_viewer_context()` 内で走らせる。
+viewer context registry の window binding を保ったまま main から独立した context へ promote して
+保持する。この状態では動画の `fs_cache` / `fullscreen_idx` / `items` はその context が正本になるため、
+`poll_video()` は registry transaction で context を mount した
+`update_active_detached_viewer_context()` 内で走らせる。
 同時に main context 側の `poll_video()` は抑止し、native presenter のイベントや source
 swap pending を detached 動画ではない `fullscreen_idx` で処理しないようにする。
 
@@ -235,23 +288,41 @@ callout は実際にクリックする UI なので、表示中の bar rect だ�
 ClickToShow の左右パネルには明示的な × を置き、callout 矢印は開状態で外向きへ反転する。
 VST3 パネル表示中は callout を描画せず、HUD region にも含めない。
 
-上部情報バーと下部シークバーの固定状態は、動画専用の bool
-`video_top_bar_locked` / `video_seek_bar_locked` を Settings の正本として native presenter へ同期する。
-既定の `false` は従来の上下端 hover と touch chrome latch による自動表示を維持し、
-`true` は各バーの可視性純関数へ入力として渡す。上部だけを固定しても下部は固定されず、
+上部情報バーの固定状態は動画専用の `video_top_bar_locked`、動画下部は永続化用の
+`video_seek_bar_locked` / `video_seek_strip_locked` を Settings の正本とする。下部の変更経路は
+`VideoBottomLock::{None, BarOnly, BarAndStrip}` に復元してから App → native command → presenter →
+overlay / layout まで同期し、「バー非固定 + ストリップ固定」を実行時の型で表現しない。
+既定の固定なしは従来の上下端 hover と touch chrome latch による自動表示を維持する。
+上部だけを固定しても下部は固定されず、
 上端を実際に hover した場合と左右パネル表示中だけは、従来どおり下部も連動表示する。
 静止画の `fullscreen_top_bar_locked` / `fullscreen_seek_bar_locked` とは設定を共有しない。
 
 固定したバーは映像へ重ねず、`compute_video_visual_transform` の target 矩形から上部 54pt / 下部
 64pt と `fullscreen_fixed_bar_gap_px` の共通余白を除外し、残った領域へ映像を letterbox fit する。
+`BarAndStrip` では presenter が所有する `Option<NativeOverlaySeekStrip>` が `Some` のときだけ
+ストリップ 104pt も下部予約領域へ足す。`Some` / `None` の変化は transform と表示解像度 surface の
+準備状態を更新し、ストリップを「なし」にしたときは固定設定を保持したまま領域だけを解放する。
 論理 pt と余白は native overlay の pixels-per-point で物理 px に変換する。presenter HWND は monitor
 全域のままで縮めない。VST の compact と同時に有効な場合は、先に固定バーを除外し、その残りの
 右上 1/4 (幅・高さを各 1/2) を compact target にする。固定解除時は除外を取り消して従来の fit に戻す。
 
-各バーには固定状態を示す鍵ボタンを置く。鍵の形は静止画の
+**受動的な overlay の `Area` は、自分が描く矩形ぶんだけを占める。画面全体を確保しない。**
+egui の `Area` は `interactable(false)` でも自分の矩形にウィジェットを 1 つ登録し
+(sense が click から hover へ下がるだけ)、egui の hit test は「別レイヤーの手前のウィジェットに
+完全に覆われたウィジェット」を捨てる。そのため画面全体を占める受動的 Area があると、その下の
+HUD ボタンが表示中ずっと hover もクリックもできなくなる (実機報告 2026-08-25: 固定トグルの
+トースト直後、下部バーの鍵が 1 回目のクリックで反応しない)。`native_video_toast` と
+`native_video_center_status` はこの理由で実描画矩形へ縮めてある。`interactable(false)` だけでは
+足りない。タイル一覧・ナビゲーションプレビュー・音量ノーマライズ blocker は意図的に全画面を
+覆う面なので対象外。
+
+各バーとシークストリップには固定状態を示す鍵ボタンを置く。鍵の形は静止画の
 `ui_fullscreen::draw_icons::draw_seek_lock_icon` を共有し、native 側で同じベクター形状を複製しない。
-クリックは typed overlay command で App へ戻し、対応する動画専用 bool だけを反転して `save()` した後、
-最新の固定状態と余白を presenter へ再同期する。
+クリックは typed overlay command で App へ戻し、下部は `VideoBottomLock` の遷移で永続 bool を更新して
+`save()` した後、最新の固定状態と余白を presenter へ再同期する。ストリップ鍵は右上 28pt 角、
+現在の範囲表示はその左へ置き、鍵矩形は seek / drag の開始対象から除外する。wheel は鍵上でも
+ストリップの範囲変更として消費する。鍵はストリップ全面の `click_and_drag` と重なるので、
+egui が後勝ちでポインタを渡す規則に合わせて本体の `interact` より後に登録する。
 
 上部・下部バーは `render_once` が算出した
 `top_bar_drawn_visible` / `bottom_hud_visible` を描画後の snapshot として保持し、
@@ -333,6 +404,16 @@ region 化は passive な source swap 表示なので、カーソルの auto-hid
   実行する。ownership を失ったら Arrow を書かず、VST のノブなど外部 window の `WM_SETCURSOR`
   に任せる。cursor ownership 判定には同期 hit-test を使わず、`WindowFromPoint` /
   `SendMessage` はこの経路へ導入しない。
+- presenter / HUD の `WM_SETCURSOR` は `LRESULT(1)` を返し、`DefWindowProcW` に流さない。
+  native video window 内では pump-owned reducer が適用した Arrow / resize / hidden をそのまま
+  維持し、window class cursor による上書きを許さない。handler 自身から `SetCursor` は呼ばないため、
+  auto-hide の `SetCursor(None)` も復帰させない。
+
+cursor ownership / icon の実機調査では `MIV_CURSOR_DEBUG=1` を付けて起動する。presenter / HUD の
+`WM_SETCURSOR` / `WM_MOUSEMOVE`、egui が frame ごとに生成した cursor、pump reducer の policy と
+実際の `SetCursor` 呼び出し結果が、process-wide sequence 付きの `[CURSOR-DEBUG]` 行として
+`%APPDATA%\mimageviewer\logs\mimageviewer.log` に出る。高頻度ログなので再現時だけ有効にする。
+この環境変数は `MIV_DETACHED_WINDOW_DEBUG=1` と同じ debug retention (256MB、4 世代) も有効にする。
 
 この事象は fullscreen 限定 (HUD HWND + `cursor_polling_tick` + 全画面 region 化が fullscreen にしか
 無い) なので、window モードでは元から再現しない。
@@ -661,6 +742,9 @@ src/video/
 ├── gpu_renderer/           # decoder + presenter の D3D11 共有基盤、unsafe 境界
 ├── dsp/                    # chain 単位 VST3 bridge / GUI / scanner / extract
 ├── thumbnail.rs            # hover / marker thumbnail worker
+├── seek_strip.rs           # seek strip の軸・窓・gesture 純ロジック
+├── seek_strip_thumbs.rs    # seek strip の窓単位 thumbnail worker
+├── seek_strip_wave.rs      # seek strip の時間窓 waveform 解析・raster worker
 ├── tile_thumbnails.rs      # tile mode 一括 thumbnail worker
 ├── tile_thumb_cache.rs     # tile thumbnail SQLite/WebP cache
 ├── screenshot.rs           # 現在 frame の clipboard copy
@@ -673,7 +757,7 @@ src/video/
 分割) → Phase 3 (state machine 配線) → Phase 4 (薄い facade 化を最終形として固定) の
 順で導入された。
 
-`thumbnail.rs` の `ThumbnailWorker` は seek hover preview、mIV Remote の seek preview、
+`thumbnail.rs` の `ThumbnailWorker` は seek bar / seek strip の共有 hover preview、mIV Remote の seek preview、
 左 jump panel (pin/bookmark/chapter) のサムネイル warmup で共有する。API は
 `request_seek_thumbnail(target_secs, tolerance_secs)` / `nearest_seek_thumbnail(target_secs,
 tolerance_secs)` とし、許容値は worker global ではなく要求ごとに渡す。desktop hover は
@@ -713,6 +797,124 @@ thumbnail decoder を入れると動画→動画 fast-swap が恒常的に詰ま
 `FullscreenVideoMarkerCache` にデコード済み RGBA を載せて即表示する。DB の WebP
 BLOB 読み出しと WebP→RGBA decode は `video-marker-thumbs` worker で行い、UI thread
 側は pin/bookmark の軽量メタ (pts/title) だけを同期取得する。
+
+動画シークストリップの persisted source of truth は
+`Settings.video_seek_strip_state` (`none / thumbnails / waveform`) ひとつで、開閉 bool と mode を
+分けない。`video_seek_strip_last_choice` は `none` から上ドラッグで復元する non-none 選択だけを
+明示的に所有する。App の `VideoSeekStripRuntime` は設定とは別に、型付きの `SeekStripCenter`、
+サムネイル軸、2 種類の worker を 1 session として所有する。サムネイルモードの
+`SeekStripThumbnailWorker` は索引の列挙、採用する場面の選択、SQLite/WebP 読み込み、未取得画像の
+抽出を UI thread の外で行う。要求は可視窓と進行方向 1 画面分の latest-wins で、取得済み画像は
+窓を動かしても再利用する。再生追従は可視窓の半分が先読み coverage 内にある間は新要求を出さず、
+coverage を外れたときだけ進行方向 1 画面を追加要求する。最小間隔の設定変更は全索引から採用列だけを
+作り直し、実 timestamp をキーにした永続キャッシュは無効化しない。最小間隔は
+0.1 / 0.2 / 0.5 / 1 / 2 / 5 / 10 / 15 / 30 / 60 秒 (既定 15 秒) の段階値とする。
+索引セルの timestamp は seek domain であり、MP4 の `AVIndexEntry` では DTS のことがある。
+worker は窓内の同じ key packet の DTS と PTS を対応付けて presentation target を作り、decoded frame
+は許容内の過去側を優先し、過去側が無い場合だけ未来側へ fallback する。indexed cell の許容幅は
+前後それぞれ隣の raw index entry まで、`TimeGrid` は 1 grid interval までであり、隣の場面を越える
+frame は前後どちらからも採らない。先頭の raw DTS が負でも cell / cache identity として保持し、
+packet PTS との対応付け後に表示 frame を選ぶ。timestamp 不一致は該当セルだけを typed failure にして
+cursor を進めるため、1 セルが同じ decode run の後続を stranded にしない。永続 cache key は
+decoded PTS ではなく要求した index/grid timestamp のまま保つ。末尾 cell のように片側の raw entry が
+無い endpoint は、存在する側の隣接 gap を両方向の上限に使う。
+index entry は axis 用に sort する前の列挙順も診断し、逆行が 1 件でもあれば
+non_monotonic_index_timestamps 理由の TimeGrid にする。keyframe-only decoder が
+NoFrame / decode / convert failure になった場合は index 軸を捨てず、成功済みセルを保持したまま
+software full-frame decoder へ file-local に切り替える。各 run は先頭セルの 1 raw index gap 前から
+pre-roll し、参照 frame を復号してから同じ DTS → packet PTS → bounded frame matching を行う。
+通常素材は従来の keyframe-only 高速経路だけを通る。
+
+axis resolver は decode request より先に index 統計を確定する。complete index の最大 raw GOP が
+15.0 秒を越えた場合は `KeyframesTooSparse` の material unavailable とし、thumbnail decoder も
+waveform decoder も開かない。この preflight は waveform session でも同じ thumbnail worker の
+axis-only 前段を使う。結果は `VideoPlayer` が video-local な typed availability として所有し、App の
+session open、全 strip KeyAction、presenter の film button、シーク行の上ドラッグが同じ値を参照する。
+最初に判明した frame で既存の unavailable toast surfaceへ 1 回だけ理由を送り、strip の persisted
+3 値は `none` へ閉じる。presenter への `SetSeekStrip` command は payload と availability を同時に渡し、
+source session reset で `Unknown` へ戻すため、前ファイルの unavailable が次の動画へ漏れない。
+
+波形モードの `SeekStripWaveWorker` は既に完成済みの `TimelineAnalysis` が現在ファイルまたは
+音楽解析 LRU にあれば対象時間窓を切り出す。無ければ、動画ごとに 1 回だけ開く
+`AudioRangeDecoder` でまず設定された可視 span (5 / 10 / 15 / 30 秒、1 / 2 / 5 / 10 / 15 /
+30 / 60 / 120 / 180 分、既定 3 分) と 0.75 秒の pre-roll
+だけを 48kHz stereo PCM にして first-paint raster を返す。表示後は同じ中心の保持 span を
+background で作る。保持 span は通常 3 倍だが 3600 秒で上限とし、30 分表示では 60 分 / 2 倍
+物理幅に抑える。両側 15 分の coverage と中央 ±7.5 分の hysteresis trigger band は残る一方、
+90 分の音声 decode は発生しない。可視 span が 60 分以上なら保持 span は可視 span と同じになり、
+同幅の background upgrade は出さない。中心が可視幅の 25% を越えて動いたときだけ次の同幅 raster を
+要求する。粗い全尺ピーク列はまだ無く、60 / 120 / 180 分も現在位置中心の窓を 1 回デコードする。
+両段は秒 / pixel と bin 幅が同一なので交換時に内容が動かない。pre-roll bins は raster 前に捨て、
+全尺前提の beat grid は作らない。波形 raster の LRU は file identity、時間窓、
+bin 幅、物理幅をキーにしたメモリ内 8 件だけで、
+永続 cache は持たない。audio stream が無い場合は通常の media property として typed status で保持し、
+decode / analysis failure とは分けて presenter payload へ渡す。閉じる、動画切替、fullscreen 終了では
+session owner が両 worker を
+`cancel()` して payload を外す。
+
+App は毎 frame、所有権を持つ `NativeOverlaySeekStrip` payload を native presenter へ渡す。
+presenter は worker が作った RGBA だけを texture 化し、presenter thread では波形を再計算しない。
+可視 first-paint raster は同じ中心の保持用 upgrade が届くまで描き続ける。
+中心が保持 span の中央 trigger band にある間は同じ texture の可視 span sub-rectangle を UV で
+ずらして描く。中心が trigger band を外れたときだけ replacement を要求し、pending span を latch に
+した hysteresis で境界往復時の発振を防ぐ。worker は replacement 完了まで shared raster を外さず、
+presenter も旧 texture を描き続けるため、解析中の blank frame / upload は生じない。
+波形 texture が無い終端状態では、音声なしと表示失敗をそれぞれ日本語の短い案内として帯内に描く。
+解析中は案内を出さない。
+サムネイルは worker の settled outcome と、不正時刻だけの最新要求 index-level failure から、各セルを
+`pending / ready / failed` の 3 値へ純粋に決める。settled failure は outcome 自体が typed reason を
+所有する。`pending` だけを空の枠として残し、`failed` は理由別の短い日本語案内で区別する。窓が
+30 秒で埋まらない場合も未決着セルを timeout failure に確定する。軸解決後に補助 decoder を開けない
+terminal state はセルごとに
+繰り返さず、列全体を 1 個の案内へ置き換える。この判定は `KeyframeIndex / TimeGrid` を区別しない。
+軸解決そのものの失敗、worker thread spawn failure、cancel は既存の open / close lifecycle が扱い、
+presenter payload の案内状態にはしない。
+波形 span の設定変更時は、旧 worker を cancel/drop して保持 raster と LRU を request coverage から
+外す一方、現在の raster の Arc とその旧可視 span を display-only holdover として session に残す。
+新 first paint が publish された frame で raster と可視 span を一緒に交換するため、再構築中に blank
+や一時的な誤スケールを挟まない。
+strip 上の wheel は上回転を 1 段狭く、下回転を 1 段広くする typed command に変換し、該当する
+persisted range を即時保存する。旧版由来の段階外値は回した向きの直近段へ移す。native wheel の
+即時 item navigation は strip 矩形上で作らず、egui 側も MouseWheel event と scroll delta を消費する。
+背後の grid / item navigation へ再転送しない。右上の固定小文字は session の現在設定値を描き、
+波形再構築中の旧 raster scale とは別フィールドで運ぶ。
+サムネイルでは等幅セルの連続する小数位置、波形では設定された時間幅の時間線形軸を使い、どちらも
+固定中央線を描く。サムネイルの整数位置 `i` はセル `i` の左端であり、セルは `[i, i+1)` を
+占める。したがって中央線のセル内位置は `cell(i)` から `cell(i+1)` までの進み具合を表す。
+描画、pointer hit test、可視窓計算はすべてこの左端基準を使う。モード切替では中央時刻を
+保ったまま軸だけを交換する。ドラッグは press 時の
+中心と pointer を immutable origin とし、現在 pointer との差から毎 frame の中心と release 中心を
+同じ純関数で求める。release の 1 回だけ補間時刻へ精密 seek して必ず再生を始める。再生中は
+100ms cadence で
+playhead を中心へ戻し、ドラッグ中だけ追従を detach、release で再 attach する。HUD の vector
+film-strip button は `none → thumbnails → waveform → none` を 1 クリック巡回し、OFF は非アクティブ、
+waveform はフィルム上の vector 音符で区別する。ストリップ本体にはモード切替 UI を置かず、全域を
+ドラッグ面にする。左右パネルの端 hover band はストリップ表示中だけ 104pt 上へ退避し、非表示時は
+従来の HUD 上端境界を保つ。hover の単発 preview と tile overlay は排他的に扱う。
+
+**D17 の共有 1 枚プレビュー**: seek bar と seek strip は presenter-local な同じ preview target を
+更新し、`ThumbnailWorker` の latest-wins request、許容値計算、texture、描画出口を共有する。
+サムネイル mode は `cell_index_at_pointer` で実セル上を確認し、既存の連続セル位置から
+`StripAxis::time_for_center_index` へ渡す。波形 mode は `waveform_time_at_pointer` を使う。
+strip が `Some` の間は preview rect の下端を `native_seek_strip_rect().min.y - 14pt` に置き、
+短い viewport では 16:9 画像を縮めて strip と重ならない不変条件を優先する。strip が無ければ従来の
+下部 HUD 上端 - 14pt を基準にする。描画は既存の 64pt HUD `Area` から行い、全画面の受動 `Area` は
+作らない。`last_drawn_preview_rect` が実描画 rect を保持し、`compute_hud_regions` はその値をそのまま
+HUD HWND region へ入れるため、位置と入力 region は同じ snapshot に追従する。strip の鍵上では
+preview target を抑止し、drag 中は strip が pointer を所有する限り更新を続ける。tile / 音声 mode /
+長さ不明では出さず、source swap、strip close、mode switch では target と worker request を typed
+`ClearSeekThumbnail` 経路で閉じる。
+
+ストリップ上の cursor ownership は egui の `pointer_hover_pos` ではなく、HUD 可視性が使う
+presenter-owned `visibility_hover_pos()` を位置正本にする。HUD / presenter の別 HWND 間を
+移動中に egui hover が一時的に消えても、native hover がストリップ内なら横 resize cursor を維持し、
+native hover が外れた frame でだけ Arrow へ戻す。
+
+動画 info の `duration_secs` が finite な正数でない場合は、再生自体を失敗扱いにせず、info を 1 回
+受信する ownership boundary で「長さ情報がないためシークバーとシークストリップは使えないが、再生は
+できる」と native presenter toast へ 1 回だけ送る。同じ pure predicate を strip session の open gate と
+presenter のシーク行 / フィルムボタンに使い、キー操作も設定状態を変更しない no-op にする。
+keyframe が疎すぎる material unavailable も同じ UI surface と入力 gate を使い、理由文だけを変える。
 
 ### 各ファイルの責務
 
@@ -1180,6 +1382,15 @@ HW decode 有効かつ `LIVE_VIDEO_DECODE_THREADS >= MAX_LIVE_VIDEO_DECODE_THREA
 から `LIVE_VIDEO_DECODE_THREADS` を再判定し、空いたら同じ idx / path / from_grid intent で
 open を再開する。新しい動画要求が来たら pending は最新 1 件に置き換える。ESC /
 fullscreen exit / items 差し替えで stale になった pending は破棄する。
+
+R2e ownership 以後、regular-open pending の owner は window ID や
+`native_video_parked_live_input_window_id` ではなく enqueue 時の `ViewerContextId` である。
+Building 中は予約済み context ID、通常の poll 中は App に投影中の context ID を使う。
+AtRest / Mounted、active / ParkedLive、window binding は別の軸なので、この pending owner を
+変更しない。live-media fork で payload 自体が新 context へ分岐するときだけ、同じ registry
+transaction 境界で owner を transfer する。detached host 待ちは owner context が投影された
+frame だけが進め、登録済み host HWND の client rect が正サイズになれば decoder gate と open
+再開へ進む。
 
 perf event:
 - `regular_open_deferred`: live decoder 上限で通常 open を保留
@@ -2087,7 +2298,8 @@ Enter / ダブルクリック等で次に開くまで再表示しない。
 main-window in-window active ではない。
 
 detached メディアを再生したままメイン一覧でフォルダ / お気に入りなどの context を切り替える場合、
-メディアは `active_detached_viewer_context` 側へ切り離して再生を維持する。切り離し後は
+メディアは viewer context registry の独立 context へ promote して再生を維持する。window binding は
+同じ context を指し続け、切り離し後は
 メイン一覧の選択変更に追従せず、メディア窓内の前後移動は切り離し時に保持していた同一一覧内だけを
 対象にする。`Ctrl+↑↓` / `Ctrl+PageUp/PageDown` のフォルダ横断は、静止画のピン /
 always-new 窓と同じく no-op として扱う。

@@ -14,8 +14,8 @@ use crate::settings::{
     self, AiFeatureMode, ArchiveFileHandling, CachePolicy, FullscreenFitMode,
     FullscreenHorizontalCursorDirection, FullscreenJumpMode, FullscreenSeekDirection,
     GridItemDisplayKind, Parallelism, ReadingDirection, ReadingFlow, SortOrder, SpreadMode,
-    StartupFolderMode, TextContrast, UI_FONT_VERTICAL_ADJUST_MAX, UI_FONT_VERTICAL_ADJUST_MIN,
-    UiFontSelection, UiTheme,
+    StartupFolderMode, StartupWindowState, TextContrast, UI_FONT_VERTICAL_ADJUST_MAX,
+    UI_FONT_VERTICAL_ADJUST_MIN, UiFontSelection, UiTheme,
 };
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
@@ -366,7 +366,7 @@ pub(super) fn page_font(ui: &mut egui::Ui, state: &mut PreferencesState) {
     }
 }
 
-pub(super) fn page_startup_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
+pub(super) fn page_startup(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "startup/mode", |ui, state| {
         ui.label(egui::RichText::new("起動時に開く場所").strong());
         ui.add_space(4.0);
@@ -442,6 +442,39 @@ pub(super) fn page_startup_folder(ui: &mut egui::Ui, state: &mut PreferencesStat
         )
         .weak(),
     );
+    });
+
+    ui.add_space(14.0);
+    ui.separator();
+    ui.add_space(10.0);
+
+    anchored(ui, state, "startup/window-state", |ui, state| {
+        ui.label(egui::RichText::new("起動時のウィンドウ状態").strong());
+        ui.add_space(4.0);
+
+        ui.radio_value(
+            &mut state.settings.startup_window_state,
+            StartupWindowState::RememberLast,
+            StartupWindowState::RememberLast.label(),
+        );
+        ui.radio_value(
+            &mut state.settings.startup_window_state,
+            StartupWindowState::Normal,
+            StartupWindowState::Normal.label(),
+        );
+        ui.radio_value(
+            &mut state.settings.startup_window_state,
+            StartupWindowState::Maximized,
+            StartupWindowState::Maximized.label(),
+        );
+
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(
+                "ウィンドウの位置とサイズは、どの選択でも前回終了時のものを復元します。\n最大化を解いたときは、その位置とサイズに戻ります。",
+            )
+            .weak(),
+        );
     });
 }
 
@@ -6067,16 +6100,29 @@ pub(super) fn draw_video_bar_visibility_settings(
 ) {
     ui.label(egui::RichText::new("再生画面のバー").strong());
     ui.add_space(4.0);
-    ui.label("動画の上部と下部のバーをそれぞれ固定表示できます。");
+    ui.label("動画の上部バーと、下部バー・シークストリップを固定表示できます。");
     ui.add_space(6.0);
 
     ui.checkbox(&mut settings.video_top_bar_locked, "上部情報バーを固定表示");
     ui.small("ON のときは再生画面上端に情報バー領域を確保し、映像をその下の領域にフィットします。上部情報バー端の鍵アイコンからも切り替えできます。");
-    ui.checkbox(
-        &mut settings.video_seek_bar_locked,
-        "下部シークバーを固定表示",
-    );
+    let mut bottom_lock = settings.video_bottom_lock();
+    let mut seek_bar_locked = bottom_lock.bar_locked();
+    if ui
+        .checkbox(&mut seek_bar_locked, "下部シークバーを固定表示")
+        .changed()
+    {
+        bottom_lock = bottom_lock.with_bar(seek_bar_locked);
+        settings.set_video_bottom_lock(bottom_lock);
+    }
     ui.small("ON のときは再生画面下端にシークバー領域を確保し、映像をその上の領域にフィットします。下部シークバー端の鍵アイコンからも切り替えできます。");
+    let mut seek_strip_locked = bottom_lock.strip_locked();
+    if ui
+        .checkbox(&mut seek_strip_locked, "シークストリップを固定表示")
+        .changed()
+    {
+        settings.set_video_seek_strip_locked(seek_strip_locked);
+    }
+    ui.small("ON にするとストリップを開いたままにし、下部シークバーも固定して、ストリップの領域を映像から除外します。ストリップ右上の鍵アイコンからも切り替えできます。");
     ui.small("固定バーと映像の間隔は、静止画フルスクリーンと共通の余白設定を使います。");
 }
 
@@ -6194,6 +6240,68 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 egui::RichText::new(
                     "大きいほどシークバーのプレビューが早く表示されます。0.0 は位置の正確さを優先します。\n\
                      大きめの値で構いません。迷ったら大きめにしてください。値を上げても、実際のズレはその動画で利用できる近い画像までに限られます。",
+                )
+                .small(),
+            );
+        });
+
+        ui.add_space(8.0);
+        anchored(ui, state, "video/seek-strip-interval", |ui, state| {
+            let s = &mut state.settings;
+            ui.horizontal(|ui| {
+                ui.label("シークストリップの画像間隔");
+                egui::ComboBox::from_id_salt("video_seek_strip_min_interval")
+                    .selected_text(crate::video::seek_strip::format_seek_strip_range_value(
+                        crate::settings::VideoSeekStripMode::Thumbnails,
+                        s.video_seek_strip_min_interval_secs,
+                    ))
+                    .show_ui(ui, |ui| {
+                        for &step in crate::video::seek_strip::THUMBNAIL_RANGE_STEPS_SECS {
+                            ui.selectable_value(
+                                &mut s.video_seek_strip_min_interval_secs,
+                                step,
+                                crate::video::seek_strip::format_seek_strip_range_value(
+                                    crate::settings::VideoSeekStripMode::Thumbnails,
+                                    step,
+                                ),
+                            );
+                        }
+                    });
+            });
+            ui.label(
+                egui::RichText::new(
+                    "大きいほど、ストリップ 1 画面でより長い時間を見渡せるため、大まかな位置を探す用途に向きます。",
+                )
+                .small(),
+            );
+        });
+
+        ui.add_space(8.0);
+        anchored(ui, state, "video/seek-strip-waveform-span", |ui, state| {
+            let s = &mut state.settings;
+            ui.horizontal(|ui| {
+                ui.label("音声波形で見渡す範囲");
+                egui::ComboBox::from_id_salt("video_seek_strip_waveform_span")
+                    .selected_text(crate::video::seek_strip::format_seek_strip_range_value(
+                        crate::settings::VideoSeekStripMode::Waveform,
+                        s.video_seek_strip_waveform_span_secs,
+                    ))
+                    .show_ui(ui, |ui| {
+                        for &step in crate::video::seek_strip::WAVEFORM_RANGE_STEPS_SECS {
+                            ui.selectable_value(
+                                &mut s.video_seek_strip_waveform_span_secs,
+                                step,
+                                crate::video::seek_strip::format_seek_strip_range_value(
+                                    crate::settings::VideoSeekStripMode::Waveform,
+                                    step,
+                                ),
+                            );
+                        }
+                    });
+            });
+            ui.label(
+                egui::RichText::new(
+                    "大きいほど、音声波形で動画の長い範囲を一度に見渡せます。初めて表示するまでの時間は長くなります。",
                 )
                 .small(),
             );

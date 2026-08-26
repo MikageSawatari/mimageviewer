@@ -97,7 +97,7 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     ),
     entry!(
         "startup/mode",
-        StartupFolder,
+        Startup,
         "起動時に開く場所",
         [
             "起動フォルダ",
@@ -109,9 +109,22 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     ),
     entry!(
         "startup/specific-folder",
-        StartupFolder,
+        Startup,
         "指定フォルダ:",
         ["パス", "folder", "directory"]
+    ),
+    entry!(
+        "startup/window-state",
+        Startup,
+        "起動時のウィンドウ状態",
+        [
+            "最大化",
+            "ウィンドウサイズ",
+            "サイズ復元",
+            "位置",
+            "maximize",
+            "window"
+        ]
     ),
     entry!(
         "explorer/context-menu",
@@ -746,6 +759,7 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         [
             "上部情報バー",
             "下部シークバー",
+            "シークストリップ",
             "固定表示",
             "鍵",
             "領域を確保",
@@ -770,6 +784,18 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         Video,
         "シーク時のズレ許容 (秒)",
         ["プレビュー", "サムネイル", "速度", "位置", "seek"]
+    ),
+    entry!(
+        "video/seek-strip-interval",
+        Video,
+        "シークストリップの画像間隔",
+        ["動画", "サムネイル", "見渡す", "大まか", "seek"]
+    ),
+    entry!(
+        "video/seek-strip-waveform-span",
+        Video,
+        "音声波形で見渡す範囲",
+        ["動画", "波形", "音声", "見渡す", "長時間", "seek"]
     ),
     entry!(
         "video/remote-streaming",

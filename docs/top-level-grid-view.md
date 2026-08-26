@@ -13,6 +13,12 @@ surface を共有する。現在の最上位 surface と一時ビューからの
 `take_return_to()` で snapshot を次の遷移へ移譲する。戻る時は
 `restore_view_return_context()` が実フォルダと synthetic view を同じ型から振り分ける。
 
+検索由来の ★固定を別 viewer context へ fork する場合、`TopLevelGridView` / snapshot と、
+Ctrl+S / Ctrl+G の synthetic subfolder restore payload は同じ `ViewerContextBundle` に複製する。
+rating filter の一時解除 anchor も context 所有であり、一方の snapshot 解除が sibling の
+anchor や fallback を `take()` してはならない。canonical `return_to` が存在する遷移では、
+未使用の legacy fallback slot は consume しない。
+
 ブックマーク一覧は `TopLevelGridSurface::Bookmarks` を所有者とし、動画・音声・本の各ブックマークを
 `App.items` の 1 行へ materialize する。ブックマーク ID、登録位置、登録日時、欠落状態、保存済み動画
 サムネイルは同じ index の sidecar row に保持する。通常の facet / rating / tag / details 表示を共有する一方、

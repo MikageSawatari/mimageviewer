@@ -723,12 +723,22 @@ unsafe extern "system" fn hud_wnd_proc(
         //
         // 現在の方針 (2026-06-06): WM_SETCURSOR では復帰も SetCursor もせず `LRESULT(1)` を返す
         // だけ (= DefWindowProc がクラスカーソルを出すのを防ぎ、直近 SetCursor を維持)。
+        // presenter 側の対になる方針は `native_window.rs` の WM_SETCURSOR branch に置く。
         // navigation preview は source swap 中に HUD region を全画面化するため、キー操作だけでも
         // 静止 cursor の下へ HUD HWND が広がり WM_SETCURSOR / zero-delta WM_MOUSEMOVE が発生する。
         // ここ (や WM_MOUSEMOVE) で復帰すると「↓キーで次の動画に行くだけで cursor が復活」する。
         // 実カーソルアイコンは pump-owned reducer が local input ownership を確認して駆動する。
         // ownership を失った後は外部 window の WM_SETCURSOR に任せ、ここでは書き込まない。
-        WM_SETCURSOR => LRESULT(1),
+        WM_SETCURSOR => {
+            let hit_test = signed_low_word(lparam.0);
+            let trigger_message = ((lparam.0 as u32 >> 16) & 0xffff) as u16;
+            let result = LRESULT(1);
+            crate::video::cursor_debug::log(format_args!(
+                "layer=win32 event=WM_SETCURSOR window=hud hwnd=0x{:016X} cursor_hwnd=0x{:016X} hit_test={hit_test} trigger_message=0x{trigger_message:04X} handler=explicit returned={}",
+                hwnd.0 as usize as u64, wparam.0 as u64, result.0,
+            ));
+            result
+        }
 
         WM_NCHITTEST => {
             // SetWindowRgn で region 外は OS が下層に転送するため通常ここまで来ない。
@@ -750,6 +760,12 @@ unsafe extern "system" fn hud_wnd_proc(
         }
 
         WM_MOUSEMOVE => {
+            crate::video::cursor_debug::log(format_args!(
+                "layer=win32 event=WM_MOUSEMOVE window=hud hwnd=0x{:016X} client_px=({}, {})",
+                hwnd.0 as usize as u64,
+                signed_low_word(lparam.0),
+                signed_high_word(lparam.0),
+            ));
             if should_discard_promoted_touch_mouse(msg, NativeVideoWindowSource::Hud) {
                 return LRESULT(0);
             }

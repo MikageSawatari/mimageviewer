@@ -1682,7 +1682,7 @@ pub struct DecodeHandles {
 /// `engine_event_tx` (Phase 3e) は decoder thread から SeekCompleted を engine に
 /// 通知するために使う。これがないと runtime seek 後 engine が永久 Seeking 状態に
 /// 張り付き、pacing escape も解除されない。
-pub fn spawn(
+pub(crate) fn spawn(
     path: PathBuf,
     clock: Arc<AvClock>,
     cancel: Arc<AtomicBool>,
@@ -1693,7 +1693,7 @@ pub fn spawn(
         std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
     >,
     engine_state: Arc<std::sync::atomic::AtomicU8>,
-    engine_event_tx: crossbeam_channel::Sender<crate::video::engine::EngineEvent>,
+    engine_event_tx: crate::video::EngineEventSender,
     skipped_frame_count: Arc<std::sync::atomic::AtomicU64>,
     dynamic: Arc<VideoDynamicState>,
 ) -> DecodeHandles {
@@ -1760,8 +1760,12 @@ pub fn spawn(
                 // エラー表示に倒す (info_rx の Err 経路 = VideoPlayer.error)。
                 // info 送信済みで bounded(1) が埋まっている場合 try_send は失敗するが、
                 // そのケースは既に再生が始まっているので下の Failed event 側で拾う。
-                let _ = info_tx_for_panic
-                    .try_send(Err("動画の再生中に内部エラーが発生しました".to_string()));
+                if info_tx_for_panic
+                    .try_send(Err("動画の再生中に内部エラーが発生しました".to_string()))
+                    .is_ok()
+                {
+                    engine_event_tx_for_panic.wake_ui();
+                }
                 // 再生開始後の panic 用: engine を Loading/Playing から Idle へ戻す。
                 let _ =
                     engine_event_tx_for_panic.try_send(crate::video::engine::EngineEvent::Decoder(
@@ -1774,6 +1778,7 @@ pub fn spawn(
                 // (mod.rs: `if self.clock.decode_failed()`) を発火させ、無言フリーズ
                 // ではなくエラー表示に倒す (v1.0.0 安定性レビュー P3-2)。
                 clock_for_panic.set_decode_failed(true);
+                engine_event_tx_for_panic.wake_ui();
             }
         })
         .expect("spawn video-decode thread");
@@ -1784,6 +1789,16 @@ pub fn spawn(
         info_rx,
         prep_progress,
         video_tap,
+    }
+}
+
+fn send_video_info(
+    info_tx: &Sender<Result<VideoInfo, String>>,
+    engine_event_tx: &crate::video::EngineEventSender,
+    result: Result<VideoInfo, String>,
+) {
+    if info_tx.send(result).is_ok() {
+        engine_event_tx.wake_ui();
     }
 }
 
@@ -1898,7 +1913,7 @@ fn run_decoder(
         std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
     >,
     engine_state: Arc<std::sync::atomic::AtomicU8>,
-    engine_event_tx: crossbeam_channel::Sender<crate::video::engine::EngineEvent>,
+    engine_event_tx: crate::video::EngineEventSender,
     video_tx: Sender<VideoFrame>,
     video_tap: VideoTapProducer,
     audio_tx: Sender<AudioFrame>,
@@ -1926,7 +1941,11 @@ fn run_decoder(
     let path_label = path.display().to_string();
     crate::logger::log(format!("[demux] run_decoder start: path={path_label}"));
     if let Err(e) = ffmpeg::init() {
-        let _ = info_tx.send(Err(format!("ffmpeg::init failed: {e}")));
+        send_video_info(
+            &info_tx,
+            &engine_event_tx,
+            Err(format!("ffmpeg::init failed: {e}")),
+        );
         return;
     }
     crate::logger::log(format!(
@@ -1954,7 +1973,7 @@ fn run_decoder(
         match crate::video::avio_progress::input_with_progress(&path, Arc::clone(&prep_progress)) {
             Ok(v) => v,
             Err(e) => {
-                let _ = info_tx.send(Err(format!("open input: {e}")));
+                send_video_info(&info_tx, &engine_event_tx, Err(format!("open input: {e}")));
                 return;
             }
         }
@@ -2030,7 +2049,11 @@ fn run_decoder(
             let video_params_owned = match clone_codec_parameters(&video_params) {
                 Ok(p) => p,
                 Err(e) => {
-                    let _ = info_tx.send(Err(format!("video codec parameters clone: {e}")));
+                    send_video_info(
+                        &info_tx,
+                        &engine_event_tx,
+                        Err(format!("video codec parameters clone: {e}")),
+                    );
                     return;
                 }
             };
@@ -2084,7 +2107,11 @@ fn run_decoder(
             let opened_video = match opened_video_result {
                 Ok(v) => v,
                 Err(e) => {
-                    let _ = info_tx.send(Err(format!("video decoder open: {e}")));
+                    send_video_info(
+                        &info_tx,
+                        &engine_event_tx,
+                        Err(format!("video decoder open: {e}")),
+                    );
                     return;
                 }
             };
@@ -2273,7 +2300,11 @@ fn run_decoder(
     // audio-only 対応: video も audio も無ければ再生できるものが無い。ここで初めて
     // エラーにする (= 添付画像だけの MP3 で映像も音声も開けなかった等の異常時)。
     if !has_video && !has_audio {
-        let _ = info_tx.send(Err("再生可能なストリームが見つかりません".into()));
+        send_video_info(
+            &info_tx,
+            &engine_event_tx,
+            Err("再生可能なストリームが見つかりません".into()),
+        );
         return;
     }
 
@@ -2427,7 +2458,7 @@ fn run_decoder(
         sar_den: vi_sar_den,
         orientation: vi_orientation,
     };
-    let _ = info_tx.send(Ok(info));
+    send_video_info(&info_tx, &engine_event_tx, Ok(info));
 
     if let Some(v) = video_setup.as_ref() {
         crate::logger::log(format!(
@@ -2687,6 +2718,7 @@ fn run_decoder(
         let clock_v = clock.clone();
         let cancel_v = cancel.clone();
         let engine_state_v = engine_state.clone();
+        let engine_event_tx_v = engine_event_tx.clone();
         let skipped_frame_count_v = skipped_frame_count.clone();
         let dynamic_v = Arc::clone(&dynamic);
         // video_tx の所有を video decode thread に move。run_decoder (= demux) 側は
@@ -2721,6 +2753,7 @@ fn run_decoder(
                         clock_v,
                         cancel_v,
                         engine_state_v,
+                        engine_event_tx_v,
                         skipped_frame_count_v,
                         dst_w,
                         dst_h,
@@ -3265,6 +3298,7 @@ fn run_decoder(
             // idle ループで待つ。これで末尾停止後の re-seek / replay が
             // decoder 再生成なしで動作する。
             clock.notify_eof_reached();
+            engine_event_tx.wake_ui();
             // Phase A: audio decode thread にも Eof を通知して残フレームを drain させる。
             // (= 末尾の音声を確実に出し切る。drain しないと数十 ms の音声が抜ける。)
             if audio_stream_idx_for_demux.is_some() {
@@ -3381,6 +3415,7 @@ fn run_video_decode(
     clock: Arc<AvClock>,
     cancel: Arc<AtomicBool>,
     engine_state: Arc<std::sync::atomic::AtomicU8>,
+    engine_event_tx: crate::video::EngineEventSender,
     skipped_frame_count: Arc<std::sync::atomic::AtomicU64>,
     dst_w: u32,
     dst_h: u32,
@@ -3514,6 +3549,7 @@ fn run_video_decode(
                 );
             }
             clock.set_decode_failed(true);
+            engine_event_tx.wake_ui();
             break 'outer;
         }
 
@@ -3958,6 +3994,7 @@ fn run_video_decode(
                         );
                     }
                     clock.set_decode_failed(true);
+                    engine_event_tx.wake_ui();
                     break 'outer;
                 }
                 continue;
@@ -4679,6 +4716,7 @@ fn run_video_decode(
                                         );
                                     }
                                     clock.set_decode_failed(true);
+                                    engine_event_tx.wake_ui();
                                     break 'outer;
                                 }
                                 // この frame は捨てて次の packet 処理に進む

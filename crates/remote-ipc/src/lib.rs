@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 51;
+pub const PROTOCOL_VERSION: u32 = 52;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -228,6 +228,9 @@ pub struct ContainerRequest {
 }
 
 /// Web へ公開するページ構成。旧 DB 互換用 `Vertical` は本体側で `Single` へ解決してから返す。
+///
+/// `SplitLtr` / `SplitRtl` は横長 1 ページを左右へ分けて 2 回の表示ステップとして読むモード。
+/// 見開きとは**排他**で、`is_rtl` には含めない (見開きのペア並び順とは別の概念)。
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteSpreadMode {
@@ -236,11 +239,66 @@ pub enum RemoteSpreadMode {
     LtrCover,
     Rtl,
     RtlCover,
+    SplitLtr,
+    SplitRtl,
 }
 
 impl RemoteSpreadMode {
     pub fn is_rtl(self) -> bool {
         matches!(self, Self::Rtl | Self::RtlCover)
+    }
+
+    /// 横長ページを左右へ分割して読むモードか。
+    pub fn is_split(self) -> bool {
+        matches!(self, Self::SplitLtr | Self::SplitRtl)
+    }
+
+    /// wire 上の名前。JSON も query 文字列もこの綴りを使う。
+    ///
+    /// **この enum の綴りを列挙する場所を他に作らないこと。**query 文字列側に同じ表を
+    /// 手で書いていたため、`SplitLtr` / `SplitRtl` を足したときに片方だけ古いままになり、
+    /// 端末からモードを選ぶと 400 が返って分割が一切効かなかった (2026-08-26)。
+    /// ここは網羅 match なので、variant を足せばコンパイルが止まる。
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Ltr => "ltr",
+            Self::LtrCover => "ltr_cover",
+            Self::Rtl => "rtl",
+            Self::RtlCover => "rtl_cover",
+            Self::SplitLtr => "split_ltr",
+            Self::SplitRtl => "split_rtl",
+        }
+    }
+
+    /// wire 上の名前から戻す。**表を持たず serde の derive をそのまま使う**ので、
+    /// variant を足しても解析側を直し忘れようがない。
+    pub fn from_wire_name(name: &str) -> Option<Self> {
+        use serde::de::IntoDeserializer;
+        let deserializer: serde::de::value::StrDeserializer<serde::de::value::Error> =
+            name.into_deserializer();
+        Self::deserialize(deserializer).ok()
+    }
+}
+
+/// 分割したページの、どちら側を表示しているか。
+///
+/// **元ページのアドレスは変えない。** `PageGroup.anchor` は画像取得・履歴 URL・
+/// キャッシュの identity として使われており、そこへ半分を埋め込むと URL と転送まで
+/// 巻き込む。本体と同じく「元は正本、左右は表示だけ」に揃える。
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemotePageSlice {
+    #[default]
+    Full,
+    Left,
+    Right,
+}
+
+impl RemotePageSlice {
+    /// 半分だけを表示しているか。
+    pub fn is_half(self) -> bool {
+        matches!(self, Self::Left | Self::Right)
     }
 }
 
@@ -874,8 +932,14 @@ pub struct ContainerEntry {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct PageGroup {
     /// 読み順でこの表示単位の先頭になるページ。履歴 URL とグループ移動の identity。
+    ///
+    /// **分割中は同じ anchor の group が 2 つ並ぶ**ので、これ単体では表示単位を
+    /// 特定できない。位置の照合は `(anchor, slice)` の組で行うこと。
     pub anchor: RemoteAddress,
     pub pages: Vec<RemoteAddress>,
+    /// 分割中にこの表示単位が元ページのどちら側か。分割していなければ `Full`。
+    #[serde(default)]
+    pub slice: RemotePageSlice,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -2674,8 +2738,42 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v51_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
-        assert_eq!(PROTOCOL_VERSION, 51);
+    /// wire 上の綴りは JSON と query 文字列で同じでなければならない。
+    ///
+    /// **この 2 つを別々の表で書いていたのが実害の原因**なので、片方が動いていることでは
+    /// なく、**両方が同じ綴りに落ちること**を確かめる。
+    fn every_spread_mode_has_one_spelling_for_json_and_query() {
+        let modes = [
+            RemoteSpreadMode::Single,
+            RemoteSpreadMode::Ltr,
+            RemoteSpreadMode::LtrCover,
+            RemoteSpreadMode::Rtl,
+            RemoteSpreadMode::RtlCover,
+            RemoteSpreadMode::SplitLtr,
+            RemoteSpreadMode::SplitRtl,
+        ];
+        for mode in modes {
+            let json = serde_json::to_string(&mode).expect("serialize");
+            assert_eq!(
+                json,
+                format!("\"{}\"", mode.wire_name()),
+                "JSON と query 名が食い違っている: {mode:?}"
+            );
+            assert_eq!(
+                RemoteSpreadMode::from_wire_name(mode.wire_name()),
+                Some(mode),
+                "query 名から戻せない: {mode:?}"
+            );
+        }
+        // 綴りが重複していれば往復が壊れるので、重複していないことも上で保証される。
+        assert_eq!(RemoteSpreadMode::from_wire_name("vertical"), None);
+        assert_eq!(RemoteSpreadMode::from_wire_name(""), None);
+        assert_eq!(RemoteSpreadMode::from_wire_name("Single"), None);
+    }
+
+    #[test]
+    fn protocol_v52_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
+        assert_eq!(PROTOCOL_VERSION, 52);
         let expected = ClientMessage::RemoteWebConnectionInfo {
             id: 10,
             info: RemoteWebConnectionInfo {
@@ -2850,8 +2948,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v51_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 51);
+    fn protocol_v52_remote_video_thumbnail_shape_round_trips() {
+        assert_eq!(PROTOCOL_VERSION, 52);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -3005,6 +3103,7 @@ mod tests {
                 page_groups: vec![PageGroup {
                     anchor: page(0),
                     pages: vec![page(1), page(0)],
+                    slice: RemotePageSlice::Full,
                 }],
                 entry_limit: 1000,
                 truncated: false,
@@ -3334,6 +3433,7 @@ mod tests {
                 page_groups: vec![PageGroup {
                     anchor: page.clone(),
                     pages: vec![page],
+                    slice: RemotePageSlice::Full,
                 }],
                 entry_limit: 1000,
                 truncated: false,
