@@ -1299,8 +1299,8 @@ HUD コマンドをアクティブ化へ変換し、**それ以外の利用者�
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
 **2026-08-27 terminal retire 時の context-owned producer 停止を bundle Drop へ集約
-(利用者提示の ClaudeCode sweep と Codex の source inspection が一致。ClaudeCode 最終 review /
-mutation check 待ち):**
+(利用者提示の ClaudeCode sweep と Codex の source inspection が一致。ClaudeCode review /
+mutation check 完了。cancel 4 件を個別に抑す mutation で各テストが落ちることを確認済み):**
 
 **触った範囲**: [src/app/viewer_context_registry.rs](../src/app/viewer_context_registry.rs) の
 `ViewerContextBundle::cancel_all_context_work` と `Drop for ViewerContextBundle`、
@@ -1327,7 +1327,7 @@ detached heuristic は追加していない。4 cancel 行をそれぞれ個別�
 §2 の context ownership 境界修正であり leak 対策用の過剰な lifecycle machinery ではない。
 
 **2026-08-26 ★固定に残っていた context ownership / index-space 同期の補完
-(利用者指定の構造修正、Codex 実装。ClaudeCode review / mutation check 待ち):**
+(利用者指定の構造修正、Codex 実装。ClaudeCode review / mutation check 完了):**
 
 **触った範囲**: [src/app/viewer_context_registry.rs](../src/app/viewer_context_registry.rs) の
 `ViewerContextBundle` mount / fork policy、[src/app/snapshot_ops.rs](../src/app/snapshot_ops.rs) と

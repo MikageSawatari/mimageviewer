@@ -2801,6 +2801,88 @@ Codex は方針に同意したうえで、一次分類案に **5 件の反例**�
   待ち方を変えるのであって、待たなくするのではない。
 - 規模 \\ 優先度: Small 〜 Medium / P3。
 
+### 1.131 v3.3.0 出荷前レビュー (Codex) の指摘と対応 ✅ 完了 (2026-08-27)
+
+- 出典: 2026-08-27、Codex による `v3.2.0..HEAD` の出荷前レビュー。
+  実装は Codex Sol、検収は ClaudeCode (3 本の brief に分けて実施)。
+
+#### P1 — 製品版に `Drop for ViewerContextBundle` が存在しなかった ✅
+
+`#[cfg(all(test, windows))]` と `#[cfg(windows)]` が重なっており、複数の
+`#[cfg]` は AND されるので実効条件が `test && windows` になっていた。
+`2918e639` (read view 導入) で事故的に追加されたもの。
+
+worker pool (5〜14 スレッド) の condvar を起こす唯一の経路なので、
+**窓の開閉ごとに 1 プールずつ永久残留**していた。実機で 400 スレッドまで
+増えるのを確認し、修正後は繰り返しても増えないことを確認済み。
+
+再発防止は **製品ビルドで落ちる形** にした (テストでは検出できない穴だったため):
+
+- `#[cfg(all(windows, not(test)))]` の const item が `ViewerContextBundle: Drop` を要求 → E0277
+- `tools/viewer_context_audit` に正規形を登録
+
+両方ともバグを再導入して実際に落ちることを確認済み。
+
+⚠ **検証中に踏んだ罠**: worktree が 2 つあると `target\dev-runtime\mimageviewer-core.exe` も
+2 つできる。相対パスで起動手順を渡したため、利用者が**修正の無い別 worktree の
+ビルド**を測っていた。どのビルドが書いたログかは `ffmpeg DLLs expected at ...` 行で判別できる。
+今後は検証バイナリを**絶対パス**で渡す。
+
+#### P2-2 / P2-3 — App-global slot の context 所有化 ✅ (ただし到達性に訂正あり)
+
+`rating_filter_suppressed_at` / `favsearch_subfolder_restore` / `global_search_subfolder_restore`
+を `ViewerContextBundle` へ移し、既存の `swap_field!` 契約に乗せた。
+
+⚠ **レビューの前提は実機と違った**。「A 窓の一時解除を B 窓の snapshot 解除が消す」
+とされていたが、**今日の mIV では踏めない**:
+
+- ★固定 (snapshot) は **メインウィンドウのツールバー専用**で、メインは 1 つしかない
+- suppression を立てる経路は、直前の
+  `if self.open_grid_container_in_detached_book_context(..) { return None; }` で
+  **別ウィンドウ側が早期 return する**
+
+つまりこの修正は「今起きている不具合の修正」ではなく、
+**fork が増えたときに踏む穴を先に塞いだもの**。単体テストが検証手段で、
+**手動確認の手順は作れない** (次に同じ指摘が出たときに再調査しないこと)。
+
+ただし P2-3 のうち **「canonical な `return_to` があるときでも fallback slot を
+消費していた」半分は単一窓でも成立する**ので、こちらは実害の修正。
+
+#### §1.126 / §1.127 — 添字空間の追従 ✅
+
+`SnapshotState` に `saved_image_metas` / `list_view_image_metas` を追加し、
+`items` / `thumbnails` と同じ `mem::replace` の並びへ入れた。Details は専用の
+invalidate / rebuild 境界を作り、**color filter OFF でも**最終 `visible_indices` から order を
+再構築する (ON だと後段の `rebuild_visible_indices` が偶然直していた)。実機確認済み。
+
+#### P2-4 — `cancel_all_context_work` へ集約 ✅
+
+既存 8 件 + 新規 4 件 (`fs_pending` / `details_meta_pending` / `comic_bake_pending` /
+`erase_inpaint_pending`) を 1 つの関数へ。`Drop` がそれだけを呼ぶので、
+`close_fullscreen` を経ない bulk retire 経路も**構造的に**カバーされる。
+
+**重大度は P1 と別物** — こちらは一発型 worker で自然終了し、**蓄積しない**。
+コストは孤児化したジョブ 1 件分の CPU / GPU / AI 時間 (最悪で MI-GAN 完走)。
+この区別を曖昧にすると watchdog 等の過剰な機構を呼び込むので明記する。
+
+✅ `facet_name_cache_pending` は有限 worker を持つが cancel ハンドルが無く、
+**あえて新設しない**判断 (得られるのは有限ジョブ 1 本の末尾だけで、
+代わりに worker 側へ新しい監視点が増える)。
+`pdf_enumerate_pending` は `PdfEnumerateHandle::Drop` が既に自己処理していた。
+
+#### 検収で使った手法
+
+全 12 件の mutation (各 cancel / 各 guard を 1 つずつ壊し、名指しされたテストが
+落ちるか確認) を実施。すべて期待どおり落ちた。
+
+⚠ 検収側の事故 2 件 (記録): ① フィールド名を変える mutation は参照側が
+全壊れてコンパイル不能になり不定になる (→ `swap_field!` の 1 行だけ消す形へ)。
+② 置換先を空文字列にすると逆変換が全箇所にマッチして**復元できず、
+Codex の修正の半分が消えたままになった** (→ マーカーを残す形へ、
+かつ `git diff --numstat` を Codex 申告値と突き合わせる)。
+
+- 規模 \\ 優先度: — (完了)。
+
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断
