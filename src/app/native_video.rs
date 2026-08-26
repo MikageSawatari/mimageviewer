@@ -7042,7 +7042,17 @@ impl App {
             // 旧 payload を外す必要がある。別 fs context の同一 path には触れない。
             player.set_native_seek_strip(None);
         }
-        crate::logger::log(format!("[video-seek-strip] close: {cause:?}"));
+        // 閉じるのは「埋まらないと諦めた」瞬間なので、ここが一番確実な採取点になる。
+        // 待ち時間の閾値に届かないまま閉じられても、未着セルの有無だけは残す。
+        crate::logger::log(format!(
+            "[video-seek-strip] close: {cause:?} pending_since={:?} pending_reported={} requested_coverage={:?} last_requested_center={:?}",
+            session
+                .visible_pending_since
+                .map(|since| since.elapsed().as_secs_f64()),
+            session.visible_pending_reported,
+            session.thumbnail_request_coverage,
+            session.last_requested_center,
+        ));
         true
     }
 
@@ -7623,7 +7633,10 @@ impl App {
         pending_cells: &[(usize, Option<f64>)],
         settled_cell_count: usize,
     ) -> Option<String> {
-        const STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(12);
+        // 3 秒。実測では 1 セルの生成が 100ms 未満なので、3 秒残っている時点で異常。
+        // 12 秒にしていたら、利用者が 12.3 秒でストリップを閉じて **0.3 秒差で出なかった**
+        // (2026-08-27)。観測窓は「人が見ている時間」より短くないと証拠が取れない。
+        const STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
         if !visible_cells_pending {
             session.visible_pending_since = None;
             session.visible_pending_reported = false;
