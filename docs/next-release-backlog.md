@@ -2039,40 +2039,96 @@ F12 往復 ~950ms のうち約 350ms
 **アプリ全体のもたつきでもある** — 別ウィンドウで動画を見ている間、
 メインウィンドウの一覧操作はすべて 12fps で動いている。
 
-##### 修正の方向 (未着手、要合意)
+##### 単価側 (38.6ms) は §1.129 で消えた — pump だけが残っている (2026-08-26)
+
+上の連鎖は **2 つの掛け算**だった。そのうち **単価側 = §1.129 は修正済み**で、
+12fps の症状は消えている (実機確認済み)。**頻度側 = 16ms pump は未着手**。
+
+修正後の新規セッションを 1 本測った結果 (`perf_events.jsonl`、5166 フレーム):
+
+| | 修正前 | 修正後 |
+| --- | --- | --- |
+| `slow_frame_breakdown` (30ms 超フレーム) | 33〜140 件 | **0 件** |
+| viewport paint > 8ms | 210 件 | **18 件** |
+| `vp_max_tex` / `main_max_tex` | 2048 / 8192 | **8192 / 8192** |
+
+→ **F12 往復の遅さも、別ウィンドウ再生中のもたつきも、この時点で実用域に入っている。**
+
+##### それでも pump は回っている (修正後の実測)
+
+`prev_frame_causes` を 3787 フレーム分集計した:
+
+| 状態 | 最大の repaint 要因 | 件数 |
+| --- | --- | --- |
+| フルスクリーン (動画を開いている) | **`app.rs` の pump** | **1905 / 1923** |
+| 一覧 (動画なし) | egui 自身の `context.rs:529` | 1936 / 1850 |
+
+つまり **動画を開いている間、UI スレッドを回しているのはほぼ pump だけ**。
+一方で、実測のフレーム間隔は **フルスクリーン有無にかかわらず median 6.0ms**で、
+pump が要求する 16ms より短い。**pump を消してもアイドル時の周期が 16ms になるわけではない**
+(他の要求元が重なっている)。効果の見積もりをするならここを先に分けること。
+
+##### 修正の方向 (未着手、Codex と合意済み)
 
 pump の目的は「native window の shortcut event を UI キューに滞留させない」こと。
 現状 **video スレッドは `egui::Context` を持っておらず UI スレッドを起こせない**
 (`src/video/` 内に UI 向け `request_repaint` は無い) ので、定期 poll で代用している。
 
-→ イベント到着時に UI を起こす形 (`Context::request_repaint` は他スレッドから可) にすれば、
-定期 pump 自体をなくせる。
+**Direction A = イベント駆動 + 既存の意味的期限への one-shot wake**。
+Codex の判断は「**完全な形にしたときだけ**構造的修正」で、イベントだけの狭い版は却下。
+
+- **イベント側の入り口は 1 つしかない**: [`NativeOutputEventSender::send`](../src/video/mod.rs)。
+  native window から UI へ向かうイベントは全部ここを通るので、
+  `wake: Arc<dyn Fn() + Send + Sync>` を 1 つ持たせればよい。
+  **同形の既存例**: [test_script.rs:1023](../src/test_script.rs:1023) の `RunnerBridge.wake`
+  (`ctx.clone()` を持ち `request_repaint_of(ViewportId::ROOT)` を呼ぶ)。
+- **それだけでは足りない**。`poll_video` にはイベントではなく
+  **時間 / 位置のしきい値**で発火する処理が乗っている。全部に one-shot wake が要る:
+
+| 乗っている処理 | 期限 | 場所 |
+| --- | --- | --- |
+| EOF drain の quiet ticks | 3 tick 連続 (≈ 48ms) | `video/mod.rs` `EOF_DRAIN_QUIET_TICKS` |
+| stuck seek の強制解除 | 1200ms | `video/mod.rs` `SEEK_STUCK_EOF_TIMEOUT` |
+| placement 切替 pending の timeout | `native_video_mode_switch.deadline` | `app.rs` |
+| 再生位置の resume 保存 | 5 秒 | `app.rs` `video_resume_last_save` |
+| preparing HUD の数値更新 | 50ms | `video/mod.rs` `tick` |
+| **CH/BM ループ境界** | **位置の跨ぎ検出 (prev→cur)** | [native_video.rs:4758](../src/app/native_video.rs:4758) |
+| normalize scan の完了 poll | ワーカー完了 | `app.rs` `poll_normalize_scan` |
+| detached host の再親付け | host HWND 変化 | `app.rs` `poll_detached_video_host_resync` |
+
+  ↑ **CH/BM ループ境界だけはイベント化できない** (位置を sample して跨ぎを検出する形)。
+  ただし **次の境界秒数は既知**なので、そこへ one-shot wake を張る方が現行より**精度が上がる**
+  (現行は 16ms 分オーバーランする)。
+
+- **Direction B (pump は残して viewport だけ描かない) は不可能**。
+  egui 0.33.3 は親パスで提示されなかった child viewport を除去するので、
+  `show_viewport_deferred` 化 (= R4 の所有権再構成) が先に要る。
 
 ⚠ pump 間隔を伸ばす / detached のときだけ間引く、は症状パッチなので採用しない。
-⚠ detached 述語に触れるので [detached-rework-plan.md](detached-rework-plan.md) §2 の手続きが必要。
-⚠ `show_viewport_immediate` 自体がなぜ黒地の描画で 38.6ms かかるのかは**未解明**。
-   repaint を止めれば頻度は下がるが、単価自体は残る。
+⚠ detached 述語に触れるので [detached-rework-plan.md](detached-rework-plan.md) §2 の手続きが必要
+   (合意は取済み。実装後に §11 への記録が要る)。
+⚠ トレイ非表示時の Win32 50ms pump は別物なので維持。keep-alive backstop も消さない。
+⚠ ワーカーからは `request_repaint()` ではなく **`request_repaint_of(ViewportId::ROOT)`**。
 
-#### 次の一手 — 41ms の `pre_grid` の中身
+↑ **16ms を注入しているのは 2 か所あり、片方だけ消してもループは残る**:
 
-`pg_top` には `selection_info:0.4ms` / `facet:0.3ms` しか出ておらず、**41ms の大半が
-名前の付いた区間の外**にある。ただし既存の perf event `ui/slow_frame_breakdown`
-([app.rs:67280](../src/app.rs:67280)) が `keep_fullscreen_viewport_ms` /
-`render_fullscreen_viewport_ms` / `ensure_native_video_front_ms` / `background_polls_ms` /
-`bars_ms` などに分解済みで、`perf::is_enabled() && frame > 30ms` で発火する。
-今回のフレームは 43〜45ms なので条件を満たす。
-**コード変更なしで、`--perf-log` を付けて同じ操作を 1 回取れば分かる。**
+1. [app.rs](../src/app.rs) `poll_video` 末尾 — `if native_owner_hwnd != 0 { 16ms }` (= 本体)
+2. [video/mod.rs](../src/video/mod.rs) `VideoPlayer::tick` の native 経路 —
+   再生中 / seek 中は `Some(16ms)`、preparing は `Some(50ms)` を返す
 
-**残りをやるなら優先順は:**
+#### 残りの優先順 (2026-08-26 時点)
 
-1. **detached 再生中の main UI スレッド 41ms/フレーム** — 上記のとおり、
-   `publish` (260〜331ms) と `host_attach` (40〜45ms) の両方の原因。まず内訳を取る
+1. **16ms pump のイベント駆動化 (Direction A)** — 上記。
+   12fps は §1.129 で解消済みなので、**応答性の修正ではなく
+   「動画を開いている間ずっと UI スレッドを回し続けない」構造修正**に位置が変わった。
+   先に「6.0ms 周期の他の要求元」を分けないと、pump を消しても周期は下がらない
 2. **`egui_overlay` (116〜139ms × 2)** — 切替のたびに wgpu device を新規作成している
-   (`request_device` 64〜72ms)。presenter 間で device を共有できるかを見る
+   (`request_device` 64〜72ms)。presenter 間で device を共有できるかを見る。
+   **F12 往復の残りではこれが最大**
 3. `d3d11_device` (27〜31ms × 2) — 同じく共有候補
 
 - ⚠ **guard / delay / retry で待ち時間を隠さない。**
-- 規模 \\ 優先度: Medium / P3 (主因は取れた。残りは体感上実用域)。
+- 規模 \\ 優先度: Medium / P3 (主因は 2 段階とも取れた。残りは体感上実用域)。
 
 ### 1.123 スレッド終了中の heap 例外を、例外ハンドラ自身が二次クラッシュで握り潰す — 実機クラッシュ
 
@@ -2331,7 +2387,7 @@ fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize
 
 - 規模 \\ 優先度: Medium / P3 (不具合ではなく仕様改善)。
 
-### 1.129 別ウィンドウの viewport を 1 枚描くのに CPU 9500 万サイクル使っている ✅ 修正済み (2026-08-26、実機確認待ち)
+### 1.129 別ウィンドウの viewport を 1 枚描くのに CPU 9500 万サイクル使っている ✅ 修正済み (2026-08-26、実機確認済み)
 
 - 出典: 2026-08-26、§1.122 の分解。§1.122 の**頻度**側 (16ms pump) とは別の
   **単価**側の問題なので別項目にした (憲法 §2 規則 7)。
