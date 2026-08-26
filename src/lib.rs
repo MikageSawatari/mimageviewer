@@ -158,6 +158,7 @@ pub mod perf;
 mod pipeline_debug;
 pub mod png_metadata;
 pub mod post_filter;
+pub mod post_operation_selection;
 pub mod rar_loader;
 pub mod rating_db;
 pub mod rating_view;

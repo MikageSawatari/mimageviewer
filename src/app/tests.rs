@@ -16015,6 +16015,161 @@ mod favorite_adjustment_defaults_tests {
     /// 見開きから消しゴムに入ったあと `reset_erase_mode` で元の見開き状態に戻ること。
     /// (Apply [E] / Cancel [Esc] どちらの経路でも内部的に reset_erase_mode が呼ばれる。)
     #[test]
+    fn a_created_folder_takes_the_cursor_even_though_something_was_selected() {
+        // 「作った物を選ぶ」ヒントを置いてから再読込を頼む経路。現在の選択で上書きすると
+        // カーソルが動かない (専用スレ >>305)。
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.selected = Some(0);
+
+        app.select_after_load = Some("new folder".to_string());
+        app.preserve_cursor_hint_for_reload();
+        assert_eq!(
+            app.select_after_load.as_deref(),
+            Some("new folder"),
+            "操作が置いたヒントを現在の選択で潰してはいけない"
+        );
+
+        // 誰も指定していないときは、これまでどおり今の選択を保つ。
+        app.select_after_load = None;
+        app.preserve_cursor_hint_for_reload();
+        assert_eq!(app.select_after_load.as_deref(), Some("a.jpg"));
+    }
+
+    #[test]
+    fn pasted_items_get_checked_and_the_first_one_gets_the_cursor() {
+        use crate::grid_item::GridItem;
+        use crate::post_operation_selection::ExpectedOutputs;
+        let mut app = setup_app();
+        let folder = std::path::PathBuf::from("c:/p");
+        for name in ["a.jpg", "b.jpg", "c.jpg", "d.jpg"] {
+            app.items.push(GridItem::Image(folder.join(name)));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.current_folder = Some(folder.clone());
+        app.rebuild_visible_indices();
+        app.selected = Some(0);
+        app.checked.insert(0);
+
+        // 貼り付け前に一覧にあったのは a と d。b / c が増えた。
+        app.request_post_operation_selection(
+            folder.clone(),
+            ExpectedOutputs::AddedSince(
+                [folder.join("a.jpg"), folder.join("d.jpg")]
+                    .into_iter()
+                    .collect(),
+            ),
+        );
+        assert!(app.apply_post_operation_selection());
+
+        assert_eq!(app.selected, Some(1), "表示順で先頭の追加項目へカーソル");
+        assert_eq!(
+            app.checked,
+            [1, 2].into_iter().collect::<std::collections::HashSet<_>>(),
+            "複数件なら追加項目だけをチェックし、元のチェックは解除する"
+        );
+        assert!(app.scroll_to_selected, "見える位置まで運ぶ");
+        assert_eq!(
+            app.grid_click_selection_anchor
+                .and_then(|anchor| anchor.index_for_generation(app.items_generation)),
+            Some(1),
+            "Shift 選択の起点も追加項目へ移す"
+        );
+    }
+
+    #[test]
+    fn a_single_created_item_gets_the_cursor_but_no_checkmark() {
+        use crate::grid_item::GridItem;
+        use crate::post_operation_selection::ExpectedOutputs;
+        let mut app = setup_app();
+        let folder = std::path::PathBuf::from("c:/p");
+        for name in ["a.jpg", "new", "z.jpg"] {
+            app.items.push(GridItem::Image(folder.join(name)));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.current_folder = Some(folder.clone());
+        app.rebuild_visible_indices();
+        app.checked.insert(2);
+
+        app.request_post_operation_selection(
+            folder.clone(),
+            ExpectedOutputs::Known(vec![folder.join("new")]),
+        );
+        assert!(app.apply_post_operation_selection());
+
+        assert_eq!(app.selected, Some(1));
+        assert!(
+            app.checked.is_empty(),
+            "1 件のときはチェックを付けず、元のチェックだけ解除する"
+        );
+    }
+
+    #[test]
+    fn an_operation_in_another_folder_does_not_touch_this_list() {
+        use crate::grid_item::GridItem;
+        use crate::post_operation_selection::ExpectedOutputs;
+        let mut app = setup_app();
+        let here = std::path::PathBuf::from("c:/here");
+        app.items.push(GridItem::Image(here.join("new")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.current_folder = Some(here.clone());
+        app.rebuild_visible_indices();
+        app.selected = Some(0);
+        app.checked.insert(0);
+
+        // 別フォルダ宛の要求。同じ名前の項目がここにあっても選択を奪わない。
+        app.request_post_operation_selection(
+            std::path::PathBuf::from("c:/elsewhere"),
+            ExpectedOutputs::Known(vec![std::path::PathBuf::from("c:/elsewhere/new")]),
+        );
+        assert!(!app.apply_post_operation_selection());
+        assert_eq!(app.checked.len(), 1, "他所の操作でチェックを消さない");
+        assert!(
+            app.post_operation_selection.is_none(),
+            "別フォルダへ来たら要求は捨てる"
+        );
+    }
+
+    #[test]
+    fn an_output_the_filter_hides_leaves_the_filter_and_the_selection_alone() {
+        use crate::grid_item::GridItem;
+        use crate::post_operation_selection::ExpectedOutputs;
+        let mut app = setup_app();
+        let folder = std::path::PathBuf::from("c:/p");
+        for name in ["a.jpg", "hidden.jpg"] {
+            app.items.push(GridItem::Image(folder.join(name)));
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.current_folder = Some(folder.clone());
+        app.rebuild_visible_indices();
+        app.selected = Some(0);
+
+        // 出力は items にはあるが、絞り込みで表示から外れている状態。フィルタを
+        // 自動解除して無理に見せたり、隠れたままの項目を選んだりしてはいけない。
+        let before_filter = app.visible_indices.clone();
+        app.visible_indices.retain(|&idx| idx != 1);
+        assert_ne!(app.visible_indices, before_filter);
+        app.request_post_operation_selection(
+            folder.clone(),
+            ExpectedOutputs::Known(vec![folder.join("hidden.jpg")]),
+        );
+        assert!(!app.apply_post_operation_selection());
+        assert_eq!(
+            app.selected,
+            Some(0),
+            "見えない項目のために選択を動かさない"
+        );
+        assert_eq!(app.visible_indices, vec![0], "フィルタは変えない");
+        assert!(
+            app.post_operation_selection.is_some(),
+            "まだ届いていないだけかもしれないので要求は残す"
+        );
+    }
+
+    #[test]
     fn switching_sides_in_text_mode_keeps_the_way_back_to_the_spread() {
         use crate::grid_item::GridItem;
         use crate::settings::SpreadMode;
