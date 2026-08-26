@@ -66,6 +66,7 @@ pub(crate) mod seek_strip;
 pub mod seek_strip_batch;
 pub(crate) mod seek_strip_thumbs;
 pub(crate) mod seek_strip_wave;
+pub mod spherical_metadata;
 pub(crate) mod stream;
 pub mod swscale_helpers;
 pub mod thumbnail;
