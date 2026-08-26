@@ -2331,6 +2331,54 @@ fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize
 
 - 規模 \\ 優先度: Medium / P3 (不具合ではなく仕様改善)。
 
+### 1.129 別ウィンドウの viewport を 1 枚描くのに CPU 9500 万サイクル使っている — 調査中
+
+- 出典: 2026-08-26、§1.122 の分解。§1.122 の**頻度**側 (16ms pump) とは別の
+  **単価**側の問題なので別項目にした (憲法 §2 規則 7)。
+- 動画を別ウィンドウへ出している間、main UI スレッドの
+  `show_viewport_immediate` が **1 回 38.6ms** かかる。描いているのは実質黒地 1 枚
+  (native presenter が子 HWND に映像を出している)。
+
+#### 実測 (2026-08-26、223 サンプルの median)
+
+| | 値 |
+| --- | --- |
+| `body_ms` (`show_viewport_immediate` 全体) | 38.9ms |
+| `closure_ms` (自前の描画コード) | 0.3ms |
+| `prep_ms` (描画前の処理) | 0.0ms |
+| eframe 部分のみ (`body - closure`) | **38.58ms / 95,224,648 cycles** |
+
+**待ちではなく CPU 実行**であることを `QueryThreadCycleTime` で確定させた。
+校正値として、確実に CPU を焼いている closure (0.3ms) のサイクルレートを同時に取った:
+
+| | cycles/ms |
+| --- | --- |
+| `closure_cycles_per_ms` (校正値) | 2,487,568 |
+| `body_cycles_per_ms` | 2,478,017 |
+| eframe 部分のみ | 2,478,149 |
+
+差 0.4%。**vsync / GPU / lock 待ちではない**。
+(測定は `dev-runtime` = release 継承の opt-level 2。release でも同じ桁)
+
+#### 影響
+
+§1.122 の pump を直しても**この単価は残る**。別ウィンドウでマウスを動かす・
+パネルを出すなどで repaint が起きるたび 38.6ms かかるのなら、それ自体が体感不具合。
+
+#### 仮説 (未検証)
+
+egui の font atlas は **`Context` に 1 つ**しか無いが、main と子 viewport が
+異なる `pixels_per_point` を要求しうる。epaint 0.33 の `Fonts::begin_pass` は
+`fill_ratio() > 0.8` で atlas を**作り直す**ので、両方の ppp 分の glyph が交互に
+積むと毎フレーム rebuild + 全 atlas の delta アップロードになり得る。
+mIV は fallback font を 6 系統登録しているので atlas は大きい。
+
+検証中: `vp_ppp` / `main_ppp` / `vp_atlas_w,h` / `vp_atlas_fill` / `vp_galleys` /
+`main_atlas_fill` / `main_galleys` と viewport サイズを perf event へ追加した。
+サイズに比例するなら per-pixel 処理、atlas fill が鋸歯状なら rebuild のスラッシング。
+
+- 規模 \ 優先度: 未知 / P2 (原因が分かるまでは見積もらない)。
+
 ## 2. 一覧 / サムネイル / フォルダ走査
 
 ### 2.1 folder pane scan worker の thread 構成判断

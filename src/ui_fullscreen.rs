@@ -13812,6 +13812,26 @@ impl App {
         Some(self.ensure_fs_page_load(idx))
     }
 
+    /// Cycles this thread has actually executed. Dividing by wall time tells whether a
+    /// span burned CPU or waited: a busy span reports the machine's real clock rate, a
+    /// blocked one reports a small fraction of it (backlog 1.129).
+    #[cfg(windows)]
+    fn thread_cycles_now() -> u64 {
+        let mut cycles = 0u64;
+        unsafe {
+            let _ = windows::Win32::System::WindowsProgramming::QueryThreadCycleTime(
+                windows::Win32::System::Threading::GetCurrentThread(),
+                &mut cycles,
+            );
+        }
+        cycles
+    }
+
+    #[cfg(not(windows))]
+    fn thread_cycles_now() -> u64 {
+        0
+    }
+
     pub(crate) fn render_fullscreen_viewport(&mut self, ctx: &egui::Context) {
         let Some(fs_idx) = self.fullscreen_idx else {
             // in-window 静止画モードで PDF/ZIP enumerate defer 中:
@@ -14121,6 +14141,17 @@ impl App {
         // viewport (backlog 1.122).
         let fs_prep_ms;
         let fs_body_ms;
+        let fs_body_cycles;
+        let mut fs_closure_cycles = 0u64;
+        // The 38ms is CPU, not a wait. egui keeps ONE font atlas per Context while two
+        // viewports can ask for different pixels_per_point; a full atlas rebuild would
+        // look exactly like this. Record what the atlas is doing on both sides, plus the
+        // viewport size, so a per-pixel cost is distinguishable (backlog 1.129).
+        let mut fs_vp_ppp = 0.0_f32;
+        let mut fs_vp_atlas = [0usize; 2];
+        let mut fs_vp_atlas_fill = 0.0_f32;
+        let mut fs_vp_galleys = 0usize;
+        let mut fs_vp_size = [0.0_f32; 2];
         let fs_state_is_video = state.is_video;
         // 動画は native presenter が独立 HWND に描画するので、egui 側 viewport は
         // 黒 backdrop のみ。ここで GPU 経路かどうかを区別する必要は無い。
@@ -14155,6 +14186,7 @@ impl App {
         {
             let mut render_fs_body = |ctx: &egui::Context, embedded: bool| {
                 let closure_t0 = std::time::Instant::now();
+                let closure_cycles_t0 = Self::thread_cycles_now();
                 let setup_t0 = std::time::Instant::now();
                 // フルスクリーンビューポート内のイベントで IME 状態を更新する
                 // (メインビューポートとは別のイベントキューなのでここで呼ぶ必要がある)。
@@ -15829,9 +15861,19 @@ impl App {
 
                 self.fs_prev_foreground_hwnd = current_foreground_hwnd();
                 fs_closure_ms = closure_t0.elapsed().as_secs_f64() * 1000.0;
+                fs_closure_cycles = Self::thread_cycles_now().saturating_sub(closure_cycles_t0);
+                fs_vp_ppp = ctx.pixels_per_point();
+                let vp_rect = ctx.viewport_rect();
+                fs_vp_size = [vp_rect.width(), vp_rect.height()];
+                ctx.fonts(|f| {
+                    fs_vp_atlas = f.font_image_size();
+                    fs_vp_atlas_fill = f.font_atlas_fill_ratio();
+                    fs_vp_galleys = f.num_galleys_in_cache();
+                });
             };
             fs_prep_ms = fs_viewport_t0.elapsed().as_secs_f64() * 1000.0;
             let fs_body_t0 = std::time::Instant::now();
+            let fs_body_cycles_t0 = Self::thread_cycles_now();
             if embedded {
                 // in-window 静止画: メインウィンドウの egui ctx に直接描画する。
                 render_fs_body(main_ctx, true);
@@ -15852,6 +15894,7 @@ impl App {
                 self.mark_active_detached_viewport_rendered_if_matches(fs_id);
             }
             fs_body_ms = fs_body_t0.elapsed().as_secs_f64() * 1000.0;
+            fs_body_cycles = Self::thread_cycles_now().saturating_sub(fs_body_cycles_t0);
         }
         #[cfg(windows)]
         if let Some(window_id) = active_render_window_id {
@@ -15910,6 +15953,43 @@ impl App {
                     ("outer_ms", serde_json::Value::from(fs_outer_ms)),
                     ("closure_ms", serde_json::Value::from(fs_closure_ms)),
                     ("prep_ms", serde_json::Value::from(fs_prep_ms)),
+                    ("body_cycles", serde_json::Value::from(fs_body_cycles)),
+                    ("vp_ppp", serde_json::Value::from(fs_vp_ppp)),
+                    (
+                        "main_ppp",
+                        serde_json::Value::from(main_ctx.pixels_per_point()),
+                    ),
+                    ("vp_w", serde_json::Value::from(fs_vp_size[0])),
+                    ("vp_h", serde_json::Value::from(fs_vp_size[1])),
+                    ("vp_atlas_w", serde_json::Value::from(fs_vp_atlas[0] as i64)),
+                    ("vp_atlas_h", serde_json::Value::from(fs_vp_atlas[1] as i64)),
+                    ("vp_atlas_fill", serde_json::Value::from(fs_vp_atlas_fill)),
+                    ("vp_galleys", serde_json::Value::from(fs_vp_galleys as i64)),
+                    (
+                        "main_atlas_fill",
+                        serde_json::Value::from(main_ctx.fonts(|f| f.font_atlas_fill_ratio())),
+                    ),
+                    (
+                        "main_galleys",
+                        serde_json::Value::from(main_ctx.fonts(|f| f.num_galleys_in_cache()) as i64),
+                    ),
+                    ("closure_cycles", serde_json::Value::from(fs_closure_cycles)),
+                    (
+                        "body_cycles_per_ms",
+                        serde_json::Value::from(if fs_body_ms > 0.0 {
+                            fs_body_cycles as f64 / fs_body_ms
+                        } else {
+                            0.0
+                        }),
+                    ),
+                    (
+                        "closure_cycles_per_ms",
+                        serde_json::Value::from(if fs_closure_ms > 0.0 {
+                            fs_closure_cycles as f64 / fs_closure_ms
+                        } else {
+                            0.0
+                        }),
+                    ),
                     ("body_ms", serde_json::Value::from(fs_body_ms)),
                     (
                         "eframe_show_ms",
