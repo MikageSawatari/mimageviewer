@@ -13139,6 +13139,32 @@ impl App {
             .unwrap_or_default();
         crate::perf::emit_ms("startup", "db_load_local_adjust_keys", 0, t);
 
+        // リリース済みの旧マスク形式を詰め直す。実測 954 MB の DB が数十 MB になり、
+        // そのページを開くときの JSON パース (最大 93 MB) が消える。移行済みなら数 ms。
+        if local_adjust_db.is_some() {
+            let path = crate::local_adjust_db::LocalAdjustDb::db_path();
+            std::thread::Builder::new()
+                .name("local-adjust-repack".into())
+                .spawn(move || {
+                    let started = std::time::Instant::now();
+                    let report = crate::local_adjust_db::repack_legacy_masks(&path);
+                    if report.did_work() {
+                        crate::logger::log(format!(
+                            "local_adjust: repacked {} of {} rows in {:.1}s (JSON {:.1}MB -> {:.1}MB, file {:.1}MB -> {:.1}MB, {} skipped as changed)",
+                            report.rewritten,
+                            report.scanned,
+                            started.elapsed().as_secs_f64(),
+                            report.bytes_before as f64 / 1e6,
+                            report.bytes_after as f64 / 1e6,
+                            report.file_bytes_before as f64 / 1e6,
+                            report.file_bytes_after as f64 / 1e6,
+                            report.skipped_changed,
+                        ));
+                    }
+                })
+                .ok();
+        }
+
         let t = std::time::Instant::now();
         let export_crop_db = crate::export_crop::CropDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_export_crop", 0, t);
