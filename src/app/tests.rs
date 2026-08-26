@@ -382,7 +382,7 @@ fn spread_page_dims_survive_fs_cache_and_thumbnail_eviction() {
         ]
     );
 
-    app.harvest_page_dims_from_fs_cache();
+    app.harvest_page_dims();
     assert_eq!(
         app.page_dims_cache.get(app.items_generation, 0),
         Some((1800, 1100))
@@ -30271,6 +30271,49 @@ mod pipeline_cache_refactor_tests {
         key
     }
 
+    /// `fs_cache` を持たないまま表示できるページの寸法も収穫する。
+    ///
+    /// 実機で出た形をそのまま再現する: PDF を開き直して items 世代が変わると
+    /// `page_dims_cache` は失効し、retained composite から復元されたページは
+    /// `fs_cache` にもサムネイルにも載らない。供給源がゼロになり、横長分割が
+    /// 「寸法が分からない」を理由に効かなくなっていた
+    /// (2026-08-25、`[split] idx=0 decision=dimensions_unknown`)。
+    #[test]
+    fn a_page_restored_from_the_retained_composite_still_reports_its_size() {
+        let mut app = setup_app();
+        enable_pdf_final_ai_params(&mut app);
+
+        let idx = push_pdf_page(&mut app, r"D:\scan\20190503.pdf", 0);
+        let edit_size = [1512, 1921];
+        store_matching_pdf_final_ai(
+            &mut app,
+            idx,
+            edit_size,
+            Arc::new(egui::ColorImage::new(
+                [8, 8],
+                vec![egui::Color32::from_rgb(9, 9, 9); 64],
+            )),
+        );
+        app.fullscreen_idx = Some(idx);
+
+        // 開き直しと同じ条件: 世代が進み、live cache もサムネイルも無い。
+        app.items_generation += 1;
+        app.fs_cache.remove(&idx);
+        assert_eq!(
+            app.page_dims_cache.get(app.items_generation, idx),
+            None,
+            "fixture check: 世代更新で寸法の記憶は消えている"
+        );
+
+        app.harvest_page_dims();
+
+        assert_eq!(
+            app.page_dims_cache.get(app.items_generation, idx),
+            Some((1512, 1921)),
+            "画面に出せるページなのに寸法が分からないままになっている"
+        );
+    }
+
     /// The reported failure, reproduced from the log that recorded it.
     ///
     /// An AI upscale of `_001.pdf` page 0 is deliberately harvested after the reader has moved on
@@ -51456,6 +51499,7 @@ mod still_window_mode_key_tests {
             &[0.0, 100.0],
             1,
             second,
+            crate::page_split::PageSlice::Full,
             crate::app::HistoryTrigger::UserChosen,
         );
 
@@ -56933,6 +56977,56 @@ fn touch_owned_side_panels_close_on_file_change_and_fullscreen_exit() {
     assert!(!app.metadata_panel_click_shown());
 }
 
+/// 連結読みで段が変わったら、**元ページが同じでも**左右を採り直す。
+///
+/// 分割中は 1 つの元ページが 2 段になるので、段が変わっても `fullscreen_idx` は動かない。
+/// 左右を書かずにいると、次のフレームで現在位置が元の段に解決され、スクロールが
+/// 引き戻されて先へ進めなくなる (実機で発生、2026-08-25)。
+#[test]
+fn scrolling_into_the_other_half_adopts_that_half() {
+    use crate::page_split::PageSlice;
+
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    let folder = PathBuf::from("C:/photos");
+    app.current_folder = Some(folder.clone());
+    app.items = vec![
+        GridItem::Image(folder.join("wide.jpg")),
+        GridItem::Image(folder.join("tall.jpg")),
+    ];
+    app.visible_indices = vec![0, 1];
+    app.fullscreen_idx = Some(0);
+    app.fullscreen_page_slice = PageSlice::Left;
+
+    // 同じ元ページの 2 段目へ。index は動かないが左右は変わる。
+    app.reanchor_continuous_reading_viewer(
+        &ctx,
+        &[0.0, 100.0, 200.0],
+        1,
+        0,
+        PageSlice::Right,
+        crate::app::HistoryTrigger::UserChosen,
+    );
+    assert_eq!(app.fullscreen_idx, Some(0), "元ページは変わらない");
+    assert_eq!(
+        app.fullscreen_page_slice,
+        PageSlice::Right,
+        "段が変わったのに左右が取り残されている"
+    );
+
+    // 分割していない段へ移ったら Full に戻る (左右の記憶が居残らない)。
+    app.reanchor_continuous_reading_viewer(
+        &ctx,
+        &[0.0, 100.0, 200.0],
+        2,
+        1,
+        PageSlice::Full,
+        crate::app::HistoryTrigger::UserChosen,
+    );
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert_eq!(app.fullscreen_page_slice, PageSlice::Full);
+}
+
 #[test]
 fn continuous_reanchor_history_trigger_controls_recording() {
     let mut app = phase_c_support::setup_app();
@@ -56952,6 +57046,7 @@ fn continuous_reanchor_history_trigger_controls_recording() {
         &[0.0, 100.0],
         1,
         1,
+        crate::page_split::PageSlice::Full,
         crate::app::HistoryTrigger::AutoAdvance,
     );
     assert!(
@@ -56964,6 +57059,7 @@ fn continuous_reanchor_history_trigger_controls_recording() {
         &[0.0, 100.0],
         0,
         0,
+        crate::page_split::PageSlice::Full,
         crate::app::HistoryTrigger::UserChosen,
     );
     assert_eq!(
@@ -57002,6 +57098,7 @@ fn continuous_reanchor_preserves_pointer_panels_and_page_trim_override() {
         &[0.0, 100.0],
         1,
         second,
+        crate::page_split::PageSlice::Full,
         crate::app::HistoryTrigger::UserChosen,
     );
 
@@ -57027,6 +57124,7 @@ fn continuous_reanchor_preserves_pointer_panels_and_page_trim_override() {
         &[0.0, 100.0],
         0,
         first,
+        crate::page_split::PageSlice::Full,
         crate::app::HistoryTrigger::UserChosen,
     );
     assert_eq!(

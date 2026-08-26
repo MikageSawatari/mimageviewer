@@ -9511,6 +9511,8 @@ pub struct App {
     /// 置くと、context を切り替えたときに前の viewer の左右が次の viewer へ残る。
     /// 永続化はしない (開き直しは分割方向の最初の半分へ着地する)。
     pub(crate) fullscreen_page_slice: crate::page_split::PageSlice,
+    /// 直近に記録した分割判断 (診断用)。変わったときだけログへ 1 行出すための重複除け。
+    pub(crate) last_split_decision: Option<(usize, crate::ui_fullscreen::SplitDecision)>,
     /// 現在の viewer session の実表示先。要求値ではなく、実際に採用した表示先を保持する。
     pub(crate) viewer_presentation: ViewerPresentation,
     /// detached viewer とメイン選択の同期済み対象。idx 単体ではなく items 世代と項目キーを持つ。
@@ -13188,6 +13190,7 @@ impl App {
             show_stats_dialog: false,
             fullscreen_idx: None,
             fullscreen_page_slice: crate::page_split::PageSlice::Full,
+            last_split_decision: None,
             viewer_presentation: ViewerPresentation::Fullscreen,
             last_viewer_sync_stamp: None,
             #[cfg(windows)]
@@ -55597,6 +55600,20 @@ impl App {
 
     fn has_retained_pdf_final_ai_for_current_params(&self, idx: usize) -> bool {
         self.retained_pdf_final_ai_matches_current(idx).is_some()
+    }
+
+    /// retained composite だけで表示できるページの**元寸法**。
+    ///
+    /// このページは `fs_cache` を持たないまま表示できる ([`Self::fs_page_load_state`] の
+    /// doc 参照)。そのため寸法の収穫を `fs_cache` だけに頼ると「画面に出ているのに
+    /// 寸法が分からない」状態が起きる。実際、PDF を開き直して items 世代が変わった直後に
+    /// 横長分割が効かなくなる形で表面化した (2026-08-25、`[split] decision=dimensions_unknown`)。
+    pub(crate) fn retained_pdf_page_source_dims(&self, idx: usize) -> Option<(u32, u32)> {
+        let (_, edit_size) = self.retained_pdf_final_ai_matches_current(idx)?;
+        Some((
+            u32::try_from(edit_size[0]).ok()?,
+            u32::try_from(edit_size[1]).ok()?,
+        ))
     }
 
     fn insert_retained_pdf_page_raster(

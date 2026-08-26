@@ -151,6 +151,7 @@ const {
   normalizeRemoteGridSortState,
   normalizeRemotePostFilterState,
   normalizeRemoteViewTrimState,
+  pageGroupIndexIn,
   parentContainerAddress,
   parseRoute,
   reloadApplication,
@@ -3576,4 +3577,28 @@ test("the measurement HUD stays closed once dismissed, and never shows signed ou
   assert.equal(telemetryHudVisible({ ...HUD_ON, dismissed: true }), false);
   assert.equal(telemetryHudVisible({ ...HUD_ON, authenticated: false }), false);
   assert.equal(telemetryHudVisible({ ...HUD_ON, enabled: false }), false);
+});
+
+test("the half you are reading survives a rebuild of the page groups", () => {
+  const page = { path: "C:/book/p2.jpg" };
+  const groups = [
+    { anchor: { path: "C:/book/p1.jpg" }, entries: [{ path: "C:/book/p1.jpg" }], slice: "full" },
+    { anchor: page, entries: [page], slice: "left" },
+    { anchor: page, entries: [page], slice: "right" },
+  ];
+  // **同じページを持つ表示単位が 2 つある。**半分を渡さないと必ず先頭へ吸われる。
+  assert.equal(pageGroupIndexIn(groups, page), 1);
+  assert.equal(pageGroupIndexIn(groups, page, "right"), 2);
+  assert.equal(pageGroupIndexIn(groups, page, "left"), 1);
+});
+
+test("asking for a half that no longer exists lands on the page itself", () => {
+  const page = { path: "C:/book/p2.jpg" };
+  const groups = [
+    { anchor: { path: "C:/book/p1.jpg" }, entries: [{ path: "C:/book/p1.jpg" }], slice: "full" },
+    { anchor: page, entries: [page], slice: "full" },
+  ];
+  // 分割をやめた直後。右半分はもう無いので、そのページの表示単位へ戻す。
+  assert.equal(pageGroupIndexIn(groups, page, "right"), 1);
+  assert.equal(pageGroupIndexIn(groups, { path: "C:/book/p9.jpg" }, "left"), -1);
 });

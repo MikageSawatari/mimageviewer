@@ -1539,7 +1539,8 @@ ClaudeCode の追加ログと Codex の portable / normal ログを併記して 
   2領域展開が必要。ただし seek / resume / bookmark / DB / サムネイルを論理ページ化する必要はない。
 - detached 制約: 別ウィンドウ経路へ到達する前に [detached-rework-plan.md](detached-rework-plan.md) §2 を読み、
   owner 外へ分割状態を足す症状修正にしない。通常の本体フルスクリーンを先に完成させ、detached は R4 後に
-  同じ presentation step を所有できる場合だけ拡張する。Remote は MVP 対象外とし、元ページ表示を維持する。
+  同じ presentation step を所有できる場合だけ拡張する。Remote は当初 MVP 対象外としていたが、
+  **スマートフォンの縦画面で一番効く**ため 2026-08-26 に実施した ([web-remote-plan.md](web-remote-plan.md) §15)。
 - 回帰条件: 左→右 / 右→左の往復、横長と縦長の混在、回転後の分割判定、先頭 / 末尾、キー長押し、
   縦連結、シーク、編集画面への出入り、ブックマーク再表示で元 index と表示片の不変条件を固定する。
 - 規模 / 優先度: 通常ページ表示 Medium、縦連結まで含めて Medium〜Large (1〜2週間程度)。当初の
@@ -1606,6 +1607,26 @@ ClaudeCode の追加ログと Codex の portable / normal ログを併記して 
     実際に描く 1 か所が所有する形へ変えた。
   - 縦連結は同じステップ列から段を組む。現在位置は左右まで見て選ぶ (同じ元 index の段が
     2 つ並ぶため)。連結の寸法計算にも `content_bbox` と座標系のずれがあり、同じ形で直した。
+  - **スクロールで段が変わったときに左右を書く人がいなかった** (実機で発覚)。現在位置が
+    毎フレーム元の段へ戻され、スクロールが引き戻されて先へ進めなくなっていた。
+    表示は正しく入れ替わっていたので、**描画は合っていて現在位置の追従だけが
+    取り残されていた**形。`reanchor_continuous_reading_viewer` が `fullscreen_idx` と
+    同じ場所で左右も書くようにした。
+  - **同じ形の取りこぼしを 2 回踏んだ**: 「元 index は変わらないが表示位置は変わった」
+    という状態を、元 index しか見ていない既存コードが取りこぼす。1 回目は描画側
+    (`content_bbox` の producer)、2 回目は現在位置側。分割のように**既存の識別子を
+    細分化する機能**では、その識別子を読んでいる場所を先に数えるべきだった。
+- **「分割を選んだのにページがつながったまま」の実機報告を解決** (2026-08-25)。
+  再現手順が分からなかったので、**先に理由を型で残す計装を入れた** (`SplitDecision`)。
+  次の再現で `[split] idx=0 decision=dimensions_unknown` が出て、そこから確定した。
+  - `is_landscape` は寸法が未取得でも `false` を返す。見開きのペアリングでは困らないが、
+    分割では「まだ分からない」と「縦長」が別の意味を持つ。探索と判定を分けた。
+  - 真因は**収穫側**。PDF を開き直すと items 世代が変わり `page_dims_cache` が失効する。
+    そのページは retained composite から復元されて表示できるので `fs_cache` にも
+    サムネイルにも載らず、**供給源がゼロ**になっていた。寸法自体は retained 側が
+    持っている (ログに `source=1512x1921` と出ていた)。
+  - `harvest_page_dims_from_fs_cache` → `harvest_page_dims` に変え、**表示できる 2 経路**
+    (live cache / retained composite) の両方から収穫するようにした。
 - **残り**: 縦連結の実機確認、製品ページへの追記、リリース時の更新履歴。
 
 ### 1.120 Susie 32bit ワーカー異常終了後の自己回復 — 外部SNSでの不具合言及 ✅ 実装済み (2026-08-25、実機確認済み)
@@ -3269,3 +3290,22 @@ SimplySign のクラウド鍵セッションが切れていても通過する (�
 | 詳細表示 / スマートフィルタ | `docs/details-view-and-filter-plan.md`, `CLAUDE.md` の UI / スクロール節 |
 | タグ / フルスクリーン右パネル / 動画 overlay | `docs/tag-catalog-redesign-plan.md`, `docs/display-pipeline.md`, `docs/video-architecture.md`, `docs/detached-viewer-implementation-plan.md` |
 | リリース / 依存更新 | `CLAUDE.md` のリリース手順、各 native 依存管理節 |
+
+### 1.124 見開き表示のまま Ctrl+G で補正レイヤーへ入ると、左右の切り替えもマスク編集も効かない — 実機報告
+
+- 出典: 2026-08-26、利用者報告。**見開き表示のページ**で <kbd>Ctrl</kbd>+<kbd>G</kbd> を押して
+  補正レイヤー画面へ入ると、左右ページの切り替えが動かず、マスク編集も含めて操作が
+  まったく効かなくなる。
+- **未調査。着手前に確認すること** (推測で直さない):
+  1. 補正レイヤー画面は「1 ページ 1 編集対象」を前提にしているはず。見開きで入ったとき
+     **編集対象がどちらのページに決まるのか**、あるいは決まらないまま入っているのかを
+     まず観測する。決まっていないなら、入口で単ページへ落とすのか、左右を選ばせるのかは
+     仕様判断になる。
+  2. 「すべて効かない」= 入力が別の所有者に吸われている可能性がある。キー・ポインタの
+     消費経路 (`consume_key` / キャンバス入力) を、見開きと単ページで比べる。
+  3. 同型の入口を数える。<kbd>Ctrl</kbd>+<kbd>G</kbd> だけでなく、メニュー・ツールバーから
+     補正レイヤーへ入る経路、連結読み中、横長分割中 (v3.3.0 で追加) でも同じか。
+     [CLAUDE.md](../CLAUDE.md) 「バグ修正の一般原則」に従い、再現した経路だけで終えない。
+- 関連ドキュメント: [local-adjustment-layer-v1.1.0-plan.md](local-adjustment-layer-v1.1.0-plan.md)、
+  [preset-and-adjustment.md](preset-and-adjustment.md)、[display-pipeline.md](display-pipeline.md)。
+- 規模 / 優先度: 未見積 / **v3.3.0 に含める** (利用者判断、2026-08-26)。

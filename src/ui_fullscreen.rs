@@ -8149,17 +8149,57 @@ fn continuous_reading_drag_delta(
 /// live なフルサイズ cache、ロード済みサムネイル、退去後も残るページ寸法 cache の順で
 /// 参照する。一度も寸法が判明していないページだけは false（縦長）として扱うが、判明済みの
 /// 寸法はテクスチャ退去で失わないため、同じ items 世代で既知から未知へは後退しない。
-fn is_landscape(
+/// 分割するか、しないならその理由。
+///
+/// **無言で「割らない」を返さない。** 実機で「分割を選んだのにページがつながったまま」
+/// という報告が出たとき、原因が「寸法待ち」なのか「そもそも縦長」なのかが分からず、
+/// ログに何も残っていなかった (2026-08-25)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SplitDecision {
+    /// 分割する。判明した寸法を添える。
+    Split { w: u32, h: u32 },
+    /// 縦長なので分割しない。これは確定した答え。
+    NotLandscape { w: u32, h: u32 },
+    /// **まだ寸法が分からない**ので分割しない。一時的で、届けば割れる。
+    DimensionsUnknown,
+    /// 静止画ページではない (動画 / 音声 / フォルダ等)。
+    NotAStillPage,
+}
+
+impl SplitDecision {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Split { .. } => "split",
+            Self::NotLandscape { .. } => "not_landscape",
+            Self::DimensionsUnknown => "dimensions_unknown",
+            Self::NotAStillPage => "not_a_still_page",
+        }
+    }
+
+    fn dims(self) -> Option<(u32, u32)> {
+        match self {
+            Self::Split { w, h } | Self::NotLandscape { w, h } => Some((w, h)),
+            Self::DimensionsUnknown | Self::NotAStillPage => None,
+        }
+    }
+}
+
+/// 表示判断に使える寸法を優先順に探す。
+///
+/// **見つからないことがある** (まだ読み込んでいない / テクスチャが退去した)。
+/// 見開きのペアリングでは「分からない = 横長でない」で困らないが、分割では
+/// 「まだ分からないので割らない」と「縦長だから割らない」が別の意味を持つので、
+/// 判定と探索を分けてある。
+fn known_page_dims(
     idx: usize,
-    rotation: crate::rotation_db::Rotation,
     fs_cache: &ItemsGenerationMap<FsCacheEntry>,
     thumbnails: &[ThumbnailState],
     page_dims_cache: &crate::page_dims::PageDimsCache,
     items_generation: u64,
-) -> bool {
+) -> Option<(u32, u32)> {
     // フルサイズキャッシュから判定
-    if let Some((w, h)) = fs_cache.get(&idx).and_then(fs_cache_entry_page_dims) {
-        return crate::rotation_db::landscape_after_rotation(w, h, rotation);
+    if let Some(dims) = fs_cache.get(&idx).and_then(fs_cache_entry_page_dims) {
+        return Some(dims);
     }
     // サムネイルから判定
     if let Some(ThumbnailState::Loaded {
@@ -8169,18 +8209,27 @@ fn is_landscape(
         ..
     }) = thumbnails.get(idx)
     {
-        if let Some((w, h)) = (*layout_dims).or(*source_dims) {
-            return crate::rotation_db::landscape_after_rotation(w, h, rotation);
+        if let Some(dims) = (*layout_dims).or(*source_dims) {
+            return Some(dims);
         }
         let width = u32::try_from(tex.size()[0]).unwrap_or(u32::MAX);
         let height = u32::try_from(tex.size()[1]).unwrap_or(u32::MAX);
-        return crate::rotation_db::landscape_after_rotation(width, height, rotation);
+        return Some((width, height));
     }
     // live texture が退去済みでも、一度判明した同世代の寸法は忘れない。
-    if let Some((w, h)) = page_dims_cache.get(items_generation, idx) {
-        return crate::rotation_db::landscape_after_rotation(w, h, rotation);
-    }
-    false
+    page_dims_cache.get(items_generation, idx)
+}
+
+fn is_landscape(
+    idx: usize,
+    rotation: crate::rotation_db::Rotation,
+    fs_cache: &ItemsGenerationMap<FsCacheEntry>,
+    thumbnails: &[ThumbnailState],
+    page_dims_cache: &crate::page_dims::PageDimsCache,
+    items_generation: u64,
+) -> bool {
+    known_page_dims(idx, fs_cache, thumbnails, page_dims_cache, items_generation)
+        .is_some_and(|(w, h)| crate::rotation_db::landscape_after_rotation(w, h, rotation))
 }
 
 fn fs_cache_entry_page_dims(entry: &FsCacheEntry) -> Option<(u32, u32)> {
@@ -8346,15 +8395,50 @@ fn build_spread_display_units_with_predicates(
 /// ペア可能種別、表紙位相、横長ページ境界、RTL の左右反転を fullscreen と同じ
 /// `SpreadDisplayUnit::spread_pair` へ通す。`is_landscape` は一覧生成側が既存 catalog の
 /// source dimensions から解決し、未確定は fullscreen と同じく縦長扱いにする。
+/// リモートへ返す 1 つの表示単位。
+///
+/// **分割中は同じ index が 2 つの単位に現れる**ので、index だけでは識別子にならない
+/// (端末側の位置照合は `(anchor, slice)` の組で行う)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RemotePageGroupSpec {
+    pub(crate) indices: Vec<usize>,
+    pub(crate) slice: crate::page_split::PageSlice,
+}
+
+impl RemotePageGroupSpec {
+    fn whole(indices: Vec<usize>) -> Self {
+        Self {
+            indices,
+            slice: crate::page_split::PageSlice::Full,
+        }
+    }
+}
+
 pub(crate) fn build_remote_spread_page_groups(
     items: &[GridItem],
     spread_mode: SpreadMode,
     is_landscape: &[bool],
-) -> Vec<Vec<usize>> {
+) -> Vec<RemotePageGroupSpec> {
     let visible = (0..items.len()).collect::<Vec<_>>();
     let nav = build_image_reading_indices(items, &visible);
+    // 分割は本体と**同じステップ列**から作る。並べ替えの規則を 2 か所に持たない。
+    if let Some(direction) = crate::page_split::SplitDirection::from_spread_mode(spread_mode) {
+        return crate::page_split::presentation_steps(&nav, direction, |_, idx| {
+            is_spread_pairable_item(items.get(idx))
+                && is_landscape.get(idx).copied().unwrap_or(false)
+        })
+        .into_iter()
+        .map(|step| RemotePageGroupSpec {
+            indices: vec![step.source_idx],
+            slice: step.slice,
+        })
+        .collect();
+    }
     if !spread_mode.is_spread() {
-        return nav.into_iter().map(|idx| vec![idx]).collect();
+        return nav
+            .into_iter()
+            .map(|idx| RemotePageGroupSpec::whole(vec![idx]))
+            .collect();
     }
     build_spread_display_units_with_predicates(
         &nav,
@@ -8365,10 +8449,21 @@ pub(crate) fn build_remote_spread_page_groups(
     )
     .into_iter()
     .map(|unit| match unit.spread_pair(spread_mode) {
-        SpreadPair::Single => vec![unit.anchor_idx()],
-        SpreadPair::Double { left, right } => vec![left, right],
+        SpreadPair::Single => RemotePageGroupSpec::whole(vec![unit.anchor_idx()]),
+        SpreadPair::Double { left, right } => RemotePageGroupSpec::whole(vec![left, right]),
     })
     .collect()
+}
+
+/// 本体の左右を、リモートの protocol 型へ写す。
+pub(crate) fn remote_page_slice(
+    slice: crate::page_split::PageSlice,
+) -> mimageviewer_ipc::RemotePageSlice {
+    match slice {
+        crate::page_split::PageSlice::Full => mimageviewer_ipc::RemotePageSlice::Full,
+        crate::page_split::PageSlice::Left => mimageviewer_ipc::RemotePageSlice::Left,
+        crate::page_split::PageSlice::Right => mimageviewer_ipc::RemotePageSlice::Right,
+    }
 }
 
 fn append_spread_display_units_until(
@@ -9567,12 +9662,28 @@ pub fn draw_music_panel_reach_snapshot_fixture(
 impl App {
     /// live なフルスクリーン cache から、現在世代で判明済みのページ寸法を回収する。
     /// cache 自体は小さな先読み窓なので、フレーム冒頭に 1 回だけ走査する。
-    pub(crate) fn harvest_page_dims_from_fs_cache(&mut self) {
+    /// 表示できるページの寸法を `page_dims_cache` へ集める。
+    ///
+    /// **表示できる経路は 2 つある。** live な `fs_cache` と、`fs_cache` が無くても
+    /// 復元できる retained PDF composite。以前は前者しか収穫しておらず、後者だけで
+    /// 表示しているページは「画面に出ているのに寸法が分からない」ままだった。
+    /// 通常は他の判定がそれで困らないが、横長分割は寸法が要るので効かなくなる
+    /// (PDF を開き直して items 世代が変わると `page_dims_cache` も失効するため、
+    /// サムネイル未読込と重なると供給源がゼロになる)。
+    pub(crate) fn harvest_page_dims(&mut self) {
         let generation = self.items_generation;
         for (&idx, entry) in &self.fs_cache {
             if let Some(dims) = fs_cache_entry_page_dims(entry) {
                 self.page_dims_cache.record(generation, idx, dims);
             }
+        }
+        // retained composite は現在ページを表示するための経路なので、そのページだけ見る。
+        let retained = self.fullscreen_idx.and_then(|idx| {
+            self.retained_pdf_page_source_dims(idx)
+                .map(|dims| (idx, dims))
+        });
+        if let Some((idx, dims)) = retained {
+            self.page_dims_cache.record(generation, idx, dims);
         }
     }
 
@@ -9649,15 +9760,33 @@ impl App {
         idx: usize,
         rotation: crate::rotation_db::Rotation,
     ) -> bool {
-        is_spread_pairable_item(self.items.get(idx))
-            && is_landscape(
-                idx,
-                rotation,
-                &self.fs_cache,
-                &self.thumbnails,
-                &self.page_dims_cache,
-                self.items_generation,
-            )
+        matches!(
+            self.split_decision(idx, rotation),
+            SplitDecision::Split { .. }
+        )
+    }
+
+    /// 分割するか / しないなら理由。**「まだ寸法が分からない」と「縦長だから」を分ける。**
+    ///
+    /// 混ぜると「たまに割れない」が観測できない。前者は一時的で、寸法が届けば割れる。
+    fn split_decision(&self, idx: usize, rotation: crate::rotation_db::Rotation) -> SplitDecision {
+        if !is_spread_pairable_item(self.items.get(idx)) {
+            return SplitDecision::NotAStillPage;
+        }
+        let Some((w, h)) = known_page_dims(
+            idx,
+            &self.fs_cache,
+            &self.thumbnails,
+            &self.page_dims_cache,
+            self.items_generation,
+        ) else {
+            return SplitDecision::DimensionsUnknown;
+        };
+        if crate::rotation_db::landscape_after_rotation(w, h, rotation) {
+            SplitDecision::Split { w, h }
+        } else {
+            SplitDecision::NotLandscape { w, h }
+        }
     }
 
     /// 表示中のページと分割モードから、左右の記憶を辻褄の合う値へ寄せる。
@@ -9666,18 +9795,47 @@ impl App {
     /// すべてに「左右を戻す」を足すと必ずどれか漏れる。**表示側で 1 か所そろえる。**
     /// 分割していないページや分割 OFF では `Full` に戻すので、記憶が居残らない。
     fn reconcile_fullscreen_page_slice(&mut self, fs_idx: usize) {
-        let splits = self.split_direction_now().map(|direction| {
-            let rotation = self.get_rotation(fs_idx);
-            (direction, self.page_splits_with_rotation(fs_idx, rotation))
-        });
-        match splits {
-            Some((direction, true)) => {
-                if !self.fullscreen_page_slice.is_half() {
-                    self.fullscreen_page_slice = direction.first();
-                }
+        let Some(direction) = self.split_direction_now() else {
+            self.fullscreen_page_slice = crate::page_split::PageSlice::Full;
+            self.note_split_decision(fs_idx, None);
+            return;
+        };
+        let rotation = self.get_rotation(fs_idx);
+        let decision = self.split_decision(fs_idx, rotation);
+        self.note_split_decision(fs_idx, Some(decision));
+        if matches!(decision, SplitDecision::Split { .. }) {
+            if !self.fullscreen_page_slice.is_half() {
+                self.fullscreen_page_slice = direction.first();
             }
-            _ => self.fullscreen_page_slice = crate::page_split::PageSlice::Full,
+        } else {
+            self.fullscreen_page_slice = crate::page_split::PageSlice::Full;
         }
+    }
+
+    /// 表示中ページの分割判断を、**変わったときだけ** 1 行残す。
+    ///
+    /// 毎フレーム出すとログが埋まるので、対象ページか理由が変わった瞬間だけ書く。
+    /// これがあると「分割を選んだのにつながったまま」の原因が、寸法待ちなのか
+    /// 縦長なのかを後から切り分けられる。
+    fn note_split_decision(&mut self, fs_idx: usize, decision: Option<SplitDecision>) {
+        let stamp = decision.map(|d| (fs_idx, d));
+        if self.last_split_decision == stamp {
+            return;
+        }
+        self.last_split_decision = stamp;
+        let Some(decision) = decision else {
+            return;
+        };
+        let dims = decision
+            .dims()
+            .map(|(w, h)| format!("{w}x{h}"))
+            .unwrap_or_else(|| "unknown".to_string());
+        crate::logger::log(format!(
+            "[split] idx={fs_idx} decision={} dims={dims} rotation={:?} mode={:?}",
+            decision.reason(),
+            self.get_rotation(fs_idx),
+            self.spread_mode
+        ));
     }
 
     /// このページへ渡す部分矩形。**分割中は分割が勝ち、表示トリムは使わない。**
@@ -13647,7 +13805,7 @@ impl App {
             return;
         };
 
-        self.harvest_page_dims_from_fs_cache();
+        self.harvest_page_dims();
         self.reconcile_fullscreen_page_slice(fs_idx);
 
         let page_turn_decision = self.fs_page_turn_decision_for_frame(ctx, fs_idx);
@@ -26506,12 +26664,19 @@ impl App {
         )
     }
 
+    /// 連結読みのスクロールで現在の段が変わったときの再アンカー。
+    ///
+    /// `new_slice` は移った先の段の左右。**分割中は元 index が変わらないまま段だけが
+    /// 変わる**ので、これを書かないと次のフレームで現在位置が元の段に解決され、
+    /// スクロールが引き戻されて先へ進めなくなる (実機で発生)。
+    /// 分割していない段は `Full` を渡す。
     pub(crate) fn reanchor_continuous_reading_viewer(
         &mut self,
         ctx: &egui::Context,
         old_offsets: &[f32],
         new_pos: usize,
         new_idx: usize,
+        new_slice: crate::page_split::PageSlice,
         history_trigger: crate::app::HistoryTrigger,
     ) {
         if self.items.get(new_idx).is_none() {
@@ -26528,6 +26693,7 @@ impl App {
         self.fs_vertical_scroll =
             vertical_reading_reanchor_scroll(self.fs_vertical_scroll, old_offsets, new_pos);
         self.fullscreen_idx = Some(new_idx);
+        self.fullscreen_page_slice = new_slice;
         self.sync_main_selection_from_viewer_idx(new_idx);
         self.record_book_resume(new_idx);
         self.record_reading_history(new_idx, history_trigger);
@@ -26816,11 +26982,13 @@ impl App {
             && let Some(unit) = units.get(new_pos)
         {
             let new_idx = unit.anchor_idx;
+            let new_slice = unit.slice;
             self.reanchor_continuous_reading_viewer(
                 ctx,
                 &offsets,
                 new_pos,
                 new_idx,
+                new_slice,
                 history_trigger,
             );
         }
@@ -45400,6 +45568,71 @@ mod tests {
         assert_spread_seek_units_cover_nav_and_endpoints(&nav, &units);
     }
 
+    /// リモートへ返す分割の表示単位。**同じ index の group が 2 つ並ぶ。**
+    ///
+    /// 端末側はこれを `(anchor, slice)` の組で照合する。index だけで解決すると
+    /// 必ず先頭へ吸われる (本体側で 2 回踏んだのと同じ形)。
+    #[test]
+    fn a_landscape_page_becomes_two_remote_groups() {
+        use crate::page_split::PageSlice;
+
+        let items = (0..3)
+            .map(|k| GridItem::Image(std::path::PathBuf::from(format!("p{k}.jpg"))))
+            .collect::<Vec<_>>();
+        let mut landscape = vec![false; items.len()];
+        landscape[1] = true;
+
+        let groups = build_remote_spread_page_groups(&items, SpreadMode::SplitLtr, &landscape);
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| (group.indices.clone(), group.slice))
+                .collect::<Vec<_>>(),
+            vec![
+                (vec![0], PageSlice::Full),
+                (vec![1], PageSlice::Left),
+                (vec![1], PageSlice::Right),
+                (vec![2], PageSlice::Full),
+            ]
+        );
+
+        // 右→左では左右の順序だけが変わる。元ページの順序は変わらない。
+        let rtl = build_remote_spread_page_groups(&items, SpreadMode::SplitRtl, &landscape);
+        assert_eq!(
+            rtl.iter().map(|group| group.slice).collect::<Vec<_>>(),
+            vec![
+                PageSlice::Full,
+                PageSlice::Right,
+                PageSlice::Left,
+                PageSlice::Full
+            ]
+        );
+        assert_eq!(
+            rtl.iter()
+                .map(|group| group.indices.clone())
+                .collect::<Vec<_>>(),
+            groups
+                .iter()
+                .map(|group| group.indices.clone())
+                .collect::<Vec<_>>()
+        );
+
+        // 分割は見開きではない。1 group に 2 ページを入れない。
+        assert!(groups.iter().all(|group| group.indices.len() == 1));
+    }
+
+    /// リモート group の index だけを取り出す。左右は分割モードの専用テストで確かめる。
+    fn remote_group_indices(
+        items: &[GridItem],
+        spread_mode: SpreadMode,
+        landscape: &[bool],
+    ) -> Vec<Vec<usize>> {
+        build_remote_spread_page_groups(items, spread_mode, landscape)
+            .into_iter()
+            .map(|group| group.indices)
+            .collect()
+    }
+
     fn spread_unit_summary(units: &[SpreadDisplayUnit]) -> Vec<(usize, Vec<usize>)> {
         units
             .iter()
@@ -45539,23 +45772,23 @@ mod tests {
         let landscape = [false, false, false, true, false, false, false];
 
         assert_eq!(
-            build_remote_spread_page_groups(&items, SpreadMode::Ltr, &landscape),
+            remote_group_indices(&items, SpreadMode::Ltr, &landscape),
             vec![vec![0, 1], vec![2], vec![3], vec![4, 5], vec![6]]
         );
         assert_eq!(
-            build_remote_spread_page_groups(&items, SpreadMode::LtrCover, &landscape),
+            remote_group_indices(&items, SpreadMode::LtrCover, &landscape),
             vec![vec![0], vec![1, 2], vec![3], vec![4, 5], vec![6]]
         );
         assert_eq!(
-            build_remote_spread_page_groups(&items, SpreadMode::Rtl, &landscape),
+            remote_group_indices(&items, SpreadMode::Rtl, &landscape),
             vec![vec![1, 0], vec![2], vec![3], vec![5, 4], vec![6]]
         );
         assert_eq!(
-            build_remote_spread_page_groups(&items, SpreadMode::RtlCover, &landscape),
+            remote_group_indices(&items, SpreadMode::RtlCover, &landscape),
             vec![vec![0], vec![2, 1], vec![3], vec![5, 4], vec![6]]
         );
         assert_eq!(
-            build_remote_spread_page_groups(&items, SpreadMode::Single, &landscape),
+            remote_group_indices(&items, SpreadMode::Single, &landscape),
             (0..7).map(|index| vec![index]).collect::<Vec<_>>()
         );
     }
