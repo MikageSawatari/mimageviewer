@@ -16558,6 +16558,43 @@ mod favorite_adjustment_defaults_tests {
 
         // 表示していない別ページには左右を持ち込まない。
         assert_eq!(app.fs_page_content_bbox(7, Rotation::None, trim), trim);
+
+        // **編集ツールへ入ったら分割を掛けない。**マスク・注釈・切り取り枠・補正レイヤーは
+        // 分割前の画像へ記録されるので、半分だけ見ながら全体に効く編集をさせない
+        // (2026-08-26 の実機報告: 半ページのまま編集ツールへ入っていた)。
+        for enter in [
+            |app: &mut crate::app::App| app.erase_mode = true,
+            |app: &mut crate::app::App| app.conceal_mode = true,
+            |app: &mut crate::app::App| app.text_mode = true,
+            |app: &mut crate::app::App| app.local_adjust_mode = true,
+            |app: &mut crate::app::App| app.export_crop_mode = true,
+        ] {
+            enter(&mut app);
+            assert_eq!(
+                app.fs_page_content_bbox(4, Rotation::None, trim),
+                trim,
+                "編集ツール中は分割前の全体を出す"
+            );
+            // 左右の記憶は消さない。抜ければ元の半分へ戻る。
+            assert_eq!(app.fullscreen_page_slice, PageSlice::Left);
+            app.erase_mode = false;
+            app.conceal_mode = false;
+            app.text_mode = false;
+            app.local_adjust_mode = false;
+            app.export_crop_mode = false;
+            assert_eq!(
+                app.fs_page_content_bbox(4, Rotation::None, trim),
+                Some(PageSlice::Left.uv_rect())
+            );
+        }
+
+        // 分析モードは「見る」ための機能なので分割したまま。
+        app.analysis_mode = true;
+        assert_eq!(
+            app.fs_page_content_bbox(4, Rotation::None, trim),
+            Some(PageSlice::Left.uv_rect())
+        );
+        app.analysis_mode = false;
     }
 
     /// 横長分割のページ送り。**同じページの左右移動と、別ページへの移動を分けて返す。**
@@ -16636,6 +16673,22 @@ mod favorite_adjustment_defaults_tests {
         app.fullscreen_page_slice = PageSlice::Full;
         assert_eq!(
             app.spread_page_nav(-1),
+            FsPageNav::Split(PresentationStep {
+                source_idx: 1,
+                slice: PageSlice::Right
+            })
+        );
+
+        // **自動送りも同じ歩幅。**スライドショーが分割を無視すると、始めた瞬間に分割が
+        // 解除されて画面が大きく変わる (2026-08-26 の実機判断)。解決経路が同じであることを、
+        // スライドショーが使う `spread_page_nav_for_indices` 側でも固定する。
+        let display_order = app.current_grid_order().to_vec();
+        let reading =
+            crate::ui_fullscreen::build_image_reading_indices_for_test(&app.items, &display_order);
+        app.fullscreen_idx = Some(1);
+        app.fullscreen_page_slice = PageSlice::Left;
+        assert_eq!(
+            app.spread_page_nav_for_indices(&reading, 1, 1),
             FsPageNav::Split(PresentationStep {
                 source_idx: 1,
                 slice: PageSlice::Right

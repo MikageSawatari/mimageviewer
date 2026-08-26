@@ -5806,7 +5806,7 @@ impl App {
     }
 
     fn visual_spread_shift_dir(&self, right: bool) -> i32 {
-        let rtl = self.spread_mode.is_rtl();
+        let rtl = self.spread_mode.advances_right_to_left();
         match (right, rtl) {
             (true, false) | (false, true) => 1,
             (true, true) | (false, false) => -1,
@@ -6163,7 +6163,7 @@ impl App {
                 PadDir::Up | PadDir::Down | PadDir::Left | PadDir::Right => {}
             }
         }
-        let rtl = self.spread_mode.is_rtl();
+        let rtl = self.spread_mode.advances_right_to_left();
         let base_delta = match dir {
             PadDir::Right if !rtl => 1,
             PadDir::Right => -1,
@@ -6199,7 +6199,7 @@ impl App {
     }
 
     fn handle_gamepad_spread_nudge(&mut self, ctx: &egui::Context, fs_idx: usize, dir: PadDir) {
-        let rtl = self.spread_mode.is_rtl();
+        let rtl = self.spread_mode.advances_right_to_left();
         let nudge_dir = match dir {
             PadDir::Right if !rtl => Some(1),
             PadDir::Right => Some(-1),

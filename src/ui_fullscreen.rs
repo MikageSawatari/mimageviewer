@@ -1651,10 +1651,11 @@ fn spread_mode_key_action(mode: SpreadMode) -> Option<KeyAction> {
         SpreadMode::LtrCover => Some(KeyAction::FsSpreadLtrCover),
         SpreadMode::Rtl => Some(KeyAction::FsSpreadRtl),
         SpreadMode::RtlCover => Some(KeyAction::FsSpreadRtlCover),
-        // 分割モードには既定キーを割り当てていない。1〜5 は既存の 5 モードで埋まっており、
-        // 空いた既定を作るために既存の割り当てを動かすのは、利用者の手癖を壊す方が損である。
-        // 上のバーのプルダウンから選ぶ。keymap で足したくなったらここへ `KeyAction` を追加する。
-        SpreadMode::Vertical | SpreadMode::SplitLtr | SpreadMode::SplitRtl => None,
+        // 分割は 8 / 9。1〜5 の見開きと 6 (連結) / 7 (綴じ方向) / 0 (フィット) の後ろに続く。
+        SpreadMode::SplitLtr => Some(KeyAction::FsSpreadSplitLtr),
+        SpreadMode::SplitRtl => Some(KeyAction::FsSpreadSplitRtl),
+        // 旧 DB 互換の `Vertical` は連結方式 (6) 側へ移したので、キーを持たない。
+        SpreadMode::Vertical => None,
     }
 }
 
@@ -7654,6 +7655,15 @@ pub(crate) fn navigable_delta_between(
     (delta != 0).then_some(delta)
 }
 
+/// スライドショーが使う並びを試験から引くための入口。生成規則は本体と同じものを通す。
+#[cfg(test)]
+pub(crate) fn build_image_reading_indices_for_test(
+    items: &[GridItem],
+    visible_indices: &[usize],
+) -> Vec<usize> {
+    build_image_reading_indices(items, visible_indices)
+}
+
 fn build_image_reading_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize> {
     crate::ui_helpers::still_image_display_indices(items, visible_indices)
 }
@@ -9862,11 +9872,31 @@ impl App {
     ///
     /// 記憶している左右が今のページのものとは限らない (モードを切り替えた直後など) ので、
     /// **表示中のページであること**も併せて確かめる。
+    ///
+    /// ページ全体を対象にする編集ツールが画面を持っている間は `None`。左右の記憶は消さない
+    /// ので、ツールを抜ければ元の半分へ戻る。
     fn active_page_slice_for(&self, idx: usize) -> Option<crate::page_split::PageSlice> {
         (self.spread_mode.is_split()
             && self.fullscreen_idx == Some(idx)
-            && self.fullscreen_page_slice.is_half())
+            && self.fullscreen_page_slice.is_half()
+            && !self.page_edit_tool_owns_canvas())
         .then_some(self.fullscreen_page_slice)
+    }
+
+    /// ページ全体を対象にする編集ツールが画面を持っているか。
+    ///
+    /// マスク・注釈・切り取り枠・補正レイヤーは**分割前の画像**へ記録されるので、これらの
+    /// ツールへ入ったら分割を掛けたままにしない (半分だけを見ながら全体に効く編集をすると、
+    /// 見えていない側を触れないまま保存することになる)。
+    ///
+    /// 分析モードとルーペは「見る」ための機能なので対象外。半分のまま見えてよい
+    /// (2026-08-26 の実機確認で、この 2 つは現状の見え方でよいと確認済み)。
+    fn page_edit_tool_owns_canvas(&self) -> bool {
+        self.erase_mode
+            || self.conceal_mode
+            || self.text_mode
+            || self.local_adjust_mode
+            || self.export_crop_mode
     }
 
     /// 分割中のページ送り。ステップ列の中を 1 つ動かす。
@@ -10610,7 +10640,11 @@ impl App {
             egui::vec2(placement.w.max(1.0), placement.h.max(1.0)),
         );
         let image_rect = self.fullscreen_media_rect(full_rect, idx, false);
-        let content_bbox = self.view_trim_single_content_bbox(idx);
+        // **凍結ウィンドウも分割を通す。**非アクティブなウィンドウはこの snapshot から描くので、
+        // ここを通し忘れると、ウィンドウが非アクティブになった瞬間に半分が全体へ戻る
+        // (2026-08-26 の実機報告)。トリムの扱いは従来どおり (回転時の可否を変えない)。
+        let trim = self.view_trim_single_content_bbox(idx);
+        let content_bbox = self.fs_page_content_bbox(idx, rotation, trim);
         let draw_rect = fs_image_draw_rect_for_size(
             image_rect,
             texture_size,
@@ -18013,7 +18047,7 @@ impl App {
         self.spread_page_nav_for_indices(&nav, fs_idx, base_delta)
     }
 
-    fn spread_page_nav_for_indices(
+    pub(crate) fn spread_page_nav_for_indices(
         &mut self,
         nav: &[usize],
         fs_idx: usize,
@@ -19973,6 +20007,10 @@ impl App {
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsSpreadRtl);
         let key_5 =
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsSpreadRtlCover);
+        let key_8 =
+            !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsSpreadSplitLtr);
+        let key_9 =
+            !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsSpreadSplitRtl);
         let key_6 = !fs_music_view_active
             && self
                 .keymap
@@ -20126,6 +20164,10 @@ impl App {
             Some(SpreadMode::Rtl)
         } else if key_5 {
             Some(SpreadMode::RtlCover)
+        } else if key_8 {
+            Some(SpreadMode::SplitLtr)
+        } else if key_9 {
+            Some(SpreadMode::SplitRtl)
         } else {
             None
         };
@@ -20141,8 +20183,12 @@ impl App {
                 3
             } else if key_4 {
                 4
-            } else {
+            } else if key_5 {
                 5
+            } else if key_8 {
+                8
+            } else {
+                9
             };
             self.show_feedback_toast(format!("[{}:{}]", key_num, mode.label()));
         }
@@ -20592,7 +20638,8 @@ impl App {
         // 通常の左右キーによるページ移動だけは、ページ表示の綴じ方向かシークバーの
         // 実効方向かを設定で選べる。Ctrl/Shift+左右などの明示コマンドは従来どおり
         // ページ表示の綴じ方向を使い、この設定へ巻き込まない。
-        let page_rtl = self.spread_mode.is_rtl();
+        // 入力の左右は読み順で決める。ペア並び順 (`is_rtl`) は別の問い。
+        let page_rtl = self.spread_mode.advances_right_to_left();
         let seek_bar_rtl = self
             .settings
             .fullscreen_seek_direction
@@ -22997,8 +23044,10 @@ impl App {
                         // A recognized tap is an intentional discrete page turn,
                         // including in continuous reading. Use the same unit
                         // resolver as FsPageNext/FsPagePrev.
-                        let base =
-                            fullscreen_click_nav_delta_for_side(left, self.spread_mode.is_rtl());
+                        let base = fullscreen_click_nav_delta_for_side(
+                            left,
+                            self.spread_mode.advances_right_to_left(),
+                        );
                         page_nav = self.spread_page_nav(base);
                     }
                     crate::touch_input::TouchCommand::Zoom { factor, pivot } => {
@@ -23546,7 +23595,7 @@ impl App {
                                     let base = fullscreen_click_nav_base_delta(
                                         pos.x,
                                         full_rect.center().x,
-                                        self.spread_mode.is_rtl(),
+                                        self.spread_mode.advances_right_to_left(),
                                     );
                                     page_nav = self.spread_page_nav(base);
                                 }
@@ -23877,25 +23926,44 @@ impl App {
     /// ループ / 次フォルダ / 停止する。
     fn advance_slideshow(&mut self, ctx: &egui::Context, cur: usize) {
         let display_order = self.current_grid_order().to_vec();
-        let slide_nav = if self.spread_mode.is_spread() {
+        // **自動送りは、読み手が自分で送るのと同じ歩幅にする。**分割を無視すると、
+        // スライドショーを始めた瞬間に分割が解除されて画面が大きく変わってしまう
+        // (2026-08-26 の実機判断)。
+        let slide_nav = if self.spread_mode.is_spread() || self.spread_mode.is_split() {
             let image_indices = build_image_reading_indices(&self.items, &display_order);
             self.spread_page_nav_for_indices(&image_indices, cur, 1)
         } else {
             FsPageNav::Delta(1)
         };
+        // 同じページの反対側はページ遷移ではない。テクスチャも読み込みも同じなので、
+        // 遷移の機構を通さずに左右だけ動かす (通常のページ送りと同じ扱い)。
+        if let FsPageNav::Split(step) = slide_nav
+            && step.source_idx == cur
+        {
+            self.fullscreen_page_slice = step.slice;
+            ctx.request_repaint();
+            return;
+        }
         let next_idx = match slide_nav {
             FsPageNav::Target(idx) => Some(idx),
+            // 別ページの半分へ。着地してから左右を確定する。
+            FsPageNav::Split(step) => Some(step.source_idx),
             FsPageNav::Delta(delta) => {
                 crate::ui_helpers::adjacent_slideshow_idx(&self.items, &display_order, cur, delta)
             }
-            // スライドショーは分割を使わない (`is_spread()` が偽なので `Delta` へ行く)。
-            // 届かないが、届いたときに黙って先へ進まないよう塞いでおく。
-            FsPageNav::None | FsPageNav::Boundary { .. } | FsPageNav::Split(_) => None,
+            FsPageNav::None | FsPageNav::Boundary { .. } => None,
         };
         if let Some(idx) = next_idx {
             // フォルダ内の次の静止画系アイテムへ前進。
             self.slideshow_anchor_idx = None;
             self.open_fullscreen_from_slideshow_navigation(ctx, idx);
+            // **着地できたときだけ**左右を確定する。断られた場合に左右だけ動くと、
+            // 今見えているページの反対側が出る (通常のページ送りと同じ約束)。
+            if let FsPageNav::Split(step) = slide_nav
+                && self.fullscreen_idx == Some(step.source_idx)
+            {
+                self.fullscreen_page_slice = step.slice;
+            }
             self.selected = Some(idx);
             self.scroll_to_selected = true;
             return;
@@ -25942,10 +26010,8 @@ impl App {
     }
 
     pub(crate) fn update_reading_direction_from_spread_mode(&mut self, mode: SpreadMode) {
-        if mode.is_rtl() {
-            self.reading_direction = ReadingDirection::Rtl;
-        } else if matches!(mode, SpreadMode::Ltr | SpreadMode::LtrCover) {
-            self.reading_direction = ReadingDirection::Ltr;
+        if let Some(direction) = mode.reading_direction() {
+            self.reading_direction = direction;
         }
     }
 

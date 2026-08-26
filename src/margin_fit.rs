@@ -407,6 +407,48 @@ pub fn diagnose(img: &ColorImage, tol: u8) -> MarginFitDiag {
 
 #[cfg(test)]
 mod tests {
+    /// サンプル素材が本当にトリムされるかを、素材と同じ作りで確かめる。
+    ///
+    /// `scripts/make-split-trim-sample.py` の初版はページ端に 1px の枠線を描いていた。
+    /// 枠線は縁いっぱいの「中身」として検出されるので中身の箱が全面になり、**トリムが
+    /// 一切効かない**。実機確認で「余白が消えない」と報告され、アプリではなく素材の作りが
+    /// 原因だった (2026-08-26)。同じ罠を踏み直さないようここで固定する。
+    #[test]
+    fn a_plain_white_margin_is_trimmed_but_a_page_edge_frame_defeats_it() {
+        fn page(width: usize, height: usize, margin: usize, frame: bool) -> ColorImage {
+            let mut pixels = vec![egui::Color32::WHITE; width * height];
+            for y in margin..height - margin {
+                for x in margin..width - margin {
+                    pixels[y * width + x] = egui::Color32::from_rgb(40, 90, 170);
+                }
+            }
+            if frame {
+                for x in 0..width {
+                    pixels[x] = egui::Color32::from_rgb(200, 200, 200);
+                    pixels[(height - 1) * width + x] = egui::Color32::from_rgb(200, 200, 200);
+                }
+                for y in 0..height {
+                    pixels[y * width] = egui::Color32::from_rgb(200, 200, 200);
+                    pixels[y * width + width - 1] = egui::Color32::from_rgb(200, 200, 200);
+                }
+            }
+            ColorImage {
+                size: [width, height],
+                pixels,
+                source_size: egui::vec2(width as f32, height as f32),
+            }
+        }
+
+        let trimmed =
+            detect_content_bbox(&page(300, 420, 35, false), 16).expect("白い余白は検出できる");
+        // 余白 35/300 と 35/420 のぶん内側へ寄る。ダウンスケールの誤差があるので幅で見る。
+        assert!(trimmed.min.x > 0.05 && trimmed.max.x < 0.95, "{trimmed:?}");
+        assert!(trimmed.min.y > 0.03 && trimmed.max.y < 0.97, "{trimmed:?}");
+
+        // 枠線を引くと縁まで中身になり、切る余地が無くなる。
+        assert_eq!(detect_content_bbox(&page(300, 420, 35, true), 16), None);
+    }
+
     use super::*;
 
     fn white(w: usize, h: usize) -> ColorImage {

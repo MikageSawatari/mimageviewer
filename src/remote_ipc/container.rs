@@ -1958,6 +1958,105 @@ fn folder_thumb_aspect_height_ratio(settings: &crate::settings::Settings, folder
 /// worker への往復が要るので、開くたびに全ページ分を払うわけにいかない。どちらも既定
 /// (`cache_zip_always` / `cache_pdf_always`) でカタログが作られるため実害はそれらを切った
 /// 場合に限られる。**黙って効かなくならないよう、寸法不明の件数はログへ残す。**
+/// カタログに寸法が無い PDF ページが 1 つでもあるか。
+///
+/// **無いなら worker へ問い合わせない。**既にサムネイルを作った PDF に追加費用を出さない
+/// ための条件で、費用の有無がここだけで決まるようにしてある。
+fn pdf_page_sizes_needed(
+    items: &[crate::grid_item::GridItem],
+    cached: &std::collections::HashMap<String, Option<(u32, u32)>>,
+) -> bool {
+    items.iter().any(|item| match item {
+        crate::grid_item::GridItem::PdfPage { page_num, .. } => {
+            !cached.contains_key(&crate::grid_item::pdf_page_cache_key(*page_num))
+        }
+        _ => false,
+    })
+}
+
+/// 画像ヘッダを読むために取り出すエントリ先頭のバイト数。
+///
+/// JPEG / PNG / WebP はいずれも寸法が先頭近くにある。これで足りなければ寸法不明として
+/// 扱う (件数はログへ)。**エントリ全体は展開しない。**
+const ZIP_HEADER_PROBE_BYTES: u64 = 64 * 1024;
+
+/// カタログに行が無い ZIP エントリの寸法を、書庫を **1 回だけ開いて**集める。
+///
+/// 端末から直接開いた書庫には PC 側のサムネイルが無く、カタログも作られない。横長判定を
+/// カタログだけに頼っていると、その本では**見開きのページ揃えも横長分割も黙って効かない**。
+///
+/// ネストパス (`inner.zip/p01.jpg`) と旧形式の名前はこの経路では解決できない。RAR は
+/// 部分読みの経路が無く、1 エントリごとに全体展開になるので**対象にしない**。解決できな
+/// かったものは寸法不明のまま残り、件数がログに出る。
+fn collect_zip_entry_dims(
+    container_path: &Path,
+    items: &[crate::grid_item::GridItem],
+    cached: &std::collections::HashMap<String, Option<(u32, u32)>>,
+    dims: &mut std::collections::HashMap<String, (u32, u32)>,
+) {
+    if crate::rar_loader::is_rar_path(container_path) {
+        return;
+    }
+    let missing = items
+        .iter()
+        .filter_map(|item| match item {
+            crate::grid_item::GridItem::ZipImage { entry_name, .. }
+                if !cached.contains_key(entry_name) =>
+            {
+                Some(entry_name.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return;
+    }
+    let mut archive = match crate::zip_loader::open_archive(container_path) {
+        Ok(archive) => archive,
+        Err(error) => {
+            crate::logger::log(format!(
+                "remote_ipc: zip entry dims unavailable path={} error={error}",
+                container_path.display()
+            ));
+            return;
+        }
+    };
+    // **黙って諦めない。**名前解決に失敗した書庫では 1 件も取れず、原因が見えないまま
+    // 「分割されない」だけが残る (2026-08-26 に実際そうなった)。
+    let attempted = missing.len();
+    let mut unresolved = 0usize;
+    let mut undecodable = 0usize;
+    for entry_name in missing {
+        let head = match crate::zip_loader::read_entry_prefix_from_archive(
+            &mut archive,
+            &entry_name,
+            ZIP_HEADER_PROBE_BYTES,
+        ) {
+            Ok(head) => head,
+            Err(_) => {
+                unresolved += 1;
+                continue;
+            }
+        };
+        match image::ImageReader::new(std::io::Cursor::new(head))
+            .with_guessed_format()
+            .ok()
+            .and_then(|reader| reader.into_dimensions().ok())
+        {
+            Some(size) => {
+                dims.insert(entry_name, size);
+            }
+            None => undecodable += 1,
+        }
+    }
+    if unresolved > 0 || undecodable > 0 {
+        crate::logger::log(format!(
+            "remote_ipc: zip entry dims incomplete path={} attempted={attempted}              unresolved={unresolved} undecodable={undecodable}",
+            container_path.display()
+        ));
+    }
+}
+
 pub(super) fn page_dims_without_catalog(item: &crate::grid_item::GridItem) -> Option<(u32, u32)> {
     match item {
         crate::grid_item::GridItem::Image(path) => image::ImageReader::open(path)
@@ -4575,7 +4674,13 @@ impl ContainerEngine {
         );
         let (image_count, video_count, other_count) =
             crate::ui_fullscreen::seek_overlay_media_counts(source_items);
-        let landscape = self.cached_landscape_flags(&resolved.logical, items);
+        // Single は横長判定を一切見ない。**見ないものを作らない** (PDF は寸法の取得に
+        // worker 往復が要るので、開くたびに払うと無駄になる)。
+        let landscape = if effective == RemoteSpreadMode::Single {
+            vec![false; items.len()]
+        } else {
+            self.cached_landscape_flags(&resolved.logical, items)
+        };
         let index_groups = crate::ui_fullscreen::build_remote_spread_page_groups(
             items,
             core_spread_mode(effective),
@@ -4954,6 +5059,51 @@ impl ContainerEngine {
         }
     }
 
+    /// カタログに行が無いページの寸法を、**カタログに依らない経路でまとめて**求める。
+    ///
+    /// 返す辞書のキーはカタログと同じ (`pdf_page_cache_key` / ZIP の entry_name) なので、
+    /// 呼び出し側はページ種別で分岐しない。**費用が要るものだけをここで払う**:
+    ///
+    /// - PDF: 文書ごとに 1 往復。`FPDF_GetPageSizeByIndexF` はページを読み込まないので
+    ///   レンダリング 1 枚より安い。
+    /// - ZIP: 書庫を 1 回だけ開き、各エントリの**先頭だけ**を読む。全体を展開すると、
+    ///   寸法のためだけに 1 冊分の画像を伸長することになる。
+    /// - 画像ファイル: ここでは扱わない (1 件ずつ `page_dims_without_catalog` で足りる)。
+    ///
+    /// カタログに寸法がある間は 1 件も読まないので、既にサムネイルを作った本に追加費用は
+    /// 出ない。取得できなければ従来どおり「寸法不明」とし、件数はログへ残す。
+    fn catalog_free_dims(
+        &self,
+        container_path: &Path,
+        items: &[crate::grid_item::GridItem],
+        cached: &std::collections::HashMap<String, Option<(u32, u32)>>,
+    ) -> std::collections::HashMap<String, (u32, u32)> {
+        let mut dims = std::collections::HashMap::new();
+        if pdf_page_sizes_needed(items, cached) {
+            let password = self.pdf_passwords.get(container_path);
+            match crate::pdf_loader::get_page_sizes(container_path, password.as_deref()) {
+                Ok(sizes) => {
+                    for (page_num, (width, height)) in sizes.into_iter().enumerate() {
+                        // 縦横比だけを見る。points を丸めて幅・高さとして扱う。
+                        dims.insert(
+                            crate::grid_item::pdf_page_cache_key(page_num as u32),
+                            (
+                                width.max(0.0).round() as u32,
+                                height.max(0.0).round() as u32,
+                            ),
+                        );
+                    }
+                }
+                Err(error) => crate::logger::log(format!(
+                    "remote_ipc: pdf page sizes unavailable path={} error={error}",
+                    container_path.display()
+                )),
+            }
+        }
+        collect_zip_entry_dims(container_path, items, cached, &mut dims);
+        dims
+    }
+
     fn cached_landscape_flags(
         &self,
         container_path: &Path,
@@ -4971,6 +5121,9 @@ impl ContainerEngine {
             .as_ref()
             .and_then(|catalog| catalog.load_source_dims().ok())
             .unwrap_or_default();
+        // カタログに行が無いページの寸法を、カタログに依らない経路でまとめて求める。
+        // カタログが揃っている間は 1 件も読まない。
+        let fallback_dims = self.catalog_free_dims(container_path, items, &cached);
         let rotation_keys = items
             .iter()
             .map(crate::edit_source::page_key_for_grid_item)
@@ -5015,8 +5168,11 @@ impl ContainerEngine {
                                     crate::catalog::decode_thumb_dims(&entry.jpeg_data)
                                 })
                         }),
-                        // カタログ行が 1 つも無い場合。ヘッダだけ読んで補う。
-                        None => page_dims_without_catalog(item),
+                        // カタログ行が 1 つも無い場合。まとめて求めた辞書、無ければ 1 件読み。
+                        None => fallback_dims
+                            .get(&key)
+                            .copied()
+                            .or_else(|| page_dims_without_catalog(item)),
                     }
                 });
                 if dims.is_none() {
@@ -5039,7 +5195,8 @@ impl ContainerEngine {
         // 件数を残す。全ページ不明ならカタログもヘッダ読みも当たっていない。
         if unknown > 0 {
             crate::logger::log(format!(
-                "remote_ipc: page dims unknown pages={unknown}/{pages}                  (landscape detection is off for those pages)"
+                "remote_ipc: page dims unknown pages={unknown}/{pages} path={}                  (landscape detection is off for those pages)",
+                container_path.display()
             ));
         }
         flags
@@ -7559,6 +7716,44 @@ mod tests {
     }
 
     #[test]
+    /// **カタログが揃っている PDF に追加費用を出さない。**
+    ///
+    /// 1 ページでも寸法が無ければ文書ごと 1 往復で取りに行くが、揃っていれば行かない。
+    fn pdf_page_sizes_are_fetched_only_when_the_catalog_misses_a_page() {
+        let items = (0..3)
+            .map(|page_num| crate::grid_item::GridItem::PdfPage {
+                pdf_path: std::path::PathBuf::from("book.pdf"),
+                page_num,
+                content_type: None,
+            })
+            .collect::<Vec<_>>();
+        let mut cached = std::collections::HashMap::new();
+        for page_num in 0..3 {
+            cached.insert(
+                crate::grid_item::pdf_page_cache_key(page_num),
+                Some((600u32, 800u32)),
+            );
+        }
+        assert!(!pdf_page_sizes_needed(&items, &cached));
+
+        // 寸法列が空の古い行でも「行はある」ので取りに行かない (サムネイルから復元できる)。
+        cached.insert(crate::grid_item::pdf_page_cache_key(1), None);
+        assert!(!pdf_page_sizes_needed(&items, &cached));
+
+        // 行そのものが無いページが 1 つでもあれば取りに行く。
+        cached.remove(&crate::grid_item::pdf_page_cache_key(2));
+        assert!(pdf_page_sizes_needed(&items, &cached));
+
+        // PDF ページが 1 つも無ければ関係ない。
+        assert!(!pdf_page_sizes_needed(
+            &[crate::grid_item::GridItem::Image(std::path::PathBuf::from(
+                "a.jpg"
+            ))],
+            &std::collections::HashMap::new()
+        ));
+    }
+
+    #[test]
     /// ZIP / PDF ページはこの経路では補わない (書庫展開と worker 往復が要るため)。
     /// **意図した範囲であることを固定する。**広げるときはここが落ちる。
     fn archive_and_pdf_pages_still_depend_on_the_catalog() {
@@ -7656,6 +7851,63 @@ mod tests {
         let engine = ContainerEngine::new(crate::settings::Settings::default());
         assert_eq!(
             engine.cached_landscape_flags(&folder, &items),
+            [true, false]
+        );
+    }
+
+    #[test]
+    /// **カタログが無い ZIP でも横長を見つける。**
+    ///
+    /// 端末から直接開いた書庫には PC 側のサムネイルが無く、カタログも作られない。
+    /// 寸法のためにエントリ全体を展開せず、先頭だけ読んで判定する。
+    fn landscape_is_found_in_a_zip_that_has_no_catalog_at_all() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let zip_path = data_dir.path().join("book.zip");
+
+        let mut png = |width: u32, height: u32| {
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgb8(image::RgbImage::new(width, height))
+                .write_to(
+                    &mut std::io::Cursor::new(&mut bytes),
+                    image::ImageFormat::Png,
+                )
+                .unwrap();
+            bytes
+        };
+        {
+            use std::io::Write;
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            writer.start_file("001.png", options).unwrap();
+            writer.write_all(&png(240, 120)).unwrap();
+            writer.start_file("002.png", options).unwrap();
+            writer.write_all(&png(120, 240)).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let items = ["001.png", "002.png"]
+            .into_iter()
+            .map(|entry_name| crate::grid_item::GridItem::ZipImage {
+                zip_path: zip_path.clone(),
+                entry_name: entry_name.to_owned(),
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            crate::catalog::CatalogDb::open_existing_read_only(
+                &crate::catalog::default_cache_dir(),
+                &zip_path,
+            )
+            .ok()
+            .flatten()
+            .is_none(),
+            "この試験はカタログが無い状態を確かめるもの"
+        );
+
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        assert_eq!(
+            engine.cached_landscape_flags(&zip_path, &items),
             [true, false]
         );
     }

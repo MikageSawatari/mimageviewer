@@ -17499,14 +17499,9 @@ impl App {
             self.spread_mode = stored_spread;
         }
         self.spread_shift_anchor_idx = None;
-        if self.spread_mode.is_rtl() {
-            self.reading_direction = crate::settings::ReadingDirection::Rtl;
-        } else if matches!(
-            self.spread_mode,
-            crate::settings::SpreadMode::Ltr | crate::settings::SpreadMode::LtrCover
-        ) {
-            self.reading_direction = crate::settings::ReadingDirection::Ltr;
-        }
+        // 読み順の対応表は `SpreadMode::reading_direction` が正本。ここへ写すと、
+        // モードを足したとき保存済みの本を開く経路だけ古いままになる。
+        self.update_reading_direction_from_spread_mode(self.spread_mode);
     }
 
     pub(crate) fn apply_view_trim_for_key(&mut self, key: &std::path::Path) {
@@ -27619,14 +27614,8 @@ impl App {
             } else {
                 self.spread_mode = stored_spread;
             }
-            if self.spread_mode.is_rtl() {
-                self.reading_direction = crate::settings::ReadingDirection::Rtl;
-            } else if matches!(
-                self.spread_mode,
-                crate::settings::SpreadMode::Ltr | crate::settings::SpreadMode::LtrCover
-            ) {
-                self.reading_direction = crate::settings::ReadingDirection::Ltr;
-            }
+            // 読み順の対応表は `SpreadMode::reading_direction` が正本 (上と同じ理由)。
+            self.update_reading_direction_from_spread_mode(self.spread_mode);
             self.spread_shift_anchor_idx = None;
             let trim = container.view_trim.unwrap_or_default();
             self.view_trim_apply_mode = match trim.apply_mode {
