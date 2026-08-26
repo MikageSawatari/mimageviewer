@@ -1233,18 +1233,58 @@ passive detached は通常どおり release で窓を activate するが、選�
 - **着手条件: §1.47 (動画の拡大縮小を mIV のシェーダで行う) が入ること。** §1.47 は
   swap chain を表示矩形サイズにし、シェーダでソース解像度から表示解像度へ解決する構造にする。
   **そのステージができれば、正距円筒投影は同じステージ上のもう 1 枚のシェーダ**になる。
-- §1.47 が入った後に残る作業:
-  1. **シェーダ移植**: 静止画側は WGSL ([panorama_wgpu.rs](../src/panorama_wgpu.rs))、presenter は
-     実行時 HLSL コンパイル ([grade_pipeline.rs](../src/video/native_presenter/grade_pipeline.rs) の
-     `D3DCompile`)。投影の数式はそのまま移せる。
-  2. **ミップ生成**: 静止画側はフルミップ + `textureSampleGrad` で品質を出している
-     ([panorama_wgpu.rs](../src/panorama_wgpu.rs))。毎フレーム 5.7K のミップ生成が現実的かは
-     **実測してから決める** (代替は品質を落とした単純フィルタ)。
-  3. **入力**: 見回しドラッグと FOV を presenter 側に持たせ、シークバードラッグ / ジェスチャ /
-     HUD と共存させる。報告者の「動画には拡大縮小ドラッグの処理がなさそう」は正しい観察で、
-     それを作るのが §1.47。
-  4. **UI 導線**: 投影方式の選択・視野角・リセットを動画 HUD から出す。§1.105 (動画の「…」) と
-     関係する。
+- **段階と進捗** (レーン C、branch `panorama-projection`):
+
+  | 段 | 内容 | 状態 |
+  | --- | --- | --- |
+  | 1 | **判定** — 球面メタデータ + 2:1 フォールバック + ステレオ排除 | **完了** (2026-08-24) |
+  | 2 | **描画** — presenter へ投影パスを足す | 未着手 (設計は下記で確定) |
+  | 3 | **入力と導線** — 見回しドラッグ / FOV / 投影方式 / HUD | 未着手 |
+
+- **第 1 段 (完了)**: [spherical_metadata.rs](../src/video/spherical_metadata.rs)。
+  `display_metadata.rs` と同じ形で、FFmpeg の side data をこのモジュールだけで型に直す。
+  `detect()` が `VideoPanoramaTrigger` (Auto / Hint) か `VideoPanoramaRejection`
+  (未対応投影 / ステレオ / 平面) を返す。実素材 16 本を
+  `cargo run --features dev-tools --bin probe_spherical -- <dir>` で通して確認済み。
+  **presenter に触っていないので、レーン B と衝突しない。**
+
+- **第 2 段 (描画) — 読んで確定した挿入点**:
+  1. **`D3DCompile` はもう使っていない** (上の記述は古い)。presenter のシェーダは
+     **build.rs が FXC で `.cso` 化**して `include_bytes!` する
+     ([build.rs](../build.rs) の `compile_video_presenter_shaders`、backlog §1.122 で切替済み)。
+     投影シェーダも `shaders/video_panorama.hlsl` を足して同じ表に 1 行足すだけでよい。
+     **実行時コンパイルを復活させないこと** (placement 切替のたびに数秒固まる)。
+  2. **投影は resample と同じステージに立つが、別パイプラインにする**。
+     `VideoResamplePipeline::draw(source_tex -> target_tex)` が「ソース解像度 → 表示解像度」を
+     解決する場所で、投影もそこを置き換える。ただし **`VideoResampleMode` の variant には
+     しない**: あの enum は設定から決まる filter の選択で、`select_video_resample_mode` と
+     多数の perf イベント名の match に紐づいている。**毎フレーム変わる pose を混ぜると
+     意味が濁る**ので、`panorama_pipeline` を別に持ち、resolve 直前で分岐する。
+     投影が有効な間は Lanczos3 / Anime4K は走らない (投影シェーダ自身が球面から
+     表示解像度へ直接解決するため)。
+  3. **pose の渡し方は `set_video_grade` の前例に合わせる**
+     ([render_core.rs](../src/video/native_presenter/render_core.rs) の `set_video_grade`)。
+     `presenter.set_panorama_pose(Option<...>)` を足し、`video/mod.rs` の再生スレッドが
+     grade と同じ経路で流す。**静止画側の `PanoPose` をそのまま使う** (yaw/pitch/fov_y/投影方式)。
+     型を分けると stale 判定と丸めが 2 つになる。
+  4. **surface は既に表示解像度**。§1.47 の `decide_video_surface_size` が shader filter 時に
+     表示矩形サイズの swap chain を作るので、投影でも同じ条件を満たせばよい
+     ([surface_policy.rs](../src/video/native_presenter/surface_policy.rs))。
+  5. **ミップは「まず無しで測る」**。静止画側はフルミップ + `textureSampleGrad` で品質を出すが、
+     動画は毎フレーム生成になる。D3D11 の `GenerateMips` は使えるものの、5.7K で毎フレーム
+     払えるかは**実測してから決める**。まず bilinear で出して、広い画角でのエイリアスが
+     実用に耐えるかを見る。耐えないときだけミップを足す。
+  6. **投影方式は静止画と同じ 4 種**。数式・分岐位置・uniform の持ち方は
+     [panorama-360-view-plan.md §13](panorama-360-view-plan.md) で確定済みで、WGSL の
+     `projection_theta` をそのまま HLSL へ移せる。**部分 FOV の UV 変換も静止画と同じ
+     `PanoUvTransform`** なので、crop 時の軸別 clamp もそのまま移す。
+
+- **第 3 段 (入力) — レーン B と正面衝突する**。見回しドラッグは動画キャンバス上の
+  マウスドラッグを新規に定義する操作で、レーン B (§1.102 / §1.113 のシークバー上ドラッグ)
+  と同じ入力経路を取り合う ([next-cycle-work-lanes.md §4](next-cycle-work-lanes.md) が
+  予告していたとおり)。**第 3 段はレーン B の着地後に設計する。**
+  第 2 段までは presenter の resolve 経路だけなので先行してよい (レーン B の diff は
+  `render_core.rs` を 4 行しか触っていない、2026-08-24 実測)。
 - **自動判定は可能だが、それだけでは足りない**。FFmpeg は `AV_SPHERICAL_EQUIRECTANGULAR` を
   出す ([spherical.h](../vendor/ffmpeg/include/libavutil/spherical.h))。回転メタデータと同じ扱いに
   できる。ただし**実素材を集めて測った結果、次の 3 点が分かった** (2026-08-24、
