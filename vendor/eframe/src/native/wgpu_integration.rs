@@ -1169,6 +1169,7 @@ fn render_immediate_viewport(
         input
     };
 
+    let input_max_tex = input.max_texture_side;
     let input_ms = t_all.elapsed().as_secs_f64() * 1000.0;
     let egui_ctx = shared.borrow().egui_ctx.clone();
 
@@ -1279,7 +1280,8 @@ fn render_immediate_viewport(
             "[eframe] immediate_viewport id={} total={total_ms:.1}ms input={input_ms:.1} \
              run={run_ms:.1} set_window={set_window_ms:.1} tessellate={tessellate_ms:.1} \
              paint={paint_ms:.1} platform_out={platform_ms:.1} viewport_out={viewport_out_ms:.1} \
-             prims={} delta_set={delta_set} delta_free={delta_free} delta_bytes={delta_bytes}",
+             prims={} delta_set={delta_set} delta_free={delta_free} delta_bytes={delta_bytes} \
+             max_tex={input_max_tex:?}",
             ids.this.0.value(),
             clipped_primitives.len(),
         ));

@@ -14152,6 +14152,7 @@ impl App {
         let mut fs_vp_atlas_fill = 0.0_f32;
         let mut fs_vp_galleys = 0usize;
         let mut fs_vp_size = [0.0_f32; 2];
+        let mut fs_vp_max_tex = 0usize;
         let fs_state_is_video = state.is_video;
         // 動画は native presenter が独立 HWND に描画するので、egui 側 viewport は
         // 黒 backdrop のみ。ここで GPU 経路かどうかを区別する必要は無い。
@@ -15865,6 +15866,7 @@ impl App {
                 fs_vp_ppp = ctx.pixels_per_point();
                 let vp_rect = ctx.viewport_rect();
                 fs_vp_size = [vp_rect.width(), vp_rect.height()];
+                fs_vp_max_tex = ctx.input(|i| i.max_texture_side);
                 ctx.fonts(|f| {
                     fs_vp_atlas = f.font_image_size();
                     fs_vp_atlas_fill = f.font_atlas_fill_ratio();
@@ -15955,6 +15957,11 @@ impl App {
                     ("prep_ms", serde_json::Value::from(fs_prep_ms)),
                     ("body_cycles", serde_json::Value::from(fs_body_cycles)),
                     ("vp_ppp", serde_json::Value::from(fs_vp_ppp)),
+                    ("vp_max_tex", serde_json::Value::from(fs_vp_max_tex as i64)),
+                    (
+                        "main_max_tex",
+                        serde_json::Value::from(main_ctx.input(|i| i.max_texture_side) as i64),
+                    ),
                     (
                         "main_ppp",
                         serde_json::Value::from(main_ctx.pixels_per_point()),
