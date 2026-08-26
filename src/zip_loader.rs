@@ -865,6 +865,33 @@ pub fn read_entry_from_archive(
     }
 }
 
+/// すでに開いた `ZipArchiveHandle` から 1 エントリの**先頭だけ**を読む。
+///
+/// 画像ヘッダから寸法を取るための限定 API。全体を展開すると、寸法を知るためだけに
+/// 1 冊分の画像を伸長することになる (見開きの単独表示と横長分割は、ページが横長かを
+/// 知る必要がある)。
+///
+/// **ネストパスには対応しない** (`.zip/` を含む entry_name は `read_entry_bytes` を使う)。
+/// 解決できなければ `NotFound` を返すので、呼び出し側が従来経路へ落とせる。
+pub fn read_entry_prefix_from_archive(
+    archive: &mut ZipArchiveHandle,
+    entry_name: &str,
+    limit: u64,
+) -> std::io::Result<Vec<u8>> {
+    match archive {
+        ZipArchiveHandle::Zip(archive) => {
+            let mut entry = archive
+                .by_name(entry_name)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e.to_string()))?;
+            let mut bytes = Vec::with_capacity(limit.min(entry.size()) as usize);
+            entry.by_ref().take(limit).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        }
+        // RAR は部分読みの経路を持たない。全体を読んで先頭だけ使う。
+        ZipArchiveHandle::Rar(path) => crate::rar_loader::read_entry_bytes(path, entry_name),
+    }
+}
+
 /// ZIP 内エントリ名からサブディレクトリ名 (親ディレクトリ) を取り出す。
 /// ルート直下のエントリは空文字列を返す。
 pub fn entry_dir(entry_name: &str) -> &str {
