@@ -22,7 +22,9 @@ pub(super) struct VideoSeekStripSession {
     completed_analysis: Option<crate::video::seek_strip_wave::CompletedTimelineAnalysis>,
     visible_count: usize,
     last_requested_center: Option<f64>,
-    thumbnail_request_coverage: Option<crate::video::seek_strip::CellRange>,
+    /// 直前にワーカーへ送った要求の id。**要求台帳ではない。**
+    /// 「届いたか」は worker 側の cells で見る。ここは「まだ処理中か」を知るためだけに持つ。
+    last_sent_thumbnail_request_id: Option<u64>,
     wave_raster_size: Option<(usize, usize)>,
     last_wave_request: Option<crate::video::seek_strip_wave::WaveRequestSignature>,
     pending_wave_span: Option<crate::video::seek_strip_wave::WaveSpan>,
@@ -6971,7 +6973,7 @@ impl App {
                 completed_analysis,
                 visible_count: 9,
                 last_requested_center: None,
-                thumbnail_request_coverage: None,
+                last_sent_thumbnail_request_id: None,
                 wave_raster_size: None,
                 last_wave_request: None,
                 pending_wave_span: None,
@@ -7045,12 +7047,12 @@ impl App {
         // 閉じるのは「埋まらないと諦めた」瞬間なので、ここが一番確実な採取点になる。
         // 待ち時間の閾値に届かないまま閉じられても、未着セルの有無だけは残す。
         crate::logger::log(format!(
-            "[video-seek-strip] close: {cause:?} pending_since={:?} pending_reported={} requested_coverage={:?} last_requested_center={:?}",
+            "[video-seek-strip] close: {cause:?} pending_since={:?} pending_reported={} last_sent_request={:?} last_requested_center={:?}",
             session
                 .visible_pending_since
                 .map(|since| since.elapsed().as_secs_f64()),
             session.visible_pending_reported,
-            session.thumbnail_request_coverage,
+            session.last_sent_thumbnail_request_id,
             session.last_requested_center,
         ));
         true
@@ -7292,7 +7294,7 @@ impl App {
             }
         }
         session.last_requested_center = None;
-        session.thumbnail_request_coverage = None;
+        session.last_sent_thumbnail_request_id = None;
         session.last_wave_request = None;
         session.pending_wave_span = None;
         session.wave_holdover = None;
@@ -7387,28 +7389,33 @@ impl App {
                     axis.cell_count(),
                     None,
                 );
-                if let (Some(coverage), Some(required)) =
-                    (&session.thumbnail_request_coverage, trigger.ready.as_ref())
-                    && coverage.contains_range(required)
-                {
+                let trigger_targets: Vec<f64> = trigger
+                    .ready
+                    .as_ref()
+                    .map(|range| {
+                        (range.start()..=range.end())
+                            .filter_map(|index| axis.cell(index))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let trigger_cells_missing = worker.any_cell_unsettled(&trigger_targets);
+                if !crate::video::seek_strip::should_request_strip_window(
+                    trigger_cells_missing,
+                    session.last_sent_thumbnail_request_id,
+                    worker.last_finished_request_id(),
+                ) {
                     session.last_requested_center = Some(center_index);
                     return;
                 }
-                let requested = crate::video::seek_strip::compute_strip_window(
-                    center_index,
-                    visible,
-                    request_lookahead,
-                    axis.cell_count(),
-                    None,
-                );
-                let _ = worker.request(
+                if let Ok(request_id) = worker.request(
                     std::sync::Arc::clone(axis),
                     center_index,
                     visible,
                     request_lookahead,
-                );
+                ) {
+                    session.last_sent_thumbnail_request_id = Some(request_id);
+                }
                 session.last_requested_center = Some(center_index);
-                session.thumbnail_request_coverage = requested.ready;
             }
             crate::video::seek_strip::SeekStripCenter::Waveform { center_time_secs } => {
                 let Some((visible_pixel_width, pixel_height)) = session.wave_raster_size else {
@@ -7506,7 +7513,7 @@ impl App {
         }
         session.axis = VideoSeekStripAxisState::Ready(rebuilt);
         session.last_requested_center = None;
-        session.thumbnail_request_coverage = None;
+        session.last_sent_thumbnail_request_id = None;
         if matches!(
             session.center,
             crate::video::seek_strip::SeekStripCenter::Thumbnails { .. }
@@ -7661,7 +7668,7 @@ impl App {
             .collect::<Vec<_>>()
             .join(",");
         Some(format!(
-            "[video-seek-strip] visible cells still pending after {:.1}s: path={} center={:?} axis={} worker_status={:?} settled_cells={settled_cell_count} pending=[{pending_list}] requested_coverage={:?} last_requested_center={:?}",
+            "[video-seek-strip] visible cells still pending after {:.1}s: path={} center={:?} axis={} worker_status={:?} settled_cells={settled_cell_count} pending=[{pending_list}] last_sent_request={:?} last_requested_center={:?}",
             started.elapsed().as_secs_f64(),
             session.video_path.display(),
             session.center,
@@ -7671,7 +7678,7 @@ impl App {
                     format!("ready/{} cells", axis.cell_count()),
             },
             worker_status,
-            session.thumbnail_request_coverage,
+            session.last_sent_thumbnail_request_id,
             session.last_requested_center,
         ))
     }

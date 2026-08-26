@@ -277,6 +277,29 @@ pub(crate) const WAVEFORM_RANGE_STEPS_SECS: &[f64] = &[
     5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0, 7200.0, 10800.0,
 ];
 
+/// 表示範囲に未着セルがあるとき、ワーカーへ頼み直すか。
+///
+/// **要求台帳ではなく配達で判断する。** ワーカーは新しい要求が来ると処理中の窓を捨てるので、
+/// 「要求した」は「届く」を意味しない。速いドラッグでは 1 つの窓が 2 セルほどしか解決できず、
+/// 残りは捨てられる。ドラッグが止まった時点で「要求済みだから頼まない」と判断すると、
+/// 捨てられたセルが**セッション中ずっと空のまま**残る (2026-08-27 実機)。
+///
+/// 送りっぱなしにもしない。ワーカーが処理中の要求を毎フレーム上書きすると、そのたびに
+/// 計画を立て直して前へ進まなくなる。手を離すまでは待つ。
+pub(crate) fn should_request_strip_window(
+    trigger_cells_missing: bool,
+    last_sent_request_id: Option<u64>,
+    last_finished_request_id: Option<u64>,
+) -> bool {
+    if !trigger_cells_missing {
+        return false;
+    }
+    match (last_sent_request_id, last_finished_request_id) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(sent), Some(finished)) => finished >= sent,
+    }
+}
 /// One wheel event changes the strip range by exactly one adjacent ladder step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeekStripRangeStep {
@@ -613,10 +636,6 @@ impl CellRange {
 
     pub(crate) fn end(&self) -> usize {
         *self.0.end()
-    }
-
-    pub(crate) fn contains_range(&self, other: &Self) -> bool {
-        self.start() <= other.start() && self.end() >= other.end()
     }
 }
 
@@ -1354,6 +1373,28 @@ mod tests {
 
         let genuinely_short = [0.0, 2.0 - 1.0e-8, 4.0];
         assert_eq!(thin_keyframes(&genuinely_short, 2.0), vec![0, 2]);
+    }
+
+    /// 「要求した」を「届く」として扱うと、ワーカーが supersede で捨てたセルへ戻る道が無くなる。
+    /// 2026-08-27 実機: 速いドラッグで末尾 5 セルが空のまま固定され、Shift+S で開き直すまで
+    /// 埋まらなかった。判定は配達で行い、ワーカーが手を離すまでは待つ。
+    #[test]
+    fn strip_window_request_follows_delivery_not_the_request_ledger() {
+        // 届いているなら頼まない。
+        assert!(!should_request_strip_window(false, None, None));
+        assert!(!should_request_strip_window(false, Some(7), Some(7)));
+
+        // 一度も頼んでいないなら頼む。
+        assert!(should_request_strip_window(true, None, None));
+
+        // 頼んだが、ワーカーはまだ 1 件も終えていない。毎フレーム上書きすると計画が
+        // 立て直され続けて前へ進まないので待つ。
+        assert!(!should_request_strip_window(true, Some(3), None));
+        assert!(!should_request_strip_window(true, Some(3), Some(2)));
+
+        // ワーカーが手を離したのに未着が残っている = supersede で捨てられた。頼み直す。
+        assert!(should_request_strip_window(true, Some(3), Some(3)));
+        assert!(should_request_strip_window(true, Some(3), Some(9)));
     }
 
     #[test]

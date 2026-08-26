@@ -831,6 +831,10 @@ struct SharedState {
     cells: BTreeMap<StripCellId, StripThumbnailOutcome>,
     status: StripThumbnailWorkerStatus,
     latest_request_failures: Vec<(usize, StripThumbnailFailure)>,
+    /// 最後に処理を終えた要求の id。**終えた = 全セルが揃った、ではない。**
+    /// supersede / cancel で途中で抜けた場合も含む。app はこれを見て「まだ処理中なので
+    /// 待つ」と「もう手を離しているので、未着セルがあるなら頼み直す」を区別する。
+    last_finished_request_id: Option<u64>,
     #[cfg(any(test, feature = "dev-tools"))]
     decode_diagnostics: StripThumbnailDecodeDiagnostics,
     fill_wait_emitted_request_id: Option<u64>,
@@ -844,6 +848,7 @@ impl SharedState {
             cells: BTreeMap::new(),
             status: StripThumbnailWorkerStatus::Running,
             latest_request_failures: Vec::new(),
+            last_finished_request_id: None,
             #[cfg(any(test, feature = "dev-tools"))]
             decode_diagnostics: StripThumbnailDecodeDiagnostics::default(),
             fill_wait_emitted_request_id: None,
@@ -987,6 +992,21 @@ impl SeekStripThumbnailWorker {
         Ok(request_id)
     }
 
+    /// 表示範囲のうち、まだ 1 つも結果が無いセルがあるか。
+    ///
+    /// snapshot を作らずに済ませる軽い問い合わせ。要求のたびに cells を丸ごと clone すると、
+    /// 判定のためだけに毎回のコピーが乗る。
+    pub(crate) fn any_cell_unsettled(&self, target_secs: &[f64]) -> bool {
+        let shared = lock_recover(&self.state);
+        target_secs.iter().any(|secs| {
+            StripCellId::from_secs(*secs).is_none_or(|id| !shared.cells.contains_key(&id))
+        })
+    }
+
+    /// ワーカーが最後に手を離した要求の id。**全セルが揃ったという意味ではない。**
+    pub(crate) fn last_finished_request_id(&self) -> Option<u64> {
+        lock_recover(&self.state).last_finished_request_id
+    }
     /// 現在までの画像・型付き失敗を shallow clone して返す。
     pub(crate) fn snapshot(&self) -> StripThumbnailSnapshot {
         lock_recover(&self.state).snapshot()
@@ -1139,6 +1159,7 @@ fn run_worker(
     while !cancel.load(Ordering::Acquire) {
         let request = lock_recover(&requests).take();
         if let Some(request) = request {
+            let request_id = request.id;
             process_window_request(
                 &path,
                 hw_decode,
@@ -1150,6 +1171,9 @@ fn run_worker(
                 &mut runtime,
                 request,
             );
+            // 早期 return が多い関数なので、記録は**戻ってきたこの 1 箇所**で行う。
+            // 出口ごとに書くと、いつか足し忘れた出口が無言で残る。
+            lock_recover(&state).last_finished_request_id = Some(request_id);
             continue;
         }
 
