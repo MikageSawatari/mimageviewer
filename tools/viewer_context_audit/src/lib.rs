@@ -136,6 +136,7 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "item enum # [cfg (windows)] pub (in crate :: app) enum BuildOutcome { Commit , Abort (& 'static str) , }",
     "item enum # [cfg (windows)] pub (in crate :: app) enum RetireContextError { Mount (MountError) , Retire (RetireError) , }",
     "item struct # [cfg (windows)] pub (in crate :: app) struct ViewerContextBundle { }",
+    "trait impl # [cfg (windows)]   ViewerContextBundle  Drop {   fn drop (& mut self) }",
     "item struct # [cfg (windows)] pub (in crate :: app) struct ContextRef < 'a > { }",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn mounted (app : & 'a App) -> Self",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn at_rest (bundle : & 'a ViewerContextBundle) -> Self",
@@ -1961,6 +1962,39 @@ mod tests {
             &audit_public_api(changed, &refs).unwrap(),
             Rule::A4
         ));
+    }
+
+    #[test]
+    fn a4_rejects_cfg_test_gating_a_required_drop_impl() {
+        let allowed = r#"
+            #[cfg(windows)]
+            pub(crate) struct ViewerContextBundle;
+            #[cfg(windows)]
+            impl Drop for ViewerContextBundle {
+                fn drop(&mut self) {}
+            }
+        "#;
+        let allowlist = api_allowlist(allowed);
+        let refs = allowlist.iter().map(String::as_str).collect::<Vec<_>>();
+        let changed = r#"
+            #[cfg(windows)]
+            pub(crate) struct ViewerContextBundle;
+            #[cfg(all(test, windows))]
+            #[cfg(windows)]
+            impl Drop for ViewerContextBundle {
+                fn drop(&mut self) {}
+            }
+        "#;
+        let violations = audit_public_api(changed, &refs).unwrap();
+        assert!(
+            violations.iter().any(|violation| {
+                violation.rule == Rule::A4
+                    && violation
+                        .message
+                        .contains("allowlisted public API fingerprint is missing")
+            }),
+            "{violations:#?}"
+        );
     }
 
     #[test]

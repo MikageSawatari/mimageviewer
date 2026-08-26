@@ -1297,6 +1297,25 @@ HUD コマンドをアクティブ化へ変換し、**それ以外の利用者�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-08-26 `ViewerContextBundle` の production Drop 復元
+(ClaudeCode / Codex 双方が既存 ownership 契約の構造的復元と合意):**
+
+**触った範囲**: [src/app/viewer_context_registry.rs](../src/app/viewer_context_registry.rs) の既存
+`Drop for ViewerContextBundle` から誤って追加された `#[cfg(all(test, windows))]` を除去し、
+Windows production compile 時の明示 `Drop` trait bound 証明を追加した。
+[tools/viewer_context_audit/src/lib.rs](../tools/viewer_context_audit/src/lib.rs) の A4 exact-surface
+にも `#[cfg(windows)] impl Drop` を正規形として固定し、同じ test cfg 事故の fixture test を追加した。
+
+**不変条件**: viewer context の破棄は production でも context-owned `cancel_token` を立て、通常 / heavy
+worker queue の condvar を両方起こし、tag prewarm / legacy seed / metadata / converted archive cache paths /
+folder nav / folder pane open / 全 final effect の pending work をその context だけ cancel する。
+
+**判断理由 (なぜ症状パッチではないか)**: `2918e639` は context read view の導入 commit であり、
+既存 teardown の意味変更を伴わず Drop の直前にだけ test cfg を追加していた。新しい状態、detached 述語、
+viewport 経路、待機・retry・時間窓は追加せず、出荷済みの context ownership / teardown 契約を production
+へ戻す修正である。本番 compile proof は明示 Drop が消えれば型検査で失敗し、A4 は正規形から cfg を
+変更しても失敗するため、テストだけが teardown を持つ状態を再発させない。
+
 **2026-08-26 native video の固定16ms repaint pump 撤去 = backlog §1.122
 (ClaudeCode / Codex 双方が完全な Direction A を構造的修正と合意):**
 

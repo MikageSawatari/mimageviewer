@@ -1175,7 +1175,6 @@ impl ContextMut<'_> {
     }
 }
 
-#[cfg(all(test, windows))]
 #[cfg(windows)]
 impl Drop for ViewerContextBundle {
     /// bundle 化したロード複合体 (review-v2.3.0 P2-8/P2-9) の後始末。detached 窓の close /
@@ -1217,6 +1216,15 @@ impl Drop for ViewerContextBundle {
         }
     }
 }
+
+// Tests exercise their own cfg graph, so production must prove this teardown exists explicitly.
+#[cfg(all(windows, not(test)))]
+const _: () = {
+    #[allow(drop_bounds)]
+    fn assert_explicit_drop<T: Drop>() {}
+
+    let _ = assert_explicit_drop::<ViewerContextBundle>;
+};
 
 #[cfg(windows)]
 impl ViewerContextBundle {
