@@ -2668,6 +2668,72 @@ mIV は fallback font を 6 系統登録しているので atlas は大きい。
 
 - 規模 \ 優先度: 未知 / P2 (原因が分かるまでは見積もらない)。
 
+### 1.131 複数ウィンドウで動画再生中、他の窓をアクティブにすると 13ms で動画へ奪い返される ⚠️ 出荷ブロッカー候補
+
+- 出典: 2026-08-27、利用者報告。**複数ウィンドウモードで動画を再生中に PDF を開こうとすると
+  「ウィンドウがちらつくだけで開けない」。動画の前に開いていた PDF ウィンドウも、
+  アクティブにしようとすると動画のウィンドウが手前に来る。**動画が無ければ開ける。
+
+#### 原因 — 実ログで確定 (推測ではない)
+
+`MIV_DETACHED_WINDOW_DEBUG=1` で再現。同じ 3 行が繰り返される:
+
+```
+31.172  passive_activate_begin id=4                                  ← 利用者が PDF 窓をクリック
+31.185  parked-live hud command converted to activation: window_id=1
+        event=RequestSeekStripWindow { center: Thumbnails { .. }, .. }   ← 動画側が活性化を要求
+31.185  session_closing window_id=4 reason=pause_active_context      ← PDF が 13ms で降ろされる
+31.185  session_begin window_id=1 source=Video                       ← 動画が奪い返す
+```
+
+**`RequestSeekStripWindow` は利用者のクリックではない。**シークストリップが自分の窓を
+要求しているだけの layout / resource イベント。それが「HUD がクリックされた」と分類され、
+parked-live の動画窓へ活性化要求を出している。
+
+[native_video.rs](../src/app/native_video.rs) の
+`native_video_output_event_is_parked_live_maintenance`:
+
+```rust
+Ev::Window(_) | Ev::PlacementSwitched { .. } | Ev::PlacementSwitchFailed { .. }
+| Ev::RequestSeekThumbnail { .. } | Ev::ClearSeekThumbnail
+| Ev::TileColumnsDelta { .. } => false,          // 維持イベント (活性化しない)
+Ev::NavigateItem { via_wheel, .. } => !*via_wheel,
+_ => true,                                        // ⚠ それ以外は全部「HUD クリック」
+```
+
+**catch-all `_ => true` が構造的な欠陥。**後から足したイベントは、何もしなくても
+「利用者がクリックした → 前面へ奪う」に既定で入る。
+
+- `RequestSeekStripWindow` の追加: **2026-08-23** (`2edc070c` シークストリップ)
+- この分類器の最終更新: **2026-08-21** (`c71d8c08` detached-rework R2)
+
+シークストリップは 10 個近くイベントを足したが、維持側に登録されたのは 3 つだけ
+(`RequestSeekThumbnail` / `ClearSeekThumbnail` / `TileColumnsDelta`)。
+`OpenSeekStrip` / `CloseSeekStrip` / `MoveSeekStrip` / `CommitSeekStrip` /
+`RequestSeekStripWindow` / `SetSeekStripState` / `StepSeekStripRange` は未分類。
+利用者の見立て (「ストリップのマージで壊れた可能性」) がそのまま当たっている。
+
+#### 直し方 (症状パッチにしない)
+
+`_ => true` を**網羅 match** にして、新しいイベントを足したらコンパイラが分類を要求する形に
+する。そのうえで、シークストリップの layout / resource 系イベントを維持側へ入れる。
+「未知のイベント = 利用者のクリック = 前面を奪う」という既定をやめるのが本体。
+
+もう 1 か所、同じ形の述語がある。[ui_fullscreen.rs](../src/ui_fullscreen.rs) の
+`take_parked_live_activation_requests_after_passive_render` の消費側は
+`detached_window_state_is_parked_live(id)` だけを見て活性化する。これは
+「この窓は parked-live か」であって「**この活性化要求はまだ望まれているか**」ではない。
+利用者が別の窓を活性化した後でも通る。分類器を直せば今回の症状は消えるが、この述語も
+同じ「1 つの述語で 2 つの問いに答えている」形。
+
+#### 手続き
+
+detached リワーク中の凍結ルール下 ([CLAUDE.md](../CLAUDE.md))。網羅 match 化は症状パッチでは
+なく構造的修正だが、着手には plan §2 を読んだうえで ClaudeCode と Codex 双方の合意が要る。
+
+- 規模 / 優先度: Small (分類器の網羅化 + 分類) / **P1 出荷ブロッカー候補**。
+  複数ウィンドウ + 動画は主要な組み合わせで、回避策が無い。
+
 ### 1.130 font atlas resync 待ちが 16ms 固定でスピンする
 
 - 出典: 2026-08-26、§1.122 の repaint 要求元を分けているときに見つけた。
