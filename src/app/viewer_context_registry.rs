@@ -1188,17 +1188,15 @@ impl ContextMut<'_> {
 }
 
 #[cfg(windows)]
-impl Drop for ViewerContextBundle {
-    /// bundle 化したロード複合体 (review-v2.3.0 P2-8/P2-9) の後始末。detached 窓の close /
-    /// モード切替の一括 clear / 新メディアによる parked 窓の強制 close では bundle ごと
-    /// 破棄されるが、この context の worker pool (通常 5〜14 スレッド) は cancel が立たないと
-    /// queue の condvar 待ちで永久残留する (窓の開閉のたびに 1 プールずつ蓄積するスレッド
-    /// リーク、review-v2.3.0 hunt P2)。cancel を立てて両キューを notify すれば worker は
-    /// 起床 → cancel 検知 → 退出する。swap は参照パターンの destructure なので Drop と
-    /// 両立し、空 bundle (`empty()`) の drop は誰も掴んでいない token を立てるだけの no-op。
-    fn drop(&mut self) {
-        self.cancel_token
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+impl ViewerContextBundle {
+    /// この viewer context が所有する非同期 work を、context の terminal retire と同じ
+    /// ownership 境界で停止する。
+    ///
+    /// thumbnail pool だけは condvar 待ちで残留し得るため notify まで必要。その他は有限の
+    /// one-shot worker だが、owner の消滅後に CPU / GPU / AI 処理を続ける理由がないので、
+    /// 各 worker が既に監視している cancel token を立てる。
+    fn cancel_all_context_work(&self) {
+        self.cancel_token.store(true, Ordering::Relaxed);
         if let Some(q) = &self.reload_queue {
             q.1.notify_all();
         }
@@ -1226,6 +1224,33 @@ impl Drop for ViewerContextBundle {
         for pending in self.final_effect_pending.values() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
+
+        for pending in self.fs_pending.values() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        if let Some(pending) = self.details_meta_pending.as_ref() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        for pending in self.comic_bake_pending.values() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        for pending in self.erase_inpaint_pending.values() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ViewerContextBundle {
+    /// bundle 化したロード複合体 (review-v2.3.0 P2-8/P2-9) の後始末。detached 窓の close /
+    /// モード切替の一括 clear / 新メディアによる parked 窓の強制 close では bundle ごと
+    /// 破棄されるが、この context の worker pool (通常 5〜14 スレッド) は cancel が立たないと
+    /// queue の condvar 待ちで永久残留する (窓の開閉のたびに 1 プールずつ蓄積するスレッド
+    /// リーク、review-v2.3.0 hunt P2)。cancel を立てて両キューを notify すれば worker は
+    /// 起床 → cancel 検知 → 退出する。swap は参照パターンの destructure なので Drop と
+    /// 両立し、空 bundle (`empty()`) の drop は誰も掴んでいない token を立てるだけの no-op。
+    fn drop(&mut self) {
+        self.cancel_all_context_work();
     }
 }
 

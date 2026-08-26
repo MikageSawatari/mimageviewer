@@ -1298,6 +1298,34 @@ HUD コマンドをアクティブ化へ変換し、**それ以外の利用者�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-08-27 terminal retire 時の context-owned producer 停止を bundle Drop へ集約
+(利用者提示の ClaudeCode sweep と Codex の source inspection が一致。ClaudeCode 最終 review /
+mutation check 待ち):**
+
+**触った範囲**: [src/app/viewer_context_registry.rs](../src/app/viewer_context_registry.rs) の
+`ViewerContextBundle::cancel_all_context_work` と `Drop for ViewerContextBundle`、
+[src/app/tests.rs](../src/app/tests.rs) の pending 別 / bulk retire / sibling 非干渉テスト。
+detached predicate、viewport / HWND / placement / focus / epoch、keep-alive backstop、overlay GPU、
+grid selection / paste / new-folder は変更しない。
+
+**不変条件**: context の terminal retire は caller が pause や `close_fullscreen` を先に実行したかに
+依存せず、bundle が所有する thumbnail pool の cancel + 両 queue notify、tag prewarm、legacy seed、
+metadata、converted archive cache paths、folder nav、folder pane open、全 final effect に加えて、
+全 `fs_pending`、`details_meta_pending`、全 `comic_bake_pending`、全
+`erase_inpaint_pending` の cancel token を立てる。`final_ai_pending`、
+`local_adjust_pending`、`zip_enumerate_pending` は各 pending 型自身の Drop による停止を維持し、
+bundle 側へ二重化しない。bulk ParkedLive retire と sibling context の停止境界も同じ規則にする。
+
+**重大度と判断理由 (なぜ症状パッチではないか)**: P1 の thumbnail pool は condvar 待ちのまま
+窓の開閉ごとに蓄積する thread leak だった。今回追加した4種は有限 one-shot worker なので、
+receiver が無くても計算を終えて退出し、hang や蓄積は起こさない。ただし破棄済み context のために
+CPU / GPU / AI を使い続け、最悪は orphaned MI-GAN が画像全体の tile 推論を完走する。
+そこで caller 別の guard や retry を足さず、すべての retire 経路が必ず通る既存 owner の Drop に
+停止責務を集約した。新しい App-level bool / Option、時間窓、debounce / grace / retry、repaint、
+detached heuristic は追加していない。4 cancel 行をそれぞれ個別に検出するテスト、pause /
+`close_fullscreen` を経ない bulk retire テスト、sibling の4 token が未変更であるテストを持つため、
+§2 の context ownership 境界修正であり leak 対策用の過剰な lifecycle machinery ではない。
+
 **2026-08-26 ★固定に残っていた context ownership / index-space 同期の補完
 (利用者指定の構造修正、Codex 実装。ClaudeCode review / mutation check 待ち):**
 

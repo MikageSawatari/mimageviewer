@@ -40156,6 +40156,204 @@ mod still_window_mode_key_tests {
         );
     }
 
+    fn install_context_fs_pending(app: &mut App, cancel: Arc<AtomicBool>) {
+        let (_tx, rx) = mpsc::channel();
+        app.fs_pending.insert(
+            0,
+            FsPendingValue::new(cancel, rx, 1, FsLoadPurpose::for_page(true)),
+        );
+    }
+
+    fn install_context_details_meta_pending(app: &mut App, cancel: Arc<AtomicBool>) {
+        let (_event_tx, event_rx) = mpsc::channel();
+        let (priority_tx, _priority_rx) = mpsc::channel();
+        app.details_meta_pending = Some(DetailsMetaPending {
+            visible_revision: app.details_lazy_visible_revision,
+            selection_target_key: None,
+            normal_target_keys: Default::default(),
+            cancel,
+            phase: DetailsMetaPendingPhase::Loading {
+                rx: event_rx,
+                priority_tx,
+            },
+        });
+    }
+
+    fn install_context_comic_bake_pending(app: &mut App, cancel: Arc<AtomicBool>) {
+        let (_tx, rx) = mpsc::channel();
+        app.comic_bake_pending.insert(
+            0,
+            ComicBakePending {
+                comic_gen: 1,
+                items_gen: app.items_generation,
+                base: Arc::new(egui::ColorImage::filled([1, 1], egui::Color32::TRANSPARENT)),
+                dims: [1, 1],
+                preview_scale: 1,
+                started: std::time::Instant::now(),
+                cancel,
+                rx,
+            },
+        );
+    }
+
+    fn install_context_erase_inpaint_pending(app: &mut App, cancel: Arc<AtomicBool>) {
+        let (_tx, rx) = mpsc::channel();
+        let (_progress_tx, progress_rx) = mpsc::channel();
+        app.erase_inpaint_pending.insert(
+            crate::ui_erase::EraseInpaintPendingKey {
+                idx: 0,
+                kind: crate::ui_erase::EraseInpaintKind::Commit,
+            },
+            crate::ui_erase::EraseInpaintPending {
+                idx: 0,
+                items_generation: app.items_generation,
+                path_key: None,
+                rx,
+                progress_rx,
+                progress: crate::ui_erase::EraseInpaintProgress::Preparing,
+                cancel,
+                started_at: std::time::Instant::now(),
+                input_generation: 0,
+                mask_generation: 0,
+                log_prefix: "context-retire-test",
+                is_preview: false,
+            },
+        );
+    }
+
+    fn context_work_cancel_tokens() -> [Arc<AtomicBool>; 4] {
+        std::array::from_fn(|_| Arc::new(AtomicBool::new(false)))
+    }
+
+    fn install_all_context_work(app: &mut App, cancels: &[Arc<AtomicBool>; 4]) {
+        install_context_fs_pending(app, Arc::clone(&cancels[0]));
+        install_context_details_meta_pending(app, Arc::clone(&cancels[1]));
+        install_context_comic_bake_pending(app, Arc::clone(&cancels[2]));
+        install_context_erase_inpaint_pending(app, Arc::clone(&cancels[3]));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn retiring_context_cancels_fs_pending() {
+        let mut app = setup_app();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let context_cancel = Arc::clone(&cancel);
+        let id = app.build_window_context_for_test(701, move |context| {
+            install_context_fs_pending(context, context_cancel);
+        });
+
+        assert!(!cancel.load(Ordering::Relaxed));
+        app.retire_context(id, "test_fs_pending_retire", |_| ())
+            .expect("context should retire");
+
+        assert!(cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn retiring_context_cancels_details_meta_pending() {
+        let mut app = setup_app();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let context_cancel = Arc::clone(&cancel);
+        let id = app.build_window_context_for_test(702, move |context| {
+            install_context_details_meta_pending(context, context_cancel);
+        });
+
+        assert!(!cancel.load(Ordering::Relaxed));
+        app.retire_context(id, "test_details_meta_pending_retire", |_| ())
+            .expect("context should retire");
+
+        assert!(cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn retiring_context_cancels_comic_bake_pending() {
+        let mut app = setup_app();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let context_cancel = Arc::clone(&cancel);
+        let id = app.build_window_context_for_test(703, move |context| {
+            install_context_comic_bake_pending(context, context_cancel);
+        });
+
+        assert!(!cancel.load(Ordering::Relaxed));
+        app.retire_context(id, "test_comic_bake_pending_retire", |_| ())
+            .expect("context should retire");
+
+        assert!(cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn retiring_context_cancels_erase_inpaint_pending() {
+        let mut app = setup_app();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let context_cancel = Arc::clone(&cancel);
+        let id = app.build_window_context_for_test(704, move |context| {
+            install_context_erase_inpaint_pending(context, context_cancel);
+        });
+
+        assert!(!cancel.load(Ordering::Relaxed));
+        app.retire_context(id, "test_erase_inpaint_pending_retire", |_| ())
+            .expect("context should retire");
+
+        assert!(cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn bulk_parked_context_retire_cancels_work_without_close_fullscreen() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let context_cancel = Arc::clone(&cancel);
+        let id = app.push_window_context_for_test(&ctx, 705, move |context| {
+            install_context_fs_pending(context, context_cancel);
+        });
+
+        assert!(!cancel.load(Ordering::Relaxed));
+        // This is the bulk teardown seam: it retires the at-rest bundle directly and deliberately
+        // does not mount it or call close_fullscreen first.
+        app.teardown_paused_media_bundles_for_window_ids(&[705], "test_bulk_context_retire");
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert_eq!(app.viewer_context_residence(id), ContextResidence::Retired);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn retiring_context_leaves_sibling_context_work_untouched() {
+        let mut app = setup_app();
+        let retiring_cancels = context_work_cancel_tokens();
+        let sibling_cancels = context_work_cancel_tokens();
+        let retiring_installed = retiring_cancels.clone();
+        let sibling_installed = sibling_cancels.clone();
+        let retiring = app.build_window_context_for_test(706, move |context| {
+            install_all_context_work(context, &retiring_installed);
+        });
+        let sibling = app.build_window_context_for_test(707, move |context| {
+            install_all_context_work(context, &sibling_installed);
+        });
+
+        app.retire_context(retiring, "test_context_work_sibling_isolation", |_| ())
+            .expect("context should retire");
+
+        assert!(
+            retiring_cancels
+                .iter()
+                .all(|cancel| cancel.load(Ordering::Relaxed))
+        );
+        assert!(
+            sibling_cancels
+                .iter()
+                .all(|cancel| !cancel.load(Ordering::Relaxed))
+        );
+        assert_eq!(
+            app.viewer_context_residence(sibling),
+            ContextResidence::AtRest
+        );
+    }
+
     #[test]
     #[cfg(windows)]
     fn detached_folder_pending_requests_are_cancelled_on_pause_and_drop() {
