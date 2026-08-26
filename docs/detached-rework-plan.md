@@ -1298,6 +1298,33 @@ HUD コマンドをアクティブ化へ変換し、**それ以外の利用者�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-08-27 detached grid の Descriptor open から main filter suppression を分離
+(backlog §1.131 P2-2 follow-up、利用者提示の ClaudeCode re-review と Codex の callee
+inspection が一致):**
+
+**触った範囲**: [src/app.rs](../src/app.rs) の
+`open_grid_item_in_detached_book_context_with_auto_fullscreen` にある
+`DetachedGridItemOpenPlan::Descriptor` arm、[src/app/tests.rs](../src/app/tests.rs) の
+実 detached open producer 回帰テスト。detached predicate、viewport / HWND / placement /
+focus / epoch、keep-alive、overlay GPU、grid selection / paste / new-folder は変更しない。
+
+**不変条件と判断理由**: Descriptor は park が完了しない場合、または context start が
+`false` を返す場合に通常 main navigation へ戻り得るが、その2 caller は採用した main 分岐で
+既に rating / facet suppression を行う。成功時は fresh bundle が `DetachedPhysical` を所有し、物理 scope の全ページを
+App-global display filter より前に確定するため suppression は誰にも不要である。したがって
+detached helper は mounted main projection を変更せず、抑制責務は実際に main navigation を
+採用した境界にだけ残す。FolderCandidate も分類後の main fallback だけで抑制し、
+ConvertibleArchiveCandidate の detached completion は抑制しないため、sibling route と一致する。
+
+**回帰証明と別件記録**: 新テストは★5 filter と ZIP/PDF kind facet が有効な main から、
+★5 の ZIP / PDF を実 helper で detached open し、main の suppression / filter / stack /
+items / visible set / search filter が不変で、detached は3ページすべてを表示することを検査する。
+Descriptor arm へ rating producer だけを戻す mutation は main anchor の `is_none()` で失敗し、
+facet producer だけを戻す mutation は `{Pdf}` filter の保持比較で失敗した。新しい App-level
+state、時間窓、guard / retry / repaint は追加していない。同じ caller 前段の
+`note_reading_history_open(idx)` が context-owned `reading_history_return_from` を main 上で
+変更してから detached build に入る別件は、§2 規則7に従い修正せず backlog §1.131 に記録した。
+
 **2026-08-27 terminal retire 時の context-owned producer 停止を bundle Drop へ集約
 (利用者提示の ClaudeCode sweep と Codex の source inspection が一致。ClaudeCode review /
 mutation check 完了。cancel 4 件を個別に抑す mutation で各テストが落ちることを確認済み):**

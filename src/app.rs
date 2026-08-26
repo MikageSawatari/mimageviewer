@@ -40117,8 +40117,8 @@ impl App {
                 self.cancel_detached_grid_archive_open_for_replacement(
                     "detached_grid_archive_replaced_by_descriptor",
                 );
-                self.maybe_suppress_rating_filter_for_opened_container(idx);
-                self.maybe_suppress_facet_filter_for_opened_container(idx);
+                // Suppression belongs to the ordinary main-navigation branches in the callers.
+                // A committed DetachedPhysical context ignores App-global display filters.
                 descriptor
             }
             DetachedGridItemOpenPlan::FolderCandidate { path } => {

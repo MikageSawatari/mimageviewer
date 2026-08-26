@@ -45122,6 +45122,130 @@ mod still_window_mode_key_tests {
         }
     }
 
+    #[cfg(windows)]
+    fn install_filtered_starred_book_grid(
+        app: &mut AppTestEnv,
+        use_zip: bool,
+    ) -> (PathBuf, PathBuf) {
+        use crate::settings::FacetItemKind;
+
+        let parent = app.tmp.path().join("filtered-main-grid");
+        let book = parent.join(if use_zip {
+            "starred.zip"
+        } else {
+            "starred.pdf"
+        });
+        std::fs::create_dir_all(&parent).unwrap();
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.settings.rating_filter = [false, false, false, false, false, true];
+        app.settings.facet_filter.kinds.insert(if use_zip {
+            FacetItemKind::Zip
+        } else {
+            FacetItemKind::Pdf
+        });
+        app.current_folder = Some(parent.clone());
+        app.address = parent.to_string_lossy().to_string();
+        app.items = vec![if use_zip {
+            GridItem::ZipFile(book.clone())
+        } else {
+            GridItem::PdfFile(book.clone())
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.search_filter = Some(HashSet::from([0]));
+        app.selected = Some(0);
+        app.scroll_offset_y = 184.0;
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set(&crate::adjustment_db::normalize_path(&book), 5)
+            .unwrap();
+        app.rebuild_visible_indices();
+        assert_eq!(app.visible_indices, vec![0]);
+        assert_eq!(app.get_rating(0), 5);
+        (parent, book)
+    }
+
+    #[cfg(windows)]
+    fn assert_filtered_main_book_grid_unchanged(
+        app: &App,
+        parent: &Path,
+        item_key: &str,
+        facet_filter: &crate::settings::FacetFilter,
+        generation: u64,
+    ) {
+        assert_eq!(
+            app.items.iter().map(GridItem::perf_key).collect::<Vec<_>>(),
+            vec![item_key.to_string()]
+        );
+        assert_eq!(app.visible_indices, vec![0]);
+        assert_eq!(app.search_filter, Some(HashSet::from([0])));
+        assert_eq!(
+            app.settings.rating_filter,
+            [false, false, false, false, false, true]
+        );
+        assert_eq!(&app.settings.facet_filter, facet_filter);
+        assert_eq!(app.current_folder.as_deref(), Some(parent));
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.scroll_offset_y, 184.0);
+        assert_eq!(app.items_generation, generation);
+        assert!(app.rating_filter_suppressed_at.is_none());
+        assert!(app.facet_filter_suppression_stack.is_empty());
+    }
+
+    #[cfg(windows)]
+    fn complete_filtered_detached_book(app: &mut App, use_zip: bool, book: &Path) {
+        if use_zip {
+            let pages = ["001.jpg", "002.jpg", "003.jpg"];
+            complete_detached_archive_page_enumeration(app, book, &pages);
+            assert_detached_archive_pages(app, book, &pages);
+        } else {
+            complete_detached_pdf_page_enumeration(app, book, 3);
+            assert_detached_pdf_pages(app, book, &[0, 1, 2]);
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_descriptor_open_preserves_main_filters_and_shows_every_physical_page() {
+        let ctx = egui::Context::default();
+        for use_zip in [false, true] {
+            let mut app = setup_app();
+            let (parent, book) = install_filtered_starred_book_grid(&mut app, use_zip);
+            let item_key = app.items[0].perf_key();
+            let facet_filter = app.settings.facet_filter.clone();
+            let generation = app.items_generation;
+            assert!(
+                app.open_grid_item_in_detached_book_context_with_auto_fullscreen(&ctx, 0, true)
+            );
+            assert_filtered_main_book_grid_unchanged(
+                &app,
+                &parent,
+                &item_key,
+                &facet_filter,
+                generation,
+            );
+            complete_filtered_detached_book(&mut app, use_zip, &book);
+            app.with_active_viewer_context(|detached| {
+                assert_eq!(
+                    detached.navigation_scope,
+                    ViewerNavigationScope::DetachedPhysical
+                );
+                detached.rebuild_visible_indices();
+                assert_eq!(detached.visible_indices, vec![0, 1, 2]);
+            })
+            .unwrap();
+            assert_filtered_main_book_grid_unchanged(
+                &app,
+                &parent,
+                &item_key,
+                &facet_filter,
+                generation,
+            );
+        }
+    }
+
     #[test]
     fn detached_book_pdf_open_keeps_main_grid_on_parent_list() {
         let mut app = setup_app();

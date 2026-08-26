@@ -2876,6 +2876,27 @@ worker pool (5〜14 スレッド) の condvar を起こす唯一の経路なの�
 ただし P2-3 のうち **「canonical な `return_to` があるときでも fallback slot を
 消費していた」半分は単一窓でも成立する**ので、こちらは実害の修正。
 
+#### P2-2 re-review follow-up — detached descriptor open が main filter suppression を変更 ✅
+
+`open_grid_item_in_detached_book_context_with_auto_fullscreen` の Descriptor arm は、
+fresh detached bundle を作る前の mounted main projection 上で rating / facet suppression を
+立てていた。★付き ZIP / PDF を別窓へ開くと main の
+`rating_filter_suppressed_at`、facet filter、suppression stack が変わる実到達バグだった。
+
+2026-08-27 修正。Descriptor helper から抑制を外し、detached start 不成立後に main navigation を
+採用する2 caller の既存抑制だけを正本にした。FolderCandidate も分類後の main fallback だけが
+抑制し、ConvertibleArchiveCandidate の detached completion は抑制しない。実 producer で★付き
+ZIP/PDFを開くテストを追加し、main state 不変と detached の全ページ表示を固定した。
+
+#### 同経路の別件 — reading-history return owner を detached destination と照合する (未対応)
+
+2つの UI caller は detached helper より前に `note_reading_history_open(idx)` を呼ぶ。
+この関数が変更する `reading_history_return_from` は `ViewerContextBundle` 所有なので、
+detached build が fresh bundle へ交換する前の main に変更が残り、detached 側は `None` から
+始まる。閲覧履歴から別窓で本を開いた場合の戻り先仕様と、通常一覧から別窓を開いた際に main の
+既存予約を消すべきかを、両 caller / close / Backspace lifecycle で棚卸しして owner 境界を決める。
+今回の filter suppression 修正には含めない (§2 規則7)。優先度 P2、規模 Small〜Medium。
+
 #### §1.126 / §1.127 — 添字空間の追従 ✅
 
 `SnapshotState` に `saved_image_metas` / `list_view_image_metas` を追加し、
