@@ -19,7 +19,7 @@
 use eframe::egui;
 use std::sync::Arc;
 
-use crate::app::{App, ConcealSnapshot, EraseSpreadCtx, MaskDirtyRect};
+use crate::app::{App, ConcealSnapshot, MaskDirtyRect};
 use crate::conceal::ConcealTool;
 use crate::displayed_image_transform::DisplayedImageTransform;
 use crate::keymap::KeyAction;
@@ -133,13 +133,7 @@ impl App {
         if !self.fullscreen_edit_mode_entry_allowed(requested_fs_idx) {
             return false;
         }
-        let spread_pair = match self.resolve_spread_pair(requested_fs_idx) {
-            crate::ui_fullscreen::SpreadPair::Double { left, right } => Some((left, right)),
-            crate::ui_fullscreen::SpreadPair::Single => None,
-        };
-        let target_idx = spread_pair
-            .map(|(left, _)| left)
-            .unwrap_or(requested_fs_idx);
+        let (target_idx, pivot) = self.plan_page_edit_pivot(requested_fs_idx);
         let current_target = self
             .fullscreen_idx
             .map(|idx| match self.resolve_spread_pair(idx) {
@@ -152,15 +146,9 @@ impl App {
         self.conceal_base_cache
             .insert(target_idx, Arc::clone(&pixels));
 
-        if let Some(pair) = spread_pair {
-            self.conceal_spread_ctx = Some(EraseSpreadCtx {
-                saved_mode: self.spread_mode,
-                pair,
-            });
-            self.spread_mode = crate::settings::SpreadMode::Single;
-            self.fullscreen_idx = Some(target_idx);
-            self.fs_zoom = 1.0;
-            self.fs_pan = egui::Vec2::ZERO;
+        if let Some(pivot) = pivot {
+            self.conceal_spread_ctx = Some(pivot);
+            self.enter_page_edit_single_view(target_idx);
         }
         let fs_idx = target_idx;
         let [w, h] = pixels.size;
@@ -298,12 +286,8 @@ impl App {
         self.fs_pan_drag_start = None;
 
         // 見開きから入っていた場合は spread_mode と表示ページを復元
-        if let Some(ctx) = self.conceal_spread_ctx.take() {
-            self.spread_mode = ctx.saved_mode;
-            self.fullscreen_idx = Some(ctx.pair.0);
-            self.fs_zoom = 1.0;
-            self.fs_pan = egui::Vec2::ZERO;
-        }
+        let pivot = self.conceal_spread_ctx.take();
+        self.leave_page_edit_single_view(pivot);
         crate::logger::log("conceal: reset mode".to_string());
     }
 

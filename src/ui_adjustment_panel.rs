@@ -9465,6 +9465,16 @@ impl App {
         {
             return;
         }
+        // 他の 4 ツールと同じく、編集する 1 ページを単独で表示してから始める。
+        // 見開きのままだと canvas 用の transform が作られず、**マスク編集も左右の
+        // 切り替えも一切効かないモード**になる (2026-08-26 の利用者報告)。
+        if let Some(fs_idx) = self.fullscreen_idx {
+            let (target_idx, pivot) = self.plan_page_edit_pivot(fs_idx);
+            if let Some(pivot) = pivot {
+                self.local_adjust_spread_ctx = Some(pivot);
+                self.enter_page_edit_single_view(target_idx);
+            }
+        }
         self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.local_adjust_mode = true;
         self.local_adjust_show_source = false;
@@ -12853,6 +12863,11 @@ impl App {
             return;
         };
 
+        // 見開きから入っていると単ページへ倒してあるので `resolve_spread_pair` は Single。
+        // 左右ボタンを出すためのペアは退避から引く。
+        let spread_lr_from_pivot = self.page_edit_spread_pair();
+        // クロージャから `self` を触れないので、押されたページを持ち帰って後で適用する。
+        let mut switch_target_to: Option<usize> = None;
         let spread_pair = self.resolve_spread_pair(fs_root_idx);
         let (fs_idx, spread_lr): (usize, Option<(usize, usize)>) = match spread_pair {
             SpreadPair::Double { left, right } => {
@@ -12862,7 +12877,7 @@ impl App {
                 };
                 (target, Some((left, right)))
             }
-            SpreadPair::Single => (fs_root_idx, None),
+            SpreadPair::Single => (fs_root_idx, spread_lr_from_pivot),
         };
 
         self.maybe_start_local_adjust_render(fs_idx);
@@ -13065,21 +13080,21 @@ impl App {
 
                                         if let Some((left, right)) = spread_lr {
                                             ui.horizontal(|ui| {
-                                                let is_left = self.adjust_spread_target
-                                                    == AdjustSpreadTarget::Left;
+                                                // 倒した後は表示中のページが対象。選択状態も
+                                                // それに合わせる (`adjust_spread_target` は
+                                                // 倒す前の見開き用の値が残ることがある)。
+                                                let is_left = fs_idx == left;
                                                 if ui
                                                     .selectable_label(is_left, "左ページ")
                                                     .clicked()
                                                 {
-                                                    self.adjust_spread_target =
-                                                        AdjustSpreadTarget::Left;
+                                                    switch_target_to = Some(left);
                                                 }
                                                 if ui
                                                     .selectable_label(!is_left, "右ページ")
                                                     .clicked()
                                                 {
-                                                    self.adjust_spread_target =
-                                                        AdjustSpreadTarget::Right;
+                                                    switch_target_to = Some(right);
                                                 }
                                             });
                                             ui.label(
@@ -13301,6 +13316,13 @@ impl App {
             clear_layers,
             effect_requests,
         );
+        // 左右ボタンで対象ページを切り替える。退避は触らないので、ボタンはそのまま
+        // トグルとして使い続けられる (消しゴムの `switch_erase_target_in_spread` と同じ約束)。
+        if let Some(new_idx) = switch_target_to
+            && self.fullscreen_idx != Some(new_idx)
+        {
+            self.enter_page_edit_single_view(new_idx);
+        }
     }
 
     fn draw_bookmark_panel_body(

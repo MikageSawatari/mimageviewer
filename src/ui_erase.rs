@@ -259,13 +259,8 @@ impl App {
             return;
         }
         // 見開きから入った場合は左ページへピボット。Single 起動 / 片側のみのページ
-        // (表紙・末尾奇数・横長画像) では `resolve_spread_pair` が Single を返すので
-        // ピボット処理はスキップされる。
-        let spread_pair = match self.resolve_spread_pair(fs_idx) {
-            crate::ui_fullscreen::SpreadPair::Double { left, right } => Some((left, right)),
-            crate::ui_fullscreen::SpreadPair::Single => None,
-        };
-        let target_idx = spread_pair.map(|(l, _)| l).unwrap_or(fs_idx);
+        // (表紙・末尾奇数・横長画像) ではピボットは要らない。
+        let (target_idx, pivot) = self.plan_page_edit_pivot(fs_idx);
         // 消しゴム入力取得は state mutation より前にやる。ここで取れないと erase は始められず、
         // 取れる前に spread_mode / fullscreen_idx を弄ると見開きが解除されたまま
         // 編集も開始しない不整合状態になる (Codex P2 指摘)。
@@ -289,12 +284,9 @@ impl App {
         self.erase_base_cache
             .insert(target_idx, Arc::clone(&pixels));
         // ピクセル取得成功 → ここから state mutation。
-        if let Some(pair) = spread_pair {
-            self.erase_spread_ctx = Some(crate::app::EraseSpreadCtx {
-                saved_mode: self.spread_mode,
-                pair,
-            });
-            self.set_single_page_view(target_idx);
+        if let Some(pivot) = pivot {
+            self.erase_spread_ctx = Some(pivot);
+            self.enter_page_edit_single_view(target_idx);
         }
         let fs_idx = target_idx;
         let [w, h] = self.erase_working_size(fs_idx, pixels.size);
@@ -429,22 +421,11 @@ impl App {
         self.fs_pan_drag_start = None;
 
         // 見開きから入っていた場合は spread_mode と表示ページを復元する。
-        // ページ位置は left_idx に揃える (resolve_spread_pair が同じペアを返すので
-        // 元と同じ見開きが再構築される)。ズーム/パンはリセット。
-        // ※ `set_single_page_view` を使わないのは spread_mode を Single に倒さない
-        //   ため (= 見開きへ復帰する経路)。
-        if let Some(ctx) = self.erase_spread_ctx.take() {
-            self.spread_mode = ctx.saved_mode;
-            self.fullscreen_idx = Some(ctx.pair.0);
-            self.fs_zoom = 1.0;
-            self.fs_pan = egui::Vec2::ZERO;
-        }
+        let pivot = self.erase_spread_ctx.take();
+        self.leave_page_edit_single_view(pivot);
     }
 
-    /// 単一ページ表示用に状態を初期化する: spread_mode を Single に倒し、
-    /// `fullscreen_idx` を `idx` に固定し、ズーム/パンをリセット。
-    /// `enter_erase_mode` のピボット先と `switch_erase_target_in_spread` の
-    /// ページ切替先で同じシーケンスを使うので共通化している。
+    /// 単一ページ表示用に状態を初期化する ([`App::enter_page_edit_single_view`] の別名)。
     fn set_single_page_view(&mut self, idx: usize) {
         self.spread_mode = crate::settings::SpreadMode::Single;
         self.fullscreen_idx = Some(idx);

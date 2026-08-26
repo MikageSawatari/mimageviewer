@@ -7161,14 +7161,102 @@ fn build_passthrough_rendition_pixels(
     }
 }
 
-/// 見開きから消しゴムに入ったときのコンテキスト。Apply / Cancel で
-/// 元の見開き状態 (= `saved_mode` の spread_mode + `pair.0` を中心ページとした
-/// 見開き表示) を復元するために保存する。
+/// 見開きから編集ツールへ入ったときの退避。抜けたら元の見開き表示へ戻す。
+///
+/// **編集ツールは「編集する 1 ページ」を単独で表示してから始める。**canvas 用の
+/// transform は単ページ経路でしか作られないので、見開きのまま入ると**オーバーレイも
+/// 入力も無いモード**になる。消しゴム / 隠蔽 / 注釈 / 切り取りはこの退避を持っていたが、
+/// 補正レイヤー (Ctrl+G) だけ持っておらず、見開きから入ると操作が一切効かなかった
+/// (2026-08-26 の利用者報告)。
+///
+/// 手順は [`App::plan_page_edit_pivot`] / [`App::enter_page_edit_single_view`] /
+/// [`App::leave_page_edit_single_view`] が持つ。**ツールごとに書き写さない。**
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct EraseSpreadCtx {
+pub(crate) struct PageEditSpreadPivot {
     pub saved_mode: crate::settings::SpreadMode,
     /// (left_idx, right_idx)。LTR / RTL のいずれでも「画面上の左/右」の意味で固定。
     pub pair: (usize, usize),
+}
+
+impl App {
+    /// 編集するページと、見開きなら戻すための退避を決める。**この時点では何も変えない。**
+    ///
+    /// 素材の取得など失敗しうる準備を先に済ませてから
+    /// [`Self::enter_page_edit_single_view`] を呼べるように、決定と適用を分けてある
+    /// (先に倒すと、見開きが解除されたのに編集も始まらない状態になる)。
+    pub(crate) fn plan_page_edit_pivot(
+        &mut self,
+        fs_idx: usize,
+    ) -> (usize, Option<PageEditSpreadPivot>) {
+        match self.resolve_spread_pair(fs_idx) {
+            crate::ui_fullscreen::SpreadPair::Double { left, right } => (
+                left,
+                Some(PageEditSpreadPivot {
+                    saved_mode: self.spread_mode,
+                    pair: (left, right),
+                }),
+            ),
+            // 単ページ / 表紙単独 / 横長単独。倒す必要が無い。
+            crate::ui_fullscreen::SpreadPair::Single => (fs_idx, None),
+        }
+    }
+
+    /// 単ページ表示へ倒す。見開きを解除し、対象ページへ寄せ、ズーム / パンを戻す。
+    pub(crate) fn enter_page_edit_single_view(&mut self, target_idx: usize) {
+        self.spread_mode = crate::settings::SpreadMode::Single;
+        self.fullscreen_idx = Some(target_idx);
+        self.fs_zoom = 1.0;
+        self.fs_pan = egui::Vec2::ZERO;
+    }
+
+    /// 編集ツールを抜けたのに見開きが戻っていない状態を解消する。
+    ///
+    /// **退避はツールが動いている間だけ存在してよい。**解除の経路はツールごとに複数ある
+    /// (専用の reset、フルスクリーンを閉じる、ページ送り、コンテキスト切替…)。その全部へ
+    /// 復元を書くと必ずどれか漏れるので、「モードが落ちていたら戻す」を 1 か所で見る。
+    /// `take` は冪等なので、ツール自身の reset が先に戻していても二重にはならない。
+    pub(crate) fn reconcile_page_edit_spread_pivots(&mut self) {
+        let stale = [
+            (!self.erase_mode, &mut self.erase_spread_ctx),
+            (!self.conceal_mode, &mut self.conceal_spread_ctx),
+            (!self.text_mode, &mut self.text_spread_ctx),
+            (!self.export_crop_mode, &mut self.export_crop_spread_ctx),
+            (!self.local_adjust_mode, &mut self.local_adjust_spread_ctx),
+        ]
+        .into_iter()
+        .filter_map(|(mode_is_off, slot)| mode_is_off.then(|| slot.take()).flatten())
+        .collect::<Vec<_>>();
+        for pivot in stale {
+            self.leave_page_edit_single_view(Some(pivot));
+        }
+    }
+
+    /// 編集ツールで倒す前の見開きペア。**倒した後も左右の切り替えを出すために使う。**
+    ///
+    /// 倒した後は `resolve_spread_pair` が Single を返すので、パネルはこちらから引く。
+    /// これが無いと、見開きから入った編集ツールで**片方のページしか触れない**。
+    pub(crate) fn page_edit_spread_pair(&self) -> Option<(usize, usize)> {
+        self.erase_spread_ctx
+            .or(self.conceal_spread_ctx)
+            .or(self.text_spread_ctx)
+            .or(self.export_crop_spread_ctx)
+            .or(self.local_adjust_spread_ctx)
+            .map(|pivot| pivot.pair)
+    }
+
+    /// 退避しておいた見開きへ戻す。
+    ///
+    /// ページ位置は左ページに揃える (`resolve_spread_pair` が同じペアを返すので、
+    /// 元と同じ見開きが再構築される)。
+    pub(crate) fn leave_page_edit_single_view(&mut self, pivot: Option<PageEditSpreadPivot>) {
+        let Some(pivot) = pivot else {
+            return;
+        };
+        self.spread_mode = pivot.saved_mode;
+        self.fullscreen_idx = Some(pivot.pair.0);
+        self.fs_zoom = 1.0;
+        self.fs_pan = egui::Vec2::ZERO;
+    }
 }
 
 /// 見開き表示中に補正パネルが編集対象とするページ (画面上の左/右で固定、
@@ -11459,7 +11547,11 @@ pub struct App {
     pub(crate) export_crop_create_drag: Option<ExportCropCreateDrag>,
     /// 見開きから切り取りモードに入ったときの spread 状態スナップショット
     /// (消しゴム / 隠蔽加工と同じく Single へ pivot し、退場時に復元する)。
-    pub(crate) export_crop_spread_ctx: Option<EraseSpreadCtx>,
+    pub(crate) export_crop_spread_ctx: Option<PageEditSpreadPivot>,
+    /// 補正レイヤーを見開きから開いたときの退避。**5 つの編集ツールで唯一これが無く**、
+    /// 見開きのまま入ると canvas 用 transform が作られずマスク編集が一切効かなかった
+    /// (2026-08-26 の利用者報告)。
+    pub(crate) local_adjust_spread_ctx: Option<PageEditSpreadPivot>,
     /// 補正レイヤーパネルで選択中のレイヤー index。ページごとに保持する。
     pub(crate) local_adjust_selected_layers: std::collections::HashMap<usize, usize>,
     /// 補正レイヤー追加時のマスク種類選択ダイアログ。
@@ -12040,7 +12132,7 @@ pub struct App {
     /// (表紙・末尾奇数・横長画像) から入った場合は `None`。
     /// 2 値を 1 構造体にまとめてあるのは「mode と pair は常に同時に set / take される」
     /// という不変条件をフィールドの形で表現するため。
-    pub(crate) erase_spread_ctx: Option<EraseSpreadCtx>,
+    pub(crate) erase_spread_ctx: Option<PageEditSpreadPivot>,
 
     // ── 隠蔽加工 (Conceal、Phase 1) ───────────────────────────────
     //
@@ -12103,9 +12195,9 @@ pub struct App {
     pub(crate) conceal_shape_drag_start: Option<(f32, f32)>,
     /// Rect / Ellipse ツールのドラッグ末尾点 (画像座標、プレビューと確定で共用)。
     pub(crate) conceal_shape_drag_end: Option<(f32, f32)>,
-    /// 見開きから隠蔽加工に入ったときの状態スナップショット (消しゴムの `EraseSpreadCtx`
+    /// 見開きから隠蔽加工に入ったときの状態スナップショット (消しゴムの `PageEditSpreadPivot`
     /// と同型、Phase 2 で見開きハンドリング実装時に活用)。
-    pub(crate) conceal_spread_ctx: Option<EraseSpreadCtx>,
+    pub(crate) conceal_spread_ctx: Option<PageEditSpreadPivot>,
     /// バッジ判定: マスクが保存されているページの idx 集合 (Phase 4 で活性化)。
     /// フォルダロード時に `conceal_db::load_conceal_keys` で hydrate し、
     /// `save_conceal_with_sidecar` / `delete_conceal_with_sidecar` で同期更新する。
@@ -12309,7 +12401,7 @@ pub struct App {
     /// スタンプピッカーのサムネイルテクスチャキャッシュ (`stamp_source_key` → テクスチャ)。
     pub(crate) stamp_thumb_cache: std::collections::HashMap<String, egui::TextureHandle>,
     /// 見開きから text モードに入ったときの spread 復元コンテキスト (conceal と同じ流儀)。
-    pub(crate) text_spread_ctx: Option<EraseSpreadCtx>,
+    pub(crate) text_spread_ctx: Option<PageEditSpreadPivot>,
 
     // ── テキスト注釈 Undo/Redo (Inc 6) ────────────────────────────
     /// エディタ専用スナップショット undo スタック (D7)。現在編集中ページの注釈
@@ -13925,6 +14017,7 @@ impl App {
             export_crop_drag: None,
             export_crop_create_drag: None,
             export_crop_spread_ctx: None,
+            local_adjust_spread_ctx: None,
             local_adjust_selected_layers: std::collections::HashMap::new(),
             local_adjust_add_layer_dialog_open: false,
             local_adjust_change_mask_dialog_open: false,
@@ -65662,6 +65755,8 @@ impl eframe::App for App {
         // メインビューポートの IME 状態を更新 (ここで Ime イベントを拾う)。
         // フルスクリーンビューポートは別イベントキューなので render_fullscreen_viewport 内で別途呼ぶ。
         self.update_ime_state(ctx);
+        // 編集ツールを抜けたのに見開きが戻っていない状態を、毎フレーム 1 か所で解消する。
+        self.reconcile_page_edit_spread_pivots();
         crate::touch_debug::log_egui_touch_events(ctx, self.frame_counter);
 
         // エクスプローラ等から mIV へドロップされたファイル / フォルダを現在のフォルダへコピーする
