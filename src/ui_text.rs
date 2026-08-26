@@ -1987,6 +1987,17 @@ impl App {
             self.enter_page_edit_single_view(target_idx);
         }
 
+        // ページに紐づく作業物は、どの経路で入ってきても入場時に捨てる。見開きの
+        // 左右切り替えは退場を経由せずにページだけ変わるので、退場側だけで消していると
+        // 前のページの下地・しっぽ・埋め込み worker がそのまま残る。
+        if let Some(pending) = self.stamp_embed_pending.take() {
+            pending
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.comic_preview_base = None;
+        self.comic_tail_stash.clear();
+
         self.text_mode = true;
         self.text_selected = None;
         self.text_selected_ids.clear();
@@ -2022,18 +2033,44 @@ impl App {
 
     /// テキスト編集モードを抜ける。作業セットを comic.db + サイドカーへ保存してから
     /// 状態をクリアし、見開きから入っていた場合は spread を復元する。
-    pub(crate) fn reset_text_mode(&mut self) {
-        let restore_idx = self.fullscreen_idx;
-        let was_text_mode = self.text_mode;
-
-        if was_text_mode {
-            if let Some(idx) = restore_idx {
-                if let Some(key) = self.page_path_key(idx) {
-                    let objs = self.comic_docs.get(&key).cloned().unwrap_or_default();
-                    self.save_comic_objects(idx, &key, &objs);
-                }
-            }
+    /// 見開きから入ったテキスト注釈で、編集対象を左右のもう一方へ移す。
+    ///
+    /// **退避 (`text_spread_ctx`) を消費しない。**退場処理を通すと退避が使い切られ、
+    /// 抜けたときに見開きへ戻れなくなる (2026-08-26 の実機報告: 右ページを選んで抜けると
+    /// 単ページのままになる)。消しゴムの [`Self::switch_erase_target_in_spread`] と同じ約束。
+    pub(crate) fn switch_text_target_in_spread(&mut self, new_idx: usize) {
+        if self.fullscreen_idx == Some(new_idx) {
+            return;
         }
+        self.commit_text_page();
+        self.enter_page_edit_single_view(new_idx);
+        // spread_mode は Single のままなので、enter 内のペア再判定は Single を返し、
+        // 退避はそのまま残る。
+        self.enter_text_mode(new_idx);
+    }
+
+    /// 現在ページの注釈を確定する。**モードは抜けないし、見開きの退避も触らない。**
+    ///
+    /// 見開きの左右切り替えは「ページだけ変わってツールは続く」ので、退場処理は使えない
+    /// (退場は退避を使い切って見開きへ戻してしまい、抜けたときに戻る先が消える)。
+    /// 消しゴムの `apply_inpaint_only` と同じ役割。
+    pub(crate) fn commit_text_page(&mut self) {
+        if !self.text_mode {
+            return;
+        }
+        let Some(idx) = self.fullscreen_idx else {
+            return;
+        };
+        let Some(key) = self.page_path_key(idx) else {
+            return;
+        };
+        let objs = self.comic_docs.get(&key).cloned().unwrap_or_default();
+        self.save_comic_objects(idx, &key, &objs);
+    }
+
+    pub(crate) fn reset_text_mode(&mut self) {
+        let was_text_mode = self.text_mode;
+        self.commit_text_page();
 
         self.text_mode = false;
         self.text_selected = None;
@@ -3439,12 +3476,8 @@ impl App {
         // 左右ボタンで対象ページを切り替える。注釈はページごとなので、現在ページの
         // 作業セットを確定してから入り直す (消しゴムの `switch_erase_target_in_spread`
         // と同じ約束)。退避は触らないので、ボタンはトグルとして使い続けられる。
-        if let Some(new_idx) = switch_target_to
-            && self.fullscreen_idx != Some(new_idx)
-        {
-            self.reset_text_mode();
-            self.enter_page_edit_single_view(new_idx);
-            self.enter_text_mode(new_idx);
+        if let Some(new_idx) = switch_target_to {
+            self.switch_text_target_in_spread(new_idx);
         }
     }
 

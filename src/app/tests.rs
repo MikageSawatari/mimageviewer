@@ -16004,6 +16004,46 @@ mod favorite_adjustment_defaults_tests {
     /// 見開きから消しゴムに入ったあと `reset_erase_mode` で元の見開き状態に戻ること。
     /// (Apply [E] / Cancel [Esc] どちらの経路でも内部的に reset_erase_mode が呼ばれる。)
     #[test]
+    fn switching_sides_in_text_mode_keeps_the_way_back_to_the_spread() {
+        use crate::grid_item::GridItem;
+        use crate::settings::SpreadMode;
+        let mut app = setup_app();
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/b.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.thumbnails.push(ThumbnailState::Pending);
+        // 見開きから Ctrl+T に入った直後の状態。左ページを編集している。
+        app.fullscreen_idx = Some(0);
+        app.spread_mode = SpreadMode::Single;
+        app.text_spread_ctx = Some(crate::app::PageEditSpreadPivot {
+            saved_mode: SpreadMode::Rtl,
+            pair: (0, 1),
+        });
+        app.text_mode = true;
+
+        app.switch_text_target_in_spread(1);
+
+        assert_eq!(app.fullscreen_idx, Some(1), "右ページへ移る");
+        assert_eq!(
+            app.spread_mode,
+            SpreadMode::Single,
+            "単ページのまま編集を続ける"
+        );
+        assert!(
+            app.text_spread_ctx.is_some(),
+            "左右の切り替えで退避を使い切ってはいけない (使い切ると抜けたときに戻れない)"
+        );
+
+        // ここで抜けると、入る前の見開きへ戻る。
+        app.reset_text_mode();
+        assert_eq!(app.spread_mode, SpreadMode::Rtl);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(app.text_spread_ctx.is_none(), "退場では退避を使い切る");
+    }
+
+    #[test]
     fn reset_erase_mode_restores_saved_spread_state() {
         use crate::grid_item::GridItem;
         use crate::settings::SpreadMode;
