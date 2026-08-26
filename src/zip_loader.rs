@@ -725,31 +725,59 @@ fn read_entry_from_bytes(bytes: &Arc<Vec<u8>>, entry_name: &str) -> std::io::Res
     read_by_name(&mut archive, entry_name, None)
 }
 
+/// エントリ名から index を解く。**名前解決はここだけが持つ。**
+///
+/// 正確名 → 旧形式の `\` 区切り → 生メタから復号した名前、の順。日本語の書庫は
+/// Shift-JIS の生名を持つことがあり、復号した名前では `index_for_name` が当たらない。
+/// 部分読みを別経路で書いたときにこの段を丸ごと落とし、**その書庫では寸法が 1 件も
+/// 取れなかった** (2026-08-26)。読み方が増えても、解決の順番は複製しないこと。
+fn resolve_entry_index<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    entry_name: &str,
+    cache_key: Option<DecodedNameCacheKey>,
+) -> std::io::Result<usize> {
+    if let Some(index) = archive.index_for_name(entry_name) {
+        return Ok(index);
+    }
+    let legacy_name = entry_name.replace('/', "\\");
+    if legacy_name != entry_name
+        && let Some(index) = archive.index_for_name(&legacy_name)
+    {
+        return Ok(index);
+    }
+    decoded_name_index(archive, entry_name, cache_key)
+}
+
 fn read_by_name<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     entry_name: &str,
     cache_key: Option<DecodedNameCacheKey>,
 ) -> std::io::Result<Vec<u8>> {
-    match read_by_exact_name(archive, entry_name) {
-        Ok(bytes) => Ok(bytes),
-        Err(first_err) if first_err.kind() == std::io::ErrorKind::NotFound => {
-            let legacy_name = entry_name.replace('/', "\\");
-            if legacy_name != entry_name
-                && let Ok(bytes) = read_by_exact_name(archive, &legacy_name)
-            {
-                return Ok(bytes);
-            }
-            read_by_decoded_name(archive, entry_name, cache_key).map_err(|_| first_err)
-        }
-        Err(err) => Err(err),
-    }
+    let index = resolve_entry_index(archive, entry_name, cache_key)?;
+    read_by_index(archive, index)
 }
 
-fn read_by_decoded_name<R: Read + Seek>(
+/// エントリの先頭 `limit` バイトだけを読む。画像ヘッダから寸法を取るための限定 API。
+fn read_prefix_by_name<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     entry_name: &str,
     cache_key: Option<DecodedNameCacheKey>,
+    limit: u64,
 ) -> std::io::Result<Vec<u8>> {
+    let index = resolve_entry_index(archive, entry_name, cache_key)?;
+    let mut entry = archive
+        .by_index(index)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let mut bytes = Vec::with_capacity(limit.min(entry.size()) as usize);
+    entry.by_ref().take(limit).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn decoded_name_index<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    entry_name: &str,
+    cache_key: Option<DecodedNameCacheKey>,
+) -> std::io::Result<usize> {
     let wanted = entry_name.replace('\\', "/");
     if let Some(key) = cache_key {
         let map = match decoded_name_cache_get(&key) {
@@ -760,26 +788,21 @@ fn read_by_decoded_name<R: Read + Seek>(
                 map
             }
         };
-        return match map.get(&wanted) {
-            Some(&i) => read_by_index(archive, i),
-            None => Err(entry_not_found(entry_name)),
-        };
+        return map
+            .get(&wanted)
+            .copied()
+            .ok_or_else(|| entry_not_found(entry_name));
     }
     // キャッシュキーなし (メモリ上の子 ZIP): raw メタの 1 パス走査で index を探す。
-    let mut found = None;
     for i in 0..archive.len() {
         let entry = archive
             .by_index_raw(i)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         if normalized_zip_entry_name(&entry) == wanted {
-            found = Some(i);
-            break;
+            return Ok(i);
         }
     }
-    match found {
-        Some(i) => read_by_index(archive, i),
-        None => Err(entry_not_found(entry_name)),
-    }
+    Err(entry_not_found(entry_name))
 }
 
 fn build_decoded_name_index_map<R: Read + Seek>(
@@ -813,18 +836,6 @@ fn entry_not_found(entry_name: &str) -> std::io::Error {
         std::io::ErrorKind::NotFound,
         format!("ZIP entry not found: {entry_name}"),
     )
-}
-
-fn read_by_exact_name<R: Read + Seek>(
-    archive: &mut zip::ZipArchive<R>,
-    entry_name: &str,
-) -> std::io::Result<Vec<u8>> {
-    let mut entry = archive
-        .by_name(entry_name)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e.to_string()))?;
-    let mut bytes = Vec::with_capacity(entry.size() as usize);
-    entry.read_to_end(&mut bytes)?;
-    Ok(bytes)
 }
 
 /// 複数エントリをまとめて読むときのアーカイブハンドル型。
@@ -879,14 +890,8 @@ pub fn read_entry_prefix_from_archive(
     limit: u64,
 ) -> std::io::Result<Vec<u8>> {
     match archive {
-        ZipArchiveHandle::Zip(archive) => {
-            let mut entry = archive
-                .by_name(entry_name)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e.to_string()))?;
-            let mut bytes = Vec::with_capacity(limit.min(entry.size()) as usize);
-            entry.by_ref().take(limit).read_to_end(&mut bytes)?;
-            Ok(bytes)
-        }
+        // 名前解決は `read_entry_from_archive` と同じ段を通す。
+        ZipArchiveHandle::Zip(archive) => read_prefix_by_name(archive, entry_name, None, limit),
         // RAR は部分読みの経路を持たない。全体を読んで先頭だけ使う。
         ZipArchiveHandle::Rar(path) => crate::rar_loader::read_entry_bytes(path, entry_name),
     }
@@ -912,6 +917,46 @@ pub fn entry_basename(entry_name: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **先頭だけ読む経路も、全体を読む経路と同じ名前解決を通る。**
+    ///
+    /// 日本語の書庫は Shift-JIS の生名を持つことがあり、列挙側が返すのは復号後の名前。
+    /// 部分読みを別経路で書いて `by_name` だけに頼ったとき、この種の書庫では 1 件も
+    /// 解決できず、寸法が全く取れなかった (2026-08-26)。
+    #[test]
+    fn a_prefix_read_finds_an_entry_whose_stored_name_is_not_utf8() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("cp932.zip");
+        // "あ.txt" を CP932 で格納する。UTF-8 フラグは立てない。
+        let raw_name = vec![0x82u8, 0xA0, b'.', b't', b'x', b't'];
+        let stored_name = unsafe { String::from_utf8_unchecked(raw_name.clone()) };
+        {
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer.start_file(stored_name, options).unwrap();
+            writer.write_all(b"0123456789abcdef").unwrap();
+            writer.finish().unwrap();
+        }
+
+        // 列挙側が返す名前 (= 復号後) で引く。生名とは別物。
+        let mut archive = open_archive(&zip_path).unwrap();
+        let listed = match &mut archive {
+            ZipArchiveHandle::Zip(archive) => {
+                normalized_zip_entry_name(&archive.by_index(0).unwrap())
+            }
+            ZipArchiveHandle::Rar(_) => unreachable!(),
+        };
+
+        let whole = read_entry_from_archive(&mut archive, &listed).unwrap();
+        assert_eq!(whole, b"0123456789abcdef");
+
+        let head = read_entry_prefix_from_archive(&mut archive, &listed, 4).unwrap();
+        assert_eq!(head, b"0123");
+    }
 
     #[test]
     fn entry_dir_root_is_empty() {

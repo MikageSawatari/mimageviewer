@@ -2021,21 +2021,39 @@ fn collect_zip_entry_dims(
             return;
         }
     };
+    // **黙って諦めない。**名前解決に失敗した書庫では 1 件も取れず、原因が見えないまま
+    // 「分割されない」だけが残る (2026-08-26 に実際そうなった)。
+    let attempted = missing.len();
+    let mut unresolved = 0usize;
+    let mut undecodable = 0usize;
     for entry_name in missing {
-        let Ok(head) = crate::zip_loader::read_entry_prefix_from_archive(
+        let head = match crate::zip_loader::read_entry_prefix_from_archive(
             &mut archive,
             &entry_name,
             ZIP_HEADER_PROBE_BYTES,
-        ) else {
-            continue;
+        ) {
+            Ok(head) => head,
+            Err(_) => {
+                unresolved += 1;
+                continue;
+            }
         };
-        if let Some(size) = image::ImageReader::new(std::io::Cursor::new(head))
+        match image::ImageReader::new(std::io::Cursor::new(head))
             .with_guessed_format()
             .ok()
             .and_then(|reader| reader.into_dimensions().ok())
         {
-            dims.insert(entry_name, size);
+            Some(size) => {
+                dims.insert(entry_name, size);
+            }
+            None => undecodable += 1,
         }
+    }
+    if unresolved > 0 || undecodable > 0 {
+        crate::logger::log(format!(
+            "remote_ipc: zip entry dims incomplete path={} attempted={attempted}              unresolved={unresolved} undecodable={undecodable}",
+            container_path.display()
+        ));
     }
 }
 
@@ -5177,7 +5195,8 @@ impl ContainerEngine {
         // 件数を残す。全ページ不明ならカタログもヘッダ読みも当たっていない。
         if unknown > 0 {
             crate::logger::log(format!(
-                "remote_ipc: page dims unknown pages={unknown}/{pages}                  (landscape detection is off for those pages)"
+                "remote_ipc: page dims unknown pages={unknown}/{pages} path={}                  (landscape detection is off for those pages)",
+                container_path.display()
             ));
         }
         flags
