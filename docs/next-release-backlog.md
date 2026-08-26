@@ -2668,15 +2668,16 @@ mIV は fallback font を 6 系統登録しているので atlas は大きい。
 
 - 規模 \ 優先度: 未知 / P2 (原因が分かるまでは見積もらない)。
 
-### 1.131 複数ウィンドウで動画再生中、他の窓をアクティブにすると 13ms で動画へ奪い返される ⚠️ 出荷ブロッカー候補
+### 1.131 複数ウィンドウで動画再生中、他の窓をアクティブにすると 13ms で動画へ奪い返される ✅ 修正済み
 
 - 出典: 2026-08-27、利用者報告。**複数ウィンドウモードで動画を再生中に PDF を開こうとすると
   「ウィンドウがちらつくだけで開けない」。動画の前に開いていた PDF ウィンドウも、
   アクティブにしようとすると動画のウィンドウが手前に来る。**動画が無ければ開ける。
+- 状態: **2026-08-27 修正**。実機確認待ち。
 
 #### 原因 — 実ログで確定 (推測ではない)
 
-`MIV_DETACHED_WINDOW_DEBUG=1` で再現。同じ 3 行が繰り返される:
+`MIV_DETACHED_WINDOW_DEBUG=1` で再現。同じ 4 行が 5 回繰り返された:
 
 ```
 31.172  passive_activate_begin id=4                                  ← 利用者が PDF 窓をクリック
@@ -2686,12 +2687,13 @@ mIV は fallback font を 6 系統登録しているので atlas は大きい。
 31.185  session_begin window_id=1 source=Video                       ← 動画が奪い返す
 ```
 
-**`RequestSeekStripWindow` は利用者のクリックではない。**シークストリップが自分の窓を
-要求しているだけの layout / resource イベント。それが「HUD がクリックされた」と分類され、
-parked-live の動画窓へ活性化要求を出している。
+**`RequestSeekStripWindow` は利用者のクリックではない。**
+[render_core.rs](../src/video/native_presenter/render_core.rs) が**描画中に**、strip の
+layout key (overlay サイズ / DPI / 可視セル数 / center) が変わるたびに push する
+layout / resource 要求。それが「HUD がクリックされた」と分類されていた。
 
 [native_video.rs](../src/app/native_video.rs) の
-`native_video_output_event_is_parked_live_maintenance`:
+`native_video_output_event_is_parked_live_hud_click_activation` (旧):
 
 ```rust
 Ev::Window(_) | Ev::PlacementSwitched { .. } | Ev::PlacementSwitchFailed { .. }
@@ -2701,38 +2703,54 @@ Ev::NavigateItem { via_wheel, .. } => !*via_wheel,
 _ => true,                                        // ⚠ それ以外は全部「HUD クリック」
 ```
 
-**catch-all `_ => true` が構造的な欠陥。**後から足したイベントは、何もしなくても
-「利用者がクリックした → 前面へ奪う」に既定で入る。
+**catch-all `_ => true` が構造的な欠陥。**`NativeVideoOutputEvent` は 77 variant あり、
+後から足したイベントは、何もしなくても「利用者がクリックした → 前面へ奪う」に既定で入る。
 
 - `RequestSeekStripWindow` の追加: **2026-08-23** (`2edc070c` シークストリップ)
 - この分類器の最終更新: **2026-08-21** (`c71d8c08` detached-rework R2)
 
-シークストリップは 10 個近くイベントを足したが、維持側に登録されたのは 3 つだけ
-(`RequestSeekThumbnail` / `ClearSeekThumbnail` / `TileColumnsDelta`)。
-`OpenSeekStrip` / `CloseSeekStrip` / `MoveSeekStrip` / `CommitSeekStrip` /
-`RequestSeekStripWindow` / `SetSeekStripState` / `StepSeekStripRange` は未分類。
-利用者の見立て (「ストリップのマージで壊れた可能性」) がそのまま当たっている。
+シークストリップは 10 個近くイベントを足したが、維持側に登録されたのは 3 つだけ。
+利用者の見立て (「ストリップのマージで壊れた可能性」) がそのまま当たっていた。
 
-#### 直し方 (症状パッチにしない)
+#### 修正 (2026-08-27)
 
-`_ => true` を**網羅 match** にして、新しいイベントを足したらコンパイラが分類を要求する形に
-する。そのうえで、シークストリップの layout / resource 系イベントを維持側へ入れる。
-「未知のイベント = 利用者のクリック = 前面を奪う」という既定をやめるのが本体。
+`_ => true` を撤去し、**77 variant を網羅 match で分類**した。新しいイベントを足すと
+コンパイラが分類を要求する。「未知のイベント = 利用者のクリック = 前面を奪う」という
+既定をやめるのが本体で、`RequestSeekStripWindow` を維持側へ足すだけの症状パッチにはしない。
 
-もう 1 か所、同じ形の述語がある。[ui_fullscreen.rs](../src/ui_fullscreen.rs) の
-`take_parked_live_activation_requests_after_passive_render` の消費側は
-`detached_window_state_is_parked_live(id)` だけを見て活性化する。これは
-「この窓は parked-live か」であって「**この活性化要求はまだ望まれているか**」ではない。
-利用者が別の窓を活性化した後でも通る。分類器を直せば今回の症状は消えるが、この述語も
-同じ「1 つの述語で 2 つの問いに答えている」形。
+Codex は方針に同意したうえで、一次分類案に **5 件の反例**を出した。全件を emit 元で裏取りし、
+うち 2 件は**同じバグの別インスタンス**だった:
 
-#### 手続き
+| 指摘 | 裏取り結果 | 対応 |
+| --- | --- | --- |
+| `CloseSeekStrip` は cause 依存 | ✓ **`HudHidden` は描画の else 枝から出る** (2 例目) | 既存の `SeekStripCloseCause::is_user_dismissal()` を使う |
+| `SetVst3PanelPos` は自動 clamp でも出る | ✓ `saved_pos_was_clamped` で発火 (3 例目)。利用者のドラッグは左ボタン経路が先に活性化するので失われない | false |
+| `TouchChromeLearned` は利用者入力 | ✓ `ToggleChrome` / `PageSide` のタップにのみ応答 | true |
+| `SetVst3PanelVisible` に producer が無い | ✓ presenter に push 箇所ゼロ | default-deny で false |
+| `TileColumnsDelta` は入力源が 2 つ | ✓ ただし**両方とも利用者入力**。今回の欠陥ではない | 現状の false を維持 (下記) |
 
-detached リワーク中の凍結ルール下 ([CLAUDE.md](../CLAUDE.md))。網羅 match 化は症状パッチでは
-なく構造的修正だが、着手には plan §2 を読んだうえで ClaudeCode と Codex 双方の合意が要る。
+自分で追加確認した 1 件: `VideoScaleSettingsCommitted` は presenter が適用完了後に送る通知
+なので false。
 
-- 規模 / 優先度: Small (分類器の網羅化 + 分類) / **P1 出荷ブロッカー候補**。
-  複数ウィンドウ + 動画は主要な組み合わせで、回避策が無い。
+回帰テスト: `parked_live_renderer_emitted_events_do_not_request_activation`
+([src/app/tests.rs](../src/app/tests.rs))。`RequestSeekStripWindow` を活性化側へ戻す変異と
+`CloseSeekStrip` の cause を無視する変異の両方で落ちることを確認済み。
+
+凍結ルール下の合意は [detached-rework-plan.md](detached-rework-plan.md) §11 に記録した。
+
+#### 残した 2 件 (憲法 §2 規則 7 によりスコープ外)
+
+1. **`TileColumnsDelta` の provenance 分離** — Ctrl+ホイールと HUD の列数 ± ボタンが同じ
+   variant を共有する。現状はどちらも parked 中に活性化しない (R2 以降の挙動)。
+   分けるには payload に typed origin が要り、今回の欠陥とは別。
+2. **活性化要求の寿命・順序** — [ui_fullscreen.rs](../src/ui_fullscreen.rs) の
+   `take_parked_live_activation_requests_after_passive_render` の消費側は
+   `detached_window_state_is_parked_live(id)` だけを見る。これは「この窓は parked-live か」
+   であって「**この活性化要求はまだ望まれているか**」ではない。要求は生成理由も順序も
+   持たない `Vec<u64>` で、同一 batch は時系列でなく ID 順に並ぶ。
+   今回の症状の原因ではないが、同じ「1 つの述語で 2 つの問いに答えている」形。
+   扱うなら既存の `DetachedActivationIntent` を含む reducer へ統合し、
+   **入力順序か request identity** で最新を定義する (フレーム数や数 ms の猶予で棄却しない)。
 
 ### 1.130 font atlas resync 待ちが 16ms 固定でスピンする
 
