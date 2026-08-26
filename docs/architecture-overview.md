@@ -63,6 +63,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `main.rs` | `windows_subsystem` 属性と `mimageviewer::run()` 呼び出しだけを持つ薄い実行ファイル入口 |
 | `lib.rs` | アプリの単一 crate root。全モジュール宣言、logger / eframe 起動、worker サブコマンド分岐を所有し、unit test・integration test・実行ファイルで同じコンパイル結果を共有する |
 | `app.rs` | `App` 構造体と `eframe::App` 実装。状態遷移の中心 |
+| `app/viewer_context_registry.rs` | main / detached / parked viewer context の唯一の bundle 保管先。`ViewerContextId`、`ContextResidence`、window binding の双方向表と、mount / build / fork / retire / promote の 5 transaction を所有する。`App` の viewer field 群は常に registry が選んだ 1 context の投影であり、active / parked は bundle の保管場所ではなく detached window runtime state が表す |
 | `app/vram_accounting.rs` | `App` が所有する全 GPU テクスチャキャッシュを、実寸・mip chain・`TextureId` 重複排除で横断集計する。サブシステム別会計、モード判定、共有予算の参照、1 秒間隔の perf 計装を担当する |
 | `app/folder_scan.rs` | 通常実フォルダの列挙と、1 物理フォルダ内に限定した同名メディア / コンテナ正規化の所有者。動画 + sidecar 画像、実フォルダ + ZIP/PDF/対応アーカイブ、ZIP + 変換元アーカイブ、画像拡張子優先度の規則を通常一覧・サブ展開・スマートフォルダで共有する |
 | `app/native_video.rs` | Windows native video presenter から戻る overlay event / key / mouse / marker / VST3 操作の App 側処理。native Touch は render overlay 内で完結し、App の legacy mouse 操作へは再注入しない |
@@ -118,7 +119,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `seek_ruler.rs` | 静止画 / 本のページ数と動画 / 音楽の duration から、トラック幅に収まる 1 / 2 / 5 系の目盛り位置と大小区分を生成する純ロジック。3 面の共通寸法・低コントラスト色も所有する |
 | `page_dims.rs` | 一度判明したページ寸法を GPU texture の生存期間から分離して保持する generation 付き CPU cache。`ViewerContextBundle` 所有で、同じ idx の別 items へ寸法を誤適用しない |
 | `displayed_image_transform.rs` | ページ単位の実表示 transform の正本。fit / scale limit / trim / 90 度・free rotation / 通常または Z の zoom-pan から paint・hit・UV rect、source↔screen 写像、total scale を一度に解決する。`FullscreenPageLayout` はフレーム中に実際に描いた Single / Spread / Continuous の各ページ transform を paint 順で保持し、ルーペと範囲キャプチャへ共通 `hit_test` を提供する。見開き・連結読みの配置計算自体は `ui_fullscreen.rs` が担当する |
-| `vendor/eframe` | eframe 0.33.3 の Windows hidden/minimized repaint scheduler に upstream PR #7905 を backport するローカルパッチ。不可視 HWND へ `ControlFlow::Poll` + OS redraw を要求せず direct UI pass で pending command を消化し、アプリが要求した repaint だけを `max(要求済み時刻, now + 100ms)` へ制限し、先の予定は早めない。要求が無ければ heartbeat を作らず sleep する。App / tray / detached の状態 ownership は変更しない |
+| `vendor/eframe` | eframe 0.33.3 の Windows hidden/minimized repaint scheduler に upstream PR #7905 を backport するローカルパッチ。不可視 HWND へ `ControlFlow::Poll` + OS redraw を要求せず direct UI pass で pending command を消化し、アプリが要求した repaint だけを `max(要求済み時刻, now + 100ms)` へ制限し、先の予定は早めない。要求が無ければ heartbeat を作らず sleep する。App / tray / detached の状態 ownership は変更しない。**もう 1 件**: wgpu backend は `max_texture_side` を `State::new` で 1 度スナップショットするだけだったのを、glow backend と同じく毎フレーム painter の値へ同期するようにした。egui は font atlas を `Context` に 1 つしか持たず、`max_texture_side` が変わると全フォントを再パースして atlas を作り直すので、2 つの viewport が 2048 と 8192 を交互に報告すると毎パス rebuild (実測 38.6ms) になる。詳細と実測は [next-release-backlog.md](next-release-backlog.md) §1.129。上流還元候補なので vendored crate 更新時はこの差分を持ち越す |
 | `vendor/egui-wgpu` | egui 0.33.3 の managed texture に opt-in GPU mipmap を追加するローカルパッチ。`TextureOptions::mipmap_mode` 指定時だけ完全な mip chain を確保・生成し、静止画の論理 `TextureHandle` / cache 構造は変えない。`Rgba8Unorm`生成器は比較callbackと360度パノラマの独自textureにも公開して共用する。上流の`LICENSE-MIT` / `LICENSE-APACHE`本文をcrate内に保持し、アプリ内表示と配布物同梱の正本にする |
 | `ui_fullscreen/draw_icons.rs` | フルスクリーン上部バー / 動画 HUD のボタン・アイコン描画 helper、ファイル情報文字列 builder |
 | `export_dialog.rs` | Ctrl+E エクスポートのダイアログ状態・worker・ファイル名衝突回避。UI は base pixels / mask / preset を snapshot し、隠蔽合成・画像エンコード・メタデータ転記は worker が担当 |
@@ -457,13 +458,19 @@ archive member / nested container の identity は大小文字を区別せず、
 保持する。成功・キャンセル・部分成功の終端で変更sectionを1回だけ確定し、影響するmain /
 detached / parked contextの現在項目キーを3 ms / 2048項目のフレーム予算でcompact snapshot化する。
 専用refresh workerがrating / tag / page state / container state / pinをSQLiteからbatch取得し、
-UIはitems generationとdetached window identityが一致する完成cacheだけをswapする。不一致時は
+UIは要求構築時に焼き込んだViewerContextIdのresidenceがMounted / AtRestで、かつitems generationが
+一致する完成cacheだけをswapする。Retiredへの遅延結果は正常な破棄、Unknownはidentity不変条件違反として
+診断して破棄する。不一致時は
 モーダルを維持して再snapshot・再取得する。bookmark / media cacheは影響contextごとに1回だけ
 無効化し、全体page badge集合もworker生成snapshotへ置換する。folder pinのlookup identityは
 通常ロードと共通化し、current folder / 現在のZIP本 / ZipDirのliteral-effective aliasを含める。
 cache swap後のvisible/facet/details/selection再計算と代表サムネ再materializeは各contextをmount
-している間に行う。video pinは現DBにWebPがない項目も再生成対象へ含め、削除を通常フレーム抽出へ
-戻す。終端refreshはimport本体と別のcancel tokenを持ち、App終了時はDB chunk間で中断する。
+している間に行う。pin refreshは通常ナビゲーションの`load_folder`を通さず、影響thumbnailだけを
+evictし、不要になった`#pin:` catalog行の削除とvideo pin WebPのseedを同じcontextで行う。古いpin
+snapshotを持つin-flight結果はcontext所有のthumbnail worker channel / queueを交換して到達不能にし、
+items generation・fullscreen・media sessionを変更しない。video pinは現DBにWebPがない項目も再生成
+対象へ含め、削除を通常フレーム抽出へ戻す。終端refreshはimport本体と別のcancel tokenを持ち、
+App終了時はDB chunk間で中断する。
 page state import時は永続edit preview cacheの破棄完了を非同期ACKで待ち、main / active detached /
 paused detachedのmaterialized previewを失効させる。各contextではimport前後のどちらかに編集が
 あるthumbnailも再要求するため、編集削除後の旧WebPを残さない。

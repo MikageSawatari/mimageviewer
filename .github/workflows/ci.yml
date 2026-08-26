@@ -1,12 +1,13 @@
 name: CI
 
 # 公開リポジトリなので GitHub Actions は標準ランナーで無制限・無料。
-# 現在のゲートは 2 本:
+# 現在のゲートは 3 本:
 #   1. `cargo fmt --check` (ローカル pre-commit フックの cloud 版)
 #   2. ubuntu での `cargo check --bin mimageviewer-core --features portable`
 #      — Windows 上の cargo check では原理的に検出できない「#[cfg(windows)] 宣言の
 #      unguarded 参照 (非 Windows ビルド破壊)」を機械的に検出する
 #      (v2.3.0 レビュー docs/review-v2.3.0/claude-hunt-crosscut.md [P3] の再発防止)。
+#   3. viewer context 所有の source-only 監査 (A2 / A3 / A7)
 #
 # clippy / test の本格ゲートは Windows ランナー + vendor bootstrap (PDFium/ONNX/
 # FFmpeg/Susie) + Git LFS (models) + VST3 host exe が必要で、build.rs が
@@ -38,6 +39,17 @@ jobs:
         run: rustup component add rustfmt
       - name: Check formatting
         run: cargo fmt --all --check
+
+  viewer-context-audit:
+    name: viewer context audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked -p viewer_context_audit
+      - run: cargo run --locked -p viewer_context_audit
 
   # ───────────────────────────────────────────────────────────────────────────
   # 非 Windows cfg の compile ゲート。

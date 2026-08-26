@@ -331,6 +331,10 @@
 # FsSpreadRtl.2 = Numpad4 ; 右開き見開き表示に切り替える
 # FsSpreadRtlCover.1 = 5 ; 右開き表紙単独の見開き表示に切り替える
 # FsSpreadRtlCover.2 = Numpad5 ; 右開き表紙単独の見開き表示に切り替える
+# FsSpreadSplitLtr.1 = 8 ; 横長ページを左半分から順に分割表示する
+# FsSpreadSplitLtr.2 = Numpad8 ; 横長ページを左半分から順に分割表示する
+# FsSpreadSplitRtl.1 = 9 ; 横長ページを右半分から順に分割表示する
+# FsSpreadSplitRtl.2 = Numpad9 ; 横長ページを右半分から順に分割表示する
 # FsReadingFlowCycle.1 = 6 ; ページ単位/縦連結/横連結を切り替える
 # FsReadingFlowCycle.2 = Numpad6 ; ページ単位/縦連結/横連結を切り替える
 # FsReadingDirectionToggle.1 = 7 ; 横方向の読み進み方向を切り替える

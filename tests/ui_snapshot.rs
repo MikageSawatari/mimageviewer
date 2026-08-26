@@ -967,7 +967,7 @@ fn network_data_dir_notice_dark() {
 // Susie 診断 UI (PoolStatus 各バリアントのレンダリング) のスナップショット
 // ---------------------------------------------------------------------------
 
-use mimageviewer::susie_loader::{PluginInfo, PoolStatus};
+use mimageviewer::susie_loader::{PluginInfo, PoolStatus, SusieWorkerHealth};
 use mimageviewer::ui_susie_diagnostic::render_diagnostic;
 use std::path::PathBuf;
 
@@ -1061,6 +1061,15 @@ fn ready_with_plugins_fixture() -> Vec<PluginInfo> {
     ]
 }
 
+/// 何も起きていない状態。復帰履歴は出ない。
+fn healthy_workers() -> SusieWorkerHealth {
+    SusieWorkerHealth {
+        started_workers: 3,
+        live_workers: 3,
+        ..SusieWorkerHealth::default()
+    }
+}
+
 #[test]
 fn susie_diagnostic_ready_with_plugins() {
     let plugins = ready_with_plugins_fixture();
@@ -1068,8 +1077,49 @@ fn susie_diagnostic_ready_with_plugins() {
         "susie_diagnostic_ready_with_plugins",
         PoolStatus::ReadyWithPlugins {
             count: plugins.len(),
+            health: healthy_workers(),
         },
         plugins,
+    );
+}
+
+/// クラッシュから復帰した後。プラグイン一覧の下に履歴が付く。
+#[test]
+fn susie_diagnostic_ready_after_recovery() {
+    let plugins = ready_with_plugins_fixture();
+    snapshot_diagnostic(
+        "susie_diagnostic_ready_after_recovery",
+        PoolStatus::ReadyWithPlugins {
+            count: plugins.len(),
+            health: SusieWorkerHealth {
+                started_workers: 3,
+                live_workers: 2,
+                restarts: 4,
+                gave_up_workers: 1,
+                crashing_subjects: 2,
+                last_failure: Some("unexpected end of file".to_string()),
+            },
+        },
+        plugins,
+    );
+}
+
+/// 枠を使い切った後。以前はこれが「起動に失敗しました」と表示されていた。
+#[test]
+fn susie_diagnostic_workers_exhausted() {
+    snapshot_diagnostic(
+        "susie_diagnostic_workers_exhausted",
+        PoolStatus::WorkersExhausted {
+            health: SusieWorkerHealth {
+                started_workers: 3,
+                live_workers: 0,
+                restarts: 15,
+                gave_up_workers: 3,
+                crashing_subjects: 3,
+                last_failure: Some("unexpected end of file".to_string()),
+            },
+        },
+        Vec::new(),
     );
 }
 
@@ -1082,6 +1132,7 @@ fn susie_diagnostic_ready_with_plugins_dark() {
         mimageviewer::os_theme::ResolvedTheme::Dark,
         PoolStatus::ReadyWithPlugins {
             count: plugins.len(),
+            health: healthy_workers(),
         },
         plugins,
     );

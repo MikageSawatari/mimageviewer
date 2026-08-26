@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use super::ViewerContextId;
 use crate::metadata_transfer::{ImportChangedSections, ImportPageStateSnapshot};
 
 /// SQLiteのbind上限回避と終了時cancel応答を兼ねるworker work unit。
@@ -45,7 +46,7 @@ impl ItemKey {
 
 #[derive(Debug)]
 pub(crate) struct ContextRequest {
-    pub(crate) slot: ContextSlot,
+    pub(crate) context_id: ViewerContextId,
     pub(crate) items_generation: u64,
     pub(crate) items: Vec<ItemKey>,
     /// UIの段階snapshot中に収集済みのlegacy XMP tag seed対象。
@@ -57,15 +58,8 @@ pub(crate) struct ContextRequest {
     pub(crate) folder_pin_aliases: Vec<(String, String)>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ContextSlot {
-    Main,
-    ActiveDetached(Option<u64>),
-    PausedDetached { index: usize, window_id: u64 },
-}
-
 pub(crate) struct ContextResult {
-    pub(crate) slot: ContextSlot,
+    pub(crate) context_id: ViewerContextId,
     pub(crate) items_generation: u64,
     pub(crate) rating_cache: Option<HashMap<usize, u8>>,
     pub(crate) tags_cache: Option<HashMap<String, Vec<String>>>,
@@ -556,7 +550,7 @@ fn build_context_result(
         return None;
     }
     Some(ContextResult {
-        slot: request.slot,
+        context_id: request.context_id,
         items_generation: request.items_generation,
         rating_cache,
         tags_cache,
@@ -624,7 +618,7 @@ mod tests {
         let result = run(
             data_dir,
             vec![ContextRequest {
-                slot: ContextSlot::Main,
+                context_id: ViewerContextId::for_test(0),
                 items_generation: 7,
                 items: vec![
                     ItemKey {
@@ -712,7 +706,7 @@ mod tests {
         let result = run(
             temp.path().join("missing"),
             vec![ContextRequest {
-                slot: ContextSlot::Main,
+                context_id: ViewerContextId::for_test(0),
                 items_generation: 1,
                 items: vec![ItemKey {
                     index: 0,
@@ -782,7 +776,7 @@ mod tests {
         let result = run(
             data_dir,
             vec![ContextRequest {
-                slot: ContextSlot::Main,
+                context_id: ViewerContextId::for_test(0),
                 items_generation: 4,
                 items: vec![
                     ItemKey {
@@ -856,7 +850,7 @@ mod tests {
         let result = run(
             data_dir,
             vec![ContextRequest {
-                slot: ContextSlot::Main,
+                context_id: ViewerContextId::for_test(0),
                 items_generation: 9,
                 items: vec![ItemKey {
                     index: 4,

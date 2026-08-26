@@ -634,6 +634,11 @@ mod tests {
 
     #[test]
     fn bookmark_synthetic_path_restores_bookmark_surface() {
+        // `bookmark_view_synthetic_path` reads the process-global data dir, and this test
+        // reads it twice -- once to build the restore and once to compare. Another test
+        // swapping `set_test_override` in between makes the two disagree, so take the
+        // shared guard `data_dir::test_override_lock` documents for every `get()` caller.
+        let _data_dir_guard = crate::data_dir::test_override_lock();
         let restore = TopLevelGridRestore::from_legacy_parts(
             Some(super::super::bookmark_view_synthetic_path()),
             None,

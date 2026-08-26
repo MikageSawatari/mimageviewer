@@ -81,6 +81,20 @@ fn requested_video_seek_strip_state(
 }
 
 #[cfg(windows)]
+pub(super) fn send_normalize_message_with_wake(
+    tx: &mpsc::Sender<crate::app::normalize::NormalizeMessage>,
+    ui_wake: &crate::video::VideoUiWake,
+    message: crate::app::normalize::NormalizeMessage,
+) -> bool {
+    if tx.send(message).is_ok() {
+        ui_wake.wake();
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VideoAudioEnterSource {
     EguiKey,
@@ -313,7 +327,6 @@ pub(crate) fn take_video_audio_enter_requests_for_test() -> Vec<(usize, VideoAud
 enum NativeVideoKeyBlockReason {
     MusicVstShell,
     NormalizeModal,
-    StaleDetachedToggle,
 }
 
 #[cfg(windows)]
@@ -322,7 +335,6 @@ impl NativeVideoKeyBlockReason {
         match self {
             Self::MusicVstShell => "music_vst_shell",
             Self::NormalizeModal => "normalize_modal",
-            Self::StaleDetachedToggle => "stale_detached_toggle",
         }
     }
 }
@@ -576,33 +588,6 @@ fn log_native_video_key_diagnostic(record: NativeVideoKeyDiagnosticRecord) {
     }
 }
 
-/// native presenter が転送してきた KeyDown の virtual key が **いま物理的に押下中か**を
-/// OS に問い合わせる。placement 切替 (Plan B) で presenter を作り直すと、既に離された
-/// F12 の KeyDown が数百 ms 遅れて再配送され (`repeat=false` でも stale)、detached→main→
-/// detached の二重トグルになる。`repeat` フラグは信用できない (stale でも false) ため、
-/// GetAsyncKeyState の high bit で「今まだ押されているか」を見て stale 再配送を弾く。
-#[cfg(windows)]
-fn native_video_key_physically_down(
-    key: &crate::video::native_window::NativeVideoKeyEvent,
-) -> bool {
-    let physically_down = crate::key_input::physical_key_down(
-        crate::key_input::PhysicalKeySlot::new(key.virtual_key, key.extended),
-    );
-    // headless な単体テストは合成 KeyDown を送るので実際には物理キーが押されておらず、
-    // GetAsyncKeyState が常に false を返して F12 トグルが走らない。この OS 問い合わせは
-    // 実機の stale 再配送弾き専用なので、テスト時は「押されている」とみなして production
-    // 分岐 (実機でのみ意味を持つ) を迂回する。
-    #[cfg(test)]
-    {
-        let _ = physically_down;
-        true
-    }
-    #[cfg(not(test))]
-    {
-        physically_down
-    }
-}
-
 #[cfg(windows)]
 fn main_iconic_video_source_enabled(
     detached_or_switching: bool,
@@ -700,9 +685,12 @@ pub(crate) struct NativeVideoOpenPending {
     pub(crate) requested_at: std::time::Instant,
     pub(crate) deadline: std::time::Instant,
     pub(crate) input_seq: u64,
-    /// ParkedLive mount 中に生成された pending の owner window id。
-    /// VST3 deferred open からも parked mount 中に到達するため mounted 専用ではない。
-    pub(crate) parked_live_window_id: Option<u64>,
+    /// Owner identity at enqueue time. Residence and window binding may change while the host is
+    /// being created, but the context identity does not.
+    pub(crate) owner_context_id: ViewerContextId,
+    /// poll が直前に見送った理由。**毎フレーム同じ理由を出さないためだけの記憶**で、
+    /// 判断には使わない。見送りが無言だと「開かないまま静かに止まった」が観測できない。
+    pub(crate) last_declined: Option<&'static str>,
 }
 
 #[cfg(windows)]
@@ -1014,6 +1002,7 @@ impl App {
 
         let now = std::time::Instant::now();
         self.native_video_open_pending = Some(NativeVideoOpenPending {
+            last_declined: None,
             idx,
             path: path.to_path_buf(),
             from_grid,
@@ -1023,7 +1012,7 @@ impl App {
             requested_at: now,
             deadline: now + std::time::Duration::from_secs(10),
             input_seq: self.input_seq,
-            parked_live_window_id: self.native_video_parked_live_input_window_id,
+            owner_context_id: self.projected_viewer_context_id(),
         });
         crate::logger::log(format!(
             "[native-video] defer regular open: idx={idx} live_video_decode_threads={live_decoders} max={max_live_video_decode_threads}"
@@ -1061,6 +1050,7 @@ impl App {
     ) -> bool {
         let now = std::time::Instant::now();
         self.native_video_open_pending = Some(NativeVideoOpenPending {
+            last_declined: None,
             idx,
             path: path.to_path_buf(),
             from_grid,
@@ -1070,7 +1060,7 @@ impl App {
             requested_at: now,
             deadline: now + std::time::Duration::from_secs(10),
             input_seq: self.input_seq,
-            parked_live_window_id: self.native_video_parked_live_input_window_id,
+            owner_context_id: self.projected_viewer_context_id(),
         });
         crate::logger::log(format!(
             "[native-video] defer regular open until detached host is ready: idx={idx}"
@@ -1078,15 +1068,70 @@ impl App {
         true
     }
 
+    /// 見送り理由を、**理由が変わったときだけ**記録する。毎フレーム出すとログが埋まり、
+    /// 出さないと「静かに止まった」が観測できない。判断には使わない記録専用の経路。
+    #[cfg(windows)]
+    fn log_native_video_open_pending_declined(&mut self, reason: &'static str, detail: String) {
+        let Some(pending) = self.native_video_open_pending.as_mut() else {
+            return;
+        };
+        if pending.last_declined == Some(reason) {
+            return;
+        }
+        pending.last_declined = Some(reason);
+        crate::logger::log(format!(
+            "[native-video] deferred regular open waiting: reason={reason} {detail}"
+        ));
+    }
+
+    /// 保留中の regular open を破棄し、**理由を残す**。破棄そのものは正常な経路が複数あるが、
+    /// 無言だと「動画が始まらないまま黒いウィンドウが残った」ときにどれが効いたのか分からない。
+    #[cfg(windows)]
+    pub(crate) fn clear_native_video_open_pending(&mut self, reason: &'static str) {
+        let Some(pending) = self.native_video_open_pending.take() else {
+            return;
+        };
+        crate::logger::log(format!(
+            "[native-video] clear deferred regular open: reason={reason} idx={} owner={:?}",
+            pending.idx, pending.owner_context_id
+        ));
+    }
+
     #[cfg(windows)]
     pub(super) fn poll_native_video_open_pending(&mut self, ctx: &egui::Context) {
+        self.poll_native_video_open_pending_with_readiness(
+            ctx,
+            |app| app.detached_viewer_video_host_ready(),
+            || {
+                crate::video::decoder::LIVE_VIDEO_DECODE_THREADS
+                    .load(std::sync::atomic::Ordering::Acquire)
+            },
+            |app, idx| app.start_fs_load(idx),
+        );
+    }
+
+    #[cfg(windows)]
+    pub(in crate::app) fn poll_native_video_open_pending_with_readiness(
+        &mut self,
+        ctx: &egui::Context,
+        detached_host_ready: impl FnOnce(&Self) -> bool,
+        live_decoder_count: impl FnOnce() -> usize,
+        resume_open: impl FnOnce(&mut Self, usize),
+    ) {
         let Some(pending) = self.native_video_open_pending.as_ref() else {
             return;
         };
-        if !Self::parked_source_swap_poll_owner_matches(
-            pending.parked_live_window_id,
-            self.native_video_parked_live_input_window_id,
-        ) {
+        let current_owner = self.projected_viewer_context_id();
+        if pending.owner_context_id != current_owner {
+            let pending_owner = pending.owner_context_id;
+            let declined_idx = pending.idx;
+            self.log_native_video_open_pending_declined(
+                "owner_mismatch",
+                format!(
+                    "idx={declined_idx} pending_owner={pending_owner:?} \
+                     projected_owner={current_owner:?}"
+                ),
+            );
             return;
         }
         let idx = pending.idx;
@@ -1098,18 +1143,30 @@ impl App {
         let requested_at = pending.requested_at;
         let deadline = pending.deadline;
         let input_seq = pending.input_seq;
-        let parked_live_window_id = pending.parked_live_window_id;
+        let owner_context_id = pending.owner_context_id;
+        let parked_live_window_id = self
+            .viewer_context_window(owner_context_id)
+            .filter(|window_id| self.detached_window_state_is_parked_live(*window_id));
 
-        if self.fullscreen_idx != Some(idx)
-            || !matches!(self.items.get(idx), Some(GridItem::Video(p)) if p == &path)
-            || self.fs_cache.contains_key(&idx)
-        {
+        let fullscreen_moved = self.fullscreen_idx != Some(idx);
+        let item_changed = !matches!(self.items.get(idx), Some(GridItem::Video(p)) if p == &path);
+        let already_cached = self.fs_cache.contains_key(&idx);
+        if fullscreen_moved || item_changed || already_cached {
+            // 破棄そのものは正常な経路 (別の項目へ移った / 既に開けた) だが、**どれが効いたのか**を
+            // 残さないと「黒いウィンドウのまま何も起きない」を後から説明できない。
+            crate::logger::log(format!(
+                "[native-video] drop deferred regular open: idx={idx} \
+                 fullscreen_moved={fullscreen_moved} item_changed={item_changed} \
+                 already_cached={already_cached} fullscreen_idx={:?} items_len={}",
+                self.fullscreen_idx,
+                self.items.len()
+            ));
             self.native_video_open_pending = None;
             return;
         }
 
         let now = std::time::Instant::now();
-        if wait_for_detached_host && !self.detached_viewer_video_host_ready() {
+        if wait_for_detached_host && !detached_host_ready(self) {
             if now >= deadline {
                 self.native_video_open_pending = None;
                 crate::logger::log(format!(
@@ -1130,6 +1187,13 @@ impl App {
                 self.close_fullscreen();
                 ctx.request_repaint();
             } else {
+                self.log_native_video_open_pending_declined(
+                    "host_not_ready",
+                    format!(
+                        "idx={idx} remaining_ms={:.1}",
+                        deadline.saturating_duration_since(now).as_secs_f64() * 1000.0
+                    ),
+                );
                 ctx.request_repaint_after(
                     deadline
                         .saturating_duration_since(now)
@@ -1140,8 +1204,7 @@ impl App {
         }
 
         let max_live_video_decode_threads = crate::video::decoder::MAX_LIVE_VIDEO_DECODE_THREADS;
-        let live_decoders = crate::video::decoder::LIVE_VIDEO_DECODE_THREADS
-            .load(std::sync::atomic::Ordering::Acquire);
+        let live_decoders = live_decoder_count();
         if live_decoders < max_live_video_decode_threads {
             self.native_video_open_pending = None;
             self.fs_open_intent_from_grid = from_grid;
@@ -1170,7 +1233,7 @@ impl App {
                     ],
                 );
             }
-            self.start_fs_load(idx);
+            resume_open(self, idx);
             ctx.request_repaint();
             return;
         }
@@ -1586,7 +1649,7 @@ impl App {
             self.cleanup_normalize_state_for_fs_idx(from_idx);
             self.fs_cache.remove(&from_idx);
         }
-        self.native_video_open_pending = None;
+        self.clear_native_video_open_pending("source_swap_defer");
         if self.fullscreen_idx != Some(target_idx) {
             self.reset_fs_side_panel_runtime_for_file_change();
         }
@@ -1780,7 +1843,7 @@ impl App {
             .is_some_and(|pending| {
                 pending.parked_live_window_id == self.native_video_parked_live_input_window_id
                     && (self.native_video_parked_live_input_window_id.is_some()
-                        || !self.active_detached_viewer_context_contains_video())
+                        || !self.other_active_viewer_context_contains_video())
             })
     }
 
@@ -1805,7 +1868,9 @@ impl App {
         }
     }
 
-    /// App-global pending の mounted/active と ParkedLive の ownership 遷移。
+    /// Window-scoped legacy pending の mounted/active と ParkedLive の ownership 遷移。
+    /// Regular-open pending は ViewerContextId を owner に持つため、この window rebinding の
+    /// 対象ではない。
     #[cfg(windows)]
     pub(crate) fn rebind_native_video_pending_owners(
         &mut self,
@@ -1814,13 +1879,6 @@ impl App {
         _reason: &'static str,
     ) {
         if let Some(pending) = self.native_video_source_swap_pending.as_mut() {
-            pending.parked_live_window_id = Self::pending_owner_after_context_transition(
-                pending.parked_live_window_id,
-                from_owner,
-                to_owner,
-            );
-        }
-        if let Some(pending) = self.native_video_open_pending.as_mut() {
             pending.parked_live_window_id = Self::pending_owner_after_context_transition(
                 pending.parked_live_window_id,
                 from_owner,
@@ -1847,6 +1905,21 @@ impl App {
                 from_owner,
                 to_owner,
             );
+        }
+    }
+
+    /// Transfer only the regular-open request whose viewer payload moved to a newly forked
+    /// context. Mount, park, and activation do not alter this identity.
+    #[cfg(windows)]
+    pub(crate) fn transfer_native_video_open_pending_context(
+        &mut self,
+        from: ViewerContextId,
+        to: ViewerContextId,
+    ) {
+        if let Some(pending) = self.native_video_open_pending.as_mut()
+            && pending.owner_context_id == from
+        {
+            pending.owner_context_id = to;
         }
     }
 
@@ -1896,12 +1969,15 @@ impl App {
         reason: &'static str,
     ) -> bool {
         let mut discarded = self.discard_parked_source_swap_pending_for_window(window_id, reason);
+        let open_owner = self
+            .locate_window_context(window_id)
+            .map(|(context_id, _)| context_id);
         if self
             .native_video_open_pending
             .as_ref()
-            .is_some_and(|pending| pending.parked_live_window_id == Some(window_id))
+            .is_some_and(|pending| open_owner == Some(pending.owner_context_id))
         {
-            self.native_video_open_pending = None;
+            self.clear_native_video_open_pending("parked_window_discard");
             discarded = true;
         }
         let discarded_fast = self
@@ -1931,9 +2007,17 @@ impl App {
     /// close_fullscreen が現在 mount 中の context に属する pending だけを破棄する。
     #[cfg(windows)]
     pub(crate) fn clear_mounted_native_video_pending(&mut self) {
+        let projected = self.projected_viewer_context_id();
+        if self
+            .native_video_open_pending
+            .as_ref()
+            .is_some_and(|pending| pending.owner_context_id == projected)
+        {
+            self.clear_native_video_open_pending("close_fullscreen_mounted");
+        }
         // promoted active context は owner=None だが、main close 中は bundle が unmounted。
         // media 窓自身の close は active context を take + mount してからここへ来るため false。
-        if self.active_detached_viewer_context_contains_video() {
+        if self.other_active_viewer_context_contains_video() {
             return;
         }
         if self
@@ -1943,13 +2027,6 @@ impl App {
             && let Some(pending) = self.native_video_source_swap_pending.take()
         {
             pending.native_output.set_navigation_preview(None);
-        }
-        if self
-            .native_video_open_pending
-            .as_ref()
-            .is_some_and(|pending| pending.parked_live_window_id.is_none())
-        {
-            self.native_video_open_pending = None;
         }
         if self
             .native_video_fast_swap_pending
@@ -4891,9 +4968,12 @@ impl App {
     ///
     /// 手動 seek (シークバー/J/K/←/→/タイル) は serial 変化で検出して baseline 更新のみに
     /// 切り替え、誤爆 seek を防ぐ (Codex P1 第2ラウンド)。
-    pub(crate) fn tick_native_video_loop_boundary(&mut self, fs_idx: usize) {
+    pub(crate) fn tick_native_video_loop_boundary(
+        &mut self,
+        fs_idx: usize,
+    ) -> Option<std::time::Duration> {
         if self.video_continuous_mode.is_enabled() {
-            return;
+            return None;
         }
         let display_mode = self.settings.video_loop_mode;
         // 早期 return: HUD 表示は CH/BM でも、effective が Off/Full なら何もしない
@@ -4902,14 +4982,14 @@ impl App {
             display_mode,
             crate::settings::VideoLoopMode::Off | crate::settings::VideoLoopMode::Full
         ) {
-            return;
+            return None;
         }
         // Phase 1: player + cache から必要データを snapshot。再生中でなければ何もしない。
         // 一時停止 / scrub 中は baseline だけ最新位置に更新 (Codex P2 第7ラウンド —
         // 一時停止中に境界手前へ scrub すると即ループ開始点へ戻されるのを防ぐ)。
-        let (cur, serial, chapters_owned, is_playing) = {
+        let (cur, serial, chapters_owned, is_playing, speed) = {
             let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
-                return;
+                return None;
             };
             let chapters = player
                 .info()
@@ -4920,11 +5000,12 @@ impl App {
                 player.current_seek_serial(),
                 chapters,
                 player.is_playing(),
+                player.playback_speed(),
             )
         };
         if !is_playing {
             self.last_loop_pos.insert(fs_idx, (cur, serial));
-            return;
+            return None;
         }
 
         // bookmarks は cache 直読み (DB fallback しない)
@@ -4934,7 +5015,7 @@ impl App {
             .filter(|c| c.fs_idx == fs_idx)
         {
             Some(c) => c.bookmarks.clone(),
-            None => return,
+            None => return None,
         };
 
         let chapter_starts = crate::video::decoder::boundary_starts_from_chapters(&chapters_owned);
@@ -4946,7 +5027,7 @@ impl App {
             eff,
             crate::settings::VideoLoopMode::Chapter | crate::settings::VideoLoopMode::Bookmark
         ) {
-            return;
+            return None;
         }
         let starts = match eff {
             crate::settings::VideoLoopMode::Chapter => chapter_starts,
@@ -4954,7 +5035,7 @@ impl App {
             _ => unreachable!(),
         };
         if starts.is_empty() {
-            return;
+            return None;
         }
 
         let (prev_pos, prev_serial) = self
@@ -4968,7 +5049,7 @@ impl App {
         let next_boundary = crate::settings::first_boundary_after(&starts, prev_start);
 
         const LOOP_BOUNDARY_TOL: f64 = 0.020;
-        match crate::settings::decide_boundary_action(
+        let schedule_from = match crate::settings::decide_boundary_action(
             prev_pos,
             prev_serial,
             cur,
@@ -4984,6 +5065,7 @@ impl App {
                     player.set_loop_target_secs(new_target);
                 }
                 self.last_loop_pos.insert(fs_idx, (cur, serial));
+                cur
             }
             crate::settings::BoundaryDecision::Loop { seek_to } => {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
@@ -4994,6 +5076,7 @@ impl App {
                 // seek 後 baseline は seek_to に。次 tick で serial 変化を検出すれば baseline
                 // が再更新される。
                 self.last_loop_pos.insert(fs_idx, (seek_to, serial));
+                seek_to
             }
             crate::settings::BoundaryDecision::Continue => {
                 // 現区間の開始秒 (= prev_start) で loop_target を維持する。
@@ -5003,8 +5086,12 @@ impl App {
                     player.set_loop_target_secs(prev_start);
                 }
                 self.last_loop_pos.insert(fs_idx, (cur, serial));
+                cur
             }
-        }
+        };
+        let schedule_start = crate::settings::start_at(&starts, schedule_from).unwrap_or(0.0);
+        crate::settings::first_boundary_after(&starts, schedule_start)
+            .and_then(|boundary| playback_position_deadline(schedule_from, boundary, speed))
     }
 
     /// 音量ノーマライズ ボタン左クリック (3 状態モデル: Off → ON 化 / OnApplied → OFF 化 /
@@ -5313,10 +5400,14 @@ impl App {
     #[cfg(windows)]
     fn start_normalize_scan_inner(&mut self, fs_idx: usize, was_playing_override: Option<bool>) {
         use crate::video::normalize_types::NormalizeUiState;
-        let (path, was_playing) = match self.fs_cache.get(&fs_idx) {
+        let (path, was_playing, ui_wake) = match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) => {
                 let was_playing = was_playing_override.unwrap_or_else(|| player.intent_playing());
-                (player.path().to_path_buf(), was_playing)
+                (
+                    player.path().to_path_buf(),
+                    was_playing,
+                    player.ui_wake_handle(),
+                )
             }
             _ => return,
         };
@@ -5349,14 +5440,18 @@ impl App {
         let cancel_clone = cancel.clone();
         let progress_clone = progress.clone();
         let path_clone = path.clone();
+        let provisional_ui_wake = Arc::clone(&ui_wake);
         let join = std::thread::Builder::new()
             .name("normalize-scan".to_string())
             .spawn(move || {
                 let tx_provisional = tx.clone();
                 let mut send_provisional =
                     move |result: crate::video::normalize_types::NormalizeResult| {
-                        let _ = tx_provisional
-                            .send(crate::app::normalize::NormalizeMessage::Provisional(result));
+                        send_normalize_message_with_wake(
+                            &tx_provisional,
+                            &provisional_ui_wake,
+                            crate::app::normalize::NormalizeMessage::Provisional(result),
+                        );
                     };
                 let result = crate::video::normalize_scanner::scan_audio_loudness_with_provisional(
                     &path_clone,
@@ -5366,7 +5461,11 @@ impl App {
                     crate::video::normalize_scanner::PROVISIONAL_SCAN_AFTER_SECS,
                     &mut send_provisional,
                 );
-                let _ = tx.send(crate::app::normalize::NormalizeMessage::from(result));
+                send_normalize_message_with_wake(
+                    &tx,
+                    &ui_wake,
+                    crate::app::normalize::NormalizeMessage::from(result),
+                );
             });
         let join = match join {
             Ok(j) => j,
@@ -8871,22 +8970,20 @@ impl App {
                     .keymap
                     .matches_vk_action(KeyAction::ToggleDetachedViewerMode, &key) =>
             {
-                // placement 切替 (Plan B) で presenter を作り直すと、既に離された F12 の
-                // KeyDown が数百 ms 遅れて再配送され、直前のトグルを打ち消す
-                // (detached→main→detached、= main への一瞬フラッシュ + 再分離)。`repeat` は
-                // stale でも false なので信用せず、OS に「今まだ F12 が押されているか」を
-                // 問い合わせて、離された後の stale 再配送を弾く。実押下は KeyDown 到着時点で
-                // まだ物理的に down なので通る (Codex 助言)。
-                if !native_video_key_physically_down(&key) {
-                    crate::logger::log(format!(
-                        "[native-video] ignore stale native F12 toggle: os_down=false \
-                         presentation={:?} (rebuild re-delivery of a released key)",
-                        self.viewer_presentation
-                    ));
-                    return NativeVideoKeyOutcome::Blocked(
-                        NativeVideoKeyBlockReason::StaleDetachedToggle,
-                    );
-                }
+                // ここへ来る `repeat=false` は、**現 HWND・現 epoch が生成した
+                // first-key-down** である。stale 判定を App 側でやり直さないこと:
+                //
+                // - 旧 presenter 由来の event は、host ごとに epoch を焼き付けた envelope を
+                //   `window_event_belongs_to_generation` が落とす (src/video/mod.rs)。
+                // - 押しっぱなしで新 HWND に届く auto-repeat は `WM_KEYDOWN` の
+                //   previous-key-state (lParam bit 30) が立つので、上の `!key.repeat` が落とす。
+                // - 切替中に届いた押下は `switch_native_video_viewer_presentation` の
+                //   pending guard が落とす。
+                //
+                // 以前はここで `GetAsyncKeyState` に「今まだ押されているか」を聞いていた。
+                // 処理時点の押下レベルは、既に配送された離散 event の識別子にならない ——
+                // 早押しは stale 再配送と同じく false になり、**本物の連打が捨てられていた**
+                // (backlog §1.124)。
                 self.toggle_detached_viewer_mode();
                 hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::ToggleDetachedViewerMode)
@@ -9508,17 +9605,8 @@ impl App {
 
     #[cfg(windows)]
     fn apply_native_video_rating_key(&mut self, fs_idx: usize, stars: u8) {
-        let before = self.rating_cache.get(&fs_idx).copied().unwrap_or(0);
         if !self.set_rating(fs_idx, stars) {
             return;
-        }
-        if before != stars {
-            let summary = if stars == 0 {
-                "★解除".to_string()
-            } else {
-                format!("★{stars}")
-            };
-            self.capture_rating_undo(vec![(fs_idx, before, stars)], summary);
         }
         self.rebuild_visible_indices();
         if stars == 0 {
@@ -10783,6 +10871,19 @@ impl App {
                 self.show_native_video_boundary_toast(ctx, at_end);
                 return;
             }
+            // 分割中の移動。ここに来るのは動画 / 音声を表示しているときで、動画は
+            // 分割されないので同じページ内の左右移動にはならない。念のため塞ぐ。
+            crate::ui_fullscreen::FsPageNav::Split(step) if step.source_idx == fs_idx => return,
+            crate::ui_fullscreen::FsPageNav::Split(step) => {
+                // 左右は着地側が決めるので、ここでは元ページまでの距離だけ見る。
+                crate::ui_fullscreen::navigable_delta_between(
+                    &self.items,
+                    &display_order,
+                    fs_idx,
+                    step.source_idx,
+                )
+                .unwrap_or(base_delta)
+            }
         };
         self.start_manual_media_navigation(
             ctx,
@@ -11822,10 +11923,6 @@ mod native_video_key_observation_tests {
             (
                 NativeVideoKeyOutcome::Blocked(NativeVideoKeyBlockReason::NormalizeModal),
                 "blocked:normalize_modal",
-            ),
-            (
-                NativeVideoKeyOutcome::Blocked(NativeVideoKeyBlockReason::StaleDetachedToggle),
-                "blocked:stale_detached_toggle",
             ),
             (
                 NativeVideoKeyOutcome::Action(KeyAction::VideoPin),

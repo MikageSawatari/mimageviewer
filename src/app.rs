@@ -128,6 +128,12 @@ pub(crate) use subfolder_expansion::{
     SUBFOLDER_EXPANSION_FILTER_KINDS, SubfolderExpansionDepthChoice, SubfolderExpansionScanFilter,
 };
 pub(crate) mod top_level_grid_view;
+mod viewer_context_registry;
+#[cfg(windows)]
+pub(crate) use viewer_context_registry::ContextResidence;
+pub(crate) use viewer_context_registry::ViewerContextId;
+#[cfg(windows)]
+use viewer_context_registry::{BuildOutcome, ContextRef, RetireError, ViewerContextRegistry};
 #[cfg(windows)]
 mod viewer_session;
 mod vram_accounting;
@@ -430,7 +436,6 @@ pub(crate) struct DetachedImageWindowSnapshot {
     pub(crate) activation_armed: bool,
     pub(crate) focused_last_frame: bool,
     pub(crate) initial_placement_applied: bool,
-    paused_bundle: Option<Box<ViewerContextBundle>>,
 }
 
 #[derive(Clone)]
@@ -688,46 +693,14 @@ impl Clone for DetachedImageWindowSnapshot {
             activation_armed: self.activation_armed,
             focused_last_frame: self.focused_last_frame,
             initial_placement_applied: self.initial_placement_applied,
-            paused_bundle: None,
         }
     }
 }
 
 #[cfg(windows)]
 impl DetachedImageWindowSnapshot {
-    pub(crate) fn can_activate(&self) -> bool {
-        self.reopen_descriptor.is_some()
-            || self.reopen_sync_stamp.is_some()
-            || self.paused_bundle.is_some()
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn has_paused_bundle(&self) -> bool {
-        self.paused_bundle.is_some()
-    }
-
-    pub(crate) fn right_drag_context(&self) -> crate::ring_shortcut::RightDragContext {
-        self.paused_bundle
-            .as_deref()
-            .and_then(|bundle| bundle.fullscreen_idx.and_then(|idx| bundle.items.get(idx)))
-            .map(|item| match item {
-                GridItem::Video(_) | GridItem::Audio(_) => {
-                    crate::ring_shortcut::RightDragContext::VideoFullscreen
-                }
-                _ => crate::ring_shortcut::RightDragContext::ImageFullscreen,
-            })
-            .unwrap_or(crate::ring_shortcut::RightDragContext::ImageFullscreen)
-    }
-
-    pub(crate) fn right_drag_viewer_identity(&self) -> Option<DetachedRightDragViewerIdentity> {
-        self.paused_bundle
-            .as_deref()
-            .map(|bundle| DetachedRightDragViewerIdentity::ItemsGeneration(bundle.items_generation))
-            .or_else(|| {
-                self.reopen_sync_stamp
-                    .clone()
-                    .map(DetachedRightDragViewerIdentity::ReopenSyncStamp)
-            })
+    fn has_reopen_identity(&self) -> bool {
+        self.reopen_descriptor.is_some() || self.reopen_sync_stamp.is_some()
     }
 }
 
@@ -1059,6 +1032,7 @@ impl App {
     #[cfg(windows)]
     fn adopt_unclaimed_detached_window_hwnd_after_show(
         &mut self,
+        ctx: &egui::Context,
         window_id: u64,
         label: &'static str,
         viewport_id: egui::ViewportId,
@@ -1084,7 +1058,11 @@ impl App {
                     self.frame_counter,
                     Self::win32_hwnd_debug_state(hwnd)
                 ));
+                let wake_video_resync = self.pending_detached_video_host_resync;
                 self.try_resync_detached_video_host_after_registration(window_id);
+                if wake_video_resync {
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
                 true
             }
             DetachedWindowHwndDiff::NoChange => {
@@ -1138,20 +1116,19 @@ impl App {
         // rare overnight/tray-restore failure survives until the next report without per-frame
         // noise. Resuming/Closing are valid handoff states even while the snapshot is still
         // present for part of the transition.
-        let passive_media_owner = self
-            .detached_image_windows
-            .iter()
-            .find(|window| window.id == window_id)
-            .and_then(|window| window.paused_bundle.as_deref())
-            .filter(|bundle| Self::viewer_context_bundle_contains_video(bundle))
-            .map(|bundle| {
-                let video_cache_entries = bundle
-                    .fs_cache
-                    .values()
-                    .filter(|entry| matches!(entry, FsCacheEntry::Video { .. }))
-                    .count();
-                (bundle.fullscreen_idx, video_cache_entries)
-            });
+        let passive_media_owner = self.locate_window_context(window_id).and_then(|(id, _)| {
+            self.with_viewer_context_ref(id, |context| {
+                Self::viewer_context_contains_video(context).then(|| {
+                    let video_cache_entries = context
+                        .fs_cache()
+                        .values()
+                        .filter(|entry| matches!(entry, FsCacheEntry::Video { .. }))
+                        .count();
+                    (context.fullscreen_idx(), video_cache_entries)
+                })
+            })
+            .flatten()
+        });
         let previous_state = self.detached_window_state(window_id);
         let default_linked = self.detached_window_runtime_default_linked();
         let transition =
@@ -1199,6 +1176,45 @@ impl App {
     pub(crate) fn active_detached_window_id(&self) -> Option<u64> {
         self.active_detached_session
             .map(|session| session.window_id)
+    }
+
+    #[cfg(windows)]
+    fn active_viewer_context_id(&self) -> Option<ViewerContextId> {
+        if let Some(window_id) = self.active_detached_window_id() {
+            return self.locate_window_context(window_id).map(|(id, _)| id);
+        }
+
+        // Terminal close clears the keep-alive session before the final context frame retires
+        // its bundle. The binding remains authoritative during that short, explicit lifecycle
+        // state. A passive snapshot with the same id means the window has already been handed
+        // off and therefore is not the active context.
+        let window_id = self
+            .detached_viewer_window_id
+            .or(self.last_active_detached_window_id)?;
+        if self
+            .detached_image_windows
+            .iter()
+            .any(|snapshot| snapshot.id == window_id)
+        {
+            return None;
+        }
+        self.locate_window_context(window_id).map(|(id, _)| id)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_window_context_is_at_rest(&self, window_id: u64) -> bool {
+        self.locate_window_context(window_id)
+            .is_some_and(|(_, residence)| residence == ContextResidence::AtRest)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detached_window_can_activate(&self, window_id: u64) -> bool {
+        self.detached_image_windows
+            .iter()
+            .find(|window| window.id == window_id)
+            .is_some_and(|window| {
+                window.has_reopen_identity() || self.locate_window_context(window_id).is_some()
+            })
     }
 
     pub(crate) fn active_detached_window_state(&self) -> Option<DetachedWindowState> {
@@ -1257,16 +1273,46 @@ impl App {
             .detached_image_windows
             .iter()
             .find(|window| window.id == window_id)?;
-        if self.native_video_parked_live_input_window_id == Some(window_id) {
-            // ParkedLive polling sets this owner only after swapping its bundle onto App and
-            // restores it before swapping back. During that span paused_bundle is legitimately
-            // None, and the mounted App generation is this window's identity.
-            Some(DetachedRightDragViewerIdentity::ItemsGeneration(
-                self.items_generation,
-            ))
-        } else {
-            window.right_drag_viewer_identity()
-        }
+        self.locate_window_context(window_id)
+            .and_then(|(id, residence)| match residence {
+                ContextResidence::Mounted | ContextResidence::AtRest => self
+                    .with_viewer_context_ref(id, |context| {
+                        DetachedRightDragViewerIdentity::ItemsGeneration(context.items_generation())
+                    }),
+                ContextResidence::Building
+                | ContextResidence::Retiring
+                | ContextResidence::Retired
+                | ContextResidence::Unknown => None,
+            })
+            .or_else(|| {
+                window
+                    .reopen_sync_stamp
+                    .clone()
+                    .map(DetachedRightDragViewerIdentity::ReopenSyncStamp)
+            })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn right_drag_context_for_window_id(
+        &self,
+        window_id: u64,
+    ) -> crate::ring_shortcut::RightDragContext {
+        self.locate_window_context(window_id)
+            .and_then(|(id, _)| {
+                self.with_viewer_context_ref(id, |context| {
+                    context
+                        .fullscreen_idx()
+                        .and_then(|idx| context.items().get(idx))
+                        .map(|item| match item {
+                            GridItem::Video(_) | GridItem::Audio(_) => {
+                                crate::ring_shortcut::RightDragContext::VideoFullscreen
+                            }
+                            _ => crate::ring_shortcut::RightDragContext::ImageFullscreen,
+                        })
+                })
+                .flatten()
+            })
+            .unwrap_or(crate::ring_shortcut::RightDragContext::ImageFullscreen)
     }
 
     #[cfg(windows)]
@@ -1786,16 +1832,22 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn repair_detached_window_hwnd_from_watcher(&mut self, window_id: u64, hwnd: u64) -> bool {
+    fn repair_detached_window_hwnd_from_watcher(
+        &mut self,
+        ctx: &egui::Context,
+        window_id: u64,
+        hwnd: u64,
+    ) -> bool {
         if !self.detached_hwnd_is_unclaimed_egui_viewport_for_window(window_id, hwnd) {
             return false;
         }
-        self.repair_detached_window_hwnd_from_watcher_unchecked(window_id, hwnd)
+        self.repair_detached_window_hwnd_from_watcher_unchecked(ctx, window_id, hwnd)
     }
 
     #[cfg(windows)]
     fn repair_detached_window_hwnd_from_watcher_unchecked(
         &mut self,
+        ctx: &egui::Context,
         window_id: u64,
         hwnd: u64,
     ) -> bool {
@@ -1814,13 +1866,18 @@ impl App {
                 .unwrap_or_else(|| "none".to_string()),
             Self::win32_hwnd_debug_state(hwnd)
         ));
+        let wake_video_resync = self.pending_detached_video_host_resync;
         self.try_resync_detached_video_host_after_registration(window_id);
+        if wake_video_resync {
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+        }
         true
     }
 
     #[cfg(all(windows, test))]
     fn repair_detached_window_hwnd_from_watcher_with_snapshot(
         &mut self,
+        ctx: &egui::Context,
         window_id: u64,
         hwnd: u64,
         windows: &[crate::dwm_transitions::ThreadWindowSnapshotEntry],
@@ -1830,14 +1887,14 @@ impl App {
         ) {
             return false;
         }
-        self.repair_detached_window_hwnd_from_watcher_unchecked(window_id, hwnd)
+        self.repair_detached_window_hwnd_from_watcher_unchecked(ctx, window_id, hwnd)
     }
 
     #[cfg(windows)]
     fn deferred_detached_activation_watch_targets(&self) -> Vec<DetachedActivationWatchTarget> {
         self.detached_image_windows
             .iter()
-            .filter(|window| window.can_activate())
+            .filter(|window| self.detached_window_can_activate(window.id))
             .filter_map(|window| {
                 let runtime = self.detached_window_manager.runtime(window.id)?;
                 if runtime.state != DetachedWindowState::Parked {
@@ -1949,7 +2006,7 @@ impl App {
         for request in self.detached_window_manager.drain_activation_requests() {
             let id = request.window_id;
             if let Some(repair_hwnd) = request.repair_hwnd
-                && !self.repair_detached_window_hwnd_from_watcher(id, repair_hwnd)
+                && !self.repair_detached_window_hwnd_from_watcher(ctx, id, repair_hwnd)
             {
                 let known_hwnd = self.detached_window_hwnd_raw_for_window_id(id);
                 let known_state = self.detached_window_state(id);
@@ -1969,7 +2026,7 @@ impl App {
             }
             let can_activate = self.detached_image_windows.iter().any(|window| {
                 window.id == id
-                    && window.can_activate()
+                    && self.detached_window_can_activate(window.id)
                     && self.detached_window_state(id) == Some(DetachedWindowState::Parked)
             });
             if can_activate {
@@ -2013,7 +2070,7 @@ impl App {
             "deferred_activate_commit frame={frame} id={id} before_active_dispatch=true \
              passive_windows={} active_context={}",
             self.detached_image_windows.len(),
-            self.active_detached_viewer_context_present()
+            self.active_detached_context_is_at_rest()
         ));
         if self.activate_detached_image_window_snapshot(ctx, id) {
             if let Some(command) = dispatch.command {
@@ -2048,7 +2105,7 @@ impl App {
                 "deferred_activate_commit_succeeded frame={frame} id={id} \
                  passive_windows={} active_context={} session={:?}",
                 self.detached_image_windows.len(),
-                self.active_detached_viewer_context_present(),
+                self.active_detached_context_is_at_rest(),
                 self.active_detached_session
             ));
             true
@@ -2058,14 +2115,14 @@ impl App {
                 "deferred_activate_commit_failed frame={frame} id={id} \
                  passive_windows={} active_context={}",
                 self.detached_image_windows.len(),
-                self.active_detached_viewer_context_present()
+                self.active_detached_context_is_at_rest()
             ));
             false
         }
     }
 
     /// Consume a passive right-drag command only while the owning viewer bundle is mounted.
-    /// `update_active_detached_viewer_context` is the sole caller and establishes that mount.
+    /// `update_active_viewer_context` is the sole caller and establishes that mount.
     #[cfg(windows)]
     fn execute_pending_right_drag_command_in_mounted_context(
         &mut self,
@@ -2254,11 +2311,6 @@ enum DetachedGridItemOpenPlan {
     Descriptor(ViewerContextDescriptor),
 }
 
-#[cfg(windows)]
-struct ActiveDetachedViewerContext {
-    bundle: ViewerContextBundle,
-}
-
 /// アクティブ detached viewer セッションの再オープン経路の種別 (将来拡張用)。
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2379,6 +2431,43 @@ impl BookmarkViewState {
     }
 }
 
+/// 終端 close された context から、閉じた後に必要な所有値だけを取り出したもの。
+#[cfg(windows)]
+struct ClosedBookmarkSummary {
+    /// `bundle.bookmark_view_state.as_ref().and_then(BookmarkViewState::target).cloned()`。
+    bookmark_target: Option<crate::bookmark_browser::BookmarkViewReturnTarget>,
+    /// `selected` が指す item が `Video` / `Audio` のときだけ `Some`。
+    selected_media_path: Option<PathBuf>,
+    /// `archive_source_override` を優先し、無ければ `current_folder`。
+    destination: Option<PathBuf>,
+    /// `pdf_password_request.is_some()`。
+    had_pdf_password_request: bool,
+}
+
+#[cfg(windows)]
+impl ClosedBookmarkSummary {
+    fn read(context: ContextRef<'_>) -> Self {
+        let selected_media_path = context.selected().and_then(|idx| {
+            context.items().get(idx).and_then(|item| match item {
+                GridItem::Video(path) | GridItem::Audio(path) => Some(path.clone()),
+                _ => None,
+            })
+        });
+        Self {
+            bookmark_target: context
+                .bookmark_view_state()
+                .and_then(BookmarkViewState::target)
+                .cloned(),
+            selected_media_path,
+            destination: context
+                .archive_source_override()
+                .or_else(|| context.current_folder())
+                .map(Path::to_path_buf),
+            had_pdf_password_request: context.pdf_password_request().is_some(),
+        }
+    }
+}
+
 /// このプロセスで path-keyed rating DB に適用した最新値。
 ///
 /// DB は main / detached / parked context で共有されるため、idx cache と違ってこの台帳は
@@ -2459,617 +2548,6 @@ struct FolderPinLookupTarget {
     path: PathBuf,
     /// `ZipDir` cellのliteral keyからDB保存先のeffective keyへのalias。
     alias: Option<(String, String)>,
-}
-
-#[cfg(windows)]
-struct ViewerContextBundle {
-    address: String,
-    current_folder: Option<PathBuf>,
-    navigation_scope: ViewerNavigationScope,
-    archive_source_override: Option<PathBuf>,
-    zip_nav: Option<crate::zip_tree::ZipNavState>,
-    stack_mode_requested: bool,
-    stack_view: Option<crate::filename_stack::StackView>,
-    stack_showing_flat: bool,
-    stack_active_rule: Option<String>,
-    stack_script_error: Option<String>,
-    stack_toggle_select_path: Option<PathBuf>,
-    items: Vec<GridItem>,
-    items_generation: u64,
-    visible_indices: Vec<usize>,
-    /// `items` と同じ添字の正規化済み basename と、その worker lifecycle。
-    /// query / tokens / debounce は App 全体で同じ絞り込み条件を使うため swap しないが、
-    /// 導出 cache は generation 空間を共有しない viewer context と一緒に所有する。
-    /// failed generation も別 context の同値 generation の build を抑止しないようここに含める。
-    facet_name_cache: Vec<Box<str>>,
-    facet_name_cache_generation: Option<u64>,
-    facet_name_cache_pending: Option<facet_name_filter::FacetNameCachePending>,
-    facet_name_cache_failed_generation: Option<u64>,
-    thumbnails: Vec<ThumbnailState>,
-    image_metas: Vec<Option<(i64, i64)>>,
-    video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
-    auto_aspect: crate::auto_aspect::AutoAspectState,
-    selected: Option<usize>,
-    grid_click_selection_anchor: Option<GridClickSelectionAnchor>,
-    scroll_offset_y: f32,
-    scroll_to_selected: bool,
-    pending_grid_scroll: Option<GridScrollIntent>,
-    requested: std::collections::HashMap<usize, bool>,
-    idle_upgrade_cache_bypass_ineligible: std::collections::HashSet<usize>,
-    keep_range: (usize, usize),
-    keep_set: std::collections::HashSet<usize>,
-    thumbnail_eviction_generation: Option<u64>,
-    details_thumb_suppression_applied: bool,
-    details_hover_thumb_idx: Option<usize>,
-    details_hover_thumb_viewport_open: bool,
-    texture_backlog: Vec<crate::thumb_loader::ThumbMsg>,
-    details_order: Vec<usize>,
-    details_order_revision: u64,
-    details_cell_content_revisions: DetailsCellContentRevisions,
-    details_tag_prewarm_indices: Vec<usize>,
-    details_lazy_meta: std::collections::HashMap<String, DetailsLazyMeta>,
-    details_meta_pending: Option<DetailsMetaPending>,
-    details_lazy_visible_revision: u64,
-    details_image_dims_state: LazyColumnState,
-    metadata_cache: std::collections::HashMap<String, Option<crate::png_metadata::AiMetadata>>,
-    exif_cache: std::collections::HashMap<String, Option<crate::exif_reader::ExifInfo>>,
-    xmp_cache: std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
-    xmp_panorama_info:
-        std::collections::HashMap<String, Option<crate::xmp_reader::XmpPanoramaInfo>>,
-    metadata_pending: Option<MetadataLoadPending>,
-    /// 一覧ごとの tags.db 表示キャッシュ。detached context の実フォルダ load が
-    /// main 一覧のタグを消さないよう、item 列と同じ ownership で交換する。
-    tags_cache: std::collections::HashMap<String, Vec<String>>,
-    tag_prewarm_pending: Option<crate::tag_prewarm::TagPrewarmPending>,
-    tag_prewarm_queued: std::collections::HashSet<usize>,
-    tag_legacy_seed_pending: Option<crate::tag_legacy_seed_worker::LegacySeedPending>,
-    pending_finalize: std::collections::HashSet<usize>,
-    // ── per-context ロード複合体 (review-v2.3.0 P2-8/P2-9) ──
-    // thumb channel (tx/rx)・cancel_token・ワーカーキュー 2 本は `start_loading_items` が
-    // ロードごとに作り直す「現用セット」で、コンテキストに属する。bundle に含めないと
-    // (a) detached book context の load_zip/pdf_as_folder が main の cancel_token を flip し、
-    //     main の動画サムネ抽出 (再リクエスト経路なし) を恒久停止させる (P2-9)、
-    // (b) channel/token が global なせいで bundle 済み bookkeeping (requested 等) が swap 後に
-    //     信用できず、swap のたびに clear → 毎フレーム再エンキュー → サムネ重複デコード
-    //     churn になる (P2-8)。
-    tx: mpsc::Sender<ThumbMsg>,
-    rx: mpsc::Receiver<ThumbMsg>,
-    cancel_token: Arc<AtomicBool>,
-    reload_queue: Option<Arc<NotifyQueue>>,
-    heavy_io_queue: Option<Arc<NotifyQueue>>,
-    // worker が out-of-keep skip / 優先度計算に読む共有 atomic も per-context にする。
-    // global のままだと (a) detached ロードの初期化 (0,0 store) が main の keep range を
-    // 一瞬潰して可視サムネの skip churn を起こし、(b) detached の queue 項目が以後
-    // main の keep range で gate され続ける (review-v2.3.0 hunt P3)。
-    scroll_hint: Arc<AtomicUsize>,
-    visible_end_shared: Arc<AtomicUsize>,
-    keep_start_shared: Arc<AtomicUsize>,
-    keep_end_shared: Arc<AtomicUsize>,
-    last_vis_range: (usize, usize),
-    vis_settle_at: Option<std::time::Instant>,
-    vis_first_logged: bool,
-    vis_all_logged: bool,
-    folder_nav_pending: Option<FolderNavPending>,
-    folder_pane_open_pending: Option<FolderPaneOpenPending>,
-    pending_folder_nav_steps: i32,
-    pending_folder_nav_mode: FolderNavMode,
-    search_filter: Option<std::collections::HashSet<usize>>,
-    search_filter_origin_folder: Option<PathBuf>,
-    checked: std::collections::HashSet<usize>,
-    rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
-    page_dims_cache: crate::page_dims::PageDimsCache,
-    rating_cache: std::collections::HashMap<usize, u8>,
-    /// App-global な path rating 更新をこの context の idx cache へ反映済みの世代。
-    rating_session_write_seen_generation: u64,
-    metadata_import_refresh_index: Option<MetadataImportRefreshIndex>,
-    current_folder_rating_cache: Option<u8>,
-    current_folder_last_mtime: Option<std::time::SystemTime>,
-    current_folder_signature: Option<u64>,
-    folder_pin_map: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
-    converted_archive_cache_paths: std::collections::HashMap<String, ConvertedArchiveSourceState>,
-    converted_archive_pin_root_states:
-        std::collections::HashMap<String, ConvertedArchivePinRootState>,
-    converted_archive_cache_paths_pending: Option<ConvertedArchiveCachePathsPending>,
-    current_color_cache_map: Option<
-        Arc<std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>>,
-    >,
-    current_color_catalog: Option<Arc<crate::catalog::CatalogDb>>,
-    /// VST3 startup load 完了まで start_fs_load を保留している、この context の media idx。
-    vst3_deferred_media_open: Option<usize>,
-    fullscreen_idx: Option<usize>,
-    viewer_session: ViewerSession,
-    native_video_in_window_active: bool,
-    video_audio_mode: Option<usize>,
-    video_audio_vst: Option<VideoAudioVstState>,
-    video_audio_mode_entry_target: Option<(
-        crate::video::NativeVideoPlacement,
-        windows::Win32::Foundation::RECT,
-        u64,
-    )>,
-    video_audio_exit_pending: Option<VideoAudioExitPending>,
-    panorama_state: Option<crate::panorama::PanoramaState>,
-    pano_toast_shown_for_current_fs: bool,
-    analysis_mode: bool,
-    analysis_hover_color: Option<[u8; 4]>,
-    analysis_pinned_color: Option<[u8; 4]>,
-    analysis_grayscale: bool,
-    analysis_mosaic_grid: bool,
-    analysis_filter_mag: u8,
-    analysis_guide_drag: Option<(egui::Pos2, egui::Pos2, u8)>,
-    view_trim_mode: bool,
-    view_trim_apply_mode: crate::view_trim::ViewTrimApplyMode,
-    view_trim_page_apply_root_idx: Option<usize>,
-    view_trim_page_spread_separate: bool,
-    view_trim_book_settings: crate::view_trim::ViewTrimBookSettings,
-    view_trim_page_overrides:
-        std::collections::HashMap<usize, crate::view_trim::ViewTrimPageOverride>,
-    view_trim_dirty_page_overrides: std::collections::HashSet<usize>,
-    view_trim_save_pending: bool,
-    fs_cache: ItemsGenerationMap<FsCacheEntry>,
-    fs_lanczos_cache: crate::gpu_lanczos::GpuLanczosCache,
-    fs_margin_bbox_cache: std::collections::HashMap<usize, (u64, usize, Option<egui::Rect>)>,
-    input_generation: std::collections::HashMap<usize, u64>,
-    fs_pending: ItemsGenerationMap<FsPendingValue>,
-    fullscreen_pdf_promotion: FullscreenPdfPromotionState,
-    /// この viewer context の実描画先から得た PDF 初回レンダターゲット。
-    fs_pdf_display_target: Option<crate::pdf_loader::PdfDisplayTarget>,
-    fs_early_dims: ItemsGenerationMap<[usize; 2]>,
-    fs_upload_backlog: FsUploadBacklog,
-    top_level_grid_view: top_level_grid_view::TopLevelGridView,
-    items_are_global_search_view: bool,
-    items_are_tag_view: bool,
-    items_are_reading_history_view: bool,
-    items_are_bookmark_view: bool,
-    items_are_rating_view: bool,
-    items_are_subfolder_expansion_view: bool,
-    items_are_smart_folder_view: bool,
-    items_are_drive_list: bool,
-    reading_history_return_from: Option<PathBuf>,
-    bookmark_view_state: Option<BookmarkViewState>,
-    bookmark_open_pending: Option<crate::bookmark_browser::PendingBookmarkOpen>,
-    fs_open_intent_from_grid: bool,
-    pending_detached_video_host_switch: Option<DetachedVideoHostSwitchPending>,
-    fs_zoom: f32,
-    fs_pan: egui::Vec2,
-    fs_zoom_active: bool,
-    fs_zoom_aiming: bool,
-    fs_zoom_factor: f32,
-    fs_zoom_pdf_rerender_idx: Option<usize>,
-    fs_zoom_pdf_rerender_zoom: f32,
-    fs_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
-    fs_vertical_scroll: f32,
-    fs_seek_drag_active: bool,
-    fs_seek_overlay_visible: bool,
-    fs_vertical_cache_keep_set: std::collections::HashSet<usize>,
-    continuous_page_transitions: std::collections::HashMap<usize, ContinuousPageTransition>,
-    fs_free_rotation: f32,
-    fs_rotation_drag_start: Option<(egui::Pos2, f32)>,
-    analysis_zoom: f32,
-    analysis_pan: egui::Vec2,
-    analysis_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
-    analysis_overlay_cache: Option<(
-        egui::TextureHandle,
-        u8,
-        Option<[u8; 4]>,
-        f32,
-        egui::Vec2,
-        usize,
-    )>,
-    analysis_hist_cache: Option<(f32, egui::Vec2, usize, [u32; 360], [u32; 256], [u32; 256])>,
-    analysis_sv_cache: Option<(f32, egui::Vec2, usize, egui::TextureHandle)>,
-    spread_mode: crate::settings::SpreadMode,
-    spread_shift_anchor_idx: Option<usize>,
-    reading_flow: crate::settings::ReadingFlow,
-    reading_direction: crate::settings::ReadingDirection,
-    slideshow_playing: bool,
-    slideshow_next_at: std::time::Instant,
-    slideshow_anchor_idx: Option<usize>,
-    continuous_reading_scroll_transition: Option<ContinuousReadingScrollTransition>,
-    slideshow_scroll_range_cache: Option<(usize, f32, f32)>,
-    pdf_password_request: Option<PdfPasswordRequest>,
-    pdf_current_password: Option<String>,
-    pdf_password_pending_save: Option<(PathBuf, String)>,
-    pdf_enumerate_pending: Option<(
-        PathBuf,
-        Option<String>,
-        crate::pdf_loader::PdfEnumerateHandle,
-    )>,
-    zip_enumerate_pending: Option<ZipEnumeratePending>,
-    fs_nav_after_pdf_enumerate: Option<DeferredFsReopen>,
-    pending_auto_fs_open: bool,
-    pending_return_to_parent: bool,
-    pdf_placeholder_count: Option<u32>,
-    cached_nav_indices: Option<Vec<usize>>,
-    cached_fs_seek_info: Option<(usize, crate::ui_fullscreen::FsSeekInfo)>,
-    fs_nav_locked_gen: Option<u64>,
-    fs_nav_dropped_block_signature: Option<String>,
-    fs_nav_dropped_block_count: u32,
-    fs_load_skip_signature: Option<String>,
-    fs_holdover_tex: Option<FsHoldover>,
-    fs_boundary_hint: Option<crate::ui_fullscreen::FsBoundaryHint>,
-    virtual_folder_writeback: Option<VirtualFolderWriteback>,
-    pdf_prefetch_grace_until: Option<std::time::Instant>,
-    thumb_pixels: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
-    thumb_edit_preview_layers: std::collections::HashMap<
-        usize,
-        std::sync::Arc<Vec<crate::edit_preview_cache::CachedAnnotationLayer>>,
-    >,
-    thumb_edit_preview_keys: std::collections::HashMap<usize, String>,
-    thumb_adjust_tex: std::collections::HashMap<usize, egui::TextureHandle>,
-    passthrough_rendition_cache: PassthroughRenditionCache,
-    adjustment_page_params: std::collections::HashMap<usize, crate::adjustment::AdjustParams>,
-    local_adjust_page_layers:
-        std::collections::HashMap<usize, Vec<local_adjust_core::LocalAdjustmentLayer>>,
-    local_adjust_pages: std::collections::HashSet<usize>,
-    local_adjust_selected_layers: std::collections::HashMap<usize, usize>,
-    local_adjust_generation: std::collections::HashMap<usize, u64>,
-    local_adjust_cache: std::collections::HashMap<LocalAdjustResultKey, LocalAdjustCacheEntry>,
-    local_adjust_pending: std::collections::HashMap<usize, LocalAdjustRenderPending>,
-    export_crop_page_settings: std::collections::HashMap<usize, crate::export_crop::CropSettings>,
-    export_crop_pages: std::collections::HashSet<usize>,
-    mask_pages: std::collections::HashSet<usize>,
-    comic_pages: std::collections::HashSet<usize>,
-    conceal_pages: std::collections::HashSet<usize>,
-    erase_mask_generation: std::collections::HashMap<usize, u64>,
-    conceal_mask_generation: std::collections::HashMap<usize, u64>,
-    edit_result_cache: std::collections::HashMap<EditResultKey, EditResultEntry>,
-    final_ai_cache: std::collections::HashMap<FinalAiKey, FinalAiEntry>,
-    final_ai_pending: std::collections::HashMap<FinalAiKey, FinalAiPending>,
-    final_ai_failed: std::collections::HashSet<FinalAiKey>,
-    final_composite_cache: FinalCompositeCache,
-    final_effect_pending: std::collections::HashMap<FinalCompositeKey, FinalEffectPending>,
-    adjustment_cache: std::collections::HashMap<usize, FsCacheEntry>,
-    erase_result_cache: std::collections::HashMap<EraseResultKey, EraseResultCacheEntry>,
-    erase_preview_cache: std::collections::HashMap<usize, ErasePreviewCacheEntry>,
-    erase_base_cache: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
-    conceal_base_cache: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
-    conceal_cache: std::collections::HashMap<usize, ConcealCacheEntry>,
-    comic_cache: std::collections::HashMap<usize, ComicCacheEntry>,
-    comic_bake_pending: std::collections::HashMap<usize, ComicBakePending>,
-    erase_inpaint_pending: std::collections::HashMap<
-        crate::ui_erase::EraseInpaintPendingKey,
-        crate::ui_erase::EraseInpaintPending,
-    >,
-    ai_classify_cache: std::collections::HashMap<usize, crate::ai::ImageCategory>,
-    normalize_ui_states:
-        std::collections::HashMap<usize, crate::video::normalize_types::NormalizeUiState>,
-    normalize_auto_scan_suppressed: std::collections::HashSet<usize>,
-    music_bookmarks: Vec<crate::video_bookmarks::VideoBookmarkMeta>,
-    music_bookmarks_loaded_for: Option<PathBuf>,
-    last_loop_pos: std::collections::HashMap<usize, (f64, u64)>,
-}
-
-#[cfg(windows)]
-impl Drop for ViewerContextBundle {
-    /// bundle 化したロード複合体 (review-v2.3.0 P2-8/P2-9) の後始末。detached 窓の close /
-    /// モード切替の一括 clear / 新メディアによる parked 窓の強制 close では bundle ごと
-    /// 破棄されるが、この context の worker pool (通常 5〜14 スレッド) は cancel が立たないと
-    /// queue の condvar 待ちで永久残留する (窓の開閉のたびに 1 プールずつ蓄積するスレッド
-    /// リーク、review-v2.3.0 hunt P2)。cancel を立てて両キューを notify すれば worker は
-    /// 起床 → cancel 検知 → 退出する。swap は参照パターンの destructure なので Drop と
-    /// 両立し、空 bundle (`empty()`) の drop は誰も掴んでいない token を立てるだけの no-op。
-    fn drop(&mut self) {
-        self.cancel_token
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(q) = &self.reload_queue {
-            q.1.notify_all();
-        }
-        if let Some(q) = &self.heavy_io_queue {
-            q.1.notify_all();
-        }
-        if let Some(pending) = self.tag_prewarm_pending.as_ref() {
-            pending.cancel();
-        }
-        if let Some(pending) = self.tag_legacy_seed_pending.as_ref() {
-            pending.cancel();
-        }
-        if let Some(pending) = self.metadata_pending.as_ref() {
-            pending.cancel();
-        }
-        if let Some(pending) = self.converted_archive_cache_paths_pending.as_ref() {
-            pending.cancel.store(true, Ordering::Relaxed);
-        }
-        if let Some(pending) = self.folder_nav_pending.as_ref() {
-            pending.cancel.store(true, Ordering::Relaxed);
-        }
-        if let Some(pending) = self.folder_pane_open_pending.as_ref() {
-            pending.cancel.store(true, Ordering::Relaxed);
-        }
-        for pending in self.final_effect_pending.values() {
-            pending.cancel.store(true, Ordering::Relaxed);
-        }
-    }
-}
-
-#[cfg(windows)]
-impl ViewerContextBundle {
-    fn set_items_generation(&mut self, items_generation: u64) {
-        self.items_generation = items_generation;
-        self.fs_cache.set_items_generation(items_generation);
-        self.fs_pending.set_items_generation(items_generation);
-        self.fs_early_dims.set_items_generation(items_generation);
-        self.fs_upload_backlog
-            .set_items_generation(items_generation);
-    }
-
-    fn empty() -> Self {
-        // per-context ロード複合体: 空コンテキストは「誰も繋がっていない」fresh channel と
-        // token を持つ (App::new と同じ初期状態。この tx を掴む worker は存在しないので
-        // rx は常に Empty を返す)。
-        let (tx, rx) = mpsc::channel();
-        Self {
-            address: String::new(),
-            current_folder: None,
-            navigation_scope: ViewerNavigationScope::Main,
-            archive_source_override: None,
-            zip_nav: None,
-            stack_mode_requested: false,
-            stack_view: None,
-            stack_showing_flat: false,
-            stack_active_rule: None,
-            stack_script_error: None,
-            stack_toggle_select_path: None,
-            items: Vec::new(),
-            items_generation: 0,
-            visible_indices: Vec::new(),
-            facet_name_cache: Vec::new(),
-            facet_name_cache_generation: None,
-            facet_name_cache_pending: None,
-            facet_name_cache_failed_generation: None,
-            thumbnails: Vec::new(),
-            image_metas: Vec::new(),
-            video_thumb_overrides: std::collections::HashMap::new(),
-            auto_aspect: crate::auto_aspect::AutoAspectState::default(),
-            selected: None,
-            grid_click_selection_anchor: None,
-            scroll_offset_y: 0.0,
-            scroll_to_selected: false,
-            pending_grid_scroll: None,
-            requested: std::collections::HashMap::new(),
-            idle_upgrade_cache_bypass_ineligible: std::collections::HashSet::new(),
-            keep_range: (0, 0),
-            keep_set: std::collections::HashSet::new(),
-            thumbnail_eviction_generation: None,
-            details_thumb_suppression_applied: false,
-            details_hover_thumb_idx: None,
-            details_hover_thumb_viewport_open: false,
-            texture_backlog: Vec::new(),
-            details_order: Vec::new(),
-            details_order_revision: 0,
-            details_cell_content_revisions: DetailsCellContentRevisions::default(),
-            details_tag_prewarm_indices: Vec::new(),
-            details_lazy_meta: std::collections::HashMap::new(),
-            details_meta_pending: None,
-            details_lazy_visible_revision: 0,
-            details_image_dims_state: LazyColumnState::Disabled,
-            metadata_cache: std::collections::HashMap::new(),
-            exif_cache: std::collections::HashMap::new(),
-            xmp_cache: std::collections::HashMap::new(),
-            xmp_panorama_info: std::collections::HashMap::new(),
-            metadata_pending: None,
-            tags_cache: std::collections::HashMap::new(),
-            tag_prewarm_pending: None,
-            tag_prewarm_queued: std::collections::HashSet::new(),
-            tag_legacy_seed_pending: None,
-            pending_finalize: std::collections::HashSet::new(),
-            tx,
-            rx,
-            cancel_token: Arc::new(AtomicBool::new(false)),
-            reload_queue: None,
-            heavy_io_queue: None,
-            scroll_hint: Arc::new(AtomicUsize::new(0)),
-            visible_end_shared: Arc::new(AtomicUsize::new(0)),
-            keep_start_shared: Arc::new(AtomicUsize::new(0)),
-            keep_end_shared: Arc::new(AtomicUsize::new(0)),
-            last_vis_range: (0, 0),
-            vis_settle_at: None,
-            vis_first_logged: false,
-            vis_all_logged: false,
-            folder_nav_pending: None,
-            folder_pane_open_pending: None,
-            pending_folder_nav_steps: 0,
-            pending_folder_nav_mode: FolderNavMode::Grid,
-            search_filter: None,
-            search_filter_origin_folder: None,
-            checked: std::collections::HashSet::new(),
-            rotation_cache: std::collections::HashMap::new(),
-            page_dims_cache: crate::page_dims::PageDimsCache::default(),
-            rating_cache: std::collections::HashMap::new(),
-            rating_session_write_seen_generation: 0,
-            metadata_import_refresh_index: None,
-            current_folder_rating_cache: None,
-            current_folder_last_mtime: None,
-            current_folder_signature: None,
-            folder_pin_map: std::collections::HashMap::new(),
-            converted_archive_cache_paths: std::collections::HashMap::new(),
-            converted_archive_pin_root_states: std::collections::HashMap::new(),
-            converted_archive_cache_paths_pending: None,
-            current_color_cache_map: None,
-            current_color_catalog: None,
-            vst3_deferred_media_open: None,
-            fullscreen_idx: None,
-            viewer_session: ViewerSession::default(),
-            native_video_in_window_active: false,
-            video_audio_mode: None,
-            video_audio_vst: None,
-            video_audio_mode_entry_target: None,
-            video_audio_exit_pending: None,
-            panorama_state: None,
-            pano_toast_shown_for_current_fs: false,
-            analysis_mode: false,
-            analysis_hover_color: None,
-            analysis_pinned_color: None,
-            analysis_grayscale: false,
-            analysis_mosaic_grid: false,
-            analysis_filter_mag: 0,
-            analysis_guide_drag: None,
-            view_trim_mode: false,
-            view_trim_apply_mode: crate::view_trim::ViewTrimApplyMode::default(),
-            view_trim_page_apply_root_idx: None,
-            view_trim_page_spread_separate: false,
-            view_trim_book_settings: crate::view_trim::ViewTrimBookSettings::default(),
-            view_trim_page_overrides: std::collections::HashMap::new(),
-            view_trim_dirty_page_overrides: std::collections::HashSet::new(),
-            view_trim_save_pending: false,
-            fs_cache: ItemsGenerationMap::new("fs_cache"),
-            fs_lanczos_cache: crate::gpu_lanczos::GpuLanczosCache::default(),
-            fs_margin_bbox_cache: std::collections::HashMap::new(),
-            input_generation: std::collections::HashMap::new(),
-            fs_pending: ItemsGenerationMap::with_discard("fs_pending", cancel_fs_pending_value),
-            fullscreen_pdf_promotion: FullscreenPdfPromotionState::default(),
-            fs_pdf_display_target: None,
-            fs_early_dims: ItemsGenerationMap::new("fs_early_dims"),
-            fs_upload_backlog: FsUploadBacklog::new("fs_upload_backlog", fs_upload_backlog_idx),
-            top_level_grid_view: top_level_grid_view::TopLevelGridView::default(),
-            items_are_global_search_view: false,
-            items_are_tag_view: false,
-            items_are_reading_history_view: false,
-            items_are_bookmark_view: false,
-            items_are_rating_view: false,
-            items_are_subfolder_expansion_view: false,
-            items_are_smart_folder_view: false,
-            items_are_drive_list: false,
-            reading_history_return_from: None,
-            bookmark_view_state: None,
-            bookmark_open_pending: None,
-            fs_open_intent_from_grid: false,
-            pending_detached_video_host_switch: None,
-            fs_zoom: 1.0,
-            fs_pan: egui::Vec2::ZERO,
-            fs_zoom_active: false,
-            fs_zoom_aiming: false,
-            fs_zoom_factor: 1.0,
-            fs_zoom_pdf_rerender_idx: None,
-            fs_zoom_pdf_rerender_zoom: 1.0,
-            fs_pan_drag_start: None,
-            fs_vertical_scroll: 0.0,
-            fs_seek_drag_active: false,
-            fs_seek_overlay_visible: false,
-            fs_vertical_cache_keep_set: std::collections::HashSet::new(),
-            continuous_page_transitions: std::collections::HashMap::new(),
-            fs_free_rotation: 0.0,
-            fs_rotation_drag_start: None,
-            analysis_zoom: 1.0,
-            analysis_pan: egui::Vec2::ZERO,
-            analysis_pan_drag_start: None,
-            analysis_overlay_cache: None,
-            analysis_hist_cache: None,
-            analysis_sv_cache: None,
-            spread_mode: crate::settings::SpreadMode::default(),
-            spread_shift_anchor_idx: None,
-            reading_flow: crate::settings::ReadingFlow::default(),
-            reading_direction: crate::settings::ReadingDirection::default(),
-            slideshow_playing: false,
-            slideshow_next_at: std::time::Instant::now(),
-            slideshow_anchor_idx: None,
-            continuous_reading_scroll_transition: None,
-            slideshow_scroll_range_cache: None,
-            pdf_password_request: None,
-            pdf_current_password: None,
-            pdf_password_pending_save: None,
-            pdf_enumerate_pending: None,
-            zip_enumerate_pending: None,
-            fs_nav_after_pdf_enumerate: None,
-            pending_auto_fs_open: false,
-            pending_return_to_parent: false,
-            pdf_placeholder_count: None,
-            cached_nav_indices: None,
-            cached_fs_seek_info: None,
-            fs_nav_locked_gen: None,
-            fs_nav_dropped_block_signature: None,
-            fs_nav_dropped_block_count: 0,
-            fs_load_skip_signature: None,
-            fs_holdover_tex: None,
-            fs_boundary_hint: None,
-            virtual_folder_writeback: None,
-            pdf_prefetch_grace_until: None,
-            thumb_pixels: std::collections::HashMap::new(),
-            thumb_edit_preview_layers: std::collections::HashMap::new(),
-            thumb_edit_preview_keys: std::collections::HashMap::new(),
-            thumb_adjust_tex: std::collections::HashMap::new(),
-            passthrough_rendition_cache: PassthroughRenditionCache::default(),
-            adjustment_page_params: std::collections::HashMap::new(),
-            local_adjust_page_layers: std::collections::HashMap::new(),
-            local_adjust_pages: std::collections::HashSet::new(),
-            local_adjust_selected_layers: std::collections::HashMap::new(),
-            local_adjust_generation: std::collections::HashMap::new(),
-            local_adjust_cache: std::collections::HashMap::new(),
-            local_adjust_pending: std::collections::HashMap::new(),
-            export_crop_page_settings: std::collections::HashMap::new(),
-            export_crop_pages: std::collections::HashSet::new(),
-            mask_pages: std::collections::HashSet::new(),
-            comic_pages: std::collections::HashSet::new(),
-            conceal_pages: std::collections::HashSet::new(),
-            erase_mask_generation: std::collections::HashMap::new(),
-            conceal_mask_generation: std::collections::HashMap::new(),
-            edit_result_cache: std::collections::HashMap::new(),
-            final_ai_cache: std::collections::HashMap::new(),
-            final_ai_pending: std::collections::HashMap::new(),
-            final_ai_failed: std::collections::HashSet::new(),
-            final_composite_cache: FinalCompositeCache::default(),
-            final_effect_pending: std::collections::HashMap::new(),
-            adjustment_cache: std::collections::HashMap::new(),
-            erase_result_cache: std::collections::HashMap::new(),
-            erase_preview_cache: std::collections::HashMap::new(),
-            erase_base_cache: std::collections::HashMap::new(),
-            conceal_base_cache: std::collections::HashMap::new(),
-            conceal_cache: std::collections::HashMap::new(),
-            comic_cache: std::collections::HashMap::new(),
-            comic_bake_pending: std::collections::HashMap::new(),
-            erase_inpaint_pending: std::collections::HashMap::new(),
-            ai_classify_cache: std::collections::HashMap::new(),
-            normalize_ui_states: std::collections::HashMap::new(),
-            normalize_auto_scan_suppressed: std::collections::HashSet::new(),
-            music_bookmarks: Vec::new(),
-            music_bookmarks_loaded_for: None,
-            last_loop_pos: std::collections::HashMap::new(),
-        }
-    }
-
-    fn pause_background_work_keep_current_frame(&mut self) {
-        self.slideshow_playing = false;
-        self.continuous_reading_scroll_transition = None;
-        self.slideshow_scroll_range_cache = None;
-        self.fs_seek_drag_active = false;
-        self.fs_seek_overlay_visible = false;
-        self.pending_auto_fs_open = false;
-        self.pending_return_to_parent = false;
-        self.fs_nav_after_pdf_enumerate = None;
-        self.fs_nav_locked_gen = None;
-        self.fs_holdover_tex = None;
-        // The dedup describes the sequence that was just discarded, so the next block has to be
-        // reported afresh rather than mistaken for a continuation of this one.
-        self.fs_nav_dropped_block_signature = None;
-        self.fs_nav_dropped_block_count = 0;
-        self.continuous_page_transitions.clear();
-        self.pdf_enumerate_pending = None;
-        self.zip_enumerate_pending = None;
-        if let Some(pending) = self.folder_nav_pending.take() {
-            pending.cancel.store(true, Ordering::Relaxed);
-        }
-        if let Some(pending) = self.folder_pane_open_pending.take() {
-            pending.cancel.store(true, Ordering::Relaxed);
-        }
-        self.pending_folder_nav_steps = 0;
-        self.pending_folder_nav_mode = FolderNavMode::Grid;
-        for (_, pending) in self.fs_pending.drain() {
-            pending.cancel.store(true, Ordering::Relaxed);
-        }
-        self.texture_backlog.clear();
-        for pending in self.final_ai_pending.values() {
-            pending.cancel.store(true, Ordering::Relaxed);
-        }
-        self.final_ai_pending.clear();
-        for (_, pending) in self.local_adjust_pending.drain() {
-            pending.cancel.store(true, Ordering::Relaxed);
-        }
-        for (_, pending) in self.comic_bake_pending.drain() {
-            pending.cancel.store(true, Ordering::Relaxed);
-        }
-        for (_, pending) in self.erase_inpaint_pending.drain() {
-            pending.cancel.store(true, Ordering::Relaxed);
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -7683,14 +7161,102 @@ fn build_passthrough_rendition_pixels(
     }
 }
 
-/// 見開きから消しゴムに入ったときのコンテキスト。Apply / Cancel で
-/// 元の見開き状態 (= `saved_mode` の spread_mode + `pair.0` を中心ページとした
-/// 見開き表示) を復元するために保存する。
+/// 見開きから編集ツールへ入ったときの退避。抜けたら元の見開き表示へ戻す。
+///
+/// **編集ツールは「編集する 1 ページ」を単独で表示してから始める。**canvas 用の
+/// transform は単ページ経路でしか作られないので、見開きのまま入ると**オーバーレイも
+/// 入力も無いモード**になる。消しゴム / 隠蔽 / 注釈 / 切り取りはこの退避を持っていたが、
+/// 補正レイヤー (Ctrl+G) だけ持っておらず、見開きから入ると操作が一切効かなかった
+/// (2026-08-26 の利用者報告)。
+///
+/// 手順は [`App::plan_page_edit_pivot`] / [`App::enter_page_edit_single_view`] /
+/// [`App::leave_page_edit_single_view`] が持つ。**ツールごとに書き写さない。**
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct EraseSpreadCtx {
+pub(crate) struct PageEditSpreadPivot {
     pub saved_mode: crate::settings::SpreadMode,
     /// (left_idx, right_idx)。LTR / RTL のいずれでも「画面上の左/右」の意味で固定。
     pub pair: (usize, usize),
+}
+
+impl App {
+    /// 編集するページと、見開きなら戻すための退避を決める。**この時点では何も変えない。**
+    ///
+    /// 素材の取得など失敗しうる準備を先に済ませてから
+    /// [`Self::enter_page_edit_single_view`] を呼べるように、決定と適用を分けてある
+    /// (先に倒すと、見開きが解除されたのに編集も始まらない状態になる)。
+    pub(crate) fn plan_page_edit_pivot(
+        &mut self,
+        fs_idx: usize,
+    ) -> (usize, Option<PageEditSpreadPivot>) {
+        match self.resolve_spread_pair(fs_idx) {
+            crate::ui_fullscreen::SpreadPair::Double { left, right } => (
+                left,
+                Some(PageEditSpreadPivot {
+                    saved_mode: self.spread_mode,
+                    pair: (left, right),
+                }),
+            ),
+            // 単ページ / 表紙単独 / 横長単独。倒す必要が無い。
+            crate::ui_fullscreen::SpreadPair::Single => (fs_idx, None),
+        }
+    }
+
+    /// 単ページ表示へ倒す。見開きを解除し、対象ページへ寄せ、ズーム / パンを戻す。
+    pub(crate) fn enter_page_edit_single_view(&mut self, target_idx: usize) {
+        self.spread_mode = crate::settings::SpreadMode::Single;
+        self.fullscreen_idx = Some(target_idx);
+        self.fs_zoom = 1.0;
+        self.fs_pan = egui::Vec2::ZERO;
+    }
+
+    /// 編集ツールを抜けたのに見開きが戻っていない状態を解消する。
+    ///
+    /// **退避はツールが動いている間だけ存在してよい。**解除の経路はツールごとに複数ある
+    /// (専用の reset、フルスクリーンを閉じる、ページ送り、コンテキスト切替…)。その全部へ
+    /// 復元を書くと必ずどれか漏れるので、「モードが落ちていたら戻す」を 1 か所で見る。
+    /// `take` は冪等なので、ツール自身の reset が先に戻していても二重にはならない。
+    pub(crate) fn reconcile_page_edit_spread_pivots(&mut self) {
+        let stale = [
+            (!self.erase_mode, &mut self.erase_spread_ctx),
+            (!self.conceal_mode, &mut self.conceal_spread_ctx),
+            (!self.text_mode, &mut self.text_spread_ctx),
+            (!self.export_crop_mode, &mut self.export_crop_spread_ctx),
+            (!self.local_adjust_mode, &mut self.local_adjust_spread_ctx),
+        ]
+        .into_iter()
+        .filter_map(|(mode_is_off, slot)| mode_is_off.then(|| slot.take()).flatten())
+        .collect::<Vec<_>>();
+        for pivot in stale {
+            self.leave_page_edit_single_view(Some(pivot));
+        }
+    }
+
+    /// 編集ツールで倒す前の見開きペア。**倒した後も左右の切り替えを出すために使う。**
+    ///
+    /// 倒した後は `resolve_spread_pair` が Single を返すので、パネルはこちらから引く。
+    /// これが無いと、見開きから入った編集ツールで**片方のページしか触れない**。
+    pub(crate) fn page_edit_spread_pair(&self) -> Option<(usize, usize)> {
+        self.erase_spread_ctx
+            .or(self.conceal_spread_ctx)
+            .or(self.text_spread_ctx)
+            .or(self.export_crop_spread_ctx)
+            .or(self.local_adjust_spread_ctx)
+            .map(|pivot| pivot.pair)
+    }
+
+    /// 退避しておいた見開きへ戻す。
+    ///
+    /// ページ位置は左ページに揃える (`resolve_spread_pair` が同じペアを返すので、
+    /// 元と同じ見開きが再構築される)。
+    pub(crate) fn leave_page_edit_single_view(&mut self, pivot: Option<PageEditSpreadPivot>) {
+        let Some(pivot) = pivot else {
+            return;
+        };
+        self.spread_mode = pivot.saved_mode;
+        self.fullscreen_idx = Some(pivot.pair.0);
+        self.fs_zoom = 1.0;
+        self.fs_pan = egui::Vec2::ZERO;
+    }
 }
 
 /// 見開き表示中に補正パネルが編集対象とするページ (画面上の左/右で固定、
@@ -9210,25 +8776,24 @@ fn migrate_key_map_for_rename<V>(
 /// fs_cache 内の VideoPlayer (再生中 handle)。含まれるだけのアイテムは対象外。
 #[cfg(windows)]
 fn viewer_bundle_references_removed(
-    bundle: &ViewerContextBundle,
+    context: ContextRef<'_>,
     matches_key: &dyn Fn(&str) -> bool,
 ) -> bool {
-    if bundle
-        .fullscreen_idx
-        .and_then(|idx| bundle.items.get(idx))
+    if context
+        .fullscreen_idx()
+        .and_then(|idx| context.items().get(idx))
         .and_then(|item| item.drag_source_path())
         .is_some_and(|p| matches_key(&crate::adjustment_db::normalize_path(p)))
     {
         return true;
     }
-    if bundle
-        .current_folder
-        .as_deref()
+    if context
+        .current_folder()
         .is_some_and(|folder| matches_key(&crate::adjustment_db::normalize_path(folder)))
     {
         return true;
     }
-    bundle.fs_cache.values().any(|entry| {
+    context.fs_cache().values().any(|entry| {
         matches!(entry, FsCacheEntry::Video { player, .. }
             if matches_key(&crate::adjustment_db::normalize_path(player.path())))
     })
@@ -9252,15 +8817,14 @@ struct ViewerContextMediaTeardownPlan {
 }
 
 #[cfg(windows)]
-fn viewer_context_bundle_is_music_consumer(bundle: &ViewerContextBundle) -> bool {
-    let Some(idx) = bundle.fullscreen_idx else {
+fn viewer_context_is_music_consumer(context: ContextRef<'_>) -> bool {
+    let Some(idx) = context.fullscreen_idx() else {
         return false;
     };
-    matches!(bundle.items.get(idx), Some(GridItem::Audio(_)))
-        || (bundle.video_audio_mode == Some(idx)
-            && !bundle
-                .video_audio_vst
-                .as_ref()
+    matches!(context.items().get(idx), Some(GridItem::Audio(_)))
+        || (context.video_audio_mode() == Some(idx)
+            && !context
+                .video_audio_vst()
                 .is_some_and(|state| state.fs_idx == idx))
 }
 
@@ -9282,12 +8846,33 @@ fn video_resume_position_for_save(
     }
 }
 
+fn playback_position_deadline(
+    current_secs: f64,
+    target_secs: f64,
+    playback_speed: f64,
+) -> Option<std::time::Duration> {
+    let remaining = target_secs - current_secs;
+    if !remaining.is_finite() || remaining <= 0.0 {
+        return None;
+    }
+    Some(std::time::Duration::from_secs_f64(
+        remaining / playback_speed.max(crate::video::clock::MIN_PLAYBACK_SPEED),
+    ))
+}
+
+fn merge_repaint_deadline(
+    next: &mut Option<std::time::Duration>,
+    candidate: Option<std::time::Duration>,
+) {
+    if let Some(candidate) = candidate {
+        *next = Some(next.map_or(candidate, |previous| previous.min(candidate)));
+    }
+}
+
 #[cfg(windows)]
-fn viewer_context_media_teardown_plan(
-    bundle: &ViewerContextBundle,
-) -> ViewerContextMediaTeardownPlan {
+fn viewer_context_media_teardown_plan(context: ContextRef<'_>) -> ViewerContextMediaTeardownPlan {
     let mut plan = ViewerContextMediaTeardownPlan {
-        music_consumer: viewer_context_bundle_is_music_consumer(bundle),
+        music_consumer: viewer_context_is_music_consumer(context),
         ..Default::default()
     };
     let mut push_media_path = |path: &std::path::Path| {
@@ -9299,20 +8884,22 @@ fn viewer_context_media_teardown_plan(
             plan.media_paths.push(path.to_path_buf());
         }
     };
-    if let Some(item) = bundle.fullscreen_idx.and_then(|idx| bundle.items.get(idx)) {
+    if let Some(item) = context
+        .fullscreen_idx()
+        .and_then(|idx| context.items().get(idx))
+    {
         match item {
             GridItem::Video(path) | GridItem::Audio(path) => push_media_path(path),
             _ => {}
         }
     }
-    for (idx, entry) in &bundle.fs_cache {
+    for (idx, entry) in context.fs_cache() {
         if let FsCacheEntry::Video { player, .. } = entry {
             let path = player.path().clone();
             push_media_path(&path);
-            let audio_mode_without_vst = bundle.video_audio_mode == Some(*idx)
-                && !bundle
-                    .video_audio_vst
-                    .as_ref()
+            let audio_mode_without_vst = context.video_audio_mode() == Some(*idx)
+                && !context
+                    .video_audio_vst()
                     .is_some_and(|state| state.fs_idx == *idx);
             plan.resume_updates.push(MediaResumeUpdate {
                 key: crate::adjustment_db::normalize_path(&path),
@@ -9328,17 +8915,17 @@ fn viewer_context_media_teardown_plan(
 
 #[cfg(windows)]
 fn sync_viewer_context_bundle_presenters_for_tray(
-    bundle: &ViewerContextBundle,
+    context: ContextRef<'_>,
     app_visible: bool,
 ) -> usize {
     let mut routed = 0;
-    let music_consumer = viewer_context_bundle_is_music_consumer(bundle);
-    for (idx, entry) in &bundle.fs_cache {
+    let music_consumer = viewer_context_is_music_consumer(context);
+    for (idx, entry) in context.fs_cache() {
         let FsCacheEntry::Video { player, .. } = entry else {
             continue;
         };
         let presenter_visible =
-            app_visible && bundle.fullscreen_idx == Some(*idx) && !music_consumer;
+            app_visible && context.fullscreen_idx() == Some(*idx) && !music_consumer;
         player.set_native_window_visible(presenter_visible);
         routed += 1;
     }
@@ -9365,13 +8952,13 @@ fn player_needs_resident_media_updates(
 
 #[cfg(windows)]
 fn viewer_context_bundle_needs_resident_media_updates(
-    bundle: &ViewerContextBundle,
+    context: ContextRef<'_>,
     continuous_mode: crate::video::VideoContinuousMode,
     continuous_last_eof: Option<(usize, u64)>,
 ) -> bool {
-    bundle
-        .fullscreen_idx
-        .and_then(|idx| bundle.fs_cache.get(&idx).map(|entry| (idx, entry)))
+    context
+        .fullscreen_idx()
+        .and_then(|idx| context.fs_cache().get(&idx).map(|entry| (idx, entry)))
         .is_some_and(|(idx, entry)| {
             matches!(entry, FsCacheEntry::Video { player, .. }
             if player_needs_resident_media_updates(
@@ -9400,8 +8987,8 @@ fn pause_current_media_player_for_remote_session(
 }
 
 #[cfg(windows)]
-fn pause_viewer_context_bundle_media_for_remote_session(bundle: &ViewerContextBundle) -> bool {
-    pause_current_media_player_for_remote_session(bundle.fullscreen_idx, &bundle.fs_cache)
+fn pause_viewer_context_bundle_media_for_remote_session(context: ContextRef<'_>) -> bool {
+    pause_current_media_player_for_remote_session(context.fullscreen_idx(), context.fs_cache())
 }
 
 #[cfg(windows)]
@@ -9441,38 +9028,37 @@ fn grid_item_media_path(item: &GridItem) -> Option<&std::path::Path> {
 
 #[cfg(windows)]
 fn viewer_context_bundle_displays_media_path(
-    bundle: &ViewerContextBundle,
+    context: ContextRef<'_>,
     target: &std::path::Path,
 ) -> bool {
-    let Some(idx) = bundle.fullscreen_idx else {
+    let Some(idx) = context.fullscreen_idx() else {
         return false;
     };
     let player_matches = matches!(
-        bundle.fs_cache.get(&idx),
+        context.fs_cache().get(&idx),
         Some(FsCacheEntry::Video { player, .. })
             if crate::folder_tree::path_eq(player.path(), target)
     );
-    let item_matches = bundle
-        .items
+    let item_matches = context
+        .items()
         .get(idx)
         .and_then(grid_item_media_path)
         .is_some_and(|path| crate::folder_tree::path_eq(path, target));
     let normalized_target = crate::adjustment_db::normalize_path(target);
     player_matches
         || item_matches
-        || bundle
-            .viewer_session
-            .last_sync_stamp
-            .as_ref()
+        || context
+            .viewer_session_last_sync_stamp()
             .is_some_and(|stamp| stamp.item_key == normalized_target)
 }
 
 /// detached 窓 (passive / parked) が削除 / リネーム対象 path を表示中か。
 /// sync stamp の item_key は `metadata_cache_key` 由来 (= 正規化済み / zip_entry_key
-/// 形式) なのでそのまま照合できる。reopen descriptor と paused_bundle も見る。
+/// 形式) なのでそのまま照合できる。reopen descriptor と registry context も見る。
 #[cfg(windows)]
 fn detached_window_references_removed(
     window: &DetachedImageWindowSnapshot,
+    context: Option<ContextRef<'_>>,
     matches_key: &dyn Fn(&str) -> bool,
 ) -> bool {
     if window
@@ -9500,10 +9086,7 @@ fn detached_window_references_removed(
             return true;
         }
     }
-    window
-        .paused_bundle
-        .as_deref()
-        .is_some_and(|bundle| viewer_bundle_references_removed(bundle, matches_key))
+    context.is_some_and(|context| viewer_bundle_references_removed(context, matches_key))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -9915,6 +9498,10 @@ pub struct App {
     /// OS DPI only の論理 geometry に戻す。inner を優先することで、outer を inner として
     /// 再適用するタイトルバー分のサイズ縮小を防ぐ。
     pub(crate) last_inner_size: Option<[f32; 2]>,
+    /// ウィンドウ状態保存用：最後に確認した最大化 flag（最小化中は更新しない）。
+    /// `last_outer_rect` / `last_inner_size` とは独立に持つ。同じ値へ畳み込むと、
+    /// 最大化して終了した次の起動で「戻る先」を失う。
+    pub(crate) last_window_maximized: bool,
     /// 直近に `ViewportCommand::Title` で送信したタイトル文字列のキャッシュ。
     /// 毎フレーム無条件に send_viewport_cmd(Title(...)) すると、egui 内部の
     /// `request_repaint_of` が毎回発火して App::update が 60fps で回り続け、
@@ -9926,7 +9513,16 @@ pub struct App {
     /// 初回フレームで適用する inner_size（egui#4918 / winit#923 対策）。
     /// ViewportBuilder 段階では マルチモニタ DPI 混在時に サイズを誤って設定する
     /// ケースがあるため、DPI 確定後の初回フレームで再適用する。
+    ///
+    /// 最大化起動のときは**最大化が解けるまで保留する**。最大化中に InnerSize を
+    /// 送ると通常サイズへ戻ってしまい、利用者が選んだ起動状態を初回フレームで
+    /// 打ち消す。保留した値は最大化を解いた最初のフレームで 1 回だけ適用され、
+    /// mixed-DPI で壊れた復元矩形をそこで矯正する (§1.116)。
     pub(crate) pending_initial_size: Option<[f32; 2]>,
+    /// ウィンドウを最大化状態で作ったか (`ViewportBuilder::with_maximized`)。
+    /// `pending_initial_size` を保留すべきかの判断にだけ使う起動時の事実で、
+    /// 現在最大化されているかを表す `last_window_maximized` とは別物。
+    pub(crate) created_maximized: bool,
 
     /// キャッシュ生成進捗：新規デコードが必要だった画像の総数
     pub(crate) cache_gen_total: usize,
@@ -10036,6 +9632,14 @@ pub struct App {
     // ── フルスクリーン表示・先読みキャッシュ ───────────────────────
     /// Some(idx) = フルスクリーン表示中（self.items のインデックス）
     pub(crate) fullscreen_idx: Option<usize>,
+    /// 分割表示中に、今どちら側を見ているか。分割していなければ `Full`。
+    ///
+    /// **元ページ (`fullscreen_idx`) と同じ context 所有**にする。片方だけ App 側に
+    /// 置くと、context を切り替えたときに前の viewer の左右が次の viewer へ残る。
+    /// 永続化はしない (開き直しは分割方向の最初の半分へ着地する)。
+    pub(crate) fullscreen_page_slice: crate::page_split::PageSlice,
+    /// 直近に記録した分割判断 (診断用)。変わったときだけログへ 1 行出すための重複除け。
+    pub(crate) last_split_decision: Option<(usize, crate::ui_fullscreen::SplitDecision)>,
     /// 現在の viewer session の実表示先。要求値ではなく、実際に採用した表示先を保持する。
     pub(crate) viewer_presentation: ViewerPresentation,
     /// detached viewer とメイン選択の同期済み対象。idx 単体ではなく items 世代と項目キーを持つ。
@@ -10087,12 +9691,9 @@ pub struct App {
     #[cfg(windows)]
     pub(crate) deferred_detached_image_window_views:
         HashMap<u64, Arc<DeferredDetachedImageWindowShared>>,
-    /// メイン一覧から独立して動く active detached viewer の item/cache context。
-    ///
-    /// `App` の既存 fullscreen 実装は `self.items[self.fullscreen_idx]` 前提が広いため、
-    /// active viewer を処理する短い区間だけこの bundle を mount して既存処理を再利用する。
+    /// Sole owner of viewer-context payloads and window bindings.
     #[cfg(windows)]
-    active_detached_viewer_context: Option<ActiveDetachedViewerContext>,
+    viewer_contexts: ViewerContextRegistry,
     /// active detached viewer の PDF / ZIP ページ文脈を処理している間、メイン一覧用の
     /// 起動復元先・クイックフォルダ履歴を更新しないためのネスト可能な抑止カウンタ。
     ///
@@ -10146,7 +9747,6 @@ pub struct App {
     #[cfg(windows)]
     native_video_parked_live_activation_requests: Vec<u64>,
     #[cfg(windows)]
-    next_detached_viewer_context_serial: u64,
     /// 先読みキャッシュ: item_idx → ロード済みエントリ（静止画 or アニメーション）。
     /// entry はこの bundle の items_generation を刻み、全参照で照合する。
     pub(crate) fs_cache: ItemsGenerationMap<FsCacheEntry>,
@@ -11485,7 +11085,7 @@ pub struct App {
     pub(crate) main_font_atlas_resync_reason: Option<&'static str>,
     /// detached viewer の teardown 後にメイン font atlas resync が必要なことを表す pending。
     ///
-    /// `active_detached_viewer_context` mount 中に即時 resync 判定をすると、outer/main context
+    /// detached context の mount 中に即時 resync 判定をすると、outer/main context
     /// に戻った後の detached viewport 生存を見落として Y-32 wgpu validation panic を起こす。
     /// close 経路はこの flag だけを立て、outer/main context で安全判定してから flush する。
     #[cfg(windows)]
@@ -11949,7 +11549,11 @@ pub struct App {
     pub(crate) export_crop_create_drag: Option<ExportCropCreateDrag>,
     /// 見開きから切り取りモードに入ったときの spread 状態スナップショット
     /// (消しゴム / 隠蔽加工と同じく Single へ pivot し、退場時に復元する)。
-    pub(crate) export_crop_spread_ctx: Option<EraseSpreadCtx>,
+    pub(crate) export_crop_spread_ctx: Option<PageEditSpreadPivot>,
+    /// 補正レイヤーを見開きから開いたときの退避。**5 つの編集ツールで唯一これが無く**、
+    /// 見開きのまま入ると canvas 用 transform が作られずマスク編集が一切効かなかった
+    /// (2026-08-26 の利用者報告)。
+    pub(crate) local_adjust_spread_ctx: Option<PageEditSpreadPivot>,
     /// 補正レイヤーパネルで選択中のレイヤー index。ページごとに保持する。
     pub(crate) local_adjust_selected_layers: std::collections::HashMap<usize, usize>,
     /// 補正レイヤー追加時のマスク種類選択ダイアログ。
@@ -12366,6 +11970,9 @@ pub struct App {
     /// 引いたらここへ転写する。バナー UI で「再起動」/「閉じる」が押されるまで
     /// 残る (時間で消えない、ユーザーが認識する必要があるため)。
     pub(crate) trt_worker_notice: Option<crate::ai::runtime::WorkerNotice>,
+    /// Susie の読み込み枠が全部尽きたことを 1 回だけ知らせる notice。
+    /// 発行条件は `susie_loader::should_notify_workers_gone` が単独で所有する。
+    pub(crate) susie_worker_notice: Option<crate::susie_loader::SusieWorkerNotice>,
     /// セッション中に worker 死亡 → 自動再起動を試みた回数。
     /// `MAX_TRT_AUTO_RESTART_ATTEMPTS` 回まで silent に再 spawn して、それを超えたら
     /// バナーを出してユーザー操作を待つ (= TRT pack 自体の問題等で永久ループしない
@@ -12527,7 +12134,7 @@ pub struct App {
     /// (表紙・末尾奇数・横長画像) から入った場合は `None`。
     /// 2 値を 1 構造体にまとめてあるのは「mode と pair は常に同時に set / take される」
     /// という不変条件をフィールドの形で表現するため。
-    pub(crate) erase_spread_ctx: Option<EraseSpreadCtx>,
+    pub(crate) erase_spread_ctx: Option<PageEditSpreadPivot>,
 
     // ── 隠蔽加工 (Conceal、Phase 1) ───────────────────────────────
     //
@@ -12590,9 +12197,9 @@ pub struct App {
     pub(crate) conceal_shape_drag_start: Option<(f32, f32)>,
     /// Rect / Ellipse ツールのドラッグ末尾点 (画像座標、プレビューと確定で共用)。
     pub(crate) conceal_shape_drag_end: Option<(f32, f32)>,
-    /// 見開きから隠蔽加工に入ったときの状態スナップショット (消しゴムの `EraseSpreadCtx`
+    /// 見開きから隠蔽加工に入ったときの状態スナップショット (消しゴムの `PageEditSpreadPivot`
     /// と同型、Phase 2 で見開きハンドリング実装時に活用)。
-    pub(crate) conceal_spread_ctx: Option<EraseSpreadCtx>,
+    pub(crate) conceal_spread_ctx: Option<PageEditSpreadPivot>,
     /// バッジ判定: マスクが保存されているページの idx 集合 (Phase 4 で活性化)。
     /// フォルダロード時に `conceal_db::load_conceal_keys` で hydrate し、
     /// `save_conceal_with_sidecar` / `delete_conceal_with_sidecar` で同期更新する。
@@ -12796,7 +12403,7 @@ pub struct App {
     /// スタンプピッカーのサムネイルテクスチャキャッシュ (`stamp_source_key` → テクスチャ)。
     pub(crate) stamp_thumb_cache: std::collections::HashMap<String, egui::TextureHandle>,
     /// 見開きから text モードに入ったときの spread 復元コンテキスト (conceal と同じ流儀)。
-    pub(crate) text_spread_ctx: Option<EraseSpreadCtx>,
+    pub(crate) text_spread_ctx: Option<PageEditSpreadPivot>,
 
     // ── テキスト注釈 Undo/Redo (Inc 6) ────────────────────────────
     /// エディタ専用スナップショット undo スタック (D7)。現在編集中ページの注釈
@@ -12963,6 +12570,9 @@ pub struct App {
     /// フォルダ側サイドカー (`mimageviewer.dat`) のメモリ表現。キーはフォルダの絶対パス。
     /// 中央 DB への書き込みと同じタイミングで更新し、フォルダ切替・終了・5 秒アイドル時に flush する。
     pub(crate) sidecars: std::collections::HashMap<std::path::PathBuf, crate::sidecar::SidecarFile>,
+    /// 前フレームで編集ツールがキャンバスを持っていたか。true → false の瞬間が
+    /// 「編集終了」で、そこでサイドカーを書き出す。
+    pub(crate) page_edit_tool_had_canvas: bool,
 
     // ── タスクトレイ常駐 (v0.9) ──────────────────────────────────
     /// タスクトレイコントローラ (専用スレッドで動作)。設定 ON のときだけ初期化される。
@@ -13531,6 +13141,32 @@ impl App {
             .unwrap_or_default();
         crate::perf::emit_ms("startup", "db_load_local_adjust_keys", 0, t);
 
+        // リリース済みの旧マスク形式を詰め直す。実測 954 MB の DB が数十 MB になり、
+        // そのページを開くときの JSON パース (最大 93 MB) が消える。移行済みなら数 ms。
+        if local_adjust_db.is_some() {
+            let path = crate::local_adjust_db::LocalAdjustDb::db_path();
+            std::thread::Builder::new()
+                .name("local-adjust-repack".into())
+                .spawn(move || {
+                    let started = std::time::Instant::now();
+                    let report = crate::local_adjust_db::repack_legacy_masks(&path);
+                    if report.did_work() {
+                        crate::logger::log(format!(
+                            "local_adjust: repacked {} of {} rows in {:.1}s (JSON {:.1}MB -> {:.1}MB, file {:.1}MB -> {:.1}MB, {} skipped as changed)",
+                            report.rewritten,
+                            report.scanned,
+                            started.elapsed().as_secs_f64(),
+                            report.bytes_before as f64 / 1e6,
+                            report.bytes_after as f64 / 1e6,
+                            report.file_bytes_before as f64 / 1e6,
+                            report.file_bytes_after as f64 / 1e6,
+                            report.skipped_changed,
+                        ));
+                    }
+                })
+                .ok();
+        }
+
         let t = std::time::Instant::now();
         let export_crop_db = crate::export_crop::CropDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_export_crop", 0, t);
@@ -13680,9 +13316,11 @@ impl App {
             pending_grid_scroll: None,
             last_outer_rect: None,
             last_inner_size: None,
+            last_window_maximized: false,
             last_window_title: None,
             last_pixels_per_point: 1.0,
             pending_initial_size: None,
+            created_maximized: false,
             cache_gen_total: 0,
             cache_gen_done: Arc::new(AtomicUsize::new(0)),
             image_metas: Vec::new(),
@@ -13713,6 +13351,8 @@ impl App {
             stats: Arc::new(Mutex::new(crate::stats::ThumbStats::new())),
             show_stats_dialog: false,
             fullscreen_idx: None,
+            fullscreen_page_slice: crate::page_split::PageSlice::Full,
+            last_split_decision: None,
             viewer_presentation: ViewerPresentation::Fullscreen,
             last_viewer_sync_stamp: None,
             #[cfg(windows)]
@@ -13734,7 +13374,7 @@ impl App {
             #[cfg(windows)]
             deferred_detached_image_window_views: HashMap::new(),
             #[cfg(windows)]
-            active_detached_viewer_context: None,
+            viewer_contexts: ViewerContextRegistry::new(),
             #[cfg(windows)]
             detached_viewer_main_history_suppression_depth: 0,
             #[cfg(windows)]
@@ -13758,7 +13398,6 @@ impl App {
             #[cfg(windows)]
             native_video_parked_live_activation_requests: Vec::new(),
             #[cfg(windows)]
-            next_detached_viewer_context_serial: 1,
             fs_cache: ItemsGenerationMap::new("fs_cache"),
             fs_lanczos_cache: crate::gpu_lanczos::GpuLanczosCache::default(),
             fs_margin_bbox_cache: std::collections::HashMap::new(),
@@ -14411,6 +14050,7 @@ impl App {
             export_crop_drag: None,
             export_crop_create_drag: None,
             export_crop_spread_ctx: None,
+            local_adjust_spread_ctx: None,
             local_adjust_selected_layers: std::collections::HashMap::new(),
             local_adjust_add_layer_dialog_open: false,
             local_adjust_change_mask_dialog_open: false,
@@ -14550,6 +14190,7 @@ impl App {
             source_swap_keep_audio_mode: false,
             pdf_worker_notice: None,
             trt_worker_notice: None,
+            susie_worker_notice: None,
             trt_auto_restart_attempts: 0,
             trt_spawn_restart_attempts: 0,
             trt_restart_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -14746,6 +14387,7 @@ impl App {
             #[cfg(windows)]
             video_resume_preview_cache: std::collections::VecDeque::new(),
             sidecars: std::collections::HashMap::new(),
+            page_edit_tool_had_canvas: false,
             tray_controller: None,
             window_visible: true,
             show_tray_enabled_notice: false,
@@ -16175,503 +15817,6 @@ impl App {
     /// ユーザー視点でのカレントフォルダ。変換済みアーカイブを開いているときは
     /// 元 (RAR/7z/LZH) のパスを返す。通常時は `current_folder` と同じ。
     /// BS / Ctrl+↑↓ / タイトルバー / アドレスバー表示で使うこと。
-    #[cfg(windows)]
-    fn swap_viewer_context_bundle(&mut self, bundle: &mut ViewerContextBundle) {
-        // path-keyed DB 更新は context-global。退避する側も復元する側も、idx-keyed cache を
-        // その時点の最新世代へ揃えてから ownership を渡す。この関数はnavigationではなく
-        // ownership交換のプリミティブなので、同期に伴う表示再構築でApp-globalなfacet
-        // scope / suppressionを変更してはならない。
-        if self.sync_current_context_rating_session_writes() {
-            self.rebuild_visible_indices_preserving_facet_scope();
-        }
-        macro_rules! swap_field {
-            ($field:ident) => {
-                std::mem::swap(&mut self.$field, $field);
-            };
-        }
-
-        let ViewerContextBundle {
-            address,
-            current_folder,
-            navigation_scope,
-            archive_source_override,
-            zip_nav,
-            stack_mode_requested,
-            stack_view,
-            stack_showing_flat,
-            stack_active_rule,
-            stack_script_error,
-            stack_toggle_select_path,
-            items,
-            items_generation,
-            visible_indices,
-            facet_name_cache,
-            facet_name_cache_generation,
-            facet_name_cache_pending,
-            facet_name_cache_failed_generation,
-            thumbnails,
-            image_metas,
-            video_thumb_overrides,
-            auto_aspect,
-            selected,
-            grid_click_selection_anchor,
-            scroll_offset_y,
-            scroll_to_selected,
-            pending_grid_scroll,
-            requested,
-            idle_upgrade_cache_bypass_ineligible,
-            keep_range,
-            keep_set,
-            thumbnail_eviction_generation,
-            details_thumb_suppression_applied,
-            details_hover_thumb_idx,
-            details_hover_thumb_viewport_open,
-            texture_backlog,
-            details_order,
-            details_order_revision,
-            details_cell_content_revisions,
-            details_tag_prewarm_indices,
-            details_lazy_meta,
-            details_meta_pending,
-            details_lazy_visible_revision,
-            details_image_dims_state,
-            metadata_cache,
-            exif_cache,
-            xmp_cache,
-            xmp_panorama_info,
-            metadata_pending,
-            tags_cache,
-            tag_prewarm_pending,
-            tag_prewarm_queued,
-            tag_legacy_seed_pending,
-            pending_finalize,
-            tx,
-            rx,
-            cancel_token,
-            reload_queue,
-            heavy_io_queue,
-            scroll_hint,
-            visible_end_shared,
-            keep_start_shared,
-            keep_end_shared,
-            last_vis_range,
-            vis_settle_at,
-            vis_first_logged,
-            vis_all_logged,
-            folder_nav_pending,
-            folder_pane_open_pending,
-            pending_folder_nav_steps,
-            pending_folder_nav_mode,
-            search_filter,
-            search_filter_origin_folder,
-            checked,
-            rotation_cache,
-            page_dims_cache,
-            rating_cache,
-            rating_session_write_seen_generation,
-            metadata_import_refresh_index,
-            current_folder_rating_cache,
-            current_folder_last_mtime,
-            current_folder_signature,
-            folder_pin_map,
-            converted_archive_cache_paths,
-            converted_archive_pin_root_states,
-            converted_archive_cache_paths_pending,
-            current_color_cache_map,
-            current_color_catalog,
-            vst3_deferred_media_open,
-            fullscreen_idx,
-            viewer_session,
-            native_video_in_window_active,
-            video_audio_mode,
-            video_audio_vst,
-            video_audio_mode_entry_target,
-            video_audio_exit_pending,
-            panorama_state,
-            pano_toast_shown_for_current_fs,
-            analysis_mode,
-            analysis_hover_color,
-            analysis_pinned_color,
-            analysis_grayscale,
-            analysis_mosaic_grid,
-            analysis_filter_mag,
-            analysis_guide_drag,
-            view_trim_mode,
-            view_trim_apply_mode,
-            view_trim_page_apply_root_idx,
-            view_trim_page_spread_separate,
-            view_trim_book_settings,
-            view_trim_page_overrides,
-            view_trim_dirty_page_overrides,
-            view_trim_save_pending,
-            fs_cache,
-            fs_lanczos_cache,
-            fs_margin_bbox_cache,
-            input_generation,
-            fs_pending,
-            fullscreen_pdf_promotion,
-            fs_pdf_display_target,
-            fs_early_dims,
-            fs_upload_backlog,
-            top_level_grid_view,
-            items_are_global_search_view,
-            items_are_tag_view,
-            items_are_reading_history_view,
-            items_are_bookmark_view,
-            items_are_rating_view,
-            items_are_subfolder_expansion_view,
-            items_are_smart_folder_view,
-            items_are_drive_list,
-            reading_history_return_from,
-            bookmark_view_state,
-            bookmark_open_pending,
-            fs_open_intent_from_grid,
-            pending_detached_video_host_switch,
-            fs_zoom,
-            fs_pan,
-            fs_zoom_active,
-            fs_zoom_aiming,
-            fs_zoom_factor,
-            fs_zoom_pdf_rerender_idx,
-            fs_zoom_pdf_rerender_zoom,
-            fs_pan_drag_start,
-            fs_vertical_scroll,
-            fs_seek_drag_active,
-            fs_seek_overlay_visible,
-            fs_vertical_cache_keep_set,
-            continuous_page_transitions,
-            fs_free_rotation,
-            fs_rotation_drag_start,
-            analysis_zoom,
-            analysis_pan,
-            analysis_pan_drag_start,
-            analysis_overlay_cache,
-            analysis_hist_cache,
-            analysis_sv_cache,
-            spread_mode,
-            spread_shift_anchor_idx,
-            reading_flow,
-            reading_direction,
-            slideshow_playing,
-            slideshow_next_at,
-            slideshow_anchor_idx,
-            continuous_reading_scroll_transition,
-            slideshow_scroll_range_cache,
-            pdf_password_request,
-            pdf_current_password,
-            pdf_password_pending_save,
-            pdf_enumerate_pending,
-            zip_enumerate_pending,
-            fs_nav_after_pdf_enumerate,
-            pending_auto_fs_open,
-            pending_return_to_parent,
-            pdf_placeholder_count,
-            cached_nav_indices,
-            cached_fs_seek_info,
-            fs_nav_locked_gen,
-            fs_nav_dropped_block_signature,
-            fs_nav_dropped_block_count,
-            fs_load_skip_signature,
-            fs_holdover_tex,
-            fs_boundary_hint,
-            virtual_folder_writeback,
-            pdf_prefetch_grace_until,
-            thumb_pixels,
-            thumb_edit_preview_layers,
-            thumb_edit_preview_keys,
-            thumb_adjust_tex,
-            passthrough_rendition_cache,
-            adjustment_page_params,
-            local_adjust_page_layers,
-            local_adjust_pages,
-            local_adjust_selected_layers,
-            local_adjust_generation,
-            local_adjust_cache,
-            local_adjust_pending,
-            export_crop_page_settings,
-            export_crop_pages,
-            mask_pages,
-            comic_pages,
-            conceal_pages,
-            erase_mask_generation,
-            conceal_mask_generation,
-            edit_result_cache,
-            final_ai_cache,
-            final_ai_pending,
-            final_ai_failed,
-            final_composite_cache,
-            final_effect_pending,
-            adjustment_cache,
-            erase_result_cache,
-            erase_preview_cache,
-            erase_base_cache,
-            conceal_base_cache,
-            conceal_cache,
-            comic_cache,
-            comic_bake_pending,
-            erase_inpaint_pending,
-            ai_classify_cache,
-            normalize_ui_states,
-            normalize_auto_scan_suppressed,
-            music_bookmarks,
-            music_bookmarks_loaded_for,
-            last_loop_pos,
-        } = bundle;
-
-        swap_field!(address);
-        swap_field!(current_folder);
-        swap_field!(navigation_scope);
-        swap_field!(archive_source_override);
-        swap_field!(zip_nav);
-        swap_field!(stack_mode_requested);
-        swap_field!(stack_view);
-        swap_field!(stack_showing_flat);
-        swap_field!(stack_active_rule);
-        swap_field!(stack_script_error);
-        swap_field!(stack_toggle_select_path);
-        swap_field!(items);
-        swap_field!(items_generation);
-        swap_field!(visible_indices);
-        swap_field!(facet_name_cache);
-        swap_field!(facet_name_cache_generation);
-        swap_field!(facet_name_cache_pending);
-        swap_field!(facet_name_cache_failed_generation);
-        swap_field!(thumbnails);
-        swap_field!(image_metas);
-        swap_field!(video_thumb_overrides);
-        swap_field!(auto_aspect);
-        swap_field!(selected);
-        swap_field!(grid_click_selection_anchor);
-        swap_field!(scroll_offset_y);
-        swap_field!(scroll_to_selected);
-        swap_field!(pending_grid_scroll);
-        swap_field!(requested);
-        swap_field!(idle_upgrade_cache_bypass_ineligible);
-        swap_field!(keep_range);
-        swap_field!(keep_set);
-        swap_field!(thumbnail_eviction_generation);
-        swap_field!(details_thumb_suppression_applied);
-        swap_field!(details_hover_thumb_idx);
-        swap_field!(details_hover_thumb_viewport_open);
-        swap_field!(texture_backlog);
-        swap_field!(details_order);
-        swap_field!(details_order_revision);
-        swap_field!(details_cell_content_revisions);
-        swap_field!(details_tag_prewarm_indices);
-        swap_field!(details_lazy_meta);
-        swap_field!(details_meta_pending);
-        swap_field!(details_lazy_visible_revision);
-        swap_field!(details_image_dims_state);
-        swap_field!(metadata_cache);
-        swap_field!(exif_cache);
-        swap_field!(xmp_cache);
-        swap_field!(xmp_panorama_info);
-        swap_field!(metadata_pending);
-        swap_field!(tags_cache);
-        swap_field!(tag_prewarm_pending);
-        swap_field!(tag_prewarm_queued);
-        swap_field!(tag_legacy_seed_pending);
-        swap_field!(pending_finalize);
-        // per-context ロード複合体 (review-v2.3.0 P2-8/P2-9)。channel/token/キューが
-        // コンテキストと一緒に移動するので、requested / pending_finalize の bookkeeping は
-        // swap 後もそのまま信用できる (末尾の clear は不要になった)。
-        swap_field!(tx);
-        swap_field!(rx);
-        swap_field!(cancel_token);
-        swap_field!(reload_queue);
-        swap_field!(heavy_io_queue);
-        swap_field!(scroll_hint);
-        swap_field!(visible_end_shared);
-        swap_field!(keep_start_shared);
-        swap_field!(keep_end_shared);
-        swap_field!(last_vis_range);
-        swap_field!(vis_settle_at);
-        swap_field!(vis_first_logged);
-        swap_field!(vis_all_logged);
-        swap_field!(folder_nav_pending);
-        swap_field!(folder_pane_open_pending);
-        swap_field!(pending_folder_nav_steps);
-        swap_field!(pending_folder_nav_mode);
-        swap_field!(search_filter);
-        swap_field!(search_filter_origin_folder);
-        swap_field!(checked);
-        swap_field!(rotation_cache);
-        swap_field!(page_dims_cache);
-        swap_field!(rating_cache);
-        swap_field!(rating_session_write_seen_generation);
-        swap_field!(metadata_import_refresh_index);
-        swap_field!(current_folder_rating_cache);
-        swap_field!(current_folder_last_mtime);
-        swap_field!(current_folder_signature);
-        swap_field!(folder_pin_map);
-        swap_field!(converted_archive_cache_paths);
-        swap_field!(converted_archive_pin_root_states);
-        swap_field!(converted_archive_cache_paths_pending);
-        swap_field!(current_color_cache_map);
-        swap_field!(current_color_catalog);
-        // VST3 deferred open は fullscreen_idx / items と同じ context ownership。
-        // (review-v2.3.0 追補 BA-7: vst3 deferred)
-        swap_field!(vst3_deferred_media_open);
-        swap_field!(fullscreen_idx);
-        viewer_session.swap_with_mounted(
-            &mut self.viewer_presentation,
-            &mut self.last_viewer_sync_stamp,
-            &mut self.detached_viewer_independent_active,
-            &mut self.detached_viewer_open_next_still_detached_once,
-            &mut self.detached_viewer_window_id,
-        );
-        swap_field!(native_video_in_window_active);
-        swap_field!(video_audio_mode);
-        swap_field!(video_audio_vst);
-        swap_field!(video_audio_mode_entry_target);
-        swap_field!(video_audio_exit_pending);
-        swap_field!(panorama_state);
-        swap_field!(pano_toast_shown_for_current_fs);
-        swap_field!(analysis_mode);
-        swap_field!(analysis_hover_color);
-        swap_field!(analysis_pinned_color);
-        swap_field!(analysis_grayscale);
-        swap_field!(analysis_mosaic_grid);
-        swap_field!(analysis_filter_mag);
-        swap_field!(analysis_guide_drag);
-        swap_field!(view_trim_mode);
-        swap_field!(view_trim_apply_mode);
-        swap_field!(view_trim_page_apply_root_idx);
-        swap_field!(view_trim_page_spread_separate);
-        swap_field!(view_trim_book_settings);
-        swap_field!(view_trim_page_overrides);
-        swap_field!(view_trim_dirty_page_overrides);
-        swap_field!(view_trim_save_pending);
-        swap_field!(fs_cache);
-        swap_field!(fs_lanczos_cache);
-        swap_field!(fs_margin_bbox_cache);
-        swap_field!(input_generation);
-        swap_field!(fs_pending);
-        swap_field!(fullscreen_pdf_promotion);
-        swap_field!(fs_pdf_display_target);
-        swap_field!(fs_early_dims);
-        swap_field!(fs_upload_backlog);
-        swap_field!(top_level_grid_view);
-        swap_field!(items_are_global_search_view);
-        swap_field!(items_are_tag_view);
-        swap_field!(items_are_reading_history_view);
-        swap_field!(items_are_bookmark_view);
-        swap_field!(items_are_rating_view);
-        swap_field!(items_are_subfolder_expansion_view);
-        swap_field!(items_are_smart_folder_view);
-        swap_field!(items_are_drive_list);
-        swap_field!(reading_history_return_from);
-        swap_field!(bookmark_view_state);
-        swap_field!(bookmark_open_pending);
-        swap_field!(fs_open_intent_from_grid);
-        swap_field!(pending_detached_video_host_switch);
-        swap_field!(fs_zoom);
-        swap_field!(fs_pan);
-        swap_field!(fs_zoom_active);
-        swap_field!(fs_zoom_aiming);
-        swap_field!(fs_zoom_factor);
-        swap_field!(fs_zoom_pdf_rerender_idx);
-        swap_field!(fs_zoom_pdf_rerender_zoom);
-        swap_field!(fs_pan_drag_start);
-        swap_field!(fs_vertical_scroll);
-        swap_field!(fs_seek_drag_active);
-        swap_field!(fs_seek_overlay_visible);
-        swap_field!(fs_vertical_cache_keep_set);
-        swap_field!(continuous_page_transitions);
-        swap_field!(fs_free_rotation);
-        swap_field!(fs_rotation_drag_start);
-        swap_field!(analysis_zoom);
-        swap_field!(analysis_pan);
-        swap_field!(analysis_pan_drag_start);
-        swap_field!(analysis_overlay_cache);
-        swap_field!(analysis_hist_cache);
-        swap_field!(analysis_sv_cache);
-        swap_field!(spread_mode);
-        swap_field!(spread_shift_anchor_idx);
-        swap_field!(reading_flow);
-        swap_field!(reading_direction);
-        swap_field!(slideshow_playing);
-        swap_field!(slideshow_next_at);
-        swap_field!(slideshow_anchor_idx);
-        swap_field!(continuous_reading_scroll_transition);
-        swap_field!(slideshow_scroll_range_cache);
-        swap_field!(pdf_password_request);
-        swap_field!(pdf_current_password);
-        swap_field!(pdf_password_pending_save);
-        swap_field!(pdf_enumerate_pending);
-        swap_field!(zip_enumerate_pending);
-        swap_field!(fs_nav_after_pdf_enumerate);
-        swap_field!(pending_auto_fs_open);
-        swap_field!(pending_return_to_parent);
-        swap_field!(pdf_placeholder_count);
-        swap_field!(cached_nav_indices);
-        swap_field!(cached_fs_seek_info);
-        swap_field!(fs_nav_locked_gen);
-        swap_field!(fs_nav_dropped_block_signature);
-        swap_field!(fs_nav_dropped_block_count);
-        swap_field!(fs_load_skip_signature);
-        swap_field!(fs_holdover_tex);
-        swap_field!(fs_boundary_hint);
-        swap_field!(virtual_folder_writeback);
-        swap_field!(pdf_prefetch_grace_until);
-        swap_field!(thumb_pixels);
-        swap_field!(thumb_edit_preview_layers);
-        swap_field!(thumb_edit_preview_keys);
-        swap_field!(thumb_adjust_tex);
-        swap_field!(passthrough_rendition_cache);
-        swap_field!(adjustment_page_params);
-        swap_field!(local_adjust_page_layers);
-        swap_field!(local_adjust_pages);
-        swap_field!(local_adjust_selected_layers);
-        swap_field!(local_adjust_generation);
-        swap_field!(local_adjust_cache);
-        swap_field!(local_adjust_pending);
-        swap_field!(export_crop_page_settings);
-        swap_field!(export_crop_pages);
-        swap_field!(mask_pages);
-        swap_field!(comic_pages);
-        swap_field!(conceal_pages);
-        swap_field!(erase_mask_generation);
-        swap_field!(conceal_mask_generation);
-        swap_field!(edit_result_cache);
-        swap_field!(final_ai_cache);
-        swap_field!(final_ai_pending);
-        swap_field!(final_ai_failed);
-        swap_field!(final_composite_cache);
-        swap_field!(final_effect_pending);
-        swap_field!(adjustment_cache);
-        swap_field!(erase_result_cache);
-        swap_field!(erase_preview_cache);
-        swap_field!(erase_base_cache);
-        swap_field!(conceal_base_cache);
-        swap_field!(conceal_cache);
-        swap_field!(comic_cache);
-        swap_field!(comic_bake_pending);
-        swap_field!(erase_inpaint_pending);
-        swap_field!(ai_classify_cache);
-        swap_field!(normalize_ui_states);
-        swap_field!(normalize_auto_scan_suppressed);
-        swap_field!(music_bookmarks);
-        swap_field!(music_bookmarks_loaded_for);
-        swap_field!(last_loop_pos);
-
-        // 旧実装はここで requested / pending_finalize を無条件 clear していた (worker queue が
-        // App-global で、swap 後の bookkeeping を信用できなかったため)。detached 窓が 1 枚でも
-        // あると mount/unmount + parked poll の swap が毎フレーム走るので、main の bookkeeping が
-        // 毎フレーム消え、Pending サムネがフレームごとに重複エンキュー/重複デコードされる
-        // churn になっていた (review-v2.3.0 P2-8)。channel/token/キューを bundle 化した現在は
-        // bookkeeping がコンテキストと一緒に移動するため clear 不要。
-        if self.sync_current_context_rating_session_writes() {
-            self.rebuild_visible_indices_preserving_facet_scope();
-        }
-    }
-
-    #[cfg(windows)]
-    fn take_current_viewer_context_bundle(&mut self) -> ViewerContextBundle {
-        let mut bundle = ViewerContextBundle::empty();
-        self.swap_viewer_context_bundle(&mut bundle);
-        bundle
-    }
 
     #[cfg(windows)]
     fn detached_viewer_suppresses_main_history_persistence(&self) -> bool {
@@ -16699,22 +15844,20 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn with_active_detached_viewer_context<R>(
+    pub(crate) fn with_active_viewer_context<R>(
         &mut self,
         f: impl FnOnce(&mut Self) -> R,
     ) -> Option<R> {
-        let mut active = self.active_detached_viewer_context.take()?;
-        self.swap_viewer_context_bundle(&mut active.bundle);
-        let previous_depth = self.detached_viewer_main_history_suppression_depth;
-        self.detached_viewer_main_history_suppression_depth = previous_depth.saturating_add(1);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
-        self.detached_viewer_main_history_suppression_depth = previous_depth;
-        self.swap_viewer_context_bundle(&mut active.bundle);
-        self.active_detached_viewer_context = Some(active);
-        match result {
-            Ok(value) => Some(value),
-            Err(payload) => std::panic::resume_unwind(payload),
-        }
+        let id = self.active_viewer_context_id()?;
+        self.with_viewer_context(id, |app| {
+            app.with_detached_viewer_main_history_suppressed(f)
+        })
+        .map_err(|error| {
+            crate::logger::log(format!(
+                "active_viewer_context_mount_failed error={error:?}"
+            ));
+        })
+        .ok()
     }
 
     pub(crate) fn effective_folder(&self) -> Option<PathBuf> {
@@ -18522,14 +17665,9 @@ impl App {
             self.spread_mode = stored_spread;
         }
         self.spread_shift_anchor_idx = None;
-        if self.spread_mode.is_rtl() {
-            self.reading_direction = crate::settings::ReadingDirection::Rtl;
-        } else if matches!(
-            self.spread_mode,
-            crate::settings::SpreadMode::Ltr | crate::settings::SpreadMode::LtrCover
-        ) {
-            self.reading_direction = crate::settings::ReadingDirection::Ltr;
-        }
+        // 読み順の対応表は `SpreadMode::reading_direction` が正本。ここへ写すと、
+        // モードを足したとき保存済みの本を開く経路だけ古いままになる。
+        self.update_reading_direction_from_spread_mode(self.spread_mode);
     }
 
     pub(crate) fn apply_view_trim_for_key(&mut self, key: &std::path::Path) {
@@ -19804,17 +18942,16 @@ impl App {
             consume(self, idx);
         }
 
-        let active_has_pending = self
-            .active_detached_viewer_context
-            .as_ref()
-            .is_some_and(|active| active.bundle.vst3_deferred_media_open.is_some());
-        if active_has_pending && let Some(mut active) = self.active_detached_viewer_context.take() {
-            self.swap_viewer_context_bundle(&mut active.bundle);
-            if let Some(idx) = self.take_mounted_deferred_vst3_media_open() {
-                consume(self, idx);
-            }
-            self.swap_viewer_context_bundle(&mut active.bundle);
-            self.active_detached_viewer_context = Some(active);
+        let active_has_pending = self.active_viewer_context_id().is_some_and(|id| {
+            self.with_viewer_context_ref(id, |context| context.vst3_deferred_media_open().is_some())
+                .unwrap_or(false)
+        });
+        if active_has_pending {
+            self.with_active_viewer_context(|app| {
+                if let Some(idx) = app.take_mounted_deferred_vst3_media_open() {
+                    consume(app, idx);
+                }
+            });
         }
 
         self.consume_deferred_vst3_media_open_in_parked_contexts(&mut consume);
@@ -19829,39 +18966,38 @@ impl App {
             .detached_image_windows
             .iter()
             .filter(|window| {
-                window
-                    .paused_bundle
-                    .as_deref()
-                    .is_some_and(|bundle| bundle.vst3_deferred_media_open.is_some())
+                self.locate_window_context(window.id)
+                    .is_some_and(|(id, _)| {
+                        self.with_viewer_context_ref(id, |context| {
+                            context.vst3_deferred_media_open().is_some()
+                        })
+                        .unwrap_or(false)
+                    })
             })
             .map(|window| window.id)
             .collect();
         for id in ids {
-            let Some(pos) = self
+            if !self
                 .detached_image_windows
                 .iter()
-                .position(|window| window.id == id)
-            else {
-                continue;
-            };
-            let Some(mut bundle) = self.detached_image_windows[pos].paused_bundle.take() else {
-                continue;
-            };
-            self.swap_viewer_context_bundle(&mut bundle);
-            let saved_input_window_id = self.native_video_parked_live_input_window_id;
-            self.native_video_parked_live_input_window_id = Some(id);
-            if let Some(idx) = self.take_mounted_deferred_vst3_media_open() {
-                consume(self, idx);
-            }
-            self.native_video_parked_live_input_window_id = saved_input_window_id;
-            self.swap_viewer_context_bundle(&mut bundle);
-            if let Some(window) = self
-                .detached_image_windows
-                .iter_mut()
-                .find(|window| window.id == id)
+                .any(|window| window.id == id)
             {
-                window.paused_bundle = Some(bundle);
+                continue;
             }
+            self.with_window_viewer_context(id, |app| {
+                let saved_input_window_id = app.native_video_parked_live_input_window_id;
+                app.native_video_parked_live_input_window_id = Some(id);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if let Some(idx) = app.take_mounted_deferred_vst3_media_open() {
+                        consume(app, idx);
+                    }
+                }));
+                app.native_video_parked_live_input_window_id = saved_input_window_id;
+                if let Err(payload) = result {
+                    std::panic::resume_unwind(payload);
+                }
+            })
+            .unwrap_or_else(|error| panic!("parked VST3 context {id} failed to mount: {error:?}"));
         }
     }
 
@@ -23404,12 +22540,14 @@ impl App {
 
     pub(crate) fn pdf_password_dialog_path(&self) -> Option<PathBuf> {
         #[cfg(windows)]
-        if let Some(path) = self
-            .active_detached_viewer_context
-            .as_ref()
-            .and_then(|active| active.bundle.pdf_password_request.as_ref())
-            .map(|request| request.path.clone())
-        {
+        if let Some(path) = self.active_viewer_context_id().and_then(|id| {
+            self.with_viewer_context_ref(id, |context| {
+                context
+                    .pdf_password_request()
+                    .map(|request| request.path.clone())
+            })
+            .flatten()
+        }) {
             return Some(path);
         }
         self.pdf_password_request
@@ -23423,10 +22561,10 @@ impl App {
         }
         #[cfg(windows)]
         {
-            return self
-                .active_detached_viewer_context
-                .as_ref()
-                .is_some_and(|active| active.bundle.pdf_password_request.is_some());
+            return self.active_viewer_context_id().is_some_and(|id| {
+                self.with_viewer_context_ref(id, |context| context.pdf_password_request().is_some())
+                    .unwrap_or(false)
+            });
         }
         #[cfg(not(windows))]
         false
@@ -23452,13 +22590,12 @@ impl App {
         save: bool,
     ) -> bool {
         #[cfg(windows)]
-        if self
-            .active_detached_viewer_context
-            .as_ref()
-            .is_some_and(|active| active.bundle.pdf_password_request.is_some())
-        {
+        if self.active_viewer_context_id().is_some_and(|id| {
+            self.with_viewer_context_ref(id, |context| context.pdf_password_request().is_some())
+                .unwrap_or(false)
+        }) {
             return self
-                .with_active_detached_viewer_context(|app| {
+                .with_active_viewer_context(|app| {
                     app.retry_pdf_password_request_in_mounted_context(password, save)
                 })
                 .unwrap_or(false);
@@ -23479,13 +22616,12 @@ impl App {
 
     pub(crate) fn cancel_pdf_password_dialog_request(&mut self) -> bool {
         #[cfg(windows)]
-        if self
-            .active_detached_viewer_context
-            .as_ref()
-            .is_some_and(|active| active.bundle.pdf_password_request.is_some())
-        {
+        if self.active_viewer_context_id().is_some_and(|id| {
+            self.with_viewer_context_ref(id, |context| context.pdf_password_request().is_some())
+                .unwrap_or(false)
+        }) {
             return self
-                .with_active_detached_viewer_context(|app| {
+                .with_active_viewer_context(|app| {
                     app.cancel_pdf_password_request_in_mounted_context()
                 })
                 .unwrap_or(false);
@@ -25143,13 +24279,17 @@ impl App {
         let mut pin_archive_dependencies: std::collections::HashMap<String, Vec<usize>> =
             std::collections::HashMap::new();
         for idx in 0..self.items.len() {
-            if !candidate_indices.contains(&idx)
-                || self.requested.contains_key(&idx)
-                || !matches!(
-                    self.thumbnails.get(idx),
-                    Some(ThumbnailState::Pending | ThumbnailState::Evicted)
-                )
-            {
+            // pin-root の発見は、そのタイルが今どう描かれているかとは無関係な事実に
+            // 基づく。以前はサムネイルが `Pending | Evicted` で未 requested のものだけを
+            // 見ていたが、`Loaded` と `Failed` は終端状態なので、いったんそこへ落ちた
+            // コンテナの pin は二度と解決されなかった。中身がアーカイブだけのフォルダは
+            // 自動選定が代表画像を選べず必ず `Failed` になるため、代表サムネの指定が
+            // 永久に反映されない自己強化ループになる (§1.121)。
+            //
+            // コストを抑える役目は、可視範囲の絞り込み (`candidate_indices`) と、
+            // root ごとに解決結果を覚える `converted_archive_pin_root_states` が持つ。
+            // 解決済みの root はここで DB も cascade も引き直さない。
+            if !candidate_indices.contains(&idx) {
                 continue;
             }
             let Some(target) = self
@@ -27037,8 +26177,9 @@ impl App {
     /// idx-keyed ページ編集状態の正準リスト**。新しい idx-keyed ページ編集マップを足したら
     /// ここと `remove_items_batch` の shift 群の両方に追加すること。bundle 外の native pending
     /// (`native_video_source_swap_pending` / `native_video_open_pending` /
-    /// `native_video_fast_swap_pending` / `video_tile_swap_pending`) も owner=None の mounted 所有だけ
-    /// 同じ shift 群へ追加すること (review-v2.3.0 追補3: 角度A-1)。
+    /// `native_video_fast_swap_pending` / `video_tile_swap_pending`) も同じ shift 群へ追加すること。
+    /// regular open は `ViewerContextId`、残る 3 種は legacy owner=None が mounted 所有を表す
+    /// (review-v2.3.0 追補3: 角度A-1)。
     pub(crate) fn clear_page_edit_state(&mut self) {
         self.adjustment_page_params.clear();
         self.local_adjust_page_layers.clear();
@@ -27403,8 +26544,7 @@ impl App {
             }
         }
         #[cfg(windows)]
-        let detached_media_owns_global_indices = self
-            .active_detached_viewer_context_contains_video()
+        let detached_media_owns_global_indices = self.other_active_viewer_context_contains_video()
             || self.parked_live_media_window_exists();
         #[cfg(not(windows))]
         let detached_media_owns_global_indices = false;
@@ -27472,14 +26612,13 @@ impl App {
         #[cfg(windows)]
         {
             self.vst3_deferred_media_open = self.vst3_deferred_media_open.and_then(shift);
-            // owner=None は mounted と promoted active の二義。active bundle が存在する間は
-            // 4 pending の idx 空間も bundle 側なので main items の削除では shift しない。
-            // ParkedLive pending は owner=Some(window_id) の既存 gate で別途守られる。
-            let shift_ownerless_native_pending =
-                !self.active_detached_viewer_context_contains_video();
-            // bundle 外の native pending 4 種も、現在 mount 中の context 所有 (owner=None)
-            // だけ main items の old→new idx へ追随させる。owner=Some(window_id) は ParkedLive
-            // bundle 内 items の idx 空間なので、main grid の削除では絶対に動かさない。
+            // source/fast/tile の owner=None は mounted と promoted active の二義。active bundle が
+            // 存在する間は 3 pending の idx 空間も bundle 側なので main items の削除では shift
+            // しない。regular open は投影中の ViewerContextId との一致で判定できる。
+            let shift_ownerless_native_pending = !self.other_active_viewer_context_contains_video();
+            let projected_context = self.projected_viewer_context_id();
+            // bundle 外の native pending も、それぞれ現在投影中の context が所有するものだけ
+            // main items の old→new idx へ追随させる。別 context の idx 空間は動かさない。
             // (review-v2.3.0 追補3: 角度A-1)
             let discard_source_swap =
                 self.native_video_source_swap_pending
@@ -27519,15 +26658,12 @@ impl App {
                 .native_video_open_pending
                 .as_ref()
                 .is_some_and(|pending| {
-                    pending.parked_live_window_id.is_none()
-                        && shift_ownerless_native_pending
-                        && shift(pending.idx).is_none()
+                    pending.owner_context_id == projected_context && shift(pending.idx).is_none()
                 });
             if discard_open {
-                self.native_video_open_pending = None;
+                self.clear_native_video_open_pending("items_removed");
             } else if let Some(pending) = self.native_video_open_pending.as_mut()
-                && pending.parked_live_window_id.is_none()
-                && shift_ownerless_native_pending
+                && pending.owner_context_id == projected_context
             {
                 pending.idx = shift(pending.idx).expect("native open target removal handled above");
             }
@@ -27653,12 +26789,11 @@ impl App {
                         return false;
                     }
                     let vst_waiting = self.vst3_deferred_media_open == Some(idx);
-                    let native_waiting = !self.active_detached_viewer_context_contains_video()
-                        && self
-                            .native_video_open_pending
+                    let native_waiting =
+                        self.native_video_open_pending
                             .as_ref()
                             .is_some_and(|pending| {
-                                pending.parked_live_window_id.is_none()
+                                pending.owner_context_id == self.projected_viewer_context_id()
                                     && pending.idx == idx
                                     && crate::folder_tree::path_eq(&pending.path, item_path)
                                     && matches_key(&crate::adjustment_db::normalize_path(
@@ -27681,15 +26816,17 @@ impl App {
         #[cfg(windows)]
         {
             // active detached (live bundle) が対象を表示 / 再生中なら閉じる。
-            let active_matches = self
-                .active_detached_viewer_context
-                .as_ref()
-                .is_some_and(|c| viewer_bundle_references_removed(&c.bundle, &matches_key));
+            let active_matches = self.active_viewer_context_id().is_some_and(|id| {
+                self.with_viewer_context_ref(id, |context| {
+                    viewer_bundle_references_removed(context, &matches_key)
+                })
+                .unwrap_or(false)
+            });
             if active_matches {
                 crate::logger::log(format!(
                     "[removed-path] close active detached reason={reason}"
                 ));
-                self.close_current_active_detached_viewer_context(ctx);
+                self.close_current_active_viewer_context(ctx);
             }
 
             // passive / parked 窓 (parked-live メディア含む)。ctx 不要の close 経路
@@ -27697,7 +26834,20 @@ impl App {
             let ids: Vec<u64> = self
                 .detached_image_windows
                 .iter()
-                .filter(|w| detached_window_references_removed(w, &matches_key))
+                .filter(|window| {
+                    self.locate_window_context(window.id)
+                        .is_some_and(|(id, _)| {
+                            self.with_viewer_context_ref(id, |context| {
+                                detached_window_references_removed(
+                                    window,
+                                    Some(context),
+                                    &matches_key,
+                                )
+                            })
+                            .unwrap_or(false)
+                        })
+                        || detached_window_references_removed(window, None, &matches_key)
+                })
                 .map(|w| w.id)
                 .collect();
             if !ids.is_empty() {
@@ -27885,21 +27035,25 @@ impl App {
         self.metadata_import_refresh_index = None;
         #[cfg(windows)]
         {
-            if let Some(mut active) = self.active_detached_viewer_context.take() {
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                self.metadata_import_refresh_index = None;
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                self.active_detached_viewer_context = Some(active);
-            }
-            for index in 0..self.detached_image_windows.len() {
-                let Some(mut bundle) = self.detached_image_windows[index].paused_bundle.take()
-                else {
+            self.with_active_viewer_context(|app| {
+                app.metadata_import_refresh_index = None;
+            });
+            let window_ids: Vec<u64> = self
+                .detached_image_windows
+                .iter()
+                .map(|window| window.id)
+                .collect();
+            for window_id in window_ids {
+                if self.locate_window_context(window_id).is_none() {
                     continue;
-                };
-                self.swap_viewer_context_bundle(&mut bundle);
-                self.metadata_import_refresh_index = None;
-                self.swap_viewer_context_bundle(&mut bundle);
-                self.detached_image_windows[index].paused_bundle = Some(bundle);
+                }
+                if let Err(error) = self.with_window_viewer_context(window_id, |app| {
+                    app.metadata_import_refresh_index = None;
+                }) {
+                    crate::logger::log(format!(
+                        "metadata_import_index_clear_mount_failed window_id={window_id} error={error:?}"
+                    ));
+                }
             }
         }
     }
@@ -27929,44 +27083,55 @@ impl App {
         );
         #[cfg(windows)]
         {
-            if complete
-                && remaining > 0
-                && std::time::Instant::now() < deadline
-                && let Some(mut active) = self.active_detached_viewer_context.take()
-            {
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                complete = self.advance_current_metadata_import_terminal_index(
-                    import_root,
-                    recursive,
-                    collect_legacy_seed_paths,
-                    &mut remaining,
-                    deadline,
-                );
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                self.active_detached_viewer_context = Some(active);
-            }
-            if complete {
-                for index in 0..self.detached_image_windows.len() {
-                    if remaining == 0 || std::time::Instant::now() >= deadline {
-                        complete = false;
-                        break;
-                    }
-                    let Some(mut bundle) = self.detached_image_windows[index].paused_bundle.take()
-                    else {
-                        continue;
-                    };
-                    self.swap_viewer_context_bundle(&mut bundle);
-                    complete = self.advance_current_metadata_import_terminal_index(
+            if complete && remaining > 0 && std::time::Instant::now() < deadline {
+                if let Some(context_complete) = self.with_active_viewer_context(|app| {
+                    app.advance_current_metadata_import_terminal_index(
                         import_root,
                         recursive,
                         collect_legacy_seed_paths,
                         &mut remaining,
                         deadline,
-                    );
-                    self.swap_viewer_context_bundle(&mut bundle);
-                    self.detached_image_windows[index].paused_bundle = Some(bundle);
-                    if !complete {
+                    )
+                }) {
+                    complete = context_complete;
+                }
+            }
+            if complete {
+                let window_ids: Vec<u64> = self
+                    .detached_image_windows
+                    .iter()
+                    .map(|window| window.id)
+                    .collect();
+                for window_id in window_ids {
+                    if remaining == 0 || std::time::Instant::now() >= deadline {
+                        complete = false;
                         break;
+                    }
+                    if self.locate_window_context(window_id).is_none() {
+                        continue;
+                    }
+                    match self.with_window_viewer_context(window_id, |app| {
+                        app.advance_current_metadata_import_terminal_index(
+                            import_root,
+                            recursive,
+                            collect_legacy_seed_paths,
+                            &mut remaining,
+                            deadline,
+                        )
+                    }) {
+                        Ok(context_complete) => {
+                            complete = context_complete;
+                            if !complete {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            crate::logger::log(format!(
+                                "metadata_import_index_mount_failed window_id={window_id} error={error:?}"
+                            ));
+                            complete = false;
+                            break;
+                        }
                     }
                 }
             }
@@ -28120,13 +27285,13 @@ impl App {
     ) -> Vec<metadata_import_refresh::ContextRequest> {
         fn take_current(
             index: &mut Option<MetadataImportRefreshIndex>,
-            slot: metadata_import_refresh::ContextSlot,
+            context_id: ViewerContextId,
             spread_container_path: Option<PathBuf>,
             old_folder_pin_keys: std::collections::HashSet<String>,
         ) -> Option<metadata_import_refresh::ContextRequest> {
             let index = index.take()?;
             (index.complete && index.affected).then_some(metadata_import_refresh::ContextRequest {
-                slot,
+                context_id,
                 items_generation: index.items_generation,
                 items: index.items,
                 legacy_seed_paths: index.legacy_seed_paths,
@@ -28139,58 +27304,42 @@ impl App {
         }
 
         let mut requests = Vec::new();
-        let spread_path = self.spread_container_key();
-        let old_folder_pin_keys = self.folder_pin_map.keys().cloned().collect();
-        if let Some(request) = take_current(
-            &mut self.metadata_import_refresh_index,
-            metadata_import_refresh::ContextSlot::Main,
-            spread_path,
-            old_folder_pin_keys,
-        ) {
-            requests.push(request);
-        }
         #[cfg(windows)]
         {
-            if let Some(mut active) = self.active_detached_viewer_context.take() {
-                let window_id = self.active_detached_window_id();
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                let spread_path = self.spread_container_key();
-                let old_folder_pin_keys = self.folder_pin_map.keys().cloned().collect();
-                if let Some(request) = take_current(
-                    &mut self.metadata_import_refresh_index,
-                    metadata_import_refresh::ContextSlot::ActiveDetached(window_id),
-                    spread_path,
-                    old_folder_pin_keys,
-                ) {
-                    requests.push(request);
+            let main_id = self.viewer_context_main();
+            let mut context_ids = self.viewer_context_ids();
+            context_ids.sort_by_key(|id| (*id != main_id, id.serial()));
+            for context_id in context_ids {
+                if let Err(error) = self.with_viewer_context(context_id, |app| {
+                    let spread_path = app.spread_container_key();
+                    let old_folder_pin_keys = app.folder_pin_map.keys().cloned().collect();
+                    if let Some(request) = take_current(
+                        &mut app.metadata_import_refresh_index,
+                        context_id,
+                        spread_path,
+                        old_folder_pin_keys,
+                    ) {
+                        requests.push(request);
+                    }
+                }) {
+                    crate::logger::log(format!(
+                        "metadata_import_request_mount_failed context_id={context_id:?} error={error:?}"
+                    ));
                 }
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                self.active_detached_viewer_context = Some(active);
             }
-            for window_index in 0..self.detached_image_windows.len() {
-                let window_id = self.detached_image_windows[window_index].id;
-                let Some(mut bundle) = self.detached_image_windows[window_index]
-                    .paused_bundle
-                    .take()
-                else {
-                    continue;
-                };
-                self.swap_viewer_context_bundle(&mut bundle);
-                let spread_path = self.spread_container_key();
-                let old_folder_pin_keys = self.folder_pin_map.keys().cloned().collect();
-                if let Some(request) = take_current(
-                    &mut self.metadata_import_refresh_index,
-                    metadata_import_refresh::ContextSlot::PausedDetached {
-                        index: window_index,
-                        window_id,
-                    },
-                    spread_path,
-                    old_folder_pin_keys,
-                ) {
-                    requests.push(request);
-                }
-                self.swap_viewer_context_bundle(&mut bundle);
-                self.detached_image_windows[window_index].paused_bundle = Some(bundle);
+        }
+        #[cfg(not(windows))]
+        {
+            let context_id = ViewerContextId::single_context();
+            let spread_path = self.spread_container_key();
+            let old_folder_pin_keys = self.folder_pin_map.keys().cloned().collect();
+            if let Some(request) = take_current(
+                &mut self.metadata_import_refresh_index,
+                context_id,
+                spread_path,
+                old_folder_pin_keys,
+            ) {
+                requests.push(request);
             }
         }
         requests
@@ -28222,25 +27371,37 @@ impl App {
         release_tag_db_for_import: bool,
     ) -> Result<bool, String> {
         let mut busy = self.quiesce_current_metadata_transfer_context_writers();
+        #[cfg(all(test, windows))]
+        {
+            busy |= tests::take_metadata_busy_initial_for_test();
+        }
         #[cfg(windows)]
         {
-            if let Some(mut active) = self.active_detached_viewer_context.take() {
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                busy |= self.quiesce_current_metadata_transfer_context_writers();
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                self.active_detached_viewer_context = Some(active);
+            if let Some(context_busy) = self.with_active_viewer_context(|app| {
+                app.quiesce_current_metadata_transfer_context_writers()
+            }) {
+                busy |= context_busy;
             }
-            for window_index in 0..self.detached_image_windows.len() {
-                let Some(mut bundle) = self.detached_image_windows[window_index]
-                    .paused_bundle
-                    .take()
-                else {
+            let window_ids: Vec<u64> = self
+                .detached_image_windows
+                .iter()
+                .map(|window| window.id)
+                .collect();
+            for window_id in window_ids {
+                if self.locate_window_context(window_id).is_none() {
                     continue;
-                };
-                self.swap_viewer_context_bundle(&mut bundle);
-                busy |= self.quiesce_current_metadata_transfer_context_writers();
-                self.swap_viewer_context_bundle(&mut bundle);
-                self.detached_image_windows[window_index].paused_bundle = Some(bundle);
+                }
+                match self.with_window_viewer_context(window_id, |app| {
+                    app.quiesce_current_metadata_transfer_context_writers()
+                }) {
+                    Ok(context_busy) => busy |= context_busy,
+                    Err(error) => {
+                        crate::logger::log(format!(
+                            "metadata_transfer_quiesce_mount_failed window_id={window_id} error={error:?}"
+                        ));
+                        busy = true;
+                    }
+                }
             }
         }
 
@@ -28291,6 +27452,12 @@ impl App {
 
     /// 転送待機で取消したXMP rating readerを、完了・開始失敗・待機キャンセル後に
     /// contextごとへ戻す。legacy seedは安全に完走させているため再生成しない。
+    fn ensure_mounted_tag_prewarm_started(&mut self) {
+        if !self.items.is_empty() && self.tag_prewarm_pending.is_none() {
+            self.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
+        }
+    }
+
     pub(crate) fn resume_metadata_transfer_context_readers(&mut self) {
         if let Some(handle) = self.tag_write_handle.as_ref() {
             handle.resume_db();
@@ -28300,26 +27467,37 @@ impl App {
         if !self.settings.write_rating_to_xmp {
             return;
         }
-        if !self.items.is_empty() && self.tag_prewarm_pending.is_none() {
-            self.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
-        }
+        self.ensure_mounted_tag_prewarm_started();
         #[cfg(windows)]
         {
-            if let Some(active) = self.active_detached_viewer_context.as_mut()
-                && !active.bundle.items.is_empty()
-                && active.bundle.tag_prewarm_pending.is_none()
-            {
-                active.bundle.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
-            }
-            for window in &mut self.detached_image_windows {
-                if let Some(bundle) = window.paused_bundle.as_mut()
-                    && !bundle.items.is_empty()
-                    && bundle.tag_prewarm_pending.is_none()
-                {
-                    bundle.tag_prewarm_pending = Some(crate::tag_prewarm::spawn());
+            for id in self.other_viewer_context_ids() {
+                if let Err(error) = self.with_viewer_context(id, |app| {
+                    app.ensure_mounted_tag_prewarm_started();
+                }) {
+                    crate::logger::log(format!(
+                        "tag_prewarm_resume_skipped id={id:?} error={error:?}"
+                    ));
                 }
             }
         }
+    }
+
+    #[cfg(windows)]
+    fn log_metadata_import_context_drop(context_id: ViewerContextId, residence: ContextResidence) {
+        let reason = match residence {
+            ContextResidence::Retired => "context_retired",
+            ContextResidence::Unknown => "unknown_identity severity=unexpected",
+            ContextResidence::Building | ContextResidence::Retiring => {
+                "ui_thread_transition_observed severity=unexpected"
+            }
+            ContextResidence::Mounted | ContextResidence::AtRest => return,
+        };
+        let message = format!(
+            "metadata_import_refresh_result_dropped context_id={context_id:?} residence={residence:?} reason={reason}"
+        );
+        #[cfg(all(test, windows))]
+        tests::record_metadata_import_drop_log_for_test(&message);
+        crate::logger::log(message);
     }
 
     pub(crate) fn apply_metadata_import_terminal_refresh(
@@ -28327,90 +27505,73 @@ impl App {
         result: metadata_import_refresh::RefreshResult,
         changed: crate::metadata_transfer::ImportChangedSections,
     ) -> (Vec<String>, bool) {
-        let stale_before_apply = result.contexts.iter().any(|context| match context.slot {
-            metadata_import_refresh::ContextSlot::Main => {
-                context.items_generation != self.items_generation
+        #[cfg(windows)]
+        let stale_before_apply = result.contexts.iter().any(|context| {
+            match self.viewer_context_residence(context.context_id) {
+                ContextResidence::Mounted | ContextResidence::AtRest => self
+                    .with_viewer_context_ref(context.context_id, |viewer| {
+                        viewer.items_generation() != context.items_generation
+                    })
+                    .expect("a live viewer context must be readable for metadata refresh"),
+                ContextResidence::Building
+                | ContextResidence::Retiring
+                | ContextResidence::Retired
+                | ContextResidence::Unknown => false,
             }
-            #[cfg(windows)]
-            metadata_import_refresh::ContextSlot::ActiveDetached(expected_window_id) => {
-                self.active_detached_window_id() != expected_window_id
-                    || self
-                        .active_detached_viewer_context
-                        .as_ref()
-                        .is_some_and(|active| {
-                            active.bundle.items_generation != context.items_generation
-                        })
-            }
-            #[cfg(windows)]
-            metadata_import_refresh::ContextSlot::PausedDetached {
-                index: window_index,
-                window_id,
-            } => self
-                .detached_image_windows
-                .get(window_index)
-                .is_some_and(|window| {
-                    window.id != window_id
-                        || window.paused_bundle.as_ref().is_some_and(|bundle| {
-                            bundle.items_generation != context.items_generation
-                        })
-                }),
-            #[cfg(not(windows))]
-            _ => false,
+        });
+        #[cfg(not(windows))]
+        let stale_before_apply = result.contexts.iter().any(|context| {
+            context.context_id == ViewerContextId::single_context()
+                && context.items_generation != self.items_generation
         });
         if stale_before_apply {
             return (result.errors, true);
         }
         let mut stale_context = false;
+        #[cfg(all(test, windows))]
+        {
+            stale_context |= tests::take_metadata_stale_initial_for_test();
+        }
         if let Some(snapshot) = result.page_snapshot {
             self.replace_metadata_import_page_state_snapshot(snapshot);
         }
         for context in result.contexts {
-            match context.slot {
-                metadata_import_refresh::ContextSlot::Main => {
-                    stale_context |=
-                        !self.apply_current_metadata_import_terminal_result(context, changed);
-                }
-                #[cfg(windows)]
-                metadata_import_refresh::ContextSlot::ActiveDetached(expected_window_id) => {
-                    if self.active_detached_window_id() != expected_window_id {
-                        stale_context = true;
-                    } else if let Some(mut active) = self.active_detached_viewer_context.take() {
-                        self.swap_viewer_context_bundle(&mut active.bundle);
-                        stale_context |=
-                            !self.apply_current_metadata_import_terminal_result(context, changed);
-                        self.swap_viewer_context_bundle(&mut active.bundle);
-                        self.active_detached_viewer_context = Some(active);
-                    }
-                }
-                #[cfg(windows)]
-                metadata_import_refresh::ContextSlot::PausedDetached {
-                    index: window_index,
-                    window_id,
-                } => {
-                    if self
-                        .detached_image_windows
-                        .get(window_index)
-                        .is_some_and(|window| window.id != window_id)
-                    {
-                        stale_context = true;
-                        continue;
-                    }
-                    if let Some(mut bundle) = self
-                        .detached_image_windows
-                        .get_mut(window_index)
-                        .and_then(|window| window.paused_bundle.take())
-                    {
-                        self.swap_viewer_context_bundle(&mut bundle);
-                        stale_context |=
-                            !self.apply_current_metadata_import_terminal_result(context, changed);
-                        self.swap_viewer_context_bundle(&mut bundle);
-                        if let Some(window) = self.detached_image_windows.get_mut(window_index) {
-                            window.paused_bundle = Some(bundle);
+            #[cfg(windows)]
+            {
+                let context_id = context.context_id;
+                match self.viewer_context_residence(context_id) {
+                    ContextResidence::Mounted | ContextResidence::AtRest => {
+                        match self.with_viewer_context(context_id, |app| {
+                            app.apply_current_metadata_import_terminal_result(context, changed)
+                        }) {
+                            Ok(applied) => stale_context |= !applied,
+                            Err(error) => {
+                                crate::logger::log(format!(
+                                    "metadata_import_apply_mount_failed context_id={context_id:?} error={error:?}"
+                                ));
+                                stale_context = true;
+                            }
                         }
                     }
+                    residence @ (ContextResidence::Building
+                    | ContextResidence::Retiring
+                    | ContextResidence::Retired
+                    | ContextResidence::Unknown) => {
+                        Self::log_metadata_import_context_drop(context_id, residence);
+                    }
                 }
-                #[cfg(not(windows))]
-                _ => {}
+            }
+            #[cfg(not(windows))]
+            {
+                if context.context_id == ViewerContextId::single_context() {
+                    stale_context |=
+                        !self.apply_current_metadata_import_terminal_result(context, changed);
+                } else {
+                    crate::logger::log(format!(
+                        "metadata_import_refresh_result_dropped context_id={:?} reason=unknown_identity severity=unexpected",
+                        context.context_id
+                    ));
+                }
             }
         }
 
@@ -28436,6 +27597,108 @@ impl App {
             self.notify_bookmarks_changed();
         }
         (result.errors, stale_context)
+    }
+
+    fn refresh_folder_pin_thumbnail_materializations(&mut self, indices: &[usize]) {
+        let use_full_path_keys = self.use_full_path_cache_keys();
+        let mut pin_prefixes = std::collections::HashSet::new();
+        let mut retained_pin_keys = std::collections::HashSet::new();
+        for &index in indices {
+            let Some(item) = self.items.get(index) else {
+                continue;
+            };
+            let item_meta = self.image_metas.get(index).copied().flatten();
+            let keys = folder_thumb_existing_keys_for(
+                item,
+                item_meta,
+                &self.folder_pin_map,
+                self.folder_thumb_pin_db.as_deref(),
+                Some(self.settings.folder_thumb_sort),
+                self.settings.folder_thumb_depth,
+                use_full_path_keys,
+            );
+            if let Some(base_key) = keys.first() {
+                pin_prefixes.insert(
+                    [base_key.as_str(), crate::thumb_loader::CACHE_KEY_PIN_SUFFIX].concat(),
+                );
+            }
+            retained_pin_keys.extend(keys.into_iter().skip(1));
+        }
+
+        for &index in indices {
+            self.evict_thumbnail_for_reload(index);
+        }
+
+        let Some(cache_map) = self.current_color_cache_map.clone() else {
+            return;
+        };
+        let Some(catalog) = self.current_color_catalog.clone() else {
+            return;
+        };
+        let stale_pin_keys = cache_map
+            .read()
+            .ok()
+            .map(|map| {
+                map.keys()
+                    .filter(|key| {
+                        pin_prefixes.iter().any(|prefix| key.starts_with(prefix))
+                            && !retained_pin_keys.contains(*key)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for key in stale_pin_keys {
+            match catalog.delete_one(&key) {
+                Ok(()) => {
+                    if let Ok(mut map) = cache_map.write() {
+                        map.remove(&key);
+                    }
+                }
+                Err(error) => crate::logger::log(format!(
+                    "metadata pin refresh: stale catalog delete failed: {error} ({key})"
+                )),
+            }
+        }
+        self.seed_folder_video_pin_thumbs(&cache_map, Some(&catalog));
+    }
+
+    fn restart_thumbnail_workers_after_metadata_pin_refresh(&mut self) {
+        if self.reload_queue.is_none() && self.heavy_io_queue.is_none() {
+            return;
+        }
+        let Some(cache_map) = self.current_color_cache_map.clone() else {
+            return;
+        };
+
+        self.cancel_token.store(true, Ordering::Relaxed);
+        self.wake_all_workers();
+
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let reload_queue: Arc<NotifyQueue> = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        let heavy_io_queue: Arc<NotifyQueue> = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+
+        self.tx = tx.clone();
+        self.rx = rx;
+        self.cancel_token = Arc::clone(&cancel);
+        self.reload_queue = Some(Arc::clone(&reload_queue));
+        self.heavy_io_queue = Some(Arc::clone(&heavy_io_queue));
+        self.requested.clear();
+        self.pending_finalize.clear();
+        self.texture_backlog.clear();
+        self.cache_gen_total = 0;
+        self.cache_gen_done = Arc::new(AtomicUsize::new(0));
+
+        self.spawn_thumbnail_workers(
+            &tx,
+            cancel,
+            reload_queue,
+            heavy_io_queue,
+            cache_map,
+            self.current_color_catalog.clone(),
+            self.folder_thumb_pin_db.clone(),
+        );
     }
 
     fn apply_current_metadata_import_terminal_result(
@@ -28517,14 +27780,8 @@ impl App {
             } else {
                 self.spread_mode = stored_spread;
             }
-            if self.spread_mode.is_rtl() {
-                self.reading_direction = crate::settings::ReadingDirection::Rtl;
-            } else if matches!(
-                self.spread_mode,
-                crate::settings::SpreadMode::Ltr | crate::settings::SpreadMode::LtrCover
-            ) {
-                self.reading_direction = crate::settings::ReadingDirection::Ltr;
-            }
+            // 読み順の対応表は `SpreadMode::reading_direction` が正本 (上と同じ理由)。
+            self.update_reading_direction_from_spread_mode(self.spread_mode);
             self.spread_shift_anchor_idx = None;
             let trim = container.view_trim.unwrap_or_default();
             self.view_trim_apply_mode = match trim.apply_mode {
@@ -28537,34 +27794,27 @@ impl App {
             self.view_trim_page_apply_root_idx = None;
             self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
         }
-        let folder_thumbnails_changed = result
-            .folder_pin_reset_indices
-            .as_ref()
-            .is_some_and(|indices| !indices.is_empty());
+        let folder_pin_reset_indices = result.folder_pin_reset_indices.take().unwrap_or_default();
         if let Some(folder_pins) = result.folder_pin_map.take() {
             self.invalidate_converted_archive_pin_root_states();
             self.folder_pin_map = folder_pins;
         }
-        if let Some(indices) = result.folder_pin_reset_indices.take() {
-            for index in indices {
-                if let Some(thumbnail) = self.thumbnails.get_mut(index) {
-                    *thumbnail = ThumbnailState::Pending;
-                }
-                self.requested.remove(&index);
-                self.pending_finalize.remove(&index);
-            }
+        if !folder_pin_reset_indices.is_empty() {
+            self.refresh_folder_pin_thumbnail_materializations(&folder_pin_reset_indices);
         }
-        if let (Some(video_items), Some(pin_blobs)) =
-            (result.video_items.take(), result.video_pin_blobs.take())
-            && !video_items.is_empty()
-        {
-            for (index, _, _) in &video_items {
-                if let Some(thumbnail) = self.thumbnails.get_mut(*index) {
-                    *thumbnail = ThumbnailState::Pending;
+        let video_refresh = match (result.video_items.take(), result.video_pin_blobs.take()) {
+            (Some(video_items), Some(pin_blobs)) if !video_items.is_empty() => {
+                for (index, _, _) in &video_items {
+                    self.evict_thumbnail_for_reload(*index);
                 }
-                self.requested.remove(index);
-                self.pending_finalize.remove(index);
+                Some((video_items, pin_blobs))
             }
+            _ => None,
+        };
+        if !folder_pin_reset_indices.is_empty() || video_refresh.is_some() {
+            self.restart_thumbnail_workers_after_metadata_pin_refresh();
+        }
+        if let Some((video_items, pin_blobs)) = video_refresh {
             self.spawn_video_thread(
                 self.tx.clone(),
                 Arc::clone(&self.cancel_token),
@@ -28573,16 +27823,6 @@ impl App {
                 pin_blobs,
             );
         }
-        // folder pin自体、またはそのleafとなるvideo pinの変更時はcontextを一度だけ
-        // 再materializeし、catalogへseed済みの代表WebPも更新・削除する。
-        if folder_thumbnails_changed {
-            self.folder_thumb_pin_dirty = true;
-            // dirty flag自体はApp-globalなので、detached/parked bundleをswap backする前に
-            // 現在mount中のcontextで消費する。video pinをleafに持つ代表サムネの
-            // catalog seed更新・削除も、通常ロードと同じ経路でcontextごとに一度だけ行う。
-            self.consume_folder_thumb_pin_dirty();
-        }
-
         if changed.book_bookmarks {
             self.current_book_bookmarks.clear();
             self.current_book_bookmarks_key = None;
@@ -28985,45 +28225,42 @@ impl App {
 
         #[cfg(windows)]
         {
-            let active_matches = self
-                .active_detached_viewer_context
-                .as_ref()
-                .is_some_and(|c| {
-                    viewer_bundle_references_removed(&c.bundle, &matches_key)
-                        || folder_refs(c.bundle.current_folder.as_deref())
-                        || items_ref(&c.bundle.items)
-                });
+            let active_matches = self.active_viewer_context_id().is_some_and(|id| {
+                self.with_viewer_context_ref(id, |context| {
+                    viewer_bundle_references_removed(context, &matches_key)
+                        || folder_refs(context.current_folder())
+                        || items_ref(context.items())
+                })
+                .unwrap_or(false)
+            });
             if active_matches {
-                if let Some(ctx_state) = self.active_detached_viewer_context.take() {
-                    let mut bundle = ctx_state.bundle;
-                    self.swap_viewer_context_bundle(&mut bundle);
-                    self.rehydrate_mounted_context_after_rename();
-                    self.swap_viewer_context_bundle(&mut bundle);
-                    self.active_detached_viewer_context =
-                        Some(ActiveDetachedViewerContext { bundle });
-                }
+                self.with_active_viewer_context(|app| {
+                    app.rehydrate_mounted_context_after_rename();
+                });
             }
-            let idxs: Vec<usize> = self
+            let window_ids: Vec<u64> = self
                 .detached_image_windows
                 .iter()
-                .enumerate()
-                .filter(|(_, w)| {
-                    w.paused_bundle.as_deref().is_some_and(|b| {
-                        viewer_bundle_references_removed(b, &matches_key)
-                            || folder_refs(b.current_folder.as_deref())
-                            || items_ref(&b.items)
-                    })
+                .filter(|window| {
+                    self.locate_window_context(window.id)
+                        .is_some_and(|(id, _)| {
+                            self.with_viewer_context_ref(id, |context| {
+                                viewer_bundle_references_removed(context, &matches_key)
+                                    || folder_refs(context.current_folder())
+                                    || items_ref(context.items())
+                            })
+                            .unwrap_or(false)
+                        })
                 })
-                .map(|(i, _)| i)
+                .map(|window| window.id)
                 .collect();
-            for i in idxs {
-                let Some(mut bundle) = self.detached_image_windows[i].paused_bundle.take() else {
-                    continue;
-                };
-                self.swap_viewer_context_bundle(&mut bundle);
-                self.rehydrate_mounted_context_after_rename();
-                self.swap_viewer_context_bundle(&mut bundle);
-                self.detached_image_windows[i].paused_bundle = Some(bundle);
+            for window_id in window_ids {
+                self.with_window_viewer_context(window_id, |app| {
+                    app.rehydrate_mounted_context_after_rename();
+                })
+                .unwrap_or_else(|error| {
+                    panic!("rename rehydrate context {window_id} failed to mount: {error:?}")
+                });
             }
         }
     }
@@ -30422,23 +29659,25 @@ impl App {
         self.rebuild_visible_indices_preserving_facet_scope();
         #[cfg(windows)]
         {
-            if let Some(mut active) = self.active_detached_viewer_context.take() {
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                self.rebuild_visible_indices_preserving_facet_scope();
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                self.active_detached_viewer_context = Some(active);
-            }
-            for window_index in 0..self.detached_image_windows.len() {
-                let Some(mut bundle) = self.detached_image_windows[window_index]
-                    .paused_bundle
-                    .take()
-                else {
+            self.with_active_viewer_context(|app| {
+                app.rebuild_visible_indices_preserving_facet_scope();
+            });
+            let window_ids: Vec<u64> = self
+                .detached_image_windows
+                .iter()
+                .map(|window| window.id)
+                .collect();
+            for window_id in window_ids {
+                if self.locate_window_context(window_id).is_none() {
                     continue;
-                };
-                self.swap_viewer_context_bundle(&mut bundle);
-                self.rebuild_visible_indices_preserving_facet_scope();
-                self.swap_viewer_context_bundle(&mut bundle);
-                self.detached_image_windows[window_index].paused_bundle = Some(bundle);
+                }
+                if let Err(error) = self.with_window_viewer_context(window_id, |app| {
+                    app.rebuild_visible_indices_preserving_facet_scope();
+                }) {
+                    crate::logger::log(format!(
+                        "visible_index_rebuild_mount_failed window_id={window_id} error={error:?}"
+                    ));
+                }
             }
         }
     }
@@ -32019,7 +31258,7 @@ impl App {
     }
 
     /// 現在 detached viewer context (独立/ピン/Book) がマウント中 (= bundle swap で App が
-    /// detached 側の状態を保持している) か。`with_active_detached_viewer_context` が mount 中
+    /// detached 側の状態を保持している) か。`with_active_viewer_context` が mount 中
     /// だけ suppression depth を上げるので、それを流用する。
     fn detached_viewer_context_is_mounted(&self) -> bool {
         #[cfg(windows)]
@@ -35828,8 +35067,7 @@ impl App {
                 }
 
                 let base_placement = self.active_detached_viewer_current_placement();
-                let had_active_detached = self.active_detached_viewer_context.is_some()
-                    || self.viewer_session_is_detached();
+                let had_active_detached = self.active_detached_context_exists();
                 if !self.park_and_close_current_active_detached_viewer(ctx) {
                     return None;
                 }
@@ -36869,18 +36107,50 @@ impl App {
         }
     }
 
+    /// 起動直後の InnerSize 補正 (egui#4918 / winit#923) を適用する。
+    ///
+    /// ViewportBuilder 段階ではマルチモニタ DPI 混在時に論理/物理ピクセルを取り違えて
+    /// 異常サイズのウィンドウが作られるので、DPI が確定してから意図したサイズを
+    /// 再適用して矯正する。通常起動なら初回フレームで終わる。
+    ///
+    /// 最大化起動のときは保留する。最大化中に InnerSize を送ると通常サイズへ戻り、
+    /// 利用者が選んだ起動状態を打ち消してしまうため。保留した値は最大化が解けた
+    /// 最初のフレームで 1 回だけ適用され、そこで復元矩形を矯正する。最大化のまま
+    /// 終了した場合は使われずに捨てられる (矯正すべき通常矩形が画面に無いので実害なし)。
+    fn apply_deferred_initial_size(&mut self, ctx: &egui::Context) {
+        let Some([w, h]) = self.pending_initial_size else {
+            return;
+        };
+        let (ppp, reported_maximized) = ctx.input(|i| (i.pixels_per_point, i.viewport().maximized));
+        if !deferred_initial_size_ready(self.created_maximized, reported_maximized) {
+            return;
+        }
+        self.pending_initial_size = None;
+        let viewport_size = egui::vec2(
+            crate::settings::window_geometry_to_viewport_points(w, self.settings.ui_scale_factor),
+            crate::settings::window_geometry_to_viewport_points(h, self.settings.ui_scale_factor),
+        );
+        crate::logger::log(format!(
+            "[viewport] deferred InnerSize apply: {w:.0}x{h:.0} ppp={ppp:.2} created_maximized={}",
+            self.created_maximized
+        ));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(viewport_size));
+    }
+
     /// ウィンドウ位置を記録する（最小化・最大化中は更新しない）。
     fn track_window_rect(&mut self, ctx: &egui::Context) {
-        let (outer_rect, inner_rect, pixels_per_point, minimized, maximized) = ctx.input(|i| {
-            let vp = i.viewport();
-            (
-                vp.outer_rect,
-                vp.inner_rect,
-                i.pixels_per_point,
-                vp.minimized.unwrap_or(false),
-                vp.maximized.unwrap_or(false),
-            )
-        });
+        let (outer_rect, inner_rect, pixels_per_point, minimized, reported_maximized) =
+            ctx.input(|i| {
+                let vp = i.viewport();
+                (
+                    vp.outer_rect,
+                    vp.inner_rect,
+                    i.pixels_per_point,
+                    vp.minimized.unwrap_or(false),
+                    vp.maximized,
+                )
+            });
+        let maximized = reported_maximized.unwrap_or(false);
 
         if outer_rect.is_none() && self.last_outer_rect.is_none() {
             crate::logger::log(format!(
@@ -36897,6 +36167,9 @@ impl App {
 
         let best_rect = outer_rect.or(inner_rect);
         self.last_pixels_per_point = pixels_per_point;
+
+        self.last_window_maximized =
+            tracked_window_maximized(self.last_window_maximized, minimized, reported_maximized);
 
         if !minimized && !maximized {
             if let Some(rect) = best_rect {
@@ -37409,7 +36682,7 @@ impl App {
 
     pub(crate) fn viewer_session_is_detached_or_switching(&self) -> bool {
         #[cfg(windows)]
-        if self.active_detached_viewer_context.is_some() {
+        if self.active_detached_context_is_at_rest() {
             return true;
         }
         self.current_viewer_session_is_detached_or_switching()
@@ -37533,9 +36806,7 @@ impl App {
 
     #[cfg(windows)]
     fn active_detached_viewer_has_foreground(&self) -> bool {
-        if !self.viewer_session_is_detached_or_switching()
-            && self.active_detached_viewer_context.is_none()
-        {
+        if !self.viewer_session_is_detached_or_switching() {
             return false;
         }
         let Some(hwnd) = self.detached_viewer_host_hwnd_alive() else {
@@ -37585,7 +36856,7 @@ impl App {
                 self.main_font_atlas_resync_repeats_left,
                 self.detached_font_atlas_resync_should_wait(),
                 self.detached_cleanup_font_atlas_resync_is_safe(),
-                self.active_detached_viewer_context.is_some(),
+                self.active_detached_context_debug_state(),
                 self.active_detached_session,
                 self.fullscreen_idx,
                 self.viewer_presentation,
@@ -37623,7 +36894,7 @@ impl App {
                 self.pending_detached_cleanup_font_atlas_resync,
                 self.detached_font_atlas_resync_should_wait(),
                 self.detached_cleanup_font_atlas_resync_is_safe(),
-                self.active_detached_viewer_context.is_some(),
+                self.active_detached_context_debug_state(),
                 self.active_detached_session,
                 self.fullscreen_idx,
                 self.viewer_presentation,
@@ -37705,7 +36976,7 @@ impl App {
             safety.cloak_or_backdrop_active,
             safety.opening_count,
             safety.closing_count,
-            self.active_detached_viewer_context.is_some(),
+            self.active_detached_context_debug_state(),
             self.active_detached_session,
             self.fullscreen_idx,
             self.viewer_presentation,
@@ -37779,7 +37050,7 @@ impl App {
                     "font_resync_deferred_detached_alive active_context={} session={:?} \
                  fullscreen_idx={:?} presentation={:?} fs_shown={} passive_windows={} \
                  reason={reason} placement_pending={} cloak_or_backdrop={} opening={} closing={}",
-                    self.active_detached_viewer_context.is_some(),
+                    self.active_detached_context_debug_state(),
                     self.active_detached_session,
                     self.fullscreen_idx,
                     self.viewer_presentation,
@@ -37832,7 +37103,7 @@ impl App {
                     self.fs_viewport_presentation,
                     self.fs_viewport_shown,
                     self.detached_image_windows.len(),
-                    self.active_detached_viewer_context.is_some(),
+                    self.active_detached_context_debug_state(),
                     self.active_detached_session
                 ));
             }
@@ -38089,25 +37360,6 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn allocate_detached_viewer_context_generation(&mut self) -> (u64, u64) {
-        let context_serial = self.next_detached_viewer_context_serial.max(1);
-        self.next_detached_viewer_context_serial = self
-            .next_detached_viewer_context_serial
-            .wrapping_add(1)
-            .max(1);
-        let items_generation = DETACHED_VIEWER_CONTEXT_GENERATION_BASE
-            | context_serial.wrapping_mul(DETACHED_VIEWER_CONTEXT_GENERATION_STRIDE);
-        (context_serial, items_generation)
-    }
-
-    #[cfg(windows)]
-    fn assign_next_detached_viewer_context_generation(&mut self) -> u64 {
-        let (context_serial, items_generation) = self.allocate_detached_viewer_context_generation();
-        self.set_items_generation(items_generation);
-        context_serial
-    }
-
-    #[cfg(windows)]
     fn allocate_detached_viewer_window_id(&mut self) -> u64 {
         let id = self.next_detached_image_window_id.max(1);
         self.next_detached_image_window_id =
@@ -38169,6 +37421,12 @@ impl App {
         let Some(session) = self.active_detached_session.take() else {
             return;
         };
+        if let Some((owner, ContextResidence::Mounted)) =
+            self.locate_window_context(session.window_id)
+            && owner == self.viewer_context_main()
+        {
+            assert_eq!(self.unbind_window(session.window_id), Some(owner));
+        }
         self.log_detached_image_window_debug(format!(
             "session_finish window_id={} reason={reason}",
             session.window_id
@@ -38343,54 +37601,27 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn pause_current_active_detached_viewer_context(&mut self, ctx: &egui::Context) -> bool {
-        let Some(mut active) = self.active_detached_viewer_context.take() else {
+    fn pause_current_active_viewer_context(&mut self, ctx: &egui::Context) -> bool {
+        let Some(id) = self.active_viewer_context_id() else {
             return false;
         };
-
-        self.log_detached_image_window_debug(format!(
-            "pause_active_context_begin bundle_window_id={:?} bundle_fs_idx={:?} \
-             bundle_independent={} bundle_pending={} bundle_cache={} \
-             bundle_passive_windows={}",
-            active.bundle.viewer_session.detached_window_id,
-            active.bundle.fullscreen_idx,
-            active.bundle.viewer_session.independent_active,
-            active.bundle.fs_pending.len(),
-            active.bundle.fs_cache.len(),
-            self.detached_image_windows.len()
-        ));
-        self.swap_viewer_context_bundle(&mut active.bundle);
-        if let Some(fs_idx) = self.fullscreen_idx {
-            self.reset_detached_pause_foreground_modes(fs_idx);
+        if self.viewer_context_residence(id) != ContextResidence::AtRest {
+            return false;
         }
-        self.log_detached_image_window_debug(format!(
-            "pause_active_context_mounted window_id={:?} fs_idx={:?} \
-             independent={} session_detached={} supported={} current_pending={} \
-             pending={} cache={} passive_windows={}",
-            self.detached_viewer_window_id,
-            self.fullscreen_idx,
-            self.detached_viewer_independent_active,
-            self.viewer_session_is_detached(),
-            self.fullscreen_idx
-                .is_some_and(|idx| self.viewer_item_supports_detached_still(idx)),
-            self.fullscreen_idx
-                .is_some_and(|idx| self.fs_pending.contains_key(&idx)),
-            self.fs_pending.len(),
-            self.fs_cache.len(),
-            self.detached_image_windows.len()
-        ));
-        let keep_paused_bundle = true;
-        let Some(mut snapshot) = self.build_active_detached_image_window_snapshot(Some(ctx)) else {
-            self.log_detached_image_window_debug(format!(
-                "pause_active_context_snapshot_failed keep_active=true window_id={:?} \
-                 fs_idx={:?} pending={} cache={}",
-                self.detached_viewer_window_id,
-                self.fullscreen_idx,
-                self.fs_pending.len(),
-                self.fs_cache.len()
-            ));
-            self.swap_viewer_context_bundle(&mut active.bundle);
-            self.active_detached_viewer_context = Some(active);
+        let result = self.with_viewer_context(id, |app| {
+            if let Some(fs_idx) = app.fullscreen_idx {
+                app.reset_detached_pause_foreground_modes(fs_idx);
+            }
+            let snapshot = app.build_active_detached_image_window_snapshot(Some(ctx))?;
+            let before = (app.fs_pending.len(), app.fs_cache.len(), app.fullscreen_idx);
+            app.pause_mounted_background_work_keep_current_frame();
+            let after = (app.fs_pending.len(), app.fs_cache.len());
+            Some((snapshot, before, after))
+        });
+        let Ok(Some((snapshot, before, after))) = result else {
+            self.log_detached_image_window_debug(
+                "pause_active_context_snapshot_or_mount_failed keep_active=true".to_string(),
+            );
             return false;
         };
         let snapshot_id = snapshot.id;
@@ -38400,23 +37631,8 @@ impl App {
         let snapshot_has_stamp = snapshot.reopen_sync_stamp.is_some();
         let snapshot_frozen_pages = snapshot.frozen_continuous_pages.len();
         let snapshot_image_dims = snapshot.image_dims;
-        let mut paused_bundle = self.take_current_viewer_context_bundle();
-        let paused_pending_before = paused_bundle.fs_pending.len();
-        let paused_cache_before = paused_bundle.fs_cache.len();
-        let paused_fs_idx = paused_bundle.fullscreen_idx;
-        paused_bundle.pause_background_work_keep_current_frame();
-        let paused_pending_after = paused_bundle.fs_pending.len();
-        let paused_cache_after = paused_bundle.fs_cache.len();
-        self.swap_viewer_context_bundle(&mut active.bundle);
-        if keep_paused_bundle {
-            snapshot.paused_bundle = Some(Box::new(paused_bundle));
-        }
         self.detached_image_windows.push(snapshot);
-        self.update_detached_window_runtime_flags(
-            snapshot_id,
-            !keep_paused_bundle,
-            "pause_active_context",
-        );
+        self.update_detached_window_runtime_flags(snapshot_id, false, "pause_active_context");
         self.handoff_active_detached_viewport_to_passive("pause_active_context");
         self.transition_detached_window_state(
             snapshot_id,
@@ -38427,10 +37643,15 @@ impl App {
             "pause_active_context_snapshot_pushed id={snapshot_id} \
              title={snapshot_title:?} descriptor={snapshot_descriptor} stamp={} \
              frozen_pages={snapshot_frozen_pages} image_dims={snapshot_image_dims:?} \
-             keep_bundle={keep_paused_bundle} \
-             paused_fs_idx={paused_fs_idx:?} paused_pending={paused_pending_before}->{paused_pending_after} \
-             paused_cache={paused_cache_before}->{paused_cache_after} passive_windows={}",
+             keep_bundle=true \
+             paused_fs_idx={:?} paused_pending={}->{} \
+             paused_cache={}->{} passive_windows={}",
             snapshot_has_stamp,
+            before.2,
+            before.0,
+            after.0,
+            before.1,
+            after.1,
             self.detached_image_windows.len()
         ));
         true
@@ -38578,45 +37799,55 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn take_and_close_current_active_detached_viewer_context(
+    fn take_and_close_current_active_viewer_context(
         &mut self,
         ctx: &egui::Context,
         reason: &'static str,
-    ) -> Option<ViewerContextBundle> {
-        let Some(mut active) = self.active_detached_viewer_context.take() else {
+    ) -> Option<ClosedBookmarkSummary> {
+        let Some(id) = self.active_viewer_context_id() else {
             return None;
         };
 
         // book context の明示 close = detached セッション終了 (§3.7 closing)。Close 送信前に
         // closing を立て、teardown 後に finish して backstop が窓を復活させないようにする。
         self.begin_active_detached_session_close(reason);
-        self.swap_viewer_context_bundle(&mut active.bundle);
-        if self.fs_viewport_shown {
-            let fs_id = self.fullscreen_viewport_id();
-            ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Close);
-        }
-        self.close_fullscreen();
-        let closed_context = self.take_current_viewer_context_bundle();
-        self.swap_viewer_context_bundle(&mut active.bundle);
+        let result = self.close_and_retire_context(
+            id,
+            reason,
+            |app| {
+                if app.fs_viewport_shown {
+                    let fs_id = app.fullscreen_viewport_id();
+                    ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Close);
+                }
+                app.close_fullscreen();
+            },
+            |context| ClosedBookmarkSummary::read(context.as_ref()),
+        );
         self.finish_active_detached_session_close(reason);
+        let summary = match result {
+            Ok(summary) => summary,
+            Err(error) => {
+                crate::logger::log(format!(
+                    "active_viewer_context_retire_failed id={id:?} reason={reason} error={error:?}"
+                ));
+                return None;
+            }
+        };
         // PDF password dialog の UI state 自体は App-global だが、request owner は bundle。
         // viewport 作成前の terminal close で owner を捨てた後に orphan dialog を残さない。
-        if closed_context.pdf_password_request.is_some() && self.pdf_password_request.is_none() {
+        if summary.had_pdf_password_request && self.pdf_password_request.is_none() {
             self.show_pdf_password_dialog = false;
             self.pdf_password_input.clear();
             self.pdf_password_error = None;
             self.pdf_password_save = false;
         }
-        Some(closed_context)
+        Some(summary)
     }
 
     #[cfg(windows)]
-    fn close_current_active_detached_viewer_context(&mut self, ctx: &egui::Context) -> bool {
-        self.take_and_close_current_active_detached_viewer_context(
-            ctx,
-            "close_active_detached_viewer_context",
-        )
-        .is_some()
+    fn close_current_active_viewer_context(&mut self, ctx: &egui::Context) -> bool {
+        self.take_and_close_current_active_viewer_context(ctx, "close_active_viewer_context")
+            .is_some()
     }
 
     #[cfg(windows)]
@@ -38624,7 +37855,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
     ) -> bool {
-        let had_detached = self.active_detached_viewer_context.is_some()
+        let had_detached = self.active_detached_context_is_at_rest()
             || self.active_detached_session.is_some()
             || self.viewer_session_is_detached_or_switching()
             || self.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow)
@@ -38640,7 +37871,7 @@ impl App {
         self.log_detached_image_window_debug(format!(
             "mode_change_close_all begin active_context={} session={:?} fs_idx={:?} \
              presentation={:?} shown={} passive_windows={} runtimes={} pending_host_switch={}",
-            self.active_detached_viewer_context.is_some(),
+            self.active_detached_context_debug_state(),
             self.active_detached_session,
             self.fullscreen_idx,
             self.viewer_presentation,
@@ -38651,18 +37882,18 @@ impl App {
         ));
         crate::dwm_transitions::disable_transitions_for_thread_windows();
 
-        let active_context_window_id = self
-            .active_detached_viewer_context
-            .as_ref()
-            .and_then(|active| active.bundle.viewer_session.detached_window_id);
+        let active_context_window_id = self.active_viewer_context_id().and_then(|id| {
+            self.with_viewer_context_ref(id, |context| context.viewer_session_detached_window_id())
+                .flatten()
+        });
         if let Some(window_id) = active_context_window_id {
             ctx.send_viewport_cmd_to(
                 Self::detached_image_window_viewport_id(window_id),
                 egui::ViewportCommand::Close,
             );
         }
-        if self.active_detached_viewer_context.is_some() {
-            let _ = self.close_current_active_detached_viewer_context(ctx);
+        if self.active_detached_context_is_at_rest() {
+            let _ = self.close_current_active_viewer_context(ctx);
         }
 
         let active_window_id = self
@@ -38739,7 +37970,6 @@ impl App {
         }
 
         self.active_detached_session = None;
-        self.active_detached_viewer_context = None;
         self.pending_detached_video_host_switch = None;
         self.pending_detached_video_host_resync = false;
         self.detached_viewer_window_id = None;
@@ -38762,7 +37992,7 @@ impl App {
         self.log_detached_image_window_debug(format!(
             "mode_change_close_all end active_context={} session={:?} fs_idx={:?} \
              presentation={:?} shown={} passive_windows={} runtimes={}",
-            self.active_detached_viewer_context.is_some(),
+            self.active_detached_context_debug_state(),
             self.active_detached_session,
             self.fullscreen_idx,
             self.viewer_presentation,
@@ -38817,7 +38047,7 @@ impl App {
                 || self.viewer_session_is_detached_or_switching()
                 || self.pending_detached_video_host_switch.is_some()
                 || self.native_video_mode_switch.is_some()
-                || self.active_detached_viewer_context.is_some()
+                || self.active_detached_context_is_at_rest()
                 || !self.detached_image_windows.is_empty())
     }
 
@@ -38837,7 +38067,7 @@ impl App {
             self.fs_viewport_shown,
             self.fs_viewport_presentation,
             self.active_detached_session,
-            self.active_detached_viewer_context.is_some(),
+            self.active_detached_context_debug_state(),
             self.detached_image_windows.len(),
             self.native_video_fullscreen_active_for_main_backdrop(),
             self.native_video_main_cloaked,
@@ -38935,13 +38165,19 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn register_detached_window_hwnd_after_show(
         &mut self,
+        ctx: &egui::Context,
         window_id: u64,
         label: &'static str,
         viewport_id: egui::ViewportId,
         before: Option<&[crate::dwm_transitions::ThreadWindowSnapshotEntry]>,
     ) {
         let Some(before) = before else {
-            self.recover_detached_window_hwnd_after_skipped_snapshot(window_id, label, viewport_id);
+            self.recover_detached_window_hwnd_after_skipped_snapshot(
+                ctx,
+                window_id,
+                label,
+                viewport_id,
+            );
             return;
         };
         let Some(main_hwnd) = self.main_hwnd else {
@@ -38968,10 +38204,15 @@ impl App {
                         .unwrap_or_else(|| "none".to_string()),
                     Self::win32_hwnd_debug_state(hwnd)
                 ));
+                let wake_video_resync = self.pending_detached_video_host_resync;
                 self.try_resync_detached_video_host_after_registration(window_id);
+                if wake_video_resync {
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
             }
             DetachedWindowHwndDiff::NoChange => {
                 if self.adopt_unclaimed_detached_window_hwnd_after_show(
+                    ctx,
                     window_id,
                     label,
                     viewport_id,
@@ -39007,6 +38248,7 @@ impl App {
     #[cfg(windows)]
     fn recover_detached_window_hwnd_after_skipped_snapshot(
         &mut self,
+        ctx: &egui::Context,
         window_id: u64,
         label: &'static str,
         viewport_id: egui::ViewportId,
@@ -39040,6 +38282,7 @@ impl App {
             windows::Win32::Foundation::HWND(main_hwnd as *mut _),
         );
         self.adopt_unclaimed_detached_window_hwnd_after_show(
+            ctx,
             window_id,
             label,
             viewport_id,
@@ -39100,37 +38343,57 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn active_detached_viewer_context_present(&self) -> bool {
-        self.active_detached_viewer_context.is_some()
+    pub(crate) fn active_detached_context_is_at_rest(&self) -> bool {
+        self.active_viewer_context_id()
+            .is_some_and(|id| self.viewer_context_residence(id) == ContextResidence::AtRest)
     }
 
     #[cfg(windows)]
-    fn viewer_context_bundle_contains_video(bundle: &ViewerContextBundle) -> bool {
-        let active_item_is_video = bundle
-            .fullscreen_idx
-            .and_then(|idx| bundle.items.get(idx))
+    fn active_detached_context_exists(&self) -> bool {
+        self.active_detached_context_is_at_rest() || self.viewer_session_is_detached()
+    }
+
+    #[cfg(windows)]
+    fn active_detached_context_debug_state(&self) -> bool {
+        self.active_detached_context_is_at_rest()
+    }
+
+    #[cfg(windows)]
+    fn detached_viewer_host_owns_surface(&self) -> bool {
+        matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow)
+            || self.active_viewer_context_id().is_some()
+    }
+
+    #[cfg(windows)]
+    fn viewer_context_contains_video(context: ContextRef<'_>) -> bool {
+        let active_item_is_video = context
+            .fullscreen_idx()
+            .and_then(|idx| context.items().get(idx))
             .is_some_and(|item| matches!(item, GridItem::Video(_)));
-        let deferred_item_is_media = bundle.vst3_deferred_media_open.is_some_and(|idx| {
-            bundle.fullscreen_idx == Some(idx)
+        let deferred_item_is_media = context.vst3_deferred_media_open().is_some_and(|idx| {
+            context.fullscreen_idx() == Some(idx)
                 && matches!(
-                    bundle.items.get(idx),
+                    context.items().get(idx),
                     Some(GridItem::Video(_) | GridItem::Audio(_))
                 )
         });
         active_item_is_video
             || deferred_item_is_media
-            || bundle
-                .fs_cache
+            || context
+                .fs_cache()
                 .values()
                 .any(|entry| matches!(entry, FsCacheEntry::Video { .. }))
     }
 
     #[cfg(windows)]
-    fn viewer_context_bundle_detached_source(bundle: &ViewerContextBundle) -> DetachedSource {
-        match bundle.fullscreen_idx.and_then(|idx| bundle.items.get(idx)) {
+    fn viewer_context_bundle_detached_source(context: ContextRef<'_>) -> DetachedSource {
+        match context
+            .fullscreen_idx()
+            .and_then(|idx| context.items().get(idx))
+        {
             Some(GridItem::Audio(_)) => DetachedSource::Audio,
             Some(GridItem::Video(_)) => DetachedSource::Video,
-            _ if Self::viewer_context_bundle_contains_video(bundle) => DetachedSource::Video,
+            _ if Self::viewer_context_contains_video(context) => DetachedSource::Video,
             _ => DetachedSource::Book,
         }
     }
@@ -39138,20 +38401,17 @@ impl App {
     #[cfg(windows)]
     fn viewer_context_bundle_music_window_info(
         &self,
-        bundle: &ViewerContextBundle,
+        context: ContextRef<'_>,
     ) -> Option<ParkedLiveMusicWindowInfo> {
-        let idx = bundle.fullscreen_idx?;
-        let item = bundle.items.get(idx)?;
-        let video_audio_mode = bundle.video_audio_mode == Some(idx)
-            && !bundle
-                .video_audio_vst
-                .as_ref()
-                .is_some_and(|s| s.fs_idx == idx);
-        if !Self::viewer_context_bundle_is_music_consumer(bundle) {
+        let idx = context.fullscreen_idx()?;
+        let item = context.items().get(idx)?;
+        let video_audio_mode = context.video_audio_mode() == Some(idx)
+            && !context.video_audio_vst().is_some_and(|s| s.fs_idx == idx);
+        if !viewer_context_is_music_consumer(context) {
             return None;
         }
         let (position_secs, duration_secs, playing, title, volume, muted) =
-            match bundle.fs_cache.get(&idx) {
+            match context.fs_cache().get(&idx) {
                 Some(FsCacheEntry::Video { player, .. }) => (
                     player.position().max(0.0),
                     player.duration().max(0.0),
@@ -39166,7 +38426,11 @@ impl App {
                 ),
                 _ => (0.0, 0.0, false, item.name().to_string(), 1.0, false),
             };
-        let bookmark_secs: Vec<f64> = bundle.music_bookmarks.iter().map(|b| b.pts_secs).collect();
+        let bookmark_secs: Vec<f64> = context
+            .music_bookmarks()
+            .iter()
+            .map(|b| b.pts_secs)
+            .collect();
         Some(ParkedLiveMusicWindowInfo {
             fs_idx: idx,
             title,
@@ -39180,42 +38444,28 @@ impl App {
             loop_mode: self.settings.video_loop_mode,
             continuous_mode: self.video_continuous_mode,
             row_secs: self.music_timeline_row_secs,
-            normalize_ui_state: bundle
-                .normalize_ui_states
-                .get(&idx)
-                .copied()
-                .unwrap_or_default(),
+            normalize_ui_state: context.normalize_ui_state(idx).unwrap_or_default(),
             bookmark_secs,
-            bookmarks_loaded: bundle.music_bookmarks_loaded_for.is_some(),
+            bookmarks_loaded: context.music_bookmarks_loaded(),
         })
     }
 
     #[cfg(windows)]
-    pub(crate) fn active_detached_viewer_context_contains_video(&self) -> bool {
-        self.active_detached_viewer_context
-            .as_ref()
-            .is_some_and(|active| Self::viewer_context_bundle_contains_video(&active.bundle))
+    /// Whether the active detached session that is not currently projected onto App contains
+    /// video. The mounted context is the current context and must be inspected through
+    /// current_viewer_context_contains_video instead.
+    pub(crate) fn other_active_viewer_context_contains_video(&self) -> bool {
+        self.active_viewer_context_id().is_some_and(|id| {
+            id != self.projected_viewer_context_id()
+                && self
+                    .with_viewer_context_ref(id, Self::viewer_context_contains_video)
+                    .unwrap_or(false)
+        })
     }
 
     #[cfg(windows)]
     pub(crate) fn current_viewer_context_contains_video(&self) -> bool {
-        let active_item_is_video = self
-            .fullscreen_idx
-            .and_then(|idx| self.items.get(idx))
-            .is_some_and(|item| matches!(item, GridItem::Video(_)));
-        let deferred_item_is_media = self.vst3_deferred_media_open.is_some_and(|idx| {
-            self.fullscreen_idx == Some(idx)
-                && matches!(
-                    self.items.get(idx),
-                    Some(GridItem::Video(_) | GridItem::Audio(_))
-                )
-        });
-        active_item_is_video
-            || deferred_item_is_media
-            || self
-                .fs_cache
-                .values()
-                .any(|entry| matches!(entry, FsCacheEntry::Video { .. }))
+        Self::viewer_context_contains_video(ContextRef::mounted(self))
     }
 
     #[cfg(windows)]
@@ -39233,11 +38483,12 @@ impl App {
         &self,
         window_id: u64,
     ) -> Option<ParkedLiveMusicWindowInfo> {
-        self.detached_image_windows
-            .iter()
-            .find(|window| window.id == window_id)
-            .and_then(|window| window.paused_bundle.as_deref())
-            .and_then(|bundle| self.viewer_context_bundle_music_window_info(bundle))
+        self.locate_window_context(window_id).and_then(|(id, _)| {
+            self.with_viewer_context_ref(id, |context| {
+                self.viewer_context_bundle_music_window_info(context)
+            })
+            .flatten()
+        })
     }
 
     #[cfg(windows)]
@@ -39267,15 +38518,21 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn window_viewer_context_contains_video(&self, window_id: u64) -> bool {
+        self.locate_window_context(window_id)
+            .is_some_and(|(id, _)| {
+                self.with_viewer_context_ref(id, Self::viewer_context_contains_video)
+                    .unwrap_or(false)
+            })
+    }
+
+    #[cfg(windows)]
     fn parked_live_media_window_ids(&self) -> Vec<u64> {
         self.detached_image_windows
             .iter()
             .filter(|window| {
                 self.detached_window_state_is_parked_live(window.id)
-                    && window
-                        .paused_bundle
-                        .as_deref()
-                        .is_some_and(Self::viewer_context_bundle_contains_video)
+                    && self.window_viewer_context_contains_video(window.id)
             })
             .map(|window| window.id)
             .collect()
@@ -39285,10 +38542,7 @@ impl App {
     pub(crate) fn parked_live_media_window_exists(&self) -> bool {
         self.detached_image_windows.iter().any(|window| {
             self.detached_window_state_is_parked_live(window.id)
-                && window
-                    .paused_bundle
-                    .as_deref()
-                    .is_some_and(Self::viewer_context_bundle_contains_video)
+                && self.window_viewer_context_contains_video(window.id)
         })
     }
 
@@ -39297,24 +38551,24 @@ impl App {
     /// main 文脈の open/close から破棄してはいけない (review-v2.3.0 P2-3)。
     #[cfg(windows)]
     pub(crate) fn detached_music_window_exists(&self) -> bool {
-        self.active_detached_viewer_context
-            .as_ref()
-            .is_some_and(|active| {
-                self.viewer_context_bundle_music_window_info(&active.bundle)
+        self.active_viewer_context_id().is_some_and(|id| {
+            self.with_viewer_context_ref(id, |context| {
+                self.viewer_context_bundle_music_window_info(context)
                     .is_some()
             })
-            || self.detached_image_windows.iter().any(|window| {
-                self.detached_window_state_is_parked_live(window.id)
-                    && window.paused_bundle.as_deref().is_some_and(|bundle| {
-                        self.viewer_context_bundle_music_window_info(bundle)
-                            .is_some()
+            .unwrap_or(false)
+        }) || self.detached_image_windows.iter().any(|window| {
+            self.detached_window_state_is_parked_live(window.id)
+                && self
+                    .locate_window_context(window.id)
+                    .is_some_and(|(id, _)| {
+                        self.with_viewer_context_ref(id, |context| {
+                            self.viewer_context_bundle_music_window_info(context)
+                                .is_some()
+                        })
+                        .unwrap_or(false)
                     })
-            })
-    }
-
-    #[cfg(windows)]
-    fn viewer_context_bundle_is_music_consumer(bundle: &ViewerContextBundle) -> bool {
-        viewer_context_bundle_is_music_consumer(bundle)
+        })
     }
 
     /// App-global な tile companion が、閉じる ParkedLive 窓のものかを判定する。
@@ -39353,43 +38607,46 @@ impl App {
             return false;
         }
 
-        let bundle_video_path = self
-            .detached_image_windows
-            .iter()
-            .find(|window| window.id == window_id)
-            .and_then(|window| window.paused_bundle.as_deref())
-            .and_then(|bundle| {
-                bundle
-                    .fullscreen_idx
-                    .and_then(|idx| bundle.items.get(idx))
+        let bundle_video_path = self.locate_window_context(window_id).and_then(|(id, _)| {
+            self.with_viewer_context_ref(id, |context| {
+                context
+                    .fullscreen_idx()
+                    .and_then(|idx| context.items().get(idx))
                     .and_then(|item| match item {
-                        GridItem::Video(path) => Some(path.as_path()),
+                        GridItem::Video(path) => Some(path.clone()),
                         _ => None,
                     })
-            });
+            })
+            .flatten()
+        });
         let Some(bundle_video_path) = bundle_video_path else {
             return false;
         };
         if self.current_viewer_context_contains_video()
-            || self.active_detached_viewer_context_contains_video()
+            || self.other_active_viewer_context_contains_video()
         {
             return false;
         }
         let another_parked_video_exists = self.detached_image_windows.iter().any(|window| {
             window.id != window_id
-                && window.paused_bundle.as_deref().is_some_and(|bundle| {
-                    bundle
-                        .fullscreen_idx
-                        .and_then(|idx| bundle.items.get(idx))
-                        .is_some_and(|item| matches!(item, GridItem::Video(_)))
-                })
+                && self
+                    .locate_window_context(window.id)
+                    .is_some_and(|(id, _)| {
+                        self.with_viewer_context_ref(id, |context| {
+                            context
+                                .fullscreen_idx()
+                                .and_then(|idx| context.items().get(idx))
+                                .is_some_and(|item| matches!(item, GridItem::Video(_)))
+                        })
+                        .unwrap_or(false)
+                    })
         });
         if another_parked_video_exists {
             return false;
         }
         self.video_tile_state
             .as_ref()
-            .is_none_or(|state| crate::folder_tree::path_eq(&state.video_path, bundle_video_path))
+            .is_none_or(|state| crate::folder_tree::path_eq(&state.video_path, &bundle_video_path))
     }
 
     /// owner stamp を持たない `native_video_mode_switch` が、まとめて閉じる ParkedLive 群の
@@ -39400,24 +38657,17 @@ impl App {
     fn closing_parked_windows_own_native_video_mode_switch(&self, window_ids: &[u64]) -> bool {
         if self.native_video_mode_switch.is_none()
             || self.current_viewer_context_contains_video()
-            || self.active_detached_viewer_context_contains_video()
+            || self.other_active_viewer_context_contains_video()
         {
             return false;
         }
         let closing_has_video = self.detached_image_windows.iter().any(|window| {
-            window_ids.contains(&window.id)
-                && window
-                    .paused_bundle
-                    .as_deref()
-                    .is_some_and(Self::viewer_context_bundle_contains_video)
+            window_ids.contains(&window.id) && self.window_viewer_context_contains_video(window.id)
         });
         closing_has_video
             && !self.detached_image_windows.iter().any(|window| {
                 !window_ids.contains(&window.id)
-                    && window
-                        .paused_bundle
-                        .as_deref()
-                        .is_some_and(Self::viewer_context_bundle_contains_video)
+                    && self.window_viewer_context_contains_video(window.id)
             })
     }
 
@@ -39454,36 +38704,30 @@ impl App {
         if clears_mode_switch {
             self.native_video_mode_switch = None;
         }
-        let mut dropped_bundles = Vec::new();
-        for window in &mut self.detached_image_windows {
-            if window_ids.contains(&window.id)
-                && let Some(bundle) = window.paused_bundle.take()
-            {
-                dropped_bundles.push(bundle);
+        let mut plans = Vec::new();
+        for &window_id in window_ids {
+            let Some((id, _)) = self.locate_window_context(window_id) else {
+                continue;
+            };
+            match self.retire_context(id, reason, |mut context| {
+                let plan = viewer_context_media_teardown_plan(context.as_ref());
+                context.clear_normalize_state();
+                plan
+            }) {
+                Ok(plan) => plans.push(plan),
+                Err(RetireError::IsMain) => {
+                    unreachable!("parked window owned the main viewer context")
+                }
+                Err(error) => self.log_detached_image_window_debug(format!(
+                    "media_teardown_skipped id={id:?} reason={reason} error={error:?}"
+                )),
             }
         }
-        self.teardown_paused_media_bundles(dropped_bundles, reason);
-    }
-
-    #[cfg(windows)]
-    fn teardown_paused_media_bundles(
-        &mut self,
-        mut dropped_bundles: Vec<Box<ViewerContextBundle>>,
-        reason: &'static str,
-    ) {
-        if dropped_bundles.is_empty() {
+        if plans.is_empty() {
             return;
         }
-        let plans: Vec<ViewerContextMediaTeardownPlan> = dropped_bundles
-            .iter()
-            .map(|bundle| viewer_context_media_teardown_plan(bundle))
-            .collect();
         self.save_viewer_context_media_teardown_resumes(&plans);
         self.cleanup_viewer_context_media_teardown_globals(&plans, reason);
-        for bundle in &mut dropped_bundles {
-            bundle.normalize_ui_states.clear();
-            bundle.normalize_auto_scan_suppressed.clear();
-        }
     }
 
     #[cfg(windows)]
@@ -39545,20 +38789,16 @@ impl App {
             player.set_native_window_visible(presenter_visible);
             routed += 1;
         }
-        let active = self
-            .active_detached_viewer_context
-            .as_ref()
-            .map(|active| {
-                sync_viewer_context_bundle_presenters_for_tray(&active.bundle, app_visible)
+        routed += self
+            .other_viewer_context_ids()
+            .into_iter()
+            .map(|id| {
+                self.with_viewer_context_ref(id, |context| {
+                    sync_viewer_context_bundle_presenters_for_tray(context, app_visible)
+                })
+                .unwrap_or(0)
             })
-            .unwrap_or(0);
-        let parked = self
-            .detached_image_windows
-            .iter()
-            .filter_map(|window| window.paused_bundle.as_deref())
-            .map(|bundle| sync_viewer_context_bundle_presenters_for_tray(bundle, app_visible))
             .sum::<usize>();
-        routed += active + parked;
         if let Some(pending) = self.native_video_source_swap_pending.as_ref() {
             pending
                 .native_output
@@ -39598,27 +38838,16 @@ impl App {
                     self.video_continuous_last_eof,
                 ))
             });
-        let active_detached = self
-            .active_detached_viewer_context
-            .as_ref()
-            .is_some_and(|active| {
+        let detached = self.other_viewer_context_ids().into_iter().any(|id| {
+            self.with_viewer_context_ref(id, |context| {
                 viewer_context_bundle_needs_resident_media_updates(
-                    &active.bundle,
+                    context,
                     self.video_continuous_mode,
                     self.video_continuous_last_eof,
                 )
-            });
-        let parked = self
-            .detached_image_windows
-            .iter()
-            .filter_map(|window| window.paused_bundle.as_deref())
-            .any(|bundle| {
-                viewer_context_bundle_needs_resident_media_updates(
-                    bundle,
-                    self.video_continuous_mode,
-                    self.video_continuous_last_eof,
-                )
-            });
+            })
+            .unwrap_or(false)
+        });
         let eof_resolution = self
             .media_navigation_pending
             .as_ref()
@@ -39629,7 +38858,7 @@ impl App {
                 || self.native_video_fast_swap_pending.is_some()
                 || self.video_tile_swap_pending.is_some());
 
-        mounted || active_detached || parked || eof_resolution || eof_handoff
+        mounted || detached || eof_resolution || eof_handoff
     }
 
     /// Non-Windows builds have no tray residency and no hidden-root wake bridge, so nothing
@@ -39644,6 +38873,13 @@ impl App {
     /// リモートが操作権を取得した瞬間に、ローカル側で時間とともに進む状態を停止する。
     /// tray の transport-preserving lifecycle とは分離し、mounted / active detached /
     /// ParkedLive の current player だけを位置と viewer context を保ったまま pause する。
+    fn pause_mounted_animations_for_remote_session(&mut self) -> usize {
+        self.fs_cache
+            .values_mut()
+            .map(|entry| usize::from(entry.pause_animation()))
+            .sum()
+    }
+
     pub(crate) fn pause_local_progress_for_remote_session(&mut self) -> (bool, bool, usize, bool) {
         let mut media_paused_count = usize::from(pause_current_media_player_for_remote_session(
             self.fullscreen_idx,
@@ -39652,20 +38888,15 @@ impl App {
         #[cfg(windows)]
         {
             media_paused_count += self
-                .active_detached_viewer_context
-                .as_ref()
-                .map(|active| {
-                    usize::from(pause_viewer_context_bundle_media_for_remote_session(
-                        &active.bundle,
-                    ))
-                })
-                .unwrap_or(0);
-            media_paused_count += self
-                .detached_image_windows
-                .iter()
-                .filter_map(|window| window.paused_bundle.as_deref())
-                .map(|bundle| {
-                    usize::from(pause_viewer_context_bundle_media_for_remote_session(bundle))
+                .other_viewer_context_ids()
+                .into_iter()
+                .map(|id| {
+                    self.with_viewer_context_ref(id, |context| {
+                        usize::from(pause_viewer_context_bundle_media_for_remote_session(
+                            context,
+                        ))
+                    })
+                    .unwrap_or(0)
                 })
                 .sum::<usize>();
         }
@@ -39674,31 +38905,18 @@ impl App {
         self.save_detached_video_resume_positions_for_exit();
         let media_paused = media_paused_count > 0;
         let slideshow_paused = self.stop_slideshow_playback();
-        let mut animations_paused = self
-            .fs_cache
-            .values_mut()
-            .map(|entry| usize::from(entry.pause_animation()))
-            .sum();
+        let mut animations_paused = self.pause_mounted_animations_for_remote_session();
         #[cfg(windows)]
         {
-            if let Some(active) = self.active_detached_viewer_context.as_mut() {
-                animations_paused += active
-                    .bundle
-                    .fs_cache
-                    .values_mut()
-                    .map(|entry| usize::from(entry.pause_animation()))
-                    .sum::<usize>();
-            }
-            for bundle in self
-                .detached_image_windows
-                .iter_mut()
-                .filter_map(|window| window.paused_bundle.as_deref_mut())
-            {
-                animations_paused += bundle
-                    .fs_cache
-                    .values_mut()
-                    .map(|entry| usize::from(entry.pause_animation()))
-                    .sum::<usize>();
+            for id in self.other_viewer_context_ids() {
+                match self.with_viewer_context(id, |app| {
+                    app.pause_mounted_animations_for_remote_session()
+                }) {
+                    Ok(count) => animations_paused += count,
+                    Err(error) => crate::logger::log(format!(
+                        "remote_animation_pause_skipped id={id:?} error={error:?}"
+                    )),
+                }
             }
 
             // EOF から既に始まった source swap も既存の owner-scoped cancel 入口で止める。
@@ -39733,16 +38951,11 @@ impl App {
     /// (review-v2.3.0 追補6: R1-2 detached exit resume)
     #[cfg(windows)]
     pub(crate) fn save_detached_video_resume_positions_for_exit(&mut self) {
-        let mut plans = Vec::new();
-        if let Some(active) = self.active_detached_viewer_context.as_ref() {
-            plans.push(viewer_context_media_teardown_plan(&active.bundle));
-        }
-        plans.extend(
-            self.detached_image_windows
-                .iter()
-                .filter_map(|window| window.paused_bundle.as_deref())
-                .map(viewer_context_media_teardown_plan),
-        );
+        let plans = self
+            .other_viewer_context_ids()
+            .into_iter()
+            .filter_map(|id| self.with_viewer_context_ref(id, viewer_context_media_teardown_plan))
+            .collect::<Vec<_>>();
         self.save_viewer_context_media_teardown_resumes(&plans);
     }
 
@@ -39800,7 +39013,7 @@ impl App {
         self.native_video_parked_live_input_window_id.is_some()
     }
 
-    /// ParkedLive bundle の mount 中は snapshot.paused_bundle が一時的に None なので、その場で
+    /// ParkedLive context の mount 中も registry binding が owner を指し続けるため、
     /// window を retain-drop せず、poll 後の swap-back まで close を遅延する。
     /// (review-v2.3.0 追補6: R1-4 parked open timeout)
     #[cfg(windows)]
@@ -39823,44 +39036,29 @@ impl App {
     pub(crate) fn poll_parked_live_detached_windows(&mut self, ctx: &egui::Context) {
         let ids = self.parked_live_media_window_ids();
         for id in ids {
-            let Some(pos) = self
-                .detached_image_windows
-                .iter()
-                .position(|window| window.id == id)
-            else {
-                continue;
-            };
-            let Some(mut bundle) = self.detached_image_windows[pos].paused_bundle.take() else {
-                continue;
-            };
-            if !Self::viewer_context_bundle_contains_video(&bundle) {
-                self.detached_image_windows[pos].paused_bundle = Some(bundle);
-                continue;
-            }
-            if Self::detached_image_window_debug_enabled() && self.frame_counter % 600 == 0 {
-                self.log_detached_image_window_debug(format!(
-                    "parked_live_poll_begin frame={} id={id} bundle_fs_idx={:?}",
-                    self.frame_counter, bundle.fullscreen_idx
-                ));
-            }
-            self.swap_viewer_context_bundle(&mut bundle);
-            let saved_input_window_id = self.native_video_parked_live_input_window_id;
-            self.native_video_parked_live_input_window_id = Some(id);
-            self.poll_video(ctx);
-            self.poll_bookmark_media_open(ctx);
-            self.update_parked_live_audio_music_view_state(ctx);
-            // set_native_video_* resolves through fullscreen_idx/fs_cache, so build and push
-            // this owner's overlays before swapping its mounted bundle back out.
-            self.sync_parked_live_native_video_right_drag_overlays(ctx, id);
-            self.native_video_parked_live_input_window_id = saved_input_window_id;
-            self.swap_viewer_context_bundle(&mut bundle);
-            if let Some(window) = self
-                .detached_image_windows
-                .iter_mut()
-                .find(|window| window.id == id)
-            {
-                window.paused_bundle = Some(bundle);
-            }
+            self.with_window_viewer_context(id, |app| {
+                if Self::detached_image_window_debug_enabled() && app.frame_counter % 600 == 0 {
+                    app.log_detached_image_window_debug(format!(
+                        "parked_live_poll_begin frame={} id={id} bundle_fs_idx={:?}",
+                        app.frame_counter, app.fullscreen_idx
+                    ));
+                }
+                let saved_input_window_id = app.native_video_parked_live_input_window_id;
+                app.native_video_parked_live_input_window_id = Some(id);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    app.poll_video(ctx);
+                    app.poll_bookmark_media_open(ctx);
+                    app.update_parked_live_audio_music_view_state(ctx);
+                    app.sync_parked_live_native_video_right_drag_overlays(ctx, id);
+                }));
+                app.native_video_parked_live_input_window_id = saved_input_window_id;
+                if let Err(payload) = result {
+                    std::panic::resume_unwind(payload);
+                }
+            })
+            .unwrap_or_else(|error| {
+                panic!("parked live context {id} failed to mount for poll: {error:?}")
+            });
             if let Some(request_pos) = self
                 .parked_live_media_close_after_poll
                 .iter()
@@ -39891,26 +39089,29 @@ impl App {
             .detached_image_windows
             .iter()
             .filter_map(|window| {
-                let bundle = window.paused_bundle.as_deref()?;
-                if !Self::viewer_context_bundle_contains_video(bundle) {
-                    return None;
-                }
                 let state = self.detached_window_state(window.id);
                 if state == Some(DetachedWindowState::ParkedLive) {
                     return None;
                 }
-                let video_cache_entries = bundle
-                    .fs_cache
-                    .values()
-                    .filter(|entry| matches!(entry, FsCacheEntry::Video { .. }))
-                    .count();
-                Some(format!(
-                    "id={} state={state:?} hwnd=0x{:x} bundle_fullscreen_idx={:?} \
-                     video_cache_entries={video_cache_entries}",
-                    window.id,
-                    self.detached_window_hwnd_raw_for_window_id(window.id),
-                    bundle.fullscreen_idx
-                ))
+                let (id, _) = self.locate_window_context(window.id)?;
+                self.with_viewer_context_ref(id, |context| {
+                    if !Self::viewer_context_contains_video(context) {
+                        return None;
+                    }
+                    let video_cache_entries = context
+                        .fs_cache()
+                        .values()
+                        .filter(|entry| matches!(entry, FsCacheEntry::Video { .. }))
+                        .count();
+                    Some(format!(
+                        "id={} state={state:?} hwnd=0x{:x} bundle_fullscreen_idx={:?} \
+                         video_cache_entries={video_cache_entries}",
+                        window.id,
+                        self.detached_window_hwnd_raw_for_window_id(window.id),
+                        context.fullscreen_idx()
+                    ))
+                })
+                .flatten()
             })
             .collect::<Vec<_>>();
         if !mismatches.is_empty() {
@@ -39944,8 +39145,32 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn should_poll_main_video_context(&self) -> bool {
-        !self.active_detached_viewer_context_contains_video()
+        !self.other_active_viewer_context_contains_video()
             && !self.parked_live_media_window_exists()
+    }
+
+    fn poll_main_video_context(&mut self, ctx: &egui::Context) {
+        let should_poll = {
+            #[cfg(windows)]
+            {
+                self.should_poll_main_video_context()
+            }
+            #[cfg(not(windows))]
+            {
+                true
+            }
+        };
+        if should_poll {
+            self.poll_video(ctx);
+        } else {
+            #[cfg(windows)]
+            if Self::detached_image_window_debug_enabled() && self.frame_counter % 60 == 0 {
+                self.log_detached_image_window_debug(format!(
+                    "main_poll_video_deferred_to_active_context frame={}",
+                    self.frame_counter
+                ));
+            }
+        }
     }
 
     #[cfg(windows)]
@@ -39978,7 +39203,8 @@ impl App {
         apply_initial_placement: bool,
     ) -> DeferredDetachedImageWindowView {
         let owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(window.id);
-        let right_drag_guide = self.right_drag_guide_for_owner(owner, window.right_drag_context());
+        let right_drag_guide = self
+            .right_drag_guide_for_owner(owner, self.right_drag_context_for_window_id(window.id));
         DeferredDetachedImageWindowView::from_snapshot(
             window,
             placement,
@@ -40033,6 +39259,7 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn adopt_deferred_detached_window_hwnd_after_callback(
         &mut self,
+        ctx: &egui::Context,
         window_id: u64,
         viewport_id: egui::ViewportId,
     ) {
@@ -40075,7 +39302,11 @@ impl App {
                         .unwrap_or_else(|| "none".to_string()),
                     Self::win32_hwnd_debug_state(hwnd)
                 ));
+                let wake_video_resync = self.pending_detached_video_host_resync;
                 self.try_resync_detached_video_host_after_registration(window_id);
+                if wake_video_resync {
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
             }
             DetachedWindowHwndDiff::NoChange => {
                 self.log_detached_image_window_debug(format!(
@@ -40119,11 +39350,7 @@ impl App {
         if !self.detached_window_state_is_parked_live(id) {
             return false;
         }
-        if !self.detached_image_windows[pos]
-            .paused_bundle
-            .as_deref()
-            .is_some_and(Self::viewer_context_bundle_contains_video)
-        {
+        if !self.window_viewer_context_contains_video(id) {
             self.log_detached_image_window_debug(format!(
                 "parked_live_activate_aborted id={id} reason=no_video_bundle"
             ));
@@ -40132,7 +39359,7 @@ impl App {
         self.ensure_detached_window_runtime_placement(id, "parked_live_activate_begin");
         self.log_detached_image_window_debug(format!(
             "parked_live_activate_begin id={id} pos={pos} active_context={} session={:?}",
-            self.active_detached_viewer_context.is_some(),
+            self.active_detached_context_debug_state(),
             self.active_detached_session
         ));
         self.clear_fullscreen_feedback_for_viewer_switch();
@@ -40154,10 +39381,10 @@ impl App {
             ));
             return false;
         };
-        let mut snapshot = self.detached_image_windows.remove(pos);
-        let Some(mut paused_bundle) = snapshot.paused_bundle.take() else {
+        let snapshot = self.detached_image_windows.remove(pos);
+        let Some((context_id, residence)) = self.locate_window_context(id) else {
             self.log_detached_image_window_debug(format!(
-                "parked_live_activate_aborted id={id} reason=bundle_missing_after_remove"
+                "parked_live_activate_aborted id={id} reason=context_missing_after_remove"
             ));
             self.transition_detached_window_state(
                 id,
@@ -40167,11 +39394,10 @@ impl App {
             self.detached_image_windows.insert(pos, snapshot);
             return false;
         };
-        if !Self::viewer_context_bundle_contains_video(&paused_bundle) {
+        if residence != ContextResidence::AtRest {
             self.log_detached_image_window_debug(format!(
-                "parked_live_activate_aborted id={id} reason=bundle_not_video_after_remove"
+                "parked_live_activate_aborted id={id} reason=context_not_at_rest residence={residence:?}"
             ));
-            snapshot.paused_bundle = Some(paused_bundle);
             self.transition_detached_window_state(
                 id,
                 DetachedWindowState::ParkedLive,
@@ -40181,16 +39407,18 @@ impl App {
             return false;
         }
 
-        paused_bundle
-            .viewer_session
-            .activate_independent_detached(id);
-        paused_bundle.fs_open_intent_from_grid = false;
-        paused_bundle.pending_auto_fs_open = false;
-        paused_bundle.pending_return_to_parent = false;
-        paused_bundle.pdf_prefetch_grace_until = None;
+        let activation = self.with_viewer_context(context_id, |app| {
+            app.activate_mounted_as_independent_detached(id);
+            app.adopt_active_detached_viewport_runtime_from_passive("resume_parked_live_media");
+            Self::viewer_context_bundle_detached_source(ContextRef::mounted(app))
+        });
+        let Ok(source) = activation else {
+            self.detached_image_windows.insert(pos, snapshot);
+            return false;
+        };
 
-        // ParkedLive owner の pending は active context の通常 poll へ引き継ぐ。
-        // owner を残すと parked poll が二度と来ず、timeout 判定も含めて永久停止する。
+        // Window-scoped legacy pending は ParkedLive poll から active context の通常 poll へ
+        // 引き継ぐ。regular open は ViewerContextId owner のまま mount を追跡する。
         // (review-v2.3.0 追補2 BA-7: activation pending ownership)
         self.rebind_native_video_pending_owners(Some(id), None, "parked_live_activate_commit");
         self.detached_viewer_window_id = Some(id);
@@ -40200,13 +39428,8 @@ impl App {
             DetachedWindowState::Resuming,
             "parked_live_activate_commit",
         );
-        self.adopt_active_detached_viewport_runtime_from_passive("resume_parked_live_media");
         self.last_active_detached_window_id = Some(id);
-        let source = Self::viewer_context_bundle_detached_source(&paused_bundle);
         self.begin_active_detached_session(id, source);
-        self.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
-            bundle: *paused_bundle,
-        });
         self.log_detached_image_window_debug(format!(
             "parked_live_activate_committed id={id} passive_remaining={} active_context=true \
              session={:?}",
@@ -40301,10 +39524,10 @@ impl App {
             ));
             return;
         }
-        if self.active_detached_viewer_context.is_some() || self.fullscreen_idx.is_some() {
+        if self.active_detached_context_is_at_rest() || self.fullscreen_idx.is_some() {
             self.log_detached_image_window_debug(format!(
                 "main_focus_after_close_skipped reason={reason} active_context={} fs_idx={:?}",
-                self.active_detached_viewer_context.is_some(),
+                self.active_detached_context_debug_state(),
                 self.fullscreen_idx
             ));
             return;
@@ -40374,7 +39597,7 @@ impl App {
         ctx: &egui::Context,
         preserve_fullfeature_linked_still: bool,
     ) -> bool {
-        if self.active_detached_viewer_context_contains_video()
+        if self.other_active_viewer_context_contains_video()
             && self
                 .park_active_detached_context_as_live_media(ctx, "park_active_context_live_media")
         {
@@ -40382,7 +39605,7 @@ impl App {
                 "park_current_active_detached result=parked_live_active_context passive_windows={} \
                  active_context={} session={:?}",
                 self.detached_image_windows.len(),
-                self.active_detached_viewer_context.is_some(),
+                self.active_detached_context_debug_state(),
                 self.active_detached_session
             ));
             return true;
@@ -40395,25 +39618,25 @@ impl App {
                 "park_current_active_detached result=parked_live_legacy passive_windows={} \
                  active_context={} session={:?}",
                 self.detached_image_windows.len(),
-                self.active_detached_viewer_context.is_some(),
+                self.active_detached_context_debug_state(),
                 self.active_detached_session
             ));
             return true;
         }
-        if self.pause_current_active_detached_viewer_context(ctx) {
+        if self.pause_current_active_viewer_context(ctx) {
             self.log_detached_image_window_debug(format!(
                 "park_current_active_detached result=paused passive_windows={} \
                  active_context={} session={:?}",
                 self.detached_image_windows.len(),
-                self.active_detached_viewer_context.is_some(),
+                self.active_detached_context_debug_state(),
                 self.active_detached_session
             ));
             return true;
-        } else if self.active_detached_viewer_context.is_some() {
+        } else if self.active_detached_context_is_at_rest() {
             self.log_detached_image_window_debug(
                 "park_current_active_detached result=close_active_context".to_string(),
             );
-            return self.close_current_active_detached_viewer_context(ctx);
+            return self.close_current_active_viewer_context(ctx);
         } else if self.viewer_session_is_detached() {
             if self.preserve_active_detached_image_window_for_main_context_change_inner(
                 preserve_fullfeature_linked_still,
@@ -40467,7 +39690,7 @@ impl App {
             self.close_fullscreen();
             return true;
         }
-        self.active_detached_viewer_context.is_none()
+        !self.active_detached_context_is_at_rest()
     }
 
     #[cfg(windows)]
@@ -40546,122 +39769,125 @@ impl App {
             }
         };
         let target = Self::detached_book_context_target(&descriptor);
-        let mut main_context = self.take_current_viewer_context_bundle();
-        // From this point until the bundle is captured, all loads belong to the
-        // independent detached still viewer.  The scope travels with the bundle
-        // and is restored whenever that viewer is mounted.
-        self.navigation_scope = ViewerNavigationScope::DetachedPhysical;
-        if let Some(pending) = bookmark_pending.as_mut() {
-            pending.begin_page_wait();
-            self.bookmark_view_state = Some(BookmarkViewState::Detached {
-                target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(
-                    pending.bookmark.container_path.clone(),
-                ),
-            });
-        }
-        self.bookmark_open_pending =
-            bookmark_pending.map(crate::bookmark_browser::PendingBookmarkOpen::Book);
-        let context_serial = self.assign_next_detached_viewer_context_generation();
-        self.reset_active_detached_viewport_runtime_for_new_window(
-            context_serial,
-            "start_active_detached_book_context",
-        );
-        let window_id =
-            resume_window_id.unwrap_or_else(|| self.allocate_detached_viewer_window_id());
-        self.log_detached_image_window_debug(format!(
-            "allocate_window_id reason=start_active_detached_book_context id={window_id} \
+        let built =
+            self.build_viewer_context("start_active_detached_book_context", |app, reserved| {
+                // From this point until the bundle is captured, all loads belong to the
+                // independent detached still viewer.  The scope travels with the bundle
+                // and is restored whenever that viewer is mounted.
+                app.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+                if let Some(pending) = bookmark_pending.as_mut() {
+                    pending.begin_page_wait();
+                    app.bookmark_view_state = Some(BookmarkViewState::Detached {
+                        target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(
+                            pending.bookmark.container_path.clone(),
+                        ),
+                    });
+                }
+                app.bookmark_open_pending =
+                    bookmark_pending.map(crate::bookmark_browser::PendingBookmarkOpen::Book);
+                let context_serial = reserved.serial();
+                app.reset_active_detached_viewport_runtime_for_new_window(
+                    context_serial,
+                    "start_active_detached_book_context",
+                );
+                let window_id =
+                    resume_window_id.unwrap_or_else(|| app.allocate_detached_viewer_window_id());
+                app.reserve_window_binding_for_build(window_id);
+                app.log_detached_image_window_debug(format!(
+                    "allocate_window_id reason=start_active_detached_book_context id={window_id} \
              resumed={} context_serial={context_serial} folder_nav_reuse_once={}",
-            resume_window_id.is_some(),
-            self.detached_viewer_folder_nav_reuse_window_once
-        ));
-        self.detached_viewer_window_id = Some(window_id);
-        self.last_active_detached_window_id = Some(window_id);
-        let seed = placement_seed.unwrap_or_else(|| self.detached_viewer_window_placement());
-        self.set_detached_window_runtime_placement(
-            window_id,
-            seed,
-            "start_active_detached_book_context",
-        );
-        self.transition_detached_window_state(
-            window_id,
-            DetachedWindowState::Opening,
-            "start_active_detached_book_context",
-        );
-        self.detached_viewer_folder_nav_reuse_window_once = false;
-        // keep-alive: book context 開始 = detached セッション開始 (§3.7 set)。enumerate 待ちの
-        // gap でも backstop が窓を生かせるよう、deferred open を待たずここで session を立てる。
-        let session_source = match &descriptor {
-            ViewerContextDescriptor::Image { .. } => DetachedSource::Image,
-            _ => DetachedSource::Book,
-        };
-        self.begin_active_detached_session(window_id, session_source);
-        // Image はフォルダ load 後に明示 open_fullscreen するので auto-fullscreen 予約を
-        // 立てない (立てると「画像のみフォルダ」設定次第で先頭画像が先に開いて二重になる)。
-        let is_image_reopen = matches!(descriptor, ViewerContextDescriptor::Image { .. });
-        let bookmark_open = self.bookmark_open_pending.is_some();
-        self.pending_auto_fs_open = !is_image_reopen && !bookmark_open;
-        self.fs_open_intent_from_grid = !is_image_reopen && !bookmark_open;
+                    resume_window_id.is_some(),
+                    app.detached_viewer_folder_nav_reuse_window_once
+                ));
+                app.detached_viewer_window_id = Some(window_id);
+                app.last_active_detached_window_id = Some(window_id);
+                let seed = placement_seed.unwrap_or_else(|| app.detached_viewer_window_placement());
+                app.set_detached_window_runtime_placement(
+                    window_id,
+                    seed,
+                    "start_active_detached_book_context",
+                );
+                app.transition_detached_window_state(
+                    window_id,
+                    DetachedWindowState::Opening,
+                    "start_active_detached_book_context",
+                );
+                app.detached_viewer_folder_nav_reuse_window_once = false;
+                // keep-alive: book context 開始 = detached セッション開始 (§3.7 set)。enumerate 待ちの
+                // gap でも backstop が窓を生かせるよう、deferred open を待たずここで session を立てる。
+                let session_source = match &descriptor {
+                    ViewerContextDescriptor::Image { .. } => DetachedSource::Image,
+                    _ => DetachedSource::Book,
+                };
+                app.begin_active_detached_session(window_id, session_source);
+                // Image はフォルダ load 後に明示 open_fullscreen するので auto-fullscreen 予約を
+                // 立てない (立てると「画像のみフォルダ」設定次第で先頭画像が先に開いて二重になる)。
+                let is_image_reopen = matches!(descriptor, ViewerContextDescriptor::Image { .. });
+                let bookmark_open = app.bookmark_open_pending.is_some();
+                app.pending_auto_fs_open = !is_image_reopen && !bookmark_open;
+                app.fs_open_intent_from_grid = !is_image_reopen && !bookmark_open;
 
-        self.with_detached_viewer_main_history_suppressed(|app| match start {
-            DetachedBookContextStart::Descriptor(descriptor) => match descriptor {
-                ViewerContextDescriptor::Zip {
-                    path,
-                    archive_source_override,
-                    ..
-                } => {
-                    app.load_zip_as_folder(path);
-                    if let Some(source) = archive_source_override {
-                        app.archive_source_override = Some(source.clone());
-                        app.address = source.to_string_lossy().to_string();
+                app.with_detached_viewer_main_history_suppressed(|app| match start {
+                    DetachedBookContextStart::Descriptor(descriptor) => match descriptor {
+                        ViewerContextDescriptor::Zip {
+                            path,
+                            archive_source_override,
+                            ..
+                        } => {
+                            app.load_zip_as_folder(path);
+                            if let Some(source) = archive_source_override {
+                                app.archive_source_override = Some(source.clone());
+                                app.address = source.to_string_lossy().to_string();
+                            }
+                        }
+                        ViewerContextDescriptor::Pdf { path, .. } => {
+                            app.load_pdf_as_folder(path);
+                        }
+                        ViewerContextDescriptor::BookFolder { path } => {
+                            app.start_detached_folder_open(path);
+                        }
+                        ViewerContextDescriptor::Image { path } => {
+                            // 仮想一覧の backing snapshot は使わず、親フォルダを worker で完全走査する。
+                            // 対象画像は scan request 自身が所有し、結果を detached bundle 内で
+                            // materialize した後に物理順の index へ解決する。
+                            if !app.start_detached_image_folder_open(path.clone()) {
+                                app.log_detached_image_window_debug(format!(
+                                    "image_reopen_no_parent_for_async_folder_scan path={}",
+                                    path.display()
+                                ));
+                            }
+                        }
+                    },
+                    DetachedBookContextStart::ScannedFolder { path, scan } => {
+                        // The main-owned preflight already established that this is an image book.
+                        // Transfer the completed scan exactly once; do not re-read the directory or
+                        // publish a detached session for mixed folders.
+                        app.load_folder_with_scan(path, Some(scan));
                     }
-                }
-                ViewerContextDescriptor::Pdf { path, .. } => {
-                    app.load_pdf_as_folder(path);
-                }
-                ViewerContextDescriptor::BookFolder { path } => {
-                    app.start_detached_folder_open(path);
-                }
-                ViewerContextDescriptor::Image { path } => {
-                    // 仮想一覧の backing snapshot は使わず、親フォルダを worker で完全走査する。
-                    // 対象画像は scan request 自身が所有し、結果を detached bundle 内で
-                    // materialize した後に物理順の index へ解決する。
-                    if !app.start_detached_image_folder_open(path.clone()) {
-                        app.log_detached_image_window_debug(format!(
-                            "image_reopen_no_parent_for_async_folder_scan path={}",
-                            path.display()
-                        ));
-                    }
-                }
-            },
-            DetachedBookContextStart::ScannedFolder { path, scan } => {
-                // The main-owned preflight already established that this is an image book.
-                // Transfer the completed scan exactly once; do not re-read the directory or
-                // publish a detached session for mixed folders.
-                app.load_folder_with_scan(path, Some(scan));
-            }
-        });
+                });
 
-        if !bookmark_open
-            && !is_image_reopen
-            && let Some(target) = target
-        {
-            self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
-                history_trigger: crate::app::HistoryTrigger::UserChosen,
-                resume_slideshow: false,
-                target: DeferredFsTarget::Required(target),
-                resume_to_last_page: false,
-                from_explicit_open: true,
-                preserve_after_password_prompt: true,
+                if !bookmark_open
+                    && !is_image_reopen
+                    && let Some(target) = target
+                {
+                    app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                        history_trigger: crate::app::HistoryTrigger::UserChosen,
+                        resume_slideshow: false,
+                        target: DeferredFsTarget::Required(target),
+                        resume_to_last_page: false,
+                        from_explicit_open: true,
+                        preserve_after_password_prompt: true,
+                    });
+                }
+
+                BuildOutcome::Commit
             });
+        if built.is_some() {
+            ctx.request_repaint();
+            true
+        } else {
+            false
         }
-
-        let active_context = self.take_current_viewer_context_bundle();
-        self.swap_viewer_context_bundle(&mut main_context);
-        self.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
-            bundle: active_context,
-        });
-        ctx.request_repaint();
-        true
     }
 
     #[cfg(windows)]
@@ -40894,8 +40120,7 @@ impl App {
         };
 
         let base_placement = self.active_detached_viewer_current_placement();
-        let had_active_detached =
-            self.active_detached_viewer_context.is_some() || self.viewer_session_is_detached();
+        let had_active_detached = self.active_detached_context_exists();
         if !self.park_and_close_current_active_detached_viewer(ctx) {
             return false;
         }
@@ -40921,8 +40146,7 @@ impl App {
             return DetachedGridArchiveOpenOutcome::Cancelled("archive_detached_completion_stale");
         }
         let base_placement = self.active_detached_viewer_current_placement();
-        let had_active_detached =
-            self.active_detached_viewer_context.is_some() || self.viewer_session_is_detached();
+        let had_active_detached = self.active_detached_context_exists();
         if !self.park_and_close_current_active_detached_viewer(ctx) {
             return DetachedGridArchiveOpenOutcome::Failed;
         }
@@ -40989,8 +40213,7 @@ impl App {
             }
         };
         let base_placement = self.active_detached_viewer_current_placement();
-        let had_active_detached =
-            self.active_detached_viewer_context.is_some() || self.viewer_session_is_detached();
+        let had_active_detached = self.active_detached_context_exists();
         if !self.park_and_close_current_active_detached_viewer(ctx) {
             self.bookmark_open_pending =
                 Some(crate::bookmark_browser::PendingBookmarkOpen::Book(pending));
@@ -41029,7 +40252,7 @@ impl App {
         else {
             return false;
         };
-        let mut snapshot = self.detached_image_windows.remove(pos);
+        let snapshot = self.detached_image_windows.remove(pos);
         self.update_detached_window_runtime_flags(snapshot.id, false, "passive_activate_begin");
         self.transition_detached_window_state(
             snapshot.id,
@@ -41037,64 +40260,49 @@ impl App {
             "passive_activate_begin",
         );
         self.log_detached_image_window_debug(format!(
-            "passive_activate_begin id={id} pos={pos} has_paused_bundle={} \
+            "passive_activate_begin id={id} pos={pos} has_context={} \
              descriptor={} stamp={} passive_remaining={} active_context={} session={:?}",
-            snapshot.paused_bundle.is_some(),
+            self.detached_window_context_is_at_rest(id),
             Self::detached_viewer_descriptor_debug_kind(&snapshot.reopen_descriptor),
             snapshot.reopen_sync_stamp.is_some(),
             self.detached_image_windows.len(),
-            self.active_detached_viewer_context.is_some(),
+            self.active_detached_context_debug_state(),
             self.active_detached_session
         ));
         self.clear_fullscreen_feedback_for_viewer_switch();
 
-        if let Some(mut paused_bundle) = snapshot.paused_bundle.take() {
-            self.log_detached_image_window_debug(format!(
-                "passive_activate_resume_paused_bundle id={} bundle_window_id={:?} \
-                 bundle_fs_idx={:?} bundle_independent={} \
-                 bundle_pending={} bundle_cache={} snapshot_title={:?}",
-                snapshot.id,
-                paused_bundle.viewer_session.detached_window_id,
-                paused_bundle.fullscreen_idx,
-                paused_bundle.viewer_session.independent_active,
-                paused_bundle.fs_pending.len(),
-                paused_bundle.fs_cache.len(),
-                snapshot.title
-            ));
-            self.ensure_detached_window_runtime_placement(snapshot.id, "resume_paused_bundle");
+        if let Some((context_id, ContextResidence::AtRest)) = self.locate_window_context(id) {
+            self.ensure_detached_window_runtime_placement(snapshot.id, "resume_viewer_context");
             if !self.park_and_close_current_active_detached_viewer(ctx) {
                 self.log_detached_image_window_debug(format!(
-                    "passive_activate_resume_paused_bundle_aborted id={} reason=park_current_failed",
+                    "passive_activate_resume_context_aborted id={} reason=park_current_failed",
                     snapshot.id
                 ));
-                snapshot.paused_bundle = Some(paused_bundle);
                 self.transition_detached_window_state(
                     snapshot.id,
                     DetachedWindowState::Parked,
-                    "passive_activate_resume_paused_bundle_aborted",
+                    "passive_activate_resume_context_aborted",
                 );
                 self.detached_image_windows.insert(pos, snapshot);
                 return false;
             }
-            paused_bundle
-                .viewer_session
-                .activate_independent_detached(snapshot.id);
-            paused_bundle.fs_open_intent_from_grid = false;
-            paused_bundle.pdf_prefetch_grace_until = None;
-            self.adopt_active_detached_viewport_runtime_from_passive("resume_paused_bundle");
+            let activation = self.with_viewer_context(context_id, |app| {
+                app.activate_mounted_as_independent_detached(snapshot.id);
+                app.adopt_active_detached_viewport_runtime_from_passive("resume_viewer_context");
+                app.rearm_final_ai_prefetch_after_detached_resume();
+                Self::viewer_context_bundle_detached_source(ContextRef::mounted(app))
+            });
+            let Ok(source) = activation else {
+                self.detached_image_windows.insert(pos, snapshot);
+                return false;
+            };
             // keep-alive: passive→active 再開 = セッション再開 (§3.7 set)。open_fullscreen を
             // 通らない経路なのでここで明示的に session を立てる。
+            self.detached_viewer_window_id = Some(snapshot.id);
             self.last_active_detached_window_id = Some(snapshot.id);
-            let source = Self::viewer_context_bundle_detached_source(&paused_bundle);
             self.begin_active_detached_session(snapshot.id, source);
-            self.active_detached_viewer_context = Some(ActiveDetachedViewerContext {
-                bundle: *paused_bundle,
-            });
-            let _ = self.with_active_detached_viewer_context(|app| {
-                app.rearm_final_ai_prefetch_after_detached_resume();
-            });
             self.log_detached_image_window_debug(format!(
-                "passive_activate_resume_paused_bundle_committed id={} active_context=true \
+                "passive_activate_resume_context_committed id={} active_context=true \
                  session={:?}",
                 snapshot.id, self.active_detached_session
             ));
@@ -41170,7 +40378,7 @@ impl App {
                 "passive_activate_still_committed id={} active_context={} fs_idx={:?} \
                  independent={} session={:?}",
                 activate_window_id,
-                self.active_detached_viewer_context.is_some(),
+                self.active_detached_context_debug_state(),
                 self.fullscreen_idx,
                 self.detached_viewer_independent_active,
                 self.active_detached_session
@@ -41263,7 +40471,7 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn reconcile_closed_bookmark_detached_context(&mut self, closed: &ViewerContextBundle) {
+    fn reconcile_closed_bookmark_detached_context(&mut self, closed: &ClosedBookmarkSummary) {
         let Some(BookmarkViewState::Opening {
             target: main_target,
             ..
@@ -41277,11 +40485,7 @@ impl App {
             return;
         }
 
-        let stayed_at_opened_bookmark = closed
-            .bookmark_view_state
-            .as_ref()
-            .and_then(BookmarkViewState::target)
-            == Some(&main_target);
+        let stayed_at_opened_bookmark = closed.bookmark_target.as_ref() == Some(&main_target);
         let keep_origin_grid = matches!(
             main_target,
             crate::bookmark_browser::BookmarkViewReturnTarget::Book(_)
@@ -41314,16 +40518,8 @@ impl App {
         // Ctrl+↑↓ や前後ファイル移動で対象を離れた場合は、従来仕様どおり viewer が最後に
         // 表示していた実フォルダへ main を移す。close_fullscreen は cursor を selected へ戻すため、
         // bundle の selected item を再選択すれば同じファイルを可視範囲へ戻せる。
-        let selected_media_path = closed.selected.and_then(|idx| {
-            closed.items.get(idx).and_then(|item| match item {
-                GridItem::Video(path) | GridItem::Audio(path) => Some(path.clone()),
-                _ => None,
-            })
-        });
-        let destination = closed
-            .archive_source_override
-            .clone()
-            .or_else(|| closed.current_folder.clone());
+        let selected_media_path = closed.selected_media_path.clone();
+        let destination = closed.destination.clone();
         self.clear_bookmark_view_return_state();
         let Some(destination) = destination else {
             return;
@@ -41352,13 +40548,13 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn update_active_detached_viewer_context(&mut self, ctx: &egui::Context) -> bool {
-        if self.active_detached_viewer_context.is_none() {
+    pub(crate) fn update_active_viewer_context(&mut self, ctx: &egui::Context) -> bool {
+        if !self.active_detached_context_is_at_rest() {
             return false;
         }
 
         let (should_drop, detached_viewport_finalized) = self
-            .with_active_detached_viewer_context(|app| {
+            .with_active_viewer_context(|app| {
                 let close_viewport_id = (app.fs_viewport_shown
                     && app.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow))
                 .then(|| app.fullscreen_viewport_id());
@@ -41498,17 +40694,34 @@ impl App {
             .unwrap_or((false, false));
 
         if should_drop {
+            let active_id = self.active_viewer_context_id();
             let closed = if detached_viewport_finalized {
-                self.active_detached_viewer_context
-                    .take()
-                    .map(|active| active.bundle)
+                active_id.and_then(|id| {
+                    match self.retire_context(id, "active_viewport_finalized", |context| {
+                        ClosedBookmarkSummary::read(context.as_ref())
+                    }) {
+                        Ok(summary) => Some(summary),
+                        Err(error) => {
+                            crate::logger::log(format!(
+                                "active_viewer_context_retire_failed id={id:?} +                                 reason=active_viewport_finalized error={error:?}"
+                            ));
+                            None
+                        }
+                    }
+                })
             } else {
-                self.take_and_close_current_active_detached_viewer_context(
+                self.take_and_close_current_active_viewer_context(
                     ctx,
                     "active_terminal_before_viewport",
                 )
             };
             if let Some(closed) = closed {
+                if closed.had_pdf_password_request && self.pdf_password_request.is_none() {
+                    self.show_pdf_password_dialog = false;
+                    self.pdf_password_input.clear();
+                    self.pdf_password_error = None;
+                    self.pdf_password_save = false;
+                }
                 self.reconcile_closed_bookmark_detached_context(&closed);
             }
         }
@@ -41789,7 +41002,6 @@ impl App {
             activation_armed: false,
             focused_last_frame: false,
             initial_placement_applied: false,
-            paused_bundle: None,
         })
     }
 
@@ -41834,7 +41046,6 @@ impl App {
             activation_armed: false,
             focused_last_frame: false,
             initial_placement_applied: false,
-            paused_bundle: None,
         })
     }
 
@@ -41844,7 +41055,7 @@ impl App {
         ctx: &egui::Context,
         reason: &'static str,
     ) -> bool {
-        self.park_current_viewer_context_as_live_media_inner(ctx, reason, true)
+        self.park_current_viewer_context_as_live_media_inner(ctx, reason)
     }
 
     /// スタック集約の適用直前に、bundle 化前の detached セッションを退避する
@@ -41873,30 +41084,35 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         reason: &'static str,
-        preserve_main_context: bool,
     ) -> bool {
-        let Some(mut snapshot) = self.build_parked_live_media_window_snapshot(ctx) else {
+        if !self.current_viewer_context_contains_video() {
+            return false;
+        }
+        let Some(snapshot) = self.build_parked_live_media_window_snapshot(ctx) else {
             return false;
         };
         let snapshot_id = snapshot.id;
-        let mut parked_bundle = if preserve_main_context {
-            self.split_current_context_preserving_main_grid()
-        } else {
-            Box::new(self.take_current_viewer_context_bundle())
-        };
-        if !Self::viewer_context_bundle_contains_video(&parked_bundle) {
-            if !preserve_main_context {
-                self.swap_viewer_context_bundle(&mut parked_bundle);
+        let mounted = self
+            .mounted_viewer_context_id()
+            .expect("live-media fork requires a mounted context");
+        match self.locate_window_context(snapshot_id) {
+            Some((owner, ContextResidence::Mounted)) => assert_eq!(owner, mounted),
+            Some((owner, residence)) => {
+                panic!("live-media window {snapshot_id} belongs to {owner:?} in {residence:?}")
             }
-            return false;
+            None => self
+                .bind_window(mounted, snapshot_id)
+                .unwrap_or_else(|error| panic!("live-media source binding failed: {error:?}")),
         }
-        parked_bundle
-            .viewer_session
-            .activate_independent_detached(snapshot_id);
-        snapshot.paused_bundle = Some(parked_bundle);
+        let parked_id = self.fork_mounted_live_media_context(snapshot_id);
+        self.with_viewer_context(parked_id, |app| {
+            app.activate_mounted_as_independent_detached(snapshot_id);
+        })
+        .expect("freshly forked live-media context must be mountable");
         self.detached_image_windows.push(snapshot);
-        // mounted/active owner の pending を ParkedLive window へ焼き直す。別 parked window の
-        // owner は一致しないため変更しない (review-v2.3.0 追補2 BA-7)。
+        // Window-scoped legacy pending の mounted/active owner を ParkedLive window へ
+        // 焼き直す。regular open は fork transaction で ViewerContextId owner を移している。
+        // 別 parked window の owner は一致しないため変更しない (review-v2.3.0 追補2 BA-7)。
         self.rebind_native_video_pending_owners(None, Some(snapshot_id), "parked_live_park_commit");
         self.update_detached_window_runtime_flags(snapshot_id, false, reason);
         self.handoff_active_detached_viewport_to_passive(reason);
@@ -41911,556 +41127,6 @@ impl App {
             self.detached_image_windows.len()
         ));
         true
-    }
-
-    /// legacy/unbundled viewer 用に、現在 context を main と独立 viewer に分割する。
-    ///
-    /// main grid が使う一覧 identity / worker 複合体は main に残し、viewer の一時状態だけを
-    /// 戻り値へ移す。ParkedLive media と、通常画像を grid から always-new detached viewer
-    /// として開く境界の両方がこの primitive を使う。
-    ///
-    /// `ViewerContextBundle` の全 field を destructure して 3 分類するため、field 追加時は
-    /// コンパイルエラーになり、空 bundle + allowlist 方式の状態喪失を再発させない。
-    /// (review-v2.3.0 追補4: live-park main 文脈保持)
-    #[cfg(windows)]
-    fn split_current_context_preserving_main_grid(&mut self) -> Box<ViewerContextBundle> {
-        macro_rules! duplicate_for_parked {
-            ($($field:ident),+ $(,)?) => {
-                $(*$field = self.$field.clone();)+
-            };
-        }
-        macro_rules! move_to_parked {
-            ($($field:ident),+ $(,)?) => {
-                $(std::mem::swap(&mut self.$field, $field);)+
-            };
-        }
-        macro_rules! keep_in_main {
-            ($($field:ident),+ $(,)?) => {
-                $(let _ = $field;)+
-            };
-        }
-
-        let mut parked = Box::new(ViewerContextBundle::empty());
-        let ViewerContextBundle {
-            address,
-            current_folder,
-            navigation_scope,
-            archive_source_override,
-            zip_nav,
-            stack_mode_requested,
-            stack_view,
-            stack_showing_flat,
-            stack_active_rule,
-            stack_script_error,
-            stack_toggle_select_path,
-            items,
-            items_generation,
-            visible_indices,
-            facet_name_cache,
-            facet_name_cache_generation,
-            facet_name_cache_pending,
-            facet_name_cache_failed_generation,
-            thumbnails,
-            image_metas,
-            video_thumb_overrides,
-            auto_aspect,
-            selected,
-            grid_click_selection_anchor,
-            scroll_offset_y,
-            scroll_to_selected,
-            pending_grid_scroll,
-            requested,
-            metadata_import_refresh_index,
-            idle_upgrade_cache_bypass_ineligible,
-            keep_range,
-            keep_set,
-            thumbnail_eviction_generation,
-            details_thumb_suppression_applied,
-            details_hover_thumb_idx,
-            details_hover_thumb_viewport_open,
-            texture_backlog,
-            details_order,
-            details_order_revision,
-            details_cell_content_revisions,
-            details_tag_prewarm_indices,
-            details_lazy_meta,
-            details_meta_pending,
-            details_lazy_visible_revision,
-            details_image_dims_state,
-            metadata_cache,
-            exif_cache,
-            xmp_cache,
-            xmp_panorama_info,
-            metadata_pending,
-            tags_cache,
-            tag_prewarm_pending,
-            tag_prewarm_queued,
-            tag_legacy_seed_pending,
-            pending_finalize,
-            tx,
-            rx,
-            cancel_token,
-            reload_queue,
-            heavy_io_queue,
-            scroll_hint,
-            visible_end_shared,
-            keep_start_shared,
-            keep_end_shared,
-            last_vis_range,
-            vis_settle_at,
-            vis_first_logged,
-            vis_all_logged,
-            folder_nav_pending,
-            folder_pane_open_pending,
-            pending_folder_nav_steps,
-            pending_folder_nav_mode,
-            search_filter,
-            search_filter_origin_folder,
-            checked,
-            rotation_cache,
-            page_dims_cache,
-            rating_cache,
-            rating_session_write_seen_generation,
-            current_folder_rating_cache,
-            current_folder_last_mtime,
-            current_folder_signature,
-            folder_pin_map,
-            converted_archive_cache_paths,
-            converted_archive_pin_root_states,
-            converted_archive_cache_paths_pending,
-            current_color_cache_map,
-            current_color_catalog,
-            vst3_deferred_media_open,
-            fullscreen_idx,
-            viewer_session,
-            native_video_in_window_active,
-            video_audio_mode,
-            video_audio_vst,
-            video_audio_mode_entry_target,
-            video_audio_exit_pending,
-            panorama_state,
-            pano_toast_shown_for_current_fs,
-            analysis_mode,
-            analysis_hover_color,
-            analysis_pinned_color,
-            analysis_grayscale,
-            analysis_mosaic_grid,
-            analysis_filter_mag,
-            analysis_guide_drag,
-            view_trim_mode,
-            view_trim_apply_mode,
-            view_trim_page_apply_root_idx,
-            view_trim_page_spread_separate,
-            view_trim_book_settings,
-            view_trim_page_overrides,
-            view_trim_dirty_page_overrides,
-            view_trim_save_pending,
-            fs_cache,
-            fs_lanczos_cache,
-            fs_margin_bbox_cache,
-            input_generation,
-            fs_pending,
-            fullscreen_pdf_promotion,
-            fs_pdf_display_target,
-            fs_early_dims,
-            fs_upload_backlog,
-            top_level_grid_view,
-            items_are_global_search_view,
-            items_are_tag_view,
-            items_are_reading_history_view,
-            items_are_bookmark_view,
-            items_are_rating_view,
-            items_are_subfolder_expansion_view,
-            items_are_smart_folder_view,
-            items_are_drive_list,
-            reading_history_return_from,
-            bookmark_view_state,
-            bookmark_open_pending,
-            fs_open_intent_from_grid,
-            pending_detached_video_host_switch,
-            fs_zoom,
-            fs_pan,
-            fs_zoom_active,
-            fs_zoom_aiming,
-            fs_zoom_factor,
-            fs_zoom_pdf_rerender_idx,
-            fs_zoom_pdf_rerender_zoom,
-            fs_pan_drag_start,
-            fs_vertical_scroll,
-            fs_seek_drag_active,
-            fs_seek_overlay_visible,
-            fs_vertical_cache_keep_set,
-            continuous_page_transitions,
-            fs_free_rotation,
-            fs_rotation_drag_start,
-            analysis_zoom,
-            analysis_pan,
-            analysis_pan_drag_start,
-            analysis_overlay_cache,
-            analysis_hist_cache,
-            analysis_sv_cache,
-            spread_mode,
-            spread_shift_anchor_idx,
-            reading_flow,
-            reading_direction,
-            slideshow_playing,
-            slideshow_next_at,
-            slideshow_anchor_idx,
-            continuous_reading_scroll_transition,
-            slideshow_scroll_range_cache,
-            pdf_enumerate_pending,
-            zip_enumerate_pending,
-            fs_nav_after_pdf_enumerate,
-            pdf_password_request,
-            pdf_current_password,
-            pdf_password_pending_save,
-            pending_auto_fs_open,
-            pending_return_to_parent,
-            pdf_placeholder_count,
-            cached_nav_indices,
-            cached_fs_seek_info,
-            fs_nav_locked_gen,
-            fs_nav_dropped_block_signature,
-            fs_nav_dropped_block_count,
-            fs_load_skip_signature,
-            fs_holdover_tex,
-            fs_boundary_hint,
-            virtual_folder_writeback,
-            pdf_prefetch_grace_until,
-            thumb_pixels,
-            thumb_edit_preview_layers,
-            thumb_edit_preview_keys,
-            thumb_adjust_tex,
-            passthrough_rendition_cache,
-            adjustment_page_params,
-            local_adjust_page_layers,
-            local_adjust_pages,
-            local_adjust_selected_layers,
-            local_adjust_generation,
-            local_adjust_cache,
-            local_adjust_pending,
-            export_crop_page_settings,
-            export_crop_pages,
-            mask_pages,
-            comic_pages,
-            conceal_pages,
-            erase_mask_generation,
-            conceal_mask_generation,
-            edit_result_cache,
-            final_ai_cache,
-            final_ai_pending,
-            final_ai_failed,
-            final_composite_cache,
-            final_effect_pending,
-            adjustment_cache,
-            erase_result_cache,
-            erase_preview_cache,
-            erase_base_cache,
-            conceal_base_cache,
-            conceal_cache,
-            comic_cache,
-            comic_bake_pending,
-            erase_inpaint_pending,
-            ai_classify_cache,
-            normalize_ui_states,
-            normalize_auto_scan_suppressed,
-            music_bookmarks,
-            music_bookmarks_loaded_for,
-            last_loop_pos,
-        } = parked.as_mut();
-
-        // EOF 連続再生 / 前後ファイル移動が参照する一覧 identity は parked にも複製する。
-        duplicate_for_parked!(
-            address,
-            current_folder,
-            archive_source_override,
-            zip_nav,
-            stack_mode_requested,
-            stack_view,
-            stack_showing_flat,
-            stack_active_rule,
-            stack_script_error,
-            stack_toggle_select_path,
-            items,
-            items_generation,
-            visible_indices,
-            facet_name_cache,
-            facet_name_cache_generation,
-            facet_name_cache_failed_generation,
-            thumbnails,
-            image_metas,
-            auto_aspect,
-            selected,
-            grid_click_selection_anchor,
-            scroll_offset_y,
-            scroll_to_selected,
-            pending_grid_scroll,
-            keep_range,
-            keep_set,
-            thumbnail_eviction_generation,
-            details_order,
-            details_order_revision,
-            details_cell_content_revisions,
-            search_filter,
-            search_filter_origin_folder,
-            checked,
-            rotation_cache,
-            page_dims_cache,
-            rating_cache,
-            rating_session_write_seen_generation,
-            current_folder_rating_cache,
-            tags_cache,
-            current_folder_last_mtime,
-            current_folder_signature,
-            top_level_grid_view,
-            items_are_global_search_view,
-            items_are_tag_view,
-            items_are_reading_history_view,
-            items_are_bookmark_view,
-            items_are_rating_view,
-            items_are_subfolder_expansion_view,
-            items_are_smart_folder_view,
-            items_are_drive_list,
-            reading_history_return_from,
-            bookmark_view_state,
-        );
-
-        // 再生中 player / pending と fullscreen viewer の一時 UI だけを parked 所有へ移す。
-        move_to_parked!(
-            vst3_deferred_media_open,
-            fullscreen_idx,
-            native_video_in_window_active,
-            video_audio_mode,
-            video_audio_vst,
-            video_audio_mode_entry_target,
-            video_audio_exit_pending,
-            panorama_state,
-            pano_toast_shown_for_current_fs,
-            analysis_mode,
-            analysis_hover_color,
-            analysis_pinned_color,
-            analysis_grayscale,
-            analysis_mosaic_grid,
-            analysis_filter_mag,
-            analysis_guide_drag,
-            fs_cache,
-            fs_lanczos_cache,
-            fs_margin_bbox_cache,
-            input_generation,
-            fs_pending,
-            fullscreen_pdf_promotion,
-            fs_pdf_display_target,
-            fs_early_dims,
-            fs_upload_backlog,
-            fs_open_intent_from_grid,
-            pending_detached_video_host_switch,
-            fs_zoom,
-            fs_pan,
-            fs_zoom_active,
-            fs_zoom_aiming,
-            fs_zoom_factor,
-            fs_zoom_pdf_rerender_idx,
-            fs_zoom_pdf_rerender_zoom,
-            fs_pan_drag_start,
-            fs_vertical_scroll,
-            fs_seek_drag_active,
-            fs_seek_overlay_visible,
-            fs_vertical_cache_keep_set,
-            continuous_page_transitions,
-            fs_free_rotation,
-            fs_rotation_drag_start,
-            analysis_zoom,
-            analysis_pan,
-            analysis_pan_drag_start,
-            analysis_overlay_cache,
-            analysis_hist_cache,
-            analysis_sv_cache,
-            slideshow_playing,
-            slideshow_next_at,
-            slideshow_anchor_idx,
-            continuous_reading_scroll_transition,
-            slideshow_scroll_range_cache,
-            cached_fs_seek_info,
-            fs_nav_locked_gen,
-            fs_nav_dropped_block_signature,
-            fs_nav_dropped_block_count,
-            fs_load_skip_signature,
-            fs_holdover_tex,
-            fs_boundary_hint,
-            pdf_password_request,
-            pdf_current_password,
-            pdf_password_pending_save,
-            normalize_ui_states,
-            normalize_auto_scan_suppressed,
-            music_bookmarks,
-            music_bookmarks_loaded_for,
-            last_loop_pos,
-            bookmark_open_pending,
-        );
-
-        viewer_session.swap_with_mounted(
-            &mut self.viewer_presentation,
-            &mut self.last_viewer_sync_stamp,
-            &mut self.detached_viewer_independent_active,
-            &mut self.detached_viewer_open_next_still_detached_once,
-            &mut self.detached_viewer_window_id,
-        );
-
-        // グリッド worker / 詳細列 / タグ prewarm / 編集・見開き・view-trim / folder-nav は
-        // main が原本を保持する。parked メディア窓はこれらを駆動しないので empty のままでよい。
-        keep_in_main!(
-            navigation_scope,
-            // 新しい parked context は複製済み items/cache の独立 owner になる。進行中の
-            // receiver だけは複製できないため、元の main context に残す。
-            facet_name_cache_pending,
-            requested,
-            metadata_import_refresh_index,
-            idle_upgrade_cache_bypass_ineligible,
-            details_thumb_suppression_applied,
-            details_hover_thumb_idx,
-            details_hover_thumb_viewport_open,
-            texture_backlog,
-            details_tag_prewarm_indices,
-            details_lazy_meta,
-            details_meta_pending,
-            details_lazy_visible_revision,
-            details_image_dims_state,
-            video_thumb_overrides,
-            metadata_cache,
-            exif_cache,
-            xmp_cache,
-            xmp_panorama_info,
-            metadata_pending,
-            tag_prewarm_pending,
-            tag_prewarm_queued,
-            tag_legacy_seed_pending,
-            pending_finalize,
-            tx,
-            rx,
-            cancel_token,
-            reload_queue,
-            heavy_io_queue,
-            scroll_hint,
-            visible_end_shared,
-            keep_start_shared,
-            keep_end_shared,
-            last_vis_range,
-            vis_settle_at,
-            vis_first_logged,
-            vis_all_logged,
-            folder_nav_pending,
-            folder_pane_open_pending,
-            pending_folder_nav_steps,
-            pending_folder_nav_mode,
-            folder_pin_map,
-            converted_archive_cache_paths,
-            converted_archive_pin_root_states,
-            converted_archive_cache_paths_pending,
-            current_color_cache_map,
-            current_color_catalog,
-            view_trim_mode,
-            view_trim_apply_mode,
-            view_trim_page_apply_root_idx,
-            view_trim_page_spread_separate,
-            view_trim_book_settings,
-            view_trim_page_overrides,
-            view_trim_dirty_page_overrides,
-            view_trim_save_pending,
-            spread_mode,
-            spread_shift_anchor_idx,
-            reading_flow,
-            reading_direction,
-            pdf_enumerate_pending,
-            zip_enumerate_pending,
-            fs_nav_after_pdf_enumerate,
-            pending_auto_fs_open,
-            pending_return_to_parent,
-            pdf_placeholder_count,
-            cached_nav_indices,
-            virtual_folder_writeback,
-            pdf_prefetch_grace_until,
-            thumb_pixels,
-            thumb_edit_preview_layers,
-            thumb_edit_preview_keys,
-            thumb_adjust_tex,
-            passthrough_rendition_cache,
-            adjustment_page_params,
-            local_adjust_page_layers,
-            local_adjust_pages,
-            local_adjust_selected_layers,
-            local_adjust_generation,
-            local_adjust_cache,
-            local_adjust_pending,
-            export_crop_page_settings,
-            export_crop_pages,
-            mask_pages,
-            comic_pages,
-            conceal_pages,
-            erase_mask_generation,
-            conceal_mask_generation,
-            edit_result_cache,
-            final_ai_cache,
-            final_ai_pending,
-            final_ai_failed,
-            final_composite_cache,
-            final_effect_pending,
-            adjustment_cache,
-            erase_result_cache,
-            erase_preview_cache,
-            erase_base_cache,
-            conceal_base_cache,
-            conceal_cache,
-            comic_cache,
-            comic_bake_pending,
-            erase_inpaint_pending,
-            ai_classify_cache,
-        );
-        parked
-    }
-
-    /// 完全な物理一覧を既に materialize 済みの main context から、auto-fullscreen の
-    /// detached read model を作る。通常の grid leaf open は descriptor 経路で非同期列挙するため、
-    /// この snapshot 経路は folder / ZIP / PDF の列挙完了後に限る。
-    #[cfg(windows)]
-    fn split_materialized_physical_context_for_independent_still_open(
-        &mut self,
-    ) -> Box<ViewerContextBundle> {
-        let mut detached = self.split_current_context_preserving_main_grid();
-
-        detached.view_trim_mode = self.view_trim_mode;
-        detached.view_trim_apply_mode = self.view_trim_apply_mode;
-        detached.view_trim_page_apply_root_idx = self.view_trim_page_apply_root_idx;
-        detached.view_trim_page_spread_separate = self.view_trim_page_spread_separate;
-        detached.view_trim_book_settings = self.view_trim_book_settings.clone();
-        detached.view_trim_page_overrides = self.view_trim_page_overrides.clone();
-        detached.spread_mode = self.spread_mode;
-        detached.spread_shift_anchor_idx = self.spread_shift_anchor_idx;
-        detached.reading_flow = self.reading_flow;
-        detached.reading_direction = self.reading_direction;
-
-        detached.thumb_pixels = self.thumb_pixels.clone();
-        detached.thumb_edit_preview_layers = self.thumb_edit_preview_layers.clone();
-        detached.thumb_edit_preview_keys = self.thumb_edit_preview_keys.clone();
-        detached.thumb_adjust_tex = self.thumb_adjust_tex.clone();
-        detached.adjustment_page_params = self.adjustment_page_params.clone();
-        detached.local_adjust_page_layers = self.local_adjust_page_layers.clone();
-        detached.local_adjust_pages = self.local_adjust_pages.clone();
-        detached.local_adjust_selected_layers = self.local_adjust_selected_layers.clone();
-        detached.local_adjust_generation = self.local_adjust_generation.clone();
-        detached.export_crop_page_settings = self.export_crop_page_settings.clone();
-        detached.export_crop_pages = self.export_crop_pages.clone();
-        detached.mask_pages = self.mask_pages.clone();
-        detached.comic_pages = self.comic_pages.clone();
-        detached.conceal_pages = self.conceal_pages.clone();
-        detached.erase_mask_generation = self.erase_mask_generation.clone();
-        detached.conceal_mask_generation = self.conceal_mask_generation.clone();
-        detached.final_ai_cache = self.final_ai_cache.clone();
-        detached.final_ai_failed = self.final_ai_failed.clone();
-        detached.erase_base_cache = self.erase_base_cache.clone();
-        detached.conceal_base_cache = self.conceal_base_cache.clone();
-        detached.ai_classify_cache = self.ai_classify_cache.clone();
-
-        detached
     }
 
     #[cfg(windows)]
@@ -42487,7 +41153,7 @@ impl App {
     /// materialized source が一致し、仮想 surface flag がすべて落ちた場合にだけ使う。
     #[cfg(windows)]
     fn route_materialized_physical_still_open_to_active_context(&mut self, idx: usize) -> bool {
-        if self.active_detached_viewer_context.is_some()
+        if self.active_detached_context_is_at_rest()
             || !matches!(self.navigation_scope, ViewerNavigationScope::Main)
             || self.detached_viewer_main_history_suppression_depth != 0
             || self.fullscreen_idx.is_some()
@@ -42515,38 +41181,26 @@ impl App {
             return false;
         }
 
-        let (_context_serial, items_generation) =
-            self.allocate_detached_viewer_context_generation();
-        let mut bundle = self.split_materialized_physical_context_for_independent_still_open();
-        bundle.navigation_scope = ViewerNavigationScope::DetachedPhysical;
-        bundle.set_items_generation(items_generation);
-        bundle.address = physical_context.display().to_string();
-        bundle.current_folder = Some(physical_context.clone());
-        bundle.visible_indices = bundle
-            .items
-            .iter()
-            .enumerate()
-            .filter_map(|(item_idx, item)| {
-                item_belongs_to_detached_physical_scope(item, &physical_context).then_some(item_idx)
-            })
-            .collect();
-        bundle.top_level_grid_view = top_level_grid_view::TopLevelGridView::default();
-        bundle.details_thumb_suppression_applied = false;
-        bundle.details_order.clear();
-        bundle.cached_nav_indices = None;
-        bundle.cached_fs_seek_info = None;
-        bundle.selected = Some(idx);
-
-        self.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle: *bundle });
+        let detached_id = self.fork_materialized_still_context(&physical_context, idx);
         self.log_detached_image_window_debug(format!(
             "materialized_physical_context_promoted idx={idx} main_items={} active_context=true",
             self.items.len()
         ));
 
-        self.with_active_detached_viewer_context(|detached| {
-            detached.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
-        })
-        .expect("materialized physical context must remain present while opening");
+        let window_id = self
+            .with_viewer_context(detached_id, |detached| {
+                detached.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
+                detached
+                    .active_detached_session
+                    .map(|session| session.window_id)
+                    .or(detached.detached_viewer_window_id)
+                    .expect("materialized still open must allocate a detached window")
+            })
+            .expect("materialized physical context must remain present while opening");
+        self.bind_window(detached_id, window_id)
+            .unwrap_or_else(|error| {
+                panic!("materialized still binding failed for {detached_id:?}: {error:?}")
+            });
         true
     }
 
@@ -42556,27 +41210,45 @@ impl App {
         ctx: &egui::Context,
         reason: &'static str,
     ) -> bool {
-        let Some(mut active) = self.active_detached_viewer_context.take() else {
+        let Some(active_id) = self.active_viewer_context_id() else {
             return false;
         };
-        if !Self::viewer_context_bundle_contains_video(&active.bundle) {
-            self.active_detached_viewer_context = Some(active);
+        if self.viewer_context_residence(active_id) != ContextResidence::AtRest {
             return false;
         }
-        let parked_window_id = active.bundle.viewer_session.detached_window_id;
-        self.swap_viewer_context_bundle(&mut active.bundle);
-        let parked = self.park_current_viewer_context_as_live_media_inner(ctx, reason, false);
-        self.swap_viewer_context_bundle(&mut active.bundle);
-        if !parked {
-            self.active_detached_viewer_context = Some(active);
-        } else if parked_window_id.is_some() && self.detached_viewer_window_id == parked_window_id {
-            // park_inner の window_id クリアは take_current 後の**空バンドル側**に書かれるため、
-            // ここで復元した main 文脈には parked 窓 id の stale コピーが残り得る。残すと直後の
-            // grid open (ensure_detached_viewer_window_id の直参照分岐) が同じ id を再利用し、
-            // parked live メディア窓と新セッションが同一窓を取り合う (2026-07-09 実機、BA-7)。
-            self.detached_viewer_window_id = None;
+        let has_video = self
+            .with_viewer_context_ref(active_id, Self::viewer_context_contains_video)
+            .unwrap_or(false);
+        if !has_video {
+            return false;
         }
-        parked
+        let snapshot = self
+            .with_viewer_context(active_id, |app| {
+                let snapshot = app.build_parked_live_media_window_snapshot(ctx)?;
+                let window_id = snapshot.id;
+                app.activate_mounted_as_independent_detached(window_id);
+                Some(snapshot)
+            })
+            .expect("active live-media context must be mountable");
+        let Some(snapshot) = snapshot else {
+            return false;
+        };
+        let snapshot_id = snapshot.id;
+        self.detached_image_windows.push(snapshot);
+        self.rebind_native_video_pending_owners(None, Some(snapshot_id), "parked_live_park_commit");
+        self.update_detached_window_runtime_flags(snapshot_id, false, reason);
+        self.handoff_active_detached_viewport_to_passive(reason);
+        self.transition_detached_window_state(snapshot_id, DetachedWindowState::ParkedLive, reason);
+        self.fullscreen_idx = None;
+        self.viewer_presentation = self.non_detached_viewer_presentation();
+        self.detached_viewer_independent_active = false;
+        self.detached_viewer_window_id = None;
+        self.last_viewer_sync_stamp = None;
+        self.log_detached_image_window_debug(format!(
+            "parked_live_media_committed id={snapshot_id} reason={reason} passive_windows={}",
+            self.detached_image_windows.len()
+        ));
+        true
     }
 
     #[cfg(windows)]
@@ -42669,7 +41341,7 @@ impl App {
                 self.fullscreen_idx,
                 self.viewer_session_is_detached(),
                 self.detached_viewer_independent_active,
-                self.active_detached_viewer_context.is_some(),
+                self.active_detached_context_debug_state(),
                 self.detached_viewer_window_id,
                 self.detached_image_windows.len(),
                 self.fs_nav_is_locked()
@@ -42687,10 +41359,22 @@ impl App {
             self.fullscreen_idx,
             self.detached_viewer_window_id,
             self.detached_image_windows.len(),
-            self.active_detached_viewer_context.is_some(),
+            self.active_detached_context_debug_state(),
             self.active_detached_session
         ));
         if parked {
+            let window_id = parked_window_id
+                .expect("preserved detached still must retain its mounted window identity");
+            let mounted = self
+                .mounted_viewer_context_id()
+                .expect("preserving a detached still requires a mounted context");
+            let owner = self
+                .unbind_window(window_id)
+                .expect("preserved detached still window must be bound before handoff");
+            assert_eq!(
+                owner, mounted,
+                "preserved detached still window binding belonged to another context"
+            );
             if parked_as_fullfeature_linked_still && let Some(window_id) = parked_window_id {
                 // review-v2.3.0 追補5 完結編: media handoff で退避した linked still。
                 // Parked + linked を one-shot identity とし、次の still grid open で同じ
@@ -42721,7 +41405,13 @@ impl App {
         let Some(idx) = self.fullscreen_idx else {
             return false;
         };
-        self.active_detached_viewer_context.is_none()
+        self.active_detached_session
+            .map(|session| session.window_id)
+            .or(self.detached_viewer_window_id)
+            .is_some_and(|window_id| {
+            self.locate_window_context(window_id)
+                .is_some_and(|(_, residence)| residence == ContextResidence::Mounted)
+        })
             // Tray residency keeps both committed detached sessions and an in-flight switch to
             // detached alive. A main-context refresh must use that same lifecycle predicate before
             // replacing `items`, otherwise `start_loading_items` falls through to
@@ -42743,18 +41433,13 @@ impl App {
             return false;
         };
         let window_id = self.ensure_detached_viewer_window_id();
-        let mut bundle = self.take_current_viewer_context_bundle();
-        bundle.selected = Some(idx);
-        bundle.fullscreen_idx = Some(idx);
-        bundle.native_video_in_window_active = false;
-        bundle
-            .viewer_session
-            .activate_independent_detached(window_id);
-        bundle.viewer_session.last_sync_stamp = None;
-        bundle.fs_open_intent_from_grid = false;
-        bundle.pending_auto_fs_open = false;
-        bundle.pending_return_to_parent = false;
-        self.active_detached_viewer_context = Some(ActiveDetachedViewerContext { bundle });
+        self.become_mounted_independent_detached_viewer(window_id, idx);
+        let stashed =
+            self.stash_mounted_and_start_fresh("promote_detached_video_for_main_context_change");
+        self.bind_window(stashed, window_id)
+            .unwrap_or_else(|error| {
+                panic!("promoted detached media binding failed for {stashed:?}: {error:?}")
+            });
         self.update_detached_window_runtime_flags(
             window_id,
             false,
@@ -42795,6 +41480,10 @@ impl App {
             && current_idx.is_some_and(|current| self.viewer_item_supports_detached_still(current))
             && always_new;
         let base_placement = self.active_detached_viewer_current_placement();
+        let parked_window_id = self
+            .active_detached_session
+            .map(|session| session.window_id)
+            .or(self.detached_viewer_window_id);
         let parked = if should_park_active {
             self.park_active_detached_image_window()
         } else {
@@ -42806,7 +41495,33 @@ impl App {
         let mut should_recreate_active_viewport = false;
 
         if parked {
+            let snapshot_window_id = self
+                .detached_image_windows
+                .last()
+                .expect("parked detached still must publish its snapshot")
+                .id;
+            if let Some(expected_window_id) = parked_window_id {
+                assert_eq!(
+                    expected_window_id, snapshot_window_id,
+                    "parked detached still snapshot must keep its previous window"
+                );
+            }
+            let parked_window_id = snapshot_window_id;
+            let mounted = self
+                .mounted_viewer_context_id()
+                .expect("always-new detached still open requires a mounted context");
+            let owner = self
+                .unbind_window(parked_window_id)
+                .expect("parked detached still window must be bound");
+            assert_eq!(
+                owner, mounted,
+                "always-new detached still window binding belonged to another context"
+            );
             let window_id = self.allocate_detached_viewer_window_id();
+            self.bind_window(mounted, window_id)
+                .unwrap_or_else(|error| {
+                    panic!("always-new detached still binding failed: {error:?}")
+                });
             self.log_detached_image_window_debug(format!(
                 "allocate_window_id reason=prepare_detached_image_windows_for_open id={window_id} \
                  idx={idx} current_idx={current_idx:?} always_new={always_new} \
@@ -42863,7 +41578,7 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn detached_independent_session_blocks_folder_nav(&self) -> bool {
-        if self.active_detached_viewer_context.is_some() {
+        if self.active_detached_context_is_at_rest() {
             return true;
         }
         if self.detached_viewer_independent_session() {
@@ -42894,7 +41609,7 @@ impl App {
         if self.detached_viewer_independent_still_session() {
             return Some("独立した別ウィンドウでは、画像編集機能は利用できません");
         }
-        if self.active_detached_viewer_context.is_some() {
+        if self.active_detached_context_is_at_rest() {
             return Some("切り離した別ウィンドウでは、画像編集機能は利用できません");
         }
         None
@@ -43233,9 +41948,9 @@ impl App {
             self.items_generation,
             self.items.len(),
             self.fullscreen_idx,
-            // `with_active_detached_viewer_context` takes the context out for the span it is
+            // `with_active_viewer_context` takes the context out for the span it is
             // mounted, so `is_none()` is what means App state currently *is* the viewer's.
-            self.active_detached_viewer_context.is_none(),
+            !self.active_detached_context_debug_state(),
             self.active_detached_session
                 .map(|session| session.window_id),
         ));
@@ -43965,29 +42680,39 @@ impl App {
         ctx: &egui::Context,
         target_path: &std::path::Path,
     ) -> bool {
-        let Some(active) = self.active_detached_viewer_context.as_ref() else {
+        let Some(active_id) = self.active_viewer_context_id() else {
             return false;
         };
-        if !viewer_context_bundle_displays_media_path(&active.bundle, target_path) {
-            return false;
-        }
-        let Some(idx) = active.bundle.fullscreen_idx else {
+        let session_window_id = self
+            .active_detached_session
+            .map(|session| session.window_id);
+        let Some((window_id, presenter_target)) = self
+            .with_viewer_context_ref(active_id, |context| {
+                if !viewer_context_bundle_displays_media_path(context, target_path) {
+                    return None;
+                }
+                let idx = context.fullscreen_idx()?;
+                let presenter_player = match context.fs_cache().get(&idx) {
+                    Some(FsCacheEntry::Video { player, .. }) => Some(player.as_ref()),
+                    _ => None,
+                };
+                let presenter_target = matches!(context.items().get(idx), Some(GridItem::Video(_)))
+                    && !viewer_context_is_music_consumer(context)
+                    && presenter_player.is_some();
+                if let Some(player) = presenter_player.filter(|_| presenter_target) {
+                    player.request_presenter_raise();
+                }
+                Some((
+                    context
+                        .viewer_session_detached_window_id()
+                        .or(session_window_id),
+                    presenter_target,
+                ))
+            })
+            .flatten()
+        else {
             return false;
         };
-        let window_id = active.bundle.viewer_session.detached_window_id.or_else(|| {
-            self.active_detached_session
-                .map(|session| session.window_id)
-        });
-        let presenter_player = match active.bundle.fs_cache.get(&idx) {
-            Some(FsCacheEntry::Video { player, .. }) => Some(player.as_ref()),
-            _ => None,
-        };
-        let presenter_target = matches!(active.bundle.items.get(idx), Some(GridItem::Video(_)))
-            && !Self::viewer_context_bundle_is_music_consumer(&active.bundle)
-            && presenter_player.is_some();
-        if let Some(player) = presenter_player.filter(|_| presenter_target) {
-            player.request_presenter_raise();
-        }
         if presenter_target {
             self.native_video_front_recover_after_external_foreground = true;
             self.native_video_front_last_raise = None;
@@ -44053,9 +42778,14 @@ impl App {
         }
         let parked_id = self.detached_image_windows.iter().find_map(|window| {
             (self.detached_window_state_is_parked_live(window.id)
-                && window.paused_bundle.as_deref().is_some_and(|bundle| {
-                    viewer_context_bundle_displays_media_path(bundle, &target_path)
-                }))
+                && self
+                    .locate_window_context(window.id)
+                    .is_some_and(|(id, _)| {
+                        self.with_viewer_context_ref(id, |context| {
+                            viewer_context_bundle_displays_media_path(context, &target_path)
+                        })
+                        .unwrap_or(false)
+                    }))
             .then_some(window.id)
         });
         if let Some(window_id) = parked_id
@@ -44097,7 +42827,7 @@ impl App {
             "park_active_context_for_grid_open begin active_context={} session={:?} \
              fs_idx={:?} presentation={:?} window_id={:?} independent={} \
              passive_windows={}",
-            self.active_detached_viewer_context.is_some(),
+            self.active_detached_context_debug_state(),
             self.active_detached_session,
             self.fullscreen_idx,
             self.viewer_presentation,
@@ -44105,13 +42835,13 @@ impl App {
             self.detached_viewer_independent_active,
             self.detached_image_windows.len()
         ));
-        if self.active_detached_viewer_context.is_some() {
+        if self.active_detached_context_is_at_rest() {
             let ok = self.park_and_close_current_active_detached_viewer(ctx);
             self.log_detached_image_window_debug(format!(
                 "park_active_context_for_grid_open result={ok} passive_windows={} \
                  active_context={} session={:?}",
                 self.detached_image_windows.len(),
-                self.active_detached_viewer_context.is_some(),
+                self.active_detached_context_debug_state(),
                 self.active_detached_session
             ));
             return ok;
@@ -44241,7 +42971,7 @@ impl App {
             .enumerate()
             .filter_map(|(pos, window)| {
                 let runtime = self.detached_window_manager.runtime(window.id)?;
-                (window.paused_bundle.is_none()
+                (!self.detached_window_context_is_at_rest(window.id)
                     && runtime.linked
                     && runtime.state == DetachedWindowState::Parked)
                     .then_some((pos, window.id))
@@ -44307,7 +43037,7 @@ impl App {
             self.settings.detached_viewer_open_images_in_window,
             self.detached_viewer_open_next_still_detached_once,
             self.fs_open_intent_from_grid,
-            self.active_detached_viewer_context.is_some(),
+            self.active_detached_context_debug_state(),
             self.active_detached_session,
             self.detached_viewer_window_id,
             self.detached_viewer_independent_active,
@@ -44319,9 +43049,23 @@ impl App {
         }
         if matches!(presentation, ViewerPresentation::DetachedWindow) {
             let id = self.ensure_detached_viewer_window_id();
+            // A build has no Mounted residence and publishes its reserved binding only at commit.
+            // Every ordinary/reuse open binds the current projection here; repeated reuse is
+            // intentionally idempotent.
+            if let Some(mounted) = self.mounted_viewer_context_id() {
+                match self.locate_window_context(id) {
+                    Some((owner, ContextResidence::Mounted)) => assert_eq!(owner, mounted),
+                    Some((owner, residence)) => {
+                        panic!("detached open window {id} belongs to {owner:?} in {residence:?}")
+                    }
+                    None => self.bind_window(mounted, id).unwrap_or_else(|error| {
+                        panic!("detached open binding failed for {mounted:?}: {error:?}")
+                    }),
+                }
+            }
             // keep-alive: detached を開いた = セッション開始 (§3.7 set)。book context が
             // あれば Book、なければ Image。folder-nav reopen でも同じ window_id で据え置く。
-            let source = if self.active_detached_viewer_context_present() {
+            let source = if self.active_detached_context_is_at_rest() {
                 DetachedSource::Book
             } else {
                 self.detached_source_for_idx(idx)
@@ -44331,11 +43075,15 @@ impl App {
             // 非 detached を開いた (動画 fullscreen / detached 非対応アイテム等) =
             // detached セッションは終了。明示遷移なので session を畳む (§3.7)。
             //
-            // ただし active_detached_viewer_context が外側に存在する状態でここへ来た場合、
+            // ただし別の detached context が at-rest の状態でここへ来た場合、
             // これは **メイン context 側** の open であり、active detached session の所有者ではない。
             // その session を畳むと、独立 PDF などの別ウィンドウ context が main 側の
             // ページ切替に巻き込まれ、同じ ViewportId / bundle が混線する。
-            let owns_active_detached_session = self.active_detached_viewer_context.is_none();
+            let owns_active_detached_session =
+                self.active_detached_session.is_some_and(|session| {
+                    self.locate_window_context(session.window_id)
+                        .is_some_and(|(_, residence)| residence == ContextResidence::Mounted)
+                });
             if owns_active_detached_session && self.active_detached_session.is_some() {
                 self.begin_active_detached_session_close("open_non_detached");
                 self.finish_active_detached_session_close("open_non_detached");
@@ -48657,8 +47405,21 @@ impl App {
     /// レーティング対象外アイテムの場合は何もしない。
     /// フォルダ / ZIP / PDF ファイル本体も対象 (コンテナレーティング)。
     pub(crate) fn set_rating(&mut self, idx: usize, stars: u8) -> bool {
+        let stars = stars.min(5);
+        let before = self.rating_cache.get(&idx).copied().unwrap_or(0);
         match self.set_rating_result(idx, stars) {
-            Ok(changed) => changed,
+            Ok(true) => {
+                if before != stars {
+                    let summary = if stars == 0 {
+                        "★解除".to_string()
+                    } else {
+                        format!("★{stars}")
+                    };
+                    self.capture_rating_undo(vec![(idx, before, stars)], summary);
+                }
+                true
+            }
+            Ok(false) => false,
             Err(error) => {
                 self.report_rating_write_error(&error);
                 false
@@ -48718,38 +47479,6 @@ impl App {
             crate::content_identity::ContentIdentityTrigger::Edit,
         );
         Ok(true)
-    }
-
-    /// 任意のフォルダパスの★ (コンテナレーティング) を DB から読む (Inc 5 FB)。
-    /// フルスクリーンでは対象フォルダがグリッドアイテムでない (idx がない) ので、
-    /// idx ベースの `get_rating` ではなくパスキー直読みで取得する。
-    pub(crate) fn folder_rating_by_path(&self, folder: &std::path::Path) -> u8 {
-        let key = crate::adjustment_db::normalize_path(folder);
-        self.rating_db.as_ref().map(|db| db.get(&key)).unwrap_or(0)
-    }
-
-    /// 任意のフォルダパスの★ (コンテナレーティング) を設定する (Inc 5 FB)。
-    /// `set_rating` のコンテナ分岐と同じキャッシュ無効化を行う (idx キャッシュはフォルダに
-    /// エントリを持たないので触らない。グリッド復帰時に DB から読み直される)。
-    pub(crate) fn set_folder_rating_by_path(
-        &mut self,
-        folder: &std::path::Path,
-        stars: u8,
-    ) -> bool {
-        let stars = stars.min(5);
-        let key = crate::adjustment_db::normalize_path(folder);
-        let meta = crate::rating_db::RatingMeta::new(crate::rating_db::RatingItemKind::Folder)
-            .with_source_path(folder);
-        if let Err(error) = self.write_user_rating_shared(&key, stars, Some(&meta)) {
-            self.report_rating_write_error(&error);
-            return false;
-        }
-        self.invalidate_rating_counts_cache();
-        self.current_folder_rating_cache = Some(stars);
-        self.schedule_current_smart_folder_metadata_refresh(
-            smart_folder::SmartFolderMetadataDependency::Rating,
-        );
-        true
     }
 
     /// レーティング XMP 書き込み worker を必要なら起動する (遅延初期化)。
@@ -52632,7 +51361,7 @@ impl App {
         // Phase 5.5: タイルモードもフルスクリーン解除と同時に閉じる (Codex H2 反映)。
         #[cfg(windows)]
         {
-            let detached_pending_owner = self.active_detached_viewer_context_contains_video()
+            let detached_pending_owner = self.other_active_viewer_context_contains_video()
                 || self.parked_live_media_window_exists()
                 || self
                     .native_video_source_swap_pending
@@ -52641,7 +51370,12 @@ impl App {
                 || self
                     .native_video_open_pending
                     .as_ref()
-                    .is_some_and(|pending| pending.parked_live_window_id.is_some())
+                    .is_some_and(|pending| {
+                        pending.owner_context_id != self.viewer_context_main()
+                            || self
+                                .viewer_context_window(pending.owner_context_id)
+                                .is_some()
+                    })
                 || self
                     .native_video_fast_swap_pending
                     .as_ref()
@@ -52658,9 +51392,9 @@ impl App {
                 self.video_tile_swap_pending = None;
                 self.native_video_deferred_nav_delta = None;
             }
-            // App-global native pending は mounted context owner (None) だけ閉じる。
-            // Some(window_id) は別 ParkedLive context の presenter/open を所有しているため、
-            // main 画像の close から破棄しない (review-v2.3.0 追補2 BA-7)。
+            // App-global native pending は現在投影中の context が所有するものだけ閉じる。
+            // 別 context の pending は main 画像の close から破棄しない
+            // (review-v2.3.0 追補2 BA-7)。
             self.clear_mounted_native_video_pending();
         }
         self.reset_erase_mode();
@@ -53025,7 +51759,7 @@ impl App {
         self.cancel_mounted_context_ai_for_remote_barrier();
         #[cfg(windows)]
         {
-            let _ = self.with_active_detached_viewer_context(|app| {
+            let _ = self.with_active_viewer_context(|app| {
                 app.cancel_mounted_context_ai_for_remote_barrier();
             });
         }
@@ -53047,9 +51781,8 @@ impl App {
     pub(crate) fn local_ai_remote_barrier_snapshot(&mut self) -> LocalAiRemoteBarrierSnapshot {
         let mounted = self.mounted_context_ai_remote_barrier_snapshot();
         #[cfg(windows)]
-        let detached = self.with_active_detached_viewer_context(|app| {
-            app.mounted_context_ai_remote_barrier_snapshot()
-        });
+        let detached =
+            self.with_active_viewer_context(|app| app.mounted_context_ai_remote_barrier_snapshot());
         #[cfg(not(windows))]
         let detached = None;
         let video_upscale =
@@ -54329,6 +53062,8 @@ impl App {
     }
 
     fn clear_current_edit_preview_materializations(&mut self) {
+        #[cfg(all(test, windows))]
+        tests::record_current_edit_preview_clear_for_test(self);
         let mut invalidated: std::collections::HashSet<usize> =
             self.thumb_edit_preview_keys.keys().copied().collect();
         invalidated.extend(
@@ -54359,21 +53094,42 @@ impl App {
         self.clear_current_edit_preview_materializations();
         #[cfg(windows)]
         {
-            if let Some(mut active) = self.active_detached_viewer_context.take() {
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                self.clear_current_edit_preview_materializations();
-                self.swap_viewer_context_bundle(&mut active.bundle);
-                self.active_detached_viewer_context = Some(active);
+            let mounted = self
+                .mounted_viewer_context_id()
+                .expect("all-context edit-preview clear requires a mounted projection");
+            let mut processed = vec![mounted];
+            if let Some(active) = self.active_viewer_context_id()
+                && active != mounted
+            {
+                if let Err(error) = self.with_viewer_context(active, |app| {
+                    app.clear_current_edit_preview_materializations();
+                }) {
+                    crate::logger::log(format!(
+                        "edit_preview_clear_mount_failed context={active:?} error={error:?}"
+                    ));
+                }
+                processed.push(active);
             }
-            for index in 0..self.detached_image_windows.len() {
-                let Some(mut bundle) = self.detached_image_windows[index].paused_bundle.take()
-                else {
+            let window_ids: Vec<u64> = self
+                .detached_image_windows
+                .iter()
+                .map(|window| window.id)
+                .collect();
+            for window_id in window_ids {
+                let Some((id, _)) = self.locate_window_context(window_id) else {
                     continue;
                 };
-                self.swap_viewer_context_bundle(&mut bundle);
-                self.clear_current_edit_preview_materializations();
-                self.swap_viewer_context_bundle(&mut bundle);
-                self.detached_image_windows[index].paused_bundle = Some(bundle);
+                if processed.contains(&id) {
+                    continue;
+                }
+                if let Err(error) = self.with_viewer_context(id, |app| {
+                    app.clear_current_edit_preview_materializations();
+                }) {
+                    crate::logger::log(format!(
+                        "edit_preview_clear_mount_failed context={id:?} window_id={window_id} error={error:?}"
+                    ));
+                }
+                processed.push(id);
             }
         }
     }
@@ -54599,11 +53355,14 @@ impl App {
         }
     }
 
-    /// すべての dirty なサイドカーをディスクにフラッシュする。
-    /// 呼び出し側: フォルダ切替時・アプリ終了時・5 秒アイドル時。
+    /// すべての dirty なサイドカーの書き出しを writer スレッドへ積む。
+    /// 呼び出し側: フォルダ切替時・編集ツールを抜けた時・定期・アプリ終了時。
+    ///
+    /// **戻った時点ではまだ書けていない。**終了時など、書けたことが必要な経路は
+    /// このあと [`crate::sidecar::wait_for_pending_writes`] を呼ぶこと。
     pub(crate) fn flush_all_sidecars(&mut self) {
         for sidecar in self.sidecars.values_mut() {
-            sidecar.flush();
+            sidecar.queue_flush();
         }
     }
 
@@ -54614,6 +53373,8 @@ impl App {
     ///   (不明なら前回保存値を維持。outer に fallback すると titlebar 分だけ縮小する
     ///    問題が再発するので fallback しない)。
     /// - 位置は outer_rect から取る (`with_position` は outer 座標を受け取る)。
+    /// - 最大化 flag は矩形とは別のフィールドへ書く。矩形側は最大化中に更新されないので、
+    ///   「最大化で終了したが、解いたら元のサイズに戻る」を両方保てる。
     pub(crate) fn persist_window_state_and_flush(&mut self) {
         // スマートフォルダ管理画面は TextEdit 中の値をローカル draft に保持する。
         // 終了 / トレイ退避はダイアログ描画より先にこの経路へ来るため、Settings.save
@@ -54673,8 +53434,11 @@ impl App {
                 ));
             }
         }
+        self.settings.window_maximized = self.last_window_maximized;
         self.settings.save();
         self.flush_all_sidecars();
+        // 終了・トレイ退避はここから先プロセスが止まり得るので、writer が捌き終わるまで待つ。
+        crate::sidecar::wait_for_pending_writes();
     }
 
     /// マスクとベクタを DB に保存し、サイドカーにもミラーする。消しゴムモード終了時に呼ぶ。
@@ -57051,6 +55815,20 @@ impl App {
 
     fn has_retained_pdf_final_ai_for_current_params(&self, idx: usize) -> bool {
         self.retained_pdf_final_ai_matches_current(idx).is_some()
+    }
+
+    /// retained composite だけで表示できるページの**元寸法**。
+    ///
+    /// このページは `fs_cache` を持たないまま表示できる ([`Self::fs_page_load_state`] の
+    /// doc 参照)。そのため寸法の収穫を `fs_cache` だけに頼ると「画面に出ているのに
+    /// 寸法が分からない」状態が起きる。実際、PDF を開き直して items 世代が変わった直後に
+    /// 横長分割が効かなくなる形で表面化した (2026-08-25、`[split] decision=dimensions_unknown`)。
+    pub(crate) fn retained_pdf_page_source_dims(&self, idx: usize) -> Option<(u32, u32)> {
+        let (_, edit_size) = self.retained_pdf_final_ai_matches_current(idx)?;
+        Some((
+            u32::try_from(edit_size[0]).ok()?,
+            u32::try_from(edit_size[1]).ok()?,
+        ))
     }
 
     fn insert_retained_pdf_page_raster(
@@ -60031,12 +58809,12 @@ impl App {
     ) -> bool {
         #[cfg(windows)]
         {
-            if let Some(active) = self.active_detached_viewer_context.as_ref() {
-                return active
-                    .bundle
-                    .final_ai_pending
-                    .get(&key)
-                    .is_some_and(|pending| pending.job_id == job_id);
+            if let Some(id) = self.active_viewer_context_id() {
+                return self
+                    .with_viewer_context_ref(id, |context| {
+                        context.final_ai_pending_job_id(&key) == Some(job_id)
+                    })
+                    .unwrap_or(false);
             }
         }
         let _ = (key, job_id);
@@ -60322,7 +59100,7 @@ impl App {
         // 例外として、メモリキャッシュが `is_dirty()` (= アプリ内で未保存の編集がある)
         // 場合は再ロードで edits を破壊してしまうので、slow-path を抜けて何もせず帰る。
         // ここで `sidecar_sync_upsert` もスキップするので、次回ナビゲート時 (通常は
-        // `flush_idle_sidecars` で dirty が解消された後) に改めて判定される。
+        // `flush_periodic_sidecars` で dirty が解消された後) に改めて判定される。
         let cached_dirty = self
             .sidecars
             .get(sidecar_folder)
@@ -60433,19 +59211,35 @@ impl App {
         }
     }
 
-    /// アイドル時 (5 秒間変更がない) に dirty なサイドカーをフラッシュする。
-    /// 長時間の編集セッション中にクラッシュや電源断で失う事故への保険。
-    pub(crate) fn flush_idle_sidecars(&mut self) {
+    /// 編集ツールを抜けた瞬間にサイドカーを書き出す。
+    ///
+    /// 「編集が終わった」の判定を各ツールの終了関数へ配らない。キャンバスの所有が
+    /// 外れたことだけを見れば、ツールが増えても勝手に拾える
+    /// ([`crate::app::App::page_edit_tool_owns_canvas`] が唯一の定義)。
+    pub(crate) fn flush_sidecars_when_page_edit_ends(&mut self) {
+        let owns_canvas = self.page_edit_tool_owns_canvas();
+        if self.page_edit_tool_had_canvas && !owns_canvas {
+            self.flush_all_sidecars();
+        }
+        self.page_edit_tool_had_canvas = owns_canvas;
+    }
+
+    /// dirty のまま一定時間が経ったサイドカーを書き出す。
+    ///
+    /// 通常の保存契機は「編集ツールを抜けた時 / フォルダ切替 / アプリ終了」で、これは
+    /// **クラッシュや電源断でしか使われない保険**。だから頻度は低くてよい。dirty に
+    /// なった時刻から測るので、編集を続けている間も一定間隔で確実に書かれる
+    /// (最後の変更時刻から測ると、編集し続ける限り一度も書かれない)。
+    pub(crate) fn flush_periodic_sidecars(&mut self) {
         let now = std::time::Instant::now();
-        const IDLE_THRESHOLD_SECS: u64 = 5;
         for sidecar in self.sidecars.values_mut() {
             if !sidecar.is_dirty() {
                 continue;
             }
-            if let Some(last) = sidecar.last_change() {
-                if now.duration_since(last).as_secs() >= IDLE_THRESHOLD_SECS {
-                    sidecar.flush();
-                }
+            if let Some(since) = sidecar.dirty_since()
+                && now.duration_since(since) >= crate::sidecar::PERIODIC_FLUSH_INTERVAL
+            {
+                sidecar.queue_flush();
             }
         }
     }
@@ -60780,7 +59574,7 @@ impl App {
             self.settings.detached_viewer_enabled,
             self.fullscreen_idx,
             self.viewer_presentation,
-            self.active_detached_viewer_context.is_some(),
+            self.active_detached_context_debug_state(),
             self.active_detached_session,
             self.detached_viewer_window_id,
             self.detached_viewer_independent_active,
@@ -60899,7 +59693,7 @@ impl App {
                 self.settings.detached_viewer_enabled,
                 self.fullscreen_idx,
                 self.viewer_presentation,
-                self.active_detached_viewer_context.is_some(),
+                self.active_detached_context_debug_state(),
                 self.active_detached_session,
                 self.detached_viewer_window_id,
                 self.detached_viewer_independent_active,
@@ -65232,7 +64026,7 @@ impl App {
     fn cancel_media_navigation_pending_for_current_context(&mut self, reason: &'static str) {
         #[cfg(windows)]
         if self.current_media_navigation_owner().is_none()
-            && self.active_detached_viewer_context_contains_video()
+            && self.other_active_viewer_context_contains_video()
         {
             // promoted active media は owner=None だが現在 App へ mount されていない。
             // main context の close/load から別 context の候補解決を破棄しない。
@@ -65865,28 +64659,32 @@ impl App {
     /// 音声版)。`poll_video` の入力反映後に呼ぶ。音声はチャプター無しなので Bookmark モード
     /// のみ実効。一時停止 / scrub 中は baseline のみ更新して誤爆 seek を防ぐ。cfg 不問
     /// (音声は egui 経路なので非 Windows でも動く)。
-    pub(crate) fn tick_music_loop_boundary(&mut self, fs_idx: usize) {
+    pub(crate) fn tick_music_loop_boundary(
+        &mut self,
+        fs_idx: usize,
+    ) -> Option<std::time::Duration> {
         if self.video_continuous_mode.is_enabled() {
-            return;
+            return None;
         }
         let starts = self.music_bookmark_starts_for(fs_idx);
         let has_bm = !starts.is_empty();
         let eff =
             crate::settings::effective_loop_mode(self.settings.video_loop_mode, false, has_bm);
         if !matches!(eff, crate::settings::VideoLoopMode::Bookmark) {
-            return;
+            return None;
         }
-        let (cur, serial, is_playing) = match self.fs_cache.get(&fs_idx) {
+        let (cur, serial, is_playing, speed) = match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) => (
                 player.position_secs(),
                 player.current_seek_serial(),
                 player.is_playing(),
+                player.playback_speed(),
             ),
-            _ => return,
+            _ => return None,
         };
         if !is_playing {
             self.last_loop_pos.insert(fs_idx, (cur, serial));
-            return;
+            return None;
         }
         let (prev_pos, prev_serial) = self
             .last_loop_pos
@@ -65897,7 +64695,7 @@ impl App {
         let prev_start = crate::settings::start_at(&starts, prev_pos).unwrap_or(0.0);
         let next_boundary = crate::settings::first_boundary_after(&starts, prev_start);
         const LOOP_BOUNDARY_TOL: f64 = 0.020;
-        match crate::settings::decide_boundary_action(
+        let schedule_from = match crate::settings::decide_boundary_action(
             prev_pos,
             prev_serial,
             cur,
@@ -65912,6 +64710,7 @@ impl App {
                     player.set_loop_target_secs(new_target);
                 }
                 self.last_loop_pos.insert(fs_idx, (cur, serial));
+                cur
             }
             crate::settings::BoundaryDecision::Loop { seek_to } => {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
@@ -65919,14 +64718,19 @@ impl App {
                     player.set_loop_target_secs(seek_to);
                 }
                 self.last_loop_pos.insert(fs_idx, (seek_to, serial));
+                seek_to
             }
             crate::settings::BoundaryDecision::Continue => {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     player.set_loop_target_secs(prev_start);
                 }
                 self.last_loop_pos.insert(fs_idx, (cur, serial));
+                cur
             }
-        }
+        };
+        let schedule_start = crate::settings::start_at(&starts, schedule_from).unwrap_or(0.0);
+        crate::settings::first_boundary_after(&starts, schedule_start)
+            .and_then(|boundary| playback_position_deadline(schedule_from, boundary, speed))
     }
 
     /// 音楽ビューのループモード切替 (L キー / HUD ループボタン)。共有 `video_loop_mode` を
@@ -66110,10 +64914,12 @@ impl App {
         let mut next_repaint: Option<std::time::Duration> = None;
         // 5 秒ごとに動画再生位置を settings に書き戻す (drop 漏れ救済)。
         let now = std::time::Instant::now();
+        const VIDEO_RESUME_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
         let do_save = self
             .video_resume_last_save
-            .map(|t| now.duration_since(t).as_secs_f64() >= 5.0)
+            .map(|t| now.saturating_duration_since(t) >= VIDEO_RESUME_SAVE_INTERVAL)
             .unwrap_or(true);
+        let mut resume_save_playing = false;
         let mut updates: Vec<MediaResumeUpdate> = Vec::new();
 
         // Phase 0: bookmark cache を ensure (Phase 1 / Phase 3 で直読みするため)。
@@ -66242,16 +65048,9 @@ impl App {
                 #[cfg(windows)]
                 player.set_native_text_contrast(native_text_contrast);
                 if let Some(d) = player.tick(ctx) {
-                    let d = if player.is_playing() {
-                        d.min(std::time::Duration::from_millis(16))
-                    } else {
-                        d
-                    };
-                    next_repaint = Some(match next_repaint {
-                        Some(prev) => prev.min(d),
-                        None => d,
-                    });
+                    merge_repaint_deadline(&mut next_repaint, Some(d));
                 }
+                resume_save_playing |= player.is_playing();
                 #[cfg(windows)]
                 if !anime4k_info_was_ready && player.native_video_info_for_anime4k().is_some() {
                     anime4k_info_ready_indices.push(*idx);
@@ -66453,10 +65252,14 @@ impl App {
                 if matches!(self.items.get(*idx), Some(GridItem::Audio(_)))
                     || (video_audio_mode == Some(*idx) && video_audio_vst_idx != Some(*idx))
                 {
-                    self.tick_music_loop_boundary(*idx);
+                    let deadline = self.tick_music_loop_boundary(*idx);
+                    merge_repaint_deadline(&mut next_repaint, deadline);
                 } else {
                     #[cfg(windows)]
-                    self.tick_native_video_loop_boundary(*idx);
+                    {
+                        let deadline = self.tick_native_video_loop_boundary(*idx);
+                        merge_repaint_deadline(&mut next_repaint, deadline);
+                    }
                 }
             }
         }
@@ -66486,13 +65289,19 @@ impl App {
         // 破棄する。
         #[cfg(windows)]
         if let Some(pending) = self.native_video_mode_switch {
-            if std::time::Instant::now() >= pending.deadline {
+            let mode_switch_now = std::time::Instant::now();
+            if mode_switch_now >= pending.deadline {
                 crate::logger::log(format!(
                     "[native-video] placement switch request {} timed out \
                      (no presenter event); clearing pending",
                     pending.request_id
                 ));
                 self.native_video_mode_switch = None;
+            } else {
+                merge_repaint_deadline(
+                    &mut next_repaint,
+                    Some(pending.deadline.saturating_duration_since(mode_switch_now)),
+                );
             }
         }
         #[cfg(windows)]
@@ -66541,17 +65350,21 @@ impl App {
             }
             return;
         }
-        #[cfg(windows)]
-        if native_owner_hwnd != 0 {
-            let pump_interval = std::time::Duration::from_millis(16);
-            next_repaint = Some(match next_repaint {
-                Some(prev) => prev.min(pump_interval),
-                None => pump_interval,
-            });
-        }
         if do_save {
             self.video_resume_last_save = Some(now);
             self.apply_media_resume_updates(updates);
+        }
+        if resume_save_playing {
+            let until_save = if do_save {
+                VIDEO_RESUME_SAVE_INTERVAL
+            } else {
+                self.video_resume_last_save
+                    .map_or(VIDEO_RESUME_SAVE_INTERVAL, |last_save| {
+                        VIDEO_RESUME_SAVE_INTERVAL
+                            .saturating_sub(now.saturating_duration_since(last_save))
+                    })
+            };
+            merge_repaint_deadline(&mut next_repaint, Some(until_save));
         }
         if let Some(d) = next_repaint {
             let d = d.saturating_sub(poll_started.elapsed());
@@ -66783,7 +65596,7 @@ impl eframe::App for App {
 
         // アイドル 5 秒で dirty なサイドカーをフラッシュ (電源断や強制終了への保険)。
         // 頻繁なフレームで呼ばれるが is_dirty 判定で大半は no-op になる。
-        self.flush_idle_sidecars();
+        self.flush_periodic_sidecars();
 
         // パフォーマンス計装: フレーム境界。--perf-log 無効時は is_enabled() 読みのみ
         self.frame_counter = self.frame_counter.wrapping_add(1);
@@ -67035,6 +65848,9 @@ impl eframe::App for App {
         // メインビューポートの IME 状態を更新 (ここで Ime イベントを拾う)。
         // フルスクリーンビューポートは別イベントキューなので render_fullscreen_viewport 内で別途呼ぶ。
         self.update_ime_state(ctx);
+        // 編集ツールを抜けたのに見開きが戻っていない状態を、毎フレーム 1 か所で解消する。
+        self.reconcile_page_edit_spread_pivots();
+        self.flush_sidecars_when_page_edit_ends();
         crate::touch_debug::log_egui_touch_events(ctx, self.frame_counter);
 
         // エクスプローラ等から mIV へドロップされたファイル / フォルダを現在のフォルダへコピーする
@@ -67123,34 +65939,14 @@ impl eframe::App for App {
 
             // AI ランタイムを初期化
             self.ensure_ai_runtime();
-
-            // ViewportBuilder 段階では マルチモニタ DPI 混在時に
-            // 論理/物理ピクセルの取り違えで異常サイズのウィンドウが
-            // 生成されるケースがある (egui#4918 / winit#923)。
-            // DPI が確定した初回フレームで意図したサイズを再適用して矯正する。
-            if let Some([w, h]) = self.pending_initial_size.take() {
-                let ppp = ctx.input(|i| i.pixels_per_point);
-                let viewport_size = egui::vec2(
-                    crate::settings::window_geometry_to_viewport_points(
-                        w,
-                        self.settings.ui_scale_factor,
-                    ),
-                    crate::settings::window_geometry_to_viewport_points(
-                        h,
-                        self.settings.ui_scale_factor,
-                    ),
-                );
-                crate::logger::log(format!(
-                    "[viewport] deferred InnerSize apply: {w:.0}x{h:.0} ppp={ppp:.2}"
-                ));
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(viewport_size));
-            }
         }
 
         #[cfg(windows)]
         self.poll_activation_open_paths(ctx);
 
         self.poll_startup_open_path_resolve(ctx);
+
+        self.apply_deferred_initial_size(ctx);
 
         self.track_window_rect(ctx);
 
@@ -67190,27 +65986,7 @@ impl eframe::App for App {
         self.enqueue_visible_tag_prewarms();
 
         self.poll_prefetch(ctx);
-        let should_poll_main_video_context = {
-            #[cfg(windows)]
-            {
-                self.should_poll_main_video_context()
-            }
-            #[cfg(not(windows))]
-            {
-                true
-            }
-        };
-        if should_poll_main_video_context {
-            self.poll_video(ctx);
-        } else {
-            #[cfg(windows)]
-            if Self::detached_image_window_debug_enabled() && self.frame_counter % 60 == 0 {
-                self.log_detached_image_window_debug(format!(
-                    "main_poll_video_deferred_to_active_context frame={}",
-                    self.frame_counter
-                ));
-            }
-        }
+        self.poll_main_video_context(ctx);
         self.poll_ai_upscale(ctx);
         self.poll_final_ai(ctx);
         self.poll_erase_inpaint(ctx);
@@ -67486,7 +66262,7 @@ impl eframe::App for App {
         #[cfg(windows)]
         self.commit_pending_deferred_detached_window_activation(ctx);
         #[cfg(windows)]
-        let active_detached_context_updated = self.update_active_detached_viewer_context(ctx);
+        let active_detached_context_updated = self.update_active_viewer_context(ctx);
         #[cfg(not(windows))]
         let active_detached_context_updated = false;
         #[cfg(windows)]
@@ -67495,7 +66271,7 @@ impl eframe::App for App {
             self.keep_fullscreen_viewport_alive(ctx);
         }
         let t_keep_fullscreen_viewport = frame_t0.elapsed();
-        // active detached は update_active_detached_viewer_context 内で
+        // active detached は update_active_viewer_context 内で
         // folder result -> PDF/ZIP enumerate -> nav lock -> render の順に処理する。
         // main embedded も同じ所有順序に揃え、items_generation 更新による cache purge が
         // CentralPanel の shape 構築後に走って 1 presentation frame だけ黒くなる隙をなくす。
@@ -67562,14 +66338,19 @@ impl eframe::App for App {
         if should_render_main_fullscreen_viewport {
             self.render_fullscreen_viewport(ctx);
         }
+        // This span is the whole of `pre_grid` while a video plays in a detached
+        // window (backlog 1.122). Name the call that owns it.
+        let t_main_fs_viewport = frame_t0.elapsed();
         #[cfg(windows)]
         self.render_detached_image_windows(ctx);
-        // keep-alive backstop (§3.2/§4 K0): ここまでの経路 (update_active_detached_viewer_context
+        let t_detached_image_windows = frame_t0.elapsed();
+        // keep-alive backstop (§3.2/§4 K0): ここまでの経路 (update_active_viewer_context
         // 内 / top-level の keep_alive + render_fullscreen) のどれも今フレーム detached viewport を
         // 描かなかった場合に、holdover で 1 回だけ描いて egui に OS ウィンドウを破棄させない。
         // 必ずアクティブ detached 描画経路すべての後 (= フルスクリーン区間末尾) で呼ぶ。
         #[cfg(windows)]
         self.render_active_detached_viewport_backstop(ctx);
+        let t_detached_backstop = frame_t0.elapsed();
         #[cfg(windows)]
         self.flush_pending_detached_cleanup_font_atlas_resync();
         let t_render_fullscreen_viewport = frame_t0.elapsed();
@@ -67880,6 +66661,8 @@ impl eframe::App for App {
         // PDF pool の遅延初期化失敗 notice。poll は pool 自体を初期化しない。
         self.poll_pdf_worker_notice();
         self.show_pdf_worker_notice_dialog(ctx);
+        self.poll_susie_worker_notice();
+        self.show_susie_worker_notice_dialog(ctx);
         // Phase 3 Step 5: TRT ワーカー関連の通知バナー (起動失敗 / 推論中の死亡)。
         // poll で AiRuntime の通知キューを 1 回引き、show でバナー描画。
         self.poll_trt_worker_notice();
@@ -68810,6 +67593,32 @@ impl eframe::App for App {
                         serde_json::Value::from(
                             (t_render_fullscreen_viewport - t_keep_fullscreen_viewport)
                                 .as_secs_f64()
+                                * 1000.0,
+                        ),
+                    ),
+                    (
+                        "main_fs_viewport_ms",
+                        serde_json::Value::from(
+                            (t_main_fs_viewport - t_keep_fullscreen_viewport).as_secs_f64()
+                                * 1000.0,
+                        ),
+                    ),
+                    (
+                        "detached_image_windows_ms",
+                        serde_json::Value::from(
+                            (t_detached_image_windows - t_main_fs_viewport).as_secs_f64() * 1000.0,
+                        ),
+                    ),
+                    (
+                        "detached_backstop_ms",
+                        serde_json::Value::from(
+                            (t_detached_backstop - t_detached_image_windows).as_secs_f64() * 1000.0,
+                        ),
+                    ),
+                    (
+                        "font_atlas_resync_ms",
+                        serde_json::Value::from(
+                            (t_render_fullscreen_viewport - t_detached_backstop).as_secs_f64()
                                 * 1000.0,
                         ),
                     ),
@@ -70381,6 +69190,43 @@ fn apply_folder_thumb_pin(
         pinned_only: None,
         force_cache: false,
     }
+}
+
+/// 保存する最大化 flag を決める。
+///
+/// 最小化中に報告される maximized は当てにならない (Windows は WS_MINIMIZE を被せる)
+/// ので、最小化されている間は最後に見えていた状態をそのまま保つ。最小化したまま
+/// 終了しても、その前に最大化だったかどうかが残る。「最小化で終了したら次回も最小化」
+/// にはしない、という §1.116 の条件もこれで満たす。
+///
+/// 報告が無い (`None`) のは「最大化ではない」という証拠ではないので、これも直前の
+/// 状態を保つ。ここを `unwrap_or(false)` にすると、報告が来ない環境では最大化して
+/// 終了しても毎回 flag が落ち、「前回終了時の状態」が永久に効かなくなる。
+pub(crate) fn tracked_window_maximized(
+    previous: bool,
+    minimized: bool,
+    reported_maximized: Option<bool>,
+) -> bool {
+    if minimized {
+        previous
+    } else {
+        reported_maximized.unwrap_or(previous)
+    }
+}
+
+/// 起動直後の InnerSize 補正をこのフレームで送ってよいか。
+///
+/// 通常起動 (`created_maximized == false`) なら即座に送ってよい。最大化で起動した
+/// ときは、egui が「最大化ではない」と**明示的に**報告するまで保留する。報告がまだ
+/// 無い (`None`) 段階を「最大化ではない」と読むと、初回フレームで最大化を打ち消す。
+pub(crate) fn deferred_initial_size_ready(
+    created_maximized: bool,
+    reported_maximized: Option<bool>,
+) -> bool {
+    if !created_maximized {
+        return true;
+    }
+    reported_maximized == Some(false)
 }
 
 /// DynamicImage を egui::ColorImage に変換する (リサイズなし)。

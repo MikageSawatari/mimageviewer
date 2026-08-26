@@ -1,4 +1,4 @@
-# 動画再生サブシステム アーキテクチャ
+﻿# 動画再生サブシステム アーキテクチャ
 
 mimageviewer の動画インライン再生機能の設計指針と内部構造をまとめる。
 NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終構成** を記述する。
@@ -81,9 +81,16 @@ content、filter、縮小なめらかさ、Anime4K variant、grade の resource 
 state と presenter 側 prepared resource の両方を破棄し、command と App event の source-epoch gate
 も旧 source の request / 成功通知を棄却する。App を往復する `Prepared -> Commit` command は無い。
 
-Anime4K は B1 が GLSL の `//!SAVE` / `//!BIND` から生成した variant topology と WGSL を正本にする。
-build 時に S / M / L / VL / UL の WGSL を Naga で HLSL へ変換し、Windows SDK FXC で全 pixel
-shader を SM5 bytecode 化する。runtime は全67 shader object を pipeline 作成時に bytecode から
+**presenter の shader は全部 build 時に SM5 bytecode 化する。** grade / resample (Lanczos3・
+nearest) の手書き HLSL は [src/video/native_presenter/shaders/](../src/video/native_presenter/shaders/)、
+NIS と Anime4K は WGSL を Naga で HLSL へ変換したものを、いずれも Windows SDK FXC で
+`.cso` にして `include_bytes!` する。runtime は `CreatePixelShader` に bytecode を渡すだけで、
+`D3DCompile` を呼ばない。render core は動画を開くたびと **placement 切替 (F12) のたび**に
+作り直されるので、runtime compile はそのまま体感遅延になる。NIS の pixel shader 1 本で
+実測 2.1 秒あり、F12 往復に約 4.5 秒を足していた (backlog §1.122)。runtime 側で
+`D3DCompile` を復活させないこと。
+
+Anime4K は B1 が GLSL の `//!SAVE` / `//!BIND` から生成した variant topology と WGSL を正本にする。runtime は全67 shader object を pipeline 作成時に bytecode から
 ロードし、選択した1 variant 分だけ source-resolution `RGBA16Float` intermediate を適用準備で
 確保する。候補の確保が全部成功し、その選択での present が成功した後だけ旧 variant の中間画像を
 解放する。各 pass の入力と順番は生成 topology 駆動で、vertex stage は
@@ -113,9 +120,54 @@ USER32 read/mutation は行わない。pump が採取する幾何 cursor 座標 
 source-stamped mouse ownership event と、render が返す focus / IME / cursor policy intent だけで
 接続する。cursor auto-hide の状態と `SetCursor` 書き込みは pump が所有する。
 
-`VideoPlayer::tick(_ctx)` は再生制御 / repaint hint / ホバーサムネイル要求のみ扱う。
-フレームの実体描画は native presenter 内のスレッドが行うため、`tick` で受け取る
-`egui::Context` は実質未使用 (互換のため引数だけ残してある)。
+native egui overlay の wgpu stack は [overlay_gpu.rs](../src/video/native_presenter/overlay_gpu.rs) の
+process-owned `OverlayGpuService` が所有する。`OnceLock` が保持するのは device そのものではなく、
+共有 `Instance` と replaceable な `DeviceEpoch` cache を持つ service である。
+
+```
+OverlayGpuService (process lifetime)
+├─ wgpu::Instance
+└─ Mutex<Vec<Arc<DeviceEpoch>>>
+   └─ generation / Adapter / Device / Queue / RwLock gate / loss latch
+
+NativeEguiOverlay (window lifetime)
+└─ Surface / egui_wgpu::Renderer / egui::Context / DComp visual・target lease / UI state
+```
+
+overlay 作成は共有 Instance から対象 DComp visual の Surface を先に作り、loss 未確定かつ
+`Adapter::is_surface_supported` が true の epoch を再利用する。無ければその Surface を
+`compatible_surface` にして Adapter / Device / Queue を 1 組作る。通常は epoch 1 個で、
+複数 GPU の genuinely incompatible な Surface または device loss 後だけ後続 epoch が増える。
+cache の強参照は最後の presenter が閉じても維持し、Surface / Renderer / Context だけを窓と一緒に
+破棄する。動画 present 用 D3D11 device と immediate context は従来どおり presenter ごとであり、
+この service へ統合しない。
+
+gate の理由は「動画を同時に複数再生するから」**ではない**。mIV の生きているメディア session は常に 1 つで
+([`close_parked_live_media_windows_for_new_media`](../src/app.rs))、F12 placement switch も新旧 presenter を
+同じ `native-video-render` thread 上で直列に扱う。重なり得るのは **teardown** だけで、
+`Drop for NativeVideoOutput` が render thread の join を待たず別 thread へ逃すため、
+旧 render thread の submit と新 thread の configure が重なり得る。overlay ごとに Device を
+持っていた頃は無害だったが、共有したことで初めて問題になる。このため epoch の RwLock gate は
+`Surface::configure` 全体を write lock、`update_texture` から `update_buffers`、
+`get_current_texture`、`queue.submit`、`SurfaceTexture::present` までを read lock にする。
+`egui::Context::run`、texture delta を作る font atlas の CPU 処理、tessellation は gate 外。
+実際に競合するかは perf の `gate_wait_ms` で見る (通常は 0ms 近傍のはず)。
+
+Device 作成直後に device-lost callback を登録する。callback は自 epoch generation と一致する
+一方向 latch を立てるだけで、wgpu 呼び出し、再作成、retry、ログを行わない。新しい overlay は
+latched epoch を選ばず fresh epoch を作る。既存 overlay は dead epoch を持ち続け、次の draw で
+terminal error を返して従来どおり presenter を停止する。`SurfaceError::Lost / Outdated / Timeout`
+は surface / swapchain 条件として epoch を invalidate せず、`Other` も callback latch が立った場合だけ
+device loss と診断する。旧 generation の遅い callback は successor の latch と一致しない。
+
+`VideoPlayer::tick(ctx)` は再生制御 / 意味的 deadline / ホバーサムネイル要求を扱う。
+フレームの実体描画は native presenter 内のスレッドが行うため、native 経路では
+フレームレート cadence を返さない。`ctx` は player ごとの `VideoUiWake` に一度結び、
+decoder / audio / native-window / thumbnail worker が状態を publish したとき
+`request_repaint_of(ViewportId::ROOT)` で UI を起こすために使う。時間でしか決まらない処理は
+stuck seek (1200ms)、EOF drain (観測残量の消費時刻 + quiet 48ms)、既知の再生末尾、
+user seek coalesce (250ms)、open 進捗 HUD (50ms) の最短 one-shot だけを返す。
+準備済み・一時停止中の native 動画は periodic repaint を返さない。
 
 ### NativeVideoPlacement と detached viewer
 
@@ -141,9 +193,10 @@ Esc / Enter と同じく `close_fullscreen()` で viewer session を終了する
 キー入力は App へ転送し、動画操作 / session close / F12 切替を同じ keymap 経路に通す。
 
 メインウィンドウでフォルダ移動や別フォルダ open が発生しても、表示中 detached 動画は
-`active_detached_viewer_context` に切り離して保持する。この状態では動画の `fs_cache` /
-`fullscreen_idx` / `items` は detached 側 bundle が正本になるため、`poll_video()` は
-その bundle を mount した `update_active_detached_viewer_context()` 内で走らせる。
+viewer context registry の window binding を保ったまま main から独立した context へ promote して
+保持する。この状態では動画の `fs_cache` / `fullscreen_idx` / `items` はその context が正本になるため、
+`poll_video()` は registry transaction で context を mount した
+`update_active_detached_viewer_context()` 内で走らせる。
 同時に main context 側の `poll_video()` は抑止し、native presenter のイベントや source
 swap pending を detached 動画ではない `fullscreen_idx` で処理しないようにする。
 
@@ -1330,6 +1383,15 @@ HW decode 有効かつ `LIVE_VIDEO_DECODE_THREADS >= MAX_LIVE_VIDEO_DECODE_THREA
 open を再開する。新しい動画要求が来たら pending は最新 1 件に置き換える。ESC /
 fullscreen exit / items 差し替えで stale になった pending は破棄する。
 
+R2e ownership 以後、regular-open pending の owner は window ID や
+`native_video_parked_live_input_window_id` ではなく enqueue 時の `ViewerContextId` である。
+Building 中は予約済み context ID、通常の poll 中は App に投影中の context ID を使う。
+AtRest / Mounted、active / ParkedLive、window binding は別の軸なので、この pending owner を
+変更しない。live-media fork で payload 自体が新 context へ分岐するときだけ、同じ registry
+transaction 境界で owner を transfer する。detached host 待ちは owner context が投影された
+frame だけが進め、登録済み host HWND の client rect が正サイズになれば decoder gate と open
+再開へ進む。
+
 perf event:
 - `regular_open_deferred`: live decoder 上限で通常 open を保留
 - `regular_open_deferred_start`: 保留していた open を開始
@@ -2236,7 +2298,8 @@ Enter / ダブルクリック等で次に開くまで再表示しない。
 main-window in-window active ではない。
 
 detached メディアを再生したままメイン一覧でフォルダ / お気に入りなどの context を切り替える場合、
-メディアは `active_detached_viewer_context` 側へ切り離して再生を維持する。切り離し後は
+メディアは viewer context registry の独立 context へ promote して再生を維持する。window binding は
+同じ context を指し続け、切り離し後は
 メイン一覧の選択変更に追従せず、メディア窓内の前後移動は切り離し時に保持していた同一一覧内だけを
 対象にする。`Ctrl+↑↓` / `Ctrl+PageUp/PageDown` のフォルダ横断は、静止画のピン /
 always-new 窓と同じく no-op として扱う。

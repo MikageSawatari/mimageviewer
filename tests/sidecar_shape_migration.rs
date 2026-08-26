@@ -70,7 +70,7 @@ fn sidecar_new_shape_roundtrip() {
 
     let mut sidecar = SidecarFile::new(temp.path().to_path_buf());
     sidecar.set_mask("photo.jpg", SidecarMask::from_raw(&raw, &[shape], 4, 4));
-    sidecar.flush();
+    sidecar.flush_blocking();
 
     let loaded = SidecarFile::load(temp.path());
     let vectors = &loaded
@@ -94,7 +94,7 @@ fn sidecar_subtract_persists_through_import() {
 
     let mut sidecar = SidecarFile::new(temp.path().to_path_buf());
     sidecar.set_mask("photo.jpg", SidecarMask::from_raw(&raw, &[shape], 4, 4));
-    sidecar.flush();
+    sidecar.flush_blocking();
 
     let loaded = SidecarFile::load(temp.path());
     let stats = import_to_dbs(

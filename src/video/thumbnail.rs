@@ -291,7 +291,11 @@ impl ThumbnailWorker {
     /// 内部で `ffmpeg::format::input` を別途開くので、メインデコーダの状態には影響しない。
     /// 失敗しても `Some(worker)` を返し、worker thread 内で諦めて即終了する
     /// (UI 側はサムネが返らないだけ)。
-    pub fn spawn(path: PathBuf, hw_decode: bool) -> Self {
+    pub(crate) fn spawn(
+        path: PathBuf,
+        hw_decode: bool,
+        ui_wake: Arc<crate::video::VideoUiWake>,
+    ) -> Self {
         let (wake_tx, wake_rx) = bounded::<()>(1);
         let requests = Arc::new(Mutex::new(ThumbnailRequestState::default()));
         let state = Arc::new(Mutex::new(ThumbnailState::new()));
@@ -300,6 +304,7 @@ impl ThumbnailWorker {
         let worker_requests = requests.clone();
         let worker_state = state.clone();
         let worker_cancel = cancel.clone();
+        let worker_ui_wake = Arc::clone(&ui_wake);
         let thread = std::thread::Builder::new()
             .name("video-thumb".into())
             .spawn(move || {
@@ -310,6 +315,7 @@ impl ThumbnailWorker {
                     worker_requests,
                     worker_state,
                     worker_cancel,
+                    worker_ui_wake,
                 );
             })
             .ok();
@@ -651,6 +657,7 @@ fn run_worker(
     requests: Arc<Mutex<ThumbnailRequestState>>,
     state: Arc<Mutex<ThumbnailState>>,
     cancel: Arc<AtomicBool>,
+    ui_wake: Arc<crate::video::VideoUiWake>,
 ) {
     let mut decoder: Option<SeekThumbnailDecoder> = None;
     let mut hw_decode_failed = false;
@@ -669,6 +676,7 @@ fn run_worker(
         // キャッシュヒットなら何もしない
         if state.lock().unwrap().lookup(request).is_some() {
             requests.lock().unwrap().finish(request);
+            ui_wake.wake();
             continue;
         }
 
@@ -678,6 +686,7 @@ fn run_worker(
                 Ok(decoder) => Some(decoder),
                 Err(e) => {
                     crate::logger::log(format!("video-thumb: decoder open failed: {e}"));
+                    ui_wake.wake();
                     return;
                 }
             };
@@ -713,6 +722,7 @@ fn run_worker(
                         ));
                         state.lock().unwrap().mark_attempted(request);
                         requests.lock().unwrap().finish(request);
+                        ui_wake.wake();
                         continue;
                     }
                 };
@@ -727,6 +737,7 @@ fn run_worker(
                         decoder = Some(sw_decoder);
                         state.lock().unwrap().mark_attempted(request);
                         requests.lock().unwrap().finish(request);
+                        ui_wake.wake();
                         continue;
                     }
                 }
@@ -735,6 +746,7 @@ fn run_worker(
                 crate::logger::log(format!("video-thumb: decode failed: {e}"));
                 state.lock().unwrap().mark_attempted(request);
                 requests.lock().unwrap().finish(request);
+                ui_wake.wake();
                 continue;
             }
         };
@@ -744,6 +756,7 @@ fn run_worker(
             DecodeOutcome::NoFrame => {
                 state.lock().unwrap().mark_attempted(request);
                 requests.lock().unwrap().finish(request);
+                ui_wake.wake();
                 continue;
             }
             DecodeOutcome::Superseded => {
@@ -775,6 +788,7 @@ fn run_worker(
         }
         state.lock().unwrap().insert_for_request(request, thumb);
         requests.lock().unwrap().finish(request);
+        ui_wake.wake();
     }
     crate::logger::log("video-thumb: terminated");
 }

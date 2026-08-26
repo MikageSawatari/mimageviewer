@@ -1285,8 +1285,13 @@ fn flush_import_sidecars(resources: &Arc<Mutex<ImportWorkerResources>>) -> Resul
         Err(poisoned) => poisoned.into_inner(),
     };
     let mut failed = Vec::new();
+    // 全部積んでから 1 度だけ待つ。1 件ずつ待つと writer の直列化ぶんだけ遅くなる。
     for sidecar in resources.sidecars.values_mut() {
-        if !sidecar.flush() {
+        sidecar.queue_flush();
+    }
+    crate::sidecar::wait_for_pending_writes();
+    for sidecar in resources.sidecars.values_mut() {
+        if !sidecar.written_to_disk() {
             failed.push(sidecar.folder().display().to_string());
         }
     }

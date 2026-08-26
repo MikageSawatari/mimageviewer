@@ -525,8 +525,7 @@ impl App {
         #[cfg(windows)]
         {
             return self.detached_window_manager.resolve_input_surface(
-                self.viewer_session_is_detached_or_switching()
-                    || self.active_detached_viewer_context.is_some(),
+                self.viewer_session_is_detached_or_switching(),
                 self.main_hwnd.and_then(|hwnd| u64::try_from(hwnd).ok()),
                 foreground_app_hwnd(),
                 self.fullscreen_idx.is_some(),
@@ -558,16 +557,7 @@ impl App {
         &self,
         surface: crate::app::ActionSurface,
     ) -> RingShortcutContext {
-        let detached_dual_surface = self.viewer_session_is_detached_or_switching() || {
-            #[cfg(windows)]
-            {
-                self.active_detached_viewer_context.is_some()
-            }
-            #[cfg(not(windows))]
-            {
-                false
-            }
-        };
+        let detached_dual_surface = self.viewer_session_is_detached_or_switching();
         let viewer_context = self.fullscreen_idx.map(|fs_idx| {
             if self.fullscreen_uses_video_ring_context(fs_idx) {
                 RingShortcutContext::VideoFullscreen
@@ -5793,9 +5783,7 @@ impl App {
         match context {
             RingShortcutContext::Grid => live_main(),
             RingShortcutContext::ImageFullscreen | RingShortcutContext::VideoFullscreen => {
-                if matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow)
-                    || self.active_detached_viewer_context.is_some()
-                {
+                if self.detached_viewer_host_owns_surface() {
                     if let Some(hwnd) = self.detached_viewer_host_hwnd_alive() {
                         return Some(hwnd);
                     }
@@ -5818,7 +5806,7 @@ impl App {
     }
 
     fn visual_spread_shift_dir(&self, right: bool) -> i32 {
-        let rtl = self.spread_mode.is_rtl();
+        let rtl = self.spread_mode.advances_right_to_left();
         match (right, rtl) {
             (true, false) | (false, true) => 1,
             (true, true) | (false, false) => -1,
@@ -6175,7 +6163,7 @@ impl App {
                 PadDir::Up | PadDir::Down | PadDir::Left | PadDir::Right => {}
             }
         }
-        let rtl = self.spread_mode.is_rtl();
+        let rtl = self.spread_mode.advances_right_to_left();
         let base_delta = match dir {
             PadDir::Right if !rtl => 1,
             PadDir::Right => -1,
@@ -6211,7 +6199,7 @@ impl App {
     }
 
     fn handle_gamepad_spread_nudge(&mut self, ctx: &egui::Context, fs_idx: usize, dir: PadDir) {
-        let rtl = self.spread_mode.is_rtl();
+        let rtl = self.spread_mode.advances_right_to_left();
         let nudge_dir = match dir {
             PadDir::Right if !rtl => Some(1),
             PadDir::Right => Some(-1),

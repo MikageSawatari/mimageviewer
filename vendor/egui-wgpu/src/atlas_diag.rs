@@ -329,6 +329,12 @@ impl Drop for BatchScope {
     }
 }
 
+/// mIV: emit a free-form diagnostic line through the same sink, for probes that live in
+/// the vendored backend but have no other way back to the file logger.
+pub fn log_line(line: String) {
+    emit(line);
+}
+
 /// Install the log sink. mIV points this at its file logger.
 pub fn set_sink(sink: fn(String)) {
     if let Ok(mut guard) = SINK.lock() {

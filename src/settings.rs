@@ -2668,6 +2668,9 @@ fn default_reading_history_limit() -> usize {
 /// - `Rtl`: 見開き 右→左（表紙なし）— [0,1] [2,3] ...
 /// - `RtlCover`: 見開き 右→左（表紙あり）— [0] [2,1] [4,3] ...
 /// - `Vertical`: 旧DB互換用。新規 UI では `ReadingFlow::Vertical` を使う。
+/// - `SplitLtr` / `SplitRtl`: 横長ページ 1 枚を左右へ分けて 2 回の表示ステップとして読む。
+///   見開きと**排他**にしてある。独立した bool にすると「見開き かつ 分割」のような
+///   組み合わせ状態が増え、どちらが有効かを各所で判定し直すことになる。
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Default)]
 pub enum SpreadMode {
     #[default]
@@ -2677,6 +2680,8 @@ pub enum SpreadMode {
     Rtl,
     RtlCover,
     Vertical,
+    SplitLtr,
+    SplitRtl,
 }
 
 impl SpreadMode {
@@ -2693,9 +2698,17 @@ impl SpreadMode {
         matches!(self, Self::Vertical)
     }
 
-    /// 右→左（RTL）モードか
+    /// 右→左（RTL）モードか。
+    ///
+    /// 見開きのペア並び順の判定に使う。**分割モードは含めない** — 分割の左右順は
+    /// `crate::page_split::SplitDirection` が持ち、見開きのペア順とは別の概念である。
     pub fn is_rtl(self) -> bool {
         matches!(self, Self::Rtl | Self::RtlCover)
+    }
+
+    /// 横長ページを左右へ分割して読むモードか。
+    pub fn is_split(self) -> bool {
+        matches!(self, Self::SplitLtr | Self::SplitRtl)
     }
 
     /// 表紙（1ページ目単独表示）ありか
@@ -2711,6 +2724,8 @@ impl SpreadMode {
             3 => Self::Rtl,
             4 => Self::RtlCover,
             5 => Self::Vertical,
+            6 => Self::SplitLtr,
+            7 => Self::SplitRtl,
             _ => Self::Single,
         }
     }
@@ -2742,6 +2757,8 @@ impl SpreadMode {
             Self::Rtl => 3,
             Self::RtlCover => 4,
             Self::Vertical => 5,
+            Self::SplitLtr => 6,
+            Self::SplitRtl => 7,
         }
     }
 
@@ -2753,6 +2770,8 @@ impl SpreadMode {
             Self::Rtl => "見開き 右→左",
             Self::RtlCover => "見開き 右→左（表紙あり）",
             Self::Vertical => "縦読み（旧）",
+            Self::SplitLtr => "横長分割 左→右",
+            Self::SplitRtl => "横長分割 右→左",
         }
     }
 
@@ -2763,7 +2782,33 @@ impl SpreadMode {
             Self::LtrCover,
             Self::Rtl,
             Self::RtlCover,
+            Self::SplitLtr,
+            Self::SplitRtl,
         ]
+    }
+
+    /// このモードが持つ読み順。持たないモード (`Single` / 旧 `Vertical`) は `None`。
+    ///
+    /// [`Self::with_reading_direction`] の逆向き。**両方向をここに並べて置く。**片方だけに
+    /// variant を足すと、選んだモードと送り方向がずれる (2026-08-26: 横長分割を選んでも
+    /// 綴じ方向が付いてこず、左右の順序と分割の順序が食い違った)。網羅 match なので、
+    /// モードを足せばコンパイラが両方を要求する。
+    pub fn reading_direction(self) -> Option<ReadingDirection> {
+        match self {
+            Self::Ltr | Self::LtrCover | Self::SplitLtr => Some(ReadingDirection::Ltr),
+            Self::Rtl | Self::RtlCover | Self::SplitRtl => Some(ReadingDirection::Rtl),
+            Self::Single | Self::Vertical => None,
+        }
+    }
+
+    /// **入力の左右を反転するか。**「右」が次ページ側になるモード。
+    ///
+    /// [`Self::is_rtl`] は**見開きのペア並び順**を表す別の問いで、横長分割を含まない。
+    /// 入力の左右まで `is_rtl` で決めていたため、横長分割 右→左 を選んでも矢印キーと
+    /// タップの左右が反転しなかった (2026-08-26 の実機報告。シークバーの向きは合っていた)。
+    /// 読み順は [`Self::reading_direction`] が正本なので、そこから導く。
+    pub fn advances_right_to_left(self) -> bool {
+        matches!(self.reading_direction(), Some(ReadingDirection::Rtl))
     }
 
     /// 見開きの表紙有無を保ったまま横方向だけを差し替える。
@@ -2775,6 +2820,9 @@ impl SpreadMode {
             (Self::Ltr | Self::Rtl, ReadingDirection::Rtl) => Self::Rtl,
             (Self::LtrCover | Self::RtlCover, ReadingDirection::Ltr) => Self::LtrCover,
             (Self::LtrCover | Self::RtlCover, ReadingDirection::Rtl) => Self::RtlCover,
+            // 分割も読み順を持つので、読み方向の切替に追随させる。
+            (Self::SplitLtr | Self::SplitRtl, ReadingDirection::Ltr) => Self::SplitLtr,
+            (Self::SplitLtr | Self::SplitRtl, ReadingDirection::Rtl) => Self::SplitRtl,
             (mode, _) => mode,
         }
     }
@@ -3147,6 +3195,66 @@ impl StartupFolderMode {
 }
 
 // -----------------------------------------------------------------------
+// StartupWindowState (起動時のウィンドウ状態)
+// -----------------------------------------------------------------------
+
+/// 起動直後にメインウィンドウを通常表示にするか最大化するか。
+///
+/// この選択は「最大化するか」だけを決める。通常ウィンドウの位置・サイズは
+/// どの値でも `window_pos` / `window_size` から復元する。最大化を解いたときに
+/// 戻る先がその矩形なので、両者を 1 つの値に同居させてはいけない (§1.116 / §1.115)。
+#[derive(serde::Serialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupWindowState {
+    /// 前回終了時が最大化だったなら最大化で起動する。Windows の一般的な挙動に合わせた既定。
+    ///
+    /// v3.2.0 から更新した利用者の設定にはこの field 自体が無く、最大化 flag も
+    /// 未記録 (= false) なので、更新直後の初回起動は通常ウィンドウのまま。次に
+    /// 最大化して終了したときから効き始める。
+    #[default]
+    RememberLast,
+    /// 常に通常ウィンドウで起動する。v3.2.0 までの振る舞い。
+    Normal,
+    /// 常に最大化で起動する。
+    Maximized,
+}
+
+impl<'de> serde::Deserialize<'de> for StartupWindowState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            "normal" => Self::Normal,
+            "maximized" => Self::Maximized,
+            "remember_last" => Self::RememberLast,
+            _ => Self::default(),
+        })
+    }
+}
+
+impl StartupWindowState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RememberLast => "前回終了時の状態",
+            Self::Normal => "通常ウィンドウ",
+            Self::Maximized => "最大化",
+        }
+    }
+}
+
+/// 起動時に最大化するかを決める。`last_exit_maximized` は前回終了時の
+/// 最大化 flag (`Settings::window_maximized`)。
+pub fn resolve_startup_maximized(state: StartupWindowState, last_exit_maximized: bool) -> bool {
+    match state {
+        StartupWindowState::Normal => false,
+        StartupWindowState::Maximized => true,
+        StartupWindowState::RememberLast => last_exit_maximized,
+    }
+}
+
+// -----------------------------------------------------------------------
 // Settings
 // -----------------------------------------------------------------------
 
@@ -3466,12 +3574,21 @@ pub struct Settings {
     /// キーは `"C:"` のような大文字ドライブ表記。
     #[serde(default = "default_quick_folder_drive_current_dirs")]
     pub quick_folder_drive_current_dirs: [BTreeMap<String, PathBuf>; 2],
-    /// ウィンドウ左上座標 (outer rect)
+    /// 通常ウィンドウの左上座標 (outer rect)。最大化中は更新しないので、
+    /// 最大化を解いたときに戻る矩形として残る。
     #[serde(default)]
     pub window_pos: Option<[f32; 2]>,
-    /// ウィンドウサイズ (outer rect)
+    /// 通常ウィンドウのサイズ (inner rect)。`window_pos` と同じく最大化中は更新しない。
     #[serde(default)]
     pub window_size: Option<[f32; 2]>,
+    /// 前回終了時 (トレイ退避を含む) に最大化していたか。`window_pos` /
+    /// `window_size` とは**別に**持つ: 1 つの矩形へ最大化状態を畳み込むと、
+    /// 復元先が最大化サイズで潰れて戻れなくなる (detached 側の §1.115 と同じ根)。
+    #[serde(default)]
+    pub window_maximized: bool,
+    /// 起動時にメインウィンドウを最大化するか。既定は従来どおり通常ウィンドウ。
+    #[serde(default)]
+    pub startup_window_state: StartupWindowState,
     #[serde(default)]
     pub parallelism: Parallelism,
     /// PDF worker pool のプロセス数。変更は次回起動時に反映される。
@@ -5635,6 +5752,8 @@ impl Default for Settings {
             quick_folder_drive_current_dirs: default_quick_folder_drive_current_dirs(),
             window_pos: None,
             window_size: None,
+            window_maximized: false,
+            startup_window_state: StartupWindowState::default(),
             parallelism: Parallelism::default(),
             pdf_worker_count: default_pdf_worker_count(),
             prefetch_back: default_prefetch_back(),
@@ -7805,6 +7924,9 @@ impl Settings {
             std::mem::take(&mut src.quick_folder_drive_current_dirs);
         self.window_pos = src.window_pos;
         self.window_size = src.window_size;
+        // 最大化 flag は環境設定に出さない実行時状態。`startup_window_state` の方は
+        // 利用者が編集する設定なので、ここで live 値へ巻き戻してはいけない。
+        self.window_maximized = src.window_maximized;
         self.detached_viewer_enabled = src.detached_viewer_enabled;
         self.detached_viewer_window_placement = src.detached_viewer_window_placement;
         // ── お気に入り / スマートフォルダ / タグ (専用ダイアログで編集) ──
@@ -8015,6 +8137,52 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **モードと読み順は互いの逆向きでなければならない。**
+    ///
+    /// 方向 → モードだけが分割を扱い、モード → 方向が素通りしていたため、横長分割を
+    /// 選んでも綴じ方向が付いてこず、**分割の左右とページ送りの左右が食い違った**
+    /// (2026-08-26 の実機報告)。片方に variant を足したらここが落ちる。
+    #[test]
+    fn a_spread_mode_and_its_reading_direction_stay_each_other_s_inverse() {
+        for &mode in SpreadMode::all() {
+            let Some(direction) = mode.reading_direction() else {
+                // 読み順を持たないモードは、方向を変えても動かない。
+                assert_eq!(mode.with_reading_direction(ReadingDirection::Ltr), mode);
+                assert_eq!(mode.with_reading_direction(ReadingDirection::Rtl), mode);
+                continue;
+            };
+            // 自分の方向を渡しても変わらない。
+            assert_eq!(mode.with_reading_direction(direction), mode, "{mode:?}");
+            // 反転させると相方になり、その相方は反転後の方向を返す。
+            let flipped = mode.with_reading_direction(direction.next());
+            assert_ne!(flipped, mode, "{mode:?}");
+            assert_eq!(
+                flipped.reading_direction(),
+                Some(direction.next()),
+                "{mode:?}"
+            );
+            // 元へ戻る。
+            assert_eq!(flipped.with_reading_direction(direction), mode, "{mode:?}");
+            // **入力の左右も同じ読み順から導く。**ペア並び順 (`is_rtl`) で決めていたため、
+            // 横長分割 右→左 で矢印キーが反転しなかった (2026-08-26 の実機報告)。
+            assert_eq!(
+                mode.advances_right_to_left(),
+                direction == ReadingDirection::Rtl,
+                "{mode:?}"
+            );
+        }
+
+        // 読み順を持たないモードは反転しない (1ページ表示の従来動作を変えない)。
+        assert!(!SpreadMode::Single.advances_right_to_left());
+        // 見開き 右→左 は従来どおり反転し、横長分割 右→左 も同じになる。
+        assert!(SpreadMode::Rtl.advances_right_to_left());
+        assert!(SpreadMode::RtlCover.advances_right_to_left());
+        assert!(SpreadMode::SplitRtl.advances_right_to_left());
+        assert!(!SpreadMode::SplitLtr.advances_right_to_left());
+        // ペア並び順は分割を含まない。2 つの問いを取り違えない。
+        assert!(!SpreadMode::SplitRtl.is_rtl());
+    }
 
     #[test]
     fn video_seek_strip_state_defaults_closed_and_round_trips_with_explicit_last_choice() {
@@ -10143,6 +10311,102 @@ mod tests {
     }
 
     #[test]
+    fn startup_maximized_follows_the_chosen_state() {
+        // 「通常」は前回が最大化でも最大化しない。
+        assert!(!resolve_startup_maximized(StartupWindowState::Normal, true));
+        assert!(!resolve_startup_maximized(
+            StartupWindowState::Normal,
+            false
+        ));
+        // 「最大化」は前回の状態に関係なく最大化する。
+        assert!(resolve_startup_maximized(
+            StartupWindowState::Maximized,
+            false
+        ));
+        assert!(resolve_startup_maximized(
+            StartupWindowState::Maximized,
+            true
+        ));
+        // 「前回終了時の状態」だけが保存済み flag を見る。これが既定。
+        assert!(resolve_startup_maximized(
+            StartupWindowState::RememberLast,
+            true
+        ));
+        assert!(!resolve_startup_maximized(
+            StartupWindowState::RememberLast,
+            false
+        ));
+    }
+
+    #[test]
+    fn window_state_survives_a_settings_round_trip() {
+        let mut saved = Settings::default();
+        saved.startup_window_state = StartupWindowState::RememberLast;
+        saved.window_maximized = true;
+        saved.window_pos = Some([120.0, 80.0]);
+        saved.window_size = Some([1600.0, 900.0]);
+
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(
+            restored.startup_window_state,
+            StartupWindowState::RememberLast
+        );
+        assert!(restored.window_maximized);
+        // 最大化 flag は復元矩形を潰さない。最大化を解いたときの戻り先が要るので、
+        // 両者は別のフィールドとして往復する必要がある。
+        assert_eq!(restored.window_pos, Some([120.0, 80.0]));
+        assert_eq!(restored.window_size, Some([1600.0, 900.0]));
+    }
+
+    #[test]
+    fn unknown_startup_window_state_falls_back_to_the_default() {
+        // 新しい選択肢を足した版で書いた設定を古い版が読む経路。既定へ落として
+        // 起動できることを保証する。
+        let loaded: Settings =
+            serde_json::from_str(r#"{"startup_window_state":"tiled_to_the_left"}"#).unwrap();
+        assert_eq!(
+            loaded.startup_window_state,
+            StartupWindowState::RememberLast
+        );
+    }
+
+    #[test]
+    fn updating_from_an_older_version_does_not_change_the_first_start() {
+        // v3.2.0 までの設定にはこの field も最大化 flag も無い。既定が
+        // 「前回終了時の状態」でも、記録が無い以上は通常ウィンドウで起動する。
+        // 更新直後に勝手に最大化しないことを固定する。
+        let loaded: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            loaded.startup_window_state,
+            StartupWindowState::RememberLast
+        );
+        assert!(!loaded.window_maximized);
+        assert!(!resolve_startup_maximized(
+            loaded.startup_window_state,
+            loaded.window_maximized
+        ));
+    }
+
+    #[test]
+    fn preferences_ok_keeps_the_edited_startup_window_state() {
+        // 環境設定 OK は編集済みコピーを live 値で上書きするが、対象は実行時状態だけ。
+        // 起動状態は利用者が今そこで選んだ設定なので巻き戻してはいけない。
+        let mut edited = Settings::default();
+        edited.startup_window_state = StartupWindowState::Maximized;
+        edited.window_maximized = false;
+
+        let mut live = Settings::default();
+        live.startup_window_state = StartupWindowState::Normal;
+        live.window_maximized = true;
+
+        edited.overwrite_non_preferences_from(&mut live);
+
+        assert_eq!(edited.startup_window_state, StartupWindowState::Maximized);
+        assert!(edited.window_maximized);
+    }
+
+    #[test]
     fn settings_default_values() {
         let s = Settings::default();
         assert_eq!(s.grid_cols, 4);
@@ -10164,6 +10428,8 @@ mod tests {
         );
         assert!(s.window_pos.is_none());
         assert!(s.window_size.is_none());
+        assert!(!s.window_maximized);
+        assert_eq!(s.startup_window_state, StartupWindowState::RememberLast);
         assert_eq!(s.prefetch_back, 4);
         assert_eq!(s.prefetch_forward, 12);
         assert_eq!(

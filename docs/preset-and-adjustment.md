@@ -1494,7 +1494,48 @@ release 時に 1 Undo として確定する。モード終了・フォルダ切�
 **キーの整合性はユニットテストで担保**。`adjustment_db::normalize_path` の挙動と揃っていないと
 インポートで復元されない。
 
-### 9.3 マスクの書き込みタイミング
+### 9.3 マスクの格納形式 (packed)
+
+**画素ごとの値を JSON の数値配列で書かない。**[`crates/local-adjust-core/src/mask_codec.rs`](../crates/local-adjust-core/src/mask_codec.rs)
+が `"<tag>:<count>:<base64(deflate(bytes))>"` へ詰める。
+
+| 対象 | tag | バイト |
+| --- | --- | --- |
+| 被覆率 (`f32` 0..=1): `RasterMask` / `RasterVectorMask` / `SubjectMask` の `alpha`・`source_alpha` | `q8z` | 1 画素 1 バイト (`round(a * 255)`) |
+| 領域ラベル (`u32`): `RegionMask.labels` | `u32z` | 1 画素 4 バイト (little-endian) |
+
+`serde` のフィールド属性なので、**このレイヤー配列を持つ全ストアが同時にこの形式になる**
+(`local_adjust.db` / `mimageviewer.dat` / 編集 bundle / メタデータ移送)。同じ知識を
+4 か所へ書かないための配置。
+
+- **量子化は 8bit**。ブラシは 0.0 / 1.0 しか書かないので 1bit でも無損失だが、
+  `SubjectMask` はマッティングモデルの出力で連続値。1 つの符号化で両方を担うので、
+  ぼかした境界が残るほうを選ぶ。2 値データなら deflate が潰すので容量差も出ない。
+- `<count>` は要素数。deflate は途中で切れた入力を黙って受け入れて短い列を返すので、
+  これが無いと書きかけのファイルがここでは通り、後段の添字アクセスで壊れる。
+
+**旧形式 (v1.1.0〜v3.2.0) の読み込みと移行**:
+
+- デコーダは数値配列も受け付ける (エンコーダだけが新しい)。旧形式を読むと
+  `mask_codec::legacy_decode_count()` が進む。
+- `SidecarFile::load` は count の変化を見て dirty を立て、次の書き出しで置き換える。
+- `local_adjust_db::repack_legacy_masks` が起動時 worker で全行を走査し、旧形式だった
+  行だけを書き戻したうえで VACUUM する。書き戻しは「読んだ内容から 1 バイトも
+  変わっていない」ことを条件にするので、その間の保存を潰さない。
+- 実測 (2026-08-26、利用者の実データ):
+
+  | | 前 | 後 | 時間 |
+  | --- | --- | --- | --- |
+  | `local_adjust.db` (82 行 / 最大 1 行 93MB) | 959.0 MB | 2.7 MB | 5.2 s (worker) |
+  | `d:\home\scan\comic\mimageviewer.dat` (415 items) | 733.9 MB | 0.6 MB | 読み 0.8s / 書き 0.3s |
+
+  移行後の DB を元の DB と突き合わせて検証済み: 82 行・**1 億 5200 万個**の alpha を
+  比較して最大誤差 0.00196 = **量子化 1 段の半分**ちょうど (= 丸め以外の変化なし)。
+  ここで 0 でない値が出ていることが、実データに連続値のマスクが実在する証拠でもある
+  —— 1bit を選んでいたら壊していた。検証スクリプトは
+  `MIV_REPACK_DRY_RUN` / `MIV_SIDECAR_DRY_RUN` のテストと合わせて使う。
+
+### 9.3.1 マスクの書き込みタイミング
 
 消しゴムマスクは書き込みコストが大きい (1bit/pixel pack + deflate + JSON 埋め込み) ため、
 **消しゴムモードの確定点でのみ** 書く:
@@ -1504,6 +1545,39 @@ release 時に 1 Undo として確定する。モード終了・フォルダ切�
 3. 「マスク全削除」ボタン (ui_erase.rs 内 `delete_mask_with_sidecar`)
 
 ストローク毎の書き込みは行わない。中央 DB もサイドカーも同じタイミングでしか書かない。
+
+### 9.3.2 サイドカーの書き出しは非同期 (`SidecarWriter`)
+
+ディスクへ書くのは専用スレッド 1 本だけ。UI スレッドは `SidecarFile::queue_flush()` で
+内容を渡して即座に戻る。
+
+- **まだ届いていない内容は writer の pending に残り、`SidecarFile::load` がディスクより
+  先にそれを見る**。これが read-after-write の成立条件なので、pending は
+  プロセス内に 1 つ (`sidecar::WRITER`)。context ごとに分けない。
+- 書いている最中に積み直された場合、完了処理は seq が一致するときだけ pending を外す。
+  外してしまうと、次の job が走るまでの間だけ読み手が 1 つ前の内容を見る。
+- 失敗したフォルダ (読み取り専用メディア等) は writer が folder 単位で覚え、以降積まない。
+  `SidecarFile::disabled` は別概念 (**ディスク上の内容を上書きしてはいけない** = パース
+  失敗・新しいバージョンが書いたファイル)。
+- プロセスが止まる直前 (終了・トレイ退避) だけ `sidecar::wait_for_pending_writes()` で待つ。
+  削除移行のように結果を報告する必要がある経路は `flush_blocking()`。
+- UI スレッドが払うのは `items` の clone だけ。マスクはメモリ上では `Vec<f32>` のままなので
+  これはゼロコストではない —— 実測で **415 items / 31.5M 画素の最大ケースが 38ms**
+  (元の同期 flush は 6059ms)。`Arc<SidecarEntry>` にすればほぼ 0 にできるが、
+  flush の契機は限られている (毎フレームではない) のでこの数字なら見合わない。
+
+書き出しの契機:
+
+| 契機 | 実装 |
+| --- | --- |
+| 編集ツールを抜けた | `App::flush_sidecars_when_page_edit_ends` (`page_edit_tool_owns_canvas` が true → false) |
+| フォルダ切替 | `start_loading_items` の `flush_all_sidecars` |
+| アプリ終了 / トレイ退避 | `persist_window_state_and_flush` (+ 待つ) |
+| 定期 (`PERIODIC_FLUSH_INTERVAL` = 10 分) | `App::flush_periodic_sidecars` |
+
+定期フラッシュは**クラッシュ・電源断でしか使われない保険**なので頻度は低くてよい。
+判定は「dirty になった時刻」からの経過で行う。最後の変更時刻から測ると、編集を
+続けている限り一度も書かれない。
 
 ### 9.4 空になったファイル
 
@@ -1526,8 +1600,8 @@ OFF にすると **読み書き両方スキップ** (既存 `.dat` は削除し�
 
 読み取り専用メディアや権限不足で IO が失敗した場合:
 - ログに 1 行書いて無視
-- `SidecarFile::disabled = true` を立てて以降同フォルダは再試行しない (ログ汚染防止)
-- アプリ再起動で `disabled` はリセット
+- writer が folder 単位で失敗を覚え、以降そのフォルダへは積まない (ログ汚染防止)
+- アプリ再起動でリセット
 
 ユーザへのダイアログ表示はしない (視聴体験の邪魔になるため)。
 

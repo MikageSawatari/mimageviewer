@@ -5,11 +5,14 @@
 //! chain is exactly the physical video display rectangle and DComp only places
 //! that rectangle.
 
+#[cfg(test)]
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0,
-    D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob, ID3DInclude,
+    D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
 };
+#[cfg(test)]
+use windows::Win32::Graphics::Direct3D::{ID3DBlob, ID3DInclude};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
     D3D11_BUFFER_DESC, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_QUERY_DATA_TIMESTAMP_DISJOINT,
@@ -22,7 +25,9 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice};
-use windows::core::{Interface, PCSTR};
+use windows::core::Interface;
+#[cfg(test)]
+use windows::core::PCSTR;
 
 use crate::gpu_anime4k::{Anime4kPassInput, Anime4kVariant};
 use crate::settings::VideoScaleFilter;
@@ -30,102 +35,21 @@ use crate::video::anime4k_policy::VideoAnime4kMeasurementPoint;
 use crate::video::anime4k_policy::VideoAnime4kVariant;
 use crate::video::display_metadata::VideoOrientation;
 
-const NIS_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/video_nis.hlsl"));
-const RESAMPLE_SHADER: &[u8] = br#"
-Texture2D<float4> source_tex : register(t0);
-
-cbuffer ResampleConstants : register(b0) {
-    float4 source_target;  // raw source width/height, final target width/height
-    float4 axis_filter;    // oriented source axis lengths, horizontal/vertical stretch
-    float4 inverse_axes;   // d(raw xy)/d(oriented x), d(raw xy)/d(oriented y)
-    float4 inverse_offset; // raw xy at oriented (0,0), unused
-};
-
-struct VsOut {
-    float4 position : SV_Position;
-};
-
-VsOut vs_main(uint vertex_id : SV_VertexID) {
-    VsOut output;
-    float2 uv = float2((vertex_id << 1) & 2, vertex_id & 2);
-    output.position = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
-    return output;
-}
-
-float sinc_pi(float value) {
-    float x = value * 3.14159265358979323846;
-    return abs(x) < 1.0e-5 ? 1.0 : sin(x) / x;
-}
-
-float lanczos3_weight(float distance, float stretch) {
-    float x = abs(distance) / stretch;
-    if (x >= 3.0) {
-        return 0.0;
-    }
-    return sinc_pi(x) * sinc_pi(x / 3.0);
-}
-
-float4 ps_horizontal(VsOut input) : SV_Target {
-    float source_axis_x = axis_filter.x;
-    float source_axis_y = axis_filter.y;
-    float target_width = source_target.z;
-    float source_position = input.position.x * source_axis_x / target_width - 0.5;
-    float oriented_y = clamp(input.position.y - 0.5, 0.0, source_axis_y - 1.0);
-    float stretch = axis_filter.z;
-    int radius = (int)ceil(3.0 * stretch);
-    int first = (int)floor(source_position) - radius;
-    int last = (int)floor(source_position) + radius + 1;
-    int2 raw_max = int2(source_target.xy) - 1;
-    float4 accumulated = 0.0;
-    float weight_sum = 0.0;
-    [loop]
-    for (int sample_index = first; sample_index <= last; ++sample_index) {
-        float weight = lanczos3_weight(source_position - sample_index, stretch);
-        float2 raw_position =
-            (float)sample_index * inverse_axes.xy
-            + oriented_y * inverse_axes.zw
-            + inverse_offset.xy;
-        int2 raw_coord = clamp(int2(round(raw_position)), int2(0, 0), raw_max);
-        accumulated += source_tex.Load(int3(raw_coord, 0)) * weight;
-        weight_sum += weight;
-    }
-    return abs(weight_sum) > 1.0e-6 ? accumulated / weight_sum : accumulated;
-}
-
-float4 ps_vertical(VsOut input) : SV_Target {
-    float source_axis_y = axis_filter.y;
-    float target_height = source_target.w;
-    float source_position = input.position.y * source_axis_y / target_height - 0.5;
-    float stretch = axis_filter.w;
-    int radius = (int)ceil(3.0 * stretch);
-    int first = (int)floor(source_position) - radius;
-    int last = (int)floor(source_position) + radius + 1;
-    int source_x = clamp((int)input.position.x, 0, (int)source_target.z - 1);
-    int source_y_max = (int)source_axis_y - 1;
-    float4 accumulated = 0.0;
-    float weight_sum = 0.0;
-    [loop]
-    for (int sample_index = first; sample_index <= last; ++sample_index) {
-        float weight = lanczos3_weight(source_position - sample_index, stretch);
-        int source_y = clamp(sample_index, 0, source_y_max);
-        accumulated += source_tex.Load(int3(source_x, source_y, 0)) * weight;
-        weight_sum += weight;
-    }
-    return abs(weight_sum) > 1.0e-6 ? accumulated / weight_sum : accumulated;
-}
-
-float4 ps_nearest(VsOut input) : SV_Target {
-    float2 oriented_position =
-        input.position.xy * axis_filter.xy / source_target.zw - 0.5;
-    float2 raw_position =
-        round(oriented_position.x) * inverse_axes.xy
-        + round(oriented_position.y) * inverse_axes.zw
-        + inverse_offset.xy;
-    int2 raw_max = int2(source_target.xy) - 1;
-    int2 raw_coord = clamp(int2(round(raw_position)), int2(0, 0), raw_max);
-    return source_tex.Load(int3(raw_coord, 0));
-}
-"#;
+/// ビルド時に FXC で DXBC 化した resample シェーダ
+/// ([shaders/video_resample.hlsl](shaders/video_resample.hlsl))。NIS は WGSL から naga で
+/// HLSL に変換したものを、同じくビルド時に DXBC 化してある。実行時 `D3DCompile` は
+/// NIS だけで 2.1 秒かかり、placement 切替のたびに払っていた (backlog §1.122)。
+const RESAMPLE_VS_MAIN: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/video_resample_vs_main.cso"));
+const RESAMPLE_PS_HORIZONTAL: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/video_resample_ps_horizontal.cso"
+));
+const RESAMPLE_PS_VERTICAL: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/video_resample_ps_vertical.cso"));
+const RESAMPLE_PS_NEAREST: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/video_resample_ps_nearest.cso"));
+const NIS_FS_NIS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/video_nis_fs_nis.cso"));
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -407,11 +331,6 @@ impl VideoAnime4kPipeline {
 
 impl VideoResamplePipeline {
     pub(super) fn new(device: &ID3D11Device1) -> Result<Self, String> {
-        let vertex_blob = compile_resample_shader("vs_main", "vs_5_0")?;
-        let horizontal_blob = compile_resample_shader("ps_horizontal", "ps_5_0")?;
-        let vertical_blob = compile_resample_shader("ps_vertical", "ps_5_0")?;
-        let nearest_blob = compile_resample_shader("ps_nearest", "ps_5_0")?;
-        let nis_blob = compile_shader_source(NIS_SHADER, "fs_nis", "ps_5_0")?;
         let mut vertex_shader = None;
         let mut horizontal_shader = None;
         let mut vertical_shader = None;
@@ -421,23 +340,19 @@ impl VideoResamplePipeline {
         let mut nis_constants = None;
         unsafe {
             device
-                .CreateVertexShader(blob_bytes(&vertex_blob), None, Some(&mut vertex_shader))
+                .CreateVertexShader(RESAMPLE_VS_MAIN, None, Some(&mut vertex_shader))
                 .map_err(|error| format!("CreateVertexShader resample: {error:?}"))?;
             device
-                .CreatePixelShader(
-                    blob_bytes(&horizontal_blob),
-                    None,
-                    Some(&mut horizontal_shader),
-                )
+                .CreatePixelShader(RESAMPLE_PS_HORIZONTAL, None, Some(&mut horizontal_shader))
                 .map_err(|error| format!("CreatePixelShader resample horizontal: {error:?}"))?;
             device
-                .CreatePixelShader(blob_bytes(&vertical_blob), None, Some(&mut vertical_shader))
+                .CreatePixelShader(RESAMPLE_PS_VERTICAL, None, Some(&mut vertical_shader))
                 .map_err(|error| format!("CreatePixelShader resample vertical: {error:?}"))?;
             device
-                .CreatePixelShader(blob_bytes(&nearest_blob), None, Some(&mut nearest_shader))
+                .CreatePixelShader(RESAMPLE_PS_NEAREST, None, Some(&mut nearest_shader))
                 .map_err(|error| format!("CreatePixelShader nearest: {error:?}"))?;
             device
-                .CreatePixelShader(blob_bytes(&nis_blob), None, Some(&mut nis_shader))
+                .CreatePixelShader(NIS_FS_NIS, None, Some(&mut nis_shader))
                 .map_err(|error| format!("CreatePixelShader NIS: {error:?}"))?;
             let constants_desc = D3D11_BUFFER_DESC {
                 ByteWidth: std::mem::size_of::<ResampleConstants>() as u32,
@@ -1148,10 +1063,10 @@ fn anime4k_pass_views(
         .collect())
 }
 
-fn compile_resample_shader(entry: &'static str, target: &'static str) -> Result<ID3DBlob, String> {
-    compile_shader_source(RESAMPLE_SHADER, entry, target)
-}
-
+/// 実行時 HLSL コンパイル。**production 経路では使わない** (シェーダは `build.rs` が
+/// FXC で DXBC 化してある)。Anime4K の GPU 実測テストが、生成済み HLSL から
+/// その場で pixel shader を作るために残してある (backlog §1.122)。
+#[cfg(test)]
 fn compile_shader_source(source: &[u8], entry: &str, target: &str) -> Result<ID3DBlob, String> {
     let mut bytecode = None;
     let mut errors = None;
@@ -1183,12 +1098,14 @@ fn compile_shader_source(source: &[u8], entry: &str, target: &str) -> Result<ID3
     bytecode.ok_or_else(|| "D3DCompile returned null bytecode".to_string())
 }
 
+#[cfg(test)]
 fn blob_bytes(blob: &ID3DBlob) -> &[u8] {
     unsafe {
         std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
     }
 }
 
+#[cfg(test)]
 fn blob_string(blob: &ID3DBlob) -> String {
     String::from_utf8_lossy(blob_bytes(blob))
         .trim_end_matches('\0')
@@ -1535,6 +1452,7 @@ fn wait_query_data<T: Copy + Default>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     const ANIME4K_VL_HLSL: &[u8] =
         include_bytes!(concat!(env!("OUT_DIR"), "/video_anime4k_vl.hlsl"));
     use windows::Win32::Graphics::Direct3D::{
@@ -1590,18 +1508,27 @@ mod tests {
         (device, context.expect("D3D11 immediate context"))
     }
 
+    /// resample / NIS シェーダがビルド時に DXBC 化されていること。
+    ///
+    /// 以前はここで `D3DCompile` を呼んで「HLSL が通る」ことを確かめていた。NIS の
+    /// コンパイルだけで 2.1 秒かかっており、テストにも実行時にも同じ代金を払っていた。
+    /// コンパイルは `build.rs` の仕事になった (通らなければビルドが落ちる) ので、
+    /// 検査は「実行時に渡す DXBC が実在するか」に合わせる (backlog §1.122)。
     #[test]
-    fn resample_hlsl_compiles_for_shader_model_5() {
-        compile_resample_shader("vs_main", "vs_5_0").expect("vertex shader");
-        compile_resample_shader("ps_horizontal", "ps_5_0").expect("horizontal shader");
-        compile_resample_shader("ps_vertical", "ps_5_0").expect("vertical shader");
-        compile_resample_shader("ps_nearest", "ps_5_0").expect("nearest shader");
-    }
-
-    #[test]
-    fn nis_converter_output_compiles_for_shader_model_5() {
-        compile_shader_source(NIS_SHADER, "vs_main", "vs_5_0").expect("NIS vertex shader");
-        compile_shader_source(NIS_SHADER, "fs_nis", "ps_5_0").expect("NIS pixel shader");
+    fn resample_shaders_are_precompiled_dxbc() {
+        for (label, bytecode) in [
+            ("vs_main", RESAMPLE_VS_MAIN),
+            ("ps_horizontal", RESAMPLE_PS_HORIZONTAL),
+            ("ps_vertical", RESAMPLE_PS_VERTICAL),
+            ("ps_nearest", RESAMPLE_PS_NEAREST),
+            ("fs_nis", NIS_FS_NIS),
+        ] {
+            assert!(
+                bytecode.len() > 4 && &bytecode[..4] == b"DXBC",
+                "{label} is not DXBC bytecode (len={})",
+                bytecode.len()
+            );
+        }
     }
 
     fn assert_resample_mode_writes_target(mode: VideoResampleMode, label: &str) {

@@ -61,6 +61,9 @@ fn find_worker_exe() -> Option<PathBuf> {
     let candidates = [
         manifest.join("target/i686-pc-windows-msvc/release/mimageviewer-susie32.exe"),
         manifest.join("target/i686-pc-windows-msvc/debug/mimageviewer-susie32.exe"),
+        // bootstrap-vendor.sh が置く配布用の実体。32bit target を入れていない環境でも
+        // このテストが黙って skip しないようにする (skip したテストは何も証明しない)。
+        manifest.join("vendor/susie-worker/mimageviewer-susie32.exe"),
     ];
     candidates.into_iter().find(|p| p.exists())
 }
@@ -417,4 +420,64 @@ fn sevenz_convert_includes_susie_extensions() {
         "MAG not carried into converted ZIP: {names:?}",
     );
     assert!(!names.iter().any(|n| n.ends_with("notes.txt")));
+}
+
+/// フルスクリーン表示の decode 入口が Susie に到達する。
+///
+/// バックログ 2.21 は「フルスクリーンは Susie に到達していない」という見立てで
+/// 記録された。根拠は `The file extension `."xxx"` was not recognized as an image
+/// format` というエラー文だが、これは fallback 連鎖の**最初の decoder** が返した
+/// エラーで、Susie を試したかどうかを何も語らない。ここで実プラグイン (ifpi.spi) と
+/// 実ファイルを使い、製品と同じ入口を通して確かめる。
+///
+/// `susie_loader::decode_file` を直接呼ぶ既存テストではこの経路を通らないので、
+/// 同じ疑いが再び立つのを防ぐ意味でも入口側から掛ける。
+#[test]
+fn fullscreen_decode_entry_reaches_susie_for_a_plugin_only_extension() {
+    let _guard = lock_susie_test();
+    setup_env();
+    if !testdata_ok() {
+        eprintln!("skip: missing worker exe or testdata");
+        return;
+    }
+    let Some(pi) = retro_path("pi", "C165.PI") else {
+        eprintln!("skip: missing C165.PI");
+        return;
+    };
+    susie_loader::reload(true, true);
+    assert!(
+        susie_loader::supports_extension("pi"),
+        "test precondition: the PI plugin must be loaded",
+    );
+
+    // 前提: PI は image クレートにも WIC にも読めない。Susie 抜きでは decode できない
+    // ことを先に確かめておかないと、このテストは何も証明しない。
+    assert!(
+        image::open(&pi).is_err(),
+        "PI must be undecodable without Susie for this test to mean anything",
+    );
+
+    let decoded = mimageviewer::canonical_image_loader::decode_canonical_image(
+        mimageviewer::canonical_image_loader::CanonicalImageSource::File {
+            path: &pi,
+            verified_bytes: None,
+        },
+        mimageviewer::canonical_image_loader::CanonicalDecodeOptions::fullscreen(
+            mimageviewer::canonical_image_loader::AnimationPolicy::FullFrames,
+        ),
+    )
+    .expect("fullscreen decode entry must fall back to Susie");
+
+    let mimageviewer::canonical_image_loader::CanonicalImageDecode::Static(still) = decoded else {
+        panic!("PI must decode as a still image");
+    };
+    assert!(
+        still.source_dims[0] > 0 && still.source_dims[1] > 0,
+        "decoded PI has no pixels: {:?}",
+        still.source_dims,
+    );
+    eprintln!(
+        "fullscreen entry decoded PI: {}x{}",
+        still.source_dims[0], still.source_dims[1]
+    );
 }

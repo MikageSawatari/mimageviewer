@@ -2699,3 +2699,134 @@ Rust 1.94.1 の標準ライブラリ実装も確認した。`stdout().lock()` �
 回転変更後も同じ generation から異なる画素を返さないよう、`/api/page` の resource key に加え、
 集約コレクションが使う旧 `/api/image` / `/api/image-info` の URL にも generation を含める。
 session 再取得時の session cache epoch による HTTP cache 分離も従来どおり併用する。
+
+## 15. 横長ページの左右分割 (§1.119) をリモートへ (2026-08-25)
+
+本体側の設計は [page-split-plan.md](page-split-plan.md)。本節は**端末側で何が変わるか**だけを決める。
+
+**動機**: 横長 2 ページの scan を縦持ちスマホで読む場面は、縦持ち強制 (`force_single_page`) が
+解こうとしている問題と同じで、分割の方が直接的である。本体より効く場面が多い。
+
+### 15.1 識別子を細分化する — 先に読み手を数える
+
+分割は「元ページ 1 枚 = 表示 2 回」なので、**既存の識別子を細分化する**。本体側では同じ形で
+2 回取りこぼした (描画の切り抜き / 連結読みの現在位置)。どちらも「元 index しか見ていない
+既存コードが、ページ全体の答えを返し続ける」形だった。**リモートでは先に数える。**
+
+`PageGroup.anchor` は doc comment のとおり「履歴 URL とグループ移動の identity」である。
+同じアドレスの group が 2 つ並ぶので、アドレスだけで解決している所は必ず先頭に吸われる。
+
+| 読み手 | 対応 |
+| --- | --- |
+| `pageGroupIndexForEntry(anchor)` ([app.js](../crates/remote-web/web/app.js)) | **左右まで見る。** ここが本体の `contains_idx` と同じ穴 |
+| `resolveReanchoredViewerPosition` | 上を通るので同時に直る |
+| 画像取得 (`/api/page` の resource key) | **元ページのまま。** 同じ画像の別の見え方なので、2 回取らない |
+| 履歴 URL | **元ページのまま。** どちら側を見ていたかは永続化しない (本体と同じ) |
+| 先読み / キャッシュ | 元ページ単位のまま。段が 2 つでも実体は 1 枚 |
+
+### 15.2 決めたこと
+
+- **識別子は `(anchor, slice)` の組**にする。`RemoteAddress` は変えない。アドレスに半分を
+  埋め込むと URL・画像要求・キャッシュまで巻き込むので、本体と同じく「元は正本、左右は
+  表示だけ」に揃える。
+- **group を作るのはサーバ側**。`build_remote_spread_page_groups` が既に landscape flags を
+  受け取ってグルーピングしているので、分割もそこで 2 group に展開する。端末側で縦横比を
+  読み直さない (判定が 2 か所に増える)。
+- `PageGroup` に `slice` を足す。`RemoteSpreadMode` に `SplitLtr` / `SplitRtl` を足し、
+  `PROTOCOL_VERSION` を上げる。launcher が core と remote を同梱するので版ずれは起きない。
+- **描画は端末側の CSS で切る。** 追加の転送もサーバ側の切り出しも要らない。
+  `viewerSpreadLayout` は分割 group では 1 ページとして扱い、幅を半分として計算する。
+- 縦持ち強制 (`force_single_page`) との関係: **分割中は縦持ち強制を適用しない。**
+  分割が既に「1 画面 1 ページ」を達成しているので、そこへ Single を重ねると分割が消える。
+- 本体側と同じく、**見開きとは排他**。連結読みはリモートに無いので対象外。
+
+### 15.3 回転との関係
+
+§14.22 は「本体は回転していると表示トリム bbox を採用しない。remote も同じ不変条件を適用する」
+と書いているが、**本体側は 2026-08-25 に変わった** ([page-split-plan.md](page-split-plan.md) §2)。
+矩形を fit 計算では表示空間、UV では元画像空間として二重に使っていたのが原因で、空間を分けた
+結果、保存回転では矩形を落とさなくなった (落とすのは自由回転だけ)。
+
+remote 側の表示トリムは今のところ従来どおり回転中は無効のままでよい (端末側に逆変換を
+持たない、という §14.22 の理由は生きている)。ただし**分割の crop はトリムとは別の経路**で
+渡すこと。トリムの生成境界へ相乗りさせると、回転したページで分割が消える。
+
+### 15.4 サーバ側 — 実装済み (2026-08-26、`83f1d5a7`)
+
+- `RemoteSpreadMode` に `SplitLtr` / `SplitRtl`、`PageGroup` に `slice`、
+  `PROTOCOL_VERSION` 51 → 52。
+- group は**本体と同じステップ列**から作る (`build_remote_spread_page_groups` が
+  `page_split::presentation_steps` を呼ぶ)。並べ替えの規則を wire 用に書き直さない。
+- 分割 group は必ず 1 ページ (見開きと排他)。
+- **縦持ち強制は分割へ適用しない** (`resolve_spread_state`)。
+- テスト: `a_landscape_page_becomes_two_remote_groups` (同じ index の group が 2 つ、
+  左→右 / 右→左で左右の順序だけが変わる)。
+
+### 15.5 端末側 — 実装済み (2026-08-26、`03ced000`)。**先に数えた読み手**
+
+位置の正本は `state.pageGroupIndex` で、**index 自体が左右を区別する** (段 1 と段 2)。
+したがって左右の状態を別に持つ必要はない。アドレスから index へ戻す所だけが左右を要る。
+
+| 場所 | 対応 |
+| --- | --- |
+| `setContainerPageGroups` | server の `slice` を group へ持ち越す |
+| `resolveReanchoredViewerPosition` → `pageGroupIndexForEntry` | **左右まで見る。**group 一覧が作り直された後に位置を戻す唯一の経路 |
+| `pageRenderContextForEntry` / grid から開く / 6058 / 6803 の `pageGroupIndexForEntry` | **そのままでよい。**「このページの最初の group」= 分割方向の最初の半分で、本体の着地規則と同じ |
+| `SpreadMode` 定数 + モード選択メニュー | 2 モードを追加。巡回 (`nextSpreadMode`) には**入れない** (本体の 1〜5 巡回と同じ扱い) |
+
+**描画は 3 か所で img のサイズを決めている** — `setLayout` (単ページ) /
+`refitVisibleContent` / decoded-unit の適用ループ。**本体側で同じ形を 2 回踏んでいる**
+(描き手が複数あり、1 か所を通し忘れた) ので、**1 つの helper に集約してから**手を入れる。
+
+切り抜きは DOM を組み替えず CSS で行う:
+
+- レイアウト入力の元幅を半分にする (分割 group のとき)
+- `object-fit: cover` + `object-position: left center` / `right center`
+
+box の縦横比が元画像のちょうど半分になるので `cover` は拡大せずぴったり収まる。追加の
+転送もサーバ側の切り出しも要らない。
+
+#### 実装の結果
+
+**描き手は 1 つになった。**`ImageViewer.applyImageBox` だけが img の寸法・`object-fit` ・
+`object-position` を書く。`setLayout` / `refitVisibleContent` / spread 適用ループは全て
+そこを通る (`grep "style.width = "` が 1 件になることで確認できる)。
+
+配置の計算は `viewerSlicedSpreadLayout` に集約した。**box を決める寸法と、取り寄せる
+画像の寸法が違う**のがこの関数の存在理由で、見せるのは半分でも届くのは元ページ 1 枚
+まるごとなので、要求幅まで半分にすると実質 1/4 の解像度になる。半分用に幅を割って
+から要求幅だけ元へ戻し、上限は割る前の値で守る。
+
+いま見ている半分は **img の `dataset.pageSlice`** が持つ。`refitVisibleContent` は
+向きの変更やバー開閉のたびに走るが、そのとき group を知らない。補正プレビューの
+差し替え (`replacePageBlobs`) が `cssText` と dataset を写すので、この置き場所なら
+プレビュー後も半分が保たれる。
+
+`dataset.sourceWidth/Height` には**元ページのままの寸法**を入れる。半分にした寸法を
+持たせると `refitVisibleContent` が読み直したときにもう一度半分になる。
+
+`decodedPageUnitKey` は左右で**共有したままにした**。同じページ画像なので、左半分から
+右半分へ進むときに decode 済みの img をそのまま使い回せる。単ページ経路は再利用時にも
+`setLayout` を必ず通るので、`object-position` は新しい半分へ更新される。
+
+`/api/page` の URL は画質プリセットから幅を決めており配置に依存しないので、左右で
+同じ resource key になる。**追加の転送は無い。**
+
+テスト: `viewerSlicedSpreadLayout` の要求幅 (半分の box なのに元ページ幅を要求する)、
+上限のクランプ、`pageSliceObjectPosition`、分割モードが巡回に入らないこと、
+`pageGroupIndexIn` が左右まで見ること・指定した半分がもう無ければページ側へ戻ること。
+
+#### 見開き設定の書き込み先は、要求した場所ではなく本体が開いた場所 (2026-08-26)
+
+ZIP の中身が 1 つのフォルダにまとまっていると、本体は `collapse_redundant` でその中へ
+降りる。**読み出しは降りた先をキーにするのに、端末は要求したアドレス (書庫そのもの) へ
+書いていた。**書いた行は二度と読まれないので、端末から見開き / 分割モードを変えても
+一切反映されない (書庫側の行が「1ページ表示」、内側の行が「横長分割」のまま固定)。
+
+端末は container 応答の `effective_address` を書き込み先に使う。文脈の同一性判定
+(`activeSpreadContextIdentity`) は従来どおり要求側で見る — 用途が違う。
+
+サーバ側で書き込みを解決し直す案は採らない。書き込みは UI スレッドで処理されるので、
+キーを求めるためだけに書庫を開くことになる。**サーバは既に解決結果を応答へ載せている**
+ので、端末がそれを使えばよい。ずれを見つけやすくするため、要求側と実効側でキーが別行に
+なることを ui.rs の試験で固定した。

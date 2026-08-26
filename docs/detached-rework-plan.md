@@ -50,9 +50,17 @@ BA-1 (rect 一致による HWND 誤同定) × BA-6 (placement 三重所有) の�
    R2 より前のステージでどうしても必要なら、追加前に ClaudeCode に相談する。
 4. **placement (位置・サイズ) の新しい保存先・同期経路を作らない** (提案書 BA-6)。
    既定サイズ拒否のようなヒューリスティック防波堤も新設しない。
-5. **時間窓 (debounce / grace / settle ms) で競合を吸収しない**。stale F12 再配送を
-   `GetAsyncKeyState` の物理状態で棄却した実例のように、**事実 (OS 状態・世代・
-   イベント) で判定**する。時間窓は「頻度を下げるだけでループを消さない」。
+5. **時間窓 (debounce / grace / settle ms) で競合を吸収しない**。判定は、問うている事柄と
+   **同じ時間・所有境界の事実**で行う (世代、イベント生成時の情報、必要な場合の現在 OS 状態)。
+   `GetAsyncKeyState` が示す**処理時点の current level を、既に配送された離散 `KeyDown` の
+   fresh / stale identity の代用にしてはならない**。native F12 では、旧 HWND 由来 event を
+   per-window epoch / generation で、hold による repeat を `WM_KEYDOWN` の previous-key-state
+   (lParam bit 30) で判定し、App 側に追加の時間窓・物理 level proxy・generation guard を置かない。
+   時間窓は「頻度を下げるだけでループを消さない」。
+
+   > ⚠ **旧版はこの規則の好例として「stale F12 再配送を `GetAsyncKeyState` の物理状態で
+   > 棄却した実例」を挙げていたが、2026-08-26 に実機ログで反証されて撤回した**。
+   > その probe は本物の連打を stale と誤分類していた (backlog §1.124)。一般原則は維持される。
 6. **実機で新症状が出ても、その場でヒューリスティックを入れない**。症状を BA 番号
    (提案書 §2) に対応付けて報告し、どのステージで根治されるかを確認してから動く。
 7. **ステージの指示書に書かれていないファイル・機構を「ついでに」直さない**。
@@ -195,7 +203,7 @@ BA-1 (rect 一致による HWND 誤同定) × BA-6 (placement 三重所有) の�
 
 ## 9. 進捗記録
 
-### 9.1 現況 (唯一の進捗表、2026-07-26 コード確認)
+### 9.1 現況 (唯一の進捗表、2026-07-26 コード確認、R2e 分を 2026-08-25 に反映)
 
 この表だけを現行ステージ判定に使う。後続のコミット・検収記録は、各時点の実装履歴であり、
 現在の完了判定ではない。コードから実装を確認できた範囲を記載し、7 月 24〜26 日分を含む
@@ -206,7 +214,7 @@ BA-1 (rect 一致による HWND 誤同定) × BA-6 (placement 三重所有) の�
 | R0 | **完了** | geometry 非依存の生成前後 HWND registry 方式を採用済み |
 | R1 | **完了** | detached host HWND は registry 所有へ移行済み。キー入力 subclass の rect 探索は R1 の対象外として残り、BA-1 の後続課題 |
 | R2a | **完了** | `DetachedWindowRuntime` と manager を導入済み |
-| R2b | **部分完了** | Runtime routing と `ParkedLive` は実装済み。HWND 再生成・差分登録・watcher repair は `ParkedLive` を保持し、OS host 状態だけで live media state を降格させない。純粋 reducer、合法遷移制約、散在 pending/flag の typed state 集約は未完 |
+| R2b | **部分完了 (R2e で 1 軸閉じた)** | Runtime routing と `ParkedLive` は実装済み。HWND 再生成・差分登録・watcher repair は `ParkedLive` を保持し、OS host 状態だけで live media state を降格させない。**所有の型化 (R2e、2026-08-25 完了) で、bundle の保管場所は registry に一本化され、mount / build / fork / retire / promote の transaction でしか遷移できない**。残るのは **純粋 reducer** と、**所有以外の散在 pending / flag の typed 集約** |
 | R2c | **完了** | placement は runtime 所有、settings は seed |
 | R2d | **完了** | live-park と active 復帰の直列化を実装済み |
 | R3 | **実質完了** | active session の `window_id` を ViewportId 決定で最優先し、passive も window_id 由来 |
@@ -332,7 +340,842 @@ R2b の残件 (純粋 reducer / 合法遷移制約 / 散在 pending・flag の t
 第 2 版 (phase + slot map + 復元スタック) にも BLOCKER が 4 件残っている (同書 §6)。
 所有の transaction が無い / `window_id → ViewerContextId` の対応表が無い /
 ステージ分割がコンパイルできない切り方になっている / 「組み立て中は identity が無い」が誤り。
-**R2e に着手する前に第 3 版を書くこと。**
+
+**第 3 版を書いた (2026-08-23、branch `r2e-ownership`、worktree `C:\home\mimageviewer-r2e`)。
+Codex レビュー 6 巡で BLOCKER 0 に到達。**正本は同じファイル
+[briefs/detached-r2e-ownership-design.md](briefs/detached-r2e-ownership-design.md)。要点:
+
+- 診断は 1 つ ——「1 個の保管場所の値の有無で、identity 以外の軸 (所在 / 駆動者 / 時制) を
+  答えている」。**修理は 3 箇所に分かれる**: 所在 = R2e、右ドラッグの producer = R2f、
+  placement の現在/復元ジオメトリ = レーン A-0 (§1.4)。R2e に 3 件全部を持ち込まない。
+- 保管を 1 箇所に統合する。`active_detached_viewer_context` と `paused_bundle` の往復を
+  registry の slot 1 種類にし、active か parked かは `DetachedWindowRuntime.state` だけが持つ。
+- `ViewerContextId` に `Main` 変種を置かない (`Main` は identity ではなく binding)。
+- 所有を動かす操作は mount / build / fork / retire / promote の 5 transaction だけ。
+  生 bundle を返す API を 1 つも置かない。
+- binding は registry 所有で `bind` / `unbind` / `transfer` の 3 本。build 中の binding は
+  予約として積み、commit と同時にだけ公開する。
+- 完了確認の第一の門は **Rust の可視性** (型を registry モジュールへ移してフィールドを private に
+  すると、生成 / destructure / 生 swap がモジュール外で書けなくなる)。syn 監査 (A1〜A7) は
+  可視性で表せない残りだけを見る。塞げない穴 (マクロ展開 / ローカル関数エイリアス /
+  別モジュール再エクスポート / 意味的到達可能性) は明記した。
+- ステージは ① 抽象データ構造 → ②-pre 手書き mount の helper 化 → ②-a 終端 digest →
+  ②-b 型の移設 → ②-c accessor と監査 → **②-d 保管・binding・transaction の一括切替 (1 コミット)**
+  → ②-e 完全 private と allowlist → ③ 巡回 → ④ 非同期 identity。各段の終了時に
+  コンパイルが通る状態を明記した。
+
+レビューで訂正した事実 (実装時に踏まないこと):
+
+- **folder-nav reopen (Ctrl+↑↓) は「同じ窓・同じ context・新しいフォルダ」**。
+  `close_fullscreen_for_folder_nav_reopen` ([app.rs:52211](../src/app.rs:52211)) は
+  マウント中の context を保つ。window_id 再利用は ViewportId を安定させるためで、
+  context の差し替えではない。
+- **生きた context 同士で窓が移る経路は実在する**: live-media fork
+  ([app.rs:41868](../src/app.rs:41868))。`transfer_window_binding` が要る。
+- **build transaction は 2 本ある**: `start_active_detached_book_context_with_start` と
+  `open_bookmark_media_in_detached_context` ([startup_ops.rs:608](../src/app/startup_ops.rs:608))。
+  後者には正常な失敗経路があるので `BuildOutcome::Abort` が要る。
+- **App の投影は空にできない** (225 個の実フィールドで `Option` ではない)。
+  「取り出す」と「空を据える」は 1 動作。
+- abort の drop は **main を戻した後** ([startup_ops.rs:652](../src/app/startup_ops.rs:652)〜654)。
+- `ViewerContextBundle` は **225 フィールド**。tests.rs 側の参照は 294 行。
+
+ステージ①の実装指示書は
+[detached-rework-stage-r2e-1.md](detached-rework-stage-r2e-1.md) (2026-08-23)。
+`ContextTable<P>` (payload ジェネリックの状態機械) を 1 モジュール追加するだけで、
+production は `mod` 宣言 1 行しか変わらない。**モジュール外への公開は 0 件**
+(②-e で入れる監査 A4 の allowlist が空から始まる)。実機 smoke 不要。
+
+**ステージ① 完了 (2026-08-23、実装 = Codex / 検収 = ClaudeCode)。**
+`src/app/viewer_context_registry.rs` (1,400 行弱) + `src/app.rs` の `mod` 宣言 1 行のみ。
+挙動不変 (誰からも呼ばれない)。registry テスト 22 本、ライブラリ全体 6224 本が緑、
+`cargo fmt --check` clean、公開項目 0、非 test cfg 0、既存テストファイルの差分ゼロ。
+
+検収で見つかった **BLOCKER 2 件** (いずれも修正済み。②以降で同じ罠を踏まないこと):
+
+1. **`main` が指す context を retire できてしまい I4 が回復不能に壊れた。**
+   fork → 別 context を mount → 旧 main が `AtRest` → `begin_retire(main)` が通る。
+   以後 `main()` は Retired な id を指し、mount も promote もできない。
+   → `RetireError::IsMain` で拒否する。**main は `promote` で置き換えるもので、破棄しない。**
+   「`main` が非 Option だから I4 は守られる」は**誤り**だった (名前が常にあることと、
+   指す先が存在することは別)。
+2. **op ベクタのテストが fork の policy を固定していなかった。**
+   `plan_fork(LiveMediaPark)` が `ForkProjectionIntoTransient(MaterializedStillOpen)` を
+   返す実装でも全テストが通った。②-d では policy が 225 フィールドの move / clone 分けを
+   決めるので、間違えると静かに壊れる。→ 両 policy の完全一致 assert + 派生 payload の検証。
+
+**②-d への申し送り**: ①の failpoint sweep は **op と op の境目**にしか panic を注入しない。
+op の内部で binding を早く公開して正常終了までに戻す実装は検出できない。production の
+`ReplaceProjectionWithFreshEmpty` / `RestoreProjectionAndDropDisplacedEmpty` は
+`swap_viewer_context_bundle` を通り、その中で rating 同期と visible index 再構築が走る
+= **op の内部で panic し得る**。②-d では swap の内側にも failpoint を刺すこと。
+
+**ステージ②-pre 完了 (2026-08-24、実装 = Codex / 検収 = ClaudeCode)。実機 smoke 待ち。**
+指示書 [detached-rework-stage-r2e-2pre.md](detached-rework-stage-r2e-2pre.md)、
+憲法 §2 の合意は §11 の 2026-08-23 の項。手書き mount 18 箇所 (active 9 / parked 9) を
+`with_active_detached_viewer_context` と新設 `with_paused_detached_context` の 2 本へ集約。
+`src/app.rs` は正味 19 行減、`src/app/tests.rs` は 592 行追加・**削除ゼロ**、
+ライブラリ全体 6235 本が緑。mount inventory は active take 4 件 / parked take 5 件
+(= helper 2 本 + 変換しない 7 箇所) で手書きは 0。
+
+検収で見つかった **P1 1 件** (修正済み):
+
+- **parked-live の入力 marker が panic でリークした。** VST3 の deferred consume は
+  marker を立てて実行し**後で**戻していたので、consume が panic すると helper が投影と
+  bundle を復元する一方 marker は `Some(id)` のまま残り、**「main がマウント中なのに
+  marker は parked 窓を指す」**という旧コードには作れない状態になった
+  (旧コードは panic 時に parked 投影をマウントしたまま落ちるので両者は一致していた)。
+  → 呼び出し元側で `catch_unwind` → marker 復元 → `resume_unwind`。
+  **helper は marker 非関与のまま** (§11 の合意どおり)。
+
+**「落ちないテスト」を 4 件強化した**(いずれもこのステージ特有の誤実装を通してしまう形だった):
+
+- 窓が closure 内で閉じられるテストに**後続の兄弟窓**を足した (無いと、id ではなく
+  保存した index で戻す誤実装が通る)
+- 累積値の不変テストを **true 始まり**にした (false 始まりだと「代入で累積を潰す」誤りを検出できない)
+- 「既にマウント中の context も処理される」を、**どの context に何回走ったかの列を完全一致で
+  検証**する形にした (「1 回以上」だと parked ループを丸ごと飛ばす実装も二重実行も通る)
+- panic 経路そのもののテストが無かったので追加した
+
+**②-d への申し送り** (設計 §7 ②-d に記録):
+現行の全 context 操作は「マウント中を先に処理 → その後 parked を巡回」で、マウント中のものは
+巡回に含まれない。②-d の統一 mount は「既にマウント済みなら swap せず `f` を実行」するので、
+**巡回側にマウント中の id が含まれると `f` が 2 回走る**。上の exactly-once テストが
+それを捕まえるので、②-d で弱めないこと。ほかに、②-pre が holder 側に残した前置きフィルタ
+2 箇所 (vst3 の pending 判定 / rename 述語) を `ContextRef` 経由へ移すこと。
+
+**実機 smoke (2026-08-24) で挙がった 2 件** — どちらも②-pre の退行ではない
+(`release_viewer_surfaces_for_removed_paths` も `stale_before_apply` も
+`git diff 488e00f0..HEAD -- src/app.rs` に 1 行も出てこない):
+
+1. **ファイル名変更で開いていた PDF ウィンドウが閉じる → 仕様として確認済み (利用者判断 2026-08-24)。**
+   `poll_rename_pending` ([ui_dialogs/rename_item.rs:139](../src/ui_dialogs/rename_item.rs:139)) が
+   `release_viewer_surfaces_for_removed_paths(.., "rename_old_path")` を呼び、旧パスを表示している
+   viewer を active / parked とも閉じる ([app.rs:27709](../src/app.rs:27709))。
+   **新パスで開き直す形には変えない。** 動画では開き直しても再生が一度止まるので、
+   「移動されたら閉じる」方が動きとして自然、という判断。
+   ⚠ **将来これを「症状」と誤認して開き直しを実装しないこと。**
+2. **PDF のレーティングが import 後に右パネルへ反映されない** → **表示側の既存問題だった。**
+   import も refresh も正常で、**グリッドはコンテナキー、右パネルは現在ページのキー**を読んでいて
+   どちらも正しい値を出していた。パネルにコンテナ★を出す行は存在したが、対象を
+   **タグ行のラベル文字列 `"フォルダ"` を探して**決めていたため、PDF ページ (ラベル `None`) では
+   行が見つからず出なかった。→ `current_container_rating_target()` を正にする形へ修正 (fa731724)。
+   ついでに ZIP 内ディレクトリの合成キー誤読と、コンテナ★書き込みの種別 (`Folder` 固定) と
+   Undo 欠落も直った。
+3. **インポートで別ウィンドウの動画が停止し、窓が真っ黒になる** → **既存の重大な不具合だった**
+   (導入は 2026-07-23 の `c169a081`)。代表サムネの更新が **`load_folder()` = ナビゲーションの
+   プリミティブ**を呼んでおり、`start_loading_items_inner` → `close_fullscreen` まで走っていた。
+   影響 context ごとに 1 回走るので、parked-live の動画はプレイヤーがキャッシュから落ちて
+   presenter が停止し、アクティブな静止画 context は静止 snapshot 化されて次フレームで
+   bundle が drop された (detached 窓が main 由来の `items_gen` を持っていたのはこれ)。
+   → キャッシュ更新をナビゲーションで書くのをやめ、影響サムネの evict / 不要 `#pin:` 行の削除 /
+   video pin の再 seed / context 所有の worker channel 交換に置き換えた (b3ea74bb)。
+4. **★の Ctrl+Z がパネルから効かない** → **同じ書き込みなのに操作元で挙動が違っていた。**
+   フルスクリーンのキーと動画 HUD は自分の呼び出し側で Undo を記録していたが、パネルと
+   音楽パネルは記録していなかった。→ 記録を書き込みと同じ場所 (`set_rating`) へ移し、
+   呼び出し側のコピー 2 つを削除 (6316102c)。グリッド一括は「操作 1 回 = 1 エントリ」を維持。
+
+**実機 smoke 全項目グリーン (利用者確認 2026-08-24)。②-pre 完了。**
+
+⚠ 上の 2〜4 はいずれも**②-pre の退行ではない**が、**レーンの外**の修正である。
+2 と 4 は表示・Undo の一貫性、3 は「ナビゲーションのプリミティブをキャッシュ更新に再利用していた」
+という R2e と同じ形の構造問題。3 の教訓は②-d に効く: **所有権を動かす経路を、別の目的で
+呼び直さない。**
+
+**ステージ②-a も完了** (2026-08-24、`3c435070`、指示書
+[detached-rework-stage-r2e-2a.md](detached-rework-stage-r2e-2a.md))。
+終端 2 本 — ブックマーク照合と メディア teardown — が生 bundle を外へ出さなくなった。
+`ClosedBookmarkSummary` が reconcile の読む 4 値 + PDF パスワードの bool を運び、
+teardown は窓ごとに plan → normalize clear → drop してから App-global の後始末をする。
+**保管も挙動も変えていない。** lib テスト 6251 件緑。
+
+指示書で「推測せず確かめろ」と書いた 2 点の結論:
+
+- **PDF パスワードの畳みが `detached_viewport_finalized` 側に無いのは意図的。**
+  両分岐とも `should_drop` の内側にあり、`should_drop` は
+  `active_detached_transition_outstanding()` が偽であることを要求する。この述語は
+  **detached bundle をマウントした状態で評価される**うえ `pdf_password_request.is_some()` を
+  含むので、そこへ来る context は request を持ち得ない。畳みが効くのは gate の無い
+  明示 close 経路 (`close_current_active_detached_viewer_context`) の方である。
+- **teardown plan の入力は context を跨がない。** よって 2 窓目の plan を 1 窓目の drop 後に
+  作っても値は同じ。加えて、App-global の後始末より前に走るようになった
+  `normalize_ui_states` / `normalize_auto_scan_suppressed` の clear は
+  **`Copy` の素データで `Drop` を持たない**ため観測不能で、後始末側は plans と main 自身の
+  state しか読まない (`cancel_viewer_context_teardown_normalize` /
+  `clear_music_state_after_viewer_context_teardown` を確認済み)。
+
+⚠ **検収で 1 件差し戻した。指示書の要求が間違っていた。**
+指示書に「追加テストは現行コードで必ず落ちること」と書いたが、**この段は挙動不変なので
+挙動テストは原理的に落ちない**。実装側はそれを `include_str!("../app.rs").contains(...)` の
+**ソース文字列 assertion 3 本**で満たしていた。これは (1) 完了判定を grep でやらないという
+設計 §6 に反し、(2) 目的の文字列が消えた瞬間から永久に真になって何も守らなくなり、
+(3) ②-b / ②-d で当の関数が移動すると腐る。3 本とも削除し、うち 1 本が守っていた
+「窓が bundle を持たないとき」のテストは**混在ケース** (bundle 無しの窓を先頭に置く) へ
+書き直した。
+
+**挙動不変の段では「旧コードで落ちること」ではなく「間違った新コードで落ちること」を
+要求する。** 今回はそれを mutation で実証した:
+
+| 変異 | 落ちたテスト |
+| --- | --- |
+| bundle が無い窓で `continue` せず `break` する | `media_teardown_skips_a_bundleless_window_without_abandoning_the_rest` (新規) |
+| tile-companion / mode-switch の判定を take の後に動かす | `parked_close_clears_bundle_owned_tile_companion_without_pending` (既存) |
+
+2 つ目は、§3.3 の「判定をループより前から動かすな」を**既存テストが既に守っていた**ことの
+確認でもある。
+
+**ステージ②-b も完了** (2026-08-24、`fd121be3`、指示書
+[detached-rework-stage-r2e-2b.md](detached-rework-stage-r2e-2b.md))。
+`ViewerContextBundle` (225 フィールド) / `Drop` / `impl` 3 メソッド /
+`swap_viewer_context_bundle` / `split_current_context_preserving_main_grid` の 5 ブロック
+1602 行が `src/app/viewer_context_registry.rs` へ移った。**純粋な移設**で、5 ブロックの
+SHA-256 が可視性接頭辞を除いて一致することを実装側が確認している。
+lib テスト 6251 件緑 (件数不変)、`src/app/tests.rs` は無変更。
+
+- **実効可視性は変わっていない。** 移設前は app.rs 内の private = `app` とその子孫から見える。
+  移設後は `pub(in crate::app)` = 同じ範囲。**広げていない**ことを検収で確認済み
+  (移設領域に `pub` / `pub(crate)` が 1 つも無い)。
+- 素直に移すと壊れる 2 点を指示書で先に潰した:
+  **①`impl App` のメソッドの private は「`impl` を書いたモジュール」の private** なので、
+  移設した 2 プリミティブには `pub(in crate::app)` が要る。
+  **②`#![allow(dead_code)]` はファイル全体に効く**ので、そのままだと production 型にもかかり
+  未使用フィールドの検出が止まる。stage ① の非テスト 13 項目への個別付与に置き換えた
+  (②-d で registry が本番に繋がったら全部外す)。
+- ②-e で弾けるようになるのはこの移設の結果である。今はまだフィールドが
+  `pub(in crate::app)` なので**何も弾けていない**。
+
+**設計の②-c は 3 つに割った。** 「accessor 移行」と「監査ツール導入」は共有するものが無く、
+accessor 側も**読みと書きで性質が違う**ため。②-c1 (読み) / ②-c1b (書き) / ②-c2 (監査ツール)。
+
+**ステージ②-c1 完了** (2026-08-25、`2918e639`、指示書
+[detached-rework-stage-r2e-2c1.md](detached-rework-stage-r2e-2c1.md))。
+lib テスト 6251 件緑 (件数不変)。
+
+### 対象を数えた — 見積もりを使わなかった
+
+設計 B-3 の「~26 種」を使わず、**225 フィールドを一時的に private にして
+`cargo check -p mimageviewer --bin mimageviewer-core` を通した**。設計 §6.1 の完了判定は
+この性質そのものなので、ここで一度使って確かめた意味もある。
+
+| | 箇所 |
+| --- | --- |
+| 外部アクセス 合計 | 164 |
+| うち `split_materialized_physical_context_for_independent_still_open` の中 | 31 |
+| うち **書き** | 27 |
+| **読み (②-c1 の対象)** | **106** (21 フィールド) |
+
+⚠ **見積もりとの差より重要だったのは、27 箇所が書きだったこと。** 書きに場当たりで setter を
+生やすのは設計 §6.2 が名指しする「公開面が静かに育つ」に当たるので、②-c1b へ回した。
+
+### ②-c1 で分かったこと
+
+- **`ViewerSession` には mounted 側の実体が無い。** App は `last_viewer_sync_stamp` /
+  `detached_viewer_window_id` / `detached_viewer_independent_active` を**別々のミラー
+  フィールド**として持ち、`ViewerSession::swap_with_mounted` が対応付けている。よって
+  `ContextRef` からは `&ViewerSession` を返せず、**成分 3 つの accessor に分解**した。
+  「mounted 側は bundle の逐語ミラー」という素朴な前提が成り立たない実例。
+- `contains_video` の 2 本は **`self.` と `bundle.` の違いだけで一字一句同じ**だった。
+  3 経路が 1 本になった。`is_music_consumer` の片方は元から delegate だけの wrapper。
+
+### 検収で 1 件差し戻した — `impl Into<ContextRef>`
+
+helper 3 本が `impl Into<ContextRef<'a>>` を取り、`From<&ViewerContextBundle> for ContextRef`
+経由で `&bundle` をそのまま渡せる形になっていた。**`src/app/tests.rs` を無変更にする**という
+指示書の条件を満たすためだったが、
+① 生の `&ViewerContextBundle` が helper 境界を**暗黙に**越え続ける、
+② 設計 §6.3 の A4 が「ジェネリック境界と trait 実装は可視性だけ見る監査を素通りする」と
+名指ししている形そのもの、の 2 点で採らなかった。helper は `ContextRef<'_>` を直接取り、
+テスト 6 箇所が `ContextRef::at_rest(...)` と明示するようにした。
+**「テストを触らない」は「API の変化をテストで糊塗しない」ための代理条件**であって、
+読み口を明示するための 6 行の書き換えはそれに当たらない。
+
+### ⚠ 数が合っても中身は変わり得る
+
+完了判定を「private 化したとき残る E0616 がちょうど 27」としたが、**27 のまま中身が入れ替わって
+いた**。私の分類器が `bundle.viewer_session.activate_independent_detached(..)` のような
+「フィールド経由の mutating メソッド呼び出し」を読みと誤判定していたためで、実装側は
+それらに狭い名前付き操作を足し (`activate_independent_detached_session` /
+`pause_animations_for_remote_session` / `adopt_bookmark_media_open_pending`)、
+代わりに catalogue 済みだった `details_order.clear()` を `clear_details_order()` へ変えていた。
+差し引き 27 のまま。**リストを突き合わせるまで気づけなかった。数だけの門は弱い。**
+
+### ②-c1b の材料 (②-c1 完了後の実測、`2918e639`)
+
+残る 27 箇所。**この 4 本は既に②-c1 で名前付き操作になっている**ので、②-c1b は同じ形に揃える:
+`clear_details_order` / `activate_independent_detached_session` /
+`pause_animations_for_remote_session` / `adopt_bookmark_media_open_pending`。
+
+| # | 束 | 箇所 (`2918e639`) |
+| --- | --- | --- |
+| W1 | tag prewarm 起動 | app.rs:27289 / 27296 (同じ代入が 2 箇所) |
+| W2 | normalize state の破棄 | app.rs:38495 / 38496 (設計 §4.4 が `clear_normalize_state()` と命名済み) |
+| W3 | auto-open intent の解除 | app.rs:39210〜39213 (4 フラグ) / 40105〜40106 (**同じ 4 つのうち 2 つだけ**) |
+| W4 | detached physical への読み替え | app.rs:40983〜41000 (9 箇所。`details_order` は②-c1 で分離済みなので**畳み直すこと**) |
+| W5 | index を指し直す | app.rs:41210〜41217 (7 箇所。`viewer_session` への直接代入を含む) |
+| W6 | bookmark_view_state の設定 | startup_ops.rs:591 |
+
+⚠ **W3 の非対称は②-c1b で結論を出す。** 意図的な部分解除か、同型経路の直し残しか。
+
+**ステージ②-c1b 完了** (2026-08-25、`2894926c`、指示書
+[detached-rework-stage-r2e-2c1b.md](detached-rework-stage-r2e-2c1b.md))。
+書き 27 箇所が registry モジュール内の名前付き操作になった。lib テスト 6251 件緑 (件数不変)。
+
+### 到達点: 非テストのビルドは 225 フィールド private で通る
+
+`ViewerContextBundle` の全 225 フィールドを private にして
+`cargo check -p mimageviewer --bin mimageviewer-core` が **E0616 ゼロ・exit 0**。
+設計 §6.1 が「モジュールの外では struct literal も destructure も `empty()` も
+言語仕様として書けなくなる」と言っている状態に、**非テスト面では既に到達している**。
+残るのは `src/app/tests.rs` からの直接アクセスだけで、それが②-e (`test_access`) の仕事。
+
+主な操作: `ensure_tag_prewarm_started` / `clear_normalize_state` (設計 §4.4 の命名) /
+`activate_parked_live_as_independent_detached` / `activate_passive_as_independent_detached` /
+`become_independent_detached_viewer` / `retarget_bookmark_media_open` /
+`split_materialized_physical_context_for_detached_scope` (fork + 絞り込みを 1 本に)。
+
+**ステージ②-d 実装完了・実機 smoke 待ち (2026-08-25、`bf391e6a`。指示書
+[detached-rework-stage-r2e-2d.md](detached-rework-stage-r2e-2d.md))。**
+`App::active_detached_viewer_context` と `DetachedImageWindowSnapshot::paused_bundle` を削除し、
+production の唯一の保管先を `ViewerContextRegistry` の slot に切り替えた。registry は
+`ViewerContextId` / `ContextResidence`、window↔context の双方向 binding、mount / build / fork /
+retire / promote の 5 transaction を所有する。build の binding は commit まで公開せず、
+live-media fork は binding を旧 main から新 context へ transfer する。
+
+- §6.5 の 3 stopgap は `locate_window_context()` と `ContextResidence` の問い合わせへ置換した。
+  active / parked は保管場所ではなく `DetachedWindowRuntime.state` が引き続き表す。
+- 全 context 操作は mounted id を先に 1 回処理し、同じ id を registry 巡回から除外する。
+  `all_context_clear_processes_a_paused_context_that_is_already_mounted` の完全一致列は維持した。
+- VST3 と rename の前置きフィルタは `ContextRef` へ移した。VST3 consume の marker 復元は
+  呼び出し元の `catch_unwind` 境界に残した。
+- swap 内部 failpoint を production payload の build abort / panic unwind に対して追加し、
+  I8 (commit 前の binding 非公開) を確認した。`RetireError::IsMain` と
+  `highest_reserved_serial` による Retired / Unknown の区別も維持している。
+- 4 one-shot の解除は registry 内の activate 操作へ集約した。ただし mounted 側に
+  `ViewerSession` の逐語実体があるとは扱わず、App の 3 ミラーは従来どおり個別に復元する。
+- 監査 A1 / A5 を有効化した。A1 は bundle 型の registry 外流出、A5 は旧 2 識別子の復活を
+  fixture で検出する。production 監査は既知の `activate_snapshot` 1 件だけを維持している。
+- library は 6285 tests / exit 0、audit は 25 tests / exit 0。実機では F12 still の
+  always-new / reuse、PDF/ZIP の park・resume と folder-nav、video/audio の live park・resume と
+  main context change promote、複数窓の順不同 close、右ドラッグ / keep-alive、tray / remote、
+  native presenter の HWND / focus / z-order を確認する。
+
+### ②-d 回帰修正と dead API 清算 (2026-08-25)
+
+detached 動画の host 準備前に作った `NativeVideoOpenPending` が再開しない回帰を修正した。
+pending は enqueue 時の `native_video_parked_live_input_window_id` を owner として持ち、poll は
+その値を現在の marker と比較していた。②-d で marker の set / restore が registry mount の
+closure 内へ移ったため、**同じ viewer context のままでも marker の寿命だけが先に終わる**。
+この場合 owner gate は deadline 判定と repaint 要求より前で return し、host が登録された後も
+pending が永久に残った。marker は入力 routing の一時 policy であって context identity ではない。
+
+修正後の regular-open pending は enqueue 時の `ViewerContextId` を持つ。App の投影が Building
+中でも予約済み ID を取得でき、AtRest / Mounted の移動や window binding の変化では owner を
+書き換えない。live-media fork で payload が新 context へ分岐する transaction だけが pending
+owner も同時に transfer する。poll は現在 App に投影された context ID と照合する。host 準備判定
+自体は従来どおり、登録済み HWND に対する `GetClientRect` の正サイズで成立する。
+
+回帰テストは marker がある状態で defer し、marker を復元した次 frame で host 未準備の待機を
+確認した後、同じ context を再 mount して host 準備済みにすると resume callback が実行され、
+pending が消えるところまで固定する。pending の生成だけを確認するテストではない。
+
+②-d が残した dead item 16 個 (warning group 11 件) も清算した。旧 bundle-side の bookmark retarget / tag prewarm /
+remote animation pause / detached activation / promote helper は、実際に
+`with_viewer_context` から呼ばれる mounted-side 実装へ置換済みだったため削除した。
+window binding の公開 transfer wrapper 2 本は、`finish_fork` が同じ `transfer_core` を ownership
+transaction 内で直接呼ぶため削除した。未使用の汎用巡回 helper、read accessor 2 本、
+`ContextMut` の未使用 ID も削除した。
+
+`ViewerContextBundle::pause_background_work_keep_current_frame` については、失われた挙動ではなかった。
+②-d の同じ差分が同内容の `App::pause_mounted_background_work_keep_current_frame` を追加し、
+`pause_current_active_viewer_context` の mount closure 内で snapshot 作成直後・AtRest へ戻す前に
+呼んでいる。final-AI cancellation を含む既存の実 park テストもこの経路を通る。したがって未使用の
+bundle 版は重複として削除し、その同等性テストは mounted-side 実装へ移した。
+
+### 検収 (ClaudeCode、2026-08-25)
+
+**テストが減っていないことを最優先で確認した** (この段は `src/app/tests.rs` が
+956 追加 / 1238 削除 = 差し引き 282 行減っているため)。
+
+- `src/app/tests.rs` の `#[test]` 数は **1399 → 1399 で不変**。消えた 6 つの識別子は
+  helper 3 つ (`paused_test_window` / `parked_bundle_snapshot` /
+  `passive_right_drag_image_bundle`) と、**改名された test 3 つ**だった:
+  `paused_detached_mount_skips_missing_bundle_and_window` →
+  `window_mount_rejects_unbound_snapshot_and_unknown_window`、
+  `paused_detached_mount_drops_bundle_when_target_closes_inside_closure` →
+  `window_mount_round_trips_context_when_snapshot_vector_changes_inside_closure`、
+  `exit_resume_harvest_reads_active_and_paused_bundles_without_dropping_them` →
+  `..._active_and_parked_contexts_without_dropping_them`。
+  行数減はテスト本体ではなく**セットアップの共通化** (直書き 4 行 →
+  `push_window_context_for_test` 1 行) による。
+  ⚠ 2 番目の改名は**意味も変わっている**: 窓の snapshot が消えても context は registry に
+  残るので drop されない。これは②-d の目的そのものであって退行ではない。
+- 保護指定した 2 本は健在。`all_context_clear_processes_a_paused_context_that_is_already_mounted`
+  の**完全一致列の assert は diff に現れない = 無変更**。差分は setup の移行のみ。
+- test helper と failpoint は**すべて `#[cfg(all(test, windows))]`** で、production に costs が無い。
+  failpoint は**本物の `swap_viewer_context_bundle` の内側** (rating 同期と
+  visible index 再構築の直後) に刺さっている。
+- 独立実行: `cargo fmt --check` 無出力 / `cargo run -p viewer_context_audit` exit 0 (既知の指摘
+  1 件のまま) / `cargo test -p viewer_context_audit` 25 件 / **`rg "active_detached_viewer_context|paused_bundle"
+  src/ -g "!viewer_context_registry.rs"` が 0 件** / `cargo test -p mimageviewer --lib` **6258 passed**。
+- registry モジュールの `#[test]` は 22 → 29 (+7)。lib 件数 6251 → 6258 と一致する。
+
+### 実機 smoke 結果 (2026-08-25)
+
+| シナリオ | 結果 |
+| --- | --- |
+| 1 複数ウィンドウ (always-new) の静止画・順不同 close | **OK** |
+| 2 フル機能ウィンドウの窓再利用・フォルダ移動 | **OK** |
+| 3 PDF を別ウィンドウで | **OK** |
+| 4 detached 動画の再生 | **OK** (下の退行を直した後) |
+| 7 複数ウィンドウで PDF / 動画を開閉 | **OK** |
+| 5 VST3 | **OK** |
+| 6 parked 右ドラッグ (非アクティブ窓へのリング) | **OK** |
+| 8 マルチモニター (窓移動 / 最小化・復元) | **OK** |
+
+**②-d の実機 smoke は完了 (2026-08-25)。**
+
+- 8 の「VST GUI の開閉」は**確認対象外だった**。in-window モードは設計上 VST を対象外にしており、
+  フルスクリーン以外へ切り替える時点で VST GUI を自動的に隠す
+  ([native_video.rs](../src/app/native_video.rs) の placement 切替、
+  「in-window モードは VST を対象外にするため」のコメント)。利用者の観測どおりで正常。
+- smoke 中に F12 の placement 往復が遅いという指摘が出たが、**利用者が v3.2.0 と v3.0.0
+  ポータブルでも同じだと確認した既存の問題**。R2e は presenter 本体を 1 行も触っていない。
+  backlog [next-release-backlog.md](next-release-backlog.md) **§1.116** に、
+  共有出力プール枯渇のログ証拠付きで積んだ。
+
+### ステージ②-e 完了: bundle の言語境界と audit A4 / A6 (2026-08-25)
+
+`ViewerContextBundle` の 225 フィールドをすべて module private にし、`empty()` /
+`set_items_generation()` / `clear_normalize_state()` も registry module private にした。
+registry 外では struct literal、destructure、field access、`empty()` 呼び出しを Rust の可視性規則が
+拒否する。production / detached の挙動は変えていない。
+
+- `src/app/tests.rs` の bundle 構築 103 箇所と field write 約 230 箇所は、context を一時 mount して
+  `&mut App` を受け取る closure setup へ移した。読み取り assertion も mounted App 上で行う。
+  assertion マクロ数・期待値・message は変更していない。
+- bundle を引数／戻り値にする test helper は削除した。`build_window_context_for_test` は
+  `install_window_context_for_test` の closure 版後継であり、snapshot を追加しない at-rest window
+  context の構築に必要。test 専用 registry 入口は 14 → 9 に減った。
+- A3 の `tests.rs` 特例除外を削除した。A4 は production registry の正規化 API 指紋 62 件を
+  完全一致 allowlist とし、正確な可視性、generic / bound / where、public field / variant、
+  re-export、公開型への trait impl と関連型まで固定する。
+- A6 は設計が想定した未実装の `viewer_context_registry::test_access::` ではなく、実在する
+  `#[cfg(all(test, windows))] impl App` の `*_for_test` 定義と呼び出しを対象に再定義した。
+  `_for_test` 定義は `cfg(test)` を含む必要があり、呼び出しも test cfg 外では禁止する。
+  この差は audit allowlist コメントにも明記した。
+- 検証は library **6261 passed / 0 failed / 27 ignored** (検出総数 6288)、audit **31 passed**。
+  audit 実行は A1 / A2a / A2b / A3 / A4 / A5 / A6 / A7 が有効で、既知の
+  `activate_snapshot` 1 件のみ。library の dead-code warning は従来どおり **9 件**。
+
+### ステージ④完了: metadata import refresh の context identity (2026-08-25)
+
+`metadata_import_refresh::ContextSlot` を廃止し、request / result が
+`ViewerContextId` を所有するようにした。main は場所を表す特別値ではなく、request 構築時の
+`registry.main()` を焼き込む。window context も Vec index / window id から適用時に引き直さず、
+要求時の同じ identity を worker 往復後まで保持する。`items_generation` は従来どおり別フィールドに
+残し、「どの context か」と「その items snapshot がまだ current か」を独立に照合する。
+
+- apply 前後は registry の `residence(ViewerContextId)` を正本にする。`Mounted` / `AtRest` だけが
+  適用可能、`Retired` は正常な遅延結果として debug 記録だけで破棄、`Unknown` は identity
+  不変条件違反を常時ログして破棄する。UI thread の同期 transaction 外から観測不能な
+  `Building` / `Retiring` も不変条件違反として診断し、guard / retry / delay は追加しない。
+- 変更前の HEAD で、先行 window close により後続 window の refresh が失われるテストと、
+  request / apply 間の main promote で別 context に結果が入るテストがともに失敗することを確認した。
+  修正後は両テストに retired / unknown の分岐テストを加えた 3 本が通る。
+- `ContextSlot` は `src/` で **0 件**。A4 は non-Windows の単一 context identity を構築する
+  `ViewerContextId::single_context()` の正確な指紋を同じ変更で allowlist へ追加した。
+- 検証は library **6313 passed / 0 failed / 27 ignored** (検出総数 6340)、audit **31 passed**。
+  library の dead-code warning は従来どおり **9 件**。実機 smoke はこの behavior change の
+  verification build で利用者確認待ち。
+
+## ②-d の退行 1 件と、その調査でかかった 3 往復
+
+**症状**: detached で動画を開くと黒いウィンドウのまま再生が始まらない (両モード)。
+
+**真因** (`549be614` で修正): `should_poll_main_video_context` の第 1 項を
+②-d が `active_detached_viewer_context_contains_video()` から
+`active_viewer_context_contains_video()` へ**改名と同時に意味を広げていた**。
+
+- 旧: holder を読む = context が **at rest のときだけ** true
+- 新: `locate_window_context` の結果から **residence を捨てる** = **mounted でも** true
+
+detached で動画を開く瞬間、その context は App にマウントされていて `fullscreen_idx` が
+動画を指す。よって門が閉じ、**main が `poll_video` を飛ばす**。飛ばされた poll こそが
+プレイヤーを作る当人で、detached 側の poll 経路は「生きたプレイヤーがある」ことが前提。
+**動画を開く poll が、「動画を開こうとしているから」閉じる門の後ろにいた。**
+期限判定も poll の中なのでタイムアウトも出ない。
+
+述語は `other_active_viewer_context_contains_video` へ改名し、投影中の context を除外した。
+**11 箇所の呼び出し全部が旧い意味を必要としていた** (広い意味が要る箇所はゼロ)。
+
+### 調査から得たもの
+
+- **計装が答えを出した。** 無言だった出口 3 つ (`bc723138`) と破棄 4 箇所 (`0bb5dd81`) に
+  理由を書かせた結果、**7 つとも無言のまま**だった。その沈黙自体が
+  「誰も pending を見ていない = poll が呼ばれていない」を意味し、門にたどり着けた。
+- ⚠ **最初に掴んだ手がかりを捨てた。** この述語の変化は、最初にログを読んだ直後に
+  ②-d の diff で目に留めていた。にもかかわらず dead-code 警告 11 件という
+  **機械的で分かりやすい手がかり**へ乗り換え、そこから 2 往復を空振りした。
+  警告は確かに何かの印だったが「掃除し忘れ」であって退行ではなかった。
+- ⚠ **dead-code 警告から「呼び出しが落ちた」と推論しない。** 16 件を 1 件ずつ
+  ②-d の diff と突き合わせたところ、**全部が置き換え後の残骸**だった。
+  「後継が実際に呼ばれているか」を見るまでは、どちらとも言えない。
+- 回帰テストは**門の戻り値ではなく poll への到達**を見る。前者は門を書き換えれば通る。
+  述語を元の広い形へ戻す変異でこのテストだけが落ちることを確認済み。
+
+### 実機 smoke シナリオ (利用者へ)
+
+リポジトリルートから。**起動前にインストール版 / トレイ常駐版を終了すること**
+(single-instance mutex を共有する)。**引数なしでは実利用中の `%APPDATA%\mimageviewer` を
+使う**ので、設定・キャッシュ・ログを更新し得る。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+1. **always-new の静止画**: 「常に別ウィンドウで開く」ON。静止画 A を F12 → main へ戻る →
+   B を開く → A を再アクティブ化 → **B を A より先に閉じる**。
+   各窓が画像・選択・ズーム/パン・配置・フォーカス・右ドラッグの identity を保つか。
+2. **reuse の静止画**: always-new OFF。F12 で開き、Ctrl+↑↓ でフォルダ移動、閉じて開き直す。
+   **同じ OS ウィンドウ / サイズが再利用され、小窓のチラつきが出ない**か。
+3. **PDF / ZIP の本**: 別ウィンドウで開き、**非同期の列挙中とパスワード入力中**に park / resume。
+   ページ / フォルダ移動。空の viewport・別の本・パスワード状態の喪失が無いか。
+4. **動画 / 音声 + promote**: detached で再生 → main 側のフォルダ / お気に入り /
+   スマートフォルダを変更。**再生が promote をまたいで続き**、main の一覧は独立し、
+   再アクティブ化で同じセッションに戻るか。
+5. **VST3**: 4 を VST3 有効で。deferred media open コマンドも含める。
+   再生 / marker の所有 / VST GUI / pending コマンドが**正しい窓に付いたまま**か。
+6. **右ドラッグ (park 中 / keep-alive の隙間)**: parked な窓、または PDF/ZIP の keep-alive 中に
+   passive 右ドラッグ。**その窓だけに届き**、viewport が消えないか。
+7. **順不同 close + tray / remote**: 静止画 / PDF / 動画の窓を複数作り、**順不同で閉じる**。
+   トレイへの hide / 復帰、リモートセッションの pause / resume。兄弟窓が壊れないか。
+8. **マルチモニター / 混在 DPI**: detached 動画窓をモニター間で移動し、アクティブ化・
+   最小化 / 復元・VST GUI・close。native child HWND の配置・フォーカス・z-order・
+   presenter の連続性。
+
+## 「独立 detached viewer にする」3 経路のフラグ集合が違う — 調査済み・不具合なし
+
+**②-c1b では意図的に揃えなかった** (揃えると 2 経路の挙動が変わるため)。
+名前だけ分けて集合はそのまま保ってある。
+
+| 経路 | `fs_open_intent_from_grid` | `pending_auto_fs_open` | `pending_return_to_parent` | `pdf_prefetch_grace_until` |
+| --- | --- | --- | --- | --- |
+| ParkedLive → active | ✓ | ✓ | ✓ | ✓ |
+| passive → active | ✓ | — | — | ✓ |
+| promote | ✓ | ✓ | ✓ | — |
+
+履歴 (実際に `git show` で確認済み):
+
+- `7ee84fdb` (2026-06-28) passive resume 新設 — `pdf_prefetch_grace_until` のみ
+- `5ba4d537` (2026-07-01) promote 新設 — 3 フラグ。`pdf_prefetch_grace_until` は当時既に
+  存在していたので、「フィールドが無かったから」ではない
+- `76f36d94` (2026-07-06) ParkedLive 経路 新設 — 4 フラグまとめて
+- `d3b56c15` (2026-07-06、`(detached-rework CUT) remove linked detached pin`) —
+  passive resume に `fs_open_intent_from_grid` **だけ**追加。**同じ diff の中に 4 フラグ版が
+  見えている状態で、残り 2 つは足していない**
+
+**非対称を意図的だと述べたコミットメッセージもコメントも無い。** 3 経路が別々の時期に
+別々のリストとして育ち、`d3b56c15` は目の前の症状に対応する 1 つだけを足した形に見える。
+
+### 決着 (2026-08-25、Codex Sol に read-only で調査依頼 → 主要 3 点を自分で照合)
+
+**不具合は無い。差は「どこで消すか」の違いであって「消さない」ではない。**
+
+| 経路 | park 時 | activate 時 | 結果 |
+| --- | --- | --- | --- |
+| passive → active | `pause_background_work_keep_current_frame` が `pending_auto_fs_open` / `pending_return_to_parent` を消す ([viewer_context_registry.rs:1489](../src/app/viewer_context_registry.rs:1489)、呼び出しは [app.rs:37447](../src/app.rs:37447)) | 残り 2 つ | **4 つとも false** |
+| ParkedLive → active | **消さない** (メディアを生かしたまま park するので `pause_background_work_...` を通らない) | 4 つとも | **4 つとも false** |
+| promote | — (mounted context をそのまま取る) | 3 つ | `pdf_prefetch_grace_until` だけ残る |
+
+promote が残す 1 つは**観測できない**。理由 3 つとも確認済み:
+① grace が `Some` になるのは **PDF 仮想フォルダを開いたときだけ** ([app.rs:22495](../src/app.rs:22495) / [:22546](../src/app.rs:22546))、
+② promote は現在のフルスクリーン項目が **video / audio のときしか走らない** ([app.rs:41156](../src/app.rs:41156))、
+③ 消費側 `update_keep_range_and_requests` を呼ぶ `update_thumbnail_frame_bookkeeping` の
+production 呼び出しは [app.rs:65555](../src/app.rs:65555) **1 箇所だけ**で、detached bundle を
+マウントしている `update_active_detached_viewer_context` ([app.rs:65862](../src/app.rs:65862)) より
+**前**に走る。マウント中の値は誰も読まない。
+そもそも grace は絶対時刻 100ms の期限で、読まれれば期限切れとして clear される。
+
+**したがって挙動は変えない。** 3 経路の集合は現状のまま正しい。
+
+### ここから出た②-d への申し送り 3 件
+
+1. **「active detached になる context は 4 つの one-shot がすべて false」という不変条件が、
+   経路によって別の場所で維持されている** (park 時 / activate 時)。これは R2e が畳もうとしている
+   「1 つの不変条件を 2 箇所が分担する」形そのもの。②-d の mount / activate transaction が
+   1 箇所で持てば、**挙動を変えずに** 3 経路が同じ集合になる。今やると挙動変更になるのでやらない。
+2. **active detached 側の `pending_return_to_parent` 消費が、フィールドの documented semantics と
+   違う。** 定義 ([app.rs:16034](../src/app.rs:16034)) は「親のファイル一覧へ戻るナビを解決して流す」
+   だが、active detached の消費は `mem::take` して `close_fullscreen()` するだけ
+   ([app.rs:40478](../src/app.rs:40478))。R2e 由来ではないが、別途見る価値がある。
+3. **caller 側の所有権**: `pending_auto_fs_open` は container dispatcher が走る前に立つことがあり
+   ([app.rs:17962](../src/app.rs:17962))、ZIP dispatch は消費 ([app.rs:20917](../src/app.rs:20917)) より
+   前に promote を試みる ([app.rs:20871](../src/app.rs:20871))。通常の grid 経路は新しい intent を
+   立てる前に旧 context を park する ([ui_main.rs:13082](../src/ui_main.rs:13082)) が、
+   起動引数 / 外部 / 変換アーカイブ経路までは確認できていない。**promote が現に消しているので
+   今のリスクは無い**が、これは 3 つの activate メソッドでは決着しない caller 側の問題。
+
+## その他
+
+- W1 (tag prewarm 起動) は **mounted 側に 3 コピー目がある** ([app.rs:27280](../src/app.rs:27280))。
+  `&mut` が要るので②-d の `ContextMut` 待ち。触っていない。
+- ②-c1 で `From<&ViewerContextBundle> for ContextRef` + `impl Into<ContextRef>` を
+  差し戻したのと同じ理由で、②-c1b でも引数でフラグ集合が変わる汎用操作は作っていない。
+
+**ステージ②-c2 完了** (2026-08-25、指示書
+[detached-rework-stage-r2e-2c2.md](detached-rework-stage-r2e-2c2.md))。
+`tools/viewer_context_audit` (workspace member、`syn` の source-only 解析、本体に非依存) が
+**A2 / A3 / A7** を実装。自身のテスト 23 件、CI に 3 つ目の軽量 job を追加
+(apt も FFmpeg ヘッダも要らない)。**`src/` は 1 行も変えていない。**
+
+### 規則を実測してから 2 点ずらした
+
+| 規則 | 設計のまま | 実測 | 採用した形 |
+| --- | --- | --- | --- |
+| A2 | swap/replace/take の実引数に 225 フィールド名 → 行単位 allowlist | **62 箇所・全部 false positive**。`mem::swap` は **0 件** | **A2a** = `mem::swap` に bundle フィールド (0 件) + **A2b** = 1 関数内の**異なる**フィールドが **3 つ以上** (5 件) |
+| A3 | `src/**/*.rs` 全部 | **110 箇所中 109 が `tests.rs` の `empty()`** | `#[cfg(test)]` と `tests.rs` を除外。②-e で `test_access` が入れば**コンパイラが弾く**ので監査は不要 |
+
+A2b の分離は 21 / 11 / 10 / 5 と **2 以下**で、閾値 3 に十分なマージンがある。
+allowlist の鍵は**行番号ではなくファイル + 関数名 + 理由** (`src/app.rs` は 4 万行あり
+行キーは即腐る)。**A7 は対象 (`App::viewer_contexts`) が②-d まで存在しない**ので、
+(a)〜(f) の 6 形すべてを fixture テストで覆ってある。「本番 0 件」を根拠にしない。
+
+## 監査が初回実行で見つけた本物: `activate_snapshot` ✅ 解決済み (2026-08-26)
+
+**当初は allowlist に入れず「既知の指摘」として記録した (R2e の範囲外だったため)。
+後述の「R2e snapshot ownership follow-up」で解決し、KNOWN_FINDINGS は空になった。**
+
+`activate_snapshot` ([src/app/snapshot_ops.rs:270](../src/app/snapshot_ops.rs:270)) は
+**per-context の 5 フィールド** (`items` / `thumbnails` / `visible_indices` /
+`scroll_offset_y` / `selected`) を `App::snapshot` へ `mem::replace` で退避する。
+
+**`App::snapshot` は `ViewerContextBundle` のフィールドではなく、
+`swap_viewer_context_bundle` で交換されない** (`swap_field!(snapshot)` は存在しない)。
+つまり **per-context の状態を App-global の枠が持っている** — R2e が畳もうとしている
+BA-7 系の形そのもの。
+
+書き戻す経路は 1 つだけ ([snapshot_ops.rs:539](../src/app/snapshot_ops.rs:539)) で、
+`current_folder == snap.origin` で守られている。`current_folder` 自体も per-context なので、
+context を切り替えた後は通常「snapshot を捨てて再読み込み」に倒れる。
+**ただし 2 つの context が同じフォルダを指していれば一致する** — main と同じフォルダで
+detached viewer を開いた状態がそれ。
+
+正しい修正は `snapshot` を per-context にすることだが、**挙動が変わる**ので別の段の仕事。
+②-d で registry が context を所有するようになっても、`snapshot` を bundle へ移す判断は
+別に要る。
+
+→ **その段を 2026-08-26 に実施した。下の「R2e snapshot ownership follow-up」を参照。**
+
+### 「既知の指摘」というカテゴリを足した理由
+
+allowlist に入れれば見えなくなり、違反のままなら CI が永久に赤い。どちらも良くない。
+既知の指摘は **毎回印字され / 実行は失敗させず / 検出されなくなったら失敗する**。
+最後の性質が要点で、誰かが黙って消したり規則が退行したりしたときに気づける
+(stale allowlist entry も同じ扱いで失敗する)。
+
+ついでに `ENABLE_ALLOWLIST` という const スイッチを `--no-allowlist` フラグに置き換えた。
+フリップして忘れられるうえ、false 側が誰も通らない死んだ枝になっていたため。
+
+**ステージ②-d-pre 完了** (2026-08-25、`7282fd01`、指示書
+[detached-rework-stage-r2e-2d-pre.md](detached-rework-stage-r2e-2d-pre.md))。
+lib テスト 6251 件緑 (件数不変)、監査 exit 0 (既知の指摘 1 件のまま)。
+
+### 設計に無い段を足した (保管は分けていない)
+
+設計 §7 は②-d を「ここだけは分けられない」とする。**保管についてはそのとおり**なので
+**保管は 1 コミットで切り替える**。分けたのは**読み方**である。実測 (非テスト):
+
+| | 箇所 |
+| --- | --- |
+| `.active_detached_viewer_context` のフィールドアクセス | 84 (うち存在検査 47 / 所有操作 23) |
+| `.paused_bundle` のフィールドアクセス | 42 (うち存在検査 4 / 所有操作 33) |
+
+**存在検査 51 箇所がこの rework の病因そのもの。** 設計 §1 の診断は
+「`None` は『ここに無い』であって決して『別の場所にある』ではない」で、`.is_some()` は
+その 2 つを混ぜたまま書ける形 = **どの問いなのかがコードに書かれていない**。
+保管を差し替える段で同時に問いを決めると、**命名の誤りが保管のバグに見える**。
+
+### 判断サイト 23 箇所の読み解き
+
+| 付けた名前 | 箇所 | 意味 |
+| --- | --- | --- |
+| `active_detached_context_is_at_rest()` | 13 | holder に context が在る (2 箇所は否定で使用。否定形の名前は作らない) |
+| `active_detached_context_exists()` | **5** | context が在る **または** session が detached。**同じ問いが 5 回書かれていた** |
+| `viewer_session_is_detached_or_switching()` | 3 | **生の OR / AND が冗長だった** (下記) |
+| `detached_viewer_host_owns_surface()` | 1 | presentation が detached、または holder に context |
+| `mounted_projection_owns_active_detached_session()` | 2 | §6.5 の暫定回避策。**撤去せず名前で言う** |
+
+**判断不能だったサイトは無し。**
+
+- **5 コピー**: `had_active_detached` の 3 行 (直前の `base_placement` 行を含む) が
+  4 箇所でバイト単位一致、5 つ目は改行だけ違う同じ問いだった。1 本に畳んだ。
+- **冗長だった 3 箇所**: `viewer_session_is_detached_or_switching()` は
+  **冒頭で holder に context があれば true を返す**ので、同じ検査を `||` で足すのも、
+  その否定に `&& is_none()` を足すのも**元から意味が無かった** (防御ではなく重複)。
+  非 Windows 側も元から `false` 固定で、挙動は変わらない。
+- **§6.5 stopgap 2 箇所**: `!is_at_rest()` に
+  `mounted_projection_owns_active_detached_session()` という名前を付け、
+  **「holder が空であることは mounted session の所有を証明しない」**とコメントに書いた。
+  撤去は②-d。
+- ログ引数 28 箇所は 1 つの診断入口 (`active_detached_context_debug_state()`) に通した。
+  **出力文字列は変えていない。**
+- ②-pre が holder 側に残した前置きフィルタ 2 つ (vst3 pending / rename 述語) は
+  `.as_deref().is_some_and(..)` の形で、この段の存在検査には含まれない。②-d で扱う。
+
+### ②-d に残っているもの
+
+- 所有操作 **56 箇所** (`as_ref` / `as_mut` / `take` / 代入、23 + 33)
+- 保管 2 つの削除と `App::viewer_contexts` への統合
+- 生プリミティブ 4 種 → 5 transaction (設計 §4)、window binding table
+- §6.5 の暫定回避策 3 種の撤去 (stopgap 2 箇所 + keep-alive backstop)
+- 監査 **A1 / A5** の有効化 (保管が消えて初めて通る)
+- swap の内側への failpoint (設計 §7 ②-d の I8 確認)
+
+### ステージ④の実機 smoke — 想定を 1 度書き直した (2026-08-25)
+
+最初に出した手順は**実機で成立しなかった**。利用者の指摘で 3 点とも誤りと分かった:
+
+1. **「import 実行中に窓を閉じる」は時間的に無理。** 通常サイズのフォルダでは import が
+   速すぎて、要求〜適用の窓に手が入らない。
+2. **「import 中に F12」も同じ理由で無理。**
+3. **複数ウィンドウモードに F12 は無い。** `ToggleDetachedViewerMode` は
+   **フル機能ウィンドウの main ⇄ 別ウィンドウ切替**であって、常に別ウィンドウで開くモードには
+   切り替える対象が無い。**F12 を使う手順はフル機能ウィンドウモードでしか書けない。**
+
+**そもそもレースを実機で狙う必要が無かった。** ④ が直した 2 つのレースは
+**現行コードで落ちる単体テスト**で捕まえてある
+(`metadata_refresh_context_identity_survives_closing_an_earlier_window` /
+`..._survives_main_promotion`、どちらも旧コードで結果が別 context へ届くことを示して失敗した)。
+相関ロジックは決定的なので、実機で再現させる価値は低い。
+
+**実機で見るべきは日常の経路**である。④ は要求の作り方 (registry の id を列挙) と
+適用の引き方 (residence で分岐) を両方変えたので、そこが壊れていないことを見る:
+
+| # | モード | 手順 | 見るところ |
+| --- | --- | --- | --- |
+| A | 複数ウィンドウ | 別ウィンドウ 3 つにそれぞれ違う値の項目 → import | **各窓が自分の値**を受け取るか (混ざらないか) |
+| B | **フル機能ウィンドウ** | main と別ウィンドウ (F12) で別項目 → import | 両方が自分の値を受け取るか (`Main` の焼き付け経路) |
+| C (任意) | どちらでも | **数千枚**のフォルダで import 中に窓を 1 つ閉じる | 窓を広げたいときだけ。DB は 500 件ずつ chunk 読みなので大きいフォルダなら秒単位の窓ができる |
+
+**教訓**: smoke 手順を書くときは「**その操作が実機で成立する時間があるか**」と
+「**そのモードにその操作が存在するか**」を先に確かめる。決定的なロジックの検証は
+単体テストの仕事で、実機に回すのは**実機でしか出ないもの** (HWND / focus / 実 viewport /
+タイミング) に限る。
+
+### R2e snapshot ownership follow-up (2026-08-26 完了)
+
+R2e が保留した監査の既知の指摘 1 件を閉じた。**リワーク外の変更 (§11) ではなく、
+R2e の続きの独立ステージ**としてここに記録する (Codex の手続き判断)。
+
+**守るべき不変条件**: 表示中の `items` と、それを元へ戻す `SnapshotState` は
+**同じ `ViewerContextId` が所有する**。
+
+`activate_snapshot` は `items` / `thumbnails` / `visible_indices` / `scroll_offset_y` /
+`selected` / `zip_nav` の **6 つとも bundle field** を `App::snapshot` へ退避する。ところが
+`App::snapshot` だけが App-global で `swap_viewer_context_bundle` で交換されなかった。
+**表面の `top_level_grid_view` (どの top-level surface を表示中か) は既に per-context** なので、
+「表示は context ごと・取り消しは App 共有」という所有境界の食い違いになっていた。
+
+**入れたもの**: `snapshot` を `ViewerContextBundle` の field にした。bundle に field を
+足すと R2e の完了ゲートが働き、**3 箱所でコンパイルが止まって分類を迫られた**:
+`empty()` / swap の destructure / `split_current_context_preserving_main_grid` の destructure。
+park 時は `duplicate_for_parked!` (= `items` / `top_level_grid_view` と同クラス)、
+物理フォルダ scope の detached fork は `detached.snapshot = None` (隔壁の
+`top_level_grid_view` リセットと対)。
+
+**動かさなかった隣接フィールドと、その理由**:
+
+- `snapshot_internal_nav` — set → call → clear を同一同期スコープで行う再入フラグ。
+  ⚠ Codex の指摘で訂正: 「call tree に swap が絶対に無い」は強すぎる。`load_folder` の下流には
+  `start_loading_items_inner` → `promote_active_detached_video_for_main_context_change` という
+  transaction 経路がある。ただし現在の 2 入口は promotion の `fullscreen_idx` 条件を
+  満たさないので、正常実行で `true` のまま swap する経路は見つからない。
+- `snapshot_next_generation_id` — global のまま。
+  ⚠ **当初書いた根拠は誤りだった**。field の doc コメントは「stale な pending folder nav を
+  無視するため」と言うが、**`SnapshotState::generation_id` を読む production の consumer は
+  存在しない** (採番とテストだけ)。将来の ID allocator として global に残すのは妥当だが、
+  「global でなければならない」までは言えない。**doc コメントが実装より古い**。
+
+**監査の handshake (Codex の指摘で修正)**: `snapshot` を bundle へ移しても
+`activate_snapshot` は 6 field の `mem::replace` のままなので、**A2b は検出され続ける**。
+KNOWN_FINDINGS から削除するだけだと untracked violation になるので、
+**ALLOWLIST_ENTRIES へ意味を移した** (理由 = 退避先が context 所有になったこと)。
+KNOWN_FINDINGS は空になり、「既知の指摘が存在する前提」の監査テスト 1 本も直した
+(合成データ側の 3 本が描画・失敗条件を担っているので、実リストが空でも回帰は検知できる)。
+
+**挙動の変化** (Codex の列挙を採用):
+
+- A / B がそれぞれ独立した snapshot を持てる (旧: 2 つ目が 1 つ目の退避を上書き)
+- 同じフォルダでも他 context の退避を復元しなくなる
+- A だけ snapshot 中で B は通常、が可能になる (旧は badge / ナビ制限 / `is_snapshot_active()` に漏れた)
+- `build_viewer_context` の fresh context は snapshot inactive から始まる
+- `promote` では旧 context と一緒に stash され、fresh main へ漏れない
+- `retire` では所有 context と一緒に破棄される
+- 他 context の snapshot があるだけで materialized-still fork が阻止される現象が消える
+
+**回帰テスト** (どちらも `swap_field!(snapshot)` を取り除く変異で落ちることを確認済み):
+
+- `a_second_context_taking_a_snapshot_does_not_clobber_the_first_stash`
+- `deactivating_does_not_restore_another_context_stash_for_the_same_folder`
+  — 変異下で main の解除が他 context の `other.jpg` を書き戻し、**実バグをそのまま再現した**
+
+**残した確認事項** (Codex の指摘、本ステージでは未着手):
+`rating_filter_suppressed_at` と `favsearch_subfolder_restore` /
+`global_search_subfolder_restore` は App-global のまま snapshot lifecycle と結合している。
+前者は snapshot 解除が無条件に global suppression を解く。後者は dismiss/deactivate が
+global slot を `take()` するため、検索由来 snapshot を fork した場合に先に閉じた側が
+sibling の fallback restore を消費し得る。
+
+### R2e の現況 (2026-08-25 時点、新しいセッションはここを最初に見る)
+
+**R2e は全段完了。** master へは②-e まで (`189803b5`) をファストフォワードで投入済み。
+その後 ③ / ④ が `r2e-ownership` に載っており、**master より 8 コミット先**。
+
+| 段 | 内容 | 状態 |
+| --- | --- | --- |
+| ① 〜 ②-e | 状態機械 / mount helper / digest / 型移設 / accessor / 監査 / 保管切替 / private 化 | ✅ master 投入済み |
+| ③ | `other_ids()` — 巡回から「投影中の context」を正しく除く | ✅ 未 merge |
+| ④ | `ContextSlot` → `ViewerContextId`。**挙動が変わる** | ✅ 未 merge・実機 smoke 実施済み |
+
+**④ の実機 smoke (2026-08-25)**: 別ウィンドウ 3 つ (**A / A / C** — 利用者が A を 2 つ開いた)
+でメタ情報 import → **各窓に正しく反映された**。C は A と別の値なので
+**「別 context の結果が混ざらない」は確認できている**。A 同士の取り違えは同値のため区別できない。
+厳密な A / B / C は未実施だが、実用上は通過と見なす。
+
+**残件 (R2e の外)**:
+
+- **backlog §1.123** — スレッド終了中の heap 例外を、例外ハンドラ自身が二次クラッシュで
+  握り潰す。**通常操作 (タグ付け → フォルダ移動) で落ちた実機クラッシュ。**
+  利用者は**次のリリースまでに直したい**意向。(B) 二次 AV は解決済みで一次例外は観測待ち。
+  **未解決のまま残っている唯一の項目。**
+- **backlog §1.122** — F12 の placement 往復が遅い。✅ **主因は 2026-08-25 に解決**
+  (NIS シェーダの実行時コンパイル 2.1 秒。当初書いた「共有出力プール枯渇」は**誤診**で、
+  引用ログが別セッションのものだった)。残りは `publish` 289-424ms と `egui_overlay` 116-139ms。
+- **backlog §1.124** — F12 連打で本物の押下が捨てられる。✅ **2026-08-26 に解決** (廃れた
+  `GetAsyncKeyState` proxy の撤去)。憲法 §2 規則 5 の好例記述もこれで撤回した。
+- ~~**監査の既知の指摘 1 件**~~ — ✅ **2026-08-26 に解決**。`snapshot` を
+  `ViewerContextBundle` の field にした。上の「R2e snapshot ownership follow-up」を参照。
+  KNOWN_FINDINGS は空になった。
+
+### R2e の作業環境 (新しいセッションが最初に読むもの)
+
+- **worktree**: `C:\home\mimageviewer-r2e` / branch `r2e-ownership`。
+  master の作業ツリー (`C:\home\mimageviewer`) ではない。
+- **master へのマージは全ステージ完了後にまとめて行う** (利用者判断 2026-08-24)。
+  途中でマージしない。**master 側では別のバグ修正が進行中なので、時期は利用者が決める**
+  (こちらから merge を提案しない)。差分は docs + `src/` のみで、他レーンとは衝突していない。
+- **vendor は実体コピー済み** (junction 禁止。`ffmpeg` / `pdfium` / `ort` / `susie-worker` /
+  `vst3-host` / `models` / `twemoji`)。`eframe` / `egui-wgpu` は git 追跡下なので触らない。
+  worktree を作り直す場合は
+  [briefs/session-lane-b-video-strip.md](briefs/session-lane-b-video-strip.md) §5 の robocopy 手順。
+- **`cargo test` は PowerShell から実行する。** bash 経由の `PATH` 追加では
+  FFmpeg DLL が解決されず `STATUS_DLL_NOT_FOUND` になる。DLL は
+  `target\debug` と `target\debug\deps` へコピー済み (worktree を作り直したら再度必要)。
+- **Git for Windows の `grep.exe` は Codex の制限付きトークン下で
+  `CreateFileMapping ... Win32 error 5` で落ちる。** Codex には `rg` / `Select-String` を使わせる。
+- **実機確認バイナリ**: `.\scripts\build-dev.ps1` → `target\dev-runtime\mimageviewer-core.exe`。
+  引数なしでは実利用中の `%APPDATA%\mimageviewer` を使うので、**エージェントは起動しない**。
+- **Codex は 1 worktree に 1 本だけ**走らせる (同時実行すると変更が混ざる)。
 
 **§1.99 / §1.100 は R2e の完成に依存しない** (ClaudeCode / Codex 双方で確認)。
 
@@ -454,6 +1297,167 @@ HUD コマンドをアクティブ化へ変換し、**それ以外の利用者�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-08-26 native video の固定16ms repaint pump 撤去 = backlog §1.122
+(ClaudeCode / Codex 双方が完全な Direction A を構造的修正と合意):**
+
+**触った範囲**: [src/app.rs](../src/app.rs) `poll_video` の native presenter 常時 pump、
+[src/video/mod.rs](../src/video/mod.rs) `VideoPlayer::tick` の native 16ms return、native event /
+worker completion wake、CH/BM 境界 deadline、detached host HWND registration / adoption / watcher
+repair 後の ROOT one-shot wake。`find_visible_thread_window_matching_rect`、keep-alive backstop、
+native window pump の focus / placement / epoch reducer は変更しない。
+
+**不変条件**: native event は唯一の `NativeOutputEventSender::send` から
+`request_repaint_of(ViewportId::ROOT)` で起こす。時間・位置で決まる仕事は、それぞれの既存 owner が
+stuck seek / EOF quiet / placement timeout / resume save / preparing HUD / CH-BM境界の正確な残り時間を
+one-shot として返す。host 再親付けは実際の HWND generation 変更だけが起こし、別の
+ParkedLive / detached context を mount・変更しない。準備済み paused native video は予約ゼロ。
+
+**判断理由 (なぜ症状パッチではないか)**: 16msを延長・detached時だけ間引き・viewport paintを
+skipする修正ではなく、入力イベントと期限の所有者を明示して固定 cadence 自体を除去した。
+新規 App bool / Option、時間窓、grace、debounce、retry は無い。EOF の旧「3 tick」は cadence に
+依存しない実時間48msへ意味を固定し、CH/BMは既知境界へ直接起こすので最大16msのovershootも減る。
+host change wake の sibling 非干渉を含む回帰テストで context ownership を固定する。
+
+**2026-08-26 native video egui overlay の process-lifetime wgpu device epoch 共有 =
+backlog §1.122 残り優先 2 (ClaudeCode / Codex 双方が構造的修正と合意):**
+
+**触った範囲**: [src/video/native_presenter/overlay_gpu.rs](../src/video/native_presenter/overlay_gpu.rs)
+を新設し、[src/video/native_presenter/render_core.rs](../src/video/native_presenter/render_core.rs) の
+`NativeEguiOverlay` が process-owned `OverlayGpuService` の compatible / healthy `DeviceEpoch` を共有する。
+[src/video/mod.rs](../src/video/mod.rs) は F12 placement switch の旧 core drop 計測を overlay / rest に
+分割しただけ。detached predicate、viewport ID / 登録 / recreate、runtime / host ownership、
+focus / placement / epoch reducer、keep-alive backstop、font atlas resync は変更しない。
+
+**不変条件**: `OnceLock` は device 直置きでなく service cache manager を保持する。各 overlay は共有
+Instance から Surface を先に作り、loss 未確定かつ Surface-compatible な epoch を選ぶ。通常 epoch は
+1 個、multi-GPU の incompatible Surface または device loss 後だけ追加する。健康な epoch は最後の
+presenter が閉じても process lifetime の強参照を維持し、Surface / Renderer / Context / DComp lease は
+従来どおり presenter ごと。epoch の RwLock は configure を write、texture update から acquire / submit /
+present までを read とする (理由は同時再生ではなく、`Drop for NativeVideoOutput` が join を
+待たないために新旧 render thread が重なり得ること)。`Context::run` と tessellation は外に置く。device-lost callback は自 generation
+の一方向 latch だけを立て、次の overlay construction が latched epoch を skip する。dead epoch を既に
+持つ overlay は次 draw で terminal error。Surface Lost / Outdated / Timeout は epoch を invalidate しない。
+D3D11 present device / immediate context は presenter ごとのまま共有しない。
+
+**判断理由 (なぜ症状パッチではないか)**: F12 の待ちを非同期化・pre-warm・hidden presenter 維持・
+delay / retry で隠す変更ではなく、Surface / Renderer / UI context の window lifetime と、Instance /
+Adapter / Device / Queue の process lifetime を所有型で分離した。新規 App bool / Option、detached 分岐、
+時間窓、recreate trigger は無い。lost epoch 非再利用、旧 generation callback の successor 非干渉、
+configure / submission exclusion を純ロジック test で固定したため §2 に適合する。
+
+**2026-08-26 ★固定による items index-space 交換時の viewer/session 所有権調停 =
+backlog §1.125 (ClaudeCode / Codex 双方が構造的修正と合意):**
+
+**触った範囲**: [src/app/snapshot_ops.rs](../src/app/snapshot_ops.rs) の
+`activate_snapshot` と `deactivate_snapshot` の at-origin 直接復元だけ。現在 mount 中の
+`ViewerContextBundle` が所有する fullscreen / media session / folder-nav / 派生 index と、
+既存 owner stamp を持つ App-global native pending を、同じ items 交換境界で調停する。
+detached predicate、viewport / registry / recreate、runtime / host ownership、geometry / focus、
+`find_visible_thread_window_matching_rect` は変更しない。
+
+**不変条件**: 交換前の `GridItem` から `snapshot_key_from_grid_item` の完全一致 key を取り、
+同一 item が交換先にあれば live `FsCacheEntry` を generation bump 前に owner から退避し、
+bump + invalidate 後に新 idx へ戻す。音声モード、VST shell、normalize、EOF / loop、marker、
+native open/source/fast/tile pending も同じ owner のものだけを exact old→new 対応へ移す。
+source-swap の `native_output` は pending 内で生存させ、`target_idx` を移す。miss は items 交換前に
+正規 `close_fullscreen()` を通す。解除側は activation 時の idx ではなく、解除直前に実際に開いて
+いる item を解決する。旧 generation を答える media-nav / marker worker は remap せず cancel し、
+folder-nav / holdover は任意の一覧交換を越えさせない。別の active / ParkedLive context の pending
+と App-global media index は owner fact が一致しない限り触らない。
+
+**判断理由 (なぜ症状パッチではないか)**: `selected` が既に使う snapshot の正規 identity と、
+`remove_items_batch` / pending completion が既に使う context owner stamp・idx/path validation を
+items の wholesale swap に適用した欠落 lifecycle の補完である。新規 detached bool / Option、
+時間窓、debounce、grace、retry、repaint、rect / HWND heuristic を追加しない。完全一致と prefix
+owner lookup を混ぜず、mounted main / mounted detached / ParkedLive / promoted active / sibling parked
+の ownership 行列を回帰テストで直接固定するため、§2 に適合する構造的修正である。
+
+**2026-08-26 廃れた proxy の削除 = backlog §1.124
+(ClaudeCode / Codex 双方が構造的修正と合意):**
+
+**触った範囲**: [src/app/native_video.rs](../src/app/native_video.rs) の F12 arm と
+`native_video_key_physically_down` / `NativeVideoKeyBlockReason::StaleDetachedToggle`、
+[src/video/mod.rs](../src/video/mod.rs) の window event drain の述語切り出し。
+
+**症状**: 別ウィンドウから F12 で main へ戻るとき、連打すると最初の何回かが無反応。
+実機ログに `ignore stale native F12 toggle: os_down=false` が 1 セッション 7 件、
+**切替完了の 390ms 後から 240〜300ms 間隔で 3 連続**。rebuild 直後に 1 回来る stale
+再配送ではなく、人間の連打そのものだった。
+
+**判断理由 (なぜ症状パッチではないか)**: 新しい状態・時間窓・分岐を**一つも足さない**。
+2026-07-01 に入った物理 probe は、当時存在しなかった識別子の**代用**だった。
+その識別子は **2026-07-30 の pump 分離** (`0cf4b6a9`) で入っている ——
+`NativeVideoWindowEventSink` は host window ごとに epoch を焼き付け、render 側が
+`window_event_belongs_to_generation` で落とす。つまり **古い代用判定を撤去して
+既存の所有境界に戻す修正**であり、追加ではなく削除である。
+
+F12 arm に届く `repeat=false` は、**現 HWND・現 epoch が生成した first-key-down** である:
+
+| 軸 | 何が落とすか |
+| --- | --- |
+| 旧 presenter 由来 | `window_event_belongs_to_generation` (host ごとの epoch) |
+| hold による auto-repeat | `WM_KEYDOWN` の previous-key-state (lParam bit 30) → 既存の `!key.repeat` |
+| 切替中の押下 | `switch_native_video_viewer_presentation` の pending guard |
+
+**Codex の提起で 1 点修正した**: 「旧世代 event は絶対に filter を通らない」は強すぎる。
+旧世代がまだ current の間に通過済みの event はあり得る。ただしそれは `PlacementSwitched`
+より前の sequence を持ち、bus は sequence 順に drain されるので、App は pending 中に処理して
+既存の early-return で落とす。
+
+**回帰テスト**: `window_event_is_accepted_only_for_the_current_presenter_generation`
+(述語を表で 3 通り、述語を `true` に変異させて落ちることを確認済み) と
+`native_video_f12_does_not_toggle_while_a_placement_switch_is_pending` (キー経路を通して
+pending guard を固定)。既存の `native_video_f12_toggles_detached_viewer_mode` は
+**probe 削除後に初めて意味を持つ** —— 旧コードでは `#[cfg(test)] { true }` で
+probe を迷回しており、**この退行を 2 ヶ月近く隠していた**。
+
+→ 憲法 §2 規則 5 の好例記述をこの実機ログで撤回した (一般原則は維持)。
+
+**2026-08-23 手書き mount 18 箇所の helper 化 = R2e ステージ②-pre
+(ClaudeCode / Codex 双方が構造的修正と合意):**
+「bundle を holder から取り出す → App へ swap → 何かする → swap で戻す → holder へ戻す」
+という**所有権移動の定型が 17〜18 箇所に手書きコピーされている**。正しい版は既にあり
+([app.rs:16703](../src/app.rs:16703) `with_active_detached_viewer_context`、`catch_unwind` +
+`resume_unwind` で panic 安全)。②-pre は parked 用の対 `with_paused_detached_context(window_id, f)`
+を足し、**18 箇所** (active 9 / parked 9) を 2 本の helper へ寄せる。
+
+- **変換する 18 箇所**: active = [19808](../src/app.rs:19808) / [27885](../src/app.rs:27885) /
+  [27932](../src/app.rs:27932) / [28151](../src/app.rs:28151) / [28224](../src/app.rs:28224) /
+  [28374](../src/app.rs:28374) / [28994](../src/app.rs:28994) / [30422](../src/app.rs:30422) /
+  [54322](../src/app.rs:54322)、parked = [19844](../src/app.rs:19844) / [27892](../src/app.rs:27892) /
+  [27951](../src/app.rs:27951) / [28170](../src/app.rs:28170) / [28232](../src/app.rs:28232) /
+  [28398](../src/app.rs:28398) / [29017](../src/app.rs:29017) / [30430](../src/app.rs:30430) /
+  [54329](../src/app.rs:54329)。
+- **変換しない** (mount-and-restore ではない): park ([38344](../src/app.rs:38344) /
+  [42556](../src/app.rs:42556))、終端 close / teardown ([38583](../src/app.rs:38583) /
+  [39457](../src/app.rs:39457))、activation の恒久移動 ([40155](../src/app.rs:40155) /
+  [41048](../src/app.rs:41048))。parked-live poll ([39830](../src/app.rs:39830)) は
+  mount-and-restore だが close-after-poll と結合しているので**②-d へ送る**。
+- **挙動の差は 1 つだけ**: mount 中の closure が panic したとき、押しのけられた bundle が
+  drop されずに戻る。panic 自体は `resume_unwind` でそのまま伝播するので**何も握り潰さない**。
+  今日は drop → `Drop for ViewerContextBundle` ([app.rs:2743](../src/app.rs:2743)) で
+  その context の worker pool が cancel される。**既に致命的な事象の巻き添えが減るだけ**である。
+- **なぜ症状パッチではないか**: guard / delay / retry / 追加 repaint / 一括 reset /
+  silent fallback を 1 つも足さない。R2e が集約しようとしている primitive の複製を 18 個消す。
+  panic 安全は目的ではなく、**既に正しい形を使った結果**である。②-d では
+  「取り出せなかったので飛ばす」分岐も 1 箇所へ集まり、そこが `residence()` の match になる。
+- **Codex が付けた等価性の制約 2 件** (指示書に反映済み):
+  1. [28398](../src/app.rs:28398) の `window_index` + `window_id` の検証を維持すること。
+     window_id だけで引くと、index がずれた context に対して**今は捨てられている結果が
+     適用されてしまう**。identity の是正はステージ④の担当。
+  2. [19844](../src/app.rs:19844) の `native_video_parked_live_input_window_id` は
+     **mount 中の closure の内側**で立てること。
+- **helper に `native_video_parked_live_input_window_id` を入れない** (双方合意)。あれは
+  parked-live の入力 / メディア方針であって汎用の residence ではない。汎用化すると
+  metadata import や cache 保守の mount 中に入力フィルタ・HUD・activation・メディア所有権が
+  変わる。汎用化は②-d で `residence()` として行う。
+- 補足: active 側 helper は `detached_viewer_main_history_suppression_depth` を一時的に上げるが、
+  変換対象 9 本の本体からその読み手へ到達しないことを Codex が確認済み (追加の差は出ない)。
+- **憲法チェック**: 1 rect 捕捉に触れない / 2 recreate トリガを作らない / 3 App に新しい
+  bool・Option を足さない / 4 placement の保存先を作らない / 5 時間窓を使わない /
+  7 範囲は上の列挙どおり / 8 既存テストを削除・弱体化しない。
+- 指示書: [detached-rework-stage-r2e-2pre.md](detached-rework-stage-r2e-2pre.md)。
+
 **2026-08-20 keep-alive backstop の所有権 (ClaudeCode / Codex 双方が構造的修正と合意):**
 `render_active_detached_viewport_backstop` ([ui_fullscreen.rs](../src/ui_fullscreen.rs) 12740 付近) が
 **mount の外**で走り、**App にマウントされている別 context の状態から detached window の内容を
@@ -540,6 +1544,7 @@ foreground ownership を扱う際の観測として残す。
 
 | 日付 | 変更 | 触れた範囲 | 合意の根拠 |
 | --- | --- | --- | --- |
+| 2026-08-25 | R2e-2d で active_viewer_context_contains_video が registry 化と同時に mounted context まで含む意味へ広がり、detached video open の main-update poll を自己抑止した回帰を修正。active ID が現在 projected ではない場合だけ動画を検出する other_active_viewer_context_contains_video へ改名し、旧述語から継承した十一 caller を全数監査して同じ「別 context」意味へ移行 | src/app.rs の context predicate、main video poll 入口、pending index / tile / mode-switch / park / close / media-navigation ownership、src/app/native_video.rs の source-swap / mounted clear ownership、src/app/startup_ops.rs の bookmark handoff、src/app/tests.rs の main-update poll 到達テスト。viewport ID / registry transaction / runtime / host ownership、geometry / placement / focus、window lifecycle、pending field と既存計装は変更なし | 利用者のログ・source 分析と Codex の十一 caller / mounted・at-rest lifecycle 監査が、旧 holder 述語の意味は「App に投影されていない active context」であり、全 caller が current/mounted を別の条件または現在処理中の owner として扱う点で一致。guard / retry / delay / re-entrancy flag を足さず、projected identity との比較で residence を保つ ownership 修正である。修正前に production main-update 入口から pending poll に未到達する red を確認し、修正後は poll_native_video_open_pending 固有の host_not_ready 記録まで到達する回帰テストで固定したため、症状パッチではなく §2 に適合すると双方合意 |
 | 2026-08-22 | backlog §1.106 の右ドラッグ中左ボタン取消を passive detached viewer にも通し、既存 `DetachedRightDragEventKind::Cancel` に typed reason `PrimaryButtonPressed` を追加。deferred / ParkedLive の window callback は右ドラッグ中の primary down をこの cancel として同じ sequence channel へ送り、owner reducer が既存 cancel を実行する。左 release による通常の passive window activation は維持し、選択 / open / viewer action へは再利用しない | `src/app.rs` の `DetachedRightDragCancelReason` と deferred callback capture、`src/ui_fullscreen.rs` の ParkedLive callback / 既存 passive right-drag reducer、callback・owner・activation tests。`Input` variant の field、viewport ID / registry / recreate、runtime / host ownership、geometry / placement / focus、window lifecycle、`ViewerContextBundle` field は変更なし | 利用者の再調査と Codex の全 producer 列挙が、backlog 作成後の §1.100 で passive start point が第 4 surface として増え、typed cancel channel だけが primary press を表現できない点で一致。利用者が §2 を確認し、既存 `Cancel { reason }` への reason 追加は新規 App-level detached bool / Option、時間窓、heuristic、rect 条件を作らず、入力を既存 owner cancel 境界へ流す構造修正であると明示的に同意。Codex も同じ理由で症状パッチではなく §2 に適合すると合意した。activation reducerへ cancel suppression を足さず、cancel と Windows 標準の activation が並立することをテストで固定 |
 | 2026-08-22 | backlog §1.99 の ConvertibleArchive grid open を、probe / 変換前は main 所有の typed candidate、実体確定後は新しい detached context を作る destination intent として完結させた。直読み RAR、変換 RAR、RAR cache fallback、非 RAR 同期 cache hit、ZIP / PDF control の page-list 完了後にも main context 不変を回帰テストで固定 | src/app.rs の DetachedGridItemOpenPlan::ConvertibleArchiveCandidate、OpenRequestOwner::DetachedGridArchive、request sequence / stale arbitration、open_converted_grid_archive_in_detached_context と同期 cache-hit arm、src/ui_dialogs/archive_convert.rs の ArchiveConvertCompletionPolicy::DetachedGridArchive および direct / converted completion consumer、src/app/tests.rs。visibility 述語、show_viewport_* builder、viewport ID / registry / recreate、runtime / host ownership、geometry / placement / focus、R2e は変更なし | backlog §1.99 と docs/detached-rework-stage-archive-open.md の ClaudeCode 分析、Codex の source inspection が、誤りは完了先を Navigation に固定した request ownership にあり、RAR を ZIP descriptor に分類する問題ではない点で一致。要求 identity と completion policy が元アーカイブを保持し、確定した backing archive から ViewerContextDescriptor::Zip { archive_source_override: Some(source), .. } を作るため、別 context の main grid を後段で戻す guard ではなく request 作成境界の構造修正である。新規 detached bool / Option、delay / retry / repaint / reset / fallback を追加せず、フル機能ウィンドウの Navigation と ZIP / PDF descriptor を維持するので §2 に適合すると ClaudeCode / Codex 双方が合意 |
 | 2026-08-21 | content identity A2 の検出 owner を main の通常物理フォルダ一覧に限定し、detached physical context では worker / 候補 state を作らない | `src/app/content_identity_detection.rs::is_physical_folder_listing` と、`src/app.rs::start_loading_items_inner` の既存 `detached_physical` projection。detached predicate は read-only で再利用し、viewport ID / registry / recreate、runtime / host ownership、geometry / placement / focus、window lifecycle、`ViewerContextBundle` field は変更なし | 正本 `docs/briefs/edit-identity-a2-detection.md` が smart folder / 検索 / archive 等を除く「その物理フォルダ一覧」だけを owner として確定し、Codex の source inspection でも A2 の size index / pending / A3 候補は App-global で detached bundle の context-owned resource ではないことを確認。detached 側へ App-global worker を発生させると別 context の folder change が cancel / apply するため、既存 typed `ViewerNavigationScope::DetachedPhysical` を開始境界の除外にだけ使う。新規 detached bool / Option、guard / delay / retry、viewport heuristic を追加せず、main Folder / detached / smart / search / ZIP / PDF の predicate test と generation + folder key の stale test を持つ ownership 境界の追加なので、症状パッチではなく §2 に適合する |

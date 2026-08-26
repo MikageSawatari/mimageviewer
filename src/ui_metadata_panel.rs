@@ -279,19 +279,11 @@ impl App {
             .filter(|&i| self.items.get(i).is_some_and(|it| it.accepts_rating()));
         let rating_stars = rating_idx.map(|i| self.get_rating(i)).unwrap_or(0);
         let mut set_rating: Option<u8> = None;
-        // タグがフォルダ・ページ両方に付くページでは★も両方出す (Inc 5 FB)。タグパネルの
-        // 「フォルダ」行の対象パス = 共有親フォルダなので、そのパスの★ (コンテナレーティング)
-        // をパスキー直読みで出す。
-        let folder_rating_path: Option<PathBuf> = tag_rows
-            .iter()
-            .find(|r| r.label.as_deref() == Some("フォルダ"))
-            .and_then(|r| r.targets.first())
-            .map(|t| t.path.clone());
-        let folder_rating_stars = folder_rating_path
-            .as_ref()
-            .map(|p| self.folder_rating_by_path(p))
-            .unwrap_or(0);
-        let mut set_folder_rating: Option<u8> = None;
+        // ページ★とは独立したコンテナ★を、タグ行の表示ラベルではなく現在の
+        // container-rating ownership から解決する。これにより PDF / ZIP / 変換書庫でも
+        // ページ行とコンテナ行を並べて表示できる。
+        let container_rating = self.current_metadata_panel_container_rating();
+        let mut set_container_rating: Option<u8> = None;
         let tag_picker_enter_pressed = self.dialog_enter_pressed(ctx);
         let tag_picker_escape_pressed = self.dialog_escape_pressed(ctx);
         if self.fullscreen_tag_picker_open && tag_picker_escape_pressed {
@@ -334,17 +326,12 @@ impl App {
                 }
 
                 // ── ★ レーティング (最上段。★ → タグ → 内容 の統一順序) ──
-                // タグと同じく、フォルダ★ と ページ★ を両方出す (フォルダ行があるとき)。
-                let show_rating = rating_idx.is_some() || folder_rating_path.is_some();
+                // ページ★とコンテナ★を両方出す (コンテナ行があるときはページを明記)。
+                let show_rating = rating_idx.is_some() || container_rating.is_some();
                 if show_rating {
-                    if folder_rating_path.is_some() {
-                        ui.label(
-                            egui::RichText::new("フォルダ")
-                                .color(LABEL_COLOR)
-                                .size(11.0),
-                        );
-                        set_folder_rating =
-                            crate::ui_helpers::draw_rating_stars(ui, folder_rating_stars);
+                    if let Some((label, stars)) = container_rating {
+                        ui.label(egui::RichText::new(label).color(LABEL_COLOR).size(11.0));
+                        set_container_rating = crate::ui_helpers::draw_rating_stars(ui, stars);
                         if rating_idx.is_some() {
                             ui.add_space(4.0);
                             ui.label(egui::RichText::new("ページ").color(LABEL_COLOR).size(11.0));
@@ -468,7 +455,7 @@ impl App {
                     && sidecar_info.is_none()
                     && current_palette.is_none()
                     && rating_idx.is_none()
-                    && folder_rating_path.is_none()
+                    && container_rating.is_none()
                 {
                     draw_no_metadata(ui);
                 }
@@ -478,8 +465,11 @@ impl App {
         if let (Some(idx), Some(new_stars)) = (rating_idx, set_rating) {
             self.set_rating(idx, new_stars);
         }
-        if let (Some(folder), Some(new_stars)) = (folder_rating_path.as_ref(), set_folder_rating) {
-            self.set_folder_rating_by_path(folder, new_stars);
+        if let Some(new_stars) = set_container_rating {
+            match self.set_current_folder_rating(new_stars) {
+                Ok(_) => {}
+                Err(error) => self.report_rating_write_error(&error),
+            }
         }
         // タグボタンクリックの後処理 (closure 外で self を可変借用する)
         if let Some((tag_name, targets)) = clicked_tag {
@@ -668,6 +658,19 @@ impl App {
         let idx = self.fullscreen_idx?;
         let key = self.metadata_cache_key(idx)?;
         self.sidecar_display_cache.get(&key).cloned().flatten()
+    }
+
+    pub(crate) fn current_metadata_panel_container_rating(&mut self) -> Option<(&'static str, u8)> {
+        use crate::rating_db::RatingItemKind;
+
+        let (_, _, meta) = self.current_container_rating_target()?;
+        let label = match meta.kind {
+            RatingItemKind::Folder | RatingItemKind::ZipDir => "フォルダ",
+            RatingItemKind::PdfFile => "PDF",
+            RatingItemKind::ZipFile | RatingItemKind::ConvertibleArchive => "書庫",
+            _ => return None,
+        };
+        Some((label, self.current_folder_rating()))
     }
 
     fn collect_fullscreen_tag_panel_rows(&mut self) -> Vec<TagPanelRow> {

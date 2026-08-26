@@ -40,7 +40,7 @@
 | 本ブックマーク DB | `std::thread` (`book-bookmarks`) + mpsc | App-global 1 | `book_bookmarks.db` の追加 / コンテナ別一覧 / 全件一覧 / 削除 / path migration を直列処理する。製本 worker は最初のファイル変更前に、最終 path mapping と永続 temp 名・copy/move identity を含む filesystem plan を `Prepared` journal として保存する。`Applying` の step ごとに進捗を保存し、全 filesystem step 完了後の `FilesystemCommitted` だけ bookmark migration と journal 消去を同一 transaction で commit する。通常エラーは先に `RollingBack` を保存し、全 inverse step の成功を証明できた場合だけ journal を消す。起動時は `Prepared` を no-op 破棄し、`Applying` / `RollingBack` を実 filesystem 状態から冪等再開する。ただし同一プロセスで writer が生存中の job は active ownership registry で回復対象外にし、複数 service が実行中操作を crash 残存と誤認しない。DB busy / parse / I/O failure の entry と診断は消さず次回 retry に残す。UI は正規化前の表示値と identity を request で送り、result event からメモリ上の現在本一覧を更新する。SQLite open / schema 作成を含め UI スレッドでは行わない |
 | 横断ブックマーク一覧 | `std::thread` (`bookmark-browser-build` / `bookmark-browser-delete`) + mpsc | 一覧再読込または削除ごとに最大 1 | `video_bookmarks.db` と `book_bookmarks.db` を共通 read model にまとめ、登録日時順ソートと元コンテナ / ページの存在確認を行う。動画・音声の種別判定、保存済み WebP の decode、ZIP entry / PDF page の確認も worker 側。結果は通常の `App.items` グリッドと同順の sidecar row として install し、保存済み WebP も通常のフレーム当たり texture upload 上限を通す。削除 worker は DB 行だけを削除し、元メディアへ filesystem 操作を行わない。UI は在メモリの media / book subtype filter と通常 facet だけを評価する |
 | ブックマーク状態フィルタ | `std::thread` (`bookmark-presence-build`) + mpsc | 状態条件の初回使用または CRUD 後に最大 1 | 動画・音声 path、本 container / page identity の軽量集合だけを両 DB から読み、通常一覧へ渡す。行ごとのフィルタ判定は在メモリ。snapshot完了時はmain / active detached / paused detachedを順にmountし、各context所有の表示集合をDB I/Oなしで再計算する。スマートフォルダは既存 prepare worker 内で同じ snapshot を読み、UI スレッドから DB を開かない |
-| 明示メタ情報転送 | `std::thread` (`metadata-export` / `metadata-import-preview` / `metadata-import` / `metadata-import-refresh`) + mpsc + `AtomicBool` | 完全モーダル中にimport本体と終端refreshを直列で最大 1 | `mimageviewer.meta.miv` の再帰列挙、JSON / media-kind / file-size検証・原子的exportと、評価 / タグ / ブックマーク / 見開き / 表示トリム / 回転 / ページ編集 / サムネピンDBのimportをUI thread外で行う。変換archiveはsource containerとcache ZIP pageのaliasをportable identityへ変換する。列挙は`read_dir`を逐次消費し、メタ情報DBは一時scope表とpath indexで列挙済み項目だけを読む。開始前にpending view-trimをメモリsnapshotとしてworkerへ渡す。main / active detached / paused detachedのXMP rating readerは取消し、legacy tag seedは完了結果をcontextへ適用してから、既存metadata writer / rename migrationとともにdrainする。転送完了・開始失敗・待機cancel後はXMP readerを全contextへ再生成する。dirtyな`mimageviewer.dat`群とAppのTagsDb connectionも所有権ごとimport workerへ移してflush / journal-mode handoff / 再openを行い、いずれかのflush失敗時はDB更新を開始しない。importは15ストアをattached connectionへまとめ、256項目 / 実record 64 MiB / 500 msの外側transactionと項目SAVEPOINTを使う。target照合はファイル本体を読まず相対path / kind / sizeを使う。family削除はindex range seek、sidecar syncはfolder / section単位、file種別外storeはskipする。異常終了では現在batch、項目エラーでは当該SAVEPOINTだけをrollbackし、明示cancelでは現在batchもcommitする。DB更新中は既存UI cacheを変更しない。終端時だけ影響viewer contextの現在キー、folder-pin identity、legacy seed pathを3 ms / 2048項目ずつcompact snapshot化し、refresh workerがDBを一括再取得する。タグcacheは未タグキーも空Vecの読込済みsentinelとして含める。page-state importは永続edit-preview cacheのclear ACKを待ち、main / active detached / paused detachedへ失効を伝播し、旧/新編集状態の和に当たるmaterialized thumbnailを再要求する。UIは世代・window identity一致後、各contextをmount中にcache swapとvisible/facet/details/selection再計算、およびXMP rating hydration / legacy tag seed workerの再生成を行う。外部snapshotによる表示再計算はApp-globalなfacet scope / suppressionを同期せず、不一致ならモーダル中に再取得する。video pin削除も全対象動画の再生成として表現する。終端refreshはimport本体と別cancel tokenを持ち、終了・破棄時はcontext/DB chunk境界で中断して巨大な途中結果をworker側でdropする。本体と終端refreshの段階時間は常時logと任意の構造化perf logへ記録する |
+| 明示メタ情報転送 | `std::thread` (`metadata-export` / `metadata-import-preview` / `metadata-import` / `metadata-import-refresh`) + mpsc + `AtomicBool` | 完全モーダル中にimport本体と終端refreshを直列で最大 1 | `mimageviewer.meta.miv` の再帰列挙、JSON / media-kind / file-size検証・原子的exportと、評価 / タグ / ブックマーク / 見開き / 表示トリム / 回転 / ページ編集 / サムネピンDBのimportをUI thread外で行う。変換archiveはsource containerとcache ZIP pageのaliasをportable identityへ変換する。列挙は`read_dir`を逐次消費し、メタ情報DBは一時scope表とpath indexで列挙済み項目だけを読む。開始前にpending view-trimをメモリsnapshotとしてworkerへ渡す。main / active detached / paused detachedのXMP rating readerは取消し、legacy tag seedは完了結果をcontextへ適用してから、既存metadata writer / rename migrationとともにdrainする。転送完了・開始失敗・待機cancel後はXMP readerを全contextへ再生成する。dirtyな`mimageviewer.dat`群とAppのTagsDb connectionも所有権ごとimport workerへ移してflush / journal-mode handoff / 再openを行い、いずれかのflush失敗時はDB更新を開始しない。importは15ストアをattached connectionへまとめ、256項目 / 実record 64 MiB / 500 msの外側transactionと項目SAVEPOINTを使う。target照合はファイル本体を読まず相対path / kind / sizeを使う。family削除はindex range seek、sidecar syncはfolder / section単位、file種別外storeはskipする。異常終了では現在batch、項目エラーでは当該SAVEPOINTだけをrollbackし、明示cancelでは現在batchもcommitする。DB更新中は既存UI cacheを変更しない。終端時だけ影響viewer contextの現在キー、folder-pin identity、legacy seed pathを3 ms / 2048項目ずつcompact snapshot化し、refresh workerがDBを一括再取得する。タグcacheは未タグキーも空Vecの読込済みsentinelとして含める。page-state importは永続edit-preview cacheのclear ACKを待ち、main / active detached / paused detachedへ失効を伝播し、旧/新編集状態の和に当たるmaterialized thumbnailを再要求する。UIは要求構築時に焼き込んだViewerContextIdのresidenceがMounted / AtRestで、かつitems generation一致後、各contextをmount中にcache swapとvisible/facet/details/selection再計算、およびXMP rating hydration / legacy tag seed workerの再生成を行う。mainも適用時のbindingではなく要求時のregistry.main()をidentityとして保持する。Retiredへの遅延結果はdebug記録だけで破棄し、Unknown / Building / Retiringは不変条件違反として診断して破棄する。外部snapshotによる表示再計算はApp-globalなfacet scope / suppressionを同期せず、不一致ならモーダル中に再取得する。video pin削除も全対象動画の再生成として表現する。終端refreshはimport本体と別cancel tokenを持ち、終了・破棄時はcontext/DB chunk境界で中断して巨大な途中結果をworker側でdropする。本体と終端refreshの段階時間は常時logと任意の構造化perf logへ記録する |
 | テキスト注釈ベイク | `std::thread` (`comic-bake`) + mpsc | 閲覧時最大 2 | Ctrl+T 注釈を final composite 上へ焼き込む。閲覧時は stamp 画像の cache miss デコードも worker 側で行い、完了時に `comic_stamp_cache` へ merge する。編集中はライブ追従を優先し、プレビュー解像度で同期ベイクする |
 | 音声出力 warm-up | `std::thread` (`cpal-warmup`) | 起動時 1 本 | WASAPI の初回 audio session 確立をバックグラウンドで済ませる。小さな無音 cpal stream を短時間だけ開いて閉じ、初回動画 open の UI スレッド停止を避ける |
 | 動画サムネイル | `std::thread` | 1 | Windows Shell API を逐次呼び出し |
@@ -278,7 +278,8 @@ Ctrl+↑↓ は複数の起点から発火し、DFS 完了時に異なる後処�
   `FolderPaneOpenPending`、`pending_folder_nav_steps`、`pending_folder_nav_mode`、
   `ViewerNavigationScope` を一式で所有する。main と
   `DetachedPhysical` の active independent 静止画窓は bundle swap で完全に分離され、
-  active detached の結果はその bundle を mount 中の
+  bundle は viewer context registry の slot だけに保管される。active detached の結果は
+  window binding から特定した context を registry transaction で mount 中の
   `update_active_detached_viewer_context` だけが poll / apply する。pause / Drop は
   cancel token を立て、遅延結果を sibling context へ持ち越さない。
 - 仮想一覧から通常画像を detached open するときは、親フォルダの `read_dir` / metadata scan を
@@ -760,10 +761,33 @@ analyze / metadata 取得はすべて同じ cache を通り、要求ごとに st
 `(path, password, mtime, file_size)` が完全一致した場合だけ document を再利用する。stat 失敗では
 保持 document を閉じ、古い内容を返さない。cache は 1 件固定で、時間窓や context epoch 解放は持たない。
 
-一方、**起動成功後に PDF / Susie worker が想定外終了しても、現在は自動 respawn しない**。
+一方、**起動成功後に PDF worker が想定外終了しても、現在は自動 respawn しない**。
 dispatcher は stdin/stdout の切断をその要求の Err として返すだけで、worker 数も補充しない。
-したがって、この節は起動後の自己回復を保証しない。respawn を追加する場合は、in-flight request の
-再送可否、worker_count と lane cap の更新、終了・cancel との競合を別設計として扱う必要がある。
+したがって、この節は PDF 側の起動後の自己回復を保証しない。respawn を追加する場合は、in-flight
+request の再送可否、worker_count と lane cap の更新、終了・cancel との競合を別設計として扱う。
+
+**Susie worker は自己回復する** (§1.120、2026-08-25)。スロットごとに以下を持つ:
+
+- `DispatcherExit::WorkerLost` — transport が切れた dispatcher は**即座に退役**する。
+  死んだ pipe を持ったまま共有キューから後続を取り続けると、失敗が即座に返る分だけ
+  生きているワーカーより速く job を吸う。`InvalidData` は含めない (ワーカーは生きている)。
+- `run_worker_slot` が backoff (200ms × 試行回数、上限 5 回) で同じスロットを作り直す。
+  **再起動回数は連続失敗で数える** (`restart_count_after_loss`)。1 件でも応答を返せた
+  ワーカーは働けていたので数え直す。累積で数えると、たまに落ちるプラグインでも
+  使い続けるうちに必ず枯渇する。
+- **クラッシュを起こした要求は再送しない。** その 1 件はエラーで返し、後続のためだけに
+  補充する。落とした対象 (`crashers`) はプールの生存期間だけ記憶し、二度と投げない。
+  これが無いと同じフォルダを開くたびに同じ画像でワーカーが死に続ける。
+- 最後のスロットが閉じたら `fail_pending_jobs_no_workers` がキューを排出し、以降の
+  enqueue も**積むのと同じロックの中で**断る。これが無いと UI が「読込中」で固着する。
+- 諦めた理由は `SlotExit` として抜けた場所で確定させ、**最後のスロットが諦めたときだけ**
+  one-shot notice を発行する (`should_notify_workers_gone`)。終了・再読み込みで畳んだ
+  場合は出さない。枠が 1 つ減っただけでも出さない (残りが処理を続けられる間、利用者に
+  できることが無い)。
+- 集計 (`SusieWorkerHealth`) は起動できた枠数・生存枠数・作り直し回数・打ち切り数・
+  落とした対象数・最後の失敗理由を持ち、環境設定の診断パネルと notice の両方がここだけを
+  読む。**起動できなかった** (`WorkerSpawnFailed`) と**起動したが尽きた**
+  (`WorkersExhausted`) を区別するために起動時の枠数を残す。
 
 **Susie プラグインの並列実行に関する注意**: Susie 画像プラグインは 1990〜2000 年代の
 レガシー規格で、並列実行 (特にプロセス跨ぎ) を想定していないプラグインが稀にある。

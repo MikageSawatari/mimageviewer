@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+pub mod mask_codec;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalAdjustError {
     InvalidImageBuffer { expected: usize, actual: usize },
@@ -215,6 +217,7 @@ pub enum LocalMask {
 pub struct RasterMask {
     pub width: usize,
     pub height: usize,
+    #[serde(with = "crate::mask_codec::alpha")]
     pub alpha: Vec<f32>,
 }
 
@@ -253,8 +256,13 @@ fn default_subject_cutout_feather_px() -> i32 {
 pub struct SubjectMask {
     pub width: usize,
     pub height: usize,
+    #[serde(with = "crate::mask_codec::alpha")]
     pub alpha: Vec<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::mask_codec::alpha_opt"
+    )]
     pub source_alpha: Option<Vec<f32>>,
     #[serde(default)]
     pub refinement: SubjectMaskRefinement,
@@ -265,6 +273,7 @@ pub struct RegionMask {
     pub width: usize,
     pub height: usize,
     /// 0 means no region / background. Positive labels index into `selected`.
+    #[serde(with = "crate::mask_codec::labels")]
     pub labels: Vec<u32>,
     pub selected: Vec<bool>,
 }
@@ -300,6 +309,7 @@ pub struct RasterVectorMask {
     pub width: usize,
     pub height: usize,
     /// Bitmap strokes and filled polygon results.
+    #[serde(with = "crate::mask_codec::alpha")]
     pub alpha: Vec<f32>,
     /// Editable object mask shapes, applied on top of the bitmap alpha.
     pub shapes: Vec<MaskShape>,

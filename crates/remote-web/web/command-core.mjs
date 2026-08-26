@@ -16,6 +16,8 @@ export const CommandName = Object.freeze({
   SPREAD_LTR_COVER: "spread_ltr_cover",
   SPREAD_RTL: "spread_rtl",
   SPREAD_RTL_COVER: "spread_rtl_cover",
+  SPREAD_SPLIT_LTR: "spread_split_ltr",
+  SPREAD_SPLIT_RTL: "spread_split_rtl",
   SET_TRANSFORM: "set_transform",
   PAN_BY: "pan_by",
   TOGGLE_MENU: "toggle_menu",
@@ -61,6 +63,19 @@ export const SpreadMode = Object.freeze({
   LTR_COVER: "ltr_cover",
   RTL: "rtl",
   RTL_COVER: "rtl_cover",
+  SPLIT_LTR: "split_ltr",
+  SPLIT_RTL: "split_rtl",
+});
+
+/// 分割したページの、どちら側を見せているか。
+///
+/// **元ページのアドレスは変えない。**取得も履歴もキャッシュも元ページのままで、左右は
+/// 表示だけの区別 (本体・protocol と同じ約束)。したがって同じアドレスを持つ表示単位が
+/// 2 つ並ぶ場面があり、アドレスだけでは位置が決まらない。
+export const PageSlice = Object.freeze({
+  FULL: "full",
+  LEFT: "left",
+  RIGHT: "right",
 });
 
 export const ReadingDirection = Object.freeze({
@@ -874,6 +889,9 @@ export function commandFromKey(input, context) {
     if (plain && key === "3") return command(CommandName.SPREAD_LTR_COVER);
     if (plain && key === "4") return command(CommandName.SPREAD_RTL);
     if (plain && key === "5") return command(CommandName.SPREAD_RTL_COVER);
+    // 6 / 7 は本体の保存値 (SpreadMode::to_int) と同じ並び。
+    if (plain && key === "6") return command(CommandName.SPREAD_SPLIT_LTR);
+    if (plain && key === "7") return command(CommandName.SPREAD_SPLIT_RTL);
     return null;
   }
 
@@ -953,15 +971,42 @@ export function isRtlSpread(mode) {
   return mode === SpreadMode.RTL || mode === SpreadMode.RTL_COVER;
 }
 
+/// 横長 1 ページを左右へ分けて読むモードか。**見開きとは排他**なので `isRtlSpread`
+/// には含めない (見開きのペア並び順とは別の概念)。
+export function isSplitSpread(mode) {
+  return mode === SpreadMode.SPLIT_LTR || mode === SpreadMode.SPLIT_RTL;
+}
+
+export function isHalfSlice(slice) {
+  return slice === PageSlice.LEFT || slice === PageSlice.RIGHT;
+}
+
+/// 切り抜きは DOM を組み替えず CSS で行う。box の縦横比が元画像のちょうど半分なので
+/// `cover` は拡大せずぴったり収まり、`object-position` が左右どちらを見せるかを決める。
+/// 分割していないときは null を返し、既定の描画に戻す。
+export function pageSliceObjectPosition(slice) {
+  if (slice === PageSlice.LEFT) return "left center";
+  if (slice === PageSlice.RIGHT) return "right center";
+  return null;
+}
+
 export function isRtlReadingDirection(direction) {
   return direction === ReadingDirection.RTL;
 }
 
 export function readingDirectionForSpreadMode(mode, currentDirection) {
-  if (mode === SpreadMode.RTL || mode === SpreadMode.RTL_COVER) {
+  if (
+    mode === SpreadMode.RTL ||
+    mode === SpreadMode.RTL_COVER ||
+    mode === SpreadMode.SPLIT_RTL
+  ) {
     return ReadingDirection.RTL;
   }
-  if (mode === SpreadMode.LTR || mode === SpreadMode.LTR_COVER) {
+  if (
+    mode === SpreadMode.LTR ||
+    mode === SpreadMode.LTR_COVER ||
+    mode === SpreadMode.SPLIT_LTR
+  ) {
     return ReadingDirection.LTR;
   }
   return currentDirection === ReadingDirection.RTL
@@ -1214,6 +1259,46 @@ export function viewerSpreadLayout({
     gap: resolvedGap,
     cssWidth: pageLayouts.reduce((sum, page) => sum + page.cssWidth, 0) + resolvedGap,
     cssHeight,
+  };
+}
+
+/// 表示単位ひとつ分の配置。**左右分割を知っているのはここだけ。**
+///
+/// box を決める寸法と、取り寄せる画像の寸法が違う。見せるのは半分でも、届くのは元
+/// ページ 1 枚まるごとなので、要求幅まで半分にすると実質 1/4 の解像度になる。半分の
+/// box 用に幅を割ってから、要求幅だけ元ページ分へ戻す。
+///
+/// **配置を自前で組み立てないこと。**同じページを 2 回、別の場所を見せるので、box の
+/// 寸法だけ合わせて切り抜きを忘れると、拡大された同じ絵が 2 回出る。
+export function viewerSlicedSpreadLayout({
+  slice = PageSlice.FULL,
+  pages,
+  maxRequestWidth = 8192,
+  ...rest
+}) {
+  const half = isHalfSlice(slice);
+  const sources = (pages ?? []).map((page) => {
+    const width = Math.max(1, Number(page?.width) || 1);
+    return {
+      width: half ? Math.max(1, Math.round(width / 2)) : width,
+      height: Math.max(1, Number(page?.height) || 1),
+    };
+  });
+  const layout = viewerSpreadLayout({
+    ...rest,
+    pages: sources,
+    // 半分の box に対する要求幅を 2 倍しても元の上限を超えないよう、先に割っておく。
+    maxRequestWidth: half
+      ? Math.max(1, Math.floor(maxRequestWidth / 2))
+      : maxRequestWidth,
+  });
+  if (!half) return layout;
+  return {
+    ...layout,
+    pages: layout.pages.map((page) => ({
+      ...page,
+      requestWidth: page.requestWidth * 2,
+    })),
   };
 }
 

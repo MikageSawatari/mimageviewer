@@ -130,7 +130,33 @@ pub enum CanonicalImageDecode {
 #[derive(Debug)]
 pub enum CanonicalDecodeError {
     SourceRead(std::io::Error),
-    Decode(image::ImageError),
+    Decode(DecodeChainFailure),
+}
+
+/// 画像 → WIC → Susie の連鎖が全部失敗したときの内訳。
+///
+/// 以前は image クレートのエラーだけを返していた。その文面は未対応拡張子に対して
+/// `The file extension `."xxx"` was not recognized as an image format` になるため、
+/// **WIC も Susie も試したうえで失敗したのに「Susie に到達していない」と読めてしまう**。
+/// 実際にバックログ 2.21 はその誤読から立てられた。連鎖の各段が何をしたかを持たせる。
+/// この型が作られるのは連鎖の**最後**だけなので、WIC と Susie は必ず試されている。
+/// 「試したか」の bool は持たない (常に true にしかならない分岐を作らない)。
+#[derive(Debug)]
+pub struct DecodeChainFailure {
+    /// image クレートのエラー。拡張子由来の「非対応」もここに出る。
+    pub primary: image::ImageError,
+    /// Susie が返した失敗理由。プラグイン無効・未対応・ワーカー喪失を区別できる。
+    pub susie_error: std::io::Error,
+}
+
+impl std::fmt::Display for DecodeChainFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} (WIC could not read it either; Susie failed: {})",
+            self.primary, self.susie_error
+        )
+    }
 }
 
 impl std::fmt::Display for CanonicalDecodeError {
@@ -310,24 +336,33 @@ fn decode_canonical_image_with_fallbacks(
         }
     }
 
+    // 失敗したときは連鎖のどこで何が起きたかを持って返す。Susie のエラーを捨てると、
+    // 「拡張子が認識されない」という image クレートの文面だけが残り、Susie を試した
+    // ことすら伝わらない (バックログ 2.21 の誤読の原因)。
     let image = if let Some(bytes) = bytes {
         match image::load_from_memory(bytes) {
             Ok(image) => Ok(image),
-            Err(primary_error) => match fallbacks.wic_bytes(bytes) {
+            Err(primary) => match fallbacks.wic_bytes(bytes) {
                 Some(image) => Ok(image),
                 None => fallbacks
                     .susie_bytes(&source.filename_hint, bytes, options)
-                    .map_err(|_| primary_error),
+                    .map_err(|susie_error| DecodeChainFailure {
+                        primary,
+                        susie_error,
+                    }),
             },
         }
     } else {
         match image::open(source.path) {
             Ok(image) => Ok(image),
-            Err(primary_error) => match fallbacks.wic_path(source.path) {
+            Err(primary) => match fallbacks.wic_path(source.path) {
                 Some(image) => Ok(image),
                 None => fallbacks
                     .susie_path(source.path, options)
-                    .map_err(|_| primary_error),
+                    .map_err(|susie_error| DecodeChainFailure {
+                        primary,
+                        susie_error,
+                    }),
             },
         }
     }
@@ -1249,6 +1284,42 @@ mod tests {
 
         assert!(matches!(result, Err(CanonicalDecodeError::Decode(_))));
         assert_eq!(fallbacks.calls(), vec!["wic_bytes", "susie_bytes"]);
+    }
+
+    /// 連鎖が全部失敗したとき、失敗の内訳が読める文面で出る。
+    ///
+    /// image クレートの文面だけを見せると、未対応拡張子では
+    /// 「拡張子が画像として認識されなかった」としか読めず、**WIC も Susie も試した
+    /// あとの失敗なのに Susie に到達していないように見える**。実際にバックログ 2.21 は
+    /// この文面から立てられた誤った見立てだった。
+    #[test]
+    fn a_failed_decode_says_that_wic_and_susie_were_tried_too() {
+        let fallbacks = RecordingFallbacks {
+            calls: Mutex::new(Vec::new()),
+            wic: BackendResult::Miss,
+            susie: BackendResult::Miss,
+        };
+        let result = decode_canonical_image_with_fallbacks(
+            CanonicalImageSource::File {
+                path: Path::new("page.miv-unknown"),
+                verified_bytes: Some(b"not an image"),
+            },
+            CanonicalDecodeOptions::fullscreen(AnimationPolicy::FullFrames),
+            &fallbacks,
+        );
+        let Err(error) = result else {
+            panic!("nothing can decode this");
+        };
+
+        let text = error.to_string();
+        assert!(
+            text.contains("WIC") && text.contains("Susie"),
+            "the message must name the decoders that ran: {text}"
+        );
+        assert!(
+            text.contains("miss"),
+            "the Susie failure reason must survive: {text}"
+        );
     }
 
     #[cfg(windows)]

@@ -45,13 +45,6 @@ impl ViewerSession {
         );
         std::mem::swap(&mut self.detached_window_id, detached_window_id);
     }
-
-    pub(super) fn activate_independent_detached(&mut self, window_id: u64) {
-        self.presentation = ViewerPresentation::DetachedWindow;
-        self.independent_active = true;
-        self.open_next_still_detached_once = false;
-        self.detached_window_id = Some(window_id);
-    }
 }
 
 #[cfg(test)]
@@ -131,16 +124,32 @@ mod tests {
     }
 
     #[test]
-    fn activating_independent_detached_sets_the_complete_identity_tuple() {
-        let mut session = ViewerSession::default();
-        session.last_sync_stamp = Some(stamp(1, "keep", 10));
+    fn independent_detached_identity_tuple_round_trips_through_the_mounted_projection() {
+        let mut session = ViewerSession {
+            presentation: ViewerPresentation::DetachedWindow,
+            last_sync_stamp: Some(stamp(1, "keep", 10)),
+            independent_active: true,
+            open_next_still_detached_once: false,
+            detached_window_id: Some(37),
+        };
+        let mut presentation = ViewerPresentation::Fullscreen;
+        let mut last_sync_stamp = None;
+        let mut independent_active = false;
+        let mut open_next_still_detached_once = true;
+        let mut detached_window_id = None;
 
-        session.activate_independent_detached(37);
+        session.swap_with_mounted(
+            &mut presentation,
+            &mut last_sync_stamp,
+            &mut independent_active,
+            &mut open_next_still_detached_once,
+            &mut detached_window_id,
+        );
 
-        assert_eq!(session.presentation, ViewerPresentation::DetachedWindow);
-        assert!(session.independent_active);
-        assert!(!session.open_next_still_detached_once);
-        assert_eq!(session.detached_window_id, Some(37));
-        assert_eq!(session.last_sync_stamp, Some(stamp(1, "keep", 10)));
+        assert_eq!(presentation, ViewerPresentation::DetachedWindow);
+        assert!(independent_active);
+        assert!(!open_next_still_detached_once);
+        assert_eq!(detached_window_id, Some(37));
+        assert_eq!(last_sync_stamp, Some(stamp(1, "keep", 10)));
     }
 }

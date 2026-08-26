@@ -9,9 +9,20 @@ fn main() {
     // CARGO_CFG_TARGET_OS 環境変数で実行時判定する。
     let target_is_windows = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
 
-    // Native video NIS is compiled by D3D11 from this converter output at pipeline creation.
-    generate_video_nis_hlsl();
-    generate_video_anime4k_shaders(target_is_windows);
+    // native presenter のシェーダは **すべてビルド時に FXC で DXBC 化する**。
+    //
+    // 以前は NIS / grade / resample を `NativeRenderCore::new` の中で `D3DCompile` して
+    // いた。この constructor は動画を開くたび、さらに **F12 の placement 切替のたび**に
+    // 丸ごと走るため、compile コストがそのまま体感遅延になっていた。実測で NIS だけが
+    // **2138ms** (他 6 本は合計 28ms)。1 往復あたり 2 秒以上を毎回払っていたことになる
+    // (backlog §1.122)。Anime4K は最初からこの経路なので、残りを揃えただけ。
+    let fxc = target_is_windows
+        .then(find_fxc)
+        .transpose()
+        .unwrap_or_else(|error| panic!("{error}"));
+    generate_video_nis_hlsl(fxc.as_deref());
+    compile_video_presenter_shaders(fxc.as_deref());
+    generate_video_anime4k_shaders(fxc.as_deref());
 
     // 先に vendor ファイルの存在チェックをして、cryptic な include_bytes! エラーに
     // 代わって復旧手順付きの明確なメッセージを出す。
@@ -77,21 +88,86 @@ fn main() {
     }
 }
 
-/// Convert the canonical WGSL NIS shader to Shader Model 5 HLSL.
+/// Convert the canonical WGSL NIS shader to Shader Model 5 HLSL, then to DXBC.
 ///
 /// `gpu_nis.wgsl` remains the single source for the NIS coefficients and algorithm.
 /// Native video consumes only this generated output; it does not carry a second hand port.
-fn generate_video_nis_hlsl() {
+/// The HLSL file is FXC's input; the presenter only ever sees the `.cso` (backlog §1.122).
+fn generate_video_nis_hlsl(fxc: Option<&std::path::Path>) {
+    use naga::ShaderStage;
+
     const SOURCE_PATH: &str = "src/gpu_nis.wgsl";
     println!("cargo:rerun-if-changed={SOURCE_PATH}");
     let source = std::fs::read_to_string(SOURCE_PATH)
         .unwrap_or_else(|error| panic!("read {SOURCE_PATH}: {error}"));
-    let (_, _, output) = convert_wgsl_to_hlsl(SOURCE_PATH, &source, None);
+    let (module, hlsl_entry_names, output) = convert_wgsl_to_hlsl(SOURCE_PATH, &source, None);
 
-    let out_dir = std::env::var_os("OUT_DIR").expect("OUT_DIR");
-    let output_path = std::path::PathBuf::from(out_dir).join("video_nis.hlsl");
+    let out_dir = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let output_path = out_dir.join("video_nis.hlsl");
     std::fs::write(&output_path, output)
         .unwrap_or_else(|error| panic!("write {}: {error}", output_path.display()));
+
+    // naga は entry point 名を書き換えることがあるので、WGSL 側の名前ではなく
+    // reflection が返した HLSL 側の名前で FXC を呼ぶ (Anime4K と同じ扱い)。
+    let (entry_index, _) = module
+        .entry_points
+        .iter()
+        .enumerate()
+        .find(|(_, entry)| entry.stage == ShaderStage::Fragment && entry.name == "fs_nis")
+        .unwrap_or_else(|| panic!("{SOURCE_PATH} has no fs_nis fragment entry point"));
+    if let Some(fxc) = fxc {
+        compile_hlsl_with_fxc(
+            fxc,
+            &output_path,
+            &hlsl_entry_names[entry_index],
+            "ps_5_0",
+            &out_dir.join("video_nis_fs_nis.cso"),
+        );
+    }
+}
+
+/// grade / resample の手書き HLSL をビルド時に DXBC 化する。
+///
+/// これらは `NativeRenderCore::new` から `D3DCompile` されていたが、同 constructor は
+/// placement 切替のたびに走る。`.cso` にしておけば `CreatePixelShader` を呼ぶだけになる
+/// (backlog §1.122)。
+fn compile_video_presenter_shaders(fxc: Option<&std::path::Path>) {
+    const SHADERS: &[(&str, &[(&str, &str)])] = &[
+        (
+            "src/video/native_presenter/shaders/video_grade.hlsl",
+            &[("vs_main", "vs_5_0"), ("ps_main", "ps_5_0")],
+        ),
+        (
+            "src/video/native_presenter/shaders/video_resample.hlsl",
+            &[
+                ("vs_main", "vs_5_0"),
+                ("ps_horizontal", "ps_5_0"),
+                ("ps_vertical", "ps_5_0"),
+                ("ps_nearest", "ps_5_0"),
+            ],
+        ),
+    ];
+
+    let out_dir = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    for (source_path, entries) in SHADERS {
+        println!("cargo:rerun-if-changed={source_path}");
+        let stem = std::path::Path::new(source_path)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_else(|| panic!("{source_path} has no file stem"));
+        for (entry, target) in *entries {
+            let output = out_dir.join(format!("{stem}_{entry}.cso"));
+            if let Some(fxc) = fxc {
+                compile_hlsl_with_fxc(
+                    fxc,
+                    std::path::Path::new(source_path),
+                    entry,
+                    target,
+                    &output,
+                );
+            }
+        }
+    }
 }
 
 fn convert_wgsl_to_hlsl(
@@ -180,15 +256,11 @@ const ANIME4K_BUILD_VARIANTS: &[Anime4kBuildVariant] = &[
     },
 ];
 
-fn generate_video_anime4k_shaders(target_is_windows: bool) {
+fn generate_video_anime4k_shaders(fxc: Option<&std::path::Path>) {
     use naga::ShaderStage;
     use std::fmt::Write as _;
 
     let out_dir = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
-    let fxc = target_is_windows
-        .then(find_fxc)
-        .transpose()
-        .unwrap_or_else(|error| panic!("{error}"));
     let mut generated_table = String::from(
         "// Generated by build.rs from the generated Anime4K WGSL entry points.\n\
          // Do not edit this file directly.\n\n\
@@ -248,8 +320,14 @@ fn generate_video_anime4k_shaders(target_is_windows: bool) {
         .expect("write Anime4K bytecode table");
         for (index, entry) in &convolution_entries {
             let output_name = format!("video_anime4k_{}_{}.cso", variant.suffix, index);
-            if let Some(fxc) = &fxc {
-                compile_hlsl_with_fxc(fxc, &hlsl_path, entry, &out_dir.join(&output_name));
+            if let Some(fxc) = fxc {
+                compile_hlsl_with_fxc(
+                    fxc,
+                    &hlsl_path,
+                    entry,
+                    "ps_5_0",
+                    &out_dir.join(&output_name),
+                );
             }
             writeln!(
                 generated_table,
@@ -258,11 +336,12 @@ fn generate_video_anime4k_shaders(target_is_windows: bool) {
             .expect("write Anime4K convolution bytecode table");
         }
         let resolve_name = format!("video_anime4k_{}_resolve.cso", variant.suffix);
-        if let Some(fxc) = &fxc {
+        if let Some(fxc) = fxc {
             compile_hlsl_with_fxc(
                 fxc,
                 &hlsl_path,
                 &hlsl_entry_names[resolve_entry.0],
+                "ps_5_0",
                 &out_dir.join(&resolve_name),
             );
         }
@@ -314,7 +393,8 @@ fn find_fxc() -> Result<std::path::PathBuf, String> {
     }
 
     Err(
-        "Anime4K video shader bytecode requires the Windows SDK FXC compiler, but fxc.exe was not found.\n\
+        "Native presenter shader bytecode (NIS / grade / resample / Anime4K) requires the Windows SDK\n\
+         FXC compiler, but fxc.exe was not found.\n\
          Recovery: install the Windows 10/11 SDK Desktop C++ tools, or set MIV_FXC_PATH to its x64\\fxc.exe.\n\
          Typical location: C:\\Program Files (x86)\\Windows Kits\\10\\bin\\<sdk-version>\\x64\\fxc.exe"
             .to_string(),
@@ -325,10 +405,11 @@ fn compile_hlsl_with_fxc(
     fxc: &std::path::Path,
     source: &std::path::Path,
     entry: &str,
+    target: &str,
     output: &std::path::Path,
 ) {
     let result = std::process::Command::new(fxc)
-        .args(["/nologo", "/T", "ps_5_0", "/E", entry, "/O3", "/Fo"])
+        .args(["/nologo", "/T", target, "/E", entry, "/O3", "/Fo"])
         .arg(output)
         .arg(source)
         .output()

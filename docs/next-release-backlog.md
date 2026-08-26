@@ -647,6 +647,51 @@
   既存編集の遡りは一括スキャンせず訪問時に少しずつ。
 - 規模 / 優先度: Medium / P2 (データ損失ではないが、編集した資産が黙って失われる体験は重い)。
 
+#### 追加項目: 取り消した編集が復元元として残り続ける ✅ 修正済み (2026-08-25)
+
+- 出典: Susie クラッシュ検証中に、編集していないはずのテストファイルで復元ダイアログが出た。
+- **索引側は正しい。** `ContentIdentityIndex::upsert` は `has_restorable_content == false` の
+  エントリを索引に入れない ([content_identity.rs:221](../src/content_identity.rs:221))。
+  「中身が同じだけ」で候補になることは設計上ない。
+- **記録側が実データと同期していない。** 台帳では 5 ファイルが
+  `has_restorable_content = 1` かつ `last_edit_at` が全て同一だったが、**編集データは
+  どのデータベースにも無かった** (`content_identity.db` 以外の全 DB を走査して 0 件)。
+- **経路**: 利用者が `Ctrl+Alt+1` (`FsAdjustSlotDefault1` = 補正プリセットスロットを標準設定へ
+  読み込む) を実行 → 編集として記録 → 対象が 8x8 単色画像で結果が標準値と変わらず、
+  保存時に破棄 (`edit_preview_close: outcome=delete_no_edits`) → **台帳の記録だけが残る**。
+- **構造**: `has_restorable_content` は 0 → 1 の単調遷移として実装されている
+  ([content_identity.rs:219](../src/content_identity.rs:219))。遅れて届いた detection cache が
+  先の復元元更新を消さないための設計だが、その結果**「編集を入れてすぐ取り消した」ファイルが
+  永久に復元元として残る**。テストデータが特殊だったから目立っただけで、通常の画像でも
+  「補正をかけて元に戻した」後に同内容のコピーを開けば同じことが起きる。
+- **修正 (2026-08-25)**: 記録側で flag を下げる経路は作らなかった。編集を取り消す経路は
+  `delete_mask_with_sidecar` / `remove_view_trim_page_override` / `remove_folder_thumb_pin` など
+  複数あり、そのどれもが「編集した」として同じ record を通る。全部を数え上げて `Absent` を
+  渡す形にすると、1 つ漏らしただけで**本物の復元元を消す**側に倒れる。
+  - 代わりに**読む側で確かめる**。復元が運ぶのは `copy_stores_at` が `STORES` の unique 行を
+    写すことが全てなので、そこに 1 行も無い復元元は選ばれても no-op にしかならない。
+    **候補から外しても失われるものは無い**、が根拠。
+    `rename_key_migration::ledger_keys_with_restorable_rows_at` が同じ表・同じ正規化で引く。
+  - 台帳自身 (`content_identity.db` / `edit_origin`) は `STORES` に載っているが**除外する**
+    (`content_identity::LEDGER_DB_FILE`)。台帳の行はこの問いの対象であって答えではない。
+    最初これを数えてしまい、常に「行がある」になって probe が効かなかった。
+  - 仮想ページの `<container>::<entry>` も見る。`LIKE` はパスに普通に現れる `_` / `%` を
+    ワイルドカードとして拾うので、半開区間 (`::` 〜 `:;`) で引く。
+  - **読めない store があった key は「行がある」側へ倒す**。余計な確認が 1 回出る方が、
+    復元元を黙って消すよりはるかに軽い。
+  - ついでに flag も下ろす (`clear_restorable_if_unchanged`)。単調遷移の例外はここだけで、
+    根拠は「遅れて届いた 0」ではなく「実データがもう無い」。probe 中に UI スレッドが
+    新しい編集を記録していたら `last_edit_at` の一致条件で弾かれる (compare-and-swap)。
+    既に台帳へ残ってしまった stale 行も、次に該当コピーを開いた時点で自動的に消える。
+  - probe は候補が出たときだけ走り (= full hash 一致が必要なので稀)、背景 I/O の枠内で行う。
+- **既存テストの fixture を直した**: `folder_backfill_then_copy_...` と
+  `book_byte_copy_is_declined_...` は、実データを 1 行も持たないファイルを backfill して
+  候補を期待していた。本番の backfill は編集済みファイルにしか走らないので、fixture 側に
+  実際の ★ 行を置いて production と同じ形にした (`rated-only.jpg` という名前が既に
+  そう主張していた)。
+- 再現データ: `C:\tmp\miv-susie-crash-test` (中身が同一の `MIVOK` ファイル 5 個)。
+- 規模 / 優先度: 小〜中 / P3 (実害は余計な確認ダイアログ。データは失われない)。
+
 ### 1.99 複数ウィンドウモードで RAR を開くとメイングリッドまで書庫一覧へ切り替わる — 専用スレ >>270 ✅ 実装済み (2026-08-22)
 
 > 実装は detached-rework の `21c3dc0d` / `d7e139d0` に入っており、2026-08-22 の master マージで
@@ -1188,7 +1233,9 @@ passive detached は通常どおり release で窓を activate するが、選�
 
 - 出典: 2026-08-23 (v3.2.0 公開後)。`g:\home\comfyui\202608-29_焼き肉レストラン` を開くと、
   フルスクリーンと一覧の切り替えが激しくちらつく。**ポータブル版では同じ操作で起きない。**
-- **ポータブルで起きない理由は build flavor ではなく設定**。ポータブルは既定設定なので
+  これは初回比較時の観測で、その後タイトルバーから detached 窓を最大化するとポータブル版でも再現した
+  (下記「最大化後の追試」で訂正)。
+- **初回推定 (最大化後の追試で訂正)**: ポータブルで起きない理由は build flavor ではなく設定。ポータブルは既定設定なので
   フルスクリーンが別ウィンドウにならず、下の `detached_viewer_cleanup` 経路自体を通らない。
   `portable` feature が変えるのは native 依存の解決先と data_dir だけで、この経路に分岐は無い。
 - **ログで確認できた事実** (`mimageviewer.log`、1 セッション 14 open / 10 cleanup):
@@ -1228,7 +1275,8 @@ passive detached は通常どおり release で窓を activate するが、選�
      事実 3 と 4 から「discard 窓中に同じキーが複数回配送され、main 側が Enter を
      もう一度 open として解釈している」が第一候補だが、**未確定**。
   3. 1 と 2 は独立に進められる。1 だけでも破棄フレームが 5 → 1 になり、ちらつきの大半は消える。
-- **再現条件は「設定」ではなく「実行時の状態」** (2026-08-23 追記、利用者の settings.db を読んで確認):
+- **初回推定 (最大化後の追試で訂正): 再現条件は「設定」ではなく「実行時の状態」**
+  (2026-08-23 追記、利用者の settings.db を読んで確認):
   報告者の永続設定は `detached_viewer_enabled=false` / `detached_viewer_open_images_in_window=false` /
   `fullfeature_media_window=true` / `video_in_window_mode=true`。**静止画を別ウィンドウで開く設定は
   どれも OFF** なのに、ログでは静止画 open のたびに `presentation=Some(DetachedWindow)` になっている。
@@ -1241,10 +1289,61 @@ passive detached は通常どおり release で窓を activate するが、選�
   利用者がポータブルで同手順を試すと、閉じた後の再オープンで detached が維持されず
   `non_detached_viewer_presentation()` へ落ちた (= `video_in_window_mode=true` なので MainWindow)。
   **同じ操作で detached セッションの寿命が 2 環境で違う**こと自体が、この不具合と同じ所有権の問題。
-- **次の観測**: `MIV_DETACHED_WINDOW_DEBUG=1` で起動すると `[ui-fonts][diag]` /
+- **追加観測の指定 (実施済み)**: `MIV_DETACHED_WINDOW_DEBUG=1` で起動すると `[ui-fonts][diag]` /
   `[detached-window-debug]` が `presentation` / `session` / `active_context` / `passive_windows` /
   `fullscreen_idx` を毎回出す ([app.rs:38773](../src/app.rs:38773))。**どの分岐で DetachedWindow に
   なっているかはこれで確定できる。** 再オープンの契機と併せて 1 回の再現で両方取れる。
+- **最大化後の追試と訂正 (2026-08-23、Codex、ポータブル v3.2.0、
+  `MIV_DETACHED_WINDOW_DEBUG=1`)**:
+  1. **再現を可視化する条件はタイトルバーの最大化状態**。最初の通常サイズ open は
+     `rect=(110,110 1462x1136)` / `window_id=20` / **16.1ms**。その窓をタイトルバーで最大化して
+     close すると、settings.db は
+     `detached_viewer_window_placement.maximized=true` を保存し、次の open は
+     `rect=(-11,-11 3862x2110)` / `window_id=21` / **157.7ms**、その次も別 HWND の
+     `window_id=22` / **147.6ms** になった。通常サイズの約 10 倍を UI thread の
+     `pre_grid` で費やしている。builder が保存 placement の `maximized` を新 viewport へ適用する
+     ([ui_fullscreen.rs:17331](../src/ui_fullscreen.rs:17331)) ためで、portable feature や F11 の
+     borderless fullscreen は必要条件ではない。
+  2. **1 close ごとに HWND / viewport identity を捨て、次の open で作り直している。** ログは毎回
+     `cleanup_visible_false ... recreate=true` の後に host を clear し、generation を進める
+     ([ui_fullscreen.rs:13083](../src/ui_fullscreen.rs:13083),
+     [ui_fullscreen.rs:13111](../src/ui_fullscreen.rs:13111))。そのため最大化した新しい全面 HWND の
+     生成・surface 初期化が、一覧との切替時にそのまま見える。
+  3. close 後は既報どおり **5 回の font-atlas resync discard** が必ず走った。今回の 3 回は
+     157〜161 = 229ms、162〜166 = 240ms、167〜171 = 231ms。つまり最大化 host の
+     148〜158ms の再生成に加え、一覧側も約 0.23 秒を固定回数の race 吸収に使っている。
+     **画像 decode は 10〜11msで完了しており主因ではない。**
+  4. 上記「内部イベントによる自動再オープン」「同一 Enter の 4 重配送」は今回のログで訂正する。
+     open 時の `input_seq` は 59 → 61 → 63。viewer の Enter close が 1 回 increment
+     ([ui_fullscreen.rs:14144](../src/ui_fullscreen.rs:14144)) し、一覧の Enter open がさらに 1 回
+     increment してから `open_fullscreen` を呼ぶ
+     ([app.rs:35015](../src/app.rs:35015)) 契約と一致する。`[fs-key]` は fullscreen context の
+     生存中しか一覧側 Enter を記録しないため、「キー行が無い」ことは内部 open の証拠にならない。
+     4 個並んだのは `Enter:up` のみで、close/open を発火する `down` の重複は無かった。
+- **確定した原因**: 最大化そのものは増幅条件で、根は次の 2 つの時間窓 / lifecycle 不整合。
+  1. 明示 close が linked detached host を terminal teardown し、次の明示 open が保存済み
+     `maximized=true` の全面 HWND / surface を同期的に新規作成する。
+  2. teardown 後の main surface 復帰を観測せず、固定 5 フレームの discard で font atlas の
+     full upload を再送する。結果として、利用者が Enter で viewer と一覧を往復するたび、
+     「全面 host の作り直し」と「一覧側の 5 pass 破棄」が交互に露出する。
+- **構造的な解消方針 (実装前に detached R4 / ゲート C で方式を確定する)**:
+  1. font atlas は固定 5 回再送を廃止し、main surface の no-surface / acquire / present と
+     full-upload 完了を既存 owner の typed state で acknowledgment する。surface が使える最初の
+     1 pass だけ resync し、delay / retry / 追加 repaint で吸収しない。
+  2. linked detached の content close と OS host lifetime を分離し、`DetachedWindowManager` が
+     hidden host の再利用可否を所有する。再利用できる方式なら同じ `window_id` / HWND を
+     hidden → content remount → visible と遷移させる。egui の制約で terminal teardown が必須なら、
+     新 maximized host は HWND 作成・placement 適用・surface/content-ready acknowledgment が揃うまで
+     hidden のまま保持し、`Visible(true)` を 1 回だけ発行する。App-level bool / Option、rect heuristic、
+     固定待ち時間は追加しない。
+  3. `maximized=false` への強制リセット、最大化 placement の保存停止、windowed 強制は機能劣化なので
+     修正に使わない。タイトルバー最大化と F11 borderless は別状態のまま維持する。
+- **回帰条件**: 保存 placement が `maximized=true` の linked 静止画窓で Enter close/open を反復し、
+  (a) 1 操作につき visibility 遷移が 1 回、(b) 再利用方式なら `window_id` / HWND が不変、teardown
+  方式なら ready 前に visible にならない、(c) main font atlas が surface acknowledgment 後の 1 回だけ
+  full upload、(d)通常サイズ・F11・folder-nav reopen・always-new / passive / ParkedLive の所有権を
+  変えないことを state-transition test + debug log smoke で固定する。実装時は
+  [detached-rework-plan.md §11](detached-rework-plan.md#11-リワーク外の変更ログ) に合意と変更境界を記録する。
 
 #### 追記 (2026-08-23): 最大化が再現条件、原因は placement の毎フレーム書き戻し
 
@@ -1284,11 +1383,1326 @@ passive detached は通常どおり release で窓を activate するが、選�
   こと ②`builder_no_position` が毎フレーム出ないこと ③close 後の `discard pass` が 1 回に
   なること ④最大化 → 復元でウィンドウが元のサイズに戻ること (A で restore 値を壊していない証明)。
 
+#### Codex クロスチェック: 2 つの欠陥を同一原因として扱わない
+
+ClaudeCode の追加ログと Codex の portable / normal ログを併記して source まで照合した結果、
+**最大化が再現を可視化する条件**、**open / close は実入力**、**placement が毎フレーム同値更新される**
+という観測は一致した。ただし、ちらつきへの因果は次のように分ける。
+
+- `active_placement_update_maximized` の `from == to` は runtime manager 内の
+  `runtime.placement = Some(placement)` であり
+  ([detached_window_manager.rs:538](../src/app/detached_window_manager.rs:538))、viewport command、
+  generation 更新、visibility 更新、repaint 要求を発行しない。ログの `builder_no_position` も
+  `apply_placement=false`、すなわち生存中の窓へ position / maximize を再適用していない。
+- settings への永続化は毎フレームではなく、runtime を remove する close 境界で 1 回だけ行う
+  ([app.rs:2174](../src/app.rs:2174))。したがって「82 回の同値更新」だけから
+  **ウィンドウが82回再表示された**、または**それがちらつきの直接原因**とは結論できない。
+- 一方、画面遷移と一対一に対応する事実は、各 close の `recreate=true` + 5 discard と、各 open の
+  **新 `window_id` / 新 HWND / 113〜177ms の最大化 host 生成**である。よって §1.115 の直接原因は
+  上記「確定した原因」の lifecycle + surface acknowledgment 欠如とする。
+- 現在 geometry と restore geometry を1値に混在させる placement model は、§2.20 の座標破綻、
+  不要な runtime 書き戻し、将来の placement command 振動を招く**独立した構造欠陥**であり、
+  ClaudeCode の A/B は同じ R4 設計で直す価値がある。ただし A/B だけ適用しても close ごとの
+  host 再生成と 5 discard が残る限り、§1.115 の完了条件は満たさない。
+- 実装レビューでは (1) placement A/B のみで HWND 再生成 / discard が残るケース、
+  (2) lifecycle + surface acknowledgment 修正で最大化 placement を維持するケースを分けて測り、
+  「ログ量が減った」ことを「ちらつきが直った」ことの代用にしない。
+
 - 規模 / 優先度: 中 / **P1** (常用操作で目に見える。ただし凍結領域なので構造修正が前提)。
 - 関連: §2.20 (**同じ根**。最大化中の placement が実ジオメトリを表していない)、
   [docs/detached-rework-plan.md](detached-rework-plan.md) の BA-5 / findings-12 D1
   (font resync の discard パスが passive 窓を破棄した実害) / findings-14
   (毎フレーム seed による振動を `builder_placement_latch` で止めた前例)。
+
+### 1.116 メインウィンドウの起動状態を選べるようにする — 外部SNSでの移行検討者の指摘
+
+- 出典: 2026-08-24。ZipPla からの移行を検討している利用者が、終了時のウィンドウサイズ復元、
+  最大化状態の維持、最大化起動の設定が見つからないと外部SNSへ投稿した。直接受けた実装要望では
+  ないため、需要候補として記録する。
+- **現状の整理**: 通常ウィンドウの位置とクライアントサイズは既に `window_pos` / `window_size` へ
+  保存し、起動時に復元している ([lib.rs:1124](../src/lib.rs:1124),
+  [app.rs:54576](../src/app.rs:54576))。最大化中は restore 用の通常矩形を壊さないため
+  `track_window_rect` の更新対象外だが、**最大化して終了したという状態自体は保存していない**。
+  そのため「サイズ復元なし」ではなく、「次回も最大化」と「常に最大化で起動」が不足している。
+- 仕様候補: 環境設定へ `起動時のウィンドウ状態 = 前回の状態 / 通常 / 最大化` を追加する。
+  現行互換の既定値は `通常`。restore 用の通常位置・サイズと、終了時の最大化 flag を別々に持つ。
+  必要性があれば `--window-state normal|maximized|restore` も同じ resolver へ通す。
+- 実装条件:
+  - `pending_initial_size` の mixed-DPI 起動補正が、最大化適用後に通常サイズへ戻さない順序にする。
+  - 最小化終了は前回の有効な通常矩形を維持し、起動時に最小化は復元しない。
+  - 設定 round-trip と起動状態 resolver の unit test に加え、複数モニター / 異なる DPI /
+    トレイ終了で restore rect と最大化状態を手動確認する。
+- 規模 / 優先度: Small (0.5〜1.5日程度) / P2。コード量より Windows / DPI 実機確認が主なリスク。
+- **実装済み (2026-08-25、実機確認待ち)**:
+  - `Settings.startup_window_state` (`Normal` 既定 / `Maximized` / `RememberLast`) と、
+    終了時の最大化 flag `Settings.window_maximized` を追加。flag は復元矩形
+    (`window_pos` / `window_size`) と**別フィールド**にして、最大化を解いたときの
+    戻り先を残す (detached 側 §1.115 と同じ根を作らない)。
+  - `resolve_startup_maximized` で起動状態を決め、`ViewportBuilder::with_maximized` へ渡す。
+    初回フレームで `ViewportCommand::Maximized` を送る形にすると通常サイズが一度見えて
+    ちらつくため、生成時に指定する。`--window-size` は設定より優先して通常ウィンドウ。
+  - `pending_initial_size` の mixed-DPI 補正は、最大化起動では**最大化が解けるまで保留**する
+    (`deferred_initial_size_ready`)。egui が「最大化ではない」と明示報告した最初のフレームで
+    1 回だけ流し、そこで復元矩形を矯正する。報告が無い `None` を「最大化ではない」と
+    読まないこと自体が条件。
+  - 追跡側 (`tracked_window_maximized`) は最小化中と報告欠落時に直前の状態を保つ。
+    Windows は最小化中の `GetWindowPlacement().showCmd` を `SW_SHOWMINIMIZED` にするため、
+    素直に読むと最大化して最小化しただけで flag が落ちる。
+  - 環境設定のページ名を「起動時に開く場所」→「起動時の動作」に変更し、同ページへ
+    「起動時のウィンドウ状態」節と検索索引エントリを追加。
+  - unit test: 起動状態 resolver / 設定 round-trip / 未知値の既定落ち / 環境設定 OK が
+    選択を巻き戻さないこと / 補正の保留条件 / 最小化中の追跡 / 保存が復元矩形を触らないこと。
+  - **既定は `RememberLast`** (2026-08-25 利用者判断)。v3.2.0 以前の設定には field も
+    `window_maximized` も無いため、更新直後の初回起動は通常ウィンドウのまま。次に最大化して
+    終了したときから効き始めるので、更新した瞬間に驚かせない。
+  - 既定の変更なので `version_highlights.rs` へ `must_read` を追加済み。
+    **⚠ 版数は暫定 `"3.3.0"`。次のリリース版数を決めるときに合わせること** (リリース手順 Phase 1)。
+  - 実機確認済み (2026-08-25): 設定 UI / 検索、前回状態の復元と解除後のサイズ、別 DPI モニター、
+    最小化終了、トレイ終了、通常ウィンドウ。
+
+### 1.117 外部ツール連携を設定画面へ出し、引数・複数選択へ拡張する — 外部SNSでの移行検討者の指摘
+
+- 出典: 2026-08-24。移行元の ZipPla / NeeView にある外部ツール設定が mIV に無いとの外部SNS投稿。
+  直接受けた実装要望ではないが、既存機能の発見性不足と機能差の両方があるため候補として記録する。
+- **現状の整理**: 右クリックの「アプリケーションで開く…」から Windows 関連付けアプリと任意 exe を
+  追加・実行できる ([context_menu.rs:2037](../src/ui_dialogs/context_menu.rs:2037))。ただし登録場所が
+  コンテキストメニュー内だけで見つけにくく、実行は `exe + 物理ファイル1件` 固定
+  ([open_with.rs:142](../src/open_with.rs:142))。引数、作業フォルダー、複数選択、ZIP / PDF 内ページ、
+  任意ツールの直接キー割り当ては未対応。動画の <kbd>Shift+Enter</kbd> は OS 既定アプリを開く別経路。
+- 段階案:
+  1. 環境設定の「起動と連携」に外部ツール管理を追加し、既存の任意 exe 登録を改名・並べ替え・削除
+     できるようにする。操作カスタマイズにはまず動的 action を増やさず、「外部ツールを選んで開く」
+     という汎用 picker action を追加する。
+  2. `ExternalToolDefinition { id, name, executable, arguments, working_directory, selection_mode }` の
+     typed 定義へ移行し、`{file}` / `{folder}` / `{files}` 等の明示 placeholder と複数物理項目を扱う。
+  3. ZIP / PDF / 変換アーカイブ内ページを対象にする場合は、一時実体化、キャンセル、外部プロセスが
+     読み終えるまでの lifetime、終了後 cleanup を別 phase で設計する。
+- 安全性 / 応答性:
+  - コマンド文字列を `cmd /c` へ渡さず、exe と `OsString` 引数列を分離して `Command` を使う。
+  - ネットワーク上の exe / 作業フォルダー確認や仮想ページ抽出を UI スレッドで行わない。
+  - 起動失敗を黙って捨てず、ツール名と OS error を通知する。
+- 規模 / 優先度: 管理UIのみ Small〜Medium (1〜2日)、物理項目の引数・複数選択まで Medium
+  (3〜6日)、仮想ページ込み Large (追加1〜2週間) / P2。
+- **段階 3 まで一度に出す (2026-08-25、利用者判断)。** 段階 2 で切って出す案は採らない:
+  - 段階 2 までだと現状 (実ファイル 1 件を関連付けで開く) から用途があまり広がらない。
+  - **設定画面を一度出すと、それが互換の約束になる。** `selection_mode` と `{file}` の
+    意味は仮想ページが入ると変わるので、後から段階 3 を足すと「同じ設定なのに挙動が違う」
+    形になる。設定の形を決めるのは仮想ページまで見えてからにする。
+  - 出典は要望ではなく不満の声なので**優先度は高くない**。急いで段階を刻む理由が無い。
+
+### 1.118 任意の実ファイルを参照だけで束ねる「コレクション」 — 外部SNSでの移行検討者の指摘
+
+- 出典: 2026-08-24。ZipPla / NeeView からの移行に「仮想ディレクトリ」が不足するとの外部SNS投稿。
+  直接受けた要望ではなく、相手が期待する詳細操作は未確認。ZipPla の仮想フォルダや NeeView の
+  プレイリストに相当する、手動で選んだ分散ファイルの参照一覧を想定して候補化する。
+- **既存機能との差**:
+  - スマートフォルダは複数 root と条件から毎回結果を作るため、ZipPla の「スマートフォルダ」相当。
+  - 製本は追加時点のページを実ファイルとしてコピー / 焼き込みするため、元ファイルへの参照一覧ではない。
+  - 任意項目を手動登録し、元の場所に置いたまま1フォルダのように見せる機能は無い。
+- MVP 案:
+  - 内部名も ZIP / PDF の `virtual folder` と衝突させず、利用者向け名称を「コレクション」とする。
+  - `TopLevelGridSurface::Collection` を追加し、専用 DB worker が
+    `CollectionDefinition` / `CollectionEntry { id, collection_id, source_path, order }` を所有する。
+    設定 JSON の巨大配列や UI thread の同期存在確認にはしない。
+  - 対象はまず実フォルダ / 実ファイル / アーカイブ本体のみ。コレクション入れ子と ZIP / PDF 内の
+    仮想ページは対象外。追加、手動順序、コレクションから外す、元の場所を開くを提供する。
+  - 「コレクションから外す」と「元ファイルをごみ箱へ移す」を明確に別操作・別確認にする。
+- identity / lifecycle:
+  - mIV 内の rename / move は既存 path migration の同じ transaction から entry を更新する。
+  - OS 側で移動された項目は推測で別ファイルへ結び付けず、missing 表示と削除 / 再リンクを提供する。
+  - 外部から任意パス一覧を読み込む機能は、UNC への意図しないアクセスや他人由来リストの危険があるため
+    MVP に含めない。追加する場合は明示 import と確認を別途設計する。
+- 規模 / 優先度: 物理項目だけの MVP Medium〜Large (1〜2週間)、仮想ページ・移動追跡・完全な
+  D&D 管理まで Large (2〜4週間) / P3。着手前に利用者が期待する「仮想ディレクトリ」の操作例を確認する。
+
+### 1.119 横長画像1枚を左右の表示ステップへ分割して読む — 外部SNSでの移行検討者の指摘
+
+- 出典: 2026-08-24。ZipPla / NeeView からの移行に「見開き分割」が不足するとの外部SNS投稿。
+  NeeView の「横長ページを分割する」(横長画像を左右へ分けて順番に読む) に相当する機能を想定する。
+- **採用する簡略仕様 (2026-08-24)**: 分割した左右を永続的な論理ページにはしない。元の item index を
+  正本のまま維持し、フルスクリーン内だけで `PageSlice::Full | Left | Right` に相当する一時的な表示位置を
+  持つ。同じ texture の UV を左右半分へ crop し、1つの元ページを2回の表示ステップとして読む。
+- 設定 / 分割判定:
+  - 既存のページ構成プルダウンへ排他的な表示モードとして「横長分割 左→右」「横長分割 右→左」を
+    追加する。「1ページ表示 / 通常の見開き」と組み合わせる独立 bool にはせず、組み合わせ状態を増やさない。
+  - 保存済み回転を反映した後に横長となる静止画ページだけを 50% 位置で分割する。左→右は左半分から、
+    右→左は右半分から表示する。分割率の手動調整は MVP に含めない。
+  - 自動表示トリムは分割対象ページでは無効にする。分割の適用条件と UV crop は1つの resolver に集約し、
+    ページ送り、描画、ナビゲータ、ルーペ等で左右の解釈を重複させない。
+- 元ページ単位のまま維持する機能:
+  - ★、タグ、ブックマーク、読書位置、補正、注釈、切り取り等はすべて分割前の元ページへ記録する。
+    編集画面も分割前の画像全体で開き、左右別の編集データは持たない。
+  - サムネイルは分割前の画像を使う。ブックマーク、履歴、検索、シークバー等から再び開いた場合は、
+    選択した分割方向の最初の半分へ着地する。左右どちらを見ていたかは永続化しない。
+  - シークバーのページ数とノブ位置は元ページ単位のままとし、左右間の移動では変えない。スクラブ時も
+    対象ページの最初の半分へ着地する。表示中だけ「12ページ・左側」のように片側を示して混乱を避ける。
+- ナビゲーション / 連結読み:
+  - 通常のページ送りは `(source_idx, PageSlice)` の typed な一時状態を1か所で進める。分割状態を複数の
+    bool / `Option` へ分散させず、同じ元ページ内の左右移動と次の元ページへの移動を区別する。
+  - 縦連結では、分割対象ページを同じ texture 由来の2つの crop 領域として縦に並べる。幅フィットで
+    スクロール読みする用途を対象とする。横連結と通常の見開き表示には MVP では分割を適用しない。
+- **現状の構造差**: 現在の `SpreadDisplayUnit` は物理 item index だけを単位とし、ページ送り、通過表示、
+  表示確定も `fullscreen_idx` の変化を前提にする ([ui_fullscreen.rs:8169](../src/ui_fullscreen.rs:8169))。
+  元 index が同じ左右移動でも表示変更として扱う typed presentation step と、縦連結の layout-only な
+  2領域展開が必要。ただし seek / resume / bookmark / DB / サムネイルを論理ページ化する必要はない。
+- detached 制約: 別ウィンドウ経路へ到達する前に [detached-rework-plan.md](detached-rework-plan.md) §2 を読み、
+  owner 外へ分割状態を足す症状修正にしない。通常の本体フルスクリーンを先に完成させ、detached は R4 後に
+  同じ presentation step を所有できる場合だけ拡張する。Remote は当初 MVP 対象外としていたが、
+  **スマートフォンの縦画面で一番効く**ため 2026-08-26 に実施した ([web-remote-plan.md](web-remote-plan.md) §15)。
+- 回帰条件: 左→右 / 右→左の往復、横長と縦長の混在、回転後の分割判定、先頭 / 末尾、キー長押し、
+  縦連結、シーク、編集画面への出入り、ブックマーク再表示で元 index と表示片の不変条件を固定する。
+- 規模 / 優先度: 通常ページ表示 Medium、縦連結まで含めて Medium〜Large (1〜2週間程度)。当初の
+  logical page 全面対応 (2〜8週間想定) より範囲を大きく限定できる / P3。
+
+**実装プランは [page-split-plan.md](page-split-plan.md)** (当たりを付けた結果・範囲の根拠・
+次に触る場所)。以下は着手時の記録。
+
+#### 純ロジックだけ先行 (2026-08-25、[page_split.rs](../src/page_split.rs))
+
+配線はレーン A の `app.rs` 一括切替の後に回す
+([next-cycle-work-lanes.md](next-cycle-work-lanes.md) §6.2)。待つ間に、共有ファイルを
+触らない部分だけ作った。単体テスト 9 本。
+
+- `PageSlice { Full, Left, Right }` + `uv_rect()` (50% 固定) + `is_half()`
+  (自動表示トリムを無効にする条件でもある)
+- `SplitDirection { LeftFirst, RightFirst }` の `first()` / `second()`
+- `PresentationStep { source_idx, slice }` — **元 index が正本**で、slice は表示だけ
+- `presentation_steps(nav, direction, is_split_idx)` — nav をステップ列へ広げる。
+  **既存の見開きユニット生成と同じ述語渡しの形**にした。回転を反映した縦横比と
+  「静止画か」は `is_landscape` / `is_spread_pairable_item` が既に持っているので、
+  ここで読み直さない。寸法が未取得の item は 1 ステップになり、届いた後に組み直される
+  (既存の見開きが `is_landscape` に対して持つ性質と同じ。分割のために読み込みを待たせない)
+- `landing_step` — しおり / 履歴 / 検索 / シークから**分割方向の最初の半分**へ着地
+- `step_forward` / `step_backward` → `StepMove::{WithinPage, ToAnotherPage, AtEnd}`。
+  同じ元ページ内の左右移動と別ページへの移動を**型で**区別する (呼び出し側で
+  `before.source_idx != after.source_idx` を組み立てると判定が散る)
+- 縦連結も同じステップ列を使う。「同じ texture 由来の 2 領域を縦に並べる」順序は
+  ページ送りの順序と同じものなので、別の列を作らない
+#### モードと per-viewer 状態まで (2026-08-25、レーン A マージ後)
+
+- `SpreadMode::SplitLtr` / `SplitRtl` を追加。**`all()` には入れていない**ので
+  プルダウンには出ない (選べるのに何も起きない状態を master へ置かない)。
+  見開きとは排他で、`is_spread` / `is_rtl` / `has_cover` はすべて偽のまま。
+- `App::fullscreen_page_slice` + bundle 側 + `swap_field!` を追加。**元ページと同じ
+  context 所有**にした。片方だけ App に置くと、context を切り替えたときに前の viewer の
+  左右が次の viewer に残る。`viewer_context_audit` は通過 (既知 1 件のみ)。
+- **回転したページも分割する** (利用者判断で最初のリリースに含める。回転したページだけ
+  分割されないのは、使う側からは不具合にしか見えず報告が来る)。
+  - 当初は「型付き `SourceCrop` へ作り替えるしかない (215 箇所)」と見立てたが、**外れ**。
+    実際の原因は `DisplayedImageTransform::resolve` が**同じ矩形を 2 つの座標系として
+    使っていた**こと (fit 倍率では回転後の `display_size` に掛け、UV では元画像空間の
+    まま渡す)。回転すると両立しないので丸ごと捨てていた。**UV 側は元々正しかった。**
+  - 修正は用途ごとに座標系を分けるだけだった。`rotate_bbox_to_display` を足し、fit と
+    paint rect は表示空間、UV は元画像空間にした。写像は screen ↔ source と同じ
+    `forward_uv` を使う。**`content_bbox` の型も 215 箇所も動かしていない。**
+  - `effective_bbox` が降ろすのは**自由回転中だけ**になった (傾いた矩形の外接が広がる分の
+    拡大量を解けないため)。自由回転は保存しない一時値なので、やめれば戻る。
+  - 旧テスト `fit_rotation_and_trim_share_paint_and_hit_geometry` は「回転時 UV は全体」を
+    固定していた。**制限を仕様として固定していたテスト**なので期待値を更新した。
+  - 詳細は [page-split-plan.md](page-split-plan.md) §2、正本は
+    [display-pipeline.md](display-pipeline.md)「部分矩形 (content bbox) の座標系」。
+- **表示トリムはまだ回転ページで効かない** (2026-08-25 訂正。一度「効くようになった」と
+  書いたが誤り)。変換側で扱えるようになっただけで、**トリムを作る側に同じ規則の複製が
+  4 か所残っている** (`capture_fs_display_unit_*` の単ページ / 見開き、Z ズーム、連結読み)。
+  そのコメントは「描画側が bbox を使わない**ので**」と消費側を理由に挙げており、対の片方
+  だけが変わった状態。**外すのは別件** —— 見開きの左右そろえが表示空間で定義されていて、
+  180 度回転で左右が入れ替わるページに素直には適用できない。分割は自前の resolver
+  (`fs_page_content_bbox`) から矩形を出すのでこのガードを通らない。
+- **ページ送り / 描画 / 着地 / 縦連結まで実装済み** (2026-08-25)。通常表示は実機確認済み。
+  - 描画の解決は `draw_fs_image` が所有する。最初は呼び出し側で解決させていて、
+    `content_bbox` を作る 6 か所のうち**通常表示の 1 か所を通し忘れ**、ページ送りだけ
+    半分ずつ進んで絵は横長のまま、という状態を実機で出した。数えて塞ぐのではなく、
+    実際に描く 1 か所が所有する形へ変えた。
+  - 縦連結は同じステップ列から段を組む。現在位置は左右まで見て選ぶ (同じ元 index の段が
+    2 つ並ぶため)。連結の寸法計算にも `content_bbox` と座標系のずれがあり、同じ形で直した。
+  - **スクロールで段が変わったときに左右を書く人がいなかった** (実機で発覚)。現在位置が
+    毎フレーム元の段へ戻され、スクロールが引き戻されて先へ進めなくなっていた。
+    表示は正しく入れ替わっていたので、**描画は合っていて現在位置の追従だけが
+    取り残されていた**形。`reanchor_continuous_reading_viewer` が `fullscreen_idx` と
+    同じ場所で左右も書くようにした。
+  - **同じ形の取りこぼしを 2 回踏んだ**: 「元 index は変わらないが表示位置は変わった」
+    という状態を、元 index しか見ていない既存コードが取りこぼす。1 回目は描画側
+    (`content_bbox` の producer)、2 回目は現在位置側。分割のように**既存の識別子を
+    細分化する機能**では、その識別子を読んでいる場所を先に数えるべきだった。
+- **「分割を選んだのにページがつながったまま」の実機報告を解決** (2026-08-25)。
+  再現手順が分からなかったので、**先に理由を型で残す計装を入れた** (`SplitDecision`)。
+  次の再現で `[split] idx=0 decision=dimensions_unknown` が出て、そこから確定した。
+  - `is_landscape` は寸法が未取得でも `false` を返す。見開きのペアリングでは困らないが、
+    分割では「まだ分からない」と「縦長」が別の意味を持つ。探索と判定を分けた。
+  - 真因は**収穫側**。PDF を開き直すと items 世代が変わり `page_dims_cache` が失効する。
+    そのページは retained composite から復元されて表示できるので `fs_cache` にも
+    サムネイルにも載らず、**供給源がゼロ**になっていた。寸法自体は retained 側が
+    持っている (ログに `source=1512x1921` と出ていた)。
+  - `harvest_page_dims_from_fs_cache` → `harvest_page_dims` に変え、**表示できる 2 経路**
+    (live cache / retained composite) の両方から収穫するようにした。
+- **残り**: 縦連結の実機確認、製品ページへの追記、リリース時の更新履歴。
+
+### 1.120 Susie 32bit ワーカー異常終了後の自己回復 — 外部SNSでの不具合言及 ✅ 実装済み (2026-08-25、実機確認済み)
+
+- 出典: 2026-08-24。mIV の Susie 中継 exe が繰り返しエラーで落ちるとの外部SNS投稿。
+  プラグイン名、対象画像、ログ、並列設定は不明で再現未確認。直接の報告ではないため、まず条件採取が必要。
+- **コード上確認できた問題**:
+  - Susie プラグインを32bit子プロセスへ隔離しているため、プラグインの access violation 等で本体まで
+    落ちない設計は維持されている。
+  - 起動成功後に worker が想定外終了しても自動 respawn しない
+    ([async-architecture.md:757](async-architecture.md#54-pdf-ワーカー--susie-ワーカーの想定外終了))。
+  - `run_dispatcher` は `send_recv` の transport error 後も loop を抜けないため、死んだ pipe の dispatcher が
+    共有 queue から後続 job を取り、エラーを返し続ける可能性がある
+    ([susie_loader.rs:794](../src/susie_loader.rs:794))。
+  - README の「プラグインクラッシュ時は自動再起動」という説明は現行実装と食い違う。実装を合わせるまで
+    説明を訂正するか、既知の問題として明示する。
+- 修正方向:
+  - worker slot ごとの generation と状態 (`Starting / Ready / Failed / Backoff / Shutdown`) を持つ
+    `SusieWorkerSupervisor` が child / dispatcher の lifetime と実効 worker 数を所有する。
+  - EOF / BrokenPipe 等の fatal transport error ではその dispatcher を即座に退役させ、残り queue を
+    奪わせない。回数上限と backoff を付けて同じ slot を再 handshake する。
+  - クラッシュを起こした in-flight request は自動再送しない。同じ不正画像 / プラグインで crash loop に
+    なるため、その item はエラーとして返し、後続 request のためだけに worker を補充する。
+  - 通常のプラグイン decode error と worker transport failure を型で分け、診断画面へ plugin / extension、
+    worker id、再起動回数、最終失敗理由を出す。並列実行 OFF で回避できる plugin-global race も案内する。
+- 回帰: handshake 後に意図的に exit するダミーワーカーで、in-flight 1件だけが失敗し、後続は再生成された
+  worker で成功すること、shutdown / cancel と respawn が競合しないこと、再起動上限後は queue を
+  無限消費せず persistent notice になることを統合テストする。
+- 規模 / 優先度: Medium (3〜7日) / P2。利用者のプラグイン名・画像・ログが得られれば優先度を再判断する。
+
+#### 実機で再現させた結果 (2026-08-25)
+
+検証手段が無かったので、**落ちるプラグインを自作した** ([susie-crash-plugin.md](susie-crash-plugin.md))。
+`C:\tmp\miv-susie-crash-test` の 8 ファイル (正常 5 / クラッシュ 3) を一覧で開いた結果:
+
+- **ワーカーはクラッシュのたびに 1 つずつ減り、再生成されない。** 起動時 3 本
+  (`susie: 3 workers ready`) が、クラッシュ 3 回で **0 本**になった。この間 mIV 自身は動作を続けている。
+- 枯渇後は Susie 形式が**一切読めない**。利用者からは「しばらく使っていたら Susie が全部読めなく
+  なった」に見える。**アプリを再起動するまで戻らない。**
+- 一覧の初回表示では 8 枚中 6 枚が成功した。生き残っているワーカーが処理できたためで、
+  **1 回のクラッシュで全滅するわけではない**。枯渇するまでは部分的にしか見えない。
+- 表示が残っていた 1 枚はサムネイルキャッシュ由来 (`state=DisplayReady(LiveCache)`) で、
+  キャッシュが切れると失敗に変わった。
+
+**この結果を受けて段階分けを変更する。** 当初案の「段階 1 = dispatcher の退役だけ、respawn は後」
+では**直らない**。dispatcher を退役させてもワーカーは減り続け、枯渇後の結末は同じである。
+respawn までを 1 つの修正として扱う:
+
+1. transport error でその dispatcher を退役させ、共有キューを吸わせない
+2. **backoff 付きで同じスロットを再起動する** (本命。これが無いと枯渇は止まらない)
+3. クラッシュを起こした要求は**再送しない** (同じ不正画像で crash loop になる)。その 1 件は
+   エラーで返し、後続のためだけにワーカーを補充する
+4. 再起動上限に達したら無言で諦めず、利用者へ通知する
+
+**副産物: フルスクリーンが Susie 拡張子を認識しない** (§2.21 として分離)。
+
+#### 実装 (2026-08-25、実機確認済み)
+
+`af6882e5` + `9ecbbec7`。4 つの欠陥を閉じた。**順に実機で確かめ、直すたびに次が現れた**ので、
+その経緯も残す。
+
+1. **dispatcher が終了理由を返す** (`DispatcherExit::{Shutdown, WorkerLost}`)。以前は
+   `shutdown` でしか抜けず、死んだ pipe を持つ dispatcher が共有キューから後続を取り続けた。
+   しかも失敗は即座に返るので、生きているワーカーより速く吸っていた。
+   落ちたと扱うのは transport が切れた場合だけで、`InvalidData` 等は含めない。
+2. **スロットが backoff 付きで作り直す** (`run_worker_slot`)。上限 5 回、200ms × 試行回数。
+   待つのは競合を時間で隠すためではなく、crash loop が CPU を焼き切らないため。
+3. **再起動回数は連続失敗で数える** (`restart_count_after_loss`)。累積で数えていたため、
+   実機では 3 スロットとも上限に達して Susie が丸ごと死んだ。1 件でも応答を返せた
+   ワーカーは働けていたので数え直す。上限が意味を持つのは「起動しても何も返せない」場合だけ。
+4. **最後のスロットが閉じたらキューを排出する** (`fail_pending_jobs_no_workers`)。
+   これが無いと積まれた要求に誰も答えず、UI が「読込中」で固着した (実機で確認)。
+   投入の可否は `is_ready()` の外側チェックではなく**積むのと同じロックの中**で見る。
+5. **ワーカーを落とした対象は二度と投げない** (`crashers`)。失敗したデコードはサムネイルに
+   残らないので、記録しないと**同じフォルダを開くたびに同じ画像でワーカーが死に続ける**。
+   これが 1〜4 だけでは止まらなかった殺し合いの原因。記憶はプールの生存期間だけで、
+   起動し直せば忘れる。実ファイルは正規化パス、書庫内は「エントリ名#バイト長」で識別する
+   (名前だけだと別書庫の同名エントリを巻き添えにする)。
+- `is_ready()` は起動時の本数ではなく**生存スロット数**を見る。全滅しても真を返していた。
+- 実機結果: 5 回死んで 5 回とも復帰、スロット喪失 0、上限到達 0。クラッシュする 3 ファイルは
+  各 1 回だけ記録され、残る 5 ファイルは何度開き直しても読める。
+- README とマニュアルの「自動再起動されます」は**実装が追いついた**形。マニュアルには
+  利用者から見える 2 点 (クラッシュした画像は再試行しない / 何度も落ちる場合は打ち切る) を追記。
+#### 通知と診断表示 (2026-08-25、実機確認済み)
+
+残っていた 2 点を閉じた。
+
+- **枠が尽きたことを利用者へ伝える**。`SusieWorkerNotice` を one-shot で発行し、
+  PDF の `PdfWorkerNotice` と同じ形 (毎 update poll → 閉じるまで残る Window) で出す。
+  - **発行条件を 1 か所に閉じた** (`should_notify_workers_gone`)。枠が 1 つ減っただけでは
+    出さない (残りが処理を続けられる間、利用者にできることが無い)。終了・再読み込みで
+    畳んだ場合も出さない。**最後の枠が諦めたときだけ**。
+  - そのために `run_worker_slot` は `SlotExit::{Shutdown, GaveUp}` を**抜けた場所で確定**
+    させる。閉じてからフラグを読み直すと、その間に終了要求が来た場合に「自分から畳んだ」と
+    誤って読める。
+  - 文面が案内するのは**アプリの再起動ではなく「⟳ プラグインを再読み込み」**。`reload()` は
+    プールを作り直すので再起動は要らず、案内すると開いている一覧と表示位置を捨てさせる。
+    再読み込みボタンを notice 側には置いていない (`reload` は同期でプロセスを 3 つ起こすため、
+    新しい UI スレッド同期経路を増やさない)。
+- **診断パネルに実績を出す** (`SusieWorkerHealth`)。起動できた枠数 / 生存枠数 / 作り直し回数 /
+  打ち切り数 / 落とした対象数 / 最後の失敗理由。0 の項目は出さない (実際に起きた項目が埋もれる)。
+  - **副産物の修正**: 枠を使い切った状態が `WorkerSpawnFailed` として出ていた。「起動または
+    ハンドシェイクに失敗しました」と書かれるが実際には起動しており、利用者が確認すべきものが
+    違う。`WorkersExhausted` を分けた。判定は純関数 `pool_status_from` に出してテストした
+    (`a_pool_that_ran_and_then_died_is_not_reported_as_a_failed_start`)。
+  - 正常時は何も出さない。復帰の履歴は「読めない画像があった」ときに辿るためのもので、
+    常時出す情報ではない。
+- **ついでに直した race**: `live_workers` はスロットスレッドを起こした**後**に
+  `store(worker_count)` していた。起動直後に落ちたワーカーが先に減算すると 0 を下回って
+  戻れない。スレッドを起こす前に `fetch_add` する形にした。
+- 変更ファイル: [susie_loader.rs](../src/susie_loader.rs) /
+  [ui_susie_diagnostic.rs](../src/ui_susie_diagnostic.rs) /
+  [ui_dialogs/susie_worker_notice.rs](../src/ui_dialogs/susie_worker_notice.rs) /
+  `app.rs` (4 行) / マニュアル (設定・FAQ) / [async-architecture.md](async-architecture.md) §5.4。
+  §5.4 は「Susie も respawn しない」と書いたままだったので、実装に合わせた。
+
+### 2.21 フルスクリーンが Susie プラグインの拡張子を画像として扱わない ✅ 見立ての誤りと判明 (2026-08-25)
+
+- 出典: 2026-08-25。クラッシュプラグインの検証中、サムネイルは Susie 経路を通るのに、
+  同じファイルをフルスクリーンで開くと
+  `fs load FAIL: The file extension `."miv-crashtest"` was not recognized as an image format`
+  で落ちた。ここから「フルスクリーンは Susie に到達していない」と記録した。
+- **この見立ては誤り。フルスクリーンは Susie に到達している。**
+  - 復号は `decode_canonical_image` の 1 本で、fallback は image → WIC → Susie
+    ([canonical_image_loader.rs](../src/canonical_image_loader.rs))。フルスクリーンの
+    呼び出し ([app.rs:51540](../src/app.rs:51540)) は `CanonicalDecodeOptions::fullscreen`
+    (= `susie_priority: true`) を渡していて、Susie 段を飛ばす分岐は無い。
+  - 実プラグイン (`ifpi.spi`) と実ファイル (`C165.PI`) で、製品と同じ入口を通して
+    640×400 を復号できることを統合テストで確認した
+    (`fullscreen_decode_entry_reaches_susie_for_a_plugin_only_extension`)。
+    既存の Susie 統合テストは `susie_loader::decode_file` を直接叩いていて
+    **この入口を一度も通っていなかった**ため、疑いを晴らせなかった。
+- **本当の問題は診断文だった**。連鎖が全部失敗したとき、返していたのは image クレートの
+  エラーだけ。未対応拡張子ではそれが「拡張子が画像として認識されない」になるため、
+  **WIC も Susie も試したあとの失敗なのに Susie を試していないように読める**。
+  Susie 側のエラーは `.map_err(|_| primary_error)` で捨てられていた。
+  - 修正: `CanonicalDecodeError::Decode` を `DecodeChainFailure { primary, susie_error }` に変え、
+    `Display` が「WIC も読めず、Susie は〈理由〉で失敗した」まで出すようにした。
+    「試したか」の bool は**持たない** (この型が作られるのは連鎖の最後だけで、常に true にしかならない)。
+  - 観測された失敗そのもの (クラッシュプラグイン検証中の decode 失敗) は §1.120 の
+    ワーカー枯渇と、修正で入れた「一度落とした対象は投げ直さない」記憶で説明が付く。
+    どちらも設計どおりで、新しい欠陥ではない。
+- 教訓: **エラー文の出所を確かめずに、そこから経路の有無を推定した**。最初の decoder の
+  エラーは連鎖について何も語らない。捨てられている失敗理由を先に拾うべきだった
+  (§1.121 と同じ教訓)。
+
+### 1.121 RAR を代表サムネにしても親フォルダのタイルに出ない — 専用スレ >>302 ✅ 修正済み (2026-08-24、実機確認済み)
+
+- 出典: 専用スレ >>302。RAR があるフォルダで RAR を `P` で代表サムネに指定し、親フォルダへ移動すると
+  そのサムネイルが出ない。利用者の切り分けでは v3.1.0 は正常、v3.1.1 で発生。
+- **原因 (計装を入れて 1 回の再現で確定)**。`archive cache unavailable → base_req` と
+  `thumb_not_eligible failed` が同じ 1 秒の中に並んで記録された:
+  - pin の解決自体は成功していた (cascade → `ArchiveFirstImage` → `dummy-book-002.rar`、pinned_key も正しい)。
+    捨てていたのは `converted_archive_cache_paths` に対象 RAR が載っていなかったため。
+  - 載らなかったのは、pin-root の収集 ([app.rs:25141](../src/app.rs:25141)) が
+    `candidate && !requested && (Pending | Evicted)` を要求していたから。
+    **`Loaded` と `Failed` は終端状態で、そこへ落ちたコンテナの pin は二度と解決されない。**
+  - **中身がアーカイブだけのフォルダは自動選定が代表画像を選べず (アーカイブを展開しない仕様)、
+    必ず `Failed` になる。**そのため出口のないループになっていた:
+    ピンが捨てられる → 自動選定が走る → 失敗する → `Failed` → 発見されない → ピンが捨てられる。
+  - `Loaded` は反対側から同じ穴に落ちる (画像が 1 枚混ざったフォルダはその画像を描いたまま固定)。
+  - 初めて成立させたのは `bc4adbdd` (v3.1.2、prefetch gate と admission 制限の追加)。
+    `0f346e20` は下流を整備しただけで、見つからない root は救えない。
+- **v3.1.1 の境界は未確定のまま**。v3.1.0..v3.1.1 で `folder_thumb_pins.rs` / `thumb_loader.rs` /
+  `rar_loader.rs` / `zip_loader.rs` は blob が同一、`app.rs` の 3 コミットもこの経路に差分が無い
+  (ClaudeCode と Codex が独立に確認)。現行の原因は上記で閉じているので、修正には支障しない。
+- **修正**: pin-root の発見条件から**サムネイルの状態と進行中要求を外した**。ピンの有無は、
+  そのタイルが今どう描かれているかとは無関係な事実である。コストを抑える役目は可視範囲の
+  絞り込み (`candidate_indices`) と root ごとの解決結果の記憶
+  (`converted_archive_pin_root_states`) が引き継ぐ。解決済みの root は DB も cascade も引き直さない。
+- **回帰テスト**: タイルを終端状態にしてから collector を回す 2 本
+  (`converted_archive_pin_root_is_found_when_the_folder_tile_already_failed` /
+  `..._while_the_folder_tile_is_requested`)。既存の archive-through-folder-pin テストは
+  `start_converted_archive_cache_paths_refresh` を直接呼ぶため、描画済みのタイルを一度も見ておらず
+  この退行を捕まえられなかった。
+- 教訓: **無言の早期 return に理由を型で残してから直した**。事前の推定は
+  ClaudeCode / Codex とも `already_requested` か `Loaded` で、**どちらも外れていた** (実際は `Failed`)。
+### 1.122 F12 で動画をメイン ⇄ 別ウィンドウへ往復させると重い ✅ 主因は修正済み (2026-08-25、実機確認済み)
+
+- 出典: R2e ②-d の実機 smoke 中の指摘 (2026-08-25)。動作はするが体感でかなり遅い。
+- **既存の問題であることは確認済み**: 利用者が **v3.2.0 と v3.0.0 ポータブル**でも同じだと
+  確認した。R2e ブランチ由来ではない。**presenter 本体
+  ([src/video/native_presenter/](../src/video/native_presenter/)) は R2e で 1 行も触っていない。**
+
+#### ⚠ 最初にここへ書いたログ根拠は誤りだった (2026-08-25 訂正)
+
+当初この項目には `shared output pool exhausted` / `late_drop=88` / `[demux] audio packet
+send waited` / `[SLOW FRAME]` を根拠として並べていたが、**保存ログを読み直したところ
+別セッションのものだった**。
+
+- 引用元は `mimageviewer.log.bak1` で、**video-strip worktree の dev ビルド**
+  (`ffmpeg DLLs expected at C:\home\mimageviewer-video-strip\target\dev-runtime`) のログ。
+  **F12 の placement 切替は 1 度も含まれていない** (`switch placement request=` が 0 件)。
+- `shared output pool exhausted` は保存ログ全体で **1 回だけ**で、しかも
+  **動画の切替 (idx 41 → 42) の瞬間**。直後に旧 decode スレッドが exit しており、
+  source 切替時の一過性。F12 とは無関係。
+- `[demux] audio packet send waited 20-41ms queue_len_before=64/64` は、同じ区間の
+  presenter summary が `fps=59.1 late_drop=0` の**正常再生中に連続して出ている**。
+  音声キューが先読みで満杯なだけの通常の backpressure で、症状ではない。
+- **F12 往復を含むログは 1 つも残っていない** (該当セッションのログはローテーション済み)。
+
+つまり **§1.122 には現時点で計測根拠が無い**。プールを疑う理由も無くなった。
+
+#### 構造から分かっていること (コードを読んだ結果)
+
+placement 切替は [src/video/mod.rs](../src/video/mod.rs) の `SwitchPlacement` 分岐で処理され、
+**placement が変わる場合は presenter を丸ごと作り直す**。`NativeRenderCore::new`
+([render_core.rs](../src/video/native_presenter/render_core.rs)) が 1 往復ごとに作るもの:
+
+| 段 | 内容 |
+| --- | --- |
+| `d3d11_device` | `D3D11CreateDevice` で**新しい D3D11 デバイス**を作る |
+| `shader_pipelines` | `VideoGradePipeline::new` + `VideoResamplePipeline::new` (Anime4K 含む全 PS を生成) |
+| `swapchain_dcomp` | swapchain + `DCompositionCreateDevice` + visual ツリー + 背景 |
+| `egui_overlay` | `NativeEguiOverlay::new` — **wgpu instance / adapter / device (D3D12) を新規作成**し、 |
+| | `egui::Context` を作って `configure_fonts_with_settings` で**フォントを構成し直す** |
+
+再生スレッドはこの間フレームを出せないので、**体感遅延 = この区間の実時間**。
+「新しいサーフェスを確保してから古いスロットを返す」といった順序の問題ではなく、
+**デバイス級のリソースを往復ごとに作り直していること**が疑わしい。
+
+#### 原因 — 実行時の HLSL コンパイル (確定、修正済み)
+
+保存ログに、presenter を作るたびに同じ区間で **毎回 1.8〜2.5 秒**消えている証拠が 15 回分残っていた
+(`presenter D3D11 device created` → `Anime4K bytecode loaded` の差)。この間にあるのは
+COM cast と `VideoGradePipeline::new` / `VideoResamplePipeline::new` だけ。
+
+単体テストで 7 本の `D3DCompile` を個別に計った結果 (2026-08-25 実測):
+
+| shader | compile |
+| --- | --- |
+| grade `vs_main` | 2.1 ms |
+| grade `ps_main` | 8.0 ms |
+| resample `vs_main` | 1.6 ms |
+| resample `ps_horizontal` | 6.8 ms |
+| resample `ps_vertical` | 6.6 ms |
+| resample `ps_nearest` | 2.6 ms |
+| **NIS `fs_nis`** | **2138.1 ms** |
+| **合計** | **2155.8 ms** |
+
+**NIS の pixel shader 1 本だけで 2.1 秒**。これを `NativeRenderCore::new` の中で毎回
+コンパイルしていたので、**F12 片道 ≈ 2.2 秒 / 往復 ≈ 4.5 秒**の固定費用になっていた。
+同じコストは **動画を最初に開くときにも**払っている (ウィンドウが出るまでの待ち)。
+
+※ 当初疑ったプール枯渇は無関係だった。
+
+#### 修正
+
+**シェーダを全部ビルド時に FXC で DXBC 化する**。Anime4K は最初からこの経路
+(`build.rs` の `find_fxc` / `compile_hlsl_with_fxc`) なので、残りを揃えただけ。
+
+- 手書き HLSL を Rust の文字列リテラルから [src/video/native_presenter/shaders/](../src/video/native_presenter/shaders/)
+  の `.hlsl` へ出し、`build.rs` が FXC で `.cso` にする
+- NIS はすでに `build.rs` が WGSL → HLSL にしていたので、FXC 工程を足すだけ
+- 実行時は `CreatePixelShader` に `include_bytes!` した DXBC を渡すのみ。
+  production 経路から `D3DCompile` が消える (残るのは `#[cfg(test)]` の Anime4K GPU 実測テストのみ)
+- 「この HLSL はコンパイルできる」テストはビルドが保証するので削除し、
+  「実行時に渡す DXBC が実在するか」を見るテストに差し替えた
+  (副次効果: lib テストからも NIS の 2.1 秒が消える)
+
+検証は `nis_draw_writes_target_with_default_d3d11_rasterizer` と
+`anime4k_chain_writes_target_with_native_fullscreen_vertex_shader` (実 GPU で描画して出力を見る) が兼ねる。
+
+#### 実機確認済み (2026-08-25)。残りの内訳
+
+`shader_pipelines` は **2156ms → 2.8〜5.7ms**。往復 **≈ 5.2 秒 → ≈ 0.95 秒**。
+利用者確認でも「速くなりました」。以下は実機ログの実測値:
+
+| 段 | main → 別ウィンドウ | 別ウィンドウ → main |
+| --- | --- | --- |
+| **total** | **234〜252ms** | **590〜722ms** |
+| `host_attach` | 2〜10ms | 45〜48ms |
+| `render_core_new` | 166〜176ms | 184〜187ms |
+| `prepare` | 17〜26ms | 18〜19ms |
+| **`publish`** | 7〜10ms | **289〜424ms** |
+| `detach_old` | ≈ 5ms | ≈ 5ms |
+
+`render_core_new` の内訳: `d3d11_device` 27〜31ms / `shader_pipelines` 2.8〜5.7ms /
+`swapchain_dcomp` 4〜5ms / **`egui_overlay` 116〜139ms**。
+`egui_overlay` の内訳: `wgpu_instance` 0.3〜0.7ms / `adapter` 1.7〜2.2ms /
+**`device` 64〜72ms** (wgpu `request_device`) / `renderer` 9.5〜11ms / `egui_ctx` 0.0ms。
+
+⚠ **フォントは無関係だった** (`of_which_fonts=0.0`)。egui の font atlas は初回描画時に
+遅延構築されるので、`configure_fonts_with_settings` 自体は払っていない。
+事前に疑っていたので記録する — 測らなければここを直しに行っていた。
+
+#### `publish` の非対称は `SetFocus` だった (2026-08-26 実測、確定)
+
+probe を render / pump 両スレッドに入れて F12 を 5 回切替えた。
+`publish` の内訳は `hud=0.0 retire=0.0` で、**全部が pump 待ち**。pump 側も
+`queue=0.4〜3.7ms` (拾うのは遅くない) / `topology=0.0` / `intents=0.0` で、
+残りはすべて `publish_host` → `show_for_placement` の中にあった:
+
+| 呼び出し | main へ戻る | 別ウィンドウへ |
+| --- | --- | --- |
+| `ShowWindow` | 1.8〜2.1ms | 1.2〜1.7ms |
+| `SetWindowPos` | 0.1〜0.2ms | 0.0〜0.1ms |
+| **`SetFocus`** | **259.9 / 331.2ms** | **3.8 / 4.4ms** |
+
+**待ち時間は main UI スレッドのフレーム境界の整数倍**で、cross-thread の同期
+メッセージが 3〜4 往復していることを示す:
+
+- `18.176s` 開始 → `18.436s` 完了 (260ms)。間の UI フレーム = 18.176 / 18.260 / 18.343 / 18.432 — **3 間隔**
+- `10.958s` 開始 → `11.290s` 完了 (332ms)。間の UI フレーム = 11.026 / 11.112 / 11.197 / 11.285 — **4 間隔**
+
+#### なぜ main へ戻る向きだけ遅いのか — placement ではなかった
+
+`SetFocus` は両方向とも同じように呼ばれている (どちらも child window + activate=true)。
+違うのは、**その時点で main UI スレッドが遅いかどうか**だけ:
+
+> **動画が detached にある間だけ、main UI スレッドが 1 フレーム 43ms (`pre_grid` 41ms) ・周期 85ms になる。**
+
+- 遅いフレームの区間は `8.456→11.367s` と `14.864→18.432s`。**どちらも動画が
+  detached にある区間と一致**し、main へ戻すと止まる (18.432s 以降、ログ終端 25.1s まで 0 件)。
+- 同じ理由で `host_attach` も main 方向だけ 40〜45ms (`CreateWindowEx` が親へ
+  `WM_PARENTNOTIFY` を送る)。**最初の 1 回だけ 4.2ms** なのは、その時点では
+  まだ UI スレッドが速かったから。
+
+つまり **残りは「F12 の問題」ではなく「detached 再生中に main UI スレッドが
+1 フレーム 41ms かかる問題」**。これを直せば `SetFocus` と `CreateWindowEx` の待ちが
+同時に消え、**detached 再生中のアプリ全体のもたつきも同時に消える**。
+
+⚠ `SetFocus` を遅延・省略・別スレッド化して待ちを隠すのは対策にしない。
+
+#### 41ms の正体は fullscreen viewport 区間 (2026-08-26、`--perf-log` 実測)
+
+`ui/slow_frame_breakdown` を 33 フレーム分読んだ。**全フレームで同じ形**:
+
+| 区間 | 実測 |
+| --- | --- |
+| `total_ms` | 40.6〜53.9 |
+| `pre_grid_ms` | 38.8〜51.6 |
+| **`render_fullscreen_viewport_ms`** | **35.9〜48.3** |
+| `keep_fullscreen_viewport_ms` | 0.0 |
+| `ensure_native_video_front_ms` | 0.0 |
+| `background_polls_ms` / `bars_ms` / `grid_ms` / `post_grid_ms` | 0.1〜1.4 |
+
+発生区間は `11.2〜13.6s` と `15.6〜16.3s` — **動画が別ウィンドウにある区間だけ**。
+
+`keep_fullscreen_viewport_ms = 0.0` なので、**本来の描画経路
+(`update_active_viewer_context` 内) はこの間一度も描いていない**。
+区間 ([app.rs:66084](../src/app.rs:66084)-) の内訳は次の 4 つ:
+
+1. `render_fullscreen_viewport` (今回はウィンドウ内動画モードなので走らないはず)
+2. `render_detached_image_windows` (受動的な静止画別窓。今回は無いはず)
+3. **`render_active_detached_viewport_backstop`** — keep-alive 経路
+   ([ui_fullscreen.rs:13484](../src/ui_fullscreen.rs:13484))。他の経路が描かなかった
+   フレームで 1 回描いて OS ウィンドウを破棄させないための backstop
+4. `flush_pending_detached_cleanup_font_atlas_resync`
+
+見立ては 3 だが**未確認**。次の測定で 4 分割する。
+
+#### 根本原因 — 16ms repaint pump が「隠れた viewport」前提のまま残っている (2026-08-26、確定)
+
+41ms を最後まで割った結果 (median、144 サンプル):
+
+| 区間 | 値 |
+| --- | --- |
+| `render_fullscreen_viewport` 全体 | 39.5ms |
+| 　`prep_ms` (描画前の処理) | **0.0ms** |
+| 　`closure_ms` (自前の描画コード) | **0.3ms** |
+| 　**`eframe_show_ms`** (`show_viewport_immediate` の内部) | **38.6ms** |
+| `detached_backstop_ms` / `detached_image_windows_ms` / `font_atlas_resync_ms` | 0.0ms |
+
+→ **keep-alive backstop だという見立ては誤り**。描画コードも無関係で、
+実体は **子 viewport の render + present そのもの**。
+
+そして **それを毎フレーム走らせているのが 16ms pump**:
+
+```rust
+// src/app.rs:65106
+if native_owner_hwnd != 0 {
+    let pump_interval = std::time::Duration::from_millis(16);
+    ...
+}
+```
+
+perf の `prev_frame_causes` で裏取り済み — detached 再生中の repaint の
+**123/135 件**、main ウィンドウ再生中は **97/97 件** が
+[app.rs:65123](../src/app.rs:65123) 発。**両モードで同じ pump が回っており、
+違うのは 1 回あたりの値段だけ**。
+
+##### なぜこれが入ったのか (推測ではなく当時の記録)
+
+`5d9bc31d` (2026-05-05, `fix(video): keep UI pumping for native fullscreen input`) が
+[docs/dcomp-native-presenter-integration-plan.md](dcomp-native-presenter-integration-plan.md)
+に残している:
+
+> while a native presenter HWND is active, the UI thread keeps a **lightweight** 16ms
+> repaint pump alive ... This prevents native-window shortcut events such as Escape from
+> sitting in the UI event queue **when the hidden egui fullscreen viewport has no other
+> reason to repaint**.
+
+→ 当時 fullscreen viewport は **hidden** だったので repaint は実際に安かった。
+detached viewer の導入でこの viewport が **表示中の 1864x1132 ウィンドウ**になり、
+**前提だけが失効した**。pump はそのまま。
+
+##### 因果の連鎖 (全部実測済み)
+
+```
+native presenter が生きている間、UI スレッドは 16ms ごとに repaint を要求 (app.rs:65106)
+        ↓  detached だと 1 回の repaint が show_viewport_immediate で 38.6ms
+UI スレッドが ~12fps (周期 85ms) に落ちる
+        ↓  pump スレッドからの cross-thread 同期メッセージは 1 往復 = UI 1 フレーム
+SetFocus 260〜354ms (3〜4 往復) / CreateWindowEx 40ms
+        ↓
+F12 往復 ~950ms のうち約 350ms
+```
+
+**アプリ全体のもたつきでもある** — 別ウィンドウで動画を見ている間、
+メインウィンドウの一覧操作はすべて 12fps で動いている。
+
+##### 単価側 (38.6ms) は §1.129 で消えた — pump だけが残っている (2026-08-26)
+
+上の連鎖は **2 つの掛け算**だった。そのうち **単価側 = §1.129 は修正済み**で、
+12fps の症状は消えている (実機確認済み)。**頻度側 = 16ms pump は未着手**。
+
+修正後の新規セッションを 1 本測った結果 (`perf_events.jsonl`、5166 フレーム):
+
+| | 修正前 | 修正後 |
+| --- | --- | --- |
+| `slow_frame_breakdown` (30ms 超フレーム) | 33〜140 件 | **0 件** |
+| viewport paint > 8ms | 210 件 | **18 件** |
+| `vp_max_tex` / `main_max_tex` | 2048 / 8192 | **8192 / 8192** |
+
+→ **F12 往復の遅さも、別ウィンドウ再生中のもたつきも、この時点で実用域に入っている。**
+
+##### それでも pump は回っている (修正後の実測)
+
+`prev_frame_causes` を 3787 フレーム分集計した。最大の要求元は状態で分かれる:
+
+| 状態 | 最大の repaint 要因 | 該当フレーム |
+| --- | --- | --- |
+| フルスクリーン (動画を開いている) | **`app.rs` の pump** | **1905 / 1930 (98.7%)** |
+| 一覧 (動画なし) | egui 自身の `context.rs:529` | 1479 / 1857 (79.6%) |
+
+一方で、実測のフレーム間隔は **フルスクリーン有無にかかわらず median 6.0ms**で、
+pump が要求する 16ms より短い。**pump だけ消しても周期は 16ms にならない**。
+フルスクリーン **1930 フレーム**の repaint 要求元を分けると
+(「フレーム」= その要求元を含むフレーム数、「延べ」= 発行回数):
+
+| フレーム | 延べ | 要求元 | 間隔 |
+| --- | --- | --- | --- |
+| **1905** (98.7%) | 1905 | `poll_video` 末尾の pump | **16ms 固定** |
+| 431 | 431 | 削除 purge の input idle guard | 残り時間 (入力後 1 秒だけ) |
+| **343** (17.8%) | **672** | **`maybe_defer_for_main_font_atlas_resync` の `!safety.is_settled()`** | **16ms 固定** |
+| 182 | 182 | tail の `reasons` 非空 | 即時 |
+| 148 | 148 | `auto_aspect` streak / input idle guard | 残り時間 |
+| 174 | 174 | egui 自身 (scroll_area / tooltip / area) | — |
+| 13 | 13 | font atlas の full upload 再発行 | 即時 |
+
+→ **pump はフルスクリーンフレームの 98.7%** に乗っている。
+スパンで見ても **動画を開いている区間を連続で埋めている** (3.0s / 2.7s / 2.7s / 4.9s / 2.4s)。
+**これが主因**であることは変わらない。
+
+⚠ **ただし 16ms 固定のスピンはもう 1 つある**。
+[`maybe_defer_for_main_font_atlas_resync`](../src/app.rs) は main font atlas resync が
+pending の間、「フレームが settled になるまで 16ms ごとに見に行く」形。
+pump と違って**連続ではなく 3 回のバースト** (0.3s / 0.3s / 3.8s、計 ≈ 4.4s) だが、
+1 フレームに **2 回**発行している (672 延べ / 343 フレーム)。
+形は同じ (= 条件を poll するための固定間隔 repaint) だが、**owner も原因も違う**
+(こちらは動画ではなく「フレームが settled になるの」を待っている) ので、
+憲法 §2 規則 7 に従って **§1.130 として別項目にした**。同じ変更でまとめて直さない。
+
+⚠ この 343 フレームは §1.129 の修正**後**のログ。atlas rebuild 自体は止まったが、
+   **resync 待ちのスピンは別経路として残っている**。
+
+##### 修正の方向 (未着手、Codex と合意済み)
+
+pump の目的は「native window の shortcut event を UI キューに滞留させない」こと。
+現状 **video スレッドは `egui::Context` を持っておらず UI スレッドを起こせない**
+(`src/video/` 内に UI 向け `request_repaint` は無い) ので、定期 poll で代用している。
+
+**Direction A = イベント駆動 + 既存の意味的期限への one-shot wake**。
+Codex の判断は「**完全な形にしたときだけ**構造的修正」で、イベントだけの狭い版は却下。
+
+- **イベント側の入り口は 1 つしかない**: [`NativeOutputEventSender::send`](../src/video/mod.rs)。
+  native window から UI へ向かうイベントは全部ここを通るので、
+  `wake: Arc<dyn Fn() + Send + Sync>` を 1 つ持たせればよい。
+  **同形の既存例**: [test_script.rs:1023](../src/test_script.rs:1023) の `RunnerBridge.wake`
+  (`ctx.clone()` を持ち `request_repaint_of(ViewportId::ROOT)` を呼ぶ)。
+- **それだけでは足りない**。`poll_video` にはイベントではなく
+  **時間 / 位置のしきい値**で発火する処理が乗っている。全部に one-shot wake が要る:
+
+| 乗っている処理 | 期限 | 場所 |
+| --- | --- | --- |
+| EOF drain の quiet ticks | 3 tick 連続 (≈ 48ms) | `video/mod.rs` `EOF_DRAIN_QUIET_TICKS` |
+| stuck seek の強制解除 | 1200ms | `video/mod.rs` `SEEK_STUCK_EOF_TIMEOUT` |
+| placement 切替 pending の timeout | `native_video_mode_switch.deadline` | `app.rs` |
+| 再生位置の resume 保存 | 5 秒 | `app.rs` `video_resume_last_save` |
+| preparing HUD の数値更新 | 50ms | `video/mod.rs` `tick` |
+| **CH/BM ループ境界** | **位置の跨ぎ検出 (prev→cur)** | [native_video.rs:4758](../src/app/native_video.rs:4758) |
+| normalize scan の完了 poll | ワーカー完了 | `app.rs` `poll_normalize_scan` |
+| detached host の再親付け | host HWND 変化 | `app.rs` `poll_detached_video_host_resync` |
+
+  ↑ **CH/BM ループ境界だけはイベント化できない** (位置を sample して跨ぎを検出する形)。
+  ただし **次の境界秒数は既知**なので、そこへ one-shot wake を張る方が現行より**精度が上がる**
+  (現行は 16ms 分オーバーランする)。
+
+- **Direction B (pump は残して viewport だけ描かない) は不可能**。
+  egui 0.33.3 は親パスで提示されなかった child viewport を除去するので、
+  `show_viewport_deferred` 化 (= R4 の所有権再構成) が先に要る。
+
+⚠ pump 間隔を伸ばす / detached のときだけ間引く、は症状パッチなので採用しない。
+⚠ detached 述語に触れるので [detached-rework-plan.md](detached-rework-plan.md) §2 の手続きが必要
+   (合意は取済み。実装後に §11 への記録が要る)。
+⚠ トレイ非表示時の Win32 50ms pump は別物なので維持。keep-alive backstop も消さない。
+⚠ ワーカーからは `request_repaint()` ではなく **`request_repaint_of(ViewportId::ROOT)`**。
+
+↑ **16ms を注入しているのは 2 か所あり、片方だけ消してもループは残る**:
+
+1. [app.rs](../src/app.rs) `poll_video` 末尾 — `if native_owner_hwnd != 0 { 16ms }` (= 本体)
+2. [video/mod.rs](../src/video/mod.rs) `VideoPlayer::tick` の native 経路 —
+   再生中 / seek 中は `Some(16ms)`、preparing は `Some(50ms)` を返す
+
+#### Direction A 実装 ✅ (2026-08-26、実機確認済み)
+
+2 か所の固定16ms注入を両方削除し、`VideoPlayer` が所有する `VideoUiWake` を
+worker / native event funnel と共有した。worker からの wake はすべて
+`request_repaint_of(ViewportId::ROOT)`。新しい detached bool / Option、猶予時間、
+debounce、fallback cadence は追加していない。
+
+| 旧 pump に乗っていた処理 | 置換 |
+| --- | --- |
+| native window の全イベント | 唯一の funnel `NativeOutputEventSender::send` が publish 後に ROOT を即時 wake |
+| video info / engine event / decoder EOF・fatal | 各 worker の publish 成功 / clock state 変更時に ROOT を即時 wake |
+| EOF drain | 旧「3 UI tick」を実時間 **48ms quiet** に変更。quiet 前は既知の media end と観測済み audio/video 残量から消費完了時刻を one-shot、quiet 開始後は残り48msを one-shot |
+| stuck seek | `seek_eof_stuck_since + 1200ms` の残りを one-shot |
+| placement switch timeout | `native_video_mode_switch.deadline` の残りを one-shot |
+| resume 保存 | 実再生中だけ `video_resume_last_save + 5s` を one-shot。paused / idle は予約しない |
+| preparing HUD | Loading / Buffering / 初回 frame 前だけ50ms。Seeking 完了は event、stuck は1200ms deadline |
+| CH/BM loop | 現区間の次境界と playback speed から境界時刻を one-shot。wake 後も既存 prev→cur crossing 判定を通す |
+| normalize scan | provisional / terminal message の mpsc publish 成功時に ROOT を即時 wake |
+| detached host 再親付け | HWND registration / adoption / watcher repair で host generation が変わった事実に対して ROOT を1回 wake |
+| seek-bar hover thumbnail | overlay request 自体は既存 event funnel を通る。App が mutex へ書いた直後と thumbnail worker の terminal publish で ROOT を wake |
+
+監査で表外に見つかった依存も同じ所有境界へ移した: user seek の250ms coalesce、
+既知 duration の再生末尾、video info 到着、engine/audio readiness、decoder EOF / fatal、
+native presenter init fault、thumbnail cache publish。marker thumbnail decode / media navigation /
+native open・source・tile pending 等は、もともと各 owner が独自の completion wake または
+固有 deadline を予約しており、今回削除した2本の pump には依存しないため変更していない。
+
+`maybe_defer_for_main_font_atlas_resync` の16ms spin、その他の `app.rs` 16ms site、tray 50ms、
+detached backstop、native window の focus / placement / epoch 処理は scope 外のまま維持。
+
+##### 実機確認結果 (2026-08-26)
+
+利用者の動作確認: Escape / F12、末尾停止、全体ループ、CH/BM ループ、
+末尾超えシーク、2x / 0.5x、音量ノーマライズ、ホバーサムネイル、preparing HUD は全て正常。
+
+`--perf-log` の実測比較 (どちらも §1.129 修正後。フルスクリーンが開いている区間だけを集計):
+
+| | 修正前 (15.9s / 5 区間) | 修正後 (120.3s / 17 区間) |
+| --- | --- | --- |
+| **動画を開いている間の UI フレーム** | **121.7 / 秒** | **48.0 / 秒 (−61%)** |
+| pump / deadline だけが理由のフレーム | 1089 (56.4%) | 924 (15.6%) |
+| 30ms 超フレーム | 0 | 23 (うち 17 件は `background_polls`、viewport は 1 件) |
+| `vp_max_tex` / `main_max_tex` | 8192 / 8192 | 8192 / 8192 (§1.129 維持) |
+
+**最も直接的な証拠 — フルスクリーンを開いたまま UI が審るようになった**。
+0.5 秒を超える無描画区間が 65 件、**うち 62 件がフルスクリーン中**で、
+最長 **17.3 秒** (他に 5.0 / 5.0 / 4.4 / 3.7 / 3.2 秒…)。
+修正前は pump が 16ms ごとに repaint を要求していたので、**これは構造上不可能だった**。
+
+残る 924 フレーム (再生中の 4〜11/秒) は `poll_video` 末尾の one-shot deadline 発。
+一定間隔のスピンではなく、一時停止中は 0 件 (上の 17.3 秒の無描画区間がそれ)。
+
+⚠ タスクマネージャーの CPU% では判別できない (どちらも 0% 表示)。
+   判定には perf log のフレーム間隔を見ること。
+
+#### process-lifetime overlay GPU device epoch 共有 ✅ (2026-08-26、実機確認済み)
+
+残り優先 2 として、[src/video/native_presenter/overlay_gpu.rs](../src/video/native_presenter/overlay_gpu.rs)
+に process-owned `OverlayGpuService` を追加した。`OnceLock` は device 直置きではなく、共有
+`wgpu::Instance` と `Mutex<Vec<Arc<DeviceEpoch>>>` を持つ replaceable cache manager を保持する。
+overlay は DComp visual から Surface を先に作り、loss 未確定かつ compatible な epoch を再利用する。
+Surface / `egui_wgpu::Renderer` / `egui::Context` は従来どおり窓ごとで、D3D11 present device も
+presenter ごとのまま。
+
+⚠ gate の理由を 2026-08-26 に訂正した。当初 Codex は「複数の動画窓が並行し得る」とし、
+ClaudeCode は裏を取らずにそのまま伝えたが、**この前提は誤り**。生きているメディア session は常に 1 つで
+([app.rs](../src/app.rs) `close_parked_live_media_windows_for_new_media` + 回帰 test `new_media_open_closes_existing_parked_live_window`)、
+動画→動画の移動は `SwitchSource` で presenter を作り直さないし、F12 切替は新旧とも
+同じ render thread 上で直列。**正しい理由は teardown** — [video/mod.rs](../src/video/mod.rs) の
+`Drop for NativeVideoOutput` は render thread の join を待たず別 thread へ逃すので、
+cancel 後の旧 thread の submit と新 thread の configure が重なり得る。overlay ごとに
+Device を持っていた頃は無害で、**共有したことで初めて生じる**。
+実機ログでは旧 thread 停止 (49.516s) → 新 thread 開始 (50.163s) と 0.65 秒空いており、
+「起こり得るが未観測」が正確な状態。実際の競合は `gate_wait_ms` で見る。
+
+epoch の RwLock は `Surface::configure` を
+write lock、texture update / buffer update / acquire / submit / present の連続区間を read lock にした。
+`Context::run` と tessellation は lock 外。device-lost callback は generation 付き一方向 latch だけを
+立て、新規 overlay は lost epoch を skip する。既存 overlay は次 draw で terminal error を返す。
+Surface Lost / Outdated / Timeout は device loss と扱わない。
+
+次の実機ログ向けに span も分割した。
+
+- `render core created`: 旧 `egui_overlay` total を維持しつつ `overlay_new` /
+  `overlay_first_render` を追加。
+- `egui overlay created`: service/Instance、Surface、Adapter、Device、reuse / generation、Renderer、
+  Context/font configure、`Surface::configure` を分離。
+- `egui_overlay_present`: `first_render`、`egui_run_ms`、`tessellate_ms`、font atlas を含む
+  `texture_update_ms`、`surface_acquire_ms`、buffer update/encode、submit/present、gate wait / GPU span。
+  atlas の CPU 構築だけは `Context::run` 内の通常 UI layout と分離できないため、
+  `egui_run_ms` は両者を含む。texture upload と acquire 以降は独立して読める。
+- F12 `detach_old`: `NativeEguiOverlay` drop と残りの `NativeRenderCore` drop を分離。
+
+実装直前の最新値は switch total **214.8〜235.0ms** / `render_core_new` **144.1〜161.3ms** /
+`egui_overlay` **104.2〜113.0ms**。Instance + Adapter + Device の予測削減 **54.5〜68.2ms** から、
+次の switch は teardown 改善を数えず **約147〜181ms** を期待する。`overlay_new` の reuse 時
+Adapter / Device は 0ms 近傍、`overlay_first_render` は atlas / per-context Renderer 分だけ残るはず。
+`detach_old.egui_overlay` は service の強参照により Device drop を含まなくなるが、削減幅は未測定。
+
+pure logic test は lost epoch 非再利用 + healthy compatible epoch 再利用、old generation callback の
+successor 非干渉、configure / submission gate の排他を検証済み。実 Surface を 2 個作るには
+Win32 / DComp window が必要なため、2 overlay の同一 `wgpu::Device` identity は unit test 化していない。
+実機 F12 往復で `device_reused=true` と同一 generation を確認する。
+
+##### 実機測定結果 (2026-08-26)
+
+同じ解析ツールで 2 セッションを比べた (before = pump 修正後 / device 共有前)。
+**27 回の overlay 作成のうち 26 回が `reused=true`、全部 `generation=1`** —
+セッション中すっと device 1 つで回った。
+
+| span | before (6 switch) | after (8 switch) | |
+| --- | --- | --- | --- |
+| **switch total** | 231.8ms | **198.1ms** | −34 |
+| `render_core_new` | 159.1 | **105.0** | **−54** |
+| 　`egui_overlay` | 104〜113 | **42.0** | |
+| 　　`overlay_new` | (未分割) | **5.0** | |
+| 　　`overlay_first_render` | (未分割) | **37.2** | ← 今後の最大 |
+| 　`d3d11_device` | 21〜25 | 26.1 | 共有していない |
+| `detach_old` | 38.3 | **29.2** | −9 (`egui_overlay` 部分は 6.4) |
+| `publish` | 13.4 | 30.3 | **+17** |
+
+overlay 内訳は予測どおり: `wgpu_instance` / `surface` / `adapter` / `device` がすべて **0.0ms**。
+予測外の収穫として **`egui_wgpu::Renderer::new` も 8.4〜9.7ms → 1.1ms**
+(warm device で pipeline 作成が安い)。
+
+⚠ **`publish` が上がって利得の 1/3 を食っている**。方向別に分けると:
+
+| | before | after |
+| --- | --- | --- |
+| → detached | 7.7 / 11.7 / 13.4 | 12.8 / 13.5 / 10.4 (変化なし) |
+| → main | 40.5 / 18.6 / 13.3 | 57.3 / 43.6 / 48.4 / 51.4 / 17.0 |
+
+`publish` は全部 `wait` (= pump の `SetFocus` を main UI thread が処理するのを待つ)。
+→ main だけ遅い非対称は **元々あった** (18.6 vs 11.7) が、今回拡大したように見える。
+
+**ただし before n=3 / after n=5 で、before にも 40.5 の外れ値がある。
+この差を今回の変更に帰属させるにはサンプルが足りない**。仮説は 2 つあるがどちらも未検証:
+
+- `render_core_new` が 54ms 早くなった分、`SetFocus` が main UI thread の sleep/wake 位相の
+  別のところへ落ちるようになった (= 生産側を速くして消費側の遅延が露出した)
+- 今回のセッションは F12 往復だけでなく「動画を連続で開き直す」操作を含むので、
+  foreground / focus の状態が before と違う
+
+実機確認: F12 往復、連続での動画切替、再生中のリサイズ、別 DPI モニターへの移動、
+音声モード、VST GUI 開閉、初回 (`reused=false`) → F12 (`reused=true`) の HUD 表示を利用者が確認済み。
+
+#### 残りの優先順 (2026-08-26 時点)
+
+1. ~~**16ms pump のイベント駆動化 (Direction A)**~~ ✅ **実装・実機確認済み (2026-08-26)**。
+   上の「Direction A 実装」節を参照。動画を開いている間の UI フレームが 121.7/秒 → 48.0/秒。
+   残りの固定スピンは §1.130。
+2. ~~**`egui_overlay` の wgpu device 共有**~~ ✅ **実装・実機確認済み (2026-08-26)**。
+   上の節を参照。switch total 231.8 → 198.1ms。
+3. ~~`d3d11_device` の共有~~ **見送り**。1 device に immediate context は 1 本しか作れず、
+   `Present` まで同じ submission owner に寄せる必要がある。この repo は共有 `GpuVideoDevice` で
+   immediate context 競合による hard-stuck を既に経験済みなので、26ms のために戻らない。
+4. **残りの最大は `overlay_first_render` (37.2ms)** — overlay ごとに新しい `egui::Context` を
+   作るので font atlas を毎回建て直している。次に見るならここか `publish` (`SetFocus`)。
+
+- ⚠ **guard / delay / retry で待ち時間を隠さない。**
+- 規模 \\ 優先度: Medium / P3 (主因は 2 段階とも取れた。残りは体感上実用域)。
+
+### 1.123 スレッド終了中の heap 例外を、例外ハンドラ自身が二次クラッシュで握り潰す — 実機クラッシュ
+
+- 出典: 2026-08-25、R2e ステージ④の smoke 準備中。タグを付けて上のフォルダへ移動した直後に
+  `mimageviewer-core.exe` が **0xc0000005 で異常終了**。`panic.log` に記録なし
+  (= Rust panic ではない)。**R2e とは無関係の既存不具合**
+  ([logger.rs](../src/logger.rs) も [lib.rs](../src/lib.rs) の handler も
+  このブランチでは 1 行も変更していない)。
+- **WER のフルダンプから取得したスタック** (`cdb -z <dump> -c ".ecxr; kn"`)。下から読む:
+
+  ```
+  0b ntdll!RtlUserThreadStart
+  0a kernel32!BaseThreadInitThunk
+  09 ntdll!RtlExitUserThread          ← スレッドが終了処理に入っている
+  08 ntdll!LdrShutdownThread          ← DLL_THREAD_DETACH / TLS デストラクタ実行中
+  07 ntdll!LdrShutdownThread
+  06 ntdll!RtlFreeHeap+0x726          ← ここで一次例外が発生
+  05 ntdll!KiUserExceptionDispatcher
+  02 mimageviewer_core!mimageviewer::native_exception_handler+0xa0   ← 自前ハンドラが走る
+  01 mimageviewer_core!mimageviewer::logger::current_thread_id_num+0x19
+  00 mimageviewer_core!std::thread::current::current+0xf   ← 二次 AV (rcx=0)
+  ```
+
+- **問題は 2 つある。**
+
+  **(A) 一次例外**: スレッド終了中の `RtlFreeHeap` で例外。ヒープの不整合か、
+  TLS デストラクタ順序に依存した解放。直前のログは**フォルダ移動でワーカー 12 本を
+  停止して 12 本を起動**した箇所 (`w0 stopped` … `spawning 10 regular + 2 I/O workers`)。
+
+  **(B) 自前ハンドラが、その文脈で走れない**:
+  [lib.rs:693](../src/lib.rs:693) の `native_exception_handler` は
+  `logger::current_thread_id_num()` ([logger.rs:272](../src/logger.rs:272)) を呼び、
+  その中の `std::thread::current()` が **TLS 依存**である。
+  `LdrShutdownThread` 以降は TLS が破棄済みなので `rcx=0` を deref して二次 AV になる。
+  **ハンドラが自分で死ぬので `panic.log` に何も残らない。**
+
+- ⚠ **(B) を直しても (A) は直らない。だが (B) を直さないと (A) は永久に見えない。**
+  今は例外ハンドラが証拠ごと消している。**(B) を先に直す。**
+- (B) の直し方: 例外ハンドラの内側では **TLS に触れる API を使わない**。
+  スレッド ID は `std::thread::current().id()` ではなく **`GetCurrentThreadId()`** を使う。
+  ハンドラ経路が通るログ整形すべてを同じ基準で見直す (`format!` の allocator も
+  ヒープ破損時は危険なので、固定バッファ + `write!` が望ましい)。
+- (A) の手掛かり: 一次例外は `RtlFreeHeap` の中。`Application Verifier` の page heap か
+  `_NT_GLOBAL_FLAG` の heap tail checking を有効にして再現すると、壊した側が特定できる。
+  ダンプは `C:\Users\<user>\AppData\Local\CrashDumps\` に残る (今回は 59.6 GB)。
+- 規模 / 優先度: Small (B) / Medium (A)。**P2** — 通常操作 (タグ付け → フォルダ移動) で落ちた。
+
+### 1.124 F12 を連打すると実際の押下が破棄される ✅ 修正済み (2026-08-26、実機確認済み)
+
+- 出典: 2026-08-25、§1.122 修正後の実機確認。別ウィンドウから F12 で main へ戻るとき、
+  **連打すると最初の何回かが無反応**。**§1.122 とは別の既存不具合**。
+- ログにそのまま残っている (`mimageviewer.log`):
+
+  ```
+  30.274  PlacementSwitched request=12 applied DetachedWindow generation=9   ← 切替完了
+  30.663  ignore stale native F12 toggle: os_down=false presentation=DetachedWindow
+  30.906  ignore stale native F12 toggle: os_down=false presentation=DetachedWindow
+  31.203  ignore stale native F12 toggle: os_down=false presentation=DetachedWindow
+  32.093  switch placement request=13 -> target=MainWindow                   ← 4 回目でやっと反応
+  ```
+
+  切替完了の **390ms 後から** 240〜300ms 間隔で 3 回。rebuild 直後に 1 回だけ来る
+  stale 再配送ではなく、**人間の連打そのもの**。1 セッションで 7 件、
+  うち 6 件が `presentation=DetachedWindow` (= 利用者の報告と一致)。
+- 原因: [native_video.rs](../src/app/native_video.rs) の F12 arm が
+  `native_video_key_physically_down()` で **「今この瞬間キーが物理的に押されているか」**を
+  `GetAsyncKeyState` に聞いている。これは「この event は rebuild の再配送か」の
+  **代用判定**でしかない。presenter の wndproc が WM_KEYDOWN を拾ってから App が
+  event を引くまでの遅延よりも押下時間が短いと、**本物の押下も同じく false になる**。
+  早押しと stale 再配送をこの検査では区別できない。
+- §1.122 で切替が速くなった分、連打しやすくなって顔を出しやすくなっている
+  (利用者も「前からかもしれない」と報告)。
+
+#### 修正 — 廃れた proxy を削除した (追加ではなく削除)
+
+当初は「`KeyDown` に presenter generation を乗せる」を提案したが、**Codex の指摘で撤回した**。
+rebuild 後に**新しい HWND が decode した**再配送は**現世代**で stamp されるので、generation では
+早押しと区別できない。generation は stale key の identity ではない。
+
+実際に入れたのは削除である。F12 arm に届く `repeat=false` は
+**現 HWND・現 epoch が生成した first-key-down** であり、probe に仕事が残っていない:
+
+| 軸 | 何が落とすか | 入った時期 |
+| --- | --- | --- |
+| 旧 presenter 由来 | `window_event_belongs_to_generation` (host ごとの epoch) | **2026-07-30** (`0cf4b6a9` pump 分離) |
+| hold による auto-repeat | `WM_KEYDOWN` の previous-key-state (lParam bit 30) → 既存の `!key.repeat` | 当初から |
+| 切替中の押下 | `switch_native_video_viewer_presentation` の pending guard | 当初から |
+
+物理 probe は **2026-07-01** 。つまり 1 行目の識別子が入る **1 ヶ月前**の代用判定で、
+その後撤去されずに残っていた。
+
+**削除したもの**: `native_video_key_physically_down` / その呼び出し /
+`NativeVideoKeyBlockReason::StaleDetachedToggle` / formatter の対応 case。
+基盤の `key_input::physical_key_down` は他に 3 箱所の本番利用があるので残す。
+
+**回帰テスト**:
+
+- `window_event_is_accepted_only_for_the_current_presenter_generation` — 述語を切り出して表で 3 通り。
+  述語を `true` に変異させて落ちることを確認済み (空振りでない)
+- `native_video_f12_does_not_toggle_while_a_placement_switch_is_pending` — キー経路を通して pending guard を固定
+- 既存の `native_video_f12_toggles_detached_viewer_mode` は **probe 削除後に初めて意味を持つ**。
+  旧コードは `#[cfg(test)] { true }` で probe を迷回しており、**この退行を 2 ヶ月近く隠していた**。
+  旧コードで落ちるテストは原理的に書けない (テストビルドでは常に true を返していたため)
+
+憲法 §2 規則 5 はこの probe を好例として名指ししていたので、実機ログで反証されたとして
+該当部分を撤回した (一般原則は維持)。触った範囲と判断理由は
+[detached-rework-plan.md](detached-rework-plan.md) §11 に記録。
+
+- ✅ **実機確認済み (2026-08-26)**: F12 押下 15 回に対し切替 13 回・意図的な無視 2 回で、
+  取りこぼしゼロ・二重トグルゼロ。無視された 2 件はどちらも切替飛行中で、
+  `ignore F12 toggle while video placement switch is pending` として記録されていた
+  (= 意図した pending guard)。`ignore stale native F12 toggle` は 0 件。
+
+### 1.125 ★固定を押すと、開いている fullscreen が古い idx を指したままになる ✅ 修正済み (2026-08-26、実機確認済み)
+
+- ✅ **実機確認済み (2026-08-26)**: 9 回の判断がすべて説明可能だった。
+  追従 7 回 / 閉鎖 1 回 / 対象なし 1 回。閉じたのは `target_len=6` かつ再生中ファイルが
+  その 6 件に含まれないときだけ。**往復の対称性も確認** (`57 → 2 → 57`、`5 → 0 → 5`) で、
+  固定中に別ファイルへ移動していても解除時に正しく戻る。`no snapshot key` の異常は 0 件。
+- ✅ **実装 (2026-08-26)**: 案 C を採用。ただし identity は
+  `snapshot_owner_entry` の prefix owner 解決ではなく、`selected` と同じ
+  `snapshot_key_from_grid_item` の完全一致とした。hit は generation bump 前に live
+  `FsCacheEntry` を退避し、items 交換 / bump / invalidate 後に新 idx へ再挿入して、
+  fullscreen と音声 / VST / normalize / loop / EOF / marker / native pending を同じ owner の
+  index-space へ追従させる。miss は交換前に正規 `close_fullscreen()` を通す。
+- 解除側の at-origin 直接復元にも同じ調停を適用し、activation 時ではなく解除直前に実際に
+  開いている item を解決する。media-navigation と generation-stamped marker worker は cancel +
+  新 index-space で再開、folder-nav / holdover は解放する。別 context の pending は owner stamp が
+  一致しない限り変更しない。
+- 回帰テスト 12 件を追加し、activate hit / miss、解除前の viewer 内移動、ZipImage と ZipFile の
+  prefix 誤一致、130 item の大規模並べ替え、player Box identity の往復維持、複合 media session、
+  late worker result、mounted main / detached / ParkedLive / promoted active / sibling parked の native
+  owner 行列、folder-nav / 派生 index lifecycle を固定した。detached 憲法 §11 に判断理由を記録。
+
+- 出典: 2026-08-26、別件 (per-context snapshot) の実機確認中に利用者が発見。
+  **動画を再生しながら ★固定 を押すと再生が止まり、
+  「読込中...」のまま固着する**。画面には `c:\home\youtube\movie\youtube` のような
+  **フォルダに見える path** が出ていた。
+- **既存の不具合**。`activate_snapshot` の最終変更は **2026-06-04** (`969ba68f`、★固定 UI 導入時)。
+  発見時のブランチは [snapshot_ops.rs](../src/app/snapshot_ops.rs) と
+  [ui_fullscreen.rs](../src/ui_fullscreen.rs) を 1 行も触っていない。
+
+#### 原因 — `activate_snapshot` が fullscreen を一切見ていない
+
+[snapshot_ops.rs](../src/app/snapshot_ops.rs) の `activate_snapshot` (165〜330 行) には
+`fullscreen_idx` / `fs_cache` / `close_fullscreen` への参照が **1 つも無い**。やっているのは:
+
+1. `items` を snapshot の部分集合へ**丸ごと差し替える**
+2. `bump_items_generation()` + `invalidate_idx_state_and_queues()`
+
+しかし **fullscreen ビューアは古い `fs_idx` を指したまま**なので:
+
+- `fs_idx` の先が**別のアイテム**になる。snapshot に含まれない / フォルダだった場合、
+  fullscreen はそれを読めず **「読込中...」で永久に止まる**
+- `fs_cache` は `ItemsGenerationMap<FsCacheEntry>`
+  ([viewer_context_registry.rs:845](../src/app/viewer_context_registry.rs:845)) なので、
+  generation を進めた時点で **開いていた動画エントリごと無効化**される → 再生が止まる
+
+**設計の穴はここだけ**: snapshot 側は fullscreen を知らないわけではなく、
+`snapshot_current_fullscreen_path()` ([snapshot_ops.rs:711](../src/app/snapshot_ops.rs:711)) を持ち、
+**snapshot が既に active な状態での fullscreen ナビ**はちゃんと扱っている。
+抜けているのは **「fullscreen を開いている最中に snapshot を activate した」場合の整合**だけ。
+
+`deactivate_snapshot` も同じ形で items を戻すので、**解除側にも同型の穴があるはず**。
+修正時は両方を列挙すること。
+
+#### 直し方は仕様判断 — 決めてから着手する
+
+| 案 | 挙動 | 考えどころ |
+| --- | --- | --- |
+| A | ★固定時に fullscreen を閉じる | 単純で確実。ただし見ていたものが消える |
+| B | 同じアイテムを新 idx へ追従させる | 一番自然。`snapshot_owner_entry` が既に path → entry 解決を持っている |
+| C | snapshot に含まれるなら B、含まれなければ閉じる | B の自然さを保ちつつ範囲外を定義できる |
+
+⚠ **「読込中のまま固着するなら timeout で閉じる」は症状パッチ**。idx が意味を失ったこと自体を扱う。
+⚠ 動画の再生停止だけを見て `fs_cache` を generation 無効化から外すのも不可。
+   無効化は「idx の意味が変わった」という正しい事実を表している。直すべきは **見ている側の追従**。
+
+#### 再現手順
+
+1. 動画を含むフォルダを開く
+2. 動画を fullscreen で再生する
+3. (一覧側に戻らずに) **★固定** を押す
+4. → 再生が止まり、「読込中...」のまま戻らない
+
+- 規模 \\ 優先度: Small〜Medium / **P2** (通常操作で到達し、固着する)。
+
+### 1.126 ★固定の items 交換で `image_metas` だけ取り残される — 添字空間の交換漏れ
+
+- 出典: 2026-08-26、§1.125 の設計相談中に Codex が発見。
+  **§1.125 とは別の症状**なので別項目にした (憲法 §2 規則 7: ついでに直さない)。
+- `image_metas` は `items` と **同じ位置の `Vec`** なのに、`activate_snapshot` が
+  subset 化していない。`SnapshotState` にも `saved_image_metas` /
+  `list_view_image_metas` が無い。
+- 具体例: 元の `visible_indices = [4, 9]` なら、新しい `items[0]` は旧 4 の項目だが、
+  `image_metas[0]` は **旧 0 のまま**。
+- `invalidate_idx_state_and_queues()` はこれを消さない。同関数の責務コメントが
+  **「caller 責任」**と明記している ([app.rs:25872](../src/app.rs:25872))。
+- 規模 \\ 優先度: Small / P3 (表示されるメタ情報がずれる。固着はしない)。
+
+### 1.127 ★固定の items 交換後、Details 表示の index state が再構築されない
+
+- 出典: §1.126 と同じ、Codex の指摘 (2026-08-26)。
+- `details_order` / `details_tag_prewarm_indices` / `details_meta_pending` は、
+  items 交換後に**無条件では再構築・cancel されない**。
+- color filter が有効な場合だけ後段の `rebuild_visible_indices()` が偶然更新するので、
+  **通常の Details 表示では旧 order が残り得る**。
+- 規模 \\ 優先度: Small / P3。
+
+### 1.128 ★固定で範囲外になった別窓を、閉じず自前の一覧へ切り出す — 仕様提案
+
+- 出典: 2026-08-26、§1.125 の実機確認。複数ウィンドウモードで動画再生中に
+  ★固定を押し、**そのファイルが固定範囲外だったため動画窓が閉じた**。
+  **§1.125 の設計どおりの動作**であり、不具合ではない。ただし体験としては
+  **グリッドのボタンを押したら別の窓が消えた**に見える。
+- 利用者の希望: **再生はなるべく継続**し、前後移動も納得できる形で残す。
+
+#### 前提の確認 (2026-08-26、コードで裏取り済み)
+
+「★固定していないときは実 FS 順で前後移動する」という想定は **実装と違う**。
+
+```rust
+fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize>
+```
+
+`get_nav_indices()` は `current_grid_order()` (= `visible_indices`、Details なら `details_order`)
+を渡す ([ui_fullscreen.rs:7621](../src/ui_fullscreen.rs:7621) /
+[app.rs:46141](../src/app.rs:46141))。つまり **★固定の有無にかかわらず、
+前後移動は常にグリッドの表示順・絞り込み結果を辿る**。実 FS 順を辿るモードは存在しない。
+
+したがって ★固定は「別の並びに切り替える」操作ではなく、
+**その時点の並びを凍結する**操作である。
+
+#### 提案 — 別窓を自前の context へ切り出す
+
+現状、複数ウィンドウモードの動画窓は **同じ context を別の窓で描いている**
+(実機ログ: `main_fs_idx=Some(121) mounted=true`)。だから親のグリッド操作が直撃する。
+
+**器は既にある**:
+
+- 2026-08-26 に `snapshot` を `ViewerContextBundle` の field にしたので、
+  **context ごとに別の並び・別の凍結状態を持てる**
+- `fork_mounted_live_media_context` が「再生中メディアを自前の context へ切り出す」既存の仕組み
+
+よって §1.125 の miss 経路を「閉じる」から「**切り出す**」へ変えることで、
+窓は自分の items を持ち続け、再生も前後移動も維持される。
+
+#### 詰めるべき点
+
+- 切り出した context の一覧は **固定前の並び** を保持する。それを利用者にどう示すか
+  (窓のタイトル / HUD に何か出すか、無言でよいか)
+- 親が ★固定を**解除**したとき、切り出した窓を親へ戻すのか、独立のままにするのか
+- 切り出した context の寿命 (窓を閉じるまで / 親のフォルダ移動まで)
+- 静止画でも同じにするか、メディア限定にするか
+- ⚠ detached 述語に触れるので §2 の手続きが必要
+
+- 規模 \\ 優先度: Medium / P3 (不具合ではなく仕様改善)。
+
+### 1.129 別ウィンドウの viewport を 1 枚描くのに CPU 9500 万サイクル使っている ✅ 修正済み (2026-08-26、実機確認済み)
+
+- 出典: 2026-08-26、§1.122 の分解。§1.122 の**頻度**側 (16ms pump) とは別の
+  **単価**側の問題なので別項目にした (憲法 §2 規則 7)。
+- 動画を別ウィンドウへ出している間、main UI スレッドの
+  `show_viewport_immediate` が **1 回 38.6ms** かかる。描いているのは実質黒地 1 枚
+  (native presenter が子 HWND に映像を出している)。
+
+#### 実測 (2026-08-26、223 サンプルの median)
+
+| | 値 |
+| --- | --- |
+| `body_ms` (`show_viewport_immediate` 全体) | 38.9ms |
+| `closure_ms` (自前の描画コード) | 0.3ms |
+| `prep_ms` (描画前の処理) | 0.0ms |
+| eframe 部分のみ (`body - closure`) | **38.58ms / 95,224,648 cycles** |
+
+**待ちではなく CPU 実行**であることを `QueryThreadCycleTime` で確定させた。
+校正値として、確実に CPU を焼いている closure (0.3ms) のサイクルレートを同時に取った:
+
+| | cycles/ms |
+| --- | --- |
+| `closure_cycles_per_ms` (校正値) | 2,487,568 |
+| `body_cycles_per_ms` | 2,478,017 |
+| eframe 部分のみ | 2,478,149 |
+
+差 0.4%。**vsync / GPU / lock 待ちではない**。
+(測定は `dev-runtime` = release 継承の opt-level 2。release でも同じ桁)
+
+#### 影響
+
+§1.122 の pump を直しても**この単価は残る**。別ウィンドウでマウスを動かす・
+パネルを出すなどで repaint が起きるたび 38.6ms かかるのなら、それ自体が体感不具合。
+
+#### 原因 — viewport ごとに `max_texture_side` が違う (確定)
+
+`egui_ctx.run` の中であることを vendored eframe に probe を入れて確定させた:
+
+```
+total=40.2ms input=0.0 run=39.4 set_window=0.0 tessellate=0.0 paint=0.7
+             prims=1 delta_set=1 delta_bytes=262144 max_tex=None
+```
+
+`set_window` / `tessellate` / `paint` は全部 1ms 未満。**39.4ms は `run`**で、
+自前の描画は 0.3ms なので egui 自身。そして**毎フレーム atlas 全体の delta**が出ている。
+
+| viewport | `max_texture_side` | atlas | delta |
+| --- | --- | --- | --- |
+| detached (遅い側) | **None** → egui 既定 2048 | 2048x32 | 262,144 = 2048x32x4 |
+| root / 他 | **Some(8192)** | 8192x32 | 1,048,576 = 8192x32x4 |
+
+perf 側でも遅いフレーム **73 件すべて** `vp_max_tex=2048` / `main_max_tex=8192`。
+
+egui の font atlas は **`Context` に 1 つ**しか無く、`Fonts::begin_pass` は
+`max_texture_side` が変わると atlas を作り直す。`FontsImpl::new` は
+**登録済み全フォントを ab_glyph で再パース**するので、
+2 つの viewport が 2048 と 8192 を交互に報告すると**毎パス rebuild** になる。
+これがサイズにも内容にも依存しない一定 38.6ms の正体。
+
+#### なぜ食い違うのか — eframe wgpu backend の非対称
+
+`RawInput::max_texture_side` は `Option<usize>` で、**None なら egui が既定 2048** を使う。
+wgpu backend はこの値を **`State::new` で 1 度スナップショットするだけ**で以後同期しないので、
+render state が無い時点で作られた viewport は `None` のまま固定される。
+
+**glow backend は毎フレーム全 viewport へ配っている**
+([glow_integration.rs:221](../vendor/eframe/src/native/glow_integration.rs:221))。wgpu 側だけこれが無い。
+mIV 由来ではなく上流の非対称。
+
+#### 修正
+
+`vendor/eframe` の wgpu backend で、**root と immediate viewport の両方**が
+`take_egui_input` の直前に painter の値へ同期するようにした。glow と同じ契約に揃えただけで、
+値をスナップショットせず painter に追従させる構造の修正。
+
+⚠ 上流 eframe への還元候補。vendored crate を更新するときはこの差分を持ち越すこと。
+
+#### 旧仮説 (いずれも実測で否定済み、同じ道を辿らないために残す)
+
+- **keep-alive backstop が描いている** → `detached_backstop_ms = 0.0`。外れ
+- **font atlas の ppp スラッシング** → `vp_ppp == main_ppp == 1.5`、`fill = 0.009`。外れ
+  (rebuild していたのは当たりだが、引き金は ppp ではなく `max_texture_side` だった)
+- **per-pixel 処理** → ウィンドウを 1242x720 → 348x260 (面積 1/10) にしても 38.3〜39.5ms。外れ
+- **vsync / GPU / lock 待ち** → cycles が校正値と 0.4% 差。外れ
+
+#### 仮説 (否定済み、参考)
+
+egui の font atlas は **`Context` に 1 つ**しか無いが、main と子 viewport が
+異なる `pixels_per_point` を要求しうる。epaint 0.33 の `Fonts::begin_pass` は
+`fill_ratio() > 0.8` で atlas を**作り直す**ので、両方の ppp 分の glyph が交互に
+積むと毎フレーム rebuild + 全 atlas の delta アップロードになり得る。
+mIV は fallback font を 6 系統登録しているので atlas は大きい。
+
+検証中: `vp_ppp` / `main_ppp` / `vp_atlas_w,h` / `vp_atlas_fill` / `vp_galleys` /
+`main_atlas_fill` / `main_galleys` と viewport サイズを perf event へ追加した。
+サイズに比例するなら per-pixel 処理、atlas fill が鋸歯状なら rebuild のスラッシング。
+
+- 規模 \ 優先度: 未知 / P2 (原因が分かるまでは見積もらない)。
+
+### 1.130 font atlas resync 待ちが 16ms 固定でスピンする
+
+- 出典: 2026-08-26、§1.122 の repaint 要求元を分けているときに見つけた。
+  **§1.122 と owner も原因も違う**ので別項目にした (憲法 §2 規則 7)。
+- [`maybe_defer_for_main_font_atlas_resync`](../src/app.rs) は、main font atlas resync が
+  pending の間 `!safety.is_settled()` だと
+  `ctx.request_repaint_after(16ms)` して `false` を返す。
+  つまり「**フレームが settled になるまで 16ms ごとに見に行く**」。
+- 呼び出し元が **2 つ** (`update_early` / `pre_main_ui`) なので、
+  1 フレームに **2 回**発行される。
+
+#### 実測 (2026-08-26、§1.129 修正**後**のログ)
+
+| | 値 |
+| --- | --- |
+| 発火したフレーム | **343 / 1930 (17.8%)** |
+| 延べ発行回数 | 672 (= 1 フレーム 2 回) |
+| 分布 | 連続ではなく **3 回のバースト** (0.3s / 0.3s / 3.8s、計 ≈ 4.4s) |
+
+§1.122 の pump (98.7% を連続で埋める) と違って常時ではないが、
+**atlas rebuild を止めた後でも残っている**ので、§1.129 では消えない別経路。
+
+#### 直し方の見立て (未検証)
+
+`safety` は `placement_pending` / `cloak_or_backdrop_active` / `opening_count` /
+`closing_count` から作られる。これらは**全部、変化したときに知らせられる側の事実**なので、
+ポーリングではなく **settled になったときに resync を flush する**形にできるはず。
+§1.122 の Direction A と同じ機構を使えるならそれに乗せる。
+
+- ⚠ detached 述語 (placement / cloak / opening / closing) に触れるので
+  [detached-rework-plan.md](detached-rework-plan.md) §2 の手続きが必要。
+- ⚠ `d48982e5`「Use conservative font atlas resync」で確定した
+  「stale font atlas で描かない = フォント崩れ回避」のトレードオフを崩さないこと。
+  待ち方を変えるのであって、待たなくするのではない。
+- 規模 \\ 優先度: Small 〜 Medium / P3。
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 
@@ -1477,7 +2891,8 @@ passive detached は通常どおり release で窓を activate するが、選�
 - 出典: 利用者報告 (2026-08-23、v3.2.0 出荷前の実機確認)。リモートで PDF を開いたとき、
   端末に「ページ表示グループの読み込みに失敗しました。」が出た。前後ページ移動で復帰。
 - **v3.2.0 の退行ではない。** この経路は `732420e3` (2026-07-31) 由来で v3.1.3 以前から出荷済み。
-- **サーバ側ログで確定** (`%APPDATA%\mimageviewer-remoteemote-web-log.jsonl`):
+- **サーバ側ログで確定** (`%APPDATA%\mimageviewer-remote
+emote-web-log.jsonl`):
 
   ```
   /api/page  status=500  page.ipc_status="miv_media_internal"
@@ -1911,6 +3326,45 @@ passive detached は通常どおり release で窓を activate するが、選�
 - 関連: §1.115 (**同じ根**。最大化中のちらつき)、
   [docs/detached-rework-plan.md](detached-rework-plan.md) §2 (憲法) / BA-7、
   findings-12 D3 (同型の App-global 汚染)。
+
+### 2.22 貼り付け / 新しいフォルダー作成後に、追加項目へカーソル・選択を移す — 専用スレ >>305
+
+- 出典: 専用スレ >>305 (2026-08-26)。グリッドへ貼り付けたファイルが現在のソート順で
+  離れた位置へ入ると、どれが追加されたものか分からなくなるため、エクスプローラーと同様に
+  貼り付けた項目を選択状態にしてほしいという要望。新しいフォルダーを作成した場合も、
+  作成後のフォルダーへカーソルが移らず不便なことがあるため、同じ完了規則へ揃える。
+- 期待する動作 (貼り付け / 新しいフォルダー作成で共通):
+  - 現在表示中の実フォルダへ追加された項目が **1 件**なら、既存のチェック選択を解除し、
+    追加項目へカーソルと Shift 選択の anchor だけを移す。チェックマークは付けない。
+  - 追加項目が **複数件**なら、既存のチェック選択を解除し、一覧へ現れた追加項目をすべて
+    チェック選択する。現在の表示順で先頭の追加項目へカーソル / anchor を置き、見える位置へ
+    スクロールする。
+  - サムネイル表示 / 詳細表示、チェック方式 / エクスプローラー方式のどちらでも、上の
+    単一 / 複数規則を同じにする。現在のソートと絞り込みは変更しない。絞り込みによって
+    表示されない追加項目を無理に選択したり、絞り込みを自動解除したりしない。
+- 現状と修正境界:
+  - 新しいフォルダー作成は既に `select_after_load` へ作成名を渡しているが、利用者の実操作では
+    カーソルが移らないことがある。非同期 reload のどこで selection hint が失われるかを確認し、
+    表示へ install した後の共通選択処理まで届くことを回帰テストにする。
+  - Ctrl+V / 背景メニューの貼り付けは、現在はフォルダ背景の Shell `paste` verb を呼び、
+    notify-rs のフォルダ変更通知で一覧を再読込するだけなので、mIV は実際に作成された出力パスを
+    所有していない。元の basename だけで推測せず、名前衝突時に Shell が改名した結果も含めて
+    **成功した操作の実出力パス**を取得できる完了通知を設計する。必要なら
+    `IFileOperationProgressSink` を持つ操作経路への移行、または operation token 付きの限定的な
+    前後 snapshot を検討する。外部アプリが同時に追加したファイルを誤選択しないこと。
+  - `select_after_load: Option<String>` へ複数名や追加 bool を足して分岐を増やさず、宛先フォルダの
+    identity / operation token / 実出力パス群 / 適用世代を持つ typed な post-operation selection
+    request を 1 つの owner にする。reload 完了時に path key から新しい index へ解決し、cursor /
+    anchor / checked / scroll を一度だけ更新する。
+- 完了条件:
+  1. 名前順 / 日付順で追加項目が離れて配置される 1 件・複数件の貼り付けで、上の選択規則になる。
+  2. コピー貼り付け / 切り取り貼り付け / 名前衝突による改名、作成直後のフォルダーを確認する。
+  3. 操作完了前に別フォルダへ移動した場合、その一覧の選択を汚さない。外部変更との同時発生でも
+     貼り付け操作と無関係な項目を選択しない。
+  4. フィルタで一部または全部が非表示の場合、フィルタを変えず、表示中の実出力だけへ適用する。
+- 関連: [shell-file-operations-context-menu-plan.md](shell-file-operations-context-menu-plan.md)
+  §7〜§8、`src/ui_dialogs/new_folder.rs`、`App::try_select_after_load`。
+- 規模 / 優先度: 新しいフォルダー側は Small、貼り付け完了結果の取得を含めると Medium / P2。
 
 ## 3. 補正 / AI
 
@@ -2397,3 +3851,171 @@ SimplySign のクラウド鍵セッションが切れていても通過する (�
 | 詳細表示 / スマートフィルタ | `docs/details-view-and-filter-plan.md`, `CLAUDE.md` の UI / スクロール節 |
 | タグ / フルスクリーン右パネル / 動画 overlay | `docs/tag-catalog-redesign-plan.md`, `docs/display-pipeline.md`, `docs/video-architecture.md`, `docs/detached-viewer-implementation-plan.md` |
 | リリース / 依存更新 | `CLAUDE.md` のリリース手順、各 native 依存管理節 |
+
+### 1.125 見開き表示のまま Ctrl+G で補正レイヤーへ入ると、左右の切り替えもマスク編集も効かない — 実機報告 ✅ 修正済み (2026-08-26、実機確認待ち)
+
+- 出典: 2026-08-26、利用者報告。見開き表示のページで <kbd>Ctrl</kbd>+<kbd>G</kbd> を押して
+  補正レイヤー画面へ入ると、左右ページの切り替えが動かず、マスク編集も含めて操作がまったく
+  効かなくなる。<kbd>E</kbd> (消しゴム) と <kbd>Ctrl</kbd>+<kbd>M</kbd> (隠蔽加工) は正常だった。
+
+- **原因**: 編集ツールの canvas 用 transform は**単ページ経路でしか作られない**
+  (`draw_fs_spread` は返さない)。そのため編集ツールは「編集する 1 ページ」を単独で表示して
+  から始める必要があり、消しゴム / 隠蔽 / 注釈 / 切り取りの 4 つは見開きから入ると単ページへ
+  倒す退避を持っていた。**補正レイヤーだけこの退避を持っていなかった。**同じ 10 行が 4 か所に
+  写されていて、5 つ目に書き忘れられた形。
+
+- **修正**: 手順を `App::plan_page_edit_pivot` / `enter_page_edit_single_view` /
+  `leave_page_edit_single_view` の 1 か所へ集約し、5 つのツールすべてがそこを通す。型名も
+  `EraseSpreadCtx` → `PageEditSpreadPivot` (4 ツールで使うのに消しゴムの名前だった)。
+  解除の経路はツールごとに複数あり (専用 reset / フルスクリーンを閉じる / ページ送り /
+  コンテキスト切替)、局所補正だけで 6 か所ある。復元を各経路へ書くと必ず漏れるので、
+  **`reconcile_page_edit_spread_pivots` が毎フレーム「モードが落ちていたら戻す」を 1 か所で
+  見る**形にした。
+
+- **左右の切り替え** (2026-08-26 の実機報告で追加): 倒した後は `resolve_spread_pair` が
+  Single を返すのでパネルの L/R セレクタが消えていた。`App::page_edit_spread_pair` が退避から
+  ペアを返すようにし、補正レイヤーパネルのボタンは押されたページへ表示を移すようにした。
+  選択状態は `adjust_spread_target` ではなく**表示中のページ**で決める (倒す前の値が残るため)。
+
+- **テキスト注釈** (2026-08-26 に追加): パネルへ L/R セレクタを足した。注釈はページごとの
+  作業セットなので、切り替え時は現在ページを確定 (`reset_text_mode`) してから入り直す。
+
+### 1.126 フォルダ切替でサイドカーの読み書きが UI スレッドを 8 秒止める — perf-log で実測
+
+- 出典: 2026-08-26、利用者報告「操作していると何度か応答なしになって非常に重くなる」。
+  perf-log (`nav` seq=12) で内訳が取れた。**推測ではなく実測**。
+
+  | 区間 | 時間 | スレッド |
+  | --- | --- | --- |
+  | `load_folder_end` (`d:\home\scan\comic`, 177 items) | **8334.5ms** | main |
+  | └ `sli_sidecar_flush` (dirty サイドカーの書き出し) | **6058.9ms** | main |
+  | └ `sli_sidecar_import` (読み直し) | **2180.2ms** | main |
+  | └ 残りすべて (scan / sort / DB / catalog / workers) | 合計 90ms 未満 | main |
+
+  [app.rs](../src/app.rs) の `flush_all_sidecars()` と、その後の import。どちらも
+  [ui-responsiveness.md](ui-responsiveness.md) §4 が禁じている **UI スレッドからの同期 I/O**。
+
+- **原因は実測できた** (2026-08-26、サイドカー実物を計測)。**遅いのは書き方ではなく、
+  書いている中身**:
+
+  | | |
+  | --- | --- |
+  | `d:\home\scan\comic\mimageviewer.dat` | **699.9 MB** (415 items) |
+  | 最大の 1 item | **69 MB** (`20230103_009.pdf::page_9`) |
+  | その 69 MB の中身 | `local_adjust_layers[0].mask` |
+  | mask の実体 | `{"RasterVector": {"width": 3082, "height": 4486, "alpha": [0,0,0,…]}}` |
+
+  **補正レイヤーのラスターマスクを、1 画素 1 数値の JSON 配列で書いている。**
+  3082×4486 = 1382 万要素。全 415 item の内訳は local_adjust_layers 164.6 MB に対し
+  adjust 0.3 MB / mask 0.2 MB / comic・export_crop はほぼ 0。
+
+  さらに `serde_json::to_string_pretty` なので、**1382 万要素の配列が 1 行 1 数値**に
+  展開される。compact なら 165 MB 相当のものが 700 MB になっているのはこれ。
+
+  **消しゴム / 隠蔽のマスクは同じ問題を持っていない** (`mask` は全体で 178 KB)。あちらは
+  `mask_db` へ raw で書いており、サイドカーには参照しか置いていない。**補正レイヤーだけが
+  ラスターを JSON へ直接入れている。**
+
+- **3 つ別々の問題が重なっている。**分けて考えること:
+  1. ラスターマスクの格納形式 (JSON 配列 → 消しゴムと同じ `mask_db` の raw、または圧縮)
+  2. `to_string_pretty` (マスクを外に出せば残りは小さいので、これ単体は些細)
+  3. flush / import が UI スレッド同期
+
+  **1 を直せば 2 と 3 の実害はほぼ消える** (165 MB → 数百 KB)。3 の worker 化だけでは
+  700 MB の I/O が背景へ移るだけで、メモリと保存時間は残る。
+
+- ⚠ **補正レイヤーはリリース済み** (v1.1.0)。格納形式を変えるなら**移行が必須**
+  ([CLAUDE.md](../CLAUDE.md)「永続データ・スキーマ変更時の判断」)。既存の巨大サイドカーを
+  読んで新形式へ移す経路が要る。
+
+- **紛らわしい観測**: 同じセッションに 6.5 秒の無反応区間がもう 1 つあるが、そちらは
+  **どのスレッドにもイベントが 1 つも無く**、直前の `ui/tail_repaint` が `action=none`。
+  = 意図した就寝であって不具合ではない。100〜600ms のヒッチ 28 件は 27 件までが AI
+  アップスケールの 1.5 秒以内で、これは別の話 (体感の重さには効くが「応答なし」ではない)。
+
+- **直し方の方針**: [ui-responsiveness.md](ui-responsiveness.md) §2 の worker 化テンプレ
+  (`XxxPending { cancel, rx }` + `start_xxx` / `poll_xxx`)。フォルダ切替の完了を待たせずに
+  書き出す場合、**切替先で同じサイドカーを読む競合**をどう扱うかが設計の核。
+
+- 規模 / 優先度: 未見積 / P2 (実害が「数秒の無反応」なので体感は大きい)。
+
+#### 方針は決まっている (2026-08-26、利用者判断)
+
+**サイドカー機能は維持し、格納形式だけ変える。**削除は検討したうえで却下した。
+
+検討時に一度「サイドカーにはマスクが入っていないのでは」「フォーマットが用途に合って
+いないのでは」という見立てが出たが、**どちらもコードで否定された**。次に読む人が同じ道を
+辿らないよう、根拠を残す:
+
+| 種類 | サイドカー内の形式 | 415 item の合計 |
+| --- | --- | --- |
+| 消しゴム `mask` | **1bit/pixel + deflate + base64** (`SidecarMask`) | 0.2 MB |
+| 隠蔽 `conceal` | 同上 | 同程度 |
+| 補正レイヤー `local_adjust_layers` | `RasterVectorMask.alpha: Vec<f32>` を **JSON 数値配列のまま** | **164.6 MB** |
+
+3 種ともマスクは保存されており、「別プロファイルでも復元できる」という当初の意図は実装
+されている。**フォーマットの問題ではなく、補正レイヤーだけがメモリ上の構造体の serde を
+そのまま使っている**のが欠陥。消しゴム側が同じファイルで成立していることが、形式が用途に
+適している証拠になっている。
+
+削除しない理由: サイドカーが守っているのは**アプリ外でフォルダごと移動された**場合。
+[rename_key_migration.rs](../src/rename_key_migration.rs) は「対象外」節のとおり**アプリ内
+リネーム専用**で、そこは埋まらない。[metadata_transfer.rs](../src/metadata_transfer.rs) は
+別環境への復元を単体で担えるが**明示操作**なので、エクスポートしていない利用者は救えない。
+黙って重くなるのは悪いが、**黙ってデータが消えるほうがさらに悪い**。
+
+`tag_sidecar_backup_enabled` は既定 OFF で、タグは文字列なので容量問題とは無関係。今回を
+理由に一緒に削る根拠は無い。
+
+#### 着手順
+
+1. ~~**`RasterVectorMask` の格納形式を圧縮形式にする。**~~ → **完了 (2026-08-26)**
+2. ~~flush の worker 化~~ / **import の worker 化は残り** (下記)
+3. サイドカーが肥大したときに気づける仕組み (サイズをログか設定画面へ) — **未着手**
+
+#### 1 と 2 の結果 (2026-08-26)
+
+正本は [preset-and-adjustment.md](preset-and-adjustment.md) §9.3 / §9.3.2。
+
+- **格納形式**: 画素ごとの値を `"<tag>:<count>:<base64(deflate(bytes))>"` へ詰める
+  ([crates/local-adjust-core/src/mask_codec.rs](../crates/local-adjust-core/src/mask_codec.rs))。
+  `serde` のフィールド属性なので、レイヤー配列を持つ**全ストアが同時に**新形式になる
+  (`local_adjust.db` / `mimageviewer.dat` / 編集 bundle / メタデータ移送)。
+- **量子化は 8bit**。実データの alpha は 0.0 / 1.0 だけ (31.5M 値中 99.95% が 0) だったが、
+  `SubjectMask` はマッティングモデルの連続値なので 1bit にはしない。2 値データなら
+  deflate が潰すので容量差も出ない。
+- **`RasterVectorMask` だけではなかった**。同じ形の per-pixel 配列が `RasterMask.alpha` /
+  `SubjectMask.alpha` / `SubjectMask.source_alpha` / `RegionMask.labels` にもある。5 か所まとめて直した。
+- **`local_adjust.db` も同じ欠陥で、しかもサイドカーより大きかった** (959 MB / 82 行 /
+  最大 1 行 93 MB)。そのページを開くたびに UI スレッドで 93 MB の数値配列をパースしていた。
+  `local_adjust_db::repack_legacy_masks` が起動時 worker で移行 + VACUUM する。
+- **移行の実測** (利用者の実データのコピー):
+
+  | | 前 | 後 | 時間 |
+  | --- | --- | --- | --- |
+  | `local_adjust.db` | 959.0 MB | 2.7 MB | 5.2 s (worker、82 行走査 / 69 行書換 / 0 skip) |
+  | `mimageviewer.dat` (415 items) | 733.9 MB | 0.6 MB | 読み 0.8s / 書き 0.3s |
+
+- **flush は非同期化**。`SidecarWriter` (専用スレッド 1 本)。まだ届いていない内容は
+  pending に残り `SidecarFile::load` がディスクより先に見るので、フォルダ切替が
+  書き込み完了を待つ ack は不要になった。
+- **定期フラッシュは 5 秒 → 10 分**、判定は「dirty になった時刻」から。通常の保存契機は
+  「編集ツールを抜けた時 / フォルダ切替 / アプリ終了」で、定期はクラッシュ・電源断用の保険。
+  「編集ツールを抜けた」は `page_edit_tool_owns_canvas` の true → false から導くので、
+  ツールが増えても呼び出し側を足さなくてよい。
+
+#### 残り
+
+- **import (`SidecarFile::load` + `import_to_dbs`) は UI スレッドのまま。**移行後は
+  0.6 MB / 数 ms なので実害は消えたが、§4 チェックリスト違反ではある。ネットワーク
+  ドライブや巨大フォルダでは効く。
+- **移行の 1 回目だけ UI が止まる** (実測 0.8 秒 / フォルダ)。旧形式を読む経路が
+  同期なので。2 回目以降は無い。
+- **mtime fast-path に当たり続けるフォルダは移行されない**。実害は disk 容量だけ
+  (開かないので遅くもならない)。開けば slow-path に入って移行される。
+- `metadata_transfer` の `FORMAT_VERSION` は **上げていない**。上げると `!=` 比較なので
+  新版が既存の v7 エクスポートを一切読めなくなる。上げない場合の副作用は「新版で
+  書き出した bundle を旧版で import すると layers のパースで失敗する」だけで、
+  データが黙って壊れる経路は無い。
+- **VACUUM は `local_adjust.db` だけ**。他の DB (tags.db 213MB / fts_meta.db 365MB /
+  audio_analysis.db 1.5GB) の肥大は別問題で、未調査。

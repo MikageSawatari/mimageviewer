@@ -51,6 +51,7 @@ use crate::video::{VideoAnime4kFallbackNotice, VideoScaleFallbackNotice};
 // 音楽ビュー (Inc 5c-A) がジャンプ/ブックマークパネル本体・一括登録ダイアログを共有するため
 // crate 内に公開する。動画専用の `pub(super)` ヘルパは従来どおり parent 限定のまま。
 use super::overlay_draw::*;
+use super::overlay_gpu::{DeviceEpoch, overlay_gpu_service};
 
 #[path = "grade_pipeline.rs"]
 mod grade_pipeline;
@@ -998,6 +999,12 @@ pub struct NativeRenderCore {
     retired_video_surfaces: VecDeque<RetiredVideoSurface>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct NativeRenderCoreDetachTimings {
+    pub(crate) egui_overlay_ms: f64,
+    pub(crate) rest_ms: f64,
+}
+
 /// 解像度変更で差し替えた旧 video swap chain。`retired_video_surfaces` で遅延保持し、
 /// キューから押し出されたタイミングで Drop される (= swap chain + waitable を解放)。
 struct RetiredVideoSurface {
@@ -1238,10 +1245,7 @@ struct NativeEguiOverlay {
     /// `Some(v)` なら presenter フォールバック経路で `video_visual` の後ろに挟む。
     /// `None` なら HUD HWND の DComp root に単独で配置する (CP3 P1 #3 反映)。
     after_visual: Option<IDCompositionVisual>,
-    _instance: wgpu::Instance,
-    adapter: wgpu::Adapter,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    gpu_epoch: Arc<DeviceEpoch>,
     format: wgpu::TextureFormat,
     present_mode: wgpu::PresentMode,
     alpha_mode: wgpu::CompositeAlphaMode,
@@ -1262,6 +1266,7 @@ struct NativeEguiOverlay {
     modifiers: egui::Modifiers,
     pointer_pos: Option<egui::Pos2>,
     event_count: u64,
+    render_count: u64,
     dirty: bool,
     next_repaint_deadline: Option<Instant>,
     wants_pointer_input: bool,
@@ -2783,6 +2788,9 @@ impl NativeRenderCore {
             crate::video::native_window_health::NativeRenderOperation::Attach,
             window_epoch,
         );
+        // placement 切替 (F12) はこの関数を丸ごと走らせる。どの段が支配的かを
+        // 1 切替につき 1 行だけ残す (backlog §1.122)。
+        let core_t0 = Instant::now();
         unsafe {
             let (d3d_device, d3d_context) = create_present_d3d11_device()?;
             let d3d_device1: ID3D11Device1 = d3d_device
@@ -2797,6 +2805,8 @@ impl NativeRenderCore {
             let d3d_context1: ID3D11DeviceContext1 = d3d_context
                 .cast()
                 .map_err(|e| format!("cast ID3D11DeviceContext1: {e:?}"))?;
+            let d3d_ms = core_t0.elapsed().as_secs_f64() * 1000.0;
+            let pipelines_t0 = Instant::now();
             // Compile every small Phase A shader while the render pipeline is
             // created. Anime4K pixel shaders are loaded here from build-time FXC
             // bytecode. A later filter selection never invokes D3DCompile.
@@ -2812,6 +2822,8 @@ impl NativeRenderCore {
                     (None, Some(error))
                 }
             };
+            let pipelines_ms = pipelines_t0.elapsed().as_secs_f64() * 1000.0;
+            let compositor_t0 = Instant::now();
             let dxgi_device: IDXGIDevice = d3d_device
                 .cast()
                 .map_err(|e| format!("cast IDXGIDevice: {e:?}"))?;
@@ -2919,6 +2931,11 @@ impl NativeRenderCore {
                 }
             }
 
+            let compositor_ms = compositor_t0.elapsed().as_secs_f64() * 1000.0;
+            let overlay_t0 = Instant::now();
+            let mut overlay_new_ms = 0.0;
+            let mut overlay_first_render_ms = 0.0;
+
             // CP4 + P2 #1 反映: egui overlay の attach は HUD 経路 → presenter フォールバック
             // 経路の 2 段階で試す。HUD 経路で `NativeEguiOverlay::new` が失敗したら、
             // HUD fields を全部 None にクリアしてから presenter フォールバック経路で
@@ -2937,7 +2954,8 @@ impl NativeRenderCore {
                     let overlay_visual = dcomp_device
                         .CreateVisual()
                         .map_err(|e| format!("CreateVisual egui overlay (HUD): {e:?}"))?;
-                    match NativeEguiOverlay::new(
+                    let overlay_new_t0 = Instant::now();
+                    let overlay_result = NativeEguiOverlay::new(
                         overlay_visual,
                         &dcomp_device,
                         hud_root,
@@ -2953,8 +2971,11 @@ impl NativeRenderCore {
                         config.ui_font.clone(),
                         Arc::clone(&health),
                         window_epoch,
-                    ) {
+                    );
+                    overlay_new_ms += overlay_new_t0.elapsed().as_secs_f64() * 1000.0;
+                    match overlay_result {
                         Ok(mut overlay) => {
+                            let first_render_t0 = Instant::now();
                             match overlay.render_once() {
                                 Ok((_, intents)) => startup_window_intents.extend(intents),
                                 Err(err) => {
@@ -2967,6 +2988,8 @@ impl NativeRenderCore {
                                     );
                                 }
                             }
+                            overlay_first_render_ms +=
+                                first_render_t0.elapsed().as_secs_f64() * 1000.0;
                             egui_overlay = Some(overlay);
                         }
                         Err(err) => {
@@ -2996,7 +3019,8 @@ impl NativeRenderCore {
                     let overlay_visual = dcomp_device
                         .CreateVisual()
                         .map_err(|e| format!("CreateVisual egui overlay (fallback): {e:?}"))?;
-                    match NativeEguiOverlay::new(
+                    let overlay_new_t0 = Instant::now();
+                    let overlay_result = NativeEguiOverlay::new(
                         overlay_visual,
                         &dcomp_device,
                         &root_visual,
@@ -3012,8 +3036,11 @@ impl NativeRenderCore {
                         config.ui_font.clone(),
                         Arc::clone(&health),
                         window_epoch,
-                    ) {
+                    );
+                    overlay_new_ms += overlay_new_t0.elapsed().as_secs_f64() * 1000.0;
+                    match overlay_result {
                         Ok(mut overlay) => {
+                            let first_render_t0 = Instant::now();
                             match overlay.render_once() {
                                 Ok((_, intents)) => startup_window_intents.extend(intents),
                                 Err(err) => {
@@ -3026,6 +3053,8 @@ impl NativeRenderCore {
                                     );
                                 }
                             }
+                            overlay_first_render_ms +=
+                                first_render_t0.elapsed().as_secs_f64() * 1000.0;
                             egui_overlay = Some(overlay);
                         }
                         Err(err) => {
@@ -3040,6 +3069,19 @@ impl NativeRenderCore {
                     }
                 }
             }
+
+            let overlay_ms = overlay_t0.elapsed().as_secs_f64() * 1000.0;
+            crate::logger::log(format!(
+                "native-presenter: render core created in {:.1}ms \
+                 (d3d11_device={d3d_ms:.1} shader_pipelines={pipelines_ms:.1} \
+                 swapchain_dcomp={compositor_ms:.1} egui_overlay={overlay_ms:.1} \
+                 overlay_new={overlay_new_ms:.1} \
+                 overlay_first_render={overlay_first_render_ms:.1}) \
+                 {}x{} epoch={window_epoch}",
+                core_t0.elapsed().as_secs_f64() * 1000.0,
+                config.width,
+                config.height,
+            ));
 
             // Route A — MPO ちらつき修正 (v0.9.2): 動画 visual の真上に完全透明な
             // 全画面カバー visual を常駐させる。presenter HWND の内容が「動画 swap
@@ -6320,29 +6362,24 @@ impl NativeEguiOverlay {
         health: Arc<crate::video::native_window_health::NativeWindowHealth>,
         window_epoch: u64,
     ) -> Result<Self, String> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::DX12,
-            ..Default::default()
-        });
-        let surface = unsafe {
-            instance
-                .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CompositionVisual(
-                    visual.as_raw() as *mut core::ffi::c_void,
-                ))
-                .map_err(|e| format!("wgpu CompositionVisual surface: {e:?}"))?
-        };
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: Some(&surface),
-        }))
-        .map_err(|e| format!("wgpu request_adapter for DComp overlay: {e:?}"))?;
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("mIV native egui overlay"),
-            ..Default::default()
-        }))
-        .map_err(|e| format!("wgpu request_device for DComp overlay: {e:?}"))?;
-        let caps = surface.get_capabilities(&adapter);
+        // 本関数は placement 切替 (F12 の main ⇄ 別ウィンドウ) のたびに丸ごと走る。
+        // Surface / Renderer / Context は窓ごとに作るが、Instance と compatible な
+        // DeviceEpoch は process-owned service から再利用する (backlog §1.122)。
+        let overlay_t0 = Instant::now();
+        let service_t0 = Instant::now();
+        let gpu_service = overlay_gpu_service();
+        let instance_ms = service_t0.elapsed().as_secs_f64() * 1000.0;
+        let surface_t0 = Instant::now();
+        let surface =
+            gpu_service.create_composition_surface(visual.as_raw() as *mut core::ffi::c_void)?;
+        let surface_ms = surface_t0.elapsed().as_secs_f64() * 1000.0;
+        let epoch_selection = gpu_service.select_or_create_epoch(&surface)?;
+        let adapter_ms = epoch_selection.adapter_ms;
+        let device_ms = epoch_selection.device_ms;
+        let device_reused = epoch_selection.reused;
+        let gpu_epoch = epoch_selection.epoch;
+        let device_generation = gpu_epoch.generation();
+        let caps = surface.get_capabilities(gpu_epoch.adapter());
         let format = choose_overlay_surface_format(&caps.formats)?;
         let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::AutoVsync) {
             wgpu::PresentMode::AutoVsync
@@ -6360,15 +6397,24 @@ impl NativeEguiOverlay {
         } else {
             wgpu::CompositeAlphaMode::Auto
         };
-        let renderer =
-            egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
+        let renderer_t0 = Instant::now();
+        let renderer = egui_wgpu::Renderer::new(
+            gpu_epoch.device(),
+            format,
+            egui_wgpu::RendererOptions::default(),
+        );
+        let renderer_ms = renderer_t0.elapsed().as_secs_f64() * 1000.0;
+        let ctx_t0 = Instant::now();
         let egui_ctx = egui::Context::default();
         crate::ime_focus::install_ime_input_policy(&egui_ctx);
         crate::egui_focus_policy::install_tab_shortcut_focus_policy(&egui_ctx);
         crate::double_click_time::configure_context(&egui_ctx);
         egui_ctx.options_mut(|options| options.zoom_with_keyboard = false);
+        let fonts_t0 = Instant::now();
         configure_overlay_fonts(&egui_ctx, &ui_font);
+        let fonts_ms = fonts_t0.elapsed().as_secs_f64() * 1000.0;
         configure_overlay_style(&egui_ctx, text_contrast);
+        let ctx_ms = ctx_t0.elapsed().as_secs_f64() * 1000.0;
         let ui_scale = crate::settings::normalize_ui_scale_factor(ui_scale);
         let pixels_per_point = effective_overlay_pixels_per_point(os_pixels_per_point, ui_scale);
         let this = Self {
@@ -6379,10 +6425,7 @@ impl NativeEguiOverlay {
             dcomp_device: dcomp_device.clone(),
             root_visual: root_visual.clone(),
             after_visual: after_visual.cloned(),
-            _instance: instance,
-            adapter,
-            device,
-            queue,
+            gpu_epoch,
             format,
             present_mode,
             alpha_mode,
@@ -6397,6 +6440,7 @@ impl NativeEguiOverlay {
             modifiers: egui::Modifiers::default(),
             pointer_pos: None,
             event_count: 0,
+            render_count: 0,
             dirty: true,
             next_repaint_deadline: None,
             wants_pointer_input: false,
@@ -6519,7 +6563,18 @@ impl NativeEguiOverlay {
             height: height.max(1),
             normalize_state: crate::video::normalize_types::NormalizeOverlayState::default(),
         };
-        this.configure();
+        let configure_t0 = Instant::now();
+        this.configure()?;
+        let configure_ms = configure_t0.elapsed().as_secs_f64() * 1000.0;
+        crate::logger::log(format!(
+            "native-presenter: egui overlay created in {:.1}ms \
+             (wgpu_instance={instance_ms:.1} surface={surface_ms:.1} \
+             adapter={adapter_ms:.1} device={device_ms:.1} reused={device_reused} \
+             generation={device_generation} renderer={renderer_ms:.1} \
+             egui_ctx={ctx_ms:.1} of_which_fonts={fonts_ms:.1} configure={configure_ms:.1}) \
+             epoch={window_epoch}",
+            overlay_t0.elapsed().as_secs_f64() * 1000.0,
+        ));
         log_event(
             "egui_overlay_init",
             &[
@@ -6531,7 +6586,13 @@ impl NativeEguiOverlay {
                     Value::from(format!("{:?}", this.present_mode)),
                 ),
                 ("alpha_mode", Value::from(format!("{:?}", this.alpha_mode))),
-                ("adapter", Value::from(this.adapter.get_info().name)),
+                (
+                    "adapter",
+                    Value::from(this.gpu_epoch.adapter().get_info().name),
+                ),
+                ("device_generation", Value::from(device_generation)),
+                ("device_reused", Value::from(device_reused)),
+                ("configure_ms", Value::from(configure_ms)),
                 ("pixels_per_point", Value::from(this.pixels_per_point)),
                 ("visual_attached", Value::from(this.visual_attached)),
             ],
@@ -6547,7 +6608,7 @@ impl NativeEguiOverlay {
         }
         self.width = width;
         self.height = height;
-        self.configure();
+        self.configure()?;
         self.dirty = true;
         self.render_once().map(|(_, intents)| intents)
     }
@@ -8789,9 +8850,14 @@ impl NativeEguiOverlay {
                     .contains(pos))
     }
 
-    fn configure(&self) {
+    fn configure(&self) -> Result<(), String> {
+        // `Surface::configure` may internally wait for queue work. Serialize it
+        // against this epoch's submission span across every overlay window.
+        self.gpu_epoch.ensure_alive("surface configure")?;
+        let _configure_guard = self.gpu_epoch.configure_guard();
+        self.gpu_epoch.ensure_alive("surface configure")?;
         self.surface.configure(
-            &self.device,
+            self.gpu_epoch.device(),
             &wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                 format: self.format,
@@ -8803,6 +8869,7 @@ impl NativeEguiOverlay {
                 view_formats: vec![],
             },
         );
+        Ok(())
     }
 
     fn set_visual_attached(&mut self, attached: bool) -> Result<(), String> {
@@ -8848,6 +8915,8 @@ impl NativeEguiOverlay {
     ) -> Result<(Vec<NativeOverlayCommand>, Vec<NativeWindowIntent>), String> {
         let mut window_intents = Vec::new();
         let render_t0 = Instant::now();
+        self.gpu_epoch.ensure_alive("overlay draw")?;
+        let first_render = self.render_count == 0;
         if self
             .toast
             .as_ref()
@@ -9138,6 +9207,7 @@ impl NativeEguiOverlay {
         let tag_picker_enter_allowed = !tag_picker_ime_active;
         let mut seek_strip_area_ran = false;
         let mut seek_strip_preview_hover = NativeSeekStripPreviewHover::Outside;
+        let egui_run_t0 = Instant::now();
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             if !overlay_visible {
                 return;
@@ -10976,6 +11046,7 @@ impl NativeEguiOverlay {
                 );
             }
         });
+        let egui_run_ms = egui_run_t0.elapsed().as_secs_f64() * 1000.0;
         let egui_hover_pos = self.egui_ctx.pointer_hover_pos();
         crate::video::cursor_debug::log(format_args!(
             "layer=egui event=presenter_frame epoch={} strip_area_ran={seek_strip_area_ran} strip_present={} bottom_hud_visible={bottom_hud_visible} tile_overlay_visible={tile_overlay_visible} navigation_preview_visible={navigation_preview_visible} native_hover_points={visibility_hover_pos:?} egui_hover_points={egui_hover_pos:?} platform_cursor={:?}",
@@ -11087,6 +11158,35 @@ impl NativeEguiOverlay {
         });
 
         let shape_count = full_output.shapes.len();
+        // Pure CPU tessellation is deliberately outside the epoch gate.
+        let tessellate_t0 = Instant::now();
+        let paint_jobs = self
+            .egui_ctx
+            .tessellate(full_output.shapes, full_output.pixels_per_point);
+        let tessellate_ms = tessellate_t0.elapsed().as_secs_f64() * 1000.0;
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.width, self.height],
+            pixels_per_point: full_output.pixels_per_point,
+        };
+
+        // Two native-video-render threads can briefly share one DeviceEpoch. NOT because
+        // two videos play at once -- only one live media session exists at a time
+        // (`close_parked_live_media_windows_for_new_media`), and an F12 placement switch
+        // builds and drops both presenters on this same thread. The overlap comes from
+        // teardown: `Drop for NativeVideoOutput` sets cancel and hands the joins to a
+        // separate thread instead of blocking, so the outgoing render thread can still
+        // finish a submit while the incoming one configures its surface. Before the device
+        // was shared each overlay had its own, so this could not happen.
+        //
+        // A read guard covers all texture/queue/surface GPU work through present; configure
+        // takes the matching write guard. Context::run and tessellation stay outside.
+        // `gate_wait_ms` below reports whether the overlap is ever actually observed.
+        let gpu_span_t0 = Instant::now();
+        let gate_wait_t0 = Instant::now();
+        let _submission_guard = self.gpu_epoch.submission_guard();
+        let gate_wait_ms = gate_wait_t0.elapsed().as_secs_f64() * 1000.0;
+        self.gpu_epoch.ensure_alive("overlay GPU submission")?;
+
         // presenter は本体とは別の egui Context / Renderer を持つ。font atlas の追跡台帳は
         // renderer 番号で区別するので、こちらの適用も同じ経路に載せる
         // (詳細: `egui_wgpu::atlas_diag`)。
@@ -11096,38 +11196,52 @@ impl NativeEguiOverlay {
             diag_id,
             &full_output.textures_delta,
         );
+        let texture_update_t0 = Instant::now();
         for (id, image_delta) in &full_output.textures_delta.set {
             let before = self.renderer.texture_size(id);
-            self.renderer
-                .update_texture(&self.device, &self.queue, *id, image_delta);
+            self.renderer.update_texture(
+                self.gpu_epoch.device(),
+                self.gpu_epoch.queue(),
+                *id,
+                image_delta,
+            );
             let after = self.renderer.texture_size(id);
             egui_wgpu::atlas_diag::record_applied(*id, diag_id, image_delta, before, after);
         }
+        let texture_update_ms = texture_update_t0.elapsed().as_secs_f64() * 1000.0;
         if atlas_batch.tracked() {
             egui_wgpu::atlas_diag::flush("applying the presenter's texture delta batch");
         }
-        let paint_jobs = self
-            .egui_ctx
-            .tessellate(full_output.shapes, full_output.pixels_per_point);
-        let screen_descriptor = egui_wgpu::ScreenDescriptor {
-            size_in_pixels: [self.width, self.height],
-            pixels_per_point: full_output.pixels_per_point,
+
+        let surface_acquire_t0 = Instant::now();
+        let surface_texture = match self.surface.get_current_texture() {
+            Ok(texture) => texture,
+            Err(error) => {
+                if error == wgpu::SurfaceError::Other && self.gpu_epoch.is_lost() {
+                    return Err(format!(
+                        "wgpu overlay device epoch {} was lost during surface acquire: {error:?}",
+                        self.gpu_epoch.generation()
+                    ));
+                }
+                // Lost / Outdated / Timeout are surface conditions. They preserve the
+                // epoch cache; only the device-lost callback can latch an epoch.
+                return Err(format!("egui overlay get_current_texture: {error:?}"));
+            }
         };
-        let surface_texture = self
-            .surface
-            .get_current_texture()
-            .map_err(|e| format!("egui overlay get_current_texture: {e:?}"))?;
+        let surface_acquire_ms = surface_acquire_t0.elapsed().as_secs_f64() * 1000.0;
         let view = surface_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("mIV native egui overlay encoder"),
-            });
+        let buffer_update_encode_t0 = Instant::now();
+        let mut encoder =
+            self.gpu_epoch
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("mIV native egui overlay encoder"),
+                });
         let user_cmds = self.renderer.update_buffers(
-            &self.device,
-            &self.queue,
+            self.gpu_epoch.device(),
+            self.gpu_epoch.queue(),
             &mut encoder,
             &paint_jobs,
             &screen_descriptor,
@@ -11156,13 +11270,18 @@ impl NativeEguiOverlay {
         }
         let mut submissions = user_cmds;
         submissions.push(encoder.finish());
-        self.queue.submit(submissions);
+        let buffer_update_encode_ms = buffer_update_encode_t0.elapsed().as_secs_f64() * 1000.0;
+        let submit_present_t0 = Instant::now();
+        self.gpu_epoch.queue().submit(submissions);
         {
             let _operation = self
                 .health
                 .begin_render_operation(NativeRenderOperation::Present, self.window_epoch);
             surface_texture.present();
         }
+        let submit_present_ms = submit_present_t0.elapsed().as_secs_f64() * 1000.0;
+        let gpu_span_ms = gpu_span_t0.elapsed().as_secs_f64() * 1000.0;
+        drop(_submission_guard);
         if overlay_visible {
             self.set_visual_attached(true)?;
         }
@@ -11174,6 +11293,7 @@ impl NativeEguiOverlay {
             || self.bulk_bookmark_dialog.is_some()
             || self.shortcut_help_open
             || left_panel_open_changed;
+        self.render_count = self.render_count.saturating_add(1);
         log_event(
             "egui_overlay_present",
             &[
@@ -11182,13 +11302,33 @@ impl NativeEguiOverlay {
                 ("input_events", Value::from(pending_event_count as i64)),
                 ("native_events", Value::from(event_count as i64)),
                 ("pixels_per_point", Value::from(ppp)),
+                ("first_render", Value::from(first_render)),
+                (
+                    "device_generation",
+                    Value::from(self.gpu_epoch.generation()),
+                ),
                 ("shapes", Value::from(shape_count as i64)),
                 ("paint_jobs", Value::from(paint_jobs.len() as i64)),
+                (
+                    "texture_set_count",
+                    Value::from(full_output.textures_delta.set.len() as i64),
+                ),
                 ("wants_pointer", Value::from(self.wants_pointer_input)),
                 ("wants_keyboard", Value::from(self.wants_keyboard_input)),
                 ("hud_visible", Value::from(hud_visible)),
                 ("perf_visible", Value::from(perf_visible)),
                 ("visual_attached", Value::from(self.visual_attached)),
+                ("egui_run_ms", Value::from(egui_run_ms)),
+                ("tessellate_ms", Value::from(tessellate_ms)),
+                ("gate_wait_ms", Value::from(gate_wait_ms)),
+                ("texture_update_ms", Value::from(texture_update_ms)),
+                ("surface_acquire_ms", Value::from(surface_acquire_ms)),
+                (
+                    "buffer_update_encode_ms",
+                    Value::from(buffer_update_encode_ms),
+                ),
+                ("submit_present_ms", Value::from(submit_present_ms)),
+                ("gpu_span_ms", Value::from(gpu_span_ms)),
                 (
                     "render_ms",
                     Value::from(render_t0.elapsed().as_secs_f64() * 1000.0),
@@ -11560,12 +11700,23 @@ impl Drop for NativeRenderCore {
 }
 
 impl NativeRenderCore {
-    pub(crate) fn detach(self) {
+    pub(crate) fn detach(mut self) -> NativeRenderCoreDetachTimings {
         let health = Arc::clone(&self.health);
         let epoch = self.window_epoch;
         let operation = health.begin_render_operation(NativeRenderOperation::Detach, epoch);
+
+        let overlay_t0 = Instant::now();
+        drop(self.egui_overlay.take());
+        let egui_overlay_ms = overlay_t0.elapsed().as_secs_f64() * 1000.0;
+
+        let rest_t0 = Instant::now();
         drop(self);
+        let rest_ms = rest_t0.elapsed().as_secs_f64() * 1000.0;
         drop(operation);
+        NativeRenderCoreDetachTimings {
+            egui_overlay_ms,
+            rest_ms,
+        }
     }
 }
 

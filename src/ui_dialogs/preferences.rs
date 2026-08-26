@@ -107,7 +107,7 @@ pub enum Vst3ScanMessage {
 pub(crate) enum PreferencesPage {
     General,
     Font,
-    StartupFolder,
+    Startup,
     ExplorerIntegration,
     Thumbnail,
     Slideshow,
@@ -153,7 +153,7 @@ impl PreferencesPage {
     const ALL: &'static [Self] = &[
         Self::General,
         Self::Font,
-        Self::StartupFolder,
+        Self::Startup,
         Self::ExplorerIntegration,
         Self::Thumbnail,
         Self::Slideshow,
@@ -186,7 +186,7 @@ impl PreferencesPage {
         match self {
             Self::General => "全体設定",
             Self::Font => "フォント",
-            Self::StartupFolder => "起動時に開く場所",
+            Self::Startup => "起動時の動作",
             Self::ExplorerIntegration => "エクスプローラ連携",
             Self::Thumbnail => "サムネイル",
             Self::Slideshow => "スライドショー",
@@ -403,7 +403,7 @@ const TREE: &[TreeCategory] = &[
         label: "起動と連携",
         page: None,
         children: &[
-            PreferencesPage::StartupFolder,
+            PreferencesPage::Startup,
             PreferencesPage::ExplorerIntegration,
             PreferencesPage::TrayResidency,
             PreferencesPage::UpdateCheck,
@@ -2692,7 +2692,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
     match state.selected {
         PreferencesPage::General => page_general(ui, state),
         PreferencesPage::Font => page_font(ui, state),
-        PreferencesPage::StartupFolder => page_startup_folder(ui, state),
+        PreferencesPage::Startup => page_startup(ui, state),
         PreferencesPage::ExplorerIntegration => page_explorer_integration(ui, state),
         PreferencesPage::Thumbnail => page_thumbnail(ui, state),
         PreferencesPage::Slideshow => page_slideshow(ui, state),

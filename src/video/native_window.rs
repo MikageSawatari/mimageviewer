@@ -770,14 +770,26 @@ impl NativeVideoWindow {
         if self.hwnd.0.is_null() {
             return false;
         }
+        let t0 = std::time::Instant::now();
         unsafe {
             if !IsWindow(Some(self.hwnd)).as_bool() {
                 return false;
             }
             crate::dwm_transitions::disable_transitions_for_window(self.hwnd);
+        }
+        let dwm_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let show_t0 = std::time::Instant::now();
+        unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOW);
         }
+        let show_ms = show_t0.elapsed().as_secs_f64() * 1000.0;
+        let raise_t0 = std::time::Instant::now();
         let raised = bring_hwnd_to_front(self.hwnd);
+        let raise_ms = raise_t0.elapsed().as_secs_f64() * 1000.0;
+        crate::logger::log(format!(
+            "[native-video] show_and_raise dwm={dwm_ms:.1}ms show_window={show_ms:.1} \
+             set_window_pos={raise_ms:.1}"
+        ));
         log_window_state("shown", self.hwnd);
         raised
     }
@@ -787,12 +799,21 @@ impl NativeVideoWindow {
         if self.hwnd.0.is_null() {
             return false;
         }
+        let t0 = std::time::Instant::now();
         unsafe {
             if !IsWindow(Some(self.hwnd)).as_bool() {
                 return false;
             }
             crate::dwm_transitions::disable_transitions_for_window(self.hwnd);
+        }
+        let dwm_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let show_t0 = std::time::Instant::now();
+        unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+        }
+        let show_ms = show_t0.elapsed().as_secs_f64() * 1000.0;
+        let swp_t0 = std::time::Instant::now();
+        unsafe {
             let _ = SetWindowPos(
                 self.hwnd,
                 Some(HWND_TOP),
@@ -803,6 +824,11 @@ impl NativeVideoWindow {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
         }
+        crate::logger::log(format!(
+            "[native-video] show_no_activate dwm={dwm_ms:.1}ms show_window={show_ms:.1} \
+             set_window_pos={:.1}",
+            swp_t0.elapsed().as_secs_f64() * 1000.0,
+        ));
         log_window_state("shown-noactivate", self.hwnd);
         true
     }

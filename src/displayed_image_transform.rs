@@ -112,7 +112,8 @@ impl DisplayedImageTransform {
             return None;
         }
         let display_size = rotated_size(input.texture_size, input.rotation);
-        let fit_bbox = effective_bbox(input.rotation, input.free_rotation_rad, input.content_bbox);
+        let fit_bbox = effective_bbox(input.free_rotation_rad, input.content_bbox)
+            .map(|bbox| rotate_bbox_to_display(bbox, input.rotation));
         let bbox_fit = fit_bbox.map(|bbox| {
             let width = (bbox.width() * display_size.x).max(1.0);
             let height = (bbox.height() * display_size.y).max(1.0);
@@ -191,9 +192,16 @@ impl DisplayedImageTransform {
             total_scale,
             input.pixels_per_point,
         );
-        let fit_bbox = effective_bbox(input.rotation, input.free_rotation_rad, input.content_bbox);
-        let (paint_rect, uv_rect) = fit_bbox
-            .map(|bbox| (normalized_sub_rect(full_image_rect, bbox), bbox))
+        // 描画位置は表示空間、UV は元画像空間。**同じ矩形を両方に使わない**のが、
+        // 回転時に部分矩形を丸ごと捨てていた原因だった。
+        let (paint_rect, uv_rect) = effective_bbox(input.free_rotation_rad, input.content_bbox)
+            .map(|source_bbox| {
+                let display_bbox = rotate_bbox_to_display(source_bbox, input.rotation);
+                (
+                    normalized_sub_rect(full_image_rect, display_bbox),
+                    source_bbox,
+                )
+            })
             .unwrap_or((full_image_rect, full_uv_rect()));
         let hit_rect = rotated_rect_aabb(
             paint_rect,
@@ -619,7 +627,8 @@ impl ResolvedZTransform {
         input.image.fit_scale_limits = FullscreenFitScaleLimits::default();
         input.image.free_rotation_rad = 0.0;
         let display_size = rotated_size(input.image.texture_size, input.image.rotation);
-        let bbox = effective_bbox(input.image.rotation, 0.0, input.image.content_bbox);
+        let bbox = effective_bbox(0.0, input.image.content_bbox)
+            .map(|bbox| rotate_bbox_to_display(bbox, input.image.rotation));
         let (content_min, content_size) = bbox
             .map(|bbox| {
                 (
@@ -803,12 +812,33 @@ fn rotated_size(size: egui::Vec2, rotation: Rotation) -> egui::Vec2 {
     }
 }
 
-fn effective_bbox(
-    rotation: Rotation,
+/// 使える部分矩形か。**自由回転中だけ降ろす。**
+///
+/// 保存回転では降ろさない。以前は回転していれば無条件に捨てていたが、それは
+/// `content_bbox` を fit 計算では表示空間、UV では元画像空間として二重に扱っていた
+/// ためで、矩形自体は回転しても使える。空間を分けたので保存回転は扱える
+/// ([rotate_bbox_to_display])。自由回転は、傾けた矩形の外接が広がる分の拡大量を
+/// 解けないので従来どおり降ろす。
+pub(crate) fn effective_bbox(
     free_rotation_rad: f32,
     content_bbox: Option<egui::Rect>,
 ) -> Option<egui::Rect> {
-    content_bbox.filter(|_| rotation.is_none() && free_rotation_rad.abs() <= EPSILON)
+    content_bbox.filter(|_| free_rotation_rad.abs() <= EPSILON)
+}
+
+/// 元画像空間の正規化部分矩形を、保存回転を反映した表示空間へ写す。
+///
+/// `content_bbox` は**元画像の画素から作られる** (`margin_fit::detect_content_bbox` は
+/// 回転を知らない)。一方 `full_image_rect` と `display_size` は回転後の寸法なので、
+/// 描画位置と fit にはこちらを使う。UV は元画像空間のまま渡す。
+/// 写像は screen ↔ source と同じ [`forward_uv`] を使う (別の式を書かない)。
+pub(crate) fn rotate_bbox_to_display(bbox: egui::Rect, rotation: Rotation) -> egui::Rect {
+    let (ax, ay) = forward_uv(rotation, bbox.min.x, bbox.min.y);
+    let (bx, by) = forward_uv(rotation, bbox.max.x, bbox.max.y);
+    egui::Rect::from_min_max(
+        egui::pos2(ax.min(bx), ay.min(by)),
+        egui::pos2(ax.max(bx), ay.max(by)),
+    )
 }
 
 fn full_uv_rect() -> egui::Rect {
@@ -843,6 +873,92 @@ pub(crate) fn inverse_uv(rotation: Rotation, u: f32, v: f32) -> (f32, f32) {
         Rotation::Cw90 => (v, 1.0 - u),
         Rotation::Cw180 => (1.0 - u, 1.0 - v),
         Rotation::Cw270 => (1.0 - v, u),
+    }
+}
+
+#[cfg(test)]
+mod bbox_space_tests {
+    use super::*;
+
+    fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> egui::Rect {
+        egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1))
+    }
+
+    fn about(a: egui::Rect, b: egui::Rect) {
+        for (l, r) in [
+            (a.min.x, b.min.x),
+            (a.min.y, b.min.y),
+            (a.max.x, b.max.x),
+            (a.max.y, b.max.y),
+        ] {
+            assert!((l - r).abs() < 1e-5, "{a:?} != {b:?}");
+        }
+    }
+
+    /// 元画像の左上寄りの矩形が、回転ごとに表示空間のどこへ行くか。
+    #[test]
+    fn a_source_rect_lands_where_the_rotation_puts_it() {
+        let source = rect(0.0, 0.0, 0.25, 0.5);
+        about(
+            rotate_bbox_to_display(source, Rotation::None),
+            rect(0.0, 0.0, 0.25, 0.5),
+        );
+        // 時計回り 90 度: 上辺が右辺へ。元の「上寄り」は表示では「右寄り」。
+        about(
+            rotate_bbox_to_display(source, Rotation::Cw90),
+            rect(0.5, 0.0, 1.0, 0.25),
+        );
+        about(
+            rotate_bbox_to_display(source, Rotation::Cw180),
+            rect(0.75, 0.5, 1.0, 1.0),
+        );
+        about(
+            rotate_bbox_to_display(source, Rotation::Cw270),
+            rect(0.0, 0.75, 0.5, 1.0),
+        );
+    }
+
+    /// 90 / 270 度では縦横が入れ替わる。入れ替えを忘れると fit が縦横取り違える。
+    #[test]
+    fn the_quarter_turns_swap_width_and_height() {
+        let source = rect(0.1, 0.2, 0.4, 0.9);
+        for rotation in [Rotation::Cw90, Rotation::Cw270] {
+            let display = rotate_bbox_to_display(source, rotation);
+            assert!((display.width() - source.height()).abs() < 1e-5);
+            assert!((display.height() - source.width()).abs() < 1e-5);
+        }
+        for rotation in [Rotation::None, Rotation::Cw180] {
+            let display = rotate_bbox_to_display(source, rotation);
+            assert!((display.width() - source.width()).abs() < 1e-5);
+            assert!((display.height() - source.height()).abs() < 1e-5);
+        }
+    }
+
+    /// 表示空間へ写した矩形の中心を戻すと、元の中心に一致する。
+    /// `screen_to_source_normalized` と同じ `inverse_uv` を通る経路の裏取り。
+    #[test]
+    fn mapping_back_returns_the_source_centre() {
+        let source = rect(0.2, 0.05, 0.6, 0.35);
+        for rotation in [
+            Rotation::None,
+            Rotation::Cw90,
+            Rotation::Cw180,
+            Rotation::Cw270,
+        ] {
+            let display = rotate_bbox_to_display(source, rotation);
+            let (s, t) = inverse_uv(rotation, display.center().x, display.center().y);
+            assert!((s - source.center().x).abs() < 1e-5, "{rotation:?}");
+            assert!((t - source.center().y).abs() < 1e-5, "{rotation:?}");
+        }
+    }
+
+    /// 部分矩形が降りるのは自由回転中だけ。保存回転では残る。
+    #[test]
+    fn only_free_rotation_drops_the_bbox() {
+        let bbox = Some(rect(0.1, 0.1, 0.9, 0.9));
+        assert_eq!(effective_bbox(0.0, bbox), bbox);
+        assert_eq!(effective_bbox(0.2, bbox), None);
+        assert_eq!(effective_bbox(0.0, None), None);
     }
 }
 
@@ -1280,11 +1396,10 @@ mod tests {
                         transform.hit_rect,
                         transform.paint_rect.intersect(transform.viewport_rect),
                     );
-                    let expected_uv = if rotation == Rotation::None {
-                        content_bbox.unwrap_or_else(full_uv_rect)
-                    } else {
-                        full_uv_rect()
-                    };
+                    // 部分矩形は元画像空間なので、**回転しても同じものが UV になる**。
+                    // 以前はここで回転時だけ全体へ倒していたが、それは fit 計算と UV で
+                    // 同じ矩形を別の空間として使っていたことの辻褄合わせだった。
+                    let expected_uv = content_bbox.unwrap_or_else(full_uv_rect);
                     rect_close(transform.uv_rect, expected_uv);
                     let center_source =
                         transform.screen_to_source_normalized(transform.paint_rect.center());
@@ -1483,7 +1598,8 @@ mod tests {
         for (rotation, content_bbox) in [(Rotation::None, Some(trim)), (Rotation::Cw90, None)] {
             let base = input(FullscreenFitMode::Page, rotation, content_bbox);
             let display_size = rotated_size(base.texture_size, rotation);
-            let bbox = effective_bbox(rotation, 0.0, content_bbox);
+            let bbox = effective_bbox(0.0, content_bbox)
+                .map(|bbox| rotate_bbox_to_display(bbox, rotation));
             let content_size = bbox
                 .map(|bbox| {
                     egui::vec2(
