@@ -7620,6 +7620,8 @@ impl App {
         session: &mut VideoSeekStripSession,
         visible_cells_pending: bool,
         worker_status: Option<&crate::video::seek_strip_thumbs::StripThumbnailWorkerStatus>,
+        pending_cells: &[(usize, Option<f64>)],
+        settled_cell_count: usize,
     ) -> Option<String> {
         const STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(12);
         if !visible_cells_pending {
@@ -7634,8 +7636,19 @@ impl App {
             return None;
         }
         session.visible_pending_reported = true;
+        // どちらの側が落としたのかを 1 行で決められるように、**app が要求したと思っている範囲**と
+        // **worker に実際に届いている数**を並べて出す。要求台帳を配達台帳として使っていないかが
+        // ここで分かる。
+        let pending_list = pending_cells
+            .iter()
+            .map(|(index, target_secs)| match target_secs {
+                Some(secs) => format!("{index}@{secs:.2}s"),
+                None => format!("{index}@?"),
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         Some(format!(
-            "[video-seek-strip] visible cells still pending after {:.1}s: path={} center={:?}              axis={} worker_status={:?}",
+            "[video-seek-strip] visible cells still pending after {:.1}s: path={} center={:?} axis={} worker_status={:?} settled_cells={settled_cell_count} pending=[{pending_list}] requested_coverage={:?} last_requested_center={:?}",
             started.elapsed().as_secs_f64(),
             session.video_path.display(),
             session.center,
@@ -7645,6 +7658,8 @@ impl App {
                     format!("ready/{} cells", axis.cell_count()),
             },
             worker_status,
+            session.thumbnail_request_coverage,
+            session.last_requested_center,
         ))
     }
 
@@ -7754,6 +7769,7 @@ impl App {
                     }
                 }
                 let mut visible_cells_pending = false;
+                let mut pending_cell_report: Vec<(usize, Option<f64>)> = Vec::new();
                 let mut thumbnail_notice = None;
                 let mut wave_image = None;
                 let mut wave_notice = None;
@@ -7806,6 +7822,7 @@ impl App {
                                         ) {
                                             crate::video::seek_strip_thumbs::StripThumbnailCellState::Pending => {
                                                 visible_cells_pending = true;
+                                                pending_cell_report.push((index, target_secs));
                                                 crate::video::native_presenter::NativeOverlaySeekStripCellContent::Pending
                                             }
                                             crate::video::seek_strip_thumbs::StripThumbnailCellState::Ready(thumbnail) => {
@@ -7893,6 +7910,10 @@ impl App {
                     session,
                     visible_cells_pending,
                     thumbnail_snapshot.as_ref().map(|snapshot| &snapshot.status),
+                    &pending_cell_report,
+                    thumbnail_snapshot
+                        .as_ref()
+                        .map_or(0, |snapshot| snapshot.cells.len()),
                 );
                 Some(crate::video::native_presenter::NativeOverlaySeekStrip {
                     center: session.center,

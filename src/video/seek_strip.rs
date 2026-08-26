@@ -265,8 +265,12 @@ impl SeekStripMaterialAvailability {
 pub(crate) const SEEK_STRIP_MAX_RAW_KEYFRAME_GAP_SECS: f64 = 15.0;
 
 /// Persisted minimum-interval choices for the thumbnail strip, in seconds.
-pub(crate) const THUMBNAIL_RANGE_STEPS_SECS: &[f64] =
-    &[0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0];
+///
+/// 分の段は 4 時間級の動画のためにある。1 分間隔だと 1 画面が 11 分ぶんにしかならず、
+/// 全体を見渡せない (利用者要望 2026-08-26)。30 分まで広げると 4 時間が 8 セルに収まる。
+pub(crate) const THUMBNAIL_RANGE_STEPS_SECS: &[f64] = &[
+    0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0,
+];
 
 /// Persisted one-screen span choices for the waveform strip, in seconds.
 pub(crate) const WAVEFORM_RANGE_STEPS_SECS: &[f64] = &[
@@ -309,10 +313,10 @@ pub(crate) fn format_seek_strip_range_value(
         return "--".to_owned();
     }
     let whole_epsilon = f64::EPSILON * seconds.abs().max(1.0) * 8.0;
-    let (value, unit) = if mode == crate::settings::VideoSeekStripMode::Waveform
-        && seconds >= 60.0
-        && (seconds % 60.0).abs() <= whole_epsilon
-    {
+    // 分表示は mode を問わない。サムネイル側も 2 分以上の段を持つようになったので、
+    // 波形だけ分・サムネイルだけ秒にすると同じ値が画面によって違う書き方になる。
+    let _ = mode;
+    let (value, unit) = if seconds >= 60.0 && (seconds % 60.0).abs() <= whole_epsilon {
         (seconds / 60.0, " 分")
     } else {
         (seconds, " 秒")
@@ -1356,7 +1360,10 @@ mod tests {
     fn range_step_ladders_match_the_persisted_choices() {
         assert_eq!(
             THUMBNAIL_RANGE_STEPS_SECS,
-            &[0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0]
+            &[
+                0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0,
+                1800.0,
+            ]
         );
         assert_eq!(
             WAVEFORM_RANGE_STEPS_SECS,
@@ -1401,7 +1408,15 @@ mod tests {
                 60.0,
                 SeekStripRangeStep::Wider,
             ),
-            Some(60.0)
+            Some(120.0)
+        );
+        assert_eq!(
+            step_seek_strip_range(
+                crate::settings::VideoSeekStripMode::Thumbnails,
+                1800.0,
+                SeekStripRangeStep::Wider,
+            ),
+            Some(1800.0)
         );
         assert_eq!(
             step_seek_strip_range(

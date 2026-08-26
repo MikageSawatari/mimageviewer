@@ -808,7 +808,7 @@ BLOB 読み出しと WebP→RGBA decode は `video-marker-thumbs` worker で行�
 窓を動かしても再利用する。再生追従は可視窓の半分が先読み coverage 内にある間は新要求を出さず、
 coverage を外れたときだけ進行方向 1 画面を追加要求する。最小間隔の設定変更は全索引から採用列だけを
 作り直し、実 timestamp をキーにした永続キャッシュは無効化しない。最小間隔は
-0.1 / 0.2 / 0.5 / 1 / 2 / 5 / 10 / 15 / 30 / 60 秒 (既定 15 秒) の段階値とする。
+0.1 / 0.2 / 0.5 / 1 / 2 / 5 / 10 / 15 / 30 / 60 秒と 2 / 5 / 10 / 15 / 30 分 (既定 15 秒) の段階値とする。
 索引セルの timestamp は seek domain であり、MP4 の `AVIndexEntry` では DTS のことがある。
 worker は窓内の同じ key packet の DTS と PTS を対応付けて presentation target を作り、decoded frame
 は許容内の過去側を優先し、過去側が無い場合だけ未来側へ fallback する。indexed cell の許容幅は
