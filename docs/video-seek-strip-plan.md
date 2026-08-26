@@ -30,7 +30,7 @@ MPEG-TS など `TimeGrid` 経路の実素材確認。
 
 ### 第 2 段の一括検証の結果 (2026-08-25、22,811 ファイル / 4 時間 26 分)
 
-`D:\home8` + `E:\share8`。生データは `C:\home\miv-batch-runner\sweep-stage2.json`
+`D:\home\18` + `E:\share\18`。生データは `C:\home\miv-batch-runner\sweep-stage2.json`
 (BOM 付き。`encoding='utf-8-sig'` で読む)。
 
 | | 件数 |
@@ -96,20 +96,31 @@ MPEG-TS など `TimeGrid` 経路の実素材確認。
   失敗を並べる形にしない。
 - `seek failed` (180 セル / 18 件) — 古い AVI / MPG に集中。索引が無い / 壊れている素材。
 
-**着手順**: A → B → `decoder unavailable` → `seek failed` → D17 → §5.4。
+**着手順 (当初)**: A → B → `decoder unavailable` → `seek failed` → D17 → §5.4。
+**A は D23 / D26 で解消。残り 19 件は利用者判断で Fix とした** (2026-08-26、下節)。
 
-### 次のセッションが最初にすること
+### 実素材 sweep の打ち切り (2026-08-26、利用者判断)
 
-**第 2 段の sweep は完了・集計済み** (上節)。**A (末尾セル) から着手する** — 失敗 303 件のうち
-246 件がこれ 1 つで、直せば 87% が消える。以降は上節の「着手順」に従う。
+**残り 19 件は直さずに Fix とした**。22,811 件中 19 件 (0.08%) で、しかも
+「ファイル末尾への seek そのものができない」類で、ストリップ以前の素材側の問題だから。
+内訳は B 13 件 / `decoder not found` 2 件 / `seek failed` 1 件 / `sws_scale Input changed` 1 件 /
+その他 2 件。一覧は `C:\home\miv-batch-runner\remaining-failures.txt`。
 
+**再開するなら**、B の失敗セル数が多い上位 2 件を batch で個別に診断するところから。
 **推測で直さない。** 実素材はここまで 6 件連続で別々の原因を出しており、着手前の見立ては
-6 件中 1 件しか当たっていない。`seek_strip_batch` の診断で理由を出してから直す。自前の簡易復号
-(`tools/seek_strip_probe`) はアプリが失敗する素材で 2 回とも通っている。
+6 件中 1 件しか当たっていない。`seek_strip_batch` の診断で理由を出してから直す。
+自前の簡易復号 (`tools/seek_strip_probe`) はアプリが失敗する素材で 2 回とも通っている。
 
-§5.4 の優先度は、利用者が波形 60 分以上の段を常用するかで決まる
-(実測 60 分 3.1 秒 / 120 分 6.5 秒 / 180 分 8.2 秒)。
+黒いセルの報告は**未再現のまま**。D25 の 12 秒診断が仕掛けてあるので、次に出たら
+`%APPDATA%\mimageviewer\logs\mimageviewer.log` に理由が残る。
 
+§5.4 (波形の絵巻き全長化) は未着手。優先度は、利用者が波形 60 分以上の段を常用するかで決まる
+(実測 60 分 3.1 秒 / 120 分 6.5 秒 / 180 分 8.2 秒)。D17 も未着手。
+
+**ブランチの状態 (2026-08-26)**: `video-strip` は master を取り込み済み。衝突は 3 箇所で、
+いずれも両側が同じ場所へ独立な物を足しただけだったので両方残した (Cargo.toml の workspace member /
+`native_video.rs` の型定義 / `render_core.rs` の per-frame 状態)。計測だけは順序に意味があるので、
+`egui_run_t0` を `run()` の直前、`egui_run_ms` を直後に置いてある。lib test 6498 件 green。
 
 ### 検証ツール
 
@@ -321,7 +332,7 @@ status を 1 行だけ出す (`note_seek_strip_visible_pending`)。次に出た�
 coverage 99〜100%** の健全な索引を持ち、**13 件すべてが既に全フレーム復号へフォールバック済み**
 (うち 7 件はハードウェアのまま完走)。つまり「索引が無い」のではなく、**全フレーム復号でも特定の
 セルだけフレームが出ない**。ファイルごとの診断が要る。一覧は
-`C:\home\miv-batch-runneremaining-failures.txt`。
+`C:\home\miv-batch-runner\remaining-failures.txt`。
 
 **D16 (実装済み、2026-08-24)**: サムネイルのセルは**左端をキーフレーム時刻に合わせる**。
 旧実装は `Rect::from_center_size` でセル中央がキーフレーム時刻になっていたが、キーフレームは
