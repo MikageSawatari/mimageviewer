@@ -2010,3 +2010,49 @@ mod writer_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod real_data_dry_run {
+    use super::*;
+
+    /// 実データでの一度きりの確認用。`MIV_SIDECAR_DRY_RUN=<folder>` を指定したときだけ走る。
+    #[test]
+    fn migrate_a_copy_of_a_real_sidecar() {
+        let Ok(folder) = std::env::var("MIV_SIDECAR_DRY_RUN") else {
+            return;
+        };
+        let folder = std::path::PathBuf::from(folder);
+        let before = std::fs::metadata(folder.join(SIDECAR_FILENAME))
+            .unwrap()
+            .len();
+
+        let read_at = std::time::Instant::now();
+        let mut sidecar = SidecarFile::load(&folder);
+        let read_secs = read_at.elapsed().as_secs_f64();
+        assert!(
+            sidecar.is_dirty(),
+            "the copy should still be in the old form"
+        );
+
+        let write_at = std::time::Instant::now();
+        assert!(sidecar.flush_blocking());
+        let after = std::fs::metadata(folder.join(SIDECAR_FILENAME))
+            .unwrap()
+            .len();
+        println!(
+            "{} items, {:.1}MB -> {:.1}MB, read {:.1}s, write {:.1}s",
+            sidecar.items().len(),
+            before as f64 / 1e6,
+            after as f64 / 1e6,
+            read_secs,
+            write_at.elapsed().as_secs_f64(),
+        );
+
+        let again = SidecarFile::load(&folder);
+        assert!(
+            !again.is_dirty(),
+            "the second read must find nothing to migrate"
+        );
+        assert_eq!(again.items().len(), sidecar.items().len());
+    }
+}
