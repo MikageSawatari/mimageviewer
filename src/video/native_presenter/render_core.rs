@@ -9918,9 +9918,18 @@ impl NativeEguiOverlay {
             pixels_per_point: full_output.pixels_per_point,
         };
 
-        // Multiple native-video-render threads can use one DeviceEpoch. A read guard
-        // covers all texture/queue/surface GPU work through present; configure takes
-        // the matching write guard. Context::run and tessellation stay outside.
+        // Two native-video-render threads can briefly share one DeviceEpoch. NOT because
+        // two videos play at once -- only one live media session exists at a time
+        // (`close_parked_live_media_windows_for_new_media`), and an F12 placement switch
+        // builds and drops both presenters on this same thread. The overlap comes from
+        // teardown: `Drop for NativeVideoOutput` sets cancel and hands the joins to a
+        // separate thread instead of blocking, so the outgoing render thread can still
+        // finish a submit while the incoming one configures its surface. Before the device
+        // was shared each overlay had its own, so this could not happen.
+        //
+        // A read guard covers all texture/queue/surface GPU work through present; configure
+        // takes the matching write guard. Context::run and tessellation stay outside.
+        // `gate_wait_ms` below reports whether the overlap is ever actually observed.
         let gpu_span_t0 = Instant::now();
         let gate_wait_t0 = Instant::now();
         let _submission_guard = self.gpu_epoch.submission_guard();

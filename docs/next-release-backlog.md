@@ -2206,7 +2206,18 @@ overlay は DComp visual から Surface を先に作り、loss 未確定かつ c
 Surface / `egui_wgpu::Renderer` / `egui::Context` は従来どおり窓ごとで、D3D11 present device も
 presenter ごとのまま。
 
-複数 `native-video-render` thread の同時利用に対して、epoch の RwLock は `Surface::configure` を
+⚠ gate の理由を 2026-08-26 に訂正した。当初 Codex は「複数の動画窓が並行し得る」とし、
+ClaudeCode は裏を取らずにそのまま伝えたが、**この前提は誤り**。生きているメディア session は常に 1 つで
+([app.rs](../src/app.rs) `close_parked_live_media_windows_for_new_media` + 回帰 test `new_media_open_closes_existing_parked_live_window`)、
+動画→動画の移動は `SwitchSource` で presenter を作り直さないし、F12 切替は新旧とも
+同じ render thread 上で直列。**正しい理由は teardown** — [video/mod.rs](../src/video/mod.rs) の
+`Drop for NativeVideoOutput` は render thread の join を待たず別 thread へ逃すので、
+cancel 後の旧 thread の submit と新 thread の configure が重なり得る。overlay ごとに
+Device を持っていた頃は無害で、**共有したことで初めて生じる**。
+実機ログでは旧 thread 停止 (49.516s) → 新 thread 開始 (50.163s) と 0.65 秒空いており、
+「起こり得るが未観測」が正確な状態。実際の競合は `gate_wait_ms` で見る。
+
+epoch の RwLock は `Surface::configure` を
 write lock、texture update / buffer update / acquire / submit / present の連続区間を read lock にした。
 `Context::run` と tessellation は lock 外。device-lost callback は generation 付き一方向 latch だけを
 立て、新規 overlay は lost epoch を skip する。既存 overlay は次 draw で terminal error を返す。

@@ -12,6 +12,13 @@ pub(super) fn overlay_gpu_service() -> &'static OverlayGpuService {
 ///
 /// The instance and every healthy device epoch remain strongly owned for the
 /// process lifetime. Surfaces and egui renderers remain presenter-owned.
+///
+/// On sharing and the [`DeviceEpoch`] gate: mIV has exactly one live media session at a
+/// time, so this is NOT about two videos playing together. Two `native-video-render`
+/// threads can still overlap because `Drop for NativeVideoOutput` does not block on the
+/// render-thread join -- it sets cancel and spawns a joiner -- so an outgoing thread can
+/// submit while an incoming one configures. That window did not matter while every overlay
+/// owned its own device; it does now.
 pub(super) struct OverlayGpuService {
     instance: wgpu::Instance,
     epochs: Mutex<Vec<Arc<DeviceEpoch>>>,
@@ -49,9 +56,9 @@ impl OverlayGpuService {
         &self,
         surface: &wgpu::Surface<'_>,
     ) -> Result<DeviceEpochSelection, String> {
-        // Keep selection and creation in one critical section. Otherwise two render
-        // threads opening windows concurrently could both miss and create duplicate
-        // devices for the same adapter.
+        // Keep selection and creation in one critical section. Otherwise an outgoing and
+        // an incoming render thread (see the type doc: teardown does not block) could both
+        // miss and create duplicate devices for the same adapter.
         let mut epochs = lock_unpoisoned(&self.epochs);
         if let Some(index) = find_reusable_epoch_index(
             epochs.as_slice(),

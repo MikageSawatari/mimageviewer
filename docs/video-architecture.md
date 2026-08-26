@@ -1,4 +1,4 @@
-# 動画再生サブシステム アーキテクチャ
+﻿# 動画再生サブシステム アーキテクチャ
 
 mimageviewer の動画インライン再生機能の設計指針と内部構造をまとめる。
 NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終構成** を記述する。
@@ -142,10 +142,16 @@ cache の強参照は最後の presenter が閉じても維持し、Surface / Re
 破棄する。動画 present 用 D3D11 device と immediate context は従来どおり presenter ごとであり、
 この service へ統合しない。
 
-同じ wgpu Device を複数の `native-video-render` thread が使うため、epoch の RwLock gate は
+gate の理由は「動画を同時に複数再生するから」**ではない**。mIV の生きているメディア session は常に 1 つで
+([`close_parked_live_media_windows_for_new_media`](../src/app.rs))、F12 placement switch も新旧 presenter を
+同じ `native-video-render` thread 上で直列に扱う。重なり得るのは **teardown** だけで、
+`Drop for NativeVideoOutput` が render thread の join を待たず別 thread へ逃すため、
+旧 render thread の submit と新 thread の configure が重なり得る。overlay ごとに Device を
+持っていた頃は無害だったが、共有したことで初めて問題になる。このため epoch の RwLock gate は
 `Surface::configure` 全体を write lock、`update_texture` から `update_buffers`、
 `get_current_texture`、`queue.submit`、`SurfaceTexture::present` までを read lock にする。
 `egui::Context::run`、texture delta を作る font atlas の CPU 処理、tessellation は gate 外。
+実際に競合するかは perf の `gate_wait_ms` で見る (通常は 0ms 近傍のはず)。
 
 Device 作成直後に device-lost callback を登録する。callback は自 epoch generation と一致する
 一方向 latch を立てるだけで、wgpu 呼び出し、再作成、retry、ログを行わない。新しい overlay は

@@ -1333,7 +1333,8 @@ Instance から Surface を先に作り、loss 未確定かつ Surface-compatibl
 1 個、multi-GPU の incompatible Surface または device loss 後だけ追加する。健康な epoch は最後の
 presenter が閉じても process lifetime の強参照を維持し、Surface / Renderer / Context / DComp lease は
 従来どおり presenter ごと。epoch の RwLock は configure を write、texture update から acquire / submit /
-present までを read とし、`Context::run` と tessellation は外に置く。device-lost callback は自 generation
+present までを read とする (理由は同時再生ではなく、`Drop for NativeVideoOutput` が join を
+待たないために新旧 render thread が重なり得ること)。`Context::run` と tessellation は外に置く。device-lost callback は自 generation
 の一方向 latch だけを立て、次の overlay construction が latched epoch を skip する。dead epoch を既に
 持つ overlay は次 draw で terminal error。Surface Lost / Outdated / Timeout は epoch を invalidate しない。
 D3D11 present device / immediate context は presenter ごとのまま共有しない。
