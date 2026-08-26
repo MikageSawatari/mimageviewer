@@ -5075,7 +5075,7 @@ fn run_native_video_output(
                     let publish_ms = publish_t0.elapsed().as_secs_f64() * 1000.0;
                     let detach_t0 = std::time::Instant::now();
                     let old_presenter = std::mem::replace(&mut presenter, new_presenter);
-                    old_presenter.detach();
+                    let detach_timings = old_presenter.detach();
                     let detach_ms = detach_t0.elapsed().as_secs_f64() * 1000.0;
                     if source
                         .video_scale_state
@@ -5102,7 +5102,7 @@ fn run_native_video_output(
                          total={:.1}ms (host_attach={attach_ms:.1} render_core_new={core_new_ms:.1} \
                          prepare={prepare_ms:.1} \
                          publish={publish_ms:.1}[hud={hud_ms:.1} retire={retire_ms:.1} wait={wait_ms:.1}] \
-                         detach_old={detach_ms:.1})",
+                         detach_old={detach_ms:.1}[egui_overlay={:.1} rest={:.1}])",
                         placement.label(),
                         attach.width,
                         attach.height,
@@ -5110,6 +5110,8 @@ fn run_native_video_output(
                         request_id,
                         cur_generation,
                         switch_t0.elapsed().as_secs_f64() * 1000.0,
+                        detach_timings.egui_overlay_ms,
+                        detach_timings.rest_ms,
                     ));
                     send_native_output_event(
                         &ui_event_tx,

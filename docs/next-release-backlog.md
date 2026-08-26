@@ -2197,14 +2197,52 @@ detached backstop、native window の focus / placement / epoch 処理は scope 
 ⚠ タスクマネージャーの CPU% では判別できない (どちらも 0% 表示)。
    判定には perf log のフレーム間隔を見ること。
 
+#### process-lifetime overlay GPU device epoch 共有を実装 (2026-08-26、実機確認待ち)
+
+残り優先 2 として、[src/video/native_presenter/overlay_gpu.rs](../src/video/native_presenter/overlay_gpu.rs)
+に process-owned `OverlayGpuService` を追加した。`OnceLock` は device 直置きではなく、共有
+`wgpu::Instance` と `Mutex<Vec<Arc<DeviceEpoch>>>` を持つ replaceable cache manager を保持する。
+overlay は DComp visual から Surface を先に作り、loss 未確定かつ compatible な epoch を再利用する。
+Surface / `egui_wgpu::Renderer` / `egui::Context` は従来どおり窓ごとで、D3D11 present device も
+presenter ごとのまま。
+
+複数 `native-video-render` thread の同時利用に対して、epoch の RwLock は `Surface::configure` を
+write lock、texture update / buffer update / acquire / submit / present の連続区間を read lock にした。
+`Context::run` と tessellation は lock 外。device-lost callback は generation 付き一方向 latch だけを
+立て、新規 overlay は lost epoch を skip する。既存 overlay は次 draw で terminal error を返す。
+Surface Lost / Outdated / Timeout は device loss と扱わない。
+
+次の実機ログ向けに span も分割した。
+
+- `render core created`: 旧 `egui_overlay` total を維持しつつ `overlay_new` /
+  `overlay_first_render` を追加。
+- `egui overlay created`: service/Instance、Surface、Adapter、Device、reuse / generation、Renderer、
+  Context/font configure、`Surface::configure` を分離。
+- `egui_overlay_present`: `first_render`、`egui_run_ms`、`tessellate_ms`、font atlas を含む
+  `texture_update_ms`、`surface_acquire_ms`、buffer update/encode、submit/present、gate wait / GPU span。
+  atlas の CPU 構築だけは `Context::run` 内の通常 UI layout と分離できないため、
+  `egui_run_ms` は両者を含む。texture upload と acquire 以降は独立して読める。
+- F12 `detach_old`: `NativeEguiOverlay` drop と残りの `NativeRenderCore` drop を分離。
+
+実装直前の最新値は switch total **214.8〜235.0ms** / `render_core_new` **144.1〜161.3ms** /
+`egui_overlay` **104.2〜113.0ms**。Instance + Adapter + Device の予測削減 **54.5〜68.2ms** から、
+次の switch は teardown 改善を数えず **約147〜181ms** を期待する。`overlay_new` の reuse 時
+Adapter / Device は 0ms 近傍、`overlay_first_render` は atlas / per-context Renderer 分だけ残るはず。
+`detach_old.egui_overlay` は service の強参照により Device drop を含まなくなるが、削減幅は未測定。
+
+pure logic test は lost epoch 非再利用 + healthy compatible epoch 再利用、old generation callback の
+successor 非干渉、configure / submission gate の排他を検証済み。実 Surface を 2 個作るには
+Win32 / DComp window が必要なため、2 overlay の同一 `wgpu::Device` identity は unit test 化していない。
+実機 F12 往復で `device_reused=true` と同一 generation を確認する。
+
 #### 残りの優先順 (2026-08-26 時点)
 
 1. ~~**16ms pump のイベント駆動化 (Direction A)**~~ ✅ **実装・実機確認済み (2026-08-26)**。
    上の「Direction A 実装」節を参照。動画を開いている間の UI フレームが 121.7/秒 → 48.0/秒。
    残りの固定スピンは §1.130。
-2. **`egui_overlay` (116〜139ms × 2)** — 切替のたびに wgpu device を新規作成している
-   (`request_device` 64〜72ms)。presenter 間で device を共有できるかを見る。
-   **F12 往復の残りではこれが最大**
+2. ~~**`egui_overlay` の wgpu device 共有**~~ ✅ **実装済み、実機確認待ち (2026-08-26)**。
+   process-lifetime `OverlayGpuService` / compatible `DeviceEpoch` 共有と loss 世代を実装。
+   上の実装節と次回計測 span を参照。
 3. `d3d11_device` (27〜31ms × 2) — 同じく共有候補
 
 - ⚠ **guard / delay / retry で待ち時間を隠さない。**

@@ -1318,6 +1318,32 @@ skipする修正ではなく、入力イベントと期限の所有者を明示�
 依存しない実時間48msへ意味を固定し、CH/BMは既知境界へ直接起こすので最大16msのovershootも減る。
 host change wake の sibling 非干渉を含む回帰テストで context ownership を固定する。
 
+**2026-08-26 native video egui overlay の process-lifetime wgpu device epoch 共有 =
+backlog §1.122 残り優先 2 (ClaudeCode / Codex 双方が構造的修正と合意):**
+
+**触った範囲**: [src/video/native_presenter/overlay_gpu.rs](../src/video/native_presenter/overlay_gpu.rs)
+を新設し、[src/video/native_presenter/render_core.rs](../src/video/native_presenter/render_core.rs) の
+`NativeEguiOverlay` が process-owned `OverlayGpuService` の compatible / healthy `DeviceEpoch` を共有する。
+[src/video/mod.rs](../src/video/mod.rs) は F12 placement switch の旧 core drop 計測を overlay / rest に
+分割しただけ。detached predicate、viewport ID / 登録 / recreate、runtime / host ownership、
+focus / placement / epoch reducer、keep-alive backstop、font atlas resync は変更しない。
+
+**不変条件**: `OnceLock` は device 直置きでなく service cache manager を保持する。各 overlay は共有
+Instance から Surface を先に作り、loss 未確定かつ Surface-compatible な epoch を選ぶ。通常 epoch は
+1 個、multi-GPU の incompatible Surface または device loss 後だけ追加する。健康な epoch は最後の
+presenter が閉じても process lifetime の強参照を維持し、Surface / Renderer / Context / DComp lease は
+従来どおり presenter ごと。epoch の RwLock は configure を write、texture update から acquire / submit /
+present までを read とし、`Context::run` と tessellation は外に置く。device-lost callback は自 generation
+の一方向 latch だけを立て、次の overlay construction が latched epoch を skip する。dead epoch を既に
+持つ overlay は次 draw で terminal error。Surface Lost / Outdated / Timeout は epoch を invalidate しない。
+D3D11 present device / immediate context は presenter ごとのまま共有しない。
+
+**判断理由 (なぜ症状パッチではないか)**: F12 の待ちを非同期化・pre-warm・hidden presenter 維持・
+delay / retry で隠す変更ではなく、Surface / Renderer / UI context の window lifetime と、Instance /
+Adapter / Device / Queue の process lifetime を所有型で分離した。新規 App bool / Option、detached 分岐、
+時間窓、recreate trigger は無い。lost epoch 非再利用、旧 generation callback の successor 非干渉、
+configure / submission exclusion を純ロジック test で固定したため §2 に適合する。
+
 **2026-08-26 ★固定による items index-space 交換時の viewer/session 所有権調停 =
 backlog §1.125 (ClaudeCode / Codex 双方が構造的修正と合意):**
 

@@ -120,6 +120,40 @@ USER32 read/mutation は行わない。pump が採取する幾何 cursor 座標 
 source-stamped mouse ownership event と、render が返す focus / IME / cursor policy intent だけで
 接続する。cursor auto-hide の状態と `SetCursor` 書き込みは pump が所有する。
 
+native egui overlay の wgpu stack は [overlay_gpu.rs](../src/video/native_presenter/overlay_gpu.rs) の
+process-owned `OverlayGpuService` が所有する。`OnceLock` が保持するのは device そのものではなく、
+共有 `Instance` と replaceable な `DeviceEpoch` cache を持つ service である。
+
+```
+OverlayGpuService (process lifetime)
+├─ wgpu::Instance
+└─ Mutex<Vec<Arc<DeviceEpoch>>>
+   └─ generation / Adapter / Device / Queue / RwLock gate / loss latch
+
+NativeEguiOverlay (window lifetime)
+└─ Surface / egui_wgpu::Renderer / egui::Context / DComp visual・target lease / UI state
+```
+
+overlay 作成は共有 Instance から対象 DComp visual の Surface を先に作り、loss 未確定かつ
+`Adapter::is_surface_supported` が true の epoch を再利用する。無ければその Surface を
+`compatible_surface` にして Adapter / Device / Queue を 1 組作る。通常は epoch 1 個で、
+複数 GPU の genuinely incompatible な Surface または device loss 後だけ後続 epoch が増える。
+cache の強参照は最後の presenter が閉じても維持し、Surface / Renderer / Context だけを窓と一緒に
+破棄する。動画 present 用 D3D11 device と immediate context は従来どおり presenter ごとであり、
+この service へ統合しない。
+
+同じ wgpu Device を複数の `native-video-render` thread が使うため、epoch の RwLock gate は
+`Surface::configure` 全体を write lock、`update_texture` から `update_buffers`、
+`get_current_texture`、`queue.submit`、`SurfaceTexture::present` までを read lock にする。
+`egui::Context::run`、texture delta を作る font atlas の CPU 処理、tessellation は gate 外。
+
+Device 作成直後に device-lost callback を登録する。callback は自 epoch generation と一致する
+一方向 latch を立てるだけで、wgpu 呼び出し、再作成、retry、ログを行わない。新しい overlay は
+latched epoch を選ばず fresh epoch を作る。既存 overlay は dead epoch を持ち続け、次の draw で
+terminal error を返して従来どおり presenter を停止する。`SurfaceError::Lost / Outdated / Timeout`
+は surface / swapchain 条件として epoch を invalidate せず、`Other` も callback latch が立った場合だけ
+device loss と診断する。旧 generation の遅い callback は successor の latch と一致しない。
+
 `VideoPlayer::tick(ctx)` は再生制御 / 意味的 deadline / ホバーサムネイル要求を扱う。
 フレームの実体描画は native presenter 内のスレッドが行うため、native 経路では
 フレームレート cadence を返さない。`ctx` は player ごとの `VideoUiWake` に一度結び、
