@@ -4930,7 +4930,12 @@ function requestSpreadMode(mode) {
     (!state.container && !collectionRoute) ||
     !Object.values(SpreadMode).includes(mode)
   ) return false;
-  const address = state.container?.requestedAddress ?? null;
+  // **書き込み先は、こちらが要求した場所ではなく本体が実際に開いた場所。**
+  // ZIP の中身が 1 つのフォルダにまとまっていると本体はその中へ降りるので、要求した
+  // アドレス (書庫そのもの) と、本体が見開き設定を引くときのキー (書庫の中のフォルダ)
+  // がずれる。要求側へ書くと、書いた行が二度と読まれず**モードを変えられなくなる**
+  // (2026-08-26 に実際に起きた: 書庫側の行が 1ページ表示、内側の行が横長分割のまま)。
+  const address = state.container?.address ?? null;
   const spreadIntent = planSpreadIntent({
     address,
     selectedMode: mode,
@@ -4942,9 +4947,10 @@ function requestSpreadMode(mode) {
   const writeRequest = spreadIntent.writeRequest;
   if (!writeRequest) return false;
   const readingDirection = writeRequest.reading_direction;
+  // 一方、文脈の同一性は要求側で見る (`activeSpreadContextIdentity` と揃える)。
   const identity = collectionRoute
     ? collectionHash(collectionRoute.collectionKind, collectionRoute.value)
-    : addressIdentity(address);
+    : activeSpreadContextIdentity();
   const sequence = ++spreadWriteSequence;
   state.spreadMode = mode;
   state.readingDirection = readingDirection;
