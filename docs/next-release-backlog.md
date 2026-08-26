@@ -2016,7 +2016,22 @@ rebuild 後に**新しい HWND が decode した**再配送は**現世代**で s
   `ignore F12 toggle while video placement switch is pending` として記録されていた
   (= 意図した pending guard)。`ignore stale native F12 toggle` は 0 件。
 
-### 1.125 ★固定を押すと、開いている fullscreen が古い idx を指したままになる — 実機
+### 1.125 ★固定を押すと、開いている fullscreen が古い idx を指したままになる ✅ 実装済み (2026-08-26、実機確認待ち)
+
+- ✅ **実装済み (2026-08-26、レビュー待ち)**: 案 C を採用。ただし identity は
+  `snapshot_owner_entry` の prefix owner 解決ではなく、`selected` と同じ
+  `snapshot_key_from_grid_item` の完全一致とした。hit は generation bump 前に live
+  `FsCacheEntry` を退避し、items 交換 / bump / invalidate 後に新 idx へ再挿入して、
+  fullscreen と音声 / VST / normalize / loop / EOF / marker / native pending を同じ owner の
+  index-space へ追従させる。miss は交換前に正規 `close_fullscreen()` を通す。
+- 解除側の at-origin 直接復元にも同じ調停を適用し、activation 時ではなく解除直前に実際に
+  開いている item を解決する。media-navigation と generation-stamped marker worker は cancel +
+  新 index-space で再開、folder-nav / holdover は解放する。別 context の pending は owner stamp が
+  一致しない限り変更しない。
+- 回帰テスト 12 件を追加し、activate hit / miss、解除前の viewer 内移動、ZipImage と ZipFile の
+  prefix 誤一致、130 item の大規模並べ替え、player Box identity の往復維持、複合 media session、
+  late worker result、mounted main / detached / ParkedLive / promoted active / sibling parked の native
+  owner 行列、folder-nav / 派生 index lifecycle を固定した。detached 憲法 §11 に判断理由を記録。
 
 - 出典: 2026-08-26、別件 (per-context snapshot) の実機確認中に利用者が発見。
   **動画を再生しながら ★固定 を押すと再生が止まり、
@@ -2070,6 +2085,28 @@ rebuild 後に**新しい HWND が decode した**再配送は**現世代**で s
 4. → 再生が止まり、「読込中...」のまま戻らない
 
 - 規模 \\ 優先度: Small〜Medium / **P2** (通常操作で到達し、固着する)。
+
+### 1.126 ★固定の items 交換で `image_metas` だけ取り残される — 添字空間の交換漏れ
+
+- 出典: 2026-08-26、§1.125 の設計相談中に Codex が発見。
+  **§1.125 とは別の症状**なので別項目にした (憲法 §2 規則 7: ついでに直さない)。
+- `image_metas` は `items` と **同じ位置の `Vec`** なのに、`activate_snapshot` が
+  subset 化していない。`SnapshotState` にも `saved_image_metas` /
+  `list_view_image_metas` が無い。
+- 具体例: 元の `visible_indices = [4, 9]` なら、新しい `items[0]` は旧 4 の項目だが、
+  `image_metas[0]` は **旧 0 のまま**。
+- `invalidate_idx_state_and_queues()` はこれを消さない。同関数の責務コメントが
+  **「caller 責任」**と明記している ([app.rs:25872](../src/app.rs:25872))。
+- 規模 \\ 優先度: Small / P3 (表示されるメタ情報がずれる。固着はしない)。
+
+### 1.127 ★固定の items 交換後、Details 表示の index state が再構築されない
+
+- 出典: §1.126 と同じ、Codex の指摘 (2026-08-26)。
+- `details_order` / `details_tag_prewarm_indices` / `details_meta_pending` は、
+  items 交換後に**無条件では再構築・cancel されない**。
+- color filter が有効な場合だけ後段の `rebuild_visible_indices()` が偶然更新するので、
+  **通常の Details 表示では旧 order が残り得る**。
+- 規模 \\ 優先度: Small / P3。
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 

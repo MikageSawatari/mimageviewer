@@ -1297,6 +1297,33 @@ HUD コマンドをアクティブ化へ変換し、**それ以外の利用者�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-08-26 ★固定による items index-space 交換時の viewer/session 所有権調停 =
+backlog §1.125 (ClaudeCode / Codex 双方が構造的修正と合意):**
+
+**触った範囲**: [src/app/snapshot_ops.rs](../src/app/snapshot_ops.rs) の
+`activate_snapshot` と `deactivate_snapshot` の at-origin 直接復元だけ。現在 mount 中の
+`ViewerContextBundle` が所有する fullscreen / media session / folder-nav / 派生 index と、
+既存 owner stamp を持つ App-global native pending を、同じ items 交換境界で調停する。
+detached predicate、viewport / registry / recreate、runtime / host ownership、geometry / focus、
+`find_visible_thread_window_matching_rect` は変更しない。
+
+**不変条件**: 交換前の `GridItem` から `snapshot_key_from_grid_item` の完全一致 key を取り、
+同一 item が交換先にあれば live `FsCacheEntry` を generation bump 前に owner から退避し、
+bump + invalidate 後に新 idx へ戻す。音声モード、VST shell、normalize、EOF / loop、marker、
+native open/source/fast/tile pending も同じ owner のものだけを exact old→new 対応へ移す。
+source-swap の `native_output` は pending 内で生存させ、`target_idx` を移す。miss は items 交換前に
+正規 `close_fullscreen()` を通す。解除側は activation 時の idx ではなく、解除直前に実際に開いて
+いる item を解決する。旧 generation を答える media-nav / marker worker は remap せず cancel し、
+folder-nav / holdover は任意の一覧交換を越えさせない。別の active / ParkedLive context の pending
+と App-global media index は owner fact が一致しない限り触らない。
+
+**判断理由 (なぜ症状パッチではないか)**: `selected` が既に使う snapshot の正規 identity と、
+`remove_items_batch` / pending completion が既に使う context owner stamp・idx/path validation を
+items の wholesale swap に適用した欠落 lifecycle の補完である。新規 detached bool / Option、
+時間窓、debounce、grace、retry、repaint、rect / HWND heuristic を追加しない。完全一致と prefix
+owner lookup を混ぜず、mounted main / mounted detached / ParkedLive / promoted active / sibling parked
+の ownership 行列を回帰テストで直接固定するため、§2 に適合する構造的修正である。
+
 **2026-08-26 廃れた proxy の削除 = backlog §1.124
 (ClaudeCode / Codex 双方が構造的修正と合意):**
 

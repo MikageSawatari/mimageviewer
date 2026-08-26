@@ -49509,6 +49509,637 @@ mod still_window_mode_key_tests {
         assert!(app.native_video_deferred_nav_delta.is_none());
     }
 
+    fn test_player_identity(app: &App, idx: usize) -> usize {
+        let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&idx) else {
+            panic!("test video player missing at idx {idx}");
+        };
+        (&**player as *const crate::video::VideoPlayer) as usize
+    }
+
+    #[test]
+    fn snapshot_activate_large_reorder_preserves_live_player_box_and_reader_identity() {
+        let mut app = setup_app();
+        app.current_folder = Some(PathBuf::from(r"C:\snapshot"));
+        for i in 0..17 {
+            push_image(&mut app, &format!(r"C:\snapshot\before-{i}.jpg"));
+        }
+        let video = push_video(&mut app, r"C:\snapshot\playing.mp4");
+        for i in 0..112 {
+            push_image(&mut app, &format!(r"C:\snapshot\after-{i}.jpg"));
+        }
+        app.fullscreen_idx = Some(video);
+        app.selected = Some(video);
+        install_playing_test_media(
+            &mut app,
+            video,
+            PathBuf::from(r"C:\snapshot\playing.mp4"),
+            37.25,
+        );
+        let player_identity = test_player_identity(&app, video);
+        let old_generation = app.items_generation;
+        app.visible_indices = (0..app.items.len()).rev().collect();
+        let expected_new_idx = app.items.len() - 1 - video;
+
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+
+        assert_eq!(app.fullscreen_idx, Some(expected_new_idx));
+        assert!(app.items_generation > old_generation);
+        assert_eq!(
+            test_player_identity(&app, expected_new_idx),
+            player_identity
+        );
+        let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&expected_new_idx) else {
+            unreachable!();
+        };
+        assert_eq!(player.position(), 37.25);
+        assert!(player.intent_playing());
+        assert!(matches!(
+            app.items.get(expected_new_idx),
+            Some(GridItem::Video(path)) if path.ends_with("playing.mp4")
+        ));
+    }
+
+    #[test]
+    fn snapshot_deactivate_follows_video_opened_after_activation_and_preserves_player_box() {
+        let mut app = setup_app();
+        app.current_folder = Some(PathBuf::from(r"C:\snapshot"));
+        let first = push_video(&mut app, r"C:\snapshot\first.mp4");
+        push_image(&mut app, r"C:\snapshot\middle.jpg");
+        let navigated = push_video(&mut app, r"C:\snapshot\navigated.mp4");
+        push_image(&mut app, r"C:\snapshot\tail.jpg");
+        app.fullscreen_idx = Some(first);
+        install_playing_test_media(
+            &mut app,
+            first,
+            PathBuf::from(r"C:\snapshot\first.mp4"),
+            4.0,
+        );
+        app.visible_indices = vec![navigated, first, 3];
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+
+        app.fs_cache.clear();
+        let navigated_snapshot_idx = 0;
+        app.fullscreen_idx = Some(navigated_snapshot_idx);
+        install_playing_test_media(
+            &mut app,
+            navigated_snapshot_idx,
+            PathBuf::from(r"C:\snapshot\navigated.mp4"),
+            81.5,
+        );
+        let player_identity = test_player_identity(&app, navigated_snapshot_idx);
+
+        app.deactivate_snapshot();
+
+        assert_eq!(app.fullscreen_idx, Some(navigated));
+        assert_eq!(test_player_identity(&app, navigated), player_identity);
+        let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&navigated) else {
+            unreachable!();
+        };
+        assert_eq!(player.position(), 81.5);
+        assert!(player.intent_playing());
+    }
+
+    #[test]
+    fn snapshot_activate_exact_key_does_not_prefix_match_zip_image_to_zip_file() {
+        let mut app = setup_app();
+        let zip_path = PathBuf::from(r"C:\books\same.zip");
+        app.current_folder = Some(PathBuf::from(r"C:\books"));
+        app.items = vec![
+            GridItem::ZipImage {
+                zip_path: zip_path.clone(),
+                entry_name: "page-001.jpg".into(),
+            },
+            GridItem::ZipFile(zip_path.clone()),
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; 2];
+        app.visible_indices = vec![1];
+        app.fullscreen_idx = Some(0);
+
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+
+        assert_eq!(app.fullscreen_idx, None);
+        assert!(app.fs_cache.is_empty());
+        assert!(matches!(app.items.as_slice(), [GridItem::ZipFile(path)] if path == &zip_path));
+    }
+
+    #[test]
+    fn snapshot_activate_miss_closes_current_reader_without_closing_sibling_context() {
+        let mut app = setup_app();
+        app.current_folder = Some(PathBuf::from(r"C:\main"));
+        let main_video = push_video(&mut app, r"C:\main\excluded.mp4");
+        let retained_image = push_image(&mut app, r"C:\main\retained.jpg");
+        app.fullscreen_idx = Some(main_video);
+        app.selected = Some(main_video);
+        install_playing_test_media(
+            &mut app,
+            main_video,
+            PathBuf::from(r"C:\main\excluded.mp4"),
+            12.0,
+        );
+
+        let sibling_id =
+            app.build_active_context_for_test(Some(411), DetachedSource::Video, |sibling| {
+                sibling.current_folder = Some(PathBuf::from(r"C:\sibling"));
+                let sibling_video = push_video(sibling, r"C:\sibling\keep.mp4");
+                sibling.fullscreen_idx = Some(sibling_video);
+                install_playing_test_media(
+                    sibling,
+                    sibling_video,
+                    PathBuf::from(r"C:\sibling\keep.mp4"),
+                    66.0,
+                );
+            });
+        let sibling_identity = app
+            .with_viewer_context(sibling_id, |sibling| test_player_identity(sibling, 0))
+            .unwrap();
+        app.visible_indices = vec![retained_image];
+
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+
+        assert_eq!(app.fullscreen_idx, None);
+        assert!(app.fs_cache.is_empty());
+        app.with_viewer_context(sibling_id, |sibling| {
+            assert_eq!(sibling.fullscreen_idx, Some(0));
+            assert_eq!(test_player_identity(sibling, 0), sibling_identity);
+            let Some(FsCacheEntry::Video { player, .. }) = sibling.fs_cache.get(&0) else {
+                unreachable!();
+            };
+            assert_eq!(player.position(), 66.0);
+            assert!(player.intent_playing());
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn snapshot_media_session_indices_follow_exact_item_together() {
+        let mut app = setup_app();
+        app.current_folder = Some(PathBuf::from(r"C:\session"));
+        let before = push_image(&mut app, r"C:\session\before.jpg");
+        push_image(&mut app, r"C:\session\skip.jpg");
+        let video = push_video(&mut app, r"C:\session\playing.mp4");
+        let after = push_image(&mut app, r"C:\session\after.jpg");
+        app.fullscreen_idx = Some(video);
+        app.video_audio_mode = Some(video);
+        app.video_audio_vst = Some(VideoAudioVstState {
+            fs_idx: video,
+            phase: VideoAudioVstPhase::Active,
+        });
+        app.video_audio_exit_pending = Some(VideoAudioExitPending {
+            fs_idx: video,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+            saw_hidden: true,
+        });
+        app.music_vst_shell = Some(MusicVstShell {
+            fs_idx: video,
+            activated: true,
+        });
+        app.vst3_deferred_media_open = Some(video);
+        app.normalize_ui_states.insert(
+            video,
+            crate::video::normalize_types::NormalizeUiState::OnApplied { gain_db: -2.25 },
+        );
+        app.normalize_auto_scan_suppressed.insert(video);
+        app.last_loop_pos.insert(video, (19.0, 8));
+        app.video_continuous_last_eof = Some((video, 13));
+        let scan_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut normalize =
+            normalize_scan_state_for_test(video, PathBuf::from(r"C:\session\playing.mp4"));
+        normalize.cancel = std::sync::Arc::clone(&scan_cancel);
+        app.normalize_state = Some(normalize);
+        app.fullscreen_video_marker_cache = Some(FullscreenVideoMarkerCache {
+            fs_idx: video,
+            path: PathBuf::from(r"C:\session\playing.mp4"),
+            pin_pts: Some(3.0),
+            pin_thumbnail: None,
+            pin_thumb_current: false,
+            bookmarks: Vec::new(),
+            bookmark_thumbnails: Default::default(),
+            chapter_thumbnails: Default::default(),
+        });
+        app.pending_pin_thumb_refresh = Some(native_video::PendingPinThumbRefresh {
+            fs_idx: video,
+            path: PathBuf::from(r"C:\session\playing.mp4"),
+            pts: 3.0,
+            started_at: std::time::Instant::now(),
+        });
+        app.last_viewer_sync_stamp = app.viewer_sync_stamp_for_idx(video);
+        install_playing_test_media(
+            &mut app,
+            video,
+            PathBuf::from(r"C:\session\playing.mp4"),
+            19.0,
+        );
+        app.visible_indices = vec![after, video, before];
+        let new_idx = 1;
+
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+
+        assert_eq!(app.fullscreen_idx, Some(new_idx));
+        assert_eq!(app.video_audio_mode, Some(new_idx));
+        assert_eq!(
+            app.video_audio_vst.as_ref().map(|s| s.fs_idx),
+            Some(new_idx)
+        );
+        assert_eq!(
+            app.video_audio_exit_pending.as_ref().map(|s| s.fs_idx),
+            Some(new_idx)
+        );
+        assert_eq!(
+            app.music_vst_shell.as_ref().map(|s| s.fs_idx),
+            Some(new_idx)
+        );
+        assert_eq!(app.vst3_deferred_media_open, Some(new_idx));
+        assert!(app.normalize_ui_states.contains_key(&new_idx));
+        assert!(app.normalize_auto_scan_suppressed.contains(&new_idx));
+        assert_eq!(
+            app.normalize_state.as_ref().map(|s| s.fs_idx),
+            Some(new_idx)
+        );
+        assert!(!scan_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(app.last_loop_pos.get(&new_idx), Some(&(19.0, 8)));
+        assert_eq!(app.video_continuous_last_eof, Some((new_idx, 13)));
+        assert_eq!(
+            app.fullscreen_video_marker_cache.as_ref().map(|s| s.fs_idx),
+            Some(new_idx)
+        );
+        assert_eq!(
+            app.pending_pin_thumb_refresh.as_ref().map(|s| s.fs_idx),
+            Some(new_idx)
+        );
+        let stamp = app.last_viewer_sync_stamp.as_ref().unwrap();
+        assert_eq!(stamp.idx, new_idx);
+        assert_eq!(stamp.items_generation, app.items_generation);
+    }
+
+    #[test]
+    fn snapshot_media_navigation_cancel_rolls_back_eof_and_ignores_late_response() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.current_folder = Some(PathBuf::from(r"C:\nav"));
+        let first = push_image(&mut app, r"C:\nav\first.jpg");
+        let video = push_video(&mut app, r"C:\nav\playing.mp4");
+        let last = push_image(&mut app, r"C:\nav\last.jpg");
+        app.fullscreen_idx = Some(video);
+        install_playing_test_media(&mut app, video, PathBuf::from(r"C:\nav\playing.mp4"), 7.0);
+        let late_response_tx = install_fake_media_navigation_resolver(&mut app);
+        let request_id = 731;
+        app.video_continuous_last_eof = Some((video, 99));
+        app.media_navigation_pending = Some(MediaNavigationPending {
+            request_id,
+            items_generation: app.items_generation,
+            input_seq: app.input_seq,
+            owner_window_id: None,
+            fullscreen_idx: Some(video),
+            source: "snapshot_test",
+            action: MediaNavigationAction::VideoContinuousEof {
+                fs_idx: video,
+                seek_serial: 99,
+            },
+            started_at: std::time::Instant::now(),
+        });
+        app.visible_indices = vec![last, video, first];
+
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+
+        assert!(app.media_navigation_pending.is_none());
+        assert_eq!(app.video_continuous_last_eof, None);
+        assert_eq!(app.fullscreen_idx, Some(1));
+        late_response_tx
+            .send(MediaNavigationResolverResponse {
+                request_id,
+                result: MediaNavigationResolveResult {
+                    target_idx: Some(0),
+                    missing: Vec::new(),
+                },
+            })
+            .unwrap();
+        app.poll_media_navigation_pending(&ctx);
+        assert_eq!(app.fullscreen_idx, Some(1));
+        assert!(matches!(app.items.get(1), Some(GridItem::Video(_))));
+        assert!(app.media_navigation_pending.is_none());
+    }
+
+    #[test]
+    fn snapshot_marker_worker_is_restarted_at_remapped_index_and_old_result_is_ignored() {
+        let mut app = setup_app();
+        app.current_folder = Some(PathBuf::from(r"C:\marker"));
+        let first = push_image(&mut app, r"C:\marker\first.jpg");
+        let video = push_video(&mut app, r"C:\marker\playing.mp4");
+        let last = push_image(&mut app, r"C:\marker\last.jpg");
+        app.fullscreen_idx = Some(video);
+        let old_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (old_tx, old_rx) = std::sync::mpsc::channel();
+        let path = PathBuf::from(r"C:\marker\playing.mp4");
+        app.fullscreen_video_marker_thumb_decode_pending =
+            Some(FullscreenVideoMarkerThumbDecodePending {
+                fs_idx: video,
+                path: path.clone(),
+                cancel: std::sync::Arc::clone(&old_cancel),
+                rx: old_rx,
+            });
+        app.visible_indices = vec![last, video, first];
+
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+
+        assert!(old_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        let restarted = app
+            .fullscreen_video_marker_thumb_decode_pending
+            .as_ref()
+            .expect("marker decode must restart in the new index space");
+        assert_eq!(restarted.fs_idx, 1);
+        assert!(crate::folder_tree::path_eq(&restarted.path, &path));
+        let old_result = FullscreenVideoMarkerThumbDecodeResult {
+            fs_idx: video,
+            path,
+            pin_pts: Some(44.0),
+            pin_thumbnail: None,
+            pin_thumb_current: true,
+            bookmark_thumbnails: Default::default(),
+            chapter_thumbnails: Default::default(),
+        };
+        assert!(
+            old_tx.send(old_result).is_err(),
+            "the old-generation receiver must be dropped, so its result cannot apply"
+        );
+    }
+
+    fn native_source_output_identity(app: &App) -> usize {
+        let pending = app
+            .native_video_source_swap_pending
+            .as_ref()
+            .expect("source swap pending");
+        (&pending.native_output as *const crate::video::NativeVideoOutput) as usize
+    }
+
+    #[test]
+    fn snapshot_native_pending_mounted_main_remaps_and_preserves_source_output() {
+        let mut app = setup_app();
+        app.current_folder = Some(PathBuf::from(r"C:\native-main"));
+        let first = push_image(&mut app, r"C:\native-main\first.jpg");
+        let from = push_video(&mut app, r"C:\native-main\from.mp4");
+        let target = push_video(&mut app, r"C:\native-main\target.mp4");
+        let last = push_image(&mut app, r"C:\native-main\last.jpg");
+        app.fullscreen_idx = Some(target);
+        let owner = app.projected_viewer_context_id();
+        install_all_native_pending_for_test(&mut app, from, target, None, owner);
+        app.native_video_deferred_nav_delta = Some(-1);
+        let output_identity = native_source_output_identity(&app);
+        app.visible_indices = vec![last, target, first, from];
+
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+
+        assert_eq!(app.fullscreen_idx, Some(1));
+        let source = app.native_video_source_swap_pending.as_ref().unwrap();
+        assert_eq!((source.from_idx, source.target_idx), (3, 1));
+        assert_eq!(native_source_output_identity(&app), output_identity);
+        assert_eq!(
+            app.native_video_open_pending.as_ref().map(|p| p.idx),
+            Some(1)
+        );
+        assert_eq!(
+            app.native_video_fast_swap_pending
+                .as_ref()
+                .map(|p| p.target_idx),
+            Some(1)
+        );
+        assert_eq!(
+            app.video_tile_swap_pending.as_ref().map(|p| p.target_idx),
+            Some(1)
+        );
+        assert_eq!(app.native_video_deferred_nav_delta, Some(-1));
+        assert!(
+            matches!(app.items.get(1), Some(GridItem::Video(path)) if path.ends_with("target.mp4"))
+        );
+    }
+
+    #[test]
+    fn snapshot_native_pending_mounted_detached_context_remaps() {
+        let mut app = setup_app();
+        let context_id =
+            app.build_active_context_for_test(Some(512), DetachedSource::Video, |detached| {
+                detached.current_folder = Some(PathBuf::from(r"C:\native-detached"));
+                push_image(detached, r"C:\native-detached\first.jpg");
+                let from = push_video(detached, r"C:\native-detached\from.mp4");
+                let target = push_video(detached, r"C:\native-detached\target.mp4");
+                detached.fullscreen_idx = Some(target);
+                detached.visible_indices = vec![target, from, 0];
+            });
+
+        app.with_viewer_context(context_id, |detached| {
+            let owner = detached.projected_viewer_context_id();
+            install_all_native_pending_for_test(detached, 1, 2, None, owner);
+            detached.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+            assert_eq!(detached.fullscreen_idx, Some(0));
+            let source = detached.native_video_source_swap_pending.as_ref().unwrap();
+            assert_eq!((source.from_idx, source.target_idx), (1, 0));
+            assert_eq!(
+                detached.native_video_open_pending.as_ref().map(|p| p.idx),
+                Some(0)
+            );
+            assert_eq!(
+                detached
+                    .native_video_fast_swap_pending
+                    .as_ref()
+                    .map(|p| p.target_idx),
+                Some(0)
+            );
+            assert_eq!(
+                detached
+                    .video_tile_swap_pending
+                    .as_ref()
+                    .map(|p| p.target_idx),
+                Some(0)
+            );
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn snapshot_native_pending_mounted_parked_live_context_remaps() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let window_id = 513;
+        let context_id = app.push_window_context_for_test(&ctx, window_id, |parked| {
+            parked.current_folder = Some(PathBuf::from(r"C:\native-parked"));
+            push_image(parked, r"C:\native-parked\first.jpg");
+            let from = push_video(parked, r"C:\native-parked\from.mp4");
+            let target = push_video(parked, r"C:\native-parked\target.mp4");
+            parked.fullscreen_idx = Some(target);
+            parked.visible_indices = vec![target, 0, from];
+        });
+        app.transition_detached_window_state(
+            window_id,
+            DetachedWindowState::ParkedLive,
+            "snapshot_test",
+        );
+
+        app.with_viewer_context(context_id, |parked| {
+            parked.native_video_parked_live_input_window_id = Some(window_id);
+            let open_owner = parked.projected_viewer_context_id();
+            install_all_native_pending_for_test(parked, 1, 2, Some(window_id), open_owner);
+            parked.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+            assert_eq!(parked.fullscreen_idx, Some(0));
+            let source = parked.native_video_source_swap_pending.as_ref().unwrap();
+            assert_eq!((source.from_idx, source.target_idx), (2, 0));
+            assert_eq!(
+                parked.native_video_open_pending.as_ref().map(|p| p.idx),
+                Some(0)
+            );
+            assert_eq!(
+                parked
+                    .native_video_fast_swap_pending
+                    .as_ref()
+                    .map(|p| p.target_idx),
+                Some(0)
+            );
+            assert_eq!(
+                parked
+                    .video_tile_swap_pending
+                    .as_ref()
+                    .map(|p| p.target_idx),
+                Some(0)
+            );
+            parked.native_video_parked_live_input_window_id = None;
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn snapshot_main_swap_leaves_promoted_active_and_other_parked_pending_untouched() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.current_folder = Some(PathBuf::from(r"C:\owner-main"));
+        let open = push_image(&mut app, r"C:\owner-main\open.jpg");
+        let other = push_image(&mut app, r"C:\owner-main\other.jpg");
+        let from = push_video(&mut app, r"C:\owner-main\from.mp4");
+        let target = push_video(&mut app, r"C:\owner-main\target.mp4");
+        app.fullscreen_idx = Some(open);
+
+        let active_items = app.items.clone();
+        let active_id =
+            app.build_active_context_for_test(None, DetachedSource::Video, move |active| {
+                active.items = active_items;
+                active.thumbnails = vec![ThumbnailState::Pending; 4];
+                active.visible_indices = vec![0, 1, 2, 3];
+                active.fullscreen_idx = Some(target);
+            });
+        let parked_items = app.items.clone();
+        let parked_window_id = 514;
+        app.push_window_context_for_test(&ctx, parked_window_id, move |parked| {
+            parked.items = parked_items;
+            parked.thumbnails = vec![ThumbnailState::Pending; 4];
+            parked.visible_indices = vec![0, 1, 2, 3];
+            parked.fullscreen_idx = Some(target);
+        });
+        app.transition_detached_window_state(
+            parked_window_id,
+            DetachedWindowState::ParkedLive,
+            "snapshot_test",
+        );
+
+        install_all_native_pending_for_test(&mut app, from, target, None, active_id);
+        app.video_tile_swap_pending
+            .as_mut()
+            .unwrap()
+            .parked_live_window_id = Some(parked_window_id);
+        app.video_continuous_last_eof = Some((target, 55));
+        app.normalize_state = Some(normalize_scan_state_for_test(
+            target,
+            PathBuf::from(r"C:\owner-main\target.mp4"),
+        ));
+        let source_output_identity = native_source_output_identity(&app);
+        app.visible_indices = vec![target, from, other, open];
+
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+
+        assert_eq!(app.fullscreen_idx, Some(3));
+        let source = app.native_video_source_swap_pending.as_ref().unwrap();
+        assert_eq!((source.from_idx, source.target_idx), (from, target));
+        assert_eq!(native_source_output_identity(&app), source_output_identity);
+        assert_eq!(
+            app.native_video_open_pending
+                .as_ref()
+                .map(|p| (p.owner_context_id, p.idx)),
+            Some((active_id, target))
+        );
+        assert_eq!(
+            app.native_video_fast_swap_pending
+                .as_ref()
+                .map(|p| p.target_idx),
+            Some(target)
+        );
+        assert_eq!(
+            app.video_tile_swap_pending
+                .as_ref()
+                .map(|p| (p.parked_live_window_id, p.target_idx)),
+            Some((Some(parked_window_id), target))
+        );
+        assert_eq!(app.video_continuous_last_eof, Some((target, 55)));
+        assert_eq!(app.normalize_state.as_ref().map(|s| s.fs_idx), Some(target));
+    }
+
+    #[test]
+    fn snapshot_swap_releases_folder_navigation_remaps_anchors_and_clears_derived_targets() {
+        let mut app = setup_app();
+        app.current_folder = Some(PathBuf::from(r"C:\derived"));
+        let before = push_image(&mut app, r"C:\derived\before.jpg");
+        let excluded = push_image(&mut app, r"C:\derived\excluded.jpg");
+        let video = push_video(&mut app, r"C:\derived\playing.mp4");
+        let last = push_image(&mut app, r"C:\derived\last.jpg");
+        app.fullscreen_idx = Some(video);
+
+        let nav_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_nav_tx, nav_rx) = std::sync::mpsc::channel::<FolderNavThreadResult>();
+        app.folder_nav_pending = Some(FolderNavPending {
+            cancel: std::sync::Arc::clone(&nav_cancel),
+            rx: nav_rx,
+            forward: true,
+            mode: FolderNavMode::Fullscreen,
+        });
+        app.pending_folder_nav_steps = 3;
+        app.pending_folder_nav_mode = FolderNavMode::Fullscreen;
+        app.fs_nav_locked_gen = Some(app.items_generation);
+        app.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous: None,
+            opened_at: std::time::Instant::now(),
+            target: FsNavigationSequenceTarget::FolderItems {
+                accepted_generation: app.items_generation,
+            },
+        }));
+
+        app.slideshow_anchor_idx = Some(before);
+        app.spread_shift_anchor_idx = Some(excluded);
+        app.fs_zoom_pdf_rerender_idx = Some(video);
+        app.slideshow_scroll_range_cache = Some((video, 1.0, 2.0));
+        app.cached_nav_indices = Some(vec![before, video, last]);
+        app.fs_vertical_cache_keep_set.insert(video);
+        app.fs_context_menu_idx = Some(video);
+        app.adjust_scope_selection_idx = Some(video);
+        app.mouse_ring_grid_target_idx = Some(video);
+        app.mouse_gesture_grid_target_idx = Some(video);
+        app.mouse_ring_suppress_context_menu_once = true;
+        app.visible_indices = vec![last, video, before];
+
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+
+        assert!(nav_cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(app.folder_nav_pending.is_none());
+        assert_eq!(app.pending_folder_nav_steps, 0);
+        assert!(app.fs_nav_locked_gen.is_none());
+        assert!(app.fs_holdover_tex.is_none());
+        assert_eq!(app.slideshow_anchor_idx, Some(2));
+        assert_eq!(app.spread_shift_anchor_idx, None);
+        assert_eq!(app.fs_zoom_pdf_rerender_idx, Some(1));
+        assert!(app.slideshow_scroll_range_cache.is_none());
+        assert!(app.cached_nav_indices.is_none());
+        assert!(app.fs_vertical_cache_keep_set.is_empty());
+        assert!(app.fs_context_menu_idx.is_none());
+        assert!(app.adjust_scope_selection_idx.is_none());
+        assert!(app.mouse_ring_grid_target_idx.is_none());
+        assert!(app.mouse_gesture_grid_target_idx.is_none());
+        assert!(!app.mouse_ring_suppress_context_menu_once);
+    }
+
     #[test]
     #[cfg(windows)]
     fn main_close_fullscreen_preserves_parked_source_swap_pending() {
