@@ -627,6 +627,13 @@ const MSG_GET_INFO: u8 = 4;
 const MSG_DISPLAY_RENDER: u8 = 5;
 const MSG_ANALYZE_PAGE: u8 = 6;
 const MSG_OPEN: u8 = 7;
+/// 全ページの用紙寸法だけを 1 往復で取る。
+///
+/// PDFium の `FPDF_GetPageSizeByIndexF` はページを読み込まずに寸法を返すので、
+/// レンダリングもサムネイルも要らない。見開きの単独表示と横長分割はページが横長かを
+/// 知る必要があり、それをサムネイルカタログに頼っていたため、**まだサムネイルを
+/// 作っていない PDF ではどちらも黙って効かなかった** (2026-08-26 に利用者報告)。
+const MSG_PAGE_SIZES: u8 = 8;
 const STATUS_OK: u8 = 0;
 const STATUS_ERR: u8 = 1;
 const RENDER_METRICS_MAGIC: &[u8; 4] = &[0x50, 0x44, 0x4d, 0x31];
@@ -888,6 +895,13 @@ fn encode_get_info_request(path: &Path, password: Option<&str>) -> Vec<u8> {
     buf
 }
 
+fn encode_page_sizes_request(path: &Path, password: Option<&str>) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    buf.push(MSG_PAGE_SIZES);
+    encode_path_and_password(&mut buf, path, password);
+    buf
+}
+
 fn encode_analyze_page_request(path: &Path, page_num: u32, password: Option<&str>) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
     buf.push(MSG_ANALYZE_PAGE);
@@ -1027,6 +1041,10 @@ fn decode_request(data: &[u8]) -> std::io::Result<DecodedRequest> {
             let (path, password, _) = decode_path_and_password(payload)?;
             Ok(DecodedRequest::Enumerate { path, password })
         }
+        MSG_PAGE_SIZES => {
+            let (path, password, _) = decode_path_and_password(payload)?;
+            Ok(DecodedRequest::PageSizes { path, password })
+        }
         MSG_RENDER | MSG_DISPLAY_RENDER => {
             // Render: [path][page_num(4B)][target fields][password]
             if payload.len() < 2 {
@@ -1149,6 +1167,10 @@ enum DecodedRequest {
         path: PathBuf,
         password: Option<String>,
     },
+    PageSizes {
+        path: PathBuf,
+        password: Option<String>,
+    },
     AnalyzePage {
         path: PathBuf,
         page_num: u32,
@@ -1165,6 +1187,7 @@ fn pdf_document_identity(request: &DecodedRequest) -> Option<PdfDocumentIdentity
     let (path, password) = match request {
         DecodedRequest::Enumerate { path, password }
         | DecodedRequest::GetInfo { path, password }
+        | DecodedRequest::PageSizes { path, password }
         | DecodedRequest::Open { path, password } => (path, password),
         DecodedRequest::Render { path, password, .. }
         | DecodedRequest::AnalyzePage { path, password, .. } => (path, password),
@@ -1247,6 +1270,16 @@ pub fn run_worker_process() {
         match req {
             DecodedRequest::Enumerate { path, password } => {
                 match ipc_enumerate(&mut document_cache, &path, password.as_deref()) {
+                    Ok(resp) => {
+                        let _ = write_msg(&mut stdout, &resp);
+                    }
+                    Err(e) => {
+                        let _ = send_error(&mut stdout, &e.to_string());
+                    }
+                }
+            }
+            DecodedRequest::PageSizes { path, password } => {
+                match ipc_page_sizes(&mut document_cache, &path, password.as_deref()) {
                     Ok(resp) => {
                         let _ = write_msg(&mut stdout, &resp);
                     }
@@ -1364,6 +1397,35 @@ fn ipc_enumerate(
     for e in &entries {
         buf.extend_from_slice(&e.mtime.to_le_bytes());
         buf.extend_from_slice(&e.file_size.to_le_bytes());
+    }
+    Ok(buf)
+}
+
+/// 全ページの用紙寸法 (points) を 1 往復で返す。
+///
+/// `FPDF_GetPageSizeByIndexF` はページを読み込まないので、134 ページでもレンダリング 1 枚
+/// より安い。**寸法の比だけを見る**用途 (横長かどうか) に使い、編集座標には使わない。
+///
+/// 形式: `[status][count u32]([width f32][height f32]) * count`
+fn ipc_page_sizes(
+    cache: &mut PdfDocumentCache<'_>,
+    path: &Path,
+    password: Option<&str>,
+) -> std::io::Result<Vec<u8>> {
+    let (sizes, _) = cache.with_document(path, password, |document, _key| {
+        document.pages().page_sizes().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("page_sizes failed: {e:?}"),
+            )
+        })
+    })?;
+    let mut buf = Vec::with_capacity(1 + 4 + sizes.len() * 8);
+    buf.push(STATUS_OK);
+    buf.extend_from_slice(&(sizes.len() as u32).to_le_bytes());
+    for size in &sizes {
+        buf.extend_from_slice(&size.width().value.to_le_bytes());
+        buf.extend_from_slice(&size.height().value.to_le_bytes());
     }
     Ok(buf)
 }
@@ -2640,6 +2702,43 @@ impl PdfWorkerPool {
     /// `ipc_get_info` レスポンスを PdfDocumentInfo にデコード。
     /// フォーマット: [status][4B title_len][title_bytes][4B author_len][author_bytes]
     ///             [4B subject_len][subject_bytes][4B keywords_len][keywords_bytes]
+    fn parse_page_sizes_response(data: &[u8]) -> std::io::Result<Vec<(f32, f32)>> {
+        if data.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "empty response",
+            ));
+        }
+        if data[0] == STATUS_ERR {
+            let msg = std::str::from_utf8(&data[1..]).unwrap_or("unknown error");
+            return Err(std::io::Error::other(msg));
+        }
+        if data[0] != STATUS_OK || data.len() < 5 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid page_sizes response",
+            ));
+        }
+        let count = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
+        // **要素数を信用して確保しない。**壊れた応答で 4 GiB を掴まないよう、
+        // 実際に載っているバイト数と一致することを先に確かめる。
+        if data.len() != 5 + count * 8 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "page_sizes truncated",
+            ));
+        }
+        Ok((0..count)
+            .map(|index| {
+                let at = 5 + index * 8;
+                (
+                    f32::from_le_bytes(data[at..at + 4].try_into().unwrap()),
+                    f32::from_le_bytes(data[at + 4..at + 8].try_into().unwrap()),
+                )
+            })
+            .collect())
+    }
+
     fn parse_get_info_response(data: &[u8]) -> std::io::Result<PdfDocumentInfo> {
         if data.is_empty() {
             return Err(std::io::Error::new(
@@ -3834,6 +3933,28 @@ pub fn get_document_info(
         CancelWaitPolicy::AbortOnCancel,
     )?;
     PdfWorkerPool::parse_get_info_response(&resp.bytes)
+}
+
+/// 全ページの用紙寸法 (points) を 1 往復で取る。
+///
+/// **ページの縦横比だけを見る用途に使う。**編集座標ではない。レンダリングもサムネイル
+/// 生成も伴わないので、見開きの単独表示と横長分割の判定を、サムネイルカタログの有無から
+/// 切り離せる (2026-08-26 の利用者報告: まだサムネイルの無い PDF では分割が黙って
+/// 効かなかった)。
+pub fn get_page_sizes(pdf_path: &Path, password: Option<&str>) -> std::io::Result<Vec<(f32, f32)>> {
+    let pool = get_pool();
+    let req = encode_page_sizes_request(pdf_path, password);
+    let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
+    // ページ構成を組むための背景処理。epoch=0 (prune 対象外) + AbortOnCancel。
+    let resp = pool.execute(
+        &req,
+        None,
+        JobPriority::Normal,
+        Some(perf_key),
+        0,
+        CancelWaitPolicy::AbortOnCancel,
+    )?;
+    PdfWorkerPool::parse_page_sizes_response(&resp.bytes)
 }
 
 /// AI canonical loader が vector PDF を pixel 化する前に型付きで拒否するための解析 API。
@@ -5381,6 +5502,38 @@ C:\isolated\miv-data"#
     fn pdf_document_info_empty_gives_empty_string() {
         let info = PdfDocumentInfo::default();
         assert_eq!(info.as_search_text(), "");
+    }
+
+    #[test]
+    /// 全ページ寸法の往復。**これが無いと、まだサムネイルを作っていない PDF で
+    /// 見開きの単独表示も横長分割も黙って効かない** (2026-08-26 の利用者報告)。
+    fn page_sizes_round_trip_and_reject_a_truncated_reply() {
+        let mut encoded = vec![STATUS_OK];
+        encoded.extend_from_slice(&2u32.to_le_bytes());
+        for (width, height) in [(842.0f32, 595.0f32), (595.0f32, 842.0f32)] {
+            encoded.extend_from_slice(&width.to_le_bytes());
+            encoded.extend_from_slice(&height.to_le_bytes());
+        }
+        assert_eq!(
+            PdfWorkerPool::parse_page_sizes_response(&encoded).unwrap(),
+            vec![(842.0, 595.0), (595.0, 842.0)]
+        );
+
+        // **件数を信じて確保しない。**途中で切れた応答は失敗させる。
+        assert!(PdfWorkerPool::parse_page_sizes_response(&encoded[..9]).is_err());
+        let mut lying = vec![STATUS_OK];
+        lying.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(PdfWorkerPool::parse_page_sizes_response(&lying).is_err());
+
+        // 要求も往復する。opcode を足して decode 側を忘れると、ここが落ちる。
+        let request = encode_page_sizes_request(Path::new(r"C:ooks.pdf"), Some("pw"));
+        match decode_request(&request).unwrap() {
+            DecodedRequest::PageSizes { path, password } => {
+                assert_eq!(path, Path::new(r"C:ooks.pdf"));
+                assert_eq!(password.as_deref(), Some("pw"));
+            }
+            _ => panic!("MSG_PAGE_SIZES を decode 側が知らない"),
+        }
     }
 
     #[test]

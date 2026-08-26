@@ -1958,6 +1958,22 @@ fn folder_thumb_aspect_height_ratio(settings: &crate::settings::Settings, folder
 /// worker への往復が要るので、開くたびに全ページ分を払うわけにいかない。どちらも既定
 /// (`cache_zip_always` / `cache_pdf_always`) でカタログが作られるため実害はそれらを切った
 /// 場合に限られる。**黙って効かなくならないよう、寸法不明の件数はログへ残す。**
+/// カタログに寸法が無い PDF ページが 1 つでもあるか。
+///
+/// **無いなら worker へ問い合わせない。**既にサムネイルを作った PDF に追加費用を出さない
+/// ための条件で、費用の有無がここだけで決まるようにしてある。
+fn pdf_page_sizes_needed(
+    items: &[crate::grid_item::GridItem],
+    cached: &std::collections::HashMap<String, Option<(u32, u32)>>,
+) -> bool {
+    items.iter().any(|item| match item {
+        crate::grid_item::GridItem::PdfPage { page_num, .. } => {
+            !cached.contains_key(&crate::grid_item::pdf_page_cache_key(*page_num))
+        }
+        _ => false,
+    })
+}
+
 pub(super) fn page_dims_without_catalog(item: &crate::grid_item::GridItem) -> Option<(u32, u32)> {
     match item {
         crate::grid_item::GridItem::Image(path) => image::ImageReader::open(path)
@@ -4575,7 +4591,13 @@ impl ContainerEngine {
         );
         let (image_count, video_count, other_count) =
             crate::ui_fullscreen::seek_overlay_media_counts(source_items);
-        let landscape = self.cached_landscape_flags(&resolved.logical, items);
+        // Single は横長判定を一切見ない。**見ないものを作らない** (PDF は寸法の取得に
+        // worker 往復が要るので、開くたびに払うと無駄になる)。
+        let landscape = if effective == RemoteSpreadMode::Single {
+            vec![false; items.len()]
+        } else {
+            self.cached_landscape_flags(&resolved.logical, items)
+        };
         let index_groups = crate::ui_fullscreen::build_remote_spread_page_groups(
             items,
             core_spread_mode(effective),
@@ -4954,6 +4976,44 @@ impl ContainerEngine {
         }
     }
 
+    /// カタログに寸法が無い PDF ページがあるときだけ、文書の全ページ寸法を取りに行く。
+    ///
+    /// **1 文書につき 1 往復。**ページを読み込まない PDFium の API なので、レンダリング
+    /// 1 枚より安い。カタログが揃っている間は呼ばないので、既にサムネイルを作った PDF に
+    /// 追加費用は出ない。取得できなければ従来どおり「寸法不明」として扱う (件数はログへ)。
+    fn pdf_page_sizes_if_needed(
+        &self,
+        container_path: &Path,
+        items: &[crate::grid_item::GridItem],
+        cached: &std::collections::HashMap<String, Option<(u32, u32)>>,
+    ) -> Option<Vec<(u32, u32)>> {
+        if !pdf_page_sizes_needed(items, cached) {
+            return None;
+        }
+        let password = self.pdf_passwords.get(container_path);
+        match crate::pdf_loader::get_page_sizes(container_path, password.as_deref()) {
+            Ok(sizes) => Some(
+                sizes
+                    .into_iter()
+                    // 縦横比だけを見る。points をそのまま丸めて幅・高さとして扱う。
+                    .map(|(width, height)| {
+                        (
+                            width.max(0.0).round() as u32,
+                            height.max(0.0).round() as u32,
+                        )
+                    })
+                    .collect(),
+            ),
+            Err(error) => {
+                crate::logger::log(format!(
+                    "remote_ipc: pdf page sizes unavailable path={} error={error}",
+                    container_path.display()
+                ));
+                None
+            }
+        }
+    }
+
     fn cached_landscape_flags(
         &self,
         container_path: &Path,
@@ -4971,6 +5031,9 @@ impl ContainerEngine {
             .as_ref()
             .and_then(|catalog| catalog.load_source_dims().ok())
             .unwrap_or_default();
+        // PDF はカタログが無くても寸法を取れる。ページを読み込まない PDFium の API を
+        // **文書ごとに 1 往復だけ**呼ぶ。カタログに寸法がある間は呼ばない。
+        let pdf_page_sizes = self.pdf_page_sizes_if_needed(container_path, items, &cached);
         let rotation_keys = items
             .iter()
             .map(crate::edit_source::page_key_for_grid_item)
@@ -5015,8 +5078,14 @@ impl ContainerEngine {
                                     crate::catalog::decode_thumb_dims(&entry.jpeg_data)
                                 })
                         }),
-                        // カタログ行が 1 つも無い場合。ヘッダだけ読んで補う。
-                        None => page_dims_without_catalog(item),
+                        // カタログ行が 1 つも無い場合。カタログに依らない経路で補う。
+                        None => match item {
+                            crate::grid_item::GridItem::PdfPage { page_num, .. } => pdf_page_sizes
+                                .as_ref()
+                                .and_then(|sizes| sizes.get(*page_num as usize))
+                                .copied(),
+                            _ => page_dims_without_catalog(item),
+                        },
                     }
                 });
                 if dims.is_none() {
@@ -7556,6 +7625,44 @@ mod tests {
             )),
             None
         );
+    }
+
+    #[test]
+    /// **カタログが揃っている PDF に追加費用を出さない。**
+    ///
+    /// 1 ページでも寸法が無ければ文書ごと 1 往復で取りに行くが、揃っていれば行かない。
+    fn pdf_page_sizes_are_fetched_only_when_the_catalog_misses_a_page() {
+        let items = (0..3)
+            .map(|page_num| crate::grid_item::GridItem::PdfPage {
+                pdf_path: std::path::PathBuf::from("book.pdf"),
+                page_num,
+                content_type: None,
+            })
+            .collect::<Vec<_>>();
+        let mut cached = std::collections::HashMap::new();
+        for page_num in 0..3 {
+            cached.insert(
+                crate::grid_item::pdf_page_cache_key(page_num),
+                Some((600u32, 800u32)),
+            );
+        }
+        assert!(!pdf_page_sizes_needed(&items, &cached));
+
+        // 寸法列が空の古い行でも「行はある」ので取りに行かない (サムネイルから復元できる)。
+        cached.insert(crate::grid_item::pdf_page_cache_key(1), None);
+        assert!(!pdf_page_sizes_needed(&items, &cached));
+
+        // 行そのものが無いページが 1 つでもあれば取りに行く。
+        cached.remove(&crate::grid_item::pdf_page_cache_key(2));
+        assert!(pdf_page_sizes_needed(&items, &cached));
+
+        // PDF ページが 1 つも無ければ関係ない。
+        assert!(!pdf_page_sizes_needed(
+            &[crate::grid_item::GridItem::Image(std::path::PathBuf::from(
+                "a.jpg"
+            ))],
+            &std::collections::HashMap::new()
+        ));
     }
 
     #[test]
