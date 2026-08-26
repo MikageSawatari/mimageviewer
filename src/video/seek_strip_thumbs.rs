@@ -1443,6 +1443,13 @@ fn process_window_request(
 
     let mut metrics = DecodeMetrics::default();
     let mut superseded = false;
+    // どの出口で run ループを抜けたかを残す。抜け方によっては**セルが未着のまま**になり、
+    // app 側は要求済みとしか分からない (2026-08-27 の「末尾数枚が黒い」調査)。
+    let mut exit_reason = "complete";
+    let planned_cells: Vec<(usize, StripCellId)> = decode_cells
+        .iter()
+        .map(|cell| (cell.index, cell.id))
+        .collect();
     let mut retry_with_software = true;
     while retry_with_software && !cancel.load(Ordering::Acquire) {
         retry_with_software = false;
@@ -1454,6 +1461,11 @@ fn process_window_request(
                     decide_strip_supersede(&lock_recover(state).settled_ids(), &run.cells);
                 metrics.discarded_on_supersede += decision.discarded.len();
                 superseded = !cancel.load(Ordering::Acquire);
+                exit_reason = if superseded {
+                    "superseded_before_run"
+                } else {
+                    "cancelled_before_run"
+                };
                 break;
             }
 
@@ -1467,6 +1479,7 @@ fn process_window_request(
                 .is_some_and(SeekStripDecoder::keyframes_only);
             let result = {
                 let Some(decoder) = runtime.decoder.as_mut() else {
+                    exit_reason = "decoder_gone";
                     break;
                 };
                 let pending_writes = &mut runtime.deferred_cache_writes;
@@ -1528,8 +1541,12 @@ fn process_window_request(
             }
             match result.stop {
                 RunStop::Complete => {}
-                RunStop::Cancelled => break,
+                RunStop::Cancelled => {
+                    exit_reason = "cancelled_in_run";
+                    break;
+                }
                 RunStop::Superseded => {
+                    exit_reason = "superseded_in_run";
                     let decision =
                         decide_strip_supersede(&lock_recover(state).settled_ids(), &run.cells);
                     metrics.discarded_on_supersede += decision.discarded.len();
@@ -1592,6 +1609,26 @@ fn process_window_request(
         }
     }
 
+    // 未着のまま終わったセルだけを名指しする。app 側の 1 行と突き合わせれば、
+    // どちらが落としたかが決まる。
+    let unresolved: Vec<usize> = {
+        let shared = lock_recover(state);
+        planned_cells
+            .iter()
+            .filter(|(_, id)| !shared.cells.contains_key(id))
+            .map(|(index, _)| *index)
+            .collect()
+    };
+    if !unresolved.is_empty() {
+        crate::logger::log(format!(
+            "[video-seek-strip] window {} left cells unresolved: exit={exit_reason} planned={:?} unresolved={unresolved:?}",
+            request.id,
+            planned_cells
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+        ));
+    }
     emit_decode(path, &request, runtime, &metrics, superseded);
 }
 
