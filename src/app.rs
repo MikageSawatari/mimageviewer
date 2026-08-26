@@ -12568,6 +12568,9 @@ pub struct App {
     /// フォルダ側サイドカー (`mimageviewer.dat`) のメモリ表現。キーはフォルダの絶対パス。
     /// 中央 DB への書き込みと同じタイミングで更新し、フォルダ切替・終了・5 秒アイドル時に flush する。
     pub(crate) sidecars: std::collections::HashMap<std::path::PathBuf, crate::sidecar::SidecarFile>,
+    /// 前フレームで編集ツールがキャンバスを持っていたか。true → false の瞬間が
+    /// 「編集終了」で、そこでサイドカーを書き出す。
+    pub(crate) page_edit_tool_had_canvas: bool,
 
     // ── タスクトレイ常駐 (v0.9) ──────────────────────────────────
     /// タスクトレイコントローラ (専用スレッドで動作)。設定 ON のときだけ初期化される。
@@ -14354,6 +14357,7 @@ impl App {
             #[cfg(windows)]
             video_resume_preview_cache: std::collections::VecDeque::new(),
             sidecars: std::collections::HashMap::new(),
+            page_edit_tool_had_canvas: false,
             tray_controller: None,
             window_visible: true,
             show_tray_enabled_notice: false,
@@ -53284,11 +53288,14 @@ impl App {
         }
     }
 
-    /// すべての dirty なサイドカーをディスクにフラッシュする。
-    /// 呼び出し側: フォルダ切替時・アプリ終了時・5 秒アイドル時。
+    /// すべての dirty なサイドカーの書き出しを writer スレッドへ積む。
+    /// 呼び出し側: フォルダ切替時・編集ツールを抜けた時・定期・アプリ終了時。
+    ///
+    /// **戻った時点ではまだ書けていない。**終了時など、書けたことが必要な経路は
+    /// このあと [`crate::sidecar::wait_for_pending_writes`] を呼ぶこと。
     pub(crate) fn flush_all_sidecars(&mut self) {
         for sidecar in self.sidecars.values_mut() {
-            sidecar.flush();
+            sidecar.queue_flush();
         }
     }
 
@@ -53363,6 +53370,8 @@ impl App {
         self.settings.window_maximized = self.last_window_maximized;
         self.settings.save();
         self.flush_all_sidecars();
+        // 終了・トレイ退避はここから先プロセスが止まり得るので、writer が捌き終わるまで待つ。
+        crate::sidecar::wait_for_pending_writes();
     }
 
     /// マスクとベクタを DB に保存し、サイドカーにもミラーする。消しゴムモード終了時に呼ぶ。
@@ -59024,7 +59033,7 @@ impl App {
         // 例外として、メモリキャッシュが `is_dirty()` (= アプリ内で未保存の編集がある)
         // 場合は再ロードで edits を破壊してしまうので、slow-path を抜けて何もせず帰る。
         // ここで `sidecar_sync_upsert` もスキップするので、次回ナビゲート時 (通常は
-        // `flush_idle_sidecars` で dirty が解消された後) に改めて判定される。
+        // `flush_periodic_sidecars` で dirty が解消された後) に改めて判定される。
         let cached_dirty = self
             .sidecars
             .get(sidecar_folder)
@@ -59135,19 +59144,35 @@ impl App {
         }
     }
 
-    /// アイドル時 (5 秒間変更がない) に dirty なサイドカーをフラッシュする。
-    /// 長時間の編集セッション中にクラッシュや電源断で失う事故への保険。
-    pub(crate) fn flush_idle_sidecars(&mut self) {
+    /// 編集ツールを抜けた瞬間にサイドカーを書き出す。
+    ///
+    /// 「編集が終わった」の判定を各ツールの終了関数へ配らない。キャンバスの所有が
+    /// 外れたことだけを見れば、ツールが増えても勝手に拾える
+    /// ([`crate::app::App::page_edit_tool_owns_canvas`] が唯一の定義)。
+    pub(crate) fn flush_sidecars_when_page_edit_ends(&mut self) {
+        let owns_canvas = self.page_edit_tool_owns_canvas();
+        if self.page_edit_tool_had_canvas && !owns_canvas {
+            self.flush_all_sidecars();
+        }
+        self.page_edit_tool_had_canvas = owns_canvas;
+    }
+
+    /// dirty のまま一定時間が経ったサイドカーを書き出す。
+    ///
+    /// 通常の保存契機は「編集ツールを抜けた時 / フォルダ切替 / アプリ終了」で、これは
+    /// **クラッシュや電源断でしか使われない保険**。だから頻度は低くてよい。dirty に
+    /// なった時刻から測るので、編集を続けている間も一定間隔で確実に書かれる
+    /// (最後の変更時刻から測ると、編集し続ける限り一度も書かれない)。
+    pub(crate) fn flush_periodic_sidecars(&mut self) {
         let now = std::time::Instant::now();
-        const IDLE_THRESHOLD_SECS: u64 = 5;
         for sidecar in self.sidecars.values_mut() {
             if !sidecar.is_dirty() {
                 continue;
             }
-            if let Some(last) = sidecar.last_change() {
-                if now.duration_since(last).as_secs() >= IDLE_THRESHOLD_SECS {
-                    sidecar.flush();
-                }
+            if let Some(since) = sidecar.dirty_since()
+                && now.duration_since(since) >= crate::sidecar::PERIODIC_FLUSH_INTERVAL
+            {
+                sidecar.queue_flush();
             }
         }
     }
@@ -65503,7 +65528,7 @@ impl eframe::App for App {
 
         // アイドル 5 秒で dirty なサイドカーをフラッシュ (電源断や強制終了への保険)。
         // 頻繁なフレームで呼ばれるが is_dirty 判定で大半は no-op になる。
-        self.flush_idle_sidecars();
+        self.flush_periodic_sidecars();
 
         // パフォーマンス計装: フレーム境界。--perf-log 無効時は is_enabled() 読みのみ
         self.frame_counter = self.frame_counter.wrapping_add(1);
@@ -65757,6 +65782,7 @@ impl eframe::App for App {
         self.update_ime_state(ctx);
         // 編集ツールを抜けたのに見開きが戻っていない状態を、毎フレーム 1 か所で解消する。
         self.reconcile_page_edit_spread_pivots();
+        self.flush_sidecars_when_page_edit_ends();
         crate::touch_debug::log_egui_touch_events(ctx, self.frame_counter);
 
         // エクスプローラ等から mIV へドロップされたファイル / フォルダを現在のフォルダへコピーする

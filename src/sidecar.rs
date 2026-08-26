@@ -23,8 +23,13 @@
 //! - 読み込み: `load_folder` 時に 1 度だけ、DB にエントリが無いものだけインポート。
 //!   既に DB にあるエントリは無視 (中央が authoritative)。
 //! - 書き込み: DB 更新と同じタイミングでメモリ上のサイドカーを更新 (`dirty = true`)。
-//!   実ディスク書き込みは **フォルダ切替 / アプリ終了 / 5 秒アイドル** のいずれか。
-//! - エラー処理: IO 失敗は黙ってログ 1 行、`disabled = true` で以降そのフォルダは無視
+//!   実ディスク書き込みは **編集ツールを抜けた時 / フォルダ切替 / アプリ終了 /
+//!   [`PERIODIC_FLUSH_INTERVAL`]** のいずれかで、専用スレッドが行う。
+//! - **書き出しは非同期**。UI スレッドは内容を writer へ渡すだけで、戻った時点では
+//!   まだ書けていない。まだ届いていない内容は writer の pending に残り、[`SidecarFile::load`]
+//!   がディスクより先にそれを見るので、読み直しても直前の編集は消えない。プロセスが
+//!   止まる直前 (終了・トレイ退避) だけ [`wait_for_pending_writes`] で待つ。
+//! - エラー処理: IO 失敗は黙ってログ 1 行、以降そのフォルダへは書きに行かない
 //!   (読み取り専用メディア対策)。
 //! - 設定 OFF 時: 読み書き両方スキップ。既存ファイルは削除しない。
 
@@ -44,6 +49,13 @@ pub const SIDECAR_FILENAME: &str = "mimageviewer.dat";
 
 /// 現在のスキーマバージョン。互換性のない変更があったら上げる。
 const CURRENT_VERSION: u32 = 1;
+
+/// dirty のまま放置されたサイドカーを書き出す間隔。
+///
+/// 通常は編集ツールを抜けた時点・フォルダ切替・アプリ終了で書かれるので、この経路が
+/// 使われるのは**クラッシュや電源断のとき**だけ。頻度を上げても守れる範囲は「最後の
+/// 数分」しか変わらないのに、書き出しの回数だけが増える。
+pub const PERIODIC_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 // ── JSON 形式 ─────────────────────────────────────────────────────────
 
@@ -140,10 +152,14 @@ pub struct SidecarFile {
     folder: PathBuf,
     items: BTreeMap<String, SidecarEntry>,
     dirty: bool,
-    /// 書き込み失敗後の再試行抑制フラグ。起動中一度失敗したら以降そのフォルダは書き込まない。
+    /// ディスク上の内容を**上書きしてはいけない**と分かっているフラグ。パース失敗や
+    /// 新しいバージョンが書いたファイルがこれに当たる。書き込み自体の失敗 (読み取り
+    /// 専用メディア等) は writer 側が folder 単位で覚えるので、ここには入らない。
     disabled: bool,
-    /// 最後に `mark_dirty` を呼ばれた時刻 (5 秒アイドル flush 判定用)。
-    last_change: Option<Instant>,
+    /// clean → dirty になった時刻。定期フラッシュはここからの経過で判定するので、
+    /// 編集を continuous に続けても「最大 N 分ぶんしか危険に晒さない」保証になる
+    /// (最後の変更時刻で測ると、編集し続ける限り一度も書かれない)。
+    dirty_since: Option<Instant>,
 }
 
 /// 実ファイル (フォルダ直下のメディア/コンテナ) のサイドカー相対キー。
@@ -162,14 +178,27 @@ impl SidecarFile {
             items: BTreeMap::new(),
             dirty: false,
             disabled: false,
-            last_change: None,
+            dirty_since: None,
         }
     }
 
     /// フォルダから `mimageviewer.dat` を読み込む。無ければ空のサイドカーを返す。
     /// パース失敗時もログ 1 行で空サイドカーを返す (古いバージョンや壊れたファイルで落ちない)。
+    ///
+    /// 書き出しは非同期なので、**まだディスクに届いていない内容が writer に残っていれば
+    /// そちらを返す**。これが無いと、フォルダを離れて戻るだけで直前の編集が消えて見える。
     pub fn load(folder: &Path) -> Self {
+        Self::load_from(folder, &writer().state)
+    }
+
+    /// [`SidecarFile::load`] の実体。writer を明示的に渡すのはテストのためだけで、
+    /// 本番の入口は 1 つ (`load`)。
+    fn load_from(folder: &Path, writer: &WriterState) -> Self {
         let mut me = Self::new(folder.to_path_buf());
+        if let Some(items) = writer.pending_items(folder) {
+            me.items = items;
+            return me;
+        }
         let path = folder.join(SIDECAR_FILENAME);
         let data = match std::fs::read_to_string(&path) {
             Ok(s) => s,
@@ -179,6 +208,7 @@ impl SidecarFile {
                 return me;
             }
         };
+        let legacy_before = local_adjust_core::mask_codec::legacy_decode_count();
         let parsed: SidecarJson = match serde_json::from_str(&data) {
             Ok(v) => v,
             Err(e) => {
@@ -205,6 +235,17 @@ impl SidecarFile {
             return me;
         }
         me.items = parsed.items;
+        // v1.1.0〜v3.2.0 は補正レイヤーのマスクを 1 画素 1 数値の JSON 配列で書いていた。
+        // 実測で 1 ページ 290MB になり、フォルダ切替のたびに UI を数秒止めていた。読めた
+        // ものはメモリ上では新形式なので、dirty にしておけば次の書き出しで置き換わる。
+        if local_adjust_core::mask_codec::legacy_decode_count() != legacy_before {
+            crate::logger::log(format!(
+                "sidecar: rewriting legacy mask arrays ({} bytes): {}",
+                data.len(),
+                path.display()
+            ));
+            me.mark_dirty();
+        }
         me
     }
 
@@ -222,8 +263,9 @@ impl SidecarFile {
         self.dirty
     }
 
-    pub fn last_change(&self) -> Option<Instant> {
-        self.last_change
+    /// clean → dirty になった時刻。定期フラッシュの判定に使う。
+    pub fn dirty_since(&self) -> Option<Instant> {
+        self.dirty_since
     }
 
     /// 画像編集の 6 系統だけを page bundle として全置換する。タグは編集 bundle の
@@ -457,84 +499,287 @@ impl SidecarFile {
     }
 
     fn mark_dirty(&mut self) {
+        if !self.dirty {
+            self.dirty_since = Some(Instant::now());
+        }
         self.dirty = true;
-        self.last_change = Some(Instant::now());
     }
 
     // ── 書き込み ──────────────────────────────────────────────────
 
-    /// dirty ならディスクに書き出す (または空なら削除する)。dirty でなければ何もしない。
-    /// 書き込み失敗時は `disabled = true` にして以降の書き込みをスキップ。
-    /// 戻り値は、未変更を含めてディスクと整合した場合だけ true。
-    pub fn flush(&mut self) -> bool {
+    /// dirty ならディスクへの書き出しを writer スレッドに積む。dirty でなければ何もしない。
+    ///
+    /// **戻ってきた時点ではまだ書けていない。**積んだ内容は writer の pending にも入り、
+    /// 同じフォルダを読み直すとディスクより先にそちらが見えるので、書き終わるのを待たずに
+    /// メモリから降ろしてよい。実際に書けたことを確かめたい呼び出し側は
+    /// [`SidecarFile::flush_blocking`] を使う。
+    pub fn queue_flush(&mut self) {
         if !self.dirty || self.disabled {
-            return !self.dirty;
+            return;
         }
-        let path = self.folder.join(SIDECAR_FILENAME);
+        if writer().is_failed(&self.folder) {
+            // 読み取り専用メディア等。既に一度失敗しているので積まない。
+            self.dirty = false;
+            self.dirty_since = None;
+            return;
+        }
+        let request = if self.items.is_empty() {
+            WriteRequest::Remove
+        } else {
+            WriteRequest::Write(self.items.clone())
+        };
+        writer().enqueue(self.folder.clone(), request);
+        self.dirty = false;
+        self.dirty_since = None;
+    }
 
-        // 空なら削除
-        if self.items.is_empty() {
-            match std::fs::remove_file(&path) {
-                Ok(_) => {
-                    self.dirty = false;
+    /// この内容がディスクに載っているか。積んだだけで**まだ待っていない**間は false
+    /// なので、[`wait_for_pending_writes`] のあとに読むこと。
+    pub fn written_to_disk(&self) -> bool {
+        !self.dirty && !writer().is_failed(&self.folder)
+    }
+
+    /// 書き出しを積み、writer が捌き終わるまで待って結果を返す。
+    /// 削除移行のように「書けたか」を報告する必要がある稀な経路だけが使う。
+    /// UI スレッドからは呼ばない。
+    pub fn flush_blocking(&mut self) -> bool {
+        self.queue_flush();
+        writer().wait_until_idle();
+        self.written_to_disk()
+    }
+}
+
+// ── 書き出し worker ───────────────────────────────────────────────────
+
+/// 1 フォルダぶんの書き出し要求。
+#[derive(Clone)]
+enum WriteRequest {
+    Write(BTreeMap<String, SidecarEntry>),
+    Remove,
+}
+
+struct QueuedWrite {
+    /// 積んだ順番。worker は書いた後、これが変わっていなければ pending から外す。
+    seq: u64,
+    request: WriteRequest,
+}
+
+/// サイドカーの書き出しを 1 本のスレッドへ集約する。
+///
+/// **プロセス内で 1 つだけ**存在する。読み手が pending を必ず見られることが
+/// read-after-write の成立条件なので、context ごとに持たせて分裂させない。
+pub struct SidecarWriter {
+    tx: std::sync::mpsc::Sender<PathBuf>,
+    state: std::sync::Arc<WriterState>,
+}
+
+#[derive(Default)]
+struct WriterState {
+    /// まだディスクに反映していない内容。読み手はディスクより先にここを見る。
+    pending: std::sync::Mutex<std::collections::HashMap<PathBuf, QueuedWrite>>,
+    /// 書き込みに失敗したフォルダ。以降そこへは書きに行かない (読み取り専用メディア対策)。
+    failed: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+    /// 未処理 + 実行中の件数と、0 になったことを知らせる condvar。
+    inflight: std::sync::Mutex<usize>,
+    idle: std::sync::Condvar,
+    next_seq: std::sync::atomic::AtomicU64,
+}
+
+static WRITER: std::sync::OnceLock<SidecarWriter> = std::sync::OnceLock::new();
+
+fn writer() -> &'static SidecarWriter {
+    WRITER.get_or_init(SidecarWriter::spawn)
+}
+
+/// 積んである書き出しがすべてディスクに反映されるまで待つ。
+/// アプリ終了・トレイ退避の直前に呼ぶ (ここを省くと最後の編集が落ちる)。
+pub fn wait_for_pending_writes() {
+    writer().wait_until_idle();
+}
+
+impl SidecarWriter {
+    fn spawn() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+        let state = std::sync::Arc::new(WriterState::default());
+        let worker_state = state.clone();
+        // 失敗しても書き出しが同期に戻るだけなので、spawn 失敗はログして続行する。
+        if let Err(error) = std::thread::Builder::new()
+            .name("sidecar-writer".into())
+            .spawn(move || {
+                while let Ok(folder) = rx.recv() {
+                    worker_state.write_one(&folder);
+                    worker_state.finish_one();
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    self.dirty = false;
-                }
+            })
+        {
+            crate::logger::log(format!("sidecar: writer thread spawn failed ({error})"));
+        }
+        Self { tx, state }
+    }
+
+    fn enqueue(&self, folder: PathBuf, request: WriteRequest) {
+        self.state.queue(folder.clone(), request);
+        if self.tx.send(folder.clone()).is_err() {
+            // worker が居ない (spawn 失敗)。積んだままにすると読み手が永久に
+            // pending を見続けるので、この場で同期に書いて整合させる。
+            self.state.write_one(&folder);
+            self.state.finish_one();
+        }
+    }
+
+    /// まだディスクへ反映していない内容。あればディスクを読まずにこれを使う。
+    fn pending_items(&self, folder: &Path) -> Option<BTreeMap<String, SidecarEntry>> {
+        self.state.pending_items(folder)
+    }
+
+    fn is_failed(&self, folder: &Path) -> bool {
+        self.state.is_failed(folder)
+    }
+
+    fn wait_until_idle(&self) {
+        let Ok(mut inflight) = self.state.inflight.lock() else {
+            return;
+        };
+        while *inflight > 0 {
+            let Ok(next) = self.state.idle.wait(inflight) else {
+                return;
+            };
+            inflight = next;
+        }
+    }
+}
+
+impl WriterState {
+    /// 書き出し内容を pending へ載せ、未処理件数を 1 増やす。
+    /// 実際に書くのは worker (または送信失敗時の呼び出し元)。
+    fn queue(&self, folder: PathBuf, request: WriteRequest) {
+        let seq = self
+            .next_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.insert(folder, QueuedWrite { seq, request });
+        }
+        if let Ok(mut inflight) = self.inflight.lock() {
+            *inflight += 1;
+        }
+    }
+
+    fn pending_items(&self, folder: &Path) -> Option<BTreeMap<String, SidecarEntry>> {
+        let pending = self.pending.lock().ok()?;
+        match &pending.get(folder)?.request {
+            WriteRequest::Write(items) => Some(items.clone()),
+            WriteRequest::Remove => Some(BTreeMap::new()),
+        }
+    }
+
+    fn is_failed(&self, folder: &Path) -> bool {
+        self.failed
+            .lock()
+            .map(|failed| failed.contains(folder))
+            .unwrap_or(false)
+    }
+
+    fn write_one(&self, folder: &Path) {
+        let Some((seq, request)) = self.take_for_write(folder) else {
+            return;
+        };
+        let ok = write_sidecar_to_disk(folder, &request);
+        self.finish_write(folder, seq, ok);
+    }
+
+    /// これから書く内容。同じフォルダに複数の job が積まれていても、常に**最新**を
+    /// 書く。追い越された job はここで None になって空振りする (coalescing)。
+    fn take_for_write(&self, folder: &Path) -> Option<(u64, WriteRequest)> {
+        let pending = self.pending.lock().ok()?;
+        let queued = pending.get(folder)?;
+        Some((queued.seq, queued.request.clone()))
+    }
+
+    /// 書き終えた後始末。
+    ///
+    /// **書いている最中に積み直されていたら pending を消さない。**消すと、次の job が
+    /// 走るまでの間だけ読み手がディスク (= 1 つ前の内容) を見てしまう。
+    fn finish_write(&self, folder: &Path, seq: u64, ok: bool) {
+        if !ok && let Ok(mut failed) = self.failed.lock() {
+            failed.insert(folder.to_path_buf());
+        }
+        if let Ok(mut pending) = self.pending.lock()
+            && pending.get(folder).is_some_and(|queued| queued.seq == seq)
+        {
+            pending.remove(folder);
+        }
+    }
+
+    fn finish_one(&self) {
+        if let Ok(mut inflight) = self.inflight.lock() {
+            *inflight = inflight.saturating_sub(1);
+            if *inflight == 0 {
+                self.idle.notify_all();
+            }
+        }
+    }
+}
+
+/// 実際のディスク操作。成功なら true。
+fn write_sidecar_to_disk(folder: &Path, request: &WriteRequest) -> bool {
+    let path = folder.join(SIDECAR_FILENAME);
+    let items = match request {
+        WriteRequest::Remove => {
+            return match std::fs::remove_file(&path) {
+                Ok(()) => true,
+                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => true,
                 Err(e) => {
                     crate::logger::log(format!(
                         "sidecar: remove failed: {} ({})",
                         path.display(),
                         e
                     ));
-                    self.disabled = true;
+                    false
                 }
-            }
-            return !self.dirty;
+            };
         }
+        WriteRequest::Write(items) => items,
+    };
 
-        let json_value = SidecarJson {
-            version: CURRENT_VERSION,
-            app: Some(format!("mimageviewer {}", env!("CARGO_PKG_VERSION"))),
-            saved_at: Some(current_timestamp()),
-            items: self.items.clone(),
-        };
-        let json = match serde_json::to_string_pretty(&json_value) {
-            Ok(s) => s,
-            Err(e) => {
-                crate::logger::log(format!("sidecar: serialize failed: {e}"));
-                self.disabled = true;
-                return false;
-            }
-        };
-
-        // アトミック書き込み: temp → rename
-        let tmp = self.folder.join(format!("{SIDECAR_FILENAME}.tmp"));
-        if let Err(e) = std::fs::write(&tmp, &json) {
-            crate::logger::log(format!("sidecar: write failed: {} ({})", tmp.display(), e));
-            self.disabled = true;
+    let json_value = SidecarJson {
+        version: CURRENT_VERSION,
+        app: Some(format!("mimageviewer {}", env!("CARGO_PKG_VERSION"))),
+        saved_at: Some(current_timestamp()),
+        items: items.clone(),
+    };
+    // pretty ではなく compact。人が読むファイルではないし、マスクを packed 文字列に
+    // したあとは pretty の改行とインデントが残りの大半になる。
+    let json = match serde_json::to_string(&json_value) {
+        Ok(s) => s,
+        Err(e) => {
+            crate::logger::log(format!("sidecar: serialize failed: {e}"));
             return false;
         }
-        // 既存ファイルの属性を一度クリアしないと rename が失敗するケースがあるため、
-        // 既存ファイルがあれば属性を NORMAL に戻してから rename する。
-        #[cfg(windows)]
-        clear_hidden_system(&path);
-        if let Err(e) = std::fs::rename(&tmp, &path) {
-            crate::logger::log(format!(
-                "sidecar: rename failed: {} -> {} ({})",
-                tmp.display(),
-                path.display(),
-                e
-            ));
-            let _ = std::fs::remove_file(&tmp);
-            self.disabled = true;
-            return false;
-        }
-        #[cfg(windows)]
-        mark_hidden_system(&path);
-        self.dirty = false;
-        true
+    };
+
+    // アトミック書き込み: temp → rename
+    let tmp = folder.join(format!("{SIDECAR_FILENAME}.tmp"));
+    if let Err(e) = std::fs::write(&tmp, &json) {
+        crate::logger::log(format!("sidecar: write failed: {} ({})", tmp.display(), e));
+        return false;
     }
+    // 既存ファイルの属性を一度クリアしないと rename が失敗するケースがあるため、
+    // 既存ファイルがあれば属性を NORMAL に戻してから rename する。
+    #[cfg(windows)]
+    clear_hidden_system(&path);
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        crate::logger::log(format!(
+            "sidecar: rename failed: {} -> {} ({})",
+            tmp.display(),
+            path.display(),
+            e
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    #[cfg(windows)]
+    mark_hidden_system(&path);
+    true
 }
 
 // ── キー再構成ヘルパー ─────────────────────────────────────────────────
@@ -898,7 +1143,7 @@ mod tests {
 
         // disabled なら dirty でも flush は書き込まない。
         s.set_adjust("img.jpg", sample_params());
-        s.flush();
+        s.flush_blocking();
         assert_eq!(
             std::fs::read(&path).unwrap(),
             original,
@@ -1143,7 +1388,7 @@ mod tests {
             );
             s.set_export_crop("img.jpg", sample_export_crop());
             s.set_tags("img.jpg", ["#Cat", "dog"]);
-            s.flush();
+            s.flush_blocking();
             assert!(!s.is_dirty());
         }
         let s2 = SidecarFile::load(&folder);
@@ -1334,11 +1579,11 @@ mod tests {
 
         let mut s = SidecarFile::new(folder.clone());
         s.set_adjust("img.jpg", sample_params());
-        s.flush();
+        s.flush_blocking();
         assert!(path.exists());
 
         s.remove_adjust("img.jpg");
-        s.flush();
+        s.flush_blocking();
         assert!(!path.exists(), "file should be removed when empty");
     }
 
@@ -1489,7 +1734,7 @@ mod tests {
                 ],
             },
         );
-        s.flush();
+        s.flush_blocking();
         // 読み戻し
         let s2 = SidecarFile::load(dir.path());
         let mask = s2
@@ -1537,7 +1782,7 @@ mod tests {
                 vectors: Vec::new(),
             },
         );
-        s.flush();
+        s.flush_blocking();
 
         let s2 = SidecarFile::load(dir.path());
         let mask = s2
@@ -1547,5 +1792,221 @@ mod tests {
             .expect("mask");
         assert!(mask.vectors.is_empty());
         assert_eq!(mask.w, 50);
+    }
+}
+
+// ── 非同期書き出しと旧形式の移行 ─────────────────────────────────────────
+
+#[cfg(test)]
+mod writer_tests {
+    use super::*;
+
+    fn sample_layer() -> local_adjust_core::LocalAdjustmentLayer {
+        let mut mask = local_adjust_core::RasterVectorMask::empty(4, 4);
+        mask.alpha[5] = 1.0;
+        local_adjust_core::LocalAdjustmentLayer::new(
+            "layer",
+            local_adjust_core::LocalMask::RasterVector(mask),
+            local_adjust_core::LocalEffect::None,
+        )
+    }
+
+    #[test]
+    fn a_queued_write_is_readable_before_the_worker_reaches_it() {
+        // worker を回さずに state だけを動かすので、「まだ書いていない」状態を
+        // 確実に作れる。ディスクには何も無いのに読めることが要件。
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().to_path_buf();
+        let state = WriterState::default();
+
+        let mut items = BTreeMap::new();
+        items.insert("img.jpg".to_string(), SidecarEntry::default());
+        state.queue(folder.clone(), WriteRequest::Write(items.clone()));
+
+        assert!(
+            !folder.join(SIDECAR_FILENAME).exists(),
+            "the test is meaningless if the file is already on disk"
+        );
+        assert_eq!(
+            state.pending_items(&folder).map(|items| items.len()),
+            Some(1),
+            "a folder switch that reloads now must see the queued content"
+        );
+
+        state.write_one(&folder);
+        assert!(folder.join(SIDECAR_FILENAME).exists());
+        assert!(
+            state.pending_items(&folder).is_none(),
+            "once it is on disk the queue entry has to go, or the file can never be re-read"
+        );
+    }
+
+    fn items_named(names: &[&str]) -> BTreeMap<String, SidecarEntry> {
+        names
+            .iter()
+            .map(|name| (name.to_string(), SidecarEntry::default()))
+            .collect()
+    }
+
+    #[test]
+    fn an_edit_made_during_a_write_is_not_lost_when_that_write_finishes() {
+        // worker が書いている最中に UI スレッドが積み直す並び。実際に起きる順番を
+        // 手で再現する (write_one 1 回では、この隙間を作れない)。
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().to_path_buf();
+        let state = WriterState::default();
+
+        state.queue(
+            folder.clone(),
+            WriteRequest::Write(items_named(&["one.jpg"])),
+        );
+        let (seq, request) = state.take_for_write(&folder).expect("the first job");
+
+        // ここで編集が入る。
+        state.queue(
+            folder.clone(),
+            WriteRequest::Write(items_named(&["one.jpg", "two.jpg"])),
+        );
+
+        // 1 件目の書き込みが完了する。
+        write_sidecar_to_disk(&folder, &request);
+        state.finish_write(&folder, seq, true);
+
+        assert_eq!(
+            state.pending_items(&folder).map(|items| items.len()),
+            Some(2),
+            "the newer edit must stay queued, or a reload sees the pre-edit disk copy"
+        );
+        assert_eq!(SidecarFile::load_from(&folder, &state).items().len(), 2);
+
+        // 2 件目の job が走ると、ようやくディスクと一致して pending が空になる。
+        state.write_one(&folder);
+        assert!(state.pending_items(&folder).is_none());
+        assert_eq!(SidecarFile::load_from(&folder, &state).items().len(), 2);
+    }
+
+    #[test]
+    fn a_job_that_was_overtaken_does_not_write_the_older_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().to_path_buf();
+        let state = WriterState::default();
+
+        state.queue(
+            folder.clone(),
+            WriteRequest::Write(items_named(&["one.jpg"])),
+        );
+        state.queue(
+            folder.clone(),
+            WriteRequest::Write(items_named(&["one.jpg", "two.jpg"])),
+        );
+
+        // 2 つ積まれているが、最初の job が既に最新を書いてしまう。
+        state.write_one(&folder);
+        assert_eq!(SidecarFile::load_from(&folder, &state).items().len(), 2);
+        // 2 つめの job は空振りする。ここで 1 件目の内容へ巻き戻ってはいけない。
+        state.write_one(&folder);
+        assert_eq!(SidecarFile::load_from(&folder, &state).items().len(), 2);
+    }
+
+    #[test]
+    fn a_queued_removal_reads_back_as_an_empty_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().to_path_buf();
+        std::fs::write(
+            folder.join(SIDECAR_FILENAME),
+            br##"{"version":1,"items":{"img.jpg":{"tags":["#a"]}}}"##,
+        )
+        .unwrap();
+        let state = WriterState::default();
+        state.queue(folder.clone(), WriteRequest::Remove);
+        assert_eq!(
+            state.pending_items(&folder).map(|items| items.len()),
+            Some(0),
+            "the file is still on disk, but it is already logically gone"
+        );
+    }
+
+    #[test]
+    fn the_released_number_array_form_is_read_and_then_rewritten_packed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SIDECAR_FILENAME);
+        // v1.1.0〜v3.2.0 が書いていた形。
+        std::fs::write(
+            &path,
+            br#"{"version":1,"items":{"img.jpg":{"local_adjust_layers":[{
+                "name":"layer","enabled":true,"opacity":1.0,
+                "mask":{"RasterVector":{"width":2,"height":2,"alpha":[0.0,1.0,0.0,0.0],"shapes":[]}},
+                "mask_inverted":false,"mask_expand_px":0.0,"mask_feather_px":0.0,
+                "effect":"None"}]}}}"#,
+        )
+        .unwrap();
+
+        let mut sidecar = SidecarFile::load(dir.path());
+        let layers = sidecar
+            .items()
+            .get("img.jpg")
+            .and_then(|entry| entry.local_adjust_layers.as_ref())
+            .expect("the old form still has to load");
+        assert_eq!(layers.len(), 1);
+        assert!(
+            sidecar.is_dirty(),
+            "reading the old form has to schedule the rewrite, or the file stays huge forever"
+        );
+
+        assert!(sidecar.flush_blocking());
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !rewritten.contains(r#""alpha":["#),
+            "the number array must be gone after the rewrite: {rewritten}"
+        );
+        assert!(rewritten.contains(r#""alpha":"q8z:"#));
+
+        // ...and the second read finds nothing to migrate.
+        let reloaded = SidecarFile::load(dir.path());
+        assert!(!reloaded.is_dirty());
+    }
+
+    #[test]
+    fn a_page_worth_of_mask_no_longer_dominates_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sidecar = SidecarFile::new(dir.path().to_path_buf());
+        // 1000x1000 は実データ (3082x4486) より小さいが、旧形式なら 1 枚で
+        // 4 MB を超える。packed ならページ数を増やしても効かない。
+        let mut mask = local_adjust_core::RasterVectorMask::empty(1000, 1000);
+        for y in 100..140 {
+            for x in 100..180 {
+                mask.alpha[y * 1000 + x] = 1.0;
+            }
+        }
+        sidecar.set_local_adjust_layers(
+            "img.jpg",
+            vec![local_adjust_core::LocalAdjustmentLayer::new(
+                "layer",
+                local_adjust_core::LocalMask::RasterVector(mask),
+                local_adjust_core::LocalEffect::None,
+            )],
+        );
+        assert!(sidecar.flush_blocking());
+        let size = std::fs::metadata(dir.path().join(SIDECAR_FILENAME))
+            .unwrap()
+            .len();
+        assert!(
+            size < 64 * 1024,
+            "one million mask pixels should not cost {size} bytes"
+        );
+    }
+
+    #[test]
+    fn the_periodic_deadline_is_measured_from_when_editing_started() {
+        // 最後の変更時刻で測ると、編集し続けている間は一度も書かれない。
+        let mut sidecar = SidecarFile::new(std::path::PathBuf::from("nowhere"));
+        sidecar.set_local_adjust_layers("img.jpg", vec![sample_layer()]);
+        let first = sidecar.dirty_since().expect("dirty since the first edit");
+        sidecar.set_local_adjust_layers("other.jpg", vec![sample_layer()]);
+        assert_eq!(
+            sidecar.dirty_since(),
+            Some(first),
+            "a later edit must not push the deadline back"
+        );
     }
 }

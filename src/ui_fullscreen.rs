@@ -9891,7 +9891,7 @@ impl App {
     ///
     /// 分析モードとルーペは「見る」ための機能なので対象外。半分のまま見えてよい
     /// (2026-08-26 の実機確認で、この 2 つは現状の見え方でよいと確認済み)。
-    fn page_edit_tool_owns_canvas(&self) -> bool {
+    pub(crate) fn page_edit_tool_owns_canvas(&self) -> bool {
         self.erase_mode
             || self.conceal_mode
             || self.text_mode
