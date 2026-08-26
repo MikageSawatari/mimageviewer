@@ -75,14 +75,20 @@ impl StripAxis {
 
         let count = self.cell_count();
         let first = self.cell(0)?;
-        if count == 1 || center_index <= 0.0 {
+        if center_index <= 0.0 {
             return Some(first);
         }
 
         let last_index = count.checked_sub(1)?;
         let last = self.cell(last_index)?;
         if center_index >= last_index as f64 {
-            return Some(last);
+            // 末尾セルの右端は素材の末尾。そこまで中心を進められないと、再生が末尾へ
+            // 近づく間だけスクロールが止まって見える (利用者報告 2026-08-27)。
+            let Some(tail_end_secs) = self.tail_end_secs() else {
+                return Some(last);
+            };
+            let fraction = (center_index - last_index as f64).clamp(0.0, 1.0);
+            return Some(last + fraction * (tail_end_secs - last));
         }
 
         let lower_index = center_index.floor() as usize;
@@ -93,6 +99,19 @@ impl StripAxis {
         Some(lower_time + fraction * (upper_time - lower_time))
     }
 
+    /// 末尾セルの右端の時刻。中心位置はここまで進める。
+    ///
+    /// 格子軸は尺を持っているので分かる。キーフレーム軸は尺を持たず、末尾セルは実在する
+    /// キーフレームなので、その先がどこで終わるか軸には分からない。**分からないものを
+    /// 推定しない**ので `None` を返し、従来どおり末尾セルでクランプする。
+    fn tail_end_secs(&self) -> Option<f64> {
+        match self {
+            Self::TimeGrid { duration_secs, .. } => {
+                duration_secs.is_finite().then_some(*duration_secs)
+            }
+            Self::KeyframeIndex { .. } => None,
+        }
+    }
     /// 時刻を採用セル間の小数位置へ変換する。
     ///
     /// 時刻は両端へクランプする。同一時刻のセルが連続する場合は最初の一致セルを返す。
@@ -103,14 +122,18 @@ impl StripAxis {
 
         let count = self.cell_count();
         let first = self.cell(0)?;
-        if count == 1 || time_secs <= first {
+        if time_secs <= first {
             return Some(0.0);
         }
 
         let last_index = count.checked_sub(1)?;
         let last = self.cell(last_index)?;
         if time_secs >= last {
-            return Some(last_index as f64);
+            let Some(tail_end_secs) = self.tail_end_secs().filter(|end| *end > last) else {
+                return Some(last_index as f64);
+            };
+            let fraction = ((time_secs - last) / (tail_end_secs - last)).clamp(0.0, 1.0);
+            return Some(last_index as f64 + fraction);
         }
 
         // 最初の `cell(i) >= time_secs` を探す。軸は列挙・間引き時に時刻順になる。
@@ -1234,6 +1257,65 @@ mod tests {
     }
 
     /// 実機で報告された形。172.7 秒 / 5 秒間隔で、末尾セルが 170.0 秒に来ていた。
+    /// 末尾セルの右端は素材の末尾。中心はそこまで進む。止めてしまうと、再生が末尾へ
+    /// 近づく間だけストリップのスクロールが固まって見える (利用者報告 2026-08-27)。
+    #[test]
+    fn time_grid_center_keeps_moving_through_the_last_cell() {
+        let duration_secs = 172.733_243_f64;
+        let interval_secs = 5.0_f64;
+        let axis = StripAxis::TimeGrid {
+            interval_secs,
+            fallback_interval_secs: interval_secs,
+            duration_secs,
+        };
+        let last_index = axis.cell_count() - 1;
+        let last = axis.cell(last_index).unwrap();
+
+        // 末尾セルの先頭では index も末尾セル。
+        assert_close(axis.center_index_for_time(last), last_index as f64);
+        // 素材の末尾では 1 セルぶん先まで進む。
+        assert_close(
+            axis.center_index_for_time(duration_secs),
+            last_index as f64 + 1.0,
+        );
+        // 途中は線形。
+        let middle_secs = last + (duration_secs - last) * 0.5;
+        assert_close(
+            axis.center_index_for_time(middle_secs),
+            last_index as f64 + 0.5,
+        );
+
+        // 逆写像も対称。
+        assert_close(axis.time_for_center_index(last_index as f64), last);
+        assert_close(
+            axis.time_for_center_index(last_index as f64 + 1.0),
+            duration_secs,
+        );
+        assert_close(
+            axis.time_for_center_index(last_index as f64 + 0.5),
+            middle_secs,
+        );
+        // 行き過ぎはクランプする。
+        assert_close(
+            axis.time_for_center_index(last_index as f64 + 9.0),
+            duration_secs,
+        );
+    }
+
+    /// キーフレーム軸は尺を持たない。末尾セルは実在するキーフレームで、その先がどこで
+    /// 終わるかは軸に分からないので、推定せず従来どおりクランプする。
+    #[test]
+    fn keyframe_axis_still_clamps_at_the_last_cell() {
+        let axis = StripAxis::KeyframeIndex {
+            keyframes: vec![0.0, 10.0, 20.0],
+            adopted: vec![0, 1, 2],
+        };
+        assert_close(axis.center_index_for_time(20.0), 2.0);
+        assert_close(axis.center_index_for_time(999.0), 2.0);
+        assert_close(axis.time_for_center_index(2.0), 20.0);
+        assert_close(axis.time_for_center_index(9.0), 20.0);
+    }
+
     #[test]
     fn time_grid_last_cell_ends_at_the_material_end() {
         let duration_secs = 172.733_243_f64;
