@@ -33828,17 +33828,25 @@ impl App {
         // Ctrl の状態判定。AutoHotKey 等の外部ツールが Ctrl+矢印を送信する場合、
         // Ctrl と矢印が別フレームで届くことがある。直前フレームの Ctrl 押下も
         // 考慮するため、egui の全イベントから Ctrl 修飾子を探す。
-        let ctrl_held = ctx.input(|i| {
+        let (ctrl_held, ctrl_from_events_only) = ctx.input(|i| {
             // 現在のフレームで Ctrl が押されている
-            if input_permits.current_level.is_some() && i.modifiers.ctrl {
-                return true;
-            }
+            let now = input_permits.current_level.is_some() && i.modifiers.ctrl;
             // イベントの中に Ctrl 修飾子付きのキーイベントがあるか
-            i.events.iter().any(|e| match e {
+            let from_events = i.events.iter().any(|e| match e {
                 egui::Event::Key { modifiers, .. } => modifiers.ctrl,
                 _ => false,
-            })
+            });
+            (now || from_events, !now && from_events)
         });
+        // `resync_egui_modifiers_from_os` は `i.modifiers` しか直せない。イベントが
+        // 自分で持っている修飾子は古いままなので、ここだけ Ctrl が立ち続けることがある。
+        // 押しっぱなし報告 (2026-08-26) の裏取り用。**まだ挙動は変えていない。**
+        if ctrl_from_events_only {
+            crate::logger::log(
+                "[modifiers] ctrl came only from event modifiers this frame (i.modifiers.ctrl is false)"
+                    .to_string(),
+            );
+        }
         let alt_held = ctx.input(|i| {
             if input_permits.current_level.is_some() && i.modifiers.alt {
                 return true;
@@ -36335,6 +36343,28 @@ impl App {
     /// modifier の hold 状態を OS API から毎フレーム同期し、Shell 復帰直後にも
     /// 明示同期する。個別の Key event に記録された modifiers はイベント時点の情報
     /// として残し、離散ショートカットの判定までは書き換えない。
+    /// 修飾キーの押しっぱなし疑いを、状態が変わったときだけ 1 行残す。
+    ///
+    /// 「Ctrl が押しっぱなしになったように見える」という報告 (2026-08-26) に対して、
+    /// **どこがずれているのかを記録する経路がまだ無かった**。毎フレーム出すと流れるので
+    /// 遷移だけ出す。
+    fn log_modifier_staleness(stale: egui::Modifiers) {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static LAST: AtomicU8 = AtomicU8::new(0);
+        let mask = u8::from(stale.ctrl) | (u8::from(stale.shift) << 1) | (u8::from(stale.alt) << 2);
+        if LAST.swap(mask, Ordering::Relaxed) == mask {
+            return;
+        }
+        if mask == 0 {
+            crate::logger::log("[modifiers] egui caught up with the OS".to_string());
+        } else {
+            crate::logger::log(format!(
+                "[modifiers] egui still holds ctrl={} shift={} alt={} after the OS released them",
+                stale.ctrl, stale.shift, stale.alt
+            ));
+        }
+    }
+
     pub(crate) fn resync_egui_modifiers_from_os(ctx: &egui::Context) {
         #[cfg(windows)]
         {
@@ -36355,10 +36385,21 @@ impl App {
                 key_down(VK_SHIFT.0),
                 key_down(VK_MENU.0),
             );
-            ctx.input_mut(|input| {
+            let stale = ctx.input_mut(|input| {
+                let before = input.modifiers;
                 input.modifiers = modifiers;
                 input.raw.modifiers = modifiers;
+                // egui 側が「押されている」と思っていたのに OS では離れていた分。
+                // Shell のモーダルが KeyUp を持っていった後に残る。
+                egui::Modifiers {
+                    ctrl: before.ctrl && !modifiers.ctrl,
+                    shift: before.shift && !modifiers.shift,
+                    alt: before.alt && !modifiers.alt,
+                    command: false,
+                    mac_cmd: false,
+                }
             });
+            Self::log_modifier_staleness(stale);
         }
         #[cfg(not(windows))]
         let _ = ctx;
