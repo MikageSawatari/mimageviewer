@@ -2331,7 +2331,7 @@ fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize
 
 - 規模 \\ 優先度: Medium / P3 (不具合ではなく仕様改善)。
 
-### 1.129 別ウィンドウの viewport を 1 枚描くのに CPU 9500 万サイクル使っている — 調査中
+### 1.129 別ウィンドウの viewport を 1 枚描くのに CPU 9500 万サイクル使っている ✅ 修正済み (2026-08-26、実機確認待ち)
 
 - 出典: 2026-08-26、§1.122 の分解。§1.122 の**頻度**側 (16ms pump) とは別の
   **単価**側の問題なので別項目にした (憲法 §2 規則 7)。
@@ -2365,7 +2365,58 @@ fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize
 §1.122 の pump を直しても**この単価は残る**。別ウィンドウでマウスを動かす・
 パネルを出すなどで repaint が起きるたび 38.6ms かかるのなら、それ自体が体感不具合。
 
-#### 仮説 (未検証)
+#### 原因 — viewport ごとに `max_texture_side` が違う (確定)
+
+`egui_ctx.run` の中であることを vendored eframe に probe を入れて確定させた:
+
+```
+total=40.2ms input=0.0 run=39.4 set_window=0.0 tessellate=0.0 paint=0.7
+             prims=1 delta_set=1 delta_bytes=262144 max_tex=None
+```
+
+`set_window` / `tessellate` / `paint` は全部 1ms 未満。**39.4ms は `run`**で、
+自前の描画は 0.3ms なので egui 自身。そして**毎フレーム atlas 全体の delta**が出ている。
+
+| viewport | `max_texture_side` | atlas | delta |
+| --- | --- | --- | --- |
+| detached (遅い側) | **None** → egui 既定 2048 | 2048x32 | 262,144 = 2048x32x4 |
+| root / 他 | **Some(8192)** | 8192x32 | 1,048,576 = 8192x32x4 |
+
+perf 側でも遅いフレーム **73 件すべて** `vp_max_tex=2048` / `main_max_tex=8192`。
+
+egui の font atlas は **`Context` に 1 つ**しか無く、`Fonts::begin_pass` は
+`max_texture_side` が変わると atlas を作り直す。`FontsImpl::new` は
+**登録済み全フォントを ab_glyph で再パース**するので、
+2 つの viewport が 2048 と 8192 を交互に報告すると**毎パス rebuild** になる。
+これがサイズにも内容にも依存しない一定 38.6ms の正体。
+
+#### なぜ食い違うのか — eframe wgpu backend の非対称
+
+`RawInput::max_texture_side` は `Option<usize>` で、**None なら egui が既定 2048** を使う。
+wgpu backend はこの値を **`State::new` で 1 度スナップショットするだけ**で以後同期しないので、
+render state が無い時点で作られた viewport は `None` のまま固定される。
+
+**glow backend は毎フレーム全 viewport へ配っている**
+([glow_integration.rs:221](../vendor/eframe/src/native/glow_integration.rs:221))。wgpu 側だけこれが無い。
+mIV 由来ではなく上流の非対称。
+
+#### 修正
+
+`vendor/eframe` の wgpu backend で、**root と immediate viewport の両方**が
+`take_egui_input` の直前に painter の値へ同期するようにした。glow と同じ契約に揃えただけで、
+値をスナップショットせず painter に追従させる構造の修正。
+
+⚠ 上流 eframe への還元候補。vendored crate を更新するときはこの差分を持ち越すこと。
+
+#### 旧仮説 (いずれも実測で否定済み、同じ道を辿らないために残す)
+
+- **keep-alive backstop が描いている** → `detached_backstop_ms = 0.0`。外れ
+- **font atlas の ppp スラッシング** → `vp_ppp == main_ppp == 1.5`、`fill = 0.009`。外れ
+  (rebuild していたのは当たりだが、引き金は ppp ではなく `max_texture_side` だった)
+- **per-pixel 処理** → ウィンドウを 1242x720 → 348x260 (面積 1/10) にしても 38.3〜39.5ms。外れ
+- **vsync / GPU / lock 待ち** → cycles が校正値と 0.4% 差。外れ
+
+#### 仮説 (否定済み、参考)
 
 egui の font atlas は **`Context` に 1 つ**しか無いが、main と子 viewport が
 異なる `pixels_per_point` を要求しうる。epaint 0.33 の `Fonts::begin_pass` は

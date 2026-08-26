@@ -733,6 +733,17 @@ impl WgpuWinitRunning<'_> {
             let Some(egui_winit) = egui_winit.as_mut() else {
                 return Ok(EventResult::Wait);
             };
+            // mIV (backlog 1.129): every viewport must report the SAME max_texture_side,
+            // because egui keeps one font atlas per Context and `Fonts::begin_pass` rebuilds
+            // it whenever that number changes -- re-parsing every registered font. This
+            // backend only ever snapshotted the value in `State::new`, so a viewport created
+            // before the render state existed kept `None` (egui then substitutes 2048) while
+            // the root reported 8192, and the two rebuilt the atlas at each other every
+            // frame. The glow backend already syncs this to every viewport each frame; do
+            // the same here.
+            if let Some(max_texture_side) = painter.max_texture_side() {
+                egui_winit.set_max_texture_side(max_texture_side);
+            }
             let mut raw_input = egui_winit.take_egui_input(window);
 
             integration.pre_update();
@@ -1160,6 +1171,11 @@ fn render_immediate_viewport(
         };
         egui_winit::update_viewport_info(&mut viewport.info, egui_ctx, window, false);
 
+        // mIV (backlog 1.129): keep this viewport's max_texture_side equal to the root's.
+        // See the note on the same call in `run_ui_and_paint`.
+        if let Some(max_texture_side) = painter.max_texture_side() {
+            egui_winit.set_max_texture_side(max_texture_side);
+        }
         let mut input = egui_winit.take_egui_input(window);
         input.viewports = viewports
             .iter()
