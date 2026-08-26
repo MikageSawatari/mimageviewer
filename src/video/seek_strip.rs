@@ -577,6 +577,20 @@ pub(crate) fn thin_keyframes(keyframes: &[f64], min_gap_secs: f64) -> Vec<usize>
             last_adopted = pts_secs;
         }
     }
+    // **最後のキーフレームは間隔に関わらず必ず採る** (利用者判断 2026-08-26)。
+    //
+    // 間引きは前から順に採るので、末尾のキーフレームが直前の採用より近いと落ちる。すると
+    // ストリップは動画の終わりまで届かず、右端が空く。実素材 `アカリがやってきたぞっ` は
+    // 301 秒だが最終セルが 283.1 秒になり、末尾 18 秒にセルが無かった (最後のキーフレーム
+    // 294.8 秒が直前から 11.7 秒しか離れておらず、15 秒に満たない)。
+    //
+    // 末尾だけ間隔が詰まるが、**間隔が詰まるよりサムネイルが見えない方が影響が大きい**という
+    // 判断。終わりは利用者が探す目印なので、必ず 1 枚置く。
+    if let Some(&last) = adopted.last()
+        && last + 1 < keyframes.len()
+    {
+        adopted.push(keyframes.len() - 1);
+    }
     adopted
 }
 
@@ -1314,14 +1328,18 @@ mod tests {
     }
 
     #[test]
-    fn thinning_larger_than_duration_keeps_only_first() {
-        assert_eq!(thin_keyframes(&[0.0, 1.0, 3.0, 8.0], 20.0), vec![0]);
+    fn thinning_larger_than_duration_keeps_the_first_and_the_last() {
+        // 間隔が尺より長くても、先頭と**末尾**は置く (2026-08-26 の判断。以前は先頭だけだった)。
+        // 8 秒の素材に 20 秒を指定した場合、始まりと終わりの 2 枚になる。
+        assert_eq!(thin_keyframes(&[0.0, 1.0, 3.0, 8.0], 20.0), vec![0, 3]);
     }
 
     #[test]
     fn thinning_uses_minimum_gap_for_variable_gop() {
         let keyframes = [0.0, 0.4, 0.9, 2.0, 2.1, 4.2, 7.0, 7.5];
-        assert_eq!(thin_keyframes(&keyframes, 2.0), vec![0, 3, 5, 6]);
+        // 末尾の 7.5 は直前の 7.0 から 0.5 秒しか離れていないが、**終わりは必ず置く**ので
+        // 採用する。末尾だけ間隔が詰まるのは承知のうえの判断 (2026-08-26)。
+        assert_eq!(thin_keyframes(&keyframes, 2.0), vec![0, 3, 5, 6, 7]);
     }
 
     #[test]
@@ -1862,6 +1880,28 @@ mod tests {
             }
         );
     }
+    /// 実機報告 2026-08-26: ストリップが動画の終わりまで届かない動画があった。数値は
+    /// `アカリがやってきたぞっ` のもの。最後のキーフレーム 294.795 秒は直前の採用 283.083 秒
+    /// から 11.7 秒しか離れておらず、15 秒の間引きで落ちて末尾 18 秒が空いていた。
+    #[test]
+    fn the_last_keyframe_is_always_adopted() {
+        let keyframes = vec![0.0, 15.5, 31.0, 283.083, 294.795];
+        let adopted = thin_keyframes(&keyframes, 15.0);
+        assert_eq!(
+            adopted.last(),
+            Some(&(keyframes.len() - 1)),
+            "間隔に満たなくても最後のキーフレームは採る"
+        );
+        assert_eq!(adopted, vec![0, 1, 2, 3, 4]);
+
+        // 既に最後を採っているなら二重に入れない。
+        let already = thin_keyframes(&[0.0, 20.0, 40.0], 15.0);
+        assert_eq!(already, vec![0, 1, 2]);
+
+        // 1 枚しかない場合も壊れない。
+        assert_eq!(thin_keyframes(&[7.0], 15.0), vec![0]);
+    }
+
     /// 実機報告 2026-08-26: 画像間隔を変えてもストリップの一覧が変わらない動画があった。
     /// 索引が不完全で格子軸へ落ちた場合、`with_minimum_gap` が格子には何もしていなかった。
     /// 数値は報告された mp4 のもの (172.7 秒、尺由来の下限は 1 秒)。
