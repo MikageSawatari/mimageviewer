@@ -627,11 +627,6 @@ impl SidecarWriter {
         }
     }
 
-    /// まだディスクへ反映していない内容。あればディスクを読まずにこれを使う。
-    fn pending_items(&self, folder: &Path) -> Option<BTreeMap<String, SidecarEntry>> {
-        self.state.pending_items(folder)
-    }
-
     fn is_failed(&self, folder: &Path) -> bool {
         self.state.is_failed(folder)
     }
