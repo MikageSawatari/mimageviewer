@@ -836,18 +836,28 @@ source session reset で `Unknown` へ戻すため、前ファイルの unavaila
 
 波形モードの `SeekStripWaveWorker` は既に完成済みの `TimelineAnalysis` が現在ファイルまたは
 音楽解析 LRU にあれば対象時間窓を切り出す。無ければ、動画ごとに 1 回だけ開く
-`AudioRangeDecoder` でまず設定された可視 span (5 / 10 / 15 / 30 秒、1 / 2 / 5 / 10 / 15 /
+`AudioRangeDecoder` で設定された可視 span (5 / 10 / 15 / 30 秒、1 / 2 / 5 / 10 / 15 /
 30 / 60 / 120 / 180 分、既定 3 分) と 0.75 秒の pre-roll
 だけを 48kHz stereo PCM にして first-paint raster を返す。表示後は同じ中心の保持 span を
-background で作る。保持 span は通常 3 倍だが 3600 秒で上限とし、30 分表示では 60 分 / 2 倍
-物理幅に抑える。両側 15 分の coverage と中央 ±7.5 分の hysteresis trigger band は残る一方、
-90 分の音声 decode は発生しない。可視 span が 60 分以上なら保持 span は可視 span と同じになり、
-同幅の background upgrade は出さない。中心が可視幅の 25% を越えて動いたときだけ次の同幅 raster を
-要求する。粗い全尺ピーク列はまだ無く、60 / 120 / 180 分も現在位置中心の窓を 1 回デコードする。
-両段は秒 / pixel と bin 幅が同一なので交換時に内容が動かない。pre-roll bins は raster 前に捨て、
-全尺前提の beat grid は作らない。波形 raster の LRU は file identity、時間窓、
-bin 幅、物理幅をキーにしたメモリ内 8 件だけで、
-永続 cache は持たない。audio stream が無い場合は通常の media property として typed status で保持し、
+background で作る。保持 span は通常 3 倍だが 3600 秒で上限とする。可視 span が 60 分以上なら
+保持 span は可視 span と同じになり、同幅の background upgrade は出さない。
+
+可視 span が 10 分以上になると、同じ worker / decoder が 100ms、7 byte/bin の粗い全尺列を
+60 秒 chunk でメモリ内だけに構築する。foreground latest-wins request を loop 先頭で処理し、無いとき
+だけ現在中心に最も近い未試行 chunk を 1 個埋める。chunk 中は foreground へ譲らないため、待ち上限は
+1 chunk で、thread / decoder は増えない。粗い列が可視範囲を被覆し要求 bin 幅が 100ms 以上なら
+粗い列を使い、未被覆か解像度不足でも可視 span 30 分以下は従来の窓復号を維持する。30 分超は
+粗い列だけを progressive に描き、未解析列は暗い背景かつ中心線なしで区別する。粗い列、bitset、
+content revision は worker とともに捨て、永続 cache は持たない。chunk 単位の decode / 合成失敗は
+coverage と別の failed bitset に記録して選択から外し、残りの構築を継続する。終了は両 bitset の和で
+判定するが、failed chunk は被覆や waveform bin に含めず未解析表示のままにする。decoder open failure と
+音声 track なしだけはファイル単位の `Unavailable` として全体を止める。
+
+`AudioRangeDecoder::open` は FFI で音声以外の `AVStream.discard` を `AVDISCARD_ALL` にし、
+chunk perf は `wave_coarse_chunk`、粗い列からの描画は `wave_coarse_serve` へ出す。従来窓の
+pre-roll bins は raster 前に捨て、全尺前提の beat grid は作らない。窓波形 raster の LRU は
+file identity、時間窓、bin 幅、物理幅をキーにしたメモリ内 8 件だけである。
+audio stream が無い場合は通常の media property として typed status で保持し、
 decode / analysis failure とは分けて presenter payload へ渡す。閉じる、動画切替、fullscreen 終了では
 session owner が両 worker を
 `cancel()` して payload を外す。

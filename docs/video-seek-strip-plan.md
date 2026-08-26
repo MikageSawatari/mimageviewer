@@ -8,7 +8,7 @@ backlog [§1.102](next-release-backlog.md) (YouTube 型のサムネイル列) �
 
 作業ブランチ `video-strip` (worktree `C:\home\mimageviewer-video-strip`)。
 
-実装状況 (2026-08-25): Increment 1 (軸・窓・gesture の純ロジック) / Increment 2 (サムネイル抽出
+実装状況 (2026-08-26): Increment 1 (軸・窓・gesture の純ロジック) / Increment 2 (サムネイル抽出
 worker) / Increment 3 (App owner・設定・描画・入力・HUD region・tile と hover preview の排他、
 **実機確認済み**) / Increment 4 (波形モード・モード切替) / Increment 5 (3 値の表示状態、
 フィルムアイコン、再生位置追従、180 秒波形ラスタのスクロール) / Increment 6 (フィルムボタンの
@@ -18,8 +18,9 @@ worker) / Increment 3 (App owner・設定・描画・入力・HUD region・tile 
 操作抑止、波形可視 span 設定、無 blank 再構築、長尺 first-paint 実測) / stage-1 follow-up
 (raw GOP が疎すぎる素材の decode 前 unavailable 判定、batch の sampled duplicate skip) / D18
 (ホイールによる段階的な範囲変更、現在値表示、設定 UI の段階値化) / D19
-(ストリップ固定) / D17 (シークバーと両ストリップ mode の共有 1 枚プレビュー) まで実装。
-残りは §5.4、§9 の未確定項目の実機調整、
+(ストリップ固定) / D17 (シークバーと両ストリップ mode の共有 1 枚プレビュー) / D27
+(メモリ内の粗い全尺ピーク列) まで実装。
+残りは §9 の未確定項目の実機調整、
 MPEG-TS など `TimeGrid` 経路の実素材確認。
 
 確定した既定値: 開閉は `Shift+S` (`V` はレーン C の動画パノラマ用に空けた)、最小間隔 15 秒、
@@ -114,10 +115,10 @@ MPEG-TS など `TimeGrid` 経路の実素材確認。
 黒いセルの報告は**未再現のまま**。D25 の 12 秒診断が仕掛けてあるので、次に出たら
 `%APPDATA%\mimageviewer\logs\mimageviewer.log` に理由が残る。
 
-§5.4 (波形の絵巻き全長化) は未着手。優先度は、利用者が波形 60 分以上の段を常用するかで決まる
-(実測 60 分 3.1 秒 / 120 分 6.5 秒 / 180 分 8.2 秒)。
+§5.4 (波形の絵巻き全長化) は D27 として実装済み。100ms / 60 秒 chunk のメモリ内列を
+現在中心優先で埋め、30 分超は未解析区間を区別しながら progressive に描く。
 **D17 は実装済み** (2026-08-25 に範囲を両モードへ拡大)。上の「着手順 (当初)」は D17 を
-実装する前に書いた並びなので、そこだけ古い。残りは §5.4 と、§9 の U2〜U5 の実機調整、
+実装する前に書いた並びなので、そこだけ古い。残りは §9 の U2〜U5 の実機調整、
 MPEG-TS など `TimeGrid` 経路の実素材確認。
 
 **ブランチの状態 (2026-08-26)**: `video-strip` は master を取り込み済み。衝突は 3 箇所で、
@@ -194,10 +195,8 @@ D15 は「離す前の再生状態を保つ」という当初の既定を置き�
 - サムネイルは全索引から adopted list だけを作り直し、実 timestamp をキーにした永続 cache を
   保つ (D11)。波形は旧 raster を display-only holdover にして、新しい first paint が届くまで
   表示し続ける。設定変更中に帯を blank にしない。
-- **§5.4 はこの increment では実装しない。** 30 分超の段も隠さず、現在位置を中心とする可視幅を
-  現行の窓 decoder で 1 回復号する。60 分以上は保持幅上限と可視幅が等しくなるため、同じ幅の
-  background upgrade は行わない。実測待ち時間は §14。§5.4 実装後は中央から埋まる粗い全尺
-  ピーク列へ置き換える。
+- **D18 increment では §5.4 を実装しなかったが、D27 で置き換え済み。** 30 分超は中央から
+  埋まる粗い全尺ピーク列を progressive に描く。D27 前の窓復号待ち時間は比較基準として §14 に残す。
 
 **D19 (実装済み、2026-08-25)**: **ストリップの右上に鍵アイコンを置き、固定できるようにする** (利用者要望
 2026-08-25)。ストリップが見やすいので常時出しておきたい、という用途。
@@ -571,16 +570,16 @@ enum StripAxisDecision {
 **ストリップは `ensure_music_analysis` を呼ばない。** 代わりに窓だけを解析する。
 
 ```
-優先順位:
-  1. 同じファイルの完成済み TimelineAnalysis が既にある
-     (音楽ビュー / 動画→音声モード / LRU ヒット)
-     → そのまま窓で切って描く。再デコードしない
-  2. 無ければ「窓オンデマンド解析」: 窓 ± pre-roll だけ音声を復号して bins を作る
-  3. (フェーズ 2) 粗い全尺ピーク列の永続キャッシュがあれば、全尺を即描ける
+D27 の優先順位:
+  1. 粗い列が可視範囲を被覆済み、かつ要求 bin 幅が 100ms 以上 → 粗い列
+  2. 可視 span が 30 分以下 → 従来の窓経路
+     a. 同じファイルの完成済み TimelineAnalysis があれば窓で切る
+     b. 無ければ窓 ± pre-roll だけ音声を復号する
+  3. それ以外 → worker-local の粗い列だけを progressive に描く
 ```
 
-これで「ストリップを開いたときだけ解析を起動する」という条件が、**そもそも全尺デコードを
-起動しない**という形で構造的に満たされる。
+粗い列もストリップを開き 10 分以上の span を使ったときだけ開始し、現在中心から 60 秒ずつ埋める。
+先頭からの全尺 decode を起動しないため、見ない残り範囲は動画を閉じれば費用を払わずに終わる。
 
 ### 5.2 窓オンデマンド解析
 
@@ -639,10 +638,9 @@ D7 の時点では「窓オンデマンドで即応するので要らない」�
 30 分までは窓オンデマンドで実用範囲 (実測 first paint 3.1 秒)。それを超える段では、粗いピーク列
 を作ってそこから任意の範囲を描く。
 
-**D18 increment 時点では未実装。** 暫定的に 60 / 120 / 180 分も現行の窓オンデマンドで動かす。
-旧 raster は完成まで表示されるが、新範囲が段階的に埋まる表示ではない。3 時間 AAC 付き MP4 の
-最適化プロファイル実測は 60 分 3.120 秒、120 分 6.546 秒、180 分 8.189 秒 (§14)。実素材の codec、
-ストレージ、CPU により待ちは変わる。
+**D18 increment 時点では未実装だったが、D27 で実装済み。** D27 前の 3 時間 AAC 付き MP4 の
+窓復号実測は 60 分 3.120 秒、120 分 6.546 秒、180 分 8.189 秒 (§14)。この旧値を、D27 の
+`wave_coarse_chunk` / `wave_coarse_serve` と比較できるよう残す。
 
 **先頭から全尺を舐めない (利用者指摘 2026-08-25)。** 動画は 1GB を超えることがあり、HDD 上の
 ファイルを先頭から読み切るのは待ち時間が大きい。**現在位置を起点に、前後へ範囲を広げながら
@@ -660,8 +658,8 @@ D7 の時点では「窓オンデマンドで即応するので要らない」�
 `ffmpeg-the-third` の安全 API に `set_discard` は無いため、索引列挙と同じく `AVStream.discard`
 を ffi 経由で立てる。**効果は実測して記録する** (立てた場合と立てない場合の読み出し時間)。
 
-- 解像度 100ms、`peak` / `rms` / 3 バンドを各 u8 で 5 バイト/bin → 2 時間で約 360KB。
-- 初回は窓オンデマンドで描きつつ、背景で全尺の粗ピークを作って保存する。
+- 以下の D27 より前は mono 5 バイト/bin と保存を想定していたが、D27 で stereo 7 バイト/bin、
+  worker のメモリ内だけへ変更した。
 - 音楽ビューの「永続 DB はやめて直近 N 曲だけメモリ」方針とは**別物**として扱う。あちらは
   10ms・chroma 込みの重い解析で、こちらは表示専用の粗い列。用途も精度も違う。
 
@@ -680,6 +678,11 @@ chunk index の bitset (3 時間で 180 個)。区間演算が要らず、合成
 
 **埋める順**: 現在中心に最も近い未取得 chunk を 1 つ選んで復号し、公開して、また選ぶ。
 中心が動けば次の選択から反映される。**先頭から舐めない** (利用者指摘 2026-08-25)。
+
+**chunk-local failure**: 取得に失敗した chunk は coverage とは別の failed bitset に記録し、以後の
+選択から外して残りへ進む。構築終了は `covered ∪ failed` が全 chunk を埋めた時点だが、failed は
+可視範囲の被覆には数えず、未解析の暗い背景かつ中心線なしで残す。音声 track が無い、または decoder
+自体を開けない `Unavailable` だけはファイル単位の性質なので、従来どおり構築全体を終了する。
 
 **前面が常に勝つ**: worker は 1 スレッド・1 decoder のまま。ループの先頭で前面要求を見て、
 あれば先に処理する。粗い列の 1 単位は 60 秒ぶんなので、**前面要求が待たされる上限は chunk 1 つ分**。
@@ -706,11 +709,22 @@ chunk index の bitset (3 時間で 180 個)。区間演算が要らず、合成
 **AVDISCARD_ALL**: `AudioRangeDecoder::open` で音声以外の全ストリームに `AVDISCARD_ALL` を立てる。
 `ffmpeg-the-third` の安全 API に `set_discard` が無いので `AVStream.discard` を ffi で書く。
 `AudioRangeDecoder` の利用者は strip の波形ワーカーだけなので、影響範囲はここに閉じる。
-**効果は実測して記録する** (立てた場合と立てない場合で、同じ素材の 1 chunk 復号時間を比べる)。
+**実測 (2026-08-26)**: 7.0GB / H.264 + AAC の MP4 (コンサート映像) で、60 秒 chunk を 4 つ
+復号した合計。**立てると 219 / 220 / 221ms、立てないと 390 / 394 / 404ms** (各 3 回、
+page cache が温まった状態)。**1.8 倍速く、1 chunk あたり約 98ms → 約 55ms。**
+初回だけは cold cache で ON 345ms / OFF 390ms と差が縮むので、**この数字は I/O ではなく
+demux と copy の削減**を測っている。HDD 上の cold read でどれだけ効くかは別途。
 
-**計測**: `wave_coarse_chunk` (chunk の復号 + 解析時間、chunk index、被覆数) と
+**計測**: `wave_coarse_chunk` (chunk の復号 + 解析時間、chunk index、成功 / 失敗、失敗理由、
+被覆数 / 失敗数) と
 `wave_coarse_serve` (粗い列から描いた回数、被覆率) を perf へ出す。3 時間素材で「開いてから
 可視範囲が埋まるまで」を実測して §14 に追記する。
+
+**実装メモ (2026-08-26)**: worker の foreground latest-wins slot と単一 decoder は維持し、
+foreground が無い loop だけが 1 chunk を処理する。現在中心は App から atomic priority hint として
+同期するため、既存 raster の保持範囲内で中心だけ動いて新しい foreground request が出ない場合も、
+次 chunk の選択へ反映される。chunk ごとの同一時間窓 raster 再公開を presenter が検知できるよう、
+RGBA payload に worker-local content revision を含める。これは永続 identity ではない。
 
 ## 6. presenter との境界
 
@@ -828,6 +842,9 @@ enum SeekRowGesture {
   replacement を要求すること。
 - 保持中の波形 texture から設定可視 span の部分を切り出す UV / 部分 gap の算術。
 - preference 変更時に旧 raster が request coverage にならず、新 first paint まで display holdover になること。
+- 粗い 7-byte bin の量子化往復誤差、現在中心に最も近い未試行 chunk の選択、failed chunk の
+  選択除外と非被覆扱い、`Unavailable` の全体終了、D27 の順序付き 3 経路、bitset coverage の
+  連続区間合成、chunk bin の全尺列への合成。
 - 再生位置追従の 100ms rate limit、微小差の抑制、ドラッグ中の detach。
 - サムネイルセルの `pending / ready / failed` 判定と、最新要求の index-level failure の反映。
 - サムネイル窓の 30 秒境界が pending セルを typed timeout failure へ確定し、UI / batch 用の理由を
@@ -879,6 +896,10 @@ enum SeekRowGesture {
   既存の hover 待ち計装 (`seek-thumb-bench` ブランチ) と同じ観点。
 - `video_strip/decode` — 1 窓の復号内訳 (シーク / 復号 / 変換、枚数)。
 - `video_strip/wave_window` — 窓の音声復号 + 解析 + ラスタの内訳。
+- `video_strip/wave_coarse_chunk` — chunk index、成功時の復号 / 解析時間、失敗時の理由、
+  `AVDISCARD_ALL` を立てた非音声 stream 数、被覆済み / 失敗 / 全 chunk 数。
+- `video_strip/wave_coarse_serve` — 粗い列から raster を作った時点の全尺被覆率と被覆済み /
+  失敗 / 全 chunk 数。
 
 判断基準: **窓が確定してから可視セルが埋まるまでの p90 を 300ms 未満**に置く。超えるなら
 先読み量・抽出幅・窓の大きさを調整する。

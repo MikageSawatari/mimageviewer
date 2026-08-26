@@ -7407,6 +7407,7 @@ impl App {
                 let Some(worker) = session.wave_worker.as_ref() else {
                     return;
                 };
+                worker.prioritize_coarse_center(center_time_secs);
                 let snapshot = worker.snapshot();
                 if let (Some(pending), Some(raster)) =
                     (session.pending_wave_span, snapshot.raster.as_ref())
@@ -7865,6 +7866,7 @@ impl App {
                                 waveform_span_secs = raster.visible_span_secs;
                                 wave_image = Some(
                                 crate::video::native_presenter::NativeOverlaySeekStripWaveImage {
+                                    revision: raster.revision,
                                     window_start_secs: raster.window_start_secs,
                                     window_end_secs: raster.window_end_secs,
                                     bin_secs: raster.bin_secs,

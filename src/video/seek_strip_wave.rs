@@ -2,10 +2,12 @@
 //!
 //! The worker owns one lazy-opened audio range decoder for the current video.
 //! It first reuses a completed full TimelineAnalysis when the file identity
-//! matches; otherwise it decodes the requested span plus pre-roll. The first request is one visible
-//! screen, followed by a same-scale wider upgrade. Rasterization also runs here, and only RGBA plus
-//! its time coverage crosses to the App and native presenter. The cache is process-memory-only by
-//! design.
+//! matches; otherwise it decodes the requested span plus pre-roll. For spans from ten minutes it
+//! also builds a worker-local 100ms full-length column in center-prioritized 60-second chunks; spans
+//! over thirty minutes are served progressively from that column. The first request is one visible
+//! screen, followed by a same-scale wider upgrade where window decode still applies. Rasterization
+//! also runs here, and only versioned RGBA plus its time coverage crosses to the App and native
+//! presenter. All caches are process-memory-only by design.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -31,6 +33,11 @@ const WAVEFORM_REQUEST_MARGIN_RATIO: f64 = 0.25;
 pub(crate) const WAVEFORM_PRE_ROLL_SECS: f64 = 0.75;
 const MIN_WAVEFORM_BIN_SECS: f64 = 0.010;
 const WAVE_RASTER_LRU_MAX_ENTRIES: usize = 8;
+pub(crate) const COARSE_BIN_SECS: f64 = 0.100;
+pub(crate) const COARSE_CHUNK_SECS: f64 = 60.0;
+const COARSE_BINS_PER_CHUNK: usize = 600;
+const WINDOW_DECODE_MAX_SPAN_SECS: f64 = 1800.0;
+const COARSE_BUILD_MIN_SPAN_SECS: f64 = 600.0;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct WaveFileIdentity {
@@ -329,6 +336,309 @@ pub(crate) fn waveform_bin_secs(span_secs: f64, pixel_width: usize) -> f64 {
     (raw * 1000.0).ceil() / 1000.0
 }
 
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct QuantizedWaveformBin([u8; 7]);
+
+fn quantize_unit(value: f32) -> u8 {
+    if value.is_finite() {
+        (value.clamp(0.0, 1.0) * 255.0).round() as u8
+    } else {
+        0
+    }
+}
+
+fn quantize_waveform_bin(bin: &WaveformBin) -> QuantizedWaveformBin {
+    QuantizedWaveformBin([
+        quantize_unit(bin.peak_l),
+        quantize_unit(bin.rms_l),
+        quantize_unit(bin.peak_r),
+        quantize_unit(bin.rms_r),
+        quantize_unit(bin.band_energy[0]),
+        quantize_unit(bin.band_energy[1]),
+        quantize_unit(bin.band_energy[2]),
+    ])
+}
+
+fn dequantize_waveform_bin(
+    bin: QuantizedWaveformBin,
+    start_secs: f64,
+    duration_secs: f64,
+) -> WaveformBin {
+    let [peak_l, rms_l, peak_r, rms_r, low, mid, high] = bin.0.map(|value| value as f32 / 255.0);
+    WaveformBin {
+        start_secs,
+        duration_secs,
+        peak: peak_l.max(peak_r),
+        rms: rms_l.max(rms_r),
+        peak_l,
+        rms_l,
+        peak_r,
+        rms_r,
+        band_energy: [low, mid, high],
+        ..WaveformBin::default()
+    }
+}
+
+fn coarse_chunk_count(duration_secs: f64) -> usize {
+    if !duration_secs.is_finite() || duration_secs <= 0.0 {
+        0
+    } else {
+        (duration_secs / COARSE_CHUNK_SECS).ceil() as usize
+    }
+}
+
+fn coarse_bin_count(duration_secs: f64) -> usize {
+    if !duration_secs.is_finite() || duration_secs <= 0.0 {
+        0
+    } else {
+        (duration_secs / COARSE_BIN_SECS).ceil() as usize
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CoarseChunkCoverage {
+    bits: Vec<u64>,
+    chunk_count: usize,
+}
+
+impl CoarseChunkCoverage {
+    fn new(chunk_count: usize) -> Self {
+        Self {
+            bits: vec![0; chunk_count.div_ceil(64)],
+            chunk_count,
+        }
+    }
+
+    fn contains(&self, chunk_index: usize) -> bool {
+        chunk_index < self.chunk_count
+            && self.bits[chunk_index / 64] & (1_u64 << (chunk_index % 64)) != 0
+    }
+
+    fn insert(&mut self, chunk_index: usize) -> bool {
+        if chunk_index >= self.chunk_count {
+            return false;
+        }
+        let bit = 1_u64 << (chunk_index % 64);
+        let word = &mut self.bits[chunk_index / 64];
+        let changed = *word & bit == 0;
+        *word |= bit;
+        changed
+    }
+
+    fn marked_count(&self) -> usize {
+        self.bits
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum::<usize>()
+            .min(self.chunk_count)
+    }
+
+    fn covers_time_span(&self, start_secs: f64, end_secs: f64, duration_secs: f64) -> bool {
+        let start_secs = start_secs.clamp(0.0, duration_secs);
+        let end_secs = end_secs.clamp(0.0, duration_secs);
+        if end_secs <= start_secs {
+            return true;
+        }
+        let first = (start_secs / COARSE_CHUNK_SECS).floor() as usize;
+        let end = (end_secs / COARSE_CHUNK_SECS).ceil() as usize;
+        (first.min(self.chunk_count)..end.min(self.chunk_count))
+            .all(|chunk_index| self.contains(chunk_index))
+    }
+
+    fn analyzed_spans(
+        &self,
+        window_start_secs: f64,
+        window_end_secs: f64,
+        duration_secs: f64,
+    ) -> Vec<(f64, f64)> {
+        let mut spans = Vec::new();
+        let mut chunk_index = 0;
+        while chunk_index < self.chunk_count {
+            if !self.contains(chunk_index) {
+                chunk_index += 1;
+                continue;
+            }
+            let run_start = chunk_index;
+            while chunk_index < self.chunk_count && self.contains(chunk_index) {
+                chunk_index += 1;
+            }
+            let start_secs = (run_start as f64 * COARSE_CHUNK_SECS)
+                .max(window_start_secs)
+                .max(0.0);
+            let end_secs = (chunk_index as f64 * COARSE_CHUNK_SECS)
+                .min(window_end_secs)
+                .min(duration_secs);
+            if end_secs > start_secs {
+                spans.push((start_secs, end_secs));
+            }
+        }
+        spans
+    }
+}
+
+/// Pick the unattempted 60-second chunk whose midpoint is nearest the current view center.
+fn next_coarse_chunk(
+    coverage: &CoarseChunkCoverage,
+    failed: &CoarseChunkCoverage,
+    center_secs: f64,
+) -> Option<usize> {
+    debug_assert_eq!(coverage.chunk_count, failed.chunk_count);
+    let center_secs = if center_secs.is_finite() {
+        center_secs.max(0.0)
+    } else {
+        0.0
+    };
+    (0..coverage.chunk_count)
+        .filter(|&chunk_index| !coverage.contains(chunk_index) && !failed.contains(chunk_index))
+        .min_by(|&left, &right| {
+            let left_center = (left as f64 + 0.5) * COARSE_CHUNK_SECS;
+            let right_center = (right as f64 + 0.5) * COARSE_CHUNK_SECS;
+            (left_center - center_secs)
+                .abs()
+                .total_cmp(&(right_center - center_secs).abs())
+                .then_with(|| left.cmp(&right))
+        })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CoarseChunkUpdate {
+    bin_start: usize,
+    bins: Vec<QuantizedWaveformBin>,
+}
+
+/// Convert one analyzed chunk into the exact slots it owns in the full-length coarse column.
+fn compose_coarse_chunk(
+    duration_secs: f64,
+    chunk_index: usize,
+    analyzed_bins: &[WaveformBin],
+) -> Option<CoarseChunkUpdate> {
+    let total_bins = coarse_bin_count(duration_secs);
+    let bin_start = chunk_index.checked_mul(COARSE_BINS_PER_CHUNK)?;
+    let bin_end = bin_start
+        .saturating_add(COARSE_BINS_PER_CHUNK)
+        .min(total_bins);
+    if chunk_index >= coarse_chunk_count(duration_secs) || bin_end <= bin_start {
+        return None;
+    }
+    let mut bins = vec![None; bin_end - bin_start];
+    for bin in analyzed_bins {
+        let global_index = (bin.start_secs / COARSE_BIN_SECS).round() as usize;
+        if global_index < bin_start || global_index >= bin_end {
+            continue;
+        }
+        let expected_start = global_index as f64 * COARSE_BIN_SECS;
+        if (bin.start_secs - expected_start).abs() > 1.0e-6 {
+            return None;
+        }
+        bins[global_index - bin_start] = Some(quantize_waveform_bin(bin));
+    }
+    Some(CoarseChunkUpdate {
+        bin_start,
+        bins: bins.into_iter().collect::<Option<Vec<_>>>()?,
+    })
+}
+
+struct CoarseWaveform {
+    duration_secs: f64,
+    bins: Vec<QuantizedWaveformBin>,
+    coverage: CoarseChunkCoverage,
+    failed: CoarseChunkCoverage,
+}
+
+impl CoarseWaveform {
+    fn new(duration_secs: f64) -> Self {
+        let chunk_count = coarse_chunk_count(duration_secs);
+        Self {
+            duration_secs,
+            bins: vec![QuantizedWaveformBin::default(); coarse_bin_count(duration_secs)],
+            coverage: CoarseChunkCoverage::new(chunk_count),
+            failed: CoarseChunkCoverage::new(chunk_count),
+        }
+    }
+
+    fn apply_chunk(&mut self, chunk_index: usize, analyzed_bins: &[WaveformBin]) -> bool {
+        let Some(update) = compose_coarse_chunk(self.duration_secs, chunk_index, analyzed_bins)
+        else {
+            return false;
+        };
+        let bin_end = update.bin_start + update.bins.len();
+        self.bins[update.bin_start..bin_end].copy_from_slice(&update.bins);
+        self.coverage.insert(chunk_index)
+    }
+
+    fn mark_failed(&mut self, chunk_index: usize) -> bool {
+        !self.coverage.contains(chunk_index) && self.failed.insert(chunk_index)
+    }
+
+    fn is_complete(&self) -> bool {
+        (0..self.coverage.chunk_count).all(|chunk_index| {
+            self.coverage.contains(chunk_index) || self.failed.contains(chunk_index)
+        })
+    }
+
+    fn covers_span(&self, start_secs: f64, end_secs: f64) -> bool {
+        self.coverage
+            .covers_time_span(start_secs, end_secs, self.duration_secs)
+    }
+
+    fn analyzed_spans(&self, start_secs: f64, end_secs: f64) -> Vec<(f64, f64)> {
+        self.coverage
+            .analyzed_spans(start_secs, end_secs, self.duration_secs)
+    }
+
+    fn waveform_bins(&self, start_secs: f64, end_secs: f64) -> Vec<WaveformBin> {
+        let start_secs = start_secs.clamp(0.0, self.duration_secs);
+        let end_secs = end_secs.clamp(0.0, self.duration_secs);
+        if end_secs <= start_secs {
+            return Vec::new();
+        }
+        let first = (start_secs / COARSE_BIN_SECS).floor() as usize;
+        let end = (end_secs / COARSE_BIN_SECS).ceil() as usize;
+        (first.min(self.bins.len())..end.min(self.bins.len()))
+            .filter(|&bin_index| self.coverage.contains(bin_index / COARSE_BINS_PER_CHUNK))
+            .map(|bin_index| {
+                let bin_start_secs = bin_index as f64 * COARSE_BIN_SECS;
+                dequantize_waveform_bin(
+                    self.bins[bin_index],
+                    bin_start_secs,
+                    COARSE_BIN_SECS.min(self.duration_secs - bin_start_secs),
+                )
+            })
+            .collect()
+    }
+
+    fn coverage_ratio(&self) -> f64 {
+        if self.coverage.chunk_count == 0 {
+            1.0
+        } else {
+            self.coverage.marked_count() as f64 / self.coverage.chunk_count as f64
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaveRenderRoute {
+    Coarse,
+    WindowDecode,
+    CoarseProgressive,
+}
+
+/// D27's ordered three-way routing decision.
+fn decide_wave_render_route(
+    coarse_covers_visible: bool,
+    requested_bin_secs: f64,
+    visible_span_secs: f64,
+) -> WaveRenderRoute {
+    if coarse_covers_visible && requested_bin_secs >= COARSE_BIN_SECS {
+        WaveRenderRoute::Coarse
+    } else if visible_span_secs <= WINDOW_DECODE_MAX_SPAN_SECS {
+        WaveRenderRoute::WindowDecode
+    } else {
+        WaveRenderRoute::CoarseProgressive
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct WaveAnalysisRange {
     start_secs: f64,
@@ -504,6 +814,7 @@ impl WaveRasterKey {
 
 #[derive(Clone)]
 pub(crate) struct WaveRaster {
+    pub(crate) revision: u64,
     pub(crate) window_start_secs: f64,
     pub(crate) window_end_secs: f64,
     pub(crate) visible_span_secs: f64,
@@ -600,6 +911,7 @@ pub(crate) struct SeekStripWaveWorker {
     state: Arc<Mutex<WaveSharedState>>,
     cancel: Arc<AtomicBool>,
     latest_request_id: Arc<AtomicU64>,
+    coarse_center_bits: Arc<AtomicU64>,
     next_request_id: AtomicU64,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -615,10 +927,12 @@ impl SeekStripWaveWorker {
         }));
         let cancel = Arc::new(AtomicBool::new(false));
         let latest_request_id = Arc::new(AtomicU64::new(0));
+        let coarse_center_bits = Arc::new(AtomicU64::new(0.0_f64.to_bits()));
         let worker_pending = Arc::clone(&pending);
         let worker_state = Arc::clone(&state);
         let worker_cancel = Arc::clone(&cancel);
         let worker_latest = Arc::clone(&latest_request_id);
+        let worker_coarse_center_bits = Arc::clone(&coarse_center_bits);
         let thread_result = std::thread::Builder::new()
             .name("video-seek-strip-wave".into())
             .spawn(move || {
@@ -634,8 +948,19 @@ impl SeekStripWaveWorker {
                             &worker_state,
                             &worker_cancel,
                             &worker_latest,
+                            &worker_coarse_center_bits,
                             &mut runtime,
                         );
+                        continue;
+                    }
+                    if process_next_coarse_chunk(
+                        &path,
+                        &worker_state,
+                        &worker_cancel,
+                        &worker_latest,
+                        &worker_coarse_center_bits,
+                        &mut runtime,
+                    ) {
                         continue;
                     }
                     if wake_rx.recv().is_err() {
@@ -662,6 +987,7 @@ impl SeekStripWaveWorker {
             state,
             cancel,
             latest_request_id,
+            coarse_center_bits,
             next_request_id: AtomicU64::new(1),
             thread,
         }
@@ -698,6 +1024,13 @@ impl SeekStripWaveWorker {
         }
     }
 
+    pub(crate) fn prioritize_coarse_center(&self, center_time_secs: f64) {
+        if center_time_secs.is_finite() {
+            self.coarse_center_bits
+                .store(center_time_secs.to_bits(), Ordering::Release);
+        }
+    }
+
     pub(crate) fn cancel(&self) {
         self.cancel.store(true, Ordering::Release);
         self.latest_request_id.fetch_add(1, Ordering::AcqRel);
@@ -712,9 +1045,24 @@ impl Drop for SeekStripWaveWorker {
     }
 }
 
+enum CoarseBuildState {
+    Dormant,
+    Building(CoarseWaveform),
+    Unavailable(crate::audio_decode::AudioDecodeOpenError),
+}
+
+#[derive(Clone, Copy)]
+struct ActiveWaveRequest {
+    id: u64,
+    signature: WaveRequestSignature,
+}
+
 struct WaveWorkerRuntime {
     decoder: Option<crate::audio_decode::AudioRangeDecoder>,
     decoder_open_error: Option<crate::audio_decode::AudioDecodeOpenError>,
+    coarse: CoarseBuildState,
+    active_request: Option<ActiveWaveRequest>,
+    next_raster_revision: u64,
     lru: WaveRasterLru,
 }
 
@@ -723,13 +1071,361 @@ impl WaveWorkerRuntime {
         Self {
             decoder: None,
             decoder_open_error: None,
+            coarse: CoarseBuildState::Dormant,
+            active_request: None,
+            next_raster_revision: 1,
             lru: WaveRasterLru::new(WAVE_RASTER_LRU_MAX_ENTRIES),
         }
     }
+
+    fn start_coarse_if_needed(&mut self, duration_secs: f64, visible_span_secs: f64) {
+        if visible_span_secs >= COARSE_BUILD_MIN_SPAN_SECS
+            && matches!(self.coarse, CoarseBuildState::Dormant)
+        {
+            self.coarse = CoarseBuildState::Building(CoarseWaveform::new(duration_secs));
+        }
+    }
+
+    fn coarse(&self) -> Option<&CoarseWaveform> {
+        match &self.coarse {
+            CoarseBuildState::Building(coarse) => Some(coarse),
+            CoarseBuildState::Dormant | CoarseBuildState::Unavailable(_) => None,
+        }
+    }
+
+    fn coarse_mut(&mut self) -> Option<&mut CoarseWaveform> {
+        match &mut self.coarse {
+            CoarseBuildState::Building(coarse) => Some(coarse),
+            CoarseBuildState::Dormant | CoarseBuildState::Unavailable(_) => None,
+        }
+    }
+
+    fn next_raster_revision(&mut self) -> u64 {
+        let revision = self.next_raster_revision;
+        self.next_raster_revision = self.next_raster_revision.wrapping_add(1).max(1);
+        revision
+    }
+}
+
+enum CoarseChunkError {
+    Unavailable(crate::audio_decode::AudioDecodeOpenError),
+    Failed(String),
+    Cancelled,
+}
+
+struct CoarseChunkAnalysis {
+    bins: Vec<WaveformBin>,
+    decode_elapsed: Duration,
+    analyze_elapsed: Duration,
+    discarded_non_audio_streams: usize,
+}
+
+fn analyze_coarse_chunk(
+    path: &Path,
+    chunk_index: usize,
+    duration_secs: f64,
+    cancel: &AtomicBool,
+    runtime: &mut WaveWorkerRuntime,
+) -> Result<CoarseChunkAnalysis, CoarseChunkError> {
+    let chunk_start_secs = chunk_index as f64 * COARSE_CHUNK_SECS;
+    let chunk_end_secs = (chunk_start_secs + COARSE_CHUNK_SECS).min(duration_secs);
+    let window = WaveWindow {
+        start_secs: chunk_start_secs,
+        end_secs: chunk_end_secs,
+        content_start_secs: chunk_start_secs,
+        content_end_secs: chunk_end_secs,
+    };
+    let analysis_range = waveform_analysis_range(window, duration_secs, COARSE_BIN_SECS)
+        .ok_or_else(|| CoarseChunkError::Failed("invalid coarse chunk range".into()))?;
+    if runtime.decoder.is_none() && runtime.decoder_open_error.is_none() {
+        match crate::audio_decode::AudioRangeDecoder::open(path) {
+            Ok(decoder) => runtime.decoder = Some(decoder),
+            Err(error) => runtime.decoder_open_error = Some(error),
+        }
+    }
+    if let Some(error) = runtime.decoder_open_error.as_ref() {
+        return Err(CoarseChunkError::Unavailable(error.clone()));
+    }
+    let decoder = runtime
+        .decoder
+        .as_mut()
+        .ok_or_else(|| CoarseChunkError::Failed("audio decoder unavailable".into()))?;
+    let discarded_non_audio_streams = decoder.discarded_non_audio_streams();
+    let decode_t0 = Instant::now();
+    let decoded = decoder
+        .decode_range_to_stereo_f32(analysis_range.start_secs, analysis_range.end_secs, &|| {
+            cancel.load(Ordering::Acquire)
+        })
+        .map_err(|error| {
+            if error == "cancelled" {
+                CoarseChunkError::Cancelled
+            } else {
+                CoarseChunkError::Failed(error)
+            }
+        })?;
+    let decode_elapsed = decode_t0.elapsed();
+    let analyze_t0 = Instant::now();
+    let analysis = analyze_window_samples(
+        &decoded.stereo_samples,
+        decoded.info.sample_rate,
+        analysis_range.start_secs,
+        chunk_start_secs,
+        chunk_end_secs,
+        COARSE_BIN_SECS,
+        COARSE_CHUNK_SECS,
+        &|| cancel.load(Ordering::Acquire),
+    )
+    .ok_or(CoarseChunkError::Cancelled)?;
+    Ok(CoarseChunkAnalysis {
+        bins: analysis.bins,
+        decode_elapsed,
+        analyze_elapsed: analyze_t0.elapsed(),
+        discarded_non_audio_streams,
+    })
+}
+
+fn record_coarse_chunk_failure(
+    chunk_index: usize,
+    reason: &str,
+    state: &Mutex<WaveSharedState>,
+    latest_request_id: &AtomicU64,
+    coarse_center_bits: &AtomicU64,
+    runtime: &mut WaveWorkerRuntime,
+) {
+    let coarse = runtime
+        .coarse_mut()
+        .expect("selected coarse chunk requires an active build");
+    assert!(
+        coarse.mark_failed(chunk_index),
+        "selected coarse chunk must be unattempted"
+    );
+    let covered_chunks = coarse.coverage.marked_count();
+    let failed_chunks = coarse.failed.marked_count();
+    let total_chunks = coarse.coverage.chunk_count;
+    emit_wave_coarse_chunk_failure(
+        chunk_index,
+        reason,
+        covered_chunks,
+        failed_chunks,
+        total_chunks,
+    );
+    publish_active_coarse_raster(state, latest_request_id, coarse_center_bits, runtime);
+}
+
+fn process_next_coarse_chunk(
+    path: &Path,
+    state: &Mutex<WaveSharedState>,
+    cancel: &AtomicBool,
+    latest_request_id: &AtomicU64,
+    coarse_center_bits: &AtomicU64,
+    runtime: &mut WaveWorkerRuntime,
+) -> bool {
+    if cancel.load(Ordering::Acquire) {
+        return false;
+    }
+    let center_secs = f64::from_bits(coarse_center_bits.load(Ordering::Acquire));
+    let Some(chunk_index) = runtime
+        .coarse()
+        .and_then(|coarse| next_coarse_chunk(&coarse.coverage, &coarse.failed, center_secs))
+    else {
+        return false;
+    };
+    let analysis = match analyze_coarse_chunk(
+        path,
+        chunk_index,
+        runtime.coarse().map_or(0.0, |coarse| coarse.duration_secs),
+        cancel,
+        runtime,
+    ) {
+        Ok(analysis) => analysis,
+        Err(CoarseChunkError::Cancelled) => return true,
+        Err(CoarseChunkError::Unavailable(error)) => {
+            runtime.coarse = CoarseBuildState::Unavailable(error.clone());
+            publish_active_decoder_error(runtime.active_request, state, latest_request_id, &error);
+            return false;
+        }
+        Err(CoarseChunkError::Failed(error)) => {
+            record_coarse_chunk_failure(
+                chunk_index,
+                &error,
+                state,
+                latest_request_id,
+                coarse_center_bits,
+                runtime,
+            );
+            return true;
+        }
+    };
+    let decode_elapsed = analysis.decode_elapsed;
+    let analyze_elapsed = analysis.analyze_elapsed;
+    let discarded_non_audio_streams = analysis.discarded_non_audio_streams;
+    let Some(coarse) = runtime.coarse_mut() else {
+        return false;
+    };
+    if !coarse.apply_chunk(chunk_index, &analysis.bins) {
+        record_coarse_chunk_failure(
+            chunk_index,
+            "coarse chunk composition failed",
+            state,
+            latest_request_id,
+            coarse_center_bits,
+            runtime,
+        );
+        return true;
+    }
+    let covered_chunks = coarse.coverage.marked_count();
+    let failed_chunks = coarse.failed.marked_count();
+    let total_chunks = coarse.coverage.chunk_count;
+    emit_wave_coarse_chunk(
+        chunk_index,
+        decode_elapsed,
+        analyze_elapsed,
+        discarded_non_audio_streams,
+        covered_chunks,
+        failed_chunks,
+        total_chunks,
+    );
+    publish_active_coarse_raster(state, latest_request_id, coarse_center_bits, runtime);
+    true
+}
+
+fn publish_active_decoder_error(
+    active: Option<ActiveWaveRequest>,
+    state: &Mutex<WaveSharedState>,
+    latest_request_id: &AtomicU64,
+    error: &crate::audio_decode::AudioDecodeOpenError,
+) {
+    if let Some(active) = active {
+        publish_decoder_open_error(state, active.id, latest_request_id, error);
+    }
+}
+
+fn publish_active_coarse_raster(
+    state: &Mutex<WaveSharedState>,
+    latest_request_id: &AtomicU64,
+    coarse_center_bits: &AtomicU64,
+    runtime: &mut WaveWorkerRuntime,
+) {
+    let Some(active) = runtime.active_request else {
+        return;
+    };
+    if latest_request_id.load(Ordering::Acquire) != active.id {
+        return;
+    }
+    let visible_center_secs = f64::from_bits(coarse_center_bits.load(Ordering::Acquire));
+    let Some(coarse) = runtime.coarse() else {
+        return;
+    };
+    let visible_covered = coarse_covers_visible(coarse, active.signature, visible_center_secs);
+    let route = decide_wave_render_route(
+        visible_covered,
+        waveform_bin_secs(active.signature.span_secs(), active.signature.pixel_width),
+        active.signature.visible_span_secs(),
+    );
+    if route == WaveRenderRoute::WindowDecode {
+        return;
+    }
+    let Some(window) = waveform_window(
+        active.signature.center_time_secs(),
+        active.signature.duration_secs(),
+        active.signature.span_secs(),
+    ) else {
+        return;
+    };
+    process_coarse_request(
+        active.id,
+        active.signature,
+        window,
+        visible_covered,
+        state,
+        latest_request_id,
+        runtime,
+    );
 }
 
 fn request_is_stale(id: u64, cancel: &AtomicBool, latest_request_id: &AtomicU64) -> bool {
     cancel.load(Ordering::Acquire) || latest_request_id.load(Ordering::Acquire) != id
+}
+
+fn coarse_covers_visible(
+    coarse: &CoarseWaveform,
+    signature: WaveRequestSignature,
+    visible_center_secs: f64,
+) -> bool {
+    waveform_window(
+        visible_center_secs,
+        signature.duration_secs(),
+        signature.visible_span_secs(),
+    )
+    .is_some_and(|window| coarse.covers_span(window.content_start_secs, window.content_end_secs))
+}
+
+fn process_coarse_request(
+    request_id: u64,
+    signature: WaveRequestSignature,
+    window: WaveWindow,
+    visible_covered: bool,
+    state: &Mutex<WaveSharedState>,
+    latest_request_id: &AtomicU64,
+    runtime: &mut WaveWorkerRuntime,
+) {
+    let revision = runtime.next_raster_revision();
+    if let CoarseBuildState::Unavailable(error) = &runtime.coarse {
+        publish_decoder_open_error(state, request_id, latest_request_id, error);
+        return;
+    }
+    let CoarseBuildState::Building(coarse) = &runtime.coarse else {
+        publish_wave_failure(
+            state,
+            request_id,
+            latest_request_id,
+            "coarse waveform unavailable",
+        );
+        return;
+    };
+    let raster = render_coarse_raster(coarse, signature, window, revision);
+    let status = if visible_covered || coarse.is_complete() {
+        WaveWorkerStatus::Idle
+    } else {
+        WaveWorkerStatus::Working
+    };
+    publish_wave_raster(state, request_id, latest_request_id, raster, status);
+}
+
+fn render_coarse_raster(
+    coarse: &CoarseWaveform,
+    signature: WaveRequestSignature,
+    window: WaveWindow,
+    revision: u64,
+) -> Arc<WaveRaster> {
+    let bins = coarse.waveform_bins(window.content_start_secs, window.content_end_secs);
+    let analyzed_spans = coarse.analyzed_spans(window.start_secs, window.end_secs);
+    let (image, _) = crate::ui_music_timeline::render_timeline_row_image(
+        window.start_secs,
+        signature.span_secs(),
+        &bins,
+        Some(&analyzed_spans),
+        signature.pixel_width,
+        signature.pixel_height,
+        0,
+        0,
+        true,
+    );
+    let mut rgba = Vec::with_capacity(image.pixels.len().saturating_mul(4));
+    for pixel in image.pixels {
+        rgba.extend_from_slice(&pixel.to_srgba_unmultiplied());
+    }
+    emit_wave_coarse_serve(coarse, signature);
+    Arc::new(WaveRaster {
+        revision,
+        window_start_secs: window.start_secs,
+        window_end_secs: window.end_secs,
+        visible_span_secs: signature.visible_span_secs(),
+        bin_secs: COARSE_BIN_SECS,
+        width: signature.pixel_width as u32,
+        height: signature.pixel_height as u32,
+        rgba: Arc::new(rgba),
+    })
 }
 
 fn process_wave_request(
@@ -739,10 +1435,16 @@ fn process_wave_request(
     state: &Mutex<WaveSharedState>,
     cancel: &AtomicBool,
     latest_request_id: &AtomicU64,
+    coarse_center_bits: &AtomicU64,
     runtime: &mut WaveWorkerRuntime,
 ) {
     let total_t0 = Instant::now();
     let signature = request.signature;
+    runtime.active_request = Some(ActiveWaveRequest {
+        id: request.id,
+        signature,
+    });
+    runtime.start_coarse_if_needed(signature.duration_secs(), signature.visible_span_secs());
     let Some(window) = waveform_window(
         signature.center_time_secs(),
         signature.duration_secs(),
@@ -757,6 +1459,43 @@ fn process_wave_request(
         return;
     };
     let bin_secs = waveform_bin_secs(signature.span_secs(), signature.pixel_width);
+    let coarse_covers_visible = runtime.coarse().is_some_and(|coarse| {
+        coarse_covers_visible(
+            coarse,
+            signature,
+            f64::from_bits(coarse_center_bits.load(Ordering::Acquire)),
+        )
+    });
+    let route = decide_wave_render_route(
+        coarse_covers_visible,
+        bin_secs,
+        signature.visible_span_secs(),
+    );
+    if route == WaveRenderRoute::CoarseProgressive && runtime.decoder.is_none() {
+        if runtime.decoder_open_error.is_none() {
+            match crate::audio_decode::AudioRangeDecoder::open(path) {
+                Ok(decoder) => runtime.decoder = Some(decoder),
+                Err(error) => runtime.decoder_open_error = Some(error),
+            }
+        }
+        if let Some(error) = runtime.decoder_open_error.clone() {
+            runtime.coarse = CoarseBuildState::Unavailable(error.clone());
+            publish_decoder_open_error(state, request.id, latest_request_id, &error);
+            return;
+        }
+    }
+    if route != WaveRenderRoute::WindowDecode {
+        process_coarse_request(
+            request.id,
+            signature,
+            window,
+            coarse_covers_visible,
+            state,
+            latest_request_id,
+            runtime,
+        );
+        return;
+    }
     let key = WaveRasterKey::new(
         identity.clone(),
         window,
@@ -766,7 +1505,13 @@ fn process_wave_request(
         signature.pixel_height,
     );
     if let Some(raster) = runtime.lru.get(&key) {
-        publish_wave_raster(state, request.id, latest_request_id, raster);
+        publish_wave_raster(
+            state,
+            request.id,
+            latest_request_id,
+            raster,
+            WaveWorkerStatus::Idle,
+        );
         emit_wave_perf(
             "memory_lru",
             Duration::ZERO,
@@ -869,6 +1614,7 @@ fn process_wave_request(
         window.start_secs,
         signature.span_secs(),
         bins,
+        None,
         signature.pixel_width,
         signature.pixel_height,
         0,
@@ -881,6 +1627,7 @@ fn process_wave_request(
         rgba.extend_from_slice(&pixel.to_srgba_unmultiplied());
     }
     let raster = Arc::new(WaveRaster {
+        revision: runtime.next_raster_revision(),
         window_start_secs: window.start_secs,
         window_end_secs: window.end_secs,
         visible_span_secs: signature.visible_span_secs(),
@@ -890,7 +1637,13 @@ fn process_wave_request(
         rgba: Arc::new(rgba),
     });
     runtime.lru.insert(key, Arc::clone(&raster));
-    publish_wave_raster(state, request.id, latest_request_id, raster);
+    publish_wave_raster(
+        state,
+        request.id,
+        latest_request_id,
+        raster,
+        WaveWorkerStatus::Idle,
+    );
     emit_wave_perf(
         source,
         decode_elapsed,
@@ -909,13 +1662,14 @@ fn publish_wave_raster(
     request_id: u64,
     latest_request_id: &AtomicU64,
     raster: Arc<WaveRaster>,
+    status: WaveWorkerStatus,
 ) {
     if latest_request_id.load(Ordering::Acquire) != request_id {
         return;
     }
     let mut shared = lock_recover(state);
     if shared.latest_request_id == request_id {
-        shared.status = WaveWorkerStatus::Idle;
+        shared.status = status;
         shared.raster = Some(raster);
     }
 }
@@ -932,6 +1686,22 @@ fn publish_wave_failure(
     let mut shared = lock_recover(state);
     if shared.latest_request_id == request_id {
         shared.status = WaveWorkerStatus::Failed(error.to_string());
+    }
+}
+
+fn publish_decoder_open_error(
+    state: &Mutex<WaveSharedState>,
+    request_id: u64,
+    latest_request_id: &AtomicU64,
+    error: &crate::audio_decode::AudioDecodeOpenError,
+) {
+    match error {
+        crate::audio_decode::AudioDecodeOpenError::NoAudioTrack => {
+            publish_wave_no_audio_track(state, request_id, latest_request_id);
+        }
+        crate::audio_decode::AudioDecodeOpenError::Failed(error) => {
+            publish_wave_failure(state, request_id, latest_request_id, error);
+        }
     }
 }
 
@@ -994,6 +1764,134 @@ fn emit_wave_perf(
                     serde_json::Value::from(visible_span_secs),
                 ),
                 ("pixel_width", serde_json::Value::from(pixel_width as u64)),
+            ],
+        );
+    }
+}
+
+fn emit_wave_coarse_chunk(
+    chunk_index: usize,
+    decode: Duration,
+    analyze: Duration,
+    discarded_non_audio_streams: usize,
+    covered_chunks: usize,
+    failed_chunks: usize,
+    total_chunks: usize,
+) {
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            stringify!(video_strip),
+            stringify!(wave_coarse_chunk),
+            None,
+            0,
+            &[
+                (stringify!(outcome), serde_json::Value::from("success")),
+                (
+                    stringify!(chunk_index),
+                    serde_json::Value::from(chunk_index as u64),
+                ),
+                (
+                    stringify!(decode_ms),
+                    serde_json::Value::from(decode.as_secs_f64() * 1000.0),
+                ),
+                (
+                    stringify!(analyze_ms),
+                    serde_json::Value::from(analyze.as_secs_f64() * 1000.0),
+                ),
+                (
+                    stringify!(discarded_non_audio_streams),
+                    serde_json::Value::from(discarded_non_audio_streams as u64),
+                ),
+                (
+                    stringify!(covered_chunks),
+                    serde_json::Value::from(covered_chunks as u64),
+                ),
+                (
+                    stringify!(failed_chunks),
+                    serde_json::Value::from(failed_chunks as u64),
+                ),
+                (
+                    stringify!(total_chunks),
+                    serde_json::Value::from(total_chunks as u64),
+                ),
+            ],
+        );
+    }
+}
+
+fn emit_wave_coarse_chunk_failure(
+    chunk_index: usize,
+    reason: &str,
+    covered_chunks: usize,
+    failed_chunks: usize,
+    total_chunks: usize,
+) {
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            stringify!(video_strip),
+            stringify!(wave_coarse_chunk),
+            None,
+            0,
+            &[
+                (stringify!(outcome), serde_json::Value::from("failed")),
+                (
+                    stringify!(chunk_index),
+                    serde_json::Value::from(chunk_index as u64),
+                ),
+                (stringify!(reason), serde_json::Value::from(reason)),
+                (
+                    stringify!(covered_chunks),
+                    serde_json::Value::from(covered_chunks as u64),
+                ),
+                (
+                    stringify!(failed_chunks),
+                    serde_json::Value::from(failed_chunks as u64),
+                ),
+                (
+                    stringify!(total_chunks),
+                    serde_json::Value::from(total_chunks as u64),
+                ),
+            ],
+        );
+    }
+}
+
+fn emit_wave_coarse_serve(coarse: &CoarseWaveform, signature: WaveRequestSignature) {
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            stringify!(video_strip),
+            stringify!(wave_coarse_serve),
+            None,
+            0,
+            &[
+                (
+                    stringify!(coverage_ratio),
+                    serde_json::Value::from(coarse.coverage_ratio()),
+                ),
+                (
+                    stringify!(covered_chunks),
+                    serde_json::Value::from(coarse.coverage.marked_count() as u64),
+                ),
+                (
+                    stringify!(failed_chunks),
+                    serde_json::Value::from(coarse.failed.marked_count() as u64),
+                ),
+                (
+                    stringify!(total_chunks),
+                    serde_json::Value::from(coarse.coverage.chunk_count as u64),
+                ),
+                (
+                    stringify!(complete),
+                    serde_json::Value::from(coarse.is_complete()),
+                ),
+                (
+                    stringify!(raster_span_secs),
+                    serde_json::Value::from(signature.span_secs()),
+                ),
+                (
+                    stringify!(visible_span_secs),
+                    serde_json::Value::from(signature.visible_span_secs()),
+                ),
             ],
         );
     }
@@ -1071,6 +1969,224 @@ mod tests {
         }
     }
 
+    #[test]
+    fn coarse_quantization_round_trip_stays_within_one_u8_step() {
+        assert_eq!(std::mem::size_of::<QuantizedWaveformBin>(), 7);
+        let source = WaveformBin {
+            peak_l: 0.013,
+            rms_l: 0.177,
+            peak_r: 0.501,
+            rms_r: 0.749,
+            band_energy: [0.111, 0.333, 0.901],
+            ..WaveformBin::default()
+        };
+        let restored = dequantize_waveform_bin(quantize_waveform_bin(&source), 12.3, 0.1);
+        let original = [
+            source.peak_l,
+            source.rms_l,
+            source.peak_r,
+            source.rms_r,
+            source.band_energy[0],
+            source.band_energy[1],
+            source.band_energy[2],
+        ];
+        let round_trip = [
+            restored.peak_l,
+            restored.rms_l,
+            restored.peak_r,
+            restored.rms_r,
+            restored.band_energy[0],
+            restored.band_energy[1],
+            restored.band_energy[2],
+        ];
+        for (original, restored) in original.into_iter().zip(round_trip) {
+            assert!((original - restored).abs() <= 1.0 / 255.0);
+        }
+    }
+
+    #[test]
+    fn coarse_chunk_selection_tracks_center_and_coverage_islands() {
+        let mut coverage = CoarseChunkCoverage::new(7);
+        let mut failed = CoarseChunkCoverage::new(7);
+        assert_eq!(next_coarse_chunk(&coverage, &failed, 0.0), Some(0));
+        assert_eq!(next_coarse_chunk(&coverage, &failed, 10_000.0), Some(6));
+        assert_eq!(next_coarse_chunk(&coverage, &failed, 210.0), Some(3));
+        coverage.insert(3);
+        assert_eq!(next_coarse_chunk(&coverage, &failed, 210.0), Some(2));
+        failed.insert(2);
+        assert_eq!(next_coarse_chunk(&coverage, &failed, 210.0), Some(4));
+        for chunk_index in 0..7 {
+            if chunk_index % 2 == 0 {
+                failed.insert(chunk_index);
+            } else {
+                coverage.insert(chunk_index);
+            }
+        }
+        assert_eq!(next_coarse_chunk(&coverage, &failed, 210.0), None);
+    }
+
+    #[test]
+    fn d27_route_order_preserves_window_decode_through_thirty_minutes() {
+        assert_eq!(
+            decide_wave_render_route(true, COARSE_BIN_SECS, 600.0),
+            WaveRenderRoute::Coarse
+        );
+        assert_eq!(
+            decide_wave_render_route(true, COARSE_BIN_SECS - 0.001, 600.0),
+            WaveRenderRoute::WindowDecode
+        );
+        assert_eq!(
+            decide_wave_render_route(false, 0.5, WINDOW_DECODE_MAX_SPAN_SECS),
+            WaveRenderRoute::WindowDecode
+        );
+        assert_eq!(
+            decide_wave_render_route(false, 0.5, WINDOW_DECODE_MAX_SPAN_SECS + 0.001),
+            WaveRenderRoute::CoarseProgressive
+        );
+    }
+
+    #[test]
+    fn coarse_build_starts_at_the_visible_span_threshold_only() {
+        let mut runtime = WaveWorkerRuntime::new();
+        runtime.start_coarse_if_needed(3600.0, COARSE_BUILD_MIN_SPAN_SECS - 0.001);
+        assert!(matches!(&runtime.coarse, CoarseBuildState::Dormant));
+        runtime.start_coarse_if_needed(3600.0, COARSE_BUILD_MIN_SPAN_SECS);
+        assert!(matches!(&runtime.coarse, CoarseBuildState::Building(_)));
+    }
+
+    #[test]
+    fn coarse_coverage_composes_adjacent_chunks_and_keeps_islands_separate() {
+        let mut coverage = CoarseChunkCoverage::new(6);
+        coverage.insert(1);
+        coverage.insert(2);
+        coverage.insert(4);
+        assert_eq!(
+            coverage.analyzed_spans(30.0, 330.0, 360.0),
+            vec![(60.0, 180.0), (240.0, 300.0)]
+        );
+        assert!(coverage.covers_time_span(65.0, 175.0, 360.0));
+        assert!(!coverage.covers_time_span(175.0, 245.0, 360.0));
+    }
+
+    #[test]
+    fn failed_coarse_chunks_finish_selection_without_covering_their_span() {
+        let mut coarse = CoarseWaveform::new(180.0);
+        coarse.coverage.insert(0);
+        assert!(coarse.mark_failed(1));
+        coarse.coverage.insert(2);
+
+        assert!(coarse.is_complete());
+        assert_eq!(
+            next_coarse_chunk(&coarse.coverage, &coarse.failed, 90.0),
+            None
+        );
+        assert!(!coarse.covers_span(60.0, 120.0));
+        assert_eq!(
+            coarse.analyzed_spans(0.0, 180.0),
+            vec![(0.0, 60.0), (120.0, 180.0)]
+        );
+        assert!(coarse.waveform_bins(60.0, 120.0).is_empty());
+    }
+
+    #[test]
+    fn coarse_decoder_unavailable_remains_a_file_global_terminal_state() {
+        let request_id = 1;
+        let signature =
+            WaveRequestSignature::new(90.0, 180.0, 180.0, 180.0, 320, 48).expect("valid signature");
+        let window = waveform_window(90.0, 180.0, 180.0).expect("valid window");
+        let state = Mutex::new(WaveSharedState {
+            latest_request_id: request_id,
+            status: WaveWorkerStatus::Working,
+            raster: None,
+        });
+        let latest_request_id = AtomicU64::new(request_id);
+        let mut runtime = WaveWorkerRuntime::new();
+        runtime.coarse =
+            CoarseBuildState::Unavailable(crate::audio_decode::AudioDecodeOpenError::NoAudioTrack);
+
+        process_coarse_request(
+            request_id,
+            signature,
+            window,
+            false,
+            &state,
+            &latest_request_id,
+            &mut runtime,
+        );
+
+        assert!(matches!(
+            &runtime.coarse,
+            CoarseBuildState::Unavailable(crate::audio_decode::AudioDecodeOpenError::NoAudioTrack)
+        ));
+        assert!(runtime.coarse().is_none());
+        assert_eq!(lock_recover(&state).status, WaveWorkerStatus::NoAudioTrack);
+    }
+
+    #[test]
+    fn coarse_chunk_composition_places_all_bins_in_its_owned_slice() {
+        let mut analyzed = Vec::with_capacity(COARSE_BINS_PER_CHUNK);
+        for offset in 0..COARSE_BINS_PER_CHUNK {
+            analyzed.push(WaveformBin {
+                start_secs: COARSE_CHUNK_SECS + offset as f64 * COARSE_BIN_SECS,
+                duration_secs: COARSE_BIN_SECS,
+                peak_l: 0.25,
+                rms_l: 0.125,
+                peak_r: 0.75,
+                rms_r: 0.5,
+                band_energy: [0.2, 0.3, 0.5],
+                ..WaveformBin::default()
+            });
+        }
+        let mut coarse = CoarseWaveform::new(180.0);
+        assert!(coarse.apply_chunk(1, &analyzed));
+        assert_eq!(coarse.coverage.marked_count(), 1);
+        assert_eq!(coarse.analyzed_spans(0.0, 180.0), vec![(60.0, 120.0)]);
+        let restored = coarse.waveform_bins(0.0, 180.0);
+        assert_eq!(restored.len(), COARSE_BINS_PER_CHUNK);
+        assert!((restored[0].start_secs - 60.0).abs() < 1.0e-9);
+        assert!((restored[0].peak_l - 0.25).abs() <= 1.0 / 255.0);
+    }
+
+    /// The last chunk of a file is short whenever the duration is not a whole number of chunks,
+    /// and the last bin is short whenever it is not a whole number of bins. `apply_chunk` returning
+    /// false marks that chunk as unavailable, so a short tail must still compose successfully.
+    #[test]
+    fn coarse_chunk_composition_survives_a_short_final_chunk() {
+        for duration_secs in [301.0_f64, 300.05, 299.999, 180.0, 61.0] {
+            let chunk_index = coarse_chunk_count(duration_secs) - 1;
+            let chunk_start_secs = chunk_index as f64 * COARSE_CHUNK_SECS;
+            let chunk_end_secs = (chunk_start_secs + COARSE_CHUNK_SECS).min(duration_secs);
+            let window = WaveWindow {
+                start_secs: chunk_start_secs,
+                end_secs: chunk_end_secs,
+                content_start_secs: chunk_start_secs,
+                content_end_secs: chunk_end_secs,
+            };
+            let range = waveform_analysis_range(window, duration_secs, COARSE_BIN_SECS)
+                .unwrap_or_else(|| panic!("no analysis range for duration {duration_secs}"));
+            let frames = ((range.end_secs - range.start_secs) * 48_000.0).ceil() as usize;
+            let samples = vec![0.05_f32; frames * 2];
+            let analysis = analyze_window_samples(
+                &samples,
+                48_000,
+                range.start_secs,
+                chunk_start_secs,
+                chunk_end_secs,
+                COARSE_BIN_SECS,
+                COARSE_CHUNK_SECS,
+                &|| false,
+            )
+            .unwrap_or_else(|| panic!("no analysis for duration {duration_secs}"));
+            let mut coarse = CoarseWaveform::new(duration_secs);
+            assert!(
+                coarse.apply_chunk(chunk_index, &analysis.bins),
+                "final chunk {chunk_index} of duration {duration_secs} failed to compose \
+                 ({} bins produced)",
+                analysis.bins.len()
+            );
+        }
+    }
+
     fn key(name: &str) -> WaveRasterKey {
         WaveRasterKey {
             identity: WaveFileIdentity {
@@ -1089,6 +2205,7 @@ mod tests {
 
     fn raster(value: u8) -> Arc<WaveRaster> {
         Arc::new(WaveRaster {
+            revision: value as u64,
             window_start_secs: 0.0,
             window_end_secs: 1.0,
             visible_span_secs: DEFAULT_WAVEFORM_SPAN_SECS,

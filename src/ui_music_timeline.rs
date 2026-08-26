@@ -369,6 +369,7 @@ fn run_timeline_raster_worker(
             row_start,
             request.row_secs,
             &request.analysis.bins[start_idx..end_idx],
+            None,
             request.key.width_px,
             request.key.waveform_h_px,
             request.key.gap_px,
@@ -955,6 +956,7 @@ pub(crate) fn render_timeline_row_image(
     row_start: f64,
     row_secs: f64,
     bins: &[WaveformBin],
+    analyzed_spans: Option<&[(f64, f64)]>,
     width: usize,
     waveform_h: usize,
     gap_h: usize,
@@ -975,6 +977,27 @@ pub(crate) fn render_timeline_row_image(
         waveform_h,
         egui::Color32::BLACK,
     );
+    if let Some(analyzed_spans) = analyzed_spans {
+        for &(start_secs, end_secs) in analyzed_spans {
+            let visible_start = start_secs.max(row_start);
+            let visible_end = end_secs.min(row_start + row_secs);
+            if visible_end <= visible_start {
+                continue;
+            }
+            let x0 = ((visible_start - row_start) / row_secs) as f32 * width as f32;
+            let x1 = ((visible_end - row_start) / row_secs) as f32 * width as f32;
+            fill_rect_f32(
+                &mut pixels,
+                width,
+                height,
+                x0,
+                0.0,
+                x1,
+                waveform_h as f32,
+                egui::Color32::from_rgb(6, 8, 10),
+            );
+        }
+    }
     let metrics_top = waveform_h + gap_h;
     fill_rect_px(
         &mut pixels,
@@ -987,16 +1010,40 @@ pub(crate) fn render_timeline_row_image(
         egui::Color32::from_rgb(3, 5, 7),
     );
     let center_y = waveform_h as f32 * 0.5;
-    fill_rect_f32(
-        &mut pixels,
-        width,
-        height,
-        0.0,
-        center_y - 0.5,
-        width as f32,
-        center_y + 0.5,
-        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28),
-    );
+    let center_line = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28);
+    match analyzed_spans {
+        None => fill_rect_f32(
+            &mut pixels,
+            width,
+            height,
+            0.0,
+            center_y - 0.5,
+            width as f32,
+            center_y + 0.5,
+            center_line,
+        ),
+        Some(analyzed_spans) => {
+            for &(start_secs, end_secs) in analyzed_spans {
+                let visible_start = start_secs.max(row_start);
+                let visible_end = end_secs.min(row_start + row_secs);
+                if visible_end <= visible_start {
+                    continue;
+                }
+                let x0 = ((visible_start - row_start) / row_secs) as f32 * width as f32;
+                let x1 = ((visible_end - row_start) / row_secs) as f32 * width as f32;
+                fill_rect_f32(
+                    &mut pixels,
+                    width,
+                    height,
+                    x0,
+                    center_y - 0.5,
+                    x1,
+                    center_y + 0.5,
+                    center_line,
+                );
+            }
+        }
+    }
 
     let mut drawn_bins = 0;
     let mut visible_bins = Vec::new();
@@ -2295,5 +2342,16 @@ mod tests {
         // 30..60 の窓 + 前後 3s (KEY_WINDOW/2) パディング → 27..63 くらい。
         assert!(sub.first().unwrap().start_secs <= 27.0);
         assert!(sub.last().unwrap().start_secs >= 60.0);
+    }
+
+    #[test]
+    fn unanalyzed_waveform_columns_are_dark_and_have_no_center_line() {
+        let (image, _) =
+            render_timeline_row_image(0.0, 10.0, &[], Some(&[(0.0, 5.0)]), 10, 6, 0, 0, true);
+        let pixel = |x: usize, y: usize| image.pixels[y * 10 + x];
+        assert_eq!(pixel(2, 1), egui::Color32::from_rgb(6, 8, 10));
+        assert_eq!(pixel(7, 1), egui::Color32::BLACK);
+        assert_ne!(pixel(2, 3), egui::Color32::from_rgb(6, 8, 10));
+        assert_eq!(pixel(7, 3), egui::Color32::BLACK);
     }
 }
