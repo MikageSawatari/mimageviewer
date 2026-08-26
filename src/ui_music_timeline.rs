@@ -951,12 +951,25 @@ fn timeline_bins_for_raster(
 
 // ── row ラスタライズ (ピクセル描画、ワーカースレッドで実行) ──
 
+/// シークストリップの帯としてこの行を描くときの素材情報。音楽ビューは `None` を渡し、
+/// 見た目は従来のまま変わらない。
+pub(crate) struct SeekStripRowStyle<'a> {
+    /// 解析済みの時間範囲。ここから外れた列は「まだ解析していない」として暗く描き、
+    /// 中心線も引かない。無音 (中心線だけが見える) と区別が付く必要がある。
+    pub(crate) analyzed_spans: &'a [(f64, f64)],
+    /// 素材の長さ。0 秒と末尾に境界線を引く。帯は中心固定なので、端へ寄ると窓が素材の
+    /// 外へはみ出す。
+    pub(crate) duration_secs: f64,
+}
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_timeline_row_image(
     row_start: f64,
     row_secs: f64,
     bins: &[WaveformBin],
-    analyzed_spans: Option<&[(f64, f64)]>,
+    // `Some` はシークストリップの帯。粗い列と窓復号の**どちらも** `Some` を渡す。片方だけ
+    // 渡すと、同じ帯なのに中心線の見え方が経路で変わってしまう。`None` は音楽ビューで、
+    // 見た目は従来のまま (raster スナップショットが一致し続ける必要がある)。
+    seek_strip: Option<&SeekStripRowStyle>,
     width: usize,
     waveform_h: usize,
     gap_h: usize,
@@ -977,8 +990,8 @@ pub(crate) fn render_timeline_row_image(
         waveform_h,
         egui::Color32::BLACK,
     );
-    if let Some(analyzed_spans) = analyzed_spans {
-        for &(start_secs, end_secs) in analyzed_spans {
+    if let Some(strip) = seek_strip {
+        for &(start_secs, end_secs) in strip.analyzed_spans {
             let visible_start = start_secs.max(row_start);
             let visible_end = end_secs.min(row_start + row_secs);
             if visible_end <= visible_start {
@@ -1010,8 +1023,7 @@ pub(crate) fn render_timeline_row_image(
         egui::Color32::from_rgb(3, 5, 7),
     );
     let center_y = waveform_h as f32 * 0.5;
-    let center_line = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28);
-    match analyzed_spans {
+    match seek_strip {
         None => fill_rect_f32(
             &mut pixels,
             width,
@@ -1020,10 +1032,16 @@ pub(crate) fn render_timeline_row_image(
             center_y - 0.5,
             width as f32,
             center_y + 0.5,
-            center_line,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28),
         ),
-        Some(analyzed_spans) => {
-            for &(start_secs, end_secs) in analyzed_spans {
+        Some(strip) => {
+            // 帯の中心線は 1 物理ピクセルしかないうえ、`center_y - 0.5 .. center_y + 0.5` は
+            // 2 行に半分ずつ乗るので、音楽ビューと同じ 11% 白では**無音の動画でほぼ見えない**
+            // (利用者報告 2026-08-26)。無音とは「中心線だけが見えている状態」なので、
+            // ここが見えないと無音と未解析の区別も付かない。行境界へ丸めて 1 行を満たし、
+            // 濃さも上げる。
+            let line_top = center_y.floor();
+            for &(start_secs, end_secs) in strip.analyzed_spans {
                 let visible_start = start_secs.max(row_start);
                 let visible_end = end_secs.min(row_start + row_secs);
                 if visible_end <= visible_start {
@@ -1036,15 +1054,34 @@ pub(crate) fn render_timeline_row_image(
                     width,
                     height,
                     x0,
-                    center_y - 0.5,
+                    line_top,
                     x1,
-                    center_y + 0.5,
-                    center_line,
+                    line_top + 1.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170),
+                );
+            }
+            // 素材の先頭と末尾に境界線を引く。ストリップは中心固定なので、端に寄ると窓が
+            // 素材の外へはみ出す。そこを未解析と同じ見た目のままにすると、**末尾より先へ
+            // シークして次の動画へ移ってしまう** (利用者指摘 2026-08-26)。
+            for boundary_secs in [0.0_f64, strip.duration_secs] {
+                if boundary_secs < row_start || boundary_secs > row_start + row_secs {
+                    continue;
+                }
+                let x = ((boundary_secs - row_start) / row_secs) as f32 * width as f32;
+                let x0 = x.floor().clamp(0.0, (width.saturating_sub(1)) as f32);
+                fill_rect_f32(
+                    &mut pixels,
+                    width,
+                    height,
+                    x0,
+                    0.0,
+                    x0 + 1.0,
+                    waveform_h as f32,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200),
                 );
             }
         }
     }
-
     let mut drawn_bins = 0;
     let mut visible_bins = Vec::new();
     for (index, bin) in bins.iter().enumerate() {
@@ -2344,14 +2381,81 @@ mod tests {
         assert!(sub.last().unwrap().start_secs >= 60.0);
     }
 
+    fn strip_style(analyzed: &[(f64, f64)], duration_secs: f64) -> SeekStripRowStyle<'_> {
+        SeekStripRowStyle {
+            analyzed_spans: analyzed,
+            duration_secs,
+        }
+    }
+
+    /// 10x6 の帯では、波形レーンの実体は x=1..8 / y=1..4 (外周 1px は timeline 背景)。
+    /// 窓 [-2, 8) に素材 [0, 5) を置くと、境界は x=2 と x=7、素材内は x=2..7。
+    fn strip_probe() -> egui::ColorImage {
+        let analyzed = [(0.0, 5.0)];
+        let style = strip_style(&analyzed, 5.0);
+        render_timeline_row_image(-2.0, 10.0, &[], Some(&style), 10, 6, 0, 0, true).0
+    }
+
     #[test]
     fn unanalyzed_waveform_columns_are_dark_and_have_no_center_line() {
-        let (image, _) =
-            render_timeline_row_image(0.0, 10.0, &[], Some(&[(0.0, 5.0)]), 10, 6, 0, 0, true);
+        let image = strip_probe();
         let pixel = |x: usize, y: usize| image.pixels[y * 10 + x];
-        assert_eq!(pixel(2, 1), egui::Color32::from_rgb(6, 8, 10));
-        assert_eq!(pixel(7, 1), egui::Color32::BLACK);
-        assert_ne!(pixel(2, 3), egui::Color32::from_rgb(6, 8, 10));
-        assert_eq!(pixel(7, 3), egui::Color32::BLACK);
+        // 素材の中 (解析済み) は僅かに明るい背景 + 中心線。
+        assert_eq!(pixel(4, 1), egui::Color32::from_rgb(6, 8, 10));
+        assert!(
+            pixel(4, 3).r() > 60,
+            "analyzed center line {:?}",
+            pixel(4, 3)
+        );
+        // 素材の外は素の黒のまま、中心線も引かない。無音 (中心線が見える) と区別が付く。
+        assert_eq!(pixel(8, 1), egui::Color32::BLACK);
+        assert_eq!(pixel(8, 3), egui::Color32::BLACK);
+    }
+
+    /// 無音の動画では中心線だけが見える。`center_y +- 0.5` は 2 行に半分ずつ乗るので、
+    /// 音楽ビューと同じ 11% 白では**帯でほぼ見えなかった** (利用者報告 2026-08-26)。
+    /// 行境界へ丸めて 1 行を満たす。音楽ビューの見た目は変えない。
+    #[test]
+    fn seek_strip_center_line_is_far_brighter_than_the_music_view_one() {
+        let strip = strip_probe();
+        let music = render_timeline_row_image(-2.0, 10.0, &[], None, 10, 6, 0, 0, true).0;
+        let strip_line = strip.pixels[3 * 10 + 4];
+        let music_line = music.pixels[3 * 10 + 4];
+        assert!(
+            u32::from(strip_line.r()) >= u32::from(music_line.r()) * 8,
+            "strip center line {strip_line:?} must clearly outshine the music view one {music_line:?}"
+        );
+        // 音楽ビューは 2 行に分かれたまま。ここが変わるとスナップショットが動く。
+        assert_eq!(music.pixels[2 * 10 + 4], music_line);
+    }
+
+    /// 帯は中心固定なので、端へ寄ると窓が素材の外へはみ出す。境界が分からないと、
+    /// **末尾より先へシークして次の動画へ移ってしまう** (利用者指摘 2026-08-26)。
+    #[test]
+    fn seek_strip_marks_the_start_and_end_of_the_material() {
+        let image = strip_probe();
+        let pixel = |x: usize, y: usize| image.pixels[y * 10 + x];
+        let center = pixel(4, 3);
+        for y in 1..5 {
+            for x in [2usize, 7] {
+                assert!(
+                    pixel(x, y).r() > center.r(),
+                    "boundary at ({x},{y}) = {:?} must stand out over the center line {center:?}",
+                    pixel(x, y)
+                );
+            }
+        }
+        // 境界線はレーンの全高に伸びる (中心行だけではない)。
+        assert!(pixel(2, 1).r() > 100 && pixel(2, 4).r() > 100);
+    }
+
+    /// 音楽ビューには境界線を引かない (行は常に素材の内側)。
+    #[test]
+    fn music_view_rows_have_no_material_boundary() {
+        let image = render_timeline_row_image(-2.0, 10.0, &[], None, 10, 6, 0, 0, true).0;
+        for x in 1..9 {
+            let p = image.pixels[1 * 10 + x];
+            assert_eq!(p, egui::Color32::BLACK, "music view x={x} must stay plain");
+        }
     }
 }

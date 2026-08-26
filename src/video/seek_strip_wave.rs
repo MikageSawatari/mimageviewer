@@ -1400,11 +1400,15 @@ fn render_coarse_raster(
 ) -> Arc<WaveRaster> {
     let bins = coarse.waveform_bins(window.content_start_secs, window.content_end_secs);
     let analyzed_spans = coarse.analyzed_spans(window.start_secs, window.end_secs);
+    let strip = crate::ui_music_timeline::SeekStripRowStyle {
+        analyzed_spans: &analyzed_spans,
+        duration_secs: signature.duration_secs(),
+    };
     let (image, _) = crate::ui_music_timeline::render_timeline_row_image(
         window.start_secs,
         signature.span_secs(),
         &bins,
-        Some(&analyzed_spans),
+        Some(&strip),
         signature.pixel_width,
         signature.pixel_height,
         0,
@@ -1610,11 +1614,18 @@ fn process_wave_request(
         .map(|(analysis, range)| &analysis.bins[range.clone()])
         .unwrap_or(&[]);
     let raster_t0 = Instant::now();
+    // 窓復号は窓全体が解析済み。ここで `None` を渡すと音楽ビュー扱いになり、同じ帯なのに
+    // 粗い列の経路と中心線の明るさが変わってしまう。
+    let window_analyzed = [(window.content_start_secs, window.content_end_secs)];
+    let strip = crate::ui_music_timeline::SeekStripRowStyle {
+        analyzed_spans: &window_analyzed,
+        duration_secs: signature.duration_secs(),
+    };
     let (image, _) = crate::ui_music_timeline::render_timeline_row_image(
         window.start_secs,
         signature.span_secs(),
         bins,
-        None,
+        Some(&strip),
         signature.pixel_width,
         signature.pixel_height,
         0,
