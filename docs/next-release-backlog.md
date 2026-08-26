@@ -3327,7 +3327,7 @@ emote-web-log.jsonl`):
   [docs/detached-rework-plan.md](detached-rework-plan.md) §2 (憲法) / BA-7、
   findings-12 D3 (同型の App-global 汚染)。
 
-### 2.22 貼り付け / 新しいフォルダー作成後に、追加項目へカーソル・選択を移す — 専用スレ >>305
+### 2.22 貼り付け / 新しいフォルダー作成後に、追加項目へカーソル・選択を移す — 専用スレ >>305 ✅ 実装済み (2026-08-26、実機確認待ち)
 
 - 出典: 専用スレ >>305 (2026-08-26)。グリッドへ貼り付けたファイルが現在のソート順で
   離れた位置へ入ると、どれが追加されたものか分からなくなるため、エクスプローラーと同様に
@@ -3365,6 +3365,42 @@ emote-web-log.jsonl`):
 - 関連: [shell-file-operations-context-menu-plan.md](shell-file-operations-context-menu-plan.md)
   §7〜§8、`src/ui_dialogs/new_folder.rs`、`App::try_select_after_load`。
 - 規模 / 優先度: 新しいフォルダー側は Small、貼り付け完了結果の取得を含めると Medium / P2。
+
+#### 実装 (2026-08-26)
+
+正本は [post_operation_selection.rs](../src/post_operation_selection.rs) の module doc。
+
+- **新しいフォルダーでカーソルが移らなかった原因**: `reload_current_folder_preserving_override`
+  が `select_after_load` を**無条件で現在の選択に上書き**していた。作成側は先に名前を
+  置いてから再読込を頼むので、使われる前に潰されていた。**名前変更も同じ経路で同じように
+  壊れていた** (報告は無かった)。`preserve_cursor_hint_for_reload` が「既にヒントがあれば
+  触らない」を持つ 1 か所になった。
+- **貼り付けの出力パス**: Shell の背景 `paste` verb に委ねているので mIV は何が作られたか
+  知らない。クリップボードの元名から推測すると、**まさに拾いたい衝突時の改名を取り逃がす**。
+  操作の**直前**に一覧にあったパスを控え、差分を追加項目とみなす方式にした。
+- **型付き要求 1 つ**にまとめた (`select_after_load` へ bool や複数名を足さない):
+
+  | 持ち物 | 効く完了条件 |
+  | --- | --- |
+  | 適用先フォルダ | 3 (操作完了前に別フォルダへ移っても、その一覧を汚さない) |
+  | `ExpectedOutputs::{Known, AddedSince}` | 2 (mIV が作った物と Shell が作った物を同じ扱いにする) |
+  | 表示中の項目だけを渡す入口 | 4 (フィルタを変えず、隠れている出力は待つだけ) |
+  | 前回適用した集合 | 大きい貼り付けで届くたびに選び足し、増えなくなったら手を引く |
+
+  判断は `post_operation_selection::decide` の純関数で、状態遷移をテストで固定した。
+- **選択規則**: 1 件はチェックを付けずカーソルだけ。複数件は全部チェックして表示順の
+  先頭へカーソルと Shift 起点。表示形式・選択方式では変えない。
+- **自動再読込との調停**: `check_external_folder_changes` は要求が生きている間、自前の
+  「元の選択へ戻す」を止める (貼り付けの完了を拾うのはこの再読込なので、放っておくと
+  打ち消し合う)。
+
+#### 残っている穴
+
+**貼り付け中に外部アプリが同じフォルダへ足したファイルと区別できない。**差分方式の
+原理的な限界。消すには貼り付け自体を `IFileOperation` + `IFileOperationProgressSink` へ
+移して実出力を受け取るしかなく、それは
+[shell-file-operations-context-menu-plan.md](shell-file-operations-context-menu-plan.md)
+§7 の残作業 (drop-to-folder の PowerShell 置き換え) と同じ移行になる。
 
 ## 3. 補正 / AI
 
