@@ -1073,9 +1073,11 @@ impl PumpRuntime {
                 if slot.is_none() {
                     *slot = Some(rendered);
                 }
+                self.ui_event_tx.wake_ui();
             }
             Err(std::sync::TryLockError::WouldBlock) => {
                 let init_error = Arc::clone(&self.init_error);
+                let ui_event_tx = self.ui_event_tx.clone();
                 let _ = std::thread::Builder::new()
                     .name("native-video-quarantine-report".to_string())
                     .spawn(move || {
@@ -1084,6 +1086,7 @@ impl PumpRuntime {
                         {
                             *slot = Some(rendered);
                         }
+                        ui_event_tx.wake_ui();
                     });
             }
             Err(std::sync::TryLockError::Poisoned(_)) => {}
@@ -1570,7 +1573,11 @@ mod tests {
         let init_error = Arc::new(Mutex::new(None));
         let channel_fault = Arc::new(AtomicBool::new(false));
         let health = super::super::native_window_health::NativeWindowHealth::new_registered();
-        let (ui_tx, _ui_rx) = super::super::native_output_event_bus(32, Arc::clone(&channel_fault));
+        let (ui_tx, _ui_rx) = super::super::native_output_event_bus(
+            32,
+            Arc::clone(&channel_fault),
+            Arc::new(super::super::VideoUiWake::default()),
+        );
         let config = NativeVideoOutputConfig {
             rect: windows::Win32::Foundation::RECT {
                 left: 0,

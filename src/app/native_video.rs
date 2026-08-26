@@ -4,6 +4,20 @@ use crate::keymap::{
 };
 
 #[cfg(windows)]
+pub(super) fn send_normalize_message_with_wake(
+    tx: &mpsc::Sender<crate::app::normalize::NormalizeMessage>,
+    ui_wake: &crate::video::VideoUiWake,
+    message: crate::app::normalize::NormalizeMessage,
+) -> bool {
+    if tx.send(message).is_ok() {
+        ui_wake.wake();
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VideoAudioEnterSource {
     EguiKey,
@@ -4755,9 +4769,12 @@ impl App {
     ///
     /// 手動 seek (シークバー/J/K/←/→/タイル) は serial 変化で検出して baseline 更新のみに
     /// 切り替え、誤爆 seek を防ぐ (Codex P1 第2ラウンド)。
-    pub(crate) fn tick_native_video_loop_boundary(&mut self, fs_idx: usize) {
+    pub(crate) fn tick_native_video_loop_boundary(
+        &mut self,
+        fs_idx: usize,
+    ) -> Option<std::time::Duration> {
         if self.video_continuous_mode.is_enabled() {
-            return;
+            return None;
         }
         let display_mode = self.settings.video_loop_mode;
         // 早期 return: HUD 表示は CH/BM でも、effective が Off/Full なら何もしない
@@ -4766,14 +4783,14 @@ impl App {
             display_mode,
             crate::settings::VideoLoopMode::Off | crate::settings::VideoLoopMode::Full
         ) {
-            return;
+            return None;
         }
         // Phase 1: player + cache から必要データを snapshot。再生中でなければ何もしない。
         // 一時停止 / scrub 中は baseline だけ最新位置に更新 (Codex P2 第7ラウンド —
         // 一時停止中に境界手前へ scrub すると即ループ開始点へ戻されるのを防ぐ)。
-        let (cur, serial, chapters_owned, is_playing) = {
+        let (cur, serial, chapters_owned, is_playing, speed) = {
             let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
-                return;
+                return None;
             };
             let chapters = player
                 .info()
@@ -4784,11 +4801,12 @@ impl App {
                 player.current_seek_serial(),
                 chapters,
                 player.is_playing(),
+                player.playback_speed(),
             )
         };
         if !is_playing {
             self.last_loop_pos.insert(fs_idx, (cur, serial));
-            return;
+            return None;
         }
 
         // bookmarks は cache 直読み (DB fallback しない)
@@ -4798,7 +4816,7 @@ impl App {
             .filter(|c| c.fs_idx == fs_idx)
         {
             Some(c) => c.bookmarks.clone(),
-            None => return,
+            None => return None,
         };
 
         let chapter_starts = crate::video::decoder::boundary_starts_from_chapters(&chapters_owned);
@@ -4810,7 +4828,7 @@ impl App {
             eff,
             crate::settings::VideoLoopMode::Chapter | crate::settings::VideoLoopMode::Bookmark
         ) {
-            return;
+            return None;
         }
         let starts = match eff {
             crate::settings::VideoLoopMode::Chapter => chapter_starts,
@@ -4818,7 +4836,7 @@ impl App {
             _ => unreachable!(),
         };
         if starts.is_empty() {
-            return;
+            return None;
         }
 
         let (prev_pos, prev_serial) = self
@@ -4832,7 +4850,7 @@ impl App {
         let next_boundary = crate::settings::first_boundary_after(&starts, prev_start);
 
         const LOOP_BOUNDARY_TOL: f64 = 0.020;
-        match crate::settings::decide_boundary_action(
+        let schedule_from = match crate::settings::decide_boundary_action(
             prev_pos,
             prev_serial,
             cur,
@@ -4848,6 +4866,7 @@ impl App {
                     player.set_loop_target_secs(new_target);
                 }
                 self.last_loop_pos.insert(fs_idx, (cur, serial));
+                cur
             }
             crate::settings::BoundaryDecision::Loop { seek_to } => {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
@@ -4858,6 +4877,7 @@ impl App {
                 // seek 後 baseline は seek_to に。次 tick で serial 変化を検出すれば baseline
                 // が再更新される。
                 self.last_loop_pos.insert(fs_idx, (seek_to, serial));
+                seek_to
             }
             crate::settings::BoundaryDecision::Continue => {
                 // 現区間の開始秒 (= prev_start) で loop_target を維持する。
@@ -4867,8 +4887,12 @@ impl App {
                     player.set_loop_target_secs(prev_start);
                 }
                 self.last_loop_pos.insert(fs_idx, (cur, serial));
+                cur
             }
-        }
+        };
+        let schedule_start = crate::settings::start_at(&starts, schedule_from).unwrap_or(0.0);
+        crate::settings::first_boundary_after(&starts, schedule_start)
+            .and_then(|boundary| playback_position_deadline(schedule_from, boundary, speed))
     }
 
     /// 音量ノーマライズ ボタン左クリック (3 状態モデル: Off → ON 化 / OnApplied → OFF 化 /
@@ -5177,10 +5201,14 @@ impl App {
     #[cfg(windows)]
     fn start_normalize_scan_inner(&mut self, fs_idx: usize, was_playing_override: Option<bool>) {
         use crate::video::normalize_types::NormalizeUiState;
-        let (path, was_playing) = match self.fs_cache.get(&fs_idx) {
+        let (path, was_playing, ui_wake) = match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) => {
                 let was_playing = was_playing_override.unwrap_or_else(|| player.intent_playing());
-                (player.path().to_path_buf(), was_playing)
+                (
+                    player.path().to_path_buf(),
+                    was_playing,
+                    player.ui_wake_handle(),
+                )
             }
             _ => return,
         };
@@ -5213,14 +5241,18 @@ impl App {
         let cancel_clone = cancel.clone();
         let progress_clone = progress.clone();
         let path_clone = path.clone();
+        let provisional_ui_wake = Arc::clone(&ui_wake);
         let join = std::thread::Builder::new()
             .name("normalize-scan".to_string())
             .spawn(move || {
                 let tx_provisional = tx.clone();
                 let mut send_provisional =
                     move |result: crate::video::normalize_types::NormalizeResult| {
-                        let _ = tx_provisional
-                            .send(crate::app::normalize::NormalizeMessage::Provisional(result));
+                        send_normalize_message_with_wake(
+                            &tx_provisional,
+                            &provisional_ui_wake,
+                            crate::app::normalize::NormalizeMessage::Provisional(result),
+                        );
                     };
                 let result = crate::video::normalize_scanner::scan_audio_loudness_with_provisional(
                     &path_clone,
@@ -5230,7 +5262,11 @@ impl App {
                     crate::video::normalize_scanner::PROVISIONAL_SCAN_AFTER_SECS,
                     &mut send_provisional,
                 );
-                let _ = tx.send(crate::app::normalize::NormalizeMessage::from(result));
+                send_normalize_message_with_wake(
+                    &tx,
+                    &ui_wake,
+                    crate::app::normalize::NormalizeMessage::from(result),
+                );
             });
         let join = match join {
             Ok(j) => j,

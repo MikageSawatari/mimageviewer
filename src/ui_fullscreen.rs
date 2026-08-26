@@ -11686,7 +11686,7 @@ impl App {
                     .any(|window| window.id == id)
                 {
                     let viewport_id = Self::detached_image_window_viewport_id(id);
-                    self.adopt_deferred_detached_window_hwnd_after_callback(id, viewport_id);
+                    self.adopt_deferred_detached_window_hwnd_after_callback(ctx, id, viewport_id);
                 }
             }
             crate::app::DeferredDetachedImageWindowEvent::Frame {
@@ -11708,7 +11708,7 @@ impl App {
                 };
                 if self.detached_window_hwnd_alive_for_window_id(id).is_none() {
                     let viewport_id = Self::detached_image_window_viewport_id(id);
-                    self.adopt_deferred_detached_window_hwnd_after_callback(id, viewport_id);
+                    self.adopt_deferred_detached_window_hwnd_after_callback(ctx, id, viewport_id);
                 }
                 let window = self.detached_image_windows[window_pos].clone();
                 let window_placement =
@@ -12557,6 +12557,7 @@ impl App {
             });
             #[cfg(windows)]
             self.register_detached_window_hwnd_after_show(
+                ctx,
                 window.id,
                 "passive",
                 viewport_id,
@@ -13408,6 +13409,7 @@ impl App {
             #[cfg(windows)]
             if let Some(window_id) = keep_alive_window_id {
                 self.register_detached_window_hwnd_after_show(
+                    ctx,
                     window_id,
                     "keep_alive_holdover",
                     fs_id,
@@ -13717,6 +13719,7 @@ impl App {
         }
         if let Some(window_id) = backstop_window_id {
             self.register_detached_window_hwnd_after_show(
+                ctx,
                 window_id,
                 "keepalive_backstop",
                 viewport_id,
@@ -15935,6 +15938,7 @@ impl App {
         #[cfg(windows)]
         if let Some(window_id) = active_render_window_id {
             self.register_detached_window_hwnd_after_show(
+                ctx,
                 window_id,
                 "active_render",
                 fs_id,

@@ -1032,6 +1032,7 @@ impl App {
     #[cfg(windows)]
     fn adopt_unclaimed_detached_window_hwnd_after_show(
         &mut self,
+        ctx: &egui::Context,
         window_id: u64,
         label: &'static str,
         viewport_id: egui::ViewportId,
@@ -1057,7 +1058,11 @@ impl App {
                     self.frame_counter,
                     Self::win32_hwnd_debug_state(hwnd)
                 ));
+                let wake_video_resync = self.pending_detached_video_host_resync;
                 self.try_resync_detached_video_host_after_registration(window_id);
+                if wake_video_resync {
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
                 true
             }
             DetachedWindowHwndDiff::NoChange => {
@@ -1827,16 +1832,22 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn repair_detached_window_hwnd_from_watcher(&mut self, window_id: u64, hwnd: u64) -> bool {
+    fn repair_detached_window_hwnd_from_watcher(
+        &mut self,
+        ctx: &egui::Context,
+        window_id: u64,
+        hwnd: u64,
+    ) -> bool {
         if !self.detached_hwnd_is_unclaimed_egui_viewport_for_window(window_id, hwnd) {
             return false;
         }
-        self.repair_detached_window_hwnd_from_watcher_unchecked(window_id, hwnd)
+        self.repair_detached_window_hwnd_from_watcher_unchecked(ctx, window_id, hwnd)
     }
 
     #[cfg(windows)]
     fn repair_detached_window_hwnd_from_watcher_unchecked(
         &mut self,
+        ctx: &egui::Context,
         window_id: u64,
         hwnd: u64,
     ) -> bool {
@@ -1855,13 +1866,18 @@ impl App {
                 .unwrap_or_else(|| "none".to_string()),
             Self::win32_hwnd_debug_state(hwnd)
         ));
+        let wake_video_resync = self.pending_detached_video_host_resync;
         self.try_resync_detached_video_host_after_registration(window_id);
+        if wake_video_resync {
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+        }
         true
     }
 
     #[cfg(all(windows, test))]
     fn repair_detached_window_hwnd_from_watcher_with_snapshot(
         &mut self,
+        ctx: &egui::Context,
         window_id: u64,
         hwnd: u64,
         windows: &[crate::dwm_transitions::ThreadWindowSnapshotEntry],
@@ -1871,7 +1887,7 @@ impl App {
         ) {
             return false;
         }
-        self.repair_detached_window_hwnd_from_watcher_unchecked(window_id, hwnd)
+        self.repair_detached_window_hwnd_from_watcher_unchecked(ctx, window_id, hwnd)
     }
 
     #[cfg(windows)]
@@ -1990,7 +2006,7 @@ impl App {
         for request in self.detached_window_manager.drain_activation_requests() {
             let id = request.window_id;
             if let Some(repair_hwnd) = request.repair_hwnd
-                && !self.repair_detached_window_hwnd_from_watcher(id, repair_hwnd)
+                && !self.repair_detached_window_hwnd_from_watcher(ctx, id, repair_hwnd)
             {
                 let known_hwnd = self.detached_window_hwnd_raw_for_window_id(id);
                 let known_state = self.detached_window_state(id);
@@ -8739,6 +8755,29 @@ fn video_resume_position_for_save(
         player
             .last_displayed_pts_secs()
             .unwrap_or_else(|| player.position())
+    }
+}
+
+fn playback_position_deadline(
+    current_secs: f64,
+    target_secs: f64,
+    playback_speed: f64,
+) -> Option<std::time::Duration> {
+    let remaining = target_secs - current_secs;
+    if !remaining.is_finite() || remaining <= 0.0 {
+        return None;
+    }
+    Some(std::time::Duration::from_secs_f64(
+        remaining / playback_speed.max(crate::video::clock::MIN_PLAYBACK_SPEED),
+    ))
+}
+
+fn merge_repaint_deadline(
+    next: &mut Option<std::time::Duration>,
+    candidate: Option<std::time::Duration>,
+) {
+    if let Some(candidate) = candidate {
+        *next = Some(next.map_or(candidate, |previous| previous.min(candidate)));
     }
 }
 
@@ -37999,13 +38038,19 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn register_detached_window_hwnd_after_show(
         &mut self,
+        ctx: &egui::Context,
         window_id: u64,
         label: &'static str,
         viewport_id: egui::ViewportId,
         before: Option<&[crate::dwm_transitions::ThreadWindowSnapshotEntry]>,
     ) {
         let Some(before) = before else {
-            self.recover_detached_window_hwnd_after_skipped_snapshot(window_id, label, viewport_id);
+            self.recover_detached_window_hwnd_after_skipped_snapshot(
+                ctx,
+                window_id,
+                label,
+                viewport_id,
+            );
             return;
         };
         let Some(main_hwnd) = self.main_hwnd else {
@@ -38032,10 +38077,15 @@ impl App {
                         .unwrap_or_else(|| "none".to_string()),
                     Self::win32_hwnd_debug_state(hwnd)
                 ));
+                let wake_video_resync = self.pending_detached_video_host_resync;
                 self.try_resync_detached_video_host_after_registration(window_id);
+                if wake_video_resync {
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
             }
             DetachedWindowHwndDiff::NoChange => {
                 if self.adopt_unclaimed_detached_window_hwnd_after_show(
+                    ctx,
                     window_id,
                     label,
                     viewport_id,
@@ -38071,6 +38121,7 @@ impl App {
     #[cfg(windows)]
     fn recover_detached_window_hwnd_after_skipped_snapshot(
         &mut self,
+        ctx: &egui::Context,
         window_id: u64,
         label: &'static str,
         viewport_id: egui::ViewportId,
@@ -38104,6 +38155,7 @@ impl App {
             windows::Win32::Foundation::HWND(main_hwnd as *mut _),
         );
         self.adopt_unclaimed_detached_window_hwnd_after_show(
+            ctx,
             window_id,
             label,
             viewport_id,
@@ -39080,6 +39132,7 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn adopt_deferred_detached_window_hwnd_after_callback(
         &mut self,
+        ctx: &egui::Context,
         window_id: u64,
         viewport_id: egui::ViewportId,
     ) {
@@ -39122,7 +39175,11 @@ impl App {
                         .unwrap_or_else(|| "none".to_string()),
                     Self::win32_hwnd_debug_state(hwnd)
                 ));
+                let wake_video_resync = self.pending_detached_video_host_resync;
                 self.try_resync_detached_video_host_after_registration(window_id);
+                if wake_video_resync {
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
             }
             DetachedWindowHwndDiff::NoChange => {
                 self.log_detached_image_window_debug(format!(
@@ -64417,28 +64474,32 @@ impl App {
     /// 音声版)。`poll_video` の入力反映後に呼ぶ。音声はチャプター無しなので Bookmark モード
     /// のみ実効。一時停止 / scrub 中は baseline のみ更新して誤爆 seek を防ぐ。cfg 不問
     /// (音声は egui 経路なので非 Windows でも動く)。
-    pub(crate) fn tick_music_loop_boundary(&mut self, fs_idx: usize) {
+    pub(crate) fn tick_music_loop_boundary(
+        &mut self,
+        fs_idx: usize,
+    ) -> Option<std::time::Duration> {
         if self.video_continuous_mode.is_enabled() {
-            return;
+            return None;
         }
         let starts = self.music_bookmark_starts_for(fs_idx);
         let has_bm = !starts.is_empty();
         let eff =
             crate::settings::effective_loop_mode(self.settings.video_loop_mode, false, has_bm);
         if !matches!(eff, crate::settings::VideoLoopMode::Bookmark) {
-            return;
+            return None;
         }
-        let (cur, serial, is_playing) = match self.fs_cache.get(&fs_idx) {
+        let (cur, serial, is_playing, speed) = match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) => (
                 player.position_secs(),
                 player.current_seek_serial(),
                 player.is_playing(),
+                player.playback_speed(),
             ),
-            _ => return,
+            _ => return None,
         };
         if !is_playing {
             self.last_loop_pos.insert(fs_idx, (cur, serial));
-            return;
+            return None;
         }
         let (prev_pos, prev_serial) = self
             .last_loop_pos
@@ -64449,7 +64510,7 @@ impl App {
         let prev_start = crate::settings::start_at(&starts, prev_pos).unwrap_or(0.0);
         let next_boundary = crate::settings::first_boundary_after(&starts, prev_start);
         const LOOP_BOUNDARY_TOL: f64 = 0.020;
-        match crate::settings::decide_boundary_action(
+        let schedule_from = match crate::settings::decide_boundary_action(
             prev_pos,
             prev_serial,
             cur,
@@ -64464,6 +64525,7 @@ impl App {
                     player.set_loop_target_secs(new_target);
                 }
                 self.last_loop_pos.insert(fs_idx, (cur, serial));
+                cur
             }
             crate::settings::BoundaryDecision::Loop { seek_to } => {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
@@ -64471,14 +64533,19 @@ impl App {
                     player.set_loop_target_secs(seek_to);
                 }
                 self.last_loop_pos.insert(fs_idx, (seek_to, serial));
+                seek_to
             }
             crate::settings::BoundaryDecision::Continue => {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     player.set_loop_target_secs(prev_start);
                 }
                 self.last_loop_pos.insert(fs_idx, (cur, serial));
+                cur
             }
-        }
+        };
+        let schedule_start = crate::settings::start_at(&starts, schedule_from).unwrap_or(0.0);
+        crate::settings::first_boundary_after(&starts, schedule_start)
+            .and_then(|boundary| playback_position_deadline(schedule_from, boundary, speed))
     }
 
     /// 音楽ビューのループモード切替 (L キー / HUD ループボタン)。共有 `video_loop_mode` を
@@ -64662,10 +64729,12 @@ impl App {
         let mut next_repaint: Option<std::time::Duration> = None;
         // 5 秒ごとに動画再生位置を settings に書き戻す (drop 漏れ救済)。
         let now = std::time::Instant::now();
+        const VIDEO_RESUME_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
         let do_save = self
             .video_resume_last_save
-            .map(|t| now.duration_since(t).as_secs_f64() >= 5.0)
+            .map(|t| now.saturating_duration_since(t) >= VIDEO_RESUME_SAVE_INTERVAL)
             .unwrap_or(true);
+        let mut resume_save_playing = false;
         let mut updates: Vec<MediaResumeUpdate> = Vec::new();
 
         // Phase 0: bookmark cache を ensure (Phase 1 / Phase 3 で直読みするため)。
@@ -64794,16 +64863,9 @@ impl App {
                 #[cfg(windows)]
                 player.set_native_text_contrast(native_text_contrast);
                 if let Some(d) = player.tick(ctx) {
-                    let d = if player.is_playing() {
-                        d.min(std::time::Duration::from_millis(16))
-                    } else {
-                        d
-                    };
-                    next_repaint = Some(match next_repaint {
-                        Some(prev) => prev.min(d),
-                        None => d,
-                    });
+                    merge_repaint_deadline(&mut next_repaint, Some(d));
                 }
+                resume_save_playing |= player.is_playing();
                 #[cfg(windows)]
                 if !anime4k_info_was_ready && player.native_video_info_for_anime4k().is_some() {
                     anime4k_info_ready_indices.push(*idx);
@@ -65005,10 +65067,14 @@ impl App {
                 if matches!(self.items.get(*idx), Some(GridItem::Audio(_)))
                     || (video_audio_mode == Some(*idx) && video_audio_vst_idx != Some(*idx))
                 {
-                    self.tick_music_loop_boundary(*idx);
+                    let deadline = self.tick_music_loop_boundary(*idx);
+                    merge_repaint_deadline(&mut next_repaint, deadline);
                 } else {
                     #[cfg(windows)]
-                    self.tick_native_video_loop_boundary(*idx);
+                    {
+                        let deadline = self.tick_native_video_loop_boundary(*idx);
+                        merge_repaint_deadline(&mut next_repaint, deadline);
+                    }
                 }
             }
         }
@@ -65038,13 +65104,19 @@ impl App {
         // 破棄する。
         #[cfg(windows)]
         if let Some(pending) = self.native_video_mode_switch {
-            if std::time::Instant::now() >= pending.deadline {
+            let mode_switch_now = std::time::Instant::now();
+            if mode_switch_now >= pending.deadline {
                 crate::logger::log(format!(
                     "[native-video] placement switch request {} timed out \
                      (no presenter event); clearing pending",
                     pending.request_id
                 ));
                 self.native_video_mode_switch = None;
+            } else {
+                merge_repaint_deadline(
+                    &mut next_repaint,
+                    Some(pending.deadline.saturating_duration_since(mode_switch_now)),
+                );
             }
         }
         #[cfg(windows)]
@@ -65092,17 +65164,21 @@ impl App {
             }
             return;
         }
-        #[cfg(windows)]
-        if native_owner_hwnd != 0 {
-            let pump_interval = std::time::Duration::from_millis(16);
-            next_repaint = Some(match next_repaint {
-                Some(prev) => prev.min(pump_interval),
-                None => pump_interval,
-            });
-        }
         if do_save {
             self.video_resume_last_save = Some(now);
             self.apply_media_resume_updates(updates);
+        }
+        if resume_save_playing {
+            let until_save = if do_save {
+                VIDEO_RESUME_SAVE_INTERVAL
+            } else {
+                self.video_resume_last_save
+                    .map_or(VIDEO_RESUME_SAVE_INTERVAL, |last_save| {
+                        VIDEO_RESUME_SAVE_INTERVAL
+                            .saturating_sub(now.saturating_duration_since(last_save))
+                    })
+            };
+            merge_repaint_deadline(&mut next_repaint, Some(until_save));
         }
         if let Some(d) = next_repaint {
             let d = d.saturating_sub(poll_started.elapsed());

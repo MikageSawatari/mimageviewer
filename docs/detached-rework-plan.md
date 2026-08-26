@@ -1297,6 +1297,27 @@ HUD コマンドをアクティブ化へ変換し、**それ以外の利用者�
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
 
+**2026-08-26 native video の固定16ms repaint pump 撤去 = backlog §1.122
+(ClaudeCode / Codex 双方が完全な Direction A を構造的修正と合意):**
+
+**触った範囲**: [src/app.rs](../src/app.rs) `poll_video` の native presenter 常時 pump、
+[src/video/mod.rs](../src/video/mod.rs) `VideoPlayer::tick` の native 16ms return、native event /
+worker completion wake、CH/BM 境界 deadline、detached host HWND registration / adoption / watcher
+repair 後の ROOT one-shot wake。`find_visible_thread_window_matching_rect`、keep-alive backstop、
+native window pump の focus / placement / epoch reducer は変更しない。
+
+**不変条件**: native event は唯一の `NativeOutputEventSender::send` から
+`request_repaint_of(ViewportId::ROOT)` で起こす。時間・位置で決まる仕事は、それぞれの既存 owner が
+stuck seek / EOF quiet / placement timeout / resume save / preparing HUD / CH-BM境界の正確な残り時間を
+one-shot として返す。host 再親付けは実際の HWND generation 変更だけが起こし、別の
+ParkedLive / detached context を mount・変更しない。準備済み paused native video は予約ゼロ。
+
+**判断理由 (なぜ症状パッチではないか)**: 16msを延長・detached時だけ間引き・viewport paintを
+skipする修正ではなく、入力イベントと期限の所有者を明示して固定 cadence 自体を除去した。
+新規 App bool / Option、時間窓、grace、debounce、retry は無い。EOF の旧「3 tick」は cadence に
+依存しない実時間48msへ意味を固定し、CH/BMは既知境界へ直接起こすので最大16msのovershootも減る。
+host change wake の sibling 非干渉を含む回帰テストで context ownership を固定する。
+
 **2026-08-26 ★固定による items index-space 交換時の viewer/session 所有権調停 =
 backlog §1.125 (ClaudeCode / Codex 双方が構造的修正と合意):**
 

@@ -787,10 +787,10 @@ pub fn default_output_sample_rate() -> Option<u32> {
 /// 音声出力ストリームを起動する。`dsp_bridge` を渡すと audio-pump で VST3 プラグイン
 /// 処理 (チェーン) を挿入する。`is_enabled()=true` かつアクティブスロット
 /// (= bypass=false の Loaded スロット) が 1 個以上のときのみ実行され、それ以外はパススルー。
-pub fn start(
+pub(crate) fn start(
     audio_rx: Receiver<AudioFrame>,
     clock: Arc<AvClock>,
-    engine_event_tx: crossbeam_channel::Sender<crate::video::engine::EngineEvent>,
+    engine_event_tx: crate::video::EngineEventSender,
     engine_state: Arc<AtomicU8>,
     diagnostics: Arc<AudioDiagnostics>,
     #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
@@ -994,7 +994,7 @@ fn run_pump(
     buffer: Arc<Mutex<AudioBuffer>>,
     cancel: Arc<AtomicBool>,
     clock: Arc<AvClock>,
-    engine_event_tx: crossbeam_channel::Sender<crate::video::engine::EngineEvent>,
+    engine_event_tx: crate::video::EngineEventSender,
     engine_state: Arc<AtomicU8>,
     diagnostics: Arc<AudioDiagnostics>,
     audio_tap_command_rx: Receiver<AudioTapCommand>,
@@ -2389,7 +2389,11 @@ mod tests {
         let (audio_tx, audio_rx) = bounded(32);
         let queue_observer = audio_tx.clone();
         let (shutdown_tx, shutdown_rx) = bounded(1);
-        let (event_tx, event_rx) = bounded(64);
+        let (raw_event_tx, event_rx) = bounded(64);
+        let event_tx = crate::video::EngineEventSender::new(
+            raw_event_tx,
+            Arc::new(crate::video::VideoUiWake::default()),
+        );
         let (_tap_tx, tap_rx) = unbounded();
 
         let pump = {

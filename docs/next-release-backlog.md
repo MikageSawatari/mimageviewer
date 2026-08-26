@@ -2087,8 +2087,9 @@ pump が要求する 16ms より短い。**pump だけ消しても周期は 16ms
 pending の間、「フレームが settled になるまで 16ms ごとに見に行く」形。
 pump と違って**連続ではなく 3 回のバースト** (0.3s / 0.3s / 3.8s、計 ≈ 4.4s) だが、
 1 フレームに **2 回**発行している (672 延べ / 343 フレーム)。
-形が同じ (= 条件を poll するための固定間隔 repaint) なので、Direction A をやるなら
-**この 2 つは同じ問題として扱う**。
+形は同じ (= 条件を poll するための固定間隔 repaint) だが、**owner も原因も違う**
+(こちらは動画ではなく「フレームが settled になるの」を待っている) ので、
+憲法 §2 規則 7 に従って **§1.130 として別項目にした**。同じ変更でまとめて直さない。
 
 ⚠ この 343 フレームは §1.129 の修正**後**のログ。atlas rebuild 自体は止まったが、
    **resync 待ちのスピンは別経路として残っている**。
@@ -2141,12 +2142,42 @@ Codex の判断は「**完全な形にしたときだけ**構造的修正」で�
 2. [video/mod.rs](../src/video/mod.rs) `VideoPlayer::tick` の native 経路 —
    再生中 / seek 中は `Some(16ms)`、preparing は `Some(50ms)` を返す
 
+#### Direction A 実装 (2026-08-26、実機再計測待ち)
+
+2 か所の固定16ms注入を両方削除し、`VideoPlayer` が所有する `VideoUiWake` を
+worker / native event funnel と共有した。worker からの wake はすべて
+`request_repaint_of(ViewportId::ROOT)`。新しい detached bool / Option、猶予時間、
+debounce、fallback cadence は追加していない。
+
+| 旧 pump に乗っていた処理 | 置換 |
+| --- | --- |
+| native window の全イベント | 唯一の funnel `NativeOutputEventSender::send` が publish 後に ROOT を即時 wake |
+| video info / engine event / decoder EOF・fatal | 各 worker の publish 成功 / clock state 変更時に ROOT を即時 wake |
+| EOF drain | 旧「3 UI tick」を実時間 **48ms quiet** に変更。quiet 前は既知の media end と観測済み audio/video 残量から消費完了時刻を one-shot、quiet 開始後は残り48msを one-shot |
+| stuck seek | `seek_eof_stuck_since + 1200ms` の残りを one-shot |
+| placement switch timeout | `native_video_mode_switch.deadline` の残りを one-shot |
+| resume 保存 | 実再生中だけ `video_resume_last_save + 5s` を one-shot。paused / idle は予約しない |
+| preparing HUD | Loading / Buffering / 初回 frame 前だけ50ms。Seeking 完了は event、stuck は1200ms deadline |
+| CH/BM loop | 現区間の次境界と playback speed から境界時刻を one-shot。wake 後も既存 prev→cur crossing 判定を通す |
+| normalize scan | provisional / terminal message の mpsc publish 成功時に ROOT を即時 wake |
+| detached host 再親付け | HWND registration / adoption / watcher repair で host generation が変わった事実に対して ROOT を1回 wake |
+| seek-bar hover thumbnail | overlay request 自体は既存 event funnel を通る。App が mutex へ書いた直後と thumbnail worker の terminal publish で ROOT を wake |
+
+監査で表外に見つかった依存も同じ所有境界へ移した: user seek の250ms coalesce、
+既知 duration の再生末尾、video info 到着、engine/audio readiness、decoder EOF / fatal、
+native presenter init fault、thumbnail cache publish。marker thumbnail decode / media navigation /
+native open・source・tile pending 等は、もともと各 owner が独自の completion wake または
+固有 deadline を予約しており、今回削除した2本の pump には依存しないため変更していない。
+
+`maybe_defer_for_main_font_atlas_resync` の16ms spin、その他の `app.rs` 16ms site、tray 50ms、
+detached backstop、native window の focus / placement / epoch 処理は scope 外のまま維持。
+
 #### 残りの優先順 (2026-08-26 時点)
 
-1. **16ms pump のイベント駆動化 (Direction A)** — 上記。
-   12fps は §1.129 で解消済みなので、**応答性の修正ではなく
-   「動画を開いている間ずっと UI スレッドを回し続けない」構造修正**に位置が変わった。
-   先に「6.0ms 周期の他の要求元」を分けないと、pump を消しても周期は下がらない
+1. ~~**16ms pump のイベント駆動化 (Direction A)**~~ ✅ **実装済み (2026-08-26)**。
+   上の「Direction A 実装」節を参照。実機再計測待ち。
+   なお「6.0ms 周期の他の要求元」は残るので、**pump-only の 1084 フレームが消えること**を見る
+   (周期そのものが 16ms になることを期待しない)。残りの固定スピンは §1.130。
 2. **`egui_overlay` (116〜139ms × 2)** — 切替のたびに wgpu device を新規作成している
    (`request_device` 64〜72ms)。presenter 間で device を共有できるかを見る。
    **F12 往復の残りではこれが最大**
@@ -2510,6 +2541,42 @@ mIV は fallback font を 6 系統登録しているので atlas は大きい。
 サイズに比例するなら per-pixel 処理、atlas fill が鋸歯状なら rebuild のスラッシング。
 
 - 規模 \ 優先度: 未知 / P2 (原因が分かるまでは見積もらない)。
+
+### 1.130 font atlas resync 待ちが 16ms 固定でスピンする
+
+- 出典: 2026-08-26、§1.122 の repaint 要求元を分けているときに見つけた。
+  **§1.122 と owner も原因も違う**ので別項目にした (憲法 §2 規則 7)。
+- [`maybe_defer_for_main_font_atlas_resync`](../src/app.rs) は、main font atlas resync が
+  pending の間 `!safety.is_settled()` だと
+  `ctx.request_repaint_after(16ms)` して `false` を返す。
+  つまり「**フレームが settled になるまで 16ms ごとに見に行く**」。
+- 呼び出し元が **2 つ** (`update_early` / `pre_main_ui`) なので、
+  1 フレームに **2 回**発行される。
+
+#### 実測 (2026-08-26、§1.129 修正**後**のログ)
+
+| | 値 |
+| --- | --- |
+| 発火したフレーム | **343 / 1930 (17.8%)** |
+| 延べ発行回数 | 672 (= 1 フレーム 2 回) |
+| 分布 | 連続ではなく **3 回のバースト** (0.3s / 0.3s / 3.8s、計 ≈ 4.4s) |
+
+§1.122 の pump (98.7% を連続で埋める) と違って常時ではないが、
+**atlas rebuild を止めた後でも残っている**ので、§1.129 では消えない別経路。
+
+#### 直し方の見立て (未検証)
+
+`safety` は `placement_pending` / `cloak_or_backdrop_active` / `opening_count` /
+`closing_count` から作られる。これらは**全部、変化したときに知らせられる側の事実**なので、
+ポーリングではなく **settled になったときに resync を flush する**形にできるはず。
+§1.122 の Direction A と同じ機構を使えるならそれに乗せる。
+
+- ⚠ detached 述語 (placement / cloak / opening / closing) に触れるので
+  [detached-rework-plan.md](detached-rework-plan.md) §2 の手続きが必要。
+- ⚠ `d48982e5`「Use conservative font atlas resync」で確定した
+  「stale font atlas で描かない = フォント崩れ回避」のトレードオフを崩さないこと。
+  待ち方を変えるのであって、待たなくするのではない。
+- 規模 \\ 優先度: Small 〜 Medium / P3。
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 

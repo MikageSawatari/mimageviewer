@@ -120,9 +120,14 @@ USER32 read/mutation は行わない。pump が採取する幾何 cursor 座標 
 source-stamped mouse ownership event と、render が返す focus / IME / cursor policy intent だけで
 接続する。cursor auto-hide の状態と `SetCursor` 書き込みは pump が所有する。
 
-`VideoPlayer::tick(_ctx)` は再生制御 / repaint hint / ホバーサムネイル要求のみ扱う。
-フレームの実体描画は native presenter 内のスレッドが行うため、`tick` で受け取る
-`egui::Context` は実質未使用 (互換のため引数だけ残してある)。
+`VideoPlayer::tick(ctx)` は再生制御 / 意味的 deadline / ホバーサムネイル要求を扱う。
+フレームの実体描画は native presenter 内のスレッドが行うため、native 経路では
+フレームレート cadence を返さない。`ctx` は player ごとの `VideoUiWake` に一度結び、
+decoder / audio / native-window / thumbnail worker が状態を publish したとき
+`request_repaint_of(ViewportId::ROOT)` で UI を起こすために使う。時間でしか決まらない処理は
+stuck seek (1200ms)、EOF drain (観測残量の消費時刻 + quiet 48ms)、既知の再生末尾、
+user seek coalesce (250ms)、open 進捗 HUD (50ms) の最短 one-shot だけを返す。
+準備済み・一時停止中の native 動画は periodic repaint を返さない。
 
 ### NativeVideoPlacement と detached viewer
 

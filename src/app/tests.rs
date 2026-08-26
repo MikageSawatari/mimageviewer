@@ -35603,7 +35603,12 @@ mod still_window_mode_key_tests {
         ];
 
         assert!(
-            !app.repair_detached_window_hwnd_from_watcher_with_snapshot(7, 0x9000, &snapshot),
+            !app.repair_detached_window_hwnd_from_watcher_with_snapshot(
+                &egui::Context::default(),
+                7,
+                0x9000,
+                &snapshot,
+            ),
             "watcher repair must not replace a live registered HWND with a geometry-derived one"
         );
         assert_eq!(app.detached_window_hwnd_raw_for_window_id(7), 0x7000);
@@ -35618,7 +35623,11 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         app.transition_detached_window_state(7, DetachedWindowState::ParkedLive, "test_setup");
 
-        assert!(app.repair_detached_window_hwnd_from_watcher_unchecked(7, 0x7000));
+        assert!(app.repair_detached_window_hwnd_from_watcher_unchecked(
+            &egui::Context::default(),
+            7,
+            0x7000,
+        ));
         assert_eq!(
             app.detached_window_state(7),
             Some(DetachedWindowState::ParkedLive),
@@ -35638,7 +35647,12 @@ mod still_window_mode_key_tests {
         ];
 
         assert!(
-            app.repair_detached_window_hwnd_from_watcher_with_snapshot(7, 0x9000, &snapshot),
+            app.repair_detached_window_hwnd_from_watcher_with_snapshot(
+                &egui::Context::default(),
+                7,
+                0x9000,
+                &snapshot,
+            ),
             "watcher repair remains valid when the registered HWND is genuinely stale"
         );
         assert_eq!(app.detached_window_hwnd_raw_for_window_id(7), 0x9000);
@@ -35768,6 +35782,7 @@ mod still_window_mode_key_tests {
         ];
 
         assert!(app.adopt_unclaimed_detached_window_hwnd_after_show(
+            &egui::Context::default(),
             7,
             "active_render",
             App::detached_image_window_viewport_id(7),
@@ -60194,4 +60209,266 @@ fn the_exit_maximized_flag_is_saved_without_touching_the_restore_rect() {
     assert!(app.settings.window_maximized);
     assert_eq!(app.settings.window_pos, Some([100.0, 60.0]));
     assert_eq!(app.settings.window_size, Some([1440.0, 900.0]));
+}
+
+#[cfg(windows)]
+fn install_native_deadline_player(
+    app: &mut App,
+    path: PathBuf,
+    position_secs: f64,
+    duration_secs: f64,
+    playing: bool,
+) -> usize {
+    let idx = app.items.len();
+    app.items.push(GridItem::Video(path.clone()));
+    app.thumbnails.push(ThumbnailState::Pending);
+    let mut player = crate::video::VideoPlayer::disconnected_for_test(path, position_secs);
+    player.configure_native_timing_for_test(position_secs, duration_secs, playing, false);
+    app.fs_cache.insert(
+        idx,
+        FsCacheEntry::Video {
+            player: Box::new(player),
+            load_seq: 0,
+        },
+    );
+    idx
+}
+
+#[cfg(windows)]
+fn repaint_request_probe() -> (
+    egui::Context,
+    std::sync::Arc<std::sync::Mutex<Vec<egui::RequestRepaintInfo>>>,
+) {
+    let ctx = egui::Context::default();
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let requests_cb = std::sync::Arc::clone(&requests);
+    ctx.set_request_repaint_callback(move |info| requests_cb.lock().unwrap().push(info));
+    (ctx, requests)
+}
+
+#[test]
+#[cfg(windows)]
+fn poll_video_schedules_placement_switch_deadline() {
+    let mut app = phase_c_support::setup_app();
+    install_native_deadline_player(
+        &mut app,
+        PathBuf::from(r"C:\clips\placement.mp4"),
+        10.0,
+        30.0,
+        false,
+    );
+    app.native_video_mode_switch = Some(NativeVideoModeSwitchPending {
+        request_id: 7,
+        target_presentation: ViewerPresentation::DetachedWindow,
+        deadline: std::time::Instant::now() + std::time::Duration::from_millis(400),
+        announce_main_hint: false,
+    });
+    let (ctx, requests) = repaint_request_probe();
+
+    app.poll_video(&ctx);
+
+    assert!(requests.lock().unwrap().iter().any(|request| {
+        request.viewport_id == egui::ViewportId::ROOT
+            && request.delay > std::time::Duration::from_millis(300)
+            && request.delay <= std::time::Duration::from_millis(400)
+    }));
+}
+
+#[test]
+#[cfg(windows)]
+fn paused_idle_native_video_poll_schedules_no_periodic_wake() {
+    let mut app = phase_c_support::setup_app();
+    install_native_deadline_player(
+        &mut app,
+        PathBuf::from(r"C:\clips\idle.mp4"),
+        10.0,
+        30.0,
+        false,
+    );
+    let (ctx, requests) = repaint_request_probe();
+
+    app.poll_video(&ctx);
+
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[test]
+#[cfg(windows)]
+fn poll_video_schedules_resume_save_deadline() {
+    let mut app = phase_c_support::setup_app();
+    install_native_deadline_player(
+        &mut app,
+        PathBuf::from(r"C:\clips\resume.mp4"),
+        10.0,
+        30.0,
+        true,
+    );
+    app.video_resume_last_save =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+    let (ctx, requests) = repaint_request_probe();
+
+    app.poll_video(&ctx);
+
+    assert!(requests.lock().unwrap().iter().any(|request| {
+        request.viewport_id == egui::ViewportId::ROOT
+            && request.delay > std::time::Duration::from_millis(2900)
+            && request.delay <= std::time::Duration::from_secs(3)
+    }));
+}
+
+#[test]
+#[cfg(windows)]
+fn normalize_worker_message_wakes_root_viewport() {
+    let mut app = phase_c_support::setup_app();
+    let idx = install_native_deadline_player(
+        &mut app,
+        PathBuf::from(r"C:\clips\normalize.mp4"),
+        10.0,
+        30.0,
+        false,
+    );
+    let (ctx, requests) = repaint_request_probe();
+    let wake = match app.fs_cache.get_mut(&idx) {
+        Some(FsCacheEntry::Video { player, .. }) => {
+            assert_eq!(player.tick(&ctx), None);
+            player.ui_wake_handle()
+        }
+        _ => unreachable!(),
+    };
+    requests.lock().unwrap().clear();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    assert!(native_video::send_normalize_message_with_wake(
+        &tx,
+        &wake,
+        crate::app::normalize::NormalizeMessage::Cancelled,
+    ));
+    assert!(matches!(
+        rx.recv().unwrap(),
+        crate::app::normalize::NormalizeMessage::Cancelled
+    ));
+    assert!(requests.lock().unwrap().iter().any(|request| {
+        request.viewport_id == egui::ViewportId::ROOT && request.delay.is_zero()
+    }));
+}
+
+#[test]
+#[cfg(windows)]
+fn poll_video_schedules_and_detects_chapter_and_bookmark_boundaries() {
+    let mut chapter_app = phase_c_support::setup_app();
+    let chapter_path = PathBuf::from(r"C:\clips\chapters.mp4");
+    let chapter_idx =
+        install_native_deadline_player(&mut chapter_app, chapter_path.clone(), 9.0, 30.0, true);
+    chapter_app.fullscreen_idx = Some(chapter_idx);
+    chapter_app.settings.video_loop_mode = crate::settings::VideoLoopMode::Chapter;
+    chapter_app.fullscreen_video_marker_cache = Some(FullscreenVideoMarkerCache {
+        fs_idx: chapter_idx,
+        path: chapter_path,
+        pin_pts: None,
+        pin_thumbnail: None,
+        pin_thumb_current: false,
+        bookmarks: Vec::new(),
+        bookmark_thumbnails: std::collections::HashMap::new(),
+        chapter_thumbnails: std::collections::HashMap::new(),
+    });
+    let chapter_serial = match chapter_app.fs_cache.get_mut(&chapter_idx) {
+        Some(FsCacheEntry::Video { player, .. }) => {
+            player.set_chapters_for_test(&[0.0, 10.0, 20.0]);
+            player.current_seek_serial()
+        }
+        _ => unreachable!(),
+    };
+    chapter_app
+        .last_loop_pos
+        .insert(chapter_idx, (9.0, chapter_serial));
+    let (chapter_ctx, chapter_requests) = repaint_request_probe();
+    chapter_app.poll_video(&chapter_ctx);
+    assert!(chapter_requests.lock().unwrap().iter().any(|request| {
+        request.viewport_id == egui::ViewportId::ROOT
+            && request.delay > std::time::Duration::from_millis(900)
+            && request.delay <= std::time::Duration::from_secs(1)
+    }));
+    if let Some(FsCacheEntry::Video { player, .. }) = chapter_app.fs_cache.get(&chapter_idx) {
+        player.set_position_for_test(10.01);
+    }
+    let _ = chapter_app.tick_native_video_loop_boundary(chapter_idx);
+    let chapter_serial_after = match chapter_app.fs_cache.get(&chapter_idx) {
+        Some(FsCacheEntry::Video { player, .. }) => player.current_seek_serial(),
+        _ => unreachable!(),
+    };
+    assert!(chapter_serial_after > chapter_serial);
+    drop(chapter_app);
+
+    let mut bookmark_app = phase_c_support::setup_app();
+    let bookmark_path = PathBuf::from(r"C:\clips\bookmarks.flac");
+    let bookmark_idx =
+        install_native_deadline_player(&mut bookmark_app, bookmark_path.clone(), 4.0, 30.0, true);
+    bookmark_app.items[bookmark_idx] = GridItem::Audio(bookmark_path.clone());
+    bookmark_app.fullscreen_idx = Some(bookmark_idx);
+    bookmark_app.settings.video_loop_mode = crate::settings::VideoLoopMode::Bookmark;
+    bookmark_app.music_bookmarks_loaded_for = Some(bookmark_path);
+    bookmark_app.music_bookmarks = vec![
+        crate::video_bookmarks::VideoBookmarkMeta {
+            id: 1,
+            pts_secs: 0.0,
+            title: None,
+        },
+        crate::video_bookmarks::VideoBookmarkMeta {
+            id: 2,
+            pts_secs: 5.0,
+            title: None,
+        },
+        crate::video_bookmarks::VideoBookmarkMeta {
+            id: 3,
+            pts_secs: 10.0,
+            title: None,
+        },
+    ];
+    let bookmark_serial = match bookmark_app.fs_cache.get(&bookmark_idx) {
+        Some(FsCacheEntry::Video { player, .. }) => player.current_seek_serial(),
+        _ => unreachable!(),
+    };
+    bookmark_app
+        .last_loop_pos
+        .insert(bookmark_idx, (4.0, bookmark_serial));
+    let (bookmark_ctx, bookmark_requests) = repaint_request_probe();
+    bookmark_app.poll_video(&bookmark_ctx);
+    assert!(bookmark_requests.lock().unwrap().iter().any(|request| {
+        request.viewport_id == egui::ViewportId::ROOT
+            && request.delay > std::time::Duration::from_millis(900)
+            && request.delay <= std::time::Duration::from_secs(1)
+    }));
+    if let Some(FsCacheEntry::Video { player, .. }) = bookmark_app.fs_cache.get(&bookmark_idx) {
+        player.set_position_for_test(5.01);
+    }
+    let _ = bookmark_app.tick_music_loop_boundary(bookmark_idx);
+    let bookmark_serial_after = match bookmark_app.fs_cache.get(&bookmark_idx) {
+        Some(FsCacheEntry::Video { player, .. }) => player.current_seek_serial(),
+        _ => unreachable!(),
+    };
+    assert!(bookmark_serial_after > bookmark_serial);
+}
+
+#[test]
+#[cfg(windows)]
+fn detached_host_change_wakes_root_without_touching_sibling_context() {
+    let mut app = phase_c_support::setup_app();
+    let (ctx, requests) = repaint_request_probe();
+    app.push_window_context_for_test(&ctx, 99, |sibling| {
+        sibling.fullscreen_idx = Some(23);
+        sibling.detached_viewer_window_id = Some(99);
+    });
+    app.transition_detached_window_state(7, DetachedWindowState::ParkedLive, "test_setup");
+    app.pending_detached_video_host_resync = true;
+
+    assert!(app.repair_detached_window_hwnd_from_watcher_unchecked(&ctx, 7, 0x7000));
+
+    assert!(requests.lock().unwrap().iter().any(|request| {
+        request.viewport_id == egui::ViewportId::ROOT && request.delay.is_zero()
+    }));
+    app.with_window_viewer_context(99, |sibling| {
+        assert_eq!(sibling.fullscreen_idx, Some(23));
+        assert_eq!(sibling.detached_viewer_window_id, Some(99));
+    })
+    .unwrap();
 }

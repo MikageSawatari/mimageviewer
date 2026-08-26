@@ -176,7 +176,11 @@ pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
     let cancel = Arc::new(AtomicBool::new(false));
     let engine_state = Arc::new(AtomicU8::new(state_code::PLAYING));
     let skipped_frame_count = Arc::new(AtomicU64::new(0));
-    let (engine_event_tx, _engine_event_rx) = crossbeam_channel::unbounded();
+    let (raw_engine_event_tx, _engine_event_rx) = crossbeam_channel::unbounded();
+    let engine_event_tx = crate::video::EngineEventSender::new(
+        raw_engine_event_tx,
+        Arc::new(crate::video::VideoUiWake::default()),
+    );
     let dynamic = Arc::new(crate::video::decoder::VideoDynamicState::default());
     let handles = crate::video::decoder::spawn(
         config.path.clone(),
