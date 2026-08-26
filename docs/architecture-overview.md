@@ -185,6 +185,13 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `dwm_transitions.rs` | DWM トランジション抑止 + UI スレッド窓 snapshot (HWND を生成イベントの before/after 差分で同定 = rect 一致捕捉の全廃、BA-1 根治) + 仮想デスクトップ移動 |
 | `app/native_video.rs` | F12 host migration / source-swap / 動画→音声モード enter/exit など、native 動画 presenter と detached 窓の接続層 |
 
+★固定の `snapshot`、評価 filter の一時解除 anchor、Ctrl+S / Ctrl+G 由来の synthetic
+subfolder restore payload は同じ `ViewerContextBundle` の mounted projection に属する。
+live-media fork はこの三者を top-level surface と一緒に複製し、fresh / materialized physical
+context は空から始める。snapshot が `items` を直接交換するときは、位置対応する
+`thumbnails` / `image_metas` と Details の order / prewarm / metadata pending も同じ generation
+境界で交換・失効・再構築する。
+
 BA-1 の不変条件は geometry 非依存の HWND 所有である。detached host 登録は registry 化済みだが、
 キー入力 subclass に rect 選択が残る具体的な仕様違反は
 [v2.8.1 detached 監査](review-v2.8.1/s2-detached.md) に記録されており、後続リワークへ引き継ぐ。

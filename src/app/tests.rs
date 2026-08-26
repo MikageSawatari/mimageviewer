@@ -1142,7 +1142,7 @@ fn metadata_request_bakes_context_identity_across_bundleless_window() {
     );
 }
 
-/// snapshot の退避先は、退避される 6 フィールドと同じ context が持つ。
+/// snapshot の退避先は、退避される 7 フィールドと同じ context が持つ。
 ///
 /// `App::snapshot` が App-global だった頃は、2 つ目の context が snapshot を張ると
 /// 1 つ目の退避を**上書きして復元不能**にしていた。
@@ -1158,9 +1158,47 @@ fn snapshot_test_items(paths: &[&str]) -> Vec<GridItem> {
 fn seed_snapshot_context(app: &mut App, folder: &str, paths: &[&str]) {
     app.items = snapshot_test_items(paths);
     app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+    app.image_metas = vec![None; app.items.len()];
     app.visible_indices = (0..app.items.len()).collect();
     app.current_folder = Some(PathBuf::from(folder));
     app.selected = Some(0);
+}
+
+#[cfg(windows)]
+fn snapshot_subfolder_restore(
+    root: PathBuf,
+) -> crate::app::subfolder_expansion::SubfolderExpansionRestoreState {
+    crate::app::subfolder_expansion::SubfolderExpansionRestoreState {
+        root: Some(root.clone()),
+        roots: vec![root.clone()],
+        saved_folder: Some(root),
+        snapshot: None,
+        removed_paths: Default::default(),
+    }
+}
+
+#[cfg(windows)]
+fn install_snapshot_details_pending(
+    app: &mut App,
+) -> (
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::sync::mpsc::Sender<DetailsMetaEvent>,
+) {
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
+    app.details_meta_pending = Some(DetailsMetaPending {
+        visible_revision: app.details_lazy_visible_revision,
+        selection_target_key: None,
+        normal_target_keys: Default::default(),
+        cancel: std::sync::Arc::clone(&cancel),
+        phase: DetailsMetaPendingPhase::Loading {
+            rx: event_rx,
+            priority_tx,
+        },
+    });
+    app.details_image_dims_state = LazyColumnState::Loading { done: 0, total: 1 };
+    (cancel, event_tx)
 }
 
 #[cfg(windows)]
@@ -1172,6 +1210,203 @@ fn snapshot_item_paths(app: &App) -> Vec<PathBuf> {
             _ => None,
         })
         .collect()
+}
+
+#[test]
+#[cfg(windows)]
+fn rating_filter_suppression_is_owned_by_the_context_that_established_it() {
+    let mut app = phase_c_support::setup_app();
+    let filtered = [false, false, false, false, false, true];
+    app.settings.rating_filter = filtered;
+    seed_snapshot_context(&mut app, "E:/rating-owner", &["E:/rating-owner/a.jpg"]);
+    app.rating_filter_suppressed_at = Some((PathBuf::from("E:/rating-owner"), filtered));
+    assert_eq!(app.effective_rating_filter(), [true; 6]);
+
+    let other = app.build_window_context_for_test(905, |ctx| {
+        seed_snapshot_context(ctx, "E:/rating-sibling", &["E:/rating-sibling/b.jpg"]);
+    });
+    let mounted = app.with_viewer_context(other, |ctx| {
+        assert_eq!(ctx.effective_rating_filter(), filtered);
+        ctx.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        ctx.deactivate_snapshot();
+        assert!(ctx.rating_filter_suppressed_at.is_none());
+    });
+    assert!(mounted.is_ok());
+    assert!(app.rating_filter_suppressed_at.is_some());
+    assert_eq!(app.effective_rating_filter(), [true; 6]);
+}
+
+#[test]
+#[cfg(windows)]
+fn forked_search_snapshots_each_restore_their_own_synthetic_subfolder_fallback() {
+    let mut app = phase_c_support::setup_app();
+    let root = app.tmp.path().join("forked-search-restore");
+    std::fs::create_dir_all(&root).unwrap();
+    let search_path = crate::app::search_results_synthetic_path();
+    seed_snapshot_context(
+        &mut app,
+        search_path.to_string_lossy().as_ref(),
+        &["E:/search/hit.jpg"],
+    );
+    app.global_search.active = true;
+    app.global_search.saved_folder = Some(subfolder_expansion_synthetic_path());
+    app.global_search_subfolder_restore = Some(snapshot_subfolder_restore(root.clone()));
+    app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::GlobalSearch {
+        query: "hit".into(),
+    });
+
+    app.bind_mounted_context_for_test(906);
+    let first = app.fork_mounted_live_media_context(906);
+    app.bind_mounted_context_for_test(907);
+    let second = app.fork_mounted_live_media_context(907);
+    for (position, context_id) in [first, second].into_iter().enumerate() {
+        if position != 0 {
+            // Eliminate the first restore's legacy App-global runtime as an accidental fallback.
+            app.clear_subfolder_expansion_view_state();
+        }
+        let mounted = app.with_viewer_context(context_id, |ctx| {
+            assert!(ctx.global_search_subfolder_restore.is_some());
+            assert!(ctx.top_level_grid_view.take_return_to().is_some());
+            ctx.deactivate_snapshot();
+            assert_eq!(ctx.subfolder_expansion_root.as_ref(), Some(&root));
+        });
+        assert!(mounted.is_ok());
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn dismissing_snapshot_with_owned_return_preserves_unused_search_restore_fallback() {
+    let mut app = phase_c_support::setup_app();
+    let root = app.tmp.path().join("unused-search-restore");
+    std::fs::create_dir_all(&root).unwrap();
+    let search_path = crate::app::search_results_synthetic_path();
+    seed_snapshot_context(
+        &mut app,
+        search_path.to_string_lossy().as_ref(),
+        &["E:/search/hit.jpg"],
+    );
+    app.global_search.active = true;
+    app.global_search.saved_folder = Some(subfolder_expansion_synthetic_path());
+    app.global_search_subfolder_restore = Some(snapshot_subfolder_restore(root));
+    app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::GlobalSearch {
+        query: "hit".into(),
+    });
+
+    let returned = app.dismiss_snapshot_without_restore();
+    assert!(matches!(
+        returned,
+        Some(crate::app::top_level_grid_view::TopLevelGridRestore::SubfolderExpansion(_))
+    ));
+    assert!(app.global_search_subfolder_restore.is_some());
+}
+
+#[test]
+#[cfg(windows)]
+fn snapshot_activate_and_deactivate_keep_image_metas_parallel_to_items() {
+    let mut app = phase_c_support::setup_app();
+    let origin = PathBuf::from("E:/meta-snapshot");
+    app.current_folder = Some(origin.clone());
+    app.items = (0..10)
+        .map(|idx| GridItem::Image(origin.join(format!("page-{idx}.jpg"))))
+        .collect();
+    app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+    app.image_metas = (0..10).map(|idx| Some((100 + idx, 1_000 + idx))).collect();
+    app.visible_indices = vec![4, 9];
+
+    app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+
+    assert_eq!(
+        app.image_metas,
+        vec![Some((104, 1_004)), Some((109, 1_009))]
+    );
+    assert!(matches!(&app.items[0], GridItem::Image(path) if path.ends_with("page-4.jpg")));
+    assert!(matches!(&app.items[1], GridItem::Image(path) if path.ends_with("page-9.jpg")));
+
+    app.current_folder = Some(origin.join("child"));
+    app.items = vec![GridItem::Image(origin.join("child/temporary.jpg"))];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.image_metas = vec![Some((999, 999))];
+    app.visible_indices = vec![0];
+    assert!(app.snapshot_return_to_list_view());
+    assert_eq!(
+        app.image_metas,
+        vec![Some((104, 1_004)), Some((109, 1_009))]
+    );
+
+    app.deactivate_snapshot();
+
+    assert_eq!(app.items.len(), 10);
+    assert_eq!(app.image_metas.len(), 10);
+    for idx in 0..10 {
+        assert!(matches!(
+            &app.items[idx],
+            GridItem::Image(path) if path.ends_with(format!("page-{idx}.jpg"))
+        ));
+        assert_eq!(
+            app.image_metas[idx],
+            Some((100 + idx as i64, 1_000 + idx as i64))
+        );
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn snapshot_swaps_rebuild_details_state_without_color_filter_and_cancel_old_pending() {
+    let mut app = phase_c_support::setup_app();
+    let origin = PathBuf::from("E:/details-snapshot");
+    app.current_folder = Some(origin.clone());
+    app.items = (0..10)
+        .map(|idx| GridItem::Image(origin.join(format!("page-{idx}.jpg"))))
+        .collect();
+    app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+    app.image_metas = vec![None; app.items.len()];
+    app.visible_indices = vec![4, 9];
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.settings.details_sort_key = crate::settings::DetailsSortKey::Toolbar;
+    app.settings.details_show_created = true;
+    app.color_filter.enabled = false;
+    app.details_order = vec![9, 4];
+    app.details_tag_prewarm_indices = vec![9];
+    let (activate_cancel, activate_tx) = install_snapshot_details_pending(&mut app);
+    let activate_generation = app.items_generation;
+
+    app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+
+    assert!(activate_cancel.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(app.details_meta_pending.is_none());
+    assert!(
+        activate_tx
+            .send(DetailsMetaEvent::Finished {
+                generation: activate_generation,
+                failed: 0,
+            })
+            .is_err()
+    );
+    assert_eq!(app.details_order, vec![0, 1]);
+    assert!(app.details_tag_prewarm_indices.is_empty());
+    assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
+
+    app.details_order = vec![1, 0];
+    app.details_tag_prewarm_indices = vec![1];
+    let (deactivate_cancel, deactivate_tx) = install_snapshot_details_pending(&mut app);
+    let deactivate_generation = app.items_generation;
+
+    app.deactivate_snapshot();
+
+    assert!(deactivate_cancel.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(app.details_meta_pending.is_none());
+    assert!(
+        deactivate_tx
+            .send(DetailsMetaEvent::Finished {
+                generation: deactivate_generation,
+                failed: 0,
+            })
+            .is_err()
+    );
+    assert_eq!(app.details_order, vec![4, 9]);
+    assert!(app.details_tag_prewarm_indices.is_empty());
+    assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
 }
 
 #[test]

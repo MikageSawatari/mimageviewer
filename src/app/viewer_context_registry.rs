@@ -790,6 +790,12 @@ pub(in crate::app) struct ViewerContextBundle {
     rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
     page_dims_cache: crate::page_dims::PageDimsCache,
     rating_cache: std::collections::HashMap<usize, u8>,
+    /// 現在の viewer context だけに効く評価 filter の一時解除 anchor。
+    ///
+    /// `effective_rating_filter` と snapshot / folder navigation の restore が同じ
+    /// mounted projection を読み書きする。ここを bundle 外に置くと、別 context の
+    /// snapshot release が owner の suppression を消費し、表示 filter も sibling へ漏れる。
+    rating_filter_suppressed_at: Option<(PathBuf, [bool; 6])>,
     /// App-global な path rating 更新をこの context の idx cache へ反映済みの世代。
     rating_session_write_seen_generation: u64,
     metadata_import_refresh_index: Option<MetadataImportRefreshIndex>,
@@ -865,6 +871,12 @@ pub(in crate::app) struct ViewerContextBundle {
     /// ② 両者が同じフォルダを指していると解除時に他 context の一覧を書き戻した
     /// (監査 A2b の既知の指摘、docs/detached-rework-plan.md §9.5)。
     snapshot: Option<crate::snapshot::SnapshotState>,
+    /// Ctrl+G / Ctrl+S の検索由来 snapshot が synthetic サブ展開へ戻るための fallback。
+    /// search state 自体は App の UI projection だが、この restore payload は snapshot と
+    /// 一緒に fork / mount / retire されなければ sibling の `take()` で失われる。
+    global_search_subfolder_restore:
+        Option<super::subfolder_expansion::SubfolderExpansionRestoreState>,
+    favsearch_subfolder_restore: Option<super::subfolder_expansion::SubfolderExpansionRestoreState>,
     items_are_global_search_view: bool,
     items_are_tag_view: bool,
     items_are_reading_history_view: bool,
@@ -1325,6 +1337,7 @@ impl ViewerContextBundle {
             rotation_cache: std::collections::HashMap::new(),
             page_dims_cache: crate::page_dims::PageDimsCache::default(),
             rating_cache: std::collections::HashMap::new(),
+            rating_filter_suppressed_at: None,
             rating_session_write_seen_generation: 0,
             metadata_import_refresh_index: None,
             current_folder_rating_cache: None,
@@ -1373,6 +1386,8 @@ impl ViewerContextBundle {
             fs_upload_backlog: FsUploadBacklog::new("fs_upload_backlog", fs_upload_backlog_idx),
             top_level_grid_view: top_level_grid_view::TopLevelGridView::default(),
             snapshot: None,
+            global_search_subfolder_restore: None,
+            favsearch_subfolder_restore: None,
             items_are_global_search_view: false,
             items_are_tag_view: false,
             items_are_reading_history_view: false,
@@ -1647,6 +1662,7 @@ impl App {
             rotation_cache,
             page_dims_cache,
             rating_cache,
+            rating_filter_suppressed_at,
             rating_session_write_seen_generation,
             metadata_import_refresh_index,
             current_folder_rating_cache,
@@ -1695,6 +1711,8 @@ impl App {
             fs_upload_backlog,
             top_level_grid_view,
             snapshot,
+            global_search_subfolder_restore,
+            favsearch_subfolder_restore,
             items_are_global_search_view,
             items_are_tag_view,
             items_are_reading_history_view,
@@ -1936,6 +1954,9 @@ impl App {
         swap_field!(fs_upload_backlog);
         swap_field!(top_level_grid_view);
         swap_field!(snapshot);
+        swap_field!(rating_filter_suppressed_at);
+        swap_field!(global_search_subfolder_restore);
+        swap_field!(favsearch_subfolder_restore);
         swap_field!(items_are_global_search_view);
         swap_field!(items_are_tag_view);
         swap_field!(items_are_reading_history_view);
@@ -2159,6 +2180,7 @@ impl App {
             rotation_cache,
             page_dims_cache,
             rating_cache,
+            rating_filter_suppressed_at,
             rating_session_write_seen_generation,
             current_folder_rating_cache,
             current_folder_last_mtime,
@@ -2206,6 +2228,8 @@ impl App {
             fs_upload_backlog,
             top_level_grid_view,
             snapshot,
+            global_search_subfolder_restore,
+            favsearch_subfolder_restore,
             items_are_global_search_view,
             items_are_tag_view,
             items_are_reading_history_view,
@@ -2348,6 +2372,7 @@ impl App {
             rotation_cache,
             page_dims_cache,
             rating_cache,
+            rating_filter_suppressed_at,
             rating_session_write_seen_generation,
             current_folder_rating_cache,
             tags_cache,
@@ -2355,6 +2380,8 @@ impl App {
             current_folder_signature,
             top_level_grid_view,
             snapshot,
+            global_search_subfolder_restore,
+            favsearch_subfolder_restore,
             items_are_global_search_view,
             items_are_tag_view,
             items_are_reading_history_view,
@@ -2625,6 +2652,9 @@ impl App {
         // **作成ポリシーとして明示**しておく (退避だけ相続して surface が Folder に
         // 戻っていると、解除の行き先が無い state になる)。
         detached.snapshot = None;
+        detached.rating_filter_suppressed_at = None;
+        detached.global_search_subfolder_restore = None;
+        detached.favsearch_subfolder_restore = None;
         detached.details_thumb_suppression_applied = false;
         detached.details_order.clear();
         detached.cached_nav_indices = None;

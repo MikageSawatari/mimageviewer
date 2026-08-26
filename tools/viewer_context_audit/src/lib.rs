@@ -114,7 +114,7 @@ const ALLOWLIST_ENTRIES: &[AllowlistEntry] = &[
         file: "src/app/snapshot_ops.rs",
         function: "activate_snapshot",
         rule: Rule::A2b,
-        reason: "Stashes six per-context grid fields into ViewerContextBundle::snapshot, which is itself a bundle field exchanged by swap_viewer_context_bundle. Every value stays inside the mounted context and is restored by deactivate_snapshot in that same context; nothing is transferred to another window or owner. This was a KNOWN_FINDINGS entry while App::snapshot was App-global.",
+        reason: "Stashes seven per-context grid fields into ViewerContextBundle::snapshot, which is itself a bundle field exchanged by swap_viewer_context_bundle. Every value stays inside the mounted context and is restored by deactivate_snapshot in that same context; nothing is transferred to another window or owner. This was a KNOWN_FINDINGS entry while App::snapshot was App-global.",
     },
 ];
 
@@ -198,7 +198,8 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
 ///
 /// The one entry this list carried, `activate_snapshot`, was resolved by making
 /// `snapshot` a `ViewerContextBundle` field. Note the violation itself did **not**
-/// disappear: the function still moves six fields with `mem::replace`. What changed is
+/// disappear: the function still moves six fields with `mem::replace` and takes `zip_nav`.
+/// What changed is
 /// that the destination is now context-owned, so the entry moved to `ALLOWLIST_ENTRIES`
 /// rather than being deleted (deleting it alone would have turned a tracked finding into
 /// an untracked violation).

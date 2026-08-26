@@ -1070,8 +1070,9 @@ R2e の続きの独立ステージ**としてここに記録する (Codex の手
 **守るべき不変条件**: 表示中の `items` と、それを元へ戻す `SnapshotState` は
 **同じ `ViewerContextId` が所有する**。
 
-`activate_snapshot` は `items` / `thumbnails` / `visible_indices` / `scroll_offset_y` /
-`selected` / `zip_nav` の **6 つとも bundle field** を `App::snapshot` へ退避する。ところが
+`activate_snapshot` は `items` / `thumbnails` / `image_metas` / `visible_indices` /
+`scroll_offset_y` / `selected` / `zip_nav` の **7 つとも bundle field** を `App::snapshot` へ
+退避する。ところが
 `App::snapshot` だけが App-global で `swap_viewer_context_bundle` で交換されなかった。
 **表面の `top_level_grid_view` (どの top-level surface を表示中か) は既に per-context** なので、
 「表示は context ごと・取り消しは App 共有」という所有境界の食い違いになっていた。
@@ -1097,7 +1098,8 @@ park 時は `duplicate_for_parked!` (= `items` / `top_level_grid_view` と同ク
   「global でなければならない」までは言えない。**doc コメントが実装より古い**。
 
 **監査の handshake (Codex の指摘で修正)**: `snapshot` を bundle へ移しても
-`activate_snapshot` は 6 field の `mem::replace` のままなので、**A2b は検出され続ける**。
+`activate_snapshot` は 6 field の `mem::replace` + `zip_nav.take()` のままなので、
+**A2b は検出され続ける**。
 KNOWN_FINDINGS から削除するだけだと untracked violation になるので、
 **ALLOWLIST_ENTRIES へ意味を移した** (理由 = 退避先が context 所有になったこと)。
 KNOWN_FINDINGS は空になり、「既知の指摘が存在する前提」の監査テスト 1 本も直した
@@ -1119,12 +1121,11 @@ KNOWN_FINDINGS は空になり、「既知の指摘が存在する前提」の�
 - `deactivating_does_not_restore_another_context_stash_for_the_same_folder`
   — 変異下で main の解除が他 context の `other.jpg` を書き戻し、**実バグをそのまま再現した**
 
-**残した確認事項** (Codex の指摘、本ステージでは未着手):
+**残した確認事項の解決 (2026-08-26)**:
 `rating_filter_suppressed_at` と `favsearch_subfolder_restore` /
-`global_search_subfolder_restore` は App-global のまま snapshot lifecycle と結合している。
-前者は snapshot 解除が無条件に global suppression を解く。後者は dismiss/deactivate が
-global slot を `take()` するため、検索由来 snapshot を fork した場合に先に閉じた側が
-sibling の fallback restore を消費し得る。
+`global_search_subfolder_restore` も `ViewerContextBundle` 所有へ移した。検索 fallback の
+先行 `take()`、`image_metas` と Details index state の交換漏れも同時に、互いを混ぜない
+ownership / index-space 修正として閉じた。判断と変更境界は §11 の同日記録を参照。
 
 ### R2e の現況 (2026-08-25 時点、新しいセッションはここを最初に見る)
 
@@ -1296,6 +1297,32 @@ HUD コマンドをアクティブ化へ変換し、**それ以外の利用者�
 リワークのステージ外から detached 述語 / viewport 経路へ触れた変更をここに残す。
 §2 の適用範囲どおり、ClaudeCode と Codex の双方が「症状パッチではなく構造的修正である」
 ことに合意したものだけが対象。リワーク側は次のステージ設計時にここを読み、整合を取る。
+
+**2026-08-26 ★固定に残っていた context ownership / index-space 同期の補完
+(利用者指定の構造修正、Codex 実装。ClaudeCode review / mutation check 待ち):**
+
+**触った範囲**: [src/app/viewer_context_registry.rs](../src/app/viewer_context_registry.rs) の
+`ViewerContextBundle` mount / fork policy、[src/app/snapshot_ops.rs](../src/app/snapshot_ops.rs) と
+[src/snapshot.rs](../src/snapshot.rs) の snapshot 交換境界、対応する回帰テストと
+viewer-context audit allowlist。detached predicate、viewport / HWND / placement / focus / epoch、
+keep-alive、overlay GPU、grid selection / paste / new-folder は変更しない。
+
+**不変条件**: rating filter の一時解除 anchor と Ctrl+S / Ctrl+G の synthetic subfolder
+restore payload は、それを読み書き・consume する snapshot と同じ `ViewerContextBundle` が所有する。
+live-media fork は snapshot / top-level state と一緒に複製し、fresh / materialized physical context は
+`None` から始める。`dismiss_snapshot_without_restore` は canonical `return_to` がある限り unused
+fallback を `take()` しない。items の直接交換では、位置対応する `image_metas` も capture / swap /
+restore し、generation bump 後に旧 Details metadata worker を cancel、旧 prewarm indices を破棄して、
+最終 `visible_indices` から `details_order` を再構築する。activate と at-origin deactivate の両方向、
+および snapshot list 復帰を同じ規則にする。
+
+**判断理由 (なぜ症状パッチではないか)**: Group A は per-context operation が consume する state の
+owner を既存 bundle の mount / retire 境界へ揃え、Group B は `items` と平行な state を既存の
+capture → swap → generation bump → invalidate → restore lifecycle に参加させた。新しい App-level
+bool / Option、時間窓、delay / debounce / grace / retry / repaint、detached heuristic は追加していない。
+各 mutation (`rating_filter_suppressed_at` を App-global に戻す、search restore の先行 `take()` を戻す、
+`image_metas` subset を外す、Details rebuild を外す) を個別に検出するテストを持つため、§2 の
+所有境界修正であり症状 guard ではない。
 
 **2026-08-26 `ViewerContextBundle` の production Drop 復元
 (ClaudeCode / Codex 双方が既存 ownership 契約の構造的復元と合意):**

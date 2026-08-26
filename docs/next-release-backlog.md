@@ -2498,7 +2498,12 @@ rebuild 後に**新しい HWND が decode した**再配送は**現世代**で s
 
 - 規模 \\ 優先度: Small〜Medium / **P2** (通常操作で到達し、固着する)。
 
-### 1.126 ★固定の items 交換で `image_metas` だけ取り残される — 添字空間の交換漏れ
+### 1.126 ★固定の items 交換で `image_metas` だけ取り残される — 添字空間の交換漏れ ✅ 修正済み (2026-08-26)
+
+- ✅ `SnapshotState` に `saved_image_metas` / `list_view_image_metas` を追加し、visible subset の
+  capture、activate の swap、snapshot list 復帰、at-origin deactivate の restore を
+  `items` / `thumbnails` と同じ位置対応で行う。`visible_indices = [4, 9]` の非連続 subset と
+  元一覧への往復を回帰テストで固定した。
 
 - 出典: 2026-08-26、§1.125 の設計相談中に Codex が発見。
   **§1.125 とは別の症状**なので別項目にした (憲法 §2 規則 7: ついでに直さない)。
@@ -2511,7 +2516,13 @@ rebuild 後に**新しい HWND が decode した**再配送は**現世代**で s
   **「caller 責任」**と明記している ([app.rs:25872](../src/app.rs:25872))。
 - 規模 \\ 優先度: Small / P3 (表示されるメタ情報がずれる。固着はしない)。
 
-### 1.127 ★固定の items 交換後、Details 表示の index state が再構築されない
+### 1.127 ★固定の items 交換後、Details 表示の index state が再構築されない ✅ 修正済み (2026-08-26)
+
+- ✅ items swap 後の generation bump / index queue invalidation に続けて、旧
+  `details_meta_pending` を cancel + receiver drop、`details_tag_prewarm_indices` を clear し、
+  color filter の有無に依存せず最終 `visible_indices` から `details_order` を再構築する。
+  activate / at-origin deactivate の両方向を、color filter OFF と late result rejection を含む
+  回帰テストで固定した。
 
 - 出典: §1.126 と同じ、Codex の指摘 (2026-08-26)。
 - `details_order` / `details_tag_prewarm_indices` / `details_meta_pending` は、
