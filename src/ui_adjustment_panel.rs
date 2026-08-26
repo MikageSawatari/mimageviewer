@@ -12863,6 +12863,11 @@ impl App {
             return;
         };
 
+        // 見開きから入っていると単ページへ倒してあるので `resolve_spread_pair` は Single。
+        // 左右ボタンを出すためのペアは退避から引く。
+        let spread_lr_from_pivot = self.page_edit_spread_pair();
+        // クロージャから `self` を触れないので、押されたページを持ち帰って後で適用する。
+        let mut switch_target_to: Option<usize> = None;
         let spread_pair = self.resolve_spread_pair(fs_root_idx);
         let (fs_idx, spread_lr): (usize, Option<(usize, usize)>) = match spread_pair {
             SpreadPair::Double { left, right } => {
@@ -12872,7 +12877,7 @@ impl App {
                 };
                 (target, Some((left, right)))
             }
-            SpreadPair::Single => (fs_root_idx, None),
+            SpreadPair::Single => (fs_root_idx, spread_lr_from_pivot),
         };
 
         self.maybe_start_local_adjust_render(fs_idx);
@@ -13075,21 +13080,21 @@ impl App {
 
                                         if let Some((left, right)) = spread_lr {
                                             ui.horizontal(|ui| {
-                                                let is_left = self.adjust_spread_target
-                                                    == AdjustSpreadTarget::Left;
+                                                // 倒した後は表示中のページが対象。選択状態も
+                                                // それに合わせる (`adjust_spread_target` は
+                                                // 倒す前の見開き用の値が残ることがある)。
+                                                let is_left = fs_idx == left;
                                                 if ui
                                                     .selectable_label(is_left, "左ページ")
                                                     .clicked()
                                                 {
-                                                    self.adjust_spread_target =
-                                                        AdjustSpreadTarget::Left;
+                                                    switch_target_to = Some(left);
                                                 }
                                                 if ui
                                                     .selectable_label(!is_left, "右ページ")
                                                     .clicked()
                                                 {
-                                                    self.adjust_spread_target =
-                                                        AdjustSpreadTarget::Right;
+                                                    switch_target_to = Some(right);
                                                 }
                                             });
                                             ui.label(
@@ -13311,6 +13316,13 @@ impl App {
             clear_layers,
             effect_requests,
         );
+        // 左右ボタンで対象ページを切り替える。退避は触らないので、ボタンはそのまま
+        // トグルとして使い続けられる (消しゴムの `switch_erase_target_in_spread` と同じ約束)。
+        if let Some(new_idx) = switch_target_to
+            && self.fullscreen_idx != Some(new_idx)
+        {
+            self.enter_page_edit_single_view(new_idx);
+        }
     }
 
     fn draw_bookmark_panel_body(

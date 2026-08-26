@@ -7215,6 +7215,19 @@ impl App {
         }
     }
 
+    /// 編集ツールで倒す前の見開きペア。**倒した後も左右の切り替えを出すために使う。**
+    ///
+    /// 倒した後は `resolve_spread_pair` が Single を返すので、パネルはこちらから引く。
+    /// これが無いと、見開きから入った編集ツールで**片方のページしか触れない**。
+    pub(crate) fn page_edit_spread_pair(&self) -> Option<(usize, usize)> {
+        self.erase_spread_ctx
+            .or(self.conceal_spread_ctx)
+            .or(self.text_spread_ctx)
+            .or(self.export_crop_spread_ctx)
+            .or(self.local_adjust_spread_ctx)
+            .map(|pivot| pivot.pair)
+    }
+
     /// 退避しておいた見開きへ戻す。
     ///
     /// ページ位置は左ページに揃える (`resolve_spread_pair` が同じペアを返すので、
