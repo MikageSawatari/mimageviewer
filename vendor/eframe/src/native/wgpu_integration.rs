@@ -1290,8 +1290,12 @@ fn render_immediate_viewport(
     );
     let viewport_out_ms = t_viewport_out.elapsed().as_secs_f64() * 1000.0;
 
+    // mIV (backlog 1.129): a slow viewport paint that also carries a texture delta is the
+    // shape this bug had -- a whole font atlas re-uploaded every frame because two viewports
+    // disagreed on max_texture_side. Keep the line as the regression signal; a paint that
+    // uploads nothing stays silent.
     let total_ms = t_all.elapsed().as_secs_f64() * 1000.0;
-    if total_ms >= 8.0 {
+    if total_ms >= 8.0 && delta_bytes > 0 {
         egui_wgpu::atlas_diag::log_line(format!(
             "[eframe] immediate_viewport id={} total={total_ms:.1}ms input={input_ms:.1} \
              run={run_ms:.1} set_window={set_window_ms:.1} tessellate={tessellate_ms:.1} \
