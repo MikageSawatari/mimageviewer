@@ -1979,6 +1979,80 @@ probe を render / pump 両スレッドに入れて F12 を 5 回切替えた。
 
 見立ては 3 だが**未確認**。次の測定で 4 分割する。
 
+#### 根本原因 — 16ms repaint pump が「隠れた viewport」前提のまま残っている (2026-08-26、確定)
+
+41ms を最後まで割った結果 (median、144 サンプル):
+
+| 区間 | 値 |
+| --- | --- |
+| `render_fullscreen_viewport` 全体 | 39.5ms |
+| 　`prep_ms` (描画前の処理) | **0.0ms** |
+| 　`closure_ms` (自前の描画コード) | **0.3ms** |
+| 　**`eframe_show_ms`** (`show_viewport_immediate` の内部) | **38.6ms** |
+| `detached_backstop_ms` / `detached_image_windows_ms` / `font_atlas_resync_ms` | 0.0ms |
+
+→ **keep-alive backstop だという見立ては誤り**。描画コードも無関係で、
+実体は **子 viewport の render + present そのもの**。
+
+そして **それを毎フレーム走らせているのが 16ms pump**:
+
+```rust
+// src/app.rs:65106
+if native_owner_hwnd != 0 {
+    let pump_interval = std::time::Duration::from_millis(16);
+    ...
+}
+```
+
+perf の `prev_frame_causes` で裏取り済み — detached 再生中の repaint の
+**123/135 件**、main ウィンドウ再生中は **97/97 件** が
+[app.rs:65123](../src/app.rs:65123) 発。**両モードで同じ pump が回っており、
+違うのは 1 回あたりの値段だけ**。
+
+##### なぜこれが入ったのか (推測ではなく当時の記録)
+
+`5d9bc31d` (2026-05-05, `fix(video): keep UI pumping for native fullscreen input`) が
+[docs/dcomp-native-presenter-integration-plan.md](dcomp-native-presenter-integration-plan.md)
+に残している:
+
+> while a native presenter HWND is active, the UI thread keeps a **lightweight** 16ms
+> repaint pump alive ... This prevents native-window shortcut events such as Escape from
+> sitting in the UI event queue **when the hidden egui fullscreen viewport has no other
+> reason to repaint**.
+
+→ 当時 fullscreen viewport は **hidden** だったので repaint は実際に安かった。
+detached viewer の導入でこの viewport が **表示中の 1864x1132 ウィンドウ**になり、
+**前提だけが失効した**。pump はそのまま。
+
+##### 因果の連鎖 (全部実測済み)
+
+```
+native presenter が生きている間、UI スレッドは 16ms ごとに repaint を要求 (app.rs:65106)
+        ↓  detached だと 1 回の repaint が show_viewport_immediate で 38.6ms
+UI スレッドが ~12fps (周期 85ms) に落ちる
+        ↓  pump スレッドからの cross-thread 同期メッセージは 1 往復 = UI 1 フレーム
+SetFocus 260〜354ms (3〜4 往復) / CreateWindowEx 40ms
+        ↓
+F12 往復 ~950ms のうち約 350ms
+```
+
+**アプリ全体のもたつきでもある** — 別ウィンドウで動画を見ている間、
+メインウィンドウの一覧操作はすべて 12fps で動いている。
+
+##### 修正の方向 (未着手、要合意)
+
+pump の目的は「native window の shortcut event を UI キューに滞留させない」こと。
+現状 **video スレッドは `egui::Context` を持っておらず UI スレッドを起こせない**
+(`src/video/` 内に UI 向け `request_repaint` は無い) ので、定期 poll で代用している。
+
+→ イベント到着時に UI を起こす形 (`Context::request_repaint` は他スレッドから可) にすれば、
+定期 pump 自体をなくせる。
+
+⚠ pump 間隔を伸ばす / detached のときだけ間引く、は症状パッチなので採用しない。
+⚠ detached 述語に触れるので [detached-rework-plan.md](detached-rework-plan.md) §2 の手続きが必要。
+⚠ `show_viewport_immediate` 自体がなぜ黒地の描画で 38.6ms かかるのかは**未解明**。
+   repaint を止めれば頻度は下がるが、単価自体は残る。
+
 #### 次の一手 — 41ms の `pre_grid` の中身
 
 `pg_top` には `selection_info:0.4ms` / `facet:0.3ms` しか出ておらず、**41ms の大半が
