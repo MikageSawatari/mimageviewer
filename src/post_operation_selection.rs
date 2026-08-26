@@ -75,10 +75,6 @@ impl PostOperationSelection {
         }
     }
 
-    pub(crate) fn folder(&self) -> &Path {
-        &self.folder
-    }
-
     /// 適用したことを記録し、次の再読込を待つ期限を延ばす。
     fn note_applied(&mut self, paths: Vec<PathBuf>, now: Instant) {
         self.applied = paths;
