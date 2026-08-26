@@ -2142,7 +2142,7 @@ Codex の判断は「**完全な形にしたときだけ**構造的修正」で�
 2. [video/mod.rs](../src/video/mod.rs) `VideoPlayer::tick` の native 経路 —
    再生中 / seek 中は `Some(16ms)`、preparing は `Some(50ms)` を返す
 
-#### Direction A 実装 (2026-08-26、実機再計測待ち)
+#### Direction A 実装 ✅ (2026-08-26、実機確認済み)
 
 2 か所の固定16ms注入を両方削除し、`VideoPlayer` が所有する `VideoUiWake` を
 worker / native event funnel と共有した。worker からの wake はすべて
@@ -2172,12 +2172,36 @@ native open・source・tile pending 等は、もともと各 owner が独自の 
 `maybe_defer_for_main_font_atlas_resync` の16ms spin、その他の `app.rs` 16ms site、tray 50ms、
 detached backstop、native window の focus / placement / epoch 処理は scope 外のまま維持。
 
+##### 実機確認結果 (2026-08-26)
+
+利用者の動作確認: Escape / F12、末尾停止、全体ループ、CH/BM ループ、
+末尾超えシーク、2x / 0.5x、音量ノーマライズ、ホバーサムネイル、preparing HUD は全て正常。
+
+`--perf-log` の実測比較 (どちらも §1.129 修正後。フルスクリーンが開いている区間だけを集計):
+
+| | 修正前 (15.9s / 5 区間) | 修正後 (120.3s / 17 区間) |
+| --- | --- | --- |
+| **動画を開いている間の UI フレーム** | **121.7 / 秒** | **48.0 / 秒 (−61%)** |
+| pump / deadline だけが理由のフレーム | 1089 (56.4%) | 924 (15.6%) |
+| 30ms 超フレーム | 0 | 23 (うち 17 件は `background_polls`、viewport は 1 件) |
+| `vp_max_tex` / `main_max_tex` | 8192 / 8192 | 8192 / 8192 (§1.129 維持) |
+
+**最も直接的な証拠 — フルスクリーンを開いたまま UI が審るようになった**。
+0.5 秒を超える無描画区間が 65 件、**うち 62 件がフルスクリーン中**で、
+最長 **17.3 秒** (他に 5.0 / 5.0 / 4.4 / 3.7 / 3.2 秒…)。
+修正前は pump が 16ms ごとに repaint を要求していたので、**これは構造上不可能だった**。
+
+残る 924 フレーム (再生中の 4〜11/秒) は `poll_video` 末尾の one-shot deadline 発。
+一定間隔のスピンではなく、一時停止中は 0 件 (上の 17.3 秒の無描画区間がそれ)。
+
+⚠ タスクマネージャーの CPU% では判別できない (どちらも 0% 表示)。
+   判定には perf log のフレーム間隔を見ること。
+
 #### 残りの優先順 (2026-08-26 時点)
 
-1. ~~**16ms pump のイベント駆動化 (Direction A)**~~ ✅ **実装済み (2026-08-26)**。
-   上の「Direction A 実装」節を参照。実機再計測待ち。
-   なお「6.0ms 周期の他の要求元」は残るので、**pump-only の 1084 フレームが消えること**を見る
-   (周期そのものが 16ms になることを期待しない)。残りの固定スピンは §1.130。
+1. ~~**16ms pump のイベント駆動化 (Direction A)**~~ ✅ **実装・実機確認済み (2026-08-26)**。
+   上の「Direction A 実装」節を参照。動画を開いている間の UI フレームが 121.7/秒 → 48.0/秒。
+   残りの固定スピンは §1.130。
 2. **`egui_overlay` (116〜139ms × 2)** — 切替のたびに wgpu device を新規作成している
    (`request_device` 64〜72ms)。presenter 間で device を共有できるかを見る。
    **F12 往復の残りではこれが最大**
