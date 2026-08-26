@@ -19,6 +19,9 @@ on:
     branches: [main, master]
   pull_request:
     branches: [main, master]
+  # 手動実行。push イベントが取りこぼされたときに、同じゲートを同じ ref で回せる
+  # (2026-08-27: 244 コミットの push が run を 1 つも作らなかった)。
+  workflow_dispatch:
 
 # 同じブランチで新しい push が来たら古い実行をキャンセル (無料枠の節約 + 高速化)
 concurrency:

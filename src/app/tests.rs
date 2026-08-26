@@ -49239,6 +49239,107 @@ mod still_window_mode_key_tests {
         }));
     }
 
+    /// Regression for backlog §1.131: while ParkedLive, the seek strip asked the presenter for its
+    /// own window from the draw path and the classifier read that as a HUD click, so the video
+    /// window took the foreground back 13ms after the user activated a different one. Renderer-,
+    /// worker- and lifecycle-produced events must never request activation, and the classifier is
+    /// exhaustive so a new event cannot join them by default.
+    #[test]
+    #[cfg(windows)]
+    fn parked_live_renderer_emitted_events_do_not_request_activation() {
+        use crate::video::NativeVideoOutputEvent as Ev;
+        use crate::video::seek_strip::{SeekStripCenter, SeekStripCloseCause};
+
+        // The event the user hit: emitted whenever the strip layout key changes, with no click.
+        assert!(
+            !App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::RequestSeekStripWindow {
+                    center: SeekStripCenter::Thumbnails { center_index: 0.0 },
+                    visible_count: 10,
+                    pixel_width: 1752,
+                    pixel_height: 141,
+                }
+            )
+        );
+
+        // The strip closes itself from the draw path whenever the HUD is not visible. Only the
+        // three causes the user actually asks for count as a dismissal.
+        for cause in [
+            SeekStripCloseCause::HudHidden,
+            SeekStripCloseCause::VideoChanged,
+            SeekStripCloseCause::FullscreenExit,
+            SeekStripCloseCause::TileModeOpened,
+            SeekStripCloseCause::Unavailable,
+        ] {
+            assert!(
+                !App::native_video_output_event_is_parked_live_hud_click_activation(
+                    &Ev::CloseSeekStrip { cause }
+                ),
+                "{cause:?} is not a user dismissal"
+            );
+        }
+        for cause in [
+            SeekStripCloseCause::Toggle,
+            SeekStripCloseCause::DownwardDrag,
+            SeekStripCloseCause::Escape,
+        ] {
+            assert!(
+                App::native_video_output_event_is_parked_live_hud_click_activation(
+                    &Ev::CloseSeekStrip { cause }
+                ),
+                "{cause:?} is a user dismissal"
+            );
+        }
+
+        // Worker completions and commit notifications arrive on their own schedule.
+        assert!(
+            !App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::Anime4kMeasurementCompleted(Err("failed".to_string()))
+            )
+        );
+        assert!(
+            !App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::VideoScaleSettingsCommitted {
+                    filter: crate::settings::VideoScaleFilter::default(),
+                    smoothing_percent: 50,
+                    anime4k_variant: None,
+                    toast: None,
+                }
+            )
+        );
+
+        // The VST panel reports its position both after a drag and after an automatic clamp. The
+        // drag already requests activation through the left-button path, so this must not.
+        assert!(
+            !App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::SetVst3PanelPos { pos: [12.0, 34.0] }
+            )
+        );
+        assert!(
+            !App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::SetVst3PanelVisible { visible: true }
+            )
+        );
+
+        // A touch that teaches the chrome gesture is still the user acting.
+        assert!(
+            App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::TouchChromeLearned
+            )
+        );
+        // So is every deliberate strip operation.
+        assert!(
+            App::native_video_output_event_is_parked_live_hud_click_activation(&Ev::OpenSeekStrip)
+        );
+        assert!(
+            App::native_video_output_event_is_parked_live_hud_click_activation(
+                &Ev::CommitSeekStrip {
+                    center: SeekStripCenter::Thumbnails { center_index: 4.0 },
+                }
+            )
+        );
+    }
+
     #[test]
     #[cfg(windows)]
     fn parked_live_native_hud_commands_request_activation_only() {

@@ -1178,6 +1178,76 @@ fn changelog_markdown_dark() {
     );
 }
 
+/// 実データの長さの絶対パスが複数候補で並ぶ場合。コピー元セレクタは折り返さないので、
+/// ここが伸びるとモーダルがウィンドウの外へ出て、両端の文字が読めなくなる
+/// (2026-08-26 の実機報告)。既存の `content_restore_prompt_light` は短いパスしか
+/// 持っていなかったので、この形を通していなかった。
+#[test]
+fn content_restore_prompt_long_paths() {
+    use mimageviewer::ui_dialogs::content_restore::{
+        ContentRestoreUiRow, ContentRestoreUiSource, render_content_restore_modal,
+    };
+
+    let long_sources: Vec<ContentRestoreUiSource> = [
+        r"h:/home/mimageviewer_old/testimage/y/chatgpt image 2026-06-07 15_49_45 (2).png",
+        r"h:/home/mimageviewer_old/testimage/x2/y/chatgpt image 2026-06-07 15_49_45 (2).png",
+        r"h:/home/mimageviewer_old/testimage/xxx/chatgpt image 2026-06-07 15_49_45 (2).png",
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, path)| ContentRestoreUiSource {
+        path: path.to_string(),
+        source_exists: index % 2 == 0,
+    })
+    .collect();
+
+    let mut rows = vec![
+        ContentRestoreUiRow {
+            file_name: "chatgpt image 2026-06-07 15_49_45 (2).png".to_string(),
+            selected: true,
+            source_index: 0,
+            sources: long_sources,
+        },
+        ContentRestoreUiRow {
+            file_name: "avif_Mexico - コピー2.avif".to_string(),
+            selected: true,
+            source_index: 0,
+            sources: vec![ContentRestoreUiSource {
+                path: r"h:/home/mimageviewer_old/testimage/photo/avif_Mexico.avif".to_string(),
+                source_exists: true,
+            }],
+        },
+    ];
+    let mut dont_ask_again = false;
+    let mut fonts_ready = false;
+    const WINDOW_SIZE: egui::Vec2 = egui::vec2(980.0, 600.0);
+    let mut harness = Harness::builder().with_size(WINDOW_SIZE).build(move |ctx| {
+        mimageviewer::os_theme::apply_resolved(ctx, mimageviewer::os_theme::ResolvedTheme::Light);
+        if !fonts_ready {
+            install_app_fonts(ctx);
+            fonts_ready = true;
+            ctx.request_repaint();
+            return;
+        }
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("画像一覧");
+        });
+        let _ = render_content_restore_modal(ctx, &mut rows, &mut dont_ask_again);
+    });
+    harness.run();
+    let modal = harness
+        .ctx
+        .memory(|m| m.area_rect(egui::Id::new("content_restore_modal")))
+        .expect("the modal has to be on screen");
+    assert!(
+        modal.width() <= WINDOW_SIZE.x,
+        "モーダルがウィンドウ ({}px) からはみ出している: {}px",
+        WINDOW_SIZE.x,
+        modal.width()
+    );
+    harness.snapshot("content_restore_prompt_long_paths");
+}
+
 #[test]
 fn content_restore_prompt_light() {
     use mimageviewer::ui_dialogs::content_restore::{

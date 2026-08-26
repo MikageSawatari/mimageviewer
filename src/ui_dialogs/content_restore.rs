@@ -23,6 +23,21 @@ pub enum ContentRestoreUiAction {
 const RESTORE_FOOTER_RESERVE: f32 = 64.0;
 const RESTORE_LIST_FALLBACK_MAX_HEIGHT: f32 = 360.0;
 
+/// コピー元セレクタのボタンに出すパスの上限 (文字数)。
+///
+/// ボタンは折り返さないので、絶対パスをそのまま入れると**モーダルがウィンドウより
+/// 広くなり、両端が画面外へ出る** (2026-08-26 の実機報告)。全文はホバーと候補一覧で見せる。
+///
+/// ⚠ 文字数を削るだけでは足りない。egui の `max_rect` は折り返す widget にしか効かず、
+/// ComboBox のボタンは単体でそれを超えて広がる。**幅も明示する** ([`SOURCE_SELECTOR_MARGIN`])。
+const SOURCE_BUTTON_MAX_CHARS: usize = 44;
+
+/// コピー元セレクタ行の字下げ。どのファイルに対する選択かを見せる。
+const SOURCE_SELECTOR_INDENT: f32 = 22.0;
+
+/// セレクタの幅を、モーダルの内容幅からどれだけ狭めるか (字下げ + 縦スクロールバー分)。
+const SOURCE_SELECTOR_MARGIN: f32 = SOURCE_SELECTOR_INDENT + 28.0;
+
 pub fn set_all_restore_rows_selected(rows: &mut [ContentRestoreUiRow], selected: bool) {
     rows.iter_mut().for_each(|row| row.selected = selected);
 }
@@ -37,6 +52,24 @@ fn relation_label(source_exists: bool) -> &'static str {
 
 fn source_option_text(source: &ContentRestoreUiSource) -> String {
     format!("{} ({})", source.path, relation_label(source.source_exists))
+}
+
+/// 長すぎるテキストの**真ん中**を省く。
+///
+/// 末尾にファイル名、先頭にドライブが来るので、どちらも残す。省いた分は呼び出し側が
+/// ホバーで全文を出して補う。
+fn shorten_middle(text: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max_chars || max_chars < 4 {
+        return text.to_string();
+    }
+    // 末尾側を厚く残す。区別が付くのはファイル名であることが多い。
+    let tail = (max_chars - 1) * 2 / 3;
+    let head = max_chars - 1 - tail;
+    let mut out: String = chars[..head].iter().collect();
+    out.push('…');
+    out.extend(&chars[chars.len() - tail..]);
+    out
 }
 
 fn single_source_row_text(row: &ContentRestoreUiRow) -> Option<String> {
@@ -88,6 +121,9 @@ pub fn render_content_restore_modal(
     egui::Modal::new(egui::Id::new("content_restore_modal"))
         .show(ctx, |ui| {
             ui.set_min_width(modal_width);
+            // 上限も要る。中身が要求する幅で伸びるので、長いパスを持つ行があると
+            // ウィンドウをはみ出す。
+            ui.set_max_width(modal_width);
             ui.heading("編集内容の復元");
             ui.add_space(8.0);
             render_content_restore_contents(ui, rows, dont_ask_again)
@@ -125,12 +161,15 @@ fn render_content_restore_contents_with_list_height(
     } else {
         RESTORE_LIST_FALLBACK_MAX_HEIGHT
     };
+    // ScrollArea の中では `available_width` が行の残りしか返さないので、セレクタの幅は
+    // 外側の内容幅から決める。
+    let selector_width = (ui.max_rect().width() - SOURCE_SELECTOR_MARGIN).max(200.0);
     let list_top = ui.cursor().top();
     egui::ScrollArea::vertical()
         .id_salt("content_restore_candidate_list")
         .max_height(list_max_height)
         .auto_shrink([false, true])
-        .show(ui, |ui| render_restore_rows(ui, rows));
+        .show(ui, |ui| render_restore_rows(ui, rows, selector_width));
     let list_height = (ui.cursor().top() - list_top).max(0.0);
 
     ui.add_space(6.0);
@@ -152,7 +191,7 @@ fn render_content_restore_contents_with_list_height(
     (action, list_height)
 }
 
-fn render_restore_rows(ui: &mut egui::Ui, rows: &mut [ContentRestoreUiRow]) {
+fn render_restore_rows(ui: &mut egui::Ui, rows: &mut [ContentRestoreUiRow], selector_width: f32) {
     for (row_index, row) in rows.iter_mut().enumerate() {
         row.source_index = row.source_index.min(row.sources.len().saturating_sub(1));
         let Some(source) = row.sources.get(row.source_index) else {
@@ -163,14 +202,29 @@ fn render_restore_rows(ui: &mut egui::Ui, rows: &mut [ContentRestoreUiRow]) {
         let single_source_text = single_source_row_text(row);
         ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut row.selected, &row.file_name);
-            if let Some(single_source_text) = single_source_text {
+            match &single_source_text {
                 // 単一候補は大多数を占めるため、A3b からの行表示を変えない。
-                ui.label(single_source_text);
-            } else {
-                ui.label(format!("← コピー元を選択 ({source_count} 件)"));
+                // 折り返す Label なので、長いパスでも幅を押し広げない。
+                Some(single_source_text) => ui.label(single_source_text),
+                None => ui.label(format!("← コピー元を選択 ({source_count} 件)")),
+            };
+        });
+        if single_source_text.is_none() {
+            // **セレクタは必ず自分の行に置く。**`horizontal_wrapped` は ComboBox の幅を
+            // 事前に知らないので折り返しの判断ができず、同じ行に続けるとその分だけ
+            // モーダルが横へ伸びる (2026-08-26 の実機報告)。
+            ui.horizontal(|ui| {
+                ui.add_space(SOURCE_SELECTOR_INDENT);
                 egui::ComboBox::from_id_salt(("content_restore_source", row_index))
-                    .selected_text(selected_source_text)
+                    .selected_text(shorten_middle(
+                        &selected_source_text,
+                        SOURCE_BUTTON_MAX_CHARS,
+                    ))
+                    .width(selector_width)
                     .show_ui(ui, |ui| {
+                        // 候補一覧は幅が決まっているので、こちらは全文を折り返して出す。
+                        // 省略したままだと、真ん中だけが違う候補を見分けられない。
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                         for (source_index, source) in row.sources.iter().enumerate() {
                             ui.selectable_value(
                                 &mut row.source_index,
@@ -178,9 +232,11 @@ fn render_restore_rows(ui: &mut egui::Ui, rows: &mut [ContentRestoreUiRow]) {
                                 source_option_text(source),
                             );
                         }
-                    });
-            }
-        });
+                    })
+                    .response
+                    .on_hover_text(&selected_source_text);
+            });
+        }
         ui.add_space(3.0);
     }
 }
@@ -208,6 +264,37 @@ impl crate::app::App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_too_long_for_the_button_keeps_both_ends() {
+        let long = r"h:/home/mimageviewer_old/testimage/y/chatgpt image 2026-06-07 15_49_45 (2).png (コピー元は残っています)";
+        let short = shorten_middle(long, SOURCE_BUTTON_MAX_CHARS);
+        assert_eq!(short.chars().count(), SOURCE_BUTTON_MAX_CHARS);
+        assert!(
+            short.starts_with("h:/home"),
+            "先頭のドライブは残す: {short}"
+        );
+        assert!(
+            short.ends_with("(コピー元は残っています)"),
+            "末尾の関係表示は残す: {short}"
+        );
+        assert!(short.contains('…'));
+    }
+
+    #[test]
+    fn a_path_that_already_fits_is_left_exactly_as_it_is() {
+        let short = r"D:\photo.jpg (移動)";
+        assert_eq!(shorten_middle(short, SOURCE_BUTTON_MAX_CHARS), short);
+    }
+
+    #[test]
+    fn shortening_counts_characters_not_bytes() {
+        // 日本語を含むパスでバイト単位に数えると、途中で切って panic するか
+        // 表示が想定より短くなる。
+        let text = "ｈ:/画像/とてもながいフォルダ名/とてもながいファイル名.png (移動)";
+        let short = shorten_middle(text, 20);
+        assert_eq!(short.chars().count(), 20);
+    }
 
     fn rows() -> Vec<ContentRestoreUiRow> {
         [true, false, true]

@@ -2679,6 +2679,90 @@ mIV は fallback font を 6 系統登録しているので atlas は大きい。
 
 - 規模 \ 優先度: 未知 / P2 (原因が分かるまでは見積もらない)。
 
+### 1.131 複数ウィンドウで動画再生中、他の窓をアクティブにすると 13ms で動画へ奪い返される ✅ 修正済み
+
+- 出典: 2026-08-27、利用者報告。**複数ウィンドウモードで動画を再生中に PDF を開こうとすると
+  「ウィンドウがちらつくだけで開けない」。動画の前に開いていた PDF ウィンドウも、
+  アクティブにしようとすると動画のウィンドウが手前に来る。**動画が無ければ開ける。
+- 状態: **2026-08-27 修正**。実機確認待ち。
+
+#### 原因 — 実ログで確定 (推測ではない)
+
+`MIV_DETACHED_WINDOW_DEBUG=1` で再現。同じ 4 行が 5 回繰り返された:
+
+```
+31.172  passive_activate_begin id=4                                  ← 利用者が PDF 窓をクリック
+31.185  parked-live hud command converted to activation: window_id=1
+        event=RequestSeekStripWindow { center: Thumbnails { .. }, .. }   ← 動画側が活性化を要求
+31.185  session_closing window_id=4 reason=pause_active_context      ← PDF が 13ms で降ろされる
+31.185  session_begin window_id=1 source=Video                       ← 動画が奪い返す
+```
+
+**`RequestSeekStripWindow` は利用者のクリックではない。**
+[render_core.rs](../src/video/native_presenter/render_core.rs) が**描画中に**、strip の
+layout key (overlay サイズ / DPI / 可視セル数 / center) が変わるたびに push する
+layout / resource 要求。それが「HUD がクリックされた」と分類されていた。
+
+[native_video.rs](../src/app/native_video.rs) の
+`native_video_output_event_is_parked_live_hud_click_activation` (旧):
+
+```rust
+Ev::Window(_) | Ev::PlacementSwitched { .. } | Ev::PlacementSwitchFailed { .. }
+| Ev::RequestSeekThumbnail { .. } | Ev::ClearSeekThumbnail
+| Ev::TileColumnsDelta { .. } => false,          // 維持イベント (活性化しない)
+Ev::NavigateItem { via_wheel, .. } => !*via_wheel,
+_ => true,                                        // ⚠ それ以外は全部「HUD クリック」
+```
+
+**catch-all `_ => true` が構造的な欠陥。**`NativeVideoOutputEvent` は 77 variant あり、
+後から足したイベントは、何もしなくても「利用者がクリックした → 前面へ奪う」に既定で入る。
+
+- `RequestSeekStripWindow` の追加: **2026-08-23** (`2edc070c` シークストリップ)
+- この分類器の最終更新: **2026-08-21** (`c71d8c08` detached-rework R2)
+
+シークストリップは 10 個近くイベントを足したが、維持側に登録されたのは 3 つだけ。
+利用者の見立て (「ストリップのマージで壊れた可能性」) がそのまま当たっていた。
+
+#### 修正 (2026-08-27)
+
+`_ => true` を撤去し、**77 variant を網羅 match で分類**した。新しいイベントを足すと
+コンパイラが分類を要求する。「未知のイベント = 利用者のクリック = 前面を奪う」という
+既定をやめるのが本体で、`RequestSeekStripWindow` を維持側へ足すだけの症状パッチにはしない。
+
+Codex は方針に同意したうえで、一次分類案に **5 件の反例**を出した。全件を emit 元で裏取りし、
+うち 2 件は**同じバグの別インスタンス**だった:
+
+| 指摘 | 裏取り結果 | 対応 |
+| --- | --- | --- |
+| `CloseSeekStrip` は cause 依存 | ✓ **`HudHidden` は描画の else 枝から出る** (2 例目) | 既存の `SeekStripCloseCause::is_user_dismissal()` を使う |
+| `SetVst3PanelPos` は自動 clamp でも出る | ✓ `saved_pos_was_clamped` で発火 (3 例目)。利用者のドラッグは左ボタン経路が先に活性化するので失われない | false |
+| `TouchChromeLearned` は利用者入力 | ✓ `ToggleChrome` / `PageSide` のタップにのみ応答 | true |
+| `SetVst3PanelVisible` に producer が無い | ✓ presenter に push 箇所ゼロ | default-deny で false |
+| `TileColumnsDelta` は入力源が 2 つ | ✓ ただし**両方とも利用者入力**。今回の欠陥ではない | 現状の false を維持 (下記) |
+
+自分で追加確認した 1 件: `VideoScaleSettingsCommitted` は presenter が適用完了後に送る通知
+なので false。
+
+回帰テスト: `parked_live_renderer_emitted_events_do_not_request_activation`
+([src/app/tests.rs](../src/app/tests.rs))。`RequestSeekStripWindow` を活性化側へ戻す変異と
+`CloseSeekStrip` の cause を無視する変異の両方で落ちることを確認済み。
+
+凍結ルール下の合意は [detached-rework-plan.md](detached-rework-plan.md) §11 に記録した。
+
+#### 残した 2 件 (憲法 §2 規則 7 によりスコープ外)
+
+1. **`TileColumnsDelta` の provenance 分離** — Ctrl+ホイールと HUD の列数 ± ボタンが同じ
+   variant を共有する。現状はどちらも parked 中に活性化しない (R2 以降の挙動)。
+   分けるには payload に typed origin が要り、今回の欠陥とは別。
+2. **活性化要求の寿命・順序** — [ui_fullscreen.rs](../src/ui_fullscreen.rs) の
+   `take_parked_live_activation_requests_after_passive_render` の消費側は
+   `detached_window_state_is_parked_live(id)` だけを見る。これは「この窓は parked-live か」
+   であって「**この活性化要求はまだ望まれているか**」ではない。要求は生成理由も順序も
+   持たない `Vec<u64>` で、同一 batch は時系列でなく ID 順に並ぶ。
+   今回の症状の原因ではないが、同じ「1 つの述語で 2 つの問いに答えている」形。
+   扱うなら既存の `DetachedActivationIntent` を含む reducer へ統合し、
+   **入力順序か request identity** で最新を定義する (フレーム数や数 ms の猶予で棄却しない)。
+
 ### 1.130 font atlas resync 待ちが 16ms 固定でスピンする
 
 - 出典: 2026-08-26、§1.122 の repaint 要求元を分けているときに見つけた。
@@ -3338,7 +3422,7 @@ emote-web-log.jsonl`):
   [docs/detached-rework-plan.md](detached-rework-plan.md) §2 (憲法) / BA-7、
   findings-12 D3 (同型の App-global 汚染)。
 
-### 2.22 貼り付け / 新しいフォルダー作成後に、追加項目へカーソル・選択を移す — 専用スレ >>305 ✅ 実装済み (2026-08-26、実機確認待ち)
+### 2.22 貼り付け / 新しいフォルダー作成後に、追加項目へカーソル・選択を移す — 専用スレ >>305 ✅ 実装済み (2026-08-26、実機確認済み)
 
 - 出典: 専用スレ >>305 (2026-08-26)。グリッドへ貼り付けたファイルが現在のソート順で
   離れた位置へ入ると、どれが追加されたものか分からなくなるため、エクスプローラーと同様に
@@ -3412,6 +3496,17 @@ emote-web-log.jsonl`):
 移して実出力を受け取るしかなく、それは
 [shell-file-operations-context-menu-plan.md](shell-file-operations-context-menu-plan.md)
 §7 の残作業 (drop-to-folder の PowerShell 置き換え) と同じ移行になる。
+
+**絞り込みで貼り付け結果が 1 件も見えない場合、何も起きない。**実機確認 (2026-08-26) で
+「分かりやすくはないが、一旦この動きで良い」と判断。案内を出すなら「貼り付けたファイルが
+絞り込みで隠れています」のようなトーストになる。
+
+#### 実機確認 (2026-08-26)
+
+新しいフォルダー / 名前変更 / 1 件貼り付け / 複数件貼り付け / 切り取り貼り付け /
+操作直後の別フォルダ移動 / 絞り込み中、すべて期待どおり。名前衝突は利用者の環境の OS
+ダイアログに「両方保持」が無く (無視 / スキップのみ) 未確認。改名経路自体は
+`AddedSince` の差分で拾うので、選択規則としては同じ扱いになる。
 
 ## 3. 補正 / AI
 
