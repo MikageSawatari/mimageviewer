@@ -2056,36 +2056,41 @@ F12 往復 ~950ms のうち約 350ms
 
 ##### それでも pump は回っている (修正後の実測)
 
-`prev_frame_causes` を 3787 フレーム分集計した:
+`prev_frame_causes` を 3787 フレーム分集計した。最大の要求元は状態で分かれる:
 
-| 状態 | 最大の repaint 要因 | 件数 |
+| 状態 | 最大の repaint 要因 | 該当フレーム |
 | --- | --- | --- |
-| フルスクリーン (動画を開いている) | **`app.rs` の pump** | **1905 / 1923** |
-| 一覧 (動画なし) | egui 自身の `context.rs:529` | 1936 / 1850 |
+| フルスクリーン (動画を開いている) | **`app.rs` の pump** | **1905 / 1930 (98.7%)** |
+| 一覧 (動画なし) | egui 自身の `context.rs:529` | 1479 / 1857 (79.6%) |
 
 一方で、実測のフレーム間隔は **フルスクリーン有無にかかわらず median 6.0ms**で、
 pump が要求する 16ms より短い。**pump だけ消しても周期は 16ms にならない**。
-フルスクリーン 1923 フレームの repaint 要求元を全部分けると (合計 3534 件 = 1 フレームに複数):
+フルスクリーン **1930 フレーム**の repaint 要求元を分けると
+(「フレーム」= その要求元を含むフレーム数、「延べ」= 発行回数):
 
-| 件数 | 要求元 | 間隔 |
-| --- | --- | --- |
-| 1905 | `poll_video` 末尾の pump | **16ms 固定** |
-| **672** | **`maybe_defer_for_main_font_atlas_resync` の `!safety.is_settled()`** | **16ms 固定** |
-| 431 | 削除 purge の input idle guard | 残り時間 (入力後 1 秒だけ) |
-| 182 | tail の `reasons` 非空 | 即時 |
-| 174 | egui 自身 | — |
-| 148 | `auto_aspect` streak / input idle guard | 残り時間 |
-| 13 | font atlas の full upload 再発行 | 即時 |
-| 9 | native video HUD の hover | 即時 |
+| フレーム | 延べ | 要求元 | 間隔 |
+| --- | --- | --- | --- |
+| **1905** (98.7%) | 1905 | `poll_video` 末尾の pump | **16ms 固定** |
+| 431 | 431 | 削除 purge の input idle guard | 残り時間 (入力後 1 秒だけ) |
+| **343** (17.8%) | **672** | **`maybe_defer_for_main_font_atlas_resync` の `!safety.is_settled()`** | **16ms 固定** |
+| 182 | 182 | tail の `reasons` 非空 | 即時 |
+| 148 | 148 | `auto_aspect` streak / input idle guard | 残り時間 |
+| 174 | 174 | egui 自身 (scroll_area / tooltip / area) | — |
+| 13 | 13 | font atlas の full upload 再発行 | 即時 |
 
-→ **16ms 固定のスピンは 2 つある**。2 番目の
-[`maybe_defer_for_main_font_atlas_resync`](../src/app.rs) は、main font atlas resync が
-pending の間「フレームが settled になるまで 16ms ごとに見に行く」形で、
-**フルスクリーンフレームの 35% を占めていた** (修正後の測定でも)。
-pump と同じ形 (= 条件を poll するための固定間隔 repaint) なので、Direction A をやるなら
-**この 2 つは同じ問題として扱う**。片方だけ直しても UI スレッドは回り続ける。
+→ **pump はフルスクリーンフレームの 98.7%** に乗っている。
+スパンで見ても **動画を開いている区間を連続で埋めている** (3.0s / 2.7s / 2.7s / 4.9s / 2.4s)。
+**これが主因**であることは変わらない。
 
-⚠ この 672 件は §1.129 の修正**後**のログ。atlas rebuild 自体は止まったが、
+⚠ **ただし 16ms 固定のスピンはもう 1 つある**。
+[`maybe_defer_for_main_font_atlas_resync`](../src/app.rs) は main font atlas resync が
+pending の間、「フレームが settled になるまで 16ms ごとに見に行く」形。
+pump と違って**連続ではなく 3 回のバースト** (0.3s / 0.3s / 3.8s、計 ≈ 4.4s) だが、
+1 フレームに **2 回**発行している (672 延べ / 343 フレーム)。
+形が同じ (= 条件を poll するための固定間隔 repaint) なので、Direction A をやるなら
+**この 2 つは同じ問題として扱う**。
+
+⚠ この 343 フレームは §1.129 の修正**後**のログ。atlas rebuild 自体は止まったが、
    **resync 待ちのスピンは別経路として残っている**。
 
 ##### 修正の方向 (未着手、Codex と合意済み)
