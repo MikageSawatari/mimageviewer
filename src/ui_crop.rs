@@ -160,19 +160,10 @@ impl App {
     /// Single ページへ pivot し、退場時に spread 状態を復元する。crop は表示 overlay
     /// のみで重い合成が無いため、post_filter バイパスや base cache 準備は行わない。
     pub(crate) fn enter_export_crop_mode(&mut self, fs_idx: usize) {
-        let spread_pair = match self.resolve_spread_pair(fs_idx) {
-            crate::ui_fullscreen::SpreadPair::Double { left, right } => Some((left, right)),
-            crate::ui_fullscreen::SpreadPair::Single => None,
-        };
-        if let Some(pair) = spread_pair {
-            self.export_crop_spread_ctx = Some(crate::app::EraseSpreadCtx {
-                saved_mode: self.spread_mode,
-                pair,
-            });
-            self.spread_mode = crate::settings::SpreadMode::Single;
-            self.fullscreen_idx = Some(pair.0);
-            self.fs_zoom = 1.0;
-            self.fs_pan = egui::Vec2::ZERO;
+        let (target_idx, pivot) = self.plan_page_edit_pivot(fs_idx);
+        if let Some(pivot) = pivot {
+            self.export_crop_spread_ctx = Some(pivot);
+            self.enter_page_edit_single_view(target_idx);
         }
         self.export_crop_mode = true;
         self.export_crop_drag = None;
@@ -185,12 +176,8 @@ impl App {
         self.export_crop_mode = false;
         self.export_crop_drag = None;
         self.export_crop_create_drag = None;
-        if let Some(ctx) = self.export_crop_spread_ctx.take() {
-            self.spread_mode = ctx.saved_mode;
-            self.fullscreen_idx = Some(ctx.pair.0);
-            self.fs_zoom = 1.0;
-            self.fs_pan = egui::Vec2::ZERO;
-        }
+        let pivot = self.export_crop_spread_ctx.take();
+        self.leave_page_edit_single_view(pivot);
     }
 
     pub(crate) fn handle_export_crop_keys(

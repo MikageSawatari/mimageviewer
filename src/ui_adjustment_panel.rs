@@ -9465,6 +9465,16 @@ impl App {
         {
             return;
         }
+        // 他の 4 ツールと同じく、編集する 1 ページを単独で表示してから始める。
+        // 見開きのままだと canvas 用の transform が作られず、**マスク編集も左右の
+        // 切り替えも一切効かないモード**になる (2026-08-26 の利用者報告)。
+        if let Some(fs_idx) = self.fullscreen_idx {
+            let (target_idx, pivot) = self.plan_page_edit_pivot(fs_idx);
+            if let Some(pivot) = pivot {
+                self.local_adjust_spread_ctx = Some(pivot);
+                self.enter_page_edit_single_view(target_idx);
+            }
+        }
         self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.local_adjust_mode = true;
         self.local_adjust_show_source = false;

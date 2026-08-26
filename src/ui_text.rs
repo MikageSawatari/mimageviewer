@@ -30,7 +30,7 @@ use crate::app::{App, TextDrag, TextDragKind, TextMarquee, TextSmartGuides};
 use crate::comic_presets::{ShapeStylePreset, TextStylePreset, WindowStylePreset};
 use crate::displayed_image_transform::DisplayedImageTransform;
 use crate::keymap::{KeyAction, ModKind, modifier_held_via_os};
-use crate::ui_fullscreen::{FsKeyAction, SpreadPair};
+use crate::ui_fullscreen::FsKeyAction;
 use comic_core::{
     AnnotationKind, AnnotationObject, BubbleObject, BubbleShape, DecoKind, DecoPlacement,
     DecorationLayer, FillBlend, FillMode, FontSet, FrameStyle, IndicatorKind, InlineDir,
@@ -1976,25 +1976,15 @@ impl App {
         if !self.fullscreen_edit_mode_entry_allowed(fs_idx) {
             return;
         }
-        let spread_pair = match self.resolve_spread_pair(fs_idx) {
-            SpreadPair::Double { left, right } => Some((left, right)),
-            SpreadPair::Single => None,
-        };
-        let target_idx = spread_pair.map(|(l, _)| l).unwrap_or(fs_idx);
+        let (target_idx, pivot) = self.plan_page_edit_pivot(fs_idx);
 
         let Some(key) = self.page_path_key(target_idx) else {
             return;
         };
 
-        if let Some(pair) = spread_pair {
-            self.text_spread_ctx = Some(crate::app::EraseSpreadCtx {
-                saved_mode: self.spread_mode,
-                pair,
-            });
-            self.spread_mode = crate::settings::SpreadMode::Single;
-            self.fullscreen_idx = Some(target_idx);
-            self.fs_zoom = 1.0;
-            self.fs_pan = egui::Vec2::ZERO;
+        if let Some(pivot) = pivot {
+            self.text_spread_ctx = Some(pivot);
+            self.enter_page_edit_single_view(target_idx);
         }
 
         self.text_mode = true;
@@ -2081,12 +2071,8 @@ impl App {
         // しっぽ stash もクリア (ページ / モードをまたいで持ち越さない)。
         self.comic_tail_stash.clear();
 
-        if let Some(ctx) = self.text_spread_ctx.take() {
-            self.spread_mode = ctx.saved_mode;
-            self.fullscreen_idx = Some(ctx.pair.0);
-            self.fs_zoom = 1.0;
-            self.fs_pan = egui::Vec2::ZERO;
-        }
+        let pivot = self.text_spread_ctx.take();
+        self.leave_page_edit_single_view(pivot);
         crate::logger::log("text: reset mode".to_string());
     }
 

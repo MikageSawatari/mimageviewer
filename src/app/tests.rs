@@ -16018,7 +16018,7 @@ mod favorite_adjustment_defaults_tests {
         // 編集対象は左ページとする
         app.fullscreen_idx = Some(0);
         app.spread_mode = SpreadMode::Single; // 消しゴム中の状態
-        app.erase_spread_ctx = Some(crate::app::EraseSpreadCtx {
+        app.erase_spread_ctx = Some(crate::app::PageEditSpreadPivot {
             saved_mode: SpreadMode::Ltr,
             pair: (0, 1),
         });
@@ -16595,6 +16595,89 @@ mod favorite_adjustment_defaults_tests {
             Some(PageSlice::Left.uv_rect())
         );
         app.analysis_mode = false;
+    }
+
+    /// **5 つの編集ツールが同じ手順で単ページへ倒れ、抜けたら見開きへ戻る。**
+    ///
+    /// 補正レイヤー (Ctrl+G) だけこの手順を持たず、見開きから入るとマスク編集も左右の
+    /// 切り替えも一切効かないモードになっていた (2026-08-26 の利用者報告)。canvas 用の
+    /// transform は単ページ経路でしか作られないため。
+    #[test]
+    fn every_page_edit_tool_pivots_to_one_page_and_puts_the_spread_back() {
+        use crate::settings::SpreadMode;
+
+        let mut app = setup_app();
+        app.items = (0..4)
+            .map(|k| {
+                crate::grid_item::GridItem::Image(std::path::PathBuf::from(format!("p{k}.jpg")))
+            })
+            .collect();
+        app.visible_indices = (0..4).collect();
+        app.cached_nav_indices = None;
+        app.spread_mode = SpreadMode::Ltr;
+        app.fullscreen_idx = Some(0);
+
+        let (target_idx, pivot) = app.plan_page_edit_pivot(0);
+        let pivot = pivot.expect("見開きなら退避が要る");
+        // 計画しただけでは何も変わらない (素材の取得に失敗しても見開きを壊さないため)。
+        assert_eq!(app.spread_mode, SpreadMode::Ltr);
+
+        app.enter_page_edit_single_view(target_idx);
+        assert_eq!(app.spread_mode, SpreadMode::Single);
+        assert_eq!(app.fullscreen_idx, Some(target_idx));
+
+        // ツールが動いている間は戻さない。
+        app.local_adjust_spread_ctx = Some(pivot);
+        app.local_adjust_mode = true;
+        app.reconcile_page_edit_spread_pivots();
+        assert_eq!(app.spread_mode, SpreadMode::Single, "ツール中は倒したまま");
+        assert!(app.local_adjust_spread_ctx.is_some());
+
+        // モードが落ちたら、どの経路で落ちたかによらず次のフレームで戻る。
+        app.local_adjust_mode = false;
+        app.reconcile_page_edit_spread_pivots();
+        assert_eq!(app.spread_mode, SpreadMode::Ltr, "見開きへ戻る");
+        assert_eq!(app.fullscreen_idx, Some(pivot.pair.0));
+        assert!(app.local_adjust_spread_ctx.is_none());
+
+        // **入口が実際に倒すこと**を確かめる。手順があっても呼ばれていなければ意味がない
+        // (補正レイヤーはまさにそれだった)。
+        app.spread_mode = SpreadMode::Ltr;
+        app.fullscreen_idx = Some(0);
+        app.local_adjust_spread_ctx = None;
+        app.enter_local_adjust_mode();
+        assert!(app.local_adjust_mode, "モードは立つ");
+        assert_eq!(
+            app.spread_mode,
+            SpreadMode::Single,
+            "Ctrl+G は編集する 1 ページを単独で表示してから始める"
+        );
+        assert!(
+            app.local_adjust_spread_ctx.is_some(),
+            "戻すための退避を持つ"
+        );
+        app.local_adjust_mode = false;
+        app.reconcile_page_edit_spread_pivots();
+        assert_eq!(app.spread_mode, SpreadMode::Ltr);
+
+        // 5 つのツールすべてが同じ扱いを受ける。1 つでも見落とすと倒れたままになる。
+        for (index, put) in [
+            (
+                0usize,
+                (|app: &mut crate::app::App, p| app.erase_spread_ctx = Some(p))
+                    as fn(&mut crate::app::App, crate::app::PageEditSpreadPivot),
+            ),
+            (1, |app, p| app.conceal_spread_ctx = Some(p)),
+            (2, |app, p| app.text_spread_ctx = Some(p)),
+            (3, |app, p| app.export_crop_spread_ctx = Some(p)),
+            (4, |app, p| app.local_adjust_spread_ctx = Some(p)),
+        ] {
+            app.enter_page_edit_single_view(target_idx);
+            put(&mut app, pivot);
+            app.reconcile_page_edit_spread_pivots();
+            assert_eq!(app.spread_mode, SpreadMode::Ltr, "ツール {index}");
+            assert_eq!(app.fullscreen_idx, Some(pivot.pair.0), "ツール {index}");
+        }
     }
 
     /// 横長分割のページ送り。**同じページの左右移動と、別ページへの移動を分けて返す。**
@@ -22415,7 +22498,7 @@ mod favorite_adjustment_defaults_tests {
         app.thumbnails.push(ThumbnailState::Pending);
         app.fullscreen_idx = Some(1);
         app.spread_mode = SpreadMode::Single;
-        app.conceal_spread_ctx = Some(crate::app::EraseSpreadCtx {
+        app.conceal_spread_ctx = Some(crate::app::PageEditSpreadPivot {
             saved_mode: SpreadMode::Ltr,
             pair: (0, 1),
         });
@@ -22447,7 +22530,7 @@ mod favorite_adjustment_defaults_tests {
         app.thumbnails.push(ThumbnailState::Pending);
         app.fullscreen_idx = Some(1);
         app.spread_mode = SpreadMode::Single;
-        app.export_crop_spread_ctx = Some(crate::app::EraseSpreadCtx {
+        app.export_crop_spread_ctx = Some(crate::app::PageEditSpreadPivot {
             saved_mode: SpreadMode::Ltr,
             pair: (0, 1),
         });
@@ -25354,7 +25437,7 @@ mod favorite_adjustment_defaults_tests {
         app.thumbnails.push(ThumbnailState::Pending);
         app.fullscreen_idx = Some(0);
         app.spread_mode = SpreadMode::Single; // 消しゴム中
-        app.erase_spread_ctx = Some(crate::app::EraseSpreadCtx {
+        app.erase_spread_ctx = Some(crate::app::PageEditSpreadPivot {
             saved_mode: SpreadMode::Ltr,
             pair: (0, 1),
         });
