@@ -1596,6 +1596,8 @@ pub enum KeyAction {
     FsSpreadLtrCover,
     FsSpreadRtl,
     FsSpreadRtlCover,
+    FsSpreadSplitLtr,
+    FsSpreadSplitRtl,
     FsReadingFlowCycle,
     FsReadingDirectionToggle,
     FsFitModeCycle,
@@ -2050,6 +2052,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsSpreadLtrCover,
     KeyAction::FsSpreadRtl,
     KeyAction::FsSpreadRtlCover,
+    KeyAction::FsSpreadSplitLtr,
+    KeyAction::FsSpreadSplitRtl,
     KeyAction::FsReadingFlowCycle,
     KeyAction::FsReadingDirectionToggle,
     KeyAction::FsFitModeCycle,
@@ -3575,6 +3579,8 @@ impl KeyAction {
             FsSpreadLtrCover => "FsSpreadLtrCover",
             FsSpreadRtl => "FsSpreadRtl",
             FsSpreadRtlCover => "FsSpreadRtlCover",
+            FsSpreadSplitLtr => "FsSpreadSplitLtr",
+            FsSpreadSplitRtl => "FsSpreadSplitRtl",
             FsReadingFlowCycle => "FsReadingFlowCycle",
             FsReadingDirectionToggle => "FsReadingDirectionToggle",
             FsFitModeCycle => "FsFitModeCycle",
@@ -4134,6 +4140,8 @@ impl KeyAction {
             FsSpreadLtrCover => "左開き表紙単独の見開き表示に切り替える",
             FsSpreadRtl => "右開き見開き表示に切り替える",
             FsSpreadRtlCover => "右開き表紙単独の見開き表示に切り替える",
+            FsSpreadSplitLtr => "横長ページを左半分から順に分割表示する",
+            FsSpreadSplitRtl => "横長ページを右半分から順に分割表示する",
             FsReadingFlowCycle => "ページ単位/縦連結/横連結を切り替える",
             FsReadingDirectionToggle => "横方向の読み進み方向を切り替える",
             FsFitModeCycle => "ズーム/フィット方式を切り替える",
@@ -4558,6 +4566,8 @@ impl KeyAction {
             | FsSpreadLtrCover
             | FsSpreadRtl
             | FsSpreadRtlCover
+            | FsSpreadSplitLtr
+            | FsSpreadSplitRtl
             | FsReadingFlowCycle
             | FsReadingDirectionToggle
             | FsFitModeCycle
@@ -4964,6 +4974,8 @@ impl KeyAction {
             | FsSpreadLtrCover
             | FsSpreadRtl
             | FsSpreadRtlCover
+            | FsSpreadSplitLtr
+            | FsSpreadSplitRtl
             | FsReadingFlowCycle
             | FsReadingDirectionToggle
             | FsFitModeCycle
@@ -5409,6 +5421,8 @@ impl KeyAction {
             FsSpreadLtrCover => digit_pair(Num3, Numpad3),
             FsSpreadRtl => digit_pair(Num4, Numpad4),
             FsSpreadRtlCover => digit_pair(Num5, Numpad5),
+            FsSpreadSplitLtr => digit_pair(Num8, Numpad8),
+            FsSpreadSplitRtl => digit_pair(Num9, Numpad9),
             FsReadingFlowCycle => digit_pair(Num6, Numpad6),
             FsReadingDirectionToggle => digit_pair(Num7, Numpad7),
             FsFitModeCycle => digit_pair(Num0, Numpad0),
@@ -12245,6 +12259,31 @@ mod tests {
             keymap.warnings()
         );
         assert!(keymap.overrides.is_empty());
+    }
+
+    /// `docs/keymap.ini.default` は生成物と一致していなければならない。
+    ///
+    /// 手で維持していたので、`KeyAction` を足したときに書き忘れると黙ってずれる
+    /// (利用者はこのファイルを既定キーの正本として読む)。`UPDATE_KEYMAP_DEFAULT=1` で
+    /// 書き直せる。
+    #[test]
+    fn the_checked_in_default_keymap_matches_what_the_app_writes() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs")
+            .join("keymap.ini.default");
+        let generated = Keymap::default_reference_ini();
+        if std::env::var("UPDATE_KEYMAP_DEFAULT").is_ok() {
+            std::fs::write(&path, generated.as_bytes()).expect("write default keymap");
+            return;
+        }
+        let checked_in = std::fs::read_to_string(&path).expect("read docs/keymap.ini.default");
+        // 改行だけの差は無視する (git の autocrlf で往復するため)。
+        let normalize = |text: &str| text.replace('\r', "");
+        assert_eq!(
+            normalize(&checked_in),
+            normalize(&generated),
+            "docs/keymap.ini.default が古い。UPDATE_KEYMAP_DEFAULT=1 cargo test で更新すること"
+        );
     }
 
     #[test]

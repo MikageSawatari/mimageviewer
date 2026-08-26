@@ -2787,6 +2787,20 @@ impl SpreadMode {
         ]
     }
 
+    /// このモードが持つ読み順。持たないモード (`Single` / 旧 `Vertical`) は `None`。
+    ///
+    /// [`Self::with_reading_direction`] の逆向き。**両方向をここに並べて置く。**片方だけに
+    /// variant を足すと、選んだモードと送り方向がずれる (2026-08-26: 横長分割を選んでも
+    /// 綴じ方向が付いてこず、左右の順序と分割の順序が食い違った)。網羅 match なので、
+    /// モードを足せばコンパイラが両方を要求する。
+    pub fn reading_direction(self) -> Option<ReadingDirection> {
+        match self {
+            Self::Ltr | Self::LtrCover | Self::SplitLtr => Some(ReadingDirection::Ltr),
+            Self::Rtl | Self::RtlCover | Self::SplitRtl => Some(ReadingDirection::Rtl),
+            Self::Single | Self::Vertical => None,
+        }
+    }
+
     /// 見開きの表紙有無を保ったまま横方向だけを差し替える。
     ///
     /// Single / 旧 Vertical は見開き構成ではないため、そのまま返す。
@@ -7874,6 +7888,35 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **モードと読み順は互いの逆向きでなければならない。**
+    ///
+    /// 方向 → モードだけが分割を扱い、モード → 方向が素通りしていたため、横長分割を
+    /// 選んでも綴じ方向が付いてこず、**分割の左右とページ送りの左右が食い違った**
+    /// (2026-08-26 の実機報告)。片方に variant を足したらここが落ちる。
+    #[test]
+    fn a_spread_mode_and_its_reading_direction_stay_each_other_s_inverse() {
+        for &mode in SpreadMode::all() {
+            let Some(direction) = mode.reading_direction() else {
+                // 読み順を持たないモードは、方向を変えても動かない。
+                assert_eq!(mode.with_reading_direction(ReadingDirection::Ltr), mode);
+                assert_eq!(mode.with_reading_direction(ReadingDirection::Rtl), mode);
+                continue;
+            };
+            // 自分の方向を渡しても変わらない。
+            assert_eq!(mode.with_reading_direction(direction), mode, "{mode:?}");
+            // 反転させると相方になり、その相方は反転後の方向を返す。
+            let flipped = mode.with_reading_direction(direction.next());
+            assert_ne!(flipped, mode, "{mode:?}");
+            assert_eq!(
+                flipped.reading_direction(),
+                Some(direction.next()),
+                "{mode:?}"
+            );
+            // 元へ戻る。
+            assert_eq!(flipped.with_reading_direction(direction), mode, "{mode:?}");
+        }
+    }
 
     #[test]
     fn recycle_bin_delete_confirmation_skip_defaults_off_and_round_trips() {

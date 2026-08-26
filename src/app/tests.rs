@@ -16678,6 +16678,22 @@ mod favorite_adjustment_defaults_tests {
                 slice: PageSlice::Right
             })
         );
+
+        // **自動送りも同じ歩幅。**スライドショーが分割を無視すると、始めた瞬間に分割が
+        // 解除されて画面が大きく変わる (2026-08-26 の実機判断)。解決経路が同じであることを、
+        // スライドショーが使う `spread_page_nav_for_indices` 側でも固定する。
+        let display_order = app.current_grid_order().to_vec();
+        let reading =
+            crate::ui_fullscreen::build_image_reading_indices_for_test(&app.items, &display_order);
+        app.fullscreen_idx = Some(1);
+        app.fullscreen_page_slice = PageSlice::Left;
+        assert_eq!(
+            app.spread_page_nav_for_indices(&reading, 1, 1),
+            FsPageNav::Split(PresentationStep {
+                source_idx: 1,
+                slice: PageSlice::Right
+            })
+        );
     }
 
     /// 右→左では右半分から読む。左右の順序だけが変わり、元ページの順序は変わらない。
