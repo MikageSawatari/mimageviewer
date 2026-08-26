@@ -2944,6 +2944,10 @@ impl App {
             return;
         };
         let (sw, sh) = self.source_dims_for_idx(fs_idx).unwrap_or((1000.0, 1000.0));
+        // 見開きから入ったときのペア。倒した後の `resolve_spread_pair` は Single を返す。
+        let spread_lr = self.page_edit_spread_pair();
+        // クロージャから `self` を触れないので、押されたページを持ち帰って後で適用する。
+        let mut switch_target_to: Option<usize> = None;
         let font_key = crate::comic_overlay::COMIC_FONT_KEY.to_string();
 
         let panel_pos = egui::pos2(
@@ -3046,6 +3050,20 @@ impl App {
                                 },
                             );
                         });
+                        // 見開きから入っていると単ページへ倒してあるので、左右の
+                        // 切り替えは退避したペアから出す。これが無いと片方のページしか
+                        // 注釈できない (2026-08-26 の実機報告)。
+                        if let Some((left, right)) = spread_lr {
+                            ui.horizontal(|ui| {
+                                let is_left = fs_idx == left;
+                                if ui.selectable_label(is_left, "左ページ").clicked() {
+                                    switch_target_to = Some(left);
+                                }
+                                if ui.selectable_label(!is_left, "右ページ").clicked() {
+                                    switch_target_to = Some(right);
+                                }
+                            });
+                        }
                         ui.separator();
 
                         // ── プレビュー解像度 (R2 perf) ──。編集中だけ表示を 1/N に下げて合成 +
@@ -3417,6 +3435,16 @@ impl App {
         }
         if close {
             self.reset_text_mode();
+        }
+        // 左右ボタンで対象ページを切り替える。注釈はページごとなので、現在ページの
+        // 作業セットを確定してから入り直す (消しゴムの `switch_erase_target_in_spread`
+        // と同じ約束)。退避は触らないので、ボタンはトグルとして使い続けられる。
+        if let Some(new_idx) = switch_target_to
+            && self.fullscreen_idx != Some(new_idx)
+        {
+            self.reset_text_mode();
+            self.enter_page_edit_single_view(new_idx);
+            self.enter_text_mode(new_idx);
         }
     }
 
