@@ -329,26 +329,59 @@ impl App {
 
     /// Prepare preservation/cancellation while the old index space is still authoritative.
     /// A miss closes through the normal lifecycle before callers replace `items`.
+    ///
+    /// **Every outcome is logged.** Whether the open reader followed its item or was closed
+    /// is the whole user-visible behaviour of this path, and in the multi-window mode a
+    /// close takes a whole window down. Without a line here the only evidence left is an
+    /// `items_len` that changed and a reader that vanished, which is what the 2026-08-26
+    /// report had to be reconstructed from (backlog §1.125).
     fn prepare_snapshot_viewer_index_swap(
         &mut self,
+        phase: &'static str,
         target_membership: &HashMap<SnapshotKey, usize>,
     ) -> Option<SnapshotViewerIndexSwap> {
         self.cancel_media_navigation_pending_for_current_context("snapshot_items_swap");
         self.cancel_pending_folder_nav();
 
-        let old_fullscreen_idx = self.fullscreen_idx?;
+        let Some(old_fullscreen_idx) = self.fullscreen_idx else {
+            crate::logger::log(format!(
+                "[snapshot] {phase}: no open reader to reconcile (items={})",
+                self.items.len()
+            ));
+            return None;
+        };
+        let open_label = self
+            .items
+            .get(old_fullscreen_idx)
+            .map(crate::grid_item::GridItem::display_path)
+            .unwrap_or_else(|| "<out of range>".to_string());
         let Some(open_key) = self
             .items
             .get(old_fullscreen_idx)
             .and_then(snapshot_key_from_grid_item)
         else {
+            crate::logger::log(format!(
+                "[snapshot] {phase}: closing reader, the open item has no snapshot key \
+                 old_idx={old_fullscreen_idx} item={open_label}"
+            ));
             self.close_fullscreen();
             return None;
         };
         let Some(&new_fullscreen_idx) = target_membership.get(&open_key) else {
+            crate::logger::log(format!(
+                "[snapshot] {phase}: closing reader, the open item is outside the new list \
+                 old_idx={old_fullscreen_idx} target_len={} item={open_label}",
+                target_membership.len()
+            ));
             self.close_fullscreen();
             return None;
         };
+        crate::logger::log(format!(
+            "[snapshot] {phase}: reader follows its item \
+             old_idx={old_fullscreen_idx} -> new_idx={new_fullscreen_idx} \
+             target_len={} item={open_label}",
+            target_membership.len()
+        ));
 
         let old_to_new = self.snapshot_exact_idx_map(target_membership);
         let opened_media_path = self
@@ -637,7 +670,7 @@ impl App {
         }
 
         // Preserve or close the open viewer while the old index space and player are alive.
-        let viewer_index_swap = self.prepare_snapshot_viewer_index_swap(&membership);
+        let viewer_index_swap = self.prepare_snapshot_viewer_index_swap("activate", &membership);
 
         // Step 2: close search (= mutual exclusion)
         let search_was_active = self.close_searches_for_snapshot();
@@ -912,7 +945,8 @@ impl App {
                 .filter_map(|(idx, item)| snapshot_key_from_grid_item(item).map(|key| (key, idx)))
                 .collect();
             // Resolve the item actually open now; navigation may have changed it since capture.
-            let viewer_index_swap = self.prepare_snapshot_viewer_index_swap(&restore_membership);
+            let viewer_index_swap =
+                self.prepare_snapshot_viewer_index_swap("deactivate", &restore_membership);
 
             // snapshot 中に subset (= self.thumbnails) で thumbnail worker が
             // Pending → Loaded に進めたものを、path key 経由で saved 側に merge する。
