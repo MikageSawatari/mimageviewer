@@ -3867,10 +3867,53 @@ SimplySign のクラウド鍵セッションが切れていても通過する (�
 
 #### 着手順
 
-1. **`RasterVectorMask` の格納形式を `SidecarMask` 相当の圧縮形式にする。**
-   ⚠ 補正レイヤーはリリース済み (v1.1.0) なので**移行必須**。旧形式の巨大サイドカーを
-   読んで新形式へ書き直す経路が要る。読み側は当面 both を受け付ける。
-   `alpha` は `f32` なので、消しゴムの 1bit とは違い量子化の判断が要る (8bit で足りるか、
-   PNG/WebP のグレースケールに寄せるか) — **着手時に実データの alpha 分布を見て決める**。
-2. flush / import の worker 化。1 を直せば緊急度は下がるが、同期 I/O 自体は残る。
-3. サイドカーが肥大したときに気づける仕組み (サイズをログか設定画面へ)。
+1. ~~**`RasterVectorMask` の格納形式を圧縮形式にする。**~~ → **完了 (2026-08-26)**
+2. ~~flush の worker 化~~ / **import の worker 化は残り** (下記)
+3. サイドカーが肥大したときに気づける仕組み (サイズをログか設定画面へ) — **未着手**
+
+#### 1 と 2 の結果 (2026-08-26)
+
+正本は [preset-and-adjustment.md](preset-and-adjustment.md) §9.3 / §9.3.2。
+
+- **格納形式**: 画素ごとの値を `"<tag>:<count>:<base64(deflate(bytes))>"` へ詰める
+  ([crates/local-adjust-core/src/mask_codec.rs](../crates/local-adjust-core/src/mask_codec.rs))。
+  `serde` のフィールド属性なので、レイヤー配列を持つ**全ストアが同時に**新形式になる
+  (`local_adjust.db` / `mimageviewer.dat` / 編集 bundle / メタデータ移送)。
+- **量子化は 8bit**。実データの alpha は 0.0 / 1.0 だけ (31.5M 値中 99.95% が 0) だったが、
+  `SubjectMask` はマッティングモデルの連続値なので 1bit にはしない。2 値データなら
+  deflate が潰すので容量差も出ない。
+- **`RasterVectorMask` だけではなかった**。同じ形の per-pixel 配列が `RasterMask.alpha` /
+  `SubjectMask.alpha` / `SubjectMask.source_alpha` / `RegionMask.labels` にもある。5 か所まとめて直した。
+- **`local_adjust.db` も同じ欠陥で、しかもサイドカーより大きかった** (959 MB / 82 行 /
+  最大 1 行 93 MB)。そのページを開くたびに UI スレッドで 93 MB の数値配列をパースしていた。
+  `local_adjust_db::repack_legacy_masks` が起動時 worker で移行 + VACUUM する。
+- **移行の実測** (利用者の実データのコピー):
+
+  | | 前 | 後 | 時間 |
+  | --- | --- | --- | --- |
+  | `local_adjust.db` | 959.0 MB | 2.7 MB | 5.2 s (worker、82 行走査 / 69 行書換 / 0 skip) |
+  | `mimageviewer.dat` (415 items) | 733.9 MB | 0.6 MB | 読み 0.8s / 書き 0.3s |
+
+- **flush は非同期化**。`SidecarWriter` (専用スレッド 1 本)。まだ届いていない内容は
+  pending に残り `SidecarFile::load` がディスクより先に見るので、フォルダ切替が
+  書き込み完了を待つ ack は不要になった。
+- **定期フラッシュは 5 秒 → 10 分**、判定は「dirty になった時刻」から。通常の保存契機は
+  「編集ツールを抜けた時 / フォルダ切替 / アプリ終了」で、定期はクラッシュ・電源断用の保険。
+  「編集ツールを抜けた」は `page_edit_tool_owns_canvas` の true → false から導くので、
+  ツールが増えても呼び出し側を足さなくてよい。
+
+#### 残り
+
+- **import (`SidecarFile::load` + `import_to_dbs`) は UI スレッドのまま。**移行後は
+  0.6 MB / 数 ms なので実害は消えたが、§4 チェックリスト違反ではある。ネットワーク
+  ドライブや巨大フォルダでは効く。
+- **移行の 1 回目だけ UI が止まる** (実測 0.8 秒 / フォルダ)。旧形式を読む経路が
+  同期なので。2 回目以降は無い。
+- **mtime fast-path に当たり続けるフォルダは移行されない**。実害は disk 容量だけ
+  (開かないので遅くもならない)。開けば slow-path に入って移行される。
+- `metadata_transfer` の `FORMAT_VERSION` は **上げていない**。上げると `!=` 比較なので
+  新版が既存の v7 エクスポートを一切読めなくなる。上げない場合の副作用は「新版で
+  書き出した bundle を旧版で import すると layers のパースで失敗する」だけで、
+  データが黙って壊れる経路は無い。
+- **VACUUM は `local_adjust.db` だけ**。他の DB (tags.db 213MB / fts_meta.db 365MB /
+  audio_analysis.db 1.5GB) の肥大は別問題で、未調査。
