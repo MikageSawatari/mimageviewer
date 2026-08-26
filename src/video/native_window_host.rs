@@ -522,16 +522,20 @@ impl NativeWindowHost {
         placement: NativeVideoPlacement,
     ) -> bool {
         self.assert_owner_thread();
+        let show_t0 = std::time::Instant::now();
         let shown = if activate_on_show {
             self.presenter().show_and_raise()
         } else {
             self.presenter().show_no_activate()
         };
+        let show_ms = show_t0.elapsed().as_secs_f64() * 1000.0;
+        let focus_t0 = std::time::Instant::now();
         if super::native_child_should_set_focus(placement, activate_on_show) {
             unsafe {
                 let _ = SetFocus(Some(self.presenter().hwnd()));
             }
         }
+        let focus_ms = focus_t0.elapsed().as_secs_f64() * 1000.0;
         if placement.is_main_window_child() {
             super::native_window::set_in_window_video_child(
                 self.presenter().hwnd().0 as usize as u64,
@@ -539,6 +543,11 @@ impl NativeWindowHost {
         } else {
             super::native_window::set_in_window_video_child(0);
         }
+        crate::logger::log(format!(
+            "[native-video] show_for_placement placement={} activate={activate_on_show} \
+             show={show_ms:.1}ms set_focus={focus_ms:.1}",
+            placement.label(),
+        ));
         shown
     }
 

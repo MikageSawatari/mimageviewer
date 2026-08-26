@@ -1913,11 +1913,58 @@ COM cast と `VideoGradePipeline::new` / `VideoResamplePipeline::new` だけ。
 遅延構築されるので、`configure_fonts_with_settings` 自体は払っていない。
 事前に疑っていたので記録する — 測らなければここを直しに行っていた。
 
+#### `publish` の非対称は `SetFocus` だった (2026-08-26 実測、確定)
+
+probe を render / pump 両スレッドに入れて F12 を 5 回切替えた。
+`publish` の内訳は `hud=0.0 retire=0.0` で、**全部が pump 待ち**。pump 側も
+`queue=0.4〜3.7ms` (拾うのは遅くない) / `topology=0.0` / `intents=0.0` で、
+残りはすべて `publish_host` → `show_for_placement` の中にあった:
+
+| 呼び出し | main へ戻る | 別ウィンドウへ |
+| --- | --- | --- |
+| `ShowWindow` | 1.8〜2.1ms | 1.2〜1.7ms |
+| `SetWindowPos` | 0.1〜0.2ms | 0.0〜0.1ms |
+| **`SetFocus`** | **259.9 / 331.2ms** | **3.8 / 4.4ms** |
+
+**待ち時間は main UI スレッドのフレーム境界の整数倍**で、cross-thread の同期
+メッセージが 3〜4 往復していることを示す:
+
+- `18.176s` 開始 → `18.436s` 完了 (260ms)。間の UI フレーム = 18.176 / 18.260 / 18.343 / 18.432 — **3 間隔**
+- `10.958s` 開始 → `11.290s` 完了 (332ms)。間の UI フレーム = 11.026 / 11.112 / 11.197 / 11.285 — **4 間隔**
+
+#### なぜ main へ戻る向きだけ遅いのか — placement ではなかった
+
+`SetFocus` は両方向とも同じように呼ばれている (どちらも child window + activate=true)。
+違うのは、**その時点で main UI スレッドが遅いかどうか**だけ:
+
+> **動画が detached にある間だけ、main UI スレッドが 1 フレーム 43ms (`pre_grid` 41ms) ・周期 85ms になる。**
+
+- 遅いフレームの区間は `8.456→11.367s` と `14.864→18.432s`。**どちらも動画が
+  detached にある区間と一致**し、main へ戻すと止まる (18.432s 以降、ログ終端 25.1s まで 0 件)。
+- 同じ理由で `host_attach` も main 方向だけ 40〜45ms (`CreateWindowEx` が親へ
+  `WM_PARENTNOTIFY` を送る)。**最初の 1 回だけ 4.2ms** なのは、その時点では
+  まだ UI スレッドが速かったから。
+
+つまり **残りは「F12 の問題」ではなく「detached 再生中に main UI スレッドが
+1 フレーム 41ms かかる問題」**。これを直せば `SetFocus` と `CreateWindowEx` の待ちが
+同時に消え、**detached 再生中のアプリ全体のもたつきも同時に消える**。
+
+⚠ `SetFocus` を遅延・省略・別スレッド化して待ちを隠すのは対策にしない。
+
+#### 次の一手 — 41ms の `pre_grid` の中身
+
+`pg_top` には `selection_info:0.4ms` / `facet:0.3ms` しか出ておらず、**41ms の大半が
+名前の付いた区間の外**にある。ただし既存の perf event `ui/slow_frame_breakdown`
+([app.rs:67280](../src/app.rs:67280)) が `keep_fullscreen_viewport_ms` /
+`render_fullscreen_viewport_ms` / `ensure_native_video_front_ms` / `background_polls_ms` /
+`bars_ms` などに分解済みで、`perf::is_enabled() && frame > 30ms` で発火する。
+今回のフレームは 43〜45ms なので条件を満たす。
+**コード変更なしで、`--perf-log` を付けて同じ操作を 1 回取れば分かる。**
+
 **残りをやるなら優先順は:**
 
-1. **`publish` (289〜424ms、main へ戻る向きだけ)** — 往復の約 4 割。
-   `window_pump.target_ready` → `wait_for_native_window_published` の待ち。main 方向だけ
-   40 倍遅い理由を先に特定する (非対称なので原因があるはず)
+1. **detached 再生中の main UI スレッド 41ms/フレーム** — 上記のとおり、
+   `publish` (260〜331ms) と `host_attach` (40〜45ms) の両方の原因。まず内訳を取る
 2. **`egui_overlay` (116〜139ms × 2)** — 切替のたびに wgpu device を新規作成している
    (`request_device` 64〜72ms)。presenter 間で device を共有できるかを見る
 3. `d3d11_device` (27〜31ms × 2) — 同じく共有候補

@@ -38,6 +38,8 @@ use super::{
 const CONTROL_CAPACITY: usize = 64;
 const WINDOW_EVENT_CAPACITY: usize = 256;
 const PUMP_TICK: Duration = Duration::from_millis(4);
+/// A pump iteration this long starves whatever the render thread is waiting for.
+const PUMP_SLOW_ITERATION_MS: f64 = 20.0;
 const CHILD_REFLOW_TICK: Duration = Duration::from_millis(16);
 const OBSERVATION_TICK: Duration = Duration::from_millis(8);
 const HUD_RAISE_RETRY_OFFSETS: [Duration; 3] = [
@@ -66,6 +68,9 @@ enum PumpCommand {
         epoch: u64,
         topology: HostWindowTopology,
         startup_intents: Vec<NativeWindowIntent>,
+        /// When the render thread handed this over. The pump reports the pickup
+        /// delay so a busy pump is not mistaken for a slow publish (backlog 1.122).
+        issued_at: Instant,
     },
     TargetFailed {
         request: u64,
@@ -209,6 +214,7 @@ impl NativeWindowPumpRenderClient {
             epoch,
             topology,
             startup_intents,
+            issued_at: Instant::now(),
         })
     }
 
@@ -430,22 +436,43 @@ impl PumpRuntime {
             if self.channel_fault.swap(false, Ordering::AcqRel) {
                 self.quarantine("native video bounded event route overflow".to_string());
             }
+            let iter_t0 = Instant::now();
             self.drain_commands()?;
+            let commands_ms = iter_t0.elapsed().as_secs_f64() * 1000.0;
             // A typed Shutdown reducer posts the one final WM_QUIT only after every
             // owned HWND has been destroyed. Do not consume that expected quit as an
             // external fault on the way out of this iteration.
             if self.quitting {
                 break;
             }
+            let messages_t0 = Instant::now();
             if crate::video::native_window::pump_thread_messages_with_health(&self.health) {
                 return Err("native window pump received an unexpected WM_QUIT".to_string());
             }
+            let messages_ms = messages_t0.elapsed().as_secs_f64() * 1000.0;
+            let events_t0 = Instant::now();
             self.drain_window_events()?;
+            let events_ms = events_t0.elapsed().as_secs_f64() * 1000.0;
             if self.quitting {
                 break;
             }
+            let visual_t0 = Instant::now();
             self.apply_latest_visual();
+            let visual_ms = visual_t0.elapsed().as_secs_f64() * 1000.0;
+            let periodic_t0 = Instant::now();
             self.run_periodic_work();
+            let periodic_ms = periodic_t0.elapsed().as_secs_f64() * 1000.0;
+            // A pump iteration is ~4ms of sleep plus a little work. Anything an order
+            // of magnitude above that delays every command the render thread is
+            // waiting on, so name the phase that ate it (backlog 1.122).
+            let iter_ms = iter_t0.elapsed().as_secs_f64() * 1000.0;
+            if iter_ms >= PUMP_SLOW_ITERATION_MS {
+                crate::logger::log(format!(
+                    "[native-video] pump slow iteration total={iter_ms:.1}ms \
+                     commands={commands_ms:.1} messages={messages_ms:.1} \
+                     window_events={events_ms:.1} visual={visual_ms:.1} periodic={periodic_ms:.1}"
+                ));
+            }
             if !self.quitting {
                 std::thread::sleep(PUMP_TICK);
             }
@@ -507,7 +534,8 @@ impl PumpRuntime {
                 epoch,
                 topology,
                 startup_intents,
-            } => self.target_ready(request, epoch, topology, startup_intents)?,
+                issued_at,
+            } => self.target_ready(request, epoch, topology, startup_intents, issued_at)?,
             PumpCommand::TargetFailed { request, epoch } => {
                 self.dispatch(WindowHostInput::Event(WindowHostEvent::TargetFailed {
                     request: WindowRequestId(request),
@@ -674,6 +702,7 @@ impl PumpRuntime {
             self.pump_route.clone(),
             self.render_route.clone(),
         );
+        let create_t0 = Instant::now();
         let mut window = NativeWindowHost::create(NativeWindowHostConfig {
             window: super::native_window::NativeVideoWindowConfig {
                 mode: native_window_mode_for_placement(placement.placement, placement.rect),
@@ -694,6 +723,7 @@ impl PumpRuntime {
             },
             event_sink: hud_sink,
         })?;
+        let create_ms = create_t0.elapsed().as_secs_f64() * 1000.0;
         window.set_editor_hwnds_snapshot(self.config.editor_hwnds_snapshot.clone());
         window.set_main_hwnd_for_raise_check(self.config.main_hwnd_for_raise);
         let actual_spec = WindowHostSpec {
@@ -713,12 +743,21 @@ impl PumpRuntime {
         );
         self.hosts.insert(epoch, window);
         self.parent_sizes.insert(epoch, (width, height));
-        self.dispatch(WindowHostInput::Event(WindowHostEvent::WindowCreated {
+        let dispatch_t0 = Instant::now();
+        let result = self.dispatch(WindowHostInput::Event(WindowHostEvent::WindowCreated {
             request,
             epoch,
             spec: actual_spec,
             windows,
-        }))
+        }));
+        crate::logger::log(format!(
+            "[native-video] pump create_hidden epoch={} placement={} \
+             create_window={create_ms:.1}ms dispatch_with_attach={:.1}",
+            epoch.0,
+            placement.placement.label(),
+            dispatch_t0.elapsed().as_secs_f64() * 1000.0,
+        ));
+        result
     }
 
     fn attach_target(&mut self, host: HostedWindow) -> Result<(), String> {
@@ -753,18 +792,33 @@ impl PumpRuntime {
         epoch: u64,
         topology: HostWindowTopology,
         startup_intents: Vec<NativeWindowIntent>,
+        issued_at: Instant,
     ) -> Result<(), String> {
+        let queue_ms = issued_at.elapsed().as_secs_f64() * 1000.0;
         let key = WindowEpoch(epoch);
         let Some(window) = self.hosts.remove(&key) else {
             return Ok(());
         };
+        let topology_t0 = Instant::now();
         let window = window.retain_render_topology(topology);
         self.hosts.insert(key, window);
+        let topology_ms = topology_t0.elapsed().as_secs_f64() * 1000.0;
+        let intents_t0 = Instant::now();
         self.apply_window_intents(key, &startup_intents);
-        self.dispatch(WindowHostInput::Event(WindowHostEvent::TargetReady {
+        let intents_ms = intents_t0.elapsed().as_secs_f64() * 1000.0;
+        let dispatch_t0 = Instant::now();
+        let result = self.dispatch(WindowHostInput::Event(WindowHostEvent::TargetReady {
             request: WindowRequestId(request),
             epoch: key,
-        }))
+        }));
+        crate::logger::log(format!(
+            "[native-video] pump target_ready request={request} epoch={epoch} \
+             queue={queue_ms:.1}ms topology={topology_ms:.1} intents={intents_ms:.1} \
+             dispatch_with_destroy={:.1} intents_len={}",
+            dispatch_t0.elapsed().as_secs_f64() * 1000.0,
+            startup_intents.len(),
+        ));
+        result
     }
 
     fn publish_host(
@@ -784,6 +838,7 @@ impl PumpRuntime {
             .get(&host.epoch)
             .copied()
             .ok_or_else(|| format!("missing placement for publish epoch {}", host.epoch.0))?;
+        let show_t0 = Instant::now();
         match visibility {
             WindowVisibility::Visible => {
                 let _ = window.show_for_placement(placement.activate_on_show, placement.placement);
@@ -795,6 +850,8 @@ impl PumpRuntime {
                 self.presenter_visibility.publish_hidden(true);
             }
         }
+        let show_ms = show_t0.elapsed().as_secs_f64() * 1000.0;
+        let rest_t0 = Instant::now();
         self.hwnd_out
             .store(window.hwnd().0 as usize as u64, Ordering::Release);
         self.hud_hwnd_out
@@ -810,6 +867,14 @@ impl PumpRuntime {
         if window.hud_hwnd() != 0 {
             self.validate_published_window_owner(window.hud_hwnd());
         }
+        crate::logger::log(format!(
+            "[native-video] pump publish_host epoch={} placement={} visible={} \
+             show={show_ms:.1}ms rest={:.1}",
+            host.epoch.0,
+            placement.placement.label(),
+            visibility == WindowVisibility::Visible,
+            rest_t0.elapsed().as_secs_f64() * 1000.0,
+        ));
         self.send_lifecycle(PumpLifecycleEvent::Published {
             request: host.request.0,
             epoch: host.epoch.0,

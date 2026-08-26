@@ -4969,8 +4969,12 @@ fn run_native_video_output(
                         &new_presenter,
                         &overlay_outcome,
                     );
+                    let hud_ms = publish_t0.elapsed().as_secs_f64() * 1000.0;
+                    let retire_t0 = std::time::Instant::now();
                     frame_output.retire_completed(presenter.copy_fence_completed_value());
                     let old_retire_len = frame_output.retire_len();
+                    let retire_ms = retire_t0.elapsed().as_secs_f64() * 1000.0;
+                    let wait_t0 = std::time::Instant::now();
                     window_pump.target_ready(
                         host_request,
                         candidate_epoch,
@@ -4983,6 +4987,7 @@ fn run_native_video_output(
                         candidate_epoch,
                         &cancel,
                     )?;
+                    let wait_ms = wait_t0.elapsed().as_secs_f64() * 1000.0;
                     let publish_ms = publish_t0.elapsed().as_secs_f64() * 1000.0;
                     let detach_t0 = std::time::Instant::now();
                     let old_presenter = std::mem::replace(&mut presenter, new_presenter);
@@ -5011,7 +5016,9 @@ fn run_native_video_output(
                     crate::logger::log(format!(
                         "[native-video] placement switched placement={} {}x{} primed={} request={} generation={} \
                          total={:.1}ms (host_attach={attach_ms:.1} render_core_new={core_new_ms:.1} \
-                         prepare={prepare_ms:.1} publish={publish_ms:.1} detach_old={detach_ms:.1})",
+                         prepare={prepare_ms:.1} \
+                         publish={publish_ms:.1}[hud={hud_ms:.1} retire={retire_ms:.1} wait={wait_ms:.1}] \
+                         detach_old={detach_ms:.1})",
                         placement.label(),
                         attach.width,
                         attach.height,
