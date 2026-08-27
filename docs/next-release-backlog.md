@@ -2995,7 +2995,7 @@ Codex は方針に同意したうえで、一次分類案に **5 件の反例**�
   待ち方を変えるのであって、待たなくするのではない。
 - 規模 \\ 優先度: Small 〜 Medium / P3。
 
-### 1.131 v3.3.0 出荷前レビュー (Codex) の指摘と対応 ✅ 完了 (2026-08-27)
+### 1.132 v3.3.0 出荷前レビュー (Codex) の指摘と対応 ✅ 再レビュー承認済み (2026-08-27、実機確認待ち)
 
 - 出典: 2026-08-27、Codex による `v3.2.0..HEAD` の出荷前レビュー。
   実装は Codex Sol、検収は ClaudeCode (3 本の brief に分けて実施)。
@@ -3042,6 +3042,87 @@ worker pool (5〜14 スレッド) の condvar を起こす唯一の経路なの�
 ただし P2-3 のうち **「canonical な `return_to` があるときでも fallback slot を
 消費していた」半分は単一窓でも成立する**ので、こちらは実害の修正。
 
+#### P2-2 re-review follow-up — detached descriptor open が main filter suppression を変更 ✅
+
+`open_grid_item_in_detached_book_context_with_auto_fullscreen` の Descriptor arm は、
+fresh detached bundle を作る前の mounted main projection 上で rating / facet suppression を
+立てていた。★付き ZIP / PDF を別窓へ開くと main の
+`rating_filter_suppressed_at`、facet filter、suppression stack が変わる実到達バグだった。
+
+2026-08-27 修正。Descriptor helper から抑制を外し、detached start 不成立後に main navigation を
+採用する通常到達3入口 (Enter / double-click / gamepad accept) と、明示 container mode の
+static site 1箇所の計4箇所にある既存抑制だけを正本にした。FolderCandidate も分類後の main
+fallback だけが抑制し、ConvertibleArchiveCandidate の detached completion は抑制しない。実 producer で★付き
+ZIP/PDFを開くテストを追加し、main state 不変と detached の全ページ表示を固定した。
+
+#### follow-up — reading-history owner と convertible 非遷移 lifecycle ✅
+
+2026-08-27 修正。Enter、double-click、gamepad accept、明示 container mode の4 static site は、
+detached arbitration が main fallback を採用した後だけ `reading_history_return_from` を更新する。
+このうち通常到達するのは前3入口で、明示 mode は multi-window 時に副作用なしで早期 return する。
+
+残っていた反例は `GridItem::ConvertibleArchive` だった。main fallback 採用後でも、Ignore 判定や
+非同期変換 request より前に reading-history 予約、rating / facet suppression stack、smart-folder
+position を更新していたため、Ignore と dialog cancel で画面が遷移しないのに main state だけが
+変わっていた。`MainGridArchiveTransitionIntent` を既存の open / convert request owner に保持し、
+cache / RAR direct / 変換完了の実 load 成功時だけ4状態を commit する。Ignore、request start failure、
+dialog cancel は intent を捨てるだけで main items と4状態を変えない。これは d7645901 の regression
+ではない。同 commit より前から `note_reading_history_open` は入口先頭にあり、d7645901 は呼出しを
+convertible arm 内へ移したものの Ignore 判定より前という誤った側を維持し、両 suppression も元から
+同じ側にあった。
+
+#### final P2 — ★固定中の変換 cache alias と拒否前 mutation ✅
+
+2026-08-27 修正。★固定 snapshot の member は source `book.7z` だが、cache hit と非同期変換完了は
+実体の cache ZIP を `load_folder_with_scan_claimed` へ渡すため、実 path だけを見ていた snapshot guard が
+正当な open を範囲外として拒否していた。`OpenRequestOwner::MainGridArchive` の
+`MainGridArchiveTransitionIntent::source_path` を snapshot scope identity とし、既存の
+`snapshot_owner_entry` (完全一致 + separator-aware prefix 一致) へ渡す。cache path との OR にはせず、
+source 自体が snapshot member / member container 配下でない要求は従来どおり拒否する。
+
+同 guard は smart-folder session の認可 consume / surface clear、folder-pane cancel、synthetic restore、
+smart scope reconcile、reading-history reservation clear、bookmark return reconcile より後ろにあった。
+これらは guard が読む snapshot / navigation scope / typed owner identity の成立には不要なので、guard を
+`load_folder_with_scan_claimed` の先頭 precondition へ移した。拒否時に残す effect は stale な
+`pending_auto_fs_open` の破棄と feedback toast だけで、main の表示・復元 ownership は変更しない。
+
+実 gamepad producer からの同期 cache hit、同 producerが作った request の `ConvertDone` completion、
+範囲外の common load 拒否を回帰テストにした。前2本は source alias 解決を cache ZIP 判定へ戻す mutation、
+拒否テストは smart session consume / clear または reading-history reconcile を guard より上へ戻す mutation で
+失敗する。拒否テストは smart session の `Option` だけでなく、拒否後も one-shot source 認可を実
+`preserve_smart_folder_session_for_load` 境界で consume できること、main items と snapshot count が同一なことを
+確認する。Folder / ZIP / PDF の3通常入口 + 明示 mode static site が `AddressBarNav::Direct` の common guard
+より前に caller-side effect を commit する既知の同型は、本 defect の funnel 内修正には含めていない。
+
+#### final P2 re-review — scope preflight と RAR generation swap ✅
+
+2026-08-27 修正。`claim_open_request_owner` は snapshot scope guard より前で、拒否される
+navigation でも進行中の archive conversion、未解決 startup open、競合 bookmark open を
+終了していた。navigation scope、snapshot active、`snapshot_internal_nav`、typed owner の
+source identity だけを読む純粋な `snapshot_scope_allows_open` へ判定を集約し、container
+dispatcher と pre-scan 対応 folder load の2入口では claim より前に実行する。common load の
+既存 guard も同じ述語を使う。cache path と source path は OR にせず、
+`MainGridArchiveTransitionIntent::source_path` が実 path を置き換える。ユーザー操作の拒否 effect は
+共通 helper 1箇所に置き、stale `pending_auto_fs_open` clear と既存 toast を1回だけ行う。
+
+dialog を隠して走る RAR direct-read 完了も、実 load / auto-fullscreen 予約 / smart-folder 認可より
+前に現在 snapshot で同じ preflight を再実行する。generation N の pin 中に始めた RAR が、解除と
+filter 変更を経た generation N+1 に含まれなければ旧完了を捨てる。これは現在のユーザー操作では
+ないため toast は出さず、通常ログだけを残す。`ArchiveConvertState` の Drop による cancel token、
+deferred fullscreen の `release_fs_nav_lock`、bookmark request cleanup は拒否 branch でも完了する。
+
+PDF の guard 非経由 route は password dialog の OK retry と detached descriptor だけだった。
+前者は `show_pdf_password_dialog` が common modal input blocker に入り、背面で snapshot の解除・
+filter 変更・再固定を行えない。後者は `DetachedPhysical` context である。現行 UI から同じ
+generation swap は到達不能なので、規則7に従い変更していない。
+
+回帰テストは両 claim 入口で archive request / cancel token を保持し、未解決 startup owner と
+競合 bookmark owner も保持すること、RAR generation swap が load を拒否しつつ state Drop と nav
+lock cleanup を終えること、current generation 内の RAR は通常どおり開くことを固定した。
+mutation は `move_scope_preflight_below_claim`、
+`omit_rar_direct_completion_scope_preflight`、
+`reject_all_rar_direct_completions_in_snapshot`。
+
 #### §1.126 / §1.127 — 添字空間の追従 ✅
 
 `SnapshotState` に `saved_image_metas` / `list_view_image_metas` を追加し、
@@ -3076,6 +3157,64 @@ Codex の修正の半分が消えたままになった** (→ マーカーを残
 かつ `git diff --numstat` を Codex 申告値と突き合わせる)。
 
 - 規模 \\ 優先度: — (完了)。
+
+### 1.133 外部 Activation が scope 判定より前に変換をキャンセルする — 未対応
+
+- 出典: 2026-08-27、§1.132 (v3.3.0 出荷前レビュー) の追加確認で Codex が発見。
+  **v3.3.0 出荷前に閉じる対象**。
+
+[startup_ops.rs](../src/app/startup_ops.rs) の Activation 分岐は、**パス解決と
+snapshot scope 判定より前に無条件で** `cancel_archive_convert_for_navigation` を呼ぶ:
+
+```rust
+if matches!(source, StartupOpenPathSource::Activation) {
+    self.cancel_archive_convert_for_navigation("activation_navigation");
+```
+
+したがって「**範囲外 Activation → 変換が先に死ぬ → その後 navigation は拒否**」
+が成立する。SendTo / 二重起動で踏める。`3aaa4659` で入れた preflight は
+UI producer の claim だけを覛っており、**この経路は覛えていない**。
+
+#### ⚠ 単に削除してはいけない
+
+この早期キャンセルは「Activation の解決中に、古い bookmark / archive completion が
+表示へ着地する race」を防ぐために入っている (コメントに明記あり、
+既存テストも「Activation は解決前にキャンセルする」を固定している)。
+
+正しい形は **Activation に request ownership / 世代を持たせ、
+scope admission の後で supersede を確定させる**こと。そうしないと、早期
+キャンセル導入前の race が戻る。
+
+#### 手動再現 (Codex 提示)
+
+1. キャッシュ未作成で変換に時間のかかる大きめの 7z をフォルダ A に置く
+2. 範囲外のフォルダ B を用意する
+3. A の一覧を ★固定 (7z が member、B が範囲外)
+4. 「確認せず変換」で 7z を開き、進捗ウィンドウが出るまで待つ
+5. **その最中に SendTo / 二重起動で B を既存インスタンスへ転送**
+6. 現状: 進捗ウィンドウが消えて変換がキャンセルされ、その後 B が範囲外として拒否される
+
+- 規模 \\ 優先度: Small 〜 Medium / **P2 (v3.3.0 出荷前)**。
+
+### 1.134 common modal がツールバー / メニューバーのポインターナビを止めていない — 未対応
+
+- 出典: 2026-08-27、§1.133 の調査中に Codex が発見。**archive convert 固有ではなく、
+  全 common-modal window に関わる入力ゲートの不統一**。
+
+`common_modal_dialog_open` に登録された window は、キーボードショートカット /
+グリッド open / 背面 wheel / フルスクリーン入力を止めるが、**ツールバーの
+お気に入りボタンなどのポインターナビは止まらない** (`any_dialog_open()` で
+無効化されていない)。
+
+変換進捗ウィンドウ表示中でもお気に入りクリックでナビできるのはこれが原因。
+これ自体は §1.133 の修正対象ではない (preflight が拒否するので安全) が、
+**モーダルの意味が入力種別で違う**のは設計として不揃い。
+
+⚠ `archive_convert` を `archive_convert.is_some()` で一括登録するのは**誤り**。
+意図的に非表示にしている `Scanning` 中まで操作不能になる。現行の
+`archive_convert_dialog_visible()` 経由の登録が正しい。
+
+- 規模 \\ 優先度: Medium / P3 (出荷ブロッカーではない)。
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 

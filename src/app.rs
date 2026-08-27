@@ -332,6 +332,21 @@ pub(crate) struct DetachedGridArchiveOpenRequestOwner {
     pub(crate) source_path: PathBuf,
 }
 
+/// Main-grid state that may change only after a convertible archive has actually become the
+/// mounted main destination.
+///
+/// The intent is captured while the source grid item still exists, then travels with the existing
+/// archive open request. Ignore, request-start failure, and cancellation drop it without touching
+/// the mounted main state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MainGridArchiveTransitionIntent {
+    source_path: PathBuf,
+    reading_history_return_from: Option<PathBuf>,
+    suppress_rating_filter: bool,
+    suppress_facet_filter: bool,
+    smart_folder_drill: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DetachedGridArchiveOpenOutcome {
     Opened,
@@ -342,6 +357,7 @@ pub(crate) enum DetachedGridArchiveOpenOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OpenRequestOwner {
     Navigation,
+    MainGridArchive(MainGridArchiveTransitionIntent),
     Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner),
     DetachedGridArchive(DetachedGridArchiveOpenRequestOwner),
 }
@@ -16112,10 +16128,91 @@ impl App {
         if !is_container {
             return;
         }
+        let Some(path) = item.container_path().map(Path::to_path_buf) else {
+            return;
+        };
+        self.note_reading_history_container_open_path(&path);
+    }
+
+    /// main navigation がコンテナを採用した境界で、閲覧履歴への戻り先予約を更新する。
+    fn note_reading_history_container_open_path(&mut self, path: &Path) {
         if self.items_are_reading_history_view {
-            self.reading_history_return_from = item.container_path().map(|p| p.to_path_buf());
+            self.reading_history_return_from = Some(path.to_path_buf());
         } else {
             self.reading_history_return_from = None;
+        }
+    }
+
+    /// Capture the main-grid effects of opening a convertible archive without applying them.
+    /// The source item may be gone by the time an asynchronous conversion completes, so every
+    /// decision that depends on the source grid is recorded here.
+    pub(crate) fn main_grid_archive_open_owner(
+        &mut self,
+        idx: usize,
+        source_path: &Path,
+    ) -> OpenRequestOwner {
+        debug_assert!(matches!(
+            self.items.get(idx),
+            Some(GridItem::ConvertibleArchive { path, .. })
+                if crate::folder_tree::path_eq(path, source_path)
+        ));
+
+        let suppress_rating_filter =
+            if self.rating_filter_suppressed_at.is_none() && self.rating_filter_active() {
+                let stars = self.get_rating(idx);
+                (1..=5).contains(&stars)
+                    && self.items.get(idx).is_some_and(|item| {
+                        passes_rating_filter(item, stars, &self.settings.rating_filter)
+                    })
+            } else {
+                false
+            };
+        let suppress_facet_filter =
+            self.facet_filter_active() && self.passes_facet_filter(idx, None);
+
+        OpenRequestOwner::MainGridArchive(MainGridArchiveTransitionIntent {
+            source_path: source_path.to_path_buf(),
+            reading_history_return_from: self
+                .items_are_reading_history_view
+                .then(|| source_path.to_path_buf()),
+            suppress_rating_filter,
+            suppress_facet_filter,
+            smart_folder_drill: self.top_level_grid_view.smart_folder_session().is_some(),
+        })
+    }
+
+    /// Smart-folder sessions require a one-shot authorization before the common load boundary can
+    /// preserve their prepared grid. This does not advance the smart-folder position; the actual
+    /// position is committed only after the caller proves that the load succeeded.
+    pub(crate) fn prepare_main_grid_archive_transition_for_load(
+        &mut self,
+        owner: &OpenRequestOwner,
+        load_path: &Path,
+    ) {
+        let OpenRequestOwner::MainGridArchive(intent) = owner else {
+            return;
+        };
+        if !intent.smart_folder_drill {
+            return;
+        }
+        let _ = self.authorize_smart_folder_session_open(load_path);
+    }
+
+    /// Commit the source-grid transition exactly once, after the destination load has been adopted
+    /// by main. In particular, conversion request adoption is not a commit boundary.
+    pub(crate) fn commit_main_grid_archive_transition(&mut self, owner: &OpenRequestOwner) {
+        let OpenRequestOwner::MainGridArchive(intent) = owner else {
+            return;
+        };
+        self.reading_history_return_from = intent.reading_history_return_from.clone();
+        if intent.smart_folder_drill {
+            self.begin_smart_folder_drill(&intent.source_path);
+        }
+        if intent.suppress_rating_filter {
+            self.maybe_suppress_rating_filter_for_opened_container_path(&intent.source_path);
+        }
+        if intent.suppress_facet_filter {
+            self.maybe_suppress_facet_filter_for_opened_container_path(&intent.source_path);
         }
     }
 
@@ -18102,6 +18199,12 @@ impl App {
         auto_fullscreen: bool,
         owner: OpenRequestOwner,
     ) -> FolderOpenOutcome {
+        // Scope refusal must precede lifecycle adoption: claim_open_request_owner cancels an
+        // in-flight archive conversion, unresolved startup open, and conflicting bookmark open.
+        if !self.snapshot_scope_allows_open(&path, &owner) {
+            self.reject_snapshot_out_of_scope_open();
+            return FolderOpenOutcome::Ignored;
+        }
         // Claim the visible-open lifecycle before dispatching by container type. In particular,
         // archive B must replace an in-flight archive A before request_* observes the old state.
         if !self.claim_open_request_owner(&path, &owner) {
@@ -18183,10 +18286,45 @@ impl App {
         pre_scan: Option<ScannedDir>,
         owner: OpenRequestOwner,
     ) {
+        if !self.snapshot_scope_allows_open(&path, &owner) {
+            self.reject_snapshot_out_of_scope_open();
+            return;
+        }
         if !self.claim_open_request_owner(&path, &owner) {
             return;
         }
         self.load_folder_with_scan_claimed(path, pre_scan, owner);
+    }
+
+    /// Pure preflight for whether a visible open belongs to the current snapshot scope.
+    ///
+    /// A converted cache ZIP is an implementation alias. Main-grid archive requests therefore
+    /// use the source identity captured by their typed owner instead of the load path; the two
+    /// paths are deliberately not OR-ed because that would widen the pinned scope.
+    pub(crate) fn snapshot_scope_allows_open(&self, path: &Path, owner: &OpenRequestOwner) -> bool {
+        if self.navigation_scope.is_detached_physical()
+            || !self.is_snapshot_active()
+            || self.snapshot_internal_nav
+        {
+            return true;
+        }
+        let scope_path = match owner {
+            OpenRequestOwner::MainGridArchive(intent) => &intent.source_path,
+            OpenRequestOwner::Navigation
+            | OpenRequestOwner::Bookmark(_)
+            | OpenRequestOwner::DetachedGridArchive(_) => path,
+        };
+        self.snapshot_owner_entry(scope_path).is_some()
+    }
+
+    /// Apply the user-visible effects of one refused open exactly once at its earliest boundary.
+    fn reject_snapshot_out_of_scope_open(&mut self) {
+        // A blocked load cannot consume an auto-fullscreen reservation. Clear any stale request
+        // so the next valid open does not unexpectedly enter fullscreen.
+        self.pending_auto_fs_open = false;
+        self.show_feedback_toast(
+            "スナップショット中は範囲外のフォルダに移動できません (★固定を解除してください)".into(),
+        );
     }
 
     /// Acquire the right to perform a visible load before any format-specific dispatch.
@@ -18197,7 +18335,7 @@ impl App {
     /// `cancel_archive_convert_for_navigation_to`.
     fn claim_open_request_owner(&mut self, path: &Path, owner: &OpenRequestOwner) -> bool {
         match owner {
-            OpenRequestOwner::Navigation => {
+            OpenRequestOwner::Navigation | OpenRequestOwner::MainGridArchive(_) => {
                 if self.navigation_scope.is_detached_physical() {
                     // Archive conversion, unresolved startup opens, and bookmark
                     // opens are App-global main requests. A detached context can
@@ -18290,6 +18428,22 @@ impl App {
         owner: OpenRequestOwner,
     ) {
         let detached_physical = self.navigation_scope.is_detached_physical();
+        // ★固定 (Snapshot Lock) 中は **範囲外** フォルダへの移動を block する (= §4.4)。
+        // 範囲内 (= snapshot 内 entry またはその下の階層) は自由に navigate 可能。
+        // 変換 cache ZIP は source archive の実装 alias なので、typed owner が保持する
+        // source identity に対して同じ完全一致 / prefix owner 解決を行う。source 自体が
+        // snapshot 範囲外なら cache の場所にかかわらず拒否される。
+        // snapshot_internal_nav は snapshot_load_and_open 経由の forced bypass (= 既知
+        // safe path のみ)、ここの owner_entry チェックは UI 経由 click を扱う。
+        if !self.snapshot_scope_allows_open(&path, &owner) {
+            self.reject_snapshot_out_of_scope_open();
+            return;
+        }
+        // A converted cache ZIP is an implementation alias outside the source archive's smart
+        // scope. Keep the resident session mounted here; the typed owner commits the logical
+        // source path only after the cache/direct load proves successful.
+        let defer_main_grid_archive_transition =
+            matches!(&owner, OpenRequestOwner::MainGridArchive(_));
         if !detached_physical && !smart_folder::is_smart_folder_synthetic_path(&path) {
             let preserve_smart_folder_session = self.preserve_smart_folder_session_for_load(&path);
             if self.smart_folder_pending.is_some()
@@ -18318,7 +18472,9 @@ impl App {
                 self.suppress_nav_record_for_search_restore = false;
                 return;
             }
-            self.reconcile_smart_folder_scoped_real_folder_load(&path);
+            if !defer_main_grid_archive_transition {
+                self.reconcile_smart_folder_scoped_real_folder_load(&path);
+            }
         }
         if matches!(
             self.top_level_grid_view.surface(),
@@ -18338,30 +18494,13 @@ impl App {
         {
             self.reading_history_return_from = None;
         }
-        if !detached_physical && matches!(owner, OpenRequestOwner::Navigation) {
-            self.reconcile_bookmark_return_target_for_folder_load(&path);
-        }
-        // ★固定 (Snapshot Lock) 中は **範囲外** フォルダへの移動を block する (= §4.4)。
-        // 範囲内 (= snapshot 内 entry またはその下の階層) は自由に navigate 可能
-        // (§4.4 「captured folder の中の child folder」)。判定は `snapshot_owner_entry`
-        // で path 完全一致または prefix 一致を見る。
-        // snapshot_internal_nav は snapshot_load_and_open 経由の forced bypass (= 既知
-        // safe path のみ)、ここの owner_entry チェックは UI 経由 click を扱う。
         if !detached_physical
-            && self.is_snapshot_active()
-            && !self.snapshot_internal_nav
-            && self.snapshot_owner_entry(&path).is_none()
+            && matches!(
+                owner,
+                OpenRequestOwner::Navigation | OpenRequestOwner::MainGridArchive(_)
+            )
         {
-            // 範囲外で load がブロックされると、開く直前に立てた自動フルスクリーン予約を
-            // load_zip_as_folder が消化できず stale 化する (Codex P3: ★固定中に範囲外の
-            // 変換アーカイブ/ZIP/PDF を開こうとしたケース)。ここで明示的にクリアして、
-            // 次の正当な open が誤ってフルスクリーンになるのを防ぐ。
-            self.pending_auto_fs_open = false;
-            self.show_feedback_toast(
-                "スナップショット中は範囲外のフォルダに移動できません (★固定を解除してください)"
-                    .into(),
-            );
-            return;
+            self.reconcile_bookmark_return_target_for_folder_load(&path);
         }
         // perf: UI スレッドをブロックする load_folder 全体の wall time を計測する。
         // Ctrl+↑↓ 連打時の引っかかりの主要因がここに集まる想定。
@@ -34252,8 +34391,6 @@ impl App {
                     if !self.guard_reading_history_open(idx) {
                         return None;
                     }
-                    // 閲覧履歴ビューから本を開く場合は、閉じたときに閲覧履歴へ戻れるよう予約する。
-                    self.note_reading_history_open(idx);
                     // ファイル名スタックの集約グリッドでメディアセルを Enter したら、フラット読書
                     // フルスクリーンへ (スタック/単独画像/動画を直接開く)。コンテナは false で通常へ。
                     // ただし Shift+Enter で動画を外部プレイヤーに渡す経路は intercept より優先する
@@ -34283,6 +34420,8 @@ impl App {
                             {
                                 return None;
                             }
+                            // detached に採用されず、通常の main navigation が確定した境界で更新する。
+                            self.note_reading_history_open(idx);
                             if auto_fs {
                                 self.pending_auto_fs_open = true;
                             }
@@ -34318,9 +34457,7 @@ impl App {
                         }
                         Some(GridItem::ConvertibleArchive { path, .. }) => {
                             let pf = path.clone();
-                            self.begin_smart_folder_drill(&pf);
-                            self.maybe_suppress_rating_filter_for_opened_container(idx);
-                            self.maybe_suppress_facet_filter_for_opened_container(idx);
+                            let owner = self.main_grid_archive_open_owner(idx, &pf);
                             let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
                             let search_rollback = if self.favsearch.active
                                 || self.tag_view.active
@@ -34338,7 +34475,9 @@ impl App {
                             }
                             self.record_rating_view_nav_open(&pf);
                             let open_outcome = self
-                                .load_folder_or_convert_archive_with_auto_fullscreen(pf, auto_fs);
+                                .load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                                    pf, auto_fs, owner,
+                                );
                             match (open_outcome, search_rollback) {
                                 (FolderOpenOutcome::ConversionDialogOpened, Some(snapshot)) => {
                                     self.attach_archive_convert_nav_history_rollback(snapshot);
@@ -35100,6 +35239,7 @@ impl App {
                     // Rejoin the exact main navigation pipeline used by Enter/double-click/
                     // gamepad. This restores history/search/smart-folder behavior for mixed
                     // folders instead of terminating an unmaterialized detached context.
+                    self.note_reading_history_container_open_path(&ready.path);
                     if let Some(idx) = self.items.iter().position(|item| {
                         matches!(
                             item,
@@ -35322,7 +35462,6 @@ impl App {
         if !self.guard_reading_history_open(idx) {
             return None;
         }
-        self.note_reading_history_open(idx);
 
         let auto_fs = mode.auto_fullscreen();
         match item {
@@ -35337,6 +35476,7 @@ impl App {
                 if auto_fs && !self.park_active_detached_context_for_new_grid_open(ctx, idx) {
                     return None;
                 }
+                self.note_reading_history_open(idx);
                 self.pending_auto_fs_open = auto_fs;
                 self.maybe_suppress_rating_filter_for_opened_container(idx);
                 self.maybe_suppress_facet_filter_for_opened_container(idx);
@@ -35345,9 +35485,7 @@ impl App {
                 Some(crate::ui_main::AddressBarNav::Direct(p))
             }
             GridItem::ConvertibleArchive { path, .. } => {
-                self.begin_smart_folder_drill(&path);
-                self.maybe_suppress_rating_filter_for_opened_container(idx);
-                self.maybe_suppress_facet_filter_for_opened_container(idx);
+                let owner = self.main_grid_archive_open_owner(idx, &path);
                 let search_rollback = if self.favsearch.active
                     || self.tag_view.active
                     || self.rating_view_nav_context_active()
@@ -35363,8 +35501,9 @@ impl App {
                     self.record_tag_view_nav_open(&path);
                 }
                 self.record_rating_view_nav_open(&path);
-                let open_outcome =
-                    self.load_folder_or_convert_archive_with_auto_fullscreen(path, auto_fs);
+                let open_outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                    path, auto_fs, owner,
+                );
                 match (open_outcome, search_rollback) {
                     (FolderOpenOutcome::ConversionDialogOpened, Some(snapshot)) => {
                         self.attach_archive_convert_nav_history_rollback(snapshot);
@@ -40130,8 +40269,8 @@ impl App {
                 self.cancel_detached_grid_archive_open_for_replacement(
                     "detached_grid_archive_replaced_by_descriptor",
                 );
-                self.maybe_suppress_rating_filter_for_opened_container(idx);
-                self.maybe_suppress_facet_filter_for_opened_container(idx);
+                // Suppression belongs to the ordinary main-navigation branches in the callers.
+                // A committed DetachedPhysical context ignores App-global display filters.
                 descriptor
             }
             DetachedGridItemOpenPlan::FolderCandidate { path } => {
