@@ -11949,6 +11949,153 @@ mod phase_c_drill_nav_tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn detached_container_open_via_gamepad_preserves_main_reading_history_return() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        let mut app = setup_app();
+        let reserved_book = app.tmp.path().join("history-book.zip");
+        let detached_book = app.tmp.path().join("other-book.pdf");
+
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.current_folder = Some(reserved_book.clone());
+        app.items_are_reading_history_view = false;
+        app.reading_history_return_from = Some(reserved_book.clone());
+        app.items = vec![GridItem::PdfFile(detached_book)];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+
+        assert!(
+            app.handle_gamepad_grid_accept(&egui::Context::default())
+                .is_none(),
+            "detached open must consume the main navigation"
+        );
+        assert!(
+            app.active_viewer_context_id().is_some(),
+            "the gamepad route must drive a real detached book open"
+        );
+        assert_eq!(
+            app.reading_history_return_from,
+            Some(reserved_book.clone()),
+            "detached navigation must not clear the mounted main reservation"
+        );
+        assert!(matches!(
+            app.reading_history_back_nav(),
+            Some(crate::ui_main::AddressBarNav::ReadingHistory)
+        ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn main_container_open_via_gamepad_sets_or_clears_reading_history_return() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+
+        for from_history in [true, false] {
+            let mut app = setup_app();
+            let book = app.tmp.path().join(if from_history {
+                "from-history.pdf"
+            } else {
+                "ordinary.pdf"
+            });
+            std::fs::write(&book, b"pdf fixture").unwrap();
+            let previous = app.tmp.path().join("previous.zip");
+
+            app.settings.detached_viewer_open_images_in_window = false;
+            app.settings.auto_fullscreen_zip_pdf = false;
+            app.items_are_reading_history_view = from_history;
+            app.reading_history_return_from = Some(previous);
+            app.items = vec![GridItem::PdfFile(book.clone())];
+            app.thumbnails = vec![ThumbnailState::Pending];
+            app.image_metas = vec![None];
+            app.visible_indices = vec![0];
+            app.selected = Some(0);
+
+            assert!(matches!(
+                app.handle_gamepad_grid_accept(&egui::Context::default()),
+                Some(crate::ui_main::AddressBarNav::Direct(path)) if path == book
+            ));
+            assert_eq!(
+                app.reading_history_return_from,
+                from_history.then_some(book),
+                "ordinary main navigation must preserve the historical set/clear semantics"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn main_folder_candidate_fallback_updates_reading_history_at_adoption() {
+        use crate::app::{FolderOpenScanPurpose, FolderPaneOpenPending, scan_directory};
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, mpsc};
+
+        for from_history in [true, false] {
+            let mut app = setup_app();
+            let parent = app.tmp.path().join(if from_history {
+                "history-parent"
+            } else {
+                "ordinary-parent"
+            });
+            let folder = parent.join("mixed-folder");
+            std::fs::create_dir_all(folder.join("nested-container")).unwrap();
+            let previous = app.tmp.path().join("previous.zip");
+            let initial_reservation = (!from_history).then_some(previous);
+            let scan = scan_directory(&folder);
+
+            app.settings.detached_viewer_open_images_in_window = true;
+            app.settings.auto_fullscreen_image_folders = true;
+            app.current_folder = Some(parent);
+            app.items_are_reading_history_view = from_history;
+            app.reading_history_return_from = initial_reservation.clone();
+            app.items = vec![GridItem::Folder(folder.clone())];
+            app.thumbnails = vec![ThumbnailState::Pending];
+            app.image_metas = vec![None];
+            app.visible_indices = vec![0];
+            app.selected = Some(0);
+
+            assert!(
+                app.handle_gamepad_grid_accept(&egui::Context::default())
+                    .is_none(),
+                "the folder candidate must be consumed until classification completes"
+            );
+            assert_eq!(
+                app.reading_history_return_from, initial_reservation,
+                "starting main-owned classification is not yet main navigation"
+            );
+
+            let (scan_tx, scan_rx) = mpsc::channel();
+            scan_tx.send(Ok(scan)).unwrap();
+            let real_pending = app
+                .folder_pane_open_pending
+                .take()
+                .expect("the real gamepad path must start folder classification");
+            real_pending.cancel.store(true, Ordering::Relaxed);
+            app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                path: folder.clone(),
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx: scan_rx,
+                purpose: FolderOpenScanPurpose::GridFolderCandidate,
+            });
+            let ready = app
+                .poll_folder_pane_open(&egui::Context::default())
+                .expect("the deterministic mixed-folder scan must complete");
+            let (adopted_path, _) = app
+                .resolve_main_folder_open_ready(&egui::Context::default(), ready)
+                .expect("a mixed folder must fall back to ordinary main navigation");
+
+            assert_eq!(adopted_path, folder);
+            assert_eq!(
+                app.reading_history_return_from,
+                from_history.then_some(adopted_path),
+                "the adopted main fallback must preserve the historical set/clear semantics"
+            );
+        }
+    }
+
+    #[test]
     fn reading_history_back_nav_handles_converted_archive() {
         use crate::archive_converter::ArchiveFormat;
         use crate::grid_item::GridItem;

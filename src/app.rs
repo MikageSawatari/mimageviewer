@@ -16101,8 +16101,16 @@ impl App {
         if !is_container {
             return;
         }
+        let Some(path) = item.container_path().map(Path::to_path_buf) else {
+            return;
+        };
+        self.note_reading_history_container_open_path(&path);
+    }
+
+    /// main navigation がコンテナを採用した境界で、閲覧履歴への戻り先予約を更新する。
+    fn note_reading_history_container_open_path(&mut self, path: &Path) {
         if self.items_are_reading_history_view {
-            self.reading_history_return_from = item.container_path().map(|p| p.to_path_buf());
+            self.reading_history_return_from = Some(path.to_path_buf());
         } else {
             self.reading_history_return_from = None;
         }
@@ -34240,8 +34248,6 @@ impl App {
                     if !self.guard_reading_history_open(idx) {
                         return None;
                     }
-                    // 閲覧履歴ビューから本を開く場合は、閉じたときに閲覧履歴へ戻れるよう予約する。
-                    self.note_reading_history_open(idx);
                     // ファイル名スタックの集約グリッドでメディアセルを Enter したら、フラット読書
                     // フルスクリーンへ (スタック/単独画像/動画を直接開く)。コンテナは false で通常へ。
                     // ただし Shift+Enter で動画を外部プレイヤーに渡す経路は intercept より優先する
@@ -34271,6 +34277,8 @@ impl App {
                             {
                                 return None;
                             }
+                            // detached に採用されず、通常の main navigation が確定した境界で更新する。
+                            self.note_reading_history_open(idx);
                             if auto_fs {
                                 self.pending_auto_fs_open = true;
                             }
@@ -34306,6 +34314,7 @@ impl App {
                         }
                         Some(GridItem::ConvertibleArchive { path, .. }) => {
                             let pf = path.clone();
+                            self.note_reading_history_open(idx);
                             self.begin_smart_folder_drill(&pf);
                             self.maybe_suppress_rating_filter_for_opened_container(idx);
                             self.maybe_suppress_facet_filter_for_opened_container(idx);
@@ -35088,6 +35097,7 @@ impl App {
                     // Rejoin the exact main navigation pipeline used by Enter/double-click/
                     // gamepad. This restores history/search/smart-folder behavior for mixed
                     // folders instead of terminating an unmaterialized detached context.
+                    self.note_reading_history_container_open_path(&ready.path);
                     if let Some(idx) = self.items.iter().position(|item| {
                         matches!(
                             item,
@@ -35310,7 +35320,6 @@ impl App {
         if !self.guard_reading_history_open(idx) {
             return None;
         }
-        self.note_reading_history_open(idx);
 
         let auto_fs = mode.auto_fullscreen();
         match item {
@@ -35325,6 +35334,7 @@ impl App {
                 if auto_fs && !self.park_active_detached_context_for_new_grid_open(ctx, idx) {
                     return None;
                 }
+                self.note_reading_history_open(idx);
                 self.pending_auto_fs_open = auto_fs;
                 self.maybe_suppress_rating_filter_for_opened_container(idx);
                 self.maybe_suppress_facet_filter_for_opened_container(idx);
@@ -35333,6 +35343,7 @@ impl App {
                 Some(crate::ui_main::AddressBarNav::Direct(p))
             }
             GridItem::ConvertibleArchive { path, .. } => {
+                self.note_reading_history_open(idx);
                 self.begin_smart_folder_drill(&path);
                 self.maybe_suppress_rating_filter_for_opened_container(idx);
                 self.maybe_suppress_facet_filter_for_opened_container(idx);

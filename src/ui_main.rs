@@ -13059,8 +13059,6 @@ impl App {
             None
         };
         if activation_allowed {
-            // 閲覧履歴ビューから本を開く場合は、閉じたときに閲覧履歴へ戻れるよう予約する。
-            self.note_reading_history_open(idx);
             // ファイル名スタックの集約グリッドでメディアセルをダブルクリックしたら、フラット読書
             // フルスクリーンへ (スタック/単独画像/動画を直接開く)。コンテナは false で通常ナビへ。
             if self.stack_try_open_from_grid(ctx, idx, true) {
@@ -13076,7 +13074,9 @@ impl App {
                     // 並べているので、通常の load_folder ではなく絞り込みをさらに 1 段潜る
                     // 経路に流す (docs §10.3 [3] 絞り込みビュー)。
                     if self.global_search.active && self.global_search.drill.is_some() {
-                        self.drill_into_subfolder(p.clone());
+                        let p = p.clone();
+                        self.note_reading_history_open(idx);
+                        self.drill_into_subfolder(p);
                     } else {
                         let p = p.clone();
                         let auto_fs = self.should_auto_fullscreen_grid_container(idx);
@@ -13085,6 +13085,7 @@ impl App {
                         {
                             return nav;
                         }
+                        self.note_reading_history_open(idx);
                         self.maybe_suppress_rating_filter_for_opened_container(idx);
                         self.maybe_suppress_facet_filter_for_opened_container(idx);
                         self.record_rating_view_nav_open(&p);
@@ -13103,6 +13104,7 @@ impl App {
                     if auto_fs && !self.park_active_detached_context_for_new_grid_open(ctx, idx) {
                         return nav;
                     }
+                    self.note_reading_history_open(idx);
                     self.maybe_suppress_rating_filter_for_opened_container(idx);
                     self.maybe_suppress_facet_filter_for_opened_container(idx);
                     self.record_rating_view_nav_open(&p);
@@ -13151,6 +13153,7 @@ impl App {
                 }
                 Some(GridItem::ConvertibleArchive { path, .. }) => {
                     let pf = path.clone();
+                    self.note_reading_history_open(idx);
                     self.begin_smart_folder_drill(&pf);
                     let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
                     let search_rollback = if self.favsearch.active

@@ -1325,6 +1325,40 @@ state、時間窓、guard / retry / repaint は追加していない。同じ ca
 `note_reading_history_open(idx)` が context-owned `reading_history_return_from` を main 上で
 変更してから detached build に入る別件は、§2 規則7に従い修正せず backlog §1.131 に記録した。
 
+**2026-08-27 detached container open から main の閲覧履歴戻り先予約更新を分離
+(backlog §1.131 reading_history_return_from、利用者提示の ClaudeCode re-review と
+Codex の4入口 inspection が一致):**
+
+**触った範囲**: [src/app.rs](../src/app.rs) の Enter / 明示 container mode /
+main-owned Folder candidate 完了境界、[src/ui_main.rs](../src/ui_main.rs) の
+double-click、[src/app/gamepad_input.rs](../src/app/gamepad_input.rs) の gamepad accept、
+[src/app/tests.rs](../src/app/tests.rs) の実 gamepad producer / 非同期 Folder fallback
+回帰テスト。detached predicate、viewport / HWND / placement / focus / epoch、
+keep-alive、overlay GPU、grid selection / paste / new-folder は変更しない。
+
+**不変条件と判断理由**: context-owned reading_history_return_from は main が
+閲覧履歴 view から本へ遷移したときの Backspace 戻り先であり、fresh
+DetachedPhysical bundle は予約を None から開始する。別窓 open は main navigation
+ではないため、履歴 view からの set も既存予約の clear も行わない。3つの通常入口では
+detached arbitration と必要な active-context park が main fallback を許可した後、
+各 container arm でだけ更新する。明示 mode は always-new 設定中に入口で無効化されるため
+現行の detached helper は到達不能だが、ZIP/PDF の park 失敗も main navigation を
+採用しないので同じ境界へ揃えた。Folder candidate は分類中の scan を従来どおり main が
+所有し、mixed folder と確定して main fallback を採用した完了境界でだけ path 予約を更新する。
+image-book の detached completion と scan error は更新しない。
+
+**回帰証明と mutation**: main に既存予約を持たせ、別 PDF を実
+handle_gamepad_grid_accept 経路で detached open しても予約と
+reading_history_back_nav() == ReadingHistory が残ることを検査する。通常 main open は
+履歴 view / 非履歴 view の双方で従来どおり set / clear し、mixed Folder candidate は
+分類開始時には不変、main fallback 採用時にだけ同じ set / clear を行う。
+gamepad の note_reading_history_open(idx) を guard 直後の detached attempt 前へ戻す
+mutation では、新 detached テストが予約 Some(history-book.zip) に対する実値 None で
+失敗した。新しい App-level state、時間窓、guard / retry / repaint は追加していない。
+4入口の arbitration 前に同形の別 mutation は見つからなかった。UI の選択 / 入力診断、
+Folder candidate の main-owned scan、convertible archive の App-global request owner は
+各 ownership 契約どおりなので、§2 規則7に従い変更していない。
+
 **2026-08-27 terminal retire 時の context-owned producer 停止を bundle Drop へ集約
 (利用者提示の ClaudeCode sweep と Codex の source inspection が一致。ClaudeCode review /
 mutation check 完了。cancel 4 件を個別に抑す mutation で各テストが落ちることを確認済み):**
