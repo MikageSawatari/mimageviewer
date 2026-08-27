@@ -12209,6 +12209,7 @@ mod tests {
                 crate::video::seek_strip::StripAxis::KeyframeIndex {
                     keyframes: vec![0.0, 10.0, 40.0],
                     adopted: vec![0, 1, 2],
+                    duration_secs: 40.0,
                 },
             )),
             range_value_secs: 15.0,

@@ -16,6 +16,10 @@ pub(crate) enum StripAxis {
     KeyframeIndex {
         keyframes: Vec<f64>,
         adopted: Vec<usize>,
+        /// 素材の長さ。**末尾セルの先がどこで終わるかを知るために持つ。**
+        /// 無いと、再生が末尾へ向かう間だけ中心位置がクランプされ、ストリップの
+        /// スクロールが固まって見える (利用者報告 2026-08-27)。
+        duration_secs: f64,
     },
     /// コンテナ索引を利用できない場合の等時間グリッド。
     ///
@@ -45,7 +49,9 @@ impl StripAxis {
     /// セル `index` が表す時刻を返す。
     pub(crate) fn cell(&self, index: usize) -> Option<f64> {
         match self {
-            Self::KeyframeIndex { keyframes, adopted } => adopted
+            Self::KeyframeIndex {
+                keyframes, adopted, ..
+            } => adopted
                 .get(index)
                 .and_then(|keyframe_index| keyframes.get(*keyframe_index))
                 .copied(),
@@ -101,15 +107,17 @@ impl StripAxis {
 
     /// 末尾セルの右端の時刻。中心位置はここまで進める。
     ///
-    /// 格子軸は尺を持っているので分かる。キーフレーム軸は尺を持たず、末尾セルは実在する
-    /// キーフレームなので、その先がどこで終わるか軸には分からない。**分からないものを
-    /// 推定しない**ので `None` を返し、従来どおり末尾セルでクランプする。
+    /// 両方の軸が尺を持つ。キーフレーム軸の末尾セルは実在するキーフレームなので、素材の
+    /// 末尾との間に隙間がある (D26 が最後のキーフレームを採用するため、その隙間は普通は
+    /// 短い)。そこも中心が進めるようにする。
     fn tail_end_secs(&self) -> Option<f64> {
         match self {
             Self::TimeGrid { duration_secs, .. } => {
                 duration_secs.is_finite().then_some(*duration_secs)
             }
-            Self::KeyframeIndex { .. } => None,
+            Self::KeyframeIndex { duration_secs, .. } => {
+                duration_secs.is_finite().then_some(*duration_secs)
+            }
         }
     }
     /// 時刻を採用セル間の小数位置へ変換する。
@@ -164,9 +172,14 @@ impl StripAxis {
     /// 設定変更でサムネイルキャッシュを無効化しないための境界でもある。
     pub(crate) fn with_minimum_gap(&self, min_gap_secs: f64) -> Self {
         match self {
-            Self::KeyframeIndex { keyframes, .. } => Self::KeyframeIndex {
+            Self::KeyframeIndex {
+                keyframes,
+                duration_secs,
+                ..
+            } => Self::KeyframeIndex {
                 keyframes: keyframes.clone(),
                 adopted: thin_keyframes(keyframes, min_gap_secs),
+                duration_secs: *duration_secs,
             },
             Self::TimeGrid {
                 fallback_interval_secs,
@@ -1197,6 +1210,7 @@ mod tests {
         StripAxis::KeyframeIndex {
             keyframes: keyframes.to_vec(),
             adopted: adopted.to_vec(),
+            duration_secs: keyframes.last().copied().unwrap_or(0.0),
         }
     }
 
@@ -1302,20 +1316,38 @@ mod tests {
         );
     }
 
-    /// キーフレーム軸は尺を持たない。末尾セルは実在するキーフレームで、その先がどこで
-    /// 終わるかは軸に分からないので、推定せず従来どおりクランプする。
+    /// キーフレーム軸でも中心は素材の末尾まで進む。末尾セルは実在するキーフレームなので
+    /// 素材の末尾との間に隙間が残る (D26 が最後のキーフレームを採用しても、その先に
+    /// キーフレームが無い区間は残る)。実機報告の素材は 90.14 秒で最後のキーフレームが
+    /// 87.59 秒。ここでクランプすると **末尾 2.5 秒だけバーが止まって見える**。
     #[test]
-    fn keyframe_axis_still_clamps_at_the_last_cell() {
+    fn keyframe_axis_center_also_runs_to_the_material_end() {
+        let axis = StripAxis::KeyframeIndex {
+            keyframes: vec![0.0, 40.0, 87.5875],
+            adopted: vec![0, 1, 2],
+            duration_secs: 90.139_864,
+        };
+        assert_close(axis.center_index_for_time(87.5875), 2.0);
+        assert_close(axis.center_index_for_time(90.139_864), 3.0);
+        assert_close(axis.time_for_center_index(3.0), 90.139_864);
+        // 行き過ぎはクランプする。
+        assert_close(axis.center_index_for_time(999.0), 3.0);
+        assert_close(axis.time_for_center_index(9.0), 90.139_864);
+    }
+
+    /// 末尾セルが素材の末尾と同時刻なら、伸ばす余地は無い。従来どおりクランプする。
+    #[test]
+    fn axis_without_a_tail_still_clamps_at_the_last_cell() {
         let axis = StripAxis::KeyframeIndex {
             keyframes: vec![0.0, 10.0, 20.0],
             adopted: vec![0, 1, 2],
+            duration_secs: 20.0,
         };
         assert_close(axis.center_index_for_time(20.0), 2.0);
         assert_close(axis.center_index_for_time(999.0), 2.0);
         assert_close(axis.time_for_center_index(2.0), 20.0);
         assert_close(axis.time_for_center_index(9.0), 20.0);
     }
-
     #[test]
     fn time_grid_last_cell_ends_at_the_material_end() {
         let duration_secs = 172.733_243_f64;
@@ -2077,6 +2109,7 @@ mod tests {
             StripAxis::KeyframeIndex {
                 keyframes: vec![0.0, 1.0, 2.1, 4.5],
                 adopted: vec![0, 2, 3],
+                duration_secs: 4.5,
             }
         );
     }

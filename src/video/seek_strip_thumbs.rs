@@ -410,7 +410,9 @@ impl FrameMatchTolerance {
 
 fn frame_match_tolerance(axis: &StripAxis, index: usize) -> Option<FrameMatchTolerance> {
     match axis {
-        StripAxis::KeyframeIndex { keyframes, adopted } => {
+        StripAxis::KeyframeIndex {
+            keyframes, adopted, ..
+        } => {
             let raw_index = *adopted.get(index)?;
             let target = *keyframes.get(raw_index)?;
             let previous_gap = keyframes[..raw_index]
@@ -1309,7 +1311,11 @@ fn resolve_strip_axis(
                 )
             } else {
                 Ok(ResolvedStripAxisOutcome::Ready(ResolvedStripAxis {
-                    axis: StripAxis::KeyframeIndex { keyframes, adopted },
+                    axis: StripAxis::KeyframeIndex {
+                        keyframes,
+                        adopted,
+                        duration_secs,
+                    },
                     diagnostics,
                 }))
             }
@@ -2675,6 +2681,7 @@ mod tests {
         StripAxis::KeyframeIndex {
             keyframes: (0..count).map(|index| index as f64).collect(),
             adopted: (0..count).collect(),
+            duration_secs: count.saturating_sub(1) as f64,
         }
     }
 
@@ -2921,7 +2928,12 @@ mod tests {
                 .expect("probe video must expose an index")
                 .keyframes;
             let adopted = thin_keyframes(&keyframes, minimum_gap_secs);
-            Arc::new(StripAxis::KeyframeIndex { keyframes, adopted })
+            let duration_secs = keyframes.last().copied().unwrap_or(0.0);
+            Arc::new(StripAxis::KeyframeIndex {
+                keyframes,
+                adopted,
+                duration_secs,
+            })
         } else {
             axis
         };
@@ -3036,7 +3048,9 @@ mod tests {
             snapshot.decode_diagnostics.software_retry_failure,
         );
         match axis.as_ref() {
-            StripAxis::KeyframeIndex { keyframes, adopted } => {
+            StripAxis::KeyframeIndex {
+                keyframes, adopted, ..
+            } => {
                 let adopted_gaps: Vec<_> = adopted
                     .windows(2)
                     .map(|pair| (pair[0], pair[1], keyframes[pair[1]] - keyframes[pair[0]]))
@@ -3120,6 +3134,7 @@ mod tests {
         let axis = StripAxis::KeyframeIndex {
             keyframes: vec![10.0, 12.0, 20.0],
             adopted: vec![0, 1, 2],
+            duration_secs: 20.0,
         };
         let work = plan(
             &axis,
@@ -3176,6 +3191,7 @@ mod tests {
         let axis = StripAxis::KeyframeIndex {
             keyframes: vec![first_dts_secs, 7.632625],
             adopted: vec![0, 1],
+            duration_secs: 7.632625,
         };
         let work = plan(
             &axis,
@@ -3204,6 +3220,7 @@ mod tests {
         let axis = StripAxis::KeyframeIndex {
             keyframes: vec![0.0, 2.0, 4.0],
             adopted: vec![0, 1, 2],
+            duration_secs: 4.0,
         };
         let work = plan(
             &axis,
@@ -3274,6 +3291,7 @@ mod tests {
         let axis = StripAxis::KeyframeIndex {
             keyframes: vec![10.0, 12.0, 20.0],
             adopted: vec![0, 1, 2],
+            duration_secs: 20.0,
         };
         let work = plan(
             &axis,
@@ -3482,6 +3500,7 @@ mod tests {
         let axis = StripAxis::KeyframeIndex {
             keyframes: vec![0.0, f64::NAN, 2.0],
             adopted: vec![0, 1, 2],
+            duration_secs: 2.0,
         };
         let work = plan(
             &axis,
