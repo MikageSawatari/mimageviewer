@@ -51197,8 +51197,20 @@ impl App {
     /// `keep_fullscreen_viewport_alive` がこのフラグを見て Visible(false) を
     /// 送信し、その直後に false に落とす。ここで先に落とすと送信が抑止される。
     pub(crate) fn close_fullscreen(&mut self) {
+        // 閉じる間 UI スレッドが止まっていると、その分だけ**誰も描かない**フレームが並び、
+        // 画面のちらつきとして見える (利用者報告 2026-08-27、実測 9 フレーム / 約 300ms)。
+        // どの段で止まっているかを 1 行で出す。ログ行の時刻と合わせれば、presenter 停止や
+        // ウィンドウ破棄との前後関係も追える。
+        let close_t0 = std::time::Instant::now();
+        let mut close_stages: Vec<(&'static str, f64)> = Vec::new();
+        let close_stage = |name: &'static str, stages: &mut Vec<(&'static str, f64)>| {
+            let previous: f64 = stages.iter().map(|(_, ms)| *ms).sum();
+            let now = close_t0.elapsed().as_secs_f64() * 1000.0;
+            stages.push((name, now - previous));
+        };
         #[cfg(windows)]
         self.close_video_seek_strip(crate::video::seek_strip::SeekStripCloseCause::FullscreenExit);
+        close_stage("seek_strip", &mut close_stages);
         // teardown で fullscreen_idx / edit_result_cache を落とす前に、現在見えている
         // 最新の edit-result を snapshot。実際の encode / 保存は reset 系の DB 更新
         // command より後へ enqueue し、旧 preview の invalidate が後着しない順序にする。
@@ -51639,6 +51651,7 @@ impl App {
                 ],
             );
         }
+        close_stage("fs_cache", &mut close_stages);
         if fc_drop_ms > 50.0 {
             crate::logger::log(format!(
                 "[close-fullscreen] fs_cache.clear took {fc_drop_ms:.1}ms entries={fc_drop_count}"
@@ -51675,6 +51688,20 @@ impl App {
                     ("ai_cache", serde_json::Value::from(cf_ai_cache)),
                 ],
             );
+        }
+        close_stage("rest", &mut close_stages);
+        let close_total_ms = close_t0.elapsed().as_secs_f64() * 1000.0;
+        // 1 フレーム (60fps で 16.7ms) を越えたら残す。ちらつきは「描かれないフレーム数」
+        // そのものなので、閾値はフレーム時間に置く。
+        if close_total_ms > 16.7 {
+            let breakdown = close_stages
+                .iter()
+                .map(|(name, ms)| format!("{name}={ms:.1}ms"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            crate::logger::log(format!(
+                "[close-fullscreen] blocked the ui thread for {close_total_ms:.1}ms ({breakdown})"
+            ));
         }
     }
 
