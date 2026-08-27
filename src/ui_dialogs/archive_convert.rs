@@ -46,6 +46,7 @@ pub(crate) enum ArchiveConvertMsg {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ArchiveConvertCompletionPolicy {
     Navigation,
+    MainGridArchive(crate::app::MainGridArchiveTransitionIntent),
     Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner),
     DetachedGridArchive(crate::app::DetachedGridArchiveOpenRequestOwner),
     SiblingZip,
@@ -61,7 +62,10 @@ impl ArchiveConvertCompletionPolicy {
     ) -> Option<&crate::bookmark_browser::BookmarkOpenRequestOwner> {
         match self {
             Self::Bookmark(owner) => Some(owner),
-            Self::Navigation | Self::DetachedGridArchive(_) | Self::SiblingZip => None,
+            Self::Navigation
+            | Self::MainGridArchive(_)
+            | Self::DetachedGridArchive(_)
+            | Self::SiblingZip => None,
         }
     }
 
@@ -70,13 +74,18 @@ impl ArchiveConvertCompletionPolicy {
     ) -> Option<&crate::app::DetachedGridArchiveOpenRequestOwner> {
         match self {
             Self::DetachedGridArchive(owner) => Some(owner),
-            Self::Navigation | Self::Bookmark(_) | Self::SiblingZip => None,
+            Self::Navigation | Self::MainGridArchive(_) | Self::Bookmark(_) | Self::SiblingZip => {
+                None
+            }
         }
     }
 
     fn open_owner(&self) -> Option<crate::app::OpenRequestOwner> {
         match self {
             Self::Navigation => Some(crate::app::OpenRequestOwner::Navigation),
+            Self::MainGridArchive(intent) => Some(crate::app::OpenRequestOwner::MainGridArchive(
+                intent.clone(),
+            )),
             Self::Bookmark(owner) => Some(crate::app::OpenRequestOwner::Bookmark(owner.clone())),
             Self::DetachedGridArchive(_) | Self::SiblingZip => None,
         }
@@ -321,6 +330,7 @@ impl App {
         if auto_fullscreen {
             self.pending_auto_fs_open = true;
         }
+        let transition_owner = owner.clone();
         // load_folder(cache_zip) は load_folder_with_scan のクリアで履歴 / ブックマーク一覧の
         // 戻り先予約を落とす (cache_zip != 元アーカイブのため)。元アーカイブから開いた
         // viewer なら、override と同じく予約も元パスへ復元する。
@@ -337,6 +347,7 @@ impl App {
                     .is_some_and(|target| target.matches_loaded_container(&src))
             })
             .cloned();
+        self.prepare_main_grid_archive_transition_for_load(&transition_owner, &cached_zip);
         self.authorize_smart_folder_session_alias(&src, &cached_zip);
         self.load_folder_with_scan_owned(cached_zip.clone(), None, owner);
         // load が ★固定 (snapshot lock) の範囲外ガード等でブロックされると current_folder は
@@ -366,6 +377,7 @@ impl App {
             self.bookmark_view_state = Some(state);
         }
         self.archive_source_override = Some(src);
+        self.commit_main_grid_archive_transition(&transition_owner);
         true
     }
 
@@ -425,6 +437,9 @@ impl App {
                 crate::app::OpenRequestOwner::Navigation => {
                     ArchiveConvertCompletionPolicy::Navigation
                 }
+                crate::app::OpenRequestOwner::MainGridArchive(intent) => {
+                    ArchiveConvertCompletionPolicy::MainGridArchive(intent)
+                }
                 crate::app::OpenRequestOwner::Bookmark(owner) => {
                     ArchiveConvertCompletionPolicy::Bookmark(owner)
                 }
@@ -482,6 +497,9 @@ impl App {
             completion: match owner {
                 crate::app::OpenRequestOwner::Navigation => {
                     ArchiveConvertCompletionPolicy::Navigation
+                }
+                crate::app::OpenRequestOwner::MainGridArchive(intent) => {
+                    ArchiveConvertCompletionPolicy::MainGridArchive(intent)
                 }
                 crate::app::OpenRequestOwner::Bookmark(owner) => {
                     ArchiveConvertCompletionPolicy::Bookmark(owner)
@@ -732,6 +750,7 @@ impl App {
             let auto_fs = state.auto_fullscreen;
             let deferred = state.deferred_fullscreen.take();
             let completion = state.completion.clone();
+            let nav_history_rollback = state.nav_history_rollback.clone();
             drop(state);
             if crate::perf::is_enabled() {
                 let archive_key = crate::path_key::normalize_keep_drive(&src);
@@ -785,14 +804,51 @@ impl App {
                     return;
                 }
             }
+            let open_owner = completion.open_owner();
+            if let Some(owner) = open_owner.as_ref()
+                && !self.snapshot_scope_allows_open(&src, owner)
+            {
+                // The user may have replaced snapshot generation N while the hidden direct-read
+                // probe was running. This is a stale asynchronous completion, not a current user
+                // action, so discard it without surfacing the normal scope-refusal toast.
+                crate::logger::log(format!(
+                    "archive direct completion refused by current snapshot scope source={}",
+                    src.display()
+                ));
+                if let ArchiveConvertCompletionPolicy::Bookmark(owner) = &completion {
+                    self.cancel_bookmark_open_request(
+                        owner.request_id,
+                        "archive_direct_navigation_outside_snapshot_scope",
+                    );
+                }
+                if let Some(snapshot) = nav_history_rollback {
+                    self.restore_folder_nav_history(snapshot);
+                }
+                if deferred.is_some() {
+                    self.release_fs_nav_lock();
+                }
+                return;
+            }
             if auto_fs {
                 self.pending_auto_fs_open = true;
+            }
+            if let Some(owner) = open_owner.as_ref() {
+                self.prepare_main_grid_archive_transition_for_load(owner, &src);
             }
             self.load_zip_as_folder_with_input_seq(src.clone(), input_seq);
             let loaded = self
                 .current_folder
                 .as_ref()
                 .is_some_and(|current| crate::folder_tree::path_eq(current, &src));
+            if open_owner.as_ref().is_some_and(|owner| {
+                matches!(owner, crate::app::OpenRequestOwner::MainGridArchive(_))
+            }) && !loaded
+            {
+                if deferred.is_some() {
+                    self.release_fs_nav_lock();
+                }
+                return;
+            }
             if let ArchiveConvertCompletionPolicy::Bookmark(owner) = &completion {
                 if loaded {
                     self.begin_bookmark_page_wait(owner);
@@ -806,6 +862,9 @@ impl App {
                     }
                     return;
                 }
+            }
+            if loaded && let Some(owner) = open_owner.as_ref() {
+                self.commit_main_grid_archive_transition(owner);
             }
             self.advance_drilled_current_path(&src);
             if self.favsearch.active {
@@ -982,6 +1041,7 @@ impl App {
                                 .to_string(),
                         ),
                         ArchiveConvertCompletionPolicy::Navigation
+                        | ArchiveConvertCompletionPolicy::MainGridArchive(_)
                         | ArchiveConvertCompletionPolicy::Bookmark(_) => {}
                     }
                     return;
@@ -992,6 +1052,8 @@ impl App {
                 if let Some(source) = src.as_deref() {
                     self.authorize_smart_folder_session_alias(source, &nav);
                 }
+                self.prepare_main_grid_archive_transition_for_load(&open_owner, &nav);
+                let transition_owner = open_owner.clone();
                 self.load_folder_with_scan_owned(nav.clone(), None, open_owner);
                 // load が ★固定 (snapshot lock) の範囲外ガード等でブロックされると
                 // current_folder は変わらない。その場合は override / address / recent を
@@ -1032,6 +1094,7 @@ impl App {
                     }
                     self.archive_source_override = Some(src);
                 }
+                self.commit_main_grid_archive_transition(&transition_owner);
                 if let ArchiveConvertCompletionPolicy::Bookmark(owner) = &completion {
                     self.begin_bookmark_page_wait(owner);
                 }

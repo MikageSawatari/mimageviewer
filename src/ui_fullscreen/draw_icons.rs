@@ -953,7 +953,7 @@ pub(super) fn draw_camera_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
 /// docs/panorama-360-view-plan.md §5.3 のホバーバーボタン用。
 /// 検出強度 (Auto / Hint) によらず単一の見た目に統一 (Codex P3 反映)。
 /// 非対応画像のときは bar_button_bg 側で disable 色にすることで区別する。
-pub(super) fn draw_panorama_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+pub(crate) fn draw_panorama_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     let white = egui::Color32::WHITE;
     let main_stroke = egui::Stroke::new(1.8, white);
     let line_stroke = egui::Stroke::new(1.2, white);
@@ -995,9 +995,68 @@ pub(super) fn draw_panorama_icon(painter: &egui::Painter, c: egui::Pos2, r: f32)
     );
 }
 
+/// 投影方式アイコン。360 モード中の上バーに出し、クリックで方式を順送りする。
+///
+/// **絵で方式そのものを表す**: 球のアイコンに引く経度線の位置を、その方式の
+/// 半径写像 `r = g(θ)` で決める (θ = 30° / 60° を θ_max = 80° で正規化)。
+/// 透視は線が外周へ寄り、等距離は等間隔、等立体角は中心寄り、立体射影はその中間に
+/// なる。方式名はツールチップと切り替え時のトーストで示す
+/// (UI 文字列に環境依存グリフを使わない方針のため、記号は描かない)。
+pub(crate) fn draw_panorama_projection_icon(
+    painter: &egui::Painter,
+    c: egui::Pos2,
+    r: f32,
+    projection: crate::panorama::PanoProjection,
+) {
+    use crate::panorama::PanoProjection as P;
+    let white = egui::Color32::WHITE;
+    let main_stroke = egui::Stroke::new(1.8, white);
+    let line_stroke = egui::Stroke::new(1.2, white);
+    let sphere_r = r * 1.05;
+    painter.circle_stroke(c, sphere_r, main_stroke);
+    painter.line_segment(
+        [
+            egui::pos2(c.x - sphere_r, c.y),
+            egui::pos2(c.x + sphere_r, c.y),
+        ],
+        line_stroke,
+    );
+    // θ = 30° / 60° を θ_max = 80° で正規化した相対半径。
+    // panorama.rs の `PanoProjection` の写像表と同じ式。
+    let deg = std::f32::consts::PI / 180.0;
+    let (p1, p2) = match projection.normalized() {
+        P::Perspective => (
+            (30.0 * deg).tan() / (80.0 * deg).tan(),
+            (60.0 * deg).tan() / (80.0 * deg).tan(),
+        ),
+        P::Stereographic => (
+            (15.0 * deg).tan() / (40.0 * deg).tan(),
+            (30.0 * deg).tan() / (40.0 * deg).tan(),
+        ),
+        P::Equidistant => (30.0 / 80.0, 60.0 / 80.0),
+        P::EquisolidAngle => (
+            (15.0 * deg).sin() / (40.0 * deg).sin(),
+            (30.0 * deg).sin() / (40.0 * deg).sin(),
+        ),
+        P::Unknown => unreachable!(),
+    };
+    // 中央経度 + 左右対称の経度線 2 組。円内に収まる弦として引く。
+    for offset in [0.0, p1, -p1, p2, -p2] {
+        let a = sphere_r * offset;
+        let half_chord = (sphere_r * sphere_r - a * a).max(0.0).sqrt();
+        painter.line_segment(
+            [
+                egui::pos2(c.x + a, c.y - half_chord),
+                egui::pos2(c.x + a, c.y + half_chord),
+            ],
+            line_stroke,
+        );
+    }
+}
+
 /// 360 度パノラマアイコン (disabled 版)。非対応画像のときに dim 色で描画。
 /// シルエットは同じだが、配色だけ落として「ボタン自体は存在するが押せない」感を出す。
-pub(super) fn draw_panorama_icon_disabled(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+pub(crate) fn draw_panorama_icon_disabled(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     let dim = egui::Color32::from_rgba_unmultiplied(180, 180, 180, 140);
     let main_stroke = egui::Stroke::new(1.5, dim);
     let line_stroke = egui::Stroke::new(1.0, dim);

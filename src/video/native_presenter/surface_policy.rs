@@ -17,6 +17,14 @@ pub(super) enum VideoScaleFallbackReason {
     ResamplePipelineUnavailable {
         error: String,
     },
+    PanoramaPipelineUnavailable {
+        error: String,
+    },
+    PanoramaOrientationIntermediateCreationFailed {
+        width: u32,
+        height: u32,
+        error: String,
+    },
     ResampleIntermediateCreationFailed {
         width: u32,
         height: u32,
@@ -55,6 +63,10 @@ impl VideoScaleFallbackReason {
         match self {
             Self::DisplaySizeLimitExceeded { .. } => "display_size_limit_exceeded",
             Self::ResamplePipelineUnavailable { .. } => "resample_pipeline_unavailable",
+            Self::PanoramaPipelineUnavailable { .. } => "panorama_pipeline_unavailable",
+            Self::PanoramaOrientationIntermediateCreationFailed { .. } => {
+                "panorama_orientation_intermediate_creation_failed"
+            }
             Self::ResampleIntermediateCreationFailed { .. } => {
                 "resample_intermediate_creation_failed"
             }
@@ -79,6 +91,12 @@ impl VideoScaleFallbackReason {
                 "requested={requested_width}x{requested_height} max_dimension={max_dimension} max_pixels={max_pixels}"
             ),
             Self::ResamplePipelineUnavailable { error } => error.clone(),
+            Self::PanoramaPipelineUnavailable { error } => error.clone(),
+            Self::PanoramaOrientationIntermediateCreationFailed {
+                width,
+                height,
+                error,
+            } => format!("size={width}x{height} error={error}"),
             Self::ResampleIntermediateCreationFailed {
                 width,
                 height,
@@ -116,6 +134,7 @@ impl VideoScaleFallbackReason {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct VideoSurfaceSizeInput {
     pub filter: VideoScaleFilter,
+    pub panorama_active: bool,
     pub source_width: u32,
     pub source_height: u32,
     pub sar_num: u32,
@@ -154,7 +173,7 @@ pub(super) enum VideoSurfaceSizeDecision {
 pub(super) fn decide_video_surface_size(input: VideoSurfaceSizeInput) -> VideoSurfaceSizeDecision {
     let source_width = input.source_width.max(1);
     let source_height = input.source_height.max(1);
-    if input.filter == VideoScaleFilter::OsDefault {
+    if !input.panorama_active && input.filter == VideoScaleFilter::OsDefault {
         return VideoSurfaceSizeDecision::LegacySource {
             width: source_width,
             height: source_height,
@@ -163,31 +182,42 @@ pub(super) fn decide_video_surface_size(input: VideoSurfaceSizeInput) -> VideoSu
 
     let target_rect =
         compute_video_visual_target_rect(input.viewport_width, input.viewport_height, input.layout);
-    let (display_width, display_height) = display_dimensions(
-        source_width,
-        source_height,
-        input.sar_num,
-        input.sar_den,
-        input.orientation,
-    );
-    let display_scale = (f64::from(target_rect.width) / display_width)
-        .min(f64::from(target_rect.height) / display_height);
+    let (target_width, target_height) = if input.panorama_active {
+        // A spherical camera view owns the full video display region. Fitting
+        // the encoded 2:1 equirectangular frame here would incorrectly retain
+        // its ordinary-playback letterbox bars.
+        (
+            target_rect.width.round().clamp(1.0, u32::MAX as f32) as u32,
+            target_rect.height.round().clamp(1.0, u32::MAX as f32) as u32,
+        )
+    } else {
+        let (display_width, display_height) = display_dimensions(
+            source_width,
+            source_height,
+            input.sar_num,
+            input.sar_den,
+            input.orientation,
+        );
+        let display_scale = (f64::from(target_rect.width) / display_width)
+            .min(f64::from(target_rect.height) / display_height);
 
-    // At physical 1:1 the existing source-sized copy and DComp geometry path is
-    // both exact and cheaper than materializing an equivalent shader output.
-    if (display_scale - 1.0).abs() <= 1.0e-9 {
-        return VideoSurfaceSizeDecision::LegacySource {
-            width: source_width,
-            height: source_height,
-        };
-    }
-
-    let target_width = (display_width * display_scale)
-        .round()
-        .clamp(1.0, f64::from(u32::MAX)) as u32;
-    let target_height = (display_height * display_scale)
-        .round()
-        .clamp(1.0, f64::from(u32::MAX)) as u32;
+        // At physical 1:1 the existing source-sized copy and DComp geometry path is
+        // both exact and cheaper than materializing an equivalent shader output.
+        if (display_scale - 1.0).abs() <= 1.0e-9 {
+            return VideoSurfaceSizeDecision::LegacySource {
+                width: source_width,
+                height: source_height,
+            };
+        }
+        (
+            (display_width * display_scale)
+                .round()
+                .clamp(1.0, f64::from(u32::MAX)) as u32,
+            (display_height * display_scale)
+                .round()
+                .clamp(1.0, f64::from(u32::MAX)) as u32,
+        )
+    };
 
     // Window resize is the only reason to retain a stale display-sized surface.
     // A source change still has to replace a legacy source-sized surface whose
@@ -232,6 +262,7 @@ mod tests {
     fn input(filter: VideoScaleFilter) -> VideoSurfaceSizeInput {
         VideoSurfaceSizeInput {
             filter,
+            panorama_active: false,
             source_width: 640,
             source_height: 360,
             sar_num: 1,
@@ -254,6 +285,36 @@ mod tests {
             VideoSurfaceSizeDecision::LegacySource {
                 width: 640,
                 height: 360,
+            }
+        );
+    }
+
+    #[test]
+    fn panorama_uses_display_resolution_even_with_os_default() {
+        let mut case = input(VideoScaleFilter::OsDefault);
+        case.panorama_active = true;
+        assert_eq!(
+            decide_video_surface_size(case),
+            VideoSurfaceSizeDecision::DisplayResolution {
+                width: 1280,
+                height: 720,
+            }
+        );
+    }
+
+    #[test]
+    fn panorama_fills_the_display_region_instead_of_letterboxing_two_to_one_source() {
+        let mut case = input(VideoScaleFilter::Standard);
+        case.panorama_active = true;
+        case.source_width = 3840;
+        case.source_height = 1920;
+        case.viewport_width = 1920;
+        case.viewport_height = 1080;
+        assert_eq!(
+            decide_video_surface_size(case),
+            VideoSurfaceSizeDecision::DisplayResolution {
+                width: 1920,
+                height: 1080,
             }
         );
     }

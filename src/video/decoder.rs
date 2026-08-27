@@ -27,6 +27,9 @@ use crossbeam_channel::{Receiver, SendTimeoutError, Sender, TryRecvError, bounde
 
 use super::clock::AvClock;
 use super::display_metadata::{VideoOrientation, orientation_from_stream};
+use super::spherical_metadata::{
+    VideoSphericalMapping, VideoStereoLayout, spherical_from_stream, stereo_layout_from_stream,
+};
 use super::stream::video_tap::{VideoTapController, VideoTapProducer, video_tap_channel};
 
 /// 同時に走っている **video decode thread** (= `run_video_decode`) の数。
@@ -1570,6 +1573,10 @@ pub struct VideoInfo {
     pub sar_den: u32,
     /// Container display matrix normalized to 0/90/180/270 plus reflection.
     pub orientation: VideoOrientation,
+    /// Selected stream's normalized spherical projection metadata, if present.
+    pub spherical_mapping: Option<VideoSphericalMapping>,
+    /// Selected stream's stereo layout. Undeclared streams normalize to mono.
+    pub stereo_layout: VideoStereoLayout,
 }
 
 /// 埋め込みチャプター 1 件分。`AVChapter` の `start`/`end` を `time_base` で秒に
@@ -1888,6 +1895,8 @@ struct VideoSetup {
     sar_num: u32,
     sar_den: u32,
     orientation: VideoOrientation,
+    spherical_mapping: Option<VideoSphericalMapping>,
+    stereo_layout: VideoStereoLayout,
     src_w: u32,
     src_h: u32,
     dst_w: u32,
@@ -2026,6 +2035,8 @@ fn run_decoder(
             let video_stream_idx = video_stream.index();
             let video_time_base = video_stream.time_base();
             let video_orientation = orientation_from_stream(&video_stream);
+            let video_spherical_mapping = spherical_from_stream(&video_stream);
+            let video_stereo_layout = stereo_layout_from_stream(&video_stream);
             let video_params = video_stream.parameters();
             let (video_fps_num, video_fps_den) =
                 selected_video_rate(video_stream.avg_frame_rate(), video_stream.rate())
@@ -2158,6 +2169,8 @@ fn run_decoder(
                 sar_num: video_sar_num,
                 sar_den: video_sar_den,
                 orientation: video_orientation,
+                spherical_mapping: video_spherical_mapping,
+                stereo_layout: video_stereo_layout,
                 src_w,
                 src_h,
                 dst_w,
@@ -2324,6 +2337,8 @@ fn run_decoder(
         vi_sar_num,
         vi_sar_den,
         vi_orientation,
+        vi_spherical_mapping,
+        vi_stereo_layout,
         vi_stream_interlaced,
     ) = match video_setup.as_ref() {
         Some(v) => (
@@ -2340,6 +2355,8 @@ fn run_decoder(
             v.sar_num,
             v.sar_den,
             v.orientation,
+            v.spherical_mapping,
+            v.stereo_layout,
             v.stream_interlaced,
         ),
         None => (
@@ -2356,6 +2373,8 @@ fn run_decoder(
             1,
             1,
             VideoOrientation::IDENTITY,
+            None,
+            VideoStereoLayout::Mono,
             false,
         ),
     };
@@ -2457,6 +2476,8 @@ fn run_decoder(
         sar_num: vi_sar_num,
         sar_den: vi_sar_den,
         orientation: vi_orientation,
+        spherical_mapping: vi_spherical_mapping,
+        stereo_layout: vi_stereo_layout,
     };
     send_video_info(&info_tx, &engine_event_tx, Ok(info));
 

@@ -6539,8 +6539,6 @@ impl App {
         if !self.guard_reading_history_open(idx) {
             return None;
         }
-        // 閲覧履歴ビューから本を開く場合は、閉じたときに閲覧履歴へ戻れるよう予約する。
-        self.note_reading_history_open(idx);
         // ファイル名スタックの集約グリッドでメディアセルを開いたら、フラット読書フルスクリーンへ
         // (スタック/単独画像/動画を直接開く)。コンテナは false で通常ナビへ流れる。
         if self.stack_try_open_from_grid(ctx, idx, false) {
@@ -6553,6 +6551,7 @@ impl App {
         let item = self.items.get(idx).cloned();
         match item {
             Some(GridItem::Folder(p)) | Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => {
+                self.note_reading_history_open(idx);
                 if self.should_auto_fullscreen_grid_container(idx) {
                     self.pending_auto_fs_open = true;
                 }
@@ -6578,18 +6577,16 @@ impl App {
                 None
             }
             Some(GridItem::ConvertibleArchive { path, format }) => {
-                self.begin_smart_folder_drill(&path);
+                let owner = self.main_grid_archive_open_owner(idx, &path);
                 let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
-                self.maybe_suppress_rating_filter_for_opened_container(idx);
-                self.maybe_suppress_facet_filter_for_opened_container(idx);
                 if self.settings.archive_file_handling_ignores_convertible() {
                     self.show_feedback_toast(
                         "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
                     );
                 } else if let Some(cached) = self.try_archive_cache_lookup(&path) {
-                    self.open_archive_via_cache(path, cached, auto_fs);
+                    self.open_archive_via_cache_owned(path, cached, auto_fs, owner);
                 } else {
-                    self.request_archive_convert(path, format, auto_fs);
+                    self.request_archive_convert_owned(path, format, auto_fs, owner);
                 }
                 None
             }

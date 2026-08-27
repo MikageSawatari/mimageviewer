@@ -547,9 +547,31 @@
   やや膨らむ。**どちらか一方ではなく、方式を選ぶ形にするのが素直** (実装コストがほぼ同じため)。
 - 判断が要る点: 投影方式を増やすと画角スライダの意味と上限が方式ごとに変わる。既定は透視のまま、
   切り替えを提供するのか、パノラマ設定に持たせるのかを先に決める。
-- **先送り (2026-08-13、利用者判断)**。提案として妥当だが、v3.0.0 では扱わない。
-  却下ではないので、要望が重なったら再評価する。
-- 規模 / 優先度: Medium / P3 (先送り)。
+- ~~**先送り (2026-08-13、利用者判断)**。提案として妥当だが、v3.0.0 では扱わない。
+  却下ではないので、要望が重なったら再評価する。~~
+- **実装済み (2026-08-27、レーン C、branch `panorama-projection`)**。着手可否を利用者へ再確認し、
+  4 方式すべてを入れる / 既定は透視のまま / 切り替えはキー + 360 表示中の上バーのボタン、で確定。
+  **仕様の正本は [panorama-360-view-plan.md §13](panorama-360-view-plan.md)**。要点:
+  - 視野角の意味を全方式で共通化 (画面上下端の入射角 = `fov_y / 2`)。透視は導入前の式と恒等で、
+    既定の見え方は変わらない (格子点での回帰テストあり)。
+  - 画角上限は方式ごと。透視 = 約 149° (従来と同値)、非透視 = 約 340°。方式を戻すときに
+    `clamp_fov` を通すので、広げた画角のまま透視へ戻しても発散しない。
+  - 等距離 / 等立体角は広画角で画面隅が定義域を出るため、そこは不透明の黒 (魚眼のイメージ
+    サークル外)。WGSL は seam 勾配の uniform control flow を守るため早期 return せず、最後の
+    色選択でだけ判定する。
+  - settle overlay の stale 判定キーを `PanoPose` へ型化 (投影方式の比較漏れを構造で防ぐ)。
+  - **実機確認の状況** (2026-08-27):
+    - 確認済み: 既定 (透視) の見え方が導入前と同じに見えること、4 方式で見え方が変わること、
+      上バーの投影一覧が画面内に収まること。
+    - **未確認**: 各方式が幾何的に正しいか。利用者が 4 方式を見比べた時点では違いを判別
+      できなかった。**これは実装の問題ではなく、普通のパノラマ写真では原理的に判別
+      できない**ため (差は周辺と広い画角にしか出ない)。判別用のチャートと手順を
+      [panorama-360-view-plan.md §13.7](panorama-360-view-plan.md) に用意したので、
+      次に触る人はそれで確認する。特に「水平を向いて画角を最大まで引くと、赤道が
+      直線になるのは透視だけ」が最も差が出る。
+- 規模 / 優先度: Medium / P3 (実装済み)。
+- **次の一手 (§1.112)**: 数式・分岐位置・uniform の持ち方はここで確定した。動画側は
+  `panorama.rs` の写像表と WGSL の `projection_theta` をそのまま実行時 HLSL へ移す。
 
 ### 1.62 お気に入り編集を開いている間、進捗が動いていなくても 100ms ごとに repaint する
 
@@ -1211,20 +1233,152 @@ passive detached は通常どおり release で窓を activate するが、選�
 - **着手条件: §1.47 (動画の拡大縮小を mIV のシェーダで行う) が入ること。** §1.47 は
   swap chain を表示矩形サイズにし、シェーダでソース解像度から表示解像度へ解決する構造にする。
   **そのステージができれば、正距円筒投影は同じステージ上のもう 1 枚のシェーダ**になる。
-- §1.47 が入った後に残る作業:
-  1. **シェーダ移植**: 静止画側は WGSL ([panorama_wgpu.rs](../src/panorama_wgpu.rs))、presenter は
-     実行時 HLSL コンパイル ([grade_pipeline.rs](../src/video/native_presenter/grade_pipeline.rs) の
-     `D3DCompile`)。投影の数式はそのまま移せる。
-  2. **ミップ生成**: 静止画側はフルミップ + `textureSampleGrad` で品質を出している
-     ([panorama_wgpu.rs](../src/panorama_wgpu.rs))。毎フレーム 5.7K のミップ生成が現実的かは
-     **実測してから決める** (代替は品質を落とした単純フィルタ)。
-  3. **入力**: 見回しドラッグと FOV を presenter 側に持たせ、シークバードラッグ / ジェスチャ /
-     HUD と共存させる。報告者の「動画には拡大縮小ドラッグの処理がなさそう」は正しい観察で、
-     それを作るのが §1.47。
-  4. **UI 導線**: 投影方式の選択・視野角・リセットを動画 HUD から出す。§1.105 (動画の「…」) と
-     関係する。
-- **自動判定は可能**。FFmpeg が `AV_SPHERICAL_EQUIRECTANGULAR` を出す
-  ([spherical.h](../vendor/ffmpeg/include/libavutil/spherical.h))。回転メタデータと同じ扱いにできる。
+- **段階と進捗** (レーン C、branch `panorama-projection`):
+
+  | 段 | 内容 | 状態 |
+  | --- | --- | --- |
+  | 1 | **判定** — 球面メタデータ + 2:1 フォールバック + ステレオ排除 | **完了** (2026-08-27) |
+  | 2 | **描画** — presenter へ投影パスを足す | **完了** (2026-08-27) |
+  | 3 | **入力と導線** — 見回しドラッグ / FOV / 投影方式 / HUD | **完了** (2026-08-27、実機確認済み) |
+
+  **実機確認済み (2026-08-27、利用者)**。360 動画を開いて見回し・画角・投影方式の切替・
+  視点リセット・再生系 HUD の同居まで確認した。実機で挙がった 3 件はいずれも対応済み:
+
+  1. **左右パネルが見回し中に出て邪魔** → 360 表示中は左右パネルを出さないようにした
+     (右 / 左 / ClickToShow の呼び出しタブの 3 経路とも塞ぐ。タグピッカーが開いていると
+     通常のホバー条件を迂回するので、そこも塞いだ)。
+  2. **投影方式が静止画のプルダウンと揃っていない** → 一覧から選ぶ形にした。
+  3. **`.webm` の素材が一覧に出ない** → mIV の `SUPPORTED_VIDEO_EXTENSIONS` に `webm` が
+     無いため。**動画側 360 の不具合ではない。** テスト素材は無劣化で `.mkv` へ詰め替えた
+     (WebM は Matroska のサブセットなので `-c copy` で済み、球面メタデータも残る)。
+     **`webm` を対応拡張子に足すかは別途判断が要る** (サムネイル / 検索 / 変換へ波及する)。
+
+  実機確認中に**動画が再生不能になるパニック**も出たが、**360 の退行ではなく波形
+  ストリップの既存不具合**だった (panic.log に 2026-08-10 / 08-14 の同型が残っている)。
+  幅の上限として修正済み。パニック後に復旧しない構造自体は §1.135 へ分けた。
+
+- **第 1 段 (完了)**: [spherical_metadata.rs](../src/video/spherical_metadata.rs)。
+  `display_metadata.rs` と同じ形で、FFmpeg の side data をこのモジュールだけで型に直す。
+  `detect()` が `VideoPanoramaTrigger` (Auto / Hint) か `VideoPanoramaRejection`
+  (未対応投影 / ステレオ / 平面) を返す。実素材 16 本を
+  `cargo run --features dev-tools --bin probe_spherical -- <dir>` で通して確認済み。
+  **presenter に触っていないので、レーン B と衝突しない。**
+
+- **第 2 段 (描画) — 読んで確定した挿入点**:
+  1. **`D3DCompile` はもう使っていない** (上の記述は古い)。presenter のシェーダは
+     **build.rs が FXC で `.cso` 化**して `include_bytes!` する
+     ([build.rs](../build.rs) の `compile_video_presenter_shaders`、backlog §1.122 で切替済み)。
+     投影シェーダも `shaders/video_panorama.hlsl` を足して同じ表に 1 行足すだけでよい。
+     **実行時コンパイルを復活させないこと** (placement 切替のたびに数秒固まる)。
+  2. **投影は resample と同じステージに立つが、別パイプラインにする**。
+     `VideoResamplePipeline::draw(source_tex -> target_tex)` が「ソース解像度 → 表示解像度」を
+     解決する場所で、投影もそこを置き換える。ただし **`VideoResampleMode` の variant には
+     しない**: あの enum は設定から決まる filter の選択で、`select_video_resample_mode` と
+     多数の perf イベント名の match に紐づいている。**毎フレーム変わる pose を混ぜると
+     意味が濁る**ので、`panorama_pipeline` を別に持ち、resolve 直前で分岐する。
+     投影が有効な間は Lanczos3 / Anime4K は走らない (投影シェーダ自身が球面から
+     表示解像度へ直接解決するため)。
+  3. **pose の渡し方は `set_video_grade` の前例に合わせる**
+     ([render_core.rs](../src/video/native_presenter/render_core.rs) の `set_video_grade`)。
+     `presenter.set_panorama_pose(Option<...>)` を足し、`video/mod.rs` の再生スレッドが
+     grade と同じ経路で流す。**静止画側の `PanoPose` をそのまま使う** (yaw/pitch/fov_y/投影方式)。
+     型を分けると stale 判定と丸めが 2 つになる。
+  4. **surface は既に表示解像度**。§1.47 の `decide_video_surface_size` が shader filter 時に
+     表示矩形サイズの swap chain を作るので、投影でも同じ条件を満たせばよい
+     ([surface_policy.rs](../src/video/native_presenter/surface_policy.rs))。
+  5. **ミップは「まず無しで測る」**。静止画側はフルミップ + `textureSampleGrad` で品質を出すが、
+     動画は毎フレーム生成になる。D3D11 の `GenerateMips` は使えるものの、5.7K で毎フレーム
+     払えるかは**実測してから決める**。まず bilinear で出して、広い画角でのエイリアスが
+     実用に耐えるかを見る。耐えないときだけミップを足す。
+  6. **投影方式は静止画と同じ 4 種**。数式・分岐位置・uniform の持ち方は
+     [panorama-360-view-plan.md §13](panorama-360-view-plan.md) で確定済みで、WGSL の
+     `projection_theta` をそのまま HLSL へ移せる。**部分 FOV の UV 変換も静止画と同じ
+     `PanoUvTransform`** なので、crop 時の軸別 clamp もそのまま移す。
+
+- **第 3 段 (入力) — レーン B との衝突は「予告ほどではない」(2026-08-27 実測で訂正)**。
+  [next-cycle-work-lanes.md §4](next-cycle-work-lanes.md) は「どちらも動画上のマウスドラッグを
+  新規に定義するので正面衝突する」と予告していたが、実際のコードを読むと**取り合わない**:
+  - **動画キャンバス上のドラッグは現在まったく使われていない**。動画 HUD 内のドラッグは
+    seek bar / 音量スライダ / VST パネル移動の 3 つで、すべてウィジェット矩形内。
+  - **動画のタッチもタップのみ** (中央 = HUD 切替、左右 = ±5 秒シーク)。キャンバス全体の
+    パンジェスチャは無い。
+  - レーン B のドラッグは**ストリップ矩形の中**の横スクラブと下方向クローズ。
+  - 残る重なりは `ui_fullscreen.rs` というファイル (マージ衝突) と、HUD の場所の取り合い
+    (レーン B が下部、360 は上部) だけ。**設計上の競合ではない。**
+
+- **入力設計の決定** (2026-08-27、Codex Sol と相談のうえ確定):
+  1. **360 は「再生の制限モード」ではなく「映像キャンバスの表示モード」**。静止画の 360 は
+     他機能を止める制限モードだが、動画は再生 / 一時停止 / シーク / 音量が要るので**再生系
+     HUD は維持する**。排他にするのは**同じキャンバスか最終リサンプルを所有する機能**だけ。
+  2. **ホイールは 360 中、修飾キー不問で FOV** (静止画と同じ)。ファイル移動は ↑/↓ に残る。
+     ⚠ **FOV が上下限に達しても必ずホイールを消費する**。未消費に戻すと、限界でもう一度
+     回した瞬間にファイルが切り替わる。レターボックス部分も同じ扱いにする (画面端だけ
+     挙動が変わると予測できない)。
+  3. **排他にする機能**: タイル一覧 / 比較 / 表示スケーリング (Anime4K・Lanczos・NIS・nearest)。
+     **投影シェーダとスケーラーは両方が「表示解像度の最終出力」を所有する**ので、UI だけで
+     なく実効描画モードとして排他にする。前段に置くと投影の原画が加工済みになり、後段に
+     置くと視点を動かすたびに再生成が要る。
+     ⚠ **利用者の設定値は書き換えない**。「360 投影中のため一時停止しています」と出すだけに
+     する (既存の `processing_size_outside_note` と同じ作法)。
+     色調補正 / LUT は投影前の source-resolution 処理なので維持してよい。
+     音声モード♪ は維持するが、音声画面の間は 360 入力を休止する (見えない FOV が動かない
+     ようにする)。映像へ戻ったら視点を復元する。
+  4. **タッチはドラッグ = 見回し、タップ = 既存のまま**。ただし release 時の距離判定だけでは
+     不十分で、既存のタッチ認識器と同じ ownership latch が要る:
+     - しきい値 (12 logical pt / 700 ms) を一度でも超えたら、その接触列は最後まで見回し。
+       開始位置へ戻して離してもタップに戻さない。
+     - 見回し確定フレームでは DOWN からの全移動量を反映する (最初の移動を捨てない)。
+     - HUD 上から始まった接触は外へ出ても HUD 所有。逆も同じ。
+     - 2 本目が入ったら pending tap を必ず取り消す。
+     - **ダブルタップを視点リセットに割り当てない**。左右の連続タップ (シーク) が化ける。
+       リセットは上バーのボタンに置く。
+  5. **ON/OFF ボタンは上バー** (VST3 と全画面切替の間あたり)。静止画と同じ論理位置。
+     ⚠ **静止画の「360 中はボタンを隠して × を解除に使う」方式は踏襲しない**。動画の × は
+     常に動画 / ビューアを閉じる意味であり、360 状態で意味が変わると別ウィンドウで事故る。
+     360 ボタンは ON 中も強調表示で残し、同じボタンで OFF にする。ON 中は隣に投影方式と
+     視点リセットを出す。非対応時は同じスロットに理由付き disabled (隣のボタンを動かさない)。
+
+- **決定: 360 ON はファイルをまたいで保持する (静止画に合わせる)** (2026-08-27、利用者判断)。
+  Codex は source-scoped (別ファイルでは改めて明示 ON) を勧めたが、**静止画との一貫性を
+  優先する**。静止画側の lifecycle をそのまま写す:
+  - 明示 ON でセッション state を作り、**通常ナビでは視点 (yaw/pitch/fov/投影方式) を保持**する。
+  - **360 でない動画へ移ったら非アクティブ化するが state は捨てない**。次に 360 と判定された
+    動画へ移ると同じ視点で再開する。判定は `is_panorama_mode_active` と同じ形
+    (`state.is_some() && detect(...).is_ok()`) にして、静止画と述語の形も揃える。
+  - **明示 OFF とフルスクリーン退出では state を破棄する。**
+  - 受け入れる副作用: Hint (2:1 のみ) の通常動画へ ↑/↓ で移ると、その動画も投影表示になる。
+    **静止画側が既にそう振る舞っており出荷済み**なので、動画だけ別の境界にはしない。
+    利用者が迷ったら明示 OFF で抜けられる。
+- **第 3 段 (完了、2026-08-27)**: 静止画と共通の `App::panorama_state` を正本として、
+  native presenter へ pose を同期する。動画キャンバスのマウス / タッチドラッグ、修飾キー不問の
+  FOV ホイール、`FsPanorama` / `FsPanoramaProjection`、上バーの固定 360 スロット・投影方式・
+  視点リセットを実装した。ホイールは FOV 上下限でも消費し、タッチは 12 logical pt の
+  ownership latch で DOWN からの全移動量を初回ドラッグへ含め、2 本目で pending tap を取り消す。
+  ダブルタップは既存のタップ操作のままでリセットには使わない。動画の × は常に close のまま。
+  タイル一覧は 360 ON 時に閉じて再入場を抑止し、動画スケーラーは実効描画だけ休止して
+  `VideoScaleFilter` の保存値を変更しない。音声モード中は入力だけを休止し、映像へ戻ると同じ
+  pose を再開する。自動テスト済み、Windows native presenter の実機確認は残る。
+- **自動判定は可能だが、それだけでは足りない**。FFmpeg は `AV_SPHERICAL_EQUIRECTANGULAR` を
+  出す ([spherical.h](../vendor/ffmpeg/include/libavutil/spherical.h))。回転メタデータと同じ扱いに
+  できる。ただし**実素材を集めて測った結果、次の 3 点が分かった** (2026-08-27、
+  テストセットは `H:\home\mimageviewer_old\testimage\360d\movie\`、同梱の README.md に実測表):
+  1. **実素材の大半は metadata を持たない。** Wikimedia から集めた実在の 360 動画 10 件のうち、
+     spherical metadata があったのは **2 件だけ**。WebM トランスコードが Matroska の Projection
+     要素を落とすため。→ **静止画側と同じ 2:1 アスペクト比のフォールバック
+     (`PanoramaTrigger::Hint` 相当) が必須**。metadata 判定だけで作ると、利用者の手元の多くの
+     ファイルで 360 ボタンが有効にならない。
+  2. **部分 FOV は別の enum になる。** `equi` の projection_bounds が非ゼロだと FFmpeg は
+     `AV_SPHERICAL_EQUIRECTANGULAR` ではなく **`AV_SPHERICAL_EQUIRECTANGULAR_TILE`** を返す。
+     これは静止画側の GPano `CroppedArea*` (Phase 1.5 の `PanoUvTransform`) に相当する。
+     **`EQUIRECTANGULAR` だけを見ると部分 FOV 素材を取りこぼす。**
+     `av_spherical_tile_bounds()` が 0.32 固定小数を画素へ直してくれるので、静止画側の
+     `PanoUvTransform::from_gpano` と同じ形へ落とせる。
+  3. **上下分割ステレオ (3D 360) が実在する。** 集めた中の 1 件が該当し、モノラル equirect と
+     して扱うと上下に同じ絵が 2 つ出る。`st3d` の stereo_mode を見て弾くか、片目だけ使うかを
+     決める必要がある。**静止画側にはこの分岐が無い。**
+- **テスト素材の作り方**: `ffmpeg` は MP4 出力へ spherical metadata を引き継がない (8.1 で
+  `-c copy` / 再エンコードとも確認) ため、上記フォルダに `make_spherical_mp4.py` を置いてある。
+  `st3d` / `sv3d` を自前で書き込み、全球と部分 FOV の MP4 を作れる (ffprobe で往復検証済み)。
 - 規模 / 優先度: Large / P3。**§1.47 待ち**。
 
 ### 1.113 動画シークバー近傍のストリップを「サムネイル列 ⇄ 音声波形」で切り替える — 利用者要望
@@ -2793,6 +2947,34 @@ Codex は方針に同意したうえで、一次分類案に **5 件の反例**�
    扱うなら既存の `DetachedActivationIntent` を含む reducer へ統合し、
    **入力順序か request identity** で最新を定義する (フレーム数や数 ms の猶予で棄却しない)。
 
+### 1.135 動画レンダースレッドがパニックすると、以後どの動画も再生できなくなる
+
+- 出典: 2026-08-27 実機。シークバーのストリップを開いた直後に
+  `native video render fault: native video render thread panicked` が出て、**以後どの動画を
+  開いても同じエラー**になった。アプリを再起動するまで戻らない。
+- **直接の原因になったパニックは §1.112 の作業中に直した** (波形テクスチャ幅が GPU 上限を
+  超えていた。`WaveSpanRequest::pixel_width` に上限が無く 4K 幅 × 3 = 11520px を要求していた)。
+  **本項はその先の構造の話**: パニックの原因が何であれ、一度死んだら復旧しないこと。
+- 観測できた事実:
+  - panic.log に**同じ形の `Device::create_texture` パニックが 2026-08-10 (8320px) と
+    08-14 (9000px) にも残っている**。つまり以前から起きており、そのたびに再生不能に
+    なっていたはず。利用者が「動画が再生できない」と気付いた時点では、原因のストリップ
+    操作から離れているので、結び付けにくい。
+  - スレッドは `catch_unwind` で包まれており ([video/mod.rs:1922](../src/video/mod.rs))、
+    パニック自体は捕まえてログに残る。しかし**その後スレッドを作り直さない**ので、
+    presenter が居ないまま `native video render fault` を返し続ける。
+- 判断が要る点:
+  1. **作り直してよいのか。** パニックの原因が GPU リソースの不整合だと、作り直しても
+    同じ場所で落ちてループする。無条件の再生成は「症状パッチ」になり得る。
+  2. 作り直すなら**回数を制限し、理由を型で持つ**必要がある (`VideoScaleFallbackReason` と
+    同じ作法)。何度目で諦めるか、諦めたら何を見せるかを決める。
+  3. **少なくとも利用者への見せ方は変えられる。** 現在の「動画を再生できません:
+    native video render fault」は内部語で、再起動すれば直ることが伝わらない。
+- 参考: 静止画側には同種の「GPU 経路が死んだら次のフレームで作り直す」機構が無いので、
+  前例として使えるものは無い。
+- 規模 / 優先度: Medium / P2 (実害はデータ喪失ではないが、**再起動するまで動画機能が
+  丸ごと死ぬ**。原因側を潰しても別のパニックで再発し得る)。
+
 ### 1.130 font atlas resync 待ちが 16ms 固定でスピンする
 
 - 出典: 2026-08-26、§1.122 の repaint 要求元を分けているときに見つけた。
@@ -2829,7 +3011,7 @@ Codex は方針に同意したうえで、一次分類案に **5 件の反例**�
   待ち方を変えるのであって、待たなくするのではない。
 - 規模 \\ 優先度: Small 〜 Medium / P3。
 
-### 1.131 v3.3.0 出荷前レビュー (Codex) の指摘と対応 ✅ 完了 (2026-08-27)
+### 1.132 v3.3.0 出荷前レビュー (Codex) の指摘と対応 ✅ 再レビュー承認済み (2026-08-27、実機確認待ち)
 
 - 出典: 2026-08-27、Codex による `v3.2.0..HEAD` の出荷前レビュー。
   実装は Codex Sol、検収は ClaudeCode (3 本の brief に分けて実施)。
@@ -2884,18 +3066,78 @@ fresh detached bundle を作る前の mounted main projection 上で rating / fa
 `rating_filter_suppressed_at`、facet filter、suppression stack が変わる実到達バグだった。
 
 2026-08-27 修正。Descriptor helper から抑制を外し、detached start 不成立後に main navigation を
-採用する2 caller の既存抑制だけを正本にした。FolderCandidate も分類後の main fallback だけが
-抑制し、ConvertibleArchiveCandidate の detached completion は抑制しない。実 producer で★付き
+採用する通常到達3入口 (Enter / double-click / gamepad accept) と、明示 container mode の
+static site 1箇所の計4箇所にある既存抑制だけを正本にした。FolderCandidate も分類後の main
+fallback だけが抑制し、ConvertibleArchiveCandidate の detached completion は抑制しない。実 producer で★付き
 ZIP/PDFを開くテストを追加し、main state 不変と detached の全ページ表示を固定した。
 
-#### 同経路の別件 — reading-history return owner を detached destination と照合する (未対応)
+#### follow-up — reading-history owner と convertible 非遷移 lifecycle ✅
 
-2つの UI caller は detached helper より前に `note_reading_history_open(idx)` を呼ぶ。
-この関数が変更する `reading_history_return_from` は `ViewerContextBundle` 所有なので、
-detached build が fresh bundle へ交換する前の main に変更が残り、detached 側は `None` から
-始まる。閲覧履歴から別窓で本を開いた場合の戻り先仕様と、通常一覧から別窓を開いた際に main の
-既存予約を消すべきかを、両 caller / close / Backspace lifecycle で棚卸しして owner 境界を決める。
-今回の filter suppression 修正には含めない (§2 規則7)。優先度 P2、規模 Small〜Medium。
+2026-08-27 修正。Enter、double-click、gamepad accept、明示 container mode の4 static site は、
+detached arbitration が main fallback を採用した後だけ `reading_history_return_from` を更新する。
+このうち通常到達するのは前3入口で、明示 mode は multi-window 時に副作用なしで早期 return する。
+
+残っていた反例は `GridItem::ConvertibleArchive` だった。main fallback 採用後でも、Ignore 判定や
+非同期変換 request より前に reading-history 予約、rating / facet suppression stack、smart-folder
+position を更新していたため、Ignore と dialog cancel で画面が遷移しないのに main state だけが
+変わっていた。`MainGridArchiveTransitionIntent` を既存の open / convert request owner に保持し、
+cache / RAR direct / 変換完了の実 load 成功時だけ4状態を commit する。Ignore、request start failure、
+dialog cancel は intent を捨てるだけで main items と4状態を変えない。これは d7645901 の regression
+ではない。同 commit より前から `note_reading_history_open` は入口先頭にあり、d7645901 は呼出しを
+convertible arm 内へ移したものの Ignore 判定より前という誤った側を維持し、両 suppression も元から
+同じ側にあった。
+
+#### final P2 — ★固定中の変換 cache alias と拒否前 mutation ✅
+
+2026-08-27 修正。★固定 snapshot の member は source `book.7z` だが、cache hit と非同期変換完了は
+実体の cache ZIP を `load_folder_with_scan_claimed` へ渡すため、実 path だけを見ていた snapshot guard が
+正当な open を範囲外として拒否していた。`OpenRequestOwner::MainGridArchive` の
+`MainGridArchiveTransitionIntent::source_path` を snapshot scope identity とし、既存の
+`snapshot_owner_entry` (完全一致 + separator-aware prefix 一致) へ渡す。cache path との OR にはせず、
+source 自体が snapshot member / member container 配下でない要求は従来どおり拒否する。
+
+同 guard は smart-folder session の認可 consume / surface clear、folder-pane cancel、synthetic restore、
+smart scope reconcile、reading-history reservation clear、bookmark return reconcile より後ろにあった。
+これらは guard が読む snapshot / navigation scope / typed owner identity の成立には不要なので、guard を
+`load_folder_with_scan_claimed` の先頭 precondition へ移した。拒否時に残す effect は stale な
+`pending_auto_fs_open` の破棄と feedback toast だけで、main の表示・復元 ownership は変更しない。
+
+実 gamepad producer からの同期 cache hit、同 producerが作った request の `ConvertDone` completion、
+範囲外の common load 拒否を回帰テストにした。前2本は source alias 解決を cache ZIP 判定へ戻す mutation、
+拒否テストは smart session consume / clear または reading-history reconcile を guard より上へ戻す mutation で
+失敗する。拒否テストは smart session の `Option` だけでなく、拒否後も one-shot source 認可を実
+`preserve_smart_folder_session_for_load` 境界で consume できること、main items と snapshot count が同一なことを
+確認する。Folder / ZIP / PDF の3通常入口 + 明示 mode static site が `AddressBarNav::Direct` の common guard
+より前に caller-side effect を commit する既知の同型は、本 defect の funnel 内修正には含めていない。
+
+#### final P2 re-review — scope preflight と RAR generation swap ✅
+
+2026-08-27 修正。`claim_open_request_owner` は snapshot scope guard より前で、拒否される
+navigation でも進行中の archive conversion、未解決 startup open、競合 bookmark open を
+終了していた。navigation scope、snapshot active、`snapshot_internal_nav`、typed owner の
+source identity だけを読む純粋な `snapshot_scope_allows_open` へ判定を集約し、container
+dispatcher と pre-scan 対応 folder load の2入口では claim より前に実行する。common load の
+既存 guard も同じ述語を使う。cache path と source path は OR にせず、
+`MainGridArchiveTransitionIntent::source_path` が実 path を置き換える。ユーザー操作の拒否 effect は
+共通 helper 1箇所に置き、stale `pending_auto_fs_open` clear と既存 toast を1回だけ行う。
+
+dialog を隠して走る RAR direct-read 完了も、実 load / auto-fullscreen 予約 / smart-folder 認可より
+前に現在 snapshot で同じ preflight を再実行する。generation N の pin 中に始めた RAR が、解除と
+filter 変更を経た generation N+1 に含まれなければ旧完了を捨てる。これは現在のユーザー操作では
+ないため toast は出さず、通常ログだけを残す。`ArchiveConvertState` の Drop による cancel token、
+deferred fullscreen の `release_fs_nav_lock`、bookmark request cleanup は拒否 branch でも完了する。
+
+PDF の guard 非経由 route は password dialog の OK retry と detached descriptor だけだった。
+前者は `show_pdf_password_dialog` が common modal input blocker に入り、背面で snapshot の解除・
+filter 変更・再固定を行えない。後者は `DetachedPhysical` context である。現行 UI から同じ
+generation swap は到達不能なので、規則7に従い変更していない。
+
+回帰テストは両 claim 入口で archive request / cancel token を保持し、未解決 startup owner と
+競合 bookmark owner も保持すること、RAR generation swap が load を拒否しつつ state Drop と nav
+lock cleanup を終えること、current generation 内の RAR は通常どおり開くことを固定した。
+mutation は `move_scope_preflight_below_claim`、
+`omit_rar_direct_completion_scope_preflight`、
+`reject_all_rar_direct_completions_in_snapshot`。
 
 #### §1.126 / §1.127 — 添字空間の追従 ✅
 
@@ -2931,6 +3173,64 @@ Codex の修正の半分が消えたままになった** (→ マーカーを残
 かつ `git diff --numstat` を Codex 申告値と突き合わせる)。
 
 - 規模 \\ 優先度: — (完了)。
+
+### 1.133 外部 Activation が scope 判定より前に変換をキャンセルする — 未対応
+
+- 出典: 2026-08-27、§1.132 (v3.3.0 出荷前レビュー) の追加確認で Codex が発見。
+  **v3.3.0 出荷前に閉じる対象**。
+
+[startup_ops.rs](../src/app/startup_ops.rs) の Activation 分岐は、**パス解決と
+snapshot scope 判定より前に無条件で** `cancel_archive_convert_for_navigation` を呼ぶ:
+
+```rust
+if matches!(source, StartupOpenPathSource::Activation) {
+    self.cancel_archive_convert_for_navigation("activation_navigation");
+```
+
+したがって「**範囲外 Activation → 変換が先に死ぬ → その後 navigation は拒否**」
+が成立する。SendTo / 二重起動で踏める。`3aaa4659` で入れた preflight は
+UI producer の claim だけを覛っており、**この経路は覛えていない**。
+
+#### ⚠ 単に削除してはいけない
+
+この早期キャンセルは「Activation の解決中に、古い bookmark / archive completion が
+表示へ着地する race」を防ぐために入っている (コメントに明記あり、
+既存テストも「Activation は解決前にキャンセルする」を固定している)。
+
+正しい形は **Activation に request ownership / 世代を持たせ、
+scope admission の後で supersede を確定させる**こと。そうしないと、早期
+キャンセル導入前の race が戻る。
+
+#### 手動再現 (Codex 提示)
+
+1. キャッシュ未作成で変換に時間のかかる大きめの 7z をフォルダ A に置く
+2. 範囲外のフォルダ B を用意する
+3. A の一覧を ★固定 (7z が member、B が範囲外)
+4. 「確認せず変換」で 7z を開き、進捗ウィンドウが出るまで待つ
+5. **その最中に SendTo / 二重起動で B を既存インスタンスへ転送**
+6. 現状: 進捗ウィンドウが消えて変換がキャンセルされ、その後 B が範囲外として拒否される
+
+- 規模 \\ 優先度: Small 〜 Medium / **P2 (v3.3.0 出荷前)**。
+
+### 1.134 common modal がツールバー / メニューバーのポインターナビを止めていない — 未対応
+
+- 出典: 2026-08-27、§1.133 の調査中に Codex が発見。**archive convert 固有ではなく、
+  全 common-modal window に関わる入力ゲートの不統一**。
+
+`common_modal_dialog_open` に登録された window は、キーボードショートカット /
+グリッド open / 背面 wheel / フルスクリーン入力を止めるが、**ツールバーの
+お気に入りボタンなどのポインターナビは止まらない** (`any_dialog_open()` で
+無効化されていない)。
+
+変換進捗ウィンドウ表示中でもお気に入りクリックでナビできるのはこれが原因。
+これ自体は §1.133 の修正対象ではない (preflight が拒否するので安全) が、
+**モーダルの意味が入力種別で違う**のは設計として不揃い。
+
+⚠ `archive_convert` を `archive_convert.is_some()` で一括登録するのは**誤り**。
+意図的に非表示にしている `Scanning` 中まで操作不能になる。現行の
+`archive_convert_dialog_visible()` 経由の登録が正しい。
+
+- 規模 \\ 優先度: Medium / P3 (出荷ブロッカーではない)。
 
 ## 2. 一覧 / サムネイル / フォルダ走査
 

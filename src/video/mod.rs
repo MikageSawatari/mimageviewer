@@ -66,6 +66,7 @@ pub(crate) mod seek_strip;
 pub mod seek_strip_batch;
 pub(crate) mod seek_strip_thumbs;
 pub(crate) mod seek_strip_wave;
+pub mod spherical_metadata;
 pub(crate) mod stream;
 pub mod swscale_helpers;
 pub mod thumbnail;
@@ -646,6 +647,17 @@ pub enum NativeVideoOutputEvent {
         delta_secs: f64,
     },
     TouchChromeLearned,
+    PanoramaDrag {
+        delta_points: egui::Vec2,
+        viewport_height_points: f32,
+    },
+    PanoramaWheel {
+        delta: i32,
+    },
+    TogglePanorama,
+    CyclePanoramaProjection,
+    SetPanoramaProjection(crate::panorama::PanoProjection),
+    ResetPanorama,
     TileSeek {
         target_secs: f64,
     },
@@ -1033,6 +1045,9 @@ enum NativeVideoOutputCommand {
     },
     SetVideoGrade {
         grade: crate::creative_lut::VideoGradeSnapshot,
+    },
+    SetPanoramaPose {
+        panorama_pose: Option<(crate::panorama::PanoPose, crate::panorama::PanoUvTransform)>,
     },
     StartAnime4kMeasurement,
     SetAnime4kState {
@@ -1473,10 +1488,6 @@ impl<F> FramePresentationState<F> {
         Self::into_displaced(previous)
     }
 
-    fn should_represent_for_grade_change(&self, render_grade_changed: bool) -> bool {
-        self.should_represent_for_visual_change(render_grade_changed)
-    }
-
     fn should_represent_for_visual_change(&self, changed: bool) -> bool {
         changed && matches!(self, Self::Visible { .. })
     }
@@ -1500,7 +1511,7 @@ impl<F> FramePresentationState<F> {
 }
 
 #[cfg(windows)]
-const NATIVE_COMMAND_LATEST_SLOTS: usize = 31;
+const NATIVE_COMMAND_LATEST_SLOTS: usize = 32;
 
 #[cfg(windows)]
 fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usize> {
@@ -1536,6 +1547,7 @@ fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usiz
         NativeVideoOutputCommand::SetAnime4kState { .. } => Some(28),
         NativeVideoOutputCommand::SetBarLockState { .. } => Some(29),
         NativeVideoOutputCommand::SetSeekStrip { .. } => Some(30),
+        NativeVideoOutputCommand::SetPanoramaPose { .. } => Some(31),
         NativeVideoOutputCommand::ResetSidePanelSession
         | NativeVideoOutputCommand::StartAnime4kMeasurement
         | NativeVideoOutputCommand::ShowToast { .. }
@@ -2080,6 +2092,16 @@ impl NativeVideoOutput {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::SetVideoGrade { grade });
+        crate::video::native_window::post_wake(self.hwnd.load(Ordering::Acquire));
+    }
+
+    fn set_panorama_pose(
+        &self,
+        panorama_pose: Option<(crate::panorama::PanoPose, crate::panorama::PanoUvTransform)>,
+    ) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetPanoramaPose { panorama_pose });
         crate::video::native_window::post_wake(self.hwnd.load(Ordering::Acquire));
     }
 
@@ -2954,7 +2976,12 @@ impl NativeFrameOutputContext {
 
     fn should_represent_for_grade_change(&self, render_grade_changed: bool) -> bool {
         self.presentation
-            .should_represent_for_grade_change(render_grade_changed)
+            .should_represent_for_visual_change(render_grade_changed)
+    }
+
+    fn should_represent_for_visual_change(&self, changed: bool) -> bool {
+        self.presentation
+            .should_represent_for_visual_change(changed)
     }
 
     fn hide(&mut self) {
@@ -3588,6 +3615,20 @@ fn send_native_overlay_command(
         Command::Seek { target_secs } => NativeVideoOutputEvent::Seek { target_secs },
         Command::SeekRelative { delta_secs } => NativeVideoOutputEvent::SeekRelative { delta_secs },
         Command::TouchChromeLearned => NativeVideoOutputEvent::TouchChromeLearned,
+        Command::PanoramaDrag {
+            delta_points,
+            viewport_height_points,
+        } => NativeVideoOutputEvent::PanoramaDrag {
+            delta_points,
+            viewport_height_points,
+        },
+        Command::PanoramaWheel { delta } => NativeVideoOutputEvent::PanoramaWheel { delta },
+        Command::TogglePanorama => NativeVideoOutputEvent::TogglePanorama,
+        Command::CyclePanoramaProjection => NativeVideoOutputEvent::CyclePanoramaProjection,
+        Command::SetPanoramaProjection(projection) => {
+            NativeVideoOutputEvent::SetPanoramaProjection(projection)
+        }
+        Command::ResetPanorama => NativeVideoOutputEvent::ResetPanorama,
         Command::TileSeek { target_secs } => NativeVideoOutputEvent::TileSeek { target_secs },
         Command::NavigateItem { delta, via_wheel } => {
             NativeVideoOutputEvent::NavigateItem { delta, via_wheel }
@@ -4045,6 +4086,10 @@ fn run_native_video_output(
     let mut cur_video_compact: Option<bool> = None;
     let mut cur_fallback_file_name = config.fallback_file_name.clone();
     let mut cur_video_grade = config.video_grade.clone();
+    let mut cur_panorama_pose: Option<(
+        crate::panorama::PanoPose,
+        crate::panorama::PanoUvTransform,
+    )> = None;
     let mut cur_scale_filter = config.scale_filter;
     let mut cur_downscale_smoothing_percent = config.downscale_smoothing_percent;
     let mut cur_anime4k_variant = config.anime4k_variant;
@@ -4068,6 +4113,7 @@ fn run_native_video_output(
     let run_started = Instant::now();
     presenter.set_overlay_vst3_available(config.vst3_available);
     presenter.set_video_grade(cur_video_grade.clone())?;
+    presenter.set_panorama_pose(cur_panorama_pose)?;
     presenter.set_overlay_audio_only(config.audio_only);
     presenter.set_overlay_checked(config.checked);
     presenter.set_overlay_fallback_file_name(cur_fallback_file_name.clone());
@@ -4482,6 +4528,48 @@ fn run_native_video_output(
                         }
                         Err(error) => crate::logger::log(format!(
                             "[native-video] Creative LUT shader update failed: {error}"
+                        )),
+                    }
+                }
+                NativeVideoOutputCommand::SetPanoramaPose { panorama_pose } => {
+                    let changed = cur_panorama_pose != panorama_pose;
+                    let activation_changed = cur_panorama_pose.is_some() != panorama_pose.is_some();
+                    cur_panorama_pose = panorama_pose;
+                    match presenter.set_panorama_pose(cur_panorama_pose) {
+                        Ok(()) => {
+                            if activation_changed
+                                && source
+                                    .video_scale_state
+                                    .invalidate_preparation_and_keep_desired()
+                            {
+                                presenter.discard_prepared_video_scale_settings();
+                                desired_scale_apply_due = true;
+                            }
+                            if frame_output.should_represent_for_visual_change(changed)
+                                && !source.video_scale_state.has_desired()
+                            {
+                                let refresh = frame_output
+                                    .visible_frame()
+                                    .map(|frame| presenter.present(frame, config.sync_interval));
+                                match refresh {
+                                    Some(Ok(outcome)) => {
+                                        debug_assert!(
+                                            frame_output
+                                                .mark_current_visible(outcome.copy_fence_value)
+                                        );
+                                        frame_output.retire_completed(
+                                            presenter.copy_fence_completed_value(),
+                                        );
+                                    }
+                                    Some(Err(error)) => crate::logger::log(format!(
+                                        "[native-video] panorama refresh present failed: {error}"
+                                    )),
+                                    None => {}
+                                }
+                            }
+                        }
+                        Err(error) => crate::logger::log(format!(
+                            "[native-video] panorama pose update failed: {error}"
                         )),
                     }
                 }
@@ -5080,6 +5168,7 @@ fn run_native_video_output(
                             cur_vst3_available && placement.is_fullscreen_borderless(),
                         );
                         new_presenter.set_video_grade(cur_video_grade.clone())?;
+                        new_presenter.set_panorama_pose(cur_panorama_pose)?;
                         new_presenter.set_overlay_audio_only(config.audio_only);
                         new_presenter.set_overlay_hud_dimmed(cur_hud_dimmed);
                         new_presenter.set_overlay_checked(cur_checked);
@@ -5386,6 +5475,56 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::TouchChromeLearned,
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::PanoramaDrag {
+                                delta_points,
+                                viewport_height_points,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::PanoramaDrag {
+                                        delta_points,
+                                        viewport_height_points,
+                                    },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::PanoramaWheel {
+                                delta,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::PanoramaWheel { delta },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::TogglePanorama => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::TogglePanorama,
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::CyclePanoramaProjection => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::CyclePanoramaProjection,
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::SetPanoramaProjection(projection) => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SetPanoramaProjection(projection),
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::ResetPanorama => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::ResetPanorama,
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::TileSeek {
@@ -6910,6 +7049,8 @@ impl VideoPlayer {
             d3d11va_supported: false,
             d3d11va_config: String::new(),
             orientation: crate::video::display_metadata::VideoOrientation::IDENTITY,
+            spherical_mapping: None,
+            stereo_layout: crate::video::spherical_metadata::VideoStereoLayout::Mono,
             audio_codec: Some("aac".to_owned()),
             audio_bit_rate_bps: 128_000,
             has_audio: true,
@@ -6931,6 +7072,30 @@ impl VideoPlayer {
             sar_den: 1,
         });
         player
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_panorama_metadata_for_test(
+        &mut self,
+        width: u32,
+        height: u32,
+        sar_num: u32,
+        sar_den: u32,
+        orientation: crate::video::display_metadata::VideoOrientation,
+        spherical_mapping: Option<crate::video::spherical_metadata::VideoSphericalMapping>,
+        stereo_layout: crate::video::spherical_metadata::VideoStereoLayout,
+    ) {
+        let info = self
+            .info
+            .as_mut()
+            .expect("stream-ready test player must have VideoInfo");
+        info.width = width;
+        info.height = height;
+        info.sar_num = sar_num;
+        info.sar_den = sar_den;
+        info.orientation = orientation;
+        info.spherical_mapping = spherical_mapping;
+        info.stereo_layout = stereo_layout;
     }
 
     #[cfg(test)]
@@ -8799,6 +8964,16 @@ impl VideoPlayer {
     }
 
     #[cfg(windows)]
+    pub fn set_native_panorama_pose(
+        &self,
+        panorama_pose: Option<(crate::panorama::PanoPose, crate::panorama::PanoUvTransform)>,
+    ) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_panorama_pose(panorama_pose);
+        }
+    }
+
+    #[cfg(windows)]
     pub fn start_native_anime4k_measurement(&self) {
         if let Some(output) = self.native_output.as_ref() {
             output.start_anime4k_measurement();
@@ -8822,6 +8997,39 @@ impl VideoPlayer {
             .as_ref()
             .filter(|info| info.has_video)
             .map(|info| (info.width, info.height, info.avg_fps))
+    }
+
+    /// Returns the normalized 360-video decision once stream information is ready.
+    /// The aspect-ratio fallback uses display dimensions after SAR and orientation.
+    pub(crate) fn panorama_detection(
+        &self,
+    ) -> Option<
+        Result<
+            spherical_metadata::VideoPanoramaTrigger,
+            spherical_metadata::VideoPanoramaRejection,
+        >,
+    > {
+        let info = self.info.as_ref()?;
+        if !info.has_video {
+            return None;
+        }
+        let (display_width, display_height) = display_metadata::display_pixel_dimensions(
+            info.width,
+            info.height,
+            info.sar_num,
+            info.sar_den,
+            info.orientation,
+        );
+        Some(spherical_metadata::detect(
+            info.spherical_mapping.as_ref(),
+            info.stereo_layout,
+            display_width,
+            display_height,
+        ))
+    }
+
+    pub(crate) fn panorama_mapping(&self) -> Option<spherical_metadata::VideoSphericalMapping> {
+        self.info.as_ref()?.spherical_mapping
     }
 
     #[cfg(windows)]
@@ -10650,23 +10858,23 @@ mod tests {
     }
 
     #[test]
-    fn frame_presentation_grade_change_requests_only_visible_represent() {
+    fn frame_presentation_visual_change_requests_only_visible_represent() {
         let mut state = super::FramePresentationState::Empty;
-        assert!(!state.should_represent_for_grade_change(true));
+        assert!(!state.should_represent_for_visual_change(true));
 
         assert!(state.replace_hidden("hidden").is_none());
         assert!(state.is_hidden());
-        assert!(!state.should_represent_for_grade_change(true));
+        assert!(!state.should_represent_for_visual_change(true));
 
         let _ = state.replace_visible("visible", 3);
-        assert!(state.should_represent_for_grade_change(true));
+        assert!(state.should_represent_for_visual_change(true));
     }
 
     #[test]
-    fn frame_presentation_unchanged_grade_does_not_request_idle_present() {
+    fn frame_presentation_unchanged_visual_state_does_not_request_idle_present() {
         let mut state = super::FramePresentationState::Empty;
         assert!(state.replace_visible("visible", 5).is_none());
-        assert!(!state.should_represent_for_grade_change(false));
+        assert!(!state.should_represent_for_visual_change(false));
     }
 
     #[test]
@@ -10677,7 +10885,7 @@ mod tests {
         state.hide();
 
         assert!(state.is_hidden());
-        assert!(!state.should_represent_for_grade_change(true));
+        assert!(!state.should_represent_for_visual_change(true));
         assert_eq!(state.frame(), Some(&"visible"));
     }
 
@@ -10975,6 +11183,38 @@ mod tests {
         );
         assert!(output.drain_events().is_empty());
         assert!(!output.overlay_input_routing_snapshot().wants_keyboard_input);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn panorama_projection_selection_preserves_mode_through_overlay_event_routing() {
+        let fault = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = super::native_output_event_bus(
+            8,
+            std::sync::Arc::clone(&fault),
+            std::sync::Arc::new(super::VideoUiWake::default()),
+        );
+        super::send_native_overlay_command(
+            &tx,
+            41,
+            7,
+            crate::video::native_presenter::NativeOverlayCommand::SetPanoramaProjection(
+                crate::panorama::PanoProjection::Equidistant,
+            ),
+        );
+
+        let events = rx.drain();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            (
+                41,
+                super::NativeVideoOutputEvent::SetPanoramaProjection(
+                    crate::panorama::PanoProjection::Equidistant
+                )
+            )
+        ));
+        assert!(!fault.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]

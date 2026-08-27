@@ -5521,6 +5521,138 @@ mod startup_open_path_resolve_tests {
         ));
     }
 
+    fn activate_single_archive_snapshot(app: &mut App, source: &Path) {
+        app.current_folder = source.parent().map(Path::to_path_buf);
+        app.items = vec![GridItem::ConvertibleArchive {
+            path: source.to_path_buf(),
+            format: ArchiveFormat::SevenZ,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        assert!(app.is_snapshot_active());
+        assert_eq!(app.snapshot_owner_entry(source), Some(0));
+        app.fs_feedback_toast = None;
+    }
+
+    #[test]
+    fn snapshot_refusal_before_both_claim_sites_preserves_running_archive_open_owner() {
+        for through_container_dispatcher in [true, false] {
+            let mut app = setup_app();
+            let source = app.tmp.path().join(if through_container_dispatcher {
+                "dispatcher-running.7z"
+            } else {
+                "scan-running.7z"
+            });
+            std::fs::write(&source, b"archive source").unwrap();
+            activate_single_archive_snapshot(&mut app, &source);
+            let (_scan_tx, cancel) = install_normal_archive_scan_transition(&mut app, source);
+            let owner_cancel = Arc::clone(
+                &app.archive_convert
+                    .as_ref()
+                    .expect("archive request must be installed")
+                    .cancel,
+            );
+            let current_before = app.current_folder.clone();
+            let outside = app.tmp.path().join(if through_container_dispatcher {
+                "outside-dispatcher"
+            } else {
+                "outside-scan"
+            });
+            std::fs::create_dir_all(&outside).unwrap();
+            app.pending_auto_fs_open = true;
+
+            if through_container_dispatcher {
+                assert_eq!(
+                    app.load_folder_or_convert_archive(outside),
+                    FolderOpenOutcome::Ignored
+                );
+            } else {
+                app.load_folder(outside);
+            }
+
+            assert_eq!(app.current_folder, current_before);
+            assert!(app.archive_convert.is_some(), "request owner was destroyed");
+            assert!(Arc::ptr_eq(&owner_cancel, &cancel));
+            assert!(!cancel.load(Ordering::Relaxed), "worker was cancelled");
+            assert!(!app.pending_auto_fs_open);
+            assert!(app.fs_feedback_toast.as_ref().is_some_and(|toast| {
+                toast.0.contains("スナップショット中は範囲外")
+            }));
+        }
+        // Mutation `move_scope_preflight_below_claim`: move either entry preflight back after
+        // claim_open_request_owner. The corresponding iteration loses archive_convert and sets
+        // its cancel token before the common guard refuses the load.
+    }
+
+    #[test]
+    fn snapshot_refusal_preserves_unresolved_startup_open_owner() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("startup-snapshot-member.7z");
+        std::fs::write(&source, b"archive source").unwrap();
+        activate_single_archive_snapshot(&mut app, &source);
+        let (_resolve_tx, resolve_rx) = mpsc::channel::<StartupOpenPathResolveResult>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.startup_open_path_resolve_pending = Some(StartupOpenPathResolvePending {
+            requested: app.tmp.path().join("unresolved-startup-target"),
+            owner: StartupOpenPathOwner::Activation,
+            cancel: Arc::clone(&cancel),
+            rx: resolve_rx,
+            started_at: std::time::Instant::now(),
+            toast_shown: false,
+        });
+        let outside = app.tmp.path().join("outside-startup-snapshot");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        app.load_folder(outside);
+
+        let pending = app
+            .startup_open_path_resolve_pending
+            .as_ref()
+            .expect("refusal must preserve the unresolved startup owner");
+        assert!(Arc::ptr_eq(&pending.cancel, &cancel));
+        assert!(!cancel.load(Ordering::Relaxed));
+        // Mutation `move_scope_preflight_below_claim`: the claim drops the resolver and sets this
+        // token before the inner snapshot guard refuses the visible load.
+    }
+
+    #[test]
+    fn snapshot_refusal_preserves_conflicting_bookmark_open_owner() {
+        let mut app = setup_app();
+        let source = app.tmp.path().join("bookmark-snapshot-member.7z");
+        std::fs::write(&source, b"archive source").unwrap();
+        activate_single_archive_snapshot(&mut app, &source);
+        let request_id = crate::bookmark_browser::BookmarkOpenRequestId(701);
+        let bookmark_path = app.tmp.path().join("still-resolving-bookmark.pdf");
+        arm_book_bookmark(
+            &mut app,
+            request_id,
+            bookmark_path.clone(),
+            std::time::Instant::now(),
+        );
+        let outside = app.tmp.path().join("outside-bookmark-snapshot");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        app.load_folder(outside);
+
+        assert_eq!(
+            app.bookmark_open_pending
+                .as_ref()
+                .map(crate::bookmark_browser::PendingBookmarkOpen::request_id),
+            Some(request_id)
+        );
+        assert_eq!(
+            app.bookmark_view_target(),
+            Some(&crate::bookmark_browser::BookmarkViewReturnTarget::Book(
+                bookmark_path
+            ))
+        );
+        // Mutation `move_scope_preflight_below_claim`: the claim treats this destination as a
+        // conflicting navigation and clears both bookmark request and return state.
+    }
+
     #[test]
     fn replacing_scanning_archive_bookmark_cancels_old_scan() {
         let mut app = setup_app();
@@ -11946,6 +12078,153 @@ mod phase_c_drill_nav_tests {
         app.items = vec![GridItem::Folder(std::path::PathBuf::from("c:/elsewhere"))];
         app.note_reading_history_open(0);
         assert!(app.reading_history_return_from.is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_container_open_via_gamepad_preserves_main_reading_history_return() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        let mut app = setup_app();
+        let reserved_book = app.tmp.path().join("history-book.zip");
+        let detached_book = app.tmp.path().join("other-book.pdf");
+
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.current_folder = Some(reserved_book.clone());
+        app.items_are_reading_history_view = false;
+        app.reading_history_return_from = Some(reserved_book.clone());
+        app.items = vec![GridItem::PdfFile(detached_book)];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+
+        assert!(
+            app.handle_gamepad_grid_accept(&egui::Context::default())
+                .is_none(),
+            "detached open must consume the main navigation"
+        );
+        assert!(
+            app.active_viewer_context_id().is_some(),
+            "the gamepad route must drive a real detached book open"
+        );
+        assert_eq!(
+            app.reading_history_return_from,
+            Some(reserved_book.clone()),
+            "detached navigation must not clear the mounted main reservation"
+        );
+        assert!(matches!(
+            app.reading_history_back_nav(),
+            Some(crate::ui_main::AddressBarNav::ReadingHistory)
+        ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn main_container_open_via_gamepad_sets_or_clears_reading_history_return() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+
+        for from_history in [true, false] {
+            let mut app = setup_app();
+            let book = app.tmp.path().join(if from_history {
+                "from-history.pdf"
+            } else {
+                "ordinary.pdf"
+            });
+            std::fs::write(&book, b"pdf fixture").unwrap();
+            let previous = app.tmp.path().join("previous.zip");
+
+            app.settings.detached_viewer_open_images_in_window = false;
+            app.settings.auto_fullscreen_zip_pdf = false;
+            app.items_are_reading_history_view = from_history;
+            app.reading_history_return_from = Some(previous);
+            app.items = vec![GridItem::PdfFile(book.clone())];
+            app.thumbnails = vec![ThumbnailState::Pending];
+            app.image_metas = vec![None];
+            app.visible_indices = vec![0];
+            app.selected = Some(0);
+
+            assert!(matches!(
+                app.handle_gamepad_grid_accept(&egui::Context::default()),
+                Some(crate::ui_main::AddressBarNav::Direct(path)) if path == book
+            ));
+            assert_eq!(
+                app.reading_history_return_from,
+                from_history.then_some(book),
+                "ordinary main navigation must preserve the historical set/clear semantics"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn main_folder_candidate_fallback_updates_reading_history_at_adoption() {
+        use crate::app::{FolderOpenScanPurpose, FolderPaneOpenPending, scan_directory};
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, mpsc};
+
+        for from_history in [true, false] {
+            let mut app = setup_app();
+            let parent = app.tmp.path().join(if from_history {
+                "history-parent"
+            } else {
+                "ordinary-parent"
+            });
+            let folder = parent.join("mixed-folder");
+            std::fs::create_dir_all(folder.join("nested-container")).unwrap();
+            let previous = app.tmp.path().join("previous.zip");
+            let initial_reservation = (!from_history).then_some(previous);
+            let scan = scan_directory(&folder);
+
+            app.settings.detached_viewer_open_images_in_window = true;
+            app.settings.auto_fullscreen_image_folders = true;
+            app.current_folder = Some(parent);
+            app.items_are_reading_history_view = from_history;
+            app.reading_history_return_from = initial_reservation.clone();
+            app.items = vec![GridItem::Folder(folder.clone())];
+            app.thumbnails = vec![ThumbnailState::Pending];
+            app.image_metas = vec![None];
+            app.visible_indices = vec![0];
+            app.selected = Some(0);
+
+            assert!(
+                app.handle_gamepad_grid_accept(&egui::Context::default())
+                    .is_none(),
+                "the folder candidate must be consumed until classification completes"
+            );
+            assert_eq!(
+                app.reading_history_return_from, initial_reservation,
+                "starting main-owned classification is not yet main navigation"
+            );
+
+            let (scan_tx, scan_rx) = mpsc::channel();
+            scan_tx.send(Ok(scan)).unwrap();
+            let real_pending = app
+                .folder_pane_open_pending
+                .take()
+                .expect("the real gamepad path must start folder classification");
+            real_pending.cancel.store(true, Ordering::Relaxed);
+            app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                path: folder.clone(),
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx: scan_rx,
+                purpose: FolderOpenScanPurpose::GridFolderCandidate,
+            });
+            let ready = app
+                .poll_folder_pane_open(&egui::Context::default())
+                .expect("the deterministic mixed-folder scan must complete");
+            let (adopted_path, _) = app
+                .resolve_main_folder_open_ready(&egui::Context::default(), ready)
+                .expect("a mixed folder must fall back to ordinary main navigation");
+
+            assert_eq!(adopted_path, folder);
+            assert_eq!(
+                app.reading_history_return_from,
+                from_history.then_some(adopted_path),
+                "the adopted main fallback must preserve the historical set/clear semantics"
+            );
+        }
     }
 
     #[test]
@@ -26949,6 +27228,32 @@ mod pipeline_cache_refactor_tests {
         pixels
     }
 
+    #[cfg(windows)]
+    fn insert_panorama_video(
+        app: &mut App,
+        path: &str,
+        width: u32,
+        height: u32,
+        orientation: crate::video::display_metadata::VideoOrientation,
+        mapping: Option<crate::video::spherical_metadata::VideoSphericalMapping>,
+        stereo: crate::video::spherical_metadata::VideoStereoLayout,
+    ) -> usize {
+        let idx = app.items.len();
+        let path = PathBuf::from(path);
+        app.items.push(GridItem::Video(path.clone()));
+        app.thumbnails.push(ThumbnailState::Pending);
+        let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+        player.set_panorama_metadata_for_test(width, height, 1, 1, orientation, mapping, stereo);
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        idx
+    }
+
     fn insert_pano_final_source(
         app: &mut App,
         ctx: &egui::Context,
@@ -29487,7 +29792,11 @@ mod pipeline_cache_refactor_tests {
                 "pano_edit_mode_raw",
                 egui::Color32::BLACK,
             );
-            app.panorama_state = Some(crate::panorama::PanoramaState::new(0.0, 0.0));
+            app.panorama_state = Some(crate::panorama::PanoramaState::new(
+                0.0,
+                0.0,
+                crate::panorama::PanoProjection::Perspective,
+            ));
 
             let ctrl = egui::Modifiers {
                 ctrl: ctrl_pressed,
@@ -29520,6 +29829,214 @@ mod pipeline_cache_refactor_tests {
             ));
         }
         crate::key_input::clear_test_frame();
+    }
+
+    /// 投影方式の一覧は上バーの投影ボタンから吊り下がり、そのボタンは 360 表示中しか
+    /// 出ない。360 を抜けたら一覧も畳む。残すと、持ち主のいない矩形がカーソル自動
+    /// 非表示・ホイール・タッチを抑止したままになる。
+    #[test]
+    fn leaving_panorama_mode_closes_the_projection_list() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/pano-projection-popup.jpg");
+        app.fullscreen_idx = Some(idx);
+        insert_pano_static_source(
+            &mut app,
+            &ctx,
+            idx,
+            "pano_projection_popup",
+            egui::Color32::BLACK,
+        );
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(
+            0.0,
+            0.0,
+            crate::panorama::PanoProjection::Perspective,
+        ));
+        app.panorama_projection_popup_open = true;
+
+        app.toggle_panorama_mode(idx);
+
+        assert!(app.panorama_state.is_none(), "360 を抜けたはず");
+        assert!(
+            !app.panorama_projection_popup_open,
+            "the projection list must not outlive the button that owns it"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn panorama_detection_has_one_entry_for_stills_and_display_oriented_video() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let still = push_image(&mut app, "C:/pics/pano-detect.jpg");
+        insert_pano_static_source(
+            &mut app,
+            &ctx,
+            still,
+            "pano_detect_still",
+            egui::Color32::BLACK,
+        );
+        let video = insert_panorama_video(
+            &mut app,
+            "C:/clips/pano-rotated.mp4",
+            1920,
+            3840,
+            crate::video::display_metadata::VideoOrientation::new(90, false),
+            None,
+            crate::video::spherical_metadata::VideoStereoLayout::Mono,
+        );
+
+        assert_eq!(
+            app.detect_panorama(still),
+            Some(crate::panorama::PanoramaTrigger::Hint)
+        );
+        assert_eq!(
+            app.detect_panorama(video),
+            Some(crate::panorama::PanoramaTrigger::Hint),
+            "video fallback must use dimensions after orientation"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn video_panorama_lifecycle_wheel_audio_pause_and_tile_exclusion_share_app_state() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let first = insert_panorama_video(
+            &mut app,
+            "C:/clips/pano-a.mp4",
+            3840,
+            1920,
+            crate::video::display_metadata::VideoOrientation::IDENTITY,
+            None,
+            crate::video::spherical_metadata::VideoStereoLayout::Mono,
+        );
+        let flat = insert_panorama_video(
+            &mut app,
+            "C:/clips/flat.mp4",
+            1920,
+            1080,
+            crate::video::display_metadata::VideoOrientation::IDENTITY,
+            None,
+            crate::video::spherical_metadata::VideoStereoLayout::Mono,
+        );
+        let second = insert_panorama_video(
+            &mut app,
+            "C:/clips/pano-b.mp4",
+            3840,
+            1920,
+            crate::video::display_metadata::VideoOrientation::IDENTITY,
+            None,
+            crate::video::spherical_metadata::VideoStereoLayout::Mono,
+        );
+        app.fullscreen_idx = Some(first);
+        app.video_tile_mode_active = true;
+        app.settings.video_scale_filter = crate::settings::VideoScaleFilter::Anime;
+
+        app.toggle_panorama_mode(first);
+        assert!(app.is_panorama_mode_active(first));
+        assert!(!app.video_tile_mode_active);
+        assert_eq!(
+            app.settings.video_scale_filter,
+            crate::settings::VideoScaleFilter::Anime,
+            "360 must not rewrite the selected video scale filter"
+        );
+        {
+            let state = app.panorama_state.as_mut().unwrap();
+            state.yaw = 0.75;
+            state.pitch = -0.25;
+            state.fov_y = state.projection.fov_max();
+        }
+        let retained_pose = app.panorama_state.as_ref().unwrap().pose();
+        assert!(
+            app.apply_native_video_panorama_wheel(&ctx, first, -120),
+            "wheel remains consumed when FOV is already at its upper limit"
+        );
+        assert_eq!(app.panorama_state.as_ref().unwrap().pose(), retained_pose);
+
+        app.fullscreen_idx = Some(flat);
+        assert!(!app.is_panorama_mode_active(flat));
+        assert_eq!(app.panorama_state.as_ref().unwrap().pose(), retained_pose);
+        app.fullscreen_idx = Some(second);
+        assert!(app.is_panorama_mode_active(second));
+        assert_eq!(app.panorama_state.as_ref().unwrap().pose(), retained_pose);
+
+        app.video_audio_mode = Some(second);
+        assert!(!app.native_video_panorama_input_active(second));
+        assert_eq!(app.panorama_state.as_ref().unwrap().pose(), retained_pose);
+        app.video_audio_mode = None;
+        assert!(app.native_video_panorama_input_active(second));
+        assert_eq!(app.panorama_state.as_ref().unwrap().pose(), retained_pose);
+
+        app.toggle_panorama_mode(second);
+        assert!(
+            app.panorama_state.is_none(),
+            "explicit OFF discards the state"
+        );
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(
+            0.0,
+            0.0,
+            crate::panorama::PanoProjection::Perspective,
+        ));
+        app.close_fullscreen();
+        assert!(
+            app.panorama_state.is_none(),
+            "fullscreen exit discards the shared panorama state"
+        );
+    }
+
+    /// 一覧から選ぶ経路と、キーの順送り経路は同じ適用処理へ合流する。
+    /// 別々に持つと、片方だけ画角の丸めや通知を落とす。
+    #[test]
+    fn choosing_and_cycling_the_projection_share_one_apply_path() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/pano-projection-apply.jpg");
+        app.fullscreen_idx = Some(idx);
+        insert_pano_static_source(
+            &mut app,
+            &ctx,
+            idx,
+            "pano_projection_apply",
+            egui::Color32::BLACK,
+        );
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(
+            0.0,
+            0.0,
+            crate::panorama::PanoProjection::Stereographic,
+        ));
+        // 立体射影でしか許されない広い画角にしておく。
+        app.panorama_state.as_mut().unwrap().fov_y = crate::panorama::FOV_MAX_WIDE;
+
+        // 一覧から透視を選ぶ = 画角も透視の上限まで丸める。
+        assert_eq!(
+            app.set_panorama_projection(crate::panorama::PanoProjection::Perspective),
+            Some(crate::panorama::PanoProjection::Perspective)
+        );
+        let pano = app.panorama_state.as_ref().unwrap();
+        assert_eq!(
+            pano.projection,
+            crate::panorama::PanoProjection::Perspective
+        );
+        assert!(pano.fov_y <= crate::panorama::FOV_MAX, "fov={}", pano.fov_y);
+
+        // キーの順送りも同じ適用処理を通る。
+        assert_eq!(
+            app.cycle_panorama_projection(),
+            Some(crate::panorama::PanoProjection::Stereographic)
+        );
+        assert_eq!(
+            app.panorama_state.as_ref().unwrap().projection,
+            crate::panorama::PanoProjection::Stereographic
+        );
+
+        // 360 が動いていなければどちらも何もしない。
+        app.panorama_state = None;
+        assert_eq!(app.cycle_panorama_projection(), None);
+        assert_eq!(
+            app.set_panorama_projection(crate::panorama::PanoProjection::Equidistant),
+            None
+        );
     }
 
     #[test]
@@ -33948,6 +34465,52 @@ mod native_video_rating_key_tests {
         assert_eq!(
             app.settings.fullscreen_side_panel_mode,
             crate::settings::FsSidePanelMode::Hover
+        );
+    }
+
+    #[test]
+    fn native_projection_selection_event_reaches_shared_app_apply_path() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let path = PathBuf::from(r"C:\clips\pano-projection.mp4");
+        let idx = push_video(&mut app, path.clone());
+        let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+        player.set_panorama_metadata_for_test(
+            640,
+            320,
+            1,
+            1,
+            crate::video::display_metadata::VideoOrientation::IDENTITY,
+            None,
+            crate::video::spherical_metadata::VideoStereoLayout::Mono,
+        );
+        let source_epoch = player.native_source_epoch().unwrap();
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(idx);
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(
+            0.0,
+            0.0,
+            crate::panorama::PanoProjection::Stereographic,
+        ));
+
+        app.handle_native_video_output_event(
+            &ctx,
+            idx,
+            source_epoch,
+            crate::video::NativeVideoOutputEvent::SetPanoramaProjection(
+                crate::panorama::PanoProjection::Equidistant,
+            ),
+        );
+
+        assert_eq!(
+            app.panorama_state.as_ref().unwrap().projection,
+            crate::panorama::PanoProjection::Equidistant
         );
     }
 
@@ -44732,7 +45295,11 @@ mod still_window_mode_key_tests {
         app.settings.detached_viewer_open_images_in_window = true;
         app.fullscreen_idx = Some(first);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.panorama_state = Some(crate::panorama::PanoramaState::new(0.5, -0.25));
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(
+            0.5,
+            -0.25,
+            crate::panorama::PanoProjection::Perspective,
+        ));
         app.pano_toast_shown_for_current_fs = true;
         app.analysis_mode = true;
         app.analysis_zoom = 2.0;
@@ -44771,7 +45338,11 @@ mod still_window_mode_key_tests {
         app.fullscreen_idx = Some(first);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.panorama_state = Some(crate::panorama::PanoramaState::new(0.5, -0.25));
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(
+            0.5,
+            -0.25,
+            crate::panorama::PanoProjection::Perspective,
+        ));
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.fs_open_intent_from_grid = true;
@@ -46749,7 +47320,11 @@ mod still_window_mode_key_tests {
             app.viewer_presentation = ViewerPresentation::DetachedWindow;
             app.detached_viewer_independent_active = true;
             app.detached_viewer_window_id = Some(42);
-            app.panorama_state = Some(crate::panorama::PanoramaState::new(1.0, -0.5));
+            app.panorama_state = Some(crate::panorama::PanoramaState::new(
+                1.0,
+                -0.5,
+                crate::panorama::PanoProjection::Perspective,
+            ));
             app.pano_toast_shown_for_current_fs = true;
             app.analysis_mode = true;
             app.analysis_zoom = 2.5;
@@ -46892,7 +47467,11 @@ mod still_window_mode_key_tests {
     #[test]
     fn active_detached_context_uses_its_own_panorama_mode_state() {
         let mut app = setup_app();
-        app.panorama_state = Some(crate::panorama::PanoramaState::new(1.0, 0.0));
+        app.panorama_state = Some(crate::panorama::PanoramaState::new(
+            1.0,
+            0.0,
+            crate::panorama::PanoProjection::Perspective,
+        ));
         app.pano_toast_shown_for_current_fs = true;
 
         app.build_active_context_for_test(None, DetachedSource::Image, |bundle| {
@@ -46909,7 +47488,11 @@ mod still_window_mode_key_tests {
                 !mounted.pano_toast_shown_for_current_fs,
                 "panorama guide state is also per fullscreen viewer context"
             );
-            mounted.panorama_state = Some(crate::panorama::PanoramaState::new(0.25, -0.1));
+            mounted.panorama_state = Some(crate::panorama::PanoramaState::new(
+                0.25,
+                -0.1,
+                crate::panorama::PanoProjection::Perspective,
+            ));
             mounted.pano_toast_shown_for_current_fs = true;
         });
 
@@ -56062,6 +56645,768 @@ mod smart_folder_transition_tests {
             .expect("root entry must be materialized");
         app.selected = Some(index);
         index
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct ConvertibleArchiveMainState {
+        reading_history_return_from: Option<PathBuf>,
+        rating_filter_suppressed_at: Option<(PathBuf, [bool; 6])>,
+        facet_filter: crate::settings::FacetFilter,
+        facet_filter_suppression_stack: Vec<(PathBuf, crate::settings::FacetFilter)>,
+        smart_folder: super::top_level_grid_view::SmartFolderViewState,
+        item_keys: Vec<String>,
+    }
+
+    fn convertible_archive_main_state(app: &App) -> ConvertibleArchiveMainState {
+        ConvertibleArchiveMainState {
+            reading_history_return_from: app.reading_history_return_from.clone(),
+            rating_filter_suppressed_at: app.rating_filter_suppressed_at.clone(),
+            facet_filter: app.settings.facet_filter.clone(),
+            facet_filter_suppression_stack: app
+                .facet_filter_suppression_stack
+                .iter()
+                .map(|suppression| (suppression.anchor.clone(), suppression.saved_filter.clone()))
+                .collect(),
+            smart_folder: app
+                .top_level_grid_view
+                .smart_folder()
+                .cloned()
+                .expect("smart-folder position must exist"),
+            item_keys: app.items.iter().map(GridItem::perf_key).collect(),
+        }
+    }
+
+    fn install_convertible_archive_main_grid(
+        app: &mut super::phase_c_support::AppTestEnv,
+    ) -> (PathBuf, ConvertibleArchiveMainState) {
+        let root = app.tmp.path().join("convertible-smart-root");
+        let entry = root.join("books");
+        let source = entry.join("book.7z");
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(&source, b"deterministic archive request fixture").unwrap();
+        app.rating_db
+            .as_ref()
+            .expect("rating DB")
+            .set(&crate::adjustment_db::normalize_path(&source), 5)
+            .unwrap();
+
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        app.settings
+            .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+        let smart = definition("Convertible lifecycle", root);
+        let smart_id = smart.id;
+        app.settings.smart_folders = vec![smart];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(smart_id, false);
+        wait_for_smart_folder_idle(app, &ctx, smart_id);
+
+        select_real_path(app, &entry);
+        assert!(app.begin_smart_folder_drill(&entry));
+        app.load_folder(entry.clone());
+        assert_eq!(
+            app.top_level_grid_view
+                .smart_folder()
+                .and_then(|state| state.scoped_current()),
+            Some(entry.as_path())
+        );
+
+        let idx = select_real_path(app, &source);
+        assert_eq!(
+            app.get_rating(idx),
+            5,
+            "smart snapshot must carry source rating"
+        );
+        app.settings.rating_filter = [false, false, false, false, false, true];
+        app.settings
+            .facet_filter
+            .kinds
+            .insert(crate::settings::FacetItemKind::Archive);
+        app.rebuild_visible_indices();
+        assert!(app.visible_indices.contains(&idx));
+        app.reading_history_return_from = Some(app.tmp.path().join("reserved-history.zip"));
+        assert!(app.rating_filter_suppressed_at.is_none());
+        assert!(app.facet_filter_suppression_stack.is_empty());
+
+        let before = convertible_archive_main_state(app);
+        (source, before)
+    }
+
+    fn write_convert_completion_zip(path: &Path) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("page-001.jpg", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zip, b"page").unwrap();
+        zip.finish().unwrap();
+    }
+
+    fn record_convertible_archive_cache(
+        app: &mut super::phase_c_support::AppTestEnv,
+        source: &Path,
+        cached: &Path,
+    ) {
+        let source_metadata = std::fs::metadata(source).unwrap();
+        app.archive_cache_db
+            .as_ref()
+            .expect("archive cache DB")
+            .record(
+                source,
+                crate::ui_helpers::mtime_secs(&source_metadata),
+                source_metadata.len() as i64,
+                ArchiveFormat::SevenZ,
+                cached,
+                std::fs::metadata(cached).unwrap().len() as i64,
+                1,
+                false,
+            )
+            .unwrap();
+    }
+
+    fn activate_convertible_archive_snapshot(app: &mut App, source: &Path) {
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        assert!(app.is_snapshot_active());
+        assert_eq!(app.snapshot_owner_entry(source), Some(0));
+        assert!(matches!(
+            app.items.as_slice(),
+            [GridItem::ConvertibleArchive { path, .. }]
+                if crate::folder_tree::path_eq(path, source)
+        ));
+        app.selected = Some(0);
+    }
+
+    fn install_pending_direct_rar_completion(
+        app: &mut App,
+        source: &Path,
+        with_deferred_fullscreen: bool,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        install_pending_direct_rar_completion_with_policy(
+            app,
+            source,
+            with_deferred_fullscreen,
+            crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::MainGridArchive(
+                MainGridArchiveTransitionIntent {
+                    source_path: source.to_path_buf(),
+                    reading_history_return_from: None,
+                    suppress_rating_filter: false,
+                    suppress_facet_filter: false,
+                    smart_folder_drill: false,
+                },
+            ),
+            None,
+        )
+    }
+
+    fn install_pending_direct_rar_completion_with_policy(
+        app: &mut App,
+        source: &Path,
+        with_deferred_fullscreen: bool,
+        completion: crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy,
+        nav_history_rollback: Option<FolderNavHistorySnapshot>,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let deferred_fullscreen = with_deferred_fullscreen.then(|| {
+            crate::ui_dialogs::archive_convert::ArchiveConvertDeferredFullscreen {
+                restore_video_tile: false,
+                reopen: DeferredFsReopen {
+                    history_trigger: crate::app::HistoryTrigger::UserChosen,
+                    resume_slideshow: false,
+                    target: DeferredFsTarget::None,
+                    resume_to_last_page: false,
+                    from_explicit_open: false,
+                    preserve_after_password_prompt: false,
+                },
+            }
+        });
+        if with_deferred_fullscreen {
+            app.fs_nav_locked_gen = Some(app.items_generation);
+        }
+        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            src_path: source.to_path_buf(),
+            input_seq: app.input_seq,
+            format: ArchiveFormat::Rar,
+            password: None,
+            password_input: String::new(),
+            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+            cancel: std::sync::Arc::clone(&cancel),
+            rx,
+            pending_nav: None,
+            pending_direct_nav: Some(source.to_path_buf()),
+            allow_direct_read: true,
+            fallback_cached_zip: None,
+            completion,
+            pending_sibling_output: None,
+            nav_history_rollback,
+            auto_fullscreen: false,
+            deferred_fullscreen,
+            suppress_confirm: false,
+            suppress_confirm_next_time: false,
+        });
+        cancel
+    }
+
+    fn wait_for_snapshot_archive_listing(app: &mut App, cached: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.zip_enumerate_pending.is_some() && std::time::Instant::now() < deadline {
+            app.poll_zip_enumerate();
+            std::thread::yield_now();
+        }
+        assert!(app.zip_enumerate_pending.is_none());
+        assert!(matches!(
+            app.items.as_slice(),
+            [GridItem::ZipImage { zip_path, entry_name }]
+                if zip_path == cached && entry_name == "page-001.jpg"
+        ));
+    }
+
+    #[test]
+    fn ignored_convertible_archive_keeps_main_transition_intent_uncommitted() {
+        let mut app = setup_app();
+        let (_source, before) = install_convertible_archive_main_grid(&mut app);
+        app.settings
+            .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
+
+        assert!(
+            app.handle_gamepad_grid_accept(&egui::Context::default())
+                .is_none()
+        );
+
+        assert_eq!(convertible_archive_main_state(&app), before);
+        assert!(app.archive_convert.is_none());
+        // Mutation `commit_before_ignore_guard`: commit the captured intent before the Ignore
+        // check. This assertion then observes the cleared reservation, both suppressions, and the
+        // advanced smart scope.
+    }
+
+    #[test]
+    fn cancelled_convertible_archive_dialog_drops_main_transition_intent() {
+        let mut app = setup_app();
+        let (_source, before) = install_convertible_archive_main_grid(&mut app);
+
+        assert!(
+            app.handle_gamepad_grid_accept(&egui::Context::default())
+                .is_none()
+        );
+        assert!(app.archive_convert.is_some());
+        assert_eq!(convertible_archive_main_state(&app), before);
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| app.show_archive_convert_dialog(ctx),
+        );
+
+        assert!(app.archive_convert.is_none());
+        assert_eq!(convertible_archive_main_state(&app), before);
+        // Mutation `commit_on_request_adoption`: commit MainGridArchive when
+        // request_archive_convert_owned adopts the request. The pre-cancel assertion and the final
+        // assertion both fail.
+    }
+
+    fn publish_convert_done_and_open(app: &mut App, cached: &Path) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let state = app
+            .archive_convert
+            .as_mut()
+            .expect("real grid path must create the conversion request");
+        state.rx = rx;
+        state.phase = crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Converting {
+            progress: std::sync::Arc::new(
+                crate::ui_dialogs::archive_convert::ArchiveConvertProgressShared::new(),
+            ),
+        };
+        tx.send(
+            crate::ui_dialogs::archive_convert::ArchiveConvertMsg::ConvertDone(Ok((
+                crate::archive_converter::ArchiveImageSummary {
+                    image_count: 1,
+                    total_uncompressed_bytes: 4,
+                    nested_archive_count: 0,
+                },
+                cached.to_path_buf(),
+                std::fs::metadata(cached).unwrap().len() as i64,
+            ))),
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_archive_convert_dialog(ctx);
+        });
+    }
+
+    #[test]
+    fn successful_convertible_archive_completion_commits_main_transition_intent() {
+        let mut app = setup_app();
+        let (source, before) = install_convertible_archive_main_grid(&mut app);
+        let cached = app.tmp.path().join("converted-book.zip");
+        write_convert_completion_zip(&cached);
+
+        assert!(
+            app.handle_gamepad_grid_accept(&egui::Context::default())
+                .is_none()
+        );
+        assert_eq!(convertible_archive_main_state(&app), before);
+        assert!(matches!(
+            app.archive_convert.as_ref().map(|state| &state.completion),
+            Some(
+                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::MainGridArchive(
+                    intent
+                )
+            ) if intent.smart_folder_drill
+        ));
+        assert!(app.top_level_grid_view.smart_folder_session().is_some());
+        publish_convert_done_and_open(&mut app, &cached);
+
+        assert!(app.archive_convert.is_none());
+        assert_eq!(app.current_folder.as_deref(), Some(cached.as_path()));
+        assert_eq!(
+            app.archive_source_override.as_deref(),
+            Some(source.as_path())
+        );
+        assert!(app.reading_history_return_from.is_none());
+        assert_eq!(
+            app.rating_filter_suppressed_at
+                .as_ref()
+                .map(|(anchor, _)| anchor),
+            Some(&source)
+        );
+        assert!(!app.settings.facet_filter.is_active());
+        assert_eq!(app.facet_filter_suppression_stack.len(), 1);
+        assert_eq!(app.facet_filter_suppression_stack[0].anchor, source);
+        assert_eq!(
+            app.facet_filter_suppression_stack[0].saved_filter,
+            before.facet_filter
+        );
+        assert_eq!(
+            app.top_level_grid_view
+                .smart_folder()
+                .and_then(|state| state.scoped_current()),
+            Some(source.as_path())
+        );
+        assert!(
+            app.items.is_empty(),
+            "successful load boundary replaces the source grid with the archive loading state"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.zip_enumerate_pending.is_some() && std::time::Instant::now() < deadline {
+            app.poll_zip_enumerate();
+            std::thread::yield_now();
+        }
+        assert!(app.zip_enumerate_pending.is_none());
+        assert!(matches!(
+            app.items.as_slice(),
+            [GridItem::ZipImage { zip_path, entry_name }]
+                if zip_path == &cached && entry_name == "page-001.jpg"
+        ));
+        assert_eq!(
+            app.top_level_grid_view
+                .smart_folder()
+                .and_then(|state| state.scoped_current()),
+            Some(source.as_path())
+        );
+        // Mutation `omit_success_completion_commit`: remove commit_main_grid_archive_transition
+        // from the loaded pending_nav branch. The reservation/suppression/smart-scope assertions
+        // all fail.
+    }
+
+    #[test]
+    fn snapshot_convertible_archive_cache_hit_uses_owned_source_scope() {
+        let mut app = setup_app();
+        let (source, _before) = install_convertible_archive_main_grid(&mut app);
+        let cached = app.tmp.path().join("snapshot-cache-hit.zip");
+        write_convert_completion_zip(&cached);
+        record_convertible_archive_cache(&mut app, &source, &cached);
+        activate_convertible_archive_snapshot(&mut app, &source);
+
+        assert!(
+            app.handle_gamepad_grid_accept(&egui::Context::default())
+                .is_none()
+        );
+
+        assert!(app.archive_convert.is_none());
+        assert_eq!(app.current_folder.as_deref(), Some(cached.as_path()));
+        assert_eq!(
+            app.archive_source_override.as_deref(),
+            Some(source.as_path())
+        );
+        assert!(app.is_snapshot_active());
+        wait_for_snapshot_archive_listing(&mut app, &cached);
+        // Mutation `scope_cache_zip_instead_of_owned_source`: resolve snapshot ownership from
+        // `cached` instead of MainGridArchiveTransitionIntent::source_path. The current-folder and
+        // listing assertions fail because the common snapshot guard refuses the implementation
+        // alias before load_zip_as_folder can adopt it.
+    }
+
+    #[test]
+    fn snapshot_convertible_archive_async_completion_uses_owned_source_scope() {
+        let mut app = setup_app();
+        let (source, _before) = install_convertible_archive_main_grid(&mut app);
+        let cached = app.tmp.path().join("snapshot-convert-done.zip");
+        write_convert_completion_zip(&cached);
+        activate_convertible_archive_snapshot(&mut app, &source);
+
+        assert!(
+            app.handle_gamepad_grid_accept(&egui::Context::default())
+                .is_none()
+        );
+        assert!(matches!(
+            app.archive_convert.as_ref().map(|state| &state.completion),
+            Some(
+                crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::MainGridArchive(
+                    _
+                )
+            )
+        ));
+
+        publish_convert_done_and_open(&mut app, &cached);
+
+        assert!(app.archive_convert.is_none());
+        assert_eq!(app.current_folder.as_deref(), Some(cached.as_path()));
+        assert_eq!(
+            app.archive_source_override.as_deref(),
+            Some(source.as_path())
+        );
+        assert!(app.is_snapshot_active());
+        wait_for_snapshot_archive_listing(&mut app, &cached);
+        // The same `scope_cache_zip_instead_of_owned_source` mutation reaches this test through
+        // ConvertDone -> pending_nav -> load_folder_with_scan_owned and leaves the source grid
+        // mounted instead of opening the completed archive.
+    }
+
+    #[test]
+    fn rar_direct_completion_generation_swap_refuses_stale_source_and_cleans_up() {
+        let mut app = setup_app();
+        let root = app.tmp.path().join("rar-generation-swap");
+        std::fs::create_dir_all(&root).unwrap();
+        let stale_source = root.join("generation-n.rar");
+        let current_source = root.join("generation-n-plus-one.rar");
+        std::fs::write(&stale_source, b"stale rar").unwrap();
+        std::fs::write(&current_source, b"current rar").unwrap();
+        app.current_folder = Some(root.clone());
+        app.items = vec![
+            GridItem::ConvertibleArchive {
+                path: stale_source.clone(),
+                format: ArchiveFormat::Rar,
+            },
+            GridItem::ConvertibleArchive {
+                path: current_source.clone(),
+                format: ArchiveFormat::Rar,
+            },
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
+        app.image_metas = vec![None, None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        let generation_n = app.snapshot.as_ref().unwrap().generation_id;
+        let cancel = install_pending_direct_rar_completion(&mut app, &stale_source, true);
+
+        app.deactivate_snapshot();
+        assert!(app.archive_convert.is_some());
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        app.settings.rating_filter = [false, false, false, false, false, true];
+        app.visible_indices = vec![1];
+        app.selected = Some(1);
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::RatingFilter {
+            active_levels: vec![5],
+        });
+        assert!(app.snapshot.as_ref().unwrap().generation_id > generation_n);
+        assert_eq!(app.snapshot_owner_entry(&stale_source), None);
+        assert_eq!(app.snapshot_owner_entry(&current_source), Some(0));
+        app.fs_feedback_toast = None;
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_archive_convert_dialog(ctx);
+        });
+
+        assert!(app.archive_convert.is_none());
+        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(app.current_folder.as_deref(), Some(root.as_path()));
+        assert!(app.zip_enumerate_pending.is_none());
+        assert!(!app.fs_nav_is_locked());
+        assert!(app.fs_nav_after_pdf_enumerate.is_none());
+        assert!(app.fs_feedback_toast.is_none());
+        // Mutation `omit_rar_direct_completion_scope_preflight`: remove the completion check.
+        // The stale RAR becomes current, starts enumeration, and retains the deferred nav lock.
+    }
+
+    #[test]
+    fn rar_direct_completion_in_current_snapshot_opens_normally() {
+        let mut app = setup_app();
+        let root = app.tmp.path().join("rar-current-generation");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("in-scope.rar");
+        std::fs::write(&source, b"direct rar").unwrap();
+        app.current_folder = Some(root);
+        app.items = vec![GridItem::ConvertibleArchive {
+            path: source.clone(),
+            format: ArchiveFormat::Rar,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        assert_eq!(app.snapshot_owner_entry(&source), Some(0));
+        let cancel = install_pending_direct_rar_completion(&mut app, &source, false);
+        app.fs_feedback_toast = None;
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_archive_convert_dialog(ctx);
+        });
+
+        assert!(app.archive_convert.is_none());
+        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(app.current_folder.as_deref(), Some(source.as_path()));
+        assert!(app.zip_enumerate_pending.is_some());
+        assert!(app.is_snapshot_active());
+        assert!(app.fs_feedback_toast.is_none());
+        // Mutation `reject_all_rar_direct_completions_in_snapshot`: make the new preflight branch
+        // unconditional while a snapshot is active. This test leaves the parent folder mounted
+        // and never creates zip_enumerate_pending.
+    }
+
+    #[test]
+    fn rar_direct_navigation_generation_swap_restores_history_on_scope_refusal() {
+        let mut app = setup_app();
+        let root = app.tmp.path().join("rar-navigation-generation-swap");
+        std::fs::create_dir_all(&root).unwrap();
+        let stale_source = root.join("history-generation-n.rar");
+        let current_source = root.join("history-generation-n-plus-one.rar");
+        std::fs::write(&stale_source, b"stale rar").unwrap();
+        std::fs::write(&current_source, b"current rar").unwrap();
+        app.current_folder = Some(root.clone());
+        app.items = vec![
+            GridItem::ConvertibleArchive {
+                path: stale_source.clone(),
+                format: ArchiveFormat::Rar,
+            },
+            GridItem::ConvertibleArchive {
+                path: current_source.clone(),
+                format: ArchiveFormat::Rar,
+            },
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
+        app.image_metas = vec![None, None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        let generation_n = app.snapshot.as_ref().unwrap().generation_id;
+
+        let slot = QuickFolderSlotId::A;
+        app.quick_folder_workspaces[slot.index()].history.back_stack = vec![stale_source.clone()];
+        app.quick_folder_workspaces[slot.index()]
+            .history
+            .forward_stack
+            .clear();
+        let rollback = app.folder_nav_history_snapshot();
+        assert_eq!(
+            app.navigate_folder_history_back(),
+            Some(stale_source.clone())
+        );
+        assert!(
+            app.quick_folder_workspaces[slot.index()]
+                .history
+                .back_stack
+                .is_empty()
+        );
+        assert_eq!(
+            app.quick_folder_workspaces[slot.index()]
+                .history
+                .forward_stack,
+            vec![root.clone()]
+        );
+        install_pending_direct_rar_completion_with_policy(
+            &mut app,
+            &stale_source,
+            false,
+            crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
+            Some(rollback),
+        );
+
+        app.deactivate_snapshot();
+        app.settings.rating_filter = [false, false, false, false, false, true];
+        app.visible_indices = vec![1];
+        app.selected = Some(1);
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::RatingFilter {
+            active_levels: vec![5],
+        });
+        assert!(app.snapshot.as_ref().unwrap().generation_id > generation_n);
+        assert_eq!(app.snapshot_owner_entry(&stale_source), None);
+        assert_eq!(app.snapshot_owner_entry(&current_source), Some(0));
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_archive_convert_dialog(ctx);
+        });
+
+        assert!(app.archive_convert.is_none());
+        assert_eq!(app.current_folder.as_deref(), Some(root.as_path()));
+        assert!(app.zip_enumerate_pending.is_none());
+        assert_eq!(
+            app.quick_folder_workspaces[slot.index()].history.back_stack,
+            vec![stale_source]
+        );
+        assert!(
+            app.quick_folder_workspaces[slot.index()]
+                .history
+                .forward_stack
+                .is_empty()
+        );
+        // Mutation `omit_rar_direct_scope_refusal_history_restore`: drop the refusal branch's
+        // restore call. The post-click empty back stack and root-bearing forward stack remain.
+    }
+
+    #[test]
+    fn rar_direct_navigation_in_scope_keeps_successful_history_transition() {
+        let mut app = setup_app();
+        let root = app.tmp.path().join("rar-navigation-current-generation");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("history-in-scope.rar");
+        std::fs::write(&source, b"direct rar").unwrap();
+        app.current_folder = Some(root.clone());
+        app.items = vec![GridItem::ConvertibleArchive {
+            path: source.clone(),
+            format: ArchiveFormat::Rar,
+        }];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        assert_eq!(app.snapshot_owner_entry(&source), Some(0));
+
+        let slot = QuickFolderSlotId::A;
+        app.quick_folder_workspaces[slot.index()].history.back_stack = vec![source.clone()];
+        app.quick_folder_workspaces[slot.index()]
+            .history
+            .forward_stack
+            .clear();
+        let rollback = app.folder_nav_history_snapshot();
+        assert_eq!(app.navigate_folder_history_back(), Some(source.clone()));
+        assert!(
+            app.quick_folder_workspaces[slot.index()]
+                .history
+                .back_stack
+                .is_empty()
+        );
+        assert_eq!(
+            app.quick_folder_workspaces[slot.index()]
+                .history
+                .forward_stack,
+            vec![root.clone()]
+        );
+        install_pending_direct_rar_completion_with_policy(
+            &mut app,
+            &source,
+            false,
+            crate::ui_dialogs::archive_convert::ArchiveConvertCompletionPolicy::Navigation,
+            Some(rollback),
+        );
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.show_archive_convert_dialog(ctx);
+        });
+
+        assert!(app.archive_convert.is_none());
+        assert_eq!(app.current_folder.as_deref(), Some(source.as_path()));
+        assert!(app.zip_enumerate_pending.is_some());
+        assert!(
+            app.quick_folder_workspaces[slot.index()]
+                .history
+                .back_stack
+                .is_empty()
+        );
+        assert_eq!(
+            app.quick_folder_workspaces[slot.index()]
+                .history
+                .forward_stack,
+            vec![root]
+        );
+        // Mutation `restore_rar_direct_history_unconditionally`: apply the rollback before the
+        // scope decision. The successful click is undone to back=[source], forward=[].
+    }
+
+    #[test]
+    fn snapshot_out_of_scope_load_is_refused_before_main_state_effects() {
+        let mut app = setup_app();
+        let (source, _before) = install_convertible_archive_main_grid(&mut app);
+
+        // Preserve a real resident smart-folder session while installing the real SnapshotState,
+        // then put both owners back into the common-load precondition state. This makes the
+        // one-shot authorization observable: a refused load must neither consume it nor discard
+        // its SmartFolder surface.
+        let smart_state = app
+            .top_level_grid_view
+            .smart_folder()
+            .cloned()
+            .expect("smart-folder surface before snapshot");
+        let smart_session = app
+            .top_level_grid_view
+            .take_smart_folder_session()
+            .expect("resident smart-folder session before snapshot");
+        activate_convertible_archive_snapshot(&mut app, &source);
+        app.top_level_grid_view.replace_surface(
+            super::top_level_grid_view::TopLevelGridSurface::SmartFolder(smart_state),
+        );
+        app.top_level_grid_view
+            .install_smart_folder_session(smart_session);
+        assert!(app.authorize_smart_folder_session_open(&source));
+
+        let outside = app.tmp.path().join("outside-snapshot-scope");
+        std::fs::create_dir_all(&outside).unwrap();
+        let reserved_history = app.tmp.path().join("still-reserved-history.zip");
+        app.reading_history_return_from = Some(reserved_history.clone());
+        app.suppress_nav_record_for_search_restore = true;
+
+        let folder_before = app.current_folder.clone();
+        let surface_before = app.top_level_grid_view.surface().clone();
+        let smart_id_before = app.current_smart_folder_id;
+        let items_before = app.items.iter().map(GridItem::perf_key).collect::<Vec<_>>();
+        let snapshot_count_before = app.snapshot_count();
+        assert_eq!(app.snapshot_owner_entry(&outside), None);
+
+        app.load_folder(outside);
+
+        assert_eq!(app.current_folder, folder_before);
+        assert_eq!(app.reading_history_return_from, Some(reserved_history));
+        assert!(app.suppress_nav_record_for_search_restore);
+        assert_eq!(app.top_level_grid_view.surface(), &surface_before);
+        assert_eq!(app.current_smart_folder_id, smart_id_before);
+        assert!(app.top_level_grid_view.smart_folder_session().is_some());
+        assert_eq!(
+            app.items.iter().map(GridItem::perf_key).collect::<Vec<_>>(),
+            items_before
+        );
+        assert_eq!(app.snapshot_count(), snapshot_count_before);
+
+        // Prove the authorization assertion is not a field-presence check: after temporarily
+        // removing only the snapshot precondition, the exact previously authorized source is
+        // still consumable by the real session boundary.
+        let snapshot = app
+            .snapshot
+            .take()
+            .expect("snapshot remains active after refusal");
+        assert!(app.preserve_smart_folder_session_for_load(&source));
+        app.snapshot = Some(snapshot);
+        // Mutation `smart_session_effect_before_snapshot_guard`: move
+        // preserve_smart_folder_session_for_load/clear_smart_folder_view_state back above the
+        // guard. It consumes/drops the authorization and surface, so the surface/session and
+        // behavioral authorization assertions fail. Moving the reading-history reconciliation
+        // back above the guard independently fails the reservation assertion.
     }
 
     fn drain_smart_folder_nav(app: &mut App, ctx: &egui::Context) {

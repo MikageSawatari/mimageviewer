@@ -263,6 +263,8 @@
 # FsCtrlNavNext = Ctrl+Down ; 次のフォルダまたは検索結果へ移動する
 # FsSiblingPrev = Ctrl+PageUp ; 前の兄弟フォルダへ移動する
 # FsSiblingNext = Ctrl+PageDown ; 次の兄弟フォルダへ移動する
+# FsPanorama = V ; 360度パノラマモードを切り替える
+# FsPanoramaProjection = Shift+V ; 360度パノラマの投影方式を切り替える
 
 [Rating] ; レーティング
 # RatingItem1 = F1 ; 星1を付ける（アイテム）
@@ -307,7 +309,6 @@
 # FsRotateCcw = L ; 現在の画像を左に90度回転する
 # FsImageAnalysis = Shift+Z ; 画像分析モードを開く
 # FsZoomMode = Z ; 全画面ズームモード (押している間ズーム範囲を指定)
-# FsPanorama = V ; 360度パノラマモードを切り替える
 # FsNavigatorToggle = Alt+N ; ナビゲータの表示を切り替える
 # FsNavigatorHold = Alt ; 押している間だけナビゲータを表示する
 # FsPixelGrid = G ; ピクセルグリッド表示を切り替える

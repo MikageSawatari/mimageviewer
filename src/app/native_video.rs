@@ -3744,7 +3744,8 @@ impl App {
             | Ev::RequestSeekThumbnail { .. }
             | Ev::ClearSeekThumbnail
             | Ev::RequestSeekStripWindow { .. }
-            | Ev::VideoScaleSettingsCommitted { .. } => false,
+            | Ev::VideoScaleSettingsCommitted { .. }
+            | Ev::PanoramaWheel { .. } => false,
             // Emitted both when the user finishes dragging the VST panel and when a saved position
             // is clamped back inside changed bounds. The drag already requests activation through
             // the left-button path above, so the renderer half must not add a second request.
@@ -3765,6 +3766,11 @@ impl App {
             Ev::Seek { .. }
             | Ev::SeekRelative { .. }
             | Ev::TouchChromeLearned
+            | Ev::PanoramaDrag { .. }
+            | Ev::TogglePanorama
+            | Ev::CyclePanoramaProjection
+            | Ev::SetPanoramaProjection(_)
+            | Ev::ResetPanorama
             | Ev::TileSeek { .. }
             | Ev::OpenSeekStrip
             | Ev::MoveSeekStrip { .. }
@@ -4174,6 +4180,46 @@ impl App {
                     self.sync_native_video_metadata(fs_idx);
                 }
                 ctx.request_repaint();
+            }
+            crate::video::NativeVideoOutputEvent::PanoramaDrag {
+                delta_points,
+                viewport_height_points,
+            } => {
+                self.apply_native_video_panorama_drag(
+                    ctx,
+                    fs_idx,
+                    delta_points,
+                    viewport_height_points,
+                );
+            }
+            crate::video::NativeVideoOutputEvent::PanoramaWheel { delta } => {
+                self.apply_native_video_panorama_wheel(ctx, fs_idx, delta);
+            }
+            crate::video::NativeVideoOutputEvent::TogglePanorama => {
+                if self.detect_panorama(fs_idx).is_some() {
+                    self.toggle_panorama_mode(fs_idx);
+                    self.sync_native_video_metadata(fs_idx);
+                    self.request_native_video_hud_repaint(ctx);
+                }
+            }
+            crate::video::NativeVideoOutputEvent::CyclePanoramaProjection => {
+                if self.native_video_panorama_input_active(fs_idx)
+                    && self.cycle_panorama_projection().is_some()
+                {
+                    self.sync_native_video_panorama_state(fs_idx);
+                    self.request_native_video_hud_repaint(ctx);
+                }
+            }
+            crate::video::NativeVideoOutputEvent::SetPanoramaProjection(projection) => {
+                if self.native_video_panorama_input_active(fs_idx)
+                    && self.set_panorama_projection(projection).is_some()
+                {
+                    self.sync_native_video_panorama_state(fs_idx);
+                    self.request_native_video_hud_repaint(ctx);
+                }
+            }
+            crate::video::NativeVideoOutputEvent::ResetPanorama => {
+                self.reset_native_video_panorama(ctx, fs_idx);
             }
             crate::video::NativeVideoOutputEvent::TileSeek { target_secs } => {
                 self.handle_native_video_tile_seek_command(ctx, fs_idx, target_secs);
@@ -4676,6 +4722,36 @@ impl App {
                 if mouse.x < 340 {
                     self.sync_native_video_timeline_markers(fs_idx);
                 }
+                if let Some(NativeVideoPointerDown::PanoramaDrag {
+                    fs_idx: drag_fs_idx,
+                    last_position_points,
+                    viewport_height_points,
+                    pixels_per_point,
+                }) = self.native_video_pointer_down
+                {
+                    if drag_fs_idx == fs_idx && self.native_video_panorama_input_active(fs_idx) {
+                        let current = egui::pos2(
+                            mouse.x as f32 / pixels_per_point,
+                            mouse.y as f32 / pixels_per_point,
+                        );
+                        self.apply_native_video_panorama_drag(
+                            ctx,
+                            fs_idx,
+                            current - last_position_points,
+                            viewport_height_points,
+                        );
+                        self.native_video_pointer_down =
+                            Some(NativeVideoPointerDown::PanoramaDrag {
+                                fs_idx,
+                                last_position_points: current,
+                                viewport_height_points,
+                                pixels_per_point,
+                            });
+                        self.mark_native_video_hud_activity(ctx);
+                        return;
+                    }
+                    self.native_video_pointer_down = None;
+                }
                 if self.mouse_ring_flick.is_some() {
                     let _ = self.update_native_mouse_ring_flick(
                         ctx,
@@ -4721,6 +4797,9 @@ impl App {
             }
             crate::video::native_window::NativeVideoWindowEvent::MouseWheel(wheel) => {
                 self.mark_native_video_hud_activity(ctx);
+                if self.apply_native_video_panorama_wheel(ctx, fs_idx, i32::from(wheel.delta)) {
+                    return;
+                }
                 if wheel.ctrl && self.video_tile_mode_active {
                     let delta = if wheel.delta > 0 { -1 } else { 1 };
                     self.adjust_native_video_tile_columns(ctx, fs_idx, delta);
@@ -6316,6 +6395,10 @@ impl App {
             toggle_audio_mode: self
                 .keymap
                 .first_chord_label(KeyAction::VideoToggleAudioMode),
+            panorama: self.keymap.first_chord_label(KeyAction::FsPanorama),
+            panorama_projection: self
+                .keymap
+                .first_chord_label(KeyAction::FsPanoramaProjection),
         }
     }
 
@@ -6430,7 +6513,91 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn sync_native_video_panorama_state(&self, fs_idx: usize) {
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
+            return;
+        };
+        let panorama_pose = self
+            .is_panorama_mode_active(fs_idx)
+            .then(|| {
+                self.panorama_state
+                    .as_ref()
+                    .map(|state| (state.pose(), self.compute_pano_uv_transform(fs_idx)))
+            })
+            .flatten();
+        player.set_native_panorama_pose(panorama_pose);
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn native_video_panorama_input_active(&self, fs_idx: usize) -> bool {
+        self.fullscreen_idx == Some(fs_idx)
+            && self.video_audio_mode != Some(fs_idx)
+            && self
+                .music_vst_shell
+                .as_ref()
+                .is_none_or(|shell| shell.fs_idx != fs_idx)
+            && self.is_panorama_mode_active(fs_idx)
+    }
+
+    #[cfg(windows)]
+    fn apply_native_video_panorama_drag(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        delta_points: egui::Vec2,
+        viewport_height_points: f32,
+    ) -> bool {
+        if !self.native_video_panorama_input_active(fs_idx) {
+            return false;
+        }
+        let changed = self
+            .panorama_state
+            .as_mut()
+            .is_some_and(|state| state.apply_drag_delta(delta_points, viewport_height_points));
+        if changed {
+            self.sync_native_video_panorama_state(fs_idx);
+            self.request_native_video_hud_repaint(ctx);
+        }
+        true
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn apply_native_video_panorama_wheel(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        wheel_delta: i32,
+    ) -> bool {
+        if !self.native_video_panorama_input_active(fs_idx) {
+            return false;
+        }
+        let changed = self
+            .panorama_state
+            .as_mut()
+            .is_some_and(|state| state.apply_wheel_delta(wheel_delta as f32));
+        if changed {
+            self.sync_native_video_panorama_state(fs_idx);
+            self.request_native_video_hud_repaint(ctx);
+        }
+        // The panorama owns every wheel event, including no-op deltas at FOV limits.
+        true
+    }
+
+    #[cfg(windows)]
+    fn reset_native_video_panorama(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if !self.native_video_panorama_input_active(fs_idx) {
+            return;
+        }
+        if let Some(state) = self.panorama_state.as_mut() {
+            state.reset();
+        }
+        self.sync_native_video_panorama_state(fs_idx);
+        self.request_native_video_hud_repaint(ctx);
+    }
+
+    #[cfg(windows)]
     pub(super) fn sync_native_video_metadata(&mut self, fs_idx: usize) {
+        self.sync_native_video_panorama_state(fs_idx);
         let Some(path) = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
             FsCacheEntry::Video { player, .. } => Some(player.path().clone()),
             _ => None,
@@ -6505,6 +6672,7 @@ impl App {
                 deinterlace_status,
                 interlace_detected,
                 touch_video_chrome_learned,
+                panorama_detection: player.panorama_detection(),
                 shortcuts,
                 shortcut_help: shortcut_help.clone(),
             }
@@ -6539,6 +6707,7 @@ impl App {
                 deinterlace_status: crate::video::decoder::DeinterlaceStatusSnapshot::Pending,
                 interlace_detected: false,
                 touch_video_chrome_learned,
+                panorama_detection: None,
                 shortcuts,
                 shortcut_help,
             }
@@ -6768,6 +6937,12 @@ impl App {
     /// ではなくこの実サイズを使う。HWND 未確定 / 取得失敗時は `None`。
     #[cfg(windows)]
     fn native_video_overlay_size_points(&self, fs_idx: usize) -> Option<egui::Vec2> {
+        self.native_video_overlay_geometry_points(fs_idx)
+            .map(|(size, _)| size)
+    }
+
+    #[cfg(windows)]
+    fn native_video_overlay_geometry_points(&self, fs_idx: usize) -> Option<(egui::Vec2, f32)> {
         use windows::Win32::Foundation::{HWND as Win32Hwnd, RECT as Win32Rect};
         use windows::Win32::UI::HiDpi::GetDpiForWindow;
         use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
@@ -6795,7 +6970,7 @@ impl App {
             os_ppp,
             self.settings.ui_scale_factor,
         );
-        Some(egui::vec2(w_px / ppp, h_px / ppp))
+        Some((egui::vec2(w_px / ppp, h_px / ppp), ppp))
     }
 
     /// タイル状態構築用の画面サイズ。native presenter の実クライアントサイズを優先し、
@@ -9129,6 +9304,25 @@ impl App {
                 self.toggle_video_window_mode_for_input(ctx);
                 hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::FsToggleWindowMode)
+            }
+            _ if !key.repeat
+                && self
+                    .keymap
+                    .matches_vk_action(KeyAction::FsPanoramaProjection, &key) =>
+            {
+                if self.native_video_panorama_input_active(fs_idx)
+                    && self.cycle_panorama_projection().is_some()
+                {
+                    self.sync_native_video_panorama_state(fs_idx);
+                }
+                NativeVideoKeyOutcome::Action(KeyAction::FsPanoramaProjection)
+            }
+            _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::FsPanorama, &key) => {
+                if self.detect_panorama(fs_idx).is_some() {
+                    self.toggle_panorama_mode(fs_idx);
+                    self.sync_native_video_metadata(fs_idx);
+                }
+                NativeVideoKeyOutcome::Action(KeyAction::FsPanorama)
             }
             // Tile mode: left/right move the keyboard cursor instead of seeking
             // behind the opaque tile grid. Ctrl moves by one visible row.
@@ -11858,8 +12052,36 @@ impl App {
             return;
         }
 
+        let panorama_drag_in_progress = matches!(
+            self.native_video_pointer_down,
+            Some(NativeVideoPointerDown::PanoramaDrag { fs_idx: drag_idx, .. })
+                if drag_idx == fs_idx
+        );
+        if self.native_video_panorama_input_active(fs_idx) || panorama_drag_in_progress {
+            if event.down {
+                if let Some((size, pixels_per_point)) =
+                    self.native_video_overlay_geometry_points(fs_idx)
+                {
+                    self.native_video_pointer_down = Some(NativeVideoPointerDown::PanoramaDrag {
+                        fs_idx,
+                        last_position_points: egui::pos2(
+                            event.x as f32 / pixels_per_point,
+                            event.y as f32 / pixels_per_point,
+                        ),
+                        viewport_height_points: size.y,
+                        pixels_per_point,
+                    });
+                } else {
+                    self.native_video_pointer_down = None;
+                }
+            } else {
+                self.native_video_pointer_down = None;
+            }
+            return;
+        }
+
         if event.down {
-            self.native_video_pointer_down = Some(NativeVideoPointerDown {
+            self.native_video_pointer_down = Some(NativeVideoPointerDown::PlaybackClick {
                 fs_idx,
                 x: event.x,
                 y: event.y,
@@ -11868,17 +12090,23 @@ impl App {
             return;
         }
 
-        let Some(start) = self.native_video_pointer_down.take() else {
+        let Some(NativeVideoPointerDown::PlaybackClick {
+            fs_idx: start_fs_idx,
+            x: start_x,
+            y: start_y,
+            at: started_at,
+        }) = self.native_video_pointer_down.take()
+        else {
             return;
         };
-        if start.fs_idx != fs_idx {
+        if start_fs_idx != fs_idx {
             return;
         }
-        let dx = event.x - start.x;
-        let dy = event.y - start.y;
+        let dx = event.x - start_x;
+        let dy = event.y - start_y;
         let moved_sq = dx.saturating_mul(dx) + dy.saturating_mul(dy);
         let click_like =
-            moved_sq <= 36 && start.at.elapsed() <= std::time::Duration::from_millis(500);
+            moved_sq <= 36 && started_at.elapsed() <= std::time::Duration::from_millis(500);
         if !click_like || self.settings.vst3_gui_visible {
             return;
         }

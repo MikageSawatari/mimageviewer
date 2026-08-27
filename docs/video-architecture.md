@@ -353,7 +353,7 @@ callout の可視判定・描画・region は変更しない。
 **Region 計算とアクティベーション検出**:
 
 `NativeEguiOverlay::compute_hud_regions` が egui run 末尾で表示中の各 UI 要素の rect を集めて返す
-(= 上 hover bar / 下 HUD / right panel / jump panel / touch panel handle / ClickToShow callout / VST3 panel / speed popup / bookmark editor /
+(= 上 hover bar / 下 HUD / right panel / jump panel / touch panel handle / ClickToShow callout / VST3 panel / speed popup / 360 投影方式 popup / bookmark editor /
 normalize blocker / tile overlay / seek hover thumbnail / checkmark)。**activation zone** (= bar
 非表示時の hover 検出範囲、画面上下端の帯) は region に **含めない** — 含めると bar 非表示時に VST の
 ノブが上下端と重なったとき入力を奪うため。

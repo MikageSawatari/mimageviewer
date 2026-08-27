@@ -332,6 +332,21 @@ pub(crate) struct DetachedGridArchiveOpenRequestOwner {
     pub(crate) source_path: PathBuf,
 }
 
+/// Main-grid state that may change only after a convertible archive has actually become the
+/// mounted main destination.
+///
+/// The intent is captured while the source grid item still exists, then travels with the existing
+/// archive open request. Ignore, request-start failure, and cancellation drop it without touching
+/// the mounted main state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MainGridArchiveTransitionIntent {
+    source_path: PathBuf,
+    reading_history_return_from: Option<PathBuf>,
+    suppress_rating_filter: bool,
+    suppress_facet_filter: bool,
+    smart_folder_drill: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DetachedGridArchiveOpenOutcome {
     Opened,
@@ -342,6 +357,7 @@ pub(crate) enum DetachedGridArchiveOpenOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OpenRequestOwner {
     Navigation,
+    MainGridArchive(MainGridArchiveTransitionIntent),
     Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner),
     DetachedGridArchive(DetachedGridArchiveOpenRequestOwner),
 }
@@ -2930,11 +2946,19 @@ impl PlayTestState {
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug)]
-struct NativeVideoPointerDown {
-    fs_idx: usize,
-    x: i32,
-    y: i32,
-    at: std::time::Instant,
+enum NativeVideoPointerDown {
+    PlaybackClick {
+        fs_idx: usize,
+        x: i32,
+        y: i32,
+        at: std::time::Instant,
+    },
+    PanoramaDrag {
+        fs_idx: usize,
+        last_position_points: egui::Pos2,
+        viewport_height_points: f32,
+        pixels_per_point: f32,
+    },
 }
 
 #[cfg(windows)]
@@ -10976,6 +11000,8 @@ pub struct App {
     pub(crate) fit_popup_open: bool,
     /// スライドショー設定ポップアップ表示中
     pub(crate) slideshow_popup_open: bool,
+    /// 360 度ビューの投影方式ポップアップ表示中。360 表示中しか開けない。
+    pub(crate) panorama_projection_popup_open: bool,
     /// 上バーの「…」から開く右上パネル。root / navigator submenu を単一状態で所有する。
     pub(crate) fs_overflow_panel_state: FsOverflowPanelState,
 
@@ -13857,6 +13883,7 @@ impl App {
             reading_flow: crate::settings::ReadingFlow::default(),
             reading_direction: crate::settings::ReadingDirection::default(),
             spread_popup_open: false,
+            panorama_projection_popup_open: false,
             fit_popup_open: false,
             slideshow_popup_open: false,
             fs_overflow_panel_state: FsOverflowPanelState::Closed,
@@ -16106,10 +16133,91 @@ impl App {
         if !is_container {
             return;
         }
+        let Some(path) = item.container_path().map(Path::to_path_buf) else {
+            return;
+        };
+        self.note_reading_history_container_open_path(&path);
+    }
+
+    /// main navigation がコンテナを採用した境界で、閲覧履歴への戻り先予約を更新する。
+    fn note_reading_history_container_open_path(&mut self, path: &Path) {
         if self.items_are_reading_history_view {
-            self.reading_history_return_from = item.container_path().map(|p| p.to_path_buf());
+            self.reading_history_return_from = Some(path.to_path_buf());
         } else {
             self.reading_history_return_from = None;
+        }
+    }
+
+    /// Capture the main-grid effects of opening a convertible archive without applying them.
+    /// The source item may be gone by the time an asynchronous conversion completes, so every
+    /// decision that depends on the source grid is recorded here.
+    pub(crate) fn main_grid_archive_open_owner(
+        &mut self,
+        idx: usize,
+        source_path: &Path,
+    ) -> OpenRequestOwner {
+        debug_assert!(matches!(
+            self.items.get(idx),
+            Some(GridItem::ConvertibleArchive { path, .. })
+                if crate::folder_tree::path_eq(path, source_path)
+        ));
+
+        let suppress_rating_filter =
+            if self.rating_filter_suppressed_at.is_none() && self.rating_filter_active() {
+                let stars = self.get_rating(idx);
+                (1..=5).contains(&stars)
+                    && self.items.get(idx).is_some_and(|item| {
+                        passes_rating_filter(item, stars, &self.settings.rating_filter)
+                    })
+            } else {
+                false
+            };
+        let suppress_facet_filter =
+            self.facet_filter_active() && self.passes_facet_filter(idx, None);
+
+        OpenRequestOwner::MainGridArchive(MainGridArchiveTransitionIntent {
+            source_path: source_path.to_path_buf(),
+            reading_history_return_from: self
+                .items_are_reading_history_view
+                .then(|| source_path.to_path_buf()),
+            suppress_rating_filter,
+            suppress_facet_filter,
+            smart_folder_drill: self.top_level_grid_view.smart_folder_session().is_some(),
+        })
+    }
+
+    /// Smart-folder sessions require a one-shot authorization before the common load boundary can
+    /// preserve their prepared grid. This does not advance the smart-folder position; the actual
+    /// position is committed only after the caller proves that the load succeeded.
+    pub(crate) fn prepare_main_grid_archive_transition_for_load(
+        &mut self,
+        owner: &OpenRequestOwner,
+        load_path: &Path,
+    ) {
+        let OpenRequestOwner::MainGridArchive(intent) = owner else {
+            return;
+        };
+        if !intent.smart_folder_drill {
+            return;
+        }
+        let _ = self.authorize_smart_folder_session_open(load_path);
+    }
+
+    /// Commit the source-grid transition exactly once, after the destination load has been adopted
+    /// by main. In particular, conversion request adoption is not a commit boundary.
+    pub(crate) fn commit_main_grid_archive_transition(&mut self, owner: &OpenRequestOwner) {
+        let OpenRequestOwner::MainGridArchive(intent) = owner else {
+            return;
+        };
+        self.reading_history_return_from = intent.reading_history_return_from.clone();
+        if intent.smart_folder_drill {
+            self.begin_smart_folder_drill(&intent.source_path);
+        }
+        if intent.suppress_rating_filter {
+            self.maybe_suppress_rating_filter_for_opened_container_path(&intent.source_path);
+        }
+        if intent.suppress_facet_filter {
+            self.maybe_suppress_facet_filter_for_opened_container_path(&intent.source_path);
         }
     }
 
@@ -18096,6 +18204,12 @@ impl App {
         auto_fullscreen: bool,
         owner: OpenRequestOwner,
     ) -> FolderOpenOutcome {
+        // Scope refusal must precede lifecycle adoption: claim_open_request_owner cancels an
+        // in-flight archive conversion, unresolved startup open, and conflicting bookmark open.
+        if !self.snapshot_scope_allows_open(&path, &owner) {
+            self.reject_snapshot_out_of_scope_open();
+            return FolderOpenOutcome::Ignored;
+        }
         // Claim the visible-open lifecycle before dispatching by container type. In particular,
         // archive B must replace an in-flight archive A before request_* observes the old state.
         if !self.claim_open_request_owner(&path, &owner) {
@@ -18177,10 +18291,45 @@ impl App {
         pre_scan: Option<ScannedDir>,
         owner: OpenRequestOwner,
     ) {
+        if !self.snapshot_scope_allows_open(&path, &owner) {
+            self.reject_snapshot_out_of_scope_open();
+            return;
+        }
         if !self.claim_open_request_owner(&path, &owner) {
             return;
         }
         self.load_folder_with_scan_claimed(path, pre_scan, owner);
+    }
+
+    /// Pure preflight for whether a visible open belongs to the current snapshot scope.
+    ///
+    /// A converted cache ZIP is an implementation alias. Main-grid archive requests therefore
+    /// use the source identity captured by their typed owner instead of the load path; the two
+    /// paths are deliberately not OR-ed because that would widen the pinned scope.
+    pub(crate) fn snapshot_scope_allows_open(&self, path: &Path, owner: &OpenRequestOwner) -> bool {
+        if self.navigation_scope.is_detached_physical()
+            || !self.is_snapshot_active()
+            || self.snapshot_internal_nav
+        {
+            return true;
+        }
+        let scope_path = match owner {
+            OpenRequestOwner::MainGridArchive(intent) => &intent.source_path,
+            OpenRequestOwner::Navigation
+            | OpenRequestOwner::Bookmark(_)
+            | OpenRequestOwner::DetachedGridArchive(_) => path,
+        };
+        self.snapshot_owner_entry(scope_path).is_some()
+    }
+
+    /// Apply the user-visible effects of one refused open exactly once at its earliest boundary.
+    fn reject_snapshot_out_of_scope_open(&mut self) {
+        // A blocked load cannot consume an auto-fullscreen reservation. Clear any stale request
+        // so the next valid open does not unexpectedly enter fullscreen.
+        self.pending_auto_fs_open = false;
+        self.show_feedback_toast(
+            "スナップショット中は範囲外のフォルダに移動できません (★固定を解除してください)".into(),
+        );
     }
 
     /// Acquire the right to perform a visible load before any format-specific dispatch.
@@ -18191,7 +18340,7 @@ impl App {
     /// `cancel_archive_convert_for_navigation_to`.
     fn claim_open_request_owner(&mut self, path: &Path, owner: &OpenRequestOwner) -> bool {
         match owner {
-            OpenRequestOwner::Navigation => {
+            OpenRequestOwner::Navigation | OpenRequestOwner::MainGridArchive(_) => {
                 if self.navigation_scope.is_detached_physical() {
                     // Archive conversion, unresolved startup opens, and bookmark
                     // opens are App-global main requests. A detached context can
@@ -18284,6 +18433,22 @@ impl App {
         owner: OpenRequestOwner,
     ) {
         let detached_physical = self.navigation_scope.is_detached_physical();
+        // ★固定 (Snapshot Lock) 中は **範囲外** フォルダへの移動を block する (= §4.4)。
+        // 範囲内 (= snapshot 内 entry またはその下の階層) は自由に navigate 可能。
+        // 変換 cache ZIP は source archive の実装 alias なので、typed owner が保持する
+        // source identity に対して同じ完全一致 / prefix owner 解決を行う。source 自体が
+        // snapshot 範囲外なら cache の場所にかかわらず拒否される。
+        // snapshot_internal_nav は snapshot_load_and_open 経由の forced bypass (= 既知
+        // safe path のみ)、ここの owner_entry チェックは UI 経由 click を扱う。
+        if !self.snapshot_scope_allows_open(&path, &owner) {
+            self.reject_snapshot_out_of_scope_open();
+            return;
+        }
+        // A converted cache ZIP is an implementation alias outside the source archive's smart
+        // scope. Keep the resident session mounted here; the typed owner commits the logical
+        // source path only after the cache/direct load proves successful.
+        let defer_main_grid_archive_transition =
+            matches!(&owner, OpenRequestOwner::MainGridArchive(_));
         if !detached_physical && !smart_folder::is_smart_folder_synthetic_path(&path) {
             let preserve_smart_folder_session = self.preserve_smart_folder_session_for_load(&path);
             if self.smart_folder_pending.is_some()
@@ -18312,7 +18477,9 @@ impl App {
                 self.suppress_nav_record_for_search_restore = false;
                 return;
             }
-            self.reconcile_smart_folder_scoped_real_folder_load(&path);
+            if !defer_main_grid_archive_transition {
+                self.reconcile_smart_folder_scoped_real_folder_load(&path);
+            }
         }
         if matches!(
             self.top_level_grid_view.surface(),
@@ -18332,30 +18499,13 @@ impl App {
         {
             self.reading_history_return_from = None;
         }
-        if !detached_physical && matches!(owner, OpenRequestOwner::Navigation) {
-            self.reconcile_bookmark_return_target_for_folder_load(&path);
-        }
-        // ★固定 (Snapshot Lock) 中は **範囲外** フォルダへの移動を block する (= §4.4)。
-        // 範囲内 (= snapshot 内 entry またはその下の階層) は自由に navigate 可能
-        // (§4.4 「captured folder の中の child folder」)。判定は `snapshot_owner_entry`
-        // で path 完全一致または prefix 一致を見る。
-        // snapshot_internal_nav は snapshot_load_and_open 経由の forced bypass (= 既知
-        // safe path のみ)、ここの owner_entry チェックは UI 経由 click を扱う。
         if !detached_physical
-            && self.is_snapshot_active()
-            && !self.snapshot_internal_nav
-            && self.snapshot_owner_entry(&path).is_none()
+            && matches!(
+                owner,
+                OpenRequestOwner::Navigation | OpenRequestOwner::MainGridArchive(_)
+            )
         {
-            // 範囲外で load がブロックされると、開く直前に立てた自動フルスクリーン予約を
-            // load_zip_as_folder が消化できず stale 化する (Codex P3: ★固定中に範囲外の
-            // 変換アーカイブ/ZIP/PDF を開こうとしたケース)。ここで明示的にクリアして、
-            // 次の正当な open が誤ってフルスクリーンになるのを防ぐ。
-            self.pending_auto_fs_open = false;
-            self.show_feedback_toast(
-                "スナップショット中は範囲外のフォルダに移動できません (★固定を解除してください)"
-                    .into(),
-            );
-            return;
+            self.reconcile_bookmark_return_target_for_folder_load(&path);
         }
         // perf: UI スレッドをブロックする load_folder 全体の wall time を計測する。
         // Ctrl+↑↓ 連打時の引っかかりの主要因がここに集まる想定。
@@ -23456,6 +23606,7 @@ impl App {
         self.spread_popup_open = false;
         self.fit_popup_open = false;
         self.slideshow_popup_open = false;
+        self.panorama_projection_popup_open = false;
         self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
         self.search_filter = None;
@@ -34245,8 +34396,6 @@ impl App {
                     if !self.guard_reading_history_open(idx) {
                         return None;
                     }
-                    // 閲覧履歴ビューから本を開く場合は、閉じたときに閲覧履歴へ戻れるよう予約する。
-                    self.note_reading_history_open(idx);
                     // ファイル名スタックの集約グリッドでメディアセルを Enter したら、フラット読書
                     // フルスクリーンへ (スタック/単独画像/動画を直接開く)。コンテナは false で通常へ。
                     // ただし Shift+Enter で動画を外部プレイヤーに渡す経路は intercept より優先する
@@ -34276,6 +34425,8 @@ impl App {
                             {
                                 return None;
                             }
+                            // detached に採用されず、通常の main navigation が確定した境界で更新する。
+                            self.note_reading_history_open(idx);
                             if auto_fs {
                                 self.pending_auto_fs_open = true;
                             }
@@ -34311,9 +34462,7 @@ impl App {
                         }
                         Some(GridItem::ConvertibleArchive { path, .. }) => {
                             let pf = path.clone();
-                            self.begin_smart_folder_drill(&pf);
-                            self.maybe_suppress_rating_filter_for_opened_container(idx);
-                            self.maybe_suppress_facet_filter_for_opened_container(idx);
+                            let owner = self.main_grid_archive_open_owner(idx, &pf);
                             let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
                             let search_rollback = if self.favsearch.active
                                 || self.tag_view.active
@@ -34331,7 +34480,9 @@ impl App {
                             }
                             self.record_rating_view_nav_open(&pf);
                             let open_outcome = self
-                                .load_folder_or_convert_archive_with_auto_fullscreen(pf, auto_fs);
+                                .load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                                    pf, auto_fs, owner,
+                                );
                             match (open_outcome, search_rollback) {
                                 (FolderOpenOutcome::ConversionDialogOpened, Some(snapshot)) => {
                                     self.attach_archive_convert_nav_history_rollback(snapshot);
@@ -35093,6 +35244,7 @@ impl App {
                     // Rejoin the exact main navigation pipeline used by Enter/double-click/
                     // gamepad. This restores history/search/smart-folder behavior for mixed
                     // folders instead of terminating an unmaterialized detached context.
+                    self.note_reading_history_container_open_path(&ready.path);
                     if let Some(idx) = self.items.iter().position(|item| {
                         matches!(
                             item,
@@ -35315,7 +35467,6 @@ impl App {
         if !self.guard_reading_history_open(idx) {
             return None;
         }
-        self.note_reading_history_open(idx);
 
         let auto_fs = mode.auto_fullscreen();
         match item {
@@ -35330,6 +35481,7 @@ impl App {
                 if auto_fs && !self.park_active_detached_context_for_new_grid_open(ctx, idx) {
                     return None;
                 }
+                self.note_reading_history_open(idx);
                 self.pending_auto_fs_open = auto_fs;
                 self.maybe_suppress_rating_filter_for_opened_container(idx);
                 self.maybe_suppress_facet_filter_for_opened_container(idx);
@@ -35338,9 +35490,7 @@ impl App {
                 Some(crate::ui_main::AddressBarNav::Direct(p))
             }
             GridItem::ConvertibleArchive { path, .. } => {
-                self.begin_smart_folder_drill(&path);
-                self.maybe_suppress_rating_filter_for_opened_container(idx);
-                self.maybe_suppress_facet_filter_for_opened_container(idx);
+                let owner = self.main_grid_archive_open_owner(idx, &path);
                 let search_rollback = if self.favsearch.active
                     || self.tag_view.active
                     || self.rating_view_nav_context_active()
@@ -35356,8 +35506,9 @@ impl App {
                     self.record_tag_view_nav_open(&path);
                 }
                 self.record_rating_view_nav_open(&path);
-                let open_outcome =
-                    self.load_folder_or_convert_archive_with_auto_fullscreen(path, auto_fs);
+                let open_outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                    path, auto_fs, owner,
+                );
                 match (open_outcome, search_rollback) {
                     (FolderOpenOutcome::ConversionDialogOpened, Some(snapshot)) => {
                         self.attach_archive_convert_nav_history_rollback(snapshot);
@@ -37792,6 +37943,7 @@ impl App {
         self.spread_popup_open = false;
         self.fit_popup_open = false;
         self.slideshow_popup_open = false;
+        self.panorama_projection_popup_open = false;
         // The same reason as in `close_fullscreen`: this is the other place that gives up the
         // fullscreen foreground, and a panel that only draws there must not outlive it.
         self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
@@ -51228,6 +51380,7 @@ impl App {
         self.spread_popup_open = false;
         self.fit_popup_open = false;
         self.slideshow_popup_open = false;
+        self.panorama_projection_popup_open = false;
         // The top bar's overflow panel belongs to this list for the same reason and was missing
         // from it: it is drawn only in fullscreen, and it holds the keyboard while it is open -
         // including the Esc that would close it. Leaving fullscreen by any other route (the
@@ -61547,6 +61700,17 @@ impl App {
         &self,
         fs_idx: usize,
     ) -> Option<crate::panorama::PanoramaTrigger> {
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            return match player.panorama_detection()? {
+                Ok(crate::video::spherical_metadata::VideoPanoramaTrigger::Auto) => {
+                    Some(crate::panorama::PanoramaTrigger::Auto)
+                }
+                Ok(crate::video::spherical_metadata::VideoPanoramaTrigger::Hint) => {
+                    Some(crate::panorama::PanoramaTrigger::Hint)
+                }
+                Err(_) => None,
+            };
+        }
         let source_key = self.metadata_cache_key(fs_idx)?;
         let pano_info = self
             .xmp_panorama_info
@@ -61907,7 +62071,7 @@ impl App {
         let Some(pano_state) = self.panorama_state.as_ref() else {
             return;
         };
-        let pose = (pano_state.yaw, pano_state.pitch, pano_state.fov_y);
+        let pose = pano_state.pose();
         let cache_key = resolution.cache_key;
         let source_key = resolution.source_key.clone();
 
@@ -62019,7 +62183,7 @@ impl App {
         let Some(pano_state) = self.panorama_state.as_ref() else {
             return;
         };
-        let pose = (pano_state.yaw, pano_state.pitch, pano_state.fov_y);
+        let pose = pano_state.pose();
         let cache_key = resolution.cache_key;
         let source_key = resolution.source_key.clone();
 
@@ -62117,7 +62281,7 @@ impl App {
         &mut self,
         fs_idx: usize,
         resolution: &crate::panorama::PanoSourceResolution,
-        pose: (f32, f32, f32),
+        pose: crate::panorama::PanoPose,
     ) {
         let source_key = resolution.source_key.clone();
         let cache_key = resolution.cache_key;
@@ -62146,15 +62310,12 @@ impl App {
         let cancel_worker = Arc::clone(&cancel);
         let source_key_worker = source_key.clone();
         std::thread::spawn(move || {
-            let (yaw, pitch, fov_y) = pose;
             let out = crate::panorama::render_settle_overlay(
                 &src_rgba,
                 src_w,
                 src_h,
                 uv,
-                yaw,
-                pitch,
-                fov_y,
+                pose,
                 out_w,
                 out_h,
                 &policy,
@@ -62262,13 +62423,14 @@ impl App {
             refinement.settle_since = None;
         }
         crate::logger::log(format!(
-            "[Pano] settle overlay uploaded {}x{} for key={} pose=({:.3},{:.3},{:.3}) viewport={:?}",
+            "[Pano] settle overlay uploaded {}x{} for key={} pose=({:.3},{:.3},{:.3},{}) viewport={:?}",
             result.width,
             result.height,
             result.source_key,
-            result.pose.0,
-            result.pose.1,
-            result.pose.2,
+            result.pose.yaw,
+            result.pose.pitch,
+            result.pose.fov_y,
+            result.pose.projection.label(),
             result.viewport_size,
         ));
     }
@@ -62715,6 +62877,36 @@ impl App {
         }
     }
 
+    /// 360 ビューの投影方式を順送りする (`KeyAction::FsPanoramaProjection` / 上バーの
+    /// 投影ボタン)。360 モード中しか意味を持たないので、非アクティブなら `None`。
+    ///
+    /// **環境設定の既定値 (`Settings::panorama_projection`) は書き換えない**。ここは
+    /// 「今見ているこの 1 枚を別の写り方で見る」操作であって、既定の変更ではない。
+    /// 既定を変えたい利用者は環境設定から選ぶ。
+    ///
+    /// 方式が変わると settle overlay の pose 一致が崩れるので、次フレームの
+    /// `note_state` が自動で進行中 render を cancel し、静止 500ms 後に焼き直す。
+    /// ここで overlay を明示破棄しないのは、pose を単一の型
+    /// ([`crate::panorama::PanoPose`]) に閉じて stale 判定を 1 箇所に保つため。
+    pub(crate) fn cycle_panorama_projection(&mut self) -> Option<crate::panorama::PanoProjection> {
+        let next = self.panorama_state.as_ref()?.projection.next();
+        self.set_panorama_projection(next)
+    }
+
+    /// 上バーの一覧から選ばれた投影方式を適用する。順送り
+    /// ([`Self::cycle_panorama_projection`]) もここへ合流するので、適用と通知の
+    /// 経路は 1 つだけになる。
+    pub(crate) fn set_panorama_projection(
+        &mut self,
+        projection: crate::panorama::PanoProjection,
+    ) -> Option<crate::panorama::PanoProjection> {
+        let pano = self.panorama_state.as_mut()?;
+        let applied = pano.set_projection(projection);
+        pano.sanitize();
+        self.show_feedback_toast(format!("投影方式: {}", applied.label()));
+        Some(applied)
+    }
+
     /// 360 モード ON / OFF をトグル。fs_idx は対象画像 (検出 hint の初期視点取得用)。
     ///
     /// ON 時の副作用 (360 モードは機能制限モードなので、衝突する状態を抑止する):
@@ -62723,10 +62915,14 @@ impl App {
     /// - compare_view_mode を Off
     /// - show_metadata_panel は false に
     pub(crate) fn toggle_panorama_mode(&mut self, fs_idx: usize) {
+        let is_video = matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Video { .. }));
         if self.panorama_state.is_some() {
             // OFF: state と GPU リソースを drop (callback_resources からも除去、
             // Codex P2 第 18 ラウンド)。
             self.panorama_state = None;
+            // 投影ポップアップの持ち主 (上バーの投影ボタン) は 360 OFF で消えるので、
+            // 開いたまま残さない。残すとカーソル自動非表示やホイールの抑制が効き続ける。
+            self.panorama_projection_popup_open = false;
             self.clear_pano_upload();
             // **進行中の settle render と high-res worker を cancel** (Codex P2 第 8、
             // 2026-05): 360 OFF 中も worker が走り続けると、(a) ~2.15 GB の RGBA を
@@ -62738,11 +62934,32 @@ impl App {
             for (_, req) in self.pano_high_res_pending.drain() {
                 req.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             }
+            #[cfg(windows)]
+            if is_video {
+                self.sync_native_video_panorama_state(fs_idx);
+            }
             return;
         }
         // ON: GPano hint があれば初期視点に反映
         let (init_yaw, init_pitch) = self.panorama_initial_pose(fs_idx);
-        self.panorama_state = Some(crate::panorama::PanoramaState::new(init_yaw, init_pitch));
+        self.panorama_state = Some(crate::panorama::PanoramaState::new(
+            init_yaw,
+            init_pitch,
+            self.settings.panorama_projection,
+        ));
+        // Video 360 owns the same native canvas as tile mode, but it is not the
+        // still-viewer's restriction mode. Keep playback and panels intact.
+        if is_video {
+            self.close_video_tile_mode();
+            #[cfg(windows)]
+            {
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    player.set_native_tile_overlay(None);
+                }
+                self.sync_native_video_panorama_state(fs_idx);
+            }
+            return;
+        }
         // 衝突する機能を停止 (docs/panorama-360-view-plan.md フィードバック対応):
         // 360 中は上バーのみの機能制限モードになるので、他の panel / mode を OFF
         // しておく。これらは 360 OFF 後にユーザーが再度有効化できる。
@@ -62784,6 +63001,13 @@ impl App {
     /// GPano `PoseHeadingDegrees` / `PosePitchDegrees` を radians に変換して
     /// 初期視点として返す。XMP が無いか hint が無い場合は (0, 0)。
     fn panorama_initial_pose(&self, fs_idx: usize) -> (f32, f32) {
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            let Some(mapping) = player.panorama_mapping() else {
+                return (0.0, 0.0);
+            };
+            let to_rad = std::f32::consts::PI / 180.0;
+            return (mapping.yaw_degrees * to_rad, mapping.pitch_degrees * to_rad);
+        }
         let Some(source_key) = self.metadata_cache_key(fs_idx) else {
             return (0.0, 0.0);
         };
@@ -62809,6 +63033,12 @@ impl App {
         &self,
         fs_idx: usize,
     ) -> crate::panorama::PanoUvTransform {
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            return player
+                .panorama_mapping()
+                .map(|mapping| mapping.uv_transform)
+                .unwrap_or(crate::panorama::PanoUvTransform::IDENTITY);
+        }
         let Some(source_key) = self.metadata_cache_key(fs_idx) else {
             return crate::panorama::PanoUvTransform::IDENTITY;
         };

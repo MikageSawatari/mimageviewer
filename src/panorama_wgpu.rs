@@ -53,6 +53,10 @@ struct Params {
     // フル equirect なら (0, 0, 1, 1)。
     // 部分 FOV equirect (GPano CroppedArea*) は実画像 / フル球面比から計算 (Phase 1.5)。
     crop: vec4<f32>,
+    // proj.x = 投影方式コード (PanoProjection::shader_code)
+    // proj.y = 投影写像の係数 k = g(fov_y/2) (CPU 側 ProjectionMap と同一値)
+    // proj.zw = 予約 (0)
+    proj: vec4<f32>,
 };
 
 @group(0) @binding(0) var pano_tex: texture_2d<f32>;
@@ -63,21 +67,71 @@ const PI: f32 = 3.141592653589793;
 const INV_TWO_PI: f32 = 0.15915494309189535;
 const INV_PI: f32 = 0.3183098861837907;
 
+// 投影方式コード。**panorama.rs の PanoProjection::shader_code と 1:1 対応**。
+// 片側だけ変えると別の投影で描く。
+const PROJ_PERSPECTIVE: u32 = 0u;
+const PROJ_STEREOGRAPHIC: u32 = 1u;
+const PROJ_EQUIDISTANT: u32 = 2u;
+const PROJ_EQUISOLID: u32 = 3u;
+
+struct ProjTheta {
+    // 光軸からの入射角 (radians)。
+    theta: f32,
+    // false = 投影の定義域外 (等距離 / 等立体角の広画角で画面隅が球の裏側より遠くなる)。
+    // 魚眼のイメージサークル外と同じ扱いで、呼び出し側が黒を返す。
+    valid: bool,
+};
+
+// 正規化半径 r (画面中心 0、上下端 1) → 入射角 θ。
+// **panorama.rs の ProjectionMap::theta と同じ式**。動画側 (backlog §1.112) の
+// 実行時 HLSL へはこの関数をそのまま移す。
+fn projection_theta(mode: u32, k: f32, r: f32) -> ProjTheta {
+    let arg = r * k;
+    var out: ProjTheta;
+    if (mode == PROJ_STEREOGRAPHIC) {
+        // r = 2f·tan(θ/2): 有限の r は必ず θ < π へ写るので常に有効。
+        out.theta = 2.0 * atan(arg);
+        out.valid = true;
+    } else if (mode == PROJ_EQUIDISTANT) {
+        // r = f·θ: θ が π を超えた先は球の裏側より遠い。
+        out.theta = arg;
+        out.valid = arg <= PI;
+    } else if (mode == PROJ_EQUISOLID) {
+        // r = 2f·sin(θ/2): |arg| > 1 はイメージサークルの外。
+        out.theta = 2.0 * asin(clamp(arg, -1.0, 1.0));
+        out.valid = arg <= 1.0;
+    } else {
+        // PROJ_PERSPECTIVE: r = f·tan θ。θ < π/2 で常に有効。
+        out.theta = atan(arg);
+        out.valid = true;
+    }
+    return out;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let yaw    = params.pose.x;
     let pitch  = params.pose.y;
-    let fov_y  = params.pose.z;
     let aspect = params.pose.w;
+    let proj_mode = u32(params.proj.x + 0.5);
+    let proj_k = params.proj.y;
 
-    let tan_half = tan(fov_y * 0.5);
     // NDC: 中心 (0,0)、Y は上向き正
     let ndc = vec2<f32>(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0);
-    let cam_dir = normalize(vec3<f32>(
-        ndc.x * tan_half * aspect,
-        ndc.y * tan_half,
-        -1.0,
-    ));
+    // 画面上下端を 1 とする像面座標と、その半径 / 方位。
+    // 透視投影では normalize(ndc.x*tan_half*aspect, ndc.y*tan_half, -1) と恒等。
+    let plane = vec2<f32>(ndc.x * aspect, ndc.y);
+    let radius = length(plane);
+    let proj = projection_theta(proj_mode, proj_k, radius);
+    let sin_theta = sin(proj.theta);
+    // radius ≈ 0 は画面中心 (θ ≈ 0) なので光軸そのもの。0 除算を避ける。
+    let dir_xy = select(
+        vec2<f32>(0.0, 0.0),
+        plane / max(radius, 1e-6) * sin_theta,
+        radius > 1e-6,
+    );
+    // sin²+cos² = 1 なので既に単位ベクトル。
+    let cam_dir = vec3<f32>(dir_xy.x, dir_xy.y, -cos(proj.theta));
 
     // pitch (X 軸回転) → yaw (Y 軸回転) を順に適用
     let cp = cos(pitch);
@@ -157,13 +211,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             v_crop,
         ),
     );
-    return textureSampleGrad(
+    let sampled = textureSampleGrad(
         pano_tex,
         pano_samp,
         texture_uv,
         texture_dx,
         texture_dy,
     );
+    // **早期 return しない**: dpdx / dpdy を uniform control flow 内で評価する契約
+    // (上の seam 勾配) を壊さないため、定義域外の判定は最後に色の選択でだけ行う。
+    // 不透明の黒は「魚眼のイメージサークル外」で、CPU 側 settle overlay と同じ値。
+    return select(vec4<f32>(0.0, 0.0, 0.0, 1.0), sampled, proj.valid);
 }
 "#;
 
@@ -180,9 +238,9 @@ pub struct PanoramaShaderCallback {
     /// `(idx_hash, source_kind, adjust_gen, ai_gen)` を u64 にパックしたキー。
     /// `resolve_pano_source` の出力をそのまま焼き付ける (§4.1.2)。
     pub cache_key: u64,
-    pub yaw: f32,
-    pub pitch: f32,
-    pub fov_y: f32,
+    /// 視点 (yaw / pitch / fov_y / 投影方式)。投影方式まで含めて 1 つの型で持つので、
+    /// 方式を足したときに uniform への反映漏れが起きない。
+    pub pose: crate::panorama::PanoPose,
     pub aspect: f32,
     /// Phase 1.5 部分 FOV equirect: フル球面 UV → 画像テクスチャ UV 変換。
     /// `crate::panorama::PanoUvTransform::IDENTITY` ならフル equirect。
@@ -393,10 +451,10 @@ impl PanoStaticGpu {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Uniform buffer は paint() の前 (prepare()) で毎フレーム write_buffer される。
-        // ここでは初期値 0 で作っておく (Params = 2 × vec4<f32> = 32 bytes)。
+        // ここでは初期値 0 で作っておく (Params = 3 × vec4<f32> = 48 bytes)。
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("miv_panorama_uniform"),
-            size: 32,
+            size: PANO_UNIFORM_BYTES as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -470,13 +528,7 @@ impl egui_wgpu::CallbackTrait for PanoramaShaderCallback {
             // 後のフレームで stale が解消したときに古い pose で 1 フレーム描画する事故を
             // 防ぐため、毎フレ最新 yaw/pitch/fov を流し込んでおく。
             if uploaded.0.source_key == self.source_key && uploaded.0.cache_key == self.cache_key {
-                let bytes = pano_uniform_bytes(
-                    self.yaw,
-                    self.pitch,
-                    self.fov_y,
-                    self.aspect,
-                    self.uv_transform,
-                );
+                let bytes = pano_uniform_bytes(self.pose, self.aspect, self.uv_transform);
                 queue.write_buffer(&uploaded.0.uniform, 0, &bytes);
             }
         }
@@ -761,7 +813,7 @@ pub struct UploadedSettleOverlay {
 pub struct SettleOverlayCallback {
     pub source_key: String,
     pub cache_key: u64,
-    pub pose: (f32, f32, f32),
+    pub pose: crate::panorama::PanoPose,
     pub alpha: f32,
     pub target_format: wgpu::TextureFormat,
     /// `SettleOverlay.gpu` から `Arc::clone` で渡される。
@@ -773,7 +825,7 @@ pub struct SettleOverlayCallback {
 pub struct SettleOverlayRef {
     pub source_key: String,
     pub cache_key: u64,
-    pub pose: (f32, f32, f32),
+    pub pose: crate::panorama::PanoPose,
     pub alpha: f32,
     pub gpu: Arc<UploadedSettleOverlay>,
 }
@@ -851,7 +903,8 @@ impl egui_wgpu::CallbackTrait for SettleOverlayCallback {
 
 #[cfg(test)]
 mod tests {
-    use super::{SHADER, pano_uniform_bytes};
+    use super::{PANO_UNIFORM_BYTES, SHADER, pano_uniform_bytes};
+    use crate::panorama::{PanoPose, PanoProjection, PanoUvTransform};
 
     #[test]
     fn panorama_shader_uses_wrapped_explicit_gradients() {
@@ -863,19 +916,70 @@ mod tests {
         assert!(!SHADER.contains("lod_bias"));
     }
 
+    /// 投影モードを足しても、定義域外の判定で `fs_main` から早期 return しないこと。
+    /// return すると seam 勾配の `dpdx` / `dpdy` が uniform control flow から外れる。
     #[test]
-    fn panorama_uniform_contains_pose_and_crop_only() {
-        let default_bytes = pano_uniform_bytes(
-            0.0,
-            0.0,
-            1.0,
-            1.0,
-            crate::panorama::PanoUvTransform::IDENTITY,
+    fn panorama_shader_defers_projection_domain_check_to_final_select() {
+        let body = SHADER.split_once("fn fs_main").expect("fs_main present").1;
+        // Comments mention the rule, so strip them before counting statements.
+        let code: String = body
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        assert_eq!(
+            code.matches("return").count(),
+            1,
+            "fs_main must have exactly one return so dpdx/dpdy stay in uniform control flow"
         );
-        assert_eq!(default_bytes.len(), 32);
+        assert!(body.contains("select(vec4<f32>(0.0, 0.0, 0.0, 1.0), sampled, proj.valid)"));
+    }
+
+    /// WGSL の分岐が `PanoProjection::shader_code` と同じ番号を使っていること。
+    #[test]
+    fn panorama_shader_projection_codes_match_rust() {
+        for (mode, name) in [
+            (PanoProjection::Perspective, "PROJ_PERSPECTIVE"),
+            (PanoProjection::Stereographic, "PROJ_STEREOGRAPHIC"),
+            (PanoProjection::Equidistant, "PROJ_EQUIDISTANT"),
+            (PanoProjection::EquisolidAngle, "PROJ_EQUISOLID"),
+        ] {
+            let decl = format!("const {name}: u32 = {}u;", mode.shader_code());
+            assert!(SHADER.contains(&decl), "missing or renumbered: {decl}");
+        }
+    }
+
+    #[test]
+    fn panorama_uniform_contains_pose_crop_and_projection() {
+        let pose = PanoPose::new(0.0, 0.0, 1.0, PanoProjection::Perspective);
+        let default_bytes = pano_uniform_bytes(pose, 1.0, PanoUvTransform::IDENTITY);
+        assert_eq!(default_bytes.len(), PANO_UNIFORM_BYTES);
         assert_eq!(
             f32::from_ne_bytes(default_bytes[24..28].try_into().unwrap()),
             1.0
+        );
+        // proj.x = 方式コード、proj.y = k = g(fov_y/2)
+        assert_eq!(
+            f32::from_ne_bytes(default_bytes[32..36].try_into().unwrap()),
+            0.0
+        );
+        assert!(
+            (f32::from_ne_bytes(default_bytes[36..40].try_into().unwrap()) - 0.5_f32.tan()).abs()
+                < 1e-6
+        );
+
+        let stereo = PanoPose::new(0.0, 0.0, 1.0, PanoProjection::Stereographic);
+        let stereo_bytes = pano_uniform_bytes(stereo, 1.0, PanoUvTransform::IDENTITY);
+        assert_eq!(
+            f32::from_ne_bytes(stereo_bytes[32..36].try_into().unwrap()),
+            1.0
+        );
+        assert!(
+            (f32::from_ne_bytes(stereo_bytes[36..40].try_into().unwrap()) - 0.25_f32.tan()).abs()
+                < 1e-6
         );
 
         let module = wgpu::naga::front::wgsl::parse_str(SHADER).expect("parse panorama WGSL");
@@ -888,29 +992,40 @@ mod tests {
     }
 }
 
-/// `Params` uniform 用バイト列 (2 × vec4<f32> = 8 floats、32 bytes)。
+/// `Params` uniform のバイト長 (3 × vec4<f32> = 12 floats)。
+pub const PANO_UNIFORM_BYTES: usize = 48;
+
+/// `Params` uniform 用バイト列 (3 × vec4<f32> = 12 floats、48 bytes)。
 ///
 /// レイアウト:
 /// - bytes[0..16]: pose = (yaw, pitch, fov_y, aspect)
 /// - bytes[16..32]: crop = (u_offset, v_offset, u_scale, v_scale)
+/// - bytes[32..48]: proj = (mode_code, k, 0, 0)
+///
+/// `k` は CPU 側 [`crate::panorama::ProjectionMap`] が持つ係数そのもの。シェーダで
+/// `fov_y` から作り直さないのは、CPU の settle overlay と GPU の base が別々に
+/// `tan` を評価して幾何がわずかにずれるのを避けるため。
 pub fn pano_uniform_bytes(
-    yaw: f32,
-    pitch: f32,
-    fov_y: f32,
+    pose: crate::panorama::PanoPose,
     aspect: f32,
     uv_transform: crate::panorama::PanoUvTransform,
-) -> [u8; 32] {
+) -> [u8; PANO_UNIFORM_BYTES] {
+    let map = pose.map();
     let float_values = [
-        yaw,
-        pitch,
-        fov_y,
+        pose.yaw,
+        pose.pitch,
+        pose.fov_y,
         aspect,
         uv_transform.u_offset,
         uv_transform.v_offset,
         uv_transform.u_scale,
         uv_transform.v_scale,
+        pose.projection.shader_code() as f32,
+        map.coefficient(),
+        0.0,
+        0.0,
     ];
-    let mut bytes = [0u8; 32];
+    let mut bytes = [0u8; PANO_UNIFORM_BYTES];
     for (i, v) in float_values.iter().enumerate() {
         bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
     }

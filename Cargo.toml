@@ -101,6 +101,13 @@ bench = false
 required-features = ["dev-tools"]
 
 [[bin]]
+name = "probe_spherical"
+path = "src/bin/probe_spherical.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
 name = "build_editing_pack"
 path = "src/bin/build_editing_pack.rs"
 bench = false
